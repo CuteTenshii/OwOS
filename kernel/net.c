@@ -1,0 +1,1435 @@
+/* net.c — a minimal IPv4 protocol stack on top of the RTL8139 driver.
+ *
+ * Just enough plumbing to ping a host through QEMU's user-mode (SLIRP)
+ * network: Ethernet -> ARP -> IPv4 -> ICMP echo, plus a tiny UDP+DNS resolver
+ * so a name like "google.com" can be looked up. The NIC itself lives in
+ * rtl8139.c; this file only assembles frames (nic_send) and parses the ones
+ * the driver hands up (net_rx_frame).
+ *
+ * SLIRP presents a fixed virtual network, so the IP configuration is hardcoded
+ * rather than discovered over DHCP:
+ *
+ *     guest  10.0.2.15      gateway 10.0.2.2      DNS 10.0.2.3      /24
+ *
+ * Inbound frames are parsed in interrupt context (the RX path fills small
+ * reply slots that the command-context senders below poll on).
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "net.h"
+#include "rtl8139.h"
+#include "tcp.h"
+#include "tls.h"
+#include "timer.h"
+#include "vga.h"
+#include "fs.h"
+#include "kstring.h"
+#include "url.h"
+#include "gzip.h"
+#include "heap.h"
+
+/* ------------------------------------------------------------------ helpers */
+
+static int nmemcmp(const void *a, const void *b, uint32_t n)
+{
+	const uint8_t *pa = a, *pb = b;
+	while (n--) {
+		if (*pa != *pb)
+			return (int)*pa - (int)*pb;
+		pa++; pb++;
+	}
+	return 0;
+}
+
+static inline uint16_t bswap16(uint16_t x) { return (uint16_t)((x << 8) | (x >> 8)); }
+#define htons(x) bswap16((uint16_t)(x))
+#define ntohs(x) bswap16((uint16_t)(x))
+
+/* Internet checksum (RFC 1071). Reads bytes as big-endian 16-bit words and
+ * returns the host value of the checksum; store it into a header field with
+ * htons() so the bytes land in network order. The csum field must be zero
+ * while computing. Callers only ever pass even lengths here. */
+static uint16_t inet_csum(const uint8_t *p, uint32_t len)
+{
+	uint32_t sum = 0;
+	while (len > 1) {
+		sum += ((uint32_t)p[0] << 8) | p[1];
+		p += 2;
+		len -= 2;
+	}
+	if (len)
+		sum += (uint32_t)p[0] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xFFFF) + (sum >> 16);
+	return (uint16_t)~sum;
+}
+
+/* --------------------------------------------------------------- on-the-wire */
+
+struct eth_hdr {
+	uint8_t  dst[6];
+	uint8_t  src[6];
+	uint16_t type;
+} __attribute__((packed));
+
+struct arp_hdr {
+	uint16_t htype, ptype;
+	uint8_t  hlen, plen;
+	uint16_t oper;
+	uint8_t  sha[6], spa[4];
+	uint8_t  tha[6], tpa[4];
+} __attribute__((packed));
+
+struct ip_hdr {
+	uint8_t  ver_ihl, tos;
+	uint16_t len, id, frag;
+	uint8_t  ttl, proto;
+	uint16_t csum;
+	uint8_t  src[4], dst[4];
+} __attribute__((packed));
+
+struct icmp_hdr {
+	uint8_t  type, code;
+	uint16_t csum, id, seq;
+} __attribute__((packed));
+
+struct udp_hdr {
+	uint16_t sport, dport, len, csum;
+} __attribute__((packed));
+
+struct dns_hdr {
+	uint16_t id, flags, qd, an, ns, ar;
+} __attribute__((packed));
+
+#define ETH_IP   0x0800
+#define ETH_ARP  0x0806
+#define IP_ICMP  1
+#define IP_TCP   6
+#define IP_UDP   17
+
+/* ------------------------------------------------------------------- config */
+
+/* The fixed SLIRP virtual network, as raw network-order octets. */
+static const uint8_t my_ip[4]   = { 10, 0, 2, 15 };
+static const uint8_t gw_ip[4]   = { 10, 0, 2, 2 };
+static const uint8_t dns_ip[4]  = { 10, 0, 2, 3 };
+static const uint8_t netmask[4] = { 255, 255, 255, 0 };
+
+#define ARP_CACHE 8
+static struct arp_entry {
+	uint8_t ip[4];
+	uint8_t mac[6];
+	int     valid;
+} arp_cache[ARP_CACHE];
+
+/* Reply slots written by the RX interrupt, polled by the command context. */
+static volatile int      icmp_got;
+static volatile uint16_t icmp_id_rx, icmp_seq_rx;
+static volatile uint8_t  icmp_from[4];
+static volatile uint32_t icmp_send_us;  /* set just before the echo goes out  */
+static volatile uint32_t icmp_rtt_us;   /* recv timestamp - send, set by IRQ  */
+
+#define DNS_MAX_ANS 16
+#define DNS_TEXT    128
+static volatile int      dns_got, dns_ok;             /* dns_ok: saw an A record */
+static volatile uint16_t dns_qid;
+static volatile uint8_t  dns_result[4];               /* first A record (resolve) */
+static volatile uint16_t dns_ans_type[DNS_MAX_ANS];   /* each answer's RR type */
+static volatile uint32_t dns_ans_ttl[DNS_MAX_ANS];
+static volatile char     dns_ans_text[DNS_MAX_ANS][DNS_TEXT]; /* formatted rdata */
+static volatile int      dns_ans_count;
+static volatile uint32_t dns_send_us, dns_rtt_us;     /* query timing          */
+
+static uint16_t ip_ident = 1;
+
+/* ----------------------------------------------------------------- transmit */
+
+/* Assemble an Ethernet frame on the stack and hand it to the driver. The
+ * stack-local buffer keeps the command-context senders and the IRQ-context
+ * ARP reply from ever sharing one. */
+static void eth_send(const uint8_t dst[6], uint16_t type,
+                     const uint8_t *payload, uint32_t plen)
+{
+	if (plen > 1500)
+		return;
+	uint8_t frame[1514];
+	struct eth_hdr *e = (struct eth_hdr *)frame;
+	kmemcpy(e->dst, dst, 6);
+	kmemcpy(e->src, nic_mac(), 6);
+	e->type = htons(type);
+	kmemcpy(frame + 14, payload, plen);
+	nic_send(frame, 14 + plen);
+}
+
+/* ---------------------------------------------------------------------- ARP */
+
+static int arp_lookup(const uint8_t ip[4], uint8_t out[6])
+{
+	for (int i = 0; i < ARP_CACHE; i++) {
+		if (arp_cache[i].valid && nmemcmp(arp_cache[i].ip, ip, 4) == 0) {
+			kmemcpy(out, arp_cache[i].mac, 6);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void arp_cache_put(const uint8_t ip[4], const uint8_t m[6])
+{
+	int slot = -1;
+	for (int i = 0; i < ARP_CACHE; i++) {
+		if (arp_cache[i].valid && nmemcmp(arp_cache[i].ip, ip, 4) == 0) {
+			slot = i;
+			break;
+		}
+		if (slot < 0 && !arp_cache[i].valid)
+			slot = i;
+	}
+	if (slot < 0)
+		slot = 0;
+	kmemcpy(arp_cache[slot].ip, ip, 4);
+	kmemcpy(arp_cache[slot].mac, m, 6);
+	arp_cache[slot].valid = 1;
+}
+
+static void arp_build(uint8_t *pkt, uint16_t oper,
+                      const uint8_t tha[6], const uint8_t tpa[4])
+{
+	struct arp_hdr *a = (struct arp_hdr *)pkt;
+	a->htype = htons(1);
+	a->ptype = htons(ETH_IP);
+	a->hlen  = 6;
+	a->plen  = 4;
+	a->oper  = htons(oper);
+	kmemcpy(a->sha, nic_mac(), 6);
+	kmemcpy(a->spa, my_ip, 4);
+	kmemcpy(a->tha, tha, 6);
+	kmemcpy(a->tpa, tpa, 4);
+}
+
+static void arp_request(const uint8_t ip[4])
+{
+	static const uint8_t bcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+	static const uint8_t zero[6]  = { 0 };
+	uint8_t pkt[28];
+	arp_build(pkt, 1, zero, ip);
+	eth_send(bcast, ETH_ARP, pkt, 28);
+}
+
+static void arp_recv(const uint8_t *p, uint32_t len)
+{
+	if (len < 28)
+		return;
+	const struct arp_hdr *a = (const struct arp_hdr *)p;
+	if (ntohs(a->ptype) != ETH_IP)
+		return;
+
+	uint16_t op = ntohs(a->oper);
+	if (op == 2) {                          /* reply: learn the sender         */
+		arp_cache_put(a->spa, a->sha);
+	} else if (op == 1 && nmemcmp(a->tpa, my_ip, 4) == 0) {
+		arp_cache_put(a->spa, a->sha);  /* someone is asking for us: answer */
+		uint8_t pkt[28];
+		arp_build(pkt, 2, a->sha, a->spa);
+		eth_send(a->sha, ETH_ARP, pkt, 28);
+	}
+}
+
+/* Resolve an IP to a MAC, sending requests and waiting on the RX interrupt. */
+static int arp_resolve(const uint8_t ip[4], uint8_t out[6])
+{
+	if (arp_lookup(ip, out))
+		return 1;
+	for (int tries = 0; tries < 4; tries++) {
+		arp_request(ip);
+		uint32_t deadline = timer_ticks() + 25;   /* ~250 ms                 */
+		while (timer_ticks() < deadline) {
+			__asm__ volatile ("" ::: "memory");
+			if (arp_lookup(ip, out))
+				return 1;
+			/* sti before hlt: this resolve can run in syscall context (a
+			 * ring-3 program connecting through net_sock_*), where the int
+			 * 0x80 gate left IF=0 — a bare hlt would halt the CPU forever. */
+			__asm__ volatile ("sti\n\thlt");
+		}
+	}
+	return 0;
+}
+
+static int same_subnet(const uint8_t ip[4])
+{
+	for (int i = 0; i < 4; i++)
+		if ((ip[i] & netmask[i]) != (my_ip[i] & netmask[i]))
+			return 0;
+	return 1;
+}
+
+/* Pick the next hop (host directly, or the gateway) and resolve its MAC. */
+static int next_hop_mac(const uint8_t dst[4], uint8_t out[6])
+{
+	return arp_resolve(same_subnet(dst) ? dst : gw_ip, out);
+}
+
+/* ----------------------------------------------------------------------- IP */
+
+static void ip_send(const uint8_t dst[4], uint8_t proto,
+                    const uint8_t *payload, uint32_t plen)
+{
+	uint8_t nh[6];
+	if (!next_hop_mac(dst, nh))
+		return;
+
+	static uint8_t buf[1500];
+	if (20 + plen > sizeof(buf))
+		return;
+
+	struct ip_hdr *ip = (struct ip_hdr *)buf;
+	ip->ver_ihl = 0x45;
+	ip->tos     = 0;
+	ip->len     = htons(20 + plen);
+	ip->id      = htons(ip_ident++);
+	ip->frag    = htons(0x4000);            /* don't fragment                  */
+	ip->ttl     = 64;
+	ip->proto   = proto;
+	ip->csum    = 0;
+	kmemcpy(ip->src, my_ip, 4);
+	kmemcpy(ip->dst, dst, 4);
+	ip->csum    = htons(inet_csum(buf, 20));
+
+	kmemcpy(buf + 20, payload, plen);
+	eth_send(nh, ETH_IP, buf, 20 + plen);
+}
+
+/* Lower-layer hooks for the transport layer. */
+void net_ip_send(const uint8_t dst[4], uint8_t proto,
+                 const uint8_t *payload, uint32_t plen)
+{
+	ip_send(dst, proto, payload, plen);
+}
+
+const uint8_t *net_my_ip(void)
+{
+	return my_ip;
+}
+
+/* --------------------------------------------------------------------- ICMP */
+
+static void icmp_send_echo(const uint8_t dst[4], uint16_t id, uint16_t seq)
+{
+	uint8_t pkt[8 + 32];
+	struct icmp_hdr *ic = (struct icmp_hdr *)pkt;
+	ic->type = 8;
+	ic->code = 0;
+	ic->csum = 0;
+	ic->id   = htons(id);
+	ic->seq  = htons(seq);
+	for (int i = 0; i < 32; i++)
+		pkt[8 + i] = (uint8_t)('a' + (i % 26));
+	ic->csum = htons(inet_csum(pkt, sizeof(pkt)));
+	ip_send(dst, IP_ICMP, pkt, sizeof(pkt));
+}
+
+static void icmp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
+{
+	if (len < 8)
+		return;
+	const struct icmp_hdr *ic = (const struct icmp_hdr *)p;
+	if (ic->type == 0) {                    /* echo reply                      */
+		icmp_rtt_us = timer_us() - icmp_send_us;  /* sample at arrival   */
+		icmp_id_rx  = ntohs(ic->id);
+		icmp_seq_rx = ntohs(ic->seq);
+		for (int i = 0; i < 4; i++)
+			icmp_from[i] = src[i];
+		icmp_got = 1;
+	}
+}
+
+/* ---------------------------------------------------------------- UDP / DNS */
+
+/* Walk past a DNS name (label sequence or compression pointer). Returns the
+ * position just after the name, or NULL if it runs off the end. */
+static const uint8_t *dns_skip_name(const uint8_t *cur, const uint8_t *end)
+{
+	while (cur < end) {
+		uint8_t b = *cur;
+		if (b == 0)
+			return cur + 1;
+		if ((b & 0xC0) == 0xC0)         /* pointer ends the name in 2 bytes */
+			return cur + 2 <= end ? cur + 2 : NULL;
+		cur += 1 + b;
+	}
+	return NULL;
+}
+
+/* Decode a (possibly compressed) DNS name at `pos` into a dotted string.
+ * `msg`..`end` bound the whole message so compression pointers can be chased. */
+static void dns_name_to_str(const uint8_t *msg, const uint8_t *end,
+                            const uint8_t *pos, char *out, int outsz)
+{
+	int oi = 0, jumps = 0;
+	const uint8_t *cur = pos;
+	while (cur < end) {
+		uint8_t b = *cur;
+		if (b == 0)
+			break;
+		if ((b & 0xC0) == 0xC0) {               /* compression pointer    */
+			if (cur + 1 >= end)
+				break;
+			uint32_t off = ((uint32_t)(b & 0x3F) << 8) | cur[1];
+			if (msg + off >= end || ++jumps > 16)
+				break;
+			cur = msg + off;
+			continue;
+		}
+		if (oi > 0 && oi < outsz - 1)
+			out[oi++] = '.';
+		for (int i = 0; i < b && cur + 1 + i < end; i++)
+			if (oi < outsz - 1)
+				out[oi++] = (char)cur[1 + i];
+		cur += 1 + b;
+	}
+	if (oi == 0 && oi < outsz - 1)
+		out[oi++] = '.';                        /* the root name          */
+	out[oi] = '\0';
+}
+
+static int u32_to_str(uint32_t v, char *out)
+{
+	char tmp[12];
+	int n = 0;
+	do { tmp[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+	for (int i = 0; i < n; i++)
+		out[i] = tmp[n - 1 - i];
+	out[n] = '\0';
+	return n;
+}
+
+static void dns_recv(const uint8_t *p, uint32_t len)
+{
+	if (len < 12)
+		return;
+	const struct dns_hdr *h = (const struct dns_hdr *)p;
+	if (ntohs(h->id) != dns_qid)
+		return;
+
+	uint16_t qd = ntohs(h->qd), an = ntohs(h->an);
+	const uint8_t *cur = p + 12;
+	const uint8_t *end = p + len;
+
+	for (int i = 0; i < qd; i++) {          /* skip the echoed questions       */
+		cur = dns_skip_name(cur, end);
+		if (!cur || cur + 4 > end)
+			return;
+		cur += 4;
+	}
+	int count = 0, saw_a = 0;
+	for (int i = 0; i < an && count < DNS_MAX_ANS; i++) {
+		cur = dns_skip_name(cur, end);
+		if (!cur || cur + 10 > end)
+			break;
+		uint16_t type  = ((uint16_t)cur[0] << 8) | cur[1];
+		uint32_t ttl   = ((uint32_t)cur[4] << 24) | ((uint32_t)cur[5] << 16) |
+		                 ((uint32_t)cur[6] << 8) | cur[7];
+		uint16_t rdlen = ((uint16_t)cur[8] << 8) | cur[9];
+		const uint8_t *rd = cur + 10;
+		cur = rd;
+		if (cur + rdlen > end)
+			break;
+
+		/* Format the record data as text according to its type. */
+		char txt[DNS_TEXT];
+		int t = 0;
+		if (type == 1 && rdlen == 4) {                  /* A               */
+			t += u32_to_str(rd[0], txt + t); txt[t++] = '.';
+			t += u32_to_str(rd[1], txt + t); txt[t++] = '.';
+			t += u32_to_str(rd[2], txt + t); txt[t++] = '.';
+			t += u32_to_str(rd[3], txt + t);
+			if (!saw_a) {
+				for (int k = 0; k < 4; k++)
+					dns_result[k] = rd[k];
+				saw_a = 1;
+			}
+		} else if (type == 28 && rdlen == 16) {         /* AAAA            */
+			static const char hx[] = "0123456789abcdef";
+			for (int g = 0; g < 8; g++) {
+				if (g) txt[t++] = ':';
+				uint8_t hi = rd[g * 2], lo = rd[g * 2 + 1];
+				txt[t++] = hx[hi >> 4]; txt[t++] = hx[hi & 15];
+				txt[t++] = hx[lo >> 4]; txt[t++] = hx[lo & 15];
+			}
+			txt[t] = '\0';
+		} else if (type == 5 || type == 2 || type == 12) { /* CNAME/NS/PTR */
+			dns_name_to_str(p, end, rd, txt, sizeof(txt));
+		} else if (type == 15 && rdlen >= 3) {          /* MX              */
+			uint32_t pref = ((uint32_t)rd[0] << 8) | rd[1];
+			t += u32_to_str(pref, txt + t);
+			txt[t++] = ' ';
+			dns_name_to_str(p, end, rd + 2, txt + t, (int)sizeof(txt) - t);
+		} else if (type == 16) {                        /* TXT             */
+			const uint8_t *q = rd, *re = rd + rdlen;
+			while (q < re && t < (int)sizeof(txt) - 1) {
+				int sl = *q++;
+				for (int k = 0; k < sl && q < re && t < (int)sizeof(txt) - 1; k++)
+					txt[t++] = (char)*q++;
+			}
+			txt[t] = '\0';
+		} else {                                        /* unknown         */
+			t  = (int)(txt[0] = 't', 1);
+			txt[t++] = 'y'; txt[t++] = 'p'; txt[t++] = 'e'; txt[t++] = ' ';
+			t += u32_to_str(type, txt + t);
+		}
+
+		for (int k = 0; k < DNS_TEXT; k++) {
+			dns_ans_text[count][k] = txt[k];
+			if (!txt[k])
+				break;
+		}
+		dns_ans_text[count][DNS_TEXT - 1] = '\0';
+		dns_ans_type[count] = type;
+		dns_ans_ttl[count]  = ttl;
+		count++;
+		cur += rdlen;
+	}
+	dns_ans_count = count;
+	dns_ok      = saw_a;
+	dns_rtt_us  = timer_us() - dns_send_us;   /* sample at arrival           */
+	dns_got     = 1;
+}
+
+/* Registered UDP servers (kernel/services.c). Looked up by destination port. */
+#define UDP_LISTENERS 8
+static struct { uint16_t port; udp_handler_t fn; } udp_listeners[UDP_LISTENERS];
+
+static udp_handler_t udp_lookup(uint16_t port)
+{
+	for (int i = 0; i < UDP_LISTENERS; i++)
+		if (udp_listeners[i].fn && udp_listeners[i].port == port)
+			return udp_listeners[i].fn;
+	return 0;
+}
+
+int net_udp_listen(uint16_t port, udp_handler_t fn)
+{
+	for (int i = 0; i < UDP_LISTENERS; i++)        /* re-bind an existing port */
+		if (udp_listeners[i].fn && udp_listeners[i].port == port) {
+			udp_listeners[i].fn = fn;
+			return 0;
+		}
+	for (int i = 0; i < UDP_LISTENERS; i++)
+		if (!udp_listeners[i].fn) {
+			udp_listeners[i].port = port;
+			udp_listeners[i].fn = fn;
+			return 0;
+		}
+	return -1;
+}
+
+void net_udp_unlisten(uint16_t port)
+{
+	for (int i = 0; i < UDP_LISTENERS; i++)
+		if (udp_listeners[i].fn && udp_listeners[i].port == port)
+			udp_listeners[i].fn = 0;
+}
+
+void net_udp_send(const uint8_t dst[4], uint16_t dport, uint16_t sport,
+                  const uint8_t *data, uint32_t len)
+{
+	if (len > 512)
+		len = 512;
+	uint8_t pkt[8 + 512];
+	struct udp_hdr *u = (struct udp_hdr *)pkt;
+	u->sport = htons(sport);
+	u->dport = htons(dport);
+	u->len   = htons((uint16_t)(8 + len));
+	u->csum  = 0;                           /* checksum optional over IPv4      */
+	for (uint32_t i = 0; i < len; i++)
+		pkt[8 + i] = data[i];
+	ip_send(dst, IP_UDP, pkt, 8 + len);
+}
+
+static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
+{
+	if (len < 8)
+		return;
+	const struct udp_hdr *u = (const struct udp_hdr *)p;
+	if (ntohs(u->sport) == 53) {
+		dns_recv(p + 8, len - 8);
+		return;
+	}
+	udp_handler_t fn = udp_lookup(ntohs(u->dport));
+	if (fn) {
+		uint32_t ulen = ntohs(u->len);         /* trust the smaller length     */
+		if (ulen < 8 || ulen > len)
+			ulen = len;
+		fn(src, ntohs(u->sport), p + 8, ulen - 8);
+	}
+}
+
+#define DNS_SPORT 0xC053
+
+static void dns_send_query(uint16_t id, const char *host, uint16_t qtype)
+{
+	uint8_t udp[8 + 512];
+	struct udp_hdr *u = (struct udp_hdr *)udp;
+	uint8_t *dns = udp + 8;
+
+	struct dns_hdr *h = (struct dns_hdr *)dns;
+	h->id    = htons(id);
+	h->flags = htons(0x0100);               /* standard query, recursion       */
+	h->qd    = htons(1);
+	h->an = 0; h->ns = 0; h->ar = 0;
+
+	uint8_t *q = dns + 12;
+	const char *s = host;
+	while (*s) {                            /* encode labels                   */
+		int l = 0;
+		while (s[l] && s[l] != '.')
+			l++;
+		if (l > 63)
+			return;
+		*q++ = (uint8_t)l;
+		for (int i = 0; i < l; i++)
+			*q++ = (uint8_t)s[i];
+		s += l;
+		if (*s == '.')
+			s++;
+	}
+	*q++ = 0;                               /* root label                      */
+	*q++ = (uint8_t)(qtype >> 8);           /* QTYPE                           */
+	*q++ = (uint8_t)qtype;
+	*q++ = 0; *q++ = 1;                     /* QCLASS = IN                      */
+
+	uint32_t dlen = (uint32_t)(q - dns);
+	u->sport = htons(DNS_SPORT);
+	u->dport = htons(53);
+	u->len   = htons(8 + dlen);
+	u->csum  = 0;                           /* optional for IPv4               */
+
+	ip_send(dns_ip, IP_UDP, udp, 8 + dlen);
+}
+
+/* ----------------------------------------------------------- receive bottom */
+
+static void ip_recv(const uint8_t *p, uint32_t len)
+{
+	if (len < 20)
+		return;
+	const struct ip_hdr *ip = (const struct ip_hdr *)p;
+	if ((ip->ver_ihl >> 4) != 4)
+		return;
+	uint32_t ihl = (uint32_t)(ip->ver_ihl & 0x0F) * 4;
+	uint32_t total = ntohs(ip->len);
+	if (ihl < 20 || ihl > len)
+		return;
+	if (total > len)
+		total = len;
+	if (total < ihl)
+		return;
+
+	const uint8_t *payload = p + ihl;
+	uint32_t plen = total - ihl;
+	if (ip->proto == IP_ICMP)
+		icmp_recv(ip->src, payload, plen);
+	else if (ip->proto == IP_UDP)
+		udp_recv(ip->src, payload, plen);
+	else if (ip->proto == IP_TCP)
+		tcp_input(ip->src, payload, plen);
+}
+
+/* The NIC driver hands every inbound Ethernet frame (FCS stripped) here. */
+void net_rx_frame(const uint8_t *f, uint32_t len)
+{
+	if (len < 14)
+		return;
+	const struct eth_hdr *e = (const struct eth_hdr *)f;
+	uint16_t type = ntohs(e->type);
+	if (type == ETH_ARP)
+		arp_recv(f + 14, len - 14);
+	else if (type == ETH_IP)
+		ip_recv(f + 14, len - 14);
+}
+
+/* ------------------------------------------------------------------ command */
+
+static int parse_ipv4(const char *s, uint8_t out[4])
+{
+	for (int i = 0; i < 4; i++) {
+		if (*s < '0' || *s > '9')
+			return 0;
+		int v = 0, digits = 0;
+		while (*s >= '0' && *s <= '9') {
+			v = v * 10 + (*s++ - '0');
+			if (++digits > 3 || v > 255)
+				return 0;
+		}
+		out[i] = (uint8_t)v;
+		if (i < 3) {
+			if (*s != '.')
+				return 0;
+			s++;
+		}
+	}
+	return *s == '\0';
+}
+
+static void print_ip(const uint8_t ip[4])
+{
+	for (int i = 0; i < 4; i++) {
+		vga_write_dec(ip[i]);
+		if (i < 3)
+			vga_putc('.');
+	}
+}
+
+/* Print a microsecond duration as milliseconds with 3 decimals (e.g. 1.234). */
+static void print_rtt(uint32_t us)
+{
+	uint32_t frac = us % 1000;
+	vga_write_dec(us / 1000);
+	vga_putc('.');
+	vga_putc('0' + (char)(frac / 100));
+	vga_putc('0' + (char)((frac / 10) % 10));
+	vga_putc('0' + (char)(frac % 10));
+}
+
+/* Send a query of the given type for `host` and wait for the reply, retrying a
+ * few times. Returns 1 if any response arrived (inspect dns_ans_count / the
+ * dns_* answer slots for what it carried). */
+static int dns_query(const char *host, uint16_t qtype)
+{
+	if (!nic_present())
+		return 0;
+
+	/* Warm the route to the DNS server so the send isn't ARP-blocked and the
+	 * query-time measurement reflects the server round-trip, not ARP. */
+	uint8_t warm[6];
+	next_hop_mac(dns_ip, warm);
+
+	dns_qid = (uint16_t)(timer_ticks() * 2654435761u) | 1;
+	for (int tries = 0; tries < 3; tries++) {
+		dns_got = 0;
+		dns_ok  = 0;
+		dns_ans_count = 0;
+		dns_send_us = timer_us();
+		dns_send_query(dns_qid, host, qtype);
+		uint32_t deadline = timer_ticks() + 200;   /* ~2 s                    */
+		while (timer_ticks() < deadline) {
+			__asm__ volatile ("" ::: "memory");
+			if (dns_got)
+				break;
+			__asm__ volatile ("sti\n\thlt");  /* IF=0 in syscall ctx; see arp_resolve */
+		}
+		if (dns_got)
+			return 1;
+	}
+	return 0;
+}
+
+static int dns_resolve(const char *host, uint8_t out[4])
+{
+	if (!dns_query(host, 1) || !dns_ok)        /* type 1 = A                 */
+		return 0;
+	for (int i = 0; i < 4; i++)
+		out[i] = dns_result[i];
+	return 1;
+}
+
+static int dns_streq_ci(const char *a, const char *b)
+{
+	while (*a && *b) {
+		char ca = *a, cb = *b;
+		if (ca >= 'a' && ca <= 'z') ca -= 32;
+		if (cb >= 'a' && cb <= 'z') cb -= 32;
+		if (ca != cb)
+			return 0;
+		a++; b++;
+	}
+	return *a == *b;
+}
+
+static uint16_t dig_type_num(const char *s)
+{
+	if (dns_streq_ci(s, "A"))     return 1;
+	if (dns_streq_ci(s, "NS"))    return 2;
+	if (dns_streq_ci(s, "CNAME")) return 5;
+	if (dns_streq_ci(s, "SOA"))   return 6;
+	if (dns_streq_ci(s, "PTR"))   return 12;
+	if (dns_streq_ci(s, "MX"))    return 15;
+	if (dns_streq_ci(s, "TXT"))   return 16;
+	if (dns_streq_ci(s, "AAAA"))  return 28;
+	return 0;
+}
+
+static const char *dig_type_name(uint16_t t)
+{
+	switch (t) {
+	case 1:  return "A";
+	case 2:  return "NS";
+	case 5:  return "CNAME";
+	case 6:  return "SOA";
+	case 12: return "PTR";
+	case 15: return "MX";
+	case 16: return "TXT";
+	case 28: return "AAAA";
+	default: return "?";
+	}
+}
+
+/* dig <host> [TYPE] — query DNS and print the answer records. Defaults to A. */
+int net_dig(const char *arg)
+{
+	if (!nic_present()) {
+		vga_write("dig: no network device\n");
+		return -1;
+	}
+
+	char host[128];
+	int n = 0;
+	while (*arg == ' ')
+		arg++;
+	while (*arg && *arg != ' ' && n < (int)sizeof(host) - 1)
+		host[n++] = *arg++;
+	host[n] = '\0';
+	while (*arg == ' ')
+		arg++;
+
+	uint16_t qtype = 1;
+	if (*arg) {
+		qtype = dig_type_num(arg);
+		if (qtype == 0) {
+			vga_write("dig: unknown type (A, AAAA, NS, CNAME, MX, TXT, PTR, SOA)\n");
+			return -1;
+		}
+	}
+	if (host[0] == '\0') {
+		vga_write("dig: usage: dig <host> [type]\n");
+		return -1;
+	}
+
+	if (!dns_query(host, qtype)) {
+		vga_write(";; no response from ");
+		print_ip(dns_ip);
+		vga_write("#53\n");
+		return -1;
+	}
+
+	vga_write("; OwOS dig  ");
+	vga_write(host);
+	vga_write("  ");
+	vga_write(dig_type_name(qtype));
+	vga_putc('\n');
+
+	if (dns_ans_count == 0) {
+		vga_write(";; no records\n");
+	} else {
+		vga_write(";; ANSWER SECTION:\n");
+		for (int i = 0; i < dns_ans_count; i++) {
+			char tx[DNS_TEXT];
+			for (int k = 0; k < DNS_TEXT; k++) {
+				tx[k] = dns_ans_text[i][k];
+				if (!tx[k])
+					break;
+			}
+			tx[DNS_TEXT - 1] = '\0';
+
+			vga_write(host);
+			vga_write(".  ");
+			vga_write_dec(dns_ans_ttl[i]);
+			vga_write("  IN  ");
+			vga_write(dig_type_name(dns_ans_type[i]));
+			vga_write("  ");
+			vga_write(tx);
+			vga_putc('\n');
+		}
+	}
+
+	vga_write(";; Query time: ");
+	print_rtt(dns_rtt_us);
+	vga_write(" ms   server ");
+	print_ip(dns_ip);
+	vga_write("#53\n");
+	return dns_ans_count > 0 ? 0 : -1;
+}
+
+
+static int append(char *dst, int n, int cap, const char *s)
+{
+	while (*s && n < cap - 1)
+		dst[n++] = *s++;
+	return n;
+}
+
+/* A byte reader buffered over the transport, for parsing the HTTP response.
+ * curl_tls picks the TLS stream over the bare TCP one. */
+static uint8_t curl_ibuf[2048];
+static int     curl_ipos, curl_ilen, curl_iclosed;
+static int     curl_tls;
+static tcp_conn_t *curl_conn;           /* the bare-TCP connection (non-TLS)   */
+
+static int curl_getc(void)              /* next byte; -1 at EOF, -2 on reset   */
+{
+	if (curl_ipos >= curl_ilen) {
+		if (curl_iclosed)
+			return -1;
+		int r = curl_tls ? tls_read(curl_ibuf, sizeof(curl_ibuf), &curl_iclosed)
+		                  : tcp_read(curl_conn, curl_ibuf, sizeof(curl_ibuf), &curl_iclosed);
+		if (r < 0)
+			return -2;
+		if (r == 0)
+			return -1;
+		curl_ipos = 0;
+		curl_ilen = r;
+	}
+	return curl_ibuf[curl_ipos++];
+}
+
+static char ci_low(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+
+static int ci_starts(const char *s, const char *pre)
+{
+	while (*pre) {
+		if (ci_low(*s) != ci_low(*pre))
+			return 0;
+		s++; pre++;
+	}
+	return 1;
+}
+
+/* Case-insensitive substring search, bounded to the current header line. */
+static int ci_in_line(const char *hay, const char *needle)
+{
+	for (; *hay && *hay != '\n'; hay++) {
+		const char *h = hay, *n = needle;
+		while (*n && *h && *h != '\n' && ci_low(*h) == ci_low(*n)) {
+			h++; n++;
+		}
+		if (!*n)
+			return 1;
+	}
+	return 0;
+}
+
+/* When the response is "Content-Encoding: gzip", body bytes are the compressed
+ * stream: collect them here and inflate once the body is complete, rather than
+ * emitting them straight away. Capped so a runaway response can't exhaust the
+ * heap. */
+#define CURL_GZ_MAX (1024 * 1024)
+static uint8_t *curl_gzbuf;
+static uint32_t curl_gzn;
+static int      curl_gz;                /* 1 while collecting a gzip body       */
+static int      curl_gzof;             /* set if the body overflowed the buffer */
+
+/* When curl_mem is non-NULL the body is captured into it (up to curl_memcap)
+ * instead of being printed/saved — this is how net_http_get() reuses all of
+ * net_curl()'s response framing to fetch a URL into memory. */
+static uint8_t *curl_mem;
+static uint32_t curl_memcap, curl_memlen;
+
+/* One body byte: while collecting a gzip body, buffer it; otherwise stream it
+ * into the output file when saving, or echo it to the screen (which would be
+ * garbage for a binary like an mp3). */
+static void curl_emit(int save, int b)
+{
+	if (curl_gz) {
+		if (curl_gzn < CURL_GZ_MAX)
+			curl_gzbuf[curl_gzn++] = (uint8_t)b;
+		else
+			curl_gzof = 1;
+		return;
+	}
+	if (curl_mem) {
+		if (curl_memlen < curl_memcap)
+			curl_mem[curl_memlen++] = (uint8_t)b;
+		return;
+	}
+	if (save) {
+		uint8_t bb = (uint8_t)b;
+		fs_stream_write(&bb, 1);
+	} else {
+		vga_putc((char)b);
+	}
+}
+
+int net_curl(const char *arg)
+{
+	if (!nic_present()) {
+		vga_write("curl: no network device\n");
+		return -1;
+	}
+
+	int show_headers = 0;
+	char method[16] = "GET";
+	int save = 0;
+	char outname[64];
+	while (*arg == ' ')
+		arg++;
+	while (arg[0] == '-') {
+		if (arg[1] == 'i' && (arg[2] == ' ' || arg[2] == '\0')) {
+			show_headers = 1;
+			arg += 2;
+		} else if (arg[1] == 'X' && (arg[2] == ' ' || arg[2] == '\0')) {
+			arg += 2;
+			while (*arg == ' ')
+				arg++;
+			int m = 0;
+			while (*arg && *arg != ' ' && m < (int)sizeof(method) - 1)
+				method[m++] = *arg++;
+			method[m] = '\0';
+			if (m == 0) {
+				vga_write("curl: -X needs a method\n");
+				return -1;
+			}
+		} else if (arg[1] == 'o' && (arg[2] == ' ' || arg[2] == '\0')) {
+			arg += 2;
+			while (*arg == ' ')
+				arg++;
+			int m = 0;
+			while (*arg && *arg != ' ' && m < (int)sizeof(outname) - 1)
+				outname[m++] = *arg++;
+			outname[m] = '\0';
+			if (m == 0) {
+				vga_write("curl: -o needs a filename\n");
+				return -1;
+			}
+			save = 1;
+		} else {
+			break;          /* not a known flag; treat as the URL */
+		}
+		while (*arg == ' ')
+			arg++;
+	}
+
+	struct url u;
+	if (!url_parse(arg, &u)) {
+		vga_write("curl: could not parse URL\n");
+		return -1;
+	}
+	const char *host = u.host;
+	uint16_t port = u.port ? u.port : 80;
+	int use_tls = u.is_tls;
+	curl_tls = use_tls;
+
+	/* HTTP request-target: path (defaulting to "/") plus any ?query. */
+	char path[URL_PATH_MAX + URL_QUERY_MAX + 2];
+	int tn = 0;
+	tn = append(path, tn, sizeof(path), u.path[0] ? u.path : "/");
+	if (u.has_query) {
+		tn = append(path, tn, sizeof(path), "?");
+		tn = append(path, tn, sizeof(path), u.query);
+	}
+	path[tn] = '\0';
+
+	uint8_t ip[4];
+	if (!parse_ipv4(host, ip) && !dns_resolve(host, ip)) {
+		vga_write("curl: could not resolve host: ");
+		vga_write(host);
+		vga_putc('\n');
+		return -1;
+	}
+	int ok;
+	if (use_tls) {
+		ok = tls_connect(ip, port, host);
+	} else {
+		curl_conn = tcp_connect(ip, port);
+		ok = curl_conn != NULL;
+	}
+	if (!ok) {
+		vga_write("curl: failed to connect to ");
+		print_ip(ip);
+		vga_putc('\n');
+		return -1;
+	}
+
+	char req[512];
+	int n = 0;
+	n = append(req, n, sizeof(req), method);
+	n = append(req, n, sizeof(req), " ");
+	n = append(req, n, sizeof(req), path);
+	n = append(req, n, sizeof(req), " HTTP/1.1\r\nHost: ");
+	n = append(req, n, sizeof(req), host);
+	n = append(req, n, sizeof(req),
+		   "\r\nUser-Agent: owos\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n");
+	if (use_tls)
+		tls_write(req, (uint32_t)n);
+	else
+		tcp_write(curl_conn, req, (uint32_t)n);
+
+	/* Read the header block (through the blank line) into a buffer. */
+	curl_ipos = curl_ilen = 0;
+	curl_iclosed = 0;
+	char hdr[4096];
+	int hlen = 0, match = 0;
+	for (;;) {
+		int ci = curl_getc();
+		if (ci < 0) {
+			vga_write("curl: no response from server\n");
+			if (use_tls)
+				tls_close();
+			else
+				tcp_close(curl_conn);
+			return -1;
+		}
+		char c = (char)ci;
+		if (hlen < (int)sizeof(hdr) - 1)
+			hdr[hlen++] = c;
+		if (c == '\r')
+			match = (match == 0) ? 1 : (match == 2 ? 3 : 1);
+		else if (c == '\n')
+			match = (match == 1) ? 2 : (match == 3 ? 4 : 0);
+		else
+			match = 0;
+		if (match == 4)
+			break;                        /* end of headers ("\r\n\r\n") */
+	}
+	hdr[hlen] = '\0';
+
+	if (show_headers)
+		vga_write(hdr);
+
+	/* HTTP/1.1 body framing: chunked takes precedence over Content-Length,
+	 * which takes precedence over read-until-close. */
+	int chunked = 0, have_len = 0, gz = 0;
+	uint32_t content_len = 0;
+	for (char *line = hdr; *line; ) {
+		if (ci_starts(line, "transfer-encoding:")) {
+			if (ci_in_line(line, "chunked"))
+				chunked = 1;
+		} else if (ci_starts(line, "content-encoding:")) {
+			if (ci_in_line(line, "gzip"))
+				gz = 1;
+		} else if (ci_starts(line, "content-length:")) {
+			const char *v = line + 15;            /* past "content-length:" */
+			while (*v == ' ')
+				v++;
+			uint32_t x = 0;
+			while (*v >= '0' && *v <= '9')
+				x = x * 10 + (uint32_t)(*v++ - '0');
+			content_len = x;
+			have_len = 1;
+		}
+		char *eol = line;
+		while (*eol && *eol != '\n')
+			eol++;
+		if (!*eol)
+			break;
+		line = eol + 1;
+	}
+
+	if (save && fs_stream_begin(outname) != 0) {
+		vga_write("curl: cannot open output file ");
+		vga_write(outname);
+		vga_putc('\n');
+		if (use_tls)
+			tls_close();
+		else
+			tcp_close(curl_conn);
+		return -1;
+	}
+
+	/* A gzip body is collected whole, then inflated at body_done. */
+	curl_gz = 0;
+	curl_gzof = 0;
+	curl_gzn = 0;
+	curl_gzbuf = NULL;
+	if (gz) {
+		curl_gzbuf = kmalloc(CURL_GZ_MAX);
+		if (!curl_gzbuf) {
+			vga_write("curl: out of memory for gzip body\n");
+			if (use_tls)
+				tls_close();
+			else
+				tcp_close(curl_conn);
+			if (save)
+				fs_stream_end();
+			return -1;
+		}
+		curl_gz = 1;
+	}
+
+	if (chunked) {
+		for (;;) {
+			uint32_t sz = 0;
+			int c, any = 0;
+			while ((c = curl_getc()) >= 0 && c != '\r' && c != ';') {
+				int d;
+				if (c >= '0' && c <= '9') d = c - '0';
+				else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+				else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+				else break;
+				sz = sz * 16 + (uint32_t)d;
+				any = 1;
+			}
+			while (c >= 0 && c != '\n')            /* rest of the size line */
+				c = curl_getc();
+			if (!any || sz == 0)
+				break;                        /* last chunk */
+			for (uint32_t i = 0; i < sz; i++) {
+				int b = curl_getc();
+				if (b < 0)
+					goto body_done;
+				curl_emit(save, b);
+			}
+			curl_getc();                          /* trailing CR */
+			curl_getc();                          /* trailing LF */
+		}
+	} else if (have_len) {
+		for (uint32_t i = 0; i < content_len; i++) {
+			int b = curl_getc();
+			if (b < 0)
+				break;
+			curl_emit(save, b);
+		}
+	} else {
+		int b;
+		while ((b = curl_getc()) >= 0)
+			curl_emit(save, b);
+	}
+body_done:
+	if (use_tls)
+		tls_close();
+	else
+		tcp_close(curl_conn);
+
+	/* Inflate the collected gzip body and emit it (to file or screen). */
+	if (gz) {
+		curl_gz = 0;                   /* curl_emit now really emits      */
+		int failed = 0;
+		if (curl_gzof) {
+			vga_write("curl: gzip body exceeds 1 MiB limit\n");
+			failed = 1;
+		} else {
+			int orig = gzip_orig_size(curl_gzbuf, curl_gzn);
+			uint8_t *plain = (orig >= 0)
+				? kmalloc(orig ? (uint32_t)orig : 1) : NULL;
+			int dn = (orig >= 0 && plain)
+				? gzip_decompress(curl_gzbuf, curl_gzn, plain,
+						  (uint32_t)orig)
+				: -1;
+			if (dn < 0) {
+				vga_write("curl: gzip decode failed\n");
+				failed = 1;
+			} else {
+				for (int i = 0; i < dn; i++)
+					curl_emit(save, plain[i]);
+			}
+			kfree(plain);
+		}
+		kfree(curl_gzbuf);
+		curl_gzbuf = NULL;
+		if (failed) {
+			if (save)
+				fs_stream_end();
+			return -1;
+		}
+	}
+
+	if (save) {
+		int wrote = fs_stream_end();
+		if (wrote < 0) {
+			vga_write("curl: failed to save ");
+			vga_write(outname);
+			vga_write(" (disk full or write error)\n");
+			return -1;
+		}
+		vga_write("curl: saved ");
+		vga_write_dec((uint32_t)wrote);
+		vga_write(" bytes to ");
+		vga_write(outname);
+		vga_putc('\n');
+	} else if (!curl_mem) {
+		vga_putc('\n');
+	}
+	return 0;
+}
+
+/* Fetch `url` with a plain GET, capturing the response body into buf (cap
+ * bytes). Returns the body length (truncated to cap), or -1 on error. Reuses
+ * net_curl()'s full HTTP/1.1 framing — chunked, Content-Length, and gzip. */
+int net_http_get(const char *url, uint8_t *buf, uint32_t cap)
+{
+	curl_mem = buf;
+	curl_memcap = cap;
+	curl_memlen = 0;
+	int rc = net_curl(url);
+	int n = (rc == 0) ? (int)curl_memlen : -1;
+	curl_mem = NULL;
+	return n;
+}
+
+/* ---- ring-3 socket handles ------------------------------------------------
+ * A thin, handle-based connection table so user programs (the curl in
+ * user/curl.c) can drive the kernel transport without a built-in doing the
+ * HTTP itself. Deliberately tiny: connect (DNS + TCP + optional TLS), send,
+ * recv (blocking, EOF-terminated), close. TLS is single-flow in tls.c, so at
+ * most one handle may be a TLS session at a time. */
+#define NET_SOCK_MAX 4
+static struct usock {
+	uint8_t      used;
+	uint8_t      tls;          /* this handle owns the (single) TLS session  */
+	uint8_t      closed;       /* peer FIN / close_notify already seen        */
+	tcp_conn_t  *conn;         /* bare-TCP connection (NULL while tls)         */
+} usocks[NET_SOCK_MAX];
+
+/* Resolve `host` (dotted-quad or DNS name), open TCP, optionally run the TLS
+ * handshake with SNI=host. Returns a handle 0..NET_SOCK_MAX-1, or a negative
+ * error: -1 no slot / no NIC, -2 resolve failed, -3 connect/handshake failed. */
+int net_sock_connect(const char *host, uint16_t port, int tls)
+{
+	if (!nic_present())
+		return -1;
+	int h = -1;
+	for (int i = 0; i < NET_SOCK_MAX; i++)
+		if (!usocks[i].used) { h = i; break; }
+	if (h < 0)
+		return -1;
+	if (tls)
+		for (int i = 0; i < NET_SOCK_MAX; i++)
+			if (usocks[i].used && usocks[i].tls)
+				return -1;            /* TLS is single-flow */
+
+	uint8_t ip[4];
+	if (!parse_ipv4(host, ip) && !dns_resolve(host, ip))
+		return -2;
+
+	struct usock *s = &usocks[h];
+	s->tls = tls ? 1 : 0;
+	s->closed = 0;
+	s->conn = NULL;
+	if (tls) {
+		if (!tls_connect(ip, port, host))
+			return -3;
+	} else {
+		s->conn = tcp_connect(ip, port);
+		if (!s->conn)
+			return -3;
+	}
+	s->used = 1;
+	return h;
+}
+
+int net_sock_send(int h, const void *buf, uint32_t len)
+{
+	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+		return -1;
+	struct usock *s = &usocks[h];
+	return s->tls ? tls_write(buf, len) : tcp_write(s->conn, buf, len);
+}
+
+/* Block until bytes arrive or the peer closes. Returns >0 bytes, 0 at EOF,
+ * -1 on error/reset. */
+int net_sock_recv(int h, void *buf, uint32_t max)
+{
+	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+		return -1;
+	struct usock *s = &usocks[h];
+	if (s->closed)
+		return 0;
+	int closed = 0;
+	int r = s->tls ? tls_read(buf, max, &closed)
+	               : tcp_read(s->conn, buf, max, &closed);
+	if (r < 0)
+		return -1;
+	if (closed)
+		s->closed = 1;
+	return r;
+}
+
+int net_sock_close(int h)
+{
+	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+		return -1;
+	struct usock *s = &usocks[h];
+	if (s->tls)
+		tls_close();
+	else if (s->conn)
+		tcp_close(s->conn);
+	s->used = s->tls = s->closed = 0;
+	s->conn = NULL;
+	return 0;
+}
+
+int net_ping(const char *host)
+{
+	if (!nic_present()) {
+		vga_write("ping: no network device\n");
+		return -1;
+	}
+
+	uint8_t ip[4];
+	if (!parse_ipv4(host, ip)) {
+		if (!dns_resolve(host, ip)) {
+			vga_write("ping: cannot resolve ");
+			vga_write(host);
+			vga_putc('\n');
+			return -1;
+		}
+	}
+
+	vga_write("PING ");
+	vga_write(host);
+	vga_write(" (");
+	print_ip(ip);
+	vga_write("): 32 data bytes\n");
+
+	uint16_t id = (uint16_t)(timer_ticks() ^ 0xBEEF);
+	int recv = 0;
+
+	/* Resolve the next hop up front so the per-packet send below isn't
+	 * blocked waiting on ARP — otherwise the first RTT would absorb the
+	 * ARP round-trip. */
+	uint8_t warm[6];
+	next_hop_mac(ip, warm);
+
+	for (int seq = 1; seq <= 4; seq++) {
+		icmp_got = 0;
+		uint32_t deadline = timer_ticks() + 100;   /* ~1 s                    */
+		icmp_send_us = timer_us();          /* stamp immediately before TX     */
+		icmp_send_echo(ip, id, (uint16_t)seq);
+
+		int got = 0;
+		while (timer_ticks() < deadline) {
+			__asm__ volatile ("" ::: "memory");
+			if (icmp_got && icmp_id_rx == id) {
+				got = 1;
+				break;
+			}
+			__asm__ volatile ("hlt");
+		}
+
+		if (got) {
+			recv++;
+			vga_write("64 bytes from ");
+			print_ip((const uint8_t *)icmp_from);
+			vga_write(": icmp_seq=");
+			vga_write_dec((uint32_t)icmp_seq_rx);
+			vga_write(" time=");
+			print_rtt(icmp_rtt_us);
+			vga_write(" ms\n");
+		} else {
+			vga_write("request timeout for icmp_seq=");
+			vga_write_dec((uint32_t)seq);
+			vga_putc('\n');
+		}
+
+		if (seq < 4)
+			timer_sleep(300);
+	}
+
+	vga_write("--- ");
+	vga_write(host);
+	vga_write(" ping statistics ---\n");
+	vga_write_dec(4);
+	vga_write(" packets transmitted, ");
+	vga_write_dec((uint32_t)recv);
+	vga_write(" received\n");
+	return recv > 0 ? 0 : -1;
+}
+
+void net_init(void)
+{
+	nic_init();
+	if (nic_present())
+		vga_write("net: ip 10.0.2.15 gw 10.0.2.2 dns 10.0.2.3 (try 'ping google.com')\n");
+}
