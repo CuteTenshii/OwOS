@@ -99,6 +99,14 @@ int ata_write_sector(uint32_t lba, const void *buf)
  * and fills words[] on success, -1 if no drive responds. */
 static int identify(uint16_t *words)
 {
+	/* Floating-bus check. With no IDE controller decoding these ports (e.g. an
+	 * AHCI/NVMe-only laptop), reads return 0xFF. Without this we'd mistake the
+	 * stuck-high 0xFF (BSY set) for a perpetually-busy drive and spin the full
+	 * POLL_LIMIT on every probe — ~5s of dead port reads before concluding "no
+	 * drive". Bail immediately instead. */
+	if (inb(ATA_STATUS) == 0xFF)
+		return -1;
+
 	if (wait_not_busy())
 		return -1;
 	outb(ATA_DRIVE, 0xA0);                  /* select master                    */

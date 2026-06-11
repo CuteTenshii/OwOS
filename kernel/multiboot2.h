@@ -18,6 +18,10 @@
 #define MB2_TAG_END         0
 #define MB2_TAG_MMAP        6
 #define MB2_TAG_FRAMEBUFFER 8
+#define MB2_TAG_EFI32       11   /* EFI 32-bit system table ptr (UEFI only)    */
+#define MB2_TAG_EFI64       12   /* EFI 64-bit system table ptr (UEFI only)    */
+#define MB2_TAG_ACPI_OLD    14   /* a copy of the ACPI 1.0 RSDP (RSDT path)    */
+#define MB2_TAG_ACPI_NEW    15   /* a copy of the ACPI 2.0+ RSDP (has XSDT too) */
 
 #define MB2_MEMORY_AVAILABLE 1   /* same code as multiboot1                    */
 
@@ -55,6 +59,16 @@ struct mb2_tag_framebuffer {
 	uint8_t  framebuffer_type;
 	uint16_t reserved;
 	/* color_info follows; we don't read it (we only accept 32-bpp direct RGB) */
+} __attribute__((packed));
+
+/* type 14/15: a verbatim copy of the firmware's RSDP. On UEFI this is the ONLY
+ * way to reach ACPI — the RSDP is not in the legacy BIOS memory area, so the
+ * power.c scan finds nothing without it. `rsdp` is the raw RSDP bytes (20 for
+ * v1, 36 for v2); we only need the first 20 (signature..rsdt_addr). */
+struct mb2_tag_acpi {
+	uint32_t type;
+	uint32_t size;
+	uint8_t  rsdp[];
 } __attribute__((packed));
 
 #endif /* OWOS_MULTIBOOT2_H */

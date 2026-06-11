@@ -12,6 +12,8 @@
 #define PAGE_PRESENT 0x1
 #define PAGE_RW      0x2
 #define PAGE_USER    0x4
+#define PAGE_PWT     0x8   /* write-through bit; selects PAT entry 1 here      */
+#define PAGE_PCD     0x10  /* cache-disable bit; UC- mapping for MMIO regs     */
 
 #define PD_ENTRIES   1024
 #define PT_ENTRIES   1024
@@ -51,7 +53,9 @@ uint32_t paging_kernel_phys(void)
 /* --- page-frame pool over [12 MiB, 16 MiB) (identity-mapped) --------------- */
 #define POOL_START 0x00C00000u
 #define POOL_END   0x01000000u
-#define USER_WINDOW_START 0x00200000u   /* 2 MiB: start of the per-process window */
+#define USER_WINDOW_START 0x00280000u   /* 2.5 MiB: start of the per-process window
+                                          * (kernel image + BSS now reaches ~2.1 MiB,
+                                          *  so the window starts above it) */
 
 static uint32_t pool_next = POOL_START;
 static uint32_t pool_free;              /* freelist head (0 = empty)           */
@@ -115,6 +119,16 @@ void paging_map_user_page(uint32_t *dir, uint32_t vaddr, uint32_t frame)
 		(frame & ~0xFFFu) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
 }
 
+/* Clear a single user-window PTE *without* freeing the frame. Used to detach a
+ * shared window buffer (heap-backed, not a pool frame) from a process before
+ * its dir is torn down, so paging_free_process_dir's pfree never sees a page
+ * that didn't come from the pool. */
+void paging_unmap_user_page(uint32_t *dir, uint32_t vaddr)
+{
+	uint32_t *t0 = (uint32_t *)(dir[0] & ~0xFFFu);
+	t0[(vaddr >> 12) & 0x3FF] = 0;
+}
+
 void paging_free_process_dir(uint32_t *dir)
 {
 	uint32_t *t0 = (uint32_t *)(dir[0] & ~0xFFFu);
@@ -123,6 +137,23 @@ void paging_free_process_dir(uint32_t *dir)
 			pfree((void *)(t0[i] & ~0xFFFu));   /* free private user frames    */
 	pfree(t0);
 	pfree(dir);
+}
+
+/* Is `vaddr` a present, user-accessible page in the CURRENT address space?
+ * Reads cr3 (so it works for threads, which carry dir=0) and walks the tables,
+ * all identity-mapped. Lets the crash handler probe a frame pointer before
+ * dereferencing it for a backtrace, so a corrupt one can't double-fault. */
+int paging_user_mapped(uint32_t vaddr)
+{
+	uint32_t cr3;
+	__asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+	uint32_t *pd = (uint32_t *)(cr3 & ~0xFFFu);
+	uint32_t pde = pd[vaddr >> 22];
+	if (!(pde & PAGE_PRESENT))
+		return 0;
+	uint32_t *pt = (uint32_t *)(pde & ~0xFFFu);
+	uint32_t pte = pt[(vaddr >> 12) & 0x3FF];
+	return (pte & PAGE_PRESENT) && (pte & PAGE_USER);
 }
 
 uint32_t paging_user_phys(uint32_t *dir, uint32_t vaddr)
@@ -178,4 +209,44 @@ int paging_identity_map(uint32_t phys, uint32_t len)
 		__asm__ volatile ("invlpg (%0)" : : "r"(a) : "memory");
 	}
 	return 0;
+}
+
+void paging_mark_wc(uint32_t virt, uint32_t len)
+{
+	uint32_t *dir;
+	__asm__ volatile ("mov %%cr3, %0" : "=r"(dir));
+
+	uint32_t start = virt & ~0xFFFu;
+	uint32_t stop  = (virt + len + 0xFFFu) & ~0xFFFu;
+	for (uint32_t a = start; a < stop && a >= start; a += 4096) {
+		uint32_t pdi = a >> 22;
+		uint32_t pti = (a >> 12) & 0x3FF;
+		if (!(dir[pdi] & PAGE_PRESENT))
+			continue;
+		uint32_t *pt = (uint32_t *)(dir[pdi] & ~0xFFFu);
+		if (pt[pti] & PAGE_PRESENT) {
+			pt[pti] |= PAGE_PWT;
+			__asm__ volatile ("invlpg (%0)" : : "r"(a) : "memory");
+		}
+	}
+}
+
+void paging_mark_uc(uint32_t virt, uint32_t len)
+{
+	uint32_t *dir;
+	__asm__ volatile ("mov %%cr3, %0" : "=r"(dir));
+
+	uint32_t start = virt & ~0xFFFu;
+	uint32_t stop  = (virt + len + 0xFFFu) & ~0xFFFu;
+	for (uint32_t a = start; a < stop && a >= start; a += 4096) {
+		uint32_t pdi = a >> 22;
+		uint32_t pti = (a >> 12) & 0x3FF;
+		if (!(dir[pdi] & PAGE_PRESENT))
+			continue;
+		uint32_t *pt = (uint32_t *)(dir[pdi] & ~0xFFFu);
+		if (pt[pti] & PAGE_PRESENT) {
+			pt[pti] |= PAGE_PCD;
+			__asm__ volatile ("invlpg (%0)" : : "r"(a) : "memory");
+		}
+	}
 }

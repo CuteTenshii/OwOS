@@ -78,7 +78,7 @@ struct tcp_hdr {
 #define TCP_RXBUF    65536u
 #define TCP_MAX_CONNS 8
 #define TCP_MAX_LISTEN 4
-#define TCP_SYN_RCVD_TIMEOUT 200   /* ticks (~2 s) before a half-open is reaped */
+#define TCP_SYN_RCVD_TIMEOUT (2 * TIMER_HZ)  /* ~2 s before a half-open is reaped */
 
 enum { ST_CLOSED, ST_LISTEN, ST_SYN_SENT, ST_SYN_RCVD,
        ST_ESTAB, ST_CLOSE_WAIT, ST_DONE };
@@ -395,7 +395,7 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport)
 
 	for (int tries = 0; tries < 6; tries++) {
 		tcp_send_ctl(c, TCP_SYN, isn);
-		uint32_t deadline = timer_ticks() + 50;   /* ~500 ms                 */
+		uint32_t deadline = timer_ticks() + TIMER_HZ / 2;   /* ~500 ms        */
 		while (timer_ticks() < deadline) {
 			__asm__ volatile ("" ::: "memory");
 			if (c->state == ST_ESTAB)
@@ -466,7 +466,7 @@ int tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed)
 		*closed = 1;
 		return -1;
 	}
-	uint32_t deadline = timer_ticks() + 500;       /* ~5 s idle timeout       */
+	uint32_t deadline = timer_ticks() + 5 * TIMER_HZ;   /* ~5 s idle timeout   */
 	for (;;) {
 		int r = tcp_read_nb(c, buf, max, closed);
 		if (r != 0)                            /* data, or error            */

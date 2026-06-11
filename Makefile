@@ -24,18 +24,29 @@ OBJS    := boot/boot.o kernel/kernel.o kernel/vga.o kernel/gdt.o kernel/gdt_flus
            kernel/keyboard.o kernel/timer.o kernel/shell.o kernel/serial.o \
            kernel/pmm.o kernel/paging.o kernel/heap.o kernel/kstring.o \
            kernel/sched.o kernel/switch.o \
-           kernel/ata.o kernel/ahci.o kernel/nvme.o kernel/fs.o kernel/pci.o kernel/usb.o \
-           kernel/rtl8139.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/tls.o \
+           kernel/ata.o kernel/ahci.o kernel/nvme.o kernel/blk.o kernel/fs.o kernel/pci.o kernel/usb.o kernel/xhci.o \
+           kernel/nic.o kernel/rtl8139.o kernel/e1000.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/tls.o \
            kernel/url.o kernel/zip.o kernel/gzip.o \
            kernel/bencode.o kernel/torrent.o kernel/tracker.o kernel/peer.o \
            kernel/speaker.o kernel/sb16.o \
-           kernel/cpu.o kernel/rtc.o kernel/neofetch.o kernel/power.o \
+           kernel/cpu.o kernel/rtc.o kernel/neofetch.o kernel/power.o kernel/battery.o \
+           kernel/firmware.o kernel/aml.o kernel/edid.o \
            kernel/syscall.o kernel/loader.o kernel/pipe.o kernel/services.o \
            kernel/smb.o \
-           kernel/fb.o kernel/mouse.o kernel/wm.o \
+           kernel/fb.o kernel/mouse.o kernel/wm.o kernel/uwin.o kernel/crash.o \
+           kernel/apps.o kernel/app_term.o \
            kernel/hello_blob.o kernel/worker_blob.o kernel/args_blob.o \
            kernel/pipe_blob.o kernel/produce_blob.o kernel/upper_blob.o \
-           kernel/edit_blob.o kernel/curl_blob.o
+           kernel/edit_blob.o kernel/curl_blob.o \
+           kernel/demo_blob.o kernel/editor_blob.o kernel/about_blob.o \
+           kernel/clock_blob.o kernel/files_blob.o kernel/browser_blob.o \
+           kernel/crashme_blob.o
+
+# Which NIC QEMU attaches. Default rtl8139 (QEMU's classic card); override to
+# exercise the Intel driver, e.g. `make run NIC=e1000` (82540EM) — both the
+# RTL8139 and e1000 drivers are built in and the kernel picks whichever is
+# present. (`-device e1000e`/82574L is PCIe and may need `-machine q35`.)
+NIC ?= rtl8139
 
 .PHONY: all run debug iso run-iso run-iso-uefi usb clean distclean
 
@@ -54,7 +65,7 @@ $(KERNEL): $(OBJS) linker.ld
 # Built freestanding against the tiny user lib, linked flat at 0x200000, then
 # embedded into the kernel as an object.
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -Iuser/lib -Wall
-ULIB    := user/lib/start.o user/lib/lib.o
+ULIB    := user/lib/start.o user/lib/lib.o user/lib/gfx.o
 
 user/lib/start.o: user/lib/start.S
 	$(CC) $(UCFLAGS) -c $< -o $@
@@ -66,6 +77,13 @@ user/%.o: user/%.c
 
 user/%.elf: user/%.o $(ULIB) user/user.ld
 	ld -m elf_i386 -T user/user.ld -o $@ $< $(ULIB)
+
+# The browser is a multi-file user program (user/browser/*.c), linked flat.
+BROWSER_OBJS := user/browser/main.o user/browser/fetch.o user/browser/html.o
+user/browser/%.o: user/browser/%.c
+	$(CC) $(UCFLAGS) -c $< -o $@
+user/browser.elf: $(BROWSER_OBJS) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(ULIB)
 
 # Embed each ELF as an object; gives _binary_user_<name>_elf_{start,end}.
 kernel/%_blob.o: user/%.elf
@@ -93,7 +111,7 @@ STORAGE := -hda $(DISK) \
 
 run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK)
 	qemu-system-i386 -kernel $(KERNEL) $(STORAGE) -serial stdio \
-		-netdev user,id=net0,hostfwd=tcp::1445-:445 -device rtl8139,netdev=net0 \
+		-netdev user,id=net0,hostfwd=tcp::1445-:445 -device $(NIC),netdev=net0 \
 		-audiodev pipewire,id=snd0 -machine pcspk-audiodev=snd0 \
 		-device sb16,audiodev=snd0 \
 		-usb -device usb-tablet
@@ -101,7 +119,7 @@ run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK)
 # Headless: no window, console comes out on the terminal via COM1.
 debug: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK)
 	qemu-system-i386 -kernel $(KERNEL) -display none $(STORAGE) -serial stdio \
-		-netdev user,id=net0,hostfwd=tcp::1445-:445 -device rtl8139,netdev=net0 \
+		-netdev user,id=net0,hostfwd=tcp::1445-:445 -device $(NIC),netdev=net0 \
 		-usb -device usb-tablet
 
 # --- bootable ISO ----------------------------------------------------------

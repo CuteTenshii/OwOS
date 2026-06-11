@@ -3,6 +3,7 @@
 #include "timer.h"
 #include "irq.h"
 #include "io.h"
+#include "nic.h"
 
 #define PIT_BASE_HZ   1193182      /* the PIT's fixed input frequency        */
 #define PIT_CH0_DATA  0x40
@@ -26,6 +27,7 @@ static void timer_handler(struct registers *r)
 {
 	(void)r;
 	ticks++;
+	nic_poll();                    /* IRQ-independent NIC RX drain (VMware etc.) */
 	if (tick_cb)
 		tick_cb();             /* e.g. the scheduler preempts here        */
 }

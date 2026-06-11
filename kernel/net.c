@@ -19,7 +19,7 @@
 #include <stddef.h>
 
 #include "net.h"
-#include "rtl8139.h"
+#include "nic.h"
 #include "tcp.h"
 #include "tls.h"
 #include "timer.h"
@@ -29,6 +29,7 @@
 #include "url.h"
 #include "gzip.h"
 #include "heap.h"
+#include "sched.h"
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -111,11 +112,12 @@ struct dns_hdr {
 
 /* ------------------------------------------------------------------- config */
 
-/* The fixed SLIRP virtual network, as raw network-order octets. */
-static const uint8_t my_ip[4]   = { 10, 0, 2, 15 };
-static const uint8_t gw_ip[4]   = { 10, 0, 2, 2 };
-static const uint8_t dns_ip[4]  = { 10, 0, 2, 3 };
-static const uint8_t netmask[4] = { 255, 255, 255, 0 };
+/* Defaults match QEMU's SLIRP virtual network; DHCP overwrites them on a real
+ * link (e.g. a tethered phone, which is on 192.168.x). Mutable for that reason. */
+static uint8_t my_ip[4]   = { 10, 0, 2, 15 };
+static uint8_t gw_ip[4]   = { 10, 0, 2, 2 };
+static uint8_t dns_ip[4]  = { 10, 0, 2, 3 };
+static uint8_t netmask[4] = { 255, 255, 255, 0 };
 
 #define ARP_CACHE 8
 static struct arp_entry {
@@ -244,7 +246,7 @@ static int arp_resolve(const uint8_t ip[4], uint8_t out[6])
 		return 1;
 	for (int tries = 0; tries < 4; tries++) {
 		arp_request(ip);
-		uint32_t deadline = timer_ticks() + 25;   /* ~250 ms                 */
+		uint32_t deadline = timer_ticks() + TIMER_HZ / 4;   /* ~250 ms        */
 		while (timer_ticks() < deadline) {
 			__asm__ volatile ("" ::: "memory");
 			if (arp_lookup(ip, out))
@@ -683,6 +685,149 @@ static void print_ip(const uint8_t ip[4])
 	}
 }
 
+/* --------------------------------------------------------------------- DHCP */
+/* A minimal DHCP client: DISCOVER -> OFFER -> REQUEST -> ACK, then apply the
+ * lease (IP/mask/gateway/DNS). Needed on a real link like a tethered phone,
+ * which is on its own subnet (e.g. 192.168.42.x) rather than QEMU's SLIRP. The
+ * client runs in its own thread so it can block while the USB/NIC RX path (a
+ * different thread) feeds replies in through dhcp_recv. */
+
+static volatile int dhcp_state;        /* 0 init, 2 offered, 4 acked            */
+static uint8_t dhcp_xid[4]      = { 'O', 'w', 'O', 'S' };
+static uint8_t dhcp_offered[4];
+static uint8_t dhcp_server[4];
+static uint8_t dhcp_mask[4]     = { 255, 255, 255, 0 };
+static uint8_t dhcp_router[4];
+static uint8_t dhcp_dns[4];
+static int     dhcp_have_router, dhcp_have_dns;
+
+/* Build a BOOTP/DHCP message (type 1=DISCOVER, 3=REQUEST) into out[]. Returns
+ * its length. */
+static uint32_t dhcp_build(uint8_t msgtype, uint8_t *out)
+{
+	for (int i = 0; i < 300; i++) out[i] = 0;
+	out[0] = 1; out[1] = 1; out[2] = 6;          /* op=request, ethernet, hlen 6 */
+	kmemcpy(out + 4, dhcp_xid, 4);               /* transaction id               */
+	out[10] = 0x80;                              /* flags: broadcast the reply   */
+	kmemcpy(out + 28, nic_mac(), 6);             /* chaddr                       */
+	out[236] = 0x63; out[237] = 0x82;            /* magic cookie 63 82 53 63     */
+	out[238] = 0x53; out[239] = 0x63;
+	int o = 240;
+	out[o++] = 53; out[o++] = 1; out[o++] = msgtype;          /* message type    */
+	if (msgtype == 3) {                          /* REQUEST carries the choices  */
+		out[o++] = 50; out[o++] = 4; kmemcpy(out + o, dhcp_offered, 4); o += 4;
+		out[o++] = 54; out[o++] = 4; kmemcpy(out + o, dhcp_server, 4);  o += 4;
+	}
+	out[o++] = 55; out[o++] = 3;                 /* parameter request list       */
+	out[o++] = 1;  out[o++] = 3; out[o++] = 6;   /* mask, router, DNS            */
+	out[o++] = 255;                              /* end                          */
+	return (uint32_t)o;
+}
+
+/* Broadcast a DHCP message (src 0.0.0.0:68 -> 255.255.255.255:67), built raw
+ * because ip_send would stamp our (not-yet-assigned) IP and try to ARP it. */
+static void dhcp_xmit(const uint8_t *dhcp, uint32_t dlen)
+{
+	static const uint8_t bmac[6] = { 0xff,0xff,0xff,0xff,0xff,0xff };
+	uint8_t buf[20 + 8 + 300];
+	struct ip_hdr  *ip = (struct ip_hdr *)buf;
+	struct udp_hdr *u  = (struct udp_hdr *)(buf + 20);
+	uint32_t ulen = 8 + dlen;
+
+	ip->ver_ihl = 0x45; ip->tos = 0; ip->len = htons(20 + ulen);
+	ip->id = htons(ip_ident++); ip->frag = htons(0x4000);
+	ip->ttl = 64; ip->proto = IP_UDP; ip->csum = 0;
+	for (int i = 0; i < 4; i++) { ip->src[i] = 0; ip->dst[i] = 0xff; }
+	ip->csum = htons(inet_csum(buf, 20));
+	u->sport = htons(68); u->dport = htons(67); u->len = htons(ulen); u->csum = 0;
+	kmemcpy(buf + 28, dhcp, dlen);
+	eth_send(bmac, ETH_IP, buf, 20 + ulen);
+}
+
+/* RX handler bound to UDP port 68: parse an OFFER or ACK and stash the lease. */
+static void dhcp_recv(const uint8_t src[4], uint16_t sport,
+                      const uint8_t *p, uint32_t len)
+{
+	(void)src; (void)sport;
+	if (len < 240 || nmemcmp(p + 4, dhcp_xid, 4) != 0)
+		return;
+	uint8_t mtype = 0;
+	for (uint32_t i = 240; i + 1 < len; ) {
+		uint8_t opt = p[i++];
+		if (opt == 0) continue;                  /* pad                          */
+		if (opt == 255) break;                   /* end                          */
+		uint8_t olen = p[i++];
+		if (i + olen > len) break;
+		if (opt == 53 && olen >= 1)      mtype = p[i];
+		else if (opt == 1 && olen >= 4)  kmemcpy(dhcp_mask, p + i, 4);
+		else if (opt == 3 && olen >= 4){ kmemcpy(dhcp_router, p + i, 4); dhcp_have_router = 1; }
+		else if (opt == 6 && olen >= 4){ kmemcpy(dhcp_dns, p + i, 4);    dhcp_have_dns = 1; }
+		else if (opt == 54 && olen >= 4) kmemcpy(dhcp_server, p + i, 4);
+		i += olen;
+	}
+	kmemcpy(dhcp_offered, p + 16, 4);            /* yiaddr                       */
+	if (mtype == 2 && dhcp_state < 2) dhcp_state = 2;       /* OFFER             */
+	else if (mtype == 5)              dhcp_state = 4;       /* ACK               */
+}
+
+/* Run the DHCP exchange and apply the lease. Returns 0 on success. */
+static int dhcp_run(void)
+{
+	uint8_t pkt[300];
+	dhcp_state = 0;
+	net_udp_listen(68, dhcp_recv);
+
+	for (int t = 0; t < 6 && dhcp_state < 2; t++) {        /* DISCOVER          */
+		dhcp_xmit(pkt, dhcp_build(1, pkt));
+		for (int w = 0; w < 60 && dhcp_state < 2; w++)
+			timer_sleep(10);                              /* ~600ms per try    */
+	}
+	if (dhcp_state < 2) { net_udp_unlisten(68); return -1; }
+
+	for (int t = 0; t < 6 && dhcp_state < 4; t++) {        /* REQUEST           */
+		dhcp_xmit(pkt, dhcp_build(3, pkt));
+		for (int w = 0; w < 60 && dhcp_state < 4; w++)
+			timer_sleep(10);
+	}
+	net_udp_unlisten(68);
+	if (dhcp_state < 4)
+		return -1;
+
+	kmemcpy(my_ip, dhcp_offered, 4);
+	kmemcpy(netmask, dhcp_mask, 4);
+	if (dhcp_have_router) kmemcpy(gw_ip, dhcp_router, 4);
+	if (dhcp_have_dns)    kmemcpy(dns_ip, dhcp_dns, 4);
+	for (int i = 0; i < ARP_CACHE; i++)          /* subnet changed              */
+		arp_cache[i].valid = 0;
+	return 0;
+}
+
+static void dhcp_thread(void)
+{
+	if (dhcp_run() == 0) {
+		vga_write("dhcp: ip ");  print_ip(my_ip);
+		vga_write(" gw ");       print_ip(gw_ip);
+		vga_write(" dns ");      print_ip(dns_ip);
+		vga_putc('\n');
+	} else {
+		vga_write("dhcp: no lease\n");
+	}
+	for (;;)                                     /* threads can't be reaped     */
+		timer_sleep(60000);
+}
+
+/* Kick off DHCP on a freshly-up link: at boot once a PCI NIC is found, and again
+ * when the RNDIS tethering NIC registers. No-op with no NIC so a netless boot
+ * doesn't spawn a thread that just times out. On QEMU's SLIRP this re-leases the
+ * same 10.0.2.15 the static defaults already use; on a real link (VMware NAT, a
+ * tethered phone, bare-metal Ethernet) it's the only way to get a routable IP. */
+void net_dhcp_start(void)
+{
+	if (!nic_present())
+		return;
+	sched_create_thread("dhcp", dhcp_thread);
+}
+
 /* Print a microsecond duration as milliseconds with 3 decimals (e.g. 1.234). */
 static void print_rtt(uint32_t us)
 {
@@ -714,7 +859,7 @@ static int dns_query(const char *host, uint16_t qtype)
 		dns_ans_count = 0;
 		dns_send_us = timer_us();
 		dns_send_query(dns_qid, host, qtype);
-		uint32_t deadline = timer_ticks() + 200;   /* ~2 s                    */
+		uint32_t deadline = timer_ticks() + 2 * TIMER_HZ;   /* ~2 s            */
 		while (timer_ticks() < deadline) {
 			__asm__ volatile ("" ::: "memory");
 			if (dns_got)
@@ -1384,7 +1529,7 @@ int net_ping(const char *host)
 
 	for (int seq = 1; seq <= 4; seq++) {
 		icmp_got = 0;
-		uint32_t deadline = timer_ticks() + 100;   /* ~1 s                    */
+		uint32_t deadline = timer_ticks() + TIMER_HZ;   /* ~1 s                */
 		icmp_send_us = timer_us();          /* stamp immediately before TX     */
 		icmp_send_echo(ip, id, (uint16_t)seq);
 

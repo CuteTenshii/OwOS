@@ -1,17 +1,18 @@
 /* fs.c — owofs implementation (see fs.h for the on-disk layout). */
 
 #include "fs.h"
-#include "ata.h"
+#include "blk.h"
 #include "vga.h"
 #include "rtc.h"
 
 #define SECTOR_SIZE     512
-#define FS_MAGIC        0x4F574F33u    /* "OWO3" (bumped: dirents form a tree)  */
-#define FS_MAX_FILES    16
+#define FS_MAGIC        0x4F574F34u    /* "OWO4" (bumped: 32-entry, 2-sector dir) */
+#define FS_MAX_FILES    32             /* 32 entries -> a 2-sector directory      */
 #define FS_NAME_LEN     18             /* per-component name: up to 17 + NUL    */
 #define SUPER_LBA       0
 #define DIR_LBA         1
-#define DATA_LBA        2
+#define DIR_SECTORS     ((FS_MAX_FILES * 32 + SECTOR_SIZE - 1) / SECTOR_SIZE)
+#define DATA_LBA        (DIR_LBA + DIR_SECTORS)   /* data starts past the dir   */
 #define FS_MAX_SECTORS  32768          /* 16 MiB disk image                   */
 
 #define FS_DIR_FLAG     0x01u          /* dirent.flags: entry is a directory    */
@@ -39,6 +40,21 @@ struct super {
 static struct super  sb;
 static struct dirent dir[FS_MAX_FILES];
 static int           mounted;
+
+/* The directory table spans DIR_SECTORS consecutive sectors from DIR_LBA. */
+static void dir_load(void)
+{
+	for (int i = 0; i < DIR_SECTORS; i++)
+		blk_read_sector(DIR_LBA + i, (uint8_t *)dir + i * SECTOR_SIZE);
+}
+
+static int dir_store(void)
+{
+	for (int i = 0; i < DIR_SECTORS; i++)
+		if (blk_write_sector(DIR_LBA + i, (uint8_t *)dir + i * SECTOR_SIZE) != 0)
+			return -1;
+	return 0;
+}
 
 static int name_eq(const char *a, const char *b)
 {
@@ -192,25 +208,38 @@ void fs_format(void)
 		dir[i].start = 0;
 		dir[i].mtime = 0;
 	}
-	ata_write_sector(SUPER_LBA, &sb);
-	ata_write_sector(DIR_LBA, dir);
+	blk_write_sector(SUPER_LBA, &sb);
+	dir_store();
 	mounted = 1;
 }
 
 void fs_init(void)
 {
-	if (ata_read_sector(SUPER_LBA, &sb) != 0) {
-		vga_write("fs: no disk found.\n");
-		mounted = 0;
+	int have = (blk_read_sector(SUPER_LBA, &sb) == 0);
+
+	if (have && sb.magic == FS_MAGIC) {        /* a real owofs disk -- mount it  */
+		dir_load();
+		mounted = 1;
 		return;
 	}
-	if (sb.magic != FS_MAGIC) {
-		vga_write("fs: unformatted disk -- creating owofs.\n");
+	if (have && blk_is_ide()) {                /* blank IDE dev disk -- make owofs*/
+		vga_write("fs: unformatted IDE disk -- creating owofs.\n");
 		fs_format();
 		return;
 	}
-	ata_read_sector(DIR_LBA, dir);
-	mounted = 1;
+
+	/* No usable persistent disk: either no controller at all, or an AHCI/NVMe
+	 * disk that is the user's OS drive and must NOT be auto-formatted (it has no
+	 * owofs magic because it holds a real partition table). Fall back to a
+	 * volatile RAM-backed filesystem so the system still has a working fs; the
+	 * real disk is only ever read (sector 0 above), never written. */
+	if (blk_use_ram() == 0) {
+		vga_write("fs: no owofs disk -- using RAM (tmpfs; not persistent).\n");
+		fs_format();                       /* formats + mounts the RAM disk   */
+		return;
+	}
+	vga_write("fs: no disk and RAM fs unavailable.\n");
+	mounted = 0;
 }
 
 /* Print a zero-padded decimal of the given width (1..) */
@@ -294,7 +323,7 @@ int fs_read(const char *name, void *buf, uint32_t maxlen)
 	uint32_t copied = 0;
 
 	for (uint32_t s = 0; s < sectors; s++) {
-		if (ata_read_sector(dir[i].start + s, tmp) != 0)
+		if (blk_read_sector(dir[i].start + s, tmp) != 0)
 			return -1;
 		uint32_t chunk = (want - copied) < SECTOR_SIZE
 		                 ? (want - copied) : SECTOR_SIZE;
@@ -335,7 +364,7 @@ int fs_read_at(const char *name, uint32_t offset, void *buf, uint32_t len)
 		uint32_t pos   = offset + copied;
 		uint32_t sec   = dir[i].start + pos / SECTOR_SIZE;
 		uint32_t soff  = pos % SECTOR_SIZE;
-		if (ata_read_sector(sec, tmp) != 0)
+		if (blk_read_sector(sec, tmp) != 0)
 			return (int)copied;       /* partial read on I/O error */
 		uint32_t chunk = SECTOR_SIZE - soff;
 		if (chunk > want - copied)
@@ -383,7 +412,7 @@ int fs_create(const char *name, const void *data, uint32_t size)
 		                 ? (size - written) : SECTOR_SIZE;
 		for (uint32_t k = 0; k < chunk; k++)
 			tmp[k] = ((const uint8_t *)data)[written + k];
-		if (ata_write_sector(start + s, tmp) != 0)
+		if (blk_write_sector(start + s, tmp) != 0)
 			return -1;
 		written += chunk;
 	}
@@ -395,9 +424,9 @@ int fs_create(const char *name, const void *data, uint32_t size)
 	dir[slot].start = start;
 	dir[slot].mtime = pack_now();
 
-	if (ata_write_sector(SUPER_LBA, &sb) != 0)
+	if (blk_write_sector(SUPER_LBA, &sb) != 0)
 		return -1;
-	if (ata_write_sector(DIR_LBA, dir) != 0)
+	if (dir_store() != 0)
 		return -1;
 	return 0;
 }
@@ -423,7 +452,7 @@ int fs_delete(const char *name)
 	if (dir[i].flags & FS_DIR_FLAG)
 		return -2;                                 /* it's a directory -> fs_rmdir    */
 	slot_clear(i);
-	return (ata_write_sector(DIR_LBA, dir) == 0) ? 0 : -1;
+	return (dir_store() == 0) ? 0 : -1;
 }
 
 int fs_rename(const char *old, const char *neu)
@@ -459,7 +488,7 @@ int fs_rename(const char *old, const char *neu)
 	name_copy(dir[src].name, dleaf);
 	dir[src].parent = (uint8_t)dparent;
 	dir[src].mtime = pack_now();
-	return (ata_write_sector(DIR_LBA, dir) == 0) ? 0 : -1;
+	return (dir_store() == 0) ? 0 : -1;
 }
 
 int fs_mkdir(const char *path)
@@ -481,7 +510,7 @@ int fs_mkdir(const char *path)
 	dir[slot].size = 0;
 	dir[slot].start = 0;
 	dir[slot].mtime = pack_now();
-	return (ata_write_sector(DIR_LBA, dir) == 0) ? 0 : -1;
+	return (dir_store() == 0) ? 0 : -1;
 }
 
 int fs_rmdir(const char *path)
@@ -497,7 +526,7 @@ int fs_rmdir(const char *path)
 		if (dir[i].name[0] && dir[i].parent == (uint8_t)s)
 			return -3;
 	slot_clear(s);
-	return (ata_write_sector(DIR_LBA, dir) == 0) ? 0 : -1;
+	return (dir_store() == 0) ? 0 : -1;
 }
 
 int fs_isdir(const char *path)
@@ -540,7 +569,7 @@ int fs_prealloc(const char *name, uint32_t size)
 	for (int k = 0; k < SECTOR_SIZE; k++)
 		zero[k] = 0;
 	for (uint32_t s = 0; s < sectors; s++)
-		if (ata_write_sector(start + s, zero) != 0)
+		if (blk_write_sector(start + s, zero) != 0)
 			return -1;                         /* leave next_free untouched */
 
 	sb.next_free += sectors;                           /* commit the reservation */
@@ -551,9 +580,9 @@ int fs_prealloc(const char *name, uint32_t size)
 	dir[slot].start = start;
 	dir[slot].mtime = pack_now();
 
-	if (ata_write_sector(SUPER_LBA, &sb) != 0)
+	if (blk_write_sector(SUPER_LBA, &sb) != 0)
 		return -1;
-	if (ata_write_sector(DIR_LBA, dir) != 0)
+	if (dir_store() != 0)
 		return -1;
 	return 0;
 }
@@ -579,12 +608,12 @@ int fs_write_at(const char *name, uint32_t offset, const void *data, uint32_t le
 				chunk = len - written;
 
 			if (soff != 0 || chunk != SECTOR_SIZE) {  /* partial: read-modify-write */
-				if (ata_read_sector(sec, tmp) != 0)
+				if (blk_read_sector(sec, tmp) != 0)
 					return -1;
 			}
 			for (uint32_t k = 0; k < chunk; k++)
 				tmp[soff + k] = p[written + k];
-			if (ata_write_sector(sec, tmp) != 0)
+			if (blk_write_sector(sec, tmp) != 0)
 				return -1;
 			written += chunk;
 		}
@@ -633,7 +662,7 @@ int fs_stream_write(const void *data, uint32_t size)
 		strm_size++;
 		if (strm_fill == SECTOR_SIZE) {
 			if (strm_start + strm_sectors >= FS_MAX_SECTORS ||
-			    ata_write_sector(strm_start + strm_sectors, strm_buf) != 0) {
+			    blk_write_sector(strm_start + strm_sectors, strm_buf) != 0) {
 				strm_active = 0;       /* disk full / I/O error: bail out */
 				return -1;
 			}
@@ -654,7 +683,7 @@ int fs_stream_end(void)
 		for (uint32_t k = strm_fill; k < SECTOR_SIZE; k++)
 			strm_buf[k] = 0;
 		if (strm_start + strm_sectors >= FS_MAX_SECTORS ||
-		    ata_write_sector(strm_start + strm_sectors, strm_buf) != 0)
+		    blk_write_sector(strm_start + strm_sectors, strm_buf) != 0)
 			return -1;
 		strm_sectors++;
 		strm_fill = 0;
@@ -676,9 +705,9 @@ int fs_stream_end(void)
 	dir[slot].start = strm_start;
 	dir[slot].mtime = pack_now();
 
-	if (ata_write_sector(SUPER_LBA, &sb) != 0)
+	if (blk_write_sector(SUPER_LBA, &sb) != 0)
 		return -1;
-	if (ata_write_sector(DIR_LBA, dir) != 0)
+	if (dir_store() != 0)
 		return -1;
 	return (int)strm_size;
 }

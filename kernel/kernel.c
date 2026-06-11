@@ -13,15 +13,18 @@
 #include "keyboard.h"
 #include "multiboot.h"
 #include "multiboot2.h"
+#include "firmware.h"
 #include "fs.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "blk.h"
 #include "net.h"
 #include "heap.h"
 #include "loader.h"
 #include "paging.h"
 #include "pci.h"
 #include "pmm.h"
+#include "power.h"
 #include "sched.h"
 #include "services.h"
 #include "syscall.h"
@@ -32,6 +35,7 @@
 #include "vga.h"
 #include "fb.h"
 #include "wm.h"
+#include "xhci.h"
 
 /* Two CPU-bound kernel threads that never yield. If scheduling were
  * cooperative the first one would hang the machine; under preemption the
@@ -63,6 +67,7 @@ static struct multiboot_info *multiboot2_to_info(uint32_t info_addr)
 		mz[i] = 0;
 
 	int mmap_used = 0;
+	int uefi = 0;
 	/* The info block starts with total_size + reserved (8 bytes), then tags. */
 	uint8_t *p = (uint8_t *)info_addr + 8;
 	for (;;) {
@@ -95,10 +100,24 @@ static struct multiboot_info *multiboot2_to_info(uint32_t info_addr)
 			m->framebuffer_bpp    = fbt->framebuffer_bpp;
 			m->framebuffer_type   = fbt->framebuffer_type;
 			m->flags |= MULTIBOOT_FLAG_FB;
+		} else if (tag->type == MB2_TAG_ACPI_OLD ||
+		           tag->type == MB2_TAG_ACPI_NEW) {
+			/* The firmware's RSDP. On UEFI it's not in the legacy BIOS area,
+			 * so hand it to power.c now (we're still pre-paging and the whole
+			 * 4 GiB is flat) — it stashes a copy so shutdown can reach ACPI. */
+			struct mb2_tag_acpi *a = (struct mb2_tag_acpi *)p;
+			acpi_set_rsdp(a->rsdp);
+		} else if (tag->type == MB2_TAG_EFI32 ||
+		           tag->type == MB2_TAG_EFI64) {
+			/* GRUB only hands us an EFI system-table tag on a UEFI boot;
+			 * legacy BIOS / CSM carries none. */
+			uefi = 1;
 		}
 
 		p += (tag->size + 7) & ~7u;    /* tags are 8-byte aligned             */
 	}
+
+	firmware_set(uefi ? FIRMWARE_UEFI : FIRMWARE_BIOS);
 
 	if (mmap_used) {
 		m->flags     |= MULTIBOOT_FLAG_MMAP;
@@ -138,12 +157,21 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	vga_write_dec((mbi->flags & MULTIBOOT_FLAG_MMAP) ? 1 : 0);
 	vga_write(" entries=");
 	vga_write_dec(mbi->mmap_length / 24);   /* synth/E820 entries are 24 bytes  */
+	vga_write(" firmware=");
+	vga_write(firmware_name());
 	vga_putc('\n');
 
 	pmm_init(mbi);                 /* read the memory map, track frames       */
 	vga_write("pmm: ");
-	vga_write_dec(pmm_total_bytes() / (1024 * 1024));
-	vga_write(" MiB RAM detected.\n");
+	vga_write_dec(pmm_installed_kib() / 1024);
+	vga_write(" MiB RAM detected");
+	if (pmm_installed_kib() > pmm_total_kib()) {
+		/* 32-bit, no PAE: we can only manage the low 4 GiB of it. */
+		vga_write(" (");
+		vga_write_dec(pmm_total_kib() / 1024);
+		vga_write(" MiB usable)");
+	}
+	vga_write(".\n");
 
 	paging_init();                 /* identity-map low 16 MiB, enable paging  */
 	vga_write("paging: enabled (low 16 MiB identity-mapped).\n");
@@ -185,10 +213,11 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
 	net_init();                    /* bring up the RTL8139 NIC, if present     */
 
-	fs_init();                     /* mount (or format) the ATA disk          */
-
 	ahci_init();                   /* bring up a SATA disk via AHCI, if present */
 	nvme_init();                   /* bring up an NVMe namespace, if present    */
+
+	blk_init();                    /* pick owofs's backing disk: IDE>AHCI>NVMe */
+	fs_init();                     /* mount it (auto-format only the IDE disk) */
 
 	syscall_init();                /* int 0x80 gate (DPL 3)                   */
 
@@ -210,6 +239,20 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		extern const unsigned char _binary_user_edit_elf_end[];
 		extern const unsigned char _binary_user_curl_elf_start[];
 		extern const unsigned char _binary_user_curl_elf_end[];
+		extern const unsigned char _binary_user_demo_elf_start[];
+		extern const unsigned char _binary_user_demo_elf_end[];
+		extern const unsigned char _binary_user_editor_elf_start[];
+		extern const unsigned char _binary_user_editor_elf_end[];
+		extern const unsigned char _binary_user_about_elf_start[];
+		extern const unsigned char _binary_user_about_elf_end[];
+		extern const unsigned char _binary_user_clock_elf_start[];
+		extern const unsigned char _binary_user_clock_elf_end[];
+		extern const unsigned char _binary_user_files_elf_start[];
+		extern const unsigned char _binary_user_files_elf_end[];
+		extern const unsigned char _binary_user_browser_elf_start[];
+		extern const unsigned char _binary_user_browser_elf_end[];
+		extern const unsigned char _binary_user_crashme_elf_start[];
+		extern const unsigned char _binary_user_crashme_elf_end[];
 		char probe;
 		/* A Unix-like layout: programs in /bin, a home for the user. mkdir is
 		 * a no-op if the directory already exists from a previous boot. */
@@ -248,6 +291,34 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			fs_create("/bin/curl", _binary_user_curl_elf_start,
 			          (uint32_t)(_binary_user_curl_elf_end -
 			                     _binary_user_curl_elf_start));
+		if (fs_read("/bin/demo", &probe, 0) < 0)
+			fs_create("/bin/demo", _binary_user_demo_elf_start,
+			          (uint32_t)(_binary_user_demo_elf_end -
+			                     _binary_user_demo_elf_start));
+		if (fs_read("/bin/editor", &probe, 0) < 0)
+			fs_create("/bin/editor", _binary_user_editor_elf_start,
+			          (uint32_t)(_binary_user_editor_elf_end -
+			                     _binary_user_editor_elf_start));
+		if (fs_read("/bin/about", &probe, 0) < 0)
+			fs_create("/bin/about", _binary_user_about_elf_start,
+			          (uint32_t)(_binary_user_about_elf_end -
+			                     _binary_user_about_elf_start));
+		if (fs_read("/bin/clock", &probe, 0) < 0)
+			fs_create("/bin/clock", _binary_user_clock_elf_start,
+			          (uint32_t)(_binary_user_clock_elf_end -
+			                     _binary_user_clock_elf_start));
+		if (fs_read("/bin/files", &probe, 0) < 0)
+			fs_create("/bin/files", _binary_user_files_elf_start,
+			          (uint32_t)(_binary_user_files_elf_end -
+			                     _binary_user_files_elf_start));
+		if (fs_read("/bin/browser", &probe, 0) < 0)
+			fs_create("/bin/browser", _binary_user_browser_elf_start,
+			          (uint32_t)(_binary_user_browser_elf_end -
+			                     _binary_user_browser_elf_start));
+		if (fs_read("/bin/crashme", &probe, 0) < 0)
+			fs_create("/bin/crashme", _binary_user_crashme_elf_start,
+			          (uint32_t)(_binary_user_crashme_elf_end -
+			                     _binary_user_crashme_elf_start));
 	}
 	vga_write("usermode: ready ('run hello').\n");
 
@@ -266,6 +337,14 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
 	__asm__ volatile ("sti");      /* interrupts on; preemption begins        */
 
+	net_dhcp_start();              /* lease IP/gw/dns on the boot NIC (post-sti:  */
+	                               /* uses timer_sleep). No-op if no NIC; on QEMU */
+	                               /* SLIRP re-leases the 10.0.2.15 default.      */
+
+	xhci_boot();                   /* USB host up + devices configured (post-sti: */
+	                               /* uses timer_sleep). Keeps a tethered phone   */
+	                               /* offering USB tethering without running lsusb.*/
+
 	shell_init();
 
 	for (;;) {
@@ -273,9 +352,10 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			shell_interrupt();
 		char c;
 		while (keyboard_poll(&c))          /* PS/2 keyboard (the QEMU window)  */
-			shell_feed(c);
+			if (!wm_feed_key(c))           /* focused GUI app first, else shell */
+				shell_feed(c);
 		while (serial_poll(&c))            /* host terminal (-serial stdio)    */
-			shell_feed(c);
+			shell_feed(c);                 /* the debug console always drives shell */
 		__asm__ volatile ("hlt");  /* sleep until the next interrupt          */
 	}
 }

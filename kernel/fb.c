@@ -95,6 +95,31 @@ static void mark(int x, int y, int w, int h)
 
 static void alloc_backbuffer(void);
 
+/* Make the visible framebuffer write-combining. On real GPUs VRAM defaults to
+ * uncached, so each store is its own slow bus transaction; write-combining lets
+ * the CPU batch them into bursts — the single biggest win for the per-frame
+ * copy. We program PAT entry 1 to WC and tag the framebuffer's PTEs to use it.
+ * A no-op (harmless) under QEMU, whose "VRAM" is host RAM. */
+static void enable_wc(void)
+{
+	uint32_t a, b, c, d;
+	__asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+	                          : "a"(1), "c"(0));
+	if (!(d & (1u << 16)))         /* CPUID.01H:EDX.PAT — no PAT, give up      */
+		return;
+
+	/* Read IA32_PAT (MSR 0x277), set entry 1 (PA1) to WC (0x01), write it back.
+	 * Editing only PA1 preserves whatever the firmware set for the rest. */
+	uint32_t lo, hi;
+	__asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x277));
+	lo = (lo & ~0x0000FF00u) | (0x01u << 8);
+	__asm__ volatile ("wrmsr" : : "a"(lo), "d"(hi), "c"(0x277));
+
+	/* Drop any cached lines for the framebuffer, then switch it to WC. */
+	__asm__ volatile ("wbinvd" ::: "memory");
+	paging_mark_wc((uint32_t)front, fb_pixels * 4);
+}
+
 static void dispi_write(uint16_t index, uint16_t value)
 {
 	outw(VBE_DISPI_INDEX, index);
@@ -157,6 +182,7 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
 	fb_pitch = pitch_px;
 	fb_pixels = pixels;
 
+	enable_wc();               /* write-combining on the framebuffer          */
 	alloc_backbuffer();        /* off-screen buffer in cached RAM              */
 
 	active = 1;
@@ -223,6 +249,7 @@ int fb_init(uint32_t want_w, uint32_t want_h)
 	if (paging_identity_map(lfb, fb_pixels * 4) < 0)
 		return -1;
 	front = (uint32_t *)lfb;
+	enable_wc();
 	alloc_backbuffer();
 
 	active = 1;
@@ -249,6 +276,12 @@ void fb_present(void)
 		for (int x = 0; x < dirty_x1 - dirty_x0; x++)
 			d[x] = s[x];
 	}
+	/* Drain the write-combining buffer to VRAM. The front buffer is WC
+	 * (enable_wc), so these stores otherwise linger in the CPU's WC buffer and
+	 * don't reach the panel until some later eviction — which is why a small
+	 * present (clock tick, cursor move) stayed invisible on real hardware until
+	 * a burst of input forced a flush. SFENCE makes the frame appear now. */
+	__asm__ volatile ("sfence" ::: "memory");
 	dirty_x1 = dirty_x0;           /* mark the damage box empty again           */
 }
 

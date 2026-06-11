@@ -90,17 +90,12 @@ static int      tx_cur;
 
 /* ----------------------------------------------------------------- exported */
 
-int nic_present(void)
-{
-	return nic_found;
-}
-
-const uint8_t *nic_mac(void)
+static const uint8_t *rtl8139_mac(void)
 {
 	return mac;
 }
 
-void nic_send(const uint8_t *frame, uint32_t len)
+static void rtl8139_send(const uint8_t *frame, uint32_t len)
 {
 	if (!nic_found || len > 1514)
 		return;
@@ -157,7 +152,7 @@ static void rtl_irq(struct registers *r)
 
 /* --------------------------------------------------------------------- init */
 
-void nic_init(void)
+static int rtl8139_probe(void)
 {
 	int found = 0;
 	uint8_t bus = 0, slot = 0, func = 0;
@@ -177,10 +172,8 @@ void nic_init(void)
 			}
 		}
 	}
-	if (!found) {
-		vga_write("net: no RTL8139 NIC found\n");
-		return;
-	}
+	if (!found)
+		return 0;               /* silent: the dispatch layer reports "no NIC" */
 
 	uint32_t bar0 = pci_read32(bus, slot, func, 0x10);
 	uint8_t  irq  = (uint8_t)(pci_read32(bus, slot, func, 0x3C) & 0xFF);
@@ -195,12 +188,12 @@ void nic_init(void)
 		tx_buf[i] = kmalloc(2048);
 	if (!rx_buf) {
 		vga_write("net: RX buffer allocation failed\n");
-		return;
+		return 0;
 	}
 	for (int i = 0; i < TX_BUFS; i++) {
 		if (!tx_buf[i]) {
 			vga_write("net: TX buffer allocation failed\n");
-			return;
+			return 0;
 		}
 	}
 
@@ -240,4 +233,12 @@ void nic_init(void)
 			vga_putc(':');
 	}
 	vga_putc('\n');
+	return 1;
 }
+
+const struct nic_ops rtl8139_ops = {
+	.name  = "RTL8139",
+	.probe = rtl8139_probe,
+	.send  = rtl8139_send,
+	.mac   = rtl8139_mac,
+};

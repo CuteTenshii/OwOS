@@ -26,6 +26,8 @@
 #include "crypto.h"
 #include "url.h"
 #include "keyboard.h"
+#include "wm.h"
+#include "serial.h"
 #include "zip.h"
 #include "gzip.h"
 #include "services.h"
@@ -279,65 +281,14 @@ static void prompt(void)
 	line_len = cursor = render_len = 0;
 }
 
-static void cmd_help(void)
-{
-	vga_write("commands:\n");
-	vga_write("  help          show this list\n");
-	vga_write("  clear         clear the screen\n");
-	vga_write("  uptime        seconds since boot\n");
-	vga_write("  sleep <secs>  block for a number of seconds\n");
-	vga_write("  meminfo       physical and heap memory usage\n");
-	vga_write("  memtest       allocate/free check of the heap\n");
-	vga_write("  tasks         list scheduler threads and run counts\n");
-	vga_write("  ls [path]     list a directory (default: current)\n");
-	vga_write("  pwd           print the working directory\n");
-	vga_write("  cd [dir]      change directory (no arg -> home)\n");
-	vga_write("  cat <file>    print a file\n");
-	vga_write("  grep <p> [f]  lines containing <p>, from <f> or a pipe\n");
-	vga_write("  <cmd> | grep <p>  filter any command's output\n");
-	vga_write("  write <f> <t> write text to a file\n");
-	vga_write("  cp <src> <dst> copy a file\n");
-	vga_write("  mv <src> <dst> rename/move a file or directory\n");
-	vga_write("  rm <file>...  delete files\n");
-	vga_write("  mkdir <dir>...  create directories\n");
-	vga_write("  rmdir <dir>...  remove empty directories\n");
-	vga_write("  zip <s> [d]   compress a file (d defaults to <s>.z)\n");
-	vga_write("  unzip <s> [d] decompress a file (d defaults to <s> minus .z)\n");
-	vga_write("  gzip <s> [d]  compress to gzip (d defaults to <s>.gz)\n");
-	vga_write("  gunzip <s> [d] decompress a gzip file (d defaults to <s> minus .gz)\n");
-	vga_write("  run <f> [a|b] run a program (ring 3); a|b pipes a into b\n");
-	vga_write("  format        erase the filesystem\n");
-	vga_write("  lspci         list PCI devices\n");
-	vga_write("  lsusb         list USB controllers and ports\n");
-	vga_write("  storage       list storage devices (IDE/SATA/NVMe)\n");
-	vga_write("  beep          beep the PC speaker\n");
-	vga_write("  play [arg]    play a tune (twinkle/megalovania/sweden) or a .wav file\n");
-	vga_write("  cpuinfo       CPU vendor, model, and feature flags\n");
-	vga_write("  uname [-a]    system identity\n");
-	vga_write("  whoami        current user\n");
-	vga_write("  which <name>  locate a command (built-in or file)\n");
-	vga_write("  loadkeys <l>  set keyboard layout (us, fr)\n");
-	vga_write("  date          current date and time\n");
-	vga_write("  neofetch      system info splash\n");
-	vga_write("  ping <host>   ICMP-echo a host or IP (e.g. google.com)\n");
-	vga_write("  dig <host> [t] DNS lookup; type t=A,AAAA,CNAME,MX,TXT,NS...\n");
-	vga_write("  curl <url>    HTTP an http:// or https:// URL (-i headers, -X method, -o file)\n");
-	vga_write("  url <url>     parse a URL into its parts and rebuild it\n");
-	vga_write("  torrent info <f> parse a .torrent: name, infohash, files (test: self-check)\n");
-	vga_write("  torrent peers <f> announce to the tracker and list returned peers\n");
-	vga_write("  torrent peer <f> <ip> <port> leech piece 0 from a peer, verify sha1\n");
-	vga_write("  torrent get <f>  download a whole single-file torrent to disk\n");
-	vga_write("  services [..] manage headless daemons (list/start/stop/restart/status)\n");
-	vga_write("  echo <text>   print text back\n");
-	vga_write("  <cmd> > <f>   redirect a command's output into a file\n");
-	vga_write("  poweroff      shut the machine down\n");
-	vga_write("  restart       reboot the machine\n");
-}
+/* "help" — list every built-in. The text is data in the `builtins` table just
+ * above run(), so this walks that table; the definition lives there too. */
+static void cmd_help(const char *a);
 
-static void print_kib(const char *label, uint32_t bytes)
+static void print_kib(const char *label, uint32_t kib)
 {
 	vga_write(label);
-	vga_write_dec(bytes / 1024);
+	vga_write_dec(kib);
 	vga_write(" KiB\n");
 }
 
@@ -380,11 +331,11 @@ static void cmd_storage(void)
 
 static void cmd_meminfo(void)
 {
-	print_kib("phys total: ", pmm_total_bytes());
-	print_kib("phys used:  ", pmm_used_bytes());
-	print_kib("phys free:  ", pmm_free_bytes());
-	print_kib("heap used:  ", (uint32_t)heap_used_bytes());
-	print_kib("heap free:  ", (uint32_t)heap_free_bytes());
+	print_kib("phys total: ", pmm_total_kib());
+	print_kib("phys used:  ", pmm_used_kib());
+	print_kib("phys free:  ", pmm_free_kib());
+	print_kib("heap used:  ", (uint32_t)(heap_used_bytes() / 1024));
+	print_kib("heap free:  ", (uint32_t)(heap_free_bytes() / 1024));
 }
 
 /* Allocate two blocks (expect distinct, non-overlapping), write and read them
@@ -470,8 +421,20 @@ static int spawn(int argc, char **argv)
 static void wait_reap(int pid)
 {
 	int status;
-	while (!sched_try_reap(pid, &status))
-		__asm__ volatile ("hlt");
+	while (!sched_try_reap(pid, &status)) {
+		/* While a foreground child runs, the main loop is parked here and isn't
+		 * draining the keyboard. If a GUI window holds focus (e.g. a ring-3 app
+		 * the child spawned), pump input to it; otherwise leave keystrokes in
+		 * the ring for a console program's own read()/readline. */
+		if (wm_focus_takes_keys()) {
+			char c;
+			while (keyboard_poll(&c))
+				wm_feed_key(c);
+			while (serial_poll(&c))
+				wm_feed_key(c);
+		}
+		__asm__ volatile ("sti; hlt");
+	}
 	vga_write("[pid ");
 	vga_write_dec((uint32_t)pid);
 	vga_write(" exited, status ");
@@ -1055,24 +1018,20 @@ static void cmd_whoami(void)
 	vga_write("root\n");
 }
 
-/* Every shell built-in name, for "which" to resolve against. Keep in sync with
- * the dispatch in run(). */
-static const char *const builtins[] = {
-	"help", "clear", "uptime", "sleep", "meminfo", "memtest", "tasks", "ls",
-	"pwd", "cd", "cp", "mv", "rm", "mkdir", "rmdir",
-	"cat", "grep", "write", "zip", "unzip", "gzip", "gunzip", "run", "format",
-	"lspci", "lsusb", "storage", "beep", "play", "cpuinfo", "uname", "whoami",
-	"loadkeys", "date", "neofetch", "ping", "dig", "curl", "url", "conns",
-	"services", "cryptotest", "echo", "which", "poweroff", "restart",
+/* A shell built-in is a row in the `builtins` table defined just above run():
+ * a name, a handler (called with the argument string — "" when none), and a
+ * one-line help string. fn == NULL marks a documentation-only pseudo-entry
+ * (curl, the pipe/redirect notes) that `help` prints but dispatch skips. The
+ * table is the single source of truth for dispatch, `which`, and `help`. It
+ * lives below because it must follow every handler it points at. */
+typedef void (*cmd_fn)(const char *arg);
+struct builtin {
+	const char *name;
+	cmd_fn      fn;
+	const char *help;
 };
 
-static int is_builtin(const char *name)
-{
-	for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++)
-		if (streq(builtins[i], name))
-			return 1;
-	return 0;
-}
+static int is_builtin(const char *name);
 
 /* "which <name>..." — for each name, report whether it resolves to a shell
  * built-in or to a runnable file in owofs (checked in that order, as run()
@@ -1584,10 +1543,180 @@ static void cmd_gunzip(const char *arg)
 
 #define REDIR_MAX (16 * 1024)  /* cap on captured output for "cmd > file" */
 
+/* ---- built-in command table ---------------------------------------------
+ * Adapters give every handler the uniform cmd_fn shape (one const char *arg).
+ * No-arg commands ignore it; a few carry the small bit of glue that used to
+ * sit inline in run()'s dispatch ladder. Handlers already taking a single
+ * const char * go into the table directly. */
+static void bi_clear(const char *a)    { (void)a; vga_clear(); }
+static void bi_uptime(const char *a)
+{
+	(void)a;
+	vga_write("up ");
+	vga_write_dec(timer_seconds());
+	vga_write(" seconds\n");
+}
+static void bi_sleep(const char *a)    { timer_sleep(parse_uint(a) * 1000); }
+static void bi_meminfo(const char *a)  { (void)a; cmd_meminfo(); }
+static void bi_memtest(const char *a)  { (void)a; cmd_memtest(); }
+static void bi_tasks(const char *a)    { (void)a; sched_dump(); }
+static void bi_ls(const char *a)
+{
+	if (a[0] == '\0') {
+		fs_list(cwd);
+		return;
+	}
+	char rpath[PATH_MAX];
+	if (path_resolve(a, rpath) != 0)
+		vga_write("ls: path too long\n");
+	else
+		fs_list(rpath);
+}
+static void bi_pwd(const char *a)      { (void)a; cmd_pwd(); }
+static void bi_run(const char *a)      { cmd_run((char *)a); }
+static void bi_format(const char *a)   { (void)a; fs_format(); vga_write("filesystem erased.\n"); }
+static void bi_lspci(const char *a)    { (void)a; pci_list(); }
+static void bi_lsusb(const char *a)
+{
+	while (*a == ' ') a++;            /* "lsusb <port>" shows detail for a port  */
+	int port = -1;
+	if (*a >= '0' && *a <= '9') {
+		port = 0;
+		while (*a >= '0' && *a <= '9')
+			port = port * 10 + (*a++ - '0');
+	}
+	usb_list(port);
+}
+static void bi_storage(const char *a)  { (void)a; cmd_storage(); }
+static void bi_beep(const char *a)     { (void)a; speaker_beep(1000, 200); }
+static void bi_play(const char *a)
+{
+	if (a[0] == '\0')                       /* bare "play" -> the default tune  */
+		speaker_song();
+	else if (fs_size(a) >= 0)               /* a file -> treat it as a WAV      */
+		sb16_play_wav(a);
+	else if (speaker_play(a) != 0) {
+		vga_write("play: unknown tune: ");
+		vga_write(a);
+		vga_write("\ntunes: twinkle, megalovania, sweden (or a .wav file)\n");
+	}
+}
+static void bi_cpuinfo(const char *a)  { (void)a; cmd_cpuinfo(); }
+static void bi_whoami(const char *a)   { (void)a; cmd_whoami(); }
+static void bi_which(const char *a)    { cmd_which((char *)a); }
+static void bi_date(const char *a)     { (void)a; cmd_date(); }
+static void bi_neofetch(const char *a) { (void)a; neofetch(); }
+static void bi_ping(const char *a)
+{
+	if (a[0] == '\0') { vga_write("usage: ping <host>\n"); return; }
+	net_ping(a);
+}
+static void bi_dig(const char *a)
+{
+	if (a[0] == '\0') { vga_write("usage: dig <host> [type]\n"); return; }
+	net_dig(a);
+}
+static void bi_fstest(const char *a)     { (void)a; fs_selftest(); }
+static void bi_cryptotest(const char *a) { (void)a; crypto_selftest(); }
+static void bi_echo(const char *a)       { vga_write(a); vga_putc('\n'); }
+static void bi_poweroff(const char *a)
+{
+	(void)a;
+	vga_write("powering off...\n");
+	power_off();
+	vga_write("poweroff not supported here\n");
+}
+static void bi_restart(const char *a)    { (void)a; vga_write("restarting...\n"); power_reset(); }
+
+/* The one and only command list. Add a built-in here — that wires it into
+ * dispatch, `which`, and `help` at once. Order is the order `help` prints.
+ * fn == NULL rows are help-only notes for things that aren't bare commands. */
+static const struct builtin builtins[] = {
+	{ "help",     cmd_help,     "help          show this list" },
+	{ "clear",    bi_clear,     "clear         clear the screen" },
+	{ "uptime",   bi_uptime,    "uptime        seconds since boot" },
+	{ "sleep",    bi_sleep,     "sleep <secs>  block for a number of seconds" },
+	{ "meminfo",  bi_meminfo,   "meminfo       physical and heap memory usage" },
+	{ "memtest",  bi_memtest,   "memtest       allocate/free check of the heap" },
+	{ "tasks",    bi_tasks,     "tasks         list scheduler threads and run counts" },
+	{ "ls",       bi_ls,        "ls [path]     list a directory (default: current)" },
+	{ "pwd",      bi_pwd,       "pwd           print the working directory" },
+	{ "cd",       cmd_cd,       "cd [dir]      change directory (no arg -> home)" },
+	{ "cat",      cmd_cat,      "cat <file>    print a file" },
+	{ "grep",     cmd_grep,     "grep <p> [f]  lines containing <p>, from <f> or a pipe\n"
+	                            "  <cmd> | grep <p>  filter any command's output" },
+	{ "write",    cmd_write,    "write <f> <t> write text to a file" },
+	{ "cp",       cmd_cp,       "cp <src> <dst> copy a file" },
+	{ "mv",       cmd_mv,       "mv <src> <dst> rename/move a file or directory" },
+	{ "rm",       cmd_rm,       "rm <file>...  delete files" },
+	{ "mkdir",    cmd_mkdir,    "mkdir <dir>...  create directories" },
+	{ "rmdir",    cmd_rmdir,    "rmdir <dir>...  remove empty directories" },
+	{ "zip",      cmd_zip,      "zip <s> [d]   compress a file (d defaults to <s>.z)" },
+	{ "unzip",    cmd_unzip,    "unzip <s> [d] decompress a file (d defaults to <s> minus .z)" },
+	{ "gzip",     cmd_gzip,     "gzip <s> [d]  compress to gzip (d defaults to <s>.gz)" },
+	{ "gunzip",   cmd_gunzip,   "gunzip <s> [d] decompress a gzip file (d defaults to <s> minus .gz)" },
+	{ "run",      bi_run,       "run <f> [a|b] run a program (ring 3); a|b pipes a into b" },
+	{ "format",   bi_format,    "format        erase the filesystem" },
+	{ "lspci",    bi_lspci,     "lspci         list PCI devices" },
+	{ "lsusb",    bi_lsusb,     "lsusb [port]  list USB devices (port: detail for one)" },
+	{ "storage",  bi_storage,   "storage       list storage devices (IDE/SATA/NVMe)" },
+	{ "beep",     bi_beep,      "beep          beep the PC speaker" },
+	{ "play",     bi_play,      "play [arg]    play a tune (twinkle/megalovania/sweden) or a .wav file" },
+	{ "cpuinfo",  bi_cpuinfo,   "cpuinfo       CPU vendor, model, and feature flags" },
+	{ "uname",    cmd_uname,    "uname [-a]    system identity" },
+	{ "whoami",   bi_whoami,    "whoami        current user" },
+	{ "which",    bi_which,     "which <name>  locate a command (built-in or file)" },
+	{ "loadkeys", cmd_loadkeys, "loadkeys <l>  set keyboard layout (us, fr)" },
+	{ "date",     bi_date,      "date          current date and time" },
+	{ "neofetch", bi_neofetch,  "neofetch      system info splash" },
+	{ "ping",     bi_ping,      "ping <host>   ICMP-echo a host or IP (e.g. google.com)" },
+	{ "dig",      bi_dig,       "dig <host> [t] DNS lookup; type t=A,AAAA,CNAME,MX,TXT,NS..." },
+	{ NULL,       NULL,         "curl <url>    HTTP an http:// or https:// URL (-i headers, -X method, -o file)" },
+	{ "url",      cmd_url,      "url <url>     parse a URL into its parts and rebuild it" },
+	{ "torrent",  cmd_torrent,  "torrent info <f> parse a .torrent: name, infohash, files (test: self-check)\n"
+	                            "  torrent peers <f> announce to the tracker and list returned peers\n"
+	                            "  torrent peer <f> <ip> <port> leech piece 0 from a peer, verify sha1\n"
+	                            "  torrent get <f>  download a whole single-file torrent to disk" },
+	{ "services", services_cmd, "services [..] manage headless daemons (list/start/stop/restart/status)" },
+	{ "echo",     bi_echo,      "echo <text>   print text back" },
+	{ NULL,       NULL,         "<cmd> > <f>   redirect a command's output into a file" },
+	{ "poweroff", bi_poweroff,  "poweroff      shut the machine down" },
+	{ "restart",  bi_restart,   "restart       reboot the machine" },
+	/* dispatchable but intentionally absent from `help` (developer self-tests) */
+	{ "fstest",     bi_fstest,     NULL },
+	{ "cryptotest", bi_cryptotest, NULL },
+	{ NULL, NULL, NULL },   /* sentinel */
+};
+
+/* Resolve a command name to its row, skipping help-only (fn == NULL) entries. */
+static const struct builtin *builtin_find(const char *name)
+{
+	for (const struct builtin *b = builtins; b->name || b->help; b++)
+		if (b->fn && streq(b->name, name))
+			return b;
+	return NULL;
+}
+
+static int is_builtin(const char *name)
+{
+	return builtin_find(name) != NULL;
+}
+
+static void cmd_help(const char *a)
+{
+	(void)a;
+	vga_write("commands:\n");
+	for (const struct builtin *b = builtins; b->name || b->help; b++) {
+		if (!b->help)
+			continue;
+		vga_write("  ");
+		vga_write(b->help);
+		vga_putc('\n');
+	}
+}
+
 static void run(char *cmd)
 {
-	const char *arg;
-
 	if (cmd[0] == '\0')
 		return;                /* blank line                              */
 
@@ -1674,148 +1803,39 @@ static void run(char *cmd)
 		}
 	}
 
-	if (streq(cmd, "help")) {
-		cmd_help();
-	} else if (streq(cmd, "clear")) {
-		vga_clear();
-	} else if (streq(cmd, "uptime")) {
-		vga_write("up ");
-		vga_write_dec(timer_seconds());
-		vga_write(" seconds\n");
-	} else if ((arg = after_prefix(cmd, "sleep ")) != NULL) {
-		timer_sleep(parse_uint(arg) * 1000);
-	} else if (streq(cmd, "meminfo")) {
-		cmd_meminfo();
-	} else if (streq(cmd, "memtest")) {
-		cmd_memtest();
-	} else if (streq(cmd, "tasks")) {
-		sched_dump();
-	} else if (streq(cmd, "ls")) {
-		fs_list(cwd);
-	} else if ((arg = after_prefix(cmd, "ls ")) != NULL) {
-		char rpath[PATH_MAX];
-		if (path_resolve(arg, rpath) != 0)
-			vga_write("ls: path too long\n");
-		else
-			fs_list(rpath);
-	} else if (streq(cmd, "pwd")) {
-		cmd_pwd();
-	} else if (streq(cmd, "cd")) {
-		cmd_cd("");
-	} else if ((arg = after_prefix(cmd, "cd ")) != NULL) {
-		cmd_cd(arg);
-	} else if ((arg = after_prefix(cmd, "cp ")) != NULL) {
-		cmd_cp(arg);
-	} else if ((arg = after_prefix(cmd, "mv ")) != NULL) {
-		cmd_mv(arg);
-	} else if ((arg = after_prefix(cmd, "rm ")) != NULL) {
-		cmd_rm(arg);
-	} else if ((arg = after_prefix(cmd, "mkdir ")) != NULL) {
-		cmd_mkdir(arg);
-	} else if ((arg = after_prefix(cmd, "rmdir ")) != NULL) {
-		cmd_rmdir(arg);
-	} else if ((arg = after_prefix(cmd, "cat ")) != NULL) {
-		cmd_cat(arg);
-	} else if ((arg = after_prefix(cmd, "grep ")) != NULL) {
-		cmd_grep(arg);
-	} else if ((arg = after_prefix(cmd, "write ")) != NULL) {
-		cmd_write(arg);
-	} else if ((arg = after_prefix(cmd, "zip ")) != NULL) {
-		cmd_zip(arg);
-	} else if ((arg = after_prefix(cmd, "unzip ")) != NULL) {
-		cmd_unzip(arg);
-	} else if ((arg = after_prefix(cmd, "gzip ")) != NULL) {
-		cmd_gzip(arg);
-	} else if ((arg = after_prefix(cmd, "gunzip ")) != NULL) {
-		cmd_gunzip(arg);
-	} else if ((arg = after_prefix(cmd, "run ")) != NULL) {
-		cmd_run((char *)arg);
-	} else if (streq(cmd, "format")) {
-		fs_format();
-		vga_write("filesystem erased.\n");
-	} else if (streq(cmd, "lspci")) {
-		pci_list();
-	} else if (streq(cmd, "lsusb")) {
-		usb_list();
-	} else if (streq(cmd, "storage")) {
-		cmd_storage();
-	} else if (streq(cmd, "beep")) {
-		speaker_beep(1000, 200);
-	} else if ((arg = after_prefix(cmd, "play ")) != NULL) {
-		if (fs_size(arg) >= 0) {          /* a file -> treat it as a WAV       */
-			sb16_play_wav(arg);
-		} else if (speaker_play(arg) != 0) {
-			vga_write("play: unknown tune: ");
-			vga_write(arg);
-			vga_write("\ntunes: twinkle, megalovania, sweden (or a .wav file)\n");
-		}
-	} else if (streq(cmd, "play")) {
-		speaker_song();
-	} else if (streq(cmd, "cpuinfo")) {
-		cmd_cpuinfo();
-	} else if (streq(cmd, "uname")) {
-		cmd_uname("");
-	} else if ((arg = after_prefix(cmd, "uname ")) != NULL) {
-		cmd_uname(arg);
-	} else if (streq(cmd, "whoami")) {
-		cmd_whoami();
-	} else if ((arg = after_prefix(cmd, "which ")) != NULL) {
-		cmd_which((char *)arg);
-	} else if (streq(cmd, "which")) {
-		cmd_which("");
-	} else if ((arg = after_prefix(cmd, "loadkeys ")) != NULL) {
-		cmd_loadkeys(arg);
-	} else if (streq(cmd, "loadkeys")) {
-		cmd_loadkeys("");
-	} else if (streq(cmd, "date")) {
-		cmd_date();
-	} else if ((arg = after_prefix(cmd, "ping ")) != NULL) {
-		net_ping(arg);
-	} else if ((arg = after_prefix(cmd, "dig ")) != NULL) {
-		net_dig(arg);
-	} else if ((arg = after_prefix(cmd, "url ")) != NULL) {
-		cmd_url(arg);
-	} else if ((arg = after_prefix(cmd, "services ")) != NULL) {
-		services_cmd(arg);
-	} else if (streq(cmd, "services")) {
-		services_cmd("");
-	} else if ((arg = after_prefix(cmd, "torrent ")) != NULL) {
-		cmd_torrent(arg);
-	} else if (streq(cmd, "torrent")) {
-		cmd_torrent("");
-	} else if (streq(cmd, "fstest")) {
-		fs_selftest();
-	} else if (streq(cmd, "cryptotest")) {
-		crypto_selftest();
-	} else if (streq(cmd, "neofetch")) {
-		neofetch();
-	} else if (streq(cmd, "echo")) {
-		vga_putc('\n');
-	} else if ((arg = after_prefix(cmd, "echo ")) != NULL) {
-		vga_write(arg);
-		vga_putc('\n');
-	} else if (streq(cmd, "poweroff")) {
-		vga_write("powering off...\n");
-		power_off();
-		vga_write("poweroff not supported here\n");
-	} else if (streq(cmd, "restart")) {
-		vga_write("restarting...\n");
-		power_reset();
-	} else {
-		/* Not a builtin: treat it like a shell would — look for a program of
-		 * that name (cwd, then /bin) and run it in ring 3 with its arguments.
-		 * This is how every user program (hello, args, curl, ...) is launched
-		 * by bare name; none of them is wired into the dispatch above. */
-		char *av[8] = {0};
-		int ac = tokenize(cmd, av, 8);
-		int pid = (ac > 0) ? spawn(ac, av) : -1;
-		if (pid >= 0) {
-			wait_reap(pid);
-		} else if (ac > 0) {
-			vga_write("unknown command: ");
-			vga_write(av[0]);
-			vga_write("\ntype 'help'\n");
-		}
+	/* Split off the first whitespace-delimited token (the command name); the
+	 * rest, leading blanks trimmed, is its argument string ("" when none).
+	 * `cmd` is left intact so the /bin fallback can re-tokenize the whole line. */
+	char name[64];
+	int n = 0;
+	while (cmd[n] && cmd[n] != ' ' && n < (int)sizeof(name) - 1) {
+		name[n] = cmd[n];
+		n++;
+	}
+	name[n] = '\0';
+	const char *carg = cmd + n;
+	while (*carg == ' ')
+		carg++;
+
+	const struct builtin *b = builtin_find(name);
+	if (b) {
+		b->fn(carg);
+		return;
+	}
+
+	/* Not a builtin: treat it like a shell would — look for a program of that
+	 * name (cwd, then /bin) and run it in ring 3 with its arguments. This is
+	 * how every user program (hello, args, curl, ...) launches by bare name;
+	 * none of them is wired into the command table above. */
+	char *av[8] = {0};
+	int ac = tokenize(cmd, av, 8);
+	int pid = (ac > 0) ? spawn(ac, av) : -1;
+	if (pid >= 0) {
+		wait_reap(pid);
+	} else if (ac > 0) {
+		vga_write("unknown command: ");
+		vga_write(av[0]);
+		vga_write("\ntype 'help'\n");
 	}
 }
 

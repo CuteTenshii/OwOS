@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include "usb.h"
+#include "xhci.h"
 #include "pci.h"
 #include "io.h"
 #include "vga.h"
@@ -375,7 +376,7 @@ static void uhci_probe(uint8_t bus, uint8_t slot, uint8_t func)
 	uhci_probe_port(io_base, UHCI_PORTSC2, 2);
 }
 
-void usb_list(void)
+void usb_list(int detail_port)
 {
 	int found = 0;
 
@@ -410,6 +411,8 @@ void usb_list(void)
 
 				if (prog_if == USB_PROGIF_UHCI)
 					uhci_probe(bus, slot, f);
+				else if (prog_if == USB_PROGIF_XHCI)
+					xhci_init(detail_port);   /* enumerate; detail per port */
 			}
 		}
 	}

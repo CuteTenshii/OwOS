@@ -12,6 +12,10 @@
 #include "ata.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "battery.h"
+#include "firmware.h"
+#include "fb.h"
+#include "edid.h"
 
 #define LOGO_WIDTH 16
 
@@ -30,6 +34,10 @@ static void wr2(uint32_t v)   /* two-digit zero-padded                       */
 	vga_putc('0' + (char)((v / 10) % 10));
 	vga_putc('0' + (char)(v % 10));
 }
+
+/* CPU speed (MHz), calibrated once and cached: cpu_mhz() busy-waits ~200 ms, so
+ * we never want to pay that again on a re-run of the splash. */
+static uint32_t cpu_speed_mhz;
 
 static void label(const char *s)
 {
@@ -77,7 +85,21 @@ static void info_row(int i, const char *brand, const struct rtc_time *t)
 	case 1: vga_write("----------------"); break;
 	case 2: label("OS:      "); vga_write("OwOS 0.1"); break;
 	case 3: label("Kernel:  "); vga_write("owos (i386, 32-bit)"); break;
-	case 4: label("CPU:     "); vga_write(brand); break;
+	case 11: label("Firmware:"); vga_putc(' '); vga_write(firmware_name()); break;
+	case 4:
+		label("CPU:     ");
+		vga_write(brand);
+		if (cpu_speed_mhz) {
+			/* MHz -> GHz with two decimals, rounded in hundredths so a value
+			 * like 2995 MHz carries cleanly to 3.00 GHz rather than 2.99. */
+			uint32_t cghz = (cpu_speed_mhz + 5) / 10;   /* hundredths of a GHz */
+			vga_write(" @ ");
+			vga_write_dec(cghz / 100);
+			vga_putc('.');
+			wr2(cghz % 100);
+			vga_write(" GHz");
+		}
+		break;
 	case 5: label("Uptime:  "); vga_write_dec(timer_seconds()); vga_write(" s"); break;
 	case 6:
 		label("Date:    ");
@@ -86,8 +108,8 @@ static void info_row(int i, const char *brand, const struct rtc_time *t)
 		break;
 	case 7:
 		label("Memory:  ");
-		vga_write_dec(pmm_used_bytes() / (1024 * 1024)); vga_write(" / ");
-		vga_write_dec(pmm_total_bytes() / (1024 * 1024)); vga_write(" MiB");
+		vga_write_dec(pmm_ram_used_kib() / 1024); vga_write(" / ");
+		vga_write_dec(pmm_installed_kib() / 1024); vga_write(" MiB");
 		break;
 	case 8:
 		label("Disk:    ");
@@ -133,14 +155,26 @@ static void display_row(int idx, const struct pci_display *dd, int ndd)
 		vga_write(dd[idx].name);
 	else
 		vga_write("VGA-compatible controller");
-	if (idx == 0)
-		vga_write(" (80x25 text)");
+	if (idx == 0) {
+		/* Prefer the monitor's real refresh from EDID (real hardware, Intel
+		 * GMBUS). Failing that there is no refresh register to read, so report
+		 * the standard mode timing: a linear framebuffer (VBE/DISPI or adopted)
+		 * runs at 60 Hz, VGA text mode 3 (720x400) at its native 70 Hz. */
+		int hz = edid_refresh_hz();
+		if (hz <= 0)
+			hz = fb_active() ? 60 : 70;
+		vga_write(" (80x25 text, ");
+		vga_write_dec((uint32_t)hz);
+		vga_write("Hz)");
+	}
 }
 
 void neofetch(void)
 {
 	char brand[49];
 	cpu_brand(brand);
+	if (!cpu_speed_mhz)
+		cpu_speed_mhz = cpu_mhz();   /* calibrate once; cached for re-runs    */
 	struct rtc_time t;
 	rtc_now(&t);
 
@@ -150,10 +184,11 @@ void neofetch(void)
 	struct pci_display dd[8];
 	int ndd = pci_displays(dd, 8);
 
-	const int fixed = 11;
+	const int fixed = 12;   /* info_row cases 0..11 (last is Firmware)            */
+	const int batt_rows = battery_present() ? 1 : 0;  /* only when detected     */
 	const int storage_rows = nsd > 0 ? nsd : 1;   /* always show one "Storage:" */
 	const int display_rows = ndd > 0 ? ndd : 1;   /* always show one "Display:" */
-	const int rows = fixed + storage_rows + display_rows;
+	const int rows = fixed + batt_rows + storage_rows + display_rows;
 	for (int i = 0; i < rows; i++) {
 		/* logo column (cyan), padded to a fixed width */
 		vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
@@ -169,10 +204,28 @@ void neofetch(void)
 		vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
 		if (i < fixed)
 			info_row(i, brand, &t);
-		else if (i < fixed + storage_rows)
-			storage_row(i - fixed, sd, nsd);
+		else if (i < fixed + batt_rows) {
+			label("Battery: ");
+			/* Evaluate _BST/_BIF for the real charge; fall back to bare
+			 * presence if the AML can't be read (e.g. a silent EC). */
+			int chg = 0, dis = 0;
+			int pct = battery_percent(&chg, &dis);
+			if (pct >= 0) {
+				vga_write_dec((uint32_t)pct);
+				vga_putc('%');
+				if (chg)      vga_write(" (charging)");
+				else if (dis) vga_write(" (discharging)");
+			} else {
+				/* Couldn't read _BST/_BIF; show why, for diagnosis. */
+				const char *e = battery_error();
+				vga_write("present (");
+				vga_write((e && e[0]) ? e : "ACPI");
+				vga_putc(')');
+			}
+		} else if (i < fixed + batt_rows + storage_rows)
+			storage_row(i - fixed - batt_rows, sd, nsd);
 		else
-			display_row(i - fixed - storage_rows, dd, ndd);
+			display_row(i - fixed - batt_rows - storage_rows, dd, ndd);
 		vga_putc('\n');
 	}
 	vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);

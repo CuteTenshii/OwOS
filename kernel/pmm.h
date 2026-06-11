@@ -21,8 +21,19 @@ void     pmm_free_frame(uint32_t phys);
  * contiguous and don't fit in the small identity-mapped heap. Not freeable. */
 uint32_t pmm_alloc_contig(uint32_t bytes);
 
-uint32_t pmm_total_bytes(void);
-uint32_t pmm_used_bytes(void);
-uint32_t pmm_free_bytes(void);
+/* Reported in KiB rather than bytes so a ≥4 GiB machine doesn't overflow the
+ * uint32 (4 GiB of bytes wraps to 0; 4 GiB is 4194304 KiB, which fits).
+ * `installed` is the true firmware-reported RAM total (can exceed 4 GiB on a
+ * 16 GiB machine); `total` is what the allocator actually manages, capped at
+ * 4 GiB by the bitmap and 32-bit (non-PAE) paging. */
+uint32_t pmm_installed_kib(void);
+uint32_t pmm_total_kib(void);
+uint32_t pmm_used_kib(void);
+uint32_t pmm_free_kib(void);
+
+/* RAM actually allocated by the OS, in KiB. Unlike pmm_used_kib() this excludes
+ * the PCI/MMIO hole and reserved regions (which aren't RAM), so it's the honest
+ * figure for a memory summary — ~16 MiB at boot, not ~1 GiB of hole. */
+uint32_t pmm_ram_used_kib(void);
 
 #endif /* OWOS_PMM_H */

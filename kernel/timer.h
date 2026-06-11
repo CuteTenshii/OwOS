@@ -8,7 +8,12 @@
 
 #include <stdint.h>
 
-#define TIMER_HZ 100   /* PIT interrupts per second                          */
+#define TIMER_HZ 250   /* PIT interrupts per second. Finer than the classic
+                        * 100 Hz so the compositor can pace to a real 60/120 Hz
+                        * frame budget (10 ms tick granularity quantised it to
+                        * 50 fps) and input latency drops to one 4 ms tick.
+                        * Raw timer_ticks() deadlines are expressed in TIMER_HZ
+                        * units (N * TIMER_HZ seconds), so they track this. */
 
 typedef void (*timer_tick_fn)(void);
 

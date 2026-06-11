@@ -136,7 +136,10 @@ int exec_program(const void *image, uint32_t size, int argc, char *const argv[])
 		return -1;
 
 	uint32_t user_esp = setup_args(dir, argc, argv);
-	int pid = sched_create_process("user", entry, dir, user_esp);
+	/* Name the task after the program (argv[0]) so the crash reporter and
+	 * `tasks` show e.g. "browser" instead of a generic "user". */
+	const char *nm = (argc > 0 && argv[0]) ? argv[0] : "user";
+	int pid = sched_create_process(nm, entry, dir, user_esp);
 	if (pid < 0)
 		paging_free_process_dir(dir);
 	return pid;

@@ -49,6 +49,20 @@ void cpu_brand(char *buf49)
 		off += 16;
 	}
 	buf49[48] = '\0';
+
+	/* The brand is a fixed 48-char field, space-padded: Intel tends to pad on
+	 * the left ("   Intel(R)..."), AMD on the right ("...Processor      ").
+	 * Trim both ends so callers can print it flush. */
+	int start = 0;
+	while (buf49[start] == ' ')
+		start++;
+	int end = 47;
+	while (end >= start && buf49[end] == ' ')
+		end--;
+	int n = end - start + 1;
+	for (int i = 0; i < n; i++)
+		buf49[i] = buf49[start + i];
+	buf49[n] = '\0';
 }
 
 void cpu_signature(struct cpu_signature *sig)

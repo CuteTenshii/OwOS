@@ -4,7 +4,10 @@
 #include "idt.h"
 #include "gdt.h"
 #include "vga.h"
+#include "fb.h"
 #include "syscall.h"
+#include "sched.h"
+#include "crash.h"
 
 /* One 8-byte interrupt gate descriptor. */
 struct idt_entry {
@@ -61,12 +64,104 @@ void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags)
 	idt[num].flags     = flags;
 }
 
+/* Tiny string builders for the panic screen — no libc, no heap (the heap may be
+ * the very thing that's corrupt). Each returns the new end-of-string pointer. */
+static char *p_str(char *p, const char *s) { while (*s) *p++ = *s++; return p; }
+static char *p_hex(char *p, uint32_t v)
+{
+	const char *h = "0123456789ABCDEF";
+	*p++ = '0'; *p++ = 'x';
+	for (int i = 28; i >= 0; i -= 4)
+		*p++ = h[(v >> i) & 0xF];
+	return p;
+}
+
+/* Render a full-screen crash report to the framebuffer. Under UEFI there is no
+ * VGA text console, so without this a fault is an information-free frozen screen
+ * (it just looks like a hang). Draws straight to the framebuffer with the
+ * console font; safe to call from the fault handler since it touches no heap and
+ * no locks. No-op if no graphics mode is up (the VGA path still printed). */
+static void panic_screen(struct registers *r)
+{
+	if (!fb_active())
+		return;
+
+	int W = (int)fb_width(), H = (int)fb_height();
+	uint32_t bg = fb_rgb(0x0a, 0x14, 0x6e);   /* deep blue, the classic        */
+	uint32_t fg = fb_rgb(0xe6, 0xe6, 0xe6);
+	uint32_t hi = fb_rgb(0xff, 0xd0, 0x40);   /* yellow for the heading        */
+
+	fb_clip_full();
+	fb_fill_rect(0, 0, W, H, bg);
+
+	int x = 24, y = 24, lh = 18;
+	char line[160], *p;
+
+	fb_text(x, y, "KERNEL PANIC", hi, bg); y += lh * 2;
+
+	p = p_str(line, "exception: ");
+	p = p_str(p, r->int_no < 32 ? exception_messages[r->int_no] : "Unknown");
+	*p = 0; fb_text(x, y, line, fg, bg); y += lh;
+
+	p = line;
+	p = p_str(p, "vector="); p = p_hex(p, r->int_no);
+	p = p_str(p, "  err=");  p = p_hex(p, r->err_code);
+	*p = 0; fb_text(x, y, line, fg, bg); y += lh;
+
+	p = line;
+	p = p_str(p, "eip=");    p = p_hex(p, r->eip);
+	p = p_str(p, "  cs=");   p = p_hex(p, r->cs);
+	p = p_str(p, "  eflags="); p = p_hex(p, r->eflags);
+	*p = 0; fb_text(x, y, line, fg, bg); y += lh;
+
+	if (r->int_no == 14) {         /* page fault: CR2 holds the bad address    */
+		uint32_t cr2, cr3;
+		__asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+		__asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+		p = line;
+		p = p_str(p, "cr2=");  p = p_hex(p, cr2);
+		p = p_str(p, "  cr3="); p = p_hex(p, cr3);
+		*p = 0; fb_text(x, y, line, fg, bg); y += lh;
+
+		p = line;
+		p = p_str(p, "fault: ");
+		p = p_str(p, (r->err_code & 1) ? "protection " : "not-present ");
+		p = p_str(p, (r->err_code & 2) ? "write " : "read ");
+		p = p_str(p, (r->err_code & 4) ? "user " : "supervisor ");
+		if (r->err_code & 16) p = p_str(p, "insn-fetch ");
+		*p = 0; fb_text(x, y, line, fg, bg); y += lh;
+	}
+	y += lh;
+
+	p = line;
+	p = p_str(p, "eax="); p = p_hex(p, r->eax); p = p_str(p, "  ebx="); p = p_hex(p, r->ebx);
+	p = p_str(p, "  ecx="); p = p_hex(p, r->ecx); p = p_str(p, "  edx="); p = p_hex(p, r->edx);
+	*p = 0; fb_text(x, y, line, fg, bg); y += lh;
+
+	p = line;
+	p = p_str(p, "esi="); p = p_hex(p, r->esi); p = p_str(p, "  edi="); p = p_hex(p, r->edi);
+	p = p_str(p, "  ebp="); p = p_hex(p, r->ebp); p = p_str(p, "  esp="); p = p_hex(p, r->esp);
+	*p = 0; fb_text(x, y, line, fg, bg); y += lh * 2;
+
+	fb_text(x, y, "system halted. photograph this screen.", hi, bg);
+
+	fb_present();
+}
+
 /* Called from isr_common_stub for every CPU exception. */
 void isr_handler(struct registers *r)
 {
 	if (r->int_no == 0x80) {       /* system call, not an exception            */
 		syscall_dispatch(r);
 		return;
+	}
+
+	/* A fault that came from ring 3 (CS RPL = 3) is a user-program bug, not a
+	 * kernel one: record it for a crash window and terminate just that process
+	 * instead of panicking the whole system. */
+	if (r->int_no < 32 && (r->cs & 3) == 3) {
+		crash_record(sched_current_name(), r);
+		sched_exit(139);           /* kill the faulting task; never returns    */
 	}
 
 	vga_set_color(VGA_WHITE, VGA_RED);
@@ -85,6 +180,8 @@ void isr_handler(struct registers *r)
 	}
 
 	vga_write("\n  system halted.\n");
+
+	panic_screen(r);               /* and a readable version on the framebuffer */
 
 	for (;;)
 		__asm__ volatile ("cli; hlt");

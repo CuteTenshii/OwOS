@@ -22,8 +22,14 @@ struct rsdp {
 	char     signature[8];          /* "RSD PTR " */
 	uint8_t  checksum;
 	char     oemid[6];
-	uint8_t  revision;
+	uint8_t  revision;              /* 0 = ACPI 1.0 (RSDT only); >=2 adds XSDT */
 	uint32_t rsdt_addr;
+	/* ACPI 2.0+ extension, present when revision >= 2. UEFI firmware often sets
+	 * rsdt_addr to 0 and only fills in this 64-bit XSDT pointer. */
+	uint32_t length;
+	uint64_t xsdt_addr;
+	uint8_t  ext_checksum;
+	uint8_t  reserved[3];
 } __attribute__((packed));
 
 struct sdt_header {
@@ -79,8 +85,44 @@ static struct rsdp *scan_rsdp(uint32_t start, uint32_t end)
 	return 0;
 }
 
+/* A copy of the RSDP the bootloader handed us via the multiboot2 ACPI tag.
+ * On a UEFI boot the firmware leaves no RSDP in the legacy BIOS area, so the
+ * scan below finds nothing and this copy is the only way to reach ACPI. */
+static struct rsdp boot_rsdp;
+static int boot_rsdp_valid;
+
+void acpi_set_rsdp(const void *rsdp_copy)
+{
+	const struct rsdp *src = rsdp_copy;
+	/* "RSD PTR " is the anchor; ignore anything that isn't really an RSDP. */
+	if (!(src->signature[0] == 'R' && src->signature[1] == 'S' &&
+	      src->signature[2] == 'D' && src->signature[3] == ' '))
+		return;
+	/* GRUB may hand us both an ACPI-1.0 (type 14) and a 2.0 (type 15) tag.
+	 * Never let the 1.0 one clobber a 2.0 RSDP already captured — only the 2.0
+	 * RSDP carries the XSDT that UEFI firmware actually populates. */
+	if (boot_rsdp_valid && boot_rsdp.revision >= 2 && src->revision < 2)
+		return;
+
+	const uint8_t *s = rsdp_copy;
+	uint8_t *d = (uint8_t *)&boot_rsdp;
+	/* A 2.0 RSDP is 36 bytes (adds length + the 64-bit XSDT pointer); a 1.0 one
+	 * is only 20, so don't read the extension fields out of a smaller tag. */
+	uint32_t len = src->revision >= 2 ? sizeof boot_rsdp : 20;
+	for (uint32_t i = 0; i < len; i++)
+		d[i] = s[i];
+	/* Reachable if it names a root table — the RSDT (1.0) or XSDT (2.0+). */
+	boot_rsdp_valid = boot_rsdp.rsdt_addr != 0 ||
+	                  (boot_rsdp.revision >= 2 && boot_rsdp.xsdt_addr != 0);
+}
+
 static struct rsdp *find_rsdp(void)
 {
+	/* Prefer the loader-provided copy: on UEFI it's the only one that exists,
+	 * and on a legacy boot it's simply absent (boot_rsdp_valid == 0). */
+	if (boot_rsdp_valid)
+		return &boot_rsdp;
+
 	/* The EBDA segment pointer lives at physical 0x40E (real-mode word). */
 	uint32_t ebda = (uint32_t)(*(uint16_t *)0x40E) << 4;
 	struct rsdp *r = 0;
@@ -91,17 +133,79 @@ static struct rsdp *find_rsdp(void)
 	return r;
 }
 
+/* Map and validate the root system description table: the XSDT (8-byte entry
+ * pointers) on ACPI 2.0+ when the firmware populated it, otherwise the RSDT
+ * (4-byte). Returns 0 on failure; on success *hdr is the mapped header, *count
+ * the number of table pointers, and *xsdt is 1 for 8-byte entries. */
+static int find_root_sdt(struct sdt_header **hdr, uint32_t *count, int *xsdt)
+{
+	struct rsdp *rsdp = find_rsdp();
+	if (!rsdp)
+		return 0;
+
+	uint32_t phys;
+	int is_xsdt;
+	if (rsdp->revision >= 2 && rsdp->xsdt_addr &&
+	    rsdp->xsdt_addr < 0x100000000ull) {
+		phys = (uint32_t)rsdp->xsdt_addr;
+		is_xsdt = 1;
+	} else {
+		phys = rsdp->rsdt_addr;
+		is_xsdt = 0;
+	}
+	if (!phys)
+		return 0;
+
+	struct sdt_header *h = (struct sdt_header *)phys;
+	if (paging_identity_map(phys, sizeof(*h)) != 0)
+		return 0;
+	if (!sig4(h->signature, is_xsdt ? "XSDT" : "RSDT"))
+		return 0;
+	if (paging_identity_map(phys, h->length) != 0)
+		return 0;
+
+	*hdr = h;
+	*count = (h->length - sizeof(*h)) / (is_xsdt ? 8 : 4);
+	*xsdt = is_xsdt;
+	return 1;
+}
+
+/* Physical address of the i-th table the root SDT points at. RSDT entries are
+ * 4 bytes, XSDT entries 8; either way ACPI tables live below 4 GiB, so the
+ * truncation to 32 bits is safe (we only manage the low 4 GiB anyway). */
+static uint32_t root_entry(struct sdt_header *root, uint32_t i, int xsdt)
+{
+	uint8_t *base = (uint8_t *)root + sizeof(struct sdt_header);
+	if (xsdt)
+		return (uint32_t)(*(uint64_t *)(base + (uint32_t)i * 8));
+	return *(uint32_t *)(base + (uint32_t)i * 4);
+}
+
+/* The DSDT's physical address from the FADT. Prefer the 64-bit X_DSDT (offset
+ * 140, ACPI 2.0+): UEFI firmware routinely leaves the legacy 32-bit dsdt field
+ * zero. Falls back to that field. The caller must have mapped the full FADT. */
+static uint32_t fadt_dsdt_phys(struct fadt *f)
+{
+	if (f->header.length >= 148) {
+		uint64_t x = *(uint64_t *)((uint8_t *)f + 140);
+		if (x && x < 0x100000000ull)
+			return (uint32_t)x;
+	}
+	return f->dsdt;
+}
+
 /* Dig SLP_TYPa/SLP_TYPb out of the DSDT's \_S5_ package. Returns 0 on failure;
  * on success the values are written *already shifted* into PM1_CNT position. */
 static int parse_s5(struct fadt *f, uint16_t *slp_a, uint16_t *slp_b)
 {
-	struct sdt_header *dsdt = (struct sdt_header *)f->dsdt;
+	uint32_t dphys = fadt_dsdt_phys(f);
+	struct sdt_header *dsdt = (struct sdt_header *)dphys;
 	/* Map the header, then the whole table once its length is known. */
-	if (paging_identity_map(f->dsdt, sizeof(*dsdt)) != 0)
+	if (paging_identity_map(dphys, sizeof(*dsdt)) != 0)
 		return 0;
 	if (!dsdt || !sig4(dsdt->signature, "DSDT"))
 		return 0;
-	if (paging_identity_map(f->dsdt, dsdt->length) != 0)
+	if (paging_identity_map(dphys, dsdt->length) != 0)
 		return 0;
 
 	uint8_t *p   = (uint8_t *)dsdt + sizeof(*dsdt);
@@ -133,36 +237,132 @@ static int parse_s5(struct fadt *f, uint16_t *slp_a, uint16_t *slp_b)
 	return 1;
 }
 
+/* Locate and identity-map the FADT (its ACPI signature is "FACP"). Returns 0 if
+ * ACPI isn't present. Walks whichever root table the RSDP names (XSDT or RSDT).
+ * Maps the *whole* FADT, not just the prefix, so fadt_dsdt_phys() can read the
+ * 64-bit X_DSDT at offset 140. Shared by the shutdown path and acpi_aml_contains. */
+static struct fadt *find_fadt(void)
+{
+	struct sdt_header *root;
+	uint32_t count;
+	int xsdt;
+	if (!find_root_sdt(&root, &count, &xsdt))
+		return 0;
+
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t phys = root_entry(root, i, xsdt);
+		if (paging_identity_map(phys, sizeof(struct sdt_header)) != 0)
+			continue;
+		struct sdt_header *h = (struct sdt_header *)phys;
+		if (sig4(h->signature, "FACP")) {
+			if (paging_identity_map(phys, h->length) != 0)
+				return 0;
+			return (struct fadt *)h;
+		}
+	}
+	return 0;
+}
+
+/* Map one already-located SDT (whose signature is sig) and scan its AML body for
+ * a byte sequence. Returns 1 if found. The header must be reachable; we map the
+ * full table once its length is known. A garbage length can't run away: it's a
+ * table's own self-reported size and we only ever read inside the mapped span. */
+static int sdt_contains(struct sdt_header *h, const char *sig,
+                        const uint8_t *needle, uint32_t n)
+{
+	if (!h || paging_identity_map((uint32_t)h, sizeof(*h)) != 0)
+		return 0;
+	if (!sig4(h->signature, sig) || h->length <= sizeof(*h) || n == 0)
+		return 0;
+	if (paging_identity_map((uint32_t)h, h->length) != 0)
+		return 0;
+
+	const uint8_t *body = (const uint8_t *)h + sizeof(*h);
+	uint32_t len = h->length - sizeof(*h);
+	if (len < n)
+		return 0;
+	for (uint32_t i = 0; i + n <= len; i++) {
+		uint32_t j = 0;
+		while (j < n && body[i + j] == needle[j])
+			j++;
+		if (j == n)
+			return 1;
+	}
+	return 0;
+}
+
+/* Scan the device AML for a byte sequence (e.g. an EISA _HID), looking in both
+ * the DSDT and every SSDT. Returns 1 if found. Firmware may declare a device —
+ * the battery especially — in an SSDT rather than the DSDT, so battery.c must
+ * search both. Returns 0 when ACPI isn't reachable (e.g. RSDP not in the legacy
+ * BIOS area, as on a pure-UEFI boot). */
+int acpi_aml_contains(const uint8_t *needle, uint32_t n)
+{
+	struct sdt_header *root;
+	uint32_t count;
+	int xsdt;
+	if (!find_root_sdt(&root, &count, &xsdt))
+		return 0;
+
+	/* The DSDT hangs off the FADT, not the root table, so reach it separately
+	 * (and via the 64-bit X_DSDT when the firmware uses it). */
+	struct fadt *f = find_fadt();
+	if (f && sdt_contains((struct sdt_header *)fadt_dsdt_phys(f), "DSDT", needle, n))
+		return 1;
+
+	/* Every other table is a direct root-table entry; scan the SSDTs. */
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t phys = root_entry(root, i, xsdt);
+		if (paging_identity_map(phys, sizeof(struct sdt_header)) != 0)
+			continue;
+		if (sdt_contains((struct sdt_header *)phys, "SSDT", needle, n))
+			return 1;
+	}
+	return 0;
+}
+
+/* Hand each AML definition block (DSDT, then every SSDT) to fn as a (body, len)
+ * pair past the 36-byte table header. Maps each table fully first. The AML
+ * interpreter uses this to build its namespace without duplicating the table
+ * walk. Mirrors acpi_aml_contains' traversal. */
+void acpi_for_each_aml(void (*fn)(const uint8_t *body, uint32_t len, void *ctx),
+                       void *ctx)
+{
+	struct sdt_header *root;
+	uint32_t count;
+	int xsdt;
+	if (!find_root_sdt(&root, &count, &xsdt))
+		return;
+
+	struct fadt *f = find_fadt();
+	if (f) {
+		uint32_t dphys = fadt_dsdt_phys(f);
+		struct sdt_header *d = (struct sdt_header *)dphys;
+		if (paging_identity_map(dphys, sizeof(*d)) == 0 &&
+		    sig4(d->signature, "DSDT") &&
+		    paging_identity_map(dphys, d->length) == 0 &&
+		    d->length > sizeof(*d))
+			fn((const uint8_t *)d + sizeof(*d), d->length - sizeof(*d), ctx);
+	}
+
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t phys = root_entry(root, i, xsdt);
+		struct sdt_header *h = (struct sdt_header *)phys;
+		if (paging_identity_map(phys, sizeof(*h)) != 0)
+			continue;
+		if (!sig4(h->signature, "SSDT"))
+			continue;
+		if (paging_identity_map(phys, h->length) != 0)
+			continue;
+		if (h->length > sizeof(*h))
+			fn((const uint8_t *)h + sizeof(*h), h->length - sizeof(*h), ctx);
+	}
+}
+
 /* Returns only if ACPI shutdown could not be performed. */
 static void acpi_off(void)
 {
-	struct rsdp *rsdp = find_rsdp();
-	if (!rsdp)
-		return;
-
-	/* The RSDT (and the tables it points to) usually sit near the top of RAM,
-	 * above the 16 MiB identity map, so map each before dereferencing it. */
-	struct sdt_header *rsdt = (struct sdt_header *)rsdp->rsdt_addr;
-	if (paging_identity_map(rsdp->rsdt_addr, sizeof(*rsdt)) != 0)
-		return;
-	if (!rsdt || !sig4(rsdt->signature, "RSDT"))
-		return;
-	if (paging_identity_map(rsdp->rsdt_addr, rsdt->length) != 0)
-		return;
-
-	/* Walk the RSDT's array of 32-bit table pointers looking for the FADT. */
-	uint32_t count = (rsdt->length - sizeof(*rsdt)) / 4;
-	uint32_t *entry = (uint32_t *)((uint8_t *)rsdt + sizeof(*rsdt));
-	struct fadt *f = 0;
-	for (uint32_t i = 0; i < count; i++) {
-		struct sdt_header *h = (struct sdt_header *)entry[i];
-		if (paging_identity_map(entry[i], sizeof(struct fadt)) != 0)
-			continue;
-		if (h && sig4(h->signature, "FACP")) {  /* FADT's signature is "FACP" */
-			f = (struct fadt *)h;
-			break;
-		}
-	}
+	struct fadt *f = find_fadt();
 	if (!f)
 		return;
 
@@ -200,14 +400,73 @@ void power_off(void)
 	outw(0x4004, 0x3400);   /* VirtualBox      */
 }
 
+/* ---- ACPI reset register (FADT) ---------------------------------------- *
+ * ACPI 2.0+ lets the firmware name the exact register and value that reboot
+ * the platform: a Generic Address Structure (RESET_REG) at FADT offset 116
+ * and a one-byte RESET_VALUE at offset 128, valid only when FADT flags bit 10
+ * (RESET_REG_SUP) is set. This is the spec-blessed reboot and the method most
+ * UEFI laptops actually honour — where the legacy 8042 pulse and a triple
+ * fault below often do nothing (the firmware/SMM swallows the fault and the
+ * box just hangs, which is exactly what "restart froze the OS" looks like).
+ * Returns if it couldn't issue the write; the caller falls through. */
+static void acpi_reset(void)
+{
+	struct fadt *f = find_fadt();
+	if (!f || f->header.length < 129)
+		return;
+
+	uint32_t flags = *(uint32_t *)((uint8_t *)f + 112);
+	if (!(flags & (1u << 10)))      /* RESET_REG_SUP */
+		return;
+
+	/* GAS layout: [0]=address-space id, [1..3]=width/offset/access, [4..11]=addr. */
+	uint8_t *gas   = (uint8_t *)f + 116;
+	uint8_t  space = gas[0];        /* 0 = system memory, 1 = system I/O */
+	uint64_t addr  = *(uint64_t *)(gas + 4);
+	uint8_t  value = *((uint8_t *)f + 128);
+	if (!addr)
+		return;
+
+	if (space == 1) {               /* system I/O space (the common case) */
+		outb((uint16_t)addr, value);
+	} else if (space == 0) {        /* memory-mapped reset register */
+		if (addr < 0x100000000ull &&
+		    paging_identity_map((uint32_t)addr, 1) == 0)
+			*(volatile uint8_t *)(uint32_t)addr = value;
+	}
+}
+
 void power_reset(void)
 {
+	/* Firmware-declared ACPI reset first — the most reliable path on real
+	 * (especially UEFI) hardware. Returns only if it couldn't be issued. */
+	acpi_reset();
+
+	/* The PCI reset-control register at port 0xCF9, present on essentially
+	 * every ICH/PCH-based x86 machine. Bit 2 (RST_CPU) triggers the reset and
+	 * bit 1 (SYS_RST) selects a full reset; assert them in the Linux-blessed
+	 * two-write order. Harmless on a box that lacks it. */
+	{
+		uint8_t v = inb(0xCF9) & ~0x06u;
+		outb(0xCF9, v | 0x02);   /* arm: SYS_RST */
+		io_wait();
+		outb(0xCF9, v | 0x06);   /* fire: SYS_RST | RST_CPU */
+		io_wait();
+	}
+
 	/* Pulse the reset line via the 8042: wait until the controller's input
-	 * buffer is empty (status bit 1 clear), then issue command 0xFE. */
-	uint8_t status;
-	do {
-		status = inb(0x64);
-	} while (status & 0x02);
+	 * buffer is empty (status bit 1 clear), then issue command 0xFE.
+	 *
+	 * The wait MUST be bounded. On real hardware with no 8042 (many laptops,
+	 * pure-UEFI machines) port 0x64 reads back 0xFF on the open bus, so
+	 * (status & 0x02) is permanently set and an unbounded loop hangs the
+	 * machine forever — which looks exactly like "restart froze the OS".
+	 * Spin a finite number of times, then issue 0xFE and fall through to the
+	 * triple fault below regardless: if the controller is alive the pulse
+	 * resets us, and if it isn't the triple fault does. QEMU's 8042 drains
+	 * immediately so this still resets cleanly there. */
+	for (int i = 0; i < 100000 && (inb(0x64) & 0x02); i++)
+		io_wait();
 	outb(0x64, 0xFE);
 
 	/* If that did nothing, force a triple fault: a null IDT means the next

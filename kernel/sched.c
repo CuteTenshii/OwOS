@@ -10,6 +10,7 @@
 #include "idt.h"
 #include "file.h"
 #include "pipe.h"
+#include "uwin.h"
 #include <stdint.h>
 
 #define MAX_TASKS   16
@@ -31,6 +32,7 @@ typedef struct task {
 	int           wait_pid;    /* pid being waited on while WAITING            */
 	int           exit_status; /* set on exit, read by waitpid                 */
 	const char   *name;
+	char          namebuf[16]; /* owns `name` for spawned programs (argv[0])    */
 	uint32_t      runs;
 	struct fd     fds[MAX_FD]; /* open file descriptors                        */
 	char          cwd[TASK_CWD_MAX]; /* working dir; relative path syscalls join here */
@@ -155,7 +157,13 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
 	if (!t)
 		return -1;
 	t->id = next_id++;
-	t->name = name;
+	{	/* copy the program name so it persists (callers pass argv[0]) */
+		int i = 0;
+		for (; name && name[i] && i < (int)sizeof t->namebuf - 1; i++)
+			t->namebuf[i] = name[i];
+		t->namebuf[i] = '\0';
+		t->name = t->namebuf;
+	}
 	t->runs = 0;
 	t->cr3 = (uint32_t)dir;
 	t->dir = dir;
@@ -173,6 +181,47 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
 	uint32_t *sp = (uint32_t *)t->kstack_top;
 	*--sp = 0x23;                   /* user SS                                 */
 	*--sp = user_esp;               /* user ESP (points at argc)               */
+	*--sp = 0x202;                  /* EFLAGS (IF set)                         */
+	*--sp = 0x1B;                   /* user CS                                 */
+	*--sp = entry;                  /* user EIP                                */
+	*--sp = (uint32_t)enter_user_task;
+	*--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;   /* ebp,ebx,esi,edi          */
+	t->esp = (uint32_t)sp;
+
+	enqueue(t);
+	return (int)t->id;
+}
+
+/* Spawn a thread inside the CURRENT process: a new task that SHARES the
+ * caller's address space (same CR3) and runs `entry` in ring 3 on the
+ * caller-provided user stack. dir=0 so its reap never frees the shared address
+ * space — that belongs to the process's main task. It is an ordinary child of
+ * the caller (parent = current->id), so the caller joins it with waitpid()
+ * before exiting (which is required: the threads must be gone before the main
+ * task's reap tears down the address space they run in). Returns its tid. */
+int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
+{
+	task_t *t = alloc_task();
+	if (!t)
+		return -1;
+	t->id = next_id++;
+	t->name = "thread";
+	t->runs = 0;
+	t->cr3 = current->cr3;          /* share the creator's address space      */
+	t->dir = 0;                     /* not the owner: don't free it on reap    */
+	t->parent = current->id;
+	t->state = TASK_RUNNABLE;
+	fds_init_console(t);
+	cwd_set(t->cwd, current->cwd);
+
+	uint8_t *kstack = kmalloc(UKSTACK_SIZE);
+	if (!kstack) { t->state = TASK_FREE; return -1; }
+	t->kstack = kstack;
+	t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
+
+	uint32_t *sp = (uint32_t *)t->kstack_top;
+	*--sp = 0x23;                   /* user SS                                 */
+	*--sp = user_esp;               /* user ESP                                */
 	*--sp = 0x202;                  /* EFLAGS (IF set)                         */
 	*--sp = 0x1B;                   /* user CS                                 */
 	*--sp = entry;                  /* user EIP                                */
@@ -267,6 +316,25 @@ struct fd *sched_fds(void)
 	return current->fds;
 }
 
+/* The current task's page directory (for the windowing layer to map a shared
+ * buffer into the calling process's user window). */
+uint32_t *sched_current_dir(void)
+{
+	return current->dir;
+}
+
+/* The current task's pid (owner id for windowing-layer bookkeeping). */
+uint32_t sched_current_id(void)
+{
+	return current->id;
+}
+
+/* The current task's name (for the crash reporter). */
+const char *sched_current_name(void)
+{
+	return current->name ? current->name : "task";
+}
+
 /* Point a (not-yet-running) process's fd at a pipe end -- used by the shell to
  * wire up `a | b` before the children are scheduled. */
 void sched_set_pipe_fd(int pid, int fd, int writer, int pipe_id)
@@ -301,6 +369,7 @@ void sched_yield(void)
 
 void sched_exit(int status)
 {
+	uwin_task_exiting(current->id);   /* tear down any GUI windows it owns */
 	fds_close_all(current);
 	current->exit_status = status;
 	current->state = TASK_ZOMBIE;

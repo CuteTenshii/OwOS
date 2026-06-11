@@ -18,6 +18,21 @@ static uint32_t bitmap[BITMAP_DWORDS];
 static uint32_t total_frames;
 static uint32_t used_frames;
 
+/* Frames backed by *real, allocatable RAM* (the available regions below 4 GiB).
+ * Distinct from total_frames, which also spans the PCI/MMIO hole and reserved
+ * regions just under 4 GiB — those are marked "used" in the bitmap but were
+ * never RAM. On real hardware that hole is ~1 GiB, so reporting used_frames as
+ * "memory in use" wildly overstates it; pmm_ram_used_kib() measures against this
+ * instead, to show what the OS actually allocated. */
+static uint32_t ram_frames;
+
+/* Total available RAM the firmware reported, in KiB — independent of the
+ * allocator, which the bitmap and 32-bit paging cap at MAX_FRAMES (4 GiB). On a
+ * machine with more than 4 GiB this is larger than total_frames*4: we *detect*
+ * all of it but can only *manage* the low 4 GiB without PAE. KiB (not bytes) so
+ * 16 GiB fits in a uint32 (16 GiB = 16777216 KiB; bytes would overflow). */
+static uint32_t installed_kib;
+
 static int  frame_test(uint32_t f)  { return (bitmap[f / 32] >> (f % 32)) & 1u; }
 static void frame_set(uint32_t f)   { bitmap[f / 32] |=  (1u << (f % 32)); }
 static void frame_clear(uint32_t f) { bitmap[f / 32] &= ~(1u << (f % 32)); }
@@ -30,8 +45,11 @@ void pmm_init(const struct multiboot_info *mbi)
 		return;
 	}
 
-	/* First pass: find the highest usable address to size the bitmap. */
+	/* First pass: find the highest usable address to size the bitmap, and sum
+	 * every available region (in 64-bit, so RAM above 4 GiB still counts) to
+	 * report the true installed total even though we can only manage 4 GiB. */
 	uint64_t highest = 0;
+	uint64_t avail   = 0;
 	uint32_t addr = mbi->mmap_addr;
 	uint32_t end  = mbi->mmap_addr + mbi->mmap_length;
 	while (addr < end) {
@@ -41,9 +59,11 @@ void pmm_init(const struct multiboot_info *mbi)
 			uint64_t top = e->addr + e->len;
 			if (top > highest)
 				highest = top;
+			avail += e->len;
 		}
 		addr += e->size + 4;
 	}
+	installed_kib = (uint32_t)(avail / 1024);
 
 	total_frames = highest / FRAME_SIZE;
 	if (total_frames > MAX_FRAMES)
@@ -65,6 +85,7 @@ void pmm_init(const struct multiboot_info *mbi)
 				if (frame_test(f)) {
 					frame_clear(f);
 					used_frames--;
+					ram_frames++;   /* a frame of real, usable RAM */
 				}
 			}
 		}
@@ -123,6 +144,24 @@ void pmm_free_frame(uint32_t phys)
 	}
 }
 
-uint32_t pmm_total_bytes(void) { return total_frames * FRAME_SIZE; }
-uint32_t pmm_used_bytes(void)  { return used_frames * FRAME_SIZE; }
-uint32_t pmm_free_bytes(void)  { return (total_frames - used_frames) * FRAME_SIZE; }
+/* Reported in KiB, not bytes: a fully-populated 4 GiB machine is 4194304 KiB,
+ * which fits in a uint32, whereas the byte count (4 GiB = 2^32) would wrap to
+ * 0 — which is exactly why a real ≥4 GiB laptop printed "0 MiB RAM detected"
+ * while QEMU's 128 MiB looked fine. (total_frames is clamped to MAX_FRAMES, so
+ * total_frames * 4 never overflows.) */
+uint32_t pmm_installed_kib(void) { return installed_kib; }
+uint32_t pmm_total_kib(void) { return total_frames * (FRAME_SIZE / 1024); }
+uint32_t pmm_used_kib(void)  { return used_frames * (FRAME_SIZE / 1024); }
+uint32_t pmm_free_kib(void)  { return (total_frames - used_frames) * (FRAME_SIZE / 1024); }
+
+/* RAM the OS has actually allocated, in KiB: manageable RAM minus what's still
+ * free. Every currently-free frame is RAM (only RAM frames are ever cleared), so
+ * free RAM is total_frames-used_frames and used RAM is the rest of ram_frames.
+ * Unlike pmm_used_kib() this excludes the PCI/MMIO hole and reserved regions, so
+ * it reflects real usage (~16 MiB at boot) instead of ~1 GiB of unusable hole. */
+uint32_t pmm_ram_used_kib(void)
+{
+	uint32_t free_ram = total_frames - used_frames;
+	uint32_t used_ram = ram_frames > free_ram ? ram_frames - free_ram : 0;
+	return used_ram * (FRAME_SIZE / 1024);
+}

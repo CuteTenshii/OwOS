@@ -29,4 +29,58 @@ void puts(const char *s);                     /* write a NUL-terminated string *
 void print_uint(unsigned v);                  /* write a decimal number        */
 int  readline(char *buf, int max);            /* echoed line input, returns len*/
 
+/* ----------------------------------------------------------- windowing API */
+/*
+ * A program creates one window, gets a shared client pixel buffer mapped at
+ * WIN_FB_ADDR (XRGB8888, row-major, pitch = the width passed to win_create),
+ * draws into it, calls win_present() to show it, and reads input events.
+ * win_wait() sleeps roughly one frame so the event loop doesn't busy-spin.
+ */
+#define WIN_FB_ADDR  0x00300000u
+
+#define WEV_KEY    1    /* a = key char (control codes < 0x20 for editing keys) */
+#define WEV_MOUSE  2    /* a, b = client-relative x, y of a left click          */
+#define WEV_CLOSE  3    /* the close box was clicked                            */
+#define WEV_RESIZE 4    /* a, b = new client w, h (only if win_resizable on)    */
+
+struct win_event { unsigned type; int a, b; };
+
+int  win_create(int w, int h, const char *title);  /* -> window id, or -1      */
+int  win_present(int id);                           /* flush the buffer to screen */
+int  win_poll(int id, struct win_event *ev);        /* 1 = got event, 0 = none  */
+void win_wait(int id);                              /* sleep ~a frame for events */
+int  win_close(int id);
+
+static inline unsigned *win_fb(void) { return (unsigned *)WIN_FB_ADDR; }
+
+int win_settitle(int id, const char *title);   /* set the window's title bar */
+int win_resizable(int id, int on);   /* opt the window in/out of user resizing */
+
+/* Wall-clock time, packed as (hour<<16)|(min<<8)|sec. */
+unsigned now_hms(void);
+
+/* Sleep for `ms` milliseconds (yields the CPU to other tasks meanwhile). */
+void msleep(unsigned ms);
+
+/* Threads. thread_create spawns `fn` on a caller-provided stack, sharing this
+ * process's address space; it returns a tid. The thread function must not
+ * return (loop, then call exit()); join it with thread_join (== waitpid) before
+ * the process exits, so the shared address space outlives every thread. */
+int thread_create(void (*fn)(void), void *stack_top);
+static inline int thread_join(int tid) { return waitpid(tid); }
+
+/* Directory enumeration: fill *out with the idx-th child of `path`
+ * (NULL/""/"/" = root). Returns 1 if it exists, 0 past the end, -1 on error. */
+struct dirent_u { char name[20]; int is_dir; unsigned size; };
+int readdir(const char *path, int idx, struct dirent_u *out);
+
+/* Editing key codes delivered via WEV_KEY (mirror kernel/keyboard.h). */
+#define KEY_UP     0x01
+#define KEY_DOWN   0x02
+#define KEY_LEFT   0x03
+#define KEY_RIGHT  0x04
+#define KEY_HOME   0x05
+#define KEY_END    0x06
+#define KEY_DELETE 0x07
+
 #endif /* OWOS_USER_H */

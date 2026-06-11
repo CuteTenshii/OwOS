@@ -80,25 +80,65 @@ int pci_count(void)
 	return device_count;
 }
 
-/* A friendly name for the common class/subclass pairs QEMU exposes. */
+/* A friendly name for the PCI class/subclass pairs. Covers the full standard
+ * base-class list (not just what QEMU exposes) so a real laptop's many
+ * Intel-vendor devices we don't have an exact model for still read as e.g.
+ * "Intel SMBus" instead of "Intel Unknown device". */
 static const char *class_name(uint8_t cls, uint8_t sub)
 {
 	switch (cls) {
+	case 0x00: return "Unclassified device";
 	case 0x01:
+		if (sub == 0x00) return "SCSI controller";
 		if (sub == 0x01) return "IDE controller";
+		if (sub == 0x02) return "Floppy controller";
+		if (sub == 0x04) return "RAID controller";
+		if (sub == 0x05) return "ATA controller";
 		if (sub == 0x06) return "SATA controller";
+		if (sub == 0x07) return "SAS controller";
+		if (sub == 0x08) return "NVMe controller";
 		return "Storage controller";
-	case 0x02: return "Network controller";
-	case 0x03: return "Display controller";
-	case 0x04: return "Multimedia controller";
+	case 0x02:
+		if (sub == 0x00) return "Ethernet controller";
+		if (sub == 0x80) return "Network controller";
+		return "Network controller";
+	case 0x03:
+		if (sub == 0x00) return "VGA controller";
+		return "Display controller";
+	case 0x04:
+		if (sub == 0x01) return "Audio controller";
+		if (sub == 0x03) return "HD Audio controller";
+		return "Multimedia controller";
+	case 0x05:
+		if (sub == 0x00) return "RAM controller";
+		if (sub == 0x01) return "Flash memory controller";
+		return "Memory controller";
 	case 0x06:
 		if (sub == 0x00) return "Host bridge";
 		if (sub == 0x01) return "ISA bridge";
 		if (sub == 0x04) return "PCI bridge";
 		return "Bridge";
+	case 0x07:
+		if (sub == 0x80) return "Communication controller";
+		return "Communication controller";
+	case 0x08:
+		if (sub == 0x05) return "SD Host controller";
+		return "System peripheral";
+	case 0x09: return "Input device controller";
+	case 0x0A: return "Docking station";
+	case 0x0B: return "Processor";
 	case 0x0C:
+		if (sub == 0x00) return "FireWire controller";
 		if (sub == 0x03) return "USB controller";
+		if (sub == 0x05) return "SMBus controller";
 		return "Serial bus controller";
+	case 0x0D: return "Wireless controller";
+	case 0x0E: return "Intelligent controller";
+	case 0x0F: return "Satellite communication controller";
+	case 0x10: return "Encryption controller";
+	case 0x11: return "Signal processing controller";
+	case 0x12: return "Processing accelerator";
+	case 0x13: return "Non-essential instrumentation";
 	default: return "Unknown device";
 	}
 }

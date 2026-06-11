@@ -20,6 +20,10 @@ void sched_create_thread(const char *name, void (*entry)(void));
 int  sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
                           uint32_t user_esp);
 
+/* Spawn a thread inside the current process (shares its address space); runs
+ * `entry` on the user stack `user_esp`. Returns the thread's tid, or -1. */
+int  sched_create_user_thread(uint32_t entry, uint32_t user_esp);
+
 /* fork the current process from its syscall trap frame; returns child pid to
  * the parent (the child returns 0 via the duplicated frame). */
 int  sched_fork(struct registers *r);
@@ -33,6 +37,9 @@ void sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp,
 void schedule(void);     /* invoked from the timer tick                       */
 void sched_yield(void);  /* voluntarily give up the CPU (stays runnable)      */
 struct fd *sched_fds(void);   /* the current task's file descriptor table     */
+uint32_t *sched_current_dir(void); /* current task's page dir (windowing layer) */
+uint32_t  sched_current_id(void);  /* current task's pid                        */
+const char *sched_current_name(void); /* current task's name (crash reporter)   */
 void sched_set_pipe_fd(int pid, int fd, int writer, int pipe_id);
 void sched_set_cwd(int pid, const char *path);  /* set a child's working dir    */
 const char *sched_cwd(void);  /* the current task's working dir (absolute)     */

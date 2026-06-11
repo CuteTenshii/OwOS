@@ -32,11 +32,13 @@
 
 static volatile int      cur_x, cur_y;
 static volatile int      buttons;
+static volatile int      wheel;        /* cumulative wheel notches              */
 static volatile uint32_t seq;
 static int               bound_x, bound_y;
 
-static uint8_t           packet[3];
+static uint8_t           packet[4];
 static uint8_t           cycle;
+static int               wheel_mode;   /* 1 once IntelliMouse 4-byte mode is on  */
 
 /* Spin until the controller can accept a write (input buffer empties). */
 static void ps2_wait_write(void)
@@ -88,6 +90,13 @@ static void mouse_apply(void)
 	cur_x = nx;
 	cur_y = ny;
 	buttons = flags & (PKT_LEFT | PKT_RIGHT | PKT_MIDDLE);
+
+	if (wheel_mode) {
+		/* Byte 3 carries the wheel delta in its low nibble, sign-extended. */
+		int dz = packet[3] & 0x0F;
+		if (dz & 0x08) dz -= 16;
+		wheel += dz;
+	}
 	seq++;
 }
 
@@ -99,6 +108,7 @@ static void mouse_handler(struct registers *r)
 		return;
 
 	uint8_t data = inb(PS2_DATA);
+	int last = wheel_mode ? 3 : 2;    /* index of the packet's final byte       */
 	switch (cycle) {
 	case 0:
 		if (!(data & PKT_ALWAYS1))   /* resync on the always-1 bit             */
@@ -112,6 +122,11 @@ static void mouse_handler(struct registers *r)
 		break;
 	case 2:
 		packet[2] = data;
+		if (last == 2) { cycle = 0; mouse_apply(); }
+		else             cycle = 3;
+		break;
+	case 3:
+		packet[3] = data;
 		cycle = 0;
 		mouse_apply();
 		break;
@@ -155,6 +170,22 @@ void mouse_init(int max_x, int max_y)
 	outb(PS2_CMD, 0xAE);
 
 	mouse_command(0xF6);           /* load default settings                    */
+
+	/* Try to switch the mouse into IntelliMouse mode (adds a scroll-wheel byte
+	 * to every packet). The "magic knock" is three set-sample-rate commands
+	 * (200, 100, 80); afterwards the device reports ID 3 if it has a wheel. */
+	mouse_command(0xF3); mouse_command(200);
+	mouse_command(0xF3); mouse_command(100);
+	mouse_command(0xF3); mouse_command(80);
+	ps2_wait_write();
+	outb(PS2_CMD, 0xD4);
+	ps2_wait_write();
+	outb(PS2_DATA, 0xF2);          /* get device ID                            */
+	ps2_wait_read();
+	(void)inb(PS2_DATA);           /* ACK                                      */
+	ps2_wait_read();
+	wheel_mode = (inb(PS2_DATA) == 3);
+
 	mouse_command(0xF4);           /* enable data reporting                    */
 
 	irq_register(12, mouse_handler);
@@ -165,4 +196,5 @@ void mouse_init(int max_x, int max_y)
 int      mouse_x(void)        { return cur_x; }
 int      mouse_y(void)        { return cur_y; }
 int      mouse_buttons(void)  { return buttons; }
+int      mouse_wheel(void)    { return wheel; }
 uint32_t mouse_seq(void)      { return seq; }

@@ -17,6 +17,17 @@
 #define SYS_NET_SEND   13
 #define SYS_NET_RECV   14
 #define SYS_NET_CLOSE  15
+#define SYS_WIN_CREATE 16
+#define SYS_WIN_PRESENT 17
+#define SYS_WIN_POLL   18
+#define SYS_WIN_WAIT   19
+#define SYS_WIN_CLOSE  20
+#define SYS_RTC        21
+#define SYS_READDIR    22
+#define SYS_WIN_TITLE  23
+#define SYS_THREAD     24
+#define SYS_SLEEP      25
+#define SYS_WIN_RESIZABLE 26
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -103,6 +114,61 @@ int net_recv(int h, void *buf, int max)
 int net_close(int h)
 {
 	return syscall(SYS_NET_CLOSE, h, 0, 0);
+}
+
+int win_create(int w, int h, const char *title)
+{
+	return syscall(SYS_WIN_CREATE, w, h, (int)title);
+}
+
+int win_present(int id)
+{
+	return syscall(SYS_WIN_PRESENT, id, 0, 0);
+}
+
+int win_poll(int id, struct win_event *ev)
+{
+	return syscall(SYS_WIN_POLL, id, (int)ev, 0);
+}
+
+void win_wait(int id)
+{
+	syscall(SYS_WIN_WAIT, id, 0, 0);
+}
+
+int win_close(int id)
+{
+	return syscall(SYS_WIN_CLOSE, id, 0, 0);
+}
+
+int win_settitle(int id, const char *title)
+{
+	return syscall(SYS_WIN_TITLE, id, (int)title, 0);
+}
+
+int win_resizable(int id, int on)
+{
+	return syscall(SYS_WIN_RESIZABLE, id, on, 0);
+}
+
+unsigned now_hms(void)
+{
+	return (unsigned)syscall(SYS_RTC, 0, 0, 0);
+}
+
+int readdir(const char *path, int idx, struct dirent_u *out)
+{
+	return syscall(SYS_READDIR, (int)path, idx, (int)out);
+}
+
+void msleep(unsigned ms)
+{
+	syscall(SYS_SLEEP, (int)ms, 0, 0);
+}
+
+int thread_create(void (*fn)(void), void *stack_top)
+{
+	return syscall(SYS_THREAD, (int)fn, (int)stack_top, 0);
 }
 
 static int slen(const char *s)

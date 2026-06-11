@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-#define USER_BASE       0x00200000u    /* 2 MiB: where user code is loaded    */
+#define USER_BASE       0x00280000u    /* 2.5 MiB: where user code is loaded  */
 #define USER_REGION_END 0x00400000u    /* 4 MiB: end of the user window       */
 #define USER_STACK_TOP  0x003FF000u    /* user stack grows down from here     */
 

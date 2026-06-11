@@ -369,7 +369,7 @@ int peer_fetch_piece(const struct torrent *t, const uint8_t ip[4],
 		return -1;
 	int rc = -1;
 	if (peer_start_piece(pc, t, index, out) == 0) {
-		uint32_t deadline = timer_ticks() + 3000;  /* ~30 s                  */
+		uint32_t deadline = timer_ticks() + 30 * TIMER_HZ;  /* ~30 s          */
 		for (;;) {
 			int r = peer_pump(pc, t);
 			if (r == PEER_PIECE) { rc = (int)pc->piece_size; break; }
