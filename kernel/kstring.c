@@ -8,3 +8,11 @@ void kmemcpy(void *dst, const void *src, uint32_t n)
 	while (n--)
 		*d++ = *s++;
 }
+
+/* gcc lowers struct/array assignments (e.g. in fat.c) to implicit memcpy calls
+ * even under -ffreestanding, so the freestanding kernel must provide one. */
+void *memcpy(void *dst, const void *src, uint32_t n)
+{
+	kmemcpy(dst, src, n);
+	return dst;
+}

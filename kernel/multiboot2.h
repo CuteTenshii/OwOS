@@ -20,6 +20,7 @@
 #define MB2_TAG_FRAMEBUFFER 8
 #define MB2_TAG_EFI32       11   /* EFI 32-bit system table ptr (UEFI only)    */
 #define MB2_TAG_EFI64       12   /* EFI 64-bit system table ptr (UEFI only)    */
+#define MB2_TAG_SMBIOS      13   /* a copy of the SMBIOS entry point + tables  */
 #define MB2_TAG_ACPI_OLD    14   /* a copy of the ACPI 1.0 RSDP (RSDT path)    */
 #define MB2_TAG_ACPI_NEW    15   /* a copy of the ACPI 2.0+ RSDP (has XSDT too) */
 
@@ -69,6 +70,36 @@ struct mb2_tag_acpi {
 	uint32_t type;
 	uint32_t size;
 	uint8_t  rsdp[];
+} __attribute__((packed));
+
+/* type 11/12: the firmware's EFI system table pointer (UEFI boots only). 32-bit
+ * GRUB emits type 11 with a 32-bit pointer, 64-bit GRUB type 12 with a 64-bit
+ * one. The system table's configuration-table array is the canonical place to
+ * find SMBIOS/ACPI under UEFI (no legacy BIOS area to scan). */
+struct mb2_tag_efi32 {
+	uint32_t type;
+	uint32_t size;
+	uint32_t pointer;
+} __attribute__((packed));
+
+struct mb2_tag_efi64 {
+	uint32_t type;
+	uint32_t size;
+	uint64_t pointer;
+} __attribute__((packed));
+
+/* type 13: a verbatim copy of the SMBIOS entry-point structure followed by the
+ * structure table. On UEFI the entry point is not in the legacy f-segment, so
+ * this tag is the only way to reach DMI (vendor/product for the splash). The
+ * entry point begins at `tables` ("_SM_"/"_SM3_"); smbios.c parses it from
+ * there. major/minor are the SMBIOS version. */
+struct mb2_tag_smbios {
+	uint32_t type;
+	uint32_t size;
+	uint8_t  major;
+	uint8_t  minor;
+	uint8_t  reserved[6];
+	uint8_t  tables[];
 } __attribute__((packed));
 
 #endif /* OWOS_MULTIBOOT2_H */

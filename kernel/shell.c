@@ -9,6 +9,10 @@
 #include "heap.h"
 #include "sched.h"
 #include "fs.h"
+#include "fat.h"
+#include "hfs.h"
+#include "ext.h"
+#include "blk.h"
 #include "ata.h"
 #include "ahci.h"
 #include "nvme.h"
@@ -294,6 +298,23 @@ static void print_kib(const char *label, uint32_t kib)
 
 /* List every storage device the kernel brought up, with its capacity, and do a
  * read-only sanity check (read LBA 0) on the DMA-based controllers. */
+/* Print a 512-byte-sector capacity as "N MiB", or "N.N GiB" once it reaches
+ * 1 GiB so large disks read naturally. */
+static void write_capacity(uint32_t sectors)
+{
+	uint32_t mib = sectors / 2048;
+	if (mib >= 1024) {
+		uint32_t tenths = (mib * 10) / 1024;   /* MiB -> tenths of a GiB        */
+		vga_write_dec(tenths / 10);
+		vga_putc('.');
+		vga_write_dec(tenths % 10);
+		vga_write(" GiB");
+	} else {
+		vga_write_dec(mib);
+		vga_write(" MiB");
+	}
+}
+
 static void cmd_storage(void)
 {
 	uint8_t buf[512];
@@ -303,16 +324,16 @@ static void cmd_storage(void)
 		vga_write("  IDE/ATA    ");
 		vga_write(ata_model());
 		vga_write("  ");
-		vga_write_dec(ata_sectors() / 2048);
-		vga_write(" MiB (PIO, primary master)\n");
+		write_capacity(ata_sectors());
+		vga_write(" (PIO, primary master)\n");
 		n++;
 	}
 	if (ahci_present()) {
 		vga_write("  SATA/AHCI  ");
 		vga_write(ahci_model());
 		vga_write("  ");
-		vga_write_dec(ahci_sectors() / 2048);
-		vga_write(" MiB (DMA) -- read LBA0: ");
+		write_capacity(ahci_sectors());
+		vga_write(" (DMA) -- read LBA0: ");
 		vga_write(ahci_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
 		n++;
 	}
@@ -320,8 +341,8 @@ static void cmd_storage(void)
 		vga_write("  NVMe       ");
 		vga_write(nvme_model());
 		vga_write("  ");
-		vga_write_dec(nvme_sectors() / 2048);
-		vga_write(" MiB (ns 1) -- read LBA0: ");
+		write_capacity(nvme_sectors());
+		vga_write(" (ns 1) -- read LBA0: ");
 		vga_write(nvme_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
 		n++;
 	}
@@ -1588,6 +1609,42 @@ static void bi_lsusb(const char *a)
 	usb_list(port);
 }
 static void bi_storage(const char *a)  { (void)a; cmd_storage(); }
+
+/* Safely detach the removable volume mounted at /media so the medium can be removed.
+ * Writes are write-through, so there is nothing buffered to flush -- this just
+ * drops the mount. `mount` re-probes a non-owofs disk and remounts. */
+static void bi_eject(const char *a)
+{
+	(void)a;
+	int hfs = hfs_mounted(), ext = ext_mounted();
+	if (!fat_mounted() && !hfs && !ext) {
+		vga_write("eject: nothing mounted at /media\n");
+		return;
+	}
+	vga_write("eject: detaching ");
+	vga_write(ext ? ext_type() : hfs ? hfs_type() : fat_type());
+	const char *label = ext ? ext_label() : hfs ? hfs_label() : fat_label();
+	if (label[0]) {
+		vga_write(" \"");
+		vga_write(label);
+		vga_write("\"");
+	}
+	vga_write(" from /media -- safe to remove\n");
+	if (ext)      ext_unmount();
+	else if (hfs) hfs_unmount();
+	else          fat_unmount();
+}
+
+static void bi_mount(const char *a)
+{
+	(void)a;
+	if (fat_mounted() || hfs_mounted() || ext_mounted()) {
+		vga_write("mount: a volume is already mounted at /media\n");
+		return;
+	}
+	if (blk_mount_fat() != 0)
+		vga_write("mount: no FAT/HFS+/ext volume found\n");
+}
 static void bi_beep(const char *a)     { (void)a; speaker_beep(1000, 200); }
 static void bi_play(const char *a)
 {
@@ -1660,6 +1717,8 @@ static const struct builtin builtins[] = {
 	{ "lspci",    bi_lspci,     "lspci         list PCI devices" },
 	{ "lsusb",    bi_lsusb,     "lsusb [port]  list USB devices (port: detail for one)" },
 	{ "storage",  bi_storage,   "storage       list storage devices (IDE/SATA/NVMe)" },
+	{ "mount",    bi_mount,     "mount         mount a removable volume (USB/SD/disk) at /media" },
+	{ "eject",    bi_eject,     "eject         safely detach the removable volume at /media" },
 	{ "beep",     bi_beep,      "beep          beep the PC speaker" },
 	{ "play",     bi_play,      "play [arg]    play a tune (twinkle/megalovania/sweden) or a .wav file" },
 	{ "cpuinfo",  bi_cpuinfo,   "cpuinfo       CPU vendor, model, and feature flags" },

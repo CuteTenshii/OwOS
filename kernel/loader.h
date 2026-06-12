@@ -4,9 +4,15 @@
 
 #include <stdint.h>
 
-#define USER_BASE       0x00280000u    /* 2.5 MiB: where user code is loaded  */
-#define USER_REGION_END 0x00400000u    /* 4 MiB: end of the user window       */
-#define USER_STACK_TOP  0x003FF000u    /* user stack grows down from here     */
+/* Each process gets a large PRIVATE virtual window at 1 GiB, backed on demand by
+ * pmm high memory (>16 MiB) through its own page tables. 1 GiB is clear of the
+ * identity map (low 16 MiB), the kernel heap/pool, every device MMIO mapping,
+ * and the per-window framebuffer at WIN_FB_VADDR (3 GiB), so it collides with
+ * nothing. The span is the per-process cap; frames are only allocated for the
+ * program image + stack actually used. */
+#define USER_BASE       0x40000000u    /* 1 GiB: where user code is loaded      */
+#define USER_REGION_END 0x44000000u    /* +64 MiB: end of the per-process window */
+#define USER_STACK_TOP  0x43FFF000u    /* user stack grows down from the top    */
 
 /* Build a fresh address space from an ELF32 image. On success returns 0 and
  * fills *out_dir / *out_entry; on a bad image returns -1. */

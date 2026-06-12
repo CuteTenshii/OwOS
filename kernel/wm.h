@@ -29,6 +29,20 @@
 #define WM_MIN_W     140     /* smallest a window may be dragged to            */
 #define WM_MIN_H     90
 
+/* Cursor shapes. The compositor picks one per frame from context (a hand over
+ * clickable chrome, the diagonal arrow over a resize grip, the spinner while a
+ * window is still catching up after a live-resize). An app can also request a
+ * shape for its own client area via w->cursor / wm_set_cursor (e.g. an I-beam
+ * over editable text). WM_CURSOR_ARROW (0) is the default. */
+enum wm_cursor {
+	WM_CURSOR_ARROW = 0,    /* the plain pointer                              */
+	WM_CURSOR_HAND,         /* pointing hand — over clickable things          */
+	WM_CURSOR_TEXT,         /* I-beam — over editable / selectable text       */
+	WM_CURSOR_BUSY,         /* animated spinner — "working / loading"         */
+	WM_CURSOR_RESIZE,       /* diagonal double-arrow — over a resize grip     */
+	WM_CURSOR_COUNT
+};
+
 struct window {
 	int  x, y, w, h;
 	char title[WM_TITLE_MAX];
@@ -52,6 +66,11 @@ struct window {
 	/* The scroll wheel moved while the cursor was over this window. `dz` is the
 	 * notch delta (positive = wheel away from the user / scroll up). */
 	void     (*scroll)(struct window *w, int mx, int my, int dz);
+
+	/* Preferred cursor shape (enum wm_cursor) while the pointer is over this
+	 * window's client area; 0 (WM_CURSOR_ARROW) = the default pointer. Resize
+	 * grips and the close box always win over this. */
+	int  cursor;
 
 	void *state;             /* per-window app data (opaque to the WM)         */
 };
@@ -80,6 +99,11 @@ struct window *wm_create_window(int x, int y, int w, int h,
  * The new title shows the next time the window is repainted — pair it with a
  * dirty() bump if nothing else is forcing a redraw that frame. */
 void wm_set_title(struct window *w, const char *title);
+
+/* Request the cursor shape (enum wm_cursor) shown while the pointer is over
+ * this window's client area. Takes effect on the next frame the pointer is
+ * inside; pass WM_CURSOR_ARROW to go back to the default pointer. */
+void wm_set_cursor(struct window *w, int cursor);
 
 /* Destroy a window: hide it, clear its callbacks, and mark its pool slot
  * reusable by a later wm_create_window. The struct window* must not be used

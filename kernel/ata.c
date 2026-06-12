@@ -58,12 +58,15 @@ static int wait_drq(void)
 	return -1;
 }
 
-static int issue(uint32_t lba, uint8_t cmd)
+/* Start a transfer of `count` sectors (1..256) at `lba`. The SECCNT register is
+ * 8-bit and reads 0 as 256, so (uint8_t)256 == 0 is exactly right for a
+ * full-block transfer. */
+static int issue(uint32_t lba, uint8_t cmd, uint32_t count)
 {
 	if (wait_not_busy())
 		return -1;
 	outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));  /* master, LBA mode        */
-	outb(ATA_SECCNT, 1);
+	outb(ATA_SECCNT, (uint8_t)count);
 	outb(ATA_LBA0, lba & 0xFF);
 	outb(ATA_LBA1, (lba >> 8) & 0xFF);
 	outb(ATA_LBA2, (lba >> 16) & 0xFF);
@@ -71,24 +74,40 @@ static int issue(uint32_t lba, uint8_t cmd)
 	return 0;
 }
 
+/* Read `count` sectors into buf. One READ SECTORS command covers up to 256
+ * sectors (the LBA28 limit); the drive raises DRQ once per sector, and each is
+ * drained with a single `rep insw`. Batching this way turns the old
+ * 256-inw-per-sector loop (a VM-exit per word) into one bulk transfer per
+ * sector and amortizes the command setup across the whole run. */
+int ata_read(uint32_t lba, void *buf, uint32_t count)
+{
+	uint8_t *p = buf;
+	while (count > 0) {
+		uint32_t n = count > 256 ? 256 : count;
+		if (issue(lba, CMD_READ, n))
+			return -1;
+		for (uint32_t s = 0; s < n; s++) {
+			if (wait_drq())
+				return -1;
+			insw(ATA_DATA, p, 256);
+			p += 512;
+		}
+		lba   += n;
+		count -= n;
+	}
+	return 0;
+}
+
 int ata_read_sector(uint32_t lba, void *buf)
 {
-	if (issue(lba, CMD_READ) || wait_drq())
-		return -1;
-	uint16_t *w = buf;
-	for (int i = 0; i < 256; i++)
-		w[i] = inw(ATA_DATA);
-	return 0;
+	return ata_read(lba, buf, 1);
 }
 
 int ata_write_sector(uint32_t lba, const void *buf)
 {
-	if (issue(lba, CMD_WRITE) || wait_drq())
+	if (issue(lba, CMD_WRITE, 1) || wait_drq())
 		return -1;
-	const uint16_t *w = buf;
-	for (int i = 0; i < 256; i++)
-		outw(ATA_DATA, w[i]);
-
+	outsw(ATA_DATA, buf, 256);
 	outb(ATA_STATUS, CMD_FLUSH);       /* commit to the platter               */
 	return wait_not_busy();
 }

@@ -35,7 +35,6 @@ static void launch_bin(const char *name)
 }
 
 static void launch_editor(void)  { launch_bin("editor"); }
-static void launch_demo(void)    { launch_bin("demo"); }
 static void launch_files(void)   { launch_bin("files"); }
 static void launch_clock(void)   { launch_bin("clock"); }
 static void launch_about(void)   { launch_bin("about"); }
@@ -48,7 +47,6 @@ static const struct { const char *name; void (*launch)(void); } app_menu[] = {
 	{ "Browser", launch_browser   },
 	{ "Clock",   launch_clock     },
 	{ "About",   launch_about     },
-	{ "Demo",    launch_demo      },
 };
 
 int apps_menu_count(void)

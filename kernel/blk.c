@@ -11,6 +11,10 @@
 #include "ata.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "xhci.h"
+#include "fat.h"
+#include "hfs.h"
+#include "ext.h"
 #include "pmm.h"
 #include "paging.h"
 #include "vga.h"
@@ -93,6 +97,75 @@ int blk_use_ram(void)
 	return 0;
 }
 
+/* What kind of device currently backs the removable volume mounted at /media, for the
+ * UI to label it (e.g. "USB" in the file explorer's Devices list). Set by
+ * blk_mount_fat; meaningful only while a FAT volume is mounted. */
+static const char *fat_src = "";
+
+const char *blk_fat_source(void)
+{
+	return fat_src;
+}
+
+/* Announce whichever removable volume just mounted (FAT via fat.c or HFS+ via
+ * hfs.c) and remember its backing device for the UI's Devices list. */
+static void announce_vol(const char *source)
+{
+	fat_src = source;
+	int ro = hfs_mounted() || ext_mounted();
+	const char *type  = ext_mounted() ? ext_type()  : hfs_mounted() ? hfs_type()  : fat_type();
+	const char *label = ext_mounted() ? ext_label() : hfs_mounted() ? hfs_label() : fat_label();
+	vga_write("vol: mounted ");
+	vga_write(type);
+	if (label[0]) {
+		vga_write(" \""); vga_write(label); vga_write("\"");
+	}
+	vga_write(" on "); vga_write(source);
+	vga_write(ro ? " (ro)\n" : fat_writable() ? " (rw)\n" : " (ro)\n");
+}
+
+/* Try every removable FS we support on one device: FAT, then HFS+, then ext. */
+static int mount_removable(const char *name, fat_read_fn r, fat_write_fn w)
+{
+	if (fat_mount_probe(r, w) == 0) { announce_vol(name); return 0; }
+	if (hfs_mount_probe(r) == 0)    { announce_vol(name); return 0; }
+	if (ext_mount_probe(r) == 0)    { announce_vol(name); return 0; }
+	return -1;
+}
+
+int blk_mount_fat(void)
+{
+	/* Mount a removable volume on the first present device that owofs is NOT
+	 * using as its own backing store. owofs lives on one disk (blk_init's pick);
+	 * a stick/SD/second image lives on another. This is where device knowledge
+	 * belongs -- fat.c/hfs.c stay controller-agnostic. */
+
+	/* A USB mass-storage device is the most natural target -- a real removable
+	 * stick -- so try it first. It only becomes present after xhci_boot()
+	 * enumerates it, which is why this runs again post-boot. */
+	if (xhci_msc_present()) {
+		/* USB MSC has no write hook wired here; FAT writes still work because
+		 * xhci_msc_write is passed. */
+		if (mount_removable("USB", xhci_msc_read, xhci_msc_write) == 0)
+			return 0;
+	}
+
+	struct { int present; enum backend id; const char *name;
+	         fat_read_fn r; fat_write_fn w; } dev[] = {
+		{ ata_present(),  BK_IDE,  "IDE",  ata_read_sector,  ata_write_sector  },
+		{ ahci_present(), BK_AHCI, "SATA", ahci_read_sector, ahci_write_sector },
+		{ nvme_present(), BK_NVME, "NVMe", nvme_read_sector, nvme_write_sector },
+	};
+	for (unsigned i = 0; i < sizeof(dev) / sizeof(dev[0]); i++) {
+		if (!dev[i].present || dev[i].id == backend)
+			continue;                  /* skip absent disks and owofs's own */
+		if (mount_removable(dev[i].name, dev[i].r, dev[i].w) == 0)
+			return 0;
+	}
+	vga_write("vol: no FAT/HFS+/ext volume found\n");
+	return -1;
+}
+
 int blk_read_sector(uint32_t lba, void *buf)
 {
 	switch (backend) {
@@ -106,6 +179,22 @@ int blk_read_sector(uint32_t lba, void *buf)
 		return 0;
 	default:      return -1;
 	}
+}
+
+int blk_read(uint32_t lba, void *buf, uint32_t count)
+{
+	if (count == 0)
+		return 0;
+	/* IDE gets the batched READ SECTORS path; the others have no multi-sector
+	 * primitive here, so fan out to their per-sector read (RAM is a memcpy,
+	 * AHCI/NVMe already issue one fast command each). */
+	if (backend == BK_IDE)
+		return ata_read(lba, buf, count);
+	uint8_t *p = buf;
+	for (uint32_t i = 0; i < count; i++, p += 512)
+		if (blk_read_sector(lba + i, p) != 0)
+			return -1;
+	return 0;
 }
 
 int blk_write_sector(uint32_t lba, const void *buf)

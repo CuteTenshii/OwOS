@@ -11,6 +11,7 @@ int main(void)
 	int id = win_create(W, H, "about");
 	if (id < 0) { puts("about: no window\n"); return 1; }
 	gfx_init(win_fb(), W, H);
+	win_resizable(id, 0);            /* fixed-size info box */
 
 	gfx_clear(BG);
 	const char *lines[] = {

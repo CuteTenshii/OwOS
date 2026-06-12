@@ -16,15 +16,18 @@
 #include <stdint.h>
 
 /* Fixed user-virtual address where a window's client buffer is mapped. It sits
- * between the program image (from 0x200000) and the stack (below 0x3FF000). */
-#define WIN_FB_VADDR  0x00300000u
-#define WIN_MAX_BYTES 0x000E0000u      /* 896 KiB: caps client w*h*4           */
+ * well above the program image (0x280000), stack (~0x3FF000) and the 16 MiB
+ * identity map, in its own page tables — so the buffer can be as large as the
+ * whole screen without colliding with the low per-process window. */
+#define WIN_FB_VADDR  0xC0000000u
+#define WIN_MAX_BYTES 0x000E0000u      /* fallback cap if the screen size is 0 */
 
 /* Input event delivered to the owning process. Must match user/lib/owos.h. */
 #define WEV_KEY    1                   /* a:  key char (control codes < 0x20)  */
 #define WEV_MOUSE  2                   /* a,b: client-relative x,y (left click) */
 #define WEV_CLOSE  3                   /* the close box was clicked            */
 #define WEV_RESIZE 4                   /* a,b: new client w,h (app opted in)    */
+#define WEV_DBLCLICK 5                 /* a,b: client x,y of a double click     */
 
 struct win_event {
 	uint32_t type;
@@ -38,6 +41,8 @@ int  uwin_poll(int id, struct win_event *out);        /* 1 event / 0 none / -1  
 int  uwin_close(int id);                              /* -> 0 / -1              */
 int  uwin_set_title(int id, const char *title);       /* -> 0 / -1              */
 int  uwin_set_resizable(int id, int on);              /* app opts into resizing */
+int  uwin_set_cursor(int id, int cursor);             /* enum wm_cursor for the
+                                                         window's client area     */
 
 /* Called from sched_exit(): free every window owned by the exiting task. */
 void uwin_task_exiting(uint32_t owner_id);

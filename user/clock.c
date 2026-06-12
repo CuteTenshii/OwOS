@@ -13,6 +13,7 @@ int main(void)
 	int id = win_create(W, H, "clock");
 	if (id < 0) { puts("clock: no window\n"); return 1; }
 	gfx_init(win_fb(), W, H);
+	win_resizable(id, 0);            /* fixed-size clock face */
 
 	unsigned last = 0xffffffff;
 	for (;;) {

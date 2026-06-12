@@ -5,6 +5,8 @@
 #include "keyboard.h"
 #include "irq.h"
 #include "io.h"
+#include "screenshot.h"
+#include "serial.h"
 
 #define KBD_DATA_PORT   0x60
 #define KBD_STATUS_PORT 0x64
@@ -241,6 +243,10 @@ static void keyboard_handler(struct registers *r)
 			ctrl_held = 0;
 			return;
 		}
+		if (sc == 0x37) {          /* Print Screen make (E0 2A E0 37)        */
+			screenshot_request();
+			return;
+		}
 		if (sc & SC_RELEASE)       /* other extended release: ignore         */
 			return;
 		switch (sc) {
@@ -286,6 +292,11 @@ static void keyboard_handler(struct registers *r)
 	if (sc & SC_RELEASE)           /* any other key release: ignore          */
 		return;
 
+	if (sc == 0x3F) {              /* F5: app-defined refresh/reload          */
+		ring_push(KEY_F5);
+		return;
+	}
+
 	/* Numeric keypad: types digits when Num Lock is on; otherwise the keys
 	 * are navigation (Home/arrows/etc.), which we don't handle. */
 	if (sc >= SC_KP_FIRST && sc <= SC_KP_LAST) {
@@ -305,6 +316,9 @@ static void keyboard_handler(struct registers *r)
 		case 'u': ring_push(KEY_KILL);   break;
 		case 'a': ring_push(KEY_HOME);   break;
 		case 'e': ring_push(KEY_END);    break;
+		case 'n': ring_push(KEY_NEW);    break;  /* menu accelerators: the   */
+		case 'o': ring_push(KEY_OPEN);   break;  /* focused window's key cb  */
+		case 's': ring_push(KEY_SAVE);   break;  /* maps these to menu items */
 		}
 		return;
 	}

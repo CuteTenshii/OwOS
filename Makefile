@@ -24,23 +24,21 @@ OBJS    := boot/boot.o kernel/kernel.o kernel/vga.o kernel/gdt.o kernel/gdt_flus
            kernel/keyboard.o kernel/timer.o kernel/shell.o kernel/serial.o \
            kernel/pmm.o kernel/paging.o kernel/heap.o kernel/kstring.o \
            kernel/sched.o kernel/switch.o \
-           kernel/ata.o kernel/ahci.o kernel/nvme.o kernel/blk.o kernel/fs.o kernel/pci.o kernel/usb.o kernel/xhci.o \
+           kernel/ata.o kernel/ahci.o kernel/nvme.o kernel/blk.o kernel/fs.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/pci.o kernel/usb.o kernel/xhci.o \
            kernel/nic.o kernel/rtl8139.o kernel/e1000.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/tls.o \
-           kernel/url.o kernel/zip.o kernel/gzip.o \
+           kernel/url.o kernel/zip.o kernel/gzip.o kernel/png.o kernel/screenshot.o \
            kernel/bencode.o kernel/torrent.o kernel/tracker.o kernel/peer.o \
            kernel/speaker.o kernel/sb16.o \
            kernel/cpu.o kernel/rtc.o kernel/neofetch.o kernel/power.o kernel/battery.o \
-           kernel/firmware.o kernel/aml.o kernel/edid.o \
+           kernel/firmware.o kernel/smbios.o kernel/aml.o kernel/edid.o \
            kernel/syscall.o kernel/loader.o kernel/pipe.o kernel/services.o \
            kernel/smb.o \
            kernel/fb.o kernel/mouse.o kernel/wm.o kernel/uwin.o kernel/crash.o \
            kernel/apps.o kernel/app_term.o \
-           kernel/hello_blob.o kernel/worker_blob.o kernel/args_blob.o \
-           kernel/pipe_blob.o kernel/produce_blob.o kernel/upper_blob.o \
            kernel/edit_blob.o kernel/curl_blob.o \
-           kernel/demo_blob.o kernel/editor_blob.o kernel/about_blob.o \
+           kernel/editor_blob.o kernel/about_blob.o \
            kernel/clock_blob.o kernel/files_blob.o kernel/browser_blob.o \
-           kernel/crashme_blob.o
+           kernel/imgview_blob.o kernel/crashme_blob.o
 
 # Which NIC QEMU attaches. Default rtl8139 (QEMU's classic card); override to
 # exercise the Intel driver, e.g. `make run NIC=e1000` (82540EM) — both the
@@ -66,6 +64,10 @@ $(KERNEL): $(OBJS) linker.ld
 # embedded into the kernel as an object.
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -Iuser/lib -Wall
 ULIB    := user/lib/start.o user/lib/lib.o user/lib/gfx.o
+# Optional libs, linked only into the programs that use them (so a tiny program
+# like hello doesn't carry the 32 KiB inflate window or the decoder buffers).
+INFLATE := user/lib/inflate.o
+UPNG    := user/lib/upng.o
 
 user/lib/start.o: user/lib/start.S
 	$(CC) $(UCFLAGS) -c $< -o $@
@@ -79,11 +81,17 @@ user/%.elf: user/%.o $(ULIB) user/user.ld
 	ld -m elf_i386 -T user/user.ld -o $@ $< $(ULIB)
 
 # The browser is a multi-file user program (user/browser/*.c), linked flat.
+# It pulls in the streaming inflate lib for gzip/deflate HTTP responses and the
+# PNG decoder so image/* pages render instead of showing as raw bytes.
 BROWSER_OBJS := user/browser/main.o user/browser/fetch.o user/browser/html.o
 user/browser/%.o: user/browser/%.c
 	$(CC) $(UCFLAGS) -c $< -o $@
-user/browser.elf: $(BROWSER_OBJS) $(ULIB) user/user.ld
-	ld -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(ULIB)
+user/browser.elf: $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(ULIB)
+
+# The image viewer links the streaming PNG decoder (which uses inflate).
+user/imgview.elf: user/imgview.o $(UPNG) $(INFLATE) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ user/imgview.o $(UPNG) $(INFLATE) $(ULIB)
 
 # Embed each ELF as an object; gives _binary_user_<name>_elf_{start,end}.
 kernel/%_blob.o: user/%.elf
@@ -93,23 +101,50 @@ kernel/%_blob.o: user/%.elf
 $(DISK):
 	dd if=/dev/zero of=$(DISK) bs=1M count=16 status=none
 
-# Scratch images for the SATA (AHCI) and NVMe drivers to probe and exercise.
+# The SATA (AHCI) scratch disk doubles as a FAT volume so the read-only FAT
+# driver (kernel/fat.c) has something real to mount. Formatted FAT16 and seeded
+# with a small tree (incl. a long filename and a subdirectory) via mtools, no
+# root/loop-mount needed. Delete sata.img to re-seed. The NVMe disk stays blank.
 $(SATADISK):
 	dd if=/dev/zero of=$(SATADISK) bs=1M count=16 status=none
+	mkfs.fat -F 16 -n OWOSFAT $(SATADISK) >/dev/null
+	printf 'hello from a FAT16 volume\n' > /tmp/owos_fat_hello.txt
+	printf 'OwOS reads FAT12/16/32, long names and all.\n' > /tmp/owos_fat_long.txt
+	mmd   -i $(SATADISK) ::docs
+	mcopy -i $(SATADISK) /tmp/owos_fat_hello.txt ::HELLO.TXT
+	mcopy -i $(SATADISK) /tmp/owos_fat_long.txt  '::A Long File Name.txt'
+	mcopy -i $(SATADISK) /tmp/owos_fat_hello.txt ::docs/README.TXT
+	rm -f /tmp/owos_fat_hello.txt /tmp/owos_fat_long.txt
 $(NVMEDISK):
 	dd if=/dev/zero of=$(NVMEDISK) bs=1M count=16 status=none
 
+# A FAT16-formatted image presented as a USB flash drive (qemu-xhci +
+# usb-storage), so the xHCI mass-storage driver (kernel/xhci.c) has a real stick
+# to enumerate, mount at /fat, and eject. Delete usb.img to re-seed.
+USBDISK := usb.img
+$(USBDISK):
+	dd if=/dev/zero of=$(USBDISK) bs=1M count=16 status=none
+	mkfs.fat -F 16 -n OWOSUSB $(USBDISK) >/dev/null
+	printf 'hello from a USB stick\n' > /tmp/owos_usb.txt
+	mmd   -i $(USBDISK) ::photos
+	mcopy -i $(USBDISK) /tmp/owos_usb.txt ::READID.TXT
+	mcopy -i $(USBDISK) /tmp/owos_usb.txt ::photos/NOTES.TXT
+	rm -f /tmp/owos_usb.txt
+
 # disk.img stays the IDE boot disk (owofs). The SATA disk hangs off an AHCI
 # controller and the NVMe disk off an emulated PCIe SSD, so all three storage
-# drivers find hardware to drive.
+# drivers find hardware to drive. A USB flash drive hangs off an xHCI controller.
 STORAGE := -hda $(DISK) \
 	-device ich9-ahci,id=ahci \
 	-drive id=satadisk,file=$(SATADISK),if=none,format=raw \
 	-device ide-hd,drive=satadisk,bus=ahci.0 \
 	-drive id=nvmedisk,file=$(NVMEDISK),if=none,format=raw \
-	-device nvme,drive=nvmedisk,serial=owos-nvme0
+	-device nvme,drive=nvmedisk,serial=owos-nvme0 \
+	-device qemu-xhci,id=xhci \
+	-drive id=usbdisk,file=$(USBDISK),if=none,format=raw \
+	-device usb-storage,bus=xhci.0,drive=usbdisk
 
-run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK)
+run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK)
 	qemu-system-i386 -kernel $(KERNEL) $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445 -device $(NIC),netdev=net0 \
 		-audiodev pipewire,id=snd0 -machine pcspk-audiodev=snd0 \
@@ -117,7 +152,7 @@ run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK)
 		-usb -device usb-tablet
 
 # Headless: no window, console comes out on the terminal via COM1.
-debug: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK)
+debug: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK)
 	qemu-system-i386 -kernel $(KERNEL) -display none $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445 -device $(NIC),netdev=net0 \
 		-usb -device usb-tablet
@@ -188,6 +223,7 @@ usb: $(ISO)
 
 clean:
 	rm -f $(OBJS) $(KERNEL) $(ISO)
+	rm -f user/*.o user/*.elf user/lib/*.o user/browser/*.o user/browser/*.elf
 	rm -rf $(ISODIR)
 
 # Also remove the disk images (wipes stored files).

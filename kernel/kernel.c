@@ -14,10 +14,12 @@
 #include "multiboot.h"
 #include "multiboot2.h"
 #include "firmware.h"
+#include "smbios.h"
 #include "fs.h"
 #include "ahci.h"
 #include "nvme.h"
 #include "blk.h"
+#include "fat.h"
 #include "net.h"
 #include "heap.h"
 #include "loader.h"
@@ -35,6 +37,7 @@
 #include "vga.h"
 #include "fb.h"
 #include "wm.h"
+#include "screenshot.h"
 #include "xhci.h"
 
 /* Two CPU-bound kernel threads that never yield. If scheduling were
@@ -107,11 +110,22 @@ static struct multiboot_info *multiboot2_to_info(uint32_t info_addr)
 			 * 4 GiB is flat) — it stashes a copy so shutdown can reach ACPI. */
 			struct mb2_tag_acpi *a = (struct mb2_tag_acpi *)p;
 			acpi_set_rsdp(a->rsdp);
-		} else if (tag->type == MB2_TAG_EFI32 ||
-		           tag->type == MB2_TAG_EFI64) {
+		} else if (tag->type == MB2_TAG_EFI32) {
 			/* GRUB only hands us an EFI system-table tag on a UEFI boot;
-			 * legacy BIOS / CSM carries none. */
+			 * legacy BIOS / CSM carries none. Its configuration-table array
+			 * is how we reach SMBIOS under UEFI (smbios.c). */
 			uefi = 1;
+			smbios_set_efi(((struct mb2_tag_efi32 *)p)->pointer, 0);
+		} else if (tag->type == MB2_TAG_EFI64) {
+			uefi = 1;
+			smbios_set_efi(((struct mb2_tag_efi64 *)p)->pointer, 1);
+		} else if (tag->type == MB2_TAG_SMBIOS) {
+			/* The SMBIOS entry point. On UEFI the "_SM_"/"_SM3_" anchor is
+			 * not in the legacy f-segment, so this tag is the only route to
+			 * DMI (machine vendor/product for the splash's Host line). The
+			 * entry point starts at the tag's `tables` field. */
+			struct mb2_tag_smbios *sm = (struct mb2_tag_smbios *)p;
+			smbios_set_entry((uint32_t)sm->tables);
 		}
 
 		p += (tag->size + 7) & ~7u;    /* tags are 8-byte aligned             */
@@ -179,6 +193,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	heap_init();                   /* kmalloc/kfree over [4 MiB, 16 MiB)      */
 	vga_write("heap: ready.\n");
 
+	smbios_init();                 /* read DMI vendor/product for the splash  */
+
 	pci_init();                    /* enumerate the PCI bus                   */
 	vga_write("pci: ");
 	vga_write_dec((uint32_t)pci_count());
@@ -218,29 +234,17 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
 	blk_init();                    /* pick owofs's backing disk: IDE>AHCI>NVMe */
 	fs_init();                     /* mount it (auto-format only the IDE disk) */
+	blk_mount_fat();               /* mount a FAT volume on a non-owofs disk    */
+
 
 	syscall_init();                /* int 0x80 gate (DPL 3)                   */
 
 	/* Install the embedded ring-3 programs onto the disk if absent. */
 	{
-		extern const unsigned char _binary_user_hello_elf_start[];
-		extern const unsigned char _binary_user_hello_elf_end[];
-		extern const unsigned char _binary_user_worker_elf_start[];
-		extern const unsigned char _binary_user_worker_elf_end[];
-		extern const unsigned char _binary_user_args_elf_start[];
-		extern const unsigned char _binary_user_args_elf_end[];
-		extern const unsigned char _binary_user_pipe_elf_start[];
-		extern const unsigned char _binary_user_pipe_elf_end[];
-		extern const unsigned char _binary_user_produce_elf_start[];
-		extern const unsigned char _binary_user_produce_elf_end[];
-		extern const unsigned char _binary_user_upper_elf_start[];
-		extern const unsigned char _binary_user_upper_elf_end[];
 		extern const unsigned char _binary_user_edit_elf_start[];
 		extern const unsigned char _binary_user_edit_elf_end[];
 		extern const unsigned char _binary_user_curl_elf_start[];
 		extern const unsigned char _binary_user_curl_elf_end[];
-		extern const unsigned char _binary_user_demo_elf_start[];
-		extern const unsigned char _binary_user_demo_elf_end[];
 		extern const unsigned char _binary_user_editor_elf_start[];
 		extern const unsigned char _binary_user_editor_elf_end[];
 		extern const unsigned char _binary_user_about_elf_start[];
@@ -251,6 +255,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		extern const unsigned char _binary_user_files_elf_end[];
 		extern const unsigned char _binary_user_browser_elf_start[];
 		extern const unsigned char _binary_user_browser_elf_end[];
+		extern const unsigned char _binary_user_imgview_elf_start[];
+		extern const unsigned char _binary_user_imgview_elf_end[];
 		extern const unsigned char _binary_user_crashme_elf_start[];
 		extern const unsigned char _binary_user_crashme_elf_end[];
 		char probe;
@@ -259,30 +265,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		fs_mkdir("/bin");
 		fs_mkdir("/home");
 		fs_mkdir("/home/root");
-		if (fs_read("/bin/hello", &probe, 0) < 0)
-			fs_create("/bin/hello", _binary_user_hello_elf_start,
-			          (uint32_t)(_binary_user_hello_elf_end -
-			                     _binary_user_hello_elf_start));
-		if (fs_read("/bin/worker", &probe, 0) < 0)
-			fs_create("/bin/worker", _binary_user_worker_elf_start,
-			          (uint32_t)(_binary_user_worker_elf_end -
-			                     _binary_user_worker_elf_start));
-		if (fs_read("/bin/args", &probe, 0) < 0)
-			fs_create("/bin/args", _binary_user_args_elf_start,
-			          (uint32_t)(_binary_user_args_elf_end -
-			                     _binary_user_args_elf_start));
-		if (fs_read("/bin/pipe", &probe, 0) < 0)
-			fs_create("/bin/pipe", _binary_user_pipe_elf_start,
-			          (uint32_t)(_binary_user_pipe_elf_end -
-			                     _binary_user_pipe_elf_start));
-		if (fs_read("/bin/produce", &probe, 0) < 0)
-			fs_create("/bin/produce", _binary_user_produce_elf_start,
-			          (uint32_t)(_binary_user_produce_elf_end -
-			                     _binary_user_produce_elf_start));
-		if (fs_read("/bin/upper", &probe, 0) < 0)
-			fs_create("/bin/upper", _binary_user_upper_elf_start,
-			          (uint32_t)(_binary_user_upper_elf_end -
-			                     _binary_user_upper_elf_start));
 		if (fs_read("/bin/edit", &probe, 0) < 0)
 			fs_create("/bin/edit", _binary_user_edit_elf_start,
 			          (uint32_t)(_binary_user_edit_elf_end -
@@ -291,10 +273,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			fs_create("/bin/curl", _binary_user_curl_elf_start,
 			          (uint32_t)(_binary_user_curl_elf_end -
 			                     _binary_user_curl_elf_start));
-		if (fs_read("/bin/demo", &probe, 0) < 0)
-			fs_create("/bin/demo", _binary_user_demo_elf_start,
-			          (uint32_t)(_binary_user_demo_elf_end -
-			                     _binary_user_demo_elf_start));
 		if (fs_read("/bin/editor", &probe, 0) < 0)
 			fs_create("/bin/editor", _binary_user_editor_elf_start,
 			          (uint32_t)(_binary_user_editor_elf_end -
@@ -315,12 +293,16 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			fs_create("/bin/browser", _binary_user_browser_elf_start,
 			          (uint32_t)(_binary_user_browser_elf_end -
 			                     _binary_user_browser_elf_start));
+		if (fs_read("/bin/imgview", &probe, 0) < 0)
+			fs_create("/bin/imgview", _binary_user_imgview_elf_start,
+			          (uint32_t)(_binary_user_imgview_elf_end -
+			                     _binary_user_imgview_elf_start));
 		if (fs_read("/bin/crashme", &probe, 0) < 0)
 			fs_create("/bin/crashme", _binary_user_crashme_elf_start,
 			          (uint32_t)(_binary_user_crashme_elf_end -
 			                     _binary_user_crashme_elf_start));
 	}
-	vga_write("usermode: ready ('run hello').\n");
+	vga_write("usermode: ready ('run curl <url>').\n");
 
 	timer_init();                  /* IRQ0: keep time                         */
 	keyboard_init();               /* IRQ1: buffer keystrokes                 */
@@ -335,6 +317,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
 	wm_init();                     /* graphics desktop + mouse, if fb is up    */
 
+	screenshot_init();             /* Print Screen worker (off the WM thread)  */
+
 	__asm__ volatile ("sti");      /* interrupts on; preemption begins        */
 
 	net_dhcp_start();              /* lease IP/gw/dns on the boot NIC (post-sti:  */
@@ -344,6 +328,9 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	xhci_boot();                   /* USB host up + devices configured (post-sti: */
 	                               /* uses timer_sleep). Keeps a tethered phone   */
 	                               /* offering USB tethering without running lsusb.*/
+
+	if (!fat_mounted())            /* a USB stick only appears after xhci_boot --  */
+		blk_mount_fat();           /* mount its FAT now if no other FAT volume did */
 
 	shell_init();
 

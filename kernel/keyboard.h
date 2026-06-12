@@ -21,6 +21,14 @@
 #define KEY_DELETE  0x07
 #define KEY_KILL    0x0B   /* Ctrl+U: erase the whole line                     */
 #define KEY_CLEAR   0x0C   /* Ctrl+L: clear the screen                         */
+#define KEY_F5      0x0E   /* F5: app-defined refresh/reload                   */
+/* Menu accelerators: Ctrl+<letter> chords a windowed app binds to its menu
+ * items (the keyboard forwards them like any other editing key; the focused
+ * app decides what each means -- typically New/Open/Save). The shell ignores
+ * them, as it does any unrecognised control byte. */
+#define KEY_NEW     0x0F   /* Ctrl+N                                           */
+#define KEY_OPEN    0x10   /* Ctrl+O                                           */
+#define KEY_SAVE    0x13   /* Ctrl+S                                           */
 /* Ctrl+C is not queued here -- it is a latch read via keyboard_take_interrupt
  * so it can interrupt a running command, not just the line being typed.       */
 

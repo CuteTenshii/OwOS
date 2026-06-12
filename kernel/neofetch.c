@@ -16,6 +16,7 @@
 #include "firmware.h"
 #include "fb.h"
 #include "edid.h"
+#include "smbios.h"
 
 #define LOGO_WIDTH 16
 
@@ -121,6 +122,23 @@ static void info_row(int i, const char *brand, const struct rtc_time *t)
 	}
 }
 
+/* Print a 512-byte-sector capacity as "N MiB", or "N.N GiB" once it reaches
+ * 1 GiB so large disks read naturally. */
+static void write_capacity(uint32_t sectors)
+{
+	uint32_t mib = sectors / 2048;
+	if (mib >= 1024) {
+		uint32_t tenths = (mib * 10) / 1024;   /* MiB -> tenths of a GiB        */
+		vga_write_dec(tenths / 10);
+		vga_putc('.');
+		vga_write_dec(tenths % 10);
+		vga_write(" GiB");
+	} else {
+		vga_write_dec(mib);
+		vga_write(" MiB");
+	}
+}
+
 /* Render one "Storage:" row: the first carries the label, the rest indent to
  * line up under it. idx selects which detected device to print. */
 static void storage_row(int idx, const struct storage_dev *sd, int nsd)
@@ -137,8 +155,8 @@ static void storage_row(int idx, const struct storage_dev *sd, int nsd)
 	}
 	if (sd[idx].sectors) {
 		vga_write(" (");
-		vga_write_dec(sd[idx].sectors / 2048);   /* 512-B sectors -> MiB         */
-		vga_write(" MiB)");
+		write_capacity(sd[idx].sectors);
+		vga_putc(')');
 	}
 }
 
@@ -185,10 +203,15 @@ void neofetch(void)
 	int ndd = pci_displays(dd, 8);
 
 	const int fixed = 12;   /* info_row cases 0..11 (last is Firmware)            */
+	/* "Host:" is the machine's DMI vendor+product (QEMU advertises "QEMU ...",
+	 * most real boards a model name). Always shown: when SMBIOS can't be read
+	 * the row carries the reason, the way the Battery row does. */
+	const char *host = smbios_host();
+	const int host_rows = 1;
 	const int batt_rows = battery_present() ? 1 : 0;  /* only when detected     */
 	const int storage_rows = nsd > 0 ? nsd : 1;   /* always show one "Storage:" */
 	const int display_rows = ndd > 0 ? ndd : 1;   /* always show one "Display:" */
-	const int rows = fixed + batt_rows + storage_rows + display_rows;
+	const int rows = fixed + host_rows + batt_rows + storage_rows + display_rows;
 	for (int i = 0; i < rows; i++) {
 		/* logo column (cyan), padded to a fixed width */
 		vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
@@ -204,7 +227,18 @@ void neofetch(void)
 		vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
 		if (i < fixed)
 			info_row(i, brand, &t);
-		else if (i < fixed + batt_rows) {
+		else if (i < fixed + host_rows) {
+			label("Host:    ");
+			if (host[0]) {
+				vga_write(host);
+			} else {
+				/* No DMI: show why, for on-hardware diagnosis. */
+				const char *e = smbios_error();
+				vga_write("unknown (");
+				vga_write((e && e[0]) ? e : "no SMBIOS");
+				vga_putc(')');
+			}
+		} else if (i < fixed + host_rows + batt_rows) {
 			label("Battery: ");
 			/* Evaluate _BST/_BIF for the real charge; fall back to bare
 			 * presence if the AML can't be read (e.g. a silent EC). */
@@ -222,10 +256,10 @@ void neofetch(void)
 				vga_write((e && e[0]) ? e : "ACPI");
 				vga_putc(')');
 			}
-		} else if (i < fixed + batt_rows + storage_rows)
-			storage_row(i - fixed - batt_rows, sd, nsd);
+		} else if (i < fixed + host_rows + batt_rows + storage_rows)
+			storage_row(i - fixed - host_rows - batt_rows, sd, nsd);
 		else
-			display_row(i - fixed - batt_rows - storage_rows, dd, ndd);
+			display_row(i - fixed - host_rows - batt_rows - storage_rows, dd, ndd);
 		vga_putc('\n');
 	}
 	vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);

@@ -33,9 +33,14 @@ static int   prompt_len;
 
 static char  io_buf[MAXLINES * (MAXCOLS + 1)];
 
-/* GUI widgets (shared gfx lib): the File menu and the status message. */
+/* GUI widgets (shared gfx lib): the File menu and the status message. The hint
+ * labels and key bytes are parallel to file_items, giving New/Open/Save the
+ * Ctrl+N/O/S accelerators (Save As has none -- shown only in the dropdown). */
 static const char *const file_items[] = { "New", "Open", "Save", "Save As" };
-static struct menu       filemenu = { "File", file_items, 4, 0 };
+static const char *const file_hints[] = { "Ctrl+N", "Ctrl+O", "Ctrl+S", "" };
+static const unsigned char file_keys[] = { KEY_NEW, KEY_OPEN, KEY_SAVE, 0 };
+static struct menu       filemenu = { "File", file_items, 4, 0,
+                                      file_hints, file_keys };
 static struct status_bar sbar;
 
 /* ------------------------------------------------------------- tiny helpers */
@@ -50,6 +55,8 @@ static void scopy(char *d, const char *s, int max)
 
 static void set_status(const char *s) { status_set(&sbar, s); }
 
+static int has_high;   /* 1 if the buffer holds any byte >= 0x80 (-> UTF-8) */
+
 static void ed_clear(void)
 {
 	nlines = 1;
@@ -57,6 +64,7 @@ static void ed_clear(void)
 	lines[0][0] = 0;
 	curx = cury = top_line = 0;
 	modified = 0;
+	has_high = 0;
 }
 
 /* ------------------------------------------------------------- buffer edits */
@@ -71,6 +79,7 @@ static void ed_insert(char c)
 	linelen[cury]++;
 	curx++;
 	modified = 1;
+	if ((unsigned char)c >= 0x80) has_high = 1;
 }
 
 static void ed_newline(void)
@@ -156,6 +165,7 @@ static void ed_load(const char *name)
 			else break;
 		} else if (ch != '\r' && col < MAXCOLS - 1) {
 			lines[li][col++] = ch;
+			if ((unsigned char)ch >= 0x80) has_high = 1;
 		}
 	}
 	linelen[li] = col;
@@ -229,6 +239,9 @@ static void key(int id, char c)
 			prompt_buf[prompt_len++] = c;
 		return;
 	}
+	/* Menu accelerators (Ctrl+N/O/S): fire the item directly, like a click. */
+	int sc = menu_shortcut(&filemenu, (unsigned char)c);
+	if (sc >= 0) { filemenu.open = 0; menu_action(sc); return; }
 	if (c == 27) { filemenu.open = 0; return; }
 
 	switch (c) {
@@ -247,6 +260,10 @@ static void key(int id, char c)
 	case KEY_DOWN: if (cury < nlines - 1) { cury++; clamp_curx(); }   break;
 	case KEY_HOME: curx = 0;                                          break;
 	case KEY_END:  curx = linelen[cury];                              break;
+	case KEY_F5:   /* reload the file from disk, discarding edits */
+		if (has_name) ed_load(fname);
+		else          set_status("nothing to reload");
+		break;
 	default:
 		if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7F)
 			ed_insert(c);
@@ -290,6 +307,16 @@ static void apnd(char *buf, int *p, int cap, const char *s)
 	buf[*p] = 0;
 }
 
+static void apnd_uint(char *buf, int *p, int cap, unsigned v)
+{
+	char t[12];
+	int n = 0;
+	if (v == 0) t[n++] = '0';
+	while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+	while (n && *p < cap - 1) buf[(*p)++] = t[--n];
+	buf[*p] = 0;
+}
+
 static void render(void)
 {
 	unsigned txt_bg = 0x0d1117;
@@ -319,10 +346,11 @@ static void render(void)
 		              0x66ddff);
 	}
 
-	/* Status / prompt bar. */
+	/* Status / prompt bar, rendered with the gfx status_bar widget (it owns the
+	 * bar background + the left-aligned message). */
 	int sy = H - STATUS_H;
-	gfx_fill_rect(0, sy, W, STATUS_H, 0x161d28);
-	char line[96];
+	struct status_bar bar;
+	char line[64];
 	int p = 0;
 	line[0] = 0;
 	if (prompt_mode) {
@@ -330,20 +358,36 @@ static void render(void)
 		     prompt_mode == PROMPT_OPEN ? "Open: " : "Save as: ");
 		apnd(line, &p, sizeof line, prompt_buf);
 		apnd(line, &p, sizeof line, "_");
-		gfx_text(6, sy + 1, line, 0xffe08a, 0x161d28);
+		status_set(&bar, line);
+		status_draw(&bar, 0, sy, W, 0xffe08a, 0x161d28);
 	} else {
 		apnd(line, &p, sizeof line, has_name ? fname : "[no name]");
 		if (modified) apnd(line, &p, sizeof line, " *");
 		apnd(line, &p, sizeof line, "  -  ");
 		apnd(line, &p, sizeof line, sbar.msg);
-		gfx_text(6, sy + 1, line, 0x9fb0c4, 0x161d28);
+		status_set(&bar, line);
+		status_draw(&bar, 0, sy, W, 0x9fb0c4, 0x161d28);
+
+		/* Cursor position + encoding, right-aligned over the bar the widget
+		 * just drew (status_draw is left-only). */
+		char rstat[40];
+		int rp = 0;
+		rstat[0] = 0;
+		apnd(rstat, &rp, sizeof rstat, "Ln ");
+		apnd_uint(rstat, &rp, sizeof rstat, (unsigned)(cury + 1));
+		apnd(rstat, &rp, sizeof rstat, ", Col ");
+		apnd_uint(rstat, &rp, sizeof rstat, (unsigned)(curx + 1));
+		apnd(rstat, &rp, sizeof rstat, has_high ? "  UTF-8" : "  ASCII");
+		int rx = W - 6 - rp * COL_W;
+		if (rx < 6) rx = 6;
+		gfx_text(rx, sy + 1, rstat, 0x9fb0c4, 0x161d28);
 	}
 
 	/* The File menu, drawn last so its dropdown overlays the text. */
 	menu_draw(&filemenu, 2, 0);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
 	ed_clear();
 	set_status("new file");
@@ -353,7 +397,12 @@ int main(void)
 		return 1;
 	}
 	gfx_init(win_fb(), W, H);
-	win_resizable(id, 1);            /* the editor can be resized */
+	win_cursor(id, WIN_CURSOR_TEXT);   /* I-beam over the text area */
+
+	/* Launched with a path (e.g. double-clicked in the file explorer): open
+	 * it straight away instead of starting on a blank buffer. */
+	if (argc > 1 && argv[1] && argv[1][0])
+		ed_load(argv[1]);
 
 	int need = 1;
 	for (;;) {

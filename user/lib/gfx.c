@@ -91,9 +91,16 @@ void menu_draw(const struct menu *m, int x, int y)
 	gfx_text(x + 3, y + 1, m->title, 0xe0e6ee, bg);
 	if (m->open) {
 		gfx_fill_rect(x, y + GUI_BAR_H, GUI_MENU_W, m->n * GUI_ROW_H, 0x2a3342);
-		for (int i = 0; i < m->n; i++)
-			gfx_text(x + 6, y + GUI_BAR_H + i * GUI_ROW_H, m->items[i],
-			         0xe0e6ee, 0x2a3342);
+		for (int i = 0; i < m->n; i++) {
+			int ry = y + GUI_BAR_H + i * GUI_ROW_H;
+			gfx_text(x + 6, ry, m->items[i], 0xe0e6ee, 0x2a3342);
+			/* Accelerator hint ("Ctrl+S"), right-aligned and dimmed. */
+			if (m->hints && m->hints[i] && m->hints[i][0]) {
+				int hw = wstrlen(m->hints[i]) * 8;
+				gfx_text(x + GUI_MENU_W - 6 - hw, ry, m->hints[i],
+				         0x8a93a0, 0x2a3342);
+			}
+		}
 		gfx_rect(x, y + GUI_BAR_H, GUI_MENU_W, m->n * GUI_ROW_H, 0x05070a);
 	}
 }
@@ -111,5 +118,93 @@ int menu_click(struct menu *m, int mx, int my, int x, int y)
 		if (mx >= x && mx < x + GUI_MENU_W && i >= 0 && i < m->n)
 			return i;
 	}
+	return -1;
+}
+
+int menu_shortcut(const struct menu *m, int key)
+{
+	if (!m->keys || !key)
+		return -1;
+	for (int i = 0; i < m->n; i++)
+		if (m->keys[i] == key)
+			return i;
+	return -1;
+}
+
+/* ------------------------------------------------------------- menu bar */
+
+#define MENUBAR_GAP 4   /* px between adjacent titles on the bar */
+
+/* x of menu i's title: the bar origin plus the widths of the titles before it. */
+static int menubar_title_x(const struct menubar *mb, int i)
+{
+	int x = mb->x;
+	for (int k = 0; k < i; k++)
+		x += wstrlen(mb->menus[k]->title) * 8 + 6 + MENUBAR_GAP;
+	return x;
+}
+
+void menubar_close(struct menubar *mb)
+{
+	for (int i = 0; i < mb->n; i++)
+		mb->menus[i]->open = 0;
+}
+
+void menubar_draw(const struct menubar *mb)
+{
+	/* Closed titles first; the open one (if any) last so its dropdown overlays
+	 * a neighbouring title. */
+	int openi = -1;
+	for (int i = 0; i < mb->n; i++) {
+		if (mb->menus[i]->open) { openi = i; continue; }
+		menu_draw(mb->menus[i], menubar_title_x(mb, i), mb->y);
+	}
+	if (openi >= 0)
+		menu_draw(mb->menus[openi], menubar_title_x(mb, openi), mb->y);
+}
+
+int menubar_click(struct menubar *mb, int mx, int my, int *menu, int *item)
+{
+	*menu = -1;
+	*item = -1;
+
+	/* On the title row: toggle the clicked title and close the others, so only
+	 * one dropdown is ever open. */
+	if (my >= mb->y && my < mb->y + GUI_BAR_H) {
+		for (int i = 0; i < mb->n; i++) {
+			int x = menubar_title_x(mb, i);
+			int tw = wstrlen(mb->menus[i]->title) * 8 + 6;
+			if (mx >= x && mx < x + tw) {
+				int wasopen = mb->menus[i]->open;
+				menubar_close(mb);
+				mb->menus[i]->open = !wasopen;
+				*menu = i;
+				return 1;
+			}
+		}
+		menubar_close(mb);        /* empty bar area: dismiss any open menu */
+		return 1;
+	}
+
+	/* Below the bar: hand the click to whichever menu is open (menu_click closes
+	 * it and returns the chosen item, or -1 if the click missed the dropdown). */
+	for (int i = 0; i < mb->n; i++) {
+		if (!mb->menus[i]->open)
+			continue;
+		int it = menu_click(mb->menus[i], mx, my, menubar_title_x(mb, i), mb->y);
+		if (it >= 0) { *menu = i; *item = it; }
+		return 1;
+	}
+	return 0;
+}
+
+int menubar_shortcut(const struct menubar *mb, int key, int *menu)
+{
+	for (int i = 0; i < mb->n; i++) {
+		int it = menu_shortcut(mb->menus[i], key);
+		if (it >= 0) { if (menu) *menu = i; return it; }
+	}
+	if (menu)
+		*menu = -1;
 	return -1;
 }

@@ -17,8 +17,6 @@ void  pfree(void *page);
 /* Per-process address spaces. A new directory shares the kernel/heap
  * mappings but owns a private user window [2 MiB, 4 MiB). */
 uint32_t *paging_new_process_dir(void);
-void      paging_map_user_page(uint32_t *dir, uint32_t vaddr, uint32_t frame);
-void      paging_unmap_user_page(uint32_t *dir, uint32_t vaddr);
 void      paging_free_process_dir(uint32_t *dir);
 
 /* Duplicate an address space for fork(): copies each mapped user page into a
@@ -36,6 +34,27 @@ int paging_user_mapped(uint32_t vaddr);
  * Page tables are taken from the pool and not reclaimed — intended for one-shot
  * use just before power-off. Returns 0 on success, -1 if the pool is exhausted. */
 int paging_identity_map(uint32_t phys, uint32_t len);
+
+/* Map/unmap a physical range into the kernel master directory (supervisor RW),
+ * so kernel code reaches a buffer in >16 MiB physical memory under its own CR3.
+ * Used for ring-3 window client buffers, which the WM compositor blits. */
+int  paging_kmap(uint32_t phys, uint32_t len);
+void paging_kunmap(uint32_t phys, uint32_t len);
+
+/* Map/unmap user pages at an arbitrary vaddr in `dir` (with private USER page
+ * tables), for a window's client buffer mapped outside the low-4-MiB window. */
+int  paging_map_user_at(uint32_t *dir, uint32_t vaddr, uint32_t phys, int npages);
+void paging_unmap_user_at(uint32_t *dir, uint32_t vaddr, uint32_t bytes);
+
+/* Transient SUPERVISOR-only mapping of a physical frame into kernel space, so
+ * the kernel can read/write a fresh pmm frame (which lives above the identity
+ * map) while preparing a user address space — without ever exposing it to ring
+ * 3. The scratch PDE is installed at boot in the shared kernel directory, so the
+ * mapping is reachable under any CR3. `slot` selects one of a few independent
+ * scratch pages (0..PAGING_SCRATCH_SLOTS-1); always unmap after use. */
+#define PAGING_SCRATCH_SLOTS 4
+void *paging_scratch_map(int slot, uint32_t phys);
+void  paging_scratch_unmap(int slot);
 
 /* Set the PWT bit on every PTE backing [virt, virt+len) so those pages use PAT
  * entry 1. Paired with a PAT that programs entry 1 as write-combining, this

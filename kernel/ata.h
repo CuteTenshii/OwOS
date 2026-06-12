@@ -9,6 +9,11 @@
 int ata_read_sector(uint32_t lba, void *buf);
 int ata_write_sector(uint32_t lba, const void *buf);
 
+/* Read `count` contiguous sectors at `lba` into buf (count*512 bytes) using as
+ * few READ SECTORS commands as the LBA28 256-sector limit allows. Same return
+ * convention as ata_read_sector. */
+int ata_read(uint32_t lba, void *buf, uint32_t count);
+
 /* Non-zero if a drive answers IDENTIFY on the primary master. */
 int ata_present(void);
 

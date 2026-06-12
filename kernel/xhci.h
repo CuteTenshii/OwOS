@@ -23,4 +23,15 @@ int xhci_init(int detail_port);
  * after interrupts are enabled — it uses timer_sleep. No-op if no controller. */
 void xhci_boot(void);
 
+/* USB Mass Storage (Bulk-Only Transport / SCSI) block device. A connected USB
+ * flash drive / SD reader is exposed as a 512-byte-sector block device the FAT
+ * driver can mount at /media. Present only after xhci_boot() has enumerated it.
+ * Sector I/O is serviced by the USB poll thread, so it must not be called from
+ * that thread; the block/FAT layer (shell/main thread) is the intended caller. */
+int      xhci_msc_present(void);             /* 1 once a stick is configured        */
+uint32_t xhci_msc_sectors(void);             /* capacity in 512-byte sectors        */
+const char *xhci_msc_model(void);            /* INQUIRY vendor+product string       */
+int      xhci_msc_read(uint32_t lba, void *buf);        /* one sector; 0 ok, -1 err */
+int      xhci_msc_write(uint32_t lba, const void *buf); /* one sector; 0 ok, -1 err */
+
 #endif /* OWOS_XHCI_H */

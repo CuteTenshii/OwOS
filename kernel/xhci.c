@@ -27,6 +27,8 @@
 #include "io.h"
 #include "vga.h"
 #include "paging.h"
+#include "heap.h"
+#include "kstring.h"
 #include "timer.h"
 
 #define PCI_CLASS_SERIAL_BUS  0x0C
@@ -155,6 +157,7 @@ struct usbdev {
 	/* If this looks like a USB-Ethernet (RNDIS) device: the comm interface that
 	 * takes encapsulated commands, the bulk data pair, and the MAC we learned. */
 	int      is_net;
+	int      is_msc;       /* bulk-only-transport mass storage (class 08/06/50) */
 	int      ctrl_iface;
 	uint8_t  bulk_in, bulk_out, intr_in;
 	uint16_t bulk_in_mps, bulk_out_mps, intr_in_mps;
@@ -749,8 +752,19 @@ static int configure_bulk(struct usbdev *d, int port)
 	/* Add slot (A0, to bump Context Entries) + bulk in/out (+ interrupt). */
 	icc[1] = (1u << 0) | (1u << in_dci) | (1u << out_dci) |
 	         (intr_dci ? (1u << intr_dci) : 0);
-	sctx[0] = ((uint32_t)max_dci << 27) | ((uint32_t)d->speed << 20);
-	sctx[1] = (uint32_t)port << 16;
+
+	/* Configure Endpoint's input slot context must be a COPY of the controller's
+	 * current (output) slot context with only Context Entries changed (xHCI 4.6.6).
+	 * Rebuilding it fresh would zero sctx[3] — the USB device address Address Device
+	 * assigned — and real Intel xHCI then addresses the device as 0, so every bulk
+	 * transfer comes back cc=4 (USB Transaction Error). QEMU ignores the fields it
+	 * doesn't need and hides this. Copy the live context, then bump Context Entries
+	 * (DWORD0 bits 27-31) to cover the new endpoints; speed/port/address survive. */
+	(void)port;
+	uint32_t *out_slot = (uint32_t *)dcbaa[d->slot];
+	for (uint32_t i = 0; i < ctx_sz / 4; i++)
+		sctx[i] = out_slot[i];
+	sctx[0] = (sctx[0] & ~(0x1Fu << 27)) | ((uint32_t)max_dci << 27);
 
 	/* EP type: bulk OUT = 2, bulk IN = 6, interrupt IN = 7. CErr=3. */
 	epin[1]  = (3u << 1) | (6u << 3) | ((uint32_t)d->bulk_in_mps  << 16);
@@ -1006,6 +1020,402 @@ static void data_loop(void)
 	}
 }
 
+/* ============================================================ USB Mass Storage
+ *
+ * A USB flash drive / SD reader speaks the Bulk-Only Transport (BOT) protocol
+ * over a bulk IN + bulk OUT endpoint pair: a 31-byte Command Block Wrapper (CBW)
+ * carrying a SCSI CDB, an optional data stage, then a 13-byte Command Status
+ * Wrapper (CSW). We implement just enough SCSI (TEST UNIT READY, INQUIRY, READ
+ * CAPACITY(10), READ(10), WRITE(10)) to expose the device as a 512-byte block
+ * device for the FAT driver to mount/eject.
+ *
+ * Concurrency: BOT is strictly synchronous (one CBW->data->CSW at a time) and
+ * the xHCI rings are driven from a single context -- the usb-poll thread. So
+ * sector I/O isn't done in the caller's thread; the caller drops a request in a
+ * one-slot mailbox and yields, and the poll thread runs the BOT exchange. The
+ * capacity/inquiry probe runs synchronously at boot, while the poll thread does
+ * not yet exist and enumeration owns the rings.
+ *
+ * Because the poll thread runs data_loop() forever once a tether is up, a live
+ * RNDIS tether and a mass-storage device are mutually exclusive after boot --
+ * an acceptable limit (you don't usually tether and mount a stick at once). */
+
+static int        msc_ready;          /* device configured + capacity known       */
+static int        msc_slot;
+static int        msc_in_dci, msc_out_dci;
+static uint8_t    msc_in_ep, msc_out_ep;
+static uint16_t   msc_in_mps, msc_out_mps;
+static struct ring msc_in_ring, msc_out_ring;
+static struct ring msc_ep0;           /* this device's EP0 ring (stall recovery)   */
+static uint32_t   msc_capacity;       /* size in 512-byte sectors                  */
+static uint32_t   msc_tag;            /* CBW tag counter                           */
+static char       msc_model[40];
+static uint8_t   *msc_cbw, *msc_csw, *msc_data;   /* DMA scratch (palloc'd once)    */
+
+/* One-slot request mailbox serviced by the poll thread. */
+static volatile int      msc_req, msc_done, msc_rw, msc_result, msc_busy;
+static volatile int      msc_mb_count;     /* sectors in this request            */
+static volatile uint32_t msc_mb_lba;
+static volatile uint8_t *msc_mb_buf;
+
+/* Read cache: USB BOT transactions are slow (one CBW/data/CSW round-trip each,
+ * plus a scheduler hop through the mailbox), and metadata sectors -- the FAT
+ * table, an HFS+ catalog node -- get re-read constantly while listing a
+ * directory. So reads go through a small set of MSC_CHUNK-sector lines: a miss
+ * fetches a whole line in ONE multi-sector READ(10); hits are served from RAM
+ * caller-side, skipping the mailbox entirely. Writes are write-through and
+ * invalidate the covering line. Only the lock holder touches the cache. */
+#define MSC_CHUNK  8                       /* sectors per line (4 KiB == msc_data)*/
+#define MSC_LINES  64                      /* 64 * 4 KiB = 256 KiB cache          */
+#define MSC_LINE_BYTES (MSC_CHUNK * 512)
+static uint8_t  *msc_cache;                /* MSC_LINES * MSC_LINE_BYTES, or NULL */
+static uint32_t  msc_ctag[MSC_LINES];      /* line's aligned base LBA (~0 = empty)*/
+static int       msc_victim;               /* round-robin replacement cursor      */
+
+/* Find a Mass Storage interface (class 0x08, SCSI transparent 0x06, Bulk-Only
+ * 0x50) in the cached config descriptor and grab its bulk IN/OUT endpoints. */
+static void parse_msc(struct usbdev *d)
+{
+	d->is_msc = 0;
+	const uint8_t *p = d->cfg;
+	int len = d->cfg_len, in_iface = 0;
+	uint8_t bin = 0, bout = 0;
+	uint16_t binmps = 0, boutmps = 0;
+
+	for (int i = 0; i + 1 < len; ) {
+		uint8_t l = p[i], t = p[i + 1];
+		if (l < 2) break;
+		if (t == 0x04 && i + 7 < len) {            /* INTERFACE */
+			in_iface = (p[i + 5] == 0x08 && p[i + 6] == 0x06 && p[i + 7] == 0x50);
+		} else if (t == 0x05 && in_iface && i + 5 < len) {   /* ENDPOINT */
+			uint8_t addr = p[i + 2], attr = p[i + 3];
+			uint16_t mps = p[i + 4] | (p[i + 5] << 8);
+			if ((attr & 0x03) == 0x02) {           /* bulk */
+				if (addr & 0x80) { bin = addr;  binmps = mps; }
+				else             { bout = addr; boutmps = mps; }
+			}
+		}
+		i += l;
+	}
+	if (bin && bout) {
+		d->is_msc = 1;
+		d->bulk_in = bin;   d->bulk_in_mps  = binmps  ? binmps  : 64;
+		d->bulk_out = bout; d->bulk_out_mps = boutmps ? boutmps : 64;
+	}
+}
+
+/* Configure Endpoint for the bulk pair (same input-context discipline as the
+ * net path: copy the live slot context, only bump Context Entries). */
+static int configure_bulk_msc(struct usbdev *d)
+{
+	int in_dci  = ep_dci(d->bulk_in);
+	int out_dci = ep_dci(d->bulk_out);
+	int max_dci = in_dci > out_dci ? in_dci : out_dci;
+
+	ring_init(&msc_in_ring);
+	ring_init(&msc_out_ring);
+
+	uint8_t *input = palloc();
+	uint32_t *icc  = (uint32_t *)input;
+	uint32_t *sctx = (uint32_t *)(input + ctx_sz * 1);
+	uint32_t *epin  = (uint32_t *)(input + ctx_sz * (1 + in_dci));
+	uint32_t *epout = (uint32_t *)(input + ctx_sz * (1 + out_dci));
+
+	icc[1] = (1u << 0) | (1u << in_dci) | (1u << out_dci);
+
+	uint32_t *out_slot = (uint32_t *)dcbaa[d->slot];
+	for (uint32_t i = 0; i < ctx_sz / 4; i++)
+		sctx[i] = out_slot[i];
+	sctx[0] = (sctx[0] & ~(0x1Fu << 27)) | ((uint32_t)max_dci << 27);
+
+	epin[1]  = (3u << 1) | (6u << 3) | ((uint32_t)d->bulk_in_mps  << 16);  /* bulk IN  */
+	epin[2]  = (uint32_t)msc_in_ring.base | 1;
+	epin[4]  = d->bulk_in_mps;
+	epout[1] = (3u << 1) | (2u << 3) | ((uint32_t)d->bulk_out_mps << 16);  /* bulk OUT */
+	epout[2] = (uint32_t)msc_out_ring.base | 1;
+	epout[4] = d->bulk_out_mps;
+
+	ring_push(&cmd_ring, (uint32_t)input, 0, 0,
+	          TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
+	if (cmd_submit() != CC_SUCCESS)
+		return -1;
+
+	msc_slot = d->slot;
+	msc_in_dci = in_dci;   msc_out_dci = out_dci;
+	msc_in_ep = d->bulk_in; msc_out_ep = d->bulk_out;
+	msc_in_mps = d->bulk_in_mps; msc_out_mps = d->bulk_out_mps;
+	return 0;
+}
+
+/* One bulk transfer: post a Normal TRB, ring the doorbell, wait for completion.
+ * Returns bytes transferred (len - residue), or -1; *cc gets the completion code. */
+static int bulk_xfer(struct ring *ring, int dci, uint8_t *buf, int len, int *cc)
+{
+	ring_push(ring, (uint32_t)buf, 0, len, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+	db[msc_slot] = dci;
+	struct trb *e = event_wait();
+	if (!e || TRB_GET_TYPE(e->control) != TRB_TRANSFER_EVENT) { *cc = 0; return -1; }
+	*cc = (e->status >> 24) & 0xFF;
+	if (*cc == CC_SUCCESS || *cc == CC_SHORT_PKT)
+		return len - (int)(e->status & 0xFFFFFF);          /* residue */
+	return -1;
+}
+
+/* Clear a STALL on a bulk endpoint: reset it, CLEAR_FEATURE(HALT) over EP0, then
+ * point the controller back at our ring. Runs in the poll-thread context, so it
+ * borrows the global EP0 ring for the control transfer and restores it. */
+static void msc_clear_stall(int dci, uint8_t ep_addr, struct ring *ring)
+{
+	ring_push(&cmd_ring, 0, 0, 0, TRB_TYPE(TRB_RESET_EP) |
+	          ((uint32_t)dci << 16) | ((uint32_t)msc_slot << 24));
+	cmd_submit();
+
+	struct ring saved = ep0_ring;
+	ep0_ring = msc_ep0;
+	control_no_data(msc_slot, 0x02, 0x01, 0, ep_addr);     /* CLEAR_FEATURE HALT */
+	ep0_ring = saved;
+
+	uint32_t deq = (uint32_t)&ring->base[ring->enq] | ring->cycle;
+	ring_push(&cmd_ring, deq, 0, 0, TRB_TYPE(TRB_SET_TRDQ) |
+	          ((uint32_t)dci << 16) | ((uint32_t)msc_slot << 24));
+	cmd_submit();
+}
+
+/* Run one BOT command: CBW (with the SCSI CDB) -> optional data -> CSW. For a
+ * read, the data lands in `data`; for a write, `data` is sent. Returns 0 iff the
+ * CSW reports success. */
+static int bot_xfer(const uint8_t *cdb, int cdb_len, int dlen, int write, uint8_t *data)
+{
+	/* --- Command Block Wrapper --- */
+	for (int i = 0; i < 31; i++) msc_cbw[i] = 0;
+	msc_cbw[0] = 'U'; msc_cbw[1] = 'S'; msc_cbw[2] = 'B'; msc_cbw[3] = 'C';
+	uint32_t tag = ++msc_tag;
+	put_le32(msc_cbw + 4, tag);
+	put_le32(msc_cbw + 8, (uint32_t)dlen);
+	msc_cbw[12] = write ? 0x00 : 0x80;     /* bmCBWFlags: 0x80 = data IN */
+	msc_cbw[13] = 0;                       /* LUN 0 */
+	msc_cbw[14] = (uint8_t)cdb_len;
+	for (int i = 0; i < 16 && i < cdb_len; i++) msc_cbw[15 + i] = cdb[i];
+
+	int cc;
+	if (bulk_xfer(&msc_out_ring, msc_out_dci, msc_cbw, 31, &cc) < 0) {
+		if (cc == CC_STALL) msc_clear_stall(msc_out_dci, msc_out_ep, &msc_out_ring);
+		return -1;
+	}
+
+	/* --- Data stage --- */
+	if (dlen > 0) {
+		if (write) {
+			for (int i = 0; i < dlen; i++) msc_data[i] = data[i];
+			if (bulk_xfer(&msc_out_ring, msc_out_dci, msc_data, dlen, &cc) < 0 &&
+			    cc == CC_STALL)
+				msc_clear_stall(msc_out_dci, msc_out_ep, &msc_out_ring);
+		} else {
+			if (bulk_xfer(&msc_in_ring, msc_in_dci, msc_data, dlen, &cc) < 0 &&
+			    cc == CC_STALL)
+				msc_clear_stall(msc_in_dci, msc_in_ep, &msc_in_ring);
+		}
+	}
+
+	/* --- Command Status Wrapper --- */
+	if (bulk_xfer(&msc_in_ring, msc_in_dci, msc_csw, 13, &cc) < 0) {
+		if (cc != CC_STALL) return -1;
+		msc_clear_stall(msc_in_dci, msc_in_ep, &msc_in_ring);
+		if (bulk_xfer(&msc_in_ring, msc_in_dci, msc_csw, 13, &cc) < 0)
+			return -1;
+	}
+	if (msc_csw[0] != 'U' || msc_csw[1] != 'S' || msc_csw[2] != 'B' || msc_csw[3] != 'S')
+		return -1;
+	if (le32(msc_csw + 4) != tag || msc_csw[12] != 0)     /* tag mismatch / failed */
+		return -1;
+
+	if (dlen > 0 && !write)
+		for (int i = 0; i < dlen; i++) data[i] = msc_data[i];
+	return 0;
+}
+
+static int scsi_tur(void)
+{
+	uint8_t cdb[6] = { 0 };                 /* TEST UNIT READY */
+	return bot_xfer(cdb, 6, 0, 0, 0);
+}
+static int scsi_request_sense(uint8_t *out18)
+{
+	uint8_t cdb[6] = { 0x03, 0, 0, 0, 18, 0 };
+	return bot_xfer(cdb, 6, 18, 0, out18);
+}
+static int scsi_inquiry(uint8_t *out36)
+{
+	uint8_t cdb[6] = { 0x12, 0, 0, 0, 36, 0 };
+	return bot_xfer(cdb, 6, 36, 0, out36);
+}
+static int scsi_read_capacity(uint32_t *last_lba, uint32_t *blk)
+{
+	uint8_t cdb[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	uint8_t r[8];
+	if (bot_xfer(cdb, 10, 8, 0, r) != 0) return -1;
+	*last_lba = ((uint32_t)r[0] << 24) | (r[1] << 16) | (r[2] << 8) | r[3];
+	*blk      = ((uint32_t)r[4] << 24) | (r[5] << 16) | (r[6] << 8) | r[7];
+	return 0;
+}
+static int scsi_rw10(uint32_t lba, uint8_t *buf, int count, int write)
+{
+	uint8_t cdb[10] = { write ? (uint8_t)0x2A : (uint8_t)0x28, 0,
+	                    (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+	                    (uint8_t)(lba >> 8), (uint8_t)lba,
+	                    0, (uint8_t)(count >> 8), (uint8_t)count, 0 };
+	return bot_xfer(cdb, 10, count * 512, write, buf);
+}
+
+/* Configure the bulk pipes and probe the medium. Runs at boot enumeration time
+ * (single ring context), so it uses the synchronous transfers directly. */
+static int bring_up_msc(struct usbdev *d, int port)
+{
+	(void)port;
+	if (configure_bulk_msc(d) != 0) {
+		vga_write("usbmsc: configure-endpoint failed\n");
+		return -1;
+	}
+	if (!msc_cbw)  msc_cbw  = palloc();
+	if (!msc_csw)  msc_csw  = palloc();
+	if (!msc_data) msc_data = palloc();
+	if (!msc_cache)
+		msc_cache = kmalloc(MSC_LINES * MSC_LINE_BYTES);
+	for (int i = 0; i < MSC_LINES; i++)     /* fresh medium: drop stale lines */
+		msc_ctag[i] = 0xFFFFFFFFu;
+	msc_victim = 0;
+	msc_ep0 = ep0_ring;                     /* save for post-boot stall recovery */
+	msc_tag = 0;
+
+	/* A freshly attached stick often reports "not ready" once; clear it with a
+	 * couple of TEST UNIT READY / REQUEST SENSE rounds before reading capacity. */
+	for (int i = 0; i < 4; i++) {
+		if (scsi_tur() == 0) break;
+		uint8_t sense[18];
+		scsi_request_sense(sense);
+		timer_sleep(50);
+	}
+
+	uint8_t inq[36];
+	msc_model[0] = '\0';
+	if (scsi_inquiry(inq) == 0) {           /* vendor[8..15] + product[16..31] */
+		int o = 0;
+		for (int i = 8; i < 32 && o < 38; i++)
+			msc_model[o++] = (inq[i] >= 0x20 && inq[i] < 0x7F) ? (char)inq[i] : ' ';
+		while (o > 0 && msc_model[o - 1] == ' ') o--;
+		msc_model[o] = '\0';
+	}
+
+	uint32_t last, blk;
+	if (scsi_read_capacity(&last, &blk) != 0) {
+		vga_write("usbmsc: READ CAPACITY failed\n");
+		return -1;
+	}
+	if (blk != 512) {
+		vga_write("usbmsc: unsupported block size "); vga_write_dec(blk); vga_putc('\n');
+		return -1;
+	}
+	msc_capacity = last + 1;
+	msc_ready = 1;
+	vga_write("usbmsc: ");
+	vga_write(msc_model[0] ? msc_model : "USB disk");
+	vga_write(" "); vga_write_dec(msc_capacity / 2048); vga_write(" MiB ready\n");
+	return 0;
+}
+
+/* Poll-thread side of the mailbox: run the queued (multi-sector) read/write. */
+static void msc_service(void)
+{
+	msc_result = scsi_rw10(msc_mb_lba, (uint8_t *)msc_mb_buf, msc_mb_count, msc_rw);
+	msc_req = 0;
+	msc_done = 1;
+}
+
+/* Serialize MSC ops -- and the cache -- across caller threads. Every sched_yield
+ * is preceded by `sti`: context_switch does NOT save/restore EFLAGS, so yielding
+ * with interrupts off poisons the next-resumed thread (it inherits IF=0 and its
+ * next `hlt` halts the CPU forever). The trailing sti in msc_unlock guarantees we
+ * leave with interrupts on regardless of how we were last resumed. */
+static void msc_lock(void)
+{
+	for (;;) {
+		__asm__ volatile ("cli");
+		if (!msc_busy) { msc_busy = 1; __asm__ volatile ("sti"); return; }
+		__asm__ volatile ("sti");
+		sched_yield();
+	}
+}
+static void msc_unlock(void)
+{
+	msc_busy = 0;
+	__asm__ volatile ("sti");
+}
+
+/* Hand one op to the poll thread and wait (caller already holds the lock). */
+static int msc_io(uint32_t lba, uint8_t *buf, int count, int write)
+{
+	msc_mb_lba = lba; msc_mb_buf = buf; msc_mb_count = count;
+	msc_rw = write; msc_done = 0; msc_req = 1;
+	while (!msc_done) {
+		__asm__ volatile ("sti");
+		sched_yield();
+	}
+	return msc_result;
+}
+
+int      xhci_msc_present(void) { return msc_ready; }
+uint32_t xhci_msc_sectors(void) { return msc_ready ? msc_capacity : 0; }
+const char *xhci_msc_model(void) { return msc_ready ? msc_model : ""; }
+
+int xhci_msc_read(uint32_t lba, void *buf)
+{
+	if (!msc_ready || lba >= msc_capacity)
+		return -1;
+	msc_lock();
+
+	int rc = 0;
+	if (msc_cache) {
+		uint32_t base = lba & ~(uint32_t)(MSC_CHUNK - 1);
+		int line = -1;
+		for (int i = 0; i < MSC_LINES; i++)
+			if (msc_ctag[i] == base) { line = i; break; }
+		if (line < 0) {                          /* miss: fetch a whole line */
+			line = msc_victim;
+			msc_victim = (msc_victim + 1) % MSC_LINES;
+			msc_ctag[line] = 0xFFFFFFFFu;        /* invalid while filling */
+			uint32_t cnt = MSC_CHUNK;
+			if (base + cnt > msc_capacity) cnt = msc_capacity - base;
+			if (msc_io(base, msc_cache + line * MSC_LINE_BYTES, (int)cnt, 0) != 0)
+				rc = -1;
+			else
+				msc_ctag[line] = base;
+		}
+		if (rc == 0)
+			kmemcpy(buf, msc_cache + line * MSC_LINE_BYTES +
+			             (lba - base) * 512, 512);
+	} else {
+		rc = msc_io(lba, buf, 1, 0);             /* no cache (alloc failed) */
+	}
+
+	msc_unlock();
+	return rc;
+}
+
+int xhci_msc_write(uint32_t lba, const void *buf)
+{
+	if (!msc_ready || lba >= msc_capacity)
+		return -1;
+	msc_lock();
+	int rc = msc_io(lba, (uint8_t *)buf, 1, 1);
+	if (msc_cache) {                             /* keep the cache coherent */
+		uint32_t base = lba & ~(uint32_t)(MSC_CHUNK - 1);
+		for (int i = 0; i < MSC_LINES; i++)
+			if (msc_ctag[i] == base) { msc_ctag[i] = 0xFFFFFFFFu; break; }
+	}
+	msc_unlock();
+	return rc;
+}
+
 /* Walk a configuration descriptor blob and print its interfaces + endpoints, so
  * lsusb shows what each device actually exposes (class/subclass/protocol and the
  * bulk/interrupt endpoints a driver would use). */
@@ -1105,6 +1515,12 @@ static void enumerate_device(uint32_t port, int speed)
 	parse_net(d);
 	if (d->is_net && rndis_setup(d) == 0 && !net_up)
 		bring_up_net(d, (int)port);   /* filter + bulk endpoints + register NIC  */
+
+	/* Or a USB mass-storage device: configure its bulk pipes and probe capacity
+	 * now (still single-context), so it's a ready block device for FAT. */
+	parse_msc(d);
+	if (d->is_msc && !msc_ready)
+		bring_up_msc(d, (int)port);
 }
 
 /* Print the cached device table: one summary line per device, plus full
@@ -1248,11 +1664,23 @@ static void scan_ports(void)
  * instead of timing out and snapping back off. `lsusb` only reads the cache. */
 static void usb_poll_thread(void)
 {
+	int idle = 0;
 	for (;;) {
 		if (net_up)
 			data_loop();           /* once up, never rescan (would reset ports) */
-		scan_ports();
-		timer_sleep(250);
+		/* Service a queued mass-storage sector op promptly (checked every ~1 ms),
+		 * and rescan ports for hotplug only occasionally (~250 ms). Both run from
+		 * this one thread, so the rings stay single-context. */
+		if (msc_req) {
+			msc_service();
+			idle = 0;
+			continue;
+		}
+		if (++idle >= 250) {
+			scan_ports();
+			idle = 0;
+		}
+		timer_sleep(1);
 	}
 }
 

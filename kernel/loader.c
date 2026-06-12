@@ -2,28 +2,70 @@
 
 #include "loader.h"
 #include "paging.h"
+#include "pmm.h"
 #include "gdt.h"
 #include "elf.h"
 #include "sched.h"
 
 #define USER_STACK_PAGES 4   /* 16 KiB of user stack                          */
 
-/* Map [vaddr, vaddr+memsz) into dir, copying filesz bytes of segment data
- * from `src` and zeroing the rest (.bss). Returns 0 on success. */
+/* The scratch mapping (paging_scratch_*) is shared kernel state, so a map->
+ * write->unmap interval must not be preempted by another exec/fork using the
+ * same slot. These bracket each interval with interrupts off and restore the
+ * prior IF, so it is safe whether exec runs from a kernel thread (IF=1) or an
+ * int 0x80 syscall (IF=0). */
+static inline uint32_t irq_save(void)
+{
+	uint32_t f;
+	__asm__ volatile ("pushf\n\tpop %0\n\tcli" : "=r"(f) :: "memory");
+	return f;
+}
+static inline void irq_restore(uint32_t f)
+{
+	__asm__ volatile ("push %0\n\tpopf" :: "r"(f) : "memory", "cc");
+}
+
+/* Map [vaddr, vaddr+memsz) into dir from fresh pmm frames, copying filesz bytes
+ * of segment data and zeroing the rest (.bss). Each frame is written in full
+ * (data then zero-fill), so no stale RAM from a previous process leaks through.
+ * Returns 0 on success, -1 if physical memory is exhausted. */
 static int load_segment(uint32_t *dir, uint32_t vaddr, const uint8_t *src,
                         uint32_t filesz, uint32_t memsz)
 {
 	uint32_t first = vaddr & ~0xFFFu;
 	uint32_t last  = (vaddr + memsz + 0xFFFu) & ~0xFFFu;
 	for (uint32_t page = first; page < last; page += 4096) {
-		uint8_t *frame = palloc();
-		if (!frame)
+		uint32_t phys = pmm_alloc_frame();
+		if (!phys)
 			return -1;
-		for (uint32_t b = 0; b < 4096; b++) {
-			uint32_t off = (page + b) - vaddr;   /* offset within the segment */
-			frame[b] = (off < filesz) ? src[off] : 0;
+		uint32_t fl = irq_save();
+		uint8_t *kv = paging_scratch_map(0, phys);
+		/* Split the page into [0,lo) pre-segment padding, [lo,hi) file data, and
+		 * [hi,4096) .bss tail. A pure-.bss page (the common case for big zeroed
+		 * buffers) is lo==hi==0, so it skips straight to the word-store zero-fill
+		 * below — ~4x fewer stores than the old per-byte branch, which matters at
+		 * -O0 where a 11 MiB .bss otherwise stalls the launcher for seconds. */
+		uint32_t seg_end = vaddr + filesz;
+		uint32_t lo = (vaddr > page) ? (vaddr - page) : 0;
+		uint32_t hi = (seg_end > page) ? (seg_end - page) : 0;
+		if (hi > 4096) hi = 4096;
+		if (hi < lo)   hi = lo;
+		uint32_t b = 0;
+		for (; b < lo; b++)                       /* pad before the segment start  */
+			kv[b] = 0;
+		uint32_t off = page + b - vaddr;          /* segment offset at byte b      */
+		for (; b < hi; b++)                       /* file data for this page       */
+			kv[b] = src[off++];
+		while (b < 4096 && (b & 3u))              /* align up, then word-fill zeros */
+			kv[b++] = 0;
+		for (; b + 4 <= 4096; b += 4)
+			*(uint32_t *)(kv + b) = 0;
+		paging_scratch_unmap(0);
+		irq_restore(fl);
+		if (paging_map_user_at(dir, page, phys, 1) < 0) {   /* private tables   */
+			pmm_free_frame(phys);
+			return -1;
 		}
-		paging_map_user_page(dir, page, (uint32_t)frame);
 	}
 	return 0;
 }
@@ -70,13 +112,23 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
 	}
 
 	for (int p = 0; p < USER_STACK_PAGES; p++) {
-		uint8_t *frame = palloc();
-		if (!frame) {
+		uint32_t phys = pmm_alloc_frame();
+		if (!phys) {
 			paging_free_process_dir(dir);
 			return -1;
 		}
-		paging_map_user_page(dir, USER_STACK_TOP - (uint32_t)(p + 1) * 4096,
-		                     (uint32_t)frame);
+		uint32_t fl = irq_save();             /* zero it: never leak prior data  */
+		uint32_t *kv = paging_scratch_map(0, phys);
+		for (int k = 0; k < 1024; k++)
+			kv[k] = 0;
+		paging_scratch_unmap(0);
+		irq_restore(fl);
+		if (paging_map_user_at(dir, USER_STACK_TOP - (uint32_t)(p + 1) * 4096,
+		                       phys, 1) < 0) {
+			pmm_free_frame(phys);
+			paging_free_process_dir(dir);
+			return -1;
+		}
 	}
 
 	*out_dir = dir;
@@ -85,7 +137,7 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
 }
 
 #define MAX_ARGS 8
-#define ARG_TOP  0x003FF000u   /* args live in the top mapped stack page       */
+#define ARG_TOP  USER_STACK_TOP   /* args live in the top mapped stack page    */
 
 static int str_len(const char *s)
 {
@@ -97,22 +149,29 @@ static int str_len(const char *s)
 
 uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 {
-	/* The top stack page [ARG_TOP-4K, ARG_TOP) backs the argument block; we
-	 * write through its physical frame (identity-mapped) but store pointers
-	 * as the user virtual addresses the process will see. */
+	/* The top stack page [ARG_TOP-4K, ARG_TOP) backs the argument block. Its
+	 * frame is pmm-backed (above the identity map), so reach it through the
+	 * supervisor scratch mapping; pointers are stored as the user virtual
+	 * addresses the process will see. Interrupts off for the whole build, since
+	 * we hold the scratch slot across it. */
 	uint32_t page = ARG_TOP - 4096;
-	uint8_t *fp = (uint8_t *)paging_user_phys(dir, page);
-	if (!fp || argc > MAX_ARGS)
+	uint32_t pa = paging_user_phys(dir, page);
+	if (!pa || argc > MAX_ARGS)
 		return USER_STACK_TOP;
 
+	uint32_t fl = irq_save();
+	uint8_t *fp = paging_scratch_map(0, pa);
 	uint32_t uargv[MAX_ARGS];
 	uint32_t sp = ARG_TOP;
 
 	for (int i = 0; i < argc; i++) {           /* copy the strings            */
 		int len = str_len(argv[i]) + 1;
 		sp -= (uint32_t)len;
-		if (sp < page)
-			return USER_STACK_TOP;             /* args too big; bail safely   */
+		if (sp < page) {                       /* args too big; bail safely   */
+			paging_scratch_unmap(0);
+			irq_restore(fl);
+			return USER_STACK_TOP;
+		}
 		for (int k = 0; k < len; k++)
 			fp[sp - page + (uint32_t)k] = (uint8_t)argv[i][k];
 		uargv[i] = sp;
@@ -125,6 +184,8 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 		PUSH(uargv[i]);                        /* argv[i]                     */
 	PUSH((uint32_t)argc);                      /* argc, at the lowest addr    */
 #undef PUSH
+	paging_scratch_unmap(0);
+	irq_restore(fl);
 	return sp;
 }
 

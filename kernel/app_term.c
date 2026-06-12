@@ -60,4 +60,5 @@ void app_term_init(void)
 	w->draw  = term_draw;
 	w->dirty = term_dirty;
 	w->resizable = 0;     /* the console grid is a fixed 80x25 */
+	w->cursor = WM_CURSOR_TEXT;   /* I-beam over the console text */
 }

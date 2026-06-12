@@ -30,12 +30,26 @@ const char *blk_backend(void);        /* "IDE" / "AHCI" / "NVMe" / "tmpfs"/"none
  * Returns 0 on success, -1 if the allocation failed. */
 int         blk_use_ram(void);
 
+/* Mount a FAT volume (fat.c) on the first present block device that is NOT the
+ * one backing owofs -- i.e. a second disk, a USB stick, an SD card. owofs and
+ * the FAT volume thus live on separate media. Call after blk_init() (it needs
+ * to know owofs's pick). Returns 0 if a FAT volume was mounted, -1 otherwise. */
+int         blk_mount_fat(void);
+
+/* Name of the device backing the removable volume at /media ("USB"/"SATA"/"NVMe"/"IDE"),
+ * for the UI to label it. Valid only while a FAT volume is mounted ("" if none
+ * was ever mounted). */
+const char *blk_fat_source(void);
+
 /* True only for the IDE disk. fs_init() auto-creates owofs on a blank IDE disk
  * (the dev/QEMU disk) but never on AHCI/NVMe, which on real hardware is the
  * user's OS drive — formatting that automatically would destroy their data. */
 int         blk_is_ide(void);
 
 int         blk_read_sector(uint32_t lba, void *buf);
+/* Read `count` contiguous sectors at once. On IDE this batches into a single
+ * READ SECTORS command; other backends fan out to blk_read_sector. */
+int         blk_read(uint32_t lba, void *buf, uint32_t count);
 int         blk_write_sector(uint32_t lba, const void *buf);
 uint32_t    blk_sectors(void);        /* capacity in 512-byte sectors (0 if none)*/
 const char *blk_model(void);          /* backing drive's model string            */

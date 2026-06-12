@@ -21,6 +21,9 @@ void     pmm_free_frame(uint32_t phys);
  * contiguous and don't fit in the small identity-mapped heap. Not freeable. */
 uint32_t pmm_alloc_contig(uint32_t bytes);
 
+/* Free a run returned by pmm_alloc_contig (frame by frame). */
+void     pmm_free_contig(uint32_t phys, uint32_t bytes);
+
 /* Reported in KiB rather than bytes so a ≥4 GiB machine doesn't overflow the
  * uint32 (4 GiB of bytes wraps to 0; 4 GiB is 4194304 KiB, which fits).
  * `installed` is the true firmware-reported RAM total (can exceed 4 GiB on a

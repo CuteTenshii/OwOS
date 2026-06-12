@@ -914,3 +914,95 @@ int gzip_decompress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dc
 		return -1;
 	return n;
 }
+
+/* Raw zlib stream (RFC 1950): a 2-byte header, the DEFLATE body, a 4-byte
+ * adler32. The header's low nibble of byte 0 is the compression method (8 =
+ * DEFLATE); FDICT (byte 1 bit 5) means a preset dictionary follows, which PNG
+ * never uses and we don't support. We reuse the very same inflate() as gzip —
+ * only the envelope differs — and leave the adler32 trailer unverified. */
+int zlib_inflate(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
+{
+	if (slen < 6)                           /* 2 header + >=0 body + 4 adler   */
+		return -1;
+	if ((src[0] & 0x0F) != 0x08)            /* CM must be DEFLATE              */
+		return -1;
+	if (((uint32_t)src[0] << 8 | src[1]) % 31 != 0)  /* FCHECK: header % 31    */
+		return -1;
+	if (src[1] & 0x20)                      /* FDICT — unsupported             */
+		return -1;
+
+	return inflate(src, 2, slen - 4, dst, dcap);
+}
+
+/* adler32 (RFC 1950): two rolling 16-bit sums mod 65521. Stored big-endian in
+ * the zlib trailer (unlike gzip's little-endian CRC32). */
+static uint32_t adler32(const uint8_t *data, uint32_t n)
+{
+	uint32_t a = 1, b = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		a = (a + data[i]) % 65521;
+		b = (b + a) % 65521;
+	}
+	return (b << 16) | a;
+}
+
+int zlib_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
+{
+	if (dcap < 6)
+		return -1;
+	dst[0] = 0x78;                  /* CM=8 (DEFLATE), CINFO=7 (32K window)    */
+	dst[1] = 0x01;                  /* FLEVEL=0, no FDICT; 0x7801 % 31 == 0    */
+
+	struct outbits o = { dst, dcap, 2, 0, 0, 0 };
+	if (deflate(src, slen, &o) < 0)
+		return -1;
+	flush_bits(&o);
+	if (o.err || o.pos + 4 > dcap)
+		return -1;
+
+	uint32_t ad = adler32(src, slen);     /* big-endian trailer                */
+	dst[o.pos + 0] = (uint8_t)(ad >> 24);
+	dst[o.pos + 1] = (uint8_t)(ad >> 16);
+	dst[o.pos + 2] = (uint8_t)(ad >> 8);
+	dst[o.pos + 3] = (uint8_t)ad;
+	return (int)(o.pos + 4);
+}
+
+int zlib_store(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
+{
+	/* Worst case: header(2) + one 5-byte block header per <=65535-byte chunk +
+	 * the data + adler(4). */
+	uint32_t nblocks = slen ? (slen + 65534) / 65535 : 1;
+	if (dcap < 2 + nblocks * 5 + slen + 4)
+		return -1;
+
+	uint32_t pos = 0;
+	dst[pos++] = 0x78;              /* CM=8, CINFO=7; 0x7801 % 31 == 0         */
+	dst[pos++] = 0x01;
+
+	/* One or more stored blocks. A stored block's 3-bit header (BFINAL, BTYPE=00)
+	 * sits in the low bits of a byte and is then padded to a byte boundary, so a
+	 * whole header byte of 0x00 (or 0x01 for the final block) is exactly right. */
+	uint32_t off = 0;
+	do {
+		uint32_t chunk = slen - off;
+		if (chunk > 65535)
+			chunk = 65535;
+		int final = (off + chunk >= slen);
+		dst[pos++] = final ? 0x01 : 0x00;       /* BFINAL | BTYPE=00 (stored)  */
+		dst[pos++] = (uint8_t)chunk;            /* LEN  (little-endian)        */
+		dst[pos++] = (uint8_t)(chunk >> 8);
+		dst[pos++] = (uint8_t)~chunk;           /* NLEN = ~LEN                 */
+		dst[pos++] = (uint8_t)(~chunk >> 8);
+		for (uint32_t i = 0; i < chunk; i++)
+			dst[pos++] = src[off + i];
+		off += chunk;
+	} while (off < slen);
+
+	uint32_t ad = adler32(src, slen);           /* big-endian trailer          */
+	dst[pos++] = (uint8_t)(ad >> 24);
+	dst[pos++] = (uint8_t)(ad >> 16);
+	dst[pos++] = (uint8_t)(ad >> 8);
+	dst[pos++] = (uint8_t)ad;
+	return (int)pos;
+}

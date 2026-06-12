@@ -20,6 +20,7 @@ int      fb_active(void);          /* 1 once a graphics mode is up            */
 uint32_t fb_width(void);
 uint32_t fb_height(void);
 uint32_t *fb_ptr(void);            /* the back buffer drawing primitives target */
+uint32_t fb_pitch_pixels(void);    /* back buffer row stride in pixels (>= width) */
 
 /* Copy the damaged region of the back buffer to the visible framebuffer.
  * Drawing happens off-screen (no tearing) and only the rectangle touched since

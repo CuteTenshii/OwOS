@@ -28,6 +28,11 @@
 #define SYS_THREAD     24
 #define SYS_SLEEP      25
 #define SYS_WIN_RESIZABLE 26
+#define SYS_MSEC       27
+#define SYS_READFILE_AT 28
+#define SYS_VOLUMES    29
+#define SYS_EJECT      30
+#define SYS_WIN_CURSOR 31
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -76,6 +81,11 @@ int execp(const char *name)
 	return syscall(SYS_EXEC, (int)name, 0, 0);
 }
 
+int execp1(const char *name, const char *arg)
+{
+	return syscall(SYS_EXEC, (int)name, (int)arg, 0);
+}
+
 int waitpid(int pid)
 {
 	return syscall(SYS_WAITPID, pid, 0, 0);
@@ -86,6 +96,11 @@ unsigned uptime(void)
 	return (unsigned)syscall(SYS_UPTIME, 0, 0, 0);
 }
 
+unsigned msec(void)
+{
+	return (unsigned)syscall(SYS_MSEC, 0, 0, 0);
+}
+
 int readfile(const char *name, char *buf, int max)
 {
 	return syscall(SYS_READFILE, (int)name, (int)buf, max);
@@ -94,6 +109,12 @@ int readfile(const char *name, char *buf, int max)
 int writefile(const char *name, const void *buf, int len)
 {
 	return syscall(SYS_WRITEFILE, (int)name, (int)buf, len);
+}
+
+int readfile_at(const char *name, unsigned off, void *buf, unsigned len)
+{
+	unsigned a[4] = { (unsigned)name, off, (unsigned)buf, len };
+	return syscall(SYS_READFILE_AT, (int)a, 0, 0);
 }
 
 int net_connect(const char *host, int port, int tls)
@@ -151,6 +172,11 @@ int win_resizable(int id, int on)
 	return syscall(SYS_WIN_RESIZABLE, id, on, 0);
 }
 
+int win_cursor(int id, int shape)
+{
+	return syscall(SYS_WIN_CURSOR, id, shape, 0);
+}
+
 unsigned now_hms(void)
 {
 	return (unsigned)syscall(SYS_RTC, 0, 0, 0);
@@ -159,6 +185,16 @@ unsigned now_hms(void)
 int readdir(const char *path, int idx, struct dirent_u *out)
 {
 	return syscall(SYS_READDIR, (int)path, idx, (int)out);
+}
+
+int volumes(int idx, struct volinfo *out)
+{
+	return syscall(SYS_VOLUMES, idx, (int)out, 0);
+}
+
+int eject(const char *path)
+{
+	return syscall(SYS_EJECT, (int)path, 0, 0);
 }
 
 void msleep(unsigned ms)

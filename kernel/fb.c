@@ -289,6 +289,7 @@ int      fb_active(void) { return active; }
 uint32_t fb_width(void)  { return fb_w; }
 uint32_t fb_height(void) { return fb_h; }
 uint32_t *fb_ptr(void)   { return fb; }
+uint32_t fb_pitch_pixels(void) { return fb_pitch; }
 
 void fb_pixel(int x, int y, uint32_t color)
 {

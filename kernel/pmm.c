@@ -18,6 +18,13 @@ static uint32_t bitmap[BITMAP_DWORDS];
 static uint32_t total_frames;
 static uint32_t used_frames;
 
+/* Search cursor: the lowest frame that might be free. pmm_alloc_frame scans up
+ * from here instead of from 0, so allocating N frames in a row is O(N) total
+ * rather than O(N^2) — without it, loading a program with a multi-MiB .bss (or
+ * forking) re-scanned every already-taken low frame on each allocation. A free
+ * below the cursor pulls it back so the freed frame is reused. */
+static uint32_t alloc_hint;
+
 /* Frames backed by *real, allocatable RAM* (the available regions below 4 GiB).
  * Distinct from total_frames, which also spans the PCI/MMIO hole and reserved
  * regions just under 4 GiB — those are marked "used" in the bitmap but were
@@ -99,14 +106,27 @@ void pmm_init(const struct multiboot_info *mbi)
 			used_frames++;
 		}
 	}
+
+	/* Everything below here is reserved, so that's where the search starts. */
+	alloc_hint = RESERVED_FRAMES;
 }
 
 uint32_t pmm_alloc_frame(void)
 {
-	for (uint32_t f = 0; f < total_frames; f++) {
+	for (uint32_t f = alloc_hint; f < total_frames; f++) {
 		if (!frame_test(f)) {
 			frame_set(f);
 			used_frames++;
+			alloc_hint = f + 1;
+			return f * FRAME_SIZE;
+		}
+	}
+	/* The cursor can outrun frames freed below it; sweep from the bottom once. */
+	for (uint32_t f = RESERVED_FRAMES; f < alloc_hint; f++) {
+		if (!frame_test(f)) {
+			frame_set(f);
+			used_frames++;
+			alloc_hint = f + 1;
 			return f * FRAME_SIZE;
 		}
 	}
@@ -141,7 +161,18 @@ void pmm_free_frame(uint32_t phys)
 	if (f < total_frames && frame_test(f)) {
 		frame_clear(f);
 		used_frames--;
+		if (f < alloc_hint)        /* let the next alloc reuse this frame */
+			alloc_hint = f;
 	}
+}
+
+/* Release a run previously handed out by pmm_alloc_contig. The bitmap allocator
+ * tracks frames individually, so a contiguous run is just freed frame by frame. */
+void pmm_free_contig(uint32_t phys, uint32_t bytes)
+{
+	uint32_t need = (bytes + FRAME_SIZE - 1) / FRAME_SIZE;
+	for (uint32_t i = 0; i < need; i++)
+		pmm_free_frame(phys + i * FRAME_SIZE);
 }
 
 /* Reported in KiB, not bytes: a fully-populated 4 GiB machine is 4194304 KiB,

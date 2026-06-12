@@ -1,9 +1,50 @@
 /* fs.c — owofs implementation (see fs.h for the on-disk layout). */
 
+#include <stddef.h>
+
 #include "fs.h"
 #include "blk.h"
+#include "fat.h"
+#include "hfs.h"
+#include "ext.h"
 #include "vga.h"
 #include "rtc.h"
+
+/* A mounted removable volume (FAT via fat.c, HFS+ via hfs.c, or ext2/3/4 via
+ * ext.c) is grafted into the owofs namespace at "/media" -- so the ordinary
+ * ls/cat/cd reach it with no per-command special-casing and no parallel verbs.
+ * media_subpath() recognises a path inside the mount and returns the path *within*
+ * the volume: "" for "/media" itself, "/docs/README.TXT" for the nested file. It
+ * returns NULL when nothing is mounted or the path is plain owofs. */
+#define MEDIA_MOUNT "media"
+
+/* Exactly one removable volume is mounted at a time; these dispatch to whichever
+ * driver owns it. Writes go to FAT only -- HFS+ and ext are read-only. */
+static int rvol_mounted(void)  { return fat_mounted() || hfs_mounted() || ext_mounted(); }
+static int rvol_readonly(void) { return hfs_mounted() || ext_mounted(); }
+static int rvol_list(const char *p)
+{ return ext_mounted() ? ext_list(p) : hfs_mounted() ? hfs_list(p) : fat_list(p); }
+static int rvol_stat(const char *p, int *d, uint32_t *s)
+{ return ext_mounted() ? ext_stat(p, d, s) : hfs_mounted() ? hfs_stat(p, d, s) : fat_stat(p, d, s); }
+static int rvol_read_at(const char *p, uint32_t o, void *b, uint32_t l)
+{ return ext_mounted() ? ext_read_at(p, o, b, l) : hfs_mounted() ? hfs_read_at(p, o, b, l) : fat_read_at(p, o, b, l); }
+static int rvol_enum(const char *p, int i, char *n, int *d, uint32_t *s)
+{ return ext_mounted() ? ext_enum_dir(p, i, n, d, s) : hfs_mounted() ? hfs_enum_dir(p, i, n, d, s) : fat_enum_dir(p, i, n, d, s); }
+
+static const char *media_subpath(const char *path)
+{
+	if (!path || !rvol_mounted())
+		return NULL;
+	while (*path == '/')               /* tolerate absolute or root-relative */
+		path++;
+	const char *m = MEDIA_MOUNT;
+	while (*m && *path == *m) { path++; m++; }
+	if (*m != '\0')                    /* didn't match the whole "media"      */
+		return NULL;
+	if (*path != '\0' && *path != '/') /* "mediafoo" must not match "media"   */
+		return NULL;
+	return path;                       /* "" or "/sub/path"                  */
+}
 
 #define SECTOR_SIZE     512
 #define FS_MAGIC        0x4F574F34u    /* "OWO4" (bumped: 32-entry, 2-sector dir) */
@@ -289,6 +330,12 @@ void fs_list(const char *path)
 		vga_write("fs: not mounted\n");
 		return;
 	}
+	const char *sub = media_subpath(path);
+	if (sub) {                             /* under the FAT mount -> fat.c      */
+		if (rvol_list(sub) < 0)
+			vga_write("ls: no such file or directory\n");
+		return;
+	}
 	int d = (path && path[0]) ? find_path(path) : FS_SLOT_ROOT;
 	if (d == -1) {
 		vga_write("ls: no such file or directory\n");
@@ -305,6 +352,10 @@ void fs_list(const char *path)
 			list_row(i);
 			n++;
 		}
+	if (d == FS_SLOT_ROOT && rvol_mounted()) {  /* surface the mount point      */
+		vga_write("       -            <DIR>  " MEDIA_MOUNT "/\n");
+		n++;
+	}
 	if (!n)
 		vga_write("(empty)\n");
 }
@@ -313,6 +364,11 @@ int fs_read(const char *name, void *buf, uint32_t maxlen)
 {
 	if (!mounted)
 		return -1;
+	const char *sub = media_subpath(name);
+	if (sub) {
+		int r = rvol_read_at(sub, 0, buf, maxlen);
+		return r < 0 ? -1 : r;
+	}
 	int i = find_file(name);
 	if (i < 0)
 		return -1;
@@ -339,6 +395,13 @@ int fs_size(const char *name)
 {
 	if (!mounted)
 		return -1;
+	const char *sub = media_subpath(name);
+	if (sub) {
+		int is_dir; uint32_t sz;
+		if (rvol_stat(sub, &is_dir, &sz) != 0 || is_dir)
+			return -1;
+		return (int)sz;
+	}
 	int i = find_file(name);
 	return (i < 0) ? -1 : (int)dir[i].size;
 }
@@ -350,6 +413,11 @@ int fs_read_at(const char *name, uint32_t offset, void *buf, uint32_t len)
 {
 	if (!mounted)
 		return -1;
+	const char *sub = media_subpath(name);
+	if (sub) {
+		int r = rvol_read_at(sub, offset, buf, len);
+		return r < 0 ? -1 : r;
+	}
 	int i = find_file(name);
 	if (i < 0)
 		return -1;
@@ -364,11 +432,27 @@ int fs_read_at(const char *name, uint32_t offset, void *buf, uint32_t len)
 		uint32_t pos   = offset + copied;
 		uint32_t sec   = dir[i].start + pos / SECTOR_SIZE;
 		uint32_t soff  = pos % SECTOR_SIZE;
+		uint32_t left  = want - copied;
+
+		/* Whole sectors landing on a sector boundary go straight into the
+		 * caller's buffer in one batched read — no per-sector bounce through
+		 * tmp. A streaming reader (4 KiB-aligned, e.g. imgview) hits this for
+		 * all but a possible tail, turning a megabyte into a handful of
+		 * READ SECTORS commands. */
+		if (soff == 0 && left >= SECTOR_SIZE) {
+			uint32_t nsec = left / SECTOR_SIZE;
+			if (blk_read(sec, (uint8_t *)buf + copied, nsec) != 0)
+				return (int)copied;   /* partial read on I/O error */
+			copied += nsec * SECTOR_SIZE;
+			continue;
+		}
+
+		/* Partial leading/trailing sector: read one and copy the slice. */
 		if (blk_read_sector(sec, tmp) != 0)
 			return (int)copied;       /* partial read on I/O error */
 		uint32_t chunk = SECTOR_SIZE - soff;
-		if (chunk > want - copied)
-			chunk = want - copied;
+		if (chunk > left)
+			chunk = left;
 		for (uint32_t k = 0; k < chunk; k++)
 			((uint8_t *)buf)[copied + k] = tmp[soff + k];
 		copied += chunk;
@@ -380,6 +464,11 @@ int fs_create(const char *name, const void *data, uint32_t size)
 {
 	if (!mounted)
 		return -1;
+	const char *sub = media_subpath(name);
+	if (sub) {
+		if (rvol_readonly()) return -1;        /* HFS+ is read-only */
+		return fat_create(sub, data, size) == 0 ? 0 : -1;
+	}
 
 	int parent;
 	char leaf[FS_NAME_LEN];
@@ -446,6 +535,14 @@ int fs_delete(const char *name)
 {
 	if (!mounted)
 		return -1;
+	const char *sub = media_subpath(name);
+	if (sub) {
+		if (rvol_readonly()) return -1;        /* HFS+ is read-only */
+		int r = fat_delete(sub);
+		if (r == 0)  return 0;
+		if (r == -3) return -2;          /* it's a directory -> fs_rmdir */
+		return -1;
+	}
 	int i = find_path(name);
 	if (i < 0 || i == FS_SLOT_ROOT)
 		return -1;                                 /* no such file                    */
@@ -495,6 +592,11 @@ int fs_mkdir(const char *path)
 {
 	if (!mounted)
 		return -1;
+	const char *sub = media_subpath(path);
+	if (sub) {
+		if (rvol_readonly()) return -1;        /* HFS+ is read-only */
+		return fat_mkdir(sub) == 0 ? 0 : -1;
+	}
 	int parent;
 	char leaf[FS_NAME_LEN];
 	if (resolve_path(path, &parent, leaf) != 0 || leaf[0] == '\0')
@@ -517,6 +619,12 @@ int fs_rmdir(const char *path)
 {
 	if (!mounted)
 		return -1;
+	const char *sub = media_subpath(path);
+	if (sub) {
+		if (rvol_readonly()) return -1;        /* HFS+ is read-only */
+		int r = fat_rmdir(sub);
+		return (r == 0) ? 0 : (r == -2) ? -2 : (r == -3) ? -3 : -1;
+	}
 	int s = find_path(path);
 	if (s < 0 || s == FS_SLOT_ROOT)
 		return -1;                                 /* not found / can't remove root   */
@@ -531,6 +639,13 @@ int fs_rmdir(const char *path)
 
 int fs_isdir(const char *path)
 {
+	const char *sub = media_subpath(path);
+	if (sub) {
+		int is_dir;
+		if (rvol_stat(sub, &is_dir, NULL) != 0)
+			return -1;
+		return is_dir ? 1 : 0;
+	}
 	int s = find_path(path);
 	if (s == FS_SLOT_ROOT)
 		return 1;
@@ -798,6 +913,16 @@ int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime)
 {
 	if (!mounted)
 		return -1;
+	const char *sub = media_subpath(path);
+	if (sub) {
+		int d; uint32_t sz;
+		if (rvol_stat(sub, &d, &sz) != 0)
+			return -1;
+		if (is_dir) *is_dir = d;
+		if (size)   *size = sz;
+		if (mtime)  *mtime = 0;        /* FAT mtimes not surfaced yet */
+		return 0;
+	}
 	int slot = find_path((path && path[0]) ? path : "/");
 	if (slot == FS_SLOT_ROOT) {        /* the root directory itself */
 		if (is_dir) *is_dir = 1;
@@ -818,6 +943,16 @@ int fs_enum_dir(const char *path, int idx, char *name, int *is_dir,
 {
 	if (!mounted || idx < 0)
 		return 0;
+	const char *sub = media_subpath(path);
+	if (sub) {                         /* browsing inside the FAT mount      */
+		int d; uint32_t sz;
+		if (!rvol_enum(sub, idx, name, &d, &sz))
+			return 0;
+		if (is_dir) *is_dir = d;
+		if (size)   *size = sz;
+		if (mtime)  *mtime = 0;
+		return 1;
+	}
 	int slot = find_path((path && path[0]) ? path : "/");
 	uint8_t parent;
 	if (slot == FS_SLOT_ROOT)
@@ -839,6 +974,20 @@ int fs_enum_dir(const char *path, int idx, char *name, int *is_dir,
 			if (is_dir) *is_dir = (dir[i].flags & FS_DIR_FLAG) ? 1 : 0;
 			if (size)   *size = dir[i].size;
 			if (mtime)  *mtime = dir[i].mtime;
+			return 1;
+		}
+		count++;
+	}
+	/* The FAT volume appears as a synthetic "fat" directory in the root. */
+	if (parent == FS_ROOT && rvol_mounted()) {
+		if (count == idx) {
+			int j = 0;
+			for (; MEDIA_MOUNT[j] && j < FS_NAME_LEN - 1; j++)
+				name[j] = MEDIA_MOUNT[j];
+			name[j] = '\0';
+			if (is_dir) *is_dir = 1;
+			if (size)   *size = 0;
+			if (mtime)  *mtime = 0;
 			return 1;
 		}
 		count++;

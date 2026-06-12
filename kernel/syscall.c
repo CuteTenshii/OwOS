@@ -11,6 +11,10 @@
 #include "keyboard.h"
 #include "timer.h"
 #include "fs.h"
+#include "fat.h"
+#include "hfs.h"
+#include "ext.h"
+#include "blk.h"
 #include "loader.h"
 #include "sched.h"
 #include "heap.h"
@@ -46,6 +50,11 @@
 #define SYS_THREAD     24 /* thread_create(entry=ebx, stacktop=ecx) -> tid/-1   */
 #define SYS_SLEEP      25 /* msleep(ms=ebx) -> 0                                */
 #define SYS_WIN_RESIZABLE 26 /* win_resizable(id=ebx, on=ecx) -> 0/-1           */
+#define SYS_MSEC       27 /* msec() -> milliseconds since boot                  */
+#define SYS_READFILE_AT 28 /* pread(args=ebx -> {name,off,buf,len}) -> bytes/0/-1 */
+#define SYS_VOLUMES    29 /* volumes(idx=ebx, out=ecx -> struct volinfo) -> 1/0/-1 */
+#define SYS_EJECT      30 /* eject(path=ebx, ignored) -> 0/-1 (unmount /media)        */
+#define SYS_WIN_CURSOR 31 /* win_cursor(id=ebx, shape=ecx) -> 0/-1 (enum wm_cursor)   */
 
 #define NET_HOST_MAX 128
 
@@ -73,8 +82,8 @@ static void join_cwd(const char *name, char *out, int outsz)
 
 /* Read a file by `name` (resolved against the cwd), falling back to /bin/<name>
  * when a relative name isn't found -- the same PATH-style lookup the shell does,
- * so a program can read or run another by bare name (fork+run "worker" ->
- * /bin/worker). */
+ * so a program can read or run another by bare name (fork+run "curl" ->
+ * /bin/curl). */
 static int read_with_path(const char *name, void *buf, uint32_t max)
 {
 	char abs[SYS_PATH_MAX];
@@ -92,6 +101,41 @@ static int read_with_path(const char *name, void *buf, uint32_t max)
 		n = fs_read(p, buf, max);
 	}
 	return n;
+}
+
+/* Resolve `name` (cwd-relative, then /bin) to an absolute owofs path that
+ * exists; fills `out`, returns 0 / -1. */
+static int resolve_path(const char *name, char *out, int outcap)
+{
+	uint32_t sz;
+	join_cwd(name, out, (uint32_t)outcap);
+	if (fs_stat(out, 0, &sz, 0) == 0)
+		return 0;
+	if (name[0] == '/')
+		return -1;
+	int j = 0;
+	const char *pfx = "/bin/";
+	for (int i = 0; pfx[i]; i++) out[j++] = pfx[i];
+	for (int i = 0; name[i] && j < outcap - 1; i++) out[j++] = name[i];
+	out[j] = '\0';
+	return fs_stat(out, 0, &sz, 0) == 0 ? 0 : -1;
+}
+
+/* pread: read up to `len` bytes at byte `off`. Clamps to the file size and
+ * returns a short count (0 = EOF), so a ring-3 program can stream a file far
+ * larger than its 1.5 MiB window — e.g. an image viewer decoding a big PNG. */
+static int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t len)
+{
+	char abs[SYS_PATH_MAX];
+	uint32_t size;
+	if (resolve_path(name, abs, sizeof abs) != 0)
+		return -1;
+	fs_stat(abs, 0, &size, 0);
+	if (off >= size)
+		return 0;                      /* EOF                                  */
+	if (len > size - off)
+		len = size - off;
+	return fs_read_at(abs, off, buf, len);
 }
 
 /* A user pointer must stay entirely within the ring-3 region, or we refuse
@@ -201,6 +245,25 @@ void syscall_dispatch(struct registers *r)
 			name[i] = uname[i];
 		name[i] = '\0';
 
+		/* Optional argv[1] (ecx): a single string argument, copied in before
+		 * we touch the new address space. NULL/0 means no argument. Bounds-check
+		 * the pointer per byte (like SYS_READFILE_AT) so a bogus ecx can't make
+		 * the kernel read outside the user window. */
+		char arg[128];
+		int have_arg = 0;
+		uint32_t uarg = r->ecx;
+		if (uarg) {
+			int j = 0;
+			while (j < (int)sizeof(arg) - 1 && user_range(uarg + (uint32_t)j, 1)) {
+				char ch = ((const char *)uarg)[j];
+				if (!ch)
+					break;
+				arg[j++] = ch;
+			}
+			arg[j] = '\0';
+			have_arg = 1;
+		}
+
 		void *buf = kmalloc(64 * 1024);
 		if (!buf) {
 			r->eax = (uint32_t)-1;
@@ -215,8 +278,8 @@ void syscall_dispatch(struct registers *r)
 			break;
 		}
 		kfree(buf);
-		char *argv[1] = { name };
-		uint32_t user_esp = setup_args(dir, 1, argv);
+		char *argv[2] = { name, arg };
+		uint32_t user_esp = setup_args(dir, have_arg ? 2 : 1, argv);
 		sched_replace(dir, entry, user_esp, r);   /* returns into the new image */
 		break;
 	}
@@ -251,6 +314,9 @@ void syscall_dispatch(struct registers *r)
 	}
 	case SYS_UPTIME:
 		r->eax = timer_seconds();
+		break;
+	case SYS_MSEC:
+		r->eax = timer_us() / 1000u;   /* ms since boot (wraps ~49.7 days) */
 		break;
 	case SYS_READFILE: {
 		const char *name = (const char *)r->ebx;
@@ -422,6 +488,82 @@ void syscall_dispatch(struct registers *r)
 	case SYS_WIN_RESIZABLE:
 		r->eax = (uint32_t)uwin_set_resizable((int)r->ebx, (int)r->ecx);
 		break;
+	case SYS_WIN_CURSOR:
+		r->eax = (uint32_t)uwin_set_cursor((int)r->ebx, (int)r->ecx);
+		break;
+	case SYS_READFILE_AT: {
+		/* ebx -> {name, offset, buf, len}. Copy the name in with a per-byte
+		 * bounds check, validate the destination buffer, then stream-read. */
+		if (!user_range(r->ebx, 16)) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		const uint32_t *a = (const uint32_t *)r->ebx;
+		uint32_t np = a[0], off = a[1], bp = a[2], len = a[3];
+		char name[SYS_PATH_MAX];
+		int k = 0;
+		while (k < SYS_PATH_MAX - 1 && user_range(np + (uint32_t)k, 1)) {
+			char ch = ((const char *)np)[k];
+			if (!ch)
+				break;
+			name[k++] = ch;
+		}
+		name[k] = '\0';
+		if (len && !user_range(bp, len)) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		r->eax = (uint32_t)read_at_with_path(name, off, (void *)bp, len);
+		break;
+	}
+	/* Report mounted removable volumes, so the file explorer can list them as
+	 * devices. Today there is at most one: the removable volume at /media. */
+	case SYS_VOLUMES: {
+		struct vinfo { char label[24]; char path[24]; char kind[8]; int removable; } *o;
+		if (!user_range(r->ecx, sizeof *o)) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		o = (struct vinfo *)r->ecx;
+		int got = 0;
+		if ((int)r->ebx == 0 && (fat_mounted() || hfs_mounted() || ext_mounted())) {
+			const char *lbl = ext_mounted() ? ext_label() :
+			                  hfs_mounted() ? hfs_label() : fat_label();
+			if (!lbl[0])
+				lbl = "Removable";
+			int i = 0;
+			for (; i < 23 && lbl[i]; i++) o->label[i] = lbl[i];
+			o->label[i] = '\0';
+			const char *p = "/media";
+			for (i = 0; i < 23 && p[i]; i++) o->path[i] = p[i];
+			o->path[i] = '\0';
+			const char *k = blk_fat_source();
+			for (i = 0; i < 7 && k[i]; i++) o->kind[i] = k[i];
+			o->kind[i] = '\0';
+			o->removable = 1;
+			got = 1;
+		}
+		r->eax = (uint32_t)got;
+		break;
+	}
+
+	/* Eject (unmount) the removable volume at /media. Writes are write-through, so this
+	 * just drops the mount; the medium is then safe to remove. */
+	case SYS_EJECT:
+		if (ext_mounted()) {
+			ext_unmount();
+			r->eax = 0;
+		} else if (hfs_mounted()) {
+			hfs_unmount();
+			r->eax = 0;
+		} else if (fat_mounted()) {
+			fat_unmount();
+			r->eax = 0;
+		} else {
+			r->eax = (uint32_t)-1;
+		}
+		break;
+
 	default:
 		r->eax = (uint32_t)-1;
 		break;
