@@ -25,7 +25,7 @@
 #include "net.h"
 #include "pci.h"
 #include "io.h"
-#include "vga.h"
+#include "console.h"
 #include "paging.h"
 #include "heap.h"
 #include "kstring.h"
@@ -217,7 +217,7 @@ static void put_hex(uint32_t value, int digits)
 {
 	static const char h[] = "0123456789abcdef";
 	for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-		vga_putc(h[(value >> shift) & 0xF]);
+		con_putc(h[(value >> shift) & 0xF]);
 }
 
 /* Initialize a producer ring in a fresh page, with a Link TRB in the last slot
@@ -355,8 +355,8 @@ static volatile uint8_t *find_and_map(void)
 				if (paging_identity_map(phys, size) != 0)
 					return NULL;
 				paging_mark_uc(phys, size);
-				vga_write("xhci: controller at "); put_hex(phys, 8);
-				vga_write(" size "); put_hex(size, 8); vga_putc('\n');
+				con_write("xhci: controller at "); put_hex(phys, 8);
+				con_write(" size "); put_hex(size, 8); con_putc('\n');
 				return (volatile uint8_t *)phys;
 			}
 		}
@@ -388,7 +388,7 @@ static void xhci_takeover(void)
 			}
 			/* USBLEGCTLSTS (next dword): clear all SMI enables + ack changes. */
 			*(volatile uint32_t *)(p + 4) = (1u<<29)|(1u<<30)|(1u<<31);
-			vga_write("xhci: took ownership from BIOS\n");
+			con_write("xhci: took ownership from BIOS\n");
 			return;
 		}
 		if (!next)
@@ -493,8 +493,8 @@ static int address_device(int slot_id, int port, int speed)
 	          TRB_TYPE(TRB_ADDRESS_DEVICE) | ((uint32_t)slot_id << 24));
 	int cc = cmd_submit();
 	if (cc != CC_SUCCESS) {
-		vga_write("xhci: address-device failed cc="); vga_write_dec(cc);
-		vga_putc('\n');
+		con_write("xhci: address-device failed cc="); con_write_dec(cc);
+		con_putc('\n');
 		return -1;
 	}
 	return 0;
@@ -870,20 +870,20 @@ static void post_bulk_out(const uint8_t *frame, int len)
 static int bring_up_net(struct usbdev *d, int port)
 {
 	if (rndis_set_filter(d) != 0) {
-		vga_write("rndis: set-filter failed\n");
+		con_write("rndis: set-filter failed\n");
 		return -1;
 	}
 	if (configure_bulk(d, port) != 0) {
-		vga_write("rndis: configure-endpoint failed\n");
+		con_write("rndis: configure-endpoint failed\n");
 		return -1;
 	}
-	vga_write("rndis: data path up (in ep=");
-	put_hex(d->bulk_in, 2);  vga_write(" dci="); vga_write_dec(net_in_dci);
-	vga_write(" mps="); vga_write_dec(d->bulk_in_mps);
-	vga_write(", out ep="); put_hex(d->bulk_out, 2);
-	vga_write(" dci="); vga_write_dec(net_out_dci);
-	vga_write(" mps="); vga_write_dec(d->bulk_out_mps);
-	vga_write(")\n");
+	con_write("rndis: data path up (in ep=");
+	put_hex(d->bulk_in, 2);  con_write(" dci="); con_write_dec(net_in_dci);
+	con_write(" mps="); con_write_dec(d->bulk_in_mps);
+	con_write(", out ep="); put_hex(d->bulk_out, 2);
+	con_write(" dci="); con_write_dec(net_out_dci);
+	con_write(" mps="); con_write_dec(d->bulk_out_mps);
+	con_write(")\n");
 
 	net_rx_buf = palloc();
 	net_tx_buf = palloc();
@@ -919,7 +919,7 @@ static void recover_in_stall(void)
 	if (net_stall_retries++ > 16)
 		return;                                  /* give up; DHCP will time out  */
 	if (net_stall_retries <= 2)
-		vga_write("usbnet: recovering bulk-in\n");
+		con_write("usbnet: recovering bulk-in\n");
 
 	ring_push(&cmd_ring, 0, 0, 0, TRB_TYPE(TRB_RESET_EP) |
 	          ((uint32_t)net_in_dci << 16) | ((uint32_t)net_slot << 24));
@@ -969,10 +969,10 @@ static void data_loop(void)
 				 * RNDIS message type) so a stuck phone path is debuggable. */
 				if (dbg_rx < 4) {
 					dbg_rx++;
-					vga_write("usbnet: rx cc="); vga_write_dec(cc);
-					vga_write(" len="); vga_write_dec(got);
-					vga_write(" type="); put_hex(le32(net_rx_buf), 8);
-					vga_putc('\n');
+					con_write("usbnet: rx cc="); con_write_dec(cc);
+					con_write(" len="); con_write_dec(got);
+					con_write(" type="); put_hex(le32(net_rx_buf), 8);
+					con_putc('\n');
 				}
 				if (cc == CC_STALL || cc == CC_BABBLE || cc == CC_USB_TXN_ERR) {
 					/* These halt the endpoint — reset it and retry rather than
@@ -994,15 +994,15 @@ static void data_loop(void)
 			} else if (epid == net_out_dci) {
 				if (dbg_tx < 2) {
 					dbg_tx++;
-					vga_write("usbnet: tx cc="); vga_write_dec(cc); vga_putc('\n');
+					con_write("usbnet: tx cc="); con_write_dec(cc); con_putc('\n');
 				}
 				net_out_pending = 0;
 			} else if (epid == net_intr_dci) {
 				if (dbg_intr < 4) {
 					dbg_intr++;
-					vga_write("usbnet: intr cc="); vga_write_dec(cc);
-					vga_write(" note="); put_hex(le32(net_intr_buf), 8);
-					vga_putc('\n');
+					con_write("usbnet: intr cc="); con_write_dec(cc);
+					con_write(" note="); put_hex(le32(net_intr_buf), 8);
+					con_putc('\n');
 				}
 				net_intr_pending = 0;
 				if (cc == CC_SUCCESS || cc == CC_SHORT_PKT)
@@ -1273,7 +1273,7 @@ static int bring_up_msc(struct usbdev *d, int port)
 {
 	(void)port;
 	if (configure_bulk_msc(d) != 0) {
-		vga_write("usbmsc: configure-endpoint failed\n");
+		con_write("usbmsc: configure-endpoint failed\n");
 		return -1;
 	}
 	if (!msc_cbw)  msc_cbw  = palloc();
@@ -1308,18 +1308,18 @@ static int bring_up_msc(struct usbdev *d, int port)
 
 	uint32_t last, blk;
 	if (scsi_read_capacity(&last, &blk) != 0) {
-		vga_write("usbmsc: READ CAPACITY failed\n");
+		con_write("usbmsc: READ CAPACITY failed\n");
 		return -1;
 	}
 	if (blk != 512) {
-		vga_write("usbmsc: unsupported block size "); vga_write_dec(blk); vga_putc('\n');
+		con_write("usbmsc: unsupported block size "); con_write_dec(blk); con_putc('\n');
 		return -1;
 	}
 	msc_capacity = last + 1;
 	msc_ready = 1;
-	vga_write("usbmsc: ");
-	vga_write(msc_model[0] ? msc_model : "USB disk");
-	vga_write(" "); vga_write_dec(msc_capacity / 2048); vga_write(" MiB ready\n");
+	con_write("usbmsc: ");
+	con_write(msc_model[0] ? msc_model : "USB disk");
+	con_write(" "); con_write_dec(msc_capacity / 2048); con_write(" MiB ready\n");
 	return 0;
 }
 
@@ -1427,19 +1427,19 @@ static void print_config(const uint8_t *cfg, int total)
 			break;
 		uint8_t btype = cfg[i + 1];
 		if (btype == 0x04 && i + 9 <= total) {            /* interface         */
-			vga_write("         if "); vga_write_dec(cfg[i + 2]);
-			vga_write(" class "); put_hex(cfg[i + 5], 2);
-			vga_putc('/'); put_hex(cfg[i + 6], 2);
-			vga_putc('/'); put_hex(cfg[i + 7], 2);
-			vga_putc('\n');
+			con_write("         if "); con_write_dec(cfg[i + 2]);
+			con_write(" class "); put_hex(cfg[i + 5], 2);
+			con_putc('/'); put_hex(cfg[i + 6], 2);
+			con_putc('/'); put_hex(cfg[i + 7], 2);
+			con_putc('\n');
 		} else if (btype == 0x05 && i + 7 <= total) {     /* endpoint          */
 			uint8_t addr = cfg[i + 2];
 			uint8_t attr = cfg[i + 3] & 0x3;
 			const char *t = attr == 2 ? "bulk" : attr == 3 ? "intr"
 			              : attr == 1 ? "isoc" : "ctrl";
-			vga_write("           ep "); put_hex(addr, 2);
-			vga_write((addr & 0x80) ? " IN  " : " OUT ");
-			vga_write(t); vga_putc('\n');
+			con_write("           ep "); put_hex(addr, 2);
+			con_write((addr & 0x80) ? " IN  " : " OUT ");
+			con_write(t); con_putc('\n');
 		}
 		i += blen;
 	}
@@ -1533,30 +1533,30 @@ static void print_devs(int detail_port)
 		if (!d->active)
 			continue;
 		any = 1;
-		vga_write("xhci: port "); vga_write_dec(p); vga_write(": ");
-		put_hex(d->vid, 4); vga_putc(':'); put_hex(d->pid, 4);
-		vga_write(" class "); put_hex(d->cls, 2);
-		vga_write(" speed "); vga_write_dec(d->speed);
+		con_write("xhci: port "); con_write_dec(p); con_write(": ");
+		put_hex(d->vid, 4); con_putc(':'); put_hex(d->pid, 4);
+		con_write(" class "); put_hex(d->cls, 2);
+		con_write(" speed "); con_write_dec(d->speed);
 		if (d->mac_ok)                 /* only devices RNDIS actually answered  */
-			vga_write(" [net]");
-		vga_putc('\n');
+			con_write(" [net]");
+		con_putc('\n');
 		if (detail_port == (int)p) {
 			if (d->cfg_len)
 				print_config(d->cfg, d->cfg_len);
 			if (d->is_net && d->mac_ok) {
-				vga_write("         rndis mac ");
+				con_write("         rndis mac ");
 				for (int i = 0; i < 6; i++) {
 					put_hex(d->mac[i], 2);
-					if (i < 5) vga_putc(':');
+					if (i < 5) con_putc(':');
 				}
-				vga_putc('\n');
+				con_putc('\n');
 			} else if (d->is_net) {
-				vga_write("         rndis: init failed\n");
+				con_write("         rndis: init failed\n");
 			}
 		}
 	}
 	if (!any)
-		vga_write("xhci: no usable device on any port\n");
+		con_write("xhci: no usable device on any port\n");
 }
 
 /* Bring the controller out of reset and stand up its rings — ONCE. Kept separate
@@ -1588,7 +1588,7 @@ static int setup_controller(void)
 	xhci_takeover();
 
 	if (controller_reset() != 0) {
-		vga_write("xhci: controller reset timed out\n");
+		con_write("xhci: controller reset timed out\n");
 		return -1;
 	}
 

@@ -200,25 +200,25 @@ static void render(void)
 	/* Sidebar. */
 	gfx_fill_rect(0, 0, sbw, H, 0x0e1218);
 	gfx_fill_rect(0, MENU_H, sbw, HEADER_H, 0x161d28);
-	gfx_text(6, MENU_H + 1, "Places", 0x8aa0b8, 0x161d28);
+	gfx_ui_text(6, MENU_H + 1, "Places", 0x8aa0b8);
 	for (int i = 0; i < NPLACES; i++) {
 		int ry = LIST_TOP + i * ROW_H;
 		int here = feq(path, places[i].path);
 		unsigned rbg = here ? 0x24405c : 0x0e1218;
 		if (here) gfx_fill_rect(0, ry, sbw, ROW_H, rbg);
-		gfx_text(6, ry, places[i].label, here ? 0xffffff : 0xc8d0dc, rbg);
+		gfx_ui_text(6, ry, places[i].label, here ? 0xffffff : 0xc8d0dc);
 	}
 
 	/* Devices: mounted removable volumes, each with an eject button. */
 	scan_vols();
 	if (nvols > 0) {
-		gfx_text(6, dev_header_y(), "Devices", 0x8aa0b8, 0x0e1218);
+		gfx_ui_text(6, dev_header_y(), "Devices", 0x8aa0b8);
 		for (int i = 0; i < nvols; i++) {
 			int ry = dev_row_y(i);
 			int here = under_path(path, vols[i].path);
 			unsigned rbg = here ? 0x24405c : 0x0e1218;
 			if (here) gfx_fill_rect(0, ry, sbw, ROW_H, rbg);
-			gfx_text(6, ry, vols[i].label, here ? 0xffffff : 0xc8d0dc, rbg);
+			gfx_ui_text(6, ry, vols[i].label, here ? 0xffffff : 0xc8d0dc);
 			draw_eject(sbw - EJECT_W + 2, ry + 3, 0x8aa0b8);
 		}
 	}
@@ -240,7 +240,7 @@ static void render(void)
 	int pl = flen(path);
 	if (pl <= avail) fcpy(pbuf, path);
 	else { pbuf[0] = pbuf[1] = pbuf[2] = '.'; fcpy(pbuf + 3, path + (pl - (avail - 3))); }
-	gfx_text(lx + 4, MENU_H + 1, pbuf, 0x9ad0ff, 0x1d2430);
+	gfx_ui_text(lx + 4, MENU_H + 1, pbuf, 0x9ad0ff);
 	gfx_glyph(lx + lw - 32, MENU_H + 1, 0x1E, 0xffffff, 0x1d2430);
 	gfx_glyph(lx + lw - 16, MENU_H + 1, 0x1F, 0xffffff, 0x1d2430);
 
@@ -252,13 +252,13 @@ static void render(void)
 		unsigned rbg = (e == sel) ? 0x2f6fb0 : 0x12161e;
 		if (e == sel) gfx_fill_rect(lx, ry, lw, ROW_H, rbg);
 		unsigned col = fe->is_dir ? 0xffd479 : 0xc8d0dc;
-		gfx_text(lx + 4, ry, fe->name, col, rbg);
+		gfx_ui_text(lx + 4, ry, fe->name, col);
 		if (fe->is_dir && !feq(fe->name, ".."))
-			gfx_text(lx + 4 + flen(fe->name) * 8, ry, "/", col, rbg);
+			gfx_ui_text(lx + 4 + gfx_ui_width(fe->name), ry, "/", col);
 		if (!fe->is_dir) {
 			char sb[16];
 			size_str(fe->size, sb);
-			gfx_text(lx + lw - 4 - flen(sb) * 8, ry, sb, 0x8aa0b8, rbg);
+			gfx_ui_text(lx + lw - 4 - gfx_ui_width(sb), ry, sb, 0x8aa0b8);
 		}
 	}
 
@@ -407,8 +407,7 @@ static void ctx_draw(void)
 	gfx_fill_rect(ctx.x, ctx.y, CTX_W, h, 0x232a36);
 	gfx_rect(ctx.x, ctx.y, CTX_W, h, 0x05070a);
 	for (int i = 0; i < n; i++)
-		gfx_text(ctx.x + 6, ctx.y + 1 + i * CTX_ROW, it[i].label,
-		         0xc8d0dc, 0x232a36);
+		gfx_ui_text(ctx.x + 6, ctx.y + 1 + i * CTX_ROW, it[i].label, 0xc8d0dc);
 }
 
 /* Run the chosen context-menu action against the captured target. */

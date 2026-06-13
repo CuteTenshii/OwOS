@@ -3,7 +3,7 @@
 #include "sched.h"
 #include "heap.h"
 #include "timer.h"
-#include "vga.h"
+#include "console.h"
 #include "gdt.h"
 #include "paging.h"
 #include "loader.h"
@@ -14,8 +14,15 @@
 #include <stdint.h>
 
 #define MAX_TASKS   16
-#define KSTACK_SIZE 16384
-#define UKSTACK_SIZE 8192   /* user task kernel stack (room for trap frames)   */
+/* Every timer tick, timer_handler() runs nic_poll() -> the full IP/TCP/UDP RX
+ * path BEFORE schedule(), nested in the IRQ on whatever thread it interrupted
+ * (real hosts/VMware poll the NIC off the tick because its INTx never reaches
+ * our PIC). So a thread's worst-case stack is its own depth PLUS a nested
+ * receive stack. The wm compositor mid-compose() + a nested RX overran 16 KiB
+ * on real hardware, silently smashing the adjacent thread's stack (a GP fault
+ * resuming an unrelated thread into EIP 0x0000000D). Size for both. */
+#define KSTACK_SIZE 32768
+#define UKSTACK_SIZE 16384  /* user task kernel stack (trap frames + nested RX) */
 #define TASK_CWD_MAX 128    /* must match the shell's PATH_MAX                  */
 
 enum { TASK_FREE = 0, TASK_RUNNABLE, TASK_WAITING, TASK_ZOMBIE };
@@ -484,15 +491,15 @@ int sched_count(void)
 
 void sched_dump(void)
 {
-	vga_write("id  name        runs\n");
+	con_write("id  name        runs\n");
 	task_t *t = &tasks[0];
 	do {
-		vga_write_dec(t->id);
-		vga_write("   ");
-		vga_write(t->name);
-		vga_write("\t");
-		vga_write_dec(t->runs);
-		vga_putc('\n');
+		con_write_dec(t->id);
+		con_write("   ");
+		con_write(t->name);
+		con_write("\t");
+		con_write_dec(t->runs);
+		con_putc('\n');
 		t = t->next;
 	} while (t != &tasks[0]);
 }

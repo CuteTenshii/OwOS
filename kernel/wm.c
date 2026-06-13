@@ -21,7 +21,7 @@
 #include "wm.h"
 #include "apps.h"
 #include "fb.h"
-#include "vga.h"
+#include "console.h"
 #include "mouse.h"
 #include "keyboard.h"
 #include "timer.h"
@@ -29,6 +29,7 @@
 #include "sched.h"
 #include "edid.h"
 #include "crash.h"
+#include "battery.h"
 
 #define MAXWIN 40    /* compositor window slots: app windows + terminal + chrome */
 static struct window wins[MAXWIN];
@@ -199,7 +200,7 @@ static void draw_window(struct window *w, int focused)
 	/* Outer frame and title bar. */
 	fb_fill_rect(w->x, w->y, w->w, w->h, frame);
 	fb_fill_rect(w->x, w->y, w->w, WM_TITLE_H, title_bg);
-	fb_text(w->x + 8, w->y + 3, w->title, 0xffffff, title_bg);
+	fb_ui_text(w->x + 8, w->y + (WM_TITLE_H - UIFONT_H) / 2, w->title, 0xffffff);
 
 	if (w->closable) {
 		int bx = w->x + w->w - 18, by = w->y + 4;
@@ -311,14 +312,70 @@ static void draw_cursor(int kind, int mx, int my)
 	}
 }
 
+/* Battery indicator, drawn just left of the clock. `clock_x` is the clock
+ * text's left edge; we lay the icon + "NN%" out ending a little before it.
+ * The reading is cached and only refreshed every ~30 s, since evaluating the
+ * ACPI _BST AML on every taskbar repaint (once a second) is wasteful. We only
+ * draw when a real percentage (0..100) comes back: some hypervisors (VMware)
+ * advertise a phantom battery whose _BST can't be evaluated, and that simply
+ * fails the read here and shows nothing rather than a bogus gauge. */
+static void draw_battery(int clock_x, int y)
+{
+	static int last_poll = -1000;
+	static int cached_pct = -1;
+	static int cached_charging;
+
+	int now = (int)timer_seconds();
+	if (now - last_poll >= 30 || last_poll == -1000) {
+		last_poll = now;
+		if (battery_present())
+			cached_pct = battery_percent(&cached_charging, 0);
+		else
+			cached_pct = -1;
+	}
+	if (cached_pct < 0 || cached_pct > 100)
+		return;   /* no real battery, or the reading couldn't be taken */
+
+	char s[5];   /* "100%" + NUL */
+	int n = 0;
+	if (cached_pct >= 100) { s[n++] = '1'; s[n++] = '0'; s[n++] = '0'; }
+	else if (cached_pct >= 10) { s[n++] = '0' + cached_pct / 10; s[n++] = '0' + cached_pct % 10; }
+	else s[n++] = '0' + cached_pct;
+	s[n++] = '%';
+	s[n] = 0;
+
+	const uint32_t bg = 0x0c0e14;
+	int icon_w = 22, icon_h = 11, nub_w = 2;
+	int txt_w = fb_ui_width(s);
+	int total = icon_w + nub_w + 6 + txt_w;
+	int x = clock_x - 12 - total;
+	int iy = y + (WM_BAR_H - icon_h) / 2;
+
+	/* fill colour: red when low, amber while charging, green otherwise */
+	uint32_t fill = cached_pct <= 15 ? 0xd05040
+	              : cached_charging ? 0xe0b040 : 0x60c060;
+
+	fb_rect(x, iy, icon_w, icon_h, 0xc8d0dc);                 /* outline   */
+	fb_fill_rect(x + icon_w, iy + 3, nub_w, icon_h - 6, 0xc8d0dc); /* nub  */
+	int inner_w = icon_w - 4;
+	int lvl = inner_w * cached_pct / 100;
+	if (lvl < 1 && cached_pct > 0) lvl = 1;
+	fb_fill_rect(x + 2, iy + 2, inner_w, icon_h - 4, bg);     /* clear gauge */
+	if (lvl > 0)
+		fb_fill_rect(x + 2, iy + 2, lvl, icon_h - 4, fill);
+
+	fb_ui_text(x + icon_w + nub_w + 6, y + (WM_BAR_H - UIFONT_H) / 2, s, 0xc8d0dc);
+}
+
 static void draw_taskbar(void)
 {
 	int y = screen_h - WM_BAR_H;
 	fb_fill_rect(0, y, screen_w, WM_BAR_H, 0x0c0e14);
 	fb_fill_rect(0, y, screen_w, 1, 0x2a3550);
 	uint32_t btn = start_open ? 0x2f6fb0 : 0x0c0e14;   /* Start button */
+	int uy = y + (WM_BAR_H - UIFONT_H) / 2;             /* UI text baseline row */
 	fb_fill_rect(0, y + 1, START_W, WM_BAR_H - 1, btn);
-	fb_text(10, y + 6, "OwOS", 0x9ad0ff, btn);
+	fb_ui_text(10, uy, "OwOS", 0x9ad0ff);
 
 	struct rtc_time t;
 	rtc_now(&t);
@@ -326,7 +383,10 @@ static void draw_taskbar(void)
 	put2(s + 0, t.hour);
 	put2(s + 3, t.min);
 	put2(s + 6, t.sec);
-	fb_text(screen_w - 8 * 8 - 12, y + 6, s, 0xc8d0dc, 0x0c0e14);
+	int clock_x = screen_w - fb_ui_width(s) - 12;
+	fb_ui_text(clock_x, uy, s, 0xc8d0dc);
+
+	draw_battery(clock_x, y);
 }
 
 /* The Start menu popup, listing the launchable apps above the taskbar. */
@@ -337,7 +397,7 @@ static void draw_start_menu(void)
 	fb_fill_rect(0, top, SM_W, sm_h(), 0x141a24);
 	for (int i = 0; i < n; i++) {
 		int iy = top + i * SM_ITEM_H;
-		fb_text(10, iy + 3, apps_menu_name(i), 0xc8d0dc, 0x141a24);
+		fb_ui_text(10, iy + (SM_ITEM_H - UIFONT_H) / 2, apps_menu_name(i), 0xc8d0dc);
 	}
 	fb_rect(0, top, SM_W, sm_h(), 0x05070a);
 }
@@ -650,8 +710,12 @@ static void damage_add(int x, int y, int w, int h)
 	}
 }
 
+extern const char *g_boot_stage;   /* breadcrumb shown on the panic screen     */
+
 static void wm_thread(void)
 {
+	g_boot_stage = "wm_thread:enter";
+	con_write("BOOTMARK: wm_thread enter\n");
 	/* Previous-frame snapshots, to diff against and damage what moved. */
 	int prev_x[MAXWIN], prev_y[MAXWIN], prev_vis[MAXWIN], prev_z[MAXWIN];
 	int prev_w[MAXWIN], prev_h[MAXWIN];
@@ -661,13 +725,18 @@ static void wm_thread(void)
 	int      prev_wheel = mouse_wheel();
 	int      prev_start = 0;
 	int      last_sec = -1;
+	int      prev_focus = -1;     /* topmost-visible window shown last frame     */
 	int      inited = 0;
 
 	/* Pace the compositor to the panel's native refresh. edid_refresh_hz()
 	 * reads it over GMBUS on real Intel hardware and returns 0 under QEMU /
 	 * non-Intel / eDP, where we fall back to 60. Clamp to one tick so a high
 	 * refresh can't spin the loop faster than the timer can wake it. */
+	g_boot_stage = "wm_thread:edid";
+	con_write("BOOTMARK: wm_thread edid\n");
 	int      hz = edid_refresh_hz();
+	g_boot_stage = "wm_thread:edid-done";
+	con_write("BOOTMARK: wm_thread edid done\n");
 	int      frame_ms = 1000 / (hz ? hz : 60);
 	if (frame_ms < 1000 / TIMER_HZ)
 		frame_ms = 1000 / TIMER_HZ;
@@ -675,6 +744,7 @@ static void wm_thread(void)
 	for (int i = 0; i < MAXWIN; i++)
 		prev_dirty[i] = 0xFFFFFFFF;
 
+	g_boot_stage = "wm_thread:loop";
 	for (;;) {
 		/* Reap any GUI apps we launched from the Start menu that have exited. */
 		int rst;
@@ -707,18 +777,27 @@ static void wm_thread(void)
 			cur_dirty[i] = wins[i].dirty ? wins[i].dirty(&wins[i]) : 0;
 
 		if (!full) {
-			/* A z-order/focus/visibility change only ever affects pixels inside
-			 * window rectangles (never the bare desktop between them), so damage
-			 * every window's old and new rect rather than the whole screen. */
-			int zvis = 0;
+			/* A z-order / visibility / focus change is recomposed in full. Two
+			 * windows can't be damaged-and-repainted reliably here: it would need
+			 * every window's old AND new rect (2 each), which overruns MAXDMG once
+			 * a few windows are open (damage_add silently drops the overflow). And
+			 * a focus change flips a title-bar highlight without moving the window
+			 * at all, so there's no per-window rect to key off. The classic symptom
+			 * is two windows both showing the focused (blue) title bar: the one that
+			 * lost focus never got repainted. A focus change is detected directly
+			 * off topmost_visible() rather than inferred from the zlist diff, which
+			 * is unreliable when nwin grows (a freshly created window's prev_z slot
+			 * holds stale data that can coincidentally match). These changes are
+			 * rare and user-driven and the damage spans most of the screen anyway,
+			 * so the full repaint costs little and never drops a window. */
+			int focus = topmost_visible();
+			int zvis = (focus != prev_focus);
 			for (int i = 0; i < nwin; i++)
 				if (zlist[i] != prev_z[i] || wins[i].visible != prev_vis[i])
 					zvis = 1;
 			if (zvis)
-				for (int i = 0; i < nwin; i++) {
-					damage_add(prev_x[i], prev_y[i], prev_w[i], prev_h[i]);
-					damage_add(wins[i].x, wins[i].y, wins[i].w, wins[i].h);
-				}
+				full = 1;
+			prev_focus = focus;
 
 			/* Windows that moved or resized: damage old and new rectangles. */
 			for (int i = 0; i < nwin; i++)
@@ -806,6 +885,6 @@ void wm_init(void)
 	apps_start();
 
 	/* Route the console into the terminal window, then start compositing. */
-	vga_use_framebuffer(1);
+	con_use_framebuffer(1);
 	sched_create_thread("wm", wm_thread);
 }

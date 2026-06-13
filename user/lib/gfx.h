@@ -18,6 +18,16 @@ void gfx_rect(int x, int y, int w, int h, unsigned color);   /* 1px outline */
 void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg);
 void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg);
 
+/* Proportional sans-serif UI font for chrome (menus, titles, tabs, status).
+ * Variable per-glyph advance; cell is UIFONT_W x UIFONT_H. gfx_ui_text blends
+ * fg over the existing pixels (fill the background first), so it has no bg
+ * argument. gfx_ui_width gives a string's pixel width for layout/centring. */
+#define UIFONT_W 16
+#define UIFONT_H 18
+void gfx_ui_text(int x, int y, const char *s, unsigned fg);
+int  gfx_ui_width(const char *s);
+int  gfx_ui_cw(unsigned char c);   /* one glyph's pen advance (for fitting text) */
+
 /* --------------------------------------------------------------- GUI widgets */
 /*
  * Reusable pieces every windowed app tends to want, so they aren't reinvented

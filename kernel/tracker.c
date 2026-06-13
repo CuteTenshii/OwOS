@@ -4,7 +4,7 @@
 #include "bencode.h"
 #include "net.h"
 #include "heap.h"
-#include "vga.h"
+#include "console.h"
 
 /* Our peer id: 20 bytes, Azureus-style client prefix + filler. Trackers treat
  * it as opaque; we never accept incoming connections, so it need not be
@@ -150,27 +150,27 @@ int tracker_announce(const char *announce, const uint8_t infohash[20],
                      int *interval_out)
 {
 	if (!announce || announce[0] == '\0') {
-		vga_write("tracker: torrent has no announce URL\n");
+		con_write("tracker: torrent has no announce URL\n");
 		return -1;
 	}
 
 	char url[640];
 	if (build_announce_url(url, (int)sizeof(url), announce, infohash, left) < 0) {
-		vga_write("tracker: announce URL too long\n");
+		con_write("tracker: announce URL too long\n");
 		return -1;
 	}
 
 	uint8_t *rx = kmalloc(TRACKER_RXMAX);
 	struct ben_node *pool = kmalloc(512 * sizeof *pool);
 	if (!rx || !pool) {
-		vga_write("tracker: out of memory\n");
+		con_write("tracker: out of memory\n");
 		kfree(rx); kfree(pool);
 		return -1;
 	}
 
 	int n = net_http_get(url, rx, TRACKER_RXMAX);
 	if (n < 0) {
-		vga_write("tracker: announce request failed\n");
+		con_write("tracker: announce request failed\n");
 		kfree(rx); kfree(pool);
 		return -1;
 	}
@@ -179,16 +179,16 @@ int tracker_announce(const char *announce, const uint8_t infohash[20],
 	int rc = -1;
 	if (ben_parse(&b, rx, (uint32_t)n, pool, 512) != 0 ||
 	    b.nodes[b.root].type != BEN_DICT) {
-		vga_write("tracker: malformed reply\n");
+		con_write("tracker: malformed reply\n");
 		goto out;
 	}
 
 	int fail = ben_dict_get(&b, b.root, "failure reason");
 	if (fail >= 0 && b.nodes[fail].type == BEN_STR) {
-		vga_write("tracker error: ");
+		con_write("tracker error: ");
 		for (uint32_t i = 0; i < b.nodes[fail].slen; i++)
-			vga_putc((char)b.nodes[fail].str[i]);
-		vga_putc('\n');
+			con_putc((char)b.nodes[fail].str[i]);
+		con_putc('\n');
 		goto out;
 	}
 
@@ -199,7 +199,7 @@ int tracker_announce(const char *announce, const uint8_t infohash[20],
 
 	int pp = ben_dict_get(&b, b.root, "peers");
 	if (pp < 0) {
-		vga_write("tracker: reply has no peers\n");
+		con_write("tracker: reply has no peers\n");
 		goto out;
 	}
 	rc = parse_peers(&b, pp, peers, max);
@@ -211,36 +211,36 @@ out:
 
 void tracker_print(const struct tracker_peer *peers, int count, int interval)
 {
-	vga_write("tracker: ");
+	con_write("tracker: ");
 	/* small decimal print via uappend into a scratch line */
 	char line[32];
 	int ln = uappend(line, 0, (int)sizeof(line), (uint64_t)count);
 	line[ln] = '\0';
-	vga_write(line);
-	vga_write(count == 1 ? " peer" : " peers");
+	con_write(line);
+	con_write(count == 1 ? " peer" : " peers");
 	if (interval > 0) {
-		vga_write(", re-announce in ");
+		con_write(", re-announce in ");
 		ln = uappend(line, 0, (int)sizeof(line), (uint64_t)interval);
 		line[ln] = '\0';
-		vga_write(line);
-		vga_write("s");
+		con_write(line);
+		con_write("s");
 	}
-	vga_putc('\n');
+	con_putc('\n');
 
 	for (int i = 0; i < count; i++) {
-		vga_write("  ");
+		con_write("  ");
 		for (int o = 0; o < 4; o++) {
 			char num[4];
 			int nn = uappend(num, 0, (int)sizeof(num), peers[i].ip[o]);
 			num[nn] = '\0';
-			vga_write(num);
-			vga_putc(o < 3 ? '.' : ':');
+			con_write(num);
+			con_putc(o < 3 ? '.' : ':');
 		}
 		char num[8];
 		int nn = uappend(num, 0, (int)sizeof(num), peers[i].port);
 		num[nn] = '\0';
-		vga_write(num);
-		vga_putc('\n');
+		con_write(num);
+		con_putc('\n');
 	}
 }
 
@@ -269,7 +269,7 @@ int tracker_selftest(void)
 	int pct_ok = (el == 8);
 	for (int i = 0; want[i] && pct_ok; i++)
 		if (enc[i] != want[i]) pct_ok = 0;
-	vga_write("  pct-encode "); vga_write(pct_ok ? "PASS\n" : "FAIL\n");
+	con_write("  pct-encode "); con_write(pct_ok ? "PASS\n" : "FAIL\n");
 
 	/* peer extraction from the canned reply */
 	struct ben_node pool[64];
@@ -285,9 +285,9 @@ int tracker_selftest(void)
 	peers_ok = (cnt == 2 && iv == 1800 &&
 	            peers[0].ip[0] == 1 && peers[0].ip[3] == 4 && peers[0].port == 6881 &&
 	            peers[1].ip[0] == 5 && peers[1].ip[3] == 8 && peers[1].port == 51413);
-	vga_write("  peers      "); vga_write(peers_ok ? "PASS\n" : "FAIL\n");
+	con_write("  peers      "); con_write(peers_ok ? "PASS\n" : "FAIL\n");
 
 	ok = pct_ok && peers_ok;
-	vga_write(ok ? "tracker selftest: PASS\n" : "tracker selftest: FAIL\n");
+	con_write(ok ? "tracker selftest: PASS\n" : "tracker selftest: FAIL\n");
 	return ok ? 0 : -1;
 }

@@ -7,7 +7,7 @@
 #include "syscall.h"
 #include "idt.h"
 #include "gdt.h"
-#include "vga.h"
+#include "console.h"
 #include "keyboard.h"
 #include "timer.h"
 #include "fs.h"
@@ -23,6 +23,7 @@
 #include "net.h"
 #include "uwin.h"
 #include "rtc.h"
+#include "shell.h"
 
 #define SYS_WRITE    1   /* write(fd=ebx, buf=ecx, len=edx) -> bytes          */
 #define SYS_EXIT     2   /* exit(code=ebx) -- terminates the process          */
@@ -58,6 +59,13 @@
 #define SYS_STREAM_BEGIN 32 /* stream_begin(name=ebx) -> 0/-1 (open a streaming write) */
 #define SYS_STREAM_WRITE 33 /* stream_write(buf=ebx, len=ecx) -> 0/-1 (append a chunk) */
 #define SYS_STREAM_END   34 /* stream_end() -> bytes committed / -1 (commit + close)   */
+#define SYS_MKDIR      35 /* mkdir(path=ebx) -> 0/-1                                    */
+#define SYS_RMDIR      36 /* rmdir(path=ebx) -> 0/-1                                    */
+#define SYS_DELETE     37 /* delete(path=ebx) -> 0/-1 (rm a file)                       */
+#define SYS_RENAME     38 /* rename(old=ebx, new=ecx) -> 0/-1                           */
+#define SYS_STAT       39 /* stat(path=ebx, out=ecx -> {int is_dir; u32 size}) -> 0/-1  */
+#define SYS_SPAWN      40 /* spawn(path=ebx, arg=ecx|0) -> pid/-1 (detached, like the WM) */
+#define SYS_SHELL      41 /* shell(cmd=ebx, out=ecx, max=edx) -> bytes/-1 (run a kernel builtin) */
 
 #define NET_HOST_MAX 128
 
@@ -172,7 +180,7 @@ void syscall_dispatch(struct registers *r)
 		struct fd *f = &sched_fds()[fd];
 		if (f->type == FD_CONSOLE) {
 			for (uint32_t i = 0; i < len; i++)
-				vga_putc(buf[i]);
+				con_putc(buf[i]);
 			r->eax = len;
 		} else if (f->type == FD_PIPE_WR) {
 			r->eax = (uint32_t)pipe_write(f->pipe, buf, (int)len);
@@ -592,6 +600,134 @@ void syscall_dispatch(struct registers *r)
 			r->eax = (uint32_t)-1;
 		}
 		break;
+
+	/* Filesystem management for a ring-3 shell. Each joins a relative name onto
+	 * the caller's cwd (like readfile/writefile) before hitting owofs. */
+	case SYS_MKDIR: {
+		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
+		char abs[SYS_PATH_MAX];
+		join_cwd((const char *)r->ebx, abs, sizeof abs);
+		r->eax = (uint32_t)fs_mkdir(abs);
+		break;
+	}
+	case SYS_RMDIR: {
+		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
+		char abs[SYS_PATH_MAX];
+		join_cwd((const char *)r->ebx, abs, sizeof abs);
+		r->eax = (uint32_t)fs_rmdir(abs);
+		break;
+	}
+	case SYS_DELETE: {
+		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
+		char abs[SYS_PATH_MAX];
+		join_cwd((const char *)r->ebx, abs, sizeof abs);
+		r->eax = (uint32_t)fs_delete(abs);
+		break;
+	}
+	case SYS_RENAME: {
+		if (!user_range(r->ebx, 1) || !user_range(r->ecx, 1)) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		char a[SYS_PATH_MAX], b[SYS_PATH_MAX];
+		join_cwd((const char *)r->ebx, a, sizeof a);
+		join_cwd((const char *)r->ecx, b, sizeof b);
+		r->eax = (uint32_t)fs_rename(a, b);
+		break;
+	}
+	/* Launch a /bin program as a DETACHED process (like the Start menu), rather
+	 * than fork+exec — a windowed shell can't fork itself cleanly. `path` must be
+	 * resolved by the caller (the shell prepends /bin/ or passes an absolute
+	 * path); `arg` is an optional single argv[1]. Returns the child pid. */
+	case SYS_SPAWN: {
+		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
+		char path[SYS_PATH_MAX];
+		int n = 0;
+		for (; n < SYS_PATH_MAX - 1 && user_range(r->ebx + (uint32_t)n, 1); n++) {
+			char c = ((const char *)r->ebx)[n];
+			if (!c) break;
+			path[n] = c;
+		}
+		path[n] = '\0';
+		/* Size the buffer to the file (like apps.c launch_bin), not a fixed
+		 * 256 KiB -- a large fixed kmalloc fails on a pressured/fragmented heap
+		 * (real drivers, VMware) even when the smaller program would fit, which
+		 * showed up as "failed to launch" for GUI apps. */
+		int fsz = fs_size(path);
+		if (fsz < 0) { r->eax = (uint32_t)-1; break; }
+		uint8_t *buf = kmalloc((uint32_t)fsz);
+		if (!buf) { r->eax = (uint32_t)-1; break; }
+		int sz = fs_read(path, buf, (uint32_t)fsz);
+		if (sz < 0) { kfree(buf); r->eax = (uint32_t)-1; break; }
+		char arg[SYS_PATH_MAX];
+		char *argv[2];
+		int argc = 1;
+		argv[0] = path;
+		if (r->ecx && user_range(r->ecx, 1)) {
+			int j = 0;
+			for (; j < SYS_PATH_MAX - 1 && user_range(r->ecx + (uint32_t)j, 1); j++) {
+				char c = ((const char *)r->ecx)[j];
+				if (!c) break;
+				arg[j] = c;
+			}
+			arg[j] = '\0';
+			argv[1] = arg;
+			argc = 2;
+		}
+		int pid = exec_program(buf, (uint32_t)sz, argc, argv);
+		kfree(buf);
+		r->eax = (uint32_t)pid;
+		break;
+	}
+	/* Bridge: run a kernel builtin (journal, neofetch, lspci, ...) with its
+	 * output captured, so the ring-3 terminal can reuse every kernel command
+	 * without re-implementing it. Capture into a kernel buffer, then copy to the
+	 * caller (bounds-checked). Returns bytes produced, or -1 if not a builtin. */
+	case SYS_SHELL: {
+		uint32_t out = r->ecx, max = r->edx;
+		if (!user_range(r->ebx, 1) || !user_range(out, max) || max == 0) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		char cmd[256];
+		int n = 0;
+		for (; n < (int)sizeof cmd - 1 && user_range(r->ebx + (uint32_t)n, 1); n++) {
+			char c = ((const char *)r->ebx)[n];
+			if (!c) break;
+			cmd[n] = c;
+		}
+		cmd[n] = '\0';
+		/* The int 0x80 gate runs with IF=0. A builtin may run long or wait on an
+		 * IRQ (ping/dig/ntp, AML in neofetch); without interrupts it can't be
+		 * preempted and a hlt-wait would deadlock. Enable them for the duration. */
+		__asm__ volatile ("sti");
+		/* Capture straight into the caller's buffer (already range-checked above):
+		 * the builtin runs in this process's CR3, so con_putc writes land in the
+		 * user buffer directly. No 64 KiB kmalloc per call -- that could fail under
+		 * heap pressure (real drivers + apps), turning every kernel command into a
+		 * spurious "command not found". */
+		r->eax = (uint32_t)shell_exec_capture(cmd, (char *)out, (int)max);
+		break;
+	}
+	case SYS_STAT: {
+		struct st_out { int is_dir; uint32_t size; } *o;
+		if (!user_range(r->ebx, 1) || !user_range(r->ecx, sizeof *o)) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		char abs[SYS_PATH_MAX];
+		join_cwd((const char *)r->ebx, abs, sizeof abs);
+		int isd = 0;
+		uint32_t sz = 0;
+		int rc = fs_stat(abs, &isd, &sz, 0);
+		o = (struct st_out *)r->ecx;
+		if (rc == 0) {
+			o->is_dir = isd;
+			o->size = sz;
+		}
+		r->eax = (uint32_t)rc;
+		break;
+	}
 
 	default:
 		r->eax = (uint32_t)-1;

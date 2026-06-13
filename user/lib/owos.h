@@ -59,6 +59,7 @@ int  readline(char *buf, int max);            /* echoed line input, returns len*
 #define WEV_RESIZE 4    /* a, b = new client w, h (only if win_resizable on)    */
 #define WEV_DBLCLICK 5  /* a, b = client x, y of a double click (after WEV_MOUSE)*/
 #define WEV_RCLICK   6  /* a, b = client x, y of a right click                   */
+#define WEV_SCROLL   7  /* a = mouse-wheel delta (+ up / - down)                 */
 
 struct win_event { unsigned type; int a, b; };
 
@@ -100,6 +101,24 @@ static inline int thread_join(int tid) { return waitpid(tid); }
  * (NULL/""/"/" = root). Returns 1 if it exists, 0 past the end, -1 on error. */
 struct dirent_u { char name[20]; int is_dir; unsigned size; };
 int readdir(const char *path, int idx, struct dirent_u *out);
+
+/* Filesystem management (paths join onto the process cwd; the shell passes
+ * absolute paths). All return 0 on success, -1 on failure. */
+struct statinfo { int is_dir; unsigned size; };
+int mkdir(const char *path);
+int rmdir(const char *path);
+int unlink(const char *path);                       /* delete a file          */
+int rename(const char *old, const char *neu);
+int stat(const char *path, struct statinfo *out);   /* -1 if path absent      */
+
+/* Launch a program (resolved /bin path or absolute) as a detached process,
+ * with an optional single argument. Returns the child pid, or -1. */
+int spawn(const char *path, const char *arg);
+
+/* Run a kernel-shell builtin (journal, neofetch, lspci, date, ...) and capture
+ * its text output into out[max]. Returns bytes written, or -1 if not a builtin.
+ * Lets the ring-3 terminal reuse every kernel command. */
+int shell_cmd(const char *cmd, char *out, int max);
 
 /* Mounted removable volumes (USB sticks, etc.). Fill *out with the idx-th
  * volume: its label, mount path (e.g. "/media"), backing kind ("USB"/"SATA"/...),

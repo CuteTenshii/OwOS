@@ -14,7 +14,7 @@
 #include <stddef.h>
 
 #include "ext.h"
-#include "vga.h"
+#include "console.h"
 #include "kstring.h"
 
 /* ---------------------------------------------------------- LE readers */
@@ -30,7 +30,7 @@ static void put_u32(uint32_t v)
 	char b[11]; int i = 10; b[i--] = '\0';
 	if (!v) b[i--] = '0';
 	while (v) { b[i--] = (char)('0' + v % 10); v /= 10; }
-	vga_write(&b[i + 1]);
+	con_write(&b[i + 1]);
 }
 
 /* ---------------------------------------------------------------- state */
@@ -431,11 +431,11 @@ static int dir_walk(const char *path, int want_idx, char *name,
 							isd = inode_is_dir(cur_inode);
 							s = (uint32_t)inode_size(cur_inode);
 						}
-						vga_write(isd ? "  <DIR>  " : "         ");
-						if (!isd) { put_u32(s); vga_write("  "); }
-						else      { vga_write("  "); }
-						vga_write(nm);
-						vga_putc('\n');
+						con_write(isd ? "  <DIR>  " : "         ");
+						if (!isd) { put_u32(s); con_write("  "); }
+						else      { con_write("  "); }
+						con_write(nm);
+						con_putc('\n');
 					} else if (seen == want_idx) {     /* index mode */
 						if (read_inode(ino, cur_inode) == 0) {
 							isd = inode_is_dir(cur_inode);

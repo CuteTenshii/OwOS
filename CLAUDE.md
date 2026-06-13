@@ -160,7 +160,7 @@ a private user window backed by pmm high memory. The scheduler switches CR3 and
 threads and interrupt handlers run under *any* CR3 — that invariant is why the
 scheduler needn't special-case address spaces.
 
-## Graphics & window manager (fb.c → wm.c, with mouse.c + vga.c)
+## Graphics & window manager (fb.c → wm.c, with mouse.c + console.c)
 
 A 32-bpp linear framebuffer, PS/2 mouse, and a compositing WM whose terminal
 window hosts the shell. **Strictly optional** — with no framebuffer the kernel
@@ -170,10 +170,14 @@ stays in 80×25 text mode and everything still works.
   DISPI registers (ports 0x1CE/0x1CF) from protected mode, LFB via VGA PCI BAR0.
   GRUB/real HW: **adopt** the bootloader's framebuffer (`fb_adopt`). `kernel_main`
   prefers adopt, falls back to DISPI.
-- **The console is unchanged.** vga.c keeps an 80×25 shadow grid (char+attr);
-  `vga_use_framebuffer(1)` stops it touching 0xB8000, and the compositor renders
-  that grid with an 8×16 CP437 font. Shell/line-editor/scrolling work in the
-  window with **zero shell changes** — keys still flow through `kernel_main` into
+- **The console is the `con_*` layer (console.c, formerly vga.c).** `con_putc`
+  is the one funnel every console write passes through; it fans out to serial,
+  the journal (log.c), the framebuffer boot console (fb.c, verbose), an optional
+  capture buffer, and the VGA text backend — an 80×25 shadow grid (char+attr).
+  `con_use_framebuffer(1)` stops the text backend touching 0xB8000, and the
+  compositor renders that grid with an 8×16 CP437 font. Shell/line-editor/
+  scrolling work in the window with **zero shell changes** — keys still flow
+  through `kernel_main` into
   `shell_feed`.
 - **wm.c is one kernel thread.** Draggable title bars, raise-on-click z-order,
   focus, close boxes, cursor, clock/taskbar; windows have kinds (`enum win_kind`:

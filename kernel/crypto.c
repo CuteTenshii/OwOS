@@ -7,7 +7,7 @@
  */
 
 #include "crypto.h"
-#include "vga.h"
+#include "console.h"
 #include "kstring.h"
 
 /* ------------------------------------------------------------------ helpers */
@@ -721,8 +721,8 @@ static int eqbytes(const uint8_t *a, const uint8_t *b, uint32_t n)
 
 static void report(const char *name, int ok, int *all)
 {
-	vga_write(name);
-	vga_write(ok ? ": PASS\n" : ": FAIL\n");
+	con_write(name);
+	con_write(ok ? ": PASS\n" : ": FAIL\n");
 	if (!ok)
 		*all = 0;
 }
@@ -858,6 +858,6 @@ int crypto_selftest(void)
 		report("hkdf-sha256", eqbytes(prk, prkw, 32) && eqbytes(okm, okmw, 42), &all);
 	}
 
-	vga_write(all ? "crypto: ALL PASS\n" : "crypto: FAILURES\n");
+	con_write(all ? "crypto: ALL PASS\n" : "crypto: FAILURES\n");
 	return all ? 0 : -1;
 }

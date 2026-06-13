@@ -20,7 +20,7 @@
 #include "xhci.h"
 #include "pci.h"
 #include "io.h"
-#include "vga.h"
+#include "console.h"
 #include "paging.h"
 #include "timer.h"
 
@@ -99,7 +99,7 @@ static void put_hex(uint32_t value, int digits)
 {
 	static const char h[] = "0123456789abcdef";
 	for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-		vga_putc(h[(value >> shift) & 0xF]);
+		con_putc(h[(value >> shift) & 0xF]);
 }
 
 static const char *controller_type(uint8_t prog_if)
@@ -300,12 +300,12 @@ static void uhci_print_string(uint16_t io, int lowspeed, uint8_t maxpacket, uint
 	if (uhci_control_in(io, lowspeed, 0, maxpacket, 0x80, 0x06,
 	                    (0x03 << 8) | index, 0x0409, buf, len) < len)
 		return;
-	vga_write(" \"");
+	con_write(" \"");
 	for (int i = 2; i + 1 < len; i += 2) {
 		uint8_t lo = buf[i], hi = buf[i + 1];
-		vga_putc((hi == 0 && lo >= 32 && lo < 127) ? (char)lo : '?');
+		con_putc((hi == 0 && lo >= 32 && lo < 127) ? (char)lo : '?');
 	}
-	vga_putc('"');
+	con_putc('"');
 }
 
 /* Enumerate the device on a freshly reset port: read its device descriptor and
@@ -332,25 +332,25 @@ static void uhci_enumerate(uint16_t io, uint16_t portsc_off)
 	uint8_t  cls = desc[4];
 	uint8_t  iproduct = desc[15];
 
-	vga_write("      ");
-	put_hex(vid, 4); vga_putc(':'); put_hex(pid, 4);
-	vga_write("  class "); put_hex(cls, 2);
+	con_write("      ");
+	put_hex(vid, 4); con_putc(':'); put_hex(pid, 4);
+	con_write("  class "); put_hex(cls, 2);
 	uhci_print_string(io, lowspeed, maxpacket, iproduct);
-	vga_putc('\n');
+	con_putc('\n');
 }
 
 /* Read and report one UHCI root-hub port, then enumerate any device on it. */
 static void uhci_probe_port(uint16_t io_base, uint16_t offset, int port)
 {
 	uint16_t status = inw(io_base + offset);
-	vga_write("    port ");
-	vga_write_dec((uint32_t)port);
-	vga_write(": ");
+	con_write("    port ");
+	con_write_dec((uint32_t)port);
+	con_write(": ");
 	if (!(status & UHCI_PORT_CONNECTED)) {
-		vga_write("no device\n");
+		con_write("no device\n");
 		return;
 	}
-	vga_write((status & UHCI_PORT_LOWSPEED) ? "low-speed device\n"
+	con_write((status & UHCI_PORT_LOWSPEED) ? "low-speed device\n"
 	                                        : "full-speed device\n");
 	uhci_enumerate(io_base, offset);
 }
@@ -361,7 +361,7 @@ static void uhci_probe(uint8_t bus, uint8_t slot, uint8_t func)
 {
 	uint32_t bar4 = pci_read32(bus, slot, func, 0x20);
 	if (!(bar4 & 0x1)) {          /* expect an I/O-space BAR (bit 0 set)  */
-		vga_write("    (no I/O BAR; cannot probe ports)\n");
+		con_write("    (no I/O BAR; cannot probe ports)\n");
 		return;
 	}
 	uint16_t io_base = (uint16_t)(bar4 & 0xFFFC);
@@ -399,15 +399,15 @@ void usb_list(int detail_port)
 					continue;
 
 				found++;
-				put_hex(bus, 2);  vga_putc(':');
-				put_hex(slot, 2); vga_putc('.');
+				put_hex(bus, 2);  con_putc(':');
+				put_hex(slot, 2); con_putc('.');
 				put_hex(f, 1);
-				vga_write("  ");
-				put_hex(id & 0xFFFF, 4); vga_putc(':');
+				con_write("  ");
+				put_hex(id & 0xFFFF, 4); con_putc(':');
 				put_hex((id >> 16) & 0xFFFF, 4);
-				vga_write("  ");
-				vga_write(controller_type(prog_if));
-				vga_putc('\n');
+				con_write("  ");
+				con_write(controller_type(prog_if));
+				con_putc('\n');
 
 				if (prog_if == USB_PROGIF_UHCI)
 					uhci_probe(bus, slot, f);
@@ -418,5 +418,5 @@ void usb_list(int detail_port)
 	}
 
 	if (!found)
-		vga_write("no USB controllers found\n");
+		con_write("no USB controllers found\n");
 }

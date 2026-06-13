@@ -10,7 +10,7 @@
 #include <stddef.h>
 
 #include "nic.h"
-#include "vga.h"
+#include "console.h"
 
 extern const struct nic_ops e1000_ops;
 extern const struct nic_ops rtl8139_ops;
@@ -32,7 +32,7 @@ void nic_init(void)
 			return;
 		}
 	}
-	vga_write("net: no NIC found\n");
+	con_write("net: no NIC found\n");
 }
 
 /* Install a driver discovered after boot (the USB-tethering RNDIS NIC, which

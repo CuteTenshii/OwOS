@@ -4,7 +4,7 @@
 #include "bencode.h"
 #include "crypto.h"
 #include "heap.h"
-#include "vga.h"
+#include "console.h"
 
 #define TORRENT_MAX_NODES 8192  /* enough for a large multi-file torrent: each
                                  * file is a dict (~6 nodes), so ~1000 files   */
@@ -119,51 +119,51 @@ static void print_u64(uint64_t v)
 {
 	char tmp[20];
 	int i = 0;
-	if (v == 0) { vga_putc('0'); return; }
+	if (v == 0) { con_putc('0'); return; }
 	while (v) { tmp[i++] = (char)('0' + (v % 10)); v /= 10; }
-	while (i--) vga_putc(tmp[i]);
+	while (i--) con_putc(tmp[i]);
 }
 
 static void print_hex20(const uint8_t h[20])
 {
 	static const char hx[] = "0123456789abcdef";
 	for (int i = 0; i < 20; i++) {
-		vga_putc(hx[h[i] >> 4]);
-		vga_putc(hx[h[i] & 0xf]);
+		con_putc(hx[h[i] >> 4]);
+		con_putc(hx[h[i] & 0xf]);
 	}
 }
 
 void torrent_print(const struct torrent *t)
 {
-	vga_write("name:      ");
+	con_write("name:      ");
 	for (uint32_t i = 0; i < t->name_len; i++)
-		vga_putc((char)t->name[i]);
-	vga_putc('\n');
+		con_putc((char)t->name[i]);
+	con_putc('\n');
 
-	vga_write("infohash:  ");
+	con_write("infohash:  ");
 	print_hex20(t->infohash);
-	vga_putc('\n');
+	con_putc('\n');
 
-	vga_write("announce:  ");
-	vga_write(t->announce[0] ? t->announce : "(none)");
-	vga_putc('\n');
+	con_write("announce:  ");
+	con_write(t->announce[0] ? t->announce : "(none)");
+	con_putc('\n');
 
-	vga_write("layout:    ");
-	vga_write(t->multi_file ? "multi-file (" : "single-file (");
+	con_write("layout:    ");
+	con_write(t->multi_file ? "multi-file (" : "single-file (");
 	print_u64((uint64_t)t->file_count);
-	vga_write(t->file_count == 1 ? " file)\n" : " files)\n");
+	con_write(t->file_count == 1 ? " file)\n" : " files)\n");
 
-	vga_write("total:     ");
+	con_write("total:     ");
 	print_u64((uint64_t)t->total_length);
-	vga_write(" bytes\n");
+	con_write(" bytes\n");
 
-	vga_write("piece len: ");
+	con_write("piece len: ");
 	print_u64((uint64_t)t->piece_length);
-	vga_write(" bytes\n");
+	con_write(" bytes\n");
 
-	vga_write("pieces:    ");
+	con_write("pieces:    ");
 	print_u64((uint64_t)t->n_pieces);
-	vga_putc('\n');
+	con_putc('\n');
 }
 
 /* --------------------------------------------------------------- self-test */
@@ -208,7 +208,7 @@ int torrent_selftest(void)
 	int ok = 1;
 
 	if (torrent_parse(&t, sample_torrent, (uint32_t)sizeof(sample_torrent)) != 0) {
-		vga_write("torrent selftest: parse FAILED\n");
+		con_write("torrent selftest: parse FAILED\n");
 		return -1;
 	}
 
@@ -221,11 +221,11 @@ int torrent_selftest(void)
 	                !t.multi_file && t.file_count == 1;
 
 	torrent_print(&t);
-	vga_write("  infohash  "); vga_write(hash_ok   ? "PASS\n" : "FAIL\n");
-	vga_write("  fields    "); vga_write(fields_ok ? "PASS\n" : "FAIL\n");
+	con_write("  infohash  "); con_write(hash_ok   ? "PASS\n" : "FAIL\n");
+	con_write("  fields    "); con_write(fields_ok ? "PASS\n" : "FAIL\n");
 	ok = hash_ok && fields_ok;
 
 	torrent_free(&t);
-	vga_write(ok ? "torrent selftest: PASS\n" : "torrent selftest: FAIL\n");
+	con_write(ok ? "torrent selftest: PASS\n" : "torrent selftest: FAIL\n");
 	return ok ? 0 : -1;
 }

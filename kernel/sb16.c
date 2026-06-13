@@ -13,7 +13,7 @@
 #include "sb16.h"
 #include "io.h"
 #include "irq.h"
-#include "vga.h"
+#include "console.h"
 #include "fs.h"
 #include "keyboard.h"
 
@@ -129,14 +129,14 @@ void sb16_init(void)
 {
 	if (!dsp_reset()) {
 		present = 0;
-		vga_write("sb16: no device (run QEMU with -device sb16)\n");
+		con_write("sb16: no device (run QEMU with -device sb16)\n");
 		return;
 	}
 	present = 1;
 	irq_register(SB_IRQ, sb16_irq);
 	irq_unmask(SB_IRQ);
 	set_mixer_volume();             /* defaults to SB_VOL_MAX (== 0xFF L+R)     */
-	vga_write("sb16: Sound Blaster 16 ready (io 0x220 irq 5 dma 1)\n");
+	con_write("sb16: Sound Blaster 16 ready (io 0x220 irq 5 dma 1)\n");
 }
 
 int sb16_present(void)
@@ -225,22 +225,22 @@ static uint32_t fill_half(uint8_t *dst, const char *fn, uint32_t data_off,
 int sb16_play_wav(const char *fn)
 {
 	if (!present) {
-		vga_write("play: no sound card (start QEMU with -device sb16)\n");
+		con_write("play: no sound card (start QEMU with -device sb16)\n");
 		return -1;
 	}
 
 	int fsize = fs_size(fn);
 	if (fsize < 0) {
-		vga_write("play: no such file: ");
-		vga_write(fn);
-		vga_putc('\n');
+		con_write("play: no such file: ");
+		con_write(fn);
+		con_putc('\n');
 		return -1;
 	}
 
 	uint8_t hdr[256];
 	int got = fs_read_at(fn, 0, hdr, sizeof(hdr));
 	if (got < 44 || !tag_eq(hdr, "RIFF") || !tag_eq(hdr + 8, "WAVE")) {
-		vga_write("play: not a WAV file\n");
+		con_write("play: not a WAV file\n");
 		return -1;
 	}
 
@@ -266,7 +266,7 @@ int sb16_play_wav(const char *fn)
 
 	if (!data_off || fmt != 1 || (bits != 8 && bits != 16) ||
 	    channels < 1 || channels > 2) {
-		vga_write("play: unsupported WAV (need PCM 8/16-bit mono/stereo)\n");
+		con_write("play: unsupported WAV (need PCM 8/16-bit mono/stereo)\n");
 		return -1;
 	}
 	if (data_off + data_len > (uint32_t)fsize)      /* clamp to the real file   */

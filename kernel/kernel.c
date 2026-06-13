@@ -32,13 +32,28 @@
 #include "syscall.h"
 #include "serial.h"
 #include "shell.h"
+#include "log.h"
 #include "sb16.h"
 #include "timer.h"
-#include "vga.h"
+#include "console.h"
 #include "fb.h"
 #include "wm.h"
+#include "apps.h"
 #include "screenshot.h"
 #include "xhci.h"
+
+/* Boot-stage breadcrumb shown on the panic screen. On a laptop there is no COM1
+ * to capture the serial log and the panic clears the boot log off screen, so the
+ * panic must carry "how far did boot get" itself. Updated by bootmark(). TEMP
+ * diagnostic for the wm-thread boot crash. */
+const char *g_boot_stage = "early";
+static void bootmark(const char *s)
+{
+	g_boot_stage = s;
+	con_write("BOOTMARK: ");
+	con_write(s);
+	con_write("\n");
+}
 
 /* Two CPU-bound kernel threads that never yield. If scheduling were
  * cooperative the first one would hang the machine; under preemption the
@@ -55,6 +70,30 @@ static void spinner(void)
  * emitted in multiboot1 entry layout (a 4-byte size=20 field, then the 8/8/4
  * addr/len/type) into a static scratch buffer that pmm walks the usual way.
  * Returns the filled-in info struct. */
+/* True if the NUL-terminated command line `s` contains the whitespace-delimited
+ * token `tok` (so "verbose" matches "ro verbose quiet" but not "verbosely").
+ * Used to read boot flags like `verbose` off the kernel command line. */
+static int cmdline_has(const char *s, const char *tok)
+{
+	if (!s)
+		return 0;
+	for (;;) {
+		while (*s == ' ' || *s == '\t')
+			s++;
+		if (*s == '\0')
+			return 0;
+		const char *a = s, *b = tok;
+		while (*a && *a != ' ' && *a != '\t' && *a == *b) {
+			a++;
+			b++;
+		}
+		if (*b == '\0' && (*a == '\0' || *a == ' ' || *a == '\t'))
+			return 1;
+		while (*s && *s != ' ' && *s != '\t')   /* skip to the next token       */
+			s++;
+	}
+}
+
 static struct multiboot_info synth_mbi;
 /* Real UEFI firmware hands GRUB a memory map with *hundreds* of descriptors
  * (ACPI, runtime services, MMIO holes, fragmented conventional RAM); QEMU has
@@ -78,7 +117,12 @@ static struct multiboot_info *multiboot2_to_info(uint32_t info_addr)
 		if (tag->type == MB2_TAG_END)
 			break;
 
-		if (tag->type == MB2_TAG_MMAP) {
+		if (tag->type == MB2_TAG_CMDLINE) {
+			/* GRUB's command line. A `verbose` token here shows the boot log
+			 * on screen, same as the mb1 path below. */
+			if (cmdline_has(((struct mb2_tag_string *)p)->string, "verbose"))
+				log_set_verbose(1);
+		} else if (tag->type == MB2_TAG_MMAP) {
 			struct mb2_tag_mmap *mm = (struct mb2_tag_mmap *)p;
 			uint8_t *e   = p + sizeof *mm;
 			uint8_t *end = p + mm->size;
@@ -144,19 +188,29 @@ static struct multiboot_info *multiboot2_to_info(uint32_t info_addr)
 void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 {
 	serial_init();                 /* first: the console mirrors here         */
-	vga_init();
+	con_init();
 
-	vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
-	vga_write("OwOS\n");
-	vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
-	vga_write("booted in 32-bit protected mode via multiboot.\n");
+	/* Boot is quiet on screen by default; a `verbose` token on the kernel
+	 * command line shows the bring-up log live. Either way the journal records
+	 * it (and the serial port streams it). Read it before the first log line so
+	 * the whole boot honours it. mb1 carries the cmdline in the info struct;
+	 * mb2's is read in multiboot2_to_info() below. */
+	if (magic == MULTIBOOT_BOOTLOADER_MAGIC &&
+	    (mbi->flags & MULTIBOOT_FLAG_CMD) &&
+	    cmdline_has((const char *)(uintptr_t)mbi->cmdline, "verbose"))
+		log_set_verbose(1);
+
+	con_set_color(CON_LIGHT_CYAN, CON_BLACK);
+	con_write("OwOS\n");
+	con_set_color(CON_LIGHT_GREY, CON_BLACK);
+	con_write("booted in 32-bit protected mode via multiboot.\n");
 
 	if (magic == MULTIBOOT2_BOOTLOADER_MAGIC) {
 		/* GRUB/UEFI path: ebx points at a multiboot2 tag chain, not an mbi. */
 		mbi = multiboot2_to_info((uint32_t)mbi);
 	} else if (magic != MULTIBOOT_BOOTLOADER_MAGIC) {
-		vga_set_color(VGA_WHITE, VGA_RED);
-		vga_write("bad multiboot magic -- halting.\n");
+		con_set_color(CON_WHITE, CON_RED);
+		con_write("bad multiboot magic -- halting.\n");
 		for (;;)
 			__asm__ volatile ("cli; hlt");
 	}
@@ -165,66 +219,74 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	idt_init();
 	irq_init();
 
-	vga_write("mmdbg: path=");
-	vga_write(magic == MULTIBOOT2_BOOTLOADER_MAGIC ? "mb2" : "mb1");
-	vga_write(" mmapflag=");
-	vga_write_dec((mbi->flags & MULTIBOOT_FLAG_MMAP) ? 1 : 0);
-	vga_write(" entries=");
-	vga_write_dec(mbi->mmap_length / 24);   /* synth/E820 entries are 24 bytes  */
-	vga_write(" firmware=");
-	vga_write(firmware_name());
-	vga_putc('\n');
+	con_write("mmdbg: path=");
+	con_write(magic == MULTIBOOT2_BOOTLOADER_MAGIC ? "mb2" : "mb1");
+	con_write(" mmapflag=");
+	con_write_dec((mbi->flags & MULTIBOOT_FLAG_MMAP) ? 1 : 0);
+	con_write(" entries=");
+	con_write_dec(mbi->mmap_length / 24);   /* synth/E820 entries are 24 bytes  */
+	con_write(" firmware=");
+	con_write(firmware_name());
+	con_putc('\n');
 
 	pmm_init(mbi);                 /* read the memory map, track frames       */
-	vga_write("pmm: ");
-	vga_write_dec(pmm_installed_kib() / 1024);
-	vga_write(" MiB RAM detected");
+	con_write("pmm: ");
+	con_write_dec(pmm_installed_kib() / 1024);
+	con_write(" MiB RAM detected");
 	if (pmm_installed_kib() > pmm_total_kib()) {
 		/* 32-bit, no PAE: we can only manage the low 4 GiB of it. */
-		vga_write(" (");
-		vga_write_dec(pmm_total_kib() / 1024);
-		vga_write(" MiB usable)");
+		con_write(" (");
+		con_write_dec(pmm_total_kib() / 1024);
+		con_write(" MiB usable)");
 	}
-	vga_write(".\n");
+	con_write(".\n");
 
 	paging_init();                 /* identity-map low 16 MiB, enable paging  */
-	vga_write("paging: enabled (low 16 MiB identity-mapped).\n");
+	con_write("paging: enabled (low 16 MiB identity-mapped).\n");
 
 	heap_init();                   /* kmalloc/kfree over [4 MiB, 16 MiB)      */
-	vga_write("heap: ready.\n");
+	con_write("heap: ready.\n");
 
 	smbios_init();                 /* read DMI vendor/product for the splash  */
 
 	pci_init();                    /* enumerate the PCI bus                   */
-	vga_write("pci: ");
-	vga_write_dec((uint32_t)pci_count());
-	vga_write(" devices found.\n");
+	con_write("pci: ");
+	con_write_dec((uint32_t)pci_count());
+	con_write(" devices found.\n");
 
 	/* Bring up a linear framebuffer. Prefer one the bootloader handed us (GRUB
 	 * via Multiboot, on real VMs/hardware where we can't drive the GPU to set a
 	 * mode); otherwise program QEMU's DISPI adapter directly (the -kernel path,
 	 * which provides no framebuffer). */
 	{
-		int rc = -1;
+		int rc = -1, adopted = 0;
 		if ((mbi->flags & MULTIBOOT_FLAG_FB) &&
 		    mbi->framebuffer_type == MULTIBOOT_FB_TYPE_RGB &&
 		    mbi->framebuffer_bpp == 32) {
 			rc = fb_adopt((uint32_t)mbi->framebuffer_addr,
 			              mbi->framebuffer_width, mbi->framebuffer_height,
 			              mbi->framebuffer_pitch, mbi->framebuffer_bpp);
-			if (rc == 0) {
-				vga_write("fb: adopted bootloader framebuffer ");
-				vga_write_dec(mbi->framebuffer_width);  vga_putc('x');
-				vga_write_dec(mbi->framebuffer_height); vga_write("x32.\n");
-			}
+			adopted = (rc == 0);
 		}
 		if (rc != 0)
 			rc = fb_init(1024, 768);   /* VBE DISPI fallback (QEMU -kernel) */
 
+		/* On a verbose boot, catch the framebuffer console up with everything
+		 * logged before graphics mode existed (banner, pmm, paging, ...), which
+		 * until now only reached the 0xB8000 text the graphics mode hides. After
+		 * this the status lines below stream onto it live. */
+		if (rc == 0 && log_verbose())
+			journal_to_fb();
+
+		if (adopted) {
+			con_write("fb: adopted bootloader framebuffer ");
+			con_write_dec(mbi->framebuffer_width);  con_putc('x');
+			con_write_dec(mbi->framebuffer_height); con_write("x32.\n");
+		}
 		if (rc == 0)
-			vga_write("fb: graphics mode up.\n");
+			con_write("fb: graphics mode up.\n");
 		else
-			vga_write("fb: no framebuffer available; staying in text mode.\n");
+			con_write("fb: no framebuffer available; staying in text mode.\n");
 	}
 
 	net_init();                    /* bring up the RTL8139 NIC, if present     */
@@ -259,6 +321,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		extern const unsigned char _binary_user_imgview_elf_end[];
 		extern const unsigned char _binary_user_crashme_elf_start[];
 		extern const unsigned char _binary_user_crashme_elf_end[];
+		extern const unsigned char _binary_user_term_elf_start[];
+		extern const unsigned char _binary_user_term_elf_end[];
 		char probe;
 		/* A Unix-like layout: programs in /bin, a home for the user. mkdir is
 		 * a no-op if the directory already exists from a previous boot. */
@@ -302,8 +366,12 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			fs_create("/bin/crashme", _binary_user_crashme_elf_start,
 			          (uint32_t)(_binary_user_crashme_elf_end -
 			                     _binary_user_crashme_elf_start));
+		if (fs_read("/bin/term", &probe, 0) < 0)
+			fs_create("/bin/term", _binary_user_term_elf_start,
+			          (uint32_t)(_binary_user_term_elf_end -
+			                     _binary_user_term_elf_start));
 	}
-	vga_write("usermode: ready ('run curl <url>').\n");
+	con_write("usermode: ready ('run curl <url>').\n");
 
 	timer_init();                  /* IRQ0: keep time                         */
 	keyboard_init();               /* IRQ1: buffer keystrokes                 */
@@ -312,27 +380,34 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	sched_init();                  /* current context becomes task "main"     */
 	sched_create_thread("spin-a", spinner);
 	sched_create_thread("spin-b", spinner);
-	vga_write("scheduler: 2 worker threads spawned.\n");
+	con_write("scheduler: 2 worker threads spawned.\n");
 
 	services_init();               /* supervisor thread + auto-start daemons   */
 
+	bootmark("wm_init");
 	wm_init();                     /* graphics desktop + mouse, if fb is up    */
 
+	bootmark("screenshot_init");
 	screenshot_init();             /* Print Screen worker (off the WM thread)  */
 
+	bootmark("sti");
 	__asm__ volatile ("sti");      /* interrupts on; preemption begins        */
 
+	bootmark("dhcp");
 	net_dhcp_start();              /* lease IP/gw/dns on the boot NIC (post-sti:  */
 	                               /* uses timer_sleep). No-op if no NIC; on QEMU */
 	                               /* SLIRP re-leases the 10.0.2.15 default.      */
 
+	bootmark("xhci");
 	xhci_boot();                   /* USB host up + devices configured (post-sti: */
 	                               /* uses timer_sleep). Keeps a tethered phone   */
 	                               /* offering USB tethering without running lsusb.*/
 
+	bootmark("mount");
 	if (!fat_mounted())            /* a USB stick only appears after xhci_boot --  */
 		blk_mount_fat();           /* mount its FAT now if no other FAT volume did */
 
+	bootmark("shell");
 	shell_init();
 
 	for (;;) {

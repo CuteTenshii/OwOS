@@ -1,7 +1,7 @@
 /* neofetch.c — a little system-info splash, OwO logo beside the stats. */
 
 #include "neofetch.h"
-#include "vga.h"
+#include "console.h"
 #include "cpu.h"
 #include "rtc.h"
 #include "timer.h"
@@ -32,8 +32,21 @@ static const char *logo[] = {
 
 static void wr2(uint32_t v)   /* two-digit zero-padded                       */
 {
-	vga_putc('0' + (char)((v / 10) % 10));
-	vga_putc('0' + (char)(v % 10));
+	con_putc('0' + (char)((v / 10) % 10));
+	con_putc('0' + (char)(v % 10));
+}
+
+/* Print a memory size given in MiB, using "N.N GiB" once it reaches a gibibyte
+ * so used and total each read in their own natural unit. */
+static void write_mib(uint32_t mib)
+{
+	if (mib >= 1024) {
+		uint32_t tenths = (mib * 10) / 1024;   /* MiB -> tenths of a GiB */
+		con_write_dec(tenths / 10); con_putc('.'); con_write_dec(tenths % 10);
+		con_write(" GiB");
+	} else {
+		con_write_dec(mib); con_write(" MiB");
+	}
 }
 
 /* CPU speed (MHz), calibrated once and cached: cpu_mhz() busy-waits ~200 ms, so
@@ -42,9 +55,9 @@ static uint32_t cpu_speed_mhz;
 
 static void label(const char *s)
 {
-	vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
-	vga_write(s);
-	vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+	con_set_color(CON_LIGHT_GREEN, CON_BLACK);
+	con_write(s);
+	con_set_color(CON_LIGHT_GREY, CON_BLACK);
 }
 
 /* The physical storage devices the kernel found, gathered for the splash. */
@@ -79,46 +92,55 @@ static void info_row(int i, const char *brand, const struct rtc_time *t)
 {
 	switch (i) {
 	case 0:
-		vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
-		vga_write("OwOS");
-		vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+		con_set_color(CON_LIGHT_CYAN, CON_BLACK);
+		con_write("OwOS");
+		con_set_color(CON_LIGHT_GREY, CON_BLACK);
 		break;
-	case 1: vga_write("----------------"); break;
-	case 2: label("OS:      "); vga_write("OwOS 0.1"); break;
-	case 3: label("Kernel:  "); vga_write("owos (i386, 32-bit)"); break;
-	case 11: label("Firmware:"); vga_putc(' '); vga_write(firmware_name()); break;
+	case 1: con_write("----------------"); break;
+	case 2: label("OS:      "); con_write("OwOS 0.1"); break;
+	case 3: label("Kernel:  "); con_write("owos (i386, 32-bit)"); break;
+	case 11: label("Firmware:"); con_putc(' '); con_write(firmware_name()); break;
 	case 4:
 		label("CPU:     ");
-		vga_write(brand);
+		con_write(brand);
 		if (cpu_speed_mhz) {
 			/* MHz -> GHz with two decimals, rounded in hundredths so a value
 			 * like 2995 MHz carries cleanly to 3.00 GHz rather than 2.99. */
 			uint32_t cghz = (cpu_speed_mhz + 5) / 10;   /* hundredths of a GHz */
-			vga_write(" @ ");
-			vga_write_dec(cghz / 100);
-			vga_putc('.');
+			con_write(" @ ");
+			con_write_dec(cghz / 100);
+			con_putc('.');
 			wr2(cghz % 100);
-			vga_write(" GHz");
+			con_write(" GHz");
 		}
 		break;
-	case 5: label("Uptime:  "); vga_write_dec(timer_seconds()); vga_write(" s"); break;
+	case 5: {
+		label("Uptime:  ");
+		uint32_t s = timer_seconds();
+		uint32_t h = s / 3600; s %= 3600;
+		uint32_t m = s / 60;   s %= 60;
+		if (h) { con_write_dec(h); con_write("h "); }
+		if (h || m) { con_write_dec(m); con_write("m "); }
+		con_write_dec(s); con_putc('s');
+		break;
+	}
 	case 6:
 		label("Date:    ");
-		vga_write_dec(t->year); vga_putc('-'); wr2(t->month); vga_putc('-'); wr2(t->day);
-		vga_putc(' '); wr2(t->hour); vga_putc(':'); wr2(t->min); vga_putc(':'); wr2(t->sec);
+		con_write_dec(t->year); con_putc('-'); wr2(t->month); con_putc('-'); wr2(t->day);
+		con_putc(' '); wr2(t->hour); con_putc(':'); wr2(t->min); con_putc(':'); wr2(t->sec);
 		break;
 	case 7:
 		label("Memory:  ");
-		vga_write_dec(pmm_ram_used_kib() / 1024); vga_write(" / ");
-		vga_write_dec(pmm_installed_kib() / 1024); vga_write(" MiB");
+		write_mib(pmm_ram_used_kib() / 1024); con_write(" / ");
+		write_mib(pmm_installed_kib() / 1024);
 		break;
 	case 8:
 		label("Disk:    ");
-		vga_write_dec((uint32_t)fs_file_count()); vga_write(" files, ");
-		vga_write_dec(fs_used_bytes()); vga_write(" bytes");
+		con_write_dec((uint32_t)fs_file_count()); con_write(" files, ");
+		con_write_dec(fs_used_bytes()); con_write(" bytes");
 		break;
-	case 9: label("PCI:     "); vga_write_dec((uint32_t)pci_count()); vga_write(" devices"); break;
-	case 10: label("Tasks:   "); vga_write_dec((uint32_t)sched_count()); break;
+	case 9: label("PCI:     "); con_write_dec((uint32_t)pci_count()); con_write(" devices"); break;
+	case 10: label("Tasks:   "); con_write_dec((uint32_t)sched_count()); break;
 	}
 }
 
@@ -129,13 +151,13 @@ static void write_capacity(uint32_t sectors)
 	uint32_t mib = sectors / 2048;
 	if (mib >= 1024) {
 		uint32_t tenths = (mib * 10) / 1024;   /* MiB -> tenths of a GiB        */
-		vga_write_dec(tenths / 10);
-		vga_putc('.');
-		vga_write_dec(tenths % 10);
-		vga_write(" GiB");
+		con_write_dec(tenths / 10);
+		con_putc('.');
+		con_write_dec(tenths % 10);
+		con_write(" GiB");
 	} else {
-		vga_write_dec(mib);
-		vga_write(" MiB");
+		con_write_dec(mib);
+		con_write(" MiB");
 	}
 }
 
@@ -145,18 +167,18 @@ static void storage_row(int idx, const struct storage_dev *sd, int nsd)
 {
 	label(idx == 0 ? "Storage: " : "         ");
 	if (nsd == 0) {
-		vga_write("none detected");
+		con_write("none detected");
 		return;
 	}
-	vga_write(sd[idx].type);
+	con_write(sd[idx].type);
 	if (sd[idx].model && sd[idx].model[0]) {
-		vga_putc(' ');
-		vga_write(sd[idx].model);
+		con_putc(' ');
+		con_write(sd[idx].model);
 	}
 	if (sd[idx].sectors) {
-		vga_write(" (");
+		con_write(" (");
 		write_capacity(sd[idx].sectors);
-		vga_putc(')');
+		con_putc(')');
 	}
 }
 
@@ -166,13 +188,13 @@ static void display_row(int idx, const struct pci_display *dd, int ndd)
 {
 	label(idx == 0 ? "Display: " : "         ");
 	if (ndd == 0) {
-		vga_write("80x25 VGA text");
+		con_write("80x25 VGA text");
 		return;
 	}
 	if (dd[idx].name && dd[idx].name[0])
-		vga_write(dd[idx].name);
+		con_write(dd[idx].name);
 	else
-		vga_write("VGA-compatible controller");
+		con_write("VGA-compatible controller");
 	if (idx == 0) {
 		/* Prefer the monitor's real refresh from EDID (real hardware, Intel
 		 * GMBUS). Failing that there is no refresh register to read, so report
@@ -181,9 +203,9 @@ static void display_row(int idx, const struct pci_display *dd, int ndd)
 		int hz = edid_refresh_hz();
 		if (hz <= 0)
 			hz = fb_active() ? 60 : 70;
-		vga_write(" (80x25 text, ");
-		vga_write_dec((uint32_t)hz);
-		vga_write("Hz)");
+		con_write(" (80x25 text, ");
+		con_write_dec((uint32_t)hz);
+		con_write("Hz)");
 	}
 }
 
@@ -214,29 +236,29 @@ void neofetch(void)
 	const int rows = fixed + host_rows + batt_rows + storage_rows + display_rows;
 	for (int i = 0; i < rows; i++) {
 		/* logo column (cyan), padded to a fixed width */
-		vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
+		con_set_color(CON_LIGHT_CYAN, CON_BLACK);
 		const char *l = (i < LOGO_LINES) ? logo[i] : "";
 		int w = 0;
 		for (const char *p = l; *p; p++) {
-			vga_putc(*p);
+			con_putc(*p);
 			w++;
 		}
 		for (; w < LOGO_WIDTH; w++)
-			vga_putc(' ');
+			con_putc(' ');
 
-		vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+		con_set_color(CON_LIGHT_GREY, CON_BLACK);
 		if (i < fixed)
 			info_row(i, brand, &t);
 		else if (i < fixed + host_rows) {
 			label("Host:    ");
 			if (host[0]) {
-				vga_write(host);
+				con_write(host);
 			} else {
 				/* No DMI: show why, for on-hardware diagnosis. */
 				const char *e = smbios_error();
-				vga_write("unknown (");
-				vga_write((e && e[0]) ? e : "no SMBIOS");
-				vga_putc(')');
+				con_write("unknown (");
+				con_write((e && e[0]) ? e : "no SMBIOS");
+				con_putc(')');
 			}
 		} else if (i < fixed + host_rows + batt_rows) {
 			label("Battery: ");
@@ -245,22 +267,22 @@ void neofetch(void)
 			int chg = 0, dis = 0;
 			int pct = battery_percent(&chg, &dis);
 			if (pct >= 0) {
-				vga_write_dec((uint32_t)pct);
-				vga_putc('%');
-				if (chg)      vga_write(" (charging)");
-				else if (dis) vga_write(" (discharging)");
+				con_write_dec((uint32_t)pct);
+				con_putc('%');
+				if (chg)      con_write(" (charging)");
+				else if (dis) con_write(" (discharging)");
 			} else {
 				/* Couldn't read _BST/_BIF; show why, for diagnosis. */
 				const char *e = battery_error();
-				vga_write("present (");
-				vga_write((e && e[0]) ? e : "ACPI");
-				vga_putc(')');
+				con_write("present (");
+				con_write((e && e[0]) ? e : "ACPI");
+				con_putc(')');
 			}
 		} else if (i < fixed + host_rows + batt_rows + storage_rows)
 			storage_row(i - fixed - host_rows - batt_rows, sd, nsd);
 		else
 			display_row(i - fixed - host_rows - batt_rows - storage_rows, dd, ndd);
-		vga_putc('\n');
+		con_putc('\n');
 	}
-	vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+	con_set_color(CON_LIGHT_GREY, CON_BLACK);
 }

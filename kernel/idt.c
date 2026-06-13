@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include "idt.h"
 #include "gdt.h"
-#include "vga.h"
+#include "console.h"
 #include "fb.h"
 #include "syscall.h"
 #include "sched.h"
@@ -141,6 +141,25 @@ static void panic_screen(struct registers *r)
 	p = line;
 	p = p_str(p, "esi="); p = p_hex(p, r->esi); p = p_str(p, "  edi="); p = p_hex(p, r->edi);
 	p = p_str(p, "  ebp="); p = p_hex(p, r->ebp); p = p_str(p, "  esp="); p = p_hex(p, r->esp);
+	*p = 0; fb_text(x, y, line, fg, bg); y += lh;
+
+	/* Breadcrumb: how far did boot get, and which task was current at the fault.
+	 * A laptop has no serial capture and the panic clears the boot log, so carry
+	 * it here. TEMP diagnostic for the wm-thread boot crash. */
+	extern const char *g_boot_stage;
+	p = line;
+	p = p_str(p, "boot=");   p = p_str(p, g_boot_stage ? g_boot_stage : "?");
+	p = p_str(p, "  task="); p = p_str(p, sched_current_name());
+	*p = 0; fb_text(x, y, line, fg, bg); y += lh;
+
+	/* Dump a few words around ESP: the smashed thread frame, to see the full
+	 * corruption pattern (e.g. back-buffer pointers + small ints). Reading the
+	 * faulting stack is safe — it is mapped. TEMP. */
+	p = line; p = p_str(p, "stk:");
+	for (int i = -2; i <= 5; i++) {
+		uint32_t a = r->esp + (uint32_t)(i * 4);
+		p = p_str(p, " "); p = p_hex(p, *(volatile uint32_t *)a);
+	}
 	*p = 0; fb_text(x, y, line, fg, bg); y += lh * 2;
 
 	fb_text(x, y, "system halted. photograph this screen.", hi, bg);
@@ -164,22 +183,22 @@ void isr_handler(struct registers *r)
 		sched_exit(139);           /* kill the faulting task; never returns    */
 	}
 
-	vga_set_color(VGA_WHITE, VGA_RED);
-	vga_write("\n*** CPU EXCEPTION: ");
-	vga_write(r->int_no < 32 ? exception_messages[r->int_no] : "Unknown");
-	vga_write(" ***\n");
+	con_set_color(CON_WHITE, CON_RED);
+	con_write("\n*** CPU EXCEPTION: ");
+	con_write(r->int_no < 32 ? exception_messages[r->int_no] : "Unknown");
+	con_write(" ***\n");
 
-	vga_write("  vector="); vga_write_hex(r->int_no);
-	vga_write("  err=");    vga_write_hex(r->err_code);
-	vga_write("  eip=");    vga_write_hex(r->eip);
+	con_write("  vector="); con_write_hex(r->int_no);
+	con_write("  err=");    con_write_hex(r->err_code);
+	con_write("  eip=");    con_write_hex(r->eip);
 
 	if (r->int_no == 14) {         /* page fault: CR2 holds the bad address    */
 		uint32_t cr2;
 		__asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-		vga_write("  cr2="); vga_write_hex(cr2);
+		con_write("  cr2="); con_write_hex(cr2);
 	}
 
-	vga_write("\n  system halted.\n");
+	con_write("\n  system halted.\n");
 
 	panic_screen(r);               /* and a readable version on the framebuffer */
 

@@ -18,19 +18,30 @@
 
 int battery_present(void)
 {
-	/* Presence is fixed for the boot session, but the lookup byte-scans every
-	 * ACPI table, so cache it — neofetch calls this on each render. */
-	static int cached = -1;
-	if (cached >= 0)
-		return cached;
+	/* Does a battery *device* exist in the tables? Fixed for the session and the
+	 * lookup byte-scans every ACPI table, so cache it. */
+	static int has_device = -1;
+	if (has_device < 0) {
+		/* EisaId("PNP0C0A") compresses to these four AML bytes: the manufacturer
+		 * letters P,N,P pack into 0x41,0xD0 and the product id "0C0A" follows. */
+		static const unsigned char eisa[4] = { 0x41, 0xD0, 0x0C, 0x0A };
+		/* Fallback: a few tables store the _HID as a literal ASCII string. */
+		static const unsigned char str[7] = { 'P', 'N', 'P', '0', 'C', '0', 'A' };
+		has_device = acpi_aml_contains(eisa, 4) || acpi_aml_contains(str, 7);
+	}
+	if (!has_device)
+		return 0;
 
-	/* EisaId("PNP0C0A") compresses to these four AML bytes: the manufacturer
-	 * letters P,N,P pack into 0x41,0xD0 and the product id "0C0A" follows. */
-	static const unsigned char eisa[4] = { 0x41, 0xD0, 0x0C, 0x0A };
-	/* Fallback: a few tables store the _HID as a literal ASCII string. */
-	static const unsigned char str[7] = { 'P', 'N', 'P', '0', 'C', '0', 'A' };
-	cached = acpi_aml_contains(eisa, 4) || acpi_aml_contains(str, 7);
-	return cached;
+	/* A device exists. A real, populated battery reports an actual charge via
+	 * _BST/_BIF — trust that outright (it's how this worked on real laptops, and
+	 * real _STA methods are quirky/EC-driven and not always evaluable by our
+	 * best-effort interpreter, so we must not gate on _STA when we have a real
+	 * reading). Only when the charge reads 0/unknown do we consult _STA to weed
+	 * out a phantom: VMware advertises a PNP0C0A whose _BST reports a flat 0% and
+	 * whose _STA says the battery is absent. */
+	if (battery_percent(0, 0) > 0)
+		return 1;
+	return aml_battery_present();
 }
 
 int battery_percent(int *charging, int *discharging)

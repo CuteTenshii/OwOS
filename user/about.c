@@ -24,7 +24,7 @@ int main(void)
 		"launched from the Start menu.",
 	};
 	for (unsigned i = 0; i < sizeof(lines) / sizeof(lines[0]); i++)
-		gfx_text(12, 10 + (int)i * 18, lines[i], i == 0 ? 0x9ad0ff : 0xc8d0dc, BG);
+		gfx_ui_text(12, 10 + (int)i * 18, lines[i], i == 0 ? 0x9ad0ff : 0xc8d0dc);
 	win_present(id);
 
 	for (;;) {

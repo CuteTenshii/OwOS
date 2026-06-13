@@ -59,11 +59,34 @@ void fb_rect(int x, int y, int w, int h, uint32_t color);
  * screen position (x,y). Used by the compositor to blit window buffers. */
 void fb_blit(int x, int y, int w, int h, const uint32_t *src, int src_pitch);
 
-/* Render one 8x16 glyph (CP437 byte) at pixel (x,y). If bg has bit 24 set it
- * is treated as transparent (only foreground pixels are drawn). */
+/* Console glyph cell. The font is an antialiased coverage atlas baked offline
+ * by tools/genfont.c into font_aa.h; change these and you must re-bake. The
+ * console grid geometry in app_term.c follows automatically via these names. */
+#define FONT_W 9
+#define FONT_H 18
+
+/* Render one FONT_W x FONT_H glyph (CP437 byte) at pixel (x,y), alpha-blending
+ * the atlas coverage between fg and bg. If bg has bit 24 set it is transparent
+ * (the coverage is blended over whatever is already in the back buffer). */
 #define FB_TRANSPARENT 0x01000000u
 void fb_glyph(int x, int y, unsigned char ch, uint32_t fg, uint32_t bg);
-/* Draw a NUL-terminated string of 8x16 glyphs left to right. */
+/* Draw a NUL-terminated string of glyphs left to right (FONT_W advance). */
 void fb_text(int x, int y, const char *s, uint32_t fg, uint32_t bg);
+
+/* Proportional sans-serif font for window chrome (titles, taskbar, menus).
+ * Variable per-glyph advance; the cell is UIFONT_W x UIFONT_H but glyphs only
+ * occupy their own width. fb_ui_text blends fg over the existing back-buffer
+ * pixels (fill the background first), so there is no bg argument. fb_ui_width
+ * returns the pixel width of a string for centring / right-alignment. */
+#define UIFONT_W 16
+#define UIFONT_H 18
+void fb_ui_text(int x, int y, const char *s, uint32_t fg);
+int  fb_ui_width(const char *s);
+
+/* Framebuffer boot console: draw one character to a scrolling text console on
+ * the framebuffer. Used during boot (graphics mode, before the WM exists) to
+ * show the verbose bring-up log on screen; vga.c feeds it from its console
+ * funnel while verbose and the compositor isn't up yet. */
+void fb_con_putc(char c);
 
 #endif /* OWOS_FB_H */

@@ -17,7 +17,7 @@
 #include "ext.h"
 #include "pmm.h"
 #include "paging.h"
-#include "vga.h"
+#include "console.h"
 
 enum backend { BK_NONE, BK_IDE, BK_AHCI, BK_NVME, BK_RAM };
 static enum backend backend;
@@ -48,14 +48,14 @@ void blk_init(void)
 	else
 		backend = BK_NONE;
 
-	vga_write("blk: owofs backing device = ");
-	vga_write(blk_backend());
+	con_write("blk: owofs backing device = ");
+	con_write(blk_backend());
 	if (backend != BK_NONE) {
-		vga_write(" (");
-		vga_write(blk_model());
-		vga_write(")");
+		con_write(" (");
+		con_write(blk_model());
+		con_write(")");
 	}
-	vga_putc('\n');
+	con_putc('\n');
 }
 
 int blk_present(void)
@@ -115,13 +115,13 @@ static void announce_vol(const char *source)
 	int ro = hfs_mounted() || ext_mounted();
 	const char *type  = ext_mounted() ? ext_type()  : hfs_mounted() ? hfs_type()  : fat_type();
 	const char *label = ext_mounted() ? ext_label() : hfs_mounted() ? hfs_label() : fat_label();
-	vga_write("vol: mounted ");
-	vga_write(type);
+	con_write("vol: mounted ");
+	con_write(type);
 	if (label[0]) {
-		vga_write(" \""); vga_write(label); vga_write("\"");
+		con_write(" \""); con_write(label); con_write("\"");
 	}
-	vga_write(" on "); vga_write(source);
-	vga_write(ro ? " (ro)\n" : fat_writable() ? " (rw)\n" : " (ro)\n");
+	con_write(" on "); con_write(source);
+	con_write(ro ? " (ro)\n" : fat_writable() ? " (rw)\n" : " (ro)\n");
 }
 
 /* Try every removable FS we support on one device: FAT, then HFS+, then ext. */
@@ -162,7 +162,7 @@ int blk_mount_fat(void)
 		if (mount_removable(dev[i].name, dev[i].r, dev[i].w) == 0)
 			return 0;
 	}
-	vga_write("vol: no FAT/HFS+/ext volume found\n");
+	con_write("vol: no FAT/HFS+/ext volume found\n");
 	return -1;
 }
 

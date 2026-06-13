@@ -7,7 +7,7 @@
 #include "fat.h"
 #include "hfs.h"
 #include "ext.h"
-#include "vga.h"
+#include "console.h"
 #include "rtc.h"
 
 /* A mounted removable volume (FAT via fat.c, HFS+ via hfs.c, or ext2/3/4 via
@@ -264,7 +264,7 @@ void fs_init(void)
 		return;
 	}
 	if (have && blk_is_ide()) {                /* blank IDE dev disk -- make owofs*/
-		vga_write("fs: unformatted IDE disk -- creating owofs.\n");
+		con_write("fs: unformatted IDE disk -- creating owofs.\n");
 		fs_format();
 		return;
 	}
@@ -275,11 +275,11 @@ void fs_init(void)
 	 * volatile RAM-backed filesystem so the system still has a working fs; the
 	 * real disk is only ever read (sector 0 above), never written. */
 	if (blk_use_ram() == 0) {
-		vga_write("fs: no owofs disk -- using RAM (tmpfs; not persistent).\n");
+		con_write("fs: no owofs disk -- using RAM (tmpfs; not persistent).\n");
 		fs_format();                       /* formats + mounts the RAM disk   */
 		return;
 	}
-	vga_write("fs: no disk and RAM fs unavailable.\n");
+	con_write("fs: no disk and RAM fs unavailable.\n");
 	mounted = 0;
 }
 
@@ -290,21 +290,21 @@ static void write_pad(uint32_t v, int width)
 	for (int i = 1; i < width; i++)
 		div *= 10;
 	for (; div > 0; div /= 10)
-		vga_putc((char)('0' + (v / div) % 10));
+		con_putc((char)('0' + (v / div) % 10));
 }
 
 /* Print a packed mtime as "YYYY-MM-DD HH:MM:SS" (see pack_now). */
 static void write_mtime(uint32_t m)
 {
 	if (m == 0) {                          /* never stamped                    */
-		vga_write("       -          ");
+		con_write("       -          ");
 		return;
 	}
-	write_pad(2000 + (m >> 26), 4);    vga_putc('-');
-	write_pad((m >> 22) & 0xF, 2);     vga_putc('-');
-	write_pad((m >> 17) & 0x1F, 2);    vga_putc(' ');
-	write_pad((m >> 12) & 0x1F, 2);    vga_putc(':');
-	write_pad((m >> 6) & 0x3F, 2);     vga_putc(':');
+	write_pad(2000 + (m >> 26), 4);    con_putc('-');
+	write_pad((m >> 22) & 0xF, 2);     con_putc('-');
+	write_pad((m >> 17) & 0x1F, 2);    con_putc(' ');
+	write_pad((m >> 12) & 0x1F, 2);    con_putc(':');
+	write_pad((m >> 6) & 0x3F, 2);     con_putc(':');
 	write_pad(m & 0x3F, 2);
 }
 
@@ -312,33 +312,33 @@ static void write_mtime(uint32_t m)
 static void list_row(int i)
 {
 	write_mtime(dir[i].mtime);
-	vga_write("  ");
+	con_write("  ");
 	if (dir[i].flags & FS_DIR_FLAG)
-		vga_write("   <DIR>");            /* same width as the size column     */
+		con_write("   <DIR>");            /* same width as the size column     */
 	else
 		write_pad(dir[i].size, 8);        /* right-aligned size column         */
-	vga_write("  ");
-	vga_write(dir[i].name);
+	con_write("  ");
+	con_write(dir[i].name);
 	if (dir[i].flags & FS_DIR_FLAG)
-		vga_putc('/');
-	vga_putc('\n');
+		con_putc('/');
+	con_putc('\n');
 }
 
 void fs_list(const char *path)
 {
 	if (!mounted) {
-		vga_write("fs: not mounted\n");
+		con_write("fs: not mounted\n");
 		return;
 	}
 	const char *sub = media_subpath(path);
 	if (sub) {                             /* under the FAT mount -> fat.c      */
 		if (rvol_list(sub) < 0)
-			vga_write("ls: no such file or directory\n");
+			con_write("ls: no such file or directory\n");
 		return;
 	}
 	int d = (path && path[0]) ? find_path(path) : FS_SLOT_ROOT;
 	if (d == -1) {
-		vga_write("ls: no such file or directory\n");
+		con_write("ls: no such file or directory\n");
 		return;
 	}
 	if (d != FS_SLOT_ROOT && !(dir[d].flags & FS_DIR_FLAG)) {
@@ -353,11 +353,11 @@ void fs_list(const char *path)
 			n++;
 		}
 	if (d == FS_SLOT_ROOT && rvol_mounted()) {  /* surface the mount point      */
-		vga_write("       -            <DIR>  " MEDIA_MOUNT "/\n");
+		con_write("       -            <DIR>  " MEDIA_MOUNT "/\n");
 		n++;
 	}
 	if (!n)
-		vga_write("(empty)\n");
+		con_write("(empty)\n");
 }
 
 int fs_read(const char *name, void *buf, uint32_t maxlen)
@@ -855,7 +855,7 @@ int fs_selftest(void)
 	int ok = 1;
 
 	if (fs_prealloc(fn, SZ) != 0) {
-		vga_write("fs selftest: prealloc FAILED\n");
+		con_write("fs selftest: prealloc FAILED\n");
 		return -1;
 	}
 
@@ -863,19 +863,19 @@ int fs_selftest(void)
 	int zeros_ok = (fs_read(fn, buf, SZ) == (int)SZ);
 	for (uint32_t i = 0; i < SZ && zeros_ok; i++)
 		if (buf[i] != 0) zeros_ok = 0;
-	vga_write("  prealloc+zero "); vga_write(zeros_ok ? "PASS\n" : "FAIL\n");
+	con_write("  prealloc+zero "); con_write(zeros_ok ? "PASS\n" : "FAIL\n");
 
 	/* Out-of-order writes: end, start, then across the sector boundary. */
 	int w_ok = 1;
 	w_ok &= fs_write_at(fn, 996, "1234", 4) == 4;   /* last 4 bytes           */
 	w_ok &= fs_write_at(fn, 0,   "ABCD", 4) == 4;   /* partial, sector start  */
 	w_ok &= fs_write_at(fn, 510, "WXYZ", 4) == 4;   /* crosses 512 boundary   */
-	vga_write("  write_at      "); vga_write(w_ok ? "PASS\n" : "FAIL\n");
+	con_write("  write_at      "); con_write(w_ok ? "PASS\n" : "FAIL\n");
 
 	/* A write that would run past EOF must be rejected, not grow the file. */
 	int bounds_ok = (fs_write_at(fn, 998, "XXXX", 4) == -1) &&
 	                (fs_write_at("nope.tmp", 0, "X", 1) == -1);
-	vga_write("  bounds        "); vga_write(bounds_ok ? "PASS\n" : "FAIL\n");
+	con_write("  bounds        "); con_write(bounds_ok ? "PASS\n" : "FAIL\n");
 
 	/* Read the whole file back and check the patches landed and nothing else
 	 * changed. */
@@ -887,10 +887,10 @@ int fs_selftest(void)
 		else if (i >= 996)      want = (uint8_t)"1234"[i - 996];
 		if (buf[i] != want) rb_ok = 0;
 	}
-	vga_write("  readback      "); vga_write(rb_ok ? "PASS\n" : "FAIL\n");
+	con_write("  readback      "); con_write(rb_ok ? "PASS\n" : "FAIL\n");
 
 	ok = zeros_ok && w_ok && bounds_ok && rb_ok;
-	vga_write(ok ? "fs selftest: PASS\n" : "fs selftest: FAIL\n");
+	con_write(ok ? "fs selftest: PASS\n" : "fs selftest: FAIL\n");
 	return ok ? 0 : -1;
 }
 

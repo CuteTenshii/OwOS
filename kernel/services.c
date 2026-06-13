@@ -20,7 +20,7 @@
 #include "tcp.h"
 #include "smb.h"
 #include "rtc.h"
-#include "vga.h"
+#include "console.h"
 #include <stdint.h>
 
 enum svc_state { SVC_STOPPED = 0, SVC_RUNNING };
@@ -66,9 +66,9 @@ static int svc_strlen(const char *s)
 /* Write `s` left-justified in a field `width` columns wide. */
 static void write_field(const char *s, int width)
 {
-	vga_write(s);
+	con_write(s);
 	for (int i = svc_strlen(s); i < width; i++)
-		vga_putc(' ');
+		con_putc(' ');
 }
 
 /* Append `v` (zero-padded to `width`, 0 = no padding) as decimal to out[*pos]. */
@@ -307,9 +307,9 @@ void services_init(void)
 		if (svc[i].autostart && svc_start(&svc[i]) == 0)
 			started++;
 
-	vga_write("services: supervisor up, ");
-	vga_write_dec((uint32_t)started);
-	vga_write(" auto-started.\n");
+	con_write("services: supervisor up, ");
+	con_write_dec((uint32_t)started);
+	con_write(" auto-started.\n");
 }
 
 /* ------------------------------------------------------------------- command */
@@ -317,14 +317,14 @@ void services_init(void)
 static void print_state(const service_t *s)
 {
 	if (s->state == SVC_RUNNING)
-		vga_write("running");
+		con_write("running");
 	else
-		vga_write("stopped");
+		con_write("stopped");
 }
 
 static void cmd_list(void)
 {
-	vga_write("NAME       PORT   STATE    DESCRIPTION\n");
+	con_write("NAME       PORT   STATE    DESCRIPTION\n");
 	for (int i = 0; i < SVC_COUNT; i++) {
 		service_t *s = &svc[i];
 		write_field(s->name, 11);
@@ -338,27 +338,27 @@ static void cmd_list(void)
 			write_field("-", 7);
 		}
 		write_field(s->state == SVC_RUNNING ? "running" : "stopped", 9);
-		vga_write(s->desc);
-		vga_putc('\n');
+		con_write(s->desc);
+		con_putc('\n');
 	}
 }
 
 static void cmd_status(service_t *s)
 {
-	vga_write(s->name);
-	vga_write(": ");
+	con_write(s->name);
+	con_write(": ");
 	print_state(s);
 	if (s->state == SVC_RUNNING) {
-		vga_write(", up ");
-		vga_write_dec(timer_seconds() - s->since);
-		vga_write("s");
-		vga_write(s->port ? ", port " : "");
+		con_write(", up ");
+		con_write_dec(timer_seconds() - s->since);
+		con_write("s");
+		con_write(s->port ? ", port " : "");
 		if (s->port)
-			vga_write_dec(s->port);
-		vga_write(", activity ");
-		vga_write_dec(s->work);
+			con_write_dec(s->port);
+		con_write(", activity ");
+		con_write_dec(s->work);
 	}
-	vga_putc('\n');
+	con_putc('\n');
 }
 
 void services_cmd(const char *args)
@@ -390,38 +390,38 @@ void services_cmd(const char *args)
 	}
 
 	if (*rest == '\0') {
-		vga_write("usage: services [list | start <name> | stop <name> | "
+		con_write("usage: services [list | start <name> | stop <name> | "
 		          "restart <name> | status [name]]\n");
 		return;
 	}
 
 	service_t *s = svc_find(rest);
 	if (!s) {
-		vga_write("services: no such service: ");
-		vga_write(rest);
-		vga_putc('\n');
+		con_write("services: no such service: ");
+		con_write(rest);
+		con_putc('\n');
 		return;
 	}
 
 	if (svc_streq(verb, "start")) {
 		int r = svc_start(s);
-		if (r == 0)      vga_write("started "), vga_write(s->name), vga_putc('\n');
-		else if (r == 1) vga_write(s->name), vga_write(" already running\n");
-		else             vga_write("failed to start "), vga_write(s->name), vga_putc('\n');
+		if (r == 0)      con_write("started "), con_write(s->name), con_putc('\n');
+		else if (r == 1) con_write(s->name), con_write(" already running\n");
+		else             con_write("failed to start "), con_write(s->name), con_putc('\n');
 	} else if (svc_streq(verb, "stop")) {
 		svc_stop(s);
-		vga_write("stopped "), vga_write(s->name), vga_putc('\n');
+		con_write("stopped "), con_write(s->name), con_putc('\n');
 	} else if (svc_streq(verb, "restart")) {
 		svc_stop(s);
 		if (svc_start(s) == 0)
-			vga_write("restarted "), vga_write(s->name), vga_putc('\n');
+			con_write("restarted "), con_write(s->name), con_putc('\n');
 		else
-			vga_write("failed to restart "), vga_write(s->name), vga_putc('\n');
+			con_write("failed to restart "), con_write(s->name), con_putc('\n');
 	} else if (svc_streq(verb, "status")) {
 		cmd_status(s);
 	} else {
-		vga_write("services: unknown subcommand: ");
-		vga_write(verb);
-		vga_putc('\n');
+		con_write("services: unknown subcommand: ");
+		con_write(verb);
+		con_putc('\n');
 	}
 }

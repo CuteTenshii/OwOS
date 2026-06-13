@@ -29,7 +29,7 @@ int main(void)
 			put2(s + 3, (int)((t >> 8) & 0xFF));
 			put2(s + 6, (int)(t & 0xFF));
 			gfx_clear(BG);
-			gfx_text((W - 8 * 8) / 2, (H - 16) / 2, s, 0x66ddff, BG);
+			gfx_ui_text((W - gfx_ui_width(s)) / 2, (H - UIFONT_H) / 2, s, 0x66ddff);
 			win_present(id);
 		}
 		win_wait(id);

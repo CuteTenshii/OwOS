@@ -14,9 +14,6 @@
 /* Spawn /bin/<name> as a detached user process (no wait; the WM reaps it). */
 static void launch_bin(const char *name)
 {
-	uint8_t *buf = kmalloc(64 * 1024);
-	if (!buf)
-		return;
 	char path[64];
 	int j = 0;
 	const char *pfx = "/bin/";
@@ -26,7 +23,15 @@ static void launch_bin(const char *name)
 		path[j++] = name[i];
 	path[j] = '\0';
 
-	int n = fs_read(path, buf, 64 * 1024);
+	/* Size the buffer to the file -- programs are 120+ KiB now, so a fixed 64 KiB
+	 * buffer would truncate the ELF and the load would silently fail. */
+	int sz = fs_size(path);
+	if (sz < 0)
+		return;
+	uint8_t *buf = kmalloc((uint32_t)sz);
+	if (!buf)
+		return;
+	int n = fs_read(path, buf, (uint32_t)sz);
 	char *argv[1];
 	argv[0] = (char *)name;
 	if (n >= 0)
@@ -39,9 +44,11 @@ static void launch_files(void)   { launch_bin("files"); }
 static void launch_clock(void)   { launch_bin("clock"); }
 static void launch_about(void)   { launch_bin("about"); }
 static void launch_browser(void) { launch_bin("browser"); }
+static void launch_term(void)    { launch_bin("term"); }
 
 /* The Start menu. Every entry spawns a ring-3 program from /bin. */
 static const struct { const char *name; void (*launch)(void); } app_menu[] = {
+	{ "Terminal", launch_term     },
 	{ "Files",   launch_files     },
 	{ "Editor",  launch_editor    },
 	{ "Browser", launch_browser   },
@@ -67,5 +74,9 @@ void apps_menu_launch(int i)
 
 void apps_start(void)
 {
-	app_term_init();   /* only the terminal opens at boot; the rest via Start */
+	/* The terminal is now the ring-3 /bin/term (a real user-space shell), opened
+	 * at boot like a Start-menu app. The old kernel-side app_term window is no
+	 * longer created; the kernel shell (shell.c) still drives the serial console
+	 * for `make debug`. */
+	launch_bin("term");
 }

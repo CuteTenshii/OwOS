@@ -1,6 +1,13 @@
 /* gfx.c — user-space drawing into a window's shared pixel buffer. See gfx.h. */
 #include "gfx.h"
-#include "font8x16.h"
+#include "font_aa.h"
+#include "font_ui.h"
+
+/* The GUI keeps the legacy 8x16 cell (app layouts depend on it); only the glyph
+ * pixels gained antialiasing. font_aa is an 8-bit coverage atlas baked offline
+ * by tools/genfont.c — change these and re-bake to match. */
+#define GFX_FONT_W 8
+#define GFX_FONT_H 16
 
 static unsigned *g_fb;
 static int       g_w, g_h;
@@ -36,36 +43,86 @@ void gfx_rect(int x, int y, int w, int h, unsigned color)
 	gfx_fill_rect(x + w - 1, y, 1, h, color);
 }
 
+/* Blend fg over bg by coverage a (0..255), per channel. */
+static unsigned gfx_blend(unsigned fg, unsigned bg, unsigned a)
+{
+	if (a == 0)   return bg;
+	if (a == 255) return fg;
+	unsigned ia = 255 - a;
+	unsigned r = (((fg >> 16) & 0xff) * a + ((bg >> 16) & 0xff) * ia) / 255;
+	unsigned g = (((fg >>  8) & 0xff) * a + ((bg >>  8) & 0xff) * ia) / 255;
+	unsigned b = ((fg & 0xff) * a + (bg & 0xff) * ia) / 255;
+	return (r << 16) | (g << 8) | b;
+}
+
 void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg)
 {
-	const unsigned char *gl = font8x16[ch];
 	int transparent = (bg & GFX_TRANSPARENT) != 0;
-	for (int row = 0; row < 16; row++) {
+	for (int row = 0; row < GFX_FONT_H; row++) {
 		int sy = y + row;
 		if ((unsigned)sy >= (unsigned)g_h)
 			continue;
-		unsigned char bits = gl[row];
-		for (int col = 0; col < 8; col++) {
+		const unsigned char *cov = font_aa[ch][row];
+		for (int col = 0; col < GFX_FONT_W; col++) {
 			int sx = x + col;
 			if ((unsigned)sx >= (unsigned)g_w)
 				continue;
-			if (bits & (0x80 >> col))
-				g_fb[sy * g_w + sx] = fg;
-			else if (!transparent)
-				g_fb[sy * g_w + sx] = bg;
+			unsigned a = cov[col];
+			if (a == 0 && transparent)
+				continue;
+			unsigned *px = &g_fb[sy * g_w + sx];
+			*px = transparent ? gfx_blend(fg, *px, a) : gfx_blend(fg, bg, a);
 		}
 	}
 }
 
 void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg)
 {
-	for (; *s; s++, x += 8)
+	for (; *s; s++, x += GFX_FONT_W)
 		gfx_glyph(x, y, (unsigned char)*s, fg, bg);
 }
 
-/* --------------------------------------------------------------- GUI widgets */
+/* Proportional sans-serif UI font (chrome only). Blends fg over the existing
+ * pixels — fill the background first — and advances per glyph. See gfx.h. */
+static void gfx_ui_glyph(int x, int y, unsigned char ch, unsigned fg)
+{
+	for (int row = 0; row < UIFONT_H; row++) {
+		int sy = y + row;
+		if ((unsigned)sy >= (unsigned)g_h)
+			continue;
+		const unsigned char *cov = font_ui[ch][row];
+		for (int col = 0; col < UIFONT_W; col++) {
+			int sx = x + col;
+			if ((unsigned)sx >= (unsigned)g_w)
+				continue;
+			unsigned a = cov[col];
+			if (a) {
+				unsigned *px = &g_fb[sy * g_w + sx];
+				*px = gfx_blend(fg, *px, a);
+			}
+		}
+	}
+}
 
-static int wstrlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+int gfx_ui_width(const char *s)
+{
+	int w = 0;
+	for (; *s; s++)
+		w += font_ui_adv[(unsigned char)*s];
+	return w;
+}
+
+int gfx_ui_cw(unsigned char c) { return font_ui_adv[c]; }
+
+void gfx_ui_text(int x, int y, const char *s, unsigned fg)
+{
+	for (; *s; s++) {
+		gfx_ui_glyph(x, y, (unsigned char)*s, fg);
+		x += font_ui_adv[(unsigned char)*s];
+	}
+}
+
+/* --------------------------------------------------------------- GUI widgets */
 
 void status_set(struct status_bar *s, const char *msg)
 {
@@ -79,7 +136,7 @@ void status_draw(const struct status_bar *s, int x, int y, int w,
                  unsigned fg, unsigned bg)
 {
 	gfx_fill_rect(x, y, w, GUI_BAR_H, bg);
-	gfx_text(x + 6, y + 1, s->msg, fg, bg);
+	gfx_ui_text(x + 6, y + (GUI_BAR_H - UIFONT_H) / 2, s->msg, fg);
 }
 
 #define MENU_BG    0x2a3342u    /* dropdown background                         */
@@ -112,13 +169,13 @@ static void menu_popup(const struct menu *m, int px, int py)
 		unsigned fg = dis ? MENU_DIM : MENU_FG;
 		if (fl & MENU_CHECKED)
 			menu_check(px + 2, ry, dis ? MENU_DIM : 0x8fd98f);
-		gfx_text(px + 6 + gutter, ry, m->items[i], fg, MENU_BG);
+		gfx_ui_text(px + 6 + gutter, ry, m->items[i], fg);
 		if (m->subs && m->subs[i])               /* submenu: a right arrow (►)  */
 			gfx_glyph(px + GUI_MENU_W - 12, ry, 0x10, fg, MENU_BG);
 		else if (m->hints && m->hints[i] && m->hints[i][0]) {
-			int hw = wstrlen(m->hints[i]) * 8;
-			gfx_text(px + GUI_MENU_W - 6 - hw, ry, m->hints[i],
-			         dis ? MENU_DIM : 0x8a93a0, MENU_BG);
+			int hw = gfx_ui_width(m->hints[i]);
+			gfx_ui_text(px + GUI_MENU_W - 6 - hw, ry, m->hints[i],
+			            dis ? MENU_DIM : 0x8a93a0);
 		}
 	}
 	gfx_rect(px, py, GUI_MENU_W, m->n * GUI_ROW_H, 0x05070a);
@@ -130,10 +187,10 @@ static void menu_popup(const struct menu *m, int px, int py)
 void menu_draw(const struct menu *m, int x, int y)
 {
 	unsigned bg = m->open ? 0x3a4a60 : 0x232a36;
-	int tw = wstrlen(m->title) * 8 + 6;
+	int tw = gfx_ui_width(m->title) + 6;
 	if (m->open)
 		gfx_fill_rect(x, y, tw, GUI_BAR_H, bg);
-	gfx_text(x + 3, y + 1, m->title, 0xe0e6ee, bg);
+	gfx_ui_text(x + 3, y + (GUI_BAR_H - UIFONT_H) / 2, m->title, 0xe0e6ee);
 	if (m->open)
 		menu_popup(m, x, y + GUI_BAR_H);
 }
@@ -183,7 +240,7 @@ int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **le
 {
 	if (leaf)
 		*leaf = 0;
-	int tw = wstrlen(m->title) * 8 + 6;
+	int tw = gfx_ui_width(m->title) + 6;
 	if (my >= y && my < y + GUI_BAR_H) {        /* the title row */
 		m->open = (mx >= x && mx < x + tw) ? !m->open : 0;
 		if (!m->open)
@@ -256,7 +313,7 @@ static int menubar_title_x(const struct menubar *mb, int i)
 {
 	int x = mb->x;
 	for (int k = 0; k < i; k++)
-		x += wstrlen(mb->menus[k]->title) * 8 + 6 + MENUBAR_GAP;
+		x += gfx_ui_width(mb->menus[k]->title) + 6 + MENUBAR_GAP;
 	return x;
 }
 
@@ -291,7 +348,7 @@ int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *i
 	if (my >= mb->y && my < mb->y + GUI_BAR_H) {
 		for (int i = 0; i < mb->n; i++) {
 			int x = menubar_title_x(mb, i);
-			int tw = wstrlen(mb->menus[i]->title) * 8 + 6;
+			int tw = gfx_ui_width(mb->menus[i]->title) + 6;
 			if (mx >= x && mx < x + tw) {
 				int wasopen = mb->menus[i]->open;
 				menubar_close(mb);
@@ -364,18 +421,24 @@ static int tabbar_new_x(int x, int w, int n, int tw)
 	return nx;
 }
 
-/* Draw `s` clipped to maxpx pixels, appending ".." when it doesn't fit. */
+/* Draw `s` (proportional UI font) clipped to maxpx pixels, appending ".." when
+ * it doesn't fit. Truncation measures real pixel widths, not a char count. */
 static void tab_label(int x, int y, const char *s, int maxpx, unsigned fg)
 {
-	int maxc = maxpx / 8;
-	if (maxc < 1) maxc = 1;
-	if (wstrlen(s) <= maxc) { gfx_text(x, y, s, fg, GFX_TRANSPARENT); return; }
+	if (gfx_ui_width(s) <= maxpx) { gfx_ui_text(x, y, s, fg); return; }
 	char buf[40];
 	int k = 0;
-	for (int i = 0; i < maxc - 2 && k < (int)sizeof buf - 3 && s[i]; i++)
+	int dots = font_ui_adv['.'] * 2;
+	int w = 0;
+	for (int i = 0; s[i] && k < (int)sizeof buf - 3; i++) {
+		int aw = font_ui_adv[(unsigned char)s[i]];
+		if (w + aw + dots > maxpx)
+			break;
 		buf[k++] = s[i];
+		w += aw;
+	}
 	buf[k++] = '.'; buf[k++] = '.'; buf[k] = '\0';
-	gfx_text(x, y, buf, fg, GFX_TRANSPARENT);
+	gfx_ui_text(x, y, buf, fg);
 }
 
 /* A small 7x7 "×" centred on (cx,cy). */
@@ -391,7 +454,7 @@ void tabbar_draw(int x, int y, int w, const char *const *labels, int n, int acti
 {
 	gfx_fill_rect(x, y, w, GUI_TAB_H, TAB_STRIP_BG);
 	int tw = tabbar_each_w(w, n);
-	int ty = y + (GUI_TAB_H - 16) / 2;
+	int ty = y + (GUI_TAB_H - UIFONT_H) / 2;
 	for (int i = 0; i < n; i++) {
 		int tx = x + i * tw;
 		int on = (i == active);
@@ -408,7 +471,7 @@ void tabbar_draw(int x, int y, int w, const char *const *labels, int n, int acti
 			             on ? 0x707880 : 0x8a93a0);
 	}
 	int nx = tabbar_new_x(x, w, n, tw);
-	gfx_text(nx + (TAB_NEW_W - 8) / 2, ty, "+", 0xc8d0dc, GFX_TRANSPARENT);
+	gfx_ui_text(nx + (TAB_NEW_W - gfx_ui_width("+")) / 2, ty, "+", 0xc8d0dc);
 }
 
 int tabbar_hit(int x, int y, int w, int n, int mx, int my, int *index)

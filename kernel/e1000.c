@@ -29,7 +29,7 @@
 #include "irq.h"
 #include "heap.h"
 #include "paging.h"
-#include "vga.h"
+#include "console.h"
 #include "fb.h"
 #include "io.h"
 
@@ -65,8 +65,8 @@ static inline void irq_restore(uint32_t f)
 static void print_hex2(uint8_t v)
 {
 	static const char h[] = "0123456789abcdef";
-	vga_putc(h[v >> 4]);
-	vga_putc(h[v & 0xF]);
+	con_putc(h[v >> 4]);
+	con_putc(h[v & 0xF]);
 }
 
 /* ----------------------------------------------------------- register file */
@@ -298,37 +298,19 @@ static inline uint32_t reg_read(uint32_t off)
 static char     diag[1024];
 static unsigned diag_len;
 static unsigned line_start;            /* index in diag where this line began   */
-static int      mark_y = 8;            /* next framebuffer log row (pixels)     */
 
-/* Paint one completed log line straight to the framebuffer and present it. On a
- * laptop the probe runs before the WM, and fb_adopt has already put the panel in
- * graphics mode, so the 0xB8000 text mirror is invisible — this is what actually
- * shows on screen. No-op in text mode (fb_active() == 0), where the mirror in
- * dlog() handles visibility. Drawn *as each line completes*, so if the next
- * step stalls the CPU on a dead MMIO cycle, the last line on the panel names
- * exactly where it died. */
-static void fb_line(const char *s)
-{
-	if (!fb_active())
-		return;
-	fb_clip_full();
-	fb_text(8, mark_y, s, 0x33ff66, 0x000000);
-	fb_present();
-	mark_y += 16;
-	if (mark_y > (int)fb_height() - 32)
-		mark_y = 8;
-}
-
-/* Append to the diagnostic log; mirror to the text console (serial + 0xB8000)
- * and, on each newline, render the finished line to the framebuffer. */
+/* Append to the diagnostic log (kept for the `ethdiag` command) and mirror to
+ * the console funnel. con_putc handles on-screen visibility for every mode: the
+ * 0xB8000 text grid in text mode, and the framebuffer boot console (fb_con_putc)
+ * in graphics mode when verbose — so the NIC bring-up shows on a laptop panel
+ * the same single way every other subsystem's log does, with no NIC-specific
+ * framebuffer drawing of its own. */
 static void dlog(const char *s)
 {
 	while (*s) {
 		char c = *s++;
-		vga_putc(c);
+		con_putc(c);
 		if (c == '\n') {
-			diag[diag_len] = 0;
-			fb_line(&diag[line_start]);
 			if (diag_len < sizeof(diag) - 1)
 				diag[diag_len++] = '\n';
 			line_start = diag_len;
@@ -1207,19 +1189,19 @@ static int e1000_probe(void)
 
 	present = 1;
 
-	vga_write("net: Intel ");
-	vga_write(model_name(device_id));
-	vga_write(" at mmio ");
-	vga_write_hex(mmio_phys);
-	vga_write(" irq ");
-	vga_write_dec(irq);
-	vga_write(" mac ");
+	con_write("net: Intel ");
+	con_write(model_name(device_id));
+	con_write(" at mmio ");
+	con_write_hex(mmio_phys);
+	con_write(" irq ");
+	con_write_dec(irq);
+	con_write(" mac ");
 	for (int i = 0; i < 6; i++) {
 		print_hex2(mac[i]);
 		if (i < 5)
-			vga_putc(':');
+			con_putc(':');
 	}
-	vga_putc('\n');
+	con_putc('\n');
 
 	/* Record the outcome into the diagnostic log too — on a laptop the summary
 	 * above scrolls past invisibly, so `ethdiag` is how it's read back. */
@@ -1246,7 +1228,7 @@ static int e1000_probe(void)
 void e1000_txtest(void)
 {
 	if (!present) {
-		vga_write("txtest: no NIC\n");
+		con_write("txtest: no NIC\n");
 		return;
 	}
 
@@ -1283,10 +1265,10 @@ void e1000_txtest(void)
 	reg_write(E1000_RCTL, save_rctl & ~0xC0u);  /* clear LBM (no MAC loopback)    */
 	pch_mdelay(20);
 
-	vga_write("txtest(PHY lb): TCTL="); vga_write_hex(reg_read(E1000_TCTL));
-	vga_write(" CTRL=");             vga_write_hex(reg_read(E1000_CTRL));
-	vga_write(" STATUS=");           vga_write_hex(reg_read(E1000_STATUS));
-	vga_putc('\n');
+	con_write("txtest(PHY lb): TCTL="); con_write_hex(reg_read(E1000_TCTL));
+	con_write(" CTRL=");             con_write_hex(reg_read(E1000_CTRL));
+	con_write(" STATUS=");           con_write_hex(reg_read(E1000_STATUS));
+	con_putc('\n');
 
 	(void)reg_read(E1000_GPTC);                 /* clear-on-read: zero counters    */
 	(void)reg_read(E1000_TPT);
@@ -1298,12 +1280,12 @@ void e1000_txtest(void)
 	e1000_send(frame, 60);
 	pch_mdelay(50);
 
-	vga_write("txtest(PHY lb): TDH="); vga_write_dec(reg_read(E1000_TDH));
-	vga_write(" TDT=");              vga_write_dec(reg_read(E1000_TDT));
-	vga_write(" GPTC=");             vga_write_dec(reg_read(E1000_GPTC));
-	vga_write(" TPT=");              vga_write_dec(reg_read(E1000_TPT));
-	vga_write(" status=");           vga_write_hex(tx_ring[slot].status);
-	vga_putc('\n');
+	con_write("txtest(PHY lb): TDH="); con_write_dec(reg_read(E1000_TDH));
+	con_write(" TDT=");              con_write_dec(reg_read(E1000_TDT));
+	con_write(" GPTC=");             con_write_dec(reg_read(E1000_GPTC));
+	con_write(" TPT=");              con_write_dec(reg_read(E1000_TPT));
+	con_write(" status=");           con_write_hex(tx_ring[slot].status);
+	con_putc('\n');
 
 	/* Take the PHY back out of loopback. */
 	if (phy_id && phy_acquire() == 0) {
@@ -1317,74 +1299,74 @@ void e1000_txtest(void)
 void e1000_diag(void)
 {
 	if (diag_len == 0) {
-		vga_write("ethdiag: no Intel NIC probed\n");
+		con_write("ethdiag: no Intel NIC probed\n");
 		return;
 	}
-	vga_write(diag);
+	con_write(diag);
 	if (!present)
 		return;
 
 	uint32_t st = reg_read(E1000_STATUS);
 	static const char *const spd[] = { "10", "100", "1000", "1000" };
-	vga_write("live: STATUS=");
-	vga_write_hex(st);
-	vga_write((st & STATUS_LU) ? " link UP " : " link DOWN ");
+	con_write("live: STATUS=");
+	con_write_hex(st);
+	con_write((st & STATUS_LU) ? " link UP " : " link DOWN ");
 	if (st & STATUS_LU) {
-		vga_write(spd[(st >> 6) & 3]);
-		vga_write((st & 1) ? "Mb FD" : "Mb HD");
+		con_write(spd[(st >> 6) & 3]);
+		con_write((st & 1) ? "Mb FD" : "Mb HD");
 	}
-	vga_putc('\n');
+	con_putc('\n');
 
 	/* Hardware packet counters (clear-on-read, so this shows traffic since the
 	 * last ethdiag). TX>0 means frames really left the MAC; RX>0 means frames
 	 * really arrived — together they localize a "no traffic" fault to TX, RX, or
 	 * the link/peer. */
-	vga_write("  tx: good=");      vga_write_dec(reg_read(E1000_GPTC));
-	vga_write(" total=");          vga_write_dec(reg_read(E1000_TPT));
-	vga_write("  rx: good=");      vga_write_dec(reg_read(E1000_GPRC));
-	vga_write(" total=");          vga_write_dec(reg_read(E1000_TPR));
-	vga_write("\n  rx errors: missed="); vga_write_dec(reg_read(E1000_MPC));
-	vga_write(" crc=");            vga_write_dec(reg_read(E1000_CRCERRS));
-	vga_write("\n  rings: RDH="); vga_write_dec(reg_read(E1000_RDH));
-	vga_write(" RDT=");            vga_write_dec(reg_read(E1000_RDT));
-	vga_write(" TDH=");            vga_write_dec(reg_read(E1000_TDH));
-	vga_write(" TDT=");            vga_write_dec(reg_read(E1000_TDT));
-	vga_write("\n  regs: CTRL=");  vga_write_hex(reg_read(E1000_CTRL));
-	vga_write(" TCTL=");           vga_write_hex(reg_read(E1000_TCTL));
-	vga_write(" RCTL=");           vga_write_hex(reg_read(E1000_RCTL));
-	vga_write(" CTRL_EXT=");       vga_write_hex(reg_read(E1000_CTRL_EXT));
-	vga_write(" FWSM=");           vga_write_hex(reg_read(E1000_FWSM));
-	vga_write("\n  tx ring: TDBAL="); vga_write_hex(reg_read(E1000_TDBAL));
-	vga_write(" TDLEN=");          vga_write_dec(reg_read(E1000_TDLEN));
-	vga_write(" TXDCTL=");         vga_write_hex(reg_read(E1000_TXDCTL));
-	vga_write("\n  rx ring: RDBAL="); vga_write_hex(reg_read(E1000_RDBAL));
-	vga_write(" RDLEN=");          vga_write_dec(reg_read(E1000_RDLEN));
-	vga_write(" RXDCTL=");         vga_write_hex(reg_read(E1000_RXDCTL));
+	con_write("  tx: good=");      con_write_dec(reg_read(E1000_GPTC));
+	con_write(" total=");          con_write_dec(reg_read(E1000_TPT));
+	con_write("  rx: good=");      con_write_dec(reg_read(E1000_GPRC));
+	con_write(" total=");          con_write_dec(reg_read(E1000_TPR));
+	con_write("\n  rx errors: missed="); con_write_dec(reg_read(E1000_MPC));
+	con_write(" crc=");            con_write_dec(reg_read(E1000_CRCERRS));
+	con_write("\n  rings: RDH="); con_write_dec(reg_read(E1000_RDH));
+	con_write(" RDT=");            con_write_dec(reg_read(E1000_RDT));
+	con_write(" TDH=");            con_write_dec(reg_read(E1000_TDH));
+	con_write(" TDT=");            con_write_dec(reg_read(E1000_TDT));
+	con_write("\n  regs: CTRL=");  con_write_hex(reg_read(E1000_CTRL));
+	con_write(" TCTL=");           con_write_hex(reg_read(E1000_TCTL));
+	con_write(" RCTL=");           con_write_hex(reg_read(E1000_RCTL));
+	con_write(" CTRL_EXT=");       con_write_hex(reg_read(E1000_CTRL_EXT));
+	con_write(" FWSM=");           con_write_hex(reg_read(E1000_FWSM));
+	con_write("\n  tx ring: TDBAL="); con_write_hex(reg_read(E1000_TDBAL));
+	con_write(" TDLEN=");          con_write_dec(reg_read(E1000_TDLEN));
+	con_write(" TXDCTL=");         con_write_hex(reg_read(E1000_TXDCTL));
+	con_write("\n  rx ring: RDBAL="); con_write_hex(reg_read(E1000_RDBAL));
+	con_write(" RDLEN=");          con_write_dec(reg_read(E1000_RDLEN));
+	con_write(" RXDCTL=");         con_write_hex(reg_read(E1000_RXDCTL));
 
 	/* Read the first TX descriptor back from memory: did the NIC write DD (bit0
 	 * of status) into it (= it processed/transmitted it) or never touch it (=
 	 * engine frozen)? And TARC0, the TX arbiter/queue-enable register. */
 	if (tx_ring) {
-		vga_write("\n  txd0: addr=");  vga_write_hex((uint32_t)tx_ring[0].addr);
-		vga_write(" len=");            vga_write_dec(tx_ring[0].length);
-		vga_write(" cmd=");            vga_write_hex(tx_ring[0].cmd);
-		vga_write(" status=");         vga_write_hex(tx_ring[0].status);
-		vga_write(" TARC0=");          vga_write_hex(reg_read(E1000_TARC0));
+		con_write("\n  txd0: addr=");  con_write_hex((uint32_t)tx_ring[0].addr);
+		con_write(" len=");            con_write_dec(tx_ring[0].length);
+		con_write(" cmd=");            con_write_hex(tx_ring[0].cmd);
+		con_write(" status=");         con_write_hex(tx_ring[0].status);
+		con_write(" TARC0=");          con_write_hex(reg_read(E1000_TARC0));
 	}
 
 	/* Scan MDIO addresses for the PHY (reg 2 = PHY ID1). A real Intel PHY answers
 	 * ~0x0154 at its address; all-zero/FFFF everywhere means MDIO isn't reaching
 	 * the PHY (interconnect likely stuck in SMBus, not PCIe) — the suspected
 	 * reason the link is degraded to 10Mb and TX won't run. */
-	vga_write("\n  phy scan (reg2):");
+	con_write("\n  phy scan (reg2):");
 	for (int a = 0; a < 4; a++) {
 		int v = phy_read((uint8_t)a, 2);
-		vga_write(" ");
-		vga_write_dec(a);
-		vga_putc(':');
-		vga_write_hex(v < 0 ? 0xFFFFFFFFu : (uint32_t)v);
+		con_write(" ");
+		con_write_dec(a);
+		con_putc(':');
+		con_write_hex(v < 0 ? 0xFFFFFFFFu : (uint32_t)v);
 	}
-	vga_putc('\n');
+	con_putc('\n');
 }
 
 /* Link state for the IP stack to gate DHCP on: real copper takes a couple of

@@ -2,7 +2,7 @@
 
 #include "pmm.h"
 #include "multiboot.h"
-#include "vga.h"
+#include "console.h"
 
 #define FRAME_SIZE     PMM_FRAME_SIZE
 #define MAX_FRAMES     (1u << 20)      /* support up to 4 GiB                 */
@@ -48,7 +48,7 @@ void pmm_init(const struct multiboot_info *mbi)
 {
 	/* Without a memory map we can't know what's safe; refuse to guess. */
 	if (!(mbi->flags & MULTIBOOT_FLAG_MMAP)) {
-		vga_write("pmm: no multiboot memory map -- cannot init.\n");
+		con_write("pmm: no multiboot memory map -- cannot init.\n");
 		return;
 	}
 

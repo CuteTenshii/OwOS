@@ -15,7 +15,9 @@
 #include "paging.h"
 #include "pmm.h"
 #include "heap.h"
-#include "font8x16.h"
+#include "mtrr.h"
+#include "font_aa.h"
+#include "font_ui.h"
 
 /* DISPI index/data ports and register indices. */
 #define VBE_DISPI_INDEX   0x01CE
@@ -133,6 +135,11 @@ static void enable_wc(void)
 	/* Drop any cached lines for the framebuffer, then switch it to WC. */
 	__asm__ volatile ("wbinvd" ::: "memory");
 	paging_mark_wc((uint32_t)front, fb_pixels * 4);
+
+	/* PAT alone isn't enough on real UEFI hardware: a firmware MTRR can mark the
+	 * framebuffer UC, which overrides PAT-WC and leaves every store slow. Pin the
+	 * range WC with a variable MTRR too (no-op under QEMU / without MTRRs). */
+	mtrr_set_wc((uint32_t)front, fb_pixels * 4);
 }
 
 static void dispi_write(uint16_t index, uint16_t value)
@@ -381,23 +388,34 @@ void fb_blit(int x, int y, int w, int h, const uint32_t *src, int src_pitch)
 	mark(cx, cy, cw, ch);
 }
 
+/* Blend src (0..255 per channel) over dst by coverage a (0..255). */
+static inline uint32_t blend(uint32_t fg, uint32_t bg, unsigned a)
+{
+	if (a == 0)   return bg;
+	if (a == 255) return fg;
+	unsigned ia = 255 - a;
+	unsigned r = (((fg >> 16) & 0xff) * a + ((bg >> 16) & 0xff) * ia) / 255;
+	unsigned g = (((fg >>  8) & 0xff) * a + ((bg >>  8) & 0xff) * ia) / 255;
+	unsigned b = ((fg & 0xff) * a + (bg & 0xff) * ia) / 255;
+	return (r << 16) | (g << 8) | b;
+}
+
 void fb_glyph(int x, int y, unsigned char ch, uint32_t fg, uint32_t bg)
 {
 	int cx, cy, cw, chh;
-	if (!clip(x, y, 8, 16, &cx, &cy, &cw, &chh))
+	if (!clip(x, y, FONT_W, FONT_H, &cx, &cy, &cw, &chh))
 		return;
-	const unsigned char *g = font8x16[ch];
 	int transparent = (bg & FB_TRANSPARENT) != 0;
 	for (int row = 0; row < chh; row++) {
 		int sy = cy + row;
-		unsigned char bits = g[sy - y];
+		const unsigned char *cov = font_aa[ch][sy - y];
 		uint32_t *d = fb + sy * (int)fb_pitch;
 		for (int col = 0; col < cw; col++) {
 			int sx = cx + col;
-			if (bits & (0x80 >> (sx - x)))
-				d[sx] = fg;
-			else if (!transparent)
-				d[sx] = bg;
+			unsigned a = cov[sx - x];
+			/* Transparent bg: blend the coverage straight over the pixel
+			 * already in the (cached) back buffer; opaque bg: fg over bg. */
+			d[sx] = transparent ? blend(fg, d[sx], a) : blend(fg, bg, a);
 		}
 	}
 	mark(cx, cy, cw, chh);
@@ -405,6 +423,103 @@ void fb_glyph(int x, int y, unsigned char ch, uint32_t fg, uint32_t bg)
 
 void fb_text(int x, int y, const char *s, uint32_t fg, uint32_t bg)
 {
-	for (; *s; s++, x += 8)
+	for (; *s; s++, x += FONT_W)
 		fb_glyph(x, y, (unsigned char)*s, fg, bg);
+}
+
+/* --- framebuffer boot console -------------------------------------------------
+ * A scrolling text console drawn straight to the framebuffer, used during boot
+ * (in graphics mode, before the window manager exists) so the verbose bring-up
+ * log is visible on screen. In graphics mode the 0xB8000 text the VGA driver
+ * writes isn't shown and the compositor isn't up yet, so without this only code
+ * that drew the framebuffer directly (the old e1000 fb_line) appeared. vga.c
+ * feeds this one char at a time when verbose logging is on; it goes quiet once
+ * the WM takes the framebuffer (vga.c stops calling it). */
+
+#define CON_MARGIN 4
+static int con_x = CON_MARGIN, con_y = CON_MARGIN;
+
+static void fb_con_newline(void)
+{
+	con_x = CON_MARGIN;
+	con_y += FONT_H;
+	if (con_y + FONT_H <= (int)fb_h)
+		return;
+	/* Scroll the back buffer up one text row and clear the new bottom row. */
+	uint32_t move = fb_h - FONT_H;
+	for (uint32_t y = 0; y < move; y++)
+		for (uint32_t x = 0; x < fb_w; x++)
+			fb[y * fb_pitch + x] = fb[(y + FONT_H) * fb_pitch + x];
+	for (uint32_t y = move; y < fb_h; y++)
+		for (uint32_t x = 0; x < fb_w; x++)
+			fb[y * fb_pitch + x] = 0x000000;
+	con_y -= FONT_H;
+	/* Push the whole back buffer to the visible framebuffer (the scroll touched
+	 * every row, so a damage-rect present won't do). single mode draws straight
+	 * to `front`, so the back-buffer scroll above is already on screen. */
+	if (!single) {
+		int dim = brightness < FB_BRIGHT_MAX;
+		for (uint32_t y = 0; y < fb_h; y++) {
+			const uint32_t *s = fb + y * fb_pitch;
+			uint32_t *d = front + y * fb_pitch;
+			for (uint32_t x = 0; x < fb_w; x++)
+				d[x] = dim ? dim_px(s[x]) : s[x];
+		}
+		__asm__ volatile ("sfence" ::: "memory");
+	}
+}
+
+void fb_con_putc(char c)
+{
+	if (!active)
+		return;
+	if (c == '\r') return;
+	if (c == '\n') { fb_con_newline(); return; }
+	if (c == '\t') { do { fb_con_putc(' '); } while (((con_x - CON_MARGIN) / FONT_W) % 8); return; }
+	if (c == '\b') { if (con_x > CON_MARGIN) con_x -= FONT_W; return; }
+	if (con_x + FONT_W > (int)fb_w)
+		fb_con_newline();
+	fb_clip_full();
+	fb_glyph(con_x, con_y, (unsigned char)c, 0x33ff66, 0x000000);  /* green on black */
+	fb_present();                  /* copies just the glyph's damage rect          */
+	con_x += FONT_W;
+}
+
+/* --- Proportional UI font (sans-serif) for window chrome. Always blends fg
+ * over whatever is already in the back buffer (callers fill the bar first), so
+ * it has no bg parameter and overlapping advances compose cleanly. --- */
+
+static void fb_ui_glyph(int x, int y, unsigned char ch, uint32_t fg)
+{
+	int cx, cy, cw, chh;
+	if (!clip(x, y, UIFONT_W, UIFONT_H, &cx, &cy, &cw, &chh))
+		return;
+	for (int row = 0; row < chh; row++) {
+		int sy = cy + row;
+		const unsigned char *cov = font_ui[ch][sy - y];
+		uint32_t *d = fb + sy * (int)fb_pitch;
+		for (int col = 0; col < cw; col++) {
+			int sx = cx + col;
+			unsigned a = cov[sx - x];
+			if (a)
+				d[sx] = blend(fg, d[sx], a);
+		}
+	}
+	mark(cx, cy, cw, chh);
+}
+
+int fb_ui_width(const char *s)
+{
+	int w = 0;
+	for (; *s; s++)
+		w += font_ui_adv[(unsigned char)*s];
+	return w;
+}
+
+void fb_ui_text(int x, int y, const char *s, uint32_t fg)
+{
+	for (; *s; s++) {
+		fb_ui_glyph(x, y, (unsigned char)*s, fg);
+		x += font_ui_adv[(unsigned char)*s];
+	}
 }

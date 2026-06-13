@@ -23,7 +23,7 @@
 #include "ahci.h"
 #include "pci.h"
 #include "paging.h"
-#include "vga.h"
+#include "console.h"
 
 /* ------------------------------------------------------- HBA / port registers */
 
@@ -256,14 +256,14 @@ void ahci_init(void)
 {
 	uint8_t bus, slot, func;
 	if (!find_controller(&bus, &slot, &func)) {
-		vga_write("ahci: no SATA controller found\n");
+		con_write("ahci: no SATA controller found\n");
 		return;
 	}
 
 	/* ABAR is BAR5 (config offset 0x24): the MMIO register block. */
 	uint32_t bar5 = pci_read32(bus, slot, func, 0x24) & 0xFFFFFFF0u;
 	if (!bar5) {
-		vga_write("ahci: controller has no MMIO base\n");
+		con_write("ahci: controller has no MMIO base\n");
 		return;
 	}
 
@@ -273,7 +273,7 @@ void ahci_init(void)
 
 	/* The register block sits above the 16 MiB identity map; map it in. */
 	if (paging_identity_map(bar5, 0x2000) != 0) {
-		vga_write("ahci: could not map MMIO\n");
+		con_write("ahci: could not map MMIO\n");
 		return;
 	}
 	abar = (volatile uint32_t *)bar5;
@@ -298,7 +298,7 @@ void ahci_init(void)
 		break;
 	}
 	if (chosen < 0) {
-		vga_write("ahci: controller present but no SATA disk attached\n");
+		con_write("ahci: controller present but no SATA disk attached\n");
 		return;
 	}
 	port = chosen;
@@ -310,7 +310,7 @@ void ahci_init(void)
 	ctab = palloc();
 	dbuf = palloc();
 	if (!clb || !fis || !ctab || !dbuf) {
-		vga_write("ahci: out of DMA frames\n");
+		con_write("ahci: out of DMA frames\n");
 		return;
 	}
 
@@ -327,17 +327,17 @@ void ahci_init(void)
 	found = 1;
 	cap_sectors = identify_drive();
 
-	vga_write("ahci: SATA disk on port ");
-	vga_write_dec((uint32_t)port);
+	con_write("ahci: SATA disk on port ");
+	con_write_dec((uint32_t)port);
 	if (model[0]) {
-		vga_write(" [");
-		vga_write(model);
-		vga_putc(']');
+		con_write(" [");
+		con_write(model);
+		con_putc(']');
 	}
 	if (cap_sectors) {
-		vga_write(", ");
-		vga_write_dec(cap_sectors / 2048);    /* 512-B sectors -> MiB           */
-		vga_write(" MiB");
+		con_write(", ");
+		con_write_dec(cap_sectors / 2048);    /* 512-B sectors -> MiB           */
+		con_write(" MiB");
 	}
-	vga_putc('\n');
+	con_putc('\n');
 }

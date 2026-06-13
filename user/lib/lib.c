@@ -36,6 +36,13 @@
 #define SYS_STREAM_BEGIN 32
 #define SYS_STREAM_WRITE 33
 #define SYS_STREAM_END   34
+#define SYS_MKDIR      35
+#define SYS_RMDIR      36
+#define SYS_DELETE     37
+#define SYS_RENAME     38
+#define SYS_STAT       39
+#define SYS_SPAWN      40
+#define SYS_SHELL      41
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -203,6 +210,29 @@ unsigned now_hms(void)
 int readdir(const char *path, int idx, struct dirent_u *out)
 {
 	return syscall(SYS_READDIR, (int)path, idx, (int)out);
+}
+
+int mkdir(const char *path)  { return syscall(SYS_MKDIR,  (int)path, 0, 0); }
+int rmdir(const char *path)  { return syscall(SYS_RMDIR,  (int)path, 0, 0); }
+int unlink(const char *path) { return syscall(SYS_DELETE, (int)path, 0, 0); }
+int rename(const char *old, const char *neu)
+{
+	return syscall(SYS_RENAME, (int)old, (int)neu, 0);
+}
+
+int stat(const char *path, struct statinfo *out)
+{
+	return syscall(SYS_STAT, (int)path, (int)out, 0);
+}
+
+int spawn(const char *path, const char *arg)
+{
+	return syscall(SYS_SPAWN, (int)path, (int)arg, 0);
+}
+
+int shell_cmd(const char *cmd, char *out, int max)
+{
+	return syscall(SYS_SHELL, (int)cmd, (int)out, max);
 }
 
 int volumes(int idx, struct volinfo *out)

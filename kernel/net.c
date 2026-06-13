@@ -23,7 +23,8 @@
 #include "tcp.h"
 #include "tls.h"
 #include "timer.h"
-#include "vga.h"
+#include "console.h"
+#include "log.h"
 #include "fs.h"
 #include "kstring.h"
 #include "url.h"
@@ -700,9 +701,9 @@ static int parse_ipv4(const char *s, uint8_t out[4])
 static void print_ip(const uint8_t ip[4])
 {
 	for (int i = 0; i < 4; i++) {
-		vga_write_dec(ip[i]);
+		con_write_dec(ip[i]);
 		if (i < 3)
-			vga_putc('.');
+			con_putc('.');
 	}
 }
 
@@ -831,15 +832,31 @@ static int dhcp_run(void)
 	return 0;
 }
 
+/* Format an IP into the journal (not the screen unless verbose) -- the klog
+ * counterpart of print_ip, for the async boot path below. */
+static void klog_ip(const uint8_t ip[4])
+{
+	for (int i = 0; i < 4; i++) {
+		klog_dec(ip[i]);
+		if (i < 3)
+			klog(".");
+	}
+}
+
 static void dhcp_thread(void)
 {
+	/* This is the boot lease, completing asynchronously in its own thread --
+	 * possibly long after the shell owns the console. Log it to the journal
+	 * (shown live only under `verbose`) rather than con_write, so it doesn't
+	 * land in the middle of the user's terminal. The `dhcp` command path
+	 * (net_dhcp_now) still prints normally; the user asked for that one. */
 	if (dhcp_run() == 0) {
-		vga_write("dhcp: ip ");  print_ip(my_ip);
-		vga_write(" gw ");       print_ip(gw_ip);
-		vga_write(" dns ");      print_ip(dns_ip);
-		vga_putc('\n');
+		klog("dhcp: ip ");  klog_ip(my_ip);
+		klog(" gw ");       klog_ip(gw_ip);
+		klog(" dns ");      klog_ip(dns_ip);
+		klog("\n");
 	} else {
-		vga_write("dhcp: no lease\n");
+		klog("dhcp: no lease\n");
 	}
 	for (;;)                                     /* threads can't be reaped     */
 		timer_sleep(60000);
@@ -863,17 +880,17 @@ void net_dhcp_start(void)
 int net_dhcp_now(void)
 {
 	if (!nic_present()) {
-		vga_write("dhcp: no NIC\n");
+		con_write("dhcp: no NIC\n");
 		return -1;
 	}
 	if (dhcp_run() == 0) {
-		vga_write("dhcp: ip ");  print_ip(my_ip);
-		vga_write(" gw ");       print_ip(gw_ip);
-		vga_write(" dns ");      print_ip(dns_ip);
-		vga_putc('\n');
+		con_write("dhcp: ip ");  print_ip(my_ip);
+		con_write(" gw ");       print_ip(gw_ip);
+		con_write(" dns ");      print_ip(dns_ip);
+		con_putc('\n');
 		return 0;
 	}
-	vga_write(nic_link_up() ? "dhcp: no lease (link up)\n"
+	con_write(nic_link_up() ? "dhcp: no lease (link up)\n"
 	                        : "dhcp: no lease (link down)\n");
 	return -1;
 }
@@ -882,11 +899,11 @@ int net_dhcp_now(void)
 static void print_rtt(uint32_t us)
 {
 	uint32_t frac = us % 1000;
-	vga_write_dec(us / 1000);
-	vga_putc('.');
-	vga_putc('0' + (char)(frac / 100));
-	vga_putc('0' + (char)((frac / 10) % 10));
-	vga_putc('0' + (char)(frac % 10));
+	con_write_dec(us / 1000);
+	con_putc('.');
+	con_putc('0' + (char)(frac / 100));
+	con_putc('0' + (char)((frac / 10) % 10));
+	con_putc('0' + (char)(frac % 10));
 }
 
 /* Send a query of the given type for `host` and wait for the reply, retrying a
@@ -976,7 +993,7 @@ static const char *dig_type_name(uint16_t t)
 int net_dig(const char *arg)
 {
 	if (!nic_present()) {
-		vga_write("dig: no network device\n");
+		con_write("dig: no network device\n");
 		return -1;
 	}
 
@@ -994,32 +1011,32 @@ int net_dig(const char *arg)
 	if (*arg) {
 		qtype = dig_type_num(arg);
 		if (qtype == 0) {
-			vga_write("dig: unknown type (A, AAAA, NS, CNAME, MX, TXT, PTR, SOA)\n");
+			con_write("dig: unknown type (A, AAAA, NS, CNAME, MX, TXT, PTR, SOA)\n");
 			return -1;
 		}
 	}
 	if (host[0] == '\0') {
-		vga_write("dig: usage: dig <host> [type]\n");
+		con_write("dig: usage: dig <host> [type]\n");
 		return -1;
 	}
 
 	if (!dns_query(host, qtype)) {
-		vga_write(";; no response from ");
+		con_write(";; no response from ");
 		print_ip(dns_ip);
-		vga_write("#53\n");
+		con_write("#53\n");
 		return -1;
 	}
 
-	vga_write("; OwOS dig  ");
-	vga_write(host);
-	vga_write("  ");
-	vga_write(dig_type_name(qtype));
-	vga_putc('\n');
+	con_write("; OwOS dig  ");
+	con_write(host);
+	con_write("  ");
+	con_write(dig_type_name(qtype));
+	con_putc('\n');
 
 	if (dns_ans_count == 0) {
-		vga_write(";; no records\n");
+		con_write(";; no records\n");
 	} else {
-		vga_write(";; ANSWER SECTION:\n");
+		con_write(";; ANSWER SECTION:\n");
 		for (int i = 0; i < dns_ans_count; i++) {
 			char tx[DNS_TEXT];
 			for (int k = 0; k < DNS_TEXT; k++) {
@@ -1029,22 +1046,22 @@ int net_dig(const char *arg)
 			}
 			tx[DNS_TEXT - 1] = '\0';
 
-			vga_write(host);
-			vga_write(".  ");
-			vga_write_dec(dns_ans_ttl[i]);
-			vga_write("  IN  ");
-			vga_write(dig_type_name(dns_ans_type[i]));
-			vga_write("  ");
-			vga_write(tx);
-			vga_putc('\n');
+			con_write(host);
+			con_write(".  ");
+			con_write_dec(dns_ans_ttl[i]);
+			con_write("  IN  ");
+			con_write(dig_type_name(dns_ans_type[i]));
+			con_write("  ");
+			con_write(tx);
+			con_putc('\n');
 		}
 	}
 
-	vga_write(";; Query time: ");
+	con_write(";; Query time: ");
 	print_rtt(dns_rtt_us);
-	vga_write(" ms   server ");
+	con_write(" ms   server ");
 	print_ip(dns_ip);
-	vga_write("#53\n");
+	con_write("#53\n");
 	return dns_ans_count > 0 ? 0 : -1;
 }
 
@@ -1143,14 +1160,14 @@ static void curl_emit(int save, int b)
 		uint8_t bb = (uint8_t)b;
 		fs_stream_write(&bb, 1);
 	} else {
-		vga_putc((char)b);
+		con_putc((char)b);
 	}
 }
 
 int net_curl(const char *arg)
 {
 	if (!nic_present()) {
-		vga_write("curl: no network device\n");
+		con_write("curl: no network device\n");
 		return -1;
 	}
 
@@ -1173,7 +1190,7 @@ int net_curl(const char *arg)
 				method[m++] = *arg++;
 			method[m] = '\0';
 			if (m == 0) {
-				vga_write("curl: -X needs a method\n");
+				con_write("curl: -X needs a method\n");
 				return -1;
 			}
 		} else if (arg[1] == 'o' && (arg[2] == ' ' || arg[2] == '\0')) {
@@ -1185,7 +1202,7 @@ int net_curl(const char *arg)
 				outname[m++] = *arg++;
 			outname[m] = '\0';
 			if (m == 0) {
-				vga_write("curl: -o needs a filename\n");
+				con_write("curl: -o needs a filename\n");
 				return -1;
 			}
 			save = 1;
@@ -1198,7 +1215,7 @@ int net_curl(const char *arg)
 
 	struct url u;
 	if (!url_parse(arg, &u)) {
-		vga_write("curl: could not parse URL\n");
+		con_write("curl: could not parse URL\n");
 		return -1;
 	}
 	const char *host = u.host;
@@ -1218,9 +1235,9 @@ int net_curl(const char *arg)
 
 	uint8_t ip[4];
 	if (!parse_ipv4(host, ip) && !dns_resolve(host, ip)) {
-		vga_write("curl: could not resolve host: ");
-		vga_write(host);
-		vga_putc('\n');
+		con_write("curl: could not resolve host: ");
+		con_write(host);
+		con_putc('\n');
 		return -1;
 	}
 	int ok;
@@ -1231,9 +1248,9 @@ int net_curl(const char *arg)
 		ok = curl_conn != NULL;
 	}
 	if (!ok) {
-		vga_write("curl: failed to connect to ");
+		con_write("curl: failed to connect to ");
 		print_ip(ip);
-		vga_putc('\n');
+		con_putc('\n');
 		return -1;
 	}
 
@@ -1259,7 +1276,7 @@ int net_curl(const char *arg)
 	for (;;) {
 		int ci = curl_getc();
 		if (ci < 0) {
-			vga_write("curl: no response from server\n");
+			con_write("curl: no response from server\n");
 			if (use_tls)
 				tls_close();
 			else
@@ -1281,7 +1298,7 @@ int net_curl(const char *arg)
 	hdr[hlen] = '\0';
 
 	if (show_headers)
-		vga_write(hdr);
+		con_write(hdr);
 
 	/* HTTP/1.1 body framing: chunked takes precedence over Content-Length,
 	 * which takes precedence over read-until-close. */
@@ -1313,9 +1330,9 @@ int net_curl(const char *arg)
 	}
 
 	if (save && fs_stream_begin(outname) != 0) {
-		vga_write("curl: cannot open output file ");
-		vga_write(outname);
-		vga_putc('\n');
+		con_write("curl: cannot open output file ");
+		con_write(outname);
+		con_putc('\n');
 		if (use_tls)
 			tls_close();
 		else
@@ -1331,7 +1348,7 @@ int net_curl(const char *arg)
 	if (gz) {
 		curl_gzbuf = kmalloc(CURL_GZ_MAX);
 		if (!curl_gzbuf) {
-			vga_write("curl: out of memory for gzip body\n");
+			con_write("curl: out of memory for gzip body\n");
 			if (use_tls)
 				tls_close();
 			else
@@ -1392,7 +1409,7 @@ body_done:
 		curl_gz = 0;                   /* curl_emit now really emits      */
 		int failed = 0;
 		if (curl_gzof) {
-			vga_write("curl: gzip body exceeds 1 MiB limit\n");
+			con_write("curl: gzip body exceeds 1 MiB limit\n");
 			failed = 1;
 		} else {
 			int orig = gzip_orig_size(curl_gzbuf, curl_gzn);
@@ -1403,7 +1420,7 @@ body_done:
 						  (uint32_t)orig)
 				: -1;
 			if (dn < 0) {
-				vga_write("curl: gzip decode failed\n");
+				con_write("curl: gzip decode failed\n");
 				failed = 1;
 			} else {
 				for (int i = 0; i < dn; i++)
@@ -1423,18 +1440,18 @@ body_done:
 	if (save) {
 		int wrote = fs_stream_end();
 		if (wrote < 0) {
-			vga_write("curl: failed to save ");
-			vga_write(outname);
-			vga_write(" (disk full or write error)\n");
+			con_write("curl: failed to save ");
+			con_write(outname);
+			con_write(" (disk full or write error)\n");
 			return -1;
 		}
-		vga_write("curl: saved ");
-		vga_write_dec((uint32_t)wrote);
-		vga_write(" bytes to ");
-		vga_write(outname);
-		vga_putc('\n');
+		con_write("curl: saved ");
+		con_write_dec((uint32_t)wrote);
+		con_write(" bytes to ");
+		con_write(outname);
+		con_putc('\n');
 	} else if (!curl_mem) {
-		vga_putc('\n');
+		con_putc('\n');
 	}
 	return 0;
 }
@@ -1548,25 +1565,25 @@ int net_sock_close(int h)
 int net_ping(const char *host)
 {
 	if (!nic_present()) {
-		vga_write("ping: no network device\n");
+		con_write("ping: no network device\n");
 		return -1;
 	}
 
 	uint8_t ip[4];
 	if (!parse_ipv4(host, ip)) {
 		if (!dns_resolve(host, ip)) {
-			vga_write("ping: cannot resolve ");
-			vga_write(host);
-			vga_putc('\n');
+			con_write("ping: cannot resolve ");
+			con_write(host);
+			con_putc('\n');
 			return -1;
 		}
 	}
 
-	vga_write("PING ");
-	vga_write(host);
-	vga_write(" (");
+	con_write("PING ");
+	con_write(host);
+	con_write(" (");
 	print_ip(ip);
-	vga_write("): 32 data bytes\n");
+	con_write("): 32 data bytes\n");
 
 	uint16_t id = (uint16_t)(timer_ticks() ^ 0xBEEF);
 	int recv = 0;
@@ -1595,30 +1612,30 @@ int net_ping(const char *host)
 
 		if (got) {
 			recv++;
-			vga_write("64 bytes from ");
+			con_write("64 bytes from ");
 			print_ip((const uint8_t *)icmp_from);
-			vga_write(": icmp_seq=");
-			vga_write_dec((uint32_t)icmp_seq_rx);
-			vga_write(" time=");
+			con_write(": icmp_seq=");
+			con_write_dec((uint32_t)icmp_seq_rx);
+			con_write(" time=");
 			print_rtt(icmp_rtt_us);
-			vga_write(" ms\n");
+			con_write(" ms\n");
 		} else {
-			vga_write("request timeout for icmp_seq=");
-			vga_write_dec((uint32_t)seq);
-			vga_putc('\n');
+			con_write("request timeout for icmp_seq=");
+			con_write_dec((uint32_t)seq);
+			con_putc('\n');
 		}
 
 		if (seq < 4)
 			timer_sleep(300);
 	}
 
-	vga_write("--- ");
-	vga_write(host);
-	vga_write(" ping statistics ---\n");
-	vga_write_dec(4);
-	vga_write(" packets transmitted, ");
-	vga_write_dec((uint32_t)recv);
-	vga_write(" received\n");
+	con_write("--- ");
+	con_write(host);
+	con_write(" ping statistics ---\n");
+	con_write_dec(4);
+	con_write(" packets transmitted, ");
+	con_write_dec((uint32_t)recv);
+	con_write(" received\n");
 	return recv > 0 ? 0 : -1;
 }
 
@@ -1654,8 +1671,8 @@ static void unix_to_rtc(uint32_t secs, struct rtc_time *t)
 static void ntp_print2(uint8_t v)
 {
 	if (v < 10)
-		vga_putc('0');
-	vga_write_dec(v);
+		con_putc('0');
+	con_write_dec(v);
 }
 
 /* Query an SNTP server, then set the CMOS clock from its reply. `arg` may carry
@@ -1664,7 +1681,7 @@ static void ntp_print2(uint8_t v)
 int net_ntp(const char *arg)
 {
 	if (!nic_present()) {
-		vga_write("ntp: no network device\n");
+		con_write("ntp: no network device\n");
 		return -1;
 	}
 
@@ -1703,9 +1720,9 @@ int net_ntp(const char *arg)
 	uint8_t ip[4];
 	if (!parse_ipv4(host, ip)) {
 		if (!dns_resolve(host, ip)) {
-			vga_write("ntp: cannot resolve ");
-			vga_write(host);
-			vga_putc('\n');
+			con_write("ntp: cannot resolve ");
+			con_write(host);
+			con_putc('\n');
 			return -1;
 		}
 	}
@@ -1734,14 +1751,14 @@ int net_ntp(const char *arg)
 	}
 
 	if (!ntp_got) {
-		vga_write("ntp: no reply from ");
-		vga_write(host);
-		vga_putc('\n');
+		con_write("ntp: no reply from ");
+		con_write(host);
+		con_putc('\n');
 		return -1;
 	}
 
 	if (ntp_secs < NTP_UNIX_DELTA) {     /* pre-1970: bogus / era-rollover     */
-		vga_write("ntp: implausible timestamp\n");
+		con_write("ntp: implausible timestamp\n");
 		return -1;
 	}
 
@@ -1749,14 +1766,14 @@ int net_ntp(const char *arg)
 	unix_to_rtc(ntp_secs - NTP_UNIX_DELTA + (uint32_t)tz_secs, &t);
 	rtc_set(&t);
 
-	vga_write("clock set: ");
-	vga_write_dec(t.year);  vga_putc('-');
-	ntp_print2(t.month);    vga_putc('-');
-	ntp_print2(t.day);      vga_putc(' ');
-	ntp_print2(t.hour);     vga_putc(':');
-	ntp_print2(t.min);      vga_putc(':');
+	con_write("clock set: ");
+	con_write_dec(t.year);  con_putc('-');
+	ntp_print2(t.month);    con_putc('-');
+	ntp_print2(t.day);      con_putc(' ');
+	ntp_print2(t.hour);     con_putc(':');
+	ntp_print2(t.min);      con_putc(':');
 	ntp_print2(t.sec);
-	vga_write(tz_secs ? " (local)\n" : " UTC\n");
+	con_write(tz_secs ? " (local)\n" : " UTC\n");
 	return 0;
 }
 
@@ -1764,5 +1781,5 @@ void net_init(void)
 {
 	nic_init();
 	if (nic_present())
-		vga_write("net: ip 10.0.2.15 gw 10.0.2.2 dns 10.0.2.3 (try 'ping google.com')\n");
+		con_write("net: ip 10.0.2.15 gw 10.0.2.2 dns 10.0.2.3 (try 'ping google.com')\n");
 }

@@ -378,9 +378,10 @@ static void render(void)
 		apnd(rstat, &rp, sizeof rstat, ", Col ");
 		apnd_uint(rstat, &rp, sizeof rstat, (unsigned)(curx + 1));
 		apnd(rstat, &rp, sizeof rstat, has_high ? "  UTF-8" : "  ASCII");
-		int rx = W - 6 - rp * COL_W;
+		(void)rp;
+		int rx = W - 6 - gfx_ui_width(rstat);
 		if (rx < 6) rx = 6;
-		gfx_text(rx, sy + 1, rstat, 0x9fb0c4, 0x161d28);
+		gfx_ui_text(rx, sy + (GUI_BAR_H - UIFONT_H) / 2, rstat, 0x9fb0c4);
 	}
 
 	/* The File menu, drawn last so its dropdown overlays the text. */

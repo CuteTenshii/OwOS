@@ -29,6 +29,7 @@
 #define WEV_RESIZE 4                   /* a,b: new client w,h (app opted in)    */
 #define WEV_DBLCLICK 5                 /* a,b: client x,y of a double click     */
 #define WEV_RCLICK 6                   /* a,b: client x,y of a right click      */
+#define WEV_SCROLL 7                   /* a: mouse-wheel delta (+up / -down)    */
 
 struct win_event {
 	uint32_t type;

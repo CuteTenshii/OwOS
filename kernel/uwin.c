@@ -129,6 +129,17 @@ static void uw_key(struct window *w, char c)
 		evq_push(u, WEV_KEY, (unsigned char)c, 0);
 }
 
+/* Mouse wheel over the window: the WM already routes wheel deltas to the
+ * focused window's scroll callback; forward them as an event so a ring-3 app
+ * (the terminal) can scroll its own content. `dz` is +up / -down. */
+static void uw_scroll(struct window *w, int mx, int my, int dz)
+{
+	struct uwin *u = w->state;
+	(void)mx; (void)my;
+	if (u)
+		evq_push(u, WEV_SCROLL, dz, 0);
+}
+
 static uint32_t uw_dirty(struct window *w)
 {
 	struct uwin *u = w->state;
@@ -277,6 +288,7 @@ int uwin_create(int w, int h, const char *title)
 	win->click = uw_click;
 	win->rclick = uw_rclick;
 	win->key = uw_key;
+	win->scroll = uw_scroll;
 	win->dirty = uw_dirty;
 	win->on_close = uw_on_close;
 	win->state = u;

@@ -2,7 +2,7 @@
 
 #include "pci.h"
 #include "io.h"
-#include "vga.h"
+#include "console.h"
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -283,42 +283,42 @@ static void put_hex(uint32_t value, int digits)
 {
 	static const char h[] = "0123456789abcdef";
 	for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-		vga_putc(h[(value >> shift) & 0xF]);
+		con_putc(h[(value >> shift) & 0xF]);
 }
 
 void pci_list(void)
 {
 	if (device_count == 0) {
-		vga_write("no PCI devices found\n");
+		con_write("no PCI devices found\n");
 		return;
 	}
-	vga_write("bus:slot.fn vendor:device class description\n");
+	con_write("bus:slot.fn vendor:device class description\n");
 	for (int i = 0; i < device_count; i++) {
 		struct pci_device *d = &devices[i];
-		put_hex(d->bus, 2);  vga_putc(':');
-		put_hex(d->slot, 2); vga_putc('.');
+		put_hex(d->bus, 2);  con_putc(':');
+		put_hex(d->slot, 2); con_putc('.');
 		put_hex(d->func, 1);
-		vga_write("    ");
-		put_hex(d->vendor, 4); vga_putc(':');
+		con_write("    ");
+		put_hex(d->vendor, 4); con_putc(':');
 		put_hex(d->device, 4);
-		vga_write("   ");
+		con_write("   ");
 		put_hex(d->class_code, 2);
 		put_hex(d->subclass, 2);
-		vga_write("  ");
+		con_write("  ");
 		/* Prefer the exact chip name; otherwise "<Vendor> <class>"; otherwise
 		 * just the class. So a known card reads "Realtek RTL8139 Fast
 		 * Ethernet", an unknown one "Intel Network controller". */
 		const char *model  = device_model(d->vendor, d->device);
 		const char *vendor = vendor_name(d->vendor);
 		if (model) {
-			if (vendor) { vga_write(vendor); vga_putc(' '); }
-			vga_write(model);
+			if (vendor) { con_write(vendor); con_putc(' '); }
+			con_write(model);
 		} else if (vendor) {
-			vga_write(vendor); vga_putc(' ');
-			vga_write(class_name(d->class_code, d->subclass));
+			con_write(vendor); con_putc(' ');
+			con_write(class_name(d->class_code, d->subclass));
 		} else {
-			vga_write(class_name(d->class_code, d->subclass));
+			con_write(class_name(d->class_code, d->subclass));
 		}
-		vga_putc('\n');
+		con_putc('\n');
 	}
 }

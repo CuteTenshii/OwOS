@@ -19,9 +19,9 @@ CFLAGS  := -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
            -mno-sse -mno-mmx -Wall -Wextra -Ikernel
 LDFLAGS := -m32 -ffreestanding -nostdlib -no-pie -T linker.ld
 
-OBJS    := boot/boot.o kernel/kernel.o kernel/vga.o kernel/gdt.o kernel/gdt_flush.o \
+OBJS    := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flush.o \
            kernel/idt.o kernel/isr.o kernel/irq.o kernel/irq_stubs.o \
-           kernel/keyboard.o kernel/timer.o kernel/shell.o kernel/serial.o \
+           kernel/keyboard.o kernel/timer.o kernel/shell.o kernel/serial.o kernel/log.o \
            kernel/pmm.o kernel/paging.o kernel/heap.o kernel/kstring.o \
            kernel/sched.o kernel/switch.o \
            kernel/ata.o kernel/ahci.o kernel/nvme.o kernel/blk.o kernel/fs.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/pci.o kernel/usb.o kernel/xhci.o \
@@ -33,12 +33,12 @@ OBJS    := boot/boot.o kernel/kernel.o kernel/vga.o kernel/gdt.o kernel/gdt_flus
            kernel/firmware.o kernel/smbios.o kernel/aml.o kernel/edid.o \
            kernel/syscall.o kernel/loader.o kernel/pipe.o kernel/services.o \
            kernel/smb.o \
-           kernel/fb.o kernel/mouse.o kernel/wm.o kernel/uwin.o kernel/crash.o \
-           kernel/apps.o kernel/app_term.o \
+           kernel/fb.o kernel/mtrr.o kernel/mouse.o kernel/wm.o kernel/uwin.o kernel/crash.o \
+           kernel/apps.o \
            kernel/edit_blob.o kernel/curl_blob.o \
            kernel/editor_blob.o kernel/about_blob.o \
            kernel/clock_blob.o kernel/files_blob.o kernel/browser_blob.o \
-           kernel/imgview_blob.o kernel/crashme_blob.o
+           kernel/imgview_blob.o kernel/crashme_blob.o kernel/term_blob.o
 
 # Which NIC QEMU attaches. Default rtl8139 (QEMU's classic card); override to
 # exercise the Intel driver, e.g. `make run NIC=e1000` (82540EM) — both the
@@ -177,10 +177,15 @@ debug: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK)
 # gfxpayload=keep: that would force the kernel to inherit GRUB's console mode
 # (often 24bpp), overriding the kernel's multiboot2 32bpp framebuffer request,
 # which fb_adopt needs (it only handles 32-bpp XRGB).
+#
+# The kernel command line carries `verbose` so the ISO (the real-VM / bare-metal
+# path) shows the bring-up log on screen by default — the boot output is the
+# first thing you want when a real machine misbehaves. The QEMU -kernel targets
+# stay quiet (no `verbose` in their -append); the log is always in the journal.
 $(ISO): $(KERNEL)
 	mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/$(KERNEL)
-	printf 'set timeout=0\nset default=0\ninsmod all_video\nset gfxmode=1920x1080x32,1366x768x32,1280x1024x32,1024x768x32,800x600x32,auto\nmenuentry "OwOS" {\n\tinsmod all_video\n\tmultiboot2 /boot/$(KERNEL)\n\tboot\n}\n' \
+	printf 'set timeout=0\nset default=0\ninsmod all_video\nset gfxmode=1920x1080x32,1366x768x32,1280x1024x32,1024x768x32,800x600x32,auto\nmenuentry "OwOS" {\n\tinsmod all_video\n\tmultiboot2 /boot/$(KERNEL) verbose\n\tboot\n}\n' \
 		> $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) $(ISODIR)
 

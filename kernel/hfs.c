@@ -12,7 +12,7 @@
 #include <stddef.h>
 
 #include "hfs.h"
-#include "vga.h"
+#include "console.h"
 #include "kstring.h"
 
 /* ------------------------------------------------------------- BE readers */
@@ -34,7 +34,7 @@ static void put_u32(uint32_t v)
 	char b[11]; int i = 10; b[i--] = '\0';
 	if (!v) b[i--] = '0';
 	while (v) { b[i--] = (char)('0' + v % 10); v /= 10; }
-	vga_write(&b[i + 1]);
+	con_write(&b[i + 1]);
 }
 
 /* --------------------------------------------------------------- state */
@@ -477,11 +477,11 @@ static int visit_list(const struct catrec *c, void *vp)
 
 	if (L->want_idx < 0) {                    /* print mode */
 		struct obj o; rec_to_obj(c, &o);
-		vga_write(o.is_dir ? "  <DIR>  " : "         ");
-		if (!o.is_dir) { put_u32((uint32_t)o.size); vga_write("  "); }
-		else           { vga_write("  "); }
-		vga_write(nm);
-		vga_putc('\n');
+		con_write(o.is_dir ? "  <DIR>  " : "         ");
+		if (!o.is_dir) { put_u32((uint32_t)o.size); con_write("  "); }
+		else           { con_write("  "); }
+		con_write(nm);
+		con_putc('\n');
 		return 0;
 	}
 	/* index mode */

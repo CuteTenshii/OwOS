@@ -19,6 +19,12 @@ struct aml_battery {
  * be evaluated. Safe to call repeatedly; the namespace is parsed once. */
 int aml_read_battery(struct aml_battery *out);
 
+/* Returns 0 only if the battery device's _STA positively reports the battery
+ * absent (bit 4 clear) — e.g. VMware's phantom battery. Returns 1 when _STA is
+ * missing or can't be evaluated (assume present; never suppress a real battery
+ * we just can't query). The caller still byte-scans for the _HID first. */
+int aml_battery_present(void);
+
 /* A short human-readable note on why the last aml_read_battery() returned 0
  * (e.g. "unsupported opcode 0xA4", "_BST not found"). For diagnostics on real
  * hardware where this can't be tested locally. Empty string after success. */

@@ -211,9 +211,9 @@ static void draw_image(int px, int py, int pw, int ph, unsigned bg)
 	struct rawrd r = { 0 };
 	unsigned iw = 0, ih = 0;
 	if (upng_dimensions(rawrd_get, &r, &iw, &ih) != 0 || !iw || !ih) {
-		gfx_text(px + 8, py + 8,
-		         "Cannot decode image (unreadable or oversized interlaced PNG).",
-		         0xb04040, bg);
+		gfx_ui_text(px + 8, py + 8,
+		            "Cannot decode image (unreadable or oversized interlaced PNG).",
+		            0xb04040);
 		return;
 	}
 	struct imgblit v;
@@ -335,15 +335,19 @@ static void render(void)
 	int fx = 6, fy = MENU_H + TAB_H + 4, fw = BW - 12, fh = ADDR_H - 8;
 	gfx_fill_rect(fx, fy, fw, fh, 0xffffff);
 	gfx_rect(fx, fy, fw, fh, 0x000000);
-	int maxc = (fw - 8) / GLYPH_W; if (maxc < 1) maxc = 1;
+	/* Show the tail of the URL that fits the field (proportional), with a caret. */
+	int avail = fw - 8 - gfx_ui_cw('_');
+	int al = B->addr_len, off = 0, ww = 0;
+	for (int i = al - 1; i >= 0; i--) {
+		ww += gfx_ui_cw((unsigned char)B->addr[i]);
+		if (ww > avail) { off = i + 1; break; }
+	}
 	char shown[300];
-	int al = B->addr_len, off = 0;
-	if (al > maxc - 1) off = al - (maxc - 1);
 	int sc = 0;
 	for (int i = off; i < al && sc < (int)sizeof shown - 2; i++) shown[sc++] = B->addr[i];
 	shown[sc++] = '_';
 	shown[sc] = '\0';
-	gfx_text(fx + 4, fy + (fh - GLYPH_H) / 2, shown, 0x101418, 0xffffff);
+	gfx_ui_text(fx + 4, fy + (fh - UIFONT_H) / 2, shown, 0x101418);
 
 	/* content pane */
 	int py = MENU_H + TAB_H + ADDR_H, pw = BW - SCROLL_W;
@@ -353,7 +357,7 @@ static void render(void)
 
 	if (B->mode == MODE_IMAGE) {
 		if (B->loading)
-			gfx_text(8, py + 8, "Loading ...", 0x4060a0, bg);
+			gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
 		else
 			draw_image(0, py, pw, phh, bg);
 		gfx_fill_rect(pw, py, SCROLL_W, phh, 0xc8ccd2);  /* inert scrollbar */
@@ -361,11 +365,11 @@ static void render(void)
 		int cols = (pw - 8) / GLYPH_W;
 		rewrap(cols);
 		if (B->loading && B->nlines == 0) {
-			gfx_text(8, py + 8, "Loading ...", 0x4060a0, bg);
+			gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
 		} else if (B->nlines == 0) {
-			gfx_text(8, py + 8, "Type a URL above and press Enter.", 0x707880, bg);
-			gfx_text(8, py + 8 + GLYPH_H, "e.g. example.com  or  https://example.com",
-			         0x9098a0, bg);
+			gfx_ui_text(8, py + 8, "Type a URL above and press Enter.", 0x707880);
+			gfx_ui_text(8, py + 8 + UIFONT_H, "e.g. example.com  or  https://example.com",
+			            0x9098a0);
 		}
 		for (int r = 0; r < rows; r++) {
 			int idx = B->scroll + r;
@@ -397,14 +401,18 @@ static void render(void)
 	/* status line */
 	int sy = BH - STATUS_H;
 	gfx_fill_rect(0, sy, BW, STATUS_H, 0x222831);
-	int smaxc = (BW - 12) / GLYPH_W;
+	/* Keep the visible tail of the status within the bar (proportional). */
+	int savail = BW - 12;
+	int sl = slen(B->status), so = 0, sw = 0;
+	for (int i = sl - 1; i >= 0; i--) {
+		sw += gfx_ui_cw((unsigned char)B->status[i]);
+		if (sw > savail) { so = i + 1; break; }
+	}
 	char st[200];
-	int sl = slen(B->status), so = 0;
-	if (sl > smaxc) so = sl - smaxc;
 	int k = 0;
 	for (int i = so; B->status[i] && k < (int)sizeof st - 1; i++) st[k++] = B->status[i];
 	st[k] = '\0';
-	gfx_text(6, sy + (STATUS_H - GLYPH_H) / 2, st, 0xc8d0dc, 0x222831);
+	gfx_ui_text(6, sy + (STATUS_H - UIFONT_H) / 2, st, 0xc8d0dc);
 
 	/* App menu bar over the top, then the dropdowns last so they overlay the page.
 	 * "Stop" is only meaningful while a fetch is in flight, so disable it when

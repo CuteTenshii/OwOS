@@ -12,6 +12,7 @@
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002
 
 #define MULTIBOOT_FLAG_MEM   (1 << 0)   /* mem_lower/mem_upper valid          */
+#define MULTIBOOT_FLAG_CMD   (1 << 2)   /* cmdline (a physical char* ) valid  */
 #define MULTIBOOT_FLAG_MMAP  (1 << 6)   /* mmap_length/mmap_addr valid        */
 #define MULTIBOOT_FLAG_FB    (1 << 12)  /* framebuffer_* fields valid          */
 

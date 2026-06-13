@@ -24,7 +24,7 @@
 #include "crypto.h"
 #include "timer.h"
 #include "rtc.h"
-#include "vga.h"
+#include "console.h"
 #include "kstring.h"
 
 /* ------------------------------------------------------------------ helpers */
@@ -555,21 +555,21 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 		uint8_t mt, *body;
 		uint32_t bl;
 		int r = hs_next(&mt, &body, &bl);
-		if (r == -2) { vga_write("tls: server alert (1.3)\n"); return 0; }
-		if (r < 0) { vga_write("tls: 1.3 handshake read failed\n"); return 0; }
+		if (r == -2) { con_write("tls: server alert (1.3)\n"); return 0; }
+		if (r < 0) { con_write("tls: 1.3 handshake read failed\n"); return 0; }
 		if (mt == HS_CERT_REQ) {
-			vga_write("tls: 1.3 client cert requested (unsupported)\n");
+			con_write("tls: 1.3 client cert requested (unsupported)\n");
 			return 0;
 		}
 		if (mt == HS_FINISHED) {
-			if (bl != 32) { vga_write("tls: bad 1.3 Finished\n"); return 0; }
+			if (bl != 32) { con_write("tls: bad 1.3 Finished\n"); return 0; }
 			uint8_t thcv[32], fk[32], expect[32];
 			sha256_final(&before, thcv);  /* ..CertificateVerify */
 			hkdf_expand_label(s_hs, "finished", 0, 0, fk, 32);
 			hmac_sha256(fk, 32, thcv, 32, expect);
 			for (int i = 0; i < 32; i++)
 				if (body[i] != expect[i]) {
-					vga_write("tls: 1.3 server Finished MISMATCH\n");
+					con_write("tls: 1.3 server Finished MISMATCH\n");
 					return 0;
 				}
 			break;
@@ -588,7 +588,7 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 	fin[0] = HS_FINISHED; fin[1] = 0; fin[2] = 0; fin[3] = 32;
 	kmemcpy(fin + 4, verify, 32);
 	if (send_record(REC_HS, fin, 36) < 0) {
-		vga_write("tls: send 1.3 Finished failed\n");
+		con_write("tls: send 1.3 Finished failed\n");
 		return 0;
 	}
 
@@ -616,7 +616,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 
 	tcp = tcp_connect(ip, port);
 	if (!tcp) {
-		vga_write("tls: tcp connect failed\n");
+		con_write("tls: tcp connect failed\n");
 		return 0;
 	}
 
@@ -633,7 +633,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 	uint32_t chlen = build_client_hello(ch, client_random, our_pub, sni);
 	sha256_update(&transcript, ch, chlen);
 	if (send_record(REC_HS, ch, chlen) < 0) {
-		vga_write("tls: send ClientHello failed\n");
+		con_write("tls: send ClientHello failed\n");
 		tcp_close(tcp);
 		return 0;
 	}
@@ -645,12 +645,12 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 		uint32_t bl;
 		int r = hs_next(&mt, &body, &bl);
 		if (r == -2) {
-			vga_write("tls: server sent an alert\n");
+			con_write("tls: server sent an alert\n");
 			tcp_close(tcp);
 			return 0;
 		}
 		if (r < 0 || mt != HS_SERVER_HELLO) {
-			vga_write("tls: expected ServerHello\n");
+			con_write("tls: expected ServerHello\n");
 			tcp_close(tcp);
 			return 0;
 		}
@@ -658,13 +658,13 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 		int sel13, have_ks;
 		if (parse_server_hello(body, bl, server_random, &suite, &sel13,
 		                       server_pub, &have_ks) < 0) {
-			vga_write("tls: bad ServerHello\n");
+			con_write("tls: bad ServerHello\n");
 			tcp_close(tcp);
 			return 0;
 		}
 		if (sel13) {
 			if (suite != CIPHER_AES128_GCM_SHA256 || !have_ks) {
-				vga_write("tls: unsupported TLS 1.3 parameters\n");
+				con_write("tls: unsupported TLS 1.3 parameters\n");
 				tcp_close(tcp);
 				return 0;
 			}
@@ -675,7 +675,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 			return 1;
 		}
 		if (suite != CIPHER_ECDHE_RSA_AES128_GCM) {
-			vga_write("tls: server chose an unsupported cipher\n");
+			con_write("tls: server chose an unsupported cipher\n");
 			tcp_close(tcp);
 			return 0;
 		}
@@ -688,12 +688,12 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 		uint32_t bl;
 		int r = hs_next(&mt, &body, &bl);
 		if (r == -2) {
-			vga_write("tls: server sent an alert\n");
+			con_write("tls: server sent an alert\n");
 			tcp_close(tcp);
 			return 0;
 		}
 		if (r < 0) {
-			vga_write("tls: handshake read failed\n");
+			con_write("tls: handshake read failed\n");
 			tcp_close(tcp);
 			return 0;
 		}
@@ -703,14 +703,14 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 			uint16_t curve = ((uint16_t)body[1] << 8) | body[2];
 			uint8_t pklen = body[3];
 			if (curve != 0x001D || pklen != 32 || bl < 4u + 32) {
-				vga_write("tls: server key exchange not x25519/32\n");
+				con_write("tls: server key exchange not x25519/32\n");
 				tcp_close(tcp);
 				return 0;
 			}
 			kmemcpy(server_pub, body + 4, 32);
 			have_ske = 1;
 		} else if (mt == HS_CERT_REQ) {
-			vga_write("tls: server requested a client certificate (unsupported)\n");
+			con_write("tls: server requested a client certificate (unsupported)\n");
 			tcp_close(tcp);
 			return 0;
 		} else if (mt == HS_DONE) {
@@ -719,7 +719,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 		/* HS_CERT and anything else: ignored (no verification). */
 	}
 	if (!have_ske) {
-		vga_write("tls: no ServerKeyExchange\n");
+		con_write("tls: no ServerKeyExchange\n");
 		tcp_close(tcp);
 		return 0;
 	}
@@ -749,7 +749,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 	kmemcpy(cke + 5, our_pub, 32);
 	sha256_update(&transcript, cke, sizeof cke);
 	if (send_record(REC_HS, cke, sizeof cke) < 0) {
-		vga_write("tls: send CKE failed\n");
+		con_write("tls: send CKE failed\n");
 		tcp_close(tcp);
 		return 0;
 	}
@@ -772,7 +772,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 	kmemcpy(fin + 4, verify, 12);
 	sha256_update(&transcript, fin, 16);
 	if (send_record(REC_HS, fin, 16) < 0) {
-		vga_write("tls: send Finished failed\n");
+		con_write("tls: send Finished failed\n");
 		tcp_close(tcp);
 		return 0;
 	}
@@ -787,7 +787,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 	uint8_t t;
 	uint32_t l;
 	if (recv_record(&t, recpt, &l) < 0 || t != REC_CCS) {
-		vga_write("tls: expected server ChangeCipherSpec\n");
+		con_write("tls: expected server ChangeCipherSpec\n");
 		tcp_close(tcp);
 		return 0;
 	}
@@ -799,13 +799,13 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 	uint8_t mt, *body;
 	uint32_t bl;
 	if (hs_next(&mt, &body, &bl) < 0 || mt != HS_FINISHED || bl != 12) {
-		vga_write("tls: bad server Finished\n");
+		con_write("tls: bad server Finished\n");
 		tcp_close(tcp);
 		return 0;
 	}
 	for (int i = 0; i < 12; i++) {
 		if (body[i] != server_verify[i]) {
-			vga_write("tls: server Finished verify MISMATCH\n");
+			con_write("tls: server Finished verify MISMATCH\n");
 			tcp_close(tcp);
 			return 0;
 		}

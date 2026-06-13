@@ -15,7 +15,7 @@
 #include <stddef.h>
 
 #include "fat.h"
-#include "vga.h"
+#include "console.h"
 #include "kstring.h"
 
 /* ------------------------------------------------------------------ helpers */
@@ -62,7 +62,7 @@ static void put_u32(uint32_t v)   /* print an unsigned decimal */
 		buf[i--] = (char)('0' + v % 10);
 		v /= 10;
 	}
-	vga_write(&buf[i + 1]);
+	con_write(&buf[i + 1]);
 }
 
 /* ----------------------------------------------------------------- mounting */
@@ -599,15 +599,15 @@ int fat_list(const char *path)
 		if (e.name[0] == '.' &&
 		    (e.name[1] == '\0' || (e.name[1] == '.' && e.name[2] == '\0')))
 			continue;                 /* hide "." and ".." */
-		vga_write(e.is_dir ? "  <DIR>  " : "         ");
+		con_write(e.is_dir ? "  <DIR>  " : "         ");
 		if (!e.is_dir) {
 			put_u32(e.size);
-			vga_write("  ");
+			con_write("  ");
 		} else {
-			vga_write("  ");
+			con_write("  ");
 		}
-		vga_write(e.name);
-		vga_putc('\n');
+		con_write(e.name);
+		con_putc('\n');
 	}
 	return 0;
 }

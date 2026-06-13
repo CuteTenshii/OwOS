@@ -3,7 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "shell.h"
-#include "vga.h"
+#include "console.h"
+#include "log.h"
 #include "timer.h"
 #include "pmm.h"
 #include "heap.h"
@@ -19,6 +20,7 @@
 #include "pci.h"
 #include "e1000.h"
 #include "usb.h"
+#include "xhci.h"
 #include "speaker.h"
 #include "sb16.h"
 #include "cpu.h"
@@ -192,9 +194,9 @@ static int path_resolve(const char *arg, char *out)
  * can't legitimately fall off the top -- a line is at most a couple of rows). */
 static void edit_fix_anchor(uint32_t before)
 {
-	uint32_t rows = vga_scroll_count() - before;
+	uint32_t rows = con_scroll_count() - before;
 	if (rows)
-		edit_start = vga_pos_scroll_up(edit_start, rows);
+		edit_start = con_pos_scroll_up(edit_start, rows);
 }
 
 /* Redraw the current line in place: text from edit_start, spaces to wipe any
@@ -203,15 +205,15 @@ static void edit_fix_anchor(uint32_t before)
  * screen mid-redraw -- edit_start is re-anchored against any scrolling. */
 static void edit_redraw(void)
 {
-	uint32_t s0 = vga_scroll_count();
-	vga_set_pos(edit_start);
+	uint32_t s0 = con_scroll_count();
+	con_set_pos(edit_start);
 	for (size_t i = 0; i < line_len; i++)
-		vga_putc(line[i]);
+		con_putc(line[i]);
 	for (size_t i = line_len; i < render_len; i++)
-		vga_putc(' ');
+		con_putc(' ');
 	render_len = line_len;
 	edit_fix_anchor(s0);
-	vga_set_pos((uint16_t)(edit_start + cursor));
+	con_set_pos((uint16_t)(edit_start + cursor));
 }
 
 /* Replace the editable line with s, cursor at the end, and redraw. */
@@ -261,28 +263,28 @@ static void hist_down(void)            /* back toward the new line           */
 
 static void print_prompt(void)
 {
-	vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
-	vga_write("owos:");
+	con_set_color(CON_LIGHT_CYAN, CON_BLACK);
+	con_write("owos:");
 	/* Show the working directory, abbreviating the home directory to "~". */
 	size_t hlen = str_len(HOME_DIR);
 	int in_home = 1;
 	for (size_t i = 0; i < hlen; i++)
 		if (cwd[i] != HOME_DIR[i]) { in_home = 0; break; }
 	if (in_home && (cwd[hlen] == '\0' || cwd[hlen] == '/')) {
-		vga_putc('~');
-		vga_write(cwd + hlen);                 /* the path below home, if any */
+		con_putc('~');
+		con_write(cwd + hlen);                 /* the path below home, if any */
 	} else {
-		vga_write(cwd);
+		con_write(cwd);
 	}
-	vga_write("$ ");
-	vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+	con_write("$ ");
+	con_set_color(CON_LIGHT_GREY, CON_BLACK);
 }
 
 /* Begin a fresh input line: draw the prompt and reset the editor state. */
 static void prompt(void)
 {
 	print_prompt();
-	edit_start = vga_get_pos();
+	edit_start = con_get_pos();
 	line_len = cursor = render_len = 0;
 }
 
@@ -292,9 +294,9 @@ static void cmd_help(const char *a);
 
 static void print_kib(const char *label, uint32_t kib)
 {
-	vga_write(label);
-	vga_write_dec(kib);
-	vga_write(" KiB\n");
+	con_write(label);
+	con_write_dec(kib);
+	con_write(" KiB\n");
 }
 
 /* List every storage device the kernel brought up, with its capacity, and do a
@@ -306,13 +308,13 @@ static void write_capacity(uint32_t sectors)
 	uint32_t mib = sectors / 2048;
 	if (mib >= 1024) {
 		uint32_t tenths = (mib * 10) / 1024;   /* MiB -> tenths of a GiB        */
-		vga_write_dec(tenths / 10);
-		vga_putc('.');
-		vga_write_dec(tenths % 10);
-		vga_write(" GiB");
+		con_write_dec(tenths / 10);
+		con_putc('.');
+		con_write_dec(tenths % 10);
+		con_write(" GiB");
 	} else {
-		vga_write_dec(mib);
-		vga_write(" MiB");
+		con_write_dec(mib);
+		con_write(" MiB");
 	}
 }
 
@@ -322,33 +324,42 @@ static void cmd_storage(void)
 	int n = 0;
 
 	if (ata_present()) {
-		vga_write("  IDE/ATA    ");
-		vga_write(ata_model());
-		vga_write("  ");
+		con_write("  IDE/ATA    ");
+		con_write(ata_model());
+		con_write("  ");
 		write_capacity(ata_sectors());
-		vga_write(" (PIO, primary master)\n");
+		con_write(" (PIO, primary master)\n");
 		n++;
 	}
 	if (ahci_present()) {
-		vga_write("  SATA/AHCI  ");
-		vga_write(ahci_model());
-		vga_write("  ");
+		con_write("  SATA/AHCI  ");
+		con_write(ahci_model());
+		con_write("  ");
 		write_capacity(ahci_sectors());
-		vga_write(" (DMA) -- read LBA0: ");
-		vga_write(ahci_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
+		con_write(" (DMA) -- read LBA0: ");
+		con_write(ahci_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
 		n++;
 	}
 	if (nvme_present()) {
-		vga_write("  NVMe       ");
-		vga_write(nvme_model());
-		vga_write("  ");
+		con_write("  NVMe       ");
+		con_write(nvme_model());
+		con_write("  ");
 		write_capacity(nvme_sectors());
-		vga_write(" (ns 1) -- read LBA0: ");
-		vga_write(nvme_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
+		con_write(" (ns 1) -- read LBA0: ");
+		con_write(nvme_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
+		n++;
+	}
+	if (xhci_msc_present()) {
+		con_write("  USB        ");
+		con_write(xhci_msc_model());
+		con_write("  ");
+		write_capacity(xhci_msc_sectors());
+		con_write(" (xHCI BOT) -- read LBA0: ");
+		con_write(xhci_msc_read(0, buf) == 0 ? "ok\n" : "FAIL\n");
 		n++;
 	}
 	if (!n)
-		vga_write("  no storage devices detected\n");
+		con_write("  no storage devices detected\n");
 }
 
 static void cmd_meminfo(void)
@@ -367,7 +378,7 @@ static void cmd_memtest(void)
 	char *a = kmalloc(64);
 	char *b = kmalloc(64);
 	if (!a || !b || a == b || (b >= a && b < a + 64)) {
-		vga_write("memtest: FAIL (bad allocation)\n");
+		con_write("memtest: FAIL (bad allocation)\n");
 		return;
 	}
 	for (int i = 0; i < 64; i++) {
@@ -375,18 +386,18 @@ static void cmd_memtest(void)
 		b[i] = (char)('a' + (i % 26));
 	}
 	if (a[0] != 'A' || a[25] != 'Z' || b[0] != 'a') {
-		vga_write("memtest: FAIL (data corrupted)\n");
+		con_write("memtest: FAIL (data corrupted)\n");
 		return;
 	}
 	kfree(a);
 	char *c = kmalloc(64);          /* should reclaim a's slot                */
 	if (c != a) {
-		vga_write("memtest: FAIL (no reuse after free)\n");
+		con_write("memtest: FAIL (no reuse after free)\n");
 		return;
 	}
 	kfree(b);
 	kfree(c);
-	vga_write("memtest: PASS\n");
+	con_write("memtest: PASS\n");
 }
 
 /* Split "prog a b c" in place into argv; returns argc (argv[0] is the prog). */
@@ -413,26 +424,31 @@ static int spawn(int argc, char **argv)
 {
 	if (argc == 0)
 		return -1;
-	uint8_t *buf = kmalloc(64 * 1024);
-	if (!buf)
-		return -1;
 
+	/* Resolve the program to a path: cwd-relative (or absolute), then /bin. */
 	char path[PATH_MAX];
-	int n = -1;
+	int sz = -1;
 	if (path_resolve(argv[0], path) == 0)
-		n = fs_read(path, buf, 64 * 1024);
-	if (n < 0 && argv[0][0] != '/') {              /* fall back to /bin/<name>  */
-		char binp[PATH_MAX];
+		sz = fs_size(path);
+	if (sz < 0 && argv[0][0] != '/') {             /* fall back to /bin/<name>  */
 		int j = 0;
 		const char *pfx = "/bin/";
 		for (int i = 0; pfx[i]; i++)
-			binp[j++] = pfx[i];
+			path[j++] = pfx[i];
 		for (int i = 0; argv[0][i] && j < PATH_MAX - 1; i++)
-			binp[j++] = argv[0][i];
-		binp[j] = '\0';
-		n = fs_read(binp, buf, 64 * 1024);
+			path[j++] = argv[0][i];
+		path[j] = '\0';
+		sz = fs_size(path);
 	}
+	if (sz < 0)
+		return -1;
 
+	/* Size the load buffer to the file -- programs are 120+ KiB now, so a fixed
+	 * small buffer would truncate the ELF and the load would fail. */
+	uint8_t *buf = kmalloc((uint32_t)sz);
+	if (!buf)
+		return -1;
+	int n = fs_read(path, buf, (uint32_t)sz);
 	int pid = (n < 0) ? -1 : exec_program(buf, (uint32_t)n, argc, argv);
 	if (pid >= 0)
 		sched_set_cwd(pid, cwd);   /* child resolves relative paths from here */
@@ -457,11 +473,11 @@ static void wait_reap(int pid)
 		}
 		__asm__ volatile ("sti; hlt");
 	}
-	vga_write("[pid ");
-	vga_write_dec((uint32_t)pid);
-	vga_write(" exited, status ");
-	vga_write_dec((uint32_t)status);
-	vga_write("]\n");
+	con_write("[pid ");
+	con_write_dec((uint32_t)pid);
+	con_write(" exited, status ");
+	con_write_dec((uint32_t)status);
+	con_write("]\n");
 }
 
 static void cmd_run(char *args)
@@ -478,12 +494,12 @@ static void cmd_run(char *args)
 		int ac1 = tokenize(lhs, av1, 8);
 		int ac2 = tokenize(rhs, av2, 8);
 		if (ac1 == 0 || ac2 == 0) {
-			vga_write("usage: run <a> | <b>\n");
+			con_write("usage: run <a> | <b>\n");
 			return;
 		}
 		int id = pipe_alloc();
 		if (id < 0) {
-			vga_write("out of pipes\n");
+			con_write("out of pipes\n");
 			return;
 		}
 		/* Set both up before either can be scheduled. */
@@ -497,7 +513,7 @@ static void cmd_run(char *args)
 		__asm__ volatile ("sti");
 
 		if (p1 < 0 || p2 < 0) {
-			vga_write("pipeline: bad program\n");
+			con_write("pipeline: bad program\n");
 			return;
 		}
 		wait_reap(p1);
@@ -508,12 +524,12 @@ static void cmd_run(char *args)
 	char *argv[8];
 	int argc = tokenize(args, argv, 8);
 	if (argc == 0) {
-		vga_write("usage: run <file> [args]\n");
+		con_write("usage: run <file> [args]\n");
 		return;
 	}
 	int pid = spawn(argc, argv);
 	if (pid < 0) {
-		vga_write("no such file / not a valid program\n");
+		con_write("no such file / not a valid program\n");
 		return;
 	}
 	wait_reap(pid);
@@ -547,8 +563,8 @@ static void grep_emit(const char *pattern, char *buf)
 		int had_newline = (*p == '\n');
 		*p = '\0';
 		if (str_contains(line_start, pattern)) {
-			vga_write(line_start);
-			vga_putc('\n');
+			con_write(line_start);
+			con_putc('\n');
 		}
 		if (had_newline)
 			p++;
@@ -572,7 +588,7 @@ static void cmd_grep(const char *arg)
 	const char *name = arg + i;
 
 	if (pattern[0] == '\0') {
-		vga_write("usage: grep <pattern> <file>  (or: <cmd> | grep <pattern>)\n");
+		con_write("usage: grep <pattern> <file>  (or: <cmd> | grep <pattern>)\n");
 		return;
 	}
 
@@ -582,7 +598,7 @@ static void cmd_grep(const char *arg)
 			return;
 		int n = fs_read(name, buf, 4095);
 		if (n < 0) {
-			vga_write("no such file\n");
+			con_write("no such file\n");
 		} else {
 			buf[n] = '\0';
 			grep_emit(pattern, buf);
@@ -591,7 +607,7 @@ static void cmd_grep(const char *arg)
 	} else if (g_pipe_in) {                 /* piped mode                     */
 		grep_emit(pattern, g_pipe_in);
 	} else {
-		vga_write("usage: grep <pattern> <file>  (or: <cmd> | grep <pattern>)\n");
+		con_write("usage: grep <pattern> <file>  (or: <cmd> | grep <pattern>)\n");
 	}
 }
 
@@ -599,7 +615,7 @@ static void cmd_cat(const char *name)
 {
 	char rpath[PATH_MAX];
 	if (path_resolve(name, rpath) != 0) {
-		vga_write("cat: path too long\n");
+		con_write("cat: path too long\n");
 		return;
 	}
 	char *buf = kmalloc(4096);
@@ -607,12 +623,12 @@ static void cmd_cat(const char *name)
 		return;
 	int n = fs_read(rpath, buf, 4095);
 	if (n < 0) {
-		vga_write("no such file\n");
+		con_write("no such file\n");
 	} else {
 		buf[n] = '\0';
-		vga_write(buf);
+		con_write(buf);
 		if (n > 0 && buf[n - 1] != '\n')
-			vga_putc('\n');
+			con_putc('\n');
 	}
 	kfree(buf);
 }
@@ -625,17 +641,17 @@ static uint8_t *load_torrent(const char *file, struct torrent *t)
 {
 	int sz = fs_size(file);
 	if (sz < 0) {
-		vga_write("no such file\n");
+		con_write("no such file\n");
 		return NULL;
 	}
 	uint8_t *buf = kmalloc(sz ? (uint32_t)sz : 1);
 	if (!buf) {
-		vga_write("torrent: out of memory\n");
+		con_write("torrent: out of memory\n");
 		return NULL;
 	}
 	int n = fs_read(file, buf, (uint32_t)sz);
 	if (n < 0 || torrent_parse(t, buf, (uint32_t)n) != 0) {
-		vga_write("torrent: not a valid .torrent file\n");
+		con_write("torrent: not a valid .torrent file\n");
 		kfree(buf);
 		return NULL;
 	}
@@ -678,13 +694,13 @@ static void cmd_torrent_peer(const char *arg)
 	uint8_t ip[4];
 	const char *after = parse_ip4(arg, ip);
 	if (fn == 0 || !after) {
-		vga_write("usage: torrent peer <file> <ip> <port>\n");
+		con_write("usage: torrent peer <file> <ip> <port>\n");
 		return;
 	}
 	while (*after == ' ') after++;
 	uint16_t port = (uint16_t)parse_uint(after);
 	if (port == 0) {
-		vga_write("usage: torrent peer <file> <ip> <port>\n");
+		con_write("usage: torrent peer <file> <ip> <port>\n");
 		return;
 	}
 
@@ -695,16 +711,16 @@ static void cmd_torrent_peer(const char *arg)
 
 	uint8_t *piece = kmalloc(t.piece_length ? (uint32_t)t.piece_length : 1);
 	if (!piece) {
-		vga_write("torrent: out of memory\n");
+		con_write("torrent: out of memory\n");
 		torrent_free(&t);
 		kfree(buf);
 		return;
 	}
 	int n = peer_fetch_piece(&t, ip, port, 0, piece);
 	if (n > 0) {
-		vga_write("got piece 0: ");
-		vga_write_dec((uint32_t)n);
-		vga_write(" bytes\n");
+		con_write("got piece 0: ");
+		con_write_dec((uint32_t)n);
+		con_write(" bytes\n");
 	}
 	kfree(piece);
 	torrent_free(&t);
@@ -730,7 +746,7 @@ static void cmd_torrent_get(const char *file)
 	if (!buf)
 		return;
 	if (t.multi_file) {
-		vga_write("get: multi-file torrents not supported yet\n");
+		con_write("get: multi-file torrents not supported yet\n");
 		torrent_free(&t);
 		kfree(buf);
 		return;
@@ -749,14 +765,14 @@ static void cmd_torrent_get(const char *file)
 	int npeers = tracker_announce(t.announce, t.infohash, t.total_length,
 	                              peers, 32, &interval);
 	if (npeers <= 0) {
-		vga_write("get: no peers available\n");
+		con_write("get: no peers available\n");
 		torrent_free(&t);
 		kfree(buf);
 		return;
 	}
 
 	if (fs_prealloc(outname, (uint32_t)t.total_length) != 0) {
-		vga_write("get: cannot allocate output file\n");
+		con_write("get: cannot allocate output file\n");
 		torrent_free(&t);
 		kfree(buf);
 		return;
@@ -778,7 +794,7 @@ static void cmd_torrent_get(const char *file)
 		if (!pbuf[i]) alloc_ok = 0;
 	}
 	if (!alloc_ok) {
-		vga_write("get: out of memory\n");
+		con_write("get: out of memory\n");
 		for (int i = 0; i < nconn; i++) kfree(pbuf[i]);
 		kfree(done_f); kfree(inflt);
 		torrent_free(&t);
@@ -794,7 +810,7 @@ static void cmd_torrent_get(const char *file)
 		if (pc[i]) live++;
 	}
 	if (live == 0)
-		vga_write("get: could not connect to any peer\n");
+		con_write("get: could not connect to any peer\n");
 
 	/* Assign the next unstarted piece this connection can serve; idle if none. */
 	#define ASSIGN(i) do {                                                     \
@@ -830,7 +846,7 @@ static void cmd_torrent_get(const char *file)
 					break;
 				}
 				done_f[idx] = 1; done++;
-				vga_putc('.');
+				con_putc('.');
 				ASSIGN(i);                       /* next piece on this conn */
 			} else if (r == PEER_LACKS) {
 				inflt[idx] = 0;                  /* free it for another peer */
@@ -853,7 +869,7 @@ static void cmd_torrent_get(const char *file)
 	}
 
 	if (done)
-		vga_putc('\n');
+		con_putc('\n');
 	for (int i = 0; i < nconn; i++) {
 		if (pc[i]) peer_disconnect(pc[i]);
 		kfree(pbuf[i]);
@@ -861,20 +877,20 @@ static void cmd_torrent_get(const char *file)
 	kfree(done_f); kfree(inflt);
 
 	if (disk_fail)
-		vga_write("get: disk write failed\n");
+		con_write("get: disk write failed\n");
 
 	if (done == t.n_pieces) {
-		vga_write("get: complete -- ");
-		vga_write_dec((uint32_t)t.total_length);
-		vga_write(" bytes verified and saved to ");
-		vga_write(outname);
-		vga_putc('\n');
+		con_write("get: complete -- ");
+		con_write_dec((uint32_t)t.total_length);
+		con_write(" bytes verified and saved to ");
+		con_write(outname);
+		con_putc('\n');
 	} else {
-		vga_write("get: incomplete (");
-		vga_write_dec(done);
-		vga_write("/");
-		vga_write_dec(t.n_pieces);
-		vga_write(" pieces)\n");
+		con_write("get: incomplete (");
+		con_write_dec(done);
+		con_write("/");
+		con_write_dec(t.n_pieces);
+		con_write(" pieces)\n");
 	}
 
 	torrent_free(&t);
@@ -911,7 +927,7 @@ static void cmd_torrent(const char *arg)
 	const char *file = after_prefix(arg, "info ");
 	const char *pfile = after_prefix(arg, "peers ");
 	if ((!file || file[0] == '\0') && (!pfile || pfile[0] == '\0')) {
-		vga_write("usage: torrent info <file> | torrent peers <file> "
+		con_write("usage: torrent info <file> | torrent peers <file> "
 		          "| torrent peer <file> <ip> <port> | torrent test\n");
 		return;
 	}
@@ -937,8 +953,8 @@ static void cmd_torrent(const char *arg)
 
 static void wr2(uint32_t v)
 {
-	vga_putc('0' + (char)((v / 10) % 10));
-	vga_putc('0' + (char)(v % 10));
+	con_putc('0' + (char)((v / 10) % 10));
+	con_putc('0' + (char)(v % 10));
 }
 
 /* url <string> — parse a URL into its parts and rebuild it (parser self-demo). */
@@ -946,21 +962,21 @@ static void cmd_url(const char *arg)
 {
 	struct url u;
 	if (!url_parse(arg, &u)) {
-		vga_write("url: malformed URL\n");
+		con_write("url: malformed URL\n");
 		return;
 	}
-	vga_write("  scheme:   "); vga_write(u.scheme[0] ? u.scheme : "(none)"); vga_putc('\n');
-	if (u.userinfo[0]) { vga_write("  userinfo: "); vga_write(u.userinfo); vga_putc('\n'); }
-	vga_write("  host:     "); vga_write(u.host); vga_putc('\n');
-	vga_write("  port:     "); vga_write_dec(u.port);
-	vga_write(u.has_port ? "\n" : " (default)\n");
-	vga_write("  path:     "); vga_write(u.path[0] ? u.path : "(empty)"); vga_putc('\n');
-	if (u.has_query)    { vga_write("  query:    "); vga_write(u.query); vga_putc('\n'); }
-	if (u.has_fragment) { vga_write("  fragment: "); vga_write(u.fragment); vga_putc('\n'); }
+	con_write("  scheme:   "); con_write(u.scheme[0] ? u.scheme : "(none)"); con_putc('\n');
+	if (u.userinfo[0]) { con_write("  userinfo: "); con_write(u.userinfo); con_putc('\n'); }
+	con_write("  host:     "); con_write(u.host); con_putc('\n');
+	con_write("  port:     "); con_write_dec(u.port);
+	con_write(u.has_port ? "\n" : " (default)\n");
+	con_write("  path:     "); con_write(u.path[0] ? u.path : "(empty)"); con_putc('\n');
+	if (u.has_query)    { con_write("  query:    "); con_write(u.query); con_putc('\n'); }
+	if (u.has_fragment) { con_write("  fragment: "); con_write(u.fragment); con_putc('\n'); }
 
 	char rebuilt[640];
 	if (url_build(&u, rebuilt, sizeof(rebuilt)) >= 0) {
-		vga_write("  rebuilt:  "); vga_write(rebuilt); vga_putc('\n');
+		con_write("  rebuilt:  "); con_write(rebuilt); con_putc('\n');
 	}
 }
 
@@ -968,10 +984,10 @@ static void cmd_date(void)
 {
 	struct rtc_time t;
 	rtc_now(&t);
-	vga_write_dec(t.year); vga_putc('-'); wr2(t.month); vga_putc('-'); wr2(t.day);
-	vga_putc(' ');
-	wr2(t.hour); vga_putc(':'); wr2(t.min); vga_putc(':'); wr2(t.sec);
-	vga_putc('\n');
+	con_write_dec(t.year); con_putc('-'); wr2(t.month); con_putc('-'); wr2(t.day);
+	con_putc(' ');
+	wr2(t.hour); con_putc(':'); wr2(t.min); con_putc(':'); wr2(t.sec);
+	con_putc('\n');
 }
 
 static void cmd_cpuinfo(void)
@@ -988,18 +1004,18 @@ static void cmd_cpuinfo(void)
 	cpu_address_bits(&phys, &virt);
 	cpu_features(flags, sizeof(flags));
 
-	vga_write("vendor: "); vga_write(vendor); vga_putc('\n');
-	vga_write("model:  "); vga_write(brand);  vga_putc('\n');
-	vga_write("family: ");  vga_write_dec(sig.family);
-	vga_write("  model: "); vga_write_dec(sig.model);
-	vga_write("  stepping: "); vga_write_dec(sig.stepping); vga_putc('\n');
-	vga_write("address: "); vga_write_dec(phys);
-	vga_write(" bits phys, "); vga_write_dec(virt); vga_write(" bits virt\n");
+	con_write("vendor: "); con_write(vendor); con_putc('\n');
+	con_write("model:  "); con_write(brand);  con_putc('\n');
+	con_write("family: ");  con_write_dec(sig.family);
+	con_write("  model: "); con_write_dec(sig.model);
+	con_write("  stepping: "); con_write_dec(sig.stepping); con_putc('\n');
+	con_write("address: "); con_write_dec(phys);
+	con_write(" bits phys, "); con_write_dec(virt); con_write(" bits virt\n");
 	uint32_t mhz = cpu_mhz();
 	if (mhz) {
-		vga_write("clock:  ~"); vga_write_dec(mhz); vga_write(" MHz\n");
+		con_write("clock:  ~"); con_write_dec(mhz); con_write(" MHz\n");
 	}
-	vga_write("flags:  "); vga_write(flags); vga_putc('\n');
+	con_write("flags:  "); con_write(flags); con_putc('\n');
 }
 
 /* System identity, the fields a POSIX uname reports. */
@@ -1018,18 +1034,18 @@ static void cmd_uname(const char *arg)
 	char flag = (arg[0] == '-') ? arg[1] : 's';
 	switch (flag) {
 	case 'a':
-		vga_write(UNAME_SYSNAME);  vga_putc(' ');
-		vga_write(UNAME_NODENAME); vga_putc(' ');
-		vga_write(UNAME_RELEASE);  vga_putc(' ');
-		vga_write(UNAME_MACHINE);  vga_putc('\n');
+		con_write(UNAME_SYSNAME);  con_putc(' ');
+		con_write(UNAME_NODENAME); con_putc(' ');
+		con_write(UNAME_RELEASE);  con_putc(' ');
+		con_write(UNAME_MACHINE);  con_putc('\n');
 		break;
 	case 's':
-	case 'o': vga_write(UNAME_SYSNAME);  vga_putc('\n'); break;
-	case 'n': vga_write(UNAME_NODENAME); vga_putc('\n'); break;
-	case 'r': vga_write(UNAME_RELEASE);  vga_putc('\n'); break;
-	case 'm': vga_write(UNAME_MACHINE);  vga_putc('\n'); break;
+	case 'o': con_write(UNAME_SYSNAME);  con_putc('\n'); break;
+	case 'n': con_write(UNAME_NODENAME); con_putc('\n'); break;
+	case 'r': con_write(UNAME_RELEASE);  con_putc('\n'); break;
+	case 'm': con_write(UNAME_MACHINE);  con_putc('\n'); break;
 	default:
-		vga_write("usage: uname [-asnrmo]\n");
+		con_write("usage: uname [-asnrmo]\n");
 		break;
 	}
 }
@@ -1037,7 +1053,7 @@ static void cmd_uname(const char *arg)
 /* "whoami" — OwOS is single-user, so the shell always runs as root. */
 static void cmd_whoami(void)
 {
-	vga_write("root\n");
+	con_write("root\n");
 }
 
 /* A shell built-in is a row in the `builtins` table defined just above run():
@@ -1063,7 +1079,7 @@ static void cmd_which(char *arg)
 	char *argv[8];
 	int argc = tokenize(arg, argv, 8);
 	if (argc == 0) {
-		vga_write("usage: which <name>...\n");
+		con_write("usage: which <name>...\n");
 		return;
 	}
 	for (int i = 0; i < argc; i++) {
@@ -1077,18 +1093,18 @@ static void cmd_which(char *arg)
 			binp[j++] = name[k];
 		binp[j] = '\0';
 		if (is_builtin(name)) {
-			vga_write(name);
-			vga_write(": shell built-in\n");
+			con_write(name);
+			con_write(": shell built-in\n");
 		} else if (path_resolve(name, rpath) == 0 && fs_size(rpath) >= 0) {
-			vga_write(name); vga_write(": "); vga_write(rpath);
-			vga_write(" (file)\n");
+			con_write(name); con_write(": "); con_write(rpath);
+			con_write(" (file)\n");
 		} else if (name[0] != '/' && fs_size(binp) >= 0) {
-			vga_write(name); vga_write(": "); vga_write(binp);
-			vga_write(" (file)\n");
+			con_write(name); con_write(": "); con_write(binp);
+			con_write(" (file)\n");
 		} else {
-			vga_write("which: no ");
-			vga_write(name);
-			vga_write(" in (built-ins, owofs)\n");
+			con_write("which: no ");
+			con_write(name);
+			con_write(" in (built-ins, owofs)\n");
 		}
 	}
 }
@@ -1099,15 +1115,15 @@ static void cmd_loadkeys(const char *arg)
 	while (*arg == ' ')
 		arg++;
 	if (arg[0] == '\0') {
-		vga_write("usage: loadkeys <us|fr>\n");
+		con_write("usage: loadkeys <us|fr>\n");
 		return;
 	}
 	if (keyboard_set_layout(arg) == 0) {
-		vga_write("keyboard layout: ");
-		vga_write(arg);
-		vga_putc('\n');
+		con_write("keyboard layout: ");
+		con_write(arg);
+		con_putc('\n');
 	} else {
-		vga_write("loadkeys: unknown layout (try us or fr)\n");
+		con_write("loadkeys: unknown layout (try us or fr)\n");
 	}
 }
 
@@ -1124,20 +1140,20 @@ static void cmd_write(const char *arg)
 	const char *text = (arg[i] == ' ') ? arg + i + 1 : arg + i;
 
 	if (name[0] == '\0') {
-		vga_write("usage: write <file> <text>\n");
+		con_write("usage: write <file> <text>\n");
 		return;
 	}
 	char rpath[PATH_MAX];
 	if (path_resolve(name, rpath) != 0) {
-		vga_write("write: path too long\n");
+		con_write("write: path too long\n");
 		return;
 	}
 	if (fs_create(rpath, text, (uint32_t)str_len(text)) == 0) {
-		vga_write("wrote ");
-		vga_write(rpath);
-		vga_putc('\n');
+		con_write("wrote ");
+		con_write(rpath);
+		con_putc('\n');
 	} else {
-		vga_write("write failed\n");
+		con_write("write failed\n");
 	}
 }
 
@@ -1170,16 +1186,16 @@ static void cmd_cd(const char *arg)
 	const char *a = (*arg == '\0') ? HOME_DIR : arg;
 	char target[PATH_MAX];
 	if (path_resolve(a, target) != 0) {
-		vga_write("cd: path too long\n");
+		con_write("cd: path too long\n");
 		return;
 	}
 	int d = fs_isdir(target);
 	if (d < 0) {
-		vga_write("cd: no such directory: "); vga_write(a); vga_putc('\n');
+		con_write("cd: no such directory: "); con_write(a); con_putc('\n');
 		return;
 	}
 	if (d == 0) {
-		vga_write("cd: not a directory: "); vga_write(a); vga_putc('\n');
+		con_write("cd: not a directory: "); con_write(a); con_putc('\n');
 		return;
 	}
 	int i = 0;
@@ -1191,8 +1207,8 @@ static void cmd_cd(const char *arg)
 /* "pwd" — print the working directory. */
 static void cmd_pwd(void)
 {
-	vga_write(cwd);
-	vga_putc('\n');
+	con_write(cwd);
+	con_putc('\n');
 }
 
 /* "cp <src> <dst>" — copy a file's contents into a new (or overwritten) file.
@@ -1202,35 +1218,35 @@ static void cmd_cp(const char *arg)
 	char src[PATH_MAX], dst[PATH_MAX], rsrc[PATH_MAX], rdst[PATH_MAX];
 	parse_two(arg, src, dst, (int)sizeof(src));
 	if (src[0] == '\0' || dst[0] == '\0') {
-		vga_write("usage: cp <src> <dst>\n");
+		con_write("usage: cp <src> <dst>\n");
 		return;
 	}
 	if (path_resolve(src, rsrc) != 0 || path_resolve(dst, rdst) != 0) {
-		vga_write("cp: path too long\n");
+		con_write("cp: path too long\n");
 		return;
 	}
 	into_dir(rdst, rsrc);
 	if (streq(rsrc, rdst)) {
-		vga_write("cp: source and destination are the same\n");
+		con_write("cp: source and destination are the same\n");
 		return;
 	}
 	int sz = fs_size(rsrc);
 	if (sz < 0) {
-		vga_write("cp: no such file: "); vga_write(src); vga_putc('\n');
+		con_write("cp: no such file: "); con_write(src); con_putc('\n');
 		return;
 	}
 	uint8_t *buf = kmalloc(sz ? (uint32_t)sz : 1);
 	if (!buf) {
-		vga_write("cp: out of memory\n");
+		con_write("cp: out of memory\n");
 		return;
 	}
 	int n = fs_read(rsrc, buf, (uint32_t)sz);
 	if (n < 0)
-		vga_write("cp: read failed\n");
+		con_write("cp: read failed\n");
 	else if (fs_create(rdst, buf, (uint32_t)n) != 0)
-		vga_write("cp: write failed (disk or directory full?)\n");
+		con_write("cp: write failed (disk or directory full?)\n");
 	else {
-		vga_write(rsrc); vga_write(" -> "); vga_write(rdst); vga_putc('\n');
+		con_write(rsrc); con_write(" -> "); con_write(rdst); con_putc('\n');
 	}
 	kfree(buf);
 }
@@ -1242,21 +1258,21 @@ static void cmd_mv(const char *arg)
 	char src[PATH_MAX], dst[PATH_MAX], rsrc[PATH_MAX], rdst[PATH_MAX];
 	parse_two(arg, src, dst, (int)sizeof(src));
 	if (src[0] == '\0' || dst[0] == '\0') {
-		vga_write("usage: mv <src> <dst>\n");
+		con_write("usage: mv <src> <dst>\n");
 		return;
 	}
 	if (path_resolve(src, rsrc) != 0 || path_resolve(dst, rdst) != 0) {
-		vga_write("mv: path too long\n");
+		con_write("mv: path too long\n");
 		return;
 	}
 	into_dir(rdst, rsrc);
 	if (streq(rsrc, rdst))
 		return;                                 /* a no-op, like real mv            */
 	if (fs_rename(rsrc, rdst) != 0) {
-		vga_write("mv: failed (no such source, or illegal move)\n");
+		con_write("mv: failed (no such source, or illegal move)\n");
 		return;
 	}
-	vga_write(rsrc); vga_write(" -> "); vga_write(rdst); vga_putc('\n');
+	con_write(rsrc); con_write(" -> "); con_write(rdst); con_putc('\n');
 }
 
 /* "rm <file> [file...]" — delete one or more files (sectors leak). */
@@ -1265,20 +1281,20 @@ static void cmd_rm(const char *arg)
 	char name[PATH_MAX], extra[PATH_MAX], rpath[PATH_MAX];
 	parse_two(arg, name, extra, (int)sizeof(name));
 	if (name[0] == '\0') {
-		vga_write("usage: rm <file>\n");
+		con_write("usage: rm <file>\n");
 		return;
 	}
 	if (path_resolve(name, rpath) != 0) {
-		vga_write("rm: path too long\n");
+		con_write("rm: path too long\n");
 	} else {
 		int r = fs_delete(rpath);
 		if (r == 0) {
-			vga_write("removed "); vga_write(rpath); vga_putc('\n');
+			con_write("removed "); con_write(rpath); con_putc('\n');
 		} else if (r == -2) {
-			vga_write("rm: is a directory (use rmdir): ");
-			vga_write(name); vga_putc('\n');
+			con_write("rm: is a directory (use rmdir): ");
+			con_write(name); con_putc('\n');
 		} else {
-			vga_write("rm: no such file: "); vga_write(name); vga_putc('\n');
+			con_write("rm: no such file: "); con_write(name); con_putc('\n');
 		}
 	}
 	if (extra[0])                                   /* a courtesy for "rm a b"  */
@@ -1291,15 +1307,15 @@ static void cmd_mkdir(const char *arg)
 	char name[PATH_MAX], extra[PATH_MAX], rpath[PATH_MAX];
 	parse_two(arg, name, extra, (int)sizeof(name));
 	if (name[0] == '\0') {
-		vga_write("usage: mkdir <dir>\n");
+		con_write("usage: mkdir <dir>\n");
 		return;
 	}
 	if (path_resolve(name, rpath) != 0)
-		vga_write("mkdir: path too long\n");
+		con_write("mkdir: path too long\n");
 	else if (fs_mkdir(rpath) == 0) {
-		vga_write("created "); vga_write(rpath); vga_putc('\n');
+		con_write("created "); con_write(rpath); con_putc('\n');
 	} else
-		vga_write("mkdir: cannot create (exists, bad path, or directory full)\n");
+		con_write("mkdir: cannot create (exists, bad path, or directory full)\n");
 	if (extra[0])
 		cmd_mkdir(extra);
 }
@@ -1310,21 +1326,21 @@ static void cmd_rmdir(const char *arg)
 	char name[PATH_MAX], extra[PATH_MAX], rpath[PATH_MAX];
 	parse_two(arg, name, extra, (int)sizeof(name));
 	if (name[0] == '\0') {
-		vga_write("usage: rmdir <dir>\n");
+		con_write("usage: rmdir <dir>\n");
 		return;
 	}
 	if (path_resolve(name, rpath) != 0) {
-		vga_write("rmdir: path too long\n");
+		con_write("rmdir: path too long\n");
 	} else {
 		int r = fs_rmdir(rpath);
 		if (r == 0) {
-			vga_write("removed "); vga_write(rpath); vga_putc('\n');
+			con_write("removed "); con_write(rpath); con_putc('\n');
 		} else if (r == -2) {
-			vga_write("rmdir: not a directory: "); vga_write(name); vga_putc('\n');
+			con_write("rmdir: not a directory: "); con_write(name); con_putc('\n');
 		} else if (r == -3) {
-			vga_write("rmdir: directory not empty: "); vga_write(name); vga_putc('\n');
+			con_write("rmdir: directory not empty: "); con_write(name); con_putc('\n');
 		} else {
-			vga_write("rmdir: no such directory: "); vga_write(name); vga_putc('\n');
+			con_write("rmdir: no such directory: "); con_write(name); con_putc('\n');
 		}
 	}
 	if (extra[0])
@@ -1355,18 +1371,18 @@ static void cmd_zip(const char *arg)
 	char src[24], dst[24];
 	parse_two(arg, src, dst, (int)sizeof(src));
 	if (src[0] == '\0') {
-		vga_write("usage: zip <src> [dst]\n");
+		con_write("usage: zip <src> [dst]\n");
 		return;
 	}
 	int sz = fs_size(src);
 	if (sz < 0) {
-		vga_write("no such file\n");
+		con_write("no such file\n");
 		return;
 	}
 	if (dst[0] == '\0') {                   /* derive <src>.z                   */
 		size_t n = str_len(src);
 		if (n + 2 >= sizeof(dst)) {
-			vga_write("zip: name too long, pass an explicit dst\n");
+			con_write("zip: name too long, pass an explicit dst\n");
 			return;
 		}
 		str_copy(dst, src);
@@ -1376,7 +1392,7 @@ static void cmd_zip(const char *arg)
 	uint8_t *in = kmalloc(sz ? (uint32_t)sz : 1);
 	uint8_t *out = kmalloc(zip_bound((uint32_t)sz));
 	if (!in || !out) {
-		vga_write("zip: out of memory\n");
+		con_write("zip: out of memory\n");
 		kfree(in); kfree(out);
 		return;
 	}
@@ -1384,14 +1400,14 @@ static void cmd_zip(const char *arg)
 	int clen = (n < 0) ? -1 :
 		zip_compress(in, (uint32_t)n, out, zip_bound((uint32_t)sz));
 	if (clen < 0) {
-		vga_write("zip: compression failed\n");
+		con_write("zip: compression failed\n");
 	} else if (fs_create(dst, out, (uint32_t)clen) != 0) {
-		vga_write("zip: write failed\n");
+		con_write("zip: write failed\n");
 	} else {
-		vga_write(src); vga_write(" -> "); vga_write(dst);
-		vga_write(" ("); vga_write_dec((uint32_t)n);
-		vga_write(" -> "); vga_write_dec((uint32_t)clen);
-		vga_write(" bytes)\n");
+		con_write(src); con_write(" -> "); con_write(dst);
+		con_write(" ("); con_write_dec((uint32_t)n);
+		con_write(" -> "); con_write_dec((uint32_t)clen);
+		con_write(" bytes)\n");
 	}
 	kfree(in); kfree(out);
 }
@@ -1403,24 +1419,24 @@ static void cmd_unzip(const char *arg)
 	char src[24], dst[24];
 	parse_two(arg, src, dst, (int)sizeof(src));
 	if (src[0] == '\0') {
-		vga_write("usage: unzip <src> [dst]\n");
+		con_write("usage: unzip <src> [dst]\n");
 		return;
 	}
 	int sz = fs_size(src);
 	if (sz < 0) {
-		vga_write("no such file\n");
+		con_write("no such file\n");
 		return;
 	}
 
 	uint8_t *in = kmalloc(sz ? (uint32_t)sz : 1);
 	if (!in) {
-		vga_write("unzip: out of memory\n");
+		con_write("unzip: out of memory\n");
 		return;
 	}
 	int n = fs_read(src, in, (uint32_t)sz);
 	int orig = (n < 0) ? -1 : zip_orig_size(in, (uint32_t)n);
 	if (orig < 0) {
-		vga_write("unzip: not an OwOS zip file\n");
+		con_write("unzip: not an OwOS zip file\n");
 		kfree(in);
 		return;
 	}
@@ -1430,7 +1446,7 @@ static void cmd_unzip(const char *arg)
 			str_copy(dst, src);
 			dst[l - 2] = '\0';
 		} else {
-			vga_write("usage: unzip <src> [dst]\n");
+			con_write("usage: unzip <src> [dst]\n");
 			kfree(in);
 			return;
 		}
@@ -1438,19 +1454,19 @@ static void cmd_unzip(const char *arg)
 
 	uint8_t *out = kmalloc(orig ? (uint32_t)orig : 1);
 	if (!out) {
-		vga_write("unzip: out of memory\n");
+		con_write("unzip: out of memory\n");
 		kfree(in);
 		return;
 	}
 	int dlen = zip_decompress(in, (uint32_t)n, out, (uint32_t)orig);
 	if (dlen < 0) {
-		vga_write("unzip: corrupt archive\n");
+		con_write("unzip: corrupt archive\n");
 	} else if (fs_create(dst, out, (uint32_t)dlen) != 0) {
-		vga_write("unzip: write failed\n");
+		con_write("unzip: write failed\n");
 	} else {
-		vga_write(src); vga_write(" -> "); vga_write(dst);
-		vga_write(" ("); vga_write_dec((uint32_t)dlen);
-		vga_write(" bytes)\n");
+		con_write(src); con_write(" -> "); con_write(dst);
+		con_write(" ("); con_write_dec((uint32_t)dlen);
+		con_write(" bytes)\n");
 	}
 	kfree(in); kfree(out);
 }
@@ -1462,18 +1478,18 @@ static void cmd_gzip(const char *arg)
 	char src[24], dst[24];
 	parse_two(arg, src, dst, (int)sizeof(src));
 	if (src[0] == '\0') {
-		vga_write("usage: gzip <src> [dst]\n");
+		con_write("usage: gzip <src> [dst]\n");
 		return;
 	}
 	int sz = fs_size(src);
 	if (sz < 0) {
-		vga_write("no such file\n");
+		con_write("no such file\n");
 		return;
 	}
 	if (dst[0] == '\0') {                   /* derive <src>.gz                  */
 		size_t n = str_len(src);
 		if (n + 3 >= sizeof(dst)) {
-			vga_write("gzip: name too long, pass an explicit dst\n");
+			con_write("gzip: name too long, pass an explicit dst\n");
 			return;
 		}
 		str_copy(dst, src);
@@ -1483,7 +1499,7 @@ static void cmd_gzip(const char *arg)
 	uint8_t *in = kmalloc(sz ? (uint32_t)sz : 1);
 	uint8_t *out = kmalloc(gzip_bound((uint32_t)sz));
 	if (!in || !out) {
-		vga_write("gzip: out of memory\n");
+		con_write("gzip: out of memory\n");
 		kfree(in); kfree(out);
 		return;
 	}
@@ -1491,14 +1507,14 @@ static void cmd_gzip(const char *arg)
 	int clen = (n < 0) ? -1 :
 		gzip_compress(in, (uint32_t)n, out, gzip_bound((uint32_t)sz));
 	if (clen < 0) {
-		vga_write("gzip: compression failed\n");
+		con_write("gzip: compression failed\n");
 	} else if (fs_create(dst, out, (uint32_t)clen) != 0) {
-		vga_write("gzip: write failed\n");
+		con_write("gzip: write failed\n");
 	} else {
-		vga_write(src); vga_write(" -> "); vga_write(dst);
-		vga_write(" ("); vga_write_dec((uint32_t)n);
-		vga_write(" -> "); vga_write_dec((uint32_t)clen);
-		vga_write(" bytes)\n");
+		con_write(src); con_write(" -> "); con_write(dst);
+		con_write(" ("); con_write_dec((uint32_t)n);
+		con_write(" -> "); con_write_dec((uint32_t)clen);
+		con_write(" bytes)\n");
 	}
 	kfree(in); kfree(out);
 }
@@ -1510,24 +1526,24 @@ static void cmd_gunzip(const char *arg)
 	char src[24], dst[24];
 	parse_two(arg, src, dst, (int)sizeof(src));
 	if (src[0] == '\0') {
-		vga_write("usage: gunzip <src> [dst]\n");
+		con_write("usage: gunzip <src> [dst]\n");
 		return;
 	}
 	int sz = fs_size(src);
 	if (sz < 0) {
-		vga_write("no such file\n");
+		con_write("no such file\n");
 		return;
 	}
 
 	uint8_t *in = kmalloc(sz ? (uint32_t)sz : 1);
 	if (!in) {
-		vga_write("gunzip: out of memory\n");
+		con_write("gunzip: out of memory\n");
 		return;
 	}
 	int n = fs_read(src, in, (uint32_t)sz);
 	int orig = (n < 0) ? -1 : gzip_orig_size(in, (uint32_t)n);
 	if (orig < 0) {
-		vga_write("gunzip: not a gzip file\n");
+		con_write("gunzip: not a gzip file\n");
 		kfree(in);
 		return;
 	}
@@ -1538,7 +1554,7 @@ static void cmd_gunzip(const char *arg)
 			str_copy(dst, src);
 			dst[l - 3] = '\0';
 		} else {
-			vga_write("usage: gunzip <src> [dst]\n");
+			con_write("usage: gunzip <src> [dst]\n");
 			kfree(in);
 			return;
 		}
@@ -1546,19 +1562,19 @@ static void cmd_gunzip(const char *arg)
 
 	uint8_t *out = kmalloc(orig ? (uint32_t)orig : 1);
 	if (!out) {
-		vga_write("gunzip: out of memory\n");
+		con_write("gunzip: out of memory\n");
 		kfree(in);
 		return;
 	}
 	int dlen = gzip_decompress(in, (uint32_t)n, out, (uint32_t)orig);
 	if (dlen < 0) {
-		vga_write("gunzip: corrupt or unsupported gzip\n");
+		con_write("gunzip: corrupt or unsupported gzip\n");
 	} else if (fs_create(dst, out, (uint32_t)dlen) != 0) {
-		vga_write("gunzip: write failed\n");
+		con_write("gunzip: write failed\n");
 	} else {
-		vga_write(src); vga_write(" -> "); vga_write(dst);
-		vga_write(" ("); vga_write_dec((uint32_t)dlen);
-		vga_write(" bytes)\n");
+		con_write(src); con_write(" -> "); con_write(dst);
+		con_write(" ("); con_write_dec((uint32_t)dlen);
+		con_write(" bytes)\n");
 	}
 	kfree(in); kfree(out);
 }
@@ -1570,13 +1586,18 @@ static void cmd_gunzip(const char *arg)
  * No-arg commands ignore it; a few carry the small bit of glue that used to
  * sit inline in run()'s dispatch ladder. Handlers already taking a single
  * const char * go into the table directly. */
-static void bi_clear(const char *a)    { (void)a; vga_clear(); }
+static void bi_clear(const char *a)    { (void)a; con_clear(); }
+static void bi_journal(const char *a)  { (void)a; journal_dump(); }
 static void bi_uptime(const char *a)
 {
 	(void)a;
-	vga_write("up ");
-	vga_write_dec(timer_seconds());
-	vga_write(" seconds\n");
+	uint32_t s = timer_seconds();
+	uint32_t h = s / 3600; s %= 3600;
+	uint32_t m = s / 60;   s %= 60;
+	con_write("up ");
+	if (h) { con_write_dec(h); con_write("h "); }
+	if (h || m) { con_write_dec(m); con_write("m "); }
+	con_write_dec(s); con_write("s\n");
 }
 static void bi_sleep(const char *a)    { timer_sleep(parse_uint(a) * 1000); }
 static void bi_meminfo(const char *a)  { (void)a; cmd_meminfo(); }
@@ -1590,13 +1611,12 @@ static void bi_ls(const char *a)
 	}
 	char rpath[PATH_MAX];
 	if (path_resolve(a, rpath) != 0)
-		vga_write("ls: path too long\n");
+		con_write("ls: path too long\n");
 	else
 		fs_list(rpath);
 }
 static void bi_pwd(const char *a)      { (void)a; cmd_pwd(); }
-static void bi_run(const char *a)      { cmd_run((char *)a); }
-static void bi_format(const char *a)   { (void)a; fs_format(); vga_write("filesystem erased.\n"); }
+static void bi_format(const char *a)   { (void)a; fs_format(); con_write("filesystem erased.\n"); }
 static void bi_lspci(const char *a)    { (void)a; pci_list(); }
 static void bi_ethdiag(const char *a)  { (void)a; e1000_diag(); }
 static void bi_dhcp(const char *a)     { (void)a; net_dhcp_now(); }
@@ -1622,18 +1642,18 @@ static void bi_eject(const char *a)
 	(void)a;
 	int hfs = hfs_mounted(), ext = ext_mounted();
 	if (!fat_mounted() && !hfs && !ext) {
-		vga_write("eject: nothing mounted at /media\n");
+		con_write("eject: nothing mounted at /media\n");
 		return;
 	}
-	vga_write("eject: detaching ");
-	vga_write(ext ? ext_type() : hfs ? hfs_type() : fat_type());
+	con_write("eject: detaching ");
+	con_write(ext ? ext_type() : hfs ? hfs_type() : fat_type());
 	const char *label = ext ? ext_label() : hfs ? hfs_label() : fat_label();
 	if (label[0]) {
-		vga_write(" \"");
-		vga_write(label);
-		vga_write("\"");
+		con_write(" \"");
+		con_write(label);
+		con_write("\"");
 	}
-	vga_write(" from /media -- safe to remove\n");
+	con_write(" from /media -- safe to remove\n");
 	if (ext)      ext_unmount();
 	else if (hfs) hfs_unmount();
 	else          fat_unmount();
@@ -1643,11 +1663,11 @@ static void bi_mount(const char *a)
 {
 	(void)a;
 	if (fat_mounted() || hfs_mounted() || ext_mounted()) {
-		vga_write("mount: a volume is already mounted at /media\n");
+		con_write("mount: a volume is already mounted at /media\n");
 		return;
 	}
 	if (blk_mount_fat() != 0)
-		vga_write("mount: no FAT/HFS+/ext volume found\n");
+		con_write("mount: no FAT/HFS+/ext volume found\n");
 }
 static void bi_beep(const char *a)     { (void)a; speaker_beep(1000, 200); }
 static void bi_play(const char *a)
@@ -1657,9 +1677,9 @@ static void bi_play(const char *a)
 	else if (fs_size(a) >= 0)               /* a file -> treat it as a WAV      */
 		sb16_play_wav(a);
 	else if (speaker_play(a) != 0) {
-		vga_write("play: unknown tune: ");
-		vga_write(a);
-		vga_write("\ntunes: twinkle, megalovania, sweden (or a .wav file)\n");
+		con_write("play: unknown tune: ");
+		con_write(a);
+		con_write("\ntunes: twinkle, megalovania, sweden (or a .wav file)\n");
 	}
 }
 static void bi_cpuinfo(const char *a)  { (void)a; cmd_cpuinfo(); }
@@ -1669,26 +1689,26 @@ static void bi_date(const char *a)     { (void)a; cmd_date(); }
 static void bi_neofetch(const char *a) { (void)a; neofetch(); }
 static void bi_ping(const char *a)
 {
-	if (a[0] == '\0') { vga_write("usage: ping <host>\n"); return; }
+	if (a[0] == '\0') { con_write("usage: ping <host>\n"); return; }
 	net_ping(a);
 }
 static void bi_dig(const char *a)
 {
-	if (a[0] == '\0') { vga_write("usage: dig <host> [type]\n"); return; }
+	if (a[0] == '\0') { con_write("usage: dig <host> [type]\n"); return; }
 	net_dig(a);
 }
 static void bi_ntp(const char *a)      { net_ntp(a); }
 static void bi_fstest(const char *a)     { (void)a; fs_selftest(); }
 static void bi_cryptotest(const char *a) { (void)a; crypto_selftest(); }
-static void bi_echo(const char *a)       { vga_write(a); vga_putc('\n'); }
+static void bi_echo(const char *a)       { con_write(a); con_putc('\n'); }
 static void bi_poweroff(const char *a)
 {
 	(void)a;
-	vga_write("powering off...\n");
+	con_write("powering off...\n");
 	power_off();
-	vga_write("poweroff not supported here\n");
+	con_write("poweroff not supported here\n");
 }
-static void bi_restart(const char *a)    { (void)a; vga_write("restarting...\n"); power_reset(); }
+static void bi_restart(const char *a)    { (void)a; con_write("restarting...\n"); power_reset(); }
 
 /* The one and only command list. Add a built-in here — that wires it into
  * dispatch, `which`, and `help` at once. Order is the order `help` prints.
@@ -1696,6 +1716,7 @@ static void bi_restart(const char *a)    { (void)a; vga_write("restarting...\n")
 static const struct builtin builtins[] = {
 	{ "help",     cmd_help,     "help          show this list" },
 	{ "clear",    bi_clear,     "clear         clear the screen" },
+	{ "journal",  bi_journal,   "journal       replay the verbose boot log" },
 	{ "uptime",   bi_uptime,    "uptime        seconds since boot" },
 	{ "sleep",    bi_sleep,     "sleep <secs>  block for a number of seconds" },
 	{ "meminfo",  bi_meminfo,   "meminfo       physical and heap memory usage" },
@@ -1717,7 +1738,6 @@ static const struct builtin builtins[] = {
 	{ "unzip",    cmd_unzip,    "unzip <s> [d] decompress a file (d defaults to <s> minus .z)" },
 	{ "gzip",     cmd_gzip,     "gzip <s> [d]  compress to gzip (d defaults to <s>.gz)" },
 	{ "gunzip",   cmd_gunzip,   "gunzip <s> [d] decompress a gzip file (d defaults to <s> minus .gz)" },
-	{ "run",      bi_run,       "run <f> [a|b] run a program (ring 3); a|b pipes a into b" },
 	{ "format",   bi_format,    "format        erase the filesystem" },
 	{ "lspci",    bi_lspci,     "lspci         list PCI devices" },
 	{ "ethdiag",  bi_ethdiag,   "ethdiag       Intel NIC bring-up log + link/traffic stats" },
@@ -1770,16 +1790,41 @@ static int is_builtin(const char *name)
 	return builtin_find(name) != NULL;
 }
 
+/* Run a command's builtin handler with its console output captured into `buf`,
+ * for the ring-3 terminal's bridge syscall: it lets the user-space shell reuse
+ * every kernel builtin (journal, neofetch, lspci, cpuinfo, date, ...) without
+ * each being re-implemented or given its own syscall. Returns the captured byte
+ * count, or -1 if the first token isn't a builtin (so the caller can fall back
+ * to launching a /bin program). */
+int shell_exec_capture(const char *cmd, char *buf, int max)
+{
+	char name[64];
+	int i = 0;
+	while (cmd[i] == ' ') i++;
+	int n = 0;
+	while (cmd[i] && cmd[i] != ' ' && n < (int)sizeof name - 1)
+		name[n++] = cmd[i++];
+	name[n] = '\0';
+	const struct builtin *b = builtin_find(name);
+	if (!b)
+		return -1;
+	const char *arg = cmd + i;
+	while (*arg == ' ') arg++;
+	con_capture_begin_ansi(buf, (uint32_t)max);   /* keep colors for the terminal */
+	b->fn(arg);
+	return (int)con_capture_end();
+}
+
 static void cmd_help(const char *a)
 {
 	(void)a;
-	vga_write("commands:\n");
+	con_write("commands:\n");
 	for (const struct builtin *b = builtins; b->name || b->help; b++) {
 		if (!b->help)
 			continue;
-		vga_write("  ");
-		vga_write(b->help);
-		vga_putc('\n');
+		con_write("  ");
+		con_write(b->help);
+		con_putc('\n');
 	}
 }
 
@@ -1789,7 +1834,7 @@ static void run(char *cmd)
 		return;                /* blank line                              */
 
 	/* "<cmd> > <file>": capture cmd's text output and write it to file.
-	 * Works for any built-in because all of them emit through vga_putc. */
+	 * Works for any built-in because all of them emit through con_putc. */
 	char *gt = cmd;
 	while (*gt && *gt != '>')
 		gt++;
@@ -1807,40 +1852,56 @@ static void run(char *cmd)
 			*--cend = '\0';
 
 		if (cmd[0] == '\0' || fname[0] == '\0') {
-			vga_write("usage: <command> > <file>\n");
+			con_write("usage: <command> > <file>\n");
 			return;
 		}
 		char *cap = kmalloc(REDIR_MAX);
 		if (!cap) {
-			vga_write("redirect: out of memory\n");
+			con_write("redirect: out of memory\n");
 			return;
 		}
-		vga_capture_begin(cap, REDIR_MAX);
+		con_capture_begin(cap, REDIR_MAX);
 		run(cmd);                              /* no '>' left: dispatches  */
-		uint32_t n = vga_capture_end();
+		uint32_t n = con_capture_end();
 		if (fs_create(fname, cap, n) == 0) {
-			vga_write("wrote ");
-			vga_write_dec(n);
-			vga_write(" bytes to ");
-			vga_write(fname);
-			vga_putc('\n');
+			con_write("wrote ");
+			con_write_dec(n);
+			con_write(" bytes to ");
+			con_write(fname);
+			con_putc('\n');
 		} else {
-			vga_write("redirect: write failed\n");
+			con_write("redirect: write failed\n");
 		}
 		kfree(cap);
 		return;
 	}
 
-	/* Generic pipe "A | B": capture A's console output and feed it to B as
-	 * piped input, which input-consuming builtins (grep) read. Each stage's
-	 * capture ends before the next runs, so pipes chain (A | grep x | grep y).
-	 * Program pipelines ("run a | b") have their own concurrent path inside
-	 * cmd_run, so those are left to it. */
-	if (after_prefix(cmd, "run ") == NULL) {
+	/* Pipe "A | B". Two cases by what B is:
+	 *  - B is a program  -> run A and B concurrently through a real kernel pipe
+	 *    (cmd_run); A's stdout becomes B's stdin. This is how program pipelines
+	 *    work now that there is no `run` keyword.
+	 *  - B is a builtin (grep) -> capture A's console output and hand it to B as
+	 *    piped input it reads from g_pipe_in. Chains: A | grep x | grep y. */
+	{
 		char *bar = cmd;
 		while (*bar && *bar != '|')
 			bar++;
 		if (*bar == '|') {
+			/* Peek B's first token without disturbing cmd. */
+			char *rp = bar + 1;
+			while (*rp == ' ')
+				rp++;
+			char rname[64];
+			int rn = 0;
+			while (rp[rn] && rp[rn] != ' ' && rn < (int)sizeof(rname) - 1) {
+				rname[rn] = rp[rn];
+				rn++;
+			}
+			rname[rn] = '\0';
+			if (!builtin_find(rname)) {        /* B is a program: real pipe   */
+				cmd_run(cmd);                  /* splits on '|', spawns both    */
+				return;
+			}
 			*bar = '\0';
 			char *left = cmd, *right = bar + 1;
 			while (*right == ' ')
@@ -1849,17 +1910,17 @@ static void run(char *cmd)
 			while (lend > left && lend[-1] == ' ')
 				*--lend = '\0';
 			if (left[0] == '\0' || right[0] == '\0') {
-				vga_write("usage: <command> | grep <pattern>\n");
+				con_write("usage: <command> | grep <pattern>\n");
 				return;
 			}
 			char *cap = kmalloc(REDIR_MAX);
 			if (!cap) {
-				vga_write("pipe: out of memory\n");
+				con_write("pipe: out of memory\n");
 				return;
 			}
-			vga_capture_begin(cap, REDIR_MAX);
+			con_capture_begin(cap, REDIR_MAX);
 			run(left);
-			uint32_t n = vga_capture_end();
+			uint32_t n = con_capture_end();
 			if (n >= REDIR_MAX)
 				n = REDIR_MAX - 1;
 			cap[n] = '\0';
@@ -1901,9 +1962,9 @@ static void run(char *cmd)
 	if (pid >= 0) {
 		wait_reap(pid);
 	} else if (ac > 0) {
-		vga_write("unknown command: ");
-		vga_write(av[0]);
-		vga_write("\ntype 'help'\n");
+		con_write("unknown command: ");
+		con_write(av[0]);
+		con_write("\ntype 'help'\n");
 	}
 }
 
@@ -1911,8 +1972,8 @@ void shell_feed(char c)
 {
 	switch (c) {
 	case '\n':
-		vga_set_pos((uint16_t)(edit_start + line_len));  /* end of line     */
-		vga_putc('\n');
+		con_set_pos((uint16_t)(edit_start + line_len));  /* end of line     */
+		con_putc('\n');
 		line[line_len] = '\0';
 		hist_add(line);
 		run(line);
@@ -1926,7 +1987,7 @@ void shell_feed(char c)
 			cursor--;
 			line_len--;
 			if (at_end) {              /* fast path: just erase the last char */
-				vga_putc('\b');
+				con_putc('\b');
 				render_len = line_len;
 			} else {
 				edit_redraw();
@@ -1943,19 +2004,19 @@ void shell_feed(char c)
 		return;
 	case KEY_LEFT:
 		if (cursor > 0)
-			vga_set_pos((uint16_t)(edit_start + --cursor));
+			con_set_pos((uint16_t)(edit_start + --cursor));
 		return;
 	case KEY_RIGHT:
 		if (cursor < line_len)
-			vga_set_pos((uint16_t)(edit_start + ++cursor));
+			con_set_pos((uint16_t)(edit_start + ++cursor));
 		return;
 	case KEY_HOME:
 		cursor = 0;
-		vga_set_pos(edit_start);
+		con_set_pos(edit_start);
 		return;
 	case KEY_END:
 		cursor = line_len;
-		vga_set_pos((uint16_t)(edit_start + line_len));
+		con_set_pos((uint16_t)(edit_start + line_len));
 		return;
 	case KEY_UP:
 		hist_up();
@@ -1968,9 +2029,9 @@ void shell_feed(char c)
 		edit_redraw();
 		return;
 	case KEY_CLEAR:                        /* Ctrl+L: clear, keep the line     */
-		vga_clear();
+		con_clear();
 		print_prompt();
-		edit_start = vga_get_pos();
+		edit_start = con_get_pos();
 		render_len = 0;
 		edit_redraw();
 		return;
@@ -1987,8 +2048,8 @@ void shell_feed(char c)
 			cursor++;
 			line_len++;
 			if (at_end) {              /* fast path: just echo the new char  */
-				uint32_t s0 = vga_scroll_count();
-				vga_putc(c);
+				uint32_t s0 = con_scroll_count();
+				con_putc(c);
 				render_len = line_len;
 				edit_fix_anchor(s0);   /* the echo may have scrolled         */
 			} else {
@@ -2004,13 +2065,19 @@ void shell_feed(char c)
  * itself; by the time control is back here the line is already empty.) */
 void shell_interrupt(void)
 {
-	vga_set_pos((uint16_t)(edit_start + line_len));
-	vga_write("^C\n");
+	con_set_pos((uint16_t)(edit_start + line_len));
+	con_write("^C\n");
 	prompt();
 }
 
 void shell_init(void)
 {
-	vga_write("\ntype 'help' for a list of commands.\n");
+	/* The shell now owns the console: stop journaling so interactive traffic
+	 * isn't logged, and clear the screen so the terminal opens clean -- whether
+	 * the boot was quiet (nothing drawn) or verbose (boot log still on screen).
+	 * The bring-up log is in the journal; `journal` replays it. */
+	journal_capture(0);
+	con_clear();
+	con_write("type 'help' for commands, 'journal' for the boot log.\n");
 	prompt();
 }

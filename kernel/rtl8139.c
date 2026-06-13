@@ -15,7 +15,7 @@
 #include "pci.h"
 #include "irq.h"
 #include "heap.h"
-#include "vga.h"
+#include "console.h"
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -43,8 +43,8 @@ static inline void irq_restore(uint32_t f)
 static void print_hex2(uint8_t v)
 {
 	static const char h[] = "0123456789abcdef";
-	vga_putc(h[v >> 4]);
-	vga_putc(h[v & 0xF]);
+	con_putc(h[v >> 4]);
+	con_putc(h[v & 0xF]);
 }
 
 /* -------------------------------------------------------------- RTL8139 regs */
@@ -187,12 +187,12 @@ static int rtl8139_probe(void)
 	for (int i = 0; i < TX_BUFS; i++)
 		tx_buf[i] = kmalloc(2048);
 	if (!rx_buf) {
-		vga_write("net: RX buffer allocation failed\n");
+		con_write("net: RX buffer allocation failed\n");
 		return 0;
 	}
 	for (int i = 0; i < TX_BUFS; i++) {
 		if (!tx_buf[i]) {
-			vga_write("net: TX buffer allocation failed\n");
+			con_write("net: TX buffer allocation failed\n");
 			return 0;
 		}
 	}
@@ -222,17 +222,17 @@ static int rtl8139_probe(void)
 
 	nic_found = 1;
 
-	vga_write("net: RTL8139 at io ");
-	vga_write_hex(io_base);
-	vga_write(" irq ");
-	vga_write_dec(irq);
-	vga_write(" mac ");
+	con_write("net: RTL8139 at io ");
+	con_write_hex(io_base);
+	con_write(" irq ");
+	con_write_dec(irq);
+	con_write(" mac ");
 	for (int i = 0; i < 6; i++) {
 		print_hex2(mac[i]);
 		if (i < 5)
-			vga_putc(':');
+			con_putc(':');
 	}
-	vga_putc('\n');
+	con_putc('\n');
 	return 1;
 }
 

@@ -22,7 +22,7 @@
 #include "nvme.h"
 #include "pci.h"
 #include "paging.h"
-#include "vga.h"
+#include "console.h"
 
 #define NVME_CLASS    0x01
 #define NVME_SUBCLASS 0x08
@@ -197,13 +197,13 @@ void nvme_init(void)
 {
 	uint8_t bus, slot, func;
 	if (!find_controller(&bus, &slot, &func)) {
-		vga_write("nvme: no controller found\n");
+		con_write("nvme: no controller found\n");
 		return;
 	}
 
 	uint32_t bar0 = pci_read32(bus, slot, func, 0x10) & 0xFFFFFFF0u;
 	if (!bar0) {
-		vga_write("nvme: controller has no MMIO base\n");
+		con_write("nvme: controller has no MMIO base\n");
 		return;
 	}
 
@@ -211,7 +211,7 @@ void nvme_init(void)
 	pci_write32(bus, slot, func, 0x04, cmd | 0x06);   /* memory space + bus master */
 
 	if (paging_identity_map(bar0, 0x2000) != 0) {
-		vga_write("nvme: could not map MMIO\n");
+		con_write("nvme: could not map MMIO\n");
 		return;
 	}
 	bar = (volatile uint32_t *)bar0;
@@ -221,7 +221,7 @@ void nvme_init(void)
 	/* Disable the controller before reprogramming the admin queues. */
 	reg_wr(REG_CC, reg_rd(REG_CC) & ~CC_EN);
 	if (wait_ready(0)) {
-		vga_write("nvme: controller did not quiesce\n");
+		con_write("nvme: controller did not quiesce\n");
 		return;
 	}
 
@@ -232,7 +232,7 @@ void nvme_init(void)
 	io_q.cq    = palloc();
 	dbuf       = palloc();
 	if (!admin_q.sq || !admin_q.cq || !io_q.sq || !io_q.cq || !dbuf) {
-		vga_write("nvme: out of DMA frames\n");
+		con_write("nvme: out of DMA frames\n");
 		return;
 	}
 	admin_q.sq_tail = admin_q.cq_head = 0;
@@ -249,7 +249,7 @@ void nvme_init(void)
 	/* CC: IOSQES=6 (64-B SQ entries), IOCQES=4 (16-B CQ entries), MPS=0, EN=1. */
 	reg_wr(REG_CC, (6 << 16) | (4 << 20) | CC_EN);
 	if (wait_ready(CSTS_RDY)) {
-		vga_write("nvme: controller did not become ready\n");
+		con_write("nvme: controller did not become ready\n");
 		return;
 	}
 
@@ -264,7 +264,7 @@ void nvme_init(void)
 	c[10] = ((QDEPTH - 1) << 16) | 1;         /* CDW10: queue size-1 | qid=1      */
 	c[11] = 1;                                 /* CDW11: PC=1, interrupts off      */
 	if (submit(&admin_q, c) != 0) {
-		vga_write("nvme: create CQ failed\n");
+		con_write("nvme: create CQ failed\n");
 		return;
 	}
 
@@ -272,7 +272,7 @@ void nvme_init(void)
 	c[10] = ((QDEPTH - 1) << 16) | 1;         /* CDW10: queue size-1 | qid=1      */
 	c[11] = (1u << 16) | 1;                    /* CDW11: CQID=1, PC=1              */
 	if (submit(&admin_q, c) != 0) {
-		vga_write("nvme: create SQ failed\n");
+		con_write("nvme: create SQ failed\n");
 		return;
 	}
 
@@ -298,16 +298,16 @@ void nvme_init(void)
 	}
 
 	found = 1;
-	vga_write("nvme: namespace 1 ready");
+	con_write("nvme: namespace 1 ready");
 	if (model[0]) {
-		vga_write(" [");
-		vga_write(model);
-		vga_putc(']');
+		con_write(" [");
+		con_write(model);
+		con_putc(']');
 	}
 	if (cap_sectors) {
-		vga_write(", ");
-		vga_write_dec(cap_sectors / 2048);    /* 512-B blocks -> MiB              */
-		vga_write(" MiB");
+		con_write(", ");
+		con_write_dec(cap_sectors / 2048);    /* 512-B blocks -> MiB              */
+		con_write(" MiB");
 	}
-	vga_putc('\n');
+	con_putc('\n');
 }

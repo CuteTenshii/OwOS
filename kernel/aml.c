@@ -33,7 +33,13 @@
 #define MAX_DEPTH   16
 #define ARENA_SIZE  (64 * 1024)
 #define MAX_WHILE   50000
-#define MAX_CALL    24
+#define MAX_CALL    12   /* nested AML method calls: each pushes a ~580-byte
+                          * struct frame on the kernel thread's 16 KiB stack    */
+#define MAX_RDEPTH  16   /* combined aml_eval/exec_list C-recursion depth.
+                          * Bounds total kernel-stack use so a deep or hostile
+                          * real DSDT can't overflow the 16 KiB thread stack and
+                          * corrupt a neighbouring thread's stack — the
+                          * interpreter must fail gracefully, never crash.       */
 
 /* Wall-clock budget for evaluating one method. Real _BST methods often spin a
  * `While (EC-not-ready)` poll, and EC reads are milliseconds each, so without a
@@ -717,9 +723,11 @@ static const uint8_t *g_p, *g_end;
 static const uint32_t *g_scope;
 static int g_sdepth;
 static int g_depth;          /* method-call recursion depth */
+static int g_rdepth;         /* combined aml_eval/exec_list C-recursion depth */
 static int g_failed;
 
 static struct obj aml_eval(struct frame *fr);       /* one TermArg (may be REF) */
+static struct obj aml_eval_inner(struct frame *fr);
 static void exec_list(struct frame *fr, const uint8_t *p, const uint8_t *end);
 static struct obj eval_named_value(struct ns_node *n, struct frame *fr);
 
@@ -954,7 +962,21 @@ static struct obj eval_package(struct frame *fr)
 
 /* Evaluate one TermArg starting at g_p. Returns an object (possibly a T_REF for
  * lvalue producers like Index / a bare Name / Local / Arg). */
+/* Depth-guarded entry point. aml_eval and exec_list are mutually recursive with
+ * no natural bound; on a real DSDT a deeply nested expression or method chain
+ * would otherwise overflow the kernel thread's 16 KiB stack and silently corrupt
+ * an adjacent thread's stack (observed as a GP fault returning to a garbage EIP
+ * in a wholly unrelated thread). Cap the combined depth and fail gracefully. */
 static struct obj aml_eval(struct frame *fr)
+{
+	if (g_rdepth >= MAX_RDEPTH) { fail("eval depth"); return mk_int(0); }
+	g_rdepth++;
+	struct obj o = aml_eval_inner(fr);
+	g_rdepth--;
+	return o;
+}
+
+static struct obj aml_eval_inner(struct frame *fr)
 {
 	if (g_failed || g_p >= g_end) { fail("truncated"); return mk_int(0); }
 	uint8_t op = *g_p++;
@@ -1177,6 +1199,9 @@ static struct obj eval_named_value(struct ns_node *n, struct frame *fr)
  * scope is taken from g_scope/g_sdepth set by the caller. */
 static void exec_list(struct frame *fr, const uint8_t *start, const uint8_t *end)
 {
+	if (g_rdepth >= MAX_RDEPTH) { fail("eval depth"); return; }
+	g_rdepth++;
+
 	const uint8_t *sp = g_p, *se = g_end;
 	g_p = start; g_end = end;
 
@@ -1239,6 +1264,7 @@ static void exec_list(struct frame *fr, const uint8_t *start, const uint8_t *end
 	}
 
 	g_p = sp; g_end = se;
+	g_rdepth--;
 }
 
 /* ---- namespace build driver --------------------------------------------- */
@@ -1302,7 +1328,7 @@ static int eval_method_pkg(struct ns_node *m, struct obj *out_pkg)
 {
 	arena_used = 0;
 	for (int i = 0; i < node_count; i++) nodes[i].materialized = 0;
-	g_failed = 0; g_depth = 0; err_buf[0] = 0;
+	g_failed = 0; g_depth = 0; g_rdepth = 0; err_buf[0] = 0;
 	g_start_us = timer_us();              /* start this method's time budget */
 
 	struct frame fr;
@@ -1317,6 +1343,42 @@ static int eval_method_pkg(struct ns_node *m, struct obj *out_pkg)
 	if (r.type != T_PKG) { set_err("method returned non-package"); return 0; }
 	*out_pkg = r;
 	return 1;
+}
+
+/* Evaluate an integer-returning method (e.g. _STA). Returns 1 and writes *out
+ * on success, 0 if the method failed or didn't return an integer. */
+static int eval_method_int(struct ns_node *m, uint64_t *out)
+{
+	arena_used = 0;
+	for (int i = 0; i < node_count; i++) nodes[i].materialized = 0;
+	g_failed = 0; g_depth = 0; g_rdepth = 0; err_buf[0] = 0;
+	g_start_us = timer_us();
+
+	struct frame fr;
+	for (int i = 0; i < 8; i++) fr.local[i] = mk_int(0);
+	for (int i = 0; i < 7; i++) fr.arg[i] = mk_int(0);
+	fr.returning = 0; fr.retval = mk_int(0);
+
+	g_scope = m->seg; g_sdepth = m->depth;
+	exec_list(&fr, m->body, m->body + m->body_len);
+	if (g_failed) return 0;
+	*out = to_int(read_through(fr.retval));
+	return 1;
+}
+
+/* _STA bit 4 (0x10) is "battery present". Some hypervisors (VMware) declare a
+ * phantom battery device whose _BST/_BIF still evaluate — to a flat 0% — even
+ * though no battery exists; honour _STA so we report "no battery" instead of a
+ * bogus 0%. _STA absent or unevaluable => assume present (don't suppress a real
+ * battery we just can't query). */
+int aml_battery_present(void)
+{
+	if (!build_namespace()) return 1;
+	struct ns_node *sta = batt_method("_STA");
+	if (!sta) return 1;
+	uint64_t st = 0;
+	if (!eval_method_int(sta, &st)) return 1;
+	return (st & 0x10) ? 1 : 0;
 }
 
 int aml_read_battery(struct aml_battery *out)
