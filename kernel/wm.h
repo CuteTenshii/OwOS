@@ -55,6 +55,9 @@ struct window {
 	void     (*draw)(struct window *w, int cx, int cy, int cw, int ch,
 	                 int focused);
 	void     (*click)(struct window *w, int mx, int my);
+	/* A right-press landed in the client area (mx,my). Apps use it to open a
+	 * context menu at the cursor. NULL = the right button is ignored. */
+	void     (*rclick)(struct window *w, int mx, int my);
 	uint32_t (*dirty)(struct window *w);
 	void     (*key)(struct window *w, char c);  /* a key while focused         */
 	void     (*on_close)(struct window *w);     /* close box clicked (else hide) */

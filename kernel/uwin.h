@@ -28,6 +28,7 @@
 #define WEV_CLOSE  3                   /* the close box was clicked            */
 #define WEV_RESIZE 4                   /* a,b: new client w,h (app opted in)    */
 #define WEV_DBLCLICK 5                 /* a,b: client x,y of a double click     */
+#define WEV_RCLICK 6                   /* a,b: client x,y of a right click      */
 
 struct win_event {
 	uint32_t type;

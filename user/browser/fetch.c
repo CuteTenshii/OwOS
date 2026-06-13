@@ -181,12 +181,180 @@ static int raw_sink(void *ctx, const unsigned char *p, unsigned n)
 	return 0;
 }
 
+/* Bulk counterpart to body_src for the uncompressed download path: copies whole
+ * runs straight out of the socket buffer rather than a byte at a time, so a
+ * multi-megabyte file isn't shuttled through one function call per byte. Returns
+ * the number of body bytes placed in out[] (0 at end of body). The per-byte
+ * body_src is reused only to step across chunk-size headers (once per chunk). */
+static int body_fill(struct bodysrc *b, unsigned char *out, int max)
+{
+	int got = 0;
+	while (got < max && !b->done) {
+		if (b->chunked && b->remaining == 0) {
+			int c = body_src(b);            /* crosses the chunk header */
+			if (c < 0) break;
+			out[got++] = (unsigned char)c;
+			continue;
+		}
+		if (b->have_len && b->remaining == 0) { b->done = 1; break; }
+		if (B->rpos >= B->rlen) {               /* refill from the socket */
+			if (B->reof) { if (!b->chunked && !b->have_len) b->done = 1; break; }
+			int rn = net_recv(B->sock, B->rbuf, (int)sizeof B->rbuf);
+			if (rn < 0) { b->done = 1; break; }
+			if (rn == 0) {
+				B->reof = 1;
+				if (!b->chunked && !b->have_len) b->done = 1;
+				break;
+			}
+			B->rpos = 0; B->rlen = rn;
+		}
+		int avail = B->rlen - B->rpos;
+		if (avail > max - got) avail = max - got;
+		if ((b->chunked || b->have_len) && (unsigned)avail > b->remaining)
+			avail = (int)b->remaining;
+		for (int i = 0; i < avail; i++) out[got + i] = B->rbuf[B->rpos + i];
+		B->rpos += avail;
+		got += avail;
+		if (b->chunked || b->have_len) b->remaining -= (unsigned)avail;
+	}
+	return got;
+}
+
+/* ------------------------------------------------------------- downloads */
+
+#define DL_DIR "/home/root/Downloads"
+
+/* A response is a download when the server flags it as an attachment, or its
+ * Content-Type is something the browser can't render in the pane (anything that
+ * isn't HTML, plain text, or an image — images get their own viewer/notice). An
+ * empty Content-Type is treated as HTML, the common sloppy-server case. */
+static int is_download(void)
+{
+	if (B->cdisp_attach) return 1;
+	if (B->ctype[0] == '\0') return 0;
+	if (has_sub(B->ctype, "html")) return 0;
+	if (starts_ci(B->ctype, "text/")) return 0;
+	if (starts_ci(B->ctype, "image/")) return 0;
+	return 1;
+}
+
+/* Copy the last path component of `in` into `out`, dropping any directory
+ * prefix and a trailing "?query" — so "/files/a/b.zip?x=1" -> "b.zip". */
+static void basename_of(const char *in, char *out, int cap)
+{
+	const char *last = in;
+	for (const char *p = in; *p; p++)
+		if (*p == '/' || *p == '\\') last = p + 1;
+	int k = 0;
+	for (; last[k] && last[k] != '?' && k < cap - 1; k++) out[k] = last[k];
+	out[k] = '\0';
+}
+
+/* Choose a filename for the download: the Content-Disposition name if any, else
+ * the URL's last path segment, else a generic fallback. */
+static void derive_filename(const char *url, char *out, int cap)
+{
+	if (B->dl_name[0]) {
+		basename_of(B->dl_name, out, cap);
+		if (out[0]) return;
+	}
+	struct purl u;
+	if (parse_url(url, &u)) {
+		basename_of(u.path, out, cap);
+		if (out[0]) return;
+	}
+	int k = 0;
+	sapp(out, &k, cap, "download.bin");
+}
+
+/* Build DL_DIR/<base> for attempt 0, or DL_DIR/<stem>-<n><ext> for n>=1, so a
+ * repeated download lands beside the original instead of clobbering it. */
+static void build_path(const char *base, int n, char *out, int cap)
+{
+	int p = 0;
+	sapp(out, &p, cap, DL_DIR "/");
+	if (n == 0) { sapp(out, &p, cap, base); return; }
+	int dot = -1;
+	for (int i = 0; base[i]; i++) if (base[i] == '.') dot = i;
+	if (dot <= 0) {                                /* no usable extension      */
+		sapp(out, &p, cap, base);
+		sapp(out, &p, cap, "-"); uapp(out, &p, cap, (unsigned)n);
+	} else {
+		for (int i = 0; i < dot && p < cap - 1; i++) out[p++] = base[i];
+		out[p] = '\0';
+		sapp(out, &p, cap, "-"); uapp(out, &p, cap, (unsigned)n);
+		sapp(out, &p, cap, base + dot);            /* ".ext"                   */
+	}
+}
+
+/* inflate sink: push decompressed bytes straight to the open stream, halting the
+ * inflater (return -1) the moment a disk write fails. */
+struct dlsink { int fail; };
+static int file_sink(void *ctx, const unsigned char *p, unsigned n)
+{
+	struct dlsink *d = ctx;
+	if (stream_write(p, (int)n) < 0) { d->fail = 1; return -1; }
+	return 0;
+}
+
+/* Stream the response body straight to ~/Downloads rather than buffering it, so
+ * a download is bounded only by the disk, never by RAW_MAX. Picks a
+ * non-clobbering name, inflates on the fly when the body is compressed, and
+ * reports the outcome through the status line and content pane. */
+static void stream_download(const char *url, struct bodysrc *bs, int enc_gz)
+{
+	char base[128];
+	derive_filename(url, base, sizeof base);
+
+	char path[256], probe[1];
+	for (int n = 0; n < 100; n++) {
+		build_path(base, n, path, sizeof path);
+		if (readfile(path, probe, 0) < 0) break;   /* first free name           */
+	}
+
+	struct dlsink d = { 0 };
+	int wrote = -1;
+	if (stream_begin(path) == 0) {
+		if (enc_gz) {
+			inflate_http(body_src, bs, file_sink, &d);
+		} else {
+			/* Bulk-read into a page-sized buffer, then one stream_write per fill. */
+			unsigned char buf[4096]; int got;
+			while ((got = body_fill(bs, buf, (int)sizeof buf)) > 0)
+				if (stream_write(buf, got) < 0) { d.fail = 1; break; }
+		}
+		wrote = stream_end();   /* commits + returns the size; -1 after a failed write */
+	}
+
+	B->mode = MODE_TEXT;
+	{ int ci = 0; sapp(B->cur_url, &ci, sizeof B->cur_url, url); }
+	B->scroll = 0;
+
+	char msg[256]; int m = 0;
+	if (!d.fail && wrote >= 0) {
+		sapp(msg, &m, sizeof msg, "Saved to ");
+		sapp(msg, &m, sizeof msg, path);
+		sapp(msg, &m, sizeof msg, "  (");
+		uapp(msg, &m, sizeof msg, (unsigned)wrote);
+		sapp(msg, &m, sizeof msg, " bytes)");
+	} else {
+		sapp(msg, &m, sizeof msg,
+		     "Download failed (disk full or cannot write to " DL_DIR ")");
+	}
+	doc_message(msg);
+	set_status(msg);
+	B->dl_saved = 1;
+}
+
 /* ----------------------------------------------------------- transaction */
 
-static int http_txn(const struct purl *u, const char *full_url, char *loc, int loc_cap)
+static int http_txn(const struct purl *u, const char *full_url, char *loc,
+                    int loc_cap, int allow_dl)
 {
 	loc[0] = '\0';
 	B->ctype[0] = '\0';
+	B->dl_name[0] = '\0';
+	B->cdisp_attach = 0;
 	B->rpos = B->rlen = B->reof = 0;
 	B->raw_len = 0;
 
@@ -273,6 +441,31 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
 			       k < (int)sizeof B->ctype - 1)
 				B->ctype[k++] = lower(*v++);
 			B->ctype[k] = '\0';
+		} else if (starts_ci(line, "content-disposition:")) {
+			/* "attachment" forces a download regardless of type; a filename=
+			 * param (quoted or bare token) names the saved file. filename*=
+			 * (RFC 5987 extended form) is skipped — we prefer the plain one. */
+			const char *v = line + 20;
+			for (const char *q = v; *q && *q != '\n'; q++)
+				if (starts_ci(q, "attachment")) { B->cdisp_attach = 1; break; }
+			for (const char *q = v; *q && *q != '\n'; q++) {
+				if (!starts_ci(q, "filename")) continue;
+				const char *f = q + 8;
+				if (*f == '*') continue;           /* filename*= : skip       */
+				while (*f == ' ') f++;
+				if (*f != '=') continue;
+				f++;
+				while (*f == ' ') f++;
+				int quoted = (*f == '"'); if (quoted) f++;
+				int k = 0;
+				while (*f && *f != '\r' && *f != '\n' &&
+				       k < (int)sizeof B->dl_name - 1) {
+					if (quoted ? (*f == '"') : (*f == ';' || *f == ' ')) break;
+					B->dl_name[k++] = *f++;
+				}
+				B->dl_name[k] = '\0';
+				break;
+			}
 		} else if (starts_ci(line, "set-cookie:")) {
 			const char *v = line + 11;
 			while (*v == ' ') v++;
@@ -288,6 +481,17 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
 
 	struct bodysrc bs = { chunked, have_len, 0, 0,
 	                      have_len ? content_len : 0 };
+
+	/* A download (attachment, or a non-renderable Content-Type) on a successful
+	 * response streams straight to ~/Downloads — decided here, before the body is
+	 * read, so binary content never has to fit in B->raw. Redirects (3xx) and
+	 * sub-resource fetches (allow_dl == 0) take the buffered path below. */
+	if (allow_dl && status >= 200 && status < 300 && is_download()) {
+		stream_download(full_url, &bs, enc_gz);
+		net_close(B->sock);
+		return status;
+	}
+
 	if (enc_gz) {
 		/* Compressed body: stream it through the inflater, which pulls framed
 		 * body bytes via body_src and pushes decompressed bytes into raw_sink.
@@ -339,7 +543,7 @@ static void fetch_inline_images(const char *page_url)
 		set_status(msg);
 
 		char loc[URL_MAX];
-		int st = http_txn(&u, full, loc, sizeof loc);
+		int st = http_txn(&u, full, loc, sizeof loc, 0);
 		if (st != 200 || B->raw_len < 8) continue;
 		if ((unsigned char)B->raw[0] != 0x89 || B->raw[1] != 'P' ||
 		    B->raw[2] != 'N' || B->raw[3] != 'G') continue;          /* PNG only */
@@ -360,10 +564,186 @@ static void fetch_inline_images(const char *page_url)
 	}
 }
 
+/* ----------------------------------------------- local & inline URL schemes */
+
+static int hexval(int c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+static int b64val(int c)
+{
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return -1;
+}
+
+/* Render whatever is in B->raw (with B->ctype already set) as the page body —
+ * HTML, plain text, or a PNG. Shared by the network, file:, and data: paths so
+ * all three pick the display mode the same way. Does not fetch sub-resources. */
+static void render_raw(const char *url)
+{
+	if (B->ctype[0] == '\0' || has_sub(B->ctype, "html")) {
+		B->mode = MODE_HTML; html_to_text();
+	} else if (starts_ci(B->ctype, "image/png")) {
+		B->mode = MODE_IMAGE;
+		B->text_len = 0; B->nlinks = 0; B->doc_title[0] = '\0';
+	} else if (starts_ci(B->ctype, "image/")) {
+		B->mode = MODE_TEXT;
+		doc_message("[unsupported image type - only PNG can be shown]");
+	} else {
+		B->mode = MODE_TEXT; plain_to_text();
+	}
+	B->scroll = 0;
+	{ int ci = 0; sapp(B->cur_url, &ci, sizeof B->cur_url, url); }
+}
+
+/* Pick a Content-Type for a local file from its extension — only the
+ * distinctions render_raw cares about (HTML vs PNG vs everything-else-as-text);
+ * an unknown or missing extension renders verbatim as text. */
+static void ctype_from_ext(const char *path)
+{
+	const char *ext = 0;
+	for (const char *q = path; *q; q++) {
+		if (*q == '/' || *q == '\\') ext = 0;
+		else if (*q == '.')          ext = q + 1;
+	}
+	const char *t = "text/plain";
+	if (ext) {
+		if      (streq_ci(ext, "html") || streq_ci(ext, "htm")) t = "text/html";
+		else if (streq_ci(ext, "png"))                          t = "image/png";
+	}
+	int k = 0; sapp(B->ctype, &k, sizeof B->ctype, t);
+}
+
+/* file:// — read a file from the local FS (owofs or a /media mount) into B->raw,
+ * bounded by RAW_MAX and streamed so a file larger than the read buffer still
+ * loads. Accepts file:/path, file://host/path (host ignored), file:///path; a
+ * trailing ?query or #fragment is dropped. Returns 0, or -1 if it can't open. */
+static int load_file_url(const char *url)
+{
+	const char *p = url + 5;            /* past "file:" */
+	if (p[0] == '/' && p[1] == '/') {   /* "//" then an (ignored) host       */
+		p += 2;
+		while (*p && *p != '/') p++;
+	}
+	if (*p != '/') return -1;           /* need an absolute local path       */
+
+	char path[URL_MAX]; int pn = 0;
+	for (const char *q = p; *q && *q != '?' && *q != '#' &&
+	                        pn < (int)sizeof path - 1; q++)
+		path[pn++] = *q;
+	path[pn] = '\0';
+
+	B->raw_len = 0;
+	unsigned off = 0;
+	for (;;) {
+		int want = RAW_MAX - B->raw_len;
+		if (want <= 0) break;
+		if (want > 4096) want = 4096;
+		int got = readfile_at(path, off, B->raw + B->raw_len, (unsigned)want);
+		if (got < 0) return -1;
+		if (got == 0) break;            /* end of file                       */
+		B->raw_len += got;
+		off        += (unsigned)got;
+	}
+	ctype_from_ext(path);
+	return 0;
+}
+
+/* data:[<mediatype>][;base64],<data> — decode an inline document into B->raw.
+ * The media type (default text/plain) sets B->ctype so render_raw shows HTML/
+ * text/PNG correctly; the payload is base64- or percent-decoded. A non-base64
+ * body keeps '+' literal (unlike form-encoding). Returns 0, or -1 if malformed. */
+static int load_data_url(const char *url)
+{
+	const char *p = url + 5;            /* past "data:" */
+	const char *comma = p;
+	while (*comma && *comma != ',') comma++;
+	if (*comma != ',') return -1;       /* a data URL must have a comma       */
+
+	char mt[80]; int mi = 0, base64 = 0;
+	const char *h = p;
+	while (h < comma && *h != ';') {    /* the media type "type/subtype"      */
+		if (mi < (int)sizeof mt - 1) mt[mi++] = lower(*h);
+		h++;
+	}
+	mt[mi] = '\0';
+	while (h < comma) {                 /* ';'-separated params               */
+		h++;
+		const char *tok = h;
+		while (h < comma && *h != ';') h++;
+		if (h - tok == 6 && starts_ci(tok, "base64")) base64 = 1;
+		/* charset= and other params are ignored                             */
+	}
+
+	int k = 0;
+	B->ctype[0] = '\0';
+	sapp(B->ctype, &k, sizeof B->ctype, mt[0] ? mt : "text/plain");
+
+	const char *d = comma + 1;
+	B->raw_len = 0;
+	if (base64) {
+		int acc = 0, nb = 0;
+		for (; *d && *d != '='; d++) {
+			int v = b64val((unsigned char)*d);
+			if (v < 0) continue;        /* skip whitespace/newlines           */
+			acc = (acc << 6) | v; nb += 6;
+			if (nb >= 8) {
+				nb -= 8;
+				if (B->raw_len >= RAW_MAX) break;
+				B->raw[B->raw_len++] = (char)((acc >> nb) & 0xff);
+			}
+		}
+	} else {
+		for (; *d && B->raw_len < RAW_MAX; d++) {
+			int c = (unsigned char)*d;
+			if (c == '%') {
+				int hi = hexval((unsigned char)d[1]);
+				int lo = hi < 0 ? -1 : hexval((unsigned char)d[2]);
+				if (lo >= 0) { c = hi * 16 + lo; d += 2; }
+			}
+			B->raw[B->raw_len++] = (char)c;
+		}
+	}
+	return 0;
+}
+
 void do_fetch(void)
 {
 	char url[URL_MAX]; int n = 0;
 	sapp(url, &n, sizeof url, B->req_url);
+	B->dl_saved = 0;
+
+	/* Local / inline schemes never touch the network: file:// reads the local
+	 * FS, data: decodes an embedded document. Both fill B->raw + B->ctype and
+	 * render through the same path as a fetched page (no sub-resource fetch). */
+	if (starts_ci(url, "file:") || starts_ci(url, "data:")) {
+		int data = starts_ci(url, "data:");
+		B->ctype[0] = '\0'; B->dl_name[0] = '\0'; B->cdisp_attach = 0;
+		B->rpos = B->rlen = B->reof = 0;
+		B->n_imgs = 0;
+		int rc = data ? load_data_url(url) : load_file_url(url);
+		if (rc < 0) {
+			set_status(data ? "Malformed data: URL"
+			                : "Cannot open file (not found or not absolute)");
+			return;
+		}
+		render_raw(url);
+		char done[256]; int dn = 0;
+		sapp(done, &dn, sizeof done, data ? "data:  -  " : "file:  -  ");
+		uapp(done, &dn, sizeof done, (unsigned)B->raw_len);
+		sapp(done, &dn, sizeof done, " bytes  -  ");
+		sapp(done, &dn, sizeof done, url);
+		set_status(done);
+		return;
+	}
 
 	for (int hop = 0; hop <= MAX_REDIR; hop++) {
 		struct purl u;
@@ -383,7 +763,7 @@ void do_fetch(void)
 		set_status(msg);
 
 		char loc[URL_MAX];
-		int st = http_txn(&u, url, loc, sizeof loc);
+		int st = http_txn(&u, url, loc, sizeof loc, 1);
 		if (st < 0) {
 			if      (st == -2) set_status("Could not resolve host");
 			else if (st == -1) set_status("No network device / out of sockets");
@@ -398,22 +778,15 @@ void do_fetch(void)
 			continue;
 		}
 
+		/* A download was streamed straight to ~/Downloads inside http_txn (it
+		 * never touched B->raw), so there is nothing to render. */
+		if (B->dl_saved)
+			return;
+
 		/* Render according to the response type. An empty Content-Type is
 		 * treated as HTML (the common case for sloppy servers); a plain text
 		 * type is shown verbatim so line breaks survive; image/png is decoded. */
-		if (B->ctype[0] == '\0' || has_sub(B->ctype, "html")) {
-			B->mode = MODE_HTML; html_to_text();
-		} else if (starts_ci(B->ctype, "image/png")) {
-			B->mode = MODE_IMAGE;
-			B->text_len = 0; B->nlinks = 0; B->doc_title[0] = '\0';
-		} else if (starts_ci(B->ctype, "image/")) {
-			B->mode = MODE_TEXT;
-			doc_message("[unsupported image type - only PNG can be shown]");
-		} else {
-			B->mode = MODE_TEXT; plain_to_text();
-		}
-		B->scroll = 0;
-		{ int ci = 0; sapp(B->cur_url, &ci, sizeof B->cur_url, url); }
+		render_raw(url);
 		/* The title bar is updated by the main thread (only the window's owner
 		 * task may call win_settitle); it reads B->doc_title / B->cur_url. */
 

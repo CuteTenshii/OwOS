@@ -20,9 +20,20 @@ static int update_in_progress(void)
 	return cmos_read(0x0A) & 0x80;     /* status A, bit 7 = update-in-progress */
 }
 
+static void cmos_write(uint8_t reg, uint8_t val)
+{
+	outb(CMOS_ADDR, reg);
+	outb(CMOS_DATA, val);
+}
+
 static uint8_t bcd_to_bin(uint8_t v)
 {
 	return (v & 0x0F) + ((v >> 4) * 10);
+}
+
+static uint8_t bin_to_bcd(uint8_t v)
+{
+	return (uint8_t)(((v / 10) << 4) | (v % 10));
 }
 
 void rtc_now(struct rtc_time *t)
@@ -54,4 +65,44 @@ void rtc_now(struct rtc_time *t)
 	t->day = day;
 	t->month = month;
 	t->year = (uint16_t)(2000 + year);
+}
+
+/* Write the wall clock back to CMOS, honouring whatever format the RTC is in
+ * (BCD vs binary, 12- vs 24-hour) so rtc_now reads it back unchanged. Like
+ * rtc_now, only the 2-digit year register is touched (the century register is
+ * chipset-specific and rtc_now hardcodes the 21st century anyway). */
+void rtc_set(const struct rtc_time *t)
+{
+	for (int i = 0; i < 1000000 && update_in_progress(); i++)
+		;
+
+	uint8_t statusB = cmos_read(0x0B);
+	int bcd = !(statusB & 0x04);       /* bit 2 clear => BCD                  */
+	int h24 = (statusB & 0x02);        /* bit 1 set   => 24-hour              */
+
+	uint8_t sec = t->sec, min = t->min, hour = t->hour;
+	uint8_t day = t->day, month = t->month, year = (uint8_t)(t->year % 100);
+
+	int pm = 0;
+	if (!h24) {                        /* fold into 12-hour if the RTC is so  */
+		pm = hour >= 12;
+		uint8_t h = (uint8_t)(hour % 12);
+		hour = h ? h : 12;
+	}
+
+	if (bcd) {
+		sec = bin_to_bcd(sec); min = bin_to_bcd(min); hour = bin_to_bcd(hour);
+		day = bin_to_bcd(day); month = bin_to_bcd(month); year = bin_to_bcd(year);
+	}
+	if (!h24 && pm)
+		hour |= 0x80;              /* 12-hour mode PM flag                */
+
+	cmos_write(0x0B, (uint8_t)(statusB | 0x80));   /* SET bit: freeze updates */
+	cmos_write(0x00, sec);
+	cmos_write(0x02, min);
+	cmos_write(0x04, hour);
+	cmos_write(0x07, day);
+	cmos_write(0x08, month);
+	cmos_write(0x09, year);
+	cmos_write(0x0B, statusB);                     /* resume updating         */
 }

@@ -49,6 +49,31 @@ static void u32str(unsigned v, char *out)
 	out[i] = 0;
 }
 
+/* Format a byte count as "N B", or "N.N KiB/MiB/GiB/TiB" scaled to the largest
+ * unit that keeps the whole part under 1024. Integer-only (no 64-bit / float):
+ * the fractional digit comes from the leftover low bits below the chosen unit. */
+static void size_str(unsigned v, char *out)
+{
+	static const char *const unit[] = { "B", "KiB", "MiB", "GiB", "TiB" };
+	int u = 0;
+	unsigned whole = v;
+	while (whole >= 1024 && u < 4) { whole >>= 10; u++; }
+
+	char t[12];
+	u32str(whole, t);
+	int i = 0;
+	for (int j = 0; t[j]; j++) out[i++] = t[j];
+
+	if (u > 0) {                       /* one fractional digit for scaled units */
+		unsigned rem = v & ((1u << (10 * u)) - 1);
+		out[i++] = '.';
+		out[i++] = '0' + (((rem >> (10 * (u - 1))) * 10) >> 10);
+	}
+	out[i++] = ' ';
+	for (const char *p = unit[u]; *p; p++) out[i++] = *p;
+	out[i] = 0;
+}
+
 static int collect(void)
 {
 	int n = 0;
@@ -165,6 +190,8 @@ static void goto_path(const char *p)
 	scroll = 0; sel = -1;
 }
 
+static void ctx_draw(void);   /* right-click popup, painted last (see below) */
+
 static void render(void)
 {
 	refresh();
@@ -229,8 +256,8 @@ static void render(void)
 		if (fe->is_dir && !feq(fe->name, ".."))
 			gfx_text(lx + 4 + flen(fe->name) * 8, ry, "/", col, rbg);
 		if (!fe->is_dir) {
-			char sb[12];
-			u32str(fe->size, sb);
+			char sb[16];
+			size_str(fe->size, sb);
 			gfx_text(lx + lw - 4 - flen(sb) * 8, ry, sb, 0x8aa0b8, rbg);
 		}
 	}
@@ -239,6 +266,8 @@ static void render(void)
 	 * overlays the listing. */
 	gfx_fill_rect(0, 0, W, MENU_H, 0x232a36);
 	menu_draw(&gomenu, 2, 0);
+
+	ctx_draw();   /* right-click popup overlays everything */
 }
 
 /* Build the absolute path of `name` under the current directory into out. */
@@ -289,17 +318,177 @@ static const char *app_for(const char *name)
  * argv[1]. waitpid keeps the child off the zombie list (the shell's outer wait
  * loop still pumps keystrokes to whichever window holds focus, so the opened app
  * stays interactive while we block). */
-static void open_file(const char *name)
+static void open_with(const char *name, const char *prog)
 {
 	char fp[256];
 	full_path(name, fp, sizeof fp);
 	int pid = fork();
 	if (pid == 0) {
-		execp1(app_for(name), fp);
+		execp1(prog, fp);
 		exit(1);                     /* exec failed: don't fall back into UI */
 	}
 	if (pid > 0)
 		waitpid(pid);
+}
+
+static void open_file(const char *name) { open_with(name, app_for(name)); }
+
+static int list_hit(int mx, int my);   /* list row under (mx,my), or -1 */
+
+/* ----------------------------------------------------------- context menu */
+/*
+ * A right-click popup whose items depend on what sits under the cursor: a file,
+ * a directory, a Places shortcut, a removable device, or empty space. It's a
+ * self-contained popup (not a `struct menu`, which is anchored to a bar title):
+ * ctx_open() captures the target and clamps the popup inside the window,
+ * ctx_draw() paints it last so it overlays the listing, and ctx_click() routes a
+ * left-press to an item or dismisses the menu.
+ */
+enum ctx_kind { CTX_BG, CTX_FILE, CTX_DIR, CTX_PLACE, CTX_DEVICE };
+enum ctx_act  { A_OPEN, A_EDIT, A_EJECT, A_REFRESH, A_UP, A_HOME };
+
+struct ctx_item { const char *label; int act; };
+static const struct ctx_item ci_file[]   = { {"Open", A_OPEN}, {"Edit", A_EDIT} };
+static const struct ctx_item ci_dir[]     = { {"Open", A_OPEN} };
+static const struct ctx_item ci_place[]   = { {"Open", A_OPEN} };
+static const struct ctx_item ci_device[]  = { {"Open", A_OPEN}, {"Eject", A_EJECT} };
+static const struct ctx_item ci_bg[]      = { {"Refresh", A_REFRESH},
+                                              {"Go Up", A_UP}, {"Home", A_HOME} };
+
+static struct {
+	int  open;
+	int  x, y;                 /* popup top-left (clamped into the window) */
+	enum ctx_kind kind;
+	int  target;               /* place / device index                    */
+	char name[20];             /* file / dir entry name                   */
+} ctx;
+
+#define CTX_W   96
+#define CTX_ROW 16
+
+/* The item table + count for the menu's current kind. */
+static const struct ctx_item *ctx_items(int *n)
+{
+	switch (ctx.kind) {
+	case CTX_FILE:   *n = 2; return ci_file;
+	case CTX_DIR:    *n = 1; return ci_dir;
+	case CTX_PLACE:  *n = 1; return ci_place;
+	case CTX_DEVICE: *n = 2; return ci_device;
+	default:         *n = 3; return ci_bg;
+	}
+}
+
+/* Open the popup at (mx,my) for the given target, clamped to stay on-screen. */
+static void ctx_open(enum ctx_kind kind, int target, const char *name,
+                     int mx, int my)
+{
+	int n;
+	ctx.kind = kind;
+	ctx.target = target;
+	ctx.name[0] = 0;
+	if (name) fcpy(ctx.name, name);
+	ctx_items(&n);
+	int h = n * CTX_ROW + 2;
+	int x = mx, y = my;
+	if (x + CTX_W > W) x = W - CTX_W;
+	if (y + h > H)     y = H - h;
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+	ctx.x = x; ctx.y = y;
+	ctx.open = 1;
+}
+
+static void ctx_draw(void)
+{
+	if (!ctx.open) return;
+	int n;
+	const struct ctx_item *it = ctx_items(&n);
+	int h = n * CTX_ROW + 2;
+	gfx_fill_rect(ctx.x, ctx.y, CTX_W, h, 0x232a36);
+	gfx_rect(ctx.x, ctx.y, CTX_W, h, 0x05070a);
+	for (int i = 0; i < n; i++)
+		gfx_text(ctx.x + 6, ctx.y + 1 + i * CTX_ROW, it[i].label,
+		         0xc8d0dc, 0x232a36);
+}
+
+/* Run the chosen context-menu action against the captured target. */
+static void ctx_run(int act, int id)
+{
+	switch (act) {
+	case A_OPEN:
+		if (ctx.kind == CTX_FILE) { open_file(ctx.name); }
+		else if (ctx.kind == CTX_DIR) {
+			if (feq(ctx.name, "..")) go_up(); else enter(ctx.name);
+			scroll = 0; sel = -1; set_title(id);
+		} else if (ctx.kind == CTX_PLACE) {
+			goto_path(places[ctx.target].path); set_title(id);
+		} else if (ctx.kind == CTX_DEVICE) {
+			goto_path(vols[ctx.target].path); set_title(id);
+		}
+		break;
+	case A_EDIT:   open_with(ctx.name, "editor"); break;
+	case A_EJECT:
+		if (eject(vols[ctx.target].path) == 0 &&
+		    under_path(path, vols[ctx.target].path)) {
+			goto_path("/"); set_title(id);
+		}
+		break;
+	case A_REFRESH: cached_seq = -1; break;
+	case A_UP:      go_up(); scroll = 0; sel = -1; set_title(id); break;
+	case A_HOME:    goto_path("/"); set_title(id); break;
+	}
+}
+
+/* Route a left-press while the popup is open: fire an item, or dismiss. Always
+ * closes the menu and bumps seq so the popup repaints away. */
+static void ctx_click(int id, int mx, int my)
+{
+	int n;
+	const struct ctx_item *it = ctx_items(&n);
+	if (mx >= ctx.x && mx < ctx.x + CTX_W &&
+	    my >= ctx.y + 1 && my < ctx.y + 1 + n * CTX_ROW) {
+		int i = (my - (ctx.y + 1)) / CTX_ROW;
+		if (i >= 0 && i < n) ctx_run(it[i].act, id);
+	}
+	ctx.open = 0;
+	seq++;
+}
+
+/* A right-press at (mx,my): figure out what's under the cursor and pop up the
+ * matching context menu. Mirrors click()'s hit regions. */
+static void rclick(int id, int mx, int my)
+{
+	int sbw = sidebar_w();
+	refresh();
+	scan_vols();
+
+	if (my < MENU_H) { ctx_open(CTX_BG, 0, 0, mx, my); seq++; return; }
+
+	if (mx < sbw) {                       /* sidebar */
+		if (my >= LIST_TOP) {
+			int i = (my - LIST_TOP) / ROW_H;
+			if (i >= 0 && i < NPLACES) {
+				ctx_open(CTX_PLACE, i, 0, mx, my); seq++; return;
+			}
+			for (int v = 0; v < nvols; v++) {
+				int ry = dev_row_y(v);
+				if (my >= ry && my < ry + ROW_H) {
+					ctx_open(CTX_DEVICE, v, 0, mx, my); seq++; return;
+				}
+			}
+		}
+		ctx_open(CTX_BG, 0, 0, mx, my); seq++; return;
+	}
+
+	int e = list_hit(mx, my);             /* file list */
+	if (e >= 0) {
+		struct fent *fe = &fent_buf[e];
+		sel = e;                          /* highlight the right-clicked row */
+		ctx_open(fe->is_dir ? CTX_DIR : CTX_FILE, e, fe->name, mx, my);
+	} else {
+		ctx_open(CTX_BG, 0, 0, mx, my);
+	}
+	seq++;
 }
 
 /* Map a click in the list area to an entry index, or -1 (sidebar/header/empty).
@@ -344,6 +533,7 @@ static void menu_action(int item, int id)
 
 static void click(int id, int mx, int my)
 {
+	if (ctx.open) { ctx_click(id, mx, my); return; }  /* popup eats the click */
 	if (my < MENU_H || gomenu.open) {     /* menu bar or open dropdown */
 		int it = menu_click(&gomenu, mx, my, 2, 0);
 		if (it >= 0)
@@ -419,7 +609,7 @@ static void key(int id, int k)
 	/* Menu accelerators (F5 refresh, Ctrl+O open): fire the item like a click. */
 	int sc = menu_shortcut(&gomenu, k);
 	if (sc >= 0) { gomenu.open = 0; menu_action(sc, id); return; }
-	if (k == 27) { gomenu.open = 0; seq++; return; }
+	if (k == 27) { gomenu.open = 0; ctx.open = 0; seq++; return; }
 
 	refresh();
 	int vis = (H - LIST_TOP) / ROW_H;
@@ -456,6 +646,7 @@ int main(void)
 		while (win_poll(id, &ev)) {
 			if (ev.type == WEV_CLOSE) { win_close(id); return 0; }
 			else if (ev.type == WEV_MOUSE) click(id, ev.a, ev.b);
+			else if (ev.type == WEV_RCLICK) rclick(id, ev.a, ev.b);
 			else if (ev.type == WEV_DBLCLICK) dblclick(ev.a, ev.b);
 			else if (ev.type == WEV_KEY) key(id, ev.a);
 			else if (ev.type == WEV_RESIZE) {

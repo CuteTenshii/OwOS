@@ -41,6 +41,21 @@ static uint32_t  fb_pixels;   /* total pixels in the mapped region (pitch*h)    
 static int       active;
 static int       single;      /* 1 when there is no back buffer (draw direct)   */
 
+/* Display brightness, FB_BRIGHT_MIN..FB_BRIGHT_MAX (max = undimmed). Applied as
+ * a per-channel scale when the back buffer is copied to the visible screen. */
+static int       brightness = FB_BRIGHT_MAX;
+
+/* Scale a back-buffer pixel by the current brightness. FB_BRIGHT_MAX is 8, so
+ * the divide is a >>3 the compiler can fold; callers skip this entirely at full
+ * brightness (the common case) to keep the per-frame copy a plain memory move. */
+static inline uint32_t dim_px(uint32_t p)
+{
+	uint32_t r = (((p >> 16) & 0xFF) * (uint32_t)brightness) >> 3;
+	uint32_t g = (((p >>  8) & 0xFF) * (uint32_t)brightness) >> 3;
+	uint32_t b = (( p        & 0xFF) * (uint32_t)brightness) >> 3;
+	return (r << 16) | (g << 8) | b;
+}
+
 /* Clip rectangle: drawing primitives only touch pixels inside it, so the
  * compositor can redraw just a damaged region by clipping to it. Half-open
  * [cl_x0,cl_x1) x [cl_y0,cl_y1). */
@@ -269,12 +284,15 @@ void fb_present(void)
 		return;                    /* nothing changed                           */
 
 	/* Copy only the damaged rectangle, row by row, from the cached RAM back
-	 * buffer to VRAM. This is the only place we ever write the framebuffer. */
+	 * buffer to VRAM. This is the only place we ever write the framebuffer.
+	 * When dimmed, each pixel is scaled on the way out; at full brightness the
+	 * copy stays a verbatim move. */
+	int dim = brightness < FB_BRIGHT_MAX;
 	for (int y = dirty_y0; y < dirty_y1; y++) {
 		const uint32_t *s = fb    + (uint32_t)y * fb_pitch + dirty_x0;
 		uint32_t       *d = front + (uint32_t)y * fb_pitch + dirty_x0;
 		for (int x = 0; x < dirty_x1 - dirty_x0; x++)
-			d[x] = s[x];
+			d[x] = dim ? dim_px(s[x]) : s[x];
 	}
 	/* Drain the write-combining buffer to VRAM. The front buffer is WC
 	 * (enable_wc), so these stores otherwise linger in the CPU's WC buffer and
@@ -284,6 +302,35 @@ void fb_present(void)
 	__asm__ volatile ("sfence" ::: "memory");
 	dirty_x1 = dirty_x0;           /* mark the damage box empty again           */
 }
+
+/* Step the display brightness and re-render the whole visible screen from the
+ * (full-colour) back buffer so the change is immediately visible — the WM only
+ * presents damaged rectangles, so without this a brightness change would not
+ * appear until something else redrew. No-op in text mode or single-buffered
+ * fallback (there is no separate back buffer to re-scale from). IRQ-safe: it
+ * runs to completion before the compositor thread resumes. */
+void fb_brightness_step(int dir)
+{
+	if (!active || single)
+		return;
+	int nb = brightness + dir;
+	if (nb < FB_BRIGHT_MIN) nb = FB_BRIGHT_MIN;
+	if (nb > FB_BRIGHT_MAX) nb = FB_BRIGHT_MAX;
+	if (nb == brightness)
+		return;
+	brightness = nb;
+
+	int dim = brightness < FB_BRIGHT_MAX;
+	for (uint32_t y = 0; y < fb_h; y++) {
+		const uint32_t *s = fb    + y * fb_pitch;
+		uint32_t       *d = front + y * fb_pitch;
+		for (uint32_t x = 0; x < fb_w; x++)
+			d[x] = dim ? dim_px(s[x]) : s[x];
+	}
+	__asm__ volatile ("sfence" ::: "memory");
+}
+
+int fb_brightness(void) { return brightness; }
 
 int      fb_active(void) { return active; }
 uint32_t fb_width(void)  { return fb_w; }

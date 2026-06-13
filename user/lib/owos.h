@@ -20,6 +20,15 @@ int      writefile(const char *name, const void *buf, int len); /* 0, or -1    *
  * may be short at end of file) or -1. Lets a program stream a file bigger than
  * its address window. */
 int      readfile_at(const char *name, unsigned off, void *buf, unsigned len);
+/* Streaming write, for content too large to hold in one buffer (e.g. a browser
+ * download). stream_begin opens `name` (overwriting any existing file);
+ * stream_write appends a chunk; stream_end commits and returns the total bytes
+ * written, or -1. Only one stream may be open at a time. begin/write return
+ * 0/-1. A failed write auto-closes the stream, so stream_end then returns -1
+ * (nothing is committed and the reserved space is reused). */
+int      stream_begin(const char *name);
+int      stream_write(const void *buf, int len);
+int      stream_end(void);
 
 /* Networking: a tiny socket-ish API. net_connect resolves `host`, opens TCP,
  * and (if tls) runs the TLS handshake; it returns a handle >= 0, or a negative
@@ -49,6 +58,7 @@ int  readline(char *buf, int max);            /* echoed line input, returns len*
 #define WEV_CLOSE  3    /* the close box was clicked                            */
 #define WEV_RESIZE 4    /* a, b = new client w, h (only if win_resizable on)    */
 #define WEV_DBLCLICK 5  /* a, b = client x, y of a double click (after WEV_MOUSE)*/
+#define WEV_RCLICK   6  /* a, b = client x, y of a right click                   */
 
 struct win_event { unsigned type; int a, b; };
 

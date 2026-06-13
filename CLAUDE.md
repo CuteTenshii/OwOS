@@ -70,10 +70,11 @@ cat -v /tmp/s.log
 `boot/boot.S` (Multiboot header, masks IRQs, sets the stack, passes magic+info)
 → `kernel_main`, which brings subsystems up in dependency order:
 
-serial → vga → gdt → idt → irq (PIC remap) → pmm → **paging** → heap → pci →
-**fb** → net (NIC dispatch + IPv4) → ahci/nvme probes → **blk (pick owofs disk)**
-→ fs → syscalls (+install user programs) → timer → keyboard → sb16 → scheduler +
-workers → services → **wm** → `sti` → **xhci_boot** → shell.
+serial → vga → gdt → idt → irq (PIC remap) → pmm → **paging** → heap → smbios →
+pci → **fb** → net (NIC dispatch + IPv4) → ahci/nvme probes → **blk (pick owofs
+disk)** → fs → syscalls (+install user programs) → timer → keyboard → sb16 →
+scheduler + workers → services → **wm** → screenshot worker → `sti` →
+**xhci_boot** (+ mount any USB stick it enumerates) → shell.
 
 Order is load-bearing: the IDT must exist before any IRQ; the PIC must be
 remapped (master→32, slave→40) before `sti` or the timer IRQ lands on a CPU
@@ -130,10 +131,21 @@ agree across files** (change one boundary → change the others):
 
 ```
 0–~2 MiB    kernel image + BSS (PMM bitmap, page tables, stacks)  [supervisor]
-2–4 MiB     per-process user window (USER_BASE..USER_REGION_END)  [user]
+2–4 MiB     spare identity-mapped low memory (was the old user window)
 4–12 MiB    kernel heap (kmalloc/kfree)
-12–16 MiB   page-frame pool (palloc/pfree: page dirs/tables/user frames)
+12–16 MiB   page-frame pool (palloc/pfree: page directories + page tables)
 ```
+
+The **per-process user window is no longer in low memory** — it's a private
+**64 MiB region at 1 GiB** (`USER_BASE 0x40000000 .. USER_REGION_END`, loader.h),
+backed on demand by **pmm high memory (>16 MiB)** through the process's own page
+tables. So `palloc`/`pfree` (the 12–16 MiB pool) now only hand out page dirs and
+page tables; the user *frames* come from the PMM. User programs link at
+`0x40000000` (`user/user.ld`), the user stack grows down from `USER_STACK_TOP`.
+1 GiB is clear of the identity map and of two other high mappings: `SCRATCH_VADDR`
+(256 MiB — a per-CR3 scratch slot the kernel uses to transiently map any pmm
+frame and write it) and `WIN_FB_VADDR` (3 GiB — where a window's client pixel
+buffer is mapped into its owning ring-3 process, see uwin.c).
 
 **Above 16 MiB is on-demand**: `pmm_alloc_contig` hands out contiguous frames
 (and identity-maps them) for things too big for the heap — the framebuffer back
@@ -143,10 +155,10 @@ both into the **shared kernel directory** (visible under any CR3):
 `paging_map_uncached(phys,len)` (UC-) for device MMIO (e1000 BAR0).
 
 Each process has its **own page directory**: shared kernel/heap/pool mappings +
-a private user window from the pool. The scheduler switches CR3 and `tss.esp0`
-per task. Every address space maps the kernel identically, so kernel threads and
-interrupt handlers run under *any* CR3 — that invariant is why the scheduler
-needn't special-case address spaces.
+a private user window backed by pmm high memory. The scheduler switches CR3 and
+`tss.esp0` per task. Every address space maps the kernel identically, so kernel
+threads and interrupt handlers run under *any* CR3 — that invariant is why the
+scheduler needn't special-case address spaces.
 
 ## Graphics & window manager (fb.c → wm.c, with mouse.c + vga.c)
 
@@ -183,6 +195,33 @@ host RAM). Three fb.c rules took a laptop from 2 fps to smooth:
 3. **Front buffer mapped write-combining** (`enable_wc`: PAT entry 1 = WC,
    `wbinvd`, `paging_mark_wc` tags LFB PTEs with PWT) — ~10× over default UC. The
    back buffer stays write-back cached (fast to draw into).
+
+## Desktop apps (apps.c + uwin.c + app_term.c + crash.c + screenshot.c)
+
+The WM hosts apps; only the **terminal** (which hosts the shell) opens at boot.
+Everything else launches from the taskbar **Start menu** — one row per app in
+`app_menu[]` (apps.c). An app is either **kernel-side** (its launcher is an
+`*_init()` that creates a `struct window`, e.g. app_term.c, the About box) or a
+**ring-3 program** spawned from `/bin` as a detached process the WM reaps
+(clock/files/editor/browser/imgview).
+
+Ring-3 GUI apps own a window through **uwin.c — the user-window server.** A
+process creates a window, gets a shared client-area pixel buffer mapped into its
+address space at `WIN_FB_VADDR` (3 GiB), draws into it, presents, and polls input
+events — all over the `SYS_WIN_*` syscalls. The kernel-side `struct window`'s
+`draw()` blits the user buffer; its click/key callbacks enqueue events the
+process drains. **Keyboard routing:** `wm_feed_key` offers a key to the focused
+GUI app first, falling back to `shell_feed` (see the input loop in kernel.c) —
+that's how a windowed editor gets keystrokes without shell changes.
+
+- **crash.c — a ring-3 fault is contained, not fatal.** When a user process
+  faults, the IDT handler calls `crash_record()` (in the faulting task's context,
+  so its user stack is still mapped for a backtrace), captures registers, and
+  kills the process; the WM's per-frame `crash_pump()` turns the report into an
+  "<app> has crashed" window. The kernel never panics on a ring-3 fault.
+- **screenshot.c — Print Screen → PNG.** The keyboard IRQ can't kmalloc megabytes
+  or block on disk, so it only *requests* a shot; a dedicated worker thread polls
+  and does the capture, writing `/home/root/screenshotN.png`.
 
 ## Process model & context switching (sched.c + switch.S)
 
@@ -249,6 +288,16 @@ user's real OS drive on hardware):
   identity map. Always a working FS, just non-persistent (`blk_backend()` →
   `"tmpfs"`).
 
+owofs is the *boot* volume; **removable volumes mount at `/media`** via the
+`mount`/`eject` commands, alongside owofs, over a separate set of read-only/
+read-write drivers: **fat.c** (FAT12/16/32, read **and** write), **hfs.c** (HFS+
+"Mac OS Extended", read-only — HFS+/HFSX only), **ext.c** (ext2/3/4, read-only,
+extent trees + indirect blocks). The mount source is any non-owofs block device:
+the AHCI/NVMe scratch disks, or a **USB flash drive** enumerated by xhci.c
+(BOT/SCSI mass storage exposed as a block device). A USB stick only appears
+after `xhci_boot` (post-`sti`), so kernel.c auto-mounts it there; others mount on
+demand. These probe by filesystem signature and never auto-format.
+
 ## Network stack (nic.c → net.c → tcp.c → tls.c, with crypto.c)
 
 Kernel-side stack; `ping`/`dig` are shell built-ins. The one ring-3 client is
@@ -265,8 +314,9 @@ daemons). Strictly layered:
   - rtl8139.c — the classic Realtek card (QEMU default).
   - e1000.c — Intel Gigabit (8254x/82574/I21x): MMIO register file (mapped UC-
     via `paging_map_uncached`), RX/TX rings, RX IRQ. `make run NIC=e1000`.
-- **net.c — IPv4**: ARP (cached), ICMP echo, UDP (DNS). `net_rx_frame()` demuxes
-  by EtherType/proto; TCP plugs in via `net_ip_send()`/`tcp_input()`.
+- **net.c — IPv4**: ARP (cached), ICMP echo, UDP (DNS), a DHCP client (boot
+  lease; `dhcp` re-requests), and NTP (`ntp` sets the clock). `net_rx_frame()`
+  demuxes by EtherType/proto; TCP plugs in via `net_ip_send()`/`tcp_input()`.
 - **tcp.c — active + passive open**, several concurrent connections, each a TCB
   in a fixed table demuxed by 4-tuple. `tcp_listen` pre-allocates per-slot
   buffers (the IRQ accept path never allocates); a SYN is accepted **in the IRQ**
@@ -336,6 +386,27 @@ READ → CLOSE`.
   KDE Dolphin, and `mount -t cifs`. `smbclient -L` (enumeration) **won't** work —
   it needs an IPC$ srvsvc pipe that isn't implemented. Connect to the share
   directly.
+
+## BitTorrent client (bencode.c → torrent.c → tracker.c → peer.c)
+
+A from-scratch torrent client, layered like the rest of the stack and driven by
+the `torrent` shell command (`info`/`peers`/`peer`/`get`):
+
+- **bencode.c — the wire encoding.** A parser for bencode (the int/string/list/
+  dict format `.torrent` files and tracker replies use). Nodes are heap-allocated
+  from a pool; spans point into the source buffer, which must outlive them.
+- **torrent.c — metainfo.** Pulls `announce`/`name`/`pieces` out of the bencoded
+  dict and computes the 20-byte **infohash = SHA-1 of the info dict's exact
+  on-disk bytes** (crypto.c) — the identifier used everywhere downstream. The
+  span fields point into the source buffer; release the node pool with
+  `torrent_free()`.
+- **tracker.c — announce.** HTTP GET to the tracker with the infohash + peer id,
+  parses the compact peer list out of the bencoded response.
+- **peer.c — the peer wire protocol.** Handshake, bitfield/interested/unchoke,
+  request a piece, and **verify the downloaded piece's SHA-1** against `pieces`.
+
+`torrent get <file>` chains all four to download a whole single-file torrent to
+owofs. TCP-only over the existing `tcp_connect`/`tcp_read` client path.
 
 ## ACPI, power & battery (power.c + aml.c + battery.c)
 

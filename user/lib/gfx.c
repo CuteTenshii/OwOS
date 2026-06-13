@@ -82,6 +82,51 @@ void status_draw(const struct status_bar *s, int x, int y, int w,
 	gfx_text(x + 6, y + 1, s->msg, fg, bg);
 }
 
+#define MENU_BG    0x2a3342u    /* dropdown background                         */
+#define MENU_FG    0xe0e6eeu    /* enabled item text                          */
+#define MENU_DIM   0x636b78u    /* disabled item text / dimmed hint           */
+
+/* A small checkmark drawn in a row's left gutter (the cell is GUI_ROW_H tall). */
+static void menu_check(int x, int y, unsigned c)
+{
+	gfx_fill_rect(x + 0, y + 8, 2, 2, c);
+	gfx_fill_rect(x + 1, y + 9, 2, 2, c);
+	gfx_fill_rect(x + 2, y + 10, 2, 2, c);   /* vertex */
+	gfx_fill_rect(x + 3, y + 8, 2, 2, c);
+	gfx_fill_rect(x + 4, y + 6, 2, 2, c);
+	gfx_fill_rect(x + 5, y + 4, 2, 2, c);
+	gfx_fill_rect(x + 6, y + 2, 2, 2, c);
+}
+
+/* Draw a popup list (no title bar) at (px,py): one row per item, with the check
+ * gutter, disabled dimming, accelerator hints, and submenu arrows. Open child
+ * submenus are then drawn on top, to the right of their parent row. */
+static void menu_popup(const struct menu *m, int px, int py)
+{
+	int gutter = m->flags ? 10 : 0;          /* reserve a check column         */
+	gfx_fill_rect(px, py, GUI_MENU_W, m->n * GUI_ROW_H, MENU_BG);
+	for (int i = 0; i < m->n; i++) {
+		int ry = py + i * GUI_ROW_H;
+		unsigned char fl = m->flags ? m->flags[i] : 0;
+		int dis = (fl & MENU_DISABLED) != 0;
+		unsigned fg = dis ? MENU_DIM : MENU_FG;
+		if (fl & MENU_CHECKED)
+			menu_check(px + 2, ry, dis ? MENU_DIM : 0x8fd98f);
+		gfx_text(px + 6 + gutter, ry, m->items[i], fg, MENU_BG);
+		if (m->subs && m->subs[i])               /* submenu: a right arrow (►)  */
+			gfx_glyph(px + GUI_MENU_W - 12, ry, 0x10, fg, MENU_BG);
+		else if (m->hints && m->hints[i] && m->hints[i][0]) {
+			int hw = wstrlen(m->hints[i]) * 8;
+			gfx_text(px + GUI_MENU_W - 6 - hw, ry, m->hints[i],
+			         dis ? MENU_DIM : 0x8a93a0, MENU_BG);
+		}
+	}
+	gfx_rect(px, py, GUI_MENU_W, m->n * GUI_ROW_H, 0x05070a);
+	for (int i = 0; i < m->n; i++)
+		if (m->subs && m->subs[i] && m->subs[i]->open)
+			menu_popup(m->subs[i], px + GUI_MENU_W - 2, py + i * GUI_ROW_H);
+}
+
 void menu_draw(const struct menu *m, int x, int y)
 {
 	unsigned bg = m->open ? 0x3a4a60 : 0x232a36;
@@ -89,46 +134,117 @@ void menu_draw(const struct menu *m, int x, int y)
 	if (m->open)
 		gfx_fill_rect(x, y, tw, GUI_BAR_H, bg);
 	gfx_text(x + 3, y + 1, m->title, 0xe0e6ee, bg);
-	if (m->open) {
-		gfx_fill_rect(x, y + GUI_BAR_H, GUI_MENU_W, m->n * GUI_ROW_H, 0x2a3342);
-		for (int i = 0; i < m->n; i++) {
-			int ry = y + GUI_BAR_H + i * GUI_ROW_H;
-			gfx_text(x + 6, ry, m->items[i], 0xe0e6ee, 0x2a3342);
-			/* Accelerator hint ("Ctrl+S"), right-aligned and dimmed. */
-			if (m->hints && m->hints[i] && m->hints[i][0]) {
-				int hw = wstrlen(m->hints[i]) * 8;
-				gfx_text(x + GUI_MENU_W - 6 - hw, ry, m->hints[i],
-				         0x8a93a0, 0x2a3342);
-			}
+	if (m->open)
+		menu_popup(m, x, y + GUI_BAR_H);
+}
+
+/* Recursively close a menu's submenus (used when the menu itself closes). */
+static void menu_subs_close(struct menu *m)
+{
+	if (!m->subs)
+		return;
+	for (int i = 0; i < m->n; i++)
+		if (m->subs[i]) { m->subs[i]->open = 0; menu_subs_close(m->subs[i]); }
+}
+
+/* Route a click in m's popup at (px,py), recursing through open submenus (drawn
+ * on top, so tested first). Returns 2 = a leaf item fired (sets *fm and *fi),
+ * 1 = handled but nothing fired (opened/closed a submenu, or a disabled item),
+ * 0 = the click missed this subtree. */
+static int menu_popup_hit(struct menu *m, int px, int py, int mx, int my,
+                          struct menu **fm, int *fi)
+{
+	for (int i = 0; i < m->n; i++)
+		if (m->subs && m->subs[i] && m->subs[i]->open) {
+			int r = menu_popup_hit(m->subs[i], px + GUI_MENU_W - 2,
+			                       py + i * GUI_ROW_H, mx, my, fm, fi);
+			if (r)
+				return r;
 		}
-		gfx_rect(x, y + GUI_BAR_H, GUI_MENU_W, m->n * GUI_ROW_H, 0x05070a);
+	if (mx < px || mx >= px + GUI_MENU_W ||
+	    my < py || my >= py + m->n * GUI_ROW_H)
+		return 0;
+	int i = (my - py) / GUI_ROW_H;
+	unsigned char fl = m->flags ? m->flags[i] : 0;
+	if (fl & MENU_DISABLED)
+		return 1;                                /* inert: swallow, stay open   */
+	if (m->subs && m->subs[i]) {                     /* parent: toggle its child */
+		int wasopen = m->subs[i]->open;
+		for (int k = 0; k < m->n; k++)
+			if (m->subs[k]) m->subs[k]->open = 0;
+		m->subs[i]->open = !wasopen;
+		return 1;
 	}
+	*fm = m; *fi = i;
+	return 2;
+}
+
+int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **leaf)
+{
+	if (leaf)
+		*leaf = 0;
+	int tw = wstrlen(m->title) * 8 + 6;
+	if (my >= y && my < y + GUI_BAR_H) {        /* the title row */
+		m->open = (mx >= x && mx < x + tw) ? !m->open : 0;
+		if (!m->open)
+			menu_subs_close(m);
+		return -1;
+	}
+	if (m->open) {
+		struct menu *fm = 0;
+		int fi = -1;
+		int r = menu_popup_hit(m, x, y + GUI_BAR_H, mx, my, &fm, &fi);
+		if (r == 2) {                       /* a leaf fired -> close everything */
+			m->open = 0;
+			menu_subs_close(m);
+			if (leaf)
+				*leaf = fm;
+			return fi;
+		}
+		if (r == 1)                         /* opened submenu / disabled: stay  */
+			return -1;
+		m->open = 0;                        /* clicked outside -> dismiss       */
+		menu_subs_close(m);
+	}
+	return -1;
 }
 
 int menu_click(struct menu *m, int mx, int my, int x, int y)
 {
-	int tw = wstrlen(m->title) * 8 + 6;
-	if (my >= y && my < y + GUI_BAR_H) {        /* the bar row */
-		m->open = (mx >= x && mx < x + tw) ? !m->open : 0;
-		return -1;
-	}
-	if (m->open) {                              /* a popup item? */
-		int i = (my - (y + GUI_BAR_H)) / GUI_ROW_H;
-		m->open = 0;
-		if (mx >= x && mx < x + GUI_MENU_W && i >= 0 && i < m->n)
-			return i;
-	}
+	struct menu *leaf;
+	int it = menu_click_ex(m, mx, my, x, y, &leaf);
+	return (leaf == m) ? it : -1;       /* back-compat: only this menu's items */
+}
+
+/* Search m (and its submenus) for an enabled item whose accelerator is `key`. */
+static int menu_shortcut_walk(const struct menu *m, int key, struct menu **leaf)
+{
+	if (m->keys)
+		for (int i = 0; i < m->n; i++) {
+			unsigned char fl = m->flags ? m->flags[i] : 0;
+			if (m->keys[i] == key && !(fl & MENU_DISABLED) &&
+			    !(m->subs && m->subs[i])) {
+				if (leaf) *leaf = (struct menu *)m;
+				return i;
+			}
+		}
+	if (m->subs)
+		for (int i = 0; i < m->n; i++)
+			if (m->subs[i]) {
+				int it = menu_shortcut_walk(m->subs[i], key, leaf);
+				if (it >= 0)
+					return it;
+			}
 	return -1;
 }
 
 int menu_shortcut(const struct menu *m, int key)
 {
-	if (!m->keys || !key)
+	if (!key)
 		return -1;
-	for (int i = 0; i < m->n; i++)
-		if (m->keys[i] == key)
-			return i;
-	return -1;
+	struct menu *leaf = 0;
+	int it = menu_shortcut_walk(m, key, &leaf);
+	return (leaf == m) ? it : -1;       /* back-compat: only this menu's items */
 }
 
 /* ------------------------------------------------------------- menu bar */
@@ -146,8 +262,10 @@ static int menubar_title_x(const struct menubar *mb, int i)
 
 void menubar_close(struct menubar *mb)
 {
-	for (int i = 0; i < mb->n; i++)
+	for (int i = 0; i < mb->n; i++) {
 		mb->menus[i]->open = 0;
+		menu_subs_close(mb->menus[i]);
+	}
 }
 
 void menubar_draw(const struct menubar *mb)
@@ -163,9 +281,9 @@ void menubar_draw(const struct menubar *mb)
 		menu_draw(mb->menus[openi], menubar_title_x(mb, openi), mb->y);
 }
 
-int menubar_click(struct menubar *mb, int mx, int my, int *menu, int *item)
+int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *item)
 {
-	*menu = -1;
+	*leaf = 0;
 	*item = -1;
 
 	/* On the title row: toggle the clicked title and close the others, so only
@@ -178,7 +296,6 @@ int menubar_click(struct menubar *mb, int mx, int my, int *menu, int *item)
 				int wasopen = mb->menus[i]->open;
 				menubar_close(mb);
 				mb->menus[i]->open = !wasopen;
-				*menu = i;
 				return 1;
 			}
 		}
@@ -186,25 +303,130 @@ int menubar_click(struct menubar *mb, int mx, int my, int *menu, int *item)
 		return 1;
 	}
 
-	/* Below the bar: hand the click to whichever menu is open (menu_click closes
-	 * it and returns the chosen item, or -1 if the click missed the dropdown). */
+	/* Below the bar: hand the click to whichever menu is open (menu_click_ex
+	 * closes it and reports the chosen leaf item, or -1 if the click missed). */
 	for (int i = 0; i < mb->n; i++) {
 		if (!mb->menus[i]->open)
 			continue;
-		int it = menu_click(mb->menus[i], mx, my, menubar_title_x(mb, i), mb->y);
-		if (it >= 0) { *menu = i; *item = it; }
+		struct menu *lf = 0;
+		int it = menu_click_ex(mb->menus[i], mx, my,
+		                       menubar_title_x(mb, i), mb->y, &lf);
+		if (it >= 0) { *leaf = lf; *item = it; }
 		return 1;
 	}
 	return 0;
 }
 
-int menubar_shortcut(const struct menubar *mb, int key, int *menu)
+int menubar_shortcut(const struct menubar *mb, int key, struct menu **leaf)
 {
+	if (!key) { if (leaf) *leaf = 0; return -1; }
 	for (int i = 0; i < mb->n; i++) {
-		int it = menu_shortcut(mb->menus[i], key);
-		if (it >= 0) { if (menu) *menu = i; return it; }
+		struct menu *lf = 0;
+		int it = menu_shortcut_walk(mb->menus[i], key, &lf);
+		if (it >= 0) { if (leaf) *leaf = lf; return it; }
 	}
-	if (menu)
-		*menu = -1;
+	if (leaf)
+		*leaf = 0;
 	return -1;
+}
+
+/* ------------------------------------------------------------- tab strip */
+
+#define TAB_NEW_W   26   /* width of the trailing "+" button            */
+#define TAB_CLOSE_W 16   /* right-edge close hit/draw zone within a tab */
+#define TAB_MAX_W  168   /* a tab never grows wider than this           */
+#define TAB_MIN_W   46   /* nor shrinks below this (then they overflow) */
+
+#define TAB_STRIP_BG 0x1c2330u   /* strip backdrop (behind/under tabs)  */
+#define TAB_ON_BG    0xf4f5f7u   /* active tab: matches the content pane */
+#define TAB_OFF_BG   0x2a3342u   /* inactive tab                        */
+#define TAB_ON_FG    0x101418u
+#define TAB_OFF_FG   0xb8c0ccu
+
+/* Even per-tab width: the strip minus the "+" button split across the tabs,
+ * clamped so labels stay legible (and overflow rather than vanish if cramped). */
+static int tabbar_each_w(int w, int n)
+{
+	if (n < 1) n = 1;
+	int avail = w - TAB_NEW_W;
+	int tw = avail / n;
+	if (tw > TAB_MAX_W) tw = TAB_MAX_W;
+	if (tw < TAB_MIN_W) tw = TAB_MIN_W;
+	return tw;
+}
+
+/* x of the "+" button: just past the last tab, but never off the right edge. */
+static int tabbar_new_x(int x, int w, int n, int tw)
+{
+	int nx = x + n * tw;
+	if (nx > x + w - TAB_NEW_W)
+		nx = x + w - TAB_NEW_W;
+	return nx;
+}
+
+/* Draw `s` clipped to maxpx pixels, appending ".." when it doesn't fit. */
+static void tab_label(int x, int y, const char *s, int maxpx, unsigned fg)
+{
+	int maxc = maxpx / 8;
+	if (maxc < 1) maxc = 1;
+	if (wstrlen(s) <= maxc) { gfx_text(x, y, s, fg, GFX_TRANSPARENT); return; }
+	char buf[40];
+	int k = 0;
+	for (int i = 0; i < maxc - 2 && k < (int)sizeof buf - 3 && s[i]; i++)
+		buf[k++] = s[i];
+	buf[k++] = '.'; buf[k++] = '.'; buf[k] = '\0';
+	gfx_text(x, y, buf, fg, GFX_TRANSPARENT);
+}
+
+/* A small 7x7 "×" centred on (cx,cy). */
+static void tab_closebox(int cx, int cy, unsigned c)
+{
+	for (int i = 0; i < 7; i++) {
+		gfx_pixel(cx + i,     cy + i, c);
+		gfx_pixel(cx + 6 - i, cy + i, c);
+	}
+}
+
+void tabbar_draw(int x, int y, int w, const char *const *labels, int n, int active)
+{
+	gfx_fill_rect(x, y, w, GUI_TAB_H, TAB_STRIP_BG);
+	int tw = tabbar_each_w(w, n);
+	int ty = y + (GUI_TAB_H - 16) / 2;
+	for (int i = 0; i < n; i++) {
+		int tx = x + i * tw;
+		int on = (i == active);
+		unsigned bg = on ? TAB_ON_BG : TAB_OFF_BG;
+		gfx_fill_rect(tx, y, tw - 1, GUI_TAB_H, bg);
+		if (on)                                      /* accent bar on top */
+			gfx_fill_rect(tx, y, tw - 1, 2, 0x2f6bd8);
+		gfx_fill_rect(tx + tw - 1, y, 1, GUI_TAB_H, TAB_STRIP_BG);  /* divider */
+		int has_x = n > 1;
+		int textpx = tw - 8 - (has_x ? TAB_CLOSE_W : 4);
+		tab_label(tx + 8, ty, labels[i], textpx, on ? TAB_ON_FG : TAB_OFF_FG);
+		if (has_x)
+			tab_closebox(tx + tw - TAB_CLOSE_W + 4, y + (GUI_TAB_H - 7) / 2,
+			             on ? 0x707880 : 0x8a93a0);
+	}
+	int nx = tabbar_new_x(x, w, n, tw);
+	gfx_text(nx + (TAB_NEW_W - 8) / 2, ty, "+", 0xc8d0dc, GFX_TRANSPARENT);
+}
+
+int tabbar_hit(int x, int y, int w, int n, int mx, int my, int *index)
+{
+	if (my < y || my >= y + GUI_TAB_H || mx < x)
+		return TABBAR_NONE;
+	int tw = tabbar_each_w(w, n);
+	int nx = tabbar_new_x(x, w, n, tw);
+	if (mx >= nx && mx < nx + TAB_NEW_W)
+		return TABBAR_NEW;
+	int i = (mx - x) / tw;
+	if (i < 0 || i >= n)
+		return TABBAR_NONE;
+	int tx = x + i * tw;
+	if (n > 1 && mx >= tx + tw - TAB_CLOSE_W) {
+		if (index) *index = i;
+		return TABBAR_CLOSE;
+	}
+	if (index) *index = i;
+	return TABBAR_SELECT;
 }

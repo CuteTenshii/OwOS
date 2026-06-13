@@ -16,6 +16,7 @@
  */
 
 #include "owos.h"
+#include "url.h"     /* struct purl, parse_url (shared with the browser) */
 
 /* ---- tiny string helpers (freestanding, no libc) ----------------------- */
 
@@ -51,61 +52,6 @@ static void sapp(char *dst, int *n, int cap, const char *s)
 	while (*s && *n < cap - 1)
 		dst[(*n)++] = *s++;
 	dst[*n] = '\0';
-}
-
-/* ---- URL parsing ------------------------------------------------------- */
-
-struct purl {
-	int  tls;
-	int  port;
-	char host[128];
-	char path[300];
-};
-
-/* Split scheme://host[:port][/path]. Lenient: a missing scheme means http.
- * No IPv6-bracket support (the kernel resolver takes a name or dotted-quad).
- * Returns 1 on success, 0 if the host is empty. */
-static int parse_url(const char *url, struct purl *u)
-{
-	const char *p = url;
-	u->tls = 0;
-	u->port = 0;
-
-	if (starts_ci(p, "http://"))
-		p += 7;
-	else if (starts_ci(p, "https://")) {
-		p += 8;
-		u->tls = 1;
-	}
-
-	int i = 0;
-	while (*p && *p != '/' && *p != ':' && i < (int)sizeof(u->host) - 1)
-		u->host[i++] = *p++;
-	u->host[i] = '\0';
-	if (i == 0)
-		return 0;
-
-	if (*p == ':') {
-		p++;
-		int port = 0;
-		while (*p >= '0' && *p <= '9')
-			port = port * 10 + (*p++ - '0');
-		u->port = port;
-	}
-	if (u->port == 0)
-		u->port = u->tls ? 443 : 80;
-
-	int j = 0;
-	if (*p != '/')
-		u->path[j++] = '/';
-	while (*p && j < (int)sizeof(u->path) - 1)
-		u->path[j++] = *p++;
-	u->path[j] = '\0';
-	if (u->path[0] == '\0') {
-		u->path[0] = '/';
-		u->path[1] = '\0';
-	}
-	return 1;
 }
 
 /* ---- buffered transport reader ----------------------------------------- */

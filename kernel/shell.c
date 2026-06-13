@@ -17,6 +17,7 @@
 #include "ahci.h"
 #include "nvme.h"
 #include "pci.h"
+#include "e1000.h"
 #include "usb.h"
 #include "speaker.h"
 #include "sb16.h"
@@ -1597,6 +1598,9 @@ static void bi_pwd(const char *a)      { (void)a; cmd_pwd(); }
 static void bi_run(const char *a)      { cmd_run((char *)a); }
 static void bi_format(const char *a)   { (void)a; fs_format(); vga_write("filesystem erased.\n"); }
 static void bi_lspci(const char *a)    { (void)a; pci_list(); }
+static void bi_ethdiag(const char *a)  { (void)a; e1000_diag(); }
+static void bi_dhcp(const char *a)     { (void)a; net_dhcp_now(); }
+static void bi_txtest(const char *a)   { (void)a; e1000_txtest(); }
 static void bi_lsusb(const char *a)
 {
 	while (*a == ' ') a++;            /* "lsusb <port>" shows detail for a port  */
@@ -1673,6 +1677,7 @@ static void bi_dig(const char *a)
 	if (a[0] == '\0') { vga_write("usage: dig <host> [type]\n"); return; }
 	net_dig(a);
 }
+static void bi_ntp(const char *a)      { net_ntp(a); }
 static void bi_fstest(const char *a)     { (void)a; fs_selftest(); }
 static void bi_cryptotest(const char *a) { (void)a; crypto_selftest(); }
 static void bi_echo(const char *a)       { vga_write(a); vga_putc('\n'); }
@@ -1715,6 +1720,9 @@ static const struct builtin builtins[] = {
 	{ "run",      bi_run,       "run <f> [a|b] run a program (ring 3); a|b pipes a into b" },
 	{ "format",   bi_format,    "format        erase the filesystem" },
 	{ "lspci",    bi_lspci,     "lspci         list PCI devices" },
+	{ "ethdiag",  bi_ethdiag,   "ethdiag       Intel NIC bring-up log + link/traffic stats" },
+	{ "dhcp",     bi_dhcp,      "dhcp          re-request a DHCP lease (waits for link)" },
+	{ "txtest",   bi_txtest,    "txtest        Intel NIC transmit self-test (MAC loopback)" },
 	{ "lsusb",    bi_lsusb,     "lsusb [port]  list USB devices (port: detail for one)" },
 	{ "storage",  bi_storage,   "storage       list storage devices (IDE/SATA/NVMe)" },
 	{ "mount",    bi_mount,     "mount         mount a removable volume (USB/SD/disk) at /media" },
@@ -1730,6 +1738,7 @@ static const struct builtin builtins[] = {
 	{ "neofetch", bi_neofetch,  "neofetch      system info splash" },
 	{ "ping",     bi_ping,      "ping <host>   ICMP-echo a host or IP (e.g. google.com)" },
 	{ "dig",      bi_dig,       "dig <host> [t] DNS lookup; type t=A,AAAA,CNAME,MX,TXT,NS..." },
+	{ "ntp",      bi_ntp,       "ntp [host] [+/-tz] set the clock from an NTP server (tz hours)" },
 	{ NULL,       NULL,         "curl <url>    HTTP an http:// or https:// URL (-i headers, -X method, -o file)" },
 	{ "url",      cmd_url,      "url <url>     parse a URL into its parts and rebuild it" },
 	{ "torrent",  cmd_torrent,  "torrent info <f> parse a .torrent: name, infohash, files (test: self-check)\n"

@@ -33,6 +33,9 @@
 #define SYS_VOLUMES    29
 #define SYS_EJECT      30
 #define SYS_WIN_CURSOR 31
+#define SYS_STREAM_BEGIN 32
+#define SYS_STREAM_WRITE 33
+#define SYS_STREAM_END   34
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -115,6 +118,21 @@ int readfile_at(const char *name, unsigned off, void *buf, unsigned len)
 {
 	unsigned a[4] = { (unsigned)name, off, (unsigned)buf, len };
 	return syscall(SYS_READFILE_AT, (int)a, 0, 0);
+}
+
+int stream_begin(const char *name)
+{
+	return syscall(SYS_STREAM_BEGIN, (int)name, 0, 0);
+}
+
+int stream_write(const void *buf, int len)
+{
+	return syscall(SYS_STREAM_WRITE, (int)buf, len, 0);
+}
+
+int stream_end(void)
+{
+	return syscall(SYS_STREAM_END, 0, 0, 0);
 }
 
 int net_connect(const char *host, int port, int tls)

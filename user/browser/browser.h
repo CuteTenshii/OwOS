@@ -16,9 +16,11 @@
 #include "gfx.h"
 #include "inflate.h"
 #include "upng.h"
+#include "url.h"     /* struct purl, parse_url, resolve_url (shared with curl) */
 
 extern int BW, BH;         /* client size (mutable: the window is resizable)    */
 #define MENU_H    18       /* top app-menu bar height (above the address bar)  */
+#define TAB_H     24       /* tab strip height (between menu and address bar)  */
 #define ADDR_H    26       /* address-bar height                               */
 #define STATUS_H  20       /* bottom status-line height                        */
 #define GLYPH_W   8
@@ -48,7 +50,6 @@ enum render_mode { MODE_HTML, MODE_TEXT, MODE_IMAGE };
 
 struct cookie { int used; char host[128]; char name[64]; char val[256]; };
 struct link   { int start, end; char href[256]; };
-struct purl   { int tls; int port; char host[256]; char path[URL_MAX]; };
 
 /* An inline <img>: anchored at a text offset, fetched into img_pool, laid out
  * into reserved blank rows, and blitted decode-on-scroll when in view. */
@@ -73,6 +74,9 @@ struct browser {
 	char     status[160];
 	char     doc_title[128];
 	char     ctype[80];              /* lowercased response Content-Type      */
+	char     dl_name[128];           /* filename from Content-Disposition     */
+	int      cdisp_attach;           /* 1 = Content-Disposition: attachment   */
+	int      dl_saved;               /* set when http_txn streamed a download */
 	int      mode;                   /* enum render_mode for the current body */
 	char     cur_url[URL_MAX];
 	char     raw[RAW_MAX];
@@ -132,8 +136,7 @@ static inline void uapp(char *d, int *n, int cap, unsigned v)
 }
 
 /* --- cross-module API ----------------------------------------------------- */
-int  parse_url(const char *url, struct purl *u);            /* html.c */
-void resolve_url(const char *base, const char *loc, char *out, int cap);
+/* parse_url / resolve_url live in user/lib/url.h (shared with curl). */
 void html_to_text(void);
 void plain_to_text(void);                                  /* html.c */
 void doc_message(const char *m);

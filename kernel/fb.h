@@ -28,6 +28,17 @@ uint32_t fb_pitch_pixels(void);    /* back buffer row stride in pixels (>= width
  * VRAM writes are slow. */
 void fb_present(void);
 
+/* Software display brightness, driven by the keyboard's brightness keys (there
+ * is no panel-backlight register we can reach, so fb_present dims pixels as it
+ * copies the back buffer to the screen). Levels run FB_BRIGHT_MIN..FB_BRIGHT_MAX;
+ * at MAX the copy is a verbatim fast path. fb_brightness_step adjusts the level
+ * and re-renders the whole screen at once so the change shows immediately. Safe
+ * to call from an IRQ; a no-op in text mode or single-buffered fallback. */
+#define FB_BRIGHT_MAX 8
+#define FB_BRIGHT_MIN 2
+void fb_brightness_step(int dir);  /* +1 = brighter, -1 = dimmer (clamped)      */
+int  fb_brightness(void);          /* current level FB_BRIGHT_MIN..FB_BRIGHT_MAX */
+
 /* Clip rectangle for drawing primitives. The compositor sets it to a damaged
  * region and redraws the scene clipped to it, so only that area is touched and
  * presented. fb_clip_full restores the whole screen. */

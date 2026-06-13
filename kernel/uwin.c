@@ -112,6 +112,16 @@ static void uw_click(struct window *w, int mx, int my)
 	}
 }
 
+static void uw_rclick(struct window *w, int mx, int my)
+{
+	struct uwin *u = w->state;
+	if (!u)
+		return;
+	int cx = mx - (w->x + WM_BORDER);
+	int cy = my - (w->y + WM_TITLE_H);
+	evq_push(u, WEV_RCLICK, cx, cy);
+}
+
 static void uw_key(struct window *w, char c)
 {
 	struct uwin *u = w->state;
@@ -265,6 +275,7 @@ int uwin_create(int w, int h, const char *title)
 	win->on_resize = uw_on_resize;
 	win->draw = uw_draw;
 	win->click = uw_click;
+	win->rclick = uw_rclick;
 	win->key = uw_key;
 	win->dirty = uw_dirty;
 	win->on_close = uw_on_close;

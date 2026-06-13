@@ -34,14 +34,24 @@ void status_set(struct status_bar *s, const char *msg);
 void status_draw(const struct status_bar *s, int x, int y, int w,
                  unsigned fg, unsigned bg);   /* fills the bar and shows msg */
 
-/* A single drop-down menu (e.g. "File" with New/Open/Save/...). The owning app
- * draws the full-width bar background itself, then calls menu_draw() last so the
- * popup overlays the content.
+/* Per-item state bits for the optional `flags` array (mutable — apps toggle
+ * them at runtime). DISABLED items are dimmed and inert (no click, no
+ * accelerator); CHECKED items show a checkmark in a left gutter. */
+#define MENU_DISABLED 0x01
+#define MENU_CHECKED  0x02
+
+/* A drop-down menu (e.g. "File" with New/Open/Save/...). The owning app draws the
+ * full-width bar background itself, then calls menu_draw() last so the popup
+ * overlays the content. The same struct doubles as a submenu (see `subs`): a
+ * submenu has no title bar of its own, just the popup, opened by its parent item.
  *
- * `hints`/`keys` are optional parallel arrays (NULL = none) giving each item a
- * keyboard accelerator: `hints[i]` is the label shown right-aligned in the
- * dropdown ("Ctrl+S"), `keys[i]` the KEY_* byte (KEY_SAVE...) the app's key
- * handler feeds to menu_shortcut() to fire that item without opening the menu. */
+ * Optional parallel arrays (NULL = absent), each indexed by item:
+ *  - `hints`/`keys`: a keyboard accelerator — `hints[i]` is the right-aligned
+ *    label ("Ctrl+S"), `keys[i]` the KEY_* byte fed to menu_shortcut().
+ *  - `flags`: MENU_DISABLED|MENU_CHECKED state bits (mutable; reserves a check
+ *    gutter for the whole menu when present).
+ *  - `subs`: a child submenu per item (subs[i] != NULL makes item i a parent that
+ *    opens subs[i] to its right instead of firing an action). */
 struct menu {
 	const char *title;
 	const char *const *items;
@@ -49,13 +59,21 @@ struct menu {
 	int open;
 	const char *const  *hints;   /* optional: per-item accelerator label */
 	const unsigned char *keys;   /* optional: per-item KEY_* shortcut byte */
+	unsigned char       *flags;  /* optional: per-item MENU_DISABLED|MENU_CHECKED */
+	struct menu *const  *subs;   /* optional: per-item submenu (NULL = none)      */
 };
 void menu_draw(const struct menu *m, int x, int y);
 /* Route a click at (mx,my) given the menu title's top-left (x,y). Toggles/closes
- * m->open as needed; returns the chosen item index, or -1 if none was chosen. */
+ * m->open (and any submenus) as needed; returns the chosen item index of `m`, or
+ * -1 if nothing in `m` fired (a disabled item, an opened submenu, a chosen
+ * *submenu* item, or a miss). Use menu_click_ex to dispatch submenu items. */
 int  menu_click(struct menu *m, int mx, int my, int x, int y);
-/* Map a pressed key to a menu item via the `keys` table: returns the item index
- * whose accelerator equals `key`, or -1 if none (or no `keys` table). */
+/* Like menu_click but reports the leaf menu that owns the fired item via *leaf
+ * (which may be a submenu, not `m`). Returns that menu's item index, or -1. */
+int  menu_click_ex(struct menu *m, int mx, int my, int x, int y,
+                   struct menu **leaf);
+/* Map a pressed key to a menu item via the `keys` tables (searches submenus too,
+ * skips disabled items): returns the item index, or -1 if none. */
 int  menu_shortcut(const struct menu *m, int key);
 
 /* A row of dropdown menus sharing one bar (File / Edit / View ...). Holds an
@@ -72,13 +90,35 @@ struct menubar {
 void menubar_draw(const struct menubar *mb);
 /* Route a click. Returns 1 if it hit the bar or an open dropdown (the app should
  * repaint and not process the click further), 0 if it was elsewhere. When an
- * item is chosen, *menu and *item give its menu and item index; otherwise *item
- * is -1 (only open/close state changed). Clicking off an open menu closes it. */
-int  menubar_click(struct menubar *mb, int mx, int my, int *menu, int *item);
-/* Map a pressed key to any menu's accelerator: returns the item index and sets
- * *menu to which menu owns it, or -1 (with *menu = -1) if none matches. */
-int  menubar_shortcut(const struct menubar *mb, int key, int *menu);
-/* Close every dropdown on the bar (e.g. after firing an accelerator or Esc). */
+ * item is chosen, *leaf and *item give the leaf menu (a bar menu OR one of its
+ * submenus — dispatch by pointer) and its item index; otherwise *item is -1
+ * (only open/close state changed). Clicking off an open menu closes it. */
+int  menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *item);
+/* Map a pressed key to any menu's accelerator (submenus included): returns the
+ * item index and sets *leaf to the owning menu, or -1 (with *leaf = NULL). */
+int  menubar_shortcut(const struct menubar *mb, int key, struct menu **leaf);
+/* Close every dropdown on the bar and its submenus (after an accelerator/Esc). */
 void menubar_close(struct menubar *mb);
+
+/* --------------------------------------------------------------- tab strip */
+/*
+ * A horizontal strip of tabs with per-tab close boxes and a trailing "+" button,
+ * the way a tabbed browser/editor lays out documents. The widget is stateless:
+ * the app owns the tab list and its bookkeeping; this only draws `labels[0..n)`
+ * (highlighting `active`) and maps a click back to an action. Tabs share the
+ * available width evenly (clamped), labels are truncated to fit, and the close
+ * box appears only when more than one tab is open.
+ */
+#define GUI_TAB_H 24    /* tab strip height */
+
+/* tabbar_hit() outcomes. SELECT/CLOSE fill *index with the tab; NEW is the "+". */
+enum { TABBAR_NONE = 0, TABBAR_SELECT, TABBAR_CLOSE, TABBAR_NEW };
+
+/* Draw the strip filling [x, x+w) at height GUI_TAB_H from y. The app fills no
+ * background itself — the widget paints the whole strip. */
+void tabbar_draw(int x, int y, int w, const char *const *labels, int n, int active);
+/* Hit-test a click at (mx,my) against the same geometry. Returns a TABBAR_*
+ * code; for SELECT/CLOSE sets *index to the tab index. */
+int  tabbar_hit(int x, int y, int w, int n, int mx, int my, int *index);
 
 #endif /* OWOS_GFX_H */

@@ -7,6 +7,8 @@
 #include "io.h"
 #include "screenshot.h"
 #include "serial.h"
+#include "sb16.h"
+#include "fb.h"
 
 #define KBD_DATA_PORT   0x60
 #define KBD_STATUS_PORT 0x64
@@ -31,6 +33,19 @@
 #define SC_E_END       0x4F
 #define SC_E_DELETE    0x53
 #define SC_ALT         0x38        /* extended 0xE0 0x38 is AltGr (right Alt)  */
+
+/* Extended (0xE0-prefixed) media / "Fn" keys. Volume + mute use the standard
+ * AT consumer-control make codes that multimedia keyboards (and QEMU's
+ * `sendkey volumeup/volumedown/volumemute`) emit. Brightness has no universal
+ * PS/2 scancode — laptops usually deliver it over ACPI/EC — so we adopt the
+ * codes commonly seen on PS/2 brightness keys; they act on the framebuffer's
+ * software dimmer. All are handled directly in the IRQ (like Print Screen),
+ * not queued as characters. */
+#define SC_E_MUTE      0x20
+#define SC_E_VOL_DOWN  0x2E
+#define SC_E_VOL_UP    0x30
+#define SC_E_BRIGHT_DN 0x6B
+#define SC_E_BRIGHT_UP 0x6C
 
 /* Numeric keypad make codes are contiguous from 0x47 to 0x53. */
 #define SC_KP_FIRST    0x47
@@ -252,6 +267,12 @@ static void keyboard_handler(struct registers *r)
 		switch (sc) {
 		case 0x1C:           ring_push('\n');       break;  /* keypad Enter  */
 		case 0x35:           ring_push('/');        break;  /* keypad /      */
+		/* Media / Fn keys: act on the device directly, like Print Screen. */
+		case SC_E_MUTE:      sb16_volume_mute();     break;
+		case SC_E_VOL_DOWN:  sb16_volume_step(-1);   break;
+		case SC_E_VOL_UP:    sb16_volume_step(+1);   break;
+		case SC_E_BRIGHT_DN: fb_brightness_step(-1); break;
+		case SC_E_BRIGHT_UP: fb_brightness_step(+1); break;
 		case SC_E_UP:        ring_push(KEY_UP);     break;
 		case SC_E_DOWN:      ring_push(KEY_DOWN);   break;
 		case SC_E_LEFT:      ring_push(KEY_LEFT);   break;
@@ -259,6 +280,7 @@ static void keyboard_handler(struct registers *r)
 		case SC_E_HOME:      ring_push(KEY_HOME);   break;
 		case SC_E_END:       ring_push(KEY_END);    break;
 		case SC_E_DELETE:    ring_push(KEY_DELETE); break;
+		case 0x5B: case 0x5C: ring_push(KEY_SUPER); break;  /* left/right GUI key */
 		}
 		return;
 	}

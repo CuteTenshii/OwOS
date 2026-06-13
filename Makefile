@@ -68,6 +68,7 @@ ULIB    := user/lib/start.o user/lib/lib.o user/lib/gfx.o
 # like hello doesn't carry the 32 KiB inflate window or the decoder buffers).
 INFLATE := user/lib/inflate.o
 UPNG    := user/lib/upng.o
+URL     := user/lib/url.o     # shared URL parse/resolve (curl + browser)
 
 user/lib/start.o: user/lib/start.S
 	$(CC) $(UCFLAGS) -c $< -o $@
@@ -80,14 +81,18 @@ user/%.o: user/%.c
 user/%.elf: user/%.o $(ULIB) user/user.ld
 	ld -m elf_i386 -T user/user.ld -o $@ $< $(ULIB)
 
+# curl speaks HTTP, so it links the shared URL lib (overrides the pattern above).
+user/curl.elf: user/curl.o $(URL) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ user/curl.o $(URL) $(ULIB)
+
 # The browser is a multi-file user program (user/browser/*.c), linked flat.
 # It pulls in the streaming inflate lib for gzip/deflate HTTP responses and the
 # PNG decoder so image/* pages render instead of showing as raw bytes.
 BROWSER_OBJS := user/browser/main.o user/browser/fetch.o user/browser/html.o
 user/browser/%.o: user/browser/%.c
 	$(CC) $(UCFLAGS) -c $< -o $@
-user/browser.elf: $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(ULIB) user/user.ld
-	ld -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(ULIB)
+user/browser.elf: $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(URL) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(URL) $(ULIB)
 
 # The image viewer links the streaming PNG decoder (which uses inflate).
 user/imgview.elf: user/imgview.o $(UPNG) $(INFLATE) $(ULIB) user/user.ld
@@ -217,7 +222,7 @@ usb: $(ISO)
 	@dev=$$(basename $(USB)); \
 	 echo "About to ERASE $(USB) [$$(cat /sys/block/$$dev/device/vendor 2>/dev/null) $$(cat /sys/block/$$dev/device/model 2>/dev/null), $$(($$(cat /sys/block/$$dev/size)/2097152)) GiB] and write $(ISO)."
 	@printf 'Type YES to continue: '; read ans; test "$$ans" = "YES" || { echo "aborted"; exit 1; }
-	sudo dd if=$(ISO) of=$(USB) bs=4M oflag=direct status=progress conv=fsync
+	dd if=$(ISO) of=$(USB) bs=4M oflag=direct status=progress conv=fsync
 	sync
 	@echo "done: $(ISO) written to $(USB) — set BIOS/UEFI to boot from it"
 

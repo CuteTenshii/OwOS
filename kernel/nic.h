@@ -27,6 +27,10 @@ struct nic_ops {
 	 * in addition to the driver's own RX IRQ, so RX still works on a host (e.g.
 	 * VMware) that routes the NIC's INTx to a line our PIC never sees. */
 	void         (*poll)(void);
+	/* Optional (may be NULL): 1 if the physical link is up. Lets the IP stack
+	 * wait for a real copper link to autonegotiate before sending (DHCP). A NULL
+	 * hook is treated as "always up" (e.g. virtual NICs with instant link). */
+	int          (*link_up)(void);
 };
 
 void           nic_init(void);    /* probe known drivers; keep the first present */
@@ -42,5 +46,9 @@ void           nic_send(const uint8_t *frame, uint32_t len);
 /* Poll the active NIC for inbound frames (no-op if it has no poll hook or no
  * NIC is present). Driven off the timer tick as an IRQ-independent RX path. */
 void           nic_poll(void);
+
+/* 1 if the active NIC's link is up (or has no link_up hook — virtual NICs).
+ * 0 only when a driver that reports link explicitly says it's down. */
+int            nic_link_up(void);
 
 #endif /* OWOS_NIC_H */

@@ -51,6 +51,11 @@ static uint8_t dma_buf[DMABUF] __attribute__((aligned(DMABUF)));
 static int present;
 static volatile int irq_count;     /* bumped by the IRQ each time a half ends  */
 
+/* Master volume, 0..SB_VOL_MAX (max by default), plus a mute latch. Adjusted
+ * live by the keyboard's volume keys; pushed to the mixer by set_mixer_volume. */
+static int volume = SB_VOL_MAX;
+static int muted;
+
 /* ---- DSP / mixer primitives -------------------------------------------- */
 
 static void dsp_write(uint8_t v)
@@ -64,6 +69,41 @@ static void mixer_write(uint8_t reg, uint8_t v)
 {
 	outb(SB_MIX_ADDR, reg);
 	outb(SB_MIX_DATA, v);
+}
+
+/* Push the current volume/mute state to the SB16 mixer. The master (0x22) and
+ * voice/DAC (0x04) registers each pack a 4-bit left and right level (bits 7-4 /
+ * 3-0), so we map our 0..SB_VOL_MAX scale onto 0..15 and mirror it L+R. */
+static void set_mixer_volume(void)
+{
+	int v = muted ? 0 : volume;
+	uint8_t lvl = (uint8_t)(v * 15 / SB_VOL_MAX);
+	uint8_t both = (uint8_t)((lvl << 4) | lvl);
+	mixer_write(0x22, both);        /* master volume                            */
+	mixer_write(0x04, both);        /* voice (DAC) volume                       */
+}
+
+void sb16_volume_step(int dir)
+{
+	int nv = volume + dir;
+	if (nv < 0)          nv = 0;
+	if (nv > SB_VOL_MAX) nv = SB_VOL_MAX;
+	volume = nv;
+	muted  = 0;                     /* nudging the level always unmutes         */
+	if (present)
+		set_mixer_volume();
+}
+
+void sb16_volume_mute(void)
+{
+	muted = !muted;
+	if (present)
+		set_mixer_volume();
+}
+
+int sb16_volume(void)
+{
+	return muted ? 0 : volume;
 }
 
 static int dsp_reset(void)
@@ -95,8 +135,7 @@ void sb16_init(void)
 	present = 1;
 	irq_register(SB_IRQ, sb16_irq);
 	irq_unmask(SB_IRQ);
-	mixer_write(0x22, 0xFF);        /* master volume to max                     */
-	mixer_write(0x04, 0xFF);        /* voice (DAC) volume to max                */
+	set_mixer_volume();             /* defaults to SB_VOL_MAX (== 0xFF L+R)     */
 	vga_write("sb16: Sound Blaster 16 ready (io 0x220 irq 5 dma 1)\n");
 }
 

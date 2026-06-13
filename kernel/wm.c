@@ -23,6 +23,7 @@
 #include "fb.h"
 #include "vga.h"
 #include "mouse.h"
+#include "keyboard.h"
 #include "timer.h"
 #include "rtc.h"
 #include "sched.h"
@@ -418,7 +419,9 @@ static void handle_input(int mx, int my, int buttons, int dz)
 	static int      rsz_sent_w, rsz_sent_h;
 	static uint32_t rsz_ack;
 
+	static int  prev_rdown;
 	int down = buttons & 1;        /* left button                              */
+	int rdown = buttons & 2;       /* right button                             */
 
 	/* Wheel: route to whatever visible window is under the cursor. */
 	if (dz) {
@@ -426,6 +429,20 @@ static void handle_input(int mx, int my, int buttons, int dz)
 		if (idx >= 0 && wins[idx].scroll)
 			wins[idx].scroll(&wins[idx], mx, my, dz);
 	}
+
+	/* Right-press: raise the window under the cursor and, if the press landed in
+	 * its client area (not the chrome), hand it to the app's rclick — typically a
+	 * context menu. Tracked on its own edge so it never disturbs a left drag. */
+	if (rdown && !prev_rdown) {
+		int idx = window_at(mx, my);
+		if (idx >= 0) {
+			raise_window(idx);
+			struct window *w = &wins[idx];
+			if (w->rclick && my >= w->y + WM_TITLE_H)
+				w->rclick(w, mx, my);
+		}
+	}
+	prev_rdown = rdown;
 
 	if (down && !prev_down) {      /* press                                    */
 		/* Start button / launcher popup take priority over windows. */
@@ -569,7 +586,8 @@ void wm_destroy_window(struct window *w)
 		return;
 	w->visible = 0;
 	w->dead = 1;
-	w->draw = 0; w->click = 0; w->dirty = 0; w->key = 0; w->on_close = 0;
+	w->draw = 0; w->click = 0; w->rclick = 0; w->dirty = 0; w->key = 0;
+	w->on_close = 0;
 	w->state = 0;
 }
 
@@ -587,6 +605,12 @@ void wm_set_cursor(struct window *w, int cursor)
 
 int wm_feed_key(char c)
 {
+	/* The Super/Windows key toggles the Start menu, whatever holds focus. */
+	if (c == KEY_SUPER) {
+		start_open = !start_open;
+		return 1;
+	}
+
 	int t = topmost_visible();
 	if (t < 0)
 		return 0;

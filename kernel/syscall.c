@@ -55,6 +55,9 @@
 #define SYS_VOLUMES    29 /* volumes(idx=ebx, out=ecx -> struct volinfo) -> 1/0/-1 */
 #define SYS_EJECT      30 /* eject(path=ebx, ignored) -> 0/-1 (unmount /media)        */
 #define SYS_WIN_CURSOR 31 /* win_cursor(id=ebx, shape=ecx) -> 0/-1 (enum wm_cursor)   */
+#define SYS_STREAM_BEGIN 32 /* stream_begin(name=ebx) -> 0/-1 (open a streaming write) */
+#define SYS_STREAM_WRITE 33 /* stream_write(buf=ebx, len=ecx) -> 0/-1 (append a chunk) */
+#define SYS_STREAM_END   34 /* stream_end() -> bytes committed / -1 (commit + close)   */
 
 #define NET_HOST_MAX 128
 
@@ -340,6 +343,32 @@ void syscall_dispatch(struct registers *r)
 		r->eax = (uint32_t)fs_create(abs, (const void *)buf, len);
 		break;
 	}
+	/* Streaming write: begin -> write* -> end, for a file too big to hold in one
+	 * user buffer (a browser download). Mirrors fs_stream_* one-to-one; owofs
+	 * allows a single open stream at a time. */
+	case SYS_STREAM_BEGIN: {
+		const char *name = (const char *)r->ebx;
+		if (!user_range(r->ebx, 24)) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		char abs[SYS_PATH_MAX];
+		join_cwd(name, abs, sizeof abs);
+		r->eax = (uint32_t)fs_stream_begin(abs);
+		break;
+	}
+	case SYS_STREAM_WRITE: {
+		uint32_t buf = r->ebx, len = r->ecx;
+		if (!user_range(buf, len)) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		r->eax = (uint32_t)fs_stream_write((const void *)buf, len);
+		break;
+	}
+	case SYS_STREAM_END:
+		r->eax = (uint32_t)fs_stream_end();
+		break;
 	case SYS_NET_CONNECT: {
 		/* Copy the host string out of user memory, bounded. */
 		if (!user_range(r->ebx, 1)) {

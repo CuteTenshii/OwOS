@@ -6,9 +6,11 @@
 
 void net_init(void);            /* bring up the NIC and announce the IP config */
 void net_dhcp_start(void);      /* spawn a DHCP client to lease IP/gw/dns (real links) */
+int  net_dhcp_now(void);        /* re-run DHCP synchronously (the `dhcp` command)       */
 int  net_ping(const char *host);/* resolve + ICMP-echo a host; returns 0 if any
                                  * reply arrived, -1 otherwise                 */
 int  net_dig(const char *host); /* DNS A-record lookup; prints the answers     */
+int  net_ntp(const char *arg);  /* SNTP-sync the CMOS clock; arg: [host] [+/-tz] */
 int  net_curl(const char *arg); /* HTTP/1.0 GET of an http:// URL (-i: headers)*/
 
 /* GET `url`, capturing the response body into buf (cap bytes); returns the

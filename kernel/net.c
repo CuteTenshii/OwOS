@@ -30,6 +30,7 @@
 #include "gzip.h"
 #include "heap.h"
 #include "sched.h"
+#include "rtc.h"
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -143,6 +144,11 @@ static volatile uint32_t dns_ans_ttl[DNS_MAX_ANS];
 static volatile char     dns_ans_text[DNS_MAX_ANS][DNS_TEXT]; /* formatted rdata */
 static volatile int      dns_ans_count;
 static volatile uint32_t dns_send_us, dns_rtt_us;     /* query timing          */
+
+/* NTP reply slot: the server's 32-bit transmit timestamp (seconds since the
+ * 1900 epoch), written by the RX interrupt and polled by net_ntp. */
+static volatile int      ntp_got;
+static volatile uint32_t ntp_secs;
 
 static uint16_t ip_ident = 1;
 
@@ -551,6 +557,17 @@ void net_udp_send(const uint8_t dst[4], uint16_t dport, uint16_t sport,
 	ip_send(dst, IP_UDP, pkt, 8 + len);
 }
 
+/* Pull the transmit timestamp out of a 48-byte NTP/SNTP reply (server -> us).
+ * Only the integer seconds (offset 40, big-endian) matter for a wall clock. */
+static void ntp_recv(const uint8_t *p, uint32_t len)
+{
+	if (len < 48)
+		return;
+	ntp_secs = ((uint32_t)p[40] << 24) | ((uint32_t)p[41] << 16) |
+	           ((uint32_t)p[42] << 8)  |  (uint32_t)p[43];
+	ntp_got  = 1;
+}
+
 static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
 {
 	if (len < 8)
@@ -558,6 +575,10 @@ static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
 	const struct udp_hdr *u = (const struct udp_hdr *)p;
 	if (ntohs(u->sport) == 53) {
 		dns_recv(p + 8, len - 8);
+		return;
+	}
+	if (ntohs(u->sport) == 123) {
+		ntp_recv(p + 8, len - 8);
 		return;
 	}
 	udp_handler_t fn = udp_lookup(ntohs(u->dport));
@@ -774,6 +795,14 @@ static void dhcp_recv(const uint8_t src[4], uint16_t sport,
 static int dhcp_run(void)
 {
 	uint8_t pkt[300];
+
+	/* Wait for the physical link before broadcasting: real copper Ethernet takes
+	 * a couple of seconds to autonegotiate, and DISCOVERs sent into a down link
+	 * are simply lost (the cause of "no lease" on a freshly-woken I219). Bounded
+	 * (~8s); virtual NICs report up immediately and fall straight through. */
+	for (int w = 0; w < 800 && !nic_link_up(); w++)
+		timer_sleep(10);
+
 	dhcp_state = 0;
 	net_udp_listen(68, dhcp_recv);
 
@@ -826,6 +855,27 @@ void net_dhcp_start(void)
 	if (!nic_present())
 		return;
 	sched_create_thread("dhcp", dhcp_thread);
+}
+
+/* Re-run DHCP synchronously (the `dhcp` shell command): for retrying a lease by
+ * hand once the link is known up. Prints the same result line as the boot path
+ * and returns 0 on success. */
+int net_dhcp_now(void)
+{
+	if (!nic_present()) {
+		vga_write("dhcp: no NIC\n");
+		return -1;
+	}
+	if (dhcp_run() == 0) {
+		vga_write("dhcp: ip ");  print_ip(my_ip);
+		vga_write(" gw ");       print_ip(gw_ip);
+		vga_write(" dns ");      print_ip(dns_ip);
+		vga_putc('\n');
+		return 0;
+	}
+	vga_write(nic_link_up() ? "dhcp: no lease (link up)\n"
+	                        : "dhcp: no lease (link down)\n");
+	return -1;
 }
 
 /* Print a microsecond duration as milliseconds with 3 decimals (e.g. 1.234). */
@@ -1570,6 +1620,144 @@ int net_ping(const char *host)
 	vga_write_dec((uint32_t)recv);
 	vga_write(" received\n");
 	return recv > 0 ? 0 : -1;
+}
+
+/* Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01). */
+#define NTP_UNIX_DELTA 2208988800u
+
+/* Convert a Unix timestamp (UTC) to a civil date/time, after Howard Hinnant's
+ * days-from-civil inverse. Valid for any non-negative day count. */
+static void unix_to_rtc(uint32_t secs, struct rtc_time *t)
+{
+	uint32_t days = secs / 86400u;
+	uint32_t rem  = secs % 86400u;
+	t->hour = (uint8_t)(rem / 3600u);
+	t->min  = (uint8_t)((rem % 3600u) / 60u);
+	t->sec  = (uint8_t)(rem % 60u);
+
+	uint32_t z   = days + 719468u;          /* shift epoch to 0000-03-01       */
+	uint32_t era = z / 146097u;
+	uint32_t doe = z - era * 146097u;                       /* [0, 146096]     */
+	uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+	uint32_t y   = yoe + era * 400u;
+	uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);   /* [0, 365]    */
+	uint32_t mp  = (5u * doy + 2u) / 153u;                       /* [0, 11]     */
+	uint32_t d   = doy - (153u * mp + 2u) / 5u + 1u;            /* [1, 31]      */
+	uint32_t m   = mp < 10u ? mp + 3u : mp - 9u;               /* [1, 12]      */
+
+	t->day   = (uint8_t)d;
+	t->month = (uint8_t)m;
+	t->year  = (uint16_t)(y + (m <= 2u ? 1u : 0u));
+}
+
+/* Print a number as two zero-padded digits (for the HH:MM:SS clock readout). */
+static void ntp_print2(uint8_t v)
+{
+	if (v < 10)
+		vga_putc('0');
+	vga_write_dec(v);
+}
+
+/* Query an SNTP server, then set the CMOS clock from its reply. `arg` may carry
+ * a server host/IP and/or a timezone offset token like "+2" or "-5" (whole
+ * hours); both are optional. Defaults: pool.ntp.org, UTC. */
+int net_ntp(const char *arg)
+{
+	if (!nic_present()) {
+		vga_write("ntp: no network device\n");
+		return -1;
+	}
+
+	const char *host = "pool.ntp.org";
+	char        hostbuf[64];
+	int         tz_secs = 0;
+
+	/* Split arg into whitespace tokens: a leading +/- token is a TZ offset in
+	 * hours, anything else is the server name/IP. */
+	const char *s = arg;
+	while (*s) {
+		while (*s == ' ' || *s == '\t')
+			s++;
+		if (!*s)
+			break;
+		const char *start = s;
+		while (*s && *s != ' ' && *s != '\t')
+			s++;
+		uint32_t tlen = (uint32_t)(s - start);
+
+		if (start[0] == '+' || start[0] == '-') {
+			int neg = start[0] == '-';
+			int h = 0;
+			for (uint32_t i = 1; i < tlen; i++)
+				if (start[i] >= '0' && start[i] <= '9')
+					h = h * 10 + (start[i] - '0');
+			tz_secs = (neg ? -h : h) * 3600;
+		} else if (tlen < sizeof(hostbuf)) {
+			for (uint32_t i = 0; i < tlen; i++)
+				hostbuf[i] = start[i];
+			hostbuf[tlen] = '\0';
+			host = hostbuf;
+		}
+	}
+
+	uint8_t ip[4];
+	if (!parse_ipv4(host, ip)) {
+		if (!dns_resolve(host, ip)) {
+			vga_write("ntp: cannot resolve ");
+			vga_write(host);
+			vga_putc('\n');
+			return -1;
+		}
+	}
+
+	/* Warm the next-hop ARP entry so the first request isn't ARP-blocked. */
+	uint8_t warm[6];
+	next_hop_mac(ip, warm);
+
+	uint8_t pkt[48];
+	for (int i = 0; i < 48; i++)
+		pkt[i] = 0;
+	pkt[0] = 0x1B;                    /* LI=0, VN=3, Mode=3 (client)          */
+
+	for (int tries = 0; tries < 3; tries++) {
+		ntp_got = 0;
+		net_udp_send(ip, 123, 0xC123, pkt, sizeof(pkt));
+		uint32_t deadline = timer_ticks() + 2 * TIMER_HZ;   /* ~2 s            */
+		while (timer_ticks() < deadline) {
+			__asm__ volatile ("" ::: "memory");
+			if (ntp_got)
+				break;
+			__asm__ volatile ("sti\n\thlt");   /* IF=0 in syscall ctx        */
+		}
+		if (ntp_got)
+			break;
+	}
+
+	if (!ntp_got) {
+		vga_write("ntp: no reply from ");
+		vga_write(host);
+		vga_putc('\n');
+		return -1;
+	}
+
+	if (ntp_secs < NTP_UNIX_DELTA) {     /* pre-1970: bogus / era-rollover     */
+		vga_write("ntp: implausible timestamp\n");
+		return -1;
+	}
+
+	struct rtc_time t;
+	unix_to_rtc(ntp_secs - NTP_UNIX_DELTA + (uint32_t)tz_secs, &t);
+	rtc_set(&t);
+
+	vga_write("clock set: ");
+	vga_write_dec(t.year);  vga_putc('-');
+	ntp_print2(t.month);    vga_putc('-');
+	ntp_print2(t.day);      vga_putc(' ');
+	ntp_print2(t.hour);     vga_putc(':');
+	ntp_print2(t.min);      vga_putc(':');
+	ntp_print2(t.sec);
+	vga_write(tz_secs ? " (local)\n" : " UTC\n");
+	return 0;
 }
 
 void net_init(void)

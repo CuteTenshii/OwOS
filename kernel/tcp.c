@@ -100,6 +100,7 @@ struct tcp_conn {
 	uint8_t          *rxbuf;         /* lazily allocated, retained per slot */
 	volatile uint32_t wlen;          /* bytes written by the IRQ           */
 	volatile uint32_t rlen;          /* bytes consumed by the reader       */
+	volatile uint32_t adv_wnd;       /* last receive window we advertised  */
 
 	volatile int      accepted;      /* server: handed out by tcp_accept   */
 	uint32_t          opened;        /* timer_ticks() at SYN_RCVD (reaping)*/
@@ -191,7 +192,9 @@ static void tcp_xmit(struct tcp_conn *c, uint8_t *seg, uint8_t flags,
 	t->off   = 5 << 4;              /* 20-byte header, no options              */
 	t->flags = flags;
 	uint32_t space = TCP_RXBUF - (c->wlen - c->rlen);
-	t->win   = htons(space > 65535 ? 65535 : space);
+	if (space > 65535) space = 65535;
+	t->win   = htons((uint16_t)space);
+	c->adv_wnd = space;             /* remember what the peer now believes */
 	t->csum  = 0;
 	t->urg   = 0;
 	t->csum  = htons(tcp_checksum(net_my_ip(), c->peer_ip, seg, 20 + dlen));
@@ -268,6 +271,7 @@ static void tcp_accept_syn(const uint8_t src[4], const struct tcp_hdr *t)
 	c->rcv_nxt = ntohl(t->seq) + 1;          /* their SYN consumes one             */
 	c->wlen    = 0;
 	c->rlen    = 0;
+	c->adv_wnd = 0;
 	c->finned  = 0;
 	c->reset   = 0;
 	c->accepted = 0;
@@ -388,6 +392,7 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport)
 	c->rcv_nxt = 0;
 	c->wlen    = 0;
 	c->rlen    = 0;
+	c->adv_wnd = 0;
 	c->finned  = 0;
 	c->reset   = 0;
 	c->accepted = 0;
@@ -452,6 +457,19 @@ int tcp_read_nb(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed)
 			kmemcpy((uint8_t *)buf + first, c->rxbuf, n - first);
 		}
 		c->rlen += n;
+
+		/* Window update (RFC 1122 SWS avoidance): draining freed space the peer
+		 * doesn't know about. Once that space has grown an MSS past what we last
+		 * advertised, send an ACK now — otherwise a receive buffer that filled
+		 * while the app was busy leaves the sender stalled until its persist
+		 * timer fires (~an RTO each time), which is the stop-and-go that throttles
+		 * large downloads to a crawl. */
+		if (c->state == ST_ESTAB || c->state == ST_CLOSE_WAIT) {
+			uint32_t freespace = TCP_RXBUF - (c->wlen - c->rlen);
+			if (freespace >= c->adv_wnd + TCP_MSS)
+				tcp_send_ctl(c, TCP_ACK, c->snd_nxt);
+		}
+
 		*closed = c->finned && c->rlen == c->wlen;
 		return (int)n;
 	}

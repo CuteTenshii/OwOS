@@ -64,3 +64,10 @@ void nic_poll(void)
 	if (active && active->poll)
 		active->poll();
 }
+
+int nic_link_up(void)
+{
+	if (!active)
+		return 0;
+	return active->link_up ? active->link_up() : 1;
+}

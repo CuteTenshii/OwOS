@@ -12,4 +12,13 @@
 
 extern const struct nic_ops e1000_ops;
 
+/* Print the Intel NIC bring-up log + live link state (the `ethdiag` command).
+ * Chiefly for the PCH-integrated I217/I218/I219 wake path, whose probe runs
+ * before any console is visible on a laptop. */
+void e1000_diag(void);
+
+/* `txtest` command: MAC-internal-loopback transmit self-test — isolates the TX
+ * engine/DMA from the external MAC<->PHY link to localize why TX is dead. */
+void e1000_txtest(void);
+
 #endif /* OWOS_E1000_H */

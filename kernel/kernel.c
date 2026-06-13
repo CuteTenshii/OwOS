@@ -265,6 +265,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		fs_mkdir("/bin");
 		fs_mkdir("/home");
 		fs_mkdir("/home/root");
+		fs_mkdir("/home/root/Downloads");   /* the browser saves here */
 		if (fs_read("/bin/edit", &probe, 0) < 0)
 			fs_create("/bin/edit", _binary_user_edit_elf_start,
 			          (uint32_t)(_binary_user_edit_elf_end -

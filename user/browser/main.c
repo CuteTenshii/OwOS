@@ -19,20 +19,50 @@ const unsigned palette[16] = {
 	0x2050d0, 0xa0a0a0,
 };
 
-/* The app menu bar: two dropdowns ("Page" and "View") laid out on one bar via
- * the gfx menubar helper, which keeps only one open at a time. Page covers
- * loading/navigation (Reload carries the F5 accelerator); View covers scrolling
- * within the current page. */
+/* The app menu bar: "Page" and "View" laid out on one bar via the gfx menubar
+ * helper (one open at a time). It also exercises the widget's per-item states:
+ * "Stop" is DISABLED while idle, "Show Images" is a CHECKED toggle, and "Scroll"
+ * is a submenu holding the scroll commands. */
+static int show_images = 1;        /* "View > Show Images" checkbox state */
+
 static const char *const page_items[] = { "Reload", "Home", "Stop" };
 static const char *const page_hints[] = { "F5", "", "" };
 static const unsigned char page_keys[] = { KEY_F5, 0, 0 };
-static struct menu pagemenu = { "Page", page_items, 3, 0, page_hints, page_keys };
+static unsigned char page_flags[]      = { 0, 0, MENU_DISABLED };   /* Stop: idle */
+static struct menu pagemenu = { "Page", page_items, 3, 0,
+                                page_hints, page_keys, page_flags, 0 };
 
-static const char *const view_items[] = { "Top", "Bottom", "Page Up", "Page Down" };
-static struct menu viewmenu = { "View", view_items, 4, 0, 0, 0 };
+/* "View > Scroll" submenu (opened by the View "Scroll" item). */
+static const char *const scroll_items[] = { "Top", "Bottom", "Page Up", "Page Down" };
+static struct menu scrollmenu = { "Scroll", scroll_items, 4, 0, 0, 0, 0, 0 };
+
+static const char *const view_items[] = { "Show Images", "Scroll" };
+static unsigned char       view_flags[] = { MENU_CHECKED, 0 };      /* images on */
+static struct menu *const  view_subs[]  = { 0, &scrollmenu };
+static struct menu viewmenu = { "View", view_items, 2, 0,
+                                0, 0, view_flags, view_subs };
 
 static struct menu *const bar_menus[] = { &pagemenu, &viewmenu };
 static struct menubar menubar = { bar_menus, 2, 2, 0 };
+
+/* --- tabs ------------------------------------------------------------------ */
+/* Each tab is lightweight — its URL, a short label, and its scroll offset. Only
+ * the *active* tab's page lives in B (the heavy ~11 MiB buffers), so switching a
+ * tab re-loads it through the same async worker that drives normal navigation:
+ * the UI stays live and memory stays bounded regardless of how many tabs exist.
+ * The strip itself is the gfx tabbar widget; this owns the list it draws. */
+#define MAX_TABS 8
+struct tab { char url[URL_MAX]; char label[40]; int scroll; };
+static struct tab tabs[MAX_TABS];
+static int n_tabs = 1;
+static int active_tab = 0;
+
+static void copy_str(char *d, const char *s, int cap)
+{
+	int i = 0;
+	for (; s[i] && i < cap - 1; i++) d[i] = s[i];
+	d[i] = '\0';
+}
 
 /* --- worker thread: drains req_pending, fetches, bumps seq for the UI ----- */
 /* 32 KiB: http_txn alone holds hdr[4096] + req[2048] + a cookie buffer on the
@@ -294,9 +324,15 @@ static void render(void)
 {
 	unsigned bg = 0xf4f5f7;
 
-	/* address bar (below the menu bar) */
-	gfx_fill_rect(0, MENU_H, BW, ADDR_H, 0x222831);
-	int fx = 6, fy = MENU_H + 4, fw = BW - 12, fh = ADDR_H - 8;
+	/* tab strip (between the menu bar and the address bar) */
+	const char *labels[MAX_TABS];
+	for (int i = 0; i < n_tabs; i++)
+		labels[i] = tabs[i].label[0] ? tabs[i].label : "New Tab";
+	tabbar_draw(0, MENU_H, BW, labels, n_tabs, active_tab);
+
+	/* address bar (below the tab strip) */
+	gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
+	int fx = 6, fy = MENU_H + TAB_H + 4, fw = BW - 12, fh = ADDR_H - 8;
 	gfx_fill_rect(fx, fy, fw, fh, 0xffffff);
 	gfx_rect(fx, fy, fw, fh, 0x000000);
 	int maxc = (fw - 8) / GLYPH_W; if (maxc < 1) maxc = 1;
@@ -310,8 +346,8 @@ static void render(void)
 	gfx_text(fx + 4, fy + (fh - GLYPH_H) / 2, shown, 0x101418, 0xffffff);
 
 	/* content pane */
-	int py = MENU_H + ADDR_H, pw = BW - SCROLL_W;
-	int phh = BH - MENU_H - ADDR_H - STATUS_H; if (phh < 0) phh = 0;
+	int py = MENU_H + TAB_H + ADDR_H, pw = BW - SCROLL_W;
+	int phh = BH - MENU_H - TAB_H - ADDR_H - STATUS_H; if (phh < 0) phh = 0;
 	gfx_fill_rect(0, py, pw, phh, bg);
 	int rows = phh / GLYPH_H;
 
@@ -344,8 +380,8 @@ static void render(void)
 			int r0 = im->start_row;
 			int r1 = r0 + (im->rows > 0 ? im->rows : 1);
 			if (r1 <= B->scroll || r0 >= B->scroll + rows) continue;  /* off-screen */
-			if (im->ok) draw_inline_image(im, py, phh, cols);
-			else        draw_alt_box(im, py, phh);
+			if (im->ok && show_images) draw_inline_image(im, py, phh, cols);
+			else                       draw_alt_box(im, py, phh);
 		}
 
 		/* scrollbar */
@@ -370,7 +406,10 @@ static void render(void)
 	st[k] = '\0';
 	gfx_text(6, sy + (STATUS_H - GLYPH_H) / 2, st, 0xc8d0dc, 0x222831);
 
-	/* App menu bar over the top, then the dropdowns last so they overlay the page. */
+	/* App menu bar over the top, then the dropdowns last so they overlay the page.
+	 * "Stop" is only meaningful while a fetch is in flight, so disable it when
+	 * idle — the widget dims it and ignores clicks/accelerators. */
+	page_flags[2] = B->loading ? 0 : MENU_DISABLED;
 	gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
 	menubar_draw(&menubar);
 }
@@ -379,8 +418,8 @@ static void render(void)
 
 static void pane_metrics(int *py, int *phh, int *rows)
 {
-	*py = MENU_H + ADDR_H;
-	*phh = BH - MENU_H - ADDR_H - STATUS_H; if (*phh < 0) *phh = 0;
+	*py = MENU_H + TAB_H + ADDR_H;
+	*phh = BH - MENU_H - TAB_H - ADDR_H - STATUS_H; if (*phh < 0) *phh = 0;
 	*rows = (*phh > 0) ? *phh / GLYPH_H : 1;
 }
 
@@ -415,13 +454,84 @@ static void submit(void)
 	B->req_pending = 1; B->seq++;
 }
 
-/* Run menu item `item` of bar menu `mi` (0 = Page, 1 = View). Reload is also
+/* Reset B to an empty page (a fresh/blank tab) without touching the net. */
+static void show_blank(void)
+{
+	B->addr[0] = '\0'; B->addr_len = 0;
+	B->cur_url[0] = '\0'; B->doc_title[0] = '\0';
+	B->mode = MODE_HTML;
+	B->text_len = 0; B->nlines = 0; B->n_imgs = 0; B->nlinks = 0;
+	B->wrap_seq = 0xFFFFFFFF;
+	set_status("New tab. Type a URL and press Enter.");
+	B->seq++;
+}
+
+/* Pull the freshly-loaded page's url + a label back into the active tab (called
+ * when a fetch finishes — only the active tab ever loads). */
+static void tab_sync_active(void)
+{
+	struct tab *t = &tabs[active_tab];
+	copy_str(t->url, B->cur_url, sizeof t->url);
+	if (B->doc_title[0]) {
+		copy_str(t->label, B->doc_title, sizeof t->label);
+	} else {
+		struct purl u;
+		if (B->cur_url[0] && parse_url(B->cur_url, &u))
+			copy_str(t->label, u.host, sizeof t->label);
+		else
+			copy_str(t->label, "Untitled", sizeof t->label);
+	}
+}
+
+/* Make tab `i` the active one, re-loading its page (or showing blank). */
+static void select_tab(int i)
+{
+	if (i < 0 || i >= n_tabs || i == active_tab) return;
+	tabs[active_tab].scroll = B->scroll;     /* remember where we were */
+	active_tab = i;
+	B->scroll = tabs[i].scroll;
+	if (tabs[i].url[0]) navigate(tabs[i].url);
+	else                show_blank();
+}
+
+static void new_tab(void)
+{
+	if (n_tabs >= MAX_TABS) { set_status("Maximum tabs open."); B->seq++; return; }
+	tabs[active_tab].scroll = B->scroll;
+	active_tab = n_tabs++;
+	tabs[active_tab].url[0] = '\0';
+	tabs[active_tab].scroll = 0;
+	copy_str(tabs[active_tab].label, "New Tab", sizeof tabs[active_tab].label);
+	show_blank();
+}
+
+static void close_tab(int i)
+{
+	if (i < 0 || i >= n_tabs || n_tabs <= 1) return;   /* keep at least one */
+	int was_active = (i == active_tab);
+	for (int j = i; j < n_tabs - 1; j++) {       /* shift the rest down a slot */
+		char *d = (char *)&tabs[j], *s = (char *)&tabs[j + 1];
+		for (int k = 0; k < (int)sizeof(struct tab); k++) d[k] = s[k];
+	}
+	n_tabs--;
+	if (active_tab > i)          active_tab--;
+	else if (active_tab >= n_tabs) active_tab = n_tabs - 1;
+	if (was_active) {                                  /* reveal the neighbour */
+		B->scroll = tabs[active_tab].scroll;
+		if (tabs[active_tab].url[0]) navigate(tabs[active_tab].url);
+		else                         show_blank();
+	}
+	B->seq++;
+}
+
+/* Run item `item` of leaf menu `m` (a bar menu or one of its submenus — the
+ * menubar helper reports which one, so we dispatch by pointer). Reload is also
  * reached via the F5 accelerator. */
-static void menu_action(int mi, int item)
+static void menu_action(struct menu *m, int item)
 {
 	int py, phh, rows;
 	pane_metrics(&py, &phh, &rows);
-	if (mi == 0) {                                   /* Page                    */
+	if (m == &pagemenu) {
 		switch (item) {
 		case 0:                                  /* Reload current page     */
 			if (B->cur_url[0]) navigate(B->cur_url);
@@ -431,7 +541,14 @@ static void menu_action(int mi, int item)
 			B->req_pending = 0; set_status("Stopped."); B->seq++;
 			break;
 		}
-	} else {                                         /* View (scrolling)        */
+	} else if (m == &viewmenu) {
+		if (item == 0) {                         /* Show Images checkbox    */
+			view_flags[0] ^= MENU_CHECKED;
+			show_images = (view_flags[0] & MENU_CHECKED) != 0;
+			set_status(show_images ? "Images shown." : "Images hidden.");
+			B->seq++;
+		}                                        /* item 1 = Scroll submenu */
+	} else if (m == &scrollmenu) {
 		switch (item) {
 		case 0: B->scroll = 0; B->seq++; break;          /* Top             */
 		case 1:                                          /* Bottom          */
@@ -457,13 +574,24 @@ static void menu_action(int mi, int item)
 static void handle_click(int mx, int my)
 {
 	if (my < MENU_H || pagemenu.open || viewmenu.open) {   /* menu bar / dropdown */
-		int mi, item;
-		if (menubar_click(&menubar, mx, my, &mi, &item)) {
+		struct menu *leaf;
+		int item;
+		if (menubar_click(&menubar, mx, my, &leaf, &item)) {
 			if (item >= 0)
-				menu_action(mi, item);
+				menu_action(leaf, item);
 			B->seq++;
 			return;
 		}
+	}
+	if (my >= MENU_H && my < MENU_H + TAB_H) {              /* tab strip */
+		int idx = 0;
+		switch (tabbar_hit(0, MENU_H, BW, n_tabs, mx, my, &idx)) {
+		case TABBAR_SELECT: select_tab(idx); break;
+		case TABBAR_CLOSE:  close_tab(idx);  break;
+		case TABBAR_NEW:    new_tab();       break;
+		}
+		B->seq++;
+		return;
 	}
 	int py, phh, rows;
 	pane_metrics(&py, &phh, &rows);
@@ -490,8 +618,9 @@ static void handle_click(int mx, int my)
 static void handle_key(char c)
 {
 	/* Menu accelerator (F5 = Reload): fire the item like a click. */
-	int mi, sc = menubar_shortcut(&menubar, (unsigned char)c, &mi);
-	if (sc >= 0) { menubar_close(&menubar); menu_action(mi, sc); return; }
+	struct menu *leaf;
+	int sc = menubar_shortcut(&menubar, (unsigned char)c, &leaf);
+	if (sc >= 0) { menubar_close(&menubar); menu_action(leaf, sc); return; }
 	if ((unsigned char)c == 27) { menubar_close(&menubar); B->seq++; return; }
 
 	switch ((unsigned char)c) {
@@ -568,6 +697,7 @@ int main(void)
 			win_cursor(id, WIN_CURSOR_BUSY);         /* spinner while loading */
 		if (prev_loading && !B->loading) {           /* fetch finished */
 			win_cursor(id, WIN_CURSOR_ARROW);
+			tab_sync_active();                       /* refresh the tab label */
 			update_title(id);
 		}
 		prev_loading = B->loading;
