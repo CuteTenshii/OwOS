@@ -9,8 +9,10 @@
 
 #include <stdint.h>
 #include "mouse.h"
+#include "vmmouse.h"
 #include "irq.h"
 #include "io.h"
+#include "console.h"
 
 #define PS2_DATA   0x60
 #define PS2_STATUS 0x64
@@ -107,7 +109,21 @@ static void mouse_handler(struct registers *r)
 	if (!(st & STAT_OUTPUT_FULL) || !(st & STAT_AUX_DATA))
 		return;
 
-	uint8_t data = inb(PS2_DATA);
+	uint8_t data = inb(PS2_DATA);     /* always consume, to clear the controller */
+
+	/* Under VMware, the vmmouse device raises IRQ12 through the i8042 but the
+	 * real data lives in the backdoor queue: read absolute position from there
+	 * and ignore the (filler) PS/2 byte we just drained. */
+	if (vmmouse_active()) {
+		int nx = cur_x, ny = cur_y, btn = buttons, dz = 0;
+		if (vmmouse_poll(&nx, &ny, &btn, &dz)) {
+			cur_x = nx; cur_y = ny; buttons = btn;
+			wheel += dz;
+			seq++;
+		}
+		return;
+	}
+
 	int last = wheel_mode ? 3 : 2;    /* index of the packet's final byte       */
 	switch (cycle) {
 	case 0:
@@ -187,6 +203,16 @@ void mouse_init(int max_x, int max_y)
 	wheel_mode = (inb(PS2_DATA) == 3);
 
 	mouse_command(0xF4);           /* enable data reporting                    */
+
+	/* If we're under VMware (or QEMU's vmport + vmmouse), switch to the absolute
+	 * pointer: the host and guest cursors then track exactly, with no PS/2 delta
+	 * decoding. The PS/2 setup above stays — vmmouse still rides IRQ12 — and we
+	 * keep the same bounds. Falls back silently to PS/2 if there's no backdoor. */
+	/* Diagnostic plumbing for on-hardware (VMware) debugging: a journal line so a
+	 * real-VMware boot shows whether the absolute pointer engaged. */
+	vmmouse_init(bound_x, bound_y);
+	con_write(vmmouse_active() ? "mouse: vmmouse absolute pointer active.\n"
+	                           : "mouse: PS/2 relative (no VMware backdoor).\n");
 
 	irq_register(12, mouse_handler);
 	irq_unmask(2);                 /* the slave PIC is cascaded onto IRQ2      */

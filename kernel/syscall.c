@@ -25,6 +25,19 @@
 #include "uwin.h"
 #include "rtc.h"
 #include "shell.h"
+#include "cpu.h"
+#include "pmm.h"
+#include "pci.h"
+#include "firmware.h"
+#include "smbios.h"
+#include "battery.h"
+#include "fb.h"
+#include "edid.h"
+#include "ata.h"
+#include "ahci.h"
+#include "nvme.h"
+#include "hda.h"
+#include "sb16.h"
 
 #define SYS_WRITE    1   /* write(fd=ebx, buf=ecx, len=edx) -> bytes          */
 #define SYS_EXIT     2   /* exit(code=ebx) -- terminates the process          */
@@ -67,6 +80,18 @@
 #define SYS_STAT       39 /* stat(path=ebx, out=ecx -> {int is_dir; u32 size}) -> 0/-1  */
 #define SYS_SPAWN      40 /* spawn(path=ebx, arg=ecx|0) -> pid/-1 (detached, like the WM) */
 #define SYS_SHELL      41 /* shell(cmd=ebx, out=ecx, max=edx) -> bytes/-1 (run a kernel builtin) */
+#define SYS_MOUNT      42 /* mount(kind=ebx) -> 0/-1 (mount a present removable device at /media) */
+/* (43 sysinfo / 44 pcidev removed: read /proc/* via the file API instead.) */
+#define SYS_AUDIO_OPEN 46 /* audio_open() -> 0/-1 (open a 48k/S16/stereo PCM stream)       */
+#define SYS_AUDIO_WRITE 47 /* audio_write(buf=ebx, len=ecx) -> bytes / -1 / -2 (Ctrl+C)    */
+#define SYS_AUDIO_CLOSE 48 /* audio_close() -> 0 (drain + stop the stream)                 */
+#define SYS_CMD_BEGIN  49 /* cmd_begin(cmd=ebx) -> 0/-1 (start a streamed shell command)   */
+#define SYS_CMD_READ   50 /* cmd_read(buf=ebx, max=ecx) -> n / 0 / -1 (drain its output)   */
+#define SYS_CMD_ABORT  51 /* cmd_abort() -> 0 (abort the streamed command; kill a CLI child) */
+#define SYS_INTR       52 /* intr_take() -> 1/0 (read+clear the Ctrl+C latch for this task) */
+/* Net transports are general sockets: SYS_NET_CONNECT's `proto` arg selects
+ * TCP/TLS/UDP/raw-ICMP, so ping/dig/resolve are ring-3 libs over sockets, not
+ * bespoke syscalls. */
 
 #define NET_HOST_MAX 128
 
@@ -166,6 +191,10 @@ void syscall_init(void)
 	/* 0xEE = present, DPL 3, 32-bit interrupt gate -- ring 3 may invoke it. */
 	idt_set_gate(0x80, (uint32_t)isr128, GDT_KERNEL_CODE, 0xEE);
 }
+
+/* Which audio back end the open stream is using: 0 none, 1 HDA, 2 SB16. Global
+ * because owofs-style there is one audio stream at a time across the system. */
+static int audio_be;
 
 void syscall_dispatch(struct registers *r)
 {
@@ -276,12 +305,27 @@ void syscall_dispatch(struct registers *r)
 			have_arg = 1;
 		}
 
-		void *buf = kmalloc(64 * 1024);
+		/* Size the buffer to the actual file. Programs are 120+ KiB now, so the
+		 * old fixed 64 KiB buffer truncated the ELF and load_elf failed silently
+		 * -- which is exactly why opening a file from the Files app (fork+exec on
+		 * the 124 KiB editor) did nothing. SYS_SPAWN and launch_bin already size
+		 * to the file; SYS_EXEC was the straggler. */
+		char abs[SYS_PATH_MAX];
+		if (resolve_path(name, abs, sizeof abs) != 0) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		int fsz = fs_size(abs);
+		if (fsz <= 0) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		void *buf = kmalloc((uint32_t)fsz);
 		if (!buf) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
-		int n = read_with_path(name, buf, 64 * 1024);
+		int n = fs_read(abs, buf, (uint32_t)fsz);
 		uint32_t *dir;
 		uint32_t entry;
 		if (n < 0 || load_elf(buf, (uint32_t)n, &dir, &entry) != 0) {
@@ -554,38 +598,67 @@ void syscall_dispatch(struct registers *r)
 		r->eax = (uint32_t)read_at_with_path(name, off, (void *)bp, len);
 		break;
 	}
-	/* Report mounted removable volumes, so the file explorer can list them as
-	 * devices. Today there is at most one: the removable volume at /media. */
+	/* Report present removable devices, so the file explorer can list them as
+	 * devices -- mounted OR not, so it can offer a "Connect" button. Indexed by
+	 * ebx; returns 1 if that index exists, 0 past the end. `mounted` says whether
+	 * the device currently backs /media (and so has a valid `path`). */
 	case SYS_VOLUMES: {
-		struct vinfo { char label[24]; char path[24]; char kind[8]; int removable; } *o;
+		struct vinfo { char label[24]; char path[24]; char kind[8];
+		               int removable; int mounted; } *o;
 		if (!user_range(r->ecx, sizeof *o)) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
 		o = (struct vinfo *)r->ecx;
-		int got = 0;
-		if ((int)r->ebx == 0 &&
-		    (fat_mounted() || hfs_mounted() || ext_mounted() || iso_mounted())) {
-			const char *lbl = "";
+		struct blk_devinfo devs[8];
+		int n = blk_device_list(devs, 8);
+		int idx = (int)r->ebx;
+		if (idx < 0 || idx >= n) {
+			r->eax = 0;
+			break;
+		}
+		struct blk_devinfo *d = &devs[idx];
+		/* Label: the volume's FS label when mounted (more meaningful), else the
+		 * drive model; fall back to the short kind name if neither is set. */
+		const char *lbl = d->model;
+		if (d->mounted) {
 			if (iso_mounted())      lbl = iso_label();
 			else if (ext_mounted()) lbl = ext_label();
 			else if (hfs_mounted()) lbl = hfs_label();
 			else                    lbl = fat_label();
-			if (!lbl[0])
-				lbl = "Removable";
-			int i = 0;
-			for (; i < 23 && lbl[i]; i++) o->label[i] = lbl[i];
-			o->label[i] = '\0';
-			const char *p = "/media";
-			for (i = 0; i < 23 && p[i]; i++) o->path[i] = p[i];
-			o->path[i] = '\0';
-			const char *k = blk_fat_source();
-			for (i = 0; i < 7 && k[i]; i++) o->kind[i] = k[i];
-			o->kind[i] = '\0';
-			o->removable = 1;
-			got = 1;
 		}
-		r->eax = (uint32_t)got;
+		if (!lbl || !lbl[0])
+			lbl = d->name;
+		int i = 0;
+		for (; i < 23 && lbl[i]; i++) o->label[i] = lbl[i];
+		o->label[i] = '\0';
+		const char *p = d->mounted ? "/media" : "";
+		for (i = 0; i < 23 && p[i]; i++) o->path[i] = p[i];
+		o->path[i] = '\0';
+		for (i = 0; i < 7 && d->name[i]; i++) o->kind[i] = d->name[i];
+		o->kind[i] = '\0';
+		o->removable = 1;
+		o->mounted = d->mounted;
+		r->eax = 1;
+		break;
+	}
+
+	/* Mount a present removable device at /media by its kind ("USB"/"CD"/...),
+	 * the GUI's Connect action. The kind string is bounds-checked per byte into a
+	 * small kernel buffer (like SYS_SPAWN's arg) so a bogus pointer can't read
+	 * outside the user window. */
+	case SYS_MOUNT: {
+		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
+		char kind[8];
+		int j = 0;
+		while (j < (int)sizeof(kind) - 1 && user_range(r->ebx + (uint32_t)j, 1)) {
+			char ch = ((const char *)r->ebx)[j];
+			if (!ch)
+				break;
+			kind[j++] = ch;
+		}
+		kind[j] = '\0';
+		r->eax = (uint32_t)blk_mount_device(kind);
 		break;
 	}
 
@@ -717,6 +790,43 @@ void syscall_dispatch(struct registers *r)
 		r->eax = (uint32_t)shell_exec_capture(cmd, (char *)out, (int)max);
 		break;
 	}
+	case SYS_CMD_BEGIN: {
+		if (!user_range(r->ebx, 1)) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		char cmd[256];
+		int n = 0;
+		for (; n < (int)sizeof cmd - 1 && user_range(r->ebx + (uint32_t)n, 1); n++) {
+			char c = ((const char *)r->ebx)[n];
+			if (!c) break;
+			cmd[n] = c;
+		}
+		cmd[n] = '\0';
+		/* Arms the producer thread; output is drained with SYS_CMD_READ. The
+		 * runner runs the command (not us), so the caller stays responsive. */
+		r->eax = (uint32_t)shell_stream_begin(cmd);
+		break;
+	}
+	case SYS_CMD_READ: {
+		uint32_t buf = r->ebx, max = r->ecx;
+		if (!user_range(buf, max) || max == 0) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		/* The runner produces with IF=1; let it (and any reaped child) run. */
+		__asm__ volatile ("sti");
+		r->eax = (uint32_t)shell_stream_read((char *)buf, (int)max);
+		break;
+	}
+	case SYS_CMD_ABORT:
+		shell_stream_abort();          /* terminal close: kill a CLI child, then
+		                                * the caller drains to EOF to reset state */
+		r->eax = 0;
+		break;
+	case SYS_INTR:
+		r->eax = (uint32_t)sched_intr_take();   /* read + clear Ctrl+C latch */
+		break;
 	case SYS_STAT: {
 		struct st_out { int is_dir; uint32_t size; } *o;
 		if (!user_range(r->ebx, 1) || !user_range(r->ecx, sizeof *o)) {
@@ -736,6 +846,33 @@ void syscall_dispatch(struct registers *r)
 		r->eax = (uint32_t)rc;
 		break;
 	}
+
+
+	/* Streaming audio: /bin/play resamples a WAV to 48 kHz/S16/stereo in ring 3
+	 * and pushes it here in bounded chunks. One stream at a time (like the file
+	 * stream); the chosen back end is latched at open. */
+	case SYS_AUDIO_OPEN:
+		if (hda_present())       audio_be = (hda_stream_open()  == 0) ? 1 : 0;
+		else if (sb16_present()) audio_be = (sb16_stream_open() == 0) ? 2 : 0;
+		else                     audio_be = 0;
+		r->eax = audio_be ? 0 : (uint32_t)-1;
+		break;
+	case SYS_AUDIO_WRITE: {
+		uint32_t buf = r->ebx, len = r->ecx;
+		if (len == 0 || !user_range(buf, len)) { r->eax = (uint32_t)-1; break; }
+		__asm__ volatile ("sti");          /* back-pressure waits need the tick */
+		if (audio_be == 1)      r->eax = (uint32_t)hda_stream_write((const void *)buf, len);
+		else if (audio_be == 2) r->eax = (uint32_t)sb16_stream_write((const void *)buf, len);
+		else                    r->eax = (uint32_t)-1;
+		break;
+	}
+	case SYS_AUDIO_CLOSE:
+		__asm__ volatile ("sti");
+		if (audio_be == 1)      hda_stream_close();
+		else if (audio_be == 2) sb16_stream_close();
+		audio_be = 0;
+		r->eax = 0;
+		break;
 
 	default:
 		r->eax = (uint32_t)-1;

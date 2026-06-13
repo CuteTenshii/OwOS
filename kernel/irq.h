@@ -16,4 +16,9 @@ void irq_init(void);
 void irq_register(uint8_t irq, irq_handler_t handler);
 void irq_unmask(uint8_t irq);
 
+/* Re-program the PIC after an ACPI S3 resume (firmware wake POST clobbers it),
+ * restoring our vector mapping and the given line masks (read from PIC1/PIC2
+ * data ports before sleeping). */
+void irq_resume(uint8_t mask1, uint8_t mask2);
+
 #endif /* OWOS_IRQ_H */

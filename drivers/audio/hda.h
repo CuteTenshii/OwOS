@@ -14,13 +14,30 @@
 #ifndef OWOS_HDA_H
 #define OWOS_HDA_H
 
+#include <stdint.h>
+
 void hda_init(void);          /* probe + bring up the controller/codec        */
 int  hda_present(void);       /* 1 if a controller + usable codec was found   */
 
-/* Play a RIFF/WAVE file from owofs. Any PCM 8/16-bit, mono/stereo WAV is
- * resampled to 48 kHz 16-bit stereo and streamed to the codec by polling the
- * stream position register (no IRQ). Ctrl+C stops playback. Returns 0 on
- * success, 1 if interrupted, -1 on error. */
-int  hda_play_wav(const char *filename);
+/* Master-volume control on the output path's amp, driven by the keyboard's
+ * media keys — the HDA counterpart to sb16_volume_*. Same 0..HDA_VOL_MAX scale
+ * so keyboard.c can treat both cards uniformly. Safe to call from the keyboard
+ * IRQ (codec_cmd runs with interrupts masked). No-ops if no card / no amp. */
+#define HDA_VOL_MAX 8
+void hda_volume_step(int dir);   /* +1 = louder, -1 = quieter (clamped)        */
+void hda_volume_mute(void);      /* toggle mute (restores the prior level)      */
+int  hda_volume(void);           /* 0..HDA_VOL_MAX, or 0 while muted            */
+
+/* Streaming PCM sink, fed from ring 3 (/bin/play) over the SYS_AUDIO_* calls.
+ * The producer pushes a fixed canonical format — 48 kHz, 16-bit, stereo — which
+ * is exactly what the DMA buffer carries, so the WAV parse + resample stay in
+ * user space and this is just the back end. open() configures the path and DMA;
+ * write() copies frames into the cyclic buffer behind the play head, blocking
+ * (back-pressure, no IRQ) until the DMA frees room — it returns the bytes
+ * consumed, -1 if no stream is open, or -2 if Ctrl+C was pressed; close() drains
+ * and stops. One stream at a time. */
+int  hda_stream_open(void);
+int  hda_stream_write(const void *pcm, uint32_t bytes);
+void hda_stream_close(void);
 
 #endif /* OWOS_HDA_H */

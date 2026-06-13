@@ -4,6 +4,7 @@
 
 #include "fs.h"
 #include "blk.h"
+#include "procfs.h"
 #include "fat.h"
 #include "hfs.h"
 #include "ext.h"
@@ -352,6 +353,23 @@ static void list_row(int i)
 
 void fs_list(const char *path)
 {
+	const char *proc = procfs_subpath(path);
+	if (proc) {
+		int k = procfs_kind(proc);
+		if (k < 0) { con_write("ls: no such file or directory\n"); return; }
+		char nm[20];
+		if (k == 0) {                  /* names one /proc file -> list just it  */
+			const char *nf = proc[0] == '/' ? proc + 1 : proc;
+			write_mtime(0); con_write("  "); write_pad((uint32_t)procfs_size(nf), 8);
+			con_write("  "); con_write(nf); con_putc('\n');
+			return;
+		}
+		for (int i = 0; procfs_list(i, nm, sizeof nm); i++) {   /* the dir     */
+			write_mtime(0); con_write("  "); write_pad((uint32_t)procfs_size(nm), 8);
+			con_write("  "); con_write(nm); con_putc('\n');
+		}
+		return;
+	}
 	if (!mounted) {
 		con_write("fs: not mounted\n");
 		return;
@@ -388,6 +406,9 @@ void fs_list(const char *path)
 
 int fs_read(const char *name, void *buf, uint32_t maxlen)
 {
+	const char *proc = procfs_subpath(name);   /* /proc entries generated on read */
+	if (proc)
+		return procfs_read(proc, (char *)buf, (int)maxlen);
 	if (!mounted)
 		return -1;
 	const char *sub = media_subpath(name);
@@ -937,6 +958,15 @@ int fs_enum(int idx, char *name, uint32_t *size, uint32_t *mtime)
 
 int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime)
 {
+	const char *proc = procfs_subpath(path);
+	if (proc) {
+		int k = procfs_kind(proc);     /* 1 dir (/proc) / 0 file / -1 unknown  */
+		if (k < 0) return -1;
+		if (is_dir) *is_dir = (k == 1);
+		if (size)   *size = (k == 0) ? (uint32_t)procfs_size(proc) : 0;
+		if (mtime)  *mtime = 0;
+		return 0;
+	}
 	if (!mounted)
 		return -1;
 	const char *sub = media_subpath(path);
@@ -967,6 +997,15 @@ int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime)
 int fs_enum_dir(const char *path, int idx, char *name, int *is_dir,
                 uint32_t *size, uint32_t *mtime)
 {
+	const char *proc = procfs_subpath(path);
+	if (proc && !proc[0]) {            /* listing /proc itself                 */
+		if (idx < 0 || !procfs_list(idx, name, 20))
+			return 0;
+		if (is_dir) *is_dir = 0;
+		if (size)   *size = (uint32_t)procfs_size(name);
+		if (mtime)  *mtime = 0;
+		return 1;
+	}
 	if (!mounted || idx < 0)
 		return 0;
 	const char *sub = media_subpath(path);

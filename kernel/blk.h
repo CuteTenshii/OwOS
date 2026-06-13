@@ -41,6 +41,24 @@ int         blk_mount_fat(void);
  * was ever mounted). */
 const char *blk_fat_source(void);
 
+/* A present removable device, mounted or not, for the file explorer's Devices
+ * list. `name` is both the short UI label and the key passed to blk_mount_device. */
+struct blk_devinfo {
+	const char *name;     /* "USB"/"CD"/"SD"/"SATA"/"NVMe"/"IDE"                */
+	const char *model;    /* drive model string                                */
+	int         mounted;  /* 1 if this device currently backs /media           */
+};
+
+/* Enumerate present removable devices WITHOUT mounting any -- this only checks
+ * each driver's hardware presence, it never reads a filesystem. Fills out[0..max)
+ * and returns the count. */
+int         blk_device_list(struct blk_devinfo *out, int max);
+
+/* Mount a specific present device at /media by its `name`. Honors the one-volume
+ * rule: succeeds as a no-op if that device is already mounted, fails if a
+ * different volume holds /media (eject it first). Returns 0 on success. */
+int         blk_mount_device(const char *name);
+
 /* True only for the IDE disk. fs_init() auto-creates owofs on a blank IDE disk
  * (the dev/QEMU disk) but never on AHCI/NVMe, which on real hardware is the
  * user's OS drive — formatting that automatically would destroy their data. */

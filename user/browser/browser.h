@@ -65,8 +65,8 @@ struct inl_img {
 };
 
 struct browser {
-	char     addr[URL_MAX];
-	int      addr_len;
+	char     addr[URL_MAX];      /* address-bar buffer (owned by addr_tf)       */
+	struct textfield addr_tf;    /* editable address-bar field (caret + scroll) */
 	char     req_url[URL_MAX];
 	int      req_pending;
 	int      loading;
@@ -117,11 +117,9 @@ struct browser {
 extern struct browser *B;
 extern const unsigned palette[16];
 
-/* --- shared tiny helpers (header-inlined so each module gets its own copy) - */
-static inline int slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+/* --- shared tiny helpers (header-inlined so each module gets its own copy) -
+ * strlen/streq come from owos.h; these are the browser-specific ones. */
 static inline char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-static inline int streq(const char *a, const char *b)
-{ while (*a && *a == *b) { a++; b++; } return *a == *b; }
 static inline int starts_ci(const char *s, const char *pre)
 { while (*pre) { if (lower(*s) != lower(*pre)) return 0; s++; pre++; } return 1; }
 static inline void sapp(char *d, int *n, int cap, const char *s)

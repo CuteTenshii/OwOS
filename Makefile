@@ -27,21 +27,24 @@ OBJS    := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_
            drivers/input/keyboard.o kernel/timer.o kernel/shell.o kernel/serial.o kernel/log.o \
            kernel/pmm.o kernel/paging.o kernel/heap.o kernel/kstring.o \
            kernel/sched.o kernel/switch.o \
-           drivers/storage/ata.o drivers/storage/ahci.o drivers/storage/nvme.o drivers/storage/sd.o drivers/storage/atapi.o kernel/blk.o kernel/fs.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/iso9660.o drivers/bus/pci.o drivers/usb/usb.o drivers/usb/xhci.o \
+           drivers/storage/ata.o drivers/storage/ahci.o drivers/storage/nvme.o drivers/storage/sd.o drivers/storage/atapi.o kernel/blk.o kernel/fs.o kernel/procfs.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/iso9660.o drivers/bus/pci.o drivers/usb/usb.o drivers/usb/xhci.o \
            drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/tls.o \
            kernel/url.o kernel/zip.o kernel/gzip.o kernel/png.o kernel/screenshot.o \
            kernel/bencode.o kernel/torrent.o kernel/tracker.o kernel/peer.o \
-           drivers/audio/speaker.o drivers/audio/sb16.o drivers/audio/hda.o \
-           kernel/cpu.o kernel/rtc.o kernel/neofetch.o drivers/acpi/power.o drivers/acpi/battery.o \
+           drivers/audio/sb16.o drivers/audio/hda.o \
+           kernel/cpu.o kernel/rtc.o drivers/acpi/power.o drivers/acpi/s3_wake.o drivers/acpi/battery.o \
            kernel/firmware.o kernel/smbios.o drivers/acpi/aml.o drivers/video/edid.o \
            kernel/syscall.o kernel/loader.o kernel/pipe.o kernel/services.o \
            kernel/smb.o \
+           drivers/bus/vmware.o drivers/bus/vmtools.o drivers/input/vmmouse.o drivers/video/vmsvga.o \
            drivers/video/fb.o drivers/video/mtrr.o drivers/input/mouse.o kernel/wm.o kernel/uwin.o kernel/crash.o \
            kernel/apps.o \
            kernel/edit_blob.o kernel/curl_blob.o \
            kernel/editor_blob.o kernel/about_blob.o \
            kernel/clock_blob.o kernel/files_blob.o kernel/browser_blob.o \
-           kernel/imgview_blob.o kernel/crashme_blob.o kernel/term_blob.o
+           kernel/imgview_blob.o kernel/crashme_blob.o kernel/term_blob.o \
+           kernel/neofetch_blob.o kernel/lspci_blob.o kernel/play_blob.o \
+           kernel/ping_blob.o kernel/dig_blob.o kernel/torrent_blob.o
 
 # Which NIC QEMU attaches. Default rtl8139 (QEMU's classic card); override to
 # exercise the Intel driver, e.g. `make run NIC=e1000` (82540EM) — both the
@@ -65,13 +68,31 @@ $(KERNEL): $(OBJS) linker.ld
 # --- user-mode programs ----------------------------------------------------
 # Built freestanding against the tiny user lib, linked flat at 0x200000, then
 # embedded into the kernel as an object.
-UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -Iuser/lib -Wall
-ULIB    := user/lib/start.o user/lib/lib.o user/lib/gfx.o
+# -mno-sse/-mmx + x87 math: like the kernel, ring-3 code must avoid SSE — the
+# context switch saves no FPU/SSE state, and the float->int conversions gcc would
+# otherwise emit as cvttss2si (#UD on a no-SSE CPU like QEMU's qemu32) must use
+# x87 instead. Needed since play/mp3.c brought the first float code to user space.
+# The user lib is one directory per actual library — curl/ torrent/ crypto/ gfx/
+# zlib/ png/ mp3/ — each linked independently into the programs that use it. Each
+# is added to the include path so the flat `#include "http.h"` convention keeps
+# resolving (same trick as the kernel's DRVDIRS). libc (start/lib.c/owos.h) is
+# the base every program includes, so it stays at the user/lib root.
+ULIBDIRS := curl torrent crypto gfx zlib png mp3
+UCFLAGS  := -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall \
+           -mno-sse -mno-mmx -mfpmath=387 \
+           -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
+ULIB    := user/lib/start.o user/lib/lib.o user/lib/gfx/gfx.o
 # Optional libs, linked only into the programs that use them (so a tiny program
 # like hello doesn't carry the 32 KiB inflate window or the decoder buffers).
-INFLATE := user/lib/inflate.o
-UPNG    := user/lib/upng.o
-URL     := user/lib/url.o     # shared URL parse/resolve (curl + browser)
+INFLATE := user/lib/zlib/inflate.o    # zlib: streaming DEFLATE (gzip/png)
+UPNG    := user/lib/png/upng.o        # libpng: streaming PNG decode (uses zlib)
+URL     := user/lib/curl/url.o    # shared URL parse/resolve (curl + browser)
+HTTP    := user/lib/curl/http.o   # libcurl: HTTP/1.1 over net_* (curl + torrent tracker)
+H2      := user/lib/curl/h2.o     # libcurl: HTTP/2 engine (HPACK + framing)
+MP3     := user/lib/mp3/mp3.o     # streaming MPEG audio decoder (play, .mp3/.mp2/.mp1)
+LIBGCC  := $(shell $(CC) -m32 -print-libgcc-file-name)  # 64-bit div helpers etc.
+CRYPTO  := user/lib/crypto/crypto.o   # SHA-1 (torrent infohash + piece verify)
+TORLIB  := user/lib/torrent/bencode.o user/lib/torrent/torrent.o   # libtorrent (+ tracker/peer)
 
 user/lib/start.o: user/lib/start.S
 	$(CC) $(UCFLAGS) -c $< -o $@
@@ -84,9 +105,9 @@ user/%.o: user/%.c
 user/%.elf: user/%.o $(ULIB) user/user.ld
 	ld -m elf_i386 -T user/user.ld -o $@ $< $(ULIB)
 
-# curl speaks HTTP, so it links the shared URL lib (overrides the pattern above).
-user/curl.elf: user/curl.o $(URL) $(ULIB) user/user.ld
-	ld -m elf_i386 -T user/user.ld -o $@ user/curl.o $(URL) $(ULIB)
+# curl is a thin CLI over libcurl (HTTP/1.1 + HTTP/2) + the shared URL lib.
+user/curl.elf: user/curl.o $(HTTP) $(H2) $(URL) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ user/curl.o $(HTTP) $(H2) $(URL) $(ULIB)
 
 # The browser is a multi-file user program (user/browser/*.c), linked flat.
 # It pulls in the streaming inflate lib for gzip/deflate HTTP responses and the
@@ -100,6 +121,15 @@ user/browser.elf: $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(URL) $(ULIB) user/user.ld
 # The image viewer links the streaming PNG decoder (which uses inflate).
 user/imgview.elf: user/imgview.o $(UPNG) $(INFLATE) $(ULIB) user/user.ld
 	ld -m elf_i386 -T user/user.ld -o $@ user/imgview.o $(UPNG) $(INFLATE) $(ULIB)
+
+# play links the streaming MPEG decoder so it can play .mp3 as well as .wav.
+user/play.elf: user/play.o $(MP3) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ user/play.o $(MP3) $(ULIB)
+
+# torrent is a thin CLI over libtorrent (bencode/torrent/tracker/peer) + libcurl
+# (tracker announce) + the crypto lib (SHA-1 infohash / piece verify).
+user/torrent.elf: user/torrent.o $(TORLIB) $(CRYPTO) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ user/torrent.o $(TORLIB) $(CRYPTO) $(ULIB) $(LIBGCC)
 
 # Embed each ELF as an object; gives _binary_user_<name>_elf_{start,end}.
 kernel/%_blob.o: user/%.elf
@@ -269,7 +299,7 @@ usb: $(ISO)
 
 clean:
 	rm -f $(OBJS) $(KERNEL) $(ISO)
-	rm -f user/*.o user/*.elf user/lib/*.o user/browser/*.o user/browser/*.elf
+	rm -f user/*.o user/*.elf user/lib/*.o user/lib/*/*.o user/browser/*.o user/browser/*.elf
 	rm -rf $(ISODIR)
 
 # Also remove the disk images (wipes stored files).

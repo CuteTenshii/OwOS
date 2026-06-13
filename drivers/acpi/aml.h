@@ -12,6 +12,7 @@ struct aml_battery {
 	int percent;        /* 0..100 remaining charge                              */
 	int charging;       /* 1 if the _BST state says charging                    */
 	int discharging;    /* 1 if discharging                                     */
+	int minutes;        /* est. minutes to empty when discharging, else -1      */
 };
 
 /* Evaluate the first ACPI battery's _BST/_BIF and fill *out. Returns 1 on
@@ -29,5 +30,11 @@ int aml_battery_present(void);
  * (e.g. "unsupported opcode 0xA4", "_BST not found"). For diagnostics on real
  * hardware where this can't be tested locally. Empty string after success. */
 const char *aml_last_error(void);
+
+/* Namespace-walk diagnostics (real-hardware battery debugging). *out_nodes gets
+ * the count of recorded ACPI objects; *out_bail gets the opcode at which a
+ * term-list walk first bailed (0x5B00|ext for an ExtOp, else the bare opcode),
+ * or -1 if none. Either argument may be NULL. */
+void aml_ns_stats(int *out_nodes, int *out_bail);
 
 #endif /* OWOS_AML_H */

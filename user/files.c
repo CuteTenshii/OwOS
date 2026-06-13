@@ -23,7 +23,9 @@ static char        path[256] = "/";
 static int         scroll, sel = -1;
 static unsigned    seq;
 static struct fent fent_buf[FMAX];
-static int         fent_count, cached_seq = -1;
+static int         fent_count;
+static char        list_path[256];   /* path the cached listing reflects */
+static int         force_relist;     /* set by F5/Refresh to re-read in place */
 
 /* The single drop-down menu ("Go"), mirroring the editor's File menu: a top
  * bar with mouse-driven items, two of them carrying keyboard accelerators
@@ -95,12 +97,16 @@ static int collect(void)
 	return n;
 }
 
+/* Re-read the directory only when the path changed or an explicit refresh was
+ * asked for — NOT on every repaint. A resize bumps `seq` each frame, and on a
+ * removable device re-listing per frame is real block I/O (visible lag). */
 static void refresh(void)
 {
-	if (cached_seq == (int)seq)
+	if (!force_relist && feq(list_path, path))
 		return;
 	fent_count = collect();
-	cached_seq = (int)seq;
+	fcpy(list_path, path);
+	force_relist = 0;
 }
 
 static void go_up(void)
@@ -130,12 +136,12 @@ static const struct { const char *label, *path; } places[] = {
 
 /* Removable volumes (USB sticks, etc.), refreshed from the kernel each paint so
  * the list reflects plug/eject in real time. */
-static struct volinfo vols[4];
+static struct volinfo vols[6];
 static int            nvols;
 static void scan_vols(void)
 {
 	nvols = 0;
-	while (nvols < 4 && volumes(nvols, &vols[nvols]) == 1)
+	while (nvols < 6 && volumes(nvols, &vols[nvols]) == 1)
 		nvols++;
 }
 
@@ -160,6 +166,16 @@ static void draw_eject(int x, int y, unsigned c)
 	gfx_fill_rect(x + 3, y + 3, 1, 1, c);
 	gfx_fill_rect(x + 2, y + 4, 3, 1, c);
 	gfx_fill_rect(x + 1, y + 5, 5, 1, c);
+	gfx_fill_rect(x + 1, y + 7, 5, 1, c);
+}
+
+/* A "connect" glyph: a down-arrow into a tray bar (insert), the mirror of eject.
+ * Marks a present-but-unmounted device; clicking it mounts the device. */
+static void draw_connect(int x, int y, unsigned c)
+{
+	gfx_fill_rect(x + 1, y + 3, 5, 1, c);
+	gfx_fill_rect(x + 2, y + 4, 3, 1, c);
+	gfx_fill_rect(x + 3, y + 5, 1, 1, c);
 	gfx_fill_rect(x + 1, y + 7, 5, 1, c);
 }
 
@@ -209,17 +225,22 @@ static void render(void)
 		gfx_ui_text(6, ry, places[i].label, here ? 0xffffff : 0xc8d0dc);
 	}
 
-	/* Devices: mounted removable volumes, each with an eject button. */
+	/* Devices: every present removable device. Mounted ones are navigable and
+	 * carry an eject button; unmounted ones read dimmer and carry a connect
+	 * (mount) button. */
 	scan_vols();
 	if (nvols > 0) {
 		gfx_ui_text(6, dev_header_y(), "Devices", 0x8aa0b8);
 		for (int i = 0; i < nvols; i++) {
 			int ry = dev_row_y(i);
-			int here = under_path(path, vols[i].path);
+			int mounted = vols[i].mounted;
+			int here = mounted && under_path(path, vols[i].path);
 			unsigned rbg = here ? 0x24405c : 0x0e1218;
 			if (here) gfx_fill_rect(0, ry, sbw, ROW_H, rbg);
-			gfx_ui_text(6, ry, vols[i].label, here ? 0xffffff : 0xc8d0dc);
-			draw_eject(sbw - EJECT_W + 2, ry + 3, 0x8aa0b8);
+			unsigned fg = here ? 0xffffff : (mounted ? 0xc8d0dc : 0x8a96a4);
+			gfx_ui_text(6, ry, vols[i].label, fg);
+			if (mounted) draw_eject(sbw - EJECT_W + 2, ry + 3, 0x8aa0b8);
+			else         draw_connect(sbw - EJECT_W + 2, ry + 3, 0x8aa0b8);
 		}
 	}
 	gfx_fill_rect(sbw, 0, 1, H, 0x05070a);
@@ -345,13 +366,14 @@ static int list_hit(int mx, int my);   /* list row under (mx,my), or -1 */
  * left-press to an item or dismisses the menu.
  */
 enum ctx_kind { CTX_BG, CTX_FILE, CTX_DIR, CTX_PLACE, CTX_DEVICE };
-enum ctx_act  { A_OPEN, A_EDIT, A_EJECT, A_REFRESH, A_UP, A_HOME };
+enum ctx_act  { A_OPEN, A_EDIT, A_EJECT, A_CONNECT, A_REFRESH, A_UP, A_HOME };
 
 struct ctx_item { const char *label; int act; };
 static const struct ctx_item ci_file[]   = { {"Open", A_OPEN}, {"Edit", A_EDIT} };
 static const struct ctx_item ci_dir[]     = { {"Open", A_OPEN} };
 static const struct ctx_item ci_place[]   = { {"Open", A_OPEN} };
 static const struct ctx_item ci_device[]  = { {"Open", A_OPEN}, {"Eject", A_EJECT} };
+static const struct ctx_item ci_device_off[] = { {"Connect", A_CONNECT} };
 static const struct ctx_item ci_bg[]      = { {"Refresh", A_REFRESH},
                                               {"Go Up", A_UP}, {"Home", A_HOME} };
 
@@ -373,7 +395,11 @@ static const struct ctx_item *ctx_items(int *n)
 	case CTX_FILE:   *n = 2; return ci_file;
 	case CTX_DIR:    *n = 1; return ci_dir;
 	case CTX_PLACE:  *n = 1; return ci_place;
-	case CTX_DEVICE: *n = 2; return ci_device;
+	case CTX_DEVICE:
+		if (ctx.target >= 0 && ctx.target < nvols && !vols[ctx.target].mounted) {
+			*n = 1; return ci_device_off;
+		}
+		*n = 2; return ci_device;
 	default:         *n = 3; return ci_bg;
 	}
 }
@@ -426,13 +452,18 @@ static void ctx_run(int act, int id)
 		}
 		break;
 	case A_EDIT:   open_with(ctx.name, "editor"); break;
+	case A_CONNECT:
+		if (ctx.target >= 0 && ctx.target < nvols) {
+			mount(vols[ctx.target].kind); set_title(id);
+		}
+		break;
 	case A_EJECT:
 		if (eject(vols[ctx.target].path) == 0 &&
 		    under_path(path, vols[ctx.target].path)) {
 			goto_path("/"); set_title(id);
 		}
 		break;
-	case A_REFRESH: cached_seq = -1; break;
+	case A_REFRESH: force_relist = 1; break;
 	case A_UP:      go_up(); scroll = 0; sel = -1; set_title(id); break;
 	case A_HOME:    goto_path("/"); set_title(id); break;
 	}
@@ -525,7 +556,7 @@ static void menu_action(int item, int id)
 	switch (item) {
 	case 0: go_up(); scroll = 0; sel = -1; set_title(id); seq++; break;  /* Up      */
 	case 1: goto_path("/"); set_title(id); seq++;                break;  /* Home    */
-	case 2: cached_seq = -1; seq++;                              break;  /* Refresh */
+	case 2: force_relist = 1; seq++;                            break;  /* Refresh */
 	case 3: activate(id);                                        break;  /* Open    */
 	}
 }
@@ -547,11 +578,14 @@ static void click(int id, int mx, int my)
 		if (my < LIST_TOP) return;
 		int i = (my - LIST_TOP) / ROW_H;
 		if (i >= 0 && i < NPLACES) { goto_path(places[i].path); set_title(id); seq++; return; }
-		/* Devices region: navigate to the volume, or eject if its button was hit. */
+		/* Devices region: an unmounted device connects (mounts) on any click; a
+		 * mounted one navigates, or ejects if its right-edge button was hit. */
 		for (int v = 0; v < nvols; v++) {
 			int ry = dev_row_y(v);
 			if (my < ry || my >= ry + ROW_H) continue;
-			if (mx >= sbw - EJECT_W) {        /* eject button */
+			if (!vols[v].mounted) {           /* connect (mount) the device */
+				mount(vols[v].kind); set_title(id); seq++;
+			} else if (mx >= sbw - EJECT_W) { /* eject button */
 				if (eject(vols[v].path) == 0) {
 					if (under_path(path, vols[v].path)) goto_path("/");
 					set_title(id); seq++;
@@ -573,30 +607,27 @@ static void click(int id, int mx, int my)
 	}
 	int e = list_hit(mx, my);
 	if (e < 0) return;
-	struct fent *fe = &fent_buf[e];
-	if (fe->is_dir) {                     /* a dir still opens on a single click */
-		if (feq(fe->name, "..")) go_up();
-		else enter(fe->name);
-		scroll = 0; sel = -1;
-		set_title(id);
-	} else {
-		sel = e;                          /* single click selects/highlights */
-	}
+	sel = e;                              /* single click selects/highlights */
 	seq++;
 }
 
 /* Double-click (delivered by the WM after the WEV_MOUSE that selected the row):
- * open the file in the editor. Directories already navigate on a single click. */
-static void dblclick(int mx, int my)
+ * activate the entry — descend into a directory or open a file in its program. */
+static void dblclick(int id, int mx, int my)
 {
 	refresh();
 	int e = list_hit(mx, my);
 	if (e < 0) return;
 	struct fent *fe = &fent_buf[e];
-	if (!fe->is_dir) {
+	if (fe->is_dir) {
+		if (feq(fe->name, "..")) go_up();
+		else enter(fe->name);
+		scroll = 0; sel = -1;
+		set_title(id);
+	} else {
 		open_file(fe->name);
-		seq++;
 	}
+	seq++;
 }
 
 /* Keyboard navigation: arrow up/down move the highlighted entry (directories
@@ -646,7 +677,7 @@ int main(void)
 			if (ev.type == WEV_CLOSE) { win_close(id); return 0; }
 			else if (ev.type == WEV_MOUSE) click(id, ev.a, ev.b);
 			else if (ev.type == WEV_RCLICK) rclick(id, ev.a, ev.b);
-			else if (ev.type == WEV_DBLCLICK) dblclick(ev.a, ev.b);
+			else if (ev.type == WEV_DBLCLICK) dblclick(id, ev.a, ev.b);
 			else if (ev.type == WEV_KEY) key(id, ev.a);
 			else if (ev.type == WEV_RESIZE) {
 				W = ev.a; H = ev.b;

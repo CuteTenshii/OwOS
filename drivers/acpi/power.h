@@ -5,6 +5,18 @@
 void power_off(void);     /* ACPI/QEMU shutdown; returns only if it fails  */
 void power_reset(void);   /* reboot via the 8042 controller, then 3-fault  */
 
+/* ACPI S3 suspend-to-RAM: save CPU state, point the firmware at a wake
+ * trampoline, and write the S3 sleep type to PM1_CNT. Returns after the machine
+ * resumes, or immediately if the firmware doesn't advertise S3. Restores the
+ * CPU only — on real hardware devices lose power across S3 and aren't re-inited
+ * yet (fine under QEMU, where S3 is a pause that keeps device state). */
+void power_sleep(void);
+
+/* 1 if ACPI S3 is available (FADT + DSDT _S3 + FACS all present). Read-only;
+ * use it to gate UI that offers Sleep so an unsupported host (e.g. VMware,
+ * which doesn't expose S3 to the guest) doesn't show a dead button. */
+int power_can_sleep(void);
+
 /* Scan the ACPI device AML (DSDT + every SSDT) for a byte sequence such as an
  * EISA _HID. Returns 1 if found, 0 if absent or ACPI is unreachable. Used by
  * battery.c to detect an ACPI battery device wherever the firmware declared it. */

@@ -294,7 +294,7 @@ static void draw_alt_box(struct inl_img *im, int py, int phh)
 	int y0 = py + (im->start_row - B->scroll) * GLYPH_H;
 	if (y0 < py || y0 + GLYPH_H > py + phh) return;        /* keep it in-pane    */
 	const char *t = im->alt[0] ? im->alt : "[image]";
-	int w = (slen(t) + 2) * GLYPH_W;
+	int w = (strlen(t) + 2) * GLYPH_W;
 	gfx_fill_rect(4, y0, w, GLYPH_H, 0xe6e9ef);
 	gfx_rect(4, y0, w, GLYPH_H, 0xb4bac4);
 	gfx_text(8, y0, t, 0x7a828c, GFX_TRANSPARENT);
@@ -330,24 +330,10 @@ static void render(void)
 		labels[i] = tabs[i].label[0] ? tabs[i].label : "New Tab";
 	tabbar_draw(0, MENU_H, BW, labels, n_tabs, active_tab);
 
-	/* address bar (below the tab strip) */
+	/* address bar (below the tab strip): a shared text-field widget */
 	gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
 	int fx = 6, fy = MENU_H + TAB_H + 4, fw = BW - 12, fh = ADDR_H - 8;
-	gfx_fill_rect(fx, fy, fw, fh, 0xffffff);
-	gfx_rect(fx, fy, fw, fh, 0x000000);
-	/* Show the tail of the URL that fits the field (proportional), with a caret. */
-	int avail = fw - 8 - gfx_ui_cw('_');
-	int al = B->addr_len, off = 0, ww = 0;
-	for (int i = al - 1; i >= 0; i--) {
-		ww += gfx_ui_cw((unsigned char)B->addr[i]);
-		if (ww > avail) { off = i + 1; break; }
-	}
-	char shown[300];
-	int sc = 0;
-	for (int i = off; i < al && sc < (int)sizeof shown - 2; i++) shown[sc++] = B->addr[i];
-	shown[sc++] = '_';
-	shown[sc] = '\0';
-	gfx_ui_text(fx + 4, fy + (fh - UIFONT_H) / 2, shown, 0x101418);
+	textfield_draw(&B->addr_tf, fx, fy, fw, fh, 1);
 
 	/* content pane */
 	int py = MENU_H + TAB_H + ADDR_H, pw = BW - SCROLL_W;
@@ -403,7 +389,7 @@ static void render(void)
 	gfx_fill_rect(0, sy, BW, STATUS_H, 0x222831);
 	/* Keep the visible tail of the status within the bar (proportional). */
 	int savail = BW - 12;
-	int sl = slen(B->status), so = 0, sw = 0;
+	int sl = strlen(B->status), so = 0, sw = 0;
 	for (int i = sl - 1; i >= 0; i--) {
 		sw += gfx_ui_cw((unsigned char)B->status[i]);
 		if (sw > savail) { so = i + 1; break; }
@@ -446,16 +432,16 @@ static void scroll_to_y(int my, int py, int phh, int rows)
 
 static void navigate(const char *url)
 {
+	textfield_set(&B->addr_tf, url);          /* writes into B->addr (its buffer) */
 	int i = 0;
-	for (; url[i] && i < URL_MAX - 1; i++) { B->addr[i] = url[i]; B->req_url[i] = url[i]; }
-	B->addr[i] = '\0'; B->req_url[i] = '\0';
-	B->addr_len = i;
+	for (; url[i] && i < URL_MAX - 1; i++) B->req_url[i] = url[i];
+	B->req_url[i] = '\0';
 	B->req_pending = 1; B->seq++;
 }
 
 static void submit(void)
 {
-	if (B->addr_len == 0) return;
+	if (B->addr_tf.len == 0) return;
 	int i = 0;
 	for (; B->addr[i] && i < URL_MAX - 1; i++) B->req_url[i] = B->addr[i];
 	B->req_url[i] = '\0';
@@ -465,7 +451,7 @@ static void submit(void)
 /* Reset B to an empty page (a fresh/blank tab) without touching the net. */
 static void show_blank(void)
 {
-	B->addr[0] = '\0'; B->addr_len = 0;
+	textfield_set(&B->addr_tf, "");
 	B->cur_url[0] = '\0'; B->doc_title[0] = '\0';
 	B->mode = MODE_HTML;
 	B->text_len = 0; B->nlines = 0; B->n_imgs = 0; B->nlinks = 0;
@@ -601,6 +587,12 @@ static void handle_click(int mx, int my)
 		B->seq++;
 		return;
 	}
+	if (my >= MENU_H + TAB_H && my < MENU_H + TAB_H + ADDR_H) {   /* address bar */
+		textfield_click(&B->addr_tf, mx, my,
+		                6, MENU_H + TAB_H + 4, BW - 12, ADDR_H - 8);
+		B->seq++;
+		return;
+	}
 	int py, phh, rows;
 	pane_metrics(&py, &phh, &rows);
 	if (mx >= BW - SCROLL_W && my >= py && my < py + phh) {  /* scrollbar */
@@ -631,11 +623,11 @@ static void handle_key(char c)
 	if (sc >= 0) { menubar_close(&menubar); menu_action(leaf, sc); return; }
 	if ((unsigned char)c == 27) { menubar_close(&menubar); B->seq++; return; }
 
+	/* The address-bar widget handles editing (printable/Backspace/Delete/caret). */
+	if (textfield_key(&B->addr_tf, c)) { B->seq++; return; }
+
 	switch ((unsigned char)c) {
 	case '\n': case '\r': submit(); return;
-	case '\b':
-		if (B->addr_len > 0) { B->addr_len--; B->addr[B->addr_len] = '\0'; }
-		B->seq++; return;
 	case KEY_UP:
 		B->scroll -= 3; if (B->scroll < 0) B->scroll = 0; B->seq++; return;
 	case KEY_DOWN:
@@ -643,13 +635,6 @@ static void handle_key(char c)
 		if (B->scroll > B->nlines - 1) B->scroll = B->nlines - 1;
 		if (B->scroll < 0) B->scroll = 0;
 		B->seq++; return;
-	default:
-		if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7f && B->addr_len < URL_MAX - 1) {
-			B->addr[B->addr_len++] = c;
-			B->addr[B->addr_len] = '\0';
-			B->seq++;
-		}
-		return;
 	}
 }
 
@@ -673,9 +658,8 @@ int main(void)
 	B->win_id = id;
 	gfx_init(win_fb(), BW, BH);
 
-	const char *start = "example.com";
-	for (int i = 0; start[i]; i++) B->addr[B->addr_len++] = start[i];
-	B->addr[B->addr_len] = '\0';
+	textfield_init(&B->addr_tf, B->addr, URL_MAX);
+	textfield_set(&B->addr_tf, "example.com");
 	set_status("Ready. Type a URL and press Enter.");
 	B->wrap_seq = 0xFFFFFFFF;
 
@@ -695,6 +679,11 @@ int main(void)
 				handle_key((char)ev.a);
 			} else if (ev.type == WEV_MOUSE) {
 				handle_click(ev.a, ev.b);
+			} else if (ev.type == WEV_SCROLL) {
+				B->scroll -= ev.a * 3;       /* wheel up scrolls back */
+				if (B->scroll > B->nlines - 1) B->scroll = B->nlines - 1;
+				if (B->scroll < 0) B->scroll = 0;
+				B->seq++;
 			} else if (ev.type == WEV_RESIZE) {
 				BW = ev.a; BH = ev.b;
 				gfx_init(win_fb(), BW, BH);

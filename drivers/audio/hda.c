@@ -12,9 +12,10 @@
  *   4. walk the codec's widget graph to find an output DAC -> pin path.
  *   5. configure that path (power, format, stream tag, unmute amps, EAPD).
  *
- * Playback (hda_play_wav, runs from the shell with interrupts on):
- *   resample the WAV to 48 kHz 16-bit stereo, stream it through one output
- *   stream descriptor over a cyclic 2-half DMA buffer, and pace the refills by
+ * Playback (hda_stream_*, fed from ring 3 with interrupts on):
+ *   ring 3 (/bin/play) parses the WAV and resamples it to 48 kHz 16-bit stereo,
+ *   then pushes ready frames here; this driver streams them through one output
+ *   stream descriptor over a cyclic 2-half DMA buffer, pacing the producer by
  *   *polling* the link position register (SDnLPIB) — no IRQ wiring, which keeps
  *   us off the PCI interrupt-sharing minefield on real hardware.
  *
@@ -96,10 +97,20 @@ static int      mix_is_sel;        /* path_mix is a selector (not a mixer)   */
 static int      pin_is_hp;         /* output pin is a headphone jack         */
 static uint32_t sd_off;            /* output stream descriptor offset        */
 
+/* Master volume: applied to one output-amp widget in the path (pin preferred,
+ * else DAC, else mixer) so attenuation isn't multiplied across stages. */
+static uint16_t vol_nid;           /* widget carrying the volume amp (0 = none) */
+static uint32_t vol_steps;         /* its loudest gain value                  */
+static int      hda_vol = HDA_VOL_MAX;
+static int      hda_muted;
+
 /* CORB/RIRB rings + the audio DMA buffer, all in one identity-mapped run. */
 #define CORB_N   256
 #define RIRB_N   256
-#define AUDIO_BYTES 0x8000u        /* 32 KiB cyclic buffer                   */
+#define AUDIO_BYTES 0x30000u       /* 192 KiB cyclic buffer (~1 s at 48k/S16/2ch):
+                                    * deep enough that a transient producer stall
+                                    * (a slow file read) can't let the play head
+                                    * lap the writer and replay stale samples.   */
 #define HALF        (AUDIO_BYTES / 2)
 static volatile uint32_t *corb;    /* CORB_N dwords                          */
 static volatile uint32_t *rirb;    /* RIRB_N * 2 dwords (resp, resp_ex)      */
@@ -126,16 +137,28 @@ static uint32_t codec_cmd(uint16_t nid, uint32_t payload)
 {
 	uint32_t cmd = ((uint32_t)codec << 28) | ((uint32_t)nid << 20) | (payload & 0xFFFFF);
 
+	/* Atomic against the keyboard IRQ, which can call in via hda_volume_*: the
+	 * ring-pointer update + poll must not interleave with another command. Mask
+	 * interrupts for the (microsecond) duration and restore the prior IF. */
+	uint32_t flags;
+	__asm__ volatile ("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+
 	corb_wp = (uint16_t)((corb_wp + 1) & 0xFF);
 	corb[corb_wp] = cmd;
 	wr16(R_CORBWP, corb_wp);
 
+	uint32_t resp = 0;
 	for (int t = 0; t < 100000; t++) {
-		if ((rd16(R_RIRBWP) & 0xFF) == corb_wp)
-			return rirb[corb_wp * 2];     /* response = first dword of entry  */
+		if ((rd16(R_RIRBWP) & 0xFF) == corb_wp) {
+			resp = rirb[corb_wp * 2];     /* response = first dword of entry  */
+			break;
+		}
 		spin(20);
 	}
-	return 0;
+
+	if (flags & 0x200)
+		__asm__ volatile ("sti");
+	return resp;
 }
 
 static uint32_t get_param(uint16_t nid, uint8_t p)
@@ -158,15 +181,18 @@ static uint16_t conn_entry(uint16_t nid, int longform, int i)
 
 static int widget_type(uint16_t nid) { return (int)((get_param(nid, P_AWCAP) >> 20) & 0xF); }
 
-/* Set a widget's output amp to its loudest unmuted setting (no-op if it has no
- * output amp — the SET is simply ignored). bit15 set-output, 13/12 left/right,
- * bit7 mute (clear), 6-0 gain. */
-static void amp_out_max(uint16_t nid)
+/* Output-amp num-steps (loudest gain value) a widget supports; 0 = no amp. */
+static uint32_t out_steps(uint16_t nid) { return (get_param(nid, P_OUTAMPCAP) >> 8) & 0x7F; }
+
+/* Set a widget's output amp, both channels, to `gain` steps and mute state.
+ * bit15 set-output, 13/12 left/right, bit7 mute, 6-0 gain. No-op on a widget
+ * with no output amp (the SET is simply ignored). */
+static void set_out_amp(uint16_t nid, uint32_t gain, int mute)
 {
-	uint32_t cap  = get_param(nid, P_OUTAMPCAP);
-	uint32_t gain = (cap >> 8) & 0x7F;     /* num-steps = loudest             */
-	codec_cmd(nid, V_SET_AMP | 0xB000 | gain);
+	codec_cmd(nid, V_SET_AMP | 0xB000 | (mute ? 0x80 : 0) | (gain & 0x7F));
 }
+
+static void amp_out_max(uint16_t nid) { set_out_amp(nid, out_steps(nid), 0); }
 
 /* Unmute a widget's input amp at the given connection index (mixer/selector). */
 static void amp_in_unmute(uint16_t nid, int idx)
@@ -267,7 +293,22 @@ static int enumerate_codec(void)
 
 	/* Re-resolve the chosen pin's path so the path_* globals match it. */
 	pin_nid = best_pin; pin_is_hp = best_hp;
-	return find_dac_path(pin_nid);
+	if (!find_dac_path(pin_nid))
+		return 0;
+
+	/* Pick the single widget the volume keys drive (pin > DAC > mixer), so
+	 * attenuation isn't multiplied across stages and volume works from the
+	 * first keypress — not only after the first play. */
+	vol_nid = 0; vol_steps = 0;
+	uint16_t cand[3]; int nc = 0;
+	cand[nc++] = pin_nid;
+	cand[nc++] = dac_nid;
+	if (path_mix) cand[nc++] = path_mix;
+	for (int i = 0; i < nc; i++) {
+		uint32_t st = out_steps(cand[i]);
+		if (st) { vol_nid = cand[i]; vol_steps = st; break; }
+	}
+	return 1;
 }
 
 /* ---- bring-up ---------------------------------------------------------- */
@@ -297,8 +338,8 @@ static int ring_setup(void)
 	 * kernel directory before touching it. Left write-back cached: x86 keeps
 	 * bus-master DMA coherent with the cache, so the controller sees our writes
 	 * and we get fast buffer fills. */
-	uint32_t base = pmm_alloc_contig(0x10000);
-	if (!base || paging_identity_map(base, 0x10000) != 0)
+	uint32_t base = pmm_alloc_contig(0x40000);
+	if (!base || paging_identity_map(base, 0x40000) != 0)
 		return 0;
 	corb  = (volatile uint32_t *)(base + 0x0000);   corb_phys = base + 0x0000;
 	rirb  = (volatile uint32_t *)(base + 0x0400);   rirb_phys = base + 0x0400;
@@ -398,6 +439,37 @@ int hda_present(void) { return present; }
 #define FMT_48K_S16_STEREO  0x0011   /* base48k, x1, 16-bit, 2ch              */
 #define STREAM_TAG          1
 
+/* Push hda_vol/hda_muted onto the volume widget's output amp. Scales the 0..MAX
+ * level onto 0..num-steps; mute drops the gain to 0 and sets the mute bit. */
+static void hda_apply_volume(void)
+{
+	if (!present || !vol_nid || !vol_steps)
+		return;
+	uint32_t gain = hda_muted ? 0 : ((uint32_t)hda_vol * vol_steps / HDA_VOL_MAX);
+	set_out_amp(vol_nid, gain, hda_muted);
+}
+
+void hda_volume_step(int dir)
+{
+	int nv = hda_vol + dir;
+	if (nv < 0)           nv = 0;
+	if (nv > HDA_VOL_MAX) nv = HDA_VOL_MAX;
+	hda_vol = nv;
+	hda_muted = 0;                 /* nudging the level always unmutes         */
+	hda_apply_volume();
+}
+
+void hda_volume_mute(void)
+{
+	hda_muted = !hda_muted;
+	hda_apply_volume();
+}
+
+int hda_volume(void)
+{
+	return hda_muted ? 0 : hda_vol;
+}
+
 static void configure_path(void)
 {
 	/* DAC: power up, set format, bind to the stream, max output amp. */
@@ -419,167 +491,169 @@ static void configure_path(void)
 	codec_cmd(pin_nid, V_SET_PINCTL | (pin_is_hp ? 0xC0 : 0x40));
 	codec_cmd(pin_nid, V_SET_EAPD   | 0x02);
 	amp_out_max(pin_nid);
+
+	/* Override the volume widget's amp with the current level (the keys may have
+	 * moved it before this play). */
+	hda_apply_volume();
 }
 
-/* ---- WAV parse + 48 kHz/S16/stereo resampler --------------------------- */
-static uint32_t rd_le32(const uint8_t *p)
-{ return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
-static uint16_t rd_le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static int tag_eq(const uint8_t *p, const char *s)
-{ return p[0]==s[0] && p[1]==s[1] && p[2]==s[2] && p[3]==s[3]; }
+/* ---- streaming PCM sink (48 kHz / S16 / stereo, fed from ring 3) --------
+ *
+ * The WAV parse + resample now live in ring 3 (/bin/play): it streams the file
+ * in small chunks, resamples to this canonical format, and pushes ready frames
+ * here over the SYS_AUDIO_* syscalls. This driver is just the DMA back end —
+ * a cyclic buffer the producer fills behind the play head. Pushing tiny bounded
+ * chunks (rather than running the whole multi-minute playback inside one kernel
+ * call) is what keeps the machine responsive while playing off slow/flaky media.
+ *
+ * One stream at a time. The producer writes into the region the DMA has already
+ * played, tracked by the link-position register (SDnLPIB); hda_stream_write
+ * back-pressures (timer_sleep) until the DMA frees space, so it self-paces to
+ * the 48 kHz output rate without an IRQ. */
+#define STREAM_GUARD 256u           /* bytes kept clear ahead of the play head  */
 
-/* Resampler / input-stream state (one playback at a time). */
-static const char *r_fn;
-static uint32_t r_data_off, r_data_len, r_filepos;
-static uint16_t r_bits, r_channels;
-static uint32_t r_frame, r_step;          /* r_step: 16.16 in-frames/out-frame */
-static uint64_t r_outcount, r_inconsumed;
-static int16_t  r_curL, r_curR;
-static int      r_eof;
-static uint8_t  r_inbuf[8192];
-static uint32_t r_inlen, r_inpos;
+static int      s_active;           /* a stream is open                         */
+static int      s_started;          /* RUN asserted (buffer pre-rolled)         */
+static uint32_t s_wpos;             /* next write offset into audio[] (bytes)   */
 
-/* Decode and consume the next input frame into r_curL/r_curR; sets r_eof and
- * yields silence once the data chunk is exhausted. */
-static void decode_next(void)
+/* Reset + program the output stream descriptor for the cyclic 2-half buffer. */
+static void stream_program_sd(void)
 {
-	if (r_eof) { r_curL = r_curR = 0; return; }
-
-	if (r_inpos + r_frame > r_inlen) {            /* refill the input buffer  */
-		if (r_filepos >= r_data_len) { r_eof = 1; r_curL = r_curR = 0; return; }
-		uint32_t want = r_data_len - r_filepos;
-		if (want > sizeof(r_inbuf)) want = sizeof(r_inbuf);
-		want -= want % r_frame;
-		if (want == 0) want = r_frame;
-		int got = fs_read_at(r_fn, r_data_off + r_filepos, r_inbuf, want);
-		if (got <= 0 || (uint32_t)got < r_frame) { r_eof = 1; r_curL = r_curR = 0; return; }
-		r_inlen = (uint32_t)got; r_inpos = 0; r_filepos += (uint32_t)got;
-	}
-
-	const uint8_t *s = r_inbuf + r_inpos;
-	r_inpos += r_frame;
-	if (r_bits == 8) {
-		int l = ((int)s[0] - 128) << 8;
-		r_curL = (int16_t)l;
-		r_curR = (int16_t)((r_channels == 2) ? (((int)s[1] - 128) << 8) : l);
-	} else {
-		r_curL = (int16_t)rd_le16(s);
-		r_curR = (r_channels == 2) ? (int16_t)rd_le16(s + 2) : r_curL;
-	}
-	r_inconsumed++;
-}
-
-/* Fill one HALF of the cyclic buffer with resampled 48 kHz S16 stereo frames.
- * Returns the number of frames that carried real audio (0 once fully drained). */
-static uint32_t fill_half(int half)
-{
-	int16_t *dst = (int16_t *)(audio + (uint32_t)half * HALF);
-	uint32_t frames = HALF / 4;
-	uint32_t real = 0;
-	for (uint32_t i = 0; i < frames; i++) {
-		uint64_t target = (r_outcount * r_step) >> 16;
-		while (r_inconsumed <= target && !r_eof)
-			decode_next();
-		dst[i * 2 + 0] = r_curL;
-		dst[i * 2 + 1] = r_curR;
-		if (!r_eof) real++;
-		r_outcount++;
-	}
-	return real;
-}
-
-int hda_play_wav(const char *fn)
-{
-	if (!present) {
-		con_write("play: no HD Audio output (start QEMU with -device intel-hda -device hda-output)\n");
-		return -1;
-	}
-
-	int fsize = fs_size(fn);
-	if (fsize < 0) { con_write("play: no such file: "); con_write(fn); con_putc('\n'); return -1; }
-
-	uint8_t hdr[256];
-	int got = fs_read_at(fn, 0, hdr, sizeof(hdr));
-	if (got < 44 || !tag_eq(hdr, "RIFF") || !tag_eq(hdr + 8, "WAVE")) {
-		con_write("play: not a WAV file\n");
-		return -1;
-	}
-
-	uint16_t fmt = 0, channels = 0, bits = 0;
-	uint32_t rate = 0, data_off = 0, data_len = 0;
-	for (uint32_t pos = 12; pos + 8 <= (uint32_t)got; ) {
-		const uint8_t *c = hdr + pos;
-		uint32_t sz = rd_le32(c + 4);
-		if (tag_eq(c, "fmt ")) {
-			fmt = rd_le16(c + 8); channels = rd_le16(c + 10);
-			rate = rd_le32(c + 12); bits = rd_le16(c + 22);
-		} else if (tag_eq(c, "data")) {
-			data_off = pos + 8; data_len = sz; break;
-		}
-		pos += 8 + sz + (sz & 1);
-	}
-	if (!data_off || fmt != 1 || (bits != 8 && bits != 16) || channels < 1 || channels > 2) {
-		con_write("play: unsupported WAV (need PCM 8/16-bit mono/stereo)\n");
-		return -1;
-	}
-	if (data_off + data_len > (uint32_t)fsize)
-		data_len = (uint32_t)fsize - data_off;
-	if (rate < 4000)   rate = 4000;
-	if (rate > 192000) rate = 192000;
-
-	/* Init the resampler/stream state. */
-	r_fn = fn; r_data_off = data_off; r_data_len = data_len; r_filepos = 0;
-	r_bits = bits; r_channels = channels; r_frame = (uint32_t)channels * (bits / 8);
-	r_step = (uint32_t)(((uint64_t)rate << 16) / 48000u);
-	r_outcount = r_inconsumed = 0; r_curL = r_curR = 0; r_eof = 0;
-	r_inlen = r_inpos = 0;
-
-	configure_path();
-
-	/* Program the output stream descriptor: reset, point at the BDL + buffer. */
 	wr8(sd_off + SD_CTL, 0);                                   /* stop          */
 	wr8(sd_off + SD_CTL, 0x01);                                /* SRST          */
 	for (int t = 0; t < 1000; t++) { if (rd8(sd_off + SD_CTL) & 1) break; spin(50); }
 	wr8(sd_off + SD_CTL, 0x00);
 	for (int t = 0; t < 1000; t++) { if (!(rd8(sd_off + SD_CTL) & 1)) break; spin(50); }
 
-	/* Two BDL entries, one per half of the cyclic buffer. */
-	bdl[0] = (uint32_t)audio;             bdl[1] = 0; bdl[2] = HALF; bdl[3] = 0;
-	bdl[4] = (uint32_t)audio + HALF;      bdl[5] = 0; bdl[6] = HALF; bdl[7] = 0;
+	bdl[0] = (uint32_t)audio;        bdl[1] = 0; bdl[2] = HALF; bdl[3] = 0;
+	bdl[4] = (uint32_t)audio + HALF; bdl[5] = 0; bdl[6] = HALF; bdl[7] = 0;
 	wr32(sd_off + SD_BDPL, bdl_phys); wr32(sd_off + SD_BDPU, 0);
 	wr32(sd_off + SD_CBL, AUDIO_BYTES);
 	wr16(sd_off + SD_LVI, 1);
 	wr16(sd_off + SD_FMT, FMT_48K_S16_STEREO);
 	wr8(sd_off + SD_CTL + 2, (uint8_t)(STREAM_TAG << 4));      /* stream number */
+}
 
-	keyboard_take_interrupt();            /* drop any stale Ctrl+C             */
-	fill_half(0);
-	fill_half(1);
+/* Open the stream: configure the codec path and the stream descriptor, clear
+ * the buffer to silence, and arm the producer. Returns 0, or -1 if no codec. */
+int hda_stream_open(void)
+{
+	if (!present)
+		return -1;
+	configure_path();
+	stream_program_sd();
+	for (uint32_t i = 0; i < AUDIO_BYTES; i++)
+		audio[i] = 0;
+	s_active = 1;
+	s_started = 0;
+	s_wpos = 0;
+	keyboard_take_interrupt();            /* drop any stale Ctrl+C              */
+	return 0;
+}
 
-	wr8(sd_off + SD_CTL, (uint8_t)(rd8(sd_off + SD_CTL) | 0x02));   /* RUN      */
+/* Push `bytes` of 48 kHz/S16/stereo PCM, blocking until it is queued. Returns
+ * the count consumed (== bytes), -1 if no stream is open, or -2 if Ctrl+C was
+ * pressed (so /bin/play stops). Frame-aligned (4-byte) writes are assumed. */
+int hda_stream_write(const void *pcm, uint32_t bytes)
+{
+	if (!s_active)
+		return -1;
+	const uint8_t *p = pcm;
+	uint32_t off = 0;
+	while (off < bytes) {
+		if (keyboard_take_interrupt())
+			return -2;
 
-	int interrupted = 0, last_half = 0, drain = 0, stalls = 0;
-	uint32_t lastpos = 0;
-	for (;;) {
-		if (keyboard_take_interrupt()) { interrupted = 1; break; }
-
-		uint32_t pos = rd32(sd_off + SD_LPIB);
-		int cur_half = (pos >= HALF) ? 1 : 0;
-
-		if (cur_half != last_half) {                  /* a half just finished */
-			uint32_t real = fill_half(last_half);
-			last_half = cur_half;
-			if (real == 0) { if (++drain >= 2) break; }
-			else drain = 0;
+		if (!s_started) {
+			/* Pre-roll: fill the buffer linearly; start RUN once it is full. A
+			 * clip shorter than the buffer simply never starts here — close()
+			 * pads it and plays it out. */
+			uint32_t space = AUDIO_BYTES - s_wpos;
+			uint32_t n = bytes - off;
+			if (n > space)
+				n = space;
+			for (uint32_t i = 0; i < n; i++)
+				audio[s_wpos + i] = p[off + i];
+			s_wpos += n;
+			off += n;
+			if (s_wpos >= AUDIO_BYTES) {
+				wr8(sd_off + SD_CTL, (uint8_t)(rd8(sd_off + SD_CTL) | 0x02));
+				s_started = 1;
+				s_wpos = 0;
+			}
+			continue;
 		}
 
-		if (pos == lastpos) { if (++stalls > 500) break; }   /* DMA wedged    */
-		else stalls = 0;
-		lastpos = pos;
+		/* Steady state: write into the bytes the play head has already passed. */
+		uint32_t rpos = rd32(sd_off + SD_LPIB);
+		uint32_t freebytes = (rpos + AUDIO_BYTES - s_wpos) % AUDIO_BYTES;
+		if (freebytes <= STREAM_GUARD) {      /* DMA hasn't freed room yet       */
+			timer_sleep(2);
+			continue;
+		}
+		uint32_t can = (freebytes - STREAM_GUARD) & ~3u;   /* frame-aligned      */
+		if (can == 0) {
+			timer_sleep(2);
+			continue;
+		}
+		uint32_t to_end = AUDIO_BYTES - s_wpos;
+		uint32_t n = bytes - off;
+		if (n > can)    n = can;
+		if (n > to_end) n = to_end;
+		for (uint32_t i = 0; i < n; i++)
+			audio[s_wpos + i] = p[off + i];
+		s_wpos += n;
+		if (s_wpos >= AUDIO_BYTES)
+			s_wpos -= AUDIO_BYTES;
+		off += n;
+	}
+	return (int)off;
+}
 
-		timer_sleep(2);
+/* Drain whatever is still queued, then stop the stream. */
+void hda_stream_close(void)
+{
+	if (!s_active)
+		return;
+
+	if (!s_started) {
+		/* Clip shorter than the buffer: pad the tail with silence, play it once. */
+		uint32_t real = s_wpos;
+		for (uint32_t i = s_wpos; i < AUDIO_BYTES; i++)
+			audio[i] = 0;
+		wr8(sd_off + SD_CTL, (uint8_t)(rd8(sd_off + SD_CTL) | 0x02));
+		s_started = 1;
+		timer_sleep(real / 192 + 30);     /* ~192 bytes/ms at 48 kHz/4B + tail   */
+	} else {
+		/* Push a full buffer of silence behind the play head (back-pressured),
+		 * which proves the DMA has consumed every real sample, then let the
+		 * silence flush. */
+		uint32_t silence = AUDIO_BYTES;
+		int guard = 0;
+		while (silence > 0 && guard < 4000) {
+			if (keyboard_take_interrupt())
+				break;
+			uint32_t rpos = rd32(sd_off + SD_LPIB);
+			uint32_t freebytes = (rpos + AUDIO_BYTES - s_wpos) % AUDIO_BYTES;
+			if (freebytes <= STREAM_GUARD) { timer_sleep(2); guard++; continue; }
+			uint32_t can = (freebytes - STREAM_GUARD) & ~3u;
+			if (can == 0) { timer_sleep(2); guard++; continue; }
+			uint32_t to_end = AUDIO_BYTES - s_wpos;
+			uint32_t n = silence;
+			if (n > can)    n = can;
+			if (n > to_end) n = to_end;
+			for (uint32_t i = 0; i < n; i++)
+				audio[s_wpos + i] = 0;
+			s_wpos += n;
+			if (s_wpos >= AUDIO_BYTES)
+				s_wpos -= AUDIO_BYTES;
+			silence -= n;
+		}
+		timer_sleep(180);                  /* let the last queued audio play out */
 	}
 
-	wr8(sd_off + SD_CTL, 0);               /* stop the stream                  */
-	return interrupted ? 1 : 0;
+	wr8(sd_off + SD_CTL, 0);               /* stop the stream                   */
+	s_active = 0;
+	s_started = 0;
 }
+

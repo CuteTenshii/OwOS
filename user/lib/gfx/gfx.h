@@ -110,6 +110,43 @@ int  menubar_shortcut(const struct menubar *mb, int key, struct menu **leaf);
 /* Close every dropdown on the bar and its submenus (after an accelerator/Esc). */
 void menubar_close(struct menubar *mb);
 
+/* --------------------------------------------------------------- text field */
+/*
+ * A single-line editable text field — an address bar, a rename box, any "type a
+ * string and press Enter" input — so apps don't re-roll caret/scroll/editing by
+ * hand. The app owns the character buffer (NUL-terminated); the widget tracks the
+ * caret and horizontal scroll, drawing the proportional UI font in a white field
+ * that scrolls to keep the caret in view.
+ *
+ * Bind once with textfield_init(&tf, buf, cap), set initial text with
+ * textfield_set, then each frame draw it and feed WEV_KEY chars to textfield_key.
+ * The current text is just tf.buf (NUL-terminated, tf.len chars).
+ */
+#define TEXTFIELD_H 26   /* a comfortable single-line field height */
+
+struct textfield {
+	char *buf;     /* app-owned buffer, NUL-terminated         */
+	int   cap;     /* buffer capacity in bytes (incl. the NUL) */
+	int   len;     /* current text length                      */
+	int   caret;   /* insertion point, 0..len                  */
+	int   scroll;  /* leftmost visible char index (maintained by textfield_draw) */
+};
+
+void textfield_init(struct textfield *tf, char *buf, int cap);
+void textfield_set(struct textfield *tf, const char *s);   /* replace text; caret to end */
+/* Draw the field box filling [x,y,w,h]; `focused` shows a caret and a bright
+ * border. Updates tf->scroll to keep the caret visible. */
+void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focused);
+/* Place the caret from a click and report focus: returns 1 if (mx,my) fell inside
+ * [x,y,w,h] (the app should treat the field as focused), 0 otherwise. Uses the
+ * scroll left by the last textfield_draw, so call draw first each frame. */
+int  textfield_click(struct textfield *tf, int mx, int my,
+                     int x, int y, int w, int h);
+/* Feed a WEV_KEY char. Handles printable insert, Backspace, Delete, and
+ * Left/Right/Home/End caret motion. Returns 1 if it consumed the key (repaint),
+ * 0 if not — e.g. Enter/Esc/arrows the field doesn't use, which the app handles. */
+int  textfield_key(struct textfield *tf, char c);
+
 /* --------------------------------------------------------------- tab strip */
 /*
  * A horizontal strip of tabs with per-tab close boxes and a trailing "+" button,

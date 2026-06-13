@@ -4,11 +4,33 @@
 
 #include <stdint.h>
 
+/* Socket protocol selector for net_sock_connect / the SYS_NET_CONNECT `proto`
+ * arg (kept wire-compatible with the old tls flag: 0=TCP, 1=TLS). Shared in
+ * value with user/lib/owos.h. */
+#define SK_TCP   0
+#define SK_TLS   1
+#define SK_UDP   2
+#define SK_ICMP  3   /* raw ICMP: the program builds/parses the ICMP message */
+
+/* DNS answer section, parsed (the IRQ-tied wire parse lives in net.c). The
+ * structs are shared in shape with user/lib/owos.h so the ring-3 dig program
+ * receives them straight from SYS_DNS_QUERY. */
+#define DNS_MAX_ANS 16
+#define DNS_TEXT    128
+struct dns_answer { unsigned type; unsigned ttl; char text[DNS_TEXT]; };
+struct dns_result { int count; unsigned rtt_us; struct dns_answer ans[DNS_MAX_ANS]; };
+
 void net_init(void);            /* bring up the NIC and announce the IP config */
 void net_dhcp_start(void);      /* spawn a DHCP client to lease IP/gw/dns (real links) */
 int  net_dhcp_now(void);        /* re-run DHCP synchronously (the `dhcp` command)       */
 int  net_ping(const char *host);/* resolve + ICMP-echo a host; returns 0 if any
                                  * reply arrived, -1 otherwise                 */
+int  net_resolve(const char *host, uint8_t ip[4]);  /* host -> IPv4; 1 = ok    */
+/* One ICMP echo (id,seq), wait ~1s. rtt_us >=0 / -1 timeout / -2 intr / -3 no NIC.
+ * Drives the ring-3 ping program via SYS_PING_ONCE. */
+int  net_ping_once(const uint8_t ip[4], uint16_t id, uint16_t seq, uint8_t from[4]);
+/* DNS query for the ring-3 dig program. count >=0 / -1 fail / -2 intr. */
+int  net_dig_query(const char *host, uint16_t qtype, struct dns_result *out);
 int  net_dig(const char *host); /* DNS A-record lookup; prints the answers     */
 int  net_ntp(const char *arg);  /* SNTP-sync the CMOS clock; arg: [host] [+/-tz] */
 int  net_curl(const char *arg); /* HTTP/1.0 GET of an http:// URL (-i: headers)*/

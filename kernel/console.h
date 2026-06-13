@@ -59,6 +59,7 @@ uint16_t con_pos_scroll_up(uint16_t pos, uint32_t rows);
  * sent to a file. con_capture_end stops capturing and returns the byte count. */
 void     con_capture_begin(char *buf, uint32_t cap);
 void     con_capture_begin_ansi(char *buf, uint32_t cap);  /* + colors as ANSI SGR */
+void     con_capture_begin_sink(void (*sink)(char));       /* stream bytes + ANSI SGR */
 uint32_t con_capture_end(void);
 
 /* Framebuffer-console hooks. The window manager flips the console into

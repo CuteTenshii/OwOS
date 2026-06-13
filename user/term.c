@@ -152,10 +152,6 @@ static void redraw(void)
 
 /* ---- tiny string helpers ---------------------------------------------------- */
 
-static int  slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
-static int  scmp(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return (unsigned char)*a - (unsigned char)*b; }
-static void scpy(char *d, const char *s) { while ((*d++ = *s++)) ; }
-static void scat(char *d, const char *s) { while (*d) d++; while ((*d++ = *s++)) ; }
 static int  has_prefix(const char *s, const char *p) { while (*p) { if (*s++ != *p++) return 0; } return 1; }
 
 /* ---- cwd + path resolution -------------------------------------------------- */
@@ -169,14 +165,14 @@ static void abspath(const char *name, char *out)
 {
 	char in[512];
 	if (name[0] == '~' && (name[1] == '\0' || name[1] == '/')) {
-		scpy(in, HOME); scat(in, name + 1);
+		strcpy(in, HOME); strcat(in, name + 1);
 	} else if (name[0] == '/') {
-		scpy(in, name);
+		strcpy(in, name);
 	} else {
-		scpy(in, cwd);
-		int l = slen(in);
+		strcpy(in, cwd);
+		int l = strlen(in);
 		if (l == 0 || in[l - 1] != '/') { in[l] = '/'; in[l + 1] = '\0'; }
-		scat(in, name);
+		strcat(in, name);
 	}
 	char seg[64][32];
 	int ns = 0, i = 0;
@@ -185,13 +181,13 @@ static void abspath(const char *name, char *out)
 		char s[32]; int j = 0;
 		while (in[i] && in[i] != '/' && j < 31) s[j++] = in[i++];
 		s[j] = '\0';
-		if (scmp(s, ".") == 0) continue;
-		if (scmp(s, "..") == 0) { if (ns > 0) ns--; continue; }
-		if (ns < 64) scpy(seg[ns++], s);
+		if (strcmp(s, ".") == 0) continue;
+		if (strcmp(s, "..") == 0) { if (ns > 0) ns--; continue; }
+		if (ns < 64) strcpy(seg[ns++], s);
 	}
-	if (ns == 0) { scpy(out, "/"); return; }
+	if (ns == 0) { strcpy(out, "/"); return; }
 	out[0] = '\0';
-	for (int k = 0; k < ns; k++) { scat(out, "/"); scat(out, seg[k]); }
+	for (int k = 0; k < ns; k++) { strcat(out, "/"); strcat(out, seg[k]); }
 }
 
 /* ---- builtins --------------------------------------------------------------- */
@@ -201,8 +197,8 @@ static char iobuf[64 * 1024];
 static void prompt(void)
 {
 	tputs_c("owos:", FG_PROMPT);
-	if (scmp(cwd, HOME) == 0) tputs_c("~", FG_PROMPT);
-	else if (has_prefix(cwd, HOME "/")) { tputs_c("~", FG_PROMPT); tputs_c(cwd + slen(HOME), FG_PROMPT); }
+	if (strcmp(cwd, HOME) == 0) tputs_c("~", FG_PROMPT);
+	else if (has_prefix(cwd, HOME "/")) { tputs_c("~", FG_PROMPT); tputs_c(cwd + strlen(HOME), FG_PROMPT); }
 	else tputs_c(cwd, FG_PROMPT);
 	tputs_c("$ ", FG_PROMPT);
 	ls_line = cl; ls_col = cc;
@@ -280,25 +276,52 @@ static void bi_stat(int argc, char **argv)
 	else { tputs("  "); tdec(st.size); tputs(" bytes\n"); }
 }
 
-/* Run a /bin program, or bridge to a kernel builtin. */
+/* Run a command. The kernel bridge handles builtins AND ring-3 CLI tools
+ * (neofetch, curl): it spawns the program, captures its output, and returns the
+ * text to render here — so a CLI program shows up inline in the terminal. It
+ * returns -1 for a GUI /bin app, which we then launch detached so it opens its
+ * own window. */
 static void run_other(const char *orig, int argc, char **argv)
 {
+	if (cmd_begin(orig) == 0) {                          /* builtin or CLI tool   */
+		/* Stream the output: render each chunk as it is produced and present,
+		 * so a long or voluminous command (curl, ping, journal) shows up live
+		 * instead of freezing the window until it finishes. Stay responsive to
+		 * window events meanwhile -- a close aborts the command (cmd_abort kills
+		 * a CLI child) and we drain to EOF so the runner resets before we exit. */
+		int closing = 0;
+		for (;;) {
+			struct win_event ev;
+			while (win_poll(win, &ev))          /* stay closable mid-command   */
+				if (ev.type == WEV_CLOSE && !closing) { closing = 1; cmd_abort(); }
+			int n = cmd_read(iobuf, sizeof iobuf);
+			if (n > 0) {
+				if (!closing) { for (int i = 0; i < n; i++) tputc(iobuf[i]); redraw(); }
+			} else if (n < 0) {
+				break;                              /* end of output          */
+			} else {
+				if (dirty && !closing) redraw();    /* running; nothing yet    */
+				msleep(8);
+			}
+		}
+		if (closing) { win_close(win); exit(0); }
+		return;
+	}
+
 	char path[256];
-	if (argv[0][0] == '/') scpy(path, argv[0]);
-	else { scpy(path, "/bin/"); scat(path, argv[0]); }
+	if (argv[0][0] == '/') strcpy(path, argv[0]);
+	else { strcpy(path, "/bin/"); strcat(path, argv[0]); }
 	struct statinfo st;
-	if (stat(path, &st) == 0 && !st.is_dir) {           /* a /bin program        */
+	if (stat(path, &st) == 0 && !st.is_dir) {           /* a detached GUI app    */
 		if (spawn(path, argc > 1 ? argv[1] : 0) < 0) err("failed to launch", 0);
 		return;
 	}
-	int n = shell_cmd(orig, iobuf, sizeof iobuf);       /* a kernel builtin?     */
-	if (n >= 0) { for (int i = 0; i < n; i++) tputc(iobuf[i]); return; }
 	err(argv[0], ": command not found");
 }
 
 static void run(const char *orig)
 {
-	char buf[256]; scpy(buf, orig);
+	char buf[256]; strcpy(buf, orig);
 	char *argv[16];
 	int argc = 0, i = 0;
 	while (buf[i] && argc < 16) {
@@ -310,26 +333,26 @@ static void run(const char *orig)
 	if (argc == 0) return;
 	const char *c = argv[0];
 
-	if      (!scmp(c, "help"))  bi_help();
-	else if (!scmp(c, "clear")) grid_reset();
-	else if (!scmp(c, "echo"))  { for (int k = 1; k < argc; k++) { tputs(argv[k]); if (k < argc - 1) tputc(' '); } tputc('\n'); }
-	else if (!scmp(c, "pwd"))   { tputs(cwd); tputc('\n'); }
-	else if (!scmp(c, "cd")) {
-		if (argc < 2) { scpy(cwd, HOME); }
+	if      (!strcmp(c, "help"))  bi_help();
+	else if (!strcmp(c, "clear")) grid_reset();
+	else if (!strcmp(c, "echo"))  { for (int k = 1; k < argc; k++) { tputs(argv[k]); if (k < argc - 1) tputc(' '); } tputc('\n'); }
+	else if (!strcmp(c, "pwd"))   { tputs(cwd); tputc('\n'); }
+	else if (!strcmp(c, "cd")) {
+		if (argc < 2) { strcpy(cwd, HOME); }
 		else { char p[256]; abspath(argv[1], p); struct statinfo st;
-		       if (stat(p, &st) == 0 && st.is_dir) scpy(cwd, p);
+		       if (stat(p, &st) == 0 && st.is_dir) strcpy(cwd, p);
 		       else err("cd: not a directory: ", argv[1]); }
 	}
-	else if (!scmp(c, "ls"))    bi_ls(argc, argv);
-	else if (!scmp(c, "cat"))   bi_cat(argc, argv);
-	else if (!scmp(c, "write")) bi_write(argc, argv);
-	else if (!scmp(c, "cp"))    bi_cp(argc, argv);
-	else if (!scmp(c, "stat"))  bi_stat(argc, argv);
-	else if (!scmp(c, "mkdir")) { for (int k = 1; k < argc; k++) { char p[256]; abspath(argv[k], p); if (mkdir(p) < 0) err("mkdir: failed: ", argv[k]); } }
-	else if (!scmp(c, "rmdir")) { for (int k = 1; k < argc; k++) { char p[256]; abspath(argv[k], p); if (rmdir(p) < 0) err("rmdir: failed: ", argv[k]); } }
-	else if (!scmp(c, "rm"))    { for (int k = 1; k < argc; k++) { char p[256]; abspath(argv[k], p); if (unlink(p) < 0) err("rm: failed: ", argv[k]); } }
-	else if (!scmp(c, "mv"))    { if (argc < 3) tputs("usage: mv <src> <dst>\n"); else { char a[256], b[256]; abspath(argv[1], a); abspath(argv[2], b); if (rename(a, b) < 0) err("mv: failed", 0); } }
-	else if (!scmp(c, "exit"))  { win_close(win); exit(0); }
+	else if (!strcmp(c, "ls"))    bi_ls(argc, argv);
+	else if (!strcmp(c, "cat"))   bi_cat(argc, argv);
+	else if (!strcmp(c, "write")) bi_write(argc, argv);
+	else if (!strcmp(c, "cp"))    bi_cp(argc, argv);
+	else if (!strcmp(c, "stat"))  bi_stat(argc, argv);
+	else if (!strcmp(c, "mkdir")) { for (int k = 1; k < argc; k++) { char p[256]; abspath(argv[k], p); if (mkdir(p) < 0) err("mkdir: failed: ", argv[k]); } }
+	else if (!strcmp(c, "rmdir")) { for (int k = 1; k < argc; k++) { char p[256]; abspath(argv[k], p); if (rmdir(p) < 0) err("rmdir: failed: ", argv[k]); } }
+	else if (!strcmp(c, "rm"))    { for (int k = 1; k < argc; k++) { char p[256]; abspath(argv[k], p); if (unlink(p) < 0) err("rm: failed: ", argv[k]); } }
+	else if (!strcmp(c, "mv"))    { if (argc < 3) tputs("usage: mv <src> <dst>\n"); else { char a[256], b[256]; abspath(argv[1], a); abspath(argv[2], b); if (rename(a, b) < 0) err("mv: failed", 0); } }
+	else if (!strcmp(c, "exit"))  { win_close(win); exit(0); }
 	else                        run_other(orig, argc, argv);
 }
 
@@ -357,7 +380,7 @@ static void line_redraw(void)
 	dirty = 1;
 }
 
-static void line_set(const char *s) { scpy(line, s); llen = lpos = slen(line); line_redraw(); }
+static void line_set(const char *s) { strcpy(line, s); llen = lpos = strlen(line); line_redraw(); }
 
 static void line_submit(void)
 {
@@ -366,12 +389,18 @@ static void line_submit(void)
 	for (int i = 0; i < llen; i++) tputc(line[i]);
 	tputc('\n');
 	if (llen) {
-		for (int k = 15; k > 0; k--) scpy(hist[k], hist[k - 1]);
-		scpy(hist[0], line);
+		for (int k = 15; k > 0; k--) strcpy(hist[k], hist[k - 1]);
+		strcpy(hist[0], line);
 		if (hcount < 16) hcount++;
 	}
-	char tmp[256]; scpy(tmp, line);
+	char tmp[256]; strcpy(tmp, line);
 	llen = lpos = rlen = 0; hpos = -1;
+	redraw();                            /* flush the echoed line + newline now: a
+	                                        command that blocks in the kernel (play,
+	                                        sleep, curl) stalls this event handler, and
+	                                        the present only runs in the main loop after
+	                                        we return -- without this the screen freezes
+	                                        on the pre-Enter line for the whole command. */
 	run(tmp);
 	cur_fg = FG; esc = 0;                 /* don't let a command's colour bleed   */
 	prompt();

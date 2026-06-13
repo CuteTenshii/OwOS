@@ -142,6 +142,11 @@ static struct ring ep0_ring;
 static struct trb *event_ring;    /* event ring segment (consumer)           */
 static uint32_t    event_cycle;   /* consumer cycle state                    */
 static uint32_t    event_idx;
+/* Cleared whenever event_wait() times out (the controller posted no completion
+ * in 500 ms) and set on any successful event. A wedged/yanked device that stops
+ * completing transfers flips this to 0, so callers can drop it instead of
+ * retrying forever. */
+static volatile int hc_responsive = 1;
 
 /* One enumerated device, indexed by root-hub port. Cached so each device is
  * enumerated exactly once (re-enumerating a configured device fails and would
@@ -271,10 +276,12 @@ static struct trb *event_wait(void)
 			 * command/transfer event they're actually waiting for. */
 			if (TRB_GET_TYPE(e->control) == TRB_PORT_STATUS)
 				continue;
+			hc_responsive = 1;
 			return e;
 		}
 		timer_sleep(1);
 	}
+	hc_responsive = 0;     /* no completion in 500 ms: controller not responding */
 	return NULL;
 }
 
@@ -1389,6 +1396,11 @@ int xhci_msc_read(uint32_t lba, void *buf)
 	}
 
 	msc_unlock();
+	/* If the controller went silent on this op, drop the device: it was unplugged
+	 * mid-transfer or has wedged. Further reads fail instantly (msc_ready == 0)
+	 * and it disappears from the Devices list, rather than re-hanging each time. */
+	if (rc != 0 && !hc_responsive)
+		msc_ready = 0;
 	return rc;
 }
 
@@ -1404,6 +1416,8 @@ int xhci_msc_write(uint32_t lba, const void *buf)
 			if (msc_ctag[i] == base) { msc_ctag[i] = 0xFFFFFFFFu; break; }
 	}
 	msc_unlock();
+	if (rc != 0 && !hc_responsive)               /* controller went silent: drop it */
+		msc_ready = 0;
 	return rc;
 }
 
@@ -1631,19 +1645,13 @@ static int mtp_do_get(uint32_t handle, const char *dst, uint32_t *rcode)
 
 	int cc;
 	int got = bulk_xfer(mtp_slot, &mtp_in_ring, mtp_in_dci, mtp_buf, MTP_CHUNK, &cc);
-	con_write("mtpdbg: get h="); con_put_hex(handle, 8);
-	con_write(" got="); con_write_dec((uint32_t)got);
-	con_write(" cc="); con_write_dec((uint32_t)cc);
-	con_write(" type="); con_write_dec(got >= 6 ? mtp_buf[4] : 0); con_putc('\n');
 	if (got < 12 || mtp_buf[4] != MTP_TYPE_DATA)
 		return -1;
 	uint32_t total = load_le32(mtp_buf);                /* header + file bytes          */
 	uint32_t fsize = total >= 12 ? total - 12 : 0;
 
-	if (fs_prealloc(dst, fsize) != 0) {
-		con_write("mtpdbg: prealloc failed fsize="); con_write_dec(fsize); con_putc('\n');
+	if (fs_prealloc(dst, fsize) != 0)
 		return -1;
-	}
 
 	uint32_t written = 0;
 	int first = (int)(got - 12);                   /* file bytes in the first chunk*/
@@ -1759,49 +1767,6 @@ static int bring_up_mtp(struct usbdev *d, int port)
 	con_write("mtp: ");
 	con_write(mtp_model[0] ? mtp_model : "device");
 	con_write(" ready (file transfer)\n");
-
-#if 1  /* TEMP self-test: deterministic, single-context (no mailbox needed) */
-	{
-		static uint8_t tb[MTP_CHUNK];
-		uint32_t trc, hs[8]; int hc = 0;
-		uint32_t hp[3] = { MTP_STORAGE_ALL, 0, MTP_PARENT_ROOT };
-		int tn = mtp_do_transaction(MTP_OP_GET_OBJECT_HANDLES, hp, 3, tb, sizeof tb, &trc);
-		con_write("MTPTEST root n="); con_write_dec((uint32_t)tn);
-		con_write(" rc="); con_put_hex(trc, 4);
-		if (tn >= 4) {
-			uint32_t c = load_le32(tb);
-			con_write(" cnt="); con_write_dec(c);
-			for (uint32_t i = 0; i < c && i < 8; i++) {
-				hs[hc++] = load_le32(tb + 4 + i * 4);
-				con_write(" "); con_put_hex(hs[i], 8);
-			}
-		}
-		con_putc('\n');
-		for (int i = 0; i < hc; i++) {
-			uint32_t fp[3] = { MTP_STORAGE_ALL, 0, hs[i] };
-			int fn = mtp_do_transaction(MTP_OP_GET_OBJECT_HANDLES, fp, 3, tb, sizeof tb, &trc);
-			con_write("MTPTEST sub "); con_put_hex(hs[i], 8);
-			con_write(" n="); con_write_dec((uint32_t)fn);
-			con_write(" rc="); con_put_hex(trc, 4);
-			if (fn >= 4) { con_write(" cnt="); con_write_dec(load_le32(tb)); }
-			con_putc('\n');
-		}
-		if (hc > 0) {
-			uint32_t gp[1] = { hs[hc > 1 ? 1 : 0] };
-			if (mtp_send_command(MTP_OP_GET_OBJECT, gp, 1)) {
-				int cc, got = bulk_xfer(mtp_slot, &mtp_in_ring, mtp_in_dci, mtp_buf, MTP_CHUNK, &cc);
-				con_write("MTPTEST get "); con_put_hex(gp[0], 8);
-				con_write(" got="); con_write_dec((uint32_t)got);
-				con_write(" cc="); con_write_dec((uint32_t)cc);
-				con_write(" type="); con_write_dec(got >= 6 ? mtp_buf[4] : 0);
-				con_write(" total="); con_write_dec(got >= 4 ? load_le32(mtp_buf) : 0);
-				con_putc('\n');
-				uint32_t grc = mtp_read_response();
-				con_write("MTPTEST get resp rc="); con_put_hex(grc, 4); con_putc('\n');
-			}
-		}
-	}
-#endif
 	return 0;
 }
 
@@ -1881,10 +1846,6 @@ int xhci_mtp_list(uint32_t parent,
 
 	uint32_t hp[3] = { MTP_STORAGE_ALL, 0, parent };
 	int n = mtp_xfer(MTP_OP_GET_OBJECT_HANDLES, hp, 3, handles, sizeof handles);
-	con_write("mtpdbg: list parent="); con_put_hex(parent, 8);
-	con_write(" n="); con_write_dec((uint32_t)n);
-	con_write(" rc="); con_put_hex(mtp_resp_code, 4);
-	con_write(" cnt="); con_write_dec(n >= 4 ? load_le32(handles) : 0); con_putc('\n');
 	if (n < 4) { mtp_unlock(); return n < 0 ? -1 : 0; }
 
 	uint32_t count = load_le32(handles);
@@ -2176,7 +2137,13 @@ static void scan_ports(void)
 					port_dev[p].active = 0;
 			}
 		} else {
-			port_dev[p].active = 0;        /* device gone                       */
+			/* Device gone. If it was the mass-storage device, drop the cached
+			 * MSC state so xhci_msc_present() goes false and the file explorer's
+			 * Devices list reflects the unplug (it was only ever set on connect). */
+			if (port_dev[p].is_msc)
+				msc_ready = 0;
+			port_dev[p].active = 0;
+			port_dev[p].is_msc = 0;
 		}
 	}
 }

@@ -221,6 +221,20 @@ static int from_efi(void)
 	return 0;
 }
 
+/* True when `product` already begins with `vendor` (case-insensitive, e.g.
+ * vendor "HP" + product "HP EliteBook 840 G3") so the join shouldn't repeat it. */
+static int product_has_vendor_prefix(void)
+{
+	for (int i = 0; vendor[i]; i++) {
+		char a = vendor[i], b = product[i];
+		if (a >= 'A' && a <= 'Z') a += 32;
+		if (b >= 'A' && b <= 'Z') b += 32;
+		if (a != b)
+			return 0;
+	}
+	return 1;
+}
+
 void smbios_init(void)
 {
 	if (parsed)
@@ -253,8 +267,11 @@ void smbios_init(void)
 build:
 	/* Compose "<vendor> <product>", skipping whichever half is missing. Some
 	 * firmwares fill one field with filler like "To Be Filled By O.E.M." — we
-	 * print it verbatim rather than trying to second-guess every vendor. */
-	if (vendor[0] && product[0]) {
+	 * print it verbatim rather than trying to second-guess every vendor.
+	 * Many OEMs (HP, Dell, LENOVO) already repeat the vendor at the start of the
+	 * product string, so a naive join reads "HP HP EliteBook 840 G3" — drop the
+	 * redundant vendor prefix (case-insensitive) when the product carries it. */
+	if (vendor[0] && product[0] && !product_has_vendor_prefix()) {
 		copy_str(host, sizeof host, vendor);
 		uint32_t n = 0;
 		while (host[n])

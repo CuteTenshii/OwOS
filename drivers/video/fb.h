@@ -28,6 +28,13 @@ uint32_t fb_pitch_pixels(void);    /* back buffer row stride in pixels (>= width
  * VRAM writes are slow. */
 void fb_present(void);
 
+/* Register a callback invoked by fb_present (and the full-screen redraw paths)
+ * with the rectangle that was just copied to the visible framebuffer, in screen
+ * pixels. A paravirtual adapter that needs an explicit "flush this region to the
+ * host" message — VMware SVGA II — uses this; pass NULL to clear it. A plain
+ * LFB (QEMU DISPI, GRUB/UEFI adopt) needs no hook and leaves it unset. */
+void fb_set_present_hook(void (*cb)(int x, int y, int w, int h));
+
 /* Software display brightness, driven by the keyboard's brightness keys (there
  * is no panel-backlight register we can reach, so fb_present dims pixels as it
  * copies the back buffer to the screen). Levels run FB_BRIGHT_MIN..FB_BRIGHT_MAX;

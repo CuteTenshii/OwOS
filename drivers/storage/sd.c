@@ -293,9 +293,14 @@ static int card_init(void)
 
 /* --------------------------------------------------------------- block I/O */
 
+static int card_bring_up(void);    /* defined below sd_init's helpers */
+
 static int do_transfer(uint32_t lba, void *buf, int write)
 {
-	if (!found)
+	/* Lazily bring up a card that was hot-inserted after boot (or re-inserted).
+	 * card_bring_up() is a no-op-fail if the slot is empty, so a yanked card just
+	 * fails the transfer rather than hanging. */
+	if (!found && card_bring_up() != 0)
 		return -1;
 
 	uint32_t arg = high_capacity ? lba : lba * 512u;
@@ -333,7 +338,20 @@ static int do_transfer(uint32_t lba, void *buf, int write)
 int sd_read_sector(uint32_t lba, void *buf)        { return do_transfer(lba, buf, 0); }
 int sd_write_sector(uint32_t lba, const void *buf) { return do_transfer(lba, (void *)buf, 1); }
 
-int sd_present(void)        { return found; }
+/* Live presence: read the SDHCI card-detect bit each call (cheap MMIO read, safe
+ * to poll per frame), so the file explorer's Devices list reflects a card being
+ * inserted or pulled after boot — not just whatever was in the slot at init. A
+ * card that is present but not yet brought up still reports present; the first
+ * transfer runs card_bring_up() lazily. */
+int sd_present(void)
+{
+	if (!mmio)                          /* no SDHCI controller at all            */
+		return 0;
+	if (rd32(R_PRESENT) & PS_CARD_PRESENT)
+		return 1;                       /* a card is physically in the slot      */
+	found = 0;                          /* slot empty -> drop any cached card     */
+	return 0;
+}
 uint32_t sd_sectors(void)   { return cap_sectors; }
 const char *sd_model(void)  { return model; }
 
@@ -356,6 +374,38 @@ static int find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
 				}
 			}
 		}
+	return 0;
+}
+
+/* Power, clock and run the SD identification handshake on the card currently in
+ * the slot, leaving it ready for transfers. Re-runnable: used at boot and lazily
+ * when a card is hot-inserted after boot. Needs base_khz already read from the
+ * controller caps; sets `found` + model on success. Returns 0 on success. */
+static int card_bring_up(void)
+{
+	if (!mmio || !(rd32(R_PRESENT) & PS_CARD_PRESENT))
+		return -1;
+
+	/* Power the slot at 3.3 V and start the ID clock (~400 kHz). */
+	wr8(R_POWER_CTRL, 0);
+	wr8(R_POWER_CTRL, PC_V33 | PC_BUS_ON);
+	sd_set_clock(400);
+	wr8(R_TIMEOUT_CTRL, 0x0E);                       /* maximum data timeout     */
+
+	/* Polled operation: let status bits latch (INT_ENABLE) but raise no IRQs. */
+	wr32(R_INT_STATUS, 0xFFFFFFFFu);
+	wr32(R_INT_ENABLE, 0xFFFFFFFFu);
+	wr32(R_SIGNAL_ENABLE, 0);
+
+	if (card_init() != 0)
+		return -1;
+
+	sd_set_clock(25000);                             /* full-speed transfers     */
+	found = 1;
+	if (high_capacity)
+		memcpy(model, "SDHC/SDXC card", sizeof("SDHC/SDXC card"));
+	else
+		memcpy(model, "SD card", sizeof("SD card"));
 	return 0;
 }
 
@@ -398,41 +448,26 @@ void sd_init(void)
 		return;
 	}
 
-	if (!(rd32(R_PRESENT) & PS_CARD_PRESENT)) {
-		con_write("sd: controller present but no card inserted\n");
-		return;
-	}
-
-	/* Base clock from capabilities (SDHCI >=3.0: bits 15:8 MHz; 2.0: 13:8). */
+	/* Base clock from capabilities (SDHCI >=3.0: bits 15:8 MHz; 2.0: 13:8). Read
+	 * it unconditionally — even with the slot empty now — so a card inserted
+	 * *after* boot can be brought up later (card_bring_up needs base_khz). */
 	uint32_t caps = rd32(R_CAPS);
 	uint16_t ver  = (uint16_t)(rd16(R_HOST_VERSION) & 0xFF);
 	uint32_t base_mhz = (ver >= 2) ? ((caps >> 8) & 0xFF) : ((caps >> 8) & 0x3F);
 	base_khz = base_mhz * 1000u;
 
-	/* Power the slot at 3.3 V and start the ID clock (~400 kHz). */
-	wr8(R_POWER_CTRL, 0);
-	wr8(R_POWER_CTRL, PC_V33 | PC_BUS_ON);
-	sd_set_clock(400);
-	wr8(R_TIMEOUT_CTRL, 0x0E);                       /* maximum data timeout     */
-
-	/* Polled operation: let status bits latch (INT_ENABLE) but raise no IRQs. */
-	wr32(R_INT_STATUS, 0xFFFFFFFFu);
-	wr32(R_INT_ENABLE, 0xFFFFFFFFu);
-	wr32(R_SIGNAL_ENABLE, 0);
-
-	if (card_init() != 0) {
-		con_write("sd: card initialisation failed\n");
+	if (!(rd32(R_PRESENT) & PS_CARD_PRESENT)) {
+		/* No card yet — but leave the controller mapped and live so SD hotplug
+		 * works: sd_present() reads the card-detect bit each poll, and the first
+		 * access after an insert brings the card up lazily. */
+		con_write("sd: controller ready, slot empty (hotplug-capable)\n");
 		return;
 	}
 
-	sd_set_clock(25000);                             /* full-speed transfers     */
-	found = 1;
-
-	/* No CID name decode; report the kind + capacity. */
-	if (high_capacity)
-		memcpy(model, "SDHC/SDXC card", sizeof("SDHC/SDXC card"));
-	else
-		memcpy(model, "SD card", sizeof("SD card"));
+	if (card_bring_up() != 0) {
+		con_write("sd: card initialisation failed\n");
+		return;
+	}
 
 	con_write("sd: ");
 	con_write(model);

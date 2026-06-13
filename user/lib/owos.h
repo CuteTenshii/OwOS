@@ -30,14 +30,47 @@ int      stream_begin(const char *name);
 int      stream_write(const void *buf, int len);
 int      stream_end(void);
 
-/* Networking: a tiny socket-ish API. net_connect resolves `host`, opens TCP,
- * and (if tls) runs the TLS handshake; it returns a handle >= 0, or a negative
- * error (-1 no NIC/slot, -2 resolve failed, -3 connect failed). net_recv
- * blocks and returns >0 bytes, 0 at EOF, -1 on error. */
-int      net_connect(const char *host, int port, int tls);
+/* Process exit status for "interrupted by Ctrl+C" (128 + SIGINT, as on Unix). A
+ * program returns this from main when a cooperative interrupt aborted it. */
+#define EXIT_SIGINT 130
+
+/* net_* error/status codes. Negative returns from net_connect/net_recv/net_send;
+ * NET_EINTR means a cooperative Ctrl+C arrived mid-call (the program should tear
+ * down and exit). Check it with `r == NET_EINTR`. */
+#define NET_EINTR (-4)
+
+/* Networking: a small Berkeley-ish socket API. net_connect resolves `host` and
+ * opens a transport selected by `proto` (SK_*): TCP, TLS (handshake, SNI=host),
+ * a UDP datagram socket to host:port, or a raw ICMP socket to host (the program
+ * builds/parses the ICMP message itself). Returns a handle >= 0, or a negative
+ * error (-1 no NIC/slot, -2 resolve failed, -3 connect failed, -4 interrupted).
+ * net_send writes (a datagram, for UDP/ICMP). net_recv blocks: TCP/TLS -> >0
+ * bytes / 0 EOF; UDP/ICMP -> >0 datagram bytes / 0 timeout; both -1 error, -4
+ * interrupted. ping/dig/resolution are ring-3 code over these sockets. */
+#define SK_TCP   0
+#define SK_TLS   1
+#define SK_UDP   2
+#define SK_ICMP  3
+int      net_connect(const char *host, int port, int proto);
 int      net_send(int h, const void *buf, int len);
 int      net_recv(int h, void *buf, int max);
 int      net_close(int h);
+
+/* Freestanding string helpers — shared so each program doesn't re-roll its own.
+ * Standard libc names, matching the kernel's kstring.h convention. */
+int  strlen(const char *s);
+int  strcmp(const char *a, const char *b);    /* <0 / 0 / >0                    */
+void strcpy(char *d, const char *s);          /* caller sizes d                 */
+void strcat(char *d, const char *s);          /* caller sizes d                 */
+static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
+
+/* mem* — the freestanding libc primitives gcc also lowers struct copies and
+ * array inits to at -O0. Provided once in the shared lib so every program (and
+ * any lib needing them, e.g. minimp3, the HTTP/2 HPACK tables) shares one copy.
+ * __SIZE_TYPE__ is gcc's builtin for size_t — no header needed. */
+void *memcpy(void *d, const void *s, __SIZE_TYPE__ n);
+void *memset(void *d, int c, __SIZE_TYPE__ n);
+void *memmove(void *d, const void *s, __SIZE_TYPE__ n);
 
 /* Conveniences built on the above. */
 void puts(const char *s);                     /* write a NUL-terminated string */
@@ -120,16 +153,43 @@ int spawn(const char *path, const char *arg);
  * Lets the ring-3 terminal reuse every kernel command. */
 int shell_cmd(const char *cmd, char *out, int max);
 
+/* Streaming variant of shell_cmd: render a command's output as it runs instead
+ * of buffering it all (so curl/ping/journal don't freeze the terminal). Start
+ * with cmd_begin (0 = streamable, -1 = not a bridged command), then loop on
+ * cmd_read until it returns -1: it returns a byte count (>0), 0 (running, no
+ * output yet -- pump events / wait), or -1 (end of output). */
+int cmd_begin(const char *cmd);
+int cmd_read(char *buf, int max);
+int cmd_abort(void);   /* abort the running streamed command (Ctrl+C / close)  */
+int intr_take(void);   /* 1 (and clear) if Ctrl+C arrived; for CPU-bound loops */
+
+/* Audio PCM sink (streaming): open a stream, push 48 kHz / 16-bit / signed /
+ * stereo frames (4 bytes each), then close. audio_write blocks (back-pressure)
+ * until the device has room, so it self-paces to real time without buffering the
+ * whole file; it returns the bytes accepted, -1 on error, or -2 if Ctrl+C was
+ * pressed. Only one stream exists system-wide. */
+int audio_open(void);
+int audio_write(const void *pcm, int len);
+int audio_close(void);
+
 /* Mounted removable volumes (USB sticks, etc.). Fill *out with the idx-th
  * volume: its label, mount path (e.g. "/media"), backing kind ("USB"/"SATA"/...),
  * and removable flag. Returns 1 if it exists, 0 past the end, -1 on error. */
-struct volinfo { char label[24]; char path[24]; char kind[8]; int removable; };
+struct volinfo { char label[24]; char path[24]; char kind[8]; int removable;
+                 int mounted; };  /* mounted: 1 if it backs /media (path valid) */
 int volumes(int idx, struct volinfo *out);
+
+/* Mount a present-but-unmounted removable device at /media, identified by its
+ * `kind` ("USB"/"CD"/"SD"/...) from volumes(). The GUI's "Connect" action. Only
+ * one volume mounts at a time, so eject any current one first. Returns 0 on
+ * success, -1 otherwise. */
+int mount(const char *kind);
 
 /* Unmount/eject the removable volume at /media (write-through, so always safe). The
  * argument is reserved for a future multi-volume API; pass the mount path or
  * NULL. Returns 0 on success, -1 if nothing was mounted. */
 int eject(const char *path);
+
 
 /* Editing key codes delivered via WEV_KEY (mirror kernel/keyboard.h). */
 #define KEY_UP     0x01

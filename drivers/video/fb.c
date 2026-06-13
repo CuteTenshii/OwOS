@@ -112,6 +112,16 @@ static void mark(int x, int y, int w, int h)
 
 static void alloc_backbuffer(void);
 
+/* Optional flush hook for paravirtual adapters (VMware SVGA II). Set, it is
+ * called with each rectangle copied to the visible framebuffer so the backend
+ * can tell the host to re-read it; unset (plain LFB), presents are just the copy. */
+static void (*present_hook)(int, int, int, int);
+
+void fb_set_present_hook(void (*cb)(int, int, int, int))
+{
+	present_hook = cb;
+}
+
 /* Make the visible framebuffer write-combining. On real GPUs VRAM defaults to
  * uncached, so each store is its own slow bus transaction; write-combining lets
  * the CPU batch them into bursts — the single biggest win for the per-frame
@@ -283,30 +293,40 @@ int fb_init(uint32_t want_w, uint32_t want_h)
 
 void fb_present(void)
 {
-	if (single) {                  /* drawing went straight to the framebuffer  */
-		dirty_x1 = dirty_x0;       /* nothing to copy; just clear the damage    */
+	if (dirty_x1 <= dirty_x0 || dirty_y1 <= dirty_y0) {
+		dirty_x1 = dirty_x0;       /* nothing changed                           */
 		return;
 	}
-	if (dirty_x1 <= dirty_x0 || dirty_y1 <= dirty_y0)
-		return;                    /* nothing changed                           */
+
+	int rx = dirty_x0, ry = dirty_y0;
+	int rw = dirty_x1 - dirty_x0, rh = dirty_y1 - dirty_y0;
 
 	/* Copy only the damaged rectangle, row by row, from the cached RAM back
 	 * buffer to VRAM. This is the only place we ever write the framebuffer.
 	 * When dimmed, each pixel is scaled on the way out; at full brightness the
-	 * copy stays a verbatim move. */
-	int dim = brightness < FB_BRIGHT_MAX;
-	for (int y = dirty_y0; y < dirty_y1; y++) {
-		const uint32_t *s = fb    + (uint32_t)y * fb_pitch + dirty_x0;
-		uint32_t       *d = front + (uint32_t)y * fb_pitch + dirty_x0;
-		for (int x = 0; x < dirty_x1 - dirty_x0; x++)
-			d[x] = dim ? dim_px(s[x]) : s[x];
+	 * copy stays a verbatim move. In single-buffered fallback drawing already
+	 * went straight to the framebuffer, so there is nothing to copy. */
+	if (!single) {
+		int dim = brightness < FB_BRIGHT_MAX;
+		for (int y = dirty_y0; y < dirty_y1; y++) {
+			const uint32_t *s = fb    + (uint32_t)y * fb_pitch + dirty_x0;
+			uint32_t       *d = front + (uint32_t)y * fb_pitch + dirty_x0;
+			for (int x = 0; x < rw; x++)
+				d[x] = dim ? dim_px(s[x]) : s[x];
+		}
+		/* Drain the write-combining buffer to VRAM. The front buffer is WC
+		 * (enable_wc), so these stores otherwise linger in the CPU's WC buffer
+		 * and don't reach the panel until some later eviction — which is why a
+		 * small present (clock tick, cursor move) stayed invisible on real
+		 * hardware until a burst of input forced a flush. SFENCE makes the frame
+		 * appear now. */
+		__asm__ volatile ("sfence" ::: "memory");
 	}
-	/* Drain the write-combining buffer to VRAM. The front buffer is WC
-	 * (enable_wc), so these stores otherwise linger in the CPU's WC buffer and
-	 * don't reach the panel until some later eviction — which is why a small
-	 * present (clock tick, cursor move) stayed invisible on real hardware until
-	 * a burst of input forced a flush. SFENCE makes the frame appear now. */
-	__asm__ volatile ("sfence" ::: "memory");
+
+	/* Paravirtual adapter (VMware SVGA II): flush just the damaged rect. */
+	if (present_hook)
+		present_hook(rx, ry, rw, rh);
+
 	dirty_x1 = dirty_x0;           /* mark the damage box empty again           */
 }
 
@@ -335,6 +355,8 @@ void fb_brightness_step(int dir)
 			d[x] = dim ? dim_px(s[x]) : s[x];
 	}
 	__asm__ volatile ("sfence" ::: "memory");
+	if (present_hook)
+		present_hook(0, 0, (int)fb_w, (int)fb_h);
 }
 
 int fb_brightness(void) { return brightness; }
@@ -467,6 +489,8 @@ static void fb_con_newline(void)
 		}
 		__asm__ volatile ("sfence" ::: "memory");
 	}
+	if (present_hook)              /* SVGA: the scroll touched the whole screen */
+		present_hook(0, 0, (int)fb_w, (int)fb_h);
 }
 
 void fb_con_putc(char c)

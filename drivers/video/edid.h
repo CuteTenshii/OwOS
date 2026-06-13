@@ -24,6 +24,17 @@ int edid_refresh_hz(void);
 int edid_width(void);
 int edid_height(void);
 
+/* The attached monitor's brand+model decoded from EDID ("<brand> <model>", e.g.
+ * "Dell U2412M"), written NUL-terminated into out; "" if no EDID was read. The
+ * model half (the 0xFC monitor-name descriptor) is optional, so a bare panel may
+ * yield brand only. Shares the one-shot probe. */
+void edid_model(char *out, int len);
+
+/* 1 if the display's PNP manufacturer id belongs to a known laptop-panel vendor
+ * (AUO/BOE/LGD/...), the practical signal that it's an integrated screen — base
+ * EDID has no explicit internal/external bit. */
+int edid_internal(void);
+
 /* Why EDID couldn't be read (e.g. "no Intel GPU", "GMBUS NAK", "bad checksum"),
  * for real-hardware diagnostics. Empty string after a successful read. */
 const char *edid_error(void);

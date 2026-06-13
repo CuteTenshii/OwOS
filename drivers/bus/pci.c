@@ -3,6 +3,7 @@
 #include "pci.h"
 #include "io.h"
 #include "console.h"
+#include "paging.h"
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -145,6 +146,84 @@ static const char *class_name(uint8_t cls, uint8_t sub)
 
 /* Friendly name for the display adapters QEMU and common hosts expose, keyed
  * by vendor (and device where it disambiguates). "" means "unknown model". */
+/* Specific Intel integrated-GPU model names, keyed by PCI device id, so the
+ * splash reads "Intel HD Graphics 520" (like fastfetch) rather than a generic
+ * "Intel Graphics". Centred on the Haswell..Tiger Lake parts a laptop is likely
+ * to carry; anything unrecognised falls back to the generic name. */
+static const char *intel_gpu_name(uint16_t device)
+{
+	switch (device) {
+	/* Haswell / Broadwell (Gen7.5 / Gen8). */
+	case 0x0416: return "Intel HD Graphics 4600";
+	case 0x0A16: return "Intel HD Graphics 4400";
+	case 0x0A26: return "Intel HD Graphics 5000";
+	case 0x0D26: return "Intel Iris Pro Graphics 5200";
+	case 0x1616: return "Intel HD Graphics 5500";
+	case 0x161E: return "Intel HD Graphics 5300";
+	case 0x1626: return "Intel HD Graphics 6000";
+	case 0x162B: return "Intel Iris Graphics 6100";
+	/* Skylake (Gen9). */
+	case 0x1902: case 0x1906: case 0x190B: return "Intel HD Graphics 510";
+	case 0x191E: return "Intel HD Graphics 515";
+	case 0x1916: case 0x1921: return "Intel HD Graphics 520";
+	case 0x1912: case 0x191B: return "Intel HD Graphics 530";
+	case 0x1926: return "Intel Iris Graphics 540";
+	case 0x1927: return "Intel Iris Graphics 550";
+	case 0x192B: return "Intel Iris Graphics 555";
+	/* Kaby Lake / Coffee Lake / Comet Lake (Gen9.5). */
+	case 0x5906: return "Intel HD Graphics 610";
+	case 0x5916: case 0x5921: return "Intel HD Graphics 620";
+	case 0x5917: return "Intel UHD Graphics 620";
+	case 0x591E: return "Intel HD Graphics 615";
+	case 0x5912: case 0x591B: return "Intel HD Graphics 630";
+	case 0x5926: return "Intel Iris Plus Graphics 640";
+	case 0x5927: return "Intel Iris Plus Graphics 650";
+	case 0x3E90: case 0x3E93: return "Intel UHD Graphics 610";
+	case 0x3E91: case 0x3E92: case 0x3E98: case 0x3E9B:
+	case 0x9BC5: case 0x9BC8: return "Intel UHD Graphics 630";
+	case 0x3EA0: return "Intel UHD Graphics 620";
+	case 0x3EA5: return "Intel Iris Plus Graphics 655";
+	/* Ice Lake / Tiger Lake (Gen11 / Gen12). */
+	case 0x8A52: case 0x8A53: return "Intel Iris Plus Graphics";
+	case 0x9A49: case 0x9A40: return "Intel Iris Xe Graphics";
+	case 0x9A78: return "Intel UHD Graphics";
+	default:     return "Intel Graphics";
+	}
+}
+
+/* The Intel iGPU's maximum render clock, in MHz, read from the GT RP_STATE_CAP
+ * register in BAR0 MMIO — the GPU analogue of the CPU's cpuid clock. Best-effort
+ * and real-hardware-only (QEMU's VGA has no GT block): returns 0 when it can't
+ * be read, so the splash simply omits it. RP_STATE_CAP is a static capability
+ * register in the always-on power well, so it reads without forcewake even when
+ * the GPU is in RC6.
+ *
+ * The byte-0 field is RP0 (the max P-state). For Gen6..Gen8 the displayed clock
+ * is rp0*50 MHz; for Gen9 big-core (Skylake/Kaby/Coffee) i915 scales rp0 by 3
+ * then divides the 50 MHz step by 3, so the factors cancel and it is *also*
+ * rp0*50 — a single formula covers the parts this targets. (Gen9-LP atoms differ;
+ * they're not a target.) */
+static unsigned intel_gpu_mhz(uint8_t bus, uint8_t slot, uint8_t func)
+{
+	uint32_t bar0 = pci_read32(bus, slot, func, 0x10);
+	if (((bar0 >> 1) & 0x3) == 0x2 &&              /* 64-bit BAR above 4 GiB?    */
+	    pci_read32(bus, slot, func, 0x14) != 0)
+		return 0;
+	uint32_t bar = bar0 & ~0xFu;
+	if (!bar)
+		return 0;
+
+	/* RP_STATE_CAP lives at MCHBAR_MIRROR_BASE_SNB (0x140000) + 0x5998; map
+	 * enough of BAR0 to reach it, uncached, one-shot (like edid.c's GMBUS map). */
+	if (paging_identity_map(bar, 0x180000) != 0)
+		return 0;
+	paging_mark_uc(bar, 0x180000);
+
+	volatile uint32_t *cap = (volatile uint32_t *)(bar + 0x145998);
+	uint32_t rp0 = *cap & 0xFF;
+	return rp0 * 50u;
+}
+
 static const char *display_name(uint16_t vendor, uint16_t device)
 {
 	switch (vendor) {
@@ -162,7 +241,7 @@ static const char *display_name(uint16_t vendor, uint16_t device)
 		return device == 0x0100 ? "QXL paravirtual GPU" : "Red Hat display";
 	case 0x10de: return "NVIDIA GPU";
 	case 0x1002: return "AMD/ATI GPU";
-	case 0x8086: return "Intel Graphics";
+	case 0x8086: return intel_gpu_name(device);
 	default:     return "";
 	}
 }
@@ -212,6 +291,8 @@ static const char *device_model(uint16_t vendor, uint16_t device)
 	case 0x808610d3: return "82574L Gigabit Ethernet";
 	case 0x8086100e: return "82540EM Gigabit Ethernet (e1000)";
 	case 0x80862415: return "82801AA AC'97 Audio";
+	case 0x80862668: return "82801G (ICH7) HD Audio";   /* QEMU -device intel-hda     */
+	case 0x8086293e: return "82801I (ICH9) HD Audio";   /* QEMU -device ich9-intel-hda */
 	/* Realtek. */
 	case 0x10ec8139: return "RTL8139 Fast Ethernet";
 	case 0x10ec8168: return "RTL8111/8168 Gigabit Ethernet";
@@ -274,6 +355,16 @@ int pci_displays(struct pci_display *out, int max)
 		out[n].vendor = d->vendor;
 		out[n].device = d->device;
 		out[n].name   = display_name(d->vendor, d->device);
+		out[n].integrated = (d->vendor == 0x8086);   /* Intel iGPU */
+		/* Map BAR0 + probe the GT clock once; cache it (the answer is fixed for
+		 * the session, and we don't want to remap MMIO on every neofetch). */
+		out[n].mhz = 0;
+		if (d->vendor == 0x8086) {
+			static int cached_mhz = -1;
+			if (cached_mhz < 0)
+				cached_mhz = (int)intel_gpu_mhz(d->bus, d->slot, d->func);
+			out[n].mhz = (unsigned)cached_mhz;
+		}
 		n++;
 	}
 	return n;
@@ -314,4 +405,41 @@ void pci_list(void)
 		}
 		con_putc('\n');
 	}
+}
+
+/* Bounded string append: copy `s` at `p` without passing `end`; returns the new
+ * end pointer. */
+static char *pci_cat(char *p, char *end, const char *s)
+{
+	while (s && *s && p < end)
+		*p++ = *s++;
+	return p;
+}
+
+/* Fill *out with cached device #idx, resolving the same friendly name pci_list
+ * prints. Returns 1 if it exists, 0 past the end. The data is cached from boot,
+ * so this touches no PCI config space. For the ring-3 `lspci` over SYS_PCIDEV. */
+int pci_dev_info(int idx, struct pci_dev_info *out)
+{
+	if (idx < 0 || idx >= device_count)
+		return 0;
+	struct pci_device *d = &devices[idx];
+	out->bus = d->bus; out->slot = d->slot; out->func = d->func;
+	out->vendor = d->vendor; out->device = d->device;
+	out->class_code = d->class_code; out->subclass = d->subclass;
+
+	const char *model  = device_model(d->vendor, d->device);
+	const char *vendor = vendor_name(d->vendor);
+	char *p = out->name, *e = out->name + sizeof out->name - 1;
+	if (model) {
+		if (vendor) { p = pci_cat(p, e, vendor); p = pci_cat(p, e, " "); }
+		p = pci_cat(p, e, model);
+	} else if (vendor) {
+		p = pci_cat(p, e, vendor); p = pci_cat(p, e, " ");
+		p = pci_cat(p, e, class_name(d->class_code, d->subclass));
+	} else {
+		p = pci_cat(p, e, class_name(d->class_code, d->subclass));
+	}
+	*p = '\0';
+	return 1;
 }

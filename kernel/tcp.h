@@ -23,6 +23,10 @@ typedef struct tcp_conn tcp_conn_t;
  * matching connection, if any. */
 void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len);
 
+/* tcp_read returns this when the caller's cooperative-interrupt latch is raised
+ * (Ctrl+C), distinct from a reset (-1) or EOF (0). */
+#define TCP_EINTR (-2)
+
 /* Blocking client API, driven from command context. A handle is valid from a
  * successful tcp_connect() until tcp_close(); the read/write/close calls take
  * the connection they operate on. */

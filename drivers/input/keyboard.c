@@ -8,6 +8,7 @@
 #include "screenshot.h"
 #include "serial.h"
 #include "sb16.h"
+#include "hda.h"
 #include "fb.h"
 
 #define KBD_DATA_PORT   0x60
@@ -46,6 +47,16 @@
 #define SC_E_VOL_UP    0x30
 #define SC_E_BRIGHT_DN 0x6B
 #define SC_E_BRIGHT_UP 0x6C
+
+/* This laptop's keyboard delivers its volume/brightness keys as bare function-
+ * key make codes (set 1), not the E0 consumer codes above -- the EC doesn't
+ * translate them. So F5/F6/F8/F9 double as brightness/volume and act directly
+ * in the IRQ, same handlers as the E0 cases. (No Fn distinction reaches us, so
+ * these keys are media keys system-wide; F5 therefore no longer sends KEY_F5.) */
+#define SC_F5          0x3F        /* brightness down                          */
+#define SC_F6          0x40        /* brightness up                            */
+#define SC_F8          0x42        /* volume down                              */
+#define SC_F9          0x43        /* volume up                                */
 
 /* Numeric keypad make codes are contiguous from 0x47 to 0x53. */
 #define SC_KP_FIRST    0x47
@@ -268,9 +279,16 @@ static void keyboard_handler(struct registers *r)
 		case 0x1C:           ring_push('\n');       break;  /* keypad Enter  */
 		case 0x35:           ring_push('/');        break;  /* keypad /      */
 		/* Media / Fn keys: act on the device directly, like Print Screen. */
-		case SC_E_MUTE:      sb16_volume_mute();     break;
-		case SC_E_VOL_DOWN:  sb16_volume_step(-1);   break;
-		case SC_E_VOL_UP:    sb16_volume_step(+1);   break;
+		/* Volume keys drive HDA when it owns output, else the SB16 mixer. */
+		case SC_E_MUTE:
+			if (hda_present()) hda_volume_mute(); else sb16_volume_mute();
+			break;
+		case SC_E_VOL_DOWN:
+			if (hda_present()) hda_volume_step(-1); else sb16_volume_step(-1);
+			break;
+		case SC_E_VOL_UP:
+			if (hda_present()) hda_volume_step(+1); else sb16_volume_step(+1);
+			break;
 		case SC_E_BRIGHT_DN: fb_brightness_step(-1); break;
 		case SC_E_BRIGHT_UP: fb_brightness_step(+1); break;
 		case SC_E_UP:        ring_push(KEY_UP);     break;
@@ -314,8 +332,17 @@ static void keyboard_handler(struct registers *r)
 	if (sc & SC_RELEASE)           /* any other key release: ignore          */
 		return;
 
-	if (sc == 0x3F) {              /* F5: app-defined refresh/reload          */
-		ring_push(KEY_F5);
+	/* Function-row media keys (bare F-key codes on this keyboard, see SC_F*).
+	 * Act on the device directly, like the E0 media keys: volume drives HDA when
+	 * it owns output, else the SB16 mixer; brightness drives the fb dimmer. */
+	switch (sc) {
+	case SC_F5: fb_brightness_step(-1); return;     /* brightness down          */
+	case SC_F6: fb_brightness_step(+1); return;     /* brightness up            */
+	case SC_F8:                                     /* volume down              */
+		if (hda_present()) hda_volume_step(-1); else sb16_volume_step(-1);
+		return;
+	case SC_F9:                                     /* volume up                */
+		if (hda_present()) hda_volume_step(+1); else sb16_volume_step(+1);
 		return;
 	}
 

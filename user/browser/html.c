@@ -75,7 +75,7 @@ static int tag_color_index(const char *tag, const char *end)
 static int tag_attr(const char *tag, const char *end, const char *attr,
                     char *out, int cap)
 {
-	int al = slen(attr);
+	int al = strlen(attr);
 	for (const char *p = tag; p + al < end; p++) {
 		if (!starts_ci(p, attr)) continue;
 		if (p != tag && (p[-1] == '-' ||
@@ -286,7 +286,7 @@ static int decode_entity(const char *p, const char *end, int *adv)
 static void decode_entities(char *s)
 {
 	char *o = s;
-	const char *p = s, *end = s + slen(s);
+	const char *p = s, *end = s + strlen(s);
 	while (p < end) {
 		if (*p == '&') {
 			int adv, c = decode_entity(p, end, &adv);

@@ -41,6 +41,7 @@
 #include "heap.h"
 #include "timer.h"
 #include "kstring.h"
+#include "sched.h"    /* sched_intr_pending: cooperative Ctrl+C abort */
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -409,6 +410,10 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport)
 				c->state = ST_CLOSED;    /* release the slot */
 				return NULL;
 			}
+			if (sched_intr_pending()) {  /* Ctrl+C: give up connecting */
+				c->state = ST_CLOSED;
+				return NULL;
+			}
 			__asm__ volatile ("sti\n\thlt");  /* never halt with IF clear */
 		}
 	}
@@ -491,6 +496,8 @@ int tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed)
 			return r;
 		if (*closed)                           /* FIN drained               */
 			return 0;
+		if (sched_intr_pending())              /* Ctrl+C: abort the read    */
+			return TCP_EINTR;
 		if (timer_ticks() > deadline) {
 			*closed = 1;
 			return 0;

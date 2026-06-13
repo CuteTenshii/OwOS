@@ -83,8 +83,16 @@ cat -v /tmp/s.log
 serial → vga → gdt → idt → irq (PIC remap) → pmm → **paging** → heap → smbios →
 pci → **fb** → net (NIC dispatch + IPv4) → ahci/nvme probes → **blk (pick owofs
 disk)** → fs → syscalls (+install user programs) → timer → keyboard → sb16 →
-scheduler + workers → services → **wm** → screenshot worker → `sti` →
-**xhci_boot** (+ mount any USB stick it enumerates) → shell.
+scheduler + workers → services → **wm** → screenshot worker → `sti` → **shell**.
+
+The slow post-`sti` bring-up — DHCP and **`xhci_boot`** — runs in a detached
+**`boot_bringup` kernel thread**, *not* inline before the shell. Both block for
+seconds on real hardware (DHCP retransmits, xHCI port resets, all `timer_sleep`),
+and doing them inline meant keystrokes typed during boot piled up in the keyboard
+ring (captured at `sti`, drained only once the shell loop ran) and flushed all at
+once — the shell felt dead for seconds. As a background thread it runs with IF=1,
+so the "must run after `sti`" `timer_sleep` paths are still satisfied. **Nothing
+is auto-mounted at boot** — removable volumes mount only on demand (see Storage).
 
 Order is load-bearing: the IDT must exist before any IRQ; the PIC must be
 remapped (master→32, slave→40) before `sti` or the timer IRQ lands on a CPU
@@ -266,6 +274,17 @@ net-close=15) **must stay in sync** between `syscall.c` and `user/lib/lib.c`. Th
 net-* calls are a thin ring-3 connect/send/recv/close handle layer (`net_sock_*`
 in net.c) — the only user-facing network API; `user/curl.c` is the client.
 
+**Syscalls are general primitives, never per-feature shortcuts.** Don't add a
+syscall because one program "needs" it; expose a general mechanism and build the
+feature in a ring-3 lib. `net_connect`'s `proto` arg selects TCP/TLS/UDP/raw-ICMP
+— so ping/dig/DNS-resolution are ring-3 code over sockets, not three bespoke
+syscalls (those were tried and removed). Same rule, computation side: codecs/
+decompression go in `user/lib`, not a syscall. **Known offenders to revisit:**
+`SYS_SYSINFO` (neofetch), `SYS_PCIDEV` (lspci), `SYS_TUNE` — each gathers data for
+one program; the general replacement is a readable interface (a `/proc`-like fs,
+or CPUID/SMBIOS exposed generally), after which those programs are rewritten over
+it. See the [[syscalls-must-be-general]] memory.
+
 Each task carries a **cwd** (`task_t.cwd`): the shell sets a child's via
 `sched_set_cwd`, fork inherits it, and path syscalls join relative names onto it
 (`join_cwd`) before hitting owofs — so `curl -o out.txt` lands in the cwd. owofs
@@ -310,10 +329,25 @@ extent trees + indirect blocks), and **iso9660.c** (ISO 9660 + Joliet CD/DVD,
 read-only). The mount source is any non-owofs block device: the AHCI/NVMe scratch
 disks, a **USB flash drive** enumerated by xhci.c (BOT/SCSI mass storage exposed
 as a block device), an **SD/MMC card** brought up by sd.c, or a **CD/DVD** in an
-ATAPI drive (atapi.c). A USB stick only appears after `xhci_boot` (post-`sti`),
-so kernel.c auto-mounts it there; others mount on demand. Exactly one removable
-volume lives at `/media` at a time. These probe by filesystem signature and never
-auto-format.
+ATAPI drive (atapi.c). **Nothing auto-mounts** — removable volumes mount only on
+demand, via the `mount` command or the Files app's per-device **Connect** button
+(`blk_mount_device`). Exactly one removable volume lives at `/media` at a time.
+These probe by filesystem signature and never auto-format.
+
+`blk.c` enumerates removable devices from one **candidate table** (CD → USB →
+IDE → SATA → NVMe → SD, in mount priority): `blk_device_list()` reports the
+**present** ones (mounted or not — purely each driver's `_present()`, no sector
+I/O) for the Files Devices list, and `blk_mount_device(name)` mounts a chosen
+one. **Hotplug is live where the hardware allows**: the xHCI poll thread sets/
+clears `msc_ready` on USB connect/disconnect, and `sd_present()` reads the SDHCI
+card-detect bit each call (lazy `card_bring_up` on first access). IDE/SATA/NVMe
+presence stays latched at boot (not hot-pluggable here). **Real-hardware caveat:**
+a flaky USB-storage adapter can wedge the xHCI controller mid-transfer; an MMIO
+read to a controller that's fallen off the bus hangs the CPU bus cycle, which no
+software timeout catches — so `mount`/`storage` on such a device can still freeze
+the machine (a hardware fault, not a driver bug). Every *software* wait in the USB
+path is bounded (`event_wait`/`reset_port` time out; `timer_sleep` does `sti; hlt`
+so an IF=0 caller can't deadlock).
 
 **sd.c — SD/MMC over an SDHCI host controller.** Probes PCI for an SD Host
 Controller (class 0x08 / subclass 0x05, e.g. QEMU's `sdhci-pci` + `sd-card`),
@@ -504,8 +538,8 @@ players — `sb16.c` and `hda.c`. `play <file.wav>` prefers HDA when present
 (`hda_present()`), else SB16; both share the same RIFF/WAVE parse + Ctrl+C stop.
 
 - **sb16.c — Sound Blaster 16**, legacy ISA: DSP reset at 0x220, 8-bit PCM over
-  8237 auto-init DMA (channel 1, IRQ 5), down-converted to 8-bit mono. The
-  volume/Fn keys drive its mixer (see [Media/Fn keys]). QEMU-only (`-device sb16`).
+  8237 auto-init DMA (channel 1, IRQ 5), down-converted to 8-bit mono. QEMU-only
+  (`-device sb16`).
 - **hda.c — Intel HD Audio + a Realtek codec**, the real-laptop path. An HDA
   *controller* (PCI 0x04/0x03) is a bus-master with an MMIO register file; the
   *codec* (a Realtek ALC on real HW, QEMU's `hda-output` in emulation) is what
@@ -524,6 +558,10 @@ players — `sb16.c` and `hda.c`. `play <file.wav>` prefers HDA when present
     half the link position just left (the SB16 gapless idea over HDA streams).
   - **Everything is resampled to 48 kHz/16-bit/stereo** (nearest-neighbour), so
     any WAV rate plays regardless of what the HDA format register can encode.
+  - **The volume/Fn keys drive HDA when present, else the SB16 mixer** (keyboard.c,
+    see [Media/Fn keys]). `hda_volume_*` set one output-amp widget (pin>DAC>mixer,
+    chosen at init) on a 0..8 scale; they run from the keyboard IRQ, so `codec_cmd`
+    masks interrupts around its CORB/RIRB ring update to stay atomic.
   - **`hda_init` runs before `sti`** (alongside `sb16_init`), so it **busy-waits**
     (like `sd_init`) — no `timer_sleep`. Playback runs from the shell with
     interrupts on, so its poll loop *can* `timer_sleep`.

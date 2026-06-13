@@ -43,6 +43,14 @@
 #define SYS_STAT       39
 #define SYS_SPAWN      40
 #define SYS_SHELL      41
+#define SYS_MOUNT      42
+#define SYS_AUDIO_OPEN 46
+#define SYS_AUDIO_WRITE 47
+#define SYS_AUDIO_CLOSE 48
+#define SYS_CMD_BEGIN  49
+#define SYS_CMD_READ   50
+#define SYS_CMD_ABORT  51
+#define SYS_INTR       52
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -235,6 +243,27 @@ int shell_cmd(const char *cmd, char *out, int max)
 	return syscall(SYS_SHELL, (int)cmd, (int)out, max);
 }
 
+int cmd_begin(const char *cmd)
+{
+	return syscall(SYS_CMD_BEGIN, (int)cmd, 0, 0);
+}
+
+int cmd_read(char *buf, int max)
+{
+	return syscall(SYS_CMD_READ, (int)buf, max, 0);
+}
+
+int cmd_abort(void)
+{
+	return syscall(SYS_CMD_ABORT, 0, 0, 0);
+}
+
+int intr_take(void)
+{
+	return syscall(SYS_INTR, 0, 0, 0);
+}
+
+
 int volumes(int idx, struct volinfo *out)
 {
 	return syscall(SYS_VOLUMES, idx, (int)out, 0);
@@ -243,6 +272,28 @@ int volumes(int idx, struct volinfo *out)
 int eject(const char *path)
 {
 	return syscall(SYS_EJECT, (int)path, 0, 0);
+}
+
+int mount(const char *kind)
+{
+	return syscall(SYS_MOUNT, (int)kind, 0, 0);
+}
+
+
+
+int audio_open(void)
+{
+	return syscall(SYS_AUDIO_OPEN, 0, 0, 0);
+}
+
+int audio_write(const void *pcm, int len)
+{
+	return syscall(SYS_AUDIO_WRITE, (int)pcm, len, 0);
+}
+
+int audio_close(void)
+{
+	return syscall(SYS_AUDIO_CLOSE, 0, 0, 0);
 }
 
 void msleep(unsigned ms)
@@ -255,7 +306,29 @@ int thread_create(void (*fn)(void), void *stack_top)
 	return syscall(SYS_THREAD, (int)fn, (int)stack_top, 0);
 }
 
-static int slen(const char *s)
+/* mem* — shared by every program (gcc lowers struct copies / array inits to
+ * these at -O0) and by libs like minimp3 and the HTTP/2 HPACK tables. */
+void *memcpy(void *d, const void *s, __SIZE_TYPE__ n)
+{
+	unsigned char *a = d; const unsigned char *b = s;
+	while (n--) *a++ = *b++;
+	return d;
+}
+void *memset(void *d, int c, __SIZE_TYPE__ n)
+{
+	unsigned char *a = d;
+	while (n--) *a++ = (unsigned char)c;
+	return d;
+}
+void *memmove(void *d, const void *s, __SIZE_TYPE__ n)
+{
+	unsigned char *a = d; const unsigned char *b = s;
+	if (a < b) { while (n--) *a++ = *b++; }
+	else if (a > b) { a += n; b += n; while (n--) *--a = *--b; }
+	return d;
+}
+
+int strlen(const char *s)
 {
 	int n = 0;
 	while (s[n])
@@ -263,9 +336,29 @@ static int slen(const char *s)
 	return n;
 }
 
+int strcmp(const char *a, const char *b)
+{
+	while (*a && *a == *b) { a++; b++; }
+	return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+void strcpy(char *d, const char *s)
+{
+	while ((*d++ = *s++))
+		;
+}
+
+void strcat(char *d, const char *s)
+{
+	while (*d)
+		d++;
+	while ((*d++ = *s++))
+		;
+}
+
 void puts(const char *s)
 {
-	write(1, s, slen(s));
+	write(1, s, strlen(s));
 }
 
 void print_uint(unsigned v)

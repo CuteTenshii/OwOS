@@ -89,3 +89,15 @@ void irq_init(void)
 		idt_set_gate(IRQ_BASE + i, (uint32_t)irq_stubs[i],
 		             GDT_KERNEL_CODE, 0x8E);
 }
+
+/* Re-initialise the 8259 PIC after an ACPI S3 resume. The firmware's wake POST
+ * remaps the PIC back to the legacy BIOS vectors and masks the lines, so a
+ * timer tick would otherwise land on a CPU exception vector (or never fire).
+ * Restore our master->0x20 / slave->0x28 mapping, then reinstate the saved line
+ * masks. The IDT gates are unchanged (the kernel IDT is restored by lidt). */
+void irq_resume(uint8_t mask1, uint8_t mask2)
+{
+	pic_remap();                 /* re-init; leaves all lines masked */
+	outb(PIC1_DATA, mask1);      /* reinstate the masks from before sleep */
+	outb(PIC2_DATA, mask2);
+}

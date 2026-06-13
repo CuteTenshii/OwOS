@@ -33,14 +33,6 @@ static enum backend backend;
 static volatile uint8_t *ram_disk;
 static uint32_t          ram_sectors;
 
-static void blk_memcpy(void *dst, const void *src, uint32_t n)
-{
-	uint8_t *d = dst;
-	const uint8_t *s = src;
-	while (n--)
-		*d++ = *s++;
-}
-
 void blk_init(void)
 {
 	if (ata_present())
@@ -140,52 +132,92 @@ static int mount_removable(const char *name, fat_read_fn r, fat_write_fn w)
 	return -1;
 }
 
+/* One row per removable-volume source we can mount at /media. The order is the
+ * mount priority used at boot (CD/USB first -- the user's most likely intent --
+ * then secondary disks). A CD/DVD is special: read-only ISO 9660 over the
+ * 2048-byte ATAPI transport, so it can't ride the 512-byte fat/hfs/ext probe
+ * path and carries an `iso` flag. `id` is the owofs backend a device would be,
+ * so we can skip whichever disk owofs itself booted from. */
+struct cand {
+	const char  *name;             /* UI label + mount key ("USB","CD",...)    */
+	int        (*present)(void);   /* hardware presence -- cheap, no sector I/O */
+	const char *(*model)(void);    /* drive model string for the UI            */
+	enum backend id;
+	int          iso;
+	fat_read_fn  r;
+	fat_write_fn w;
+};
+
+static const struct cand cands[] = {
+	{ "CD",   atapi_present,    atapi_model,    BK_NONE, 1, atapi_read_sector, 0                 },
+	{ "USB",  xhci_msc_present, xhci_msc_model, BK_NONE, 0, xhci_msc_read,     xhci_msc_write    },
+	{ "IDE",  ata_present,      ata_model,      BK_IDE,  0, ata_read_sector,   ata_write_sector  },
+	{ "SATA", ahci_present,     ahci_model,     BK_AHCI, 0, ahci_read_sector,  ahci_write_sector },
+	{ "NVMe", nvme_present,     nvme_model,     BK_NVME, 0, nvme_read_sector,  nvme_write_sector },
+	{ "SD",   sd_present,       sd_model,       BK_SD,   0, sd_read_sector,    sd_write_sector   },
+};
+#define NCAND (int)(sizeof(cands) / sizeof(cands[0]))
+
+/* A candidate is a listable removable device right now if its hardware is
+ * present and it is NOT the disk owofs booted from (the system volume is not
+ * offered as removable media). */
+static int cand_listable(const struct cand *c)
+{
+	return c->present() && c->id != backend;
+}
+
+/* Mount one candidate at /media. Returns 0 on success. */
+static int cand_mount(const struct cand *c)
+{
+	if (!cand_listable(c))
+		return -1;
+	if (c->iso) {
+		if (iso_mount_probe(c->r) == 0) { announce_vol(c->name); return 0; }
+		return -1;
+	}
+	return mount_removable(c->name, c->r, c->w);
+}
+
 int blk_mount_fat(void)
 {
-	/* Mount a removable volume on the first present device that owofs is NOT
-	 * using as its own backing store. owofs lives on one disk (blk_init's pick);
-	 * a stick/SD/second image lives on another. This is where device knowledge
-	 * belongs -- fat.c/hfs.c stay controller-agnostic. */
-
 	/* Exactly one removable volume lives at /media. If something is already
-	 * mounted (e.g. a CD claimed it at boot before the USB stick enumerated),
-	 * leave it -- the post-boot retry must not stack a second volume on top. */
+	 * mounted, leave it -- a retry must not stack a second volume on top. */
 	if (fat_mounted() || hfs_mounted() || ext_mounted() || iso_mounted())
 		return 0;
 
-	/* A CD/DVD is read-only ISO 9660, on its own ATAPI transport (2048-byte
-	 * sectors), so it can't ride the 512-byte fat/hfs/ext probe path -- handle
-	 * it directly. A drive with no disc just fails the read and falls through. */
-	if (atapi_present() && iso_mount_probe(atapi_read_sector) == 0) {
-		announce_vol("CD");
-		return 0;
-	}
-
-	/* A USB mass-storage device is the most natural target -- a real removable
-	 * stick -- so try it first. It only becomes present after xhci_boot()
-	 * enumerates it, which is why this runs again post-boot. */
-	if (xhci_msc_present()) {
-		/* USB MSC has no write hook wired here; FAT writes still work because
-		 * xhci_msc_write is passed. */
-		if (mount_removable("USB", xhci_msc_read, xhci_msc_write) == 0)
+	for (int i = 0; i < NCAND; i++)
+		if (cand_mount(&cands[i]) == 0)
 			return 0;
-	}
-
-	struct { int present; enum backend id; const char *name;
-	         fat_read_fn r; fat_write_fn w; } dev[] = {
-		{ ata_present(),  BK_IDE,  "IDE",  ata_read_sector,  ata_write_sector  },
-		{ ahci_present(), BK_AHCI, "SATA", ahci_read_sector, ahci_write_sector },
-		{ nvme_present(), BK_NVME, "NVMe", nvme_read_sector, nvme_write_sector },
-		{ sd_present(),   BK_SD,   "SD",   sd_read_sector,   sd_write_sector   },
-	};
-	for (unsigned i = 0; i < sizeof(dev) / sizeof(dev[0]); i++) {
-		if (!dev[i].present || dev[i].id == backend)
-			continue;                  /* skip absent disks and owofs's own */
-		if (mount_removable(dev[i].name, dev[i].r, dev[i].w) == 0)
-			return 0;
-	}
 	con_write("vol: no removable volume found\n");
 	return -1;
+}
+
+int blk_mount_device(const char *name)
+{
+	/* One volume at a time: if /media is taken, only a no-op re-mount of the same
+	 * device succeeds; mounting a different one requires ejecting first. */
+	if (fat_mounted() || hfs_mounted() || ext_mounted() || iso_mounted())
+		return streq(fat_src, name) ? 0 : -1;
+
+	for (int i = 0; i < NCAND; i++)
+		if (streq(cands[i].name, name))
+			return cand_mount(&cands[i]);
+	return -1;
+}
+
+int blk_device_list(struct blk_devinfo *out, int max)
+{
+	int any = fat_mounted() || hfs_mounted() || ext_mounted() || iso_mounted();
+	int n = 0;
+	for (int i = 0; i < NCAND && n < max; i++) {
+		if (!cand_listable(&cands[i]))
+			continue;
+		out[n].name    = cands[i].name;
+		out[n].model   = cands[i].model();
+		out[n].mounted = any && streq(fat_src, cands[i].name);
+		n++;
+	}
+	return n;
 }
 
 int blk_read_sector(uint32_t lba, void *buf)
@@ -197,7 +229,7 @@ int blk_read_sector(uint32_t lba, void *buf)
 	case BK_RAM:
 		if (lba >= ram_sectors)
 			return -1;
-		blk_memcpy(buf, (const void *)(ram_disk + (uint32_t)lba * 512u), 512);
+		memcpy(buf, (const void *)(ram_disk + (uint32_t)lba * 512u), 512);
 		return 0;
 	default:      return -1;
 	}
@@ -228,7 +260,7 @@ int blk_write_sector(uint32_t lba, const void *buf)
 	case BK_RAM:
 		if (lba >= ram_sectors)
 			return -1;
-		blk_memcpy((void *)(ram_disk + (uint32_t)lba * 512u), buf, 512);
+		memcpy((void *)(ram_disk + (uint32_t)lba * 512u), buf, 512);
 		return 0;
 	default:      return -1;
 	}

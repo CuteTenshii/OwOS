@@ -23,12 +23,10 @@
 #include "e1000.h"
 #include "usb.h"
 #include "xhci.h"
-#include "speaker.h"
 #include "sb16.h"
 #include "hda.h"
 #include "cpu.h"
 #include "rtc.h"
-#include "neofetch.h"
 #include "loader.h"
 #include "pipe.h"
 #include "power.h"
@@ -63,16 +61,6 @@ static int  hist_pos;
 /* When a generic pipe "A | B" is active, this holds A's captured output as a
  * NUL-terminated string; input-consuming builtins (grep) read from it. */
 static char  *g_pipe_in;
-
-static int streq(const char *a, const char *b)
-{
-	while (*a && *b) {
-		if (*a != *b)
-			return 0;
-		a++; b++;
-	}
-	return *a == *b;
-}
 
 /* If line starts with prefix, return the pointer just past it; else NULL. */
 static const char *after_prefix(const char *line, const char *prefix)
@@ -351,6 +339,10 @@ static void cmd_storage(void)
 		con_write("  ");
 		write_capacity(xhci_msc_sectors());
 		con_write(" (xHCI BOT) -- read LBA0: ");
+		/* Safe even on a flaky adapter: every wait in the read is bounded
+		 * (event_wait times out in 500 ms) and sti-safe (timer_sleep does
+		 * sti;hlt), and a controller that goes silent drops the device
+		 * (hc_responsive -> msc_ready=0). So this reports FAIL, never a freeze. */
 		con_write(xhci_msc_read(0, buf) == 0 ? "ok\n" : "FAIL\n");
 		n++;
 	}
@@ -1613,7 +1605,6 @@ static void bi_ls(const char *a)
 }
 static void bi_pwd(const char *a)      { (void)a; cmd_pwd(); }
 static void bi_format(const char *a)   { (void)a; fs_format(); con_write("filesystem erased.\n"); }
-static void bi_lspci(const char *a)    { (void)a; pci_list(); }
 static void bi_ethdiag(const char *a)  { (void)a; e1000_diag(); }
 static void bi_dhcp(const char *a)     { (void)a; net_dhcp_now(); }
 static void bi_txtest(const char *a)   { (void)a; e1000_txtest(); }
@@ -1759,34 +1750,12 @@ static void bi_mount(const char *a)
 	if (blk_mount_fat() != 0)
 		con_write("mount: no removable volume found\n");
 }
-static void bi_beep(const char *a)     { (void)a; speaker_beep(1000, 200); }
-static void bi_play(const char *a)
-{
-	if (a[0] == '\0')                       /* bare "play" -> the default tune  */
-		speaker_song();
-	else if (fs_size(a) >= 0)               /* a file -> treat it as a WAV      */
-		hda_present() ? hda_play_wav(a) : sb16_play_wav(a);
-	else if (speaker_play(a) != 0) {
-		con_write("play: unknown tune: ");
-		con_write(a);
-		con_write("\ntunes: twinkle, megalovania, sweden (or a .wav file)\n");
-	}
-}
+/* `play` is now the ring-3 program /bin/play (streaming WAV player); the kernel
+ * no longer has a play builtin. is_capture_cli() routes it like neofetch/curl. */
 static void bi_cpuinfo(const char *a)  { (void)a; cmd_cpuinfo(); }
 static void bi_whoami(const char *a)   { (void)a; cmd_whoami(); }
 static void bi_which(const char *a)    { cmd_which((char *)a); }
 static void bi_date(const char *a)     { (void)a; cmd_date(); }
-static void bi_neofetch(const char *a) { (void)a; neofetch(); }
-static void bi_ping(const char *a)
-{
-	if (a[0] == '\0') { con_write("usage: ping <host>\n"); return; }
-	net_ping(a);
-}
-static void bi_dig(const char *a)
-{
-	if (a[0] == '\0') { con_write("usage: dig <host> [type]\n"); return; }
-	net_dig(a);
-}
 static void bi_ntp(const char *a)      { net_ntp(a); }
 static void bi_fstest(const char *a)     { (void)a; fs_selftest(); }
 static void bi_cryptotest(const char *a) { (void)a; crypto_selftest(); }
@@ -1829,7 +1798,6 @@ static const struct builtin builtins[] = {
 	{ "gzip",     cmd_gzip,     "gzip <s> [d]  compress to gzip (d defaults to <s>.gz)" },
 	{ "gunzip",   cmd_gunzip,   "gunzip <s> [d] decompress a gzip file (d defaults to <s> minus .gz)" },
 	{ "format",   bi_format,    "format        erase the filesystem" },
-	{ "lspci",    bi_lspci,     "lspci         list PCI devices" },
 	{ "ethdiag",  bi_ethdiag,   "ethdiag       Intel NIC bring-up log + link/traffic stats" },
 	{ "dhcp",     bi_dhcp,      "dhcp          re-request a DHCP lease (waits for link)" },
 	{ "txtest",   bi_txtest,    "txtest        Intel NIC transmit self-test (MAC loopback)" },
@@ -1840,17 +1808,13 @@ static const struct builtin builtins[] = {
 	{ "storage",  bi_storage,   "storage       list storage devices (IDE/SATA/NVMe)" },
 	{ "mount",    bi_mount,     "mount         mount a removable volume (USB/SD/disk) at /media" },
 	{ "eject",    bi_eject,     "eject         safely detach the removable volume at /media" },
-	{ "beep",     bi_beep,      "beep          beep the PC speaker" },
-	{ "play",     bi_play,      "play [arg]    play a tune (twinkle/megalovania/sweden) or a .wav file" },
+	{ NULL,       NULL,         "play [arg]    play a .wav file, or a tune (twinkle/megalovania/sweden)" },
 	{ "cpuinfo",  bi_cpuinfo,   "cpuinfo       CPU vendor, model, and feature flags" },
 	{ "uname",    cmd_uname,    "uname [-a]    system identity" },
 	{ "whoami",   bi_whoami,    "whoami        current user" },
 	{ "which",    bi_which,     "which <name>  locate a command (built-in or file)" },
 	{ "loadkeys", cmd_loadkeys, "loadkeys <l>  set keyboard layout (us, fr)" },
 	{ "date",     bi_date,      "date          current date and time" },
-	{ "neofetch", bi_neofetch,  "neofetch      system info splash" },
-	{ "ping",     bi_ping,      "ping <host>   ICMP-echo a host or IP (e.g. google.com)" },
-	{ "dig",      bi_dig,       "dig <host> [t] DNS lookup; type t=A,AAAA,CNAME,MX,TXT,NS..." },
 	{ "ntp",      bi_ntp,       "ntp [host] [+/-tz] set the clock from an NTP server (tz hours)" },
 	{ NULL,       NULL,         "curl <url>    HTTP an http:// or https:// URL (-i headers, -X method, -o file)" },
 	{ "url",      cmd_url,      "url <url>     parse a URL into its parts and rebuild it" },
@@ -1883,12 +1847,65 @@ static int is_builtin(const char *name)
 	return builtin_find(name) != NULL;
 }
 
-/* Run a command's builtin handler with its console output captured into `buf`,
- * for the ring-3 terminal's bridge syscall: it lets the user-space shell reuse
- * every kernel builtin (journal, neofetch, lspci, cpuinfo, date, ...) without
- * each being re-implemented or given its own syscall. Returns the captured byte
- * count, or -1 if the first token isn't a builtin (so the caller can fall back
- * to launching a /bin program). */
+/* Ring-3 CLI tools whose console output the terminal captures and renders inline
+ * (like a kernel builtin), rather than launching them as a detached window. A
+ * GUI /bin app must NOT be listed — capturing it would block until it exits,
+ * which it never does. Misnaming only loses output, so this is the safe list. */
+static int is_capture_cli(const char *name)
+{
+	static const char *const cli[] = { "neofetch", "curl", "lspci", "play", "ping", "dig" };
+	for (unsigned i = 0; i < sizeof cli / sizeof cli[0]; i++)
+		if (streq(name, cli[i]))
+			return 1;
+	return 0;
+}
+
+/* Spawn a /bin CLI program and capture its console output into `buf`, blocking
+ * until it exits. The child runs in its OWN address space, so con_putc can't
+ * reach the caller's user buffer — capture into a kernel buffer and copy across
+ * at the end (we are back in the caller's CR3 by then). Returns bytes, or -1. */
+static int run_bin_capture(const char *cmd, char *buf, int max)
+{
+	static char kbuf[48 * 1024];        /* kernel BSS: mapped under every CR3   */
+	char line[256];
+	int k = 0;
+	for (; cmd[k] && k < (int)sizeof line - 1; k++)
+		line[k] = cmd[k];
+	line[k] = '\0';
+
+	char *argv[8];
+	int argc = tokenize(line, argv, 8);
+	if (argc == 0)
+		return -1;
+
+	con_capture_begin_ansi(kbuf, sizeof kbuf);
+	int pid = spawn(argc, argv);
+	if (pid < 0) {
+		con_capture_end();
+		return -1;
+	}
+	int status;
+	while (!sched_try_reap(pid, &status)) {
+		if (wm_focus_takes_keys()) {
+			char c;
+			while (keyboard_poll(&c)) wm_feed_key(c);
+			while (serial_poll(&c))   wm_feed_key(c);
+		}
+		__asm__ volatile ("sti; hlt");
+	}
+	int n = (int)con_capture_end();
+	if (n > max) n = max;
+	for (int i = 0; i < n; i++)
+		buf[i] = kbuf[i];
+	return n;
+}
+
+/* Run a command with its console output captured into `buf`, for the ring-3
+ * terminal's bridge syscall: it reuses every kernel builtin (journal, lspci,
+ * date, ...) AND every ring-3 CLI tool (neofetch, curl) without each being
+ * re-implemented or given its own syscall. Returns the captured byte count, or
+ * -1 if the first token is neither a builtin nor a capturable /bin program (so
+ * the caller can launch it as a detached GUI app instead). */
 int shell_exec_capture(const char *cmd, char *buf, int max)
 {
 	char name[64];
@@ -1900,12 +1917,202 @@ int shell_exec_capture(const char *cmd, char *buf, int max)
 	name[n] = '\0';
 	const struct builtin *b = builtin_find(name);
 	if (!b)
-		return -1;
+		return is_capture_cli(name) ? run_bin_capture(cmd, buf, max) : -1;
 	const char *arg = cmd + i;
 	while (*arg == ' ') arg++;
 	con_capture_begin_ansi(buf, (uint32_t)max);   /* keep colors for the terminal */
 	b->fn(arg);
 	return (int)con_capture_end();
+}
+
+/* ---- streaming command bridge (ring-3 terminal) -------------------------- */
+/* shell_exec_capture buffers a whole command, so the terminal freezes on a long
+ * or voluminous one (curl, ping) until it finishes, then dumps everything and is
+ * also capped by the user buffer. The streaming bridge instead runs the command
+ * in a persistent producer thread whose console output flows into a ring; the
+ * terminal drains the ring in chunks and renders as it goes. Kernel threads
+ * can't be reaped, so the runner is created once (shell_stream_start) and parked
+ * between commands. Single producer (runner/IRQ) + single consumer (terminal),
+ * so the ring is lock-free apart from a cli around the head update (a stray IRQ
+ * write can race the runner). */
+#define CMDR_RING_SZ 32768
+static char              cmdr_ring[CMDR_RING_SZ];
+static volatile uint32_t cmdr_w, cmdr_r;     /* free-running write / read counts  */
+static volatile int      cmdr_arm;           /* a command is queued or running    */
+static volatile int      cmdr_done;          /* producer finished; drain then EOF */
+static volatile int      cmdr_kill;          /* abort requested (Ctrl+C / close)  */
+static volatile int      cmdr_intr;          /* graceful interrupt already sent    */
+static volatile int      cmdr_child;         /* pid of the running CLI child, or 0 */
+static char              cmdr_cmd[256];
+static char              cmdr_cwd[256];
+
+/* con-capture sink: append one byte to the ring. The producer thread (IF=1)
+ * blocks for space when the ring is full so nothing is lost; a write from an
+ * IF-off context (a stray IRQ log) can't yield, so it drops rather than hang. */
+static void cmdr_sink(char c)
+{
+	for (;;) {
+		uint32_t fl;
+		__asm__ volatile ("pushf; pop %0; cli" : "=r"(fl));
+		if (cmdr_w - cmdr_r < CMDR_RING_SZ) {
+			cmdr_ring[cmdr_w % CMDR_RING_SZ] = c;
+			cmdr_w++;
+			if (fl & 0x200) __asm__ volatile ("sti");
+			return;
+		}
+		if (!(fl & 0x200)) return;            /* IF-off: can't drain, drop      */
+		__asm__ volatile ("sti");
+		sched_yield();                        /* let the terminal drain the ring */
+	}
+}
+
+/* Run one command with its output streamed to the ring -- builtin (in this
+ * thread) or a capturable /bin CLI tool (a child process; its output is global,
+ * so it lands in the ring too while we reap it). */
+static void cmdr_run(const char *cmd)
+{
+	char name[64];
+	int i = 0;
+	while (cmd[i] == ' ') i++;
+	int n = 0;
+	while (cmd[i] && cmd[i] != ' ' && n < (int)sizeof name - 1)
+		name[n++] = cmd[i++];
+	name[n] = '\0';
+
+	con_capture_begin_sink(cmdr_sink);
+	const struct builtin *b = builtin_find(name);
+	if (b) {
+		const char *arg = cmd + i;
+		while (*arg == ' ') arg++;
+		b->fn(arg);
+	} else {                                  /* a capturable /bin CLI tool      */
+		char line[256];
+		int k = 0;
+		for (; cmd[k] && k < (int)sizeof line - 1; k++)
+			line[k] = cmd[k];
+		line[k] = '\0';
+		char *argv[8];
+		int argc = tokenize(line, argv, 8);
+		int pid = argc > 0 ? spawn(argc, argv) : -1;
+		if (pid >= 0) {
+			cmdr_child = pid;             /* let an abort target it          */
+			int status;
+			while (!sched_try_reap(pid, &status)) {
+				if (cmdr_kill) sched_kill(pid);
+				__asm__ volatile ("sti; hlt");
+			}
+			cmdr_child = 0;
+		}
+	}
+	con_capture_end();
+}
+
+/* Persistent producer thread: park until shell_stream_begin arms a command, run
+ * it, signal EOF, then wait for the terminal to acknowledge before re-arming. */
+static void cmd_runner(void)
+{
+	for (;;) {
+		while (!cmdr_arm) __asm__ volatile ("sti; hlt");
+		sched_set_cwd_self(cmdr_cwd);         /* resolve relative paths like the bridge */
+		cmdr_run(cmdr_cmd);
+		cmdr_done = 1;                         /* terminal drains, then EOFs us   */
+		while (cmdr_arm) __asm__ volatile ("sti; hlt");
+	}
+}
+
+void shell_stream_start(void)
+{
+	sched_create_thread("cmdrunner", cmd_runner);
+}
+
+/* Begin streaming `cmd`. Returns 0 if it is a streamable command (builtin or a
+ * capturable CLI tool) -- the caller then drains with shell_stream_read; -1 if
+ * not, so the caller can launch it as a detached GUI app instead. One stream at
+ * a time (single ring + runner). */
+int shell_stream_begin(const char *cmd)
+{
+	if (cmdr_arm)
+		return -1;                            /* one at a time                   */
+	char name[64];
+	int i = 0;
+	while (cmd[i] == ' ') i++;
+	int n = 0;
+	while (cmd[i] && cmd[i] != ' ' && n < (int)sizeof name - 1)
+		name[n++] = cmd[i++];
+	name[n] = '\0';
+	if (!is_builtin(name) && !is_capture_cli(name))
+		return -1;
+
+	int k = 0;
+	for (; cmd[k] && k < (int)sizeof cmdr_cmd - 1; k++)
+		cmdr_cmd[k] = cmd[k];
+	cmdr_cmd[k] = '\0';
+	str_copy(cmdr_cwd, sched_cwd());
+	cmdr_w = cmdr_r = 0;
+	cmdr_done = 0;
+	cmdr_kill = 0;
+	cmdr_intr = 0;
+	cmdr_child = 0;
+	cmdr_arm = 1;                             /* wake the runner                 */
+	return 0;
+}
+
+/* Whether a streamed command is currently running. */
+int shell_stream_active(void)
+{
+	return cmdr_arm;
+}
+
+/* Ctrl+C on a running command. Two-stage, Linux-like: the first press echoes
+ * "^C" (the terminal's job, not each program's — so curl/ping/torrent stay
+ * silent) and delivers a cooperative interrupt to a CLI child so it can tear
+ * down its own TCP/TLS and exit cleanly; a second press (or a builtin, which
+ * can't observe the latch) hard-kills. The "^C" goes through the active capture
+ * sink, so it lands in the terminal that owns the command. */
+void shell_stream_interrupt(void)
+{
+	if (!cmdr_intr) {
+		cmdr_intr = 1;
+		con_write("^C\n");
+		if (cmdr_child > 0)
+			sched_set_intr(cmdr_child);   /* graceful: curl/ping/... abort   */
+		else
+			cmdr_kill = 1;                /* builtin: best-effort            */
+		return;
+	}
+	cmdr_kill = 1;                            /* second Ctrl+C: force          */
+	if (cmdr_child > 0)
+		sched_kill(cmdr_child);
+}
+
+/* Abort the running command without the "^C" echo (terminal close): hard-kill a
+ * CLI child so the runner's reap returns and the stream resets promptly. */
+void shell_stream_abort(void)
+{
+	cmdr_kill = 1;
+	if (cmdr_child > 0)
+		sched_kill(cmdr_child);
+}
+
+/* Drain up to `max` bytes of the running command's output into `buf`. Returns
+ * the byte count (>0), 0 if it is still running with nothing buffered yet, or -1
+ * at end of output (which also releases the runner to park). */
+int shell_stream_read(char *buf, int max)
+{
+	uint32_t avail = cmdr_w - cmdr_r;
+	if (avail) {
+		int n = (int)avail;
+		if (n > max) n = max;
+		for (int i = 0; i < n; i++)
+			buf[i] = cmdr_ring[(cmdr_r + (uint32_t)i) % CMDR_RING_SZ];
+		cmdr_r += (uint32_t)n;
+		return n;
+	}
+	if (cmdr_done) {
+		cmdr_arm = 0;                         /* let the runner re-arm           */
+		return -1;
+	}
+	return 0;
 }
 
 static void cmd_help(const char *a)

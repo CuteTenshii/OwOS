@@ -15,8 +15,8 @@
 #include "io.h"
 #include "irq.h"
 #include "console.h"
-#include "fs.h"
 #include "keyboard.h"
+#include "timer.h"
 
 /* DSP / mixer ports (offsets from the 0x220 base). */
 #define SB_BASE     0x220
@@ -167,157 +167,126 @@ static void dma_setup_autoinit(uint32_t phys, uint32_t count)
 	outb(DMA_MASK, SB_DMA);                 /* unmask -- transfer may begin     */
 }
 
-/* ---- WAV parsing + streaming ------------------------------------------- */
+/* ---- streaming PCM sink (fed from ring 3) ------------------------------
+ *
+ * Like hda.c, the WAV parse + resample now run in ring 3 (/bin/play); it pushes
+ * the canonical 48 kHz/16-bit/stereo stream here over the SYS_AUDIO_* syscalls.
+ * This back end down-converts each frame to one 8-bit unsigned mono sample (all
+ * the SB16's 8-bit DAC takes) and plays it at 48 kHz over the auto-init DMA
+ * buffer. The card raises IRQ 5 at each half boundary; the producer paces itself
+ * to those, filling the half the card has just left — so it self-throttles to
+ * the output rate without buffering the whole file. One stream at a time. */
+static int s_active;       /* a stream is open                                  */
+static int s_started;      /* both halves primed, DMA running                   */
+static int s_half;         /* half currently being filled by the producer (0/1) */
+static uint32_t s_pos;     /* fill cursor within that half (mono bytes)         */
 
-
-
-static int tag_eq(const uint8_t *p, const char *s)
+/* Kick off the continuous auto-init transfer at 48 kHz, unsigned 8-bit mono. */
+static void sb_start(void)
 {
-	return p[0] == s[0] && p[1] == s[1] && p[2] == s[2] && p[3] == s[3];
-}
-
-/* Fill one HALF-byte buffer with the next slice of audio, down-converting each
- * frame to one 8-bit unsigned mono sample and padding any shortfall at EOF with
- * silence (0x80). Advances *consumed. Returns the count of real audio samples. */
-static uint32_t fill_half(uint8_t *dst, const char *fn, uint32_t data_off,
-                          uint32_t data_len, uint32_t *consumed,
-                          uint16_t bits, uint16_t channels, uint32_t frame)
-{
-	static uint8_t in[HALF * 4];           /* worst case: 16-bit stereo input  */
-	uint32_t produced = 0;
-
-	if (*consumed < data_len) {
-		uint32_t in_bytes = HALF * frame;
-		if (*consumed + in_bytes > data_len)
-			in_bytes = data_len - *consumed;
-		int r = fs_read_at(fn, data_off + *consumed, in, in_bytes);
-		if (r > 0) {
-			uint32_t frames = (uint32_t)r / frame;
-			for (uint32_t i = 0; i < frames; i++) {
-				const uint8_t *s = in + i * frame;
-				int v;
-				if (bits == 8) {
-					v = (channels == 2) ? ((int)s[0] + s[1]) / 2 : s[0];
-				} else {
-					int v0 = (int16_t)load_le16(s);
-					if (channels == 2)
-						v0 = (v0 + (int16_t)load_le16(s + 2)) / 2;
-					v = (v0 >> 8) + 128;
-				}
-				dst[i] = (uint8_t)v;
-			}
-			produced = frames;
-			*consumed += frames * frame;
-		}
-	}
-	for (uint32_t i = produced; i < HALF; i++)     /* pad the rest with silence */
-		dst[i] = 128;
-	return produced;
-}
-
-int sb16_play_wav(const char *fn)
-{
-	if (!present) {
-		con_write("play: no sound card (start QEMU with -device sb16)\n");
-		return -1;
-	}
-
-	int fsize = fs_size(fn);
-	if (fsize < 0) {
-		con_write("play: no such file: ");
-		con_write(fn);
-		con_putc('\n');
-		return -1;
-	}
-
-	uint8_t hdr[256];
-	int got = fs_read_at(fn, 0, hdr, sizeof(hdr));
-	if (got < 44 || !tag_eq(hdr, "RIFF") || !tag_eq(hdr + 8, "WAVE")) {
-		con_write("play: not a WAV file\n");
-		return -1;
-	}
-
-	/* Walk the chunk list for "fmt " and "data" (other chunks may sit between
-	 * them). Both normally live within the first few dozen bytes. */
-	uint16_t fmt = 0, channels = 0, bits = 0;
-	uint32_t rate = 0, data_off = 0, data_len = 0;
-	for (uint32_t pos = 12; pos + 8 <= (uint32_t)got; ) {
-		const uint8_t *c = hdr + pos;
-		uint32_t sz = load_le32(c + 4);
-		if (tag_eq(c, "fmt ")) {
-			fmt      = load_le16(c + 8);
-			channels = load_le16(c + 10);
-			rate     = load_le32(c + 12);
-			bits     = load_le16(c + 22);
-		} else if (tag_eq(c, "data")) {
-			data_off = pos + 8;
-			data_len = sz;
-			break;
-		}
-		pos += 8 + sz + (sz & 1);       /* chunks are word-aligned              */
-	}
-
-	if (!data_off || fmt != 1 || (bits != 8 && bits != 16) ||
-	    channels < 1 || channels > 2) {
-		con_write("play: unsupported WAV (need PCM 8/16-bit mono/stereo)\n");
-		return -1;
-	}
-	if (data_off + data_len > (uint32_t)fsize)      /* clamp to the real file   */
-		data_len = (uint32_t)fsize - data_off;
-	if (rate < 4000)  rate = 4000;
-	if (rate > 44100) rate = 44100;
-
-	uint32_t frame = (uint32_t)channels * (bits / 8);   /* bytes per input frame */
-	uint32_t consumed = 0;
-
-	keyboard_take_interrupt();              /* drop any stale Ctrl+C            */
 	dsp_write(0xD1);                        /* speaker on                       */
-
-	/* Prime both halves, then start a continuous auto-init transfer over the
-	 * whole buffer. The DSP raises an IRQ every HALF bytes but keeps playing. */
-	fill_half(dma_buf,        fn, data_off, data_len, &consumed, bits, channels, frame);
-	fill_half(dma_buf + HALF, fn, data_off, data_len, &consumed, bits, channels, frame);
-
 	irq_count = 0;
 	dma_setup_autoinit((uint32_t)dma_buf, DMABUF);
 	dsp_write(0x41);                        /* set output sample rate (Hz)      */
-	dsp_write((rate >> 8) & 0xFF);
-	dsp_write(rate & 0xFF);
+	dsp_write((48000 >> 8) & 0xFF);
+	dsp_write(48000 & 0xFF);
 	dsp_write(0xC6);                        /* 8-bit auto-init DAC              */
 	dsp_write(0x00);                        /* mode: unsigned mono              */
 	dsp_write((HALF - 1) & 0xFF);           /* IRQ interval = one half          */
 	dsp_write(((HALF - 1) >> 8) & 0xFF);
+}
 
-	/* On each block IRQ, refill the half that just finished (the one the card
-	 * is no longer reading) while the other half keeps playing -- so the DAC
-	 * never starves. After the stream ends, drain two more halves of silence. */
-	int interrupted = 0, last = 0, next = 0, drain = 0;
-	for (;;) {
-		while (irq_count == last) {
-			if (keyboard_take_interrupt()) {
-				interrupted = 1;
-				break;
-			}
-			__asm__ volatile ("hlt");
+/* Block until the card is no longer playing half H (so we can refill it).
+ * Returns -2 if Ctrl+C is pressed. The card plays half (irq_count & 1). */
+static int sb_wait_half_free(int H)
+{
+	while ((irq_count & 1) == H) {
+		if (keyboard_take_interrupt())
+			return -2;
+		timer_sleep(2);
+	}
+	return 0;
+}
+
+int sb16_stream_open(void)
+{
+	if (!present)
+		return -1;
+	set_mixer_volume();
+	s_active = 1;
+	s_started = 0;
+	s_half = 0;
+	s_pos = 0;
+	keyboard_take_interrupt();              /* drop any stale Ctrl+C            */
+	return 0;
+}
+
+/* Push `bytes` of 48 kHz/S16/stereo PCM, blocking until queued. Returns bytes
+ * consumed, -1 if no stream is open, or -2 if Ctrl+C was pressed. */
+int sb16_stream_write(const void *pcm, uint32_t bytes)
+{
+	if (!s_active)
+		return -1;
+	const uint8_t *p = pcm;
+	uint32_t frames = bytes / 4;            /* 4 bytes per S16-stereo frame     */
+	for (uint32_t fi = 0; fi < frames; fi++) {
+		if (s_started && s_pos == 0) {      /* about to (re)fill a half         */
+			if (sb_wait_half_free(s_half) < 0)
+				return -2;
 		}
-		if (interrupted)
-			break;
-		last = irq_count;
+		const uint8_t *s = p + fi * 4;
+		int l = (int16_t)load_le16(s);
+		int r = (int16_t)load_le16(s + 2);
+		int m = (l + r) / 2;
+		dma_buf[s_half * HALF + s_pos] = (uint8_t)((m >> 8) + 128);
+		if (++s_pos == HALF) {
+			s_pos = 0;
+			if (!s_started) {
+				if (s_half == 0) {
+					s_half = 1;             /* prime the second half            */
+				} else {
+					sb_start();             /* both halves primed -> go         */
+					s_started = 1;
+					s_half = 0;             /* refill half 0 once it's played   */
+				}
+			} else {
+				s_half ^= 1;
+			}
+		}
+	}
+	return (int)(frames * 4);
+}
 
-		if (consumed < data_len) {
-			fill_half(dma_buf + next * HALF, fn, data_off, data_len,
-			          &consumed, bits, channels, frame);
-		} else {
-			if (drain >= 2)
+void sb16_stream_close(void)
+{
+	if (!s_active)
+		return;
+
+	if (!s_started) {
+		/* Clip shorter than two halves: pad with silence and play it once. */
+		uint32_t real = (uint32_t)s_half * HALF + s_pos;
+		for (uint32_t i = s_pos; i < HALF; i++)
+			dma_buf[s_half * HALF + i] = 128;
+		if (s_half == 0)
+			for (uint32_t i = 0; i < HALF; i++)
+				dma_buf[HALF + i] = 128;
+		sb_start();
+		s_started = 1;
+		timer_sleep(real / 48 + 40);        /* 48 bytes/ms at 48 kHz mono + tail */
+	} else {
+		/* Follow the last real audio with two halves of silence, then drain. */
+		for (int k = 0; k < 2; k++) {
+			if (sb_wait_half_free(s_half) < 0)
 				break;
 			for (uint32_t i = 0; i < HALF; i++)
-				dma_buf[next * HALF + i] = 128;     /* trailing silence */
-			drain++;
+				dma_buf[s_half * HALF + i] = 128;
+			s_half ^= 1;
 		}
-		next ^= 1;
+		timer_sleep(HALF / 48 + 40);
 	}
 
 	dsp_write(0xD0);                        /* halt the DMA                     */
 	dsp_write(0xD3);                        /* speaker off                      */
-	return interrupted ? 1 : 0;
+	s_active = 0;
+	s_started = 0;
 }

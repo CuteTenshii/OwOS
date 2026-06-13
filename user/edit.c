@@ -33,14 +33,6 @@ static char filename[24];
 static char loadbuf[LOAD_MAX];
 static char savebuf[LOAD_MAX + MAX_LINES];   /* room for a '\n' after each line */
 
-static int slen(const char *s)
-{
-	int n = 0;
-	while (s[n])
-		n++;
-	return n;
-}
-
 static void copy_line(char *dst, const char *src)
 {
 	int i = 0;
@@ -179,7 +171,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	copy_line(filename, argv[1]);
-	if (slen(filename) > 23)            /* owofs name limit (FS_NAME_LEN) */
+	if (strlen(filename) > 23)            /* owofs name limit (FS_NAME_LEN) */
 		filename[23] = '\0';
 
 	int n = readfile(filename, loadbuf, LOAD_MAX);

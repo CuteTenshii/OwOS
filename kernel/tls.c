@@ -29,18 +29,6 @@
 
 /* ------------------------------------------------------------------ helpers */
 
-static void tmemmove(uint8_t *d, const uint8_t *s, uint32_t n)
-{
-	if (d < s) {
-		while (n--)
-			*d++ = *s++;
-	} else {
-		d += n; s += n;
-		while (n--)
-			*--d = *--s;
-	}
-}
-
 static uint32_t rdtsc_mix(void)
 {
 	uint32_t lo, hi;
@@ -143,7 +131,7 @@ static int raw_fill(uint32_t need)
 {
 	while (rxlen - rxpos < need) {
 		if (rxpos > 0) {
-			tmemmove(rxraw, rxraw + rxpos, rxlen - rxpos);
+			memmove(rxraw, rxraw + rxpos, rxlen - rxpos);
 			rxlen -= rxpos;
 			rxpos = 0;
 		}
@@ -316,7 +304,7 @@ static int hs_fill(uint32_t need)
 		if (type != REC_HS)
 			return -1;
 		if (hspos > 0) {
-			tmemmove(hsbuf, hsbuf + hspos, hslen - hspos);
+			memmove(hsbuf, hsbuf + hspos, hslen - hspos);
 			hslen -= hspos;
 			hspos = 0;
 		}
@@ -351,14 +339,6 @@ static int hs_next(uint8_t *mtype, uint8_t **body, uint32_t *blen)
 
 /* ----------------------------------------------- TLS 1.3 key schedule */
 
-static uint32_t sstrlen(const char *s)
-{
-	uint32_t n = 0;
-	while (s[n])
-		n++;
-	return n;
-}
-
 /* HKDF-Expand-Label (RFC 8446 §7.1): wraps the secret expansion with the
  * "tls13 "-prefixed label and a context (here always a transcript hash). */
 static void hkdf_expand_label(const uint8_t secret[32], const char *label,
@@ -366,7 +346,7 @@ static void hkdf_expand_label(const uint8_t secret[32], const char *label,
                               uint8_t *out, uint16_t outlen)
 {
 	uint8_t info[2 + 1 + 6 + 32 + 1 + 32];
-	uint32_t p = 0, ll = sstrlen(label);
+	uint32_t p = 0, ll = strlen(label);
 	info[p++] = (uint8_t)(outlen >> 8);
 	info[p++] = (uint8_t)outlen;
 	info[p++] = (uint8_t)(6 + ll);

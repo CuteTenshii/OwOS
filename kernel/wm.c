@@ -30,6 +30,9 @@
 #include "edid.h"
 #include "crash.h"
 #include "battery.h"
+#include "sb16.h"
+#include "hda.h"
+#include "power.h"
 
 #define MAXWIN 40    /* compositor window slots: app windows + terminal + chrome */
 static struct window wins[MAXWIN];
@@ -45,9 +48,50 @@ int wm_screen_h(void) { return screen_h; }
 #define START_W   70         /* width of the "OwOS" Start button              */
 #define SM_ITEM_H 20         /* start-menu item height                        */
 #define SM_W      150        /* start-menu popup width                        */
+#define SM_SEP_H  9          /* separator strip above the power actions       */
 static int start_open;
-static int sm_h(void)  { return apps_menu_count() * SM_ITEM_H; }
+
+/* Power actions live at the bottom of the Start menu, below the app list and a
+ * separator. They aren't /bin programs (apps.c) — they call straight into
+ * power.c. "Sleep" (ACPI S3) is only listed when the firmware actually supports
+ * it (power_can_sleep, cached at wm_init): VMware and other hosts that don't
+ * expose S3 would otherwise show a dead button. */
+enum { PA_SLEEP, PA_RESTART, PA_SHUTDOWN };
+static int sleep_ok;                 /* ACPI S3 available? (probed once)        */
+
+static int sm_power_n(void) { return sleep_ok ? 3 : 2; }
+/* Map a power-section row to a PA_* action: with no Sleep, row 0 is Restart. */
+static int sm_power_action(int row) { return sleep_ok ? row : row + 1; }
+static const char *sm_power_label(int row)
+{
+	switch (sm_power_action(row)) {
+	case PA_SLEEP:   return "Sleep";
+	case PA_RESTART: return "Restart";
+	default:         return "Shut Down";
+	}
+}
+
+static int sm_apps_h(void) { return apps_menu_count() * SM_ITEM_H; }
+static int sm_h(void)  { return sm_apps_h() + SM_SEP_H + sm_power_n() * SM_ITEM_H; }
 static int sm_top(void){ return screen_h - WM_BAR_H - sm_h(); }
+
+/* Set after an S3 resume so the next compositor frame repaints the whole screen
+ * (the panel may have been powered down and redrawn from scratch). */
+static int force_full;
+
+/* Title-bar buttons, laid out right-to-left: slot 0 = close, 1 = maximize,
+ * 2 = minimize. Each is a TB_BTN_W square; the close box keeps its original
+ * w->w-18 position so slot N sits one button + gap further left. */
+#define TB_BTN_W   14
+#define TB_BTN_GAP 3
+
+/* Taskbar window-button band, between the Start button and the right-side
+ * clock/battery/volume indicators. draw_taskbar publishes the indicators' left
+ * edge here each frame so the input hit-test (which runs before compose) can
+ * lay the buttons out the same way. */
+#define TB_WIN_GAP 4
+static int tb_band_right;
+static int tb_band_left(void) { return START_W + 6; }
 
 /* Bitmap cursors: 'X' outline (black), '.' fill (white), ' ' transparent. Each
  * shape declares a hotspot — the pixel that actually points, drawn at the mouse
@@ -178,6 +222,150 @@ static int window_at(int px, int py)
 	return -1;
 }
 
+/* --------------------------------------------------- minimize / maximize */
+
+/* Live-resize hand-off state (shared by the grip drag in handle_input and the
+ * programmatic maximize/restore below). The frame size trails a target; the app
+ * is re-handed it only once it has acked the previous size by presenting, so
+ * each buffer realloc/remap in on_resize lands while the app is parked in
+ * win_wait, never mid-paint. The tracker outlives the gesture until the app's
+ * content catches up to the final size. */
+static int      rsz_win = -1;
+static int      rsz_target_w, rsz_target_h;
+static int      rsz_sent_w, rsz_sent_h;
+static uint32_t rsz_ack;
+
+/* Move/resize a window's frame now, and (if it has an on_resize) start the
+ * settle hand-off so its client buffer follows. Used by maximize and restore. */
+static void resize_to(int idx, int nx, int ny, int nw, int nh)
+{
+	struct window *w = &wins[idx];
+	w->x = nx; w->y = ny; w->w = nw; w->h = nh;
+	if (w->on_resize) {
+		rsz_win = idx;
+		rsz_target_w = nw; rsz_target_h = nh;
+		rsz_sent_w = rsz_sent_h = -1;   /* force the first hand-off */
+		rsz_ack = 0;
+	}
+}
+
+static void wm_minimize(int idx)
+{
+	wins[idx].visible = 0;
+	wins[idx].minimized = 1;
+}
+
+/* Bring a minimized (or merely lowered) window back up and focus it. */
+static void wm_unminimize(int idx)
+{
+	wins[idx].minimized = 0;
+	wins[idx].visible = 1;
+	raise_window(idx);
+}
+
+static void wm_toggle_maximize(int idx)
+{
+	struct window *w = &wins[idx];
+	if (w->maximized) {
+		w->maximized = 0;
+		resize_to(idx, w->saved_x, w->saved_y, w->saved_w, w->saved_h);
+	} else {
+		w->saved_x = w->x; w->saved_y = w->y;
+		w->saved_w = w->w; w->saved_h = w->h;
+		w->maximized = 1;
+		/* Fill the desktop work area, NOT the whole screen: the title bar and
+		 * the taskbar both stay visible (maximize, not fullscreen). */
+		resize_to(idx, 0, 0, screen_w, screen_h - WM_BAR_H);
+	}
+}
+
+/* Title-bar buttons by kind: 0=close, 1=maximize, 2=minimize. Close follows
+ * w->closable; maximize follows w->resizable; minimize is always offered. */
+static int btn_present(struct window *w, int kind)
+{
+	if (kind == 0) return w->closable;
+	if (kind == 1) return w->resizable;
+	return 1;                       /* minimize */
+}
+
+/* Packed slot index from the right edge (0 = rightmost), or -1 if this button
+ * isn't shown. The kinds are ordered close > maximize > minimize from the right,
+ * and absent ones are skipped so the rest close up — no gap when, e.g., a
+ * non-resizable window omits maximize. */
+static int btn_slot(struct window *w, int kind)
+{
+	if (!btn_present(w, kind))
+		return -1;
+	int slot = 0;
+	if (kind > 0 && btn_present(w, 0)) slot++;   /* close sits right of these */
+	if (kind > 1 && btn_present(w, 1)) slot++;   /* maximize right of minimize */
+	return slot;
+}
+
+/* Fill *bx,*by with button `kind`'s top-left; return 1 if it's shown, else 0. */
+static int titlebtn_box(struct window *w, int kind, int *bx, int *by)
+{
+	int slot = btn_slot(w, kind);
+	if (slot < 0)
+		return 0;
+	*bx = w->x + w->w - 4 - (slot + 1) * TB_BTN_W - slot * TB_BTN_GAP;
+	*by = w->y + 4;
+	return 1;
+}
+
+/* Which title-bar button is under (mx,my): kind 0/1/2, or -1 for none. */
+static int titlebtn_hit(struct window *w, int mx, int my)
+{
+	for (int k = 0; k < 3; k++) {
+		int bx, by;
+		if (!titlebtn_box(w, k, &bx, &by))
+			continue;
+		if (mx >= bx && mx < bx + TB_BTN_W && my >= by && my < by + TB_BTN_W)
+			return k;
+	}
+	return -1;
+}
+
+/* Lay the taskbar window buttons across the band [left,right): one per live
+ * (non-dead) window. Fills idxs/bxs/bws and returns the count. Both the painter
+ * and the hit-test call this so they always agree. */
+static int taskbar_layout(int left, int right, int *idxs, int *bxs, int *bws,
+                          int max)
+{
+	int n = 0;
+	for (int i = 0; i < nwin && n < max; i++)
+		if (!wins[i].dead)
+			idxs[n++] = i;
+	if (n == 0)
+		return 0;
+	int avail = right - left;
+	if (avail < n)            /* nothing sensible fits */
+		return 0;
+	int bw = avail / n;
+	if (bw > 168)
+		bw = 168;
+	for (int k = 0; k < n; k++) {
+		bxs[k] = left + k * bw;
+		bws[k] = bw - TB_WIN_GAP;
+		if (bws[k] < 1)
+			bws[k] = 1;
+	}
+	return n;
+}
+
+/* The live window whose taskbar button is under (mx,my), or -1. */
+static int taskbar_hit(int mx, int my)
+{
+	if (my < screen_h - WM_BAR_H)
+		return -1;
+	int idxs[MAXWIN], bxs[MAXWIN], bws[MAXWIN];
+	int n = taskbar_layout(tb_band_left(), tb_band_right, idxs, bxs, bws, MAXWIN);
+	for (int k = 0; k < n; k++)
+		if (mx >= bxs[k] && mx < bxs[k] + bws[k])
+			return idxs[k];
+	return -1;
+}
+
 /* --------------------------------------------------------------- rendering */
 
 static void draw_background(void)
@@ -202,10 +390,28 @@ static void draw_window(struct window *w, int focused)
 	fb_fill_rect(w->x, w->y, w->w, WM_TITLE_H, title_bg);
 	fb_ui_text(w->x + 8, w->y + (WM_TITLE_H - UIFONT_H) / 2, w->title, 0xffffff);
 
-	if (w->closable) {
-		int bx = w->x + w->w - 18, by = w->y + 4;
-		fb_fill_rect(bx, by, 14, 14, 0xc04030);
-		fb_text(bx + 3, by - 1, "x", 0xffffff, 0xc04030);
+	/* Title-bar buttons, right to left: close, maximize/restore, minimize. */
+	int bx, by;
+	if (titlebtn_box(w, 2, &bx, &by)) {            /* minimize: a low bar  */
+		fb_fill_rect(bx, by, TB_BTN_W, TB_BTN_W, 0x3a4658);
+		fb_fill_rect(bx + 3, by + 9, 8, 2, 0xffffff);
+	}
+	if (titlebtn_box(w, 1, &bx, &by)) {            /* maximize / restore   */
+		fb_fill_rect(bx, by, TB_BTN_W, TB_BTN_W, 0x3a4658);
+		if (w->maximized) {                        /* restore: two squares */
+			fb_rect(bx + 4, by + 2, 6, 6, 0xffffff);
+			fb_fill_rect(bx + 2, by + 5, 6, 6, 0x3a4658);
+			fb_rect(bx + 2, by + 5, 6, 6, 0xffffff);
+		} else {                                   /* maximize: one square */
+			fb_rect(bx + 3, by + 3, 8, 8, 0xffffff);
+		}
+	}
+	if (titlebtn_box(w, 0, &bx, &by)) {            /* close: an X glyph    */
+		fb_fill_rect(bx, by, TB_BTN_W, TB_BTN_W, 0xc04030);
+		for (int d = 0; d < 7; d++) {              /* two 1px diagonals     */
+			fb_pixel(bx + 4 + d, by + 4 + d, 0xffffff);
+			fb_pixel(bx + 10 - d, by + 4 + d, 0xffffff);
+		}
 	}
 
 	/* Client area inset by the border and below the title bar. */
@@ -319,7 +525,7 @@ static void draw_cursor(int kind, int mx, int my)
  * draw when a real percentage (0..100) comes back: some hypervisors (VMware)
  * advertise a phantom battery whose _BST can't be evaluated, and that simply
  * fails the read here and shows nothing rather than a bogus gauge. */
-static void draw_battery(int clock_x, int y)
+static int draw_battery(int clock_x, int y)
 {
 	static int last_poll = -1000;
 	static int cached_pct = -1;
@@ -329,12 +535,12 @@ static void draw_battery(int clock_x, int y)
 	if (now - last_poll >= 30 || last_poll == -1000) {
 		last_poll = now;
 		if (battery_present())
-			cached_pct = battery_percent(&cached_charging, 0);
+			cached_pct = battery_percent(&cached_charging, 0, 0);
 		else
 			cached_pct = -1;
 	}
 	if (cached_pct < 0 || cached_pct > 100)
-		return;   /* no real battery, or the reading couldn't be taken */
+		return clock_x;   /* no real battery, or the reading couldn't be taken */
 
 	char s[5];   /* "100%" + NUL */
 	int n = 0;
@@ -365,6 +571,104 @@ static void draw_battery(int clock_x, int y)
 		fb_fill_rect(x + 2, iy + 2, lvl, icon_h - 4, fill);
 
 	fb_ui_text(x + icon_w + nub_w + 6, y + (WM_BAR_H - UIFONT_H) / 2, s, 0xc8d0dc);
+	return x;
+}
+
+/* Volume indicator: a speaker glyph + "<device> NN%", drawn just left of the
+ * battery (or the clock when there's no battery). `anchor_x` is that neighbour's
+ * left edge. Shows whichever card owns output — HDA if present, else SB16 — so
+ * the active device and level are both visible. Reflects a key press on the next
+ * taskbar repaint (≤ 1 s). Draws nothing when there's no sound card. */
+static int draw_volume(int anchor_x, int y)
+{
+	int vol;
+	const char *dev;
+	if (hda_present())       { vol = hda_volume();  dev = "HDA";  }
+	else if (sb16_present()) { vol = sb16_volume(); dev = "SB16"; }
+	else                     return anchor_x;        /* no audio hardware */
+
+	int pct = vol * 100 / 8;                          /* 0..8 scale -> percent */
+	char s[12];                                       /* "SB16 100%" + NUL     */
+	int n = 0;
+	for (const char *d = dev; *d; d++) s[n++] = *d;
+	s[n++] = ' ';
+	if (pct >= 100)     { s[n++] = '1'; s[n++] = '0'; s[n++] = '0'; }
+	else if (pct >= 10) { s[n++] = '0' + pct / 10; s[n++] = '0' + pct % 10; }
+	else                  s[n++] = '0' + pct;
+	s[n++] = '%';
+	s[n] = 0;
+
+	int icon_w = 14, icon_h = 11;
+	int txt_w = fb_ui_width(s);
+	int total = icon_w + 6 + txt_w;
+	int x = anchor_x - 12 - total;
+	int iy = y + (WM_BAR_H - icon_h) / 2;
+
+	uint32_t col = (vol == 0) ? 0x808890 : 0xc8d0dc;  /* dim when muted / zero */
+
+	/* Speaker: a small square body, then a staircase "cone" that grows toward
+	 * the listener (no line/triangle primitive, so approximate with rects). */
+	int body = 5, by = iy + (icon_h - body) / 2;
+	fb_fill_rect(x, by, body, body, col);
+	for (int i = 0; i < 4; i++) {
+		int ch = 3 + i * 2;
+		fb_fill_rect(x + body + i, iy + (icon_h - ch) / 2, 1, ch, col);
+	}
+	/* Sound waves: one or two ticks to the right, scaled to how loud it is. */
+	if (vol > 0) {
+		int wx = x + body + 5;
+		fb_fill_rect(wx, iy + 3, 1, icon_h - 6, col);
+		if (vol >= 4) fb_fill_rect(wx + 2, iy + 1, 1, icon_h - 2, col);
+	}
+
+	fb_ui_text(x + icon_w + 6, y + (WM_BAR_H - UIFONT_H) / 2, s, col);
+	return x;
+}
+
+/* Draw UI text at (x,y) in colour `col`, truncated with ".." to fit `maxw`
+ * pixels — the taskbar buttons are narrow and titles are arbitrary. */
+static void ui_text_clip(int x, int y, const char *s, uint32_t col, int maxw)
+{
+	char buf[WM_TITLE_MAX + 2];
+	int n = 0;
+	for (; s[n] && n < WM_TITLE_MAX; n++)
+		buf[n] = s[n];
+	buf[n] = '\0';
+	if (maxw <= 0)
+		return;
+	if (fb_ui_width(buf) <= maxw) {
+		fb_ui_text(x, y, buf, col);
+		return;
+	}
+	while (n > 0) {                       /* shrink until "text.." fits */
+		buf[n] = '.'; buf[n + 1] = '.'; buf[n + 2] = '\0';
+		if (fb_ui_width(buf) <= maxw)
+			break;
+		buf[n] = '\0';
+		n--;
+	}
+	if (n > 0)
+		fb_ui_text(x, y, buf, col);
+}
+
+/* A button per live window, between the Start button and the right indicators.
+ * The focused window's button is highlighted; a minimized one is dimmed. */
+static void draw_taskbar_windows(int y, int uy, int right)
+{
+	tb_band_right = right;
+	int idxs[MAXWIN], bxs[MAXWIN], bws[MAXWIN];
+	int n = taskbar_layout(tb_band_left(), right, idxs, bxs, bws, MAXWIN);
+	int focus = topmost_visible();
+	int by = y + 3, bh = WM_BAR_H - 6;
+	for (int k = 0; k < n; k++) {
+		struct window *w = &wins[idxs[k]];
+		int active = (idxs[k] == focus);
+		uint32_t bg = active ? 0x2f6fb0 : w->minimized ? 0x12161e : 0x1d2533;
+		fb_fill_rect(bxs[k], by, bws[k], bh, bg);
+		fb_fill_rect(bxs[k], by, bws[k], 1, active ? 0x4f8fd0 : 0x2a3550);
+		uint32_t fg = w->minimized ? 0x8b94a4 : 0xc8d0dc;
+		ui_text_clip(bxs[k] + 8, uy, w->title, fg, bws[k] - 12);
+	}
 }
 
 static void draw_taskbar(void)
@@ -386,7 +690,8 @@ static void draw_taskbar(void)
 	int clock_x = screen_w - fb_ui_width(s) - 12;
 	fb_ui_text(clock_x, uy, s, 0xc8d0dc);
 
-	draw_battery(clock_x, y);
+	int ind_left = draw_volume(draw_battery(clock_x, y), y);
+	draw_taskbar_windows(y, uy, ind_left - 10);
 }
 
 /* The Start menu popup, listing the launchable apps above the taskbar. */
@@ -398,6 +703,14 @@ static void draw_start_menu(void)
 	for (int i = 0; i < n; i++) {
 		int iy = top + i * SM_ITEM_H;
 		fb_ui_text(10, iy + (SM_ITEM_H - UIFONT_H) / 2, apps_menu_name(i), 0xc8d0dc);
+	}
+	/* Separator, then the power actions below it. */
+	int sep_y = top + sm_apps_h() + SM_SEP_H / 2;
+	fb_fill_rect(8, sep_y, SM_W - 16, 1, 0x05070a);
+	int py = top + sm_apps_h() + SM_SEP_H;
+	for (int i = 0; i < sm_power_n(); i++) {
+		int iy = py + i * SM_ITEM_H;
+		fb_ui_text(10, iy + (SM_ITEM_H - UIFONT_H) / 2, sm_power_label(i), 0xa8b4c4);
 	}
 	fb_rect(0, top, SM_W, sm_h(), 0x05070a);
 }
@@ -417,17 +730,18 @@ static int pick_cursor(int mx, int my)
 	if (hover_settling) return WM_CURSOR_BUSY;
 
 	int bar_y = screen_h - WM_BAR_H;
-	if (my >= bar_y)
-		return (mx >= 0 && mx < START_W) ? WM_CURSOR_HAND : WM_CURSOR_ARROW;
+	if (my >= bar_y) {
+		if (mx >= 0 && mx < START_W)
+			return WM_CURSOR_HAND;
+		return taskbar_hit(mx, my) >= 0 ? WM_CURSOR_HAND : WM_CURSOR_ARROW;
+	}
 	if (start_open && mx >= 0 && mx < SM_W && my >= sm_top())
 		return WM_CURSOR_HAND;
 
 	int idx = window_at(mx, my);
 	if (idx >= 0) {
 		struct window *w = &wins[idx];
-		if (w->closable &&
-		    mx >= w->x + w->w - 18 && mx < w->x + w->w - 4 &&
-		    my >= w->y + 4 && my < w->y + 18)
+		if (titlebtn_hit(w, mx, my) >= 0)
 			return WM_CURSOR_HAND;
 		if (w->resizable &&
 		    mx >= w->x + w->w - WM_GRIP && mx < w->x + w->w &&
@@ -469,15 +783,8 @@ static void handle_input(int mx, int my, int buttons, int dz)
 	static int  app_dragging = -1;  /* window whose app captured the drag        */
 	static int  drag_dx, drag_dy;   /* dragging: cursor offset within the title */
 	static int  rsz_dx, rsz_dy;     /* resizing: cursor offset from bottom-right */
-	/* Live resize. The target frame size trails the cursor every frame; the app
-	 * is re-handed it only once it has presented (acked) the previous size, so
-	 * each buffer realloc/remap in uw_on_resize lands while the app is parked in
-	 * win_wait, never mid-paint. The tracker persists past button release until
-	 * the app's content has caught up to the final size. */
-	static int      rsz_win = -1;
-	static int      rsz_target_w, rsz_target_h;
-	static int      rsz_sent_w, rsz_sent_h;
-	static uint32_t rsz_ack;
+	/* The live-resize hand-off state (rsz_win/rsz_target/rsz_sent/rsz_ack) is at
+	 * file scope so maximize/restore can drive it too; see resize_to(). */
 
 	static int  prev_rdown;
 	int down = buttons & 1;        /* left button                              */
@@ -512,11 +819,42 @@ static void handle_input(int mx, int my, int buttons, int dz)
 			prev_down = down;
 			return;
 		}
+		/* A taskbar window button: restore a minimized window, minimize the
+		 * focused one, or raise any other. */
+		int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
+		if (tbw >= 0) {
+			start_open = 0;
+			if (wins[tbw].minimized)
+				wm_unminimize(tbw);
+			else if (tbw == topmost_visible())
+				wm_minimize(tbw);
+			else
+				raise_window(tbw);
+			prev_down = down;
+			return;
+		}
 		if (start_open) {
 			int top = sm_top();
 			if (mx >= 0 && mx < SM_W && my >= top && my < bar_y) {
-				apps_menu_launch((my - top) / SM_ITEM_H);   /* launch + close */
-				start_open = 0;
+				int rel = my - top;
+				if (rel < sm_apps_h()) {
+					apps_menu_launch(rel / SM_ITEM_H);   /* launch + close */
+					start_open = 0;
+				} else {
+					int prel = rel - sm_apps_h() - SM_SEP_H;
+					/* The SM_SEP_H separator gap is dead space (prel < 0). */
+					if (prel >= 0 && prel / SM_ITEM_H < sm_power_n()) {
+						start_open = 0;
+						switch (sm_power_action(prel / SM_ITEM_H)) {
+						case PA_SLEEP:                   /* ACPI S3 */
+							power_sleep();
+							force_full = 1;   /* repaint after resume */
+							break;
+						case PA_RESTART:  power_reset(); break;
+						case PA_SHUTDOWN: power_off();   break;
+						}
+					}
+				}
 				prev_down = down;
 				return;
 			}
@@ -526,15 +864,18 @@ static void handle_input(int mx, int my, int buttons, int dz)
 		if (idx >= 0) {
 			raise_window(idx);
 			struct window *w = &wins[idx];
-			/* Close box? An app with on_close is told (so it can free
-			 * resources / exit); otherwise the WM just hides the window. */
-			if (w->closable &&
-			    mx >= w->x + w->w - 18 && mx < w->x + w->w - 4 &&
-			    my >= w->y + 4 && my < w->y + 18) {
+			/* Title-bar buttons: close (app's on_close, else hide), maximize/
+			 * restore, or minimize to the taskbar. */
+			int tb = titlebtn_hit(w, mx, my);
+			if (tb == 0) {                        /* close                   */
 				if (w->on_close)
 					w->on_close(w);
 				else
 					w->visible = 0;
+			} else if (tb == 1) {                 /* maximize / restore      */
+				wm_toggle_maximize(idx);
+			} else if (tb == 2) {                 /* minimize                */
+				wm_minimize(idx);
 			} else if (w->resizable &&            /* bottom-right resize grip */
 			           mx >= w->x + w->w - WM_GRIP && mx < w->x + w->w &&
 			           my >= w->y + w->h - WM_GRIP && my < w->y + w->h) {
@@ -546,6 +887,16 @@ static void handle_input(int mx, int my, int buttons, int dz)
 				rsz_sent_w = rsz_sent_h = -1;  /* force the first hand-off  */
 				rsz_ack = 0;
 			} else if (my < w->y + WM_TITLE_H) {  /* grab the title bar      */
+				/* Dragging a maximized window restores its saved size and
+				 * follows the cursor (standard unmaximize-on-drag). */
+				if (w->maximized) {
+					int nw = w->saved_w, nh = w->saved_h;
+					int nx = mx - nw / 2;
+					if (nx < 0) nx = 0;
+					if (nx > screen_w - nw) nx = screen_w - nw;
+					w->maximized = 0;
+					resize_to(idx, nx, 0, nw, nh);
+				}
 				dragging = idx;
 				drag_dx = mx - w->x;
 				drag_dy = my - w->y;
@@ -759,7 +1110,8 @@ static void wm_thread(void)
 		handle_input(mx, my, btn, dz);
 
 		ndmg = 0;
-		int full = !inited;       /* only the very first frame paints all      */
+		int full = !inited || force_full;  /* first frame, or a wake repaint    */
+		force_full = 0;
 
 		/* Sample every window's dirty() value ONCE, before compose(), and reuse
 		 * it for both change-detection and next frame's baseline. dirty() is the
@@ -878,6 +1230,9 @@ void wm_init(void)
 
 	screen_w = (int)fb_width();
 	screen_h = (int)fb_height();
+
+	/* Probe ACPI S3 once; the Start menu shows "Sleep" only if it's available. */
+	sleep_ok = power_can_sleep();
 
 	/* Apps register their windows here; the terminal is created last so it
 	 * starts focused / on top (see apps.c). */

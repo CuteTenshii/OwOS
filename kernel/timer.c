@@ -98,5 +98,11 @@ void timer_sleep(uint32_t ms)
 	uint32_t wait = (ms * TIMER_HZ + 999) / 1000;
 	uint32_t target = ticks + wait;
 	while (ticks < target)
-		__asm__ volatile ("hlt");  /* woken by the timer IRQ                  */
+		/* sti *before* hlt, always: context_switch doesn't save/restore EFLAGS,
+		 * so this can be entered with IF=0 (e.g. resumed via a cooperative yield
+		 * from an interrupts-off context, like the xHCI poll thread servicing a
+		 * stalled USB device). A bare `hlt` then halts the CPU forever -- the
+		 * timer IRQ that advances `ticks` can never fire. This is the documented
+		 * "sti before hlt in every thread-context wait loop" invariant. */
+		__asm__ volatile ("sti; hlt");  /* woken by the timer IRQ            */
 }

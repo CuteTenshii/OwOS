@@ -21,6 +21,7 @@
 #include "smb.h"
 #include "rtc.h"
 #include "console.h"
+#include "kstring.h"
 #include <stdint.h>
 
 enum svc_state { SVC_STOPPED = 0, SVC_RUNNING };
@@ -43,31 +44,12 @@ typedef struct service {
 enum { SVC_BEAT, SVC_ECHOD, SVC_DAYTIMED, SVC_ECHOTCP, SVC_SMBD, SVC_COUNT };
 static service_t svc[SVC_COUNT];
 
-/* ------------------------------------------------------------ tiny utilities */
-
-static int svc_streq(const char *a, const char *b)
-{
-	while (*a && *b) {
-		if (*a != *b)
-			return 0;
-		a++; b++;
-	}
-	return *a == *b;
-}
-
-static int svc_strlen(const char *s)
-{
-	int n = 0;
-	while (s[n])
-		n++;
-	return n;
-}
 
 /* Write `s` left-justified in a field `width` columns wide. */
 static void write_field(const char *s, int width)
 {
 	con_write(s);
-	for (int i = svc_strlen(s); i < width; i++)
+	for (int i = strlen(s); i < width; i++)
 		con_putc(' ');
 }
 
@@ -270,7 +252,7 @@ static void svc_stop(service_t *s)
 static service_t *svc_find(const char *name)
 {
 	for (int i = 0; i < SVC_COUNT; i++)
-		if (svc_streq(svc[i].name, name))
+		if (streq(svc[i].name, name))
 			return &svc[i];
 	return 0;
 }
@@ -378,12 +360,12 @@ void services_cmd(const char *args)
 	while (*rest == ' ')
 		rest++;
 
-	if (verb[0] == '\0' || svc_streq(verb, "list")) {
+	if (verb[0] == '\0' || streq(verb, "list")) {
 		cmd_list();
 		return;
 	}
 
-	if (svc_streq(verb, "status") && *rest == '\0') {
+	if (streq(verb, "status") && *rest == '\0') {
 		for (int i = 0; i < SVC_COUNT; i++)
 			cmd_status(&svc[i]);
 		return;
@@ -403,21 +385,21 @@ void services_cmd(const char *args)
 		return;
 	}
 
-	if (svc_streq(verb, "start")) {
+	if (streq(verb, "start")) {
 		int r = svc_start(s);
 		if (r == 0)      con_write("started "), con_write(s->name), con_putc('\n');
 		else if (r == 1) con_write(s->name), con_write(" already running\n");
 		else             con_write("failed to start "), con_write(s->name), con_putc('\n');
-	} else if (svc_streq(verb, "stop")) {
+	} else if (streq(verb, "stop")) {
 		svc_stop(s);
 		con_write("stopped "), con_write(s->name), con_putc('\n');
-	} else if (svc_streq(verb, "restart")) {
+	} else if (streq(verb, "restart")) {
 		svc_stop(s);
 		if (svc_start(s) == 0)
 			con_write("restarted "), con_write(s->name), con_putc('\n');
 		else
 			con_write("failed to restart "), con_write(s->name), con_putc('\n');
-	} else if (svc_streq(verb, "status")) {
+	} else if (streq(verb, "status")) {
 		cmd_status(s);
 	} else {
 		con_write("services: unknown subcommand: ");

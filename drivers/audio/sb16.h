@@ -7,6 +7,8 @@
 #ifndef OWOS_SB16_H
 #define OWOS_SB16_H
 
+#include <stdint.h>
+
 void sb16_init(void);          /* probe + claim IRQ 5 (silent if no card)     */
 int  sb16_present(void);       /* 1 if a card was detected                     */
 
@@ -19,9 +21,14 @@ void sb16_volume_step(int dir);   /* +1 = louder, -1 = quieter (clamped)        
 void sb16_volume_mute(void);      /* toggle mute (restores the prior level)      */
 int  sb16_volume(void);           /* 0..SB_VOL_MAX, or 0 while muted             */
 
-/* Play a RIFF/WAVE file from owofs. Any PCM 8/16-bit, mono/stereo WAV is
- * down-converted to 8-bit unsigned mono and streamed to the DAC. Ctrl+C stops
- * playback. Returns 0 on success, 1 if interrupted, -1 on error. */
-int  sb16_play_wav(const char *filename);
+/* Streaming PCM sink, fed from ring 3 (/bin/play) over the SYS_AUDIO_* calls
+ * when no HD Audio codec is present. The producer pushes the canonical 48 kHz/
+ * 16-bit/stereo stream; this back end down-converts each frame to 8-bit unsigned
+ * mono for the SB16 DAC and paces refills to the auto-init DMA's half-boundary
+ * IRQs. write() returns bytes consumed, -1 if no stream is open, or -2 on
+ * Ctrl+C; close() drains and stops. One stream at a time. */
+int  sb16_stream_open(void);
+int  sb16_stream_write(const void *pcm, uint32_t bytes);
+void sb16_stream_close(void);
 
 #endif /* OWOS_SB16_H */

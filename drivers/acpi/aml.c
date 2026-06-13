@@ -1400,6 +1400,19 @@ int aml_battery_present(void)
 	return (st & 0x10) ? 1 : 0;
 }
 
+/* Diagnostics for real-hardware battery debugging (this path can't be exercised
+ * in QEMU). *out_nodes gets the number of namespace objects the two-pass walk
+ * recorded; *out_bail gets the opcode at which a term-list walk first gave up
+ * (0x5B00|ext for an ExtOp, else the bare opcode), or -1 if it never bailed. A
+ * tiny node count or a non-negative bail op means the walk choked before
+ * reaching the battery device / EC fields — i.e. an opcode we must handle. */
+void aml_ns_stats(int *out_nodes, int *out_bail)
+{
+	build_namespace();
+	if (out_nodes) *out_nodes = node_count;
+	if (out_bail)  *out_bail  = ns_bailed ? (int)ns_bail_op : -1;
+}
+
 int aml_read_battery(struct aml_battery *out)
 {
 	err_buf[0] = 0;
@@ -1412,6 +1425,7 @@ int aml_read_battery(struct aml_battery *out)
 	if (!eval_method_pkg(bst, &bstpkg)) return 0;
 	if (bstpkg.nelems < 4) { set_err("_BST package too short"); return 0; }
 	uint64_t state     = to_int(bstpkg.elems[0]);
+	uint64_t rate      = to_int(bstpkg.elems[1]);   /* present (dis)charge rate */
 	uint64_t remaining = to_int(bstpkg.elems[2]);
 
 	/* Capacity comes from _BIF (last-full @2, design @1) or _BIX (last-full @3,
@@ -1483,5 +1497,13 @@ int aml_read_battery(struct aml_battery *out)
 	out->percent = (int)pct;
 	out->discharging = (state & 0x1) ? 1 : 0;
 	out->charging = (state & 0x2) ? 1 : 0;
+
+	/* Time to empty = remaining / rate, in hours; _BST reports remaining capacity
+	 * and the present rate in the same unit (mWh+mW or mAh+mA per _BIF's power-
+	 * unit flag), so the ratio is unitless and we needn't know which. Only when
+	 * discharging with a non-zero, known rate; otherwise "unknown". */
+	out->minutes = -1;
+	if (out->discharging && rate && rate != 0xFFFFFFFFu)
+		out->minutes = (int)(remaining * 60 / rate);
 	return 1;
 }

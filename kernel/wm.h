@@ -50,6 +50,9 @@ struct window {
 	int  resizable;          /* 1 by default; an app may clear it after create */
 	int  visible;
 	int  dead;               /* destroyed; slot reusable by wm_create_window    */
+	int  minimized;          /* hidden to the taskbar (visible=0, still listed) */
+	int  maximized;          /* filling the screen above the taskbar            */
+	int  saved_x, saved_y, saved_w, saved_h;  /* frame geometry before maximize */
 
 	/* App interface (any may be NULL). `cx,cy,cw,ch` is the client rect. */
 	void     (*draw)(struct window *w, int cx, int cy, int cw, int ch,

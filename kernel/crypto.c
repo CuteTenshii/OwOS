@@ -12,13 +12,6 @@
 
 /* ------------------------------------------------------------------ helpers */
 
-static void cmemset(void *dst, uint8_t v, uint32_t n)
-{
-	uint8_t *d = dst;
-	while (n--)
-		*d++ = v;
-}
-
 static inline uint32_t rotr32(uint32_t x, int n)
 {
 	return (x >> n) | (x << (32 - n));
@@ -215,7 +208,7 @@ void hmac_sha256(const uint8_t *key, uint32_t keylen,
                  uint8_t out[SHA256_DIGEST])
 {
 	uint8_t k[SHA256_BLOCK];
-	cmemset(k, 0, SHA256_BLOCK);
+	memset(k, 0, SHA256_BLOCK);
 	if (keylen > SHA256_BLOCK)
 		sha256(key, keylen, k);
 	else
@@ -413,7 +406,7 @@ static void gcm_mul(const uint8_t x[16], const uint8_t y[16], uint8_t z[16])
 {
 	uint8_t v[16];
 	memcpy(v, y, 16);
-	cmemset(z, 0, 16);
+	memset(z, 0, 16);
 	for (int i = 0; i < 128; i++) {
 		if (x[i / 8] & (0x80 >> (i % 8)))
 			for (int j = 0; j < 16; j++)

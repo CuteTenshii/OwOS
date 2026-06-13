@@ -1,0 +1,314 @@
+/* neofetch.c — a ring-3 system-info splash: the OwO logo beside the stats.
+ *
+ * The presentation (logo, layout, colours) lives here in user space; the kernel
+ * only hands over the raw facts through one syscall (sysinfo), the few user
+ * space can't read itself — SMBIOS, RAM, the ACPI battery, and the disks and
+ * displays the kernel enumerated. CPU identity comes from cpuid, which the
+ * kernel reads once and caches into the same struct. A bug in this program is a
+ * contained process crash (a "neofetch has crashed" window), not a kernel panic.
+ *
+ * Structure: build_info() lays the stat lines (label + value, colours baked in)
+ * into a row buffer, one row per logical fact; render() then pairs row i with
+ * logo line i. Keeping content separate from layout means a new field is just
+ * one more field()/endrow() block — no row-index bookkeeping.
+ *
+ *   neofetch
+ */
+
+#include "owos.h"
+
+static const char *logo[] = {
+	"   /\\___/\\",
+	"  /       \\",
+	"  ( O w O )",
+	"  (   v   )",
+	"   \\     /",
+	"    \\___/",
+};
+#define LOGO_LINES 6
+#define LOGO_W     16
+
+/* 16-colour ANSI SGR escapes — the ring-3 terminal renders them (term.c). */
+#define CYAN  "\033[96m"
+#define GREEN "\033[92m"
+#define GREY  "\033[37m"
+#define RST   "\033[0m"
+
+static void p(const char *s)       { puts(s); }
+static void pc(char c)             { write(1, &c, 1); }
+
+/* ---------------------------------------------------- row buffer + builders */
+/* Each stat is built into one fixed row (colour escapes baked in), then printed
+ * beside the logo. Rooms for every optional disk/GPU row plus the fixed set. */
+#define MAX_ROWS 40
+#define ROW_CAP  128
+static char rows[MAX_ROWS][ROW_CAP];
+static int  nrows;
+static char *wp, *wend;            /* write cursor into the current row        */
+
+static void endrow(void) { if (nrows < MAX_ROWS) { *wp = '\0'; nrows++; } }
+static void ac(char c)   { if (wp < wend) *wp++ = c; }
+static void as(const char *s) { while (*s && wp < wend) *wp++ = *s++; }
+
+/* Begin a row whose label is `lab` (green), leaving the cursor in grey ready for
+ * the value. A blank label keeps continuation rows (disk/GPU #2+) aligned. */
+static void field(const char *lab)
+{
+	wp = rows[nrows < MAX_ROWS ? nrows : 0];
+	wend = wp + ROW_CAP - 1;
+	as(GREEN); as(lab); as(GREY);
+}
+
+static void au(unsigned v)         /* unsigned decimal */
+{
+	char t[12]; int n = 0;
+	if (!v) { ac('0'); return; }
+	while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+	while (n) ac(t[--n]);
+}
+static void a2(unsigned v) { ac('0' + (char)((v / 10) % 10)); ac('0' + (char)(v % 10)); }
+
+/* A size in MiB, switching to "N.N GiB" past a gibibyte. */
+static void amib(unsigned mib)
+{
+	if (mib >= 1024) {
+		unsigned tenths = (mib * 10) / 1024;
+		au(tenths / 10); ac('.'); au(tenths % 10); as(" GiB");
+	} else {
+		au(mib); as(" MiB");
+	}
+}
+
+/* Append a string with runs of whitespace collapsed to a single space and
+ * leading/trailing space trimmed. The cpuid brand string is space-padded inside
+ * its 48-byte field (e.g. "...CPU      @ 2.40GHz"), and that padding shows up
+ * verbatim on real silicon / VMware — collapse it so the CPU line reads clean. */
+static void asqueeze(const char *s)
+{
+	int started = 0, pending = 0;
+	for (; *s; s++) {
+		if (*s == ' ' || *s == '\t') { if (started) pending = 1; continue; }
+		if (pending) { ac(' '); pending = 0; }
+		ac(*s); started = 1;
+	}
+}
+
+/* A clock in MHz rendered as "@ N.NN GHz", the shared CPU/GPU form. */
+static void a_ghz(unsigned mhz)
+{
+	unsigned cghz = (mhz + 5) / 10;            /* hundredths of a GHz */
+	as(" @ "); au(cghz / 100); ac('.'); a2(cghz % 100); as(" GHz");
+}
+
+static int has_at(const char *s)
+{
+	for (; *s; s++)
+		if (*s == '@') return 1;
+	return 0;
+}
+
+/* ----------------------------------------------- reading the /proc facts */
+/* Each fact is its own /proc file (cpuinfo, meminfo, uptime, ...), read through
+ * the ordinary file API — no bespoke syscall. Small files, so read each whole. */
+
+
+/* Read a whole /proc file into buf (NUL-terminated). Returns length, 0 if none. */
+static int readproc(const char *path, char *buf, int max)
+{
+	int n = readfile(path, buf, max - 1);
+	if (n < 0) n = 0;
+	buf[n] = '\0';
+	return n;
+}
+
+static void rstrip(char *s) { int n = strlen(s); while (n && (s[n-1]=='\n'||s[n-1]=='\r'||s[n-1]==' ')) s[--n]='\0'; }
+
+/* Value of a "key <value>" line; copies value (to EOL) into out. 1 if found. */
+static int kvget(const char *buf, const char *key, char *out, int max)
+{
+	int kl = strlen(key);
+	for (const char *p = buf; *p; ) {
+		int match = 1;
+		for (int i = 0; i < kl; i++) if (p[i] != key[i]) { match = 0; break; }
+		if (match && p[kl] == ' ') {
+			const char *v = p + kl + 1;
+			int i = 0;
+			while (v[i] && v[i] != '\n' && i < max - 1) { out[i] = v[i]; i++; }
+			out[i] = '\0';
+			return 1;
+		}
+		while (*p && *p != '\n') p++;
+		if (*p == '\n') p++;
+	}
+	out[0] = '\0';
+	return 0;
+}
+static unsigned kvu(const char *buf, const char *key)
+{
+	char t[24];
+	if (!kvget(buf, key, t, sizeof t)) return 0;
+	unsigned v = 0;
+	for (const char *c = t; *c >= '0' && *c <= '9'; c++) v = v * 10 + (unsigned)(*c - '0');
+	return v;
+}
+static unsigned u_of(const char *s)
+{
+	unsigned v = 0;
+	while (*s == ' ') s++;
+	for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (unsigned)(*s - '0');
+	return v;
+}
+
+/* --------------------------------------------------------------- the stats */
+static void build_info(void)
+{
+	static char f[8192];                   /* reused per /proc file            */
+	char v[80];
+
+	field(CYAN "OwOS" GREY);                                          endrow();
+	field("----------------");                                       endrow();
+	field("OS:      "); as("OwOS 0.1");                              endrow();
+	field("Kernel:  "); as("owos (i386, 32-bit)");                  endrow();
+
+	readproc("/proc/cpuinfo", f, sizeof f);
+	field("CPU:     ");
+	kvget(f, "model", v, sizeof v);
+	if (v[0]) asqueeze(v); else as("unknown");
+	{ unsigned mhz = kvu(f, "mhz"); if (mhz && !has_at(v)) a_ghz(mhz); }
+	endrow();
+
+	readproc("/proc/uptime", f, sizeof f);
+	field("Uptime:  ");
+	{
+		unsigned s = u_of(f);
+		unsigned h = s / 3600; s %= 3600;
+		unsigned m = s / 60;   s %= 60;
+		if (h)      { au(h); as("h "); }
+		if (h || m) { au(m); as("m "); }
+		au(s); ac('s');
+	}
+	endrow();
+
+	readproc("/proc/date", f, sizeof f); rstrip(f);
+	field("Date:    "); as(f);                                       endrow();
+
+	readproc("/proc/meminfo", f, sizeof f);
+	field("Memory:  ");
+	amib(kvu(f, "used") / 1024); as(" / "); amib(kvu(f, "total") / 1024);
+	endrow();
+
+	readproc("/proc/owofs", f, sizeof f);
+	field("Disk:    "); au(kvu(f, "files")); as(" files, "); au(kvu(f, "bytes")); as(" bytes"); endrow();
+
+	/* /proc/pci: count the lines for the PCI total, and remember it for the GPU
+	 * pass below (class 03xx = display controller). */
+	int pci_lines = 0;
+	readproc("/proc/pci", f, sizeof f);
+	for (const char *p = f; *p; ) { pci_lines++; while (*p && *p != '\n') p++; if (*p=='\n') p++; }
+	field("PCI:     "); au((unsigned)pci_lines); as(" devices");     endrow();
+
+	readproc("/proc/tasks", f, sizeof f);
+	field("Tasks:   "); au(u_of(f));                                 endrow();
+
+	readproc("/proc/firmware", f, sizeof f); rstrip(f);
+	field("Firmware:"); ac(' '); as(f[0] ? f : "unknown");          endrow();
+
+	readproc("/proc/host", f, sizeof f); rstrip(f);
+	field("Host:    "); as(f[0] ? f : "unknown");                    endrow();
+
+	readproc("/proc/battery", f, sizeof f);
+	if (kvu(f, "present")) {
+		field("Battery: ");
+		au(kvu(f, "pct")); ac('%');
+		if (kvu(f, "charging"))         as(" (charging)");
+		else if (kvu(f, "discharging")) {
+			as(" (discharging");
+			unsigned mm = kvu(f, "minutes");
+			if (mm) { as(", "); au(mm / 60); as("h "); au(mm % 60); as("m left"); }
+			ac(')');
+		}
+		endrow();
+	}
+
+	/* /proc/storage: one "<type> <sectors> <model>" line per disk. */
+	readproc("/proc/storage", f, sizeof f);
+	if (!f[0]) { field("Storage: "); as("none detected"); endrow(); }
+	else {
+		int first = 1;
+		for (const char *p = f; *p; ) {
+			const char *eol = p; while (*eol && *eol != '\n') eol++;
+			field(first ? "Storage: " : "         "); first = 0;
+			const char *q = p;
+			while (q < eol && *q != ' ') ac(*q++);          /* type            */
+			unsigned sectors = 0; if (q < eol) { q++; sectors = u_of(q); while (q < eol && *q != ' ') q++; }
+			if (q < eol) { ac(' '); q++; while (q < eol) ac(*q++); }   /* model */
+			if (sectors) { as(" ("); amib(sectors / 2048); ac(')'); }
+			endrow();
+			p = (*eol == '\n') ? eol + 1 : eol;
+		}
+	}
+
+	/* GPUs = /proc/pci lines whose class field (3rd token) starts "03". */
+	readproc("/proc/pci", f, sizeof f);
+	int gpus = 0;
+	for (const char *p = f; *p; ) {
+		const char *eol = p; while (*eol && *eol != '\n') eol++;
+		/* tokens: bdf  vendor:device  class  name... */
+		const char *t = p; int tok = 0; const char *cls = 0, *name = 0;
+		while (t < eol) {
+			if (tok == 2) cls = t;
+			if (tok == 3) { name = t; break; }
+			while (t < eol && *t != ' ') t++;
+			while (t < eol && *t == ' ') t++;
+			tok++;
+		}
+		if (cls && cls[0] == '0' && cls[1] == '3') {
+			field(gpus == 0 ? "GPU:     " : "         "); gpus++;
+			for (const char *c = name; c && c < eol; c++) ac(*c);
+			endrow();
+		}
+		p = (*eol == '\n') ? eol + 1 : eol;
+	}
+	if (!gpus) { field("GPU:     "); as("none detected"); endrow(); }
+
+	/* The monitor: EDID brand/model + active resolution/refresh (or text mode). */
+	readproc("/proc/display", f, sizeof f);
+	field("Display: ");
+	if (kvget(f, "monitor", v, sizeof v) && v[0]) {
+		as(v);
+		if (kvu(f, "internal")) as(" (integrated)");
+	} else {
+		as(kvu(f, "internal") ? "Integrated panel" : "Generic display");
+	}
+	{
+		unsigned w = kvu(f, "fbw"), h = kvu(f, "fbh");
+		if (w && h) { as(" - "); au(w); ac('x'); au(h); as(" @ "); au(kvu(f, "hz")); as("Hz"); }
+		else        { as(" - 80x25 text"); }
+	}
+	endrow();
+}
+
+/* Pair each stat row with its logo line (cyan, padded to a fixed column). */
+static void render(void)
+{
+	int total = nrows > LOGO_LINES ? nrows : LOGO_LINES;
+	for (int i = 0; i < total; i++) {
+		p(CYAN);
+		const char *l = (i < LOGO_LINES) ? logo[i] : "";
+		int w = 0;
+		for (const char *q = l; *q; q++) { pc(*q); w++; }
+		for (; w < LOGO_W; w++) pc(' ');
+		p(GREY);
+		if (i < nrows) p(rows[i]);
+		pc('\n');
+	}
+	p(RST);
+}
+
+int main(int argc, char **argv)
+{
+	(void)argc; (void)argv;
+	build_info();
+	render();
+	return 0;
+}

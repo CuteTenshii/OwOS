@@ -15,4 +15,19 @@ void shell_interrupt(void);  /* Ctrl+C at the prompt: cancel the current line */
  * token isn't a builtin. */
 int  shell_exec_capture(const char *cmd, char *buf, int max);
 
+/* Streaming variant of the bridge: run a command in a persistent producer
+ * thread and drain its output in chunks, so a long/voluminous command renders
+ * as it runs instead of freezing the terminal until it finishes.
+ *   shell_stream_start  -- create the runner thread once (at boot).
+ *   shell_stream_begin  -- start `cmd`; 0 if streamable, -1 if not (caller falls
+ *                          back to launching it as a detached GUI app).
+ *   shell_stream_read   -- drain up to max bytes: >0 count, 0 running-but-idle,
+ *                          -1 end of output. */
+void shell_stream_start(void);
+int  shell_stream_begin(const char *cmd);
+int  shell_stream_read(char *buf, int max);
+int  shell_stream_active(void);   /* a streamed command is running              */
+void shell_stream_interrupt(void); /* Ctrl+C: echo ^C, deliver cooperative intr */
+void shell_stream_abort(void);    /* close: hard-kill a CLI child (no echo)      */
+
 #endif /* OWOS_SHELL_H */

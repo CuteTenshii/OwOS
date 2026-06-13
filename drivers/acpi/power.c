@@ -10,6 +10,8 @@
 #include "io.h"
 #include "power.h"
 #include "paging.h"
+#include "irq.h"
+#include "timer.h"
 
 /* ---- ACPI shutdown ------------------------------------------------------ *
  * The low 16 MiB is identity-mapped, and firmware parks the ACPI tables well
@@ -194,9 +196,11 @@ static uint32_t fadt_dsdt_phys(struct fadt *f)
 	return f->dsdt;
 }
 
-/* Dig SLP_TYPa/SLP_TYPb out of the DSDT's \_S5_ package. Returns 0 on failure;
- * on success the values are written *already shifted* into PM1_CNT position. */
-static int parse_s5(struct fadt *f, uint16_t *slp_a, uint16_t *slp_b)
+/* Dig SLP_TYPa/SLP_TYPb out of one of the DSDT's sleep-state packages, named by
+ * `name` ("_S5_" for off, "_S3_" for suspend-to-RAM). Returns 0 on failure; on
+ * success the values are written *already shifted* into PM1_CNT position. */
+static int parse_sleep(struct fadt *f, const char *name,
+                       uint16_t *slp_a, uint16_t *slp_b)
 {
 	uint32_t dphys = fadt_dsdt_phys(f);
 	struct sdt_header *dsdt = (struct sdt_header *)dphys;
@@ -211,20 +215,20 @@ static int parse_s5(struct fadt *f, uint16_t *slp_a, uint16_t *slp_b)
 	uint8_t *p   = (uint8_t *)dsdt + sizeof(*dsdt);
 	uint8_t *end = (uint8_t *)dsdt + dsdt->length;
 	for (; p < end - 4; p++) {
-		if (sig4((char *)p, "_S5_"))
+		if (sig4((char *)p, name))
 			break;
 	}
 	if (p >= end - 4)
 		return 0;
 
-	/* Validate it's a real NameOp("_S5_", Package): the name is preceded by an
+	/* Validate it's a real NameOp(name, Package): the name is preceded by an
 	 * AML NameOp (0x08), optionally under the root scope ('\\' == 0x5C), and
 	 * followed by a PackageOp (0x12). */
 	if (!((*(p - 1) == 0x08) ||
 	      (*(p - 2) == 0x08 && *(p - 1) == 0x5C)) || *(p + 4) != 0x12)
 		return 0;
 
-	p += 5;                          /* skip "_S5_" and the PackageOp byte */
+	p += 5;                          /* skip the name and the PackageOp byte */
 	p += ((*p & 0xC0) >> 6) + 2;     /* skip PkgLength + element count       */
 
 	if (*p == 0x0A)                  /* BytePrefix before SLP_TYPa           */
@@ -359,19 +363,10 @@ void acpi_for_each_aml(void (*fn)(const uint8_t *body, uint32_t len, void *ctx),
 	}
 }
 
-/* Returns only if ACPI shutdown could not be performed. */
-static void acpi_off(void)
+/* Switch the chipset into ACPI mode if it isn't already, so the PM1 control
+ * register is live. (QEMU boots in ACPI mode; VMware/real HW may not.) */
+static void acpi_ensure_enabled(struct fadt *f)
 {
-	struct fadt *f = find_fadt();
-	if (!f)
-		return;
-
-	uint16_t slp_a, slp_b;
-	if (!parse_s5(f, &slp_a, &slp_b))
-		return;
-
-	/* Switch the chipset into ACPI mode if it isn't already, so the PM1
-	 * control register is live. (QEMU boots in ACPI mode; VMware/HW may not.) */
 	if (f->smi_cmd && f->acpi_enable &&
 	    !(inw((uint16_t)f->pm1a_cnt_blk) & SCI_EN)) {
 		outb((uint16_t)f->smi_cmd, f->acpi_enable);
@@ -381,6 +376,20 @@ static void acpi_off(void)
 			io_wait();
 		}
 	}
+}
+
+/* Returns only if ACPI shutdown could not be performed. */
+static void acpi_off(void)
+{
+	struct fadt *f = find_fadt();
+	if (!f)
+		return;
+
+	uint16_t slp_a, slp_b;
+	if (!parse_sleep(f, "_S5_", &slp_a, &slp_b))
+		return;
+
+	acpi_ensure_enabled(f);
 
 	outw((uint16_t)f->pm1a_cnt_blk, slp_a | SLP_EN);
 	if (f->pm1b_cnt_blk)
@@ -476,4 +485,113 @@ void power_reset(void)
 		uint32_t base;
 	} __attribute__((packed)) null_idt = { 0, 0 };
 	__asm__ volatile ("lidt %0; int3" : : "m"(null_idt));
+}
+
+/* ---- ACPI S3 sleep (suspend-to-RAM) ------------------------------------- *
+ * S3 cuts power to the CPU but keeps RAM refreshed. The OS saves CPU state,
+ * tells the firmware where to re-enter on wake (the FACS firmware_waking_vector
+ * — a real-mode address), then writes the S3 sleep type to PM1_CNT. On wake the
+ * firmware bounces through our trampoline (s3_wake.S) back into the kernel.
+ *
+ * NOTE: this restores the *CPU*, not devices. Under QEMU, S3 is a pause so the
+ * emulated devices keep their state and the desktop comes back intact. On real
+ * hardware the chipset/devices lose power across S3 and would need re-init on
+ * resume (NIC, USB, the panel's backlight/timing) — not done here yet. */
+
+/* The trampoline blob and its physical landing address (must agree with the
+ * .set TRAMP in s3_wake.S). 0x8000 is free conventional RAM, below the EBDA,
+ * and inside the identity-mapped low 16 MiB so we can write it directly. */
+#define S3_TRAMPOLINE_PHYS 0x8000u
+extern uint8_t s3_trampoline_start[];
+extern uint8_t s3_trampoline_end[];
+extern void s3_enter(uint32_t pm1a_port, uint32_t pm1b_port,
+                     uint32_t slp_a_value, uint32_t slp_b_value);
+
+/* The FACS hangs off the FADT (32-bit FIRMWARE_CTRL at offset 36, or the 64-bit
+ * X_FIRMWARE_CTRL at offset 132 on ACPI 2.0+). Map and validate it; returns the
+ * mapped base or 0. This is the firmware's own FACS — the same one the BIOS
+ * reads on wake — so writing firmware_waking_vector here is what gets us back. */
+static uint8_t *find_facs(struct fadt *f)
+{
+	uint32_t phys = f->firmware_ctrl;
+	if (f->header.length >= 140) {
+		uint64_t x = *(uint64_t *)((uint8_t *)f + 132);
+		if (x && x < 0x100000000ull)
+			phys = (uint32_t)x;
+	}
+	if (!phys || paging_identity_map(phys, 64) != 0)
+		return 0;
+	uint8_t *facs = (uint8_t *)phys;
+	if (!sig4((char *)facs, "FACS"))
+		return 0;
+	return facs;
+}
+
+/* Is ACPI S3 (suspend-to-RAM) actually available? Read-only probe: the FADT
+ * must exist, the DSDT must advertise an `_S3` package, and the FACS (where we
+ * stash the wake vector) must be reachable. Used to gate the Start-menu "Sleep"
+ * item — VMware, for one, doesn't expose S3 to the guest, so offering it would
+ * just be a dead button. Safe to call any time after paging is up. */
+int power_can_sleep(void)
+{
+	struct fadt *f = find_fadt();
+	if (!f)
+		return 0;
+	uint16_t a, b;
+	if (!parse_sleep(f, "_S3_", &a, &b))
+		return 0;
+	return find_facs(f) != 0;
+}
+
+/* Enter ACPI S3. Returns (after resume, or immediately) if S3 can't be done. */
+void power_sleep(void)
+{
+	struct fadt *f = find_fadt();
+	if (!f)
+		return;
+
+	uint16_t slp_a, slp_b;
+	if (!parse_sleep(f, "_S3_", &slp_a, &slp_b))
+		return;                  /* firmware doesn't advertise S3 */
+
+	uint8_t *facs = find_facs(f);
+	if (!facs)
+		return;
+
+	acpi_ensure_enabled(f);
+
+	/* Copy the wake trampoline into low memory and point the firmware at it.
+	 * firmware_waking_vector is the 32-bit (real-mode) entry at FACS offset 12;
+	 * clear the 64-bit x_firmware_waking_vector (offset 24) so the firmware
+	 * uses the 32-bit one. */
+	uint32_t len = (uint32_t)(s3_trampoline_end - s3_trampoline_start);
+	uint8_t *dst = (uint8_t *)S3_TRAMPOLINE_PHYS;
+	for (uint32_t i = 0; i < len; i++)
+		dst[i] = s3_trampoline_start[i];
+
+	*(volatile uint32_t *)(facs + 12) = S3_TRAMPOLINE_PHYS;
+	if (facs[32] >= 1)               /* FACS version >= 1 has the 64-bit field */
+		*(volatile uint64_t *)(facs + 24) = 0;
+
+	/* Make sure the trampoline + saved state are in RAM before power drops. */
+	__asm__ volatile ("wbinvd");
+
+	/* Snapshot the PIC line masks: the firmware's wake POST resets the 8259, so
+	 * we reinstate exactly what was unmasked before sleeping. */
+	uint8_t pic_mask1 = inb(0x21);
+	uint8_t pic_mask2 = inb(0xA1);
+
+	/* Hand off to asm: it snapshots the CPU and writes SLP_TYP|SLP_EN. Control
+	 * returns here once the firmware re-enters us through the trampoline. */
+	s3_enter(f->pm1a_cnt_blk, f->pm1b_cnt_blk,
+	         (uint32_t)(slp_a | SLP_EN), (uint32_t)(slp_b | SLP_EN));
+
+	/* ---- resumed ---- The S3 wake reset left interrupts off and the chipset
+	 * timers/PIC reprogrammed by firmware. Re-establish them with interrupts
+	 * masked so a stray tick can't land on a BIOS vector mid-repair, then let
+	 * the restored EFLAGS' IF take over. */
+	__asm__ volatile ("cli");
+	irq_resume(pic_mask1, pic_mask2);   /* re-map PIC, restore masks */
+	timer_init();                       /* re-program the PIT tick   */
+	__asm__ volatile ("sti");
 }

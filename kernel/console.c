@@ -53,16 +53,29 @@ static void cell_write(int idx, uint16_t entry)
 static char    *capture_buf;
 static uint32_t capture_cap;
 static uint32_t capture_len;
+/* Alternatively, capture can stream byte-by-byte into a sink callback (the
+ * ring-3 terminal's streaming bridge): when set, con output is handed to it
+ * instead of a fixed buffer, so a long/voluminous command renders as it runs. */
+static void   (*capture_sink)(char);
 /* In ANSI capture mode, con_set_color also emits an SGR escape into the capture
- * buffer, so a consumer (the ring-3 terminal's bridge) can reproduce colors.
+ * stream, so a consumer (the ring-3 terminal's bridge) can reproduce colors.
  * Off for plain captures (file redirect, grep pipe), which want clean text. */
 static int      capture_ansi;
 
-/* Append a NUL-terminated string to the capture buffer (bounded). */
+/* One captured byte: to the sink if streaming, else into the bounded buffer. */
+static void capture_out(char c)
+{
+	if (capture_sink)
+		capture_sink(c);
+	else if (capture_len < capture_cap)
+		capture_buf[capture_len++] = c;
+}
+
+/* Append a NUL-terminated string to the active capture (bounded). */
 static void capture_puts(const char *s)
 {
-	while (*s && capture_len < capture_cap)
-		capture_buf[capture_len++] = *s++;
+	while (*s)
+		capture_out(*s++);
 }
 
 /* Emit an ANSI SGR escape for a VGA attribute byte (fg | bg<<4). VGA's palette
@@ -110,7 +123,7 @@ static void con_update_cursor(void)
 void con_set_color(enum con_color fg, enum con_color bg)
 {
 	color = (uint8_t)fg | ((uint8_t)bg << 4);
-	if (capture_buf && capture_ansi)
+	if ((capture_buf || capture_sink) && capture_ansi)
 		capture_emit_color(color);
 }
 
@@ -161,6 +174,7 @@ void con_capture_begin(char *buf, uint32_t cap)
 	capture_buf = buf;
 	capture_cap = cap;
 	capture_len = 0;
+	capture_sink = NULL;
 	capture_ansi = 0;
 }
 
@@ -172,18 +186,30 @@ void con_capture_begin_ansi(char *buf, uint32_t cap)
 	capture_ansi = 1;
 }
 
+/* Stream capture: con output is fed byte-by-byte to `sink` (with ANSI colors)
+ * instead of buffered, so the ring-3 terminal can drain and render a command's
+ * output as it is produced. End it with con_capture_end like the others. */
+void con_capture_begin_sink(void (*sink)(char))
+{
+	capture_buf = NULL;
+	capture_cap = 0;
+	capture_len = 0;
+	capture_sink = sink;
+	capture_ansi = 1;
+}
+
 uint32_t con_capture_end(void)
 {
 	uint32_t n = capture_len;
 	capture_buf = NULL;
+	capture_sink = NULL;
 	return n;
 }
 
 void con_putc(char c)
 {
-	if (capture_buf) {             /* redirected: collect, don't draw         */
-		if (capture_len < capture_cap)
-			capture_buf[capture_len++] = c;
+	if (capture_buf || capture_sink) {  /* redirected: collect, don't draw    */
+		capture_out(c);
 		return;
 	}
 

@@ -59,6 +59,9 @@ static uint32_t          base;       /* current GMBUS block offset             *
 
 static int  probed;                  /* one-shot guard                         */
 static int  cached_hz, cached_w, cached_h;
+static char cached_mfg[4];           /* 3-letter PNP manufacturer id           */
+static char cached_name[16];         /* monitor-name descriptor (0xFC), if any */
+static int  cached_internal;         /* PNP id is a known laptop-panel vendor  */
 static char err[48];
 
 static void seterr(const char *s)
@@ -189,6 +192,57 @@ static int parse_preferred(const uint8_t *e)
 	return 0;
 }
 
+/* PNP vendor ids that belong to laptop-panel makers (as opposed to standalone
+ * monitor brands). EDID alone has no "internal" bit, so the panel vendor is the
+ * practical signal that the display is an integrated laptop screen. */
+static int panel_vendor(const char *mfg)
+{
+	static const char *panels[] = {
+		"AUO",  /* AU Optronics */ "BOE",  /* BOE Technology */
+		"CMN",  /* Chi Mei / Innolux */ "LGD", /* LG Display */
+		"SHP",  /* Sharp */ "SDC", /* Samsung Display */
+		"IVO",  /* InfoVision */ "CSO", /* CSOT */
+		"CSW",  /* CSOT */ "APP", /* Apple internal */ "PNP",
+	};
+	for (uint32_t i = 0; i < sizeof(panels) / sizeof(panels[0]); i++)
+		if (mfg[0] == panels[i][0] && mfg[1] == panels[i][1] &&
+		    mfg[2] == panels[i][2])
+			return 1;
+	return 0;
+}
+
+/* Decode the manufacturer id (bytes 8-9, three 5-bit letters) and, if present,
+ * the monitor-name descriptor (tag 0xFC) — the brand/model neofetch shows. */
+static void parse_identity(const uint8_t *e)
+{
+	uint16_t m = ((uint16_t)e[8] << 8) | e[9];
+	cached_mfg[0] = (char)('@' + ((m >> 10) & 0x1F));
+	cached_mfg[1] = (char)('@' + ((m >> 5) & 0x1F));
+	cached_mfg[2] = (char)('@' + (m & 0x1F));
+	cached_mfg[3] = '\0';
+
+	/* The four 18-byte descriptors start at offset 54; a monitor descriptor has
+	 * the lead-in 00 00 00 <tag>, and tag 0xFC carries the ASCII name (≤13 bytes,
+	 * 0x0A-terminated, space-padded). */
+	for (int off = 54; off <= 108; off += 18) {
+		const uint8_t *d = e + off;
+		if (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0xFC) {
+			int j = 0;
+			for (int k = 0; k < 13 && j < (int)sizeof(cached_name) - 1; k++) {
+				uint8_t c = d[5 + k];
+				if (c == 0x0A)
+					break;
+				cached_name[j++] = (char)c;
+			}
+			while (j > 0 && cached_name[j - 1] == ' ')
+				j--;
+			cached_name[j] = '\0';
+			break;
+		}
+	}
+	cached_internal = panel_vendor(cached_mfg);
+}
+
 static void probe(void)
 {
 	probed = 1;
@@ -218,8 +272,10 @@ static void probe(void)
 				seterr("bad checksum");
 				continue;
 			}
-			if (parse_preferred(edid) == 0)
+			if (parse_preferred(edid) == 0) {
+				parse_identity(edid);
 				return;                           /* success                 */
+			}
 		}
 	}
 	if (err[0] == '\0')
@@ -235,6 +291,45 @@ static void ensure(void)
 int edid_refresh_hz(void) { ensure(); return cached_hz; }
 int edid_width(void)      { ensure(); return cached_w;  }
 int edid_height(void)     { ensure(); return cached_h;  }
+int edid_internal(void)   { ensure(); return cached_internal; }
+
+/* Friendly brand for the common monitor/panel PNP ids; falls back to the raw
+ * 3-letter code so an unknown display still shows something meaningful. */
+static const char *brand_name(const char *mfg)
+{
+	static const struct { char id[4]; const char *name; } map[] = {
+		{ "DEL", "Dell" },     { "SAM", "Samsung" }, { "SDC", "Samsung" },
+		{ "GSM", "LG" },       { "LGD", "LG" },      { "AUO", "AU Optronics" },
+		{ "BOE", "BOE" },      { "CMN", "Innolux" }, { "SHP", "Sharp" },
+		{ "ACI", "ASUS" },     { "AUS", "ASUS" },    { "BNQ", "BenQ" },
+		{ "HWP", "HP" },       { "ACR", "Acer" },    { "AOC", "AOC" },
+		{ "APP", "Apple" },    { "VSC", "ViewSonic" },{ "PHL", "Philips" },
+	};
+	for (uint32_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+		if (mfg[0] == map[i].id[0] && mfg[1] == map[i].id[1] &&
+		    mfg[2] == map[i].id[2])
+			return map[i].name;
+	return mfg;
+}
+
+/* Compose "<brand> <model>" (e.g. "Dell U2412M") into out; "" if no EDID. The
+ * monitor-name descriptor is optional, so a panel may yield brand only. */
+void edid_model(char *out, int len)
+{
+	ensure();
+	int i = 0;
+	if (cached_mfg[0]) {
+		const char *b = brand_name(cached_mfg);
+		for (; b[i] && i < len - 1; i++)
+			out[i] = b[i];
+		if (cached_name[0] && i < len - 1) {
+			out[i++] = ' ';
+			for (int k = 0; cached_name[k] && i < len - 1; k++)
+				out[i++] = cached_name[k];
+		}
+	}
+	out[i] = '\0';
+}
 
 const char *edid_error(void)
 {

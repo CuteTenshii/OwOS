@@ -22,7 +22,12 @@
  * on real hardware, silently smashing the adjacent thread's stack (a GP fault
  * resuming an unrelated thread into EIP 0x0000000D). Size for both. */
 #define KSTACK_SIZE 32768
-#define UKSTACK_SIZE 16384  /* user task kernel stack (trap frames + nested RX) */
+#define UKSTACK_SIZE 32768  /* user task kernel stack: a timer IRQ mid-syscall nests
+                             * nic_poll()'s full RX/TCP chain on top of the syscall's
+                             * frames (no ring0->ring0 stack switch), so it needs the
+                             * same headroom as KSTACK_SIZE, not half. 16K overflowed
+                             * into an adjacent task on real HW (busy LAN) -> the
+                             * victim resumed into EIP 0x0000000D. */
 #define TASK_CWD_MAX 128    /* must match the shell's PATH_MAX                  */
 
 enum { TASK_FREE = 0, TASK_RUNNABLE, TASK_WAITING, TASK_ZOMBIE };
@@ -38,6 +43,7 @@ typedef struct task {
 	uint32_t      parent;      /* pid of the task that created it              */
 	int           wait_pid;    /* pid being waited on while WAITING            */
 	int           exit_status; /* set on exit, read by waitpid                 */
+	volatile int  intr;        /* cooperative-interrupt latch (Ctrl+C / SIGINT) */
 	const char   *name;
 	char          namebuf[16]; /* owns `name` for spawned programs (argv[0])    */
 	uint32_t      runs;
@@ -124,6 +130,7 @@ void sched_init(void)
 	t->kstack = 0;
 	t->kstack_top = 0;             /* a kernel thread: never traps to ring 0   */
 	t->state = TASK_RUNNABLE;
+	t->intr = 0;
 	cwd_set(t->cwd, "/");
 	t->next = t;
 	current = t;
@@ -146,6 +153,7 @@ void sched_create_thread(const char *name, void (*entry)(void))
 	t->state = TASK_RUNNABLE;
 
 	uint8_t *stack = kmalloc(KSTACK_SIZE);
+	t->intr = 0;
 	t->kstack = stack;
 	uint32_t *sp = (uint32_t *)(stack + KSTACK_SIZE);
 	*--sp = (uint32_t)thread_exit;
@@ -176,6 +184,7 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
 	t->dir = dir;
 	t->parent = current->id;
 	t->state = TASK_RUNNABLE;
+	t->intr = 0;
 	fds_init_console(t);
 	cwd_set(t->cwd, current->cwd);   /* inherit the spawner's cwd by default */
 
@@ -218,6 +227,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
 	t->dir = 0;                     /* not the owner: don't free it on reap    */
 	t->parent = current->id;
 	t->state = TASK_RUNNABLE;
+	t->intr = 0;
 	fds_init_console(t);
 	cwd_set(t->cwd, current->cwd);
 
@@ -265,6 +275,7 @@ int sched_fork(struct registers *r)
 	t->kstack = kstack;
 	t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
 	t->state = TASK_RUNNABLE;
+	t->intr = 0;
 	cwd_set(t->cwd, current->cwd);
 
 	/* The child inherits the parent's open files (Unix semantics). */
@@ -363,6 +374,14 @@ void sched_set_cwd(int pid, const char *path)
 		cwd_set(t->cwd, path);
 }
 
+/* Set the calling task's own cwd. The streaming-command runner thread uses this
+ * to adopt the terminal's cwd before running a bridged command, so relative
+ * paths (curl -o, torrent get) resolve where the synchronous bridge did. */
+void sched_set_cwd_self(const char *path)
+{
+	cwd_set(current->cwd, path);
+}
+
 /* The current task's working directory (an absolute path), for syscall.c. */
 const char *sched_cwd(void)
 {
@@ -390,6 +409,53 @@ void sched_exit(int status)
 	schedule();                    /* switch away; never returns               */
 	for (;;)
 		;                          /* unreachable                              */
+}
+
+/* Terminate another task by pid (the streaming bridge aborts a CLI child on
+ * Ctrl+C / window close). Make it a zombie so the scheduler stops running it and
+ * its parent reaps it; tear down the windows and fds it owns. The task isn't
+ * `current` (the killer runs in another context) and this OS is cooperative with
+ * no kernel locks, so abandoning its in-kernel state is safe -- it never resumes.
+ * Done with interrupts off so a tick can't schedule it mid-teardown. */
+void sched_kill(int pid)
+{
+	uint32_t fl;
+	__asm__ volatile ("pushf; pop %0; cli" : "=r"(fl));
+	task_t *t = find_task((uint32_t)pid);
+	if (t && t != current && t->state != TASK_FREE && t->state != TASK_ZOMBIE) {
+		t->exit_status = -1;
+		t->state = TASK_ZOMBIE;       /* unschedulable from here on            */
+		uwin_task_exiting(t->id);
+		fds_close_all(t);
+		task_t *parent = find_task(t->parent);
+		if (parent && parent->state == TASK_WAITING &&
+		    (parent->wait_pid < 0 || parent->wait_pid == (int)t->id))
+			parent->state = TASK_RUNNABLE;
+	}
+	if (fl & 0x200) __asm__ volatile ("sti");
+}
+
+/* Cooperative interrupt (a minimal SIGINT). sched_set_intr raises the latch on a
+ * task (Ctrl+C targets the foreground child); blocking kernel waits peek it via
+ * sched_intr_pending() and bail with an EINTR sentinel; the program clears it
+ * with sched_intr_take() (the SYS_INTR syscall) once it has handled the abort. */
+void sched_set_intr(int pid)
+{
+	task_t *t = find_task((uint32_t)pid);
+	if (t)
+		t->intr = 1;
+}
+
+int sched_intr_pending(void)        /* peek the current task's latch          */
+{
+	return current->intr;
+}
+
+int sched_intr_take(void)           /* read and clear it (acknowledge)        */
+{
+	int v = current->intr;
+	current->intr = 0;
+	return v;
 }
 
 /* Find an exited child of `current` matching pid (-1 = any). */
@@ -468,20 +534,41 @@ void sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp,
 
 void schedule(void)
 {
+	/* Pick-next + context_switch must be ATOMIC against the timer IRQ. The
+	 * cooperative entry — sched_yield() from timer_sleep/tcp_read/tcp_accept/...
+	 * — runs with IF=1 (waiters do `sti; hlt`). Without disabling interrupts
+	 * here, a timer tick landing in the window between choosing `next` and the
+	 * stack swap inside context_switch() re-enters schedule()/context_switch()
+	 * on the SAME task, crossing the saved kernel ESPs and later resuming a
+	 * thread into a garbage return address — seen as a GP fault to EIP
+	 * 0x0000000D in whatever thread happened to be yielding, with the rest of
+	 * its register state reflecting that victim. The IRQ entry already runs
+	 * IF=0, so it is unaffected. We restore the CALLER's IF after we are resumed
+	 * (possibly many switches later, on this thread's own stack): IF=0 callers
+	 * stay IF=0, cooperative IF=1 waiters resume with interrupts back on. The
+	 * saved `flags` is a local, so it rides this thread's stack across switches.
+	 * context_switch does not touch EFLAGS, so IF stays cleared across the swap
+	 * until this restore (or thread_start's own `sti` for a first run). */
+	uint32_t flags;
+	__asm__ volatile ("pushf\n\t pop %0" : "=r"(flags) :: "memory");
+	__asm__ volatile ("cli");
+
 	task_t *prev = current;
 	task_t *next = prev->next;
 	while (next->state != TASK_RUNNABLE)
 		next = next->next;         /* always finds main if nothing else        */
-	if (next == prev)
-		return;
+	if (next != prev) {
+		current = next;
+		current->runs++;
+		if (current->kstack_top)
+			tss_set_kernel_stack(current->kstack_top);
+		if (current->cr3 != prev->cr3)
+			paging_load((uint32_t *)current->cr3);
+		context_switch(&prev->esp, current->esp);
+	}
 
-	current = next;
-	current->runs++;
-	if (current->kstack_top)
-		tss_set_kernel_stack(current->kstack_top);
-	if (current->cr3 != prev->cr3)
-		paging_load((uint32_t *)current->cr3);
-	context_switch(&prev->esp, current->esp);
+	if (flags & 0x200)             /* restore the caller's interrupt flag       */
+		__asm__ volatile ("sti");
 }
 
 int sched_count(void)

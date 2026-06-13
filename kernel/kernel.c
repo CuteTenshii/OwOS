@@ -43,6 +43,8 @@
 #include "timer.h"
 #include "console.h"
 #include "fb.h"
+#include "vmsvga.h"
+#include "vmtools.h"
 #include "wm.h"
 #include "apps.h"
 #include "screenshot.h"
@@ -68,6 +70,31 @@ static void spinner(void)
 {
 	for (;;)
 		__asm__ volatile ("");
+}
+
+/* Slow post-`sti` device bring-up, run as a background thread so the shell input
+ * loop in kernel_main starts immediately. On real hardware DHCP retransmits and
+ * xHCI port resets (both timer_sleep-based) take seconds; doing them inline left
+ * keystrokes piling up in the keyboard ring — captured at `sti`, but not drained
+ * until the loop ran — and flushing all at once when boot finished. A kernel
+ * thread runs with IF=1, so the "must run after sti" timer_sleep paths are happy. */
+static void boot_bringup(void)
+{
+	bootmark("dhcp");
+	net_dhcp_start();              /* lease IP/gw/dns on the boot NIC. No-op if no */
+	                               /* NIC; on QEMU SLIRP re-leases 10.0.2.15.      */
+
+	bootmark("xhci");
+	xhci_boot();                   /* USB host up + devices configured. Keeps a    */
+	                               /* tethered phone offering USB tethering. No      */
+	                               /* auto-mount: removable volumes mount on demand  */
+	                               /* via the `mount` command.                       */
+
+	bootmark("vmtools");
+	vmtools_init();                /* VMware guest agent: clock sync + guestinfo +   */
+	                               /* heartbeat over the backdoor. No-op off VMware. */
+
+	sched_exit(0);                 /* one-shot: done, leave a zombie to reap        */
 }
 
 /* GRUB boots us through multiboot2 (its only reliable UEFI handoff). Translate
@@ -265,8 +292,17 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	 * mode); otherwise program QEMU's DISPI adapter directly (the -kernel path,
 	 * which provides no framebuffer). */
 	{
-		int rc = -1, adopted = 0;
-		if ((mbi->flags & MULTIBOOT_FLAG_FB) &&
+		int rc = -1, adopted = 0, svga = 0;
+		/* Prefer the VMware SVGA II adapter when its PCI device is present:
+		 * driving it directly (mode control + a command FIFO) beats adopting the
+		 * dumb VBE framebuffer GRUB hands us on a VMware guest, where the legacy
+		 * framebuffer needn't keep auto-refreshing once SVGA mode is on. Returns
+		 * -1 on any non-VMware machine, so the adopt and DISPI paths below still
+		 * serve real GPUs (UEFI GOP) and QEMU's default VGA. */
+		rc = vmsvga_init(1024, 768);
+		svga = (rc == 0);
+		if (rc != 0 &&
+		    (mbi->flags & MULTIBOOT_FLAG_FB) &&
 		    mbi->framebuffer_type == MULTIBOOT_FB_TYPE_RGB &&
 		    mbi->framebuffer_bpp == 32) {
 			rc = fb_adopt((uint32_t)mbi->framebuffer_addr,
@@ -289,6 +325,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			con_write_dec(mbi->framebuffer_width);  con_putc('x');
 			con_write_dec(mbi->framebuffer_height); con_write("x32.\n");
 		}
+		if (svga)
+			con_write("fb: VMware SVGA II adopted.\n");
 		if (rc == 0)
 			con_write("fb: graphics mode up.\n");
 		else
@@ -304,8 +342,9 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
 	blk_init();                    /* pick owofs's backing disk: IDE>AHCI>NVMe */
 	fs_init();                     /* mount it (auto-format only the IDE disk) */
-	blk_mount_fat();               /* mount a FAT volume on a non-owofs disk    */
-
+	/* No auto-mount of removable volumes at boot — they mount only when asked,
+	 * via the `mount` command or the Files app's Connect button (blk_mount_fat /
+	 * blk_mount_device). */
 
 	syscall_init();                /* int 0x80 gate (DPL 3)                   */
 
@@ -331,6 +370,18 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		extern const unsigned char _binary_user_crashme_elf_end[];
 		extern const unsigned char _binary_user_term_elf_start[];
 		extern const unsigned char _binary_user_term_elf_end[];
+		extern const unsigned char _binary_user_neofetch_elf_start[];
+		extern const unsigned char _binary_user_neofetch_elf_end[];
+		extern const unsigned char _binary_user_lspci_elf_start[];
+		extern const unsigned char _binary_user_lspci_elf_end[];
+		extern const unsigned char _binary_user_play_elf_start[];
+		extern const unsigned char _binary_user_play_elf_end[];
+		extern const unsigned char _binary_user_ping_elf_start[];
+		extern const unsigned char _binary_user_ping_elf_end[];
+		extern const unsigned char _binary_user_dig_elf_start[];
+		extern const unsigned char _binary_user_dig_elf_end[];
+		extern const unsigned char _binary_user_torrent_elf_start[];
+		extern const unsigned char _binary_user_torrent_elf_end[];
 		char probe;
 		/* A Unix-like layout: programs in /bin, a home for the user. mkdir is
 		 * a no-op if the directory already exists from a previous boot. */
@@ -378,6 +429,30 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			fs_create("/bin/term", _binary_user_term_elf_start,
 			          (uint32_t)(_binary_user_term_elf_end -
 			                     _binary_user_term_elf_start));
+		if (fs_read("/bin/neofetch", &probe, 0) < 0)
+			fs_create("/bin/neofetch", _binary_user_neofetch_elf_start,
+			          (uint32_t)(_binary_user_neofetch_elf_end -
+			                     _binary_user_neofetch_elf_start));
+		if (fs_read("/bin/lspci", &probe, 0) < 0)
+			fs_create("/bin/lspci", _binary_user_lspci_elf_start,
+			          (uint32_t)(_binary_user_lspci_elf_end -
+			                     _binary_user_lspci_elf_start));
+		if (fs_read("/bin/play", &probe, 0) < 0)
+			fs_create("/bin/play", _binary_user_play_elf_start,
+			          (uint32_t)(_binary_user_play_elf_end -
+			                     _binary_user_play_elf_start));
+		if (fs_read("/bin/ping", &probe, 0) < 0)
+			fs_create("/bin/ping", _binary_user_ping_elf_start,
+			          (uint32_t)(_binary_user_ping_elf_end -
+			                     _binary_user_ping_elf_start));
+		if (fs_read("/bin/dig", &probe, 0) < 0)
+			fs_create("/bin/dig", _binary_user_dig_elf_start,
+			          (uint32_t)(_binary_user_dig_elf_end -
+			                     _binary_user_dig_elf_start));
+		if (fs_read("/bin/torrent", &probe, 0) < 0)
+			fs_create("/bin/torrent", _binary_user_torrent_elf_start,
+			          (uint32_t)(_binary_user_torrent_elf_end -
+			                     _binary_user_torrent_elf_start));
 	}
 	con_write("usermode: ready ('run curl <url>').\n");
 
@@ -389,6 +464,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	sched_init();                  /* current context becomes task "main"     */
 	sched_create_thread("spin-a", spinner);
 	sched_create_thread("spin-b", spinner);
+	shell_stream_start();          /* producer thread for the terminal's streamed cmds */
 	con_write("scheduler: 2 worker threads spawned.\n");
 
 	services_init();               /* supervisor thread + auto-start daemons   */
@@ -402,27 +478,26 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	bootmark("sti");
 	__asm__ volatile ("sti");      /* interrupts on; preemption begins        */
 
-	bootmark("dhcp");
-	net_dhcp_start();              /* lease IP/gw/dns on the boot NIC (post-sti:  */
-	                               /* uses timer_sleep). No-op if no NIC; on QEMU */
-	                               /* SLIRP re-leases the 10.0.2.15 default.      */
-
-	bootmark("xhci");
-	xhci_boot();                   /* USB host up + devices configured (post-sti: */
-	                               /* uses timer_sleep). Keeps a tethered phone   */
-	                               /* offering USB tethering without running lsusb.*/
-
-	bootmark("mount");
-	if (!fat_mounted() && !hfs_mounted() && !ext_mounted() && !iso_mounted())
-		blk_mount_fat();           /* a USB stick only appears after xhci_boot;     */
-	                               /* mount it now if nothing claimed /media yet    */
+	/* DHCP + xHCI + /media mount are slow on real hardware (timer_sleep-based
+	 * retries/resets). Run them in a background thread so the shell input loop
+	 * below starts draining keystrokes immediately instead of letting them pile
+	 * up in the keyboard ring for several seconds and flush all at once. */
+	sched_create_thread("bootup", boot_bringup);
 
 	bootmark("shell");
 	shell_init();
 
 	for (;;) {
-		if (keyboard_take_interrupt())     /* Ctrl+C with no command running  */
-			shell_interrupt();
+		if (keyboard_take_interrupt()) {   /* Ctrl+C                           */
+			/* Route it: a streamed terminal command aborts (kill a CLI child);
+			 * a focused GUI app with no command swallows it; only the bare
+			 * text/serial console falls through to the kernel shell -- otherwise
+			 * the kernel shell would inject "^C"+prompt into the ring-3 term. */
+			if (shell_stream_active())
+				shell_stream_interrupt();   /* echo ^C + cooperative abort  */
+			else if (!wm_focus_takes_keys())
+				shell_interrupt();
+		}
 		char c;
 		while (keyboard_poll(&c))          /* PS/2 keyboard (the QEMU window)  */
 			if (!wm_feed_key(c))           /* focused GUI app first, else shell */

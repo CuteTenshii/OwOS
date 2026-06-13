@@ -35,17 +35,6 @@
 
 /* ------------------------------------------------------------------ helpers */
 
-static int nmemcmp(const void *a, const void *b, uint32_t n)
-{
-	const uint8_t *pa = a, *pb = b;
-	while (n--) {
-		if (*pa != *pb)
-			return (int)*pa - (int)*pb;
-		pa++; pb++;
-	}
-	return 0;
-}
-
 static inline uint16_t bswap16(uint16_t x) { return (uint16_t)((x << 8) | (x >> 8)); }
 #define htons(x) bswap16((uint16_t)(x))
 #define ntohs(x) bswap16((uint16_t)(x))
@@ -135,8 +124,6 @@ static volatile uint8_t  icmp_from[4];
 static volatile uint32_t icmp_send_us;  /* set just before the echo goes out  */
 static volatile uint32_t icmp_rtt_us;   /* recv timestamp - send, set by IRQ  */
 
-#define DNS_MAX_ANS 16
-#define DNS_TEXT    128
 static volatile int      dns_got, dns_ok;             /* dns_ok: saw an A record */
 static volatile uint16_t dns_qid;
 static volatile uint8_t  dns_result[4];               /* first A record (resolve) */
@@ -177,7 +164,7 @@ static void eth_send(const uint8_t dst[6], uint16_t type,
 static int arp_lookup(const uint8_t ip[4], uint8_t out[6])
 {
 	for (int i = 0; i < ARP_CACHE; i++) {
-		if (arp_cache[i].valid && nmemcmp(arp_cache[i].ip, ip, 4) == 0) {
+		if (arp_cache[i].valid && memcmp(arp_cache[i].ip, ip, 4) == 0) {
 			memcpy(out, arp_cache[i].mac, 6);
 			return 1;
 		}
@@ -189,7 +176,7 @@ static void arp_cache_put(const uint8_t ip[4], const uint8_t m[6])
 {
 	int slot = -1;
 	for (int i = 0; i < ARP_CACHE; i++) {
-		if (arp_cache[i].valid && nmemcmp(arp_cache[i].ip, ip, 4) == 0) {
+		if (arp_cache[i].valid && memcmp(arp_cache[i].ip, ip, 4) == 0) {
 			slot = i;
 			break;
 		}
@@ -238,7 +225,7 @@ static void arp_recv(const uint8_t *p, uint32_t len)
 	uint16_t op = ntohs(a->oper);
 	if (op == 2) {                          /* reply: learn the sender         */
 		arp_cache_put(a->spa, a->sha);
-	} else if (op == 1 && nmemcmp(a->tpa, my_ip, 4) == 0) {
+	} else if (op == 1 && memcmp(a->tpa, my_ip, 4) == 0) {
 		arp_cache_put(a->spa, a->sha);  /* someone is asking for us: answer */
 		uint8_t pkt[28];
 		arp_build(pkt, 2, a->sha, a->spa);
@@ -258,6 +245,8 @@ static int arp_resolve(const uint8_t ip[4], uint8_t out[6])
 			__asm__ volatile ("" ::: "memory");
 			if (arp_lookup(ip, out))
 				return 1;
+			if (sched_intr_pending())    /* Ctrl+C: give up resolving */
+				return 0;
 			/* sti before hlt: this resolve can run in syscall context (a
 			 * ring-3 program connecting through net_sock_*), where the int
 			 * 0x80 gate left IF=0 — a bare hlt would halt the CPU forever. */
@@ -325,6 +314,10 @@ const uint8_t *net_my_ip(void)
 
 /* --------------------------------------------------------------------- ICMP */
 
+/* Client-socket RX delivery (defined with the usock layer below). */
+static int  usock_udp_deliver(uint16_t dport, const uint8_t *data, uint32_t len);
+static void usock_icmp_deliver(const uint8_t *msg, uint32_t len);
+
 static void icmp_send_echo(const uint8_t dst[4], uint16_t id, uint16_t seq)
 {
 	uint8_t pkt[8 + 32];
@@ -352,6 +345,7 @@ static void icmp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
 		for (int i = 0; i < 4; i++)
 			icmp_from[i] = src[i];
 		icmp_got = 1;
+		usock_icmp_deliver(p, len);     /* hand the raw message to a raw socket */
 	}
 }
 
@@ -574,6 +568,13 @@ static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
 	if (len < 8)
 		return;
 	const struct udp_hdr *u = (const struct udp_hdr *)p;
+	uint32_t ulen = ntohs(u->len);                 /* trust the smaller length     */
+	if (ulen < 8 || ulen > len)
+		ulen = len;
+	/* A ring-3 client socket (resolver, dig, ...) bound to this local port wins
+	 * first — otherwise the kernel's own sport==53 resolver would eat its reply. */
+	if (usock_udp_deliver(ntohs(u->dport), p + 8, ulen - 8))
+		return;
 	if (ntohs(u->sport) == 53) {
 		dns_recv(p + 8, len - 8);
 		return;
@@ -584,9 +585,6 @@ static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
 	}
 	udp_handler_t fn = udp_lookup(ntohs(u->dport));
 	if (fn) {
-		uint32_t ulen = ntohs(u->len);         /* trust the smaller length     */
-		if (ulen < 8 || ulen > len)
-			ulen = len;
 		fn(src, ntohs(u->sport), p + 8, ulen - 8);
 	}
 }
@@ -771,7 +769,7 @@ static void dhcp_recv(const uint8_t src[4], uint16_t sport,
                       const uint8_t *p, uint32_t len)
 {
 	(void)src; (void)sport;
-	if (len < 240 || nmemcmp(p + 4, dhcp_xid, 4) != 0)
+	if (len < 240 || memcmp(p + 4, dhcp_xid, 4) != 0)
 		return;
 	uint8_t mtype = 0;
 	for (uint32_t i = 240; i + 1 < len; ) {
@@ -931,6 +929,8 @@ static int dns_query(const char *host, uint16_t qtype)
 			__asm__ volatile ("" ::: "memory");
 			if (dns_got)
 				break;
+			if (sched_intr_pending())     /* Ctrl+C: give up the lookup */
+				return 0;
 			__asm__ volatile ("sti\n\thlt");  /* IF=0 in syscall ctx; see arp_resolve */
 		}
 		if (dns_got)
@@ -1476,18 +1476,82 @@ int net_http_get(const char *url, uint8_t *buf, uint32_t cap)
  * HTTP itself. Deliberately tiny: connect (DNS + TCP + optional TLS), send,
  * recv (blocking, EOF-terminated), close. TLS is single-flow in tls.c, so at
  * most one handle may be a TLS session at a time. */
-#define NET_SOCK_MAX 4
+#define NET_SOCK_MAX  4
+#define SOCK_DGRAM    1500   /* one datagram's worth of rx per UDP/ICMP socket */
 static struct usock {
 	uint8_t      used;
-	uint8_t      tls;          /* this handle owns the (single) TLS session  */
-	uint8_t      closed;       /* peer FIN / close_notify already seen        */
-	tcp_conn_t  *conn;         /* bare-TCP connection (NULL while tls)         */
+	uint8_t      proto;        /* SK_TCP / SK_TLS / SK_UDP / SK_ICMP          */
+	uint8_t      closed;       /* peer FIN / close_notify already seen (TCP)  */
+	tcp_conn_t  *conn;         /* bare-TCP connection (TCP only)              */
+	uint8_t      peer[4];      /* UDP/ICMP destination                        */
+	uint16_t     lport, rport; /* UDP local / remote ports                    */
+	/* Datagram receive (UDP/ICMP): the RX IRQ drops the latest datagram here;
+	 * net_sock_recv drains it. Single slot — these are request/reply flows. */
+	volatile int dg_ready;
+	volatile uint32_t dg_len;
+	uint8_t      dg[SOCK_DGRAM];
 } usocks[NET_SOCK_MAX];
 
-/* Resolve `host` (dotted-quad or DNS name), open TCP, optionally run the TLS
- * handshake with SNI=host. Returns a handle 0..NET_SOCK_MAX-1, or a negative
- * error: -1 no slot / no NIC, -2 resolve failed, -3 connect/handshake failed. */
-int net_sock_connect(const char *host, uint16_t port, int tls)
+/* Deliver an inbound UDP datagram to a matching client socket (by local port).
+ * Called from the RX IRQ; returns 1 if a socket claimed it. */
+static int usock_udp_deliver(uint16_t dport, const uint8_t *data, uint32_t len)
+{
+	for (int i = 0; i < NET_SOCK_MAX; i++) {
+		struct usock *s = &usocks[i];
+		if (s->used && s->proto == SK_UDP && s->lport == dport) {
+			if (len > SOCK_DGRAM) len = SOCK_DGRAM;
+			for (uint32_t k = 0; k < len; k++) s->dg[k] = data[k];
+			s->dg_len = len;
+			s->dg_ready = 1;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Deliver an inbound ICMP message to a raw ICMP socket (the program matches the
+ * id/seq itself). Called from the RX IRQ. */
+static void usock_icmp_deliver(const uint8_t *msg, uint32_t len)
+{
+	for (int i = 0; i < NET_SOCK_MAX; i++) {
+		struct usock *s = &usocks[i];
+		if (s->used && s->proto == SK_ICMP) {
+			if (len > SOCK_DGRAM) len = SOCK_DGRAM;
+			for (uint32_t k = 0; k < len; k++) s->dg[k] = msg[k];
+			s->dg_len = len;
+			s->dg_ready = 1;
+			return;
+		}
+	}
+}
+
+/* Block ~2 s for a datagram on a UDP/ICMP socket. >0 bytes / 0 timeout / -4 intr. */
+static int sock_dgram_recv(struct usock *s, void *buf, uint32_t max)
+{
+	uint32_t deadline = timer_ticks() + 2 * TIMER_HZ;
+	for (;;) {
+		if (s->dg_ready) {
+			__asm__ volatile ("cli");
+			uint32_t n = s->dg_len;
+			if (n > max) n = max;
+			for (uint32_t i = 0; i < n; i++)
+				((uint8_t *)buf)[i] = s->dg[i];
+			s->dg_ready = 0;
+			__asm__ volatile ("sti");
+			return (int)n;
+		}
+		if (sched_intr_pending())
+			return -4;
+		if (timer_ticks() > deadline)
+			return 0;
+		__asm__ volatile ("sti\n\thlt");
+	}
+}
+
+/* Open a socket: TCP/TLS connect, or a UDP/raw-ICMP datagram socket bound to
+ * `peer`. Returns a handle 0..NET_SOCK_MAX-1, or -1 no slot/NIC, -2 resolve, -3
+ * connect/handshake, -4 Ctrl+C. */
+int net_sock_connect(const char *host, uint16_t port, int proto)
 {
 	if (!nic_present())
 		return -1;
@@ -1496,26 +1560,41 @@ int net_sock_connect(const char *host, uint16_t port, int tls)
 		if (!usocks[i].used) { h = i; break; }
 	if (h < 0)
 		return -1;
-	if (tls)
+	if (proto == SK_TLS)
 		for (int i = 0; i < NET_SOCK_MAX; i++)
-			if (usocks[i].used && usocks[i].tls)
+			if (usocks[i].used && usocks[i].proto == SK_TLS)
 				return -1;            /* TLS is single-flow */
 
 	uint8_t ip[4];
 	if (!parse_ipv4(host, ip) && !dns_resolve(host, ip))
-		return -2;
+		return sched_intr_pending() ? -4 : -2;
 
 	struct usock *s = &usocks[h];
-	s->tls = tls ? 1 : 0;
+	s->proto = (uint8_t)proto;
 	s->closed = 0;
 	s->conn = NULL;
-	if (tls) {
+	s->dg_ready = 0;
+	for (int i = 0; i < 4; i++) s->peer[i] = ip[i];
+
+	switch (proto) {
+	case SK_TLS:
 		if (!tls_connect(ip, port, host))
-			return -3;
-	} else {
+			return sched_intr_pending() ? -4 : -3;
+		break;
+	case SK_TCP:
 		s->conn = tcp_connect(ip, port);
 		if (!s->conn)
-			return -3;
+			return sched_intr_pending() ? -4 : -3;
+		break;
+	case SK_UDP:
+		s->rport = port;
+		s->lport = (uint16_t)(0xC000 + h);   /* unique per slot for rx demux  */
+		break;
+	case SK_ICMP:
+		s->lport = s->rport = 0;
+		break;
+	default:
+		return -1;
 	}
 	s->used = 1;
 	return h;
@@ -1526,21 +1605,35 @@ int net_sock_send(int h, const void *buf, uint32_t len)
 	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
 		return -1;
 	struct usock *s = &usocks[h];
-	return s->tls ? tls_write(buf, len) : tcp_write(s->conn, buf, len);
+	switch (s->proto) {
+	case SK_TLS:  return tls_write(buf, len);
+	case SK_TCP:  return tcp_write(s->conn, buf, len);
+	case SK_UDP:
+		net_udp_send(s->peer, s->rport, s->lport, buf, len);
+		return (int)len;
+	case SK_ICMP:                            /* program built the ICMP message */
+		ip_send(s->peer, IP_ICMP, buf, len);
+		return (int)len;
+	}
+	return -1;
 }
 
-/* Block until bytes arrive or the peer closes. Returns >0 bytes, 0 at EOF,
- * -1 on error/reset. */
+/* Block for data. TCP/TLS: >0 bytes, 0 EOF, -1 error, -4 intr. UDP/ICMP: >0
+ * datagram bytes, 0 timeout, -4 intr. */
 int net_sock_recv(int h, void *buf, uint32_t max)
 {
 	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
 		return -1;
 	struct usock *s = &usocks[h];
+	if (s->proto == SK_UDP || s->proto == SK_ICMP)
+		return sock_dgram_recv(s, buf, max);
 	if (s->closed)
 		return 0;
 	int closed = 0;
-	int r = s->tls ? tls_read(buf, max, &closed)
-	               : tcp_read(s->conn, buf, max, &closed);
+	int r = s->proto == SK_TLS ? tls_read(buf, max, &closed)
+	                           : tcp_read(s->conn, buf, max, &closed);
+	if (r == TCP_EINTR)
+		return -4;
 	if (r < 0)
 		return -1;
 	if (closed)
@@ -1553,11 +1646,11 @@ int net_sock_close(int h)
 	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
 		return -1;
 	struct usock *s = &usocks[h];
-	if (s->tls)
+	if (s->proto == SK_TLS)
 		tls_close();
-	else if (s->conn)
+	else if (s->proto == SK_TCP && s->conn)
 		tcp_close(s->conn);
-	s->used = s->tls = s->closed = 0;
+	s->used = s->closed = 0;
 	s->conn = NULL;
 	return 0;
 }
@@ -1637,6 +1730,76 @@ int net_ping(const char *host)
 	con_write_dec((uint32_t)recv);
 	con_write(" received\n");
 	return recv > 0 ? 0 : -1;
+}
+
+/* Resolve a host (dotted-quad or DNS name) to an IPv4 address. 1 on success.
+ * Exposed for the ring-3 ping/dig programs via SYS_RESOLVE. */
+int net_resolve(const char *host, uint8_t ip[4])
+{
+	if (parse_ipv4(host, ip))
+		return 1;
+	return dns_resolve(host, ip);
+}
+
+/* Run a DNS query and hand the parsed answers back to the ring-3 dig program
+ * (the wire parse already happened in dns_recv off the RX IRQ). Returns the
+ * answer count (>=0), -2 if Ctrl+C interrupted the wait, -1 on no response/no
+ * NIC. Fills *out (count, rtt, answers). */
+int net_dig_query(const char *host, uint16_t qtype, struct dns_result *out)
+{
+	out->count = 0;
+	out->rtt_us = 0;
+	if (!nic_present())
+		return -1;
+	if (!dns_query(host, qtype))
+		return sched_intr_pending() ? -2 : -1;
+
+	int c = dns_ans_count;
+	if (c > DNS_MAX_ANS)
+		c = DNS_MAX_ANS;
+	out->count = c;
+	out->rtt_us = dns_rtt_us;
+	for (int i = 0; i < c; i++) {
+		out->ans[i].type = dns_ans_type[i];
+		out->ans[i].ttl  = dns_ans_ttl[i];
+		int k = 0;
+		for (; k < DNS_TEXT - 1 && dns_ans_text[i][k]; k++)
+			out->ans[i].text[k] = dns_ans_text[i][k];
+		out->ans[i].text[k] = '\0';
+	}
+	return c;
+}
+
+/* Send one ICMP echo to `ip` with (id,seq) and wait up to ~1 s for the matching
+ * reply. Returns the round-trip time in microseconds (>=0), or -1 timeout, -2
+ * Ctrl+C, -3 no NIC. `from` (if non-NULL) gets the responder's IP. The ring-3
+ * ping program drives the loop/printing/stats over SYS_PING_ONCE; the kernel
+ * just does one exchange so it stays interruptible and out of ring 0. */
+int net_ping_once(const uint8_t ip[4], uint16_t id, uint16_t seq, uint8_t from[4])
+{
+	if (!nic_present())
+		return -3;
+	uint8_t warm[6];
+	next_hop_mac(ip, warm);             /* warm ARP so the RTT isn't skewed     */
+
+	icmp_got = 0;
+	uint32_t deadline = timer_ticks() + TIMER_HZ;       /* ~1 s                 */
+	icmp_send_us = timer_us();
+	icmp_send_echo(ip, id, seq);
+
+	while (timer_ticks() < deadline) {
+		__asm__ volatile ("" ::: "memory");
+		if (icmp_got && icmp_id_rx == id) {
+			if (from)
+				for (int i = 0; i < 4; i++)
+					from[i] = ((const uint8_t *)icmp_from)[i];
+			return (int)icmp_rtt_us;
+		}
+		if (sched_intr_pending())       /* Ctrl+C from the ring-3 ping         */
+			return -2;
+		__asm__ volatile ("sti\n\thlt");  /* IF=0 in syscall ctx               */
+	}
+	return -1;
 }
 
 /* Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01). */
