@@ -7,11 +7,13 @@
 #include "fat.h"
 #include "hfs.h"
 #include "ext.h"
+#include "iso9660.h"
 #include "console.h"
 #include "rtc.h"
 
-/* A mounted removable volume (FAT via fat.c, HFS+ via hfs.c, or ext2/3/4 via
- * ext.c) is grafted into the owofs namespace at "/media" -- so the ordinary
+/* A mounted removable volume (FAT via fat.c, HFS+ via hfs.c, ext2/3/4 via ext.c,
+ * or ISO 9660 CD/DVD via iso9660.c) is grafted into the owofs namespace at
+ * "/media" -- so the ordinary
  * ls/cat/cd reach it with no per-command special-casing and no parallel verbs.
  * media_subpath() recognises a path inside the mount and returns the path *within*
  * the volume: "" for "/media" itself, "/docs/README.TXT" for the nested file. It
@@ -19,17 +21,41 @@
 #define MEDIA_MOUNT "media"
 
 /* Exactly one removable volume is mounted at a time; these dispatch to whichever
- * driver owns it. Writes go to FAT only -- HFS+ and ext are read-only. */
-static int rvol_mounted(void)  { return fat_mounted() || hfs_mounted() || ext_mounted(); }
-static int rvol_readonly(void) { return hfs_mounted() || ext_mounted(); }
+ * driver owns it. Writes go to FAT only -- HFS+, ext and ISO 9660 are read-only.
+ * One if-ladder per verb, in the same driver order, keeps the routing legible. */
+static int rvol_mounted(void)
+{ return fat_mounted() || hfs_mounted() || ext_mounted() || iso_mounted(); }
+static int rvol_readonly(void)
+{ return hfs_mounted() || ext_mounted() || iso_mounted(); }
+
 static int rvol_list(const char *p)
-{ return ext_mounted() ? ext_list(p) : hfs_mounted() ? hfs_list(p) : fat_list(p); }
+{
+	if (iso_mounted()) return iso_list(p);
+	if (ext_mounted()) return ext_list(p);
+	if (hfs_mounted()) return hfs_list(p);
+	return fat_list(p);
+}
 static int rvol_stat(const char *p, int *d, uint32_t *s)
-{ return ext_mounted() ? ext_stat(p, d, s) : hfs_mounted() ? hfs_stat(p, d, s) : fat_stat(p, d, s); }
+{
+	if (iso_mounted()) return iso_stat(p, d, s);
+	if (ext_mounted()) return ext_stat(p, d, s);
+	if (hfs_mounted()) return hfs_stat(p, d, s);
+	return fat_stat(p, d, s);
+}
 static int rvol_read_at(const char *p, uint32_t o, void *b, uint32_t l)
-{ return ext_mounted() ? ext_read_at(p, o, b, l) : hfs_mounted() ? hfs_read_at(p, o, b, l) : fat_read_at(p, o, b, l); }
+{
+	if (iso_mounted()) return iso_read_at(p, o, b, l);
+	if (ext_mounted()) return ext_read_at(p, o, b, l);
+	if (hfs_mounted()) return hfs_read_at(p, o, b, l);
+	return fat_read_at(p, o, b, l);
+}
 static int rvol_enum(const char *p, int i, char *n, int *d, uint32_t *s)
-{ return ext_mounted() ? ext_enum_dir(p, i, n, d, s) : hfs_mounted() ? hfs_enum_dir(p, i, n, d, s) : fat_enum_dir(p, i, n, d, s); }
+{
+	if (iso_mounted()) return iso_enum_dir(p, i, n, d, s);
+	if (ext_mounted()) return ext_enum_dir(p, i, n, d, s);
+	if (hfs_mounted()) return hfs_enum_dir(p, i, n, d, s);
+	return fat_enum_dir(p, i, n, d, s);
+}
 
 static const char *media_subpath(const char *path)
 {

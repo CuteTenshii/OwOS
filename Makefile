@@ -15,25 +15,28 @@ CC      := gcc
 # Freestanding: no host headers/libc, no PIE, no stack protector, no red zone.
 # -mno-sse/-mno-mmx: the kernel never enables SSE (CR4.OSFXSR), so GCC must not
 # auto-vectorize (e.g. a 16-byte init) into xmm/mmx instructions — those #UD.
+# Device drivers live under drivers/<type>/; each subdir is added to the include
+# path so the flat `#include "foo.h"` convention keeps resolving everywhere.
+DRVDIRS := storage net audio usb input video acpi bus
 CFLAGS  := -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
-           -mno-sse -mno-mmx -Wall -Wextra -Ikernel
+           -mno-sse -mno-mmx -Wall -Wextra -Ikernel $(addprefix -Idrivers/,$(DRVDIRS))
 LDFLAGS := -m32 -ffreestanding -nostdlib -no-pie -T linker.ld
 
 OBJS    := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flush.o \
            kernel/idt.o kernel/isr.o kernel/irq.o kernel/irq_stubs.o \
-           kernel/keyboard.o kernel/timer.o kernel/shell.o kernel/serial.o kernel/log.o \
+           drivers/input/keyboard.o kernel/timer.o kernel/shell.o kernel/serial.o kernel/log.o \
            kernel/pmm.o kernel/paging.o kernel/heap.o kernel/kstring.o \
            kernel/sched.o kernel/switch.o \
-           kernel/ata.o kernel/ahci.o kernel/nvme.o kernel/blk.o kernel/fs.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/pci.o kernel/usb.o kernel/xhci.o \
-           kernel/nic.o kernel/rtl8139.o kernel/e1000.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/tls.o \
+           drivers/storage/ata.o drivers/storage/ahci.o drivers/storage/nvme.o drivers/storage/sd.o drivers/storage/atapi.o kernel/blk.o kernel/fs.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/iso9660.o drivers/bus/pci.o drivers/usb/usb.o drivers/usb/xhci.o \
+           drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/tls.o \
            kernel/url.o kernel/zip.o kernel/gzip.o kernel/png.o kernel/screenshot.o \
            kernel/bencode.o kernel/torrent.o kernel/tracker.o kernel/peer.o \
-           kernel/speaker.o kernel/sb16.o \
-           kernel/cpu.o kernel/rtc.o kernel/neofetch.o kernel/power.o kernel/battery.o \
-           kernel/firmware.o kernel/smbios.o kernel/aml.o kernel/edid.o \
+           drivers/audio/speaker.o drivers/audio/sb16.o \
+           kernel/cpu.o kernel/rtc.o kernel/neofetch.o drivers/acpi/power.o drivers/acpi/battery.o \
+           kernel/firmware.o kernel/smbios.o drivers/acpi/aml.o drivers/video/edid.o \
            kernel/syscall.o kernel/loader.o kernel/pipe.o kernel/services.o \
            kernel/smb.o \
-           kernel/fb.o kernel/mtrr.o kernel/mouse.o kernel/wm.o kernel/uwin.o kernel/crash.o \
+           drivers/video/fb.o drivers/video/mtrr.o drivers/input/mouse.o kernel/wm.o kernel/uwin.o kernel/crash.o \
            kernel/apps.o \
            kernel/edit_blob.o kernel/curl_blob.o \
            kernel/editor_blob.o kernel/about_blob.o \
@@ -136,9 +139,37 @@ $(USBDISK):
 	mcopy -i $(USBDISK) /tmp/owos_usb.txt ::photos/NOTES.TXT
 	rm -f /tmp/owos_usb.txt
 
+# A FAT16-formatted image presented as an SD card behind an SDHCI controller
+# (sdhci-pci + sd-card), so the SD/MMC driver (kernel/sd.c) has a real card to
+# bring up and mount at /media. Delete sd.img to re-seed.
+SDDISK := sd.img
+$(SDDISK):
+	dd if=/dev/zero of=$(SDDISK) bs=1M count=64 status=none
+	mkfs.fat -F 16 -n OWOSSD $(SDDISK) >/dev/null
+	printf 'hello from an SD card\n' > /tmp/owos_sd.txt
+	mmd   -i $(SDDISK) ::DCIM
+	mcopy -i $(SDDISK) /tmp/owos_sd.txt ::READSD.TXT
+	mcopy -i $(SDDISK) /tmp/owos_sd.txt ::DCIM/NOTES.TXT
+	rm -f /tmp/owos_sd.txt
+
+# A real ISO 9660 disc image (with a Joliet name tree, -J) presented as an ATAPI
+# CD-ROM, so the CD/DVD driver (kernel/atapi.c) and ISO filesystem
+# (kernel/iso9660.c) have a disc to read and mount at /media. Built with
+# xorrisofs (from xorriso, already a dependency of grub-mkrescue). Delete cd.iso
+# to re-seed.
+CDISK := cd.iso
+$(CDISK):
+	rm -rf /tmp/owos_cd && mkdir -p /tmp/owos_cd/docs
+	printf 'hello from an ISO 9660 CD-ROM\n' > /tmp/owos_cd/HELLO.TXT
+	printf 'OwOS reads ISO 9660 and Joliet long names.\n' > '/tmp/owos_cd/A Long Disc File.txt'
+	printf 'nested on the disc\n' > /tmp/owos_cd/docs/README.TXT
+	xorrisofs -J -R -V OWOSCD -o $(CDISK) /tmp/owos_cd >/dev/null 2>&1
+	rm -rf /tmp/owos_cd
+
 # disk.img stays the IDE boot disk (owofs). The SATA disk hangs off an AHCI
 # controller and the NVMe disk off an emulated PCIe SSD, so all three storage
-# drivers find hardware to drive. A USB flash drive hangs off an xHCI controller.
+# drivers find hardware to drive. A USB flash drive hangs off an xHCI controller;
+# the CD-ROM rides QEMU's secondary IDE channel (-cdrom).
 STORAGE := -hda $(DISK) \
 	-device ich9-ahci,id=ahci \
 	-drive id=satadisk,file=$(SATADISK),if=none,format=raw \
@@ -147,9 +178,13 @@ STORAGE := -hda $(DISK) \
 	-device nvme,drive=nvmedisk,serial=owos-nvme0 \
 	-device qemu-xhci,id=xhci \
 	-drive id=usbdisk,file=$(USBDISK),if=none,format=raw \
-	-device usb-storage,bus=xhci.0,drive=usbdisk
+	-device usb-storage,bus=xhci.0,drive=usbdisk \
+	-device sdhci-pci,id=sdhci \
+	-drive id=sddisk,file=$(SDDISK),if=none,format=raw \
+	-device sd-card,drive=sddisk \
+	-cdrom $(CDISK)
 
-run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK)
+run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	qemu-system-i386 -kernel $(KERNEL) $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445 -device $(NIC),netdev=net0 \
 		-audiodev pipewire,id=snd0 -machine pcspk-audiodev=snd0 \
@@ -157,7 +192,7 @@ run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK)
 		-usb -device usb-tablet
 
 # Headless: no window, console comes out on the terminal via COM1.
-debug: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK)
+debug: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	qemu-system-i386 -kernel $(KERNEL) -display none $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445 -device $(NIC),netdev=net0 \
 		-usb -device usb-tablet
@@ -238,4 +273,4 @@ clean:
 
 # Also remove the disk images (wipes stored files).
 distclean: clean
-	rm -f $(DISK) $(SATADISK) $(NVMEDISK)
+	rm -f $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)

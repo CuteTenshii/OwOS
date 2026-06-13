@@ -12,30 +12,13 @@
 #include <stddef.h>
 
 #include "hfs.h"
+#include "endian.h"
 #include "console.h"
 #include "kstring.h"
 
 /* ------------------------------------------------------------- BE readers */
-static uint16_t be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
-static uint32_t be32(const uint8_t *p)
-{
-	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-	       ((uint32_t)p[2] << 8) | p[3];
-}
-static uint64_t be64(const uint8_t *p)
-{
-	return ((uint64_t)be32(p) << 32) | be32(p + 4);
-}
 
 static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
-static void put_u32(uint32_t v)
-{
-	char b[11]; int i = 10; b[i--] = '\0';
-	if (!v) b[i--] = '0';
-	while (v) { b[i--] = (char)('0' + v % 10); v /= 10; }
-	con_write(&b[i + 1]);
-}
 
 /* --------------------------------------------------------------- state */
 #define HFS_SIG   0x482Bu     /* 'H+' */
@@ -80,7 +63,7 @@ static int dev_read(uint64_t byteoff, uint8_t *buf, uint32_t len)
 			return -1;
 		uint32_t n = 512 - soff;
 		if (n > len) n = len;
-		kmemcpy(buf, s + soff, n);
+		memcpy(buf, s + soff, n);
 		buf += n; byteoff += n; len -= n;
 	}
 	return 0;
@@ -118,7 +101,7 @@ static int read_node(uint32_t idx)
  * array: the last 2 bytes hold record 0's offset, etc.). */
 static uint32_t rec_off(int i)
 {
-	return be16(nodebuf + vol.node_size - 2 * (i + 1));
+	return load_be16(nodebuf + vol.node_size - 2 * (i + 1));
 }
 
 /* Convert an HFSUniStr255 name (UTF-16BE) to ASCII into out[cap]. */
@@ -126,7 +109,7 @@ static void uni_ascii(const uint8_t *p, int n, char *out, int cap)
 {
 	int o = 0;
 	for (int i = 0; i < n && o < cap - 1; i++) {
-		uint16_t u = be16(p + i * 2);
+		uint16_t u = load_be16(p + i * 2);
 		out[o++] = (u >= 0x20 && u < 0x7F) ? (char)u : '?';
 	}
 	out[o] = '\0';
@@ -144,12 +127,12 @@ struct catrec {
 static void parse_rec(int i, struct catrec *c)
 {
 	uint32_t ro = rec_off(i);
-	uint16_t keyLen = be16(nodebuf + ro);
-	c->parent  = be32(nodebuf + ro + 2);
-	c->namelen = be16(nodebuf + ro + 6);
+	uint16_t keyLen = load_be16(nodebuf + ro);
+	c->parent  = load_be32(nodebuf + ro + 2);
+	c->namelen = load_be16(nodebuf + ro + 6);
 	c->name    = nodebuf + ro + 8;
 	c->data    = nodebuf + ro + 2 + keyLen;   /* key length excludes its field */
-	c->type    = be16(c->data);
+	c->type    = load_be16(c->data);
 }
 
 /* Hidden if the name is empty or begins with a control character -- this skips
@@ -158,7 +141,7 @@ static int rec_hidden(const struct catrec *c)
 {
 	if (c->namelen == 0)
 		return 1;
-	return be16(c->name) < 0x20;
+	return load_be16(c->name) < 0x20;
 }
 
 /* Fill an obj from a folder/file record body. */
@@ -166,16 +149,16 @@ static void rec_to_obj(const struct catrec *c, struct obj *o)
 {
 	if (c->type == 1) {                       /* folder */
 		o->is_dir = 1;
-		o->cnid   = be32(c->data + 8);
+		o->cnid   = load_be32(c->data + 8);
 		o->size   = 0;
 	} else {                                  /* file */
 		o->is_dir = 0;
-		o->cnid   = be32(c->data + 8);
+		o->cnid   = load_be32(c->data + 8);
 		const uint8_t *fork = c->data + 88;   /* HFSPlusForkData (data fork) */
-		o->size = be64(fork);
+		o->size = load_be64(fork);
 		for (int i = 0; i < 8; i++) {
-			o->ext[i].start = be32(fork + 16 + i * 8);
-			o->ext[i].count = be32(fork + 16 + i * 8 + 4);
+			o->ext[i].start = load_be32(fork + 16 + i * 8);
+			o->ext[i].count = load_be32(fork + 16 + i * 8 + 4);
 		}
 	}
 }
@@ -194,8 +177,8 @@ static int for_each_leaf(int (*visit)(const struct catrec *, void *), void *ctx)
 			return 0;
 		if (nodebuf[8] != 0xFF)               /* kind: leaf == 0xFF */
 			return 0;
-		int nrec = be16(nodebuf + 10);
-		uint32_t fLink = be32(nodebuf + 0);
+		int nrec = load_be16(nodebuf + 10);
+		uint32_t fLink = load_be32(nodebuf + 0);
 		for (int i = 0; i < nrec; i++) {
 			struct catrec c;
 			parse_rec(i, &c);
@@ -290,18 +273,18 @@ static int resolve(const char *path, struct obj *out)
 
 static int parse_volume_header(const uint8_t *vh)
 {
-	uint16_t sig = be16(vh);
+	uint16_t sig = load_be16(vh);
 	if (sig != HFS_SIG && sig != HFSX_SIG)
 		return -1;
-	vol.block_size   = be32(vh + 40);
-	vol.total_blocks = be32(vh + 44);
+	vol.block_size   = load_be32(vh + 40);
+	vol.total_blocks = load_be32(vh + 44);
 	if (vol.block_size < 512 || (vol.block_size % 512) != 0)
 		return -1;
 
 	const uint8_t *cf = vh + 272;             /* catalogFile fork */
 	for (int i = 0; i < 8; i++) {
-		vol.cat_ext[i].start = be32(cf + 16 + i * 8);
-		vol.cat_ext[i].count = be32(cf + 16 + i * 8 + 4);
+		vol.cat_ext[i].start = load_be32(cf + 16 + i * 8);
+		vol.cat_ext[i].count = load_be32(cf + 16 + i * 8 + 4);
 	}
 	if (vol.cat_ext[0].count == 0)
 		return -1;
@@ -341,8 +324,8 @@ int hfs_mount(hfs_read_fn read, uint32_t base_lba)
 	if (dev_read(devoff, hdr, 512) != 0)
 		return -1;
 	const uint8_t *hr = hdr + 14;             /* BTHeaderRec */
-	vol.first_leaf = be32(hr + 10);
-	vol.node_size  = be16(hr + 18);
+	vol.first_leaf = load_be32(hr + 10);
+	vol.node_size  = load_be16(hr + 18);
 	if (vol.node_size < 512 || vol.node_size > MAX_NODE ||
 	    (vol.node_size % 512) != 0)
 		return -1;
@@ -357,11 +340,6 @@ int hfs_mount(hfs_read_fn read, uint32_t base_lba)
 	return 0;
 }
 
-static uint32_t le32(const uint8_t *p)        /* GPT fields are little-endian */
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
 /* Read `len` bytes from absolute device byte offset using a raw read callback
  * (used during probing, before vol.read/base are set). */
@@ -375,7 +353,7 @@ static int raw_read(hfs_read_fn read, uint64_t byteoff, uint8_t *buf, uint32_t l
 			return -1;
 		uint32_t n = 512 - soff;
 		if (n > len) n = len;
-		kmemcpy(buf, s + soff, n);
+		memcpy(buf, s + soff, n);
 		buf += n; byteoff += n; len -= n;
 	}
 	return 0;
@@ -392,9 +370,9 @@ static int probe(hfs_read_fn read)
 	/* GPT: header at LBA 1 ("EFI PART"), entry array described in LE fields. */
 	if (read(1, sec) == 0 && sec[0] == 'E' && sec[1] == 'F' &&
 	    sec[2] == 'I' && sec[3] == ' ' && sec[4] == 'P') {
-		uint64_t ent_lba = (uint64_t)le32(sec + 72) | ((uint64_t)le32(sec + 76) << 32);
-		uint32_t ent_cnt = le32(sec + 80);
-		uint32_t ent_sz  = le32(sec + 84);
+		uint64_t ent_lba = (uint64_t)load_le32(sec + 72) | ((uint64_t)load_le32(sec + 76) << 32);
+		uint32_t ent_cnt = load_le32(sec + 80);
+		uint32_t ent_sz  = load_le32(sec + 84);
 		if (ent_sz < 128) ent_sz = 128;
 		if (ent_cnt > 128) ent_cnt = 128;
 		uint8_t ent[128];
@@ -404,7 +382,7 @@ static int probe(hfs_read_fn read)
 			int empty = 1;                    /* zero type GUID => unused slot */
 			for (int b = 0; b < 16; b++) if (ent[b]) { empty = 0; break; }
 			if (empty) continue;
-			uint64_t first = (uint64_t)le32(ent + 32) | ((uint64_t)le32(ent + 36) << 32);
+			uint64_t first = (uint64_t)load_le32(ent + 32) | ((uint64_t)load_le32(ent + 36) << 32);
 			if (first && hfs_mount(read, (uint32_t)first) == 0)
 				return 0;
 		}
@@ -412,12 +390,12 @@ static int probe(hfs_read_fn read)
 
 	/* Apple Partition Map: block 1 starts with 'PM' (0x504D), big-endian. */
 	if (read(1, sec) == 0 && sec[0] == 0x50 && sec[1] == 0x4D) {
-		uint32_t mapblks = be32(sec + 4);        /* pmMapBlkCnt */
+		uint32_t mapblks = load_be32(sec + 4);        /* pmMapBlkCnt */
 		if (mapblks > 64) mapblks = 64;
 		for (uint32_t i = 1; i <= mapblks; i++) {
 			if (read(i, sec) != 0) break;
 			if (sec[0] != 0x50 || sec[1] != 0x4D) continue;
-			uint32_t pstart = be32(sec + 8);     /* pmPyPartStart */
+			uint32_t pstart = load_be32(sec + 8);     /* pmPyPartStart */
 			if (pstart && hfs_mount(read, pstart) == 0)
 				return 0;
 		}
@@ -478,7 +456,7 @@ static int visit_list(const struct catrec *c, void *vp)
 	if (L->want_idx < 0) {                    /* print mode */
 		struct obj o; rec_to_obj(c, &o);
 		con_write(o.is_dir ? "  <DIR>  " : "         ");
-		if (!o.is_dir) { put_u32((uint32_t)o.size); con_write("  "); }
+		if (!o.is_dir) { con_write_dec((uint32_t)o.size); con_write("  "); }
 		else           { con_write("  "); }
 		con_write(nm);
 		con_putc('\n');

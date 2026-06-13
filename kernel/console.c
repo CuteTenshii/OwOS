@@ -320,3 +320,12 @@ void con_write_dec(uint32_t value)
 	while (i--)
 		con_putc(tmp[i]);          /* digits came out reversed                */
 }
+
+/* The bare fixed-width hex print the device probes (usb/pci/xhci) each used to
+ * carry privately: `digits` lowercase nibbles, most-significant first, no "0x". */
+void con_put_hex(uint32_t value, int digits)
+{
+	static const char h[] = "0123456789abcdef";
+	for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
+		con_putc(h[(value >> shift) & 0xF]);
+}

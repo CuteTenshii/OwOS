@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include "sb16.h"
+#include "endian.h"
 #include "io.h"
 #include "irq.h"
 #include "console.h"
@@ -168,15 +169,7 @@ static void dma_setup_autoinit(uint32_t phys, uint32_t count)
 
 /* ---- WAV parsing + streaming ------------------------------------------- */
 
-static uint32_t rd32(const uint8_t *p)
-{
-	return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
-static uint16_t rd16(const uint8_t *p)
-{
-	return (uint16_t)(p[0] | (p[1] << 8));
-}
 
 static int tag_eq(const uint8_t *p, const char *s)
 {
@@ -206,9 +199,9 @@ static uint32_t fill_half(uint8_t *dst, const char *fn, uint32_t data_off,
 				if (bits == 8) {
 					v = (channels == 2) ? ((int)s[0] + s[1]) / 2 : s[0];
 				} else {
-					int v0 = (int16_t)rd16(s);
+					int v0 = (int16_t)load_le16(s);
 					if (channels == 2)
-						v0 = (v0 + (int16_t)rd16(s + 2)) / 2;
+						v0 = (v0 + (int16_t)load_le16(s + 2)) / 2;
 					v = (v0 >> 8) + 128;
 				}
 				dst[i] = (uint8_t)v;
@@ -250,12 +243,12 @@ int sb16_play_wav(const char *fn)
 	uint32_t rate = 0, data_off = 0, data_len = 0;
 	for (uint32_t pos = 12; pos + 8 <= (uint32_t)got; ) {
 		const uint8_t *c = hdr + pos;
-		uint32_t sz = rd32(c + 4);
+		uint32_t sz = load_le32(c + 4);
 		if (tag_eq(c, "fmt ")) {
-			fmt      = rd16(c + 8);
-			channels = rd16(c + 10);
-			rate     = rd32(c + 12);
-			bits     = rd16(c + 22);
+			fmt      = load_le16(c + 8);
+			channels = load_le16(c + 10);
+			rate     = load_le32(c + 12);
+			bits     = load_le16(c + 22);
 		} else if (tag_eq(c, "data")) {
 			data_off = pos + 8;
 			data_len = sz;

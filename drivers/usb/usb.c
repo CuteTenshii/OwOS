@@ -95,13 +95,6 @@ struct uhci_qh {
 	uint32_t sw[2];
 };
 
-static void put_hex(uint32_t value, int digits)
-{
-	static const char h[] = "0123456789abcdef";
-	for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-		con_putc(h[(value >> shift) & 0xF]);
-}
-
 static const char *controller_type(uint8_t prog_if)
 {
 	switch (prog_if) {
@@ -333,8 +326,8 @@ static void uhci_enumerate(uint16_t io, uint16_t portsc_off)
 	uint8_t  iproduct = desc[15];
 
 	con_write("      ");
-	put_hex(vid, 4); con_putc(':'); put_hex(pid, 4);
-	con_write("  class "); put_hex(cls, 2);
+	con_put_hex(vid, 4); con_putc(':'); con_put_hex(pid, 4);
+	con_write("  class "); con_put_hex(cls, 2);
 	uhci_print_string(io, lowspeed, maxpacket, iproduct);
 	con_putc('\n');
 }
@@ -399,12 +392,12 @@ void usb_list(int detail_port)
 					continue;
 
 				found++;
-				put_hex(bus, 2);  con_putc(':');
-				put_hex(slot, 2); con_putc('.');
-				put_hex(f, 1);
+				con_put_hex(bus, 2);  con_putc(':');
+				con_put_hex(slot, 2); con_putc('.');
+				con_put_hex(f, 1);
 				con_write("  ");
-				put_hex(id & 0xFFFF, 4); con_putc(':');
-				put_hex((id >> 16) & 0xFFFF, 4);
+				con_put_hex(id & 0xFFFF, 4); con_putc(':');
+				con_put_hex((id >> 16) & 0xFFFF, 4);
 				con_write("  ");
 				con_write(controller_type(prog_if));
 				con_putc('\n');

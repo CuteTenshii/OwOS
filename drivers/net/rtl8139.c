@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "rtl8139.h"
+#include "kstring.h"
 #include "net.h"
 #include "io.h"
 #include "pci.h"
@@ -18,14 +19,6 @@
 #include "console.h"
 
 /* ------------------------------------------------------------------ helpers */
-
-static void kmemcpy(void *dst, const void *src, uint32_t n)
-{
-	uint8_t *d = dst;
-	const uint8_t *s = src;
-	while (n--)
-		*d++ = *s++;
-}
 
 /* Save EFLAGS and clear IF; restore only re-enables if it was on. */
 static inline uint32_t irq_save(void)
@@ -104,7 +97,7 @@ static void rtl8139_send(const uint8_t *frame, uint32_t len)
 
 	int i = tx_cur;
 	uint8_t *b = tx_buf[i];
-	kmemcpy(b, frame, len);
+	memcpy(b, frame, len);
 	while (len < 60)                /* pad runt frames to the 60-byte minimum  */
 		b[len++] = 0;
 

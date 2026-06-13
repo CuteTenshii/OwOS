@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "shell.h"
 #include "console.h"
+#include "kstring.h"
 #include "log.h"
 #include "timer.h"
 #include "pmm.h"
@@ -13,6 +14,7 @@
 #include "fat.h"
 #include "hfs.h"
 #include "ext.h"
+#include "iso9660.h"
 #include "blk.h"
 #include "ata.h"
 #include "ahci.h"
@@ -90,13 +92,6 @@ static uint32_t parse_uint(const char *s)
 	return v;
 }
 
-static size_t str_len(const char *s)
-{
-	size_t n = 0;
-	while (s[n])
-		n++;
-	return n;
-}
 
 static void str_copy(char *dst, const char *src)
 {
@@ -266,7 +261,7 @@ static void print_prompt(void)
 	con_set_color(CON_LIGHT_CYAN, CON_BLACK);
 	con_write("owos:");
 	/* Show the working directory, abbreviating the home directory to "~". */
-	size_t hlen = str_len(HOME_DIR);
+	size_t hlen = strlen(HOME_DIR);
 	int in_home = 1;
 	for (size_t i = 0; i < hlen; i++)
 		if (cwd[i] != HOME_DIR[i]) { in_home = 0; break; }
@@ -1148,7 +1143,7 @@ static void cmd_write(const char *arg)
 		con_write("write: path too long\n");
 		return;
 	}
-	if (fs_create(rpath, text, (uint32_t)str_len(text)) == 0) {
+	if (fs_create(rpath, text, (uint32_t)strlen(text)) == 0) {
 		con_write("wrote ");
 		con_write(rpath);
 		con_putc('\n');
@@ -1170,7 +1165,7 @@ static void into_dir(char *path, const char *src)
 	for (const char *p = src; *p; p++)
 		if (*p == '/' && p[1])
 			base = p + 1;
-	int n = (int)str_len(path);
+	int n = (int)strlen(path);
 	if (n == 0 || path[n - 1] != '/')
 		path[n++] = '/';
 	for (int i = 0; base[i] && n < PATH_MAX - 1; i++)
@@ -1380,7 +1375,7 @@ static void cmd_zip(const char *arg)
 		return;
 	}
 	if (dst[0] == '\0') {                   /* derive <src>.z                   */
-		size_t n = str_len(src);
+		size_t n = strlen(src);
 		if (n + 2 >= sizeof(dst)) {
 			con_write("zip: name too long, pass an explicit dst\n");
 			return;
@@ -1441,7 +1436,7 @@ static void cmd_unzip(const char *arg)
 		return;
 	}
 	if (dst[0] == '\0') {                   /* strip a trailing ".z"            */
-		size_t l = str_len(src);
+		size_t l = strlen(src);
 		if (l > 2 && src[l - 2] == '.' && src[l - 1] == 'z') {
 			str_copy(dst, src);
 			dst[l - 2] = '\0';
@@ -1487,7 +1482,7 @@ static void cmd_gzip(const char *arg)
 		return;
 	}
 	if (dst[0] == '\0') {                   /* derive <src>.gz                  */
-		size_t n = str_len(src);
+		size_t n = strlen(src);
 		if (n + 3 >= sizeof(dst)) {
 			con_write("gzip: name too long, pass an explicit dst\n");
 			return;
@@ -1548,7 +1543,7 @@ static void cmd_gunzip(const char *arg)
 		return;
 	}
 	if (dst[0] == '\0') {                   /* strip a trailing ".gz"           */
-		size_t l = str_len(src);
+		size_t l = strlen(src);
 		if (l > 3 && src[l - 3] == '.' && src[l - 2] == 'g' &&
 		    src[l - 1] == 'z') {
 			str_copy(dst, src);
@@ -1634,40 +1629,134 @@ static void bi_lsusb(const char *a)
 }
 static void bi_storage(const char *a)  { (void)a; cmd_storage(); }
 
+/* ---- mtp: browse a phone/camera attached in USB file-transfer (MTP) mode ----
+ * MTP exposes objects (files + folders), not blocks, so it isn't mounted at
+ * /media -- it's walked here, handle by handle, much like `lsusb`/`torrent`. */
+static void mtp_put_hex(uint32_t v)
+{
+	static const char hx[] = "0123456789abcdef";
+	con_write("0x");
+	for (int s = 28; s >= 0; s -= 4)
+		con_putc(hx[(v >> s) & 0xF]);
+}
+static void mtp_list_cb(uint32_t handle, const char *name, uint32_t size,
+                        int is_dir, void *ctx)
+{
+	(void)ctx;
+	mtp_put_hex(handle);
+	if (is_dir) {
+		con_write("  <dir>  ");
+	} else {
+		con_write("  ");
+		con_write_dec(size);
+		con_write(" bytes  ");
+	}
+	con_write(name);
+	con_putc('\n');
+}
+/* Parse an object handle, accepting 0x-prefixed hex or plain decimal. */
+static uint32_t mtp_parse_handle(const char *a)
+{
+	uint32_t v = 0;
+	if (a[0] == '0' && (a[1] == 'x' || a[1] == 'X')) {
+		for (a += 2; *a; a++) {
+			char c = *a; int d;
+			if (c >= '0' && c <= '9') d = c - '0';
+			else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+			else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+			else break;
+			v = v * 16 + (uint32_t)d;
+		}
+	} else {
+		for (; *a >= '0' && *a <= '9'; a++)
+			v = v * 10 + (uint32_t)(*a - '0');
+	}
+	return v;
+}
+static void cmd_mtp(const char *arg)
+{
+	while (*arg == ' ') arg++;
+	if (!xhci_mtp_present()) {
+		con_write("mtp: no device (attach a phone/camera in file-transfer mode)\n");
+		return;
+	}
+	if (arg[0] == '\0' || streq(arg, "info")) {
+		con_write("mtp: ");
+		con_write(xhci_mtp_model());
+		con_putc('\n');
+		return;
+	}
+
+	/* Split off the sub-command word. */
+	char sub[8];
+	int i = 0;
+	while (arg[i] && arg[i] != ' ' && i < (int)sizeof(sub) - 1) { sub[i] = arg[i]; i++; }
+	sub[i] = '\0';
+	const char *rest = arg + i;
+	while (*rest == ' ') rest++;
+
+	if (streq(sub, "ls")) {
+		uint32_t parent = rest[0] ? mtp_parse_handle(rest) : XHCI_MTP_ROOT;
+		int n = xhci_mtp_list(parent, mtp_list_cb, 0);
+		if (n < 0)       con_write("mtp: list failed\n");
+		else if (n == 0) con_write("(empty)\n");
+		return;
+	}
+	if (streq(sub, "get")) {
+		if (rest[0] == '\0') { con_write("usage: mtp get <handle> <dest>\n"); return; }
+		uint32_t handle = mtp_parse_handle(rest);
+		while (*rest && *rest != ' ') rest++;       /* skip the handle token       */
+		while (*rest == ' ') rest++;
+		if (rest[0] == '\0') { con_write("usage: mtp get <handle> <dest>\n"); return; }
+		char dst[PATH_MAX];
+		if (path_resolve(rest, dst) != 0) { con_write("mtp: bad path\n"); return; }
+		con_write("mtp: downloading "); mtp_put_hex(handle);
+		con_write(" -> "); con_write(rest); con_write(" ...\n");
+		if (xhci_mtp_get(handle, dst) == 0)
+			con_write("mtp: done\n");
+		else
+			con_write("mtp: get failed\n");
+		return;
+	}
+	con_write("usage: mtp [info] | mtp ls [handle] | mtp get <handle> <dest>\n");
+}
+
 /* Safely detach the removable volume mounted at /media so the medium can be removed.
  * Writes are write-through, so there is nothing buffered to flush -- this just
  * drops the mount. `mount` re-probes a non-owofs disk and remounts. */
 static void bi_eject(const char *a)
 {
 	(void)a;
-	int hfs = hfs_mounted(), ext = ext_mounted();
-	if (!fat_mounted() && !hfs && !ext) {
+	const char *type = NULL, *label = "";
+	void (*unmount)(void) = NULL;
+	if (iso_mounted())      { type = iso_type(); label = iso_label(); unmount = iso_unmount; }
+	else if (ext_mounted()) { type = ext_type(); label = ext_label(); unmount = ext_unmount; }
+	else if (hfs_mounted()) { type = hfs_type(); label = hfs_label(); unmount = hfs_unmount; }
+	else if (fat_mounted()) { type = fat_type(); label = fat_label(); unmount = fat_unmount; }
+	if (!unmount) {
 		con_write("eject: nothing mounted at /media\n");
 		return;
 	}
 	con_write("eject: detaching ");
-	con_write(ext ? ext_type() : hfs ? hfs_type() : fat_type());
-	const char *label = ext ? ext_label() : hfs ? hfs_label() : fat_label();
+	con_write(type);
 	if (label[0]) {
 		con_write(" \"");
 		con_write(label);
 		con_write("\"");
 	}
 	con_write(" from /media -- safe to remove\n");
-	if (ext)      ext_unmount();
-	else if (hfs) hfs_unmount();
-	else          fat_unmount();
+	unmount();
 }
 
 static void bi_mount(const char *a)
 {
 	(void)a;
-	if (fat_mounted() || hfs_mounted() || ext_mounted()) {
+	if (fat_mounted() || hfs_mounted() || ext_mounted() || iso_mounted()) {
 		con_write("mount: a volume is already mounted at /media\n");
 		return;
 	}
 	if (blk_mount_fat() != 0)
-		con_write("mount: no FAT/HFS+/ext volume found\n");
+		con_write("mount: no removable volume found\n");
 }
 static void bi_beep(const char *a)     { (void)a; speaker_beep(1000, 200); }
 static void bi_play(const char *a)
@@ -1744,6 +1833,9 @@ static const struct builtin builtins[] = {
 	{ "dhcp",     bi_dhcp,      "dhcp          re-request a DHCP lease (waits for link)" },
 	{ "txtest",   bi_txtest,    "txtest        Intel NIC transmit self-test (MAC loopback)" },
 	{ "lsusb",    bi_lsusb,     "lsusb [port]  list USB devices (port: detail for one)" },
+	{ "mtp",      cmd_mtp,      "mtp [info]    browse a phone/camera in file-transfer mode\n"
+	                            "  mtp ls [handle]  list the store root, or a folder by handle\n"
+	                            "  mtp get <handle> <dest>  download an object to owofs" },
 	{ "storage",  bi_storage,   "storage       list storage devices (IDE/SATA/NVMe)" },
 	{ "mount",    bi_mount,     "mount         mount a removable volume (USB/SD/disk) at /media" },
 	{ "eject",    bi_eject,     "eject         safely detach the removable volume at /media" },

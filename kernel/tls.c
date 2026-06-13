@@ -68,7 +68,7 @@ static void gen_random(uint8_t *out, uint32_t n)
 		uint8_t h[32];
 		sha256_final(&s, h);
 		uint32_t take = n < 32 ? n : 32;
-		kmemcpy(out, h, take);
+		memcpy(out, h, take);
 		out += take;
 		n -= take;
 	}
@@ -162,7 +162,7 @@ static int raw_fill(uint32_t need)
 /* TLS 1.3 per-record nonce: write_iv XOR seq (seq right-aligned in 12 bytes). */
 static void nonce13(uint8_t out[12], const uint8_t iv[12], uint64_t seq)
 {
-	kmemcpy(out, iv, 12);
+	memcpy(out, iv, 12);
 	for (int i = 0; i < 8; i++)
 		out[11 - i] ^= (uint8_t)(seq >> (8 * i));
 }
@@ -188,7 +188,7 @@ static int recv_record(uint8_t *type_out, uint8_t *out, uint32_t *outlen)
 		}
 
 		if (!recv_encrypted) {
-			kmemcpy(out, payload, len);
+			memcpy(out, payload, len);
 			*outlen = len;
 			*type_out = type;
 			rxpos += 5 + len;
@@ -223,8 +223,8 @@ static int recv_record(uint8_t *type_out, uint8_t *out, uint32_t *outlen)
 			return -1;
 		uint32_t ctlen = len - 8 - 16;
 		uint8_t nonce[12];
-		kmemcpy(nonce, server_iv, 4);
-		kmemcpy(nonce + 4, payload, 8);
+		memcpy(nonce, server_iv, 4);
+		memcpy(nonce + 4, payload, 8);
 		uint8_t aad[13];
 		put64be(aad, server_seq);
 		aad[8] = type;
@@ -260,7 +260,7 @@ static int send_record(uint8_t type, const uint8_t *data, uint32_t len)
 		/* inner plaintext = content || real_type; outer type is always 23. */
 		uint8_t nonce[12];
 		nonce13(nonce, client_iv, client_seq);
-		kmemcpy(sbuf, data, len);
+		memcpy(sbuf, data, len);
 		sbuf[len] = type;
 		uint32_t inner = len + 1;
 		uint32_t rlen = inner + 16;
@@ -268,7 +268,7 @@ static int send_record(uint8_t type, const uint8_t *data, uint32_t len)
 		                   (uint8_t)(rlen >> 8), (uint8_t)rlen };
 		uint8_t tag[16];
 		aes128_gcm_seal(client_key, nonce, aad, 5, sbuf, inner, sbuf, tag);
-		kmemcpy(sbuf + inner, tag, 16);
+		memcpy(sbuf + inner, tag, 16);
 		hdr[0] = REC_APP;
 		hdr[1] = 0x03; hdr[2] = 0x03;
 		put16(hdr + 3, (uint16_t)rlen);
@@ -279,9 +279,9 @@ static int send_record(uint8_t type, const uint8_t *data, uint32_t len)
 	}
 
 	uint8_t nonce[12];
-	kmemcpy(nonce, client_iv, 4);
+	memcpy(nonce, client_iv, 4);
 	put64be(sbuf, client_seq);                  /* explicit nonce = seq */
-	kmemcpy(nonce + 4, sbuf, 8);
+	memcpy(nonce + 4, sbuf, 8);
 	uint8_t aad[13];
 	put64be(aad, client_seq);
 	aad[8] = type;
@@ -289,7 +289,7 @@ static int send_record(uint8_t type, const uint8_t *data, uint32_t len)
 	put16(aad + 11, (uint16_t)len);
 	uint8_t tag[16];
 	aes128_gcm_seal(client_key, nonce, aad, 13, data, len, sbuf + 8, tag);
-	kmemcpy(sbuf + 8 + len, tag, 16);
+	memcpy(sbuf + 8 + len, tag, 16);
 	uint32_t rlen = 8 + len + 16;
 	hdr[0] = type;
 	hdr[1] = 0x03; hdr[2] = 0x03;
@@ -322,7 +322,7 @@ static int hs_fill(uint32_t need)
 		}
 		if (hslen + rl > sizeof hsbuf)
 			return -1;
-		kmemcpy(hsbuf + hslen, recpt, rl);
+		memcpy(hsbuf + hslen, recpt, rl);
 		hslen += rl;
 	}
 	return 0;
@@ -370,11 +370,11 @@ static void hkdf_expand_label(const uint8_t secret[32], const char *label,
 	info[p++] = (uint8_t)(outlen >> 8);
 	info[p++] = (uint8_t)outlen;
 	info[p++] = (uint8_t)(6 + ll);
-	kmemcpy(info + p, "tls13 ", 6); p += 6;
-	kmemcpy(info + p, label, ll); p += ll;
+	memcpy(info + p, "tls13 ", 6); p += 6;
+	memcpy(info + p, label, ll); p += ll;
 	info[p++] = ctxlen;
 	if (ctxlen) {
-		kmemcpy(info + p, ctx, ctxlen);
+		memcpy(info + p, ctx, ctxlen);
 		p += ctxlen;
 	}
 	hkdf_expand(secret, info, p, out, outlen);
@@ -411,7 +411,7 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
 	uint8_t *p = out + 4;                 /* leave room for the HS header */
 
 	*p++ = 0x03; *p++ = 0x03;             /* legacy_version = TLS 1.2 */
-	kmemcpy(p, client_random, 32); p += 32;
+	memcpy(p, client_random, 32); p += 32;
 	*p++ = 32;                            /* legacy_session_id (compat) */
 	gen_random(p, 32); p += 32;
 
@@ -433,7 +433,7 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
 		put16(p, (uint16_t)(namelen + 3)); p += 2;
 		*p++ = 0;                                 /* host_name type */
 		put16(p, (uint16_t)namelen); p += 2;
-		kmemcpy(p, sni, namelen); p += namelen;
+		memcpy(p, sni, namelen); p += namelen;
 	}
 	/* supported_groups: x25519 */
 	put16(p, 0x000A); p += 2;
@@ -452,7 +452,7 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
 		0x04,0x03, 0x05,0x03, 0x06,0x03 };        /* ecdsa_secp256r1/384/521     */
 	put16(p, (uint16_t)(sizeof sigalgs + 2)); p += 2;
 	put16(p, (uint16_t)sizeof sigalgs); p += 2;
-	kmemcpy(p, sigalgs, sizeof sigalgs); p += sizeof sigalgs;
+	memcpy(p, sigalgs, sizeof sigalgs); p += sizeof sigalgs;
 	/* supported_versions: TLS 1.3 then 1.2 */
 	put16(p, 0x002B); p += 2;
 	put16(p, 5); p += 2;
@@ -465,7 +465,7 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
 	put16(p, 36); p += 2;                 /* client_shares length */
 	put16(p, 0x001D); p += 2;             /* group x25519 */
 	put16(p, 32); p += 2;
-	kmemcpy(p, our_pub, 32); p += 32;
+	memcpy(p, our_pub, 32); p += 32;
 
 	put16(extlen, (uint16_t)(p - exts));
 
@@ -487,7 +487,7 @@ static int parse_server_hello(const uint8_t *body, uint32_t bl,
 	*have_ks = 0;
 	if (bl < 38)
 		return -1;
-	kmemcpy(server_random, body + 2, 32);
+	memcpy(server_random, body + 2, 32);
 	uint32_t off = 34;
 	uint8_t sidlen = body[off++];
 	if (off + sidlen + 3u > bl)
@@ -513,7 +513,7 @@ static int parse_server_hello(const uint8_t *body, uint32_t bl,
 			uint16_t grp = ((uint16_t)body[off] << 8) | body[off + 1];
 			uint16_t kl = ((uint16_t)body[off + 2] << 8) | body[off + 3];
 			if (grp == 0x001D && kl == 32 && el >= 4 + 32) {
-				kmemcpy(server_pub, body + off + 4, 32);
+				memcpy(server_pub, body + off + 4, 32);
 				*have_ks = 1;
 			}
 		}
@@ -586,7 +586,7 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 	hmac_sha256(fk_c, 32, th_sf, 32, verify);
 	uint8_t fin[36];
 	fin[0] = HS_FINISHED; fin[1] = 0; fin[2] = 0; fin[3] = 32;
-	kmemcpy(fin + 4, verify, 32);
+	memcpy(fin + 4, verify, 32);
 	if (send_record(REC_HS, fin, 36) < 0) {
 		con_write("tls: send 1.3 Finished failed\n");
 		return 0;
@@ -707,7 +707,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 				tcp_close(tcp);
 				return 0;
 			}
-			kmemcpy(server_pub, body + 4, 32);
+			memcpy(server_pub, body + 4, 32);
 			have_ske = 1;
 		} else if (mt == HS_CERT_REQ) {
 			con_write("tls: server requested a client certificate (unsupported)\n");
@@ -729,24 +729,24 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 	x25519(pre_master, our_priv, server_pub);
 
 	uint8_t seed[64], master[48], keyblock[40];
-	kmemcpy(seed, client_random, 32);
-	kmemcpy(seed + 32, server_random, 32);
+	memcpy(seed, client_random, 32);
+	memcpy(seed + 32, server_random, 32);
 	tls12_prf(pre_master, 32, "master secret", seed, 64, master, 48);
 
-	kmemcpy(seed, server_random, 32);
-	kmemcpy(seed + 32, client_random, 32);
+	memcpy(seed, server_random, 32);
+	memcpy(seed + 32, client_random, 32);
 	tls12_prf(master, 48, "key expansion", seed, 64, keyblock, 40);
-	kmemcpy(client_key, keyblock, 16);
-	kmemcpy(server_key, keyblock + 16, 16);
-	kmemcpy(client_iv, keyblock + 32, 4);
-	kmemcpy(server_iv, keyblock + 36, 4);
+	memcpy(client_key, keyblock, 16);
+	memcpy(server_key, keyblock + 16, 16);
+	memcpy(client_iv, keyblock + 32, 4);
+	memcpy(server_iv, keyblock + 36, 4);
 
 	/* --- ClientKeyExchange --- */
 	uint8_t cke[4 + 1 + 32];
 	cke[0] = HS_CKE;
 	cke[1] = 0; cke[2] = 0; cke[3] = 33;
 	cke[4] = 32;
-	kmemcpy(cke + 5, our_pub, 32);
+	memcpy(cke + 5, our_pub, 32);
 	sha256_update(&transcript, cke, sizeof cke);
 	if (send_record(REC_HS, cke, sizeof cke) < 0) {
 		con_write("tls: send CKE failed\n");
@@ -769,7 +769,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 	uint8_t fin[16];
 	fin[0] = HS_FINISHED;
 	fin[1] = 0; fin[2] = 0; fin[3] = 12;
-	kmemcpy(fin + 4, verify, 12);
+	memcpy(fin + 4, verify, 12);
 	sha256_update(&transcript, fin, 16);
 	if (send_record(REC_HS, fin, 16) < 0) {
 		con_write("tls: send Finished failed\n");
@@ -841,7 +841,7 @@ int tls_read(uint8_t *buf, uint32_t max, int *closed)
 		uint32_t n = applen - apppos;
 		if (n > max)
 			n = max;
-		kmemcpy(buf, appbuf + apppos, n);
+		memcpy(buf, appbuf + apppos, n);
 		apppos += n;
 		return (int)n;
 	}
@@ -860,11 +860,11 @@ int tls_read(uint8_t *buf, uint32_t max, int *closed)
 		if (t == REC_APP) {
 			if (l == 0)
 				continue;
-			kmemcpy(appbuf, recpt, l);
+			memcpy(appbuf, recpt, l);
 			applen = l;
 			apppos = 0;
 			uint32_t n = l < max ? l : max;
-			kmemcpy(buf, appbuf, n);
+			memcpy(buf, appbuf, n);
 			apppos = n;
 			return (int)n;
 		}

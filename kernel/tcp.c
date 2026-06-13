@@ -215,7 +215,7 @@ static void tcp_send_data(struct tcp_conn *c, uint32_t seq,
 	uint8_t seg[20 + TCP_MSS];
 	if (dlen > TCP_MSS)
 		dlen = TCP_MSS;
-	kmemcpy(seg + 20, data, dlen);
+	memcpy(seg + 20, data, dlen);
 	tcp_xmit(c, seg, TCP_PSH | TCP_ACK, seq, dlen);
 }
 
@@ -344,10 +344,10 @@ void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len)
 				uint32_t woff  = c->wlen % TCP_RXBUF;
 				uint32_t first = TCP_RXBUF - woff;   /* until wrap */
 				if (first >= take) {
-					kmemcpy(c->rxbuf + woff, data, take);
+					memcpy(c->rxbuf + woff, data, take);
 				} else {
-					kmemcpy(c->rxbuf + woff, data, first);
-					kmemcpy(c->rxbuf, data + first, take - first);
+					memcpy(c->rxbuf + woff, data, first);
+					memcpy(c->rxbuf, data + first, take - first);
 				}
 				c->wlen    += take;
 				c->rcv_nxt += take;
@@ -451,10 +451,10 @@ int tcp_read_nb(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed)
 		uint32_t roff  = c->rlen % TCP_RXBUF;     /* ring read index */
 		uint32_t first = TCP_RXBUF - roff;        /* until wrap      */
 		if (first >= n) {
-			kmemcpy(buf, c->rxbuf + roff, n);
+			memcpy(buf, c->rxbuf + roff, n);
 		} else {
-			kmemcpy(buf, c->rxbuf + roff, first);
-			kmemcpy((uint8_t *)buf + first, c->rxbuf, n - first);
+			memcpy(buf, c->rxbuf + roff, first);
+			memcpy((uint8_t *)buf + first, c->rxbuf, n - first);
 		}
 		c->rlen += n;
 

@@ -6,6 +6,7 @@
 #include "gdt.h"
 #include "elf.h"
 #include "sched.h"
+#include "kstring.h"
 
 #define USER_STACK_PAGES 4   /* 16 KiB of user stack                          */
 
@@ -139,14 +140,6 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
 #define MAX_ARGS 8
 #define ARG_TOP  USER_STACK_TOP   /* args live in the top mapped stack page    */
 
-static int str_len(const char *s)
-{
-	int n = 0;
-	while (s[n])
-		n++;
-	return n;
-}
-
 uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 {
 	/* The top stack page [ARG_TOP-4K, ARG_TOP) backs the argument block. Its
@@ -165,7 +158,7 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 	uint32_t sp = ARG_TOP;
 
 	for (int i = 0; i < argc; i++) {           /* copy the strings            */
-		int len = str_len(argv[i]) + 1;
+		int len = strlen(argv[i]) + 1;
 		sp -= (uint32_t)len;
 		if (sp < page) {                       /* args too big; bail safely   */
 			paging_scratch_unmap(0);

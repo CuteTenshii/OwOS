@@ -14,24 +14,11 @@
 #include <stddef.h>
 
 #include "ext.h"
+#include "endian.h"
 #include "console.h"
 #include "kstring.h"
 
 /* ---------------------------------------------------------- LE readers */
-static uint16_t u16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t u32(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void put_u32(uint32_t v)
-{
-	char b[11]; int i = 10; b[i--] = '\0';
-	if (!v) b[i--] = '0';
-	while (v) { b[i--] = (char)('0' + v % 10); v /= 10; }
-	con_write(&b[i + 1]);
-}
 
 /* ---------------------------------------------------------------- state */
 #define EXT_MAGIC      0xEF53u
@@ -75,7 +62,7 @@ static int dev_read(uint64_t byteoff, uint8_t *buf, uint32_t len)
 			return -1;
 		uint32_t n = 512 - soff;
 		if (n > len) n = len;
-		kmemcpy(buf, s + soff, n);
+		memcpy(buf, s + soff, n);
 		buf += n; byteoff += n; len -= n;
 	}
 	return 0;
@@ -94,9 +81,9 @@ static uint64_t group_inode_table(uint32_t group)
 	               (uint64_t)group * vol.desc_size;
 	if (dev_read(off, gd, vol.desc_size > 64 ? 64 : vol.desc_size) != 0)
 		return 0;
-	uint64_t t = u32(gd + 8);                         /* bg_inode_table_lo */
+	uint64_t t = load_le32(gd + 8);                         /* bg_inode_table_lo */
 	if (vol.desc_size >= 64)
-		t |= (uint64_t)u32(gd + 40) << 32;            /* bg_inode_table_hi */
+		t |= (uint64_t)load_le32(gd + 40) << 32;            /* bg_inode_table_hi */
 	return t;
 }
 
@@ -115,12 +102,12 @@ static int read_inode(uint32_t ino, uint8_t *ibuf)
 	return dev_read(off, ibuf, n);
 }
 
-static int inode_is_dir(const uint8_t *ibuf)  { return (u16(ibuf) & 0xF000) == 0x4000; }
+static int inode_is_dir(const uint8_t *ibuf)  { return (load_le16(ibuf) & 0xF000) == 0x4000; }
 static uint64_t inode_size(const uint8_t *ibuf)
 {
-	uint64_t sz = u32(ibuf + 4);
+	uint64_t sz = load_le32(ibuf + 4);
 	if (!inode_is_dir(ibuf))
-		sz |= (uint64_t)u32(ibuf + 108) << 32;        /* i_size_high (files) */
+		sz |= (uint64_t)load_le32(ibuf + 108) << 32;        /* i_size_high (files) */
 	return sz;
 }
 
@@ -132,19 +119,19 @@ static uint64_t inode_size(const uint8_t *ibuf)
 static uint32_t extent_lookup(const uint8_t *node, uint32_t lblk)
 {
 	for (;;) {
-		if (u16(node) != EXT_EXTENT_MAGIC)
+		if (load_le16(node) != EXT_EXTENT_MAGIC)
 			return 0;
-		uint16_t entries = u16(node + 2);
-		uint16_t depth   = u16(node + 6);
+		uint16_t entries = load_le16(node + 2);
+		uint16_t depth   = load_le16(node + 6);
 
 		if (depth == 0) {                              /* leaf: ext4_extent */
 			for (int i = 0; i < entries; i++) {
 				const uint8_t *e = node + 12 + i * 12;
-				uint32_t eb  = u32(e);
-				uint32_t len = u16(e + 4);
+				uint32_t eb  = load_le32(e);
+				uint32_t len = load_le16(e + 4);
 				if (len > 32768) len -= 32768;         /* uninitialized */
 				if (lblk >= eb && lblk < eb + len) {
-					uint32_t phys = u32(e + 8);        /* ee_start_lo */
+					uint32_t phys = load_le32(e + 8);        /* ee_start_lo */
 					return phys + (lblk - eb);
 				}
 			}
@@ -154,11 +141,11 @@ static uint32_t extent_lookup(const uint8_t *node, uint32_t lblk)
 		const uint8_t *chosen = NULL;
 		for (int i = 0; i < entries; i++) {
 			const uint8_t *e = node + 12 + i * 12;
-			if (u32(e) <= lblk) chosen = e; else break;
+			if (load_le32(e) <= lblk) chosen = e; else break;
 		}
 		if (!chosen)
 			return 0;
-		uint32_t leaf = u32(chosen + 4);               /* ei_leaf_lo */
+		uint32_t leaf = load_le32(chosen + 4);               /* ei_leaf_lo */
 		if (read_block(leaf, blk_scratch) != 0)
 			return 0;
 		node = blk_scratch;
@@ -172,31 +159,31 @@ static uint32_t indirect_lookup(const uint8_t *ibuf, uint32_t lblk)
 	uint32_t ppb = vol.block_size / 4;                 /* pointers per block */
 
 	if (lblk < 12)
-		return u32(blk + lblk * 4);
+		return load_le32(blk + lblk * 4);
 	lblk -= 12;
 	if (lblk < ppb) {
-		if (read_block(u32(blk + 12 * 4), blk_scratch) != 0) return 0;
-		return u32(blk_scratch + lblk * 4);
+		if (read_block(load_le32(blk + 12 * 4), blk_scratch) != 0) return 0;
+		return load_le32(blk_scratch + lblk * 4);
 	}
 	lblk -= ppb;
 	if (lblk < ppb * ppb) {
-		if (read_block(u32(blk + 13 * 4), blk_scratch) != 0) return 0;
-		uint32_t b = u32(blk_scratch + (lblk / ppb) * 4);
+		if (read_block(load_le32(blk + 13 * 4), blk_scratch) != 0) return 0;
+		uint32_t b = load_le32(blk_scratch + (lblk / ppb) * 4);
 		if (read_block(b, blk_scratch) != 0) return 0;
-		return u32(blk_scratch + (lblk % ppb) * 4);
+		return load_le32(blk_scratch + (lblk % ppb) * 4);
 	}
 	lblk -= ppb * ppb;
-	if (read_block(u32(blk + 14 * 4), blk_scratch) != 0) return 0;
-	uint32_t b = u32(blk_scratch + (lblk / (ppb * ppb)) * 4);
+	if (read_block(load_le32(blk + 14 * 4), blk_scratch) != 0) return 0;
+	uint32_t b = load_le32(blk_scratch + (lblk / (ppb * ppb)) * 4);
 	if (read_block(b, blk_scratch) != 0) return 0;
-	b = u32(blk_scratch + ((lblk / ppb) % ppb) * 4);
+	b = load_le32(blk_scratch + ((lblk / ppb) % ppb) * 4);
 	if (read_block(b, blk_scratch) != 0) return 0;
-	return u32(blk_scratch + (lblk % ppb) * 4);
+	return load_le32(blk_scratch + (lblk % ppb) * 4);
 }
 
 static uint32_t map_block(const uint8_t *ibuf, uint32_t lblk)
 {
-	if (u32(ibuf + 32) & INODE_EXTENTS_FL)
+	if (load_le32(ibuf + 32) & INODE_EXTENTS_FL)
 		return extent_lookup(ibuf + 40, lblk);
 	return indirect_lookup(ibuf, lblk);
 }
@@ -219,8 +206,8 @@ static uint32_t dir_find(const uint8_t *dirbuf, const char *name, int *is_dir)
 		uint32_t off = 0;
 		while (off + 8 <= vol.block_size) {
 			const uint8_t *e = data_blk + off;
-			uint32_t ino = u32(e);
-			uint16_t rec = u16(e + 4);
+			uint32_t ino = load_le32(e);
+			uint16_t rec = load_le16(e + 4);
 			uint8_t  nl  = e[6];
 			if (rec < 8) break;
 			if (ino && nl == nlen) {
@@ -280,27 +267,27 @@ static int resolve(const char *path, uint32_t *ino_out, int *is_dir_out,
 
 static int parse_superblock(const uint8_t *sb)
 {
-	if (u16(sb + 56) != EXT_MAGIC)
+	if (load_le16(sb + 56) != EXT_MAGIC)
 		return -1;
-	uint32_t bs = 1024u << u32(sb + 24);
+	uint32_t bs = 1024u << load_le32(sb + 24);
 	if (bs < 1024 || bs > MAX_BLOCK)
 		return -1;
-	uint32_t incompat = u32(sb + 96);
+	uint32_t incompat = load_le32(sb + 96);
 	if (incompat & INCOMPAT_ENCRYPT)                  /* can't decrypt */
 		return -1;
-	uint32_t ipg = u32(sb + 40);
+	uint32_t ipg = load_le32(sb + 40);
 	if (ipg == 0)
 		return -1;
 
 	vol.block_size       = bs;
 	vol.inodes_per_group = ipg;
-	vol.inode_size       = u16(sb + 88);
+	vol.inode_size       = load_le16(sb + 88);
 	if (vol.inode_size < 128) vol.inode_size = 128;
-	vol.desc_size = (incompat & INCOMPAT_64BIT) ? u16(sb + 254) : 32;
+	vol.desc_size = (incompat & INCOMPAT_64BIT) ? load_le16(sb + 254) : 32;
 	if (vol.desc_size < 32) vol.desc_size = 32;
 	vol.gd_block  = (bs == 1024) ? 2 : 1;
 
-	uint32_t compat = u32(sb + 92);
+	uint32_t compat = load_le32(sb + 92);
 	vol.type = (incompat & INCOMPAT_EXTENTS) ? "ext4"
 	         : (compat & 0x4)                ? "ext3" : "ext2";   /* has_journal */
 
@@ -330,7 +317,6 @@ int ext_mount(ext_read_fn read, uint32_t base_lba)
 	return 0;
 }
 
-static uint32_t le32(const uint8_t *p) { return u32(p); }
 
 /* Whole disk, then GPT, then MBR partitions (ext often lives in a partition). */
 static int probe(ext_read_fn read)
@@ -341,8 +327,8 @@ static int probe(ext_read_fn read)
 
 	if (read(1, sec) == 0 && sec[0] == 'E' && sec[1] == 'F' &&
 	    sec[2] == 'I' && sec[3] == ' ' && sec[4] == 'P') {        /* GPT */
-		uint64_t ent_lba = (uint64_t)le32(sec + 72) | ((uint64_t)le32(sec + 76) << 32);
-		uint32_t ent_cnt = le32(sec + 80), ent_sz = le32(sec + 84);
+		uint64_t ent_lba = (uint64_t)load_le32(sec + 72) | ((uint64_t)load_le32(sec + 76) << 32);
+		uint32_t ent_cnt = load_le32(sec + 80), ent_sz = load_le32(sec + 84);
 		if (ent_sz < 128) ent_sz = 128;
 		if (ent_cnt > 128) ent_cnt = 128;
 		uint8_t ent[128];
@@ -355,7 +341,7 @@ static int probe(ext_read_fn read)
 			for (int k = 0; k < 16; k++) if (e[k]) { empty = 0; break; }
 			if (empty) continue;
 			(void)ent;
-			uint64_t first = (uint64_t)le32(e + 32) | ((uint64_t)le32(e + 36) << 32);
+			uint64_t first = (uint64_t)load_le32(e + 32) | ((uint64_t)load_le32(e + 36) << 32);
 			if (first && ext_mount(read, (uint32_t)first) == 0)
 				return 0;
 		}
@@ -364,7 +350,7 @@ static int probe(ext_read_fn read)
 	if (read(0, sec) == 0 && sec[510] == 0x55 && sec[511] == 0xAA) {  /* MBR */
 		for (int i = 0; i < 4; i++) {
 			const uint8_t *p = sec + 446 + i * 16;
-			uint32_t first = le32(p + 8);
+			uint32_t first = load_le32(p + 8);
 			if (p[4] && first && ext_mount(read, first) == 0)
 				return 0;
 		}
@@ -400,7 +386,7 @@ static int dir_walk(const char *path, int want_idx, char *name,
 	int d; uint64_t sz;
 	if (resolve(path, NULL, &d, &sz) != 0 || !d)
 		return want_idx < 0 ? -1 : 0;
-	kmemcpy(dir_inode, cur_inode, sizeof dir_inode);   /* hold the dir inode */
+	memcpy(dir_inode, cur_inode, sizeof dir_inode);   /* hold the dir inode */
 
 	uint64_t dsize = inode_size(dir_inode);
 	int seen = 0;
@@ -411,8 +397,8 @@ static int dir_walk(const char *path, int want_idx, char *name,
 		uint32_t off = 0;
 		while (off + 8 <= vol.block_size) {
 			const uint8_t *e = data_blk + off;
-			uint32_t ino = u32(e);
-			uint16_t rec = u16(e + 4);
+			uint32_t ino = load_le32(e);
+			uint16_t rec = load_le16(e + 4);
 			uint8_t  nl  = e[6];
 			if (rec < 8) break;
 			if (ino && nl) {
@@ -432,7 +418,7 @@ static int dir_walk(const char *path, int want_idx, char *name,
 							s = (uint32_t)inode_size(cur_inode);
 						}
 						con_write(isd ? "  <DIR>  " : "         ");
-						if (!isd) { put_u32(s); con_write("  "); }
+						if (!isd) { con_write_dec(s); con_write("  "); }
 						else      { con_write("  "); }
 						con_write(nm);
 						con_putc('\n');
@@ -473,7 +459,7 @@ int ext_read_at(const char *path, uint32_t offset, void *buf, uint32_t len)
 	if (!vol.mounted) return -2;
 	uint64_t sz; int d;
 	if (resolve(path, NULL, &d, &sz) != 0 || d) return -1;   /* absent / a dir */
-	kmemcpy(dir_inode, cur_inode, sizeof dir_inode);          /* the file inode */
+	memcpy(dir_inode, cur_inode, sizeof dir_inode);          /* the file inode */
 
 	if (offset >= sz) return 0;
 	if (offset + len > sz) len = (uint32_t)(sz - offset);
@@ -492,7 +478,7 @@ int ext_read_at(const char *path, uint32_t offset, void *buf, uint32_t len)
 		} else {
 			if (read_block(phys, data_blk) != 0)
 				return got ? (int)got : -1;
-			kmemcpy(dst + got, data_blk + boff, chunk);
+			memcpy(dst + got, data_blk + boff, chunk);
 		}
 		got += chunk;
 	}

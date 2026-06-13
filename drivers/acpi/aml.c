@@ -1275,8 +1275,27 @@ static void build_one(const uint8_t *body, uint32_t len, void *ctx)
 	ns_walk(body, body + len, root, 0);
 }
 
+static void ns_map_only(const uint8_t *b, uint32_t l, void *c)
+{
+	(void)b; (void)l; (void)c;   /* acpi_for_each_aml already mapped the table */
+}
+
 static int build_namespace(void)
 {
+	/* (Re)map every ACPI table into the CURRENT address space before we touch
+	 * the node pointers that point into them. The interpreter runs from whatever
+	 * context calls it — including a syscall under a ring-3 process's CR3 (e.g.
+	 * neofetch reading the battery from the terminal). That process's page
+	 * directory is a one-time snapshot of the kernel directory taken when it was
+	 * created, which on a laptop predates the lazy mapping of the tables (they
+	 * sit at a high physical address the shared low identity map doesn't cover),
+	 * so the table pages are absent from its CR3 and the AML interpreter #PFs
+	 * dereferencing a node->init/body pointer. acpi_for_each_aml maps via
+	 * paging_identity_map into the current CR3 and is idempotent, so this is a
+	 * cheap no-op once the tables are already present. (QEMU/VMware keep the
+	 * tables low and shared, so this only matters on real hardware.) */
+	acpi_for_each_aml(ns_map_only, 0);
+
 	if (ns_built) return node_count > 0;
 	if (!nodes) {
 		nodes = kmalloc(sizeof(struct ns_node) * MAX_NODES);

@@ -18,7 +18,12 @@
 #include "fs.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "sd.h"
+#include "atapi.h"
 #include "blk.h"
+#include "hfs.h"
+#include "ext.h"
+#include "iso9660.h"
 #include "fat.h"
 #include "net.h"
 #include "heap.h"
@@ -293,6 +298,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
 	ahci_init();                   /* bring up a SATA disk via AHCI, if present */
 	nvme_init();                   /* bring up an NVMe namespace, if present    */
+	sd_init();                     /* bring up an SD/MMC card via SDHCI, if any */
+	atapi_init();                  /* find a CD/DVD drive on the IDE bus, if any */
 
 	blk_init();                    /* pick owofs's backing disk: IDE>AHCI>NVMe */
 	fs_init();                     /* mount it (auto-format only the IDE disk) */
@@ -404,8 +411,9 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	                               /* offering USB tethering without running lsusb.*/
 
 	bootmark("mount");
-	if (!fat_mounted())            /* a USB stick only appears after xhci_boot --  */
-		blk_mount_fat();           /* mount its FAT now if no other FAT volume did */
+	if (!fat_mounted() && !hfs_mounted() && !ext_mounted() && !iso_mounted())
+		blk_mount_fat();           /* a USB stick only appears after xhci_boot;     */
+	                               /* mount it now if nothing claimed /media yet    */
 
 	bootmark("shell");
 	shell_init();

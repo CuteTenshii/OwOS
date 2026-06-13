@@ -1,6 +1,7 @@
 /* peer.c — BitTorrent peer wire protocol, non-blocking state machine. See peer.h. */
 
 #include "peer.h"
+#include "endian.h"
 #include "torrent.h"
 #include "tcp.h"
 #include "crypto.h"
@@ -50,11 +51,6 @@ static void put32(uint8_t *p, uint32_t v)
 {
 	p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
 	p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
-}
-static uint32_t get32(const uint8_t *p)
-{
-	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-	       ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
 }
 
 /* Blocking read of exactly n bytes — only used during the handshake. */
@@ -124,8 +120,8 @@ peer_conn_t *peer_connect(const struct torrent *t, const uint8_t ip[4],
 		hs[1 + i] = (uint8_t)PSTR[i];
 	for (int i = 0; i < 8; i++)
 		hs[20 + i] = 0;
-	kmemcpy(hs + 28, t->infohash, 20);
-	kmemcpy(hs + 48, PEER_ID, 20);
+	memcpy(hs + 28, t->infohash, 20);
+	memcpy(hs + 48, PEER_ID, 20);
 	if (tcp_write(c, hs, HS_LEN) != HS_LEN) {
 		tcp_close(c);
 		return NULL;
@@ -214,7 +210,7 @@ static void feed(peer_conn_t *pc, const uint8_t *p, uint32_t n)
 				pc->hdr[pc->hdrgot + k] = p[k];
 			pc->hdrgot += take; p += take; n -= take;
 			if (pc->hdrgot == 4) {
-				pc->msg_len = get32(pc->hdr);
+				pc->msg_len = load_be32(pc->hdr);
 				pc->hdrgot = 0;
 				if (pc->msg_len != 0)
 					pc->rxstate = S_ID;   /* else keep-alive: stay */
@@ -252,8 +248,8 @@ static void feed(peer_conn_t *pc, const uint8_t *p, uint32_t n)
 				pc->hdr[pc->hdrgot + k] = p[k];
 			pc->hdrgot += take; p += take; n -= take; pc->pay_left -= take;
 			if (pc->hdrgot == 8) {
-				uint32_t pidx  = get32(pc->hdr);
-				uint32_t begin = get32(pc->hdr + 4);
+				uint32_t pidx  = load_be32(pc->hdr);
+				uint32_t begin = load_be32(pc->hdr + 4);
 				pc->blk_left = pc->pay_left;
 				pc->hdrgot = 0;
 				if (pc->active && pidx == pc->index &&
@@ -302,7 +298,7 @@ static void feed(peer_conn_t *pc, const uint8_t *p, uint32_t n)
 				pc->hdr[pc->hdrgot + k] = p[k];
 			pc->hdrgot += take; p += take; n -= take; pc->pay_left -= take;
 			if (pc->hdrgot == 4) {
-				uint32_t h = get32(pc->hdr);
+				uint32_t h = load_be32(pc->hdr);
 				if (h / 8 < pc->have_len)
 					pc->have[h / 8] |= (uint8_t)(0x80 >> (h & 7));
 				pc->hdrgot = 0;

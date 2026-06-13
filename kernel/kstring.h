@@ -1,13 +1,15 @@
-/* kstring.h — freestanding memory primitives shared across the kernel.
+/* kstring.h — freestanding string/memory primitives shared across the kernel.
  *
- * Deliberately *not* named memcpy(): the kernel is built -nostdlib and this
- * takes a uint32_t length, so the k-prefix keeps the compiler from mistaking it
- * for the libc memcpy() it may emit implicit calls to. */
+ * Standard C library names on purpose: the compiler emits implicit calls to
+ * memcpy for struct/array copies even under -ffreestanding, and these read like
+ * normal C. size_t is uint32_t on -m32, so the uint32_t lengths/returns match
+ * the builtins with no signature mismatch. */
 #ifndef OWOS_KSTRING_H
 #define OWOS_KSTRING_H
 
 #include <stdint.h>
 
-void kmemcpy(void *dst, const void *src, uint32_t n);
+void    *memcpy(void *dst, const void *src, uint32_t n);
+uint32_t strlen(const char *s);   /* byte count before the terminating NUL */
 
 #endif /* OWOS_KSTRING_H */

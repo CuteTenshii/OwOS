@@ -38,6 +38,7 @@ void con_putc(char c);
 void con_write(const char *s);
 void con_write_hex(uint32_t value);   /* prints "0x" + 8 hex digits */
 void con_write_dec(uint32_t value);   /* prints unsigned decimal     */
+void con_put_hex(uint32_t value, int digits);  /* `digits` lowercase hex, no "0x" */
 
 /* Hardware-cursor position as a linear offset (row * width + col). con_set_pos
  * moves the cursor only -- it draws nothing -- so a caller can reposition

@@ -90,7 +90,7 @@ void sha256_update(struct sha256 *s, const void *data, uint32_t len)
 		uint32_t take = SHA256_BLOCK - s->buflen;
 		if (take > len)
 			take = len;
-		kmemcpy(s->buf + s->buflen, p, take);
+		memcpy(s->buf + s->buflen, p, take);
 		s->buflen += take;
 		p += take;
 		len -= take;
@@ -169,7 +169,7 @@ void sha1_update(struct sha1 *s, const void *data, uint32_t len)
 		uint32_t take = SHA1_BLOCK - s->buflen;
 		if (take > len)
 			take = len;
-		kmemcpy(s->buf + s->buflen, p, take);
+		memcpy(s->buf + s->buflen, p, take);
 		s->buflen += take;
 		p += take;
 		len -= take;
@@ -219,7 +219,7 @@ void hmac_sha256(const uint8_t *key, uint32_t keylen,
 	if (keylen > SHA256_BLOCK)
 		sha256(key, keylen, k);
 	else
-		kmemcpy(k, key, keylen);
+		memcpy(k, key, keylen);
 
 	uint8_t ipad[SHA256_BLOCK], opad[SHA256_BLOCK];
 	for (int i = 0; i < SHA256_BLOCK; i++) {
@@ -252,12 +252,12 @@ static void p_sha256(const uint8_t *secret, uint32_t secretlen,
 
 	uint8_t buf[SHA256_DIGEST + 512];   /* A(i) || seed; seed is small in TLS */
 	while (outlen) {
-		kmemcpy(buf, a, SHA256_DIGEST);
-		kmemcpy(buf + SHA256_DIGEST, seed, seedlen);
+		memcpy(buf, a, SHA256_DIGEST);
+		memcpy(buf + SHA256_DIGEST, seed, seedlen);
 		uint8_t block[SHA256_DIGEST];
 		hmac_sha256(secret, secretlen, buf, SHA256_DIGEST + seedlen, block);
 		uint32_t take = outlen < SHA256_DIGEST ? outlen : SHA256_DIGEST;
-		kmemcpy(out, block, take);
+		memcpy(out, block, take);
 		out += take;
 		outlen -= take;
 		/* A(i+1) = HMAC(secret, A(i)) */
@@ -274,8 +274,8 @@ void tls12_prf(const uint8_t *secret, uint32_t secretlen,
 	uint32_t labellen = 0;
 	while (label[labellen])
 		labellen++;
-	kmemcpy(fullseed, label, labellen);
-	kmemcpy(fullseed + labellen, seed, seedlen);
+	memcpy(fullseed, label, labellen);
+	memcpy(fullseed + labellen, seed, seedlen);
 	p_sha256(secret, secretlen, fullseed, labellen + seedlen, out, outlen);
 }
 
@@ -299,15 +299,15 @@ void hkdf_expand(const uint8_t prk[SHA256_DIGEST],
 	while (done < outlen) {
 		uint8_t buf[SHA256_DIGEST + 512 + 1];
 		uint32_t p = 0;
-		kmemcpy(buf, t, tlen);
+		memcpy(buf, t, tlen);
 		p = tlen;
-		kmemcpy(buf + p, info, infolen);
+		memcpy(buf + p, info, infolen);
 		p += infolen;
 		buf[p++] = counter;
 		hmac_sha256(prk, SHA256_DIGEST, buf, p, t);
 		tlen = SHA256_DIGEST;
 		uint32_t take = outlen - done < SHA256_DIGEST ? outlen - done : SHA256_DIGEST;
-		kmemcpy(out + done, t, take);
+		memcpy(out + done, t, take);
 		done += take;
 		counter++;
 	}
@@ -379,7 +379,7 @@ void aes128_encrypt_block(const struct aes128 *a, const uint8_t in[16],
 		for (int r = 0; r < 4; r++)
 			for (int c = 0; c < 4; c++)
 				t[c * 4 + r] = s[((c + r) % 4) * 4 + r];
-		kmemcpy(s, t, 16);
+		memcpy(s, t, 16);
 		/* MixColumns (skipped on the final round) */
 		if (round != 10) {
 			for (int c = 0; c < 4; c++) {
@@ -395,7 +395,7 @@ void aes128_encrypt_block(const struct aes128 *a, const uint8_t in[16],
 		for (int i = 0; i < 16; i++)
 			s[i] ^= (uint8_t)(a->rk[round * 4 + i / 4] >> (24 - 8 * (i % 4)));
 	}
-	kmemcpy(out, s, 16);
+	memcpy(out, s, 16);
 }
 
 /* ----------------------------------------------------------------- GCM */
@@ -412,7 +412,7 @@ static void gcm_rshift1(uint8_t v[16])
 static void gcm_mul(const uint8_t x[16], const uint8_t y[16], uint8_t z[16])
 {
 	uint8_t v[16];
-	kmemcpy(v, y, 16);
+	memcpy(v, y, 16);
 	cmemset(z, 0, 16);
 	for (int i = 0; i < 128; i++) {
 		if (x[i / 8] & (0x80 >> (i % 8)))
@@ -434,7 +434,7 @@ static void ghash(const uint8_t h[16], const uint8_t *data, uint32_t len,
 			y[j] ^= data[b * 16 + j];
 		uint8_t t[16];
 		gcm_mul(y, h, t);
-		kmemcpy(y, t, 16);
+		memcpy(y, t, 16);
 	}
 	uint32_t rem = len % 16;
 	if (rem) {
@@ -442,7 +442,7 @@ static void ghash(const uint8_t h[16], const uint8_t *data, uint32_t len,
 			y[j] ^= data[full * 16 + j];
 		uint8_t t[16];
 		gcm_mul(y, h, t);
-		kmemcpy(y, t, 16);
+		memcpy(y, t, 16);
 	}
 }
 
@@ -463,12 +463,12 @@ static void gcm_crypt(const struct aes128 *aes, const uint8_t iv[12],
 	aes128_encrypt_block(aes, h, h);    /* H = E(K, 0) */
 
 	uint8_t j0[16];
-	kmemcpy(j0, iv, 12);
+	memcpy(j0, iv, 12);
 	j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
 
 	/* CTR encryption starting from J0+1. */
 	uint8_t ctr[16];
-	kmemcpy(ctr, j0, 16);
+	memcpy(ctr, j0, 16);
 	for (uint32_t off = 0; off < len; off += 16) {
 		gcm_inc32(ctr);
 		uint8_t ks[16];
@@ -522,7 +522,7 @@ int aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12],
 	aes128_encrypt_block(&aes, h, h);
 
 	uint8_t j0[16];
-	kmemcpy(j0, iv, 12);
+	memcpy(j0, iv, 12);
 	j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
 
 	uint8_t y[16] = {0};
@@ -547,7 +547,7 @@ int aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12],
 		return -1;
 
 	uint8_t ctr[16];
-	kmemcpy(ctr, j0, 16);
+	memcpy(ctr, j0, 16);
 	for (uint32_t off = 0; off < len; off += 16) {
 		gcm_inc32(ctr);
 		uint8_t ks[16];

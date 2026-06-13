@@ -15,6 +15,7 @@
 #include <stddef.h>
 
 #include "fat.h"
+#include "endian.h"
 #include "console.h"
 #include "kstring.h"
 
@@ -44,26 +45,6 @@ static int name_eq(const char *a, const char *b, uint32_t blen)
 	return a[i] == '\0';
 }
 
-static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t rd32(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void put_u32(uint32_t v)   /* print an unsigned decimal */
-{
-	char buf[11];
-	int i = 10;
-	buf[i--] = '\0';
-	if (v == 0)
-		buf[i--] = '0';
-	while (v) {
-		buf[i--] = (char)('0' + v % 10);
-		v /= 10;
-	}
-	con_write(&buf[i + 1]);
-}
 
 /* ----------------------------------------------------------------- mounting */
 
@@ -122,7 +103,7 @@ static int write_abs(uint32_t lba, const void *buf)
 	if (vol.write(lba, buf) != 0)
 		return -1;
 	if (cache_ok && cache_lba == lba)
-		kmemcpy(cache, buf, 512);
+		memcpy(cache, buf, 512);
 	return 0;
 }
 
@@ -143,13 +124,13 @@ static uint32_t fat_next(uint32_t clus)
 		uint32_t off = clus * 2;
 		if (read_sec(fat_base + off / vol.bytes_per_sec, &s) != 0)
 			return BAD_CLUSTER;
-		return rd16(s + off % vol.bytes_per_sec);
+		return load_le16(s + off % vol.bytes_per_sec);
 	}
 	if (vol.kind == FAT32) {
 		uint32_t off = clus * 4;
 		if (read_sec(fat_base + off / vol.bytes_per_sec, &s) != 0)
 			return BAD_CLUSTER;
-		return rd32(s + off % vol.bytes_per_sec) & 0x0FFFFFFFu;
+		return load_le32(s + off % vol.bytes_per_sec) & 0x0FFFFFFFu;
 	}
 	/* FAT12: 1.5 bytes per entry, possibly straddling a sector boundary. */
 	uint32_t off = clus + clus / 2;
@@ -190,18 +171,18 @@ static uint32_t cluster_first_sector(uint32_t clus)
  * Returns 0 on success. */
 static int parse_bpb(const uint8_t *bs)
 {
-	if (rd16(bs + 510) != 0xAA55)
+	if (load_le16(bs + 510) != 0xAA55)
 		return -1;
 
-	uint32_t bps  = rd16(bs + 11);
+	uint32_t bps  = load_le16(bs + 11);
 	uint32_t spc  = bs[13];
-	uint32_t rsvd = rd16(bs + 14);
+	uint32_t rsvd = load_le16(bs + 14);
 	uint32_t nfat = bs[16];
-	uint32_t rootent = rd16(bs + 17);
-	uint32_t totsec16 = rd16(bs + 19);
-	uint32_t fatsz16  = rd16(bs + 22);
-	uint32_t totsec32 = rd32(bs + 32);
-	uint32_t fatsz32  = rd32(bs + 36);
+	uint32_t rootent = load_le16(bs + 17);
+	uint32_t totsec16 = load_le16(bs + 19);
+	uint32_t fatsz16  = load_le16(bs + 22);
+	uint32_t totsec32 = load_le32(bs + 32);
+	uint32_t fatsz32  = load_le32(bs + 36);
 
 	/* Our block back ends speak 512-byte sectors, and the cache is one such
 	 * sector, so only 512-byte-logical-sector volumes are supported (the
@@ -246,7 +227,7 @@ static int parse_bpb(const uint8_t *bs)
 	/* Root location and volume label live in different places per type. */
 	const uint8_t *lbl = NULL;
 	if (vol.kind == FAT32) {
-		vol.root_cluster = rd32(bs + 44);
+		vol.root_cluster = load_le32(bs + 44);
 		if (vol.root_cluster < 2)
 			return -1;
 		if (bs[66] == 0x29)        /* extended boot signature */
@@ -347,7 +328,7 @@ static int lfn_chars(const uint8_t *e, char *dst, int *term)
 	int n = 0;
 	*term = 0;
 	for (int i = 0; i < 13; i++) {
-		uint16_t ch = rd16(e + off[i]);
+		uint16_t ch = load_le16(e + off[i]);
 		if (ch == 0x0000 || ch == 0xFFFF) {
 			*term = 1;
 			break;
@@ -481,8 +462,8 @@ static int dir_read(struct dir_iter *it, struct dirent *out)
 			run_n = 0;               /* no LFN slots belong to this entry */
 		}
 		out->is_dir  = (attr & 0x10) ? 1 : 0;
-		out->cluster = ((uint32_t)rd16(e + 20) << 16) | rd16(e + 26);
-		out->size    = out->is_dir ? 0 : rd32(e + 28);
+		out->cluster = ((uint32_t)load_le16(e + 20) << 16) | load_le16(e + 26);
+		out->size    = out->is_dir ? 0 : load_le32(e + 28);
 
 		for (int i = 0; i < run_n; i++) {     /* LFN slots, then the 8.3 entry */
 			out->loc_lba[i] = run_lba[i];
@@ -505,7 +486,7 @@ static int dir_find(uint32_t dir_cluster, const char *comp, uint32_t len,
 	diter_init(&it, dir_cluster);
 	while (dir_read(&it, &d)) {
 		if (name_eq(d.name, comp, len)) {
-			kmemcpy(out, &d, sizeof(*out));
+			memcpy(out, &d, sizeof(*out));
 			return 1;
 		}
 	}
@@ -547,7 +528,7 @@ static int resolve(const char *path, struct dirent *out)
 		struct dirent child;
 		if (!dir_find(out->cluster, comp, len, &child))
 			return -1;
-		kmemcpy(out, &child, sizeof(*out));
+		memcpy(out, &child, sizeof(*out));
 	}
 	return 0;
 }
@@ -601,7 +582,7 @@ int fat_list(const char *path)
 			continue;                 /* hide "." and ".." */
 		con_write(e.is_dir ? "  <DIR>  " : "         ");
 		if (!e.is_dir) {
-			put_u32(e.size);
+			con_write_dec(e.size);
 			con_write("  ");
 		} else {
 			con_write("  ");
@@ -654,7 +635,7 @@ int fat_read_at(const char *path, uint32_t offset, void *buf, uint32_t len)
 			uint32_t n = vol.bytes_per_sec - soff;
 			if (n > len - got)
 				n = len - got;
-			kmemcpy(dst + got, s + soff, n);
+			memcpy(dst + got, s + soff, n);
 			got += n;
 		}
 		in_clus = 0;
@@ -711,7 +692,7 @@ static int read_secbuf(uint32_t sec, uint8_t *buf)
 	const uint8_t *s;
 	if (read_sec(sec, &s) != 0)
 		return -1;
-	kmemcpy(buf, s, 512);
+	memcpy(buf, s, 512);
 	return 0;
 }
 
@@ -738,7 +719,7 @@ static int fat_set(uint32_t clus, uint32_t val)
 			uint32_t off = clus * 4;
 			uint32_t sec = fbase + off / 512, pos = off % 512;
 			if (read_secbuf(sec, b) != 0) return -1;
-			uint32_t nv = (rd32(b + pos) & 0xF0000000u) | (val & 0x0FFFFFFFu);
+			uint32_t nv = (load_le32(b + pos) & 0xF0000000u) | (val & 0x0FFFFFFFu);
 			b[pos] = nv & 0xFF; b[pos + 1] = (nv >> 8) & 0xFF;
 			b[pos + 2] = (nv >> 16) & 0xFF; b[pos + 3] = (nv >> 24) & 0xFF;
 			if (write_sec(sec, b) != 0) return -1;
@@ -1013,7 +994,7 @@ int fat_create(const char *path, const void *data, uint32_t size)
 			uint8_t b[512];
 			fmemset(b, 0, 512);
 			uint32_t chunk = size - written < 512 ? size - written : 512;
-			kmemcpy(b, src + written, chunk);
+			memcpy(b, src + written, chunk);
 			if (write_sec(fsec + s, b) != 0) { fat_free_chain(first); return -1; }
 			written += chunk;
 		}
@@ -1133,12 +1114,12 @@ int fat_mount_probe(fat_read_fn read, fat_write_fn write)
 
 	/* Otherwise look for an MBR partition table and try each FAT partition. */
 	uint8_t mbr[512];
-	if (read(0, mbr) != 0 || rd16(mbr + 510) != 0xAA55)
+	if (read(0, mbr) != 0 || load_le16(mbr + 510) != 0xAA55)
 		return -1;
 	for (int i = 0; i < 4; i++) {
 		const uint8_t *p = mbr + 446 + i * 16;
 		uint8_t type = p[4];
-		uint32_t lba = rd32(p + 8);
+		uint32_t lba = load_le32(p + 8);
 		if (type == 0x00 || lba == 0)
 			continue;
 		/* 0x01 FAT12, 0x04/0x06 FAT16, 0x0B/0x0C FAT32, 0x0E FAT16 LBA */

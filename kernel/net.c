@@ -165,10 +165,10 @@ static void eth_send(const uint8_t dst[6], uint16_t type,
 		return;
 	uint8_t frame[1514];
 	struct eth_hdr *e = (struct eth_hdr *)frame;
-	kmemcpy(e->dst, dst, 6);
-	kmemcpy(e->src, nic_mac(), 6);
+	memcpy(e->dst, dst, 6);
+	memcpy(e->src, nic_mac(), 6);
 	e->type = htons(type);
-	kmemcpy(frame + 14, payload, plen);
+	memcpy(frame + 14, payload, plen);
 	nic_send(frame, 14 + plen);
 }
 
@@ -178,7 +178,7 @@ static int arp_lookup(const uint8_t ip[4], uint8_t out[6])
 {
 	for (int i = 0; i < ARP_CACHE; i++) {
 		if (arp_cache[i].valid && nmemcmp(arp_cache[i].ip, ip, 4) == 0) {
-			kmemcpy(out, arp_cache[i].mac, 6);
+			memcpy(out, arp_cache[i].mac, 6);
 			return 1;
 		}
 	}
@@ -198,8 +198,8 @@ static void arp_cache_put(const uint8_t ip[4], const uint8_t m[6])
 	}
 	if (slot < 0)
 		slot = 0;
-	kmemcpy(arp_cache[slot].ip, ip, 4);
-	kmemcpy(arp_cache[slot].mac, m, 6);
+	memcpy(arp_cache[slot].ip, ip, 4);
+	memcpy(arp_cache[slot].mac, m, 6);
 	arp_cache[slot].valid = 1;
 }
 
@@ -212,10 +212,10 @@ static void arp_build(uint8_t *pkt, uint16_t oper,
 	a->hlen  = 6;
 	a->plen  = 4;
 	a->oper  = htons(oper);
-	kmemcpy(a->sha, nic_mac(), 6);
-	kmemcpy(a->spa, my_ip, 4);
-	kmemcpy(a->tha, tha, 6);
-	kmemcpy(a->tpa, tpa, 4);
+	memcpy(a->sha, nic_mac(), 6);
+	memcpy(a->spa, my_ip, 4);
+	memcpy(a->tha, tha, 6);
+	memcpy(a->tpa, tpa, 4);
 }
 
 static void arp_request(const uint8_t ip[4])
@@ -303,11 +303,11 @@ static void ip_send(const uint8_t dst[4], uint8_t proto,
 	ip->ttl     = 64;
 	ip->proto   = proto;
 	ip->csum    = 0;
-	kmemcpy(ip->src, my_ip, 4);
-	kmemcpy(ip->dst, dst, 4);
+	memcpy(ip->src, my_ip, 4);
+	memcpy(ip->dst, dst, 4);
 	ip->csum    = htons(inet_csum(buf, 20));
 
-	kmemcpy(buf + 20, payload, plen);
+	memcpy(buf + 20, payload, plen);
 	eth_send(nh, ETH_IP, buf, 20 + plen);
 }
 
@@ -729,16 +729,16 @@ static uint32_t dhcp_build(uint8_t msgtype, uint8_t *out)
 {
 	for (int i = 0; i < 300; i++) out[i] = 0;
 	out[0] = 1; out[1] = 1; out[2] = 6;          /* op=request, ethernet, hlen 6 */
-	kmemcpy(out + 4, dhcp_xid, 4);               /* transaction id               */
+	memcpy(out + 4, dhcp_xid, 4);               /* transaction id               */
 	out[10] = 0x80;                              /* flags: broadcast the reply   */
-	kmemcpy(out + 28, nic_mac(), 6);             /* chaddr                       */
+	memcpy(out + 28, nic_mac(), 6);             /* chaddr                       */
 	out[236] = 0x63; out[237] = 0x82;            /* magic cookie 63 82 53 63     */
 	out[238] = 0x53; out[239] = 0x63;
 	int o = 240;
 	out[o++] = 53; out[o++] = 1; out[o++] = msgtype;          /* message type    */
 	if (msgtype == 3) {                          /* REQUEST carries the choices  */
-		out[o++] = 50; out[o++] = 4; kmemcpy(out + o, dhcp_offered, 4); o += 4;
-		out[o++] = 54; out[o++] = 4; kmemcpy(out + o, dhcp_server, 4);  o += 4;
+		out[o++] = 50; out[o++] = 4; memcpy(out + o, dhcp_offered, 4); o += 4;
+		out[o++] = 54; out[o++] = 4; memcpy(out + o, dhcp_server, 4);  o += 4;
 	}
 	out[o++] = 55; out[o++] = 3;                 /* parameter request list       */
 	out[o++] = 1;  out[o++] = 3; out[o++] = 6;   /* mask, router, DNS            */
@@ -762,7 +762,7 @@ static void dhcp_xmit(const uint8_t *dhcp, uint32_t dlen)
 	for (int i = 0; i < 4; i++) { ip->src[i] = 0; ip->dst[i] = 0xff; }
 	ip->csum = htons(inet_csum(buf, 20));
 	u->sport = htons(68); u->dport = htons(67); u->len = htons(ulen); u->csum = 0;
-	kmemcpy(buf + 28, dhcp, dlen);
+	memcpy(buf + 28, dhcp, dlen);
 	eth_send(bmac, ETH_IP, buf, 20 + ulen);
 }
 
@@ -781,13 +781,13 @@ static void dhcp_recv(const uint8_t src[4], uint16_t sport,
 		uint8_t olen = p[i++];
 		if (i + olen > len) break;
 		if (opt == 53 && olen >= 1)      mtype = p[i];
-		else if (opt == 1 && olen >= 4)  kmemcpy(dhcp_mask, p + i, 4);
-		else if (opt == 3 && olen >= 4){ kmemcpy(dhcp_router, p + i, 4); dhcp_have_router = 1; }
-		else if (opt == 6 && olen >= 4){ kmemcpy(dhcp_dns, p + i, 4);    dhcp_have_dns = 1; }
-		else if (opt == 54 && olen >= 4) kmemcpy(dhcp_server, p + i, 4);
+		else if (opt == 1 && olen >= 4)  memcpy(dhcp_mask, p + i, 4);
+		else if (opt == 3 && olen >= 4){ memcpy(dhcp_router, p + i, 4); dhcp_have_router = 1; }
+		else if (opt == 6 && olen >= 4){ memcpy(dhcp_dns, p + i, 4);    dhcp_have_dns = 1; }
+		else if (opt == 54 && olen >= 4) memcpy(dhcp_server, p + i, 4);
 		i += olen;
 	}
-	kmemcpy(dhcp_offered, p + 16, 4);            /* yiaddr                       */
+	memcpy(dhcp_offered, p + 16, 4);            /* yiaddr                       */
 	if (mtype == 2 && dhcp_state < 2) dhcp_state = 2;       /* OFFER             */
 	else if (mtype == 5)              dhcp_state = 4;       /* ACK               */
 }
@@ -823,10 +823,10 @@ static int dhcp_run(void)
 	if (dhcp_state < 4)
 		return -1;
 
-	kmemcpy(my_ip, dhcp_offered, 4);
-	kmemcpy(netmask, dhcp_mask, 4);
-	if (dhcp_have_router) kmemcpy(gw_ip, dhcp_router, 4);
-	if (dhcp_have_dns)    kmemcpy(dns_ip, dhcp_dns, 4);
+	memcpy(my_ip, dhcp_offered, 4);
+	memcpy(netmask, dhcp_mask, 4);
+	if (dhcp_have_router) memcpy(gw_ip, dhcp_router, 4);
+	if (dhcp_have_dns)    memcpy(dns_ip, dhcp_dns, 4);
 	for (int i = 0; i < ARP_CACHE; i++)          /* subnet changed              */
 		arp_cache[i].valid = 0;
 	return 0;

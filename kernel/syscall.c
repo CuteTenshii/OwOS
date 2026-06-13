@@ -14,6 +14,7 @@
 #include "fat.h"
 #include "hfs.h"
 #include "ext.h"
+#include "iso9660.h"
 #include "blk.h"
 #include "loader.h"
 #include "sched.h"
@@ -563,9 +564,13 @@ void syscall_dispatch(struct registers *r)
 		}
 		o = (struct vinfo *)r->ecx;
 		int got = 0;
-		if ((int)r->ebx == 0 && (fat_mounted() || hfs_mounted() || ext_mounted())) {
-			const char *lbl = ext_mounted() ? ext_label() :
-			                  hfs_mounted() ? hfs_label() : fat_label();
+		if ((int)r->ebx == 0 &&
+		    (fat_mounted() || hfs_mounted() || ext_mounted() || iso_mounted())) {
+			const char *lbl = "";
+			if (iso_mounted())      lbl = iso_label();
+			else if (ext_mounted()) lbl = ext_label();
+			else if (hfs_mounted()) lbl = hfs_label();
+			else                    lbl = fat_label();
 			if (!lbl[0])
 				lbl = "Removable";
 			int i = 0;
@@ -587,7 +592,10 @@ void syscall_dispatch(struct registers *r)
 	/* Eject (unmount) the removable volume at /media. Writes are write-through, so this
 	 * just drops the mount; the medium is then safe to remove. */
 	case SYS_EJECT:
-		if (ext_mounted()) {
+		if (iso_mounted()) {
+			iso_unmount();
+			r->eax = 0;
+		} else if (ext_mounted()) {
 			ext_unmount();
 			r->eax = 0;
 		} else if (hfs_mounted()) {

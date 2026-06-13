@@ -6,8 +6,9 @@ boots the freestanding kernel directly through its built-in Multiboot loader; a
 GRUB ISO is also produced for real VMs and bare metal.
 
 What started as a "does it boot" experiment now has a graphical desktop with a
-window manager and mouse, ring-3 processes with `fork`/`exec`/`waitpid`, three
-storage stacks, half a dozen filesystems, a from-scratch TCP/IP + TLS network
+window manager and mouse, ring-3 processes with `fork`/`exec`/`waitpid`, block
+drivers for IDE/SATA/NVMe/SD/USB/CD-DVD, half a dozen filesystems, a from-scratch
+TCP/IP + TLS network
 stack with a real web browser on top, an SMB2 file server, a BitTorrent client,
 USB host support, and Sound Blaster audio. With no framebuffer it falls back to
 an 80×25 text console and everything still works.
@@ -47,9 +48,10 @@ VMware, VirtualBox, bare metal — and carries GRUB for both BIOS and UEFI.
 
 `make run`/`debug` auto-create the disks and devices the drivers exercise: an
 IDE disk (`disk.img`, the owofs boot volume), a SATA disk on an AHCI controller,
-an NVMe SSD, a FAT-formatted USB stick on an xHCI controller, a SLIRP user-mode
-NIC, and (for `run`) Sound Blaster 16 + a USB tablet. Files written through the
-shell persist in `disk.img` across reboots.
+an NVMe SSD, a FAT-formatted USB stick on an xHCI controller, an SD card on an
+SDHCI controller, an ISO 9660 `cd.iso` in an ATAPI CD-ROM, a SLIRP user-mode NIC,
+and (for `run`) Sound Blaster 16 + a USB tablet. Files written through the shell
+persist in `disk.img` across reboots.
 
 > **Don't pass `-vga std`.** It leaves the card in a graphics mode where the
 > 0xB8000 text window is unmapped and nothing renders. `make run` uses QEMU's
@@ -138,9 +140,13 @@ Removable volumes mount read/write or read-only at **`/media`** via `mount` /
 - **FAT12/16/32** — full read **and** write (host `fsck`-clean).
 - **HFS+** ("Mac OS Extended") — read-only.
 - **ext2/3/4** — read-only (extent trees + indirect blocks).
+- **ISO 9660 + Joliet** — read-only CD/DVD (long, mixed-case names).
 
-USB flash drives are handled by the xHCI mass-storage path (BOT/SCSI), so a
-plugged-in stick shows up as a block device and mounts the same way.
+USB flash drives are handled by the xHCI mass-storage path (BOT/SCSI) and SD/MMC
+cards by an SDHCI driver, so a plugged-in stick or card shows up as a block device
+and mounts the same way. A **CD/DVD** mounts too: a polled **ATAPI** driver tunnels
+SCSI commands over the IDE bus (2048-byte sectors) and the ISO 9660 driver reads
+the disc.
 
 `storage` lists every detected device with model and capacity; `neofetch` shows
 them too.
@@ -256,11 +262,9 @@ kernel/kernel.c    kernel_main — brings subsystems up in dependency order
 kernel/gdt.c .S    flat 32-bit GDT + lgdt/segment reload
 kernel/idt.c isr.S CPU exception IDT + dispatcher (panic screen + COM1)
 kernel/irq.c .S    PIC remap + hardware IRQ dispatch
-kernel/timer.c     PIT @ 100 Hz, tick counter + sleep (IRQ0)
+kernel/timer.c     PIT (250 Hz), tick counter + sleep (IRQ0)
 kernel/serial.c    polled COM1 UART (console mirror / logging)
-kernel/keyboard.c  PS/2 keyboard (IRQ1), input ring, US/FR layouts
-kernel/mouse.c     PS/2 mouse (IRQ12), shares the i8042 with the keyboard
-kernel/vga.c       80×25 text console (shadow grid, mirrors to serial)
+kernel/console.c   text + framebuffer console funnel (was vga.c)
 kernel/shell.c     line-buffered shell: history, editing, pipes, redirection
 kernel/crash.c     ring-3 crash reporter (fault -> crash window)
 
@@ -274,29 +278,19 @@ kernel/loader.c    ELF32 loader: load segments into a fresh address space
 kernel/pipe.c      kernel pipe ring buffers
 kernel/file.h      per-process fd table
 
-kernel/fb.c        32-bpp framebuffer (DISPI program or bootloader adopt)
 kernel/wm.c        compositing window manager (one kernel thread)
 kernel/uwin.c      ring-3 windowing server (user apps own a window)
 kernel/apps.c      desktop app registry / Start menu
-kernel/app_term.c  the terminal app (hosts the shell)
 kernel/screenshot.c Print Screen -> PNG capture worker
 kernel/png.c       PNG decoder (over the DEFLATE engine)
 
-kernel/blk.c       block-device selection for owofs (IDE>AHCI>NVMe)
-kernel/ata.c       polled ATA PIO disk driver (primary IDE)
-kernel/ahci.c      polled AHCI driver for SATA disks/SSDs (MMIO + DMA)
-kernel/nvme.c      minimal NVMe driver for PCIe SSDs (admin + I/O queues)
+kernel/blk.c       block-device selection for owofs (IDE>AHCI>NVMe) + /media mount
 kernel/fs.c        owofs: minimal persistent filesystem
 kernel/fat.c       FAT12/16/32 read+write driver (mounts at /media)
 kernel/hfs.c       HFS+ read-only driver
 kernel/ext.c       ext2/3/4 read-only driver
-kernel/pci.c       PCI bus enumeration (config mechanism #1)
-kernel/usb.c       UHCI control transfers (lsusb)
-kernel/xhci.c      xHCI host + USB mass-storage block device
+kernel/iso9660.c   ISO 9660 + Joliet read-only CD/DVD driver
 
-kernel/nic.c       link-layer driver dispatch (rtl8139 / e1000)
-kernel/rtl8139.c   RTL8139 NIC driver (QEMU default)
-kernel/e1000.c     Intel e1000 NIC driver (MMIO, RX/TX rings, IRQ)
 kernel/net.c       IPv4: ARP, ICMP, UDP/DNS, DHCP
 kernel/tcp.c       concurrent TCP: client (connect) + server (listen/accept)
 kernel/tls.c       client TLS 1.3/1.2 (for https)
@@ -311,17 +305,37 @@ kernel/peer.c      BitTorrent peer wire protocol
 
 kernel/zip.c       LZSS compressor/decompressor (zip/unzip)
 kernel/gzip.c      gzip/DEFLATE codec + CRC32 (gzip/gunzip, curl, png)
-kernel/speaker.c   PC speaker tones (PIT channel 2)
-kernel/sb16.c      Sound Blaster 16 (8-bit PCM over ISA DMA, WAV playback)
-kernel/power.c     shutdown / reboot + ACPI table walking
-kernel/aml.c       tiny AML interpreter (battery methods)
-kernel/battery.c   best-effort battery percentage (real-HW)
 kernel/smbios.c    SMBIOS/DMI host name for neofetch
-kernel/edid.c      monitor EDID over DDC/I2C (real-HW)
 kernel/firmware.c  BIOS vs UEFI detection
 kernel/cpu.c       CPUID vendor/brand
 kernel/rtc.c       CMOS real-time clock
 kernel/neofetch.c  system-info splash
+
+drivers/ — device drivers, grouped by type (each subdir is on the -I path,
+          so cross-file includes stay flat: #include "fb.h", not a path):
+
+drivers/bus/pci.c        PCI bus enumeration (config mechanism #1)
+drivers/storage/ata.c    polled ATA PIO disk driver (primary IDE)
+drivers/storage/ahci.c   polled AHCI driver for SATA disks/SSDs (MMIO + DMA)
+drivers/storage/nvme.c   minimal NVMe driver for PCIe SSDs (admin + I/O queues)
+drivers/storage/sd.c     SD/MMC card driver over an SDHCI host controller
+drivers/storage/atapi.c  polled ATAPI driver for CD/DVD drives (PACKET command)
+drivers/net/nic.c        link-layer driver dispatch (rtl8139 / e1000)
+drivers/net/rtl8139.c    RTL8139 NIC driver (QEMU default)
+drivers/net/e1000.c      Intel e1000 NIC driver (MMIO, RX/TX rings, IRQ)
+drivers/usb/usb.c        UHCI control transfers (lsusb)
+drivers/usb/xhci.c       xHCI host + USB mass-storage block device
+drivers/input/keyboard.c PS/2 keyboard (IRQ1), input ring, US/FR layouts
+drivers/input/mouse.c    PS/2 mouse (IRQ12), shares the i8042 with the keyboard
+drivers/video/fb.c       32-bpp framebuffer (DISPI program or bootloader adopt)
+drivers/video/mtrr.c     MTRR/PAT write-combining for the framebuffer
+drivers/video/edid.c     monitor EDID over DDC/I2C (real-HW)
+drivers/audio/sb16.c     Sound Blaster 16 (8-bit PCM over ISA DMA, WAV playback)
+drivers/audio/hda.c      Intel HD Audio + Realtek codec (16-bit PCM, WAV playback)
+drivers/audio/speaker.c  PC speaker tones (PIT channel 2)
+drivers/acpi/power.c     shutdown / reboot + ACPI table walking
+drivers/acpi/aml.c       tiny AML interpreter (battery methods)
+drivers/acpi/battery.c   best-effort battery percentage (real-HW)
 
 user/lib/          user libc: syscall wrappers, gfx, inflate, png, url, _start
 user/curl.c        ring-3 HTTP/1.1 client

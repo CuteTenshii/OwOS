@@ -24,6 +24,7 @@
 #include <stddef.h>
 
 #include "e1000.h"
+#include "kstring.h"
 #include "net.h"
 #include "pci.h"
 #include "irq.h"
@@ -40,14 +41,6 @@
 #define E1000_PCH_WAKE 1
 
 /* ------------------------------------------------------------------ helpers */
-
-static void kmemcpy(void *dst, const void *src, uint32_t n)
-{
-	uint8_t *d = dst;
-	const uint8_t *s = src;
-	while (n--)
-		*d++ = *s++;
-}
 
 /* Save EFLAGS and clear IF; restore only re-enables if it was on. */
 static inline uint32_t irq_save(void)
@@ -912,7 +905,7 @@ static void e1000_send(const uint8_t *frame, uint32_t len)
 	uint32_t fl = irq_save();
 
 	uint32_t i = tx_cur;
-	kmemcpy(tx_bufs[i], frame, len);
+	memcpy(tx_bufs[i], frame, len);
 	tx_ring[i].addr   = (uint32_t)tx_bufs[i];
 	tx_ring[i].length = (uint16_t)len;    /* PSP pads runts to 60 in hardware   */
 	tx_ring[i].cmd    = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS;

@@ -8,18 +8,22 @@
  */
 
 #include "blk.h"
+#include "kstring.h"
 #include "ata.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "sd.h"
 #include "xhci.h"
+#include "atapi.h"
 #include "fat.h"
 #include "hfs.h"
 #include "ext.h"
+#include "iso9660.h"
 #include "pmm.h"
 #include "paging.h"
 #include "console.h"
 
-enum backend { BK_NONE, BK_IDE, BK_AHCI, BK_NVME, BK_RAM };
+enum backend { BK_NONE, BK_IDE, BK_AHCI, BK_NVME, BK_SD, BK_RAM };
 static enum backend backend;
 
 /* RAM disk (tmpfs). Sized to match owofs's 16 MiB sector space so its bump
@@ -112,9 +116,12 @@ const char *blk_fat_source(void)
 static void announce_vol(const char *source)
 {
 	fat_src = source;
-	int ro = hfs_mounted() || ext_mounted();
-	const char *type  = ext_mounted() ? ext_type()  : hfs_mounted() ? hfs_type()  : fat_type();
-	const char *label = ext_mounted() ? ext_label() : hfs_mounted() ? hfs_label() : fat_label();
+	int ro = hfs_mounted() || ext_mounted() || iso_mounted();
+	const char *type = "none", *label = "";
+	if (iso_mounted())      { type = iso_type(); label = iso_label(); }
+	else if (ext_mounted()) { type = ext_type(); label = ext_label(); }
+	else if (hfs_mounted()) { type = hfs_type(); label = hfs_label(); }
+	else                    { type = fat_type(); label = fat_label(); }
 	con_write("vol: mounted ");
 	con_write(type);
 	if (label[0]) {
@@ -140,6 +147,20 @@ int blk_mount_fat(void)
 	 * a stick/SD/second image lives on another. This is where device knowledge
 	 * belongs -- fat.c/hfs.c stay controller-agnostic. */
 
+	/* Exactly one removable volume lives at /media. If something is already
+	 * mounted (e.g. a CD claimed it at boot before the USB stick enumerated),
+	 * leave it -- the post-boot retry must not stack a second volume on top. */
+	if (fat_mounted() || hfs_mounted() || ext_mounted() || iso_mounted())
+		return 0;
+
+	/* A CD/DVD is read-only ISO 9660, on its own ATAPI transport (2048-byte
+	 * sectors), so it can't ride the 512-byte fat/hfs/ext probe path -- handle
+	 * it directly. A drive with no disc just fails the read and falls through. */
+	if (atapi_present() && iso_mount_probe(atapi_read_sector) == 0) {
+		announce_vol("CD");
+		return 0;
+	}
+
 	/* A USB mass-storage device is the most natural target -- a real removable
 	 * stick -- so try it first. It only becomes present after xhci_boot()
 	 * enumerates it, which is why this runs again post-boot. */
@@ -155,6 +176,7 @@ int blk_mount_fat(void)
 		{ ata_present(),  BK_IDE,  "IDE",  ata_read_sector,  ata_write_sector  },
 		{ ahci_present(), BK_AHCI, "SATA", ahci_read_sector, ahci_write_sector },
 		{ nvme_present(), BK_NVME, "NVMe", nvme_read_sector, nvme_write_sector },
+		{ sd_present(),   BK_SD,   "SD",   sd_read_sector,   sd_write_sector   },
 	};
 	for (unsigned i = 0; i < sizeof(dev) / sizeof(dev[0]); i++) {
 		if (!dev[i].present || dev[i].id == backend)
@@ -162,7 +184,7 @@ int blk_mount_fat(void)
 		if (mount_removable(dev[i].name, dev[i].r, dev[i].w) == 0)
 			return 0;
 	}
-	con_write("vol: no FAT/HFS+/ext volume found\n");
+	con_write("vol: no removable volume found\n");
 	return -1;
 }
 

@@ -5,6 +5,15 @@ booted directly by QEMU's Multiboot loader. README.md has the feature list and
 per-file layout; this file covers what spans multiple files or isn't obvious
 from one read.
 
+**Source layout:** device drivers live under `drivers/<type>/`
+(`storage net audio usb input video acpi bus`); the core kernel, filesystems
+(`fs/fat/hfs/ext/iso9660`), block dispatch (`blk`), and the network *stack*
+(`net/tcp/tls/crypto`) stay in `kernel/`. Includes are **flat** — every file
+says `#include "fb.h"`, never a path — because the Makefile puts `kernel/` *and
+every* `drivers/` subdir on the `-I` path (`DRVDIRS`). So a header resolves no
+matter which folder it lives in, and moving a driver between folders needs only
+an OBJS path change, not include edits. Header basenames must stay unique.
+
 ## Build & run
 
 ```sh
@@ -21,9 +30,10 @@ make run NIC=e1000  # attach the Intel 82540EM instead of the default RTL8139
 
 There is **no cross-compiler**: a freestanding 32-bit ELF (`gcc -m32
 -ffreestanding -nostdlib`) linked at 1 MiB by `linker.ld`, loaded via QEMU's
-built-in Multiboot (`-kernel`). `make run`/`debug` auto-create three disks (IDE
-`disk.img` + AHCI + NVMe, to exercise all storage drivers), a SLIRP NIC, and a
-USB tablet; `make run` adds Sound Blaster 16 + PC speaker. Both the RTL8139 and
+built-in Multiboot (`-kernel`). `make run`/`debug` auto-create the disks each
+storage driver exercises (IDE `disk.img` + AHCI + NVMe + a USB stick + an SD card
++ an ISO 9660 `cd.iso` on an ATAPI CD-ROM), a SLIRP NIC, and a USB tablet; `make
+run` adds Sound Blaster 16 + PC speaker. Both the RTL8139 and
 e1000 drivers are built in; the kernel keeps whichever card QEMU attached.
 `make iso` is the only target needing a host bootloader (`grub-mkrescue`); it's
 for VMware/VirtualBox/bare metal, which need GRUB on the media.
@@ -276,7 +286,7 @@ help-only); add a row and `help`/dispatch pick it up.
 and the install is conditional, so after editing a `user/*.c` a plain rebuild
 boots the **stale** copy — `make distclean` to force reinstall.
 
-## Storage: block dispatch & filesystem (blk.c + fs.c + ata/ahci/nvme)
+## Storage: block dispatch & filesystem (blk.c + fs.c + ata/ahci/nvme/sd/atapi)
 
 owofs (fs.c) is a flat 512-byte-sector filesystem with a directory tree; it only
 needs to read/write LBAs. `blk.c` picks **one** backing device at boot — first
@@ -296,11 +306,48 @@ owofs is the *boot* volume; **removable volumes mount at `/media`** via the
 `mount`/`eject` commands, alongside owofs, over a separate set of read-only/
 read-write drivers: **fat.c** (FAT12/16/32, read **and** write), **hfs.c** (HFS+
 "Mac OS Extended", read-only — HFS+/HFSX only), **ext.c** (ext2/3/4, read-only,
-extent trees + indirect blocks). The mount source is any non-owofs block device:
-the AHCI/NVMe scratch disks, or a **USB flash drive** enumerated by xhci.c
-(BOT/SCSI mass storage exposed as a block device). A USB stick only appears
-after `xhci_boot` (post-`sti`), so kernel.c auto-mounts it there; others mount on
-demand. These probe by filesystem signature and never auto-format.
+extent trees + indirect blocks), and **iso9660.c** (ISO 9660 + Joliet CD/DVD,
+read-only). The mount source is any non-owofs block device: the AHCI/NVMe scratch
+disks, a **USB flash drive** enumerated by xhci.c (BOT/SCSI mass storage exposed
+as a block device), an **SD/MMC card** brought up by sd.c, or a **CD/DVD** in an
+ATAPI drive (atapi.c). A USB stick only appears after `xhci_boot` (post-`sti`),
+so kernel.c auto-mounts it there; others mount on demand. Exactly one removable
+volume lives at `/media` at a time. These probe by filesystem signature and never
+auto-format.
+
+**sd.c — SD/MMC over an SDHCI host controller.** Probes PCI for an SD Host
+Controller (class 0x08 / subclass 0x05, e.g. QEMU's `sdhci-pci` + `sd-card`),
+maps BAR0 uncached, runs the SD identification handshake (CMD0/CMD8/ACMD41/CMD2/
+CMD3/CMD9/CMD7), and reads/writes one 512-byte block at a time by **polled PIO**
+through the Buffer Data Port — same read/write/present/sectors/model API as
+ata/ahci/nvme, so blk.c lists it as a removable `/media` source. `sd_init` runs
+before the timer (alongside ahci/nvme), so it busy-spins rather than sleeping.
+SDSC cards are byte-addressed (LBA×512 in the argument), SDHC/SDXC block-
+addressed (the CCS bit from ACMD41 picks which); capacity comes from the CSD.
+
+**atapi.c — CD/DVD over the IDE bus, by PACKET.** A CD/DVD is an ATAPI device:
+SCSI command blocks tunnelled over the ATA bus via the PACKET (0xA0) command, with
+**2048-byte logical sectors** (so it can't share ata.c). `atapi_init` probes both
+IDE channels (0x1F0/0x170), master + slave, and latches the first packet device —
+detected by the **0x14/0xEB signature** a plain IDENTIFY leaves in the byte-count
+registers when it aborts on a packet device. Reads are polled PIO, one logical
+sector per `READ(10)`. Two gotchas that look like hardware bugs: **READ(10) is
+opcode 0x28** (0xA8 is READ(12), with the transfer length in different CDB bytes),
+and the **PACKET data-in loop must settle ~400 ns** (read alt-status ×4) before
+polling status — right after the CDB the drive hasn't raised BSY yet, so a bare
+wait-not-busy sees stale BSY=0/DRQ=0 and quits with zero bytes. A drive with no
+disc is still "present"; reads just fail and the mount falls through. QEMU always
+exposes an (often empty) DVD drive, and `-cdrom` lands it on the **secondary IDE
+master**.
+
+**iso9660.c — read-only ISO 9660 / Joliet.** Sits on atapi.c (its sector source
+is `atapi_read_sector`, the 2048-byte block reader — *not* the 512-byte path the
+other removable FSes use, so blk.c mounts the CD directly rather than through the
+shared fat/hfs/ext probe). The Volume Descriptor chain at sector 16 gives the root
+directory; **Joliet** (the type-2 Supplementary VD, UCS-2 names) is preferred when
+present so files show as long, mixed-case names instead of SHOUTING 8.3 with a
+`;1` suffix. Same read-only fs API as ext.c (list/stat/read_at/enum_dir/label/
+type); path resolution is case-insensitive.
 
 ## Network stack (nic.c → net.c → tcp.c → tls.c, with crypto.c)
 

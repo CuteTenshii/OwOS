@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "gzip.h"
+#include "endian.h"
 #include "heap.h"
 
 #define MAXBITS    15           /* longest Huffman code                        */
@@ -64,11 +65,6 @@ static void put_u32(uint8_t *p, uint32_t v)
 	p[3] = (uint8_t)(v >> 24);
 }
 
-static uint32_t get_u32(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
 /* ---- CRC32 (gzip's polynomial, lazily-built table) --------------------- */
 
@@ -876,7 +872,7 @@ int gzip_orig_size(const uint8_t *src, uint32_t slen)
 {
 	if (slen < 18 || src[0] != 0x1F || src[1] != 0x8B || src[2] != 0x08)
 		return -1;
-	return (int)get_u32(src + slen - 4);
+	return (int)load_le32(src + slen - 4);
 }
 
 int gzip_decompress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
@@ -903,14 +899,14 @@ int gzip_decompress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dc
 	if (pos >= slen)
 		return -1;
 
-	int orig = (int)get_u32(src + slen - 4);
+	int orig = (int)load_le32(src + slen - 4);
 	if (orig < 0 || (uint32_t)orig > dcap)
 		return -1;
 
 	int n = inflate(src, pos, slen - 8, dst, dcap);
 	if (n < 0 || (uint32_t)n != (uint32_t)orig)
 		return -1;
-	if (crc32(dst, (uint32_t)n) != get_u32(src + slen - 8))
+	if (crc32(dst, (uint32_t)n) != load_le32(src + slen - 8))
 		return -1;
 	return n;
 }

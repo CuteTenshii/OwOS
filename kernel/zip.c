@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "zip.h"
+#include "endian.h"
 #include "heap.h"
 
 #define WINDOW      4096            /* 12-bit back-distance (1..WINDOW)         */
@@ -32,11 +33,6 @@ static void put_u32(uint8_t *p, uint32_t v)
 	p[3] = (uint8_t)(v >> 24);
 }
 
-static uint32_t get_u32(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
 /* A multiplicative hash of the 3 bytes at p, folded to HASH_BITS. */
 static uint32_t hash3(const uint8_t *p)
@@ -154,7 +150,7 @@ int zip_orig_size(const uint8_t *src, uint32_t slen)
 	if (slen < ZIP_HEADER ||
 	    src[0] != 'O' || src[1] != 'W' || src[2] != 'O' || src[3] != 'Z')
 		return -1;
-	return (int)get_u32(src + 4);
+	return (int)load_le32(src + 4);
 }
 
 int zip_decompress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)

@@ -279,13 +279,6 @@ int pci_displays(struct pci_display *out, int max)
 	return n;
 }
 
-static void put_hex(uint32_t value, int digits)
-{
-	static const char h[] = "0123456789abcdef";
-	for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-		con_putc(h[(value >> shift) & 0xF]);
-}
-
 void pci_list(void)
 {
 	if (device_count == 0) {
@@ -295,15 +288,15 @@ void pci_list(void)
 	con_write("bus:slot.fn vendor:device class description\n");
 	for (int i = 0; i < device_count; i++) {
 		struct pci_device *d = &devices[i];
-		put_hex(d->bus, 2);  con_putc(':');
-		put_hex(d->slot, 2); con_putc('.');
-		put_hex(d->func, 1);
+		con_put_hex(d->bus, 2);  con_putc(':');
+		con_put_hex(d->slot, 2); con_putc('.');
+		con_put_hex(d->func, 1);
 		con_write("    ");
-		put_hex(d->vendor, 4); con_putc(':');
-		put_hex(d->device, 4);
+		con_put_hex(d->vendor, 4); con_putc(':');
+		con_put_hex(d->device, 4);
 		con_write("   ");
-		put_hex(d->class_code, 2);
-		put_hex(d->subclass, 2);
+		con_put_hex(d->class_code, 2);
+		con_put_hex(d->subclass, 2);
 		con_write("  ");
 		/* Prefer the exact chip name; otherwise "<Vendor> <class>"; otherwise
 		 * just the class. So a known card reads "Realtek RTL8139 Fast

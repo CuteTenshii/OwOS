@@ -25,6 +25,7 @@
 #include <stddef.h>
 
 #include "smb.h"
+#include "endian.h"
 #include "tcp.h"
 #include "fs.h"
 
@@ -36,13 +37,6 @@ static void put32(uint8_t *p, uint32_t v)
 	p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
 }
 static void put64(uint8_t *p, uint64_t v) { put32(p, (uint32_t)v); put32(p + 4, (uint32_t)(v >> 32)); }
-static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t get32(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static uint64_t get64(const uint8_t *p) { return (uint64_t)get32(p) | ((uint64_t)get32(p + 4) << 32); }
 
 /* ------------------------------------------------------------- SMB2 on wire */
 
@@ -168,15 +162,15 @@ static void build_header(struct smb_conn *s, const uint8_t *req, uint32_t status
 		h[i] = 0;
 	h[0] = SMB2_MAGIC0; h[1] = 'S'; h[2] = 'M'; h[3] = 'B';
 	put16(h + 4, SMB2_HDR);                 /* StructureSize */
-	put16(h + 6, get16(req + 6));           /* CreditCharge */
+	put16(h + 6, load_le16(req + 6));           /* CreditCharge */
 	put32(h + 8, status);                   /* Status */
-	put16(h + 12, get16(req + 12));         /* Command */
+	put16(h + 12, load_le16(req + 12));         /* Command */
 	put16(h + 14, 1);                       /* CreditResponse: grant 1 */
 	put32(h + 16, SMB2_FLAGS_RESPONSE);     /* Flags */
 	put32(h + 20, 0);                       /* NextCommand */
-	put64(h + 24, get64(req + 24));         /* MessageId */
+	put64(h + 24, load_le64(req + 24));         /* MessageId */
 	put32(h + 32, 0);                       /* Reserved */
-	put32(h + 36, get32(req + 36));         /* TreeId */
+	put32(h + 36, load_le32(req + 36));         /* TreeId */
 	put64(h + 40, s->session_id);           /* SessionId */
 	/* Signature (16) left zero. */
 }
@@ -369,7 +363,7 @@ static int session_setup_response(struct smb_conn *s, const uint8_t *req,
 static int do_session_setup(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 {
 	const uint8_t *ntlm = find_ntlmssp(req, reqlen);
-	uint32_t type = ntlm ? get32(ntlm + 8) : 0;
+	uint32_t type = ntlm ? load_le32(ntlm + 8) : 0;
 
 	if (type == 1) {                        /* NEGOTIATE -> CHALLENGE */
 		s->session_id = OWOS_SESSION_ID;
@@ -450,7 +444,7 @@ static int handle_alloc(struct smb_conn *s)
 
 static struct smb_handle *handle_get(struct smb_conn *s, const uint8_t *fid)
 {
-	uint64_t idx = get64(fid);
+	uint64_t idx = load_le64(fid);
 	if (idx >= SMB_MAX_HANDLES || !s->handles[idx].used)
 		return NULL;
 	return &s->handles[idx];
@@ -494,8 +488,8 @@ static int dir_entry_at(const char *dirpath, int idx, char *name, int *is_dir,
 static int do_create(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 {
 	const uint8_t *body = req + SMB2_HDR;
-	uint16_t noff = get16(body + 44);
-	uint16_t nlen = get16(body + 46);
+	uint16_t noff = load_le16(body + 44);
+	uint16_t nlen = load_le16(body + 46);
 	char path[128];
 	if (nlen && (uint32_t)noff + nlen <= reqlen)
 		smb_to_path(req + noff, nlen, path, sizeof path);
@@ -608,8 +602,8 @@ static int do_read(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 {
 	(void)reqlen;
 	const uint8_t *body = req + SMB2_HDR;
-	uint32_t len = get32(body + 4);
-	uint64_t off = get64(body + 8);
+	uint32_t len = load_le32(body + 4);
+	uint64_t off = load_le64(body + 8);
 	struct smb_handle *h = handle_get(s, body + 16);
 	if (!h || h->is_dir)
 		return do_error(s, req, STATUS_NOT_SUPPORTED);
@@ -790,7 +784,7 @@ void smb_serve(tcp_conn_t *c)
 		if (req[0] != SMB2_MAGIC0 || req[1] != 'S' || req[2] != 'M' || req[3] != 'B')
 			return;                 /* not SMB2 (SMB1 negotiate etc.) — drop */
 
-		uint16_t cmd = get16(req + 12);
+		uint16_t cmd = load_le16(req + 12);
 		int rc;
 		switch (cmd) {
 		case SMB2_NEGOTIATE:

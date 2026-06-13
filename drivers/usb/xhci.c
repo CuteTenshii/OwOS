@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "xhci.h"
+#include "endian.h"
 #include "sched.h"
 #include "nic.h"
 #include "net.h"
@@ -30,6 +31,7 @@
 #include "heap.h"
 #include "kstring.h"
 #include "timer.h"
+#include "fs.h"
 
 #define PCI_CLASS_SERIAL_BUS  0x0C
 #define PCI_SUBCLASS_USB      0x03
@@ -158,6 +160,7 @@ struct usbdev {
 	 * takes encapsulated commands, the bulk data pair, and the MAC we learned. */
 	int      is_net;
 	int      is_msc;       /* bulk-only-transport mass storage (class 08/06/50) */
+	int      is_mtp;       /* media transfer protocol / PTP (class 06/01/01)    */
 	int      ctrl_iface;
 	uint8_t  bulk_in, bulk_out, intr_in;
 	uint16_t bulk_in_mps, bulk_out_mps, intr_in_mps;
@@ -211,13 +214,6 @@ static inline void w64(volatile uint8_t *p, uint32_t off, uint64_t v)
 {
 	*(volatile uint32_t *)(p + off)     = (uint32_t)v;
 	*(volatile uint32_t *)(p + off + 4) = (uint32_t)(v >> 32);
-}
-
-static void put_hex(uint32_t value, int digits)
-{
-	static const char h[] = "0123456789abcdef";
-	for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-		con_putc(h[(value >> shift) & 0xF]);
 }
 
 /* Initialize a producer ring in a fresh page, with a Link TRB in the last slot
@@ -355,8 +351,8 @@ static volatile uint8_t *find_and_map(void)
 				if (paging_identity_map(phys, size) != 0)
 					return NULL;
 				paging_mark_uc(phys, size);
-				con_write("xhci: controller at "); put_hex(phys, 8);
-				con_write(" size "); put_hex(size, 8); con_putc('\n');
+				con_write("xhci: controller at "); con_put_hex(phys, 8);
+				con_write(" size "); con_put_hex(size, 8); con_putc('\n');
 				return (volatile uint8_t *)phys;
 			}
 		}
@@ -600,11 +596,6 @@ static int control_out(int slot_id, uint8_t bmReqType, uint8_t bReq,
  * Ethernet frames (later) ride the bulk pipes wrapped in packet headers. This
  * does the bring-up handshake: INITIALIZE, then QUERY the permanent MAC. */
 
-static uint32_t le32(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 static void put_le32(uint8_t *p, uint32_t v)
 {
 	p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
@@ -641,7 +632,7 @@ static int rndis_setup(struct usbdev *d)
 	/* INITIALIZE_CMPLT layout: type(0) len(4) reqid(8) status(12) ... */
 	if (rndis_cmd(d->slot, d->ctrl_iface, msg, 24, resp, sizeof resp) < 16)
 		return -1;
-	if (le32(resp + 12) != 0)           /* INITIALIZE_CMPLT status              */
+	if (load_le32(resp + 12) != 0)           /* INITIALIZE_CMPLT status              */
 		return -1;
 
 	for (int i = 0; i < 32; i++) msg[i] = 0;
@@ -655,9 +646,9 @@ static int rndis_setup(struct usbdev *d)
 	/* QUERY_CMPLT layout: type(0) len(4) reqid(8) status(12) infolen(16)
 	 * infooffset(20) [data]; the offset is measured from byte 8 (reqid). */
 	int n = rndis_cmd(d->slot, d->ctrl_iface, msg, 28, resp, sizeof resp);
-	if (n < 24 || le32(resp + 12) != 0) /* QUERY_CMPLT status                   */
+	if (n < 24 || load_le32(resp + 12) != 0) /* QUERY_CMPLT status                   */
 		return -1;
-	uint32_t off = 8 + le32(resp + 20); /* InfoBufferOffset is from byte 8      */
+	uint32_t off = 8 + load_le32(resp + 20); /* InfoBufferOffset is from byte 8      */
 	if ((int)off + 6 > n)
 		return -1;
 	for (int i = 0; i < 6; i++)
@@ -719,7 +710,7 @@ static int rndis_set_filter(struct usbdev *d)
 	put_le32(msg + 28, 0x0000000D);     /* DIRECTED | MULTICAST | BROADCAST     */
 	if (rndis_cmd(d->slot, d->ctrl_iface, msg, 32, resp, sizeof resp) < 16)
 		return -1;
-	return le32(resp + 12) == 0 ? 0 : -1;   /* SET_CMPLT status                 */
+	return load_le32(resp + 12) == 0 ? 0 : -1;   /* SET_CMPLT status                 */
 }
 
 /* xHCI Device Context Index for an endpoint address: EP0 is 1; others are
@@ -878,9 +869,9 @@ static int bring_up_net(struct usbdev *d, int port)
 		return -1;
 	}
 	con_write("rndis: data path up (in ep=");
-	put_hex(d->bulk_in, 2);  con_write(" dci="); con_write_dec(net_in_dci);
+	con_put_hex(d->bulk_in, 2);  con_write(" dci="); con_write_dec(net_in_dci);
 	con_write(" mps="); con_write_dec(d->bulk_in_mps);
-	con_write(", out ep="); put_hex(d->bulk_out, 2);
+	con_write(", out ep="); con_put_hex(d->bulk_out, 2);
 	con_write(" dci="); con_write_dec(net_out_dci);
 	con_write(" mps="); con_write_dec(d->bulk_out_mps);
 	con_write(")\n");
@@ -971,7 +962,7 @@ static void data_loop(void)
 					dbg_rx++;
 					con_write("usbnet: rx cc="); con_write_dec(cc);
 					con_write(" len="); con_write_dec(got);
-					con_write(" type="); put_hex(le32(net_rx_buf), 8);
+					con_write(" type="); con_put_hex(load_le32(net_rx_buf), 8);
 					con_putc('\n');
 				}
 				if (cc == CC_STALL || cc == CC_BABBLE || cc == CC_USB_TXN_ERR) {
@@ -981,9 +972,9 @@ static void data_loop(void)
 				} else {
 					/* Unwrap the RNDIS packet message -> Ethernet frame. */
 					if (got >= RNDIS_HDR &&
-					    le32(net_rx_buf) == RNDIS_PACKET_MSG) {
-						uint32_t off = 8 + le32(net_rx_buf + 8);
-						uint32_t dl  = le32(net_rx_buf + 12);
+					    load_le32(net_rx_buf) == RNDIS_PACKET_MSG) {
+						uint32_t off = 8 + load_le32(net_rx_buf + 8);
+						uint32_t dl  = load_le32(net_rx_buf + 12);
 						if (off + dl <= (uint32_t)got)
 							net_rx_frame(net_rx_buf + off, dl);
 					}
@@ -1001,7 +992,7 @@ static void data_loop(void)
 				if (dbg_intr < 4) {
 					dbg_intr++;
 					con_write("usbnet: intr cc="); con_write_dec(cc);
-					con_write(" note="); put_hex(le32(net_intr_buf), 8);
+					con_write(" note="); con_put_hex(load_le32(net_intr_buf), 8);
 					con_putc('\n');
 				}
 				net_intr_pending = 0;
@@ -1149,10 +1140,10 @@ static int configure_bulk_msc(struct usbdev *d)
 
 /* One bulk transfer: post a Normal TRB, ring the doorbell, wait for completion.
  * Returns bytes transferred (len - residue), or -1; *cc gets the completion code. */
-static int bulk_xfer(struct ring *ring, int dci, uint8_t *buf, int len, int *cc)
+static int bulk_xfer(int slot, struct ring *ring, int dci, uint8_t *buf, int len, int *cc)
 {
 	ring_push(ring, (uint32_t)buf, 0, len, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
-	db[msc_slot] = dci;
+	db[slot] = dci;
 	struct trb *e = event_wait();
 	if (!e || TRB_GET_TYPE(e->control) != TRB_TRANSFER_EVENT) { *cc = 0; return -1; }
 	*cc = (e->status >> 24) & 0xFF;
@@ -1198,7 +1189,7 @@ static int bot_xfer(const uint8_t *cdb, int cdb_len, int dlen, int write, uint8_
 	for (int i = 0; i < 16 && i < cdb_len; i++) msc_cbw[15 + i] = cdb[i];
 
 	int cc;
-	if (bulk_xfer(&msc_out_ring, msc_out_dci, msc_cbw, 31, &cc) < 0) {
+	if (bulk_xfer(msc_slot, &msc_out_ring, msc_out_dci, msc_cbw, 31, &cc) < 0) {
 		if (cc == CC_STALL) msc_clear_stall(msc_out_dci, msc_out_ep, &msc_out_ring);
 		return -1;
 	}
@@ -1207,26 +1198,26 @@ static int bot_xfer(const uint8_t *cdb, int cdb_len, int dlen, int write, uint8_
 	if (dlen > 0) {
 		if (write) {
 			for (int i = 0; i < dlen; i++) msc_data[i] = data[i];
-			if (bulk_xfer(&msc_out_ring, msc_out_dci, msc_data, dlen, &cc) < 0 &&
+			if (bulk_xfer(msc_slot, &msc_out_ring, msc_out_dci, msc_data, dlen, &cc) < 0 &&
 			    cc == CC_STALL)
 				msc_clear_stall(msc_out_dci, msc_out_ep, &msc_out_ring);
 		} else {
-			if (bulk_xfer(&msc_in_ring, msc_in_dci, msc_data, dlen, &cc) < 0 &&
+			if (bulk_xfer(msc_slot, &msc_in_ring, msc_in_dci, msc_data, dlen, &cc) < 0 &&
 			    cc == CC_STALL)
 				msc_clear_stall(msc_in_dci, msc_in_ep, &msc_in_ring);
 		}
 	}
 
 	/* --- Command Status Wrapper --- */
-	if (bulk_xfer(&msc_in_ring, msc_in_dci, msc_csw, 13, &cc) < 0) {
+	if (bulk_xfer(msc_slot, &msc_in_ring, msc_in_dci, msc_csw, 13, &cc) < 0) {
 		if (cc != CC_STALL) return -1;
 		msc_clear_stall(msc_in_dci, msc_in_ep, &msc_in_ring);
-		if (bulk_xfer(&msc_in_ring, msc_in_dci, msc_csw, 13, &cc) < 0)
+		if (bulk_xfer(msc_slot, &msc_in_ring, msc_in_dci, msc_csw, 13, &cc) < 0)
 			return -1;
 	}
 	if (msc_csw[0] != 'U' || msc_csw[1] != 'S' || msc_csw[2] != 'B' || msc_csw[3] != 'S')
 		return -1;
-	if (le32(msc_csw + 4) != tag || msc_csw[12] != 0)     /* tag mismatch / failed */
+	if (load_le32(msc_csw + 4) != tag || msc_csw[12] != 0)     /* tag mismatch / failed */
 		return -1;
 
 	if (dlen > 0 && !write)
@@ -1391,7 +1382,7 @@ int xhci_msc_read(uint32_t lba, void *buf)
 				msc_ctag[line] = base;
 		}
 		if (rc == 0)
-			kmemcpy(buf, msc_cache + line * MSC_LINE_BYTES +
+			memcpy(buf, msc_cache + line * MSC_LINE_BYTES +
 			             (lba - base) * 512, 512);
 	} else {
 		rc = msc_io(lba, buf, 1, 0);             /* no cache (alloc failed) */
@@ -1416,6 +1407,525 @@ int xhci_msc_write(uint32_t lba, const void *buf)
 	return rc;
 }
 
+/* ================================================================ MTP / PTP
+ *
+ * A phone or camera in "file transfer" mode speaks the Media Transfer Protocol
+ * (a Microsoft extension of the Picture Transfer Protocol). Unlike a USB stick
+ * it exposes *objects* (files + folders), not 512-byte sectors, so it can't be a
+ * block device the FAT driver mounts -- it's browsed object-by-object instead,
+ * via the `mtp` shell command (info / ls / get).
+ *
+ * The transport is the still-image USB class (interface 06/01/01) over a bulk
+ * IN + bulk OUT pair (an interrupt-IN carries asynchronous events we ignore).
+ * Everything rides "containers": a 12-byte little-endian header
+ *   u32 length (incl. header)  u16 type  u16 code  u32 transaction-id
+ * followed by a payload. A transaction is Command(type 1) -> optional Data(type
+ * 2) -> Response(type 3). We implement just the read path: OpenSession,
+ * GetDeviceInfo, GetObjectHandles, GetObjectInfo, GetObject.
+ *
+ * Concurrency mirrors the mass-storage path: the xHCI rings are driven only from
+ * the USB poll thread, so the shell-side calls (xhci_mtp_*) drop a request in a
+ * one-slot mailbox and yield; the poll thread runs the bulk container exchange.
+ * One outstanding op at a time, serialized by a busy flag. */
+
+#define MTP_TYPE_COMMAND   1
+#define MTP_TYPE_DATA      2
+#define MTP_TYPE_RESPONSE  3
+
+#define MTP_OP_GET_DEVICE_INFO    0x1001
+#define MTP_OP_OPEN_SESSION       0x1002
+#define MTP_OP_CLOSE_SESSION      0x1003
+#define MTP_OP_GET_OBJECT_HANDLES 0x1007
+#define MTP_OP_GET_OBJECT_INFO    0x1008
+#define MTP_OP_GET_OBJECT         0x1009
+
+#define MTP_RESP_OK               0x2001
+#define MTP_FMT_ASSOCIATION       0x3001   /* a folder (ObjectInfo.ObjectFormat)  */
+#define MTP_PARENT_ROOT           0xFFFFFFFFu
+#define MTP_STORAGE_ALL           0xFFFFFFFFu
+
+#define MTP_CHUNK  4096                    /* one palloc page == one DMA chunk     */
+
+static int        mtp_ready;               /* device configured + session open     */
+static int        mtp_slot;
+static int        mtp_in_dci, mtp_out_dci;
+static uint8_t    mtp_in_ep, mtp_out_ep;
+static uint16_t   mtp_in_mps, mtp_out_mps;
+static struct ring mtp_in_ring, mtp_out_ring;
+static uint32_t   mtp_xid;                 /* transaction-id counter               */
+static char       mtp_model[64];           /* "<manufacturer> <model>"             */
+static uint8_t   *mtp_cmd;                 /* DMA: command/response container       */
+static uint8_t   *mtp_buf;                 /* DMA: one data-phase chunk             */
+
+/* One-slot request mailbox serviced by the poll thread. kind 0 = a generic
+ * transaction whose data-IN payload is copied into mb_out; kind 1 = stream
+ * object mb_handle into owofs file mb_dst. */
+static volatile int      mtp_req, mtp_done, mtp_busy;
+static volatile int      mtp_kind, mtp_result;
+static volatile uint32_t mtp_resp_code;
+static volatile uint16_t mtp_mb_op;
+static volatile uint32_t mtp_mb_param[5];
+static volatile int      mtp_mb_nparam;
+static volatile uint8_t *mtp_mb_out;       /* kind 0: where to copy the payload    */
+static volatile int      mtp_mb_outcap;
+static volatile uint32_t mtp_mb_handle;    /* kind 1: object to download           */
+static volatile const char *mtp_mb_dst;    /* kind 1: owofs destination path       */
+
+/* Find a still-image (MTP/PTP) interface 06/01/01 in the cached config descriptor
+ * and grab its bulk IN/OUT endpoints. */
+static void parse_mtp(struct usbdev *d)
+{
+	d->is_mtp = 0;
+	const uint8_t *p = d->cfg;
+	int len = d->cfg_len, in_iface = 0;
+	uint8_t bin = 0, bout = 0;
+	uint16_t binmps = 0, boutmps = 0;
+
+	for (int i = 0; i + 1 < len; ) {
+		uint8_t l = p[i], t = p[i + 1];
+		if (l < 2) break;
+		if (t == 0x04 && i + 7 < len) {            /* INTERFACE: still image PTP */
+			in_iface = (p[i + 5] == 0x06 && p[i + 6] == 0x01 && p[i + 7] == 0x01);
+		} else if (t == 0x05 && in_iface && i + 5 < len) {   /* ENDPOINT */
+			uint8_t addr = p[i + 2], attr = p[i + 3];
+			uint16_t mps = p[i + 4] | (p[i + 5] << 8);
+			if ((attr & 0x03) == 0x02) {           /* bulk */
+				if (addr & 0x80) { bin = addr;  binmps = mps; }
+				else             { bout = addr; boutmps = mps; }
+			}
+		}
+		i += l;
+	}
+	if (bin && bout) {
+		d->is_mtp = 1;
+		d->bulk_in = bin;   d->bulk_in_mps  = binmps  ? binmps  : 64;
+		d->bulk_out = bout; d->bulk_out_mps = boutmps ? boutmps : 64;
+	}
+}
+
+/* Configure the bulk pair (same input-context discipline as the MSC path: copy
+ * the live slot context, only bump Context Entries). Returns 0 on success. */
+static int configure_bulk_mtp(struct usbdev *d)
+{
+	int in_dci  = ep_dci(d->bulk_in);
+	int out_dci = ep_dci(d->bulk_out);
+	int max_dci = in_dci > out_dci ? in_dci : out_dci;
+
+	ring_init(&mtp_in_ring);
+	ring_init(&mtp_out_ring);
+
+	uint8_t *input = palloc();
+	uint32_t *icc  = (uint32_t *)input;
+	uint32_t *sctx = (uint32_t *)(input + ctx_sz * 1);
+	uint32_t *epin  = (uint32_t *)(input + ctx_sz * (1 + in_dci));
+	uint32_t *epout = (uint32_t *)(input + ctx_sz * (1 + out_dci));
+
+	icc[1] = (1u << 0) | (1u << in_dci) | (1u << out_dci);
+
+	uint32_t *out_slot = (uint32_t *)dcbaa[d->slot];
+	for (uint32_t i = 0; i < ctx_sz / 4; i++)
+		sctx[i] = out_slot[i];
+	sctx[0] = (sctx[0] & ~(0x1Fu << 27)) | ((uint32_t)max_dci << 27);
+
+	epin[1]  = (3u << 1) | (6u << 3) | ((uint32_t)d->bulk_in_mps  << 16);  /* bulk IN  */
+	epin[2]  = (uint32_t)mtp_in_ring.base | 1;
+	epin[4]  = d->bulk_in_mps;
+	epout[1] = (3u << 1) | (2u << 3) | ((uint32_t)d->bulk_out_mps << 16);  /* bulk OUT */
+	epout[2] = (uint32_t)mtp_out_ring.base | 1;
+	epout[4] = d->bulk_out_mps;
+
+	ring_push(&cmd_ring, (uint32_t)input, 0, 0,
+	          TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
+	if (cmd_submit() != CC_SUCCESS)
+		return -1;
+
+	mtp_slot = d->slot;
+	mtp_in_dci = in_dci;   mtp_out_dci = out_dci;
+	mtp_in_ep = d->bulk_in; mtp_out_ep = d->bulk_out;
+	mtp_in_mps = d->bulk_in_mps; mtp_out_mps = d->bulk_out_mps;
+	return 0;
+}
+
+/* Send a Command container (op + up to 5 params) on the bulk-OUT pipe. Returns
+ * the transaction-id used, or 0 on error. */
+static uint32_t mtp_send_command(uint16_t op, const uint32_t *params, int nparams)
+{
+	if (nparams < 0) nparams = 0;
+	if (nparams > 5) nparams = 5;
+	int clen = 12 + 4 * nparams;
+	uint32_t xid = ++mtp_xid;
+	put_le32(mtp_cmd + 0, (uint32_t)clen);
+	mtp_cmd[4] = MTP_TYPE_COMMAND; mtp_cmd[5] = 0;
+	mtp_cmd[6] = op & 0xFF; mtp_cmd[7] = op >> 8;
+	put_le32(mtp_cmd + 8, xid);
+	for (int i = 0; i < nparams; i++)
+		put_le32(mtp_cmd + 12 + 4 * i, params[i]);
+
+	int cc;
+	if (bulk_xfer(mtp_slot, &mtp_out_ring, mtp_out_dci, mtp_cmd, clen, &cc) < 0)
+		return 0;
+	return xid;
+}
+
+/* Read a Response container (type 3) into mtp_cmd and return its response code,
+ * or 0 on transport error. */
+static uint32_t mtp_read_response(void)
+{
+	int cc;
+	if (bulk_xfer(mtp_slot, &mtp_in_ring, mtp_in_dci, mtp_cmd, MTP_CHUNK, &cc) < 0)
+		return 0;
+	if (mtp_cmd[4] != MTP_TYPE_RESPONSE)
+		return 0;
+	return (uint32_t)mtp_cmd[6] | ((uint32_t)mtp_cmd[7] << 8);
+}
+
+/* Run a transaction whose data phase is IN (or absent): send the command, read
+ * the Data container into out[outcap] with the 12-byte header stripped, then the
+ * Response. Returns the payload length copied (>=0), or -1 on error; *rcode gets
+ * the MTP response code. A no-data op passes out=NULL/outcap=0. */
+static int mtp_do_transaction(uint16_t op, const uint32_t *params, int nparams,
+                              uint8_t *out, int outcap, uint32_t *rcode)
+{
+	*rcode = 0;
+	if (mtp_send_command(op, params, nparams) == 0)
+		return -1;
+
+	int payload = 0;
+	if (out && outcap > 0) {
+		int cc;
+		int got = bulk_xfer(mtp_slot, &mtp_in_ring, mtp_in_dci, mtp_buf, MTP_CHUNK, &cc);
+		if (got < 0)
+			return -1;
+		if (mtp_buf[4] == MTP_TYPE_DATA && got >= 12) {
+			uint32_t total = load_le32(mtp_buf);            /* whole container length  */
+			int plen = (int)total - 12;
+			if (plen < 0) plen = 0;
+			if (plen > got - 12) plen = got - 12;      /* only what this chunk held*/
+			if (plen > outcap) plen = outcap;
+			for (int i = 0; i < plen; i++)
+				out[i] = mtp_buf[12 + i];
+			payload = plen;
+		} else if (mtp_buf[4] == MTP_TYPE_RESPONSE) {
+			/* No data phase -- this was already the response. */
+			*rcode = (uint32_t)mtp_buf[6] | ((uint32_t)mtp_buf[7] << 8);
+			return 0;
+		}
+	}
+
+	*rcode = mtp_read_response();
+	if (*rcode != MTP_RESP_OK)
+		return -1;
+	return payload;
+}
+
+/* Stream object `handle` to owofs path `dst`. Learns the size from the Data
+ * container header, prealloc's the file, then writes each bulk-IN chunk straight
+ * to disk. Runs on the poll thread (fs I/O is safe here: the caller is blocked,
+ * so no concurrent owofs access). Returns 0 on success, -1 on error. */
+static int mtp_do_get(uint32_t handle, const char *dst, uint32_t *rcode)
+{
+	*rcode = 0;
+	uint32_t p[1] = { handle };
+	if (mtp_send_command(MTP_OP_GET_OBJECT, p, 1) == 0)
+		return -1;
+
+	int cc;
+	int got = bulk_xfer(mtp_slot, &mtp_in_ring, mtp_in_dci, mtp_buf, MTP_CHUNK, &cc);
+	con_write("mtpdbg: get h="); con_put_hex(handle, 8);
+	con_write(" got="); con_write_dec((uint32_t)got);
+	con_write(" cc="); con_write_dec((uint32_t)cc);
+	con_write(" type="); con_write_dec(got >= 6 ? mtp_buf[4] : 0); con_putc('\n');
+	if (got < 12 || mtp_buf[4] != MTP_TYPE_DATA)
+		return -1;
+	uint32_t total = load_le32(mtp_buf);                /* header + file bytes          */
+	uint32_t fsize = total >= 12 ? total - 12 : 0;
+
+	if (fs_prealloc(dst, fsize) != 0) {
+		con_write("mtpdbg: prealloc failed fsize="); con_write_dec(fsize); con_putc('\n');
+		return -1;
+	}
+
+	uint32_t written = 0;
+	int first = (int)(got - 12);                   /* file bytes in the first chunk*/
+	if (first > (int)fsize) first = (int)fsize;
+	if (first > 0) {
+		if (fs_write_at(dst, 0, mtp_buf + 12, (uint32_t)first) < 0)
+			return -1;
+		written = (uint32_t)first;
+	}
+	while (written < fsize) {
+		uint32_t want = fsize - written;
+		if (want > MTP_CHUNK) want = MTP_CHUNK;
+		got = bulk_xfer(mtp_slot, &mtp_in_ring, mtp_in_dci, mtp_buf, (int)want, &cc);
+		if (got <= 0)
+			return -1;
+		if (fs_write_at(dst, written, mtp_buf, (uint32_t)got) < 0)
+			return -1;
+		written += (uint32_t)got;
+	}
+
+	*rcode = mtp_read_response();
+	return *rcode == MTP_RESP_OK ? 0 : -1;
+}
+
+/* ---- MTP dataset parsing (little-endian; runs in the caller's thread) ---- */
+
+/* An MTP string: 1 byte count of UTF-16 units (incl. terminator, 0 == empty),
+ * then that many UTF-16LE units. Copies the low byte of each as ASCII into
+ * out[cap] (NUL-terminated, terminator dropped). Advances *off. */
+static void mtp_get_string(const uint8_t *buf, int len, int *off, char *out, int cap)
+{
+	out[0] = '\0';
+	if (*off >= len)
+		return;
+	int n = buf[(*off)++];
+	int o = 0;
+	for (int i = 0; i < n && *off + 1 < len; i++) {
+		uint8_t lo = buf[*off];
+		*off += 2;
+		if (i < n - 1 && o < cap - 1)               /* drop the NUL terminator    */
+			out[o++] = (lo >= 0x20 && lo < 0x7F) ? (char)lo : '?';
+	}
+	out[o] = '\0';
+}
+
+/* Skip an MTP array: a u32 element count followed by `stride`-byte elements.
+ * DeviceInfo's Operations/Events/Properties/Capture/Image arrays are AUINT16
+ * (2-byte codes); storage-id and object-handle arrays are AUINT32. Advances *off. */
+static void mtp_skip_array(const uint8_t *buf, int len, int *off, int stride)
+{
+	if (*off + 4 > len) { *off = len; return; }
+	uint32_t cnt = load_le32(buf + *off);
+	*off += 4 + (int)(cnt * (uint32_t)stride);
+}
+/* Skip an MTP string. */
+static void mtp_skip_string(const uint8_t *buf, int len, int *off)
+{
+	char tmp[2];
+	mtp_get_string(buf, len, off, tmp, sizeof tmp);
+}
+
+/* Bring up an MTP device: configure the bulk pipes, read DeviceInfo for the
+ * model string, and open a session. Runs at enumeration time (single ring
+ * context), so it uses the synchronous transfers directly. Returns 0 on success. */
+static int bring_up_mtp(struct usbdev *d, int port)
+{
+	(void)port;
+	if (configure_bulk_mtp(d) != 0) {
+		con_write("mtp: configure-endpoint failed\n");
+		return -1;
+	}
+	if (!mtp_cmd) mtp_cmd = palloc();
+	if (!mtp_buf) mtp_buf = palloc();
+	mtp_xid = 0;
+
+	/* DeviceInfo: walk past the version/extension/array fields to Manufacturer +
+	 * Model (see the dataset layout in the MTP spec). */
+	uint32_t rc;
+	int n = mtp_do_transaction(MTP_OP_GET_DEVICE_INFO, 0, 0, mtp_buf, MTP_CHUNK, &rc);
+	mtp_model[0] = '\0';
+	if (n > 0) {
+		int o = 0;
+		o += 2;                                  /* StandardVersion (u16)         */
+		o += 4;                                  /* VendorExtensionID (u32)       */
+		o += 2;                                  /* VendorExtensionVersion (u16)  */
+		mtp_skip_string(mtp_buf, n, &o);         /* VendorExtensionDesc           */
+		o += 2;                                  /* FunctionalMode (u16)          */
+		mtp_skip_array(mtp_buf, n, &o, 2);       /* OperationsSupported  (AUINT16)*/
+		mtp_skip_array(mtp_buf, n, &o, 2);       /* EventsSupported      (AUINT16)*/
+		mtp_skip_array(mtp_buf, n, &o, 2);       /* DevicePropertiesSupported     */
+		mtp_skip_array(mtp_buf, n, &o, 2);       /* CaptureFormats       (AUINT16)*/
+		mtp_skip_array(mtp_buf, n, &o, 2);       /* ImageFormats         (AUINT16)*/
+		char manu[32], modl[32];
+		mtp_get_string(mtp_buf, n, &o, manu, sizeof manu);
+		mtp_get_string(mtp_buf, n, &o, modl, sizeof modl);
+		int k = 0;
+		for (int i = 0; manu[i] && k < (int)sizeof(mtp_model) - 2; i++)
+			mtp_model[k++] = manu[i];
+		if (k && modl[0]) mtp_model[k++] = ' ';
+		for (int i = 0; modl[i] && k < (int)sizeof(mtp_model) - 1; i++)
+			mtp_model[k++] = modl[i];
+		mtp_model[k] = '\0';
+	}
+
+	uint32_t sp[1] = { 1 };                      /* session id (non-zero)         */
+	if (mtp_do_transaction(MTP_OP_OPEN_SESSION, sp, 1, 0, 0, &rc) != 0 &&
+	    rc != 0x201E /* SessionAlreadyOpen */) {
+		con_write("mtp: OpenSession failed rc="); con_put_hex(rc, 4); con_putc('\n');
+		return -1;
+	}
+
+	mtp_ready = 1;
+	con_write("mtp: ");
+	con_write(mtp_model[0] ? mtp_model : "device");
+	con_write(" ready (file transfer)\n");
+
+#if 1  /* TEMP self-test: deterministic, single-context (no mailbox needed) */
+	{
+		static uint8_t tb[MTP_CHUNK];
+		uint32_t trc, hs[8]; int hc = 0;
+		uint32_t hp[3] = { MTP_STORAGE_ALL, 0, MTP_PARENT_ROOT };
+		int tn = mtp_do_transaction(MTP_OP_GET_OBJECT_HANDLES, hp, 3, tb, sizeof tb, &trc);
+		con_write("MTPTEST root n="); con_write_dec((uint32_t)tn);
+		con_write(" rc="); con_put_hex(trc, 4);
+		if (tn >= 4) {
+			uint32_t c = load_le32(tb);
+			con_write(" cnt="); con_write_dec(c);
+			for (uint32_t i = 0; i < c && i < 8; i++) {
+				hs[hc++] = load_le32(tb + 4 + i * 4);
+				con_write(" "); con_put_hex(hs[i], 8);
+			}
+		}
+		con_putc('\n');
+		for (int i = 0; i < hc; i++) {
+			uint32_t fp[3] = { MTP_STORAGE_ALL, 0, hs[i] };
+			int fn = mtp_do_transaction(MTP_OP_GET_OBJECT_HANDLES, fp, 3, tb, sizeof tb, &trc);
+			con_write("MTPTEST sub "); con_put_hex(hs[i], 8);
+			con_write(" n="); con_write_dec((uint32_t)fn);
+			con_write(" rc="); con_put_hex(trc, 4);
+			if (fn >= 4) { con_write(" cnt="); con_write_dec(load_le32(tb)); }
+			con_putc('\n');
+		}
+		if (hc > 0) {
+			uint32_t gp[1] = { hs[hc > 1 ? 1 : 0] };
+			if (mtp_send_command(MTP_OP_GET_OBJECT, gp, 1)) {
+				int cc, got = bulk_xfer(mtp_slot, &mtp_in_ring, mtp_in_dci, mtp_buf, MTP_CHUNK, &cc);
+				con_write("MTPTEST get "); con_put_hex(gp[0], 8);
+				con_write(" got="); con_write_dec((uint32_t)got);
+				con_write(" cc="); con_write_dec((uint32_t)cc);
+				con_write(" type="); con_write_dec(got >= 6 ? mtp_buf[4] : 0);
+				con_write(" total="); con_write_dec(got >= 4 ? load_le32(mtp_buf) : 0);
+				con_putc('\n');
+				uint32_t grc = mtp_read_response();
+				con_write("MTPTEST get resp rc="); con_put_hex(grc, 4); con_putc('\n');
+			}
+		}
+	}
+#endif
+	return 0;
+}
+
+/* ---- poll-thread mailbox service + shell-thread wrappers ---- */
+
+static void mtp_service(void)
+{
+	uint32_t rc = 0;
+	uint32_t p[5];
+	for (int i = 0; i < 5; i++) p[i] = mtp_mb_param[i];
+	if (mtp_kind == 0)
+		mtp_result = mtp_do_transaction(mtp_mb_op, p, mtp_mb_nparam,
+		                                (uint8_t *)mtp_mb_out, mtp_mb_outcap, &rc);
+	else
+		mtp_result = mtp_do_get(mtp_mb_handle, (const char *)mtp_mb_dst, &rc);
+	mtp_resp_code = rc;
+	mtp_req = 0;
+	mtp_done = 1;
+}
+
+/* Serialize MTP ops across caller threads; every yield is preceded by `sti` (see
+ * the matching note in msc_lock). */
+static void mtp_lock(void)
+{
+	for (;;) {
+		__asm__ volatile ("cli");
+		if (!mtp_busy) { mtp_busy = 1; __asm__ volatile ("sti"); return; }
+		__asm__ volatile ("sti");
+		sched_yield();
+	}
+}
+static void mtp_unlock(void)
+{
+	mtp_busy = 0;
+	__asm__ volatile ("sti");
+}
+static void mtp_wait(void)
+{
+	mtp_done = 0;
+	mtp_req = 1;
+	while (!mtp_done) {
+		__asm__ volatile ("sti");
+		sched_yield();
+	}
+}
+
+/* Run a data-IN transaction via the poll thread (caller holds the lock). */
+static int mtp_xfer(uint16_t op, const uint32_t *params, int nparams,
+                    uint8_t *out, int outcap)
+{
+	mtp_mb_op = op;
+	mtp_mb_nparam = nparams;
+	for (int i = 0; i < 5; i++) mtp_mb_param[i] = i < nparams ? params[i] : 0;
+	mtp_mb_out = out;
+	mtp_mb_outcap = outcap;
+	mtp_kind = 0;
+	mtp_wait();
+	return mtp_result;
+}
+
+int xhci_mtp_present(void) { return mtp_ready; }
+const char *xhci_mtp_model(void) { return mtp_ready ? mtp_model : ""; }
+
+/* List the children of `parent` (MTP_PARENT_ROOT for the storage root): for each
+ * object, fetch its ObjectInfo and hand (handle, name, size, is_dir) to `cb`.
+ * Returns the number listed, or -1 on error. */
+int xhci_mtp_list(uint32_t parent,
+                  void (*cb)(uint32_t handle, const char *name,
+                             uint32_t size, int is_dir, void *ctx),
+                  void *ctx)
+{
+	if (!mtp_ready)
+		return -1;
+	static uint8_t handles[MTP_CHUNK];
+	static uint8_t info[MTP_CHUNK];
+	mtp_lock();
+
+	uint32_t hp[3] = { MTP_STORAGE_ALL, 0, parent };
+	int n = mtp_xfer(MTP_OP_GET_OBJECT_HANDLES, hp, 3, handles, sizeof handles);
+	con_write("mtpdbg: list parent="); con_put_hex(parent, 8);
+	con_write(" n="); con_write_dec((uint32_t)n);
+	con_write(" rc="); con_put_hex(mtp_resp_code, 4);
+	con_write(" cnt="); con_write_dec(n >= 4 ? load_le32(handles) : 0); con_putc('\n');
+	if (n < 4) { mtp_unlock(); return n < 0 ? -1 : 0; }
+
+	uint32_t count = load_le32(handles);
+	if (count > (uint32_t)(n - 4) / 4)
+		count = (uint32_t)(n - 4) / 4;             /* clamp to what we received   */
+
+	int listed = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t h = load_le32(handles + 4 + i * 4);
+		uint32_t ip[1] = { h };
+		int in = mtp_xfer(MTP_OP_GET_OBJECT_INFO, ip, 1, info, sizeof info);
+		if (in < 52)
+			continue;
+		uint16_t fmt = (uint16_t)(info[4] | (info[5] << 8));
+		uint32_t size = load_le32(info + 8);
+		int o = 52;                                /* Filename begins at byte 52  */
+		char name[64];
+		mtp_get_string(info, in, &o, name, sizeof name);
+		if (cb)
+			cb(h, name, size, fmt == MTP_FMT_ASSOCIATION, ctx);
+		listed++;
+	}
+	mtp_unlock();
+	return listed;
+}
+
+/* Download object `handle` to owofs path `dst`. Returns 0 on success, -1 err. */
+int xhci_mtp_get(uint32_t handle, const char *dst)
+{
+	if (!mtp_ready)
+		return -1;
+	mtp_lock();
+	mtp_mb_handle = handle;
+	mtp_mb_dst = dst;
+	mtp_kind = 1;
+	mtp_wait();
+	int rc = mtp_result;
+	mtp_unlock();
+	return rc;
+}
+
 /* Walk a configuration descriptor blob and print its interfaces + endpoints, so
  * lsusb shows what each device actually exposes (class/subclass/protocol and the
  * bulk/interrupt endpoints a driver would use). */
@@ -1428,16 +1938,16 @@ static void print_config(const uint8_t *cfg, int total)
 		uint8_t btype = cfg[i + 1];
 		if (btype == 0x04 && i + 9 <= total) {            /* interface         */
 			con_write("         if "); con_write_dec(cfg[i + 2]);
-			con_write(" class "); put_hex(cfg[i + 5], 2);
-			con_putc('/'); put_hex(cfg[i + 6], 2);
-			con_putc('/'); put_hex(cfg[i + 7], 2);
+			con_write(" class "); con_put_hex(cfg[i + 5], 2);
+			con_putc('/'); con_put_hex(cfg[i + 6], 2);
+			con_putc('/'); con_put_hex(cfg[i + 7], 2);
 			con_putc('\n');
 		} else if (btype == 0x05 && i + 7 <= total) {     /* endpoint          */
 			uint8_t addr = cfg[i + 2];
 			uint8_t attr = cfg[i + 3] & 0x3;
 			const char *t = attr == 2 ? "bulk" : attr == 3 ? "intr"
 			              : attr == 1 ? "isoc" : "ctrl";
-			con_write("           ep "); put_hex(addr, 2);
+			con_write("           ep "); con_put_hex(addr, 2);
 			con_write((addr & 0x80) ? " IN  " : " OUT ");
 			con_write(t); con_putc('\n');
 		}
@@ -1507,20 +2017,32 @@ static void enumerate_device(uint32_t port, int speed)
 	}
 	d->active = 1;
 
-	/* If it's a USB-Ethernet/RNDIS device, run the RNDIS control handshake now
-	 * (over EP0 — the global ep0_ring is still this device's, mid-enumeration) to
-	 * INITIALIZE it and learn its MAC. Bulk data path comes next. */
+	/* Classify the device by its interface and bring up the matching driver. MTP
+	 * is checked first because its bulk IN/OUT pair would otherwise look like a
+	 * USB-Ethernet shape to parse_net, and the RNDIS probe would poke an MTP
+	 * device with control transfers it can't answer. */
 	d->is_net = 0;
 	d->mac_ok = 0;
-	parse_net(d);
-	if (d->is_net && rndis_setup(d) == 0 && !net_up)
-		bring_up_net(d, (int)port);   /* filter + bulk endpoints + register NIC  */
+	d->is_mtp = 0;
+	d->is_msc = 0;
+	parse_mtp(d);
+	if (d->is_mtp) {
+		if (!mtp_ready)
+			bring_up_mtp(d, (int)port);
+	} else {
+		/* USB-Ethernet/RNDIS: run the control handshake now (over EP0 — the global
+		 * ep0_ring is still this device's, mid-enumeration) to INITIALIZE it and
+		 * learn its MAC. Bulk data path comes next. */
+		parse_net(d);
+		if (d->is_net && rndis_setup(d) == 0 && !net_up)
+			bring_up_net(d, (int)port);   /* filter + bulk endpoints + register NIC */
 
-	/* Or a USB mass-storage device: configure its bulk pipes and probe capacity
-	 * now (still single-context), so it's a ready block device for FAT. */
-	parse_msc(d);
-	if (d->is_msc && !msc_ready)
-		bring_up_msc(d, (int)port);
+		/* Or USB mass-storage: configure its bulk pipes and probe capacity now
+		 * (still single-context), so it's a ready block device for FAT. */
+		parse_msc(d);
+		if (d->is_msc && !msc_ready)
+			bring_up_msc(d, (int)port);
+	}
 }
 
 /* Print the cached device table: one summary line per device, plus full
@@ -1534,11 +2056,13 @@ static void print_devs(int detail_port)
 			continue;
 		any = 1;
 		con_write("xhci: port "); con_write_dec(p); con_write(": ");
-		put_hex(d->vid, 4); con_putc(':'); put_hex(d->pid, 4);
-		con_write(" class "); put_hex(d->cls, 2);
+		con_put_hex(d->vid, 4); con_putc(':'); con_put_hex(d->pid, 4);
+		con_write(" class "); con_put_hex(d->cls, 2);
 		con_write(" speed "); con_write_dec(d->speed);
 		if (d->mac_ok)                 /* only devices RNDIS actually answered  */
 			con_write(" [net]");
+		if (d->is_mtp)
+			con_write(" [mtp]");
 		con_putc('\n');
 		if (detail_port == (int)p) {
 			if (d->cfg_len)
@@ -1546,7 +2070,7 @@ static void print_devs(int detail_port)
 			if (d->is_net && d->mac_ok) {
 				con_write("         rndis mac ");
 				for (int i = 0; i < 6; i++) {
-					put_hex(d->mac[i], 2);
+					con_put_hex(d->mac[i], 2);
 					if (i < 5) con_putc(':');
 				}
 				con_putc('\n');
@@ -1673,6 +2197,11 @@ static void usb_poll_thread(void)
 		 * this one thread, so the rings stay single-context. */
 		if (msc_req) {
 			msc_service();
+			idle = 0;
+			continue;
+		}
+		if (mtp_req) {
+			mtp_service();
 			idle = 0;
 			continue;
 		}

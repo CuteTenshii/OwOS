@@ -8,6 +8,7 @@
  * the un-filtering and colour packing that are specific to PNG.
  */
 #include "png.h"
+#include "endian.h"
 #include "gzip.h"
 #include "heap.h"
 #include "fs.h"
@@ -15,11 +16,6 @@
 #include <stddef.h>
 
 /* ---- big-endian helpers (PNG is big-endian; DEFLATE inside is not) ------ */
-static uint32_t be32(const uint8_t *p)
-{
-	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-	       ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
-}
 
 static const uint8_t PNG_SIG[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
 
@@ -84,7 +80,7 @@ int png_decode(const uint8_t *src, uint32_t slen, png_image *out)
 	uint32_t pos = 8;
 
 	while (pos + 8 <= slen) {
-		uint32_t len  = be32(src + pos);
+		uint32_t len  = load_be32(src + pos);
 		const uint8_t *type = src + pos + 4;
 		uint32_t body = pos + 8;
 		if (body + len + 4 > slen)          /* +4 chunk CRC (we don't verify)  */
@@ -93,8 +89,8 @@ int png_decode(const uint8_t *src, uint32_t slen, png_image *out)
 		if (type[0]=='I'&&type[1]=='H'&&type[2]=='D'&&type[3]=='R') {
 			if (len < 13)
 				return PNG_EBADHDR;
-			width     = be32(src + body);
-			height    = be32(src + body + 4);
+			width     = load_be32(src + body);
+			height    = load_be32(src + body + 4);
 			depth     = src[body + 8];
 			color     = src[body + 9];
 			/* src[body+10] compression, [body+11] filter (both always 0)      */
@@ -132,7 +128,7 @@ int png_decode(const uint8_t *src, uint32_t slen, png_image *out)
 	uint32_t zlen = 0;
 	pos = 8;
 	while (pos + 8 <= slen) {
-		uint32_t len  = be32(src + pos);
+		uint32_t len  = load_be32(src + pos);
 		const uint8_t *type = src + pos + 4;
 		uint32_t body = pos + 8;
 		if (type[0]=='I'&&type[1]=='D'&&type[2]=='A'&&type[3]=='T') {
@@ -329,7 +325,7 @@ static void sink_write(struct sink *s, const uint8_t *d, uint32_t n)
 	while (n && !s->err) {
 		uint32_t room = s->cap - s->len;
 		uint32_t k = n < room ? n : room;
-		kmemcpy(s->buf + s->len, d, k);
+		memcpy(s->buf + s->len, d, k);
 		s->len += k;
 		d += k; n -= k;
 		if (s->len == s->cap)
