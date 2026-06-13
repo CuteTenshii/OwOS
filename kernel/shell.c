@@ -25,6 +25,7 @@
 #include "xhci.h"
 #include "speaker.h"
 #include "sb16.h"
+#include "hda.h"
 #include "cpu.h"
 #include "rtc.h"
 #include "neofetch.h"
@@ -1764,7 +1765,7 @@ static void bi_play(const char *a)
 	if (a[0] == '\0')                       /* bare "play" -> the default tune  */
 		speaker_song();
 	else if (fs_size(a) >= 0)               /* a file -> treat it as a WAV      */
-		sb16_play_wav(a);
+		hda_present() ? hda_play_wav(a) : sb16_play_wav(a);
 	else if (speaker_play(a) != 0) {
 		con_write("play: unknown tune: ");
 		con_write(a);

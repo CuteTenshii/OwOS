@@ -18,8 +18,6 @@
 #include "console.h"
 #include "kstring.h"
 
-/* ---------------------------------------------------------- LE readers */
-
 /* ---------------------------------------------------------------- state */
 #define EXT_MAGIC      0xEF53u
 #define EXT_ROOT_INO   2u

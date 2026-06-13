@@ -39,6 +39,7 @@
 #include "shell.h"
 #include "log.h"
 #include "sb16.h"
+#include "hda.h"
 #include "timer.h"
 #include "console.h"
 #include "fb.h"
@@ -383,6 +384,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	timer_init();                  /* IRQ0: keep time                         */
 	keyboard_init();               /* IRQ1: buffer keystrokes                 */
 	sb16_init();                   /* IRQ5: PCM audio (no-op if absent)       */
+	hda_init();                    /* HD Audio / Realtek codec (no-op if absent) */
 
 	sched_init();                  /* current context becomes task "main"     */
 	sched_create_thread("spin-a", spinner);

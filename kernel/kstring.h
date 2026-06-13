@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 void    *memcpy(void *dst, const void *src, uint32_t n);
+void    *memset(void *dst, int c, uint32_t n);
 uint32_t strlen(const char *s);   /* byte count before the terminating NUL */
 
 #endif /* OWOS_KSTRING_H */

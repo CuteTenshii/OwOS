@@ -21,13 +21,6 @@
 
 /* ------------------------------------------------------------------ helpers */
 
-static void fmemset(void *p, int c, uint32_t n)
-{
-	uint8_t *d = p;
-	while (n--)
-		*d++ = (uint8_t)c;
-}
-
 static char lc(char c)            /* ASCII lower-case */
 {
 	return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
@@ -355,7 +348,7 @@ struct dir_iter {
 
 static void diter_init(struct dir_iter *it, uint32_t start_cluster)
 {
-	fmemset(it, 0, sizeof(*it));
+	memset(it, 0, sizeof(*it));
 	it->cluster = start_cluster;
 	if (start_cluster == 0)
 		it->root_left = vol.root_sectors;
@@ -452,7 +445,7 @@ static int dir_read(struct dir_iter *it, struct dirent *out)
 			continue;
 		}
 
-		fmemset(out, 0, sizeof(*out));
+		memset(out, 0, sizeof(*out));
 		if (have_lfn && lfn[0]) {
 			uint32_t k = 0;
 			while (k < 255 && lfn[k]) { out->name[k] = lfn[k]; k++; }
@@ -498,7 +491,7 @@ static int dir_find(uint32_t dir_cluster, const char *comp, uint32_t len,
 static int resolve(const char *path, struct dirent *out)
 {
 	/* Start at the root. */
-	fmemset(out, 0, sizeof(*out));
+	memset(out, 0, sizeof(*out));
 	out->is_dir  = 1;
 	out->cluster = (vol.kind == FAT32) ? vol.root_cluster : 0;
 	out->size    = 0;
@@ -780,7 +773,7 @@ static void fat_free_chain(uint32_t c)
 static int zero_cluster(uint32_t c)
 {
 	uint8_t z[512];
-	fmemset(z, 0, 512);
+	memset(z, 0, 512);
 	uint32_t first = cluster_first_sector(c);
 	for (uint32_t s = 0; s < vol.sec_per_clus; s++)
 		if (write_sec(first + s, z) != 0)
@@ -992,7 +985,7 @@ int fat_create(const char *path, const void *data, uint32_t size)
 		uint32_t fsec = cluster_first_sector(c);
 		for (uint32_t s = 0; s < vol.sec_per_clus && written < size; s++) {
 			uint8_t b[512];
-			fmemset(b, 0, 512);
+			memset(b, 0, 512);
 			uint32_t chunk = size - written < 512 ? size - written : 512;
 			memcpy(b, src + written, chunk);
 			if (write_sec(fsec + s, b) != 0) { fat_free_chain(first); return -1; }
@@ -1056,7 +1049,7 @@ int fat_mkdir(const char *path)
 	for (int i = 0; i < 11; i++) { dot[i] = ' '; dotdot[i] = ' '; }
 	dot[0] = '.'; dotdot[0] = '.'; dotdot[1] = '.';
 	uint8_t b[512];
-	fmemset(b, 0, 512);
+	memset(b, 0, 512);
 	fill_entry(b + 0,  dot,    0x10, dc, 0);
 	fill_entry(b + 32, dotdot, 0x10, is_root ? 0 : pcluster, 0);
 	if (write_sec(cluster_first_sector(dc), b) != 0) { fat_free_chain(dc); return -1; }

@@ -31,7 +31,7 @@ OBJS    := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_
            drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/tls.o \
            kernel/url.o kernel/zip.o kernel/gzip.o kernel/png.o kernel/screenshot.o \
            kernel/bencode.o kernel/torrent.o kernel/tracker.o kernel/peer.o \
-           drivers/audio/speaker.o drivers/audio/sb16.o \
+           drivers/audio/speaker.o drivers/audio/sb16.o drivers/audio/hda.o \
            kernel/cpu.o kernel/rtc.o kernel/neofetch.o drivers/acpi/power.o drivers/acpi/battery.o \
            kernel/firmware.o kernel/smbios.o drivers/acpi/aml.o drivers/video/edid.o \
            kernel/syscall.o kernel/loader.o kernel/pipe.o kernel/services.o \
@@ -189,6 +189,7 @@ run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 		-netdev user,id=net0,hostfwd=tcp::1445-:445 -device $(NIC),netdev=net0 \
 		-audiodev pipewire,id=snd0 -machine pcspk-audiodev=snd0 \
 		-device sb16,audiodev=snd0 \
+		-device intel-hda -device hda-output,audiodev=snd0 \
 		-usb -device usb-tablet
 
 # Headless: no window, console comes out on the terminal via COM1.

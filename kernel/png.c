@@ -15,8 +15,6 @@
 #include "kstring.h"
 #include <stddef.h>
 
-/* ---- big-endian helpers (PNG is big-endian; DEFLATE inside is not) ------ */
-
 static const uint8_t PNG_SIG[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
 
 /* Paeth predictor (RFC 2083 / PNG spec): pick whichever of a (left), b (up),

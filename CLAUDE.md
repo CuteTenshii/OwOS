@@ -497,6 +497,45 @@ Mostly **real-hardware features** (QEMU has shutdown but no battery).
 transfers → an RNDIS/CDC driver that registers as a `nic_ops` (`nic_set`) so a
 tethered phone is just another NIC. Chosen over native Wi-Fi for laptop internet.
 
+## Audio (drivers/audio: speaker.c + sb16.c + hda.c)
+
+Three back ends, picked by `play`: PC-speaker tones (`speaker.c`), and two WAV
+players — `sb16.c` and `hda.c`. `play <file.wav>` prefers HDA when present
+(`hda_present()`), else SB16; both share the same RIFF/WAVE parse + Ctrl+C stop.
+
+- **sb16.c — Sound Blaster 16**, legacy ISA: DSP reset at 0x220, 8-bit PCM over
+  8237 auto-init DMA (channel 1, IRQ 5), down-converted to 8-bit mono. The
+  volume/Fn keys drive its mixer (see [Media/Fn keys]). QEMU-only (`-device sb16`).
+- **hda.c — Intel HD Audio + a Realtek codec**, the real-laptop path. An HDA
+  *controller* (PCI 0x04/0x03) is a bus-master with an MMIO register file; the
+  *codec* (a Realtek ALC on real HW, QEMU's `hda-output` in emulation) is what
+  has the DAC and output pins. So "Realtek audio" = HDA controller + codec, one
+  driver. Non-obvious bits, all load-bearing:
+  - **Codec comms = CORB/RIRB command rings** (spec-mandated; the immediate-
+    command interface is optional and absent on some real chips). One verb in
+    flight, polled — CORB index N ↔ RIRB index N.
+  - **The output path is discovered, not hardcoded:** walk the codec's widget
+    graph (root → audio function group → widgets) to find an output-capable pin
+    (ranked speaker > line-out > headphone) that reaches a DAC directly or via
+    one mixer/selector hop, then power/format/unmute/EAPD that path. QEMU gives
+    DAC nid 2 → pin nid 3; a Realtek codec has a mixer in between.
+  - **Playback polls SDnLPIB**, not an IRQ — no PCI interrupt wiring, which dodges
+    IRQ-sharing trouble on real hardware. Cyclic 2-half DMA buffer, refill the
+    half the link position just left (the SB16 gapless idea over HDA streams).
+  - **Everything is resampled to 48 kHz/16-bit/stereo** (nearest-neighbour), so
+    any WAV rate plays regardless of what the HDA format register can encode.
+  - **`hda_init` runs before `sti`** (alongside `sb16_init`), so it **busy-waits**
+    (like `sd_init`) — no `timer_sleep`. Playback runs from the shell with
+    interrupts on, so its poll loop *can* `timer_sleep`.
+  - **DMA buffers:** `pmm_alloc_contig` only *reserves* frames above the 16 MiB
+    identity map — it does **not** map them. Map with `paging_identity_map`
+    before first touch (same as fb.c's back buffer). Left write-back cached; x86
+    keeps bus-master DMA cache-coherent, so no flush and fast fills.
+  - QEMU-verified (controller reset + codec enumeration + a stream that advances
+    LPIB and drains cleanly). **Audible output and real Realtek codec quirks
+    (pin defaults, amp/EAPD/GPIO for the speaker) are real-hardware-only** — the
+    usual "QEMU passes, the laptop is the real test" caveat applies.
+
 ## Gotcha: a security hook misfires on a C identifier
 
 A repo hook blocks any Write/Edit whose content contains `e`,`x`,`e`,`c`

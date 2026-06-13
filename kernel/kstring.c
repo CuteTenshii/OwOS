@@ -17,6 +17,15 @@ void *memcpy(void *dst, const void *src, uint32_t n)
 	return dst;
 }
 
+/* The other primitive gcc emits implicitly (e.g. for `struct x = {0}`). */
+void *memset(void *dst, int c, uint32_t n)
+{
+	uint8_t *d = dst;
+	while (n--)
+		*d++ = (uint8_t)c;
+	return dst;
+}
+
 uint32_t strlen(const char *s)
 {
 	uint32_t n = 0;

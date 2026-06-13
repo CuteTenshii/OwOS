@@ -17,8 +17,6 @@
 #include "endian.h"
 #include "console.h"
 
-/* ---------------------------------------------------------- LE readers */
-
 /* ---------------------------------------------------------------- state */
 #define ISO_SECTOR    2048u
 #define VD_START      16u             /* first Volume Descriptor sector         */
