@@ -280,19 +280,28 @@ int http_request2(const char *method, const char *url,
 	struct purl u;
 	if (!parse_url(url, &u))
 		return HTTP_EPARSE;
-	int sock = connect_url(&u);
-	if (sock < 0)
-		return sock;
+	/* Over TLS, offer ALPN "h2" (SK_TLS_H2) so the server may select HTTP/2. */
+	int sock = net_connect(u.host, u.port, u.tls ? SK_TLS_H2 : SK_TCP);
+	if (sock < 0) {
+		if (sock == NET_EINTR) return HTTP_EINTR;
+		if (sock == -2)        return HTTP_ERESOLVE;
+		return HTTP_ECONNECT;
+	}
+
+	char auth[URL_HOST_MAX + 8];
+	build_authority(auth, (int)sizeof auth, &u);
 
 	int rc;
 	if (u.tls) {
-		/* HTTP/2 over TLS is selected by ALPN ("h2"); until that's wired into
-		 * the kernel TLS, speak HTTP/1.1 on the secure connection. */
-		rc = http1_exchange(sock, method, &u, hdr, hdrcap, hdrlen, body, ctx);
+		/* HTTP/2 over TLS only if the server selected ALPN "h2"; otherwise the
+		 * server speaks HTTP/1.1, so we must too. */
+		if (net_alpn(sock) == ALPN_H2)
+			rc = h2_request(sock, 1, auth, method ? method : "GET", u.path,
+			                hdr, hdrcap, hdrlen, body, ctx);
+		else
+			rc = http1_exchange(sock, method, &u, hdr, hdrcap, hdrlen, body, ctx);
 	} else {
 		/* h2c with prior knowledge: no Upgrade dance, just the h2 preface. */
-		char auth[URL_HOST_MAX + 8];
-		build_authority(auth, (int)sizeof auth, &u);
 		rc = h2_request(sock, 0, auth, method ? method : "GET", u.path,
 		                hdr, hdrcap, hdrlen, body, ctx);
 	}

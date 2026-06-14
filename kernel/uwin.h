@@ -46,7 +46,13 @@ int  uwin_set_resizable(int id, int on);              /* app opts into resizing 
 int  uwin_set_cursor(int id, int cursor);             /* enum wm_cursor for the
                                                          window's client area     */
 
-/* Called from sched_exit(): free every window owned by the exiting task. */
+/* Called from sched_exit(): detach every window owned by the exiting task. The
+ * client buffer is freed later by the WM via uwin_reap() (see uwin.c). */
 void uwin_task_exiting(uint32_t owner_id);
+
+/* Called once per frame from the WM compositor thread: reclaim the client
+ * buffers of windows detached from another context. Must run in the WM thread,
+ * where it's serialized with uw_draw/fb_blit. */
+void uwin_reap(void);
 
 #endif /* OWOS_UWIN_H */

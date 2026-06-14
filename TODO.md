@@ -1,0 +1,21 @@
+This list is not filtered, there's no priority.
+
+- [ ] libcurl: http/3 support
+- [ ] browser: css loading
+- [ ] browser: 103 early hints + "Link" header support
+- [ ] browser: Accept- [ ]Ch header
+- [ ] brotli compression format
+- [ ] programs: archive tool program to view archives (zip, tar, tar.gz, ...)
+- [ ] support brotli for browser [de]compression
+- [ ] SSH client (ssh user@hostname) + SSH server/sshd via services
+- [ ] Samba client
+- [ ] "Network" places in Files app
+- [ ] Phones MTP shown in Files app
+- [ ] Volumes names shown in devices instead of devices names
+- [ ] NTFS support
+- [ ] Media player app.
+- [ ] GUI: buttons, progress bar.
+- [ ] JPEG, WebP, MP4 encoder/decoder
+- [ ] Dialog box GUI: sub- [ ]window linked to its parent.
+- [ ] "Properties" dialog for files and folders in Files app (accessible with right- [ ]click item)
+- [ ] Browser: view source, developer tools (page structure, Network reqs)

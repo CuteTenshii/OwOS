@@ -39,6 +39,7 @@ struct uwin {
 	int            npages;
 	int            w, h;        /* client size in pixels                     */
 	uint32_t       present_seq; /* bumped by uwin_present -> dirty()          */
+	int            free_pending; /* detached; WM thread still owes its buffer */
 	volatile int   head, tail;  /* event ring indices                        */
 	struct win_event ev[EVQ];
 	uint32_t       last_click;  /* timer_ticks() of the previous click       */
@@ -223,24 +224,47 @@ static void uw_on_resize(struct window *w, int cw, int ch)
 
 /* ------------------------------------------------------------- teardown */
 
+/* Detach a window, but DON'T free its client buffer here. uwin_free runs in the
+ * exiting/killing task's context (sched_exit/sched_kill) or a close syscall --
+ * never the WM thread. The WM blits buf_phys in fb_blit with IF=1, so a timer
+ * tick can suspend it mid-blit with buf_phys in hand; kunmap+free here would pull
+ * the pages out from under that in-progress blit -> a not-present supervisor read
+ * in the wm task at buf_phys (~3 GiB on a big-RAM guest: the real-hardware page
+ * fault). So detach now and hand the buffer to the WM thread, which reclaims it
+ * from uwin_reap() where it's serialized with compose()/uw_draw. */
 static void uwin_free(struct uwin *u)
 {
-	if (!u->used)
+	if (!u->used || u->free_pending)
 		return;
 	/* Detach the buffer from the owner's window (frees its private page tables)
 	 * before the dir is torn down, so paging_free_process_dir never touches it. */
 	if (u->owner_dir)
 		paging_unmap_user_at(u->owner_dir, WIN_FB_VADDR, u->buf_bytes);
 	if (u->win)
-		wm_destroy_window(u->win);
-	if (u->buf_phys) {
-		paging_kunmap(u->buf_phys, u->buf_bytes);
-		pmm_free_contig(u->buf_phys, u->buf_bytes);
-	}
-	u->used = 0;
+		wm_destroy_window(u->win);   /* WM stops dispatching uw_draw for it     */
 	u->win = 0;
-	u->buf_phys = 0;
 	u->owner_dir = 0;
+	u->free_pending = 1;             /* WM reclaims buf_phys in uwin_reap()      */
+}
+
+/* Reclaim the client buffers of windows torn down from another context. Runs in
+ * the WM thread (the compositor loop calls it before compose()), so freeing
+ * buf_phys is serialized with uw_draw/fb_blit -- the pages are released only when
+ * the WM is provably not mid-blit. */
+void uwin_reap(void)
+{
+	for (int i = 0; i < MAXUWIN; i++) {
+		struct uwin *u = &uwins[i];
+		if (!u->used || !u->free_pending)
+			continue;
+		if (u->buf_phys) {
+			paging_kunmap(u->buf_phys, u->buf_bytes);
+			pmm_free_contig(u->buf_phys, u->buf_bytes);
+		}
+		u->used = 0;
+		u->buf_phys = 0;
+		u->free_pending = 0;
+	}
 }
 
 /* -------------------------------------------------------------- syscalls */
@@ -329,8 +353,8 @@ static struct uwin *owned(int id)
 	if (id < 0 || id >= MAXUWIN)
 		return 0;
 	struct uwin *u = &uwins[id];
-	if (!u->used || u->owner != sched_current_id())
-		return 0;
+	if (!u->used || u->free_pending || u->owner != sched_current_id())
+		return 0;                  /* detached-but-not-yet-reaped: gone        */
 	return u;
 }
 

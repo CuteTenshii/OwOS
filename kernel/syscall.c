@@ -54,6 +54,7 @@
 #define SYS_NET_SEND   13 /* net_send(h=ebx, buf=ecx, len=edx) -> bytes/-1     */
 #define SYS_NET_RECV   14 /* net_recv(h=ebx, buf=ecx, max=edx) -> bytes(0=EOF) */
 #define SYS_NET_CLOSE  15 /* net_close(h=ebx) -> 0/-1                          */
+#define SYS_NET_ALPN   53 /* net_alpn(h=ebx) -> 2=h2 / 1=http1.1 / 0=not TLS   */
 #define SYS_WIN_CREATE 16 /* win_create(w=ebx, h=ecx, title=edx) -> id/-1      */
 #define SYS_WIN_PRESENT 17 /* win_present(id=ebx) -> 0/-1                       */
 #define SYS_WIN_POLL   18 /* win_poll(id=ebx, evt=ecx) -> 1 event/0 none/-1     */
@@ -465,6 +466,9 @@ void syscall_dispatch(struct registers *r)
 	}
 	case SYS_NET_CLOSE:
 		r->eax = (uint32_t)net_sock_close((int)r->ebx);
+		break;
+	case SYS_NET_ALPN:
+		r->eax = (uint32_t)net_sock_alpn((int)r->ebx);
 		break;
 	case SYS_WIN_CREATE: {
 		int w = (int)r->ebx, h = (int)r->ecx;

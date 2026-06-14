@@ -11,6 +11,7 @@
 #define SK_TLS   1
 #define SK_UDP   2
 #define SK_ICMP  3   /* raw ICMP: the program builds/parses the ICMP message */
+#define SK_TLS_H2 4  /* TLS that also offers ALPN "h2" (else identical to SK_TLS) */
 
 /* DNS answer section, parsed (the IRQ-tied wire parse lives in net.c). The
  * structs are shared in shape with user/lib/owos.h so the ring-3 dig program
@@ -47,6 +48,8 @@ int  net_sock_connect(const char *host, uint16_t port, int tls);
 int  net_sock_send(int h, const void *buf, uint32_t len);
 int  net_sock_recv(int h, void *buf, uint32_t max);
 int  net_sock_close(int h);
+/* Negotiated ALPN protocol on a TLS socket: 2=h2, 1=http/1.1/none, 0=not TLS. */
+int  net_sock_alpn(int h);
 
 /* Receive callback invoked by the NIC driver for each inbound Ethernet frame
  * (FCS already stripped). Runs in interrupt context. */

@@ -29,6 +29,7 @@
 #include "sched.h"
 #include "edid.h"
 #include "crash.h"
+#include "uwin.h"
 #include "battery.h"
 #include "sb16.h"
 #include "hda.h"
@@ -1102,6 +1103,8 @@ static void wm_thread(void)
 		while (sched_try_reap(-1, &rst))
 			;
 		crash_pump();              /* surface any ring-3 crash as a window      */
+		uwin_reap();               /* free buffers of windows torn down off-thread,
+		                              now that we (the WM) are not mid-blit       */
 
 		int mx = mouse_x(), my = mouse_y(), btn = mouse_buttons();
 		int wheel = mouse_wheel();

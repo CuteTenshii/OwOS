@@ -47,14 +47,22 @@ int      stream_end(void);
  * net_send writes (a datagram, for UDP/ICMP). net_recv blocks: TCP/TLS -> >0
  * bytes / 0 EOF; UDP/ICMP -> >0 datagram bytes / 0 timeout; both -1 error, -4
  * interrupted. ping/dig/resolution are ring-3 code over these sockets. */
-#define SK_TCP   0
-#define SK_TLS   1
-#define SK_UDP   2
-#define SK_ICMP  3
+#define SK_TCP    0
+#define SK_TLS    1
+#define SK_UDP    2
+#define SK_ICMP   3
+#define SK_TLS_H2 4   /* TLS that offers ALPN "h2" (check the result with net_alpn) */
 int      net_connect(const char *host, int port, int proto);
 int      net_send(int h, const void *buf, int len);
 int      net_recv(int h, void *buf, int max);
 int      net_close(int h);
+/* For a TLS socket, the ALPN protocol the server negotiated (we always offer
+ * "h2","http/1.1"): ALPN_H2, ALPN_HTTP11 (or no ALPN), or ALPN_NONE for a
+ * non-TLS socket. Lets a client pick HTTP/2 vs HTTP/1.1. */
+#define ALPN_NONE   0
+#define ALPN_HTTP11 1
+#define ALPN_H2     2
+int      net_alpn(int h);
 
 /* Freestanding string helpers — shared so each program doesn't re-roll its own.
  * Standard libc names, matching the kernel's kstring.h convention. */

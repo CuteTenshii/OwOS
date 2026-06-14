@@ -106,6 +106,24 @@ static uint8_t  client_iv[12], server_iv[12];  /* 1.2 uses first 4; 1.3 all 12 *
 
 static struct sha256 transcript;     /* running hash of handshake messages */
 
+/* ALPN: the application protocol the server selected ("h2" or "http/1.1"), or
+ * empty if it offered none. Set during the handshake, read by tls_alpn_is_h2()
+ * so the HTTP client knows whether to speak HTTP/2 on this connection. */
+static char     neg_alpn[16];
+static uint32_t neg_alpn_len;
+
+static void set_alpn(const uint8_t *p, uint32_t n)
+{
+	if (n > sizeof neg_alpn) n = sizeof neg_alpn;
+	memcpy(neg_alpn, p, n);
+	neg_alpn_len = n;
+}
+
+int tls_alpn_is_h2(void)
+{
+	return neg_alpn_len == 2 && neg_alpn[0] == 'h' && neg_alpn[1] == '2';
+}
+
 /* Raw inbound bytes from TCP, parsed into records. */
 static uint8_t  rxraw[TLS_RECMAX + 5];
 static uint32_t rxlen, rxpos;
@@ -381,7 +399,8 @@ static void install_keys(const uint8_t c_secret[32], const uint8_t s_secret[32])
 /* One ClientHello offering both TLS 1.3 (key_share + supported_versions) and
  * TLS 1.2 (ECDHE-RSA). The server's chosen version decides which path runs. */
 static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32],
-                                   const uint8_t our_pub[32], const char *sni)
+                                   const uint8_t our_pub[32], const char *sni,
+                                   int offer_h2)
 {
 	uint32_t namelen = 0;
 	if (sni)
@@ -446,6 +465,17 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
 	put16(p, 0x001D); p += 2;             /* group x25519 */
 	put16(p, 32); p += 2;
 	memcpy(p, our_pub, 32); p += 32;
+	/* ALPN: only offered when the caller wants HTTP/2 (offer_h2). Offering "h2"
+	 * unconditionally would make h2-preferring servers select HTTP/2 even for a
+	 * plain HTTP/1.1 request, breaking the connection — so a plain TLS handshake
+	 * carries no ALPN at all (identical to the pre-ALPN wire). */
+	if (offer_h2) {
+		put16(p, 0x0010); p += 2;     /* application_layer_protocol_negotiation */
+		put16(p, 14); p += 2;         /* extension_data length                  */
+		put16(p, 12); p += 2;         /* ProtocolNameList length                */
+		*p++ = 2; *p++ = 'h'; *p++ = '2';
+		*p++ = 8; memcpy(p, "http/1.1", 8); p += 8;
+	}
 
 	put16(extlen, (uint16_t)(p - exts));
 
@@ -496,6 +526,11 @@ static int parse_server_hello(const uint8_t *body, uint32_t bl,
 				memcpy(server_pub, body + off + 4, 32);
 				*have_ks = 1;
 			}
+		} else if (et == 0x0010 && el >= 3) {
+			/* ALPN (TLS 1.2): ProtocolNameList(2) ProtocolName(len+bytes). */
+			uint8_t nl = body[off + 2];
+			if (off + 3u + nl <= end)
+				set_alpn(body + off + 3, nl);
 		}
 		off += el;
 	}
@@ -554,6 +589,24 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 				}
 			break;
 		}
+		if (mt == HS_ENC_EXT && bl >= 2) {
+			/* ALPN (TLS 1.3) rides here: Extensions(2) then ext list. */
+			uint32_t el = ((uint32_t)body[0] << 8) | body[1];
+			uint32_t o = 2, e = (2 + el < bl) ? 2 + el : bl;
+			while (o + 4 <= e) {
+				uint16_t et = ((uint16_t)body[o] << 8) | body[o + 1];
+				uint16_t xl = ((uint16_t)body[o + 2] << 8) | body[o + 3];
+				o += 4;
+				if (o + xl > e)
+					break;
+				if (et == 0x0010 && xl >= 3) {
+					uint8_t nl = body[o + 2];
+					if (o + 3u + nl <= e)
+						set_alpn(body + o + 3, nl);
+				}
+				o += xl;
+			}
+		}
 		/* EncryptedExtensions / Certificate / CertificateVerify: not verified. */
 	}
 
@@ -586,10 +639,11 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 
 static const uint8_t x25519_base[32] = { 9 };
 
-int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
+int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h2)
 {
 	established = 0;
 	is13 = 0;
+	neg_alpn_len = 0;
 	rxlen = rxpos = hslen = hspos = applen = apppos = 0;
 	client_seq = server_seq = 0;
 	send_encrypted = recv_encrypted = 0;
@@ -610,7 +664,7 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni)
 
 	/* --- ClientHello --- */
 	uint8_t ch[768];
-	uint32_t chlen = build_client_hello(ch, client_random, our_pub, sni);
+	uint32_t chlen = build_client_hello(ch, client_random, our_pub, sni, offer_h2);
 	sha256_update(&transcript, ch, chlen);
 	if (send_record(REC_HS, ch, chlen) < 0) {
 		con_write("tls: send ClientHello failed\n");

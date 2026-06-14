@@ -1242,7 +1242,7 @@ int net_curl(const char *arg)
 	}
 	int ok;
 	if (use_tls) {
-		ok = tls_connect(ip, port, host);
+		ok = tls_connect(ip, port, host, /*offer_h2=*/0);
 	} else {
 		curl_conn = tcp_connect(ip, port);
 		ok = curl_conn != NULL;
@@ -1555,6 +1555,11 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
 {
 	if (!nic_present())
 		return -1;
+	/* SK_TLS_H2 is TLS that also advertises ALPN "h2"; store it as a normal TLS
+	 * socket and remember to offer h2 in the handshake. */
+	int offer_h2 = (proto == SK_TLS_H2);
+	if (proto == SK_TLS_H2)
+		proto = SK_TLS;
 	int h = -1;
 	for (int i = 0; i < NET_SOCK_MAX; i++)
 		if (!usocks[i].used) { h = i; break; }
@@ -1578,7 +1583,7 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
 
 	switch (proto) {
 	case SK_TLS:
-		if (!tls_connect(ip, port, host))
+		if (!tls_connect(ip, port, host, offer_h2))
 			return sched_intr_pending() ? -4 : -3;
 		break;
 	case SK_TCP:
@@ -1653,6 +1658,17 @@ int net_sock_close(int h)
 	s->used = s->closed = 0;
 	s->conn = NULL;
 	return 0;
+}
+
+/* Negotiated ALPN application protocol on a TLS socket: 2 = h2, 1 = http/1.1
+ * (or no ALPN), 0 = not a TLS socket. Lets ring-3 pick HTTP/2 vs HTTP/1.1. */
+int net_sock_alpn(int h)
+{
+	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+		return -1;
+	if (usocks[h].proto != SK_TLS)
+		return 0;
+	return tls_alpn_is_h2() ? 2 : 1;
 }
 
 int net_ping(const char *host)

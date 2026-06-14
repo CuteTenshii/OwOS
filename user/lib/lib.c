@@ -51,6 +51,7 @@
 #define SYS_CMD_READ   50
 #define SYS_CMD_ABORT  51
 #define SYS_INTR       52
+#define SYS_NET_ALPN   53
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -168,6 +169,11 @@ int net_recv(int h, void *buf, int max)
 int net_close(int h)
 {
 	return syscall(SYS_NET_CLOSE, h, 0, 0);
+}
+
+int net_alpn(int h)
+{
+	return syscall(SYS_NET_ALPN, h, 0, 0);
 }
 
 int win_create(int w, int h, const char *title)
