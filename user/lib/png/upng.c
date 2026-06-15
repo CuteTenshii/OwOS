@@ -245,8 +245,16 @@ static int emit_scanline(struct dec *d)
 
 static int sink_plain(struct dec *d, const unsigned char *buf, unsigned n)
 {
-	for (unsigned i = 0; i < n; i++) {
-		d->cur[d->col++] = buf[i];
+	unsigned i = 0;
+	while (i < n) {
+		/* Copy as much of the current scanline as this buffer holds in one run,
+		 * so the per-row boundary check happens once per row, not per byte. */
+		unsigned need = (1 + d->stride) - d->col;
+		unsigned take = (n - i < need) ? (n - i) : need;
+		for (unsigned k = 0; k < take; k++)
+			d->cur[d->col + k] = buf[i + k];
+		d->col += take;
+		i += take;
 		if (d->col == 1 + d->stride) {
 			int r = emit_scanline(d);
 			d->col = 0;

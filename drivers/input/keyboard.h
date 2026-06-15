@@ -45,6 +45,13 @@
 #define KEY_SDOWN   0x19
 #define KEY_SHOME   0x1A
 #define KEY_SEND    0x1C
+/* Alt+Tab window switching. The keyboard tracks the left-Alt modifier and turns
+ * Tab (and Shift+Tab) into these while Alt is held; the WM advances a switcher
+ * selection on each one. KEY_ALT_UP is emitted when Alt is released after an
+ * Alt+Tab gesture, committing the highlighted window. The shell ignores them. */
+#define KEY_ALTTAB      0x1D   /* Alt+Tab: next window                          */
+#define KEY_ALTTAB_PREV 0x1E   /* Alt+Shift+Tab: previous window                */
+#define KEY_ALT_UP      0x1F   /* Alt released: commit the Alt+Tab selection    */
 
 void keyboard_init(void);
 

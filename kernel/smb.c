@@ -574,7 +574,7 @@ static int do_query_directory(struct smb_conn *s, const uint8_t *req, uint32_t r
 	uint32_t total = 0, last_start = 0;
 	int produced = 0;
 	for (;;) {
-		char nm[24]; int is_dir; uint32_t sz, mt;
+		char nm[64]; int is_dir; uint32_t sz, mt;   /* >= owofs FS_NAME_LEN */
 		if (!dir_entry_at(h->path, h->enum_pos, nm, &is_dir, &sz, &mt))
 			break;
 		last_start = total;

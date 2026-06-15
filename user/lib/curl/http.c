@@ -3,6 +3,7 @@
 #include "owos.h"
 #include "url.h"
 #include "http.h"
+#include "headers.h"
 #include "h2.h"
 #include "h3.h"
 
@@ -36,22 +37,6 @@ static int rgetc(struct rdr *r)
 }
 
 /* ---- tiny string helpers ----------------------------------------------- */
-
-static char lower(char c)
-{
-	return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-}
-
-static int starts_ci(const char *s, const char *pre)
-{
-	while (*pre) {
-		if (lower(*s) != lower(*pre))
-			return 0;
-		s++;
-		pre++;
-	}
-	return 1;
-}
 
 static void sapp(char *dst, int *n, int cap, const char *s)
 {
@@ -148,37 +133,18 @@ static int http1_exchange(int sock, const char *method, const struct purl *u,
 		if (hdrlen) *hdrlen = i;
 	}
 
-	/* Status code from "HTTP/1.1 NNN ...". */
-	int status = 0;
-	{
-		const char *p = hbuf;
-		while (*p && *p != ' ') p++;          /* skip "HTTP/1.1"            */
-		while (*p == ' ') p++;
-		for (int k = 0; k < 3 && p[k] >= '0' && p[k] <= '9'; k++)
-			status = status * 10 + (p[k] - '0');
-	}
-
-	/* Body framing: chunked > Content-Length > read-until-close. */
-	int chunked = 0, have_len = 0;
+	/* Status code + body framing (chunked > Content-Length > read-until-close),
+	 * via the shared header object. */
+	struct http_headers H;
+	http_headers_parse(&H, hbuf);
+	int status = H.status;
+	const char *te = http_headers_get(&H, "transfer-encoding");
+	const char *cl = http_headers_get(&H, "content-length");
+	int chunked = te && http_header_has_token(te, "chunked");
+	int have_len = 0;
 	unsigned content_len = 0;
-	for (char *line = hbuf; *line; ) {
-		if (starts_ci(line, "transfer-encoding:")) {
-			for (char *q = line; *q && *q != '\n'; q++)
-				if (starts_ci(q, "chunked")) { chunked = 1; break; }
-		} else if (starts_ci(line, "content-length:")) {
-			const char *v = line + 15;
-			while (*v == ' ') v++;
-			unsigned x = 0;
-			while (*v >= '0' && *v <= '9')
-				x = x * 10 + (unsigned)(*v++ - '0');
-			content_len = x;
-			have_len = 1;
-		}
-		char *eol = line;
-		while (*eol && *eol != '\n') eol++;
-		if (!*eol) break;
-		line = eol + 1;
-	}
+	if (cl) { bool ok; content_len = http_parse_uint(cl, &ok); have_len = ok; }
+	http_headers_free(&H);
 
 	struct emitter e;
 	e.fn = body; e.ctx = ctx; e.len = 0; e.aborted = 0;

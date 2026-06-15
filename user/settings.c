@@ -2,12 +2,13 @@
  *
  * A master/detail window: a gfx `sidebar` widget down the left edge lists the
  * setting categories, the right pane shows the selected category's controls.
- * Each category maps to real kernel state reached through the ordinary /proc
- * control plane (no bespoke syscalls):
+ * Each category maps to real kernel state reached through the ordinary file
+ * interface (no bespoke syscalls): device tunables live in the sysfs tree,
+ * system info in /proc — the Unix split.
  *
- *   Mouse / Touchpad  pointer speed  -> /proc/mouse     (level 1..5)
- *   Keyboard          layout         -> /proc/keyboard  ("us" / "fr")
- *   About             system info    -> /proc/host, cpuinfo, meminfo, ...
+ *   Mouse / Touchpad  pointer speed  -> /sys/class/input/mouse0/speed  (1..5)
+ *   Keyboard          layout         -> /sys/class/input/kbd0/layout   ("us"/"fr")
+ *   About             system info    -> /sys/class/dmi/id, /proc/cpuinfo, ...
  *
  * The sidebar owns its width as a resizable property (drag the divider). A `seq`
  * counter bumps on every change so the loop repaints only when something moved.
@@ -99,7 +100,7 @@ static int field(const char *buf, const char *key, char *out, int max)
 static void load_mouse(void)
 {
 	char t[16];
-	if (read_proc("/proc/mouse", t, sizeof t) > 0) {
+	if (read_proc("/sys/class/input/mouse0/speed", t, sizeof t) > 0) {
 		int v = 0;
 		for (const char *p = t; *p >= '0' && *p <= '9'; p++) v = v * 10 + (*p - '0');
 		if (v >= 1 && v <= 5) mouse_level = v;
@@ -109,7 +110,7 @@ static void load_mouse(void)
 static void load_kbd(void)
 {
 	char t[16];
-	if (read_proc("/proc/keyboard", t, sizeof t) > 0) {
+	if (read_proc("/sys/class/input/kbd0/layout", t, sizeof t) > 0) {
 		t[sizeof kbd_layout - 1] = 0;
 		strcpy(kbd_layout, t);
 	}
@@ -132,7 +133,7 @@ static void load_about(void)
 	aline("OwOS");
 	aline("");
 
-	if (read_proc("/proc/host", v, sizeof v) > 0) {
+	if (read_proc("/sys/class/dmi/id/product_name", v, sizeof v) > 0) {
 		strcpy(line, "Host: "); strcat(line, v); aline(line);
 	}
 
@@ -156,7 +157,7 @@ static void load_about(void)
 		aline(line);
 	}
 
-	if (read_proc("/proc/firmware", v, sizeof v) > 0) {
+	if (read_proc("/sys/firmware/type", v, sizeof v) > 0) {
 		strcpy(line, "Firmware: "); strcat(line, v); aline(line);
 	}
 
@@ -182,13 +183,13 @@ static void set_mouse_level(int level)
 	if (level < 1) level = 1;
 	if (level > 5) level = 5;
 	uitoa((unsigned)level, t);
-	if (writefile("/proc/mouse", t, strlen(t)) == 0)
+	if (writefile("/sys/class/input/mouse0/speed", t, strlen(t)) == 0)
 		mouse_level = level;
 }
 
 static void set_kbd_layout(const char *name)
 {
-	if (writefile("/proc/keyboard", name, strlen(name)) == 0)
+	if (writefile("/sys/class/input/kbd0/layout", name, strlen(name)) == 0)
 		strcpy(kbd_layout, name);
 }
 

@@ -48,7 +48,7 @@ static int               syn_mode;     /* 1 once a Synaptics TouchPad took over 
  * native 1x), each mapping to a num/den factor. A fractional residual carries
  * the bit lost to integer division into the next packet, so a slow setting still
  * moves smoothly instead of snapping in whole steps. Settable from user space via
- * /proc/mouse (the Settings app's Mouse/Touchpad category). */
+ * /sys/class/input/mouse0/speed (the Settings app's Mouse/Touchpad category). */
 static int               speed = 3;
 static int               res_x, res_y;
 static const int         spd_num[5] = { 1, 3, 1, 3, 2 };

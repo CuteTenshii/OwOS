@@ -139,7 +139,11 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
 	if (need == 0)
 		return 0;
 
-	for (uint32_t f = 0; f + need <= total_frames; ) {
+	/* Start past the always-reserved low 16 MiB: those frames are permanently
+	 * marked used, so no contiguous run can begin there. Scanning from 0 stepped
+	 * through all ~4096 reserved frames one at a time (run=0 -> f+=1) on every
+	 * call before reaching allocatable RAM. */
+	for (uint32_t f = RESERVED_FRAMES; f + need <= total_frames; ) {
 		uint32_t run = 0;
 		while (run < need && !frame_test(f + run))
 			run++;

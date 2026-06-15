@@ -1,7 +1,7 @@
 # CLAUDE.md
 
-OwOS is a 32-bit x86 hobby kernel written from scratch in C + GAS assembly,
-booted directly by QEMU's Multiboot loader. README.md has the feature list and
+OwOS is a 32-bit x86 Unix-like hobby kernel written from scratch in C + GAS
+assembly, booted directly by QEMU's Multiboot loader. README.md has the feature list and
 per-file layout; this file covers what spans multiple files or isn't obvious
 from one read.
 
@@ -33,8 +33,8 @@ There is **no cross-compiler**: a freestanding 32-bit ELF (`gcc -m32
 built-in Multiboot (`-kernel`). `make run`/`debug` auto-create the disks each
 storage driver exercises (IDE `disk.img` + AHCI + NVMe + a USB stick + an SD card
 + an ISO 9660 `cd.iso` on an ATAPI CD-ROM), a SLIRP NIC, and a USB tablet; `make
-run` adds Sound Blaster 16 + PC speaker. Both the RTL8139 and
-e1000 drivers are built in; the kernel keeps whichever card QEMU attached.
+run` adds Sound Blaster 16 + PC speaker. The RTL8139, e1000, and igb drivers
+are all built in; the kernel keeps whichever card QEMU attached.
 `make iso` is the only target needing a host bootloader (`grub-mkrescue`); it's
 for VMware/VirtualBox/bare metal, which need GRUB on the media.
 
@@ -293,17 +293,48 @@ syscalls (those were tried and removed). Same rule, computation side: codecs/
 decompression go in `user/lib`, not a syscall (the zip/gzip codecs are
 `user/lib/zlib/{lzss,deflate}.c`; `inflate.c` decompresses).
 
-**`/proc` is the general interface for kernel state and actions** (procfs.c,
-reached through the ordinary file API). *Reads* expose one fact per file
+**Kernel state is exposed through two synthetic filesystems, the Unix way —
+`/proc` for process/system *info*, `/sys` for *device tunables* — both reached
+through the ordinary file API, no bespoke syscalls.**
+
+**`/proc` (procfs.c) is flat, one fact per file.** *Reads* expose system info
 (`cpuinfo meminfo uptime date storage tasks pci host firmware battery display
-journal services usb net clipboard keyboard`); *writes* are **control nodes** so
-user space triggers a kernel action without a per-feature syscall: write a layout to
-`/proc/keyboard` (loadkeys), text to `/proc/clipboard` (clip), `start X`/`stop X`
-to `/proc/services`. The earlier `SYS_SYSINFO`/`SYS_PCIDEV` were deleted in favor
-of this. A genuine *action* that returns nothing stays a syscall (e.g.
-`SYS_POWER` — "read a file to shut down" makes no sense). The terminal is
-built entirely on these: it captures a child's stdout via **`SYS_SPAWN_CAP`** (+
-`read_nb`/`kill`), and has no kernel-shell bridge. See [[syscalls-must-be-general]].
+journal services usb net clipboard`); *writes* are **control nodes** so user
+space triggers a kernel action without a per-feature syscall: text to
+`/proc/clipboard` (clip), `start X`/`stop X` to `/proc/services`, a DHCP/NTP
+re-run via `/proc/net`. The earlier `SYS_SYSINFO`/`SYS_PCIDEV` were deleted in
+favor of this.
+
+**`/sys` (sysfs.c) is a real nested hierarchy of kernel objects and their
+attributes** — unlike `/proc`, every directory level is walkable
+(`ls /sys/class/input` → `kbd0 mouse0`). It's where *device tunables* live, the
+Linux sysfs home for them:
+
+```
+/sys/class/input/kbd0/layout     keyboard layout      (rw, loadkeys)
+/sys/class/input/mouse0/speed    pointer speed 1..5   (rw, Settings)
+/sys/class/net/eth0/{address,carrier,ipaddr}          (ro)
+/sys/class/block/<dev>/{model,size}                   (ro)
+/sys/bus/pci/devices/<bdf>/{vendor,device,class}      (ro, one dir per device)
+/sys/power/battery/{capacity,status}                  (ro, real HW)
+/sys/firmware/type               BIOS / UEFI          (ro)
+```
+
+PCI devices are one directory each, named by Linux BDF (`0000:00:03.0`), so
+`ls /sys/bus/pci/devices` enumerates the whole bus (vs the flat `/proc/pci` dump
+that `lspci` still parses — both kept, as on Linux).
+
+The dynamic parts (which NIC/block devices exist, battery presence) are resolved
+by an explicit per-level path walk in sysfs.c, not a static node table. fs.c
+routes `/sys` for ls/stat/read (`sysfs_enum` lists any directory level, unlike
+`procfs_list` which only lists the `/proc` root); syscall.c routes writes. The
+choice of `/proc` vs `/sys` follows Linux: info → `/proc`, device attribute →
+`/sys` (which is why keyboard/mouse moved out of `/proc` to `/sys/class/input`).
+
+A genuine *action* that returns nothing stays a syscall (e.g. `SYS_POWER` —
+"read a file to shut down" makes no sense). The terminal is built entirely on
+these: it captures a child's stdout via **`SYS_SPAWN_CAP`** (+ `read_nb`/`kill`),
+and has no kernel-shell bridge. See [[syscalls-must-be-general]].
 
 Each task carries a **cwd** (`task_t.cwd`): a parent sets a child's via
 `sched_set_cwd`, fork/`spawn_cap` inherit it, `SYS_CHDIR` sets the caller's own,
@@ -418,13 +449,24 @@ note below. TLS is **client-only**; TCP/UDP have client + server paths (servers 
 services.c daemons). Strictly layered:
 
 - **nic.c — link-layer dispatch.** Each driver exports a `struct nic_ops`
-  (probe/send/mac); `nic_init` probes `{ e1000_ops, rtl8139_ops }` in order and
-  keeps the first present. net.c is driver-agnostic (nic_present/nic_mac/
-  nic_send; inbound via `net_rx_frame()`). `nic_set()` installs a hot-plugged
-  driver at runtime (the planned USB-tethering RNDIS driver registers this way).
+  (probe/send/mac); `nic_init` probes `{ igb_ops, e1000_ops, rtl8139_ops }` in
+  order and keeps the first present. net.c is driver-agnostic (nic_present/
+  nic_mac/nic_send; inbound via `net_rx_frame()`). `nic_set()` installs a
+  hot-plugged driver at runtime (the planned USB-tethering RNDIS driver registers
+  this way).
   - rtl8139.c — the classic Realtek card (QEMU default).
-  - e1000.c — Intel Gigabit (8254x/82574/I21x): MMIO register file (mapped UC-
-    via `paging_map_uncached`), RX/TX rings, RX IRQ. `make run NIC=e1000`.
+  - e1000.c — Intel Gigabit (8254x/82574/**I217-I219**, the PCH-integrated
+    e1000e/ich8lan parts — *not* the I210/I211): MMIO register file (mapped UC-
+    via `paging_map_uncached`), legacy RX/TX rings, RX IRQ. `make run NIC=e1000`.
+  - igb.c — Intel Gigabit **igb family** (I210/**I211**/82576/82580/I350): a
+    different MAC architecture from e1000 — per-queue descriptor windows
+    (0xC000/0xE000), *advanced* descriptors, and a per-queue RXDCTL/TXDCTL.ENABLE
+    handshake. RX is drained off the timer tick (the `.poll` hook), no RX IRQ, so
+    no GPIE/IVAR setup. MAC from RAL/RAH[0]. **QEMU-verified** against `-device
+    igb` (82576): DHCP lease + traffic over SLIRP; the I210/I211 share this exact
+    code path. `make run NIC=igb`. The I211 (0x1539) is the real-hardware target
+    (e.g. the dev's own box); QEMU has no i210/i211 model, so the 82576 is the
+    in-emulation proxy for the same programming model.
 - **net.c — IPv4**: ARP (cached), ICMP echo, UDP (DNS), a DHCP client, and NTP.
   DHCP and NTP are now **services** (services.c): `dhcp` autostarts the boot
   lease, `ntp` syncs on demand (`services start ntp`); re-lease via
@@ -548,6 +590,48 @@ the user-space one existed.) Layered like the rest of the stack:
 
 `torrent get <file>` chains all four to download a whole single-file torrent to
 owofs. TCP-only over the existing `tcp_connect`/`tcp_read` client path.
+
+## SQLite library (user/lib/sqlite) + the browser jar (user/browser/jar.c)
+
+A from-scratch reader/writer for the **real SQLite3 file format**, entirely in
+user space (`user/lib/sqlite/sqlite.{c,h}`). `sql_save()` emits a byte-for-byte
+valid `.sqlite` file — the 100-byte database header, table b-trees built **bottom
+up** (leaf pages, plus interior pages when a table outgrows one page), the
+record/serial-type encoding, and SQLite varints — and `sql_open()` parses one
+back. Files written here open in the host `sqlite3` shell (verified: `PRAGMA
+integrity_check` → `ok` on a 500-row / 26-page db) and real SQLite files load
+here. It is an **in-memory model**, matching OwOS's whole-file I/O: `sql_open`
+reads the file (via `readfile_at`, growing the buffer to the true size — no cap),
+parses it into tables/rows, you mutate in RAM, `sql_save` serialises the whole
+db back with `writefile`. Scope: table b-trees (leaf + interior), NULL/int/
+float/TEXT/BLOB columns, UTF-8; **no** index b-trees, overflow pages (so one
+record must fit a 4 KiB page — true for everything we write), or WAL. The API is
+a typed C one (`sql_new`/`sql_create_table`/`sql_insert`/`sql_table_find`/row
+walk); links with `$(SQLITE)` and needs `$(LIBGCC)` for 64-bit varint math.
+
+It is a **general** library; its first user is the **browser's persistent cookie
++ HSTS jar** (`user/browser/jar.c`, file `/home/root/cookies.db`). Two tables —
+`cookies(host,name,value)` and `hsts(host)` — in one real SQLite db. `jar_load()`
+fills `B->cookies` + `B->hsts` at boot; `jar_save()` rewrites the whole db after
+any Set-Cookie / Strict-Transport-Security change. Both in-memory lists are
+**uncapped heap linked lists** (no `MAX_COOKIES`, no fixed field widths) — malloc
+exists. The HTTP transport (`fetch.c`) only calls `cookie_store`/`cookie_header`/
+`hsts_add`/`hsts_has`; **no SQL lives in fetch.c**.
+
+## libcurl HTTP header object (user/lib/curl/headers.c)
+
+Response headers are parsed **once** into a k/v object, never re-scanned by each
+client. `http_headers_parse(&h, block)` turns a raw header block (HTTP/1.1 or the
+h2-synthesized form) into `{status, fields[]}`; clients query `http_headers_get`/
+`http_headers_count`/`http_headers_at` (case-insensitive; repeated headers like
+Set-Cookie kept in order) plus value helpers `http_header_has_token` /
+`http_parse_uint`. Names are lowercased, values are trimmed NUL-terminated heap
+copies (**no value-length cap**). This replaced the copy-pasted `starts_ci(line,
+"…")` walks in both `curl`'s `http.c` and the browser's `parse_response`. Links
+with `$(HEADERS)` (curl + browser). The browser also honours **`X-Content-Type-
+Options: nosniff`**: with it set, `render_raw` treats the body as HTML only when
+the server *declared* an HTML type — the empty-Content-Type → HTML guess is
+suppressed.
 
 ## ACPI, power & battery (power.c + aml.c + battery.c)
 

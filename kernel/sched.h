@@ -58,6 +58,13 @@ void sched_set_pipe_fd(int pid, int fd, int writer, int pipe_id);
 void sched_set_cwd(int pid, const char *path);  /* set a child's working dir    */
 void sched_set_cwd_self(const char *path);      /* set the caller's own cwd     */
 const char *sched_cwd(void);  /* the current task's working dir (absolute)     */
+
+/* Per-process credentials (inherited across spawn/fork like cwd). The current
+ * task's uid/gid; sched_set_creds_self switches the caller (used by login/su via
+ * /proc/login -- only after the kernel has validated the password). */
+uint32_t sched_uid(void);
+uint32_t sched_gid(void);
+void     sched_set_creds_self(uint32_t uid, uint32_t gid);
 void sched_dump(void);
 int  sched_count(void);
 

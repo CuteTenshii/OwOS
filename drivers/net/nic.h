@@ -37,6 +37,7 @@ void           nic_init(void);    /* probe known drivers; keep the first present
 void           nic_set(const struct nic_ops *ops); /* install a hot-plugged driver */
 int            nic_present(void); /* 1 once a NIC has been found and enabled     */
 const uint8_t *nic_mac(void);     /* our 6-byte MAC address (valid after init)   */
+const char    *nic_name(void);    /* active driver's name, or NULL if no NIC     */
 
 /* Transmit one complete Ethernet frame (dst/src/type + payload). Routed to the
  * active driver, which copies it into a DMA buffer; runt frames are padded to

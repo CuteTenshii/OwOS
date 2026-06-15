@@ -70,12 +70,33 @@ void kfree(void *ptr)
 	if (!ptr)
 		return;
 	block_t *b = (block_t *)((uint8_t *)ptr - sizeof(block_t));
+
+	/* Robustness: ignore a pointer outside the heap window, or a double free
+	 * (either would corrupt the list / underflow the used count). */
+	if ((uintptr_t)b < (uintptr_t)head || (uintptr_t)b >= KHEAP_END)
+		return;
+	if (b->free)
+		return;
 	b->free = 1;
 
 	/* Merge forward with adjacent free blocks. */
 	while (b->next && b->next->free) {
 		b->size += sizeof(block_t) + b->next->size;
 		b->next = b->next->next;
+	}
+
+	/* Merge backward: absorb b into a free predecessor. The list is kept in
+	 * address order, so one walk from head finds the block whose next is b.
+	 * Without this, freeing blocks in any order but low-to-high left a trail of
+	 * small free blocks that never recombined — the heap fragmented over uptime. */
+	if (b != head) {
+		block_t *p = head;
+		while (p && p->next != b)
+			p = p->next;
+		if (p && p->free) {
+			p->size += sizeof(block_t) + b->size;
+			p->next  = b->next;
+		}
 	}
 }
 

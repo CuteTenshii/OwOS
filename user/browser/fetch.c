@@ -1,8 +1,11 @@
-/* fetch.c — HTTP/HTTPS transport for the browser: buffered reader, cookie jar,
- * one transaction, and the redirect-following fetch. Ported from the kernel
+/* fetch.c — HTTP/HTTPS transport for the browser: buffered reader, one
+ * transaction, and the redirect-following fetch. Ported from the kernel
  * app_browser.c with net_sock_* -> the net_* user syscalls. Runs on the worker
- * thread (see main.c), so its blocking reads never stall the UI. */
+ * thread (see main.c), so its blocking reads never stall the UI. The cookie +
+ * HSTS jar and its SQLite persistence live in jar.c; this file only calls
+ * cookie_store/cookie_header/hsts_add/hsts_has (declared in browser.h). */
 #include "browser.h"
+#include "headers.h"   /* libcurl: HTTP response header parsing */
 
 static int rgetc(void)
 {
@@ -29,12 +32,8 @@ void show_error(const char *m)
 	B->seq++;
 }
 
-/* -------------------------------------------------------------- cookie jar */
-
-static int streq_ci(const char *a, const char *b)
-{ while (*a && lower(*a) == lower(*b)) { a++; b++; } return lower(*a) == lower(*b); }
-
-/* Case-insensitive substring test (used to spot "html" inside a Content-Type). */
+/* Case-insensitive substring test (used to spot "html" inside a Content-Type).
+ * streq_ci lives in browser.h; the cookie/HSTS jar lives in jar.c. */
 static int has_sub(const char *s, const char *sub)
 {
 	for (; *s; s++) {
@@ -43,71 +42,6 @@ static int has_sub(const char *s, const char *sub)
 		if (!*b) return 1;
 	}
 	return 0;
-}
-
-static void cookie_store(const char *host, const char *v)
-{
-	while (*v == ' ') v++;
-	char name[64]; int ni = 0;
-	while (*v && *v != '=' && *v != ';' && ni < (int)sizeof name - 1) name[ni++] = *v++;
-	name[ni] = '\0';
-	if (*v != '=' || ni == 0) return;
-	v++;
-	char val[256]; int vi = 0;
-	while (*v && *v != ';' && *v != '\r' && *v != '\n' && vi < (int)sizeof val - 1)
-		val[vi++] = *v++;
-	val[vi] = '\0';
-
-	int free_slot = -1;
-	for (int i = 0; i < MAX_COOKIES; i++) {
-		if (!B->cookies[i].used) { if (free_slot < 0) free_slot = i; continue; }
-		if (streq_ci(B->cookies[i].host, host) && streq(B->cookies[i].name, name)) {
-			int k = 0; for (; val[k]; k++) B->cookies[i].val[k] = val[k];
-			B->cookies[i].val[k] = '\0';
-			return;
-		}
-	}
-	if (free_slot < 0) return;
-	struct cookie *c = &B->cookies[free_slot];
-	c->used = 1;
-	int k;
-	for (k = 0; host[k] && k < (int)sizeof c->host - 1; k++) c->host[k] = host[k];
-	c->host[k] = '\0';
-	for (k = 0; name[k]; k++) c->name[k] = name[k];
-	c->name[k] = '\0';
-	for (k = 0; val[k]; k++) c->val[k] = val[k];
-	c->val[k] = '\0';
-}
-
-static int cookie_header(const char *host, char *out, int cap)
-{
-	int n = 0;
-	for (int i = 0; i < MAX_COOKIES; i++) {
-		if (!B->cookies[i].used || !streq_ci(B->cookies[i].host, host)) continue;
-		if (n) sapp(out, &n, cap, "; ");
-		sapp(out, &n, cap, B->cookies[i].name);
-		sapp(out, &n, cap, "=");
-		sapp(out, &n, cap, B->cookies[i].val);
-	}
-	return n;
-}
-
-/* ------------------------------------------------- HSTS (force-HTTPS hosts) */
-
-static int hsts_has(const char *host)
-{
-	for (int i = 0; i < B->n_hsts; i++)
-		if (streq_ci(B->hsts[i], host)) return 1;
-	return 0;
-}
-
-static void hsts_add(const char *host)
-{
-	if (hsts_has(host) || B->n_hsts >= MAX_HSTS) return;
-	int k = 0;
-	for (; host[k] && k < 127; k++) B->hsts[B->n_hsts][k] = host[k];
-	B->hsts[B->n_hsts][k] = '\0';
-	B->n_hsts++;
 }
 
 /* --------------------------------------------------- body byte source/sink */
@@ -164,17 +98,16 @@ static int body_src(void *ctx)
 	return c;
 }
 
-/* Appends decompressed (or copied) bytes to the render buffer, stopping once it
- * is full — returning <0 then makes the streaming inflater halt cleanly, so an
- * over-large page is truncated to RAW_MAX rather than failing outright. */
+/* Appends decompressed (or copied) bytes to the page body buffer, growing it as
+ * needed. Only an exhausted heap stops it (return <0), which makes the streaming
+ * inflater halt cleanly rather than failing outright — no fixed size cap. */
 static int raw_sink(void *ctx, const unsigned char *p, unsigned n)
 {
 	(void)ctx;
-	for (unsigned i = 0; i < n; i++) {
-		if (B->raw_len >= RAW_MAX)
-			return -1;
+	if (!ensure_raw(B->raw_len + (int)n))
+		return -1;
+	for (unsigned i = 0; i < n; i++)
 		B->raw[B->raw_len++] = (char)p[i];
-	}
 	return 0;
 }
 
@@ -305,24 +238,49 @@ static void derive_filename(const char *url, char *out, int cap)
 	sapp(out, &k, cap, "download.bin");
 }
 
+/* owofs caps each path component at 63 chars (FS_NAME_LEN - 1); a longer leaf
+ * makes fs_stream_begin reject the whole path, which surfaced as a bogus
+ * "disk full" download failure for any file whose name exceeds that. */
+#define DL_LEAF_MAX 63
+
 /* Build DL_DIR/<base> for attempt 0, or DL_DIR/<stem>-<n><ext> for n>=1, so a
- * repeated download lands beside the original instead of clobbering it. */
+ * repeated download lands beside the original instead of clobbering it. The
+ * leaf is clamped to owofs's component limit, truncating the stem (never the
+ * extension or the collision suffix) so e.g. "annual-report-2026-final.pdf"
+ * still lands as a valid "annual-rep.pdf". */
 static void build_path(const char *base, int n, char *out, int cap)
 {
-	int p = 0;
-	sapp(out, &p, cap, DL_DIR "/");
-	if (n == 0) { sapp(out, &p, cap, base); return; }
+	/* Split base into stem and ".ext" at the last dot (a leading dot doesn't
+	 * count -- a dotfile has no extension to preserve). */
 	int dot = -1;
 	for (int i = 0; base[i]; i++) if (base[i] == '.') dot = i;
-	if (dot <= 0) {                                /* no usable extension      */
-		sapp(out, &p, cap, base);
-		sapp(out, &p, cap, "-"); uapp(out, &p, cap, (unsigned)n);
-	} else {
-		for (int i = 0; i < dot && p < cap - 1; i++) out[p++] = base[i];
-		out[p] = '\0';
-		sapp(out, &p, cap, "-"); uapp(out, &p, cap, (unsigned)n);
-		sapp(out, &p, cap, base + dot);            /* ".ext"                   */
+	int stem_len = (dot > 0) ? dot : (int)strlen(base);
+	const char *ext = (dot > 0) ? base + dot : "";
+	int ext_len = (int)strlen(ext);
+
+	/* Collision suffix "-N" (empty for the first attempt). */
+	char sfx[8]; int sl = 0;
+	if (n > 0) { sfx[sl++] = '-'; uapp(sfx, &sl, (int)sizeof sfx, (unsigned)n); }
+	sfx[sl] = '\0';
+
+	/* A pathologically long extension can't fit either; cap it, leaving room
+	 * for the suffix and at least one stem char. */
+	if (ext_len > DL_LEAF_MAX - sl - 1) {
+		ext_len = DL_LEAF_MAX - sl - 1;
+		if (ext_len < 0) ext_len = 0;
 	}
+	/* Truncate the stem so stem + suffix + ext fits the component limit. */
+	int budget = DL_LEAF_MAX - sl - ext_len;
+	if (budget < 1) budget = 1;
+	if (stem_len > budget) stem_len = budget;
+
+	int p = 0;
+	sapp(out, &p, cap, DL_DIR "/");
+	for (int i = 0; i < stem_len && p < cap - 1; i++) out[p++] = base[i];
+	out[p] = '\0';
+	sapp(out, &p, cap, sfx);
+	for (int i = 0; i < ext_len && p < cap - 1; i++) out[p++] = ext[i];
+	out[p] = '\0';
 }
 
 /* inflate sink: push decompressed bytes straight to the open stream, halting the
@@ -412,80 +370,71 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
                           char *loc, int loc_cap, int *chunked, int *have_len,
                           unsigned *content_len, int *enc_gz)
 {
-	int status = 0;
-	{
-		const char *s = hdr;
-		while (*s && *s != ' ') s++;
-		while (*s == ' ') s++;
-		while (*s >= '0' && *s <= '9') status = status * 10 + (*s++ - '0');
+	*chunked = 0; *have_len = 0; *enc_gz = 0; *content_len = 0;
+	B->nosniff = false;
+
+	/* Parse the raw block once into a k/v object, then just query it. */
+	struct http_headers H;
+	http_headers_parse(&H, hdr);
+	int status = H.status;
+
+	const char *te = http_headers_get(&H, "transfer-encoding");
+	if (te && http_header_has_token(te, "chunked")) *chunked = 1;
+
+	const char *ce = http_headers_get(&H, "content-encoding");
+	if (ce && (http_header_has_token(ce, "gzip") || http_header_has_token(ce, "deflate")))
+		*enc_gz = 1;
+
+	const char *cl = http_headers_get(&H, "content-length");
+	if (cl) { bool ok; unsigned x = http_parse_uint(cl, &ok); if (ok) { *content_len = x; *have_len = 1; } }
+
+	const char *loc_v = http_headers_get(&H, "location");
+	if (loc_v) resolve_url(full_url, loc_v, loc, loc_cap);
+
+	const char *ct = http_headers_get(&H, "content-type");
+	if (ct) {
+		int k = 0;
+		for (const char *v = ct; *v && *v != ';' && k < (int)sizeof B->ctype - 1; v++)
+			B->ctype[k++] = lower(*v);
+		B->ctype[k] = '\0';
 	}
 
-	*chunked = 0; *have_len = 0; *enc_gz = 0; *content_len = 0;
-	for (const char *line = hdr; *line; ) {
-		if (starts_ci(line, "transfer-encoding:")) {
-			for (const char *q = line; *q && *q != '\n'; q++)
-				if (starts_ci(q, "chunked")) { *chunked = 1; break; }
-		} else if (starts_ci(line, "content-encoding:")) {
-			for (const char *q = line; *q && *q != '\n'; q++)
-				if (starts_ci(q, "gzip") || starts_ci(q, "deflate")) {
-					*enc_gz = 1; break;
-				}
-		} else if (starts_ci(line, "content-length:")) {
-			const char *v = line + 15;
-			while (*v == ' ') v++;
-			unsigned x = 0;
-			while (*v >= '0' && *v <= '9') x = x * 10 + (unsigned)(*v++ - '0');
-			*content_len = x; *have_len = 1;
-		} else if (starts_ci(line, "location:")) {
-			const char *v = line + 9;
-			while (*v == ' ') v++;
-			char raw[URL_MAX]; int r = 0;
-			while (*v && *v != '\r' && *v != '\n' && r < (int)sizeof raw - 1)
-				raw[r++] = *v++;
-			raw[r] = '\0';
-			resolve_url(full_url, raw, loc, loc_cap);
-		} else if (starts_ci(line, "content-type:")) {
-			const char *v = line + 13;
-			while (*v == ' ') v++;
+	const char *cd = http_headers_get(&H, "content-disposition");
+	if (cd) {
+		if (http_header_has_token(cd, "attachment")) B->cdisp_attach = 1;
+		for (const char *q = cd; *q; q++) {
+			if (!starts_ci(q, "filename")) continue;
+			const char *f = q + 8;
+			if (*f == '*') continue;                /* skip the filename*= form */
+			while (*f == ' ') f++;
+			if (*f != '=') continue;
+			f++;
+			while (*f == ' ') f++;
+			int quoted = (*f == '"'); if (quoted) f++;
 			int k = 0;
-			while (*v && *v != '\r' && *v != '\n' && *v != ';' &&
-			       k < (int)sizeof B->ctype - 1)
-				B->ctype[k++] = lower(*v++);
-			B->ctype[k] = '\0';
-		} else if (starts_ci(line, "content-disposition:")) {
-			const char *v = line + 20;
-			for (const char *q = v; *q && *q != '\n'; q++)
-				if (starts_ci(q, "attachment")) { B->cdisp_attach = 1; break; }
-			for (const char *q = v; *q && *q != '\n'; q++) {
-				if (!starts_ci(q, "filename")) continue;
-				const char *f = q + 8;
-				if (*f == '*') continue;
-				while (*f == ' ') f++;
-				if (*f != '=') continue;
-				f++;
-				while (*f == ' ') f++;
-				int quoted = (*f == '"'); if (quoted) f++;
-				int k = 0;
-				while (*f && *f != '\r' && *f != '\n' &&
-				       k < (int)sizeof B->dl_name - 1) {
-					if (quoted ? (*f == '"') : (*f == ';' || *f == ' ')) break;
-					B->dl_name[k++] = *f++;
-				}
-				B->dl_name[k] = '\0';
-				break;
+			while (*f && k < (int)sizeof B->dl_name - 1) {
+				if (quoted ? (*f == '"') : (*f == ';' || *f == ' ')) break;
+				B->dl_name[k++] = *f++;
 			}
-		} else if (starts_ci(line, "set-cookie:")) {
-			const char *v = line + 11;
-			while (*v == ' ') v++;
-			cookie_store(host, v);
-		} else if (starts_ci(line, "strict-transport-security:")) {
-			hsts_add(host);
+			B->dl_name[k] = '\0';
+			break;
 		}
-		const char *eol = line;
-		while (*eol && *eol != '\n') eol++;
-		if (!*eol) break;
-		line = eol + 1;
 	}
+
+	/* Set-Cookie may appear several times — store every one. */
+	int ncookie = http_headers_count(&H, "set-cookie");
+	for (int i = 0; i < ncookie; i++)
+		cookie_store(host, http_headers_at(&H, "set-cookie", i));
+
+	if (http_headers_get(&H, "strict-transport-security")) hsts_add(host);
+
+	/* nosniff: the server forbids MIME-sniffing — honour the declared
+	 * Content-Type and never guess the body's type (see render_raw). */
+	const char *xcto = http_headers_get(&H, "x-content-type-options");
+	if (xcto && http_header_has_token(xcto, "nosniff")) B->nosniff = true;
+
+	http_headers_free(&H);
+	jar_flush();   /* persist cookies/HSTS once, if this response changed them */
 	return status;
 }
 
@@ -526,7 +475,7 @@ static int h2_headers_cb(void *ctx, const char *block, int len)
 
 /* Body sink: stream to the download file (discarding if it failed to open — a
  * download is never rendered), or accumulate a renderable body into B->raw
- * (truncating at RAW_MAX). Returns non-zero to stop the transfer. */
+ * (grown on demand, no size cap). Returns non-zero to stop the transfer. */
 static int h2_body_cb(void *ctx, const unsigned char *p, int n)
 {
 	struct h2tx *h = ctx;
@@ -534,10 +483,9 @@ static int h2_body_cb(void *ctx, const unsigned char *p, int n)
 		if (h->dl_open && stream_write(p, n) < 0) { h->dl_fail = 1; return 1; }
 		return 0;
 	}
-	for (int i = 0; i < n; i++) {
-		if (B->raw_len >= RAW_MAX) return 1;       /* full: stop (truncate)   */
+	if (!ensure_raw(B->raw_len + n)) return 1;      /* out of memory: stop      */
+	for (int i = 0; i < n; i++)
 		B->raw[B->raw_len++] = (char)p[i];
-	}
 	return 0;
 }
 
@@ -662,8 +610,10 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 		inflate_http(body_src, &bs, raw_sink, 0);
 	} else {
 		int c;
-		while ((c = body_src(&bs)) >= 0 && B->raw_len < RAW_MAX)
+		while ((c = body_src(&bs)) >= 0) {
+			if (!ensure_raw(B->raw_len + 1)) break;   /* out of memory: stop */
 			B->raw[B->raw_len++] = (char)c;
+		}
 	}
 
 	net_close(B->sock);
@@ -680,11 +630,143 @@ static int memrd_get(void *c)
 	return m->pos < m->len ? m->p[m->pos++] : -1;
 }
 
-/* Fetch one inline <img> (index `i`) as a sub-resource of `page_url`, into B->raw
- * then appended to img_pool. A PNG that fits gets its dimensions peeked and ok=1;
- * anything else leaves ok=0 so the layout shows an alt box. Single-hop only
- * (a redirect on an image just drops it). */
-static void fetch_one_image(int i, const char *page_url)
+/* Self-contained per-thread HTTP reader: several images fetch in parallel, each
+ * over its OWN socket/buffer, so they never touch B->sock/B->raw (which only the
+ * page fetch uses). The kernel TLS is multi-flow, so the HTTPS handshakes run
+ * concurrently. */
+struct ireader { int sock; unsigned char buf[2048]; int pos, len, eof; };
+static int ir_getc(struct ireader *r)
+{
+	if (r->pos >= r->len) {
+		if (r->eof) return -1;
+		int n = net_recv(r->sock, r->buf, (int)sizeof r->buf);
+		if (n <= 0) { r->eof = 1; return -1; }
+		r->pos = 0; r->len = n;
+	}
+	return r->buf[r->pos++];
+}
+
+/* Append one byte to a malloc'd, doubling body buffer (capped at RAW_MAX).
+ * Returns 0, or -1 if full / out of memory (the caller stops). */
+static int body_put(unsigned char **body, int *cap, int *blen, int c)
+{
+	if (*blen >= *cap) {
+		int ncap = *cap * 2;
+		if (ncap > (int)RAW_MAX) ncap = RAW_MAX;
+		if (*blen >= ncap) return -1;             /* hit the cap */
+		unsigned char *nb = realloc(*body, (unsigned)ncap);
+		if (!nb) return -1;
+		*body = nb; *cap = ncap;
+	}
+	(*body)[(*blen)++] = (unsigned char)c;
+	return 0;
+}
+
+/* Read a 200 response's body (chunked / content-length / read-to-close) off an
+ * open image request into a freshly malloc'd buffer. Returns it (caller frees)
+ * with *outlen set, or NULL on a non-200 / error. Bounded by RAW_MAX. */
+static unsigned char *read_http_body(struct ireader *r, int *outlen)
+{
+	char hdr[2048]; int hl = 0, m = 0;
+	for (;;) {
+		int c = ir_getc(r);
+		if (c < 0) return 0;
+		if (hl < (int)sizeof hdr - 1) hdr[hl++] = (char)c;
+		if      (c == '\r') m = (m == 2) ? 3 : 1;
+		else if (c == '\n') m = (m == 1) ? 2 : (m == 3 ? 4 : 0);
+		else                m = 0;
+		if (m == 4) break;
+	}
+	hdr[hl] = '\0';
+
+	int status = 0;
+	{ const char *s = hdr; while (*s && *s != ' ') s++; while (*s == ' ') s++;
+	  while (*s >= '0' && *s <= '9') status = status * 10 + (*s++ - '0'); }
+	if (status != 200) return 0;
+
+	int chunked = 0; long clen = -1;
+	for (const char *line = hdr; *line; ) {
+		if (starts_ci(line, "content-length:")) {
+			const char *v = line + 15; while (*v == ' ') v++;
+			clen = 0; while (*v >= '0' && *v <= '9') clen = clen * 10 + (*v++ - '0');
+		} else if (starts_ci(line, "transfer-encoding:")) {
+			for (const char *q = line; *q && *q != '\n'; q++)
+				if (starts_ci(q, "chunked")) { chunked = 1; break; }
+		}
+		const char *e = line; while (*e && *e != '\n') e++;
+		if (!*e) break;
+		line = e + 1;
+	}
+
+	int cap = (clen > 0 && clen < (long)RAW_MAX) ? (int)clen + 1 : 65536;
+	unsigned char *body = malloc((unsigned)cap);
+	if (!body) return 0;
+	int blen = 0;
+
+	if (chunked) {
+		for (;;) {
+			unsigned sz = 0; int c, any = 0;
+			while ((c = ir_getc(r)) >= 0 && c != '\r' && c != ';') {
+				int d;
+				if      (c >= '0' && c <= '9') d = c - '0';
+				else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+				else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+				else break;
+				sz = sz * 16 + (unsigned)d; any = 1;
+			}
+			while (c >= 0 && c != '\n') c = ir_getc(r);
+			if (!any || sz == 0) break;
+			for (unsigned k = 0; k < sz; k++) {
+				c = ir_getc(r);
+				if (c < 0 || body_put(&body, &cap, &blen, c) < 0) goto done;
+			}
+			c = ir_getc(r); if (c == '\r') ir_getc(r);   /* trailing CRLF */
+		}
+	} else {
+		long limit = (clen >= 0) ? clen : (long)RAW_MAX;
+		while (blen < limit) {
+			int c = ir_getc(r);
+			if (c < 0 || body_put(&body, &cap, &blen, c) < 0) break;
+		}
+	}
+done:
+	*outlen = blen;
+	return body;
+}
+
+/* --- parallel inline-image fetching ---------------------------------------
+ * A small pool of threads fetches the page's images concurrently. Each thread
+ * reads an image into a malloc'd buffer, then commits it into the shared
+ * img_pool: a short lock guards only the bump of img_pool_len; the byte copy and
+ * the per-image metadata go to disjoint regions, so they need no lock. */
+#define IMG_FETCHERS    4
+#define IMG_FETCH_STACK (32 * 1024)
+
+static char         g_img_page[URL_MAX];   /* page URL the fetchers resolve against */
+static volatile int g_img_next;            /* next image index to claim             */
+static volatile int g_img_lock;            /* guards g_img_next + the pool bump      */
+
+static int img_xchg(volatile int *p, int v)
+{ __asm__ volatile ("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory"); return v; }
+static void img_lock(void)   { while (img_xchg(&g_img_lock, 1)) msleep(0); }
+static void img_unlock(void) { __asm__ volatile ("" ::: "memory"); g_img_lock = 0; }
+
+/* Claim the next eager (non-lazy) image index, or -1 when none remain. */
+static int img_claim_next(void)
+{
+	int got = -1;
+	img_lock();
+	while (g_img_next < B->n_imgs) {
+		int i = g_img_next++;
+		if (!B->imgs[i].lazy) { got = i; break; }
+	}
+	img_unlock();
+	return got;
+}
+
+/* Fetch inline image `i` over its own socket and commit it to img_pool. Safe to
+ * run on several threads at once. */
+static void fetch_image(int i, const char *page_url)
 {
 	struct inl_img *im = &B->imgs[i];
 	im->ok = 0;
@@ -695,37 +777,99 @@ static void fetch_one_image(int i, const char *page_url)
 	if (!parse_url(full, &u)) return;
 	if (!u.tls && hsts_has(u.host)) { u.tls = 1; if (u.port == 80) u.port = 443; }
 
-	char loc[URL_MAX];
-	int st = http_txn(&u, full, loc, sizeof loc, 0);
-	if (st != 200 || B->raw_len < 8) return;
-	if ((unsigned char)B->raw[0] != 0x89 || B->raw[1] != 'P' ||
-	    B->raw[2] != 'N' || B->raw[3] != 'G') return;                /* PNG only */
-	if (B->img_pool_len + B->raw_len > IMG_POOL) return;             /* no room  */
+	int sock = net_connect(u.host, u.port, u.tls ? SK_TLS : SK_TCP);
+	if (sock < 0) return;
 
-	im->coff = B->img_pool_len;
-	im->clen = B->raw_len;
-	for (int k = 0; k < B->raw_len; k++)
-		B->img_pool[im->coff + k] = (unsigned char)B->raw[k];
-	B->img_pool_len += B->raw_len;
-
-	struct memrd mr = { B->img_pool + im->coff, 0, im->clen };
-	unsigned iw = 0, ih = 0;
-	if (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih) {
-		im->iw = iw; im->ih = ih; im->ok = 1;
+	char req[1024]; int n = 0;
+	sapp(req, &n, sizeof req, "GET ");
+	sapp(req, &n, sizeof req, u.path);
+	sapp(req, &n, sizeof req, " HTTP/1.1\r\nHost: ");
+	sapp(req, &n, sizeof req, u.host);
+	if (!((u.tls && u.port == 443) || (!u.tls && u.port == 80))) {
+		sapp(req, &n, sizeof req, ":");
+		uapp(req, &n, sizeof req, (unsigned)u.port);
 	}
+	{
+		char ck[1024];
+		if (cookie_header(u.host, ck, sizeof ck) > 0) {
+			sapp(req, &n, sizeof req, "\r\nCookie: ");
+			sapp(req, &n, sizeof req, ck);
+		}
+	}
+	sapp(req, &n, sizeof req,
+	     "\r\nUser-Agent: " BR_UA "\r\nAccept: image/png,*/*\r\nConnection: close\r\n\r\n");
+	if (net_send(sock, req, n) < 0) { net_close(sock); return; }
+
+	struct ireader r = { sock, { 0 }, 0, 0, 0 };
+	int blen = 0;
+	unsigned char *body = read_http_body(&r, &blen);
+	net_close(sock);
+	if (!body) return;
+
+	if (blen >= 8 && body[0] == 0x89 && body[1] == 'P' &&
+	    body[2] == 'N' && body[3] == 'G') {            /* PNG only */
+		struct memrd mr = { body, 0, blen };
+		unsigned iw = 0, ih = 0;
+		int okdim = (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih);
+
+		int off = -1;
+		img_lock();
+		if (B->img_pool_len + blen <= IMG_POOL) {
+			off = B->img_pool_len;
+			B->img_pool_len += blen;
+		}
+		img_unlock();
+		if (off >= 0) {
+			memcpy(B->img_pool + off, body, (unsigned)blen);  /* disjoint: no lock */
+			im->coff = off; im->clen = blen;
+			if (okdim) { im->iw = iw; im->ih = ih; }
+			im->ok = okdim;            /* set last: the UI draws once ok is seen */
+			B->seq++;                  /* repaint as each image lands            */
+		}
+	}
+	free(body);
 }
 
-/* Fetch the page's *eager* inline images up front (loading != "lazy"). A
- * loading="lazy" image is left untouched until it scrolls into view, when the UI
- * flags it and the worker calls fetch_lazy_visible(). */
+/* The fetch loop each pool thread (and the worker itself) runs: claim images
+ * until none remain. */
+static void img_fetch_loop(void)
+{
+	int i;
+	while ((i = img_claim_next()) >= 0)
+		fetch_image(i, g_img_page);
+}
+
+static void img_fetcher_thread(void)
+{
+	img_fetch_loop();
+	exit(0);                           /* a thread fn must not return */
+}
+
+/* Fetch the page's *eager* inline images (loading != "lazy") in PARALLEL: spawn
+ * a few helper threads, fetch alongside them on this (worker) thread, then join.
+ * loading="lazy" images are left for fetch_lazy_visible() when scrolled in. */
 static void fetch_inline_images(const char *page_url)
 {
 	B->img_pool_len = 0;
-	for (int i = 0; i < B->n_imgs; i++) {
-		if (B->imgs[i].lazy) continue;             /* deferred until on-screen   */
-		fetch_one_image(i, page_url);
-		B->imgs[i].fetched = 1;
-		B->seq++;                  /* let the UI re-layout as each image lands  */
+	{ int k = 0; g_img_page[0] = '\0'; sapp(g_img_page, &k, sizeof g_img_page, page_url); }
+	g_img_next = 0;
+
+	int   tids[IMG_FETCHERS - 1];
+	char *stks[IMG_FETCHERS - 1];
+	int   nthr = 0;
+	for (int t = 0; t < IMG_FETCHERS - 1; t++) {
+		char *stk = malloc(IMG_FETCH_STACK);
+		if (!stk) break;
+		int tid = thread_create(img_fetcher_thread, stk + IMG_FETCH_STACK);
+		if (tid < 0) { free(stk); break; }
+		stks[nthr] = stk; tids[nthr] = tid; nthr++;
+	}
+
+	img_fetch_loop();                  /* this thread fetches too */
+
+	for (int t = 0; t < nthr; t++) {   /* wait for the helpers, free their stacks */
+		thread_join(tids[t]);
+		free(stks[t]);
 	}
 }
 
@@ -741,7 +885,7 @@ int fetch_lazy_visible(void)
 		struct inl_img *im = &B->imgs[i];
 		if (!im->lazy || im->fetched || !im->want)
 			continue;
-		fetch_one_image(i, B->cur_url);
+		fetch_image(i, B->cur_url);
 		im->fetched = 1; im->want = 0;
 		B->seq++;                  /* re-layout now that the image has landed   */
 		return 1;
@@ -969,7 +1113,13 @@ static int b64val(int c)
  * all three pick the display mode the same way. Does not fetch sub-resources. */
 static void render_raw(const char *url)
 {
-	if (B->ctype[0] == '\0' || has_sub(B->ctype, "html")) {
+	/* HTML rendering normally also covers an empty/missing Content-Type (sloppy
+	 * servers). But X-Content-Type-Options: nosniff forbids that guess: with it
+	 * set, render as HTML ONLY when the server explicitly declared an HTML type,
+	 * otherwise fall through to plain text. */
+	int as_html = has_sub(B->ctype, "html") ||
+	              (B->ctype[0] == '\0' && !B->nosniff);
+	if (as_html) {
 		B->mode = MODE_HTML; html_to_text();
 	} else if (starts_ci(B->ctype, "image/png")) {
 		B->mode = MODE_IMAGE;
@@ -1003,8 +1153,8 @@ static void ctype_from_ext(const char *path)
 }
 
 /* file:// — read a file from the local FS (owofs or a /media mount) into B->raw,
- * bounded by RAW_MAX and streamed so a file larger than the read buffer still
- * loads. Accepts file:/path, file://host/path (host ignored), file:///path; a
+ * streamed and grown on demand so a file of any size loads (bounded only by
+ * memory). Accepts file:/path, file://host/path (host ignored), file:///path; a
  * trailing ?query or #fragment is dropped. Returns 0, or -1 if it can't open. */
 static int load_file_url(const char *url)
 {
@@ -1024,10 +1174,8 @@ static int load_file_url(const char *url)
 	B->raw_len = 0;
 	unsigned off = 0;
 	for (;;) {
-		int want = RAW_MAX - B->raw_len;
-		if (want <= 0) break;
-		if (want > 4096) want = 4096;
-		int got = readfile_at(path, off, B->raw + B->raw_len, (unsigned)want);
+		if (!ensure_raw(B->raw_len + 4096)) break;   /* out of memory: stop */
+		int got = readfile_at(path, off, B->raw + B->raw_len, 4096);
 		if (got < 0) return -1;
 		if (got == 0) break;            /* end of file                       */
 		B->raw_len += got;
@@ -1077,12 +1225,13 @@ static int load_data_url(const char *url)
 			acc = (acc << 6) | v; nb += 6;
 			if (nb >= 8) {
 				nb -= 8;
-				if (B->raw_len >= RAW_MAX) break;
+				if (!ensure_raw(B->raw_len + 1)) break;
 				B->raw[B->raw_len++] = (char)((acc >> nb) & 0xff);
 			}
 		}
 	} else {
-		for (; *d && B->raw_len < RAW_MAX; d++) {
+		for (; *d; d++) {
+			if (!ensure_raw(B->raw_len + 1)) break;
 			int c = (unsigned char)*d;
 			if (c == '%') {
 				int hi = hexval((unsigned char)d[1]);

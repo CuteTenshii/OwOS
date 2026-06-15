@@ -13,7 +13,15 @@
 #include "uwin.h"
 #include <stdint.h>
 
-#define MAX_TASKS   16
+/* Total tasks (processes + kernel/user threads). This must comfortably exceed
+ * the steady-state set — the WM, the terminal, every auto-started service daemon
+ * (servicesd/smbd/dhcp/...), boot_bringup, the screenshot worker — PLUS what an
+ * app needs at once: the browser alone is its process, a fetch worker, and one
+ * thread per inline image. At 16 a freshly-opened browser left no free slot, so
+ * launching any other program failed ("failed to launch ..."). Only the tasks[]
+ * array scales with this; each slot's kernel stack is kmalloc'd on demand, so
+ * the real ceiling is the kernel heap (alloc fails gracefully). */
+#define MAX_TASKS   64
 /* Every timer tick, timer_handler() runs nic_poll() -> the full IP/TCP/UDP RX
  * path BEFORE schedule(), nested in the IRQ on whatever thread it interrupted
  * (real hosts/VMware poll the NIC off the tick because its INTx never reaches
@@ -42,6 +50,8 @@ typedef struct task {
 	uint32_t      id;
 	uint32_t      parent;      /* pid of the task that created it              */
 	int           wait_pid;    /* pid being waited on while WAITING            */
+	uint32_t      wake_tick;   /* if WAITING for a timed sleep: tick to wake at
+	                            * (0 = not a timed sleep, e.g. a waitpid waiter) */
 	int           exit_status; /* set on exit, read by waitpid                 */
 	volatile int  intr;        /* cooperative-interrupt latch (Ctrl+C / SIGINT) */
 	const char   *name;
@@ -49,6 +59,8 @@ typedef struct task {
 	uint32_t      runs;
 	struct fd     fds[MAX_FD]; /* open file descriptors                        */
 	char          cwd[TASK_CWD_MAX]; /* working dir; relative path syscalls join here */
+	uint32_t      uid;         /* owning user id (credentials; inherited like cwd)    */
+	uint32_t      gid;         /* owning primary group id                             */
 	uint32_t      brk;         /* user-space heap break; 0 = no heap (thread/kthread) */
 	uint32_t      brk_base;    /* heap start (image end); sbrk can't shrink below it  */
 	struct task  *next;
@@ -147,6 +159,7 @@ void sched_init(void)
 	t->state = TASK_RUNNABLE;
 	t->intr = 0;
 	t->brk = t->brk_base = 0;      /* no user heap                             */
+	t->uid = t->gid = 0;           /* the boot session runs as root            */
 	cwd_set(t->cwd, "/");
 	t->next = t;
 	current = t;
@@ -205,6 +218,8 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
 	t->intr = 0;
 	fds_init_console(t);
 	cwd_set(t->cwd, current->cwd);   /* inherit the spawner's cwd by default */
+	t->uid = current->uid;           /* and its credentials (uid/gid)         */
+	t->gid = current->gid;
 
 	uint8_t *kstack = kmalloc(UKSTACK_SIZE);
 	t->kstack = kstack;
@@ -294,6 +309,8 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
 	t->intr = 0;
 	fds_init_console(t);
 	cwd_set(t->cwd, current->cwd);
+	t->uid = current->uid;
+	t->gid = current->gid;
 
 	uint8_t *kstack = kmalloc(UKSTACK_SIZE);
 	if (!kstack) { t->state = TASK_FREE; return -1; }
@@ -345,6 +362,8 @@ int sched_fork(struct registers *r)
 	{	task_t *o = heap_owner_of(current);
 		t->brk = o->brk; t->brk_base = o->brk_base; }
 	cwd_set(t->cwd, current->cwd);
+	t->uid = current->uid;
+	t->gid = current->gid;
 
 	/* The child inherits the parent's open files (Unix semantics). */
 	for (int i = 0; i < MAX_FD; i++) {
@@ -454,6 +473,16 @@ void sched_set_cwd_self(const char *path)
 const char *sched_cwd(void)
 {
 	return current->cwd;
+}
+
+/* Per-process credentials. The current task's uid/gid, and a setter that
+ * switches the caller's identity (login/su, after the password check). */
+uint32_t sched_uid(void) { return current->uid; }
+uint32_t sched_gid(void) { return current->gid; }
+void sched_set_creds_self(uint32_t uid, uint32_t gid)
+{
+	current->uid = uid;
+	current->gid = gid;
 }
 
 void sched_yield(void)

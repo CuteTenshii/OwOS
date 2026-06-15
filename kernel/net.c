@@ -1081,6 +1081,7 @@ static int append(char *dst, int n, int cap, const char *s)
 static uint8_t curl_ibuf[2048];
 static int     curl_ipos, curl_ilen, curl_iclosed;
 static int     curl_tls;
+static int     curl_th = -1;            /* TLS session handle when curl_tls    */
 static tcp_conn_t *curl_conn;           /* the bare-TCP connection (non-TLS)   */
 
 static int curl_getc(void)              /* next byte; -1 at EOF, -2 on reset   */
@@ -1088,7 +1089,7 @@ static int curl_getc(void)              /* next byte; -1 at EOF, -2 on reset   *
 	if (curl_ipos >= curl_ilen) {
 		if (curl_iclosed)
 			return -1;
-		int r = curl_tls ? tls_read(curl_ibuf, sizeof(curl_ibuf), &curl_iclosed)
+		int r = curl_tls ? tls_read(curl_th, curl_ibuf, sizeof(curl_ibuf), &curl_iclosed)
 		                  : tcp_read(curl_conn, curl_ibuf, sizeof(curl_ibuf), &curl_iclosed);
 		if (r < 0)
 			return -2;
@@ -1245,7 +1246,8 @@ int net_curl(const char *arg)
 	}
 	int ok;
 	if (use_tls) {
-		ok = tls_connect(ip, port, host, /*offer_h2=*/0);
+		curl_th = tls_connect(ip, port, host, /*offer_h2=*/0);
+		ok = curl_th >= 0;
 	} else {
 		curl_conn = tcp_connect(ip, port);
 		ok = curl_conn != NULL;
@@ -1267,7 +1269,7 @@ int net_curl(const char *arg)
 	n = append(req, n, sizeof(req),
 		   "\r\nUser-Agent: owos\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n");
 	if (use_tls)
-		tls_write(req, (uint32_t)n);
+		tls_write(curl_th, req, (uint32_t)n);
 	else
 		tcp_write(curl_conn, req, (uint32_t)n);
 
@@ -1281,7 +1283,7 @@ int net_curl(const char *arg)
 		if (ci < 0) {
 			con_write("curl: no response from server\n");
 			if (use_tls)
-				tls_close();
+				tls_close(curl_th);
 			else
 				tcp_close(curl_conn);
 			return -1;
@@ -1337,7 +1339,7 @@ int net_curl(const char *arg)
 		con_write(outname);
 		con_putc('\n');
 		if (use_tls)
-			tls_close();
+			tls_close(curl_th);
 		else
 			tcp_close(curl_conn);
 		return -1;
@@ -1353,7 +1355,7 @@ int net_curl(const char *arg)
 		if (!curl_gzbuf) {
 			con_write("curl: out of memory for gzip body\n");
 			if (use_tls)
-				tls_close();
+				tls_close(curl_th);
 			else
 				tcp_close(curl_conn);
 			if (save)
@@ -1403,7 +1405,7 @@ int net_curl(const char *arg)
 	}
 body_done:
 	if (use_tls)
-		tls_close();
+		tls_close(curl_th);
 	else
 		tcp_close(curl_conn);
 
@@ -1477,15 +1479,17 @@ int net_http_get(const char *url, uint8_t *buf, uint32_t cap)
  * A thin, handle-based connection table so user programs (the curl in
  * user/curl.c) can drive the kernel transport without a built-in doing the
  * HTTP itself. Deliberately tiny: connect (DNS + TCP + optional TLS), send,
- * recv (blocking, EOF-terminated), close. TLS is single-flow in tls.c, so at
- * most one handle may be a TLS session at a time. */
-#define NET_SOCK_MAX  4
+ * recv (blocking, EOF-terminated), close. TLS is multi-flow (tls.c keeps a pool
+ * of sessions), so several handles can be TLS at once — e.g. a browser fetching
+ * images over parallel HTTPS connections. */
+#define NET_SOCK_MAX  8
 #define SOCK_DGRAM    1500   /* one datagram's worth of rx per UDP/ICMP socket */
 #define SOCK_DGRING   16     /* datagrams buffered per UDP/ICMP socket         */
 static struct usock {
 	uint8_t      used;
 	uint8_t      proto;        /* SK_TCP / SK_TLS / SK_UDP / SK_ICMP          */
 	uint8_t      closed;       /* peer FIN / close_notify already seen (TCP)  */
+	int          tls;          /* TLS session handle (SK_TLS only; else -1)   */
 	tcp_conn_t  *conn;         /* bare-TCP connection (TCP only)              */
 	uint8_t      peer[4];      /* UDP/ICMP destination                        */
 	uint16_t     lport, rport; /* UDP local / remote ports                    */
@@ -1578,31 +1582,40 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
 		if (!usocks[i].used) { h = i; break; }
 	if (h < 0)
 		return -1;
-	if (proto == SK_TLS)
-		for (int i = 0; i < NET_SOCK_MAX; i++)
-			if (usocks[i].used && usocks[i].proto == SK_TLS)
-				return -1;            /* TLS is single-flow */
 
-	uint8_t ip[4];
-	if (!parse_ipv4(host, ip) && !dns_resolve(host, ip))
-		return sched_intr_pending() ? -4 : -2;
-
+	/* Reserve the slot NOW, before any blocking call (DNS/handshake re-enable
+	 * interrupts and yield), so a concurrent connect on another thread — now
+	 * possible with several TLS sessions in flight — can't claim the same slot.
+	 * Every failure path below releases it. */
 	struct usock *s = &usocks[h];
+	s->used = 1;
 	s->proto = (uint8_t)proto;
 	s->closed = 0;
 	s->conn = NULL;
+	s->tls = -1;
 	s->dg_head = s->dg_tail = 0;
+
+	uint8_t ip[4];
+	if (!parse_ipv4(host, ip) && !dns_resolve(host, ip)) {
+		s->used = 0;
+		return sched_intr_pending() ? -4 : -2;
+	}
 	for (int i = 0; i < 4; i++) s->peer[i] = ip[i];
 
 	switch (proto) {
 	case SK_TLS:
-		if (!tls_connect(ip, port, host, offer_h2))
+		s->tls = tls_connect(ip, port, host, offer_h2);
+		if (s->tls < 0) {
+			s->used = 0;
 			return sched_intr_pending() ? -4 : -3;
+		}
 		break;
 	case SK_TCP:
 		s->conn = tcp_connect(ip, port);
-		if (!s->conn)
+		if (!s->conn) {
+			s->used = 0;
 			return sched_intr_pending() ? -4 : -3;
+		}
 		break;
 	case SK_UDP:
 		s->rport = port;
@@ -1612,9 +1625,9 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
 		s->lport = s->rport = 0;
 		break;
 	default:
+		s->used = 0;
 		return -1;
 	}
-	s->used = 1;
 	return h;
 }
 
@@ -1624,7 +1637,7 @@ int net_sock_send(int h, const void *buf, uint32_t len)
 		return -1;
 	struct usock *s = &usocks[h];
 	switch (s->proto) {
-	case SK_TLS:  return tls_write(buf, len);
+	case SK_TLS:  return tls_write(s->tls, buf, len);
 	case SK_TCP:  return tcp_write(s->conn, buf, len);
 	case SK_UDP:
 		net_udp_send(s->peer, s->rport, s->lport, buf, len);
@@ -1648,7 +1661,7 @@ int net_sock_recv(int h, void *buf, uint32_t max)
 	if (s->closed)
 		return 0;
 	int closed = 0;
-	int r = s->proto == SK_TLS ? tls_read(buf, max, &closed)
+	int r = s->proto == SK_TLS ? tls_read(s->tls, buf, max, &closed)
 	                           : tcp_read(s->conn, buf, max, &closed);
 	if (r == TCP_EINTR)
 		return -4;
@@ -1659,17 +1672,46 @@ int net_sock_recv(int h, void *buf, uint32_t max)
 	return r;
 }
 
+/* Non-blocking recv. TCP/TLS: >0 bytes, 0 would-block (no data yet, connection
+ * still open), -1 error/EOF, -4 intr. UDP/ICMP: same as the blocking path
+ * (it already returns 0 on timeout). Lets an interactive client (ssh) poll the
+ * socket alongside stdin without the blocking path's 5 s idle auto-close
+ * tearing down a session that's merely waiting for the user to type. */
+int net_sock_recv_nb(int h, void *buf, uint32_t max)
+{
+	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
+		return -1;
+	struct usock *s = &usocks[h];
+	if (s->proto == SK_UDP || s->proto == SK_ICMP)
+		return sock_dgram_recv(s, buf, max);
+	if (s->closed)
+		return -1;
+	if (sched_intr_pending())
+		return -4;
+	if (s->proto == SK_TLS)
+		return -1;                 /* TLS has no non-blocking read path here */
+	int closed = 0;
+	int r = tcp_read_nb(s->conn, buf, max, &closed);
+	if (r < 0) { s->closed = 1; return -1; }
+	if (closed) {
+		s->closed = 1;
+		return r > 0 ? r : -1;     /* hand back the last bytes, then EOF      */
+	}
+	return r;                          /* >0 data, or 0 = would-block          */
+}
+
 int net_sock_close(int h)
 {
 	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
 		return -1;
 	struct usock *s = &usocks[h];
 	if (s->proto == SK_TLS)
-		tls_close();
+		tls_close(s->tls);
 	else if (s->proto == SK_TCP && s->conn)
 		tcp_close(s->conn);
 	s->used = s->closed = 0;
 	s->conn = NULL;
+	s->tls = -1;
 	return 0;
 }
 
@@ -1681,7 +1723,7 @@ int net_sock_alpn(int h)
 		return -1;
 	if (usocks[h].proto != SK_TLS)
 		return 0;
-	return tls_alpn_is_h2() ? 2 : 1;
+	return tls_alpn_is_h2(usocks[h].tls) ? 2 : 1;
 }
 
 int net_ping(const char *host)
@@ -1972,6 +2014,11 @@ int net_ntp(const char *arg)
 void net_init(void)
 {
 	nic_init();
-	if (nic_present())
-		con_write("net: ip 10.0.2.15 gw 10.0.2.2 dns 10.0.2.3 (try 'ping google.com')\n");
+	if (!nic_present())
+		return;
+	/* The NIC driver already logged its name/MAC/link. Don't announce an IP here:
+	 * none is leased yet (the `dhcp` service runs after sti and applies the real
+	 * lease, logged via klog under `verbose`). The live IP shows in the taskbar
+	 * network indicator and `dhcp`/`ping` report it on demand. */
+	con_write("net: requesting address via DHCP\n");
 }

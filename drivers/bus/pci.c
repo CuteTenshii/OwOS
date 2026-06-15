@@ -290,6 +290,9 @@ static const char *device_model(uint16_t vendor, uint16_t device)
 	case 0x808629c0: return "82G33/G31 Express DRAM controller";
 	case 0x808610d3: return "82574L Gigabit Ethernet";
 	case 0x8086100e: return "82540EM Gigabit Ethernet (e1000)";
+	case 0x808610c9: return "82576 Gigabit Network Connection (igb)";
+	case 0x80861533: return "I210 Gigabit Network Connection";
+	case 0x80861539: return "I211 Gigabit Network Connection";
 	case 0x80862415: return "82801AA AC'97 Audio";
 	case 0x80862668: return "82801G (ICH7) HD Audio";   /* QEMU -device intel-hda     */
 	case 0x8086293e: return "82801I (ICH9) HD Audio";   /* QEMU -device ich9-intel-hda */

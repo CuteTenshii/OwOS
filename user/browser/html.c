@@ -341,13 +341,23 @@ static void decode_entities(char *s)
 	*o = '\0';
 }
 
+/* Append one styled glyph at offset `n`, growing text/attr as needed, and return
+ * the new length. If the heap is exhausted the glyph is silently dropped (the
+ * page just stops growing) — the same graceful truncation the old fixed buffer
+ * did when full, only now the ceiling is available memory, not a fixed cap. */
+static int text_put(int n, char c, unsigned char a)
+{
+	if (!ensure_text(n + 1)) return n;
+	B->text[n] = c;
+	B->attr[n] = a;
+	return n + 1;
+}
+
 void html_to_text(void)
 {
 	const char *p   = B->raw;
 	const char *end = B->raw + B->raw_len;
-	char    *o    = B->text;
-	unsigned char *oa = B->attr;
-	char    *oend = B->text + TEXT_MAX - 1;
+	int n = 0;                       /* current rendered length (offset into text) */
 
 	int skip = 0, cap_title = 0, pend_sp = 0, run_nl = 1;
 	int tl = 0, t_pend = 0, cur_link = -1;
@@ -392,10 +402,10 @@ void html_to_text(void)
 			if (streq(name, "a")) {
 				if (closing) {
 					if (cur_link >= 0) {
-						B->links[cur_link].end = (int)(o - B->text);
+						B->links[cur_link].end = n;
 						cur_link = -1;
 					}
-				} else if (B->nlinks < MAX_LINKS) {
+				} else if (ensure_links(B->nlinks + 1)) {
 					char href[256]; href[0] = '\0';
 					if (tag_attr(tagbody, tagend, "href", href, sizeof href))
 						decode_entities(href);
@@ -403,7 +413,7 @@ void html_to_text(void)
 					    !starts_ci(href, "javascript:") &&
 					    !starts_ci(href, "mailto:")) {
 						struct link *L = &B->links[B->nlinks];
-						L->start = (int)(o - B->text);
+						L->start = n;
 						int k = 0;
 						for (; href[k] && k < (int)sizeof L->href - 1; k++)
 							L->href[k] = href[k];
@@ -413,14 +423,14 @@ void html_to_text(void)
 				}
 			}
 
-			if (streq(name, "img") && !closing && B->n_imgs < MAX_INL_IMG) {
+			if (streq(name, "img") && !closing && ensure_imgs(B->n_imgs + 1)) {
 				char src[256]; src[0] = '\0';
 				if (tag_attr(tagbody, tagend, "src", src, sizeof src))
 					decode_entities(src);
 				if (src[0] && !starts_ci(src, "data:")) {
 					/* put the image on its own line: break before, anchor at
 					 * the empty line, break after. */
-					if (run_nl < 1 && o > B->text) { *oa++ = 0; *o++ = '\n'; }
+					if (run_nl < 1 && n > 0) n = text_put(n, '\n', 0);
 					struct inl_img *im = &B->imgs[B->n_imgs];
 					int k = 0;
 					for (; src[k] && k < (int)sizeof im->href - 1; k++)
@@ -457,11 +467,11 @@ void html_to_text(void)
 						if (sw) im->cw = sw;
 						if (sh) im->ch = sh;
 					}
-					im->text_pos = (int)(o - B->text);
+					im->text_pos = n;
 					im->ok = 0; im->rows = 0; im->start_row = -1;
 					im->iw = im->ih = 0; im->coff = im->clen = 0;
 					B->n_imgs++;
-					if (o < oend) { *oa++ = 0; *o++ = '\n'; }
+					n = text_put(n, '\n', 0);
 					run_nl = 1;
 				}
 			}
@@ -495,7 +505,7 @@ void html_to_text(void)
 
 			if (is_block_tag(name)) {
 				pend_sp = 0;
-				if (run_nl < 2 && o > B->text) { *oa++ = 0; *o++ = '\n'; run_nl++; }
+				if (run_nl < 2 && n > 0) { n = text_put(n, '\n', 0); run_nl++; }
 			}
 			continue;
 		}
@@ -529,13 +539,13 @@ void html_to_text(void)
 		}
 
 		if (pend_sp) {
-			if (o > B->text && run_nl == 0 && o < oend) { *oa++ = 0; *o++ = ' '; }
+			if (n > 0 && run_nl == 0) n = text_put(n, ' ', 0);
 			pend_sp = 0;
 		}
-		if (o < oend) { *oa++ = sty_byte(); *o++ = (char)c; run_nl = 0; }
-		else break;
+		n = text_put(n, (char)c, sty_byte());
+		run_nl = 0;
 	}
-	B->text_len = (int)(o - B->text);
+	B->text_len = n;
 }
 
 /* Render a non-HTML text body verbatim into the styled-text buffer: newlines
@@ -545,36 +555,37 @@ void html_to_text(void)
 void plain_to_text(void)
 {
 	const char *p = B->raw, *pend = B->raw + B->raw_len;
-	char *o = B->text; unsigned char *oa = B->attr;
-	char *oend = B->text + TEXT_MAX - 1;
-	int col = 0;
+	int n = 0, col = 0;
 
 	B->doc_title[0] = '\0';
 	B->nlinks = 0;
 	B->n_imgs = 0;
 
-	while (p < pend && o < oend) {
+	while (p < pend) {
 		unsigned char c = (unsigned char)*p++;
 		if (c == '\r') continue;
-		if (c == '\n') { *oa++ = 0; *o++ = '\n'; col = 0; continue; }
+		if (c == '\n') { n = text_put(n, '\n', 0); col = 0; continue; }
 		if (c == '\t') {
 			int sp = 8 - (col & 7);
-			while (sp-- > 0 && o < oend) { *oa++ = 0; *o++ = ' '; col++; }
+			while (sp-- > 0) { n = text_put(n, ' ', 0); col++; }
 			continue;
 		}
 		if (c < 0x20 || c >= 0x7f) continue;
-		*oa++ = 0; *o++ = (char)c; col++;
+		n = text_put(n, (char)c, 0); col++;
 	}
-	B->text_len = (int)(o - B->text);
+	B->text_len = n;
 }
 
 /* Fill the styled-text buffer with a literal one-off message (e.g. "unsupported
  * content type"), so render() shows it through the normal text path. */
 void doc_message(const char *m)
 {
-	int i = 0;
-	for (; m[i] && i < TEXT_MAX - 1; i++) { B->text[i] = m[i]; B->attr[i] = 0; }
-	B->text_len = i;
+	int n = 0;
+	while (m[n]) {
+		if (!ensure_text(n + 1)) break;
+		B->text[n] = m[n]; B->attr[n] = 0; n++;
+	}
+	B->text_len = n;
 	B->doc_title[0] = '\0';
 	B->nlinks = 0;
 	B->n_imgs = 0;

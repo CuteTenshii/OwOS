@@ -1,19 +1,29 @@
-/* tls.c — a single-connection TLS 1.2 client (see tls.h for the contract).
+/* tls.c — a MULTI-connection TLS 1.2/1.3 client (see tls.h for the contract).
  *
- * Speaks exactly one cipher suite, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:
+ * Speaks exactly one cipher suite per version:
+ *   TLS 1.3: TLS_AES_128_GCM_SHA256 (x25519 key share, HKDF schedule)
+ *   TLS 1.2: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (x25519 ECDHE)
  *
  *   ClientHello (x25519 group, SNI)
- *        -> ServerHello, Certificate, ServerKeyExchange, ServerHelloDone
+ *        -> ServerHello, Certificate, ServerKeyExchange, ServerHelloDone (1.2)
  *   ClientKeyExchange (our x25519 pubkey), ChangeCipherSpec, Finished
  *        -> ChangeCipherSpec, Finished
  *
- * The ECDHE shared secret feeds the TLS 1.2 PRF key schedule; both sides'
- * Finished messages carry a PRF over the full handshake transcript, so a
- * verified server Finished is end-to-end proof that every byte of the key
- * schedule (and therefore every primitive in crypto.c) is correct.
+ * Both sides' Finished messages carry a PRF/HMAC over the full handshake
+ * transcript, so a verified server Finished is end-to-end proof that every byte
+ * of the key schedule (and therefore every primitive in crypto.c) is correct.
  *
- * Layered straight on tcp.c: records go out via tcp_write, come in via
- * tcp_read. Driven from command context only (curl), so no locking.
+ * Layered straight on tcp.c: records go out via tcp_write, come in via tcp_read.
+ *
+ * MULTI-FLOW: every per-connection scrap of state — the TCP handle, keys, IVs,
+ * sequence numbers, transcript hash, and all the record/handshake/app reassembly
+ * buffers — lives in a `struct tls_conn` that tls_connect() kmalloc's (~92 KiB)
+ * and tls_close() frees. So any number of TLS sessions can run at once (bounded
+ * only by the kernel heap and tcp.c's connection table), with nothing reserved
+ * when idle — which the old single-`static` design forbade. The handle returned
+ * by tls_connect() is just the struct pointer. The handshake runs from a thread/
+ * command context with interrupts on; concurrent sessions are independent
+ * allocations, so no locking is needed between them.
  */
 
 #include <stdint.h>
@@ -26,6 +36,7 @@
 #include "rtc.h"
 #include "console.h"
 #include "kstring.h"
+#include "heap.h"
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -95,70 +106,73 @@ static void put64be(uint8_t *p, uint64_t v)
 
 /* ------------------------------------------------------------------- state */
 
-static int      established;
-static tcp_conn_t *tcp;              /* the single TCP connection we ride on */
-static int      is13;                /* negotiated TLS 1.3 (vs 1.2) */
-static uint64_t client_seq, server_seq;
-static int      send_encrypted, recv_encrypted;
+/* One TLS session, heap-allocated per connection (~92 KiB: the record/handshake/
+ * app buffers, sized for the worst-case TLS record, dominate). */
+struct tls_conn {
+	int         established;         /* handshake finished, app data flows     */
+	tcp_conn_t *tcp;                 /* the TCP connection this rides on        */
+	int         is13;                /* negotiated TLS 1.3 (vs 1.2)             */
+	uint64_t    client_seq, server_seq;
+	int         send_encrypted, recv_encrypted;
 
-static uint8_t  client_key[16], server_key[16];
-static uint8_t  client_iv[12], server_iv[12];  /* 1.2 uses first 4; 1.3 all 12 */
+	uint8_t     client_key[16], server_key[16];
+	uint8_t     client_iv[12], server_iv[12];   /* 1.2 uses first 4; 1.3 all 12 */
 
-static struct sha256 transcript;     /* running hash of handshake messages */
+	struct sha256 transcript;        /* running hash of handshake messages      */
 
-/* ALPN: the application protocol the server selected ("h2" or "http/1.1"), or
- * empty if it offered none. Set during the handshake, read by tls_alpn_is_h2()
- * so the HTTP client knows whether to speak HTTP/2 on this connection. */
-static char     neg_alpn[16];
-static uint32_t neg_alpn_len;
+	/* ALPN: the application protocol the server selected ("h2"/"http/1.1"), or
+	 * empty if it offered none. Read by tls_alpn_is_h2(). */
+	char        neg_alpn[16];
+	uint32_t    neg_alpn_len;
 
-static void set_alpn(const uint8_t *p, uint32_t n)
+	uint8_t     rxraw[TLS_RECMAX + 5];   /* raw inbound TCP bytes -> records     */
+	uint32_t    rxlen, rxpos;
+	uint8_t     recpt[TLS_RECMAX];       /* decrypted/plaintext current record   */
+	uint8_t     hsbuf[TLS_HSMAX];        /* reassembled handshake-message bytes  */
+	uint32_t    hslen, hspos;
+	uint8_t     appbuf[TLS_RECMAX];      /* leftover app plaintext for the caller */
+	uint32_t    applen, apppos;
+	uint8_t     sbuf[TLS_RECMAX + 32];   /* scratch for an outbound record        */
+};
+
+/* The handle is the struct pointer (kernel heap addresses are positive 32-bit
+ * values; -1 is the failure sentinel). Resolve it back, or NULL if it's the
+ * sentinel / never connected. */
+static struct tls_conn *conn_of(int h)
 {
-	if (n > sizeof neg_alpn) n = sizeof neg_alpn;
-	memcpy(neg_alpn, p, n);
-	neg_alpn_len = n;
+	return h > 0 ? (struct tls_conn *)(uint32_t)h : 0;
 }
 
-int tls_alpn_is_h2(void)
+static void set_alpn(struct tls_conn *c, const uint8_t *p, uint32_t n)
 {
-	return neg_alpn_len == 2 && neg_alpn[0] == 'h' && neg_alpn[1] == '2';
+	if (n > sizeof c->neg_alpn) n = sizeof c->neg_alpn;
+	memcpy(c->neg_alpn, p, n);
+	c->neg_alpn_len = n;
 }
 
-/* Raw inbound bytes from TCP, parsed into records. */
-static uint8_t  rxraw[TLS_RECMAX + 5];
-static uint32_t rxlen, rxpos;
-
-/* Decrypted/plaintext payload of the current record. */
-static uint8_t  recpt[TLS_RECMAX];
-
-/* Reassembled handshake-message bytes (records can split/coalesce them). */
-static uint8_t  hsbuf[TLS_HSMAX];
-static uint32_t hslen, hspos;
-
-/* Leftover application plaintext not yet handed to the caller. */
-static uint8_t  appbuf[TLS_RECMAX];
-static uint32_t applen, apppos;
-
-/* Scratch for an outbound (possibly encrypted) record payload. */
-static uint8_t  sbuf[TLS_RECMAX + 32];
+int tls_alpn_is_h2(int h)
+{
+	struct tls_conn *c = conn_of(h);
+	return c && c->neg_alpn_len == 2 && c->neg_alpn[0] == 'h' && c->neg_alpn[1] == '2';
+}
 
 /* ----------------------------------------------------------- record layer */
 
 /* Pull TCP bytes until rxraw holds at least `need` unconsumed. -1 on EOF. */
-static int raw_fill(uint32_t need)
+static int raw_fill(struct tls_conn *c, uint32_t need)
 {
-	while (rxlen - rxpos < need) {
-		if (rxpos > 0) {
-			memmove(rxraw, rxraw + rxpos, rxlen - rxpos);
-			rxlen -= rxpos;
-			rxpos = 0;
+	while (c->rxlen - c->rxpos < need) {
+		if (c->rxpos > 0) {
+			memmove(c->rxraw, c->rxraw + c->rxpos, c->rxlen - c->rxpos);
+			c->rxlen -= c->rxpos;
+			c->rxpos = 0;
 		}
-		if (rxlen == sizeof rxraw)
+		if (c->rxlen == sizeof c->rxraw)
 			return -1;
 		int closed = 0;
-		int n = tcp_read(tcp, rxraw + rxlen, sizeof rxraw - rxlen, &closed);
+		int n = tcp_read(c->tcp, c->rxraw + c->rxlen, sizeof c->rxraw - c->rxlen, &closed);
 		if (n > 0)
-			rxlen += (uint32_t)n;
+			c->rxlen += (uint32_t)n;
 		else
 			return -1;            /* closed or idle timeout */
 	}
@@ -175,46 +189,46 @@ static void nonce13(uint8_t out[12], const uint8_t iv[12], uint64_t seq)
 
 /* Receive one record; decrypt if the read side is active. Returns the (inner,
  * for 1.3) content type, fills out[*outlen] with plaintext. -1 on error/EOF. */
-static int recv_record(uint8_t *type_out, uint8_t *out, uint32_t *outlen)
+static int recv_record(struct tls_conn *c, uint8_t *type_out, uint8_t *out, uint32_t *outlen)
 {
 	for (;;) {
-		if (raw_fill(5) < 0)
+		if (raw_fill(c, 5) < 0)
 			return -1;
-		uint8_t *h = rxraw + rxpos;
+		uint8_t *h = c->rxraw + c->rxpos;
 		uint8_t type = h[0];
 		uint32_t len = ((uint32_t)h[3] << 8) | h[4];
-		if (len > TLS_RECMAX || raw_fill(5 + len) < 0)
+		if (len > TLS_RECMAX || raw_fill(c, 5 + len) < 0)
 			return -1;
-		uint8_t *payload = rxraw + rxpos + 5;
+		uint8_t *payload = c->rxraw + c->rxpos + 5;
 
 		/* TLS 1.3 sends a dummy ChangeCipherSpec for middlebox compat; ignore. */
-		if (is13 && type == REC_CCS) {
-			rxpos += 5 + len;
+		if (c->is13 && type == REC_CCS) {
+			c->rxpos += 5 + len;
 			continue;
 		}
 
-		if (!recv_encrypted) {
+		if (!c->recv_encrypted) {
 			memcpy(out, payload, len);
 			*outlen = len;
 			*type_out = type;
-			rxpos += 5 + len;
+			c->rxpos += 5 + len;
 			return 0;
 		}
 
-		if (is13) {
+		if (c->is13) {
 			if (len < 16)
 				return -1;
 			uint8_t nonce[12];
-			nonce13(nonce, server_iv, server_seq);
+			nonce13(nonce, c->server_iv, c->server_seq);
 			uint8_t aad[5] = { type, 0x03, 0x03,
 			                   (uint8_t)(len >> 8), (uint8_t)len };
 			uint32_t inner = len - 16;
 			const uint8_t *tag = payload + inner;
-			if (aes128_gcm_open(server_key, nonce, aad, 5, payload, inner,
+			if (aes128_gcm_open(c->server_key, nonce, aad, 5, payload, inner,
 			                    out, tag) != 0)
 				return -1;
-			server_seq++;
-			rxpos += 5 + len;
+			c->server_seq++;
+			c->rxpos += 5 + len;
 			while (inner > 0 && out[inner - 1] == 0)   /* strip zero padding */
 				inner--;
 			if (inner == 0)
@@ -229,80 +243,80 @@ static int recv_record(uint8_t *type_out, uint8_t *out, uint32_t *outlen)
 			return -1;
 		uint32_t ctlen = len - 8 - 16;
 		uint8_t nonce[12];
-		memcpy(nonce, server_iv, 4);
+		memcpy(nonce, c->server_iv, 4);
 		memcpy(nonce + 4, payload, 8);
 		uint8_t aad[13];
-		put64be(aad, server_seq);
+		put64be(aad, c->server_seq);
 		aad[8] = type;
 		aad[9] = 0x03; aad[10] = 0x03;
 		put16(aad + 11, (uint16_t)ctlen);
-		if (aes128_gcm_open(server_key, nonce, aad, 13, payload + 8, ctlen,
+		if (aes128_gcm_open(c->server_key, nonce, aad, 13, payload + 8, ctlen,
 		                    out, payload + 8 + ctlen) != 0)
 			return -1;
 		*outlen = ctlen;
 		*type_out = type;
-		server_seq++;
-		rxpos += 5 + len;
+		c->server_seq++;
+		c->rxpos += 5 + len;
 		return 0;
 	}
 }
 
 /* Send one record; encrypt if the write side is active. */
-static int send_record(uint8_t type, const uint8_t *data, uint32_t len)
+static int send_record(struct tls_conn *c, uint8_t type, const uint8_t *data, uint32_t len)
 {
 	uint8_t hdr[5];
-	if (!send_encrypted) {
+	if (!c->send_encrypted) {
 		hdr[0] = type;
 		hdr[1] = 0x03; hdr[2] = 0x03;
 		put16(hdr + 3, (uint16_t)len);
-		if (tcp_write(tcp, hdr, 5) < 0)
+		if (tcp_write(c->tcp, hdr, 5) < 0)
 			return -1;
-		if (len && tcp_write(tcp, data, len) < 0)
+		if (len && tcp_write(c->tcp, data, len) < 0)
 			return -1;
 		return 0;
 	}
 
-	if (is13) {
+	if (c->is13) {
 		/* inner plaintext = content || real_type; outer type is always 23. */
 		uint8_t nonce[12];
-		nonce13(nonce, client_iv, client_seq);
-		memcpy(sbuf, data, len);
-		sbuf[len] = type;
+		nonce13(nonce, c->client_iv, c->client_seq);
+		memcpy(c->sbuf, data, len);
+		c->sbuf[len] = type;
 		uint32_t inner = len + 1;
 		uint32_t rlen = inner + 16;
 		uint8_t aad[5] = { REC_APP, 0x03, 0x03,
 		                   (uint8_t)(rlen >> 8), (uint8_t)rlen };
 		uint8_t tag[16];
-		aes128_gcm_seal(client_key, nonce, aad, 5, sbuf, inner, sbuf, tag);
-		memcpy(sbuf + inner, tag, 16);
+		aes128_gcm_seal(c->client_key, nonce, aad, 5, c->sbuf, inner, c->sbuf, tag);
+		memcpy(c->sbuf + inner, tag, 16);
 		hdr[0] = REC_APP;
 		hdr[1] = 0x03; hdr[2] = 0x03;
 		put16(hdr + 3, (uint16_t)rlen);
-		if (tcp_write(tcp, hdr, 5) < 0 || tcp_write(tcp, sbuf, rlen) < 0)
+		if (tcp_write(c->tcp, hdr, 5) < 0 || tcp_write(c->tcp, c->sbuf, rlen) < 0)
 			return -1;
-		client_seq++;
+		c->client_seq++;
 		return 0;
 	}
 
 	uint8_t nonce[12];
-	memcpy(nonce, client_iv, 4);
-	put64be(sbuf, client_seq);                  /* explicit nonce = seq */
-	memcpy(nonce + 4, sbuf, 8);
+	memcpy(nonce, c->client_iv, 4);
+	put64be(c->sbuf, c->client_seq);            /* explicit nonce = seq */
+	memcpy(nonce + 4, c->sbuf, 8);
 	uint8_t aad[13];
-	put64be(aad, client_seq);
+	put64be(aad, c->client_seq);
 	aad[8] = type;
 	aad[9] = 0x03; aad[10] = 0x03;
 	put16(aad + 11, (uint16_t)len);
 	uint8_t tag[16];
-	aes128_gcm_seal(client_key, nonce, aad, 13, data, len, sbuf + 8, tag);
-	memcpy(sbuf + 8 + len, tag, 16);
+	aes128_gcm_seal(c->client_key, nonce, aad, 13, data, len, c->sbuf + 8, tag);
+	memcpy(c->sbuf + 8 + len, tag, 16);
 	uint32_t rlen = 8 + len + 16;
 	hdr[0] = type;
 	hdr[1] = 0x03; hdr[2] = 0x03;
 	put16(hdr + 3, (uint16_t)rlen);
-	if (tcp_write(tcp, hdr, 5) < 0 || tcp_write(tcp, sbuf, rlen) < 0)
+	if (tcp_write(c->tcp, hdr, 5) < 0 || tcp_write(c->tcp, c->sbuf, rlen) < 0)
 		return -1;
-	client_seq++;
+	c->client_seq++;
 	return 0;
 }
 
@@ -310,48 +324,48 @@ static int send_record(uint8_t type, const uint8_t *data, uint32_t len)
 
 /* Ensure the handshake buffer holds `need` bytes, pulling Handshake records.
  * Returns 0, -1 on error, -2 on an Alert. */
-static int hs_fill(uint32_t need)
+static int hs_fill(struct tls_conn *c, uint32_t need)
 {
-	while (hslen - hspos < need) {
+	while (c->hslen - c->hspos < need) {
 		uint8_t type;
 		uint32_t rl;
-		if (recv_record(&type, recpt, &rl) < 0)
+		if (recv_record(c, &type, c->recpt, &rl) < 0)
 			return -1;
 		if (type == REC_ALERT)
 			return -2;
 		if (type != REC_HS)
 			return -1;
-		if (hspos > 0) {
-			memmove(hsbuf, hsbuf + hspos, hslen - hspos);
-			hslen -= hspos;
-			hspos = 0;
+		if (c->hspos > 0) {
+			memmove(c->hsbuf, c->hsbuf + c->hspos, c->hslen - c->hspos);
+			c->hslen -= c->hspos;
+			c->hspos = 0;
 		}
-		if (hslen + rl > sizeof hsbuf)
+		if (c->hslen + rl > sizeof c->hsbuf)
 			return -1;
-		memcpy(hsbuf + hslen, recpt, rl);
-		hslen += rl;
+		memcpy(c->hsbuf + c->hslen, c->recpt, rl);
+		c->hslen += rl;
 	}
 	return 0;
 }
 
 /* Next handshake message: sets type, points body at the payload, feeds the
  * full message (header included) into the transcript hash. */
-static int hs_next(uint8_t *mtype, uint8_t **body, uint32_t *blen)
+static int hs_next(struct tls_conn *c, uint8_t *mtype, uint8_t **body, uint32_t *blen)
 {
-	int r = hs_fill(4);
+	int r = hs_fill(c, 4);
 	if (r < 0)
 		return r;                     /* propagate -2 (alert) vs -1 (EOF) */
-	uint32_t l = ((uint32_t)hsbuf[hspos + 1] << 16) |
-	             ((uint32_t)hsbuf[hspos + 2] << 8) | hsbuf[hspos + 3];
-	r = hs_fill(4 + l);
+	uint32_t l = ((uint32_t)c->hsbuf[c->hspos + 1] << 16) |
+	             ((uint32_t)c->hsbuf[c->hspos + 2] << 8) | c->hsbuf[c->hspos + 3];
+	r = hs_fill(c, 4 + l);
 	if (r < 0)
 		return r;
-	uint8_t *h = hsbuf + hspos;
+	uint8_t *h = c->hsbuf + c->hspos;
 	*mtype = h[0];
-	sha256_update(&transcript, h, 4 + l);
+	sha256_update(&c->transcript, h, 4 + l);
 	*body = h + 4;
 	*blen = l;
-	hspos += 4 + l;
+	c->hspos += 4 + l;
 	return 0;
 }
 
@@ -385,13 +399,14 @@ static void derive_secret(const uint8_t secret[32], const char *label,
 }
 
 /* Install a direction's traffic key+iv from its traffic secret. */
-static void install_keys(const uint8_t c_secret[32], const uint8_t s_secret[32])
+static void install_keys(struct tls_conn *c, const uint8_t c_secret[32],
+                         const uint8_t s_secret[32])
 {
-	hkdf_expand_label(c_secret, "key", 0, 0, client_key, 16);
-	hkdf_expand_label(c_secret, "iv", 0, 0, client_iv, 12);
-	hkdf_expand_label(s_secret, "key", 0, 0, server_key, 16);
-	hkdf_expand_label(s_secret, "iv", 0, 0, server_iv, 12);
-	client_seq = server_seq = 0;
+	hkdf_expand_label(c_secret, "key", 0, 0, c->client_key, 16);
+	hkdf_expand_label(c_secret, "iv", 0, 0, c->client_iv, 12);
+	hkdf_expand_label(s_secret, "key", 0, 0, c->server_key, 16);
+	hkdf_expand_label(s_secret, "iv", 0, 0, c->server_iv, 12);
+	c->client_seq = c->server_seq = 0;
 }
 
 /* --------------------------------------------------------- ClientHello */
@@ -489,7 +504,7 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
 
 /* Parse a ServerHello: extract server_random, chosen suite, whether TLS 1.3
  * was selected (supported_versions), and the server's x25519 share. */
-static int parse_server_hello(const uint8_t *body, uint32_t bl,
+static int parse_server_hello(struct tls_conn *c, const uint8_t *body, uint32_t bl,
                               uint8_t server_random[32], uint16_t *suite,
                               int *sel13, uint8_t server_pub[32], int *have_ks)
 {
@@ -530,7 +545,7 @@ static int parse_server_hello(const uint8_t *body, uint32_t bl,
 			/* ALPN (TLS 1.2): ProtocolNameList(2) ProtocolName(len+bytes). */
 			uint8_t nl = body[off + 2];
 			if (off + 3u + nl <= end)
-				set_alpn(body + off + 3, nl);
+				set_alpn(c, body + off + 3, nl);
 		}
 		off += el;
 	}
@@ -540,7 +555,8 @@ static int parse_server_hello(const uint8_t *body, uint32_t bl,
 /* The encrypted second half of a TLS 1.3 handshake, after ServerHello: derive
  * handshake keys, read EncryptedExtensions..server Finished (verifying it),
  * send client Finished, switch to application keys. Returns 1 on success. */
-static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[32])
+static int tls13_handshake(struct tls_conn *c, const uint8_t our_priv[32],
+                           const uint8_t server_pub[32])
 {
 	uint8_t zero[32] = {0}, empty_hash[32];
 	sha256("", 0, empty_hash);
@@ -552,13 +568,13 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 	hkdf_extract(derived, 32, shared, 32, hs_secret);
 
 	uint8_t th[32];
-	{ struct sha256 c = transcript; sha256_final(&c, th); }   /* ..ServerHello */
+	{ struct sha256 ts = c->transcript; sha256_final(&ts, th); }   /* ..ServerHello */
 	uint8_t c_hs[32], s_hs[32];
 	derive_secret(hs_secret, "c hs traffic", th, c_hs);
 	derive_secret(hs_secret, "s hs traffic", th, s_hs);
-	is13 = 1;
-	send_encrypted = recv_encrypted = 1;
-	install_keys(c_hs, s_hs);
+	c->is13 = 1;
+	c->send_encrypted = c->recv_encrypted = 1;
+	install_keys(c, c_hs, s_hs);
 
 	uint8_t derived2[32], master[32];
 	hkdf_expand_label(hs_secret, "derived", empty_hash, 32, derived2, 32);
@@ -566,10 +582,10 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 
 	/* Read EncryptedExtensions, Certificate, CertificateVerify, Finished. */
 	for (;;) {
-		struct sha256 before = transcript;   /* hash through prior messages */
+		struct sha256 before = c->transcript;   /* hash through prior messages */
 		uint8_t mt, *body;
 		uint32_t bl;
-		int r = hs_next(&mt, &body, &bl);
+		int r = hs_next(c, &mt, &body, &bl);
 		if (r == -2) { con_write("tls: server alert (1.3)\n"); return 0; }
 		if (r < 0) { con_write("tls: 1.3 handshake read failed\n"); return 0; }
 		if (mt == HS_CERT_REQ) {
@@ -602,7 +618,7 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 				if (et == 0x0010 && xl >= 3) {
 					uint8_t nl = body[o + 2];
 					if (o + 3u + nl <= e)
-						set_alpn(body + o + 3, nl);
+						set_alpn(c, body + o + 3, nl);
 				}
 				o += xl;
 			}
@@ -611,7 +627,7 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 	}
 
 	uint8_t th_sf[32];
-	{ struct sha256 c = transcript; sha256_final(&c, th_sf); }  /* ..srv Finished */
+	{ struct sha256 ts = c->transcript; sha256_final(&ts, th_sf); }  /* ..srv Finished */
 
 	/* client Finished, still under the handshake key. */
 	uint8_t fk_c[32], verify[32];
@@ -620,7 +636,7 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 	uint8_t fin[36];
 	fin[0] = HS_FINISHED; fin[1] = 0; fin[2] = 0; fin[3] = 32;
 	memcpy(fin + 4, verify, 32);
-	if (send_record(REC_HS, fin, 36) < 0) {
+	if (send_record(c, REC_HS, fin, 36) < 0) {
 		con_write("tls: send 1.3 Finished failed\n");
 		return 0;
 	}
@@ -629,9 +645,9 @@ static int tls13_handshake(const uint8_t our_priv[32], const uint8_t server_pub[
 	uint8_t c_ap[32], s_ap[32];
 	derive_secret(master, "c ap traffic", th_sf, c_ap);
 	derive_secret(master, "s ap traffic", th_sf, s_ap);
-	install_keys(c_ap, s_ap);
+	install_keys(c, c_ap, s_ap);
 
-	established = 1;
+	c->established = 1;
 	return 1;
 }
 
@@ -641,20 +657,24 @@ static const uint8_t x25519_base[32] = { 9 };
 
 int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h2)
 {
-	established = 0;
-	is13 = 0;
-	neg_alpn_len = 0;
-	rxlen = rxpos = hslen = hspos = applen = apppos = 0;
-	client_seq = server_seq = 0;
-	send_encrypted = recv_encrypted = 0;
+	/* Allocate this session's state (~92 KiB) on the kernel heap; freed by
+	 * tls_close(). The handle handed back is the pointer itself. */
+	struct tls_conn *c = kmalloc(sizeof *c);
+	if (!c) {
+		con_write("tls: out of memory\n");
+		return -1;
+	}
+	memset(c, 0, sizeof *c);
+	int h = (int)(uint32_t)c;
 
-	tcp = tcp_connect(ip, port);
-	if (!tcp) {
+	c->tcp = tcp_connect(ip, port);
+	if (!c->tcp) {
 		con_write("tls: tcp connect failed\n");
-		return 0;
+		kfree(c);
+		return -1;
 	}
 
-	sha256_init(&transcript);
+	sha256_init(&c->transcript);
 
 	uint8_t client_random[32], server_random[32];
 	uint8_t our_priv[32], our_pub[32];
@@ -665,11 +685,12 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h
 	/* --- ClientHello --- */
 	uint8_t ch[768];
 	uint32_t chlen = build_client_hello(ch, client_random, our_pub, sni, offer_h2);
-	sha256_update(&transcript, ch, chlen);
-	if (send_record(REC_HS, ch, chlen) < 0) {
+	sha256_update(&c->transcript, ch, chlen);
+	if (send_record(c, REC_HS, ch, chlen) < 0) {
 		con_write("tls: send ClientHello failed\n");
-		tcp_close(tcp);
-		return 0;
+		tcp_close(c->tcp);
+		kfree(c);
+		return -1;
 	}
 
 	/* --- ServerHello (plaintext in both versions); pick the version path --- */
@@ -677,41 +698,47 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h
 	{
 		uint8_t mt, *body;
 		uint32_t bl;
-		int r = hs_next(&mt, &body, &bl);
+		int r = hs_next(c, &mt, &body, &bl);
 		if (r == -2) {
 			con_write("tls: server sent an alert\n");
-			tcp_close(tcp);
-			return 0;
+			tcp_close(c->tcp);
+			kfree(c);
+			return -1;
 		}
 		if (r < 0 || mt != HS_SERVER_HELLO) {
 			con_write("tls: expected ServerHello\n");
-			tcp_close(tcp);
-			return 0;
+			tcp_close(c->tcp);
+			kfree(c);
+			return -1;
 		}
 		uint16_t suite;
 		int sel13, have_ks;
-		if (parse_server_hello(body, bl, server_random, &suite, &sel13,
+		if (parse_server_hello(c, body, bl, server_random, &suite, &sel13,
 		                       server_pub, &have_ks) < 0) {
 			con_write("tls: bad ServerHello\n");
-			tcp_close(tcp);
-			return 0;
+			tcp_close(c->tcp);
+			kfree(c);
+			return -1;
 		}
 		if (sel13) {
 			if (suite != CIPHER_AES128_GCM_SHA256 || !have_ks) {
 				con_write("tls: unsupported TLS 1.3 parameters\n");
-				tcp_close(tcp);
-				return 0;
+				tcp_close(c->tcp);
+				kfree(c);
+				return -1;
 			}
-			if (!tls13_handshake(our_priv, server_pub)) {
-				tcp_close(tcp);
-				return 0;
+			if (!tls13_handshake(c, our_priv, server_pub)) {
+				tcp_close(c->tcp);
+				kfree(c);
+				return -1;
 			}
-			return 1;
+			return h;
 		}
 		if (suite != CIPHER_ECDHE_RSA_AES128_GCM) {
 			con_write("tls: server chose an unsupported cipher\n");
-			tcp_close(tcp);
-			return 0;
+			tcp_close(c->tcp);
+			kfree(c);
+			return -1;
 		}
 	}
 
@@ -720,33 +747,37 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h
 	for (;;) {
 		uint8_t mt, *body;
 		uint32_t bl;
-		int r = hs_next(&mt, &body, &bl);
+		int r = hs_next(c, &mt, &body, &bl);
 		if (r == -2) {
 			con_write("tls: server sent an alert\n");
-			tcp_close(tcp);
-			return 0;
+			tcp_close(c->tcp);
+			kfree(c);
+			return -1;
 		}
 		if (r < 0) {
 			con_write("tls: handshake read failed\n");
-			tcp_close(tcp);
-			return 0;
+			tcp_close(c->tcp);
+			kfree(c);
+			return -1;
 		}
 		if (mt == HS_SKE) {
 			/* curve_type(1) named_curve(2) pubkeylen(1) pubkey ... */
-			if (bl < 4 || body[0] != 3) { tcp_close(tcp); return 0; }
+			if (bl < 4 || body[0] != 3) { tcp_close(c->tcp); kfree(c); return -1; }
 			uint16_t curve = ((uint16_t)body[1] << 8) | body[2];
 			uint8_t pklen = body[3];
 			if (curve != 0x001D || pklen != 32 || bl < 4u + 32) {
 				con_write("tls: server key exchange not x25519/32\n");
-				tcp_close(tcp);
-				return 0;
+				tcp_close(c->tcp);
+				kfree(c);
+				return -1;
 			}
 			memcpy(server_pub, body + 4, 32);
 			have_ske = 1;
 		} else if (mt == HS_CERT_REQ) {
 			con_write("tls: server requested a client certificate (unsupported)\n");
-			tcp_close(tcp);
-			return 0;
+			tcp_close(c->tcp);
+			kfree(c);
+			return -1;
 		} else if (mt == HS_DONE) {
 			break;
 		}
@@ -754,8 +785,9 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h
 	}
 	if (!have_ske) {
 		con_write("tls: no ServerKeyExchange\n");
-		tcp_close(tcp);
-		return 0;
+		tcp_close(c->tcp);
+		kfree(c);
+		return -1;
 	}
 
 	/* --- key schedule --- */
@@ -770,10 +802,10 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h
 	memcpy(seed, server_random, 32);
 	memcpy(seed + 32, client_random, 32);
 	tls12_prf(master, 48, "key expansion", seed, 64, keyblock, 40);
-	memcpy(client_key, keyblock, 16);
-	memcpy(server_key, keyblock + 16, 16);
-	memcpy(client_iv, keyblock + 32, 4);
-	memcpy(server_iv, keyblock + 36, 4);
+	memcpy(c->client_key, keyblock, 16);
+	memcpy(c->server_key, keyblock + 16, 16);
+	memcpy(c->client_iv, keyblock + 32, 4);
+	memcpy(c->server_iv, keyblock + 36, 4);
 
 	/* --- ClientKeyExchange --- */
 	uint8_t cke[4 + 1 + 32];
@@ -781,21 +813,22 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h
 	cke[1] = 0; cke[2] = 0; cke[3] = 33;
 	cke[4] = 32;
 	memcpy(cke + 5, our_pub, 32);
-	sha256_update(&transcript, cke, sizeof cke);
-	if (send_record(REC_HS, cke, sizeof cke) < 0) {
+	sha256_update(&c->transcript, cke, sizeof cke);
+	if (send_record(c, REC_HS, cke, sizeof cke) < 0) {
 		con_write("tls: send CKE failed\n");
-		tcp_close(tcp);
-		return 0;
+		tcp_close(c->tcp);
+		kfree(c);
+		return -1;
 	}
 
 	/* --- ChangeCipherSpec, then switch our write side to encrypted --- */
 	uint8_t one = 1;
-	send_record(REC_CCS, &one, 1);
-	send_encrypted = 1;
-	client_seq = 0;
+	send_record(c, REC_CCS, &one, 1);
+	c->send_encrypted = 1;
+	c->client_seq = 0;
 
 	/* --- client Finished --- */
-	struct sha256 tc = transcript;
+	struct sha256 tc = c->transcript;
 	uint8_t thash[32];
 	sha256_final(&tc, thash);
 	uint8_t verify[12];
@@ -804,15 +837,16 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h
 	fin[0] = HS_FINISHED;
 	fin[1] = 0; fin[2] = 0; fin[3] = 12;
 	memcpy(fin + 4, verify, 12);
-	sha256_update(&transcript, fin, 16);
-	if (send_record(REC_HS, fin, 16) < 0) {
+	sha256_update(&c->transcript, fin, 16);
+	if (send_record(c, REC_HS, fin, 16) < 0) {
 		con_write("tls: send Finished failed\n");
-		tcp_close(tcp);
-		return 0;
+		tcp_close(c->tcp);
+		kfree(c);
+		return -1;
 	}
 
 	/* expected server Finished (transcript now includes client Finished) */
-	struct sha256 tc2 = transcript;
+	struct sha256 tc2 = c->transcript;
 	uint8_t thash2[32], server_verify[12];
 	sha256_final(&tc2, thash2);
 	tls12_prf(master, 48, "server finished", thash2, 32, server_verify, 12);
@@ -820,40 +854,44 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h
 	/* --- server ChangeCipherSpec --- */
 	uint8_t t;
 	uint32_t l;
-	if (recv_record(&t, recpt, &l) < 0 || t != REC_CCS) {
+	if (recv_record(c, &t, c->recpt, &l) < 0 || t != REC_CCS) {
 		con_write("tls: expected server ChangeCipherSpec\n");
-		tcp_close(tcp);
-		return 0;
+		tcp_close(c->tcp);
+		kfree(c);
+		return -1;
 	}
-	recv_encrypted = 1;
-	server_seq = 0;
-	hslen = hspos = 0;
+	c->recv_encrypted = 1;
+	c->server_seq = 0;
+	c->hslen = c->hspos = 0;
 
 	/* --- server Finished (encrypted handshake record) --- */
 	uint8_t mt, *body;
 	uint32_t bl;
-	if (hs_next(&mt, &body, &bl) < 0 || mt != HS_FINISHED || bl != 12) {
+	if (hs_next(c, &mt, &body, &bl) < 0 || mt != HS_FINISHED || bl != 12) {
 		con_write("tls: bad server Finished\n");
-		tcp_close(tcp);
-		return 0;
+		tcp_close(c->tcp);
+		kfree(c);
+		return -1;
 	}
 	for (int i = 0; i < 12; i++) {
 		if (body[i] != server_verify[i]) {
 			con_write("tls: server Finished verify MISMATCH\n");
-			tcp_close(tcp);
-			return 0;
+			tcp_close(c->tcp);
+			kfree(c);
+			return -1;
 		}
 	}
 
-	established = 1;
-	return 1;
+	c->established = 1;
+	return h;
 }
 
 /* --------------------------------------------------------- app data I/O */
 
-int tls_write(const void *data, uint32_t len)
+int tls_write(int h, const void *data, uint32_t len)
 {
-	if (!established)
+	struct tls_conn *c = conn_of(h);
+	if (!c || !c->established)
 		return -1;
 	const uint8_t *p = data;
 	uint32_t sent = 0;
@@ -861,25 +899,30 @@ int tls_write(const void *data, uint32_t len)
 		uint32_t chunk = len - sent;
 		if (chunk > 16384)
 			chunk = 16384;
-		if (send_record(REC_APP, p + sent, chunk) < 0)
+		if (send_record(c, REC_APP, p + sent, chunk) < 0)
 			return -1;
 		sent += chunk;
 	}
 	return (int)len;
 }
 
-int tls_read(uint8_t *buf, uint32_t max, int *closed)
+int tls_read(int h, uint8_t *buf, uint32_t max, int *closed)
 {
 	*closed = 0;
-	if (apppos < applen) {
-		uint32_t n = applen - apppos;
+	struct tls_conn *c = conn_of(h);
+	if (!c) {
+		*closed = 1;
+		return 0;
+	}
+	if (c->apppos < c->applen) {
+		uint32_t n = c->applen - c->apppos;
 		if (n > max)
 			n = max;
-		memcpy(buf, appbuf + apppos, n);
-		apppos += n;
+		memcpy(buf, c->appbuf + c->apppos, n);
+		c->apppos += n;
 		return (int)n;
 	}
-	if (!established) {
+	if (!c->established) {
 		*closed = 1;
 		return 0;
 	}
@@ -887,19 +930,19 @@ int tls_read(uint8_t *buf, uint32_t max, int *closed)
 	for (;;) {
 		uint8_t t;
 		uint32_t l;
-		if (recv_record(&t, recpt, &l) < 0) {
+		if (recv_record(c, &t, c->recpt, &l) < 0) {
 			*closed = 1;
 			return 0;
 		}
 		if (t == REC_APP) {
 			if (l == 0)
 				continue;
-			memcpy(appbuf, recpt, l);
-			applen = l;
-			apppos = 0;
+			memcpy(c->appbuf, c->recpt, l);
+			c->applen = l;
+			c->apppos = 0;
 			uint32_t n = l < max ? l : max;
-			memcpy(buf, appbuf, n);
-			apppos = n;
+			memcpy(buf, c->appbuf, n);
+			c->apppos = n;
 			return (int)n;
 		}
 		if (t == REC_ALERT) {                 /* close_notify or fatal */
@@ -910,12 +953,16 @@ int tls_read(uint8_t *buf, uint32_t max, int *closed)
 	}
 }
 
-void tls_close(void)
+void tls_close(int h)
 {
-	if (established) {
+	struct tls_conn *c = conn_of(h);
+	if (!c)
+		return;
+	if (c->established) {
 		uint8_t alert[2] = { 1, 0 };          /* warning, close_notify */
-		send_record(REC_ALERT, alert, 2);
+		send_record(c, REC_ALERT, alert, 2);
 	}
-	established = 0;
-	tcp_close(tcp);
+	c->established = 0;
+	tcp_close(c->tcp);
+	kfree(c);
 }

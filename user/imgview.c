@@ -78,13 +78,19 @@ static char *au2(char *p, unsigned v) { *p++ = (char)('0' + (v / 10) % 10); *p++
 
 static void set_status(const char *s) { status_set(&sbar, s); }
 
-/* ---- a buffered file reader over readfile_at (streams any-size files) ------ */
+/* ---- a buffered file reader over readfile_at (streams any-size files) ------
+ * The data buffer is one shared static block: only a single decode/probe ever
+ * runs at a time (this app is single-threaded and never nests them), so the
+ * freaders take turns using it. A large buffer is the point — the screenshot
+ * tool writes *uncompressed* (stored-block) PNGs, so the decode is dominated by
+ * pulling bytes, and a 64 KiB buffer hits readfile_at once per 64 KiB instead
+ * of every 4 KiB (≈16× fewer syscalls for a multi-MiB image). */
+#define FR_BUF 65536
+static unsigned char fr_buffer[FR_BUF];
 struct freader {
-	const char   *name;
-	unsigned      off;
-	unsigned char buf[4096];
-	unsigned      len, pos;
-	int           eof;
+	const char *name;
+	unsigned    off, len, pos;
+	int         eof;
 };
 
 static void fr_init(struct freader *f, const char *name)
@@ -98,11 +104,11 @@ static int fr_get(void *c)
 	if (f->pos >= f->len) {
 		if (f->eof)
 			return -1;
-		int n = readfile_at(f->name, f->off, f->buf, sizeof f->buf);
+		int n = readfile_at(f->name, f->off, fr_buffer, FR_BUF);
 		if (n <= 0) { f->eof = 1; return -1; }
 		f->off += (unsigned)n; f->len = (unsigned)n; f->pos = 0;
 	}
-	return f->buf[f->pos++];
+	return fr_buffer[f->pos++];
 }
 
 /* ---- scaled blit into the backing canvas ---------------------------------- */
@@ -115,15 +121,26 @@ struct view {
 	unsigned shown;         /* next_r at the last present (throttle presents)   */
 };
 
-/* Copy the whole backing canvas into the window's image area (rows below the
- * menu bar). The window width equals the canvas width, so the image area is one
- * contiguous run starting at the first row after the menu bar. */
-static void blit_canvas(void)
+/* Per-destination-column source byte offset, (x*iw/dw)*4, computed once per
+ * decode so the per-pixel inner loop is a table lookup instead of a divide. */
+static unsigned xmap[CW_MAX];
+
+/* Copy canvas rows [y0,y1) into the window's image area (rows below the menu
+ * bar). The window width equals the canvas width, so each band is one
+ * contiguous run — used both for the full present and for the progressive
+ * band-by-band paints, so a present never recopies the whole canvas. */
+static void blit_band(int y0, int y1)
 {
+	if (y0 < 0) y0 = 0;
+	if (y1 > ch) y1 = ch;
+	if (y1 <= y0) return;
 	unsigned *fb = win_fb();
-	memcpy(fb + (unsigned long)MENU_H * W, canvas,
-	       (unsigned long)cw * ch * 4u);
+	memcpy(fb + (unsigned long)(MENU_H + y0) * W,
+	       canvas + (unsigned long)y0 * cw,
+	       (unsigned long)(y1 - y0) * cw * 4u);
 }
+
+static void blit_canvas(void) { blit_band(0, ch); }
 
 /* Called per source scanline: fill every destination row whose nearest source
  * row is this one (nearest-neighbour vertical scale), each scaled horizontally,
@@ -136,7 +153,7 @@ static int v_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 	while (v->next_r < v->dh && (v->next_r * v->ih / v->dh) == y) {
 		unsigned *drow = fb + (unsigned long)(v->oy + v->next_r) * v->cw + v->ox;
 		for (unsigned x = 0; x < v->dw; x++) {
-			const unsigned char *p = rgba + (x * v->iw / v->dw) * 4;
+			const unsigned char *p = rgba + xmap[x];   /* no per-pixel divide */
 			unsigned a = p[3];
 			if (a == 255) {
 				drow[x] = ((unsigned)p[0] << 16) | ((unsigned)p[1] << 8) | p[2];
@@ -152,10 +169,11 @@ static int v_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 	}
 	/* Decoding a megabyte PNG off PIO disk takes seconds; present the rows
 	 * filled so far every so often so the image paints top-to-bottom instead of
-	 * staying blank until the whole decode finishes. */
+	 * staying blank until the whole decode finishes. Only the newly-filled band
+	 * is copied to the screen, not the whole canvas. */
 	if (v->next_r - v->shown >= 16) {
+		blit_band((int)(v->oy + v->shown), (int)(v->oy + v->next_r));
 		v->shown = v->next_r;
-		blit_canvas();
 		win_present(v->id);
 	}
 	return 0;
@@ -184,6 +202,14 @@ static void decode_to_canvas(void)
 	if (v.dh == 0) v.dh = 1;
 	v.ox = ((unsigned)cw - v.dw) / 2;
 	v.oy = ((unsigned)ch - v.dh) / 2;
+
+	for (unsigned x = 0; x < v.dw; x++)        /* precompute the horizontal map  */
+		xmap[x] = (x * v.iw / v.dw) * 4;
+
+	/* Paint the letterbox background once up front (the progressive band blits
+	 * only touch image rows), then stream the image in over it. */
+	blit_canvas();
+	win_present(wid);
 
 	struct freader fr;
 	fr_init(&fr, curpath);

@@ -8,9 +8,12 @@
  *   /proc/cpuinfo   model + MHz          /proc/host      SMBIOS product
  *   /proc/meminfo   used / total KiB     /proc/battery   present/pct/state
  *   /proc/uptime    seconds              /proc/display   framebuffer + EDID
- *   /proc/firmware  BIOS / UEFI          /proc/storage   one line per disk
- *   /proc/date      wall clock           /proc/owofs     file/byte usage
- *   /proc/tasks     scheduler task count /proc/pci       one line per PCI device
+ *   /proc/date      wall clock           /proc/storage   one line per disk
+ *   /proc/tasks     scheduler task count /proc/owofs     file/byte usage
+ *                                        /proc/pci       one line per PCI device
+ *
+ * Device attributes that belong to a kernel object (firmware type, NIC link/IP,
+ * battery, framebuffer/monitor) live in the /sys tree instead — see sysfs.c.
  */
 
 #include <stdint.h>
@@ -22,26 +25,18 @@
 #include "rtc.h"
 #include "fs.h"
 #include "sched.h"
-#include "firmware.h"
-#include "smbios.h"
-#include "battery.h"
-#include "fb.h"
-#include "edid.h"
 #include "pci.h"
 #include "ata.h"
 #include "ahci.h"
 #include "nvme.h"
 #include "log.h"
-#include "net.h"
-#include "nic.h"
 #include "vmtools.h"
-#include "keyboard.h"
-#include "mouse.h"
 #include "power.h"
 #include "services.h"
 #include "xhci.h"
 #include "usb.h"
 #include "console.h"
+#include "users.h"
 
 /* bounded text builder */
 struct pb { char *p; char *end; };
@@ -75,7 +70,6 @@ static void gen_meminfo(struct pb *b)
 }
 
 static void gen_uptime(struct pb *b)  { pu(b, timer_seconds()); pc(b, '\n'); }
-static void gen_firmware(struct pb *b){ ps(b, firmware_name()); pc(b, '\n'); }
 static void gen_tasks(struct pb *b)   { pu(b, (uint32_t)sched_count()); pc(b, '\n'); }
 
 static void gen_date(struct pb *b)
@@ -91,43 +85,6 @@ static void gen_owofs(struct pb *b)
 {
 	ps(b, "files "); pu(b, (uint32_t)fs_file_count()); pc(b, '\n');
 	ps(b, "bytes "); pu(b, fs_used_bytes()); pc(b, '\n');
-}
-
-static void gen_host(struct pb *b)
-{
-	const char *h = smbios_host();
-	ps(b, (h && h[0]) ? h : "");
-	pc(b, '\n');
-}
-
-static void gen_battery(struct pb *b)
-{
-	int present = battery_present();
-	ps(b, "present "); pc(b, present ? '1' : '0'); pc(b, '\n');
-	if (present) {
-		int chg = 0, dis = 0, mins = -1;
-		int pct = battery_percent(&chg, &dis, &mins);
-		ps(b, "pct ");         pu(b, pct < 0 ? 0 : (uint32_t)pct); pc(b, '\n');
-		ps(b, "charging ");    pc(b, chg ? '1' : '0'); pc(b, '\n');
-		ps(b, "discharging "); pc(b, dis ? '1' : '0'); pc(b, '\n');
-		ps(b, "minutes ");     pu(b, mins < 0 ? 0 : (uint32_t)mins); pc(b, '\n');
-	}
-	/* Always include the detection diagnostic — this whole path is real-hardware
-	 * only (QEMU has no battery), so `cat /proc/battery` is the way to see why a
-	 * laptop battery isn't being detected. */
-	ps(b, "diag "); ps(b, battery_diag()); pc(b, '\n');
-}
-
-static void gen_display(struct pb *b)
-{
-	int hz = edid_refresh_hz();
-	if (hz <= 0) hz = fb_active() ? 60 : 70;
-	ps(b, "fbw ");      pu(b, fb_active() ? fb_width() : 0);  pc(b, '\n');
-	ps(b, "fbh ");      pu(b, fb_active() ? fb_height() : 0); pc(b, '\n');
-	ps(b, "hz ");       pu(b, (uint32_t)hz); pc(b, '\n');
-	char mon[48]; edid_model(mon, (int)sizeof mon);
-	ps(b, "monitor ");  ps(b, mon); pc(b, '\n');
-	ps(b, "internal "); pc(b, edid_internal() ? '1' : '0'); pc(b, '\n');
 }
 
 /* /proc/storage: one line per present disk -> "<type> <sectors> <model>" */
@@ -158,33 +115,9 @@ static void gen_journal(struct pb *b)
 	b->p += journal_copy(b->p, (int)(b->end - b->p));
 }
 
-/* /proc/net: link + IPv4 status. Writing to it re-runs DHCP or an NTP sync (see
- * procfs_write), so `dhcp`/`ntp` are a write-then-read of this one node. */
-static void gen_net(struct pb *b)
-{
-	const uint8_t *ip = net_my_ip();
-	ps(b, "ip ");
-	if (ip) { pu(b, ip[0]); pc(b, '.'); pu(b, ip[1]); pc(b, '.'); pu(b, ip[2]); pc(b, '.'); pu(b, ip[3]); }
-	else    ps(b, "0.0.0.0");
-	pc(b, '\n');
-	ps(b, "link "); ps(b, nic_present() ? "up" : "down"); pc(b, '\n');
-}
-
 static void gen_clipboard(struct pb *b)
 {
 	b->p += vmtools_clip_get(b->p, (int)(b->end - b->p));
-}
-
-static void gen_keyboard(struct pb *b)
-{
-	ps(b, keyboard_layout_name()); pc(b, '\n');
-}
-
-/* /proc/mouse: the pointer-speed level (1..5). Writing a level re-scales PS/2
- * motion (see procfs_write) — the Settings app's Mouse/Touchpad control. */
-static void gen_mouse(struct pb *b)
-{
-	pu(b, (uint32_t)mouse_speed()); pc(b, '\n');
 }
 
 /* services and usb only know how to print to the console, so capture that into
@@ -206,9 +139,9 @@ static void gen_usb(struct pb *b)
 
 /* The entry names, in listing order. Single source of truth for read + list. */
 static const char *const entries[] = {
-	"cpuinfo", "meminfo", "uptime", "firmware", "tasks", "date",
-	"owofs", "host", "battery", "display", "storage", "pci",
-	"journal", "net", "clipboard", "keyboard", "mouse",
+	"cpuinfo", "meminfo", "uptime", "tasks", "date",
+	"owofs", "storage", "pci",
+	"journal", "clipboard",
 	"services", "usb",
 };
 #define NENTRIES ((int)(sizeof entries / sizeof entries[0]))
@@ -257,20 +190,13 @@ int procfs_read(const char *sub, char *buf, int max)
 	if      (streq(sub, "cpuinfo"))  gen_cpuinfo(&b);
 	else if (streq(sub, "meminfo"))  gen_meminfo(&b);
 	else if (streq(sub, "uptime"))   gen_uptime(&b);
-	else if (streq(sub, "firmware")) gen_firmware(&b);
 	else if (streq(sub, "tasks"))    gen_tasks(&b);
 	else if (streq(sub, "date"))     gen_date(&b);
 	else if (streq(sub, "owofs"))    gen_owofs(&b);
-	else if (streq(sub, "host"))     gen_host(&b);
-	else if (streq(sub, "battery"))  gen_battery(&b);
-	else if (streq(sub, "display"))  gen_display(&b);
 	else if (streq(sub, "storage"))  gen_storage(&b);
 	else if (streq(sub, "pci"))      gen_pci(&b);
 	else if (streq(sub, "journal"))  gen_journal(&b);
-	else if (streq(sub, "net"))      gen_net(&b);
 	else if (streq(sub, "clipboard")) gen_clipboard(&b);
-	else if (streq(sub, "keyboard")) gen_keyboard(&b);
-	else if (streq(sub, "mouse"))    gen_mouse(&b);
 	else if (streq(sub, "services")) gen_services(&b);
 	else if (streq(sub, "usb"))      gen_usb(&b);
 	else                             return -1;
@@ -304,18 +230,20 @@ int procfs_write(const char *sub, const char *buf, int len)
 	arg[n] = '\0';
 	while (n > 0 && (arg[n - 1] == '\n' || arg[n - 1] == '\r')) arg[--n] = '\0';
 
-	if (streq(sub, "keyboard"))
-		return keyboard_set_layout(arg) == 0 ? len : -1;
-	if (streq(sub, "mouse")) {               /* pointer-speed level "1".."5"      */
-		int v = 0;
-		for (const char *p = arg; *p >= '0' && *p <= '9'; p++)
-			v = v * 10 + (*p - '0');
-		mouse_set_speed(v);
-		return len;
-	}
 	if (streq(sub, "services")) {            /* "start X" / "stop X" / "restart X" */
 		services_cmd(arg);
 		return len;
+	}
+	/* Switch the session: payload is "name" or "name password" (one space). The
+	 * kernel hashes the plaintext and checks it against /etc/passwd, so this is
+	 * the one trusted step user space can't fake. Returns len on success; -1 if
+	 * the account is unknown or the password is wrong (writefile -> error). */
+	if (streq(sub, "login")) {
+		char *pass = arg;
+		while (*pass && *pass != ' ') pass++;
+		if (*pass == ' ') *pass++ = '\0';     /* split name from password       */
+		else pass = (char *)"";               /* no password supplied           */
+		return users_login(arg, pass) == 0 ? len : -1;
 	}
 	return -1;
 }

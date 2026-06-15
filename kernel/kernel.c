@@ -16,6 +16,7 @@
 #include "firmware.h"
 #include "smbios.h"
 #include "fs.h"
+#include "users.h"
 #include "ahci.h"
 #include "nvme.h"
 #include "sd.h"
@@ -383,6 +384,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		extern const unsigned char _binary_user_player_elf_end[];
 		extern const unsigned char _binary_user_settings_elf_start[];
 		extern const unsigned char _binary_user_settings_elf_end[];
+		extern const unsigned char _binary_user_ssh_elf_start[];
+		extern const unsigned char _binary_user_ssh_elf_end[];
 		char probe;
 		/* A Unix-like layout: programs in /bin, a home for the user. mkdir is
 		 * a no-op if the directory already exists from a previous boot. */
@@ -390,6 +393,18 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		fs_mkdir("/home");
 		fs_mkdir("/home/root");
 		fs_mkdir("/home/root/Downloads");   /* the browser saves here */
+
+		/* The account database. /etc/passwd seeds the root account with no
+		 * password (name:pwhash:uid:gid:home); /etc/group seeds the root group.
+		 * Both are plain owofs files managed thereafter by the shell's
+		 * useradd/groupadd/passwd commands. Only created if absent, so a previous
+		 * boot's accounts (and any passwords set) persist. */
+		fs_mkdir("/etc");
+		if (fs_read("/etc/passwd", &probe, 0) < 0)
+			fs_create("/etc/passwd", "root::0:0:/home/root\n", 21);
+		if (fs_read("/etc/group", &probe, 0) < 0)
+			fs_create("/etc/group", "root:0:\n", 8);
+		users_init();
 		if (fs_read("/bin/edit", &probe, 0) < 0)
 			fs_create("/bin/edit", _binary_user_edit_elf_start,
 			          (uint32_t)(_binary_user_edit_elf_end -
@@ -462,6 +477,10 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			fs_create("/bin/settings", _binary_user_settings_elf_start,
 			          (uint32_t)(_binary_user_settings_elf_end -
 			                     _binary_user_settings_elf_start));
+		if (fs_read("/bin/ssh", &probe, 0) < 0)
+			fs_create("/bin/ssh", _binary_user_ssh_elf_start,
+			          (uint32_t)(_binary_user_ssh_elf_end -
+			                     _binary_user_ssh_elf_start));
 	}
 	con_write("usermode: ready ('run curl <url>').\n");
 

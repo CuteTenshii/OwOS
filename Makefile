@@ -11,6 +11,14 @@ DISK     := disk.img
 SATADISK := sata.img
 NVMEDISK := nvme.img
 
+# Version string baked into the build: the current git tag, else the short commit
+# hash when untagged (git describe --always), with a -dirty suffix when the tree
+# has uncommitted changes. Overridable on the command line (`make OWOS_VERSION=1.2`)
+# or env; falls back to "dev" outside a git checkout. Passed to both the kernel and
+# user builds via -DOWOS_VERSION.
+OWOS_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION_DEF  := -DOWOS_VERSION='"$(OWOS_VERSION)"'
+
 CC      := gcc
 # Freestanding: no host headers/libc, no PIE, no stack protector, no red zone.
 # -mno-sse/-mno-mmx: the kernel never enables SSE (CR4.OSFXSR), so GCC must not
@@ -19,7 +27,7 @@ CC      := gcc
 # path so the flat `#include "foo.h"` convention keeps resolving everywhere.
 DRVDIRS := storage net audio usb input video acpi bus
 CFLAGS  := -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
-           -mno-sse -mno-mmx -Wall -Wextra -Ikernel $(addprefix -Idrivers/,$(DRVDIRS))
+           -mno-sse -mno-mmx -Wall -Wextra $(VERSION_DEF) -Ikernel $(addprefix -Idrivers/,$(DRVDIRS))
 LDFLAGS := -m32 -ffreestanding -nostdlib -no-pie -T linker.ld
 
 OBJS    := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flush.o \
@@ -27,8 +35,8 @@ OBJS    := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_
            drivers/input/keyboard.o kernel/timer.o kernel/shell.o kernel/serial.o kernel/log.o \
            kernel/pmm.o kernel/paging.o kernel/heap.o kernel/kstring.o \
            kernel/sched.o kernel/switch.o \
-           drivers/storage/ata.o drivers/storage/ahci.o drivers/storage/nvme.o drivers/storage/sd.o drivers/storage/atapi.o kernel/blk.o kernel/fs.o kernel/procfs.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/iso9660.o kernel/ntfs.o drivers/bus/pci.o drivers/usb/usb.o drivers/usb/xhci.o \
-           drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/tls.o \
+           drivers/storage/ata.o drivers/storage/ahci.o drivers/storage/nvme.o drivers/storage/sd.o drivers/storage/atapi.o kernel/blk.o kernel/fs.o kernel/procfs.o kernel/sysfs.o kernel/users.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/iso9660.o kernel/ntfs.o drivers/bus/pci.o drivers/usb/usb.o drivers/usb/xhci.o \
+           drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o drivers/net/igb.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/tls.o \
            kernel/url.o kernel/gzip.o kernel/png.o kernel/screenshot.o \
            drivers/audio/sb16.o drivers/audio/hda.o \
            kernel/cpu.o kernel/rtc.o drivers/acpi/power.o drivers/acpi/s3_wake.o drivers/acpi/battery.o \
@@ -44,12 +52,13 @@ OBJS    := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_
            kernel/imgview_blob.o kernel/crashme_blob.o kernel/term_blob.o \
            kernel/neofetch_blob.o kernel/lspci_blob.o kernel/play_blob.o \
            kernel/ping_blob.o kernel/dig_blob.o kernel/torrent_blob.o \
-           kernel/player_blob.o kernel/settings_blob.o
+           kernel/player_blob.o kernel/settings_blob.o kernel/ssh_blob.o
 
 # Which NIC QEMU attaches. Default rtl8139 (QEMU's classic card); override to
-# exercise the Intel driver, e.g. `make run NIC=e1000` (82540EM) — both the
-# RTL8139 and e1000 drivers are built in and the kernel picks whichever is
-# present. (`-device e1000e`/82574L is PCIe and may need `-machine q35`.)
+# exercise an Intel driver, e.g. `make run NIC=e1000` (82540EM) or
+# `make run NIC=igb` (82576, the igb-family proxy for the I210/I211). The
+# rtl8139, e1000, and igb drivers are all built in and the kernel keeps whichever
+# is present. (`-device e1000e`/82574L is PCIe and may need `-machine q35`.)
 NIC ?= rtl8139
 
 .PHONY: all run debug iso run-iso run-iso-uefi usb clean distclean
@@ -77,9 +86,9 @@ $(KERNEL): $(OBJS) linker.ld
 # is added to the include path so the flat `#include "http.h"` convention keeps
 # resolving (same trick as the kernel's DRVDIRS). libc (start/lib.c/owos.h) is
 # the base every program includes, so it stays at the user/lib root.
-ULIBDIRS := curl torrent crypto gfx zlib png mp3
+ULIBDIRS := curl torrent crypto gfx zlib png mp3 sqlite
 UCFLAGS  := -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall \
-           -mno-sse -mno-mmx -mfpmath=387 \
+           -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) \
            -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
 ULIB    := user/lib/start.o user/lib/lib.o user/lib/gfx/gfx.o
 # Optional libs, linked only into the programs that use them (so a tiny program
@@ -88,6 +97,7 @@ INFLATE := user/lib/zlib/inflate.o    # zlib: streaming DEFLATE (gzip/png)
 UPNG    := user/lib/png/upng.o        # libpng: streaming PNG decode (uses zlib)
 URL     := user/lib/curl/url.o    # shared URL parse/resolve (curl + browser)
 HTTP    := user/lib/curl/http.o   # libcurl: HTTP/1.1 over net_* (curl + torrent tracker)
+HEADERS := user/lib/curl/headers.o # libcurl: HTTP response header parser (curl + browser)
 H2      := user/lib/curl/h2.o     # libcurl: HTTP/2 engine (HPACK + framing)
 QUIC    := user/lib/curl/quic.o   # libcurl: QUIC v1 transport (RFC 9000/9001)
 H3      := user/lib/curl/h3.o     # libcurl: HTTP/3 framing + QPACK (RFC 9114/9204)
@@ -95,6 +105,7 @@ MP3     := user/lib/mp3/mp3.o     # streaming MPEG audio decoder (play, .mp3/.mp
 LIBGCC  := $(shell $(CC) -m32 -print-libgcc-file-name)  # 64-bit div helpers etc.
 CRYPTO  := user/lib/crypto/crypto.o   # SHA-1 (torrent infohash + piece verify)
 TORLIB  := user/lib/torrent/bencode.o user/lib/torrent/torrent.o   # libtorrent (+ tracker/peer)
+SQLITE  := user/lib/sqlite/sqlite.o   # real SQLite3 file-format DB (browser cookie jar)
 
 user/lib/start.o: user/lib/start.S
 	$(CC) $(UCFLAGS) -c $< -o $@
@@ -108,25 +119,25 @@ user/%.elf: user/%.o $(ULIB) user/user.ld
 	ld -m elf_i386 -T user/user.ld -o $@ $< $(ULIB)
 
 # the terminal is a self-contained shell: it links the zip/gzip file
-# codecs (zip/unzip/gzip/gunzip).
-TERMLIB := user/lib/zlib/lzss.o user/lib/zlib/deflate.o
+# codecs (zip/unzip/gzip/gunzip) and the crypto lib (SHA-256 for su/login/passwd).
+TERMLIB := user/lib/zlib/lzss.o user/lib/zlib/deflate.o $(CRYPTO)
 user/term.elf: user/term.o $(TERMLIB) $(ULIB) user/user.ld
 	ld -m elf_i386 -T user/user.ld -o $@ user/term.o $(TERMLIB) $(ULIB) $(LIBGCC)
 
 # curl is a thin CLI over libcurl (HTTP/1.1 + HTTP/2 + HTTP/3) + the shared URL
 # lib. HTTP/3 pulls in the QUIC transport, the QPACK/h3 engine and the crypto
 # lib (AES-GCM/HKDF/x25519); libgcc covers any 64-bit helper the QUIC code needs.
-user/curl.elf: user/curl.o $(HTTP) $(H2) $(H3) $(QUIC) $(URL) $(CRYPTO) $(ULIB) user/user.ld
-	ld -m elf_i386 -T user/user.ld -o $@ user/curl.o $(HTTP) $(H2) $(H3) $(QUIC) $(URL) $(CRYPTO) $(ULIB) $(LIBGCC)
+user/curl.elf: user/curl.o $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(CRYPTO) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ user/curl.o $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(CRYPTO) $(ULIB) $(LIBGCC)
 
 # The browser is a multi-file user program (user/browser/*.c), linked flat.
 # It pulls in the streaming inflate lib for gzip/deflate HTTP responses and the
 # PNG decoder so image/* pages render instead of showing as raw bytes.
-BROWSER_OBJS := user/browser/main.o user/browser/fetch.o user/browser/html.o
+BROWSER_OBJS := user/browser/main.o user/browser/fetch.o user/browser/html.o user/browser/jar.o
 user/browser/%.o: user/browser/%.c
 	$(CC) $(UCFLAGS) -c $< -o $@
-user/browser.elf: $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(URL) $(H2) $(ULIB) user/user.ld
-	ld -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(URL) $(H2) $(ULIB)
+user/browser.elf: $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(URL) $(H2) $(HEADERS) $(SQLITE) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(URL) $(H2) $(HEADERS) $(SQLITE) $(ULIB) $(LIBGCC)
 
 # The image viewer links the streaming PNG decoder (which uses inflate).
 user/imgview.elf: user/imgview.o $(UPNG) $(INFLATE) $(ULIB) user/user.ld
@@ -145,13 +156,19 @@ user/player.elf: user/player.o $(MP3) $(ULIB) user/user.ld
 user/torrent.elf: user/torrent.o $(TORLIB) $(CRYPTO) $(ULIB) user/user.ld
 	ld -m elf_i386 -T user/user.ld -o $@ user/torrent.o $(TORLIB) $(CRYPTO) $(ULIB) $(LIBGCC)
 
+# ssh is a from-scratch SSH-2 client over net_* sockets + the crypto lib
+# (X25519 + SHA-256 + AES-128-GCM back curve25519-sha256 / aes128-gcm@openssh.com).
+user/ssh.elf: user/ssh.o $(CRYPTO) $(ULIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ user/ssh.o $(CRYPTO) $(ULIB) $(LIBGCC)
+
 # Embed each ELF as an object; gives _binary_user_<name>_elf_{start,end}.
 kernel/%_blob.o: user/%.elf
 	objcopy -I binary -O elf32-i386 -B i386 $< $@
 
-# A 16 MiB raw disk image for the filesystem; persists across reboots.
+# A 64 MiB raw disk image for the filesystem; persists across reboots. owofs
+# sizes itself to the disk's capacity (capped at 64 MiB in fs.c).
 $(DISK):
-	dd if=/dev/zero of=$(DISK) bs=1M count=16 status=none
+	dd if=/dev/zero of=$(DISK) bs=1M count=64 status=none
 
 # The SATA (AHCI) scratch disk doubles as a FAT volume so the read-only FAT
 # driver (kernel/fat.c) has something real to mount. Formatted FAT16 and seeded

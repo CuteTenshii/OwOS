@@ -166,7 +166,7 @@ static const struct kbd_layout layouts[] = {
 static const char *active_map   = keymap;
 static const char *active_shift = keymap_shift;
 static const char *active_altgr = NULL;
-static const char *active_layout = "us";       /* name, for /proc/keyboard       */
+static const char *active_layout = "us";       /* name, for /sys/class/input/kbd0 */
 
 /* Keypad keys 0x47..0x53 in order, as they type when Num Lock is on. */
 static const char keypad[] = {
@@ -179,6 +179,8 @@ static const char keypad[] = {
 static int shift_held;
 static int altgr_held;
 static int ctrl_held;
+static int alt_held;               /* left Alt, for Alt+Tab window switching   */
+static int alt_tabbed;             /* Tab was pressed during this Alt hold     */
 static int expecting_extended;
 static int num_lock = 1;           /* on by default, like most BIOSes        */
 static int caps_lock;              /* off by default                         */
@@ -375,6 +377,27 @@ static void keyboard_handler(struct registers *r)
 	}
 	if (sc == (SC_CTRL | SC_RELEASE)) {  /* left Ctrl up                      */
 		ctrl_held = 0;
+		return;
+	}
+	if (sc == SC_ALT) {            /* left Alt down (Alt+Tab modifier)        */
+		alt_held = 1;
+		return;
+	}
+	if (sc == (SC_ALT | SC_RELEASE)) {   /* left Alt up                       */
+		/* Releasing Alt after an Alt+Tab gesture commits the WM's highlighted
+		 * window; a bare Alt tap (no Tab) sends nothing. */
+		if (alt_tabbed)
+			ring_push(KEY_ALT_UP);
+		alt_held = 0;
+		alt_tabbed = 0;
+		return;
+	}
+	/* Alt+Tab / Alt+Shift+Tab: drive the window switcher instead of typing a
+	 * tab. Tab is scancode 0x0F; this matches only its make code, so the release
+	 * (0x8F) still falls through to the generic release filter below. */
+	if (alt_held && sc == 0x0F) {  /* Tab make                                */
+		ring_push(shift_held ? KEY_ALTTAB_PREV : KEY_ALTTAB);
+		alt_tabbed = 1;
 		return;
 	}
 	if (sc == SC_NUMLOCK) {        /* toggle Num Lock and update its LED      */

@@ -47,6 +47,9 @@ int  net_http_get(const char *url, uint8_t *buf, uint32_t cap);
 int  net_sock_connect(const char *host, uint16_t port, int tls);
 int  net_sock_send(int h, const void *buf, uint32_t len);
 int  net_sock_recv(int h, void *buf, uint32_t max);
+/* Non-blocking recv: >0 bytes, 0 would-block, -1 error/EOF, -4 intr. Used by
+ * interactive clients (ssh) that multiplex the socket with stdin. */
+int  net_sock_recv_nb(int h, void *buf, uint32_t max);
 int  net_sock_close(int h);
 /* Negotiated ALPN protocol on a TLS socket: 2=h2, 1=http/1.1/none, 0=not TLS. */
 int  net_sock_alpn(int h);

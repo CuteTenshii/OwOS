@@ -1,4 +1,8 @@
-/* e1000.c — Intel Gigabit Ethernet driver (8254x / 82574 / I21x family).
+/* e1000.c — Intel Gigabit Ethernet driver (8254x / 82574 / I217-I219 family).
+ *
+ * NOTE: the I210/I211 are NOT this family — they are the "igb" architecture
+ * (per-queue advanced descriptors) and live in igb.c. "I21x" here means the
+ * PCH-integrated I217/I218/I219 (ich8lan/e1000e), not I210/I211.
  *
  * Drives the Intel MAC over its memory-mapped register file using the legacy
  * descriptor model: a ring of receive descriptors the card DMAs inbound frames

@@ -2,12 +2,13 @@
  *
  * Layout (512-byte sectors on the primary ATA disk):
  *   sector 0  superblock (magic + next free data sector)
- *   sector 1  directory: 16 fixed entries
- *   sector 2+ file data, contiguous, bump-allocated
+ *   sector 1+ directory: 64 fixed entries (a 4-sector table)
+ *   data      file data, contiguous, bump-allocated, past the directory
  *
- * No deletion-with-reclaim and no fragmentation handling yet -- rewriting or
- * removing a file leaks its old sectors. Good enough to demonstrate real,
- * persistent storage.
+ * Free space is tracked by an in-RAM sector bitmap rebuilt from the directory
+ * at mount, so deleting or overwriting a file reclaims its sectors (files are
+ * contiguous extents, so allocation hands out a contiguous run). The usable
+ * size follows the backing disk's own capacity (blk_sectors), capped in fs.c.
  *
  * Files are contiguous, so a file of known size can be pre-allocated
  * (fs_prealloc) and then filled in arbitrary order (fs_write_at) -- random
@@ -22,7 +23,7 @@
 void fs_init(void);     /* mount the disk; format it if unformatted          */
 void fs_format(void);
 
-/* owofs is now hierarchical: the 16 directory slots form a tree via a parent
+/* owofs is now hierarchical: the 64 directory slots form a tree via a parent
  * pointer in each entry, with an implicit root ("/"). Paths may be absolute
  * ("/bin/hello") or relative to the root ("hello"); "." and ".." are honored.
  * Component names are still <= FS_NAME_LEN-1 chars. There is no per-process

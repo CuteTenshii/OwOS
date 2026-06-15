@@ -24,7 +24,7 @@ static int W = 320, H = 380;    /* client size; changes on resize */
  * Places/Devices rows into it. */
 static struct sidebar sb;
 
-struct fent { char name[20]; int is_dir; unsigned size; };
+struct fent { char name[64]; int is_dir; unsigned size; };  /* name: owofs FS_NAME_LEN */
 
 static char        path[256] = "/";
 static int         scroll, sel = -1;
@@ -392,7 +392,7 @@ static struct {
 	int  x, y;                 /* popup top-left (clamped into the window) */
 	enum ctx_kind kind;
 	int  target;               /* place / device index                    */
-	char name[20];             /* file / dir entry name                   */
+	char name[64];             /* file / dir entry name (owofs FS_NAME_LEN) */
 } ctx;
 
 #define CTX_W   96

@@ -2,6 +2,12 @@
 #ifndef OWOS_USER_H
 #define OWOS_USER_H
 
+/* Build version: the Makefile passes -DOWOS_VERSION="<git describe>". This is the
+ * fallback for an editor/standalone compile with no -D. */
+#ifndef OWOS_VERSION
+#define OWOS_VERSION "dev"
+#endif
+
 /* Thin syscall wrappers. */
 int      write(int fd, const void *buf, int len);   /* bytes written          */
 int      read(int fd, void *buf, int len);          /* bytes read (0 = EOF)   */
@@ -55,6 +61,10 @@ int      stream_end(void);
 int      net_connect(const char *host, int port, int proto);
 int      net_send(int h, const void *buf, int len);
 int      net_recv(int h, void *buf, int max);
+/* Non-blocking recv: >0 bytes, 0 would-block (no data yet, still open), -1
+ * EOF/error, -4 interrupted. Lets an interactive client poll the socket
+ * alongside stdin without the blocking recv's idle timeout closing the link. */
+int      net_recv_nb(int h, void *buf, int max);
 int      net_close(int h);
 /* For a TLS socket, the ALPN protocol the server negotiated (we always offer
  * "h2","http/1.1"): ALPN_H2, ALPN_HTTP11 (or no ALPN), or ALPN_NONE for a
@@ -154,7 +164,7 @@ void  free(void *ptr);
 
 /* Directory enumeration: fill *out with the idx-th child of `path`
  * (NULL/""/"/" = root). Returns 1 if it exists, 0 past the end, -1 on error. */
-struct dirent_u { char name[20]; int is_dir; unsigned size; };
+struct dirent_u { char name[64]; int is_dir; unsigned size; };  /* name: owofs FS_NAME_LEN */
 int readdir(const char *path, int idx, struct dirent_u *out);
 
 /* Filesystem management (paths join onto the process cwd; the shell passes
@@ -176,10 +186,21 @@ int spawn(const char *path, const char *arg);
  * (neofetch, curl, ...) without a kernel-shell bridge. The child inherits the
  * caller's cwd. */
 int spawn_cap(const char *path, char *const argv[], int argc, int *rfd);
+/* Like spawn_cap, but also gives the child a stdin pipe: *wfd is the write end
+ * (write keystrokes into it; the child reads fd 0). For interactive children
+ * (ssh) the terminal forwards its own keystrokes through *wfd. */
+int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *wfd);
 int read_nb(int fd, void *buf, int len);  /* >0 bytes / 0 would-block / -1 EOF */
 int chdir(const char *path);              /* set this process's cwd; 0/-1      */
 int kill(int pid);                        /* terminate a child of this process */
 int power(int action);                    /* 0 = shut down, 1 = reboot         */
+
+/* Identity: numeric ids from the kernel; name/home resolved from /etc/passwd. */
+int getuid(void);
+int getgid(void);
+int user_ident(char *name, int nmax, char *home, int hmax); /* 1 if found       */
+int gethostname(char *buf, int max);      /* /etc/hostname (default "owos")     */
+int sethostname(const char *name);        /* persist /etc/hostname; 0/-1        */
 
 int intr_take(void);   /* 1 (and clear) if Ctrl+C arrived; for CPU-bound loops */
 

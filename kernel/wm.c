@@ -34,6 +34,8 @@
 #include "sb16.h"
 #include "hda.h"
 #include "power.h"
+#include "nic.h"
+#include "net.h"
 
 #define MAXWIN 40    /* compositor window slots: app windows + terminal + chrome */
 static struct window wins[MAXWIN];
@@ -195,6 +197,30 @@ static int topmost_visible(void)
 		if (wins[zlist[i]].visible)
 			return zlist[i];
 	return -1;
+}
+
+/* Alt+Tab switcher session. While the user holds Alt and taps Tab, the WM shows
+ * a centered overlay of switchable windows in most-recently-used order and moves
+ * a highlight through them; releasing Alt raises the highlighted one. The z-order
+ * is left untouched until commit, so repeated taps cycle every window instead of
+ * just toggling the top two. */
+static int at_active;             /* switcher overlay is showing               */
+static int at_order[MAXWIN];      /* switch targets, most-recent first          */
+static int at_count;
+static int at_sel;                /* highlighted row in at_order                */
+
+/* Snapshot the switchable windows (live, and either visible or minimized) into
+ * at_order, topmost first so index 0 is the current window and 1 the previous.
+ * Returns the count. */
+static int alttab_build(void)
+{
+	int n = 0;
+	for (int i = nwin - 1; i >= 0; i--) {   /* zlist is bottom..top -> reverse */
+		struct window *w = &wins[zlist[i]];
+		if (!w->dead && (w->visible || w->minimized))
+			at_order[n++] = zlist[i];
+	}
+	return n;
 }
 
 static void raise_window(int idx)
@@ -626,6 +652,55 @@ static int draw_volume(int anchor_x, int y)
 	return x;
 }
 
+/* Network indicator: a four-bar signal glyph + the IPv4 address, drawn just left
+ * of the volume indicator. `anchor_x` is that neighbour's left edge. Bars + text
+ * are green and show the leased IP when the link is up; dimmed to grey with
+ * "no link" when a NIC is present but the cable/carrier is down. Draws nothing
+ * when there's no NIC at all (matching the battery/volume "absent hardware shows
+ * nothing" rule). The state comes from the active driver via nic_present/
+ * nic_link_up, so it tracks whichever card (igb/e1000/rtl8139) the kernel kept. */
+static int draw_network(int anchor_x, int y)
+{
+	if (!nic_present())
+		return anchor_x;
+
+	int up = nic_link_up();
+	char s[20];                          /* "255.255.255.255" / "no link" + NUL */
+	int n = 0;
+	if (up) {
+		const uint8_t *ip = net_my_ip();
+		for (int i = 0; i < 4; i++) {
+			int v = ip[i];
+			if (v >= 100) s[n++] = '0' + v / 100;
+			if (v >= 10)  s[n++] = '0' + (v / 10) % 10;
+			s[n++] = '0' + v % 10;
+			if (i < 3) s[n++] = '.';
+		}
+	} else {
+		for (const char *d = "no link"; *d; d++) s[n++] = *d;
+	}
+	s[n] = 0;
+
+	uint32_t col = up ? 0x60c060 : 0x808890;
+
+	int icon_w = 16, icon_h = 11;
+	int txt_w = fb_ui_width(s);
+	int total = icon_w + 6 + txt_w;
+	int x = anchor_x - 12 - total;
+	int iy = y + (WM_BAR_H - icon_h) / 2;
+
+	/* Four rising bars (signal-strength glyph). When the link is down, only the
+	 * shortest bar is lit so it still reads as "network, but not connected". */
+	for (int i = 0; i < 4; i++) {
+		int bh = 3 + i * 2;
+		uint32_t bc = (up || i == 0) ? col : 0x3a4150;
+		fb_fill_rect(x + i * 4, iy + (icon_h - bh), 3, bh, bc);
+	}
+
+	fb_ui_text(x + icon_w + 6, y + (WM_BAR_H - UIFONT_H) / 2, s, col);
+	return x;
+}
+
 /* Draw UI text at (x,y) in colour `col`, truncated with ".." to fit `maxw`
  * pixels — the taskbar buttons are narrow and titles are arbitrary. */
 static void ui_text_clip(int x, int y, const char *s, uint32_t col, int maxw)
@@ -691,7 +766,12 @@ static void draw_taskbar(void)
 	int clock_x = screen_w - fb_ui_width(s) - 12;
 	fb_ui_text(clock_x, uy, s, 0xc8d0dc);
 
-	int ind_left = draw_volume(draw_battery(clock_x, y), y);
+	/* Right-side indicators, each laid out leftward from the previous one's
+	 * edge: clock | battery | volume | network. */
+	int ind_left = clock_x;
+	ind_left = draw_battery(ind_left, y);
+	ind_left = draw_volume(ind_left, y);
+	ind_left = draw_network(ind_left, y);
 	draw_taskbar_windows(y, uy, ind_left - 10);
 }
 
@@ -756,6 +836,45 @@ static int pick_cursor(int mx, int my)
 	return WM_CURSOR_ARROW;
 }
 
+/* Alt+Tab switcher overlay: a centered panel listing the switchable windows,
+ * one per row, with the current selection highlighted. Drawn above everything
+ * but the cursor while a switch gesture is in progress. */
+#define AT_ROW_H  24
+#define AT_PAD    12
+#define AT_PANEL_W 340
+
+static void switcher_box(int *px, int *py, int *pw, int *ph)
+{
+	int h = AT_PAD * 2 + at_count * AT_ROW_H;
+	int maxh = screen_h - WM_BAR_H - 20;
+	if (h > maxh) h = maxh;                 /* clamp if a great many windows */
+	*pw = AT_PANEL_W;
+	*ph = h;
+	*px = (screen_w - AT_PANEL_W) / 2;
+	*py = (screen_h - h) / 2;
+}
+
+static void draw_switcher(void)
+{
+	int x, y, pw, ph;
+	switcher_box(&x, &y, &pw, &ph);
+	fb_fill_rect(x, y, pw, ph, 0x141a24);
+	fb_rect(x, y, pw, ph, 0x05070a);
+	fb_rect(x + 1, y + 1, pw - 2, ph - 2, 0x2a3550);
+
+	int rows = (ph - 2 * AT_PAD) / AT_ROW_H;   /* how many fit after clamping */
+	if (rows > at_count) rows = at_count;
+	for (int i = 0; i < rows; i++) {
+		int ry = y + AT_PAD + i * AT_ROW_H;
+		if (i == at_sel)
+			fb_fill_rect(x + 4, ry, pw - 8, AT_ROW_H, 0x2f6fb0);
+		struct window *w = &wins[at_order[i]];
+		uint32_t fg = (i == at_sel) ? 0xffffff : 0xc8d0dc;
+		ui_text_clip(x + 14, ry + (AT_ROW_H - UIFONT_H) / 2, w->title, fg,
+		             pw - 28);
+	}
+}
+
 static void compose(int mx, int my)
 {
 	draw_background();
@@ -768,6 +887,8 @@ static void compose(int mx, int my)
 	draw_taskbar();
 	if (start_open)
 		draw_start_menu();
+	if (at_active)
+		draw_switcher();
 	draw_cursor(pick_cursor(mx, my), mx, my);
 	/* No fb_present() here: the caller sets the clip rect, composes, and
 	 * presents once per frame so multi-rect damage drains the write-combining
@@ -1023,6 +1144,41 @@ int wm_feed_key(char c)
 		return 1;
 	}
 
+	/* Alt+Tab window switcher. The first Tab of a hold opens the overlay and
+	 * lands on the previous window (index 1); each further Tab steps forward,
+	 * Shift+Tab steps back. The z-order is untouched until Alt is released. */
+	if (c == KEY_ALTTAB || c == KEY_ALTTAB_PREV) {
+		if (!at_active) {
+			at_count = alttab_build();
+			if (at_count <= 1) {     /* nothing to switch to */
+				at_count = 0;
+				return 1;
+			}
+			at_active = 1;
+			at_sel = 0;
+		}
+		if (c == KEY_ALTTAB)
+			at_sel = (at_sel + 1) % at_count;
+		else
+			at_sel = (at_sel - 1 + at_count) % at_count;
+		return 1;
+	}
+	if (c == KEY_ALT_UP) {           /* Alt released: commit the selection */
+		if (at_active) {
+			int idx = at_order[at_sel];
+			at_active = 0;
+			if (!wins[idx].dead) {   /* the app may have exited mid-switch */
+				if (wins[idx].minimized)
+					wm_unminimize(idx);
+				else {
+					wins[idx].visible = 1;
+					raise_window(idx);
+				}
+			}
+		}
+		return 1;
+	}
+
 	int t = topmost_visible();
 	if (t < 0)
 		return 0;
@@ -1090,6 +1246,8 @@ static void wm_thread(void)
 	int      prev_start = 0;
 	int      last_sec = -1;
 	int      prev_focus = -1;     /* topmost-visible window shown last frame     */
+	int      prev_at_active = 0;  /* Alt+Tab overlay shown last frame            */
+	int      prev_at_sel = -1;    /* highlighted switcher row last frame         */
 	int      inited = 0;
 
 	/* Pace the compositor to the panel's native refresh. edid_refresh_hz()
@@ -1165,6 +1323,15 @@ static void wm_thread(void)
 			if (zvis)
 				full = 1;
 			prev_focus = focus;
+
+			/* The Alt+Tab overlay opening/closing or moving its highlight
+			 * repaints in full: the panel is centered and overlaps an arbitrary
+			 * stack of windows, so a sub-rect diff isn't worth the bookkeeping
+			 * for a momentary, user-driven popup. */
+			if (at_active != prev_at_active || at_sel != prev_at_sel)
+				full = 1;
+			prev_at_active = at_active;
+			prev_at_sel = at_sel;
 
 			/* Windows that moved or resized: damage old and new rectangles. */
 			for (int i = 0; i < nwin; i++)

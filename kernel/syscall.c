@@ -12,6 +12,7 @@
 #include "timer.h"
 #include "fs.h"
 #include "procfs.h"
+#include "sysfs.h"
 #include "kstring.h"
 #include "power.h"
 #include "fat.h"
@@ -57,7 +58,6 @@
 #define SYS_NET_SEND   13 /* net_send(h=ebx, buf=ecx, len=edx) -> bytes/-1     */
 #define SYS_NET_RECV   14 /* net_recv(h=ebx, buf=ecx, max=edx) -> bytes(0=EOF) */
 #define SYS_NET_CLOSE  15 /* net_close(h=ebx) -> 0/-1                          */
-#define SYS_NET_ALPN   53 /* net_alpn(h=ebx) -> 2=h2 / 1=http1.1 / 0=not TLS   */
 #define SYS_WIN_CREATE 16 /* win_create(w=ebx, h=ecx, title=edx) -> id/-1      */
 #define SYS_WIN_PRESENT 17 /* win_present(id=ebx) -> 0/-1                       */
 #define SYS_WIN_POLL   18 /* win_poll(id=ebx, evt=ecx) -> 1 event/0 none/-1     */
@@ -83,31 +83,34 @@
 #define SYS_RENAME     38 /* rename(old=ebx, new=ecx) -> 0/-1                           */
 #define SYS_STAT       39 /* stat(path=ebx, out=ecx -> {int is_dir; u32 size}) -> 0/-1  */
 #define SYS_SPAWN      40 /* spawn(path=ebx, arg=ecx|0) -> pid/-1 (detached, like the WM) */
-#define SYS_SHELL      41 /* shell(cmd=ebx, out=ecx, max=edx) -> bytes/-1 (run a kernel builtin) */
-#define SYS_MOUNT      42 /* mount(kind=ebx) -> 0/-1 (mount a present removable device at /media) */
-/* (43 sysinfo / 44 pcidev removed: read /proc/* via the file API instead.) */
-#define SYS_AUDIO_OPEN 46 /* audio_open() -> 0/-1 (open a 48k/S16/stereo PCM stream)       */
-#define SYS_AUDIO_WRITE 47 /* audio_write(buf=ebx, len=ecx) -> bytes / -1 / -2 (Ctrl+C)    */
-#define SYS_AUDIO_CLOSE 48 /* audio_close() -> 0 (drain + stop the stream)                 */
-#define SYS_CMD_BEGIN  49 /* cmd_begin(cmd=ebx) -> 0/-1 (start a streamed shell command)   */
-#define SYS_CMD_READ   50 /* cmd_read(buf=ebx, max=ecx) -> n / 0 / -1 (drain its output)   */
-#define SYS_CMD_ABORT  51 /* cmd_abort() -> 0 (abort the streamed command; kill a CLI child) */
-#define SYS_INTR       52 /* intr_take() -> 1/0 (read+clear the Ctrl+C latch for this task) */
-#define SYS_SPAWN_CAP  54 /* spawn_cap(path=ebx, arg=ecx|0, int*rfd=edx) -> pid/-1
+#define SYS_MOUNT      41 /* mount(kind=ebx) -> 0/-1 (mount a present removable device at /media) */
+#define SYS_AUDIO_OPEN 42 /* audio_open() -> 0/-1 (open a 48k/S16/stereo PCM stream)       */
+#define SYS_AUDIO_WRITE 43 /* audio_write(buf=ebx, len=ecx) -> bytes / -1 / -2 (Ctrl+C)    */
+#define SYS_AUDIO_CLOSE 44 /* audio_close() -> 0 (drain + stop the stream)                 */
+#define SYS_INTR       45 /* intr_take() -> 1/0 (read+clear the Ctrl+C latch for this task) */
+#define SYS_NET_ALPN   46 /* net_alpn(h=ebx) -> 2=h2 / 1=http1.1 / 0=not TLS              */
+#define SYS_SPAWN_CAP  47 /* spawn_cap(path=ebx, arg=ecx|0, int*rfd=edx) -> pid/-1
                            * Spawn /bin child with its stdout wired to a fresh pipe; the
                            * child inherits the caller's cwd. *rfd is the read end in the
                            * caller's fd table -- drain it (read_nb) until EOF to capture. */
-#define SYS_READ_NB    55 /* read_nb(fd=ebx, buf=ecx, len=edx) -> >0 bytes / 0 would-block
+#define SYS_READ_NB    48 /* read_nb(fd=ebx, buf=ecx, len=edx) -> >0 bytes / 0 would-block
                            * / -1 EOF or error. Non-blocking sibling of SYS_READ, so a GUI
                            * program can poll a pipe and still service window events. */
-#define SYS_CHDIR      56 /* chdir(path=ebx) -> 0/-1: set the caller's own kernel cwd, so
+#define SYS_CHDIR      49 /* chdir(path=ebx) -> 0/-1: set the caller's own kernel cwd, so
                            * children it spawns resolve relative paths from there. */
-#define SYS_KILL       57 /* kill(pid=ebx) -> 0/-1: terminate a child of the caller (used to
+#define SYS_KILL       50 /* kill(pid=ebx) -> 0/-1: terminate a child of the caller (used to
                            * abort a captured command when its terminal window closes). */
-#define SYS_POWER      58 /* power(action=ebx): 0 = shut down (ACPI S5), 1 = reboot. Does not
+#define SYS_POWER      51 /* power(action=ebx): 0 = shut down (ACPI S5), 1 = reboot. Does not
                            * return on success. A real action, so a syscall -- not a /proc file. */
-#define SYS_SBRK       59 /* sbrk(inc=ebx) -> previous break / (uint32_t)-1: grow or shrink the
+#define SYS_SBRK       52 /* sbrk(inc=ebx) -> previous break / (uint32_t)-1: grow or shrink the
                            * caller's heap by `inc` bytes. The user-space malloc primitive. */
+#define SYS_NET_RECV_NB 53 /* net_recv_nb(h=ebx, buf=ecx, max=edx) -> >0 bytes / 0 would-block /
+                            * -1 EOF|err / -4 intr. Non-blocking recv for interactive clients
+                            * (ssh) that multiplex the socket with stdin. */
+#define SYS_GETUID     54 /* getuid() -> the calling task's user id (per-process credentials, */
+#define SYS_GETGID     55 /* getgid() -> its group id; user space resolves the name/home from */
+                          /* /etc/passwd itself, so there's no /proc identity file.           */
+
 /* Net transports are general sockets: SYS_NET_CONNECT's `proto` arg selects
  * TCP/TLS/UDP/raw-ICMP, so ping/dig/resolve are libs over sockets, not
  * bespoke syscalls. */
@@ -183,10 +186,14 @@ static int resolve_path(const char *name, char *out, int outcap)
 static int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t len)
 {
 	char abs[SYS_PATH_MAX];
-	uint32_t size;
+	uint32_t size = 0;
 	if (resolve_path(name, abs, sizeof abs) != 0)
 		return -1;
-	fs_stat(abs, 0, &size, 0);
+	if (fs_stat(abs, 0, &size, 0) != 0)
+		return -1;                     /* missing/unstattable: not EOF, an error
+		                                * (fs_stat leaves *size untouched on
+		                                * failure — reading it was a UB bug that
+		                                * hung on tmpfs where the garbage was big) */
 	if (off >= size)
 		return 0;                      /* EOF                                  */
 	if (len > size - off)
@@ -394,6 +401,12 @@ void syscall_dispatch(struct registers *r)
 	case SYS_MSEC:
 		r->eax = timer_us() / 1000u;   /* ms since boot (wraps ~49.7 days) */
 		break;
+	case SYS_GETUID:
+		r->eax = sched_uid();          /* per-process credentials (see sched.c) */
+		break;
+	case SYS_GETGID:
+		r->eax = sched_gid();
+		break;
 	case SYS_READFILE: {
 		const char *name = (const char *)r->ebx;
 		uint32_t buf = r->ecx, max = r->edx;
@@ -416,6 +429,11 @@ void syscall_dispatch(struct registers *r)
 		const char *proc = procfs_subpath(abs);
 		if (proc && proc[0]) {             /* /proc/<x> is a control node, not a file */
 			r->eax = (uint32_t)procfs_write(proc, (const char *)buf, (int)len);
+			break;
+		}
+		const char *sysp = sysfs_subpath(abs);   /* /sys/<...> writable attribute */
+		if (sysp && sysp[0]) {
+			r->eax = (uint32_t)sysfs_write(sysp, (const char *)buf, (int)len);
 			break;
 		}
 		r->eax = (uint32_t)fs_create(abs, (const void *)buf, len);
@@ -488,6 +506,15 @@ void syscall_dispatch(struct registers *r)
 		r->eax = (uint32_t)net_sock_recv((int)r->ebx, (void *)r->ecx, max);
 		break;
 	}
+	case SYS_NET_RECV_NB: {
+		uint32_t max = r->edx;
+		if (max == 0 || !user_range(r->ecx, max)) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		r->eax = (uint32_t)net_sock_recv_nb((int)r->ebx, (void *)r->ecx, max);
+		break;
+	}
 	case SYS_NET_CLOSE:
 		r->eax = (uint32_t)net_sock_close((int)r->ebx);
 		break;
@@ -540,7 +567,8 @@ void syscall_dispatch(struct registers *r)
 		break;
 	}
 	case SYS_READDIR: {
-		struct rd_out { char name[20]; int is_dir; uint32_t size; } *o;
+		/* name[64] mirrors struct dirent_u (owos.h) / owofs FS_NAME_LEN. */
+		struct rd_out { char name[64]; int is_dir; uint32_t size; } *o;
 		if (!user_range(r->ebx, 1) || !user_range(r->edx, sizeof *o)) {
 			r->eax = (uint32_t)-1;
 			break;
@@ -554,13 +582,13 @@ void syscall_dispatch(struct registers *r)
 		}
 		path[n] = '\0';
 		o = (struct rd_out *)r->edx;
-		char nm[20];
+		char nm[64];
 		int isd = 0;
 		uint32_t sz = 0;
 		int got = fs_enum_dir(path[0] ? path : "/", (int)r->ecx, nm, &isd, &sz, 0);
 		if (got) {
 			int i = 0;
-			for (; i < 19 && nm[i]; i++) o->name[i] = nm[i];
+			for (; i < (int)sizeof o->name - 1 && nm[i]; i++) o->name[i] = nm[i];
 			o->name[i] = '\0';
 			o->is_dir = isd;
 			o->size = sz;
@@ -798,10 +826,16 @@ void syscall_dispatch(struct registers *r)
 		/* Args arrive as one packed request so the shell can pass a full argv
 		 * vector (curl --http2 <url>) -- it tokenizes (with quotes) in user space, the
 		 * kernel just marshals the strings in and never parses a command line. */
-		struct cap_req { uint32_t path; uint32_t argv; int argc; uint32_t rfd; };
+		/* `wfd` is optional (0 = stdout-only capture, as the CLI tools use). When
+		 * non-zero, also wire the child's stdin (fd 0) to a second pipe and hand
+		 * the *write* end back in *wfd, so the terminal can feed keystrokes to an
+		 * interactive child (ssh). All callers pass the 5-field struct. */
+		struct cap_req { uint32_t path; uint32_t argv; int argc; uint32_t rfd; uint32_t wfd; };
 		if (!user_range(r->ebx, sizeof(struct cap_req))) { r->eax = (uint32_t)-1; break; }
 		struct cap_req req = *(const struct cap_req *)r->ebx;
 		if (!user_range(req.path, 1) || !user_range(req.rfd, 4)) { r->eax = (uint32_t)-1; break; }
+		int want_stdin = req.wfd != 0;
+		if (want_stdin && !user_range(req.wfd, 4)) { r->eax = (uint32_t)-1; break; }
 
 		char path[SYS_PATH_MAX];
 		int n = 0;
@@ -858,6 +892,23 @@ void syscall_dispatch(struct registers *r)
 		sched_set_pipe_fd(pid, 1, 1, id);          /* child fd 1 (stdout) -> write end */
 		sched_set_cwd(pid, sched_cwd());           /* child inherits the caller's cwd  */
 		*(int *)req.rfd = rfd;
+		/* Optional stdin pipe: our write end -> child fd 0 (its read end). If we
+		 * can't allocate it, the child still runs (stdout-only); we just report no
+		 * write fd. The child already exists, so don't fail the whole spawn. */
+		if (want_stdin) {
+			int wfd = -1;
+			for (int i = 0; i < MAX_FD; i++)
+				if (fds[i].type == FD_NONE) { wfd = i; break; }
+			int id2 = wfd >= 0 ? pipe_alloc() : -1;
+			if (wfd >= 0 && id2 >= 0) {
+				fds[wfd].type = FD_PIPE_WR; fds[wfd].pipe = (uint8_t)id2;
+				sched_set_pipe_fd(pid, 0, 0, id2);   /* child fd 0 (stdin) -> read end */
+				*(int *)req.wfd = wfd;
+			} else {
+				if (id2 >= 0) { pipe_close(id2, 0); pipe_close(id2, 1); }
+				*(int *)req.wfd = -1;
+			}
+		}
 		r->eax = (uint32_t)pid;
 		#undef MAXARGS
 		#undef MAXARG

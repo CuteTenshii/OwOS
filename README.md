@@ -157,8 +157,9 @@ them too.
 A from-scratch stack, strictly layered:
 
 - **Link layer** — a NIC dispatch layer (`nic.c`) probes the RTL8139 (QEMU's
-  default) and the Intel e1000 (8254x/82574/I21x; `make run NIC=e1000`) and
-  keeps whichever is present. The rest of the stack is driver-agnostic.
+  default), the Intel e1000 (8254x/82574/I217-I219; `make run NIC=e1000`), and
+  the Intel igb family (I210/I211/82576; `make run NIC=igb`), keeping whichever
+  is present. The rest of the stack is driver-agnostic.
 - **IPv4** (`net.c`) — ARP, ICMP echo, UDP, DNS, and a DHCP client.
 - **TCP** (`tcp.c`) — active **and** passive open, several concurrent
   connections, SYN-accepted-in-IRQ with a daemon thread taking the connection.
@@ -326,9 +327,10 @@ drivers/storage/ahci.c   polled AHCI driver for SATA disks/SSDs (MMIO + DMA)
 drivers/storage/nvme.c   minimal NVMe driver for PCIe SSDs (admin + I/O queues)
 drivers/storage/sd.c     SD/MMC card driver over an SDHCI host controller
 drivers/storage/atapi.c  polled ATAPI driver for CD/DVD drives (PACKET command)
-drivers/net/nic.c        link-layer driver dispatch (rtl8139 / e1000)
+drivers/net/nic.c        link-layer driver dispatch (igb / e1000 / rtl8139)
 drivers/net/rtl8139.c    RTL8139 NIC driver (QEMU default)
-drivers/net/e1000.c      Intel e1000 NIC driver (MMIO, RX/TX rings, IRQ)
+drivers/net/e1000.c      Intel e1000 NIC driver, 8254x/82574/I217-I219 (MMIO, RX/TX rings, IRQ)
+drivers/net/igb.c        Intel igb NIC driver, I210/I211/82576 (advanced descriptors, poll RX)
 drivers/usb/usb.c        UHCI control transfers (lsusb)
 drivers/usb/xhci.c       xHCI host + USB mass-storage block device
 drivers/input/keyboard.c PS/2 keyboard (IRQ1), input ring, US/FR layouts

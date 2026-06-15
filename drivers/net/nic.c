@@ -12,12 +12,16 @@
 #include "nic.h"
 #include "console.h"
 
+extern const struct nic_ops igb_ops;
 extern const struct nic_ops e1000_ops;
 extern const struct nic_ops rtl8139_ops;
 
-/* Probe order. e1000 is first so a real machine's onboard Intel gigabit part is
- * preferred; rtl8139 is the fallback QEMU attaches by default. */
+/* Probe order. The Intel gigabit drivers come first so a real machine's onboard
+ * Intel part is preferred; rtl8139 is the fallback QEMU attaches by default. igb
+ * (I210/I211/82576) and e1000 (8254x/82574/I217-I219) match disjoint device-ID
+ * sets, so their relative order is cosmetic — igb leads as the newer family. */
 static const struct nic_ops *const drivers[] = {
+	&igb_ops,
 	&e1000_ops,
 	&rtl8139_ops,
 };
@@ -51,6 +55,11 @@ int nic_present(void)
 const uint8_t *nic_mac(void)
 {
 	return active ? active->mac() : NULL;
+}
+
+const char *nic_name(void)
+{
+	return active ? active->name : NULL;
 }
 
 void nic_send(const uint8_t *frame, uint32_t len)

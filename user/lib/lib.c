@@ -42,22 +42,21 @@
 #define SYS_RENAME     38
 #define SYS_STAT       39
 #define SYS_SPAWN      40
-#define SYS_SHELL      41
-#define SYS_MOUNT      42
-#define SYS_AUDIO_OPEN 46
-#define SYS_AUDIO_WRITE 47
-#define SYS_AUDIO_CLOSE 48
-#define SYS_CMD_BEGIN  49
-#define SYS_CMD_READ   50
-#define SYS_CMD_ABORT  51
-#define SYS_INTR       52
-#define SYS_NET_ALPN   53
-#define SYS_SPAWN_CAP  54
-#define SYS_READ_NB    55
-#define SYS_CHDIR      56
-#define SYS_KILL       57
-#define SYS_POWER      58
-#define SYS_SBRK       59
+#define SYS_MOUNT      41
+#define SYS_AUDIO_OPEN 42
+#define SYS_AUDIO_WRITE 43
+#define SYS_AUDIO_CLOSE 44
+#define SYS_INTR       45
+#define SYS_NET_ALPN   46
+#define SYS_SPAWN_CAP  47
+#define SYS_READ_NB    48
+#define SYS_CHDIR      49
+#define SYS_KILL       50
+#define SYS_POWER      51
+#define SYS_SBRK       52
+#define SYS_NET_RECV_NB 53
+#define SYS_GETUID     54
+#define SYS_GETGID     55
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -172,6 +171,11 @@ int net_recv(int h, void *buf, int max)
 	return syscall(SYS_NET_RECV, h, (int)buf, max);
 }
 
+int net_recv_nb(int h, void *buf, int max)
+{
+	return syscall(SYS_NET_RECV_NB, h, (int)buf, max);
+}
+
 int net_close(int h)
 {
 	return syscall(SYS_NET_CLOSE, h, 0, 0);
@@ -256,8 +260,20 @@ int spawn(const char *path, const char *arg)
  * stores the read-end fd in *rfd; drain it with read_nb until EOF. */
 int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
 {
-	struct { const char *path; char *const *argv; int argc; int *rfd; } req =
-		{ path, argv, argc, rfd };
+	struct { const char *path; char *const *argv; int argc; int *rfd; int *wfd; } req =
+		{ path, argv, argc, rfd, 0 };
+	return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
+}
+
+/* Like spawn_cap, but also wires the child's stdin (fd 0) to a pipe whose write
+ * end is stored in *wfd. Feed the child keystrokes by write()'ing into *wfd; the
+ * child reads them with read()/read_nb on fd 0. For interactive children (ssh)
+ * whose input the terminal forwards from its own keystrokes. */
+int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *wfd)
+{
+	struct { const char *path; char *const *argv; int argc; int *rfd; int *wfd; } req =
+		{ path, argv, argc, rfd, wfd };
+	*wfd = -1;
 	return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
 }
 
@@ -329,6 +345,72 @@ void msleep(unsigned ms)
 int thread_create(void (*fn)(void), void *stack_top)
 {
 	return syscall(SYS_THREAD, (int)fn, (int)stack_top, 0);
+}
+
+/* ------------------------------------------------------- identity / hostname */
+/* Per-process credentials. The kernel only hands out the numeric ids; the login
+ * name and home are resolved here from /etc/passwd, the Unix way. */
+int getuid(void) { return syscall(SYS_GETUID, 0, 0, 0); }
+int getgid(void) { return syscall(SYS_GETGID, 0, 0, 0); }
+
+/* Copy the ':'-separated field #idx (0-based) of the line [s,end) into out. */
+static void passwd_field(const char *s, const char *end, int idx, char *out, int max)
+{
+	int f = 0;
+	while (f < idx && s < end) { if (*s == ':') f++; s++; }
+	int i = 0;
+	while (s < end && *s != ':' && i < max - 1) out[i++] = *s++;
+	out[i] = '\0';
+}
+
+/* Resolve the calling process's login from its uid via /etc/passwd
+ * (name:pwhash:uid:gid:home). `name` and/or `home` may be NULL. Returns 1 if a
+ * matching account was found, 0 otherwise. */
+int user_ident(char *name, int nmax, char *home, int hmax)
+{
+	static char pw[2048];
+	int uid = getuid();
+	int n = readfile("/etc/passwd", pw, (int)sizeof pw - 1);
+	if (n <= 0) return 0;
+	pw[n] = '\0';
+	for (const char *p = pw; *p; ) {
+		const char *eol = p;
+		while (*eol && *eol != '\n') eol++;
+		char uf[12];
+		passwd_field(p, eol, 2, uf, sizeof uf);
+		int u = 0;
+		for (const char *c = uf; *c >= '0' && *c <= '9'; c++) u = u * 10 + (*c - '0');
+		if (u == uid) {
+			if (name) passwd_field(p, eol, 0, name, nmax);
+			if (home) passwd_field(p, eol, 4, home, hmax);
+			return 1;
+		}
+		p = (*eol == '\n') ? eol + 1 : eol;
+	}
+	return 0;
+}
+
+/* The system hostname from /etc/hostname (default "owos" when unset). Returns
+ * the length written. */
+int gethostname(char *buf, int max)
+{
+	int n = readfile("/etc/hostname", buf, max - 1);
+	if (n <= 0) {
+		const char *d = "owos";
+		int i = 0;
+		while (d[i] && i < max - 1) { buf[i] = d[i]; i++; }
+		buf[i] = '\0';
+		return i;
+	}
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) n--;
+	buf[n] = '\0';
+	return n;
+}
+
+/* Persist a new system hostname to /etc/hostname. Returns 0/-1. */
+int sethostname(const char *name)
+{
+	return writefile("/etc/hostname", name, (int)strlen(name)) < 0 ? -1 : 0;
 }
 
 /* ----------------------------------------------------------- malloc / free */
@@ -403,6 +485,8 @@ static Header *morecore(unsigned nu)
 void *malloc(unsigned nbytes)
 {
 	if (nbytes == 0)
+		return 0;
+	if (nbytes > 0xFFFFFFFFu - 2u * sizeof(Header))   /* size math would overflow */
 		return 0;
 	unsigned nunits = (nbytes + sizeof(Header) - 1) / sizeof(Header) + 1;
 	hlock();

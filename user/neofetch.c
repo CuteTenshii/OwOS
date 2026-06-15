@@ -159,15 +159,36 @@ static unsigned u_of(const char *s)
 	return v;
 }
 
+/* 1 if `s` begins with `pre`, case-insensitively (so "HP EliteBook" is seen to
+ * start with "HP" and the vendor isn't printed twice in the Host line). */
+static int ci_prefix(const char *s, const char *pre)
+{
+	for (; *pre; s++, pre++) {
+		int a = *s, b = *pre;
+		if (a >= 'A' && a <= 'Z') a += 32;
+		if (b >= 'A' && b <= 'Z') b += 32;
+		if (a != b) return 0;
+	}
+	return 1;
+}
+
 /* --------------------------------------------------------------- the stats */
 static void build_info(void)
 {
 	static char f[8192];                   /* reused per /proc file            */
 	char v[80];
 
-	field(CYAN "OwOS" GREY);                                          endrow();
+	/* Title line: "user@host" (classic neofetch), cyan like the old "OwOS". */
+	{
+		char title[160], un[32], hn[64];
+		if (!user_ident(un, sizeof un, 0, 0)) strcpy(un, "user");
+		gethostname(hn, sizeof hn);
+		strcpy(title, CYAN); strcat(title, un); strcat(title, "@");
+		strcat(title, hn);   strcat(title, GREY);
+		field(title);                                                endrow();
+	}
 	field("----------------");                                       endrow();
-	field("OS:      "); as("OwOS 0.1");                              endrow();
+	field("OS:      "); as("OwOS " OWOS_VERSION);                    endrow();
 	field("Kernel:  "); as("owos (i386, 32-bit)");                  endrow();
 
 	readproc("/proc/cpuinfo", f, sizeof f);
@@ -210,20 +231,31 @@ static void build_info(void)
 	readproc("/proc/tasks", f, sizeof f);
 	field("Tasks:   "); au(u_of(f));                                 endrow();
 
-	readproc("/proc/firmware", f, sizeof f); rstrip(f);
+	readproc("/sys/firmware/type", f, sizeof f); rstrip(f);
 	field("Firmware:"); ac(' '); as(f[0] ? f : "unknown");          endrow();
 
-	readproc("/proc/host", f, sizeof f); rstrip(f);
-	field("Host:    "); as(f[0] ? f : "unknown");                    endrow();
+	/* Host = vendor + product (brand + model), from /sys/class/dmi/id. Skip the
+	 * vendor when the product name already starts with it (no "HP HP EliteBook"). */
+	readproc("/sys/class/dmi/id/product_name", f, sizeof f); rstrip(f);
+	readproc("/sys/class/dmi/id/sys_vendor",   v, sizeof v); rstrip(v);
+	field("Host:    ");
+	if (v[0] && f[0] && !ci_prefix(f, v)) { as(v); ac(' '); as(f); }
+	else if (f[0])                          as(f);
+	else if (v[0])                          as(v);
+	else                                    as("unknown");
+	endrow();
 
-	readproc("/proc/battery", f, sizeof f);
-	if (kvu(f, "present")) {
+	/* Battery: present when the sysfs node exists (the dir is absent with no
+	 * battery), pct from capacity, charge state from status. */
+	if (readproc("/sys/power/battery/capacity", f, sizeof f) > 0 && f[0]) {
 		field("Battery: ");
-		au(kvu(f, "pct")); ac('%');
-		if (kvu(f, "charging"))         as(" (charging)");
-		else if (kvu(f, "discharging")) {
+		au(u_of(f)); ac('%');
+		readproc("/sys/power/battery/status", v, sizeof v); rstrip(v);
+		if (streq(v, "Charging")) as(" (charging)");
+		else if (streq(v, "Discharging")) {
 			as(" (discharging");
-			unsigned mm = kvu(f, "minutes");
+			readproc("/sys/power/battery/minutes", v, sizeof v);
+			unsigned mm = u_of(v);
 			if (mm) { as(", "); au(mm / 60); as("h "); au(mm % 60); as("m left"); }
 			ac(')');
 		}
@@ -271,18 +303,23 @@ static void build_info(void)
 	}
 	if (!gpus) { field("GPU:     "); as("none detected"); endrow(); }
 
-	/* The monitor: EDID brand/model + active resolution/refresh (or text mode). */
-	readproc("/proc/display", f, sizeof f);
+	/* The monitor: EDID brand/model + active resolution/refresh (or text mode),
+	 * one attribute per sysfs file under /sys/class/graphics/fb0. */
 	field("Display: ");
-	if (kvget(f, "monitor", v, sizeof v) && v[0]) {
-		as(v);
-		if (kvu(f, "internal")) as(" (integrated)");
+	readproc("/sys/class/graphics/fb0/monitor", f, sizeof f); rstrip(f);
+	readproc("/sys/class/graphics/fb0/internal", v, sizeof v);
+	int internal = (v[0] == '1');
+	if (f[0]) {
+		as(f);
+		if (internal) as(" (integrated)");
 	} else {
-		as(kvu(f, "internal") ? "Integrated panel" : "Generic display");
+		as(internal ? "Integrated panel" : "Generic display");
 	}
 	{
-		unsigned w = kvu(f, "fbw"), h = kvu(f, "fbh");
-		if (w && h) { as(" - "); au(w); ac('x'); au(h); as(" @ "); au(kvu(f, "hz")); as("Hz"); }
+		readproc("/sys/class/graphics/fb0/width", v, sizeof v);   unsigned w = u_of(v);
+		readproc("/sys/class/graphics/fb0/height", v, sizeof v);  unsigned h = u_of(v);
+		readproc("/sys/class/graphics/fb0/refresh", v, sizeof v); unsigned hz = u_of(v);
+		if (w && h) { as(" - "); au(w); ac('x'); au(h); as(" @ "); au(hz); as("Hz"); }
 		else        { as(" - 80x25 text"); }
 	}
 	endrow();
