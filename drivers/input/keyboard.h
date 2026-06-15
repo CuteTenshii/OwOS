@@ -19,6 +19,7 @@
 #define KEY_HOME    0x05
 #define KEY_END     0x06
 #define KEY_DELETE  0x07
+#define KEY_INTR    0x18   /* Ctrl+C: interrupt (delivered to the focused app) */
 #define KEY_KILL    0x0B   /* Ctrl+U: erase the whole line                     */
 #define KEY_CLEAR   0x0C   /* Ctrl+L: clear the screen                         */
 #define KEY_F5      0x0E   /* F5: app-defined refresh/reload                   */
@@ -32,6 +33,18 @@
 #define KEY_SAVE    0x13   /* Ctrl+S                                           */
 /* Ctrl+C is not queued here -- it is a latch read via keyboard_take_interrupt
  * so it can interrupt a running command, not just the line being typed.       */
+/* Text-editing chords for a windowed editor (Ctrl+A select-all, Ctrl+X cut).
+ * The shell's line editor treats KEY_SELALL like Home (beginning of line). */
+#define KEY_SELALL  0x12   /* Ctrl+A: select all                               */
+#define KEY_CUT     0x14   /* Ctrl+X: cut the selection                        */
+/* Shift+navigation: the same arrow/Home/End cluster with Shift held, so an app
+ * can extend a selection toward the new caret position. The shell ignores them. */
+#define KEY_SLEFT   0x15
+#define KEY_SRIGHT  0x16
+#define KEY_SUP     0x17
+#define KEY_SDOWN   0x19
+#define KEY_SHOME   0x1A
+#define KEY_SEND    0x1C
 
 void keyboard_init(void);
 
@@ -42,6 +55,7 @@ int keyboard_poll(char *out);
 /* Switch the active keyboard layout by name ("us" or "fr"). Returns 0 on
  * success, -1 if the name matches no known layout. */
 int keyboard_set_layout(const char *name);
+const char *keyboard_layout_name(void);   /* current layout name ("us"/"fr")    */
 
 /* Returns 1 and clears the latch if Ctrl+C has been pressed since the last
  * call; 0 otherwise. */

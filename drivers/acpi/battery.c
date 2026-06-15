@@ -80,7 +80,7 @@ const char *battery_error(void) { return aml_last_error(); }
  * it with `cat /proc/battery`. */
 const char *battery_diag(void)
 {
-	static char buf[192];
+	static char buf[320];
 	int i = 0;
 
 	/* Stage 1: does a battery *device* exist in the tables? (Same two encodings
@@ -127,6 +127,14 @@ const char *battery_diag(void)
 		for (int k = 0; e[k]; k++) buf[i++] = e[k];
 		const char *m = aml_last_error();
 		for (int k = 0; m[k] && i < (int)sizeof buf - 1; k++) buf[i++] = m[k];
+	}
+
+	/* Verbose raw-package dump: distinguishes an "EC not available" sentinel
+	 * (every _BST field 0xFFFFFFFF) from one field that won't read. */
+	if (hid && i < (int)sizeof buf - 2) {
+		buf[i++] = ' ';
+		aml_battery_debug(buf + i, (int)sizeof buf - i);
+		while (buf[i]) i++;
 	}
 	buf[i] = 0;
 	return buf;

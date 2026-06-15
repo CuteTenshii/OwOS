@@ -30,6 +30,7 @@ int  journal_capturing(void);
 
 /* Replay the recorded journal to the console (the `journal` command). */
 void journal_dump(void);
+int  journal_copy(char *out, int max);  /* copy the journal into a buffer; bytes */
 
 /* Replay the journal onto the framebuffer boot console (catch the screen up to
  * the lines logged before graphics mode existed). Called once, after fb is up. */

@@ -1,7 +1,7 @@
-/* play.c — ring-3 audio player.
+/* play.c — audio player.
  *
  * `play <file.wav|.mp3>` streams a song to the sound device; `play <tune>` (or a
- * bare `play`) plays a PC-speaker tune. Being a ring-3 program is the point: it
+ * bare `play`) plays a PC-speaker tune. Being a user program is the point: it
  * reads the file in small chunks with pread (so a 30 MiB song never lives in
  * memory), decodes/resamples to the device's canonical 48 kHz / 16-bit / stereo
  * here in user space, and pushes ready frames to the kernel, which

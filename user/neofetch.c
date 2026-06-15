@@ -1,4 +1,4 @@
-/* neofetch.c — a ring-3 system-info splash: the OwO logo beside the stats.
+/* neofetch.c — a system-info splash: the OwO logo beside the stats.
  *
  * The presentation (logo, layout, colours) lives here in user space; the kernel
  * only hands over the raw facts through one syscall (sysinfo), the few user
@@ -28,7 +28,7 @@ static const char *logo[] = {
 #define LOGO_LINES 6
 #define LOGO_W     16
 
-/* 16-colour ANSI SGR escapes — the ring-3 terminal renders them (term.c). */
+/* 16-colour ANSI SGR escapes — the terminal renders them (term.c). */
 #define CYAN  "\033[96m"
 #define GREEN "\033[92m"
 #define GREY  "\033[37m"

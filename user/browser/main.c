@@ -1,7 +1,7 @@
-/* main.c — the browser's windowed UI and event loop (ring 3).
+/* main.c — the browser's windowed UI and event loop.
  *
  * Owns the one `struct browser` instance and the colour palette. The address
- * bar, content pane, scrollbar and status line are drawn here; a worker thread
+ * bar, content pane and scrollbar are drawn here; a worker thread
  * (thread_create) runs the blocking fetch so typing/scrolling stay live while a
  * page loads. The worker only touches B's buffers + net; window syscalls (title,
  * present) are made by this, the owning, thread.
@@ -46,22 +46,156 @@ static struct menu *const bar_menus[] = { &pagemenu, &viewmenu };
 static struct menubar menubar = { bar_menus, 2, 2, 0 };
 
 /* --- tabs ------------------------------------------------------------------ */
-/* Each tab is lightweight — its URL, a short label, and its scroll offset. Only
- * the *active* tab's page lives in B (the heavy ~11 MiB buffers), so switching a
- * tab re-loads it through the same async worker that drives normal navigation:
- * the UI stays live and memory stays bounded regardless of how many tabs exist.
- * The strip itself is the gfx tabbar widget; this owns the list it draws. */
+/* Each tab keeps its URL, label and scroll offset, plus — when it isn't the
+ * active tab — a *snapshot* of its rendered page so switching back is instant
+ * and never re-hits the network. Only the active tab's page lives in B (the
+ * heavy ~11 MiB working buffers); an inactive tab's page is serialized into the
+ * shared `arena` below. The text/attr/img_pool/raw blobs (the bulky, variable-
+ * sized parts) go in the arena; the small fixed metadata (links, image layout,
+ * urls) lives in the tab struct. A tab whose page won't fit (after evicting the
+ * least-recently-used snapshots) falls back to the old behaviour: re-fetch on
+ * select. The strip itself is the gfx tabbar widget; this owns the list. */
 #define MAX_TABS 8
-struct tab { char url[URL_MAX]; char label[40]; int scroll; };
+struct tab {
+	char url[URL_MAX];
+	char label[40];
+	int  scroll;
+
+	int  cached;                 /* 1 = a page snapshot is held below          */
+	int  blob_off, blob_len;     /* its bytes within arena[]                   */
+	unsigned lru;                /* recency stamp for eviction                 */
+
+	/* snapshot of B's small per-page metadata (the big buffers go in arena) */
+	char cur_url[URL_MAX];
+	char doc_title[128];
+	char ctype[80];
+	int  mode, text_len, raw_len, img_pool_len, nlinks, n_imgs;
+	struct link    links[MAX_LINKS];
+	struct inl_img imgs[MAX_INL_IMG];
+
+	/* the tab's favicon (decoded 16x16 ARGB), shown in the strip even while the
+	 * tab is inactive — small enough to keep inline rather than in the arena. */
+	unsigned favicon[FAVICON_W * FAVICON_H];
+	int      favicon_ok;
+};
 static struct tab tabs[MAX_TABS];
 static int n_tabs = 1;
 static int active_tab = 0;
+
+/* Snapshot arena: holds the inactive tabs' page blobs, packed front-to-back.
+ * 32 MiB leaves comfortable room beside B (~11 MiB) in the 64 MiB user window,
+ * and is demand-paged so idle tabs cost nothing. */
+#define TAB_ARENA (32 * 1024 * 1024)
+static unsigned char arena[TAB_ARENA];
+static int      arena_used;
+static unsigned lru_clock;
+
+static void update_title(int id);   /* defined below; called from tab restore */
 
 static void copy_str(char *d, const char *s, int cap)
 {
 	int i = 0;
 	for (; s[i] && i < cap - 1; i++) d[i] = s[i];
 	d[i] = '\0';
+}
+
+/* Repack live snapshots to the front of the arena, fixing each tab's offset.
+ * Compaction only ever shifts blobs left, so it stays correct under memmove. */
+static void arena_compact(void)
+{
+	int w = 0;
+	for (int i = 0; i < n_tabs; i++) {
+		if (tabs[i].cached && tabs[i].blob_len > 0) {
+			if (tabs[i].blob_off != w)
+				memmove(arena + w, arena + tabs[i].blob_off, tabs[i].blob_len);
+			tabs[i].blob_off = w;
+			w += tabs[i].blob_len;
+		}
+	}
+	arena_used = w;
+}
+
+/* Drop the least-recently-used snapshot (other than `keep`) to free space.
+ * Returns 0 when there's nothing left to evict. */
+static int arena_evict_one(int keep)
+{
+	int victim = -1; unsigned best = 0xffffffffu;
+	for (int i = 0; i < n_tabs; i++)
+		if (i != keep && tabs[i].cached && tabs[i].blob_len > 0 && tabs[i].lru < best) {
+			best = tabs[i].lru; victim = i;
+		}
+	if (victim < 0) return 0;
+	tabs[victim].cached = 0;          /* evicted: it'll re-fetch when selected */
+	tabs[victim].blob_len = 0;
+	arena_compact();
+	return 1;
+}
+
+/* Snapshot the active tab's current page into its arena slot (no-op while a
+ * fetch is in flight or the page is blank — those just re-fetch on return). */
+static void tab_cache_active(int i)
+{
+	struct tab *t = &tabs[i];
+	t->scroll = B->scroll;
+	if (B->loading || (B->mode == MODE_HTML && B->text_len == 0 && !B->cur_url[0])) {
+		if (t->cached) { t->cached = 0; t->blob_len = 0; arena_compact(); }
+		return;
+	}
+	int need = B->text_len * 2 + B->img_pool_len + B->raw_len;
+	if (t->cached) { t->cached = 0; t->blob_len = 0; arena_compact(); }
+	while (TAB_ARENA - arena_used < need)
+		if (!arena_evict_one(i)) break;
+	if (TAB_ARENA - arena_used < need) { t->cached = 0; return; }   /* too big */
+
+	int off = arena_used, tl = B->text_len;
+	memcpy(arena + off,                                 B->text,     tl);
+	memcpy(arena + off + tl,                            B->attr,     tl);
+	memcpy(arena + off + 2 * tl,                        B->img_pool, B->img_pool_len);
+	memcpy(arena + off + 2 * tl + B->img_pool_len,      B->raw,      B->raw_len);
+	arena_used += need;
+
+	t->cached = 1; t->blob_off = off; t->blob_len = need; t->lru = ++lru_clock;
+	t->mode = B->mode; t->text_len = B->text_len; t->raw_len = B->raw_len;
+	t->img_pool_len = B->img_pool_len; t->nlinks = B->nlinks; t->n_imgs = B->n_imgs;
+	memcpy(t->cur_url, B->cur_url, sizeof t->cur_url);
+	memcpy(t->doc_title, B->doc_title, sizeof t->doc_title);
+	memcpy(t->ctype, B->ctype, sizeof t->ctype);
+	memcpy(t->links, B->links, sizeof t->links);
+	memcpy(t->imgs, B->imgs, sizeof t->imgs);
+	memcpy(t->favicon, B->favicon, sizeof t->favicon);
+	t->favicon_ok = B->favicon_ok;
+}
+
+/* Restore tab `i`'s snapshot into B (instant, no network). Frees the slot —
+ * the page is live in B now and re-cached when we next switch away. */
+static void tab_restore(int i)
+{
+	struct tab *t = &tabs[i];
+	int off = t->blob_off, tl = t->text_len;
+	memcpy(B->text,     arena + off,                            tl);
+	memcpy(B->attr,     arena + off + tl,                       tl);
+	memcpy(B->img_pool, arena + off + 2 * tl,                   t->img_pool_len);
+	memcpy(B->raw,      arena + off + 2 * tl + t->img_pool_len, t->raw_len);
+
+	B->mode = t->mode; B->text_len = t->text_len; B->raw_len = t->raw_len;
+	B->img_pool_len = t->img_pool_len; B->nlinks = t->nlinks; B->n_imgs = t->n_imgs;
+	memcpy(B->cur_url, t->cur_url, sizeof B->cur_url);
+	memcpy(B->doc_title, t->doc_title, sizeof B->doc_title);
+	memcpy(B->ctype, t->ctype, sizeof B->ctype);
+	memcpy(B->links, t->links, sizeof B->links);
+	memcpy(B->imgs, t->imgs, sizeof B->imgs);
+	memcpy(B->favicon, t->favicon, sizeof B->favicon);
+	B->favicon_ok = t->favicon_ok;
+
+	B->loading = 0; B->req_pending = 0;
+	B->scroll = t->scroll;
+	B->wrap_seq = 0xFFFFFFFFu;            /* force a re-wrap at the live width */
+	B->seq++;
+
+	t->cached = 0; t->blob_len = 0; arena_compact();   /* it's live in B now  */
+
+	textfield_set(&B->addr_tf, B->cur_url[0] ? B->cur_url : t->url);
+	update_title(B->win_id);
 }
 
 /* --- worker thread: drains req_pending, fetches, bumps seq for the UI ----- */
@@ -80,6 +214,8 @@ static void worker_fn(void)
 			B->loading = 1; B->seq++;
 			do_fetch();
 			B->loading = 0; B->seq++;
+		} else if (fetch_lazy_visible()) {
+			continue;                    /* a deferred image landed: look again */
 		}
 		msleep(30);
 	}
@@ -97,12 +233,42 @@ static void add_line(int off, int len)
 }
 
 /* How many display rows an inline image reserves at the current pane width. */
+/* Decide an inline image's drawn size (dw x dh px) within a pane `paw` px wide,
+ * honouring the CSS/HTML width & height: both given pin the box (a single one
+ * scales the other by the natural aspect ratio); with neither, the natural size
+ * is used. The result is shrunk to fit the pane width, ratio preserved. dw/dh are
+ * 0 when nothing can be sized yet (no explicit size and the image isn't decoded),
+ * which the caller renders as a one-row alt box. Explicit sizes work even before
+ * the image loads, so a lazy/slow image reserves its space and the page doesn't
+ * reflow when it lands. */
+static void img_disp_size(const struct inl_img *im, int paw, int *dw, int *dh)
+{
+	int natural = im->ok && im->iw && im->ih;
+	int w = 0, h = 0;
+	if (im->cw && im->ch) {
+		w = im->cw; h = im->ch;
+	} else if (im->cw) {
+		w = im->cw;
+		h = natural ? (int)((unsigned long)im->cw * im->ih / im->iw) : im->cw;
+	} else if (im->ch) {
+		h = im->ch;
+		w = natural ? (int)((unsigned long)im->ch * im->iw / im->ih) : im->ch;
+	} else if (natural) {
+		w = (int)im->iw; h = (int)im->ih;
+	} else {
+		*dw = 0; *dh = 0; return;
+	}
+	if (w > paw) { h = (int)((long)h * paw / (w ? w : 1)); w = paw; }  /* fit width */
+	*dw = w < 1 ? 1 : w;
+	*dh = h < 1 ? 1 : h;
+}
+
 static int img_rows(const struct inl_img *im, int cols)
 {
-	if (!im->ok || im->iw == 0) return 1;             /* alt box: one row       */
 	int paw = cols * GLYPH_W; if (paw < GLYPH_W) paw = GLYPH_W;
-	int dw = (int)im->iw; if (dw > paw) dw = paw;
-	int dh = (int)((unsigned long)im->ih * (unsigned)dw / im->iw);
+	int dw = 0, dh = 0;
+	img_disp_size(im, paw, &dw, &dh);
+	if (dh <= 0) return 1;                            /* alt box: one row       */
 	int r = (dh + GLYPH_H - 1) / GLYPH_H;
 	return r < 1 ? 1 : r;
 }
@@ -273,8 +439,8 @@ static int inl_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 static void draw_inline_image(struct inl_img *im, int py, int phh, int cols)
 {
 	int paw = cols * GLYPH_W; if (paw < GLYPH_W) paw = GLYPH_W;
-	int dw = (int)im->iw; if (dw > paw) dw = paw;
-	int dh = (int)((unsigned long)im->ih * (unsigned)dw / im->iw);
+	int dw = 0, dh = 0;
+	img_disp_size(im, paw, &dw, &dh);
 	if (dw < 1) dw = 1;
 	if (dh < 1) dh = 1;
 
@@ -324,11 +490,15 @@ static void render(void)
 {
 	unsigned bg = 0xf4f5f7;
 
-	/* tab strip (between the menu bar and the address bar) */
+	/* tab strip (between the menu bar and the address bar). Each tab passes its
+	 * decoded favicon, or NULL so the widget draws the default globe. */
 	const char *labels[MAX_TABS];
-	for (int i = 0; i < n_tabs; i++)
+	const unsigned *icons[MAX_TABS];
+	for (int i = 0; i < n_tabs; i++) {
 		labels[i] = tabs[i].label[0] ? tabs[i].label : "New Tab";
-	tabbar_draw(0, MENU_H, BW, labels, n_tabs, active_tab);
+		icons[i]  = tabs[i].favicon_ok ? tabs[i].favicon : 0;
+	}
+	tabbar_draw(0, MENU_H, BW, labels, icons, n_tabs, active_tab);
 
 	/* address bar (below the tab strip): a shared text-field widget */
 	gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
@@ -337,7 +507,7 @@ static void render(void)
 
 	/* content pane */
 	int py = MENU_H + TAB_H + ADDR_H, pw = BW - SCROLL_W;
-	int phh = BH - MENU_H - TAB_H - ADDR_H - STATUS_H; if (phh < 0) phh = 0;
+	int phh = BH - MENU_H - TAB_H - ADDR_H; if (phh < 0) phh = 0;
 	gfx_fill_rect(0, py, pw, phh, bg);
 	int rows = phh / GLYPH_H;
 
@@ -346,7 +516,7 @@ static void render(void)
 			gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
 		else
 			draw_image(0, py, pw, phh, bg);
-		gfx_fill_rect(pw, py, SCROLL_W, phh, 0xc8ccd2);  /* inert scrollbar */
+		scrollbar_draw(pw, py, SCROLL_W, phh, 0, 0, 0);  /* inert scrollbar */
 	} else {
 		int cols = (pw - 8) / GLYPH_W;
 		rewrap(cols);
@@ -370,35 +540,16 @@ static void render(void)
 			int r0 = im->start_row;
 			int r1 = r0 + (im->rows > 0 ? im->rows : 1);
 			if (r1 <= B->scroll || r0 >= B->scroll + rows) continue;  /* off-screen */
+			/* On-screen now: a deferred loading="lazy" image gets flagged so the
+			 * worker fetches it (no-op once fetched). */
+			if (im->lazy && !im->fetched && show_images) im->want = 1;
 			if (im->ok && show_images) draw_inline_image(im, py, phh, cols);
 			else                       draw_alt_box(im, py, phh);
 		}
 
 		/* scrollbar */
-		gfx_fill_rect(pw, py, SCROLL_W, phh, 0xc8ccd2);
-		if (B->nlines > rows && rows > 0) {
-			int th = phh * rows / B->nlines; if (th < 12) th = 12;
-			int maxs = B->nlines - rows;
-			int ty = (maxs > 0) ? (phh - th) * B->scroll / maxs : 0;
-			gfx_fill_rect(pw + 1, py + ty, SCROLL_W - 2, th, 0x6b7686);
-		}
+		scrollbar_draw(pw, py, SCROLL_W, phh, B->scroll, B->nlines, rows);
 	}
-
-	/* status line */
-	int sy = BH - STATUS_H;
-	gfx_fill_rect(0, sy, BW, STATUS_H, 0x222831);
-	/* Keep the visible tail of the status within the bar (proportional). */
-	int savail = BW - 12;
-	int sl = strlen(B->status), so = 0, sw = 0;
-	for (int i = sl - 1; i >= 0; i--) {
-		sw += gfx_ui_cw((unsigned char)B->status[i]);
-		if (sw > savail) { so = i + 1; break; }
-	}
-	char st[200];
-	int k = 0;
-	for (int i = so; B->status[i] && k < (int)sizeof st - 1; i++) st[k++] = B->status[i];
-	st[k] = '\0';
-	gfx_ui_text(6, sy + (STATUS_H - UIFONT_H) / 2, st, 0xc8d0dc);
 
 	/* App menu bar over the top, then the dropdowns last so they overlay the page.
 	 * "Stop" is only meaningful while a fetch is in flight, so disable it when
@@ -413,21 +564,8 @@ static void render(void)
 static void pane_metrics(int *py, int *phh, int *rows)
 {
 	*py = MENU_H + TAB_H + ADDR_H;
-	*phh = BH - MENU_H - TAB_H - ADDR_H - STATUS_H; if (*phh < 0) *phh = 0;
+	*phh = BH - MENU_H - TAB_H - ADDR_H; if (*phh < 0) *phh = 0;
 	*rows = (*phh > 0) ? *phh / GLYPH_H : 1;
-}
-
-static void scroll_to_y(int my, int py, int phh, int rows)
-{
-	if (B->nlines <= rows) return;
-	int maxs = B->nlines - rows;
-	int th = phh * rows / B->nlines; if (th < 12) th = 12;
-	int span = phh - th;
-	int rel = my - py - th / 2;
-	int s = (span > 0) ? rel * maxs / span : 0;
-	if (s < 0) s = 0;
-	if (s > maxs) s = maxs;
-	B->scroll = s; B->seq++;
 }
 
 static void navigate(const char *url)
@@ -456,7 +594,8 @@ static void show_blank(void)
 	B->mode = MODE_HTML;
 	B->text_len = 0; B->nlines = 0; B->n_imgs = 0; B->nlinks = 0;
 	B->wrap_seq = 0xFFFFFFFF;
-	set_status("New tab. Type a URL and press Enter.");
+	B->favicon_ok = 0;                          /* a blank tab shows the globe */
+	tabs[active_tab].favicon_ok = 0;
 	B->seq++;
 }
 
@@ -475,26 +614,39 @@ static void tab_sync_active(void)
 		else
 			copy_str(t->label, "Untitled", sizeof t->label);
 	}
+	memcpy(t->favicon, B->favicon, sizeof t->favicon);   /* freshly decoded icon */
+	t->favicon_ok = B->favicon_ok;
 }
 
-/* Make tab `i` the active one, re-loading its page (or showing blank). */
+/* Reveal tab `i`: restore its cached page instantly, else (re)load or blank. */
+static void reveal_tab(int i)
+{
+	B->scroll = tabs[i].scroll;
+	if (tabs[i].cached)        tab_restore(i);
+	else if (tabs[i].url[0])   navigate(tabs[i].url);
+	else                       show_blank();
+}
+
+/* Make tab `i` the active one. The page we're leaving is snapshotted so coming
+ * back is instant; the one we're entering is restored from its snapshot (no
+ * network) when present, or loaded as before. */
 static void select_tab(int i)
 {
 	if (i < 0 || i >= n_tabs || i == active_tab) return;
-	tabs[active_tab].scroll = B->scroll;     /* remember where we were */
+	tab_cache_active(active_tab);            /* remember where we were */
 	active_tab = i;
-	B->scroll = tabs[i].scroll;
-	if (tabs[i].url[0]) navigate(tabs[i].url);
-	else                show_blank();
+	reveal_tab(i);
 }
 
 static void new_tab(void)
 {
-	if (n_tabs >= MAX_TABS) { set_status("Maximum tabs open."); B->seq++; return; }
-	tabs[active_tab].scroll = B->scroll;
+	if (n_tabs >= MAX_TABS) { B->seq++; return; }
+	tab_cache_active(active_tab);
 	active_tab = n_tabs++;
 	tabs[active_tab].url[0] = '\0';
 	tabs[active_tab].scroll = 0;
+	tabs[active_tab].cached = 0;
+	tabs[active_tab].blob_len = 0;
 	copy_str(tabs[active_tab].label, "New Tab", sizeof tabs[active_tab].label);
 	show_blank();
 }
@@ -503,6 +655,9 @@ static void close_tab(int i)
 {
 	if (i < 0 || i >= n_tabs || n_tabs <= 1) return;   /* keep at least one */
 	int was_active = (i == active_tab);
+	if (tabs[i].cached) {                         /* free its snapshot first */
+		tabs[i].cached = 0; tabs[i].blob_len = 0; arena_compact();
+	}
 	for (int j = i; j < n_tabs - 1; j++) {       /* shift the rest down a slot */
 		char *d = (char *)&tabs[j], *s = (char *)&tabs[j + 1];
 		for (int k = 0; k < (int)sizeof(struct tab); k++) d[k] = s[k];
@@ -510,11 +665,8 @@ static void close_tab(int i)
 	n_tabs--;
 	if (active_tab > i)          active_tab--;
 	else if (active_tab >= n_tabs) active_tab = n_tabs - 1;
-	if (was_active) {                                  /* reveal the neighbour */
-		B->scroll = tabs[active_tab].scroll;
-		if (tabs[active_tab].url[0]) navigate(tabs[active_tab].url);
-		else                         show_blank();
-	}
+	if (was_active)                                   /* reveal the neighbour */
+		reveal_tab(active_tab);
 	B->seq++;
 }
 
@@ -532,14 +684,13 @@ static void menu_action(struct menu *m, int item)
 			break;
 		case 1: navigate("example.com"); break;  /* Home                    */
 		case 2:                                  /* Stop a queued fetch     */
-			B->req_pending = 0; set_status("Stopped."); B->seq++;
+			B->req_pending = 0; B->seq++;
 			break;
 		}
 	} else if (m == &viewmenu) {
 		if (item == 0) {                         /* Show Images checkbox    */
 			view_flags[0] ^= MENU_CHECKED;
 			show_images = (view_flags[0] & MENU_CHECKED) != 0;
-			set_status(show_images ? "Images shown." : "Images hidden.");
 			B->seq++;
 		}                                        /* item 1 = Scroll submenu */
 	} else if (m == &scrollmenu) {
@@ -595,8 +746,15 @@ static void handle_click(int mx, int my)
 	}
 	int py, phh, rows;
 	pane_metrics(&py, &phh, &rows);
-	if (mx >= BW - SCROLL_W && my >= py && my < py + phh) {  /* scrollbar */
-		scroll_to_y(my, py, phh, rows);
+	int sbpart = scrollbar_hit(BW - SCROLL_W, py, SCROLL_W, phh, mx, my);
+	if (sbpart != SCROLLBAR_NONE) {                          /* scrollbar */
+		if (sbpart == SCROLLBAR_UP)        B->scroll -= 3;
+		else if (sbpart == SCROLLBAR_DOWN) B->scroll += 3;
+		else B->scroll = scrollbar_pos(BW - SCROLL_W, py, SCROLL_W, phh, mx, my,
+		                               B->scroll, B->nlines, rows);
+		if (B->scroll > B->nlines - 1) B->scroll = B->nlines - 1;
+		if (B->scroll < 0) B->scroll = 0;
+		B->seq++;
 		return;
 	}
 	if (my >= py && my < py + phh) {                        /* a link? */
@@ -660,7 +818,6 @@ int main(void)
 
 	textfield_init(&B->addr_tf, B->addr, URL_MAX);
 	textfield_set(&B->addr_tf, "example.com");
-	set_status("Ready. Type a URL and press Enter.");
 	B->wrap_seq = 0xFFFFFFFF;
 
 	int wtid = thread_create(worker_fn, &worker_stack[sizeof worker_stack]);
@@ -696,6 +853,8 @@ int main(void)
 			win_cursor(id, WIN_CURSOR_ARROW);
 			tab_sync_active();                       /* refresh the tab label */
 			update_title(id);
+			if (B->cur_url[0])                       /* show the resolved URL */
+				textfield_set(&B->addr_tf, B->cur_url);  /* (incl. the scheme) */
 		}
 		prev_loading = B->loading;
 

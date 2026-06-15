@@ -96,7 +96,7 @@ void wm_init(void);
  * window. Each app's per-window data lives behind `w->state` and in its own
  * file-static variables, private to that module. (Kernel apps still share one
  * address space, so this is an API-level guarantee, not a memory-level one;
- * enforcing it against a hostile app is the job of the future ring-3 windowing
+ * enforcing it against a hostile app is the job of the future windowing
  * syscall layer's per-process handle table — see the wm-app-interface notes.) */
 struct window *wm_create_window(int x, int y, int w, int h,
                                 const char *title, int closable);
@@ -113,7 +113,7 @@ void wm_set_cursor(struct window *w, int cursor);
 
 /* Destroy a window: hide it, clear its callbacks, and mark its pool slot
  * reusable by a later wm_create_window. The struct window* must not be used
- * afterwards. (Used by the ring-3 windowing layer when a GUI process exits.) */
+ * afterwards. (Used by the windowing layer when a GUI process exits.) */
 void wm_destroy_window(struct window *w);
 
 int wm_screen_w(void);       /* valid once the framebuffer is up               */
@@ -126,5 +126,10 @@ int wm_feed_key(char c);
 
 /* 1 if the focused window is a GUI app that consumes keyboard input. */
 int wm_focus_takes_keys(void);
+
+/* Free slots in the focused window's key-event queue (1<<30 if unbounded), so a
+ * clipboard paste can be paced to the app's drain rate instead of
+ * overflowing its small event ring. */
+int wm_focus_key_space(void);
 
 #endif

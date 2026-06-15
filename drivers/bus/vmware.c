@@ -142,3 +142,71 @@ fail:
 	msg_call(MSG_CLOSE, 0, channel, &r);
 	return -1;
 }
+
+/* --- Legacy copy/paste backdoor ----------------------------------------------
+ * The original (pre-GuestRPC) clipboard channel: four single-instruction
+ * backdoor commands carrying plain text, four bytes at a time. GET_SELLENGTH
+ * returns the host clipboard's byte length (or a negative sentinel meaning
+ * "nothing new / don't exchange"), then GET_NEXTPIECE is read ceil(len/4) times,
+ * each handing back four bytes in EAX. The push side mirrors it: SET_SELLENGTH
+ * announces the length in EBX, then SET_NEXTPIECE ships four bytes per call. */
+
+#define BDOOR_CMD_GETSELLENGTH 6
+#define BDOOR_CMD_GETNEXTPIECE 7
+#define BDOOR_CMD_SETSELLENGTH 8
+#define BDOOR_CMD_SETNEXTPIECE 9
+
+/* An implausibly large length means either a wedged host or — on a hypervisor
+ * whose vmport doesn't implement these commands — a junk register left over from
+ * the call (e.g. our own magic echoed back). Reject it rather than draining
+ * megabytes of garbage; real clipboards we care about (commands, URLs, snippets)
+ * are far under this. */
+#define CLIP_SANE_MAX (64 * 1024)
+
+int vmware_clip_recv(char *buf, int max)
+{
+	if (!vmware_present())
+		return -1;
+
+	struct vmware_regs r = { 0 };
+	vmware_send(BDOOR_CMD_GETSELLENGTH, &r);
+
+	int32_t total = (int32_t)r.eax;
+	if (total < 0 || total > CLIP_SANE_MAX)   /* nothing new, or unsupported     */
+		return -1;
+
+	int out = 0;
+	for (int32_t got = 0; got < total; ) {
+		struct vmware_regs p = { 0 };
+		vmware_send(BDOOR_CMD_GETNEXTPIECE, &p);
+		uint32_t word = p.eax;
+		for (int b = 0; b < 4 && got < total; b++, got++) {
+			char c = (char)((word >> (b * 8)) & 0xFF);
+			if (out < max)
+				buf[out++] = c;       /* still drain past max to stay in sync    */
+		}
+	}
+	return out;
+}
+
+int vmware_clip_send(const char *buf, int len)
+{
+	if (!vmware_present())
+		return -1;
+	if (len < 0)
+		len = 0;
+
+	struct vmware_regs r = { 0 };
+	r.ebx = (uint32_t)len;
+	vmware_send(BDOOR_CMD_SETSELLENGTH, &r);
+
+	for (int i = 0; i < len; i += 4) {
+		uint32_t word = 0;
+		for (int b = 0; b < 4 && i + b < len; b++)
+			word |= (uint32_t)(uint8_t)buf[i + b] << (b * 8);
+		struct vmware_regs p = { 0 };
+		p.ebx = word;
+		vmware_send(BDOOR_CMD_SETNEXTPIECE, &p);
+	}
+	return len;
+}

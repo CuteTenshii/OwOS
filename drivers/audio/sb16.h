@@ -21,7 +21,7 @@ void sb16_volume_step(int dir);   /* +1 = louder, -1 = quieter (clamped)        
 void sb16_volume_mute(void);      /* toggle mute (restores the prior level)      */
 int  sb16_volume(void);           /* 0..SB_VOL_MAX, or 0 while muted             */
 
-/* Streaming PCM sink, fed from ring 3 (/bin/play) over the SYS_AUDIO_* calls
+/* Streaming PCM sink, fed from /bin/play over the SYS_AUDIO_* calls
  * when no HD Audio codec is present. The producer pushes the canonical 48 kHz/
  * 16-bit/stereo stream; this back end down-converts each frame to 8-bit unsigned
  * mono for the SB16 DAC and paces refills to the auto-init DMA's half-boundary

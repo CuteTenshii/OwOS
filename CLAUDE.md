@@ -85,13 +85,14 @@ pci → **fb** → net (NIC dispatch + IPv4) → ahci/nvme probes → **blk (pic
 disk)** → fs → syscalls (+install user programs) → timer → keyboard → sb16 →
 scheduler + workers → services → **wm** → screenshot worker → `sti` → **shell**.
 
-The slow post-`sti` bring-up — DHCP and **`xhci_boot`** — runs in a detached
-**`boot_bringup` kernel thread**, *not* inline before the shell. Both block for
-seconds on real hardware (DHCP retransmits, xHCI port resets, all `timer_sleep`),
-and doing them inline meant keystrokes typed during boot piled up in the keyboard
-ring (captured at `sti`, drained only once the shell loop ran) and flushed all at
-once — the shell felt dead for seconds. As a background thread it runs with IF=1,
-so the "must run after `sti`" `timer_sleep` paths are still satisfied. **Nothing
+The slow post-`sti` bring-up runs off the main thread: **`xhci_boot`** in a
+detached **`boot_bringup` kernel thread**, and **DHCP** as the autostart `dhcp`
+service (which spawns its own client thread). Both block for seconds on real
+hardware (DHCP retransmits, xHCI port resets, all `timer_sleep`), and doing them
+inline meant keystrokes typed during boot piled up in the keyboard ring
+(captured at `sti`) and flushed all at once — the console felt dead for seconds.
+Off the main thread they run with IF=1, so the "must run after `sti`"
+`timer_sleep` paths are still satisfied. **Nothing
 is auto-mounted at boot** — removable volumes mount only on demand (see Storage).
 
 Order is load-bearing: the IDT must exist before any IRQ; the PIC must be
@@ -163,7 +164,7 @@ page tables; the user *frames* come from the PMM. User programs link at
 1 GiB is clear of the identity map and of two other high mappings: `SCRATCH_VADDR`
 (256 MiB — a per-CR3 scratch slot the kernel uses to transiently map any pmm
 frame and write it) and `WIN_FB_VADDR` (3 GiB — where a window's client pixel
-buffer is mapped into its owning ring-3 process, see uwin.c).
+buffer is mapped into its owning process, see uwin.c).
 
 **Above 16 MiB is on-demand**: `pmm_alloc_contig` hands out contiguous frames
 (and identity-maps them) for things too big for the heap — the framebuffer back
@@ -180,9 +181,10 @@ scheduler needn't special-case address spaces.
 
 ## Graphics & window manager (fb.c → wm.c, with mouse.c + console.c)
 
-A 32-bpp linear framebuffer, PS/2 mouse, and a compositing WM whose terminal
-window hosts the shell. **Strictly optional** — with no framebuffer the kernel
-stays in 80×25 text mode and everything still works.
+A 32-bpp linear framebuffer, PS/2 mouse, and a compositing WM. The desktop
+terminal is the **`/bin/term`** program — a self-contained shell (see Desktop
+apps). **Strictly optional** — with no framebuffer the kernel stays in 80×25 text
+mode driven by the kernel **recovery console** (shell.c) over COM1.
 
 - **fb.c gets the LFB two ways.** QEMU `-kernel`: program the Bochs/QEMU VBE
   DISPI registers (ports 0x1CE/0x1CF) from protected mode, LFB via VGA PCI BAR0.
@@ -192,11 +194,9 @@ stays in 80×25 text mode and everything still works.
   is the one funnel every console write passes through; it fans out to serial,
   the journal (log.c), the framebuffer boot console (fb.c, verbose), an optional
   capture buffer, and the VGA text backend — an 80×25 shadow grid (char+attr).
-  `con_use_framebuffer(1)` stops the text backend touching 0xB8000, and the
-  compositor renders that grid with an 8×16 CP437 font. Shell/line-editor/
-  scrolling work in the window with **zero shell changes** — keys still flow
-  through `kernel_main` into
-  `shell_feed`.
+  `con_use_framebuffer(1)` stops the text backend touching 0xB8000. This grid is
+  the **recovery console** (kernel shell.c, on COM1/text mode); the *desktop*
+  terminal is the separate `/bin/term`, which renders its own grid.
 - **wm.c is one kernel thread.** Draggable title bars, raise-on-click z-order,
   focus, close boxes, cursor, clock/taskbar; windows have kinds (`enum win_kind`:
   terminal/clock/about/files). Paces itself with `timer_sleep`.
@@ -218,29 +218,40 @@ host RAM). Three fb.c rules took a laptop from 2 fps to smooth:
    `wbinvd`, `paging_mark_wc` tags LFB PTEs with PWT) — ~10× over default UC. The
    back buffer stays write-back cached (fast to draw into).
 
-## Desktop apps (apps.c + uwin.c + app_term.c + crash.c + screenshot.c)
+## Desktop apps (apps.c + uwin.c + crash.c + screenshot.c)
 
-The WM hosts apps; only the **terminal** (which hosts the shell) opens at boot.
-Everything else launches from the taskbar **Start menu** — one row per app in
-`app_menu[]` (apps.c). An app is either **kernel-side** (its launcher is an
-`*_init()` that creates a `struct window`, e.g. app_term.c, the About box) or a
-**ring-3 program** spawned from `/bin` as a detached process the WM reaps
-(clock/files/editor/browser/imgview).
+The WM hosts apps; only the **terminal** (`/bin/term`) opens at boot. Everything
+else launches from the taskbar **Start menu** — one row per app in `app_menu[]`
+(apps.c). Apps are **programs** spawned from `/bin` as detached processes
+the WM reaps (term/clock/files/editor/browser/imgview); the only kernel-side
+window is the About box.
 
-Ring-3 GUI apps own a window through **uwin.c — the user-window server.** A
+**The terminal is the shell (`user/term.c`).** It does its own
+line editing, history, prompt, cwd, and command dispatch; there is **no
+kernel-shell bridge**. Commands run three ways: builtins over syscalls
+(file ops, plus system info/actions that read or write `/proc` — see Syscalls);
+CLI tools (neofetch/curl/lspci/ping/dig/play/torrent) spawned with their stdout
+captured through a pipe (`spawn_cap`) and rendered inline like a pty; any other
+`/bin` program launched detached. **Ctrl+C** is delivered to the focused app as a
+`KEY_INTR` key event (kernel.c routes the latch via `wm_feed_key`): it cancels
+the line at the prompt, or kills the captured child mid-command. The kernel
+`shell.c` survives only as the COM1/text **recovery console** (its builtin table
+still has the few kernel-only ops — `format`, `mtp` — that aren't in the terminal).
+
+GUI apps own a window through **uwin.c — the user-window server.** A
 process creates a window, gets a shared client-area pixel buffer mapped into its
 address space at `WIN_FB_VADDR` (3 GiB), draws into it, presents, and polls input
 events — all over the `SYS_WIN_*` syscalls. The kernel-side `struct window`'s
 `draw()` blits the user buffer; its click/key callbacks enqueue events the
 process drains. **Keyboard routing:** `wm_feed_key` offers a key to the focused
-GUI app first, falling back to `shell_feed` (see the input loop in kernel.c) —
-that's how a windowed editor gets keystrokes without shell changes.
+GUI app first, falling back to the kernel recovery console's `shell_feed` only
+when no window has focus (see the input loop in kernel.c).
 
-- **crash.c — a ring-3 fault is contained, not fatal.** When a user process
+- **crash.c — a user-process fault is contained, not fatal.** When a user process
   faults, the IDT handler calls `crash_record()` (in the faulting task's context,
   so its user stack is still mapped for a backtrace), captures registers, and
   kills the process; the WM's per-frame `crash_pump()` turns the report into an
-  "<app> has crashed" window. The kernel never panics on a ring-3 fault.
+  "<app> has crashed" window. The kernel never panics on a user-process fault.
 - **screenshot.c — Print Screen → PNG.** The keyboard IRQ can't kmalloc megabytes
   or block on disk, so it only *requests* a shot; a dedicated worker thread polls
   and does the capture, writing `/home/root/screenshotN.png`.
@@ -271,24 +282,33 @@ and the only normal entry to a context switch.
 ABI: `int 0x80`, number in `eax`, args in `ebx/ecx/edx`, return in `eax`. All
 user pointers are bounds-checked against the user window. The numbers (write=1 …
 net-close=15) **must stay in sync** between `syscall.c` and `user/lib/lib.c`. The
-net-* calls are a thin ring-3 connect/send/recv/close handle layer (`net_sock_*`
+net-* calls are a thin connect/send/recv/close handle layer (`net_sock_*`
 in net.c) — the only user-facing network API; `user/curl.c` is the client.
 
 **Syscalls are general primitives, never per-feature shortcuts.** Don't add a
 syscall because one program "needs" it; expose a general mechanism and build the
-feature in a ring-3 lib. `net_connect`'s `proto` arg selects TCP/TLS/UDP/raw-ICMP
-— so ping/dig/DNS-resolution are ring-3 code over sockets, not three bespoke
+feature in a user-space lib. `net_connect`'s `proto` arg selects TCP/TLS/UDP/raw-ICMP
+— so ping/dig/DNS-resolution are user-space code over sockets, not three bespoke
 syscalls (those were tried and removed). Same rule, computation side: codecs/
-decompression go in `user/lib`, not a syscall. **Known offenders to revisit:**
-`SYS_SYSINFO` (neofetch), `SYS_PCIDEV` (lspci), `SYS_TUNE` — each gathers data for
-one program; the general replacement is a readable interface (a `/proc`-like fs,
-or CPUID/SMBIOS exposed generally), after which those programs are rewritten over
-it. See the [[syscalls-must-be-general]] memory.
+decompression go in `user/lib`, not a syscall (the zip/gzip codecs are
+`user/lib/zlib/{lzss,deflate}.c`; `inflate.c` decompresses).
 
-Each task carries a **cwd** (`task_t.cwd`): the shell sets a child's via
-`sched_set_cwd`, fork inherits it, and path syscalls join relative names onto it
-(`join_cwd`) before hitting owofs — so `curl -o out.txt` lands in the cwd. owofs
-itself is cwd-less; programs inherit a cwd but can't `chdir`.
+**`/proc` is the general interface for kernel state and actions** (procfs.c,
+reached through the ordinary file API). *Reads* expose one fact per file
+(`cpuinfo meminfo uptime date storage tasks pci host firmware battery display
+journal services usb net clipboard keyboard`); *writes* are **control nodes** so
+user space triggers a kernel action without a per-feature syscall: write a layout to
+`/proc/keyboard` (loadkeys), text to `/proc/clipboard` (clip), `start X`/`stop X`
+to `/proc/services`. The earlier `SYS_SYSINFO`/`SYS_PCIDEV` were deleted in favor
+of this. A genuine *action* that returns nothing stays a syscall (e.g.
+`SYS_POWER` — "read a file to shut down" makes no sense). The terminal is
+built entirely on these: it captures a child's stdout via **`SYS_SPAWN_CAP`** (+
+`read_nb`/`kill`), and has no kernel-shell bridge. See [[syscalls-must-be-general]].
+
+Each task carries a **cwd** (`task_t.cwd`): a parent sets a child's via
+`sched_set_cwd`, fork/`spawn_cap` inherit it, `SYS_CHDIR` sets the caller's own,
+and path syscalls join relative names onto it (`join_cwd`) before hitting owofs —
+so `curl -o out.txt` lands in the cwd.
 
 User programs are freestanding ELF32 (`user/*.c`) linked at `0x200000` via
 `user/user.ld`. Build chain: compile → `user/NAME.elf` → objcopy into
@@ -321,18 +341,21 @@ user's real OS drive on hardware):
   identity map. Always a working FS, just non-persistent (`blk_backend()` →
   `"tmpfs"`).
 
-owofs is the *boot* volume; **removable volumes mount at `/media`** via the
-`mount`/`eject` commands, alongside owofs, over a separate set of read-only/
-read-write drivers: **fat.c** (FAT12/16/32, read **and** write), **hfs.c** (HFS+
-"Mac OS Extended", read-only — HFS+/HFSX only), **ext.c** (ext2/3/4, read-only,
-extent trees + indirect blocks), and **iso9660.c** (ISO 9660 + Joliet CD/DVD,
-read-only). The mount source is any non-owofs block device: the AHCI/NVMe scratch
-disks, a **USB flash drive** enumerated by xhci.c (BOT/SCSI mass storage exposed
-as a block device), an **SD/MMC card** brought up by sd.c, or a **CD/DVD** in an
-ATAPI drive (atapi.c). **Nothing auto-mounts** — removable volumes mount only on
-demand, via the `mount` command or the Files app's per-device **Connect** button
-(`blk_mount_device`). Exactly one removable volume lives at `/media` at a time.
-These probe by filesystem signature and never auto-format.
+owofs is the *boot* volume. **Removable volumes mount under `/media/<name>` via a
+multi-instance mount table (fs.c + `fsmount.h` — see [[multi-mount-vfs]]):**
+several can be mounted at once, including two of the same filesystem. Each driver
+(fat/hfs/ext/iso9660/**ntfs**) is a `struct fs_ops` vtable whose ops take an
+opaque per-mount instance the driver kmalloc's in `probe()`; **fat.c** is
+read+write, the rest read-only (**ntfs.c** is a from-scratch read-only NTFS
+reader: MFT + fixups + runlists + index records). `fs_mount(dev, point)` resolves
+the device via `blk_dev_io`, probes the drivers (iso for a CD, else
+fat/ext/ntfs/hfs), and adds {point, ops, inst} to `mtab[]`; `fs_unmount(point)`
+drops it. `mount_for()` routes any path by longest-prefix to the owning volume or
+owofs. `/media` is a synthetic dir listing active mounts; `/dev` lists the block
+devices. The mount source is any non-owofs device: AHCI/NVMe disks, a USB stick
+(xhci.c BOT/SCSI), an SD card (sd.c), or a CD/DVD (atapi.c). **Nothing
+auto-mounts** — `mount <dev> [point]` / `umount <point>` or the Files app's
+Connect/Unmount buttons. Drivers probe by signature and never auto-format.
 
 `blk.c` enumerates removable devices from one **candidate table** (CD → USB →
 IDE → SATA → NVMe → SD, in mount priority): `blk_device_list()` reports the
@@ -385,11 +408,14 @@ type); path resolution is case-insensitive.
 
 ## Network stack (nic.c → net.c → tcp.c → tls.c, with crypto.c)
 
-Kernel-side stack; `ping`/`dig` are shell built-ins. The one ring-3 client is
-**curl** (`user/curl.c`), all of HTTP/1.1 in user space over the four
-`net_sock_*` syscalls (no Berkeley sockets; doesn't advertise gzip). TLS is
-**client-only**; TCP/UDP have client + server paths (servers = services.c
-daemons). Strictly layered:
+Kernel-side stack; `ping`/`dig` are `/bin` tools over `net_sock_*`. The
+one user-space client is **curl** (`user/curl.c`), all of HTTP/1.1, **HTTP/2** (`--http2`) and **HTTP/3**
+(`--http3`/`-3`) in user space over the `net_sock_*` syscalls (no Berkeley
+sockets; doesn't advertise gzip). HTTP/2 (`user/lib/curl/h2.c`) is HPACK + the
+binary framing over a TLS/TCP socket; HTTP/3 (`user/lib/curl/{quic,h3}.c`) is a
+from-scratch **QUIC v1** transport + QPACK over a `SK_UDP` socket — see the QUIC
+note below. TLS is **client-only**; TCP/UDP have client + server paths (servers =
+services.c daemons). Strictly layered:
 
 - **nic.c — link-layer dispatch.** Each driver exports a `struct nic_ops`
   (probe/send/mac); `nic_init` probes `{ e1000_ops, rtl8139_ops }` in order and
@@ -399,9 +425,11 @@ daemons). Strictly layered:
   - rtl8139.c — the classic Realtek card (QEMU default).
   - e1000.c — Intel Gigabit (8254x/82574/I21x): MMIO register file (mapped UC-
     via `paging_map_uncached`), RX/TX rings, RX IRQ. `make run NIC=e1000`.
-- **net.c — IPv4**: ARP (cached), ICMP echo, UDP (DNS), a DHCP client (boot
-  lease; `dhcp` re-requests), and NTP (`ntp` sets the clock). `net_rx_frame()`
-  demuxes by EtherType/proto; TCP plugs in via `net_ip_send()`/`tcp_input()`.
+- **net.c — IPv4**: ARP (cached), ICMP echo, UDP (DNS), a DHCP client, and NTP.
+  DHCP and NTP are now **services** (services.c): `dhcp` autostarts the boot
+  lease, `ntp` syncs on demand (`services start ntp`); re-lease via
+  `services restart dhcp`. `net_rx_frame()` demuxes by EtherType/proto; TCP plugs
+  in via `net_ip_send()`/`tcp_input()`.
 - **tcp.c — active + passive open**, several concurrent connections, each a TCB
   in a fixed table demuxed by 4-tuple. `tcp_listen` pre-allocates per-slot
   buffers (the IRQ accept path never allocates); a SYN is accepted **in the IRQ**
@@ -416,6 +444,26 @@ daemons). Strictly layered:
 RX runs in **interrupt context**, so blocking client APIs (`tcp_read` …)
 `hlt`-spin while the NIC IRQ fills buffers (tick-based idle timeout), rather than
 touching the wire themselves.
+
+**QUIC + HTTP/3 are entirely in user space** (`user/lib/curl/quic.c` + `h3.c`), not in
+the kernel: a from-scratch **QUIC v1** client (RFC 9000/9001) over a `SK_UDP`
+socket, with its own TLS 1.3 handshake carried in CRYPTO frames (same key
+schedule as kernel `tls.c`, mirrored in `user/lib/crypto` — SHA-256/HMAC/HKDF +
+AES-128-GCM + AES-ECB header protection + X25519), then HTTP/3 framing + QPACK
+(`h3.c`, static table only — we advertise a zero-cap dynamic table so responses
+decode without dynamic state; HPACK's Huffman is reused). Same pragmatic scope as
+the TCP stack: one connection at a time (file-static state), `TLS_AES_128_GCM_
+SHA256` + x25519 only, **server cert not verified**, in-order/lossless delivery
+assumed, only the client-bidi request stream buffered for reading (server uni
+streams — control + QPACK — are consumed and discarded). Two **general** kernel
+enablers were needed and live in net.c: the UDP socket now buffers a *ring* of
+datagrams (`SOCK_DGRING`) instead of one slot (a QUIC handshake flight spans
+several datagrams), and `net_udp_send`'s payload cap rose from 512 to a full MTU
+(QUIC's Initial datagram must be ≥1200 bytes). Verified in QEMU against a local
+aioquic server and **production Cloudflare** (`curl --http3 https://cloudflare-
+quic.com/` → `HTTP/3 200`). curl's big stack buffers in `emit`/`send_crypto` are
+`static` (single-flow) — at `-O0` the deep call chain otherwise overflows the
+16 KiB user stack.
 
 ## Services (services.c + UDP hooks in net.c)
 
@@ -434,6 +482,12 @@ Headless daemons in a fixed enum-indexed registry; each has up to
   `net_udp_send` (safe from the IRQ — `nic_send` clears IF around the TX). Keep
   `udp_recv`'s call site in `ip_recv` in sync (it takes the source IP).
 
+- **One-shot services** (`dhcp`, `ntp`) have no tick/port: their `on_start` *is*
+  the action. `dhcp` autostarts (it owns the boot lease — there's no inline DHCP
+  in `boot_bringup` anymore) and spawns the async client thread so it never
+  blocks bring-up; `ntp` is start-on-demand and runs its synchronous SNTP sync
+  from the command context (IF=1). Re-trigger with `services restart <name>`.
+
 Auto-start daemons come up in `services_init` before `sti`. Adding a service =
 one registry edit (+ an accept-loop thread for a TCP one). Testing needs a
 `hostfwd` (SLIRP blocks inbound; `make run`/`debug` bake in
@@ -443,7 +497,7 @@ one registry edit (+ an accept-loop thread for a TCP one). Testing needs a
 `context_switch` does *not* save/restore EFLAGS, so a thread resumed by a
 *cooperative* `sched_yield` from an IF-clear context inherits IF=0; a bare `hlt`
 then halts the CPU forever and freezes the system. `tcp_accept`/`tcp_read`/
-`tcp_connect` wait with `sti; hlt`. **Same trap from a ring-3 syscall**: the
+`tcp_connect` wait with `sti; hlt`. **Same trap from a user-space syscall**: the
 `int 0x80` gate runs with IF=0, so anything a syscall reaches that spins on `hlt`
 must `sti; hlt` too (this is why making curl a user program required fixing
 `arp_resolve`/`dns_resolve`, whose loops were bare `hlt`).
@@ -472,10 +526,12 @@ READ → CLOSE`.
   it needs an IPC$ srvsvc pipe that isn't implemented. Connect to the share
   directly.
 
-## BitTorrent client (bencode.c → torrent.c → tracker.c → peer.c)
+## BitTorrent client (user/lib/torrent: bencode.c → torrent.c → tracker.c → peer.c)
 
-A from-scratch torrent client, layered like the rest of the stack and driven by
-the `torrent` shell command (`info`/`peers`/`peer`/`get`):
+A from-scratch torrent client, **entirely in user space** now: the `/bin/torrent`
+program (`user/torrent.c`) over the `user/lib/torrent/` library, driven by
+`torrent info`/`peers`/`peer`/`get`. (The old kernel-side copy was removed once
+the user-space one existed.) Layered like the rest of the stack:
 
 - **bencode.c — the wire encoding.** A parser for bencode (the int/string/list/
   dict format `.torrent` files and tracker replies use). Nodes are heap-allocated

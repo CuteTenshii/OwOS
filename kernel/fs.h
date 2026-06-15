@@ -114,4 +114,21 @@ int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime);
 int fs_enum_dir(const char *path, int idx, char *name, int *is_dir,
                 uint32_t *size, uint32_t *mtime);
 
+/* ---- removable mounts (the mount table) ----------------------------------- */
+
+/* Mount the block device `dev` (a /dev name like "usb0"/"cd0") at mount point
+ * `point` (must be "/media/<name>"). fs.c resolves the device's sector I/O via
+ * blk_dev_io and probes the filesystem drivers. Returns 0, or -1 (unknown
+ * device, no recognised filesystem, point already mounted, or table full). */
+int fs_mount(const char *dev, const char *point);
+
+/* Unmount the volume at `point`. Returns 0, or -1 if nothing is mounted there. */
+int fs_unmount(const char *point);
+
+/* Enumerate active mounts. For the idx-th mount fill *out and return 1; return 0
+ * past the last. `type`/`label` point at driver-owned strings (valid until the
+ * volume is unmounted). */
+struct fs_mountinfo { char point[48]; char dev[16]; const char *type; const char *label; };
+int fs_mount_enum(int idx, struct fs_mountinfo *out);
+
 #endif /* OWOS_FS_H */

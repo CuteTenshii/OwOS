@@ -3,7 +3,7 @@
  * con_putc() is the one funnel every console write passes through. It fans each
  * byte out to: the serial port, the boot journal (log.c), the framebuffer boot
  * console (fb.c, when verbose), an active capture buffer (file redirect / pipe /
- * the ring-3 terminal bridge), and the VGA text grid below.
+ * the terminal bridge), and the VGA text grid below.
  *
  * The VGA text grid is just this file's primary backend: an 80x25 grid at
  * physical 0xB8000, each cell a character + attribute byte, written directly (no
@@ -54,11 +54,11 @@ static char    *capture_buf;
 static uint32_t capture_cap;
 static uint32_t capture_len;
 /* Alternatively, capture can stream byte-by-byte into a sink callback (the
- * ring-3 terminal's streaming bridge): when set, con output is handed to it
+ * terminal's streaming bridge): when set, con output is handed to it
  * instead of a fixed buffer, so a long/voluminous command renders as it runs. */
 static void   (*capture_sink)(char);
 /* In ANSI capture mode, con_set_color also emits an SGR escape into the capture
- * stream, so a consumer (the ring-3 terminal's bridge) can reproduce colors.
+ * stream, so a consumer (the terminal's bridge) can reproduce colors.
  * Off for plain captures (file redirect, grep pipe), which want clean text. */
 static int      capture_ansi;
 
@@ -179,7 +179,7 @@ void con_capture_begin(char *buf, uint32_t cap)
 }
 
 /* Like con_capture_begin, but also records colors as ANSI SGR escapes (for the
- * ring-3 terminal bridge, which renders them). */
+ * terminal bridge, which renders them). */
 void con_capture_begin_ansi(char *buf, uint32_t cap)
 {
 	con_capture_begin(buf, cap);
@@ -187,7 +187,7 @@ void con_capture_begin_ansi(char *buf, uint32_t cap)
 }
 
 /* Stream capture: con output is fed byte-by-byte to `sink` (with ANSI colors)
- * instead of buffered, so the ring-3 terminal can drain and render a command's
+ * instead of buffered, so the terminal can drain and render a command's
  * output as it is produced. End it with con_capture_end like the others. */
 void con_capture_begin_sink(void (*sink)(char))
 {

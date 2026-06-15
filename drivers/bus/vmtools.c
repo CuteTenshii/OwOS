@@ -20,6 +20,55 @@
 
 #define HEARTBEAT_MS 30000
 
+#define CLIP_POLL_MS  1000         /* how often to check the host clipboard       */
+#define CLIP_MAX      8192         /* clipboard capacity (text only)              */
+
+/* The shared clipboard. clip_len is published last on every update and gates all
+ * reads, so a reader (vmtools_clip_get, possibly in the keyboard IRQ) always
+ * sees a consistent buffer/length pair without locking — single-writer here is
+ * either the poll thread (host->guest) or vmtools_clip_set (guest copy). */
+static char         clip_buf[CLIP_MAX];
+static volatile int clip_len;
+
+void vmtools_clip_set(const char *s, int len)
+{
+	if (len < 0)
+		len = 0;
+	if (len > CLIP_MAX)
+		len = CLIP_MAX;
+	for (int i = 0; i < len; i++)
+		clip_buf[i] = s[i];
+	clip_len = len;
+	vmware_clip_send(clip_buf, clip_len);   /* push to host; -1/no-op off VMware  */
+}
+
+int vmtools_clip_get(char *out, int max)
+{
+	int n = clip_len;
+	if (n > max)
+		n = max;
+	for (int i = 0; i < n; i++)
+		out[i] = clip_buf[i];
+	return n;
+}
+
+/* Watch the host clipboard: when the host offers a new selection, mirror it into
+ * the local buffer so a guest paste sees it. Drains into a private scratch first,
+ * then publishes length last so a concurrent reader never sees a torn update. */
+static void vmclip_thread(void)
+{
+	static char scratch[CLIP_MAX];
+	for (;;) {
+		timer_sleep(CLIP_POLL_MS);
+		int n = vmware_clip_recv(scratch, sizeof scratch);
+		if (n < 0)
+			continue;                       /* nothing new from the host          */
+		for (int i = 0; i < n; i++)
+			clip_buf[i] = scratch[i];
+		clip_len = n;                       /* publish last                       */
+	}
+}
+
 /* Convert Unix seconds (UTC) to a CMOS clock value (Howard Hinnant's civil-from-
  * days). The host hands us UTC; we store UTC, same as the NTP path's default. */
 static void unix_to_rtc(uint32_t t, struct rtc_time *o)
@@ -84,6 +133,11 @@ void vmtools_init(void)
 		con_write("vmtools: clock synced from host.\n");
 	else
 		con_write("vmtools: host time-sync unavailable.\n");
+
+	/* Clipboard sync rides the plain backdoor (commands 6-9), not the GuestRPC
+	 * message channel, so start it for any VMware guest — even one where the
+	 * heartbeat RPC below turns out to be unavailable. */
+	sched_create_thread("vmclip", vmclip_thread);
 
 	/* Publish a guest variable and announce the tools version. info-set lands in
 	 * guestinfo.* which the host can read back; its success tells us whether the

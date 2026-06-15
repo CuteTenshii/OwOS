@@ -41,8 +41,19 @@ typedef struct service {
 } service_t;
 
 /* Fixed registry; handlers reach their own entry through these indices. */
-enum { SVC_BEAT, SVC_ECHOD, SVC_DAYTIMED, SVC_ECHOTCP, SVC_SMBD, SVC_COUNT };
+enum { SVC_BEAT, SVC_ECHOD, SVC_DAYTIMED, SVC_ECHOTCP, SVC_SMBD,
+       SVC_DHCP, SVC_NTP, SVC_COUNT };
 static service_t svc[SVC_COUNT];
+
+/* ----------------------------------------------------- dhcp / ntp (one-shot) */
+/* Network "services" whose start *triggers* an action rather than running a
+ * daemon: dhcp leases an address, ntp syncs the clock. dhcp autostarts at boot
+ * (replacing the old inline lease) and spawns the async client thread, so it
+ * never blocks bring-up; `services restart dhcp` re-leases. ntp is on demand
+ * (`services start ntp`), running from the command/servicesd context with
+ * interrupts on, so its synchronous SNTP round-trip is safe. */
+static int dhcp_svc_start(service_t *s) { (void)s; net_dhcp_start(); return 0; }
+static int ntp_svc_start(service_t *s)  { (void)s; return net_ntp(""); }
 
 
 /* Write `s` left-justified in a field `width` columns wide. */
@@ -278,6 +289,14 @@ void services_init(void)
 	svc[SVC_SMBD] = (service_t){
 		.name = "smbd", .desc = "SMB2 file server (read-only, guest)",
 		.port = 445, .on_start = smbd_start, .on_stop = smbd_stop_fn,
+	};
+	svc[SVC_DHCP] = (service_t){
+		.name = "dhcp", .desc = "DHCP client (lease IP/gw/dns)",
+		.autostart = 1, .on_start = dhcp_svc_start,
+	};
+	svc[SVC_NTP] = (service_t){
+		.name = "ntp", .desc = "SNTP clock sync (start to sync)",
+		.on_start = ntp_svc_start,
 	};
 
 	sched_create_thread("servicesd", services_supervisor);

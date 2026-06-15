@@ -1,22 +1,15 @@
-/* zip.c — LZSS compression for the zip/unzip shell commands.
+/* lzss.c — LZSS compression for the zip/unzip commands.
  *
- * Classic LZSS over a 4 KiB sliding window: matches of 3..18 bytes encoded as a
- * 12-bit back-distance + 4-bit length, literals passed through verbatim. A flag
- * byte precedes every run of up to eight tokens; bit i (LSB first) is 1 for a
- * literal byte, 0 for a back-reference (two bytes: distance low 8 / distance
- * high 4 + length). Hash chains keyed on 3-byte prefixes make the match search
- * fast, and a bounded chain walk keeps the worst case in check.
- *
- * The container is an 8-byte header — "OWOZ" then the original size, both so
- * unzip can reject foreign files and size its output exactly — followed by the
- * token stream.
+ * A verbatim port of kernel/zip.c (see lzss.h): classic LZSS over a 4 KiB
+ * sliding window, matches of 3..18 bytes encoded as a 12-bit back-distance +
+ * 4-bit length, literals passed through. The only change from the kernel codec
+ * is that the compressor's hash tables are file-static scratch instead of heap
+ * allocations (no allocator in user space; single-threaded use from the terminal).
  */
 
 #include <stddef.h>
 #include <stdint.h>
-#include "zip.h"
-#include "endian.h"
-#include "heap.h"
+#include "lzss.h"
 
 #define WINDOW      4096            /* 12-bit back-distance (1..WINDOW)         */
 #define MIN_MATCH   3
@@ -24,6 +17,9 @@
 #define HASH_BITS   13
 #define HASH_SIZE   (1u << HASH_BITS)
 #define MAX_CHAIN   128             /* cap chain walks so compression is bounded */
+
+static int g_head[HASH_SIZE];       /* hash chains: scratch, reset per compress */
+static int g_prev[WINDOW];
 
 static void put_u32(uint8_t *p, uint32_t v)
 {
@@ -33,6 +29,11 @@ static void put_u32(uint8_t *p, uint32_t v)
 	p[3] = (uint8_t)(v >> 24);
 }
 
+static uint32_t load_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
 
 /* A multiplicative hash of the 3 bytes at p, folded to HASH_BITS. */
 static uint32_t hash3(const uint8_t *p)
@@ -54,8 +55,6 @@ static void ht_insert(int *head, int *prev, const uint8_t *src,
 
 uint32_t zip_bound(uint32_t src_len)
 {
-	/* Worst case is all literals: one flag bit per byte (1/8 overhead) plus
-	 * a possible partial flag byte, on top of the header. */
 	return ZIP_HEADER + src_len + (src_len + 7) / 8 + 1;
 }
 
@@ -68,13 +67,8 @@ int zip_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
 	put_u32(dst + 4, slen);
 	uint32_t out = ZIP_HEADER;
 
-	int *head = kmalloc(HASH_SIZE * sizeof(int));
-	int *prev = kmalloc(WINDOW * sizeof(int));
-	if (!head || !prev) {
-		kfree(head);
-		kfree(prev);
-		return -1;
-	}
+	int *head = g_head;
+	int *prev = g_prev;
 	for (uint32_t i = 0; i < HASH_SIZE; i++)
 		head[i] = -1;
 
@@ -85,7 +79,7 @@ int zip_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
 	while (pos < slen) {
 		if (nflags == 0) {     /* reserve a fresh flag byte                 */
 			if (out >= dcap)
-				goto overflow;
+				return -1;
 			flagpos = out++;
 			dst[flagpos] = 0;
 		}
@@ -116,7 +110,7 @@ int zip_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
 
 		if (best_len >= MIN_MATCH) {            /* back-reference token     */
 			if (out + 2 > dcap)
-				goto overflow;
+				return -1;
 			uint32_t d = best_dist - 1;         /* 0..4095 in 12 bits   */
 			uint32_t lc = (uint32_t)best_len - MIN_MATCH;  /* 0..15     */
 			dst[out++] = (uint8_t)(d & 0xFF);
@@ -127,7 +121,7 @@ int zip_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
 				ht_insert(head, prev, src, slen, pos++);
 		} else {                                /* literal token            */
 			if (out + 1 > dcap)
-				goto overflow;
+				return -1;
 			dst[flagpos] |= (uint8_t)(1 << nflags);
 			dst[out++] = src[pos];
 			ht_insert(head, prev, src, slen, pos++);
@@ -135,14 +129,7 @@ int zip_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
 		nflags = (nflags + 1) & 7;
 	}
 
-	kfree(head);
-	kfree(prev);
 	return (int)out;
-
-overflow:
-	kfree(head);
-	kfree(prev);
-	return -1;
 }
 
 int zip_orig_size(const uint8_t *src, uint32_t slen)

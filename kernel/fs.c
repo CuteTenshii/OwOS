@@ -4,73 +4,123 @@
 
 #include "fs.h"
 #include "blk.h"
+#include "fsmount.h"
 #include "procfs.h"
-#include "fat.h"
-#include "hfs.h"
-#include "ext.h"
-#include "iso9660.h"
 #include "console.h"
 #include "rtc.h"
 
-/* A mounted removable volume (FAT via fat.c, HFS+ via hfs.c, ext2/3/4 via ext.c,
- * or ISO 9660 CD/DVD via iso9660.c) is grafted into the owofs namespace at
- * "/media" -- so the ordinary
- * ls/cat/cd reach it with no per-command special-casing and no parallel verbs.
- * media_subpath() recognises a path inside the mount and returns the path *within*
- * the volume: "" for "/media" itself, "/docs/README.TXT" for the nested file. It
- * returns NULL when nothing is mounted or the path is plain owofs. */
-#define MEDIA_MOUNT "media"
+/* ----------------------------------------------------------- mount table ---
+ *
+ * Removable volumes are grafted into the owofs namespace under "/media/<name>"
+ * -- so the ordinary ls/cat/cd reach them with no per-command special-casing.
+ * Each mounted volume is a slot in mtab[]: a mount point ("/media/usb0"), the
+ * /dev name it came from, and the driver's fs_ops + opaque instance. Because no
+ * driver keeps global state any more, N volumes (including two of the same
+ * type) mount at once.
+ *
+ * mount_for() does a longest-prefix match of a path against the active mount
+ * points and returns the owning mount plus the path *within* the volume ("" for
+ * the mount point itself, "/docs/README.TXT" for a nested file), or NULL for a
+ * plain-owofs path. The thin rvol_* dispatchers just call through the resolved
+ * mount's fs_ops; a mount is writable iff its ops expose create(). */
+#define MAX_MOUNTS 8
 
-/* Exactly one removable volume is mounted at a time; these dispatch to whichever
- * driver owns it. Writes go to FAT only -- HFS+, ext and ISO 9660 are read-only.
- * One if-ladder per verb, in the same driver order, keeps the routing legible. */
-static int rvol_mounted(void)
-{ return fat_mounted() || hfs_mounted() || ext_mounted() || iso_mounted(); }
-static int rvol_readonly(void)
-{ return hfs_mounted() || ext_mounted() || iso_mounted(); }
+struct mnt {
+	int                  used;
+	char                 point[48];     /* "/media/usb0"                       */
+	char                 dev[16];       /* "usb0"                              */
+	const struct fs_ops *ops;
+	void                *inst;
+};
 
-static int rvol_list(const char *p)
+static struct mnt mtab[MAX_MOUNTS];
+
+/* Length of a NUL-terminated string. */
+static int s_len(const char *s)
 {
-	if (iso_mounted()) return iso_list(p);
-	if (ext_mounted()) return ext_list(p);
-	if (hfs_mounted()) return hfs_list(p);
-	return fat_list(p);
-}
-static int rvol_stat(const char *p, int *d, uint32_t *s)
-{
-	if (iso_mounted()) return iso_stat(p, d, s);
-	if (ext_mounted()) return ext_stat(p, d, s);
-	if (hfs_mounted()) return hfs_stat(p, d, s);
-	return fat_stat(p, d, s);
-}
-static int rvol_read_at(const char *p, uint32_t o, void *b, uint32_t l)
-{
-	if (iso_mounted()) return iso_read_at(p, o, b, l);
-	if (ext_mounted()) return ext_read_at(p, o, b, l);
-	if (hfs_mounted()) return hfs_read_at(p, o, b, l);
-	return fat_read_at(p, o, b, l);
-}
-static int rvol_enum(const char *p, int i, char *n, int *d, uint32_t *s)
-{
-	if (iso_mounted()) return iso_enum_dir(p, i, n, d, s);
-	if (ext_mounted()) return ext_enum_dir(p, i, n, d, s);
-	if (hfs_mounted()) return hfs_enum_dir(p, i, n, d, s);
-	return fat_enum_dir(p, i, n, d, s);
+	int n = 0;
+	while (s[n]) n++;
+	return n;
 }
 
-static const char *media_subpath(const char *path)
+/* Longest-prefix match of `path` against the active mount points. A match needs
+ * the whole point string to match and the next char of path to be '\0' or '/'.
+ * On a match *sub is the remainder within the volume ("" when path == the mount
+ * point, else the "/..." tail). Returns the owning mnt, or NULL. */
+static struct mnt *mount_for(const char *path, const char **sub)
 {
-	if (!path || !rvol_mounted())
+	if (!path)
 		return NULL;
-	while (*path == '/')               /* tolerate absolute or root-relative */
-		path++;
-	const char *m = MEDIA_MOUNT;
+	struct mnt *best = NULL;
+	int best_len = -1;
+	for (int i = 0; i < MAX_MOUNTS; i++) {
+		if (!mtab[i].used)
+			continue;
+		const char *p = path;
+		const char *m = mtab[i].point;
+		while (*m && *p == *m) { p++; m++; }
+		if (*m != '\0')                 /* didn't match the whole point        */
+			continue;
+		if (*p != '\0' && *p != '/')    /* "/media/usb0x" must not match       */
+			continue;
+		int len = s_len(mtab[i].point);
+		if (len > best_len) {
+			best = &mtab[i];
+			best_len = len;
+			*sub = p;                   /* "" or "/sub/path"                   */
+		}
+	}
+	return best;
+}
+
+/* A mount is writable iff its driver exposes create(). */
+static int rvol_readonly(struct mnt *m) { return m->ops->create == NULL; }
+
+static int rvol_list(struct mnt *m, const char *p)
+{ return m->ops->list(m->inst, p); }
+static int rvol_stat(struct mnt *m, const char *p, int *d, uint32_t *s)
+{ return m->ops->stat(m->inst, p, d, s); }
+static int rvol_read_at(struct mnt *m, const char *p, uint32_t o, void *b, uint32_t l)
+{ return m->ops->read_at(m->inst, p, o, b, l); }
+static int rvol_enum(struct mnt *m, const char *p, int i, char *n, int *d, uint32_t *s)
+{ return m->ops->enum_dir(m->inst, p, i, n, d, s); }
+
+/* The leaf name of a mount point ("/media/usb0" -> "usb0"). */
+static const char *mnt_leaf(const struct mnt *m)
+{
+	const char *s = m->point;
+	const char *leaf = s;
+	for (const char *p = s; *p; p++)
+		if (*p == '/')
+			leaf = p + 1;
+	return leaf;
+}
+
+/* True for "/media" or "/media/" -- the synthetic mount-root directory. */
+static int is_media_root(const char *path)
+{
+	if (!path)
+		return 0;
+	const char *m = "/media";
 	while (*m && *path == *m) { path++; m++; }
-	if (*m != '\0')                    /* didn't match the whole "media"      */
+	if (*m != '\0')
+		return 0;
+	return *path == '\0' || (*path == '/' && path[1] == '\0');
+}
+
+/* The part of an absolute path after "/dev" ("" for "/dev", "/usb0" for a
+ * child), or NULL if the path isn't under /dev. Mirrors procfs_subpath. */
+static const char *dev_subpath(const char *path)
+{
+	if (!path)
 		return NULL;
-	if (*path != '\0' && *path != '/') /* "mediafoo" must not match "media"   */
+	const char *m = "/dev";
+	while (*m && *path == *m) { path++; m++; }
+	if (*m != '\0')
 		return NULL;
-	return path;                       /* "" or "/sub/path"                  */
+	if (*path != '\0' && *path != '/')      /* "/devfoo" must not match        */
+		return NULL;
+	return path;                            /* "" or "/usb0"                   */
 }
 
 #define SECTOR_SIZE     512
@@ -374,9 +424,41 @@ void fs_list(const char *path)
 		con_write("fs: not mounted\n");
 		return;
 	}
-	const char *sub = media_subpath(path);
-	if (sub) {                             /* under the FAT mount -> fat.c      */
-		if (rvol_list(sub) < 0)
+	/* /dev -- synthetic read-only directory of block-device names.            */
+	const char *dv = dev_subpath(path);
+	if (dv) {
+		if (dv[0] != '\0' && !(dv[0] == '/' && dv[1] == '\0')) {
+			con_write("ls: no such file or directory\n");
+			return;
+		}
+		struct blk_devinfo devs[16];
+		int nd = blk_dev_list(devs, 16);
+		for (int i = 0; i < nd; i++) {
+			write_mtime(0); con_write("  "); write_pad(0, 8);
+			con_write("  "); con_write(devs[i].dev); con_putc('\n');
+		}
+		if (!nd)
+			con_write("(empty)\n");
+		return;
+	}
+	/* /media -- synthetic directory of the active mounts.                     */
+	if (is_media_root(path)) {
+		int n = 0;
+		for (int i = 0; i < MAX_MOUNTS; i++)
+			if (mtab[i].used) {
+				write_mtime(0); con_write("  "); con_write("   <DIR>");
+				con_write("  "); con_write(mnt_leaf(&mtab[i])); con_putc('/');
+				con_putc('\n');
+				n++;
+			}
+		if (!n)
+			con_write("(empty)\n");
+		return;
+	}
+	const char *sub;
+	struct mnt *mv = mount_for(path, &sub);
+	if (mv) {                              /* inside a mounted volume -> driver */
+		if (rvol_list(mv, sub) < 0)
 			con_write("ls: no such file or directory\n");
 		return;
 	}
@@ -396,9 +478,10 @@ void fs_list(const char *path)
 			list_row(i);
 			n++;
 		}
-	if (d == FS_SLOT_ROOT && rvol_mounted()) {  /* surface the mount point      */
-		con_write("       -            <DIR>  " MEDIA_MOUNT "/\n");
-		n++;
+	if (d == FS_SLOT_ROOT) {               /* the mount root + /dev always show */
+		con_write("       -            <DIR>  media/\n");
+		con_write("       -            <DIR>  dev/\n");
+		n += 2;
 	}
 	if (!n)
 		con_write("(empty)\n");
@@ -411,9 +494,12 @@ int fs_read(const char *name, void *buf, uint32_t maxlen)
 		return procfs_read(proc, (char *)buf, (int)maxlen);
 	if (!mounted)
 		return -1;
-	const char *sub = media_subpath(name);
-	if (sub) {
-		int r = rvol_read_at(sub, 0, buf, maxlen);
+	if (dev_subpath(name))                 /* /dev entries are not byte-readable */
+		return -1;
+	const char *sub;
+	struct mnt *mv = mount_for(name, &sub);
+	if (mv) {
+		int r = rvol_read_at(mv, sub, 0, buf, maxlen);
 		return r < 0 ? -1 : r;
 	}
 	int i = find_file(name);
@@ -442,10 +528,11 @@ int fs_size(const char *name)
 {
 	if (!mounted)
 		return -1;
-	const char *sub = media_subpath(name);
-	if (sub) {
+	const char *sub;
+	struct mnt *mv = mount_for(name, &sub);
+	if (mv) {
 		int is_dir; uint32_t sz;
-		if (rvol_stat(sub, &is_dir, &sz) != 0 || is_dir)
+		if (rvol_stat(mv, sub, &is_dir, &sz) != 0 || is_dir)
 			return -1;
 		return (int)sz;
 	}
@@ -460,9 +547,12 @@ int fs_read_at(const char *name, uint32_t offset, void *buf, uint32_t len)
 {
 	if (!mounted)
 		return -1;
-	const char *sub = media_subpath(name);
-	if (sub) {
-		int r = rvol_read_at(sub, offset, buf, len);
+	if (dev_subpath(name))                 /* /dev entries are not byte-readable */
+		return -1;
+	const char *sub;
+	struct mnt *mv = mount_for(name, &sub);
+	if (mv) {
+		int r = rvol_read_at(mv, sub, offset, buf, len);
 		return r < 0 ? -1 : r;
 	}
 	int i = find_file(name);
@@ -511,10 +601,11 @@ int fs_create(const char *name, const void *data, uint32_t size)
 {
 	if (!mounted)
 		return -1;
-	const char *sub = media_subpath(name);
-	if (sub) {
-		if (rvol_readonly()) return -1;        /* HFS+ is read-only */
-		return fat_create(sub, data, size) == 0 ? 0 : -1;
+	const char *sub;
+	struct mnt *mv = mount_for(name, &sub);
+	if (mv) {
+		if (rvol_readonly(mv)) return -1;      /* read-only mount */
+		return mv->ops->create(mv->inst, sub, data, size) == 0 ? 0 : -1;
 	}
 
 	int parent;
@@ -582,13 +673,11 @@ int fs_delete(const char *name)
 {
 	if (!mounted)
 		return -1;
-	const char *sub = media_subpath(name);
-	if (sub) {
-		if (rvol_readonly()) return -1;        /* HFS+ is read-only */
-		int r = fat_delete(sub);
-		if (r == 0)  return 0;
-		if (r == -3) return -2;          /* it's a directory -> fs_rmdir */
-		return -1;
+	const char *sub;
+	struct mnt *mv = mount_for(name, &sub);
+	if (mv) {
+		if (rvol_readonly(mv)) return -1;      /* read-only mount */
+		return mv->ops->del(mv->inst, sub) == 0 ? 0 : -1;
 	}
 	int i = find_path(name);
 	if (i < 0 || i == FS_SLOT_ROOT)
@@ -639,10 +728,11 @@ int fs_mkdir(const char *path)
 {
 	if (!mounted)
 		return -1;
-	const char *sub = media_subpath(path);
-	if (sub) {
-		if (rvol_readonly()) return -1;        /* HFS+ is read-only */
-		return fat_mkdir(sub) == 0 ? 0 : -1;
+	const char *sub;
+	struct mnt *mv = mount_for(path, &sub);
+	if (mv) {
+		if (rvol_readonly(mv)) return -1;      /* read-only mount */
+		return mv->ops->mkdir(mv->inst, sub) == 0 ? 0 : -1;
 	}
 	int parent;
 	char leaf[FS_NAME_LEN];
@@ -666,11 +756,11 @@ int fs_rmdir(const char *path)
 {
 	if (!mounted)
 		return -1;
-	const char *sub = media_subpath(path);
-	if (sub) {
-		if (rvol_readonly()) return -1;        /* HFS+ is read-only */
-		int r = fat_rmdir(sub);
-		return (r == 0) ? 0 : (r == -2) ? -2 : (r == -3) ? -3 : -1;
+	const char *sub;
+	struct mnt *mv = mount_for(path, &sub);
+	if (mv) {
+		if (rvol_readonly(mv)) return -1;      /* read-only mount */
+		return mv->ops->rmdir(mv->inst, sub) == 0 ? 0 : -1;
 	}
 	int s = find_path(path);
 	if (s < 0 || s == FS_SLOT_ROOT)
@@ -686,10 +776,16 @@ int fs_rmdir(const char *path)
 
 int fs_isdir(const char *path)
 {
-	const char *sub = media_subpath(path);
-	if (sub) {
+	if (is_media_root(path))
+		return 1;
+	const char *dv = dev_subpath(path);
+	if (dv)
+		return (dv[0] == '\0' || (dv[0] == '/' && dv[1] == '\0')) ? 1 : 0;
+	const char *sub;
+	struct mnt *mv = mount_for(path, &sub);
+	if (mv) {
 		int is_dir;
-		if (rvol_stat(sub, &is_dir, NULL) != 0)
+		if (rvol_stat(mv, sub, &is_dir, NULL) != 0)
 			return -1;
 		return is_dir ? 1 : 0;
 	}
@@ -705,6 +801,11 @@ int fs_prealloc(const char *name, uint32_t size)
 {
 	if (!mounted)
 		return -1;
+	{   /* prealloc/write_at have no fs_ops counterpart -- not on a mount */
+		const char *sub;
+		if (mount_for(name, &sub))
+			return -1;
+	}
 
 	int parent;
 	char leaf[FS_NAME_LEN];
@@ -753,6 +854,11 @@ int fs_write_at(const char *name, uint32_t offset, const void *data, uint32_t le
 {
 	if (!mounted)
 		return -1;
+	{   /* random-access write has no fs_ops counterpart -- not on a mount */
+		const char *sub;
+		if (mount_for(name, &sub))
+			return -1;
+	}
 	int i = find_file(name);
 	if (i >= 0) {
 		if (offset > dir[i].size || len > dir[i].size - offset)
@@ -804,6 +910,11 @@ int fs_stream_begin(const char *name)
 {
 	if (!mounted || strm_active)
 		return -1;
+	{   /* streaming creation has no fs_ops counterpart -- not on a mount */
+		const char *sub;
+		if (mount_for(name, &sub))
+			return -1;
+	}
 	if (resolve_path(name, &strm_parent, strm_name) != 0 || strm_name[0] == '\0')
 		return -1;                             /* bad path / names a directory     */
 	strm_start = sb.next_free;
@@ -969,14 +1080,43 @@ int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime)
 	}
 	if (!mounted)
 		return -1;
-	const char *sub = media_subpath(path);
-	if (sub) {
+	/* /media -- the synthetic mount root is a directory, even with no mounts. */
+	if (is_media_root(path)) {
+		if (is_dir) *is_dir = 1;
+		if (size)   *size = 0;
+		if (mtime)  *mtime = 0;
+		return 0;
+	}
+	/* /dev -- the directory itself, or a named block device (a regular file). */
+	const char *dv = dev_subpath(path);
+	if (dv) {
+		if (dv[0] == '\0' || (dv[0] == '/' && dv[1] == '\0')) {
+			if (is_dir) *is_dir = 1;
+			if (size)   *size = 0;
+			if (mtime)  *mtime = 0;
+			return 0;
+		}
+		const char *nm = dv + 1;       /* skip the leading slash */
+		struct blk_devinfo devs[16];
+		int nd = blk_dev_list(devs, 16);
+		for (int i = 0; i < nd; i++)
+			if (s_eq(devs[i].dev, nm)) {
+				if (is_dir) *is_dir = 0;
+				if (size)   *size = 0;
+				if (mtime)  *mtime = 0;
+				return 0;
+			}
+		return -1;                     /* no such device */
+	}
+	const char *sub;
+	struct mnt *mv = mount_for(path, &sub);
+	if (mv) {
 		int d; uint32_t sz;
-		if (rvol_stat(sub, &d, &sz) != 0)
+		if (rvol_stat(mv, sub, &d, &sz) != 0)
 			return -1;
 		if (is_dir) *is_dir = d;
 		if (size)   *size = sz;
-		if (mtime)  *mtime = 0;        /* FAT mtimes not surfaced yet */
+		if (mtime)  *mtime = 0;        /* removable-fs mtimes not surfaced yet */
 		return 0;
 	}
 	int slot = find_path((path && path[0]) ? path : "/");
@@ -1008,10 +1148,48 @@ int fs_enum_dir(const char *path, int idx, char *name, int *is_dir,
 	}
 	if (!mounted || idx < 0)
 		return 0;
-	const char *sub = media_subpath(path);
-	if (sub) {                         /* browsing inside the FAT mount      */
+	/* /media -- the idx-th active mount's leaf name (a directory).            */
+	if (is_media_root(path)) {
+		int count = 0;
+		for (int i = 0; i < MAX_MOUNTS; i++) {
+			if (!mtab[i].used)
+				continue;
+			if (count == idx) {
+				const char *leaf = mnt_leaf(&mtab[i]);
+				int j = 0;
+				for (; leaf[j] && j < 17; j++)
+					name[j] = leaf[j];
+				name[j] = '\0';
+				if (is_dir) *is_dir = 1;
+				if (size)   *size = 0;
+				if (mtime)  *mtime = 0;
+				return 1;
+			}
+			count++;
+		}
+		return 0;
+	}
+	/* /dev -- the idx-th present block device (a regular file).               */
+	const char *dv = dev_subpath(path);
+	if (dv && (dv[0] == '\0' || (dv[0] == '/' && dv[1] == '\0'))) {
+		struct blk_devinfo devs[16];
+		int nd = blk_dev_list(devs, 16);
+		if (idx >= nd)
+			return 0;
+		int j = 0;
+		for (; devs[idx].dev[j] && j < 17; j++)
+			name[j] = devs[idx].dev[j];
+		name[j] = '\0';
+		if (is_dir) *is_dir = 0;
+		if (size)   *size = 0;
+		if (mtime)  *mtime = 0;
+		return 1;
+	}
+	const char *sub;
+	struct mnt *mv = mount_for(path, &sub);
+	if (mv) {                          /* browsing inside a mounted volume   */
 		int d; uint32_t sz;
-		if (!rvol_enum(sub, idx, name, &d, &sz))
+		if (!rvol_enum(mv, sub, idx, name, &d, &sz))
 			return 0;
 		if (is_dir) *is_dir = d;
 		if (size)   *size = sz;
@@ -1043,19 +1221,144 @@ int fs_enum_dir(const char *path, int idx, char *name, int *is_dir,
 		}
 		count++;
 	}
-	/* The FAT volume appears as a synthetic "fat" directory in the root. */
-	if (parent == FS_ROOT && rvol_mounted()) {
+	/* The mount root and /dev always appear as synthetic directories in root. */
+	if (parent == FS_ROOT) {
+		static const char *const synth[] = { "media", "dev" };
+		for (int sidx = 0; sidx < 2; sidx++) {
+			if (count == idx) {
+				const char *nm = synth[sidx];
+				int j = 0;
+				for (; nm[j] && j < FS_NAME_LEN - 1; j++)
+					name[j] = nm[j];
+				name[j] = '\0';
+				if (is_dir) *is_dir = 1;
+				if (size)   *size = 0;
+				if (mtime)  *mtime = 0;
+				return 1;
+			}
+			count++;
+		}
+	}
+	return 0;
+}
+
+/* ----------------------------------------------------------- mount API ----- */
+
+/* Validate that `point` is "/media/<name>" with exactly one path component
+ * after "/media/" (no nested slashes). Returns 0 on success, -1 otherwise. */
+static int valid_media_point(const char *point)
+{
+	const char *m = "/media/";
+	const char *p = point;
+	while (*m && *p == *m) { p++; m++; }
+	if (*m != '\0')
+		return -1;                      /* doesn't start with "/media/"        */
+	if (*p == '\0')
+		return -1;                      /* "/media/" with no name              */
+	for (; *p; p++)
+		if (*p == '/')
+			return -1;                  /* nested slash -> not one component   */
+	return 0;
+}
+
+static void str_copy(char *dst, const char *src, int cap)
+{
+	int i = 0;
+	for (; i < cap - 1 && src[i]; i++)
+		dst[i] = src[i];
+	dst[i] = '\0';
+}
+
+int fs_mount(const char *dev, const char *point)
+{
+	if (!dev || !point)
+		return -1;
+	if (valid_media_point(point) != 0)
+		return -1;
+
+	/* Reject a duplicate mount point and find a free slot. */
+	int slot = -1;
+	for (int i = 0; i < MAX_MOUNTS; i++) {
+		if (mtab[i].used) {
+			if (s_eq(mtab[i].point, point))
+				return -1;              /* already mounted there               */
+		} else if (slot < 0) {
+			slot = i;
+		}
+	}
+	if (slot < 0)
+		return -1;                      /* mount table full                    */
+
+	blk_read_fn  r = NULL;
+	blk_write_fn w = NULL;
+	int iso = 0;
+	if (blk_dev_io(dev, &r, &w, &iso) != 0)
+		return -1;                      /* no such /dev device                 */
+
+	const struct fs_ops *ops = NULL;
+	void *inst = NULL;
+	if (iso) {
+		ops = iso_ops();
+		inst = ops ? ops->probe(r, w) : NULL;
+		if (!inst)
+			return -1;
+	} else {
+		const struct fs_ops *cand[] = {
+			fat_ops(), ext_ops(), ntfs_ops(), hfs_ops(),
+		};
+		for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
+			if (!cand[i])
+				continue;
+			inst = cand[i]->probe(r, w);
+			if (inst) { ops = cand[i]; break; }
+		}
+		if (!inst)
+			return -1;                  /* no driver recognised the medium     */
+	}
+
+	mtab[slot].used = 1;
+	str_copy(mtab[slot].point, point, (int)sizeof mtab[slot].point);
+	str_copy(mtab[slot].dev, dev, (int)sizeof mtab[slot].dev);
+	mtab[slot].ops = ops;
+	mtab[slot].inst = inst;
+	return 0;
+}
+
+int fs_unmount(const char *point)
+{
+	if (!point)
+		return -1;
+	for (int i = 0; i < MAX_MOUNTS; i++) {
+		if (mtab[i].used && s_eq(mtab[i].point, point)) {
+			if (mtab[i].ops->close)
+				mtab[i].ops->close(mtab[i].inst);
+			mtab[i].used = 0;
+			mtab[i].point[0] = '\0';
+			mtab[i].dev[0] = '\0';
+			mtab[i].ops = NULL;
+			mtab[i].inst = NULL;
+			return 0;
+		}
+	}
+	return -1;                          /* no such mount                       */
+}
+
+int fs_mount_enum(int idx, struct fs_mountinfo *out)
+{
+	if (idx < 0 || !out)
+		return 0;
+	int count = 0;
+	for (int i = 0; i < MAX_MOUNTS; i++) {
+		if (!mtab[i].used)
+			continue;
 		if (count == idx) {
-			int j = 0;
-			for (; MEDIA_MOUNT[j] && j < FS_NAME_LEN - 1; j++)
-				name[j] = MEDIA_MOUNT[j];
-			name[j] = '\0';
-			if (is_dir) *is_dir = 1;
-			if (size)   *size = 0;
-			if (mtime)  *mtime = 0;
+			str_copy(out->point, mtab[i].point, (int)sizeof out->point);
+			str_copy(out->dev, mtab[i].dev, (int)sizeof out->dev);
+			out->type  = mtab[i].ops->type  ? mtab[i].ops->type(mtab[i].inst)  : "";
+			out->label = mtab[i].ops->label ? mtab[i].ops->label(mtab[i].inst) : "";
 			return 1;
 		}
 		count++;
 	}
-	return 0;
+	return 0;                           /* past the last mount                 */
 }

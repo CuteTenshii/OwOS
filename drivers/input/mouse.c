@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "mouse.h"
 #include "vmmouse.h"
+#include "synaptics.h"
 #include "irq.h"
 #include "io.h"
 #include "console.h"
@@ -41,6 +42,17 @@ static int               bound_x, bound_y;
 static uint8_t           packet[4];
 static uint8_t           cycle;
 static int               wheel_mode;   /* 1 once IntelliMouse 4-byte mode is on  */
+static int               syn_mode;     /* 1 once a Synaptics TouchPad took over   */
+
+/* Pointer-speed scale applied to PS/2 relative deltas: a level 1..5 (3 = the
+ * native 1x), each mapping to a num/den factor. A fractional residual carries
+ * the bit lost to integer division into the next packet, so a slow setting still
+ * moves smoothly instead of snapping in whole steps. Settable from user space via
+ * /proc/mouse (the Settings app's Mouse/Touchpad category). */
+static int               speed = 3;
+static int               res_x, res_y;
+static const int         spd_num[5] = { 1, 3, 1, 3, 2 };
+static const int         spd_den[5] = { 2, 4, 1, 2, 1 };
 
 /* Spin until the controller can accept a write (input buffer empties). */
 static void ps2_wait_write(void)
@@ -82,8 +94,15 @@ static void mouse_apply(void)
 	if (flags & (PKT_X_OVF | PKT_Y_OVF))   /* discard overflowed deltas        */
 		dx = dy = 0;
 
-	int nx = cur_x + dx;
-	int ny = cur_y - dy;           /* screen Y grows downward                  */
+	/* Scale the raw deltas by the pointer-speed factor, accumulating the
+	 * truncated remainder so slow settings stay smooth. */
+	int num = spd_num[speed - 1], den = spd_den[speed - 1];
+	int sx = dx * num + res_x, sy = dy * num + res_y;
+	int adx = sx / den;  res_x = sx - adx * den;
+	int ady = sy / den;  res_y = sy - ady * den;
+
+	int nx = cur_x + adx;
+	int ny = cur_y - ady;          /* screen Y grows downward                  */
 	if (nx < 0) nx = 0;
 	if (ny < 0) ny = 0;
 	if (nx > bound_x) nx = bound_x;
@@ -117,6 +136,18 @@ static void mouse_handler(struct registers *r)
 	if (vmmouse_active()) {
 		int nx = cur_x, ny = cur_y, btn = buttons, dz = 0;
 		if (vmmouse_poll(&nx, &ny, &btn, &dz)) {
+			cur_x = nx; cur_y = ny; buttons = btn;
+			wheel += dz;
+			seq++;
+		}
+		return;
+	}
+
+	/* A Synaptics TouchPad reassembles its own 6-byte absolute packets and
+	 * synthesizes relative motion / tap / scroll. Feed it the raw byte. */
+	if (syn_mode) {
+		int nx = cur_x, ny = cur_y, btn = buttons, dz = 0;
+		if (synaptics_feed(data, &nx, &ny, &btn, &dz)) {
 			cur_x = nx; cur_y = ny; buttons = btn;
 			wheel += dz;
 			seq++;
@@ -187,22 +218,34 @@ void mouse_init(int max_x, int max_y)
 
 	mouse_command(0xF6);           /* load default settings                    */
 
-	/* Try to switch the mouse into IntelliMouse mode (adds a scroll-wheel byte
-	 * to every packet). The "magic knock" is three set-sample-rate commands
-	 * (200, 100, 80); afterwards the device reports ID 3 if it has a wheel. */
-	mouse_command(0xF3); mouse_command(200);
-	mouse_command(0xF3); mouse_command(100);
-	mouse_command(0xF3); mouse_command(80);
-	ps2_wait_write();
-	outb(PS2_CMD, 0xD4);
-	ps2_wait_write();
-	outb(PS2_DATA, 0xF2);          /* get device ID                            */
-	ps2_wait_read();
-	(void)inb(PS2_DATA);           /* ACK                                      */
-	ps2_wait_read();
-	wheel_mode = (inb(PS2_DATA) == 3);
+	/* A laptop Synaptics TouchPad rides this same aux port but speaks an
+	 * extended absolute protocol. Detect and enable it here, before the
+	 * IntelliMouse knock below — the knock's set-sample-rate sequence would
+	 * disturb the pad's mode. When found, synaptics.c owns all decoding and we
+	 * skip the relative-mouse wheel setup entirely. */
+	syn_mode = (synaptics_init(bound_x, bound_y) == 0);
+	con_write(synaptics_status());
+	con_write("\n");
 
-	mouse_command(0xF4);           /* enable data reporting                    */
+	if (!syn_mode) {
+		/* Try to switch the mouse into IntelliMouse mode (adds a scroll-wheel
+		 * byte to every packet). The "magic knock" is three set-sample-rate
+		 * commands (200, 100, 80); afterwards the device reports ID 3 if it has
+		 * a wheel. */
+		mouse_command(0xF3); mouse_command(200);
+		mouse_command(0xF3); mouse_command(100);
+		mouse_command(0xF3); mouse_command(80);
+		ps2_wait_write();
+		outb(PS2_CMD, 0xD4);
+		ps2_wait_write();
+		outb(PS2_DATA, 0xF2);          /* get device ID                        */
+		ps2_wait_read();
+		(void)inb(PS2_DATA);           /* ACK                                  */
+		ps2_wait_read();
+		wheel_mode = (inb(PS2_DATA) == 3);
+
+		mouse_command(0xF4);           /* enable data reporting                */
+	}
 
 	/* If we're under VMware (or QEMU's vmport + vmmouse), switch to the absolute
 	 * pointer: the host and guest cursors then track exactly, with no PS/2 delta
@@ -221,6 +264,18 @@ void mouse_init(int max_x, int max_y)
 
 int      mouse_x(void)        { return cur_x; }
 int      mouse_y(void)        { return cur_y; }
-int      mouse_buttons(void)  { return buttons; }
+/* When a Synaptics pad is driving, route to it so the time-limited tap-to-click
+ * pulse is reflected even on frames with no new packet (finger already lifted). */
+int      mouse_buttons(void)  { return syn_mode ? synaptics_buttons() : buttons; }
 int      mouse_wheel(void)    { return wheel; }
 uint32_t mouse_seq(void)      { return seq; }
+
+void mouse_set_speed(int level)
+{
+	if (level < 1) level = 1;
+	if (level > 5) level = 5;
+	speed = level;
+	res_x = res_y = 0;             /* drop stale fraction from the old scale */
+}
+
+int mouse_speed(void) { return speed; }

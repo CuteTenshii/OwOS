@@ -1,4 +1,4 @@
-/* syscall.c — dispatch system calls from ring 3.
+/* syscall.c — dispatch system calls from user programs.
  *
  * ABI: eax = call number, ebx/ecx/edx = arguments, return value in eax.
  */
@@ -11,6 +11,9 @@
 #include "keyboard.h"
 #include "timer.h"
 #include "fs.h"
+#include "procfs.h"
+#include "kstring.h"
+#include "power.h"
 #include "fat.h"
 #include "hfs.h"
 #include "ext.h"
@@ -69,7 +72,7 @@
 #define SYS_MSEC       27 /* msec() -> milliseconds since boot                  */
 #define SYS_READFILE_AT 28 /* pread(args=ebx -> {name,off,buf,len}) -> bytes/0/-1 */
 #define SYS_VOLUMES    29 /* volumes(idx=ebx, out=ecx -> struct volinfo) -> 1/0/-1 */
-#define SYS_EJECT      30 /* eject(path=ebx, ignored) -> 0/-1 (unmount /media)        */
+#define SYS_UMOUNT     30 /* umount(point=ebx) -> 0/-1 (unmount the volume at point) */
 #define SYS_WIN_CURSOR 31 /* win_cursor(id=ebx, shape=ecx) -> 0/-1 (enum wm_cursor)   */
 #define SYS_STREAM_BEGIN 32 /* stream_begin(name=ebx) -> 0/-1 (open a streaming write) */
 #define SYS_STREAM_WRITE 33 /* stream_write(buf=ebx, len=ecx) -> 0/-1 (append a chunk) */
@@ -90,8 +93,23 @@
 #define SYS_CMD_READ   50 /* cmd_read(buf=ebx, max=ecx) -> n / 0 / -1 (drain its output)   */
 #define SYS_CMD_ABORT  51 /* cmd_abort() -> 0 (abort the streamed command; kill a CLI child) */
 #define SYS_INTR       52 /* intr_take() -> 1/0 (read+clear the Ctrl+C latch for this task) */
+#define SYS_SPAWN_CAP  54 /* spawn_cap(path=ebx, arg=ecx|0, int*rfd=edx) -> pid/-1
+                           * Spawn /bin child with its stdout wired to a fresh pipe; the
+                           * child inherits the caller's cwd. *rfd is the read end in the
+                           * caller's fd table -- drain it (read_nb) until EOF to capture. */
+#define SYS_READ_NB    55 /* read_nb(fd=ebx, buf=ecx, len=edx) -> >0 bytes / 0 would-block
+                           * / -1 EOF or error. Non-blocking sibling of SYS_READ, so a GUI
+                           * program can poll a pipe and still service window events. */
+#define SYS_CHDIR      56 /* chdir(path=ebx) -> 0/-1: set the caller's own kernel cwd, so
+                           * children it spawns resolve relative paths from there. */
+#define SYS_KILL       57 /* kill(pid=ebx) -> 0/-1: terminate a child of the caller (used to
+                           * abort a captured command when its terminal window closes). */
+#define SYS_POWER      58 /* power(action=ebx): 0 = shut down (ACPI S5), 1 = reboot. Does not
+                           * return on success. A real action, so a syscall -- not a /proc file. */
+#define SYS_SBRK       59 /* sbrk(inc=ebx) -> previous break / (uint32_t)-1: grow or shrink the
+                           * caller's heap by `inc` bytes. The user-space malloc primitive. */
 /* Net transports are general sockets: SYS_NET_CONNECT's `proto` arg selects
- * TCP/TLS/UDP/raw-ICMP, so ping/dig/resolve are ring-3 libs over sockets, not
+ * TCP/TLS/UDP/raw-ICMP, so ping/dig/resolve are libs over sockets, not
  * bespoke syscalls. */
 
 #define NET_HOST_MAX 128
@@ -160,7 +178,7 @@ static int resolve_path(const char *name, char *out, int outcap)
 }
 
 /* pread: read up to `len` bytes at byte `off`. Clamps to the file size and
- * returns a short count (0 = EOF), so a ring-3 program can stream a file far
+ * returns a short count (0 = EOF), so a program can stream a file far
  * larger than its 1.5 MiB window — e.g. an image viewer decoding a big PNG. */
 static int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t len)
 {
@@ -176,7 +194,7 @@ static int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t
 	return fs_read_at(abs, off, buf, len);
 }
 
-/* A user pointer must stay entirely within the ring-3 region, or we refuse
+/* A user pointer must stay entirely within the user region, or we refuse
  * the call -- otherwise a program could make the kernel touch its memory. */
 static int user_range(uint32_t addr, uint32_t len)
 {
@@ -328,8 +346,8 @@ void syscall_dispatch(struct registers *r)
 		}
 		int n = fs_read(abs, buf, (uint32_t)fsz);
 		uint32_t *dir;
-		uint32_t entry;
-		if (n < 0 || load_elf(buf, (uint32_t)n, &dir, &entry) != 0) {
+		uint32_t entry, brk;
+		if (n < 0 || load_elf(buf, (uint32_t)n, &dir, &entry, &brk) != 0) {
 			kfree(buf);
 			r->eax = (uint32_t)-1;
 			break;
@@ -337,6 +355,7 @@ void syscall_dispatch(struct registers *r)
 		kfree(buf);
 		char *argv[2] = { name, arg };
 		uint32_t user_esp = setup_args(dir, have_arg ? 2 : 1, argv);
+		sched_set_brk(brk);                       /* the new image's heap base   */
 		sched_replace(dir, entry, user_esp, r);   /* returns into the new image */
 		break;
 	}
@@ -394,6 +413,11 @@ void syscall_dispatch(struct registers *r)
 		}
 		char abs[SYS_PATH_MAX];
 		join_cwd(name, abs, sizeof abs);
+		const char *proc = procfs_subpath(abs);
+		if (proc && proc[0]) {             /* /proc/<x> is a control node, not a file */
+			r->eax = (uint32_t)procfs_write(proc, (const char *)buf, (int)len);
+			break;
+		}
 		r->eax = (uint32_t)fs_create(abs, (const void *)buf, len);
 		break;
 	}
@@ -607,86 +631,84 @@ void syscall_dispatch(struct registers *r)
 	 * ebx; returns 1 if that index exists, 0 past the end. `mounted` says whether
 	 * the device currently backs /media (and so has a valid `path`). */
 	case SYS_VOLUMES: {
-		struct vinfo { char label[24]; char path[24]; char kind[8];
-		               int removable; int mounted; } *o;
+		/* One entry per present removable device; cross-referenced against the
+		 * mount table so the UI knows whether it's mounted and where. */
+		struct vinfo { char dev[16]; char kind[8]; char label[24];
+		               char point[40]; int mounted; } *o;
 		if (!user_range(r->ecx, sizeof *o)) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
 		o = (struct vinfo *)r->ecx;
 		struct blk_devinfo devs[8];
-		int n = blk_device_list(devs, 8);
+		int n = blk_dev_list(devs, 8);
 		int idx = (int)r->ebx;
 		if (idx < 0 || idx >= n) {
 			r->eax = 0;
 			break;
 		}
 		struct blk_devinfo *d = &devs[idx];
-		/* Label: the volume's FS label when mounted (more meaningful), else the
-		 * drive model; fall back to the short kind name if neither is set. */
-		const char *lbl = d->model;
-		if (d->mounted) {
-			if (iso_mounted())      lbl = iso_label();
-			else if (ext_mounted()) lbl = ext_label();
-			else if (hfs_mounted()) lbl = hfs_label();
-			else                    lbl = fat_label();
-		}
-		if (!lbl || !lbl[0])
-			lbl = d->name;
+		const char *point = "", *label = d->model;
+		int mounted = 0;
+		struct fs_mountinfo mi;
+		for (int i = 0; fs_mount_enum(i, &mi); i++)
+			if (streq(mi.dev, d->dev)) {
+				mounted = 1; point = mi.point;
+				if (mi.label && mi.label[0]) label = mi.label;
+				break;
+			}
+		if (!label || !label[0]) label = d->kind;
 		int i = 0;
-		for (; i < 23 && lbl[i]; i++) o->label[i] = lbl[i];
-		o->label[i] = '\0';
-		const char *p = d->mounted ? "/media" : "";
-		for (i = 0; i < 23 && p[i]; i++) o->path[i] = p[i];
-		o->path[i] = '\0';
-		for (i = 0; i < 7 && d->name[i]; i++) o->kind[i] = d->name[i];
-		o->kind[i] = '\0';
-		o->removable = 1;
-		o->mounted = d->mounted;
+		for (; i < 15 && d->dev[i]; i++)  o->dev[i]  = d->dev[i];  o->dev[i]  = '\0';
+		for (i = 0; i < 7  && d->kind[i]; i++) o->kind[i] = d->kind[i]; o->kind[i] = '\0';
+		for (i = 0; i < 23 && label[i]; i++)   o->label[i] = label[i]; o->label[i] = '\0';
+		for (i = 0; i < 39 && point[i]; i++)   o->point[i] = point[i]; o->point[i] = '\0';
+		o->mounted = mounted;
 		r->eax = 1;
 		break;
 	}
 
-	/* Mount a present removable device at /media by its kind ("USB"/"CD"/...),
-	 * the GUI's Connect action. The kind string is bounds-checked per byte into a
-	 * small kernel buffer (like SYS_SPAWN's arg) so a bogus pointer can't read
-	 * outside the user window. */
+	/* Mount a removable device at a mount point: mount(dev=ebx, point=ecx), e.g.
+	 * mount("usb0", "/media/usb0"). fs.c probes the device's filesystem and adds
+	 * it to the mount table. Both strings are bounds-checked per byte. */
 	case SYS_MOUNT: {
-		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
-		char kind[8];
+		if (!user_range(r->ebx, 1) || !user_range(r->ecx, 1)) { r->eax = (uint32_t)-1; break; }
+		char dev[16], point[48];
 		int j = 0;
-		while (j < (int)sizeof(kind) - 1 && user_range(r->ebx + (uint32_t)j, 1)) {
+		for (; j < (int)sizeof(dev) - 1 && user_range(r->ebx + (uint32_t)j, 1); j++) {
 			char ch = ((const char *)r->ebx)[j];
-			if (!ch)
-				break;
-			kind[j++] = ch;
+			if (!ch) break;
+			dev[j] = ch;
 		}
-		kind[j] = '\0';
-		r->eax = (uint32_t)blk_mount_device(kind);
+		dev[j] = '\0';
+		j = 0;
+		for (; j < (int)sizeof(point) - 1 && user_range(r->ecx + (uint32_t)j, 1); j++) {
+			char ch = ((const char *)r->ecx)[j];
+			if (!ch) break;
+			point[j] = ch;
+		}
+		point[j] = '\0';
+		__asm__ volatile ("sti");          /* probing reads sectors (may wait on IRQ) */
+		r->eax = (uint32_t)fs_mount(dev, point);
 		break;
 	}
 
-	/* Eject (unmount) the removable volume at /media. Writes are write-through, so this
-	 * just drops the mount; the medium is then safe to remove. */
-	case SYS_EJECT:
-		if (iso_mounted()) {
-			iso_unmount();
-			r->eax = 0;
-		} else if (ext_mounted()) {
-			ext_unmount();
-			r->eax = 0;
-		} else if (hfs_mounted()) {
-			hfs_unmount();
-			r->eax = 0;
-		} else if (fat_mounted()) {
-			fat_unmount();
-			r->eax = 0;
-		} else {
-			r->eax = (uint32_t)-1;
+	/* Unmount the volume at a mount point: umount(point=ebx). */
+	case SYS_UMOUNT: {
+		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
+		char point[48];
+		int j = 0;
+		for (; j < (int)sizeof(point) - 1 && user_range(r->ebx + (uint32_t)j, 1); j++) {
+			char ch = ((const char *)r->ebx)[j];
+			if (!ch) break;
+			point[j] = ch;
 		}
+		point[j] = '\0';
+		r->eax = (uint32_t)fs_unmount(point);
 		break;
+	}
 
-	/* Filesystem management for a ring-3 shell. Each joins a relative name onto
+	/* Filesystem management for a shell. Each joins a relative name onto
 	 * the caller's cwd (like readfile/writefile) before hitting owofs. */
 	case SYS_MKDIR: {
 		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
@@ -761,72 +783,131 @@ void syscall_dispatch(struct registers *r)
 		}
 		int pid = exec_program(buf, (uint32_t)sz, argc, argv);
 		kfree(buf);
+		if (pid >= 0)
+			sched_set_cwd(pid, sched_cwd());   /* child inherits the caller's cwd */
 		r->eax = (uint32_t)pid;
 		break;
 	}
-	/* Bridge: run a kernel builtin (journal, neofetch, lspci, ...) with its
-	 * output captured, so the ring-3 terminal can reuse every kernel command
-	 * without re-implementing it. Capture into a kernel buffer, then copy to the
-	 * caller (bounds-checked). Returns bytes produced, or -1 if not a builtin. */
-	case SYS_SHELL: {
-		uint32_t out = r->ecx, max = r->edx;
-		if (!user_range(r->ebx, 1) || !user_range(out, max) || max == 0) {
+	/* Spawn a /bin child with its stdout (fd 1) wired into a fresh pipe, and hand
+	 * the read end back to the caller. The terminal uses this to render a CLI
+	 * tool's output inline (replacing the old kernel-shell bridge): drain the read
+	 * fd with read_nb until EOF. The pipe is created with one reader (us) and one
+	 * writer (the child); when the child exits, fds_close_all drops its write end
+	 * and our read returns EOF. */
+	case SYS_SPAWN_CAP: {
+		/* Args arrive as one packed request so the shell can pass a full argv
+		 * vector (curl --http2 <url>) -- it tokenizes (with quotes) in user space, the
+		 * kernel just marshals the strings in and never parses a command line. */
+		struct cap_req { uint32_t path; uint32_t argv; int argc; uint32_t rfd; };
+		if (!user_range(r->ebx, sizeof(struct cap_req))) { r->eax = (uint32_t)-1; break; }
+		struct cap_req req = *(const struct cap_req *)r->ebx;
+		if (!user_range(req.path, 1) || !user_range(req.rfd, 4)) { r->eax = (uint32_t)-1; break; }
+
+		char path[SYS_PATH_MAX];
+		int n = 0;
+		for (; n < SYS_PATH_MAX - 1 && user_range(req.path + (uint32_t)n, 1); n++) {
+			char c = ((const char *)req.path)[n];
+			if (!c) break;
+			path[n] = c;
+		}
+		path[n] = '\0';
+
+		/* Marshal argv: up to MAXARGS strings, each MAXARG bytes, copied out of the
+		 * user image (bounds-checked per byte) before we touch a new address space. */
+		#define MAXARGS 16
+		#define MAXARG  192
+		static char argbuf[MAXARGS][MAXARG];   /* syscalls don't re-enter on this OS */
+		char *argv[MAXARGS];
+		int argc = req.argc;
+		if (argc < 1) argc = 1;
+		if (argc > MAXARGS) argc = MAXARGS;
+		argv[0] = path;
+		for (int ai = 1; ai < argc; ai++) {
+			argv[ai] = argbuf[ai];
+			argbuf[ai][0] = '\0';
+			uint32_t pp = req.argv + (uint32_t)ai * 4;
+			if (!user_range(pp, 4)) { argc = ai; break; }
+			uint32_t sp = *(const uint32_t *)pp;
+			int j = 0;
+			for (; j < MAXARG - 1 && user_range(sp + (uint32_t)j, 1); j++) {
+				char c = ((const char *)sp)[j];
+				if (!c) break;
+				argbuf[ai][j] = c;
+			}
+			argbuf[ai][j] = '\0';
+		}
+
+		int fsz = fs_size(path);
+		if (fsz < 0) { r->eax = (uint32_t)-1; break; }
+		/* Reserve a free fd and a pipe before loading the image, so a failure here
+		 * doesn't leak a half-spawned child. */
+		struct fd *fds = sched_fds();
+		int rfd = -1;
+		for (int i = 0; i < MAX_FD; i++)
+			if (fds[i].type == FD_NONE) { rfd = i; break; }
+		if (rfd < 0) { r->eax = (uint32_t)-1; break; }
+		int id = pipe_alloc();
+		if (id < 0) { r->eax = (uint32_t)-1; break; }
+		uint8_t *buf = kmalloc((uint32_t)fsz);
+		if (!buf) { pipe_close(id, 0); pipe_close(id, 1); r->eax = (uint32_t)-1; break; }
+		int sz = fs_read(path, buf, (uint32_t)fsz);
+		int pid = sz < 0 ? -1 : exec_program(buf, (uint32_t)sz, argc, argv);
+		kfree(buf);
+		if (pid < 0) { pipe_close(id, 0); pipe_close(id, 1); r->eax = (uint32_t)-1; break; }
+		fds[rfd].type = FD_PIPE_RD; fds[rfd].pipe = (uint8_t)id;  /* our read end   */
+		sched_set_pipe_fd(pid, 1, 1, id);          /* child fd 1 (stdout) -> write end */
+		sched_set_cwd(pid, sched_cwd());           /* child inherits the caller's cwd  */
+		*(int *)req.rfd = rfd;
+		r->eax = (uint32_t)pid;
+		#undef MAXARGS
+		#undef MAXARG
+		break;
+	}
+	case SYS_READ_NB: {
+		int fd = (int)r->ebx;
+		char *buf = (char *)r->ecx;
+		uint32_t len = r->edx;
+		if (fd < 0 || fd >= MAX_FD || len == 0 || !user_range(r->ecx, len)) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
-		char cmd[256];
+		struct fd *f = &sched_fds()[fd];
+		if (f->type == FD_PIPE_RD)
+			r->eax = (uint32_t)pipe_read_nb(f->pipe, buf, (int)len);
+		else
+			r->eax = (uint32_t)-1;
+		break;
+	}
+	case SYS_CHDIR: {
+		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
+		char path[SYS_PATH_MAX];
 		int n = 0;
-		for (; n < (int)sizeof cmd - 1 && user_range(r->ebx + (uint32_t)n, 1); n++) {
+		for (; n < SYS_PATH_MAX - 1 && user_range(r->ebx + (uint32_t)n, 1); n++) {
 			char c = ((const char *)r->ebx)[n];
 			if (!c) break;
-			cmd[n] = c;
+			path[n] = c;
 		}
-		cmd[n] = '\0';
-		/* The int 0x80 gate runs with IF=0. A builtin may run long or wait on an
-		 * IRQ (ping/dig/ntp, AML in neofetch); without interrupts it can't be
-		 * preempted and a hlt-wait would deadlock. Enable them for the duration. */
-		__asm__ volatile ("sti");
-		/* Capture straight into the caller's buffer (already range-checked above):
-		 * the builtin runs in this process's CR3, so con_putc writes land in the
-		 * user buffer directly. No 64 KiB kmalloc per call -- that could fail under
-		 * heap pressure (real drivers + apps), turning every kernel command into a
-		 * spurious "command not found". */
-		r->eax = (uint32_t)shell_exec_capture(cmd, (char *)out, (int)max);
-		break;
-	}
-	case SYS_CMD_BEGIN: {
-		if (!user_range(r->ebx, 1)) {
+		path[n] = '\0';
+		char abs[SYS_PATH_MAX];
+		int isd = 0;
+		if (resolve_path(path, abs, sizeof abs) != 0 || fs_stat(abs, &isd, 0, 0) != 0 || !isd) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
-		char cmd[256];
-		int n = 0;
-		for (; n < (int)sizeof cmd - 1 && user_range(r->ebx + (uint32_t)n, 1); n++) {
-			char c = ((const char *)r->ebx)[n];
-			if (!c) break;
-			cmd[n] = c;
-		}
-		cmd[n] = '\0';
-		/* Arms the producer thread; output is drained with SYS_CMD_READ. The
-		 * runner runs the command (not us), so the caller stays responsive. */
-		r->eax = (uint32_t)shell_stream_begin(cmd);
-		break;
-	}
-	case SYS_CMD_READ: {
-		uint32_t buf = r->ebx, max = r->ecx;
-		if (!user_range(buf, max) || max == 0) {
-			r->eax = (uint32_t)-1;
-			break;
-		}
-		/* The runner produces with IF=1; let it (and any reaped child) run. */
-		__asm__ volatile ("sti");
-		r->eax = (uint32_t)shell_stream_read((char *)buf, (int)max);
-		break;
-	}
-	case SYS_CMD_ABORT:
-		shell_stream_abort();          /* terminal close: kill a CLI child, then
-		                                * the caller drains to EOF to reset state */
+		sched_set_cwd_self(abs);
 		r->eax = 0;
+		break;
+	}
+	case SYS_KILL:
+		r->eax = (uint32_t)sched_kill_child((int)r->ebx);
+		break;
+	case SYS_POWER:
+		if (r->ebx == 1) power_reset();
+		else             power_off();
+		r->eax = (uint32_t)-1;             /* only reached if the action failed */
+		break;
+	case SYS_SBRK:
+		r->eax = sched_sbrk((int)r->ebx);  /* grow/shrink the caller's heap */
 		break;
 	case SYS_INTR:
 		r->eax = (uint32_t)sched_intr_take();   /* read + clear Ctrl+C latch */
@@ -852,7 +933,7 @@ void syscall_dispatch(struct registers *r)
 	}
 
 
-	/* Streaming audio: /bin/play resamples a WAV to 48 kHz/S16/stereo in ring 3
+	/* Streaming audio: /bin/play resamples a WAV to 48 kHz/S16/stereo in user space
 	 * and pushes it here in bounded chunks. One stream at a time (like the file
 	 * stream); the chosen back end is latched at open. */
 	case SYS_AUDIO_OPEN:

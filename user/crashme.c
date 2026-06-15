@@ -1,4 +1,4 @@
-/* crashme.c — deliberately faults, to exercise the ring-3 crash reporter.
+/* crashme.c — deliberately faults, to exercise the crash reporter.
  * A few call frames deep so the crash window shows a real backtrace. */
 #include "owos.h"
 

@@ -16,9 +16,18 @@ struct registers;
 void sched_init(void);
 void sched_create_thread(const char *name, void (*entry)(void));
 
-/* Spawn a user process from an already-built address space; returns its pid. */
+/* Spawn a user process from an already-built address space; returns its pid.
+ * `brk` is the initial program break (page-aligned image end) for SYS_SBRK. */
 int  sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
-                          uint32_t user_esp);
+                          uint32_t user_esp, uint32_t brk);
+
+/* User-space heap. sched_sbrk moves the caller's process break by `inc` bytes
+ * (mapping/freeing window pages), returning the PREVIOUS break or (uint32_t)-1 on
+ * failure — the malloc primitive. The heap is shared by every thread of the
+ * process (they share its address space). sched_set_brk resets the caller's break
+ * base, used by the image-replace syscall when it swaps in a new program. */
+uint32_t sched_sbrk(int inc);
+void     sched_set_brk(uint32_t brk);
 
 /* Spawn a thread inside the current process (shares its address space); runs
  * `entry` on the user stack `user_esp`. Returns the thread's tid, or -1. */
@@ -30,6 +39,7 @@ int  sched_fork(struct registers *r);
 
 void sched_exit(int status);          /* terminate current task; never returns  */
 void sched_kill(int pid);             /* terminate another task by pid          */
+int  sched_kill_child(int pid);       /* terminate a child of the caller; 0/-1  */
 void sched_set_intr(int pid);         /* raise the cooperative-interrupt latch  */
 int  sched_intr_pending(void);        /* peek the caller's latch (blocking waits) */
 int  sched_intr_take(void);           /* read + clear the caller's latch         */

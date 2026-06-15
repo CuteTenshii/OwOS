@@ -16,11 +16,16 @@ static int rgetc(void)
 	return B->rbuf[B->rpos++];
 }
 
-void set_status(const char *s)
+/* Show a one-line message as the page body. The browser has no status bar, so
+ * errors (and other notices that used to live there) are rendered straight into
+ * the content pane. Clears cur_url so the address bar keeps whatever the user
+ * typed, ready to edit and retry. */
+void show_error(const char *m)
 {
-	int i = 0;
-	while (s[i] && i < (int)sizeof B->status - 1) { B->status[i] = s[i]; i++; }
-	B->status[i] = '\0';
+	B->mode = MODE_TEXT;
+	B->scroll = 0;
+	B->cur_url[0] = '\0';
+	doc_message(m);
 	B->seq++;
 }
 
@@ -84,14 +89,6 @@ static int cookie_header(const char *host, char *out, int cap)
 		sapp(out, &n, cap, "=");
 		sapp(out, &n, cap, B->cookies[i].val);
 	}
-	return n;
-}
-
-static int cookie_count(const char *host)
-{
-	int n = 0;
-	for (int i = 0; i < MAX_COOKIES; i++)
-		if (B->cookies[i].used && streq_ci(B->cookies[i].host, host)) n++;
 	return n;
 }
 
@@ -220,17 +217,29 @@ static int body_fill(struct bodysrc *b, unsigned char *out, int max)
 	return got;
 }
 
+/* Request-header values, shared by the HTTP/1.1 and HTTP/2 request builders so
+ * the browser presents itself identically on either protocol. */
+#define BR_UA     "Mozilla/5.0 (OwOS; x86) OwOS-Browser/1.0"
+#define BR_ACCEPT "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+#define BR_ACCLNG "en-US,en;q=0.9"
+
 /* ------------------------------------------------------------- downloads */
 
 #define DL_DIR "/home/root/Downloads"
 
-/* A response is a download when the server flags it as an attachment, or its
- * Content-Type is something the browser can't render in the pane (anything that
- * isn't HTML, plain text, or an image — images get their own viewer/notice). An
- * empty Content-Type is treated as HTML, the common sloppy-server case. */
-static int is_download(void)
+/* A response is a download when the server flags it as an attachment, when the
+ * URL points at a file type the browser never renders inline (audio/video/
+ * archive/document/binary — matched by extension), or when the Content-Type is
+ * something the pane can't show (anything that isn't HTML, plain text, or an
+ * image — images get their own viewer/notice). The extension check catches a
+ * download a sloppy server mislabels: an .mp3 served as text/plain or with no
+ * Content-Type at all would otherwise dump raw bytes into the page. An empty
+ * Content-Type with no telltale extension is treated as HTML, the common case. */
+static int url_is_download_ext(const char *url);
+static int is_download(const char *url)
 {
 	if (B->cdisp_attach) return 1;
+	if (url_is_download_ext(url)) return 1;
 	if (B->ctype[0] == '\0') return 0;
 	if (has_sub(B->ctype, "html")) return 0;
 	if (starts_ci(B->ctype, "text/")) return 0;
@@ -248,6 +257,35 @@ static void basename_of(const char *in, char *out, int cap)
 	int k = 0;
 	for (; last[k] && last[k] != '?' && k < cap - 1; k++) out[k] = last[k];
 	out[k] = '\0';
+}
+
+/* True when the URL's last path segment ends in an extension the browser never
+ * renders inline (audio, video, archives, documents, executables, fonts). Lets
+ * is_download() save such a file even when the server omits or mislabels the
+ * Content-Type — e.g. an .mp3 served as text/plain, which otherwise filled the
+ * page with raw bytes. Image extensions are deliberately absent: PNGs are shown
+ * inline, a decision left to the Content-Type. */
+static int url_is_download_ext(const char *url)
+{
+	struct purl u;
+	if (!parse_url(url, &u)) return 0;
+	char base[128];
+	basename_of(u.path, base, sizeof base);
+	const char *ext = 0;
+	for (const char *q = base; *q; q++) if (*q == '.') ext = q + 1;
+	if (!ext || !*ext) return 0;
+	static const char *const bin_ext[] = {
+		"mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "aac", "wma", "mid",
+		"mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "mpg", "mpeg",
+		"zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar", "iso", "img",
+		"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "epub",
+		"exe", "dll", "bin", "dmg", "deb", "rpm", "apk", "msi", "so",
+		"ttf", "otf", "woff", "woff2",
+		0
+	};
+	for (int i = 0; bin_ext[i]; i++)
+		if (streq_ci(ext, bin_ext[i])) return 1;
+	return 0;
 }
 
 /* Choose a filename for the download: the Content-Disposition name if any, else
@@ -297,20 +335,54 @@ static int file_sink(void *ctx, const unsigned char *p, unsigned n)
 	return 0;
 }
 
-/* Stream the response body straight to ~/Downloads rather than buffering it, so
- * a download is bounded only by the disk, never by RAW_MAX. Picks a
- * non-clobbering name, inflates on the fly when the body is compressed, and
- * reports the outcome through the status line and content pane. */
-static void stream_download(const char *url, struct bodysrc *bs, int enc_gz)
+/* Pick a non-clobbering DL_DIR/<name> path for a download (the saved name comes
+ * from Content-Disposition or the URL; a repeat gets a "-N" suffix). Ensures
+ * DL_DIR exists first: the boot image creates it, but a disk.img persisted from
+ * an older build may not have it, and a missing directory makes stream_begin
+ * fail (which the h2 path used to mishandle by dumping the body into the page). */
+static void pick_dl_path(const char *url, char *path, int cap)
 {
+	mkdir(DL_DIR);                                  /* no-op if it already exists */
 	char base[128];
 	derive_filename(url, base, sizeof base);
-
-	char path[256], probe[1];
+	char probe[1];
 	for (int n = 0; n < 100; n++) {
-		build_path(base, n, path, sizeof path);
+		build_path(base, n, path, cap);
 		if (readfile(path, probe, 0) < 0) break;   /* first free name           */
 	}
+}
+
+/* Report a finished download: switch to a text pane on `url` and show the saved
+ * path (and byte count) or a failure notice. Shared by the 1.1 and h2 paths. */
+static void download_finished(const char *url, const char *path, int wrote, int fail)
+{
+	B->mode = MODE_TEXT;
+	{ int ci = 0; sapp(B->cur_url, &ci, sizeof B->cur_url, url); }
+	B->scroll = 0;
+
+	char msg[256]; int m = 0;
+	if (!fail && wrote >= 0) {
+		sapp(msg, &m, sizeof msg, "Saved to ");
+		sapp(msg, &m, sizeof msg, path);
+		sapp(msg, &m, sizeof msg, "  (");
+		uapp(msg, &m, sizeof msg, (unsigned)wrote);
+		sapp(msg, &m, sizeof msg, " bytes)");
+	} else {
+		sapp(msg, &m, sizeof msg,
+		     "Download failed (disk full or cannot write to " DL_DIR ")");
+	}
+	doc_message(msg);
+	B->dl_saved = 1;
+	B->seq++;
+}
+
+/* Stream the (HTTP/1.1) response body straight to ~/Downloads rather than
+ * buffering it, so a download is bounded only by the disk, never by RAW_MAX;
+ * inflates on the fly when the body is compressed. */
+static void stream_download(const char *url, struct bodysrc *bs, int enc_gz)
+{
+	char path[256];
+	pick_dl_path(url, path, sizeof path);
 
 	struct dlsink d = { 0 };
 	int wrote = -1;
@@ -325,28 +397,188 @@ static void stream_download(const char *url, struct bodysrc *bs, int enc_gz)
 		}
 		wrote = stream_end();   /* commits + returns the size; -1 after a failed write */
 	}
-
-	B->mode = MODE_TEXT;
-	{ int ci = 0; sapp(B->cur_url, &ci, sizeof B->cur_url, url); }
-	B->scroll = 0;
-
-	char msg[256]; int m = 0;
-	if (!d.fail && wrote >= 0) {
-		sapp(msg, &m, sizeof msg, "Saved to ");
-		sapp(msg, &m, sizeof msg, path);
-		sapp(msg, &m, sizeof msg, "  (");
-		uapp(msg, &m, sizeof msg, (unsigned)wrote);
-		sapp(msg, &m, sizeof msg, " bytes)");
-	} else {
-		sapp(msg, &m, sizeof msg,
-		     "Download failed (disk full or cannot write to " DL_DIR ")");
-	}
-	doc_message(msg);
-	set_status(msg);
-	B->dl_saved = 1;
+	download_finished(url, path, wrote, d.fail);
 }
 
 /* ----------------------------------------------------------- transaction */
+
+/* Parse a response header block (an HTTP/1.1 block, or the HTTP/2-synthesized
+ * "HTTP/x NNN\r\nname: value\r\n…" equivalent) into the browser state: sets
+ * B->ctype / B->dl_name / B->cdisp_attach, stores cookies for `host`, notes
+ * HSTS, resolves any Location into `loc`, and reports the body framing
+ * (chunked / content-length / gzip — moot over h2, which sends none). Returns
+ * the status code. Shared by the HTTP/1.1 and HTTP/2 fetch paths. */
+static int parse_response(const char *hdr, const char *host, const char *full_url,
+                          char *loc, int loc_cap, int *chunked, int *have_len,
+                          unsigned *content_len, int *enc_gz)
+{
+	int status = 0;
+	{
+		const char *s = hdr;
+		while (*s && *s != ' ') s++;
+		while (*s == ' ') s++;
+		while (*s >= '0' && *s <= '9') status = status * 10 + (*s++ - '0');
+	}
+
+	*chunked = 0; *have_len = 0; *enc_gz = 0; *content_len = 0;
+	for (const char *line = hdr; *line; ) {
+		if (starts_ci(line, "transfer-encoding:")) {
+			for (const char *q = line; *q && *q != '\n'; q++)
+				if (starts_ci(q, "chunked")) { *chunked = 1; break; }
+		} else if (starts_ci(line, "content-encoding:")) {
+			for (const char *q = line; *q && *q != '\n'; q++)
+				if (starts_ci(q, "gzip") || starts_ci(q, "deflate")) {
+					*enc_gz = 1; break;
+				}
+		} else if (starts_ci(line, "content-length:")) {
+			const char *v = line + 15;
+			while (*v == ' ') v++;
+			unsigned x = 0;
+			while (*v >= '0' && *v <= '9') x = x * 10 + (unsigned)(*v++ - '0');
+			*content_len = x; *have_len = 1;
+		} else if (starts_ci(line, "location:")) {
+			const char *v = line + 9;
+			while (*v == ' ') v++;
+			char raw[URL_MAX]; int r = 0;
+			while (*v && *v != '\r' && *v != '\n' && r < (int)sizeof raw - 1)
+				raw[r++] = *v++;
+			raw[r] = '\0';
+			resolve_url(full_url, raw, loc, loc_cap);
+		} else if (starts_ci(line, "content-type:")) {
+			const char *v = line + 13;
+			while (*v == ' ') v++;
+			int k = 0;
+			while (*v && *v != '\r' && *v != '\n' && *v != ';' &&
+			       k < (int)sizeof B->ctype - 1)
+				B->ctype[k++] = lower(*v++);
+			B->ctype[k] = '\0';
+		} else if (starts_ci(line, "content-disposition:")) {
+			const char *v = line + 20;
+			for (const char *q = v; *q && *q != '\n'; q++)
+				if (starts_ci(q, "attachment")) { B->cdisp_attach = 1; break; }
+			for (const char *q = v; *q && *q != '\n'; q++) {
+				if (!starts_ci(q, "filename")) continue;
+				const char *f = q + 8;
+				if (*f == '*') continue;
+				while (*f == ' ') f++;
+				if (*f != '=') continue;
+				f++;
+				while (*f == ' ') f++;
+				int quoted = (*f == '"'); if (quoted) f++;
+				int k = 0;
+				while (*f && *f != '\r' && *f != '\n' &&
+				       k < (int)sizeof B->dl_name - 1) {
+					if (quoted ? (*f == '"') : (*f == ';' || *f == ' ')) break;
+					B->dl_name[k++] = *f++;
+				}
+				B->dl_name[k] = '\0';
+				break;
+			}
+		} else if (starts_ci(line, "set-cookie:")) {
+			const char *v = line + 11;
+			while (*v == ' ') v++;
+			cookie_store(host, v);
+		} else if (starts_ci(line, "strict-transport-security:")) {
+			hsts_add(host);
+		}
+		const char *eol = line;
+		while (*eol && *eol != '\n') eol++;
+		if (!*eol) break;
+		line = eol + 1;
+	}
+	return status;
+}
+
+/* ---- HTTP/2 transaction (used when ALPN negotiates h2 over TLS) --------- */
+
+/* Shared state for the two h2 callbacks below and the download finalizer.
+ *   is_dl    the response is a download — its body is never rendered.
+ *   dl_open  the destination file opened, so body bytes go to disk.
+ * Keeping these separate is load-bearing: a download whose file couldn't be
+ * opened still must NOT fall through to B->raw (which would dump the binary into
+ * the page as text); its body is discarded and the failure reported. */
+struct h2tx {
+	const char *full_url, *host;
+	char *loc; int loc_cap;
+	int  allow_dl;
+	int  status;
+	int  is_dl, dl_open, dl_started, dl_fail;
+	char dl_path[256];
+};
+
+/* Headers-ready hook (fired before any DATA): parse the response, and if it is
+ * a download, open the destination file now so the body streams to disk. */
+static int h2_headers_cb(void *ctx, const char *block, int len)
+{
+	(void)len;
+	struct h2tx *h = ctx;
+	int chunked, have_len, enc_gz; unsigned clen;
+	h->status = parse_response(block, h->host, h->full_url, h->loc, h->loc_cap,
+	                           &chunked, &have_len, &clen, &enc_gz);
+	if (h->allow_dl && h->status >= 200 && h->status < 300 && is_download(h->full_url)) {
+		h->is_dl = 1; h->dl_started = 1;
+		pick_dl_path(h->full_url, h->dl_path, sizeof h->dl_path);
+		if (stream_begin(h->dl_path) == 0) h->dl_open = 1;
+		else                               h->dl_fail = 1;
+	}
+	return 0;
+}
+
+/* Body sink: stream to the download file (discarding if it failed to open — a
+ * download is never rendered), or accumulate a renderable body into B->raw
+ * (truncating at RAW_MAX). Returns non-zero to stop the transfer. */
+static int h2_body_cb(void *ctx, const unsigned char *p, int n)
+{
+	struct h2tx *h = ctx;
+	if (h->is_dl) {
+		if (h->dl_open && stream_write(p, n) < 0) { h->dl_fail = 1; return 1; }
+		return 0;
+	}
+	for (int i = 0; i < n; i++) {
+		if (B->raw_len >= RAW_MAX) return 1;       /* full: stop (truncate)   */
+		B->raw[B->raw_len++] = (char)p[i];
+	}
+	return 0;
+}
+
+/* Run the request over HTTP/2 (sock already open + ALPN-confirmed h2). Mirrors
+ * http_txn's contract: fills B->raw / streams a download, resolves redirects
+ * into `loc`, and returns the status (or -5 if the transfer failed). */
+static int h2_txn(const struct purl *u, const char *full_url, char *loc,
+                  int loc_cap, int allow_dl)
+{
+	char auth[URL_HOST_MAX + 8]; int an = 0;        /* :authority = host[:port] */
+	sapp(auth, &an, sizeof auth, u->host);
+	if (u->port != 443) {
+		sapp(auth, &an, sizeof auth, ":");
+		uapp(auth, &an, sizeof auth, (unsigned)u->port);
+	}
+
+	/* Request headers: cookies + accept. No Accept-Encoding (so the body is
+	 * uncompressed — h2 DATA needs no inflate) and no Connection/Transfer-
+	 * Encoding (forbidden in HTTP/2). The User-Agent rides in h2_opts. */
+	char xh[1408]; int xn = 0;
+	char ck[1024];
+	if (cookie_header(u->host, ck, sizeof ck) > 0) {
+		sapp(xh, &xn, sizeof xh, "cookie: ");
+		sapp(xh, &xn, sizeof xh, ck);
+		sapp(xh, &xn, sizeof xh, "\r\n");
+	}
+	sapp(xh, &xn, sizeof xh,
+	     "accept: " BR_ACCEPT "\r\naccept-language: " BR_ACCLNG "\r\n");
+
+	struct h2tx h = { full_url, u->host, loc, loc_cap, allow_dl, 0, 0, 0, 0, 0, {0} };
+	struct h2_opts opts = { BR_UA, xh, h2_headers_cb };
+	char hdrbuf[4096]; int hlen = 0;
+	h2_run(B->sock, 1, auth, "GET", u->path, &opts,
+	       hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
+
+	if (h.dl_started)                               /* finish a streamed download */
+		download_finished(full_url, h.dl_path,
+		                  h.dl_open ? stream_end() : -1, h.dl_fail || !h.dl_open);
+
+	return h.status > 0 ? h.status : -5;
+}
 
 static int http_txn(const struct purl *u, const char *full_url, char *loc,
                     int loc_cap, int allow_dl)
@@ -358,8 +590,16 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	B->rpos = B->rlen = B->reof = 0;
 	B->raw_len = 0;
 
-	B->sock = net_connect(u->host, u->port, u->tls);
+	/* Over TLS, offer ALPN "h2" (SK_TLS_H2); if the server selects it, run the
+	 * request over HTTP/2 instead of the HTTP/1.1 code below. */
+	B->sock = net_connect(u->host, u->port, u->tls ? SK_TLS_H2 : SK_TCP);
 	if (B->sock < 0) return B->sock;
+
+	if (u->tls && net_alpn(B->sock) == ALPN_H2) {
+		int st = h2_txn(u, full_url, loc, loc_cap, allow_dl);
+		net_close(B->sock);
+		return st;
+	}
 
 	char req[2048]; int n = 0;
 	sapp(req, &n, sizeof req, "GET ");
@@ -378,9 +618,8 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 		}
 	}
 	sapp(req, &n, sizeof req,
-	     "\r\nUser-Agent: Mozilla/5.0 (OwOS; x86) OwOS-Browser/1.0\r\n"
-	     "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-	     "Accept-Language: en-US,en;q=0.9\r\n"
+	     "\r\nUser-Agent: " BR_UA "\r\nAccept: " BR_ACCEPT "\r\n"
+	     "Accept-Language: " BR_ACCLNG "\r\n"
 	     "Accept-Encoding: gzip, deflate\r\n"
 	     "Connection: close\r\n\r\n");
 
@@ -399,85 +638,9 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	}
 	hdr[hlen] = '\0';
 
-	int status = 0;
-	{
-		const char *s = hdr;
-		while (*s && *s != ' ') s++;
-		while (*s == ' ') s++;
-		while (*s >= '0' && *s <= '9') status = status * 10 + (*s++ - '0');
-	}
-
-	int chunked = 0, have_len = 0, enc_gz = 0; unsigned content_len = 0;
-	for (char *line = hdr; *line; ) {
-		if (starts_ci(line, "transfer-encoding:")) {
-			for (char *q = line; *q && *q != '\n'; q++)
-				if (starts_ci(q, "chunked")) { chunked = 1; break; }
-		} else if (starts_ci(line, "content-encoding:")) {
-			/* gzip / deflate -> the body is a compressed stream we inflate.
-			 * inflate_http auto-detects gzip vs zlib(deflate) from its bytes. */
-			for (char *q = line; *q && *q != '\n'; q++)
-				if (starts_ci(q, "gzip") || starts_ci(q, "deflate")) {
-					enc_gz = 1; break;
-				}
-		} else if (starts_ci(line, "content-length:")) {
-			const char *v = line + 15;
-			while (*v == ' ') v++;
-			unsigned x = 0;
-			while (*v >= '0' && *v <= '9') x = x * 10 + (unsigned)(*v++ - '0');
-			content_len = x; have_len = 1;
-		} else if (starts_ci(line, "location:")) {
-			const char *v = line + 9;
-			while (*v == ' ') v++;
-			char raw[URL_MAX]; int r = 0;
-			while (*v && *v != '\r' && *v != '\n' && r < (int)sizeof raw - 1)
-				raw[r++] = *v++;
-			raw[r] = '\0';
-			resolve_url(full_url, raw, loc, loc_cap);
-		} else if (starts_ci(line, "content-type:")) {
-			const char *v = line + 13;
-			while (*v == ' ') v++;
-			int k = 0;     /* keep the type/subtype, drop any "; charset=..." */
-			while (*v && *v != '\r' && *v != '\n' && *v != ';' &&
-			       k < (int)sizeof B->ctype - 1)
-				B->ctype[k++] = lower(*v++);
-			B->ctype[k] = '\0';
-		} else if (starts_ci(line, "content-disposition:")) {
-			/* "attachment" forces a download regardless of type; a filename=
-			 * param (quoted or bare token) names the saved file. filename*=
-			 * (RFC 5987 extended form) is skipped — we prefer the plain one. */
-			const char *v = line + 20;
-			for (const char *q = v; *q && *q != '\n'; q++)
-				if (starts_ci(q, "attachment")) { B->cdisp_attach = 1; break; }
-			for (const char *q = v; *q && *q != '\n'; q++) {
-				if (!starts_ci(q, "filename")) continue;
-				const char *f = q + 8;
-				if (*f == '*') continue;           /* filename*= : skip       */
-				while (*f == ' ') f++;
-				if (*f != '=') continue;
-				f++;
-				while (*f == ' ') f++;
-				int quoted = (*f == '"'); if (quoted) f++;
-				int k = 0;
-				while (*f && *f != '\r' && *f != '\n' &&
-				       k < (int)sizeof B->dl_name - 1) {
-					if (quoted ? (*f == '"') : (*f == ';' || *f == ' ')) break;
-					B->dl_name[k++] = *f++;
-				}
-				B->dl_name[k] = '\0';
-				break;
-			}
-		} else if (starts_ci(line, "set-cookie:")) {
-			const char *v = line + 11;
-			while (*v == ' ') v++;
-			cookie_store(u->host, v);
-		} else if (starts_ci(line, "strict-transport-security:")) {
-			hsts_add(u->host);     /* future visits to this host force HTTPS  */
-		}
-		char *eol = line;
-		while (*eol && *eol != '\n') eol++;
-		if (!*eol) break;
-		line = eol + 1;
-	}
+	int chunked, have_len, enc_gz; unsigned content_len;
+	int status = parse_response(hdr, u->host, full_url, loc, loc_cap,
+	                            &chunked, &have_len, &content_len, &enc_gz);
 
 	struct bodysrc bs = { chunked, have_len, 0, 0,
 	                      have_len ? content_len : 0 };
@@ -486,7 +649,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	 * response streams straight to ~/Downloads — decided here, before the body is
 	 * read, so binary content never has to fit in B->raw. Redirects (3xx) and
 	 * sub-resource fetches (allow_dl == 0) take the buffered path below. */
-	if (allow_dl && status >= 200 && status < 300 && is_download()) {
+	if (allow_dl && status >= 200 && status < 300 && is_download(full_url)) {
 		stream_download(full_url, &bs, enc_gz);
 		net_close(B->sock);
 		return status;
@@ -517,50 +680,267 @@ static int memrd_get(void *c)
 	return m->pos < m->len ? m->p[m->pos++] : -1;
 }
 
-/* Fetch every inline <img> the parser found as a sub-resource. Each is fetched
- * into B->raw (one at a time), and PNGs that fit are copied into img_pool with
- * their dimensions peeked; the rest are left ok=0 so the layout shows an alt
- * box. Single-hop only (redirects on an image just drop it). */
+/* Fetch one inline <img> (index `i`) as a sub-resource of `page_url`, into B->raw
+ * then appended to img_pool. A PNG that fits gets its dimensions peeked and ok=1;
+ * anything else leaves ok=0 so the layout shows an alt box. Single-hop only
+ * (a redirect on an image just drops it). */
+static void fetch_one_image(int i, const char *page_url)
+{
+	struct inl_img *im = &B->imgs[i];
+	im->ok = 0;
+
+	char full[URL_MAX];
+	resolve_url(page_url, im->href, full, sizeof full);
+	struct purl u;
+	if (!parse_url(full, &u)) return;
+	if (!u.tls && hsts_has(u.host)) { u.tls = 1; if (u.port == 80) u.port = 443; }
+
+	char loc[URL_MAX];
+	int st = http_txn(&u, full, loc, sizeof loc, 0);
+	if (st != 200 || B->raw_len < 8) return;
+	if ((unsigned char)B->raw[0] != 0x89 || B->raw[1] != 'P' ||
+	    B->raw[2] != 'N' || B->raw[3] != 'G') return;                /* PNG only */
+	if (B->img_pool_len + B->raw_len > IMG_POOL) return;             /* no room  */
+
+	im->coff = B->img_pool_len;
+	im->clen = B->raw_len;
+	for (int k = 0; k < B->raw_len; k++)
+		B->img_pool[im->coff + k] = (unsigned char)B->raw[k];
+	B->img_pool_len += B->raw_len;
+
+	struct memrd mr = { B->img_pool + im->coff, 0, im->clen };
+	unsigned iw = 0, ih = 0;
+	if (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih) {
+		im->iw = iw; im->ih = ih; im->ok = 1;
+	}
+}
+
+/* Fetch the page's *eager* inline images up front (loading != "lazy"). A
+ * loading="lazy" image is left untouched until it scrolls into view, when the UI
+ * flags it and the worker calls fetch_lazy_visible(). */
 static void fetch_inline_images(const char *page_url)
 {
 	B->img_pool_len = 0;
 	for (int i = 0; i < B->n_imgs; i++) {
-		struct inl_img *im = &B->imgs[i];
-		im->ok = 0;
+		if (B->imgs[i].lazy) continue;             /* deferred until on-screen   */
+		fetch_one_image(i, page_url);
+		B->imgs[i].fetched = 1;
+		B->seq++;                  /* let the UI re-layout as each image lands  */
+	}
+}
 
-		char full[URL_MAX];
-		resolve_url(page_url, im->href, full, sizeof full);
+/* Worker step (called when no page fetch is pending): load at most one lazy
+ * <img> the UI has flagged as scrolled into view, against the current page URL.
+ * Returns 1 if it fetched one (so the caller can loop), 0 if there was nothing to
+ * do — which keeps the worker mostly idle until the user actually scrolls. */
+int fetch_lazy_visible(void)
+{
+	if (!B->cur_url[0])
+		return 0;
+	for (int i = 0; i < B->n_imgs; i++) {
+		struct inl_img *im = &B->imgs[i];
+		if (!im->lazy || im->fetched || !im->want)
+			continue;
+		fetch_one_image(i, B->cur_url);
+		im->fetched = 1; im->want = 0;
+		B->seq++;                  /* re-layout now that the image has landed   */
+		return 1;
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------ favicon decode */
+/* A favicon is fetched into B->raw and decoded down to a fixed 16x16 ARGB
+ * bitmap (B->favicon) for the tab strip. PNG favicons go through upng; .ico
+ * files are parsed here (best directory entry -> embedded PNG or a raw DIB).
+ * Anything we can't decode (GIF/BMP/SVG/empty) just leaves favicon_ok 0 and the
+ * tab shows the default globe. */
+
+/* Nearest-neighbour scale of a decoded RGBA image into the 16x16 favicon. The
+ * row callback fills every destination row whose source maps to the row `y`
+ * upng just produced, so it works whatever the source dimensions are. */
+struct favscale { unsigned iw, ih, next_r; unsigned *dst; };
+static int fav_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
+{
+	(void)w;
+	struct favscale *v = c;
+	while (v->next_r < FAVICON_H && (v->next_r * v->ih / FAVICON_H) == y) {
+		unsigned *drow = v->dst + v->next_r * FAVICON_W;
+		for (unsigned x = 0; x < FAVICON_W; x++) {
+			const unsigned char *p = rgba + (x * v->iw / FAVICON_W) * 4;
+			drow[x] = ((unsigned)p[3] << 24) | ((unsigned)p[0] << 16) |
+			          ((unsigned)p[1] << 8) | (unsigned)p[2];
+		}
+		v->next_r++;
+	}
+	return 0;
+}
+
+static int fav_decode_png(const unsigned char *buf, int len)
+{
+	struct memrd mr = { buf, 0, len };
+	unsigned iw = 0, ih = 0;
+	if (upng_dimensions(memrd_get, &mr, &iw, &ih) != 0 || !iw || !ih)
+		return 0;
+	struct favscale v = { iw, ih, 0, B->favicon };
+	struct memrd mr2 = { buf, 0, len };
+	if (upng_decode(memrd_get, &mr2, fav_row, &v, 0, 0) != 0)
+		return 0;
+	return v.next_r > 0;
+}
+
+/* Little-endian readers for the .ico container (always little-endian). */
+static unsigned le16(const unsigned char *p) { return p[0] | ((unsigned)p[1] << 8); }
+static unsigned le32(const unsigned char *p)
+{ return p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24); }
+
+/* Decode one ICO image stored as a Windows DIB (BITMAPINFOHEADER + pixels, no
+ * BMP file header). Bottom-up rows; biHeight counts the XOR colour rows plus an
+ * equal AND (1bpp transparency) mask, so the real height is half. Supports
+ * 1/4/8/24/32 bpp, BI_RGB. Sampled directly at 16x16 to avoid a full-size
+ * intermediate buffer. */
+static int fav_decode_dib(const unsigned char *p, int len)
+{
+	if (len < 40) return 0;
+	unsigned hsz = le32(p);
+	if (hsz < 40 || (int)hsz > len) return 0;
+	int W   = (int)le32(p + 4);
+	int Hf  = (int)le32(p + 8);
+	unsigned bpp  = le16(p + 14);
+	unsigned comp = le32(p + 16);
+	if (comp != 0 && comp != 3) return 0;          /* BI_RGB / BI_BITFIELDS only */
+	if (W <= 0 || Hf <= 0) return 0;
+
+	int H = Hf / 2, mask = 1;                       /* XOR colour rows = half     */
+	if (H < 1) { H = Hf; mask = 0; }                /* no AND mask present         */
+
+	unsigned clr = le32(p + 32);
+	if (bpp <= 8 && clr == 0) clr = 1u << bpp;
+	const unsigned char *pal = p + hsz;
+	int pal_sz = (bpp <= 8) ? (int)clr * 4 : 0;
+
+	int xstride = ((W * (int)bpp + 31) / 32) * 4;
+	const unsigned char *xor_ = pal + pal_sz;
+	long xor_sz = (long)xstride * H;
+	if ((xor_ - p) + xor_sz > len) return 0;
+
+	int astride = ((W + 31) / 32) * 4;
+	const unsigned char *and_ = xor_ + xor_sz;
+	int and_present = mask && ((and_ - p) + (long)astride * H <= len);
+
+	/* Trust a 32bpp alpha channel only if at least one pixel is non-zero;
+	 * many icons leave it all-zero and rely on the AND mask instead. */
+	int has_alpha = 0;
+	if (bpp == 32)
+		for (long i = 3; i < xor_sz && !has_alpha; i += 4)
+			if (xor_[i]) has_alpha = 1;
+
+	for (int dy = 0; dy < FAVICON_H; dy++) {
+		int sy = dy * H / FAVICON_H;                /* dest row -> source row      */
+		int br = H - 1 - sy;                        /* DIB rows are bottom-up      */
+		const unsigned char *xrow = xor_ + (long)br * xstride;
+		const unsigned char *arow = and_ + (long)br * astride;
+		for (int dx = 0; dx < FAVICON_W; dx++) {
+			int sx = dx * W / FAVICON_W;
+			unsigned r = 0, g = 0, b = 0, a = 255;
+			if (bpp == 32) {
+				const unsigned char *q = xrow + sx * 4;
+				b = q[0]; g = q[1]; r = q[2]; a = has_alpha ? q[3] : 255;
+			} else if (bpp == 24) {
+				const unsigned char *q = xrow + sx * 3;
+				b = q[0]; g = q[1]; r = q[2];
+			} else {
+				unsigned idx;
+				if      (bpp == 8) idx = xrow[sx];
+				else if (bpp == 4) idx = (sx & 1) ? (xrow[sx >> 1] & 0xf)
+				                                  : (xrow[sx >> 1] >> 4);
+				else if (bpp == 1) idx = (xrow[sx >> 3] >> (7 - (sx & 7))) & 1;
+				else return 0;                      /* unsupported depth           */
+				if (idx >= clr) idx = 0;
+				const unsigned char *c = pal + idx * 4;
+				b = c[0]; g = c[1]; r = c[2];
+			}
+			if (bpp != 32 && and_present) {
+				unsigned mb = arow[sx >> 3];
+				if ((mb >> (7 - (sx & 7))) & 1) a = 0;   /* mask bit set = clear   */
+			}
+			B->favicon[dy * FAVICON_W + dx] =
+				(a << 24) | (r << 16) | (g << 8) | b;
+		}
+	}
+	return 1;
+}
+
+/* Pick the best image in an .ico directory: the smallest entry that is still
+ * >= 16px (an exact 16 wins), else the largest available. Fills poff/plen with
+ * its byte range within the file. */
+static int ico_pick(const unsigned char *p, int len, int *poff, int *plen)
+{
+	if (len < 6 || le16(p) != 0 || le16(p + 2) != 1) return 0;   /* type 1 = icon */
+	int count = le16(p + 4);
+	if (count < 1 || 6 + count * 16 > len) return 0;
+	int best = -1, best_score = -1;
+	for (int i = 0; i < count; i++) {
+		const unsigned char *e = p + 6 + i * 16;
+		int w = e[0] ? e[0] : 256;
+		int boff = (int)le32(e + 12), blen = (int)le32(e + 8);
+		if (boff < 0 || blen <= 0 || boff + blen > len) continue;
+		int score = (w >= FAVICON_W) ? (1000 - w) : w;
+		if (score > best_score) { best_score = score; best = i; *poff = boff; *plen = blen; }
+	}
+	return best >= 0;
+}
+
+/* Decode whatever sits in B->raw into B->favicon; returns 1 on success. */
+static int favicon_decode(void)
+{
+	int n = B->raw_len;
+	if (n < 4) return 0;
+	const unsigned char *r = (const unsigned char *)B->raw;
+	if (r[0] == 0x89 && r[1] == 'P' && r[2] == 'N' && r[3] == 'G')
+		return fav_decode_png(r, n);
+	if (r[0] == 0 && r[1] == 0 && r[2] == 1 && r[3] == 0) {        /* .ico        */
+		int off = 0, l = 0;
+		if (!ico_pick(r, n, &off, &l)) return 0;
+		const unsigned char *img = r + off;
+		if (l >= 8 && img[0] == 0x89 && img[1] == 'P' &&
+		    img[2] == 'N' && img[3] == 'G')                        /* PNG in .ico */
+			return fav_decode_png(img, l);
+		return fav_decode_dib(img, l);
+	}
+	return 0;                                  /* GIF/BMP/SVG favicons unsupported */
+}
+
+/* Fetch and decode the page favicon into B->favicon. Uses the <link rel=icon>
+ * href the parser found, else the conventional /favicon.ico at the site root.
+ * Follows redirects (CDNs often 30x a favicon) up to MAX_REDIR, one socket per
+ * hop, into B->raw — safe to clobber here since the page body is already
+ * rendered. Leaves favicon_ok 0 on any failure (the tab falls back to the
+ * globe). */
+static void fetch_favicon(const char *page_url)
+{
+	char full[URL_MAX];
+	resolve_url(page_url, B->favicon_href[0] ? B->favicon_href : "/favicon.ico",
+	            full, sizeof full);
+
+	for (int hop = 0; hop <= MAX_REDIR; hop++) {
 		struct purl u;
-		if (!parse_url(full, &u)) continue;
+		if (!parse_url(full, &u)) return;
 		if (!u.tls && hsts_has(u.host)) { u.tls = 1; if (u.port == 80) u.port = 443; }
 
-		char msg[200]; int m = 0;
-		sapp(msg, &m, sizeof msg, "Loading image ");
-		uapp(msg, &m, sizeof msg, (unsigned)(i + 1));
-		sapp(msg, &m, sizeof msg, "/");
-		uapp(msg, &m, sizeof msg, (unsigned)B->n_imgs);
-		sapp(msg, &m, sizeof msg, " ...");
-		set_status(msg);
-
-		char loc[URL_MAX];
+		char loc[URL_MAX]; loc[0] = '\0';
 		int st = http_txn(&u, full, loc, sizeof loc, 0);
-		if (st != 200 || B->raw_len < 8) continue;
-		if ((unsigned char)B->raw[0] != 0x89 || B->raw[1] != 'P' ||
-		    B->raw[2] != 'N' || B->raw[3] != 'G') continue;          /* PNG only */
-		if (B->img_pool_len + B->raw_len > IMG_POOL) continue;       /* no room  */
-
-		im->coff = B->img_pool_len;
-		im->clen = B->raw_len;
-		for (int k = 0; k < B->raw_len; k++)
-			B->img_pool[im->coff + k] = (unsigned char)B->raw[k];
-		B->img_pool_len += B->raw_len;
-
-		struct memrd mr = { B->img_pool + im->coff, 0, im->clen };
-		unsigned iw = 0, ih = 0;
-		if (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih) {
-			im->iw = iw; im->ih = ih; im->ok = 1;
+		if ((st == 301 || st == 302 || st == 303 || st == 307 || st == 308) && loc[0]) {
+			char next[URL_MAX];
+			resolve_url(full, loc, next, sizeof next);
+			int k = 0;
+			for (; next[k] && k < URL_MAX - 1; k++) full[k] = next[k];
+			full[k] = '\0';
+			continue;
 		}
-		B->seq++;                  /* let the UI re-layout as each image lands  */
+		if (st != 200 || B->raw_len < 4) return;
+		if (favicon_decode()) B->favicon_ok = 1;
+		return;
 	}
 }
 
@@ -720,6 +1100,7 @@ void do_fetch(void)
 	char url[URL_MAX]; int n = 0;
 	sapp(url, &n, sizeof url, B->req_url);
 	B->dl_saved = 0;
+	B->favicon_ok = 0;          /* cleared per navigation; refilled on success */
 
 	/* Local / inline schemes never touch the network: file:// reads the local
 	 * FS, data: decodes an embedded document. Both fill B->raw + B->ctype and
@@ -731,23 +1112,29 @@ void do_fetch(void)
 		B->n_imgs = 0;
 		int rc = data ? load_data_url(url) : load_file_url(url);
 		if (rc < 0) {
-			set_status(data ? "Malformed data: URL"
+			show_error(data ? "Malformed data: URL"
 			                : "Cannot open file (not found or not absolute)");
 			return;
 		}
 		render_raw(url);
-		char done[256]; int dn = 0;
-		sapp(done, &dn, sizeof done, data ? "data:  -  " : "file:  -  ");
-		uapp(done, &dn, sizeof done, (unsigned)B->raw_len);
-		sapp(done, &dn, sizeof done, " bytes  -  ");
-		sapp(done, &dn, sizeof done, url);
-		set_status(done);
 		return;
+	}
+
+	/* Auto-add a scheme when the user typed a bare host ("miwa.lol/..."): default
+	 * to https like a modern browser. Remember it was implicit so a host that
+	 * can't do TLS (or a plain dev server on a custom port) falls back to http. */
+	int implicit_scheme = 0;
+	if (!starts_ci(url, "http://") && !starts_ci(url, "https://")) {
+		char tmp[URL_MAX]; int t = 0;
+		sapp(tmp, &t, sizeof tmp, "https://");
+		sapp(tmp, &t, sizeof tmp, url);
+		n = 0; sapp(url, &n, sizeof url, tmp);
+		implicit_scheme = 1;
 	}
 
 	for (int hop = 0; hop <= MAX_REDIR; hop++) {
 		struct purl u;
-		if (!parse_url(url, &u)) { set_status("Bad URL"); return; }
+		if (!parse_url(url, &u)) { show_error("Bad URL"); return; }
 
 		/* HSTS: a host that previously sent Strict-Transport-Security is only
 		 * ever contacted over HTTPS, even if the URL says http://. */
@@ -756,24 +1143,28 @@ void do_fetch(void)
 			if (u.port == 80) u.port = 443;
 		}
 
-		char msg[200]; int m = 0;
-		sapp(msg, &m, sizeof msg, u.tls ? "Connecting (https) to " : "Connecting to ");
-		sapp(msg, &m, sizeof msg, u.host);
-		sapp(msg, &m, sizeof msg, " ...");
-		set_status(msg);
-
 		char loc[URL_MAX];
 		int st = http_txn(&u, url, loc, sizeof loc, 1);
 		if (st < 0) {
-			if      (st == -2) set_status("Could not resolve host");
-			else if (st == -1) set_status("No network device / out of sockets");
-			else if (st == -3) set_status("Connection failed");
-			else if (st == -4) set_status("Failed to send request");
-			else               set_status("No response from server");
+			/* Secure connect failed for an auto-https URL (host has no TLS, or a
+			 * plain dev server) — retry the same URL over http once. */
+			if (implicit_scheme && st == -3 && starts_ci(url, "https://")) {
+				char tmp[URL_MAX]; int t = 0;
+				sapp(tmp, &t, sizeof tmp, "http://");
+				sapp(tmp, &t, sizeof tmp, url + 8);   /* past "https://" */
+				n = 0; sapp(url, &n, sizeof url, tmp);
+				implicit_scheme = 0;
+				continue;
+			}
+			if      (st == -2) show_error("Could not resolve host");
+			else if (st == -1) show_error("No network device / out of sockets");
+			else if (st == -3) show_error("Connection failed");
+			else if (st == -4) show_error("Failed to send request");
+			else               show_error("No response from server");
 			return;
 		}
 		if ((st == 301 || st == 302 || st == 303 || st == 307 || st == 308) && loc[0]) {
-			if (hop == MAX_REDIR) { set_status("Too many redirects"); return; }
+			if (hop == MAX_REDIR) { show_error("Too many redirects"); return; }
 			n = 0; sapp(url, &n, sizeof url, loc);
 			continue;
 		}
@@ -790,31 +1181,18 @@ void do_fetch(void)
 		/* The title bar is updated by the main thread (only the window's owner
 		 * task may call win_settitle); it reads B->doc_title / B->cur_url. */
 
-		unsigned page_bytes = (unsigned)B->raw_len;
-
 		/* HTML pages may carry inline <img>: fetch each as a sub-resource and
 		 * stash its PNG bytes (this reuses B->raw, now that html_to_text has
-		 * already extracted the page text). Done before the final status line so
-		 * the per-image "Loading image N/M" notices don't linger afterwards. */
+		 * already extracted the page text). Each fetched image bumps B->seq so
+		 * the UI re-lays-out as they land. */
 		if (B->mode == MODE_HTML && B->n_imgs > 0)
 			fetch_inline_images(url);
 
-		char done[200]; int d = 0;
-		sapp(done, &d, sizeof done, "HTTP ");
-		uapp(done, &d, sizeof done, (unsigned)st);
-		sapp(done, &d, sizeof done, "  -  ");
-		uapp(done, &d, sizeof done, page_bytes);
-		sapp(done, &d, sizeof done, " bytes");
-		int nck = cookie_count(u.host);
-		if (nck) {
-			sapp(done, &d, sizeof done, "  -  ");
-			uapp(done, &d, sizeof done, (unsigned)nck);
-			sapp(done, &d, sizeof done, " cookie");
-			if (nck != 1) sapp(done, &d, sizeof done, "s");
-		}
-		sapp(done, &d, sizeof done, "  -  ");
-		sapp(done, &d, sizeof done, url);
-		set_status(done);
+		/* Pull the site favicon for the tab strip (after inline images, since it
+		 * also reuses B->raw). Skipped for a directly-rendered image page, whose
+		 * pixels still live in B->raw and would be clobbered. */
+		if (B->mode != MODE_IMAGE)
+			fetch_favicon(url);
 		return;
 	}
 }

@@ -12,8 +12,8 @@
  *   4. walk the codec's widget graph to find an output DAC -> pin path.
  *   5. configure that path (power, format, stream tag, unmute amps, EAPD).
  *
- * Playback (hda_stream_*, fed from ring 3 with interrupts on):
- *   ring 3 (/bin/play) parses the WAV and resamples it to 48 kHz 16-bit stereo,
+ * Playback (hda_stream_*, fed from user space with interrupts on):
+ *   /bin/play parses the WAV and resamples it to 48 kHz 16-bit stereo,
  *   then pushes ready frames here; this driver streams them through one output
  *   stream descriptor over a cyclic 2-half DMA buffer, pacing the producer by
  *   *polling* the link position register (SDnLPIB) — no IRQ wiring, which keeps
@@ -497,9 +497,9 @@ static void configure_path(void)
 	hda_apply_volume();
 }
 
-/* ---- streaming PCM sink (48 kHz / S16 / stereo, fed from ring 3) --------
+/* ---- streaming PCM sink (48 kHz / S16 / stereo, fed from user space) --------
  *
- * The WAV parse + resample now live in ring 3 (/bin/play): it streams the file
+ * The WAV parse + resample now live in /bin/play: it streams the file
  * in small chunks, resamples to this canonical format, and pushes ready frames
  * here over the SYS_AUDIO_* syscalls. This driver is just the DMA back end —
  * a cyclic buffer the producer fills behind the play head. Pushing tiny bounded

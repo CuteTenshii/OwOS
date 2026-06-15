@@ -7,9 +7,12 @@
 #include "io.h"
 #include "screenshot.h"
 #include "serial.h"
+#include "console.h"
 #include "sb16.h"
 #include "hda.h"
 #include "fb.h"
+#include "vmtools.h"
+#include "wm.h"
 
 #define KBD_DATA_PORT   0x60
 #define KBD_STATUS_PORT 0x64
@@ -163,6 +166,7 @@ static const struct kbd_layout layouts[] = {
 static const char *active_map   = keymap;
 static const char *active_shift = keymap_shift;
 static const char *active_altgr = NULL;
+static const char *active_layout = "us";       /* name, for /proc/keyboard       */
 
 /* Keypad keys 0x47..0x53 in order, as they type when Num Lock is on. */
 static const char keypad[] = {
@@ -204,6 +208,42 @@ static volatile uint8_t ring_tail;
  * which is busy in a loop and never draining the ring. Consumers poll it. */
 static volatile int int_pending;
 
+/* A clipboard paste can be far larger than the 128-byte key ring, so it is fed
+ * to the consumer (the main input loop) directly by keyboard_poll() rather than
+ * pushed through the ring. Single producer (the Ctrl+V handler, in the IRQ) /
+ * single consumer (the main loop), like the ring: paste_len is published last
+ * and gates the drain, so a half-filled buffer is never read. */
+#define PASTE_BUF_SIZE 8192
+static char          paste_buf[PASTE_BUF_SIZE];
+static volatile int  paste_len;
+static volatile int  paste_pos;
+
+/* Pull the clipboard and arm it for injection. Pasted text is normalized to the
+ * line editor's expectations: CRLF/CR -> LF (so a multi-line paste submits each
+ * line), tabs and newlines kept, other control bytes dropped. */
+static void keyboard_paste_clipboard(void)
+{
+	static char raw[PASTE_BUF_SIZE];
+	if (paste_pos < paste_len)
+		return;                        /* a paste is still draining; ignore       */
+
+	int n = vmtools_clip_get(raw, sizeof raw);
+	int out = 0;
+	for (int i = 0; i < n; i++) {
+		char c = raw[i];
+		if (c == '\r') {               /* fold CR and CRLF down to a single LF     */
+			if (i + 1 < n && raw[i + 1] == '\n')
+				i++;
+			c = '\n';
+		}
+		if (c != '\n' && c != '\t' && (unsigned char)c < 0x20)
+			continue;                  /* drop stray control bytes                */
+		paste_buf[out++] = c;
+	}
+	paste_pos = 0;
+	paste_len = out;                   /* publish last                            */
+}
+
 static void ring_push(char c)
 {
 	uint8_t next = (ring_head + 1) % KBD_BUF_SIZE;
@@ -215,6 +255,16 @@ static void ring_push(char c)
 
 int keyboard_poll(char *out)
 {
+	/* Drain a pending paste ahead of typed keys, but only while the focused
+	 * window's event queue has room: a paste is far faster than an app
+	 * drains, so without this back-pressure everything past the queue depth is
+	 * silently dropped (a long URL pasted only partway). When the queue is full
+	 * we hold the paste and fall through, so the caller idles (hlt) and the app
+	 * gets scheduled to drain — then the rest flows on a later poll. */
+	if (paste_pos < paste_len && wm_focus_key_space() > 1) {
+		*out = paste_buf[paste_pos++];
+		return 1;
+	}
 	if (ring_head == ring_tail)
 		return 0;
 	*out = ring[ring_tail];
@@ -243,6 +293,11 @@ static void keyboard_handler(struct registers *r)
 {
 	(void)r;
 	uint8_t sc = inb(KBD_DATA_PORT);
+
+	/* TEMP diagnostic: print every raw scancode byte on its own line, to learn
+	 * whether Fn+F-key emits a code distinct from the bare F-key. E0 prefix
+	 * shows as 0xE0; a release is make|0x80. Remove once captured. */
+	con_write("\nsc="); con_write_hex(sc);
 
 	/* Extended keys (keypad Enter/'/', arrows, right Ctrl/AltGr, etc.) arrive
 	 * as 0xE0 then a second byte. The arrow/navigation cluster is translated
@@ -291,12 +346,15 @@ static void keyboard_handler(struct registers *r)
 			break;
 		case SC_E_BRIGHT_DN: fb_brightness_step(-1); break;
 		case SC_E_BRIGHT_UP: fb_brightness_step(+1); break;
-		case SC_E_UP:        ring_push(KEY_UP);     break;
-		case SC_E_DOWN:      ring_push(KEY_DOWN);   break;
-		case SC_E_LEFT:      ring_push(KEY_LEFT);   break;
-		case SC_E_RIGHT:     ring_push(KEY_RIGHT);  break;
-		case SC_E_HOME:      ring_push(KEY_HOME);   break;
-		case SC_E_END:       ring_push(KEY_END);    break;
+		/* Shift held turns the navigation cluster into selection-extend codes
+		 * (KEY_S*) so a windowed editor can grow a selection; bare arrows stay
+		 * the plain editing codes the shell line editor and apps already use. */
+		case SC_E_UP:        ring_push(shift_held ? KEY_SUP    : KEY_UP);    break;
+		case SC_E_DOWN:      ring_push(shift_held ? KEY_SDOWN  : KEY_DOWN);  break;
+		case SC_E_LEFT:      ring_push(shift_held ? KEY_SLEFT  : KEY_LEFT);  break;
+		case SC_E_RIGHT:     ring_push(shift_held ? KEY_SRIGHT : KEY_RIGHT); break;
+		case SC_E_HOME:      ring_push(shift_held ? KEY_SHOME  : KEY_HOME);  break;
+		case SC_E_END:       ring_push(shift_held ? KEY_SEND   : KEY_END);   break;
 		case SC_E_DELETE:    ring_push(KEY_DELETE); break;
 		case 0x5B: case 0x5C: ring_push(KEY_SUPER); break;  /* left/right GUI key */
 		}
@@ -356,15 +414,18 @@ static void keyboard_handler(struct registers *r)
 
 	/* Ctrl chords: a few line-editing shortcuts. Any other Ctrl+key is
 	 * swallowed so it can't leak the bare letter (e.g. Ctrl+V must not type
-	 * 'v'). There is no clipboard channel from the host, so Ctrl+V cannot
-	 * paste -- it simply does nothing. */
+	 * 'v'). Ctrl+V injects the clipboard (the host clipboard on a VMware guest,
+	 * otherwise the local one) into the input stream. */
 	if (ctrl_held) {
 		switch (active_map[sc]) {       /* the unshifted key, layout-aware    */
 		case 'c': int_pending = 1;       break;  /* interrupt (latched)       */
+		case 'v': keyboard_paste_clipboard(); break;  /* paste               */
 		case 'l': ring_push(KEY_CLEAR);  break;
 		case 'u': ring_push(KEY_KILL);   break;
-		case 'a': ring_push(KEY_HOME);   break;
+		case 'a': ring_push(KEY_SELALL); break;  /* editor: select all; shell  */
+		                                         /* maps KEY_SELALL to Home    */
 		case 'e': ring_push(KEY_END);    break;
+		case 'x': ring_push(KEY_CUT);    break;  /* editor: cut the selection  */
 		case 'n': ring_push(KEY_NEW);    break;  /* menu accelerators: the   */
 		case 'o': ring_push(KEY_OPEN);   break;  /* focused window's key cb  */
 		case 's': ring_push(KEY_SAVE);   break;  /* maps these to menu items */
@@ -406,11 +467,14 @@ int keyboard_set_layout(const char *name)
 			active_map   = layouts[i].map;
 			active_shift = layouts[i].shift;
 			active_altgr = layouts[i].altgr;
+			active_layout = layouts[i].name;
 			return 0;
 		}
 	}
 	return -1;
 }
+
+const char *keyboard_layout_name(void) { return active_layout; }
 
 /* --- i8042 controller bring-up -------------------------------------------- *
  * QEMU's SeaBIOS leaves the i8042 with the keyboard port enabled and the

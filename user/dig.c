@@ -1,4 +1,4 @@
-/* dig.c — a ring-3 DNS lookup tool over a UDP socket.
+/* dig.c — a DNS lookup tool over a UDP socket.
  *
  * The kernel only lends a UDP datagram transport; this program builds the DNS
  * query and parses the response (header, question, answer RRs with name

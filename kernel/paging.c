@@ -347,6 +347,57 @@ void paging_unmap_user_at(uint32_t *dir, uint32_t vaddr, uint32_t bytes)
 	}
 }
 
+/* Heap grow: map fresh, zeroed user pages for [old_top, new_top) (both page-
+ * aligned) into the process window `dir`. New frames are zero-filled through the
+ * supervisor scratch slot so no prior tenant's bytes leak to ring 3, and each is
+ * invlpg'd in case a not-present translation was cached. Returns 0, or -1 on pmm/
+ * pool exhaustion after rolling back the pages this call had mapped. Backs the
+ * user-space heap (SYS_SBRK); the frames are reclaimed at process exit by
+ * paging_free_process_dir, which walks every present window PTE. */
+int paging_user_grow(uint32_t *dir, uint32_t old_top, uint32_t new_top)
+{
+	for (uint32_t page = old_top; page < new_top; page += 4096) {
+		uint32_t phys = pmm_alloc_frame();
+		int ok = phys != 0;
+		if (ok) {
+			uint32_t fl = irq_save();
+			uint32_t *kv = paging_scratch_map(0, phys);
+			for (int k = 0; k < 1024; k++)
+				kv[k] = 0;
+			paging_scratch_unmap(0);
+			irq_restore(fl);
+			if (paging_map_user_at(dir, page, phys, 1) < 0) {
+				pmm_free_frame(phys);
+				ok = 0;
+			}
+		}
+		if (!ok) {
+			paging_user_shrink(dir, old_top, page);   /* undo this call */
+			return -1;
+		}
+		__asm__ volatile ("invlpg (%0)" : : "r"(page) : "memory");
+	}
+	return 0;
+}
+
+/* Heap shrink: unmap and free the user data frames for [new_top, old_top) (both
+ * page-aligned). Page tables are left in place (they get reused as the heap grows
+ * again and are reclaimed wholesale at process exit). */
+void paging_user_shrink(uint32_t *dir, uint32_t new_top, uint32_t old_top)
+{
+	for (uint32_t a = new_top; a < old_top; a += 4096) {
+		uint32_t pdi = a >> 22, pti = (a >> 12) & 0x3FF;
+		if (!(dir[pdi] & PAGE_PRESENT))
+			continue;
+		uint32_t *pt = (uint32_t *)(dir[pdi] & ~0xFFFu);
+		if (pt[pti] & PAGE_PRESENT) {
+			pmm_free_frame(pt[pti] & ~0xFFFu);
+			pt[pti] = 0;
+			__asm__ volatile ("invlpg (%0)" : : "r"(a) : "memory");
+		}
+	}
+}
+
 void paging_mark_wc(uint32_t virt, uint32_t len)
 {
 	uint32_t *dir;

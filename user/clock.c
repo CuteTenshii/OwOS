@@ -1,4 +1,4 @@
-/* clock.c — a digital clock, as a ring-3 app. Redraws when the second ticks. */
+/* clock.c — a digital clock app. Redraws when the second ticks. */
 #include "owos.h"
 #include "gfx.h"
 

@@ -25,4 +25,29 @@ int h2_request(int sock, int scheme_https, const char *authority,
                char *hdr, int hdrcap, int *hdrlen,
                http_body_fn body, void *ctx);
 
+/* Richer entry point for callers that need more than a bare GET (the browser).
+ *   user_agent    overrides the User-Agent (NULL -> "owos-curl").
+ *   extra_headers a "name: value\r\n…" block of request headers (e.g. Cookie,
+ *                 Accept, Accept-Language) — names are lowercased on encode, as
+ *                 HTTP/2 requires; when set it replaces the default Accept.
+ *                 Do NOT include connection-specific headers (Connection,
+ *                 Transfer-Encoding) or Accept-Encoding (responses stay
+ *                 uncompressed so the body needs no inflate).
+ *   on_headers    if set, called once after the response header block is decoded
+ *                 and BEFORE any body — `block`/`len` is the synthesized
+ *                 "HTTP/2 NNN\r\nname: value\r\n…" text (requires a non-NULL hdr
+ *                 buffer). Lets the caller parse headers and pick a body sink
+ *                 before DATA arrives. Return 0 to continue, non-zero to abort. */
+struct h2_opts {
+	const char *user_agent;
+	const char *extra_headers;
+	int (*on_headers)(void *ctx, const char *block, int len);
+};
+
+/* As h2_request, plus `opts` (may be NULL for the bare-GET behaviour). */
+int h2_run(int sock, int scheme_https, const char *authority,
+           const char *method, const char *path, const struct h2_opts *opts,
+           char *hdr, int hdrcap, int *hdrlen,
+           http_body_fn body, void *ctx);
+
 #endif /* OWOS_LIBH2_H */

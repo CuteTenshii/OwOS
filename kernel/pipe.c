@@ -66,6 +66,23 @@ int pipe_read(int id, char *buf, int len)
 	return n;
 }
 
+/* Non-blocking read: >0 bytes copied, 0 if empty but a writer is still attached
+ * (would-block), -1 once drained with no writers left (EOF). Lets a GUI program
+ * poll captured child output without parking on it. */
+int pipe_read_nb(int id, char *buf, int len)
+{
+	struct pipe *p = &pipes[id];
+	if (p->count == 0)
+		return p->writers <= 0 ? -1 : 0;
+	int n = 0;
+	while (n < len && p->count > 0) {
+		buf[n++] = p->buf[p->tail];
+		p->tail = (p->tail + 1) % PIPE_SIZE;
+		p->count--;
+	}
+	return n;
+}
+
 int pipe_write(int id, const char *buf, int len)
 {
 	struct pipe *p = &pipes[id];

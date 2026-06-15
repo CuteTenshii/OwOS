@@ -6,9 +6,12 @@
  * (type 1) gives the root directory record, and an optional Joliet
  * Supplementary VD (type 2) gives a nicer UCS-2 name tree we prefer when there.
  *
- * Scratch buffers are static and the FS layer is single-threaded (the shell),
- * so this is not reentrant — consistent with fat.c/hfs.c/ext.c. Directory walks
- * and file reads use separate static sectors so a read can't clobber a resolve.
+ * Multi-instance: every per-mount mutable global (the 2048-byte read fn, the
+ * root extent, the Joliet flag, cached label/type, and the directory/file
+ * scratch sectors) lives in a heap-allocated `struct iso_mount`. The driver is
+ * exposed only through the `struct fs_ops` vtable; each op takes the instance.
+ * Within one instance the scratch sectors aren't reentrant — consistent with
+ * fat.c/hfs.c/ext.c, and the FS layer is single-threaded (the shell).
  */
 
 #include <stddef.h>
@@ -16,8 +19,9 @@
 #include "iso9660.h"
 #include "endian.h"
 #include "console.h"
+#include "heap.h"
 
-/* ---------------------------------------------------------------- state */
+/* ---------------------------------------------------------------- constants */
 #define ISO_SECTOR    2048u
 #define VD_START      16u             /* first Volume Descriptor sector         */
 #define VD_LIMIT      64u             /* stop scanning the chain past here       */
@@ -29,15 +33,17 @@
 
 struct dirrec { uint32_t lba, size; int is_dir; };
 
-static int        mounted;
-static iso_read_fn rd;
-static uint32_t   root_lba, root_size;
-static int        joliet;            /* names are UCS-2 in the active VD         */
-static char       vol_label[33];
-static char       vol_type[20];
+/* ---------------------------------------------------------------- per-mount */
+struct iso_mount {
+	blk_read_fn rd;                  /* reads one 2048-byte logical sector      */
+	uint32_t    root_lba, root_size;
+	int         joliet;              /* names are UCS-2 in the active VD         */
+	char        vol_label[33];
+	char        vol_type[20];
 
-static uint8_t dbuf[ISO_SECTOR];     /* directory walking                       */
-static uint8_t rbuf[ISO_SECTOR];     /* file reads / descriptor scan            */
+	uint8_t     dbuf[ISO_SECTOR];    /* directory walking                       */
+	uint8_t     rbuf[ISO_SECTOR];    /* file reads / descriptor scan            */
+};
 
 /* ------------------------------------------------------------ name helpers */
 static char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
@@ -55,10 +61,10 @@ static int ci_eq(const char *a, const char *b)
 /* Decode an ISO/Joliet file identifier into a clean name: drop the ";version"
  * suffix and a bare trailing '.', and (Joliet) fold UCS-2BE down to its low
  * byte. `dst` must hold at least 256 bytes. */
-static void decode_name(char *dst, const uint8_t *id, int len)
+static void decode_name(struct iso_mount *m, char *dst, const uint8_t *id, int len)
 {
 	int n = 0;
-	if (joliet) {
+	if (m->joliet) {
 		for (int i = 0; i + 1 < len && n < 254; i += 2)
 			dst[n++] = (char)id[i + 1];        /* low byte of the UCS-2 unit    */
 	} else {
@@ -90,20 +96,20 @@ static void ri_init(struct rec_iter *it, uint32_t lba, uint32_t size)
 /* Yield the next directory record. Fills out + decoded name (>=256 bytes) and
  * returns 1, or 0 at end. Records never straddle a sector: a zero length byte
  * means "skip to the next sector". */
-static int ri_next(struct rec_iter *it, char *name, struct dirrec *out)
+static int ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct dirrec *out)
 {
 	while (it->pos < it->size) {
 		uint32_t sec = it->pos / ISO_SECTOR;
 		uint32_t off = it->pos % ISO_SECTOR;
 
 		if (!it->loaded || it->cur_sec != sec) {
-			if (rd(it->base_lba + sec, dbuf) != 0)
+			if (m->rd(it->base_lba + sec, m->dbuf) != 0)
 				return 0;
 			it->cur_sec = sec;
 			it->loaded  = 1;
 		}
 
-		uint8_t reclen = dbuf[off];
+		uint8_t reclen = m->dbuf[off];
 		if (reclen == 0) {                     /* pad — jump to next sector      */
 			it->pos = (sec + 1) * ISO_SECTOR;
 			continue;
@@ -113,7 +119,7 @@ static int ri_next(struct rec_iter *it, char *name, struct dirrec *out)
 			continue;
 		}
 
-		const uint8_t *p = dbuf + off;
+		const uint8_t *p = m->dbuf + off;
 		it->pos += reclen;
 
 		out->lba    = load_le32(p + 2);
@@ -126,7 +132,7 @@ static int ri_next(struct rec_iter *it, char *name, struct dirrec *out)
 		} else if (fil == 1 && p[33] == 0x01) {/* ".." (parent)                  */
 			name[0] = '.'; name[1] = '.'; name[2] = '\0';
 		} else {
-			decode_name(name, p + 33, fil);
+			decode_name(m, name, p + 33, fil);
 		}
 		return 1;
 	}
@@ -134,13 +140,14 @@ static int ri_next(struct rec_iter *it, char *name, struct dirrec *out)
 }
 
 /* Find a named child in directory (lba,size). 1 + *out on hit, else 0. */
-static int dir_find(uint32_t lba, uint32_t size, const char *want, struct dirrec *out)
+static int dir_find(struct iso_mount *m, uint32_t lba, uint32_t size,
+                    const char *want, struct dirrec *out)
 {
 	struct rec_iter it;
 	char name[256];
 	struct dirrec r;
 	ri_init(&it, lba, size);
-	while (ri_next(&it, name, &r)) {
+	while (ri_next(m, &it, name, &r)) {
 		if (name[0] == '.' && (name[1] == '\0' ||
 		    (name[1] == '.' && name[2] == '\0')))
 			continue;
@@ -153,9 +160,9 @@ static int dir_find(uint32_t lba, uint32_t size, const char *want, struct dirrec
 }
 
 /* Resolve a media subpath ("" or "/a/b/c") to a directory/file record. */
-static int resolve(const char *path, struct dirrec *out)
+static int resolve(struct iso_mount *m, const char *path, struct dirrec *out)
 {
-	struct dirrec cur = { root_lba, root_size, 1 };
+	struct dirrec cur = { m->root_lba, m->root_size, 1 };
 
 	if (path)
 		while (*path == '/')
@@ -174,7 +181,7 @@ static int resolve(const char *path, struct dirrec *out)
 		if (n == 0)
 			continue;
 		struct dirrec child;
-		if (!dir_find(cur.lba, cur.size, comp, &child))
+		if (!dir_find(m, cur.lba, cur.size, comp, &child))
 			return -1;
 		cur = child;
 	}
@@ -183,20 +190,20 @@ static int resolve(const char *path, struct dirrec *out)
 }
 
 /* ------------------------------------------------------------------ mount */
-static void load_label(const uint8_t *vd)
+static void load_label(struct iso_mount *m, const uint8_t *vd)
 {
 	/* Volume Identifier: 32 bytes at offset 40 (Joliet: UCS-2BE, 16 chars). */
 	int n = 0;
-	if (joliet) {
+	if (m->joliet) {
 		for (int i = 0; i < 32 && n < 32; i += 2)
-			vol_label[n++] = (char)vd[40 + i + 1];
+			m->vol_label[n++] = (char)vd[40 + i + 1];
 	} else {
 		for (int i = 0; i < 32 && n < 32; i++)
-			vol_label[n++] = (char)vd[40 + i];
+			m->vol_label[n++] = (char)vd[40 + i];
 	}
-	while (n > 0 && (vol_label[n - 1] == ' ' || vol_label[n - 1] == '\0'))
+	while (n > 0 && (m->vol_label[n - 1] == ' ' || m->vol_label[n - 1] == '\0'))
 		n--;
-	vol_label[n] = '\0';
+	m->vol_label[n] = '\0';
 }
 
 /* A Supplementary VD is Joliet when its escape sequences (32 bytes at offset 88)
@@ -208,49 +215,49 @@ static int is_joliet_svd(const uint8_t *vd)
 	       (e[2] == 0x40 || e[2] == 0x43 || e[2] == 0x45);
 }
 
-int iso_mount(iso_read_fn read)
+/* Run the volume-descriptor probe into a fresh instance. 0 on success, -1 on
+ * failure (no "CD001" magic, I/O error, no medium). */
+static int mount_probe(struct iso_mount *m, blk_read_fn read)
 {
-	mounted = 0;
-	joliet  = 0;
-	rd = read;
-	vol_label[0] = '\0';
-	vol_type[0]  = '\0';
+	m->joliet  = 0;
+	m->rd = read;
+	m->vol_label[0] = '\0';
+	m->vol_type[0]  = '\0';
 
 	int have_primary = 0;
 	uint32_t pri_lba = 0, pri_size = 0;
 	char pri_label[33] = { 0 };
 
 	for (uint32_t s = VD_START; s < VD_LIMIT; s++) {
-		if (rd(s, rbuf) != 0)
+		if (m->rd(s, m->rbuf) != 0)
 			break;
-		if (rbuf[1] != 'C' || rbuf[2] != 'D' || rbuf[3] != '0' ||
-		    rbuf[4] != '0' || rbuf[5] != '1')
+		if (m->rbuf[1] != 'C' || m->rbuf[2] != 'D' || m->rbuf[3] != '0' ||
+		    m->rbuf[4] != '0' || m->rbuf[5] != '1')
 			break;                             /* not ISO 9660 / chain ended     */
 
-		uint8_t type = rbuf[0];
+		uint8_t type = m->rbuf[0];
 		if (type == VDT_TERM)
 			break;
 
 		if (type == VDT_PRIMARY) {
 			/* Root directory record sits at offset 156. */
-			pri_lba  = load_le32(rbuf + 156 + 2);
-			pri_size = load_le32(rbuf + 156 + 10);
-			joliet = 0;
-			load_label(rbuf);
-			for (int i = 0; (pri_label[i] = vol_label[i]); i++)
+			pri_lba  = load_le32(m->rbuf + 156 + 2);
+			pri_size = load_le32(m->rbuf + 156 + 10);
+			m->joliet = 0;
+			load_label(m, m->rbuf);
+			for (int i = 0; (pri_label[i] = m->vol_label[i]); i++)
 				;
 			have_primary = 1;
-		} else if (type == VDT_SUPPLEM && is_joliet_svd(rbuf)) {
+		} else if (type == VDT_SUPPLEM && is_joliet_svd(m->rbuf)) {
 			/* Prefer Joliet: long, mixed-case names. */
-			root_lba  = load_le32(rbuf + 156 + 2);
-			root_size = load_le32(rbuf + 156 + 10);
-			joliet = 1;
-			load_label(rbuf);
-			mounted = 1;
+			m->root_lba  = load_le32(m->rbuf + 156 + 2);
+			m->root_size = load_le32(m->rbuf + 156 + 10);
+			m->joliet = 1;
+			load_label(m, m->rbuf);
 			const char *t = "ISO9660+Joliet";
 			int i = 0;
-			for (; t[i]; i++) vol_type[i] = t[i];
-			vol_type[i] = '\0';
+			for (; t[i]; i++) m->vol_type[i] = t[i];
+			m->vol_type[i] = '\0';
 			return 0;
 		}
 	}
@@ -258,33 +265,26 @@ int iso_mount(iso_read_fn read)
 	if (!have_primary)
 		return -1;
 
-	root_lba  = pri_lba;
-	root_size = pri_size;
-	joliet    = 0;
-	for (int i = 0; (vol_label[i] = pri_label[i]); i++)
+	m->root_lba  = pri_lba;
+	m->root_size = pri_size;
+	m->joliet    = 0;
+	for (int i = 0; (m->vol_label[i] = pri_label[i]); i++)
 		;
 	const char *t = "ISO9660";
 	int i = 0;
-	for (; t[i]; i++) vol_type[i] = t[i];
-	vol_type[i] = '\0';
-	mounted = 1;
+	for (; t[i]; i++) m->vol_type[i] = t[i];
+	m->vol_type[i] = '\0';
 	return 0;
 }
 
-int iso_mount_probe(iso_read_fn read) { return iso_mount(read); }
-
-void iso_unmount(void)        { mounted = 0; rd = NULL; }
-int  iso_mounted(void)        { return mounted; }
-const char *iso_label(void)   { return mounted ? vol_label : ""; }
-const char *iso_type(void)    { return mounted ? vol_type : "none"; }
-
 /* ----------------------------------------------------------------- queries */
-int iso_list(const char *path)
+static const char *iso_label(struct iso_mount *m) { return m->vol_label; }
+static const char *iso_type(struct iso_mount *m)  { return m->vol_type; }
+
+static int iso_list(struct iso_mount *m, const char *path)
 {
-	if (!mounted)
-		return -2;
 	struct dirrec d;
-	if (resolve(path, &d) != 0)
+	if (resolve(m, path, &d) != 0)
 		return -1;
 	if (!d.is_dir)
 		return -1;
@@ -293,7 +293,7 @@ int iso_list(const char *path)
 	char name[256];
 	struct dirrec r;
 	ri_init(&it, d.lba, d.size);
-	while (ri_next(&it, name, &r)) {
+	while (ri_next(m, &it, name, &r)) {
 		if (name[0] == '.' && (name[1] == '\0' ||
 		    (name[1] == '.' && name[2] == '\0')))
 			continue;
@@ -307,24 +307,21 @@ int iso_list(const char *path)
 	return 0;
 }
 
-int iso_stat(const char *path, int *is_dir, uint32_t *size)
+static int iso_stat(struct iso_mount *m, const char *path, int *is_dir, uint32_t *size)
 {
-	if (!mounted)
-		return -2;
 	struct dirrec d;
-	if (resolve(path, &d) != 0)
+	if (resolve(m, path, &d) != 0)
 		return -1;
 	if (is_dir) *is_dir = d.is_dir;
 	if (size)   *size   = d.is_dir ? 0 : d.size;
 	return 0;
 }
 
-int iso_read_at(const char *path, uint32_t offset, void *buf, uint32_t len)
+static int iso_read_at(struct iso_mount *m, const char *path, uint32_t offset,
+                       void *buf, uint32_t len)
 {
-	if (!mounted)
-		return -2;
 	struct dirrec d;
-	if (resolve(path, &d) != 0 || d.is_dir)
+	if (resolve(m, path, &d) != 0 || d.is_dir)
 		return -1;
 	if (offset >= d.size)
 		return 0;
@@ -337,24 +334,23 @@ int iso_read_at(const char *path, uint32_t offset, void *buf, uint32_t len)
 		uint32_t pos = offset + done;
 		uint32_t sec = pos / ISO_SECTOR;
 		uint32_t so  = pos % ISO_SECTOR;
-		if (rd(d.lba + sec, rbuf) != 0)
+		if (m->rd(d.lba + sec, m->rbuf) != 0)
 			return done ? (int)done : -1;
 		uint32_t chunk = ISO_SECTOR - so;
 		if (chunk > len - done)
 			chunk = len - done;
 		for (uint32_t i = 0; i < chunk; i++)
-			out[done + i] = rbuf[so + i];
+			out[done + i] = m->rbuf[so + i];
 		done += chunk;
 	}
 	return (int)done;
 }
 
-int iso_enum_dir(const char *path, int idx, char *name, int *is_dir, uint32_t *size)
+static int iso_enum_dir(struct iso_mount *m, const char *path, int idx, char *name,
+                        int *is_dir, uint32_t *size)
 {
-	if (!mounted)
-		return 0;
 	struct dirrec d;
-	if (resolve(path, &d) != 0 || !d.is_dir)
+	if (resolve(m, path, &d) != 0 || !d.is_dir)
 		return 0;
 
 	struct rec_iter it;
@@ -362,7 +358,7 @@ int iso_enum_dir(const char *path, int idx, char *name, int *is_dir, uint32_t *s
 	struct dirrec r;
 	int seen = 0;
 	ri_init(&it, d.lba, d.size);
-	while (ri_next(&it, nm, &r)) {
+	while (ri_next(m, &it, nm, &r)) {
 		if (nm[0] == '.' && (nm[1] == '\0' ||
 		    (nm[1] == '.' && nm[2] == '\0')))
 			continue;
@@ -378,4 +374,64 @@ int iso_enum_dir(const char *path, int idx, char *name, int *is_dir, uint32_t *s
 		seen++;
 	}
 	return 0;
+}
+
+/* ---------------------------------------------------------------- vtable */
+static void *iso_probe(blk_read_fn read, blk_write_fn write)
+{
+	(void)write;                                   /* ISO 9660 is read-only         */
+	struct iso_mount *m = kmalloc(sizeof(*m));
+	if (!m)
+		return NULL;
+	if (mount_probe(m, read) != 0) {
+		kfree(m);
+		return NULL;
+	}
+	return m;
+}
+
+static void iso_close(void *inst) { kfree(inst); }
+
+static const char *ops_label(void *inst) { return iso_label((struct iso_mount *)inst); }
+static const char *ops_type(void *inst)  { return iso_type((struct iso_mount *)inst); }
+
+static int ops_list(void *inst, const char *path)
+{
+	return iso_list((struct iso_mount *)inst, path);
+}
+
+static int ops_stat(void *inst, const char *path, int *is_dir, uint32_t *size)
+{
+	return iso_stat((struct iso_mount *)inst, path, is_dir, size);
+}
+
+static int ops_read_at(void *inst, const char *path, uint32_t off, void *buf, uint32_t len)
+{
+	return iso_read_at((struct iso_mount *)inst, path, off, buf, len);
+}
+
+static int ops_enum_dir(void *inst, const char *path, int idx, char *name,
+                        int *is_dir, uint32_t *size)
+{
+	return iso_enum_dir((struct iso_mount *)inst, path, idx, name, is_dir, size);
+}
+
+const struct fs_ops *iso_ops(void)
+{
+	static const struct fs_ops ops = {
+		.fsname   = "ISO9660",
+		.probe    = iso_probe,
+		.close    = iso_close,
+		.label    = ops_label,
+		.type     = ops_type,
+		.list     = ops_list,
+		.stat     = ops_stat,
+		.read_at  = ops_read_at,
+		.enum_dir = ops_enum_dir,
+		.create   = NULL,
+		.del      = NULL,
+		.mkdir    = NULL,
+		.rmdir    = NULL,
+	};
+	return &ops;
 }

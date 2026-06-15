@@ -1,4 +1,4 @@
-/* ping.c — a ring-3 ICMP echo client over a raw ICMP socket.
+/* ping.c — an ICMP echo client over a raw ICMP socket.
  *
  * The kernel only lends a raw ICMP transport (net_connect(host, 0, SK_ICMP) +
  * net_send/net_recv): this program builds the echo request (type 8, id, seq,

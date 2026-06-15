@@ -4,6 +4,7 @@
 #include "url.h"
 #include "http.h"
 #include "h2.h"
+#include "h3.h"
 
 /* ---- buffered transport reader ----------------------------------------- */
 
@@ -93,14 +94,14 @@ static void emit_byte(struct emitter *e, int b)
  * the caller opened and will close). Identical framing for plaintext and TLS.
  * Returns the HTTP status or a negative HTTP_E* code. */
 static int http1_exchange(int sock, const char *method, const struct purl *u,
-                          char *hdr, int hdrcap, int *hdrlen,
-                          http_body_fn body, void *ctx)
+                          const char *extra_headers, char *hdr, int hdrcap,
+                          int *hdrlen, http_body_fn body, void *ctx)
 {
 	if (!method)
 		method = "GET";
 
 	/* Build and send the request line + headers. */
-	char req[640];
+	char req[1024];
 	int n = 0;
 	sapp(req, &n, (int)sizeof req, method);
 	sapp(req, &n, (int)sizeof req, " ");
@@ -108,7 +109,10 @@ static int http1_exchange(int sock, const char *method, const struct purl *u,
 	sapp(req, &n, (int)sizeof req, " HTTP/1.1\r\nHost: ");
 	sapp(req, &n, (int)sizeof req, u->host);
 	sapp(req, &n, (int)sizeof req,
-	     "\r\nUser-Agent: owos-curl\r\nConnection: close\r\n\r\n");
+	     "\r\nUser-Agent: owos-curl\r\nConnection: close\r\n");
+	if (extra_headers)                              /* curl -H lines (\r\n-terminated) */
+		sapp(req, &n, (int)sizeof req, extra_headers);
+	sapp(req, &n, (int)sizeof req, "\r\n");
 	if (net_send(sock, req, n) < 0)
 		return HTTP_ESEND;
 
@@ -247,66 +251,72 @@ static void build_authority(char *out, int cap, const struct purl *u)
 	}
 }
 
-static int connect_url(const struct purl *u)
+/* The one request core: connect (offering ALPN "h2" when want_h2), then run the
+ * exchange over HTTP/2 (h2c when plaintext, or when ALPN picked h2 over TLS) or
+ * HTTP/1.1. `extra_headers` is an optional "name: value\r\n…" block appended to
+ * the request (curl -H). http_request / http_request2 are thin wrappers. */
+int http_request_ex(const char *method, const char *url, int want_h2, int want_h3,
+                    const char *extra_headers, char *hdr, int hdrcap, int *hdrlen,
+                    http_body_fn body, void *ctx)
 {
-	int sock = net_connect(u->host, u->port, u->tls);   /* u->tls: 0=TCP,1=TLS */
+	struct purl u;
+	if (!parse_url(url, &u))
+		return HTTP_EPARSE;
+
+	/* HTTP/3 is https-only (QUIC carries its own TLS). It manages its own UDP
+	 * socket, so dispatch before the TCP/TLS connect below. */
+	if (want_h3 && u.tls) {
+		char auth[URL_HOST_MAX + 8];
+		build_authority(auth, (int)sizeof auth, &u);
+		return h3_run(u.host, u.port, auth, method ? method : "GET", u.path,
+		              extra_headers, hdr, hdrcap, hdrlen, body, ctx);
+	}
+
+	int proto = u.tls ? (want_h2 ? SK_TLS_H2 : SK_TLS) : SK_TCP;
+	int sock = net_connect(u.host, u.port, proto);
 	if (sock < 0) {
 		if (sock == NET_EINTR) return HTTP_EINTR;
 		if (sock == -2)        return HTTP_ERESOLVE;
 		return HTTP_ECONNECT;
 	}
-	return sock;
+
+	/* h2 for h2c (plaintext + want_h2), or when ALPN selected it over TLS. */
+	int use_h2 = want_h2 && (!u.tls || net_alpn(sock) == ALPN_H2);
+
+	int rc;
+	if (use_h2) {
+		char auth[URL_HOST_MAX + 8];
+		build_authority(auth, (int)sizeof auth, &u);
+		struct h2_opts opts = { 0, extra_headers, 0 };
+		rc = h2_run(sock, u.tls, auth, method ? method : "GET", u.path, &opts,
+		            hdr, hdrcap, hdrlen, body, ctx);
+	} else {
+		rc = http1_exchange(sock, method, &u, extra_headers,
+		                    hdr, hdrcap, hdrlen, body, ctx);
+	}
+	net_close(sock);
+	return rc;
 }
 
 int http_request(const char *method, const char *url,
                  char *hdr, int hdrcap, int *hdrlen,
                  http_body_fn body, void *ctx)
 {
-	struct purl u;
-	if (!parse_url(url, &u))
-		return HTTP_EPARSE;
-	int sock = connect_url(&u);
-	if (sock < 0)
-		return sock;
-	int rc = http1_exchange(sock, method, &u, hdr, hdrcap, hdrlen, body, ctx);
-	net_close(sock);
-	return rc;
+	return http_request_ex(method, url, 0, 0, 0, hdr, hdrcap, hdrlen, body, ctx);
 }
 
 int http_request2(const char *method, const char *url,
                   char *hdr, int hdrcap, int *hdrlen,
                   http_body_fn body, void *ctx)
 {
-	struct purl u;
-	if (!parse_url(url, &u))
-		return HTTP_EPARSE;
-	/* Over TLS, offer ALPN "h2" (SK_TLS_H2) so the server may select HTTP/2. */
-	int sock = net_connect(u.host, u.port, u.tls ? SK_TLS_H2 : SK_TCP);
-	if (sock < 0) {
-		if (sock == NET_EINTR) return HTTP_EINTR;
-		if (sock == -2)        return HTTP_ERESOLVE;
-		return HTTP_ECONNECT;
-	}
+	return http_request_ex(method, url, 1, 0, 0, hdr, hdrcap, hdrlen, body, ctx);
+}
 
-	char auth[URL_HOST_MAX + 8];
-	build_authority(auth, (int)sizeof auth, &u);
-
-	int rc;
-	if (u.tls) {
-		/* HTTP/2 over TLS only if the server selected ALPN "h2"; otherwise the
-		 * server speaks HTTP/1.1, so we must too. */
-		if (net_alpn(sock) == ALPN_H2)
-			rc = h2_request(sock, 1, auth, method ? method : "GET", u.path,
-			                hdr, hdrcap, hdrlen, body, ctx);
-		else
-			rc = http1_exchange(sock, method, &u, hdr, hdrcap, hdrlen, body, ctx);
-	} else {
-		/* h2c with prior knowledge: no Upgrade dance, just the h2 preface. */
-		rc = h2_request(sock, 0, auth, method ? method : "GET", u.path,
-		                hdr, hdrcap, hdrlen, body, ctx);
-	}
-	net_close(sock);
-	return rc;
+int http_request3(const char *method, const char *url,
+                  char *hdr, int hdrcap, int *hdrlen,
+                  http_body_fn body, void *ctx)
+{
+	return http_request_ex(method, url, 0, 1, 0, hdr, hdrcap, hdrlen, body, ctx);
 }
 
 int http_get(const char *url, http_body_fn body, void *ctx)

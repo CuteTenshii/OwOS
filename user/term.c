@@ -1,21 +1,27 @@
-/* term.c — a ring-3 terminal: a resizable, scrollable window hosting a shell.
+/* term.c — a terminal: a resizable, scrollable window hosting a shell.
  *
  * A text grid drawn with the 8x16 font (gfx.c) over a scrollback ring buffer.
- * Keys arrive as WEV_KEY events; the shell line-edits in the grid. Commands are
+ * Keys arrive as WEV_KEY events; the shell line-edits in the grid. This is a
+ * self-contained shell -- there is no kernel-shell bridge. Commands are
  * served three ways:
- *   - filesystem/string builtins run in ring 3 over syscalls (they use the
- *     shell's own cwd);
- *   - a /bin program is launched detached (GUI apps open their own window);
- *   - anything else is handed to the kernel shell's builtin via shell_cmd()
- *     (journal, neofetch, lspci, cpuinfo, date, ...) and its text is rendered
- *     here — so the user-space terminal gets every kernel command for free.
+ *   - builtins run over syscalls: filesystem/string ops, plus system
+ *     info/actions that read or write /proc (cpuinfo, journal, clip, poweroff,
+ *     dhcp, services, ...);
+ *   - CLI tools (neofetch, curl, lspci, ping, ...) are spawned with their stdout
+ *     captured through a pipe (spawn_cap) and rendered inline like a pty;
+ *   - any other /bin program is launched detached (GUI apps open their window).
+ * Ctrl+C arrives as a KEY_INTR event: it cancels the line at the prompt, or
+ * kills the captured child mid-command.
  *
  * The window resizes (WEV_RESIZE recomputes the grid) and scrolls (mouse wheel
- * -> WEV_SCROLL moves a view offset over the scrollback).
+ * -> WEV_SCROLL moves a view offset over the scrollback, or a drag/click on the
+ * gfx scrollbar widget down the right edge).
  */
 
 #include "owos.h"
 #include "gfx.h"
+#include "lzss.h"
+#include "deflate.h"
 
 #define FONT_W 8
 #define FONT_H 16
@@ -41,6 +47,7 @@ static int  view;                         /* lines scrolled up from the bottom  
 static int  ls_line, ls_col;              /* where the input line starts        */
 static unsigned cur_fg = FG;
 static int  cols = 90, rows = 27;         /* active grid (from window size)     */
+static int  winw = 720, winh = 432;       /* window client size in pixels       */
 static int  win, dirty = 1;
 
 static int phys(int logical) { return (top + logical) % SBROWS; }
@@ -132,7 +139,7 @@ static void tdec(unsigned v)
 
 static void redraw(void)
 {
-	gfx_fill_rect(0, 0, cols * FONT_W, rows * FONT_H, BG);
+	gfx_fill_rect(0, 0, winw - GUI_SCROLL_W, winh, BG);     /* text area          */
 	int bottom = nlines > rows ? nlines - rows : 0;
 	int vt = bottom - view;
 	if (vt < 0) vt = 0;
@@ -146,6 +153,11 @@ static void redraw(void)
 	}
 	if (view == 0 && cl >= vt && cl < vt + rows)            /* caret at bottom    */
 		gfx_fill_rect(cc * FONT_W, (cl - vt) * FONT_H + FONT_H - 2, FONT_W, 2, FG);
+
+	/* Scrollbar down the right edge: `scroll` is the top visible line (vt), which
+	 * runs 0..bottom as `view` runs bottom..0 (view counts lines scrolled back). */
+	scrollbar_draw(winw - GUI_SCROLL_W, 0, GUI_SCROLL_W, winh, bottom - view, nlines, rows);
+
 	win_present(win);
 	dirty = 0;
 }
@@ -213,9 +225,16 @@ static void err(const char *a, const char *b)
 
 static void bi_help(void)
 {
-	tputs("ring-3 builtins: help clear echo pwd cd ls cat write mkdir rmdir rm cp mv stat exit\n");
-	tputs("kernel commands (journal neofetch lspci cpuinfo date meminfo tasks ...) run via the\n");
-	tputs("kernel shell; /bin programs (editor files clock browser ...) open their own window.\n");
+	tputs_c("OwOS shell.  Ctrl+C cancels the line / aborts a command.\n", FG_DIR);
+	tputs("files    ls cat cp mv rm mkdir rmdir stat pwd cd grep\n");
+	tputs("archive  zip unzip gzip gunzip\n");
+	tputs("system   uptime uname whoami cpuinfo meminfo date ps journal which\n");
+	tputs("device   storage lsusb mount umount loadkeys clip\n");
+	tputs("net      services (dhcp/ntp run as services: `services start ntp`)\n");
+	tputs("power    poweroff restart\n");
+	tputs("shell    help clear echo sleep exit\n");
+	tputs("CLI tools (neofetch curl lspci ping dig play torrent) run inline; other /bin\n");
+	tputs("programs (editor files clock browser ...) open their own window.\n");
 }
 
 static void bi_ls(int argc, char **argv)
@@ -243,19 +262,6 @@ static void bi_cat(int argc, char **argv)
 	if (n && iobuf[n - 1] != '\n') tputc('\n');
 }
 
-static void bi_write(int argc, char **argv)
-{
-	if (argc < 3) { tputs("usage: write <file> <text...>\n"); return; }
-	int len = 0;
-	for (int i = 2; i < argc; i++) {
-		for (const char *a = argv[i]; *a && len < (int)sizeof iobuf - 1; a++) iobuf[len++] = *a;
-		if (i < argc - 1 && len < (int)sizeof iobuf - 1) iobuf[len++] = ' ';
-	}
-	iobuf[len++] = '\n';
-	char p[256]; abspath(argv[1], p);
-	if (writefile(p, iobuf, len) < 0) err("write: failed", 0);
-}
-
 static void bi_cp(int argc, char **argv)
 {
 	if (argc < 3) { tputs("usage: cp <src> <dst>\n"); return; }
@@ -276,46 +282,293 @@ static void bi_stat(int argc, char **argv)
 	else { tputs("  "); tdec(st.size); tputs(" bytes\n"); }
 }
 
-/* Run a command. The kernel bridge handles builtins AND ring-3 CLI tools
- * (neofetch, curl): it spawns the program, captures its output, and returns the
- * text to render here — so a CLI program shows up inline in the terminal. It
- * returns -1 for a GUI /bin app, which we then launch detached so it opens its
- * own window. */
-static void run_other(const char *orig, int argc, char **argv)
+/* ---- info builtins: read /proc and render (no kernel-shell bridge) ---------- */
+
+/* Print /proc/<name> verbatim. 1 on success, 0 if the entry is missing. */
+static int cat_proc(const char *name)
 {
-	if (cmd_begin(orig) == 0) {                          /* builtin or CLI tool   */
-		/* Stream the output: render each chunk as it is produced and present,
-		 * so a long or voluminous command (curl, ping, journal) shows up live
-		 * instead of freezing the window until it finishes. Stay responsive to
-		 * window events meanwhile -- a close aborts the command (cmd_abort kills
-		 * a CLI child) and we drain to EOF so the runner resets before we exit. */
-		int closing = 0;
-		for (;;) {
-			struct win_event ev;
-			while (win_poll(win, &ev))          /* stay closable mid-command   */
-				if (ev.type == WEV_CLOSE && !closing) { closing = 1; cmd_abort(); }
-			int n = cmd_read(iobuf, sizeof iobuf);
-			if (n > 0) {
-				if (!closing) { for (int i = 0; i < n; i++) tputc(iobuf[i]); redraw(); }
-			} else if (n < 0) {
-				break;                              /* end of output          */
-			} else {
-				if (dirty && !closing) redraw();    /* running; nothing yet    */
-				msleep(8);
-			}
-		}
-		if (closing) { win_close(win); exit(0); }
+	char p[64];
+	strcpy(p, "/proc/");
+	strcat(p, name);
+	int n = readfile(p, iobuf, sizeof iobuf);
+	if (n < 0) return 0;
+	for (int i = 0; i < n; i++) tputc(iobuf[i]);
+	if (n && iobuf[n - 1] != '\n') tputc('\n');
+	return 1;
+}
+
+static unsigned to_uint(const char *s)
+{
+	unsigned v = 0;
+	while (*s >= '0' && *s <= '9') v = v * 10 + (unsigned)(*s++ - '0');
+	return v;
+}
+
+static void bi_uptime(void)
+{
+	if (readfile("/proc/uptime", iobuf, sizeof iobuf) < 0) { err("uptime: unavailable", 0); return; }
+	unsigned s = to_uint(iobuf), h = s / 3600, m = (s % 3600) / 60;
+	tputs("up ");
+	if (h)        { tdec(h); tputs("h "); }
+	if (h || m)   { tdec(m); tputs("m "); }
+	tdec(s % 60); tputs("s\n");
+}
+
+static void bi_uname(int argc, char **argv)
+{
+	int all = argc > 1 && !strcmp(argv[1], "-a");
+	if (all) tputs("OwOS owos 0.1 i386\n");
+	else     tputs("OwOS\n");
+}
+
+static void bi_which(int argc, char **argv)
+{
+	static const char *const ring3[] = {
+		"help", "clear", "echo", "pwd", "cd", "ls", "cat", "cp", "mv",
+		"stat", "mkdir", "rmdir", "rm", "exit", "uptime", "uname", "whoami",
+		"which", "cpuinfo", "meminfo", "date", "storage", "sleep",
+	};
+	if (argc < 2) { tputs("usage: which <name>\n"); return; }
+	for (unsigned i = 0; i < sizeof ring3 / sizeof ring3[0]; i++)
+		if (!strcmp(argv[1], ring3[i])) { tputs(argv[1]); tputs(": shell builtin\n"); return; }
+	char path[256];
+	strcpy(path, "/bin/"); strcat(path, argv[1]);
+	struct statinfo st;
+	if (stat(path, &st) == 0 && !st.is_dir) { tputs(path); tputc('\n'); return; }
+	err(argv[1], " not found");
+}
+
+/* ---- control builtins: act via /proc, no kernel-shell bridge ---------------- */
+
+static void bi_loadkeys(int argc, char **argv)
+{
+	if (argc < 2) { tputs("usage: loadkeys <us|fr>\n"); return; }
+	if (writefile("/proc/keyboard", argv[1], strlen(argv[1])) < 0)
+		err("loadkeys: unknown layout (try us or fr)", 0);
+	else { tputs("keyboard layout: "); tputs(argv[1]); tputc('\n'); }
+}
+
+static void bi_clip(int argc, char **argv)
+{
+	if (argc < 2) {                              /* no text: print the clipboard  */
+		int n = readfile("/proc/clipboard", iobuf, sizeof iobuf);
+		for (int i = 0; i < n; i++) tputc(iobuf[i]);
+		if (n <= 0 || iobuf[n - 1] != '\n') tputc('\n');
 		return;
 	}
+	int len = 0;                                 /* join argv[1..] with spaces    */
+	for (int k = 1; k < argc; k++) {
+		for (const char *a = argv[k]; *a && len < (int)sizeof iobuf - 1; a++) iobuf[len++] = *a;
+		if (k < argc - 1 && len < (int)sizeof iobuf - 1) iobuf[len++] = ' ';
+	}
+	if (writefile("/proc/clipboard", iobuf, len) < 0) err("clip: failed", 0);
+}
 
+/* Default mount point for a device: /media/<dev>. */
+static void media_point(const char *dev, char *out)
+{
+	strcpy(out, "/media/");
+	strcat(out, dev);
+}
+
+static void bi_mount(int argc, char **argv)
+{
+	if (argc > 1) {                              /* mount <dev> [point]           */
+		char point[64];
+		if (argc > 2) strcpy(point, argv[2]);
+		else          media_point(argv[1], point);
+		if (mount(argv[1], point) == 0) {
+			tputs("mounted "); tputs(argv[1]); tputs(" at "); tputs(point); tputc('\n');
+		} else err("mount: cannot mount ", argv[1]);
+		return;
+	}
+	struct volinfo v;                            /* no arg: mount first unmounted */
+	for (int i = 0; volumes(i, &v) == 1; i++) {
+		if (!v.mounted) {
+			char point[64]; media_point(v.dev, point);
+			if (mount(v.dev, point) == 0) {
+				tputs("mounted "); tputs(v.label); tputs(" at "); tputs(point); tputc('\n');
+			} else err("mount: failed to mount ", v.dev);
+			return;
+		}
+	}
+	tputs("mount: no unmounted device (see `ls /dev`)\n");
+}
+
+static void bi_umount(int argc, char **argv)
+{
+	if (argc > 1) {                              /* umount <point>                */
+		if (umount(argv[1]) == 0) { tputs("unmounted "); tputs(argv[1]); tputc('\n'); }
+		else err("umount: nothing mounted at ", argv[1]);
+		return;
+	}
+	struct volinfo v;                            /* no arg: unmount first mounted */
+	for (int i = 0; volumes(i, &v) == 1; i++)
+		if (v.mounted) {
+			if (umount(v.point) == 0) { tputs("unmounted "); tputs(v.point); tputc('\n'); }
+			else err("umount: failed", 0);
+			return;
+		}
+	tputs("umount: nothing mounted\n");
+}
+
+static void bi_services(int argc, char **argv)
+{
+	if (argc < 2 || !strcmp(argv[1], "list") || !strcmp(argv[1], "status")) {
+		cat_proc("services");
+		return;
+	}
+	char req[128];                               /* "start X" / "stop X" / ...    */
+	int len = 0;
+	for (int k = 1; k < argc; k++) {
+		for (const char *a = argv[k]; *a && len < (int)sizeof req - 1; a++) req[len++] = *a;
+		if (k < argc - 1 && len < (int)sizeof req - 1) req[len++] = ' ';
+	}
+	req[len] = '\0';
+	if (writefile("/proc/services", req, len) < 0) err("services: failed", 0);
+}
+
+/* ---- file codecs: zip/unzip (LZSS) + gzip/gunzip (DEFLATE) ------------------ */
+
+static unsigned char cbuf[96 * 1024];        /* codec output (input is iobuf)   */
+
+/* zip/gzip: read src, compress into cbuf, write dst (default = src + suffix). */
+static void do_compress(int argc, char **argv, const char *suffix, const char *cmd,
+                        int (*comp)(const uint8_t *, uint32_t, uint8_t *, uint32_t),
+                        uint32_t (*bound)(uint32_t))
+{
+	if (argc < 2) { tputs("usage: "); tputs(cmd); tputs(" <src> [dst]\n"); return; }
+	char sp[256]; abspath(argv[1], sp);
+	int n = readfile(sp, iobuf, sizeof iobuf);
+	if (n < 0) { err(cmd, ": no such file"); return; }
+	if (bound((uint32_t)n) > sizeof cbuf) { err(cmd, ": file too large"); return; }
+	int clen = comp((const uint8_t *)iobuf, (uint32_t)n, cbuf, sizeof cbuf);
+	if (clen < 0) { err(cmd, ": compression failed"); return; }
+	char dp[256];
+	if (argc > 2) abspath(argv[2], dp);
+	else { abspath(argv[1], dp); strcat(dp, suffix); }
+	if (writefile(dp, cbuf, clen) < 0) { err(cmd, ": write failed"); return; }
+	tputs(argv[1]); tputs(" -> "); tputs(argc > 2 ? argv[2] : ""); if (argc <= 2) { tputs(argv[1]); tputs(suffix); }
+	tputs(" ("); tdec((unsigned)n); tputs(" -> "); tdec((unsigned)clen); tputs(" bytes)\n");
+}
+
+/* unzip/gunzip: read src, decompress into cbuf, write dst (default = src minus
+ * suffix). `orig` sizes the output; the codec validates the container. */
+static void do_decompress(int argc, char **argv, const char *suffix, const char *cmd,
+                          int (*dec)(const uint8_t *, uint32_t, uint8_t *, uint32_t),
+                          int (*orig)(const uint8_t *, uint32_t))
+{
+	if (argc < 2) { tputs("usage: "); tputs(cmd); tputs(" <src> [dst]\n"); return; }
+	char sp[256]; abspath(argv[1], sp);
+	int n = readfile(sp, iobuf, sizeof iobuf);
+	if (n < 0) { err(cmd, ": no such file"); return; }
+	int o = orig((const uint8_t *)iobuf, (uint32_t)n);
+	if (o < 0 || (unsigned)o > sizeof cbuf) { err(cmd, ": not a valid archive"); return; }
+	int dlen = dec((const uint8_t *)iobuf, (uint32_t)n, cbuf, (uint32_t)o);
+	if (dlen < 0) { err(cmd, ": corrupt archive"); return; }
+	char dp[256];
+	if (argc > 2) { abspath(argv[2], dp); }
+	else {                                   /* strip the suffix from src        */
+		int sl = strlen(argv[1]), xl = strlen(suffix);
+		if (sl <= xl || strcmp(argv[1] + sl - xl, suffix) != 0) {
+			tputs(cmd); tputs(": pass an explicit dst\n"); return;
+		}
+		char base[256]; strcpy(base, argv[1]); base[sl - xl] = '\0';
+		abspath(base, dp);
+	}
+	if (writefile(dp, cbuf, dlen) < 0) { err(cmd, ": write failed"); return; }
+	tputs(argv[1]); tputs(" -> "); tputs(argc > 2 ? argv[2] : "(decompressed)");
+	tputs(" ("); tdec((unsigned)dlen); tputs(" bytes)\n");
+}
+
+/* grep <pattern> <file>: print lines of the file that contain the pattern. */
+static void bi_grep(int argc, char **argv)
+{
+	if (argc < 3) { tputs("usage: grep <pattern> <file>\n"); return; }
+	char p[256]; abspath(argv[2], p);
+	int n = readfile(p, iobuf, sizeof iobuf);
+	if (n < 0) { err("grep: cannot read ", argv[2]); return; }
+	const char *pat = argv[1];
+	int i = 0;
+	while (i < n) {
+		int ls = i;
+		while (i < n && iobuf[i] != '\n') i++;
+		iobuf[i < n ? i : n - 1] = '\0';         /* terminate the line for strstr  */
+		int hit = 0;
+		for (const char *s = &iobuf[ls]; *s; s++) {     /* substring search        */
+			const char *a = s, *b = pat;
+			while (*a && *b && *a == *b) { a++; b++; }
+			if (!*b) { hit = 1; break; }
+		}
+		if (hit) { tputs(&iobuf[ls]); tputc('\n'); }
+		i++;
+	}
+}
+
+/* /bin programs whose stdout we capture and render inline (CLI tools), rather
+ * than launching as a detached window. Anything else under /bin is a GUI app. */
+static int is_cli(const char *name)
+{
+	static const char *const cli[] = {
+		"neofetch", "curl", "lspci", "play", "ping", "dig", "torrent",
+	};
+	for (unsigned i = 0; i < sizeof cli / sizeof cli[0]; i++)
+		if (!strcmp(name, cli[i])) return 1;
+	return 0;
+}
+
+/* Spawn a /bin CLI tool with its stdout wired to a pipe (spawn_cap) and render
+ * the output as it streams in. The terminal stays responsive to window events;
+ * closing the window kills the child. This replaces the kernel-shell bridge:
+ * the command is an ordinary process whose output we read like a pty. */
+static void render_child(const char *path, char **argv, int argc)
+{
+	int rfd = -1;
+	int pid = spawn_cap(path, argv, argc, &rfd);
+	if (pid < 0) { err("failed to launch ", path); return; }
+	int closing = 0, intr = 0;
+	for (;;) {
+		struct win_event ev;
+		while (win_poll(win, &ev)) {                 /* stay responsive mid-command */
+			if (ev.type == WEV_CLOSE && !closing) { closing = 1; kill(pid); }
+			else if (ev.type == WEV_KEY && (unsigned char)ev.a == KEY_INTR && !intr && !closing) {
+				intr = 1; kill(pid); tputs("^C\n"); redraw();   /* Ctrl+C: abort */
+			}
+		}
+		int n = read_nb(rfd, iobuf, sizeof iobuf);
+		if (n > 0) {
+			if (!closing && !intr) { for (int i = 0; i < n; i++) tputc(iobuf[i]); redraw(); }
+		} else if (n < 0) {
+			break;                                  /* child closed stdout / exited */
+		} else {
+			if (dirty && !closing) redraw();        /* running; nothing yet     */
+			msleep(8);
+		}
+	}
+	close(rfd);
+	waitpid(pid);                                   /* reap the zombie           */
+	if (closing) { win_close(win); exit(0); }
+	/* intr: fall through -- run()'s caller prints a fresh prompt */
+}
+
+/* A non-builtin command: a captured CLI tool, a detached GUI app, or (until the
+ * last kernel builtins are ported) the kernel-shell bridge. */
+static void run_other(const char *orig, int argc, char **argv)
+{
 	char path[256];
 	if (argv[0][0] == '/') strcpy(path, argv[0]);
 	else { strcpy(path, "/bin/"); strcat(path, argv[0]); }
+
+	if (is_cli(argv[0])) { render_child(path, argv, argc); return; }
+
 	struct statinfo st;
 	if (stat(path, &st) == 0 && !st.is_dir) {           /* a detached GUI app    */
 		if (spawn(path, argc > 1 ? argv[1] : 0) < 0) err("failed to launch", 0);
 		return;
 	}
+
+	/* The shell dispatches entirely in user space -- there is no kernel-shell bridge,
+	 * and every command it offers is implemented here. */
 	err(argv[0], ": command not found");
 }
 
@@ -324,11 +577,24 @@ static void run(const char *orig)
 	char buf[256]; strcpy(buf, orig);
 	char *argv[16];
 	int argc = 0, i = 0;
+	/* Split on whitespace, with double-quoted runs kept whole and the quotes
+	 * stripped (so `curl -H "X-Test: a b"` is one argument). Compacted in place. */
 	while (buf[i] && argc < 16) {
-		while (buf[i] == ' ') buf[i++] = '\0';
+		while (buf[i] == ' ') i++;
 		if (!buf[i]) break;
-		argv[argc++] = &buf[i];
-		while (buf[i] && buf[i] != ' ') i++;
+		char *w = &buf[i];
+		argv[argc++] = w;
+		while (buf[i] && buf[i] != ' ') {
+			if (buf[i] == '"') {
+				i++;
+				while (buf[i] && buf[i] != '"') *w++ = buf[i++];
+				if (buf[i] == '"') i++;
+			} else {
+				*w++ = buf[i++];
+			}
+		}
+		if (buf[i]) i++;
+		*w = '\0';
 	}
 	if (argc == 0) return;
 	const char *c = argv[0];
@@ -345,7 +611,6 @@ static void run(const char *orig)
 	}
 	else if (!strcmp(c, "ls"))    bi_ls(argc, argv);
 	else if (!strcmp(c, "cat"))   bi_cat(argc, argv);
-	else if (!strcmp(c, "write")) bi_write(argc, argv);
 	else if (!strcmp(c, "cp"))    bi_cp(argc, argv);
 	else if (!strcmp(c, "stat"))  bi_stat(argc, argv);
 	else if (!strcmp(c, "mkdir")) { for (int k = 1; k < argc; k++) { char p[256]; abspath(argv[k], p); if (mkdir(p) < 0) err("mkdir: failed: ", argv[k]); } }
@@ -353,6 +618,30 @@ static void run(const char *orig)
 	else if (!strcmp(c, "rm"))    { for (int k = 1; k < argc; k++) { char p[256]; abspath(argv[k], p); if (unlink(p) < 0) err("rm: failed: ", argv[k]); } }
 	else if (!strcmp(c, "mv"))    { if (argc < 3) tputs("usage: mv <src> <dst>\n"); else { char a[256], b[256]; abspath(argv[1], a); abspath(argv[2], b); if (rename(a, b) < 0) err("mv: failed", 0); } }
 	else if (!strcmp(c, "exit"))  { win_close(win); exit(0); }
+	else if (!strcmp(c, "uptime"))  bi_uptime();
+	else if (!strcmp(c, "uname"))   bi_uname(argc, argv);
+	else if (!strcmp(c, "whoami"))  tputs("root\n");
+	else if (!strcmp(c, "which"))   bi_which(argc, argv);
+	else if (!strcmp(c, "meminfo")) cat_proc("meminfo");
+	else if (!strcmp(c, "cpuinfo")) cat_proc("cpuinfo");
+	else if (!strcmp(c, "date"))    cat_proc("date");
+	else if (!strcmp(c, "storage")) { if (!cat_proc("storage")) tputs("no storage devices\n"); }
+	else if (!strcmp(c, "sleep"))   { if (argc > 1) msleep(to_uint(argv[1]) * 1000); }
+	else if (!strcmp(c, "journal")) cat_proc("journal");
+	else if (!strcmp(c, "poweroff")) power(0);
+	else if (!strcmp(c, "restart"))  power(1);
+	else if (!strcmp(c, "loadkeys")) bi_loadkeys(argc, argv);
+	else if (!strcmp(c, "clip"))    bi_clip(argc, argv);
+	else if (!strcmp(c, "mount"))   bi_mount(argc, argv);
+	else if (!strcmp(c, "umount"))  bi_umount(argc, argv);
+	else if (!strcmp(c, "services")) bi_services(argc, argv);
+	else if (!strcmp(c, "lsusb"))   cat_proc("usb");
+	else if (!strcmp(c, "ps"))      cat_proc("tasks");
+	else if (!strcmp(c, "grep"))    bi_grep(argc, argv);
+	else if (!strcmp(c, "zip"))     do_compress(argc, argv, ".z", "zip", zip_compress, zip_bound);
+	else if (!strcmp(c, "unzip"))   do_decompress(argc, argv, ".z", "unzip", zip_decompress, zip_orig_size);
+	else if (!strcmp(c, "gzip"))    do_compress(argc, argv, ".gz", "gzip", gzip_compress, gzip_bound);
+	else if (!strcmp(c, "gunzip"))  do_decompress(argc, argv, ".gz", "gunzip", gzip_decompress, gzip_orig_size);
 	else                        run_other(orig, argc, argv);
 }
 
@@ -410,12 +699,20 @@ static void on_key(char c)
 {
 	switch ((unsigned char)c) {
 	case '\n': case '\r': line_submit(); break;
+	case KEY_INTR:                              /* Ctrl+C: abandon the line     */
+		cl = ls_line; cc = ls_col;
+		for (int i = 0; i < llen; i++) tputc(line[i]);
+		tputs("^C\n");
+		llen = lpos = rlen = 0; hpos = -1;
+		prompt();
+		break;
 	case '\b':
 		if (lpos > 0) { for (int i = lpos - 1; i < llen - 1; i++) line[i] = line[i + 1]; llen--; lpos--; line_redraw(); }
 		break;
 	case KEY_LEFT:  if (lpos > 0)    { lpos--; line_redraw(); } break;
 	case KEY_RIGHT: if (lpos < llen) { lpos++; line_redraw(); } break;
-	case KEY_HOME:  lpos = 0;    line_redraw(); break;
+	case KEY_HOME:
+	case KEY_SELALL: lpos = 0;    line_redraw(); break;  /* Home / Ctrl+A */
 	case KEY_END:   lpos = llen; line_redraw(); break;
 	case KEY_DELETE:
 		if (lpos < llen) { for (int i = lpos; i < llen - 1; i++) line[i] = line[i + 1]; llen--; line_redraw(); }
@@ -443,10 +740,55 @@ static void on_scroll(int dz)
 	dirty = 1;
 }
 
+/* The scrollbar widget works in top-line units (`scroll`, 0..bottom); `view`
+ * counts lines scrolled back (bottom..0), so the two are mirror images. */
+static int sb_drag;                       /* 1 while the thumb is held           */
+
+static void sb_set(int scroll)
+{
+	int maxoff = nlines > rows ? nlines - rows : 0;
+	view = maxoff - scroll;
+	if (view < 0) view = 0;
+	if (view > maxoff) view = maxoff;
+	dirty = 1;
+}
+
+/* Left-click on the bar: arrows step a line, a track grab jumps the thumb to the
+ * cursor and starts a drag. A click anywhere else ends any pending drag. */
+static void on_click(int mx, int my)
+{
+	sb_drag = 0;
+	int maxoff = nlines > rows ? nlines - rows : 0;
+	if (maxoff <= 0) return;                                /* nothing to scroll  */
+	int sbx = winw - GUI_SCROLL_W;
+	int part = scrollbar_hit(sbx, 0, GUI_SCROLL_W, winh, mx, my);
+	int scroll = maxoff - view;
+	if (part == SCROLLBAR_UP)        sb_set(scroll - 3);
+	else if (part == SCROLLBAR_DOWN) sb_set(scroll + 3);
+	else if (part == SCROLLBAR_TRACK) {
+		sb_drag = 1;
+		sb_set(scrollbar_pos(sbx, 0, GUI_SCROLL_W, winh, mx, my, scroll, nlines, rows));
+	}
+}
+
+/* Drag while the thumb is held: track the cursor's y. mx is pinned into the bar
+ * so a little horizontal drift doesn't drop the grab. */
+static void on_drag(int mx, int my)
+{
+	if (!sb_drag) return;
+	int maxoff = nlines > rows ? nlines - rows : 0;
+	int sbx = winw - GUI_SCROLL_W;
+	sb_set(scrollbar_pos(sbx, 0, GUI_SCROLL_W, winh, sbx + GUI_SCROLL_W / 2, my,
+	                     maxoff - view, nlines, rows));
+}
+
 static void on_resize(int w, int h)
 {
 	gfx_init(win_fb(), w, h);
-	cols = w / FONT_W; if (cols > MAXCOLS) cols = MAXCOLS; if (cols < 1) cols = 1;
+	winw = w; winh = h;
+	cols = (w - GUI_SCROLL_W) / FONT_W;   /* reserve the right edge for the bar    */
+	if (cols > MAXCOLS) cols = MAXCOLS;
+	if (cols < 1) cols = 1;
 	rows = h / FONT_H; if (rows < 1) rows = 1;
 	dirty = 1;
 }
@@ -457,10 +799,11 @@ int main(void)
 	if (win < 0) { puts("term: no window\n"); return 1; }
 	gfx_init(win_fb(), 720, 432);
 	win_resizable(win, 1);
-	cols = 720 / FONT_W; rows = 432 / FONT_H;
+	winw = 720; winh = 432;
+	cols = (720 - GUI_SCROLL_W) / FONT_W; rows = 432 / FONT_H;
 
 	grid_reset();
-	tputs_c("OwOS terminal (ring 3) -- type 'help'.\n", FG);
+	tputs_c("OwOS terminal -- type 'help'.\n", FG);
 	prompt();
 
 	for (;;) {
@@ -470,6 +813,8 @@ int main(void)
 			case WEV_CLOSE:  win_close(win); return 0;
 			case WEV_KEY:    on_key((char)ev.a); break;
 			case WEV_SCROLL: on_scroll(ev.a); break;
+			case WEV_MOUSE:  on_click(ev.a, ev.b); break;
+			case WEV_DRAG:   on_drag(ev.a, ev.b); break;
 			case WEV_RESIZE: on_resize(ev.a, ev.b); break;
 			}
 		}

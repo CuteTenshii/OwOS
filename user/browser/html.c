@@ -100,6 +100,46 @@ static int tag_attr(const char *tag, const char *end, const char *attr,
 	return 0;
 }
 
+/* Parse a leading pixel length from an HTML/CSS value: optional spaces/quotes,
+ * then digits, then an optional "px". Returns the integer, or 0 for anything we
+ * can't resolve to an absolute pixel count here (a percentage, "auto", em/rem,
+ * empty) — which the layout treats as "size from the image / pane" instead. */
+static int parse_px(const char *v)
+{
+	while (*v == ' ' || *v == '"' || *v == '\'' || *v == ':') v++;
+	int n = 0, any = 0;
+	while (*v >= '0' && *v <= '9') { n = n * 10 + (*v++ - '0'); any = 1; }
+	if (!any) return 0;
+	while (*v == ' ') v++;
+	if (*v == '%' || *v == 'e' || *v == 'r' || *v == 'v')      /* %, em, rem, vw */
+		return 0;
+	return n;
+}
+
+/* Read a `prop: <px>` length out of an inline style="" declaration block. Only a
+ * whole-word match counts, so "width" doesn't trip on "min-width"/"max-width". */
+static int css_px(const char *style, const char *prop)
+{
+	int pl = strlen(prop);
+	for (const char *p = style; *p; p++) {
+		if (!starts_ci(p, prop)) continue;
+		if (p != style && p[-1] != ' ' && p[-1] != ';' && p[-1] != '{') continue;
+		const char *q = p + pl;
+		while (*q == ' ') q++;
+		if (*q != ':') continue;
+		return parse_px(q + 1);
+	}
+	return 0;
+}
+
+/* Case-insensitive substring test (for matching tokens inside a rel= list). */
+static int contains_ci(const char *hay, const char *needle)
+{
+	for (; *hay; hay++)
+		if (starts_ci(hay, needle)) return 1;
+	return 0;
+}
+
 /* --- per-parse style stack --- */
 struct sty { unsigned char fg, bold, under; };
 static struct sty sty_cur, sty_stk[48];
@@ -317,6 +357,8 @@ void html_to_text(void)
 	B->nlinks = 0;
 	B->n_imgs = 0;
 	B->img_pool_len = 0;
+	B->favicon_href[0] = '\0';
+	B->favicon_pri = 0;
 
 	while (p < end) {
 		if (*p == '<') {
@@ -392,12 +434,59 @@ void html_to_text(void)
 							im->alt[j] = alt[j];
 						im->alt[j] = '\0';
 					}
+					/* loading="lazy" defers the fetch until the image scrolls
+					 * into view (handled by the worker); anything else loads up
+					 * front with the rest of the page. */
+					char ld[16];
+					im->lazy = (tag_attr(tagbody, tagend, "loading", ld,
+					                     sizeof ld) && starts_ci(ld, "lazy"));
+					im->want = 0; im->fetched = 0;
+					/* Explicit box size: the width/height attributes, overridden
+					 * by the style="" CSS (which wins in real browsers). Lets the
+					 * image reserve the right space before it loads, so the page
+					 * doesn't reflow when it lands. */
+					char dim[16];
+					im->cw = tag_attr(tagbody, tagend, "width",  dim, sizeof dim)
+					         ? parse_px(dim) : 0;
+					im->ch = tag_attr(tagbody, tagend, "height", dim, sizeof dim)
+					         ? parse_px(dim) : 0;
+					char style[160];
+					if (tag_attr(tagbody, tagend, "style", style, sizeof style)) {
+						int sw = css_px(style, "width");
+						int sh = css_px(style, "height");
+						if (sw) im->cw = sw;
+						if (sh) im->ch = sh;
+					}
 					im->text_pos = (int)(o - B->text);
 					im->ok = 0; im->rows = 0; im->start_row = -1;
 					im->iw = im->ih = 0; im->coff = im->clen = 0;
 					B->n_imgs++;
 					if (o < oend) { *oa++ = 0; *o++ = '\n'; }
 					run_nl = 1;
+				}
+			}
+
+			/* <link rel="icon" href="...">: remember the page favicon. Standard
+			 * "icon"/"shortcut icon" outranks "apple-touch-icon"; "mask-icon"
+			 * (SVG) is skipped since we can't decode it. The href is resolved and
+			 * fetched later (fetch_favicon), not here. */
+			if (streq(name, "link") && !closing) {
+				char rel[64]; rel[0] = '\0';
+				if (tag_attr(tagbody, tagend, "rel", rel, sizeof rel) &&
+				    contains_ci(rel, "icon") && !contains_ci(rel, "mask-icon")) {
+					int pri = contains_ci(rel, "apple-touch") ? 1 : 2;
+					if (pri >= B->favicon_pri) {
+						char href[256]; href[0] = '\0';
+						if (tag_attr(tagbody, tagend, "href", href, sizeof href) &&
+						    href[0] && !starts_ci(href, "data:")) {
+							decode_entities(href);
+							int k = 0;
+							for (; href[k] && k < (int)sizeof B->favicon_href - 1; k++)
+								B->favicon_href[k] = href[k];
+							B->favicon_href[k] = '\0';
+							B->favicon_pri = pri;
+						}
+					}
 				}
 			}
 

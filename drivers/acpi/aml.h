@@ -37,4 +37,9 @@ const char *aml_last_error(void);
  * or -1 if none. Either argument may be NULL. */
 void aml_ns_stats(int *out_nodes, int *out_bail);
 
+/* Verbose battery dump for real-hardware debugging: the raw _BST/_BIF field
+ * values plus structural counts (_REG methods, EmbeddedControl regions, EC
+ * devices). Writes a bounded, NUL-terminated one-liner into out. */
+void aml_battery_debug(char *out, int max);
+
 #endif /* OWOS_AML_H */

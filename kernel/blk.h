@@ -14,6 +14,7 @@
 #define OWOS_BLK_H
 
 #include <stdint.h>
+#include "fsmount.h"   /* blk_read_fn / blk_write_fn */
 
 /* Choose the backing device. Call AFTER ahci_init()/nvme_init() (so their
  * _present() is valid) and BEFORE fs_init(). */
@@ -30,34 +31,24 @@ const char *blk_backend(void);        /* "IDE" / "AHCI" / "NVMe" / "tmpfs"/"none
  * Returns 0 on success, -1 if the allocation failed. */
 int         blk_use_ram(void);
 
-/* Mount a FAT volume (fat.c) on the first present block device that is NOT the
- * one backing owofs -- i.e. a second disk, a USB stick, an SD card. owofs and
- * the FAT volume thus live on separate media. Call after blk_init() (it needs
- * to know owofs's pick). Returns 0 if a FAT volume was mounted, -1 otherwise. */
-int         blk_mount_fat(void);
-
-/* Name of the device backing the removable volume at /media ("USB"/"SATA"/"NVMe"/"IDE"),
- * for the UI to label it. Valid only while a FAT volume is mounted ("" if none
- * was ever mounted). */
-const char *blk_fat_source(void);
-
-/* A present removable device, mounted or not, for the file explorer's Devices
- * list. `name` is both the short UI label and the key passed to blk_mount_device. */
+/* A present removable block device, for the /dev listing and the Files app's
+ * Devices list. blk.c no longer mounts or knows filesystems -- fs.c owns the
+ * mount table and probes a device via fs_ops. */
 struct blk_devinfo {
-	const char *name;     /* "USB"/"CD"/"SD"/"SATA"/"NVMe"/"IDE"                */
+	const char *dev;      /* /dev name: "cd0"/"usb0"/"ide0"/"sata0"/"nvme0"/"sd0" */
+	const char *kind;     /* "CD"/"USB"/"IDE"/"SATA"/"NVMe"/"SD"                */
 	const char *model;    /* drive model string                                */
-	int         mounted;  /* 1 if this device currently backs /media           */
+	int         iso;      /* reads 2048-byte ATAPI sectors (a CD/DVD)          */
 };
 
-/* Enumerate present removable devices WITHOUT mounting any -- this only checks
- * each driver's hardware presence, it never reads a filesystem. Fills out[0..max)
- * and returns the count. */
-int         blk_device_list(struct blk_devinfo *out, int max);
+/* Enumerate present removable devices WITHOUT mounting any -- only hardware
+ * presence is checked, never a filesystem. Fills out[0..max), returns the count. */
+int         blk_dev_list(struct blk_devinfo *out, int max);
 
-/* Mount a specific present device at /media by its `name`. Honors the one-volume
- * rule: succeeds as a no-op if that device is already mounted, fails if a
- * different volume holds /media (eject it first). Returns 0 on success. */
-int         blk_mount_device(const char *name);
+/* Resolve a /dev name to its sector I/O callbacks (and the 2048-byte CD flag),
+ * so fs.c can probe and mount it. Returns 0, or -1 if no present removable
+ * device has that name. `*w` is left NULL for a read-only medium. */
+int         blk_dev_io(const char *dev, blk_read_fn *r, blk_write_fn *w, int *iso);
 
 /* True only for the IDE disk. fs_init() auto-creates owofs on a blank IDE disk
  * (the dev/QEMU disk) but never on AHCI/NVMe, which on real hardware is the

@@ -1,4 +1,4 @@
-/* http.h — libcurl: a tiny ring-3 HTTP/1.1 client over the net_* syscalls.
+/* http.h — libcurl: a tiny HTTP/1.1 client over the net_* syscalls.
  *
  * The protocol (URL parse, request build, status line, header block, and body
  * framing — chunked / Content-Length / read-until-close) lives here so both the
@@ -34,11 +34,27 @@ int http_request(const char *method, const char *url,
 
 /* Same contract as http_request, but speaks HTTP/2 where possible: over http://
  * it uses h2c "prior knowledge" (sends the HTTP/2 connection preface straight
- * away); over https:// it falls back to HTTP/1.1 until TLS ALPN "h2" negotiation
- * is wired into the kernel. Returns the HTTP status or a negative HTTP_E* code. */
+ * away); over https:// it uses HTTP/2 when TLS ALPN negotiates "h2", else falls
+ * back to HTTP/1.1. Returns the HTTP status or a negative HTTP_E* code. */
 int http_request2(const char *method, const char *url,
                   char *hdr, int hdrcap, int *hdrlen,
                   http_body_fn body, void *ctx);
+
+/* Same contract, over HTTP/3: opens a QUIC connection (its own UDP socket) and
+ * runs the request on stream 0. https-only — over http:// it returns
+ * HTTP_ECONNECT. Returns the HTTP status or a negative HTTP_E* code. */
+int http_request3(const char *method, const char *url,
+                  char *hdr, int hdrcap, int *hdrlen,
+                  http_body_fn body, void *ctx);
+
+/* The full request core the wrappers use. `want_h2` offers HTTP/2 (h2c over
+ * http://, ALPN over https://); `want_h3` runs HTTP/3 over QUIC (https only,
+ * takes precedence); `extra_headers` is an optional "name: value\r\n…" block
+ * appended to the request (e.g. curl -H). Returns the HTTP status or a negative
+ * HTTP_E* code. */
+int http_request_ex(const char *method, const char *url, int want_h2, int want_h3,
+                    const char *extra_headers, char *hdr, int hdrcap, int *hdrlen,
+                    http_body_fn body, void *ctx);
 
 /* Convenience: GET, body to the sink. */
 int http_get(const char *url, http_body_fn body, void *ctx);

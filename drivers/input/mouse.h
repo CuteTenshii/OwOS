@@ -13,4 +13,9 @@ int  mouse_wheel(void);
 /* Monotonic counter bumped on every movement/button packet, so the compositor
  * can tell when state changed without polling each field. */
 uint32_t mouse_seq(void);
+/* Pointer-speed scale, a level 1..5 (3 = native 1x; lower slower, higher faster)
+ * applied to PS/2 relative motion. Settable from ring 3 via /proc/mouse (the
+ * Settings app). set clamps into range; get returns the current level. */
+void mouse_set_speed(int level);
+int  mouse_speed(void);
 #endif

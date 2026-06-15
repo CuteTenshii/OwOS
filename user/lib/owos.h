@@ -46,7 +46,7 @@ int      stream_end(void);
  * error (-1 no NIC/slot, -2 resolve failed, -3 connect failed, -4 interrupted).
  * net_send writes (a datagram, for UDP/ICMP). net_recv blocks: TCP/TLS -> >0
  * bytes / 0 EOF; UDP/ICMP -> >0 datagram bytes / 0 timeout; both -1 error, -4
- * interrupted. ping/dig/resolution are ring-3 code over these sockets. */
+ * interrupted. ping/dig/resolution are code over these sockets. */
 #define SK_TCP    0
 #define SK_TLS    1
 #define SK_UDP    2
@@ -101,6 +101,9 @@ int  readline(char *buf, int max);            /* echoed line input, returns len*
 #define WEV_DBLCLICK 5  /* a, b = client x, y of a double click (after WEV_MOUSE)*/
 #define WEV_RCLICK   6  /* a, b = client x, y of a right click                   */
 #define WEV_SCROLL   7  /* a = mouse-wheel delta (+ up / - down)                 */
+#define WEV_DRAG     8  /* a, b = client x, y while the left button is held and
+                         * moving (motion after a WEV_MOUSE press; ends silently
+                         * on release — the next WEV_MOUSE starts a fresh drag)  */
 
 struct win_event { unsigned type; int a, b; };
 
@@ -138,6 +141,17 @@ void msleep(unsigned ms);
 int thread_create(void (*fn)(void), void *stack_top);
 static inline int thread_join(int tid) { return waitpid(tid); }
 
+/* User-space heap. sbrk() moves the process break by `inc` bytes (negative to
+ * shrink) and returns the PREVIOUS break, or (void *)-1 on failure. malloc/
+ * calloc/realloc/free are a K&R-style allocator over it, and are safe to call
+ * concurrently from the threads of one process (a lock serialises the free list;
+ * the heap itself is shared, since threads share the address space). */
+void *sbrk(int inc);
+void *malloc(unsigned size);
+void *calloc(unsigned nmemb, unsigned size);
+void *realloc(void *ptr, unsigned size);
+void  free(void *ptr);
+
 /* Directory enumeration: fill *out with the idx-th child of `path`
  * (NULL/""/"/" = root). Returns 1 if it exists, 0 past the end, -1 on error. */
 struct dirent_u { char name[20]; int is_dir; unsigned size; };
@@ -156,19 +170,17 @@ int stat(const char *path, struct statinfo *out);   /* -1 if path absent      */
  * with an optional single argument. Returns the child pid, or -1. */
 int spawn(const char *path, const char *arg);
 
-/* Run a kernel-shell builtin (journal, neofetch, lspci, date, ...) and capture
- * its text output into out[max]. Returns bytes written, or -1 if not a builtin.
- * Lets the ring-3 terminal reuse every kernel command. */
-int shell_cmd(const char *cmd, char *out, int max);
+/* Spawn a /bin child with its stdout captured into a pipe: returns the pid and
+ * stores the read-end fd in *rfd. Drain *rfd with read_nb until EOF (-1) to
+ * render the child's output inline -- this is how the terminal runs CLI tools
+ * (neofetch, curl, ...) without a kernel-shell bridge. The child inherits the
+ * caller's cwd. */
+int spawn_cap(const char *path, char *const argv[], int argc, int *rfd);
+int read_nb(int fd, void *buf, int len);  /* >0 bytes / 0 would-block / -1 EOF */
+int chdir(const char *path);              /* set this process's cwd; 0/-1      */
+int kill(int pid);                        /* terminate a child of this process */
+int power(int action);                    /* 0 = shut down, 1 = reboot         */
 
-/* Streaming variant of shell_cmd: render a command's output as it runs instead
- * of buffering it all (so curl/ping/journal don't freeze the terminal). Start
- * with cmd_begin (0 = streamable, -1 = not a bridged command), then loop on
- * cmd_read until it returns -1: it returns a byte count (>0), 0 (running, no
- * output yet -- pump events / wait), or -1 (end of output). */
-int cmd_begin(const char *cmd);
-int cmd_read(char *buf, int max);
-int cmd_abort(void);   /* abort the running streamed command (Ctrl+C / close)  */
 int intr_take(void);   /* 1 (and clear) if Ctrl+C arrived; for CPU-bound loops */
 
 /* Audio PCM sink (streaming): open a stream, push 48 kHz / 16-bit / signed /
@@ -183,23 +195,23 @@ int audio_close(void);
 /* Mounted removable volumes (USB sticks, etc.). Fill *out with the idx-th
  * volume: its label, mount path (e.g. "/media"), backing kind ("USB"/"SATA"/...),
  * and removable flag. Returns 1 if it exists, 0 past the end, -1 on error. */
-struct volinfo { char label[24]; char path[24]; char kind[8]; int removable;
-                 int mounted; };  /* mounted: 1 if it backs /media (path valid) */
+struct volinfo { char dev[16]; char kind[8]; char label[24]; char point[40];
+                 int mounted; };  /* mounted: 1 -> `point` is its mount path     */
 int volumes(int idx, struct volinfo *out);
 
-/* Mount a present-but-unmounted removable device at /media, identified by its
- * `kind` ("USB"/"CD"/"SD"/...) from volumes(). The GUI's "Connect" action. Only
- * one volume mounts at a time, so eject any current one first. Returns 0 on
- * success, -1 otherwise. */
-int mount(const char *kind);
+/* Mount a present removable device `dev` ("usb0"/"cd0"/...) at mount point
+ * `point` (must be "/media/<name>"). fs.c probes the device's filesystem.
+ * Returns 0, or -1 (no device, no recognised fs, point taken, table full). */
+int mount(const char *dev, const char *point);
 
 /* Unmount/eject the removable volume at /media (write-through, so always safe). The
  * argument is reserved for a future multi-volume API; pass the mount path or
  * NULL. Returns 0 on success, -1 if nothing was mounted. */
-int eject(const char *path);
+int umount(const char *point);
 
 
 /* Editing key codes delivered via WEV_KEY (mirror kernel/keyboard.h). */
+#define KEY_INTR   0x18   /* Ctrl+C: interrupt the running command / cancel line */
 #define KEY_UP     0x01
 #define KEY_DOWN   0x02
 #define KEY_LEFT   0x03
@@ -211,5 +223,15 @@ int eject(const char *path);
 #define KEY_NEW    0x0F   /* Ctrl+N  \                                         */
 #define KEY_OPEN   0x10   /* Ctrl+O   > menu accelerators (see menu_shortcut)  */
 #define KEY_SAVE   0x13   /* Ctrl+S  /                                         */
+#define KEY_SELALL 0x12   /* Ctrl+A: select all (editor)                       */
+#define KEY_CUT    0x14   /* Ctrl+X: cut the selection (editor)                */
+/* Shift+navigation: extend a selection toward the new caret position. */
+#define KEY_SLEFT  0x15
+#define KEY_SRIGHT 0x16
+#define KEY_SUP    0x17
+#define KEY_SDOWN  0x19
+#define KEY_SHOME  0x1A
+#define KEY_SEND   0x1C
+/* Ctrl+C reaches a focused app as KEY_INTR (0x18); the editor uses it as Copy. */
 
 #endif /* OWOS_USER_H */

@@ -1,15 +1,25 @@
 /* heap.c — a first-fit free-list allocator over a fixed virtual window.
  *
- * The heap occupies [4 MiB, 16 MiB), which the identity map already covers,
- * so kmalloc never has to map pages itself yet. Blocks are a singly linked
- * list of headers; kmalloc splits a big-enough free block, kfree marks one
- * free and coalesces it with the following block.
+ * The heap runs from just past the kernel image up to 12 MiB (12-16 MiB is the
+ * page-frame pool); the identity map already covers the low 16 MiB, so kmalloc
+ * never has to map pages itself yet. Blocks are a singly linked list of headers;
+ * kmalloc splits a big-enough free block, kfree marks one free and coalesces it
+ * with the following block.
+ *
+ * The start is keyed off the linker's kernel_end, NOT a fixed 4 MiB: the kernel
+ * embeds every user-program ELF as a blob in .data, so the image keeps growing
+ * as programs are added. Once that pushed .bss past 4 MiB, a fixed heap base
+ * overlapped the image and the heap stomped low globals (fb.c's present_hook
+ * among them), so the WM's first fb_present jumped through a clobbered function
+ * pointer and triple-faulted. Anchoring to kernel_end makes that impossible.
  */
 
 #include "heap.h"
 #include <stdint.h>
 
-#define KHEAP_START 0x00400000u        /* 4 MiB                              */
+/* Defined by linker.ld as the first byte past the kernel image (end of .bss). */
+extern char kernel_end[];
+
 #define KHEAP_END   0x00C00000u        /* 12 MiB (12-16 MiB is the frame pool) */
 #define ALIGN_UP(n, a) (((n) + (a) - 1) & ~((a) - 1))
 
@@ -23,8 +33,9 @@ static block_t *head;
 
 void heap_init(void)
 {
-	head = (block_t *)KHEAP_START;
-	head->size = (KHEAP_END - KHEAP_START) - sizeof(block_t);
+	uint32_t start = ALIGN_UP((uint32_t)(uintptr_t)kernel_end, 4096u);
+	head = (block_t *)start;
+	head->size = (KHEAP_END - start) - sizeof(block_t);
 	head->free = 1;
 	head->next = 0;
 }

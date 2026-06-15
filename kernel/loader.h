@@ -13,16 +13,22 @@
 #define USER_BASE       0x40000000u    /* 1 GiB: where user code is loaded      */
 #define USER_REGION_END 0x44000000u    /* +64 MiB: end of the per-process window */
 #define USER_STACK_TOP  0x43FFF000u    /* user stack grows down from the top    */
+#define USER_STACK_PAGES 4u            /* 16 KiB of user stack                  */
+/* The heap (SYS_SBRK) grows up from the image end toward — but never into — the
+ * fixed user stack at the top of the window. */
+#define USER_HEAP_MAX   (USER_STACK_TOP - USER_STACK_PAGES * 4096u)
 
 /* Build a fresh address space from an ELF32 image. On success returns 0 and
- * fills *out_dir / *out_entry; on a bad image returns -1. */
-int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out_entry);
+ * fills *out_dir / *out_entry / *out_brk (the page-aligned image end, where the
+ * heap begins); on a bad image returns -1. */
+int load_elf(const void *image, uint32_t size, uint32_t **out_dir,
+             uint32_t *out_entry, uint32_t *out_brk);
 
 /* Lay argc/argv onto the top of a process's user stack (System V layout) and
  * return the initial user esp. */
 uint32_t setup_args(uint32_t *dir, int argc, char *const argv[]);
 
-/* Load an ELF and spawn it as a scheduled ring-3 process with the given
+/* Load an ELF and spawn it as a scheduled user process with the given
  * arguments. Returns its pid, or -1 on failure. */
 int exec_program(const void *image, uint32_t size, int argc, char *const argv[]);
 

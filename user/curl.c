@@ -1,4 +1,4 @@
-/* curl.c — a ring-3 HTTP/1.1 client, a thin CLI over libcurl (user/lib/http.c).
+/* curl.c — an HTTP/1.1 client, a thin CLI over libcurl (user/lib/http.c).
  *
  * The protocol lives in libcurl; this file just parses options, picks where the
  * body goes (console, or a buffer for -o), and reports the outcome. Ctrl+C is a
@@ -54,28 +54,37 @@ int main(int argc, char **argv)
 {
 	int show_headers = 0;
 	int http2 = 0;
+	int http3 = 0;
 	const char *method = "GET";
 	const char *outname = 0;
 	const char *url = 0;
+	char xhdr[2048]; int xhlen = 0;        /* -H request headers ("name: value\r\n"…) */
 
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		if (streq(a, "-i"))                      show_headers = 1;
 		else if (streq(a, "--http2"))            http2 = 1;
+		else if (streq(a, "--http3") || streq(a, "-3")) http3 = 1;
 		else if (streq(a, "-X") && i + 1 < argc) method = argv[++i];
 		else if (streq(a, "-o") && i + 1 < argc) outname = argv[++i];
+		else if (streq(a, "-H") && i + 1 < argc) {
+			const char *h = argv[++i];
+			for (int k = 0; h[k] && xhlen < (int)sizeof xhdr - 3; k++)
+				xhdr[xhlen++] = h[k];
+			xhdr[xhlen++] = '\r'; xhdr[xhlen++] = '\n';
+			xhdr[xhlen] = '\0';
+		}
 		else if (a[0] != '-')                    url = a;
 	}
 
 	if (!url) {
-		puts("usage: curl [-i] [--http2] [-X method] [-o file] <url>\n");
+		puts("usage: curl [-i] [--http2] [--http3|-3] [-X method] [-H \"Name: value\"] [-o file] <url>\n");
 		return 1;
 	}
 
 	char hdr[4096];
 	int  hlen = 0;
-	int rc = (http2 ? http_request2 : http_request)(
-	                      method, url,
+	int rc = http_request_ex(method, url, http2, http3, xhlen ? xhdr : 0,
 	                      show_headers ? hdr : 0, (int)sizeof hdr, &hlen,
 	                      outname ? sink_save : sink_console, 0);
 

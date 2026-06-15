@@ -1,4 +1,4 @@
-/* crash.c — ring-3 crash reporter (see crash.h). */
+/* crash.c — crash reporter (see crash.h). */
 #include <stdint.h>
 #include "crash.h"
 #include "idt.h"

@@ -28,7 +28,7 @@ void hda_volume_step(int dir);   /* +1 = louder, -1 = quieter (clamped)        *
 void hda_volume_mute(void);      /* toggle mute (restores the prior level)      */
 int  hda_volume(void);           /* 0..HDA_VOL_MAX, or 0 while muted            */
 
-/* Streaming PCM sink, fed from ring 3 (/bin/play) over the SYS_AUDIO_* calls.
+/* Streaming PCM sink, fed from /bin/play over the SYS_AUDIO_* calls.
  * The producer pushes a fixed canonical format — 48 kHz, 16-bit, stereo — which
  * is exactly what the DMA buffer carries, so the WAV parse + resample stay in
  * user space and this is just the back end. open() configures the path and DMA;

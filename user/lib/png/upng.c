@@ -1,4 +1,4 @@
-/* upng.c — streaming PNG decoder (see upng.h). Ring-3, built on inflate.c.
+/* upng.c — streaming PNG decoder (see upng.h). Built on inflate.c.
  *
  * Flow: verify signature -> read IHDR (+ PLTE) -> stream the concatenated IDAT
  * data (spanning chunks, skipping their length/CRC framing) through the
@@ -313,7 +313,7 @@ static int scan_sink(void *ctx, const unsigned char *buf, unsigned n)
 int upng_dimensions(upng_reader rd, void *rctx, unsigned *w, unsigned *h)
 {
 	/* Read inline (no struct dec on the stack — it is large and would blow a
-	 * small ring-3 stack). Signature, then the IHDR chunk's length+type, then
+	 * small user stack). Signature, then the IHDR chunk's length+type, then
 	 * its first 8 bytes (width, height). */
 	static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
 	for (int i = 0; i < 8; i++)
@@ -336,6 +336,401 @@ int upng_dimensions(upng_reader rd, void *rctx, unsigned *w, unsigned *h)
 	if (w) *w = ((unsigned)d[0] << 24) | ((unsigned)d[1] << 16) | ((unsigned)d[2] << 8) | d[3];
 	if (h) *h = ((unsigned)d[4] << 24) | ((unsigned)d[5] << 16) | ((unsigned)d[6] << 8) | d[7];
 	return UPNG_OK;
+}
+
+/* ----------------------------------------------------------- metadata probe */
+/*
+ * A second, decode-free pass over the chunk stream that collects the IHDR
+ * fields and the ancillary metadata chunks (tRNS/pHYs/gAMA/tIME/tEXt/iTXt/zTXt/
+ * eXIf) for an "image properties" view. It never inflates IDAT — it skips the
+ * image data byte-for-byte through the reader and stops at IEND.
+ */
+
+struct rdr { upng_reader rd; void *rctx; };
+static int prb(struct rdr *r) { return r->rd(r->rctx); }
+
+static int pbe32(struct rdr *r, uint32_t *v)
+{
+	int a = prb(r), b = prb(r), c = prb(r), e = prb(r);
+	if (a < 0 || b < 0 || c < 0 || e < 0) return -1;
+	*v = ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)c << 8) | (uint32_t)e;
+	return 0;
+}
+
+static int pskip(struct rdr *r, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++)
+		if (prb(r) < 0) return -1;
+	return 0;
+}
+
+/* Read `want` bytes; store the first min(want,cap) into buf, drop the rest.
+ * *got is the stored count. Returns 0, or -1 on a short stream. */
+static int pread(struct rdr *r, unsigned char *buf, uint32_t want, uint32_t cap, uint32_t *got)
+{
+	uint32_t g = 0;
+	for (uint32_t i = 0; i < want; i++) {
+		int c = prb(r);
+		if (c < 0) { *got = g; return -1; }
+		if (i < cap) buf[g++] = (unsigned char)c;
+	}
+	*got = g;
+	return 0;
+}
+
+static void m_zero(void *p, unsigned n)
+{
+	unsigned char *b = p;
+	for (unsigned i = 0; i < n; i++) b[i] = 0;
+}
+
+/* Copy up to cap-1 printable Latin-1 bytes from src into dst, NUL-terminated. */
+static void m_textcopy(char *dst, unsigned cap, const unsigned char *src, unsigned n)
+{
+	unsigned o = 0;
+	for (unsigned i = 0; i < n && o < cap - 1; i++) {
+		unsigned char c = src[i];
+		if (c == 0) break;
+		if (c < 0x20 && c != '\t') c = ' ';   /* keep it one printable line */
+		dst[o++] = (char)c;
+	}
+	dst[o] = 0;
+}
+
+/* Record one keyword/value text pair (tEXt/iTXt/zTXt) into the meta table. */
+static void m_addtext(struct upng_meta *m, const unsigned char *p, unsigned n)
+{
+	if (m->n_text >= UPNG_TEXT_MAX) return;
+	unsigned k = 0;
+	while (k < n && p[k] != 0) k++;            /* keyword runs to the first NUL  */
+	struct upng_text *t = &m->text[m->n_text];
+	m_textcopy(t->key, UPNG_KEY_MAX, p, k);
+	if (t->key[0] == 0) return;                /* a keyword is mandatory          */
+	const unsigned char *v = p + (k < n ? k + 1 : n);
+	unsigned vn = (k + 1 <= n) ? n - (k + 1) : 0;
+	m_textcopy(t->val, UPNG_VAL_MAX, v, vn);
+	m->n_text++;
+}
+
+int upng_probe(upng_reader rd, void *rctx, struct upng_meta *m)
+{
+	m_zero(m, sizeof *m);
+	struct rdr R = { rd, rctx }, *r = &R;
+
+	static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+	for (int i = 0; i < 8; i++)
+		if (prb(r) != sig[i]) return UPNG_EBADSIG;
+
+	int have_ihdr = 0;
+	for (;;) {
+		uint32_t len; uint8_t ty[4];
+		if (pbe32(r, &len) < 0) break;
+		for (int i = 0; i < 4; i++) { int c = prb(r); if (c < 0) goto done; ty[i] = (uint8_t)c; }
+
+		if (is_type(ty, "IHDR")) {
+			unsigned char hb[13]; uint32_t got;
+			if (pread(r, hb, len, 13, &got) < 0 || got < 13) return UPNG_EBADHDR;
+			m->w = ((unsigned)hb[0] << 24) | (hb[1] << 16) | (hb[2] << 8) | hb[3];
+			m->h = ((unsigned)hb[4] << 24) | (hb[5] << 16) | (hb[6] << 8) | hb[7];
+			m->depth = hb[8]; m->color = hb[9];
+			m->interlaced = hb[12] == 1;
+			switch (m->color) {
+			case 0: m->channels = 1; break;
+			case 2: m->channels = 3; break;
+			case 3: m->channels = 1; break;
+			case 4: m->channels = 2; m->has_alpha = 1; break;
+			case 6: m->channels = 4; m->has_alpha = 1; break;
+			default: m->channels = 0; break;
+			}
+			have_ihdr = 1;
+			if (pskip(r, 4) < 0) goto done;       /* CRC */
+		} else if (is_type(ty, "PLTE")) {
+			m->palette_n = len / 3;
+			if (pskip(r, len + 4) < 0) goto done;
+		} else if (is_type(ty, "tRNS")) {
+			m->has_trns = 1;
+			if (pskip(r, len + 4) < 0) goto done;
+		} else if (is_type(ty, "pHYs")) {
+			unsigned char b[9]; uint32_t got;
+			if (pread(r, b, len, 9, &got) < 0) goto done;
+			if (got >= 9) {
+				m->ppu_x = ((unsigned)b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
+				m->ppu_y = ((unsigned)b[4]<<24)|(b[5]<<16)|(b[6]<<8)|b[7];
+				m->phys_metre = (b[8] == 1);
+				m->have_phys = 1;
+			}
+			if (pskip(r, (len > 9 ? len - 9 : 0) + 4) < 0) goto done;
+		} else if (is_type(ty, "gAMA")) {
+			unsigned char b[4]; uint32_t got;
+			if (pread(r, b, len, 4, &got) < 0) goto done;
+			if (got >= 4) {
+				m->gamma = ((unsigned)b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
+				m->have_gamma = 1;
+			}
+			if (pskip(r, (len > 4 ? len - 4 : 0) + 4) < 0) goto done;
+		} else if (is_type(ty, "tIME")) {
+			unsigned char b[7]; uint32_t got;
+			if (pread(r, b, len, 7, &got) < 0) goto done;
+			if (got >= 7) {
+				m->year = (b[0]<<8)|b[1];
+				m->mon = b[2]; m->day = b[3];
+				m->hour = b[4]; m->min = b[5]; m->sec = b[6];
+				m->have_time = 1;
+			}
+			if (pskip(r, (len > 7 ? len - 7 : 0) + 4) < 0) goto done;
+		} else if (is_type(ty, "tEXt")) {
+			unsigned char b[256]; uint32_t got;
+			if (pread(r, b, len, sizeof b, &got) < 0) goto done;
+			m_addtext(m, b, got);
+			if (pskip(r, (len > got ? len - got : 0) + 4) < 0) goto done;
+		} else if (is_type(ty, "iTXt")) {
+			/* keyword\0 cflag(1) cmethod(1) lang\0 transkw\0 text */
+			unsigned char b[512]; uint32_t got;
+			if (pread(r, b, len, sizeof b, &got) < 0) goto done;
+			unsigned k = 0; while (k < got && b[k]) k++;
+			if (k + 2 < got) {
+				int compressed = b[k + 1];
+				unsigned p = k + 3;                    /* past cflag+cmethod      */
+				while (p < got && b[p]) p++;           /* skip language tag       */
+				if (p < got) p++;
+				while (p < got && b[p]) p++;           /* skip translated keyword */
+				if (p < got) p++;
+				if (m->n_text < UPNG_TEXT_MAX) {
+					struct upng_text *t = &m->text[m->n_text];
+					m_textcopy(t->key, UPNG_KEY_MAX, b, k);
+					if (t->key[0]) {
+						if (compressed)
+							m_textcopy(t->val, UPNG_VAL_MAX,
+							           (const unsigned char *)"(compressed)", 12);
+						else
+							m_textcopy(t->val, UPNG_VAL_MAX, b + p,
+							           p < got ? got - p : 0);
+						m->n_text++;
+					}
+				}
+			}
+			if (pskip(r, (len > got ? len - got : 0) + 4) < 0) goto done;
+		} else if (is_type(ty, "zTXt")) {
+			unsigned char b[256]; uint32_t got;
+			if (pread(r, b, len, sizeof b, &got) < 0) goto done;
+			unsigned k = 0; while (k < got && b[k]) k++;
+			if (m->n_text < UPNG_TEXT_MAX && k > 0) {
+				struct upng_text *t = &m->text[m->n_text];
+				m_textcopy(t->key, UPNG_KEY_MAX, b, k);
+				if (t->key[0]) {
+					m_textcopy(t->val, UPNG_VAL_MAX,
+					           (const unsigned char *)"(compressed)", 12);
+					m->n_text++;
+				}
+			}
+			if (pskip(r, (len > got ? len - got : 0) + 4) < 0) goto done;
+		} else if (is_type(ty, "eXIf")) {
+			if (len > UPNG_EXIF_MAX) {
+				m->exif_len = -1;                      /* present but over our cap */
+				if (pskip(r, len + 4) < 0) goto done;
+			} else {
+				uint32_t got;
+				if (pread(r, m->exif, len, UPNG_EXIF_MAX, &got) < 0) goto done;
+				m->exif_len = (int)got;
+				if (pskip(r, 4) < 0) goto done;        /* CRC */
+			}
+		} else if (is_type(ty, "IDAT") || is_type(ty, "IEND")) {
+			/* Stop at the image data: every metadata chunk we report is mandated
+			 * (or by convention placed) before IDAT, and scanning megabytes of
+			 * pixel data just to catch a rare trailing text chunk would freeze a
+			 * caller's UI. So the probe ends here. */
+			break;
+		} else {
+			if (pskip(r, len + 4) < 0) goto done;       /* ancillary + CRC */
+		}
+	}
+done:
+	return have_ihdr ? UPNG_OK : UPNG_EBADHDR;
+}
+
+/* ------------------------------------------------------------- EXIF decoding */
+
+/* TIFF integer reads honouring the block's byte order, all bounds-checked. */
+static unsigned ex16(const unsigned char *e, int len, int o, int le)
+{
+	if (o < 0 || o + 2 > len) return 0;
+	return le ? e[o] | (e[o+1] << 8) : (e[o] << 8) | e[o+1];
+}
+static unsigned ex32(const unsigned char *e, int len, int o, int le)
+{
+	if (o < 0 || o + 4 > len) return 0;
+	return le ? e[o] | (e[o+1]<<8) | (e[o+2]<<16) | ((unsigned)e[o+3]<<24)
+	          : ((unsigned)e[o]<<24) | (e[o+1]<<16) | (e[o+2]<<8) | e[o+3];
+}
+
+static unsigned ex_typesize(unsigned t)
+{
+	switch (t) {
+	case 1: case 2: case 6: case 7: return 1;   /* BYTE/ASCII/SBYTE/UNDEFINED */
+	case 3: case 8:                 return 2;    /* SHORT/SSHORT               */
+	case 4: case 9: case 11:        return 4;    /* LONG/SLONG/FLOAT           */
+	case 5: case 10: case 12:       return 8;    /* RATIONAL/SRATIONAL/DOUBLE  */
+	default:                        return 0;
+	}
+}
+
+/* Small freestanding string helpers (upng.c is standalone — no libc here). */
+static char *e_str(char *p, const char *s) { while (*s) *p++ = *s++; *p = 0; return p; }
+static char *e_uint(char *p, unsigned v)
+{
+	char t[12]; int n = 0;
+	if (v == 0) t[n++] = '0';
+	while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+	while (n) *p++ = t[--n];
+	*p = 0;
+	return p;
+}
+
+static unsigned e_gcd(unsigned a, unsigned b) { while (b) { unsigned t = a % b; a = b; b = t; } return a; }
+
+/* Format the value field of one IFD entry by tag into `out`; return the human
+ * label, or 0 to drop the entry. `dptr` points at the value's data in e[]. */
+static const char *ex_format(unsigned tag, unsigned type, unsigned cnt,
+                             const unsigned char *e, int len, int dptr, int le,
+                             char *out)
+{
+	char *p = out;
+	out[0] = 0;
+
+	/* ASCII string tags. */
+	if (type == 2) {
+		const char *label = 0;
+		switch (tag) {
+		case 0x010E: label = "Description"; break;
+		case 0x010F: label = "Make";        break;
+		case 0x0110: label = "Model";       break;
+		case 0x0131: label = "Software";    break;
+		case 0x0132: label = "Date/Time";   break;
+		case 0x013B: label = "Artist";      break;
+		case 0x8298: label = "Copyright";   break;
+		case 0x9003: label = "Date taken";  break;
+		case 0x9004: label = "Digitized";   break;
+		case 0xA434: label = "Lens";        break;
+		default:     return 0;
+		}
+		unsigned o = 0, n = cnt;
+		for (unsigned i = 0; i < n && o < UPNG_VAL_MAX - 1; i++) {
+			if (dptr + (int)i >= len) break;
+			unsigned char c = e[dptr + i];
+			if (c == 0) break;
+			if (c < 0x20) c = ' ';
+			p[o++] = (char)c;
+		}
+		p[o] = 0;
+		return o ? label : 0;
+	}
+
+	/* Rational tags (num/den). */
+	if (type == 5 || type == 10) {
+		unsigned num = ex32(e, len, dptr, le), den = ex32(e, len, dptr + 4, le);
+		switch (tag) {
+		case 0x829A: {                                  /* ExposureTime          */
+			if (!den) return 0;
+			unsigned g = e_gcd(num, den); if (g) { num /= g; den /= g; }
+			if (den == 1) { p = e_uint(p, num); p = e_str(p, " s"); }
+			else { p = e_uint(p, num); *p++ = '/'; p = e_uint(p, den); p = e_str(p, " s"); }
+			return "Exposure";
+		}
+		case 0x829D: {                                  /* FNumber               */
+			if (!den) return 0;
+			unsigned f10 = num * 10 / den;
+			p = e_str(p, "f/"); p = e_uint(p, f10 / 10); *p++ = '.'; p = e_uint(p, f10 % 10);
+			return "Aperture";
+		}
+		case 0x920A: {                                  /* FocalLength           */
+			if (!den) return 0;
+			p = e_uint(p, num / den); p = e_str(p, " mm");
+			return "Focal length";
+		}
+		case 0x011A: case 0x011B: {                     /* X/YResolution         */
+			if (!den) return 0;
+			p = e_uint(p, num / den);
+			return tag == 0x011A ? "X resolution" : "Y resolution";
+		}
+		default: return 0;
+		}
+	}
+
+	/* SHORT / LONG numeric tags. */
+	if (type == 3 || type == 4) {
+		unsigned v = (type == 3) ? ex16(e, len, dptr, le) : ex32(e, len, dptr, le);
+		switch (tag) {
+		case 0x0112: {                                  /* Orientation           */
+			static const char *const o[] = { "?", "Normal", "Mirror H", "Rotate 180",
+				"Mirror V", "Mirror+Rot 270", "Rotate 90", "Mirror+Rot 90", "Rotate 270" };
+			e_str(p, v >= 1 && v <= 8 ? o[v] : "?");
+			return "Orientation";
+		}
+		case 0x0128:                                    /* ResolutionUnit        */
+			e_str(p, v == 2 ? "inch" : v == 3 ? "cm" : "none");
+			return "Res. unit";
+		case 0x8827:                                    /* ISO                   */
+			p = e_str(p, "ISO "); e_uint(p, v);
+			return "ISO speed";
+		case 0x8822: {                                  /* ExposureProgram       */
+			static const char *const pr[] = { "Not defined", "Manual", "Normal",
+				"Aperture priority", "Shutter priority", "Creative", "Action",
+				"Portrait", "Landscape" };
+			e_str(p, v <= 8 ? pr[v] : "?");
+			return "Program";
+		}
+		case 0x9209:                                    /* Flash                 */
+			e_str(p, (v & 1) ? "Fired" : "Did not fire");
+			return "Flash";
+		case 0xA002:                                    /* PixelXDimension       */
+			e_uint(p, v); return "Stored width";
+		case 0xA003:                                    /* PixelYDimension       */
+			e_uint(p, v); return "Stored height";
+		default: return 0;
+		}
+	}
+	return 0;
+}
+
+/* Walk one IFD at byte offset `off`. Emits recognised tags; if !is_sub, stores
+ * the Exif sub-IFD pointer (tag 0x8769) into *sub for a single follow-up walk. */
+static void ex_walk(const unsigned char *e, int len, int off, int le,
+                    int is_sub, int *sub, upng_kv emit, void *ctx)
+{
+	if (off < 0 || off + 2 > len) return;
+	unsigned count = ex16(e, len, off, le);
+	if (count > 256) count = 256;                       /* sane bound            */
+	for (unsigned i = 0; i < count; i++) {
+		int ep = off + 2 + (int)i * 12;
+		if (ep + 12 > len) break;
+		unsigned tag  = ex16(e, len, ep, le);
+		unsigned type = ex16(e, len, ep + 2, le);
+		unsigned cnt  = ex32(e, len, ep + 4, le);
+		if (!is_sub && tag == 0x8769) { if (sub) *sub = (int)ex32(e, len, ep + 8, le); continue; }
+		unsigned ts = ex_typesize(type);
+		if (!ts) continue;
+		unsigned total = ts * cnt;
+		int dptr = (total <= 4) ? ep + 8 : (int)ex32(e, len, ep + 8, le);
+		if (dptr < 0 || dptr >= len) continue;
+		char val[UPNG_VAL_MAX];
+		const char *label = ex_format(tag, type, cnt, e, len, dptr, le, val);
+		if (label && val[0]) emit(ctx, label, val);
+	}
+}
+
+void upng_exif_emit(const unsigned char *exif, int len, upng_kv emit, void *ctx)
+{
+	if (len < 8) return;
+	int le;
+	if (exif[0] == 'I' && exif[1] == 'I') le = 1;
+	else if (exif[0] == 'M' && exif[1] == 'M') le = 0;
+	else return;
+	if (ex16(exif, len, 2, le) != 42) return;
+	int ifd0 = (int)ex32(exif, len, 4, le);
+	int sub = 0;
+	ex_walk(exif, len, ifd0, le, 0, &sub, emit, ctx);
+	if (sub > 0 && sub < len)
+		ex_walk(exif, len, sub, le, 1, 0, emit, ctx);
 }
 
 /* Validate the IHDR depth/colour combination per the PNG spec, and set samples. */

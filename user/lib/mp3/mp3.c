@@ -1,4 +1,4 @@
-/* mp3.c — streaming MPEG audio decoder for ring-3 /bin/play.
+/* mp3.c — streaming MPEG audio decoder for /bin/play.
  *
  * The decode core is minimp3 by Lion (lieff), public domain / CC0, vendored at
  * minimp3.h and adapted for OwOS (see the patch list at the top of that file).

@@ -3,7 +3,7 @@
  * A thin streaming wrapper over the vendored minimp3 frame decoder (CC0,
  * minimp3.h). It decodes one frame at a time, pulling source bytes from a file
  * through readfile_at, so a multi-megabyte song never lives in memory at once —
- * the same reason /bin/play is a ring-3 program. Output is interleaved 16-bit
+ * the same reason /bin/play is a user program. Output is interleaved 16-bit
  * signed stereo at the file's native sample rate (a mono stream is duplicated to
  * both channels); /bin/play resamples that to the device's 48 kHz. A decode bug
  * is a contained process crash, never a kernel hang.

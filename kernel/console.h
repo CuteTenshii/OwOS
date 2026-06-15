@@ -15,7 +15,7 @@
  * So "the console" is this multiplexer; the VGA text grid (0xB8000, the CRTC
  * cursor) is just one backend, kept internal to console.c. Subsystems log by
  * calling con_write/con_set_color; they neither know nor care which sinks are
- * live. The ring-3 terminal's bridge reuses every kernel builtin by switching
+ * live. The terminal's bridge reuses every kernel builtin by switching
  * the capture sink on and reading back what they printed. */
 #ifndef OWOS_CONSOLE_H
 #define OWOS_CONSOLE_H

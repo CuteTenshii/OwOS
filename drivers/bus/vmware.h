@@ -46,4 +46,18 @@ int vmware_present(void);
  * reply doesn't matter (e.g. an info-set). */
 int vmware_rpc(const char *req, char *resp, int resp_max);
 
+/* Legacy VMware copy/paste — the simple text-only clipboard channel that
+ * predates GuestRPC (backdoor commands 6-9, four bytes per call). It rides the
+ * plain single-instruction backdoor, so unlike vmware_rpc it does NOT need the
+ * message channel.
+ *
+ * vmware_clip_recv pulls the host clipboard into buf (at most max bytes, the
+ * rest drained and discarded so the host stays in sync); it returns the number
+ * of bytes the host offered (capped to max) or -1 when the host has nothing new
+ * to hand over. vmware_clip_send pushes len bytes of guest text up to the host
+ * clipboard; it returns len, or -1 off VMware. Real VMware only — QEMU's vmport
+ * does not implement these commands. */
+int vmware_clip_recv(char *buf, int max);
+int vmware_clip_send(const char *buf, int len);
+
 #endif /* OWOS_VMWARE_H */

@@ -167,9 +167,9 @@ static void dma_setup_autoinit(uint32_t phys, uint32_t count)
 	outb(DMA_MASK, SB_DMA);                 /* unmask -- transfer may begin     */
 }
 
-/* ---- streaming PCM sink (fed from ring 3) ------------------------------
+/* ---- streaming PCM sink (fed from user space) ------------------------------
  *
- * Like hda.c, the WAV parse + resample now run in ring 3 (/bin/play); it pushes
+ * Like hda.c, the WAV parse + resample now run in /bin/play; it pushes
  * the canonical 48 kHz/16-bit/stereo stream here over the SYS_AUDIO_* syscalls.
  * This back end down-converts each frame to one 8-bit unsigned mono sample (all
  * the SB16's 8-bit DAC takes) and plays it at 48 kHz over the auto-init DMA

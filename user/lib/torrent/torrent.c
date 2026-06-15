@@ -1,5 +1,5 @@
 /* torrent.c — .torrent metainfo parsing + infohash (userspace libtorrent).
- * Ported from kernel/torrent.c: the node pool is a static buffer (no ring-3
+ * Ported from kernel/torrent.c: the node pool is a static buffer (no user-space
  * malloc) and output goes to stdout instead of the kernel console. */
 
 #include "owos.h"

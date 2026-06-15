@@ -1,4 +1,4 @@
-/* torrent.c — a ring-3 BitTorrent client, a thin CLI over libtorrent
+/* torrent.c — a BitTorrent client, a thin CLI over libtorrent
  * (user/lib/net/{bencode,torrent,tracker,peer}.c + user/lib/crypto).
  *
  *   torrent info  <file>            parse a .torrent: name, infohash, layout

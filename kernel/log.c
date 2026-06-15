@@ -33,6 +33,20 @@ void journal_record(char c)
 void journal_capture(int on) { capturing = on ? 1 : 0; }
 int  journal_capturing(void) { return capturing; }
 
+/* Copy the journal (oldest-first) into out[max], for /proc/journal. Returns the
+ * byte count. Mirrors journal_dump's order but writes to a buffer instead of the
+ * console, so the terminal can `cat /proc/journal`. */
+int journal_copy(char *out, int max)
+{
+	int n = 0;
+	if (wrapped)
+		for (uint32_t i = head; i < sizeof buf && n < max; i++)
+			out[n++] = buf[i];
+	for (uint32_t i = 0; i < head && n < max; i++)
+		out[n++] = buf[i];
+	return n;
+}
+
 void klog(const char *s)
 {
 	/* Record straight into the ring, then -- only if verbose -- echo to the

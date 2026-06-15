@@ -19,7 +19,7 @@ struct pci_display {
 /* Fill out[] with up to max display controllers; returns the number found.    */
 int      pci_displays(struct pci_display *out, int max);
 
-/* One enumerated PCI device with a resolved friendly name, for the ring-3
+/* One enumerated PCI device with a resolved friendly name, for
  * `lspci`. Layout MUST match struct pci_dev_info in user/lib/owos.h. */
 struct pci_dev_info {
 	char     name[64];        /* "<Vendor> <Model>", or a class fallback        */

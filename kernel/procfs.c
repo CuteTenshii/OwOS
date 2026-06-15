@@ -1,7 +1,7 @@
 /* procfs.c — a tiny read-only /proc: kernel introspection through the ordinary
  * file interface, one concern per file, generated on read.
  *
- * This replaces the old grab-bag SYS_SYSINFO / SYS_PCIDEV syscalls: ring-3
+ * This replaces the old grab-bag SYS_SYSINFO / SYS_PCIDEV syscalls:
  * programs (neofetch, lspci) just readfile("/proc/<x>") like any other file, and
  * `cat /proc/uptime` works too. Each file is a single fact, never a bundle.
  *
@@ -31,6 +31,17 @@
 #include "ata.h"
 #include "ahci.h"
 #include "nvme.h"
+#include "log.h"
+#include "net.h"
+#include "nic.h"
+#include "vmtools.h"
+#include "keyboard.h"
+#include "mouse.h"
+#include "power.h"
+#include "services.h"
+#include "xhci.h"
+#include "usb.h"
+#include "console.h"
 
 /* bounded text builder */
 struct pb { char *p; char *end; };
@@ -142,10 +153,63 @@ static void gen_pci(struct pb *b)
 	}
 }
 
+static void gen_journal(struct pb *b)
+{
+	b->p += journal_copy(b->p, (int)(b->end - b->p));
+}
+
+/* /proc/net: link + IPv4 status. Writing to it re-runs DHCP or an NTP sync (see
+ * procfs_write), so `dhcp`/`ntp` are a write-then-read of this one node. */
+static void gen_net(struct pb *b)
+{
+	const uint8_t *ip = net_my_ip();
+	ps(b, "ip ");
+	if (ip) { pu(b, ip[0]); pc(b, '.'); pu(b, ip[1]); pc(b, '.'); pu(b, ip[2]); pc(b, '.'); pu(b, ip[3]); }
+	else    ps(b, "0.0.0.0");
+	pc(b, '\n');
+	ps(b, "link "); ps(b, nic_present() ? "up" : "down"); pc(b, '\n');
+}
+
+static void gen_clipboard(struct pb *b)
+{
+	b->p += vmtools_clip_get(b->p, (int)(b->end - b->p));
+}
+
+static void gen_keyboard(struct pb *b)
+{
+	ps(b, keyboard_layout_name()); pc(b, '\n');
+}
+
+/* /proc/mouse: the pointer-speed level (1..5). Writing a level re-scales PS/2
+ * motion (see procfs_write) — the Settings app's Mouse/Touchpad control. */
+static void gen_mouse(struct pb *b)
+{
+	pu(b, (uint32_t)mouse_speed()); pc(b, '\n');
+}
+
+/* services and usb only know how to print to the console, so capture that into
+ * the /proc buffer. con_capture is global but procfs_read is called
+ * synchronously by the reader, so the window is tiny. */
+static void gen_services(struct pb *b)
+{
+	con_capture_begin(b->p, (uint32_t)(b->end - b->p));
+	services_cmd("status");
+	b->p += con_capture_end();
+}
+
+static void gen_usb(struct pb *b)
+{
+	con_capture_begin(b->p, (uint32_t)(b->end - b->p));
+	usb_list(-1);
+	b->p += con_capture_end();
+}
+
 /* The entry names, in listing order. Single source of truth for read + list. */
 static const char *const entries[] = {
 	"cpuinfo", "meminfo", "uptime", "firmware", "tasks", "date",
 	"owofs", "host", "battery", "display", "storage", "pci",
+	"journal", "net", "clipboard", "keyboard", "mouse",
+	"services", "usb",
 };
 #define NENTRIES ((int)(sizeof entries / sizeof entries[0]))
 
@@ -202,9 +266,58 @@ int procfs_read(const char *sub, char *buf, int max)
 	else if (streq(sub, "display"))  gen_display(&b);
 	else if (streq(sub, "storage"))  gen_storage(&b);
 	else if (streq(sub, "pci"))      gen_pci(&b);
+	else if (streq(sub, "journal"))  gen_journal(&b);
+	else if (streq(sub, "net"))      gen_net(&b);
+	else if (streq(sub, "clipboard")) gen_clipboard(&b);
+	else if (streq(sub, "keyboard")) gen_keyboard(&b);
+	else if (streq(sub, "mouse"))    gen_mouse(&b);
+	else if (streq(sub, "services")) gen_services(&b);
+	else if (streq(sub, "usb"))      gen_usb(&b);
 	else                             return -1;
 
 	return (int)(b.p - buf);
+}
+
+/* The write side of /proc: control nodes through the ordinary file interface, so
+ * the shell triggers kernel actions with writefile() and never needs a
+ * per-action syscall or a "run a kernel command" bridge. Returns len on success
+ * (so writefile reports the bytes written), -1 for an unknown/!writable node. */
+int procfs_write(const char *sub, const char *buf, int len)
+{
+	__asm__ volatile ("sti");                 /* dhcp/ntp wait on the timer/IRQs   */
+	if (sub[0] == '/') sub++;
+
+	/* The clipboard is the one node that carries arbitrary text (a whole editor
+	 * selection -- multi-line, embedded newlines, far over the 255-byte command
+	 * cap below), so it takes the raw payload verbatim; vmtools_clip_set bounds
+	 * it to the clipboard capacity and mirrors it to the VMware host. */
+	if (streq(sub, "clipboard")) {
+		vmtools_clip_set(buf, len);
+		return len;
+	}
+
+	/* Trim a trailing newline and bound the payload into a NUL-terminated copy. */
+	char arg[256];
+	int n = len;
+	if (n > (int)sizeof arg - 1) n = (int)sizeof arg - 1;
+	for (int i = 0; i < n; i++) arg[i] = buf[i];
+	arg[n] = '\0';
+	while (n > 0 && (arg[n - 1] == '\n' || arg[n - 1] == '\r')) arg[--n] = '\0';
+
+	if (streq(sub, "keyboard"))
+		return keyboard_set_layout(arg) == 0 ? len : -1;
+	if (streq(sub, "mouse")) {               /* pointer-speed level "1".."5"      */
+		int v = 0;
+		for (const char *p = arg; *p >= '0' && *p <= '9'; p++)
+			v = v * 10 + (*p - '0');
+		mouse_set_speed(v);
+		return len;
+	}
+	if (streq(sub, "services")) {            /* "start X" / "stop X" / "restart X" */
+		services_cmd(arg);
+		return len;
+	}
+	return -1;
 }
 
 /* The part of `path` after a leading "/proc", or NULL if it isn't under /proc.

@@ -2,7 +2,7 @@
  *
  * apps_start() opens only the terminal at boot; the Start menu launches the
  * rest on demand. Kernel-side apps create their window via their *_init();
- * ring-3 apps are spawned from /bin as detached user processes — their parent
+ * apps are spawned from /bin as detached user processes — their parent
  * is the WM thread (the launcher's caller), which reaps them.
  */
 #include <stdint.h>
@@ -45,14 +45,18 @@ static void launch_clock(void)   { launch_bin("clock"); }
 static void launch_about(void)   { launch_bin("about"); }
 static void launch_browser(void) { launch_bin("browser"); }
 static void launch_term(void)    { launch_bin("term"); }
+static void launch_player(void)  { launch_bin("player"); }
+static void launch_settings(void){ launch_bin("settings"); }
 
-/* The Start menu. Every entry spawns a ring-3 program from /bin. */
+/* The Start menu. Every entry spawns a program from /bin. */
 static const struct { const char *name; void (*launch)(void); } app_menu[] = {
 	{ "Terminal", launch_term     },
 	{ "Files",   launch_files     },
 	{ "Editor",  launch_editor    },
 	{ "Browser", launch_browser   },
+	{ "Media Player", launch_player },
 	{ "Clock",   launch_clock     },
+	{ "Settings", launch_settings },
 	{ "About",   launch_about     },
 };
 
@@ -74,7 +78,7 @@ void apps_menu_launch(int i)
 
 void apps_start(void)
 {
-	/* The terminal is now the ring-3 /bin/term (a real user-space shell), opened
+	/* The terminal is now the /bin/term (a real user-space shell), opened
 	 * at boot like a Start-menu app. The old kernel-side app_term window is no
 	 * longer created; the kernel shell (shell.c) still drives the serial console
 	 * for `make debug`. */

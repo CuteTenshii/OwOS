@@ -8,7 +8,7 @@
 #include "sched.h"
 #include "kstring.h"
 
-#define USER_STACK_PAGES 4   /* 16 KiB of user stack                          */
+/* USER_STACK_PAGES lives in loader.h now (shared with the heap ceiling). */
 
 /* The scratch mapping (paging_scratch_*) is shared kernel state, so a map->
  * write->unmap interval must not be preempted by another exec/fork using the
@@ -79,10 +79,12 @@ static int in_user_window(uint32_t addr, uint32_t len)
 	    && addr + len >= addr;
 }
 
-int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out_entry)
+int load_elf(const void *image, uint32_t size, uint32_t **out_dir,
+             uint32_t *out_entry, uint32_t *out_brk)
 {
 	const uint8_t *file = image;
 	const Elf32_Ehdr *eh = image;
+	uint32_t image_end = USER_BASE;       /* highest vaddr used by any segment */
 
 	if (size < sizeof(Elf32_Ehdr))
 		return -1;
@@ -110,6 +112,8 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
 			paging_free_process_dir(dir);
 			return -1;
 		}
+		if (ph->p_vaddr + ph->p_memsz > image_end)
+			image_end = ph->p_vaddr + ph->p_memsz;
 	}
 
 	for (int p = 0; p < USER_STACK_PAGES; p++) {
@@ -134,6 +138,7 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
 
 	*out_dir = dir;
 	*out_entry = eh->e_entry;
+	*out_brk = (image_end + 0xFFFu) & ~0xFFFu;     /* heap starts past the image */
 	return 0;
 }
 
@@ -185,15 +190,15 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 int exec_program(const void *image, uint32_t size, int argc, char *const argv[])
 {
 	uint32_t *dir;
-	uint32_t  entry;
-	if (load_elf(image, size, &dir, &entry) != 0)
+	uint32_t  entry, brk;
+	if (load_elf(image, size, &dir, &entry, &brk) != 0)
 		return -1;
 
 	uint32_t user_esp = setup_args(dir, argc, argv);
 	/* Name the task after the program (argv[0]) so the crash reporter and
 	 * `tasks` show e.g. "browser" instead of a generic "user". */
 	const char *nm = (argc > 0 && argv[0]) ? argv[0] : "user";
-	int pid = sched_create_process(nm, entry, dir, user_esp);
+	int pid = sched_create_process(nm, entry, dir, user_esp, brk);
 	if (pid < 0)
 		paging_free_process_dir(dir);
 	return pid;

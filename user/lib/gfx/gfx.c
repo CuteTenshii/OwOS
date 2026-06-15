@@ -56,6 +56,26 @@ static unsigned gfx_blend(unsigned fg, unsigned bg, unsigned a)
 	return (r << 16) | (g << 8) | b;
 }
 
+/* Blit a w*h ARGB (0xAARRGGBB) bitmap at (x,y), alpha-blending each pixel over
+ * the framebuffer. Fully transparent pixels are skipped; clipped to bounds. */
+void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb)
+{
+	for (int r = 0; r < h; r++) {
+		int sy = y + r;
+		if ((unsigned)sy >= (unsigned)g_h) continue;
+		const unsigned *src = argb + (long)r * w;
+		unsigned *drow = g_fb + (long)sy * g_w;
+		for (int c = 0; c < w; c++) {
+			int sx = x + c;
+			if ((unsigned)sx >= (unsigned)g_w) continue;
+			unsigned px = src[c], a = px >> 24;
+			if (a == 0) continue;
+			drow[sx] = (a == 255) ? (px & 0xffffff)
+			                      : gfx_blend(px & 0xffffff, drow[sx], a);
+		}
+	}
+}
+
 void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg)
 {
 	int transparent = (bg & GFX_TRANSPARENT) != 0;
@@ -588,11 +608,50 @@ static void tab_closebox(int cx, int cy, unsigned c)
 	}
 }
 
-void tabbar_draw(int x, int y, int w, const char *const *labels, int n, int active)
+#define TAB_ICON     16  /* favicon slot drawn at the left of each tab  */
+#define TAB_ICON_PAD 6   /* left margin before the icon                 */
+#define TAB_ICON_GAP 5   /* gap between the icon and the label          */
+
+static int isqrt_i(int v)
+{
+	int r = 0;
+	if (v < 0) return 0;
+	while ((r + 1) * (r + 1) <= v) r++;
+	return r;
+}
+
+/* The default 16x16 globe shown when a tab has no decoded favicon: a blue disc
+ * with an equator, two parallels, and three meridians (one straight, two
+ * curved along the disc edge). Drawn directly so no bitmap asset is needed. */
+static void tab_globe(int x, int y)
+{
+	const int R = 7, cx = 8, cy = 8;
+	for (int py = 0; py < 16; py++) {
+		int dy = py - cy;
+		int e = isqrt_i(R * R - dy * dy);            /* disc half-width this row */
+		for (int px = 0; px < 16; px++) {
+			int dx = px - cx, d2 = dx * dx + dy * dy;
+			if (d2 > R * R) continue;
+			unsigned col;
+			if      (d2 >= (R - 1) * (R - 1))          col = 0x2f5fb0u;  /* rim    */
+			else if (dy == 0 || dy == 3 || dy == -3)   col = 0xcfe0ffu;  /* lats   */
+			else if (dx == 0 || dx == e / 2 || dx == -e / 2)
+			                                           col = 0xcfe0ffu;  /* longs  */
+			else                                       col = 0x5b8defu;  /* ocean  */
+			gfx_pixel(x + px, y + py, col);
+		}
+	}
+}
+
+/* icons[i] points to a 16x16 ARGB favicon for tab i (NULL -> draw the globe);
+ * pass a NULL icons array to give every tab the globe. */
+void tabbar_draw(int x, int y, int w, const char *const *labels,
+                 const unsigned *const *icons, int n, int active)
 {
 	gfx_fill_rect(x, y, w, GUI_TAB_H, TAB_STRIP_BG);
 	int tw = tabbar_each_w(w, n);
 	int ty = y + (GUI_TAB_H - UIFONT_H) / 2;
+	int iy = y + (GUI_TAB_H - TAB_ICON) / 2;
 	for (int i = 0; i < n; i++) {
 		int tx = x + i * tw;
 		int on = (i == active);
@@ -601,9 +660,15 @@ void tabbar_draw(int x, int y, int w, const char *const *labels, int n, int acti
 		if (on)                                      /* accent bar on top */
 			gfx_fill_rect(tx, y, tw - 1, 2, 0x2f6bd8);
 		gfx_fill_rect(tx + tw - 1, y, 1, GUI_TAB_H, TAB_STRIP_BG);  /* divider */
+
+		int ix = tx + TAB_ICON_PAD;
+		if (icons && icons[i]) gfx_blit_argb(ix, iy, TAB_ICON, TAB_ICON, icons[i]);
+		else                   tab_globe(ix, iy);
+
+		int lx = ix + TAB_ICON + TAB_ICON_GAP;
 		int has_x = n > 1;
-		int textpx = tw - 8 - (has_x ? TAB_CLOSE_W : 4);
-		tab_label(tx + 8, ty, labels[i], textpx, on ? TAB_ON_FG : TAB_OFF_FG);
+		int textpx = tw - (lx - tx) - (has_x ? TAB_CLOSE_W : 4);
+		tab_label(lx, ty, labels[i], textpx, on ? TAB_ON_FG : TAB_OFF_FG);
 		if (has_x)
 			tab_closebox(tx + tw - TAB_CLOSE_W + 4, y + (GUI_TAB_H - 7) / 2,
 			             on ? 0x707880 : 0x8a93a0);
@@ -630,4 +695,249 @@ int tabbar_hit(int x, int y, int w, int n, int mx, int my, int *index)
 	}
 	if (index) *index = i;
 	return TABBAR_SELECT;
+}
+
+/* ------------------------------------------------------------- button */
+
+/* Per-state face: fill, a 1px top highlight, label colour. The border is the
+ * same near-black as the menu/tab chrome so buttons sit on any background. */
+struct btn_face { unsigned bg, top, fg; };
+static const struct btn_face btn_faces[] = {
+	[BTN_NORMAL]   = { 0x3a4658u, 0x4a5a70u, 0xe6ebf2u },
+	[BTN_HOVER]    = { 0x46546au, 0x586a84u, 0xffffffu },
+	[BTN_PRESSED]  = { 0x2a3342u, 0x2a3342u, 0xc8d0dcu },
+	[BTN_DISABLED] = { 0x2a3038u, 0x2a3038u, 0x636b78u },
+};
+
+void button_draw(int x, int y, int w, int h, const char *label, int state)
+{
+	if (state < 0 || state > BTN_DISABLED)
+		state = BTN_NORMAL;
+	const struct btn_face *f = &btn_faces[state];
+	gfx_fill_rect(x, y, w, h, f->bg);
+	if (f->top != f->bg)                          /* raised: lit top edge */
+		gfx_fill_rect(x + 1, y + 1, w - 2, 1, f->top);
+	gfx_rect(x, y, w, h, 0x05070a);
+
+	/* Centre the label; nudge it down a pixel while pressed so it "sinks". */
+	int tw = gfx_ui_width(label);
+	int tx = x + (w - tw) / 2;
+	int ty = y + (h - UIFONT_H) / 2 + (state == BTN_PRESSED ? 1 : 0);
+	gfx_ui_text(tx, ty, label, f->fg);
+}
+
+int button_hit(int x, int y, int w, int h, int mx, int my)
+{
+	return mx >= x && mx < x + w && my >= y && my < y + h;
+}
+
+/* ------------------------------------------------------------- progress bar */
+
+#define PROG_TROUGH 0x1c2330u   /* sunken background        */
+#define PROG_FILL   0x2f6bd8u   /* accent-blue done portion */
+#define PROG_TOP    0x5a8fe0u   /* lit top edge of the fill */
+#define PROG_BORDER 0x05070au
+
+void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
+{
+	if (max < 0) max = 0;
+	if (value < 0) value = 0;
+	if (value > max) value = max;
+	int pct = max > 0 ? value * 100 / max : 0;
+
+	gfx_fill_rect(x, y, w, h, PROG_TROUGH);
+
+	/* Fill the inner area (inside the 1px border) proportionally. */
+	int inner = w - 2;
+	int fw = max > 0 && inner > 0 ? (int)((long)inner * value / max) : 0;
+	if (fw > 0) {
+		gfx_fill_rect(x + 1, y + 1, fw, h - 2, PROG_FILL);
+		if (h > 3)
+			gfx_fill_rect(x + 1, y + 1, fw, 1, PROG_TOP);
+	}
+	gfx_rect(x, y, w, h, PROG_BORDER);
+
+	if (show_pct) {
+		char buf[5];                              /* "100%" + NUL */
+		int p = pct, k = 0;
+		if (p >= 100) { buf[k++] = '1'; buf[k++] = '0'; buf[k++] = '0'; }
+		else {
+			if (p >= 10) buf[k++] = '0' + p / 10;
+			buf[k++] = '0' + p % 10;
+		}
+		buf[k++] = '%';
+		buf[k] = '\0';
+		int tw = gfx_ui_width(buf);
+		int tx = x + (w - tw) / 2;
+		int ty = y + (h - UIFONT_H) / 2;
+		/* White over the blue done-portion, light grey over the trough; pick by
+		 * whether the label's centre sits on the filled side. */
+		unsigned fg = (w / 2 < 1 + fw) ? 0xffffffu : 0xc8d0dcu;
+		gfx_ui_text(tx, ty, buf, fg);
+	}
+}
+
+/* ------------------------------------------------------------- scrollbar */
+
+#define SCROLL_TRACK     0xc8ccd2u   /* light track groove        */
+#define SCROLL_THUMB     0x6b7686u   /* draggable slate thumb     */
+#define SCROLL_ARROW_BG  0xb4b9c2u   /* arrow-button face         */
+#define SCROLL_ARROW_FG  0x4a5564u   /* arrowhead                 */
+#define SCROLL_MIN_THUMB 12          /* keep the thumb grabbable  */
+
+/* Square arrow-button height for a w-wide, h-tall bar, or 0 when the bar is too
+ * short to hold both arrows and a grabbable thumb (then it's a plain track). */
+static int scrollbar_arrow_h(int w, int h)
+{
+	int a = w;
+	if (a < 4 || h < 2 * a + SCROLL_MIN_THUMB) return 0;
+	return a;
+}
+
+/* Thumb height + top offset within a track of height `tr` for the current counts,
+ * shared by scrollbar_draw and scrollbar_pos so the visual and the hit-test
+ * agree. Assumes total > visible (the only case with a thumb). */
+static void scrollbar_thumb(int tr, int scroll, int total, int visible,
+                            int *th, int *ty)
+{
+	int t = (int)((long)tr * visible / total);
+	if (t < SCROLL_MIN_THUMB) t = SCROLL_MIN_THUMB;
+	if (t > tr) t = tr;
+	int maxs = total - visible;
+	if (scroll < 0) scroll = 0;
+	if (scroll > maxs) scroll = maxs;
+	int span = tr - t;
+	*th = t;
+	*ty = (maxs > 0) ? (int)((long)span * scroll / maxs) : 0;
+}
+
+/* A filled triangle centred in the arrow box [bx,by,w,a], pointing up or down. */
+static void scrollbar_tri(int bx, int by, int w, int a, int up, unsigned color)
+{
+	int sz = (w - 2) / 2;
+	if (sz < 3) sz = 3;
+	if (sz > a / 2) sz = a / 2;
+	if (sz < 1) sz = 1;
+	int cx = bx + w / 2;
+	int top = by + (a - sz) / 2;
+	for (int r = 0; r < sz; r++) {
+		int half = up ? r : (sz - 1 - r);
+		gfx_fill_rect(cx - half, top + r, half * 2 + 1, 1, color);
+	}
+}
+
+void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible)
+{
+	int a = scrollbar_arrow_h(w, h);
+	int tr = h - 2 * a;                    /* track region height */
+
+	gfx_fill_rect(x, y, w, h, SCROLL_TRACK);
+	if (a > 0) {
+		gfx_fill_rect(x, y, w, a, SCROLL_ARROW_BG);            /* up box   */
+		gfx_fill_rect(x, y + h - a, w, a, SCROLL_ARROW_BG);    /* down box */
+		scrollbar_tri(x, y, w, a, 1, SCROLL_ARROW_FG);
+		scrollbar_tri(x, y + h - a, w, a, 0, SCROLL_ARROW_FG);
+	}
+	if (total > visible && visible > 0 && tr > 0 && w > 2) {
+		int th, ty;
+		scrollbar_thumb(tr, scroll, total, visible, &th, &ty);
+		gfx_fill_rect(x + 1, y + a + ty, w - 2, th, SCROLL_THUMB);
+	}
+}
+
+int scrollbar_hit(int x, int y, int w, int h, int mx, int my)
+{
+	if (mx < x || mx >= x + w || my < y || my >= y + h)
+		return SCROLLBAR_NONE;
+	int a = scrollbar_arrow_h(w, h);
+	if (a > 0) {
+		if (my < y + a)        return SCROLLBAR_UP;
+		if (my >= y + h - a)   return SCROLLBAR_DOWN;
+	}
+	return SCROLLBAR_TRACK;
+}
+
+int scrollbar_pos(int x, int y, int w, int h, int mx, int my,
+                  int scroll, int total, int visible)
+{
+	if (scrollbar_hit(x, y, w, h, mx, my) != SCROLLBAR_TRACK) return scroll;
+	int maxs = total - visible;
+	if (maxs <= 0) return 0;
+	int a = scrollbar_arrow_h(w, h);
+	int tr = h - 2 * a;                    /* track region height       */
+	if (tr <= 0) return scroll;
+	int th, ty;
+	scrollbar_thumb(tr, scroll, total, visible, &th, &ty);
+	int span = tr - th;
+	int rel = my - (y + a) - th / 2;       /* centre the thumb on the cursor */
+	int s = (span > 0) ? (int)((long)rel * maxs / span) : 0;
+	if (s < 0) s = 0;
+	if (s > maxs) s = maxs;
+	return s;
+}
+
+/* ------------------------------------------------------------- sidebar */
+
+#define SB_GRIP_DOT 0x33415au   /* grip dimple colour, picked off the divider */
+
+static int sb_clamp(const struct sidebar *sb, int w)
+{
+	if (w < sb->min_w) w = sb->min_w;
+	if (w > sb->max_w) w = sb->max_w;
+	return w;
+}
+
+void sidebar_init(struct sidebar *sb, int w, int min_w, int max_w)
+{
+	if (max_w < min_w) max_w = min_w;
+	sb->min_w = min_w;
+	sb->max_w = max_w;
+	sb->resizable = 1;
+	sb->dragging = 0;
+	sb->w = sb_clamp(sb, w);
+}
+
+void sidebar_set_width(struct sidebar *sb, int w)
+{
+	sb->w = sb_clamp(sb, w);
+}
+
+void sidebar_draw(struct sidebar *sb, int x, int y, int w, int h, unsigned bg,
+                  unsigned divider)
+{
+	gfx_fill_rect(x, y, w, h, bg);
+	gfx_fill_rect(x + w, y, 1, h, divider);
+
+	/* A short centred column of dimples marks the divider as a drag handle. */
+	if (sb->resizable && h > 24) {
+		int cy = y + h / 2 - 9;
+		for (int i = 0; i < 4; i++)
+			gfx_fill_rect(x + w - 1, cy + i * 5, 2, 2, SB_GRIP_DOT);
+	}
+}
+
+int sidebar_press(struct sidebar *sb, int x, int y, int w, int h,
+                  int mx, int my)
+{
+	sb->dragging = 0;
+	if (!sb->resizable)
+		return 0;
+	int gx = x + w;                              /* the divider line            */
+	if (mx >= gx - SIDEBAR_GRIP / 2 && mx <= gx + SIDEBAR_GRIP / 2 &&
+	    my >= y && my < y + h) {
+		sb->dragging = 1;
+		return 1;
+	}
+	return 0;
+}
+
+int sidebar_drag(struct sidebar *sb, int x, int mx)
+{
+	if (!sb->dragging)
+		return 0;
+	int nw = sb_clamp(sb, mx - x);
+	if (nw == sb->w)
+		return 0;
+	sb->w = nw;
+	return 1;
 }

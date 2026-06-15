@@ -1,4 +1,4 @@
-/* crash.h — ring-3 crash reporter.
+/* crash.h — crash reporter.
  *
  * When a user process faults (page fault, GP, ...) the IDT handler calls
  * crash_record() to capture the registers and a stack backtrace, then kills the
@@ -10,7 +10,7 @@
 
 struct registers;
 
-/* Capture a crash from a ring-3 fault (called from the exception handler, in the
+/* Capture a crash from a user-program fault (called from the exception handler, in the
  * faulting task's context so its user stack is still mapped for the backtrace). */
 void crash_record(const char *name, struct registers *r);
 

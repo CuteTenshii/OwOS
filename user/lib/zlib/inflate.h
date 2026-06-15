@@ -1,4 +1,4 @@
-/* inflate.h — a streaming DEFLATE/zlib/gzip decompressor for ring-3 programs.
+/* inflate.h — a streaming DEFLATE/zlib/gzip decompressor for user programs.
  *
  * Pure user space: no syscall, no kernel involvement — decompression is just
  * computation, so it lives in the library the program links. Designed to stream

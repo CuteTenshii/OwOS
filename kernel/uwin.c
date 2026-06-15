@@ -1,4 +1,4 @@
-/* uwin.c — ring-3 windowing layer. See uwin.h.
+/* uwin.c — windowing layer. See uwin.h.
  *
  * Each user window owns its client buffer: a private, contiguous run of physical
  * RAM from pmm_alloc_contig (above the 16 MiB identity map), NOT the shared
@@ -6,7 +6,7 @@
  * buffer can be as large as the whole screen. The run is identity-mapped into
  * the kernel master directory (paging_kmap) so the WM thread (kernel CR3) blits
  * it via its physical address, and mapped into the owning process at WIN_FB_VADDR
- * (its own high page tables) so ring-3 draws into it. On window/process teardown
+ * (its own high page tables) so the owner draws into it. On window/process teardown
  * the user mapping and its page tables are released BEFORE the dir is freed, the
  * kernel mapping is dropped, and the frames are returned to the PMM.
  */
@@ -19,8 +19,8 @@
 #include "sched.h"
 #include "timer.h"
 
-#define MAXUWIN 32    /* concurrent ring-3 app windows (buffers come from pmm) */
-#define EVQ     32          /* per-window event ring                          */
+#define MAXUWIN 32    /* concurrent app windows (buffers come from pmm) */
+#define EVQ     64          /* per-window event ring                          */
 
 /* Fill colour for client pixels the app hasn't drawn yet: a fresh window before
  * its first paint, and the area newly exposed by a resize before the app
@@ -113,6 +113,22 @@ static void uw_click(struct window *w, int mx, int my)
 	}
 }
 
+/* The left button is held and moving after a press in our client area. The WM
+ * captures the drag (it set app_dragging because we expose this callback) and
+ * calls us on every motion until release; we forward it as WEV_DRAG in client
+ * coords so an app can drive a draggable element (e.g. a resizable
+ * sidebar's divider). There is no release event: motion simply stops, and the
+ * next WEV_MOUSE press begins a fresh drag. */
+static void uw_drag(struct window *w, int mx, int my)
+{
+	struct uwin *u = w->state;
+	if (!u)
+		return;
+	int cx = mx - (w->x + WM_BORDER);
+	int cy = my - (w->y + WM_TITLE_H);
+	evq_push(u, WEV_DRAG, cx, cy);
+}
+
 static void uw_rclick(struct window *w, int mx, int my)
 {
 	struct uwin *u = w->state;
@@ -130,8 +146,24 @@ static void uw_key(struct window *w, char c)
 		evq_push(u, WEV_KEY, (unsigned char)c, 0);
 }
 
+/* Free slots in this window's input event ring. Used for paste flow control: a
+ * clipboard paste must not push faster than the app drains, or events
+ * past the ring's depth are dropped (a long URL pasted only up to ~EVQ chars).
+ * Returns a large number for any window that isn't one of ours (non-uwin key
+ * sinks have no such ring and are never throttled). */
+int uwin_key_space(struct window *w)
+{
+	if (w->key != uw_key)
+		return 1 << 30;
+	struct uwin *u = w->state;
+	if (!u)
+		return 1 << 30;
+	int used = (u->head - u->tail + EVQ) % EVQ;
+	return (EVQ - 1) - used;       /* one slot is always left empty (full test) */
+}
+
 /* Mouse wheel over the window: the WM already routes wheel deltas to the
- * focused window's scroll callback; forward them as an event so a ring-3 app
+ * focused window's scroll callback; forward them as an event so an app
  * (the terminal) can scroll its own content. `dz` is +up / -down. */
 static void uw_scroll(struct window *w, int mx, int my, int dz)
 {
@@ -165,7 +197,7 @@ static uint32_t win_cap_bytes(void)
 /* A resize finished: grow/shrink the per-window client buffer. The buffer is a
  * private, contiguous run of physical RAM (its own space — not the shared kernel
  * heap), identity-mapped into the kernel master dir so the WM compositor can
- * blit it, and mapped into the owner at WIN_FB_VADDR so ring 3 can draw it. The
+ * blit it, and mapped into the owner at WIN_FB_VADDR so the owner can draw it. The
  * owner's TLB picks up the new mapping on its next schedule (CR3 reload). Runs
  * in the WM thread (CR3 = page_directory), so it touches the buffer through its
  * identity (physical) address, which the kernel mapping makes readable. */
@@ -310,6 +342,7 @@ int uwin_create(int w, int h, const char *title)
 	win->on_resize = uw_on_resize;
 	win->draw = uw_draw;
 	win->click = uw_click;
+	win->drag = uw_drag;
 	win->rclick = uw_rclick;
 	win->key = uw_key;
 	win->scroll = uw_scroll;

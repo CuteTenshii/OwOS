@@ -18,6 +18,10 @@ void gfx_rect(int x, int y, int w, int h, unsigned color);   /* 1px outline */
 void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg);
 void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg);
 
+/* Blit a w*h ARGB (0xAARRGGBB) bitmap at (x,y), alpha-blending over the buffer
+ * (fully transparent pixels skipped). Used for tab favicons. */
+void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb);
+
 /* Proportional sans-serif UI font for chrome (menus, titles, tabs, status).
  * Variable per-glyph advance; cell is UIFONT_W x UIFONT_H. gfx_ui_text blends
  * fg over the existing pixels (fill the background first), so it has no bg
@@ -162,10 +166,133 @@ int  textfield_key(struct textfield *tf, char c);
 enum { TABBAR_NONE = 0, TABBAR_SELECT, TABBAR_CLOSE, TABBAR_NEW };
 
 /* Draw the strip filling [x, x+w) at height GUI_TAB_H from y. The app fills no
- * background itself — the widget paints the whole strip. */
-void tabbar_draw(int x, int y, int w, const char *const *labels, int n, int active);
+ * background itself — the widget paints the whole strip. icons[i] is an optional
+ * 16x16 ARGB favicon for tab i (NULL -> a default globe); pass a NULL icons
+ * array to give every tab the globe. */
+void tabbar_draw(int x, int y, int w, const char *const *labels,
+                 const unsigned *const *icons, int n, int active);
 /* Hit-test a click at (mx,my) against the same geometry. Returns a TABBAR_*
  * code; for SELECT/CLOSE sets *index to the tab index. */
 int  tabbar_hit(int x, int y, int w, int n, int mx, int my, int *index);
+
+/* --------------------------------------------------------------- button */
+/*
+ * A clickable push button with a centred label — an "OK"/"Cancel"/"Connect"
+ * the way a dialog or toolbar wants one. Stateless like the tab strip: the app
+ * owns no widget struct, it just draws the button each frame with the visual
+ * state it's tracking and hit-tests clicks against the same rectangle.
+ *
+ * `state` selects the look. The app decides it: BTN_HOVER while the pointer is
+ * over the button (track the last mouse-move), BTN_PRESSED between mouse-down
+ * and mouse-up on it, BTN_DISABLED for an inert/dimmed button (button_hit still
+ * returns 0 for it so it can't fire), else BTN_NORMAL.
+ */
+#define GUI_BTN_H 26    /* a comfortable button height */
+
+enum { BTN_NORMAL = 0, BTN_HOVER, BTN_PRESSED, BTN_DISABLED };
+
+/* Draw the button filling [x,y,w,h] with `label` centred, in the given state. */
+void button_draw(int x, int y, int w, int h, const char *label, int state);
+/* Returns 1 if (mx,my) falls inside [x,y,w,h], 0 otherwise (geometry only — the
+ * app gates on its own disabled state before treating a hit as a press). */
+int  button_hit(int x, int y, int w, int h, int mx, int my);
+
+/* --------------------------------------------------------------- progress bar */
+/*
+ * A horizontal progress bar: a sunken trough with an accent-blue fill showing
+ * `value`/`max` (clamped to 0..max), for a download/copy/load. Stateless — the
+ * app passes the current counts each frame. With show_pct != 0 it overlays a
+ * centred "NN%" label; a value/max of N/0 reads as 0%.
+ */
+#define GUI_PROGRESS_H 16   /* a comfortable bar height */
+
+void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct);
+
+/* --------------------------------------------------------------- scrollbar */
+/*
+ * A vertical scrollbar: an up arrow, a track groove with a draggable thumb sized
+ * to the visible fraction of the content, and a down arrow — the way a scrolling
+ * document pane (the browser, a long listing) wants one. Stateless like the
+ * button/progress bar: the app owns the scroll position and passes the current
+ * counts each frame; the widget draws the chrome and maps a click back to either
+ * an arrow step or a new thumb position.
+ *
+ * Units are caller-defined — whatever `scroll` counts in (lines, rows, pixels) —
+ * as long as the three agree:
+ *  - `total`    total content extent
+ *  - `visible`  how much of it fits in the pane at once
+ *  - `scroll`   current top position, 0..(total - visible)
+ * When total <= visible the bar draws an empty (inert) track and scrollbar_pos
+ * returns 0 (nothing to scroll). The arrows are drawn only when [x,y,w,h] is tall
+ * enough to hold them plus a grabbable thumb; in a very short bar they collapse
+ * to a plain track, and scrollbar_hit then reports the whole bar as the track.
+ */
+#define GUI_SCROLL_W 10   /* a comfortable vertical scrollbar width */
+
+/* scrollbar_hit() outcomes: which part of the bar a click landed on. The app
+ * applies its own step for an arrow (one line/row), and uses scrollbar_pos for a
+ * track grab. */
+enum { SCROLLBAR_NONE = 0, SCROLLBAR_UP, SCROLLBAR_DOWN, SCROLLBAR_TRACK };
+
+/* Draw the scrollbar filling [x,y,w,h]: arrows top/bottom, then the track and a
+ * thumb reflecting scroll/total/visible (no thumb when everything fits). */
+void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible);
+/* Hit-test a click at (mx,my) against the same geometry: returns a SCROLLBAR_*
+ * region code (SCROLLBAR_NONE when the point is off the bar). */
+int  scrollbar_hit(int x, int y, int w, int h, int mx, int my);
+/* Map a track click/drag at (mx,my) to a new scroll position, centring the thumb
+ * on the cursor, clamped to 0..(total - visible). Returns the unchanged `scroll`
+ * when (mx,my) is outside the track region, so it can be called unconditionally. */
+int  scrollbar_pos(int x, int y, int w, int h, int mx, int my,
+                   int scroll, int total, int visible);
+
+/* --------------------------------------------------------------- sidebar */
+/*
+ * A resizable left navigation pane — the "Places / Devices" rail a file manager
+ * (or any master/detail window) puts down the left edge. The widget owns the
+ * pane's *width as a live property*: the app reads sb.w back to lay its content
+ * out, sets it directly with sidebar_set_width() (so the width is customizable),
+ * and — when `resizable` — the user drags the divider to change it, clamped to
+ * [min_w, max_w]. The widget paints the panel background plus a 1px divider and
+ * a grip dimple at the right edge; the app draws its own rows into [x, x+w).
+ *
+ * Bind once with sidebar_init(). Each frame: sidebar_draw() paints the panel +
+ * grip, then the app lays out its rows within the pane. Route mouse events:
+ *  - WEV_MOUSE  -> sidebar_press(): returns 1 if the press grabbed the divider
+ *                  grip (begin a resize; the app must NOT also treat it as a row
+ *                  click). A press that misses the grip clears any drag state.
+ *  - WEV_DRAG   -> sidebar_drag(): while a resize is live, sets the width from
+ *                  the pointer x (clamped); returns 1 if the width changed.
+ * The drag ends on its own when the button is released (no release event — the
+ * stop of WEV_DRAG ends it, and the next WEV_MOUSE re-evaluates the grip).
+ */
+#define SIDEBAR_GRIP 6   /* width of the divider's draggable hit zone (px) */
+
+struct sidebar {
+	int w;          /* current width — the live, app-readable property         */
+	int min_w;      /* lower clamp for a drag / set_width                       */
+	int max_w;      /* upper clamp for a drag / set_width                       */
+	int resizable;  /* 0 = a fixed pane: no grip, no drag (still has a divider) */
+	int dragging;   /* internal: a resize drag is in progress                   */
+};
+
+/* Initialise to width `w`, clamped into [min_w, max_w]; resizable by default. */
+void sidebar_init(struct sidebar *sb, int w, int min_w, int max_w);
+/* Set the width property directly (clamped to [min_w, max_w]). */
+void sidebar_set_width(struct sidebar *sb, int w);
+/* Paint the panel [x, x+w) x [y, y+h) in `bg`, the 1px divider at its right edge
+ * in `divider`, and (when resizable) a centred grip dimple on the divider. Pass
+ * the *effective* width the app is rendering (it may cap sb->w against the
+ * window); the divider/grip land at x+w. */
+void sidebar_draw(struct sidebar *sb, int x, int y, int w, int h, unsigned bg,
+                  unsigned divider);
+/* Hit-test a left-press at (mx,my) against the divider grip drawn at x+w over
+ * [y, y+h). On a hit, begin a resize and return 1; otherwise clear any stale
+ * drag and return 0. A non-resizable pane always returns 0. */
+int  sidebar_press(struct sidebar *sb, int x, int y, int w, int h,
+                   int mx, int my);
+/* Feed a WEV_DRAG x while a resize is live: set the width to (mx - x), clamped
+ * to [min_w, max_w]. Returns 1 if the width changed (repaint), else 0. */
+int  sidebar_drag(struct sidebar *sb, int x, int mx);
 
 #endif /* OWOS_GFX_H */

@@ -7,6 +7,10 @@
  * of tree depth and sidesteps HFS+'s gnarly Unicode key-ordering -- we only ever
  * compare keys for equality, case-insensitively over ASCII. File data is read
  * from the data fork's inline extents (allocation blocks -> device sectors).
+ *
+ * Multi-instance: every per-mount mutable global lives in a heap-allocated
+ * `struct hfs_mount`; each op takes one and threads it through. The driver is
+ * reached only through hfs_ops().
  */
 
 #include <stddef.h>
@@ -15,6 +19,7 @@
 #include "endian.h"
 #include "console.h"
 #include "kstring.h"
+#include "heap.h"
 
 static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 
@@ -26,19 +31,18 @@ static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 
 struct extent { uint32_t start, count; };   /* in allocation blocks */
 
-static struct {
-	hfs_read_fn read;
+/* All per-mount state. One per mounted volume, heap-allocated in hfs_probe. */
+struct hfs_mount {
+	blk_read_fn read;
 	uint32_t base;            /* absolute LBA of byte 0 of the volume */
-	int      mounted;
 	uint32_t block_size;      /* allocation block size (bytes) */
 	uint32_t total_blocks;
 	struct extent cat_ext[8]; /* catalog file fork extents */
 	uint32_t node_size;       /* catalog B-tree node size */
 	uint32_t first_leaf;      /* first leaf node index */
 	char     label[64];
-} vol;
-
-static uint8_t nodebuf[MAX_NODE];     /* one catalog node, reused (serialized) */
+	uint8_t  nodebuf[MAX_NODE]; /* one catalog node, reused per-mount */
+};
 
 /* A resolved catalog object. */
 struct obj {
@@ -51,13 +55,13 @@ struct obj {
 /* ------------------------------------------------------------- device I/O */
 
 /* Read `len` bytes from absolute device byte offset into buf (sector-by-sector). */
-static int dev_read(uint64_t byteoff, uint8_t *buf, uint32_t len)
+static int dev_read(struct hfs_mount *m, uint64_t byteoff, uint8_t *buf, uint32_t len)
 {
 	uint8_t s[512];
 	while (len) {
-		uint32_t lba  = vol.base + (uint32_t)(byteoff / 512);
+		uint32_t lba  = m->base + (uint32_t)(byteoff / 512);
 		uint32_t soff = (uint32_t)(byteoff % 512);
-		if (vol.read(lba, s) != 0)
+		if (m->read(lba, s) != 0)
 			return -1;
 		uint32_t n = 512 - soff;
 		if (n > len) n = len;
@@ -69,13 +73,13 @@ static int dev_read(uint64_t byteoff, uint8_t *buf, uint32_t len)
 
 /* Map a logical offset within the catalog file to an absolute device byte
  * offset, walking the catalog fork extents. Returns 0 on success. */
-static int cat_dev_off(uint64_t logoff, uint64_t *devoff)
+static int cat_dev_off(struct hfs_mount *m, uint64_t logoff, uint64_t *devoff)
 {
 	uint64_t pos = 0;
-	for (int i = 0; i < 8 && vol.cat_ext[i].count; i++) {
-		uint64_t span = (uint64_t)vol.cat_ext[i].count * vol.block_size;
+	for (int i = 0; i < 8 && m->cat_ext[i].count; i++) {
+		uint64_t span = (uint64_t)m->cat_ext[i].count * m->block_size;
 		if (logoff < pos + span) {
-			*devoff = (uint64_t)vol.cat_ext[i].start * vol.block_size +
+			*devoff = (uint64_t)m->cat_ext[i].start * m->block_size +
 			          (logoff - pos);
 			return 0;
 		}
@@ -84,22 +88,22 @@ static int cat_dev_off(uint64_t logoff, uint64_t *devoff)
 	return -1;
 }
 
-/* Read catalog node `idx` into nodebuf. */
-static int read_node(uint32_t idx)
+/* Read catalog node `idx` into m->nodebuf. */
+static int read_node(struct hfs_mount *m, uint32_t idx)
 {
 	uint64_t devoff;
-	if (cat_dev_off((uint64_t)idx * vol.node_size, &devoff) != 0)
+	if (cat_dev_off(m, (uint64_t)idx * m->node_size, &devoff) != 0)
 		return -1;
-	return dev_read(devoff, nodebuf, vol.node_size);
+	return dev_read(m, devoff, m->nodebuf, m->node_size);
 }
 
 /* ------------------------------------------------------- node/record access */
 
 /* Byte offset of record `i` within the current node (from the trailing offset
  * array: the last 2 bytes hold record 0's offset, etc.). */
-static uint32_t rec_off(int i)
+static uint32_t rec_off(struct hfs_mount *m, int i)
 {
-	return load_be16(nodebuf + vol.node_size - 2 * (i + 1));
+	return load_be16(m->nodebuf + m->node_size - 2 * (i + 1));
 }
 
 /* Convert an HFSUniStr255 name (UTF-16BE) to ASCII into out[cap]. */
@@ -122,14 +126,14 @@ struct catrec {
 	const uint8_t *data;      /* record body (after the key) */
 };
 
-static void parse_rec(int i, struct catrec *c)
+static void parse_rec(struct hfs_mount *m, int i, struct catrec *c)
 {
-	uint32_t ro = rec_off(i);
-	uint16_t keyLen = load_be16(nodebuf + ro);
-	c->parent  = load_be32(nodebuf + ro + 2);
-	c->namelen = load_be16(nodebuf + ro + 6);
-	c->name    = nodebuf + ro + 8;
-	c->data    = nodebuf + ro + 2 + keyLen;   /* key length excludes its field */
+	uint32_t ro = rec_off(m, i);
+	uint16_t keyLen = load_be16(m->nodebuf + ro);
+	c->parent  = load_be32(m->nodebuf + ro + 2);
+	c->namelen = load_be16(m->nodebuf + ro + 6);
+	c->name    = m->nodebuf + ro + 8;
+	c->data    = m->nodebuf + ro + 2 + keyLen;   /* key length excludes its field */
 	c->type    = load_be16(c->data);
 }
 
@@ -165,22 +169,24 @@ static void rec_to_obj(const struct catrec *c, struct obj *o)
 
 /* Iterate every catalog leaf record, calling visit(); stop early if it returns
  * non-zero (that value is returned). 0 if the whole tree was scanned. Reuses
- * nodebuf, so visit() must consume what it needs before returning to continue. */
-static int for_each_leaf(int (*visit)(const struct catrec *, void *), void *ctx)
+ * m->nodebuf, so visit() must consume what it needs before returning to continue. */
+static int for_each_leaf(struct hfs_mount *m,
+                         int (*visit)(struct hfs_mount *, const struct catrec *, void *),
+                         void *ctx)
 {
-	uint32_t node = vol.first_leaf;
+	uint32_t node = m->first_leaf;
 	int guard = 0;
 	while (node && guard++ < 1 << 20) {
-		if (read_node(node) != 0)
+		if (read_node(m, node) != 0)
 			return 0;
-		if (nodebuf[8] != 0xFF)               /* kind: leaf == 0xFF */
+		if (m->nodebuf[8] != 0xFF)            /* kind: leaf == 0xFF */
 			return 0;
-		int nrec = load_be16(nodebuf + 10);
-		uint32_t fLink = load_be32(nodebuf + 0);
+		int nrec = load_be16(m->nodebuf + 10);
+		uint32_t fLink = load_be32(m->nodebuf + 0);
 		for (int i = 0; i < nrec; i++) {
 			struct catrec c;
-			parse_rec(i, &c);
-			int r = visit(&c, ctx);
+			parse_rec(m, i, &c);
+			int r = visit(m, &c, ctx);
 			if (r)
 				return r;
 		}
@@ -207,8 +213,9 @@ static int names_match(const char *want, const char *have)
 	return want[i] == '\0' && have[i] == '\0';
 }
 
-static int visit_find2(const struct catrec *c, void *vp)
+static int visit_find2(struct hfs_mount *m, const struct catrec *c, void *vp)
 {
+	(void)m;
 	struct find_ctx *f = vp;
 	if (c->parent != f->parent || (c->type != 1 && c->type != 2))
 		return 0;
@@ -222,11 +229,11 @@ static int visit_find2(const struct catrec *c, void *vp)
 	return 0;
 }
 
-static int find_child(uint32_t parent, const char *name, struct obj *out)
+static int find_child(struct hfs_mount *m, uint32_t parent, const char *name, struct obj *out)
 {
 	struct find_ctx f;
 	f.parent = parent; f.name = name; f.found = 0;
-	for_each_leaf(visit_find2, &f);
+	for_each_leaf(m, visit_find2, &f);
 	if (!f.found)
 		return -1;
 	*out = f.out;
@@ -234,7 +241,7 @@ static int find_child(uint32_t parent, const char *name, struct obj *out)
 }
 
 /* Resolve `path` to an object. The root ("" / "/") is the folder CNID 2. */
-static int resolve(const char *path, struct obj *out)
+static int resolve(struct hfs_mount *m, const char *path, struct obj *out)
 {
 	out->is_dir = 1;
 	out->cnid   = ROOT_CNID;
@@ -260,7 +267,7 @@ static int resolve(const char *path, struct obj *out)
 		if (!out->is_dir)
 			return -1;
 		struct obj child;
-		if (find_child(out->cnid, name, &child) != 0)
+		if (find_child(m, out->cnid, name, &child) != 0)
 			return -1;
 		*out = child;
 	}
@@ -269,79 +276,77 @@ static int resolve(const char *path, struct obj *out)
 
 /* ------------------------------------------------------------- mounting */
 
-static int parse_volume_header(const uint8_t *vh)
+static int parse_volume_header(struct hfs_mount *m, const uint8_t *vh)
 {
 	uint16_t sig = load_be16(vh);
 	if (sig != HFS_SIG && sig != HFSX_SIG)
 		return -1;
-	vol.block_size   = load_be32(vh + 40);
-	vol.total_blocks = load_be32(vh + 44);
-	if (vol.block_size < 512 || (vol.block_size % 512) != 0)
+	m->block_size   = load_be32(vh + 40);
+	m->total_blocks = load_be32(vh + 44);
+	if (m->block_size < 512 || (m->block_size % 512) != 0)
 		return -1;
 
 	const uint8_t *cf = vh + 272;             /* catalogFile fork */
 	for (int i = 0; i < 8; i++) {
-		vol.cat_ext[i].start = load_be32(cf + 16 + i * 8);
-		vol.cat_ext[i].count = load_be32(cf + 16 + i * 8 + 4);
+		m->cat_ext[i].start = load_be32(cf + 16 + i * 8);
+		m->cat_ext[i].count = load_be32(cf + 16 + i * 8 + 4);
 	}
-	if (vol.cat_ext[0].count == 0)
+	if (m->cat_ext[0].count == 0)
 		return -1;
 	return 0;
 }
 
 /* The volume label is the name of the root folder's own catalog record, which
  * is the one folder record whose parent CNID is 1. */
-static int visit_label(const struct catrec *c, void *vp)
+static int visit_label(struct hfs_mount *m, const struct catrec *c, void *vp)
 {
 	(void)vp;
 	if (c->type == 1 && c->parent == 1) {
-		uni_ascii(c->name, c->namelen, vol.label, sizeof vol.label);
+		uni_ascii(c->name, c->namelen, m->label, sizeof m->label);
 		return 1;
 	}
 	return 0;
 }
 
-int hfs_mount(hfs_read_fn read, uint32_t base_lba)
+/* Mount the HFS+ volume whose Volume Header sits at byte 1024 of `base_lba`,
+ * reading through m->read. Returns 0 on success, -1 on failure. */
+static int hfs_mount(struct hfs_mount *m, uint32_t base_lba)
 {
 	uint8_t vh[512];
-	vol.mounted = 0;
-	vol.read = read;
-	vol.base = base_lba;
+	m->base = base_lba;
 
-	if (!read || read(base_lba + 2, vh) != 0)  /* volume header @ byte 1024 */
+	if (!m->read || m->read(base_lba + 2, vh) != 0)  /* volume header @ byte 1024 */
 		return -1;
-	if (parse_volume_header(vh) != 0)
+	if (parse_volume_header(m, vh) != 0)
 		return -1;
 
 	/* Catalog B-tree header is node 0: read its first sector for the header
 	 * record (treeDepth/rootNode/firstLeafNode/nodeSize at node+14). */
 	uint64_t devoff;
-	if (cat_dev_off(0, &devoff) != 0)
+	if (cat_dev_off(m, 0, &devoff) != 0)
 		return -1;
 	uint8_t hdr[512];
-	if (dev_read(devoff, hdr, 512) != 0)
+	if (dev_read(m, devoff, hdr, 512) != 0)
 		return -1;
 	const uint8_t *hr = hdr + 14;             /* BTHeaderRec */
-	vol.first_leaf = load_be32(hr + 10);
-	vol.node_size  = load_be16(hr + 18);
-	if (vol.node_size < 512 || vol.node_size > MAX_NODE ||
-	    (vol.node_size % 512) != 0)
+	m->first_leaf = load_be32(hr + 10);
+	m->node_size  = load_be16(hr + 18);
+	if (m->node_size < 512 || m->node_size > MAX_NODE ||
+	    (m->node_size % 512) != 0)
 		return -1;
 
-	vol.label[0] = '\0';
-	vol.mounted = 1;
-	for_each_leaf(visit_label, NULL);
-	if (!vol.label[0]) {
+	m->label[0] = '\0';
+	for_each_leaf(m, visit_label, NULL);
+	if (!m->label[0]) {
 		const char *d = "HFS+ Volume";
-		int i = 0; for (; d[i]; i++) vol.label[i] = d[i]; vol.label[i] = '\0';
+		int i = 0; for (; d[i]; i++) m->label[i] = d[i]; m->label[i] = '\0';
 	}
 	return 0;
 }
 
-
 /* Read `len` bytes from absolute device byte offset using a raw read callback
- * (used during probing, before vol.read/base are set). */
-static int raw_read(hfs_read_fn read, uint64_t byteoff, uint8_t *buf, uint32_t len)
+ * (used during probing, before m->read/base are set). */
+static int raw_read(blk_read_fn read, uint64_t byteoff, uint8_t *buf, uint32_t len)
 {
 	uint8_t s[512];
 	while (len) {
@@ -358,9 +363,9 @@ static int raw_read(hfs_read_fn read, uint64_t byteoff, uint8_t *buf, uint32_t l
 }
 
 /* Try a whole-disk mount, then GPT partitions, then an Apple Partition Map. */
-static int probe(hfs_read_fn read)
+static int probe(struct hfs_mount *m, blk_read_fn read)
 {
-	if (hfs_mount(read, 0) == 0)
+	if (hfs_mount(m, 0) == 0)
 		return 0;
 
 	uint8_t sec[512];
@@ -381,7 +386,7 @@ static int probe(hfs_read_fn read)
 			for (int b = 0; b < 16; b++) if (ent[b]) { empty = 0; break; }
 			if (empty) continue;
 			uint64_t first = (uint64_t)load_le32(ent + 32) | ((uint64_t)load_le32(ent + 36) << 32);
-			if (first && hfs_mount(read, (uint32_t)first) == 0)
+			if (first && hfs_mount(m, (uint32_t)first) == 0)
 				return 0;
 		}
 	}
@@ -394,37 +399,19 @@ static int probe(hfs_read_fn read)
 			if (read(i, sec) != 0) break;
 			if (sec[0] != 0x50 || sec[1] != 0x4D) continue;
 			uint32_t pstart = load_be32(sec + 8);     /* pmPyPartStart */
-			if (pstart && hfs_mount(read, pstart) == 0)
+			if (pstart && hfs_mount(m, pstart) == 0)
 				return 0;
 		}
 	}
 	return -1;
 }
 
-int hfs_mount_probe(hfs_read_fn read)
-{
-	if (!read)
-		return -1;
-	return probe(read);
-}
-
-void hfs_unmount(void)
-{
-	vol.mounted = 0;
-	vol.label[0] = '\0';
-}
-
-int hfs_mounted(void) { return vol.mounted; }
-const char *hfs_label(void) { return vol.mounted ? vol.label : ""; }
-const char *hfs_type(void) { return vol.mounted ? "HFS+" : "none"; }
-
 /* ------------------------------------------------------------- public reads */
 
-int hfs_stat(const char *path, int *is_dir, uint32_t *size)
+static int hfs_stat(struct hfs_mount *m, const char *path, int *is_dir, uint32_t *size)
 {
-	if (!vol.mounted) return -2;
 	struct obj o;
-	if (resolve(path, &o) != 0) return -1;
+	if (resolve(m, path, &o) != 0) return -1;
 	if (is_dir) *is_dir = o.is_dir;
 	if (size)   *size = (uint32_t)o.size;
 	return 0;
@@ -441,8 +428,9 @@ struct list_ctx {
 	int      hit;
 };
 
-static int visit_list(const struct catrec *c, void *vp)
+static int visit_list(struct hfs_mount *m, const struct catrec *c, void *vp)
 {
+	(void)m;
 	struct list_ctx *L = vp;
 	if (c->parent != L->parent || (c->type != 1 && c->type != 2))
 		return 0;
@@ -474,32 +462,32 @@ static int visit_list(const struct catrec *c, void *vp)
 	return 0;
 }
 
-int hfs_list(const char *path)
+static int hfs_list(struct hfs_mount *m, const char *path)
 {
-	if (!vol.mounted) return -2;
 	struct obj d;
-	if (resolve(path, &d) != 0) return -1;
+	if (resolve(m, path, &d) != 0) return -1;
 	if (!d.is_dir) return -1;
 	struct list_ctx L = { d.cnid, -1, 0, 0, 0, 0, 0 };
-	for_each_leaf(visit_list, &L);
+	for_each_leaf(m, visit_list, &L);
 	return 0;
 }
 
-int hfs_enum_dir(const char *path, int idx, char *name, int *is_dir, uint32_t *size)
+static int hfs_enum_dir(struct hfs_mount *m, const char *path, int idx,
+                        char *name, int *is_dir, uint32_t *size)
 {
-	if (!vol.mounted || idx < 0) return 0;
+	if (idx < 0) return 0;
 	struct obj d;
-	if (resolve(path, &d) != 0 || !d.is_dir) return 0;
+	if (resolve(m, path, &d) != 0 || !d.is_dir) return 0;
 	struct list_ctx L = { d.cnid, idx, 0, name, is_dir, size, 0 };
-	for_each_leaf(visit_list, &L);
+	for_each_leaf(m, visit_list, &L);
 	return L.hit;
 }
 
-int hfs_read_at(const char *path, uint32_t offset, void *buf, uint32_t len)
+static int hfs_read_at(struct hfs_mount *m, const char *path, uint32_t offset,
+                       void *buf, uint32_t len)
 {
-	if (!vol.mounted) return -2;
 	struct obj o;
-	if (resolve(path, &o) != 0 || o.is_dir) return -1;
+	if (resolve(m, path, &o) != 0 || o.is_dir) return -1;
 	if (offset >= o.size) return 0;
 	if (offset + len > o.size) len = (uint32_t)(o.size - offset);
 
@@ -509,23 +497,92 @@ int hfs_read_at(const char *path, uint32_t offset, void *buf, uint32_t len)
 		uint32_t cur = offset + got;
 		uint64_t pos = 0; int fi = -1; uint64_t within = 0;
 		for (int i = 0; i < 8 && o.ext[i].count; i++) {
-			uint64_t span = (uint64_t)o.ext[i].count * vol.block_size;
+			uint64_t span = (uint64_t)o.ext[i].count * m->block_size;
 			if (cur < pos + span) { fi = i; within = cur - pos; break; }
 			pos += span;
 		}
 		if (fi < 0) break;                    /* beyond inline extents */
-		uint64_t devoff = (uint64_t)o.ext[fi].start * vol.block_size + within;
-		uint64_t remain = (uint64_t)o.ext[fi].count * vol.block_size - within;
+		uint64_t devoff = (uint64_t)o.ext[fi].start * m->block_size + within;
+		uint64_t remain = (uint64_t)o.ext[fi].count * m->block_size - within;
 		uint32_t chunk = len - got;
 		if (chunk > remain) chunk = (uint32_t)remain;
-		if (dev_read(devoff, dst + got, chunk) != 0)
+		if (dev_read(m, devoff, dst + got, chunk) != 0)
 			return got ? (int)got : -1;
 		got += chunk;
 	}
 	return (int)got;
 }
 
-int hfs_read(const char *path, void *buf, uint32_t max)
+/* ------------------------------------------------------------- fs_ops vtable */
+
+static void *hfs_op_probe(blk_read_fn read, blk_write_fn write)
 {
-	return hfs_read_at(path, 0, buf, max);
+	(void)write;                              /* read-only */
+	if (!read)
+		return NULL;
+	struct hfs_mount *m = kmalloc(sizeof *m);
+	if (!m)
+		return NULL;
+	m->read = read;
+	if (probe(m, read) != 0) {
+		kfree(m);
+		return NULL;
+	}
+	return m;
 }
+
+static void hfs_op_close(void *inst)
+{
+	kfree(inst);
+}
+
+static const char *hfs_op_label(void *inst)
+{
+	return ((struct hfs_mount *)inst)->label;
+}
+
+static const char *hfs_op_type(void *inst)
+{
+	(void)inst;
+	return "HFS+";
+}
+
+static int hfs_op_list(void *inst, const char *path)
+{
+	return hfs_list(inst, path);
+}
+
+static int hfs_op_stat(void *inst, const char *path, int *is_dir, uint32_t *size)
+{
+	return hfs_stat(inst, path, is_dir, size);
+}
+
+static int hfs_op_read_at(void *inst, const char *path, uint32_t off,
+                          void *buf, uint32_t len)
+{
+	return hfs_read_at(inst, path, off, buf, len);
+}
+
+static int hfs_op_enum_dir(void *inst, const char *path, int idx,
+                           char *name, int *is_dir, uint32_t *size)
+{
+	return hfs_enum_dir(inst, path, idx, name, is_dir, size);
+}
+
+static const struct fs_ops hfs_fs_ops = {
+	.fsname   = "HFS+",
+	.probe    = hfs_op_probe,
+	.close    = hfs_op_close,
+	.label    = hfs_op_label,
+	.type     = hfs_op_type,
+	.list     = hfs_op_list,
+	.stat     = hfs_op_stat,
+	.read_at  = hfs_op_read_at,
+	.enum_dir = hfs_op_enum_dir,
+	.create   = NULL,
+	.del      = NULL,
+	.mkdir    = NULL,
+	.rmdir    = NULL,
+};
+
+const struct fs_ops *hfs_ops(void) { return &hfs_fs_ops; }

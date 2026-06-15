@@ -49,6 +49,8 @@ typedef struct task {
 	uint32_t      runs;
 	struct fd     fds[MAX_FD]; /* open file descriptors                        */
 	char          cwd[TASK_CWD_MAX]; /* working dir; relative path syscalls join here */
+	uint32_t      brk;         /* user-space heap break; 0 = no heap (thread/kthread) */
+	uint32_t      brk_base;    /* heap start (image end); sbrk can't shrink below it  */
 	struct task  *next;
 } task_t;
 
@@ -101,6 +103,19 @@ static task_t *alloc_task(void)
 	return 0;
 }
 
+/* The task that owns `t`'s heap: itself if it's a process (dir != 0), else the
+ * process whose address space it shares (a thread, dir == 0, same cr3). The heap
+ * (break + frames) is per-address-space, so every thread sbrk's the one owner. */
+static task_t *heap_owner_of(task_t *t)
+{
+	if (t->dir)
+		return t;
+	for (int i = 0; i < MAX_TASKS; i++)
+		if (tasks[i].state != TASK_FREE && tasks[i].dir && tasks[i].cr3 == t->cr3)
+			return &tasks[i];
+	return t;
+}
+
 /* Splice t into the run queue right after the main task. */
 static void enqueue(task_t *t)
 {
@@ -131,6 +146,7 @@ void sched_init(void)
 	t->kstack_top = 0;             /* a kernel thread: never traps to ring 0   */
 	t->state = TASK_RUNNABLE;
 	t->intr = 0;
+	t->brk = t->brk_base = 0;      /* no user heap                             */
 	cwd_set(t->cwd, "/");
 	t->next = t;
 	current = t;
@@ -151,6 +167,7 @@ void sched_create_thread(const char *name, void (*entry)(void))
 	t->dir = 0;
 	t->kstack_top = 0;
 	t->state = TASK_RUNNABLE;
+	t->brk = t->brk_base = 0;       /* kernel thread: no user heap             */
 
 	uint8_t *stack = kmalloc(KSTACK_SIZE);
 	t->intr = 0;
@@ -166,12 +183,13 @@ void sched_create_thread(const char *name, void (*entry)(void))
 }
 
 int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
-                         uint32_t user_esp)
+                         uint32_t user_esp, uint32_t brk)
 {
 	task_t *t = alloc_task();
 	if (!t)
 		return -1;
 	t->id = next_id++;
+	t->brk = t->brk_base = brk;     /* the process's heap (shared by its threads) */
 	{	/* copy the program name so it persists (callers pass argv[0]) */
 		int i = 0;
 		for (; name && name[i] && i < (int)sizeof t->namebuf - 1; i++)
@@ -208,6 +226,51 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
 	return (int)t->id;
 }
 
+/* Move the caller's process break by `inc` bytes (the malloc primitive), mapping
+ * fresh zeroed window pages on growth or freeing whole pages on shrink. Returns
+ * the PREVIOUS break, or (uint32_t)-1 on failure. Runs in the int 0x80 gate with
+ * IF clear, so it is atomic against the other threads that share this heap — no
+ * lock needed on the kernel side. */
+uint32_t sched_sbrk(int inc)
+{
+	task_t *o = heap_owner_of(current);
+	if (o->brk == 0)                          /* not a process with a heap */
+		return (uint32_t)-1;
+	uint32_t old = o->brk;
+	if (inc == 0)
+		return old;
+	if (inc > 0) {
+		uint32_t add = (uint32_t)inc;
+		if (old >= USER_HEAP_MAX || add > USER_HEAP_MAX - old)
+			return (uint32_t)-1;              /* would run into the user stack */
+		uint32_t newbrk  = old + add;
+		uint32_t old_top = (old + 0xFFFu) & ~0xFFFu;
+		uint32_t new_top = (newbrk + 0xFFFu) & ~0xFFFu;
+		if (new_top > old_top && paging_user_grow(o->dir, old_top, new_top) < 0)
+			return (uint32_t)-1;              /* out of physical memory */
+		o->brk = newbrk;
+		return old;
+	}
+	uint32_t dec = (uint32_t)(-inc);
+	if (dec > old - o->brk_base)               /* never shrink below the heap base */
+		dec = old - o->brk_base;
+	uint32_t newbrk  = old - dec;
+	uint32_t old_top = (old + 0xFFFu) & ~0xFFFu;
+	uint32_t new_top = (newbrk + 0xFFFu) & ~0xFFFu;
+	if (old_top > new_top)
+		paging_user_shrink(o->dir, new_top, old_top);
+	o->brk = newbrk;
+	return old;
+}
+
+/* Reset the caller's heap base + break (the image-replace syscall, after it swaps
+ * in a new program image whose end is the new heap start). */
+void sched_set_brk(uint32_t brk)
+{
+	task_t *o = heap_owner_of(current);
+	o->brk = o->brk_base = brk;
+}
+
 /* Spawn a thread inside the CURRENT process: a new task that SHARES the
  * caller's address space (same CR3) and runs `entry` in ring 3 on the
  * caller-provided user stack. dir=0 so its reap never frees the shared address
@@ -225,6 +288,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
 	t->runs = 0;
 	t->cr3 = current->cr3;          /* share the creator's address space      */
 	t->dir = 0;                     /* not the owner: don't free it on reap    */
+	t->brk = t->brk_base = 0;       /* heap belongs to the process; sbrk redirects */
 	t->parent = current->id;
 	t->state = TASK_RUNNABLE;
 	t->intr = 0;
@@ -276,6 +340,10 @@ int sched_fork(struct registers *r)
 	t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
 	t->state = TASK_RUNNABLE;
 	t->intr = 0;
+	/* The child owns a private copy of the parent's address space (paging_fork_dir
+	 * duplicated every window page, heap included), so it inherits the break. */
+	{	task_t *o = heap_owner_of(current);
+		t->brk = o->brk; t->brk_base = o->brk_base; }
 	cwd_set(t->cwd, current->cwd);
 
 	/* The child inherits the parent's open files (Unix semantics). */
@@ -433,6 +501,19 @@ void sched_kill(int pid)
 			parent->state = TASK_RUNNABLE;
 	}
 	if (fl & 0x200) __asm__ volatile ("sti");
+}
+
+/* Kill a task only if it is a child of the caller -- the guard behind SYS_KILL,
+ * so a process can abort a command it spawned (e.g. on window close) but
+ * not an unrelated task. Returns 0 on a kill, -1 if pid isn't our live child. */
+int sched_kill_child(int pid)
+{
+	task_t *t = find_task((uint32_t)pid);
+	if (!t || t->parent != current->id ||
+	    t->state == TASK_FREE || t->state == TASK_ZOMBIE)
+		return -1;
+	sched_kill(pid);
+	return 0;
 }
 
 /* Cooperative interrupt (a minimal SIGINT). sched_set_intr raises the latch on a

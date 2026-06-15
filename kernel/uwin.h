@@ -1,4 +1,4 @@
-/* uwin.h — the ring-3 windowing layer (user-window server).
+/* uwin.h — the windowing layer (user-window server).
  *
  * Lets a user process own a desktop window: it creates one, gets a shared
  * client-area pixel buffer mapped into its address space (at WIN_FB_VADDR),
@@ -6,7 +6,7 @@
  * keeps a struct window in the WM whose draw() blits the user's buffer and
  * whose click/key callbacks enqueue events for the process to poll.
  *
- * Reached from ring 3 through the SYS_WIN_* syscalls (see syscall.c); the
+ * Reached from user space through the SYS_WIN_* syscalls (see syscall.c); the
  * functions here run in the calling process's context, so user pointers are
  * caller-validated and dereferenced directly.
  */
@@ -30,6 +30,7 @@
 #define WEV_DBLCLICK 5                 /* a,b: client x,y of a double click     */
 #define WEV_RCLICK 6                   /* a,b: client x,y of a right click      */
 #define WEV_SCROLL 7                   /* a: mouse-wheel delta (+up / -down)    */
+#define WEV_DRAG   8                   /* a,b: client x,y, left button held+moving */
 
 struct win_event {
 	uint32_t type;
@@ -45,6 +46,11 @@ int  uwin_set_title(int id, const char *title);       /* -> 0 / -1              
 int  uwin_set_resizable(int id, int on);              /* app opts into resizing */
 int  uwin_set_cursor(int id, int cursor);             /* enum wm_cursor for the
                                                          window's client area     */
+
+/* Free slots in a window's input event ring (1<<30 for non-uwin windows). The
+ * WM uses it for clipboard-paste flow control — see uwin_key_space() / wm.c. */
+struct window;
+int  uwin_key_space(struct window *w);
 
 /* Called from sched_exit(): detach every window owned by the exiting task. The
  * client buffer is freed later by the WM via uwin_reap() (see uwin.c). */

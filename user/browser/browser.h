@@ -1,11 +1,11 @@
-/* browser.h — shared state and helpers for the ring-3 web browser.
+/* browser.h — shared state and helpers for the web browser.
  *
  * The app is split across:
  *   html.c   URL parsing/resolution + HTML -> styled text + link extraction
  *   fetch.c  the HTTP/HTTPS transport: buffered reader, cookies, redirects
  *   main.c   the windowed UI: draw, word-wrap, input, and the event loop
  *
- * It runs entirely in ring 3 over the windowing + net syscalls. All buffers
+ * It runs entirely in user space over the windowing + net syscalls. All buffers
  * live in one static `struct browser` (no kmalloc in user space); sizes are
  * trimmed to fit the per-process user window.
  */
@@ -17,12 +17,12 @@
 #include "inflate.h"
 #include "upng.h"
 #include "url.h"     /* struct purl, parse_url, resolve_url (shared with curl) */
+#include "h2.h"      /* HTTP/2 engine: h2_run + struct h2_opts (TLS+ALPN path) */
 
 extern int BW, BH;         /* client size (mutable: the window is resizable)    */
 #define MENU_H    18       /* top app-menu bar height (above the address bar)  */
 #define TAB_H     24       /* tab strip height (between menu and address bar)  */
 #define ADDR_H    26       /* address-bar height                               */
-#define STATUS_H  20       /* bottom status-line height                        */
 #define GLYPH_W   8
 #define GLYPH_H   16
 #define SCROLL_W  10       /* right-edge scrollbar width                       */
@@ -40,6 +40,8 @@ extern int BW, BH;         /* client size (mutable: the window is resizable)    
 #define MAX_HSTS    16     /* hosts that sent Strict-Transport-Security        */
 #define MAX_INL_IMG 16     /* inline <img> per page                            */
 #define IMG_POOL   (8 * 1024 * 1024)  /* shared store for inline images' bytes */
+#define FAVICON_W  16      /* favicon decoded to a fixed 16x16 ARGB bitmap and */
+#define FAVICON_H  16      /* shown in the page's tab (0xAARRGGBB per pixel)   */
 
 #define ST_COLOR   0x0F
 #define ST_BOLD    0x10
@@ -62,6 +64,10 @@ struct inl_img {
 	int      ok;             /* 1 = img_pool holds a decodable PNG            */
 	unsigned iw, ih;         /* natural pixel dimensions                      */
 	int      coff, clen;     /* its PNG bytes within img_pool                 */
+	int      lazy;           /* 1 = loading="lazy": fetch only when in view   */
+	int      want;           /* UI flag: a lazy image is now scrolled in      */
+	int      fetched;        /* 1 = a fetch has been attempted (ok = result)  */
+	int      cw, ch;         /* width/height from the attr or CSS, px (0=auto) */
 };
 
 struct browser {
@@ -71,7 +77,6 @@ struct browser {
 	int      req_pending;
 	int      loading;
 
-	char     status[160];
 	char     doc_title[128];
 	char     ctype[80];              /* lowercased response Content-Type      */
 	char     dl_name[128];           /* filename from Content-Disposition     */
@@ -92,6 +97,16 @@ struct browser {
 	int      n_imgs;
 	unsigned char img_pool[IMG_POOL];   /* their PNG bytes, packed             */
 	int      img_pool_len;
+
+	/* Favicon for the current page. favicon_href is discovered from a
+	 * <link rel=icon> while parsing the HTML (empty -> the /favicon.ico
+	 * default); favicon_pri ranks the captured link so a real icon beats an
+	 * apple-touch one. After fetch_favicon decodes it, favicon[] holds the
+	 * 16x16 ARGB bitmap the tab strip draws and favicon_ok flags it valid. */
+	char     favicon_href[256];
+	int      favicon_pri;            /* 0 none, 1 apple-touch, 2 standard icon */
+	unsigned favicon[FAVICON_W * FAVICON_H];
+	int      favicon_ok;
 
 	int      line_off[MAX_LINES];
 	int      line_len[MAX_LINES];
@@ -138,7 +153,8 @@ static inline void uapp(char *d, int *n, int cap, unsigned v)
 void html_to_text(void);
 void plain_to_text(void);                                  /* html.c */
 void doc_message(const char *m);
-void set_status(const char *s);                            /* fetch.c */
+void show_error(const char *m);                            /* fetch.c */
 void do_fetch(void);
+int  fetch_lazy_visible(void);   /* worker: load one in-view loading=lazy <img> */
 
 #endif /* OWOS_BROWSER_H */

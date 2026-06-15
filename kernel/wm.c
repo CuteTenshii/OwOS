@@ -1043,6 +1043,18 @@ int wm_focus_takes_keys(void)
 	return t >= 0 && wins[t].key != 0;
 }
 
+/* Free space in the focused window's key-event sink, for paste flow control.
+ * A huge number when nothing focused, or the focused window doesn't queue keys
+ * (e.g. the shell's own line editor) — those paths absorb keys without a bounded
+ * ring, so a paste need not be throttled for them. */
+int wm_focus_key_space(void)
+{
+	int t = topmost_visible();
+	if (t < 0 || !wins[t].key)
+		return 1 << 30;
+	return uwin_key_space(&wins[t]);
+}
+
 /* ---------------------------------------------------------------- the thread */
 
 /* Damage list: the rectangles that changed this frame. The compositor redraws
@@ -1102,7 +1114,7 @@ static void wm_thread(void)
 		int rst;
 		while (sched_try_reap(-1, &rst))
 			;
-		crash_pump();              /* surface any ring-3 crash as a window      */
+		crash_pump();              /* surface any crash as a window            */
 		uwin_reap();               /* free buffers of windows torn down off-thread,
 		                              now that we (the WM) are not mid-blit       */
 

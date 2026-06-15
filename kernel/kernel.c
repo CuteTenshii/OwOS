@@ -80,19 +80,15 @@ static void spinner(void)
  * thread runs with IF=1, so the "must run after sti" timer_sleep paths are happy. */
 static void boot_bringup(void)
 {
-	bootmark("dhcp");
-	net_dhcp_start();              /* lease IP/gw/dns on the boot NIC. No-op if no */
-	                               /* NIC; on QEMU SLIRP re-leases 10.0.2.15.      */
-
+	/* DHCP is now the autostart "dhcp" service (services.c), so the boot lease
+	 * happens there; this thread only does the slow USB bring-up. */
 	bootmark("xhci");
-	xhci_boot();                   /* USB host up + devices configured. Keeps a    */
-	                               /* tethered phone offering USB tethering. No      */
-	                               /* auto-mount: removable volumes mount on demand  */
-	                               /* via the `mount` command.                       */
+	xhci_boot();                   /* USB host up + devices configured.            */
 
 	bootmark("vmtools");
 	vmtools_init();                /* VMware guest agent: clock sync + guestinfo +   */
-	                               /* heartbeat over the backdoor. No-op off VMware. */
+	                               /* heartbeat + clipboard sync over the backdoor.  */
+	                               /* No-op off VMware.                              */
 
 	sched_exit(0);                 /* one-shot: done, leave a zombie to reap        */
 }
@@ -343,12 +339,13 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	blk_init();                    /* pick owofs's backing disk: IDE>AHCI>NVMe */
 	fs_init();                     /* mount it (auto-format only the IDE disk) */
 	/* No auto-mount of removable volumes at boot — they mount only when asked,
-	 * via the `mount` command or the Files app's Connect button (blk_mount_fat /
-	 * blk_mount_device). */
+	 * via `mount <dev> <point>` or the Files app's Connect button (fs_mount, which
+	 * probes the device and adds it to fs.c's mount table). Several can be mounted
+	 * at once, each at its own /media/<name>. */
 
 	syscall_init();                /* int 0x80 gate (DPL 3)                   */
 
-	/* Install the embedded ring-3 programs onto the disk if absent. */
+	/* Install the embedded programs onto the disk if absent. */
 	{
 		extern const unsigned char _binary_user_edit_elf_start[];
 		extern const unsigned char _binary_user_edit_elf_end[];
@@ -382,6 +379,10 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		extern const unsigned char _binary_user_dig_elf_end[];
 		extern const unsigned char _binary_user_torrent_elf_start[];
 		extern const unsigned char _binary_user_torrent_elf_end[];
+		extern const unsigned char _binary_user_player_elf_start[];
+		extern const unsigned char _binary_user_player_elf_end[];
+		extern const unsigned char _binary_user_settings_elf_start[];
+		extern const unsigned char _binary_user_settings_elf_end[];
 		char probe;
 		/* A Unix-like layout: programs in /bin, a home for the user. mkdir is
 		 * a no-op if the directory already exists from a previous boot. */
@@ -453,6 +454,14 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			fs_create("/bin/torrent", _binary_user_torrent_elf_start,
 			          (uint32_t)(_binary_user_torrent_elf_end -
 			                     _binary_user_torrent_elf_start));
+		if (fs_read("/bin/player", &probe, 0) < 0)
+			fs_create("/bin/player", _binary_user_player_elf_start,
+			          (uint32_t)(_binary_user_player_elf_end -
+			                     _binary_user_player_elf_start));
+		if (fs_read("/bin/settings", &probe, 0) < 0)
+			fs_create("/bin/settings", _binary_user_settings_elf_start,
+			          (uint32_t)(_binary_user_settings_elf_end -
+			                     _binary_user_settings_elf_start));
 	}
 	con_write("usermode: ready ('run curl <url>').\n");
 
@@ -464,7 +473,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	sched_init();                  /* current context becomes task "main"     */
 	sched_create_thread("spin-a", spinner);
 	sched_create_thread("spin-b", spinner);
-	shell_stream_start();          /* producer thread for the terminal's streamed cmds */
 	con_write("scheduler: 2 worker threads spawned.\n");
 
 	services_init();               /* supervisor thread + auto-start daemons   */
@@ -489,14 +497,14 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
 	for (;;) {
 		if (keyboard_take_interrupt()) {   /* Ctrl+C                           */
-			/* Route it: a streamed terminal command aborts (kill a CLI child);
-			 * a focused GUI app with no command swallows it; only the bare
-			 * text/serial console falls through to the kernel shell -- otherwise
-			 * the kernel shell would inject "^C"+prompt into the ring-3 term. */
-			if (shell_stream_active())
-				shell_stream_interrupt();   /* echo ^C + cooperative abort  */
-			else if (!wm_focus_takes_keys())
-				shell_interrupt();
+			/* A focused app gets KEY_INTR delivered as a key event so its
+			 * own shell cancels the line / kills the captured child (a real
+			 * Konsole-style Ctrl+C); only the bare text/serial recovery console
+			 * falls through to the kernel shell. */
+			if (wm_focus_takes_keys())
+				wm_feed_key(KEY_INTR);      /* focused app handles it */
+			else
+				shell_interrupt();          /* serial recovery console      */
 		}
 		char c;
 		while (keyboard_poll(&c))          /* PS/2 keyboard (the QEMU window)  */

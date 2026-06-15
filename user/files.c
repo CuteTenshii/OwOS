@@ -1,4 +1,4 @@
-/* files.c — a navigable file explorer for owofs, as a ring-3 app.
+/* files.c — a navigable file explorer for owofs.
  *
  * Ports the former kernel app_files.c: a top "Go" menu bar (mirroring the
  * editor's File menu), a left "Places" sidebar, plus a path header and
@@ -14,8 +14,15 @@ static int W = 320, H = 380;    /* client size; changes on resize */
 #define HEADER_H 18
 #define ROW_H    16
 #define FMAX     64
-#define SIDEBAR_W 96
+#define SIDEBAR_W   96   /* default sidebar width (a customizable property)   */
+#define SIDEBAR_MIN 64   /* narrowest the divider drag may make it            */
+#define SIDEBAR_MAX 220  /* widest                                            */
 #define LIST_TOP (MENU_H + HEADER_H)   /* y of the first places/list row */
+
+/* The left navigation pane is a gfx sidebar widget: it owns its width as a
+ * resizable property (drag the divider, clamped to [MIN,MAX]); we draw our own
+ * Places/Devices rows into it. */
+static struct sidebar sb;
 
 struct fent { char name[20]; int is_dir; unsigned size; };
 
@@ -179,9 +186,12 @@ static void draw_connect(int x, int y, unsigned c)
 	gfx_fill_rect(x + 1, y + 7, 5, 1, c);
 }
 
+/* The width actually rendered this frame: the widget's property width, capped so
+ * the file list always keeps ~80px (a narrow window can't be all sidebar). The
+ * property itself (sb.w) is unchanged — only the on-screen pane is clamped. */
 static int sidebar_w(void)
 {
-	int sbw = SIDEBAR_W;
+	int sbw = sb.w;
 	if (sbw > W - 80) sbw = W - 80;
 	if (sbw < 0) sbw = 0;
 	return sbw;
@@ -213,8 +223,9 @@ static void render(void)
 	refresh();
 	int sbw = sidebar_w();
 
-	/* Sidebar. */
-	gfx_fill_rect(0, 0, sbw, H, 0x0e1218);
+	/* Sidebar: the widget paints the panel base, the right divider and the
+	 * resize grip; we overdraw the header strip and the Places/Devices rows. */
+	sidebar_draw(&sb, 0, 0, sbw, H, 0x0e1218, 0x05070a);
 	gfx_fill_rect(0, MENU_H, sbw, HEADER_H, 0x161d28);
 	gfx_ui_text(6, MENU_H + 1, "Places", 0x8aa0b8);
 	for (int i = 0; i < NPLACES; i++) {
@@ -234,7 +245,7 @@ static void render(void)
 		for (int i = 0; i < nvols; i++) {
 			int ry = dev_row_y(i);
 			int mounted = vols[i].mounted;
-			int here = mounted && under_path(path, vols[i].path);
+			int here = mounted && under_path(path, vols[i].point);
 			unsigned rbg = here ? 0x24405c : 0x0e1218;
 			if (here) gfx_fill_rect(0, ry, sbw, ROW_H, rbg);
 			unsigned fg = here ? 0xffffff : (mounted ? 0xc8d0dc : 0x8a96a4);
@@ -243,7 +254,6 @@ static void render(void)
 			else         draw_connect(sbw - EJECT_W + 2, ry + 3, 0x8aa0b8);
 		}
 	}
-	gfx_fill_rect(sbw, 0, 1, H, 0x05070a);
 
 	/* File list. */
 	int lx = sbw + 1, lw = W - sbw - 1;
@@ -372,7 +382,7 @@ struct ctx_item { const char *label; int act; };
 static const struct ctx_item ci_file[]   = { {"Open", A_OPEN}, {"Edit", A_EDIT} };
 static const struct ctx_item ci_dir[]     = { {"Open", A_OPEN} };
 static const struct ctx_item ci_place[]   = { {"Open", A_OPEN} };
-static const struct ctx_item ci_device[]  = { {"Open", A_OPEN}, {"Eject", A_EJECT} };
+static const struct ctx_item ci_device[]  = { {"Open", A_OPEN}, {"Unmount", A_EJECT} };
 static const struct ctx_item ci_device_off[] = { {"Connect", A_CONNECT} };
 static const struct ctx_item ci_bg[]      = { {"Refresh", A_REFRESH},
                                               {"Go Up", A_UP}, {"Home", A_HOME} };
@@ -448,18 +458,19 @@ static void ctx_run(int act, int id)
 		} else if (ctx.kind == CTX_PLACE) {
 			goto_path(places[ctx.target].path); set_title(id);
 		} else if (ctx.kind == CTX_DEVICE) {
-			goto_path(vols[ctx.target].path); set_title(id);
+			goto_path(vols[ctx.target].point); set_title(id);
 		}
 		break;
 	case A_EDIT:   open_with(ctx.name, "editor"); break;
 	case A_CONNECT:
 		if (ctx.target >= 0 && ctx.target < nvols) {
-			mount(vols[ctx.target].kind); set_title(id);
+			char pt[40]; strcpy(pt, "/media/"); strcat(pt, vols[ctx.target].dev);
+			mount(vols[ctx.target].dev, pt); set_title(id);
 		}
 		break;
 	case A_EJECT:
-		if (eject(vols[ctx.target].path) == 0 &&
-		    under_path(path, vols[ctx.target].path)) {
+		if (umount(vols[ctx.target].point) == 0 &&
+		    under_path(path, vols[ctx.target].point)) {
 			goto_path("/"); set_title(id);
 		}
 		break;
@@ -574,6 +585,10 @@ static void click(int id, int mx, int my)
 	int sbw = sidebar_w();
 	refresh();
 
+	/* Divider grip: grab it to resize the sidebar. Consumes the press (and the
+	 * following WEV_DRAG motion) so it isn't also taken as a row click. */
+	if (sidebar_press(&sb, 0, 0, sbw, H, mx, my)) { seq++; return; }
+
 	if (mx < sbw) {                       /* sidebar shortcut */
 		if (my < LIST_TOP) return;
 		int i = (my - LIST_TOP) / ROW_H;
@@ -584,14 +599,15 @@ static void click(int id, int mx, int my)
 			int ry = dev_row_y(v);
 			if (my < ry || my >= ry + ROW_H) continue;
 			if (!vols[v].mounted) {           /* connect (mount) the device */
-				mount(vols[v].kind); set_title(id); seq++;
-			} else if (mx >= sbw - EJECT_W) { /* eject button */
-				if (eject(vols[v].path) == 0) {
-					if (under_path(path, vols[v].path)) goto_path("/");
+				char pt[40]; strcpy(pt, "/media/"); strcat(pt, vols[v].dev);
+				mount(vols[v].dev, pt); set_title(id); seq++;
+			} else if (mx >= sbw - EJECT_W) { /* eject button -> unmount */
+				if (umount(vols[v].point) == 0) {
+					if (under_path(path, vols[v].point)) goto_path("/");
 					set_title(id); seq++;
 				}
 			} else {                          /* open the device */
-				goto_path(vols[v].path); set_title(id); seq++;
+				goto_path(vols[v].point); set_title(id); seq++;
 			}
 			return;
 		}
@@ -628,6 +644,16 @@ static void dblclick(int id, int mx, int my)
 		open_file(fe->name);
 	}
 	seq++;
+}
+
+/* Left-button motion (WEV_DRAG): drive a live sidebar resize if the press
+ * grabbed the divider grip. The widget clamps the width to [MIN,MAX]; we just
+ * repaint when it moved. */
+static void drag(int id, int mx, int my)
+{
+	(void)id; (void)my;
+	if (sidebar_drag(&sb, 0, mx))
+		seq++;
 }
 
 /* Keyboard navigation: arrow up/down move the highlighted entry (directories
@@ -667,8 +693,8 @@ int main(void)
 	int id = win_create(W, H, "files");
 	if (id < 0) { puts("files: no window\n"); return 1; }
 	gfx_init(win_fb(), W, H);
+	sidebar_init(&sb, SIDEBAR_W, SIDEBAR_MIN, SIDEBAR_MAX);
 	set_title(id);
-	win_cursor(id, WIN_CURSOR_HAND);   /* hand over the clickable file list */
 
 	int last = -1;
 	for (;;) {
@@ -676,6 +702,7 @@ int main(void)
 		while (win_poll(id, &ev)) {
 			if (ev.type == WEV_CLOSE) { win_close(id); return 0; }
 			else if (ev.type == WEV_MOUSE) click(id, ev.a, ev.b);
+			else if (ev.type == WEV_DRAG) drag(id, ev.a, ev.b);
 			else if (ev.type == WEV_RCLICK) rclick(id, ev.a, ev.b);
 			else if (ev.type == WEV_DBLCLICK) dblclick(id, ev.a, ev.b);
 			else if (ev.type == WEV_KEY) key(id, ev.a);

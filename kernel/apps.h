@@ -1,6 +1,6 @@
 /* apps.h — desktop app registry.
  *
- * Every desktop app is now a ring-3 /bin program. apps_start() opens the
+ * Every desktop app is now a /bin program. apps_start() opens the
  * terminal (/bin/term, a user-space shell) at boot; the rest launch on demand
  * from the taskbar Start menu as detached user processes (the WM reaps them).
  *

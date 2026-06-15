@@ -418,7 +418,7 @@ static char *pci_cat(char *p, char *end, const char *s)
 
 /* Fill *out with cached device #idx, resolving the same friendly name pci_list
  * prints. Returns 1 if it exists, 0 past the end. The data is cached from boot,
- * so this touches no PCI config space. For the ring-3 `lspci` over SYS_PCIDEV. */
+ * so this touches no PCI config space. For `lspci` over SYS_PCIDEV. */
 int pci_dev_info(int idx, struct pci_dev_info *out)
 {
 	if (idx < 0 || idx >= device_count)

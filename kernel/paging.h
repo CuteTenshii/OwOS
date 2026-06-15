@@ -37,7 +37,7 @@ int paging_identity_map(uint32_t phys, uint32_t len);
 
 /* Map/unmap a physical range into the kernel master directory (supervisor RW),
  * so kernel code reaches a buffer in >16 MiB physical memory under its own CR3.
- * Used for ring-3 window client buffers, which the WM compositor blits. */
+ * Used for window client buffers, which the WM compositor blits. */
 int  paging_kmap(uint32_t phys, uint32_t len);
 void paging_kunmap(uint32_t phys, uint32_t len);
 
@@ -45,6 +45,12 @@ void paging_kunmap(uint32_t phys, uint32_t len);
  * tables), for a window's client buffer mapped outside the low-4-MiB window. */
 int  paging_map_user_at(uint32_t *dir, uint32_t vaddr, uint32_t phys, int npages);
 void paging_unmap_user_at(uint32_t *dir, uint32_t vaddr, uint32_t bytes);
+
+/* Grow/shrink the user-space heap (SYS_SBRK): map zeroed pages for, or free the
+ * pages of, the page-aligned half-open range. grow rolls back and returns -1 on
+ * exhaustion; both operate on the process directory `dir`. */
+int  paging_user_grow(uint32_t *dir, uint32_t old_top, uint32_t new_top);
+void paging_user_shrink(uint32_t *dir, uint32_t new_top, uint32_t old_top);
 
 /* Transient SUPERVISOR-only mapping of a physical frame into kernel space, so
  * the kernel can read/write a fresh pmm frame (which lives above the identity

@@ -394,10 +394,23 @@ static int enc_str(unsigned char *o, const char *s)
 /* Build the request header block: method/scheme indexed where possible, path
  * and authority as no-index literals on their static names, plus user-agent and
  * accept. No-index keeps unique values (the path) out of the server's table. */
+/* Connection-specific (and pseudo-) headers that HTTP/2 forbids in a normal
+ * field block (RFC 7540 §8.1.2.2) — skipped if a caller's extra_headers list
+ * them, so a stray "Connection: close" can't make the request malformed. */
+static int h2_forbidden_header(const char *name)   /* name already lowercased */
+{
+	return streq(name, "connection") || streq(name, "keep-alive") ||
+	       streq(name, "transfer-encoding") || streq(name, "upgrade") ||
+	       streq(name, "proxy-connection") || streq(name, "host");
+}
+
 static int build_request(unsigned char *hb, int https, const char *method,
-                         const char *authority, const char *path)
+                         const char *authority, const char *path,
+                         const struct h2_opts *opts)
 {
 	int n = 0;
+	const char *ua = (opts && opts->user_agent) ? opts->user_agent : "owos-curl";
+
 	if (streq(method, "GET"))       hb[n++] = 0x82;   /* :method GET  (idx 2) */
 	else if (streq(method, "POST")) hb[n++] = 0x83;   /* :method POST (idx 3) */
 	else { hb[n++] = 0x42; n += enc_str(hb + n, method); }  /* lit name idx 2 */
@@ -409,9 +422,42 @@ static int build_request(unsigned char *hb, int https, const char *method,
 
 	hb[n++] = 0x01; n += enc_str(hb + n, authority);  /* :authority (no-index)*/
 	hb[n++] = 0x0f; hb[n++] = 43;                     /* user-agent (idx 58)  */
-	n += enc_str(hb + n, "owos-curl");
-	hb[n++] = 0x0f; hb[n++] = 4;                       /* accept (idx 19)     */
-	n += enc_str(hb + n, "*/*");
+	n += enc_str(hb + n, ua);
+
+	if (opts && opts->extra_headers) {
+		/* Each "name: value" line becomes a literal-without-indexing header with
+		 * a literal, lowercased name (HTTP/2 mandates lowercase field names) —
+		 * carries the browser's Cookie / Accept / Accept-Language. */
+		const char *p = opts->extra_headers;
+		while (*p) {
+			char name[64]; int ni = 0;
+			while (*p && *p != ':' && *p != '\r' && *p != '\n') {
+				char c = *p++;
+				if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+				if (ni < (int)sizeof name - 1) name[ni++] = c;
+			}
+			name[ni] = '\0';
+			if (*p == ':') {
+				p++;
+				while (*p == ' ') p++;
+				char val[1024]; int vi = 0;
+				while (*p && *p != '\r' && *p != '\n') {
+					if (vi < (int)sizeof val - 1) val[vi++] = *p;
+					p++;
+				}
+				val[vi] = '\0';
+				if (ni > 0 && !h2_forbidden_header(name)) {
+					hb[n++] = 0x00;               /* literal, no index, new name */
+					n += enc_str(hb + n, name);
+					n += enc_str(hb + n, val);
+				}
+			}
+			while (*p == '\r' || *p == '\n') p++;
+		}
+	} else {
+		hb[n++] = 0x0f; hb[n++] = 4;              /* accept (idx 19)     */
+		n += enc_str(hb + n, "*/*");
+	}
 	return n;
 }
 
@@ -567,10 +613,10 @@ static void emit(struct emitter *e, const unsigned char *p, int n)
 static const unsigned char PREFACE[24] =
 	"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-int h2_request(int sock, int scheme_https, const char *authority,
-               const char *method, const char *path,
-               char *hdr, int hdrcap, int *hdrlen,
-               http_body_fn body, void *ctx)
+int h2_run(int sock, int scheme_https, const char *authority,
+           const char *method, const char *path, const struct h2_opts *opts,
+           char *hdr, int hdrcap, int *hdrlen,
+           http_body_fn body, void *ctx)
 {
 	dt_reset();
 	if (!method) method = "GET";
@@ -589,8 +635,8 @@ int h2_request(int sock, int scheme_https, const char *authority,
 	if (put_frame(sock, F_WINUP, 0, 0, wu, 4) < 0)
 		return HTTP_ESEND;
 
-	static unsigned char reqhb[1024];
-	int rl = build_request(reqhb, scheme_https, method, authority, path);
+	static unsigned char reqhb[4096];
+	int rl = build_request(reqhb, scheme_https, method, authority, path, opts);
 	if (put_frame(sock, F_HEADERS, FL_END_HEADERS | FL_END_STREAM, 1, reqhb, rl) < 0)
 		return HTTP_ESEND;
 
@@ -626,6 +672,14 @@ int h2_request(int sock, int scheme_https, const char *authority,
 				if (cr < 0)   { rc = HTTP_ENORESP; goto out; }
 				if (hpack_decode(hblock, hbl, &hs) < 0) { rc = HTTP_ENORESP; goto out; }
 				headers_done = 1;
+				/* Hand the decoded header block to the caller before any DATA,
+				 * so it can pick a body sink (browser: render vs download). */
+				if (opts && opts->on_headers && hs.buf && hs.cap > 0) {
+					hs.buf[hs.len < hs.cap ? hs.len : hs.cap - 1] = '\0';
+					if (opts->on_headers(ctx, hs.buf, hs.len) != 0) {
+						rc = HTTP_EABORT; goto out;
+					}
+				}
 				if (flags & FL_END_STREAM) done = 1;
 			}
 			break;
@@ -665,4 +719,13 @@ out:
 		if (hdrlen) *hdrlen = hs.len;
 	}
 	return rc;
+}
+
+int h2_request(int sock, int scheme_https, const char *authority,
+               const char *method, const char *path,
+               char *hdr, int hdrcap, int *hdrlen,
+               http_body_fn body, void *ctx)
+{
+	return h2_run(sock, scheme_https, authority, method, path, 0,
+	              hdr, hdrcap, hdrlen, body, ctx);
 }

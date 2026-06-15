@@ -1,4 +1,4 @@
-/* about.c — the "about" window, as a ring-3 app. */
+/* about.c — the "about" window. */
 #include "owos.h"
 #include "gfx.h"
 
@@ -18,7 +18,7 @@ int main(void)
 		"OwOS",
 		"a from-scratch x86 kernel",
 		"",
-		"now with ring-3 GUI apps:",
+		"now with GUI apps:",
 		"windows, a mouse, real pixels.",
 		"",
 		"launched from the Start menu.",

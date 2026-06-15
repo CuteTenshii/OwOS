@@ -4,7 +4,7 @@
  * bencoded dict and computes the 20-byte infohash (SHA-1 of the info dict's
  * exact on-disk bytes). Spans (announce, name, pieces) point into the source
  * buffer passed to torrent_parse(), which must outlive the struct. The node
- * pool is a static buffer (no malloc in ring 3) — one parse in flight at a time.
+ * pool is a static buffer (no malloc in user space) — one parse in flight at a time.
  */
 #ifndef OWOS_USER_TORRENT_H
 #define OWOS_USER_TORRENT_H

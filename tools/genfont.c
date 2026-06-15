@@ -8,7 +8,7 @@
  *   cc -O2 tools/genfont.c -o /tmp/genfont $(pkg-config --cflags --libs freetype2)
  *   /tmp/genfont <font.ttf> <ppem> [cell_w cell_h] > out.h
  *
- * The kernel console uses a 9x18 cell (fb.h); the ring-3 GUI library keeps the
+ * The kernel console uses a 9x18 cell (fb.h); the GUI library keeps the
  * legacy 8x16 cell so app layouts are untouched:
  *   /tmp/genfont .../Hack-Regular.ttf 15       > kernel/font_aa.h     (9x18)
  *   /tmp/genfont .../Hack-Regular.ttf 13 8 16   > user/lib/font_aa.h   (8x16)

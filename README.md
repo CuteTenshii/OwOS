@@ -6,7 +6,7 @@ boots the freestanding kernel directly through its built-in Multiboot loader; a
 GRUB ISO is also produced for real VMs and bare metal.
 
 What started as a "does it boot" experiment now has a graphical desktop with a
-window manager and mouse, ring-3 processes with `fork`/`exec`/`waitpid`, block
+window manager and mouse, user processes with `fork`/`exec`/`waitpid`, block
 drivers for IDE/SATA/NVMe/SD/USB/CD-DVD, half a dozen filesystems, a from-scratch
 TCP/IP + TLS network
 stack with a real web browser on top, an SMB2 file server, a BitTorrent client,
@@ -77,8 +77,8 @@ A 32-bpp linear framebuffer, a PS/2 mouse, and a compositing window manager.
 fb.c gets the framebuffer one of two ways: it programs QEMU's Bochs/DISPI VBE
 registers (`-kernel`), or it **adopts** the framebuffer GRUB/real hardware hands
 it. The 80×25 VGA console keeps running underneath as a character grid that the
-compositor renders with an 8×16 CP437 font, so the shell needs zero changes to
-run in a window.
+compositor can render with an 8×16 CP437 font — that grid is the kernel recovery
+console; the desktop terminal is a separate user program.
 
 The window manager (`wm.c`) is a single kernel thread: draggable title bars,
 raise-on-click z-order, focus, close boxes, a cursor, and a clock/taskbar with a
@@ -86,10 +86,11 @@ Start menu. Performance is real on hardware (QEMU hides it) — a cached back
 buffer above 16 MiB, damage-rectangle-only presents, and a write-combining front
 buffer took a laptop from 2 fps to smooth.
 
-Desktop apps open from the Start menu. Some are kernel-side (the terminal that
-hosts the shell, an About box); most are **ring-3 user programs** that draw into
+Desktop apps open from the Start menu. Only the About box is kernel-side;
+everything else — the terminal (a self-contained shell), clock, files,
+editor, browser, image viewer — is a **user program** that draws into
 a shared pixel buffer through the windowing syscalls (`uwin.c`): a clock, a file
-browser, a text editor, an image viewer, and a real web browser. A ring-3 app
+browser, a text editor, an image viewer, and a real web browser. A user app
 that faults gets a crash window instead of taking down the kernel.
 
 ### Memory
@@ -168,11 +169,12 @@ A from-scratch stack, strictly layered:
 
 On top of that:
 
-- `ping <host>`, `dig <host> [type]` (A/AAAA/CNAME/MX/TXT/NS…), `ntp` to set the
-  clock, `dhcp` to re-request a lease.
-- **`curl <url>`** — a ring-3 HTTP/1.1 client (the only user-facing network API
+- `ping <host>`, `dig <host> [type]` (A/AAAA/CNAME/MX/TXT/NS…). DHCP (boot lease)
+  and NTP (clock sync) are **services** — `services start ntp`,
+  `services restart dhcp`.
+- **`curl <url>`** — an HTTP/1.1 client (the only user-facing network API
   is four `net_sock_*` syscalls): `http://` or `https://`, `-i`, `-X`, `-o`.
-- **A graphical web browser** — a ring-3 desktop app that fetches over HTTP(S),
+- **A graphical web browser** — a desktop app that fetches over HTTP(S),
   inflates gzip/deflate, parses HTML, decodes PNG images, and renders the page,
   streaming downloads to `~/Downloads`.
 
@@ -189,9 +191,9 @@ the guest's 445 so `smbd` is reachable.
 
 ### BitTorrent client
 
-A from-scratch BitTorrent stack: a bencode parser (`bencode.c`), `.torrent`
-metainfo parsing with the SHA-1 infohash (`torrent.c`), tracker announce
-(`tracker.c`), and the peer wire protocol (`peer.c`) — handshake, piece
+A from-scratch BitTorrent stack, a `/bin/torrent` program over
+`user/lib/torrent/`: a bencode parser, `.torrent` metainfo parsing with the
+SHA-1 infohash, tracker announce, and the peer wire protocol — handshake, piece
 download, and SHA-1 verification. `torrent get <file>` downloads a whole
 single-file torrent to disk.
 
@@ -232,23 +234,32 @@ AZERTY (including AltGr) built in.
 
 ## Shell commands
 
+The desktop **terminal is a self-contained shell** (`user/term.c`): it
+does its own line editing, history (Up/Down), prompt, and command dispatch — no
+kernel involvement beyond syscalls. **Ctrl+C** cancels the current line, or
+aborts a running command. (The kernel keeps a minimal recovery console on COM1
+for headless `make debug`.)
+
 ```
-help  clear  uptime  sleep  meminfo  memtest  tasks
-ls  pwd  cd  cat  grep  write  cp  mv  rm  mkdir  rmdir
-zip  unzip  gzip  gunzip
-run  format  which  echo
+help  clear  uptime  sleep  meminfo  tasks  journal
+ls  pwd  cd  cat  grep  write  cp  mv  rm  mkdir  rmdir  stat
+zip  unzip  gzip  gunzip          (LZSS/DEFLATE codecs)
+which  echo
 storage  mount  eject  lspci  lsusb
-ping  dig  ntp  curl  url  torrent
-dhcp  ethdiag  txtest            (NIC bring-up / diagnostics)
-services                          (list/start/stop/restart/status)
-beep  play  cpuinfo  uname  whoami  loadkeys  date  neofetch
+ping  dig  curl  torrent
+services                          (list/start/stop/restart/status; dhcp/ntp are services)
+play  cpuinfo  uname  whoami  loadkeys  clip  date  neofetch
 poweroff  restart
 ```
+
+System info comes from `/proc` (`cat /proc/cpuinfo`, `/proc/meminfo`, …); kernel
+actions go through `/proc` control nodes or a syscall. CLI tools
+(`neofetch`/`curl`/`ping`/…) run as captured child processes rendered inline.
 
 Any command's output can be piped into `grep` (`<cmd> | grep <pattern>`) or
 redirected to a file (`<cmd> > <file>`). A bare non-builtin name runs the
 matching `/bin` program, so `curl <url>`, `editor file.txt`, and friends just
-work. Bundled ring-3 programs: `edit`, `editor`, `curl`, `browser`, `imgview`,
+work. Bundled programs: `edit`, `editor`, `curl`, `browser`, `imgview`,
 `files`, `clock`, `about`, `crashme`.
 
 ---
@@ -265,8 +276,8 @@ kernel/irq.c .S    PIC remap + hardware IRQ dispatch
 kernel/timer.c     PIT (250 Hz), tick counter + sleep (IRQ0)
 kernel/serial.c    polled COM1 UART (console mirror / logging)
 kernel/console.c   text + framebuffer console funnel (was vga.c)
-kernel/shell.c     line-buffered shell: history, editing, pipes, redirection
-kernel/crash.c     ring-3 crash reporter (fault -> crash window)
+kernel/shell.c     COM1/text recovery console (the desktop shell is user/term.c)
+kernel/crash.c     crash reporter (fault -> crash window)
 
 kernel/pmm.c       physical frame allocator (bitmap over the mmap)
 kernel/paging.c    identity map, frame pool, per-process address spaces
@@ -279,7 +290,7 @@ kernel/pipe.c      kernel pipe ring buffers
 kernel/file.h      per-process fd table
 
 kernel/wm.c        compositing window manager (one kernel thread)
-kernel/uwin.c      ring-3 windowing server (user apps own a window)
+kernel/uwin.c      windowing server (user apps own a window)
 kernel/apps.c      desktop app registry / Start menu
 kernel/screenshot.c Print Screen -> PNG capture worker
 kernel/png.c       PNG decoder (over the DEFLATE engine)
@@ -298,13 +309,8 @@ kernel/crypto.c    SHA-256/HMAC/HKDF, AES-128-GCM, X25519
 kernel/url.c       freestanding URL parser/builder
 kernel/services.c  service manager: supervisor + headless daemons
 kernel/smb.c       read-only SMB2 file server (smbd)
-kernel/bencode.c   bencode parser
-kernel/torrent.c   .torrent metainfo + SHA-1 infohash
-kernel/tracker.c   BitTorrent tracker announce
-kernel/peer.c      BitTorrent peer wire protocol
 
-kernel/zip.c       LZSS compressor/decompressor (zip/unzip)
-kernel/gzip.c      gzip/DEFLATE codec + CRC32 (gzip/gunzip, curl, png)
+kernel/gzip.c      gzip/DEFLATE codec + CRC32 (png screenshot; user space: user/lib/zlib/deflate.c)
 kernel/smbios.c    SMBIOS/DMI host name for neofetch
 kernel/firmware.c  BIOS vs UEFI detection
 kernel/cpu.c       CPUID vendor/brand
@@ -338,15 +344,15 @@ drivers/acpi/aml.c       tiny AML interpreter (battery methods)
 drivers/acpi/battery.c   best-effort battery percentage (real-HW)
 
 user/lib/          user libc: syscall wrappers, gfx, inflate, png, url, _start
-user/curl.c        ring-3 HTTP/1.1 client
-user/browser/      ring-3 web browser (fetch + HTML + render)
-user/imgview.c     ring-3 PNG image viewer
-user/editor.c      ring-3 windowed text editor (menus, Ctrl+key)
-user/edit.c        ring-3 ed-style line editor over owofs
-user/files.c       ring-3 file-browser app
-user/clock.c       ring-3 clock app
-user/about.c       ring-3 about box
-user/crashme.c     ring-3 fault demo (exercises the crash reporter)
+user/curl.c        HTTP/1.1 client
+user/browser/      web browser (fetch + HTML + render)
+user/imgview.c     PNG image viewer
+user/editor.c      windowed text editor (menus, Ctrl+key)
+user/edit.c        ed-style line editor over owofs
+user/files.c       file-browser app
+user/clock.c       clock app
+user/about.c       about box
+user/crashme.c     fault demo (exercises the crash reporter)
 
 linker.ld          loads the kernel at 1 MiB, multiboot header first
 Makefile           build + run + iso + usb

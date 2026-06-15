@@ -31,7 +31,7 @@
 #define SYS_MSEC       27
 #define SYS_READFILE_AT 28
 #define SYS_VOLUMES    29
-#define SYS_EJECT      30
+#define SYS_UMOUNT     30
 #define SYS_WIN_CURSOR 31
 #define SYS_STREAM_BEGIN 32
 #define SYS_STREAM_WRITE 33
@@ -52,6 +52,12 @@
 #define SYS_CMD_ABORT  51
 #define SYS_INTR       52
 #define SYS_NET_ALPN   53
+#define SYS_SPAWN_CAP  54
+#define SYS_READ_NB    55
+#define SYS_CHDIR      56
+#define SYS_KILL       57
+#define SYS_POWER      58
+#define SYS_SBRK       59
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -244,24 +250,37 @@ int spawn(const char *path, const char *arg)
 	return syscall(SYS_SPAWN, (int)path, (int)arg, 0);
 }
 
-int shell_cmd(const char *cmd, char *out, int max)
+/* Spawn a /bin child capturing its stdout into a pipe, passing a full argv
+ * vector (argv[0] is conventionally the program name; the kernel uses `path`
+ * for the image and argv[1..] as arguments). On success returns the pid and
+ * stores the read-end fd in *rfd; drain it with read_nb until EOF. */
+int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
 {
-	return syscall(SYS_SHELL, (int)cmd, (int)out, max);
+	struct { const char *path; char *const *argv; int argc; int *rfd; } req =
+		{ path, argv, argc, rfd };
+	return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
 }
 
-int cmd_begin(const char *cmd)
+/* Non-blocking read: >0 bytes, 0 if it would block, -1 at EOF. */
+int read_nb(int fd, void *buf, int len)
 {
-	return syscall(SYS_CMD_BEGIN, (int)cmd, 0, 0);
+	return syscall(SYS_READ_NB, fd, (int)buf, len);
 }
 
-int cmd_read(char *buf, int max)
+int chdir(const char *path)
 {
-	return syscall(SYS_CMD_READ, (int)buf, max, 0);
+	return syscall(SYS_CHDIR, (int)path, 0, 0);
 }
 
-int cmd_abort(void)
+int kill(int pid)
 {
-	return syscall(SYS_CMD_ABORT, 0, 0, 0);
+	return syscall(SYS_KILL, pid, 0, 0);
+}
+
+/* action: 0 = shut down, 1 = reboot. Does not return on success. */
+int power(int action)
+{
+	return syscall(SYS_POWER, action, 0, 0);
 }
 
 int intr_take(void)
@@ -275,14 +294,14 @@ int volumes(int idx, struct volinfo *out)
 	return syscall(SYS_VOLUMES, idx, (int)out, 0);
 }
 
-int eject(const char *path)
+int umount(const char *point)
 {
-	return syscall(SYS_EJECT, (int)path, 0, 0);
+	return syscall(SYS_UMOUNT, (int)point, 0, 0);
 }
 
-int mount(const char *kind)
+int mount(const char *dev, const char *point)
 {
-	return syscall(SYS_MOUNT, (int)kind, 0, 0);
+	return syscall(SYS_MOUNT, (int)dev, (int)point, 0);
 }
 
 
@@ -310,6 +329,148 @@ void msleep(unsigned ms)
 int thread_create(void (*fn)(void), void *stack_top)
 {
 	return syscall(SYS_THREAD, (int)fn, (int)stack_top, 0);
+}
+
+/* ----------------------------------------------------------- malloc / free */
+/* A K&R-style first-fit allocator (The C Programming Language §8.7) over the
+ * SYS_SBRK heap, with a small lock so the threads of one process (e.g. the
+ * browser's UI + fetch worker) can allocate concurrently — they share the one
+ * heap because they share the address space. Blocks carry an 8-byte header; the
+ * free list is kept address-ordered so free() coalesces neighbours. */
+
+void *sbrk(int inc) { return (void *)syscall(SYS_SBRK, inc, 0, 0); }
+
+typedef long long Align;                  /* 8-byte block + payload alignment */
+union header {
+	struct { union header *ptr; unsigned size; } s;   /* size in header units */
+	Align x;
+};
+typedef union header Header;
+
+static Header  base;                       /* degenerate block: starts the list */
+static Header *freep;                       /* roving free-list pointer          */
+
+/* Spinlock guarding the free list. xchg is atomic; on contention we yield to the
+ * lock holder (single CPU — the timer also preempts a spinner as a backstop). */
+static volatile int heap_lock;
+static inline int xchg32(volatile int *p, int v)
+{
+	__asm__ volatile ("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
+	return v;
+}
+static void hlock(void)   { while (xchg32(&heap_lock, 1)) msleep(0); }
+static void hunlock(void) { __asm__ volatile ("" ::: "memory"); heap_lock = 0; }
+
+#define NALLOC 2048u                       /* min header-units to request at once */
+
+/* free() body without the lock (so morecore can reuse it under the held lock). */
+static void free_nolock(void *ap)
+{
+	Header *bp = (Header *)ap - 1, *p;
+	for (p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr)
+		if (p >= p->s.ptr && (bp > p || bp < p->s.ptr))
+			break;                         /* freed block at the list's edge   */
+	if (bp + bp->s.size == p->s.ptr) {     /* coalesce with the upper neighbour */
+		bp->s.size += p->s.ptr->s.size;
+		bp->s.ptr   = p->s.ptr->s.ptr;
+	} else {
+		bp->s.ptr = p->s.ptr;
+	}
+	if (p + p->s.size == bp) {             /* coalesce with the lower neighbour */
+		p->s.size += bp->s.size;
+		p->s.ptr   = bp->s.ptr;
+	} else {
+		p->s.ptr = bp;
+	}
+	freep = p;
+}
+
+/* Grow the heap by at least `nu` header units via sbrk and fold it into the free
+ * list. Returns the (updated) free pointer, or 0 if sbrk failed. */
+static Header *morecore(unsigned nu)
+{
+	if (nu < NALLOC)
+		nu = NALLOC;
+	void *cp = sbrk((int)(nu * sizeof(Header)));
+	if (cp == (void *)-1)
+		return 0;
+	Header *up = (Header *)cp;
+	up->s.size = nu;
+	free_nolock((void *)(up + 1));
+	return freep;
+}
+
+void *malloc(unsigned nbytes)
+{
+	if (nbytes == 0)
+		return 0;
+	unsigned nunits = (nbytes + sizeof(Header) - 1) / sizeof(Header) + 1;
+	hlock();
+	Header *prevp = freep;
+	if (prevp == 0) {                      /* first call: one empty block       */
+		base.s.ptr = freep = prevp = &base;
+		base.s.size = 0;
+	}
+	for (Header *p = prevp->s.ptr; ; prevp = p, p = p->s.ptr) {
+		if (p->s.size >= nunits) {         /* big enough                        */
+			if (p->s.size == nunits) {
+				prevp->s.ptr = p->s.ptr;   /* exact fit: unlink                 */
+			} else {
+				p->s.size -= nunits;       /* split: carve the tail             */
+				p += p->s.size;
+				p->s.size = nunits;
+			}
+			freep = prevp;
+			hunlock();
+			return (void *)(p + 1);
+		}
+		if (p == freep) {                  /* wrapped the list: grow the heap   */
+			if ((p = morecore(nunits)) == 0) {
+				hunlock();
+				return 0;
+			}
+		}
+	}
+}
+
+void free(void *ptr)
+{
+	if (!ptr)
+		return;
+	hlock();
+	free_nolock(ptr);
+	hunlock();
+}
+
+void *calloc(unsigned nmemb, unsigned size)
+{
+	unsigned total = nmemb * size;
+	if (size && total / size != nmemb)     /* overflow                          */
+		return 0;
+	void *p = malloc(total);
+	if (p)
+		memset(p, 0, total);
+	return p;
+}
+
+void *realloc(void *ptr, unsigned size)
+{
+	if (!ptr)
+		return malloc(size);
+	if (size == 0) {
+		free(ptr);
+		return 0;
+	}
+	/* Old payload = (block units - 1) header-sized cells. Copy the smaller of the
+	 * old and new sizes into a fresh block, then release the old one. */
+	Header *h = (Header *)ptr - 1;
+	unsigned oldbytes = (h->s.size - 1) * sizeof(Header);
+	void *np = malloc(size);
+	if (!np)
+		return 0;
+	memcpy(np, ptr, oldbytes < size ? oldbytes : size);
+	free(ptr);
+	return np;
 }
 
 /* mem* — shared by every program (gcc lowers struct copies / array inits to
