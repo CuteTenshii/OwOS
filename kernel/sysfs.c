@@ -9,6 +9,7 @@
  *   /sys/class/net/eth0/{address,carrier,ipaddr}              (ro)
  *   /sys/class/block/<dev>/{model,size}                       (ro)
  *   /sys/class/graphics/fb0/{width,height,refresh,monitor,internal}  (ro)
+ *   /sys/class/sound/card0/{output,outputs}    audio output select  (rw/ro)
  *   /sys/class/dmi/id/{product_name,sys_vendor}               (ro, SMBIOS)
  *   /sys/bus/pci/devices/<bdf>/{vendor,device,class}          (ro, one dir/device)
  *   /sys/power/battery/{capacity,status}                      (ro, real HW)
@@ -34,6 +35,7 @@
 #include "fb.h"
 #include "edid.h"
 #include "smbios.h"
+#include "hda.h"
 
 /* The single NIC's sysfs name (we keep one card; nic.c is driver-agnostic). */
 #define NET_IFACE "eth0"
@@ -209,7 +211,8 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
 		if (n == 2)
 			return (eq(seg[1], "input") || eq(seg[1], "net") ||
 			        eq(seg[1], "block") || eq(seg[1], "graphics") ||
-			        eq(seg[1], "dmi"))
+			        eq(seg[1], "dmi") ||
+			        (eq(seg[1], "sound") && hda_present()))
 			       ? S_DIR : S_NONE;
 		if (eq(seg[1], "input")) {
 			if (n == 3) return (eq(seg[2], "kbd0") || eq(seg[2], "mouse0")) ? S_DIR : S_NONE;
@@ -245,6 +248,15 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
 			if (n == 4 && eq(seg[2], "id") &&
 			    (eq(seg[3], "product_name") || eq(seg[3], "sys_vendor")))
 				return S_FILE_RO;
+			return S_NONE;
+		}
+		if (eq(seg[1], "sound")) {
+			if (!hda_present()) return S_NONE;
+			if (n == 3) return eq(seg[2], "card0") ? S_DIR : S_NONE;
+			if (n == 4 && eq(seg[2], "card0")) {
+				if (eq(seg[3], "output"))  return S_FILE_RW;
+				if (eq(seg[3], "outputs")) return S_FILE_RO;
+			}
 			return S_NONE;
 		}
 		return S_NONE;
@@ -317,6 +329,20 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
 			if (eq(seg[3], "product_name")) { const char *s = smbios_product(); ps(b, s ? s : ""); pc(b, '\n'); return; }
 			if (eq(seg[3], "sys_vendor"))   { const char *s = smbios_vendor();  ps(b, s ? s : ""); pc(b, '\n'); return; }
 		}
+		if (eq(seg[1], "sound")) {
+			char nm[24];
+			if (eq(seg[3], "output")) {           /* the active output's name      */
+				int a = hda_output_active();
+				if (a >= 0 && hda_output_name(a, nm, (int)sizeof nm)) ps(b, nm);
+				pc(b, '\n'); return;
+			}
+			if (eq(seg[3], "outputs")) {          /* one name per line, index = row */
+				int cnt = hda_output_count();
+				for (int i = 0; i < cnt; i++)
+					if (hda_output_name(i, nm, (int)sizeof nm)) { ps(b, nm); pc(b, '\n'); }
+				return;
+			}
+		}
 	}
 
 	if (eq(seg[0], "bus") && eq(seg[1], "pci") && eq(seg[2], "devices")) {
@@ -366,6 +392,20 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
 			return 0;
 		}
 	}
+	if (n == 4 && eq(seg[0], "class") && eq(seg[1], "sound") &&
+	    eq(seg[2], "card0") && eq(seg[3], "output")) {
+		/* Accept an index ("1") or a name ("Headphones"). */
+		int idx = -1;
+		if (arg[0] >= '0' && arg[0] <= '9') {
+			idx = 0;
+			for (const char *p = arg; *p >= '0' && *p <= '9'; p++) idx = idx * 10 + (*p - '0');
+		} else {
+			char nm[24];
+			for (int i = 0, cnt = hda_output_count(); i < cnt; i++)
+				if (hda_output_name(i, nm, (int)sizeof nm) && eq(nm, arg)) { idx = i; break; }
+		}
+		return hda_output_select(idx) == 0 ? 0 : -1;
+	}
 	return -1;
 }
 
@@ -394,12 +434,13 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
 	if (n == 1 && eq(seg[0], "class")) {
 		/* input + graphics always; net/block only when present (so an empty dir
 		 * doesn't show). fb0 exists even in text mode, like /proc/display did. */
-		const char *kids[5]; int k = 0;
+		const char *kids[6]; int k = 0;
 		kids[k++] = "input";
 		if (nic_present())            kids[k++] = "net";
 		char tmp[SEGLEN];
 		if (block_name(0, tmp))       kids[k++] = "block";
 		kids[k++] = "graphics";
+		if (hda_present())            kids[k++] = "sound";
 		kids[k++] = "dmi";
 		hit = from_list(idx, name, max, kids, k);
 		if (hit && is_dir) *is_dir = 1;
@@ -451,6 +492,12 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
 	if (n == 2 && eq(seg[0], "class") && eq(seg[1], "dmi")) {
 		if (idx != 0) return 0;
 		cpy(name, "id", max);
+		if (is_dir) *is_dir = 1;
+		return 1;
+	}
+	if (n == 2 && eq(seg[0], "class") && eq(seg[1], "sound")) {
+		if (!hda_present() || idx != 0) return 0;
+		cpy(name, "card0", max);
 		if (is_dir) *is_dir = 1;
 		return 1;
 	}
@@ -512,6 +559,12 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
 	}
 	if (n == 3 && eq(seg[0], "class") && eq(seg[1], "dmi") && eq(seg[2], "id")) {
 		static const char *const k[] = { "product_name", "sys_vendor" };
+		hit = from_list(idx, name, max, k, 2);
+		if (hit && is_dir) *is_dir = 0;
+		return hit;
+	}
+	if (n == 3 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0")) {
+		static const char *const k[] = { "output", "outputs" };
 		hit = from_list(idx, name, max, k, 2);
 		if (hit && is_dir) *is_dir = 0;
 		return hit;

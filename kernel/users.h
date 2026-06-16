@@ -48,4 +48,11 @@ void users_home_of(uint32_t uid, char *buf, int max);
  * match. Returns 0 on success, -1 unknown user, -2 wrong password. */
 int users_login(const char *name, const char *pass);
 
+/* Validate name/pass against /etc/passwd WITHOUT changing the caller's
+ * credentials, reporting the account's uid/gid/home (home may be NULL). For the
+ * SSH server: it authenticates a remote login from a kernel thread, then spawns
+ * the user's shell with these creds. 0 ok, -1 unknown user, -2 wrong password. */
+int users_authenticate(const char *name, const char *pass,
+                       uint32_t *uid, uint32_t *gid, char *home, int homesz);
+
 #endif /* OWOS_USERS_H */

@@ -9,11 +9,13 @@
  * An Edit menu (Select All / Cut / Copy / Paste / Delete) operates on a text
  * selection. The selection is an anchor + the moving caret; extend it with
  * Shift+arrows / Shift+Home/End, select everything with Ctrl+A, and Cut/Copy
- * exchange text with the system clipboard through /proc/clipboard (which, on a
- * VMware guest, mirrors to and from the host clipboard).
+ * exchange text with the system clipboard (the clipd server, via the clipboard
+ * client lib — multi-item and any-type).
  */
 #include "owos.h"
 #include "gfx.h"
+#include "clipboard.h"
+#include "mime.h"
 
 static int W = 560, H = 360;    /* client size; grows/shrinks on resize */
 #define MAXLINES  200
@@ -38,7 +40,7 @@ static char  prompt_buf[FNAME_MAX];
 static int   prompt_len;
 
 static char  io_buf[MAXLINES * (MAXCOLS + 1)];
-static char  clip_buf[8192];   /* scratch for Cut/Copy/Paste via /proc/clipboard */
+static char  clip_buf[8192];   /* scratch for Cut/Copy (text staged for clip_put) */
 
 /* Selection: an anchor (sel_x,sel_y) plus the moving caret (curx,cury). The
  * selected span runs in document order between the two; sel_active gates it. */
@@ -329,7 +331,7 @@ static void do_copy(void)
 {
 	if (!sel_active) { set_status("nothing selected"); return; }
 	int n = sel_extract(clip_buf, sizeof clip_buf);
-	if (writefile("/proc/clipboard", clip_buf, n) >= 0)
+	if (clip_put_text(clip_buf, n) == 0)
 		set_status("copied");
 	else
 		set_status("copy failed");
@@ -350,16 +352,26 @@ static void do_cut(void)
 
 static void do_paste(void)
 {
-	int n = readfile("/proc/clipboard", clip_buf, (int)sizeof clip_buf);
-	if (n <= 0) { set_status("clipboard empty"); return; }
+	char mime[64]; void *data = 0; int n = 0;
+	if (clip_get(0, mime, sizeof mime, &data, &n) != 0 || n <= 0) {
+		set_status("clipboard empty");
+		return;
+	}
+	if (!mime_is_text(mime)) {            /* can't insert an image/pdf/etc as text */
+		free(data);
+		set_status("clipboard is not text");
+		return;
+	}
 	if (sel_active) sel_delete();
+	const char *p = (const char *)data;
 	for (int i = 0; i < n; i++) {
-		char c = clip_buf[i];
+		char c = p[i];
 		if (c == '\n')
 			ed_newline();
 		else if (c != '\r' && (unsigned char)c >= 0x20)
 			ed_insert(c);
 	}
+	free(data);
 	set_status("pasted");
 }
 

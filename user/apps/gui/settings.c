@@ -36,9 +36,9 @@ static int W = 480, H = 320;        /* client size; changes on resize */
 
 static struct sidebar sb;
 
-enum { CAT_MOUSE = 0, CAT_KEYBOARD, CAT_ABOUT, NCATS };
+enum { CAT_MOUSE = 0, CAT_KEYBOARD, CAT_SOUND, CAT_ABOUT, NCATS };
 static const char *const cat_name[NCATS] = {
-	"Mouse / Touchpad", "Keyboard", "About",
+	"Mouse / Touchpad", "Keyboard", "Sound", "About",
 };
 
 static int      sel = CAT_MOUSE;    /* selected category */
@@ -47,6 +47,11 @@ static unsigned seq = 1;            /* bump to request a repaint */
 /* Live state mirrored from /proc, re-read when a category is entered. */
 static int  mouse_level = 3;        /* pointer-speed level 1..5 */
 static char kbd_layout[8] = "us";   /* "us" / "fr"              */
+
+#define MAX_OUTS 6
+static char sound_name[MAX_OUTS][20]; /* audio output device names            */
+static int  sound_n;                  /* how many outputs the codec exposes   */
+static int  sound_cur;                /* index of the active output           */
 
 static char  about_line[10][72];    /* About: one formatted line per row */
 static int   about_n;
@@ -116,6 +121,31 @@ static void load_kbd(void)
 	}
 }
 
+static void load_sound(void)
+{
+	char buf[256];
+	sound_n = 0;
+	sound_cur = 0;
+
+	int len = readfile("/sys/class/sound/card0/outputs", buf, sizeof buf - 1);
+	if (len < 0) len = 0;
+	buf[len] = 0;
+	for (const char *p = buf; *p && sound_n < MAX_OUTS; ) {
+		int i = 0;
+		while (*p && *p != '\n' && i < (int)sizeof sound_name[0] - 1)
+			sound_name[sound_n][i++] = *p++;
+		sound_name[sound_n][i] = 0;
+		while (*p && *p != '\n') p++;       /* skip an over-long name's tail */
+		if (*p == '\n') p++;
+		if (i > 0) sound_n++;
+	}
+
+	char cur[24];
+	if (read_proc("/sys/class/sound/card0/output", cur, sizeof cur) > 0)
+		for (int i = 0; i < sound_n; i++)
+			if (streq(sound_name[i], cur)) { sound_cur = i; break; }
+}
+
 static void aline(const char *s)
 {
 	if (about_n >= 10) return;
@@ -172,6 +202,7 @@ static void load_category(int cat)
 {
 	if      (cat == CAT_MOUSE)    load_mouse();
 	else if (cat == CAT_KEYBOARD) load_kbd();
+	else if (cat == CAT_SOUND)    load_sound();
 	else if (cat == CAT_ABOUT)    load_about();
 }
 
@@ -191,6 +222,15 @@ static void set_kbd_layout(const char *name)
 {
 	if (writefile("/sys/class/input/kbd0/layout", name, strlen(name)) == 0)
 		strcpy(kbd_layout, name);
+}
+
+static void set_sound_output(int i)
+{
+	char t[4];
+	if (i < 0 || i >= sound_n) return;
+	uitoa((unsigned)i, t);
+	if (writefile("/sys/class/sound/card0/output", t, strlen(t)) == 0)
+		sound_cur = i;
 }
 
 /* ------------------------------------------------------------- layout / paint */
@@ -256,6 +296,28 @@ static void draw_keyboard(int cx, int cw)
 	            "Affects the whole system.", FG_DIM);
 }
 
+/* Sound output buttons, one per available output device. */
+#define SND_BW 160
+static int snd_by(int i) { return 80 + i * (GUI_BTN_H + 8); }
+
+static void draw_sound(int cx, int cw)
+{
+	(void)cw;
+	gfx_ui_text(cx + 16, 16, "Sound", FG_WHITE);
+	gfx_ui_text(cx + 16, 52, "Output device", FG_TEXT);
+
+	if (sound_n == 0) {
+		gfx_ui_text(cx + 16, 84, "No audio output device.", FG_DIM);
+		return;
+	}
+	for (int i = 0; i < sound_n; i++) {
+		int st = (i == sound_cur) ? BTN_PRESSED : BTN_NORMAL;
+		button_draw(cx + 16, snd_by(i), SND_BW, GUI_BTN_H, sound_name[i], st);
+	}
+	gfx_ui_text(cx + 16, snd_by(sound_n) + 12,
+	            "Routes playback to the selected output.", FG_DIM);
+}
+
 /* Draw `s` at (x,y), truncated to fit `maxw` pixels so a long line (a verbose
  * CPU brand string) can't spill past the detail pane's right edge. */
 static void draw_fit(int x, int y, const char *s, int maxw, unsigned fg)
@@ -302,6 +364,7 @@ static void render(void)
 	gfx_fill_rect(cx, 0, cw, H, BG_PANEL);
 	if      (sel == CAT_MOUSE)    draw_mouse(cx, cw);
 	else if (sel == CAT_KEYBOARD) draw_keyboard(cx, cw);
+	else if (sel == CAT_SOUND)    draw_sound(cx, cw);
 	else                          draw_about(cx, cw);
 }
 
@@ -338,6 +401,11 @@ static void click(int id, int mx, int my)
 			if (button_hit(cx + 16, kbd_by(i), KBD_BW, GUI_BTN_H, mx, my)) {
 				set_kbd_layout(kbd_opts[i].name); seq++; return;
 			}
+	} else if (sel == CAT_SOUND) {
+		for (int i = 0; i < sound_n; i++)
+			if (button_hit(cx + 16, snd_by(i), SND_BW, GUI_BTN_H, mx, my)) {
+				set_sound_output(i); seq++; return;
+			}
 	}
 }
 
@@ -370,6 +438,7 @@ int main(void)
 	/* Prime every category's state once so switching is instant. */
 	load_mouse();
 	load_kbd();
+	load_sound();
 	load_about();
 
 	int last = -1;

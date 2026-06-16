@@ -7,6 +7,7 @@
  * present) are made by this, the owning, thread.
  */
 #include "browser.h"
+#include "font.h"   /* custom @font-face faces (user/lib/font) */
 
 static struct browser binst;
 struct browser *B = &binst;
@@ -298,6 +299,138 @@ static void worker_fn(void)
 
 /* --------------------------------------------------------------- word wrap */
 
+/* The page body is drawn with the PROPORTIONAL sans-serif UI font (gfx_ui_*),
+ * not the monospace cell grid: a glyph's pen advance is gfx_ui_cw(c), a line is
+ * LINE_H tall, and wrapping/hit-testing measure in pixels. (The address bar, tabs
+ * and menus already use this font.) */
+#define LINE_H UIFONT_H
+
+/* --- body font: the baked proportional UI font, OR a page @font-face -------- *
+ * When the page loads a usable @font-face and applies it to the body (B->body_
+ * font != NULL), body text is drawn with that custom face via user/lib/font;
+ * otherwise it falls back to the baked gfx_ui font. Custom glyphs are rasterized
+ * on demand and cached per ASCII codepoint (the body text is folded to 7-bit), at
+ * a fixed pixel size, so a repaint only blits. The cache is main-thread-only;
+ * B->body_font is swapped by the worker under blk_lock (see html.c). */
+/* B->text holds UTF-8; the renderer decodes a codepoint at a time via the shared
+ * utf8_decode/utf8_seqlen (user/lib). Per-codepoint glyph cache for the active
+ * direct-mapped table (evict on collision, so a CJK page with hundreds of glyphs
+ * stays bounded and a repaint only blits). Main-thread-only; B->body_font is
+ * swapped by the worker under blk_lock (see html.c). */
+#define BODY_PX 15.0f
+#define GCACHE_N 1024
+struct gcache { unsigned cp; unsigned char *bm; int w, h, ox, oy, adv; int valid; };
+static struct gcache g_glyph[GCACHE_N];
+static struct font  *g_gf;            /* the face the cache currently holds */
+static int           g_baseline;      /* baseline offset (px) within a line */
+
+static void gcache_sync(void)
+{
+	if (g_gf == B->body_font) return;
+	for (int i = 0; i < GCACHE_N; i++) {
+		free(g_glyph[i].bm); g_glyph[i].bm = 0; g_glyph[i].valid = 0;
+	}
+	g_gf = B->body_font;
+	if (g_gf) { int asc = 0; font_vmetrics(g_gf, BODY_PX, &asc, 0, 0); g_baseline = asc; }
+}
+
+static struct gcache *gcache_get(unsigned cp)
+{
+	struct gcache *g = &g_glyph[cp & (GCACHE_N - 1)];
+	if (g->valid && g->cp == cp) return g;
+	if (g->valid) { free(g->bm); g->bm = 0; }
+	int gi = font_glyph_index(B->body_font, (int)cp);
+	g->bm = font_render_glyph(B->body_font, gi, BODY_PX, &g->w, &g->h, &g->ox, &g->oy, &g->adv);
+	g->cp = cp; g->valid = 1;
+	return g;
+}
+
+/* Pen advance of one codepoint in the active body font (baked UI font when no
+ * custom face: ASCII/Latin-1 by value, a '?'-width box for anything above it). */
+/* Raw, non-HTML content (text/plain, source, etc.) renders in the fixed-width
+ * monospace cell font, not the proportional UI font — only HTML gets the latter. */
+static int body_mono(void) { return B->mode == MODE_TEXT; }
+
+static int body_cp_adv(unsigned cp)
+{
+	if (body_mono()) return GLYPH_W;              /* monospace cell             */
+	if (!B->body_font) return gfx_ui_cw_cp(cp);   /* the gfx system-ui font     */
+	gcache_sync();
+	return gcache_get(cp)->adv;
+}
+
+static int body_width(const char *s)
+{
+	const char *end = s + strlen(s);
+	if (!body_mono() && B->body_font) gcache_sync();
+	int w = 0; unsigned cp;
+	while (s < end) { s += utf8_decode(s, end, &cp); w += body_cp_adv(cp); }
+	return w;
+}
+
+/* Alpha-blend one cached glyph's coverage in colour fg, clipped to [ct,cb). */
+static void blit_glyph(int x, int y, const struct gcache *g, unsigned fg, int ct, int cb)
+{
+	if (!g->bm) return;
+	unsigned *fb = win_fb();
+	unsigned fr = (fg >> 16) & 0xff, fgc = (fg >> 8) & 0xff, fbb = fg & 0xff;
+	for (int gy = 0; gy < g->h; gy++) {
+		int py = y + g->oy + gy;
+		if (py < ct || py >= cb || py < 0 || py >= BH) continue;
+		const unsigned char *srow = g->bm + gy * g->w;
+		unsigned *drow = fb + (unsigned long)py * BW;
+		for (int gx = 0; gx < g->w; gx++) {
+			int px = x + g->ox + gx;
+			if (px < 0 || px >= BW) continue;
+			unsigned a = srow[gx];
+			if (!a) continue;
+			if (a == 255) { drow[px] = fg; continue; }
+			unsigned dst = drow[px], ia = 255 - a;
+			unsigned r = (fr * a + ((dst >> 16) & 0xff) * ia) / 255;
+			unsigned gg = (fgc * a + ((dst >> 8) & 0xff) * ia) / 255;
+			unsigned bb = (fbb * a + (dst & 0xff) * ia) / 255;
+			drow[px] = (r << 16) | (gg << 8) | bb;
+		}
+	}
+}
+
+/* A "tofu" box for a codepoint the active font (or the ASCII baked font) can't
+ * draw, so missing glyphs are visible rather than silently dropped. */
+static void draw_tofu(int x, int y, int w, unsigned fg)
+{
+	if (w > 4) gfx_rect(x + 1, y + 3, w - 3, UIFONT_H - 6, fg);
+}
+
+/* Draw a UTF-8 string at line-top (x,y) in colour fg, one codepoint at a time,
+ * clipped to [ct,cb). Returns the pen x after the string. With a custom face,
+ * glyphs come from font.c; otherwise the baked UI font draws ASCII/Latin-1 and a
+ * tofu box stands in for anything it lacks. */
+static int body_draw(int x, int y, const char *s, unsigned fg, int ct, int cb)
+{
+	const char *end = s + strlen(s);
+	unsigned cp;
+	if (body_mono()) {                            /* raw content: monospace cells */
+		(void)ct; (void)cb;
+		gfx_text(x, y, s, fg, GFX_TRANSPARENT);
+		return x + body_width(s);
+	}
+	if (B->body_font) {
+		gcache_sync();
+		while (s < end) {
+			s += utf8_decode(s, end, &cp);
+			struct gcache *g = gcache_get(cp);
+			if (g->bm) blit_glyph(x, y + g_baseline, g, fg, ct, cb);
+			else if (cp > 0x20) draw_tofu(x, y, g->adv, fg);   /* .notdef / empty */
+			x += g->adv;
+		}
+		return x;
+	}
+	/* No @font-face: delegate the whole UTF-8 run to the gfx system-ui font,
+	 * which decodes UTF-8 and renders accents/Greek/Cyrillic from its cmap. */
+	gfx_ui_text(x, y, s, fg);
+	return x + gfx_ui_width(s);
+}
+
 static void add_line(int off, int len)
 {
 	if (!ensure_lines(B->nlines + 1))
@@ -338,20 +471,23 @@ static void img_disp_size(const struct inl_img *im, int paw, int *dw, int *dh)
 	*dh = h < 1 ? 1 : h;
 }
 
-static int img_rows(const struct inl_img *im, int cols)
+/* Display rows an inline image reserves, given the pane content width `paw` px. */
+static int img_rows(const struct inl_img *im, int paw)
 {
-	int paw = cols * GLYPH_W; if (paw < GLYPH_W) paw = GLYPH_W;
+	if (paw < 1) paw = 1;
 	int dw = 0, dh = 0;
 	img_disp_size(im, paw, &dw, &dh);
 	if (dh <= 0) return 1;                            /* alt box: one row       */
-	int r = (dh + GLYPH_H - 1) / GLYPH_H;
+	int r = (dh + LINE_H - 1) / LINE_H;
 	return r < 1 ? 1 : r;
 }
 
-static void rewrap(int cols)
+/* Word-wrap B->text into display lines that fit `paw` pixels wide (proportional
+ * font), reserving rows for inline images. wrap_cols caches the pane width. */
+static void rewrap(int paw)
 {
-	if (cols < 1) cols = 1;
-	if (B->wrap_seq == B->seq && B->wrap_cols == cols)
+	if (paw < 8) paw = 8;
+	if (B->wrap_seq == B->seq && B->wrap_cols == paw)
 		return;
 	for (int q = 0; q < B->n_imgs; q++) B->imgs[q].start_row = -1;
 	B->nlines = 0;
@@ -365,7 +501,7 @@ static void rewrap(int cols)
 				if (B->imgs[q].text_pos == i) { img = q; break; }
 			if (img >= 0) {                           /* reserve the image rows  */
 				struct inl_img *im = &B->imgs[img];
-				im->rows = img_rows(im, cols);
+				im->rows = img_rows(im, paw);
 				im->start_row = B->nlines;
 				for (int r = 0; r < im->rows; r++)
 					add_line(i, 0);
@@ -375,20 +511,27 @@ static void rewrap(int cols)
 		} else {
 			int ls = i;
 			while (ls < j) {
-				int remain = j - ls;
-				if (remain <= cols) { add_line(ls, remain); break; }
-				int brk = ls + cols, b = brk;
-				while (b > ls && B->text[b] != ' ') b--;
-				if (b == ls) b = brk;
-				add_line(ls, b - ls);
-				ls = b;
+				/* greedy fit by pixel width; break at the last space if a word
+				 * would overflow, else hard-break (one char always fits). */
+				int w = 0, e = ls, lastsp = -1;
+				while (e < j) {
+					unsigned cp;
+					int nb = utf8_decode(&B->text[e], &B->text[j], &cp);
+					int cw = body_cp_adv(cp);
+					if (w + cw > paw && e > ls) break;
+					if (cp == ' ') lastsp = e;
+					w += cw; e += nb;
+				}
+				int brk = (e < j && lastsp > ls) ? lastsp : e;
+				add_line(ls, brk - ls);
+				ls = brk;
 				while (ls < j && B->text[ls] == ' ') ls++;
 			}
 		}
 		i = j + 1;
 	}
 	B->wrap_seq = B->seq;
-	B->wrap_cols = cols;
+	B->wrap_cols = paw;
 	if (B->scroll > B->nlines - 1) B->scroll = B->nlines - 1;
 	if (B->scroll < 0) B->scroll = 0;
 }
@@ -511,9 +654,9 @@ static int inl_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 	return 0;
 }
 
-static void draw_inline_image(struct inl_img *im, int py, int phh, int cols)
+static void draw_inline_image(struct inl_img *im, int py, int phh, int paw)
 {
-	int paw = cols * GLYPH_W; if (paw < GLYPH_W) paw = GLYPH_W;
+	if (paw < 1) paw = 1;
 	int dw = 0, dh = 0;
 	img_disp_size(im, paw, &dw, &dh);
 	if (dw < 1) dw = 1;
@@ -521,9 +664,26 @@ static void draw_inline_image(struct inl_img *im, int py, int phh, int cols)
 
 	struct inlblit v;
 	v.x0 = 4;
-	v.y0 = py + (im->start_row - B->scroll) * GLYPH_H;
+	v.y0 = py + (im->start_row - B->scroll) * LINE_H;
 	v.dw = dw; v.dh = dh; v.clip_top = py; v.clip_bot = py + phh;
 	v.iw = im->iw; v.ih = im->ih; v.next_r = 0;
+
+	if (im->is_argb) {                 /* SVG: raw RGBA in img_pool, scaled blit */
+		const unsigned char *src = B->img_pool + im->coff;
+		unsigned *fb = win_fb();
+		for (int ry = 0; ry < dh; ry++) {
+			int dy = v.y0 + ry;
+			if (dy < v.clip_top || dy >= v.clip_bot) continue;
+			unsigned sy = (unsigned)ry * im->ih / (unsigned)dh;
+			const unsigned char *srow = src + (unsigned long)sy * im->iw * 4;
+			unsigned *drow = fb + (unsigned long)dy * BW + v.x0;
+			for (int x = 0; x < dw; x++) {
+				const unsigned char *p = srow + ((unsigned)x * im->iw / (unsigned)dw) * 4;
+				drow[x] = blend_px(p, drow[x]);
+			}
+		}
+		return;
+	}
 
 	struct poolrd r = { 0, im->coff, im->clen };
 	upng_decode(poolrd_get, &r, inl_row, &v, 0, 0);
@@ -532,32 +692,43 @@ static void draw_inline_image(struct inl_img *im, int py, int phh, int cols)
 /* A placeholder box for an image that couldn't be fetched/decoded. */
 static void draw_alt_box(struct inl_img *im, int py, int phh)
 {
-	int y0 = py + (im->start_row - B->scroll) * GLYPH_H;
-	if (y0 < py || y0 + GLYPH_H > py + phh) return;        /* keep it in-pane    */
+	int y0 = py + (im->start_row - B->scroll) * LINE_H;
+	if (y0 < py || y0 + LINE_H > py + phh) return;         /* keep it in-pane    */
 	const char *t = im->alt[0] ? im->alt : "[image]";
-	int w = (strlen(t) + 2) * GLYPH_W;
-	gfx_fill_rect(4, y0, w, GLYPH_H, 0xe6e9ef);
-	gfx_rect(4, y0, w, GLYPH_H, 0xb4bac4);
-	gfx_text(8, y0, t, 0x7a828c, GFX_TRANSPARENT);
+	int w = gfx_ui_width(t) + 8;
+	gfx_fill_rect(4, y0, w, LINE_H, 0xe6e9ef);
+	gfx_rect(4, y0, w, LINE_H, 0xb4bac4);
+	gfx_ui_text(8, y0 + 1, t, 0x7a828c);
 }
 
 /* --------------------------------------------------------------- drawing */
 
-static void draw_styled_line(int x, int y, int idx, unsigned bg)
+/* Draw one wrapped display line in the body font (the page @font-face when set,
+ * else the baked gfx_ui font), clipped vertically to [ct,cb). The pane bg is
+ * already filled, so the text blends over existing pixels. Bold is a 1px-offset
+ * overstrike; underline is a rule under the run. */
+static void draw_styled_line(int x, int y, int idx, int ct, int cb)
 {
 	int off = B->line_off[idx], len = B->line_len[idx];
 	int i = 0;
 	while (i < len) {
 		unsigned char a = B->attr[off + i];
 		char run[260]; int rl = 0;
-		while (i < len && B->attr[off + i] == a && rl < (int)sizeof run - 1)
-			run[rl++] = B->text[off + i++];
+		/* Accumulate whole codepoints (a multibyte char's bytes share one attr),
+		 * so the run boundary never splits a UTF-8 sequence into garbage. */
+		while (i < len && B->attr[off + i] == a) {
+			int nb = utf8_seqlen((unsigned char)B->text[off + i]);
+			if (i + nb > len) nb = 1;
+			if (rl + nb > (int)sizeof run - 1) break;
+			for (int b = 0; b < nb; b++) run[rl++] = B->text[off + i++];
+		}
 		run[rl] = '\0';
 		unsigned col = palette[a & ST_COLOR];
-		gfx_text(x, y, run, col, bg);
-		if (a & ST_BOLD)  gfx_text(x + 1, y, run, col, GFX_TRANSPARENT);
-		if (a & ST_UNDER) gfx_fill_rect(x, y + GLYPH_H - 2, rl * GLYPH_W, 1, col);
-		x += rl * GLYPH_W;
+		body_draw(x, y, run, col, ct, cb);
+		if (a & ST_BOLD) body_draw(x + 1, y, run, col, ct, cb);
+		int rw = body_width(run);
+		if (a & ST_UNDER) gfx_fill_rect(x, y + LINE_H - 4, rw, 1, col);
+		x += rw;
 	}
 }
 
@@ -590,7 +761,7 @@ static void render(void)
 	int py = MENU_H + TAB_H + ADDR_H, pw = BW - SCROLL_W;
 	int phh = BH - MENU_H - TAB_H - ADDR_H; if (phh < 0) phh = 0;
 	gfx_fill_rect(0, py, pw, phh, bg);
-	int rows = phh / GLYPH_H;
+	int rows = phh / LINE_H;
 
 	if (B->mode == MODE_IMAGE) {
 		if (B->loading)
@@ -599,8 +770,8 @@ static void render(void)
 			draw_image(0, py, pw, phh, bg);
 		scrollbar_draw(pw, py, SCROLL_W, phh, 0, 0, 0);  /* inert scrollbar */
 	} else {
-		int cols = (pw - 8) / GLYPH_W;
-		rewrap(cols);
+		int paw = pw - 8;                          /* content width, px */
+		rewrap(paw);
 		if (B->loading && B->nlines == 0) {
 			gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
 		} else if (B->nlines == 0) {
@@ -611,7 +782,7 @@ static void render(void)
 		for (int r = 0; r < rows; r++) {
 			int idx = B->scroll + r;
 			if (idx >= B->nlines) break;
-			draw_styled_line(4, py + r * GLYPH_H, idx, bg);
+			draw_styled_line(4, py + r * LINE_H, idx, py, py + phh);
 		}
 
 		/* inline images, over their reserved (blank) rows */
@@ -624,7 +795,7 @@ static void render(void)
 			/* On-screen now: a deferred loading="lazy" image gets flagged so the
 			 * worker fetches it (no-op once fetched). */
 			if (im->lazy && !im->fetched && show_images) im->want = 1;
-			if (im->ok && show_images) draw_inline_image(im, py, phh, cols);
+			if (im->ok && show_images) draw_inline_image(im, py, phh, paw);
 			else                       draw_alt_box(im, py, phh);
 		}
 
@@ -648,7 +819,7 @@ static void pane_metrics(int *py, int *phh, int *rows)
 {
 	*py = MENU_H + TAB_H + ADDR_H;
 	*phh = BH - MENU_H - TAB_H - ADDR_H; if (*phh < 0) *phh = 0;
-	*rows = (*phh > 0) ? *phh / GLYPH_H : 1;
+	*rows = (*phh > 0) ? *phh / LINE_H : 1;
 }
 
 static void navigate(const char *url)
@@ -842,19 +1013,31 @@ static void handle_click(int mx, int my)
 		return;
 	}
 	if (my >= py && my < py + phh) {                        /* a link? */
-		int row = B->scroll + (my - py) / GLYPH_H;
-		int col = (mx - 4) / GLYPH_W;
+		int row = B->scroll + (my - py) / LINE_H;
 		/* The link/line tables can be moved by a worker realloc mid-load; hold
 		 * the interlock while we scan them and copy the target href out. */
 		char res[URL_MAX]; res[0] = '\0';
 		blk_lock();
-		if (row >= 0 && row < B->nlines && col >= 0 && col < B->line_len[row]) {
-			int off = B->line_off[row] + col;
-			for (int i = 0; i < B->nlinks; i++)
-				if (off >= B->links[i].start && off < B->links[i].end) {
-					resolve_url(B->cur_url, B->links[i].href, res, sizeof res);
-					break;
-				}
+		if (row >= 0 && row < B->nlines) {
+			/* proportional: walk the line's glyphs to find which char the click
+			 * (mx, relative to the 4px left margin) falls on. */
+			int len = B->line_len[row], px = mx - 4, acc = 0, col = -1;
+			int base = B->line_off[row];
+			for (int k = 0; k < len; ) {
+				unsigned cp;
+				int nb = utf8_decode(&B->text[base + k], &B->text[base + len], &cp);
+				int cw = body_cp_adv(cp);
+				if (px < acc + cw) { col = k; break; }
+				acc += cw; k += nb;
+			}
+			if (col >= 0) {
+				int off = B->line_off[row] + col;
+				for (int i = 0; i < B->nlinks; i++)
+					if (off >= B->links[i].start && off < B->links[i].end) {
+						resolve_url(B->cur_url, B->links[i].href, res, sizeof res);
+						break;
+					}
+			}
 		}
 		blk_unlock();
 		if (res[0]) { navigate(res); return; }

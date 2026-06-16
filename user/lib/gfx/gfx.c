@@ -1,12 +1,9 @@
 /* gfx.c — user-space drawing into a window's shared pixel buffer. See gfx.h. */
 #include "gfx.h"
-#include "font_aa.h"
-#include "font_ui.h"
+#include "font.h"   /* scalable fonts, loaded at runtime (no baked atlas) */
 #include "owos.h"   /* KEY_* editing codes delivered via WEV_KEY */
 
-/* The GUI keeps the legacy 8x16 cell (app layouts depend on it); only the glyph
- * pixels gained antialiasing. font_aa is an 8-bit coverage atlas baked offline
- * by tools/genfont.c — change these and re-bake to match. */
+/* Apps lay out the monospace grid on this fixed cell (terminals, the editor). */
 #define GFX_FONT_W 8
 #define GFX_FONT_H 16
 
@@ -76,25 +73,81 @@ void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb)
 	}
 }
 
-void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg)
+/* ---------------------------------------------------------------- fonts -----
+ * Both fonts gfx draws with — the proportional UI font and the fixed-width
+ * monospace grid font — are loaded at RUNTIME from /etc/fonts (one shared copy on
+ * disk each) and rasterised by user/lib/font. No app bakes in a bitmap atlas, and
+ * text is full Unicode (UTF-8 in; accents/Greek/Cyrillic via the font's cmap).
+ * A `gfx_face` is a lazily-loaded font plus a per-codepoint glyph cache. */
+struct gcache_e { unsigned cp; unsigned char *bm; int w, h, ox, oy, adv; int valid; };
+#define FACE_CACHE 512
+/* No member initialisers here: the two faces are zero-initialised statics so the
+ * big glyph cache lives in .bss (free in the binary), not .data. The path + size
+ * are passed to face_ready by the callers (compile-time constants). */
+struct gfx_face {
+	struct font    *font;
+	int             px, baseline, tried;
+	struct gcache_e cache[FACE_CACHE];
+};
+static struct gfx_face g_sans, g_mono;
+
+#define SANS_PATH "/etc/fonts/LiberationSans-Regular.ttf"
+#define SANS_PX   15
+#define MONO_PATH "/etc/fonts/LiberationMono-Regular.ttf"
+#define MONO_PX   13
+
+static int face_ready(struct gfx_face *f, const char *path, int px)
 {
-	int transparent = (bg & GFX_TRANSPARENT) != 0;
-	for (int row = 0; row < GFX_FONT_H; row++) {
-		int sy = y + row;
-		if ((unsigned)sy >= (unsigned)g_h)
-			continue;
-		const unsigned char *cov = font_aa[ch][row];
-		for (int col = 0; col < GFX_FONT_W; col++) {
-			int sx = x + col;
-			if ((unsigned)sx >= (unsigned)g_w)
-				continue;
-			unsigned a = cov[col];
-			if (a == 0 && transparent)
-				continue;
-			unsigned *px = &g_fb[sy * g_w + sx];
-			*px = transparent ? gfx_blend(fg, *px, a) : gfx_blend(fg, bg, a);
+	if (!f->tried) {
+		f->tried = 1;
+		f->px = px;
+		struct statinfo st;
+		if (stat(path, &st) < 0 || st.is_dir || st.size == 0) return 0;
+		unsigned char *buf = malloc(st.size);    /* kept for the font's lifetime */
+		if (!buf) return 0;
+		if (readfile_at(path, 0, buf, st.size) != (int)st.size) { free(buf); return 0; }
+		f->font = font_load(buf, (int)st.size);
+		if (!f->font) { free(buf); return 0; }
+		font_vmetrics(f->font, (float)px, &f->baseline, 0, 0);
+	}
+	return f->font != 0;
+}
+
+static struct gcache_e *face_glyph(struct gfx_face *f, unsigned cp)
+{
+	struct gcache_e *g = &f->cache[cp % FACE_CACHE];
+	if (g->valid && g->cp == cp) return g;
+	if (g->valid) { free(g->bm); g->bm = 0; }
+	int gi = font_glyph_index(f->font, (int)cp);
+	g->bm = font_render_glyph(f->font, gi, (float)f->px, &g->w, &g->h, &g->ox, &g->oy, &g->adv);
+	g->cp = cp; g->valid = 1;
+	return g;
+}
+
+/* Blit a cached glyph with its top-left at (x + ox, baseline + oy). */
+static void face_blit(int x, int baseline, const struct gcache_e *g, unsigned fg)
+{
+	if (!g->bm) return;
+	for (int gy = 0; gy < g->h; gy++) {
+		int sy = baseline + g->oy + gy;
+		if ((unsigned)sy >= (unsigned)g_h) continue;
+		const unsigned char *srow = g->bm + gy * g->w;
+		for (int gx = 0; gx < g->w; gx++) {
+			int sx = x + g->ox + gx;
+			if ((unsigned)sx >= (unsigned)g_w) continue;
+			unsigned a = srow[gx];
+			if (a) { unsigned *px = &g_fb[sy * g_w + sx]; *px = gfx_blend(fg, *px, a); }
 		}
 	}
+}
+
+/* One monospace cell: optional opaque background, then the glyph centred in the
+ * fixed GFX_FONT_W x GFX_FONT_H cell so columns stay aligned. */
+void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg)
+{
+	if (!(bg & GFX_TRANSPARENT)) gfx_fill_rect(x, y, GFX_FONT_W, GFX_FONT_H, bg);
+	if (!face_ready(&g_mono, MONO_PATH, MONO_PX)) return;
+	face_blit(x, y + g_mono.baseline, face_glyph(&g_mono, ch), fg);
 }
 
 void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg)
@@ -103,43 +156,40 @@ void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg)
 		gfx_glyph(x, y, (unsigned char)*s, fg, bg);
 }
 
-/* Proportional sans-serif UI font (chrome only). Blends fg over the existing
- * pixels — fill the background first — and advances per glyph. See gfx.h. */
-static void gfx_ui_glyph(int x, int y, unsigned char ch, unsigned fg)
+/* Proportional UI text (UTF-8). UIFONT_H stays the advertised line height apps
+ * lay out against; the glyph sits on its baseline within that. */
+int gfx_ui_cw_cp(unsigned cp)
 {
-	for (int row = 0; row < UIFONT_H; row++) {
-		int sy = y + row;
-		if ((unsigned)sy >= (unsigned)g_h)
-			continue;
-		const unsigned char *cov = font_ui[ch][row];
-		for (int col = 0; col < UIFONT_W; col++) {
-			int sx = x + col;
-			if ((unsigned)sx >= (unsigned)g_w)
-				continue;
-			unsigned a = cov[col];
-			if (a) {
-				unsigned *px = &g_fb[sy * g_w + sx];
-				*px = gfx_blend(fg, *px, a);
-			}
-		}
-	}
+	if (!face_ready(&g_sans, SANS_PATH, SANS_PX)) return GFX_FONT_W;
+	return face_glyph(&g_sans, cp)->adv;
 }
+int gfx_ui_cw(unsigned char c) { return gfx_ui_cw_cp(c); }
 
 int gfx_ui_width(const char *s)
 {
-	int w = 0;
-	for (; *s; s++)
-		w += font_ui_adv[(unsigned char)*s];
+	const char *end = s + strlen(s);
+	int w = 0; unsigned cp;
+	while (s < end) { s += utf8_decode(s, end, &cp); w += gfx_ui_cw_cp(cp); }
 	return w;
 }
 
-int gfx_ui_cw(unsigned char c) { return font_ui_adv[c]; }
-
 void gfx_ui_text(int x, int y, const char *s, unsigned fg)
 {
-	for (; *s; s++) {
-		gfx_ui_glyph(x, y, (unsigned char)*s, fg);
-		x += font_ui_adv[(unsigned char)*s];
+	const char *end = s + strlen(s);
+	unsigned cp;
+	if (face_ready(&g_sans, SANS_PATH, SANS_PX)) {
+		while (s < end) {
+			s += utf8_decode(s, end, &cp);
+			struct gcache_e *g = face_glyph(&g_sans, cp);
+			face_blit(x, y + g_sans.baseline, g, fg);
+			x += g->adv;
+		}
+		return;
+	}
+	while (s < end) {                              /* sans missing: mono fallback */
+		s += utf8_decode(s, end, &cp);
+		gfx_glyph(x, y, cp < 0x80 ? (unsigned char)cp : '?', fg, GFX_TRANSPARENT);
+		x += GFX_FONT_W;
 	}
 }
 
@@ -586,10 +636,10 @@ static void tab_label(int x, int y, const char *s, int maxpx, unsigned fg)
 	if (gfx_ui_width(s) <= maxpx) { gfx_ui_text(x, y, s, fg); return; }
 	char buf[40];
 	int k = 0;
-	int dots = font_ui_adv['.'] * 2;
+	int dots = gfx_ui_cw_cp('.') * 2;
 	int w = 0;
 	for (int i = 0; s[i] && k < (int)sizeof buf - 3; i++) {
-		int aw = font_ui_adv[(unsigned char)s[i]];
+		int aw = gfx_ui_cw((unsigned char)s[i]);
 		if (w + aw + dots > maxpx)
 			break;
 		buf[k++] = s[i];
@@ -940,4 +990,139 @@ int sidebar_drag(struct sidebar *sb, int x, int mx)
 		return 0;
 	sb->w = nw;
 	return 1;
+}
+
+/* ------------------------------------------------------------- separator */
+
+/* A thin divider: a dark groove line with a faint highlight beside it, so it
+ * reads on both light and dark panels. Horizontal spans [x, x+len) at y;
+ * vertical spans [y, y+len) at x. */
+void gfx_separator(int x, int y, int len, int vertical)
+{
+	if (len <= 0) return;
+	if (vertical) {
+		gfx_fill_rect(x,     y, 1, len, 0x05070au);
+		gfx_fill_rect(x + 1, y, 1, len, 0x3a4658u);
+	} else {
+		gfx_fill_rect(x, y,     len, 1, 0x05070au);
+		gfx_fill_rect(x, y + 1, len, 1, 0x3a4658u);
+	}
+}
+
+/* ------------------------------------------------------------- select */
+
+#define SEL_BG     0xffffffu   /* field + list background          */
+#define SEL_FG     0x101418u   /* option text                      */
+#define SEL_BORDER 0x3a3f48u   /* idle border                      */
+#define SEL_ACCENT 0x2f6bd8u   /* open border + selected row mark  */
+#define SEL_HILITE 0xdce8fcu   /* hovered / selected row tint      */
+#define SEL_CHEVRON 0x5a6472u
+
+void select_init(struct select_box *s, const char *const *options, int count, int selected)
+{
+	s->options  = options;
+	s->count    = count;
+	s->selected = (selected >= 0 && selected < count) ? selected : 0;
+	s->open     = 0;
+	s->hover    = -1;
+}
+
+/* Closed box (current option + a down chevron); when open, the option list drops
+ * below it. Draw the select AFTER the rest of the UI so the open list overlays. */
+void select_draw(struct select_box *s, int x, int y, int w, int h)
+{
+	gfx_fill_rect(x, y, w, h, SEL_BG);
+	gfx_rect(x, y, w, h, s->open ? SEL_ACCENT : SEL_BORDER);
+
+	const char *lbl = (s->selected >= 0 && s->selected < s->count)
+	                  ? s->options[s->selected] : "";
+	gfx_ui_text(x + TF_PAD, y + (h - UIFONT_H) / 2, lbl, SEL_FG);
+
+	int tx = x + w - 16, ty = y + (h - 4) / 2;      /* a 8x4 down chevron */
+	for (int r = 0; r < 4; r++)
+		gfx_fill_rect(tx + r, ty + r, 8 - 2 * r, 1, SEL_CHEVRON);
+
+	if (s->open && s->count > 0) {
+		int ly = y + h, lh = s->count * GUI_ROW_H;
+		gfx_fill_rect(x, ly, w, lh, SEL_BG);
+		for (int i = 0; i < s->count; i++) {
+			int ry = ly + i * GUI_ROW_H;
+			if (i == s->hover || (s->hover < 0 && i == s->selected))
+				gfx_fill_rect(x + 1, ry, w - 2, GUI_ROW_H, SEL_HILITE);
+			gfx_ui_text(x + TF_PAD, ry + (GUI_ROW_H - UIFONT_H) / 2,
+			            s->options[i], SEL_FG);
+		}
+		gfx_rect(x, ly, w, lh, SEL_BORDER);
+	}
+}
+
+int select_click(struct select_box *s, int x, int y, int w, int h, int mx, int my)
+{
+	int in_box = mx >= x && mx < x + w && my >= y && my < y + h;
+	if (!s->open) {
+		if (in_box) { s->open = 1; s->hover = s->selected; return -1; }
+		return 0;
+	}
+	if (in_box) { s->open = 0; return -1; }          /* header toggles closed */
+	int ly = y + h, lh = s->count * GUI_ROW_H;
+	if (mx >= x && mx < x + w && my >= ly && my < ly + lh) {
+		int row = (my - ly) / GUI_ROW_H;
+		if (row >= 0 && row < s->count) { s->selected = row; s->open = 0; return 1; }
+	}
+	s->open = 0;                                      /* clicked away: close  */
+	return 0;
+}
+
+int select_motion(struct select_box *s, int x, int y, int w, int h, int mx, int my)
+{
+	if (!s->open) return 0;
+	int ly = y + h, lh = s->count * GUI_ROW_H, nh = -1;
+	if (mx >= x && mx < x + w && my >= ly && my < ly + lh)
+		nh = (my - ly) / GUI_ROW_H;
+	if (nh != s->hover) { s->hover = nh; return 1; }
+	return 0;
+}
+
+/* Keyboard control for a focused select. Up/Down move (the hovered row when open,
+ * else the selection directly, like a native <select>); Home/End jump to the
+ * ends; Enter/Space open it, or confirm the hovered row; Esc closes without
+ * changing. Same return convention as select_click. */
+int select_key(struct select_box *s, char key)
+{
+	unsigned char u = (unsigned char)key;
+	if (s->count <= 0) return 0;
+	if (u == KEY_UP || u == KEY_DOWN) {
+		int dir = (u == KEY_DOWN) ? 1 : -1;
+		if (s->open) {
+			int h = (s->hover < 0) ? s->selected : s->hover;
+			h += dir;
+			if (h < 0) h = 0;
+			if (h >= s->count) h = s->count - 1;
+			s->hover = h;
+			return -1;
+		}
+		int n = s->selected + dir;                  /* closed: change directly */
+		if (n < 0) n = 0;
+		if (n >= s->count) n = s->count - 1;
+		if (n != s->selected) { s->selected = n; return 1; }
+		return -1;
+	}
+	if (u == KEY_HOME || u == KEY_END) {
+		int n = (u == KEY_HOME) ? 0 : s->count - 1;
+		if (s->open) { s->hover = n; return -1; }
+		if (n != s->selected) { s->selected = n; return 1; }
+		return -1;
+	}
+	if (key == '\n' || key == '\r' || key == ' ') {
+		if (!s->open) { s->open = 1; s->hover = s->selected; return -1; }
+		int h = (s->hover >= 0 && s->hover < s->count) ? s->hover : s->selected;
+		s->selected = h;
+		s->open = 0;
+		return 1;
+	}
+	if (u == 27) {                                  /* Esc: close, no change   */
+		if (s->open) { s->open = 0; return -1; }
+		return 0;
+	}
+	return 0;
 }

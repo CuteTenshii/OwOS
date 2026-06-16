@@ -271,6 +271,20 @@ and the only normal entry to a context switch.
   swaps CR3 *before* freeing the old address space.
 - **exit** makes a zombie; the parent (`waitpid` / the shell's `sched_try_reap`)
   frees it. Blocking syscalls yield rather than busy-spin.
+- **`timer_sleep` deschedules** (`sched_sleep_until`): a sleeping task goes
+  `TASK_WAITING` with a `wake_tick` and is re-woken by `sched_wake_due()` (called
+  each timer tick) — it is **not** kept `RUNNABLE` and `hlt`-spun. That earlier
+  design round-robined every sleeper and burned a tick per cycle, so N sleeping
+  threads (each open GUI app = a `win_wait` loop + a worker `msleep`) dilated
+  every thread's wakeup latency to O(N) ticks and the whole UI lagged with many
+  windows. The **main task never sleeps** (polls + `hlt`), so it is the always-
+  runnable fallback and `schedule()` can't starve. (Network waits — tcp_read/
+  accept — still use their own `sti; hlt` loops; only `timer_sleep` deschedules.)
+- `MAX_TASKS` is **64**: the steady set (WM, terminal, service daemons,
+  boot_bringup, screenshot worker) plus an app's burst — the browser is its
+  process + a fetch worker + one thread per inline image. At 16 a freshly-opened
+  browser left no slot and other programs failed to `spawn`. Only `tasks[]` scales
+  with it; each slot's kstack is `kmalloc`'d on demand (heap is the real ceiling).
 - The **EOI is sent at the start of `irq_handler`**, because a timer handler that
   context-switches away never reaches the end.
 - Kernel-thread stacks are **16 KiB** (`KSTACK_SIZE`), bumped from 4 KiB for the
@@ -632,6 +646,52 @@ with `$(HEADERS)` (curl + browser). The browser also honours **`X-Content-Type-
 Options: nosniff`**: with it set, `render_raw` treats the body as HTML only when
 the server *declared* an HTML type — the empty-Content-Type → HTML guess is
 suppressed.
+
+## Brotli codec (user/lib/brotli: decode.c + encode.c + dictionary.bin)
+
+A from-scratch **RFC 7932** codec, entirely user space, for the HTTP `br`
+content-coding (and, eventually, WOFF2). Both halves are **whole-buffer** (the
+Brotli stream doesn't carry its decompressed size): they take a full buffer and
+return a malloc'd one the caller frees (`brotli_decompress`/`brotli_compress`,
+NULL on error). The 122,784-byte RFC static dictionary ships as `dictionary.bin`,
+objcopy'd into a blob (`$(BROTLIDICT)`, the path-derived symbol
+`_binary_user_lib_brotli_dictionary_bin_start` that decode.c externs) and linked
+only into consumers (browser + curl via `$(BROTLI)`).
+
+- **decode.c is a complete decoder**: stream/meta-block headers, simple + complex
+  prefix codes (the §3.5 RLE-extension and the single-symbol code-length-code
+  that is a **0-bit** code — see below), block splits, literal + distance context
+  modelling, the distance ring with postfix/direct codes, and static-dictionary
+  references with the 121 word transforms. Its constant tables (context lookup,
+  prefix/suffix transform data, dictionary offsets, command split, block-length
+  ranges) are the **authoritative reference values**; an earlier WIP's
+  `DICT_OFFSET` was shifted by one and is fixed.
+- **encode.c is greedy LZ77 + per-meta-block Huffman** — real compression, a
+  pragmatic ratio (no context modelling / optimal parse / dictionary use, so
+  ~10× larger than `brotli -q11` on text but excellent on repetitive data). It
+  keeps the format simple where allowed: one block type + one tree per category,
+  NPOSTFIX=NDIRECT=0, only regular distance codes (never the ring's short codes),
+  and length-limited Huffman via the **reference's own trick** (raise the leaf-
+  weight floor and rebuild until depth ≤ 15). Its match-finder/frequency scratch
+  is **file-static**, not on the stack (the 16 KiB user stack would overflow);
+  meta-blocks are chunked at 1<<18 so the command buffer stays bounded while
+  back-references still span the whole window.
+- **Two non-obvious format invariants, load-bearing for both halves:** the
+  decoder stops reading code-length symbols (and code-length-*code* lengths) the
+  instant the Huffman space is exhausted, so the encoder must emit **exactly** up
+  to that point — no trailing entries, or the bitstream desyncs. And a
+  code-length-code with a **single** symbol never empties its space, so it is a
+  0-bit code: the encoder emits the per-symbol lengths with zero bits and the
+  decoder must decode them with zero bits (this is the all-symbols-same-length
+  case, e.g. a full 256-symbol literal alphabet — the reference rejects anything
+  else with `CL_SPACE`).
+- **Verified** on the host against the system `brotli` CLI: our-decode of
+  `brotli`-encoded streams across every quality/window, our-encode round-tripped
+  through both `brotli -d` and our own decoder, ~700 differential + fuzz cases,
+  ASan/UBSan-clean. See [[userspace-lib-over-syscall]] (codecs are user-space libs,
+  never syscalls) and the zlib codecs for the streaming-`inflate` counterpart.
+  The browser's HTTP/1.1 path advertises `br` and decodes it via a `brotli_http`
+  helper that buffers the body then `brotli_decompress`es it (h2 stays identity).
 
 ## ACPI, power & battery (power.c + aml.c + battery.c)
 

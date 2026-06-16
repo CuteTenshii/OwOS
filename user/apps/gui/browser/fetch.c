@@ -1,11 +1,73 @@
-/* fetch.c — HTTP/HTTPS transport for the browser: buffered reader, one
- * transaction, and the redirect-following fetch. Ported from the kernel
- * app_browser.c with net_sock_* -> the net_* user syscalls. Runs on the worker
- * thread (see main.c), so its blocking reads never stall the UI. The cookie +
- * HSTS jar and its SQLite persistence live in jar.c; this file only calls
- * cookie_store/cookie_header/hsts_add/hsts_has (declared in browser.h). */
+/* fetch.c — the browser's main page transaction: the buffered reader, response-
+ * header parsing, the HTTP/1.1 + HTTP/2 fetch, downloads (an attachment response
+ * streamed to disk instead of B->raw — kept here because it shares this file's
+ * body reader), the redirect follower, the file:/data: schemes, and do_fetch.
+ * Separately-fetched sub-resources (inline images, favicon, external stylesheets)
+ * live in resource.c; the cookie/HSTS jar in jar.c. Runs on the worker thread
+ * (main.c), so its blocking reads never stall the UI. */
 #include "browser.h"
-#include "headers.h"   /* libcurl: HTTP response header parsing */
+#include "fetchint.h"  /* shared transport interface + BR_* request headers   */
+#include "headers.h"   /* libcurl: HTTP response header parsing               */
+#include "brotli.h"    /* RFC 7932 `br` content-coding (whole-buffer decode)   */
+
+/* Content-encoding of a response body. */
+enum { ENC_NONE = 0, ENC_ZLIB = 1, ENC_BR = 2 };
+
+/* Brotli equivalent of inflate_http, with the same pull/push contract: pull the
+ * whole compressed body through `rd` (brotli has no streaming window — the
+ * stream doesn't carry its decompressed size), decompress it, and push the
+ * result through `wr`. Returns 0 on success or caller early-stop, -1 on a
+ * malformed stream or OOM. */
+static int brotli_http(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
+{
+	unsigned char *buf = 0;
+	int cap = 0, len = 0, c;
+	while ((c = rd(rctx)) >= 0) {
+		if (len + 1 > cap) {
+			int ncap = cap * 2 + 8192;
+			unsigned char *nb = realloc(buf, (unsigned)ncap);
+			if (!nb) { free(buf); return -1; }
+			buf = nb; cap = ncap;
+		}
+		buf[len++] = (unsigned char)c;
+	}
+	int outlen = 0;
+	unsigned char *out = brotli_decompress(buf, len, &outlen);
+	free(buf);
+	if (!out) return -1;
+	wr(wctx, out, (unsigned)outlen);        /* one push; a <0 (full) is a clean stop */
+	free(out);
+	return 0;
+}
+
+/* Decompress an in-memory body per its content-encoding (ENC_BR / ENC_ZLIB).
+ * Returns a malloc'd buffer of *out_len bytes (caller frees), or NULL. Used by
+ * the HTTP/2 path, whose body arrives already buffered (pushed in DATA chunks)
+ * rather than pulled. */
+struct memrd { const unsigned char *p; int len, pos; };
+static int memrd_fn(void *c) { struct memrd *m = c; return m->pos < m->len ? m->p[m->pos++] : -1; }
+struct memwr { unsigned char *buf; int cap, len, oom; };
+static int memwr_fn(void *c, const unsigned char *p, unsigned n)
+{
+	struct memwr *w = c;
+	if (w->len + (int)n > w->cap) {
+		int nc = (w->len + (int)n) * 2 + 4096;
+		unsigned char *nb = realloc(w->buf, (unsigned)nc);
+		if (!nb) { w->oom = 1; return -1; }
+		w->buf = nb; w->cap = nc;
+	}
+	for (unsigned i = 0; i < n; i++) w->buf[w->len++] = p[i];
+	return 0;
+}
+static unsigned char *body_decompress(const unsigned char *in, int in_len, int enc, int *out_len)
+{
+	if (enc == ENC_BR) return brotli_decompress(in, in_len, out_len);
+	struct memrd r = { in, in_len, 0 };
+	struct memwr w = { 0, 0, 0, 0 };
+	if (inflate_http(memrd_fn, &r, memwr_fn, &w) < 0 || w.oom) { free(w.buf); return 0; }
+	*out_len = w.len;
+	return w.buf ? w.buf : malloc(1);
+}
 
 static int rgetc(void)
 {
@@ -33,7 +95,7 @@ void show_error(const char *m)
 }
 
 /* Case-insensitive substring test (used to spot "html" inside a Content-Type).
- * streq_ci lives in browser.h; the cookie/HSTS jar lives in jar.c. */
+ * streq_ci lives in dom.h (via browser.h); the cookie/HSTS jar lives in jar.c. */
 static int has_sub(const char *s, const char *sub)
 {
 	for (; *s; s++) {
@@ -149,12 +211,6 @@ static int body_fill(struct bodysrc *b, unsigned char *out, int max)
 	}
 	return got;
 }
-
-/* Request-header values, shared by the HTTP/1.1 and HTTP/2 request builders so
- * the browser presents itself identically on either protocol. */
-#define BR_UA     "Mozilla/5.0 (OwOS; x86) OwOS-Browser/1.0"
-#define BR_ACCEPT "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-#define BR_ACCLNG "en-US,en;q=0.9"
 
 /* ------------------------------------------------------------- downloads */
 
@@ -345,7 +401,9 @@ static void stream_download(const char *url, struct bodysrc *bs, int enc_gz)
 	struct dlsink d = { 0 };
 	int wrote = -1;
 	if (stream_begin(path) == 0) {
-		if (enc_gz) {
+		if (enc_gz == ENC_BR) {
+			brotli_http(body_src, bs, file_sink, &d);
+		} else if (enc_gz) {
 			inflate_http(body_src, bs, file_sink, &d);
 		} else {
 			/* Bulk-read into a page-sized buffer, then one stream_write per fill. */
@@ -360,18 +418,95 @@ static void stream_download(const char *url, struct bodysrc *bs, int enc_gz)
 
 /* ----------------------------------------------------------- transaction */
 
+/* External stylesheet URLs from the Link: response header (heap list in B->
+ * ext_css). Reset each response, consumed by html_to_text before layout. */
+static void ext_css_clear(void)
+{
+	struct css_link *c = B->ext_css;
+	while (c) { struct css_link *n = c->next; free(c->url); free(c); c = n; }
+	B->ext_css = 0;
+}
+
+static void ext_css_add(const char *url)
+{
+	struct css_link *c = malloc(sizeof *c);
+	if (!c) return;
+	int len = strlen(url);
+	c->url = malloc((unsigned)len + 1);
+	if (!c->url) { free(c); return; }
+	for (int i = 0; i <= len; i++) c->url[i] = url[i];
+	c->next = B->ext_css;
+	B->ext_css = c;
+}
+
+/* True if "stylesheet" appears as a token of the rel value within [q,end). */
+static int rel_has_stylesheet(const char *q, const char *end)
+{
+	for (const char *s = q; s + 10 <= end; s++)
+		if (starts_ci(s, "stylesheet")) return 1;
+	return 0;
+}
+
+/* Parse one Link: header value (RFC 8288): "<url>; rel=stylesheet, <url2>; …".
+ * For each entry whose rel includes "stylesheet", resolve its URL against `base`
+ * and add it to B->ext_css. Each entry's params are scanned only up to the next
+ * top-level comma, so one entry's rel can't leak into another's. */
+static void parse_link_header(const char *v, const char *base)
+{
+	while (*v) {
+		while (*v == ' ' || *v == ',' || *v == '\t') v++;
+		if (!*v) break;
+
+		const char *entry = v, *eend = v;        /* this entry: [entry, eend) */
+		while (*eend && *eend != ',') eend++;
+
+		char url[URL_MAX]; url[0] = '\0';
+		const char *p = entry;
+		if (*p == '<') {
+			p++;
+			int k = 0;
+			while (p < eend && *p != '>' && k < (int)sizeof url - 1) url[k++] = *p++;
+			url[k] = '\0';
+			if (p < eend && *p == '>') p++;
+		}
+
+		int is_sheet = 0;                        /* scan params (after the URL) */
+		for (const char *q = p; q < eend; q++) {
+			if ((q == p || q[-1] == ';' || q[-1] == ' ') && starts_ci(q, "rel")) {
+				const char *r = q + 3;
+				while (r < eend && *r == ' ') r++;
+				if (r < eend && *r == '=') {
+					r++;
+					while (r < eend && (*r == ' ' || *r == '"')) r++;
+					const char *rv = r;
+					while (rv < eend && *rv != ';') rv++;
+					if (rel_has_stylesheet(r, rv)) is_sheet = 1;
+				}
+			}
+		}
+
+		if (is_sheet && url[0]) {
+			char abs[URL_MAX];
+			resolve_url(base, url, abs, sizeof abs);
+			ext_css_add(abs);
+		}
+		v = (*eend == ',') ? eend + 1 : eend;
+	}
+}
+
 /* Parse a response header block (an HTTP/1.1 block, or the HTTP/2-synthesized
  * "HTTP/x NNN\r\nname: value\r\n…" equivalent) into the browser state: sets
  * B->ctype / B->dl_name / B->cdisp_attach, stores cookies for `host`, notes
- * HSTS, resolves any Location into `loc`, and reports the body framing
- * (chunked / content-length / gzip — moot over h2, which sends none). Returns
- * the status code. Shared by the HTTP/1.1 and HTTP/2 fetch paths. */
+ * HSTS, collects Link: stylesheets, resolves any Location into `loc`, and reports
+ * the body framing (chunked / content-length / gzip — moot over h2, which sends
+ * none). Returns the status code. Shared by the HTTP/1.1 and HTTP/2 fetch paths.*/
 static int parse_response(const char *hdr, const char *host, const char *full_url,
                           char *loc, int loc_cap, int *chunked, int *have_len,
                           unsigned *content_len, int *enc_gz)
 {
 	*chunked = 0; *have_len = 0; *enc_gz = 0; *content_len = 0;
 	B->nosniff = false;
+	ext_css_clear();        /* this response's Link: stylesheets replace the last */
 
 	/* Parse the raw block once into a k/v object, then just query it. */
 	struct http_headers H;
@@ -382,8 +517,10 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 	if (te && http_header_has_token(te, "chunked")) *chunked = 1;
 
 	const char *ce = http_headers_get(&H, "content-encoding");
-	if (ce && (http_header_has_token(ce, "gzip") || http_header_has_token(ce, "deflate")))
-		*enc_gz = 1;
+	if (ce && http_header_has_token(ce, "br"))
+		*enc_gz = ENC_BR;
+	else if (ce && (http_header_has_token(ce, "gzip") || http_header_has_token(ce, "deflate")))
+		*enc_gz = ENC_ZLIB;
 
 	const char *cl = http_headers_get(&H, "content-length");
 	if (cl) { bool ok; unsigned x = http_parse_uint(cl, &ok); if (ok) { *content_len = x; *have_len = 1; } }
@@ -398,6 +535,7 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 			B->ctype[k++] = lower(*v);
 		B->ctype[k] = '\0';
 	}
+	html_set_charset(ct);   /* charset param drives html.c transcoding (NULL = reset) */
 
 	const char *cd = http_headers_get(&H, "content-disposition");
 	if (cd) {
@@ -428,6 +566,11 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 
 	if (http_headers_get(&H, "strict-transport-security")) hsts_add(host);
 
+	/* Link: <a.css>; rel=stylesheet — external sheets declared in the header. */
+	int nlink = http_headers_count(&H, "link");
+	for (int i = 0; i < nlink; i++)
+		parse_link_header(http_headers_at(&H, "link", i), full_url);
+
 	/* nosniff: the server forbids MIME-sniffing — honour the declared
 	 * Content-Type and never guess the body's type (see render_raw). */
 	const char *xcto = http_headers_get(&H, "x-content-type-options");
@@ -452,8 +595,23 @@ struct h2tx {
 	int  allow_dl;
 	int  status;
 	int  is_dl, dl_open, dl_started, dl_fail;
+	int  enc;                         /* content-encoding (ENC_*) of the body    */
+	unsigned char *body; int blen, bcap;   /* buffered compressed body (enc != 0) */
 	char dl_path[256];
 };
+
+/* Append a DATA chunk to the h2 transaction's compressed-body buffer. */
+static int h2buf(struct h2tx *h, const unsigned char *p, int n)
+{
+	if (h->blen + n > h->bcap) {
+		int nc = (h->blen + n) * 2 + 4096;
+		unsigned char *nb = realloc(h->body, (unsigned)nc);
+		if (!nb) return -1;
+		h->body = nb; h->bcap = nc;
+	}
+	for (int i = 0; i < n; i++) h->body[h->blen++] = p[i];
+	return 0;
+}
 
 /* Headers-ready hook (fired before any DATA): parse the response, and if it is
  * a download, open the destination file now so the body streams to disk. */
@@ -464,6 +622,7 @@ static int h2_headers_cb(void *ctx, const char *block, int len)
 	int chunked, have_len, enc_gz; unsigned clen;
 	h->status = parse_response(block, h->host, h->full_url, h->loc, h->loc_cap,
 	                           &chunked, &have_len, &clen, &enc_gz);
+	h->enc = enc_gz;
 	if (h->allow_dl && h->status >= 200 && h->status < 300 && is_download(h->full_url)) {
 		h->is_dl = 1; h->dl_started = 1;
 		pick_dl_path(h->full_url, h->dl_path, sizeof h->dl_path);
@@ -479,6 +638,9 @@ static int h2_headers_cb(void *ctx, const char *block, int len)
 static int h2_body_cb(void *ctx, const unsigned char *p, int n)
 {
 	struct h2tx *h = ctx;
+	/* Compressed body (gzip/deflate/br): buffer it; decompressed at transfer end
+	 * since brotli has no streaming window and h2 DATA arrives in chunks. */
+	if (h->enc) return h2buf(h, p, n) < 0 ? 1 : 0;
 	if (h->is_dl) {
 		if (h->dl_open && stream_write(p, n) < 0) { h->dl_fail = 1; return 1; }
 		return 0;
@@ -502,9 +664,9 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 		uapp(auth, &an, sizeof auth, (unsigned)u->port);
 	}
 
-	/* Request headers: cookies + accept. No Accept-Encoding (so the body is
-	 * uncompressed — h2 DATA needs no inflate) and no Connection/Transfer-
-	 * Encoding (forbidden in HTTP/2). The User-Agent rides in h2_opts. */
+	/* Request headers: cookies + accept + accept-encoding (gzip/deflate/br — the
+	 * body is buffered and decompressed below). No Connection/Transfer-Encoding
+	 * (forbidden in HTTP/2). The User-Agent rides in h2_opts. */
 	char xh[1408]; int xn = 0;
 	char ck[1024];
 	if (cookie_header(u->host, ck, sizeof ck) > 0) {
@@ -513,13 +675,31 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 		sapp(xh, &xn, sizeof xh, "\r\n");
 	}
 	sapp(xh, &xn, sizeof xh,
-	     "accept: " BR_ACCEPT "\r\naccept-language: " BR_ACCLNG "\r\n");
+	     "accept: " BR_ACCEPT "\r\naccept-language: " BR_ACCLNG "\r\n"
+	     "accept-encoding: gzip, deflate, br\r\n");
 
-	struct h2tx h = { full_url, u->host, loc, loc_cap, allow_dl, 0, 0, 0, 0, 0, {0} };
+	struct h2tx h = { full_url, u->host, loc, loc_cap, allow_dl, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0} };
 	struct h2_opts opts = { BR_UA, xh, h2_headers_cb };
 	char hdrbuf[4096]; int hlen = 0;
 	h2_run(B->sock, 1, auth, "GET", u->path, &opts,
 	       hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
+
+	/* Decompress the buffered body (if any) into its destination. */
+	if (h.enc && h.blen > 0) {
+		int ol = 0;
+		unsigned char *o = body_decompress(h.body, h.blen, h.enc, &ol);
+		if (!o) {
+			if (h.is_dl) h.dl_fail = 1;
+		} else if (h.is_dl) {
+			if (h.dl_open && stream_write(o, ol) < 0) h.dl_fail = 1;
+			free(o);
+		} else {
+			B->raw_len = 0;
+			if (ensure_raw(ol)) { memcpy(B->raw, o, ol); B->raw_len = ol; }
+			free(o);
+		}
+	}
+	free(h.body);
 
 	if (h.dl_started)                               /* finish a streamed download */
 		download_finished(full_url, h.dl_path,
@@ -568,7 +748,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	sapp(req, &n, sizeof req,
 	     "\r\nUser-Agent: " BR_UA "\r\nAccept: " BR_ACCEPT "\r\n"
 	     "Accept-Language: " BR_ACCLNG "\r\n"
-	     "Accept-Encoding: gzip, deflate\r\n"
+	     "Accept-Encoding: gzip, deflate, br\r\n"
 	     "Connection: close\r\n\r\n");
 
 	if (net_send(B->sock, req, n) < 0) { net_close(B->sock); return -4; }
@@ -603,7 +783,10 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 		return status;
 	}
 
-	if (enc_gz) {
+	if (enc_gz == ENC_BR) {
+		/* Brotli body: buffered whole then decompressed (no streaming window). */
+		brotli_http(body_src, &bs, raw_sink, 0);
+	} else if (enc_gz) {
 		/* Compressed body: stream it through the inflater, which pulls framed
 		 * body bytes via body_src and pushes decompressed bytes into raw_sink.
 		 * Only the 32 KiB DEFLATE window lives in RAM, whatever the page size. */
@@ -618,474 +801,6 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 
 	net_close(B->sock);
 	return status;
-}
-
-/* --------------------------------------------------- inline image fetching */
-
-/* A byte reader over a slice of img_pool, for upng_dimensions. */
-struct memrd { const unsigned char *p; int pos, len; };
-static int memrd_get(void *c)
-{
-	struct memrd *m = c;
-	return m->pos < m->len ? m->p[m->pos++] : -1;
-}
-
-/* Self-contained per-thread HTTP reader: several images fetch in parallel, each
- * over its OWN socket/buffer, so they never touch B->sock/B->raw (which only the
- * page fetch uses). The kernel TLS is multi-flow, so the HTTPS handshakes run
- * concurrently. */
-struct ireader { int sock; unsigned char buf[2048]; int pos, len, eof; };
-static int ir_getc(struct ireader *r)
-{
-	if (r->pos >= r->len) {
-		if (r->eof) return -1;
-		int n = net_recv(r->sock, r->buf, (int)sizeof r->buf);
-		if (n <= 0) { r->eof = 1; return -1; }
-		r->pos = 0; r->len = n;
-	}
-	return r->buf[r->pos++];
-}
-
-/* Append one byte to a malloc'd, doubling body buffer (capped at RAW_MAX).
- * Returns 0, or -1 if full / out of memory (the caller stops). */
-static int body_put(unsigned char **body, int *cap, int *blen, int c)
-{
-	if (*blen >= *cap) {
-		int ncap = *cap * 2;
-		if (ncap > (int)RAW_MAX) ncap = RAW_MAX;
-		if (*blen >= ncap) return -1;             /* hit the cap */
-		unsigned char *nb = realloc(*body, (unsigned)ncap);
-		if (!nb) return -1;
-		*body = nb; *cap = ncap;
-	}
-	(*body)[(*blen)++] = (unsigned char)c;
-	return 0;
-}
-
-/* Read a 200 response's body (chunked / content-length / read-to-close) off an
- * open image request into a freshly malloc'd buffer. Returns it (caller frees)
- * with *outlen set, or NULL on a non-200 / error. Bounded by RAW_MAX. */
-static unsigned char *read_http_body(struct ireader *r, int *outlen)
-{
-	char hdr[2048]; int hl = 0, m = 0;
-	for (;;) {
-		int c = ir_getc(r);
-		if (c < 0) return 0;
-		if (hl < (int)sizeof hdr - 1) hdr[hl++] = (char)c;
-		if      (c == '\r') m = (m == 2) ? 3 : 1;
-		else if (c == '\n') m = (m == 1) ? 2 : (m == 3 ? 4 : 0);
-		else                m = 0;
-		if (m == 4) break;
-	}
-	hdr[hl] = '\0';
-
-	int status = 0;
-	{ const char *s = hdr; while (*s && *s != ' ') s++; while (*s == ' ') s++;
-	  while (*s >= '0' && *s <= '9') status = status * 10 + (*s++ - '0'); }
-	if (status != 200) return 0;
-
-	int chunked = 0; long clen = -1;
-	for (const char *line = hdr; *line; ) {
-		if (starts_ci(line, "content-length:")) {
-			const char *v = line + 15; while (*v == ' ') v++;
-			clen = 0; while (*v >= '0' && *v <= '9') clen = clen * 10 + (*v++ - '0');
-		} else if (starts_ci(line, "transfer-encoding:")) {
-			for (const char *q = line; *q && *q != '\n'; q++)
-				if (starts_ci(q, "chunked")) { chunked = 1; break; }
-		}
-		const char *e = line; while (*e && *e != '\n') e++;
-		if (!*e) break;
-		line = e + 1;
-	}
-
-	int cap = (clen > 0 && clen < (long)RAW_MAX) ? (int)clen + 1 : 65536;
-	unsigned char *body = malloc((unsigned)cap);
-	if (!body) return 0;
-	int blen = 0;
-
-	if (chunked) {
-		for (;;) {
-			unsigned sz = 0; int c, any = 0;
-			while ((c = ir_getc(r)) >= 0 && c != '\r' && c != ';') {
-				int d;
-				if      (c >= '0' && c <= '9') d = c - '0';
-				else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-				else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-				else break;
-				sz = sz * 16 + (unsigned)d; any = 1;
-			}
-			while (c >= 0 && c != '\n') c = ir_getc(r);
-			if (!any || sz == 0) break;
-			for (unsigned k = 0; k < sz; k++) {
-				c = ir_getc(r);
-				if (c < 0 || body_put(&body, &cap, &blen, c) < 0) goto done;
-			}
-			c = ir_getc(r); if (c == '\r') ir_getc(r);   /* trailing CRLF */
-		}
-	} else {
-		long limit = (clen >= 0) ? clen : (long)RAW_MAX;
-		while (blen < limit) {
-			int c = ir_getc(r);
-			if (c < 0 || body_put(&body, &cap, &blen, c) < 0) break;
-		}
-	}
-done:
-	*outlen = blen;
-	return body;
-}
-
-/* --- parallel inline-image fetching ---------------------------------------
- * A small pool of threads fetches the page's images concurrently. Each thread
- * reads an image into a malloc'd buffer, then commits it into the shared
- * img_pool: a short lock guards only the bump of img_pool_len; the byte copy and
- * the per-image metadata go to disjoint regions, so they need no lock. */
-#define IMG_FETCHERS    4
-#define IMG_FETCH_STACK (32 * 1024)
-
-static char         g_img_page[URL_MAX];   /* page URL the fetchers resolve against */
-static volatile int g_img_next;            /* next image index to claim             */
-static volatile int g_img_lock;            /* guards g_img_next + the pool bump      */
-
-static int img_xchg(volatile int *p, int v)
-{ __asm__ volatile ("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory"); return v; }
-static void img_lock(void)   { while (img_xchg(&g_img_lock, 1)) msleep(0); }
-static void img_unlock(void) { __asm__ volatile ("" ::: "memory"); g_img_lock = 0; }
-
-/* Claim the next eager (non-lazy) image index, or -1 when none remain. */
-static int img_claim_next(void)
-{
-	int got = -1;
-	img_lock();
-	while (g_img_next < B->n_imgs) {
-		int i = g_img_next++;
-		if (!B->imgs[i].lazy) { got = i; break; }
-	}
-	img_unlock();
-	return got;
-}
-
-/* Fetch inline image `i` over its own socket and commit it to img_pool. Safe to
- * run on several threads at once. */
-static void fetch_image(int i, const char *page_url)
-{
-	struct inl_img *im = &B->imgs[i];
-	im->ok = 0;
-
-	char full[URL_MAX];
-	resolve_url(page_url, im->href, full, sizeof full);
-	struct purl u;
-	if (!parse_url(full, &u)) return;
-	if (!u.tls && hsts_has(u.host)) { u.tls = 1; if (u.port == 80) u.port = 443; }
-
-	int sock = net_connect(u.host, u.port, u.tls ? SK_TLS : SK_TCP);
-	if (sock < 0) return;
-
-	char req[1024]; int n = 0;
-	sapp(req, &n, sizeof req, "GET ");
-	sapp(req, &n, sizeof req, u.path);
-	sapp(req, &n, sizeof req, " HTTP/1.1\r\nHost: ");
-	sapp(req, &n, sizeof req, u.host);
-	if (!((u.tls && u.port == 443) || (!u.tls && u.port == 80))) {
-		sapp(req, &n, sizeof req, ":");
-		uapp(req, &n, sizeof req, (unsigned)u.port);
-	}
-	{
-		char ck[1024];
-		if (cookie_header(u.host, ck, sizeof ck) > 0) {
-			sapp(req, &n, sizeof req, "\r\nCookie: ");
-			sapp(req, &n, sizeof req, ck);
-		}
-	}
-	sapp(req, &n, sizeof req,
-	     "\r\nUser-Agent: " BR_UA "\r\nAccept: image/png,*/*\r\nConnection: close\r\n\r\n");
-	if (net_send(sock, req, n) < 0) { net_close(sock); return; }
-
-	struct ireader r = { sock, { 0 }, 0, 0, 0 };
-	int blen = 0;
-	unsigned char *body = read_http_body(&r, &blen);
-	net_close(sock);
-	if (!body) return;
-
-	if (blen >= 8 && body[0] == 0x89 && body[1] == 'P' &&
-	    body[2] == 'N' && body[3] == 'G') {            /* PNG only */
-		struct memrd mr = { body, 0, blen };
-		unsigned iw = 0, ih = 0;
-		int okdim = (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih);
-
-		int off = -1;
-		img_lock();
-		if (B->img_pool_len + blen <= IMG_POOL) {
-			off = B->img_pool_len;
-			B->img_pool_len += blen;
-		}
-		img_unlock();
-		if (off >= 0) {
-			memcpy(B->img_pool + off, body, (unsigned)blen);  /* disjoint: no lock */
-			im->coff = off; im->clen = blen;
-			if (okdim) { im->iw = iw; im->ih = ih; }
-			im->ok = okdim;            /* set last: the UI draws once ok is seen */
-			B->seq++;                  /* repaint as each image lands            */
-		}
-	}
-	free(body);
-}
-
-/* The fetch loop each pool thread (and the worker itself) runs: claim images
- * until none remain. */
-static void img_fetch_loop(void)
-{
-	int i;
-	while ((i = img_claim_next()) >= 0)
-		fetch_image(i, g_img_page);
-}
-
-static void img_fetcher_thread(void)
-{
-	img_fetch_loop();
-	exit(0);                           /* a thread fn must not return */
-}
-
-/* Fetch the page's *eager* inline images (loading != "lazy") in PARALLEL: spawn
- * a few helper threads, fetch alongside them on this (worker) thread, then join.
- * loading="lazy" images are left for fetch_lazy_visible() when scrolled in. */
-static void fetch_inline_images(const char *page_url)
-{
-	B->img_pool_len = 0;
-	{ int k = 0; g_img_page[0] = '\0'; sapp(g_img_page, &k, sizeof g_img_page, page_url); }
-	g_img_next = 0;
-
-	int   tids[IMG_FETCHERS - 1];
-	char *stks[IMG_FETCHERS - 1];
-	int   nthr = 0;
-	for (int t = 0; t < IMG_FETCHERS - 1; t++) {
-		char *stk = malloc(IMG_FETCH_STACK);
-		if (!stk) break;
-		int tid = thread_create(img_fetcher_thread, stk + IMG_FETCH_STACK);
-		if (tid < 0) { free(stk); break; }
-		stks[nthr] = stk; tids[nthr] = tid; nthr++;
-	}
-
-	img_fetch_loop();                  /* this thread fetches too */
-
-	for (int t = 0; t < nthr; t++) {   /* wait for the helpers, free their stacks */
-		thread_join(tids[t]);
-		free(stks[t]);
-	}
-}
-
-/* Worker step (called when no page fetch is pending): load at most one lazy
- * <img> the UI has flagged as scrolled into view, against the current page URL.
- * Returns 1 if it fetched one (so the caller can loop), 0 if there was nothing to
- * do — which keeps the worker mostly idle until the user actually scrolls. */
-int fetch_lazy_visible(void)
-{
-	if (!B->cur_url[0])
-		return 0;
-	for (int i = 0; i < B->n_imgs; i++) {
-		struct inl_img *im = &B->imgs[i];
-		if (!im->lazy || im->fetched || !im->want)
-			continue;
-		fetch_image(i, B->cur_url);
-		im->fetched = 1; im->want = 0;
-		B->seq++;                  /* re-layout now that the image has landed   */
-		return 1;
-	}
-	return 0;
-}
-
-/* ------------------------------------------------------------ favicon decode */
-/* A favicon is fetched into B->raw and decoded down to a fixed 16x16 ARGB
- * bitmap (B->favicon) for the tab strip. PNG favicons go through upng; .ico
- * files are parsed here (best directory entry -> embedded PNG or a raw DIB).
- * Anything we can't decode (GIF/BMP/SVG/empty) just leaves favicon_ok 0 and the
- * tab shows the default globe. */
-
-/* Nearest-neighbour scale of a decoded RGBA image into the 16x16 favicon. The
- * row callback fills every destination row whose source maps to the row `y`
- * upng just produced, so it works whatever the source dimensions are. */
-struct favscale { unsigned iw, ih, next_r; unsigned *dst; };
-static int fav_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
-{
-	(void)w;
-	struct favscale *v = c;
-	while (v->next_r < FAVICON_H && (v->next_r * v->ih / FAVICON_H) == y) {
-		unsigned *drow = v->dst + v->next_r * FAVICON_W;
-		for (unsigned x = 0; x < FAVICON_W; x++) {
-			const unsigned char *p = rgba + (x * v->iw / FAVICON_W) * 4;
-			drow[x] = ((unsigned)p[3] << 24) | ((unsigned)p[0] << 16) |
-			          ((unsigned)p[1] << 8) | (unsigned)p[2];
-		}
-		v->next_r++;
-	}
-	return 0;
-}
-
-static int fav_decode_png(const unsigned char *buf, int len)
-{
-	struct memrd mr = { buf, 0, len };
-	unsigned iw = 0, ih = 0;
-	if (upng_dimensions(memrd_get, &mr, &iw, &ih) != 0 || !iw || !ih)
-		return 0;
-	struct favscale v = { iw, ih, 0, B->favicon };
-	struct memrd mr2 = { buf, 0, len };
-	if (upng_decode(memrd_get, &mr2, fav_row, &v, 0, 0) != 0)
-		return 0;
-	return v.next_r > 0;
-}
-
-/* Little-endian readers for the .ico container (always little-endian). */
-static unsigned le16(const unsigned char *p) { return p[0] | ((unsigned)p[1] << 8); }
-static unsigned le32(const unsigned char *p)
-{ return p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24); }
-
-/* Decode one ICO image stored as a Windows DIB (BITMAPINFOHEADER + pixels, no
- * BMP file header). Bottom-up rows; biHeight counts the XOR colour rows plus an
- * equal AND (1bpp transparency) mask, so the real height is half. Supports
- * 1/4/8/24/32 bpp, BI_RGB. Sampled directly at 16x16 to avoid a full-size
- * intermediate buffer. */
-static int fav_decode_dib(const unsigned char *p, int len)
-{
-	if (len < 40) return 0;
-	unsigned hsz = le32(p);
-	if (hsz < 40 || (int)hsz > len) return 0;
-	int W   = (int)le32(p + 4);
-	int Hf  = (int)le32(p + 8);
-	unsigned bpp  = le16(p + 14);
-	unsigned comp = le32(p + 16);
-	if (comp != 0 && comp != 3) return 0;          /* BI_RGB / BI_BITFIELDS only */
-	if (W <= 0 || Hf <= 0) return 0;
-
-	int H = Hf / 2, mask = 1;                       /* XOR colour rows = half     */
-	if (H < 1) { H = Hf; mask = 0; }                /* no AND mask present         */
-
-	unsigned clr = le32(p + 32);
-	if (bpp <= 8 && clr == 0) clr = 1u << bpp;
-	const unsigned char *pal = p + hsz;
-	int pal_sz = (bpp <= 8) ? (int)clr * 4 : 0;
-
-	int xstride = ((W * (int)bpp + 31) / 32) * 4;
-	const unsigned char *xor_ = pal + pal_sz;
-	long xor_sz = (long)xstride * H;
-	if ((xor_ - p) + xor_sz > len) return 0;
-
-	int astride = ((W + 31) / 32) * 4;
-	const unsigned char *and_ = xor_ + xor_sz;
-	int and_present = mask && ((and_ - p) + (long)astride * H <= len);
-
-	/* Trust a 32bpp alpha channel only if at least one pixel is non-zero;
-	 * many icons leave it all-zero and rely on the AND mask instead. */
-	int has_alpha = 0;
-	if (bpp == 32)
-		for (long i = 3; i < xor_sz && !has_alpha; i += 4)
-			if (xor_[i]) has_alpha = 1;
-
-	for (int dy = 0; dy < FAVICON_H; dy++) {
-		int sy = dy * H / FAVICON_H;                /* dest row -> source row      */
-		int br = H - 1 - sy;                        /* DIB rows are bottom-up      */
-		const unsigned char *xrow = xor_ + (long)br * xstride;
-		const unsigned char *arow = and_ + (long)br * astride;
-		for (int dx = 0; dx < FAVICON_W; dx++) {
-			int sx = dx * W / FAVICON_W;
-			unsigned r = 0, g = 0, b = 0, a = 255;
-			if (bpp == 32) {
-				const unsigned char *q = xrow + sx * 4;
-				b = q[0]; g = q[1]; r = q[2]; a = has_alpha ? q[3] : 255;
-			} else if (bpp == 24) {
-				const unsigned char *q = xrow + sx * 3;
-				b = q[0]; g = q[1]; r = q[2];
-			} else {
-				unsigned idx;
-				if      (bpp == 8) idx = xrow[sx];
-				else if (bpp == 4) idx = (sx & 1) ? (xrow[sx >> 1] & 0xf)
-				                                  : (xrow[sx >> 1] >> 4);
-				else if (bpp == 1) idx = (xrow[sx >> 3] >> (7 - (sx & 7))) & 1;
-				else return 0;                      /* unsupported depth           */
-				if (idx >= clr) idx = 0;
-				const unsigned char *c = pal + idx * 4;
-				b = c[0]; g = c[1]; r = c[2];
-			}
-			if (bpp != 32 && and_present) {
-				unsigned mb = arow[sx >> 3];
-				if ((mb >> (7 - (sx & 7))) & 1) a = 0;   /* mask bit set = clear   */
-			}
-			B->favicon[dy * FAVICON_W + dx] =
-				(a << 24) | (r << 16) | (g << 8) | b;
-		}
-	}
-	return 1;
-}
-
-/* Pick the best image in an .ico directory: the smallest entry that is still
- * >= 16px (an exact 16 wins), else the largest available. Fills poff/plen with
- * its byte range within the file. */
-static int ico_pick(const unsigned char *p, int len, int *poff, int *plen)
-{
-	if (len < 6 || le16(p) != 0 || le16(p + 2) != 1) return 0;   /* type 1 = icon */
-	int count = le16(p + 4);
-	if (count < 1 || 6 + count * 16 > len) return 0;
-	int best = -1, best_score = -1;
-	for (int i = 0; i < count; i++) {
-		const unsigned char *e = p + 6 + i * 16;
-		int w = e[0] ? e[0] : 256;
-		int boff = (int)le32(e + 12), blen = (int)le32(e + 8);
-		if (boff < 0 || blen <= 0 || boff + blen > len) continue;
-		int score = (w >= FAVICON_W) ? (1000 - w) : w;
-		if (score > best_score) { best_score = score; best = i; *poff = boff; *plen = blen; }
-	}
-	return best >= 0;
-}
-
-/* Decode whatever sits in B->raw into B->favicon; returns 1 on success. */
-static int favicon_decode(void)
-{
-	int n = B->raw_len;
-	if (n < 4) return 0;
-	const unsigned char *r = (const unsigned char *)B->raw;
-	if (r[0] == 0x89 && r[1] == 'P' && r[2] == 'N' && r[3] == 'G')
-		return fav_decode_png(r, n);
-	if (r[0] == 0 && r[1] == 0 && r[2] == 1 && r[3] == 0) {        /* .ico        */
-		int off = 0, l = 0;
-		if (!ico_pick(r, n, &off, &l)) return 0;
-		const unsigned char *img = r + off;
-		if (l >= 8 && img[0] == 0x89 && img[1] == 'P' &&
-		    img[2] == 'N' && img[3] == 'G')                        /* PNG in .ico */
-			return fav_decode_png(img, l);
-		return fav_decode_dib(img, l);
-	}
-	return 0;                                  /* GIF/BMP/SVG favicons unsupported */
-}
-
-/* Fetch and decode the page favicon into B->favicon. Uses the <link rel=icon>
- * href the parser found, else the conventional /favicon.ico at the site root.
- * Follows redirects (CDNs often 30x a favicon) up to MAX_REDIR, one socket per
- * hop, into B->raw — safe to clobber here since the page body is already
- * rendered. Leaves favicon_ok 0 on any failure (the tab falls back to the
- * globe). */
-static void fetch_favicon(const char *page_url)
-{
-	char full[URL_MAX];
-	resolve_url(page_url, B->favicon_href[0] ? B->favicon_href : "/favicon.ico",
-	            full, sizeof full);
-
-	for (int hop = 0; hop <= MAX_REDIR; hop++) {
-		struct purl u;
-		if (!parse_url(full, &u)) return;
-		if (!u.tls && hsts_has(u.host)) { u.tls = 1; if (u.port == 80) u.port = 443; }
-
-		char loc[URL_MAX]; loc[0] = '\0';
-		int st = http_txn(&u, full, loc, sizeof loc, 0);
-		if ((st == 301 || st == 302 || st == 303 || st == 307 || st == 308) && loc[0]) {
-			char next[URL_MAX];
-			resolve_url(full, loc, next, sizeof next);
-			int k = 0;
-			for (; next[k] && k < URL_MAX - 1; k++) full[k] = next[k];
-			full[k] = '\0';
-			continue;
-		}
-		if (st != 200 || B->raw_len < 4) return;
-		if (favicon_decode()) B->favicon_ok = 1;
-		return;
-	}
 }
 
 /* ----------------------------------------------- local & inline URL schemes */
@@ -1108,9 +823,11 @@ static int b64val(int c)
 	return -1;
 }
 
+
 /* Render whatever is in B->raw (with B->ctype already set) as the page body —
  * HTML, plain text, or a PNG. Shared by the network, file:, and data: paths so
- * all three pick the display mode the same way. Does not fetch sub-resources. */
+ * all three pick the display mode the same way. HTML pulls external stylesheets
+ * (via css_batch) before layout; other sub-resources are fetched by do_fetch. */
 static void render_raw(const char *url)
 {
 	/* HTML rendering normally also covers an empty/missing Content-Type (sloppy
@@ -1120,7 +837,7 @@ static void render_raw(const char *url)
 	int as_html = has_sub(B->ctype, "html") ||
 	              (B->ctype[0] == '\0' && !B->nosniff);
 	if (as_html) {
-		B->mode = MODE_HTML; html_to_text();
+		B->mode = MODE_HTML; html_to_text(url, css_batch);
 	} else if (starts_ci(B->ctype, "image/png")) {
 		B->mode = MODE_IMAGE;
 		B->text_len = 0; B->nlinks = 0; B->doc_title[0] = '\0';
@@ -1250,6 +967,7 @@ void do_fetch(void)
 	sapp(url, &n, sizeof url, B->req_url);
 	B->dl_saved = 0;
 	B->favicon_ok = 0;          /* cleared per navigation; refilled on success */
+	ext_css_clear();            /* Link: stylesheets refilled by parse_response  */
 
 	/* Local / inline schemes never touch the network: file:// reads the local
 	 * FS, data: decodes an embedded document. Both fill B->raw + B->ctype and
@@ -1330,16 +1048,15 @@ void do_fetch(void)
 		/* The title bar is updated by the main thread (only the window's owner
 		 * task may call win_settitle); it reads B->doc_title / B->cur_url. */
 
-		/* HTML pages may carry inline <img>: fetch each as a sub-resource and
-		 * stash its PNG bytes (this reuses B->raw, now that html_to_text has
-		 * already extracted the page text). Each fetched image bumps B->seq so
-		 * the UI re-lays-out as they land. */
+		/* HTML pages may carry inline <img>: the parallel fetchers (resource.c)
+		 * pull each over its own socket into img_pool — B->raw is untouched. Each
+		 * landed image bumps B->seq so the UI re-lays-out as they arrive. */
 		if (B->mode == MODE_HTML && B->n_imgs > 0)
 			fetch_inline_images(url);
 
-		/* Pull the site favicon for the tab strip (after inline images, since it
-		 * also reuses B->raw). Skipped for a directly-rendered image page, whose
-		 * pixels still live in B->raw and would be clobbered. */
+		/* Pull the site favicon for the tab strip. Skipped for a directly-rendered
+		 * image page, whose pixels are in B->raw (the favicon fetch uses its own
+		 * buffer, but the page is already the image, so there's nothing to fetch). */
 		if (B->mode != MODE_IMAGE)
 			fetch_favicon(url);
 		return;

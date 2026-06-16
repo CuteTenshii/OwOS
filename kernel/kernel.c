@@ -348,44 +348,48 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
 	/* Install the embedded programs onto the disk if absent. */
 	{
-		extern const unsigned char _binary_user_edit_elf_start[];
-		extern const unsigned char _binary_user_edit_elf_end[];
-		extern const unsigned char _binary_user_curl_elf_start[];
-		extern const unsigned char _binary_user_curl_elf_end[];
-		extern const unsigned char _binary_user_editor_elf_start[];
-		extern const unsigned char _binary_user_editor_elf_end[];
-		extern const unsigned char _binary_user_about_elf_start[];
-		extern const unsigned char _binary_user_about_elf_end[];
-		extern const unsigned char _binary_user_clock_elf_start[];
-		extern const unsigned char _binary_user_clock_elf_end[];
-		extern const unsigned char _binary_user_files_elf_start[];
-		extern const unsigned char _binary_user_files_elf_end[];
-		extern const unsigned char _binary_user_browser_elf_start[];
-		extern const unsigned char _binary_user_browser_elf_end[];
-		extern const unsigned char _binary_user_imgview_elf_start[];
-		extern const unsigned char _binary_user_imgview_elf_end[];
-		extern const unsigned char _binary_user_crashme_elf_start[];
-		extern const unsigned char _binary_user_crashme_elf_end[];
-		extern const unsigned char _binary_user_term_elf_start[];
-		extern const unsigned char _binary_user_term_elf_end[];
-		extern const unsigned char _binary_user_neofetch_elf_start[];
-		extern const unsigned char _binary_user_neofetch_elf_end[];
-		extern const unsigned char _binary_user_lspci_elf_start[];
-		extern const unsigned char _binary_user_lspci_elf_end[];
-		extern const unsigned char _binary_user_play_elf_start[];
-		extern const unsigned char _binary_user_play_elf_end[];
-		extern const unsigned char _binary_user_ping_elf_start[];
-		extern const unsigned char _binary_user_ping_elf_end[];
-		extern const unsigned char _binary_user_dig_elf_start[];
-		extern const unsigned char _binary_user_dig_elf_end[];
-		extern const unsigned char _binary_user_torrent_elf_start[];
-		extern const unsigned char _binary_user_torrent_elf_end[];
-		extern const unsigned char _binary_user_player_elf_start[];
-		extern const unsigned char _binary_user_player_elf_end[];
-		extern const unsigned char _binary_user_settings_elf_start[];
-		extern const unsigned char _binary_user_settings_elf_end[];
-		extern const unsigned char _binary_user_ssh_elf_start[];
-		extern const unsigned char _binary_user_ssh_elf_end[];
+		extern const unsigned char _binary_fonts_LiberationSans_Regular_ttf_start[];
+		extern const unsigned char _binary_fonts_LiberationSans_Regular_ttf_end[];
+		extern const unsigned char _binary_fonts_LiberationMono_Regular_ttf_start[];
+		extern const unsigned char _binary_fonts_LiberationMono_Regular_ttf_end[];
+		extern const unsigned char _binary_app_edit_start[];
+		extern const unsigned char _binary_app_edit_end[];
+		extern const unsigned char _binary_app_curl_start[];
+		extern const unsigned char _binary_app_curl_end[];
+		extern const unsigned char _binary_app_editor_start[];
+		extern const unsigned char _binary_app_editor_end[];
+		extern const unsigned char _binary_app_about_start[];
+		extern const unsigned char _binary_app_about_end[];
+		extern const unsigned char _binary_app_clock_start[];
+		extern const unsigned char _binary_app_clock_end[];
+		extern const unsigned char _binary_app_files_start[];
+		extern const unsigned char _binary_app_files_end[];
+		extern const unsigned char _binary_app_browser_start[];
+		extern const unsigned char _binary_app_browser_end[];
+		extern const unsigned char _binary_app_imgview_start[];
+		extern const unsigned char _binary_app_imgview_end[];
+		extern const unsigned char _binary_app_term_start[];
+		extern const unsigned char _binary_app_term_end[];
+		extern const unsigned char _binary_app_neofetch_start[];
+		extern const unsigned char _binary_app_neofetch_end[];
+		extern const unsigned char _binary_app_lspci_start[];
+		extern const unsigned char _binary_app_lspci_end[];
+		extern const unsigned char _binary_app_ping_start[];
+		extern const unsigned char _binary_app_ping_end[];
+		extern const unsigned char _binary_app_dig_start[];
+		extern const unsigned char _binary_app_dig_end[];
+		extern const unsigned char _binary_app_torrent_start[];
+		extern const unsigned char _binary_app_torrent_end[];
+		extern const unsigned char _binary_app_player_start[];
+		extern const unsigned char _binary_app_player_end[];
+		extern const unsigned char _binary_app_settings_start[];
+		extern const unsigned char _binary_app_settings_end[];
+		extern const unsigned char _binary_app_ssh_start[];
+		extern const unsigned char _binary_app_ssh_end[];
+		extern const unsigned char _binary_app_clipd_start[];
+		extern const unsigned char _binary_app_clipd_end[];
+		extern const unsigned char _binary_app_cliphist_start[];
+		extern const unsigned char _binary_app_cliphist_end[];
 		char probe;
 		/* A Unix-like layout: programs in /bin, a home for the user. mkdir is
 		 * a no-op if the directory already exists from a previous boot. */
@@ -400,87 +404,100 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		 * useradd/groupadd/passwd commands. Only created if absent, so a previous
 		 * boot's accounts (and any passwords set) persist. */
 		fs_mkdir("/etc");
+		/* The shared UI font: gfx loads it at runtime so no app bakes in a
+		 * bitmap atlas. One on-disk copy, installed if a prior boot lacks it. */
+		fs_mkdir("/etc/fonts");
+		if (fs_read("/etc/fonts/LiberationSans-Regular.ttf", &probe, 0) < 0)
+			fs_create("/etc/fonts/LiberationSans-Regular.ttf",
+			          _binary_fonts_LiberationSans_Regular_ttf_start,
+			          (uint32_t)(_binary_fonts_LiberationSans_Regular_ttf_end -
+			                     _binary_fonts_LiberationSans_Regular_ttf_start));
+		if (fs_read("/etc/fonts/LiberationMono-Regular.ttf", &probe, 0) < 0)
+			fs_create("/etc/fonts/LiberationMono-Regular.ttf",
+			          _binary_fonts_LiberationMono_Regular_ttf_start,
+			          (uint32_t)(_binary_fonts_LiberationMono_Regular_ttf_end -
+			                     _binary_fonts_LiberationMono_Regular_ttf_start));
 		if (fs_read("/etc/passwd", &probe, 0) < 0)
 			fs_create("/etc/passwd", "root::0:0:/home/root\n", 21);
 		if (fs_read("/etc/group", &probe, 0) < 0)
 			fs_create("/etc/group", "root:0:\n", 8);
 		users_init();
 		if (fs_read("/bin/edit", &probe, 0) < 0)
-			fs_create("/bin/edit", _binary_user_edit_elf_start,
-			          (uint32_t)(_binary_user_edit_elf_end -
-			                     _binary_user_edit_elf_start));
+			fs_create("/bin/edit", _binary_app_edit_start,
+			          (uint32_t)(_binary_app_edit_end -
+			                     _binary_app_edit_start));
 		if (fs_read("/bin/curl", &probe, 0) < 0)
-			fs_create("/bin/curl", _binary_user_curl_elf_start,
-			          (uint32_t)(_binary_user_curl_elf_end -
-			                     _binary_user_curl_elf_start));
+			fs_create("/bin/curl", _binary_app_curl_start,
+			          (uint32_t)(_binary_app_curl_end -
+			                     _binary_app_curl_start));
 		if (fs_read("/bin/editor", &probe, 0) < 0)
-			fs_create("/bin/editor", _binary_user_editor_elf_start,
-			          (uint32_t)(_binary_user_editor_elf_end -
-			                     _binary_user_editor_elf_start));
+			fs_create("/bin/editor", _binary_app_editor_start,
+			          (uint32_t)(_binary_app_editor_end -
+			                     _binary_app_editor_start));
 		if (fs_read("/bin/about", &probe, 0) < 0)
-			fs_create("/bin/about", _binary_user_about_elf_start,
-			          (uint32_t)(_binary_user_about_elf_end -
-			                     _binary_user_about_elf_start));
+			fs_create("/bin/about", _binary_app_about_start,
+			          (uint32_t)(_binary_app_about_end -
+			                     _binary_app_about_start));
 		if (fs_read("/bin/clock", &probe, 0) < 0)
-			fs_create("/bin/clock", _binary_user_clock_elf_start,
-			          (uint32_t)(_binary_user_clock_elf_end -
-			                     _binary_user_clock_elf_start));
+			fs_create("/bin/clock", _binary_app_clock_start,
+			          (uint32_t)(_binary_app_clock_end -
+			                     _binary_app_clock_start));
 		if (fs_read("/bin/files", &probe, 0) < 0)
-			fs_create("/bin/files", _binary_user_files_elf_start,
-			          (uint32_t)(_binary_user_files_elf_end -
-			                     _binary_user_files_elf_start));
+			fs_create("/bin/files", _binary_app_files_start,
+			          (uint32_t)(_binary_app_files_end -
+			                     _binary_app_files_start));
 		if (fs_read("/bin/browser", &probe, 0) < 0)
-			fs_create("/bin/browser", _binary_user_browser_elf_start,
-			          (uint32_t)(_binary_user_browser_elf_end -
-			                     _binary_user_browser_elf_start));
+			fs_create("/bin/browser", _binary_app_browser_start,
+			          (uint32_t)(_binary_app_browser_end -
+			                     _binary_app_browser_start));
 		if (fs_read("/bin/imgview", &probe, 0) < 0)
-			fs_create("/bin/imgview", _binary_user_imgview_elf_start,
-			          (uint32_t)(_binary_user_imgview_elf_end -
-			                     _binary_user_imgview_elf_start));
-		if (fs_read("/bin/crashme", &probe, 0) < 0)
-			fs_create("/bin/crashme", _binary_user_crashme_elf_start,
-			          (uint32_t)(_binary_user_crashme_elf_end -
-			                     _binary_user_crashme_elf_start));
+			fs_create("/bin/imgview", _binary_app_imgview_start,
+			          (uint32_t)(_binary_app_imgview_end -
+			                     _binary_app_imgview_start));
 		if (fs_read("/bin/term", &probe, 0) < 0)
-			fs_create("/bin/term", _binary_user_term_elf_start,
-			          (uint32_t)(_binary_user_term_elf_end -
-			                     _binary_user_term_elf_start));
+			fs_create("/bin/term", _binary_app_term_start,
+			          (uint32_t)(_binary_app_term_end -
+			                     _binary_app_term_start));
 		if (fs_read("/bin/neofetch", &probe, 0) < 0)
-			fs_create("/bin/neofetch", _binary_user_neofetch_elf_start,
-			          (uint32_t)(_binary_user_neofetch_elf_end -
-			                     _binary_user_neofetch_elf_start));
+			fs_create("/bin/neofetch", _binary_app_neofetch_start,
+			          (uint32_t)(_binary_app_neofetch_end -
+			                     _binary_app_neofetch_start));
 		if (fs_read("/bin/lspci", &probe, 0) < 0)
-			fs_create("/bin/lspci", _binary_user_lspci_elf_start,
-			          (uint32_t)(_binary_user_lspci_elf_end -
-			                     _binary_user_lspci_elf_start));
-		if (fs_read("/bin/play", &probe, 0) < 0)
-			fs_create("/bin/play", _binary_user_play_elf_start,
-			          (uint32_t)(_binary_user_play_elf_end -
-			                     _binary_user_play_elf_start));
+			fs_create("/bin/lspci", _binary_app_lspci_start,
+			          (uint32_t)(_binary_app_lspci_end -
+			                     _binary_app_lspci_start));
 		if (fs_read("/bin/ping", &probe, 0) < 0)
-			fs_create("/bin/ping", _binary_user_ping_elf_start,
-			          (uint32_t)(_binary_user_ping_elf_end -
-			                     _binary_user_ping_elf_start));
+			fs_create("/bin/ping", _binary_app_ping_start,
+			          (uint32_t)(_binary_app_ping_end -
+			                     _binary_app_ping_start));
 		if (fs_read("/bin/dig", &probe, 0) < 0)
-			fs_create("/bin/dig", _binary_user_dig_elf_start,
-			          (uint32_t)(_binary_user_dig_elf_end -
-			                     _binary_user_dig_elf_start));
+			fs_create("/bin/dig", _binary_app_dig_start,
+			          (uint32_t)(_binary_app_dig_end -
+			                     _binary_app_dig_start));
 		if (fs_read("/bin/torrent", &probe, 0) < 0)
-			fs_create("/bin/torrent", _binary_user_torrent_elf_start,
-			          (uint32_t)(_binary_user_torrent_elf_end -
-			                     _binary_user_torrent_elf_start));
+			fs_create("/bin/torrent", _binary_app_torrent_start,
+			          (uint32_t)(_binary_app_torrent_end -
+			                     _binary_app_torrent_start));
 		if (fs_read("/bin/player", &probe, 0) < 0)
-			fs_create("/bin/player", _binary_user_player_elf_start,
-			          (uint32_t)(_binary_user_player_elf_end -
-			                     _binary_user_player_elf_start));
+			fs_create("/bin/player", _binary_app_player_start,
+			          (uint32_t)(_binary_app_player_end -
+			                     _binary_app_player_start));
 		if (fs_read("/bin/settings", &probe, 0) < 0)
-			fs_create("/bin/settings", _binary_user_settings_elf_start,
-			          (uint32_t)(_binary_user_settings_elf_end -
-			                     _binary_user_settings_elf_start));
+			fs_create("/bin/settings", _binary_app_settings_start,
+			          (uint32_t)(_binary_app_settings_end -
+			                     _binary_app_settings_start));
 		if (fs_read("/bin/ssh", &probe, 0) < 0)
-			fs_create("/bin/ssh", _binary_user_ssh_elf_start,
-			          (uint32_t)(_binary_user_ssh_elf_end -
-			                     _binary_user_ssh_elf_start));
+			fs_create("/bin/ssh", _binary_app_ssh_start,
+			          (uint32_t)(_binary_app_ssh_end -
+			                     _binary_app_ssh_start));
+		if (fs_read("/bin/clipd", &probe, 0) < 0)
+			fs_create("/bin/clipd", _binary_app_clipd_start,
+			          (uint32_t)(_binary_app_clipd_end -
+			                     _binary_app_clipd_start));
+		if (fs_read("/bin/cliphist", &probe, 0) < 0)
+			fs_create("/bin/cliphist", _binary_app_cliphist_start,
+			          (uint32_t)(_binary_app_cliphist_end -
+			                     _binary_app_cliphist_start));
 	}
 	con_write("usermode: ready ('run curl <url>').\n");
 

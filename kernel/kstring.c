@@ -68,3 +68,17 @@ int strcmp(const char *a, const char *b)
 	while (*a && *a == *b) { a++; b++; }
 	return (int)(uint8_t)*a - (int)(uint8_t)*b;
 }
+
+/* Bounded string copy (BSD strlcpy): copy `src` into `dst` of `size` bytes,
+ * always NUL-terminating when size > 0. Returns strlen(src). Avoids the
+ * per-file local copies kernel code kept re-rolling. */
+uint32_t strlcpy(char *dst, const char *src, uint32_t size)
+{
+	uint32_t n = 0;
+	if (size) {
+		while (n < size - 1 && src[n]) { dst[n] = src[n]; n++; }
+		dst[n] = '\0';
+	}
+	while (src[n]) n++;
+	return n;
+}

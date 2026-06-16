@@ -15,12 +15,18 @@
  */
 
 #include "heap.h"
+#include "pmm.h"
 #include <stdint.h>
 
 /* Defined by linker.ld as the first byte past the kernel image (end of .bss). */
 extern char kernel_end[];
 
-#define KHEAP_END   0x00C00000u        /* 12 MiB (12-16 MiB is the frame pool) */
+/* Heap end = pmm_pool_start() (the page-table pool starts there). Both ends are
+ * RAM-scaled at boot (see pmm.c): on a 256 MiB box this is the legacy 12 MiB, on
+ * bigger machines it's far higher, so kmalloc — and the per-task 32 KiB kernel
+ * stacks it backs — scale with RAM. heap_init runs after pmm_init, so the value
+ * is ready. */
+#define KHEAP_END   (pmm_pool_start())
 #define ALIGN_UP(n, a) (((n) + (a) - 1) & ~((a) - 1))
 
 typedef struct block {

@@ -18,6 +18,17 @@ static uint32_t bitmap[BITMAP_DWORDS];
 static uint32_t total_frames;
 static uint32_t used_frames;
 
+/* RAM-scaled low region, computed in pmm_init (see there). low_end_b is the end
+ * of the identity-mapped, permanently-reserved low memory (kernel image + heap +
+ * page-table pool); pool_start_b splits it into heap [.., pool_start_b) and pool
+ * [pool_start_b, low_end_b). Default to the legacy fixed layout so any use before
+ * pmm_init still works. */
+static uint32_t low_end_b    = RESERVED_BYTES;        /* 16 MiB */
+static uint32_t pool_start_b = RESERVED_BYTES - 0x00400000u;  /* 12 MiB */
+
+uint32_t pmm_low_end(void)    { return low_end_b; }
+uint32_t pmm_pool_start(void) { return pool_start_b; }   /* = kernel heap end */
+
 /* Search cursor: the lowest frame that might be free. pmm_alloc_frame scans up
  * from here instead of from 0, so allocating N frames in a row is O(N) total
  * rather than O(N^2) — without it, loading a program with a multi-MiB .bss (or
@@ -72,6 +83,28 @@ void pmm_init(const struct multiboot_info *mbi)
 	}
 	installed_kib = (uint32_t)(avail / 1024);
 
+	/* Size the identity-mapped low region (kernel heap + page-table pool) from
+	 * detected RAM instead of a fixed 16 MiB, so the kmalloc heap — and thus the
+	 * number of tasks/windows whose 32 KiB kernel stacks come from it, plus the
+	 * palloc pool that backs per-process page dirs — scales with the machine.
+	 * ~1/16 of RAM, clamped to [16 MiB, 192 MiB] (must stay under SCRATCH_VADDR
+	 * at 256 MiB) and 4 MiB-granular (one identity page table each). A 256 MiB box
+	 * keeps the original 16 MiB layout; 4 GiB gets 192 MiB. The pool takes the top
+	 * ~1/8; the heap gets the rest. */
+	{
+		uint32_t mib = installed_kib / 1024;
+		uint32_t le  = mib / 16;
+		if (le < 16)  le = 16;
+		if (le > 192) le = 192;
+		le &= ~3u;
+		uint32_t pl = le / 8;
+		if (pl < 4)  pl = 4;
+		if (pl > 24) pl = 24;
+		pl &= ~3u;
+		low_end_b    = le << 20;
+		pool_start_b = (uint32_t)(le - pl) << 20;
+	}
+
 	total_frames = highest / FRAME_SIZE;
 	if (total_frames > MAX_FRAMES)
 		total_frames = MAX_FRAMES;
@@ -100,7 +133,7 @@ void pmm_init(const struct multiboot_info *mbi)
 	}
 
 	/* Reserve the low 16 MiB (kernel image + identity-mapped heap). */
-	for (uint32_t f = 0; f < RESERVED_FRAMES && f < total_frames; f++) {
+	for (uint32_t f = 0; f < (low_end_b / FRAME_SIZE) && f < total_frames; f++) {
 		if (!frame_test(f)) {
 			frame_set(f);
 			used_frames++;
@@ -108,7 +141,7 @@ void pmm_init(const struct multiboot_info *mbi)
 	}
 
 	/* Everything below here is reserved, so that's where the search starts. */
-	alloc_hint = RESERVED_FRAMES;
+	alloc_hint = (low_end_b / FRAME_SIZE);
 }
 
 uint32_t pmm_alloc_frame(void)
@@ -122,7 +155,7 @@ uint32_t pmm_alloc_frame(void)
 		}
 	}
 	/* The cursor can outrun frames freed below it; sweep from the bottom once. */
-	for (uint32_t f = RESERVED_FRAMES; f < alloc_hint; f++) {
+	for (uint32_t f = (low_end_b / FRAME_SIZE); f < alloc_hint; f++) {
 		if (!frame_test(f)) {
 			frame_set(f);
 			used_frames++;
@@ -143,7 +176,7 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
 	 * marked used, so no contiguous run can begin there. Scanning from 0 stepped
 	 * through all ~4096 reserved frames one at a time (run=0 -> f+=1) on every
 	 * call before reaching allocatable RAM. */
-	for (uint32_t f = RESERVED_FRAMES; f + need <= total_frames; ) {
+	for (uint32_t f = (low_end_b / FRAME_SIZE); f + need <= total_frames; ) {
 		uint32_t run = 0;
 		while (run < need && !frame_test(f + run))
 			run++;

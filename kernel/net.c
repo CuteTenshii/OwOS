@@ -103,11 +103,14 @@ struct dns_hdr {
 
 /* ------------------------------------------------------------------- config */
 
-/* Defaults match QEMU's SLIRP virtual network; DHCP overwrites them on a real
- * link (e.g. a tethered phone, which is on 192.168.x). Mutable for that reason. */
-static uint8_t my_ip[4]   = { 10, 0, 2, 15 };
-static uint8_t gw_ip[4]   = { 10, 0, 2, 2 };
-static uint8_t dns_ip[4]  = { 10, 0, 2, 3 };
+/* Unconfigured until DHCP leases an address: 0.0.0.0 means "no address held", so
+ * the taskbar/sysfs don't claim an IP the machine doesn't yet own. The DHCP
+ * handshake sources from a literal 0.0.0.0 (see dhcp_xmit) and so doesn't read
+ * these; it fills them in on success. Netmask stays /24 to keep same_subnet()
+ * well-defined before a lease. */
+static uint8_t my_ip[4]   = { 0, 0, 0, 0 };
+static uint8_t gw_ip[4]   = { 0, 0, 0, 0 };
+static uint8_t dns_ip[4]  = { 0, 0, 0, 0 };
 static uint8_t netmask[4] = { 255, 255, 255, 0 };
 
 #define ARP_CACHE 8
@@ -310,6 +313,15 @@ void net_ip_send(const uint8_t dst[4], uint8_t proto,
 const uint8_t *net_my_ip(void)
 {
 	return my_ip;
+}
+
+/* True once we hold a real IPv4 address (a DHCP lease landed, or a static config
+ * was applied). 0.0.0.0 is never a valid host address, so a non-zero my_ip is an
+ * exact "configured" test -- callers use it to distinguish "link up" from
+ * "actually has an address" instead of conflating the two. */
+int net_have_ip(void)
+{
+	return my_ip[0] || my_ip[1] || my_ip[2] || my_ip[3];
 }
 
 /* --------------------------------------------------------------------- ICMP */

@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include "vmtools.h"
 #include "vmware.h"
+#include "kclip.h"
 #include "rtc.h"
 #include "console.h"
 #include "sched.h"
@@ -52,20 +53,43 @@ int vmtools_clip_get(char *out, int max)
 	return n;
 }
 
-/* Watch the host clipboard: when the host offers a new selection, mirror it into
- * the local buffer so a guest paste sees it. Drains into a private scratch first,
- * then publishes length last so a concurrent reader never sees a torn update. */
+static int clip_same(const char *a, const char *b, int n)
+{
+	for (int i = 0; i < n; i++)
+		if (a[i] != b[i]) return 0;
+	return 1;
+}
+
+/* Bridge the VMware host clipboard and clipd (the system clipboard): a host copy
+ * becomes the newest clip, and a guest copy is offered to the host. Text only —
+ * the host backdoor channel carries text. `last` remembers whatever text we last
+ * bridged in either direction, so the two sides don't ping-pong an echo forever.
+ * Real-VMware only; vmware_clip_recv/send are no-ops (-1) off VMware, so this
+ * idles harmlessly there. */
 static void vmclip_thread(void)
 {
 	static char scratch[CLIP_MAX];
+	static char last[CLIP_MAX];
+	int last_len = 0;
 	for (;;) {
 		timer_sleep(CLIP_POLL_MS);
+
+		/* host -> clipd: the host offered a new selection. */
 		int n = vmware_clip_recv(scratch, sizeof scratch);
-		if (n < 0)
-			continue;                       /* nothing new from the host          */
-		for (int i = 0; i < n; i++)
-			clip_buf[i] = scratch[i];
-		clip_len = n;                       /* publish last                       */
+		if (n > 0 && (n != last_len || !clip_same(scratch, last, n))) {
+			kclip_set_text(scratch, n);
+			for (int i = 0; i < n; i++) last[i] = scratch[i];
+			last_len = n;
+			continue;                       /* don't echo it straight back to host */
+		}
+
+		/* clipd -> host: a guest copy changed the newest text clip. */
+		int m = kclip_get_text(scratch, sizeof scratch);
+		if (m > 0 && (m != last_len || !clip_same(scratch, last, m))) {
+			vmware_clip_send(scratch, m);
+			for (int i = 0; i < m; i++) last[i] = scratch[i];
+			last_len = m;
+		}
 	}
 }
 

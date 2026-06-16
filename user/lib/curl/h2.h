@@ -50,4 +50,31 @@ int h2_run(int sock, int scheme_https, const char *authority,
            char *hdr, int hdrcap, int *hdrlen,
            http_body_fn body, void *ctx);
 
+/* One batched, MULTIPLEXED fetch: GET every reqs[i].path concurrently over a
+ * single h2 connection (own stream each: 1, 3, 5, …), demuxing the interleaved
+ * responses. All requests share one origin (`authority`/`scheme_https`) and one
+ * `opts` (cookies/UA/accept), so it is for same-origin sub-resources.
+ *
+ * `on_done` (optional) is called the moment each request's stream COMPLETES with
+ * a 200 — (cb_ctx, request index, body, blen) — so the caller can consume it
+ * progressively (the browser commits each image as it lands). When on_done is
+ * set the engine owns and frees the bodies (the callback copies what it needs);
+ * reqs[i].body is left NULL. When on_done is NULL, each body instead accumulates
+ * into a malloc'd reqs[i].body (CALLER FREES). Either way .status/.failed are set
+ * (.failed = reset/refused/overflow/non-200 — the caller can retry on h1.1).
+ * Returns 0 if the connection ran to completion, or a negative HTTP_E* on a
+ * transport failure. `nreq` is capped at H2_FETCH_MAX. */
+#define H2_FETCH_MAX 16
+struct h2_fetch {
+	const char    *path;     /* in: :path to GET                                */
+	int            status;   /* out: HTTP status (0 if the stream never replied) */
+	unsigned char *body;     /* out: malloc'd response body (caller frees; NULL if on_done) */
+	int            blen;     /* out: its length                                 */
+	int            failed;   /* out: 1 = reset/refused/overflow/non-200          */
+};
+int h2_fetch_many(int sock, int scheme_https, const char *authority,
+                  const struct h2_opts *opts, struct h2_fetch *reqs, int nreq,
+                  void (*on_done)(void *ctx, int i, const unsigned char *body, int blen),
+                  void *cb_ctx);
+
 #endif /* OWOS_LIBH2_H */

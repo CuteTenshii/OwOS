@@ -18,8 +18,10 @@
  */
 
 #include <stdint.h>
+#include <stddef.h>
 #include "wm.h"
 #include "apps.h"
+#include "heap.h"
 #include "fb.h"
 #include "console.h"
 #include "mouse.h"
@@ -37,10 +39,53 @@
 #include "nic.h"
 #include "net.h"
 
-#define MAXWIN 40    /* compositor window slots: app windows + terminal + chrome */
-static struct window wins[MAXWIN];
-static int            nwin;
-static int            zlist[MAXWIN];   /* window indices, bottom .. top        */
+/* The window count is UNCAPPED. wins[]/zlist[] and the per-frame snapshot grow
+ * on the kernel heap as windows open, so the only ceiling is memory (each window
+ * is kmalloc'd, with its own client buffer) — there is no fixed compositor slot
+ * table. WM_LIST_MAX only bounds how many windows the taskbar / Alt-Tab overlay
+ * lay out at once (a display detail, not an open limit). */
+#define WM_LIST_MAX 64
+static struct window **wins;   /* grown array of kmalloc'd windows (stable addrs) */
+static int            *zlist;  /* z-order: indices into wins[], bottom..top       */
+static int             wins_cap;
+static int             nwin;
+
+/* Per-frame compositor diff snapshot, one entry parallel to wins[], grown with
+ * it. (Was MAXWIN-sized arrays on the wm_thread stack.) */
+struct pfsnap { int x, y, w, h, vis, z; uint32_t dirty, cur; };
+static struct pfsnap *pf;
+
+/* Grow wins[]/zlist[]/pf[] to hold at least `need` slots (~2x). Returns 0 if the
+ * heap is exhausted — wm_create_window then fails gracefully (NULL). Runs under
+ * the int 0x80 gate (IF=0) on the create path, atomic vs the WM thread that reads
+ * these; cli guards the rare WM-thread caller (crash_pump). */
+static int wm_reserve(int need)
+{
+	if (need <= wins_cap)
+		return 1;
+	int nc = wins_cap ? wins_cap * 2 : 16;
+	while (nc < need)
+		nc *= 2;
+	struct window **nw = kmalloc((size_t)nc * sizeof *nw);
+	int           *nz = kmalloc((size_t)nc * sizeof *nz);
+	struct pfsnap *np = kmalloc((size_t)nc * sizeof *np);
+	if (!nw || !nz || !np) { if (nw) kfree(nw); if (nz) kfree(nz); if (np) kfree(np); return 0; }
+	for (int i = 0; i < wins_cap; i++) { nw[i] = wins[i]; nz[i] = zlist[i]; np[i] = pf[i]; }
+	for (int i = wins_cap; i < nc; i++) {
+		nw[i] = 0; nz[i] = 0;
+		np[i].x = np[i].y = np[i].w = np[i].h = np[i].vis = np[i].z = 0;
+		np[i].dirty = 0xFFFFFFFF; np[i].cur = 0;
+	}
+	uint32_t fl;
+	__asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+	struct window **ow = wins; int *oz = zlist; struct pfsnap *op = pf;
+	wins = nw; zlist = nz; pf = np; wins_cap = nc;
+	if (fl & 0x200) __asm__ volatile ("sti");
+	if (ow) kfree(ow);
+	if (oz) kfree(oz);
+	if (op) kfree(op);
+	return 1;
+}
 
 static int screen_w, screen_h;
 
@@ -194,7 +239,7 @@ static void title_copy(char *dst, const char *s)
 static int topmost_visible(void)
 {
 	for (int i = nwin - 1; i >= 0; i--)
-		if (wins[zlist[i]].visible)
+		if (wins[zlist[i]]->visible)
 			return zlist[i];
 	return -1;
 }
@@ -205,7 +250,7 @@ static int topmost_visible(void)
  * is left untouched until commit, so repeated taps cycle every window instead of
  * just toggling the top two. */
 static int at_active;             /* switcher overlay is showing               */
-static int at_order[MAXWIN];      /* switch targets, most-recent first          */
+static int at_order[WM_LIST_MAX];      /* switch targets, most-recent first          */
 static int at_count;
 static int at_sel;                /* highlighted row in at_order                */
 
@@ -215,8 +260,8 @@ static int at_sel;                /* highlighted row in at_order                
 static int alttab_build(void)
 {
 	int n = 0;
-	for (int i = nwin - 1; i >= 0; i--) {   /* zlist is bottom..top -> reverse */
-		struct window *w = &wins[zlist[i]];
+	for (int i = nwin - 1; i >= 0 && n < WM_LIST_MAX; i--) {  /* bottom..top -> reverse */
+		struct window *w = wins[zlist[i]];
 		if (!w->dead && (w->visible || w->minimized))
 			at_order[n++] = zlist[i];
 	}
@@ -239,7 +284,7 @@ static void raise_window(int idx)
 static int window_at(int px, int py)
 {
 	for (int i = nwin - 1; i >= 0; i--) {
-		struct window *w = &wins[zlist[i]];
+		struct window *w = wins[zlist[i]];
 		if (!w->visible)
 			continue;
 		if (px >= w->x && px < w->x + w->w &&
@@ -266,7 +311,7 @@ static uint32_t rsz_ack;
  * settle hand-off so its client buffer follows. Used by maximize and restore. */
 static void resize_to(int idx, int nx, int ny, int nw, int nh)
 {
-	struct window *w = &wins[idx];
+	struct window *w = wins[idx];
 	w->x = nx; w->y = ny; w->w = nw; w->h = nh;
 	if (w->on_resize) {
 		rsz_win = idx;
@@ -278,21 +323,21 @@ static void resize_to(int idx, int nx, int ny, int nw, int nh)
 
 static void wm_minimize(int idx)
 {
-	wins[idx].visible = 0;
-	wins[idx].minimized = 1;
+	wins[idx]->visible = 0;
+	wins[idx]->minimized = 1;
 }
 
 /* Bring a minimized (or merely lowered) window back up and focus it. */
 static void wm_unminimize(int idx)
 {
-	wins[idx].minimized = 0;
-	wins[idx].visible = 1;
+	wins[idx]->minimized = 0;
+	wins[idx]->visible = 1;
 	raise_window(idx);
 }
 
 static void wm_toggle_maximize(int idx)
 {
-	struct window *w = &wins[idx];
+	struct window *w = wins[idx];
 	if (w->maximized) {
 		w->maximized = 0;
 		resize_to(idx, w->saved_x, w->saved_y, w->saved_w, w->saved_h);
@@ -361,7 +406,7 @@ static int taskbar_layout(int left, int right, int *idxs, int *bxs, int *bws,
 {
 	int n = 0;
 	for (int i = 0; i < nwin && n < max; i++)
-		if (!wins[i].dead)
+		if (!wins[i]->dead)
 			idxs[n++] = i;
 	if (n == 0)
 		return 0;
@@ -385,8 +430,8 @@ static int taskbar_hit(int mx, int my)
 {
 	if (my < screen_h - WM_BAR_H)
 		return -1;
-	int idxs[MAXWIN], bxs[MAXWIN], bws[MAXWIN];
-	int n = taskbar_layout(tb_band_left(), tb_band_right, idxs, bxs, bws, MAXWIN);
+	int idxs[WM_LIST_MAX], bxs[WM_LIST_MAX], bws[WM_LIST_MAX];
+	int n = taskbar_layout(tb_band_left(), tb_band_right, idxs, bxs, bws, WM_LIST_MAX);
 	for (int k = 0; k < n; k++)
 		if (mx >= bxs[k] && mx < bxs[k] + bws[k])
 			return idxs[k];
@@ -664,10 +709,15 @@ static int draw_network(int anchor_x, int y)
 	if (!nic_present())
 		return anchor_x;
 
-	int up = nic_link_up();
+	/* "link up" is not "has an address": a virtual NIC reports the carrier up
+	 * instantly, but until DHCP leases an address the machine holds no IP. Show
+	 * the address only once net_have_ip() is true; while the link is up but
+	 * unleased, say so rather than displaying a placeholder we don't really own. */
+	int up  = nic_link_up();
+	int got = net_have_ip();
 	char s[20];                          /* "255.255.255.255" / "no link" + NUL */
 	int n = 0;
-	if (up) {
+	if (got) {
 		const uint8_t *ip = net_my_ip();
 		for (int i = 0; i < 4; i++) {
 			int v = ip[i];
@@ -677,11 +727,11 @@ static int draw_network(int anchor_x, int y)
 			if (i < 3) s[n++] = '.';
 		}
 	} else {
-		for (const char *d = "no link"; *d; d++) s[n++] = *d;
+		for (const char *d = up ? "no ip" : "no link"; *d; d++) s[n++] = *d;
 	}
 	s[n] = 0;
 
-	uint32_t col = up ? 0x60c060 : 0x808890;
+	uint32_t col = got ? 0x60c060 : 0x808890;
 
 	int icon_w = 16, icon_h = 11;
 	int txt_w = fb_ui_width(s);
@@ -732,12 +782,12 @@ static void ui_text_clip(int x, int y, const char *s, uint32_t col, int maxw)
 static void draw_taskbar_windows(int y, int uy, int right)
 {
 	tb_band_right = right;
-	int idxs[MAXWIN], bxs[MAXWIN], bws[MAXWIN];
-	int n = taskbar_layout(tb_band_left(), right, idxs, bxs, bws, MAXWIN);
+	int idxs[WM_LIST_MAX], bxs[WM_LIST_MAX], bws[WM_LIST_MAX];
+	int n = taskbar_layout(tb_band_left(), right, idxs, bxs, bws, WM_LIST_MAX);
 	int focus = topmost_visible();
 	int by = y + 3, bh = WM_BAR_H - 6;
 	for (int k = 0; k < n; k++) {
-		struct window *w = &wins[idxs[k]];
+		struct window *w = wins[idxs[k]];
 		int active = (idxs[k] == focus);
 		uint32_t bg = active ? 0x2f6fb0 : w->minimized ? 0x12161e : 0x1d2533;
 		fb_fill_rect(bxs[k], by, bws[k], bh, bg);
@@ -821,7 +871,7 @@ static int pick_cursor(int mx, int my)
 
 	int idx = window_at(mx, my);
 	if (idx >= 0) {
-		struct window *w = &wins[idx];
+		struct window *w = wins[idx];
 		if (titlebtn_hit(w, mx, my) >= 0)
 			return WM_CURSOR_HAND;
 		if (w->resizable &&
@@ -868,7 +918,7 @@ static void draw_switcher(void)
 		int ry = y + AT_PAD + i * AT_ROW_H;
 		if (i == at_sel)
 			fb_fill_rect(x + 4, ry, pw - 8, AT_ROW_H, 0x2f6fb0);
-		struct window *w = &wins[at_order[i]];
+		struct window *w = wins[at_order[i]];
 		uint32_t fg = (i == at_sel) ? 0xffffff : 0xc8d0dc;
 		ui_text_clip(x + 14, ry + (AT_ROW_H - UIFONT_H) / 2, w->title, fg,
 		             pw - 28);
@@ -881,8 +931,8 @@ static void compose(int mx, int my)
 	int top = topmost_visible();
 	for (int i = 0; i < nwin; i++) {
 		int idx = zlist[i];
-		if (wins[idx].visible)
-			draw_window(&wins[idx], idx == top);
+		if (wins[idx]->visible)
+			draw_window(wins[idx], idx == top);
 	}
 	draw_taskbar();
 	if (start_open)
@@ -915,8 +965,8 @@ static void handle_input(int mx, int my, int buttons, int dz)
 	/* Wheel: route to whatever visible window is under the cursor. */
 	if (dz) {
 		int idx = window_at(mx, my);
-		if (idx >= 0 && wins[idx].scroll)
-			wins[idx].scroll(&wins[idx], mx, my, dz);
+		if (idx >= 0 && wins[idx]->scroll)
+			wins[idx]->scroll(wins[idx], mx, my, dz);
 	}
 
 	/* Right-press: raise the window under the cursor and, if the press landed in
@@ -926,7 +976,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
 		int idx = window_at(mx, my);
 		if (idx >= 0) {
 			raise_window(idx);
-			struct window *w = &wins[idx];
+			struct window *w = wins[idx];
 			if (w->rclick && my >= w->y + WM_TITLE_H)
 				w->rclick(w, mx, my);
 		}
@@ -946,7 +996,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
 		int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
 		if (tbw >= 0) {
 			start_open = 0;
-			if (wins[tbw].minimized)
+			if (wins[tbw]->minimized)
 				wm_unminimize(tbw);
 			else if (tbw == topmost_visible())
 				wm_minimize(tbw);
@@ -985,7 +1035,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
 		int idx = window_at(mx, my);
 		if (idx >= 0) {
 			raise_window(idx);
-			struct window *w = &wins[idx];
+			struct window *w = wins[idx];
 			/* Title-bar buttons: close (app's on_close, else hide), maximize/
 			 * restore, or minimize to the taskbar. */
 			int tb = titlebtn_hit(w, mx, my);
@@ -1028,10 +1078,10 @@ static void handle_input(int mx, int my, int buttons, int dz)
 			}
 		}
 	} else if (down && app_dragging >= 0) {     /* app-captured drag (scrollbar) */
-		struct window *w = &wins[app_dragging];
+		struct window *w = wins[app_dragging];
 		if (w->drag) w->drag(w, mx, my);
 	} else if (down && dragging >= 0) {         /* drag                        */
-		struct window *w = &wins[dragging];
+		struct window *w = wins[dragging];
 		int nx = mx - drag_dx, ny = my - drag_dy;
 		if (nx < 0) nx = 0;
 		if (ny < 0) ny = 0;
@@ -1041,7 +1091,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
 		w->x = nx;
 		w->y = ny;
 	} else if (down && resizing >= 0) {         /* resize from the grip        */
-		struct window *w = &wins[resizing];
+		struct window *w = wins[resizing];
 		int nw = mx + rsz_dx - w->x, nh = my + rsz_dy - w->y;
 		if (nw < WM_MIN_W) nw = WM_MIN_W;
 		if (nh < WM_MIN_H) nh = WM_MIN_H;
@@ -1062,7 +1112,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
 	 * an in-flight paint), and keep going after release until its content has
 	 * reached the final size. */
 	if (rsz_win >= 0) {
-		struct window *w = &wins[rsz_win];
+		struct window *w = wins[rsz_win];
 		if (w->dead || !w->on_resize) {
 			rsz_win = -1;
 		} else {
@@ -1096,21 +1146,25 @@ struct window *wm_create_window(int x, int y, int w, int h,
 {
 	int idx = -1;
 	for (int i = 0; i < nwin; i++)       /* reuse a destroyed slot if any */
-		if (wins[i].dead) { idx = i; break; }
+		if (wins[i]->dead) { idx = i; break; }
 	if (idx < 0) {
-		if (nwin >= MAXWIN)
+		if (!wm_reserve(nwin + 1))   /* grow the table; only the heap caps us */
 			return 0;
 		idx = nwin++;
+		wins[idx] = kmalloc(sizeof(struct window));
+		if (!wins[idx]) { nwin--; return 0; }
 		zlist[idx] = idx;
 	}
-	wins[idx] = (struct window){ 0 };
-	wins[idx].x = x; wins[idx].y = y; wins[idx].w = w; wins[idx].h = h;
-	title_copy(wins[idx].title, title);
-	wins[idx].closable = closable;
-	wins[idx].resizable = 1;       /* opt out with w->resizable = 0 after this  */
-	wins[idx].visible = 1;
+	struct window *win = wins[idx];
+	*win = (struct window){ 0 };
+	win->x = x; win->y = y; win->w = w; win->h = h;
+	title_copy(win->title, title);
+	win->closable = closable;
+	win->resizable = 1;            /* opt out with w->resizable = 0 after this  */
+	win->visible = 1;
+	pf[idx].dirty = 0xFFFFFFFF;    /* force its first content paint            */
 	raise_window(idx);             /* newest is topmost / focused              */
-	return &wins[idx];
+	return win;
 }
 
 void wm_destroy_window(struct window *w)
@@ -1167,11 +1221,11 @@ int wm_feed_key(char c)
 		if (at_active) {
 			int idx = at_order[at_sel];
 			at_active = 0;
-			if (!wins[idx].dead) {   /* the app may have exited mid-switch */
-				if (wins[idx].minimized)
+			if (!wins[idx]->dead) {   /* the app may have exited mid-switch */
+				if (wins[idx]->minimized)
 					wm_unminimize(idx);
 				else {
-					wins[idx].visible = 1;
+					wins[idx]->visible = 1;
 					raise_window(idx);
 				}
 			}
@@ -1182,7 +1236,7 @@ int wm_feed_key(char c)
 	int t = topmost_visible();
 	if (t < 0)
 		return 0;
-	struct window *w = &wins[t];
+	struct window *w = wins[t];
 	if (w->key) {
 		w->key(w, c);
 		return 1;
@@ -1196,7 +1250,7 @@ int wm_feed_key(char c)
 int wm_focus_takes_keys(void)
 {
 	int t = topmost_visible();
-	return t >= 0 && wins[t].key != 0;
+	return t >= 0 && wins[t]->key != 0;
 }
 
 /* Free space in the focused window's key-event sink, for paste flow control.
@@ -1206,9 +1260,9 @@ int wm_focus_takes_keys(void)
 int wm_focus_key_space(void)
 {
 	int t = topmost_visible();
-	if (t < 0 || !wins[t].key)
+	if (t < 0 || !wins[t]->key)
 		return 1 << 30;
-	return uwin_key_space(&wins[t]);
+	return uwin_key_space(wins[t]);
 }
 
 /* ---------------------------------------------------------------- the thread */
@@ -1232,14 +1286,21 @@ static void damage_add(int x, int y, int w, int h)
 
 extern const char *g_boot_stage;   /* breadcrumb shown on the panic screen     */
 
+/* Super+V clipboard history: the keyboard IRQ raises `cliphist_req`; the WM
+ * thread launches /bin/cliphist next frame and tracks its pid so it can paste
+ * the chosen clip into the now-focused window when the viewer exits. */
+static volatile int cliphist_req;
+static int          cliphist_pid;
+
+void wm_request_cliphist(void) { cliphist_req = 1; }
+
 static void wm_thread(void)
 {
 	g_boot_stage = "wm_thread:enter";
 	con_write("BOOTMARK: wm_thread enter\n");
-	/* Previous-frame snapshots, to diff against and damage what moved. */
-	int prev_x[MAXWIN], prev_y[MAXWIN], prev_vis[MAXWIN], prev_z[MAXWIN];
-	int prev_w[MAXWIN], prev_h[MAXWIN];
-	uint32_t prev_dirty[MAXWIN];
+	/* Previous-frame snapshots live in pf[] (grown with wins[]); see struct
+	 * pfsnap. New slots start with pf.dirty = 0xFFFFFFFF so a window's first
+	 * content always differs and paints. */
 	int prev_mx = -9999, prev_my = -9999;
 	int      prev_cur = -1;       /* cursor shape shown last frame              */
 	int      prev_wheel = mouse_wheel();
@@ -1263,11 +1324,26 @@ static void wm_thread(void)
 	if (frame_ms < 1000 / TIMER_HZ)
 		frame_ms = 1000 / TIMER_HZ;
 
-	for (int i = 0; i < MAXWIN; i++)
-		prev_dirty[i] = 0xFFFFFFFF;
-
 	g_boot_stage = "wm_thread:loop";
 	for (;;) {
+		/* Super+V: launch the clipboard-history viewer, and when it exits after
+		 * picking a clip (exit 0), inject a paste into whatever window now has
+		 * focus — the same path Ctrl+V uses. Reaped here, before the generic
+		 * reap below, so we see its exit status. */
+		if (cliphist_req) {
+			cliphist_req = 0;
+			if (!cliphist_pid)
+				cliphist_pid = apps_open_cliphist();
+		}
+		if (cliphist_pid) {
+			int cst;
+			if (sched_try_reap(cliphist_pid, &cst)) {
+				cliphist_pid = 0;
+				if (cst == 0)
+					keyboard_request_paste();
+			}
+		}
+
 		/* Reap any GUI apps we launched from the Start menu that have exited. */
 		int rst;
 		while (sched_try_reap(-1, &rst))
@@ -1297,9 +1373,8 @@ static void wm_thread(void)
 		 * a persistent partial paint. Sampling here makes the baseline reflect
 		 * exactly what was composed, so a later present always differs next frame
 		 * and forces a full-rect redraw. */
-		uint32_t cur_dirty[MAXWIN];
 		for (int i = 0; i < nwin; i++)
-			cur_dirty[i] = wins[i].dirty ? wins[i].dirty(&wins[i]) : 0;
+			pf[i].cur = wins[i]->dirty ? wins[i]->dirty(wins[i]) : 0;
 
 		if (!full) {
 			/* A z-order / visibility / focus change is recomposed in full. Two
@@ -1318,7 +1393,7 @@ static void wm_thread(void)
 			int focus = topmost_visible();
 			int zvis = (focus != prev_focus);
 			for (int i = 0; i < nwin; i++)
-				if (zlist[i] != prev_z[i] || wins[i].visible != prev_vis[i])
+				if (zlist[i] != pf[i].z || wins[i]->visible != pf[i].vis)
 					zvis = 1;
 			if (zvis)
 				full = 1;
@@ -1335,10 +1410,10 @@ static void wm_thread(void)
 
 			/* Windows that moved or resized: damage old and new rectangles. */
 			for (int i = 0; i < nwin; i++)
-				if (wins[i].x != prev_x[i] || wins[i].y != prev_y[i] ||
-				    wins[i].w != prev_w[i] || wins[i].h != prev_h[i]) {
-					damage_add(prev_x[i], prev_y[i], prev_w[i], prev_h[i]);
-					damage_add(wins[i].x, wins[i].y, wins[i].w, wins[i].h);
+				if (wins[i]->x != pf[i].x || wins[i]->y != pf[i].y ||
+				    wins[i]->w != pf[i].w || wins[i]->h != pf[i].h) {
+					damage_add(pf[i].x, pf[i].y, pf[i].w, pf[i].h);
+					damage_add(wins[i]->x, wins[i]->y, wins[i]->w, wins[i]->h);
 				}
 			/* The cursor moved, changed shape, or is animating (the spinner):
 			 * damage where it was and where it is. */
@@ -1354,9 +1429,9 @@ static void wm_thread(void)
 			/* Any window whose contents changed (per its dirty() callback): a
 			 * terminal that printed, a clock that ticked, a list that scrolled. */
 			for (int i = 0; i < nwin; i++)
-				if (wins[i].visible && wins[i].dirty &&
-				    cur_dirty[i] != prev_dirty[i])
-					damage_add(wins[i].x, wins[i].y, wins[i].w, wins[i].h);
+				if (wins[i]->visible && wins[i]->dirty &&
+				    pf[i].cur != pf[i].dirty)
+					damage_add(wins[i]->x, wins[i]->y, wins[i]->w, wins[i]->h);
 			/* The taskbar clock ticked. */
 			if ((int)timer_seconds() != last_sec)
 				damage_add(0, screen_h - WM_BAR_H, screen_w, WM_BAR_H);
@@ -1390,10 +1465,10 @@ static void wm_thread(void)
 
 		/* Snapshot for next frame's diff. */
 		for (int i = 0; i < nwin; i++) {
-			prev_x[i] = wins[i].x;   prev_y[i] = wins[i].y;
-			prev_w[i] = wins[i].w;   prev_h[i] = wins[i].h;
-			prev_vis[i] = wins[i].visible; prev_z[i] = zlist[i];
-			prev_dirty[i] = cur_dirty[i];   /* sampled before compose(), above */
+			pf[i].x = wins[i]->x;   pf[i].y = wins[i]->y;
+			pf[i].w = wins[i]->w;   pf[i].h = wins[i]->h;
+			pf[i].vis = wins[i]->visible; pf[i].z = zlist[i];
+			pf[i].dirty = pf[i].cur;   /* sampled before compose(), above */
 		}
 		prev_mx = mx; prev_my = my;
 		prev_start = start_open;

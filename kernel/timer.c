@@ -4,6 +4,7 @@
 #include "irq.h"
 #include "io.h"
 #include "nic.h"
+#include "sched.h"
 
 #define PIT_BASE_HZ   1193182      /* the PIT's fixed input frequency        */
 #define PIT_CH0_DATA  0x40
@@ -27,6 +28,7 @@ static void timer_handler(struct registers *r)
 {
 	(void)r;
 	ticks++;
+	sched_wake_due(ticks);         /* promote timed sleepers that are now due  */
 	nic_poll();                    /* IRQ-independent NIC RX drain (VMware etc.) */
 	if (tick_cb)
 		tick_cb();             /* e.g. the scheduler preempts here        */
@@ -96,13 +98,15 @@ void timer_sleep(uint32_t ms)
 {
 	/* Round up so a short sleep never returns early. */
 	uint32_t wait = (ms * TIMER_HZ + 999) / 1000;
-	uint32_t target = ticks + wait;
-	while (ticks < target)
-		/* sti *before* hlt, always: context_switch doesn't save/restore EFLAGS,
-		 * so this can be entered with IF=0 (e.g. resumed via a cooperative yield
-		 * from an interrupts-off context, like the xHCI poll thread servicing a
-		 * stalled USB device). A bare `hlt` then halts the CPU forever -- the
-		 * timer IRQ that advances `ticks` can never fire. This is the documented
-		 * "sti before hlt in every thread-context wait loop" invariant. */
-		__asm__ volatile ("sti; hlt");  /* woken by the timer IRQ            */
+	if (wait == 0)
+		return;
+	/* Block fully off the run queue until the deadline, rather than staying
+	 * RUNNABLE and `hlt`ing: a hlt-spinning sleeper is still round-robined and
+	 * burns a timer tick every cycle, so with many sleeping threads (e.g. lots
+	 * of open windows, each an app loop + worker) every thread's wakeup latency
+	 * grew to O(threads) ticks and the whole UI lagged. sched_sleep_until()
+	 * deschedules us; the timer IRQ (sched_wake_due) re-wakes us when due. It
+	 * preserves the caller's IF, so the old "entered with IF=0" callers are fine
+	 * (the switch-away and resume go through schedule(), which manages IF). */
+	sched_sleep_until(ticks + wait);
 }

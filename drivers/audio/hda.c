@@ -70,6 +70,7 @@
 #define P_INAMPCAP    0x0D                /* input amp capabilities          */
 #define P_CONNLEN     0x0E                /* connection list length          */
 #define P_OUTAMPCAP   0x12                /* output amp capabilities         */
+#define P_GPIOCNT     0x11                /* GPIO count (bidir/out/in fields)*/
 
 #define V_GET_CONN    0xF0200u            /* get connection list entry       */
 #define V_GET_CFGDEF  0xF1C00u            /* get configuration default       */
@@ -80,6 +81,9 @@
 #define V_SET_PINCTL  0x70700u            /* + control bits                  */
 #define V_SET_EAPD    0x70C00u            /* + bit1 EAPD enable              */
 #define V_SET_AMP     0x30000u            /* + 16-bit amp gain/mute payload  */
+#define V_SET_GPIODAT 0x71500u            /* + 8-bit GPIO data               */
+#define V_SET_GPIOMSK 0x71600u            /* + 8-bit GPIO enable mask        */
+#define V_SET_GPIODIR 0x71700u            /* + 8-bit GPIO direction (1=out)  */
 
 #define WT_DAC   0   /* audio output converter        */
 #define WT_MIXER 2   /* mixer                         */
@@ -237,6 +241,128 @@ static int find_dac_path(uint16_t pin)
 	return 0;
 }
 
+/* Some real codecs (notably Realtek laptop parts) gate the internal speaker
+ * amplifier and/or EAPD behind codec GPIO pins. QEMU's codec exposes none, so
+ * this is invisible in emulation, and without a per-model quirk table there's no
+ * telling which GPIO drives the amp — so assert every GPIO the codec advertises
+ * as an output driven high, the common polarity for an amp/EAPD enable. No-ops
+ * on a codec with no GPIOs, so it cannot regress the emulated path. */
+static void enable_codec_gpios(uint16_t afg)
+{
+	uint32_t ngpio = get_param(afg, P_GPIOCNT) & 0xFF;   /* bidirectional pins */
+	if (ngpio == 0)
+		return;
+	uint32_t mask = (ngpio >= 8) ? 0xFFu : ((1u << ngpio) - 1u);
+	codec_cmd(afg, V_SET_GPIOMSK | mask);                /* enable these GPIOs */
+	codec_cmd(afg, V_SET_GPIODIR | mask);                /* drive them as output */
+	codec_cmd(afg, V_SET_GPIODAT | mask);                /* set them high        */
+}
+
+/* ---- output endpoint table --------------------------------------------- */
+/* The codec usually exposes several output pins (speaker, headphone, line-out).
+ * Keep them all so the active one can be switched at runtime, instead of
+ * collapsing to a single best pin at init. Each entry caches the full resolved
+ * DAC path for its pin. */
+#define MAX_OUTPUTS 6
+struct out_ep {
+	uint16_t pin;          /* the output pin widget                          */
+	uint16_t dac;          /* DAC reached from it                            */
+	uint16_t mix;          /* mixer/selector hop, 0 = direct                 */
+	int      mix_in_idx;   /* mixer/selector input index -> DAC              */
+	int      pin_sel_idx;  /* pin input index -> mixer/DAC                   */
+	int      mix_is_sel;   /* the hop is a selector (not a mixer)            */
+	int      is_hp;        /* the pin is a headphone jack                    */
+	int      dev;          /* config-default device code (names the output)  */
+};
+static struct out_ep outs[MAX_OUTPUTS];
+static int n_outs;
+static int cur_out = -1;   /* active index into outs[] (-1 = none)           */
+
+/* Default-device code -> rank (lower wins) and a human name. */
+static int dev_rank(int dev)
+{
+	switch (dev) {
+	case 0x1: return 0;   /* Speaker  */
+	case 0x0: return 1;   /* Line Out */
+	case 0x2: return 2;   /* HP Out   */
+	default:  return 3;
+	}
+}
+static const char *dev_name(int dev)
+{
+	switch (dev) {
+	case 0x1: return "Speakers";
+	case 0x0: return "Line Out";
+	case 0x2: return "Headphones";
+	default:  return "Digital Out";
+	}
+}
+
+/* Choose the single widget the volume keys/amp drive for the active path
+ * (pin > DAC > mixer), so attenuation isn't multiplied across stages. */
+static void pick_vol_widget(void)
+{
+	vol_nid = 0; vol_steps = 0;
+	uint16_t cand[3]; int nc = 0;
+	cand[nc++] = pin_nid;
+	cand[nc++] = dac_nid;
+	if (path_mix) cand[nc++] = path_mix;
+	for (int i = 0; i < nc; i++) {
+		uint32_t st = out_steps(cand[i]);
+		if (st) { vol_nid = cand[i]; vol_steps = st; break; }
+	}
+}
+
+/* Copy the active endpoint into the path globals and re-pick its volume widget,
+ * so configure_path()/the volume keys act on the selected output. */
+static void apply_active_globals(void)
+{
+	struct out_ep *e = &outs[cur_out];
+	dac_nid    = e->dac;        pin_nid     = e->pin;     path_mix  = e->mix;
+	mix_in_idx = e->mix_in_idx; pin_sel_idx = e->pin_sel_idx;
+	mix_is_sel = e->mix_is_sel; pin_is_hp   = e->is_hp;
+	pick_vol_widget();
+}
+
+/* Collect every output-capable pin that reaches a DAC into outs[], ranked
+ * speaker > line-out > headphone > other. A strict pass first; only if it finds
+ * nothing, a fallback pass also trusts pins whose config default mislabels a
+ * wired output as "no physical connection". Returns the count. */
+static int collect_outputs(uint16_t w_start, int w_count)
+{
+	n_outs = 0;
+	for (int pass = 0; pass < 2 && n_outs == 0; pass++) {
+		for (int i = 0; i < w_count && n_outs < MAX_OUTPUTS; i++) {
+			uint16_t w = (uint16_t)(w_start + i);
+			if (widget_type(w) != WT_PIN)
+				continue;
+			if (!((get_param(w, P_PINCAP) >> 4) & 1))      /* output-capable?  */
+				continue;
+			uint32_t cfg = codec_cmd(w, V_GET_CFGDEF);
+			int conn = (int)((cfg >> 30) & 0x3);           /* 1 = no phys conn */
+			int dev  = (int)((cfg >> 20) & 0xF);           /* default device   */
+			if (conn == 1 && pass == 0)
+				continue;
+			uint16_t save_dac = dac_nid, save_mix = path_mix;
+			if (!find_dac_path(w)) { dac_nid = save_dac; path_mix = save_mix; continue; }
+			struct out_ep *e = &outs[n_outs++];
+			e->pin = w;                 e->dac = dac_nid;          e->mix = path_mix;
+			e->mix_in_idx = mix_in_idx; e->pin_sel_idx = pin_sel_idx;
+			e->mix_is_sel = mix_is_sel; e->is_hp = (dev == 0x2);   e->dev = dev;
+		}
+	}
+	/* Insertion-sort by rank so the speaker is the default active output. */
+	for (int i = 1; i < n_outs; i++) {
+		struct out_ep tmp = outs[i];
+		int j = i - 1;
+		while (j >= 0 && dev_rank(outs[j].dev) > dev_rank(tmp.dev)) {
+			outs[j + 1] = outs[j]; j--;
+		}
+		outs[j + 1] = tmp;
+	}
+	return n_outs;
+}
+
 /* Walk the audio function group, collect output-capable pins, and pick the best
  * one (speaker > line-out > headphone > anything) that reaches a DAC. */
 static int enumerate_codec(void)
@@ -253,61 +379,19 @@ static int enumerate_codec(void)
 	if (!afg)
 		return 0;
 	codec_cmd(afg, V_SET_POWER | 0x00);           /* power the AFG to D0      */
+	enable_codec_gpios(afg);                      /* unmute a GPIO-gated amp  */
 
 	uint32_t wsub = get_param(afg, P_SUBNODE);
 	uint16_t w_start = (uint16_t)((wsub >> 16) & 0xFF);
 	int      w_count = (int)(wsub & 0xFF);
 
-	/* Rank candidate pins by default-device; lower rank wins. */
-	uint16_t best_pin = 0; int best_rank = 99, best_hp = 0;
-	for (int i = 0; i < w_count; i++) {
-		uint16_t w = (uint16_t)(w_start + i);
-		if (widget_type(w) != WT_PIN)
-			continue;
-		if (!((get_param(w, P_PINCAP) >> 4) & 1))         /* output-capable?  */
-			continue;
-		uint32_t cfg = codec_cmd(w, V_GET_CFGDEF);
-		int conn = (int)((cfg >> 30) & 0x3);              /* 1 = no phys conn */
-		int dev  = (int)((cfg >> 20) & 0xF);              /* default device   */
-		if (conn == 1)
-			continue;
-		int rank;
-		switch (dev) {
-		case 0x1: rank = 0; break;   /* Speaker  */
-		case 0x0: rank = 1; break;   /* Line Out */
-		case 0x2: rank = 2; break;   /* HP Out   */
-		default:  rank = 3; break;
-		}
-		if (rank < best_rank) {
-			/* Only accept if a DAC path exists from this pin. */
-			uint16_t save_dac = dac_nid; uint16_t save_mix = path_mix;
-			if (find_dac_path(w)) {
-				best_pin = w; best_rank = rank; best_hp = (dev == 0x2);
-			} else {
-				dac_nid = save_dac; path_mix = save_mix;
-			}
-		}
-	}
-	if (!best_pin)
+	/* Collect every switchable output pin (speaker/headphones/line-out/...),
+	 * then make the best-ranked one active so the volume keys and the first play
+	 * route correctly before anything is selected. */
+	if (!collect_outputs(w_start, w_count))
 		return 0;
-
-	/* Re-resolve the chosen pin's path so the path_* globals match it. */
-	pin_nid = best_pin; pin_is_hp = best_hp;
-	if (!find_dac_path(pin_nid))
-		return 0;
-
-	/* Pick the single widget the volume keys drive (pin > DAC > mixer), so
-	 * attenuation isn't multiplied across stages and volume works from the
-	 * first keypress — not only after the first play. */
-	vol_nid = 0; vol_steps = 0;
-	uint16_t cand[3]; int nc = 0;
-	cand[nc++] = pin_nid;
-	cand[nc++] = dac_nid;
-	if (path_mix) cand[nc++] = path_mix;
-	for (int i = 0; i < nc; i++) {
-		uint32_t st = out_steps(cand[i]);
-		if (st) { vol_nid = cand[i]; vol_steps = st; break; }
-	}
+	cur_out = 0;
+	apply_active_globals();
 	return 1;
 }
 
@@ -472,6 +556,8 @@ int hda_volume(void)
 
 static void configure_path(void)
 {
+	apply_active_globals();          /* sync globals + vol widget to cur_out      */
+
 	/* DAC: power up, set format, bind to the stream, max output amp. */
 	codec_cmd(dac_nid, V_SET_POWER  | 0x00);
 	codec_cmd(dac_nid, V_SET_FORMAT | FMT_48K_S16_STEREO);
@@ -486,7 +572,17 @@ static void configure_path(void)
 		amp_out_max(path_mix);
 	}
 
-	/* Pin: power up, enable output (+ HP amp for a headphone), EAPD, amp. */
+	/* Disable every other output pin so playback is exclusive to the selected
+	 * one — speaker and headphone often share a DAC, so leaving both pins enabled
+	 * would drive both jacks at once. */
+	for (int i = 0; i < n_outs; i++) {
+		if (i == cur_out)
+			continue;
+		codec_cmd(outs[i].pin, V_SET_PINCTL | 0x00);   /* output disable */
+		set_out_amp(outs[i].pin, 0, 1);                /* mute its amp   */
+	}
+
+	/* Active pin: power up, enable output (+ HP amp for a headphone), EAPD, amp. */
 	codec_cmd(pin_nid, V_SET_POWER | 0x00);
 	codec_cmd(pin_nid, V_SET_PINCTL | (pin_is_hp ? 0xC0 : 0x40));
 	codec_cmd(pin_nid, V_SET_EAPD   | 0x02);
@@ -655,5 +751,38 @@ void hda_stream_close(void)
 	wr8(sd_off + SD_CTL, 0);               /* stop the stream                   */
 	s_active = 0;
 	s_started = 0;
+}
+
+/* ---- output endpoint switching (Sound settings + /sys/class/sound) ------ *
+ * The codec's output pins are enumerated once at init; these expose them so the
+ * Sound panel and /sys can list them and switch the active output at runtime.
+ * All degrade to empty/-1/failure when no codec is present. */
+int hda_output_count(void) { return present ? n_outs : 0; }
+
+int hda_output_name(int i, char *out, int max)
+{
+	if (!present || i < 0 || i >= n_outs || max <= 0)
+		return 0;
+	const char *s = dev_name(outs[i].dev);
+	int k = 0;
+	for (; s[k] && k < max - 1; k++) out[k] = s[k];
+	out[k] = 0;
+	return 1;
+}
+
+int hda_output_active(void) { return present ? cur_out : -1; }
+
+int hda_output_select(int i)
+{
+	if (!present || i < 0 || i >= n_outs)
+		return -1;
+	cur_out = i;
+	/* Re-route a live stream immediately; otherwise just record the choice so the
+	 * next play opens on the newly selected output. */
+	if (s_active)
+		configure_path();
+	else
+		apply_active_globals();
+	return 0;
 }
 

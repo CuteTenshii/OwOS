@@ -4,7 +4,7 @@
 #include "pipe.h"
 #include "sched.h"
 
-#define MAX_PIPES 8
+#define MAX_PIPES 16   /* spawn_cap uses 1 each; an IPC channel uses 2 (rx+tx) */
 #define PIPE_SIZE 512
 
 struct pipe {

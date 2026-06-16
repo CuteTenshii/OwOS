@@ -30,7 +30,6 @@
 #include "ahci.h"
 #include "nvme.h"
 #include "log.h"
-#include "vmtools.h"
 #include "power.h"
 #include "services.h"
 #include "xhci.h"
@@ -115,11 +114,6 @@ static void gen_journal(struct pb *b)
 	b->p += journal_copy(b->p, (int)(b->end - b->p));
 }
 
-static void gen_clipboard(struct pb *b)
-{
-	b->p += vmtools_clip_get(b->p, (int)(b->end - b->p));
-}
-
 /* services and usb only know how to print to the console, so capture that into
  * the /proc buffer. con_capture is global but procfs_read is called
  * synchronously by the reader, so the window is tiny. */
@@ -141,7 +135,7 @@ static void gen_usb(struct pb *b)
 static const char *const entries[] = {
 	"cpuinfo", "meminfo", "uptime", "tasks", "date",
 	"owofs", "storage", "pci",
-	"journal", "clipboard",
+	"journal",
 	"services", "usb",
 };
 #define NENTRIES ((int)(sizeof entries / sizeof entries[0]))
@@ -196,7 +190,6 @@ int procfs_read(const char *sub, char *buf, int max)
 	else if (streq(sub, "storage"))  gen_storage(&b);
 	else if (streq(sub, "pci"))      gen_pci(&b);
 	else if (streq(sub, "journal"))  gen_journal(&b);
-	else if (streq(sub, "clipboard")) gen_clipboard(&b);
 	else if (streq(sub, "services")) gen_services(&b);
 	else if (streq(sub, "usb"))      gen_usb(&b);
 	else                             return -1;
@@ -212,15 +205,6 @@ int procfs_write(const char *sub, const char *buf, int len)
 {
 	__asm__ volatile ("sti");                 /* dhcp/ntp wait on the timer/IRQs   */
 	if (sub[0] == '/') sub++;
-
-	/* The clipboard is the one node that carries arbitrary text (a whole editor
-	 * selection -- multi-line, embedded newlines, far over the 255-byte command
-	 * cap below), so it takes the raw payload verbatim; vmtools_clip_set bounds
-	 * it to the clipboard capacity and mirrors it to the VMware host. */
-	if (streq(sub, "clipboard")) {
-		vmtools_clip_set(buf, len);
-		return len;
-	}
 
 	/* Trim a trailing newline and bound the payload into a NUL-terminated copy. */
 	char arg[256];

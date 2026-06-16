@@ -23,6 +23,7 @@
 #include "upng.h"
 #include "url.h"     /* struct purl, parse_url, resolve_url (shared with curl) */
 #include "h2.h"      /* HTTP/2 engine: h2_run + struct h2_opts (TLS+ALPN path) */
+#include "dom.h"     /* DOM tree + the shared lower/starts_ci/streq_ci helpers  */
 
 extern int BW, BH;         /* client size (mutable: the window is resizable)    */
 #define MENU_H    18       /* top app-menu bar height (above the address bar)  */
@@ -81,6 +82,16 @@ struct cookie { char *host; char *name; char *val; struct cookie *next; };
 struct hsts_host { char *host; struct hsts_host *next; };
 struct link   { int start, end; char href[URL_MAX]; };
 
+/* An external stylesheet URL declared in the response's Link: header (resolved
+ * absolute). The document's own <link rel=stylesheet> elements are found while
+ * walking the DOM; these come from the HTTP header instead. Heap list, uncapped.*/
+struct css_link { char *url; struct css_link *next; };
+
+/* Batch-fetch n absolute URLs into bodies[i] (malloc'd, caller frees) + lens[i].
+ * Injected into the renderer so html.c can pull external stylesheets — same-
+ * origin ones multiplexed over h2 — without doing network I/O itself. */
+typedef void (*res_batch_fn)(char *const *urls, int n, unsigned char **bodies, int *lens);
+
 /* An inline <img>: anchored at a text offset, fetched into img_pool, laid out
  * into reserved blank rows, and blitted decode-on-scroll when in view. */
 struct inl_img {
@@ -96,6 +107,10 @@ struct inl_img {
 	int      want;           /* UI flag: a lazy image is now scrolled in      */
 	int      fetched;        /* 1 = a fetch has been attempted (ok = result)  */
 	int      cw, ch;         /* width/height from the attr or CSS, px (0=auto) */
+	int      is_argb;        /* 1 = img_pool holds raw RGBA (SVG), not PNG    */
+	int      uid;            /* session-unique id once landed (0 = none);     *
+	                          * keys the decoded-pixel cache so a PNG inflates *
+	                          * once, not on every scroll repaint (see main.c) */
 };
 
 struct browser {
@@ -125,6 +140,7 @@ struct browser {
 	struct link *links;      int nlinks,       links_cap;
 
 	struct inl_img *imgs;    int n_imgs,       imgs_cap;   /* inline <img> list */
+	int      img_uid_next;   /* monotonic id source for inl_img.uid (never reused) */
 	/* Fixed slab (see IMG_POOL above): the parallel image fetchers need a base
 	 * that never moves, so this one is not growable. */
 	unsigned char img_pool[IMG_POOL];
@@ -154,6 +170,15 @@ struct browser {
 
 	struct cookie *cookies;          /* head of the heap cookie jar (no cap)   */
 	struct hsts_host *hsts;          /* head of the HSTS host list (no cap)    */
+	struct css_link *ext_css;        /* stylesheet URLs from the Link: header   */
+
+	/* @font-face faces loaded for this page (each: family name, the parsed font,
+	 * and the owned font-file bytes the parser points into). body_font is the
+	 * face the page's body text uses, or NULL to fall back to the baked UI font.
+	 * Reset each navigation. struct font is from user/lib/font. */
+	struct loaded_face { char family[48]; struct font *font; unsigned char *data; } faces[4];
+	int          n_faces;
+	struct font *body_font;
 
 	int           sock;
 	unsigned char rbuf[2048];
@@ -164,12 +189,8 @@ extern struct browser *B;
 extern const unsigned palette[16];
 
 /* --- shared tiny helpers (header-inlined so each module gets its own copy) -
- * strlen/streq come from owos.h; these are the browser-specific ones. */
-static inline char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-static inline int starts_ci(const char *s, const char *pre)
-{ while (*pre) { if (lower(*s) != lower(*pre)) return 0; s++; pre++; } return 1; }
-static inline int streq_ci(const char *a, const char *b)
-{ while (*a && lower(*a) == lower(*b)) { a++; b++; } return lower(*a) == lower(*b); }
+ * strlen/streq come from owos.h; lower/starts_ci/streq_ci come from dom.h (shared
+ * with the parser); these are the remaining browser-specific ones. */
 static inline void sapp(char *d, int *n, int cap, const char *s)
 { while (*s && *n < cap - 1) d[(*n)++] = *s++; d[*n] = '\0'; }
 static inline void uapp(char *d, int *n, int cap, unsigned v)
@@ -205,7 +226,11 @@ void blk_unlock(void);
 
 /* --- cross-module API ----------------------------------------------------- */
 /* parse_url / resolve_url live in user/lib/url.h (shared with curl). */
-void html_to_text(void);
+/* Render B->raw as HTML into the styled-text buffers. `page_url` resolves
+ * relative stylesheet hrefs; `fetch` (may be NULL) batch-pulls external <link
+ * rel=stylesheet> + Link-header sheets so the CSS is complete before layout. */
+void html_to_text(const char *page_url, res_batch_fn fetch);
+void html_set_charset(const char *content_type);          /* charset from HTTP CT */
 void plain_to_text(void);                                  /* html.c */
 void doc_message(const char *m);
 void show_error(const char *m);                            /* fetch.c */

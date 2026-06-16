@@ -24,6 +24,12 @@ uint32_t pmm_alloc_contig(uint32_t bytes);
 /* Free a run returned by pmm_alloc_contig (frame by frame). */
 void     pmm_free_contig(uint32_t phys, uint32_t bytes);
 
+/* The RAM-scaled low-memory layout (computed in pmm_init from detected RAM).
+ * pmm_low_end()    = end of the identity-mapped/reserved low region (paging.c).
+ * pmm_pool_start() = start of the palloc page-table pool == kernel heap end. */
+uint32_t pmm_low_end(void);
+uint32_t pmm_pool_start(void);
+
 /* Reported in KiB rather than bytes so a ≥4 GiB machine doesn't overflow the
  * uint32 (4 GiB of bytes wraps to 0; 4 GiB is 4194304 KiB, which fits).
  * `installed` is the true firmware-reported RAM total (can exceed 4 GiB on a

@@ -30,6 +30,14 @@ void sha256_update(struct sha256 *s, const void *data, uint32_t len);
 void sha256_final(struct sha256 *s, uint8_t out[SHA256_DIGEST]);
 void sha256(const void *data, uint32_t len, uint8_t out[SHA256_DIGEST]);
 
+/* ------------------------------------------------------------------ SHA-512 */
+/* One-shot only (all the kernel needs: Ed25519 in ed25519.c hashes whole
+ * messages). RFC 6234 / FIPS 180-4. */
+
+#define SHA512_DIGEST 64
+
+void sha512(const void *data, uint32_t len, uint8_t out[SHA512_DIGEST]);
+
 /* -------------------------------------------------------------------- SHA-1 */
 
 #define SHA1_BLOCK 64

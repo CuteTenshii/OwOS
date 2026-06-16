@@ -25,6 +25,7 @@
 #include "heap.h"
 #include "file.h"
 #include "pipe.h"
+#include "ipc.h"
 #include "net.h"
 #include "uwin.h"
 #include "rtc.h"
@@ -110,6 +111,9 @@
 #define SYS_GETUID     54 /* getuid() -> the calling task's user id (per-process credentials, */
 #define SYS_GETGID     55 /* getgid() -> its group id; user space resolves the name/home from */
                           /* /etc/passwd itself, so there's no /proc identity file.           */
+#define SYS_PORT_OPEN  56 /* port_open(name=ebx, as_server=ecx) -> fd/-1. A named local-IPC   */
+                          /* port: server registers + accept()s, client connects (ipc.c).    */
+#define SYS_PORT_ACCEPT 57 /* port_accept(listen_fd=ebx) -> channel fd/-1 (blocks for a conn) */
 
 /* Net transports are general sockets: SYS_NET_CONNECT's `proto` arg selects
  * TCP/TLS/UDP/raw-ICMP, so ping/dig/resolve are libs over sockets, not
@@ -240,6 +244,8 @@ void syscall_dispatch(struct registers *r)
 			r->eax = len;
 		} else if (f->type == FD_PIPE_WR) {
 			r->eax = (uint32_t)pipe_write(f->pipe, buf, (int)len);
+		} else if (f->type == FD_CHANNEL) {
+			r->eax = (uint32_t)pipe_write(f->tx, buf, (int)len);
 		} else {
 			r->eax = (uint32_t)-1;
 		}
@@ -295,6 +301,11 @@ void syscall_dispatch(struct registers *r)
 			pipe_close(f->pipe, 0);
 		else if (f->type == FD_PIPE_WR)
 			pipe_close(f->pipe, 1);
+		else if (f->type == FD_CHANNEL) {
+			pipe_close(f->pipe, 0);    /* this end reads rx  */
+			pipe_close(f->tx, 1);      /* and writes tx      */
+		} else if (f->type == FD_PORT)
+			ipc_port_destroy(f->pipe);
 		f->type = FD_NONE;
 		r->eax = 0;
 		break;
@@ -390,6 +401,8 @@ void syscall_dispatch(struct registers *r)
 			r->eax = n;
 		} else if (f->type == FD_PIPE_RD) {
 			r->eax = (uint32_t)pipe_read(f->pipe, buf, (int)len);
+		} else if (f->type == FD_CHANNEL) {
+			r->eax = (uint32_t)pipe_read(f->pipe, buf, (int)len);
 		} else {
 			r->eax = (uint32_t)-1;
 		}
@@ -407,6 +420,44 @@ void syscall_dispatch(struct registers *r)
 	case SYS_GETGID:
 		r->eax = sched_gid();
 		break;
+	case SYS_PORT_OPEN: {
+		const char *name = (const char *)r->ebx;
+		int as_server = (int)r->ecx;
+		if (!user_range(r->ebx, 16)) { r->eax = (uint32_t)-1; break; }
+		struct fd *fds = sched_fds();
+		int nfd = -1;
+		for (int i = 0; i < MAX_FD; i++)
+			if (fds[i].type == FD_NONE) { nfd = i; break; }
+		if (nfd < 0) { r->eax = (uint32_t)-1; break; }
+		if (as_server) {
+			int pid = ipc_port_create(name);
+			if (pid < 0) { r->eax = (uint32_t)-1; break; }
+			fds[nfd].type = FD_PORT; fds[nfd].pipe = (uint8_t)pid;
+		} else {
+			int rx = 0, tx = 0;
+			if (ipc_connect(name, &rx, &tx) < 0) { r->eax = (uint32_t)-1; break; }
+			fds[nfd].type = FD_CHANNEL; fds[nfd].pipe = (uint8_t)rx; fds[nfd].tx = (uint8_t)tx;
+		}
+		r->eax = (uint32_t)nfd;
+		break;
+	}
+	case SYS_PORT_ACCEPT: {
+		int lfd = (int)r->ebx;
+		struct fd *fds = sched_fds();
+		if (lfd < 0 || lfd >= MAX_FD || fds[lfd].type != FD_PORT) { r->eax = (uint32_t)-1; break; }
+		int rx = 0, tx = 0;
+		if (ipc_accept(fds[lfd].pipe, &rx, &tx) < 0) { r->eax = (uint32_t)-1; break; }
+		int nfd = -1;
+		for (int i = 0; i < MAX_FD; i++)
+			if (fds[i].type == FD_NONE) { nfd = i; break; }
+		if (nfd < 0) {                  /* no slot: don't leak the new channel   */
+			pipe_close(rx, 0); pipe_close(tx, 1);
+			r->eax = (uint32_t)-1; break;
+		}
+		fds[nfd].type = FD_CHANNEL; fds[nfd].pipe = (uint8_t)rx; fds[nfd].tx = (uint8_t)tx;
+		r->eax = (uint32_t)nfd;
+		break;
+	}
 	case SYS_READFILE: {
 		const char *name = (const char *)r->ebx;
 		uint32_t buf = r->ecx, max = r->edx;

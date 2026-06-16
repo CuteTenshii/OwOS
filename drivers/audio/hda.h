@@ -40,4 +40,15 @@ int  hda_stream_open(void);
 int  hda_stream_write(const void *pcm, uint32_t bytes);
 void hda_stream_close(void);
 
+/* Output endpoint selection — speaker / headphones / line-out on the codec.
+ * The codec usually exposes more than one output pin; these let the Sound
+ * settings panel and /sys/class/sound enumerate them and switch the active one
+ * at runtime (re-routing a live stream). hda_output_select() takes an index into
+ * the list. All degrade gracefully (count 0, active -1, select fails) when no
+ * codec is present. */
+int  hda_output_count(void);                  /* number of switchable outputs   */
+int  hda_output_name(int i, char *out, int max); /* output i's name (1 if valid) */
+int  hda_output_active(void);                 /* active index, or -1            */
+int  hda_output_select(int i);                /* switch active output; 0 on ok  */
+
 #endif /* OWOS_HDA_H */

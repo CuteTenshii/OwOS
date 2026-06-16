@@ -150,3 +150,26 @@ int users_login(const char *name, const char *pass)
 	sched_set_creds_self(e.uid, e.gid);        /* switch the caller's identity   */
 	return 0;
 }
+
+/* Validate `name`/`pass` against /etc/passwd WITHOUT changing any credentials,
+ * and report the account's uid/gid/home. For the SSH server, which authenticates
+ * a remote login from a kernel thread (so it must not touch its own identity)
+ * and then spawns the user's shell with these creds. Returns 0 on success, -1
+ * unknown user, -2 wrong password. `home` may be NULL. */
+int users_authenticate(const char *name, const char *pass,
+                       uint32_t *uid, uint32_t *gid, char *home, int homesz)
+{
+	struct pwent e;
+	if (!passwd_lookup(name, 0, &e))
+		return -1;
+	if (e.pwhash[0]) {
+		char given[65];
+		hash_pw(pass ? pass : "", given);
+		if (!streq(given, e.pwhash))
+			return -2;
+	}
+	if (uid) *uid = e.uid;
+	if (gid) *gid = e.gid;
+	if (home) cpy(home, e.home[0] ? e.home : (e.uid == 0 ? "/home/root" : "/home/user"), homesz);
+	return 0;
+}

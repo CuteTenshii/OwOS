@@ -39,10 +39,13 @@ static inline void irq_restore(uint32_t f)
 
 #define PD_ENTRIES   1024
 #define PT_ENTRIES   1024
-#define IDENTITY_TABLES 4              /* 4 tables * 4 MiB = 16 MiB           */
+/* Max identity tables: 48 * 4 MiB = 192 MiB, the cap on the RAM-scaled low region
+ * (pmm_low_end()). paging_init maps only as many as that region needs; the rest
+ * sit unused in .bss (192 KiB). The region must stay below SCRATCH_VADDR. */
+#define IDENTITY_TABLES 48
 
 /* Page-aligned so their physical addresses are valid PDE/PTE pointers. Living
- * in .bss (below 4 MiB) they are themselves identity-mapped. */
+ * in .bss (below ~4 MiB) they are themselves identity-mapped. */
 static uint32_t page_directory[PD_ENTRIES]              __attribute__((aligned(4096)));
 static uint32_t page_tables[IDENTITY_TABLES][PT_ENTRIES] __attribute__((aligned(4096)));
 
@@ -54,12 +57,21 @@ static uint32_t page_tables[IDENTITY_TABLES][PT_ENTRIES] __attribute__((aligned(
 #define SCRATCH_VADDR 0x10000000u
 static uint32_t scratch_pt[PT_ENTRIES] __attribute__((aligned(4096)));
 
+/* Page-table pool cursor (primed in paging_init from pmm_pool_start). */
+static uint32_t pool_next;              /* next unused page (0 until primed)    */
+static uint32_t pool_free;              /* freelist head (0 = empty)           */
+
 void paging_init(void)
 {
 	for (int i = 0; i < PD_ENTRIES; i++)
 		page_directory[i] = 0;         /* not present                         */
 
-	for (int t = 0; t < IDENTITY_TABLES; t++) {
+	/* Identity-map [0, pmm_low_end()) — the RAM-scaled kernel/heap/pool region.
+	 * One table per 4 MiB, up to IDENTITY_TABLES. */
+	int ntables = (int)(pmm_low_end() >> 22);
+	if (ntables < 1) ntables = 4;             /* before pmm_init: legacy 16 MiB */
+	if (ntables > IDENTITY_TABLES) ntables = IDENTITY_TABLES;
+	for (int t = 0; t < ntables; t++) {
 		for (int i = 0; i < PT_ENTRIES; i++) {
 			uint32_t frame = ((uint32_t)t * PT_ENTRIES + i) * 4096;
 			page_tables[t][i] = frame | PAGE_PRESENT | PAGE_RW;
@@ -75,6 +87,8 @@ void paging_init(void)
 		scratch_pt[i] = 0;
 	page_directory[SCRATCH_VADDR >> 22] = (uint32_t)scratch_pt | PAGE_PRESENT | PAGE_RW;
 
+	pool_next = pmm_pool_start();       /* page-table pool: [pool_start, low_end) */
+
 	__asm__ volatile ("mov %0, %%cr3" : : "r"(page_directory));
 
 	uint32_t cr0;
@@ -88,14 +102,11 @@ uint32_t paging_kernel_phys(void)
 	return (uint32_t)page_directory;
 }
 
-/* --- page-frame pool over [12 MiB, 16 MiB) (identity-mapped) --------------- */
-#define POOL_START 0x00C00000u
-#define POOL_END   0x01000000u
-/* User program/stack frames now come from pmm high memory; the pool backs only
- * page directories + page tables (a few frames per process). */
-
-static uint32_t pool_next = POOL_START;
-static uint32_t pool_free;              /* freelist head (0 = empty)           */
+/* --- page-frame pool over [pmm_pool_start(), pmm_low_end()) (identity-mapped) -
+ * RAM-scaled (see pmm.c); on a 256 MiB box that is the legacy [12 MiB, 16 MiB).
+ * User program/stack frames come from pmm high memory; the pool backs only page
+ * directories + page tables (a few frames per process), so it scales with how
+ * many processes can exist. pool_next is primed in paging_init (after pmm). */
 
 void *palloc(void)
 {
@@ -103,7 +114,7 @@ void *palloc(void)
 	if (pool_free) {
 		page = pool_free;
 		pool_free = *(uint32_t *)page;     /* next link stored in the page    */
-	} else if (pool_next + 4096 <= POOL_END) {
+	} else if (pool_next + 4096 <= pmm_low_end()) {
 		page = pool_next;
 		pool_next += 4096;
 	} else {

@@ -10,18 +10,16 @@
 #include "idt.h"
 #include "file.h"
 #include "pipe.h"
+#include "ipc.h"
 #include "uwin.h"
 #include <stdint.h>
 
-/* Total tasks (processes + kernel/user threads). This must comfortably exceed
- * the steady-state set — the WM, the terminal, every auto-started service daemon
- * (servicesd/smbd/dhcp/...), boot_bringup, the screenshot worker — PLUS what an
- * app needs at once: the browser alone is its process, a fetch worker, and one
- * thread per inline image. At 16 a freshly-opened browser left no free slot, so
- * launching any other program failed ("failed to launch ..."). Only the tasks[]
- * array scales with this; each slot's kernel stack is kmalloc'd on demand, so
- * the real ceiling is the kernel heap (alloc fails gracefully). */
-#define MAX_TASKS   64
+/* Tasks are HEAP-ALLOCATED — a `kmalloc`'d task_t per task, linked into the
+ * circular run queue. There is no fixed task-table cap: the only ceiling is the
+ * kernel heap, and `alloc_task()` fails gracefully (the spawn returns -1, e.g.
+ * "failed to launch ...") when it's exhausted, rather than at an arbitrary array
+ * bound. Each task also kmalloc's a KSTACK_SIZE kernel stack, so kstacks are what
+ * actually dominate heap use as the task count grows. */
 /* Every timer tick, timer_handler() runs nic_poll() -> the full IP/TCP/UDP RX
  * path BEFORE schedule(), nested in the IRQ on whatever thread it interrupted
  * (real hosts/VMware poll the NIC off the tick because its INTx never reaches
@@ -29,7 +27,10 @@
  * receive stack. The wm compositor mid-compose() + a nested RX overran 16 KiB
  * on real hardware, silently smashing the adjacent thread's stack (a GP fault
  * resuming an unrelated thread into EIP 0x0000000D). Size for both. */
-#define KSTACK_SIZE 32768
+#define KSTACK_SIZE 65536   /* 64K: sshd runs the SSH KEX crypto (x25519/ed25519, deep
+                             * stacks) on a kernel thread, and a NIC-RX IRQ for the next
+                             * handshake packet nests its full RX/TCP chain on top — 32K
+                             * overflowed and corrupted an adjacent task struct. */
 #define UKSTACK_SIZE 32768  /* user task kernel stack: a timer IRQ mid-syscall nests
                              * nic_poll()'s full RX/TCP chain on top of the syscall's
                              * frames (no ring0->ring0 stack switch), so it needs the
@@ -92,6 +93,11 @@ static void fds_close_all(task_t *t)
 			pipe_close(t->fds[i].pipe, 0);
 		else if (t->fds[i].type == FD_PIPE_WR)
 			pipe_close(t->fds[i].pipe, 1);
+		else if (t->fds[i].type == FD_CHANNEL) {
+			pipe_close(t->fds[i].pipe, 0);     /* rx reader */
+			pipe_close(t->fds[i].tx, 1);       /* tx writer */
+		} else if (t->fds[i].type == FD_PORT)
+			ipc_port_destroy(t->fds[i].pipe);
 		t->fds[i].type = FD_NONE;
 	}
 }
@@ -102,17 +108,24 @@ extern void thread_start(void);
 extern void enter_user_task(void);
 extern void fork_child_entry(void);
 
-static task_t tasks[MAX_TASKS];
+static task_t main_task;       /* permanent head of the circular run queue (never freed) */
 static int    count;
 static uint32_t next_id;
 static task_t *current;
 
+/* Allocate a zeroed task node off the kernel heap (NOT yet on the run queue —
+ * the creator fills it in and calls enqueue()). Returns 0 if the heap is full,
+ * so every spawn path degrades gracefully. Zeroing reproduces what a fresh
+ * static array slot used to give (all-FREE fds, cleared flags). */
 static task_t *alloc_task(void)
 {
-	for (int i = 0; i < MAX_TASKS; i++)
-		if (tasks[i].state == TASK_FREE)
-			return &tasks[i];
-	return 0;
+	task_t *t = kmalloc(sizeof *t);
+	if (!t)
+		return 0;
+	uint8_t *p = (uint8_t *)t;
+	for (unsigned i = 0; i < sizeof *t; i++)
+		p[i] = 0;
+	return t;
 }
 
 /* The task that owns `t`'s heap: itself if it's a process (dir != 0), else the
@@ -122,17 +135,22 @@ static task_t *heap_owner_of(task_t *t)
 {
 	if (t->dir)
 		return t;
-	for (int i = 0; i < MAX_TASKS; i++)
-		if (tasks[i].state != TASK_FREE && tasks[i].dir && tasks[i].cr3 == t->cr3)
-			return &tasks[i];
+	task_t *p = &main_task;
+	do {
+		if (p->dir && p->cr3 == t->cr3)
+			return p;
+		p = p->next;
+	} while (p != &main_task);
 	return t;
 }
 
-/* Splice t into the run queue right after the main task. */
+/* Splice t into the run queue right after the main task. The single publishing
+ * write (main_task.next = t) makes t visible atomically, so a timer IRQ walking
+ * the queue mid-enqueue always sees a consistent list. */
 static void enqueue(task_t *t)
 {
-	t->next = tasks[0].next;
-	tasks[0].next = t;
+	t->next = main_task.next;
+	main_task.next = t;
 	count++;
 }
 
@@ -144,10 +162,7 @@ void thread_exit(void)
 
 void sched_init(void)
 {
-	for (int i = 0; i < MAX_TASKS; i++)
-		tasks[i].state = TASK_FREE;
-
-	task_t *t = &tasks[0];
+	task_t *t = &main_task;
 	t->id = next_id++;
 	t->name = "main";
 	t->runs = 1;
@@ -157,6 +172,7 @@ void sched_init(void)
 	t->kstack = 0;
 	t->kstack_top = 0;             /* a kernel thread: never traps to ring 0   */
 	t->state = TASK_RUNNABLE;
+	t->wake_tick = 0;
 	t->intr = 0;
 	t->brk = t->brk_base = 0;      /* no user heap                             */
 	t->uid = t->gid = 0;           /* the boot session runs as root            */
@@ -313,7 +329,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
 	t->gid = current->gid;
 
 	uint8_t *kstack = kmalloc(UKSTACK_SIZE);
-	if (!kstack) { t->state = TASK_FREE; return -1; }
+	if (!kstack) { kfree(t); return -1; }
 	t->kstack = kstack;
 	t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
 
@@ -338,12 +354,15 @@ int sched_fork(struct registers *r)
 		return -1;
 
 	uint32_t *child_dir = paging_fork_dir(current->dir);
-	if (!child_dir)
+	if (!child_dir) {
+		kfree(t);
 		return -1;
+	}
 
 	uint8_t *kstack = kmalloc(UKSTACK_SIZE);
 	if (!kstack) {
 		paging_free_process_dir(child_dir);
+		kfree(t);
 		return -1;
 	}
 
@@ -372,6 +391,11 @@ int sched_fork(struct registers *r)
 			pipe_ref(t->fds[i].pipe, 0);
 		else if (t->fds[i].type == FD_PIPE_WR)
 			pipe_ref(t->fds[i].pipe, 1);
+		else if (t->fds[i].type == FD_CHANNEL) {
+			pipe_ref(t->fds[i].pipe, 0);   /* rx reader */
+			pipe_ref(t->fds[i].tx, 1);     /* tx writer */
+		} else if (t->fds[i].type == FD_PORT)
+			t->fds[i].type = FD_NONE;      /* a listen port stays single-owner */
 	}
 
 	/* Copy the parent's 16-dword syscall trap frame to the top of the child's
@@ -395,25 +419,37 @@ int sched_fork(struct registers *r)
 
 static task_t *find_task(uint32_t id)
 {
-	for (int i = 0; i < MAX_TASKS; i++)
-		if (tasks[i].state != TASK_FREE && tasks[i].id == id)
-			return &tasks[i];
+	task_t *t = &main_task;
+	do {
+		if (t->id == id)
+			return t;
+		t = t->next;
+	} while (t != &main_task);
 	return 0;
 }
 
-/* Unlink a (zombie) task from the run queue and free its resources. */
+/* Unlink a (zombie) task from the run queue and free its resources, including
+ * the task node itself (now heap-allocated). The unlink is done with interrupts
+ * off so a timer tick can't walk the queue mid-splice or touch the node as it's
+ * removed; the page-dir/stack/node frees then run normally (t is already off the
+ * queue and is never `current`, so nothing can reach it). */
 static void reap_task(task_t *t)
 {
-	task_t *p = current;
+	uint32_t fl;
+	__asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+	task_t *p = &main_task;
 	while (p->next != t)
 		p = p->next;
 	p->next = t->next;
+	count--;
+	if (fl & 0x200)
+		__asm__ volatile ("sti");
+
 	if (t->dir)
 		paging_free_process_dir(t->dir);
 	if (t->kstack)
 		kfree(t->kstack);
-	t->state = TASK_FREE;
-	count--;
+	kfree(t);
 }
 
 struct fd *sched_fds(void)
@@ -485,9 +521,57 @@ void sched_set_creds_self(uint32_t uid, uint32_t gid)
 	current->gid = gid;
 }
 
+/* Set a not-yet-running child's credentials (sshd spawns the login shell as the
+ * authenticated user). */
+void sched_set_creds(int pid, uint32_t uid, uint32_t gid)
+{
+	task_t *t = find_task((uint32_t)pid);
+	if (t) { t->uid = uid; t->gid = gid; }
+}
+
 void sched_yield(void)
 {
 	schedule();                    /* give up the CPU; we stay RUNNABLE        */
+}
+
+/* Block the current task until absolute timer tick `wake`, fully off the run
+ * queue (state TASK_WAITING) so it is NOT round-robined while asleep. This is
+ * the fix for the "many windows -> whole system lags" scaling: previously
+ * timer_sleep() kept the task RUNNABLE and `hlt`ed, so every sleeping thread
+ * still got picked each cycle and burned a whole timer tick — N sleeping
+ * threads diluted every other thread's wakeup latency to N ticks. Now a sleeper
+ * costs nothing; the timer IRQ promotes it via sched_wake_due() when due.
+ * The main task never sleeps (it polls + hlt), so it is the always-runnable
+ * fallback and schedule() can never starve. */
+void sched_sleep_until(uint32_t wake)
+{
+	if (!current)                      /* called before the scheduler exists */
+		return;
+	uint32_t flags;
+	__asm__ volatile ("pushf\n\t pop %0" : "=r"(flags) :: "memory");
+	__asm__ volatile ("cli");          /* set the state + switch atomically vs the IRQ */
+	current->wake_tick = wake;
+	current->state = TASK_WAITING;
+	schedule();                        /* entered IF=0; returns once woken + rescheduled */
+	current->wake_tick = 0;
+	if (flags & 0x200)                 /* restore the caller's interrupt flag */
+		__asm__ volatile ("sti");
+}
+
+/* Promote every timed sleeper whose deadline has arrived back to RUNNABLE.
+ * Called once per timer tick from the IRQ handler (so `now` only advances there).
+ * Waiters that are not timed sleeps (waitpid: wake_tick == 0) are left alone. */
+void sched_wake_due(uint32_t now)
+{
+	task_t *t = &main_task;
+	do {
+		if (t->state == TASK_WAITING && t->wake_tick &&
+		    (int32_t)(now - t->wake_tick) >= 0) {
+			t->wake_tick = 0;
+			t->state = TASK_RUNNABLE;
+		}
+		t = t->next;
+	} while (t != &main_task);
 }
 
 void sched_exit(int status)
@@ -571,23 +655,24 @@ int sched_intr_take(void)           /* read and clear it (acknowledge)        */
 /* Find an exited child of `current` matching pid (-1 = any). */
 static task_t *zombie_child(int pid)
 {
-	for (int i = 0; i < MAX_TASKS; i++) {
-		task_t *t = &tasks[i];
+	task_t *t = &main_task;
+	do {
 		if (t->state == TASK_ZOMBIE && t->parent == current->id &&
 		    (pid < 0 || (int)t->id == pid))
 			return t;
-	}
+		t = t->next;
+	} while (t != &main_task);
 	return 0;
 }
 
 static int has_child(int pid)
 {
-	for (int i = 0; i < MAX_TASKS; i++) {
-		task_t *t = &tasks[i];
-		if (t->state != TASK_FREE && t->parent == current->id &&
-		    (pid < 0 || (int)t->id == pid))
+	task_t *t = &main_task;
+	do {
+		if (t->parent == current->id && (pid < 0 || (int)t->id == pid))
 			return 1;
-	}
+		t = t->next;
+	} while (t != &main_task);
 	return 0;
 }
 
@@ -689,7 +774,7 @@ int sched_count(void)
 void sched_dump(void)
 {
 	con_write("id  name        runs\n");
-	task_t *t = &tasks[0];
+	task_t *t = &main_task;
 	do {
 		con_write_dec(t->id);
 		con_write("   ");
@@ -698,5 +783,5 @@ void sched_dump(void)
 		con_write_dec(t->runs);
 		con_putc('\n');
 		t = t->next;
-	} while (t != &tasks[0]);
+	} while (t != &main_task);
 }

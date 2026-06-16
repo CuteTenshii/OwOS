@@ -57,6 +57,8 @@
 #define SYS_NET_RECV_NB 53
 #define SYS_GETUID     54
 #define SYS_GETGID     55
+#define SYS_PORT_OPEN  56
+#define SYS_PORT_ACCEPT 57
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -413,6 +415,21 @@ int sethostname(const char *name)
 	return writefile("/etc/hostname", name, (int)strlen(name)) < 0 ? -1 : 0;
 }
 
+/* ----------------------------------------------------------- IPC: local ports */
+/* A named local port (the unix-socket analog). A server opens its name with
+ * as_server=1 then port_accept()s connections; a client opens the same name
+ * with as_server=0 to connect. Both get a bidirectional fd that read()/write()
+ * and close() drive like any other. */
+int port_open(const char *name, int as_server)
+{
+	return syscall(SYS_PORT_OPEN, (int)name, as_server, 0);
+}
+
+int port_accept(int listen_fd)
+{
+	return syscall(SYS_PORT_ACCEPT, listen_fd, 0, 0);
+}
+
 /* ----------------------------------------------------------- malloc / free */
 /* A K&R-style first-fit allocator (The C Programming Language §8.7) over the
  * SYS_SBRK heap, with a small lock so the threads of one process (e.g. the
@@ -605,6 +622,71 @@ void strcat(char *d, const char *s)
 		d++;
 	while ((*d++ = *s++))
 		;
+}
+
+/* ------------------------------------------------------------ UTF-8 codec ---
+ * System-wide so any program handles non-Latin / multibyte text uniformly: the
+ * browser renders it, an editor counts/moves by codepoint, the shell echoes it.
+ * Encoding is the canonical 1..4-byte form; decoding is tolerant (bad/truncated
+ * sequences yield U+FFFD and advance one byte, so a malformed stream never
+ * stalls). Codepoints above U+10FFFF or in the surrogate range are not special-
+ * cased on encode — callers pass real scalar values. */
+
+int utf8_seqlen(unsigned char lead)
+{
+	if (lead < 0x80) return 1;
+	if ((lead & 0xE0) == 0xC0) return 2;
+	if ((lead & 0xF0) == 0xE0) return 3;
+	if ((lead & 0xF8) == 0xF0) return 4;
+	return 1;                                  /* continuation / invalid lead */
+}
+
+int utf8_decode(const char *s, const char *end, unsigned *cp)
+{
+	unsigned char c = (unsigned char)s[0];
+	if (c < 0x80) { *cp = c; return 1; }
+	if ((c & 0xE0) == 0xC0 && s + 1 < end && (s[1] & 0xC0) == 0x80) {
+		*cp = ((unsigned)(c & 0x1F) << 6) | (unsigned char)(s[1] & 0x3F);
+		return 2;
+	}
+	if ((c & 0xF0) == 0xE0 && s + 2 < end &&
+	    (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
+		*cp = ((unsigned)(c & 0x0F) << 12) |
+		      ((unsigned)(s[1] & 0x3F) << 6) | (unsigned char)(s[2] & 0x3F);
+		return 3;
+	}
+	if ((c & 0xF8) == 0xF0 && s + 3 < end &&
+	    (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 && (s[3] & 0xC0) == 0x80) {
+		*cp = ((unsigned)(c & 0x07) << 18) | ((unsigned)(s[1] & 0x3F) << 12) |
+		      ((unsigned)(s[2] & 0x3F) << 6) | (unsigned char)(s[3] & 0x3F);
+		return 4;
+	}
+	*cp = 0xFFFD;
+	return 1;
+}
+
+int utf8_encode(unsigned cp, char *out)
+{
+	if (cp < 0x80) {
+		out[0] = (char)cp;
+		return 1;
+	}
+	if (cp < 0x800) {
+		out[0] = (char)(0xC0 | (cp >> 6));
+		out[1] = (char)(0x80 | (cp & 0x3F));
+		return 2;
+	}
+	if (cp < 0x10000) {
+		out[0] = (char)(0xE0 | (cp >> 12));
+		out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+		out[2] = (char)(0x80 | (cp & 0x3F));
+		return 3;
+	}
+	out[0] = (char)(0xF0 | (cp >> 18));
+	out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+	out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+	out[3] = (char)(0x80 | (cp & 0x3F));
+	return 4;
 }
 
 void puts(const char *s)

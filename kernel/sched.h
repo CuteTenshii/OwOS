@@ -50,6 +50,11 @@ void sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp,
 
 void schedule(void);     /* invoked from the timer tick                       */
 void sched_yield(void);  /* voluntarily give up the CPU (stays runnable)      */
+/* Block the caller until absolute timer tick `wake`, fully off the run queue
+ * (so sleeping tasks don't dilate other tasks' scheduling). timer_sleep() is
+ * built on this; sched_wake_due() (called each timer tick) re-wakes due ones. */
+void sched_sleep_until(uint32_t wake);
+void sched_wake_due(uint32_t now);
 struct fd *sched_fds(void);   /* the current task's file descriptor table     */
 uint32_t *sched_current_dir(void); /* current task's page dir (windowing layer) */
 uint32_t  sched_current_id(void);  /* current task's pid                        */
@@ -65,6 +70,7 @@ const char *sched_cwd(void);  /* the current task's working dir (absolute)     *
 uint32_t sched_uid(void);
 uint32_t sched_gid(void);
 void     sched_set_creds_self(uint32_t uid, uint32_t gid);
+void     sched_set_creds(int pid, uint32_t uid, uint32_t gid);  /* set a child's uid/gid */
 void sched_dump(void);
 int  sched_count(void);
 

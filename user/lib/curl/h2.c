@@ -306,7 +306,10 @@ static void hs_emit(struct hsink *s, const char *nm, int nl,
  * dynamic table in sync. Returns 0, or -1 on a malformed block. */
 static int hpack_decode(const unsigned char *b, int len, struct hsink *s)
 {
-	static char nbuf[256], vbuf[2048];
+	/* Big enough for real-world response headers (a long Set-Cookie, CSP, or a
+	 * data: value). A field larger than this fails the decode; h2_run then
+	 * salvages the response if the status line already came through. */
+	static char nbuf[512], vbuf[16384];
 	int pos = 0;
 	while (pos < len) {
 		unsigned char c = b[pos];
@@ -644,14 +647,22 @@ int h2_run(int sock, int scheme_https, const char *authority,
 	struct hsink hs; hs.buf = hdr; hs.cap = (hdr ? hdrcap : 0); hs.len = 0; hs.status = 0;
 	struct emitter e; e.fn = body; e.ctx = ctx; e.len = 0; e.aborted = 0;
 
-	int done = 0, headers_done = 0;
+	int done = 0, headers_done = 0, hpack_broken = 0;
 	int rc = HTTP_ENORESP;
 
 	while (!done) {
 		int type, flags, paylen; unsigned sid;
 		int fr = read_frame(&r, &type, &flags, &sid, framebuf, &paylen);
 		if (fr == -3) { rc = HTTP_EINTR;  goto out; }
-		if (fr < 0)   { rc = HTTP_ENORESP; goto out; }
+		if (fr < 0) {
+			/* Connection closed/errored. If the response headers already arrived,
+			 * take it as the end of the response (many servers — google among
+			 * them — just close after sending, especially on a redirect, without a
+			 * clean END_STREAM) rather than failing the whole request. Mirrors
+			 * HTTP/1.1's read-to-close. */
+			if (headers_done) break;
+			rc = HTTP_ENORESP; goto out;
+		}
 
 		switch (type) {
 		case F_SETTINGS:
@@ -666,11 +677,33 @@ int h2_run(int sock, int scheme_https, const char *authority,
 			break;
 		case F_HEADERS:
 			if (sid == 1) {
+				/* Once the dynamic table is desynced (a salvaged header block, see
+				 * below) we can't decode any further HEADERS — but a trailer is
+				 * optional, so just note END_STREAM and keep going for the body. */
+				if (hpack_broken) { if (flags & FL_END_STREAM) done = 1; break; }
 				int hbl;
 				int cr = collect_header_block(&r, framebuf, paylen, flags, &hbl);
 				if (cr == -3) { rc = HTTP_EINTR;  goto out; }
 				if (cr < 0)   { rc = HTTP_ENORESP; goto out; }
-				if (hpack_decode(hblock, hbl, &hs) < 0) { rc = HTTP_ENORESP; goto out; }
+				if (hpack_decode(hblock, hbl, &hs) < 0) {
+					/* A header block we couldn't fully decode (a field past our
+					 * buffers, or HPACK state we don't model — google's big
+					 * Set-Cookies). If the status line already came through, salvage
+					 * the response: keep the status + the headers that decoded
+					 * (enough for a redirect's Location), and KEEP READING — DATA
+					 * frames carry the body and use no HPACK, so we still get the
+					 * page. We just can't decode any later HEADERS (the table is now
+					 * desynced). A failure before any status is genuinely fatal. */
+					if (hs.status <= 0) { rc = HTTP_ENORESP; goto out; }
+					hpack_broken = 1;
+					headers_done = 1;
+					if (opts && opts->on_headers && hs.buf && hs.cap > 0) {
+						hs.buf[hs.len < hs.cap ? hs.len : hs.cap - 1] = '\0';
+						opts->on_headers(ctx, hs.buf, hs.len);
+					}
+					if (flags & FL_END_STREAM) done = 1;
+					break;
+				}
 				headers_done = 1;
 				/* Hand the decoded header block to the caller before any DATA,
 				 * so it can pick a body sink (browser: render vs download). */
@@ -694,7 +727,13 @@ int h2_run(int sock, int scheme_https, const char *authority,
 			}
 			break;
 		case F_RST:
-			if (sid == 1) { rc = HTTP_ENORESP; goto out; }
+			/* A reset after the full response (some servers RST a stream they
+			 * consider done, e.g. after a redirect) isn't a failure — keep what we
+			 * have. Only a reset before any headers is a real error. */
+			if (sid == 1) {
+				if (headers_done) { done = 1; break; }
+				rc = HTTP_ENORESP; goto out;
+			}
 			break;
 		case F_GOAWAY:
 			if (!headers_done) { rc = HTTP_ENORESP; goto out; }
@@ -711,6 +750,13 @@ int h2_run(int sock, int scheme_https, const char *authority,
 
 out:
 	emit_flush(&e);
+	/* Once we have a valid response (decoded headers + status), a transport error
+	 * AFTER it — a stream/connection reset, an unexpected trailer, a peer that
+	 * just hangs up — must not turn the whole request into "no response". google
+	 * does exactly this after a redirect; return the status with whatever body
+	 * arrived. A user interrupt (EINTR) or a caller abort still wins. */
+	if (rc == HTTP_ENORESP && headers_done && hs.status > 0)
+		rc = hs.status;
 	if (hdr && hdrcap > 0) {
 		if (hs.len < hdrcap - 1) {              /* terminate the header block */
 			hdr[hs.len++] = '\r'; hdr[hs.len++] = '\n';
@@ -728,4 +774,147 @@ int h2_request(int sock, int scheme_https, const char *authority,
 {
 	return h2_run(sock, scheme_https, authority, method, path, 0,
 	              hdr, hdrcap, hdrlen, body, ctx);
+}
+
+/* ----------------------------------------------------- multiplexed batch */
+
+#define H2M_BODYCAP_MAX (16 * 1024 * 1024)   /* per-resource body cap */
+
+/* Per-stream accumulation state for a batched fetch. */
+struct h2_mstream { unsigned char *body; int blen, bcap; int status, done, failed; };
+
+static int h2m_grow(struct h2_mstream *s, int need)
+{
+	if (need <= s->bcap) return 1;
+	int nc = s->bcap ? s->bcap : 8192;
+	while (nc < need) nc += nc / 2 + 1;
+	if (nc > H2M_BODYCAP_MAX) nc = H2M_BODYCAP_MAX;
+	if (need > nc) return 0;
+	unsigned char *p = realloc(s->body, (unsigned)nc);
+	if (!p) return 0;
+	s->body = p; s->bcap = nc;
+	return 1;
+}
+
+/* Map a stream id to its request index (client streams are odd: 1,3,5,…). */
+static int h2m_idx(unsigned sid, int nreq)
+{
+	if (sid < 1 || !(sid & 1)) return -1;
+	int i = (int)((sid - 1) / 2);
+	return (i < nreq) ? i : -1;
+}
+
+int h2_fetch_many(int sock, int scheme_https, const char *authority,
+                  const struct h2_opts *opts, struct h2_fetch *reqs, int nreq,
+                  void (*on_done)(void *ctx, int i, const unsigned char *body, int blen),
+                  void *cb_ctx)
+{
+	if (nreq <= 0 || nreq > H2_FETCH_MAX) return HTTP_ENORESP;
+	dt_reset();
+
+	if (send_all(sock, PREFACE, 24) < 0) return HTTP_ESEND;
+	unsigned char st[12] = {
+		0x00, 0x02, 0x00, 0x00, 0x00, 0x00,        /* ENABLE_PUSH = 0          */
+		0x00, 0x04, 0x7f, 0xff, 0xff, 0xff,        /* INITIAL_WINDOW_SIZE max  */
+	};
+	if (put_frame(sock, F_SETTINGS, 0, 0, st, 12) < 0) return HTTP_ESEND;
+	unsigned char wu[4] = { 0x7f, 0xff, 0x00, 0x00 };  /* +~2 GiB conn window */
+	if (put_frame(sock, F_WINUP, 0, 0, wu, 4) < 0) return HTTP_ESEND;
+
+	struct h2_mstream sm[H2_FETCH_MAX];
+	for (int i = 0; i < nreq; i++) {
+		sm[i].body = 0; sm[i].blen = sm[i].bcap = 0;
+		sm[i].status = 0; sm[i].done = 0; sm[i].failed = 0;
+	}
+
+	/* Send every request's HEADERS up front (END_STREAM: no request body), each
+	 * on its own odd stream id. The server interleaves the responses. */
+	static unsigned char reqhb[4096];
+	for (int i = 0; i < nreq; i++) {
+		unsigned sid = 1u + 2u * (unsigned)i;
+		int rl = build_request(reqhb, scheme_https, "GET", authority, reqs[i].path, opts);
+		if (put_frame(sock, F_HEADERS, FL_END_HEADERS | FL_END_STREAM, sid, reqhb, rl) < 0)
+			return HTTP_ESEND;
+	}
+
+	struct frd r; r.sock = sock; r.pos = r.len = 0;
+	static char statusbuf[64];
+	int ndone = 0, rc = 0;
+
+	while (ndone < nreq) {
+		int type, flags, paylen; unsigned sid;
+		int fr = read_frame(&r, &type, &flags, &sid, framebuf, &paylen);
+		if (fr < 0) { rc = (fr == -3) ? HTTP_EINTR : HTTP_ENORESP; goto out; }
+
+		switch (type) {
+		case F_SETTINGS:
+			if (!(flags & FL_ACK))
+				if (put_frame(sock, F_SETTINGS, FL_ACK, 0, 0, 0) < 0) { rc = HTTP_ENORESP; goto out; }
+			break;
+		case F_PING:
+			if (!(flags & FL_ACK))
+				if (put_frame(sock, F_PING, FL_ACK, 0, framebuf, paylen) < 0) { rc = HTTP_ENORESP; goto out; }
+			break;
+		case F_HEADERS: {
+			int hbl;
+			int cr = collect_header_block(&r, framebuf, paylen, flags, &hbl);
+			if (cr < 0) { rc = (cr == -3) ? HTTP_EINTR : HTTP_ENORESP; goto out; }
+			/* HPACK is connection-scoped: every block must decode in wire order,
+			 * even for a stream we don't track — statusbuf is a throwaway sink. */
+			struct hsink hs; hs.buf = statusbuf; hs.cap = sizeof statusbuf; hs.len = 0; hs.status = 0;
+			if (hpack_decode(hblock, hbl, &hs) < 0) { rc = HTTP_ENORESP; goto out; }
+			int idx = h2m_idx(sid, nreq);
+			if (idx >= 0 && !sm[idx].done) {
+				sm[idx].status = hs.status;
+				if (flags & FL_END_STREAM) {
+					sm[idx].done = 1; ndone++;
+					if (on_done && sm[idx].status == 200 && sm[idx].body && sm[idx].blen > 0)
+						on_done(cb_ctx, idx, sm[idx].body, sm[idx].blen);
+				}
+			}
+			break; }
+		case F_DATA: {
+			int idx = h2m_idx(sid, nreq);
+			int start = 0, padlen = 0;
+			if (flags & FL_PADDED) padlen = framebuf[start++];
+			int dlen = paylen - start - padlen;
+			if (idx >= 0 && !sm[idx].done) {
+				if (dlen > 0) {
+					if (!h2m_grow(&sm[idx], sm[idx].blen + dlen)) sm[idx].failed = 1;
+					else { memcpy(sm[idx].body + sm[idx].blen, framebuf + start, dlen);
+					       sm[idx].blen += dlen; }
+				}
+				if (flags & FL_END_STREAM) {
+					sm[idx].done = 1; ndone++;
+					/* stream finished: hand the body to the caller now, so an image
+					 * shows the moment it lands instead of after the whole batch. */
+					if (on_done && sm[idx].status == 200 && sm[idx].body && sm[idx].blen > 0)
+						on_done(cb_ctx, idx, sm[idx].body, sm[idx].blen);
+				}
+			}
+			break; }
+		case F_RST: {
+			int idx = h2m_idx(sid, nreq);     /* refused/reset: caller retries h1.1 */
+			if (idx >= 0 && !sm[idx].done) { sm[idx].failed = 1; sm[idx].done = 1; ndone++; }
+			break; }
+		case F_GOAWAY:
+			rc = HTTP_ENORESP; goto out;       /* connection ending: bail, rest fail */
+		default:                                /* WINDOW_UPDATE, PRIORITY, PUSH: ignore */
+			break;
+		}
+	}
+
+out:
+	for (int i = 0; i < nreq; i++) {
+		if (on_done) {                     /* engine owns the bodies in this mode */
+			free(sm[i].body);
+			reqs[i].body = 0; reqs[i].blen = 0;
+		} else {
+			reqs[i].body = sm[i].body;
+			reqs[i].blen = sm[i].blen;
+		}
+		reqs[i].status = sm[i].status;
+		reqs[i].failed = sm[i].failed || (!sm[i].done) || sm[i].status != 200;
+	}
+	return rc;
 }

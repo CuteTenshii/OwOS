@@ -132,4 +132,9 @@ int wm_focus_takes_keys(void);
  * overflowing its small event ring. */
 int wm_focus_key_space(void);
 
+/* Request the Super+V clipboard-history viewer. Called from the keyboard IRQ;
+ * the WM thread launches /bin/cliphist on its next frame (loading an ELF can't
+ * happen in the interrupt) and pastes the chosen clip when it exits. */
+void wm_request_cliphist(void);
+
 #endif

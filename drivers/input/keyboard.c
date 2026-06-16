@@ -11,7 +11,7 @@
 #include "sb16.h"
 #include "hda.h"
 #include "fb.h"
-#include "vmtools.h"
+#include "kclip.h"
 #include "wm.h"
 
 #define KBD_DATA_PORT   0x60
@@ -181,6 +181,8 @@ static int altgr_held;
 static int ctrl_held;
 static int alt_held;               /* left Alt, for Alt+Tab window switching   */
 static int alt_tabbed;             /* Tab was pressed during this Alt hold     */
+static int super_held;             /* GUI/Win key, for Super+V (clipboard history) */
+static int super_chorded;          /* a Super+key fired during this Super hold */
 static int expecting_extended;
 static int num_lock = 1;           /* on by default, like most BIOSes        */
 static int caps_lock;              /* off by default                         */
@@ -219,17 +221,27 @@ static volatile int int_pending;
 static char          paste_buf[PASTE_BUF_SIZE];
 static volatile int  paste_len;
 static volatile int  paste_pos;
+static volatile int  paste_request;    /* Ctrl+V sets this in the IRQ; keyboard_poll
+                                        * services it off-IRQ (clipd needs to block) */
 
 /* Pull the clipboard and arm it for injection. Pasted text is normalized to the
  * line editor's expectations: CRLF/CR -> LF (so a multi-line paste submits each
- * line), tabs and newlines kept, other control bytes dropped. */
+ * line), tabs and newlines kept, other control bytes dropped. Runs off-IRQ
+ * (from keyboard_poll) because it talks to clipd over a blocking channel. */
+/* Arm a clipboard paste from outside the keyboard (the WM, after the Super+V
+ * history viewer picks a clip): same path as Ctrl+V, serviced off-IRQ. */
+void keyboard_request_paste(void)
+{
+	paste_request = 1;
+}
+
 static void keyboard_paste_clipboard(void)
 {
 	static char raw[PASTE_BUF_SIZE];
 	if (paste_pos < paste_len)
 		return;                        /* a paste is still draining; ignore       */
 
-	int n = vmtools_clip_get(raw, sizeof raw);
+	int n = kclip_get_text(raw, sizeof raw);
 	int out = 0;
 	for (int i = 0; i < n; i++) {
 		char c = raw[i];
@@ -257,6 +269,14 @@ static void ring_push(char c)
 
 int keyboard_poll(char *out)
 {
+	/* Service a Ctrl+V request here, off the IRQ that raised it: arming the
+	 * paste means reading clipd over a blocking channel, impossible from the
+	 * interrupt. Only re-arm when the previous paste has fully drained. */
+	if (paste_request && paste_pos >= paste_len) {
+		paste_request = 0;
+		keyboard_paste_clipboard();
+	}
+
 	/* Drain a pending paste ahead of typed keys, but only while the focused
 	 * window's event queue has room: a paste is far faster than an app
 	 * drains, so without this back-pressure everything past the queue depth is
@@ -330,6 +350,16 @@ static void keyboard_handler(struct registers *r)
 			screenshot_request();
 			return;
 		}
+		if (sc == 0x5B || sc == 0x5C) {        /* GUI/Win key down            */
+			super_held = 1; super_chorded = 0;
+			return;            /* the Start-menu toggle waits for release  */
+		}
+		if (sc == (0x5B | SC_RELEASE) || sc == (0x5C | SC_RELEASE)) {   /* Win up */
+			if (!super_chorded)            /* a bare tap -> toggle Start menu */
+				ring_push(KEY_SUPER);
+			super_held = 0; super_chorded = 0;
+			return;
+		}
 		if (sc & SC_RELEASE)       /* other extended release: ignore         */
 			return;
 		switch (sc) {
@@ -358,7 +388,6 @@ static void keyboard_handler(struct registers *r)
 		case SC_E_HOME:      ring_push(shift_held ? KEY_SHOME  : KEY_HOME);  break;
 		case SC_E_END:       ring_push(shift_held ? KEY_SEND   : KEY_END);   break;
 		case SC_E_DELETE:    ring_push(KEY_DELETE); break;
-		case 0x5B: case 0x5C: ring_push(KEY_SUPER); break;  /* left/right GUI key */
 		}
 		return;
 	}
@@ -435,14 +464,22 @@ static void keyboard_handler(struct registers *r)
 		return;
 	}
 
+	/* Super+V opens the clipboard-history viewer (cliphist). Swallow the key so
+	 * 'v' doesn't leak, and mark the hold as chorded so releasing Super won't
+	 * also toggle the Start menu. The WM launches the app off this request. */
+	if (super_held && active_map[sc] == 'v') {
+		wm_request_cliphist();
+		super_chorded = 1;
+		return;
+	}
+
 	/* Ctrl chords: a few line-editing shortcuts. Any other Ctrl+key is
 	 * swallowed so it can't leak the bare letter (e.g. Ctrl+V must not type
-	 * 'v'). Ctrl+V injects the clipboard (the host clipboard on a VMware guest,
-	 * otherwise the local one) into the input stream. */
+	 * 'v'). Ctrl+V injects the clipboard, read from clipd off-IRQ, as keys. */
 	if (ctrl_held) {
 		switch (active_map[sc]) {       /* the unshifted key, layout-aware    */
 		case 'c': int_pending = 1;       break;  /* interrupt (latched)       */
-		case 'v': keyboard_paste_clipboard(); break;  /* paste               */
+		case 'v': paste_request = 1;     break;  /* paste: serviced off-IRQ   */
 		case 'l': ring_push(KEY_CLEAR);  break;
 		case 'u': ring_push(KEY_KILL);   break;
 		case 'a': ring_push(KEY_SELALL); break;  /* editor: select all; shell  */

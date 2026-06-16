@@ -28,9 +28,10 @@ void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb);
  * argument. gfx_ui_width gives a string's pixel width for layout/centring. */
 #define UIFONT_W 16
 #define UIFONT_H 18
-void gfx_ui_text(int x, int y, const char *s, unsigned fg);
-int  gfx_ui_width(const char *s);
-int  gfx_ui_cw(unsigned char c);   /* one glyph's pen advance (for fitting text) */
+void gfx_ui_text(int x, int y, const char *s, unsigned fg);   /* UTF-8 */
+int  gfx_ui_width(const char *s);  /* UTF-8 string pixel width                    */
+int  gfx_ui_cw(unsigned char c);   /* one byte/ASCII glyph's pen advance          */
+int  gfx_ui_cw_cp(unsigned cp);    /* one Unicode codepoint's pen advance         */
 
 /* --------------------------------------------------------------- GUI widgets */
 /*
@@ -294,5 +295,35 @@ int  sidebar_press(struct sidebar *sb, int x, int y, int w, int h,
 /* Feed a WEV_DRAG x while a resize is live: set the width to (mx - x), clamped
  * to [min_w, max_w]. Returns 1 if the width changed (repaint), else 0. */
 int  sidebar_drag(struct sidebar *sb, int x, int mx);
+
+/* --- separator ----------------------------------------------------------- *
+ * A thin themed divider line. Horizontal spans [x, x+len) at row y; vertical
+ * spans [y, y+len) at column x (pass vertical = 1). Stateless. */
+void gfx_separator(int x, int y, int len, int vertical);
+
+/* --- select (dropdown) --------------------------------------------------- *
+ * A combobox: a closed box showing the current option + a chevron, and an option
+ * list that drops below when open. The app owns the `options` array (one
+ * NUL-terminated label per entry) for the widget's lifetime. Draw the select
+ * LAST so its open list overlays the rest of the UI (like a menu). */
+#define GUI_SELECT_H 24    /* a comfortable closed-box height */
+struct select_box {
+	const char *const *options;
+	int count;
+	int selected;      /* index of the chosen option (0..count-1)        */
+	int open;          /* 1 = list expanded                              */
+	int hover;         /* hovered row while open, or -1                  */
+};
+void select_init(struct select_box *s, const char *const *options, int count, int selected);
+void select_draw(struct select_box *s, int x, int y, int w, int h);
+/* Click: returns 1 if the selection changed (s->selected updated, list closed),
+ * -1 if consumed (opened/closed), 0 if the click missed the widget entirely. */
+int  select_click(struct select_box *s, int x, int y, int w, int h, int mx, int my);
+/* Update the hovered row from pointer motion while open; returns 1 if it changed. */
+int  select_motion(struct select_box *s, int x, int y, int w, int h, int mx, int my);
+/* Keyboard control for a focused select: Up/Down (move, or change when closed),
+ * Home/End (ends), Enter/Space (open / confirm), Esc (close). Same returns as
+ * select_click: 1 = selection changed, -1 = consumed, 0 = key not handled. */
+int  select_key(struct select_box *s, char key);
 
 #endif /* OWOS_GFX_H */

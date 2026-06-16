@@ -23,6 +23,7 @@
 #include "lzss.h"
 #include "deflate.h"
 #include "crypto.h"   /* SHA-256 for passwd hashing (su/login/passwd) */
+#include "clipboard.h" /* the clipd-backed multi-item clipboard */
 
 #define FONT_W 8
 #define FONT_H 16
@@ -114,8 +115,21 @@ static void sgr_apply(void)
 	}
 }
 
+/* Headless stdio mode (term -stdio): no window/grid; output goes raw to stdout
+ * and input comes from stdin, so the shell runs over a pipe instead of a window.
+ * term knows nothing about who's on the other end — the kernel sshd spawns it
+ * this way with an SSH channel as its stdio, but a plain pipe works too.
+ * `headless` switches the I/O funnels; the command dispatch (run/the builtins)
+ * is shared with the windowed terminal unchanged. */
+static int headless;
+
 static void tputc(char c)
 {
+	if (headless) {                       /* stream to stdout; LF -> CRLF for a raw tty */
+		if (c == '\n') { write(1, "\r\n", 2); }
+		else           { write(1, &c, 1); }
+		return;
+	}
 	/* ANSI SGR (colour) escape parser: ESC [ params m. Other escapes are
 	 * swallowed. Only the bridge's output carries escapes; typed input never
 	 * does (on_key filters to printable bytes). */
@@ -155,6 +169,7 @@ static void tdec(unsigned v)
 
 static void redraw(void)
 {
+	if (headless) return;                 /* no window/grid in SSH stdio mode */
 	gfx_fill_rect(0, 0, winw - GUI_SCROLL_W, winh, BG);     /* text area          */
 	int bottom = nlines > rows ? nlines - rows : 0;
 	int vt = bottom - view;
@@ -259,7 +274,7 @@ static void bi_help(void)
 	tputs("power    poweroff restart\n");
 	tputs("shell    help clear echo sleep exit\n");
 	tputs("remote   ssh user@host (interactive SSH-2 session)\n");
-	tputs("CLI tools (neofetch curl lspci ping dig play torrent) run inline; other /bin\n");
+	tputs("CLI tools (neofetch curl lspci ping dig torrent) run inline; other /bin\n");
 	tputs("programs (editor files clock browser ...) open their own window.\n");
 }
 
@@ -379,9 +394,14 @@ static void bi_loadkeys(int argc, char **argv)
 static void bi_clip(int argc, char **argv)
 {
 	if (argc < 2) {                              /* no text: print the clipboard  */
-		int n = readfile("/proc/clipboard", iobuf, sizeof iobuf);
-		for (int i = 0; i < n; i++) tputc(iobuf[i]);
-		if (n <= 0 || iobuf[n - 1] != '\n') tputc('\n');
+		char mime[64]; void *data; int len;
+		if (clip_get(0, mime, sizeof mime, &data, &len) == 0) {
+			if (has_prefix(mime, "text/")) {
+				for (int i = 0; i < len; i++) tputc(((char *)data)[i]);
+				if (len == 0 || ((char *)data)[len - 1] != '\n') tputc('\n');
+			} else { tputs("["); tputs(mime); tputc(']'); tputc('\n'); }
+			free(data);
+		} else tputc('\n');
 		return;
 	}
 	int len = 0;                                 /* join argv[1..] with spaces    */
@@ -389,7 +409,7 @@ static void bi_clip(int argc, char **argv)
 		for (const char *a = argv[k]; *a && len < (int)sizeof iobuf - 1; a++) iobuf[len++] = *a;
 		if (k < argc - 1 && len < (int)sizeof iobuf - 1) iobuf[len++] = ' ';
 	}
-	if (writefile("/proc/clipboard", iobuf, len) < 0) err("clip: failed", 0);
+	if (clip_put_text(iobuf, len) < 0) err("clip: failed", 0);
 }
 
 /* Default mount point for a device: /media/<dev>. */
@@ -538,7 +558,7 @@ static void bi_grep(int argc, char **argv)
 static int is_cli(const char *name)
 {
 	static const char *const cli[] = {
-		"neofetch", "curl", "lspci", "play", "ping", "dig", "torrent",
+		"neofetch", "curl", "lspci", "ping", "dig", "torrent",
 	};
 	for (unsigned i = 0; i < sizeof cli / sizeof cli[0]; i++)
 		if (!strcmp(name, cli[i])) return 1;
@@ -562,6 +582,30 @@ static int is_interactive(const char *name) { return !strcmp(name, "ssh"); }
 static void render_child(const char *path, char **argv, int argc, int interactive)
 {
 	int rfd = -1, wfd = -1;
+	/* Headless (SSH): no window. Capture the child's stdout to our stdout (the
+	 * channel); forward our stdin to the child if interactive; Ctrl+C (0x03 from
+	 * the remote) aborts it. */
+	if (headless) {
+		int pid = interactive ? spawn_cap_io(path, argv, argc, &rfd, &wfd)
+		                      : spawn_cap(path, argv, argc, &rfd);
+		if (pid < 0) { err("failed to launch ", path); return; }
+		for (;;) {
+			char k;
+			int kn = read_nb(0, &k, 1);
+			if (kn > 0) {
+				if ((unsigned char)k == 0x03) { kill(pid); }     /* ^C */
+				else if (wfd >= 0) write(wfd, &k, 1);            /* forward to child */
+			}
+			int n = read_nb(rfd, iobuf, sizeof iobuf);
+			if (n > 0)      for (int i = 0; i < n; i++) tputc(iobuf[i]);
+			else if (n < 0) break;
+			else if (kn <= 0) msleep(4);
+		}
+		if (wfd >= 0) close(wfd);
+		close(rfd);
+		waitpid(pid);
+		return;
+	}
 	int pid = interactive ? spawn_cap_io(path, argv, argc, &rfd, &wfd)
 	                      : spawn_cap(path, argv, argc, &rfd);
 	if (pid < 0) { err("failed to launch ", path); return; }
@@ -1361,8 +1405,43 @@ static void on_resize(int w, int h)
 	dirty = 1;
 }
 
-int main(void)
+/* Headless stdio REPL (term -stdio): the shell over stdin/stdout instead of a
+ * window. Reuses run() + every builtin unchanged; only the I/O is a raw byte
+ * stream (a simple echoing line editor — no grid, no history/arrows). Whoever
+ * spawns us (the kernel sshd, a pipe) wires our stdio; we don't care which. */
+static void stdio_repl(void)
 {
+	headless = 1;
+	reload_identity();
+	gethostname(hostnm, sizeof hostnm);
+	strcpy(cwd, home);
+	tputs("OwOS -- type 'help'.\n");
+	prompt();
+
+	char buf[256]; int len = 0;
+	for (;;) {
+		char c;
+		if (read(0, &c, 1) <= 0) break;          /* EOF: the session closed */
+		if (c == '\r' || c == '\n') {
+			write(1, "\r\n", 2);
+			buf[len] = '\0'; len = 0;
+			run(buf);
+			prompt();
+		} else if (c == '\b' || c == 0x7f) {
+			if (len > 0) { len--; write(1, "\b \b", 3); }
+		} else if ((unsigned char)c == 0x03) {   /* Ctrl+C: cancel the line */
+			write(1, "^C\r\n", 4); len = 0; prompt();
+		} else if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7f) {
+			if (len < (int)sizeof buf - 1) { buf[len++] = c; write(1, &c, 1); }
+		}
+		/* other control/escape bytes (arrows, etc.) are ignored for now */
+	}
+}
+
+int main(int argc, char **argv)
+{
+	if (argc > 1 && argv[1] && streq(argv[1], "-stdio")) { stdio_repl(); return 0; }
+
 	win = win_create(720, 432, "terminal");
 	if (win < 0) { puts("term: no window\n"); return 1; }
 	gfx_init(win_fb(), 720, 432);

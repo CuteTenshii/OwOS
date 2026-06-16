@@ -11,15 +11,21 @@
  * kernel mapping is dropped, and the frames are returned to the PMM.
  */
 #include <stdint.h>
+#include <stddef.h>
 #include "uwin.h"
 #include "wm.h"
 #include "fb.h"
+#include "heap.h"
 #include "pmm.h"
 #include "paging.h"
 #include "sched.h"
 #include "timer.h"
 
-#define MAXUWIN 32    /* concurrent app windows (buffers come from pmm) */
+/* No fixed cap on concurrent app windows: the uwins[] slot table grows on the
+ * kernel heap (each uwin kmalloc'd, stable so win->state can hold it), so the
+ * only ceiling is memory. The window handle returned to an app is its slot index,
+ * which stays valid because slots are never compacted (freed slots go NULL and
+ * are reused). */
 #define EVQ     64          /* per-window event ring                          */
 
 /* Fill colour for client pixels the app hasn't drawn yet: a fresh window before
@@ -51,7 +57,33 @@ struct uwin {
 #define DBLCLICK_TICKS 100
 #define DBLCLICK_SLOP  8
 
-static struct uwin uwins[MAXUWIN];
+static struct uwin **uwins;    /* grown array of kmalloc'd uwins (stable addrs) */
+static int           uwins_cap;
+
+/* Ensure uwins[] can index `need` slots, growing ~2x. New pointer slots are
+ * NULL. Returns 0 on heap exhaustion (uwin_create then fails -> the app's
+ * win_create returns -1). cli around the swap so the WM thread (uwin_reap) never
+ * reads a half-swapped table. */
+static int uwins_reserve(int need)
+{
+	if (need <= uwins_cap)
+		return 1;
+	int nc = uwins_cap ? uwins_cap * 2 : 16;
+	while (nc < need)
+		nc *= 2;
+	struct uwin **nu = kmalloc((size_t)nc * sizeof *nu);
+	if (!nu)
+		return 0;
+	for (int i = 0; i < uwins_cap; i++) nu[i] = uwins[i];
+	for (int i = uwins_cap; i < nc; i++) nu[i] = 0;
+	uint32_t fl;
+	__asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+	struct uwin **ou = uwins;
+	uwins = nu; uwins_cap = nc;
+	if (fl & 0x200) __asm__ volatile ("sti");
+	if (ou) kfree(ou);
+	return 1;
+}
 
 static inline void tlb_flush(void)
 {
@@ -285,9 +317,9 @@ static void uwin_free(struct uwin *u)
  * the WM is provably not mid-blit. */
 void uwin_reap(void)
 {
-	for (int i = 0; i < MAXUWIN; i++) {
-		struct uwin *u = &uwins[i];
-		if (!u->used || !u->free_pending)
+	for (int i = 0; i < uwins_cap; i++) {
+		struct uwin *u = uwins[i];
+		if (!u || !u->used || !u->free_pending)
 			continue;
 		if (u->buf_phys) {
 			paging_kunmap(u->buf_phys, u->buf_bytes);
@@ -310,11 +342,21 @@ int uwin_create(int w, int h, const char *title)
 		return -1;
 
 	int slot = -1;
-	for (int i = 0; i < MAXUWIN; i++)
-		if (!uwins[i].used) { slot = i; break; }
-	if (slot < 0)
-		return -1;
-	struct uwin *u = &uwins[slot];
+	for (int i = 0; i < uwins_cap; i++)
+		if (!uwins[i] || !uwins[i]->used) { slot = i; break; }
+	if (slot < 0) {                       /* table full: grow; new slot at old cap */
+		slot = uwins_cap;
+		if (!uwins_reserve(slot + 1))
+			return -1;
+	}
+	if (!uwins[slot]) {                   /* fresh slot: allocate + zero the uwin */
+		uwins[slot] = kmalloc(sizeof(struct uwin));
+		if (!uwins[slot])
+			return -1;
+		uint8_t *z = (uint8_t *)uwins[slot];
+		for (unsigned k = 0; k < sizeof(struct uwin); k++) z[k] = 0;
+	}
+	struct uwin *u = uwins[slot];
 
 	/* The client buffer is a private, contiguous run of physical RAM (its own
 	 * space, off the shared kernel heap), identity-mapped for the WM to blit. */
@@ -331,8 +373,22 @@ int uwin_create(int w, int h, const char *title)
 	/* The WM window framing the client buffer. */
 	int win_w = w + 2 * WM_BORDER;
 	int win_h = h + WM_TITLE_H + WM_BORDER;
-	struct window *win = wm_create_window(150 + slot * 26, 90 + slot * 26,
-	                                      win_w, win_h, title ? title : "app", 1);
+	/* Cascade new windows diagonally, but WRAP within the screen and CLAMP so a
+	 * window never opens off-screen (slot*26 used to march past the right/bottom
+	 * edge once enough windows were open). The usable range keeps the whole frame
+	 * on screen and above the taskbar; an oversized window pins to the top-left. */
+	int sw = (int)fb_width(), sh = (int)fb_height();
+	int step = 26, margin = 40;
+	int rng_x = sw - win_w - margin;
+	int rng_y = sh - WM_BAR_H - win_h - margin;
+	if (rng_x < step) rng_x = step;
+	if (rng_y < step) rng_y = step;
+	int wx = margin + (slot * step) % rng_x;
+	int wy = margin + (slot * step) % rng_y;
+	if (wx + win_w > sw) wx = sw > win_w ? sw - win_w : 0;
+	if (wy + win_h > sh - WM_BAR_H) wy = (sh - WM_BAR_H) > win_h ? sh - WM_BAR_H - win_h : 0;
+	struct window *win = wm_create_window(wx, wy, win_w, win_h,
+	                                      title ? title : "app", 1);
 	if (!win) {
 		paging_kunmap(phys, buf_bytes);
 		pmm_free_contig(phys, buf_bytes);
@@ -383,9 +439,9 @@ int uwin_create(int w, int h, const char *title)
 /* Validate an id and confirm the caller owns it. */
 static struct uwin *owned(int id)
 {
-	if (id < 0 || id >= MAXUWIN)
+	if (id < 0 || id >= uwins_cap || !uwins[id])
 		return 0;
-	struct uwin *u = &uwins[id];
+	struct uwin *u = uwins[id];
 	if (!u->used || u->free_pending || u->owner != sched_current_id())
 		return 0;                  /* detached-but-not-yet-reaped: gone        */
 	return u;
@@ -453,7 +509,7 @@ int uwin_set_cursor(int id, int cursor)
 
 void uwin_task_exiting(uint32_t owner_id)
 {
-	for (int i = 0; i < MAXUWIN; i++)
-		if (uwins[i].used && uwins[i].owner == owner_id)
-			uwin_free(&uwins[i]);
+	for (int i = 0; i < uwins_cap; i++)
+		if (uwins[i] && uwins[i]->used && uwins[i]->owner == owner_id)
+			uwin_free(uwins[i]);
 }

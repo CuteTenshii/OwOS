@@ -16,4 +16,7 @@ int         apps_menu_count(void);
 const char *apps_menu_name(int i);
 void        apps_menu_launch(int i);
 
+/* Launch the Super+V clipboard-history viewer; returns its pid (or -1). */
+int         apps_open_cliphist(void);
+
 #endif

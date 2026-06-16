@@ -72,4 +72,8 @@ int keyboard_take_interrupt(void);
  * so a Ctrl+C typed in the host terminal interrupts a running command). */
 void keyboard_signal_interrupt(void);
 
+/* Arm a clipboard paste from outside the keyboard (the WM, after the Super+V
+ * history viewer picks a clip) — same injection path as Ctrl+V. */
+void keyboard_request_paste(void);
+
 #endif /* OWOS_KEYBOARD_H */

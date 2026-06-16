@@ -62,6 +62,9 @@ void net_rx_frame(const uint8_t *frame, uint32_t len);
 void           net_ip_send(const uint8_t dst[4], uint8_t proto,
                            const uint8_t *payload, uint32_t plen);
 const uint8_t *net_my_ip(void);
+/* 1 once a real IPv4 address is held (DHCP lease / static config), else 0.
+ * Distinguishes "link up" from "has an address" -- see net.c. */
+int            net_have_ip(void);
 
 /* UDP server support, used by headless network services (kernel/services.c).
  * A handler is invoked from interrupt context for every datagram arriving on

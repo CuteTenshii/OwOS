@@ -11,8 +11,9 @@
 #include "fs.h"
 #include "heap.h"
 
-/* Spawn /bin/<name> as a detached user process (no wait; the WM reaps it). */
-static void launch_bin(const char *name)
+/* Spawn /bin/<name> as a detached user process (no wait; the WM reaps it).
+ * Returns the child pid, or -1 if the program is missing / won't load. */
+static int launch_bin(const char *name)
 {
 	char path[64];
 	int j = 0;
@@ -27,16 +28,23 @@ static void launch_bin(const char *name)
 	 * buffer would truncate the ELF and the load would silently fail. */
 	int sz = fs_size(path);
 	if (sz < 0)
-		return;
+		return -1;
 	uint8_t *buf = kmalloc((uint32_t)sz);
 	if (!buf)
-		return;
+		return -1;
 	int n = fs_read(path, buf, (uint32_t)sz);
 	char *argv[1];
 	argv[0] = (char *)name;
-	if (n >= 0)
-		exec_program(buf, (uint32_t)n, 1, argv);
+	int pid = (n >= 0) ? exec_program(buf, (uint32_t)n, 1, argv) : -1;
 	kfree(buf);
+	return pid;
+}
+
+/* Launch the clipboard-history viewer (Super+V); returns its pid so the WM can
+ * watch for its exit and paste once a clip is picked. */
+int apps_open_cliphist(void)
+{
+	return launch_bin("cliphist");
 }
 
 static void launch_editor(void)  { launch_bin("editor"); }
@@ -78,6 +86,11 @@ void apps_menu_launch(int i)
 
 void apps_start(void)
 {
+	/* clipd is the clipboard server: a windowless daemon that owns the
+	 * "clipboard" IPC port. Start it before the terminal so it's registered by
+	 * the time any app copies or pastes. */
+	launch_bin("clipd");
+
 	/* The terminal is now the /bin/term (a real user-space shell), opened
 	 * at boot like a Start-menu app. The old kernel-side app_term window is no
 	 * longer created; the kernel shell (shell.c) still drives the serial console

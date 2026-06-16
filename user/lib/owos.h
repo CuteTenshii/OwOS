@@ -82,6 +82,15 @@ void strcpy(char *d, const char *s);          /* caller sizes d                 
 void strcat(char *d, const char *s);          /* caller sizes d                 */
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 
+/* UTF-8 codec — shared so the whole system handles multibyte / non-Latin text
+ * the same way. utf8_seqlen: bytes a lead byte announces (1 for bad/continuation).
+ * utf8_decode: read one codepoint from [s,end) into *cp, returning bytes consumed
+ * (U+FFFD + 1 byte on a malformed/truncated sequence). utf8_encode: write cp as
+ * 1..4 bytes into `out` (must hold >=4), returning the count. */
+int utf8_seqlen(unsigned char lead);
+int utf8_decode(const char *s, const char *end, unsigned *cp);
+int utf8_encode(unsigned cp, char *out);
+
 /* mem* — the freestanding libc primitives gcc also lowers struct copies and
  * array inits to at -O0. Provided once in the shared lib so every program (and
  * any lib needing them, e.g. minimp3, the HTTP/2 HPACK tables) shares one copy.
@@ -201,6 +210,13 @@ int getgid(void);
 int user_ident(char *name, int nmax, char *home, int hmax); /* 1 if found       */
 int gethostname(char *buf, int max);      /* /etc/hostname (default "owos")     */
 int sethostname(const char *name);        /* persist /etc/hostname; 0/-1        */
+
+/* Named local IPC ports (the unix-socket analog). Server: port_open(name,1) ->
+ * listen fd, then port_accept(listen) -> a connection fd per client. Client:
+ * port_open(name,0) -> a connection fd. Connections are bidirectional: read(),
+ * write() and close() work on the fd. */
+int port_open(const char *name, int as_server);
+int port_accept(int listen_fd);
 
 int intr_take(void);   /* 1 (and clear) if Ctrl+C arrived; for CPU-bound loops */
 
