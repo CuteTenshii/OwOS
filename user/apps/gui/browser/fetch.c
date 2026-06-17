@@ -9,41 +9,36 @@
 #include "fetchint.h"  /* shared transport interface + BR_* request headers   */
 #include "headers.h"   /* libcurl: HTTP response header parsing               */
 #include "brotli.h"    /* RFC 7932 `br` content-coding (whole-buffer decode)   */
+#include "h3.h"        /* HTTP/3 over QUIC (libcurl engine)                    */
 
 /* Content-encoding of a response body. */
 enum { ENC_NONE = 0, ENC_ZLIB = 1, ENC_BR = 2 };
 
-/* Brotli equivalent of inflate_http, with the same pull/push contract: pull the
- * whole compressed body through `rd` (brotli has no streaming window — the
- * stream doesn't carry its decompressed size), decompress it, and push the
- * result through `wr`. Returns 0 on success or caller early-stop, -1 on a
- * malformed stream or OOM. */
-static int brotli_http(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
+/* Origins observed to advertise HTTP/3 via Alt-Svc; the next request to one is
+ * tried over h3 first (how browsers bootstrap h3 without an extra round trip). */
+#define H3_HOSTS_MAX 32
+static char h3_hosts[H3_HOSTS_MAX][URL_HOST_MAX];
+static int  h3_nhosts;
+static int h3_known(const char *host)
 {
-	unsigned char *buf = 0;
-	int cap = 0, len = 0, c;
-	while ((c = rd(rctx)) >= 0) {
-		if (len + 1 > cap) {
-			int ncap = cap * 2 + 8192;
-			unsigned char *nb = realloc(buf, (unsigned)ncap);
-			if (!nb) { free(buf); return -1; }
-			buf = nb; cap = ncap;
-		}
-		buf[len++] = (unsigned char)c;
-	}
-	int outlen = 0;
-	unsigned char *out = brotli_decompress(buf, len, &outlen);
-	free(buf);
-	if (!out) return -1;
-	wr(wctx, out, (unsigned)outlen);        /* one push; a <0 (full) is a clean stop */
-	free(out);
+	for (int i = 0; i < h3_nhosts; i++) if (streq(h3_hosts[i], host)) return 1;
 	return 0;
 }
+static void h3_remember(const char *host)
+{
+	if (h3_known(host) || h3_nhosts >= H3_HOSTS_MAX) return;
+	int j = 0;
+	for (; host[j] && j < URL_HOST_MAX - 1; j++) h3_hosts[h3_nhosts][j] = host[j];
+	h3_hosts[h3_nhosts][j] = '\0';
+	h3_nhosts++;
+}
 
-/* Decompress an in-memory body per its content-encoding (ENC_BR / ENC_ZLIB).
- * Returns a malloc'd buffer of *out_len bytes (caller frees), or NULL. Used by
- * the HTTP/2 path, whose body arrives already buffered (pushed in DATA chunks)
- * rather than pulled. */
+/* One body pipeline for every transport: each fills B->raw with the raw (maybe
+ * compressed) body, then raw_decode() decodes Content-Encoding in place and
+ * route_body() decides render vs download. (No per-transport decode paths.)
+ *
+ * Decompress an in-memory body per its content-encoding (ENC_BR / ENC_ZLIB).
+ * Returns a malloc'd buffer of *out_len bytes (caller frees), or NULL. */
 struct memrd { const unsigned char *p; int len, pos; };
 static int memrd_fn(void *c) { struct memrd *m = c; return m->pos < m->len ? m->p[m->pos++] : -1; }
 struct memwr { unsigned char *buf; int cap, len, oom; };
@@ -67,6 +62,17 @@ static unsigned char *body_decompress(const unsigned char *in, int in_len, int e
 	if (inflate_http(memrd_fn, &r, memwr_fn, &w) < 0 || w.oom) { free(w.buf); return 0; }
 	*out_len = w.len;
 	return w.buf ? w.buf : malloc(1);
+}
+
+/* Decode the body already collected in B->raw per its content-encoding, in
+ * place. A failed decode empties B->raw (never show the compressed bytes). */
+static void raw_decode(int enc)
+{
+	if (!enc || B->raw_len <= 0) return;
+	int ol = 0;
+	unsigned char *o = body_decompress((unsigned char *)B->raw, B->raw_len, enc, &ol);
+	B->raw_len = 0;
+	if (o) { if (ensure_raw(ol)) { memcpy(B->raw, o, ol); B->raw_len = ol; } free(o); }
 }
 
 static int rgetc(void)
@@ -158,58 +164,6 @@ static int body_src(void *ctx)
 	int c = rgetc();
 	if (c < 0) { b->done = 1; return -1; }
 	return c;
-}
-
-/* Appends decompressed (or copied) bytes to the page body buffer, growing it as
- * needed. Only an exhausted heap stops it (return <0), which makes the streaming
- * inflater halt cleanly rather than failing outright — no fixed size cap. */
-static int raw_sink(void *ctx, const unsigned char *p, unsigned n)
-{
-	(void)ctx;
-	if (!ensure_raw(B->raw_len + (int)n))
-		return -1;
-	for (unsigned i = 0; i < n; i++)
-		B->raw[B->raw_len++] = (char)p[i];
-	return 0;
-}
-
-/* Bulk counterpart to body_src for the uncompressed download path: copies whole
- * runs straight out of the socket buffer rather than a byte at a time, so a
- * multi-megabyte file isn't shuttled through one function call per byte. Returns
- * the number of body bytes placed in out[] (0 at end of body). The per-byte
- * body_src is reused only to step across chunk-size headers (once per chunk). */
-static int body_fill(struct bodysrc *b, unsigned char *out, int max)
-{
-	int got = 0;
-	while (got < max && !b->done) {
-		if (b->chunked && b->remaining == 0) {
-			int c = body_src(b);            /* crosses the chunk header */
-			if (c < 0) break;
-			out[got++] = (unsigned char)c;
-			continue;
-		}
-		if (b->have_len && b->remaining == 0) { b->done = 1; break; }
-		if (B->rpos >= B->rlen) {               /* refill from the socket */
-			if (B->reof) { if (!b->chunked && !b->have_len) b->done = 1; break; }
-			int rn = net_recv(B->sock, B->rbuf, (int)sizeof B->rbuf);
-			if (rn < 0) { b->done = 1; break; }
-			if (rn == 0) {
-				B->reof = 1;
-				if (!b->chunked && !b->have_len) b->done = 1;
-				break;
-			}
-			B->rpos = 0; B->rlen = rn;
-		}
-		int avail = B->rlen - B->rpos;
-		if (avail > max - got) avail = max - got;
-		if ((b->chunked || b->have_len) && (unsigned)avail > b->remaining)
-			avail = (int)b->remaining;
-		for (int i = 0; i < avail; i++) out[got + i] = B->rbuf[B->rpos + i];
-		B->rpos += avail;
-		got += avail;
-		if (b->chunked || b->have_len) b->remaining -= (unsigned)avail;
-	}
-	return got;
 }
 
 /* ------------------------------------------------------------- downloads */
@@ -339,16 +293,6 @@ static void build_path(const char *base, int n, char *out, int cap)
 	out[p] = '\0';
 }
 
-/* inflate sink: push decompressed bytes straight to the open stream, halting the
- * inflater (return -1) the moment a disk write fails. */
-struct dlsink { int fail; };
-static int file_sink(void *ctx, const unsigned char *p, unsigned n)
-{
-	struct dlsink *d = ctx;
-	if (stream_write(p, (int)n) < 0) { d->fail = 1; return -1; }
-	return 0;
-}
-
 /* Pick a non-clobbering DL_DIR/<name> path for a download (the saved name comes
  * from Content-Disposition or the URL; a repeat gets a "-N" suffix). Ensures
  * DL_DIR exists first: the boot image creates it, but a disk.img persisted from
@@ -388,32 +332,6 @@ static void download_finished(const char *url, const char *path, int wrote, int 
 	doc_message(msg);
 	B->dl_saved = 1;
 	B->seq++;
-}
-
-/* Stream the (HTTP/1.1) response body straight to ~/Downloads rather than
- * buffering it, so a download is bounded only by the disk, never by RAW_MAX;
- * inflates on the fly when the body is compressed. */
-static void stream_download(const char *url, struct bodysrc *bs, int enc_gz)
-{
-	char path[256];
-	pick_dl_path(url, path, sizeof path);
-
-	struct dlsink d = { 0 };
-	int wrote = -1;
-	if (stream_begin(path) == 0) {
-		if (enc_gz == ENC_BR) {
-			brotli_http(body_src, bs, file_sink, &d);
-		} else if (enc_gz) {
-			inflate_http(body_src, bs, file_sink, &d);
-		} else {
-			/* Bulk-read into a page-sized buffer, then one stream_write per fill. */
-			unsigned char buf[4096]; int got;
-			while ((got = body_fill(bs, buf, (int)sizeof buf)) > 0)
-				if (stream_write(buf, got) < 0) { d.fail = 1; break; }
-		}
-		wrote = stream_end();   /* commits + returns the size; -1 after a failed write */
-	}
-	download_finished(url, path, wrote, d.fail);
 }
 
 /* ----------------------------------------------------------- transaction */
@@ -566,6 +484,16 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 
 	if (http_headers_get(&H, "strict-transport-security")) hsts_add(host);
 
+	/* Alt-Svc advertising HTTP/3 (h3=… or h3-NN=…) — remember the origin so the
+	 * next request to it goes over QUIC. */
+	const char *as = http_headers_get(&H, "alt-svc");
+	if (as)
+		for (const char *p = as; *p; p++)
+			if ((p[0] == 'h' || p[0] == 'H') && p[1] == '3' && (p[2] == '=' || p[2] == '-')) {
+				h3_remember(host);
+				break;
+			}
+
 	/* Link: <a.css>; rel=stylesheet — external sheets declared in the header. */
 	int nlink = http_headers_count(&H, "link");
 	for (int i = 0; i < nlink; i++)
@@ -581,79 +509,54 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 	return status;
 }
 
-/* ---- HTTP/2 transaction (used when ALPN negotiates h2 over TLS) --------- */
-
-/* Shared state for the two h2 callbacks below and the download finalizer.
- *   is_dl    the response is a download — its body is never rendered.
- *   dl_open  the destination file opened, so body bytes go to disk.
- * Keeping these separate is load-bearing: a download whose file couldn't be
- * opened still must NOT fall through to B->raw (which would dump the binary into
- * the page as text); its body is discarded and the failure reported. */
-struct h2tx {
-	const char *full_url, *host;
-	char *loc; int loc_cap;
-	int  allow_dl;
-	int  status;
-	int  is_dl, dl_open, dl_started, dl_fail;
-	int  enc;                         /* content-encoding (ENC_*) of the body    */
-	unsigned char *body; int blen, bcap;   /* buffered compressed body (enc != 0) */
-	char dl_path[256];
-};
-
-/* Append a DATA chunk to the h2 transaction's compressed-body buffer. */
-static int h2buf(struct h2tx *h, const unsigned char *p, int n)
+/* Route the fully-received, already-content-decoded body in B->raw: a download
+ * (attachment / non-renderable type on a 2xx) is written to ~/Downloads and
+ * B->raw cleared; anything else stays in B->raw for rendering. The single place
+ * the download decision lives, shared by every transport. Returns `status`. */
+static int route_body(const char *full_url, int status, int allow_dl)
 {
-	if (h->blen + n > h->bcap) {
-		int nc = (h->blen + n) * 2 + 4096;
-		unsigned char *nb = realloc(h->body, (unsigned)nc);
-		if (!nb) return -1;
-		h->body = nb; h->bcap = nc;
+	if (allow_dl && status >= 200 && status < 300 && is_download(full_url)) {
+		char path[256];
+		pick_dl_path(full_url, path, sizeof path);
+		int wrote = -1, fail = 0;
+		if (stream_begin(path) == 0) {
+			if (B->raw_len > 0 && stream_write((const unsigned char *)B->raw, B->raw_len) < 0)
+				fail = 1;
+			wrote = stream_end();
+		}
+		download_finished(full_url, path, wrote, fail);
+		B->raw_len = 0;
 	}
-	for (int i = 0; i < n; i++) h->body[h->blen++] = p[i];
-	return 0;
+	return status;
 }
 
-/* Headers-ready hook (fired before any DATA): parse the response, and if it is
- * a download, open the destination file now so the body streams to disk. */
+/* ---- HTTP/2 transaction (used when ALPN negotiates h2 over TLS) --------- */
+
+struct h2tx { const char *full_url, *host; char *loc; int loc_cap; int status, enc; };
+
+/* Headers-ready hook (fired before any DATA): parse the response (status, enc,
+ * redirect Location, cookies). */
 static int h2_headers_cb(void *ctx, const char *block, int len)
 {
 	(void)len;
 	struct h2tx *h = ctx;
-	int chunked, have_len, enc_gz; unsigned clen;
+	int chunked, have_len; unsigned clen;
 	h->status = parse_response(block, h->host, h->full_url, h->loc, h->loc_cap,
-	                           &chunked, &have_len, &clen, &enc_gz);
-	h->enc = enc_gz;
-	if (h->allow_dl && h->status >= 200 && h->status < 300 && is_download(h->full_url)) {
-		h->is_dl = 1; h->dl_started = 1;
-		pick_dl_path(h->full_url, h->dl_path, sizeof h->dl_path);
-		if (stream_begin(h->dl_path) == 0) h->dl_open = 1;
-		else                               h->dl_fail = 1;
-	}
+	                           &chunked, &have_len, &clen, &h->enc);
 	return 0;
 }
 
-/* Body sink: stream to the download file (discarding if it failed to open — a
- * download is never rendered), or accumulate a renderable body into B->raw
- * (grown on demand, no size cap). Returns non-zero to stop the transfer. */
+/* Body sink: append the raw DATA payload to B->raw (decoded once, after). */
 static int h2_body_cb(void *ctx, const unsigned char *p, int n)
 {
-	struct h2tx *h = ctx;
-	/* Compressed body (gzip/deflate/br): buffer it; decompressed at transfer end
-	 * since brotli has no streaming window and h2 DATA arrives in chunks. */
-	if (h->enc) return h2buf(h, p, n) < 0 ? 1 : 0;
-	if (h->is_dl) {
-		if (h->dl_open && stream_write(p, n) < 0) { h->dl_fail = 1; return 1; }
-		return 0;
-	}
-	if (!ensure_raw(B->raw_len + n)) return 1;      /* out of memory: stop      */
-	for (int i = 0; i < n; i++)
-		B->raw[B->raw_len++] = (char)p[i];
+	(void)ctx;
+	if (!ensure_raw(B->raw_len + n)) return 1;      /* out of memory: stop */
+	for (int i = 0; i < n; i++) B->raw[B->raw_len++] = (char)p[i];
 	return 0;
 }
 
-/* Run the request over HTTP/2 (sock already open + ALPN-confirmed h2). Mirrors
- * http_txn's contract: fills B->raw / streams a download, resolves redirects
- * into `loc`, and returns the status (or -5 if the transfer failed). */
+/* Run the request over HTTP/2 (sock already open + ALPN-confirmed h2). Fills
+ * B->raw with the raw body; raw_decode + route_body finish it the common way. */
 static int h2_txn(const struct purl *u, const char *full_url, char *loc,
                   int loc_cap, int allow_dl)
 {
@@ -664,8 +567,7 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 		uapp(auth, &an, sizeof auth, (unsigned)u->port);
 	}
 
-	/* Request headers: cookies + accept + accept-encoding (gzip/deflate/br — the
-	 * body is buffered and decompressed below). No Connection/Transfer-Encoding
+	/* cookies + accept + accept-encoding. No Connection/Transfer-Encoding
 	 * (forbidden in HTTP/2). The User-Agent rides in h2_opts. */
 	char xh[1408]; int xn = 0;
 	char ck[1024];
@@ -678,34 +580,57 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 	     "accept: " BR_ACCEPT "\r\naccept-language: " BR_ACCLNG "\r\n"
 	     "accept-encoding: gzip, deflate, br\r\n");
 
-	struct h2tx h = { full_url, u->host, loc, loc_cap, allow_dl, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0} };
+	struct h2tx h = { full_url, u->host, loc, loc_cap, 0, 0 };
 	struct h2_opts opts = { BR_UA, xh, h2_headers_cb };
 	char hdrbuf[4096]; int hlen = 0;
 	h2_run(B->sock, 1, auth, "GET", u->path, &opts,
 	       hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
 
-	/* Decompress the buffered body (if any) into its destination. */
-	if (h.enc && h.blen > 0) {
-		int ol = 0;
-		unsigned char *o = body_decompress(h.body, h.blen, h.enc, &ol);
-		if (!o) {
-			if (h.is_dl) h.dl_fail = 1;
-		} else if (h.is_dl) {
-			if (h.dl_open && stream_write(o, ol) < 0) h.dl_fail = 1;
-			free(o);
-		} else {
-			B->raw_len = 0;
-			if (ensure_raw(ol)) { memcpy(B->raw, o, ol); B->raw_len = ol; }
-			free(o);
-		}
+	raw_decode(h.enc);
+	return route_body(full_url, h.status > 0 ? h.status : -5, allow_dl);
+}
+
+/* ---- HTTP/3 transaction (QUIC; used for Alt-Svc-advertised origins) ------- */
+
+/* Body sink: append to B->raw (decoded once, after — same as h2/h1.1). */
+static int h3_body_cb(void *ctx, const unsigned char *p, int n)
+{
+	(void)ctx;
+	if (!ensure_raw(B->raw_len + n)) return 1;
+	for (int i = 0; i < n; i++) B->raw[B->raw_len++] = (char)p[i];
+	return 0;
+}
+
+/* Run the request over HTTP/3. Mirrors http_txn's contract; returns the status,
+ * or a negative HTTP_E* (the caller then falls back to TLS h2/h1.1). */
+static int h3_txn(const struct purl *u, const char *full_url, char *loc,
+                  int loc_cap, int allow_dl)
+{
+	loc[0] = '\0';
+	B->ctype[0] = '\0'; B->dl_name[0] = '\0'; B->cdisp_attach = 0; B->raw_len = 0;
+
+	char auth[URL_HOST_MAX + 8]; int an = 0;
+	sapp(auth, &an, sizeof auth, u->host);
+	if (u->port != 443) { sapp(auth, &an, sizeof auth, ":"); uapp(auth, &an, sizeof auth, (unsigned)u->port); }
+
+	char xh[1408]; int xn = 0;
+	sapp(xh, &xn, sizeof xh, "user-agent: " BR_UA "\r\naccept: " BR_ACCEPT
+	     "\r\naccept-language: " BR_ACCLNG "\r\naccept-encoding: gzip, deflate, br\r\n");
+	char ck[1024];
+	if (cookie_header(u->host, ck, sizeof ck) > 0) {
+		sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n");
 	}
-	free(h.body);
 
-	if (h.dl_started)                               /* finish a streamed download */
-		download_finished(full_url, h.dl_path,
-		                  h.dl_open ? stream_end() : -1, h.dl_fail || !h.dl_open);
+	char hdrbuf[4096]; int hlen = 0;
+	int st = h3_run(u->host, u->port, auth, "GET", u->path, xh,
+	                hdrbuf, sizeof hdrbuf, &hlen, h3_body_cb, 0);
+	if (st <= 0) return st;                          /* QUIC failed -> caller falls back */
 
-	return h.status > 0 ? h.status : -5;
+	int chunked, have_len, enc; unsigned clen;
+	int status = parse_response(hdrbuf, u->host, full_url, loc, loc_cap,
+	                            &chunked, &have_len, &clen, &enc);
+	raw_decode(enc);
+	return route_body(full_url, status, allow_dl);
 }
 
 static int http_txn(const struct purl *u, const char *full_url, char *loc,
@@ -717,6 +642,15 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	B->cdisp_attach = 0;
 	B->rpos = B->rlen = B->reof = 0;
 	B->raw_len = 0;
+
+	/* If this https origin previously advertised HTTP/3 (Alt-Svc), try QUIC
+	 * first; on any failure fall through to the TLS h2/h1.1 path below. */
+	if (u->tls && u->port == 443 && h3_known(u->host)) {
+		int st = h3_txn(u, full_url, loc, loc_cap, allow_dl);
+		if (st > 0) return st;
+		loc[0] = '\0'; B->ctype[0] = '\0'; B->dl_name[0] = '\0';
+		B->cdisp_attach = 0; B->raw_len = 0;
+	}
 
 	/* Over TLS, offer ALPN "h2" (SK_TLS_H2); if the server selects it, run the
 	 * request over HTTP/2 instead of the HTTP/1.1 code below. */
@@ -773,34 +707,17 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	struct bodysrc bs = { chunked, have_len, 0, 0,
 	                      have_len ? content_len : 0 };
 
-	/* A download (attachment, or a non-renderable Content-Type) on a successful
-	 * response streams straight to ~/Downloads — decided here, before the body is
-	 * read, so binary content never has to fit in B->raw. Redirects (3xx) and
-	 * sub-resource fetches (allow_dl == 0) take the buffered path below. */
-	if (allow_dl && status >= 200 && status < 300 && is_download(full_url)) {
-		stream_download(full_url, &bs, enc_gz);
-		net_close(B->sock);
-		return status;
+	/* Read the whole (framed) body into B->raw, then the common pipeline decodes
+	 * Content-Encoding and routes render-vs-download. */
+	int c;
+	while ((c = body_src(&bs)) >= 0) {
+		if (!ensure_raw(B->raw_len + 1)) break;       /* out of memory: stop */
+		B->raw[B->raw_len++] = (char)c;
 	}
-
-	if (enc_gz == ENC_BR) {
-		/* Brotli body: buffered whole then decompressed (no streaming window). */
-		brotli_http(body_src, &bs, raw_sink, 0);
-	} else if (enc_gz) {
-		/* Compressed body: stream it through the inflater, which pulls framed
-		 * body bytes via body_src and pushes decompressed bytes into raw_sink.
-		 * Only the 32 KiB DEFLATE window lives in RAM, whatever the page size. */
-		inflate_http(body_src, &bs, raw_sink, 0);
-	} else {
-		int c;
-		while ((c = body_src(&bs)) >= 0) {
-			if (!ensure_raw(B->raw_len + 1)) break;   /* out of memory: stop */
-			B->raw[B->raw_len++] = (char)c;
-		}
-	}
-
 	net_close(B->sock);
-	return status;
+
+	raw_decode(enc_gz);
+	return route_body(full_url, status, allow_dl);
 }
 
 /* ----------------------------------------------- local & inline URL schemes */

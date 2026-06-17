@@ -14,7 +14,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o drivers/net/igb.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/ed25519.o kernel/tls.o \
         kernel/url.o kernel/gzip.o kernel/png.o kernel/screenshot.o \
         drivers/audio/sb16.o drivers/audio/hda.o \
-        kernel/cpu.o kernel/rtc.o drivers/acpi/power.o drivers/acpi/s3_wake.o drivers/acpi/battery.o \
+        kernel/cpu.o kernel/smp.o kernel/smp_ap.o kernel/rtc.o drivers/acpi/power.o drivers/acpi/s3_wake.o drivers/acpi/battery.o \
         kernel/firmware.o kernel/smbios.o drivers/acpi/aml.o drivers/video/edid.o \
         kernel/syscall.o kernel/loader.o kernel/pipe.o kernel/ipc.o kernel/kclip.o \
         kernel/services/services.o kernel/services/svc_smbd.o kernel/services/svc_sshd.o \

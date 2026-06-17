@@ -16,12 +16,19 @@ static unsigned rd32(const unsigned char *p)
 
 struct font {
 	const unsigned char *d; int len;
+	unsigned char *owned;            /* SFNT decoded from a WOFF container (freed here); else 0 */
 	int num_glyphs, upem, loc_long;
 	int n_hmetrics;
 	int asc, desc, lgap;             /* font units */
 	unsigned head, maxp, hhea, hmtx, loca, glyf;   /* table offsets (0 = absent) */
 	unsigned cmap_sub; int cmap_fmt;               /* chosen cmap subtable        */
 };
+
+/* WOFF/WOFF2 → SFNT decoder (user/lib/font/woff.c). Weak so a program that only
+ * renders local SFNTs need not link it (and thus drag in brotli); when present,
+ * font_load transparently decodes web-font containers. */
+extern int woff_is_woff(const unsigned char *, int) __attribute__((weak));
+extern unsigned char *woff_to_sfnt(const unsigned char *, int, int *) __attribute__((weak));
 
 static unsigned find_table(const unsigned char *d, int len, const char *tag)
 {
@@ -66,17 +73,29 @@ static void pick_cmap(struct font *f)
 struct font *font_load(const unsigned char *data, int len)
 {
 	if (!data || len < 12) return 0;
+
+	/* Transparently decode a WOFF/WOFF2 web-font container to a raw SFNT, which
+	 * the font then owns (freed in font_free). The original `data` is untouched
+	 * and remains the caller's. */
+	unsigned char *owned = 0;
+	if (woff_is_woff && woff_to_sfnt && woff_is_woff(data, len)) {
+		int sl = 0;
+		owned = woff_to_sfnt(data, len, &sl);
+		if (!owned) return 0;
+		data = owned; len = sl;
+	}
+
 	unsigned ver = rd32(data);
 	/* 0x00010000 = TrueType, 'true'/'typ1' = TT, 'OTTO' = CFF (unsupported here),
 	 * 'ttcf' = collection (unsupported). */
 	if (ver != 0x00010000 && ver != 0x74727565 /*true*/) {
-		if (ver == 0x4F54544F /*OTTO*/) return 0;   /* pure-CFF OTF: not yet */
-		if (ver != 0x74797031 /*typ1*/) return 0;
+		if (ver != 0x74797031 /*typ1*/) { free(owned); return 0; }  /* incl. OTTO (CFF) */
 	}
 
 	struct font *f = malloc(sizeof *f);
-	if (!f) return 0;
+	if (!f) { free(owned); return 0; }
 	for (unsigned i = 0; i < sizeof *f; i++) ((char *)f)[i] = 0;
+	f->owned = owned;
 	f->d = data; f->len = len;
 
 	f->head = find_table(data, len, "head");
@@ -85,7 +104,7 @@ struct font *font_load(const unsigned char *data, int len)
 	f->hmtx = find_table(data, len, "hmtx");
 	f->loca = find_table(data, len, "loca");
 	f->glyf = find_table(data, len, "glyf");
-	if (!f->head || !f->maxp || !f->hhea || !f->hmtx || !f->loca || !f->glyf) { free(f); return 0; }
+	if (!f->head || !f->maxp || !f->hhea || !f->hmtx || !f->loca || !f->glyf) { free(f->owned); free(f); return 0; }
 
 	f->upem    = (int)rd16(data + f->head + 18);
 	f->loc_long = rds16(data + f->head + 50);
@@ -100,7 +119,7 @@ struct font *font_load(const unsigned char *data, int len)
 	return f;
 }
 
-void font_free(struct font *f) { if (f) free(f); }
+void font_free(struct font *f) { if (f) { free(f->owned); free(f); } }
 
 /* ------------------------------------------------ cmap lookup -------------- */
 int font_glyph_index(const struct font *f, int cp)

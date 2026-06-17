@@ -248,18 +248,23 @@ static int dec_str(const unsigned char *b, int *pos, int len,
 	int huff = b[*pos] & 0x80;
 	long n = dec_int(b, pos, len, 7);
 	if (n < 0 || *pos + (int)n > len)
-		return -1;
+		return -1;                              /* genuinely truncated input */
+	/* A value/name larger than our buffer (a giant Set-Cookie/CSP) is truncated
+	 * and skipped, NOT treated as fatal: we still consume the field so the parser
+	 * stays in sync and keeps decoding the rest of the block. Aborting here would
+	 * drop every later header — including content-encoding, which broke `br`/gzip
+	 * decoding on header-heavy sites like google. */
 	if (!huff) {
-		if ((int)n > outcap)
-			return -1;
-		memcpy(out, b + *pos, (int)n);
-		*outlen = (int)n;
+		int take = (int)n < outcap ? (int)n : outcap;
+		memcpy(out, b + *pos, take);
+		*outlen = take;
 		*pos += (int)n;
 		return 0;
 	}
-	int rc = huff_decode(b + *pos, (int)n, out, outcap, outlen);
+	if (huff_decode(b + *pos, (int)n, out, outcap, outlen) < 0)
+		*outlen = 0;                            /* undecodable/too big: skip value */
 	*pos += (int)n;
-	return rc;
+	return 0;
 }
 
 /* ---------------------------------------------------- header block decoding */
@@ -686,14 +691,15 @@ int h2_run(int sock, int scheme_https, const char *authority,
 				if (cr == -3) { rc = HTTP_EINTR;  goto out; }
 				if (cr < 0)   { rc = HTTP_ENORESP; goto out; }
 				if (hpack_decode(hblock, hbl, &hs) < 0) {
-					/* A header block we couldn't fully decode (a field past our
-					 * buffers, or HPACK state we don't model — google's big
-					 * Set-Cookies). If the status line already came through, salvage
-					 * the response: keep the status + the headers that decoded
-					 * (enough for a redirect's Location), and KEEP READING — DATA
-					 * frames carry the body and use no HPACK, so we still get the
-					 * page. We just can't decode any later HEADERS (the table is now
-					 * desynced). A failure before any status is genuinely fatal. */
+					/* A header block we couldn't fully decode (HPACK state we don't
+					 * model). Oversized fields are no longer fatal — dec_str
+					 * truncates and keeps decoding, so a giant Set-Cookie/CSP no
+					 * longer drops every later header (that silently lost
+					 * content-encoding and rendered google's gzip body raw). If the
+					 * status line already came through, salvage the response: keep
+					 * the status + decoded headers and KEEP READING — DATA frames
+					 * carry the body and use no HPACK. A failure before any status
+					 * is genuinely fatal. */
 					if (hs.status <= 0) { rc = HTTP_ENORESP; goto out; }
 					hpack_broken = 1;
 					headers_done = 1;

@@ -270,11 +270,26 @@ static void decode_entities(char *s)
  * the new length. If the heap is exhausted the glyph is silently dropped (the
  * page just stops growing) — the same graceful truncation the old fixed buffer
  * did when full, only now the ceiling is available memory, not a fixed cap. */
+/* Current block context, saved/restored around each element like sty_cur
+ * (BP_* layout in browser.h). */
+static unsigned char W_size, W_center, W_mono, W_indent, W_pre;
+static unsigned char W_bg = 0xFF;   /* background palette index, 0xFF = none    */
+static char W_listtype;             /* 'u' / 'o' / 0 — the enclosing list kind  */
+static int  W_olnum;                /* <ol> item counter                        */
+
+static unsigned char block_byte(void)
+{
+	return (unsigned char)((W_size & 7) | (W_center ? BP_CENTER : 0) |
+	        (W_mono ? BP_MONO : 0) | ((W_indent & 7) << BP_INDENT_SH));
+}
+
 static int text_put(int n, char c, unsigned char a)
 {
 	if (!ensure_text(n + 1)) return n;
 	B->text[n] = c;
 	B->attr[n] = a;
+	B->bp[n]  = block_byte();
+	B->bgi[n] = W_bg;
 	return n + 1;
 }
 
@@ -321,6 +336,15 @@ static void emit_text(const char *s)
 			if (c == -1) { W_pend_sp = 1; continue; }      /* nbsp -> space   */
 		} else {
 			c = read_char(&p, end);
+		}
+		if (W_pre) {                                        /* <pre>: keep spacing */
+			if (c == '\n') { W_n = text_put(W_n, '\n', 0); W_run_nl = 1; continue; }
+			if (c == '\r') continue;
+			if (c == '\t') { for (int t = 0; t < 4; t++) W_n = text_put(W_n, ' ', sty_byte()); W_run_nl = 0; continue; }
+			if (cp_drop((unsigned)c)) continue;
+			W_n = utf8_emit(W_n, (unsigned)c, sty_byte());
+			W_run_nl = 0;
+			continue;
 		}
 		if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { W_pend_sp = 1; continue; }
 		if (cp_drop((unsigned)c)) continue;
@@ -466,6 +490,56 @@ static void handle_favicon(struct dom_node *el)
 	B->favicon_pri = pri;
 }
 
+/* Emit a literal ASCII/UTF-8 run with attr `a`, no whitespace collapsing — used
+ * for the chrome around form controls and list markers. */
+static void emit_lit(const char *s, unsigned char a)
+{
+	if (W_pend_sp) { if (W_n > 0 && W_run_nl == 0) W_n = text_put(W_n, ' ', 0); W_pend_sp = 0; }
+	for (const char *p = s; *p; p++) { W_n = text_put(W_n, *p, a); W_run_nl = 0; }
+}
+
+/* Render <input> as a visible boxed widget (no interaction yet). */
+static void emit_input(struct dom_node *el)
+{
+	const char *type = dom_get_attr(el, "type");
+	const char *val  = dom_get_attr(el, "value");
+	const char *ph   = dom_get_attr(el, "placeholder");
+	if (type && streq(type, "hidden")) return;
+	if (type && (streq(type, "submit") || streq(type, "button") || streq(type, "reset"))) {
+		emit_lit("[ ", ST_BOLD);
+		emit_lit(val ? val : (streq(type, "reset") ? "Reset" : "Submit"), ST_BOLD);
+		emit_lit(" ]", ST_BOLD);
+		return;
+	}
+	if (type && (streq(type, "checkbox") || streq(type, "radio"))) {
+		int on = dom_get_attr(el, "checked") != 0;
+		if (streq(type, "radio")) emit_lit(on ? "(o)" : "( )", ST_BOLD);
+		else                      emit_lit(on ? "[x]" : "[ ]", ST_BOLD);
+		return;
+	}
+	emit_lit("[ ", ST_BOLD);
+	emit_lit(val ? val : (ph ? ph : "         "), val || ph ? (unsigned char)0 : ST_BOLD);
+	emit_lit(" ]", ST_BOLD);
+}
+
+/* Render <select> as a boxed control showing the selected (or first) option. */
+static void emit_select(struct dom_node *el)
+{
+	struct dom_node *pick = 0;
+	for (struct dom_node *o = el->first_child; o; o = o->next) {
+		if (o->type == DOM_TEXT || !o->tag || !streq(o->tag, "option")) continue;
+		if (!pick) pick = o;
+		if (dom_get_attr(o, "selected")) { pick = o; break; }
+	}
+	emit_lit("[ ", ST_BOLD);
+	if (pick)
+		for (struct dom_node *t = pick->first_child; t; t = t->next)
+			if (t->type == DOM_TEXT && t->text) emit_text(t->text);
+	emit_lit(" \xe2\x96\xbe ]", ST_BOLD);   /* small down triangle */
+}
+
+static void walk(struct dom_node *node);
+
 static void walk_element(struct dom_node *el)
 {
 	const char *name = el->tag;
@@ -479,23 +553,64 @@ static void walk_element(struct dom_node *el)
 
 	if (streq(name, "img"))  { handle_img(el, &cs); return; }
 	if (streq(name, "link")) { handle_favicon(el); return; }
-	if (streq(name, "br") || streq(name, "hr")) { block_break(); return; }
+	if (streq(name, "br")) { block_break(); return; }
+	if (streq(name, "hr")) {                                     /* a rule line  */
+		block_break();
+		unsigned char s = W_size; W_size = 7;
+		W_n = text_put(W_n, ' ', 0); W_run_nl = 0;
+		W_size = s; block_break();
+		return;
+	}
+	if (streq(name, "input"))  { emit_input(el);  return; }
+	if (streq(name, "select")) { emit_select(el); return; }
+	if (streq(name, "button")) {
+		struct sty sv = sty_cur; sty_cur.bold = 1;
+		emit_lit("[ ", ST_BOLD); walk(el); emit_lit(" ]", ST_BOLD);
+		sty_cur = sv; return;
+	}
+	if (streq(name, "textarea")) { emit_lit("[ ", ST_BOLD); walk(el); emit_lit(" ]", ST_BOLD); return; }
 
 	struct sty saved = sty_cur;
+	unsigned char sv_size = W_size, sv_center = W_center, sv_mono = W_mono,
+	              sv_indent = W_indent, sv_pre = W_pre, sv_bg = W_bg;
+	char sv_lt = W_listtype; int sv_ol = W_olnum;
 	int linked = streq(name, "a") ? open_link(el) : 0;
 
 	apply_ua_style(name);
 	apply_css(&cs);
+	if (cs.bg >= 0) W_bg = (unsigned char)nearest_palette((unsigned)cs.bg);
+
+	/* Block-level browser defaults. */
+	if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) W_size = (unsigned char)(name[1] - '0');
+	if (streq(name, "center") || cs.center > 0) W_center = 1;
+	if (streq(name, "pre")) { W_mono = 1; W_pre = 1; }
+	if (streq(name, "blockquote")) W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7);
+	if (streq(name, "ul")) { W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7); W_listtype = 'u'; }
+	if (streq(name, "ol")) { W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7); W_listtype = 'o'; W_olnum = 0; }
 
 	int blk = (cs.disp == CSS_DISP_BLOCK) ? 1 :
 	          (cs.disp == CSS_DISP_INLINE) ? 0 : is_block_tag(name);
 
 	if (blk) block_break();
+	if (streq(name, "li")) {                                     /* list marker  */
+		unsigned char a = sty_byte();
+		if (W_listtype == 'o') {
+			char num[16]; int k = 0, v = ++W_olnum;
+			char d[8]; int z = 0; if (v == 0) d[z++] = '0'; while (v) { d[z++] = (char)('0' + v % 10); v /= 10; }
+			while (z) num[k++] = d[--z]; num[k++] = '.'; num[k++] = ' '; num[k] = '\0';
+			emit_lit(num, a);
+		} else {
+			emit_lit("\xe2\x80\xa2 ", a);                       /* bullet "• "  */
+		}
+	}
 	walk(el);
 	if (blk) block_break();
 
 	if (linked) close_link();
 	sty_cur = saved;
+	W_size = sv_size; W_center = sv_center; W_mono = sv_mono;
+	W_indent = sv_indent; W_pre = sv_pre; W_bg = sv_bg;
+	W_listtype = sv_lt; W_olnum = sv_ol;
 }
 
 static void walk(struct dom_node *node)
@@ -653,6 +768,7 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
 		for (int i = 0; i < nu; i++) {
 			unsigned char *body = bodies[i];
 			if (!body || lens[i] <= 0) { free(body); continue; }
+			/* font_load transparently decodes WOFF/WOFF2 containers to SFNT. */
 			struct font *f = font_load(body, lens[i]);
 			if (!f) { free(body); continue; }   /* unsupported (e.g. pure CFF) */
 			int j = 0;

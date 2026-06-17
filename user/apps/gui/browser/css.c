@@ -138,6 +138,7 @@ void css_style_reset(struct css_style *s)
 	s->color = s->bg = -1;
 	s->bold = s->under = -1;
 	s->disp = CSS_DISP_UNSET;
+	s->center = -1;
 	s->width = s->height = -1;
 	s->fam[0] = '\0';
 }
@@ -232,6 +233,8 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 	         span_is(p, pe, "text-decoration-line"))
 		out->under = has_ci(val, "underline") ? 1 : (has_ci(val, "none") ? 0 : out->under);
 	else if (span_is(p, pe, "display"))          out->disp   = parse_disp(val);
+	else if (span_is(p, pe, "text-align"))
+		out->center = has_ci(val, "center") ? 1 : (has_ci(val, "left") || has_ci(val, "right") || has_ci(val, "justify") ? 0 : out->center);
 	else if (span_is(p, pe, "width"))            out->width  = parse_len(val);
 	else if (span_is(p, pe, "height"))           out->height = parse_len(val);
 	else if (span_is(p, pe, "font-family"))      copy_family_stack(val, out->fam, CSS_FAM_STACK);
@@ -581,6 +584,7 @@ static void fold(struct css_style *out, const struct css_style *d)
 	if (d->bold >= 0)   out->bold   = d->bold;
 	if (d->under >= 0)  out->under  = d->under;
 	if (d->disp)        out->disp   = d->disp;
+	if (d->center >= 0) out->center = d->center;
 	if (d->width >= 0)  out->width  = d->width;
 	if (d->height >= 0) out->height = d->height;
 	if (d->fam[0]) { int i = 0; for (; d->fam[i] && i < CSS_FAM_STACK - 1; i++) out->fam[i] = d->fam[i]; out->fam[i] = '\0'; }

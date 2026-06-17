@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "gdt.h"
+#include "smp.h"
 
 /* One 8-byte segment descriptor. The fields are scattered across the 8 bytes
  * for historical (16-bit -> 32-bit) reasons, hence the split base/limit. */
@@ -33,16 +34,34 @@ struct tss_entry {
 	uint16_t trap, iomap_base;
 } __attribute__((packed));
 
-static struct gdt_entry gdt[6];
+/* Per-CPU TSS: each core reads its own ss0/esp0, so each needs a distinct TSS
+ * and GDT descriptor. The fixed 5 descriptors (null + kernel/user code/data) are
+ * shared; TSS i sits at descriptor 5+i, selector TSS_SEL(i). */
+#define TSS_SEL(cpu)  ((uint16_t)((5 + (cpu)) << 3))
+
+static struct gdt_entry gdt[5 + SMP_MAX_CPUS];
 static struct gdt_ptr   gdt_ptr;
-static struct tss_entry tss;
+static struct tss_entry tss[SMP_MAX_CPUS];
 
 /* Defined in gdt_flush.S: lgdt the pointer, then reload the segment regs. */
 extern void gdt_flush(uint32_t gdt_ptr_addr);
 
 void tss_set_kernel_stack(unsigned int esp0)
 {
-	tss.esp0 = esp0;
+	tss[smp_this_cpu()].esp0 = esp0;
+}
+
+/* An AP arrives on the trampoline's minimal GDT; switch it to the real kernel GDT
+ * (which carries the per-CPU TSS descriptors) before it can ltr its own TSS. */
+void gdt_load_ap(void)
+{
+	gdt_flush((uint32_t)&gdt_ptr);
+}
+
+/* Load this AP's task register with its own TSS (the BSP does it in gdt_init). */
+void tss_load_ap(void)
+{
+	__asm__ volatile ("ltr %0" : : "r"(TSS_SEL(smp_this_cpu())));
 }
 
 static void gdt_set_entry(int i, uint32_t base, uint32_t limit,
@@ -70,15 +89,19 @@ void gdt_init(void)
 	gdt_set_entry(3, 0, 0xFFFFF, 0xFA, 0xC0);  /* 0x18: user code   (DPL 3)  */
 	gdt_set_entry(4, 0, 0xFFFFF, 0xF2, 0xC0);  /* 0x20: user data   (DPL 3)  */
 
-	/* TSS descriptor: base = &tss, type 0x9 (32-bit TSS available). */
-	tss.ss0 = GDT_KERNEL_DATA;
-	tss.iomap_base = sizeof(tss);
-	gdt_set_entry(5, (uint32_t)&tss, sizeof(tss) - 1, 0x89, 0x00);
+	/* One 32-bit-TSS descriptor (type 0x9) per possible CPU. gdt_init runs before
+	 * smp_init, so the count isn't known yet — set all of them up; the unused ones
+	 * are simply never loaded. */
+	for (int i = 0; i < SMP_MAX_CPUS; i++) {
+		tss[i].ss0 = GDT_KERNEL_DATA;
+		tss[i].iomap_base = sizeof(tss[i]);
+		gdt_set_entry(5 + i, (uint32_t)&tss[i], sizeof(tss[i]) - 1, 0x89, 0x00);
+	}
 
 	gdt_ptr.limit = sizeof(gdt) - 1;
 	gdt_ptr.base  = (uint32_t)&gdt;
 
 	gdt_flush((uint32_t)&gdt_ptr);
 
-	__asm__ volatile ("ltr %0" : : "r"((uint16_t)GDT_TSS));
+	__asm__ volatile ("ltr %0" : : "r"((uint16_t)GDT_TSS));   /* BSP = TSS_SEL(0) */
 }

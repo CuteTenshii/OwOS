@@ -11,22 +11,10 @@
 #include "owos.h"
 #include "dom.h"
 #include "svg.h"
+#include "math.h"
+#include "fmt.h"
 
 #define SS_MAX 3            /* supersample factor cap (AA quality vs memory) */
-
-/* ------------------------------------------------ tiny float helpers ------- */
-/* cos/sin via range reduction + minimax polynomial (no libm, only used by
- * rotate()). Accurate enough for rasterizing small icons. */
-static float f_cos(float x)
-{
-	const float PI = 3.14159265f, TWO_PI = 6.28318531f;
-	x = x - TWO_PI * (float)(int)(x / TWO_PI);
-	if (x < 0) x += TWO_PI;
-	if (x > PI) x -= TWO_PI;
-	float x2 = x * x;
-	return 1.0f - x2/2.0f + x2*x2/24.0f - x2*x2*x2/720.0f + x2*x2*x2*x2/40320.0f;
-}
-static float f_sin(float x) { return f_cos(x - 1.57079633f); }
 
 /* ------------------------------------------------ affine matrix ------------ */
 struct mat { float a, b, c, d, e, f; };   /* x' = a x + c y + e,  y' = b x + d y + f */
@@ -55,11 +43,7 @@ static void mat_apply(struct mat m, float x, float y, float *ox, float *oy)
 static float mat_scale(struct mat m)
 {
 	float sx = m.a*m.a + m.b*m.b, sy = m.c*m.c + m.d*m.d;
-	float s = (sx + sy) * 0.5f;
-	/* sqrt via Newton */
-	float g = s > 1 ? s : 1;
-	for (int i = 0; i < 8; i++) g = 0.5f * (g + s / g);
-	return g;
+	return (float)sqrt((double)((sx + sy) * 0.5f));
 }
 
 /* ------------------------------------------------ number / token parse ----- */
@@ -70,24 +54,16 @@ static int parse_num(const char **pp, const char *end, float *out)
 	const char *p = *pp;
 	while (p < end && is_ws(*p)) p++;
 	if (p >= end) return 0;
-	int sign = 1;
-	if (*p == '+') p++; else if (*p == '-') { sign = -1; p++; }
-	float v = 0; int any = 0;
-	while (p < end && *p >= '0' && *p <= '9') { v = v*10 + (*p++ - '0'); any = 1; }
-	if (p < end && *p == '.') {
-		p++; float frac = 0.1f;
-		while (p < end && *p >= '0' && *p <= '9') { v += (*p++ - '0') * frac; frac *= 0.1f; any = 1; }
-	}
-	if (!any) return 0;
-	if (p < end && (*p == 'e' || *p == 'E')) {
-		p++; int es = 1, ev = 0;
-		if (p < end && *p == '+') p++; else if (p < end && *p == '-') { es = -1; p++; }
-		while (p < end && *p >= '0' && *p <= '9') ev = ev*10 + (*p++ - '0');
-		float m = 1; for (int i = 0; i < ev; i++) m *= 10;
-		if (es > 0) v *= m; else v /= m;
-	}
-	*out = sign * v;
-	*pp = p;
+	/* Only commit to strtod on a numeric lead, so a stray letter in the path
+	 * grammar can't be swallowed as Infinity/NaN. Attribute values are NUL-
+	 * terminated, so strtod stops at `end` on its own. */
+	char c = *p;
+	if (!(c == '+' || c == '-' || c == '.' || (c >= '0' && c <= '9'))) return 0;
+	char *e2;
+	double v = strtod(p, &e2);
+	if ((const char *)e2 == p) return 0;
+	*out = (float)v;
+	*pp = (const char *)e2;
 	return 1;
 }
 
@@ -231,7 +207,7 @@ static struct mat parse_transform(const char *s)
 			t.a = arg[0]; t.d = (na > 1) ? arg[1] : arg[0];
 		} else if (nl == 6 && starts_ci(name, "rotate")) {
 			float r = arg[0] * 3.14159265f / 180.0f;
-			float cs = f_cos(r), sn = f_sin(r);
+			float cs = (float)cos(r), sn = (float)sin(r);
 			struct mat rot = { cs, sn, -sn, cs, 0, 0 };
 			if (na >= 3) {
 				struct mat pre = mat_id();  pre.e = arg[1];  pre.f = arg[2];
@@ -388,7 +364,7 @@ static void emit_ellipse(struct ras *r, struct mat m, float cx, float cy, float 
 	const int N = 48;
 	for (int i = 0; i < N; i++) {
 		float a = (float)i / N * 6.28318531f;
-		float ux = cx + rx * f_cos(a), uy = cy + ry * f_sin(a);
+		float ux = cx + rx * (float)cos(a), uy = cy + ry * (float)sin(a);
 		float dx, dy; mat_apply(m, ux, uy, &dx, &dy);
 		ras_pt(r, dx, dy);
 	}

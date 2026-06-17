@@ -31,6 +31,7 @@
 #include "loader.h"
 #include "paging.h"
 #include "pci.h"
+#include "smp.h"
 #include "pmm.h"
 #include "power.h"
 #include "sched.h"
@@ -63,6 +64,31 @@ static void bootmark(const char *s)
 	con_write(s);
 	con_write("\n");
 }
+
+/* Install an embedded program/asset blob to owofs, (re)creating it when absent
+ * OR when the on-disk size differs from the built-in blob. The size check makes
+ * a rebuilt binary actually replace the persisted copy in disk.img — without it
+ * an "install only if absent" boots the stale program after every rebuild. */
+static void install_blob(const char *path, const unsigned char *start,
+                         const unsigned char *end)
+{
+	uint32_t len = (uint32_t)(end - start);
+	if (fs_size(path) == (int)len) return;     /* already up to date */
+	fs_delete(path);                           /* no-op if absent; drop stale copy */
+	fs_create(path, start, len);
+}
+
+/* Install any embedded blob to owofs from just its disk path + objcopy symbol
+ * base: the start/end externs and the install call all derive from the base, so
+ * adding a shipped file (program, font, asset) is one line and never a separate
+ * extern pair. INSTALL_APP wraps the /bin program convention (build.mk renames
+ * each program blob to _binary_app_<nm>_{start,end}). */
+#define INSTALL_FILE(diskpath, symbase) do {                                  \
+		extern const unsigned char symbase##_start[];                        \
+		extern const unsigned char symbase##_end[];                          \
+		install_blob(diskpath, symbase##_start, symbase##_end);              \
+	} while (0)
+#define INSTALL_APP(nm) INSTALL_FILE("/bin/" #nm, _binary_app_##nm)
 
 /* Two CPU-bound kernel threads that never yield. If scheduling were
  * cooperative the first one would hang the machine; under preemption the
@@ -284,6 +310,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	con_write_dec((uint32_t)pci_count());
 	con_write(" devices found.\n");
 
+	smp_init();                    /* discover CPUs via ACPI MADT (no AP bring-up yet) */
+
 	/* Bring up a linear framebuffer. Prefer one the bootloader handed us (GRUB
 	 * via Multiboot, on real VMs/hardware where we can't drive the GPU to set a
 	 * mode); otherwise program QEMU's DISPI adapter directly (the -kernel path,
@@ -348,48 +376,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
 	/* Install the embedded programs onto the disk if absent. */
 	{
-		extern const unsigned char _binary_fonts_LiberationSans_Regular_ttf_start[];
-		extern const unsigned char _binary_fonts_LiberationSans_Regular_ttf_end[];
-		extern const unsigned char _binary_fonts_LiberationMono_Regular_ttf_start[];
-		extern const unsigned char _binary_fonts_LiberationMono_Regular_ttf_end[];
-		extern const unsigned char _binary_app_edit_start[];
-		extern const unsigned char _binary_app_edit_end[];
-		extern const unsigned char _binary_app_curl_start[];
-		extern const unsigned char _binary_app_curl_end[];
-		extern const unsigned char _binary_app_editor_start[];
-		extern const unsigned char _binary_app_editor_end[];
-		extern const unsigned char _binary_app_about_start[];
-		extern const unsigned char _binary_app_about_end[];
-		extern const unsigned char _binary_app_clock_start[];
-		extern const unsigned char _binary_app_clock_end[];
-		extern const unsigned char _binary_app_files_start[];
-		extern const unsigned char _binary_app_files_end[];
-		extern const unsigned char _binary_app_browser_start[];
-		extern const unsigned char _binary_app_browser_end[];
-		extern const unsigned char _binary_app_imgview_start[];
-		extern const unsigned char _binary_app_imgview_end[];
-		extern const unsigned char _binary_app_term_start[];
-		extern const unsigned char _binary_app_term_end[];
-		extern const unsigned char _binary_app_neofetch_start[];
-		extern const unsigned char _binary_app_neofetch_end[];
-		extern const unsigned char _binary_app_lspci_start[];
-		extern const unsigned char _binary_app_lspci_end[];
-		extern const unsigned char _binary_app_ping_start[];
-		extern const unsigned char _binary_app_ping_end[];
-		extern const unsigned char _binary_app_dig_start[];
-		extern const unsigned char _binary_app_dig_end[];
-		extern const unsigned char _binary_app_torrent_start[];
-		extern const unsigned char _binary_app_torrent_end[];
-		extern const unsigned char _binary_app_player_start[];
-		extern const unsigned char _binary_app_player_end[];
-		extern const unsigned char _binary_app_settings_start[];
-		extern const unsigned char _binary_app_settings_end[];
-		extern const unsigned char _binary_app_ssh_start[];
-		extern const unsigned char _binary_app_ssh_end[];
-		extern const unsigned char _binary_app_clipd_start[];
-		extern const unsigned char _binary_app_clipd_end[];
-		extern const unsigned char _binary_app_cliphist_start[];
-		extern const unsigned char _binary_app_cliphist_end[];
 		char probe;
 		/* A Unix-like layout: programs in /bin, a home for the user. mkdir is
 		 * a no-op if the directory already exists from a previous boot. */
@@ -407,97 +393,20 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		/* The shared UI font: gfx loads it at runtime so no app bakes in a
 		 * bitmap atlas. One on-disk copy, installed if a prior boot lacks it. */
 		fs_mkdir("/etc/fonts");
-		if (fs_read("/etc/fonts/LiberationSans-Regular.ttf", &probe, 0) < 0)
-			fs_create("/etc/fonts/LiberationSans-Regular.ttf",
-			          _binary_fonts_LiberationSans_Regular_ttf_start,
-			          (uint32_t)(_binary_fonts_LiberationSans_Regular_ttf_end -
-			                     _binary_fonts_LiberationSans_Regular_ttf_start));
-		if (fs_read("/etc/fonts/LiberationMono-Regular.ttf", &probe, 0) < 0)
-			fs_create("/etc/fonts/LiberationMono-Regular.ttf",
-			          _binary_fonts_LiberationMono_Regular_ttf_start,
-			          (uint32_t)(_binary_fonts_LiberationMono_Regular_ttf_end -
-			                     _binary_fonts_LiberationMono_Regular_ttf_start));
+		INSTALL_FILE("/etc/fonts/LiberationSans-Regular.ttf", _binary_fonts_LiberationSans_Regular_ttf);
+		INSTALL_FILE("/etc/fonts/LiberationMono-Regular.ttf", _binary_fonts_LiberationMono_Regular_ttf);
 		if (fs_read("/etc/passwd", &probe, 0) < 0)
 			fs_create("/etc/passwd", "root::0:0:/home/root\n", 21);
 		if (fs_read("/etc/group", &probe, 0) < 0)
 			fs_create("/etc/group", "root:0:\n", 8);
 		users_init();
-		if (fs_read("/bin/edit", &probe, 0) < 0)
-			fs_create("/bin/edit", _binary_app_edit_start,
-			          (uint32_t)(_binary_app_edit_end -
-			                     _binary_app_edit_start));
-		if (fs_read("/bin/curl", &probe, 0) < 0)
-			fs_create("/bin/curl", _binary_app_curl_start,
-			          (uint32_t)(_binary_app_curl_end -
-			                     _binary_app_curl_start));
-		if (fs_read("/bin/editor", &probe, 0) < 0)
-			fs_create("/bin/editor", _binary_app_editor_start,
-			          (uint32_t)(_binary_app_editor_end -
-			                     _binary_app_editor_start));
-		if (fs_read("/bin/about", &probe, 0) < 0)
-			fs_create("/bin/about", _binary_app_about_start,
-			          (uint32_t)(_binary_app_about_end -
-			                     _binary_app_about_start));
-		if (fs_read("/bin/clock", &probe, 0) < 0)
-			fs_create("/bin/clock", _binary_app_clock_start,
-			          (uint32_t)(_binary_app_clock_end -
-			                     _binary_app_clock_start));
-		if (fs_read("/bin/files", &probe, 0) < 0)
-			fs_create("/bin/files", _binary_app_files_start,
-			          (uint32_t)(_binary_app_files_end -
-			                     _binary_app_files_start));
-		if (fs_read("/bin/browser", &probe, 0) < 0)
-			fs_create("/bin/browser", _binary_app_browser_start,
-			          (uint32_t)(_binary_app_browser_end -
-			                     _binary_app_browser_start));
-		if (fs_read("/bin/imgview", &probe, 0) < 0)
-			fs_create("/bin/imgview", _binary_app_imgview_start,
-			          (uint32_t)(_binary_app_imgview_end -
-			                     _binary_app_imgview_start));
-		if (fs_read("/bin/term", &probe, 0) < 0)
-			fs_create("/bin/term", _binary_app_term_start,
-			          (uint32_t)(_binary_app_term_end -
-			                     _binary_app_term_start));
-		if (fs_read("/bin/neofetch", &probe, 0) < 0)
-			fs_create("/bin/neofetch", _binary_app_neofetch_start,
-			          (uint32_t)(_binary_app_neofetch_end -
-			                     _binary_app_neofetch_start));
-		if (fs_read("/bin/lspci", &probe, 0) < 0)
-			fs_create("/bin/lspci", _binary_app_lspci_start,
-			          (uint32_t)(_binary_app_lspci_end -
-			                     _binary_app_lspci_start));
-		if (fs_read("/bin/ping", &probe, 0) < 0)
-			fs_create("/bin/ping", _binary_app_ping_start,
-			          (uint32_t)(_binary_app_ping_end -
-			                     _binary_app_ping_start));
-		if (fs_read("/bin/dig", &probe, 0) < 0)
-			fs_create("/bin/dig", _binary_app_dig_start,
-			          (uint32_t)(_binary_app_dig_end -
-			                     _binary_app_dig_start));
-		if (fs_read("/bin/torrent", &probe, 0) < 0)
-			fs_create("/bin/torrent", _binary_app_torrent_start,
-			          (uint32_t)(_binary_app_torrent_end -
-			                     _binary_app_torrent_start));
-		if (fs_read("/bin/player", &probe, 0) < 0)
-			fs_create("/bin/player", _binary_app_player_start,
-			          (uint32_t)(_binary_app_player_end -
-			                     _binary_app_player_start));
-		if (fs_read("/bin/settings", &probe, 0) < 0)
-			fs_create("/bin/settings", _binary_app_settings_start,
-			          (uint32_t)(_binary_app_settings_end -
-			                     _binary_app_settings_start));
-		if (fs_read("/bin/ssh", &probe, 0) < 0)
-			fs_create("/bin/ssh", _binary_app_ssh_start,
-			          (uint32_t)(_binary_app_ssh_end -
-			                     _binary_app_ssh_start));
-		if (fs_read("/bin/clipd", &probe, 0) < 0)
-			fs_create("/bin/clipd", _binary_app_clipd_start,
-			          (uint32_t)(_binary_app_clipd_end -
-			                     _binary_app_clipd_start));
-		if (fs_read("/bin/cliphist", &probe, 0) < 0)
-			fs_create("/bin/cliphist", _binary_app_cliphist_start,
-			          (uint32_t)(_binary_app_cliphist_end -
-			                     _binary_app_cliphist_start));
+		INSTALL_APP(edit);     INSTALL_APP(curl);     INSTALL_APP(editor);
+		INSTALL_APP(about);    INSTALL_APP(clock);    INSTALL_APP(files);
+		INSTALL_APP(browser);  INSTALL_APP(imgview);  INSTALL_APP(term);
+		INSTALL_APP(neofetch); INSTALL_APP(lspci);    INSTALL_APP(ping);
+		INSTALL_APP(dig);      INSTALL_APP(torrent);  INSTALL_APP(player);
+		INSTALL_APP(settings); INSTALL_APP(ssh);      INSTALL_APP(clipd);
+		INSTALL_APP(cliphist);
 	}
 	con_write("usermode: ready ('run curl <url>').\n");
 
@@ -522,6 +431,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	bootmark("sti");
 	__asm__ volatile ("sti");      /* interrupts on; preemption begins        */
 
+	smp_start_aps();               /* wake the other cores (they park for now) */
+
 	/* DHCP + xHCI + /media mount are slow on real hardware (timer_sleep-based
 	 * retries/resets). Run them in a background thread so the shell input loop
 	 * below starts draining keystrokes immediately instead of letting them pile
@@ -538,13 +449,13 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			 * Konsole-style Ctrl+C); only the bare text/serial recovery console
 			 * falls through to the kernel shell. */
 			if (wm_focus_takes_keys())
-				wm_feed_key(KEY_INTR);      /* focused app handles it */
+				wm_feed_key(KEY_INTR, 0);   /* focused app handles it */
 			else
 				shell_interrupt();          /* serial recovery console      */
 		}
-		char c;
-		while (keyboard_poll(&c))          /* PS/2 keyboard (the QEMU window)  */
-			if (!wm_feed_key(c))           /* focused GUI app first, else shell */
+		char c; unsigned char mods;
+		while (keyboard_poll(&c, &mods))   /* PS/2 keyboard (the QEMU window)  */
+			if (!wm_feed_key(c, mods))     /* focused GUI app first, else shell */
 				shell_feed(c);
 		while (serial_poll(&c))            /* host terminal (-serial stdio)    */
 			shell_feed(c);                 /* the debug console always drives shell */

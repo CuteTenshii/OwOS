@@ -217,3 +217,9 @@ void idt_init(void)
 
 	__asm__ volatile ("lidt %0" : : "m"(idt_ptr));
 }
+
+/* Load the (already-built, shared) IDT on the calling CPU — for an AP. */
+void idt_load(void)
+{
+	__asm__ volatile ("lidt %0" : : "m"(idt_ptr));
+}

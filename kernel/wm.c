@@ -1190,7 +1190,7 @@ void wm_set_cursor(struct window *w, int cursor)
 		w->cursor = cursor;
 }
 
-int wm_feed_key(char c)
+int wm_feed_key(char c, unsigned mods)
 {
 	/* The Super/Windows key toggles the Start menu, whatever holds focus. */
 	if (c == KEY_SUPER) {
@@ -1198,10 +1198,10 @@ int wm_feed_key(char c)
 		return 1;
 	}
 
-	/* Alt+Tab window switcher. The first Tab of a hold opens the overlay and
-	 * lands on the previous window (index 1); each further Tab steps forward,
-	 * Shift+Tab steps back. The z-order is untouched until Alt is released. */
-	if (c == KEY_ALTTAB || c == KEY_ALTTAB_PREV) {
+	/* Alt+Tab switcher: first Tab opens the overlay on the previous window
+	 * (index 1), further Tabs step forward, Shift+Tab back. Z-order is untouched
+	 * until Alt is released (KEY_ALT_UP). */
+	if (c == KEY_TAB && (mods & KMOD_ALT)) {
 		if (!at_active) {
 			at_count = alttab_build();
 			if (at_count <= 1) {     /* nothing to switch to */
@@ -1211,10 +1211,10 @@ int wm_feed_key(char c)
 			at_active = 1;
 			at_sel = 0;
 		}
-		if (c == KEY_ALTTAB)
-			at_sel = (at_sel + 1) % at_count;
-		else
+		if (mods & KMOD_SHIFT)
 			at_sel = (at_sel - 1 + at_count) % at_count;
+		else
+			at_sel = (at_sel + 1) % at_count;
 		return 1;
 	}
 	if (c == KEY_ALT_UP) {           /* Alt released: commit the selection */
@@ -1238,7 +1238,7 @@ int wm_feed_key(char c)
 		return 0;
 	struct window *w = wins[t];
 	if (w->key) {
-		w->key(w, c);
+		w->key(w, c, mods);
 		return 1;
 	}
 	return 0;            /* focused window doesn't take keys (e.g. the terminal) */

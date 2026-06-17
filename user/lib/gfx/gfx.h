@@ -33,6 +33,13 @@ int  gfx_ui_width(const char *s);  /* UTF-8 string pixel width                  
 int  gfx_ui_cw(unsigned char c);   /* one byte/ASCII glyph's pen advance          */
 int  gfx_ui_cw_cp(unsigned cp);    /* one Unicode codepoint's pen advance         */
 
+/* Sized UI text — the sans face at an arbitrary px, uncached (for headings). y is
+ * the line top; the baseline is derived from the px ascent. */
+void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px);
+int  gfx_ui_width_px(const char *s, int px);
+int  gfx_ui_cw_cp_px(unsigned cp, int px);
+int  gfx_ui_ascent_px(int px);
+
 /* --------------------------------------------------------------- GUI widgets */
 /*
  * Reusable pieces every windowed app tends to want, so they aren't reinvented

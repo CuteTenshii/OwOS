@@ -422,11 +422,11 @@ static void wait_reap(int pid)
 		 * the child spawned), pump input to it; otherwise leave keystrokes in
 		 * the ring for a console program's own read()/readline. */
 		if (wm_focus_takes_keys()) {
-			char c;
-			while (keyboard_poll(&c))
-				wm_feed_key(c);
+			char c; unsigned char mods;
+			while (keyboard_poll(&c, &mods))
+				wm_feed_key(c, mods);
 			while (serial_poll(&c))
-				wm_feed_key(c);
+				wm_feed_key(c, 0);          /* serial carries no modifier state */
 		}
 		__asm__ volatile ("sti; hlt");
 	}

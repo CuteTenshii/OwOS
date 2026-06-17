@@ -14,6 +14,11 @@ CDISK    := cd.iso
 # is present. (`-device e1000e`/82574L is PCIe and may need `-machine q35`.)
 NIC ?= rtl8139
 
+# How many CPU cores QEMU exposes to the guest. The kernel discovers them via the
+# ACPI MADT; override with e.g. `make run SMP=8`. Set SMP=1 for the old uniprocessor
+# behaviour.
+SMP ?= 4
+
 # A 64 MiB raw disk image for the filesystem; persists across reboots. owofs
 # sizes itself to the disk's capacity (capped at 64 MiB in fs.c).
 $(DISK):
@@ -92,7 +97,7 @@ STORAGE := -hda $(DISK) \
 	-cdrom $(CDISK)
 
 run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
-	qemu-system-i386 -kernel $(KERNEL) $(STORAGE) -serial stdio \
+	qemu-system-i386 -kernel $(KERNEL) -smp $(SMP) $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22 -device $(NIC),netdev=net0 \
 		-audiodev pipewire,id=snd0 -machine pcspk-audiodev=snd0 \
 		-device sb16,audiodev=snd0 \
@@ -101,7 +106,7 @@ run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 
 # Headless: no window, console comes out on the terminal via COM1.
 debug: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
-	qemu-system-i386 -kernel $(KERNEL) -display none $(STORAGE) -serial stdio \
+	qemu-system-i386 -kernel $(KERNEL) -smp $(SMP) -display none $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22 -device $(NIC),netdev=net0 \
 		-usb -device usb-tablet
 

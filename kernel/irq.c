@@ -5,6 +5,7 @@
 #include "idt.h"
 #include "gdt.h"
 #include "io.h"
+#include "smp.h"
 
 /* 8259 PIC ports. Two chips: a master and a slave cascaded onto IRQ2. */
 #define PIC1_CMD   0x20
@@ -66,6 +67,13 @@ void irq_unmask(uint8_t irq)
 /* Called from irq_common_stub for every hardware interrupt. */
 void irq_handler(struct registers *r)
 {
+	/* The Local APIC timer (AP scheduler tick) shares this dispatch but acks the
+	 * LAPIC, not the PIC. */
+	if (r->int_no == LAPIC_TIMER_VEC) {
+		smp_lapic_tick(r);
+		return;
+	}
+
 	uint8_t irq = r->int_no - IRQ_BASE;
 
 	/* Acknowledge the PIC *before* running the handler. A preemptive

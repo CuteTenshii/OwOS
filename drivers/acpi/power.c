@@ -241,11 +241,10 @@ static int parse_sleep(struct fadt *f, const char *name,
 	return 1;
 }
 
-/* Locate and identity-map the FADT (its ACPI signature is "FACP"). Returns 0 if
- * ACPI isn't present. Walks whichever root table the RSDP names (XSDT or RSDT).
- * Maps the *whole* FADT, not just the prefix, so fadt_dsdt_phys() can read the
- * 64-bit X_DSDT at offset 140. Shared by the shutdown path and acpi_aml_contains. */
-static struct fadt *find_fadt(void)
+/* Locate and identity-map a primary ACPI table by signature, mapping the *whole*
+ * table (not just the prefix). Walks whichever root table the RSDP names (XSDT or
+ * RSDT). Returns the mapped header, or 0 if ACPI is absent or no such table. */
+void *acpi_find_table(const char *sig)
 {
 	struct sdt_header *root;
 	uint32_t count;
@@ -258,13 +257,20 @@ static struct fadt *find_fadt(void)
 		if (paging_identity_map(phys, sizeof(struct sdt_header)) != 0)
 			continue;
 		struct sdt_header *h = (struct sdt_header *)phys;
-		if (sig4(h->signature, "FACP")) {
+		if (sig4(h->signature, sig)) {
 			if (paging_identity_map(phys, h->length) != 0)
 				return 0;
-			return (struct fadt *)h;
+			return h;
 		}
 	}
 	return 0;
+}
+
+/* The FADT ("FACP"): the whole table is mapped so fadt_dsdt_phys() can read the
+ * 64-bit X_DSDT at offset 140. Shared by the shutdown path and acpi_aml_contains. */
+static struct fadt *find_fadt(void)
+{
+	return (struct fadt *)acpi_find_table("FACP");
 }
 
 /* Map one already-located SDT (whose signature is sig) and scan its AML body for

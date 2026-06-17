@@ -171,11 +171,11 @@ static void uw_rclick(struct window *w, int mx, int my)
 	evq_push(u, WEV_RCLICK, cx, cy);
 }
 
-static void uw_key(struct window *w, char c)
+static void uw_key(struct window *w, char c, unsigned mods)
 {
 	struct uwin *u = w->state;
 	if (u)
-		evq_push(u, WEV_KEY, (unsigned char)c, 0);
+		evq_push(u, WEV_KEY, (unsigned char)c, (int)mods);   /* b = KMOD_* flags */
 }
 
 /* Free slots in this window's input event ring. Used for paste flow control: a

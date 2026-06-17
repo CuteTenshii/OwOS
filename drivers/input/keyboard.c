@@ -7,7 +7,6 @@
 #include "io.h"
 #include "screenshot.h"
 #include "serial.h"
-#include "console.h"
 #include "sb16.h"
 #include "hda.h"
 #include "fb.h"
@@ -205,6 +204,7 @@ static void keyboard_set_leds(void)
  * only written by the handler, tail only by keyboard_poll(), so byte-sized
  * indices need no locking on a single core. */
 static volatile char ring[KBD_BUF_SIZE];
+static volatile uint8_t ringmod[KBD_BUF_SIZE];   /* KMOD_* held when ring[i] was pressed */
 static volatile uint8_t ring_head;
 static volatile uint8_t ring_tail;
 
@@ -258,16 +258,30 @@ static void keyboard_paste_clipboard(void)
 	paste_len = out;                   /* publish last                            */
 }
 
+/* The modifier set currently held, as KMOD_* flags. Sampled when a key is queued
+ * so the consumer learns which chord produced it. */
+static uint8_t cur_mods(void)
+{
+	uint8_t m = 0;
+	if (shift_held) m |= KMOD_SHIFT;
+	if (ctrl_held)  m |= KMOD_CTRL;
+	if (alt_held)   m |= KMOD_ALT;
+	if (super_held) m |= KMOD_SUPER;
+	if (altgr_held) m |= KMOD_ALTGR;
+	return m;
+}
+
 static void ring_push(char c)
 {
 	uint8_t next = (ring_head + 1) % KBD_BUF_SIZE;
 	if (next != ring_tail) {       /* drop the key if the buffer is full      */
 		ring[ring_head] = c;
+		ringmod[ring_head] = cur_mods();
 		ring_head = next;
 	}
 }
 
-int keyboard_poll(char *out)
+int keyboard_poll(char *out, unsigned char *mods)
 {
 	/* Service a Ctrl+V request here, off the IRQ that raised it: arming the
 	 * paste means reading clipd over a blocking channel, impossible from the
@@ -285,11 +299,13 @@ int keyboard_poll(char *out)
 	 * gets scheduled to drain — then the rest flows on a later poll. */
 	if (paste_pos < paste_len && wm_focus_key_space() > 1) {
 		*out = paste_buf[paste_pos++];
+		if (mods) *mods = 0;                  /* injected paste carries no chord */
 		return 1;
 	}
 	if (ring_head == ring_tail)
 		return 0;
 	*out = ring[ring_tail];
+	if (mods) *mods = ringmod[ring_tail];
 	ring_tail = (ring_tail + 1) % KBD_BUF_SIZE;
 	return 1;
 }
@@ -311,106 +327,93 @@ void keyboard_signal_interrupt(void)
 	int_pending = 1;
 }
 
-static void keyboard_handler(struct registers *r)
+/* The byte after a 0xE0 prefix; unmapped extended keys are swallowed. */
+static void process_extended(uint8_t sc)
 {
-	(void)r;
-	uint8_t sc = inb(KBD_DATA_PORT);
-
-	/* TEMP diagnostic: print every raw scancode byte on its own line, to learn
-	 * whether Fn+F-key emits a code distinct from the bare F-key. E0 prefix
-	 * shows as 0xE0; a release is make|0x80. Remove once captured. */
-	con_write("\nsc="); con_write_hex(sc);
-
-	/* Extended keys (keypad Enter/'/', arrows, right Ctrl/AltGr, etc.) arrive
-	 * as 0xE0 then a second byte. The arrow/navigation cluster is translated
-	 * to the KEY_* editing codes; unmapped extended keys are still swallowed. */
-	if (sc == SC_EXTENDED) {
-		expecting_extended = 1;
+	if (sc == SC_ALT) {        /* AltGr down                             */
+		altgr_held = 1;
 		return;
 	}
-	if (expecting_extended) {
-		expecting_extended = 0;
-		if (sc == SC_ALT) {        /* AltGr down                             */
-			altgr_held = 1;
-			return;
-		}
-		if (sc == (SC_ALT | SC_RELEASE)) {   /* AltGr up                     */
-			altgr_held = 0;
-			return;
-		}
-		if (sc == SC_CTRL) {       /* right Ctrl down                        */
-			ctrl_held = 1;
-			return;
-		}
-		if (sc == (SC_CTRL | SC_RELEASE)) {  /* right Ctrl up                */
-			ctrl_held = 0;
-			return;
-		}
-		if (sc == 0x37) {          /* Print Screen make (E0 2A E0 37)        */
-			screenshot_request();
-			return;
-		}
-		if (sc == 0x5B || sc == 0x5C) {        /* GUI/Win key down            */
-			super_held = 1; super_chorded = 0;
-			return;            /* the Start-menu toggle waits for release  */
-		}
-		if (sc == (0x5B | SC_RELEASE) || sc == (0x5C | SC_RELEASE)) {   /* Win up */
-			if (!super_chorded)            /* a bare tap -> toggle Start menu */
-				ring_push(KEY_SUPER);
-			super_held = 0; super_chorded = 0;
-			return;
-		}
-		if (sc & SC_RELEASE)       /* other extended release: ignore         */
-			return;
-		switch (sc) {
-		case 0x1C:           ring_push('\n');       break;  /* keypad Enter  */
-		case 0x35:           ring_push('/');        break;  /* keypad /      */
-		/* Media / Fn keys: act on the device directly, like Print Screen. */
-		/* Volume keys drive HDA when it owns output, else the SB16 mixer. */
-		case SC_E_MUTE:
-			if (hda_present()) hda_volume_mute(); else sb16_volume_mute();
-			break;
-		case SC_E_VOL_DOWN:
-			if (hda_present()) hda_volume_step(-1); else sb16_volume_step(-1);
-			break;
-		case SC_E_VOL_UP:
-			if (hda_present()) hda_volume_step(+1); else sb16_volume_step(+1);
-			break;
-		case SC_E_BRIGHT_DN: fb_brightness_step(-1); break;
-		case SC_E_BRIGHT_UP: fb_brightness_step(+1); break;
-		/* Shift held turns the navigation cluster into selection-extend codes
-		 * (KEY_S*) so a windowed editor can grow a selection; bare arrows stay
-		 * the plain editing codes the shell line editor and apps already use. */
-		case SC_E_UP:        ring_push(shift_held ? KEY_SUP    : KEY_UP);    break;
-		case SC_E_DOWN:      ring_push(shift_held ? KEY_SDOWN  : KEY_DOWN);  break;
-		case SC_E_LEFT:      ring_push(shift_held ? KEY_SLEFT  : KEY_LEFT);  break;
-		case SC_E_RIGHT:     ring_push(shift_held ? KEY_SRIGHT : KEY_RIGHT); break;
-		case SC_E_HOME:      ring_push(shift_held ? KEY_SHOME  : KEY_HOME);  break;
-		case SC_E_END:       ring_push(shift_held ? KEY_SEND   : KEY_END);   break;
-		case SC_E_DELETE:    ring_push(KEY_DELETE); break;
-		}
+	if (sc == (SC_ALT | SC_RELEASE)) {   /* AltGr up                     */
+		altgr_held = 0;
 		return;
 	}
-
-	if (sc == SC_LSHIFT || sc == SC_RSHIFT) {
-		shift_held = 1;
-		return;
-	}
-	if (sc == (SC_LSHIFT | SC_RELEASE) || sc == (SC_RSHIFT | SC_RELEASE)) {
-		shift_held = 0;
-		return;
-	}
-	if (sc == SC_CTRL) {           /* left Ctrl down                          */
+	if (sc == SC_CTRL) {       /* right Ctrl down                        */
 		ctrl_held = 1;
 		return;
 	}
-	if (sc == (SC_CTRL | SC_RELEASE)) {  /* left Ctrl up                      */
+	if (sc == (SC_CTRL | SC_RELEASE)) {  /* right Ctrl up                */
 		ctrl_held = 0;
 		return;
 	}
+	if (sc == 0x37) {          /* Print Screen make (E0 2A E0 37)        */
+		screenshot_request();
+		return;
+	}
+	if (sc == 0x5B || sc == 0x5C) {        /* GUI/Win key down            */
+		super_held = 1; super_chorded = 0;
+		return;            /* the Start-menu toggle waits for release  */
+	}
+	if (sc == (0x5B | SC_RELEASE) || sc == (0x5C | SC_RELEASE)) {   /* Win up */
+		if (!super_chorded)            /* a bare tap -> toggle Start menu */
+			ring_push(KEY_SUPER);
+		super_held = 0; super_chorded = 0;
+		return;
+	}
+	if (sc & SC_RELEASE)       /* other extended release: ignore         */
+		return;
+	switch (sc) {
+	case 0x1C:           ring_push('\n');       break;  /* keypad Enter  */
+	case 0x35:           ring_push('/');        break;  /* keypad /      */
+	/* Media / Fn keys: act on the device directly, like Print Screen. */
+	/* Volume keys drive HDA when it owns output, else the SB16 mixer. */
+	case SC_E_MUTE:
+		if (hda_present()) hda_volume_mute(); else sb16_volume_mute();
+		break;
+	case SC_E_VOL_DOWN:
+		if (hda_present()) hda_volume_step(-1); else sb16_volume_step(-1);
+		break;
+	case SC_E_VOL_UP:
+		if (hda_present()) hda_volume_step(+1); else sb16_volume_step(+1);
+		break;
+	case SC_E_BRIGHT_DN: fb_brightness_step(-1); break;
+	case SC_E_BRIGHT_UP: fb_brightness_step(+1); break;
+	/* The navigation cluster emits the plain editing code; Shift and Alt ride
+	 * along in the modifier set (cur_mods), so a consumer extends a selection
+	 * on Shift+arrow or navigates on Alt+arrow itself. A bare Alt hold + arrow
+	 * doesn't set alt_tabbed, so releasing Alt afterwards emits no KEY_ALT_UP. */
+	case SC_E_UP:        ring_push(KEY_UP);    break;
+	case SC_E_DOWN:      ring_push(KEY_DOWN);  break;
+	case SC_E_LEFT:      ring_push(KEY_LEFT);  break;
+	case SC_E_RIGHT:     ring_push(KEY_RIGHT); break;
+	case SC_E_HOME:      ring_push(KEY_HOME);  break;
+	case SC_E_END:       ring_push(KEY_END);   break;
+	case SC_E_DELETE:    ring_push(KEY_DELETE); break;
+	}
+}
+
+/* Shift/Ctrl/Alt holds, Num/Caps lock, and the Alt+Tab gesture. 1 if consumed. */
+static int process_modifiers(uint8_t sc)
+{
+	if (sc == SC_LSHIFT || sc == SC_RSHIFT) {
+		shift_held = 1;
+		return 1;
+	}
+	if (sc == (SC_LSHIFT | SC_RELEASE) || sc == (SC_RSHIFT | SC_RELEASE)) {
+		shift_held = 0;
+		return 1;
+	}
+	if (sc == SC_CTRL) {           /* left Ctrl down                          */
+		ctrl_held = 1;
+		return 1;
+	}
+	if (sc == (SC_CTRL | SC_RELEASE)) {  /* left Ctrl up                      */
+		ctrl_held = 0;
+		return 1;
+	}
 	if (sc == SC_ALT) {            /* left Alt down (Alt+Tab modifier)        */
 		alt_held = 1;
-		return;
+		return 1;
 	}
 	if (sc == (SC_ALT | SC_RELEASE)) {   /* left Alt up                       */
 		/* Releasing Alt after an Alt+Tab gesture commits the WM's highlighted
@@ -419,86 +422,84 @@ static void keyboard_handler(struct registers *r)
 			ring_push(KEY_ALT_UP);
 		alt_held = 0;
 		alt_tabbed = 0;
-		return;
+		return 1;
 	}
-	/* Alt+Tab / Alt+Shift+Tab: drive the window switcher instead of typing a
-	 * tab. Tab is scancode 0x0F; this matches only its make code, so the release
-	 * (0x8F) still falls through to the generic release filter below. */
+	/* Alt+Tab: emit a plain Tab carrying the Alt (and any Shift) modifier and let
+	 * the WM decide it's a window switch — window-switching policy lives in the WM,
+	 * not here. alt_tabbed records that this Alt hold drove the switcher, so its
+	 * release commits the selection (KEY_ALT_UP). Tab is scancode 0x0F; matching
+	 * only the make code lets the release fall through to the generic filter. */
 	if (alt_held && sc == 0x0F) {  /* Tab make                                */
-		ring_push(shift_held ? KEY_ALTTAB_PREV : KEY_ALTTAB);
+		ring_push(KEY_TAB);
 		alt_tabbed = 1;
-		return;
+		return 1;
 	}
 	if (sc == SC_NUMLOCK) {        /* toggle Num Lock and update its LED      */
 		num_lock = !num_lock;
 		keyboard_set_leds();
-		return;
+		return 1;
 	}
 	if (sc == SC_CAPSLOCK) {       /* toggle Caps Lock and update its LED     */
 		caps_lock = !caps_lock;
 		keyboard_set_leds();
-		return;
+		return 1;
 	}
-	if (sc & SC_RELEASE)           /* any other key release: ignore          */
-		return;
+	return 0;
+}
 
-	/* Function-row media keys (bare F-key codes on this keyboard, see SC_F*).
-	 * Act on the device directly, like the E0 media keys: volume drives HDA when
-	 * it owns output, else the SB16 mixer; brightness drives the fb dimmer. */
+/* Bare F-key media codes (see SC_F*); act on the device. 1 if consumed. */
+static int process_media_fkey(uint8_t sc)
+{
 	switch (sc) {
-	case SC_F5: fb_brightness_step(-1); return;     /* brightness down          */
-	case SC_F6: fb_brightness_step(+1); return;     /* brightness up            */
+	case SC_F5: fb_brightness_step(-1); return 1;   /* brightness down          */
+	case SC_F6: fb_brightness_step(+1); return 1;   /* brightness up            */
 	case SC_F8:                                     /* volume down              */
 		if (hda_present()) hda_volume_step(-1); else sb16_volume_step(-1);
-		return;
+		return 1;
 	case SC_F9:                                     /* volume up                */
 		if (hda_present()) hda_volume_step(+1); else sb16_volume_step(+1);
-		return;
+		return 1;
 	}
+	return 0;
+}
 
-	/* Numeric keypad: types digits when Num Lock is on; otherwise the keys
-	 * are navigation (Home/arrows/etc.), which we don't handle. */
+/* Keypad digits, when Num Lock is on. 1 if sc was a keypad key. */
+static int process_keypad(uint8_t sc)
+{
 	if (sc >= SC_KP_FIRST && sc <= SC_KP_LAST) {
 		if (num_lock)
 			ring_push(keypad[sc - SC_KP_FIRST]);
-		return;
+		return 1;
 	}
+	return 0;
+}
 
-	/* Super+V opens the clipboard-history viewer (cliphist). Swallow the key so
-	 * 'v' doesn't leak, and mark the hold as chorded so releasing Super won't
-	 * also toggle the Start menu. The WM launches the app off this request. */
+/* Super+V (cliphist) and Ctrl chords. 1 if consumed. */
+static int process_chords(uint8_t sc)
+{
 	if (super_held && active_map[sc] == 'v') {
 		wm_request_cliphist();
 		super_chorded = 1;
-		return;
+		return 1;
 	}
-
-	/* Ctrl chords: a few line-editing shortcuts. Any other Ctrl+key is
-	 * swallowed so it can't leak the bare letter (e.g. Ctrl+V must not type
-	 * 'v'). Ctrl+V injects the clipboard, read from clipd off-IRQ, as keys. */
 	if (ctrl_held) {
-		switch (active_map[sc]) {       /* the unshifted key, layout-aware    */
-		case 'c': int_pending = 1;       break;  /* interrupt (latched)       */
-		case 'v': paste_request = 1;     break;  /* paste: serviced off-IRQ   */
-		case 'l': ring_push(KEY_CLEAR);  break;
-		case 'u': ring_push(KEY_KILL);   break;
-		case 'a': ring_push(KEY_SELALL); break;  /* editor: select all; shell  */
-		                                         /* maps KEY_SELALL to Home    */
-		case 'e': ring_push(KEY_END);    break;
-		case 'x': ring_push(KEY_CUT);    break;  /* editor: cut the selection  */
-		case 'n': ring_push(KEY_NEW);    break;  /* menu accelerators: the   */
-		case 'o': ring_push(KEY_OPEN);   break;  /* focused window's key cb  */
-		case 's': ring_push(KEY_SAVE);   break;  /* maps these to menu items */
-		}
-		return;
+		char m = active_map[sc];                 /* the unshifted key, layout-aware */
+		if      (m == 'c') int_pending = 1;      /* interrupt (latched)             */
+		else if (m == 'v') paste_request = 1;    /* paste: serviced off-IRQ         */
+		else if (m)        ring_push(m);         /* letter + KMOD_CTRL via cur_mods */
+		return 1;
 	}
+	return 0;
+}
 
+/* Make code -> char via the active layout; AltGr = third level, Caps Lock
+ * inverts Shift for letters. */
+static void emit_char(uint8_t sc)
+{
 	char c = 0;
 	if (altgr_held && active_altgr)        /* third level: AltGr punctuation  */
 		c = active_altgr[sc];
 	if (!c) {
-		/* Caps Lock affects letters only, and inverts the Shift state for
-		 * them; digits/punctuation still follow Shift alone. */
 		int shift = shift_held;
 		char base = active_map[sc];
 		if (caps_lock && base >= 'a' && base <= 'z')
@@ -507,6 +508,36 @@ static void keyboard_handler(struct registers *r)
 	}
 	if (c)
 		ring_push(c);
+}
+
+static void keyboard_handler(struct registers *r)
+{
+	(void)r;
+	uint8_t sc = inb(KBD_DATA_PORT);
+
+	/* Extended keys arrive as 0xE0 then a second byte. */
+	if (sc == SC_EXTENDED) {
+		expecting_extended = 1;
+		return;
+	}
+	if (expecting_extended) {
+		expecting_extended = 0;
+		process_extended(sc);
+		return;
+	}
+
+	if (process_modifiers(sc))
+		return;
+	if (sc & SC_RELEASE)           /* any other key release: ignore          */
+		return;
+	if (process_media_fkey(sc))
+		return;
+	if (process_keypad(sc))
+		return;
+	if (process_chords(sc))
+		return;
+
+	emit_char(sc);
 }
 
 /* Compare an argument (terminated by NUL or a space) against a layout name. */

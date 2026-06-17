@@ -66,11 +66,15 @@ int ensure_text(int need)
 	blk_lock();
 	char          *t = realloc(B->text, (unsigned)nc);
 	unsigned char *a = realloc(B->attr, (unsigned)nc);
+	unsigned char *p = realloc(B->bp,  (unsigned)nc);
+	unsigned char *g = realloc(B->bgi, (unsigned)nc);
 	if (t) B->text = t;
 	if (a) B->attr = a;
-	if (t && a) B->text_cap = nc;
+	if (p) B->bp  = p;
+	if (g) B->bgi = g;
+	if (t && a && p && g) B->text_cap = nc;
 	blk_unlock();
-	return t && a;
+	return t && a && p && g;
 }
 
 int ensure_links(int need)
@@ -149,6 +153,7 @@ static struct menubar menubar = { bar_menus, 2, 2, 0 };
  * on a cached page is available memory. The strip is the gfx tabbar widget;
  * this owns the list. */
 #define MAX_TABS 8
+#define HIST_MAX 32      /* per-tab back/forward history depth */
 struct tab {
 	char url[URL_MAX];
 	char label[40];
@@ -168,6 +173,13 @@ struct tab {
 	 * tab is inactive — small enough to keep inline rather than in the blob. */
 	unsigned favicon[FAVICON_W * FAVICON_H];
 	int      favicon_ok;
+
+	/* Per-tab navigation history: URLs landed on, with hist_i the current entry.
+	 * Back/Next move hist_i and re-navigate; a fresh navigation truncates any
+	 * forward entries. Entries are malloc'd; the oldest is dropped when full. */
+	char    *hist[HIST_MAX];
+	int      hist_n;             /* number of entries in use                    */
+	int      hist_i;             /* index of the current page (0..hist_n-1)     */
 };
 static struct tab tabs[MAX_TABS];
 static int n_tabs = 1;
@@ -188,6 +200,44 @@ static void tab_drop(struct tab *t)
 	if (t->blob) { free(t->blob); t->blob = 0; }
 	t->cached = 0; t->blob_len = 0;
 }
+
+/* Set while a fetch was started by Back/Next so its completion doesn't push a new
+ * history entry (we're moving within the existing list, not extending it). */
+static int nav_from_history;
+
+/* Free a tab's whole history (on close). */
+static void hist_clear(struct tab *t)
+{
+	for (int i = 0; i < t->hist_n; i++) { free(t->hist[i]); t->hist[i] = 0; }
+	t->hist_n = 0; t->hist_i = 0;
+}
+
+/* Record `url` as the tab's current page. A reload of the same page is ignored;
+ * any forward entries are dropped; the oldest is evicted when the list is full. */
+static void hist_push(struct tab *t, const char *url)
+{
+	if (!url || !url[0]) return;
+	if (t->hist_n > 0 && streq(t->hist[t->hist_i], url)) return;   /* same page */
+
+	for (int i = t->hist_i + 1; i < t->hist_n; i++) { free(t->hist[i]); t->hist[i] = 0; }
+	t->hist_n = t->hist_i + 1;
+
+	int n = (int)strlen(url) + 1;
+	char *dup = malloc(n);
+	if (!dup) return;                                  /* OOM: just don't record */
+	memcpy(dup, url, n);
+
+	if (t->hist_n >= HIST_MAX) {                        /* full: drop the oldest */
+		free(t->hist[0]);
+		for (int i = 1; i < t->hist_n; i++) t->hist[i - 1] = t->hist[i];
+		t->hist_n--;
+	}
+	t->hist[t->hist_n++] = dup;
+	t->hist_i = t->hist_n - 1;
+}
+
+static int hist_can_back(const struct tab *t) { return t->hist_i > 0; }
+static int hist_can_fwd(const struct tab *t)  { return t->hist_i < t->hist_n - 1; }
 
 /* Snapshot the active tab's current page into its own heap blob (no-op while a
  * fetch is in flight or the page is blank — those just re-fetch on return). */
@@ -345,16 +395,47 @@ static struct gcache *gcache_get(unsigned cp)
 	return g;
 }
 
+/* Heading pixel sizes (BP_SIZE 1..6 = h1..h6); 0 = ordinary body text, 7 = a
+ * horizontal rule. Kept within LINE_H (18) so a taller heading still fits one
+ * row — headings also come bold (stamped in html.c), which carries the weight. */
+static const int g_size_px[8] = { 0, 18, 17, 16, 15, 14, 13, 0 };
+
+/* Block context for the paragraph currently being measured/drawn, decoded from a
+ * glyph's BP_* byte by set_block(): a heading px (0 = default UI font), monospace
+ * (<pre>), centring, and an indent level (blockquote/list nesting). */
+static int cur_bpx;                   /* heading px, 0 = default body font   */
+static int cur_bmono;                 /* <pre>: render in the monospace cell */
+static int cur_bcenter;               /* text-align:center / <center>        */
+static int cur_bindent;               /* indent level 0..7                   */
+static int cur_bhr;                   /* this line is a horizontal rule      */
+
+/* Indent width in pixels for one nesting level. */
+#define INDENT_PX 24
+
+static void set_block(int off)
+{
+	unsigned char bp = (off >= 0 && off < B->text_len) ? B->bp[off] : 0;
+	int size = bp & BP_SIZE;
+	cur_bhr     = (size == 7);
+	cur_bpx     = (size >= 1 && size <= 6) ? g_size_px[size] : 0;
+	cur_bmono   = (bp & BP_MONO) ? 1 : 0;
+	cur_bcenter = (bp & BP_CENTER) ? 1 : 0;
+	cur_bindent = (bp & BP_INDENT) >> BP_INDENT_SH;
+}
+
 /* Pen advance of one codepoint in the active body font (baked UI font when no
  * custom face: ASCII/Latin-1 by value, a '?'-width box for anything above it). */
 /* Raw, non-HTML content (text/plain, source, etc.) renders in the fixed-width
- * monospace cell font, not the proportional UI font — only HTML gets the latter. */
-static int body_mono(void) { return B->mode == MODE_TEXT; }
+ * monospace cell font, not the proportional UI font — only HTML gets the latter.
+ * A <pre> block (cur_bmono) is monospace too, even inside an HTML page. */
+static int body_mono(void) { return B->mode == MODE_TEXT || cur_bmono; }
 
 static int body_cp_adv(unsigned cp)
 {
 	if (body_mono()) return GLYPH_W;              /* monospace cell             */
-	if (!B->body_font) return gfx_ui_cw_cp(cp);   /* the gfx system-ui font     */
+	if (!B->body_font) {                          /* the gfx system-ui font     */
+		return cur_bpx ? gfx_ui_cw_cp_px(cp, cur_bpx) : gfx_ui_cw_cp(cp);
+	}
 	gcache_sync();
 	return gcache_get(cp)->adv;
 }
@@ -426,7 +507,9 @@ static int body_draw(int x, int y, const char *s, unsigned fg, int ct, int cb)
 		return x;
 	}
 	/* No @font-face: delegate the whole UTF-8 run to the gfx system-ui font,
-	 * which decodes UTF-8 and renders accents/Greek/Cyrillic from its cmap. */
+	 * which decodes UTF-8 and renders accents/Greek/Cyrillic from its cmap. A
+	 * heading paragraph (cur_bpx) draws the run at that pixel size instead. */
+	if (cur_bpx) { gfx_ui_text_px(x, y, s, fg, cur_bpx); return x + gfx_ui_width_px(s, cur_bpx); }
 	gfx_ui_text(x, y, s, fg);
 	return x + gfx_ui_width(s);
 }
@@ -495,6 +578,11 @@ static void rewrap(int paw)
 	while (i < B->text_len) {
 		int j = i;
 		while (j < B->text_len && B->text[j] != '\n') j++;
+		/* Block context of this paragraph governs font size/monospace and how
+		 * much of the pane width its indent leaves for text. */
+		set_block(i);
+		int avail = paw - cur_bindent * INDENT_PX;
+		if (avail < 8) avail = 8;
 		if (j == i) {
 			int img = -1;
 			for (int q = 0; q < B->n_imgs; q++)
@@ -518,7 +606,7 @@ static void rewrap(int paw)
 					unsigned cp;
 					int nb = utf8_decode(&B->text[e], &B->text[j], &cp);
 					int cw = body_cp_adv(cp);
-					if (w + cw > paw && e > ls) break;
+					if (w + cw > avail && e > ls) break;
 					if (cp == ' ') lastsp = e;
 					w += cw; e += nb;
 				}
@@ -707,9 +795,27 @@ static void draw_alt_box(struct inl_img *im, int py, int phh)
  * else the baked gfx_ui font), clipped vertically to [ct,cb). The pane bg is
  * already filled, so the text blends over existing pixels. Bold is a 1px-offset
  * overstrike; underline is a rule under the run. */
-static void draw_styled_line(int x, int y, int idx, int ct, int cb)
+static void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
 {
 	int off = B->line_off[idx], len = B->line_len[idx];
+	set_block(off);
+
+	/* A horizontal rule is a whole-line element: a centred grey bar, no text. */
+	if (cur_bhr) {
+		int m = cur_bindent * INDENT_PX;
+		gfx_fill_rect(x + m, y + LINE_H / 2, paw - m, 1, 0xc4c8cf);
+		return;
+	}
+
+	x += cur_bindent * INDENT_PX;                  /* blockquote / list indent  */
+	if (cur_bcenter) {                             /* text-align:center         */
+		int lw = 0, p = off, end = off + len;
+		unsigned cp;
+		while (p < end) { p += utf8_decode(&B->text[p], &B->text[end], &cp); lw += body_cp_adv(cp); }
+		int room = (paw - cur_bindent * INDENT_PX) - lw;
+		if (room > 0) x += room / 2;
+	}
+
 	int i = 0;
 	while (i < len) {
 		unsigned char a = B->attr[off + i];
@@ -732,6 +838,22 @@ static void draw_styled_line(int x, int y, int idx, int ct, int cb)
 	}
 }
 
+/* Address-bar row layout: two nav buttons (Back, Forward) at the left, then the
+ * URL text field filling the rest. One source of truth for both render() and the
+ * click handler, so the drawn rects and hit rects never drift. */
+struct rect { int x, y, w, h; };
+#define NAV_BTN_W 28
+
+static void addr_layout(struct rect *back, struct rect *fwd, struct rect *tf)
+{
+	int y0 = MENU_H + TAB_H;
+	back->x = 4;                      back->y = y0 + 3; back->w = NAV_BTN_W; back->h = ADDR_H - 6;
+	fwd->x  = back->x + NAV_BTN_W + 2; fwd->y = back->y; fwd->w  = NAV_BTN_W; fwd->h  = back->h;
+	int tx  = fwd->x + NAV_BTN_W + 6;
+	tf->x = tx; tf->y = y0 + 4; tf->w = BW - tx - 6; tf->h = ADDR_H - 8;
+	if (tf->w < 32) tf->w = 32;       /* keep the field usable on a narrow window */
+}
+
 static void render(void)
 {
 	unsigned bg = 0xf4f5f7;
@@ -752,10 +874,18 @@ static void render(void)
 	}
 	tabbar_draw(0, MENU_H, BW, labels, icons, n_tabs, active_tab);
 
-	/* address bar (below the tab strip): a shared text-field widget */
+	/* address bar (below the tab strip): Back/Forward buttons + the text field.
+	 * The buttons dim when their direction has no history (button_hit also refuses
+	 * a disabled button, so a click on a dim arrow does nothing). */
 	gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
-	int fx = 6, fy = MENU_H + TAB_H + 4, fw = BW - 12, fh = ADDR_H - 8;
-	textfield_draw(&B->addr_tf, fx, fy, fw, fh, 1);
+	struct rect rb, rf, rtf;
+	addr_layout(&rb, &rf, &rtf);
+	struct tab *at = &tabs[active_tab];
+	button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90",   /* ← */
+	            hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED);
+	button_draw(rf.x, rf.y, rf.w, rf.h, "\xe2\x86\x92",   /* → */
+	            hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED);
+	textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
 
 	/* content pane */
 	int py = MENU_H + TAB_H + ADDR_H, pw = BW - SCROLL_W;
@@ -782,7 +912,7 @@ static void render(void)
 		for (int r = 0; r < rows; r++) {
 			int idx = B->scroll + r;
 			if (idx >= B->nlines) break;
-			draw_styled_line(4, py + r * LINE_H, idx, py, py + phh);
+			draw_styled_line(4, py + r * LINE_H, idx, paw, py, py + phh);
 		}
 
 		/* inline images, over their reserved (blank) rows */
@@ -838,6 +968,26 @@ static void submit(void)
 	for (; B->addr[i] && i < URL_MAX - 1; i++) B->req_url[i] = B->addr[i];
 	B->req_url[i] = '\0';
 	B->req_pending = 1; B->seq++;
+}
+
+/* Navigate to the active tab's previous/next history entry. The hist index moves
+ * here; nav_from_history keeps the load's completion from pushing a new entry. */
+static void go_back(void)
+{
+	struct tab *t = &tabs[active_tab];
+	if (!hist_can_back(t)) return;
+	t->hist_i--;
+	nav_from_history = 1;
+	navigate(t->hist[t->hist_i]);
+}
+
+static void go_fwd(void)
+{
+	struct tab *t = &tabs[active_tab];
+	if (!hist_can_fwd(t)) return;
+	t->hist_i++;
+	nav_from_history = 1;
+	navigate(t->hist[t->hist_i]);
 }
 
 /* Reset B to an empty page (a fresh/blank tab) without touching the net. */
@@ -902,6 +1052,8 @@ static void new_tab(void)
 	tabs[active_tab].cached = 0;
 	tabs[active_tab].blob = 0;
 	tabs[active_tab].blob_len = 0;
+	tabs[active_tab].hist_n = 0; tabs[active_tab].hist_i = 0;   /* fresh history */
+	for (int k = 0; k < HIST_MAX; k++) tabs[active_tab].hist[k] = 0;
 	copy_str(tabs[active_tab].label, "New Tab", sizeof tabs[active_tab].label);
 	show_blank();
 }
@@ -911,12 +1063,15 @@ static void close_tab(int i)
 	if (i < 0 || i >= n_tabs || n_tabs <= 1) return;   /* keep at least one */
 	int was_active = (i == active_tab);
 	tab_drop(&tabs[i]);                           /* free its snapshot first */
+	hist_clear(&tabs[i]);                         /* and its history strings  */
 	for (int j = i; j < n_tabs - 1; j++) {       /* shift the rest down a slot */
 		char *d = (char *)&tabs[j], *s = (char *)&tabs[j + 1];
 		for (int k = 0; k < (int)sizeof(struct tab); k++) d[k] = s[k];
 	}
 	tabs[n_tabs - 1].blob = 0;                    /* vacated slot now aliases the */
 	tabs[n_tabs - 1].cached = 0;                  /* moved blob — drop the alias  */
+	for (int k = 0; k < HIST_MAX; k++) tabs[n_tabs - 1].hist[k] = 0;  /* + history */
+	tabs[n_tabs - 1].hist_n = 0; tabs[n_tabs - 1].hist_i = 0;
 	n_tabs--;
 	if (active_tab > i)          active_tab--;
 	else if (active_tab >= n_tabs) active_tab = n_tabs - 1;
@@ -994,8 +1149,16 @@ static void handle_click(int mx, int my)
 		return;
 	}
 	if (my >= MENU_H + TAB_H && my < MENU_H + TAB_H + ADDR_H) {   /* address bar */
-		textfield_click(&B->addr_tf, mx, my,
-		                6, MENU_H + TAB_H + 4, BW - 12, ADDR_H - 8);
+		struct rect rb, rf, rtf;
+		addr_layout(&rb, &rf, &rtf);
+		struct tab *at = &tabs[active_tab];
+		if (hist_can_back(at) && button_hit(rb.x, rb.y, rb.w, rb.h, mx, my)) {
+			go_back();
+		} else if (hist_can_fwd(at) && button_hit(rf.x, rf.y, rf.w, rf.h, mx, my)) {
+			go_fwd();
+		} else {
+			textfield_click(&B->addr_tf, mx, my, rtf.x, rtf.y, rtf.w, rtf.h);
+		}
 		B->seq++;
 		return;
 	}
@@ -1044,8 +1207,16 @@ static void handle_click(int mx, int my)
 	}
 }
 
-static void handle_key(char c)
+static void handle_key(char c, int mods)
 {
+	/* Alt+Left / Alt+Right are history navigation — checked before the address
+	 * bar so the modifier turns the arrow into back/forward instead of a caret
+	 * move. The keyboard reports the chord via mods (KMOD_*); the app decides. */
+	if (mods & KMOD_ALT) {
+		if ((unsigned char)c == KEY_LEFT)  { go_back(); return; }
+		if ((unsigned char)c == KEY_RIGHT) { go_fwd();  return; }
+	}
+
 	/* Menu accelerator (F5 = Reload): fire the item like a click. */
 	struct menu *leaf;
 	int sc = menubar_shortcut(&menubar, (unsigned char)c, &leaf);
@@ -1106,7 +1277,7 @@ int main(void)
 				win_close(id);
 				return 0;
 			} else if (ev.type == WEV_KEY) {
-				handle_key((char)ev.a);
+				handle_key((char)ev.a, ev.b);
 			} else if (ev.type == WEV_MOUSE) {
 				handle_click(ev.a, ev.b);
 			} else if (ev.type == WEV_SCROLL) {
@@ -1128,6 +1299,10 @@ int main(void)
 			update_title(id);
 			if (B->cur_url[0])                       /* show the resolved URL */
 				textfield_set(&B->addr_tf, B->cur_url);  /* (incl. the scheme) */
+			/* Record the page we landed on, unless this load was itself a
+			 * Back/Next move (then we only walked the existing history). */
+			if (!nav_from_history) hist_push(&tabs[active_tab], B->cur_url);
+			nav_from_history = 0;
 		}
 		prev_loading = B->loading;
 

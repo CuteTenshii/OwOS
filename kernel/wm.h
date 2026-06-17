@@ -62,7 +62,7 @@ struct window {
 	 * context menu at the cursor. NULL = the right button is ignored. */
 	void     (*rclick)(struct window *w, int mx, int my);
 	uint32_t (*dirty)(struct window *w);
-	void     (*key)(struct window *w, char c);  /* a key while focused         */
+	void     (*key)(struct window *w, char c, unsigned mods); /* key + KMOD_* while focused */
 	void     (*on_close)(struct window *w);     /* close box clicked (else hide) */
 	void     (*on_resize)(struct window *w, int cw, int ch); /* resize finished  */
 	/* The left button is held and moving after a press in this window's client
@@ -122,7 +122,7 @@ int wm_screen_h(void);
 /* Route one typed character to the focused window. Returns 1 if that window
  * consumed it (it has a key callback), 0 otherwise — the caller (kernel_main)
  * then falls back to feeding the shell. Safe to call with no framebuffer. */
-int wm_feed_key(char c);
+int wm_feed_key(char c, unsigned mods);
 
 /* 1 if the focused window is a GUI app that consumes keyboard input. */
 int wm_focus_takes_keys(void);

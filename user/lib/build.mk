@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto gfx zlib png mp3 sqlite clipboard mime font brotli
+ULIBDIRS := curl torrent crypto gfx zlib png mp3 sqlite clipboard mime font brotli math gc
 UCFLAGS  := -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) \
            -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -40,6 +40,12 @@ TORLIB  := user/lib/torrent/bencode.o user/lib/torrent/torrent.o   # libtorrent
 SQLITE  := user/lib/sqlite/sqlite.o   # real SQLite3 file-format DB (browser cookie jar)
 CLIPBOARD := user/lib/clipboard/clipboard.o  # clipd client (multi-item clipboard)
 MIME    := user/lib/mime/mime.o       # filename/content -> MIME type helper
+# math: freestanding x87 libm + shortest-round-trip number<->string (Dragon4).
+# Pure computation, no syscalls; links with $(LIBGCC) for 64-bit integer divides.
+MATH    := user/lib/math/math.o user/lib/math/fmt.o
+# gc: precise mark-sweep collector over the malloc heap (roots + tracer supplied
+# by the client). For language runtimes that need managed memory.
+GC      := user/lib/gc/gc.o
 # brotli: from-scratch RFC 7932 codec (HTTP `br` content-coding). decode needs the
 # 122 KiB static dictionary blob (objcopy of dictionary.bin -> the path-derived
 # symbol decode.c externs); encode is standalone. Links with $(LIBGCC).
@@ -47,6 +53,10 @@ BROTLIDICT := user/lib/brotli/dict_blob.o
 BROTLI  := user/lib/brotli/decode.o user/lib/brotli/encode.o $(BROTLIDICT)
 $(BROTLIDICT): user/lib/brotli/dictionary.bin
 	objcopy -I binary -O elf32-i386 -B i386 $< $@
+# woff: WOFF1 (zlib) + WOFF2 (brotli + glyf transform) container -> SFNT. Lives in
+# user/lib/font and is wired into font_load via a weak ref, so font_load decodes
+# web fonts transparently; only programs that link $(WOFF) drag in brotli/inflate.
+WOFF    := user/lib/font/woff.o
 TERMLIB := user/lib/zlib/lzss.o user/lib/zlib/deflate.o $(CRYPTO) $(CLIPBOARD)  # the shell's codecs + crypto
 
 user/lib/start.o: user/lib/start.S

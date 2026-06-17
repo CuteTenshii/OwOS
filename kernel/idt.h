@@ -21,6 +21,9 @@ struct registers {
 
 void idt_init(void);
 
+/* An application processor loads the shared IDT on itself. */
+void idt_load(void);
+
 /* Install one IDT gate. Exposed so the IRQ module can add its own gates. */
 void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags);
 

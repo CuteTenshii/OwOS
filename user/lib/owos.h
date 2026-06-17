@@ -113,7 +113,8 @@ int  readline(char *buf, int max);            /* echoed line input, returns len*
  */
 #define WIN_FB_ADDR  0xC0000000u
 
-#define WEV_KEY    1    /* a = key char (control codes < 0x20 for editing keys) */
+#define WEV_KEY    1    /* a = key char (control codes < 0x20 for editing keys),
+                         * b = KMOD_* modifier flags held when it was pressed    */
 #define WEV_MOUSE  2    /* a, b = client-relative x, y of a left click          */
 #define WEV_CLOSE  3    /* the close box was clicked                            */
 #define WEV_RESIZE 4    /* a, b = new client w, h (only if win_resizable on)    */
@@ -270,5 +271,15 @@ int umount(const char *point);
 #define KEY_SHOME  0x1A
 #define KEY_SEND   0x1C
 /* Ctrl+C reaches a focused app as KEY_INTR (0x18); the editor uses it as Copy. */
+
+/* Modifier flags reported with every key event in win_event.b (WEV_KEY). An app
+ * reads these to act on chords itself — e.g. the browser treats Alt+Left as
+ * "back" — instead of the keyboard minting a dedicated code per chord. Keep in
+ * sync with the KMOD_* in drivers/input/keyboard.h. */
+#define KMOD_SHIFT 0x01
+#define KMOD_CTRL  0x02
+#define KMOD_ALT   0x04
+#define KMOD_SUPER 0x08
+#define KMOD_ALTGR 0x10
 
 #endif /* OWOS_USER_H */

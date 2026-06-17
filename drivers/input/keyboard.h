@@ -24,6 +24,11 @@
 #define KEY_CLEAR   0x0C   /* Ctrl+L: clear the screen                         */
 #define KEY_F5      0x0E   /* F5: app-defined refresh/reload                   */
 #define KEY_SUPER   0x11   /* left/right Windows (GUI) key: toggle Start menu  */
+
+/* KEY_KILL/KEY_CLEAR remain ONLY as line-editor codes for the serial recovery
+ * console (serial.c maps Ctrl+U/L to them — serial has no modifier channel). The
+ * PS/2 keyboard no longer emits them: it sends the bare letter + KMOD_CTRL and
+ * the consumer (shell/editor) decides. */
 /* Menu accelerators: Ctrl+<letter> chords a windowed app binds to its menu
  * items (the keyboard forwards them like any other editing key; the focused
  * app decides what each means -- typically New/Open/Save). The shell ignores
@@ -45,19 +50,29 @@
 #define KEY_SDOWN   0x19
 #define KEY_SHOME   0x1A
 #define KEY_SEND    0x1C
-/* Alt+Tab window switching. The keyboard tracks the left-Alt modifier and turns
- * Tab (and Shift+Tab) into these while Alt is held; the WM advances a switcher
- * selection on each one. KEY_ALT_UP is emitted when Alt is released after an
- * Alt+Tab gesture, committing the highlighted window. The shell ignores them. */
-#define KEY_ALTTAB      0x1D   /* Alt+Tab: next window                          */
-#define KEY_ALTTAB_PREV 0x1E   /* Alt+Shift+Tab: previous window                */
-#define KEY_ALT_UP      0x1F   /* Alt released: commit the Alt+Tab selection    */
+#define KEY_TAB         '\t'   /* WM keys off KEY_TAB + KMOD_ALT for Alt+Tab      */
+
+/* Alt+Tab is delivered as KEY_TAB+KMOD_ALT (+KMOD_SHIFT reverses); the WM owns
+ * switching. KEY_ALT_UP is emitted on Alt-release to commit the selection. */
+#define KEY_ALT_UP      0x1F
+
+/* Modifier state delivered alongside each key. Every key event carries the set
+ * of modifiers held when it was pressed, so an app can act on chords (e.g. a
+ * browser turns Alt+Left into "go back") without the keyboard inventing a
+ * dedicated code per chord. Delivered to GUI apps in win_event.b (see owos.h);
+ * keep these values in sync with the KMOD_* in owos.h. */
+#define KMOD_SHIFT 0x01
+#define KMOD_CTRL  0x02
+#define KMOD_ALT   0x04
+#define KMOD_SUPER 0x08
+#define KMOD_ALTGR 0x10
 
 void keyboard_init(void);
 
 /* Non-blocking: stores the next buffered character in *out and returns 1,
- * or returns 0 if no input is waiting. */
-int keyboard_poll(char *out);
+ * or returns 0 if no input is waiting. When `mods` is non-NULL it receives the
+ * KMOD_* modifier set held when that key was pressed (0 for injected paste). */
+int keyboard_poll(char *out, unsigned char *mods);
 
 /* Switch the active keyboard layout by name ("us" or "fr"). Returns 0 on
  * success, -1 if the name matches no known layout. */

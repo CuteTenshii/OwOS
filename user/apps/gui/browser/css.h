@@ -21,6 +21,7 @@ struct css_style {
 	signed char  bold;
 	signed char  under;
 	signed char  disp;
+	signed char  center;   /* text-align: 1 = center, 0 = left/other, -1 unset */
 	int          width, height;
 	char         fam[CSS_FAM_STACK];
 };

@@ -33,6 +33,15 @@ IRQ 13, 45
 IRQ 14, 46
 IRQ 15, 47
 
+/* Local APIC timer (the per-core scheduler tick on APs), vector 0x40. Same
+ * frame shape as an IRQ; irq_handler special-cases it (LAPIC EOI, not PIC). */
+.global lapic_timer_isr
+.type lapic_timer_isr, @function
+lapic_timer_isr:
+	push $0
+	push $0x40
+	jmp irq_common_stub
+
 .extern irq_handler
 .type irq_common_stub, @function
 irq_common_stub:

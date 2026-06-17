@@ -1,18 +1,19 @@
 # CLAUDE.md
 
 OwOS is a 32-bit x86 Unix-like hobby kernel written from scratch in C + GAS
-assembly, booted directly by QEMU's Multiboot loader. README.md has the feature list and
-per-file layout; this file covers what spans multiple files or isn't obvious
-from one read.
+assembly, booted by QEMU's Multiboot loader. README.md has the feature list and
+per-file layout; this file covers only what spans multiple files or isn't
+obvious from one read.
 
-**Source layout:** device drivers live under `drivers/<type>/`
+**Source layout:** drivers live under `drivers/<type>/`
 (`storage net audio usb input video acpi bus`); the core kernel, filesystems
-(`fs/fat/hfs/ext/iso9660`), block dispatch (`blk`), and the network *stack*
-(`net/tcp/tls/crypto`) stay in `kernel/`. Includes are **flat** — every file
-says `#include "fb.h"`, never a path — because the Makefile puts `kernel/` *and
-every* `drivers/` subdir on the `-I` path (`DRVDIRS`). So a header resolves no
-matter which folder it lives in, and moving a driver between folders needs only
-an OBJS path change, not include edits. Header basenames must stay unique.
+(`fs/fat/hfs/ext/iso9660`), block dispatch (`blk`), and the network stack
+(`net/tcp/tls/crypto`) stay in `kernel/`.
+
+- Includes are **flat** (`#include "fb.h"`, never a path): the Makefile puts
+  `kernel/` and every `drivers/` subdir on `-I` (`DRVDIRS`).
+- Moving a driver between folders is an OBJS path change only — no include edits.
+- **Header basenames must stay unique.**
 
 ## Build & run
 
@@ -28,23 +29,20 @@ make clean      # keeps disk.img;  make distclean  also wipes it
 make run NIC=e1000  # attach the Intel 82540EM instead of the default RTL8139
 ```
 
-There is **no cross-compiler**: a freestanding 32-bit ELF (`gcc -m32
--ffreestanding -nostdlib`) linked at 1 MiB by `linker.ld`, loaded via QEMU's
-built-in Multiboot (`-kernel`). `make run`/`debug` auto-create the disks each
-storage driver exercises (IDE `disk.img` + AHCI + NVMe + a USB stick + an SD card
-+ an ISO 9660 `cd.iso` on an ATAPI CD-ROM), a SLIRP NIC, and a USB tablet; `make
-run` adds Sound Blaster 16 + PC speaker. The RTL8139, e1000, and igb drivers
-are all built in; the kernel keeps whichever card QEMU attached.
-`make iso` is the only target needing a host bootloader (`grub-mkrescue`); it's
-for VMware/VirtualBox/bare metal, which need GRUB on the media.
+- No cross-compiler: freestanding 32-bit ELF (`gcc -m32 -ffreestanding
+  -nostdlib`) linked at 1 MiB by `linker.ld`, loaded via QEMU `-kernel`.
+- `make run`/`debug` auto-create every disk a storage driver exercises (IDE
+  `disk.img`, AHCI, NVMe, USB stick, SD card, ISO 9660 `cd.iso` on ATAPI CD),
+  a SLIRP NIC, and a USB tablet; `make run` also adds SB16 + PC speaker.
+- All of rtl8139/e1000/igb are built in; the kernel keeps whichever QEMU attached.
+- `make iso` is the only target needing a host bootloader (`grub-mkrescue`).
+- Diagnostics gate the build — fix compile/link errors first.
+- clang editor diagnostics analyze in 64-bit mode and flag every pointer/int
+  cast: **false positives** under the real `-m32` build; ignore them.
 
-Diagnostics gate the build — fix compile/link errors first. clang editor
-diagnostics analyze in 64-bit mode and flag every pointer/int cast: **false
-positives** under the real `-m32` build; ignore them.
+## Verifying changes
 
-## Testing / verifying changes
-
-No test framework. The kernel is verified by **booting it in QEMU and observing
+No test framework. The kernel is verified by **booting in QEMU and observing
 real behavior** over the monitor — "it compiled" is not "it works", and a bad
 change usually triple-faults (silent reboot loop) rather than erroring. The
 console mirrors to COM1, so capture a session as text:
@@ -59,94 +57,99 @@ console mirrors to COM1, so capture a session as text:
 cat -v /tmp/s.log
 ```
 
-`sendkey` quirks that cause fake "bugs": letters are lowercase key names
-(`sendkey a`), a capital needs `shift-a`, `.` is `dot`, space is `spc`, `|` is
-`shift-backslash`. Always send those by name.
-
-- `info registers` / `xp` over `-monitor stdio` read CPU state and physical mem.
+- `sendkey` quirks (else fake "bugs"): letters are lowercase key names
+  (`sendkey a`), a capital is `shift-a`, `.` is `dot`, space is `spc`, `|` is
+  `shift-backslash`. Always send those by name.
 - A reboot loop is a triple fault: rerun with `-no-reboot -d int,cpu_reset`.
-- On a fault, idt.c prints a panic (vector, error code, EIP, and CR2 for #PF) to
-  COM1 *and* as a heapless framebuffer panic screen. The error-code present/
-  write/**user** bits say whether the fault came from ring 3.
+- On a fault, idt.c panics (vector, error code, EIP, CR2 for #PF) to COM1 and as
+  a heapless framebuffer screen; the error-code present/write/**user** bits say
+  whether it came from ring 3.
+- `info registers` / `xp` over `-monitor stdio` read CPU state and physical mem.
 - Do **not** pass `-vga std`: it unmaps the 0xB8000 text window and nothing
   renders. The default adapter keeps SeaBIOS's text mode 3.
-- The battery and xHCI/tethering paths are **real-hardware-only** (QEMU has no
-  battery, and won't tether). They carry diagnostic plumbing (`battery_error()`,
-  `aml_last_error()`, per-port xHCI lines) for debugging on a laptop — keep it.
+- The battery and xHCI/tethering paths are **real-hardware-only**; keep their
+  diagnostic plumbing (`battery_error`, `aml_last_error`, per-port xHCI lines).
 - Remove any deliberate-fault test you add, and re-verify a clean boot.
+
+## Hard rules
+
+These change how you edit; they are the rules most likely to be violated.
+
+- **`exec` + `(` is blocked by a repo hook** (misfires as a Node child-process
+  call). So the kernel fn is `sched_replace`, the libc wrapper is `execp`, and
+  comments say "the run-image syscall" — never spell it with a parenthesis.
+- **`sti` before `hlt` in every thread-context wait loop.** `context_switch`
+  doesn't save/restore EFLAGS, so a thread resumed by a cooperative
+  `sched_yield` from an IF-clear context inherits IF=0; a bare `hlt` then halts
+  the CPU forever. The `int 0x80` gate also runs IF=0, so anything a syscall
+  reaches that spins on `hlt` must `sti; hlt` too.
+- **Memory-map boundaries must agree across files** — change one boundary, change
+  the others (see Memory model).
+- **Syscall numbers must stay in sync** between `syscall.c` and `user/lib/lib.c`.
+- **Never auto-format AHCI/NVMe** — that is the user's real OS drive (see Storage).
+- **Syscalls stay general primitives**, never per-feature shortcuts; pure
+  computation (codecs/decompression) goes in `user/lib`, not a syscall.
+
+## Code conventions
+
+- **Build general components, not single-use ones.** A file written while working
+  toward feature X is built *because of* X, not *for* X: keep its API
+  consumer-agnostic and put feature-specific logic in the caller (e.g. the GC
+  takes a generic tracer/finalizer; JS-specific marking lives in the engine).
+- **Name for what a thing is, not its first consumer** — no `js_`-style prefixes
+  on shared code; prefer the standard libc name when one exists (`dtoa`, `strtod`).
+- **Comments are short and load-bearing.** Comment only the non-obvious (a subtle
+  invariant, a footgun, why-not-the-obvious-way), one line where possible. No
+  banners, no narration of what the code plainly does; default to none.
 
 ## Boot & subsystem bring-up (kernel.c)
 
-`boot/boot.S` (Multiboot header, masks IRQs, sets the stack, passes magic+info)
-→ `kernel_main`, which brings subsystems up in dependency order:
+`boot/boot.S` (Multiboot header, masks IRQs, sets stack, passes magic+info) →
+`kernel_main`, which brings subsystems up in dependency order:
 
 serial → vga → gdt → idt → irq (PIC remap) → pmm → **paging** → heap → smbios →
 pci → **fb** → net (NIC dispatch + IPv4) → ahci/nvme probes → **blk (pick owofs
 disk)** → fs → syscalls (+install user programs) → timer → keyboard → sb16 →
 scheduler + workers → services → **wm** → screenshot worker → `sti` → **shell**.
 
-The slow post-`sti` bring-up runs off the main thread: **`xhci_boot`** in a
-detached **`boot_bringup` kernel thread**, and **DHCP** as the autostart `dhcp`
-service (which spawns its own client thread). Both block for seconds on real
-hardware (DHCP retransmits, xHCI port resets, all `timer_sleep`), and doing them
-inline meant keystrokes typed during boot piled up in the keyboard ring
-(captured at `sti`) and flushed all at once — the console felt dead for seconds.
-Off the main thread they run with IF=1, so the "must run after `sti`"
-`timer_sleep` paths are still satisfied. **Nothing
-is auto-mounted at boot** — removable volumes mount only on demand (see Storage).
+- **IDT before any IRQ.**
+- **PIC remapped (master→32, slave→40) before `sti`**, or the timer IRQ lands on
+  a CPU exception vector.
+- **`blk_init` after ahci/nvme** (needs their `_present()`) **and before fs_init**.
+- **`xhci_boot` after `sti`** (uses `timer_sleep`, needs interrupts on).
+- Slow post-`sti` work runs off the main thread (`xhci_boot` in the detached
+  `boot_bringup` thread; DHCP as the autostart `dhcp` service) so boot keystrokes
+  don't pile up in the keyboard ring; both still run IF=1.
+- Device probes are no-ops when the hardware is absent. **Nothing auto-mounts.**
 
-Order is load-bearing: the IDT must exist before any IRQ; the PIC must be
-remapped (master→32, slave→40) before `sti` or the timer IRQ lands on a CPU
-exception vector. Device probes are no-ops when the hardware is absent. Two
-non-obvious constraints: **`blk_init` runs after ahci/nvme** (needs their
-`_present()`) **and before fs_init**; **`xhci_boot` runs after `sti`** (it uses
-`timer_sleep`, so it needs interrupts on).
+## Boot loaders, Multiboot, firmware, graphics (boot.S + kernel.c + fb.c)
 
-## Boot loaders, Multiboot, firmware detection, graphics (boot.S + kernel.c + fb.c)
-
-`boot.S` carries **two** Multiboot headers:
-
-- **Multiboot1** (`0x1BADB002`) — **QEMU `-kernel`**. Hands us `struct
-  multiboot_info` directly, ignores the video request, so fb.c's DISPI driver
-  sets the mode.
-- **Multiboot2** (`0xE85250D6`) — **GRUB** (BIOS + UEFI). Used for GRUB on
-  purpose: GRUB's mb1 handoff page-faults during the long→protected transition
-  under UEFI; mb2 is the handoff GRUB does correctly.
-
-Both request a 32-bpp linear framebuffer at **0×0×32** (no fixed resolution) —
-a hardcoded mode makes GRUB fail `no suitable video mode found` on panels that
-don't advertise it. Depth is pinned to 32 because `fb_adopt` only handles 32-bpp
-XRGB.
-
-`kernel_main` branches on the magic in `eax`. On mb2 it calls
-`multiboot2_to_info()`, which walks the tag chain and **synthesizes an mb1
-`multiboot_info`** (mmap re-emitted in the 24-byte layout pmm walks, plus the
-framebuffer tag) so pmm/fb need no per-format code. Keep `synth_mmap` large —
-real UEFI hands out *hundreds* of descriptors; too small a buffer drops the bulk
-RAM region and pmm sees ~0 MiB. While walking, it also:
-
-- **Detects firmware** (`firmware.c`): GRUB emits an EFI system-table tag only on
-  UEFI. Load-bearing for ACPI — on UEFI the RSDP is **not** in the legacy BIOS
-  area, so the firmware mode tells the ACPI code where the RSDP is.
-- **Captures the RSDP** (`acpi_set_rsdp`) from the mb2 ACPI tag, while still
-  pre-paging and flat — the only way the ACPI code reaches the tables under UEFI.
-
-Graphics: if the loader gave us a 32-bpp RGB framebuffer (mb2 path), **adopt it**
-(`fb_adopt`); else program QEMU's DISPI adapter (`fb_init`); else stay in text.
-GRUB on QEMU stdvga/cirrus only offers 24-bpp (falls through to DISPI); virtio/
-qxl/vmware and real UEFI GOP give 32-bpp. Test adopt with `-vga virtio`.
-
-`make iso` builds a **hybrid** BIOS+UEFI image automatically (the host has the
-`*-efi` GRUB modules). `grub.cfg` **must `insmod all_video`** or the framebuffer
-request can't be honored. **Known limitation:** GRUB 2.14's relocator page-faults
-under strict-W^X OVMF (inside GRUB, before our kernel) for both mb1 and mb2; many
-real firmwares are more permissive. A native EFI stub (no GRUB) is the only fully
-robust UEFI path — not yet done.
+- `boot.S` carries **two** headers. **Multiboot1** (`0x1BADB002`) for QEMU
+  `-kernel` (hands us `multiboot_info` directly). **Multiboot2** (`0xE85250D6`)
+  for GRUB (BIOS+UEFI) — GRUB's mb1 handoff page-faults during the long→protected
+  transition under UEFI; mb2 is the handoff GRUB does correctly.
+- Both request a **32-bpp** linear framebuffer at `0×0×32` (no fixed resolution):
+  a hardcoded mode makes GRUB fail `no suitable video mode found`; depth is pinned
+  to 32 because `fb_adopt` only handles 32-bpp XRGB.
+- On mb2, `multiboot2_to_info()` walks the tag chain and synthesizes an mb1
+  `multiboot_info` so pmm/fb need no per-format code. Keep `synth_mmap` large —
+  real UEFI hands out hundreds of descriptors; too small drops the bulk RAM
+  region and pmm sees ~0 MiB.
+- While walking it **detects firmware** (`firmware.c`) and **captures the RSDP**
+  (`acpi_set_rsdp`) — under UEFI the RSDP isn't in the legacy BIOS area, so this
+  is the only route the ACPI code has to the tables.
+- Graphics: if the loader gave a 32-bpp RGB framebuffer, **adopt it** (`fb_adopt`);
+  else program QEMU's DISPI adapter (`fb_init`); else stay in text. Test adopt
+  with `-vga virtio`.
+- `grub.cfg` **must `insmod all_video`** or the framebuffer request can't be
+  honored. **Known limitation:** GRUB 2.14's relocator page-faults under
+  strict-W^X OVMF (inside GRUB) for both mb1 and mb2; a native EFI stub is the
+  only fully robust UEFI path — not yet done.
 
 ## Memory model (paging.c + loader.c + heap.c)
 
-Low 16 MiB is identity-mapped, partitioned by hardcoded addresses that **must
-agree across files** (change one boundary → change the others):
+Low 16 MiB is identity-mapped, partitioned by hardcoded addresses (**must agree
+across files**):
 
 ```
 0–~2 MiB    kernel image + BSS (PMM bitmap, page tables, stacks)  [supervisor]
@@ -155,174 +158,126 @@ agree across files** (change one boundary → change the others):
 12–16 MiB   page-frame pool (palloc/pfree: page directories + page tables)
 ```
 
-The **per-process user window is no longer in low memory** — it's a private
-**64 MiB region at 1 GiB** (`USER_BASE 0x40000000 .. USER_REGION_END`, loader.h),
-backed on demand by **pmm high memory (>16 MiB)** through the process's own page
-tables. So `palloc`/`pfree` (the 12–16 MiB pool) now only hand out page dirs and
-page tables; the user *frames* come from the PMM. User programs link at
-`0x40000000` (`user/user.ld`), the user stack grows down from `USER_STACK_TOP`.
-1 GiB is clear of the identity map and of two other high mappings: `SCRATCH_VADDR`
-(256 MiB — a per-CR3 scratch slot the kernel uses to transiently map any pmm
-frame and write it) and `WIN_FB_VADDR` (3 GiB — where a window's client pixel
-buffer is mapped into its owning process, see uwin.c).
-
-**Above 16 MiB is on-demand**: `pmm_alloc_contig` hands out contiguous frames
-(and identity-maps them) for things too big for the heap — the framebuffer back
-buffer and the tmpfs RAM disk. Two helpers map memory outside the identity map,
-both into the **shared kernel directory** (visible under any CR3):
-`paging_identity_map(phys,len)` for high firmware tables (ACPI),
-`paging_map_uncached(phys,len)` (UC-) for device MMIO (e1000 BAR0).
-
-Each process has its **own page directory**: shared kernel/heap/pool mappings +
-a private user window backed by pmm high memory. The scheduler switches CR3 and
-`tss.esp0` per task. Every address space maps the kernel identically, so kernel
-threads and interrupt handlers run under *any* CR3 — that invariant is why the
-scheduler needn't special-case address spaces.
+- The per-process **user window is a private 64 MiB region at 1 GiB**
+  (`USER_BASE 0x40000000 .. USER_REGION_END`, loader.h), backed on demand by pmm
+  high memory (>16 MiB) through the process's own page tables. So `palloc`/`pfree`
+  hand out only page dirs/tables; user *frames* come from the PMM.
+- User programs link at `0x40000000` (`user/user.ld`); the stack grows down from
+  `USER_STACK_TOP`. 1 GiB is clear of the identity map, of `SCRATCH_VADDR`
+  (256 MiB — a per-CR3 slot to transiently map+write any pmm frame), and of
+  `WIN_FB_VADDR` (3 GiB — a window's client pixel buffer in its owning process).
+- **Above 16 MiB is on-demand:** `pmm_alloc_contig` hands out contiguous frames
+  (and identity-maps them) for things too big for the heap (fb back buffer, tmpfs).
+- Two helpers map outside the identity map, both into the shared kernel directory:
+  `paging_identity_map(phys,len)` for high firmware tables (ACPI),
+  `paging_map_uncached(phys,len)` (UC-) for device MMIO (e1000 BAR0).
+- Each process has its **own page directory** (shared kernel/heap/pool + private
+  user window); the scheduler switches CR3 and `tss.esp0` per task. **Every
+  address space maps the kernel identically**, so kernel threads and interrupt
+  handlers run under any CR3 — why the scheduler needn't special-case address
+  spaces.
 
 ## Graphics & window manager (fb.c → wm.c, with mouse.c + console.c)
 
-A 32-bpp linear framebuffer, PS/2 mouse, and a compositing WM. The desktop
-terminal is the **`/bin/term`** program — a self-contained shell (see Desktop
-apps). **Strictly optional** — with no framebuffer the kernel stays in 80×25 text
-mode driven by the kernel **recovery console** (shell.c) over COM1.
+- fb gets the LFB two ways: program QEMU's VBE DISPI registers (ports
+  0x1CE/0x1CF, LFB via VGA PCI BAR0), or **adopt** the bootloader's framebuffer.
+  `kernel_main` prefers adopt, falls back to DISPI; with no framebuffer the kernel
+  stays in 80×25 text mode (the **recovery console**, shell.c, over COM1).
+- **`con_putc` (console.c) is the one funnel** every console write passes through;
+  it fans out to serial, the journal (log.c), the fb boot console, an optional
+  capture buffer, and the 80×25 VGA text shadow grid.
+  `con_use_framebuffer(1)` stops the text backend touching 0xB8000.
+- The text grid is the recovery console; the **desktop terminal is the separate
+  `/bin/term`**, which renders its own grid.
+- **wm.c is one kernel thread** (draggable title bars, raise-on-click z-order,
+  focus, close boxes, cursor, clock/taskbar); paces itself with `timer_sleep`.
+- **Mouse shares the i8042 with the keyboard (mouse.c, IRQ12).** `mouse_init`
+  force-sets both IRQ + clock bits and **must preserve bit 6 (translation)** or
+  keyboard.c stops seeing set-1 codes. IRQ12 is on the slave PIC → `irq_unmask(2)`
+  (cascade) too.
 
-- **fb.c gets the LFB two ways.** QEMU `-kernel`: program the Bochs/QEMU VBE
-  DISPI registers (ports 0x1CE/0x1CF) from protected mode, LFB via VGA PCI BAR0.
-  GRUB/real HW: **adopt** the bootloader's framebuffer (`fb_adopt`). `kernel_main`
-  prefers adopt, falls back to DISPI.
-- **The console is the `con_*` layer (console.c, formerly vga.c).** `con_putc`
-  is the one funnel every console write passes through; it fans out to serial,
-  the journal (log.c), the framebuffer boot console (fb.c, verbose), an optional
-  capture buffer, and the VGA text backend — an 80×25 shadow grid (char+attr).
-  `con_use_framebuffer(1)` stops the text backend touching 0xB8000. This grid is
-  the **recovery console** (kernel shell.c, on COM1/text mode); the *desktop*
-  terminal is the separate `/bin/term`, which renders its own grid.
-- **wm.c is one kernel thread.** Draggable title bars, raise-on-click z-order,
-  focus, close boxes, cursor, clock/taskbar; windows have kinds (`enum win_kind`:
-  terminal/clock/about/files). Paces itself with `timer_sleep`.
-- **Mouse shares the i8042 with the keyboard (mouse.c, IRQ12).** Enabling the aux
-  port is a read-modify-write of the config byte; a stale read once wrote the
-  keyboard's own IRQ1 bit back as disabled. So `mouse_init` **force-sets** both
-  IRQ + clock bits and **must preserve bit 6 (translation)** or keyboard.c stops
-  seeing set-1 codes. IRQ12 is on the slave PIC → `irq_unmask(2)` (cascade) too.
+**Performance is load-bearing on real hardware** (QEMU hides it). Three fb.c rules
+took a laptop from 2 fps to smooth:
 
-**Performance is load-bearing on real hardware** (QEMU hides it — its VRAM is
-host RAM). Three fb.c rules took a laptop from 2 fps to smooth:
-
-1. **Back buffer in cached system RAM**, from `pmm_alloc_contig` above 16 MiB
-   (the heap is too small for a laptop mode) — never VRAM, never single-buffered.
-2. **`fb_present` copies only the damaged rectangle.** fb tracks a clip rect +
-   dirty box; the compositor diffs each frame and damages only what changed. A
-   full-screen present every frame is what 2 fps looks like.
+1. **Back buffer in cached system RAM**, from `pmm_alloc_contig` above 16 MiB —
+   never VRAM, never single-buffered.
+2. **`fb_present` copies only the damaged rectangle** (clip rect + dirty box; the
+   compositor diffs each frame). A full-screen present every frame is 2 fps.
 3. **Front buffer mapped write-combining** (`enable_wc`: PAT entry 1 = WC,
-   `wbinvd`, `paging_mark_wc` tags LFB PTEs with PWT) — ~10× over default UC. The
-   back buffer stays write-back cached (fast to draw into).
+   `wbinvd`, `paging_mark_wc` tags LFB PTEs) — ~10× over default UC. The back
+   buffer stays write-back cached.
 
-## Desktop apps (apps.c + uwin.c + crash.c + screenshot.c)
+## Desktop apps & windowing (apps.c + uwin.c + crash.c + screenshot.c)
 
-The WM hosts apps; only the **terminal** (`/bin/term`) opens at boot. Everything
-else launches from the taskbar **Start menu** — one row per app in `app_menu[]`
-(apps.c). Apps are **programs** spawned from `/bin` as detached processes
-the WM reaps (term/clock/files/editor/browser/imgview); the only kernel-side
-window is the About box.
+- Only **`/bin/term`** opens at boot; everything else launches from the taskbar
+  Start menu (`app_menu[]`). Apps are `/bin` programs spawned detached and reaped
+  by the WM (term/clock/files/editor/browser/imgview); the only kernel-side window
+  is the About box.
+- **The terminal *is* the shell (`user/term.c`)** — own line editing, history,
+  cwd, dispatch; **no kernel-shell bridge.** Commands run three ways: builtins
+  over syscalls; CLI tools (neofetch/curl/lspci/ping/dig/play/torrent) spawned with
+  stdout captured via `spawn_cap` and rendered inline like a pty; any other `/bin`
+  program detached.
+- The kernel `shell.c` survives only as the COM1/text **recovery console** (its
+  builtin table still has kernel-only ops like `format`, `mtp`).
+- **GUI apps own a window via uwin.c** (the user-window server): create a window,
+  get a shared pixel buffer mapped at `WIN_FB_VADDR` (3 GiB), draw, present, poll
+  input events — all over `SYS_WIN_*`.
+- **Ctrl+C is a `KEY_INTR` key event** delivered to the focused app (kernel.c
+  routes the latch via `wm_feed_key`): cancels the line, or kills a captured child.
+- **Keyboard routing:** `wm_feed_key` offers a key to the focused GUI app first,
+  falling back to the recovery console's `shell_feed` only when no window has focus.
+- **crash.c contains a user-process fault, never panics:** the IDT handler calls
+  `crash_record()` in the faulting task's context, captures registers, kills the
+  process; the WM's `crash_pump()` turns it into an "<app> has crashed" window.
+- **screenshot.c:** the keyboard IRQ only *requests* a Print Screen shot; a worker
+  thread does the capture (`/home/root/screenshotN.png`).
 
-**The terminal is the shell (`user/term.c`).** It does its own
-line editing, history, prompt, cwd, and command dispatch; there is **no
-kernel-shell bridge**. Commands run three ways: builtins over syscalls
-(file ops, plus system info/actions that read or write `/proc` — see Syscalls);
-CLI tools (neofetch/curl/lspci/ping/dig/play/torrent) spawned with their stdout
-captured through a pipe (`spawn_cap`) and rendered inline like a pty; any other
-`/bin` program launched detached. **Ctrl+C** is delivered to the focused app as a
-`KEY_INTR` key event (kernel.c routes the latch via `wm_feed_key`): it cancels
-the line at the prompt, or kills the captured child mid-command. The kernel
-`shell.c` survives only as the COM1/text **recovery console** (its builtin table
-still has the few kernel-only ops — `format`, `mtp` — that aren't in the terminal).
-
-GUI apps own a window through **uwin.c — the user-window server.** A
-process creates a window, gets a shared client-area pixel buffer mapped into its
-address space at `WIN_FB_VADDR` (3 GiB), draws into it, presents, and polls input
-events — all over the `SYS_WIN_*` syscalls. The kernel-side `struct window`'s
-`draw()` blits the user buffer; its click/key callbacks enqueue events the
-process drains. **Keyboard routing:** `wm_feed_key` offers a key to the focused
-GUI app first, falling back to the kernel recovery console's `shell_feed` only
-when no window has focus (see the input loop in kernel.c).
-
-- **crash.c — a user-process fault is contained, not fatal.** When a user process
-  faults, the IDT handler calls `crash_record()` (in the faulting task's context,
-  so its user stack is still mapped for a backtrace), captures registers, and
-  kills the process; the WM's per-frame `crash_pump()` turns the report into an
-  "<app> has crashed" window. The kernel never panics on a user-process fault.
-- **screenshot.c — Print Screen → PNG.** The keyboard IRQ can't kmalloc megabytes
-  or block on disk, so it only *requests* a shot; a dedicated worker thread polls
-  and does the capture, writing `/home/root/screenshotN.png`.
-
-## Process model & context switching (sched.c + switch.S)
+## Process model & scheduling (sched.c + switch.S)
 
 Tasks are nodes in a circular run queue; `schedule()` is the timer-tick callback
 and the only normal entry to a context switch.
 
 - **switch.S stack layouts are exact.** New kernel threads, new user tasks
-  (`enter_user_task`), and forked children (`fork_child_entry`) each have a
-  hand-crafted initial kernel stack so the first `context_switch` "returns" into
-  the right trampoline. Off-by-one = triple fault.
+  (`enter_user_task`), forked children (`fork_child_entry`) each have a
+  hand-crafted initial kernel stack so the first `context_switch` returns into the
+  right trampoline. Off-by-one = triple fault.
 - **fork** copies the address space + syscall trap frame, forcing the child's
   saved `eax` to 0.
-- **the image-replace syscall** rewrites the trap frame (eip/esp/segments) and
+- **The image-replace syscall** rewrites the trap frame (eip/esp/segments) and
   swaps CR3 *before* freeing the old address space.
-- **exit** makes a zombie; the parent (`waitpid` / the shell's `sched_try_reap`)
-  frees it. Blocking syscalls yield rather than busy-spin.
-- **`timer_sleep` deschedules** (`sched_sleep_until`): a sleeping task goes
-  `TASK_WAITING` with a `wake_tick` and is re-woken by `sched_wake_due()` (called
-  each timer tick) — it is **not** kept `RUNNABLE` and `hlt`-spun. That earlier
-  design round-robined every sleeper and burned a tick per cycle, so N sleeping
-  threads (each open GUI app = a `win_wait` loop + a worker `msleep`) dilated
-  every thread's wakeup latency to O(N) ticks and the whole UI lagged with many
-  windows. The **main task never sleeps** (polls + `hlt`), so it is the always-
-  runnable fallback and `schedule()` can't starve. (Network waits — tcp_read/
-  accept — still use their own `sti; hlt` loops; only `timer_sleep` deschedules.)
-- `MAX_TASKS` is **64**: the steady set (WM, terminal, service daemons,
-  boot_bringup, screenshot worker) plus an app's burst — the browser is its
-  process + a fetch worker + one thread per inline image. At 16 a freshly-opened
-  browser left no slot and other programs failed to `spawn`. Only `tasks[]` scales
-  with it; each slot's kstack is `kmalloc`'d on demand (heap is the real ceiling).
-- The **EOI is sent at the start of `irq_handler`**, because a timer handler that
+- **exit** makes a zombie; the parent (`waitpid` / `sched_try_reap`) frees it.
+  Blocking syscalls yield rather than busy-spin.
+- **`timer_sleep` deschedules** (`sched_sleep_until`): a sleeper goes
+  `TASK_WAITING` with a `wake_tick`, woken by `sched_wake_due()` each tick — not
+  kept `RUNNABLE` and `hlt`-spun (that gave O(N-threads) wakeup latency and lagged
+  the UI with many windows). The **main task never sleeps**, so it's the
+  always-runnable fallback. (Network waits use their own `sti; hlt` loops.)
+- **`MAX_TASKS` is 64** — the steady set plus an app's burst (the browser is
+  process + fetch worker + one thread per inline image); at 16 a fresh browser
+  starved other spawns. Only `tasks[]` scales; each kstack is `kmalloc`'d on demand.
+- **EOI is sent at the start of `irq_handler`** — a timer handler that
   context-switches away never reaches the end.
-- Kernel-thread stacks are **16 KiB** (`KSTACK_SIZE`), bumped from 4 KiB for the
-  SMB server: deep handlers + an on-stack segment buffer + nested interrupt
-  frames overflowed 4 KiB and triple-faulted on the first large read.
+- **Kernel-thread stacks are 16 KiB** (`KSTACK_SIZE`), bumped from 4 KiB for the
+  SMB server (deep handlers + on-stack segment buffer + nested interrupt frames).
 
-## Syscalls & user programs (syscall.c + loader.c + user/)
+## Syscalls, /proc, /sys, user programs (syscall.c + loader.c + user/)
 
-ABI: `int 0x80`, number in `eax`, args in `ebx/ecx/edx`, return in `eax`. All
-user pointers are bounds-checked against the user window. The numbers (write=1 …
-net-close=15) **must stay in sync** between `syscall.c` and `user/lib/lib.c`. The
-net-* calls are a thin connect/send/recv/close handle layer (`net_sock_*`
-in net.c) — the only user-facing network API; `user/curl.c` is the client.
-
-**Syscalls are general primitives, never per-feature shortcuts.** Don't add a
-syscall because one program "needs" it; expose a general mechanism and build the
-feature in a user-space lib. `net_connect`'s `proto` arg selects TCP/TLS/UDP/raw-ICMP
-— so ping/dig/DNS-resolution are user-space code over sockets, not three bespoke
-syscalls (those were tried and removed). Same rule, computation side: codecs/
-decompression go in `user/lib`, not a syscall (the zip/gzip codecs are
-`user/lib/zlib/{lzss,deflate}.c`; `inflate.c` decompresses).
-
-**Kernel state is exposed through two synthetic filesystems, the Unix way —
-`/proc` for process/system *info*, `/sys` for *device tunables* — both reached
-through the ordinary file API, no bespoke syscalls.**
-
-**`/proc` (procfs.c) is flat, one fact per file.** *Reads* expose system info
-(`cpuinfo meminfo uptime date storage tasks pci host firmware battery display
-journal services usb net clipboard`); *writes* are **control nodes** so user
-space triggers a kernel action without a per-feature syscall: text to
-`/proc/clipboard` (clip), `start X`/`stop X` to `/proc/services`, a DHCP/NTP
-re-run via `/proc/net`. The earlier `SYS_SYSINFO`/`SYS_PCIDEV` were deleted in
-favor of this.
-
-**`/sys` (sysfs.c) is a real nested hierarchy of kernel objects and their
-attributes** — unlike `/proc`, every directory level is walkable
-(`ls /sys/class/input` → `kbd0 mouse0`). It's where *device tunables* live, the
-Linux sysfs home for them:
+- ABI: `int 0x80`, number in `eax`, args in `ebx/ecx/edx`, return in `eax`. All
+  user pointers are bounds-checked against the user window.
+- The net-* calls are a thin connect/send/recv/close handle layer (`net_sock_*`)
+  — the only user-facing network API; `user/curl.c` is the client. `net_connect`'s
+  `proto` arg selects TCP/TLS/UDP/raw-ICMP, so ping/dig/DNS are user-space code
+  over sockets, not bespoke syscalls.
+- **Kernel state is exposed through two synthetic filesystems** (the Unix way),
+  via the ordinary file API — no bespoke syscalls.
+- **`/proc` (procfs.c) is flat, one fact per file.** Reads expose system info
+  (`cpuinfo meminfo uptime date storage tasks pci host firmware battery display
+  journal services usb net clipboard`); writes are **control nodes** that trigger
+  a kernel action (text to `/proc/clipboard`, `start X`/`stop X` to
+  `/proc/services`, a DHCP/NTP re-run via `/proc/net`).
+- **`/sys` (sysfs.c) is a real nested hierarchy** of kernel objects + attributes,
+  walkable at every level — where *device tunables* live:
 
 ```
 /sys/class/input/kbd0/layout     keyboard layout      (rw, loadkeys)
@@ -334,450 +289,143 @@ Linux sysfs home for them:
 /sys/firmware/type               BIOS / UEFI          (ro)
 ```
 
-PCI devices are one directory each, named by Linux BDF (`0000:00:03.0`), so
-`ls /sys/bus/pci/devices` enumerates the whole bus (vs the flat `/proc/pci` dump
-that `lspci` still parses — both kept, as on Linux).
+- Choice follows Linux: info → `/proc`, device attribute → `/sys`. fs.c routes
+  `/sys` for ls/stat/read; syscall.c routes writes. Dynamic parts (which
+  NIC/block devices, battery presence) are an explicit per-level path walk.
+- A genuine *action* that returns nothing stays a syscall (e.g. `SYS_POWER`). The
+  terminal captures a child's stdout via `SYS_SPAWN_CAP` (+ `read_nb`/`kill`).
+- Each task carries a **cwd** (`task_t.cwd`); a parent sets a child's via
+  `sched_set_cwd`, fork/`spawn_cap` inherit it, `SYS_CHDIR` sets the caller's, and
+  path syscalls `join_cwd` relative names before hitting owofs.
+- User programs are freestanding ELF32 (`user/*.c`) linked at `0x200000`. Build:
+  compile → `user/NAME.elf` → objcopy into `kernel/NAME_blob.o` → linked in.
+  **Adding a program = two edits** (the `*_blob.o` in Makefile OBJS + the install
+  block in `kernel_main`); no shell wiring — `run()`'s final `else` spawns any
+  non-builtin as a `/bin` program.
+- **Install/refresh:** owofs (`disk.img`) persists installed `/bin` programs.
+  `install_blob()` reinstalls when absent **or its on-disk size differs from the
+  built-in blob**, so a rebuild replaces the persisted binary next boot — no
+  `make distclean` needed (except the rare same-byte-size behavior change).
+  `/etc/passwd`+`/etc/group` stay install-if-absent so accounts persist.
 
-The dynamic parts (which NIC/block devices exist, battery presence) are resolved
-by an explicit per-level path walk in sysfs.c, not a static node table. fs.c
-routes `/sys` for ls/stat/read (`sysfs_enum` lists any directory level, unlike
-`procfs_list` which only lists the `/proc` root); syscall.c routes writes. The
-choice of `/proc` vs `/sys` follows Linux: info → `/proc`, device attribute →
-`/sys` (which is why keyboard/mouse moved out of `/proc` to `/sys/class/input`).
+## Storage: block dispatch & filesystem (blk.c + fs.c + drivers)
 
-A genuine *action* that returns nothing stays a syscall (e.g. `SYS_POWER` —
-"read a file to shut down" makes no sense). The terminal is built entirely on
-these: it captures a child's stdout via **`SYS_SPAWN_CAP`** (+ `read_nb`/`kill`),
-and has no kernel-shell bridge. See [[syscalls-must-be-general]].
+- owofs (fs.c) is a flat 512-byte-sector filesystem with a directory tree.
+  `blk.c` picks **one** backing device at boot — first present of IDE → AHCI →
+  NVMe (`blk_backend()` names it) — and routes fs.c's sector I/O to it.
+- **Auto-format only a blank IDE disk** (`blk_is_ide`); fs_init **never**
+  auto-formats AHCI/NVMe (the user's real OS drive).
+- **tmpfs fallback:** with no usable owofs disk, fs_init calls `blk_use_ram()` → a
+  volatile RAM disk above the identity map (`blk_backend()` → `"tmpfs"`).
+- **Removable volumes mount under `/media/<name>`** via a multi-instance mount
+  table (fsmount.h): several at once, including duplicates. Each driver
+  (fat/hfs/ext/iso9660/ntfs) is a `struct fs_ops` vtable over an opaque per-mount
+  instance; fat.c is read+write, the rest read-only. `mount_for()` routes a path by
+  longest-prefix; `/media` and `/dev` are synthetic.
+- **Nothing auto-mounts** — `mount <dev> [point]` / `umount <point>` or the Files
+  app. Drivers probe by signature and never auto-format.
+- `blk_device_list()` reports *present* removable devices (candidate order CD →
+  USB → IDE → SATA → NVMe → SD, purely each driver's `_present()`, no sector I/O);
+  `blk_mount_device(name)` mounts one.
+- **Hotplug is live where the hardware allows:** the xHCI poll thread toggles
+  `msc_ready`, `sd_present()` reads the SDHCI card-detect bit each call; IDE/SATA/
+  NVMe presence is latched at boot.
+- **Real-hardware caveat:** a flaky USB-storage adapter can wedge the xHCI
+  controller; an MMIO read to a controller that's fallen off the bus hangs the CPU
+  bus cycle, which no software timeout catches — so `mount`/`storage` can freeze
+  the machine (a hardware fault). Every *software* wait in the USB path is bounded.
 
-Each task carries a **cwd** (`task_t.cwd`): a parent sets a child's via
-`sched_set_cwd`, fork/`spawn_cap` inherit it, `SYS_CHDIR` sets the caller's own,
-and path syscalls join relative names onto it (`join_cwd`) before hitting owofs —
-so `curl -o out.txt` lands in the cwd.
-
-User programs are freestanding ELF32 (`user/*.c`) linked at `0x200000` via
-`user/user.ld`. Build chain: compile → `user/NAME.elf` → objcopy into
-`kernel/NAME_blob.o` (`_binary_user_NAME_elf_{start,end}`) → linked in. At boot
-`kernel_main` installs each into owofs if absent; `loader.c` parses the ELF into
-a fresh address space. **Adding a program = two edits**: the `*_blob.o` in
-Makefile OBJS and the install block in `kernel_main`. It needs **no** shell
-wiring — `run()`'s final `else` spawns any non-builtin as a `/bin` program (cwd,
-then `/bin`), so `curl <url>`, `hello`, `args x y` run by bare name. Shell
-built-ins are a single `builtins[]` table (`{name, fn, help}`, NULL-fn rows are
-help-only); add a row and `help`/dispatch pick it up.
-
-**Testing gotcha:** owofs (`disk.img`) **persists** the installed `/bin` programs
-and the install is conditional, so after editing a `user/*.c` a plain rebuild
-boots the **stale** copy — `make distclean` to force reinstall.
-
-## Storage: block dispatch & filesystem (blk.c + fs.c + ata/ahci/nvme/sd/atapi)
-
-owofs (fs.c) is a flat 512-byte-sector filesystem with a directory tree; it only
-needs to read/write LBAs. `blk.c` picks **one** backing device at boot — first
-present of **IDE → AHCI → NVMe** (`blk_backend()` names it) — and routes fs.c's
-sector I/O to it; ata/ahci/nvme each expose an identical read/write/present/
-sectors/model API. Two load-bearing safety rules (the SATA/NVMe disk is the
-user's real OS drive on hardware):
-
-- **Auto-format only a blank IDE disk** (`blk_is_ide`). fs_init **never**
-  auto-formats AHCI/NVMe — that would destroy the user's data.
-- **tmpfs fallback**: with no usable owofs disk (no controller, or a disk it
-  mustn't format), fs_init calls `blk_use_ram()` → a volatile RAM disk above the
-  identity map. Always a working FS, just non-persistent (`blk_backend()` →
-  `"tmpfs"`).
-
-owofs is the *boot* volume. **Removable volumes mount under `/media/<name>` via a
-multi-instance mount table (fs.c + `fsmount.h` — see [[multi-mount-vfs]]):**
-several can be mounted at once, including two of the same filesystem. Each driver
-(fat/hfs/ext/iso9660/**ntfs**) is a `struct fs_ops` vtable whose ops take an
-opaque per-mount instance the driver kmalloc's in `probe()`; **fat.c** is
-read+write, the rest read-only (**ntfs.c** is a from-scratch read-only NTFS
-reader: MFT + fixups + runlists + index records). `fs_mount(dev, point)` resolves
-the device via `blk_dev_io`, probes the drivers (iso for a CD, else
-fat/ext/ntfs/hfs), and adds {point, ops, inst} to `mtab[]`; `fs_unmount(point)`
-drops it. `mount_for()` routes any path by longest-prefix to the owning volume or
-owofs. `/media` is a synthetic dir listing active mounts; `/dev` lists the block
-devices. The mount source is any non-owofs device: AHCI/NVMe disks, a USB stick
-(xhci.c BOT/SCSI), an SD card (sd.c), or a CD/DVD (atapi.c). **Nothing
-auto-mounts** — `mount <dev> [point]` / `umount <point>` or the Files app's
-Connect/Unmount buttons. Drivers probe by signature and never auto-format.
-
-`blk.c` enumerates removable devices from one **candidate table** (CD → USB →
-IDE → SATA → NVMe → SD, in mount priority): `blk_device_list()` reports the
-**present** ones (mounted or not — purely each driver's `_present()`, no sector
-I/O) for the Files Devices list, and `blk_mount_device(name)` mounts a chosen
-one. **Hotplug is live where the hardware allows**: the xHCI poll thread sets/
-clears `msc_ready` on USB connect/disconnect, and `sd_present()` reads the SDHCI
-card-detect bit each call (lazy `card_bring_up` on first access). IDE/SATA/NVMe
-presence stays latched at boot (not hot-pluggable here). **Real-hardware caveat:**
-a flaky USB-storage adapter can wedge the xHCI controller mid-transfer; an MMIO
-read to a controller that's fallen off the bus hangs the CPU bus cycle, which no
-software timeout catches — so `mount`/`storage` on such a device can still freeze
-the machine (a hardware fault, not a driver bug). Every *software* wait in the USB
-path is bounded (`event_wait`/`reset_port` time out; `timer_sleep` does `sti; hlt`
-so an IF=0 caller can't deadlock).
-
-**sd.c — SD/MMC over an SDHCI host controller.** Probes PCI for an SD Host
-Controller (class 0x08 / subclass 0x05, e.g. QEMU's `sdhci-pci` + `sd-card`),
-maps BAR0 uncached, runs the SD identification handshake (CMD0/CMD8/ACMD41/CMD2/
-CMD3/CMD9/CMD7), and reads/writes one 512-byte block at a time by **polled PIO**
-through the Buffer Data Port — same read/write/present/sectors/model API as
-ata/ahci/nvme, so blk.c lists it as a removable `/media` source. `sd_init` runs
-before the timer (alongside ahci/nvme), so it busy-spins rather than sleeping.
-SDSC cards are byte-addressed (LBA×512 in the argument), SDHC/SDXC block-
-addressed (the CCS bit from ACMD41 picks which); capacity comes from the CSD.
-
-**atapi.c — CD/DVD over the IDE bus, by PACKET.** A CD/DVD is an ATAPI device:
-SCSI command blocks tunnelled over the ATA bus via the PACKET (0xA0) command, with
-**2048-byte logical sectors** (so it can't share ata.c). `atapi_init` probes both
-IDE channels (0x1F0/0x170), master + slave, and latches the first packet device —
-detected by the **0x14/0xEB signature** a plain IDENTIFY leaves in the byte-count
-registers when it aborts on a packet device. Reads are polled PIO, one logical
-sector per `READ(10)`. Two gotchas that look like hardware bugs: **READ(10) is
-opcode 0x28** (0xA8 is READ(12), with the transfer length in different CDB bytes),
-and the **PACKET data-in loop must settle ~400 ns** (read alt-status ×4) before
-polling status — right after the CDB the drive hasn't raised BSY yet, so a bare
-wait-not-busy sees stale BSY=0/DRQ=0 and quits with zero bytes. A drive with no
-disc is still "present"; reads just fail and the mount falls through. QEMU always
-exposes an (often empty) DVD drive, and `-cdrom` lands it on the **secondary IDE
-master**.
-
-**iso9660.c — read-only ISO 9660 / Joliet.** Sits on atapi.c (its sector source
-is `atapi_read_sector`, the 2048-byte block reader — *not* the 512-byte path the
-other removable FSes use, so blk.c mounts the CD directly rather than through the
-shared fat/hfs/ext probe). The Volume Descriptor chain at sector 16 gives the root
-directory; **Joliet** (the type-2 Supplementary VD, UCS-2 names) is preferred when
-present so files show as long, mixed-case names instead of SHOUTING 8.3 with a
-`;1` suffix. Same read-only fs API as ext.c (list/stat/read_at/enum_dir/label/
-type); path resolution is case-insensitive.
+Per-driver pointers (internals live in the source):
+- **sd.c** — SD/MMC over an SDHCI host controller (PCI class 0x08/0x05), polled
+  PIO one 512-byte block at a time; `sd_init` runs before the timer so it busy-spins.
+- **atapi.c** — CD/DVD over IDE by PACKET, 2048-byte sectors; QEMU lands `-cdrom`
+  on the secondary IDE master.
+- **iso9660.c** — read-only ISO 9660 / Joliet on atapi.c (sector source is the
+  2048-byte `atapi_read_sector`), so blk.c mounts the CD directly.
 
 ## Network stack (nic.c → net.c → tcp.c → tls.c, with crypto.c)
 
-Kernel-side stack; `ping`/`dig` are `/bin` tools over `net_sock_*`. The
-one user-space client is **curl** (`user/curl.c`), all of HTTP/1.1, **HTTP/2** (`--http2`) and **HTTP/3**
-(`--http3`/`-3`) in user space over the `net_sock_*` syscalls (no Berkeley
-sockets; doesn't advertise gzip). HTTP/2 (`user/lib/curl/h2.c`) is HPACK + the
-binary framing over a TLS/TCP socket; HTTP/3 (`user/lib/curl/{quic,h3}.c`) is a
-from-scratch **QUIC v1** transport + QPACK over a `SK_UDP` socket — see the QUIC
-note below. TLS is **client-only**; TCP/UDP have client + server paths (servers =
-services.c daemons). Strictly layered:
-
-- **nic.c — link-layer dispatch.** Each driver exports a `struct nic_ops`
-  (probe/send/mac); `nic_init` probes `{ igb_ops, e1000_ops, rtl8139_ops }` in
-  order and keeps the first present. net.c is driver-agnostic (nic_present/
-  nic_mac/nic_send; inbound via `net_rx_frame()`). `nic_set()` installs a
-  hot-plugged driver at runtime (the planned USB-tethering RNDIS driver registers
-  this way).
-  - rtl8139.c — the classic Realtek card (QEMU default).
-  - e1000.c — Intel Gigabit (8254x/82574/**I217-I219**, the PCH-integrated
-    e1000e/ich8lan parts — *not* the I210/I211): MMIO register file (mapped UC-
-    via `paging_map_uncached`), legacy RX/TX rings, RX IRQ. `make run NIC=e1000`.
-  - igb.c — Intel Gigabit **igb family** (I210/**I211**/82576/82580/I350): a
-    different MAC architecture from e1000 — per-queue descriptor windows
-    (0xC000/0xE000), *advanced* descriptors, and a per-queue RXDCTL/TXDCTL.ENABLE
-    handshake. RX is drained off the timer tick (the `.poll` hook), no RX IRQ, so
-    no GPIE/IVAR setup. MAC from RAL/RAH[0]. **QEMU-verified** against `-device
-    igb` (82576): DHCP lease + traffic over SLIRP; the I210/I211 share this exact
-    code path. `make run NIC=igb`. The I211 (0x1539) is the real-hardware target
-    (e.g. the dev's own box); QEMU has no i210/i211 model, so the 82576 is the
-    in-emulation proxy for the same programming model.
-- **net.c — IPv4**: ARP (cached), ICMP echo, UDP (DNS), a DHCP client, and NTP.
-  DHCP and NTP are now **services** (services.c): `dhcp` autostarts the boot
-  lease, `ntp` syncs on demand (`services start ntp`); re-lease via
-  `services restart dhcp`. `net_rx_frame()` demuxes by EtherType/proto; TCP plugs
-  in via `net_ip_send()`/`tcp_input()`.
-- **tcp.c — active + passive open**, several concurrent connections, each a TCB
-  in a fixed table demuxed by 4-tuple. `tcp_listen` pre-allocates per-slot
-  buffers (the IRQ accept path never allocates); a SYN is accepted **in the IRQ**
-  and `tcp_accept` hands the connection to a daemon thread. Both contexts claim
-  slots through `tcb_alloc()` (scan + reserve with IF off). In-order only, retx
+- Kernel-side stack; `ping`/`dig` are `/bin` tools over `net_sock_*`. The one
+  user-space client is **curl** (`user/curl.c`): HTTP/1.1, HTTP/2 (`--http2`,
+  `user/lib/curl/h2.c`), HTTP/3 (`--http3`, `user/lib/curl/{quic,h3}.c`), all in
+  user space (no Berkeley sockets; doesn't advertise gzip).
+- **nic.c — link-layer dispatch.** Each driver exports `struct nic_ops`;
+  `nic_init` probes `{ igb, e1000, rtl8139 }` and keeps the first present.
+  `nic_set()` installs a hot-plugged driver at runtime.
+  - rtl8139.c — the QEMU default.
+  - e1000.c — Intel **I217–I219** (PCH e1000e/ich8lan), *not* I210/I211: MMIO
+    register file (UC-), legacy RX/TX rings, RX IRQ. `make run NIC=e1000`.
+  - igb.c — Intel **I210/I211/82576/82580/I350**: a different MAC (per-queue
+    descriptor windows, advanced descriptors, per-queue ENABLE handshake), RX
+    drained off the timer tick (no RX IRQ). I211 (0x1539) is the real-HW target;
+    QEMU's 82576 is the in-emulation proxy for the same code path. `make run NIC=igb`.
+- **net.c — IPv4:** ARP (cached), ICMP echo, UDP (DNS); DHCP and NTP are now
+  services (`dhcp` autostarts the boot lease, `ntp` on demand).
+- **tcp.c** — active + passive open, several concurrent TCBs demuxed by 4-tuple; a
+  SYN is accepted in the IRQ and handed to a daemon thread. In-order only, retx
   only SYN/SYN-ACK, no congestion control, no TIME_WAIT — fine over SLIRP.
-- **tls.c + crypto.c — HTTPS**: TLS 1.3 (1.2 fallback), X25519 + AES-128-GCM +
-  SHA-256/HMAC/HKDF, freestanding and allocation-free. **The server cert is not
-  verified** — deliberate: resists passive eavesdropping, not active MITM. Still
-  single-flow (one connection's record state).
-
-RX runs in **interrupt context**, so blocking client APIs (`tcp_read` …)
-`hlt`-spin while the NIC IRQ fills buffers (tick-based idle timeout), rather than
-touching the wire themselves.
-
-**QUIC + HTTP/3 are entirely in user space** (`user/lib/curl/quic.c` + `h3.c`), not in
-the kernel: a from-scratch **QUIC v1** client (RFC 9000/9001) over a `SK_UDP`
-socket, with its own TLS 1.3 handshake carried in CRYPTO frames (same key
-schedule as kernel `tls.c`, mirrored in `user/lib/crypto` — SHA-256/HMAC/HKDF +
-AES-128-GCM + AES-ECB header protection + X25519), then HTTP/3 framing + QPACK
-(`h3.c`, static table only — we advertise a zero-cap dynamic table so responses
-decode without dynamic state; HPACK's Huffman is reused). Same pragmatic scope as
-the TCP stack: one connection at a time (file-static state), `TLS_AES_128_GCM_
-SHA256` + x25519 only, **server cert not verified**, in-order/lossless delivery
-assumed, only the client-bidi request stream buffered for reading (server uni
-streams — control + QPACK — are consumed and discarded). Two **general** kernel
-enablers were needed and live in net.c: the UDP socket now buffers a *ring* of
-datagrams (`SOCK_DGRING`) instead of one slot (a QUIC handshake flight spans
-several datagrams), and `net_udp_send`'s payload cap rose from 512 to a full MTU
-(QUIC's Initial datagram must be ≥1200 bytes). Verified in QEMU against a local
-aioquic server and **production Cloudflare** (`curl --http3 https://cloudflare-
-quic.com/` → `HTTP/3 200`). curl's big stack buffers in `emit`/`send_crypto` are
-`static` (single-flow) — at `-O0` the deep call chain otherwise overflows the
-16 KiB user stack.
+- **tls.c + crypto.c** — TLS 1.3 (1.2 fallback), X25519 + AES-128-GCM +
+  SHA-256/HMAC/HKDF, freestanding. **The server cert is not verified** —
+  deliberate: resists passive eavesdropping, not active MITM.
+- **RX runs in interrupt context**, so blocking client APIs (`tcp_read` …)
+  `hlt`-spin while the NIC IRQ fills buffers, rather than touching the wire.
+- **QUIC + HTTP/3 are entirely user space** (QUIC v1 over `SK_UDP`, own TLS 1.3 in
+  CRYPTO frames + QPACK static-table). One connection at a time, cert not verified,
+  loss-free assumed. Two **general** kernel enablers in net.c: the UDP socket
+  buffers a *ring* of datagrams (`SOCK_DGRING`), and `net_udp_send`'s cap rose from
+  512 to a full MTU (QUIC's Initial must be ≥1200 bytes).
 
 ## Services (services.c + UDP hooks in net.c)
 
-Headless daemons in a fixed enum-indexed registry; each has up to
-`on_start`/`on_stop`/`tick` callbacks.
+Headless daemons in a fixed enum-indexed registry (`on_start`/`on_stop`/`tick`).
 
-- **One supervisor thread for cheap services, a dedicated thread per stream
-  one.** "servicesd" round-robins `tick` over RUNNING services and yields; start/
-  stop just flips a flag (kernel threads can't be reaped, so none are created/
-  destroyed at runtime). UDP daemons (`echod`, `daytimed`) have no tick — they
-  serve from the RX IRQ. **TCP daemons (`echotcp`, `smbd`) can't** (they block in
-  tcp_read/write), so each owns a thread that loops `tcp_accept → serve → close`
-  and parks while stopped; `on_stop` trips a flag to wake a blocked `tcp_accept`.
-- **UDP daemons serve from interrupt context.** `net_udp_listen(port, fn)`
+- **One supervisor thread for cheap services, a dedicated thread per stream one.**
+  "servicesd" round-robins `tick` over RUNNING services; start/stop just flips a
+  flag. UDP daemons (`echod`, `daytimed`) have no tick — they serve from the RX
+  IRQ. TCP daemons (`echotcp`, `smbd`) own a thread looping `tcp_accept → serve →
+  close`; `on_stop` trips a flag to wake a blocked `tcp_accept`.
+- **UDP daemons serve from interrupt context:** `net_udp_listen(port, fn)`
   registers a handler; `udp_recv` demuxes by dest port and replies with
-  `net_udp_send` (safe from the IRQ — `nic_send` clears IF around the TX). Keep
-  `udp_recv`'s call site in `ip_recv` in sync (it takes the source IP).
+  `net_udp_send` (safe from the IRQ). Keep `udp_recv`'s call site in `ip_recv` in
+  sync (it takes the source IP).
+- **One-shot services** (`dhcp`, `ntp`) have no tick/port — their `on_start` *is*
+  the action. `dhcp` autostarts and spawns an async client thread; `ntp` is
+  on-demand. Re-trigger with `services restart <name>`.
+- Adding a service = one registry edit (+ an accept-loop thread for a TCP one).
+- Testing needs a `hostfwd` (SLIRP blocks inbound; `make run`/`debug` bake in
+  `hostfwd=tcp::1445-:445` for smbd); guest IP is 10.0.2.15.
 
-- **One-shot services** (`dhcp`, `ntp`) have no tick/port: their `on_start` *is*
-  the action. `dhcp` autostarts (it owns the boot lease — there's no inline DHCP
-  in `boot_bringup` anymore) and spawns the async client thread so it never
-  blocks bring-up; `ntp` is start-on-demand and runs its synchronous SNTP sync
-  from the command context (IF=1). Re-trigger with `services restart <name>`.
+## Subsystem pointers (internals live in the source)
 
-Auto-start daemons come up in `services_init` before `sti`. Adding a service =
-one registry edit (+ an accept-loop thread for a TCP one). Testing needs a
-`hostfwd` (SLIRP blocks inbound; `make run`/`debug` bake in
-`hostfwd=tcp::1445-:445` for smbd); guest IP is 10.0.2.15.
-
-**`sti` before `hlt` in every thread-context wait loop — load-bearing.**
-`context_switch` does *not* save/restore EFLAGS, so a thread resumed by a
-*cooperative* `sched_yield` from an IF-clear context inherits IF=0; a bare `hlt`
-then halts the CPU forever and freezes the system. `tcp_accept`/`tcp_read`/
-`tcp_connect` wait with `sti; hlt`. **Same trap from a user-space syscall**: the
-`int 0x80` gate runs with IF=0, so anything a syscall reaches that spins on `hlt`
-must `sti; hlt` too (this is why making curl a user program required fixing
-`arp_resolve`/`dns_resolve`, whose loops were bare `hlt`).
-
-## SMB server (smb.c, the `smbd` service)
-
-Read-only **SMB2 file server** (dialect 2.0.2 only) exposing owofs as a share
-`owofs`, riding the TCP listen/accept path. `smb_serve()` runs the conversation
-synchronously (one request → one response). One client at a time; buffers + the
-handle table live in a single ~140 KiB `static` struct, not on the stack. Walks
-`NEGOTIATE → SESSION_SETUP → TREE_CONNECT → CREATE → QUERY_DIRECTORY/QUERY_INFO/
-READ → CLOSE`.
-
-- **Little-endian SMB2** framed by a 4-byte big-endian NetBIOS length on TCP/445.
-- **Auth is cosmetic**: SESSION_SETUP completes the NTLMSSP/SPNEGO handshake but
-  accepts any credentials as guest and verifies nothing.
-- **The full owofs tree is navigable.** A CREATE name is converted from SMB form
-  (`smb_to_path`: "bin\hello" → "/bin/hello") and resolved via `fs_stat`;
-  QUERY_DIRECTORY lists a directory's children (files + subdirs) via
-  `fs_enum_dir` plus "."/"..".
-- **Handles** are a small fixed table; the FileId encodes the slot. READ streams
-  via `fs_read_at`, chunked across messages. owofs mtimes → Windows FILETIME via
-  `owofs_filetime`.
-- Verified against Linux `smbclient` (ls + cd + byte-exact get on >64 KiB files),
-  KDE Dolphin, and `mount -t cifs`. `smbclient -L` (enumeration) **won't** work —
-  it needs an IPC$ srvsvc pipe that isn't implemented. Connect to the share
-  directly.
-
-## BitTorrent client (user/lib/torrent: bencode.c → torrent.c → tracker.c → peer.c)
-
-A from-scratch torrent client, **entirely in user space** now: the `/bin/torrent`
-program (`user/torrent.c`) over the `user/lib/torrent/` library, driven by
-`torrent info`/`peers`/`peer`/`get`. (The old kernel-side copy was removed once
-the user-space one existed.) Layered like the rest of the stack:
-
-- **bencode.c — the wire encoding.** A parser for bencode (the int/string/list/
-  dict format `.torrent` files and tracker replies use). Nodes are heap-allocated
-  from a pool; spans point into the source buffer, which must outlive them.
-- **torrent.c — metainfo.** Pulls `announce`/`name`/`pieces` out of the bencoded
-  dict and computes the 20-byte **infohash = SHA-1 of the info dict's exact
-  on-disk bytes** (crypto.c) — the identifier used everywhere downstream. The
-  span fields point into the source buffer; release the node pool with
-  `torrent_free()`.
-- **tracker.c — announce.** HTTP GET to the tracker with the infohash + peer id,
-  parses the compact peer list out of the bencoded response.
-- **peer.c — the peer wire protocol.** Handshake, bitfield/interested/unchoke,
-  request a piece, and **verify the downloaded piece's SHA-1** against `pieces`.
-
-`torrent get <file>` chains all four to download a whole single-file torrent to
-owofs. TCP-only over the existing `tcp_connect`/`tcp_read` client path.
-
-## SQLite library (user/lib/sqlite) + the browser jar (user/browser/jar.c)
-
-A from-scratch reader/writer for the **real SQLite3 file format**, entirely in
-user space (`user/lib/sqlite/sqlite.{c,h}`). `sql_save()` emits a byte-for-byte
-valid `.sqlite` file — the 100-byte database header, table b-trees built **bottom
-up** (leaf pages, plus interior pages when a table outgrows one page), the
-record/serial-type encoding, and SQLite varints — and `sql_open()` parses one
-back. Files written here open in the host `sqlite3` shell (verified: `PRAGMA
-integrity_check` → `ok` on a 500-row / 26-page db) and real SQLite files load
-here. It is an **in-memory model**, matching OwOS's whole-file I/O: `sql_open`
-reads the file (via `readfile_at`, growing the buffer to the true size — no cap),
-parses it into tables/rows, you mutate in RAM, `sql_save` serialises the whole
-db back with `writefile`. Scope: table b-trees (leaf + interior), NULL/int/
-float/TEXT/BLOB columns, UTF-8; **no** index b-trees, overflow pages (so one
-record must fit a 4 KiB page — true for everything we write), or WAL. The API is
-a typed C one (`sql_new`/`sql_create_table`/`sql_insert`/`sql_table_find`/row
-walk); links with `$(SQLITE)` and needs `$(LIBGCC)` for 64-bit varint math.
-
-It is a **general** library; its first user is the **browser's persistent cookie
-+ HSTS jar** (`user/browser/jar.c`, file `/home/root/cookies.db`). Two tables —
-`cookies(host,name,value)` and `hsts(host)` — in one real SQLite db. `jar_load()`
-fills `B->cookies` + `B->hsts` at boot; `jar_save()` rewrites the whole db after
-any Set-Cookie / Strict-Transport-Security change. Both in-memory lists are
-**uncapped heap linked lists** (no `MAX_COOKIES`, no fixed field widths) — malloc
-exists. The HTTP transport (`fetch.c`) only calls `cookie_store`/`cookie_header`/
-`hsts_add`/`hsts_has`; **no SQL lives in fetch.c**.
-
-## libcurl HTTP header object (user/lib/curl/headers.c)
-
-Response headers are parsed **once** into a k/v object, never re-scanned by each
-client. `http_headers_parse(&h, block)` turns a raw header block (HTTP/1.1 or the
-h2-synthesized form) into `{status, fields[]}`; clients query `http_headers_get`/
-`http_headers_count`/`http_headers_at` (case-insensitive; repeated headers like
-Set-Cookie kept in order) plus value helpers `http_header_has_token` /
-`http_parse_uint`. Names are lowercased, values are trimmed NUL-terminated heap
-copies (**no value-length cap**). This replaced the copy-pasted `starts_ci(line,
-"…")` walks in both `curl`'s `http.c` and the browser's `parse_response`. Links
-with `$(HEADERS)` (curl + browser). The browser also honours **`X-Content-Type-
-Options: nosniff`**: with it set, `render_raw` treats the body as HTML only when
-the server *declared* an HTML type — the empty-Content-Type → HTML guess is
-suppressed.
-
-## Brotli codec (user/lib/brotli: decode.c + encode.c + dictionary.bin)
-
-A from-scratch **RFC 7932** codec, entirely user space, for the HTTP `br`
-content-coding (and, eventually, WOFF2). Both halves are **whole-buffer** (the
-Brotli stream doesn't carry its decompressed size): they take a full buffer and
-return a malloc'd one the caller frees (`brotli_decompress`/`brotli_compress`,
-NULL on error). The 122,784-byte RFC static dictionary ships as `dictionary.bin`,
-objcopy'd into a blob (`$(BROTLIDICT)`, the path-derived symbol
-`_binary_user_lib_brotli_dictionary_bin_start` that decode.c externs) and linked
-only into consumers (browser + curl via `$(BROTLI)`).
-
-- **decode.c is a complete decoder**: stream/meta-block headers, simple + complex
-  prefix codes (the §3.5 RLE-extension and the single-symbol code-length-code
-  that is a **0-bit** code — see below), block splits, literal + distance context
-  modelling, the distance ring with postfix/direct codes, and static-dictionary
-  references with the 121 word transforms. Its constant tables (context lookup,
-  prefix/suffix transform data, dictionary offsets, command split, block-length
-  ranges) are the **authoritative reference values**; an earlier WIP's
-  `DICT_OFFSET` was shifted by one and is fixed.
-- **encode.c is greedy LZ77 + per-meta-block Huffman** — real compression, a
-  pragmatic ratio (no context modelling / optimal parse / dictionary use, so
-  ~10× larger than `brotli -q11` on text but excellent on repetitive data). It
-  keeps the format simple where allowed: one block type + one tree per category,
-  NPOSTFIX=NDIRECT=0, only regular distance codes (never the ring's short codes),
-  and length-limited Huffman via the **reference's own trick** (raise the leaf-
-  weight floor and rebuild until depth ≤ 15). Its match-finder/frequency scratch
-  is **file-static**, not on the stack (the 16 KiB user stack would overflow);
-  meta-blocks are chunked at 1<<18 so the command buffer stays bounded while
-  back-references still span the whole window.
-- **Two non-obvious format invariants, load-bearing for both halves:** the
-  decoder stops reading code-length symbols (and code-length-*code* lengths) the
-  instant the Huffman space is exhausted, so the encoder must emit **exactly** up
-  to that point — no trailing entries, or the bitstream desyncs. And a
-  code-length-code with a **single** symbol never empties its space, so it is a
-  0-bit code: the encoder emits the per-symbol lengths with zero bits and the
-  decoder must decode them with zero bits (this is the all-symbols-same-length
-  case, e.g. a full 256-symbol literal alphabet — the reference rejects anything
-  else with `CL_SPACE`).
-- **Verified** on the host against the system `brotli` CLI: our-decode of
-  `brotli`-encoded streams across every quality/window, our-encode round-tripped
-  through both `brotli -d` and our own decoder, ~700 differential + fuzz cases,
-  ASan/UBSan-clean. See [[userspace-lib-over-syscall]] (codecs are user-space libs,
-  never syscalls) and the zlib codecs for the streaming-`inflate` counterpart.
-  The browser's HTTP/1.1 path advertises `br` and decodes it via a `brotli_http`
-  helper that buffers the body then `brotli_decompress`es it (h2 stays identity).
-
-## ACPI, power & battery (power.c + aml.c + battery.c)
-
-Mostly **real-hardware features** (QEMU has shutdown but no battery).
-
-- **power.c — shutdown/reboot + ACPI walking.** `power_off()` does ACPI S5;
-  `power_reset()` reboots via the 8042, then triple-faults. To shut down it finds
-  the RSDP (scan the legacy BIOS area, or the copy `acpi_set_rsdp` stashed from
-  the mb2 tag — the only route under UEFI), walks **XSDT** (ACPI 2.0+) or
-  **RSDT**, finds the **FADT** (`"FACP"`), reaches the **DSDT** (preferring 64-bit
-  X_DSDT), and digs `_S5` out of its AML; high tables via `paging_identity_map`.
-  Exposes `acpi_aml_contains` (substring scan over DSDT + every SSDT) and
-  `acpi_for_each_aml` for battery.c/aml.c.
-- **aml.c — a tiny best-effort AML interpreter**, scoped to reading the battery
-  via `_BST` + `_BIF`/`_BIX`. **Not** an ACPICA replacement — only the opcode
-  subset those methods use (EC field reads, Store/Index, If/While, arithmetic,
-  method calls, Packages); **fails gracefully** (returns 0, never crashes/hangs).
-  `aml_last_error()` gives a note for on-hardware debugging.
-- **battery.c — best-effort battery for the neofetch splash.** `battery_present()`
-  scans the AML for a battery `_HID`; `battery_percent()` evaluates it via aml.c;
-  `battery_error()` surfaces failures (QEMU can't exercise this — keep it).
-
-## USB host & phone tethering (xhci.c + usb.c)
-
-- **usb.c — the `lsusb` command (UHCI).** Finds USB controllers on PCI
-  (0x0C/0x03), and for **UHCI** (QEMU's PIIX3) drives a real control transfer
-  over endpoint 0 (a minimal frame-list → queue-head → SETUP/DATA/STATUS TD
-  schedule in palloc'd low memory where phys == virt) to fetch device
-  descriptors — so `usb-tablet` shows up by name.
-- **xhci.c — the xHCI (USB 3.x) host**, for modern laptops (Intel dropped EHCI
-  ~Skylake, so every port routes through xHCI). `xhci_init(detail_port)` is the
-  `lsusb` backend for xHCI; `xhci_boot()` (after `sti` — uses `timer_sleep`)
-  brings the host up at boot and keeps it persistent so a tethered phone keeps
-  offering tethering.
-
-**Goal:** phone tethering — enumeration (Milestone 1, QEMU-verified) → bulk
-transfers → an RNDIS/CDC driver that registers as a `nic_ops` (`nic_set`) so a
-tethered phone is just another NIC. Chosen over native Wi-Fi for laptop internet.
-
-## Audio (drivers/audio: speaker.c + sb16.c + hda.c)
-
-Three back ends, picked by `play`: PC-speaker tones (`speaker.c`), and two WAV
-players — `sb16.c` and `hda.c`. `play <file.wav>` prefers HDA when present
-(`hda_present()`), else SB16; both share the same RIFF/WAVE parse + Ctrl+C stop.
-
-- **sb16.c — Sound Blaster 16**, legacy ISA: DSP reset at 0x220, 8-bit PCM over
-  8237 auto-init DMA (channel 1, IRQ 5), down-converted to 8-bit mono. QEMU-only
-  (`-device sb16`).
-- **hda.c — Intel HD Audio + a Realtek codec**, the real-laptop path. An HDA
-  *controller* (PCI 0x04/0x03) is a bus-master with an MMIO register file; the
-  *codec* (a Realtek ALC on real HW, QEMU's `hda-output` in emulation) is what
-  has the DAC and output pins. So "Realtek audio" = HDA controller + codec, one
-  driver. Non-obvious bits, all load-bearing:
-  - **Codec comms = CORB/RIRB command rings** (spec-mandated; the immediate-
-    command interface is optional and absent on some real chips). One verb in
-    flight, polled — CORB index N ↔ RIRB index N.
-  - **The output path is discovered, not hardcoded:** walk the codec's widget
-    graph (root → audio function group → widgets) to find an output-capable pin
-    (ranked speaker > line-out > headphone) that reaches a DAC directly or via
-    one mixer/selector hop, then power/format/unmute/EAPD that path. QEMU gives
-    DAC nid 2 → pin nid 3; a Realtek codec has a mixer in between.
-  - **Playback polls SDnLPIB**, not an IRQ — no PCI interrupt wiring, which dodges
-    IRQ-sharing trouble on real hardware. Cyclic 2-half DMA buffer, refill the
-    half the link position just left (the SB16 gapless idea over HDA streams).
-  - **Everything is resampled to 48 kHz/16-bit/stereo** (nearest-neighbour), so
-    any WAV rate plays regardless of what the HDA format register can encode.
-  - **The volume/Fn keys drive HDA when present, else the SB16 mixer** (keyboard.c,
-    see [Media/Fn keys]). `hda_volume_*` set one output-amp widget (pin>DAC>mixer,
-    chosen at init) on a 0..8 scale; they run from the keyboard IRQ, so `codec_cmd`
-    masks interrupts around its CORB/RIRB ring update to stay atomic.
-  - **`hda_init` runs before `sti`** (alongside `sb16_init`), so it **busy-waits**
-    (like `sd_init`) — no `timer_sleep`. Playback runs from the shell with
-    interrupts on, so its poll loop *can* `timer_sleep`.
-  - **DMA buffers:** `pmm_alloc_contig` only *reserves* frames above the 16 MiB
-    identity map — it does **not** map them. Map with `paging_identity_map`
-    before first touch (same as fb.c's back buffer). Left write-back cached; x86
-    keeps bus-master DMA cache-coherent, so no flush and fast fills.
-  - QEMU-verified (controller reset + codec enumeration + a stream that advances
-    LPIB and drains cleanly). **Audible output and real Realtek codec quirks
-    (pin defaults, amp/EAPD/GPIO for the speaker) are real-hardware-only** — the
-    usual "QEMU passes, the laptop is the real test" caveat applies.
-
-## Gotcha: a security hook misfires on a C identifier
-
-A repo hook blocks any Write/Edit whose content contains `e`,`x`,`e`,`c`
-immediately followed by `(` — it misfires thinking it's a Node child-process
-call. False positive on this C codebase, but it blocks the edit. That's why the
-kernel function is `sched_replace`, the libc wrapper is `execp`, and comments say
-"the run-image syscall" rather than spelling it with a parenthesis.
+- **SMB server (smb.c, the `smbd` service)** — read-only SMB2 (dialect 2.0.2)
+  exposing owofs as share `owofs`, one client at a time. **Auth is cosmetic**
+  (accepts any credentials as guest). `smbclient -L` won't work (no IPC$ srvsvc
+  pipe) — connect to the share directly.
+- **BitTorrent (user/lib/torrent)** — from-scratch client entirely in user space
+  (`/bin/torrent info|peers|peer|get`), TCP-only over `tcp_connect`/`tcp_read`.
+- **SQLite (user/lib/sqlite)** — from-scratch reader/writer for the real SQLite3
+  file format; in-memory model (whole-file `sql_open`/`sql_save`). Scope: table
+  b-trees + NULL/int/float/TEXT/BLOB; **no index b-trees, overflow pages, or WAL**
+  (one record must fit a 4 KiB page). First user is the browser cookie+HSTS jar
+  (`user/browser/jar.c`, `/home/root/cookies.db`); SQL stays out of fetch.c.
+- **HTTP headers (user/lib/curl/headers.c)** — response headers parsed once into a
+  k/v object (case-insensitive, repeats kept in order), shared by curl + browser.
+  The browser also honors `X-Content-Type-Options: nosniff`.
+- **Brotli (user/lib/brotli)** — from-scratch RFC 7932 decoder + encoder, user
+  space, whole-buffer, for the HTTP `br` content-coding; verified vs the system
+  `brotli` CLI. The browser's HTTP/1.1 path advertises and decodes `br`.
+- **ACPI/power/battery (power.c + aml.c + battery.c)** — mostly real-HW.
+  `power_off()` does ACPI S5; it finds the RSDP (legacy scan, or the mb2 copy from
+  `acpi_set_rsdp` — the only route under UEFI), walks XSDT/RSDT → FADT → DSDT.
+  aml.c is a tiny best-effort interpreter scoped to the battery; **fails gracefully**
+  (returns 0, never crashes). Battery is real-HW-only — keep its diagnostics.
+- **USB host & tethering (xhci.c + usb.c)** — `lsusb` over UHCI + xHCI; `xhci_boot`
+  keeps the host persistent. Goal: phone tethering via an RNDIS driver registering
+  as a `nic_ops`. **Tethering does not work on real hardware** — not a usable
+  fallback; the wired NIC is the real path to laptop internet.
+- **Audio (drivers/audio: speaker.c + sb16.c + hda.c)** — `play <file.wav>` prefers
+  HDA (`hda_present()`) else SB16; both share the RIFF/WAVE parse + Ctrl+C stop.
+  `hda_init` runs before `sti` so it busy-waits; DMA buffers from `pmm_alloc_contig`
+  must be `paging_identity_map`'d before first touch; volume/Fn keys run from the
+  keyboard IRQ (drive HDA when present, else the SB16 mixer). Real Realtek codec
+  quirks are real-HW-only.

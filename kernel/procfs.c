@@ -26,6 +26,7 @@
 #include "fs.h"
 #include "sched.h"
 #include "pci.h"
+#include "smp.h"
 #include "ata.h"
 #include "ahci.h"
 #include "nvme.h"
@@ -60,6 +61,7 @@ static void gen_cpuinfo(struct pb *b)
 	if (!mhz) mhz = cpu_mhz();
 	ps(b, "model "); ps(b, brand[0] ? brand : "unknown"); pc(b, '\n');
 	ps(b, "mhz ");   pu(b, mhz); pc(b, '\n');
+	ps(b, "cpus ");  pu(b, (uint32_t)smp_cpu_count()); pc(b, '\n');
 }
 
 static void gen_meminfo(struct pb *b)

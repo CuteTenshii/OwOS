@@ -113,15 +113,74 @@ static int face_ready(struct gfx_face *f, const char *path, int px)
 	return f->font != 0;
 }
 
-static struct gcache_e *face_glyph(struct gfx_face *f, unsigned cp)
+/* Look up codepoint cp in a direct-mapped glyph cache of n slots over `font` at
+ * `px`, rasterizing (and evicting the slot's previous occupant) on a miss. The
+ * cache array, its size, the font and the px are all explicit so both the fixed
+ * faces and the size-keyed sans pool below share one implementation. */
+static struct gcache_e *cache_glyph(struct font *font, int px,
+                                    struct gcache_e *cache, int n, unsigned cp)
 {
-	struct gcache_e *g = &f->cache[cp % FACE_CACHE];
+	struct gcache_e *g = &cache[cp % n];
 	if (g->valid && g->cp == cp) return g;
 	if (g->valid) { free(g->bm); g->bm = 0; }
-	int gi = font_glyph_index(f->font, (int)cp);
-	g->bm = font_render_glyph(f->font, gi, (float)f->px, &g->w, &g->h, &g->ox, &g->oy, &g->adv);
+	int gi = font_glyph_index(font, (int)cp);
+	g->bm = font_render_glyph(font, gi, (float)px, &g->w, &g->h, &g->ox, &g->oy, &g->adv);
 	g->cp = cp; g->valid = 1;
 	return g;
+}
+
+static struct gcache_e *face_glyph(struct gfx_face *f, unsigned cp)
+{
+	return cache_glyph(f->font, f->px, f->cache, FACE_CACHE, cp);
+}
+
+/* Size-keyed sans cache pool. The primary g_sans face is pinned at SANS_PX (the
+ * body-text fast path); other pixel sizes — e.g. the browser's h1..h6 headings —
+ * each get a slot here, reusing the already-loaded g_sans.font so nothing is
+ * re-read from disk. Slots are reclaimed least-recently-used when more distinct
+ * sizes are seen than there are slots. */
+#define SIZED_FACES 6
+#define SIZED_CACHE 256
+struct sized_face { int px, baseline; unsigned lru; struct gcache_e cache[SIZED_CACHE]; };
+static struct sized_face g_sized[SIZED_FACES];
+static unsigned g_lru_tick;
+
+/* Return the pool slot serving `px` (g_sans.font assumed loaded), retargeting and
+ * flushing an LRU slot if this size isn't already resident. */
+static struct sized_face *sized_slot(int px)
+{
+	int empty = -1, lru = 0;
+	for (int i = 0; i < SIZED_FACES; i++) {
+		if (g_sized[i].px == px) { g_sized[i].lru = ++g_lru_tick; return &g_sized[i]; }
+		if (g_sized[i].px == 0 && empty < 0) empty = i;
+		if (g_sized[i].lru < g_sized[lru].lru) lru = i;
+	}
+	struct sized_face *s = &g_sized[empty >= 0 ? empty : lru];
+	for (int i = 0; i < SIZED_CACHE; i++)
+		if (s->cache[i].valid) { free(s->cache[i].bm); s->cache[i].bm = 0; s->cache[i].valid = 0; }
+	s->px = px;
+	font_vmetrics(g_sans.font, (float)px, &s->baseline, 0, 0);
+	s->lru = ++g_lru_tick;
+	return s;
+}
+
+/* A resolved sans face at some px: the shared font, its baseline, and the glyph
+ * cache (slots + size) to use. SANS_PX resolves to the primary g_sans face. */
+struct face_view { struct font *font; int px, baseline; struct gcache_e *cache; int n; };
+
+static int sans_view(int px, struct face_view *v)
+{
+	if (px <= 0) px = SANS_PX;
+	if (!face_ready(&g_sans, SANS_PATH, SANS_PX)) return 0;
+	if (px == SANS_PX) {
+		v->font = g_sans.font; v->px = SANS_PX; v->baseline = g_sans.baseline;
+		v->cache = g_sans.cache; v->n = FACE_CACHE;
+	} else {
+		struct sized_face *s = sized_slot(px);
+		v->font = g_sans.font; v->px = px; v->baseline = s->baseline;
+		v->cache = s->cache; v->n = SIZED_CACHE;
+	}
+	return 1;
 }
 
 /* Blit a cached glyph with its top-left at (x + ox, baseline + oy). */
@@ -158,30 +217,46 @@ void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg)
 
 /* Proportional UI text (UTF-8). UIFONT_H stays the advertised line height apps
  * lay out against; the glyph sits on its baseline within that. */
-int gfx_ui_cw_cp(unsigned cp)
+int gfx_ui_cw_cp_px(unsigned cp, int px)
 {
-	if (!face_ready(&g_sans, SANS_PATH, SANS_PX)) return GFX_FONT_W;
-	return face_glyph(&g_sans, cp)->adv;
+	struct face_view v;
+	if (!sans_view(px, &v)) return GFX_FONT_W;     /* sans missing: mono cell */
+	return cache_glyph(v.font, v.px, v.cache, v.n, cp)->adv;
 }
+int gfx_ui_cw_cp(unsigned cp) { return gfx_ui_cw_cp_px(cp, SANS_PX); }
 int gfx_ui_cw(unsigned char c) { return gfx_ui_cw_cp(c); }
 
-int gfx_ui_width(const char *s)
+int gfx_ui_width_px(const char *s, int px)
 {
 	const char *end = s + strlen(s);
 	int w = 0; unsigned cp;
-	while (s < end) { s += utf8_decode(s, end, &cp); w += gfx_ui_cw_cp(cp); }
+	while (s < end) { s += utf8_decode(s, end, &cp); w += gfx_ui_cw_cp_px(cp, px); }
 	return w;
 }
+int gfx_ui_width(const char *s) { return gfx_ui_width_px(s, SANS_PX); }
 
-void gfx_ui_text(int x, int y, const char *s, unsigned fg)
+int gfx_ui_ascent_px(int px)
+{
+	struct face_view v;
+	if (!sans_view(px, &v)) return px <= 0 ? SANS_PX : px;
+	return v.baseline;
+}
+
+/* Proportional UI text (UTF-8, accents/Greek/Cyrillic via the font's cmap) at an
+ * arbitrary pixel size. SANS_PX (the default) draws from the primary cached face;
+ * other sizes are cached per the size-keyed pool above — so headings repaint by
+ * blitting too, not re-rasterizing. With no sans font, falls back to the fixed
+ * monospace cell. */
+void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px)
 {
 	const char *end = s + strlen(s);
 	unsigned cp;
-	if (face_ready(&g_sans, SANS_PATH, SANS_PX)) {
+	struct face_view v;
+	if (sans_view(px, &v)) {
 		while (s < end) {
 			s += utf8_decode(s, end, &cp);
-			struct gcache_e *g = face_glyph(&g_sans, cp);
-			face_blit(x, y + g_sans.baseline, g, fg);
+			struct gcache_e *g = cache_glyph(v.font, v.px, v.cache, v.n, cp);
+			face_blit(x, y + v.baseline, g, fg);
 			x += g->adv;
 		}
 		return;
@@ -191,6 +266,11 @@ void gfx_ui_text(int x, int y, const char *s, unsigned fg)
 		gfx_glyph(x, y, cp < 0x80 ? (unsigned char)cp : '?', fg, GFX_TRANSPARENT);
 		x += GFX_FONT_W;
 	}
+}
+
+void gfx_ui_text(int x, int y, const char *s, unsigned fg)
+{
+	gfx_ui_text_px(x, y, s, fg, SANS_PX);
 }
 
 /* --------------------------------------------------------------- GUI widgets */

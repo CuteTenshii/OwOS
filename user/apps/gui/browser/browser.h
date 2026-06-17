@@ -70,6 +70,14 @@ extern int BW, BH;         /* client size (mutable: the window is resizable)    
 #define ST_BOLD    0x10
 #define ST_UNDER   0x20
 
+/* Per-glyph block-layout byte (B->bp): paragraph size/kind, alignment, monospace
+ * and indent. Shared by the html walk (sets it) and the renderer (applies it). */
+#define BP_SIZE      0x07   /* 0 = body, 1..6 = h1..h6, 7 = horizontal rule */
+#define BP_CENTER    0x08
+#define BP_MONO      0x10
+#define BP_INDENT    0xE0
+#define BP_INDENT_SH 5
+
 /* How the fetched body is rendered, picked from the response Content-Type. */
 enum render_mode { MODE_HTML, MODE_TEXT, MODE_IMAGE };
 
@@ -136,6 +144,11 @@ struct browser {
 	char         *raw;       int raw_len,      raw_cap;
 	char         *text;
 	unsigned char *attr;     int text_len,     text_cap;
+	/* Per-glyph block layout: bp packs the block kind/size, alignment, monospace
+	 * and indent of the paragraph a glyph belongs to (BP_* in html.c); bg is a
+	 * background palette index (0xFF = none). Same capacity as text/attr. */
+	unsigned char *bp;
+	unsigned char *bgi;
 
 	struct link *links;      int nlinks,       links_cap;
 

@@ -391,12 +391,12 @@ void syscall_dispatch(struct registers *r)
 			 * keep firing), then drain whatever else is buffered. */
 			char c;
 			__asm__ volatile ("sti");
-			while (!keyboard_poll(&c))
+			while (!keyboard_poll(&c, 0))
 				__asm__ volatile ("hlt");
 			__asm__ volatile ("cli");
 			uint32_t n = 0;
 			buf[n++] = c;
-			while (n < len && keyboard_poll(&c))
+			while (n < len && keyboard_poll(&c, 0))
 				buf[n++] = c;
 			r->eax = n;
 		} else if (f->type == FD_PIPE_RD) {

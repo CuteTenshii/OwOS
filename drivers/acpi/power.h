@@ -29,6 +29,13 @@ int acpi_aml_contains(const unsigned char *needle, unsigned int n);
 void acpi_for_each_aml(void (*fn)(const unsigned char *body, unsigned int len,
                                   void *ctx), void *ctx);
 
+/* Locate and identity-map a primary ACPI table by its 4-character signature
+ * (e.g. "APIC" for the MADT). Walks whichever root table the RSDP names (XSDT or
+ * RSDT) and maps the whole table. Returns the mapped table base (an sdt_header:
+ * the u32 at offset 4 is its total length), or NULL if ACPI is unreachable or
+ * the table is absent. */
+void *acpi_find_table(const char *sig);
+
 /* Stash a copy of the firmware RSDP the bootloader handed us (multiboot2 ACPI
  * tag). On a UEFI boot the RSDP is NOT in the legacy BIOS memory area, so this
  * is the only way the ACPI shutdown/AML code can find the tables. Pass the raw
