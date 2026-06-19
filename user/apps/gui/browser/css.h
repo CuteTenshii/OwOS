@@ -34,6 +34,11 @@ css_sheet *css_new(void);
 void       css_add(css_sheet *sheet, const char *src, int len);   /* a <style> block */
 void       css_free(css_sheet *sheet);
 
+/* The current viewport, what @media (min/max-width|height), orientation and
+ * prefers-color-scheme test against. The browser sets it before each cascade
+ * (and on resize, so media queries re-evaluate). Defaults to a sane size. */
+void       css_set_viewport(int width, int height);
+
 /* @font-face faces declared in the sheet: each a family name + a src URL (the
  * first raw TTF/OTF url; woff/woff2 entries are skipped — we can't decode them).
  * The browser fetches the url and loads the face, keyed by family. */
@@ -46,5 +51,18 @@ void css_apply_sheet(css_sheet *sheet, const struct dom_node *el, struct css_sty
 void css_apply_inline(const char *decls, struct css_style *out);
 /* Fold HTML presentational attrs (color/bgcolor/width/height) into *out (lowest). */
 void css_apply_attrs(const struct dom_node *el, struct css_style *out);
+
+/* Devtools Styles pane: the rules whose selector matches `el`, winner first.
+ * Each carries the reconstructed selector text, the @media prelude ("" if none)
+ * plus whether that media currently applies, and the rule's declarations (the
+ * subset css.c models). Returns the number written (<= cap). */
+struct css_match {
+	char             selector[160];
+	char             media[128];
+	int              active;        /* 1 = the @media currently matches */
+	struct css_style decl;
+};
+int css_matches(css_sheet *sheet, const struct dom_node *el,
+                struct css_match *out, int cap);
 
 #endif /* OWOS_CSS_H */

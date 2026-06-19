@@ -113,10 +113,12 @@ static void mouse_apply(void)
 	buttons = flags & (PKT_LEFT | PKT_RIGHT | PKT_MIDDLE);
 
 	if (wheel_mode) {
-		/* Byte 3 carries the wheel delta in its low nibble, sign-extended. */
+		/* Byte 3 carries the wheel delta in its low nibble, sign-extended. The
+		 * PS/2 IntelliMouse reports +toward-the-user; negate so `wheel` follows
+		 * the +up/-down WEV_SCROLL convention (as Linux psmouse does). */
 		int dz = packet[3] & 0x0F;
 		if (dz & 0x08) dz -= 16;
-		wheel += dz;
+		wheel -= dz;
 	}
 	seq++;
 }

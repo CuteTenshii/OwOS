@@ -1,0 +1,2104 @@
+/* builtins.c — the core standard library: globals and prototype objects.
+ *
+ * Scope is a useful core, not the whole web platform: console, Math, Object,
+ * Array, String, Number, Boolean, JSON and the Error family. RegExp matching,
+ * Date, Map/Set, Promise, Symbol and typed arrays are deferred (see js.h). The
+ * natives follow interp.c's GC discipline: anything held across an allocation or
+ * a callback is pinned with gc_push_scope()/gc_keep(). */
+#include "interp.h"
+#include "value.h"
+#include "owos.h"
+#include "fmt.h"
+#include "math.h"
+#include "gc.h"
+
+#define ARG(i) ((i) < n ? a[i] : js_undef())
+
+static int memcmp_(const void *a, const void *b, int n) {
+    const unsigned char *x = (const unsigned char *)a, *y = (const unsigned char *)b;
+    int i;
+    for (i = 0; i < n; i++) if (x[i] != y[i]) return (int)x[i] - (int)y[i];
+    return 0;
+}
+
+static void *refp(js_value v) { return v.type == JV_OBJ ? (void *)v.u.obj : v.type == JV_STR ? (void *)v.u.str : NULL; }
+#define KEEP(v) do { void *_p = refp(v); if (_p) gc_keep(_p); } while (0)
+static int nullish(js_value v) { return v.type == JV_UNDEF || v.type == JV_NULL; }
+static js_value symbol_tostring(js_ctx *ctx, js_value t, js_value *a, int n);
+
+/* ------------------------------------------------------- string buffer ---- */
+
+typedef struct { char *b; int n, cap; } sbuf;
+static void sb_need(sbuf *s, int extra) {
+    if (s->n + extra + 1 > s->cap) {
+        int c = s->cap ? s->cap * 2 : 64;
+        while (c < s->n + extra + 1) c *= 2;
+        s->b = (char *)realloc(s->b, (unsigned)c);
+        s->cap = c;
+    }
+}
+static void sb_putc(sbuf *s, char c) { sb_need(s, 1); s->b[s->n++] = c; }
+static void sb_put(sbuf *s, const char *t, int n) { sb_need(s, n); memcpy(s->b + s->n, t, (unsigned)n); s->n += n; }
+static void sb_puts(sbuf *s, const char *t) { sb_put(s, t, strlen(t)); }
+
+/* ------------------------------------------------------- helpers ---------- */
+
+static js_value str_of(js_ctx *ctx, const char *s, int n) { return js_mk_string(ctx, s, n); }
+
+static int find_sub(const char *h, int hn, const char *needle, int nn, int from) {
+    int i;
+    if (nn == 0) return from <= hn ? from : hn;
+    for (i = from; i + nn <= hn; i++) if (memcmp_(h + i, needle, nn) == 0) return i;
+    return -1;
+}
+
+/* normalize a slice index (negative counts from the end), clamped to [0,len] */
+static int clamp_index(double d, int len) {
+    int i;
+    if (d != d) return 0;
+    if (d < 0) { d += len; if (d < 0) d = 0; }
+    if (d > len) d = len;
+    i = (int)d;
+    return i;
+}
+
+/* ------------------------------------------------------- console ---------- */
+
+static void fmtv(js_ctx *ctx, sbuf *sb, js_value v, int depth, int quote) {
+    char tmp[DTOA_MAX];
+    switch (v.type) {
+    case JV_UNDEF: sb_puts(sb, "undefined"); return;
+    case JV_NULL:  sb_puts(sb, "null"); return;
+    case JV_BOOL:  sb_puts(sb, v.u.boolean ? "true" : "false"); return;
+    case JV_NUM:   dtoa(v.u.num, tmp); sb_puts(sb, tmp); return;
+    case JV_STR:
+        if (!quote) { sb_put(sb, v.u.str->data, v.u.str->len); return; }
+        sb_putc(sb, '\'');
+        sb_put(sb, v.u.str->data, v.u.str->len);
+        sb_putc(sb, '\'');
+        return;
+    case JV_SYMBOL: { js_value s = symbol_tostring(ctx, v, 0, 0); sb_put(sb, s.u.str->data, s.u.str->len); return; }
+    default: break;
+    }
+    {
+        js_object *o = v.u.obj;
+        if (o->kind == OBJ_FUNCTION) {
+            js_value nm = js_get(ctx, v, "name");
+            sb_puts(sb, "[Function");
+            if (nm.type == JV_STR && nm.u.str->len) { sb_puts(sb, ": "); sb_put(sb, nm.u.str->data, nm.u.str->len); }
+            sb_putc(sb, ']');
+            return;
+        }
+        if (o->kind == OBJ_ERROR) {
+            js_value nm = js_get(ctx, v, "name"), msg = js_get(ctx, v, "message");
+            js_value ns = js_to_string(ctx, nm), ms = js_to_string(ctx, msg);
+            sb_put(sb, ns.u.str->data, ns.u.str->len);
+            if (ms.u.str->len) { sb_puts(sb, ": "); sb_put(sb, ms.u.str->data, ms.u.str->len); }
+            return;
+        }
+        if (depth > 4) { sb_puts(sb, o->kind == OBJ_ARRAY ? "[Array]" : "[Object]"); return; }
+        if (o->kind == OBJ_ARRAY) {
+            unsigned i;
+            if (o->elen == 0) { sb_puts(sb, "[]"); return; }
+            sb_puts(sb, "[ ");
+            for (i = 0; i < o->elen; i++) { if (i) sb_puts(sb, ", "); fmtv(ctx, sb, o->elems[i], depth + 1, 1); }
+            sb_puts(sb, " ]");
+            return;
+        }
+        {
+            int i, first = 1;
+            sb_puts(sb, "{");
+            for (i = 0; i < o->props.n; i++) {
+                pentry *pe = &o->props.e[i];
+                if (!(pe->flags & P_ENUMERABLE)) continue;
+                sb_puts(sb, first ? " " : ", "); first = 0;
+                sb_puts(sb, pe->key);
+                sb_puts(sb, ": ");
+                if (pe->flags & P_ACCESSOR) sb_puts(sb, "[Getter/Setter]");
+                else fmtv(ctx, sb, pe->value, depth + 1, 1);
+            }
+            sb_puts(sb, first ? "}" : " }");
+        }
+    }
+}
+
+/* Format the args space-joined + a newline and hand them to the print hook with
+ * the calling method's level. console.log/info/warn/error/debug share this. */
+static js_value console_emit(js_ctx *ctx, int level, js_value *args, int argc) {
+    sbuf sb;
+    int i;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    for (i = 0; i < argc; i++) { if (i) sb_putc(&sb, ' '); fmtv(ctx, &sb, args[i], 0, 0); }
+    sb_putc(&sb, '\n');
+    if (ctx->print) ctx->print(ctx, level, sb.b ? sb.b : "\n", sb.n);
+    if (sb.b) free(sb.b);
+    return js_undef();
+}
+#define CONSOLE_METHOD(NAME, LEVEL) \
+    static js_value NAME(js_ctx *ctx, js_value thisv, js_value *args, int argc) \
+    { (void)thisv; return console_emit(ctx, LEVEL, args, argc); }
+CONSOLE_METHOD(native_console_log,   JS_LOG_LOG)
+CONSOLE_METHOD(native_console_info,  JS_LOG_INFO)
+CONSOLE_METHOD(native_console_warn,  JS_LOG_WARN)
+CONSOLE_METHOD(native_console_error, JS_LOG_ERROR)
+CONSOLE_METHOD(native_console_debug, JS_LOG_DEBUG)
+
+/* ------------------------------------------------------- Math ------------- */
+
+#define MATH1(NAME, FN) static js_value NAME(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return js_number(FN(js_to_number(ctx, ARG(0)))); }
+MATH1(m_abs, fabs)   MATH1(m_floor, floor) MATH1(m_ceil, ceil)  MATH1(m_round_, round)
+MATH1(m_trunc, trunc) MATH1(m_sqrt, sqrt)  MATH1(m_cbrt, cbrt)  MATH1(m_sin, sin)
+MATH1(m_cos, cos)    MATH1(m_tan, tan)     MATH1(m_asin, asin)  MATH1(m_acos, acos)
+MATH1(m_atan, atan)  MATH1(m_sinh, sinh)   MATH1(m_cosh, cosh)  MATH1(m_tanh, tanh)
+MATH1(m_exp, exp)    MATH1(m_log, log)     MATH1(m_log2, log2)  MATH1(m_log10, log10)
+#undef MATH1
+
+static js_value m_round(js_ctx *ctx, js_value t, js_value *a, int n) {
+    double x = js_to_number(ctx, ARG(0));
+    (void)t;
+    return js_number(floor(x + 0.5));            /* JS rounds half up toward +inf */
+}
+static js_value m_sign(js_ctx *ctx, js_value t, js_value *a, int n) {
+    double x = js_to_number(ctx, ARG(0)); (void)t;
+    if (x != x) return js_number(x);
+    return js_number(x > 0 ? 1 : x < 0 ? -1 : x);
+}
+static js_value m_pow(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return js_number(pow(js_to_number(ctx, ARG(0)), js_to_number(ctx, ARG(1)))); }
+static js_value m_atan2(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return js_number(atan2(js_to_number(ctx, ARG(0)), js_to_number(ctx, ARG(1)))); }
+static js_value m_hypot(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return js_number(hypot(js_to_number(ctx, ARG(0)), js_to_number(ctx, ARG(1)))); }
+static js_value m_max(js_ctx *ctx, js_value t, js_value *a, int n) {
+    double r = -1.0 / 0.0; int i; (void)t;
+    for (i = 0; i < n; i++) { double x = js_to_number(ctx, a[i]); if (x != x) return js_number(x); if (x > r) r = x; }
+    return js_number(r);
+}
+static js_value m_min(js_ctx *ctx, js_value t, js_value *a, int n) {
+    double r = 1.0 / 0.0; int i; (void)t;
+    for (i = 0; i < n; i++) { double x = js_to_number(ctx, a[i]); if (x != x) return js_number(x); if (x < r) r = x; }
+    return js_number(r);
+}
+static js_value m_random(js_ctx *ctx, js_value t, js_value *a, int n) {
+    unsigned x = ctx->rng;
+    (void)t; (void)a; (void)n;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;     /* xorshift32 */
+    ctx->rng = x;
+    return js_number((double)(x >> 8) / (double)(1u << 24));
+}
+
+/* ------------------------------------------------------- Object ----------- */
+
+static js_value native_object(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); (void)t;
+    if (x.type == JV_OBJ) return x;
+    if (x.type == JV_UNDEF || x.type == JV_NULL) return js_obj_value(js_new_object(ctx, ctx->object_proto));
+    return x;                                    /* primitives: leave as-is (no boxing) */
+}
+static js_value obj_keys_impl(js_ctx *ctx, js_value o, int mode) {
+    /* mode: 0 keys, 1 values, 2 entries */
+    js_object *arr, *s;
+    int i;
+    if (o.type != JV_OBJ) return js_obj_value(js_new_array(ctx, 0));
+    s = o.u.obj;
+    gc_push_scope(); KEEP(o);
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (s->kind == OBJ_ARRAY) {
+        unsigned e;
+        for (e = 0; e < s->elen; e++) {
+            char ib[24]; u64toa((unsigned long long)e, ib, 10);
+            if (mode == 0) js_array_push(ctx, arr, js_mk_cstring(ctx, ib));
+            else if (mode == 1) js_array_push(ctx, arr, s->elems[e]);
+            else { js_object *pair = js_new_array(ctx, 0); gc_keep(pair); js_array_push(ctx, pair, js_mk_cstring(ctx, ib)); js_array_push(ctx, pair, s->elems[e]); js_array_push(ctx, arr, js_obj_value(pair)); }
+        }
+    }
+    for (i = 0; i < s->props.n; i++) {
+        pentry *pe = &s->props.e[i];
+        if (!(pe->flags & P_ENUMERABLE)) continue;
+        if (mode == 0) js_array_push(ctx, arr, js_mk_cstring(ctx, pe->key));
+        else if (mode == 1) js_array_push(ctx, arr, js_get(ctx, o, pe->key));
+        else { js_object *pair = js_new_array(ctx, 0); gc_keep(pair); js_array_push(ctx, pair, js_mk_cstring(ctx, pe->key)); js_array_push(ctx, pair, js_get(ctx, o, pe->key)); js_array_push(ctx, arr, js_obj_value(pair)); }
+    }
+    gc_pop_scope();
+    return js_obj_value(arr);
+}
+static js_value object_keys(js_ctx *ctx, js_value t, js_value *a, int n)    { (void)t; return obj_keys_impl(ctx, ARG(0), 0); }
+static js_value object_values(js_ctx *ctx, js_value t, js_value *a, int n)  { (void)t; return obj_keys_impl(ctx, ARG(0), 1); }
+static js_value object_entries(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return obj_keys_impl(ctx, ARG(0), 2); }
+
+static js_value object_assign(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value target = ARG(0);
+    int i, k;
+    (void)t;
+    if (target.type != JV_OBJ) return target;
+    gc_push_scope(); KEEP(target);
+    for (i = 1; i < n; i++) {
+        js_value src = a[i];
+        if (src.type != JV_OBJ) continue;
+        KEEP(src);
+        if (src.u.obj->kind == OBJ_ARRAY) { unsigned e; for (e = 0; e < src.u.obj->elen; e++) js_set_index(ctx, target, e, src.u.obj->elems[e]); }
+        for (k = 0; k < src.u.obj->props.n; k++)
+            if (src.u.obj->props.e[k].flags & P_ENUMERABLE) js_set(ctx, target, src.u.obj->props.e[k].key, js_get(ctx, src, src.u.obj->props.e[k].key));
+    }
+    gc_pop_scope();
+    return target;
+}
+static js_value object_create(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value proto = ARG(0);
+    (void)t;
+    return js_obj_value(js_new_object(ctx, proto.type == JV_OBJ ? proto.u.obj : NULL));
+}
+static js_value object_getproto(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); (void)t;
+    if (x.type == JV_OBJ && x.u.obj->proto) return js_obj_value(x.u.obj->proto);
+    return js_null();
+}
+static js_value object_setproto(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0), p = ARG(1); (void)t; (void)ctx;
+    if (x.type == JV_OBJ) x.u.obj->proto = p.type == JV_OBJ ? p.u.obj : NULL;
+    return x;
+}
+static js_value object_freeze(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); int i; (void)t; (void)ctx;
+    if (x.type == JV_OBJ) { x.u.obj->extensible = 0; for (i = 0; i < x.u.obj->props.n; i++) x.u.obj->props.e[i].flags &= (unsigned char)~(P_WRITABLE | P_CONFIGURABLE); }
+    return x;
+}
+static js_value object_isfrozen(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); (void)t; (void)ctx;
+    if (x.type != JV_OBJ) return js_bool(1);
+    return js_bool(!x.u.obj->extensible);
+}
+static js_value object_defprop(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), desc = ARG(2);
+    js_value key = js_to_string(ctx, ARG(1));
+    js_value getter, setter, val, en, wr;
+    unsigned char flags = 0;
+    (void)t;
+    if (o.type != JV_OBJ || desc.type != JV_OBJ) return js_throw_type(ctx, "defineProperty requires objects");
+    en = js_get(ctx, desc, "enumerable"); wr = js_get(ctx, desc, "writable");
+    if (js_to_boolean(en)) flags |= P_ENUMERABLE;
+    if (js_to_boolean(wr)) flags |= P_WRITABLE;
+    flags |= P_CONFIGURABLE;
+    getter = js_get(ctx, desc, "get"); setter = js_get(ctx, desc, "set");
+    if (js_is_callable(getter) || js_is_callable(setter)) {
+        js_def_accessor(o.u.obj, key.u.str->data, js_is_callable(getter) ? getter.u.obj : NULL, js_is_callable(setter) ? setter.u.obj : NULL, flags);
+    } else {
+        val = js_get(ctx, desc, "value");
+        js_def(o.u.obj, key.u.str->data, val, flags);
+    }
+    return o;
+}
+static js_value object_ownnames(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0);
+    js_object *arr, *s;
+    int i;
+    (void)t;
+    if (o.type != JV_OBJ) return js_obj_value(js_new_array(ctx, 0));
+    s = o.u.obj;
+    gc_push_scope(); KEEP(o);
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (s->kind == OBJ_ARRAY) { unsigned e; for (e = 0; e < s->elen; e++) { char ib[24]; u64toa((unsigned long long)e, ib, 10); js_array_push(ctx, arr, js_mk_cstring(ctx, ib)); } js_array_push(ctx, arr, js_mk_cstring(ctx, "length")); }
+    for (i = 0; i < s->props.n; i++) js_array_push(ctx, arr, js_mk_cstring(ctx, s->props.e[i].key));
+    gc_pop_scope();
+    return js_obj_value(arr);
+}
+static js_value object_fromentries(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value it = ARG(0);
+    js_object *obj;
+    unsigned i;
+    (void)t;
+    gc_push_scope(); KEEP(it);
+    obj = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    if (it.type == JV_OBJ && it.u.obj->kind == OBJ_ARRAY)
+        for (i = 0; i < it.u.obj->elen; i++) {
+            js_value pair = it.u.obj->elems[i];
+            js_value k = js_get_index(ctx, pair, 0), v = js_get_index(ctx, pair, 1);
+            js_value ks = js_to_string(ctx, k);
+            if (!ctx->has_exc) js_set(ctx, js_obj_value(obj), ks.u.str->data, v);
+        }
+    gc_pop_scope();
+    return js_obj_value(obj);
+}
+static js_value op_hasown(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value k = js_to_string(ctx, ARG(0));
+    if (t.type != JV_OBJ) return js_bool(0);
+    return js_bool(js_has_own(t.u.obj, k.u.str->data));
+}
+static js_value op_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
+    (void)a; (void)n;
+    if (t.type == JV_OBJ && t.u.obj->kind == OBJ_ARRAY) return js_undef();   /* array overrides */
+    return js_mk_cstring(ctx, "[object Object]");
+}
+static js_value op_valueof(js_ctx *ctx, js_value t, js_value *a, int n) { (void)ctx; (void)a; (void)n; return t; }
+static js_value op_isproto(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); js_object *o; (void)ctx;
+    if (x.type != JV_OBJ || t.type != JV_OBJ) return js_bool(0);
+    for (o = x.u.obj->proto; o; o = o->proto) if (o == t.u.obj) return js_bool(1);
+    return js_bool(0);
+}
+
+/* ------------------------------------------------------- Array ------------ */
+
+static js_object *as_array(js_ctx *ctx, js_value t) {
+    if (t.type == JV_OBJ && t.u.obj->kind == OBJ_ARRAY) return t.u.obj;
+    js_throw_type(ctx, "Array.prototype method called on non-array");
+    return NULL;
+}
+
+static js_value native_array(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr;
+    int i;
+    (void)t;
+    if (n == 1 && a[0].type == JV_NUM) { arr = js_new_array(ctx, (unsigned)a[0].u.num); return js_obj_value(arr); }
+    gc_push_scope();
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    for (i = 0; i < n; i++) js_array_push(ctx, arr, a[i]);
+    gc_pop_scope();
+    return js_obj_value(arr);
+}
+static js_value array_isarray(js_ctx *ctx, js_value t, js_value *a, int n) { (void)ctx; (void)t; return js_bool(ARG(0).type == JV_OBJ && ARG(0).u.obj->kind == OBJ_ARRAY); }
+static js_value array_of(js_ctx *ctx, js_value t, js_value *a, int n) { return native_array(ctx, t, a, n); }
+static js_value array_from(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value src = ARG(0), fn = ARG(1);
+    js_object *arr;
+    unsigned i, len;
+    int has_fn = js_is_callable(fn);
+    (void)t;
+    gc_push_scope(); KEEP(src); KEEP(fn);
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (src.type == JV_OBJ && src.u.obj->kind == OBJ_ARRAY) len = src.u.obj->elen;
+    else if (src.type == JV_STR) len = (unsigned)src.u.str->len;
+    else if (src.type == JV_OBJ) { js_value l = js_get(ctx, src, "length"); len = js_to_uint32(ctx, l); }
+    else len = 0;
+    for (i = 0; i < len && !ctx->has_exc; i++) {
+        js_value e = js_get_index(ctx, src, i);
+        if (has_fn) { js_value cargs[2]; cargs[0] = e; cargs[1] = js_number(i); e = js_call(ctx, fn, js_undef(), cargs, 2); }
+        js_array_push(ctx, arr, e);
+    }
+    gc_pop_scope();
+    return js_obj_value(arr);
+}
+static js_value array_push(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t); int i;
+    if (!arr) return js_undef();
+    for (i = 0; i < n; i++) js_array_push(ctx, arr, a[i]);
+    return js_number(arr->elen);
+}
+static js_value array_pop(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t); js_value v; (void)a; (void)n;
+    if (!arr) return js_undef();
+    if (arr->elen == 0) return js_undef();
+    v = arr->elems[--arr->elen];
+    return v;
+}
+static js_value array_shift(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t); js_value v; unsigned i; (void)a; (void)n;
+    if (!arr || arr->elen == 0) return js_undef();
+    v = arr->elems[0];
+    for (i = 1; i < arr->elen; i++) arr->elems[i - 1] = arr->elems[i];
+    arr->elen--;
+    return v;
+}
+static js_value array_unshift(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t); int i; unsigned j;
+    if (!arr) return js_undef();
+    gc_push_scope(); { int k; for (k = 0; k < n; k++) KEEP(a[k]); }
+    js_array_set_len(ctx, arr, arr->elen + (unsigned)n);
+    for (j = arr->elen; j > (unsigned)n; j--) arr->elems[j - 1] = arr->elems[j - 1 - n];
+    for (i = 0; i < n; i++) arr->elems[i] = a[i];
+    gc_pop_scope();
+    return js_number(arr->elen);
+}
+static js_value array_slice(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t), *out;
+    int start, end, i;
+    if (!arr) return js_undef();
+    start = n > 0 ? clamp_index(js_to_number(ctx, a[0]), (int)arr->elen) : 0;
+    end = n > 1 && a[1].type != JV_UNDEF ? clamp_index(js_to_number(ctx, a[1]), (int)arr->elen) : (int)arr->elen;
+    gc_push_scope(); KEEP(t);
+    out = (js_object *)gc_keep(js_new_array(ctx, 0));
+    for (i = start; i < end; i++) js_array_push(ctx, out, arr->elems[i]);
+    gc_pop_scope();
+    return js_obj_value(out);
+}
+static js_value array_splice(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t), *removed;
+    int start, del, i, ins = n > 2 ? n - 2 : 0;
+    if (!arr) return js_undef();
+    start = n > 0 ? clamp_index(js_to_number(ctx, a[0]), (int)arr->elen) : 0;
+    del = n > 1 ? (int)js_to_number(ctx, a[1]) : (int)arr->elen - start;
+    if (del < 0) del = 0;
+    if (start + del > (int)arr->elen) del = (int)arr->elen - start;
+    gc_push_scope(); KEEP(t); { int k; for (k = 0; k < n; k++) KEEP(a[k]); }
+    removed = (js_object *)gc_keep(js_new_array(ctx, 0));
+    for (i = 0; i < del; i++) js_array_push(ctx, removed, arr->elems[start + i]);
+    if (ins != del) {
+        unsigned oldlen = arr->elen, newlen = oldlen - (unsigned)del + (unsigned)ins;
+        if (ins > del) {
+            js_array_set_len(ctx, arr, newlen);
+            for (i = (int)oldlen - 1; i >= start + del; i--) arr->elems[i + ins - del] = arr->elems[i];
+        } else {
+            for (i = start + del; i < (int)oldlen; i++) arr->elems[i + ins - del] = arr->elems[i];
+            arr->elen = newlen;
+        }
+    }
+    for (i = 0; i < ins; i++) arr->elems[start + i] = a[i + 2];
+    gc_pop_scope();
+    return js_obj_value(removed);
+}
+static js_value array_concat(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *out; int i;
+    gc_push_scope(); KEEP(t); { int k; for (k = 0; k < n; k++) KEEP(a[k]); }
+    out = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (t.type == JV_OBJ && t.u.obj->kind == OBJ_ARRAY) { unsigned e; for (e = 0; e < t.u.obj->elen; e++) js_array_push(ctx, out, t.u.obj->elems[e]); }
+    else js_array_push(ctx, out, t);
+    for (i = 0; i < n; i++) {
+        if (a[i].type == JV_OBJ && a[i].u.obj->kind == OBJ_ARRAY) { unsigned e; for (e = 0; e < a[i].u.obj->elen; e++) js_array_push(ctx, out, a[i].u.obj->elems[e]); }
+        else js_array_push(ctx, out, a[i]);
+    }
+    gc_pop_scope();
+    return js_obj_value(out);
+}
+static js_value array_join(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t);
+    js_value sep = n > 0 && a[0].type != JV_UNDEF ? js_to_string(ctx, a[0]) : js_mk_cstring(ctx, ",");
+    sbuf sb; unsigned i;
+    if (!arr) return js_undef();
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    gc_push_scope(); KEEP(t); KEEP(sep);
+    for (i = 0; i < arr->elen; i++) {
+        if (i) sb_put(&sb, sep.u.str->data, sep.u.str->len);
+        if (!nullish(arr->elems[i])) { js_value s = js_to_string(ctx, arr->elems[i]); if (ctx->has_exc) break; sb_put(&sb, s.u.str->data, s.u.str->len); }
+    }
+    gc_pop_scope();
+    { js_value r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b); return r; }
+}
+static js_value array_tostring(js_ctx *ctx, js_value t, js_value *a, int n) { return array_join(ctx, t, a, 0); (void)n; }
+static js_value array_indexof(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t); unsigned i; js_value x = ARG(0); int from = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
+    if (!arr) return js_undef();
+    if (from < 0) from += (int)arr->elen;
+    if (from < 0) from = 0;
+    for (i = (unsigned)from; i < arr->elen; i++) if (js_strict_eq(arr->elems[i], x)) return js_number(i);
+    return js_number(-1);
+}
+static js_value array_lastindexof(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t); int i; js_value x = ARG(0); (void)n;
+    if (!arr) return js_undef();
+    for (i = (int)arr->elen - 1; i >= 0; i--) if (js_strict_eq(arr->elems[i], x)) return js_number(i);
+    return js_number(-1);
+}
+static js_value array_includes(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t); unsigned i; js_value x = ARG(0); (void)n;
+    if (!arr) return js_undef();
+    for (i = 0; i < arr->elen; i++) if (js_strict_eq(arr->elems[i], x)) return js_bool(1);
+    return js_bool(0);
+}
+/* shared iteration core for forEach/map/filter/some/every/find/findIndex */
+static js_value array_iter(js_ctx *ctx, js_value t, js_value *a, int n, int mode) {
+    /* mode: 0 forEach 1 map 2 filter 3 some 4 every 5 find 6 findIndex */
+    js_object *arr = as_array(ctx, t), *out = NULL;
+    js_value fn = ARG(0), self = ARG(1);
+    unsigned i;
+    if (!arr) return js_undef();
+    if (!js_is_callable(fn)) return js_throw_type(ctx, "callback is not a function");
+    gc_push_scope(); KEEP(t); KEEP(fn); KEEP(self);
+    if (mode == 1 || mode == 2) out = (js_object *)gc_keep(js_new_array(ctx, 0));
+    for (i = 0; i < arr->elen && !ctx->has_exc; i++) {
+        js_value cargs[3], r;
+        cargs[0] = arr->elems[i]; cargs[1] = js_number(i); cargs[2] = t;
+        r = js_call(ctx, fn, self, cargs, 3);
+        if (ctx->has_exc) break;
+        switch (mode) {
+        case 1: js_array_push(ctx, out, r); break;
+        case 2: if (js_to_boolean(r)) js_array_push(ctx, out, cargs[0]); break;
+        case 3: if (js_to_boolean(r)) { gc_pop_scope(); return js_bool(1); } break;
+        case 4: if (!js_to_boolean(r)) { gc_pop_scope(); return js_bool(0); } break;
+        case 5: if (js_to_boolean(r)) { gc_pop_scope(); return cargs[0]; } break;
+        case 6: if (js_to_boolean(r)) { gc_pop_scope(); return js_number(i); } break;
+        default: break;
+        }
+    }
+    gc_pop_scope();
+    if (mode == 1 || mode == 2) return js_obj_value(out);
+    if (mode == 3) return js_bool(0);
+    if (mode == 4) return js_bool(1);
+    if (mode == 5) return js_undef();
+    if (mode == 6) return js_number(-1);
+    return js_undef();
+}
+static js_value array_foreach(js_ctx *ctx, js_value t, js_value *a, int n) { return array_iter(ctx, t, a, n, 0); }
+static js_value array_map(js_ctx *ctx, js_value t, js_value *a, int n)     { return array_iter(ctx, t, a, n, 1); }
+static js_value array_filter(js_ctx *ctx, js_value t, js_value *a, int n)  { return array_iter(ctx, t, a, n, 2); }
+static js_value array_some(js_ctx *ctx, js_value t, js_value *a, int n)    { return array_iter(ctx, t, a, n, 3); }
+static js_value array_every(js_ctx *ctx, js_value t, js_value *a, int n)   { return array_iter(ctx, t, a, n, 4); }
+static js_value array_find(js_ctx *ctx, js_value t, js_value *a, int n)    { return array_iter(ctx, t, a, n, 5); }
+static js_value array_findindex(js_ctx *ctx, js_value t, js_value *a, int n){ return array_iter(ctx, t, a, n, 6); }
+static js_value array_reduce(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t);
+    js_value fn = ARG(0), acc;
+    unsigned i = 0;
+    if (!arr) return js_undef();
+    if (!js_is_callable(fn)) return js_throw_type(ctx, "reduce callback is not a function");
+    gc_push_scope(); KEEP(t); KEEP(fn);
+    if (n > 1) acc = a[1];
+    else { if (arr->elen == 0) { gc_pop_scope(); return js_throw_type(ctx, "reduce of empty array with no initial value"); } acc = arr->elems[0]; i = 1; }
+    gc_keep(refp(acc));
+    for (; i < arr->elen && !ctx->has_exc; i++) {
+        js_value cargs[4];
+        cargs[0] = acc; cargs[1] = arr->elems[i]; cargs[2] = js_number(i); cargs[3] = t;
+        acc = js_call(ctx, fn, js_undef(), cargs, 4);
+        KEEP(acc);
+    }
+    gc_pop_scope();
+    return acc;
+}
+static js_value array_reverse(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t); unsigned i; (void)a; (void)n;
+    if (!arr) return js_undef();
+    for (i = 0; i < arr->elen / 2; i++) { js_value tmp = arr->elems[i]; arr->elems[i] = arr->elems[arr->elen - 1 - i]; arr->elems[arr->elen - 1 - i] = tmp; }
+    return t;
+}
+static js_value array_fill(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t); int start, end, i; js_value v = ARG(0);
+    if (!arr) return js_undef();
+    start = n > 1 ? clamp_index(js_to_number(ctx, a[1]), (int)arr->elen) : 0;
+    end = n > 2 ? clamp_index(js_to_number(ctx, a[2]), (int)arr->elen) : (int)arr->elen;
+    for (i = start; i < end; i++) arr->elems[i] = v;
+    return t;
+}
+static js_value array_flat(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t), *out;
+    unsigned i; int depth = n > 0 ? (int)js_to_number(ctx, a[0]) : 1;
+    if (!arr) return js_undef();
+    gc_push_scope(); KEEP(t);
+    out = (js_object *)gc_keep(js_new_array(ctx, 0));
+    for (i = 0; i < arr->elen; i++) {
+        js_value e = arr->elems[i];
+        if (depth > 0 && e.type == JV_OBJ && e.u.obj->kind == OBJ_ARRAY) { unsigned j; for (j = 0; j < e.u.obj->elen; j++) js_array_push(ctx, out, e.u.obj->elems[j]); }
+        else js_array_push(ctx, out, e);
+    }
+    gc_pop_scope();
+    return js_obj_value(out);
+}
+static js_value array_sort(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t);
+    js_value cmp = ARG(0);
+    int has_cmp = js_is_callable(cmp);
+    unsigned i, j;
+    (void)n;
+    if (!arr) return js_undef();
+    gc_push_scope(); KEEP(t); KEEP(cmp);
+    for (i = 1; i < arr->elen; i++) {            /* insertion sort (stable) */
+        js_value key = arr->elems[i];
+        j = i;
+        while (j > 0 && !ctx->has_exc) {
+            int swap;
+            if (has_cmp) {
+                js_value cargs[2]; js_value r;
+                cargs[0] = arr->elems[j - 1]; cargs[1] = key;
+                r = js_call(ctx, cmp, js_undef(), cargs, 2);
+                swap = js_to_number(ctx, r) > 0;
+            } else {
+                js_value sa = js_to_string(ctx, arr->elems[j - 1]), sb = js_to_string(ctx, key);
+                swap = sa.u.str->len && sb.u.str->len ? (memcmp_(sa.u.str->data, sb.u.str->data, sa.u.str->len < sb.u.str->len ? sa.u.str->len : sb.u.str->len) > 0 || (memcmp_(sa.u.str->data, sb.u.str->data, sa.u.str->len < sb.u.str->len ? sa.u.str->len : sb.u.str->len) == 0 && sa.u.str->len > sb.u.str->len)) : sa.u.str->len > sb.u.str->len;
+            }
+            if (!swap) break;
+            arr->elems[j] = arr->elems[j - 1];
+            j--;
+        }
+        arr->elems[j] = key;
+    }
+    gc_pop_scope();
+    return t;
+}
+
+/* ------------------------------------------------------- String ----------- */
+
+static js_value this_str(js_ctx *ctx, js_value t) { return js_to_string(ctx, t); }
+
+static js_value string_fromcharcode(js_ctx *ctx, js_value t, js_value *a, int n) {
+    sbuf sb; int i; (void)t;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    for (i = 0; i < n; i++) { char tmp[4]; unsigned cp = js_to_uint32(ctx, a[i]) & 0xFFFF; int k = utf8_encode(cp, tmp); sb_put(&sb, tmp, k); }
+    { js_value r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b); return r; }
+}
+static js_value str_charat(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t); int i = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    if (i < 0 || i >= s.u.str->len) return js_mk_cstring(ctx, "");
+    return str_of(ctx, s.u.str->data + i, 1);
+}
+static js_value str_at(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t); int i = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    if (i < 0) i += s.u.str->len;
+    if (i < 0 || i >= s.u.str->len) return js_undef();
+    return str_of(ctx, s.u.str->data + i, 1);
+}
+static js_value str_charcode(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t); int i = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    if (i < 0 || i >= s.u.str->len) return js_number(0.0 / 0.0);
+    return js_number((unsigned char)s.u.str->data[i]);
+}
+static js_value str_indexof(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t), needle = js_to_string(ctx, ARG(0));
+    int from = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
+    if (from < 0) from = 0;
+    return js_number(find_sub(s.u.str->data, s.u.str->len, needle.u.str->data, needle.u.str->len, from));
+}
+static js_value str_lastindexof(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t), needle = js_to_string(ctx, ARG(0));
+    int i, last = -1; (void)n;
+    for (i = 0; (i = find_sub(s.u.str->data, s.u.str->len, needle.u.str->data, needle.u.str->len, i)) >= 0; i++) last = i;
+    return js_number(last);
+}
+static js_value str_includes(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t), needle = js_to_string(ctx, ARG(0)); (void)n;
+    return js_bool(find_sub(s.u.str->data, s.u.str->len, needle.u.str->data, needle.u.str->len, 0) >= 0);
+}
+static js_value str_startswith(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t), p = js_to_string(ctx, ARG(0)); int from = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
+    if (from < 0) from = 0;
+    if (from + p.u.str->len > s.u.str->len) return js_bool(0);
+    return js_bool(memcmp_(s.u.str->data + from, p.u.str->data, p.u.str->len) == 0);
+}
+static js_value str_endswith(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t), p = js_to_string(ctx, ARG(0));
+    int end = n > 1 ? (int)js_to_number(ctx, a[1]) : s.u.str->len;
+    if (end > s.u.str->len) end = s.u.str->len;
+    if (p.u.str->len > end) return js_bool(0);
+    return js_bool(memcmp_(s.u.str->data + end - p.u.str->len, p.u.str->data, p.u.str->len) == 0);
+}
+static js_value str_slice(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t); int len = s.u.str->len;
+    int start = n > 0 ? clamp_index(js_to_number(ctx, a[0]), len) : 0;
+    int end = n > 1 && a[1].type != JV_UNDEF ? clamp_index(js_to_number(ctx, a[1]), len) : len;
+    if (end < start) end = start;
+    return str_of(ctx, s.u.str->data + start, end - start);
+}
+static js_value str_substring(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t); int len = s.u.str->len, tmp;
+    int start = n > 0 ? clamp_index(js_to_number(ctx, a[0]), len) : 0;
+    int end = n > 1 && a[1].type != JV_UNDEF ? clamp_index(js_to_number(ctx, a[1]), len) : len;
+    if (start > end) { tmp = start; start = end; end = tmp; }
+    return str_of(ctx, s.u.str->data + start, end - start);
+}
+static js_value str_substr(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t); int len = s.u.str->len;
+    int start = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    int cnt = n > 1 ? (int)js_to_number(ctx, a[1]) : len;
+    if (start < 0) { start += len; if (start < 0) start = 0; }
+    if (start > len) start = len;
+    if (cnt < 0) cnt = 0;
+    if (start + cnt > len) cnt = len - start;
+    return str_of(ctx, s.u.str->data + start, cnt);
+}
+static js_value str_case(js_ctx *ctx, js_value t, int upper) {
+    js_value s = this_str(ctx, t);
+    char *buf = (char *)malloc((unsigned)s.u.str->len + 1);
+    int i;
+    for (i = 0; i < s.u.str->len; i++) {
+        char c = s.u.str->data[i];
+        if (upper && c >= 'a' && c <= 'z') c = (char)(c - 32);
+        else if (!upper && c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        buf[i] = c;
+    }
+    { js_value r = str_of(ctx, buf, s.u.str->len); free(buf); return r; }
+}
+static js_value str_upper(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return str_case(ctx, t, 1); }
+static js_value str_lower(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return str_case(ctx, t, 0); }
+static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
+static js_value str_trim(js_ctx *ctx, js_value t, int left, int right) {
+    js_value s = this_str(ctx, t);
+    int a = 0, b = s.u.str->len;
+    if (left) while (a < b && is_ws(s.u.str->data[a])) a++;
+    if (right) while (b > a && is_ws(s.u.str->data[b - 1])) b--;
+    return str_of(ctx, s.u.str->data + a, b - a);
+}
+static js_value strm_trim(js_ctx *ctx, js_value t, js_value *a, int n)      { (void)a; (void)n; return str_trim(ctx, t, 1, 1); }
+static js_value strm_trimstart(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return str_trim(ctx, t, 1, 0); }
+static js_value strm_trimend(js_ctx *ctx, js_value t, js_value *a, int n)   { (void)a; (void)n; return str_trim(ctx, t, 0, 1); }
+static js_value str_repeat(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t); int count = n > 0 ? (int)js_to_number(ctx, a[0]) : 0, i;
+    sbuf sb; sb.b = NULL; sb.n = 0; sb.cap = 0;
+    if (count < 0) return js_throw_range(ctx, "invalid count value");
+    gc_push_scope(); KEEP(s);
+    for (i = 0; i < count; i++) sb_put(&sb, s.u.str->data, s.u.str->len);
+    gc_pop_scope();
+    { js_value r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b); return r; }
+}
+static js_value str_pad(js_ctx *ctx, js_value t, js_value *a, int n, int start) {
+    js_value s = this_str(ctx, t);
+    int target = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    js_value pad = n > 1 && a[1].type != JV_UNDEF ? js_to_string(ctx, a[1]) : js_mk_cstring(ctx, " ");
+    sbuf sb; int need;
+    if (target <= s.u.str->len || pad.u.str->len == 0) return s;
+    need = target - s.u.str->len;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    gc_push_scope(); KEEP(s); KEEP(pad);
+    if (!start) sb_put(&sb, s.u.str->data, s.u.str->len);
+    { int i = 0; while (i < need) { sb_putc(&sb, pad.u.str->data[i % pad.u.str->len]); i++; } }
+    if (start) sb_put(&sb, s.u.str->data, s.u.str->len);
+    gc_pop_scope();
+    { js_value r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b); return r; }
+}
+static js_value str_padstart(js_ctx *ctx, js_value t, js_value *a, int n) { return str_pad(ctx, t, a, n, 1); }
+static js_value str_padend(js_ctx *ctx, js_value t, js_value *a, int n)   { return str_pad(ctx, t, a, n, 0); }
+static js_value str_concat(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t); int i;
+    gc_push_scope(); KEEP(s);
+    for (i = 0; i < n; i++) { js_value o = js_to_string(ctx, a[i]); s.u.str = js_str_concat(ctx, s.u.str, o.u.str); gc_keep(s.u.str); }
+    gc_pop_scope();
+    return s;
+}
+static js_value str_split(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t);
+    js_object *out;
+    int limit = n > 1 && a[1].type != JV_UNDEF ? (int)js_to_uint32(ctx, a[1]) : -1;
+    gc_push_scope(); KEEP(s);
+    out = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (n == 0 || a[0].type == JV_UNDEF) { js_array_push(ctx, out, s); gc_pop_scope(); return js_obj_value(out); }
+    {
+        js_value sep = js_to_string(ctx, a[0]);
+        KEEP(sep);
+        if (sep.u.str->len == 0) {
+            int i;
+            for (i = 0; i < s.u.str->len; i++) { if (limit >= 0 && (int)out->elen >= limit) break; js_array_push(ctx, out, str_of(ctx, s.u.str->data + i, 1)); }
+        } else {
+            int start = 0, at;
+            while ((at = find_sub(s.u.str->data, s.u.str->len, sep.u.str->data, sep.u.str->len, start)) >= 0) {
+                if (limit >= 0 && (int)out->elen >= limit) break;
+                js_array_push(ctx, out, str_of(ctx, s.u.str->data + start, at - start));
+                start = at + sep.u.str->len;
+            }
+            if (!(limit >= 0 && (int)out->elen >= limit)) js_array_push(ctx, out, str_of(ctx, s.u.str->data + start, s.u.str->len - start));
+        }
+    }
+    gc_pop_scope();
+    return js_obj_value(out);
+}
+static js_value str_replace_impl(js_ctx *ctx, js_value t, js_value *a, int n, int all) {
+    js_value s = this_str(ctx, t), search = js_to_string(ctx, ARG(0)), repl = ARG(1);
+    int fn = js_is_callable(repl);
+    sbuf sb; int start = 0, at;
+    sb.b = NULL; sb.n = 0; sb.cap = 0; (void)n;
+    gc_push_scope(); KEEP(s); KEEP(search); KEEP(repl);
+    while ((at = find_sub(s.u.str->data, s.u.str->len, search.u.str->data, search.u.str->len, start)) >= 0) {
+        sb_put(&sb, s.u.str->data + start, at - start);
+        if (fn) {
+            js_value cargs[3], rv;
+            cargs[0] = str_of(ctx, search.u.str->data, search.u.str->len);
+            cargs[1] = js_number(at); cargs[2] = s;
+            rv = js_call(ctx, repl, js_undef(), cargs, 3);
+            if (ctx->has_exc) break;
+            { js_value rs = js_to_string(ctx, rv); sb_put(&sb, rs.u.str->data, rs.u.str->len); }
+        } else { js_value rs = js_to_string(ctx, repl); sb_put(&sb, rs.u.str->data, rs.u.str->len); }
+        start = at + (search.u.str->len ? search.u.str->len : 1);
+        if (!all) break;
+        if (search.u.str->len == 0 && start <= s.u.str->len) { if (start <= s.u.str->len && at < s.u.str->len) sb_putc(&sb, s.u.str->data[at]); }
+    }
+    sb_put(&sb, s.u.str->data + start, s.u.str->len - start);
+    gc_pop_scope();
+    { js_value r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b); return r; }
+}
+static js_value str_replace(js_ctx *ctx, js_value t, js_value *a, int n)    { return str_replace_impl(ctx, t, a, n, 0); }
+static js_value str_replaceall(js_ctx *ctx, js_value t, js_value *a, int n) { return str_replace_impl(ctx, t, a, n, 1); }
+static js_value str_tostring(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return this_str(ctx, t); }
+
+/* ------------------------------------------------------- Number ----------- */
+
+static double parse_int(const char *s, int len, int radix) {
+    int i = 0, neg = 0; double v = 0; int any = 0;
+    while (i < len && is_ws(s[i])) i++;
+    if (i < len && (s[i] == '+' || s[i] == '-')) { neg = s[i] == '-'; i++; }
+    if ((radix == 16 || radix == 0) && i + 1 < len && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) { i += 2; radix = 16; }
+    if (radix == 0) radix = 10;
+    for (; i < len; i++) {
+        int d;
+        char c = s[i];
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+        else break;
+        if (d >= radix) break;
+        v = v * radix + d; any = 1;
+    }
+    if (!any) return 0.0 / 0.0;
+    return neg ? -v : v;
+}
+static js_value g_parseint(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = js_to_string(ctx, ARG(0));
+    int radix = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
+    (void)t;
+    return js_number(parse_int(s.u.str->data, s.u.str->len, radix));
+}
+static js_value g_parsefloat(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = js_to_string(ctx, ARG(0));
+    const char *p = s.u.str->data;
+    char buf[340]; int i = 0, j = 0; char *end; double v;
+    (void)t; (void)n;
+    while (i < s.u.str->len && is_ws(p[i])) i++;
+    while (i < s.u.str->len && j < 338 && (p[i] == '+' || p[i] == '-' || p[i] == '.' || p[i] == 'e' || p[i] == 'E' || (p[i] >= '0' && p[i] <= '9'))) buf[j++] = p[i++];
+    buf[j] = 0;
+    if (j == 0) return js_number(0.0 / 0.0);
+    v = strtod(buf, &end);
+    if (end == buf) return js_number(0.0 / 0.0);
+    return js_number(v);
+}
+static js_value g_isnan(js_ctx *ctx, js_value t, js_value *a, int n) { double x = js_to_number(ctx, ARG(0)); (void)t; (void)n; return js_bool(x != x); }
+static js_value g_isfinite(js_ctx *ctx, js_value t, js_value *a, int n) { double x = js_to_number(ctx, ARG(0)); (void)t; (void)n; return js_bool(x == x && x != 1.0 / 0.0 && x != -1.0 / 0.0); }
+
+/* encode/decodeURI{,Component}. The engine stores strings as UTF-8 bytes, so the
+ * spec's "encode each code point's UTF-8" reduces to percent-encoding raw bytes. */
+static int uri_unreserved(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+           c == '-' || c == '_' || c == '.' || c == '!' || c == '~' || c == '*' || c == '\'' || c == '(' || c == ')';
+}
+static int uri_reserved(unsigned char c) {
+    return c == ';' || c == '/' || c == '?' || c == ':' || c == '@' || c == '&' || c == '=' ||
+           c == '+' || c == '$' || c == ',' || c == '#';
+}
+static js_value uri_encode(js_ctx *ctx, js_value s, int keep_reserved) {
+    static const char hex[] = "0123456789ABCDEF";
+    sbuf sb; int i; js_value r;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    for (i = 0; i < s.u.str->len; i++) {
+        unsigned char c = (unsigned char)s.u.str->data[i];
+        if (uri_unreserved(c) || (keep_reserved && uri_reserved(c))) sb_putc(&sb, (char)c);
+        else { sb_putc(&sb, '%'); sb_putc(&sb, hex[c >> 4]); sb_putc(&sb, hex[c & 15]); }
+    }
+    r = str_of(ctx, sb.b ? sb.b : "", sb.n);
+    if (sb.b) free(sb.b);
+    return r;
+}
+static int uri_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+static js_value uri_decode(js_ctx *ctx, js_value s, int keep_reserved) {
+    sbuf sb; int i; js_value r;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    for (i = 0; i < s.u.str->len; i++) {
+        char c = s.u.str->data[i];
+        if (c != '%') { sb_putc(&sb, c); continue; }
+        if (i + 2 >= s.u.str->len) { if (sb.b) free(sb.b); return js_throw_error(ctx, ctx->error_proto, "URIError", "URI malformed"); }
+        { int hi = uri_hex(s.u.str->data[i + 1]), lo = uri_hex(s.u.str->data[i + 2]);
+          if (hi < 0 || lo < 0) { if (sb.b) free(sb.b); return js_throw_error(ctx, ctx->error_proto, "URIError", "URI malformed"); }
+          { unsigned char b = (unsigned char)((hi << 4) | lo);
+            if (keep_reserved && b < 0x80 && uri_reserved(b)) { sb_putc(&sb, '%'); sb_putc(&sb, s.u.str->data[i + 1]); sb_putc(&sb, s.u.str->data[i + 2]); }
+            else sb_putc(&sb, (char)b);
+            i += 2; } }
+    }
+    r = str_of(ctx, sb.b ? sb.b : "", sb.n);
+    if (sb.b) free(sb.b);
+    return r;
+}
+static js_value g_encode_uri_component(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)n; return uri_encode(ctx, js_to_string(ctx, ARG(0)), 0); }
+static js_value g_encode_uri(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)n; return uri_encode(ctx, js_to_string(ctx, ARG(0)), 1); }
+static js_value g_decode_uri_component(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)n; return uri_decode(ctx, js_to_string(ctx, ARG(0)), 0); }
+static js_value g_decode_uri(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)n; return uri_decode(ctx, js_to_string(ctx, ARG(0)), 1); }
+static js_value num_isinteger(js_ctx *ctx, js_value t, js_value *a, int n) { js_value x = ARG(0); (void)ctx; (void)t; (void)n; return js_bool(x.type == JV_NUM && x.u.num == x.u.num && x.u.num != 1.0 / 0.0 && x.u.num != -1.0 / 0.0 && floor(x.u.num) == x.u.num); }
+static js_value num_isfinite(js_ctx *ctx, js_value t, js_value *a, int n) { js_value x = ARG(0); (void)ctx; (void)t; (void)n; return js_bool(x.type == JV_NUM && x.u.num == x.u.num && x.u.num != 1.0 / 0.0 && x.u.num != -1.0 / 0.0); }
+static js_value num_isnan(js_ctx *ctx, js_value t, js_value *a, int n) { js_value x = ARG(0); (void)ctx; (void)t; (void)n; return js_bool(x.type == JV_NUM && x.u.num != x.u.num); }
+static js_value num_issafe(js_ctx *ctx, js_value t, js_value *a, int n) { js_value x = ARG(0); (void)ctx; (void)t; (void)n; return js_bool(x.type == JV_NUM && floor(x.u.num) == x.u.num && fabs(x.u.num) <= 9007199254740991.0); }
+static js_value native_number(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; if (n == 0) return js_number(0); return js_number(js_to_number(ctx, a[0])); }
+static js_value native_string(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; if (n == 0) return js_mk_cstring(ctx, ""); if (a[0].type == JV_SYMBOL) return symbol_tostring(ctx, a[0], 0, 0); return js_to_string(ctx, a[0]); }
+static js_value native_boolean(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)ctx; return js_bool(js_to_boolean(ARG(0))); }
+
+static js_value num_tofixed(js_ctx *ctx, js_value t, js_value *a, int n) {
+    double x = js_to_number(ctx, t);
+    int digits = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    char buf[80], ds[40];
+    int p = 0, i, dl, neg = 0;
+    double scale = 1, scaled;
+    if (x != x) return js_mk_cstring(ctx, "NaN");
+    if (x == 1.0 / 0.0) return js_mk_cstring(ctx, "Infinity");
+    if (x == -1.0 / 0.0) return js_mk_cstring(ctx, "-Infinity");
+    if (digits < 0) digits = 0;
+    if (digits > 20) digits = 20;
+    if (x < 0) { neg = 1; x = -x; }
+    for (i = 0; i < digits; i++) scale *= 10;
+    scaled = floor(x * scale + 0.5);             /* round once, as an integer     */
+    /* render `scaled` as a digit string, then place the decimal point exactly */
+    if (scaled < 1.8e19) dl = u64toa((unsigned long long)scaled, ds, 10);
+    else dl = dtoa(scaled, ds);
+    if (neg) buf[p++] = '-';
+    if (digits == 0) { memcpy(buf + p, ds, (unsigned)dl); p += dl; return str_of(ctx, buf, p); }
+    if (dl <= digits) {
+        buf[p++] = '0'; buf[p++] = '.';
+        for (i = 0; i < digits - dl; i++) buf[p++] = '0';
+        memcpy(buf + p, ds, (unsigned)dl); p += dl;
+    } else {
+        int intlen = dl - digits;
+        memcpy(buf + p, ds, (unsigned)intlen); p += intlen;
+        buf[p++] = '.';
+        memcpy(buf + p, ds + intlen, (unsigned)digits); p += digits;
+    }
+    return str_of(ctx, buf, p);
+}
+static js_value num_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
+    double x = js_to_number(ctx, t);
+    int radix = n > 0 && a[0].type != JV_UNDEF ? (int)js_to_number(ctx, a[0]) : 10;
+    char buf[DTOA_RADIX_MAX];
+    if (radix == 10) { dtoa(x, buf); return js_mk_cstring(ctx, buf); }
+    if (radix < 2 || radix > 36) return js_throw_range(ctx, "toString() radix must be between 2 and 36");
+    dtoa_radix(x, radix, buf);
+    return js_mk_cstring(ctx, buf);
+}
+/* x>0: write exactly `sig` (>=1) significant ASCII digits to ds (no NUL) and set
+ * *expo so x ~= ds[0].ds[1..] * 10^(*expo). Rounds like toFixed (round-half-up on
+ * a scaled integer); real precision caps at 17 digits, the rest pad with zeros. */
+static void num_sigdigits(double x, int sig, char *ds, int *expo) {
+    int real = sig > 17 ? 17 : sig;
+    int e = (int)floor(log10(x));
+    double lo = pow(10.0, (double)(real - 1)), hi = lo * 10.0;
+    double m = floor(x * pow(10.0, (double)(real - 1 - e)) + 0.5);
+    char tmp[24]; int dl, i;
+    if (m >= hi)      { e++; m = floor(x * pow(10.0, (double)(real - 1 - e)) + 0.5); }
+    else if (m < lo)  { e--; m = floor(x * pow(10.0, (double)(real - 1 - e)) + 0.5); }
+    if (m >= hi)      { m = floor(m / 10.0 + 0.5); e++; }   /* boundary carry guard */
+    dl = u64toa((unsigned long long)m, tmp, 10);
+    for (i = 0; i < dl && i < sig; i++) ds[i] = tmp[i];
+    for (; i < sig; i++) ds[i] = '0';
+    *expo = e;
+}
+
+/* x>0: derive the shortest significant digits (and their exponent) from dtoa's
+ * shortest decimal. Returns the digit count; ds gets that many ASCII digits. */
+static int num_shortest_sig(double x, char *ds, int *expo) {
+    char t[DTOA_MAX]; char digs[40];
+    int i = 0, ndig = 0, pointidx = -1, exp10 = 0, first, last, cnt = 0, k;
+    dtoa(x, t);
+    while (t[i] && t[i] != 'e' && t[i] != 'E') {
+        if (t[i] == '.') pointidx = ndig;
+        else if (ndig < 40) digs[ndig++] = t[i];
+        i++;
+    }
+    if (pointidx < 0) pointidx = ndig;          /* no '.' -> point after all digits */
+    if (t[i] == 'e' || t[i] == 'E') {
+        int es = 1, ev = 0; i++;
+        if (t[i] == '+') i++; else if (t[i] == '-') { es = -1; i++; }
+        while (t[i] >= '0' && t[i] <= '9') { ev = ev * 10 + (t[i] - '0'); i++; }
+        exp10 = es * ev;
+    }
+    first = 0; while (first < ndig && digs[first] == '0') first++;
+    if (first == ndig) { ds[0] = '0'; *expo = 0; return 1; }
+    last = ndig; while (last > first && digs[last - 1] == '0') last--;
+    *expo = (pointidx - 1 - first) + exp10;
+    for (k = first; k < last; k++) ds[cnt++] = digs[k];
+    return cnt;
+}
+
+static void num_put_exp(char *buf, int *pp, int expo) {
+    int p = *pp, ax = expo < 0 ? -expo : expo, el, i; char eb[8];
+    buf[p++] = 'e';
+    buf[p++] = expo < 0 ? '-' : '+';
+    el = u64toa((unsigned long long)ax, eb, 10);
+    for (i = 0; i < el; i++) buf[p++] = eb[i];
+    *pp = p;
+}
+
+static js_value num_toexp(js_ctx *ctx, js_value t, js_value *a, int n) {
+    double x = js_to_number(ctx, t);
+    int has = n > 0 && a[0].type != JV_UNDEF;
+    int f = has ? (int)js_to_number(ctx, a[0]) : 0;
+    char buf[160], ds[128];
+    int p = 0, neg = 0, expo = 0, sig, i;
+    if (x != x) return js_mk_cstring(ctx, "NaN");
+    if (x == 1.0 / 0.0) return js_mk_cstring(ctx, "Infinity");
+    if (x == -1.0 / 0.0) return js_mk_cstring(ctx, "-Infinity");
+    if (has && (f < 0 || f > 100)) return js_throw_range(ctx, "toExponential() argument must be between 0 and 100");
+    if (x < 0) { neg = 1; x = -x; }
+    if (x == 0) { sig = has ? f + 1 : 1; for (i = 0; i < sig; i++) ds[i] = '0'; expo = 0; }
+    else if (has) { sig = f + 1; num_sigdigits(x, sig, ds, &expo); }
+    else sig = num_shortest_sig(x, ds, &expo);
+    if (neg) buf[p++] = '-';
+    buf[p++] = ds[0];
+    if (sig > 1) { buf[p++] = '.'; for (i = 1; i < sig; i++) buf[p++] = ds[i]; }
+    num_put_exp(buf, &p, expo);
+    return str_of(ctx, buf, p);
+}
+
+static js_value num_toprecision(js_ctx *ctx, js_value t, js_value *a, int n) {
+    double x = js_to_number(ctx, t);
+    int prec, p = 0, neg = 0, expo = 0, i, k;
+    char buf[160], ds[128];
+    if (n == 0 || a[0].type == JV_UNDEF) return num_tostring(ctx, t, a, 0);
+    if (x != x) return js_mk_cstring(ctx, "NaN");
+    if (x == 1.0 / 0.0) return js_mk_cstring(ctx, "Infinity");
+    if (x == -1.0 / 0.0) return js_mk_cstring(ctx, "-Infinity");
+    prec = (int)js_to_number(ctx, a[0]);
+    if (prec < 1 || prec > 100) return js_throw_range(ctx, "toPrecision() argument must be between 1 and 100");
+    if (x < 0) { neg = 1; x = -x; }
+    if (x == 0) { for (i = 0; i < prec; i++) ds[i] = '0'; expo = 0; }
+    else num_sigdigits(x, prec, ds, &expo);
+    if (neg) buf[p++] = '-';
+    if (expo < -6 || expo >= prec) {              /* exponential notation */
+        buf[p++] = ds[0];
+        if (prec > 1) { buf[p++] = '.'; for (i = 1; i < prec; i++) buf[p++] = ds[i]; }
+        num_put_exp(buf, &p, expo);
+    } else if (expo >= 0) {                        /* point after expo+1 digits */
+        for (i = 0; i <= expo; i++) buf[p++] = ds[i];
+        if (prec > expo + 1) { buf[p++] = '.'; for (i = expo + 1; i < prec; i++) buf[p++] = ds[i]; }
+    } else {                                       /* 0.00...digits, expo in [-6,-1] */
+        buf[p++] = '0'; buf[p++] = '.';
+        for (k = 0; k < -expo - 1; k++) buf[p++] = '0';
+        for (i = 0; i < prec; i++) buf[p++] = ds[i];
+    }
+    return str_of(ctx, buf, p);
+}
+
+static js_value prim_valueof(js_ctx *ctx, js_value t, js_value *a, int n) { (void)ctx; (void)a; (void)n; return t; }
+static js_value bool_tostring(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return js_mk_cstring(ctx, js_to_boolean(t) ? "true" : "false"); }
+
+/* ------------------------------------------------------- Error ------------ */
+
+static js_value make_error_native(js_ctx *ctx, js_object *proto, const char *name, js_value *args, int argc) {
+    const char *msg = "";
+    js_value ms = js_undef();
+    if (argc > 0 && args[0].type != JV_UNDEF) { ms = js_to_string(ctx, args[0]); msg = ms.u.str->data; }
+    return js_make_error(ctx, proto, name, msg);
+}
+static js_value err_error(js_ctx *ctx, js_value t, js_value *a, int n)  { (void)t; return make_error_native(ctx, ctx->error_proto, "Error", a, n); }
+static js_value err_type(js_ctx *ctx, js_value t, js_value *a, int n)   { (void)t; return make_error_native(ctx, ctx->type_error_proto, "TypeError", a, n); }
+static js_value err_range(js_ctx *ctx, js_value t, js_value *a, int n)  { (void)t; return make_error_native(ctx, ctx->range_error_proto, "RangeError", a, n); }
+static js_value err_syntax(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return make_error_native(ctx, ctx->syntax_error_proto, "SyntaxError", a, n); }
+static js_value err_ref(js_ctx *ctx, js_value t, js_value *a, int n)    { (void)t; return make_error_native(ctx, ctx->ref_error_proto, "ReferenceError", a, n); }
+static js_value err_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value nm = js_get(ctx, t, "name"), msg = js_get(ctx, t, "message");
+    js_value ns = js_to_string(ctx, nm), ms = js_to_string(ctx, msg);
+    (void)a; (void)n;
+    if (ms.u.str->len == 0) return ns;
+    gc_push_scope(); KEEP(ns); KEEP(ms);
+    {
+        js_string *sep = js_mk_cstring(ctx, ": ").u.str;
+        js_string *r = js_str_concat(ctx, js_str_concat(ctx, ns.u.str, sep), ms.u.str);
+        js_value out; out.type = JV_STR; out.u.str = r;
+        gc_pop_scope();
+        return out;
+    }
+}
+
+/* ------------------------------------------------------- JSON ------------- */
+
+static void json_quote(sbuf *sb, const char *s, int len) {
+    int i;
+    sb_putc(sb, '"');
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"':  sb_puts(sb, "\\\""); break;
+        case '\\': sb_puts(sb, "\\\\"); break;
+        case '\n': sb_puts(sb, "\\n"); break;
+        case '\t': sb_puts(sb, "\\t"); break;
+        case '\r': sb_puts(sb, "\\r"); break;
+        case '\b': sb_puts(sb, "\\b"); break;
+        case '\f': sb_puts(sb, "\\f"); break;
+        default:
+            if (c < 0x20) { char h[8]; const char *hx = "0123456789abcdef"; h[0] = '\\'; h[1] = 'u'; h[2] = '0'; h[3] = '0'; h[4] = hx[c >> 4]; h[5] = hx[c & 15]; sb_put(sb, h, 6); }
+            else sb_putc(sb, (char)c);
+        }
+    }
+    sb_putc(sb, '"');
+}
+static int json_stringify_val(js_ctx *ctx, sbuf *sb, js_value v, const char *indent, int depth);
+static void json_indent(sbuf *sb, const char *indent, int depth) {
+    int i;
+    if (!indent || !indent[0]) return;
+    sb_putc(sb, '\n');
+    for (i = 0; i < depth; i++) sb_puts(sb, indent);
+}
+static int json_stringify_val(js_ctx *ctx, sbuf *sb, js_value v, const char *indent, int depth) {
+    char tmp[DTOA_MAX];
+    /* toJSON hook */
+    if (v.type == JV_OBJ) {
+        js_value tj = js_get(ctx, v, "toJSON");
+        if (js_is_callable(tj)) { v = js_call(ctx, tj, v, NULL, 0); if (ctx->has_exc) return 0; }
+    }
+    switch (v.type) {
+    case JV_UNDEF: return 0;                     /* omit */
+    case JV_NULL:  sb_puts(sb, "null"); return 1;
+    case JV_BOOL:  sb_puts(sb, v.u.boolean ? "true" : "false"); return 1;
+    case JV_NUM:   if (v.u.num != v.u.num || v.u.num == 1.0 / 0.0 || v.u.num == -1.0 / 0.0) sb_puts(sb, "null"); else { dtoa(v.u.num, tmp); sb_puts(sb, tmp); } return 1;
+    case JV_STR:   json_quote(sb, v.u.str->data, v.u.str->len); return 1;
+    default: break;
+    }
+    if (v.u.obj->kind == OBJ_FUNCTION) return 0; /* omit */
+    if (v.u.obj->kind == OBJ_ARRAY) {
+        unsigned i;
+        js_object *arr = v.u.obj;
+        if (arr->elen == 0) { sb_puts(sb, "[]"); return 1; }
+        sb_putc(sb, '[');
+        for (i = 0; i < arr->elen; i++) {
+            if (i) sb_putc(sb, ',');
+            json_indent(sb, indent, depth + 1);
+            if (!json_stringify_val(ctx, sb, arr->elems[i], indent, depth + 1)) sb_puts(sb, "null");
+            if (ctx->has_exc) return 0;
+        }
+        json_indent(sb, indent, depth);
+        sb_putc(sb, ']');
+        return 1;
+    }
+    {
+        js_object *o = v.u.obj;
+        int i, first = 1;
+        sb_putc(sb, '{');
+        for (i = 0; i < o->props.n; i++) {
+            pentry *pe = &o->props.e[i];
+            js_value pv;
+            if (!(pe->flags & P_ENUMERABLE)) continue;
+            pv = js_get(ctx, v, pe->key);
+            if (ctx->has_exc) return 0;
+            if (pv.type == JV_UNDEF || (pv.type == JV_OBJ && pv.u.obj->kind == OBJ_FUNCTION)) continue;
+            if (!first) sb_putc(sb, ',');
+            first = 0;
+            json_indent(sb, indent, depth + 1);
+            json_quote(sb, pe->key, strlen(pe->key));
+            sb_putc(sb, ':');
+            if (indent && indent[0]) sb_putc(sb, ' ');
+            json_stringify_val(ctx, sb, pv, indent, depth + 1);
+            if (ctx->has_exc) return 0;
+        }
+        if (!first) json_indent(sb, indent, depth);
+        sb_putc(sb, '}');
+        return 1;
+    }
+}
+static js_value json_stringify(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value v = ARG(0), space = ARG(2);
+    char indent[12]; sbuf sb;
+    int ok;
+    (void)t;
+    indent[0] = 0;
+    if (space.type == JV_NUM) { int k = (int)space.u.num, i; if (k > 10) k = 10; if (k < 0) k = 0; for (i = 0; i < k; i++) indent[i] = ' '; indent[k] = 0; }
+    else if (space.type == JV_STR) { int k = space.u.str->len; if (k > 10) k = 10; memcpy(indent, space.u.str->data, (unsigned)k); indent[k] = 0; }
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    gc_push_scope(); KEEP(v);
+    ok = json_stringify_val(ctx, &sb, v, indent, 0);
+    gc_pop_scope();
+    if (ctx->has_exc) { if (sb.b) free(sb.b); return js_undef(); }
+    if (!ok) { if (sb.b) free(sb.b); return js_undef(); }
+    { js_value r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b); return r; }
+}
+
+typedef struct { js_ctx *ctx; const char *s; int len, pos; } jparse;
+static void jp_ws(jparse *p) { while (p->pos < p->len && is_ws(p->s[p->pos])) p->pos++; }
+static js_value jp_value(jparse *p);
+static js_value jp_fail(jparse *p) { js_throw_error(p->ctx, p->ctx->syntax_error_proto, "SyntaxError", "Unexpected token in JSON"); return js_undef(); }
+static js_value jp_string(jparse *p) {
+    sbuf sb; js_value r;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    p->pos++;                                    /* opening quote */
+    while (p->pos < p->len && p->s[p->pos] != '"') {
+        char c = p->s[p->pos++];
+        if (c == '\\' && p->pos < p->len) {
+            char e = p->s[p->pos++];
+            switch (e) {
+            case 'n': sb_putc(&sb, '\n'); break; case 't': sb_putc(&sb, '\t'); break;
+            case 'r': sb_putc(&sb, '\r'); break; case 'b': sb_putc(&sb, '\b'); break;
+            case 'f': sb_putc(&sb, '\f'); break; case '/': sb_putc(&sb, '/'); break;
+            case '"': sb_putc(&sb, '"'); break;  case '\\': sb_putc(&sb, '\\'); break;
+            case 'u': {
+                unsigned cp = 0; int i; char enc[4]; int k;
+                for (i = 0; i < 4 && p->pos < p->len; i++) { char h = p->s[p->pos++]; cp <<= 4; if (h >= '0' && h <= '9') cp |= h - '0'; else if (h >= 'a' && h <= 'f') cp |= h - 'a' + 10; else if (h >= 'A' && h <= 'F') cp |= h - 'A' + 10; }
+                k = utf8_encode(cp, enc); sb_put(&sb, enc, k); break;
+            }
+            default: sb_putc(&sb, e);
+            }
+        } else sb_putc(&sb, c);
+    }
+    p->pos++;                                    /* closing quote */
+    r = str_of(p->ctx, sb.b ? sb.b : "", sb.n);
+    if (sb.b) free(sb.b);
+    return r;
+}
+static js_value jp_value(jparse *p) {
+    jp_ws(p);
+    if (p->pos >= p->len) return jp_fail(p);
+    {
+        char c = p->s[p->pos];
+        if (c == '"') return jp_string(p);
+        if (c == '{') {
+            js_object *o;
+            p->pos++;
+            gc_push_scope();
+            o = (js_object *)gc_keep(js_new_object(p->ctx, p->ctx->object_proto));
+            jp_ws(p);
+            if (p->pos < p->len && p->s[p->pos] == '}') { p->pos++; gc_pop_scope(); return js_obj_value(o); }
+            for (;;) {
+                js_value k, v;
+                jp_ws(p);
+                if (p->pos >= p->len || p->s[p->pos] != '"') { gc_pop_scope(); return jp_fail(p); }
+                k = jp_string(p);
+                gc_keep(refp(k));
+                jp_ws(p);
+                if (p->pos >= p->len || p->s[p->pos] != ':') { gc_pop_scope(); return jp_fail(p); }
+                p->pos++;
+                v = jp_value(p);
+                if (p->ctx->has_exc) { gc_pop_scope(); return js_undef(); }
+                js_set(p->ctx, js_obj_value(o), k.u.str->data, v);
+                jp_ws(p);
+                if (p->pos < p->len && p->s[p->pos] == ',') { p->pos++; continue; }
+                if (p->pos < p->len && p->s[p->pos] == '}') { p->pos++; break; }
+                gc_pop_scope(); return jp_fail(p);
+            }
+            gc_pop_scope();
+            return js_obj_value(o);
+        }
+        if (c == '[') {
+            js_object *arr;
+            p->pos++;
+            gc_push_scope();
+            arr = (js_object *)gc_keep(js_new_array(p->ctx, 0));
+            jp_ws(p);
+            if (p->pos < p->len && p->s[p->pos] == ']') { p->pos++; gc_pop_scope(); return js_obj_value(arr); }
+            for (;;) {
+                js_value v = jp_value(p);
+                if (p->ctx->has_exc) { gc_pop_scope(); return js_undef(); }
+                js_array_push(p->ctx, arr, v);
+                jp_ws(p);
+                if (p->pos < p->len && p->s[p->pos] == ',') { p->pos++; continue; }
+                if (p->pos < p->len && p->s[p->pos] == ']') { p->pos++; break; }
+                gc_pop_scope(); return jp_fail(p);
+            }
+            gc_pop_scope();
+            return js_obj_value(arr);
+        }
+        if (c == 't' && p->pos + 4 <= p->len && memcmp_(p->s + p->pos, "true", 4) == 0) { p->pos += 4; return js_bool(1); }
+        if (c == 'f' && p->pos + 5 <= p->len && memcmp_(p->s + p->pos, "false", 5) == 0) { p->pos += 5; return js_bool(0); }
+        if (c == 'n' && p->pos + 4 <= p->len && memcmp_(p->s + p->pos, "null", 4) == 0) { p->pos += 4; return js_null(); }
+        if (c == '-' || (c >= '0' && c <= '9')) {
+            char buf[340]; int j = 0;
+            while (p->pos < p->len && j < 338 && (p->s[p->pos] == '-' || p->s[p->pos] == '+' || p->s[p->pos] == '.' || p->s[p->pos] == 'e' || p->s[p->pos] == 'E' || (p->s[p->pos] >= '0' && p->s[p->pos] <= '9'))) buf[j++] = p->s[p->pos++];
+            buf[j] = 0;
+            return js_number(strtod(buf, NULL));
+        }
+    }
+    return jp_fail(p);
+}
+static js_value json_parse(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = js_to_string(ctx, ARG(0));
+    jparse p;
+    js_value r;
+    (void)t; (void)n;
+    p.ctx = ctx; p.s = s.u.str->data; p.len = s.u.str->len; p.pos = 0;
+    gc_push_scope(); KEEP(s);
+    r = jp_value(&p);
+    gc_pop_scope();
+    return r;
+}
+
+/* ------------------------------------------------------- Promise ---------- *
+ * A synchronous-settlement Promise: executors and .then reactions run
+ * immediately (a "microtask" is run-now, since there is no event loop yet).
+ * That makes await of an already-resolved promise correct; a promise that never
+ * settles synchronously (e.g. waiting on a timer) just stays pending. State
+ * lives in hidden own properties @s (0 pending/1 fulfilled/2 rejected), @v
+ * (value/reason) and @r (a list of pending reactions). Resolver functions carry
+ * their target promise in the native closure data (ctx->native_data). */
+
+static int      is_promise(js_value v) { return v.type == JV_OBJ && pmap_find_pub(v.u.obj, "@s") != 0; }
+static int      prom_state(js_object *p) { pentry *pe = pmap_find_pub(p, "@s"); return pe ? (int)pe->value.u.num : 0; }
+static js_value prom_value(js_object *p) { pentry *pe = pmap_find_pub(p, "@v"); return pe ? pe->value : js_undef(); }
+
+static js_object *new_promise(js_ctx *ctx);
+static void prom_settle(js_ctx *ctx, js_object *p, int state, js_value value);
+static void prom_resolve(js_ctx *ctx, js_object *p, js_value v);
+static js_value promise_then(js_ctx *ctx, js_value thisv, js_value *args, int argc);
+
+static js_object *new_promise(js_ctx *ctx) {
+    js_object *p;
+    gc_push_scope();
+    p = (js_object *)gc_keep(js_new_object(ctx, ctx->promise_proto));
+    js_def(p, "@s", js_number(0), 0);
+    js_def(p, "@v", js_undef(), 0);
+    js_def(p, "@r", js_obj_value(js_new_array(ctx, 0)), 0);
+    gc_pop_scope();
+    return p;
+}
+static js_object *resolver(js_ctx *ctx, js_native fn, js_object *p) {
+    js_object *f = js_new_native(ctx, fn, "", 1);
+    f->fn->data = js_obj_value(p);
+    return f;
+}
+/* run one stored reaction [onF, onR, childResolve, childReject] */
+static void run_reaction(js_ctx *ctx, int state, js_value value, js_value reaction) {
+    js_value onF = js_get_index(ctx, reaction, 0), onR = js_get_index(ctx, reaction, 1);
+    js_value cres = js_get_index(ctx, reaction, 2), crej = js_get_index(ctx, reaction, 3);
+    js_value handler = state == 1 ? onF : onR;
+    gc_push_scope(); KEEP(value); KEEP(cres); KEEP(crej);
+    if (js_is_callable(handler)) {
+        js_value out = js_call(ctx, handler, js_undef(), &value, 1);
+        if (ctx->has_exc) { js_value e = ctx->exc; ctx->has_exc = 0; js_call(ctx, crej, js_undef(), &e, 1); }
+        else js_call(ctx, cres, js_undef(), &out, 1);
+    } else {
+        js_call(ctx, state == 1 ? cres : crej, js_undef(), &value, 1);   /* pass through */
+    }
+    gc_pop_scope();
+}
+static void prom_settle(js_ctx *ctx, js_object *p, int state, js_value value) {
+    js_value rs;
+    if (prom_state(p) != 0) return;                       /* settle once */
+    gc_push_scope(); gc_keep(p); KEEP(value);
+    js_def(p, "@s", js_number(state), 0);
+    js_def(p, "@v", value, 0);
+    rs = js_get(ctx, js_obj_value(p), "@r");
+    if (rs.type == JV_OBJ) { unsigned i; for (i = 0; i < rs.u.obj->elen; i++) run_reaction(ctx, state, value, rs.u.obj->elems[i]); }
+    js_def(p, "@r", js_obj_value(js_new_array(ctx, 0)), 0);
+    gc_pop_scope();
+}
+static js_value prom_res_fn(js_ctx *ctx, js_value t, js_value *a, int n) { js_value pv = ctx->native_data; (void)t; if (pv.type == JV_OBJ) prom_resolve(ctx, pv.u.obj, ARG(0)); return js_undef(); }
+static js_value prom_rej_fn(js_ctx *ctx, js_value t, js_value *a, int n) { js_value pv = ctx->native_data; (void)t; if (pv.type == JV_OBJ) prom_settle(ctx, pv.u.obj, 2, ARG(0)); return js_undef(); }
+static void prom_resolve(js_ctx *ctx, js_object *p, js_value v) {
+    if (v.type == JV_OBJ && v.u.obj == p) { prom_settle(ctx, p, 2, js_make_error(ctx, ctx->type_error_proto, "TypeError", "chaining cycle")); return; }
+    if (is_promise(v)) {
+        js_object *vp = v.u.obj;
+        int st = prom_state(vp);
+        if (st == 1) prom_resolve(ctx, p, prom_value(vp));
+        else if (st == 2) prom_settle(ctx, p, 2, prom_value(vp));
+        else { js_value a[2]; a[0] = js_obj_value(resolver(ctx, prom_res_fn, p)); a[1] = js_obj_value(resolver(ctx, prom_rej_fn, p)); promise_then(ctx, v, a, 2); }
+        return;
+    }
+    if (v.type == JV_OBJ) {
+        js_value then = js_get(ctx, v, "then");
+        if (js_is_callable(then)) {
+            js_value a[2];
+            gc_push_scope(); gc_keep(p); KEEP(v);
+            a[0] = js_obj_value(resolver(ctx, prom_res_fn, p));
+            a[1] = js_obj_value(resolver(ctx, prom_rej_fn, p));
+            js_call(ctx, then, v, a, 2);
+            if (ctx->has_exc) { js_value e = ctx->exc; ctx->has_exc = 0; prom_settle(ctx, p, 2, e); }
+            gc_pop_scope();
+            return;
+        }
+    }
+    prom_settle(ctx, p, 1, v);
+}
+
+static js_value promise_ctor(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value exec = ARG(0);
+    js_object *p;
+    (void)t;
+    if (!js_is_callable(exec)) return js_throw_type(ctx, "Promise resolver is not a function");
+    gc_push_scope();
+    p = (js_object *)gc_keep(new_promise(ctx));
+    {
+        js_value ea[2];
+        ea[0] = js_obj_value(resolver(ctx, prom_res_fn, p));
+        ea[1] = js_obj_value(resolver(ctx, prom_rej_fn, p));
+        js_call(ctx, exec, js_undef(), ea, 2);
+        if (ctx->has_exc) { js_value e = ctx->exc; ctx->has_exc = 0; prom_settle(ctx, p, 2, e); }
+    }
+    gc_pop_scope();
+    return js_obj_value(p);
+}
+static js_value promise_then(js_ctx *ctx, js_value thisv, js_value *a, int n) {
+    js_object *p, *child;
+    js_value onF = ARG(0), onR = ARG(1);
+    int st;
+    if (!is_promise(thisv)) return js_throw_type(ctx, "Promise.prototype.then on non-promise");
+    p = thisv.u.obj;
+    gc_push_scope(); gc_keep(p); KEEP(onF); KEEP(onR);
+    child = (js_object *)gc_keep(new_promise(ctx));
+    {
+        js_object *cres = resolver(ctx, prom_res_fn, child), *crej = resolver(ctx, prom_rej_fn, child);
+        js_object *reaction = js_new_array(ctx, 0);
+        gc_keep(reaction);
+        js_array_push(ctx, reaction, onF);
+        js_array_push(ctx, reaction, onR);
+        js_array_push(ctx, reaction, js_obj_value(cres));
+        js_array_push(ctx, reaction, js_obj_value(crej));
+        st = prom_state(p);
+        if (st == 0) { js_value rs = js_get(ctx, thisv, "@r"); if (rs.type == JV_OBJ) js_array_push(ctx, rs.u.obj, js_obj_value(reaction)); }
+        else run_reaction(ctx, st, prom_value(p), js_obj_value(reaction));
+    }
+    gc_pop_scope();
+    return js_obj_value(child);
+}
+static js_value promise_catch(js_ctx *ctx, js_value thisv, js_value *a, int n) { js_value ar[2]; ar[0] = js_undef(); ar[1] = ARG(0); return promise_then(ctx, thisv, ar, 2); }
+static js_value promise_finally(js_ctx *ctx, js_value thisv, js_value *a, int n) {
+    /* simplified: run cb on settle, pass the value/reason through */
+    js_value cb = ARG(0);
+    if (js_is_callable(cb) && is_promise(thisv)) { int st = prom_state(thisv.u.obj); if (st != 0) js_call(ctx, cb, js_undef(), NULL, 0); }
+    return thisv;
+}
+static js_value promise_resolve_s(js_ctx *ctx, js_value t, js_value *a, int n) { js_value v = ARG(0); js_object *p; (void)t; if (is_promise(v)) return v; gc_push_scope(); p = (js_object *)gc_keep(new_promise(ctx)); prom_resolve(ctx, p, v); gc_pop_scope(); return js_obj_value(p); }
+static js_value promise_reject_s(js_ctx *ctx, js_value t, js_value *a, int n) { js_object *p; (void)t; gc_push_scope(); p = (js_object *)gc_keep(new_promise(ctx)); prom_settle(ctx, p, 2, ARG(0)); gc_pop_scope(); return js_obj_value(p); }
+static js_value promise_all_s(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value it = ARG(0);
+    js_object *result, *vals;
+    int rejected = 0;
+    (void)t;
+    gc_push_scope();
+    result = (js_object *)gc_keep(new_promise(ctx));
+    vals = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (it.type == JV_OBJ && it.u.obj->kind == OBJ_ARRAY) {
+        unsigned i;
+        for (i = 0; i < it.u.obj->elen; i++) {
+            js_value e = it.u.obj->elems[i];
+            if (is_promise(e)) {
+                int st = prom_state(e.u.obj);
+                if (st == 2) { prom_settle(ctx, result, 2, prom_value(e.u.obj)); rejected = 1; break; }
+                js_array_push(ctx, vals, st == 1 ? prom_value(e.u.obj) : js_undef());
+            } else js_array_push(ctx, vals, e);
+        }
+    }
+    if (!rejected) prom_settle(ctx, result, 1, js_obj_value(vals));
+    gc_pop_scope();
+    return js_obj_value(result);
+}
+
+js_value js_promise_resolved(js_ctx *ctx, js_value v) { return promise_resolve_s(ctx, js_undef(), &v, 1); }
+js_value js_promise_rejected(js_ctx *ctx, js_value v) { return promise_reject_s(ctx, js_undef(), &v, 1); }
+int js_promise_inspect(js_ctx *ctx, js_value v, js_value *out) { (void)ctx; if (!is_promise(v)) return -1; if (out) *out = prom_value(v.u.obj); return prom_state(v.u.obj); }
+
+/* ------------------------------------------------------- Symbol ----------- */
+
+static js_value symbol_ctor(js_ctx *ctx, js_value t, js_value *a, int n) {
+    const char *desc = 0;
+    char buf[160];
+    (void)t;
+    if (n >= 1 && !nullish(ARG(0))) {
+        js_value d = js_to_string(ctx, a[0]);
+        int l;
+        if (ctx->has_exc) return js_undef();
+        l = d.u.str->len; if (l > 158) l = 158;
+        memcpy(buf, d.u.str->data, (unsigned)l); buf[l] = 0; desc = buf;
+    }
+    return js_mk_symbol(ctx, desc);
+}
+static js_value symbol_for(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value key = js_to_string(ctx, ARG(0)), reg, existing;
+    (void)n;
+    reg = js_get(ctx, t, "@reg");                     /* the global symbol registry */
+    if (reg.type != JV_OBJ) return js_undef();
+    existing = js_get(ctx, reg, key.u.str->data);
+    if (existing.type == JV_SYMBOL) return existing;
+    gc_push_scope(); KEEP(key);
+    { js_value sym = js_mk_symbol(ctx, key.u.str->data); js_set(ctx, reg, key.u.str->data, sym); gc_pop_scope(); return sym; }
+}
+static js_value symbol_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value d;
+    sbuf sb;
+    (void)a; (void)n;
+    if (t.type != JV_SYMBOL) return js_mk_cstring(ctx, "Symbol()");
+    d = js_get(ctx, js_obj_value(t.u.obj), "@desc");
+    sb.b = 0; sb.n = 0; sb.cap = 0;
+    sb_puts(&sb, "Symbol(");
+    if (d.type == JV_STR) sb_put(&sb, d.u.str->data, d.u.str->len);
+    sb_putc(&sb, ')');
+    { js_value r = str_of(ctx, sb.b ? sb.b : "Symbol()", sb.n); if (sb.b) free(sb.b); return r; }
+}
+static js_value symbol_desc_get(js_ctx *ctx, js_value t, js_value *a, int n) {
+    (void)a; (void)n;
+    if (t.type != JV_SYMBOL) return js_undef();
+    return js_get(ctx, js_obj_value(t.u.obj), "@desc");
+}
+static js_value symbol_valueof(js_ctx *ctx, js_value t, js_value *a, int n) { (void)ctx; (void)a; (void)n; return t; }
+
+/* ------------------------------------------------------- Map / Set -------- */
+
+static void arr_remove(js_object *arr, int i) {
+    unsigned j;
+    for (j = (unsigned)i; j + 1 < arr->elen; j++) arr->elems[j] = arr->elems[j + 1];
+    if (arr->elen) arr->elen--;
+}
+static int coll_find(js_object *keys, js_value k) {
+    unsigned i;
+    for (i = 0; i < keys->elen; i++) if (js_same_value_zero(keys->elems[i], k)) return (int)i;
+    return -1;
+}
+static js_object *coll_keys(js_ctx *ctx, js_value t) { js_value v = js_get(ctx, t, "@k"); return v.type == JV_OBJ ? v.u.obj : 0; }
+static js_object *coll_vals(js_ctx *ctx, js_value t) { js_value v = js_get(ctx, t, "@v"); return v.type == JV_OBJ ? v.u.obj : 0; }
+
+/* iterator object: {@t, @i, @kind} + next() + [Symbol.iterator]->self */
+static js_value coll_iter_next(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value tgt = js_get(ctx, t, "@t");
+    int i = (int)js_to_number(ctx, js_get(ctx, t, "@i"));
+    int kind = (int)js_to_number(ctx, js_get(ctx, t, "@i2"));
+    js_object *keys = (tgt.type == JV_OBJ && tgt.u.obj->kind == OBJ_ARRAY) ? tgt.u.obj
+                    : (tgt.type == JV_OBJ ? coll_keys(ctx, tgt) : 0);
+    js_object *res;
+    (void)a; (void)n;
+    gc_push_scope();
+    res = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    if (!keys || i >= (int)keys->elen) {
+        js_def(res, "value", js_undef(), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(res, "done", js_bool(1), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+        return js_obj_value(res);
+    }
+    js_set(ctx, t, "@i", js_number(i + 1));
+    {
+        js_value val;
+        if (kind == 0) val = keys->elems[i];                          /* keys, or set values */
+        else if (kind == 1) { js_object *vv = coll_vals(ctx, tgt); val = vv ? vv->elems[i] : js_undef(); }
+        else {                                                        /* entries [k,v] */
+            js_object *vv = coll_vals(ctx, tgt), *pair = js_new_array(ctx, 0);
+            gc_keep(pair);
+            js_array_push(ctx, pair, keys->elems[i]);
+            js_array_push(ctx, pair, vv ? vv->elems[i] : keys->elems[i]);
+            val = js_obj_value(pair);
+        }
+        js_def(res, "value", val, P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(res, "done", js_bool(0), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+    }
+    gc_pop_scope();
+    return js_obj_value(res);
+}
+static js_value iter_self(js_ctx *ctx, js_value t, js_value *a, int n) { (void)ctx; (void)a; (void)n; return t; }
+static js_value make_coll_iter(js_ctx *ctx, js_value target, int kind) {
+    js_object *it;
+    gc_push_scope();
+    it = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    KEEP(target);
+    js_def(it, "@t", target, P_WRITABLE);
+    js_def(it, "@i", js_number(0), P_WRITABLE);
+    js_def(it, "@i2", js_number(kind), P_WRITABLE);
+    js_def_native(ctx, it, "next", coll_iter_next, 0);
+    { js_object *f = js_new_native(ctx, iter_self, "", 0); js_def(it, js_symbol_key(ctx->sym_iterator), js_obj_value(f), 0); }
+    gc_pop_scope();
+    return js_obj_value(it);
+}
+
+static js_object *make_coll(js_ctx *ctx, js_object *proto, int with_values) {
+    js_object *o;
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, proto));
+    js_def(o, "@k", js_obj_value(js_new_array(ctx, 0)), 0);
+    if (with_values) js_def(o, "@v", js_obj_value(js_new_array(ctx, 0)), 0);
+    gc_pop_scope();
+    return o;
+}
+
+static js_value map_set(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t), *vv = coll_vals(ctx, t);
+    js_value k = ARG(0), v = ARG(1);
+    int i;
+    if (!kk || !vv) return js_throw_type(ctx, "Map.prototype.set on non-map");
+    i = coll_find(kk, k);
+    if (i >= 0) vv->elems[i] = v;
+    else { gc_push_scope(); KEEP(t); KEEP(k); KEEP(v); js_array_push(ctx, kk, k); js_array_push(ctx, vv, v); gc_pop_scope(); }
+    return t;
+}
+static js_value map_get(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t), *vv = coll_vals(ctx, t);
+    int i; (void)n;
+    if (!kk || !vv) return js_undef();
+    i = coll_find(kk, ARG(0));
+    return i >= 0 ? vv->elems[i] : js_undef();
+}
+static js_value coll_has(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t); (void)n;
+    return js_bool(kk && coll_find(kk, ARG(0)) >= 0);
+}
+static js_value map_delete(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t), *vv = coll_vals(ctx, t);
+    int i; (void)n;
+    if (!kk) return js_bool(0);
+    i = coll_find(kk, ARG(0));
+    if (i < 0) return js_bool(0);
+    arr_remove(kk, i); if (vv) arr_remove(vv, i);
+    return js_bool(1);
+}
+static js_value coll_clear(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t), *vv = coll_vals(ctx, t); (void)a; (void)n;
+    if (kk) kk->elen = 0;
+    if (vv) vv->elen = 0;
+    return js_undef();
+}
+static js_value coll_size(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t); (void)a; (void)n;
+    return js_number(kk ? kk->elen : 0);
+}
+static js_value map_foreach(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t), *vv = coll_vals(ctx, t);
+    js_value cb = ARG(0), self = ARG(1);
+    unsigned i; (void)n;
+    if (!kk || !js_is_callable(cb)) return js_undef();
+    gc_push_scope(); KEEP(t); KEEP(cb); KEEP(self);
+    for (i = 0; i < kk->elen && !ctx->has_exc; i++) {
+        js_value cargs[3];
+        cargs[0] = vv ? vv->elems[i] : kk->elems[i];
+        cargs[1] = kk->elems[i];
+        cargs[2] = t;
+        js_call(ctx, cb, self, cargs, 3);
+    }
+    gc_pop_scope();
+    return js_undef();
+}
+static js_value map_keys(js_ctx *ctx, js_value t, js_value *a, int n)    { (void)a; (void)n; return make_coll_iter(ctx, t, 0); }
+static js_value map_values(js_ctx *ctx, js_value t, js_value *a, int n)  { (void)a; (void)n; return make_coll_iter(ctx, t, 1); }
+static js_value map_entries(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return make_coll_iter(ctx, t, 2); }
+static js_value set_values(js_ctx *ctx, js_value t, js_value *a, int n)  { (void)a; (void)n; return make_coll_iter(ctx, t, 0); }
+static js_value set_entries(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return make_coll_iter(ctx, t, 3); }
+
+static js_value set_add(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t);
+    js_value v = ARG(0); (void)n;
+    if (!kk) return js_throw_type(ctx, "Set.prototype.add on non-set");
+    if (coll_find(kk, v) < 0) { gc_push_scope(); KEEP(t); KEEP(v); js_array_push(ctx, kk, v); gc_pop_scope(); }
+    return t;
+}
+static js_value set_delete(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t);
+    int i; (void)n;
+    if (!kk) return js_bool(0);
+    i = coll_find(kk, ARG(0));
+    if (i < 0) return js_bool(0);
+    arr_remove(kk, i);
+    return js_bool(1);
+}
+static js_value set_foreach(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *kk = coll_keys(ctx, t);
+    js_value cb = ARG(0), self = ARG(1);
+    unsigned i; (void)n;
+    if (!kk || !js_is_callable(cb)) return js_undef();
+    gc_push_scope(); KEEP(t); KEEP(cb); KEEP(self);
+    for (i = 0; i < kk->elen && !ctx->has_exc; i++) { js_value cargs[3]; cargs[0] = kk->elems[i]; cargs[1] = kk->elems[i]; cargs[2] = t; js_call(ctx, cb, self, cargs, 3); }
+    gc_pop_scope();
+    return js_undef();
+}
+
+static js_value map_constructor(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *m; (void)t;
+    gc_push_scope();
+    m = (js_object *)gc_keep(make_coll(ctx, ctx->map_proto, 1));
+    if (n >= 1 && ARG(0).type == JV_OBJ && ARG(0).u.obj->kind == OBJ_ARRAY) {
+        unsigned i; js_object *src = ARG(0).u.obj;
+        for (i = 0; i < src->elen && !ctx->has_exc; i++) {
+            js_value pair = src->elems[i], cargs[2];
+            cargs[0] = js_get_index(ctx, pair, 0); cargs[1] = js_get_index(ctx, pair, 1);
+            map_set(ctx, js_obj_value(m), cargs, 2);
+        }
+    }
+    gc_pop_scope();
+    return js_obj_value(m);
+}
+static js_value set_constructor(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *s; (void)t;
+    gc_push_scope();
+    s = (js_object *)gc_keep(make_coll(ctx, ctx->set_proto, 0));
+    if (n >= 1 && ARG(0).type == JV_OBJ && ARG(0).u.obj->kind == OBJ_ARRAY) {
+        unsigned i; js_object *src = ARG(0).u.obj;
+        for (i = 0; i < src->elen && !ctx->has_exc; i++) { js_value e = src->elems[i]; set_add(ctx, js_obj_value(s), &e, 1); }
+    }
+    gc_pop_scope();
+    return js_obj_value(s);
+}
+static js_value weakmap_constructor(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)a; (void)n; return js_obj_value(make_coll(ctx, ctx->weakmap_proto, 1)); }
+static js_value weakset_constructor(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)a; (void)n; return js_obj_value(make_coll(ctx, ctx->weakset_proto, 0)); }
+static js_value weakmap_set(js_ctx *ctx, js_value t, js_value *a, int n) {
+    if (ARG(0).type != JV_OBJ && ARG(0).type != JV_SYMBOL) return js_throw_type(ctx, "Invalid value used as weak map key");
+    return map_set(ctx, t, a, n);
+}
+static js_value weakset_add(js_ctx *ctx, js_value t, js_value *a, int n) {
+    if (ARG(0).type != JV_OBJ && ARG(0).type != JV_SYMBOL) return js_throw_type(ctx, "Invalid value used in weak set");
+    return set_add(ctx, t, a, n);
+}
+
+/* ------------------------------------------------------- setup ------------ */
+
+/* ------------------------------------------------------- Date -------------- *
+ * Time is epoch-millis in a hidden @t property; the wall clock comes from the
+ * embedder's ctx->now_ms hook. UTC only (no timezone — getUTC* alias get*). The
+ * days<->civil conversions are Howard Hinnant's branch-free algorithms. */
+static double date_t(js_ctx *ctx, js_value t) {
+    js_value v = js_get(ctx, t, "@t");
+    return v.type == JV_NUM ? v.u.num : 0;
+}
+static void date_civil(double ms, int *Y, int *Mo, int *D, int *h, int *mi, int *s, int *mil, int *dow) {
+    long long t = (long long)ms;
+    long long secs = t / 1000; int millis = (int)(t - secs * 1000);
+    if (millis < 0) { millis += 1000; secs -= 1; }
+    long long days = secs / 86400; int rem = (int)(secs - days * 86400);
+    if (rem < 0) { rem += 86400; days -= 1; }
+    *h = rem / 3600; *mi = (rem % 3600) / 60; *s = rem % 60; *mil = millis;
+    { int w = (int)(((days % 7) + 4) % 7); if (w < 0) w += 7; *dow = w; }
+    days += 719468;
+    long long era = (days >= 0 ? days : days - 146096) / 146097;
+    long long doe = days - era * 146097;
+    long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long long y = yoe + era * 400;
+    long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    long long mp = (5 * doy + 2) / 153;
+    int d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    int m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    y += (m <= 2);
+    *Y = (int)y; *Mo = m - 1; *D = d;
+}
+static double date_from_civil(int Y, int Mo, int D, int h, int mi, int s, int ms) {
+    int m = Mo + 1;
+    long long yy = Y - (m <= 2);
+    long long era = (yy >= 0 ? yy : yy - 399) / 400;
+    long long yoe = yy - era * 400;
+    long long doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + D - 1;
+    long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long long days = era * 146097 + doe - 719468;
+    return (double)(days * 86400LL + (long long)h * 3600 + mi * 60 + s) * 1000.0 + ms;
+}
+static int date_pad(char *out, int v, int w) { int i; for (i = w - 1; i >= 0; i--) { out[i] = (char)('0' + v % 10); v /= 10; } return w; }
+
+static js_value date_now(js_ctx *ctx, js_value t, js_value *a, int n) {
+    (void)t; (void)a; (void)n;
+    return js_number(ctx->now_ms ? (double)ctx->now_ms() : 0);
+}
+static js_value date_ctor(js_ctx *ctx, js_value thisv, js_value *a, int n) {
+    double ms;
+    js_object *o;
+    (void)thisv;
+    if (n == 0) ms = ctx->now_ms ? (double)ctx->now_ms() : 0;
+    else if (n == 1) ms = js_to_number(ctx, a[0]);          /* new Date(ms) */
+    else {                                                   /* new Date(y, mo, d, ...) — UTC */
+        int y = (int)js_to_number(ctx, a[0]);
+        int mo = (int)js_to_number(ctx, a[1]);
+        int d = n > 2 ? (int)js_to_number(ctx, a[2]) : 1;
+        int h = n > 3 ? (int)js_to_number(ctx, a[3]) : 0;
+        int mi = n > 4 ? (int)js_to_number(ctx, a[4]) : 0;
+        int s = n > 5 ? (int)js_to_number(ctx, a[5]) : 0;
+        int milc = n > 6 ? (int)js_to_number(ctx, a[6]) : 0;
+        ms = date_from_civil(y, mo, d, h, mi, s, milc);
+    }
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, ctx->date_proto));
+    js_def(o, "@t", js_number(ms), 0);
+    gc_pop_scope();
+    return js_obj_value(o);
+}
+static js_value date_getTime(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return js_number(date_t(ctx, t)); }
+#define DATE_GET(fn, idx) static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n) { \
+    int c[8]; (void)a; (void)n; date_civil(date_t(ctx, t), &c[0],&c[1],&c[2],&c[3],&c[4],&c[5],&c[6],&c[7]); return js_number(c[idx]); }
+DATE_GET(date_getFullYear, 0)
+DATE_GET(date_getMonth, 1)
+DATE_GET(date_getDate, 2)
+DATE_GET(date_getHours, 3)
+DATE_GET(date_getMinutes, 4)
+DATE_GET(date_getSeconds, 5)
+DATE_GET(date_getMilliseconds, 6)
+DATE_GET(date_getDay, 7)
+#undef DATE_GET
+static js_value date_tzoff(js_ctx *ctx, js_value t, js_value *a, int n) { (void)ctx; (void)t; (void)a; (void)n; return js_number(0); }
+static js_value date_iso(js_ctx *ctx, js_value t, js_value *a, int n) {
+    int Y, Mo, D, h, mi, s, ms, dw; char b[40]; int i = 0;
+    (void)a; (void)n;
+    date_civil(date_t(ctx, t), &Y, &Mo, &D, &h, &mi, &s, &ms, &dw);
+    i += date_pad(b + i, Y, 4); b[i++] = '-'; i += date_pad(b + i, Mo + 1, 2); b[i++] = '-'; i += date_pad(b + i, D, 2);
+    b[i++] = 'T'; i += date_pad(b + i, h, 2); b[i++] = ':'; i += date_pad(b + i, mi, 2); b[i++] = ':'; i += date_pad(b + i, s, 2);
+    b[i++] = '.'; i += date_pad(b + i, ms, 3); b[i++] = 'Z'; b[i] = '\0';
+    return js_mk_string(ctx, b, i);
+}
+
+static js_object *make_ctor(js_ctx *ctx, const char *name, js_native fn, js_object *proto) {
+    js_object *c = js_new_native(ctx, fn, name, 1);
+    gc_push_scope(); gc_keep(c); gc_keep(proto);
+    js_def(c, "prototype", js_obj_value(proto), 0);
+    js_def(proto, "constructor", js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+    js_def(ctx->global, name, js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+    gc_pop_scope();
+    return c;
+}
+static void def_global(js_ctx *ctx, const char *name, js_value v) { js_def(ctx->global, name, v, P_WRITABLE | P_CONFIGURABLE); }
+static void def_global_fn(js_ctx *ctx, const char *name, js_native fn, int arity) { js_def_native(ctx, ctx->global, name, fn, arity); }
+
+void js_setup_builtins(js_ctx *ctx) {
+    gc_push_scope();
+
+    /* Object.prototype methods + the Object constructor */
+    js_def_native(ctx, ctx->object_proto, "hasOwnProperty", op_hasown, 1);
+    js_def_native(ctx, ctx->object_proto, "toString", op_tostring, 0);
+    js_def_native(ctx, ctx->object_proto, "valueOf", op_valueof, 0);
+    js_def_native(ctx, ctx->object_proto, "isPrototypeOf", op_isproto, 1);
+    {
+        js_object *octor = make_ctor(ctx, "Object", native_object, ctx->object_proto);
+        js_def_native(ctx, octor, "keys", object_keys, 1);
+        js_def_native(ctx, octor, "values", object_values, 1);
+        js_def_native(ctx, octor, "entries", object_entries, 1);
+        js_def_native(ctx, octor, "assign", object_assign, 2);
+        js_def_native(ctx, octor, "create", object_create, 2);
+        js_def_native(ctx, octor, "getPrototypeOf", object_getproto, 1);
+        js_def_native(ctx, octor, "setPrototypeOf", object_setproto, 2);
+        js_def_native(ctx, octor, "freeze", object_freeze, 1);
+        js_def_native(ctx, octor, "isFrozen", object_isfrozen, 1);
+        js_def_native(ctx, octor, "defineProperty", object_defprop, 3);
+        js_def_native(ctx, octor, "getOwnPropertyNames", object_ownnames, 1);
+        js_def_native(ctx, octor, "fromEntries", object_fromentries, 1);
+    }
+
+    /* Function.prototype (minimal) */
+    js_def_native(ctx, ctx->function_proto, "toString", op_tostring, 0);
+
+    /* Array */
+    js_def_native(ctx, ctx->array_proto, "push", array_push, 1);
+    js_def_native(ctx, ctx->array_proto, "pop", array_pop, 0);
+    js_def_native(ctx, ctx->array_proto, "shift", array_shift, 0);
+    js_def_native(ctx, ctx->array_proto, "unshift", array_unshift, 1);
+    js_def_native(ctx, ctx->array_proto, "slice", array_slice, 2);
+    js_def_native(ctx, ctx->array_proto, "splice", array_splice, 2);
+    js_def_native(ctx, ctx->array_proto, "concat", array_concat, 1);
+    js_def_native(ctx, ctx->array_proto, "join", array_join, 1);
+    js_def_native(ctx, ctx->array_proto, "toString", array_tostring, 0);
+    js_def_native(ctx, ctx->array_proto, "indexOf", array_indexof, 1);
+    js_def_native(ctx, ctx->array_proto, "lastIndexOf", array_lastindexof, 1);
+    js_def_native(ctx, ctx->array_proto, "includes", array_includes, 1);
+    js_def_native(ctx, ctx->array_proto, "forEach", array_foreach, 1);
+    js_def_native(ctx, ctx->array_proto, "map", array_map, 1);
+    js_def_native(ctx, ctx->array_proto, "filter", array_filter, 1);
+    js_def_native(ctx, ctx->array_proto, "some", array_some, 1);
+    js_def_native(ctx, ctx->array_proto, "every", array_every, 1);
+    js_def_native(ctx, ctx->array_proto, "find", array_find, 1);
+    js_def_native(ctx, ctx->array_proto, "findIndex", array_findindex, 1);
+    js_def_native(ctx, ctx->array_proto, "reduce", array_reduce, 1);
+    js_def_native(ctx, ctx->array_proto, "reverse", array_reverse, 0);
+    js_def_native(ctx, ctx->array_proto, "fill", array_fill, 1);
+    js_def_native(ctx, ctx->array_proto, "flat", array_flat, 0);
+    js_def_native(ctx, ctx->array_proto, "sort", array_sort, 1);
+    {
+        js_object *actor = make_ctor(ctx, "Array", native_array, ctx->array_proto);
+        js_def_native(ctx, actor, "isArray", array_isarray, 1);
+        js_def_native(ctx, actor, "from", array_from, 1);
+        js_def_native(ctx, actor, "of", array_of, 0);
+    }
+
+    /* String */
+    js_def_native(ctx, ctx->string_proto, "charAt", str_charat, 1);
+    js_def_native(ctx, ctx->string_proto, "charCodeAt", str_charcode, 1);
+    js_def_native(ctx, ctx->string_proto, "codePointAt", str_charcode, 1);
+    js_def_native(ctx, ctx->string_proto, "at", str_at, 1);
+    js_def_native(ctx, ctx->string_proto, "indexOf", str_indexof, 1);
+    js_def_native(ctx, ctx->string_proto, "lastIndexOf", str_lastindexof, 1);
+    js_def_native(ctx, ctx->string_proto, "includes", str_includes, 1);
+    js_def_native(ctx, ctx->string_proto, "startsWith", str_startswith, 1);
+    js_def_native(ctx, ctx->string_proto, "endsWith", str_endswith, 1);
+    js_def_native(ctx, ctx->string_proto, "slice", str_slice, 2);
+    js_def_native(ctx, ctx->string_proto, "substring", str_substring, 2);
+    js_def_native(ctx, ctx->string_proto, "substr", str_substr, 2);
+    js_def_native(ctx, ctx->string_proto, "toUpperCase", str_upper, 0);
+    js_def_native(ctx, ctx->string_proto, "toLowerCase", str_lower, 0);
+    js_def_native(ctx, ctx->string_proto, "trim", strm_trim, 0);
+    js_def_native(ctx, ctx->string_proto, "trimStart", strm_trimstart, 0);
+    js_def_native(ctx, ctx->string_proto, "trimEnd", strm_trimend, 0);
+    js_def_native(ctx, ctx->string_proto, "split", str_split, 2);
+    js_def_native(ctx, ctx->string_proto, "replace", str_replace, 2);
+    js_def_native(ctx, ctx->string_proto, "replaceAll", str_replaceall, 2);
+    js_def_native(ctx, ctx->string_proto, "repeat", str_repeat, 1);
+    js_def_native(ctx, ctx->string_proto, "padStart", str_padstart, 1);
+    js_def_native(ctx, ctx->string_proto, "padEnd", str_padend, 1);
+    js_def_native(ctx, ctx->string_proto, "concat", str_concat, 1);
+    js_def_native(ctx, ctx->string_proto, "toString", str_tostring, 0);
+    js_def_native(ctx, ctx->string_proto, "valueOf", str_tostring, 0);
+    {
+        js_object *sctor = make_ctor(ctx, "String", native_string, ctx->string_proto);
+        js_def_native(ctx, sctor, "fromCharCode", string_fromcharcode, 1);
+    }
+
+    /* Number */
+    js_def_native(ctx, ctx->number_proto, "toFixed", num_tofixed, 1);
+    js_def_native(ctx, ctx->number_proto, "toExponential", num_toexp, 1);
+    js_def_native(ctx, ctx->number_proto, "toPrecision", num_toprecision, 1);
+    js_def_native(ctx, ctx->number_proto, "toString", num_tostring, 1);
+    js_def_native(ctx, ctx->number_proto, "valueOf", prim_valueof, 0);
+    {
+        js_object *nctor = make_ctor(ctx, "Number", native_number, ctx->number_proto);
+        js_def_native(ctx, nctor, "isInteger", num_isinteger, 1);
+        js_def_native(ctx, nctor, "isFinite", num_isfinite, 1);
+        js_def_native(ctx, nctor, "isNaN", num_isnan, 1);
+        js_def_native(ctx, nctor, "isSafeInteger", num_issafe, 1);
+        js_def_native(ctx, nctor, "parseFloat", g_parsefloat, 1);
+        js_def_native(ctx, nctor, "parseInt", g_parseint, 2);
+        js_def(nctor, "MAX_SAFE_INTEGER", js_number(9007199254740991.0), 0);
+        js_def(nctor, "MIN_SAFE_INTEGER", js_number(-9007199254740991.0), 0);
+        js_def(nctor, "MAX_VALUE", js_number(1.7976931348623157e308), 0);
+        js_def(nctor, "MIN_VALUE", js_number(5e-324), 0);
+        js_def(nctor, "EPSILON", js_number(2.220446049250313e-16), 0);
+        js_def(nctor, "POSITIVE_INFINITY", js_number(1.0 / 0.0), 0);
+        js_def(nctor, "NEGATIVE_INFINITY", js_number(-1.0 / 0.0), 0);
+        js_def(nctor, "NaN", js_number(0.0 / 0.0), 0);
+    }
+
+    /* Boolean */
+    js_def_native(ctx, ctx->boolean_proto, "toString", bool_tostring, 0);
+    js_def_native(ctx, ctx->boolean_proto, "valueOf", prim_valueof, 0);
+    make_ctor(ctx, "Boolean", native_boolean, ctx->boolean_proto);
+
+    /* Error family */
+    js_def(ctx->error_proto, "name", js_mk_cstring(ctx, "Error"), P_WRITABLE | P_CONFIGURABLE);
+    js_def(ctx->error_proto, "message", js_mk_cstring(ctx, ""), P_WRITABLE | P_CONFIGURABLE);
+    js_def_native(ctx, ctx->error_proto, "toString", err_tostring, 0);
+    js_def(ctx->type_error_proto, "name", js_mk_cstring(ctx, "TypeError"), P_WRITABLE | P_CONFIGURABLE);
+    js_def(ctx->range_error_proto, "name", js_mk_cstring(ctx, "RangeError"), P_WRITABLE | P_CONFIGURABLE);
+    js_def(ctx->syntax_error_proto, "name", js_mk_cstring(ctx, "SyntaxError"), P_WRITABLE | P_CONFIGURABLE);
+    js_def(ctx->ref_error_proto, "name", js_mk_cstring(ctx, "ReferenceError"), P_WRITABLE | P_CONFIGURABLE);
+    make_ctor(ctx, "Error", err_error, ctx->error_proto);
+    make_ctor(ctx, "TypeError", err_type, ctx->type_error_proto);
+    make_ctor(ctx, "RangeError", err_range, ctx->range_error_proto);
+    make_ctor(ctx, "SyntaxError", err_syntax, ctx->syntax_error_proto);
+    make_ctor(ctx, "ReferenceError", err_ref, ctx->ref_error_proto);
+
+    /* Math */
+    {
+        js_object *math = js_new_object(ctx, ctx->object_proto);
+        gc_keep(math);
+        js_def(ctx->global, "Math", js_obj_value(math), P_WRITABLE | P_CONFIGURABLE);
+        js_def(math, "PI", js_number(3.141592653589793), 0);
+        js_def(math, "E", js_number(2.718281828459045), 0);
+        js_def(math, "LN2", js_number(0.6931471805599453), 0);
+        js_def(math, "LN10", js_number(2.302585092994046), 0);
+        js_def(math, "SQRT2", js_number(1.4142135623730951), 0);
+        js_def_native(ctx, math, "abs", m_abs, 1);     js_def_native(ctx, math, "floor", m_floor, 1);
+        js_def_native(ctx, math, "ceil", m_ceil, 1);   js_def_native(ctx, math, "round", m_round, 1);
+        js_def_native(ctx, math, "trunc", m_trunc, 1); js_def_native(ctx, math, "sign", m_sign, 1);
+        js_def_native(ctx, math, "sqrt", m_sqrt, 1);   js_def_native(ctx, math, "cbrt", m_cbrt, 1);
+        js_def_native(ctx, math, "pow", m_pow, 2);     js_def_native(ctx, math, "exp", m_exp, 1);
+        js_def_native(ctx, math, "log", m_log, 1);     js_def_native(ctx, math, "log2", m_log2, 1);
+        js_def_native(ctx, math, "log10", m_log10, 1); js_def_native(ctx, math, "sin", m_sin, 1);
+        js_def_native(ctx, math, "cos", m_cos, 1);     js_def_native(ctx, math, "tan", m_tan, 1);
+        js_def_native(ctx, math, "asin", m_asin, 1);   js_def_native(ctx, math, "acos", m_acos, 1);
+        js_def_native(ctx, math, "atan", m_atan, 1);   js_def_native(ctx, math, "atan2", m_atan2, 2);
+        js_def_native(ctx, math, "sinh", m_sinh, 1);   js_def_native(ctx, math, "cosh", m_cosh, 1);
+        js_def_native(ctx, math, "tanh", m_tanh, 1);   js_def_native(ctx, math, "hypot", m_hypot, 2);
+        js_def_native(ctx, math, "max", m_max, 2);     js_def_native(ctx, math, "min", m_min, 2);
+        js_def_native(ctx, math, "random", m_random, 0);
+        (void)m_round_;
+    }
+
+    /* Promise */
+    js_def_native(ctx, ctx->promise_proto, "then", promise_then, 2);
+    js_def_native(ctx, ctx->promise_proto, "catch", promise_catch, 1);
+    js_def_native(ctx, ctx->promise_proto, "finally", promise_finally, 1);
+    {
+        js_object *pctor = make_ctor(ctx, "Promise", promise_ctor, ctx->promise_proto);
+        js_def_native(ctx, pctor, "resolve", promise_resolve_s, 1);
+        js_def_native(ctx, pctor, "reject", promise_reject_s, 1);
+        js_def_native(ctx, pctor, "all", promise_all_s, 1);
+        js_def_native(ctx, pctor, "race", promise_all_s, 1);   /* simplified: first-settled-ish */
+    }
+
+    /* Symbol (+ well-known symbols). Created before Map/Set so [Symbol.iterator]
+     * keys are available. */
+    js_def_native(ctx, ctx->symbol_proto, "toString", symbol_tostring, 0);
+    js_def_native(ctx, ctx->symbol_proto, "valueOf", symbol_valueof, 0);
+    { js_object *g = js_new_native(ctx, symbol_desc_get, "description", 0); js_def_accessor(ctx->symbol_proto, "description", g, 0, P_CONFIGURABLE); }
+    {
+        js_object *sctor = make_ctor(ctx, "Symbol", symbol_ctor, ctx->symbol_proto);
+        gc_push_scope(); gc_keep(sctor);
+        js_def(sctor, "@reg", js_obj_value(js_new_object(ctx, ctx->object_proto)), 0);
+        js_def_native(ctx, sctor, "for", symbol_for, 1);
+        ctx->sym_iterator = js_mk_symbol(ctx, "Symbol.iterator");
+        js_def(sctor, "iterator", ctx->sym_iterator, 0);
+        js_def(sctor, "asyncIterator", js_mk_symbol(ctx, "Symbol.asyncIterator"), 0);
+        js_def(sctor, "hasInstance", js_mk_symbol(ctx, "Symbol.hasInstance"), 0);
+        js_def(sctor, "toPrimitive", js_mk_symbol(ctx, "Symbol.toPrimitive"), 0);
+        js_def(sctor, "toStringTag", js_mk_symbol(ctx, "Symbol.toStringTag"), 0);
+        gc_pop_scope();
+    }
+    { js_object *f = js_new_native(ctx, set_values, "[Symbol.iterator]", 0); js_def(ctx->array_proto, js_symbol_key(ctx->sym_iterator), js_obj_value(f), 0); }
+
+    /* Map */
+    js_def_native(ctx, ctx->map_proto, "set", map_set, 2);
+    js_def_native(ctx, ctx->map_proto, "get", map_get, 1);
+    js_def_native(ctx, ctx->map_proto, "has", coll_has, 1);
+    js_def_native(ctx, ctx->map_proto, "delete", map_delete, 1);
+    js_def_native(ctx, ctx->map_proto, "clear", coll_clear, 0);
+    js_def_native(ctx, ctx->map_proto, "forEach", map_foreach, 1);
+    js_def_native(ctx, ctx->map_proto, "keys", map_keys, 0);
+    js_def_native(ctx, ctx->map_proto, "values", map_values, 0);
+    js_def_native(ctx, ctx->map_proto, "entries", map_entries, 0);
+    { js_object *g = js_new_native(ctx, coll_size, "size", 0); js_def_accessor(ctx->map_proto, "size", g, 0, P_CONFIGURABLE); }
+    { js_object *f = js_new_native(ctx, map_entries, "[Symbol.iterator]", 0); js_def(ctx->map_proto, js_symbol_key(ctx->sym_iterator), js_obj_value(f), 0); }
+    make_ctor(ctx, "Map", map_constructor, ctx->map_proto);
+
+    /* Set */
+    js_def_native(ctx, ctx->set_proto, "add", set_add, 1);
+    js_def_native(ctx, ctx->set_proto, "has", coll_has, 1);
+    js_def_native(ctx, ctx->set_proto, "delete", set_delete, 1);
+    js_def_native(ctx, ctx->set_proto, "clear", coll_clear, 0);
+    js_def_native(ctx, ctx->set_proto, "forEach", set_foreach, 1);
+    js_def_native(ctx, ctx->set_proto, "values", set_values, 0);
+    js_def_native(ctx, ctx->set_proto, "keys", set_values, 0);
+    js_def_native(ctx, ctx->set_proto, "entries", set_entries, 0);
+    { js_object *g = js_new_native(ctx, coll_size, "size", 0); js_def_accessor(ctx->set_proto, "size", g, 0, P_CONFIGURABLE); }
+    { js_object *f = js_new_native(ctx, set_values, "[Symbol.iterator]", 0); js_def(ctx->set_proto, js_symbol_key(ctx->sym_iterator), js_obj_value(f), 0); }
+    make_ctor(ctx, "Set", set_constructor, ctx->set_proto);
+
+    /* WeakMap / WeakSet (non-weak: keys held strongly; object/symbol keys only) */
+    js_def_native(ctx, ctx->weakmap_proto, "set", weakmap_set, 2);
+    js_def_native(ctx, ctx->weakmap_proto, "get", map_get, 1);
+    js_def_native(ctx, ctx->weakmap_proto, "has", coll_has, 1);
+    js_def_native(ctx, ctx->weakmap_proto, "delete", map_delete, 1);
+    make_ctor(ctx, "WeakMap", weakmap_constructor, ctx->weakmap_proto);
+    js_def_native(ctx, ctx->weakset_proto, "add", weakset_add, 1);
+    js_def_native(ctx, ctx->weakset_proto, "has", coll_has, 1);
+    js_def_native(ctx, ctx->weakset_proto, "delete", set_delete, 1);
+    make_ctor(ctx, "WeakSet", weakset_constructor, ctx->weakset_proto);
+
+    /* Date — time stored as epoch-millis in a hidden "@t" property; all fields
+     * are UTC (no local timezone, getTimezoneOffset is 0). */
+    js_def_native(ctx, ctx->date_proto, "getTime", date_getTime, 0);
+    js_def_native(ctx, ctx->date_proto, "valueOf", date_getTime, 0);
+    js_def_native(ctx, ctx->date_proto, "getFullYear", date_getFullYear, 0);
+    js_def_native(ctx, ctx->date_proto, "getMonth", date_getMonth, 0);
+    js_def_native(ctx, ctx->date_proto, "getDate", date_getDate, 0);
+    js_def_native(ctx, ctx->date_proto, "getDay", date_getDay, 0);
+    js_def_native(ctx, ctx->date_proto, "getHours", date_getHours, 0);
+    js_def_native(ctx, ctx->date_proto, "getMinutes", date_getMinutes, 0);
+    js_def_native(ctx, ctx->date_proto, "getSeconds", date_getSeconds, 0);
+    js_def_native(ctx, ctx->date_proto, "getMilliseconds", date_getMilliseconds, 0);
+    js_def_native(ctx, ctx->date_proto, "getUTCFullYear", date_getFullYear, 0);
+    js_def_native(ctx, ctx->date_proto, "getUTCMonth", date_getMonth, 0);
+    js_def_native(ctx, ctx->date_proto, "getUTCDate", date_getDate, 0);
+    js_def_native(ctx, ctx->date_proto, "getUTCDay", date_getDay, 0);
+    js_def_native(ctx, ctx->date_proto, "getUTCHours", date_getHours, 0);
+    js_def_native(ctx, ctx->date_proto, "getUTCMinutes", date_getMinutes, 0);
+    js_def_native(ctx, ctx->date_proto, "getUTCSeconds", date_getSeconds, 0);
+    js_def_native(ctx, ctx->date_proto, "getUTCMilliseconds", date_getMilliseconds, 0);
+    js_def_native(ctx, ctx->date_proto, "getTimezoneOffset", date_tzoff, 0);
+    js_def_native(ctx, ctx->date_proto, "toISOString", date_iso, 0);
+    js_def_native(ctx, ctx->date_proto, "toJSON", date_iso, 0);
+    js_def_native(ctx, ctx->date_proto, "toString", date_iso, 0);
+    { js_object *dc = make_ctor(ctx, "Date", date_ctor, ctx->date_proto);
+      js_def_native(ctx, dc, "now", date_now, 0); }
+
+    /* JSON */
+    {
+        js_object *json = js_new_object(ctx, ctx->object_proto);
+        gc_keep(json);
+        js_def(ctx->global, "JSON", js_obj_value(json), P_WRITABLE | P_CONFIGURABLE);
+        js_def_native(ctx, json, "stringify", json_stringify, 3);
+        js_def_native(ctx, json, "parse", json_parse, 2);
+    }
+
+    /* console */
+    {
+        js_object *con = js_new_object(ctx, ctx->object_proto);
+        gc_keep(con);
+        js_def(ctx->global, "console", js_obj_value(con), P_WRITABLE | P_CONFIGURABLE);
+        js_def_native(ctx, con, "log", native_console_log, 0);
+        js_def_native(ctx, con, "error", native_console_error, 0);
+        js_def_native(ctx, con, "warn", native_console_warn, 0);
+        js_def_native(ctx, con, "info", native_console_info, 0);
+        js_def_native(ctx, con, "debug", native_console_debug, 0);
+    }
+
+    /* global functions and values */
+    def_global_fn(ctx, "parseInt", g_parseint, 2);
+    def_global_fn(ctx, "parseFloat", g_parsefloat, 1);
+    def_global_fn(ctx, "isNaN", g_isnan, 1);
+    def_global_fn(ctx, "isFinite", g_isfinite, 1);
+    def_global_fn(ctx, "encodeURIComponent", g_encode_uri_component, 1);
+    def_global_fn(ctx, "encodeURI", g_encode_uri, 1);
+    def_global_fn(ctx, "decodeURIComponent", g_decode_uri_component, 1);
+    def_global_fn(ctx, "decodeURI", g_decode_uri, 1);
+    def_global_fn(ctx, "eval", js_builtin_eval, 1);
+    {
+        js_object *fctor = js_new_native(ctx, js_builtin_function, "Function", 1);
+        gc_push_scope(); gc_keep(fctor);
+        js_def(fctor, "prototype", js_obj_value(ctx->function_proto), 0);
+        js_def(ctx->function_proto, "constructor", js_obj_value(fctor), P_WRITABLE | P_CONFIGURABLE);
+        js_def(ctx->global, "Function", js_obj_value(fctor), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+    def_global(ctx, "undefined", js_undef());
+    def_global(ctx, "NaN", js_number(0.0 / 0.0));
+    def_global(ctx, "Infinity", js_number(1.0 / 0.0));
+    js_def(ctx->global, "globalThis", js_obj_value(ctx->global), P_WRITABLE | P_CONFIGURABLE);
+
+    gc_pop_scope();
+}

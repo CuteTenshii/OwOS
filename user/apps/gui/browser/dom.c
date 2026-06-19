@@ -82,6 +82,7 @@ static struct dom_node *node_new(struct parser *ps, enum dom_type type)
 	n->text = 0;
 	n->attrs = 0;
 	n->parent = n->first_child = n->last_child = n->next = 0;
+	n->wrapper = 0;
 	return n;
 }
 
@@ -347,6 +348,7 @@ struct dom_node *dom_parse(const char *html, int len)
 	ps.root->attrs = 0;
 	ps.root->parent = 0;
 	ps.root->first_child = ps.root->last_child = ps.root->next = 0;
+	ps.root->wrapper = 0;
 	ps.cur = ps.root;
 
 	while (ps.p < ps.end && !ps.oom) {
@@ -356,8 +358,17 @@ struct dom_node *dom_parse(const char *html, int len)
 	return ps.root;
 }
 
+/* Set by browser/js.c: invoked when a node that has a JS wrapper is freed, so the
+ * wrapper can be detached (host cleared) instead of dangling. NULL when no JS. */
+void (*dom_on_free_wrapper)(void *wrapper);
+
+/* Bumped by every tree-mutating API below. The browser samples it around a JS
+ * event so it only re-flattens the page when a handler actually changed the DOM. */
+unsigned dom_mutation_seq;
+
 static void node_free_one(struct dom_node *n)
 {
+	if (n->wrapper && dom_on_free_wrapper) dom_on_free_wrapper(n->wrapper);
 	struct dom_attr *a = n->attrs;
 	while (a) {
 		struct dom_attr *nx = a->next;
@@ -396,4 +407,97 @@ const char *dom_get_attr(const struct dom_node *node, const char *name)
 	for (struct dom_attr *a = node->attrs; a; a = a->next)
 		if (streq_ci(a->name, name)) return a->value;
 	return 0;
+}
+
+/* --- mutation API (for the JS DOM bindings; see browser/js.c) -------------- */
+
+struct dom_node *dom_new_element(const char *tag)
+{
+	struct dom_node *n = malloc(sizeof *n);
+	if (!n) return 0;
+	n->type = DOM_ELEMENT;
+	n->text = 0;
+	n->attrs = 0;
+	n->parent = n->first_child = n->last_child = n->next = 0;
+	n->wrapper = 0;
+	{ int i = 0; for (; tag && tag[i] && i < 15; i++) n->tag[i] = lower(tag[i]); n->tag[i] = '\0'; }
+	return n;
+}
+
+struct dom_node *dom_new_text(const char *text)
+{
+	struct dom_node *n = malloc(sizeof *n);
+	if (!n) return 0;
+	n->type = DOM_TEXT;
+	n->tag[0] = '\0';
+	n->attrs = 0;
+	n->parent = n->first_child = n->last_child = n->next = 0;
+	n->wrapper = 0;
+	n->text = dupn(text ? text : "", text ? (int)strlen(text) : 0);
+	return n;
+}
+
+void dom_remove_child(struct dom_node *parent, struct dom_node *child)
+{
+	if (!parent || !child) return;
+	dom_mutation_seq++;
+	struct dom_node *prev = 0, *c = parent->first_child;
+	while (c && c != child) { prev = c; c = c->next; }
+	if (!c) return;
+	if (prev) prev->next = c->next; else parent->first_child = c->next;
+	if (parent->last_child == c) parent->last_child = prev;
+	c->next = 0;
+	c->parent = 0;
+}
+
+void dom_append_child(struct dom_node *parent, struct dom_node *child)
+{
+	if (!parent || !child) return;
+	dom_mutation_seq++;
+	if (child->parent) dom_remove_child(child->parent, child);
+	node_append(parent, child);
+}
+
+void dom_set_attr(struct dom_node *el, const char *name, const char *value)
+{
+	if (!el || el->type != DOM_ELEMENT || !name) return;
+	dom_mutation_seq++;
+	for (struct dom_attr *a = el->attrs; a; a = a->next)
+		if (streq_ci(a->name, name)) {
+			char *nv = dupn(value ? value : "", value ? (int)strlen(value) : 0);
+			if (nv) { free(a->value); a->value = nv; }
+			return;
+		}
+	{
+		char *nn = dupn_lower(name, (int)strlen(name));
+		char *nv = dupn(value ? value : "", value ? (int)strlen(value) : 0);
+		if (nn && nv) attr_append(el, nn, nv);
+		else { if (nn) free(nn); if (nv) free(nv); }
+	}
+}
+
+void dom_remove_attr(struct dom_node *el, const char *name)
+{
+	if (!el) return;
+	dom_mutation_seq++;
+	struct dom_attr *prev = 0, *a = el->attrs;
+	while (a) {
+		if (streq_ci(a->name, name)) {
+			if (prev) prev->next = a->next; else el->attrs = a->next;
+			free(a->name); free(a->value); free(a);
+			return;
+		}
+		prev = a; a = a->next;
+	}
+}
+
+/* Detach and free every child subtree. Each child is unlinked before dom_free so
+ * the post-order teardown stays within that one subtree. */
+void dom_clear_children(struct dom_node *el)
+{
+	if (!el) return;
+	dom_mutation_seq++;
+	struct dom_node *c = el->first_child;
+	el->first_child = el->last_child = 0;
+	while (c) { struct dom_node *nx = c->next; c->next = 0; c->parent = 0; dom_free(c); c = nx; }
 }

@@ -72,6 +72,11 @@ struct window {
 	/* The scroll wheel moved while the cursor was over this window. `dz` is the
 	 * notch delta (positive = wheel away from the user / scroll up). */
 	void     (*scroll)(struct window *w, int mx, int my, int dz);
+	/* The pointer moved over this window's client area with NO button held
+	 * (mx,my track the cursor). Lets an app react to hover — e.g. show a hovered
+	 * link's target in a status bar. The WM sends one final hover with mx<0 when
+	 * the pointer leaves, so the app can clear its hover state. NULL = ignored. */
+	void     (*hover)(struct window *w, int mx, int my);
 
 	/* Preferred cursor shape (enum wm_cursor) while the pointer is over this
 	 * window's client area; 0 (WM_CURSOR_ARROW) = the default pointer. Resize

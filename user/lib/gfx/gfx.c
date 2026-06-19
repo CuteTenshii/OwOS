@@ -215,6 +215,48 @@ void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg)
 		gfx_glyph(x, y, (unsigned char)*s, fg, bg);
 }
 
+/* Map a Unicode codepoint to the cell font's CP437 glyph (0 = no glyph). The
+ * Latin-1 supplement (U+00A0..U+00FF) covers the common Western-European accents;
+ * a few cp1252 punctuation marks fold to ASCII. */
+static unsigned char uni_to_cp437(unsigned cp)
+{
+	if (cp < 0x80) return (unsigned char)cp;
+	if (cp >= 0xA0 && cp <= 0xFF) {
+		static const unsigned char t[96] = {
+			0x20,0xAD,0x9B,0x9C,0x00,0x9D,0x00,0x15,0x00,0x00,0xA6,0xAE,0xAA,0x2D,0x00,0x00,
+			0xF8,0xF1,0xFD,0x00,0x00,0xE6,0x14,0xFA,0x00,0x00,0xA7,0xAF,0xAC,0xAB,0x00,0xA8,
+			0x00,0x00,0x00,0x00,0x8E,0x8F,0x92,0x80,0x00,0x90,0x00,0x00,0x00,0x00,0x00,0x00,
+			0x00,0xA5,0x00,0x00,0x00,0x00,0x99,0x00,0x00,0x00,0x00,0x00,0x9A,0x00,0x00,0xE1,
+			0x85,0xA0,0x83,0x00,0x84,0x86,0x91,0x87,0x8A,0x82,0x88,0x89,0x8D,0xA1,0x8C,0x8B,
+			0x00,0xA4,0x95,0xA2,0x93,0x00,0x94,0xF6,0x00,0x97,0xA3,0x96,0x81,0x00,0x00,0x98,
+		};
+		unsigned char c = t[cp - 0xA0];
+		return c ? c : '?';
+	}
+	switch (cp) {                                  /* common cp1252 punctuation */
+	case 0x2018: case 0x2019: return '\'';
+	case 0x201C: case 0x201D: return '"';
+	case 0x2013: case 0x2014: return '-';
+	case 0x2026: return '.';
+	}
+	return '?';
+}
+
+/* Monospace text that decodes UTF-8 — each codepoint occupies one GFX_FONT_W
+ * cell (so columns stay aligned), rendered via the CP437 cell font. Returns the
+ * pen x after the string so callers can abut coloured runs. */
+int gfx_text_utf8(int x, int y, const char *s, unsigned fg, unsigned bg)
+{
+	const char *end = s + strlen(s);
+	unsigned cp;
+	while (s < end) {
+		s += utf8_decode(s, end, &cp);
+		gfx_glyph(x, y, uni_to_cp437(cp), fg, bg);
+		x += GFX_FONT_W;
+	}
+	return x;
+}
+
 /* Proportional UI text (UTF-8). UIFONT_H stays the advertised line height apps
  * lay out against; the glyph sits on its baseline within that. */
 int gfx_ui_cw_cp_px(unsigned cp, int px)
@@ -593,22 +635,30 @@ void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focuse
 	if (tf->caret < tf->scroll) tf->scroll = tf->caret;
 	while (tf->scroll < tf->caret && tf_span(tf, tf->scroll, tf->caret) > avail - 2)
 		tf->scroll++;
+	/* Reclaim blank space on the right after a deletion shortened the tail: pull
+	 * the view left while the whole remaining text would still fit, so leading
+	 * characters never stay hidden behind an empty gap. The caret stays visible
+	 * because caret <= len. */
+	while (tf->scroll > 0 && tf_span(tf, tf->scroll - 1, tf->len) <= avail - 2)
+		tf->scroll--;
 
-	/* Draw visible chars; place the caret as we pass it. */
+	/* Draw visible chars; record where the caret falls so it's drawn afterward
+	 * (over the glyphs) and never lost to the loop's right-edge break. */
 	int px = inner;
-	for (int i = tf->scroll; i < tf->len; i++) {
+	int caret_px = -1;
+	for (int i = tf->scroll; i <= tf->len; i++) {
+		if (i == tf->caret) caret_px = px;
+		if (i == tf->len) break;
 		int cw = gfx_ui_cw((unsigned char)tf->buf[i]);
 		if (px - inner + cw > avail)
 			break;
 		char one[2] = { tf->buf[i], '\0' };
 		gfx_ui_text(px, ty, one, TF_FG);
-		if (focused && i == tf->caret)
-			gfx_fill_rect(px, ty, 1, UIFONT_H, TF_FOCUS);
 		px += cw;
 	}
-	if (focused && tf->caret >= tf->len) {           /* caret at end of text */
-		if (px > inner + avail - 1) px = inner + avail - 1;
-		gfx_fill_rect(px, ty, 1, UIFONT_H, TF_FOCUS);
+	if (focused && caret_px >= 0) {
+		if (caret_px > inner + avail - 1) caret_px = inner + avail - 1;
+		gfx_fill_rect(caret_px, ty, 1, UIFONT_H, TF_FOCUS);
 	}
 }
 

@@ -180,6 +180,8 @@ struct tab {
 	char    *hist[HIST_MAX];
 	int      hist_n;             /* number of entries in use                    */
 	int      hist_i;             /* index of the current page (0..hist_n-1)     */
+
+	struct dt_view dt;           /* this tab's devtools view (panel/scroll/open) */
 };
 static struct tab tabs[MAX_TABS];
 static int n_tabs = 1;
@@ -244,7 +246,11 @@ static int hist_can_fwd(const struct tab *t)  { return t->hist_i < t->hist_n - 1
 static void tab_cache_active(int i)
 {
 	struct tab *t = &tabs[i];
+	/* We're leaving this page; its live DOM/JS go away (the worker frees them).
+	 * Snapshots are of the flat buffers only, so interactivity doesn't persist. */
+	B->drop_dom = 1; B->events_live = 0;
 	t->scroll = B->scroll;
+	devtools_view_save(&t->dt);              /* remember this tab's devtools view */
 	if (B->loading || (B->mode == MODE_HTML && B->text_len == 0 && !B->cur_url[0])) {
 		tab_drop(t);
 		return;
@@ -284,6 +290,7 @@ static void tab_restore(int i)
 {
 	struct tab *t = &tabs[i];
 	int tl = t->text_len;
+	B->drop_dom = 1; B->events_live = 0;   /* restored from a snapshot: static page */
 	int link_b = t->nlinks * (int)sizeof(struct link);
 	int img_b  = t->n_imgs * (int)sizeof(struct inl_img);
 
@@ -330,19 +337,168 @@ static void tab_restore(int i)
 static char         worker_stack[65536];
 static volatile int worker_quit;
 
+static void worker_navigate(const char *url)
+{
+	int k = 0;
+	for (; url[k] && k < URL_MAX - 1; k++) B->req_url[k] = url[k];
+	B->req_url[k] = '\0';
+	B->req_pending = 1; B->seq++;
+}
+
+/* Submit the form enclosing `from`: fire 'submit', and unless prevented navigate
+ * to the action with the form's field values. Returns 1 if a form was found. */
+static int worker_submit(struct dom_node *from)
+{
+	char url[URL_MAX];
+	struct dom_node *form;
+	for (form = from; form; form = form->parent) if (streq(form->tag, "form")) break;
+	if (!form) return 0;
+	if (!js_dispatch_dom_event(form, "submit", 0, 0) &&
+	    html_form_submit_url(from, url, sizeof url) && url[0])
+		worker_navigate(url);
+	return 1;
+}
+
+/* Perform a clicked control's default action: toggle/cycle/focus/submit, firing
+ * the matching DOM events. Returns 1 if the page should re-flatten afterwards. */
+static int activate_control(struct dom_node *c, int kind)
+{
+	switch (kind) {
+	case CTRL_CHECKBOX:
+		html_toggle_checked(c);
+		js_dispatch_dom_event(c, "change", 0, 0);
+		html_set_focus(0);
+		return 1;
+	case CTRL_RADIO:
+		html_radio_select(c);
+		js_dispatch_dom_event(c, "change", 0, 0);
+		html_set_focus(0);
+		return 1;
+	case CTRL_SELECT:
+		html_select_cycle(c);
+		js_dispatch_dom_event(c, "change", 0, 0);
+		html_set_focus(0);
+		return 1;
+	case CTRL_TEXT:
+		html_set_focus(c);
+		return 1;
+	case CTRL_TEXTAREA:
+		if (!dom_get_attr(c, "value")) html_seed_textarea(c);
+		html_set_focus(c);
+		return 1;
+	case CTRL_SUBMIT:
+		html_set_focus(0);
+		worker_submit(c);
+		return 1;
+	default:
+		html_set_focus(0);
+		return 1;
+	}
+}
+
+/* Run a queued content-pane event through the live JS DOM (worker-thread only —
+ * the engine is single-threaded). For a click: resolve the target node, dispatch
+ * the click, then unless a handler called preventDefault perform the default
+ * action (activate a form control, or follow a link). For keyinput: edit the
+ * focused text control and fire an 'input' event. Re-flatten if anything changed. */
+static void worker_dispatch_event(void)
+{
+	unsigned mseq = dom_mutation_seq;
+	int need_relayout = 0;
+	B->evt_pending = 0;
+
+	if (streq(B->evt_type, "blur")) {
+		if (html_focus()) { html_set_focus(0); html_relayout(); }
+		return;
+	}
+	if (streq(B->evt_type, "keyinput")) {
+		struct dom_node *f = html_focus();                /* evt_x carries the char */
+		int ch = B->evt_x;
+		if (f && (ch == '\n' || ch == '\r') && html_control_kind(f) == CTRL_TEXT) {
+			worker_submit(f);                             /* Enter in a single-line field */
+			need_relayout = 1;
+		} else if ((f = html_focus_edit(ch)) != 0) {
+			js_dispatch_dom_event(f, "input", 0, 0);
+			need_relayout = 1;
+		}
+	} else {                                               /* a click */
+		struct dom_node *t = html_node_at_offset(B->evt_off), *ctrl;
+		int prevented = js_dispatch_dom_event(t, "click", B->evt_x, B->evt_y);
+		if (!prevented) {
+			int kind = CTRL_NONE;
+			for (ctrl = t; ctrl; ctrl = ctrl->parent)
+				if ((kind = html_control_kind(ctrl)) != CTRL_NONE) break;
+			if (ctrl) need_relayout |= activate_control(ctrl, kind);
+			else {
+				if (html_focus()) { html_set_focus(0); need_relayout = 1; }   /* blur */
+				if (B->evt_text[0]) worker_navigate(B->evt_text);             /* link */
+			}
+		}
+	}
+
+	if (dom_mutation_seq != mseq || need_relayout) {
+		html_relayout();
+		if (B->n_imgs > 0) fetch_inline_images(B->cur_url);
+	}
+	B->events_live = js_has_listeners() || html_has_controls();
+}
+
 static void worker_fn(void)
 {
 	for (;;) {
 		if (worker_quit)
 			exit(0);
+		if (B->drop_dom) {                   /* main switched away: free the page  */
+			B->drop_dom = 0;
+			B->events_live = 0;
+			html_page_teardown();
+		}
+		if (B->recascade) {                  /* window resized: re-run the cascade  */
+			B->recascade = 0;
+			html_relayout();                 /* re-evaluates @media at the new size */
+			if (B->n_imgs > 0) fetch_inline_images(B->cur_url);
+			B->seq++;
+		}
 		if (B->req_pending) {
 			B->req_pending = 0;
+			B->abort_load = 0;            /* a fresh navigation clears any pending Stop */
 			B->loading = 1; B->seq++;
 			do_fetch();
-			B->loading = 0; B->seq++;
+			B->loading = 0; B->abort_load = 0;
+			B->events_live = js_has_listeners() || html_has_controls();
+			B->seq++;
+		} else if (B->evt_pending) {
+			worker_dispatch_event();
 		} else if (fetch_lazy_visible()) {
 			continue;                    /* a deferred image landed: look again */
 		}
+		/* Drive the page's timers (setTimeout/setInterval/rAF) and live
+		 * WebSockets. A fired callback may mutate the DOM — relayout + repaint
+		 * when it did. */
+		{
+			unsigned mseq = dom_mutation_seq;
+			if (js_timers_pump() + js_websockets_pump()) {
+				if (dom_mutation_seq != mseq) {
+					html_relayout();
+					if (B->n_imgs > 0) fetch_inline_images(B->cur_url);
+				}
+				B->seq++;
+			}
+		}
+		/* Load any <iframe> documents the last layout discovered: fetch each,
+		 * check it against X-Frame-Options / CSP frame-ancestors, then re-flatten
+		 * so the allowed ones render in place of their placeholders. A frame's own
+		 * content may itself hold iframes, surfaced on a later pass. */
+		if (!B->req_pending && !B->loading && html_iframes_pending()) {
+			fetch_iframes();
+			html_relayout();
+			if (B->n_imgs > 0) fetch_inline_images(B->cur_url);
+			B->seq++;
+		}
+
+		/* Rebuild the devtools DOM/Styles snapshot from the live tree (this thread
+		 * owns it) when the panel is open and the page changed. No-op when closed. */
+		devtools_worker_tick();
 		msleep(30);
 	}
 }
@@ -565,6 +721,96 @@ static int img_rows(const struct inl_img *im, int paw)
 	return r < 1 ? 1 : r;
 }
 
+static void pane_metrics(int *py, int *phh, int *rows);
+
+/* Highest valid scroll line: the last `rows` lines fill the pane exactly, so the
+ * bottom stop can't scroll content up into blank space below it. */
+static int scroll_max(void)
+{
+	int py, phh, rows;
+	pane_metrics(&py, &phh, &rows);
+	int max = B->nlines - rows;
+	return max < 0 ? 0 : max;
+}
+
+/* --- approximate element geometry for the DOM geometry APIs (js.c) ---------- *
+ * The line-flow renderer has no per-element box model, so an element's pixel box
+ * is reconstructed from the wrapped line table + inline-image rows. Returns a
+ * document-relative box (x,y,w,h) for the rendered text range [start,end), 0 if
+ * the range produced no rows (unrendered/empty). Width is exact for a range that
+ * lies on one text line; the content column otherwise. Runs on the worker (JS)
+ * thread, so it holds blk_lock — render() rebuilds the line table and uses the
+ * glyph cache (set_block/body_cp_adv) under the same lock. */
+int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
+{
+	*ox = *oy = *ow = *oh = 0;
+	if (end <= start) end = start + 1;            /* zero-width span: one anchor cell */
+	int paw = (BW - SCROLL_W) - 8; if (paw < 8) paw = 8;
+
+	blk_lock();
+	int first = -1, last = -1, text_rows = 0, img_w = 0;
+	for (int r = 0; r < B->nlines; r++) {
+		int rs = B->line_off[r], rl = B->line_len[r];
+		int hit = rl > 0 ? (rs < end && rs + rl > start)    /* text-line overlap */
+		                 : (rs >= start && rs < end);       /* blank/anchor row  */
+		if (!hit) continue;
+		if (first < 0) first = r;
+		last = r;
+		if (rl > 0) text_rows++;
+	}
+	/* Inline images anchored inside the span: the <img> element itself (whose span
+	 * ends at its anchor) and any ancestor block enclosing it. */
+	for (int q = 0; q < B->n_imgs; q++) {
+		struct inl_img *im = &B->imgs[q];
+		if (im->start_row < 0 || im->text_pos < start || im->text_pos > end) continue;
+		int s0 = im->start_row, s1 = s0 + (im->rows > 0 ? im->rows : 1) - 1;
+		if (first < 0 || s0 < first) first = s0;
+		if (s1 > last) last = s1;
+		int dw = 0, dh = 0; img_disp_size(im, paw, &dw, &dh);
+		if (dw > img_w) img_w = dw;
+	}
+	if (first < 0) { blk_unlock(); return 0; }
+
+	int x = 4, w = paw, y = first * LINE_H, h = (last - first + 1) * LINE_H;
+	if (first == last && text_rows == 1) {        /* one text line: exact x + width */
+		int rs = B->line_off[first], re = rs + B->line_len[first];
+		const char *t = B->text;
+		unsigned cp;
+		set_block(rs);
+		x += cur_bindent * INDENT_PX;
+		if (cur_bcenter) {
+			int lw = 0;
+			for (int p = rs; p < re; ) { p += utf8_decode(&t[p], &t[re], &cp); lw += body_cp_adv(cp); }
+			int room = (paw - cur_bindent * INDENT_PX) - lw;
+			if (room > 0) x += room / 2;
+		}
+		int a = start > rs ? start : rs, b = end < re ? end : re;
+		for (int p = rs; p < a; ) { p += utf8_decode(&t[p], &t[re], &cp); x += body_cp_adv(cp); }
+		w = 0;
+		for (int p = a;  p < b; ) { p += utf8_decode(&t[p], &t[re], &cp); w += body_cp_adv(cp); }
+		if (w < 1) w = 1;
+	} else if (text_rows == 0 && img_w > 0) {     /* image-only box (drawn at x=4) */
+		x = 4; w = img_w;
+	} else {                                      /* block / multi-line: content col */
+		set_block(B->line_off[first]);
+		x = 4 + cur_bindent * INDENT_PX;
+		w = paw - cur_bindent * INDENT_PX; if (w < 1) w = 1;
+	}
+	blk_unlock();
+	*ox = x; *oy = y; *ow = w; *oh = h;
+	return 1;
+}
+
+int browser_scroll_px(void) { return B->scroll * LINE_H; }   /* window.scrollY */
+
+void browser_viewport_px(int *w, int *h)
+{
+	int py, phh, rows;
+	pane_metrics(&py, &phh, &rows);
+	if (w) { int vw = BW - SCROLL_W; *w = vw > 0 ? vw : 0; }
+	if (h) *h = phh;
+}
+
 /* Word-wrap B->text into display lines that fit `paw` pixels wide (proportional
  * font), reserving rows for inline images. wrap_cols caches the pane width. */
 static void rewrap(int paw)
@@ -620,7 +866,8 @@ static void rewrap(int paw)
 	}
 	B->wrap_seq = B->seq;
 	B->wrap_cols = paw;
-	if (B->scroll > B->nlines - 1) B->scroll = B->nlines - 1;
+	int max = scroll_max();
+	if (B->scroll > max) B->scroll = max;
 	if (B->scroll < 0) B->scroll = 0;
 }
 
@@ -844,14 +1091,99 @@ static void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
 struct rect { int x, y, w, h; };
 #define NAV_BTN_W 28
 
-static void addr_layout(struct rect *back, struct rect *fwd, struct rect *tf)
+static void addr_layout(struct rect *back, struct rect *fwd, struct rect *rel, struct rect *tf)
 {
 	int y0 = MENU_H + TAB_H;
-	back->x = 4;                      back->y = y0 + 3; back->w = NAV_BTN_W; back->h = ADDR_H - 6;
-	fwd->x  = back->x + NAV_BTN_W + 2; fwd->y = back->y; fwd->w  = NAV_BTN_W; fwd->h  = back->h;
-	int tx  = fwd->x + NAV_BTN_W + 6;
+	back->x = 4;                       back->y = y0 + 3; back->w = NAV_BTN_W; back->h = ADDR_H - 6;
+	fwd->x  = back->x + NAV_BTN_W + 2;  fwd->y = back->y; fwd->w  = NAV_BTN_W; fwd->h  = back->h;
+	rel->x  = fwd->x + NAV_BTN_W + 2;   rel->y = back->y; rel->w  = NAV_BTN_W; rel->h  = back->h;
+	int tx  = rel->x + NAV_BTN_W + 6;
 	tf->x = tx; tf->y = y0 + 4; tf->w = BW - tx - 6; tf->h = ADDR_H - 8;
 	if (tf->w < 32) tf->w = 32;       /* keep the field usable on a narrow window */
+}
+
+/* A load is in flight when the worker is fetching or a navigation is queued for
+ * it — the reload/stop button shows Stop, and Page>Stop is enabled, only then. */
+static int is_loading(void) { return B->loading || B->req_pending; }
+
+/* The reload (circular arrow) and stop (×) glyphs are hand-rasterized:
+ * LiberationSans has no dependable U+21BB, and drawing them keeps the button
+ * crisp at any size. Both fill a d×d box at (x0,y0). */
+static void icon_reload(int x0, int y0, int d, unsigned col)
+{
+	int cx = x0 + d / 2, cy = y0 + d / 2, r = d / 2;
+	for (int py = -r; py <= r; py++)
+		for (int px = -r; px <= r; px++) {
+			int dd = px * px + py * py;
+			if (dd > r * r || dd < (r - 2) * (r - 2)) continue;
+			if (py < 0 && px >= 0 && px <= 2) continue;   /* open the ring at the top */
+			gfx_pixel(cx + px, cy + py, col);
+		}
+	/* arrowhead at the gap's right end: a corner stroke that reads as clockwise */
+	for (int k = 0; k <= 3; k++) {
+		gfx_pixel(cx + k,     cy - r,     col);           /* along the top    */
+		gfx_pixel(cx + 3,     cy - r + k, col);           /* turning downward */
+	}
+}
+
+static void icon_stop(int x0, int y0, int d, unsigned col)
+{
+	for (int i = 0; i < d; i++) {
+		gfx_pixel(x0 + i,         y0 + i, col);
+		gfx_pixel(x0 + i + 1,     y0 + i, col);           /* 2px-thick strokes */
+		gfx_pixel(x0 + d - 1 - i, y0 + i, col);
+		gfx_pixel(x0 + d - 2 - i, y0 + i, col);
+	}
+}
+
+/* Draw the combined reload/stop button: the reload arrow while idle, a red × to
+ * stop while a load is in flight. */
+static void reload_btn_draw(const struct rect *r)
+{
+	int d = 12;
+	int x0 = r->x + (r->w - d) / 2, y0 = r->y + (r->h - d) / 2;
+	button_draw(r->x, r->y, r->w, r->h, "", BTN_NORMAL);
+	if (is_loading()) icon_stop(x0, y0, d, 0xe06a5a);
+	else              icon_reload(x0, y0, d, 0xe6ebf2);
+}
+
+/* The absolute URL of the link currently under the cursor, shown in a status box
+ * pinned to the content pane's bottom-left (like Chrome/Firefox). Empty = none.
+ * Main-thread-only UI state, so it lives here rather than in the shared struct. */
+static char hover_url[URL_MAX];
+
+/* Last pointer Y (from WEV_MOVE/clicks), so the wheel scrolls whichever surface
+ * it's over: the devtools dock when the pointer is inside it, else the page. */
+static int last_my = -1;
+
+/* Set when only the address-bar chrome changed (a URL-field keystroke): the main
+ * loop then repaints just that strip instead of re-wrapping and re-blitting the
+ * whole page. Distinct from B->seq, which forces a full render. */
+static int addr_dirty;
+
+/* Copy `src` into `dst` (cap bytes) truncated to fit `maxpx` pixels in the UI
+ * font, appending a "..." ellipsis when it had to shorten. Used for the hovered-
+ * link status box, where a long URL must not overrun the box. */
+static void fit_ui(char *dst, int cap, const char *src, int maxpx)
+{
+	int n = 0;
+	if (gfx_ui_width(src) <= maxpx) {            /* whole string fits */
+		while (src[n] && n < cap - 1) { dst[n] = src[n]; n++; }
+		dst[n] = '\0';
+		return;
+	}
+	const char *p = src, *end = src + strlen(src);
+	int ell = gfx_ui_width("..."), used = 0;
+	while (*p) {
+		unsigned cp;
+		int nb = utf8_decode(p, end, &cp);
+		if (used + gfx_ui_cw_cp(cp) + ell > maxpx) break;
+		for (int i = 0; i < nb && n < cap - 1; i++) dst[n++] = p[i];
+		used += gfx_ui_cw_cp(cp);
+		p += nb;
+	}
+	dst[n] = '\0';
+	sapp(dst, &n, cap, "...");
 }
 
 static void render(void)
@@ -878,13 +1210,14 @@ static void render(void)
 	 * The buttons dim when their direction has no history (button_hit also refuses
 	 * a disabled button, so a click on a dim arrow does nothing). */
 	gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
-	struct rect rb, rf, rtf;
-	addr_layout(&rb, &rf, &rtf);
+	struct rect rb, rf, rrl, rtf;
+	addr_layout(&rb, &rf, &rrl, &rtf);
 	struct tab *at = &tabs[active_tab];
 	button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90",   /* ← */
 	            hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED);
 	button_draw(rf.x, rf.y, rf.w, rf.h, "\xe2\x86\x92",   /* → */
 	            hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED);
+	reload_btn_draw(&rrl);
 	textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
 
 	/* content pane */
@@ -933,14 +1266,63 @@ static void render(void)
 		scrollbar_draw(pw, py, SCROLL_W, phh, B->scroll, B->nlines, rows);
 	}
 
+	/* Hovered-link status: a small flat box pinned to the content pane's bottom-
+	 * left, like Chrome/Firefox — drawn only while a link is under the cursor, on
+	 * top of the page but below the menu bar and its dropdowns. */
+	if (hover_url[0]) {
+		int sy0 = MENU_H + TAB_H + ADDR_H;
+		int sh = UIFONT_H + 6;
+		int by = BH - sh; if (by < sy0) by = sy0;
+		int maxw = BW - 2;
+		char shown[URL_MAX];
+		fit_ui(shown, sizeof shown, hover_url, maxw - 12);
+		int sw = gfx_ui_width(shown) + 12; if (sw > maxw) sw = maxw;
+		gfx_fill_rect(0, by, sw, sh, 0x202830);
+		gfx_rect(0, by, sw, sh, 0x10141a);
+		gfx_ui_text(6, by + 3, shown, 0xe8eaee);
+	}
+
+	/* Developer tools overlay (F12 / Ctrl+Shift+I): a bottom dock drawn over the
+	 * page but under the menu dropdowns. A no-op when closed. */
+	devtools_render();
+
 	/* App menu bar over the top, then the dropdowns last so they overlay the page.
 	 * "Stop" is only meaningful while a fetch is in flight, so disable it when
 	 * idle — the widget dims it and ignores clicks/accelerators. */
-	page_flags[2] = B->loading ? 0 : MENU_DISABLED;
+	page_flags[2] = is_loading() ? 0 : MENU_DISABLED;
 	gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
 	menubar_draw(&menubar);
 
 	blk_unlock();
+}
+
+/* True while any menu dropdown is expanded. Such a dropdown overlaps the address
+ * bar, so the chrome-only fast path must defer to a full render() then. */
+static int menu_any_open(void)
+{
+	for (int i = 0; i < menubar.n; i++)
+		if (menubar.menus[i] && menubar.menus[i]->open)
+			return 1;
+	return 0;
+}
+
+/* Repaint only the address-bar strip (its background, the Back/Forward buttons,
+ * and the URL field) and leave the page untouched. The page below and the menu
+ * bar above don't intersect this row, so a present's frame diff blits just this
+ * strip — no rewrap, no line/image redraw. Touches no shared content buffers, so
+ * unlike render() it needs no blk_lock. */
+static void render_addr(void)
+{
+	gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
+	struct rect rb, rf, rrl, rtf;
+	addr_layout(&rb, &rf, &rrl, &rtf);
+	struct tab *at = &tabs[active_tab];
+	button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90",
+	            hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED);
+	button_draw(rf.x, rf.y, rf.w, rf.h, "\xe2\x86\x92",
+	            hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED);
+	reload_btn_draw(&rrl);
+	textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
 }
 
 /* --------------------------------------------------------------- input */
@@ -952,8 +1334,21 @@ static void pane_metrics(int *py, int *phh, int *rows)
 	*rows = (*phh > 0) ? *phh / LINE_H : 1;
 }
 
+/* Apply a target scroll line, clamped to the page, repainting only when it
+ * actually moves — so wheeling or arrowing at an end is a no-op instead of a
+ * full content redraw. Callers wanting a tighter bottom stop (e.g. Page Down)
+ * pass an already-tighter target; this only re-clamps for safety. */
+static void scroll_set(int target)
+{
+	int max = scroll_max();
+	if (target > max) target = max;
+	if (target < 0) target = 0;
+	if (target != B->scroll) { B->scroll = target; B->seq++; }
+}
+
 static void navigate(const char *url)
 {
+	hover_url[0] = '\0';                      /* drop any stale hovered-link status */
 	textfield_set(&B->addr_tf, url);          /* writes into B->addr (its buffer) */
 	int i = 0;
 	for (; url[i] && i < URL_MAX - 1; i++) B->req_url[i] = url[i];
@@ -968,6 +1363,22 @@ static void submit(void)
 	for (; B->addr[i] && i < URL_MAX - 1; i++) B->req_url[i] = B->addr[i];
 	B->req_url[i] = '\0';
 	B->req_pending = 1; B->seq++;
+}
+
+/* Reload the current page (reload button, Page>Reload, F5, Ctrl+R). No-op on a
+ * blank tab, matching Page>Reload. */
+static void do_reload(void)
+{
+	if (B->cur_url[0]) navigate(B->cur_url);
+}
+
+/* Stop the in-flight load: drop the queued request and signal the worker to bail
+ * out of the fetch it is running (polled by the body readers in fetch.c). */
+static void do_stop(void)
+{
+	B->req_pending = 0;
+	B->abort_load = 1;
+	B->seq++;
 }
 
 /* Navigate to the active tab's previous/next history entry. The hist index moves
@@ -993,6 +1404,7 @@ static void go_fwd(void)
 /* Reset B to an empty page (a fresh/blank tab) without touching the net. */
 static void show_blank(void)
 {
+	B->drop_dom = 1; B->events_live = 0;
 	textfield_set(&B->addr_tf, "");
 	B->cur_url[0] = '\0'; B->doc_title[0] = '\0';
 	B->mode = MODE_HTML;
@@ -1026,6 +1438,7 @@ static void tab_sync_active(void)
 static void reveal_tab(int i)
 {
 	B->scroll = tabs[i].scroll;
+	devtools_view_load(&tabs[i].dt);         /* this tab's devtools view; drops old capture */
 	if (tabs[i].cached)        tab_restore(i);
 	else if (tabs[i].url[0])   navigate(tabs[i].url);
 	else                       show_blank();
@@ -1054,6 +1467,9 @@ static void new_tab(void)
 	tabs[active_tab].blob_len = 0;
 	tabs[active_tab].hist_n = 0; tabs[active_tab].hist_i = 0;   /* fresh history */
 	for (int k = 0; k < HIST_MAX; k++) tabs[active_tab].hist[k] = 0;
+	tabs[active_tab].dt.open = 0; tabs[active_tab].dt.tab = 0;  /* devtools closed   */
+	for (int k = 0; k < DT_PANELS; k++) tabs[active_tab].dt.scroll[k] = 0;
+	devtools_view_load(&tabs[active_tab].dt);
 	copy_str(tabs[active_tab].label, "New Tab", sizeof tabs[active_tab].label);
 	show_blank();
 }
@@ -1062,6 +1478,7 @@ static void close_tab(int i)
 {
 	if (i < 0 || i >= n_tabs || n_tabs <= 1) return;   /* keep at least one */
 	int was_active = (i == active_tab);
+	if (was_active) do_stop();    /* only the active tab loads: cancel its fetch */
 	tab_drop(&tabs[i]);                           /* free its snapshot first */
 	hist_clear(&tabs[i]);                         /* and its history strings  */
 	for (int j = i; j < n_tabs - 1; j++) {       /* shift the rest down a slot */
@@ -1089,13 +1506,9 @@ static void menu_action(struct menu *m, int item)
 	pane_metrics(&py, &phh, &rows);
 	if (m == &pagemenu) {
 		switch (item) {
-		case 0:                                  /* Reload current page     */
-			if (B->cur_url[0]) navigate(B->cur_url);
-			break;
+		case 0: do_reload(); break;              /* Reload current page     */
 		case 1: navigate("example.com"); break;  /* Home                    */
-		case 2:                                  /* Stop a queued fetch     */
-			B->req_pending = 0; B->seq++;
-			break;
+		case 2: do_stop(); break;                /* Stop the in-flight load */
 		}
 	} else if (m == &viewmenu) {
 		if (item == 0) {                         /* Show Images checkbox    */
@@ -1105,25 +1518,50 @@ static void menu_action(struct menu *m, int item)
 		}                                        /* item 1 = Scroll submenu */
 	} else if (m == &scrollmenu) {
 		switch (item) {
-		case 0: B->scroll = 0; B->seq++; break;          /* Top             */
-		case 1:                                          /* Bottom          */
-			B->scroll = B->nlines - rows;
-			if (B->scroll < 0) B->scroll = 0;
-			B->seq++;
-			break;
-		case 2:                                          /* Page Up         */
-			B->scroll -= rows;
-			if (B->scroll < 0) B->scroll = 0;
-			B->seq++;
-			break;
-		case 3:                                          /* Page Down       */
-			B->scroll += rows;
-			if (B->scroll > B->nlines - 1) B->scroll = B->nlines - 1;
-			if (B->scroll < 0) B->scroll = 0;
-			B->seq++;
-			break;
+		case 0: scroll_set(0); break;                    /* Top      */
+		case 1: scroll_set(B->nlines - rows); break;     /* Bottom   */
+		case 2: scroll_set(B->scroll - rows); break;     /* Page Up  */
+		case 3: scroll_set(B->scroll + rows); break;     /* Page Down */
 		}
 	}
+}
+
+/* Resolve a content-pane hit at client coords (mx,my): sets *off to the text
+ * offset under the cursor (-1 if outside the pane or past the line's glyphs) and
+ * copies the absolute href of any <a> covering it into `url` ("" if none). Holds
+ * blk_lock across the walk + resolve, since the worker can move the text/line/
+ * link tables with a realloc mid-load. Shared by the click and hover handlers. */
+static void pane_hit(int mx, int my, int *off, char *url, int cap)
+{
+	*off = -1;
+	if (cap) url[0] = '\0';
+	int py, phh, rows;
+	pane_metrics(&py, &phh, &rows);
+	if (my < py || my >= py + phh) return;
+	int row = B->scroll + (my - py) / LINE_H;
+	blk_lock();
+	if (row >= 0 && row < B->nlines) {
+		/* proportional: walk the line's glyphs to find which char the point
+		 * (mx, relative to the 4px left margin) falls on. */
+		int len = B->line_len[row], px = mx - 4, acc = 0, col = -1;
+		int base = B->line_off[row];
+		for (int k = 0; k < len; ) {
+			unsigned cp;
+			int nb = utf8_decode(&B->text[base + k], &B->text[base + len], &cp);
+			int cw = body_cp_adv(cp);
+			if (px < acc + cw) { col = k; break; }
+			acc += cw; k += nb;
+		}
+		if (col >= 0) {
+			*off = base + col;
+			for (int i = 0; i < B->nlinks; i++)
+				if (*off >= B->links[i].start && *off < B->links[i].end) {
+					resolve_url(B->cur_url, B->links[i].href, url, cap);
+					break;
+				}
+		}
+	}
+	blk_unlock();
 }
 
 static void handle_click(int mx, int my)
@@ -1138,6 +1576,9 @@ static void handle_click(int mx, int my)
 			return;
 		}
 	}
+	/* Developer tools dock (bottom of the window): consumes clicks within it.
+	 * Its rect sits below the address bar, so it never shadows the bars above. */
+	if (devtools_handle_click(mx, my)) return;
 	if (my >= MENU_H && my < MENU_H + TAB_H) {              /* tab strip */
 		int idx = 0;
 		switch (tabbar_hit(0, MENU_H, BW, n_tabs, mx, my, &idx)) {
@@ -1149,13 +1590,15 @@ static void handle_click(int mx, int my)
 		return;
 	}
 	if (my >= MENU_H + TAB_H && my < MENU_H + TAB_H + ADDR_H) {   /* address bar */
-		struct rect rb, rf, rtf;
-		addr_layout(&rb, &rf, &rtf);
+		struct rect rb, rf, rrl, rtf;
+		addr_layout(&rb, &rf, &rrl, &rtf);
 		struct tab *at = &tabs[active_tab];
 		if (hist_can_back(at) && button_hit(rb.x, rb.y, rb.w, rb.h, mx, my)) {
 			go_back();
 		} else if (hist_can_fwd(at) && button_hit(rf.x, rf.y, rf.w, rf.h, mx, my)) {
 			go_fwd();
+		} else if (button_hit(rrl.x, rrl.y, rrl.w, rrl.h, mx, my)) {
+			if (is_loading()) do_stop(); else do_reload();
 		} else {
 			textfield_click(&B->addr_tf, mx, my, rtf.x, rtf.y, rtf.w, rtf.h);
 		}
@@ -1166,49 +1609,61 @@ static void handle_click(int mx, int my)
 	pane_metrics(&py, &phh, &rows);
 	int sbpart = scrollbar_hit(BW - SCROLL_W, py, SCROLL_W, phh, mx, my);
 	if (sbpart != SCROLLBAR_NONE) {                          /* scrollbar */
-		if (sbpart == SCROLLBAR_UP)        B->scroll -= 3;
-		else if (sbpart == SCROLLBAR_DOWN) B->scroll += 3;
-		else B->scroll = scrollbar_pos(BW - SCROLL_W, py, SCROLL_W, phh, mx, my,
-		                               B->scroll, B->nlines, rows);
-		if (B->scroll > B->nlines - 1) B->scroll = B->nlines - 1;
-		if (B->scroll < 0) B->scroll = 0;
-		B->seq++;
+		int target;
+		if (sbpart == SCROLLBAR_UP)        target = B->scroll - 3;
+		else if (sbpart == SCROLLBAR_DOWN) target = B->scroll + 3;
+		else target = scrollbar_pos(BW - SCROLL_W, py, SCROLL_W, phh, mx, my,
+		                            B->scroll, B->nlines, rows);
+		scroll_set(target);
 		return;
 	}
-	if (my >= py && my < py + phh) {                        /* a link? */
-		int row = B->scroll + (my - py) / LINE_H;
-		/* The link/line tables can be moved by a worker realloc mid-load; hold
-		 * the interlock while we scan them and copy the target href out. */
-		char res[URL_MAX]; res[0] = '\0';
-		blk_lock();
-		if (row >= 0 && row < B->nlines) {
-			/* proportional: walk the line's glyphs to find which char the click
-			 * (mx, relative to the 4px left margin) falls on. */
-			int len = B->line_len[row], px = mx - 4, acc = 0, col = -1;
-			int base = B->line_off[row];
-			for (int k = 0; k < len; ) {
-				unsigned cp;
-				int nb = utf8_decode(&B->text[base + k], &B->text[base + len], &cp);
-				int cw = body_cp_adv(cp);
-				if (px < acc + cw) { col = k; break; }
-				acc += cw; k += nb;
-			}
-			if (col >= 0) {
-				int off = B->line_off[row] + col;
-				for (int i = 0; i < B->nlinks; i++)
-					if (off >= B->links[i].start && off < B->links[i].end) {
-						resolve_url(B->cur_url, B->links[i].href, res, sizeof res);
-						break;
-					}
-			}
+	if (my >= py && my < py + phh) {                        /* content pane click */
+		char res[URL_MAX];
+		int off;
+		pane_hit(mx, my, &off, res, sizeof res);
+		/* If the page registered JS listeners, hand the click to the worker to
+		 * dispatch through the live DOM (it follows the link `res` afterwards
+		 * unless a handler calls preventDefault). Otherwise take the fast path and
+		 * navigate directly — pages with no scripts behave exactly as before. */
+		if (off >= 0 && B->events_live) {
+			/* clientX/clientY are viewport-relative (pane origin), matching
+			 * getBoundingClientRect; the pane's left edge is window x 0. */
+			B->evt_off = off; B->evt_x = mx; B->evt_y = my - py;
+			{ int k = 0; sapp(B->evt_type, &k, sizeof B->evt_type, "click"); }
+			{ int k = 0; sapp(B->evt_text, &k, sizeof B->evt_text, res); }
+			B->evt_pending = 1; B->seq++;
+			return;
 		}
-		blk_unlock();
 		if (res[0]) { navigate(res); return; }
 	}
 }
 
+/* Pointer moved over the content pane with no button held (WEV_MOVE; mx<0 when it
+ * left the window): show the hovered link's target in the bottom-left status box,
+ * or clear it. Only repaints when the shown URL actually changes. */
+static void handle_move(int mx, int my)
+{
+	char url[URL_MAX];
+	int off;
+	last_my = mx < 0 ? -1 : my;         /* track for wheel routing (devtools vs page) */
+	if (mx < 0) url[0] = '\0';          /* pointer left the window: clear */
+	else        pane_hit(mx, my, &off, url, sizeof url);
+	if (streq(url, hover_url)) return;
+	int k = 0; sapp(hover_url, &k, sizeof hover_url, url);
+	B->seq++;
+}
+
 static void handle_key(char c, int mods)
 {
+	/* Developer tools: toggle on F12 or Ctrl+Shift+I; Esc closes an open panel.
+	 * Ctrl+Shift+I arrives as a bare 'i' char with the CTRL|SHIFT modifier bits. */
+	if ((unsigned char)c == KEY_F12 ||
+	    ((mods & KMOD_CTRL) && (mods & KMOD_SHIFT) && (c == 'i' || c == 'I'))) {
+		devtools_toggle();
+		return;
+	}
+	if ((unsigned char)c == 27 && devtools_visible()) { devtools_toggle(); return; }
+
 	/* Alt+Left / Alt+Right are history navigation — checked before the address
 	 * bar so the modifier turns the arrow into back/forward instead of a caret
 	 * move. The keyboard reports the chord via mods (KMOD_*); the app decides. */
@@ -1217,24 +1672,48 @@ static void handle_key(char c, int mods)
 		if ((unsigned char)c == KEY_RIGHT) { go_fwd();  return; }
 	}
 
+	/* Ctrl+R reloads (the keyboard delivers the unshifted letter + KMOD_CTRL).
+	 * Checked before the address field so it isn't typed into the URL. */
+	if ((mods & KMOD_CTRL) && (c == 'r' || c == 'R')) { do_reload(); return; }
+
 	/* Menu accelerator (F5 = Reload): fire the item like a click. */
 	struct menu *leaf;
 	int sc = menubar_shortcut(&menubar, (unsigned char)c, &leaf);
 	if (sc >= 0) { menubar_close(&menubar); menu_action(leaf, sc); return; }
+
+	/* A focused content text field captures editing keys: post them to the worker
+	 * (which owns the DOM) as keyinput/blur events instead of editing the address
+	 * bar. Esc blurs; other navigation keys fall through to the defaults below. */
+	if (B->focus_kind != 0) {
+		unsigned char uc = (unsigned char)c;
+		if (uc == 27) {
+			{ int k = 0; sapp(B->evt_type, &k, sizeof B->evt_type, "blur"); }
+			B->evt_pending = 1; B->seq++;
+			return;
+		}
+		if (uc == '\n' || uc == '\r' || uc == 8 || uc == 127 || (uc >= 0x20 && uc < 0x7f)) {
+			B->evt_x = uc;
+			{ int k = 0; sapp(B->evt_type, &k, sizeof B->evt_type, "keyinput"); }
+			B->evt_pending = 1; B->seq++;
+			return;
+		}
+	}
+
 	if ((unsigned char)c == 27) { menubar_close(&menubar); B->seq++; return; }
 
-	/* The address-bar widget handles editing (printable/Backspace/Delete/caret). */
-	if (textfield_key(&B->addr_tf, c)) { B->seq++; return; }
+	/* The address-bar widget handles editing (printable/Backspace/Delete/caret).
+	 * That only changes the URL field, so flag a chrome-only repaint rather than
+	 * bumping B->seq (a full page render) — unless an open dropdown overlaps the
+	 * strip, where only a full render restores it correctly. */
+	if (textfield_key(&B->addr_tf, c)) {
+		if (menu_any_open()) B->seq++; else addr_dirty = 1;
+		return;
+	}
 
 	switch ((unsigned char)c) {
 	case '\n': case '\r': submit(); return;
-	case KEY_UP:
-		B->scroll -= 3; if (B->scroll < 0) B->scroll = 0; B->seq++; return;
-	case KEY_DOWN:
-		B->scroll += 3;
-		if (B->scroll > B->nlines - 1) B->scroll = B->nlines - 1;
-		if (B->scroll < 0) B->scroll = 0;
-		B->seq++; return;
+	case KEY_UP:   scroll_set(B->scroll - 3); return;
+	case KEY_DOWN: scroll_set(B->scroll + 3); return;
 	}
 }
 
@@ -1251,20 +1730,24 @@ static void update_title(int id)
 	}
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	const char *start = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : "example.com";
 	int id = win_create(BW, BH, "browser");
 	if (id < 0) { puts("browser: no window\n"); return 1; }
 	B->win_id = id;
 	gfx_init(win_fb(), BW, BH);
 
 	textfield_init(&B->addr_tf, B->addr, URL_MAX);
-	textfield_set(&B->addr_tf, "example.com");
+	textfield_set(&B->addr_tf, start);
 	B->wrap_seq = 0xFFFFFFFF;
 
 	jar_load();   /* restore cookies + HSTS from the persistent SQLite db */
 
 	int wtid = thread_create(worker_fn, &worker_stack[sizeof worker_stack]);
+
+	/* Launched with a URL (e.g. `browser http://host/page`): load it at startup. */
+	if (argc > 1 && argv[1] && argv[1][0]) navigate(argv[1]);
 
 	unsigned last = B->seq - 1;
 	int prev_loading = 0;
@@ -1280,17 +1763,49 @@ int main(void)
 				handle_key((char)ev.a, ev.b);
 			} else if (ev.type == WEV_MOUSE) {
 				handle_click(ev.a, ev.b);
+			} else if (ev.type == WEV_MOVE) {
+				handle_move(ev.a, ev.b);
 			} else if (ev.type == WEV_SCROLL) {
-				B->scroll -= ev.a * 3;       /* wheel up scrolls back */
-				if (B->scroll > B->nlines - 1) B->scroll = B->nlines - 1;
-				if (B->scroll < 0) B->scroll = 0;
-				B->seq++;
+				/* The wheel scrolls whichever surface the pointer is over: the
+				 * devtools dock when inside it, otherwise the page. */
+				if (devtools_visible() && last_my >= devtools_top()) {
+					devtools_handle_scroll(ev.a);
+				} else {
+					scroll_set(B->scroll - ev.a * 3);  /* wheel up scrolls back */
+				}
 			} else if (ev.type == WEV_RESIZE) {
 				BW = ev.a; BH = ev.b;
 				gfx_init(win_fb(), BW, BH);
+				B->recascade = 1;    /* @media may change → worker re-cascades  */
 				B->seq++;            /* re-wrap + repaint at the new width */
 			}
 		}
+		/* History API requests posted by JS on the worker (see browser/js.c).
+		 * pushState/replaceState is applied before a back/forward posted in the
+		 * same script tick, so the entry it added is in place first. */
+		if (B->hist_nav) {                           /* pushState / replaceState */
+			struct tab *t = &tabs[active_tab];
+			B->hist_nav = 0;
+			if (B->hist_replace && t->hist_n > 0) {
+				int n = (int)strlen(B->hist_url) + 1;
+				char *dup = malloc((unsigned)n);
+				if (dup) { memcpy(dup, B->hist_url, (unsigned)n); free(t->hist[t->hist_i]); t->hist[t->hist_i] = dup; }
+			} else {
+				hist_push(t, B->hist_url);
+			}
+			textfield_set(&B->addr_tf, B->hist_url);
+			B->seq++;
+		}
+		if (B->hist_go) {                            /* history.back/forward/go */
+			int d = B->hist_go; B->hist_go = 0;
+			if (d < 0) go_back(); else go_fwd();
+		}
+		if (B->loc_nav) {                            /* location.assign/replace/reload */
+			B->loc_nav = 0;
+			navigate(B->loc_url);
+		}
+		B->hist_len = tabs[active_tab].hist_n;
+
 		if (B->loading && !prev_loading)             /* fetch started */
 			win_cursor(id, WIN_CURSOR_BUSY);         /* spinner while loading */
 		if (prev_loading && !B->loading) {           /* fetch finished */
@@ -1306,7 +1821,11 @@ int main(void)
 		}
 		prev_loading = B->loading;
 
-		if (B->seq != last) { render(); win_present(id); last = B->seq; }
+		if (B->seq != last) {
+			render(); win_present(id); last = B->seq; addr_dirty = 0;
+		} else if (addr_dirty) {                     /* address-bar keystroke only */
+			render_addr(); win_present(id); addr_dirty = 0;
+		}
 		win_wait(id);
 	}
 }

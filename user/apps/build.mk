@@ -25,9 +25,9 @@ user/apps/gui/cliphist.elf: user/apps/gui/cliphist.o $(CLIPBOARD) $(MIME) $(ULIB
 
 # The browser is a multi-file user program (user/apps/gui/browser/*.c), linked
 # flat: streaming inflate (gzip/deflate), the PNG decoder, HTTP/2, the SQLite jar.
-BROWSER_OBJS := user/apps/gui/browser/main.o user/apps/gui/browser/fetch.o user/apps/gui/browser/resource.o user/apps/gui/browser/html.o user/apps/gui/browser/dom.o user/apps/gui/browser/css.o user/apps/gui/browser/svg.o user/apps/gui/browser/jar.o
-user/apps/gui/browser.elf: $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(SQLITE) $(MATH) $(ULIB) $(GUILIB) user/user.ld
-	ld -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(SQLITE) $(MATH) $(GUILIB) $(ULIB) $(LIBGCC)
+BROWSER_OBJS := user/apps/gui/browser/main.o user/apps/gui/browser/fetch.o user/apps/gui/browser/resource.o user/apps/gui/browser/html.o user/apps/gui/browser/dom.o user/apps/gui/browser/css.o user/apps/gui/browser/svg.o user/apps/gui/browser/jar.o user/apps/gui/browser/js.o user/apps/gui/browser/devtools.o user/apps/gui/browser/csp.o
+user/apps/gui/browser.elf: $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(ULIB) $(GUILIB) user/user.ld
+	ld -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(GUILIB) $(ULIB) $(LIBGCC)
 
 # the image viewer links the streaming PNG decoder; player links the MPEG decoder.
 user/apps/gui/imgview.elf: user/apps/gui/imgview.o $(UPNG) $(INFLATE) $(ULIB) $(GUILIB) user/user.ld

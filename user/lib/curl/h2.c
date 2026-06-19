@@ -621,10 +621,30 @@ static void emit(struct emitter *e, const unsigned char *p, int n)
 static const unsigned char PREFACE[24] =
 	"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-int h2_run(int sock, int scheme_https, const char *authority,
-           const char *method, const char *path, const struct h2_opts *opts,
-           char *hdr, int hdrcap, int *hdrlen,
-           http_body_fn body, void *ctx)
+/* Send as much of the request body as the stream (*swnd) and connection (*cwnd)
+ * send-windows allow, in DATA frames split to the max frame size (END_STREAM on the
+ * final byte). Returns 0, or -1 on a send error. Called after HEADERS and again
+ * whenever a WINDOW_UPDATE/SETTINGS opens the window. */
+static int h2_send_body(int sock, const unsigned char *reqbody, int reqlen,
+                        int *boff, long *swnd, long *cwnd)
+{
+	while (*boff < reqlen && *swnd > 0 && *cwnd > 0) {
+		long room = *swnd < *cwnd ? *swnd : *cwnd;
+		int chunk = reqlen - *boff;
+		if (chunk > 16384) chunk = 16384;
+		if (chunk > room) chunk = (int)room;
+		int last = (*boff + chunk >= reqlen);
+		if (put_frame(sock, F_DATA, last ? FL_END_STREAM : 0, 1, reqbody + *boff, chunk) < 0) return -1;
+		*boff += chunk; *swnd -= chunk; *cwnd -= chunk;
+	}
+	return 0;
+}
+
+int h2_run_body(int sock, int scheme_https, const char *authority,
+                const char *method, const char *path, const struct h2_opts *opts,
+                const unsigned char *reqbody, int reqlen,
+                char *hdr, int hdrcap, int *hdrlen,
+                http_body_fn body, void *ctx)
 {
 	dt_reset();
 	if (!method) method = "GET";
@@ -643,9 +663,22 @@ int h2_run(int sock, int scheme_https, const char *authority,
 	if (put_frame(sock, F_WINUP, 0, 0, wu, 4) < 0)
 		return HTTP_ESEND;
 
+	int has_body = reqbody && reqlen > 0;
 	static unsigned char reqhb[4096];
 	int rl = build_request(reqhb, scheme_https, method, authority, path, opts);
-	if (put_frame(sock, F_HEADERS, FL_END_HEADERS | FL_END_STREAM, 1, reqhb, rl) < 0)
+	/* When a request body follows, the HEADERS frame must NOT end the stream; the
+	 * body rides in flow-controlled DATA frames sent below (and replenished from the
+	 * peer's SETTINGS/WINDOW_UPDATE in the loop), so a body of any size streams. */
+	if (put_frame(sock, F_HEADERS, FL_END_HEADERS | (has_body ? 0 : FL_END_STREAM), 1, reqhb, rl) < 0)
+		return HTTP_ESEND;
+
+	/* Request-body flow control. Stream + connection send-windows start at the h2
+	 * default 65535 and grow via the peer's SETTINGS(INITIAL_WINDOW_SIZE) and
+	 * WINDOW_UPDATE; h2_send_body emits DATA up to the smaller window, splitting at
+	 * the max frame size, END_STREAM on the last byte. */
+	int boff = 0;
+	long swnd = 65535, cwnd = 65535, applied_iws = 65535;
+	if (has_body && h2_send_body(sock, reqbody, reqlen, &boff, &swnd, &cwnd) < 0)
 		return HTTP_ESEND;
 
 	struct frd r; r.sock = sock; r.pos = r.len = 0;
@@ -671,9 +704,16 @@ int h2_run(int sock, int scheme_https, const char *authority,
 
 		switch (type) {
 		case F_SETTINGS:
-			if (!(flags & FL_ACK))
-				if (put_frame(sock, F_SETTINGS, FL_ACK, 0, 0, 0) < 0)
-					{ rc = HTTP_ENORESP; goto out; }
+			if (!(flags & FL_ACK)) {
+				int i;                            /* apply INITIAL_WINDOW_SIZE to our send window */
+				for (i = 0; i + 6 <= paylen; i += 6)
+					if (((framebuf[i] << 8) | framebuf[i + 1]) == 0x0004) {
+						long niw = ((long)framebuf[i + 2] << 24) | (framebuf[i + 3] << 16) | (framebuf[i + 4] << 8) | framebuf[i + 5];
+						swnd += niw - applied_iws; applied_iws = niw;
+					}
+				if (put_frame(sock, F_SETTINGS, FL_ACK, 0, 0, 0) < 0) { rc = HTTP_ENORESP; goto out; }
+				if (has_body && h2_send_body(sock, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) { rc = HTTP_ESEND; goto out; }
+			}
 			break;
 		case F_PING:
 			if (!(flags & FL_ACK))
@@ -745,8 +785,14 @@ int h2_run(int sock, int scheme_https, const char *authority,
 			if (!headers_done) { rc = HTTP_ENORESP; goto out; }
 			done = 1;
 			break;
-		default:                                   /* WINDOW_UPDATE, PRIORITY,
-		                                            * PUSH_PROMISE: ignore */
+		case F_WINUP:                              /* peer opened the send window */
+			if (has_body && boff < reqlen && paylen >= 4) {
+				long inc = ((long)(framebuf[0] & 0x7f) << 24) | (framebuf[1] << 16) | (framebuf[2] << 8) | framebuf[3];
+				if (sid == 0) cwnd += inc; else if (sid == 1) swnd += inc;
+				if (h2_send_body(sock, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) { rc = HTTP_ESEND; goto out; }
+			}
+			break;
+		default:                                   /* PRIORITY, PUSH_PROMISE: ignore */
 			break;
 		}
 	}
@@ -771,6 +817,14 @@ out:
 		if (hdrlen) *hdrlen = hs.len;
 	}
 	return rc;
+}
+
+int h2_run(int sock, int scheme_https, const char *authority,
+           const char *method, const char *path, const struct h2_opts *opts,
+           char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx)
+{
+	return h2_run_body(sock, scheme_https, authority, method, path, opts,
+	                   0, 0, hdr, hdrcap, hdrlen, body, ctx);
 }
 
 int h2_request(int sock, int scheme_https, const char *authority,

@@ -50,6 +50,14 @@ int h2_run(int sock, int scheme_https, const char *authority,
            char *hdr, int hdrcap, int *hdrlen,
            http_body_fn body, void *ctx);
 
+/* Like h2_run but sends a request body in DATA frames — for POST/PUT over h2. The
+ * body must fit the peer's default 65535 send-window; larger callers use h1.1. */
+int h2_run_body(int sock, int scheme_https, const char *authority,
+                const char *method, const char *path, const struct h2_opts *opts,
+                const unsigned char *reqbody, int reqlen,
+                char *hdr, int hdrcap, int *hdrlen,
+                http_body_fn body, void *ctx);
+
 /* One batched, MULTIPLEXED fetch: GET every reqs[i].path concurrently over a
  * single h2 connection (own stream each: 1, 3, 5, …), demuxing the interleaved
  * responses. All requests share one origin (`authority`/`scheme_https`) and one

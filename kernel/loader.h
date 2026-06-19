@@ -11,8 +11,12 @@
  * nothing. The span is the per-process cap; frames are only allocated for the
  * program image + stack actually used. */
 #define USER_BASE       0x40000000u    /* 1 GiB: where user code is loaded      */
-#define USER_REGION_END 0x44000000u    /* +64 MiB: end of the per-process window */
-#define USER_STACK_TOP  0x43FFF000u    /* user stack grows down from the top    */
+#define USER_REGION_END 0x80000000u    /* 2 GiB: a ~1 GiB per-process heap window.
+                                          Backed on demand, so the span is free
+                                          until touched; ends well below WIN_FB_VADDR
+                                          (3 GiB). Physical RAM (make run -m) is the
+                                          real ceiling now, not this boundary. */
+#define USER_STACK_TOP  (USER_REGION_END - 0x1000u)  /* stack grows down from the top */
 #define USER_STACK_PAGES 4u            /* 16 KiB of user stack                  */
 #define USER_GUARD_PAGES 1u            /* unmapped gap below the stack (overflow trap) */
 /* The heap (SYS_SBRK) grows up from the image end toward — but never into — the

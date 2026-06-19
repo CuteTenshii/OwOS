@@ -17,6 +17,9 @@ void gfx_fill_rect(int x, int y, int w, int h, unsigned color);
 void gfx_rect(int x, int y, int w, int h, unsigned color);   /* 1px outline */
 void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg);
 void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg);
+/* Monospace text that decodes UTF-8 (one CP437 cell per codepoint, columns stay
+ * aligned; accents via Unicode->CP437). Returns the pen x after the string. */
+int  gfx_text_utf8(int x, int y, const char *s, unsigned fg, unsigned bg);
 
 /* Blit a w*h ARGB (0xAARRGGBB) bitmap at (x,y), alpha-blending over the buffer
  * (fully transparent pixels skipped). Used for tab favicons. */

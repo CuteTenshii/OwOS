@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto gfx zlib png mp3 sqlite clipboard mime font brotli math gc
+ULIBDIRS := curl torrent crypto gfx zlib png mp3 sqlite clipboard mime font brotli math gc js websocket
 UCFLAGS  := -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) \
            -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -36,6 +36,7 @@ H3      := user/lib/curl/h3.o         # libcurl: HTTP/3 framing + QPACK (RFC 911
 MP3     := user/lib/mp3/mp3.o         # streaming MPEG audio decoder (.mp3/.mp2/.mp1)
 LIBGCC  := $(shell $(CC) -m32 -print-libgcc-file-name)  # 64-bit div helpers etc.
 CRYPTO  := user/lib/crypto/crypto.o   # SHA-1/SHA-256/x25519/AES-GCM (torrent, ssh, curl)
+WEBSOCKET := user/lib/websocket/websocket.o  # RFC 6455 client (browser JS WebSocket); needs $(CRYPTO)
 TORLIB  := user/lib/torrent/bencode.o user/lib/torrent/torrent.o   # libtorrent
 SQLITE  := user/lib/sqlite/sqlite.o   # real SQLite3 file-format DB (browser cookie jar)
 CLIPBOARD := user/lib/clipboard/clipboard.o  # clipd client (multi-item clipboard)
@@ -46,6 +47,12 @@ MATH    := user/lib/math/math.o user/lib/math/fmt.o
 # gc: precise mark-sweep collector over the malloc heap (roots + tracer supplied
 # by the client). For language runtimes that need managed memory.
 GC      := user/lib/gc/gc.o
+# js: the JavaScript engine for the browser. Front end (lexer/parser/AST) +
+# tree-walk interpreter (values/objects over $(GC), scopes/closures, core
+# stdlib). Pure computation; links with $(MATH) (strtod/dtoa), $(GC) and
+# $(LIBGCC). Class evaluation, RegExp matching, async/modules come next.
+JS      := user/lib/js/lexer.o user/lib/js/parser.o user/lib/js/ast.o \
+           user/lib/js/value.o user/lib/js/interp.o user/lib/js/builtins.o
 # brotli: from-scratch RFC 7932 codec (HTTP `br` content-coding). decode needs the
 # 122 KiB static dictionary blob (objcopy of dictionary.bin -> the path-derived
 # symbol decode.c externs); encode is standalone. Links with $(LIBGCC).

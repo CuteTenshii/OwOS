@@ -23,6 +23,7 @@
 #define SYS_WIN_WAIT   19
 #define SYS_WIN_CLOSE  20
 #define SYS_RTC        21
+#define SYS_RTC_EPOCH  58
 #define SYS_READDIR    22
 #define SYS_WIN_TITLE  23
 #define SYS_THREAD     24
@@ -125,6 +126,21 @@ unsigned uptime(void)
 unsigned msec(void)
 {
 	return (unsigned)syscall(SYS_MSEC, 0, 0, 0);
+}
+
+unsigned rtc_epoch(void)
+{
+	return (unsigned)syscall(SYS_RTC_EPOCH, 0, 0, 0);
+}
+
+/* Wall-clock milliseconds since the Unix epoch — the basis for JS Date.now(). The
+ * RTC has 1-second resolution, so we anchor to it once and track sub-second time
+ * with the monotonic ms counter (which also keeps now_ms() monotonic). */
+long long now_ms(void)
+{
+	static unsigned base_epoch = 0, base_msec = 0;
+	if (base_epoch == 0) { base_epoch = rtc_epoch(); base_msec = msec(); }
+	return (long long)base_epoch * 1000 + (long long)(msec() - base_msec);
 }
 
 int readfile(const char *name, char *buf, int max)

@@ -31,6 +31,7 @@
 #define WEV_RCLICK 6                   /* a,b: client x,y of a right click      */
 #define WEV_SCROLL 7                   /* a: mouse-wheel delta (+up / -down)    */
 #define WEV_DRAG   8                   /* a,b: client x,y, left button held+moving */
+#define WEV_MOVE   9                   /* a,b: client x,y, no button held (a<0=left) */
 
 struct win_event {
 	uint32_t type;
@@ -51,6 +52,16 @@ int  uwin_set_cursor(int id, int cursor);             /* enum wm_cursor for the
  * WM uses it for clipboard-paste flow control — see uwin_key_space() / wm.c. */
 struct window;
 int  uwin_key_space(struct window *w);
+
+/* 1 if `w` is a GUI-app window whose owner has stopped servicing it (events are
+ * queued but it hasn't polled within the hang timeout); 0 for a responsive
+ * window or any non-uwin (kernel) window. The WM shows "(Not Responding)" and
+ * turns the close box into a force-kill. */
+int  uwin_not_responding(struct window *w);
+
+/* Owning task id of a GUI-app window, or 0 for a non-uwin (kernel) window — the
+ * WM force-kills a hung app by this pid. */
+uint32_t uwin_owner_pid(struct window *w);
 
 /* Called from sched_exit(): detach every window owned by the exiting task. The
  * client buffer is freed later by the WM via uwin_reap() (see uwin.c). */

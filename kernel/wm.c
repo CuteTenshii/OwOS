@@ -52,7 +52,7 @@ static int             nwin;
 
 /* Per-frame compositor diff snapshot, one entry parallel to wins[], grown with
  * it. (Was MAXWIN-sized arrays on the wm_thread stack.) */
-struct pfsnap { int x, y, w, h, vis, z; uint32_t dirty, cur; };
+struct pfsnap { int x, y, w, h, vis, z, nr; uint32_t dirty, cur; };
 static struct pfsnap *pf;
 
 /* Grow wins[]/zlist[]/pf[] to hold at least `need` slots (~2x). Returns 0 if the
@@ -73,7 +73,7 @@ static int wm_reserve(int need)
 	for (int i = 0; i < wins_cap; i++) { nw[i] = wins[i]; nz[i] = zlist[i]; np[i] = pf[i]; }
 	for (int i = wins_cap; i < nc; i++) {
 		nw[i] = 0; nz[i] = 0;
-		np[i].x = np[i].y = np[i].w = np[i].h = np[i].vis = np[i].z = 0;
+		np[i].x = np[i].y = np[i].w = np[i].h = np[i].vis = np[i].z = np[i].nr = 0;
 		np[i].dirty = 0xFFFFFFFF; np[i].cur = 0;
 	}
 	uint32_t fl;
@@ -98,6 +98,18 @@ int wm_screen_h(void) { return screen_h; }
 #define SM_W      150        /* start-menu popup width                        */
 #define SM_SEP_H  9          /* separator strip above the power actions       */
 static int start_open;
+
+/* Taskbar window-button context menu: right-clicking a button opens a small
+ * popup just above it with "Close" (ask the app to close) and "Force Kill"
+ * (terminate it outright — for a window whose app has hung). tb_menu_win is the
+ * targeted wins[] index; the popup is anchored at (tb_menu_x, tb_menu_y). */
+#define TBM_W      120       /* context-menu width                            */
+#define TBM_ITEM_H 22        /* context-menu item height                      */
+#define TBM_N      2         /* number of items (Close, Force Kill)           */
+static int tb_menu_open;
+static int tb_menu_win = -1;
+static int tb_menu_x, tb_menu_y;
+static int tbm_h(void) { return TBM_N * TBM_ITEM_H; }
 
 /* Power actions live at the bottom of the Start menu, below the app list and a
  * separator. They aren't /bin programs (apps.c) — they call straight into
@@ -233,6 +245,24 @@ static void title_copy(char *dst, const char *s)
 	dst[i] = '\0';
 }
 
+/* The title shown in chrome (title bar + taskbar button): the app's own title,
+ * with " (Not Responding)" appended while the WM judges the window hung. The
+ * app's w->title is never mutated; callers pass a buffer of WM_TITLE_DISP. */
+#define WM_TITLE_DISP (WM_TITLE_MAX + 18)   /* room for the suffix + NUL */
+static void disp_title(struct window *w, char *buf)
+{
+	int n = 0;
+	for (; w->title[n] && n < WM_TITLE_MAX - 1; n++)
+		buf[n] = w->title[n];
+	buf[n] = '\0';
+	if (uwin_not_responding(w)) {
+		static const char sfx[] = " (Not Responding)";
+		for (int j = 0; sfx[j]; j++)
+			buf[n++] = sfx[j];
+		buf[n] = '\0';
+	}
+}
+
 /* ----------------------------------------------------------- z-order helpers */
 
 /* Topmost *visible* window — the one that holds focus (keyboard + highlight). */
@@ -351,6 +381,22 @@ static void wm_toggle_maximize(int idx)
 	}
 }
 
+/* Terminate the app behind a window without its cooperation: kill the owning
+ * process (its exit tears the window down via uwin_task_exiting -> uwin_free,
+ * and the WM frees the buffer in the next uwin_reap), or, for a kernel-side
+ * window with no process, fall back to its close action / hide. */
+static void wm_force_kill(int idx)
+{
+	struct window *w = wins[idx];
+	uint32_t pid = uwin_owner_pid(w);
+	if (pid)
+		sched_kill((int)pid);
+	else if (w->on_close)
+		w->on_close(w);
+	else
+		w->visible = 0;
+}
+
 /* Title-bar buttons by kind: 0=close, 1=maximize, 2=minimize. Close follows
  * w->closable; maximize follows w->resizable; minimize is always offered. */
 static int btn_present(struct window *w, int kind)
@@ -452,6 +498,8 @@ static void draw_background(void)
 	}
 }
 
+static void ui_text_clip(int x, int y, const char *s, uint32_t col, int maxw);
+
 static void draw_window(struct window *w, int focused)
 {
 	uint32_t title_bg = focused ? 0x2f6fb0 : 0x55606e;
@@ -460,7 +508,20 @@ static void draw_window(struct window *w, int focused)
 	/* Outer frame and title bar. */
 	fb_fill_rect(w->x, w->y, w->w, w->h, frame);
 	fb_fill_rect(w->x, w->y, w->w, WM_TITLE_H, title_bg);
-	fb_ui_text(w->x + 8, w->y + (WM_TITLE_H - UIFONT_H) / 2, w->title, 0xffffff);
+
+	/* Clip the title to stop before the leftmost title-bar button so a long
+	 * page title gets "text.." instead of bleeding under the buttons. */
+	int title_x = w->x + 8;
+	int title_right = w->x + w->w - 4;
+	for (int k = 0; k < 3; k++) {
+		int bbx, bby;
+		if (titlebtn_box(w, k, &bbx, &bby) && bbx < title_right)
+			title_right = bbx;
+	}
+	char dt[WM_TITLE_DISP];
+	disp_title(w, dt);
+	ui_text_clip(title_x, w->y + (WM_TITLE_H - UIFONT_H) / 2, dt,
+	             0xffffff, title_right - title_x - 6);
 
 	/* Title-bar buttons, right to left: close, maximize/restore, minimize. */
 	int bx, by;
@@ -793,7 +854,9 @@ static void draw_taskbar_windows(int y, int uy, int right)
 		fb_fill_rect(bxs[k], by, bws[k], bh, bg);
 		fb_fill_rect(bxs[k], by, bws[k], 1, active ? 0x4f8fd0 : 0x2a3550);
 		uint32_t fg = w->minimized ? 0x8b94a4 : 0xc8d0dc;
-		ui_text_clip(bxs[k] + 8, uy, w->title, fg, bws[k] - 12);
+		char dt[WM_TITLE_DISP];
+		disp_title(w, dt);
+		ui_text_clip(bxs[k] + 8, uy, dt, fg, bws[k] - 12);
 	}
 }
 
@@ -846,6 +909,22 @@ static void draw_start_menu(void)
 	fb_rect(0, top, SM_W, sm_h(), 0x05070a);
 }
 
+/* The taskbar window-button context menu (Close / Force Kill), anchored above
+ * the right-clicked button. Force Kill is tinted warm-red to flag it as the
+ * destructive action. */
+static void draw_tb_menu(void)
+{
+	static const char *const items[TBM_N] = { "Close", "Force Kill" };
+	int x = tb_menu_x, y = tb_menu_y;
+	fb_fill_rect(x, y, TBM_W, tbm_h(), 0x141a24);
+	for (int i = 0; i < TBM_N; i++) {
+		int iy = y + i * TBM_ITEM_H;
+		uint32_t fg = (i == 1) ? 0xe08070 : 0xc8d0dc;
+		fb_ui_text(x + 12, iy + (TBM_ITEM_H - UIFONT_H) / 2, items[i], fg);
+	}
+	fb_rect(x, y, TBM_W, tbm_h(), 0x05070a);
+}
+
 /* Hints from handle_input for cursor selection: a grip drag is live, or a window
  * is still catching up to a finished resize (so we show the spinner briefly). */
 static int hover_resizing;
@@ -859,6 +938,10 @@ static int pick_cursor(int mx, int my)
 {
 	if (hover_resizing) return WM_CURSOR_RESIZE;
 	if (hover_settling) return WM_CURSOR_BUSY;
+
+	if (tb_menu_open && mx >= tb_menu_x && mx < tb_menu_x + TBM_W &&
+	    my >= tb_menu_y && my < tb_menu_y + tbm_h())
+		return WM_CURSOR_HAND;
 
 	int bar_y = screen_h - WM_BAR_H;
 	if (my >= bar_y) {
@@ -937,6 +1020,8 @@ static void compose(int mx, int my)
 	draw_taskbar();
 	if (start_open)
 		draw_start_menu();
+	if (tb_menu_open)
+		draw_tb_menu();
 	if (at_active)
 		draw_switcher();
 	draw_cursor(pick_cursor(mx, my), mx, my);
@@ -973,17 +1058,54 @@ static void handle_input(int mx, int my, int buttons, int dz)
 	 * its client area (not the chrome), hand it to the app's rclick — typically a
 	 * context menu. Tracked on its own edge so it never disturbs a left drag. */
 	if (rdown && !prev_rdown) {
-		int idx = window_at(mx, my);
-		if (idx >= 0) {
-			raise_window(idx);
-			struct window *w = wins[idx];
-			if (w->rclick && my >= w->y + WM_TITLE_H)
-				w->rclick(w, mx, my);
+		int bar_y = screen_h - WM_BAR_H;
+		int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
+		if (tbw >= 0) {                 /* right-click a taskbar button: its menu */
+			tb_menu_open = 1;
+			tb_menu_win = tbw;
+			start_open = 0;
+			tb_menu_x = mx;
+			if (tb_menu_x + TBM_W > screen_w) tb_menu_x = screen_w - TBM_W;
+			if (tb_menu_x < 0) tb_menu_x = 0;
+			tb_menu_y = bar_y - tbm_h();
+		} else {
+			tb_menu_open = 0;       /* a right-click elsewhere dismisses it */
+			int idx = window_at(mx, my);
+			if (idx >= 0) {
+				raise_window(idx);
+				struct window *w = wins[idx];
+				if (w->rclick && my >= w->y + WM_TITLE_H)
+					w->rclick(w, mx, my);
+			}
 		}
 	}
 	prev_rdown = rdown;
 
 	if (down && !prev_down) {      /* press                                    */
+		/* An open taskbar context menu intercepts the next click: act on the
+		 * item under the cursor, otherwise just dismiss it (then fall through so
+		 * the click still does whatever it landed on). */
+		if (tb_menu_open) {
+			int inside = mx >= tb_menu_x && mx < tb_menu_x + TBM_W &&
+			             my >= tb_menu_y && my < tb_menu_y + tbm_h();
+			if (inside) {
+				int item = (my - tb_menu_y) / TBM_ITEM_H;
+				int idx = tb_menu_win;
+				tb_menu_open = 0;
+				if (idx >= 0 && idx < nwin && !wins[idx]->dead) {
+					struct window *w = wins[idx];
+					if (item == 0) {           /* Close: ask the app */
+						if (w->on_close) w->on_close(w);
+						else w->visible = 0;
+					} else {                   /* Force Kill */
+						wm_force_kill(idx);
+					}
+				}
+				prev_down = down;
+				return;
+			}
+			tb_menu_open = 0;
+		}
 		/* Start button / launcher popup take priority over windows. */
 		int bar_y = screen_h - WM_BAR_H;
 		if (my >= bar_y && mx >= 0 && mx < START_W) {   /* the Start button   */
@@ -1040,7 +1162,12 @@ static void handle_input(int mx, int my, int buttons, int dz)
 			 * restore, or minimize to the taskbar. */
 			int tb = titlebtn_hit(w, mx, my);
 			if (tb == 0) {                        /* close                   */
-				if (w->on_close)
+				/* Windows-style two stage: a responsive window is asked to
+				 * close (on_close), but one already flagged Not Responding is
+				 * force-killed on this click instead of asking again. */
+				if (uwin_not_responding(w))
+					wm_force_kill(idx);
+				else if (w->on_close)
 					w->on_close(w);
 				else
 					w->visible = 0;
@@ -1105,6 +1232,27 @@ static void handle_input(int mx, int my, int buttons, int dz)
 		dragging = -1;
 		resizing = -1;              /* grip let go; rsz_win lives on to settle  */
 		app_dragging = -1;
+	}
+
+	/* Pointer motion with no button held: deliver a hover event to the window
+	 * under the cursor (apps use it for link-target status bars, tooltips).
+	 * Fires only on actual movement and only inside the client area; when the
+	 * pointer leaves the window we last hovered, that window gets one final
+	 * hover with out-of-bounds (mx<0) coords so it can clear its hover state. */
+	static int hover_slot = -1, hover_px = -1, hover_py = -1;
+	if (!down && !rdown && dragging < 0 && resizing < 0 && app_dragging < 0 &&
+	    (mx != hover_px || my != hover_py)) {
+		hover_px = mx; hover_py = my;
+		int idx = window_at(mx, my);
+		struct window *w = idx >= 0 ? wins[idx] : 0;
+		int in_client = w && my >= w->y + WM_TITLE_H && my < w->y + w->h - WM_BORDER &&
+		                mx >= w->x + WM_BORDER && mx < w->x + w->w - WM_BORDER;
+		if (hover_slot >= 0 && (idx != hover_slot || !in_client)) {
+			struct window *p = wins[hover_slot];
+			if (!p->dead && p->hover) p->hover(p, -1, -1);   /* left: clear  */
+			hover_slot = -1;
+		}
+		if (in_client && w->hover) { w->hover(w, mx, my); hover_slot = idx; }
 	}
 
 	/* Drive the live-resize hand-off. Hand the app each new frame size once it
@@ -1305,6 +1453,7 @@ static void wm_thread(void)
 	int      prev_cur = -1;       /* cursor shape shown last frame              */
 	int      prev_wheel = mouse_wheel();
 	int      prev_start = 0;
+	int      prev_tb_menu = 0;     /* taskbar context menu shown last frame    */
 	int      last_sec = -1;
 	int      prev_focus = -1;     /* topmost-visible window shown last frame     */
 	int      prev_at_active = 0;  /* Alt+Tab overlay shown last frame            */
@@ -1408,6 +1557,12 @@ static void wm_thread(void)
 			prev_at_active = at_active;
 			prev_at_sel = at_sel;
 
+			/* The taskbar context menu opening/closing overlaps an arbitrary
+			 * window stack — repaint in full, like the Start menu and switcher. */
+			if (tb_menu_open != prev_tb_menu)
+				full = 1;
+			prev_tb_menu = tb_menu_open;
+
 			/* Windows that moved or resized: damage old and new rectangles. */
 			for (int i = 0; i < nwin; i++)
 				if (wins[i]->x != pf[i].x || wins[i]->y != pf[i].y ||
@@ -1432,6 +1587,13 @@ static void wm_thread(void)
 				if (wins[i]->visible && wins[i]->dirty &&
 				    pf[i].cur != pf[i].dirty)
 					damage_add(wins[i]->x, wins[i]->y, wins[i]->w, wins[i]->h);
+			/* A window flipping to/from "Not Responding" rewrites its title with
+			 * no present behind it — damage its title bar so the suffix shows or
+			 * clears. (Its taskbar button repaints on the clock tick below.) */
+			for (int i = 0; i < nwin; i++)
+				if (wins[i]->visible &&
+				    uwin_not_responding(wins[i]) != pf[i].nr)
+					damage_add(wins[i]->x, wins[i]->y, wins[i]->w, WM_TITLE_H);
 			/* The taskbar clock ticked. */
 			if ((int)timer_seconds() != last_sec)
 				damage_add(0, screen_h - WM_BAR_H, screen_w, WM_BAR_H);
@@ -1468,6 +1630,7 @@ static void wm_thread(void)
 			pf[i].x = wins[i]->x;   pf[i].y = wins[i]->y;
 			pf[i].w = wins[i]->w;   pf[i].h = wins[i]->h;
 			pf[i].vis = wins[i]->visible; pf[i].z = zlist[i];
+			pf[i].nr = uwin_not_responding(wins[i]);
 			pf[i].dirty = pf[i].cur;   /* sampled before compose(), above */
 		}
 		prev_mx = mx; prev_my = my;

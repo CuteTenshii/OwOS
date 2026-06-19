@@ -65,6 +65,7 @@
 #define SYS_WIN_WAIT   19 /* win_wait(id=ebx) -> 0 (sleep ~a frame for events)  */
 #define SYS_WIN_CLOSE  20 /* win_close(id=ebx) -> 0/-1                          */
 #define SYS_RTC        21 /* rtc() -> packed (hour<<16)|(min<<8)|sec            */
+#define SYS_RTC_EPOCH  58 /* rtc_epoch() -> Unix epoch seconds (UTC)            */
 #define SYS_READDIR    22 /* readdir(path=ebx, idx=ecx, out=edx) -> 1/0/-1      */
 #define SYS_WIN_TITLE  23 /* win_settitle(id=ebx, str=ecx) -> 0/-1              */
 #define SYS_THREAD     24 /* thread_create(entry=ebx, stacktop=ecx) -> tid/-1   */
@@ -617,6 +618,9 @@ void syscall_dispatch(struct registers *r)
 		r->eax = ((uint32_t)t.hour << 16) | ((uint32_t)t.min << 8) | t.sec;
 		break;
 	}
+	case SYS_RTC_EPOCH:
+		r->eax = rtc_epoch();                      /* Unix epoch seconds (UTC) */
+		break;
 	case SYS_READDIR: {
 		/* name[64] mirrors struct dirent_u (owos.h) / owofs FS_NAME_LEN. */
 		struct rd_out { char name[64]; int is_dir; uint32_t size; } *o;

@@ -48,6 +48,8 @@ struct uwin {
 	int            free_pending; /* detached; WM thread still owes its buffer */
 	volatile int   head, tail;  /* event ring indices                        */
 	struct win_event ev[EVQ];
+	uint32_t       last_poll;   /* timer_ticks() of the owner's last poll —
+	                               its event-loop heartbeat (hang detection)  */
 	uint32_t       last_click;  /* timer_ticks() of the previous click       */
 	int            last_cx, last_cy; /* its client-relative position         */
 };
@@ -101,6 +103,22 @@ static void evq_push(struct uwin *u, uint32_t type, int32_t a, int32_t b)
 	u->ev[u->head].a = a;
 	u->ev[u->head].b = b;
 	u->head = next;
+}
+
+/* Coalescing push for high-rate pointer motion: if the most recently queued
+ * event is also a WEV_MOVE, overwrite it in place instead of appending, so a
+ * burst of hover motion can never fill the ring and crowd out clicks or keys. */
+static void evq_push_move(struct uwin *u, int32_t a, int32_t b)
+{
+	if (u->head != u->tail) {
+		int last = (u->head - 1 + EVQ) % EVQ;
+		if (u->ev[last].type == WEV_MOVE) {
+			u->ev[last].a = a;
+			u->ev[last].b = b;
+			return;
+		}
+	}
+	evq_push(u, WEV_MOVE, a, b);
 }
 
 /* ------------------------------------------------------------ WM callbacks */
@@ -161,6 +179,21 @@ static void uw_drag(struct window *w, int mx, int my)
 	evq_push(u, WEV_DRAG, cx, cy);
 }
 
+/* The pointer moved over our client area with no button held (or left it, which
+ * the WM signals with mx<0). Forwarded as WEV_MOVE so an app can react to hover
+ * — e.g. show a hovered link's target in a status bar. Consecutive moves
+ * coalesce in the ring (evq_push_move) so fast motion can't outrun the drain. */
+static void uw_hover(struct window *w, int mx, int my)
+{
+	struct uwin *u = w->state;
+	if (!u)
+		return;
+	if (mx < 0)
+		evq_push_move(u, -1, -1);                       /* pointer left */
+	else
+		evq_push_move(u, mx - (w->x + WM_BORDER), my - (w->y + WM_TITLE_H));
+}
+
 static void uw_rclick(struct window *w, int mx, int my)
 {
 	struct uwin *u = w->state;
@@ -192,6 +225,36 @@ int uwin_key_space(struct window *w)
 		return 1 << 30;
 	int used = (u->head - u->tail + EVQ) % EVQ;
 	return (EVQ - 1) - used;       /* one slot is always left empty (full test) */
+}
+
+/* A window is "not responding" when events are queued for its owner but the
+ * owner hasn't polled within this window — i.e. its event loop has stalled. The
+ * WM shows "(Not Responding)" and turns the close box into a force-kill. Chosen
+ * over a bare last-poll age so a healthy-but-idle app (which still polls every
+ * frame, draining nothing) is never flagged, and a hung one is flagged only once
+ * there is actually input it's failing to service. */
+#define UWIN_HANG_TICKS (TIMER_HZ * 3)         /* 3 s of unserviced input */
+
+int uwin_not_responding(struct window *w)
+{
+	if (!w || w->key != uw_key)            /* not a GUI-app window */
+		return 0;
+	struct uwin *u = w->state;
+	if (!u || !u->used || u->free_pending)
+		return 0;
+	if (u->head == u->tail)                /* ring empty: nothing to ignore */
+		return 0;
+	return (timer_ticks() - u->last_poll) > UWIN_HANG_TICKS;
+}
+
+uint32_t uwin_owner_pid(struct window *w)
+{
+	if (!w || w->key != uw_key)
+		return 0;
+	struct uwin *u = w->state;
+	if (!u || !u->used || u->free_pending)
+		return 0;
+	return u->owner;
 }
 
 /* Mouse wheel over the window: the WM already routes wheel deltas to the
@@ -399,6 +462,7 @@ int uwin_create(int w, int h, const char *title)
 	win->draw = uw_draw;
 	win->click = uw_click;
 	win->drag = uw_drag;
+	win->hover = uw_hover;
 	win->rclick = uw_rclick;
 	win->key = uw_key;
 	win->scroll = uw_scroll;
@@ -432,6 +496,8 @@ int uwin_create(int w, int h, const char *title)
 	u->h = h;
 	u->present_seq = 1;
 	u->head = u->tail = 0;
+	u->last_poll = timer_ticks();  /* seed the heartbeat so a pre-first-poll
+	                                  event can't read as an instant hang     */
 	u->last_click = 0;             /* fresh slot: no prior click to pair with */
 	return slot;
 }
@@ -461,6 +527,7 @@ int uwin_poll(int id, struct win_event *out)
 	struct uwin *u = owned(id);
 	if (!u)
 		return -1;
+	u->last_poll = timer_ticks();  /* heartbeat: the owner's loop is alive */
 	if (u->tail == u->head)
 		return 0;
 	*out = u->ev[u->tail];

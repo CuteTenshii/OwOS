@@ -20,6 +20,8 @@ int      execp1(const char *name, const char *arg); /* + one argv[1] string     
 int      waitpid(int pid);                     /* block for a child; its status  */
 unsigned uptime(void);                        /* seconds since boot            */
 unsigned msec(void);                          /* milliseconds since boot       */
+unsigned rtc_epoch(void);                     /* Unix epoch seconds (UTC)      */
+long long now_ms(void);                       /* wall-clock ms since the epoch */
 int      readfile(const char *name, char *buf, int max);  /* bytes, or -1     */
 int      writefile(const char *name, const void *buf, int len); /* 0, or -1    */
 /* Partial read: up to `len` bytes at byte `off`. Returns the count (0 = EOF,
@@ -124,6 +126,9 @@ int  readline(char *buf, int max);            /* echoed line input, returns len*
 #define WEV_DRAG     8  /* a, b = client x, y while the left button is held and
                          * moving (motion after a WEV_MOUSE press; ends silently
                          * on release — the next WEV_MOUSE starts a fresh drag)  */
+#define WEV_MOVE     9  /* a, b = client x, y as the pointer moves with NO button
+                         * held; a = -1 when the pointer leaves the window. Fast
+                         * motion coalesces in the queue (only the latest is kept) */
 
 struct win_event { unsigned type; int a, b; };
 
@@ -258,6 +263,9 @@ int umount(const char *point);
 #define KEY_END    0x06
 #define KEY_DELETE 0x07
 #define KEY_F5     0x0E   /* refresh/reload (the app decides what that means)  */
+#define KEY_F12    0x1D   /* F12: the app decides (the browser opens devtools) */
+#define KEY_SUPER  0x11   /* Windows key: WM-consumed (Start menu), never reaches apps;
+                             defined only to keep 0x11 reserved and this table in sync */
 #define KEY_NEW    0x0F   /* Ctrl+N  \                                         */
 #define KEY_OPEN   0x10   /* Ctrl+O   > menu accelerators (see menu_shortcut)  */
 #define KEY_SAVE   0x13   /* Ctrl+S  /                                         */

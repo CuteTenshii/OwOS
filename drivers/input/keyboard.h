@@ -23,6 +23,7 @@
 #define KEY_KILL    0x0B   /* Ctrl+U: erase the whole line                     */
 #define KEY_CLEAR   0x0C   /* Ctrl+L: clear the screen                         */
 #define KEY_F5      0x0E   /* F5: app-defined refresh/reload                   */
+#define KEY_F12     0x1D   /* F12: app-defined (devtools)                      */
 #define KEY_SUPER   0x11   /* left/right Windows (GUI) key: toggle Start menu  */
 
 /* KEY_KILL/KEY_CLEAR remain ONLY as line-editor codes for the serial recovery

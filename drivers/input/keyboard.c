@@ -59,6 +59,7 @@
 #define SC_F6          0x40        /* brightness up                            */
 #define SC_F8          0x42        /* volume down                              */
 #define SC_F9          0x43        /* volume up                                */
+#define SC_F12         0x58        /* delivered to apps as KEY_F12 (devtools)  */
 
 /* Numeric keypad make codes are contiguous from 0x47 to 0x53. */
 #define SC_KP_FIRST    0x47
@@ -532,6 +533,10 @@ static void keyboard_handler(struct registers *r)
 		return;
 	if (process_media_fkey(sc))
 		return;
+	if (sc == SC_F12) {            /* the only plain F-key apps see (devtools) */
+		ring_push(KEY_F12);
+		return;
+	}
 	if (process_keypad(sc))
 		return;
 	if (process_chords(sc))

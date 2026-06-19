@@ -77,6 +77,7 @@ static void raw_decode(int enc)
 
 static int rgetc(void)
 {
+	if (B->abort_load) return -2;            /* Stop / tab-close: bail the read */
 	if (B->rpos >= B->rlen) {
 		if (B->reof) return -1;
 		int n = net_recv(B->sock, B->rbuf, (int)sizeof B->rbuf);
@@ -504,6 +505,17 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 	const char *xcto = http_headers_get(&H, "x-content-type-options");
 	if (xcto && http_header_has_token(xcto, "nosniff")) B->nosniff = true;
 
+	/* Content-Security-Policy: build the page's enforced policy set — each header
+	 * is one policy and a load must satisfy them all. Report-Only is deliberately
+	 * not enforced, so it is left out. (The final hop after redirects wins.) */
+	if (B->csp) { csp_free(B->csp); B->csp = 0; }
+	int ncsp = http_headers_count(&H, "content-security-policy");
+	if (ncsp > 0) {
+		B->csp = csp_new();
+		for (int i = 0; i < ncsp; i++)
+			csp_add(B->csp, http_headers_at(&H, "content-security-policy", i));
+	}
+
 	http_headers_free(&H);
 	jar_flush();   /* persist cookies/HSTS once, if this response changed them */
 	return status;
@@ -550,6 +562,7 @@ static int h2_headers_cb(void *ctx, const char *block, int len)
 static int h2_body_cb(void *ctx, const unsigned char *p, int n)
 {
 	(void)ctx;
+	if (B->abort_load) return 1;                    /* Stop: tell h2_run to bail */
 	if (!ensure_raw(B->raw_len + n)) return 1;      /* out of memory: stop */
 	for (int i = 0; i < n; i++) B->raw[B->raw_len++] = (char)p[i];
 	return 0;
@@ -596,6 +609,7 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 static int h3_body_cb(void *ctx, const unsigned char *p, int n)
 {
 	(void)ctx;
+	if (B->abort_load) return 1;                    /* Stop: tell h3_run to bail */
 	if (!ensure_raw(B->raw_len + n)) return 1;
 	for (int i = 0; i < n; i++) B->raw[B->raw_len++] = (char)p[i];
 	return 0;
@@ -881,6 +895,12 @@ static int load_data_url(const char *url)
 void do_fetch(void)
 {
 	char url[URL_MAX]; int n = 0;
+	/* Free the previous page's live DOM/CSS/JS before building the new one. This
+	 * covers every navigation (incl. plain-text/image/error paths that don't go
+	 * through html_to_text); html_to_text repeats it harmlessly for HTML pages. */
+	html_page_teardown();
+	if (B->csp) { csp_free(B->csp); B->csp = 0; }   /* drop the old page's CSP; parse_response/meta rebuild it */
+	devtools_net_reset();       /* a new top-level navigation starts a fresh net log */
 	sapp(url, &n, sizeof url, B->req_url);
 	B->dl_saved = 0;
 	B->favicon_ok = 0;          /* cleared per navigation; refilled on success */
@@ -901,6 +921,7 @@ void do_fetch(void)
 			return;
 		}
 		render_raw(url);
+		devtools_net_add("GET", url, 200, B->ctype, B->raw_len);
 		return;
 	}
 
@@ -917,6 +938,7 @@ void do_fetch(void)
 	}
 
 	for (int hop = 0; hop <= MAX_REDIR; hop++) {
+		if (B->abort_load) return;          /* stopped before this hop: leave as-is */
 		struct purl u;
 		if (!parse_url(url, &u)) { show_error("Bad URL"); return; }
 
@@ -930,6 +952,7 @@ void do_fetch(void)
 		char loc[URL_MAX];
 		int st = http_txn(&u, url, loc, sizeof loc, 1);
 		if (st < 0) {
+			if (B->abort_load) return;       /* user stopped: no error page */
 			/* Secure connect failed for an auto-https URL (host has no TLS, or a
 			 * plain dev server) — retry the same URL over http once. */
 			if (implicit_scheme && st == -3 && starts_ci(url, "https://")) {
@@ -953,6 +976,10 @@ void do_fetch(void)
 			continue;
 		}
 
+		/* Log the document request in the devtools Network tab (the final response
+		 * after any redirects; a streamed download has raw_len 0). */
+		devtools_net_add("GET", url, st, B->ctype, B->dl_saved ? 0 : B->raw_len);
+
 		/* A download was streamed straight to ~/Downloads inside http_txn (it
 		 * never touched B->raw), so there is nothing to render. */
 		if (B->dl_saved)
@@ -968,13 +995,13 @@ void do_fetch(void)
 		/* HTML pages may carry inline <img>: the parallel fetchers (resource.c)
 		 * pull each over its own socket into img_pool — B->raw is untouched. Each
 		 * landed image bumps B->seq so the UI re-lays-out as they arrive. */
-		if (B->mode == MODE_HTML && B->n_imgs > 0)
+		if (B->mode == MODE_HTML && B->n_imgs > 0 && !B->abort_load)
 			fetch_inline_images(url);
 
 		/* Pull the site favicon for the tab strip. Skipped for a directly-rendered
 		 * image page, whose pixels are in B->raw (the favicon fetch uses its own
 		 * buffer, but the page is already the image, so there's nothing to fetch). */
-		if (B->mode != MODE_IMAGE)
+		if (B->mode != MODE_IMAGE && !B->abort_load)
 			fetch_favicon(url);
 		return;
 	}

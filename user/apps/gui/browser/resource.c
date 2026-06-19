@@ -5,6 +5,7 @@
  * lets several proceed at once. The main page transaction lives in fetch.c. */
 #include "browser.h"
 #include "fetchint.h"
+#include "headers.h"   /* HTTP response headers (iframe X-Frame-Options / CSP)  */
 #include "svg.h"       /* SVG -> ARGB rasterizer (favicons, inline images) */
 
 /* --------------------------------------------------- inline image fetching */
@@ -51,17 +52,54 @@ static int body_put(unsigned char **body, int *cap, int *blen, int c)
 
 /* Response line/header facts a sub-resource fetch needs: the status code and a
  * Location (for redirects). */
-struct resp_meta { int status; char location[URL_MAX]; };
+struct resp_meta { int status; char location[URL_MAX]; char ctype[160]; };
+
+/* Parse a response header block (an HTTP/1.1 block, or the HTTP/2-synthesized
+ * "HTTP/2 NNN\r\nname: value\r\n…"): status + Location + Content-Type into `meta`,
+ * and the framing (chunked / Content-Length) for the body reader. Shared by the
+ * h1.1 socket reader and the h2 path. */
+static void parse_resp_headers(const char *hdr, struct resp_meta *meta, int *chunked, long *clen)
+{
+	meta->status = 0; meta->location[0] = '\0'; meta->ctype[0] = '\0';
+	*chunked = 0; *clen = -1;
+
+	{ const char *s = hdr; while (*s && *s != ' ') s++; while (*s == ' ') s++;
+	  while (*s >= '0' && *s <= '9') meta->status = meta->status * 10 + (*s++ - '0'); }
+
+	for (const char *line = hdr; *line; ) {
+		if (starts_ci(line, "content-length:")) {
+			const char *v = line + 15; while (*v == ' ') v++;
+			*clen = 0; while (*v >= '0' && *v <= '9') *clen = *clen * 10 + (*v++ - '0');
+		} else if (starts_ci(line, "transfer-encoding:")) {
+			for (const char *q = line; *q && *q != '\n'; q++)
+				if (starts_ci(q, "chunked")) { *chunked = 1; break; }
+		} else if (starts_ci(line, "location:")) {
+			const char *v = line + 9; while (*v == ' ') v++;
+			int k = 0;
+			while (*v && *v != '\r' && *v != '\n' && k < (int)sizeof meta->location - 1)
+				meta->location[k++] = *v++;
+			meta->location[k] = '\0';
+		} else if (starts_ci(line, "content-type:")) {
+			const char *v = line + 13; while (*v == ' ') v++;
+			int k = 0;
+			while (*v && *v != '\r' && *v != '\n' && k < (int)sizeof meta->ctype - 1)
+				meta->ctype[k++] = *v++;
+			meta->ctype[k] = '\0';
+		}
+		const char *e = line; while (*e && *e != '\n') e++;
+		if (!*e) break;
+		line = e + 1;
+	}
+}
 
 /* Read a response's body (chunked / content-length / read-to-close) off an open
  * sub-resource request into a freshly malloc'd buffer. Fills *meta (status +
  * Location) and returns the body (caller frees) with *outlen set, for ANY status
  * — the caller decides what to do with a redirect or an error. NULL only on a
  * connection error / OOM. Bounded by RAW_MAX. */
-static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp_meta *meta)
+static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp_meta *meta,
+                                     char *hdr_out, int hdr_cap)
 {
-	meta->status = 0; meta->location[0] = '\0';
-
 	char hdr[4096]; int hl = 0, m = 0;
 	for (;;) {
 		int c = ir_getc(r);
@@ -73,29 +111,12 @@ static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp
 		if (m == 4) break;
 	}
 	hdr[hl] = '\0';
-
-	{ const char *s = hdr; while (*s && *s != ' ') s++; while (*s == ' ') s++;
-	  while (*s >= '0' && *s <= '9') meta->status = meta->status * 10 + (*s++ - '0'); }
-
-	int chunked = 0; long clen = -1;
-	for (const char *line = hdr; *line; ) {
-		if (starts_ci(line, "content-length:")) {
-			const char *v = line + 15; while (*v == ' ') v++;
-			clen = 0; while (*v >= '0' && *v <= '9') clen = clen * 10 + (*v++ - '0');
-		} else if (starts_ci(line, "transfer-encoding:")) {
-			for (const char *q = line; *q && *q != '\n'; q++)
-				if (starts_ci(q, "chunked")) { chunked = 1; break; }
-		} else if (starts_ci(line, "location:")) {
-			const char *v = line + 9; while (*v == ' ') v++;
-			int k = 0;
-			while (*v && *v != '\r' && *v != '\n' && k < (int)sizeof meta->location - 1)
-				meta->location[k++] = *v++;
-			meta->location[k] = '\0';
-		}
-		const char *e = line; while (*e && *e != '\n') e++;
-		if (!*e) break;
-		line = e + 1;
+	if (hdr_out && hdr_cap > 0) {           /* hand the raw block to the caller */
+		int k = 0; for (; hdr[k] && k < hdr_cap - 1; k++) hdr_out[k] = hdr[k]; hdr_out[k] = '\0';
 	}
+
+	int chunked; long clen;
+	parse_resp_headers(hdr, meta, &chunked, &clen);
 
 	int cap = (clen > 0 && clen < (long)RAW_MAX) ? (int)clen + 1 : 65536;
 	unsigned char *body = malloc((unsigned)cap);
@@ -136,67 +157,363 @@ done:
 static int is_redirect(int s)
 { return s == 301 || s == 302 || s == 303 || s == 307 || s == 308; }
 
-/* Build a GET request for a sub-resource (Host, cookies, UA, the given Accept,
- * Connection: close). */
-static void build_get(char *req, int *n, int cap, const struct purl *u, const char *accept)
+/* Fetch an absolute URL as a sub-resource (GET, follow redirects): the 200 body
+ * (caller frees) + *outlen, or NULL. A thin wrapper over browser_fetch_url (the
+ * one single-request transport: h2 when the server offers it, else h1.1), which
+ * also gives sub-resources HTTP/2. Sends cookies, HSTS-upgrades, runs concurrently
+ * (the kernel TLS is multi-flow). */
+static unsigned char *subres_get(const char *absurl, const char *accept, int *outlen)
 {
-	sapp(req, n, cap, "GET ");
+	int status = 0;
+	unsigned char *body = browser_fetch_url(absurl, "GET", 0, 0, 0, accept,
+	                                        &status, 0, 0, outlen);
+	if (body && status != 200) { free(body); return 0; }
+	return body;
+}
+
+/* Build an arbitrary-method request (for the JS fetch()): like build_get but with
+ * the method, an optional Content-Type, and a Content-Length when a body follows. */
+static void build_request(char *req, int *n, int cap, const struct purl *u,
+                          const char *method, const char *accept, const char *ctype, int blen)
+{
+	sapp(req, n, cap, method); sapp(req, n, cap, " ");
 	sapp(req, n, cap, u->path);
 	sapp(req, n, cap, " HTTP/1.1\r\nHost: ");
 	sapp(req, n, cap, u->host);
 	if (!((u->tls && u->port == 443) || (!u->tls && u->port == 80))) {
-		sapp(req, n, cap, ":");
-		uapp(req, n, cap, (unsigned)u->port);
+		sapp(req, n, cap, ":"); uapp(req, n, cap, (unsigned)u->port);
 	}
-	char ck[1024];
-	if (cookie_header(u->host, ck, sizeof ck) > 0) {
-		sapp(req, n, cap, "\r\nCookie: ");
-		sapp(req, n, cap, ck);
-	}
+	{ char ck[1024]; if (cookie_header(u->host, ck, sizeof ck) > 0) { sapp(req, n, cap, "\r\nCookie: "); sapp(req, n, cap, ck); } }
 	sapp(req, n, cap, "\r\nUser-Agent: " BR_UA "\r\nAccept: ");
-	sapp(req, n, cap, accept);
+	sapp(req, n, cap, accept && accept[0] ? accept : "*/*");
+	if (ctype && ctype[0]) { sapp(req, n, cap, "\r\nContent-Type: "); sapp(req, n, cap, ctype); }
+	if (blen > 0) { sapp(req, n, cap, "\r\nContent-Length: "); uapp(req, n, cap, (unsigned)blen); }
 	sapp(req, n, cap, "\r\nConnection: close\r\n\r\n");
 }
 
-/* Fetch an absolute URL as a sub-resource: own socket, GET, follow redirects up
- * to MAX_REDIR. Returns the 200 body (caller frees) with *outlen set, or NULL.
- * Sends cookies and upgrades to TLS for HSTS hosts. The kernel TLS is multi-flow,
- * so several of these run concurrently (the parallel image fetchers). */
-static unsigned char *subres_get(const char *absurl, const char *accept, int *outlen)
+/* h2 response body sink for browser_fetch_url: append DATA into a growable buffer. */
+struct h2buf { unsigned char *body; int cap, blen; };
+static int h2buf_cb(void *ctx, const unsigned char *p, int n)
 {
-	char full[URL_MAX]; { int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, absurl); }
+	struct h2buf *h = ctx;
+	for (int i = 0; i < n; i++) if (body_put(&h->body, &h->cap, &h->blen, p[i]) < 0) return 1;
+	return 0;
+}
+
+/* The single-request transport core: one GET/POST (h2 when offered, else h1.1),
+ * following redirects, returning the body for ANY final status. The final hop's
+ * response metadata, absolute URL and raw header block are reported out so a
+ * caller that needs more than status+ctype (the iframe path, which reads
+ * X-Frame-Options / CSP) gets them without a second request. NULL on a
+ * connection/OOM error. Worker-thread only. */
+static unsigned char *fetch_loop(const char *url, const char *method,
+                                 const unsigned char *reqbody, int reqlen, const char *req_ctype,
+                                 const char *accept, struct resp_meta *meta_out,
+                                 char *final_url, int fu_cap, char *hdr_out, int hdr_cap, int *outlen)
+{
+	char full[URL_MAX]; { int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, url); }
+	int is_get = !method || streq_ci(method, "GET") || streq_ci(method, "HEAD");
+	if (!method) method = "GET";
+	if (!accept || !accept[0]) accept = "*/*";
+	*outlen = 0;
 
 	for (int hop = 0; hop <= MAX_REDIR; hop++) {
 		struct purl u;
+		struct resp_meta meta;
+		unsigned char *body = 0;
+		int blen = 0;
+		char rawhdr[4096]; rawhdr[0] = '\0';
 		if (!parse_url(full, &u)) return 0;
 		if (!u.tls && hsts_has(u.host)) { u.tls = 1; if (u.port == 80) u.port = 443; }
 
-		int sock = net_connect(u.host, u.port, u.tls ? SK_TLS : SK_TCP);
+		int sock = net_connect(u.host, u.port, u.tls ? SK_TLS_H2 : SK_TCP);
 		if (sock < 0) return 0;
 
-		char req[1024]; int n = 0;
-		build_get(req, &n, sizeof req, &u, accept);
-		if (net_send(sock, req, n) < 0) { net_close(sock); return 0; }
-
-		struct ireader r = { sock, { 0 }, 0, 0, 0 };
-		struct resp_meta meta;
-		int blen = 0;
-		unsigned char *body = read_http_body(&r, &blen, &meta);
-		net_close(sock);
+		if (u.tls && net_alpn(sock) == ALPN_H2) {
+			/* HTTP/2. :authority + lowercased headers; no accept-encoding so the
+			 * body comes back plain (no decompression needed here). */
+			char auth[URL_HOST_MAX + 8]; int an = 0;
+			sapp(auth, &an, sizeof auth, u.host);
+			if (u.port != 443) { sapp(auth, &an, sizeof auth, ":"); uapp(auth, &an, sizeof auth, (unsigned)u.port); }
+			char xh[1408]; int xn = 0; char ck[1024];
+			if (cookie_header(u.host, ck, sizeof ck) > 0) { sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n"); }
+			sapp(xh, &xn, sizeof xh, "accept: "); sapp(xh, &xn, sizeof xh, accept); sapp(xh, &xn, sizeof xh, "\r\n");
+			if (req_ctype && req_ctype[0]) { sapp(xh, &xn, sizeof xh, "content-type: "); sapp(xh, &xn, sizeof xh, req_ctype); sapp(xh, &xn, sizeof xh, "\r\n"); }
+			struct h2_opts opts = { BR_UA, xh, 0 };
+			struct h2buf hb; hb.cap = 65536; hb.blen = 0; hb.body = malloc((unsigned)hb.cap);
+			if (!hb.body) { net_close(sock); return 0; }
+			int hlen = 0;
+			int rc = h2_run_body(sock, 1, auth, method, u.path, &opts, reqbody, reqlen,
+			                     rawhdr, sizeof rawhdr, &hlen, h2buf_cb, &hb);
+			net_close(sock);
+			if (rc < 0) { if (hb.body) free(hb.body); return 0; }
+			int dchunk; long dclen;
+			parse_resp_headers(rawhdr, &meta, &dchunk, &dclen);
+			body = hb.body ? hb.body : malloc(1);
+			blen = hb.blen;
+		} else {
+			char req[2048]; int n = 0;
+			build_request(req, &n, sizeof req, &u, method, accept, req_ctype, reqlen);
+			if (net_send(sock, req, n) < 0) { net_close(sock); return 0; }
+			if (reqbody && reqlen > 0 && net_send(sock, (const char *)reqbody, reqlen) < 0) { net_close(sock); return 0; }
+			struct ireader r = { sock, { 0 }, 0, 0, 0 };
+			body = read_http_body(&r, &blen, &meta, rawhdr, sizeof rawhdr);
+			net_close(sock);
+		}
 		if (!body) return 0;
 
-		if (is_redirect(meta.status) && meta.location[0]) {
+		if (is_get && is_redirect(meta.status) && meta.location[0]) {
 			char next[URL_MAX];
 			resolve_url(full, meta.location, next, sizeof next);
 			int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, next);
 			free(body);
 			continue;
 		}
-		if (meta.status != 200) { free(body); return 0; }
+		if (meta_out) *meta_out = meta;
+		if (final_url && fu_cap) { int k = 0; final_url[0] = '\0'; sapp(final_url, &k, fu_cap, full); }
+		if (hdr_out && hdr_cap) { int k = 0; for (; rawhdr[k] && k < hdr_cap - 1; k++) hdr_out[k] = rawhdr[k]; hdr_out[k] = '\0'; }
 		*outlen = blen;
+		devtools_net_add(method, full, meta.status, meta.ctype, blen);
 		return body;
 	}
 	return 0;
+}
+
+/* The browser's single-request transport (sub-resources via subres_get, and the JS
+ * fetch()): one request with `method` (+ optional body), returning the response
+ * body (caller frees) for ANY status, with the status and Content-Type reported so
+ * fetch()'s Response is real. A thin wrapper over fetch_loop. Worker-thread only. */
+unsigned char *browser_fetch_url(const char *url, const char *method,
+                                 const unsigned char *reqbody, int reqlen, const char *req_ctype,
+                                 const char *accept, int *status, char *out_ctype, int oc_cap, int *outlen)
+{
+	struct resp_meta meta;
+	*status = 0; *outlen = 0; if (out_ctype && oc_cap) out_ctype[0] = '\0';
+	unsigned char *body = fetch_loop(url, method, reqbody, reqlen, req_ctype, accept,
+	                                 &meta, 0, 0, 0, 0, outlen);
+	if (!body) return 0;
+	*status = meta.status;
+	if (out_ctype && oc_cap) { int k = 0; for (; meta.ctype[k] && k < oc_cap - 1; k++) out_ctype[k] = meta.ctype[k]; out_ctype[k] = '\0'; }
+	return body;
+}
+
+/* --- iframe fetching + embedding policy ------------------------------------ *
+ * Whether a framed document may be displayed is the framed document's own call,
+ * expressed by X-Frame-Options or the CSP `frame-ancestors` directive; the
+ * embedder (the page, or an outer frame) is matched against it by origin. */
+
+/* Two URLs share an origin when scheme (tls), host and port all match. */
+static int origin_eq(const char *a, const char *b)
+{
+	struct purl ua, ub;
+	if (!parse_url(a, &ua) || !parse_url(b, &ub)) return 0;
+	return ua.tls == ub.tls && ua.port == ub.port && streq_ci(ua.host, ub.host);
+}
+
+static int contains_seq(const char *hay, const char *needle)
+{
+	for (; *hay; hay++) if (starts_ci(hay, needle)) return 1;
+	return 0;
+}
+
+/* The value of CSP directive `name` (case-insensitive, at a ';'/start boundary),
+ * or NULL. Returns a pointer into `csp` past the name + any spaces. */
+static const char *csp_directive(const char *csp, const char *name)
+{
+	if (!csp) return 0;
+	int nl = (int)strlen(name);
+	for (const char *p = csp; *p; p++) {
+		if (p != csp && p[-1] != ';' && p[-1] != ' ') continue;
+		if (!starts_ci(p, name)) continue;
+		const char *q = p + nl;
+		if (*q != ' ' && *q != ';' && *q != '\0') continue;        /* whole token */
+		while (*q == ' ') q++;
+		return q;
+	}
+	return 0;
+}
+
+/* Does one frame-ancestors source token [tok,tend) admit the embedder `parent`
+ * (`framed` is the framed doc's own URL, used by 'self')? Handles 'self', '*', a
+ * scheme://host[:port] origin, a "*.suffix" host, and a bare host. */
+static int csp_src_admits(const char *tok, const char *tend, const char *parent, const char *framed)
+{
+	int n = (int)(tend - tok);
+	if (n == 6 && starts_ci(tok, "'self'")) return origin_eq(parent, framed);
+	if (n == 1 && tok[0] == '*') return 1;
+
+	char s[256]; int k = 0;
+	for (; k < n && k < (int)sizeof s - 1; k++) s[k] = tok[k];
+	s[k] = '\0';
+	struct purl pp;
+	if (!parse_url(parent, &pp)) return 0;
+	if (contains_seq(s, "://")) return origin_eq(parent, s);   /* full origin */
+	if (s[0] == '*' && s[1] == '.') {                          /* host suffix */
+		const char *suf = s + 1;
+		int hl = (int)strlen(pp.host), sl = (int)strlen(suf);
+		return hl >= sl && streq_ci(pp.host + (hl - sl), suf);
+	}
+	return streq_ci(pp.host, s);                               /* bare host */
+}
+
+/* Decide whether `framed` may be embedded by `parent` given its X-Frame-Options
+ * and Content-Security-Policy. frame-ancestors, when present, supersedes XFO. A
+ * short human reason is written to `reason` when embedding is refused. */
+static int frame_embedding_allowed(const char *parent, const char *framed,
+                                   const char *xfo, const char *csp, char *reason, int rcap)
+{
+	if (reason && rcap) reason[0] = '\0';
+
+	const char *fa = csp_directive(csp, "frame-ancestors");
+	if (fa) {
+		const char *p = fa;
+		int any = 0, ok = 0;
+		while (*p && *p != ';') {
+			while (*p == ' ') p++;
+			const char *t = p;
+			while (*p && *p != ' ' && *p != ';') p++;
+			if (p == t) break;
+			any = 1;
+			if ((p - t) == 6 && starts_ci(t, "'none'")) {
+				if (reason && rcap) { int k = 0; sapp(reason, &k, rcap, "CSP frame-ancestors 'none'"); }
+				return 0;
+			}
+			if (csp_src_admits(t, p, parent, framed)) ok = 1;
+		}
+		if (!any || ok) return 1;
+		if (reason && rcap) { int k = 0; sapp(reason, &k, rcap, "CSP frame-ancestors"); }
+		return 0;
+	}
+
+	if (xfo && xfo[0]) {
+		const char *v = xfo; while (*v == ' ') v++;
+		if (starts_ci(v, "deny")) {
+			if (reason && rcap) { int k = 0; sapp(reason, &k, rcap, "X-Frame-Options: DENY"); }
+			return 0;
+		}
+		if (starts_ci(v, "sameorigin")) {
+			if (origin_eq(parent, framed)) return 1;
+			if (reason && rcap) { int k = 0; sapp(reason, &k, rcap, "X-Frame-Options: SAMEORIGIN"); }
+			return 0;
+		}
+		if (starts_ci(v, "allow-from")) {
+			const char *u = v + 10; while (*u == ' ' || *u == '=') u++;
+			char uri[URL_MAX]; int k = 0;
+			for (; u[k] && u[k] != ' ' && u[k] != ';' && k < (int)sizeof uri - 1; k++) uri[k] = u[k];
+			uri[k] = '\0';
+			if (uri[0] && origin_eq(parent, uri)) return 1;
+			if (reason && rcap) { int kk = 0; sapp(reason, &kk, rcap, "X-Frame-Options: ALLOW-FROM"); }
+			return 0;
+		}
+		/* Unknown / malformed value: browsers ignore it, so do we. */
+	}
+	return 1;
+}
+
+/* Decode a data: URL into a fresh buffer (caller frees) + its media type, so a
+ * `data:` iframe needs no network. base64 and percent-encoded bodies both work. */
+static int rhex(int c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+static int rb64(int c)
+{
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return -1;
+}
+static unsigned char *decode_data_url(const char *url, int *outlen, char *ctype, int cap)
+{
+	const char *p = url + 5;                          /* past "data:" */
+	const char *comma = p;
+	while (*comma && *comma != ',') comma++;
+	if (*comma != ',') return 0;
+
+	char mt[80]; int mi = 0, base64 = 0;
+	const char *h = p;
+	while (h < comma && *h != ';') { if (mi < (int)sizeof mt - 1) mt[mi++] = lower(*h); h++; }
+	mt[mi] = '\0';
+	while (h < comma) {
+		h++;
+		const char *tok = h;
+		while (h < comma && *h != ';') h++;
+		if (h - tok == 6 && starts_ci(tok, "base64")) base64 = 1;
+	}
+	{ int k = 0; ctype[0] = '\0'; sapp(ctype, &k, cap, mt[0] ? mt : "text/plain"); }
+
+	const char *d = comma + 1;
+	int cap2 = 4096, len = 0;
+	unsigned char *out = malloc((unsigned)cap2);
+	if (!out) return 0;
+	if (base64) {
+		int acc = 0, nb = 0;
+		for (; *d && *d != '='; d++) {
+			int v = rb64((unsigned char)*d);
+			if (v < 0) continue;
+			acc = (acc << 6) | v; nb += 6;
+			if (nb >= 8) { nb -= 8; if (body_put(&out, &cap2, &len, (acc >> nb) & 0xff) < 0) break; }
+		}
+	} else {
+		for (; *d; d++) {
+			int c = (unsigned char)*d;
+			if (c == '%') {
+				int hi = rhex((unsigned char)d[1]);
+				int lo = hi < 0 ? -1 : rhex((unsigned char)d[2]);
+				if (lo >= 0) { c = hi * 16 + lo; d += 2; }
+			}
+			if (body_put(&out, &cap2, &len, c) < 0) break;
+		}
+	}
+	*outlen = len;
+	return out;
+}
+
+/* Drain the page's pending iframes: fetch each (data: inline, else GET), apply
+ * the X-Frame-Options / CSP frame-ancestors policy against its embedder, and hand
+ * the result back to the cache (html.c re-flattens the page to show it). Runs on
+ * the worker thread, one frame at a time; nested frames surface on the next pass. */
+void fetch_iframes(void)
+{
+	char url[URL_MAX], parent[URL_MAX];
+	while (html_iframe_next_pending(url, sizeof url, parent, sizeof parent)) {
+		if (starts_ci(url, "data:")) {
+			char ctype[160]; int len = 0;
+			unsigned char *body = decode_data_url(url, &len, ctype, sizeof ctype);
+			if (body) { html_iframe_resolve(url, parent, FRAME_OK, "", body, len, ctype); free(body); }
+			else        html_iframe_resolve(url, parent, FRAME_ERROR, "bad data: URL", 0, 0, 0);
+			continue;
+		}
+		if (!starts_ci(url, "http://") && !starts_ci(url, "https://")) {
+			html_iframe_resolve(url, parent, FRAME_ERROR, "unsupported scheme", 0, 0, 0);
+			continue;
+		}
+
+		struct resp_meta meta; char final[URL_MAX]; char hdr[4096]; int len = 0;
+		unsigned char *body = fetch_loop(url, "GET", 0, 0, 0, "text/html,*/*",
+		                                 &meta, final, sizeof final, hdr, sizeof hdr, &len);
+		if (!body) { html_iframe_resolve(url, parent, FRAME_ERROR, "no response", 0, 0, 0); continue; }
+		if (meta.status < 200 || meta.status >= 300) {
+			char r[40]; int k = 0; sapp(r, &k, sizeof r, "HTTP "); uapp(r, &k, sizeof r, (unsigned)meta.status);
+			html_iframe_resolve(url, parent, FRAME_ERROR, r, 0, 0, 0);
+			free(body); continue;
+		}
+
+		struct http_headers H; http_headers_parse(&H, hdr);
+		const char *xfo = http_headers_get(&H, "x-frame-options");
+		const char *csp = http_headers_get(&H, "content-security-policy");
+		char reason[96];
+		int ok = frame_embedding_allowed(parent, final[0] ? final : url, xfo, csp, reason, sizeof reason);
+		http_headers_free(&H);
+
+		html_iframe_resolve(url, parent, ok ? FRAME_OK : FRAME_BLOCKED, reason, body, len, meta.ctype);
+		free(body);
+	}
 }
 
 /* Normalise a URL's origin (HSTS-upgrades http->https) into *u; returns 0 on a
@@ -213,14 +530,21 @@ static int origin_of(const char *url, struct purl *u)
  * (h1.1 fallback per failed stream / no-h2 origin); plain-http URLs go over
  * HTTP/1.1 one at a time. Single-threaded — the h2 engine's state is global — so
  * it suits a small set of already-sequential sub-resources (stylesheets). */
-#define SUBRES_BATCH_MAX 64
 void subres_get_batch(char *const *urls, int n, const char *accept,
                       unsigned char **bodies, int *lens)
 {
+	if (n <= 0) return;
 	for (int i = 0; i < n; i++) { bodies[i] = 0; lens[i] = 0; }
-	if (n > SUBRES_BATCH_MAX) n = SUBRES_BATCH_MAX;
-	char handled[SUBRES_BATCH_MAX];
-	for (int i = 0; i < n; i++) handled[i] = 0;
+
+	/* `handled` tracks which URLs a same-origin h2 batch already pulled. Sized to
+	 * n (no fixed cap): a page may reference any number of sub-resources. Each h2
+	 * round still gathers at most H2_FETCH_MAX same-origin streams per connection
+	 * and opens another connection for the rest, so this stays unbounded. */
+	char *handled = calloc((unsigned)n, 1);
+	if (!handled) {                          /* OOM: degrade to one fetch at a time */
+		for (int i = 0; i < n; i++) bodies[i] = subres_get(urls[i], accept, &lens[i]);
+		return;
+	}
 
 	for (int i = 0; i < n; i++) {
 		if (handled[i]) continue;
@@ -264,8 +588,10 @@ void subres_get_batch(char *const *urls, int n, const char *accept,
 			h2_fetch_many(sock, 1, auth, &o, reqs, nb, 0, 0);   /* accumulate */
 			net_close(sock);
 			for (int b = 0; b < nb; b++) {
-				if (!reqs[b].failed && reqs[b].body) { bodies[bi[b]] = reqs[b].body; lens[bi[b]] = reqs[b].blen; }
-				else { if (reqs[b].body) free(reqs[b].body);   /* h1.1 retry */
+				if (!reqs[b].failed && reqs[b].body) {
+					bodies[bi[b]] = reqs[b].body; lens[bi[b]] = reqs[b].blen;
+					devtools_net_add("GET", urls[bi[b]], reqs[b].status, "", reqs[b].blen);
+				} else { if (reqs[b].body) free(reqs[b].body);   /* h1.1 retry (logs itself) */
 				       bodies[bi[b]] = subres_get(urls[bi[b]], accept, &lens[bi[b]]); }
 			}
 		} else {
@@ -275,6 +601,7 @@ void subres_get_batch(char *const *urls, int n, const char *accept,
 		}
 		free(paths);
 	}
+	free(handled);
 }
 
 /* Batch hook for html.c's external stylesheets. */
@@ -403,9 +730,14 @@ struct h2img_ctx { const int *idxs; };
 static void h2img_commit(void *ctx, int b, const unsigned char *body, int blen)
 {
 	const struct h2img_ctx *c = ctx;
+	char full[URL_MAX];
 	if (c->idxs[b] == FAV_IDX) {
+		resolve_url(g_img_page, B->favicon_href[0] ? B->favicon_href : "/favicon.ico", full, sizeof full);
+		devtools_net_add("GET", full, 200, "", blen);
 		if (favicon_decode(body, blen)) { B->favicon_ok = 1; B->seq++; }
 	} else {
+		resolve_url(g_img_page, B->imgs[c->idxs[b]].href, full, sizeof full);
+		devtools_net_add("GET", full, 200, "image/*", blen);
 		commit_image(c->idxs[b], body, blen);
 	}
 }

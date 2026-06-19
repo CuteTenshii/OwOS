@@ -67,6 +67,22 @@ void rtc_now(struct rtc_time *t)
 	t->year = (uint16_t)(2000 + year);
 }
 
+/* Unix epoch seconds (UTC) from the CMOS clock — the basis for JS Date. Assumes
+ * the RTC holds UTC (the ntp service sets it so). Civil-to-days is the standard
+ * leap-aware form; fits unsigned 32-bit through 2106. */
+unsigned rtc_epoch(void)
+{
+	struct rtc_time t;
+	rtc_now(&t);
+	int y = t.year, m = t.month, d = t.day;
+	static const int mdays[12] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+	long days = (long)(y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
+	days += mdays[(m >= 1 && m <= 12) ? m - 1 : 0];
+	if (m > 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) days += 1;
+	days += d - 1;
+	return (unsigned)(days * 86400L + (long)t.hour * 3600 + (long)t.min * 60 + t.sec);
+}
+
 /* Write the wall clock back to CMOS, honouring whatever format the RTC is in
  * (BCD vs binary, 12- vs 24-hour) so rtc_now reads it back unchanged. Like
  * rtc_now, only the 2-digit year register is touched (the century register is

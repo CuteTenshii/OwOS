@@ -24,6 +24,7 @@
 #include "url.h"     /* struct purl, parse_url, resolve_url (shared with curl) */
 #include "h2.h"      /* HTTP/2 engine: h2_run + struct h2_opts (TLS+ALPN path) */
 #include "dom.h"     /* DOM tree + the shared lower/starts_ci/streq_ci helpers  */
+#include "csp.h"     /* Content-Security-Policy engine (per-page enforcement)   */
 
 extern int BW, BH;         /* client size (mutable: the window is resizable)    */
 #define MENU_H    18       /* top app-menu bar height (above the address bar)  */
@@ -51,7 +52,7 @@ extern int BW, BH;         /* client size (mutable: the window is resizable)    
 /* Per-fetch sanity cap on ONE inline image's body (fetch.c's image fetchers
  * malloc a doubling buffer up to this). The page body itself is unbounded (it
  * grows B->raw); this only stops a single runaway sub-resource. */
-#define RAW_MAX    (8 * 1024 * 1024)
+#define RAW_MAX    (32 * 1024 * 1024)   /* a big page decompresses to several MB */
 /* The address-bar/URL buffer size. Unlike the cookie and HSTS jars (now uncapped
  * heap lists), URLs flow through two SHARED, buffer-based APIs — the gfx
  * textfield widget (the address bar, edited in place) and resolve_url(base, rel,
@@ -127,6 +128,10 @@ struct browser {
 	char     req_url[URL_MAX];
 	int      req_pending;
 	int      loading;
+	volatile int abort_load;     /* main -> worker: cancel the in-flight fetch
+	                              * (Stop button / Page>Stop / closing the tab). The
+	                              * body readers poll it and bail; cleared when the
+	                              * worker picks up the next navigation.            */
 
 	char     doc_title[128];
 	char     ctype[80];              /* lowercased response Content-Type      */
@@ -179,18 +184,51 @@ struct browser {
 	int      sb_drag;
 	unsigned seq;
 
+	/* A content-pane interaction the main thread hands to the worker to dispatch
+	 * through the live JS DOM (the engine is single-threaded, worker-owned). The
+	 * main thread fills these + sets evt_pending; the worker resolves the node,
+	 * runs listeners, relays out, and navigates if the default wasn't prevented. */
+	volatile int evt_pending;        /* 1 = an event is queued for the worker      */
+	int      evt_off;                /* text offset the click resolved to          */
+	int      evt_x, evt_y;           /* viewport-relative coords (event.clientX/Y)  */
+	char     evt_type[16];           /* "click", "input", "change", ...            */
+	char     evt_text[URL_MAX];      /* payload: the link href for click default,
+	                                  * or the new field value for input/change    */
+	volatile int drop_dom;           /* main asks the worker to free the live page  */
+	volatile int recascade;          /* main asks the worker to re-run the cascade
+	                                  * (window resized → @media may change)        */
+	volatile int events_live;        /* worker -> main: page has listeners, so the
+	                                  * main thread should route clicks as events   */
+	volatile int focus_kind;         /* worker -> main: 0 none, 1 text input,
+	                                  * 2 textarea — so the main thread routes keys
+	                                  * to the focused control instead of the addr bar */
+
+	/* the History API, wired to the real per-tab back/forward history. JS runs on
+	 * the worker; these let it drive the main thread's history (which owns the
+	 * tabs[] hist list + the nav buttons). */
+	volatile int hist_go;            /* worker -> main: -1 back, +1 forward, 0 none */
+	volatile int hist_nav;           /* worker -> main: a pushState/replaceState URL */
+	int      hist_replace;           /* the queued hist_nav replaces, not pushes     */
+	char     hist_url[URL_MAX];      /* its URL                                      */
+	int      hist_len;               /* main -> worker: history.length               */
+	volatile int loc_nav;            /* worker -> main: location.assign/replace/reload */
+	char     loc_url[URL_MAX];       /* its target URL                               */
+
 	int      win_id;                 /* the window handle (for title updates) */
 
 	struct cookie *cookies;          /* head of the heap cookie jar (no cap)   */
 	struct hsts_host *hsts;          /* head of the HSTS host list (no cap)    */
 	struct css_link *ext_css;        /* stylesheet URLs from the Link: header   */
+	struct csp     *csp;             /* the page's Content-Security-Policy set   */
 
 	/* @font-face faces loaded for this page (each: family name, the parsed font,
 	 * and the owned font-file bytes the parser points into). body_font is the
 	 * face the page's body text uses, or NULL to fall back to the baked UI font.
-	 * Reset each navigation. struct font is from user/lib/font. */
-	struct loaded_face { char family[48]; struct font *font; unsigned char *data; } faces[4];
-	int          n_faces;
+	 * The array grows on demand (a page may need any number of faces); capacity
+	 * persists across navigations, n_faces resets each load. render() reads only
+	 * body_font, never the array. struct font is from user/lib/font. */
+	struct loaded_face { char family[48]; struct font *font; unsigned char *data; } *faces;
+	int          n_faces, faces_cap;
 	struct font *body_font;
 
 	int           sock;
@@ -244,6 +282,53 @@ void blk_unlock(void);
  * rel=stylesheet> + Link-header sheets so the CSS is complete before layout. */
 void html_to_text(const char *page_url, res_batch_fn fetch);
 void html_set_charset(const char *content_type);          /* charset from HTTP CT */
+
+/* js.c: run every inline <script> in `root` (document order) against a fresh JS
+ * engine context, with minimal document/window DOM bindings. Called by
+ * html_to_text after the DOM is parsed and before it is walked, so any DOM the
+ * scripts mutate is reflected in the rendered page. */
+void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn fetch);
+/* js.c lifetime + DOM-event API (the JS context now lives for the whole page). */
+void js_page_end(void);                                    /* reclaim the page ctx  */
+int  js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int y);
+int  js_has_listeners(void);                               /* any listener registered */
+int  js_timers_pump(void);     /* fire due setTimeout/Interval/rAF; -> # callbacks fired */
+int  js_websockets_pump(void); /* drain live WebSockets -> open/message/close/error events */
+
+/* html.c: tear down the live DOM + CSS sheet + JS context of the current page
+ * (called on every page replacement), re-flatten the live DOM into B's buffers
+ * after a script mutates it, and map a text offset back to its deepest DOM node. */
+void html_page_teardown(void);
+void html_relayout(void);
+struct dom_node *html_node_at_offset(int off);
+/* Inverse: the [start,end) text range a node covers, 0 if it was never laid out.
+ * Backs the DOM geometry APIs (js.c) via browser_range_box. Worker-thread-only. */
+int  html_node_span(struct dom_node *node, int *start, int *end);
+
+/* Approximate element box geometry for the DOM geometry APIs (js.c). The line-flow
+ * renderer has no per-element layout, so a box is reconstructed from the wrapped
+ * line table; browser_range_box returns a document-relative px box (0 if the range
+ * renders to nothing). Takes blk_lock internally, so it is worker-thread-safe. */
+int  browser_range_box(int start, int end, int *x, int *y, int *w, int *h);
+int  browser_scroll_px(void);                /* page vertical scroll, px (window.scrollY) */
+void browser_viewport_px(int *w, int *h);    /* content viewport size (innerWidth/Height) */
+
+/* Form controls. html_control_kind classifies a node; the worker walks up from a
+ * clicked node to the nearest control and performs its default action. The focused
+ * text control (set by the worker) is where the renderer draws a caret. */
+enum ctrl_kind { CTRL_NONE, CTRL_TEXT, CTRL_TEXTAREA, CTRL_CHECKBOX, CTRL_RADIO,
+                 CTRL_SELECT, CTRL_SUBMIT, CTRL_BUTTON };
+int  html_control_kind(struct dom_node *node);
+void html_set_focus(struct dom_node *node);     /* NULL clears focus */
+struct dom_node *html_focus(void);
+int  html_has_controls(void);                   /* page has form controls to click */
+void html_toggle_checked(struct dom_node *c);
+void html_radio_select(struct dom_node *c);
+void html_select_cycle(struct dom_node *sel);
+void html_seed_textarea(struct dom_node *ta);
+struct dom_node *html_focus_edit(int ch);       /* edit focused field; returns it */
+int  html_form_submit_url(struct dom_node *control, char *out, int cap);
+
 void plain_to_text(void);                                  /* html.c */
 void doc_message(const char *m);
 void show_error(const char *m);                            /* fetch.c */
@@ -261,7 +346,75 @@ int  cookie_header(const char *host, char *out, int cap);  /* "a=b; c=d" -> len 
 void hsts_add(const char *host);
 int  hsts_has(const char *host);
 
+/* --- devtools.c: an in-window developer-tools panel (F12 / Ctrl+Shift+I) ----
+ * A bottom-docked overlay with three views: an Elements (DOM tree) view, a
+ * Styles (computed CSS for the selected node) view, and a Console capturing the
+ * page's console.* output and JS errors. The DOM/CSS snapshots are built on the
+ * worker thread (which owns the live DOM's lifetime) by devtools_worker_tick();
+ * the console buffer is appended from the worker (js.c) and read by the main
+ * thread's render — a small spinlock guards both against the render thread. */
+enum { DT_LOG, DT_WARN, DT_ERROR };
+void devtools_toggle(void);
+int  devtools_visible(void);
+int  devtools_top(void);          /* panel's top y (main thread); BH if hidden  */
+void devtools_render(void);       /* main thread: draw the panel                */
+int  devtools_handle_click(int mx, int my);  /* 1 = consumed                    */
+int  devtools_handle_scroll(int delta);      /* 1 = consumed                    */
+void devtools_console_append(int level, const char *s, int len);  /* worker     */
+void devtools_worker_tick(void);  /* worker: rebuild DOM/Styles snapshot if open */
+/* Network tab: each HTTP response the page made (logged from the fetch paths),
+ * reset on each top-level navigation. Worker/image-thread callers. */
+void devtools_net_add(const char *method, const char *url, int status,
+                      const char *ctype, int size);
+void devtools_net_reset(void);
+
+/* Per-tab devtools view state: which panel is open and where each is scrolled, so
+ * every browser tab keeps its own devtools. The captured content (DOM/console/
+ * network) follows the live page, so it is dropped when a tab is revealed. */
+#define DT_PANELS 4
+struct dt_view { int open; int tab; int scroll[DT_PANELS]; };
+void devtools_view_save(struct dt_view *v);        /* active view  -> v             */
+void devtools_view_load(const struct dt_view *v);  /* v -> active view, drop capture */
+
+/* html.c hooks the devtools snapshot uses (worker-thread callers only). */
+struct css_style;
+struct css_match;
+struct dom_node *html_dom_root(void);
+void html_compute_style(struct dom_node *el, struct css_style *out);
+int  html_match_styles(struct dom_node *el, struct css_match *out, int cap);
+
 void do_fetch(void);
+/* The JS fetch() transport (resource.c): one HTTP request, returns the body
+ * (caller frees) for any status with *status + *out_ctype filled, NULL on a
+ * connection error. Worker-thread only. */
+unsigned char *browser_fetch_url(const char *url, const char *method,
+                                 const unsigned char *reqbody, int reqlen, const char *req_ctype,
+                                 const char *accept, int *status, char *out_ctype, int oc_cap, int *outlen);
+void fetch_inline_images(const char *page_url);  /* re-pull inline <img> after relayout */
 int  fetch_lazy_visible(void);   /* worker: load one in-view loading=lazy <img> */
+
+/* --- iframes -------------------------------------------------------------- *
+ * A nested browsing context is rendered as an indented, bordered sub-flow of the
+ * parent document. html.c finds <iframe> elements during the walk and keeps a
+ * per-page cache of each frame's fetched, parsed sub-document keyed by its src
+ * URL; resource.c does the actual fetch and decides — from the framed response's
+ * X-Frame-Options / Content-Security-Policy `frame-ancestors` — whether the
+ * document may be embedded at all. A frame that isn't yet fetched shows a
+ * placeholder; the worker thread drains the pending set (fetch_iframes) and
+ * re-flattens the page so the allowed ones appear. The iframe's `sandbox`
+ * attribute gates whether links inside the frame may navigate; `allow`
+ * (Permissions Policy) is parsed and surfaced in the frame chrome. */
+enum { FRAME_OK = 1, FRAME_BLOCKED = 2, FRAME_ERROR = 3 };  /* embedding verdict */
+int  html_iframes_pending(void);     /* worker: any frame still needs fetching?  */
+/* worker: copy the next unfetched frame's absolute src + its embedder URL out;
+ * returns 1 when one was found, 0 when none remain. */
+int  html_iframe_next_pending(char *url, int url_cap, char *parent, int parent_cap);
+/* worker: hand a fetched frame's result back to the cache. `verdict` is one of
+ * FRAME_*; `reason` is shown when the frame is blocked/failed; an FRAME_OK HTML
+ * body is parsed into the frame's live sub-document. */
+void html_iframe_resolve(const char *url, const char *parent, int verdict,
+                         const char *reason, const unsigned char *body, int len,
+                         const char *ctype);
+void fetch_iframes(void);            /* resource.c: drain + fetch the pending set */
 
 #endif /* OWOS_BROWSER_H */
