@@ -60,6 +60,9 @@ cat -v /tmp/s.log
 - `sendkey` quirks (else fake "bugs"): letters are lowercase key names
   (`sendkey a`), a capital is `shift-a`, `.` is `dot`, space is `spc`, `|` is
   `shift-backslash`. Always send those by name.
+- **macOS:** `timeout` is GNU-only — use `gtimeout` (`brew install coreutils`), or
+  run QEMU in the background and `kill` it after a `sleep`. The build needs the
+  `i686-elf-` cross-toolchain (the Makefile auto-selects it on Darwin); see README.
 - A reboot loop is a triple fault: rerun with `-no-reboot -d int,cpu_reset`.
 - On a fault, idt.c panics (vector, error code, EIP, CR2 for #PF) to COM1 and as
   a heapless framebuffer screen; the error-code present/write/**user** bits say

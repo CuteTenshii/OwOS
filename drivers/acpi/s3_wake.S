@@ -26,6 +26,7 @@
  * DS = 0 (absolute low addressing), never via %cs (whose value depends on how
  * the firmware forms the real-mode CS:IP from the vector). */
 
+#ifndef __x86_64__
 	.set TRAMP, 0x8000          /* physical load address of the trampoline */
 
 /* ---- saved CPU state -----------------------------------------------------
@@ -209,3 +210,50 @@ tramp_gdtr:
 	.word (tramp_gdtr - tramp_gdt - 1)
 	.long (TRAMP + (tramp_gdt - s3_trampoline_start))
 s3_trampoline_end:
+
+#else
+/* ---- x86_64: S3 suspend write only ---------------------------------------
+ * S3 (suspend-to-RAM) is real-hardware-only, and resuming on x86_64 means the
+ * firmware re-enters in real mode and we would have to rebuild long mode from a
+ * relocated trampoline — out of scope here. s3_enter still issues the actual
+ * sleep command (plain port writes, so QEMU/chipsets that honor S3 do power
+ * down), but the register-save/resume path is omitted; the symbols below exist
+ * only so power.c links. Resume is not supported in this build. */
+	.text
+	.code64
+	.global s3_enter
+/* void s3_enter(uint32_t pm1a_port, uint32_t pm1b_port,
+ *               uint32_t slp_a_value, uint32_t slp_b_value)  — SysV: rdi,rsi,rdx,rcx */
+s3_enter:
+	cli
+	mov %edx, %eax               /* slp_a_value */
+	mov %edi, %edx               /* pm1a_port   */
+	out %ax, %dx
+	test %esi, %esi              /* pm1b_port (0 if none) */
+	jz 1f
+	mov %ecx, %eax               /* slp_b_value */
+	mov %esi, %edx               /* pm1b_port   */
+	out %ax, %dx
+1:	mov $300, %ecx               /* bounded idle if S3 didn't engage */
+2:	sti
+	hlt
+	cli
+	dec %ecx
+	jnz 2b
+	sti                          /* restore IF before returning (see CLAUDE.md) */
+	ret
+	.size s3_enter, . - s3_enter
+
+	.global s3_resume_pm
+s3_resume_pm:                        /* resume unsupported on x86_64 */
+	hlt
+	jmp s3_resume_pm
+
+	.code16
+	.global s3_trampoline_start
+	.global s3_trampoline_end
+s3_trampoline_start:
+	cli
+	hlt
+s3_trampoline_end:
+#endif

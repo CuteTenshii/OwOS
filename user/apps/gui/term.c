@@ -358,7 +358,15 @@ static void bi_uptime(void)
 static void bi_uname(int argc, char **argv)
 {
 	int all = argc > 1 && !strcmp(argv[1], "-a");
-	if (all) tputs("OwOS owos " OWOS_VERSION " i386\n");
+	if (all) {
+		/* Machine arch from the kernel (/proc/arch); the shell is 32-bit ELF and
+		 * can't infer the kernel's arch from its own build. */
+		char a[16];
+		int n = readfile("/proc/arch", a, sizeof a - 1);
+		if (n > 0) { while (n && (a[n-1]=='\n' || a[n-1]=='\r' || a[n-1]==' ')) n--; a[n] = '\0'; }
+		else { a[0]='i'; a[1]='3'; a[2]='8'; a[3]='6'; a[4]='\0'; }
+		tputs("OwOS owos " OWOS_VERSION " "); tputs(a); tputs("\n");
+	}
 	else     tputs("OwOS\n");
 }
 

@@ -43,6 +43,56 @@ lapic_timer_isr:
 	jmp irq_common_stub
 
 .extern irq_handler
+#ifdef __x86_64__
+/* 64-bit IRQ landing pad — mirrors isr.S's 64-bit common stub but calls
+ * irq_handler. See idt.h for the struct registers layout the push order builds. */
+.type irq_common_stub, @function
+irq_common_stub:
+	push %rax
+	push %rcx
+	push %rdx
+	push %rbx
+	lea  32(%rsp), %rax
+	push %rax
+	push %rbp
+	push %rsi
+	push %rdi
+	push %r8
+	push %r9
+	push %r10
+	push %r11
+	push %r12
+	push %r13
+	push %r14
+	push %r15
+	xor  %rax, %rax
+	mov  %ds, %ax
+	push %rax
+
+	mov  %rsp, %rdi                /* arg: pointer to struct registers        */
+	call irq_handler
+
+	add  $8, %rsp                  /* drop ds                                 */
+	pop  %r15
+	pop  %r14
+	pop  %r13
+	pop  %r12
+	pop  %r11
+	pop  %r10
+	pop  %r9
+	pop  %r8
+	pop  %rdi
+	pop  %rsi
+	pop  %rbp
+	add  $8, %rsp                  /* drop the esp slot                       */
+	pop  %rbx
+	pop  %rdx
+	pop  %rcx
+	pop  %rax
+	add  $16, %rsp                 /* drop int_no and err_code                */
+	iretq
+.size irq_common_stub, . - irq_common_stub
+#else
 .type irq_common_stub, @function
 irq_common_stub:
 	pusha
@@ -70,3 +120,4 @@ irq_common_stub:
 	add $8, %esp                   /* drop int_no and err_code                */
 	iret
 .size irq_common_stub, . - irq_common_stub
+#endif

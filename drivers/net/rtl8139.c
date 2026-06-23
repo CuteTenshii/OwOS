@@ -20,18 +20,8 @@
 
 /* ------------------------------------------------------------------ helpers */
 
-/* Save EFLAGS and clear IF; restore only re-enables if it was on. */
-static inline uint32_t irq_save(void)
-{
-	uint32_t f;
-	__asm__ volatile ("pushf\n\tpop %0\n\tcli" : "=r"(f) :: "memory");
-	return f;
-}
-static inline void irq_restore(uint32_t f)
-{
-	if (f & 0x200)
-		__asm__ volatile ("sti" ::: "memory");
-}
+/* irq_save / irq_restore: snapshot EFLAGS + cli, restore the prior IF. */
+#include "irqflags.h"
 
 static void print_hex2(uint8_t v)
 {

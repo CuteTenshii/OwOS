@@ -19,6 +19,15 @@ NIC ?= rtl8139
 # behaviour.
 SMP ?= 4
 
+# QEMU host audio backend. Differs by OS: PipeWire on Linux, CoreAudio on macOS
+# (QEMU has no pipewire backend there — `qemu-system-i386 -audiodev help`). Override
+# with e.g. `make run QEMU_AUDIODEV=pa` (PulseAudio) or `none` to mute.
+ifeq ($(shell uname -s),Darwin)
+  QEMU_AUDIODEV ?= coreaudio
+else
+  QEMU_AUDIODEV ?= pipewire
+endif
+
 # A 64 MiB raw disk image for the filesystem; persists across reboots. owofs
 # sizes itself to the disk's capacity (capped at 64 MiB in fs.c).
 $(DISK):
@@ -96,17 +105,29 @@ STORAGE := -hda $(DISK) \
 	-device sd-card,drive=sddisk \
 	-cdrom $(CDISK)
 
-run: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
-	qemu-system-i386 -kernel $(KERNEL) -smp $(SMP) -m 1024 $(STORAGE) -serial stdio \
+# How the kernel image is handed to QEMU. The built-in `-kernel` multiboot loader
+# only loads 32-bit ELF ("Cannot load x86-64 image, give a 32bit one"), so the
+# 64-bit kernel is booted through GRUB on the ISO instead (multiboot2 loads
+# ELF64). The ISO carries only the kernel; disk.img etc. still attach as devices.
+ifeq ($(ARCH),x86_64)
+  BOOTARG := -cdrom $(ISO)
+  BOOTDEP := $(ISO)
+else
+  BOOTARG := -kernel $(KERNEL)
+  BOOTDEP := $(KERNEL)
+endif
+
+run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
+	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22 -device $(NIC),netdev=net0 \
-		-audiodev pipewire,id=snd0 -machine pcspk-audiodev=snd0 \
+		-audiodev $(QEMU_AUDIODEV),id=snd0 -machine pcspk-audiodev=snd0 \
 		-device sb16,audiodev=snd0 \
 		-device intel-hda -device hda-output,audiodev=snd0 \
 		-usb -device usb-tablet
 
 # Headless: no window, console comes out on the terminal via COM1.
-debug: $(KERNEL) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
-	qemu-system-i386 -kernel $(KERNEL) -smp $(SMP) -m 1024 -display none $(STORAGE) -serial stdio \
+debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
+	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 -display none $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22 -device $(NIC),netdev=net0 \
 		-usb -device usb-tablet
 
@@ -143,14 +164,22 @@ iso: $(ISO)
 # -kernel and no -hda, so missing-disk paths surface here and not in VMware.
 # This exercises the legacy-BIOS (SeaBIOS) boot path.
 run-iso: $(ISO)
-	qemu-system-i386 -cdrom $(ISO) -serial stdio
+	$(QEMU) -cdrom $(ISO) -serial stdio
 
 # Boot the SAME ISO through UEFI (OVMF firmware) to prove the hybrid image's
 # UEFI entry works — this is the path a modern VM/laptop firmware takes. OVMF is
 # 64-bit; the EFI GRUB it launches still loads our 32-bit multiboot kernel.
-# Override OVMF_CODE=/path if your distro puts the firmware elsewhere.
-OVMF_CODE ?= /usr/share/edk2/x64/OVMF_CODE.4m.fd
-OVMF_VARS ?= /usr/share/edk2/x64/OVMF_VARS.4m.fd
+# Override OVMF_CODE=/path if your distro puts the firmware elsewhere. Homebrew's
+# qemu ships it under $(brew --prefix qemu)/share/qemu on macOS; most Linux distros
+# put it in /usr/share/edk2 or /usr/share/OVMF.
+ifeq ($(shell uname -s),Darwin)
+  QEMU_SHARE := $(shell brew --prefix qemu 2>/dev/null)/share/qemu
+  OVMF_CODE ?= $(QEMU_SHARE)/edk2-x86_64-code.fd
+  OVMF_VARS ?= $(QEMU_SHARE)/edk2-i386-vars.fd
+else
+  OVMF_CODE ?= /usr/share/edk2/x64/OVMF_CODE.4m.fd
+  OVMF_VARS ?= /usr/share/edk2/x64/OVMF_VARS.4m.fd
+endif
 run-iso-uefi: $(ISO)
 	cp $(OVMF_VARS) /tmp/owos_ovmf_vars.fd
 	qemu-system-x86_64 \
@@ -166,6 +195,7 @@ run-iso-uefi: $(ISO)
 #   make usb USB=/dev/sdc
 USB ?=
 usb: $(ISO)
+	@test "$$(uname -s)" = "Linux" || { echo "refusing: 'make usb' uses Linux /sys/block to verify the target is removable; on macOS flash owos.iso manually with 'diskutil list' to find the disk, 'diskutil unmountDisk /dev/diskN', then 'sudo dd if=$(ISO) of=/dev/rdiskN bs=4m'"; exit 1; }
 	@test -n "$(USB)" || { echo "refusing: name the target, e.g. make usb USB=/dev/sdc"; exit 1; }
 	@test -b "$(USB)" || { echo "refusing: $(USB) is not a block device"; exit 1; }
 	@dev=$$(basename $(USB)); \

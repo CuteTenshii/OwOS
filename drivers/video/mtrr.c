@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include "mtrr.h"
 #include "serial.h"
+#include "irqflags.h"
 
 /* MSR addresses (SDM Vol 4). */
 #define IA32_MTRRCAP        0x0FE
@@ -57,17 +58,17 @@ static inline void wrmsr(uint32_t msr, uint64_t v)
 }
 
 static inline uint32_t read_cr0(void)
-{ uint32_t v; __asm__ volatile ("mov %%cr0, %0" : "=r"(v)); return v; }
+{ uintptr_t v; __asm__ volatile ("mov %%cr0, %0" : "=r"(v)); return (uint32_t)v; }
 static inline void write_cr0(uint32_t v)
-{ __asm__ volatile ("mov %0, %%cr0" : : "r"(v) : "memory"); }
+{ uintptr_t w = v; __asm__ volatile ("mov %0, %%cr0" : : "r"(w) : "memory"); }
 static inline uint32_t read_cr3(void)
-{ uint32_t v; __asm__ volatile ("mov %%cr3, %0" : "=r"(v)); return v; }
+{ uintptr_t v; __asm__ volatile ("mov %%cr3, %0" : "=r"(v)); return (uint32_t)v; }
 static inline void write_cr3(uint32_t v)
-{ __asm__ volatile ("mov %0, %%cr3" : : "r"(v) : "memory"); }
+{ uintptr_t w = v; __asm__ volatile ("mov %0, %%cr3" : : "r"(w) : "memory"); }
 static inline uint32_t read_cr4(void)
-{ uint32_t v; __asm__ volatile ("mov %%cr4, %0" : "=r"(v)); return v; }
+{ uintptr_t v; __asm__ volatile ("mov %%cr4, %0" : "=r"(v)); return (uint32_t)v; }
 static inline void write_cr4(uint32_t v)
-{ __asm__ volatile ("mov %0, %%cr4" : : "r"(v) : "memory"); }
+{ uintptr_t w = v; __asm__ volatile ("mov %0, %%cr4" : : "r"(w) : "memory"); }
 
 /* --- tiny heapless serial logging, mirroring idt.c's panic builder --- */
 
@@ -317,8 +318,7 @@ int mtrr_set_wc(uint32_t phys, uint32_t len)
 	/* Single-processor MTRR update sequence (SDM 11.11.8): enter no-fill cache
 	 * mode, flush, disable MTRRs, edit, flush, re-enable, restore. IF is cleared
 	 * throughout so nothing runs against half-changed cache control. */
-	uint32_t flags;
-	__asm__ volatile ("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+	uintptr_t flags = irq_save();
 
 	uint32_t cr0 = read_cr0();
 	write_cr0((cr0 & ~CR0_NW) | CR0_CD);     /* CD=1, NW=0: no-fill mode        */

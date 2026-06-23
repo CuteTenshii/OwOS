@@ -118,19 +118,9 @@ static uint16_t lport_seq;
 
 /* ----------------------------------------------------------- slot allocation */
 
-/* Save EFLAGS and disable interrupts; restore re-enables only if IF was set,
- * so calling from the IRQ (IF already clear) stays interrupts-off. */
-static inline uint32_t irq_save(void)
-{
-	uint32_t f;
-	__asm__ volatile ("pushf\n\tpop %0\n\tcli" : "=r"(f) :: "memory");
-	return f;
-}
-static inline void irq_restore(uint32_t f)
-{
-	if (f & 0x200)
-		__asm__ volatile ("sti" ::: "memory");
-}
+/* irq_save / irq_restore: snapshot EFLAGS + cli, restore the prior IF — safe to
+ * call from the IRQ (IF already clear stays interrupts-off). */
+#include "irqflags.h"
 
 /* Claim a free slot (state == ST_CLOSED), reserving it as `newstate` so a
  * concurrent claim from the other execution context can't take the same slot.

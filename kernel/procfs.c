@@ -73,6 +73,18 @@ static void gen_meminfo(struct pb *b)
 static void gen_uptime(struct pb *b)  { pu(b, timer_seconds()); pc(b, '\n'); }
 static void gen_tasks(struct pb *b)   { pu(b, (uint32_t)sched_count()); pc(b, '\n'); }
 
+/* Kernel build architecture. The kernel is compiled per-arch, so this is the one
+ * authoritative source user space can read (user programs are always 32-bit ELF
+ * and can't tell the kernel's arch from their own compile). */
+static void gen_arch(struct pb *b)
+{
+#ifdef __x86_64__
+	ps(b, "x86_64\n");
+#else
+	ps(b, "i386\n");
+#endif
+}
+
 static void gen_date(struct pb *b)
 {
 	struct rtc_time t;
@@ -136,6 +148,7 @@ static void gen_usb(struct pb *b)
 /* The entry names, in listing order. Single source of truth for read + list. */
 static const char *const entries[] = {
 	"cpuinfo", "meminfo", "uptime", "tasks", "date",
+	"arch",
 	"owofs", "storage", "pci",
 	"journal",
 	"services", "usb",
@@ -188,6 +201,7 @@ int procfs_read(const char *sub, char *buf, int max)
 	else if (streq(sub, "uptime"))   gen_uptime(&b);
 	else if (streq(sub, "tasks"))    gen_tasks(&b);
 	else if (streq(sub, "date"))     gen_date(&b);
+	else if (streq(sub, "arch"))     gen_arch(&b);
 	else if (streq(sub, "owofs"))    gen_owofs(&b);
 	else if (streq(sub, "storage"))  gen_storage(&b);
 	else if (streq(sub, "pci"))      gen_pci(&b);

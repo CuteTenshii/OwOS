@@ -189,7 +189,16 @@ static void build_info(void)
 	}
 	field("----------------");                                       endrow();
 	field("OS:      "); as("OwOS " OWOS_VERSION);                    endrow();
-	field("Kernel:  "); as("owos (i386, 32-bit)");                  endrow();
+	{
+		/* Kernel build arch comes from the kernel via /proc/arch (this program
+		 * is always 32-bit ELF, so it can't tell the kernel's arch by itself). */
+		char a[16];
+		if (readproc("/proc/arch", a, sizeof a) > 0) rstrip(a);
+		else { a[0]='i'; a[1]='3'; a[2]='8'; a[3]='6'; a[4]='\0'; }
+		field("Kernel:  ");
+		as("owos ("); as(a); as(a[0] == 'x' ? ", 64-bit)" : ", 32-bit)");
+		endrow();
+	}
 
 	readproc("/proc/cpuinfo", f, sizeof f);
 	field("CPU:     ");

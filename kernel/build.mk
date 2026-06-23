@@ -1,9 +1,28 @@
 # kernel/build.mk — the kernel image itself: the object list and the final link.
 # Program blobs (kernel/*_blob.o) are built by user/apps/build.mk; the font blobs too.
 
-KERNEL := owos.bin
+# Generic kernel compile rules. Defined here, not in toolchain.mk, so they come
+# *after* user/lib/build.mk's `user/%.o` rule in definition order — macOS's GNU
+# Make 3.81 resolves overlapping pattern rules by definition order, so the user
+# rule must be seen first (see the note in toolchain.mk).
+%.o: %.S
+	$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# KERNEL (owos.bin / owos-x86_64.bin) is set per-ARCH in toolchain.mk.
 ISO    := owos.iso
 ISODIR := isodir
+
+# Objects are emitted in place (kernel/foo.o), so the same path serves both
+# arches; this stamp makes an ARCH switch rebuild them. Touched whenever the
+# selected ARCH differs from the last build, it is a prerequisite of every object,
+# so `make` then `make ARCH=x86_64` recompiles rather than re-linking 32-bit
+# objects into a 64-bit image. clean removes the stamps.
+ARCH_STAMP := .arch.$(ARCH)
+$(ARCH_STAMP):
+	@rm -f .arch.* && touch $@
 
 OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flush.o \
         kernel/idt.o kernel/isr.o kernel/irq.o kernel/irq_stubs.o \
@@ -33,5 +52,8 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/clipd_blob.o kernel/cliphist_blob.o \
         kernel/uifont_blob.o kernel/monofont_blob.o
 
-$(KERNEL): $(OBJS) linker.ld
+$(KERNEL): $(OBJS) $(LINKER)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) -lgcc
+
+# Force a rebuild of every object when the target ARCH changes (see ARCH_STAMP).
+$(OBJS): $(ARCH_STAMP)

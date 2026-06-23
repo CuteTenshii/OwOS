@@ -2,6 +2,8 @@
 #ifndef OWOS_POWER_H
 #define OWOS_POWER_H
 
+#include <stdint.h>
+
 void power_off(void);     /* ACPI/QEMU shutdown; returns only if it fails  */
 void power_reset(void);   /* reboot via the 8042 controller, then 3-fault  */
 
@@ -20,13 +22,13 @@ int power_can_sleep(void);
 /* Scan the ACPI device AML (DSDT + every SSDT) for a byte sequence such as an
  * EISA _HID. Returns 1 if found, 0 if absent or ACPI is unreachable. Used by
  * battery.c to detect an ACPI battery device wherever the firmware declared it. */
-int acpi_aml_contains(const unsigned char *needle, unsigned int n);
+int acpi_aml_contains(const uint8_t *needle, uint32_t n);
 
 /* Invoke fn(body, len, ctx) for each ACPI AML definition block — the DSDT, then
  * every SSDT — where body/len is the table's AML byte stream (past the header).
  * Used by the AML interpreter (aml.c) to build the namespace. No-op if ACPI is
  * unreachable. */
-void acpi_for_each_aml(void (*fn)(const unsigned char *body, unsigned int len,
+void acpi_for_each_aml(void (*fn)(const uint8_t *body, uint32_t len,
                                   void *ctx), void *ctx);
 
 /* Locate and identity-map a primary ACPI table by its 4-character signature

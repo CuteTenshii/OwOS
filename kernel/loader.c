@@ -7,24 +7,15 @@
 #include "elf.h"
 #include "sched.h"
 #include "kstring.h"
+#include "irqflags.h"
 
 /* USER_STACK_PAGES lives in loader.h now (shared with the heap ceiling). */
 
 /* The scratch mapping (paging_scratch_*) is shared kernel state, so a map->
  * write->unmap interval must not be preempted by another exec/fork using the
- * same slot. These bracket each interval with interrupts off and restore the
- * prior IF, so it is safe whether exec runs from a kernel thread (IF=1) or an
- * int 0x80 syscall (IF=0). */
-static inline uint32_t irq_save(void)
-{
-	uint32_t f;
-	__asm__ volatile ("pushf\n\tpop %0\n\tcli" : "=r"(f) :: "memory");
-	return f;
-}
-static inline void irq_restore(uint32_t f)
-{
-	__asm__ volatile ("push %0\n\tpopf" :: "r"(f) : "memory", "cc");
-}
+ * same slot. irq_save/irq_restore (irqflags.h) bracket each interval with
+ * interrupts off and restore the prior IF, so it is safe whether exec runs from
+ * a kernel thread (IF=1) or an int 0x80 syscall (IF=0). */
 
 /* Map [vaddr, vaddr+memsz) into dir from fresh pmm frames, copying filesz bytes
  * of segment data and zeroing the rest (.bss). Each frame is written in full

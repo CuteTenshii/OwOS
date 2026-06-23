@@ -78,6 +78,119 @@ stack_bottom:
 .skip 16384
 stack_top:
 
+#ifdef __x86_64__
+/* ---- x86_64 long-mode entry ---------------------------------------------- *
+ * The Multiboot loader still enters in 32-bit protected mode with paging off
+ * (both header `arch` fields are 0 = i386). We build a temporary identity map
+ * of the low 4 GiB with 2 MiB pages, enable PAE + long mode + paging, load a
+ * GDT carrying a 64-bit code segment, and far-jump into 64-bit code, which sets
+ * the stack and calls kernel_main(magic, mbi). The kernel's own paging.c later
+ * installs the real address space; this map only needs to get us into C.
+ *
+ * Page tables: PML4 -> one PDPT -> four PDs (one per GiB), each PD full of 512
+ * 2 MiB pages. All of the kernel's working set (image at 1 MiB, heap, the user
+ * window at 1 GiB, WIN_FB at 3 GiB) lives under 4 GiB, so the 2 MiB identity map
+ * covers it without a single 4 KiB leaf. */
+.section .bss
+.align 4096
+boot_pml4: .skip 4096
+boot_pdpt: .skip 4096
+boot_pd:   .skip 4096 * 4          /* four PDs = 2048 entries = 4 GiB         */
+
+.section .rodata
+.align 16
+boot_gdt:
+	.quad 0x0000000000000000       /* null                                    */
+	.quad 0x00AF9A000000FFFF       /* 0x08: 64-bit kernel code (L=1)           */
+	.quad 0x00CF92000000FFFF       /* 0x10: kernel data                        */
+boot_gdt_end:
+boot_gdtr:
+	.word boot_gdt_end - boot_gdt - 1
+	.long boot_gdt                 /* 32-bit base: lgdt runs in protected mode */
+
+.section .bss
+.align 4
+mb_magic: .skip 4
+mb_info:  .skip 4
+
+.section .text
+.global _start
+.type _start, @function
+.code32
+_start:
+	cli
+	mov $stack_top, %esp
+	mov %eax, mb_magic             /* stash loader handoff before clobbering   */
+	mov %ebx, mb_info
+
+	/* PML4[0] = boot_pdpt | present|writable */
+	mov $boot_pdpt, %eax
+	or  $0x3, %eax
+	mov %eax, boot_pml4
+
+	/* PDPT[0..3] = boot_pd + i*4 KiB | present|writable */
+	mov $boot_pd, %eax
+	or  $0x3, %eax
+	mov $boot_pdpt, %edi
+	mov $4, %ecx
+1:	mov %eax, (%edi)
+	add $0x1000, %eax
+	add $8, %edi
+	loop 1b
+
+	/* PD[k] = (k << 21) | present|writable|page-size, k = 0..2047 (4 GiB). The
+	 * high dword stays 0: every mapped address is below 4 GiB. */
+	mov $boot_pd, %edi
+	xor %ecx, %ecx
+2:	mov %ecx, %eax
+	shl $21, %eax
+	or  $0x83, %eax
+	mov %eax, (%edi)
+	movl $0, 4(%edi)
+	add $8, %edi
+	inc %ecx
+	cmp $2048, %ecx
+	jne 2b
+
+	mov $boot_pml4, %eax
+	mov %eax, %cr3
+
+	mov %cr4, %eax
+	or  $0x20, %eax                /* CR4.PAE                                  */
+	mov %eax, %cr4
+
+	mov $0xC0000080, %ecx          /* EFER MSR                                 */
+	rdmsr
+	or  $0x100, %eax               /* EFER.LME                                 */
+	wrmsr
+
+	mov %cr0, %eax
+	or  $0x80000000, %eax          /* CR0.PG -> long mode active (compat)      */
+	mov %eax, %cr0
+
+	lgdt boot_gdtr
+	ljmp $0x08, $long_mode_start   /* reload CS with the 64-bit selector       */
+
+.code64
+long_mode_start:
+	mov $0x10, %ax                 /* flat data selectors                      */
+	mov %ax, %ds
+	mov %ax, %es
+	mov %ax, %ss
+	mov %ax, %fs
+	mov %ax, %gs
+	mov $stack_top, %rsp
+
+	mov mb_magic, %edi             /* arg1: magic  (SysV: rdi)                 */
+	mov mb_info,  %esi             /* arg2: mbi    (SysV: rsi); zero-extended  */
+	xor %rbp, %rbp
+	call kernel_main
+.hang64:
+	hlt
+	jmp .hang64
+.size _start, . - _start
+
+#else
 .section .text
 .global _start
 .type _start, @function
@@ -97,3 +210,4 @@ _start:
 	hlt
 	jmp .hang
 .size _start, . - _start
+#endif

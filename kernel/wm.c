@@ -27,6 +27,7 @@
 #include "mouse.h"
 #include "keyboard.h"
 #include "timer.h"
+#include "irqflags.h"
 #include "rtc.h"
 #include "sched.h"
 #include "edid.h"
@@ -76,8 +77,7 @@ static int wm_reserve(int need)
 		np[i].x = np[i].y = np[i].w = np[i].h = np[i].vis = np[i].z = np[i].nr = 0;
 		np[i].dirty = 0xFFFFFFFF; np[i].cur = 0;
 	}
-	uint32_t fl;
-	__asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+	uintptr_t fl = irq_save();
 	struct window **ow = wins; int *oz = zlist; struct pfsnap *op = pf;
 	wins = nw; zlist = nz; pf = np; wins_cap = nc;
 	if (fl & 0x200) __asm__ volatile ("sti");

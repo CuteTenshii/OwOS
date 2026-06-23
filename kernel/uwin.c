@@ -18,6 +18,8 @@
 #include "heap.h"
 #include "pmm.h"
 #include "paging.h"
+#include "creg.h"
+#include "irqflags.h"
 #include "sched.h"
 #include "timer.h"
 
@@ -78,8 +80,7 @@ static int uwins_reserve(int need)
 		return 0;
 	for (int i = 0; i < uwins_cap; i++) nu[i] = uwins[i];
 	for (int i = uwins_cap; i < nc; i++) nu[i] = 0;
-	uint32_t fl;
-	__asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+	uintptr_t fl = irq_save();
 	struct uwin **ou = uwins;
 	uwins = nu; uwins_cap = nc;
 	if (fl & 0x200) __asm__ volatile ("sti");
@@ -89,9 +90,8 @@ static int uwins_reserve(int need)
 
 static inline void tlb_flush(void)
 {
-	uint32_t c;
-	__asm__ volatile ("mov %%cr3, %0" : "=r"(c) :: "memory");
-	__asm__ volatile ("mov %0, %%cr3" :: "r"(c) : "memory");
+	/* Reloading CR3 with its current value flushes all non-global TLB entries. */
+	write_cr3(read_cr3());
 }
 
 static void evq_push(struct uwin *u, uint32_t type, int32_t a, int32_t b)

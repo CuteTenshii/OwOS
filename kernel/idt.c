@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "idt.h"
+#include "creg.h"
 #include "gdt.h"
 #include "console.h"
 #include "fb.h"
@@ -9,6 +10,18 @@
 #include "sched.h"
 #include "crash.h"
 
+#ifdef __x86_64__
+/* One 16-byte 64-bit interrupt gate descriptor. */
+struct idt_entry {
+	uint16_t base_low;     /* handler address bits  0..15                    */
+	uint16_t selector;     /* code segment selector to run the handler in    */
+	uint8_t  ist;          /* interrupt-stack-table index (0 = none)         */
+	uint8_t  flags;        /* present, ring, gate type                       */
+	uint16_t base_mid;     /* handler address bits 16..31                    */
+	uint32_t base_high;    /* handler address bits 32..63                    */
+	uint32_t reserved;
+} __attribute__((packed));
+#else
 /* One 8-byte interrupt gate descriptor. */
 struct idt_entry {
 	uint16_t base_low;     /* handler address bits  0..15                    */
@@ -17,11 +30,13 @@ struct idt_entry {
 	uint8_t  flags;        /* present, ring, gate type                       */
 	uint16_t base_high;    /* handler address bits 16..31                    */
 } __attribute__((packed));
+#endif
 
-/* Operand for lidt. */
+/* Operand for lidt. base is uintptr_t so it is the right width per arch (64-bit
+ * lidt reads an 8-byte base). */
 struct idt_ptr {
-	uint16_t limit;
-	uint32_t base;
+	uint16_t  limit;
+	uintptr_t base;
 } __attribute__((packed));
 
 static struct idt_entry idt[256];
@@ -57,11 +72,21 @@ static const char *const exception_messages[32] = {
 
 void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags)
 {
+#ifdef __x86_64__
+	idt[num].base_low  = base & 0xFFFF;
+	idt[num].base_mid  = (base >> 16) & 0xFFFF;
+	idt[num].base_high = 0;        /* handlers live below 4 GiB (uint32_t base) */
+	idt[num].selector  = sel;
+	idt[num].ist       = 0;
+	idt[num].flags     = flags;
+	idt[num].reserved  = 0;
+#else
 	idt[num].base_low  = base & 0xFFFF;
 	idt[num].base_high = (base >> 16) & 0xFFFF;
 	idt[num].selector  = sel;
 	idt[num].always0   = 0;
 	idt[num].flags     = flags;
+#endif
 }
 
 /* Tiny string builders for the panic screen — no libc, no heap (the heap may be
@@ -115,9 +140,8 @@ static void panic_screen(struct registers *r)
 	*p = 0; fb_text(x, y, line, fg, bg); y += lh;
 
 	if (r->int_no == 14) {         /* page fault: CR2 holds the bad address    */
-		uint32_t cr2, cr3;
-		__asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-		__asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+		uint32_t cr2 = (uint32_t)read_cr2();
+		uint32_t cr3 = (uint32_t)read_cr3();
 		p = line;
 		p = p_str(p, "cr2=");  p = p_hex(p, cr2);
 		p = p_str(p, "  cr3="); p = p_hex(p, cr3);
@@ -193,8 +217,7 @@ void isr_handler(struct registers *r)
 	con_write("  eip=");    con_write_hex(r->eip);
 
 	if (r->int_no == 14) {         /* page fault: CR2 holds the bad address    */
-		uint32_t cr2;
-		__asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+		uint32_t cr2 = (uint32_t)read_cr2();
 		con_write("  cr2="); con_write_hex(cr2);
 	}
 
@@ -209,7 +232,7 @@ void isr_handler(struct registers *r)
 void idt_init(void)
 {
 	idt_ptr.limit = sizeof(idt) - 1;
-	idt_ptr.base  = (uint32_t)&idt;
+	idt_ptr.base  = (uintptr_t)&idt;
 
 	/* 0x8E = present, ring 0, 32-bit interrupt gate (clears IF on entry). */
 	for (int i = 0; i < 32; i++)

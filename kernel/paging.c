@@ -7,6 +7,8 @@
  */
 
 #include "paging.h"
+#include "creg.h"
+#include "irqflags.h"
 #include "pmm.h"
 #include "loader.h"     /* USER_BASE / USER_REGION_END: the per-process window  */
 #include <stdint.h>
@@ -19,17 +21,7 @@
 
 /* Bracket a scratch-mapping interval with IF off (restoring the prior flag), so
  * a fork copying through the shared scratch slots can't be preempted by another
- * scratch user. */
-static inline uint32_t irq_save(void)
-{
-	uint32_t f;
-	__asm__ volatile ("pushf\n\tpop %0\n\tcli" : "=r"(f) :: "memory");
-	return f;
-}
-static inline void irq_restore(uint32_t f)
-{
-	__asm__ volatile ("push %0\n\tpopf" :: "r"(f) : "memory", "cc");
-}
+ * scratch user. (irq_save/irq_restore live in irqflags.h.) */
 
 #define PAGE_PRESENT 0x1
 #define PAGE_RW      0x2
@@ -91,10 +83,9 @@ void paging_init(void)
 
 	__asm__ volatile ("mov %0, %%cr3" : : "r"(page_directory));
 
-	uint32_t cr0;
-	__asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+	uintptr_t cr0 = read_cr0();
 	cr0 |= 0x80000000;                 /* CR0.PG                              */
-	__asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
+	write_cr0(cr0);
 }
 
 uint32_t paging_kernel_phys(void)
@@ -189,8 +180,7 @@ void paging_free_process_dir(uint32_t *dir)
  * dereferencing it for a backtrace, so a corrupt one can't double-fault. */
 int paging_user_mapped(uint32_t vaddr)
 {
-	uint32_t cr3;
-	__asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+	uint32_t cr3 = (uint32_t)read_cr3();
 	uint32_t *pd = (uint32_t *)(cr3 & ~0xFFFu);
 	uint32_t pde = pd[vaddr >> 22];
 	if (!(pde & PAGE_PRESENT))

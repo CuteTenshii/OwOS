@@ -10,6 +10,7 @@
 #include "idt.h"
 #include "file.h"
 #include "pipe.h"
+#include "irqflags.h"
 #include "ipc.h"
 #include "uwin.h"
 #include <stdint.h>
@@ -435,8 +436,7 @@ static task_t *find_task(uint32_t id)
  * queue and is never `current`, so nothing can reach it). */
 static void reap_task(task_t *t)
 {
-	uint32_t fl;
-	__asm__ volatile ("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+	uintptr_t fl = irq_save();
 	task_t *p = &main_task;
 	while (p->next != t)
 		p = p->next;
@@ -547,9 +547,7 @@ void sched_sleep_until(uint32_t wake)
 {
 	if (!current)                      /* called before the scheduler exists */
 		return;
-	uint32_t flags;
-	__asm__ volatile ("pushf\n\t pop %0" : "=r"(flags) :: "memory");
-	__asm__ volatile ("cli");          /* set the state + switch atomically vs the IRQ */
+	uintptr_t flags = irq_save();      /* set the state + switch atomically vs the IRQ */
 	current->wake_tick = wake;
 	current->state = TASK_WAITING;
 	schedule();                        /* entered IF=0; returns once woken + rescheduled */
@@ -600,8 +598,7 @@ void sched_exit(int status)
  * Done with interrupts off so a tick can't schedule it mid-teardown. */
 void sched_kill(int pid)
 {
-	uint32_t fl;
-	__asm__ volatile ("pushf; pop %0; cli" : "=r"(fl));
+	uintptr_t fl = irq_save();
 	task_t *t = find_task((uint32_t)pid);
 	if (t && t != current && t->state != TASK_FREE && t->state != TASK_ZOMBIE) {
 		t->exit_status = -1;
@@ -744,9 +741,7 @@ void schedule(void)
 	 * saved `flags` is a local, so it rides this thread's stack across switches.
 	 * context_switch does not touch EFLAGS, so IF stays cleared across the swap
 	 * until this restore (or thread_start's own `sti` for a first run). */
-	uint32_t flags;
-	__asm__ volatile ("pushf\n\t pop %0" : "=r"(flags) :: "memory");
-	__asm__ volatile ("cli");
+	uintptr_t flags = irq_save();
 
 	task_t *prev = current;
 	task_t *next = prev->next;

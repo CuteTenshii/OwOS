@@ -24,9 +24,26 @@ make run NIC=e1000   # attach the Intel 82540EM instead of the default RTL8139
 
 ## Build & run
 
-You need `gcc` with 32-bit support (`-m32`) and `qemu-system-i386`. Building the
+You need a toolchain that emits 32-bit ELF plus `qemu-system-i386`. Building the
 bootable ISO additionally needs `grub-mkrescue`, `xorriso`, and `mtools`; the
 seeded FAT test disks need `mkfs.fat` (dosfstools).
+
+- **Linux:** the native `gcc`/`binutils` with 32-bit support — install `gcc-multilib`
+  (Debian/Ubuntu) or the equivalent — then `qemu`, and for the ISO/disks `grub`,
+  `xorriso`, `mtools`, `dosfstools`. The build uses bare `gcc`/`ld`/`objcopy`.
+- **macOS:** the system `gcc`/`ld` are Apple Clang and emit only Mach-O, so an ELF
+  **cross-toolchain** is required. With [Homebrew](https://brew.sh):
+
+  ```sh
+  brew install i686-elf-gcc i686-elf-binutils   # the kernel toolchain
+  brew install qemu mtools dosfstools xorriso    # run + seeded test disks
+  ```
+
+  The Makefile auto-detects macOS (`uname -s` = Darwin) and prefixes the tools with
+  `i686-elf-`; override with `make CROSS=x86_64-elf-` if you installed that instead.
+  `make iso`/`make usb` stay Linux-only (`grub-mkrescue` and the `/sys/block`
+  removable-device check have no clean macOS equivalent); use QEMU's `-kernel`
+  (`make run`/`debug`) on macOS.
 
 | Target | What it does |
 | --- | --- |
@@ -40,11 +57,27 @@ seeded FAT test disks need `mkfs.fat` (dosfstools).
 | `make clean` | Remove build artifacts (keeps the disk images). |
 | `make distclean` | Also wipe the disk images. |
 
-There is **no cross-compiler**. The kernel is built with the host
-`gcc -m32 -ffreestanding -nostdlib` and linked at 1 MiB by `linker.ld`. QEMU's
-`-kernel` is itself a Multiboot loader, so nothing else is needed there. The ISO
-exists only for the targets that genuinely need a bootloader on the media —
-VMware, VirtualBox, bare metal — and carries GRUB for both BIOS and UEFI.
+### 64-bit (x86_64) build
+
+The same source tree also builds a 64-bit (long-mode) kernel: `make ARCH=x86_64`
+produces `owos-x86_64.bin`, an ELF64 image that boots into long mode (the boot
+stub sets up PAE paging + LME and far-jumps to 64-bit code). The default build is
+unchanged 32-bit. On macOS this needs the matching cross-toolchain
+(`brew install x86_64-elf-gcc x86_64-elf-binutils`); the user programs stay 32-bit
+either way (the kernel embeds them as blobs), so `i686-elf-` is still required too.
+Switching `ARCH` rebuilds the objects automatically (a `.arch.*` stamp guards it).
+
+Note QEMU's built-in `-kernel` multiboot loader only loads 32-bit ELF, so
+`make run ARCH=x86_64` boots the 64-bit kernel through GRUB on the ISO instead
+(GRUB's multiboot2 loads ELF64) — which means the `iso` toolchain (Linux-only) is
+required to run it.
+
+On Linux there is **no cross-compiler**: the kernel is built with the host
+`gcc -m32 -ffreestanding -nostdlib` and linked at 1 MiB by `linker.ld` (on macOS the
+`i686-elf-` cross-toolchain above plays that role). QEMU's `-kernel` is itself a
+Multiboot loader, so nothing else is needed there. The ISO exists only for the
+targets that genuinely need a bootloader on the media — VMware, VirtualBox, bare
+metal — and carries GRUB for both BIOS and UEFI.
 
 `make run`/`debug` auto-create the disks and devices the drivers exercise: an
 IDE disk (`disk.img`, the owofs boot volume), a SATA disk on an AHCI controller,

@@ -5,6 +5,7 @@
 #include "io.h"
 #include "nic.h"
 #include "sched.h"
+#include "irqflags.h"
 
 #define PIT_BASE_HZ   1193182      /* the PIT's fixed input frequency        */
 #define PIT_CH0_DATA  0x40
@@ -66,8 +67,7 @@ uint32_t timer_ticks(void)
  * Safe to call from interrupt context. */
 uint32_t timer_us(void)
 {
-	uint32_t fl;
-	__asm__ volatile ("pushf\n\tpop %0\n\tcli" : "=r"(fl) :: "memory");
+	uintptr_t fl = irq_save();
 
 	outb(PIT_CMD, PIT_LATCH_CH0);
 	uint32_t count = inb(PIT_CH0_DATA);

@@ -68,6 +68,58 @@ ISR_NOERR 128   /* int 0x80: system call (gate is DPL 3) */
  * We add the saved general registers and data segment to match
  * struct registers in idt.c, then hand a pointer to that frame to C. */
 .extern isr_handler
+#ifdef __x86_64__
+/* 64-bit: no pusha; push each GPR. The CPU always pushes SS:RSP, so the frame is
+ * uniform. Segment registers are flat/ignored in long mode, so we don't reload
+ * them — we only record %ds for the struct. Push order builds struct registers
+ * (idt.h) bottom-up: ds is lowest, then r15..r8, edi/esi/ebp/esp/ebx/edx/ecx/eax. */
+.type isr_common_stub, @function
+isr_common_stub:                       /* on entry: top of stack = int_no       */
+	push %rax
+	push %rcx
+	push %rdx
+	push %rbx
+	lea  32(%rsp), %rax            /* trap rsp (4 quads pushed so far) -> esp   */
+	push %rax
+	push %rbp
+	push %rsi
+	push %rdi
+	push %r8
+	push %r9
+	push %r10
+	push %r11
+	push %r12
+	push %r13
+	push %r14
+	push %r15
+	xor  %rax, %rax
+	mov  %ds, %ax
+	push %rax                      /* ds slot                                  */
+
+	mov  %rsp, %rdi                /* arg: pointer to struct registers         */
+	call isr_handler
+
+	add  $8, %rsp                  /* drop ds (segments stay flat)             */
+	pop  %r15
+	pop  %r14
+	pop  %r13
+	pop  %r12
+	pop  %r11
+	pop  %r10
+	pop  %r9
+	pop  %r8
+	pop  %rdi
+	pop  %rsi
+	pop  %rbp
+	add  $8, %rsp                  /* drop the esp slot (not a real register)  */
+	pop  %rbx
+	pop  %rdx
+	pop  %rcx
+	pop  %rax
+	add  $16, %rsp                 /* drop int_no and err_code                 */
+	iretq
+.size isr_common_stub, . - isr_common_stub
+#else
 .type isr_common_stub, @function
 isr_common_stub:
 	pusha                          /* edi,esi,ebp,esp,ebx,edx,ecx,eax        */
@@ -95,3 +147,4 @@ isr_common_stub:
 	add $8, %esp                   /* drop int_no and err_code                */
 	iret                           /* pops eip, cs, eflags (restores IF)      */
 .size isr_common_stub, . - isr_common_stub
+#endif

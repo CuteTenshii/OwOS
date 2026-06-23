@@ -28,7 +28,7 @@ include run.mk
 all: $(KERNEL)
 
 clean:
-	rm -f $(OBJS) $(KERNEL) $(ISO)
+	rm -f $(OBJS) owos.bin owos-x86_64.bin $(ISO) .arch.*
 	rm -f user/lib/*.o user/lib/*/*.o
 	rm -f user/apps/cli/*.o user/apps/cli/*.elf
 	rm -f user/apps/gui/*.o user/apps/gui/*.elf user/apps/gui/browser/*.o

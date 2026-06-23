@@ -1,6 +1,7 @@
 /* crash.c — crash reporter (see crash.h). */
 #include <stdint.h>
 #include "crash.h"
+#include "creg.h"
 #include "idt.h"
 #include "wm.h"
 #include "fb.h"
@@ -50,7 +51,7 @@ void crash_record(const char *name, struct registers *r)
 	c->eip    = r->eip;
 	c->cr2    = 0;
 	if (r->int_no == 14)
-		__asm__ volatile ("mov %%cr2, %0" : "=r"(c->cr2));
+		c->cr2 = (uint32_t)read_cr2();
 	c->eax = r->eax; c->ebx = r->ebx; c->ecx = r->ecx; c->edx = r->edx;
 	c->esi = r->esi; c->edi = r->edi; c->ebp = r->ebp; c->esp = r->esp;
 

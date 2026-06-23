@@ -32,6 +32,7 @@
 #include "keyboard.h"
 #include "console.h"
 #include "fs.h"
+#include "irqflags.h"
 
 /* ---- HDA controller MMIO register offsets ------------------------------ */
 #define R_GCAP        0x00   /* 16: capabilities (stream counts)             */
@@ -144,8 +145,7 @@ static uint32_t codec_cmd(uint16_t nid, uint32_t payload)
 	/* Atomic against the keyboard IRQ, which can call in via hda_volume_*: the
 	 * ring-pointer update + poll must not interleave with another command. Mask
 	 * interrupts for the (microsecond) duration and restore the prior IF. */
-	uint32_t flags;
-	__asm__ volatile ("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+	uintptr_t flags = irq_save();
 
 	corb_wp = (uint16_t)((corb_wp + 1) & 0xFF);
 	corb[corb_wp] = cmd;

@@ -34,7 +34,7 @@ H2      := user/lib/curl/h2.o         # libcurl: HTTP/2 engine (HPACK + framing)
 QUIC    := user/lib/curl/quic.o       # libcurl: QUIC v1 transport (RFC 9000/9001)
 H3      := user/lib/curl/h3.o         # libcurl: HTTP/3 framing + QPACK (RFC 9114/9204)
 MP3     := user/lib/mp3/mp3.o         # streaming MPEG audio decoder (.mp3/.mp2/.mp1)
-LIBGCC  := $(shell $(CC) -m32 -print-libgcc-file-name)  # 64-bit div helpers etc.
+LIBGCC  := $(shell $(UCC) -m32 -print-libgcc-file-name)  # 64-bit div helpers etc.
 CRYPTO  := user/lib/crypto/crypto.o   # SHA-1/SHA-256/x25519/AES-GCM (torrent, ssh, curl)
 WEBSOCKET := user/lib/websocket/websocket.o  # RFC 6455 client (browser JS WebSocket); needs $(CRYPTO)
 TORLIB  := user/lib/torrent/bencode.o user/lib/torrent/torrent.o   # libtorrent
@@ -59,7 +59,7 @@ JS      := user/lib/js/lexer.o user/lib/js/parser.o user/lib/js/ast.o \
 BROTLIDICT := user/lib/brotli/dict_blob.o
 BROTLI  := user/lib/brotli/decode.o user/lib/brotli/encode.o $(BROTLIDICT)
 $(BROTLIDICT): user/lib/brotli/dictionary.bin
-	objcopy -I binary -O elf32-i386 -B i386 $< $@
+	$(UOBJCOPY) -I binary -O elf32-i386 -B i386 $< $@
 # woff: WOFF1 (zlib) + WOFF2 (brotli + glyf transform) container -> SFNT. Lives in
 # user/lib/font and is wired into font_load via a weak ref, so font_load decodes
 # web fonts transparently; only programs that link $(WOFF) drag in brotli/inflate.
@@ -67,10 +67,10 @@ WOFF    := user/lib/font/woff.o
 TERMLIB := user/lib/zlib/lzss.o user/lib/zlib/deflate.o $(CRYPTO) $(CLIPBOARD)  # the shell's codecs + crypto
 
 user/lib/start.o: user/lib/start.S
-	$(CC) $(UCFLAGS) -c $< -o $@
+	$(UCC) $(UCFLAGS) -c $< -o $@
 user/lib/lib.o: user/lib/lib.c
-	$(CC) $(UCFLAGS) -c $< -o $@
+	$(UCC) $(UCFLAGS) -c $< -o $@
 
 # Everything under user/ (the libs and the apps trees) compiles with UCFLAGS.
 user/%.o: user/%.c
-	$(CC) $(UCFLAGS) -c $< -o $@
+	$(UCC) $(UCFLAGS) -c $< -o $@
