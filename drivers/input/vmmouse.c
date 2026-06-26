@@ -38,6 +38,14 @@ static int bound_x, bound_y;
 
 int vmmouse_active(void) { return enabled; }
 
+/* Rescale absolute coordinates onto a new screen size (after a resolution
+ * change). The device keeps reporting in [0,0xFFFF]; only the target box moves. */
+void vmmouse_set_bounds(int max_x, int max_y)
+{
+	bound_x = max_x;
+	bound_y = max_y;
+}
+
 int vmmouse_init(int max_x, int max_y)
 {
 	if (!vmware_present())
@@ -124,6 +132,9 @@ int vmmouse_poll(int *x, int *y, int *btn, int *dz)
 	}
 	*x  = px;
 	*y  = py;
-	*dz = wheel;
+	/* VMware reports +toward-the-user (like the raw PS/2 wheel byte); negate so
+	 * the delta follows the kernel's +up/-down WEV_SCROLL convention, matching
+	 * what mouse.c's PS/2 path does before it adds the delta. */
+	*dz = -wheel;
 	return updated;
 }

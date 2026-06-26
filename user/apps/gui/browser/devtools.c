@@ -87,26 +87,6 @@ static void tb_putc(struct textblk *t, char c)
 
 static void tb_puts(struct textblk *t, const char *s) { while (*s) tb_putc(t, *s++); }
 static void tb_newline(struct textblk *t) { tb_putc(t, '\n'); }
-static void tb_putu(struct textblk *t, int v)
-{
-	char b[12]; int n = 0;
-	if (v < 0) { tb_putc(t, '-'); v = -v; }
-	if (v == 0) { tb_putc(t, '0'); return; }
-	while (v) { b[n++] = (char)('0' + v % 10); v /= 10; }
-	while (n) tb_putc(t, b[--n]);
-}
-static void tb_puthex2(struct textblk *t, unsigned v)
-{
-	const char *h = "0123456789abcdef";
-	tb_putc(t, h[(v >> 4) & 0xf]); tb_putc(t, h[v & 0xf]);
-}
-static void tb_putcolor(struct textblk *t, unsigned rgb)
-{
-	tb_putc(t, '#');
-	tb_puthex2(t, (rgb >> 16) & 0xff);
-	tb_puthex2(t, (rgb >> 8) & 0xff);
-	tb_puthex2(t, rgb & 0xff);
-}
 
 /* Copy line `i` of `t` (truncated to `max` bytes) into `out`. Returns length. */
 static int tb_line(const struct textblk *t, int i, char *out, int max)
@@ -250,11 +230,47 @@ static void dt_reset_content(void)
 	tb_reset(&dt_dom); tb_reset(&dt_sty);
 }
 
+/* A tab's frozen devtools capture: the Elements/Styles snapshots plus the console
+ * and network rings. When a tab is backgrounded its live capture is swapped out
+ * into one of these (held by its dt_view), and swapped back in on reveal — so the
+ * panel keeps its content across tab switches instead of resetting. */
+struct dt_cap {
+	struct conline con[CON_MAX]; int con_start, con_count;
+	char *con_pend; int con_pend_len, con_pend_cap, con_pend_level;
+	struct conline net[NET_MAX]; int net_start, net_count;
+	struct textblk dom, sty; int *dom_node, dom_node_cap, sel;
+};
+
+/* Swap the live capture (the statics above) with *c, field for field. */
+static void cap_swap(struct dt_cap *c)
+{
+	for (int i = 0; i < CON_MAX; i++) { struct conline t = con[i]; con[i] = c->con[i]; c->con[i] = t; }
+	{ int t = con_start;       con_start = c->con_start;             c->con_start = t; }
+	{ int t = con_count;       con_count = c->con_count;             c->con_count = t; }
+	{ char *t = con_pend;      con_pend = c->con_pend;               c->con_pend = t; }
+	{ int t = con_pend_len;    con_pend_len = c->con_pend_len;       c->con_pend_len = t; }
+	{ int t = con_pend_cap;    con_pend_cap = c->con_pend_cap;       c->con_pend_cap = t; }
+	{ int t = con_pend_level;  con_pend_level = c->con_pend_level;   c->con_pend_level = t; }
+	for (int i = 0; i < NET_MAX; i++) { struct conline t = net[i]; net[i] = c->net[i]; c->net[i] = t; }
+	{ int t = net_start;       net_start = c->net_start;             c->net_start = t; }
+	{ int t = net_count;       net_count = c->net_count;             c->net_count = t; }
+	{ struct textblk t = dt_dom; dt_dom = c->dom; c->dom = t; }
+	{ struct textblk t = dt_sty; dt_sty = c->sty; c->sty = t; }
+	{ int *t = dt_dom_node;    dt_dom_node = c->dom_node;            c->dom_node = t; }
+	{ int t = dt_dom_node_cap; dt_dom_node_cap = c->dom_node_cap;    c->dom_node_cap = t; }
+	{ int t = dt_sel;          dt_sel = c->sel;                      c->sel = t; }
+}
+
 void devtools_view_save(struct dt_view *v)
 {
 	v->open = dt_open;
 	v->tab  = dt_tab;
 	for (int i = 0; i < N_TABS; i++) v->scroll[i] = dt_scroll[i];
+	struct dt_cap *c = v->cap;
+	if (!c) { c = calloc(1, sizeof *c); v->cap = c; if (!c) return; c->sel = -1; }
+	dt_lock();
+	cap_swap(c);                 /* freeze the live capture into this tab's handle */
+	dt_unlock();
 }
 
 void devtools_view_load(const struct dt_view *v)
@@ -263,11 +279,36 @@ void devtools_view_load(const struct dt_view *v)
 	dt_tab  = v->tab;
 	for (int i = 0; i < N_TABS; i++) dt_scroll[i] = v->scroll[i];
 	dt_lock();
-	dt_reset_content();          /* the live page changed under us; selection is moot */
-	dt_sel = -1;
-	dt_dirty = 1;                /* worker rebuilds the snapshot for the new page      */
+	if (v->cap) cap_swap((struct dt_cap *)v->cap);   /* restore this tab's frozen capture */
+	else { dt_reset_content(); dt_sel = -1; }        /* never captured: empty devtools     */
 	dt_unlock();
 	B->seq++;
+}
+
+/* Release a closed tab's frozen capture (its rings' text + snapshot buffers). */
+void devtools_view_free(struct dt_view *v)
+{
+	struct dt_cap *c = v->cap;
+	if (!c) return;
+	for (int i = 0; i < CON_MAX; i++) free(c->con[i].text);
+	free(c->con_pend);
+	for (int i = 0; i < NET_MAX; i++) free(c->net[i].text);
+	free(c->dom.buf); free(c->dom.off);
+	free(c->sty.buf); free(c->sty.off);
+	free(c->dom_node);
+	free(c);
+	v->cap = 0;
+}
+
+/* Free the LIVE capture (the statics). Used when the active tab closes: its
+ * content lives in the statics, not its dt_view, so it must be dropped here
+ * before the neighbour's capture is swapped in. */
+void devtools_reset_live(void)
+{
+	dt_lock();
+	dt_reset_content();
+	dt_sel = -1;
+	dt_unlock();
 }
 
 /* --- DOM snapshot (worker thread) ----------------------------------------- */
@@ -388,13 +429,19 @@ static void dom_emit(struct textblk *t, struct dom_node *n, int depth, int *idx)
 			dom_emit(t, c, depth + 1, idx);
 		return;
 	}
-	if (!n->first_child) {                            /* <tag></tag> on one line */
+
+	/* ::before / ::after generated content shows as pseudo-element rows, like a
+	 * real devtools tree (not real DOM nodes, so they take no pre-order index). */
+	int hb = html_has_pseudo(n, CSS_PSEUDO_BEFORE);
+	int ha = html_has_pseudo(n, CSS_PSEUDO_AFTER);
+
+	if (!n->first_child && !hb && !ha) {              /* <tag></tag> on one line */
 		tb_puts(t, "</"); tb_puts(t, tag); tb_putc(t, '>');
 		tb_newline(t);
 		return;
 	}
 
-	struct dom_node *only = dom_only_text(n);
+	struct dom_node *only = (!hb && !ha) ? dom_only_text(n) : 0;
 	if (only) {                                        /* <tag>text</tag> inline */
 		dom_emit_text(t, only->text, 80);
 		tb_puts(t, "</"); tb_puts(t, tag); tb_putc(t, '>');
@@ -404,8 +451,10 @@ static void dom_emit(struct textblk *t, struct dom_node *n, int depth, int *idx)
 	}
 
 	tb_newline(t);                                     /* open tag on its own line */
+	if (hb) { dom_record(my); dom_indent(t, depth + 1); tb_puts(t, "::before"); tb_newline(t); }
 	for (struct dom_node *c = n->first_child; c; c = c->next)
 		dom_emit(t, c, depth + 1, idx);
+	if (ha) { dom_record(my); dom_indent(t, depth + 1); tb_puts(t, "::after"); tb_newline(t); }
 	dom_record(my);                                    /* closing line = same node */
 	dom_indent(t, depth);
 	tb_puts(t, "</"); tb_puts(t, tag); tb_putc(t, '>');
@@ -421,27 +470,6 @@ static struct dom_node *dom_node_at(struct dom_node *n, int target, int *idx)
 		if (r) return r;
 	}
 	return 0;
-}
-
-/* Emit the css.c-modeled declarations of one css_style, each on its own line at
- * indent `ind`. Returns the number printed (0 = the rule set nothing we model). */
-static int emit_decls(const struct css_style *cs, const char *ind)
-{
-	int n = 0;
-	#define DL(...) do { tb_puts(&dt_sty, ind); __VA_ARGS__; tb_newline(&dt_sty); n++; } while (0)
-	if (cs->disp == CSS_DISP_BLOCK)  DL(tb_puts(&dt_sty, "display: block"));
-	else if (cs->disp == CSS_DISP_INLINE) DL(tb_puts(&dt_sty, "display: inline"));
-	else if (cs->disp == CSS_DISP_NONE)   DL(tb_puts(&dt_sty, "display: none"));
-	if (cs->color >= 0) DL(tb_puts(&dt_sty, "color: "); tb_putcolor(&dt_sty, (unsigned)cs->color));
-	if (cs->bg >= 0)    DL(tb_puts(&dt_sty, "background: "); tb_putcolor(&dt_sty, (unsigned)cs->bg));
-	if (cs->bold == 1)  DL(tb_puts(&dt_sty, "font-weight: bold"));
-	if (cs->under == 1) DL(tb_puts(&dt_sty, "text-decoration: underline"));
-	if (cs->center == 1)DL(tb_puts(&dt_sty, "text-align: center"));
-	if (cs->width >= 0) DL(tb_puts(&dt_sty, "width: "); tb_putu(&dt_sty, cs->width); tb_puts(&dt_sty, "px"));
-	if (cs->height >= 0)DL(tb_puts(&dt_sty, "height: "); tb_putu(&dt_sty, cs->height); tb_puts(&dt_sty, "px"));
-	if (cs->fam[0])     DL(tb_puts(&dt_sty, "font-family: "); tb_puts(&dt_sty, cs->fam));
-	#undef DL
-	return n;
 }
 
 /* Build the Styles view for the selected node, like a real devtools pane: the
@@ -507,9 +535,20 @@ static void style_emit(struct dom_node *root)
 		tb_puts(&dt_sty, m[i].selector); tb_puts(&dt_sty, " {"); tb_newline(&dt_sty);
 
 		char ind[8]; int k = 0; while (base[k]) { ind[k] = base[k]; k++; } ind[k++] = ' '; ind[k++] = ' '; ind[k] = '\0';
-		if (emit_decls(&m[i].decl, ind) == 0) {
+		/* The authored declarations, verbatim — including properties this engine
+		 * doesn't model (shown like a real devtools, not silently dropped). */
+		if (m[i].raw && m[i].raw[0]) {
+			const char *seg = m[i].raw;
+			while (*seg) {
+				const char *e = seg, *s2;
+				while (*e && *e != ';') e++;
+				s2 = seg; while (s2 < e && *s2 == ' ') s2++;
+				if (e > s2) { tb_puts(&dt_sty, ind); while (s2 < e) tb_putc(&dt_sty, *s2++); tb_putc(&dt_sty, ';'); tb_newline(&dt_sty); }
+				seg = *e ? e + 1 : e;
+			}
+		} else {
 			tb_puts(&dt_sty, ind);
-			tb_puts(&dt_sty, "/* only properties this engine doesn't model */");
+			tb_puts(&dt_sty, "/* (empty rule) */");
 			tb_newline(&dt_sty);
 		}
 		tb_puts(&dt_sty, base); tb_puts(&dt_sty, "}"); tb_newline(&dt_sty);
@@ -528,11 +567,15 @@ void devtools_worker_tick(void)
 
 	struct dom_node *root = html_dom_root();
 	dt_lock();
-	tb_reset(&dt_dom);
-	if (root) { int idx = 0; dom_emit(&dt_dom, root, 0, &idx); }
-	else { tb_puts(&dt_dom, "(no document loaded)"); tb_newline(&dt_dom); }
-	if (dt_sel >= dt_dom_node_cap) dt_sel = -1;
-	style_emit(root);
+	if (root) {                          /* live page: rebuild Elements + Styles */
+		tb_reset(&dt_dom);
+		int idx = 0; dom_emit(&dt_dom, root, 0, &idx);
+		if (dt_sel >= dt_dom_node_cap) dt_sel = -1;
+		style_emit(root);
+	} else if (dt_dom.nlines == 0) {     /* no doc and nothing frozen: placeholder */
+		tb_reset(&dt_dom);
+		tb_puts(&dt_dom, "(no document loaded)"); tb_newline(&dt_dom);
+	}                                    /* else: keep the frozen snapshot of a backgrounded tab */
 	dt_dirty = 0;
 	dt_unlock();
 
@@ -551,17 +594,36 @@ void devtools_toggle(void)
 
 int devtools_visible(void) { return dt_open; }
 
-int devtools_top(void)
+/* Right-side split (content | devtools), not an overlay: the panel docks on the
+ * right for the full content height, and the page pane shrinks to its left. */
+#define DT_MINW 240
+static int dt_user_w = 0;            /* 0 = auto (default fraction); >0 = user-dragged */
+static int dt_width(void)
 {
-	if (!dt_open) return BH;
-	int pane_top = MENU_H + TAB_H + ADDR_H;
-	int h = BH * 5 / 12;
-	if (h < 140) h = 140;
-	int top = BH - h;
-	if (top < pane_top + 24) top = pane_top + 24;   /* always leave some page visible */
-	if (top < 0) top = 0;
-	return top;
+	int w = dt_user_w > 0 ? dt_user_w : BW * 5 / 12;
+	if (w > BW - 220) w = BW - 220;   /* always leave the page a usable width */
+	if (w < DT_MINW)  w = DT_MINW;
+	if (w > BW - 80)  w = BW - 80;    /* tiny window: degrade gracefully      */
+	if (w < 60)       w = 60;
+	return w;
 }
+/* Drag-to-resize: the panel docks right, so its width is (BW - pointer x). */
+void devtools_set_width(int w) { dt_user_w = w; B->seq++; }
+/* Is (mx,my) on the panel's left-edge splitter (the drag handle)? */
+int devtools_on_splitter(int mx, int my)
+{
+	int x;
+	if (!dt_open) return 0;
+	x = devtools_left();
+	return mx >= x - 3 && mx <= x + 3 && my >= devtools_top() && my < BH;
+}
+
+/* X of the panel's left edge — equals BW when closed, so the page gets the full
+ * width and callers can use [0, devtools_left()) as the page region. */
+int devtools_left(void) { return dt_open ? BW - dt_width() : BW; }
+
+/* Y of the panel's top edge: just below the toolbar (tab strip + address bar). */
+int devtools_top(void) { return MENU_H + TAB_H + ADDR_H; }
 
 static const char *const tab_names[N_TABS] = { "Elements", "Styles", "Console", "Network" };
 
@@ -579,7 +641,7 @@ static int tab_w(int i) { return gfx_ui_width(tab_names[i]) + 18; }
 
 static int content_top(int top) { return top + DT_HDR; }
 static int content_rows(int top) { int h = BH - content_top(top); return h > 0 ? h / ROW_H : 0; }
-static int content_w(void) { return BW - SCROLL_W; }   /* leaves room for the scrollbar */
+static int content_w(void) { return (BW - devtools_left()) - SCROLL_W; }   /* panel minus scrollbar */
 
 /* Total scrollable line count of the active tab (read under dt_lock by caller). */
 static int active_lines(void)
@@ -657,77 +719,118 @@ static void draw_style_line(int x, int y, const char *s)
 	gfx_text_utf8(x, y, s + colon + 1, DT_C_VALUE, GFX_TRANSPARENT);   /* " value" */
 }
 
+/* Physical rows a console/network line occupies once wrapped at `max` columns. */
+static int wrap_rows_for(const char *s, int max)
+{
+	int len = 0; while (s && s[len]) len++;
+	int r = (len + max - 1) / max;
+	return r < 1 ? 1 : r;
+}
+/* The topmost logical line such that [start, total) fit (wrapped) in `rows`
+ * physical rows — i.e. the scroll position that shows the newest content. */
+static int con_tail_start(struct conline *ring, int cap, int base, int total, int rows, int max)
+{
+	int used = 0, i;
+	for (i = total - 1; i >= 0; i--) {
+		int r = wrap_rows_for(ring[(base + i) % cap].text, max);
+		if (used + r > rows) break;
+		used += r;
+	}
+	int start = i + 1;
+	if (start >= total && total > 0) start = total - 1;   /* a line taller than the panel */
+	if (start < 0) start = 0;
+	return start;
+}
+
 void devtools_render(void)
 {
 	if (!dt_open) return;
-	int top = devtools_top();
-	int w = BW, h = BH - top;
+	int left = devtools_left(), top = devtools_top();
+	int w = BW - left, h = BH - top;
 
 	dt_lock();
 
-	gfx_fill_rect(0, top, w, h, 0x1e1e1e);          /* panel body */
-	gfx_fill_rect(0, top, w, DT_HDR, 0x14171c);     /* header row */
+	gfx_fill_rect(left, top, w, h, 0x1e1e1e);          /* panel body */
+	gfx_fill_rect(left, top, w, DT_HDR, 0x14171c);     /* header row */
+	gfx_fill_rect(left, top, 1, h, 0x000000);          /* splitter line */
 
 	for (int i = 0; i < N_TABS; i++)
-		button_draw(tab_x(i), top, tab_w(i), DT_HDR, tab_names[i],
+		button_draw(left + tab_x(i), top, tab_w(i), DT_HDR, tab_names[i],
 		            i == dt_tab ? BTN_PRESSED : BTN_NORMAL);
-	button_draw(w - DT_CLOSE_W, top, DT_CLOSE_W, DT_HDR, "\xc3\x97", BTN_NORMAL);   /* × */
+	button_draw(BW - DT_CLOSE_W, top, DT_CLOSE_W, DT_HDR, "\xc3\x97", BTN_NORMAL);   /* × */
 
 	int ct = content_top(top), rows = content_rows(top), cw = content_w();
+	int tx = left + 6;
 	int total = active_lines();
 	int *sc = &dt_scroll[dt_tab];
 
-	if (dt_tab == TAB_CONSOLE && con_follow)
-		*sc = total;                                 /* pinned to the newest line */
-	*sc = clamp_scroll(*sc, total, rows);
-	if (dt_tab == TAB_CONSOLE)
-		con_follow = (*sc >= total - rows);          /* at bottom -> keep following */
+	if (dt_tab == TAB_ELEMENTS || dt_tab == TAB_STYLES)
+		*sc = clamp_scroll(*sc, total, rows);    /* console/network clamp below (wrap-aware) */
 
 	int max = (cw - 8) / GLYPH_W; if (max > 255) max = 255; if (max < 1) max = 1;
 	char line[256];
-	for (int r = 0; r < rows; r++) {
-		int idx = *sc + r;
-		if (idx >= total) break;
-		int y = ct + r * ROW_H;
-		if (dt_tab == TAB_CONSOLE || dt_tab == TAB_NETWORK) {
-			struct conline *ring = dt_tab == TAB_CONSOLE ? con : net;
-			int cap = dt_tab == TAB_CONSOLE ? CON_MAX : NET_MAX;
-			int base = dt_tab == TAB_CONSOLE ? con_start : net_start;
+	if (dt_tab == TAB_CONSOLE || dt_tab == TAB_NETWORK) {
+		/* Console/Network lines wrap: a long message spans as many rows as it needs
+		 * (so a full error/URL is readable), and scrolling steps by logical line. */
+		struct conline *ring = dt_tab == TAB_CONSOLE ? con : net;
+		int cap = dt_tab == TAB_CONSOLE ? CON_MAX : NET_MAX;
+		int base = dt_tab == TAB_CONSOLE ? con_start : net_start;
+		int bottom = ct + rows * ROW_H, y, idx;
+		int maxstart = con_tail_start(ring, cap, base, total, rows, max);
+		if (dt_tab == TAB_CONSOLE && con_follow) *sc = maxstart;   /* pinned to newest */
+		if (*sc > maxstart) *sc = maxstart;
+		if (*sc < 0) *sc = 0;
+		if (dt_tab == TAB_CONSOLE) con_follow = (*sc >= maxstart);
+		y = ct; idx = *sc;
+		while (idx < total && y + ROW_H <= bottom) {
 			int slot = (base + idx) % cap;
 			unsigned fg = ring[slot].level == DT_ERROR ? 0xf08080
 			            : ring[slot].level == DT_WARN  ? 0xe0c060 : 0xcdd3de;
-			if (ring[slot].level == DT_ERROR)
-				gfx_fill_rect(0, y, cw, ROW_H, 0x3a2222);
-			int n = 0; const char *s = ring[slot].text;
-			while (s && s[n] && n < max - 1) { line[n] = s[n]; n++; } line[n] = '\0';
-			gfx_text_utf8(6, y, line, fg, GFX_TRANSPARENT);
-		} else if (dt_tab == TAB_ELEMENTS) {
+			int iserr = ring[slot].level == DT_ERROR;
+			const char *s = ring[slot].text;
+			int len = 0, off = 0;
+			while (s && s[len]) len++;
+			do {
+				int n = 0;
+				while (off + n < len && n < max - 1) { line[n] = s[off + n]; n++; }
+				line[n] = '\0';
+				if (iserr) gfx_fill_rect(left, y, cw, ROW_H, 0x3a2222);
+				gfx_text_utf8(tx, y, line, fg, GFX_TRANSPARENT);
+				off += n; y += ROW_H;
+			} while (off < len && y + ROW_H <= bottom);
+			idx++;
+		}
+	} else for (int r = 0; r < rows; r++) {
+		int idx = *sc + r;
+		if (idx >= total) break;
+		int y = ct + r * ROW_H;
+		if (dt_tab == TAB_ELEMENTS) {
 			int sel = (idx < dt_dom_node_cap && dt_dom_node[idx] == dt_sel);
-			if (sel) gfx_fill_rect(0, y, cw, ROW_H, 0x094771);
+			if (sel) gfx_fill_rect(left, y, cw, ROW_H, 0x094771);
 			tb_line(&dt_dom, idx, line, max);
-			draw_dom_line(6, y, line);
+			draw_dom_line(tx, y, line);
 		} else {
 			tb_line(&dt_sty, idx, line, max);
-			draw_style_line(6, y, line);
+			draw_style_line(tx, y, line);
 		}
 	}
 
-	scrollbar_draw(w - SCROLL_W, ct, SCROLL_W, BH - ct, *sc, total, rows);
+	scrollbar_draw(BW - SCROLL_W, ct, SCROLL_W, BH - ct, *sc, total, rows);
 	dt_unlock();
 }
 
 int devtools_handle_click(int mx, int my)
 {
 	if (!dt_open) return 0;
-	int top = devtools_top();
-	if (my < top) return 0;                          /* above the panel: not ours */
+	int left = devtools_left(), top = devtools_top();
+	if (mx < left || my < top) return 0;             /* left of/above the panel: not ours */
 
 	if (my < top + DT_HDR) {                          /* header buttons */
 		if (button_hit(BW - DT_CLOSE_W, top, DT_CLOSE_W, DT_HDR, mx, my)) {
 			devtools_toggle(); return 1;
 		}
 		for (int i = 0; i < N_TABS; i++)
-			if (button_hit(tab_x(i), top, tab_w(i), DT_HDR, mx, my)) {
+			if (button_hit(left + tab_x(i), top, tab_w(i), DT_HDR, mx, my)) {
 				dt_tab = i; B->seq++; return 1;
 			}
 		return 1;
@@ -750,7 +853,7 @@ int devtools_handle_click(int mx, int my)
 		return 1;
 	}
 
-	if (mx < content_w() && dt_tab == TAB_ELEMENTS) {   /* select a DOM node */
+	if (mx < BW - SCROLL_W && dt_tab == TAB_ELEMENTS) {   /* select a DOM node */
 		int row = dt_scroll[dt_tab] + (my - ct) / ROW_H;
 		dt_lock();
 		int ok = row >= 0 && row < dt_dom.nlines && row < dt_dom_node_cap;
@@ -764,8 +867,7 @@ int devtools_handle_click(int mx, int my)
 int devtools_handle_scroll(int delta)
 {
 	if (!dt_open) return 0;
-	int top = devtools_top();
-	int rows = content_rows(top);
+	int rows = content_rows(devtools_top());
 	dt_lock();
 	int total = active_lines();
 	dt_unlock();

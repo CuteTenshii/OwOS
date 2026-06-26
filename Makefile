@@ -32,6 +32,7 @@ clean:
 	rm -f user/lib/*.o user/lib/*/*.o
 	rm -f user/apps/cli/*.o user/apps/cli/*.elf
 	rm -f user/apps/gui/*.o user/apps/gui/*.elf user/apps/gui/browser/*.o
+	find user -name '*.d' -delete
 	rm -rf $(ISODIR)
 
 # Also remove the disk images (wipes stored files).

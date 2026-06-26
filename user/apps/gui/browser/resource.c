@@ -19,7 +19,7 @@ static int memrd_get(void *c)
 }
 
 /* Self-contained per-thread HTTP reader: several images fetch in parallel, each
- * over its OWN socket/buffer, so they never touch B->sock/B->raw (which only the
+ * over its OWN socket/buffer, so they never touch B->sock/B->pg->raw (which only the
  * page fetch uses). The kernel TLS is multi-flow, so the HTTPS handshakes run
  * concurrently. */
 struct ireader { int sock; unsigned char buf[2048]; int pos, len, eof; };
@@ -166,15 +166,31 @@ static unsigned char *subres_get(const char *absurl, const char *accept, int *ou
 {
 	int status = 0;
 	unsigned char *body = browser_fetch_url(absurl, "GET", 0, 0, 0, accept,
-	                                        &status, 0, 0, outlen);
+	                                        &status, 0, 0, outlen, 0);
 	if (body && status != 200) { free(body); return 0; }
 	return body;
 }
 
 /* Build an arbitrary-method request (for the JS fetch()): like build_get but with
  * the method, an optional Content-Type, and a Content-Length when a body follows. */
+/* Append a caller's "Name: value\r\n" header blob to an HTTP/2 header buffer,
+ * lowercasing each field name (HTTP/2 requires lowercase header names). */
+static void h2_append_headers(char *xh, int *xn, int cap, const char *extra)
+{
+	const char *p = extra;
+	while (p && *p) {
+		const char *eol = p; while (*eol && *eol != '\n') eol++;
+		const char *colon = p; while (colon < eol && *colon != ':') colon++;
+		for (const char *q = p; q < colon && *xn < cap - 1; q++) { char c = *q; xh[(*xn)++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+		for (const char *q = colon; *q && q <= eol && *xn < cap - 1; q++) xh[(*xn)++] = *q;
+		if (*xn < cap) xh[*xn] = '\0';
+		p = *eol ? eol + 1 : eol;
+	}
+}
+
 static void build_request(char *req, int *n, int cap, const struct purl *u,
-                          const char *method, const char *accept, const char *ctype, int blen)
+                          const char *method, const char *accept, const char *ctype, int blen,
+                          const char *extra_hdrs)
 {
 	sapp(req, n, cap, method); sapp(req, n, cap, " ");
 	sapp(req, n, cap, u->path);
@@ -188,7 +204,9 @@ static void build_request(char *req, int *n, int cap, const struct purl *u,
 	sapp(req, n, cap, accept && accept[0] ? accept : "*/*");
 	if (ctype && ctype[0]) { sapp(req, n, cap, "\r\nContent-Type: "); sapp(req, n, cap, ctype); }
 	if (blen > 0) { sapp(req, n, cap, "\r\nContent-Length: "); uapp(req, n, cap, (unsigned)blen); }
-	sapp(req, n, cap, "\r\nConnection: close\r\n\r\n");
+	sapp(req, n, cap, "\r\nConnection: close\r\n");
+	if (extra_hdrs && extra_hdrs[0]) sapp(req, n, cap, extra_hdrs);   /* caller-supplied, each "Name: value\r\n" */
+	sapp(req, n, cap, "\r\n");
 }
 
 /* h2 response body sink for browser_fetch_url: append DATA into a growable buffer. */
@@ -209,7 +227,8 @@ static int h2buf_cb(void *ctx, const unsigned char *p, int n)
 static unsigned char *fetch_loop(const char *url, const char *method,
                                  const unsigned char *reqbody, int reqlen, const char *req_ctype,
                                  const char *accept, struct resp_meta *meta_out,
-                                 char *final_url, int fu_cap, char *hdr_out, int hdr_cap, int *outlen)
+                                 char *final_url, int fu_cap, char *hdr_out, int hdr_cap, int *outlen,
+                                 const char *extra_hdrs)
 {
 	char full[URL_MAX]; { int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, url); }
 	int is_get = !method || streq_ci(method, "GET") || streq_ci(method, "HEAD");
@@ -239,6 +258,7 @@ static unsigned char *fetch_loop(const char *url, const char *method,
 			if (cookie_header(u.host, ck, sizeof ck) > 0) { sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n"); }
 			sapp(xh, &xn, sizeof xh, "accept: "); sapp(xh, &xn, sizeof xh, accept); sapp(xh, &xn, sizeof xh, "\r\n");
 			if (req_ctype && req_ctype[0]) { sapp(xh, &xn, sizeof xh, "content-type: "); sapp(xh, &xn, sizeof xh, req_ctype); sapp(xh, &xn, sizeof xh, "\r\n"); }
+			if (extra_hdrs && extra_hdrs[0]) h2_append_headers(xh, &xn, sizeof xh, extra_hdrs);
 			struct h2_opts opts = { BR_UA, xh, 0 };
 			struct h2buf hb; hb.cap = 65536; hb.blen = 0; hb.body = malloc((unsigned)hb.cap);
 			if (!hb.body) { net_close(sock); return 0; }
@@ -253,7 +273,7 @@ static unsigned char *fetch_loop(const char *url, const char *method,
 			blen = hb.blen;
 		} else {
 			char req[2048]; int n = 0;
-			build_request(req, &n, sizeof req, &u, method, accept, req_ctype, reqlen);
+			build_request(req, &n, sizeof req, &u, method, accept, req_ctype, reqlen, extra_hdrs);
 			if (net_send(sock, req, n) < 0) { net_close(sock); return 0; }
 			if (reqbody && reqlen > 0 && net_send(sock, (const char *)reqbody, reqlen) < 0) { net_close(sock); return 0; }
 			struct ireader r = { sock, { 0 }, 0, 0, 0 };
@@ -285,12 +305,13 @@ static unsigned char *fetch_loop(const char *url, const char *method,
  * fetch()'s Response is real. A thin wrapper over fetch_loop. Worker-thread only. */
 unsigned char *browser_fetch_url(const char *url, const char *method,
                                  const unsigned char *reqbody, int reqlen, const char *req_ctype,
-                                 const char *accept, int *status, char *out_ctype, int oc_cap, int *outlen)
+                                 const char *accept, int *status, char *out_ctype, int oc_cap, int *outlen,
+                                 const char *extra_hdrs)
 {
 	struct resp_meta meta;
 	*status = 0; *outlen = 0; if (out_ctype && oc_cap) out_ctype[0] = '\0';
 	unsigned char *body = fetch_loop(url, method, reqbody, reqlen, req_ctype, accept,
-	                                 &meta, 0, 0, 0, 0, outlen);
+	                                 &meta, 0, 0, 0, 0, outlen, extra_hdrs);
 	if (!body) return 0;
 	*status = meta.status;
 	if (out_ctype && oc_cap) { int k = 0; for (; meta.ctype[k] && k < oc_cap - 1; k++) out_ctype[k] = meta.ctype[k]; out_ctype[k] = '\0'; }
@@ -496,7 +517,7 @@ void fetch_iframes(void)
 
 		struct resp_meta meta; char final[URL_MAX]; char hdr[4096]; int len = 0;
 		unsigned char *body = fetch_loop(url, "GET", 0, 0, 0, "text/html,*/*",
-		                                 &meta, final, sizeof final, hdr, sizeof hdr, &len);
+		                                 &meta, final, sizeof final, hdr, sizeof hdr, &len, 0);
 		if (!body) { html_iframe_resolve(url, parent, FRAME_ERROR, "no response", 0, 0, 0); continue; }
 		if (meta.status < 200 || meta.status >= 300) {
 			char r[40]; int k = 0; sapp(r, &k, sizeof r, "HTTP "); uapp(r, &k, sizeof r, (unsigned)meta.status);
@@ -632,22 +653,23 @@ static int img_claim_next(void)
 {
 	int got = -1;
 	img_lock();
-	while (g_img_next < B->n_imgs) {
+	while (g_img_next < B->pg->n_imgs) {
 		int i = g_img_next++;
-		if (!B->imgs[i].lazy && !B->imgs[i].ok) { got = i; break; }  /* skip h2-done */
+		if (!B->pg->imgs[i].lazy && !B->pg->imgs[i].ok) { got = i; break; }  /* skip h2-done */
 	}
 	img_unlock();
 	return got;
 }
 
 /* Commit a fetched image body into img_pool for image `idx`: an SVG is
- * rasterized to RGBA, a PNG stored verbatim. Sets im->ok last so the UI only
- * draws a fully-committed image. Does NOT free `body` (the caller owns it).
- * Shared by the HTTP/1.1 fetcher and the h2 multiplexed prefetch. The short
- * img_lock guards only the img_pool_len bump; the copy is to a disjoint region. */
-static void commit_image(int idx, const unsigned char *body, int blen)
+ * rasterized to RGBA (its `currentColor` resolving to `current_color`), a PNG
+ * stored verbatim. Sets im->ok last so the UI only draws a fully-committed image.
+ * Does NOT free `body` (the caller owns it). Shared by the HTTP/1.1 fetcher and
+ * the h2 multiplexed prefetch. The short img_lock guards only the img_pool_len
+ * bump; the copy is to a disjoint region. */
+static void commit_image(int idx, const unsigned char *body, int blen, unsigned current_color)
 {
-	struct inl_img *im = &B->imgs[idx];
+	struct inl_img *im = &B->pg->imgs[idx];
 
 	if (svg_probe((const char *)body, blen)) {         /* SVG -> rasterize to RGBA */
 		int sw = 0, sh = 0;
@@ -657,7 +679,7 @@ static void commit_image(int idx, const unsigned char *body, int blen)
 		if (sw < 1) sw = 1;
 		if (sh < 1) sh = 1;
 		unsigned *argb = malloc((unsigned)sw * sh * 4);
-		if (argb && svg_render((const char *)body, blen, sw, sh, argb)) {
+		if (argb && svg_render((const char *)body, blen, sw, sh, argb, current_color)) {
 			int bytes = sw * sh * 4;
 			int off = -1;
 			img_lock();
@@ -699,24 +721,33 @@ static void commit_image(int idx, const unsigned char *body, int blen)
 		if (off >= 0) {
 			memcpy(B->img_pool + off, body, (unsigned)blen);  /* disjoint: no lock */
 			im->coff = off; im->clen = blen;
-			if (okdim) { im->iw = iw; im->ih = ih; im->uid = ++B->img_uid_next; }
+			if (okdim) { im->iw = iw; im->ih = ih; im->uid = ++B->pg->img_uid_next; }
 			im->ok = okdim;            /* set last: the UI draws once ok is seen */
 			B->seq++;                  /* repaint as each image lands            */
 		}
 	}
 }
 
+/* Commit image bytes we already hold in memory (e.g. an inline <svg> element
+ * serialized back to SVG text by html.c) into image slot `idx` — no network
+ * fetch. Reuses the same committer as the HTTP path; `current_color` is what the
+ * SVG's `currentColor` resolves to (the element's CSS color). */
+void resource_commit_inline(int idx, const unsigned char *body, int len, unsigned current_color)
+{
+	commit_image(idx, body, len, current_color);
+}
+
 /* Fetch inline image `i` over its own HTTP/1.1 socket and commit it. Safe to run
  * on several threads at once (the h1.1 pool path). */
 static void fetch_image(int i, const char *page_url)
 {
-	B->imgs[i].ok = 0;
+	B->pg->imgs[i].ok = 0;
 	char full[URL_MAX];
-	resolve_url(page_url, B->imgs[i].href, full, sizeof full);
+	resolve_url(page_url, B->pg->imgs[i].href, full, sizeof full);
 	int blen = 0;
 	unsigned char *body = subres_get(full, "image/png,image/svg+xml,*/*", &blen);
 	if (!body) return;
-	commit_image(i, body, blen);
+	commit_image(i, body, blen, 0x000000);
 	free(body);
 }
 
@@ -724,7 +755,7 @@ static int favicon_decode(const unsigned char *r, int n);   /* defined below */
 
 /* on_done bridge for the h2 batch: map a batch request index back to its target
  * (idxs[]) and consume that resource as its stream lands. An index of FAV_IDX is
- * the page favicon (decoded into B->favicon); anything else is an image index. */
+ * the page favicon (decoded into B->pg->favicon); anything else is an image index. */
 #define FAV_IDX (-1)
 struct h2img_ctx { const int *idxs; };
 static void h2img_commit(void *ctx, int b, const unsigned char *body, int blen)
@@ -732,13 +763,13 @@ static void h2img_commit(void *ctx, int b, const unsigned char *body, int blen)
 	const struct h2img_ctx *c = ctx;
 	char full[URL_MAX];
 	if (c->idxs[b] == FAV_IDX) {
-		resolve_url(g_img_page, B->favicon_href[0] ? B->favicon_href : "/favicon.ico", full, sizeof full);
+		resolve_url(g_img_page, B->pg->favicon_href[0] ? B->pg->favicon_href : "/favicon.ico", full, sizeof full);
 		devtools_net_add("GET", full, 200, "", blen);
-		if (favicon_decode(body, blen)) { B->favicon_ok = 1; B->seq++; }
+		if (favicon_decode(body, blen)) { B->pg->favicon_ok = 1; B->seq++; }
 	} else {
-		resolve_url(g_img_page, B->imgs[c->idxs[b]].href, full, sizeof full);
+		resolve_url(g_img_page, B->pg->imgs[c->idxs[b]].href, full, sizeof full);
 		devtools_net_add("GET", full, 200, "image/*", blen);
-		commit_image(c->idxs[b], body, blen);
+		commit_image(c->idxs[b], body, blen, 0x000000);
 	}
 }
 
@@ -757,8 +788,8 @@ static void h2_prefetch(const char *page_url)
 	struct h2_fetch reqs[H2_FETCH_MAX];
 	int idxs[H2_FETCH_MAX], nb = 0;
 
-	for (int i = 0; i < B->n_imgs && nb < H2_FETCH_MAX; i++) {
-		struct inl_img *im = &B->imgs[i];
+	for (int i = 0; i < B->pg->n_imgs && nb < H2_FETCH_MAX; i++) {
+		struct inl_img *im = &B->pg->imgs[i];
 		if (im->lazy || im->ok) continue;
 		char full[URL_MAX];
 		resolve_url(page_url, im->href, full, sizeof full);
@@ -782,7 +813,7 @@ static void h2_prefetch(const char *page_url)
 	 * which runs only when favicon_ok is still 0. */
 	if (nb < H2_FETCH_MAX) {
 		char fav[URL_MAX];
-		resolve_url(page_url, B->favicon_href[0] ? B->favicon_href : "/favicon.ico",
+		resolve_url(page_url, B->pg->favicon_href[0] ? B->pg->favicon_href : "/favicon.ico",
 		            fav, sizeof fav);
 		struct purl fu;
 		if (parse_url(fav, &fu) && fu.tls &&
@@ -880,13 +911,13 @@ void fetch_inline_images(const char *page_url)
  * do — which keeps the worker mostly idle until the user actually scrolls. */
 int fetch_lazy_visible(void)
 {
-	if (!B->cur_url[0])
+	if (!B->pg->cur_url[0])
 		return 0;
-	for (int i = 0; i < B->n_imgs; i++) {
-		struct inl_img *im = &B->imgs[i];
+	for (int i = 0; i < B->pg->n_imgs; i++) {
+		struct inl_img *im = &B->pg->imgs[i];
 		if (!im->lazy || im->fetched || !im->want)
 			continue;
-		fetch_image(i, B->cur_url);
+		fetch_image(i, B->pg->cur_url);
 		im->fetched = 1; im->want = 0;
 		B->seq++;                  /* re-layout now that the image has landed   */
 		return 1;
@@ -895,8 +926,8 @@ int fetch_lazy_visible(void)
 }
 
 /* ------------------------------------------------------------ favicon decode */
-/* A favicon is fetched into B->raw and decoded down to a fixed 16x16 ARGB
- * bitmap (B->favicon) for the tab strip. PNG favicons go through upng; .ico
+/* A favicon is fetched into B->pg->raw and decoded down to a fixed 16x16 ARGB
+ * bitmap (B->pg->favicon) for the tab strip. PNG favicons go through upng; .ico
  * files are parsed here (best directory entry -> embedded PNG or a raw DIB).
  * Anything we can't decode (GIF/BMP/SVG/empty) just leaves favicon_ok 0 and the
  * tab shows the default globe. */
@@ -927,7 +958,7 @@ static int fav_decode_png(const unsigned char *buf, int len)
 	unsigned iw = 0, ih = 0;
 	if (upng_dimensions(memrd_get, &mr, &iw, &ih) != 0 || !iw || !ih)
 		return 0;
-	struct favscale v = { iw, ih, 0, B->favicon };
+	struct favscale v = { iw, ih, 0, B->pg->favicon };
 	struct memrd mr2 = { buf, 0, len };
 	if (upng_decode(memrd_get, &mr2, fav_row, &v, 0, 0) != 0)
 		return 0;
@@ -1009,7 +1040,7 @@ static int fav_decode_dib(const unsigned char *p, int len)
 				unsigned mb = arow[sx >> 3];
 				if ((mb >> (7 - (sx & 7))) & 1) a = 0;   /* mask bit set = clear   */
 			}
-			B->favicon[dy * FAVICON_W + dx] =
+			B->pg->favicon[dy * FAVICON_W + dx] =
 				(a << 24) | (r << 16) | (g << 8) | b;
 		}
 	}
@@ -1036,7 +1067,7 @@ static int ico_pick(const unsigned char *p, int len, int *poff, int *plen)
 	return best >= 0;
 }
 
-/* Decode `buf` (a fetched favicon) into B->favicon; returns 1 on success. */
+/* Decode `buf` (a fetched favicon) into B->pg->favicon; returns 1 on success. */
 static int favicon_decode(const unsigned char *r, int n)
 {
 	if (n < 4) return 0;
@@ -1052,23 +1083,23 @@ static int favicon_decode(const unsigned char *r, int n)
 		return fav_decode_dib(img, l);
 	}
 	if (svg_probe((const char *)r, n))                            /* SVG favicon */
-		return svg_render((const char *)r, n, FAVICON_W, FAVICON_H, B->favicon);
+		return svg_render((const char *)r, n, FAVICON_W, FAVICON_H, B->pg->favicon, 0x000000);
 	return 0;                                  /* GIF/BMP favicons unsupported */
 }
 
-/* Fetch and decode the page favicon into B->favicon, from the <link rel=icon>
+/* Fetch and decode the page favicon into B->pg->favicon, from the <link rel=icon>
  * href the parser found, else /favicon.ico. subres_get follows CDN redirects and
- * uses its own socket/buffer, so this no longer clobbers B->raw. Leaves
+ * uses its own socket/buffer, so this no longer clobbers B->pg->raw. Leaves
  * favicon_ok 0 on any failure (the tab falls back to the globe). */
 void fetch_favicon(const char *page_url)
 {
-	if (B->favicon_ok) return;       /* already decoded on the image h2 batch */
+	if (B->pg->favicon_ok) return;       /* already decoded on the image h2 batch */
 	char full[URL_MAX];
-	resolve_url(page_url, B->favicon_href[0] ? B->favicon_href : "/favicon.ico",
+	resolve_url(page_url, B->pg->favicon_href[0] ? B->pg->favicon_href : "/favicon.ico",
 	            full, sizeof full);
 	int len = 0;
 	unsigned char *body = subres_get(full, "image/png,image/x-icon,image/svg+xml,*/*", &len);
 	if (!body) return;
-	if (favicon_decode(body, len)) B->favicon_ok = 1;
+	if (favicon_decode(body, len)) B->pg->favicon_ok = 1;
 	free(body);
 }

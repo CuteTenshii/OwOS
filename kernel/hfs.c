@@ -442,10 +442,9 @@ static int visit_list(struct hfs_mount *m, const struct catrec *c, void *vp)
 	if (L->want_idx < 0) {                    /* print mode */
 		struct obj o; rec_to_obj(c, &o);
 		con_write(o.is_dir ? "  <DIR>  " : "         ");
-		if (!o.is_dir) { con_write_dec((uint32_t)o.size); con_write("  "); }
+		if (!o.is_dir) { con_printf("%u  ", (uint32_t)o.size); }
 		else           { con_write("  "); }
-		con_write(nm);
-		con_putc('\n');
+		con_printf("%s\n", nm);
 		return 0;
 	}
 	/* index mode */

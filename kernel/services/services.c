@@ -97,9 +97,7 @@ void services_init(void)
 		if (registry[i].autostart && svc_start(&registry[i]) == 0)
 			started++;
 
-	con_write("services: supervisor up, ");
-	con_write_dec((uint32_t)started);
-	con_write(" auto-started.\n");
+	con_printf("services: supervisor up, %u auto-started.\n", (uint32_t)started);
 }
 
 /* ------------------------------------------------------------------- command */
@@ -128,23 +126,17 @@ static void cmd_list(void)
 			write_field("-", 7);
 		}
 		write_field(s->state == SVC_RUNNING ? "running" : "stopped", 9);
-		con_write(s->desc);
-		con_putc('\n');
+		con_printf("%s\n", s->desc);
 	}
 }
 
 static void cmd_status(service_t *s)
 {
-	con_write(s->name);
-	con_write(": ");
-	con_write(s->state == SVC_RUNNING ? "running" : "stopped");
+	con_printf("%s: %s", s->name, s->state == SVC_RUNNING ? "running" : "stopped");
 	if (s->state == SVC_RUNNING) {
-		con_write(", up ");
-		con_write_dec(timer_seconds() - s->since);
-		con_write("s");
-		if (s->port) { con_write(", port "); con_write_dec(s->port); }
-		con_write(", activity ");
-		con_write_dec(s->work);
+		con_printf(", up %us", timer_seconds() - s->since);
+		if (s->port) { con_printf(", port %u", s->port); }
+		con_printf(", activity %u", s->work);
 	}
 	con_putc('\n');
 }
@@ -178,29 +170,25 @@ void services_cmd(const char *args)
 
 	service_t *s = svc_find(rest);
 	if (!s) {
-		con_write("services: no such service: ");
-		con_write(rest);
-		con_putc('\n');
+		con_printf("services: no such service: %s\n", rest);
 		return;
 	}
 
 	if (streq(verb, "start")) {
 		int r = svc_start(s);
-		if (r == 0)      con_write("started "), con_write(s->name), con_putc('\n');
-		else if (r == 1) con_write(s->name), con_write(" already running\n");
-		else             con_write("failed to start "), con_write(s->name), con_putc('\n');
+		if (r == 0)      con_printf("started %s\n", s->name);
+		else if (r == 1) con_printf("%s already running\n", s->name);
+		else             con_printf("failed to start %s\n", s->name);
 	} else if (streq(verb, "stop")) {
 		svc_stop(s);
-		con_write("stopped "), con_write(s->name), con_putc('\n');
+		con_printf("stopped %s\n", s->name);
 	} else if (streq(verb, "restart")) {
 		svc_stop(s);
-		if (svc_start(s) == 0) con_write("restarted "), con_write(s->name), con_putc('\n');
-		else                   con_write("failed to restart "), con_write(s->name), con_putc('\n');
+		if (svc_start(s) == 0) con_printf("restarted %s\n", s->name);
+		else                   con_printf("failed to restart %s\n", s->name);
 	} else if (streq(verb, "status")) {
 		cmd_status(s);
 	} else {
-		con_write("services: unknown subcommand: ");
-		con_write(verb);
-		con_putc('\n');
+		con_printf("services: unknown subcommand: %s\n", verb);
 	}
 }

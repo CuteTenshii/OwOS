@@ -115,6 +115,8 @@ void js_lexer_init(jlexer *lx, const char *src, js_arena *arena) {
     lx->prev_kind = 0;
     lx->saw_newline = 0;
     lx->brace_sp = 0;
+    lx->paren_sp = 0;
+    lx->prev_rparen_ctrl = 0;
     lx->err = NULL;
 }
 
@@ -347,6 +349,7 @@ static void scan_regex(jlexer *lx, jtoken *out) {
 
 void js_lex_next(jlexer *lx, jtoken *out) {
     char c;
+    int rparen_ctrl;
     out->kind = T_EOF; out->newline_before = 0; out->num = 0;
     out->value = NULL; out->value_len = 0; out->flags = NULL; out->len = 0;
 
@@ -359,6 +362,10 @@ void js_lex_next(jlexer *lx, jtoken *out) {
     out->start = lx->p;
 
     c = *lx->p;
+    /* Carry the "previous token was a control-flow header ')'" flag across the
+     * trivia between that ')' and this token, then clear it; re-set below only
+     * when this token is itself such a ')'. */
+    rparen_ctrl = lx->prev_rparen_ctrl; lx->prev_rparen_ctrl = 0;
     if (c == 0) { out->kind = T_EOF; lx->prev_kind = T_EOF; return; }
 
     if (is_id_start(c)) {
@@ -368,6 +375,21 @@ void js_lex_next(jlexer *lx, jtoken *out) {
         out->value = js_arena_strndup(lx->arena, s, out->len);
         out->value_len = out->len;
         out->kind = keyword_kind(s, out->len);
+        lx->prev_kind = out->kind;
+        return;
+    }
+
+    /* A private class name (#field / #method): lexed as an ordinary identifier
+     * token whose text keeps the leading '#', so it flows through the normal
+     * property-key / member-access machinery as the key "#name". */
+    if (c == '#' && is_id_start((unsigned char)lx->p[1])) {
+        const char *s = lx->p;
+        lx->p++;                                  /* '#' */
+        while (is_id_cont(*lx->p)) lx->p++;
+        out->len = (int)(lx->p - s);
+        out->value = js_arena_strndup(lx->arena, s, out->len);
+        out->value_len = out->len;
+        out->kind = T_IDENT;
         lx->prev_kind = out->kind;
         return;
     }
@@ -406,7 +428,7 @@ void js_lex_next(jlexer *lx, jtoken *out) {
         lx->p++; out->kind = T_RBRACE; out->len = 1; lx->prev_kind = T_RBRACE; return;
     }
 
-    if (c == '/' && regex_allowed(lx->prev_kind)) {
+    if (c == '/' && (regex_allowed(lx->prev_kind) || rparen_ctrl)) {
         scan_regex(lx, out);
         out->len = (int)(lx->p - out->start);
         if (out->kind != T_ERROR) lx->prev_kind = out->kind;
@@ -418,8 +440,21 @@ void js_lex_next(jlexer *lx, jtoken *out) {
         char d = lx->p[1];
         switch (c) {
         case '{': if (lx->brace_sp < (int)sizeof(lx->brace)) lx->brace[lx->brace_sp++] = 0; ADV(1, T_LBRACE);
-        case '(': ADV(1, T_LPAREN);
-        case ')': ADV(1, T_RPAREN);
+        case '(': {
+            /* Remember whether this '(' is an if/for/while/with header: a ')'
+             * closing it is followed by a statement, so a '/' there is a regex. */
+            int ctrl = (lx->prev_kind == T_IF || lx->prev_kind == T_FOR
+                        || lx->prev_kind == T_WHILE || lx->prev_kind == T_WITH);
+            if (lx->paren_sp < (int)sizeof(lx->paren)) lx->paren[lx->paren_sp++] = (unsigned char)ctrl;
+            ADV(1, T_LPAREN);
+        }
+        case ')': {
+            int ctrl = 0;
+            if (lx->paren_sp > 0) ctrl = lx->paren[--lx->paren_sp];
+            lx->p += 1; out->kind = T_RPAREN; out->len = 1;
+            lx->prev_kind = T_RPAREN; lx->prev_rparen_ctrl = ctrl;
+            return;
+        }
         case '[': ADV(1, T_LBRACK);
         case ']': ADV(1, T_RBRACK);
         case ';': ADV(1, T_SEMI);

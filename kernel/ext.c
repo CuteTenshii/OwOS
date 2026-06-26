@@ -411,10 +411,9 @@ static int dir_walk(struct ext_mount *m, const char *path, int want_idx, char *n
 							s = (uint32_t)inode_size(m->cur_inode);
 						}
 						con_write(isd ? "  <DIR>  " : "         ");
-						if (!isd) { con_write_dec(s); con_write("  "); }
+						if (!isd) { con_printf("%u  ", s); }
 						else      { con_write("  "); }
-						con_write(nm);
-						con_putc('\n');
+						con_printf("%s\n", nm);
 					} else if (seen == want_idx) {     /* index mode */
 						if (read_inode(m, ino, m->cur_inode) == 0) {
 							isd = inode_is_dir(m->cur_inode);

@@ -104,11 +104,8 @@ void smp_init(void)
 		apic_to_idx[cpus[i].apic_id] = (uint8_t)i;
 	topo_ready = 1;
 
-	con_write("smp: ");
-	con_write_dec((uint32_t)ncpu);
-	con_write(" CPU(s); LAPIC @ ");
-	con_write_hex(lapic_base);
-	if (ioapic_base) { con_write(", IOAPIC @ "); con_write_hex(ioapic_base); }
+	con_printf("smp: %u CPU(s); LAPIC @ 0x%08X", (uint32_t)ncpu, lapic_base);
+	if (ioapic_base) { con_printf(", IOAPIC @ 0x%08X", ioapic_base); }
 	con_write(".\n");
 }
 
@@ -298,11 +295,7 @@ void smp_start_aps(void)
 	int online = 0;
 	for (uint32_t m = online_mask; m; m &= m - 1)
 		online++;
-	con_write("smp: ");
-	con_write_dec((uint32_t)online);
-	con_write("/");
-	con_write_dec((uint32_t)ncpu);
-	con_write(" cores online.\n");
+	con_printf("smp: %u/%u cores online.\n", (uint32_t)online, (uint32_t)ncpu);
 }
 
 int smp_online_count(void)

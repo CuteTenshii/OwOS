@@ -26,8 +26,10 @@
 #define WM_BAR_H     28      /* taskbar height                                 */
 #define WM_TITLE_MAX 64      /* max window title length (incl. NUL)            */
 #define WM_GRIP      14      /* bottom-right resize-grip size                  */
+#define WM_EDGE      5       /* edge/corner resize hot-zone width              */
 #define WM_MIN_W     140     /* smallest a window may be dragged to            */
-#define WM_MIN_H     90
+#define WM_MIN_H     120     /* tall enough to keep an app's top chrome (menu/  */
+                             /* tab/address bars) on screen when shrunk         */
 
 /* Cursor shapes. The compositor picks one per frame from context (a hand over
  * clickable chrome, the diagonal arrow over a resize grip, the spinner while a
@@ -39,7 +41,10 @@ enum wm_cursor {
 	WM_CURSOR_HAND,         /* pointing hand — over clickable things          */
 	WM_CURSOR_TEXT,         /* I-beam — over editable / selectable text       */
 	WM_CURSOR_BUSY,         /* animated spinner — "working / loading"         */
-	WM_CURSOR_RESIZE,       /* diagonal double-arrow — over a resize grip     */
+	WM_CURSOR_RESIZE_NWSE,  /* diagonal double-arrow ↖↘ — over a corner/grip   */
+	WM_CURSOR_RESIZE_NESW,  /* diagonal double-arrow ↗↙ — other corner         */
+	WM_CURSOR_RESIZE_NS,    /* vertical double-arrow ↕ — top/bottom edge       */
+	WM_CURSOR_RESIZE_EW,    /* horizontal double-arrow ↔ — left/right edge     */
 	WM_CURSOR_COUNT
 };
 
@@ -141,5 +146,10 @@ int wm_focus_key_space(void);
  * the WM thread launches /bin/cliphist on its next frame (loading an ELF can't
  * happen in the interrupt) and pastes the chosen clip when it exits. */
 void wm_request_cliphist(void);
+
+/* Request a screen-resolution change (w x h). Posted from the sysfs writer (a
+ * ring-3 task) and applied by the compositor thread, which owns the framebuffer
+ * geometry. The mode must be one fb_set_mode accepts, else it's ignored. */
+void wm_request_mode(int w, int h);
 
 #endif

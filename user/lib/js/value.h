@@ -35,7 +35,17 @@ typedef struct {
 } js_value;
 
 /* object "kind" — refines a js_object */
-enum { OBJ_PLAIN, OBJ_ARRAY, OBJ_FUNCTION, OBJ_ERROR, OBJ_SYMBOL };
+enum { OBJ_PLAIN, OBJ_ARRAY, OBJ_FUNCTION, OBJ_ERROR, OBJ_SYMBOL, OBJ_ARRAYBUFFER, OBJ_TYPEDARRAY };
+
+/* typed-array element kinds (index into ta_elem_size). DataView uses type -1. */
+enum { TA_I8, TA_U8, TA_U8C, TA_I16, TA_U16, TA_I32, TA_U32, TA_F32, TA_F64 };
+#define TA_DATAVIEW (-1)
+
+/* OBJ_ARRAYBUFFER host: the raw backing bytes. OBJ_TYPEDARRAY host: a view onto
+ * an ArrayBuffer (DataView is a view with type == TA_DATAVIEW; `length` is its
+ * element count, or byteLength for a DataView). */
+typedef struct { unsigned char *data; int byteLength; } js_arraybuffer;
+typedef struct { js_object *buffer; int type, offset, length; } js_typedarray;
 
 /* property entry flags */
 enum { P_ENUMERABLE = 1, P_WRITABLE = 2, P_CONFIGURABLE = 4, P_ACCESSOR = 8 };
@@ -159,6 +169,11 @@ void     js_set_index(js_ctx *ctx, js_value obj, unsigned i, js_value val);
 void     js_array_push(js_ctx *ctx, js_object *arr, js_value v);
 unsigned js_array_len(js_object *arr);
 void     js_array_set_len(js_ctx *ctx, js_object *arr, unsigned len);
+
+/* typed-array element access (the backing-byte read/write behind ta[i]) */
+int      ta_elem_size(int type);
+js_value ta_get(js_object *view, unsigned idx);                 /* number, or undefined */
+void     ta_set(js_ctx *ctx, js_object *view, unsigned idx, js_value v);
 
 /* ---- coercions (ECMAScript abstract operations) ------------------------- */
 

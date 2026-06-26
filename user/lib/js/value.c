@@ -117,6 +117,7 @@ static void trace(void *obj, int kind) {
         mark_pmap(&o->props);
         for (i = 0; i < o->elen; i++) mark_value(o->elems[i]);
         if (o->fn) { gc_mark(o->fn->closure); gc_mark(o->fn->home); mark_value(o->fn->data); }
+        if (o->kind == OBJ_TYPEDARRAY && o->host) gc_mark(((js_typedarray *)o->host)->buffer);
     }
 }
 
@@ -129,6 +130,8 @@ static void finalize(void *obj, int kind) {
         if (o->elems) free(o->elems);
         if (o->fn) free(o->fn);
         if (o->kind == OBJ_SYMBOL && o->host) free(o->host);   /* the symbol key string */
+        if (o->kind == OBJ_ARRAYBUFFER && o->host) { js_arraybuffer *ab = (js_arraybuffer *)o->host; if (ab->data) free(ab->data); free(ab); }
+        if (o->kind == OBJ_TYPEDARRAY && o->host) free(o->host);  /* the view; its buffer is GC'd separately */
     }
 }
 
@@ -333,6 +336,55 @@ void js_array_push(js_ctx *ctx, js_object *arr, js_value v) {
     (void)ctx;
 }
 
+int ta_elem_size(int type) {
+    switch (type) {
+        case TA_I8: case TA_U8: case TA_U8C: return 1;
+        case TA_I16: case TA_U16:            return 2;
+        case TA_F64:                          return 8;
+        default:                              return 4;   /* I32/U32/F32 */
+    }
+}
+
+js_value ta_get(js_object *view, unsigned idx) {
+    js_typedarray *ta = (js_typedarray *)view->host;
+    js_arraybuffer *ab;
+    unsigned char *p;
+    if (!ta || ta->type < 0 || idx >= (unsigned)ta->length) return js_undef();
+    ab = (js_arraybuffer *)ta->buffer->host;
+    p = ab->data + ta->offset + idx * (unsigned)ta_elem_size(ta->type);
+    switch (ta->type) {
+        case TA_I8:                return js_number((double)*(signed char *)p);
+        case TA_U8: case TA_U8C:   return js_number((double)*p);
+        case TA_I16: { short x;          memcpy(&x, p, 2); return js_number((double)x); }
+        case TA_U16: { unsigned short x; memcpy(&x, p, 2); return js_number((double)x); }
+        case TA_I32: { int x;            memcpy(&x, p, 4); return js_number((double)x); }
+        case TA_U32: { unsigned x;       memcpy(&x, p, 4); return js_number((double)x); }
+        case TA_F32: { float x;          memcpy(&x, p, 4); return js_number((double)x); }
+        case TA_F64: { double x;         memcpy(&x, p, 8); return js_number(x); }
+    }
+    return js_undef();
+}
+
+void ta_set(js_ctx *ctx, js_object *view, unsigned idx, js_value v) {
+    js_typedarray *ta = (js_typedarray *)view->host;
+    js_arraybuffer *ab;
+    unsigned char *p;
+    if (!ta || ta->type < 0 || idx >= (unsigned)ta->length) return;
+    ab = (js_arraybuffer *)ta->buffer->host;
+    p = ab->data + ta->offset + idx * (unsigned)ta_elem_size(ta->type);
+    if (ta->type == TA_F32) { float f = (float)js_to_number(ctx, v); memcpy(p, &f, 4); return; }
+    if (ta->type == TA_F64) { double d = js_to_number(ctx, v); memcpy(p, &d, 8); return; }
+    if (ta->type == TA_U8C) {                       /* ToUint8Clamp */
+        double d = js_to_number(ctx, v); int x;
+        if (d != d || d <= 0) x = 0; else if (d >= 255) x = 255; else x = (int)(d + 0.5);
+        *p = (unsigned char)x; return;
+    }
+    {   /* integer kinds: ToUint32 then store the low byte(s) (little-endian x86) */
+        unsigned u = js_to_uint32(ctx, v);
+        memcpy(p, &u, (unsigned)ta_elem_size(ta->type));
+    }
+}
+
 void js_set_index(js_ctx *ctx, js_value obj, unsigned i, js_value val) {
     if (obj.type == JV_OBJ && obj.u.obj->kind == OBJ_ARRAY) {
         js_object *a = obj.u.obj;
@@ -340,6 +392,7 @@ void js_set_index(js_ctx *ctx, js_value obj, unsigned i, js_value val) {
         a->elems[i] = val;
         return;
     }
+    if (obj.type == JV_OBJ && obj.u.obj->kind == OBJ_TYPEDARRAY) { ta_set(ctx, obj.u.obj, i, val); return; }
     {
         char buf[24];
         u64toa((unsigned long long)i, buf, 10);
@@ -353,6 +406,7 @@ js_value js_get_index(js_ctx *ctx, js_value obj, unsigned i) {
         if (i < a->elen) return a->elems[i];
         return js_undef();
     }
+    if (obj.type == JV_OBJ && obj.u.obj->kind == OBJ_TYPEDARRAY) return ta_get(obj.u.obj, i);
     if (obj.type == JV_STR) {
         if ((int)i < obj.u.str->len) return js_mk_string(ctx, obj.u.str->data + i, 1);
         return js_undef();
@@ -388,6 +442,7 @@ js_value js_get(js_ctx *ctx, js_value obj, const char *key) {
             if (strcmp(key, "length") == 0) return js_number(o->elen);
             if (as_index(key, &idx)) return js_get_index(ctx, obj, idx);
         }
+        if (o->kind == OBJ_TYPEDARRAY && as_index(key, &idx)) return ta_get(o, idx);
     } else {
         char msg[160]; int i = 0; const char *p;
         for (p = "cannot read property '"; *p && i < 120; p++) msg[i++] = *p;
@@ -422,6 +477,7 @@ void js_set(js_ctx *ctx, js_value obj, const char *key, js_value val) {
         if (strcmp(key, "length") == 0) { js_array_set_len(ctx, o, js_to_uint32(ctx, val)); return; }
         if (as_index(key, &idx)) { js_set_index(ctx, obj, idx, val); return; }
     }
+    if (o->kind == OBJ_TYPEDARRAY && as_index(key, &idx)) { ta_set(ctx, o, idx, val); return; }
 
     /* own data property: update in place */
     {

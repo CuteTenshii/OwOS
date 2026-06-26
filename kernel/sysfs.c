@@ -9,6 +9,7 @@
  *   /sys/class/net/eth0/{address,carrier,ipaddr}              (ro)
  *   /sys/class/block/<dev>/{model,size}                       (ro)
  *   /sys/class/graphics/fb0/{width,height,refresh,monitor,internal}  (ro)
+ *   /sys/class/graphics/fb0/{mode,modes}       screen resolution   (rw/ro, DISPI)
  *   /sys/class/sound/card0/{output,outputs}    audio output select  (rw/ro)
  *   /sys/class/dmi/id/{product_name,sys_vendor}               (ro, SMBIOS)
  *   /sys/bus/pci/devices/<bdf>/{vendor,device,class}          (ro, one dir/device)
@@ -36,6 +37,7 @@
 #include "edid.h"
 #include "smbios.h"
 #include "hda.h"
+#include "wm.h"
 
 /* The single NIC's sysfs name (we keep one card; nic.c is driver-agnostic). */
 #define NET_IFACE "eth0"
@@ -237,10 +239,13 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
 		}
 		if (eq(seg[1], "graphics")) {
 			if (n == 3) return eq(seg[2], "fb0") ? S_DIR : S_NONE;
-			if (n == 4 && eq(seg[2], "fb0") &&
-			    (eq(seg[3], "width") || eq(seg[3], "height") || eq(seg[3], "refresh") ||
-			     eq(seg[3], "monitor") || eq(seg[3], "internal")))
-				return S_FILE_RO;
+			if (n == 4 && eq(seg[2], "fb0")) {
+				if (eq(seg[3], "width") || eq(seg[3], "height") || eq(seg[3], "refresh") ||
+				    eq(seg[3], "monitor") || eq(seg[3], "internal") || eq(seg[3], "modes"))
+					return S_FILE_RO;
+				if (eq(seg[3], "mode"))     /* rw only where we can drive the mode */
+					return fb_can_set_mode() ? S_FILE_RW : S_FILE_RO;
+			}
 			return S_NONE;
 		}
 		if (eq(seg[1], "dmi")) {
@@ -324,6 +329,24 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
 				ps(b, mon); pc(b, '\n'); return;
 			}
 			if (eq(seg[3], "internal")) { ps(b, edid_internal() ? "1" : "0"); pc(b, '\n'); return; }
+			if (eq(seg[3], "mode")) {     /* the current mode, "WxH"             */
+				pu(b, fb_active() ? fb_width() : 0); pc(b, 'x');
+				pu(b, fb_active() ? fb_height() : 0); pc(b, '\n'); return;
+			}
+			if (eq(seg[3], "modes")) {    /* one "WxH" per line; index = row     */
+				/* Only enumerate the switchable list where we can actually drive
+				 * the mode (DISPI). On an adopted/GOP framebuffer the resolution is
+				 * fixed, so just report the current one. */
+				if (fb_can_set_mode()) {
+					uint32_t w, h;
+					for (int i = 0; fb_mode_get(i, &w, &h); i++) {
+						pu(b, w); pc(b, 'x'); pu(b, h); pc(b, '\n');
+					}
+				} else if (fb_active()) {
+					pu(b, fb_width()); pc(b, 'x'); pu(b, fb_height()); pc(b, '\n');
+				}
+				return;
+			}
 		}
 		if (eq(seg[1], "dmi")) {
 			if (eq(seg[3], "product_name")) { const char *s = smbios_product(); ps(b, s ? s : ""); pc(b, '\n'); return; }
@@ -405,6 +428,19 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
 				if (hda_output_name(i, nm, (int)sizeof nm) && eq(nm, arg)) { idx = i; break; }
 		}
 		return hda_output_select(idx) == 0 ? 0 : -1;
+	}
+	if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") &&
+	    eq(seg[2], "fb0") && eq(seg[3], "mode")) {
+		/* "WxH": validate the shape here, hand the switch to the compositor. */
+		int w = 0, h = 0;
+		const char *p = arg;
+		while (*p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
+		if (*p != 'x' && *p != 'X') return -1;
+		p++;
+		while (*p >= '0' && *p <= '9') h = h * 10 + (*p++ - '0');
+		if (w <= 0 || h <= 0 || !fb_can_set_mode()) return -1;
+		wm_request_mode(w, h);
+		return 0;
 	}
 	return -1;
 }
@@ -552,8 +588,9 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
 		return hit;
 	}
 	if (n == 3 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0")) {
-		static const char *const k[] = { "width", "height", "refresh", "monitor", "internal" };
-		hit = from_list(idx, name, max, k, 5);
+		static const char *const k[] = { "width", "height", "refresh", "monitor",
+		                                 "internal", "mode", "modes" };
+		hit = from_list(idx, name, max, k, 7);
 		if (hit && is_dir) *is_dir = 0;
 		return hit;
 	}

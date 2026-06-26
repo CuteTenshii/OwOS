@@ -12,7 +12,10 @@ int svg_size(const char *data, int len, int *w, int *h);
 
 /* Render `len` bytes of SVG into the caller's w*h buffer of 0xAARRGGBB pixels.
  * Returns 1 on success (out filled), 0 if it isn't usable SVG. Aspect ratio is
- * preserved (centered); edges are antialiased by supersampling. */
-int svg_render(const char *data, int len, int w, int h, unsigned *out);
+ * preserved (centered); edges are antialiased by supersampling. `current_color`
+ * (0xRRGGBB) is what `currentColor` resolves to — pass the element's CSS color
+ * for inline <svg>, or a default (e.g. black) for a standalone image. */
+int svg_render(const char *data, int len, int w, int h, unsigned *out,
+               unsigned current_color);
 
 #endif /* OWOS_SVG_H */

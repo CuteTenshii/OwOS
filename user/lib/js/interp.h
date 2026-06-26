@@ -34,8 +34,13 @@ struct js_ctx {
 
     js_object *object_proto, *function_proto, *array_proto, *string_proto,
               *number_proto, *boolean_proto, *error_proto, *promise_proto,
-              *symbol_proto, *map_proto, *set_proto, *weakmap_proto, *weakset_proto, *date_proto;
+              *symbol_proto, *map_proto, *set_proto, *weakmap_proto, *weakset_proto, *date_proto,
+              *regexp_proto;
     js_value   sym_iterator;    /* the well-known Symbol.iterator                 */
+    /* typed arrays: the shared %TypedArray%.prototype, the per-view prototypes
+     * (indexed by TA_*), plus ArrayBuffer/DataView prototypes. */
+    js_object *typedarray_proto, *arraybuffer_proto, *dataview_proto;
+    js_object *typed_protos[9];
     /* error subclass prototypes (TypeError, RangeError, ...) chain to error_proto */
     js_object *type_error_proto, *range_error_proto, *syntax_error_proto, *ref_error_proto;
 
@@ -111,6 +116,10 @@ int      js_promise_inspect(js_ctx *ctx, js_value v, js_value *out);
 
 /* builtins.c — populate the global object and the prototype objects. */
 void     js_setup_builtins(js_ctx *ctx);
+
+/* Build a RegExp object (on ctx->regexp_proto) from a source + flag string.
+ * Shared by the `/.../ ` literal (interp.c) and the RegExp constructor. */
+js_value js_make_regexp(js_ctx *ctx, const char *source, const char *flags);
 
 /* Convenience used widely by builtins to define a native method on an object. */
 void     js_def_native(js_ctx *ctx, js_object *o, const char *name, js_native fn, int arity);

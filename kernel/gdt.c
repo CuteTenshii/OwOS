@@ -94,7 +94,9 @@ void gdt_init(void)
 	gdt_set_entry(&gdt[0], 0, 0,       0,    0);     /* 0x00: null            */
 	gdt_set_entry(&gdt[1], 0, 0xFFFFF, 0x9A, 0xA0);  /* 0x08: kernel code     */
 	gdt_set_entry(&gdt[2], 0, 0xFFFFF, 0x92, 0xC0);  /* 0x10: kernel data     */
-	gdt_set_entry(&gdt[3], 0, 0xFFFFF, 0xFA, 0xA0);  /* 0x18: user code (DPL3)*/
+	/* User code is 32-bit compat (G=1,D=1 = 0xC0), not L=1: user programs are
+	 * always 32-bit ELF, so iretq into 0x1B drops the CPU to compatibility mode. */
+	gdt_set_entry(&gdt[3], 0, 0xFFFFF, 0xFA, 0xC0);  /* 0x18: user code (DPL3)*/
 	gdt_set_entry(&gdt[4], 0, 0xFFFFF, 0xF2, 0xC0);  /* 0x20: user data (DPL3)*/
 
 	for (int i = 0; i < SMP_MAX_CPUS; i++) {

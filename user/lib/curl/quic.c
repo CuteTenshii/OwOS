@@ -50,31 +50,9 @@ static int varsize(uint64_t v)
 	return v < 0x40 ? 1 : v < 0x4000 ? 2 : v < 0x40000000 ? 4 : 8;
 }
 
-/* Weak best-effort randomness — enough to keep the ClientHello.random, the
- * ephemeral x25519 key, and the connection IDs unpredictable on this hobby OS
- * (the kernel TLS code does the same). NOT a real entropy source. */
-static void gen_random(uint8_t *out, uint32_t n)
-{
-	static uint32_t ctr;
-	while (n) {
-		struct sha256 s;
-		sha256_init(&s);
-		uint32_t a = msec(), b = uptime(), c = now_hms(), d = ctr++;
-		volatile int onstack;
-		uint32_t e = (uint32_t)(unsigned long)&onstack;
-		sha256_update(&s, &a, 4);
-		sha256_update(&s, &b, 4);
-		sha256_update(&s, &c, 4);
-		sha256_update(&s, &d, 4);
-		sha256_update(&s, &e, 4);
-		uint8_t h[32];
-		sha256_final(&s, h);
-		uint32_t take = n < 32 ? n : 32;
-		memcpy(out, h, take);
-		out += take;
-		n -= take;
-	}
-}
+/* ClientHello.random, the ephemeral x25519 key and the connection IDs come from
+ * the shared userspace CSPRNG (rng_bytes: RDRAND-backed). */
+static void gen_random(uint8_t *out, uint32_t n) { rng_bytes(out, (int)n); }
 
 /* ------------------------------------------------------- connection state */
 

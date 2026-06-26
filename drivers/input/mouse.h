@@ -19,4 +19,6 @@ uint32_t mouse_seq(void);
  * returns the current level. */
 void mouse_set_speed(int level);
 int  mouse_speed(void);
+/* Move the cursor's clamp box (called by the WM after a resolution change). */
+void mouse_set_bounds(int max_x, int max_y);
 #endif

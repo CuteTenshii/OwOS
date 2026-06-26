@@ -36,6 +36,7 @@ void con_clear(void);
 void con_set_color(enum con_color fg, enum con_color bg);
 void con_putc(char c);
 void con_write(const char *s);
+void con_printf(const char *fmt, ...);  /* formatted write; see kstring.h kvformat */
 void con_write_hex(uint32_t value);   /* prints "0x" + 8 hex digits */
 void con_write_dec(uint32_t value);   /* prints unsigned decimal     */
 void con_put_hex(uint32_t value, int digits);  /* `digits` lowercase hex, no "0x" */

@@ -165,7 +165,31 @@ static js_value m_sign(js_ctx *ctx, js_value t, js_value *a, int n) {
 }
 static js_value m_pow(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return js_number(pow(js_to_number(ctx, ARG(0)), js_to_number(ctx, ARG(1)))); }
 static js_value m_atan2(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return js_number(atan2(js_to_number(ctx, ARG(0)), js_to_number(ctx, ARG(1)))); }
-static js_value m_hypot(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return js_number(hypot(js_to_number(ctx, ARG(0)), js_to_number(ctx, ARG(1)))); }
+/* hypot is variadic in JS: sqrt of the sum of squares of every argument */
+static js_value m_hypot(js_ctx *ctx, js_value t, js_value *a, int n) {
+    double s = 0; int i; (void)t;
+    for (i = 0; i < n; i++) { double x = js_to_number(ctx, a[i]); s += x * x; }
+    return js_number(sqrt(s));
+}
+/* inverse hyperbolics, expm1, log1p — composed from the base libm calls (the
+ * freestanding libm has log/exp/sqrt but not these). Out-of-domain inputs fall
+ * out as NaN/Inf naturally, matching the spec's edge cases. */
+static js_value m_asinh(js_ctx *ctx, js_value t, js_value *a, int n) { double x = js_to_number(ctx, ARG(0)); (void)t; return js_number(log(x + sqrt(x * x + 1.0))); }
+static js_value m_acosh(js_ctx *ctx, js_value t, js_value *a, int n) { double x = js_to_number(ctx, ARG(0)); (void)t; return js_number(log(x + sqrt(x * x - 1.0))); }
+static js_value m_atanh(js_ctx *ctx, js_value t, js_value *a, int n) { double x = js_to_number(ctx, ARG(0)); (void)t; return js_number(0.5 * log((1.0 + x) / (1.0 - x))); }
+static js_value m_expm1(js_ctx *ctx, js_value t, js_value *a, int n) { double x = js_to_number(ctx, ARG(0)); (void)t; return js_number(exp(x) - 1.0); }
+static js_value m_log1p(js_ctx *ctx, js_value t, js_value *a, int n) { double x = js_to_number(ctx, ARG(0)); (void)t; return js_number(log(1.0 + x)); }
+static js_value m_fround(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return js_number((double)(float)js_to_number(ctx, ARG(0))); }
+static js_value m_clz32(js_ctx *ctx, js_value t, js_value *a, int n) {
+    unsigned x = js_to_uint32(ctx, ARG(0)); int c = 0; (void)t;
+    if (!x) return js_number(32);
+    while (!(x & 0x80000000u)) { c++; x <<= 1; }
+    return js_number(c);
+}
+static js_value m_imul(js_ctx *ctx, js_value t, js_value *a, int n) {
+    unsigned x = (unsigned)js_to_int32(ctx, ARG(0)), y = (unsigned)js_to_int32(ctx, ARG(1)); (void)t; (void)n;
+    return js_number((double)(int)(x * y));
+}
 static js_value m_max(js_ctx *ctx, js_value t, js_value *a, int n) {
     double r = -1.0 / 0.0; int i; (void)t;
     for (i = 0; i < n; i++) { double x = js_to_number(ctx, a[i]); if (x != x) return js_number(x); if (x > r) r = x; }
@@ -266,23 +290,34 @@ static js_value object_isfrozen(js_ctx *ctx, js_value t, js_value *a, int n) {
     return js_bool(!x.u.obj->extensible);
 }
 static js_value object_defprop(js_ctx *ctx, js_value t, js_value *a, int n) {
-    js_value o = ARG(0), desc = ARG(2);
-    js_value key = js_to_string(ctx, ARG(1));
-    js_value getter, setter, val, en, wr;
+    js_value o = ARG(0), desc = ARG(2), keyv = ARG(1);
+    js_value getter, setter, val, en, wr, ks = js_undef();
+    const char *key;
     unsigned char flags = 0;
     (void)t;
     if (o.type != JV_OBJ || desc.type != JV_OBJ) return js_throw_type(ctx, "defineProperty requires objects");
+    if (keyv.type == JV_SYMBOL) {
+        key = js_symbol_key(keyv);                 /* a Symbol key: use its internal key */
+    } else {
+        ks = js_to_string(ctx, keyv);
+        if (ctx->has_exc) return js_undef();
+        if (ks.type != JV_STR) return js_throw_type(ctx, "invalid property key");
+        key = ks.u.str->data;
+    }
+    gc_push_scope();
+    KEEP(o); KEEP(desc); KEEP(keyv); if (ks.type == JV_STR) KEEP(ks);   /* hold across js_get allocations */
     en = js_get(ctx, desc, "enumerable"); wr = js_get(ctx, desc, "writable");
     if (js_to_boolean(en)) flags |= P_ENUMERABLE;
     if (js_to_boolean(wr)) flags |= P_WRITABLE;
     flags |= P_CONFIGURABLE;
     getter = js_get(ctx, desc, "get"); setter = js_get(ctx, desc, "set");
     if (js_is_callable(getter) || js_is_callable(setter)) {
-        js_def_accessor(o.u.obj, key.u.str->data, js_is_callable(getter) ? getter.u.obj : NULL, js_is_callable(setter) ? setter.u.obj : NULL, flags);
+        js_def_accessor(o.u.obj, key, js_is_callable(getter) ? getter.u.obj : NULL, js_is_callable(setter) ? setter.u.obj : NULL, flags);
     } else {
         val = js_get(ctx, desc, "value");
-        js_def(o.u.obj, key.u.str->data, val, flags);
+        js_def(o.u.obj, key, val, flags);
     }
+    gc_pop_scope();
     return o;
 }
 static js_value object_ownnames(js_ctx *ctx, js_value t, js_value *a, int n) {
@@ -317,9 +352,16 @@ static js_value object_fromentries(js_ctx *ctx, js_value t, js_value *a, int n) 
     return js_obj_value(obj);
 }
 static js_value op_hasown(js_ctx *ctx, js_value t, js_value *a, int n) {
-    js_value k = js_to_string(ctx, ARG(0));
+    js_value kv = ARG(0), k;
+    const char *key;
     if (t.type != JV_OBJ) return js_bool(0);
-    return js_bool(js_has_own(t.u.obj, k.u.str->data));
+    if (kv.type == JV_SYMBOL) key = js_symbol_key(kv);
+    else {
+        k = js_to_string(ctx, kv);
+        if (ctx->has_exc || k.type != JV_STR) { ctx->has_exc = 0; ctx->exc_root = 0; return js_bool(0); }
+        key = k.u.str->data;
+    }
+    return js_bool(js_has_own(t.u.obj, key));
 }
 static js_value op_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
     (void)a; (void)n;
@@ -747,8 +789,617 @@ static js_value str_concat(js_ctx *ctx, js_value t, js_value *a, int n) {
     gc_pop_scope();
     return s;
 }
+/* ------------------------------------------------------- RegExp ----------- *
+ * A compact backtracking regex engine: the pattern is parsed into a small AST,
+ * compiled to a flat instruction list, then matched by a recursive backtracking
+ * VM (CHAR/ANY/CLASS/anchors + SPLIT/JMP/SAVE/MATCH, à la Russ Cox's "regexp2").
+ * Supported: literals, ., char classes [..]/[^..] with ranges and \d\w\s, anchors
+ * ^ $ \b \B, groups (capturing + (?:..)), alternation |, the quantifiers * + ?
+ * and {n,m} (greedy + lazy with a trailing ?), and the i/g/m/s flags. NOT
+ * supported: lookahead/behind (parsed as a plain group), backreferences (a \1 is
+ * a literal digit), and Unicode property escapes. A step + recursion-depth guard
+ * bounds catastrophic backtracking (a runaway match just reports "no match").
+ *
+ * RegExp objects carry only their source + flag strings; test/exec recompile per
+ * call (cheap for page scripts, and leak-free — the engine has no host finalizer). */
+
+enum { I_CHAR, I_ANY, I_CLASS, I_BOL, I_EOL, I_WORDB, I_NWORDB, I_SPLIT, I_JMP, I_SAVE, I_MATCH };
+typedef struct { unsigned char op, neg; char ch; int x, y; unsigned char set[32]; } reinst;
+typedef struct { reinst *ins; int n, cap; int ngroups; } reprog;
+
+enum { N_EMPTY, N_CHAR, N_ANY, N_CLASS, N_BOL, N_EOL, N_WORDB, N_NWORDB,
+       N_CAT, N_ALT, N_STAR, N_PLUS, N_QUEST, N_GROUP };
+typedef struct rnode {
+    int type; char ch; unsigned char neg, greedy; int gidx;
+    unsigned char set[32];
+    struct rnode *a, *b;
+} rnode;
+
+typedef struct {
+    const char *p, *end;
+    int ngroups, err;
+    rnode **all; int nall, callc;     /* every node, freed together (some are shared) */
+} recomp;
+
+#define RE_GROUPS_MAX 31
+#define RE_DEPTH_MAX  6000
+#define RE_STEPS_MAX  2000000
+
+static void re_setbit(unsigned char *set, unsigned char c) { set[c >> 3] |= (unsigned char)(1u << (c & 7)); }
+static int  re_getbit(const unsigned char *set, unsigned char c) { return (set[c >> 3] >> (c & 7)) & 1; }
+static int  re_flag(const char *flags, char f) { for (; flags && *flags; flags++) if (*flags == f) return 1; return 0; }
+static void re_setrange(unsigned char *set, unsigned lo, unsigned hi) { unsigned i; for (i = lo; i <= hi && i < 256; i++) re_setbit(set, (unsigned char)i); }
+static char re_lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+static char re_swapcase(char c) { if (c >= 'a' && c <= 'z') return (char)(c - 32); if (c >= 'A' && c <= 'Z') return (char)(c + 32); return c; }
+static int  re_word(int c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; }
+
+/* The \d \w \s class escapes (and uppercase complements) into a bitmap. Returns 1
+ * if `e` was such an escape (bits added), 0 if it is an ordinary escaped char. */
+static int re_class_escape(unsigned char *set, char e) {
+    unsigned char tmp[32]; int i, neg = 0; char l = re_lc(e);
+    for (i = 0; i < 32; i++) tmp[i] = 0;
+    if (l == 'd') re_setrange(tmp, '0', '9');
+    else if (l == 'w') { re_setrange(tmp, '0', '9'); re_setrange(tmp, 'A', 'Z'); re_setrange(tmp, 'a', 'z'); re_setbit(tmp, '_'); }
+    else if (l == 's') { re_setbit(tmp, ' '); re_setbit(tmp, '\t'); re_setbit(tmp, '\n'); re_setbit(tmp, '\r'); re_setbit(tmp, '\f'); re_setbit(tmp, '\v'); }
+    else return 0;
+    neg = (e >= 'A' && e <= 'Z');
+    for (i = 0; i < 256; i++) { int in = re_getbit(tmp, (unsigned char)i); if (in != neg) re_setbit(set, (unsigned char)i); }
+    return 1;
+}
+
+static rnode *rn_new(recomp *c, int type) {
+    rnode *n;
+    if (c->nall == c->callc) {
+        int nc = c->callc ? c->callc * 2 : 32;
+        rnode **na = (rnode **)realloc(c->all, (unsigned)nc * sizeof *na);
+        if (!na) { c->err = 1; return 0; }
+        c->all = na; c->callc = nc;
+    }
+    n = (rnode *)calloc(1, sizeof *n);
+    if (!n) { c->err = 1; return 0; }
+    n->type = type;
+    c->all[c->nall++] = n;
+    return n;
+}
+static rnode *rn_cat(recomp *c, rnode *a, rnode *b) {
+    rnode *n; if (!a) return b; if (!b) return a;
+    n = rn_new(c, N_CAT); if (!n) return a; n->a = a; n->b = b; return n;
+}
+
+static rnode *re_parse_alt(recomp *c);
+
+/* one hex digit, or -1 */
+static int re_hex(char ch) { if (ch >= '0' && ch <= '9') return ch - '0'; if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10; if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10; return -1; }
+static char re_read_hex(recomp *c, int ndig) {
+    int v = 0, i, h; for (i = 0; i < ndig && c->p < c->end; i++) { h = re_hex(*c->p); if (h < 0) break; v = v * 16 + h; c->p++; }
+    return (char)(v & 0xFF);
+}
+/* a backslash escape used as a single character (after the '\' is consumed) */
+static char re_escape_char(recomp *c) {
+    char e; if (c->p >= c->end) { c->err = 1; return '\\'; }
+    e = *c->p++;
+    switch (e) {
+        case 'n': return '\n'; case 't': return '\t'; case 'r': return '\r';
+        case 'f': return '\f'; case 'v': return '\v'; case '0': return '\0';
+        case 'x': return re_read_hex(c, 2);
+        case 'u': return re_read_hex(c, 4);
+        default:  return e;                 /* \. \\ \/ \( … and \1 (no backrefs) */
+    }
+}
+
+static rnode *re_parse_class(recomp *c) {
+    rnode *nd = rn_new(c, N_CLASS); int first = 1;
+    if (!nd) return 0;
+    c->p++;                                  /* '[' */
+    if (c->p < c->end && *c->p == '^') { nd->neg = 1; c->p++; }
+    while (c->p < c->end && (*c->p != ']' || first)) {
+        unsigned char lo;
+        first = 0;
+        if (*c->p == '\\') {
+            char peek = (c->p + 1 < c->end) ? c->p[1] : 0;
+            if (re_lc(peek) == 'd' || re_lc(peek) == 'w' || re_lc(peek) == 's') { c->p++; re_class_escape(nd->set, *c->p++); continue; }
+            c->p++; lo = (unsigned char)re_escape_char(c);
+        } else lo = (unsigned char)*c->p++;
+        if (c->p < c->end && *c->p == '-' && c->p + 1 < c->end && c->p[1] != ']') {
+            unsigned char hi;
+            c->p++;
+            if (*c->p == '\\') { c->p++; hi = (unsigned char)re_escape_char(c); }
+            else hi = (unsigned char)*c->p++;
+            re_setrange(nd->set, lo, hi);
+        } else re_setbit(nd->set, lo);
+    }
+    if (c->p < c->end && *c->p == ']') c->p++; else c->err = 1;
+    return nd;
+}
+
+static rnode *re_parse_atom(recomp *c) {
+    char ch;
+    if (c->p >= c->end) return 0;
+    ch = *c->p;
+    if (ch == '(') {
+        rnode *inner, *g; int cap = 1, gi = 0;
+        c->p++;
+        if (c->p < c->end && *c->p == '?') {     /* (?:..) and (unsupported) (?=..) etc. */
+            c->p++; cap = 0;
+            if (c->p < c->end && *c->p == ':') c->p++;
+            else if (c->p < c->end && (*c->p == '=' || *c->p == '!')) c->p++;   /* swallowed: matched as a plain group */
+        }
+        if (cap && c->ngroups < RE_GROUPS_MAX) gi = ++c->ngroups; else cap = 0;
+        inner = re_parse_alt(c);
+        if (c->p < c->end && *c->p == ')') c->p++; else c->err = 1;
+        g = rn_new(c, N_GROUP); if (!g) return inner;
+        g->a = inner; g->gidx = cap ? gi : 0;
+        return g;
+    }
+    if (ch == '[') return re_parse_class(c);
+    if (ch == '.') { c->p++; return rn_new(c, N_ANY); }
+    if (ch == '^') { c->p++; return rn_new(c, N_BOL); }
+    if (ch == '$') { c->p++; return rn_new(c, N_EOL); }
+    if (ch == '\\') {
+        char peek = (c->p + 1 < c->end) ? c->p[1] : 0;
+        if (re_lc(peek) == 'd' || re_lc(peek) == 'w' || re_lc(peek) == 's') {
+            rnode *nd = rn_new(c, N_CLASS); c->p++; if (nd) re_class_escape(nd->set, *c->p); c->p++; return nd;
+        }
+        if (peek == 'b') { c->p += 2; return rn_new(c, N_WORDB); }
+        if (peek == 'B') { c->p += 2; return rn_new(c, N_NWORDB); }
+        { rnode *nn; c->p++; nn = rn_new(c, N_CHAR); if (nn) nn->ch = re_escape_char(c); return nn; }
+    }
+    { rnode *nn = rn_new(c, N_CHAR); c->p++; if (nn) nn->ch = ch; return nn; }
+}
+
+static rnode *re_parse_quant(recomp *c) {
+    rnode *atom = re_parse_atom(c);
+    char q;
+    if (!atom || c->p >= c->end) return atom;
+    q = *c->p;
+    if (q == '*' || q == '+' || q == '?') {
+        rnode *r; int greedy = 1;
+        c->p++;
+        if (c->p < c->end && *c->p == '?') { greedy = 0; c->p++; }
+        r = rn_new(c, q == '*' ? N_STAR : q == '+' ? N_PLUS : N_QUEST);
+        if (!r) return atom;
+        r->a = atom; r->greedy = (unsigned char)greedy;
+        return r;
+    }
+    if (q == '{') {
+        const char *save = c->p;
+        int mn = 0, mx = -1, have = 0, greedy = 1, i;
+        rnode *result = 0;
+        c->p++;
+        while (c->p < c->end && *c->p >= '0' && *c->p <= '9') { mn = mn * 10 + (*c->p - '0'); have = 1; c->p++; }
+        if (c->p < c->end && *c->p == ',') { c->p++; if (c->p < c->end && *c->p >= '0' && *c->p <= '9') { mx = 0; while (c->p < c->end && *c->p >= '0' && *c->p <= '9') { mx = mx * 10 + (*c->p - '0'); c->p++; } } }
+        else mx = mn;
+        if (!have || c->p >= c->end || *c->p != '}') { c->p = save; return atom; }   /* literal '{' */
+        c->p++;
+        if (c->p < c->end && *c->p == '?') { greedy = 0; c->p++; }
+        for (i = 0; i < mn; i++) result = rn_cat(c, result, atom);
+        if (mx < 0) { rnode *st = rn_new(c, N_STAR); if (st) { st->a = atom; st->greedy = (unsigned char)greedy; result = rn_cat(c, result, st); } }
+        else for (i = mn; i < mx; i++) { rnode *qn = rn_new(c, N_QUEST); if (qn) { qn->a = atom; qn->greedy = (unsigned char)greedy; result = rn_cat(c, result, qn); } }
+        if (!result) result = rn_new(c, N_EMPTY);
+        return result;
+    }
+    return atom;
+}
+
+static rnode *re_parse_cat(recomp *c) {
+    rnode *head = 0;
+    while (!c->err && c->p < c->end && *c->p != '|' && *c->p != ')')
+        head = rn_cat(c, head, re_parse_quant(c));
+    return head ? head : rn_new(c, N_EMPTY);
+}
+static rnode *re_parse_alt(recomp *c) {
+    rnode *a = re_parse_cat(c);
+    while (!c->err && c->p < c->end && *c->p == '|') {
+        rnode *alt, *b;
+        c->p++;
+        b = re_parse_cat(c);
+        alt = rn_new(c, N_ALT); if (!alt) break;
+        alt->a = a; alt->b = b; a = alt;
+    }
+    return a;
+}
+
+static int re_emit_at(reprog *p, reinst in) {
+    if (p->n == p->cap) {
+        int nc = p->cap ? p->cap * 2 : 64;
+        reinst *ni = (reinst *)realloc(p->ins, (unsigned)nc * sizeof *ni);
+        if (!ni) return -1;
+        p->ins = ni; p->cap = nc;
+    }
+    p->ins[p->n] = in;
+    return p->n++;
+}
+static int re_emit(reprog *p, rnode *nd) {
+    reinst in;
+    int i, j;
+    memset(&in, 0, sizeof in);
+    if (!nd) return 0;
+    switch (nd->type) {
+        case N_EMPTY: return 0;
+        case N_CHAR:  in.op = I_CHAR; in.ch = nd->ch; return re_emit_at(p, in) < 0 ? -1 : 0;
+        case N_ANY:   in.op = I_ANY; return re_emit_at(p, in) < 0 ? -1 : 0;
+        case N_CLASS: in.op = I_CLASS; in.neg = nd->neg; memcpy(in.set, nd->set, 32); return re_emit_at(p, in) < 0 ? -1 : 0;
+        case N_BOL:   in.op = I_BOL; return re_emit_at(p, in) < 0 ? -1 : 0;
+        case N_EOL:   in.op = I_EOL; return re_emit_at(p, in) < 0 ? -1 : 0;
+        case N_WORDB: in.op = I_WORDB; return re_emit_at(p, in) < 0 ? -1 : 0;
+        case N_NWORDB:in.op = I_NWORDB; return re_emit_at(p, in) < 0 ? -1 : 0;
+        case N_CAT:   if (re_emit(p, nd->a) < 0) return -1; return re_emit(p, nd->b);
+        case N_ALT:
+            in.op = I_SPLIT; i = re_emit_at(p, in); if (i < 0) return -1;
+            p->ins[i].x = p->n;
+            if (re_emit(p, nd->a) < 0) return -1;
+            in.op = I_JMP; j = re_emit_at(p, in); if (j < 0) return -1;
+            p->ins[i].y = p->n;
+            if (re_emit(p, nd->b) < 0) return -1;
+            p->ins[j].x = p->n;
+            return 0;
+        case N_STAR: {
+            int l1 = p->n;
+            in.op = I_SPLIT; i = re_emit_at(p, in); if (i < 0) return -1;
+            p->ins[i].x = p->n;
+            if (re_emit(p, nd->a) < 0) return -1;
+            in.op = I_JMP; in.x = l1; if (re_emit_at(p, in) < 0) return -1;
+            p->ins[i].y = p->n;
+            if (!nd->greedy) { int tx = p->ins[i].x; p->ins[i].x = p->ins[i].y; p->ins[i].y = tx; }
+            return 0;
+        }
+        case N_PLUS: {
+            int l1 = p->n;
+            if (re_emit(p, nd->a) < 0) return -1;
+            in.op = I_SPLIT; in.x = l1; in.y = p->n + 1; i = re_emit_at(p, in); if (i < 0) return -1;
+            if (!nd->greedy) { int tx = p->ins[i].x; p->ins[i].x = p->ins[i].y; p->ins[i].y = tx; }
+            return 0;
+        }
+        case N_QUEST:
+            in.op = I_SPLIT; i = re_emit_at(p, in); if (i < 0) return -1;
+            p->ins[i].x = p->n;
+            if (re_emit(p, nd->a) < 0) return -1;
+            p->ins[i].y = p->n;
+            if (!nd->greedy) { int tx = p->ins[i].x; p->ins[i].x = p->ins[i].y; p->ins[i].y = tx; }
+            return 0;
+        case N_GROUP:
+            if (nd->gidx > 0) { in.op = I_SAVE; in.x = 2 * nd->gidx; if (re_emit_at(p, in) < 0) return -1; }
+            if (re_emit(p, nd->a) < 0) return -1;
+            if (nd->gidx > 0) { memset(&in, 0, sizeof in); in.op = I_SAVE; in.x = 2 * nd->gidx + 1; if (re_emit_at(p, in) < 0) return -1; }
+            return 0;
+    }
+    return 0;
+}
+
+static void re_free(reprog *p) { if (p) { if (p->ins) free(p->ins); free(p); } }
+
+static reprog *re_compile(const char *src, int srclen) {
+    recomp c; rnode *tree; reprog *p; reinst in; int i, ok;
+    c.p = src; c.end = src + srclen; c.ngroups = 0; c.err = 0;
+    c.all = 0; c.nall = 0; c.callc = 0;
+    tree = re_parse_alt(&c);
+    if (c.p != c.end) c.err = 1;                 /* trailing ')' or junk */
+    ok = !c.err;
+    p = (reprog *)calloc(1, sizeof *p);
+    if (p && ok) {
+        p->ngroups = c.ngroups;
+        memset(&in, 0, sizeof in); in.op = I_SAVE; in.x = 0; ok = re_emit_at(p, in) >= 0;
+        if (ok) ok = re_emit(p, tree) >= 0;
+        if (ok) { memset(&in, 0, sizeof in); in.op = I_SAVE; in.x = 1; ok = re_emit_at(p, in) >= 0; }
+        if (ok) { memset(&in, 0, sizeof in); in.op = I_MATCH; ok = re_emit_at(p, in) >= 0; }
+    }
+    for (i = 0; i < c.nall; i++) free(c.all[i]);
+    if (c.all) free(c.all);
+    if (!ok) { re_free(p); return 0; }
+    return p;
+}
+
+typedef struct { const char *s; int slen, icase, multiline, dotall, depth, steps; } restate;
+
+static int re_class_hit(const reinst *in, char c, int icase) {
+    int hit = re_getbit(in->set, (unsigned char)c);
+    if (!hit && icase) { char alt = re_swapcase(c); if (alt != c) hit = re_getbit(in->set, (unsigned char)alt); }
+    return in->neg ? !hit : hit;
+}
+static int re_run(reprog *p, int pc, int sp, int *caps, restate *st) {
+    if (++st->depth > RE_DEPTH_MAX) { st->depth--; return -2; }
+    for (;;) {
+        reinst *in;
+        if (++st->steps > RE_STEPS_MAX) { st->depth--; return -2; }
+        in = &p->ins[pc];
+        switch (in->op) {
+            case I_CHAR:
+                if (sp < st->slen && (st->s[sp] == in->ch || (st->icase && re_lc(st->s[sp]) == re_lc(in->ch)))) { pc++; sp++; break; }
+                st->depth--; return -1;
+            case I_ANY:
+                if (sp < st->slen && (st->dotall || st->s[sp] != '\n')) { pc++; sp++; break; }
+                st->depth--; return -1;
+            case I_CLASS:
+                if (sp < st->slen && re_class_hit(in, st->s[sp], st->icase)) { pc++; sp++; break; }
+                st->depth--; return -1;
+            case I_BOL:
+                if (sp == 0 || (st->multiline && st->s[sp - 1] == '\n')) { pc++; break; }
+                st->depth--; return -1;
+            case I_EOL:
+                if (sp == st->slen || (st->multiline && st->s[sp] == '\n')) { pc++; break; }
+                st->depth--; return -1;
+            case I_WORDB:
+            case I_NWORDB: {
+                int a = sp > 0 && re_word((unsigned char)st->s[sp - 1]);
+                int b = sp < st->slen && re_word((unsigned char)st->s[sp]);
+                int boundary = a != b;
+                if ((in->op == I_WORDB) == (boundary != 0)) { pc++; break; }
+                st->depth--; return -1;
+            }
+            case I_JMP: pc = in->x; break;
+            case I_SPLIT: {
+                int r = re_run(p, in->x, sp, caps, st);
+                if (r >= 0 || r == -2) { st->depth--; return r; }
+                pc = in->y; break;                 /* x failed (and restored its saves): try y */
+            }
+            case I_SAVE: {
+                int old = caps[in->x], r;
+                caps[in->x] = sp;
+                r = re_run(p, pc + 1, sp, caps, st);
+                if (r < 0) caps[in->x] = old;
+                st->depth--; return r;
+            }
+            case I_MATCH: st->depth--; return sp;
+            default: st->depth--; return -1;
+        }
+    }
+}
+
+/* Search `s` for `prog` starting at `from`. Fills caps[0..2*(ng+1)) with match +
+ * group offsets (-1 = unset). Returns the start index of the match, or -1. */
+static int re_search(reprog *p, const char *s, int slen, int from, int icase, int ml, int dotall, int *caps, int ncap) {
+    int start, i;
+    restate st; st.s = s; st.slen = slen; st.icase = icase; st.multiline = ml; st.dotall = dotall;
+    for (start = from; start <= slen; start++) {
+        for (i = 0; i < ncap; i++) caps[i] = -1;
+        st.depth = 0; st.steps = 0;
+        if (re_run(p, 0, start, caps, &st) >= 0) return caps[0] >= 0 ? caps[0] : start;
+    }
+    return -1;
+}
+
+static int re_is_regexp(js_ctx *ctx, js_value v) { return v.type == JV_OBJ && v.u.obj->proto == ctx->regexp_proto; }
+
+/* Compile the source+flags carried by a RegExp object; *caps_n = 2*(groups+1). */
+static reprog *re_compile_obj(js_ctx *ctx, js_value rx, int *caps_n) {
+    js_value src = js_get(ctx, rx, "source");
+    reprog *p;
+    const char *s = src.type == JV_STR ? src.u.str->data : "";
+    int len = src.type == JV_STR ? src.u.str->len : 0;
+    p = re_compile(s, len);
+    if (p && caps_n) *caps_n = 2 * (p->ngroups + 1);
+    return p;
+}
+static int re_obj_flag(js_ctx *ctx, js_value rx, const char *name) { return js_to_boolean(js_get(ctx, rx, name)); }
+
+/* Build the match result array [full, g1, g2, …] with .index and .input. */
+static js_value re_make_result(js_ctx *ctx, js_value input, int *caps, int ng) {
+    js_object *arr; int k;
+    const char *s = input.type == JV_STR ? input.u.str->data : "";
+    gc_push_scope(); KEEP(input);
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    for (k = 0; k <= ng; k++) {
+        int a = caps[2 * k], b = caps[2 * k + 1];
+        if (a >= 0 && b >= a) js_array_push(ctx, arr, str_of(ctx, s + a, b - a));
+        else js_array_push(ctx, arr, js_undef());
+    }
+    js_def(arr, "index", js_number(caps[0]), P_WRITABLE | P_ENUMERABLE | P_CONFIGURABLE);
+    js_def(arr, "input", input, P_WRITABLE | P_ENUMERABLE | P_CONFIGURABLE);
+    gc_pop_scope();
+    return js_obj_value(arr);
+}
+
+static js_value re_exec(js_ctx *ctx, js_value rx, js_value t, js_value *a, int n) {
+    js_value input = js_to_string(ctx, ARG(0));
+    reprog *p; int caps_n = 2, *caps, global, start = 0, found;
+    (void)n;
+    p = re_compile_obj(ctx, rx, &caps_n);
+    if (!p) return js_null();
+    global = re_obj_flag(ctx, rx, "global") || re_obj_flag(ctx, rx, "sticky");
+    if (global) start = (int)js_to_number(ctx, js_get(ctx, rx, "lastIndex"));
+    if (start < 0 || start > input.u.str->len) { if (global) js_set(ctx, rx, "lastIndex", js_number(0)); re_free(p); return js_null(); }
+    caps = (int *)malloc((unsigned)caps_n * sizeof *caps);
+    if (!caps) { re_free(p); return js_null(); }
+    found = re_search(p, input.u.str->data, input.u.str->len, start,
+                      re_obj_flag(ctx, rx, "ignoreCase"), re_obj_flag(ctx, rx, "multiline"), re_obj_flag(ctx, rx, "dotAll"),
+                      caps, caps_n);
+    if (found < 0) { if (global) js_set(ctx, rx, "lastIndex", js_number(0)); free(caps); re_free(p); return js_null(); }
+    if (global) js_set(ctx, rx, "lastIndex", js_number(caps[1] > caps[0] ? caps[1] : caps[0] + 1));
+    { js_value r = re_make_result(ctx, input, caps, p->ngroups); free(caps); re_free(p); return r; }
+}
+static js_value re_test(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value r = re_exec(ctx, t, t, a, n);
+    return js_bool(r.type != JV_NULL);
+}
+static js_value re_proto_exec(js_ctx *ctx, js_value t, js_value *a, int n) { return re_exec(ctx, t, t, a, n); }
+static js_value re_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value src = js_get(ctx, t, "source"), fl = js_get(ctx, t, "flags");
+    sbuf sb; js_value r; (void)a; (void)n;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    sb_putc(&sb, '/');
+    if (src.type == JV_STR) sb_put(&sb, src.u.str->data, src.u.str->len); else sb_put(&sb, "(?:)", 4);
+    sb_putc(&sb, '/');
+    if (fl.type == JV_STR) sb_put(&sb, fl.u.str->data, fl.u.str->len);
+    r = str_of(ctx, sb.b ? sb.b : "//", sb.b ? sb.n : 2);
+    if (sb.b) free(sb.b);
+    return r;
+}
+
+/* String.prototype.match / .search, and the regex paths of split / replace. */
+static js_value re_str_match(js_ctx *ctx, js_value s, js_value rx) {
+    if (!re_obj_flag(ctx, rx, "global")) { js_value a0 = s; return re_exec(ctx, rx, js_undef(), &a0, 1); }
+    {   /* /g: array of all match strings (no groups), or null */
+        reprog *p; int caps_n = 2, *caps, pos = 0, any = 0;
+        js_object *out;
+        const char *str = s.type == JV_STR ? s.u.str->data : ""; int slen = s.type == JV_STR ? s.u.str->len : 0;
+        p = re_compile_obj(ctx, rx, &caps_n);
+        if (!p) return js_null();
+        caps = (int *)malloc((unsigned)caps_n * sizeof *caps);
+        if (!caps) { re_free(p); return js_null(); }
+        gc_push_scope(); KEEP(s);
+        out = (js_object *)gc_keep(js_new_array(ctx, 0));
+        while (pos <= slen && re_search(p, str, slen, pos, re_obj_flag(ctx, rx, "ignoreCase"), re_obj_flag(ctx, rx, "multiline"), re_obj_flag(ctx, rx, "dotAll"), caps, caps_n) >= 0) {
+            js_array_push(ctx, out, str_of(ctx, str + caps[0], caps[1] - caps[0]));
+            any = 1;
+            pos = caps[1] > caps[0] ? caps[1] : caps[0] + 1;
+        }
+        gc_pop_scope();
+        free(caps); re_free(p);
+        js_set(ctx, rx, "lastIndex", js_number(0));
+        return any ? js_obj_value(out) : js_null();
+    }
+}
+static js_value re_str_split(js_ctx *ctx, js_value s, js_value rx, js_value limv) {
+    reprog *p; int caps_n = 2, *caps, pos = 0, last = 0;
+    js_object *out;
+    const char *str = s.type == JV_STR ? s.u.str->data : ""; int slen = s.type == JV_STR ? s.u.str->len : 0;
+    int limit = limv.type != JV_UNDEF ? (int)js_to_uint32(ctx, limv) : -1;
+    int ic, ml, da;
+    p = re_compile_obj(ctx, rx, &caps_n);
+    gc_push_scope(); KEEP(s);
+    out = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (!p) { js_array_push(ctx, out, s); gc_pop_scope(); return js_obj_value(out); }
+    caps = (int *)malloc((unsigned)caps_n * sizeof *caps);
+    if (!caps) { js_array_push(ctx, out, s); gc_pop_scope(); re_free(p); return js_obj_value(out); }
+    ic = re_obj_flag(ctx, rx, "ignoreCase"); ml = re_obj_flag(ctx, rx, "multiline"); da = re_obj_flag(ctx, rx, "dotAll");
+    while (pos <= slen) {
+        int at = re_search(p, str, slen, pos, ic, ml, da, caps, caps_n);
+        int mstart = caps[0], mend = caps[1];
+        if (at < 0 || mstart >= slen) break;
+        if (mend == last && mstart == last) { pos = mstart + 1; continue; }   /* empty match: advance */
+        if (limit >= 0 && (int)out->elen >= limit) { gc_pop_scope(); free(caps); re_free(p); return js_obj_value(out); }
+        js_array_push(ctx, out, str_of(ctx, str + last, mstart - last));
+        { int g; for (g = 1; g <= p->ngroups; g++) { int ga = caps[2 * g], gb = caps[2 * g + 1]; if (limit >= 0 && (int)out->elen >= limit) break; js_array_push(ctx, out, ga >= 0 && gb >= ga ? str_of(ctx, str + ga, gb - ga) : js_undef()); } }
+        last = mend;
+        pos = mend > mstart ? mend : mstart + 1;
+    }
+    if (!(limit >= 0 && (int)out->elen >= limit)) js_array_push(ctx, out, str_of(ctx, str + last, slen - last));
+    gc_pop_scope();
+    free(caps); re_free(p);
+    return js_obj_value(out);
+}
+/* expand a replacement template's $&, $1..$N, $`, $' (and $$ -> $) */
+static void re_expand_repl(sbuf *sb, const char *tmpl, int tlen, const char *str, int slen, int *caps, int ng) {
+    int i;
+    for (i = 0; i < tlen; i++) {
+        if (tmpl[i] == '$' && i + 1 < tlen) {
+            char d = tmpl[i + 1];
+            if (d == '$') { sb_putc(sb, '$'); i++; continue; }
+            if (d == '&') { sb_put(sb, str + caps[0], caps[1] - caps[0]); i++; continue; }
+            if (d == '`') { sb_put(sb, str, caps[0]); i++; continue; }
+            if (d == '\'') { sb_put(sb, str + caps[1], slen - caps[1]); i++; continue; }
+            if (d >= '0' && d <= '9') {
+                int gi = d - '0', adv = 1;
+                if (i + 2 < tlen && tmpl[i + 2] >= '0' && tmpl[i + 2] <= '9' && (gi * 10 + tmpl[i + 2] - '0') <= ng) { gi = gi * 10 + tmpl[i + 2] - '0'; adv = 2; }
+                if (gi >= 1 && gi <= ng) { int a = caps[2 * gi], b = caps[2 * gi + 1]; if (a >= 0 && b >= a) sb_put(sb, str + a, b - a); i += adv; continue; }
+            }
+        }
+        sb_putc(sb, tmpl[i]);
+    }
+}
+static js_value re_str_replace(js_ctx *ctx, js_value s, js_value rx, js_value repl, int all_hint) {
+    reprog *p; int caps_n = 2, *caps, pos = 0, last = 0;
+    int global = re_obj_flag(ctx, rx, "global") || all_hint;
+    int isfn = js_is_callable(repl), ic, ml, da;
+    sbuf sb; js_value out;
+    const char *str = s.type == JV_STR ? s.u.str->data : ""; int slen = s.type == JV_STR ? s.u.str->len : 0;
+    p = re_compile_obj(ctx, rx, &caps_n);
+    if (!p) return s;
+    caps = (int *)malloc((unsigned)caps_n * sizeof *caps);
+    if (!caps) { re_free(p); return s; }
+    ic = re_obj_flag(ctx, rx, "ignoreCase"); ml = re_obj_flag(ctx, rx, "multiline"); da = re_obj_flag(ctx, rx, "dotAll");
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    gc_push_scope(); KEEP(s); KEEP(repl);
+    while (pos <= slen && re_search(p, str, slen, pos, ic, ml, da, caps, caps_n) >= 0) {
+        sb_put(&sb, str + last, caps[0] - last);
+        if (isfn) {
+            js_value cargs[16], rv; int g, na = 0;
+            cargs[na++] = str_of(ctx, str + caps[0], caps[1] - caps[0]);
+            for (g = 1; g <= p->ngroups && na < 13; g++) { int a = caps[2 * g], b = caps[2 * g + 1]; cargs[na++] = (a >= 0 && b >= a) ? str_of(ctx, str + a, b - a) : js_undef(); }
+            cargs[na++] = js_number(caps[0]);
+            cargs[na++] = s;
+            rv = js_call(ctx, repl, js_undef(), cargs, na);
+            if (ctx->has_exc) break;
+            { js_value rs = js_to_string(ctx, rv); sb_put(&sb, rs.u.str->data, rs.u.str->len); }
+        } else {
+            js_value rs = js_to_string(ctx, repl);
+            re_expand_repl(&sb, rs.u.str->data, rs.u.str->len, str, slen, caps, p->ngroups);
+        }
+        last = caps[1];
+        pos = caps[1] > caps[0] ? caps[1] : caps[0] + 1;
+        if (caps[1] == caps[0] && caps[0] < slen) sb_putc(&sb, str[caps[0]]);   /* keep the char an empty match sat on */
+        if (caps[1] == caps[0]) last = pos;
+        if (!global) break;
+    }
+    sb_put(&sb, str + last, slen - last);
+    gc_pop_scope();
+    if (global) js_set(ctx, rx, "lastIndex", js_number(0));
+    out = str_of(ctx, sb.b ? sb.b : "", sb.n);
+    if (sb.b) free(sb.b);
+    free(caps); re_free(p);
+    return out;
+}
+
+js_value js_make_regexp(js_ctx *ctx, const char *source, const char *flags) {
+    js_object *o;
+    js_value ov;
+    if (!source) source = "";
+    if (!flags) flags = "";
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, ctx->regexp_proto));
+    js_def(o, "source", js_mk_cstring(ctx, source[0] ? source : "(?:)"), P_ENUMERABLE);
+    js_def(o, "flags", js_mk_cstring(ctx, flags), P_ENUMERABLE);
+    js_def(o, "global",     js_bool(re_flag(flags, 'g')), P_ENUMERABLE);
+    js_def(o, "ignoreCase", js_bool(re_flag(flags, 'i')), P_ENUMERABLE);
+    js_def(o, "multiline",  js_bool(re_flag(flags, 'm')), P_ENUMERABLE);
+    js_def(o, "dotAll",     js_bool(re_flag(flags, 's')), P_ENUMERABLE);
+    js_def(o, "sticky",     js_bool(re_flag(flags, 'y')), P_ENUMERABLE);
+    js_def(o, "lastIndex",  js_number(0), P_WRITABLE);
+    ov = js_obj_value(o);
+    gc_pop_scope();
+    return ov;
+}
+static js_value regexp_ctor(js_ctx *ctx, js_value thisv, js_value *a, int n) {
+    const char *src = "", *fl = "";
+    js_value sv, fv;
+    (void)thisv;
+    if (n > 0 && re_is_regexp(ctx, a[0])) {
+        sv = js_get(ctx, a[0], "source");
+        fv = (n > 1 && a[1].type != JV_UNDEF) ? js_to_string(ctx, a[1]) : js_get(ctx, a[0], "flags");
+    } else {
+        sv = (n > 0 && a[0].type != JV_UNDEF) ? js_to_string(ctx, a[0]) : js_mk_cstring(ctx, "");
+        fv = (n > 1 && a[1].type != JV_UNDEF) ? js_to_string(ctx, a[1]) : js_mk_cstring(ctx, "");
+    }
+    if (sv.type == JV_STR) src = sv.u.str->data;
+    if (fv.type == JV_STR) fl = fv.u.str->data;
+    return js_make_regexp(ctx, src, fl);
+}
+
+static js_value str_match(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t), rx, r;
+    gc_push_scope(); KEEP(s);
+    if (n > 0 && re_is_regexp(ctx, a[0])) rx = a[0];
+    else { js_value pat = n > 0 && a[0].type != JV_UNDEF ? js_to_string(ctx, a[0]) : js_mk_cstring(ctx, ""); rx = js_make_regexp(ctx, pat.u.str->data, ""); }
+    if (rx.type == JV_OBJ) gc_keep(rx.u.obj);
+    r = re_str_match(ctx, s, rx);
+    gc_pop_scope();
+    return r;
+}
+static js_value str_search(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t), rx, m, a0;
+    gc_push_scope(); KEEP(s);
+    if (n > 0 && re_is_regexp(ctx, a[0])) rx = a[0];
+    else { js_value pat = n > 0 && a[0].type != JV_UNDEF ? js_to_string(ctx, a[0]) : js_mk_cstring(ctx, ""); rx = js_make_regexp(ctx, pat.u.str->data, ""); }
+    if (rx.type == JV_OBJ) gc_keep(rx.u.obj);
+    a0 = s; m = re_exec(ctx, rx, js_undef(), &a0, 1);
+    gc_pop_scope();
+    if (m.type == JV_NULL) return js_number(-1);
+    return js_get(ctx, m, "index");
+}
+
 static js_value str_split(js_ctx *ctx, js_value t, js_value *a, int n) {
     js_value s = this_str(ctx, t);
+    if (n > 0 && re_is_regexp(ctx, a[0])) return re_str_split(ctx, s, a[0], n > 1 ? a[1] : js_undef());
     js_object *out;
     int limit = n > 1 && a[1].type != JV_UNDEF ? (int)js_to_uint32(ctx, a[1]) : -1;
     gc_push_scope(); KEEP(s);
@@ -774,7 +1425,10 @@ static js_value str_split(js_ctx *ctx, js_value t, js_value *a, int n) {
     return js_obj_value(out);
 }
 static js_value str_replace_impl(js_ctx *ctx, js_value t, js_value *a, int n, int all) {
-    js_value s = this_str(ctx, t), search = js_to_string(ctx, ARG(0)), repl = ARG(1);
+    js_value s = this_str(ctx, t);
+    if (n > 0 && re_is_regexp(ctx, ARG(0))) return re_str_replace(ctx, s, ARG(0), ARG(1), all);
+    {
+    js_value search = js_to_string(ctx, ARG(0)), repl = ARG(1);
     int fn = js_is_callable(repl);
     sbuf sb; int start = 0, at;
     sb.b = NULL; sb.n = 0; sb.cap = 0; (void)n;
@@ -796,6 +1450,7 @@ static js_value str_replace_impl(js_ctx *ctx, js_value t, js_value *a, int n, in
     sb_put(&sb, s.u.str->data + start, s.u.str->len - start);
     gc_pop_scope();
     { js_value r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b); return r; }
+    }
 }
 static js_value str_replace(js_ctx *ctx, js_value t, js_value *a, int n)    { return str_replace_impl(ctx, t, a, n, 0); }
 static js_value str_replaceall(js_ctx *ctx, js_value t, js_value *a, int n) { return str_replace_impl(ctx, t, a, n, 1); }
@@ -895,6 +1550,49 @@ static js_value g_encode_uri_component(js_ctx *ctx, js_value t, js_value *a, int
 static js_value g_encode_uri(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)n; return uri_encode(ctx, js_to_string(ctx, ARG(0)), 1); }
 static js_value g_decode_uri_component(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)n; return uri_decode(ctx, js_to_string(ctx, ARG(0)), 0); }
 static js_value g_decode_uri(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; (void)n; return uri_decode(ctx, js_to_string(ctx, ARG(0)), 1); }
+
+/* Legacy escape()/unescape(): %XX (and %uXXXX) over the unreserved set
+ * [A-Za-z0-9 @*_+-./]. Byte-oriented over our UTF-8 strings. */
+static int esc_unreserved(int c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+           c == '@' || c == '*' || c == '_' || c == '+' || c == '-' || c == '.' || c == '/';
+}
+static js_value g_escape(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = js_to_string(ctx, ARG(0)); js_value r; sbuf sb; int i;
+    static const char hex[] = "0123456789ABCDEF";
+    (void)t; (void)n;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    gc_push_scope(); KEEP(s);
+    for (i = 0; i < s.u.str->len; i++) {
+        unsigned char c = (unsigned char)s.u.str->data[i];
+        if (esc_unreserved(c)) sb_putc(&sb, (char)c);
+        else { sb_putc(&sb, '%'); sb_putc(&sb, hex[c >> 4]); sb_putc(&sb, hex[c & 15]); }
+    }
+    gc_pop_scope();
+    r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b);
+    return r;
+}
+static int esc_hex(int c) { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; }
+static js_value g_unescape(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = js_to_string(ctx, ARG(0)); js_value r; sbuf sb; int i, len; char tmp[4];
+    (void)t; (void)n;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    len = s.u.str->len;
+    gc_push_scope(); KEEP(s);
+    for (i = 0; i < len; i++) {
+        const char *d = s.u.str->data;
+        if (d[i] == '%' && i + 5 < len + 1 && d[i + 1] == 'u' &&
+            esc_hex(d[i + 2]) >= 0 && esc_hex(d[i + 3]) >= 0 && esc_hex(d[i + 4]) >= 0 && esc_hex(d[i + 5]) >= 0) {
+            unsigned cp = (unsigned)((esc_hex(d[i+2]) << 12) | (esc_hex(d[i+3]) << 8) | (esc_hex(d[i+4]) << 4) | esc_hex(d[i+5]));
+            int k = utf8_encode(cp, tmp); sb_put(&sb, tmp, k); i += 5;
+        } else if (d[i] == '%' && i + 2 < len && esc_hex(d[i + 1]) >= 0 && esc_hex(d[i + 2]) >= 0) {
+            sb_putc(&sb, (char)((esc_hex(d[i + 1]) << 4) | esc_hex(d[i + 2]))); i += 2;
+        } else sb_putc(&sb, d[i]);
+    }
+    gc_pop_scope();
+    r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b);
+    return r;
+}
 static js_value num_isinteger(js_ctx *ctx, js_value t, js_value *a, int n) { js_value x = ARG(0); (void)ctx; (void)t; (void)n; return js_bool(x.type == JV_NUM && x.u.num == x.u.num && x.u.num != 1.0 / 0.0 && x.u.num != -1.0 / 0.0 && floor(x.u.num) == x.u.num); }
 static js_value num_isfinite(js_ctx *ctx, js_value t, js_value *a, int n) { js_value x = ARG(0); (void)ctx; (void)t; (void)n; return js_bool(x.type == JV_NUM && x.u.num == x.u.num && x.u.num != 1.0 / 0.0 && x.u.num != -1.0 / 0.0); }
 static js_value num_isnan(js_ctx *ctx, js_value t, js_value *a, int n) { js_value x = ARG(0); (void)ctx; (void)t; (void)n; return js_bool(x.type == JV_NUM && x.u.num != x.u.num); }
@@ -1786,6 +2484,507 @@ static js_value date_iso(js_ctx *ctx, js_value t, js_value *a, int n) {
     return js_mk_string(ctx, b, i);
 }
 
+/* ------------------------------------------------------- base64 ----------- *
+ * btoa/atob over the WHATWG forgiving-base64. Operate on the string's raw bytes
+ * (a true "binary string"): ASCII round-trips exactly; bytes 128–255 ride through
+ * as their stored UTF-8 (we don't enforce the latin1 codepoint range). */
+static const char b64_enc[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static int b64_val(int c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+static js_value g_btoa(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = js_to_string(ctx, ARG(0));
+    const unsigned char *d;
+    int len, i; sbuf sb; js_value r; (void)t; (void)n;
+    gc_push_scope(); KEEP(s);
+    d = (const unsigned char *)s.u.str->data; len = s.u.str->len;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    for (i = 0; i + 2 < len; i += 3) {
+        unsigned v = ((unsigned)d[i] << 16) | ((unsigned)d[i + 1] << 8) | d[i + 2];
+        sb_putc(&sb, b64_enc[(v >> 18) & 63]); sb_putc(&sb, b64_enc[(v >> 12) & 63]);
+        sb_putc(&sb, b64_enc[(v >> 6) & 63]);  sb_putc(&sb, b64_enc[v & 63]);
+    }
+    if (len - i == 1) { unsigned v = (unsigned)d[i] << 16; sb_putc(&sb, b64_enc[(v >> 18) & 63]); sb_putc(&sb, b64_enc[(v >> 12) & 63]); sb_putc(&sb, '='); sb_putc(&sb, '='); }
+    else if (len - i == 2) { unsigned v = ((unsigned)d[i] << 16) | ((unsigned)d[i + 1] << 8); sb_putc(&sb, b64_enc[(v >> 18) & 63]); sb_putc(&sb, b64_enc[(v >> 12) & 63]); sb_putc(&sb, b64_enc[(v >> 6) & 63]); sb_putc(&sb, '='); }
+    gc_pop_scope();
+    r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b);
+    return r;
+}
+static js_value g_atob(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = js_to_string(ctx, ARG(0));
+    const char *d; int len, i, acc = 0, bits = 0; sbuf sb; js_value r; (void)t; (void)n;
+    gc_push_scope(); KEEP(s);
+    d = s.u.str->data; len = s.u.str->len;
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    for (i = 0; i < len; i++) {
+        int v = b64_val((unsigned char)d[i]);
+        if (v < 0) continue;                    /* skip '=', whitespace, stray bytes */
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; sb_putc(&sb, (char)((acc >> bits) & 0xFF)); }
+    }
+    gc_pop_scope();
+    r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b);
+    return r;
+}
+
+
+/* ------------------------------------------------------- Function --------- *
+ * call/apply invoke `this` (the target function) with an explicit receiver;
+ * bind returns a trampoline that prepends a fixed receiver + partial args. The
+ * trampoline carries its binding in the native's fn->data as the array
+ * [target, boundThis, ...boundArgs], read back via ctx->native_data. */
+static js_value fn_call(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value thisarg = n > 0 ? a[0] : js_undef();
+    return js_call(ctx, t, thisarg, n > 0 ? a + 1 : a, n > 0 ? n - 1 : 0);
+}
+static js_value fn_apply(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value thisarg = n > 0 ? a[0] : js_undef();
+    js_value arr = n > 1 ? a[1] : js_undef();
+    js_value *argv, r;
+    int len, i;
+    if (arr.type == JV_UNDEF || arr.type == JV_NULL) return js_call(ctx, t, thisarg, 0, 0);
+    len = arr.type == JV_OBJ && arr.u.obj->kind == OBJ_ARRAY ? (int)arr.u.obj->elen : (int)js_to_uint32(ctx, js_get(ctx, arr, "length"));
+    if (len < 0) len = 0;
+    argv = len ? (js_value *)malloc((unsigned)len * sizeof *argv) : 0;
+    if (len && !argv) return js_throw_range(ctx, "apply: out of memory");
+    gc_push_scope(); KEEP(t); KEEP(thisarg); KEEP(arr);
+    for (i = 0; i < len; i++) { argv[i] = js_get_index(ctx, arr, (unsigned)i); KEEP(argv[i]); }
+    r = js_call(ctx, t, thisarg, argv, len);
+    gc_pop_scope();
+    if (argv) free(argv);
+    return r;
+}
+/* the bound trampoline: data = [target, boundThis, ...boundArgs] */
+static js_value fn_bound_call(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value rec = ctx->native_data, target, boundThis, *argv, r;
+    int nbound, total, i;
+    (void)t;
+    if (rec.type != JV_OBJ || rec.u.obj->kind != OBJ_ARRAY) return js_undef();
+    target = js_get_index(ctx, rec, 0);
+    boundThis = js_get_index(ctx, rec, 1);
+    nbound = (int)rec.u.obj->elen - 2; if (nbound < 0) nbound = 0;
+    total = nbound + n;
+    argv = total ? (js_value *)malloc((unsigned)total * sizeof *argv) : 0;
+    if (total && !argv) return js_throw_range(ctx, "bound call: out of memory");
+    gc_push_scope(); KEEP(rec); KEEP(target); KEEP(boundThis);
+    for (i = 0; i < nbound; i++) { argv[i] = js_get_index(ctx, rec, (unsigned)(2 + i)); KEEP(argv[i]); }
+    for (i = 0; i < n; i++) { argv[nbound + i] = a[i]; KEEP(a[i]); }
+    r = js_call(ctx, target, boundThis, argv, total);
+    gc_pop_scope();
+    if (argv) free(argv);
+    return r;
+}
+static js_value fn_bind(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *rec, *bf;
+    js_value rv;
+    int i;
+    gc_push_scope(); KEEP(t);
+    rec = (js_object *)gc_keep(js_new_array(ctx, 0));
+    js_array_push(ctx, rec, t);
+    js_array_push(ctx, rec, n > 0 ? a[0] : js_undef());
+    for (i = 1; i < n; i++) js_array_push(ctx, rec, a[i]);
+    bf = (js_object *)gc_keep(js_new_native(ctx, fn_bound_call, "bound", 0));
+    bf->fn->data = js_obj_value(rec);
+    js_def(bf, "@bound", js_obj_value(rec), 0);   /* lets `new boundFn()` unwrap to the target */
+    rv = js_obj_value(bf);
+    gc_pop_scope();
+    return rv;
+}
+
+
+/* ------------------------------------------------------- typed arrays ----- *
+ * ArrayBuffer + the nine TypedArray views + DataView. A view object (kind
+ * OBJ_TYPEDARRAY) carries a js_typedarray host {buffer, type, offset, length};
+ * element get/set goes through ta_get/ta_set (value.c) so `view[i]` hits the
+ * backing bytes. The buffer's bytes are freed by the GC finalizer; the view
+ * keeps its ArrayBuffer alive via the tracer. */
+static js_object *make_ctor(js_ctx *ctx, const char *name, js_native fn, js_object *proto);  /* fwd */
+
+
+static js_object *new_arraybuffer(js_ctx *ctx, int n) {
+    js_object *o;
+    js_arraybuffer *ab;
+    if (n < 0) n = 0;
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, ctx->arraybuffer_proto));
+    o->kind = OBJ_ARRAYBUFFER;
+    ab = (js_arraybuffer *)malloc(sizeof *ab);
+    if (ab) { ab->data = (unsigned char *)calloc((unsigned)(n > 0 ? n : 1), 1); ab->byteLength = n; }
+    o->host = ab;
+    gc_pop_scope();
+    return o;
+}
+static js_value new_view(js_ctx *ctx, int type, js_object *buf, int offset, int length) {
+    js_object *o, *proto = type >= 0 ? ctx->typed_protos[type] : ctx->dataview_proto;
+    js_typedarray *ta;
+    js_value v;
+    gc_push_scope(); gc_keep(buf);
+    o = (js_object *)gc_keep(js_new_object(ctx, proto));
+    o->kind = OBJ_TYPEDARRAY;
+    ta = (js_typedarray *)malloc(sizeof *ta);
+    if (ta) { ta->buffer = buf; ta->type = type; ta->offset = offset; ta->length = length; }
+    o->host = ta;
+    v = js_obj_value(o);
+    gc_pop_scope();
+    return v;
+}
+static js_typedarray *as_ta(js_value t) { return (t.type == JV_OBJ && t.u.obj->kind == OBJ_TYPEDARRAY) ? (js_typedarray *)t.u.obj->host : 0; }
+static int clamp_idx(int i, int len) { if (i < 0) i += len; if (i < 0) i = 0; if (i > len) i = len; return i; }
+
+/* length of an array-like / typed-array source (for the copy constructors) */
+static int ta_src_len(js_ctx *ctx, js_value src) {
+    if (src.type == JV_OBJ) {
+        js_object *o = src.u.obj;
+        if (o->kind == OBJ_TYPEDARRAY) { js_typedarray *t = (js_typedarray *)o->host; return t ? t->length : 0; }
+        if (o->kind == OBJ_ARRAY) return (int)o->elen;
+    }
+    return (int)js_to_uint32(ctx, js_get(ctx, src, "length"));
+}
+
+/* new TypedArray(len) | (buffer[,off[,len]]) | (typedArray|arrayLike) */
+static js_value ta_make(js_ctx *ctx, int type, js_value *a, int n) {
+    int es = ta_elem_size(type);
+    js_value arg = n > 0 ? a[0] : js_undef();
+    if (arg.type == JV_OBJ && arg.u.obj->kind == OBJ_ARRAYBUFFER) {
+        js_arraybuffer *ab = (js_arraybuffer *)arg.u.obj->host;
+        int off = (n > 1 && a[1].type != JV_UNDEF) ? (int)js_to_number(ctx, a[1]) : 0;
+        int len;
+        if (off < 0 || off > ab->byteLength || (off % es)) return js_throw_range(ctx, "invalid typed array byte offset");
+        if (n > 2 && a[2].type != JV_UNDEF) { len = (int)js_to_number(ctx, a[2]); if (len < 0 || off + len * es > ab->byteLength) return js_throw_range(ctx, "invalid typed array length"); }
+        else { if ((ab->byteLength - off) % es) return js_throw_range(ctx, "byte length not aligned"); len = (ab->byteLength - off) / es; }
+        return new_view(ctx, type, arg.u.obj, off, len);
+    }
+    if (arg.type == JV_OBJ) {                       /* typed array or array-like: copy */
+        int len = ta_src_len(ctx, arg), i;
+        js_value view;
+        gc_push_scope();
+        { js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, len * es));
+          view = new_view(ctx, type, buf, 0, len);
+          if (view.type == JV_OBJ) { gc_keep(view.u.obj);
+              for (i = 0; i < len; i++) ta_set(ctx, view.u.obj, (unsigned)i, js_get_index(ctx, arg, (unsigned)i)); } }
+        gc_pop_scope();
+        return view;
+    }
+    { int len = arg.type == JV_UNDEF ? 0 : (int)js_to_number(ctx, arg);
+      if (len < 0) return js_throw_range(ctx, "invalid typed array length");
+      return new_view(ctx, type, new_arraybuffer(ctx, len * es), 0, len); }
+}
+#define TA_CTOR(fn, TYPE) static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n) { (void)t; return ta_make(ctx, TYPE, a, n); }
+TA_CTOR(int8a_ctor,   TA_I8)
+TA_CTOR(uint8a_ctor,  TA_U8)
+TA_CTOR(uint8ca_ctor, TA_U8C)
+TA_CTOR(int16a_ctor,  TA_I16)
+TA_CTOR(uint16a_ctor, TA_U16)
+TA_CTOR(int32a_ctor,  TA_I32)
+TA_CTOR(uint32a_ctor, TA_U32)
+TA_CTOR(float32a_ctor,TA_F32)
+TA_CTOR(float64a_ctor,TA_F64)
+#undef TA_CTOR
+
+/* %TypedArray%.prototype accessors + methods (this = a view) */
+static js_value tap_length(js_ctx *ctx, js_value t, js_value *a, int n)     { js_typedarray *ta = as_ta(t); (void)ctx; (void)a; (void)n; return js_number(ta ? ta->length : 0); }
+static js_value tap_bytelength(js_ctx *ctx, js_value t, js_value *a, int n) { js_typedarray *ta = as_ta(t); (void)ctx; (void)a; (void)n; return js_number(ta ? ta->length * ta_elem_size(ta->type) : 0); }
+static js_value tap_byteoffset(js_ctx *ctx, js_value t, js_value *a, int n) { js_typedarray *ta = as_ta(t); (void)ctx; (void)a; (void)n; return js_number(ta ? ta->offset : 0); }
+static js_value tap_buffer(js_ctx *ctx, js_value t, js_value *a, int n)     { js_typedarray *ta = as_ta(t); (void)ctx; (void)a; (void)n; return ta ? js_obj_value(ta->buffer) : js_undef(); }
+
+static js_value tap_set(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_typedarray *ta = as_ta(t);
+    js_value src = n > 0 ? a[0] : js_undef();
+    int off = n > 1 ? (int)js_to_number(ctx, a[1]) : 0, len, i;
+    if (!ta) return js_undef();
+    len = ta_src_len(ctx, src);
+    if (off < 0) off = 0;
+    for (i = 0; i < len; i++) ta_set(ctx, t.u.obj, (unsigned)(off + i), js_get_index(ctx, src, (unsigned)i));
+    return js_undef();
+}
+static js_value tap_subarray(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_typedarray *ta = as_ta(t); int len, b, e;
+    if (!ta) return js_undef();
+    len = ta->length;
+    b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[0]), len) : 0;
+    e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[1]), len) : len;
+    if (e < b) e = b;
+    return new_view(ctx, ta->type, ta->buffer, ta->offset + b * ta_elem_size(ta->type), e - b);
+}
+static js_value tap_slice(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_typedarray *ta = as_ta(t); int len, es, b, e, m, i; js_value view;
+    if (!ta) return js_undef();
+    len = ta->length; es = ta_elem_size(ta->type);
+    b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[0]), len) : 0;
+    e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[1]), len) : len;
+    m = e - b; if (m < 0) m = 0;
+    gc_push_scope();
+    { js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, m * es));
+      view = new_view(ctx, ta->type, buf, 0, m);
+      if (view.type == JV_OBJ) { gc_keep(view.u.obj);
+          for (i = 0; i < m; i++) ta_set(ctx, view.u.obj, (unsigned)i, ta_get(t.u.obj, (unsigned)(b + i))); } }
+    gc_pop_scope();
+    return view;
+}
+static js_value tap_fill(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_typedarray *ta = as_ta(t); js_value v = n > 0 ? a[0] : js_undef(); int len, s, e;
+    if (!ta) return t;
+    len = ta->length;
+    s = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[1]), len) : 0;
+    e = (n > 2 && a[2].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[2]), len) : len;
+    for (; s < e; s++) ta_set(ctx, t.u.obj, (unsigned)s, v);
+    return t;
+}
+static js_value tap_indexof(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_typedarray *ta = as_ta(t); js_value v = n > 0 ? a[0] : js_undef(); int i, from;
+    if (!ta) return js_number(-1);
+    from = n > 1 ? clamp_idx((int)js_to_number(ctx, a[1]), ta->length) : 0;
+    for (i = from; i < ta->length; i++) if (js_strict_eq(ta_get(t.u.obj, (unsigned)i), v)) return js_number(i);
+    return js_number(-1);
+}
+static js_value tap_includes(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value r = tap_indexof(ctx, t, a, n);
+    return js_bool(r.u.num >= 0);
+}
+static js_value tap_join(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_typedarray *ta = as_ta(t); sbuf sb; js_value r; int i;
+    const char *sep = ","; int seplen = 1;
+    js_value sv = js_undef();
+    if (n > 0 && a[0].type != JV_UNDEF) { sv = js_to_string(ctx, a[0]); sep = sv.u.str->data; seplen = sv.u.str->len; }
+    sb.b = NULL; sb.n = 0; sb.cap = 0;
+    gc_push_scope(); if (sv.type == JV_STR) KEEP(sv);
+    if (ta) for (i = 0; i < ta->length; i++) {
+        js_value e;
+        if (i) sb_put(&sb, sep, seplen);
+        e = js_to_string(ctx, ta_get(t.u.obj, (unsigned)i));
+        if (e.type == JV_STR) sb_put(&sb, e.u.str->data, e.u.str->len);
+    }
+    gc_pop_scope();
+    r = str_of(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b);
+    return r;
+}
+static js_value tap_tostring(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return tap_join(ctx, t, 0, 0); }
+static js_value tap_foreach(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_typedarray *ta = as_ta(t); js_value cb = n > 0 ? a[0] : js_undef(); int i;
+    if (!ta || !js_is_callable(cb)) return js_undef();
+    for (i = 0; i < ta->length; i++) { js_value ar[3]; ar[0] = ta_get(t.u.obj, (unsigned)i); ar[1] = js_number(i); ar[2] = t; js_call(ctx, cb, js_undef(), ar, 3); if (ctx->has_exc) break; }
+    return js_undef();
+}
+static js_value tap_map(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_typedarray *ta = as_ta(t); js_value cb = n > 0 ? a[0] : js_undef(), view; int i;
+    if (!ta) return js_undef();
+    gc_push_scope();
+    { js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, ta->length * ta_elem_size(ta->type)));
+      view = new_view(ctx, ta->type, buf, 0, ta->length);
+      if (view.type == JV_OBJ) { gc_keep(view.u.obj);
+          for (i = 0; i < ta->length; i++) { js_value ar[3], r; ar[0] = ta_get(t.u.obj, (unsigned)i); ar[1] = js_number(i); ar[2] = t;
+              r = js_is_callable(cb) ? js_call(ctx, cb, js_undef(), ar, 3) : ar[0]; if (ctx->has_exc) break;
+              ta_set(ctx, view.u.obj, (unsigned)i, r); } } }
+    gc_pop_scope();
+    return view;
+}
+static js_value tap_reduce(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_typedarray *ta = as_ta(t); js_value cb = n > 0 ? a[0] : js_undef(), acc; int i = 0;
+    if (!ta) return js_undef();
+    if (n > 1) acc = a[1]; else { if (ta->length == 0) return js_throw_type(ctx, "Reduce of empty array with no initial value"); acc = ta_get(t.u.obj, 0); i = 1; }
+    for (; i < ta->length; i++) { js_value ar[4]; ar[0] = acc; ar[1] = ta_get(t.u.obj, (unsigned)i); ar[2] = js_number(i); ar[3] = t; acc = js_call(ctx, cb, js_undef(), ar, 4); if (ctx->has_exc) break; }
+    return acc;
+}
+/* TypedArray.of / .from read their element kind from the native's bound data */
+static js_value ta_of(js_ctx *ctx, js_value t, js_value *a, int n) {
+    int type = (int)ctx->native_data.u.num, i; js_value view; (void)t;
+    gc_push_scope();
+    { js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, n * ta_elem_size(type)));
+      view = new_view(ctx, type, buf, 0, n);
+      if (view.type == JV_OBJ) { gc_keep(view.u.obj); for (i = 0; i < n; i++) ta_set(ctx, view.u.obj, (unsigned)i, a[i]); } }
+    gc_pop_scope();
+    return view;
+}
+static js_value ta_from(js_ctx *ctx, js_value t, js_value *a, int n) {
+    int type = (int)ctx->native_data.u.num, i, len;
+    js_value src = n > 0 ? a[0] : js_undef(), mapfn = n > 1 ? a[1] : js_undef(), view; (void)t;
+    len = ta_src_len(ctx, src);
+    gc_push_scope();
+    { js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, len * ta_elem_size(type)));
+      view = new_view(ctx, type, buf, 0, len);
+      if (view.type == JV_OBJ) { gc_keep(view.u.obj);
+          for (i = 0; i < len; i++) { js_value e = js_get_index(ctx, src, (unsigned)i);
+              if (js_is_callable(mapfn)) { js_value ar[2]; ar[0] = e; ar[1] = js_number(i); e = js_call(ctx, mapfn, js_undef(), ar, 2); if (ctx->has_exc) break; }
+              ta_set(ctx, view.u.obj, (unsigned)i, e); } } }
+    gc_pop_scope();
+    return view;
+}
+
+/* ArrayBuffer */
+static js_value ab_bytelength(js_ctx *ctx, js_value t, js_value *a, int n) {
+    (void)ctx; (void)a; (void)n;
+    if (t.type == JV_OBJ && t.u.obj->kind == OBJ_ARRAYBUFFER && t.u.obj->host) return js_number(((js_arraybuffer *)t.u.obj->host)->byteLength);
+    return js_number(0);
+}
+static js_value ab_isview(js_ctx *ctx, js_value t, js_value *a, int n) {
+    (void)ctx; (void)t; (void)n;
+    return js_bool(n > 0 && a[0].type == JV_OBJ && a[0].u.obj->kind == OBJ_TYPEDARRAY);
+}
+static js_value ab_slice(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_arraybuffer *ab; int len, b, e, m; js_object *o;
+    if (t.type != JV_OBJ || t.u.obj->kind != OBJ_ARRAYBUFFER) return js_undef();
+    ab = (js_arraybuffer *)t.u.obj->host; len = ab->byteLength;
+    b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[0]), len) : 0;
+    e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[1]), len) : len;
+    m = e - b; if (m < 0) m = 0;
+    o = new_arraybuffer(ctx, m);
+    if (o->host) memcpy(((js_arraybuffer *)o->host)->data, ab->data + b, (unsigned)m);
+    return js_obj_value(o);
+}
+static js_value arraybuffer_ctor(js_ctx *ctx, js_value t, js_value *a, int n) {
+    int len = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    (void)t;
+    if (len < 0) return js_throw_range(ctx, "Invalid array buffer length");
+    return js_obj_value(new_arraybuffer(ctx, len));
+}
+
+/* DataView: type TA_DATAVIEW, host->length = byteLength */
+static void rev_bytes(unsigned char *b, int n) { int i; for (i = 0; i < n / 2; i++) { unsigned char x = b[i]; b[i] = b[n - 1 - i]; b[n - 1 - i] = x; } }
+static js_value dv_decode(int type, unsigned char *p) {     /* p is little-endian */
+    switch (type) {
+        case TA_I8:  return js_number((double)*(signed char *)p);
+        case TA_U8:  return js_number((double)*p);
+        case TA_I16: { short x; memcpy(&x, p, 2); return js_number((double)x); }
+        case TA_U16: { unsigned short x; memcpy(&x, p, 2); return js_number((double)x); }
+        case TA_I32: { int x; memcpy(&x, p, 4); return js_number((double)x); }
+        case TA_U32: { unsigned x; memcpy(&x, p, 4); return js_number((double)x); }
+        case TA_F32: { float x; memcpy(&x, p, 4); return js_number((double)x); }
+        case TA_F64: { double x; memcpy(&x, p, 8); return js_number(x); }
+    }
+    return js_number(0);
+}
+static void dv_encode(js_ctx *ctx, int type, js_value v, unsigned char *p) {
+    if (type == TA_F32) { float f = (float)js_to_number(ctx, v); memcpy(p, &f, 4); return; }
+    if (type == TA_F64) { double d = js_to_number(ctx, v); memcpy(p, &d, 8); return; }
+    { unsigned u = js_to_uint32(ctx, v); memcpy(p, &u, (unsigned)ta_elem_size(type)); }
+}
+static js_value dv_get(js_ctx *ctx, js_value t, js_value *a, int n, int type) {
+    js_typedarray *ta = as_ta(t); int es = ta_elem_size(type), off, le; js_arraybuffer *ab; unsigned char tmp[8];
+    if (!ta || ta->type != TA_DATAVIEW) return js_undef();
+    off = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    le = (es > 1) && (n > 1) && js_to_boolean(a[1]);
+    if (off < 0 || off + es > ta->length) return js_throw_range(ctx, "Offset is outside the bounds of the DataView");
+    ab = (js_arraybuffer *)ta->buffer->host;
+    memcpy(tmp, ab->data + ta->offset + off, (unsigned)es);
+    if (!le) rev_bytes(tmp, es);             /* DataView defaults to big-endian */
+    return dv_decode(type, tmp);
+}
+static js_value dv_set(js_ctx *ctx, js_value t, js_value *a, int n, int type) {
+    js_typedarray *ta = as_ta(t); int es = ta_elem_size(type), off, le; js_arraybuffer *ab; unsigned char tmp[8];
+    if (!ta || ta->type != TA_DATAVIEW) return js_undef();
+    off = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    le = (es > 1) && (n > 2) && js_to_boolean(a[2]);
+    if (off < 0 || off + es > ta->length) return js_throw_range(ctx, "Offset is outside the bounds of the DataView");
+    ab = (js_arraybuffer *)ta->buffer->host;
+    dv_encode(ctx, type, n > 1 ? a[1] : js_undef(), tmp);
+    if (!le) rev_bytes(tmp, es);
+    memcpy(ab->data + ta->offset + off, tmp, (unsigned)es);
+    return js_undef();
+}
+#define DV_GET(fn, TYPE) static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n) { return dv_get(ctx, t, a, n, TYPE); }
+#define DV_SET(fn, TYPE) static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n) { return dv_set(ctx, t, a, n, TYPE); }
+DV_GET(dv_get_i8, TA_I8)   DV_SET(dv_set_i8, TA_I8)
+DV_GET(dv_get_u8, TA_U8)   DV_SET(dv_set_u8, TA_U8)
+DV_GET(dv_get_i16, TA_I16) DV_SET(dv_set_i16, TA_I16)
+DV_GET(dv_get_u16, TA_U16) DV_SET(dv_set_u16, TA_U16)
+DV_GET(dv_get_i32, TA_I32) DV_SET(dv_set_i32, TA_I32)
+DV_GET(dv_get_u32, TA_U32) DV_SET(dv_set_u32, TA_U32)
+DV_GET(dv_get_f32, TA_F32) DV_SET(dv_set_f32, TA_F32)
+DV_GET(dv_get_f64, TA_F64) DV_SET(dv_set_f64, TA_F64)
+#undef DV_GET
+#undef DV_SET
+static js_value dv_bytelength(js_ctx *ctx, js_value t, js_value *a, int n) { js_typedarray *ta = as_ta(t); (void)ctx; (void)a; (void)n; return js_number(ta ? ta->length : 0); }
+static js_value dataview_ctor(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_arraybuffer *ab; int off, len;
+    (void)t;
+    if (!(n > 0 && a[0].type == JV_OBJ && a[0].u.obj->kind == OBJ_ARRAYBUFFER)) return js_throw_type(ctx, "First argument to DataView constructor must be an ArrayBuffer");
+    ab = (js_arraybuffer *)a[0].u.obj->host;
+    off = (n > 1 && a[1].type != JV_UNDEF) ? (int)js_to_number(ctx, a[1]) : 0;
+    if (off < 0 || off > ab->byteLength) return js_throw_range(ctx, "Invalid DataView offset");
+    if (n > 2 && a[2].type != JV_UNDEF) { len = (int)js_to_number(ctx, a[2]); if (len < 0 || off + len > ab->byteLength) return js_throw_range(ctx, "Invalid DataView length"); }
+    else len = ab->byteLength - off;
+    return new_view(ctx, TA_DATAVIEW, a[0].u.obj, off, len);
+}
+
+/* a configurable+enumerable accessor (get only) on `proto` */
+static void ta_def_acc(js_ctx *ctx, js_object *proto, const char *name, js_native get) {
+    gc_push_scope();
+    { js_object *g = (js_object *)gc_keep(js_new_native(ctx, get, name, 0));
+      js_def_accessor(proto, name, g, 0, P_CONFIGURABLE | P_ENUMERABLE); }
+    gc_pop_scope();
+}
+
+static void setup_typed_arrays(js_ctx *ctx) {
+    static const struct { const char *name; js_native ctor; int type; } views[9] = {
+        { "Int8Array", int8a_ctor, TA_I8 }, { "Uint8Array", uint8a_ctor, TA_U8 }, { "Uint8ClampedArray", uint8ca_ctor, TA_U8C },
+        { "Int16Array", int16a_ctor, TA_I16 }, { "Uint16Array", uint16a_ctor, TA_U16 }, { "Int32Array", int32a_ctor, TA_I32 },
+        { "Uint32Array", uint32a_ctor, TA_U32 }, { "Float32Array", float32a_ctor, TA_F32 }, { "Float64Array", float64a_ctor, TA_F64 }
+    };
+    int i;
+
+    /* ArrayBuffer */
+    ta_def_acc(ctx, ctx->arraybuffer_proto, "byteLength", ab_bytelength);
+    js_def_native(ctx, ctx->arraybuffer_proto, "slice", ab_slice, 2);
+    { js_object *c = make_ctor(ctx, "ArrayBuffer", arraybuffer_ctor, ctx->arraybuffer_proto);
+      js_def_native(ctx, c, "isView", ab_isview, 1); }
+
+    /* %TypedArray%.prototype: shared accessors + methods */
+    ta_def_acc(ctx, ctx->typedarray_proto, "length", tap_length);
+    ta_def_acc(ctx, ctx->typedarray_proto, "byteLength", tap_bytelength);
+    ta_def_acc(ctx, ctx->typedarray_proto, "byteOffset", tap_byteoffset);
+    ta_def_acc(ctx, ctx->typedarray_proto, "buffer", tap_buffer);
+    js_def_native(ctx, ctx->typedarray_proto, "set", tap_set, 2);
+    js_def_native(ctx, ctx->typedarray_proto, "subarray", tap_subarray, 2);
+    js_def_native(ctx, ctx->typedarray_proto, "slice", tap_slice, 2);
+    js_def_native(ctx, ctx->typedarray_proto, "fill", tap_fill, 3);
+    js_def_native(ctx, ctx->typedarray_proto, "indexOf", tap_indexof, 1);
+    js_def_native(ctx, ctx->typedarray_proto, "includes", tap_includes, 1);
+    js_def_native(ctx, ctx->typedarray_proto, "join", tap_join, 1);
+    js_def_native(ctx, ctx->typedarray_proto, "toString", tap_tostring, 0);
+    js_def_native(ctx, ctx->typedarray_proto, "forEach", tap_foreach, 1);
+    js_def_native(ctx, ctx->typedarray_proto, "map", tap_map, 1);
+    js_def_native(ctx, ctx->typedarray_proto, "reduce", tap_reduce, 2);
+
+    /* the nine views: a constructor + a per-view prototype chained to the shared one */
+    for (i = 0; i < 9; i++) {
+        js_object *proto = ctx->typed_protos[i];
+        js_object *c, *of_fn, *from_fn;
+        gc_push_scope();
+        c = (js_object *)gc_keep(js_new_native(ctx, views[i].ctor, views[i].name, 3));
+        js_def(c, "prototype", js_obj_value(proto), 0);
+        js_def(proto, "constructor", js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+        js_def(proto, "BYTES_PER_ELEMENT", js_number(ta_elem_size(views[i].type)), 0);
+        js_def(c, "BYTES_PER_ELEMENT", js_number(ta_elem_size(views[i].type)), 0);
+        of_fn = (js_object *)gc_keep(js_new_native(ctx, ta_of, "of", 0));
+        of_fn->fn->data = js_number(views[i].type);
+        js_def(c, "of", js_obj_value(of_fn), P_WRITABLE | P_CONFIGURABLE);
+        from_fn = (js_object *)gc_keep(js_new_native(ctx, ta_from, "from", 1));
+        from_fn->fn->data = js_number(views[i].type);
+        js_def(c, "from", js_obj_value(from_fn), P_WRITABLE | P_CONFIGURABLE);
+        js_def(ctx->global, views[i].name, js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+
+    /* DataView */
+    ta_def_acc(ctx, ctx->dataview_proto, "byteLength", dv_bytelength);
+    ta_def_acc(ctx, ctx->dataview_proto, "byteOffset", tap_byteoffset);
+    ta_def_acc(ctx, ctx->dataview_proto, "buffer", tap_buffer);
+    js_def_native(ctx, ctx->dataview_proto, "getInt8", dv_get_i8, 1);   js_def_native(ctx, ctx->dataview_proto, "setInt8", dv_set_i8, 2);
+    js_def_native(ctx, ctx->dataview_proto, "getUint8", dv_get_u8, 1);  js_def_native(ctx, ctx->dataview_proto, "setUint8", dv_set_u8, 2);
+    js_def_native(ctx, ctx->dataview_proto, "getInt16", dv_get_i16, 1); js_def_native(ctx, ctx->dataview_proto, "setInt16", dv_set_i16, 2);
+    js_def_native(ctx, ctx->dataview_proto, "getUint16", dv_get_u16, 1);js_def_native(ctx, ctx->dataview_proto, "setUint16", dv_set_u16, 2);
+    js_def_native(ctx, ctx->dataview_proto, "getInt32", dv_get_i32, 1); js_def_native(ctx, ctx->dataview_proto, "setInt32", dv_set_i32, 2);
+    js_def_native(ctx, ctx->dataview_proto, "getUint32", dv_get_u32, 1);js_def_native(ctx, ctx->dataview_proto, "setUint32", dv_set_u32, 2);
+    js_def_native(ctx, ctx->dataview_proto, "getFloat32", dv_get_f32, 1);js_def_native(ctx, ctx->dataview_proto, "setFloat32", dv_set_f32, 2);
+    js_def_native(ctx, ctx->dataview_proto, "getFloat64", dv_get_f64, 1);js_def_native(ctx, ctx->dataview_proto, "setFloat64", dv_set_f64, 2);
+    make_ctor(ctx, "DataView", dataview_ctor, ctx->dataview_proto);
+}
+
 static js_object *make_ctor(js_ctx *ctx, const char *name, js_native fn, js_object *proto) {
     js_object *c = js_new_native(ctx, fn, name, 1);
     gc_push_scope(); gc_keep(c); gc_keep(proto);
@@ -1824,6 +3023,9 @@ void js_setup_builtins(js_ctx *ctx) {
 
     /* Function.prototype (minimal) */
     js_def_native(ctx, ctx->function_proto, "toString", op_tostring, 0);
+    js_def_native(ctx, ctx->function_proto, "call", fn_call, 1);
+    js_def_native(ctx, ctx->function_proto, "apply", fn_apply, 2);
+    js_def_native(ctx, ctx->function_proto, "bind", fn_bind, 1);
 
     /* Array */
     js_def_native(ctx, ctx->array_proto, "push", array_push, 1);
@@ -1878,6 +3080,8 @@ void js_setup_builtins(js_ctx *ctx) {
     js_def_native(ctx, ctx->string_proto, "split", str_split, 2);
     js_def_native(ctx, ctx->string_proto, "replace", str_replace, 2);
     js_def_native(ctx, ctx->string_proto, "replaceAll", str_replaceall, 2);
+    js_def_native(ctx, ctx->string_proto, "match", str_match, 1);
+    js_def_native(ctx, ctx->string_proto, "search", str_search, 1);
     js_def_native(ctx, ctx->string_proto, "repeat", str_repeat, 1);
     js_def_native(ctx, ctx->string_proto, "padStart", str_padstart, 1);
     js_def_native(ctx, ctx->string_proto, "padEnd", str_padend, 1);
@@ -1941,7 +3145,10 @@ void js_setup_builtins(js_ctx *ctx) {
         js_def(math, "E", js_number(2.718281828459045), 0);
         js_def(math, "LN2", js_number(0.6931471805599453), 0);
         js_def(math, "LN10", js_number(2.302585092994046), 0);
+        js_def(math, "LOG2E", js_number(1.4426950408889634), 0);
+        js_def(math, "LOG10E", js_number(0.4342944819032518), 0);
         js_def(math, "SQRT2", js_number(1.4142135623730951), 0);
+        js_def(math, "SQRT1_2", js_number(0.7071067811865476), 0);
         js_def_native(ctx, math, "abs", m_abs, 1);     js_def_native(ctx, math, "floor", m_floor, 1);
         js_def_native(ctx, math, "ceil", m_ceil, 1);   js_def_native(ctx, math, "round", m_round, 1);
         js_def_native(ctx, math, "trunc", m_trunc, 1); js_def_native(ctx, math, "sign", m_sign, 1);
@@ -1954,6 +3161,10 @@ void js_setup_builtins(js_ctx *ctx) {
         js_def_native(ctx, math, "atan", m_atan, 1);   js_def_native(ctx, math, "atan2", m_atan2, 2);
         js_def_native(ctx, math, "sinh", m_sinh, 1);   js_def_native(ctx, math, "cosh", m_cosh, 1);
         js_def_native(ctx, math, "tanh", m_tanh, 1);   js_def_native(ctx, math, "hypot", m_hypot, 2);
+        js_def_native(ctx, math, "asinh", m_asinh, 1); js_def_native(ctx, math, "acosh", m_acosh, 1);
+        js_def_native(ctx, math, "atanh", m_atanh, 1); js_def_native(ctx, math, "expm1", m_expm1, 1);
+        js_def_native(ctx, math, "log1p", m_log1p, 1); js_def_native(ctx, math, "fround", m_fround, 1);
+        js_def_native(ctx, math, "clz32", m_clz32, 1); js_def_native(ctx, math, "imul", m_imul, 2);
         js_def_native(ctx, math, "max", m_max, 2);     js_def_native(ctx, math, "min", m_min, 2);
         js_def_native(ctx, math, "random", m_random, 0);
         (void)m_round_;
@@ -2056,6 +3267,16 @@ void js_setup_builtins(js_ctx *ctx) {
     { js_object *dc = make_ctor(ctx, "Date", date_ctor, ctx->date_proto);
       js_def_native(ctx, dc, "now", date_now, 0); }
 
+    /* RegExp: prototype methods + the constructor (also reachable as the type of
+     * a `/.../ ` literal, which interp.c builds via js_make_regexp). */
+    js_def_native(ctx, ctx->regexp_proto, "test", re_test, 1);
+    js_def_native(ctx, ctx->regexp_proto, "exec", re_proto_exec, 1);
+    js_def_native(ctx, ctx->regexp_proto, "toString", re_tostring, 0);
+    make_ctor(ctx, "RegExp", regexp_ctor, ctx->regexp_proto);
+
+    /* ArrayBuffer / TypedArrays / DataView */
+    setup_typed_arrays(ctx);
+
     /* JSON */
     {
         js_object *json = js_new_object(ctx, ctx->object_proto);
@@ -2085,7 +3306,11 @@ void js_setup_builtins(js_ctx *ctx) {
     def_global_fn(ctx, "encodeURIComponent", g_encode_uri_component, 1);
     def_global_fn(ctx, "encodeURI", g_encode_uri, 1);
     def_global_fn(ctx, "decodeURIComponent", g_decode_uri_component, 1);
+    def_global_fn(ctx, "escape", g_escape, 1);
+    def_global_fn(ctx, "unescape", g_unescape, 1);
     def_global_fn(ctx, "decodeURI", g_decode_uri, 1);
+    def_global_fn(ctx, "btoa", g_btoa, 1);
+    def_global_fn(ctx, "atob", g_atob, 1);
     def_global_fn(ctx, "eval", js_builtin_eval, 1);
     {
         js_object *fctor = js_new_native(ctx, js_builtin_function, "Function", 1);

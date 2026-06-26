@@ -333,6 +333,7 @@ static int window_at(int px, int py)
  * win_wait, never mid-paint. The tracker outlives the gesture until the app's
  * content catches up to the final size. */
 static int      rsz_win = -1;
+static int      rsz_edge;       /* edges being dragged (RZ_* bits); 0 = the grip */
 static int      rsz_target_w, rsz_target_h;
 static int      rsz_sent_w, rsz_sent_h;
 static uint32_t rsz_ack;
@@ -622,7 +623,7 @@ static void cur_stroke(int x, int y, int halo)
 
 /* Diagonal double-arrow (↖↘) for the resize grip: a shaft with an arrowhead at
  * each end. Drawn halo-first so the white outline never paints over the core. */
-static void draw_resize(int mx, int my)
+static void draw_resize_nwse(int mx, int my)
 {
 	for (int halo = 1; halo >= 0; halo--) {
 		for (int t = -5; t <= 5; t++)
@@ -636,11 +637,57 @@ static void draw_resize(int mx, int my)
 	}
 }
 
+/* ↗↙ diagonal double-arrow (the other corner). */
+static void draw_resize_nesw(int mx, int my)
+{
+	for (int halo = 1; halo >= 0; halo--) {
+		for (int t = -5; t <= 5; t++)
+			cur_stroke(mx + t, my - t, halo);          /* anti-diagonal shaft */
+		for (int k = 0; k <= 4; k++) {
+			cur_stroke(mx + 5 - k, my - 5,     halo);  /* NE head            */
+			cur_stroke(mx + 5,     my - 5 + k, halo);
+			cur_stroke(mx - 5 + k, my + 5,     halo);  /* SW head            */
+			cur_stroke(mx - 5,     my + 5 - k, halo);
+		}
+	}
+}
+
+/* ↕ vertical double-arrow (top/bottom edge). */
+static void draw_resize_ns(int mx, int my)
+{
+	for (int halo = 1; halo >= 0; halo--) {
+		for (int t = -6; t <= 6; t++) cur_stroke(mx, my + t, halo);   /* shaft */
+		for (int k = 0; k <= 4; k++) {
+			cur_stroke(mx - k, my - 6 + k, halo);      /* top head    */
+			cur_stroke(mx + k, my - 6 + k, halo);
+			cur_stroke(mx - k, my + 6 - k, halo);      /* bottom head */
+			cur_stroke(mx + k, my + 6 - k, halo);
+		}
+	}
+}
+
+/* ↔ horizontal double-arrow (left/right edge). */
+static void draw_resize_ew(int mx, int my)
+{
+	for (int halo = 1; halo >= 0; halo--) {
+		for (int t = -6; t <= 6; t++) cur_stroke(mx + t, my, halo);   /* shaft */
+		for (int k = 0; k <= 4; k++) {
+			cur_stroke(mx - 6 + k, my - k, halo);      /* left head  */
+			cur_stroke(mx - 6 + k, my + k, halo);
+			cur_stroke(mx + 6 - k, my - k, halo);      /* right head */
+			cur_stroke(mx + 6 - k, my + k, halo);
+		}
+	}
+}
+
 static void draw_cursor(int kind, int mx, int my)
 {
 	switch (kind) {
-	case WM_CURSOR_BUSY:    draw_busy(mx, my);   return;
-	case WM_CURSOR_RESIZE:  draw_resize(mx, my); return;
+	case WM_CURSOR_BUSY:        draw_busy(mx, my);   return;
+	case WM_CURSOR_RESIZE_NWSE: draw_resize_nwse(mx, my); return;
+	case WM_CURSOR_RESIZE_NESW: draw_resize_nesw(mx, my); return;
+	case WM_CURSOR_RESIZE_NS:   draw_resize_ns(mx, my); return;
+	case WM_CURSOR_RESIZE_EW:   draw_resize_ew(mx, my); return;
 	default:
 		if (kind < 0 || kind >= (int)(sizeof cur_shapes / sizeof cur_shapes[0]) ||
 		    !cur_shapes[kind].rows)
@@ -930,13 +977,42 @@ static void draw_tb_menu(void)
 static int hover_resizing;
 static int hover_settling;
 
+/* Edge/corner of a window frame the pointer is over (a resize grab zone). */
+enum { RZ_L = 1, RZ_R = 2, RZ_T = 4, RZ_B = 8 };
+
+/* Which frame edges (RZ_* bitmask) the pointer at (mx,my) is within WM_EDGE of,
+ * for a resizable, non-maximized window. 0 = not on an edge. The pointer is
+ * assumed already inside the window box (window_at matched it). */
+static int resize_edge(struct window *w, int mx, int my)
+{
+	if (!w->resizable || w->maximized) return 0;
+	int e = 0;
+	if (mx < w->x + WM_EDGE)              e |= RZ_L;
+	else if (mx >= w->x + w->w - WM_EDGE) e |= RZ_R;
+	if (my < w->y + WM_EDGE)              e |= RZ_T;
+	else if (my >= w->y + w->h - WM_EDGE) e |= RZ_B;
+	return e;
+}
+
+/* The directional cursor for an edge mask. */
+static int edge_cursor(int e)
+{
+	switch (e) {
+	case RZ_L: case RZ_R:                 return WM_CURSOR_RESIZE_EW;
+	case RZ_T: case RZ_B:                 return WM_CURSOR_RESIZE_NS;
+	case RZ_L | RZ_T: case RZ_R | RZ_B:   return WM_CURSOR_RESIZE_NWSE;
+	case RZ_R | RZ_T: case RZ_L | RZ_B:   return WM_CURSOR_RESIZE_NESW;
+	}
+	return WM_CURSOR_ARROW;
+}
+
 /* Decide which cursor the pointer should be wearing this frame. Resize and
  * "busy" hints from an in-progress interaction win; then clickable chrome (the
  * Start button, an open menu item, a close box) gets the hand; then the grip
  * gets the resize arrow; otherwise a window may dress its own client area. */
 static int pick_cursor(int mx, int my)
 {
-	if (hover_resizing) return WM_CURSOR_RESIZE;
+	if (hover_resizing) return edge_cursor(rsz_edge ? rsz_edge : (RZ_R | RZ_B));
 	if (hover_settling) return WM_CURSOR_BUSY;
 
 	if (tb_menu_open && mx >= tb_menu_x && mx < tb_menu_x + TBM_W &&
@@ -960,7 +1036,9 @@ static int pick_cursor(int mx, int my)
 		if (w->resizable &&
 		    mx >= w->x + w->w - WM_GRIP && mx < w->x + w->w &&
 		    my >= w->y + w->h - WM_GRIP && my < w->y + w->h)
-			return WM_CURSOR_RESIZE;
+			return WM_CURSOR_RESIZE_NWSE;          /* the larger BR grip zone   */
+		int e = resize_edge(w, mx, my);
+		if (e) return edge_cursor(e);
 		if (w->cursor > 0 &&
 		    my >= w->y + WM_TITLE_H && my < w->y + w->h - WM_BORDER &&
 		    mx >= w->x + WM_BORDER && mx < w->x + w->w - WM_BORDER)
@@ -1039,7 +1117,8 @@ static void handle_input(int mx, int my, int buttons, int dz)
 	static int  resizing = -1;
 	static int  app_dragging = -1;  /* window whose app captured the drag        */
 	static int  drag_dx, drag_dy;   /* dragging: cursor offset within the title */
-	static int  rsz_dx, rsz_dy;     /* resizing: cursor offset from bottom-right */
+	static int  rsz_ox, rsz_oy, rsz_ow, rsz_oh;  /* frame box when the grab began */
+	static int  rsz_mx0, rsz_my0;                /* cursor when the grab began    */
 	/* The live-resize hand-off state (rsz_win/rsz_target/rsz_sent/rsz_ack) is at
 	 * file scope so maximize/restore can drive it too; see resize_to(). */
 
@@ -1175,12 +1254,18 @@ static void handle_input(int mx, int my, int buttons, int dz)
 				wm_toggle_maximize(idx);
 			} else if (tb == 2) {                 /* minimize                */
 				wm_minimize(idx);
-			} else if (w->resizable &&            /* bottom-right resize grip */
-			           mx >= w->x + w->w - WM_GRIP && mx < w->x + w->w &&
-			           my >= w->y + w->h - WM_GRIP && my < w->y + w->h) {
+			} else if (w->resizable && !w->maximized &&
+			           ((mx >= w->x + w->w - WM_GRIP && my >= w->y + w->h - WM_GRIP)
+			            || resize_edge(w, mx, my))) {  /* grip or any frame edge */
+				/* The BR grip is a larger hot-zone for the classic corner;
+				 * resize_edge covers every edge/corner within WM_EDGE. */
+				int e = (mx >= w->x + w->w - WM_GRIP &&
+				         my >= w->y + w->h - WM_GRIP)
+				        ? (RZ_R | RZ_B) : resize_edge(w, mx, my);
 				resizing = idx;
-				rsz_dx = (w->x + w->w) - mx;
-				rsz_dy = (w->y + w->h) - my;
+				rsz_edge = e;
+				rsz_ox = w->x; rsz_oy = w->y; rsz_ow = w->w; rsz_oh = w->h;
+				rsz_mx0 = mx; rsz_my0 = my;
 				rsz_win = idx;
 				rsz_target_w = w->w; rsz_target_h = w->h;
 				rsz_sent_w = rsz_sent_h = -1;  /* force the first hand-off  */
@@ -1217,15 +1302,24 @@ static void handle_input(int mx, int my, int buttons, int dz)
 			ny = screen_h - WM_BAR_H - WM_TITLE_H;
 		w->x = nx;
 		w->y = ny;
-	} else if (down && resizing >= 0) {         /* resize from the grip        */
+	} else if (down && resizing >= 0) {         /* resize from an edge/corner  */
 		struct window *w = wins[resizing];
-		int nw = mx + rsz_dx - w->x, nh = my + rsz_dy - w->y;
-		if (nw < WM_MIN_W) nw = WM_MIN_W;
-		if (nh < WM_MIN_H) nh = WM_MIN_H;
-		if (w->x + nw > screen_w) nw = screen_w - w->x;
-		if (w->y + nh > screen_h - WM_BAR_H) nh = screen_h - WM_BAR_H - w->y;
-		w->w = nw;                  /* frame tracks the cursor every frame      */
-		w->h = nh;
+		int dx = mx - rsz_mx0, dy = my - rsz_my0;
+		int nx = rsz_ox, ny = rsz_oy, nw = rsz_ow, nh = rsz_oh;
+		if (rsz_edge & RZ_R) nw = rsz_ow + dx;
+		if (rsz_edge & RZ_B) nh = rsz_oh + dy;
+		if (rsz_edge & RZ_L) { nw = rsz_ow - dx; nx = rsz_ox + dx; }
+		if (rsz_edge & RZ_T) { nh = rsz_oh - dy; ny = rsz_oy + dy; }
+		/* Min size, keeping the anchored (non-dragged) edge fixed. */
+		if (nw < WM_MIN_W) { if (rsz_edge & RZ_L) nx -= WM_MIN_W - nw; nw = WM_MIN_W; }
+		if (nh < WM_MIN_H) { if (rsz_edge & RZ_T) ny -= WM_MIN_H - nh; nh = WM_MIN_H; }
+		/* Clamp to the screen (above the taskbar). */
+		if (nx < 0) { nw += nx; nx = 0; }
+		if (ny < 0) { nh += ny; ny = 0; }
+		if (nx + nw > screen_w) nw = screen_w - nx;
+		if (ny + nh > screen_h - WM_BAR_H) nh = screen_h - WM_BAR_H - ny;
+		w->x = nx; w->y = ny;       /* frame tracks the cursor every frame      */
+		w->w = nw; w->h = nh;
 		rsz_target_w = nw;          /* commit step hands this to the app        */
 		rsz_target_h = nh;
 	} else if (!down) {                          /* release                     */
@@ -1442,10 +1536,48 @@ static int          cliphist_pid;
 
 void wm_request_cliphist(void) { cliphist_req = 1; }
 
+/* A pending resolution change, posted by the sysfs writer (a ring-3 task in the
+ * int 0x80 gate) and picked up by the compositor thread, which owns the
+ * framebuffer geometry. 0 width = nothing pending. */
+static volatile int mode_req_w, mode_req_h;
+
+void wm_request_mode(int w, int h) { mode_req_w = w; mode_req_h = h; }
+
+/* Apply a queued resolution change on the compositor thread: reprogram the
+ * adapter, then re-derive everything keyed off the screen size — cursor bounds,
+ * a maximized window's fill, and any window now hanging off the smaller screen.
+ * force_full repaints the whole desktop at the new size. */
+static void wm_apply_mode(void)
+{
+	int w = mode_req_w, h = mode_req_h;
+	mode_req_w = mode_req_h = 0;
+	if (w <= 0 || fb_set_mode((uint32_t)w, (uint32_t)h) != 0)
+		return;
+
+	screen_w = (int)fb_width();
+	screen_h = (int)fb_height();
+	mouse_set_bounds(screen_w - 1, screen_h - 1);
+
+	for (int i = 0; i < nwin; i++) {
+		struct window *win = wins[i];
+		if (win->maximized) {
+			resize_to(i, 0, 0, screen_w, screen_h - WM_BAR_H);
+			continue;
+		}
+		if (win->w > screen_w)                 win->w = screen_w;
+		if (win->h > screen_h - WM_BAR_H)      win->h = screen_h - WM_BAR_H;
+		if (win->x + win->w > screen_w)        win->x = screen_w - win->w;
+		if (win->y + win->h > screen_h - WM_BAR_H)
+			win->y = screen_h - WM_BAR_H - win->h;
+		if (win->x < 0) win->x = 0;
+		if (win->y < 0) win->y = 0;
+	}
+	force_full = 1;
+}
+
 static void wm_thread(void)
 {
 	g_boot_stage = "wm_thread:enter";
-	con_write("BOOTMARK: wm_thread enter\n");
 	/* Previous-frame snapshots live in pf[] (grown with wins[]); see struct
 	 * pfsnap. New slots start with pf.dirty = 0xFFFFFFFF so a window's first
 	 * content always differs and paints. */
@@ -1465,16 +1597,17 @@ static void wm_thread(void)
 	 * non-Intel / eDP, where we fall back to 60. Clamp to one tick so a high
 	 * refresh can't spin the loop faster than the timer can wake it. */
 	g_boot_stage = "wm_thread:edid";
-	con_write("BOOTMARK: wm_thread edid\n");
 	int      hz = edid_refresh_hz();
 	g_boot_stage = "wm_thread:edid-done";
-	con_write("BOOTMARK: wm_thread edid done\n");
 	int      frame_ms = 1000 / (hz ? hz : 60);
 	if (frame_ms < 1000 / TIMER_HZ)
 		frame_ms = 1000 / TIMER_HZ;
 
 	g_boot_stage = "wm_thread:loop";
 	for (;;) {
+		if (mode_req_w)
+			wm_apply_mode();           /* a queued resolution change            */
+
 		/* Super+V: launch the clipboard-history viewer, and when it exits after
 		 * picking a clip (exit 0), inject a paste into whatever window now has
 		 * focus — the same path Ctrl+V uses. Reaped here, before the generic

@@ -52,8 +52,7 @@
 static void print_hex2(uint8_t v)
 {
 	static const char h[] = "0123456789abcdef";
-	con_putc(h[v >> 4]);
-	con_putc(h[v & 0xF]);
+	con_printf("%c%c", h[v >> 4], h[v & 0xF]);
 }
 
 /* ----------------------------------------------------------- register file */
@@ -1176,13 +1175,8 @@ static int e1000_probe(void)
 
 	present = 1;
 
-	con_write("net: Intel ");
-	con_write(model_name(device_id));
-	con_write(" at mmio ");
-	con_write_hex(mmio_phys);
-	con_write(" irq ");
-	con_write_dec(irq);
-	con_write(" mac ");
+	con_printf("net: Intel %s at mmio 0x%08X irq %u mac ",
+	           model_name(device_id), mmio_phys, irq);
 	for (int i = 0; i < 6; i++) {
 		print_hex2(mac[i]);
 		if (i < 5)
@@ -1252,10 +1246,8 @@ void e1000_txtest(void)
 	reg_write(E1000_RCTL, save_rctl & ~0xC0u);  /* clear LBM (no MAC loopback)    */
 	pch_mdelay(20);
 
-	con_write("txtest(PHY lb): TCTL="); con_write_hex(reg_read(E1000_TCTL));
-	con_write(" CTRL=");             con_write_hex(reg_read(E1000_CTRL));
-	con_write(" STATUS=");           con_write_hex(reg_read(E1000_STATUS));
-	con_putc('\n');
+	con_printf("txtest(PHY lb): TCTL=0x%08X CTRL=0x%08X STATUS=0x%08X\n",
+	           reg_read(E1000_TCTL), reg_read(E1000_CTRL), reg_read(E1000_STATUS));
 
 	(void)reg_read(E1000_GPTC);                 /* clear-on-read: zero counters    */
 	(void)reg_read(E1000_TPT);
@@ -1267,12 +1259,9 @@ void e1000_txtest(void)
 	e1000_send(frame, 60);
 	pch_mdelay(50);
 
-	con_write("txtest(PHY lb): TDH="); con_write_dec(reg_read(E1000_TDH));
-	con_write(" TDT=");              con_write_dec(reg_read(E1000_TDT));
-	con_write(" GPTC=");             con_write_dec(reg_read(E1000_GPTC));
-	con_write(" TPT=");              con_write_dec(reg_read(E1000_TPT));
-	con_write(" status=");           con_write_hex(tx_ring[slot].status);
-	con_putc('\n');
+	con_printf("txtest(PHY lb): TDH=%u TDT=%u GPTC=%u TPT=%u status=0x%08X\n",
+	           reg_read(E1000_TDH), reg_read(E1000_TDT), reg_read(E1000_GPTC),
+	           reg_read(E1000_TPT), tx_ring[slot].status);
 
 	/* Take the PHY back out of loopback. */
 	if (phy_id && phy_acquire() == 0) {
@@ -1295,12 +1284,10 @@ void e1000_diag(void)
 
 	uint32_t st = reg_read(E1000_STATUS);
 	static const char *const spd[] = { "10", "100", "1000", "1000" };
-	con_write("live: STATUS=");
-	con_write_hex(st);
-	con_write((st & STATUS_LU) ? " link UP " : " link DOWN ");
+	con_printf("live: STATUS=0x%08X%s", st,
+	           (st & STATUS_LU) ? " link UP " : " link DOWN ");
 	if (st & STATUS_LU) {
-		con_write(spd[(st >> 6) & 3]);
-		con_write((st & 1) ? "Mb FD" : "Mb HD");
+		con_printf("%s%s", spd[(st >> 6) & 3], (st & 1) ? "Mb FD" : "Mb HD");
 	}
 	con_putc('\n');
 
@@ -1308,37 +1295,29 @@ void e1000_diag(void)
 	 * last ethdiag). TX>0 means frames really left the MAC; RX>0 means frames
 	 * really arrived — together they localize a "no traffic" fault to TX, RX, or
 	 * the link/peer. */
-	con_write("  tx: good=");      con_write_dec(reg_read(E1000_GPTC));
-	con_write(" total=");          con_write_dec(reg_read(E1000_TPT));
-	con_write("  rx: good=");      con_write_dec(reg_read(E1000_GPRC));
-	con_write(" total=");          con_write_dec(reg_read(E1000_TPR));
-	con_write("\n  rx errors: missed="); con_write_dec(reg_read(E1000_MPC));
-	con_write(" crc=");            con_write_dec(reg_read(E1000_CRCERRS));
-	con_write("\n  rings: RDH="); con_write_dec(reg_read(E1000_RDH));
-	con_write(" RDT=");            con_write_dec(reg_read(E1000_RDT));
-	con_write(" TDH=");            con_write_dec(reg_read(E1000_TDH));
-	con_write(" TDT=");            con_write_dec(reg_read(E1000_TDT));
-	con_write("\n  regs: CTRL=");  con_write_hex(reg_read(E1000_CTRL));
-	con_write(" TCTL=");           con_write_hex(reg_read(E1000_TCTL));
-	con_write(" RCTL=");           con_write_hex(reg_read(E1000_RCTL));
-	con_write(" CTRL_EXT=");       con_write_hex(reg_read(E1000_CTRL_EXT));
-	con_write(" FWSM=");           con_write_hex(reg_read(E1000_FWSM));
-	con_write("\n  tx ring: TDBAL="); con_write_hex(reg_read(E1000_TDBAL));
-	con_write(" TDLEN=");          con_write_dec(reg_read(E1000_TDLEN));
-	con_write(" TXDCTL=");         con_write_hex(reg_read(E1000_TXDCTL));
-	con_write("\n  rx ring: RDBAL="); con_write_hex(reg_read(E1000_RDBAL));
-	con_write(" RDLEN=");          con_write_dec(reg_read(E1000_RDLEN));
-	con_write(" RXDCTL=");         con_write_hex(reg_read(E1000_RXDCTL));
+	con_printf("  tx: good=%u total=%u  rx: good=%u total=%u\n"
+	           "  rx errors: missed=%u crc=%u\n"
+	           "  rings: RDH=%u RDT=%u TDH=%u TDT=%u\n"
+	           "  regs: CTRL=0x%08X TCTL=0x%08X RCTL=0x%08X CTRL_EXT=0x%08X FWSM=0x%08X\n"
+	           "  tx ring: TDBAL=0x%08X TDLEN=%u TXDCTL=0x%08X\n"
+	           "  rx ring: RDBAL=0x%08X RDLEN=%u RXDCTL=0x%08X",
+	           reg_read(E1000_GPTC), reg_read(E1000_TPT),
+	           reg_read(E1000_GPRC), reg_read(E1000_TPR),
+	           reg_read(E1000_MPC), reg_read(E1000_CRCERRS),
+	           reg_read(E1000_RDH), reg_read(E1000_RDT),
+	           reg_read(E1000_TDH), reg_read(E1000_TDT),
+	           reg_read(E1000_CTRL), reg_read(E1000_TCTL), reg_read(E1000_RCTL),
+	           reg_read(E1000_CTRL_EXT), reg_read(E1000_FWSM),
+	           reg_read(E1000_TDBAL), reg_read(E1000_TDLEN), reg_read(E1000_TXDCTL),
+	           reg_read(E1000_RDBAL), reg_read(E1000_RDLEN), reg_read(E1000_RXDCTL));
 
 	/* Read the first TX descriptor back from memory: did the NIC write DD (bit0
 	 * of status) into it (= it processed/transmitted it) or never touch it (=
 	 * engine frozen)? And TARC0, the TX arbiter/queue-enable register. */
 	if (tx_ring) {
-		con_write("\n  txd0: addr=");  con_write_hex((uint32_t)tx_ring[0].addr);
-		con_write(" len=");            con_write_dec(tx_ring[0].length);
-		con_write(" cmd=");            con_write_hex(tx_ring[0].cmd);
-		con_write(" status=");         con_write_hex(tx_ring[0].status);
-		con_write(" TARC0=");          con_write_hex(reg_read(E1000_TARC0));
+		con_printf("\n  txd0: addr=0x%08X len=%u cmd=0x%08X status=0x%08X TARC0=0x%08X",
+		           (uint32_t)tx_ring[0].addr, tx_ring[0].length, tx_ring[0].cmd,
+		           tx_ring[0].status, reg_read(E1000_TARC0));
 	}
 
 	/* Scan MDIO addresses for the PHY (reg 2 = PHY ID1). A real Intel PHY answers
@@ -1348,10 +1327,7 @@ void e1000_diag(void)
 	con_write("\n  phy scan (reg2):");
 	for (int a = 0; a < 4; a++) {
 		int v = phy_read((uint8_t)a, 2);
-		con_write(" ");
-		con_write_dec(a);
-		con_putc(':');
-		con_write_hex(v < 0 ? 0xFFFFFFFFu : (uint32_t)v);
+		con_printf(" %u:0x%08X", a, v < 0 ? 0xFFFFFFFFu : (uint32_t)v);
 	}
 	con_putc('\n');
 }

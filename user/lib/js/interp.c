@@ -739,6 +739,15 @@ static js_value eval_class(js_ctx *ctx, js_node *node) {
         const char *key;
         js_value kh;
         if (m->kind == JS_M_CTOR) continue;
+        if (m->kind == JS_M_STATIC_BLOCK) {           /* run `static { … }` with this = the class */
+            js_object *fn = js_new_function(ctx, m->value, ctx->cur_env);
+            gc_push_scope(); gc_keep(fn);
+            fn->fn->home = ctor;
+            js_call(ctx, js_obj_value(fn), js_obj_value(ctor), 0, 0);
+            gc_pop_scope();
+            if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
+            continue;
+        }
         kh = prop_key_value(ctx, m->key, m->computed, buf, (int)sizeof buf, &key);
         if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
         KEEP(kh);
@@ -888,15 +897,8 @@ static js_value evaluate(js_ctx *ctx, js_node *n) {
         gc_pop_scope();
         return result;
     }
-    case JS_REGEX: {
-        js_object *o = js_new_object(ctx, ctx->object_proto);
-        gc_push_scope(); gc_keep(o);
-        js_def(o, "source", js_mk_cstring(ctx, n->u.regex.pattern), P_ENUMERABLE);
-        js_def(o, "flags", js_mk_cstring(ctx, n->u.regex.flags), P_ENUMERABLE);
-        js_def(o, "lastIndex", js_number(0), P_WRITABLE);
-        gc_pop_scope();
-        return js_obj_value(o);
-    }
+    case JS_REGEX:
+        return js_make_regexp(ctx, n->u.regex.pattern, n->u.regex.flags);
     case JS_AWAIT: {
         js_value v = evaluate(ctx, n->u.one.arg), settled;
         int st;
@@ -1558,7 +1560,28 @@ js_value js_construct(js_ctx *ctx, js_value fnval, js_value *args, int argc) {
     js_value proto, thisobj, result;
     if (!js_is_callable(fnval)) return js_throw_type(ctx, "value is not a constructor");
     fn = fnval.u.obj;
-    if (fn->fn->native) return fn->fn->native(ctx, js_undef(), args, argc);   /* native ctors build their own object */
+    {   /* a bound function (Function.prototype.bind) constructs its target with the
+         * bound partial args prepended, ignoring the bound `this`. */
+        pentry *pb = pmap_find_pub(fn, "@bound");
+        if (pb && pb->value.type == JV_OBJ && pb->value.u.obj->kind == OBJ_ARRAY) {
+            js_object *rec = pb->value.u.obj;
+            js_value target = rec->elen > 0 ? rec->elems[0] : js_undef();
+            int nbound = (int)rec->elen - 2, total, i;
+            js_value *cv, res;
+            if (nbound < 0) nbound = 0;
+            total = nbound + argc;
+            cv = total ? (js_value *)malloc((unsigned)total * sizeof *cv) : 0;
+            if (total && !cv) return js_throw_range(ctx, "bound construct: out of memory");
+            gc_push_scope(); KEEP(fnval); KEEP(target);
+            for (i = 0; i < nbound; i++) { cv[i] = rec->elems[2 + i]; KEEP(cv[i]); }
+            for (i = 0; i < argc; i++) { cv[nbound + i] = args[i]; KEEP(cv[nbound + i]); }
+            res = js_construct(ctx, target, cv, total);
+            gc_pop_scope();
+            if (cv) free(cv);
+            return res;
+        }
+    }
+    if (fn->fn->native) { ctx->native_data = fn->fn->data; return fn->fn->native(ctx, js_undef(), args, argc); }   /* native ctors build their own object */
     if (fn->fn->is_arrow) return js_throw_type(ctx, "arrow function is not a constructor");
 
     gc_push_scope();
@@ -1720,6 +1743,11 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
     gc_add_root((void **)&ctx->weakmap_proto);
     gc_add_root((void **)&ctx->weakset_proto);
     gc_add_root((void **)&ctx->date_proto);
+    gc_add_root((void **)&ctx->regexp_proto);
+    gc_add_root((void **)&ctx->typedarray_proto);
+    gc_add_root((void **)&ctx->arraybuffer_proto);
+    gc_add_root((void **)&ctx->dataview_proto);
+    { int i; for (i = 0; i < 9; i++) gc_add_root((void **)&ctx->typed_protos[i]); }
     gc_add_root((void **)&ctx->type_error_proto);
     gc_add_root((void **)&ctx->range_error_proto);
     gc_add_root((void **)&ctx->syntax_error_proto);
@@ -1740,6 +1768,11 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
     ctx->weakmap_proto  = js_new_object(ctx, ctx->object_proto);
     ctx->weakset_proto  = js_new_object(ctx, ctx->object_proto);
     ctx->date_proto     = js_new_object(ctx, ctx->object_proto);
+    ctx->regexp_proto   = js_new_object(ctx, ctx->object_proto);
+    ctx->typedarray_proto = js_new_object(ctx, ctx->object_proto);
+    ctx->arraybuffer_proto = js_new_object(ctx, ctx->object_proto);
+    ctx->dataview_proto = js_new_object(ctx, ctx->object_proto);
+    { int i; for (i = 0; i < 9; i++) ctx->typed_protos[i] = js_new_object(ctx, ctx->typedarray_proto); }
     ctx->type_error_proto   = js_new_object(ctx, ctx->error_proto);
     ctx->range_error_proto  = js_new_object(ctx, ctx->error_proto);
     ctx->syntax_error_proto = js_new_object(ctx, ctx->error_proto);

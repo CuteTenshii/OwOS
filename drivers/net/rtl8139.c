@@ -26,8 +26,7 @@
 static void print_hex2(uint8_t v)
 {
 	static const char h[] = "0123456789abcdef";
-	con_putc(h[v >> 4]);
-	con_putc(h[v & 0xF]);
+	con_printf("%c%c", h[v >> 4], h[v & 0xF]);
 }
 
 /* -------------------------------------------------------------- RTL8139 regs */
@@ -205,11 +204,7 @@ static int rtl8139_probe(void)
 
 	nic_found = 1;
 
-	con_write("net: RTL8139 at io ");
-	con_write_hex(io_base);
-	con_write(" irq ");
-	con_write_dec(irq);
-	con_write(" mac ");
+	con_printf("net: RTL8139 at io 0x%08X irq %u mac ", io_base, irq);
 	for (int i = 0; i < 6; i++) {
 		print_hex2(mac[i]);
 		if (i < 5)

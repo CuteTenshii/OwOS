@@ -95,7 +95,7 @@ int main(int argc, char **argv)
 		con_flush();
 		switch (rc) {
 		case HTTP_EPARSE:   puts("curl: could not parse URL\n"); break;
-		case HTTP_ERESOLVE: puts("curl: could not resolve host: "); puts(url); puts("\n"); break;
+		case HTTP_ERESOLVE: printf("curl: could not resolve host: %s\n", url); break;
 		case HTTP_ECONNECT: puts("curl: failed to connect\n"); break;
 		case HTTP_ESEND:    puts("curl: failed to send request\n"); break;
 		case HTTP_ENORESP:  puts("curl: no response from server\n"); break;
@@ -109,14 +109,10 @@ int main(int argc, char **argv)
 		if (save_overflow)
 			puts("curl: response exceeds 256 KiB buffer, truncated\n");
 		if (writefile(outname, save_buf, save_len) != 0) {
-			puts("curl: failed to save "); puts(outname); puts("\n");
+			printf("curl: failed to save %s\n", outname);
 			return 1;
 		}
-		puts("curl: saved ");
-		print_uint((unsigned)save_len);
-		puts(" bytes to ");
-		puts(outname);
-		puts("\n");
+		printf("curl: saved %u bytes to %s\n", (unsigned)save_len, outname);
 	} else {
 		con_flush();
 		puts("\n");

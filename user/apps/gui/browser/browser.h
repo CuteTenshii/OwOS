@@ -67,9 +67,13 @@ extern int BW, BH;         /* client size (mutable: the window is resizable)    
 #define FAVICON_W  16      /* favicon decoded to a fixed 16x16 ARGB bitmap and */
 #define FAVICON_H  16      /* shown in the page's tab (0xAARRGGBB per pixel)   */
 
-#define ST_COLOR   0x0F
+#define ST_COLOR   0x0F            /* legacy; color is now full 0xRRGGBB (B->fg) */
 #define ST_BOLD    0x10
 #define ST_UNDER   0x20
+
+/* Per-glyph background sentinel: B->bg[i] == BG_NONE means "no background"
+ * (a real CSS colour is 0x000000..0xFFFFFF, so the high byte is free). */
+#define BG_NONE    0xFF000000u
 
 /* Per-glyph block-layout byte (B->bp): paragraph size/kind, alignment, monospace
  * and indent. Shared by the html walk (sets it) and the renderer (applies it). */
@@ -89,7 +93,7 @@ struct cookie { char *host; char *name; char *val; struct cookie *next; };
 /* A host pinned to HTTPS by a Strict-Transport-Security header. Heap-allocated,
  * linked, and uncapped — every site that sends HSTS gets remembered. */
 struct hsts_host { char *host; struct hsts_host *next; };
-struct link   { int start, end; char href[URL_MAX]; };
+struct link   { int start, end; char href[URL_MAX]; signed char newtab; };
 
 /* An external stylesheet URL declared in the response's Link: header (resolved
  * absolute). The document's own <link rel=stylesheet> elements are found while
@@ -122,7 +126,60 @@ struct inl_img {
 	                          * once, not on every scroll repaint (see main.c) */
 };
 
+/* A single tab's page: everything that *is* one rendered document. Each tab owns
+ * one (it lives inline in struct tab); B->pg points at the active tab's, so a tab
+ * switch is just a pointer swap — no serialize/restore, and no field can leak
+ * across tabs. The big image bytes are NOT here (see img_pool in struct browser):
+ * the active load shares one 16 MiB scratch slab, and a backgrounded tab keeps a
+ * right-sized copy in img_save so switching back doesn't refetch. */
+struct page {
+	char     doc_title[128];
+	char     ctype[80];              /* lowercased response Content-Type      */
+	int      mode;                   /* enum render_mode for the current body */
+	char     cur_url[URL_MAX];
+
+	/* Growable, heap-backed (ensure_raw/ensure_text in main.c). raw is the
+	 * fetched body or one inline image; text/attr/bp/fg/bg are the rendered
+	 * styled glyphs kept at one shared capacity so draw_styled_line indexes them
+	 * together. bp packs block layout (BP_* in html.c); fg/bg are 0xRRGGBB per
+	 * glyph (bg == BG_NONE = none). _cap is the current allocation. */
+	char         *raw;       int raw_len,  raw_cap;
+	char         *text;
+	unsigned char *attr;     int text_len, text_cap;
+	unsigned char *bp;
+	unsigned      *fg;
+	unsigned      *bg;
+	/* Page canvas colours from the <html>/<body> cascade (worker sets, render
+	 * reads): the pane clears to page_bg and untyped text defaults to page_fg. */
+	unsigned       page_bg, page_fg;
+
+	struct link *links;      int nlinks,  links_cap;
+	struct inl_img *imgs;    int n_imgs,  imgs_cap;   /* inline <img> list */
+	int      img_uid_next;   /* monotonic id source for inl_img.uid (never reused) */
+	unsigned char *img_save; int img_save_len;        /* backgrounded image bytes */
+
+	/* Favicon: favicon_href is discovered from <link rel=icon> (empty -> the
+	 * /favicon.ico default); favicon_pri ranks the link; favicon[] is the decoded
+	 * 16x16 ARGB the tab strip draws when favicon_ok. */
+	char     favicon_href[URL_MAX];
+	int      favicon_pri;
+	unsigned favicon[FAVICON_W * FAVICON_H];
+	int      favicon_ok;
+
+	int      scroll;                 /* vertical scroll position (display lines) */
+
+	struct csp *csp;                 /* the page's Content-Security-Policy set    */
+
+	/* @font-face faces loaded for this page (family + parsed font + owned bytes);
+	 * body_font is the face the body text uses, or NULL for the baked UI font. */
+	struct loaded_face { char family[48]; struct font *font; unsigned char *data; } *faces;
+	int          n_faces, faces_cap;
+	struct font *body_font;
+};
+
 struct browser {
+	struct page *pg;             /* the active tab's page (tabs[active_tab].page) */
+
 	char     addr[URL_MAX];      /* address-bar buffer (owned by addr_tf)       */
 	struct textfield addr_tf;    /* editable address-bar field (caret + scroll) */
 	char     req_url[URL_MAX];
@@ -133,54 +190,31 @@ struct browser {
 	                              * body readers poll it and bail; cleared when the
 	                              * worker picks up the next navigation.            */
 
-	char     doc_title[128];
-	char     ctype[80];              /* lowercased response Content-Type      */
 	bool     nosniff;               /* X-Content-Type-Options: nosniff       */
 	char     dl_name[128];           /* filename from Content-Disposition     */
 	int      cdisp_attach;           /* 1 = Content-Disposition: attachment   */
 	int      dl_saved;               /* set when http_txn streamed a download */
-	int      mode;                   /* enum render_mode for the current body */
-	char     cur_url[URL_MAX];
 
-	/* Growable, heap-backed (ensure_raw/ensure_text in main.c). raw is the
-	 * fetched body or one inline image; text/attr are the rendered styled
-	 * glyphs and their per-glyph attribute byte (kept at the same capacity so
-	 * draw_styled_line can index both). _cap is the current allocation. */
-	char         *raw;       int raw_len,      raw_cap;
-	char         *text;
-	unsigned char *attr;     int text_len,     text_cap;
-	/* Per-glyph block layout: bp packs the block kind/size, alignment, monospace
-	 * and indent of the paragraph a glyph belongs to (BP_* in html.c); bg is a
-	 * background palette index (0xFF = none). Same capacity as text/attr. */
-	unsigned char *bp;
-	unsigned char *bgi;
-
-	struct link *links;      int nlinks,       links_cap;
-
-	struct inl_img *imgs;    int n_imgs,       imgs_cap;   /* inline <img> list */
-	int      img_uid_next;   /* monotonic id source for inl_img.uid (never reused) */
-	/* Fixed slab (see IMG_POOL above): the parallel image fetchers need a base
-	 * that never moves, so this one is not growable. */
+	/* Shared inline-image scratch for the ACTIVE load: the parallel image
+	 * fetchers reserve disjoint regions under a short lock and copy in WITHOUT
+	 * the lock, so the base must never move (hence a fixed slab, not growable).
+	 * Only the active tab loads; a backgrounded tab keeps its bytes in
+	 * page->img_save and they are copied back here on reveal. */
 	unsigned char img_pool[IMG_POOL];
 	int      img_pool_len;
 
-	/* Favicon for the current page. favicon_href is discovered from a
-	 * <link rel=icon> while parsing the HTML (empty -> the /favicon.ico
-	 * default); favicon_pri ranks the captured link so a real icon beats an
-	 * apple-touch one. After fetch_favicon decodes it, favicon[] holds the
-	 * 16x16 ARGB bitmap the tab strip draws and favicon_ok flags it valid. */
-	char     favicon_href[URL_MAX];
-	int      favicon_pri;            /* 0 none, 1 apple-touch, 2 standard icon */
-	unsigned favicon[FAVICON_W * FAVICON_H];
-	int      favicon_ok;
-
-	int     *line_off;       /* growable word-wrap line table (ensure_lines)   */
+	/* Word-wrap line table — render scratch for the active page (rebuilt by
+	 * rewrap() from B->pg->text at the live width on every active repaint). With
+	 * box layout on, line_x/line_w are the per-line content origin + width the box
+	 * tree placed the line at; in flat mode they are the fixed 4 / pane width. */
+	int     *line_off;
 	int     *line_len;
+	int     *line_x;
+	int     *line_w;
 	int      nlines, line_cap;
 	int      wrap_cols;
 	unsigned wrap_seq;
 
-	int      scroll;
 	int      sb_drag;
 	unsigned seq;
 
@@ -213,28 +247,19 @@ struct browser {
 	int      hist_len;               /* main -> worker: history.length               */
 	volatile int loc_nav;            /* worker -> main: location.assign/replace/reload */
 	char     loc_url[URL_MAX];       /* its target URL                               */
+	char     referrer[URL_MAX];      /* the page navigated away from (document.referrer) */
 
 	int      win_id;                 /* the window handle (for title updates) */
 
 	struct cookie *cookies;          /* head of the heap cookie jar (no cap)   */
 	struct hsts_host *hsts;          /* head of the HSTS host list (no cap)    */
 	struct css_link *ext_css;        /* stylesheet URLs from the Link: header   */
-	struct csp     *csp;             /* the page's Content-Security-Policy set   */
-
-	/* @font-face faces loaded for this page (each: family name, the parsed font,
-	 * and the owned font-file bytes the parser points into). body_font is the
-	 * face the page's body text uses, or NULL to fall back to the baked UI font.
-	 * The array grows on demand (a page may need any number of faces); capacity
-	 * persists across navigations, n_faces resets each load. render() reads only
-	 * body_font, never the array. struct font is from user/lib/font. */
-	struct loaded_face { char family[48]; struct font *font; unsigned char *data; } *faces;
-	int          n_faces, faces_cap;
-	struct font *body_font;
 
 	int           sock;
 	unsigned char rbuf[2048];
 	int           rpos, rlen, reof;
 };
+
 
 extern struct browser *B;
 extern const unsigned palette[16];
@@ -356,10 +381,13 @@ int  hsts_has(const char *host);
 enum { DT_LOG, DT_WARN, DT_ERROR };
 void devtools_toggle(void);
 int  devtools_visible(void);
-int  devtools_top(void);          /* panel's top y (main thread); BH if hidden  */
+int  devtools_top(void);          /* panel's top y (main thread)                */
+int  devtools_left(void);         /* panel's left x; BW if hidden (right-dock)  */
 void devtools_render(void);       /* main thread: draw the panel                */
 int  devtools_handle_click(int mx, int my);  /* 1 = consumed                    */
 int  devtools_handle_scroll(int delta);      /* 1 = consumed                    */
+int  devtools_on_splitter(int mx, int my);   /* 1 = pointer is on the resize edge */
+void devtools_set_width(int w);              /* drag-resize the docked panel      */
 void devtools_console_append(int level, const char *s, int len);  /* worker     */
 void devtools_worker_tick(void);  /* worker: rebuild DOM/Styles snapshot if open */
 /* Network tab: each HTTP response the page made (logged from the fetch paths),
@@ -369,12 +397,16 @@ void devtools_net_add(const char *method, const char *url, int status,
 void devtools_net_reset(void);
 
 /* Per-tab devtools view state: which panel is open and where each is scrolled, so
- * every browser tab keeps its own devtools. The captured content (DOM/console/
- * network) follows the live page, so it is dropped when a tab is revealed. */
+ * every browser tab keeps its own devtools. `cap` is an opaque per-tab capture
+ * handle (the Elements/Console/Network content), owned by devtools.c — frozen
+ * when the tab is backgrounded and restored on reveal, so switching tabs no longer
+ * wipes the panel. devtools_view_free releases it when a tab closes. */
 #define DT_PANELS 4
-struct dt_view { int open; int tab; int scroll[DT_PANELS]; };
-void devtools_view_save(struct dt_view *v);        /* active view  -> v             */
-void devtools_view_load(const struct dt_view *v);  /* v -> active view, drop capture */
+struct dt_view { int open; int tab; int scroll[DT_PANELS]; void *cap; };
+void devtools_view_save(struct dt_view *v);        /* active view+capture -> v       */
+void devtools_view_load(const struct dt_view *v);  /* v -> active, restoring capture */
+void devtools_view_free(struct dt_view *v);        /* free a closed tab's capture    */
+void devtools_reset_live(void);                    /* drop the live (statics) capture */
 
 /* html.c hooks the devtools snapshot uses (worker-thread callers only). */
 struct css_style;
@@ -382,6 +414,7 @@ struct css_match;
 struct dom_node *html_dom_root(void);
 void html_compute_style(struct dom_node *el, struct css_style *out);
 int  html_match_styles(struct dom_node *el, struct css_match *out, int cap);
+int  html_has_pseudo(struct dom_node *el, int which);   /* ::before/::after present? */
 
 void do_fetch(void);
 /* The JS fetch() transport (resource.c): one HTTP request, returns the body
@@ -389,7 +422,8 @@ void do_fetch(void);
  * connection error. Worker-thread only. */
 unsigned char *browser_fetch_url(const char *url, const char *method,
                                  const unsigned char *reqbody, int reqlen, const char *req_ctype,
-                                 const char *accept, int *status, char *out_ctype, int oc_cap, int *outlen);
+                                 const char *accept, int *status, char *out_ctype, int oc_cap, int *outlen,
+                                 const char *extra_hdrs);
 void fetch_inline_images(const char *page_url);  /* re-pull inline <img> after relayout */
 int  fetch_lazy_visible(void);   /* worker: load one in-view loading=lazy <img> */
 
@@ -416,5 +450,9 @@ void html_iframe_resolve(const char *url, const char *parent, int verdict,
                          const char *reason, const unsigned char *body, int len,
                          const char *ctype);
 void fetch_iframes(void);            /* resource.c: drain + fetch the pending set */
+/* Commit in-memory image bytes (inline <svg> serialized by html.c) into image
+ * slot idx with no fetch; SVG is rasterized to RGBA like a fetched .svg, with
+ * `current_color` (0xRRGGBB) as the value of `currentColor`. */
+void resource_commit_inline(int idx, const unsigned char *body, int len, unsigned current_color);
 
 #endif /* OWOS_BROWSER_H */

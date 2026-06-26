@@ -575,13 +575,11 @@ static int fat_list(struct fat_mount *m, const char *path)
 			continue;                 /* hide "." and ".." */
 		con_write(e.is_dir ? "  <DIR>  " : "         ");
 		if (!e.is_dir) {
-			con_write_dec(e.size);
-			con_write("  ");
+			con_printf("%u  ", e.size);
 		} else {
 			con_write("  ");
 		}
-		con_write(e.name);
-		con_putc('\n');
+		con_printf("%s\n", e.name);
 	}
 	return 0;
 }

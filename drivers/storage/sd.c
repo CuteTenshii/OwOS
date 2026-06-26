@@ -469,12 +469,9 @@ void sd_init(void)
 		return;
 	}
 
-	con_write("sd: ");
-	con_write(model);
+	con_printf("sd: %s", model);
 	if (cap_sectors) {
-		con_write(", ");
-		con_write_dec(cap_sectors / 2048);          /* 512-B sectors -> MiB     */
-		con_write(" MiB");
+		con_printf(", %u MiB", cap_sectors / 2048);          /* 512-B sectors -> MiB     */
 	}
 	con_putc('\n');
 }

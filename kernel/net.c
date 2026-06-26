@@ -1042,11 +1042,7 @@ int net_dig(const char *arg)
 		return -1;
 	}
 
-	con_write("; OwOS dig  ");
-	con_write(host);
-	con_write("  ");
-	con_write(dig_type_name(qtype));
-	con_putc('\n');
+	con_printf("; OwOS dig  %s  %s\n", host, dig_type_name(qtype));
 
 	if (dns_ans_count == 0) {
 		con_write(";; no records\n");
@@ -1061,14 +1057,8 @@ int net_dig(const char *arg)
 			}
 			tx[DNS_TEXT - 1] = '\0';
 
-			con_write(host);
-			con_write(".  ");
-			con_write_dec(dns_ans_ttl[i]);
-			con_write("  IN  ");
-			con_write(dig_type_name(dns_ans_type[i]));
-			con_write("  ");
-			con_write(tx);
-			con_putc('\n');
+			con_printf("%s.  %u  IN  %s  %s\n", host,
+				   dns_ans_ttl[i], dig_type_name(dns_ans_type[i]), tx);
 		}
 	}
 
@@ -1251,9 +1241,7 @@ int net_curl(const char *arg)
 
 	uint8_t ip[4];
 	if (!parse_ipv4(host, ip) && !dns_resolve(host, ip)) {
-		con_write("curl: could not resolve host: ");
-		con_write(host);
-		con_putc('\n');
+		con_printf("curl: could not resolve host: %s\n", host);
 		return -1;
 	}
 	int ok;
@@ -1347,9 +1335,7 @@ int net_curl(const char *arg)
 	}
 
 	if (save && fs_stream_begin(outname) != 0) {
-		con_write("curl: cannot open output file ");
-		con_write(outname);
-		con_putc('\n');
+		con_printf("curl: cannot open output file %s\n", outname);
 		if (use_tls)
 			tls_close(curl_th);
 		else
@@ -1457,16 +1443,11 @@ body_done:
 	if (save) {
 		int wrote = fs_stream_end();
 		if (wrote < 0) {
-			con_write("curl: failed to save ");
-			con_write(outname);
-			con_write(" (disk full or write error)\n");
+			con_printf("curl: failed to save %s (disk full or write error)\n",
+				   outname);
 			return -1;
 		}
-		con_write("curl: saved ");
-		con_write_dec((uint32_t)wrote);
-		con_write(" bytes to ");
-		con_write(outname);
-		con_putc('\n');
+		con_printf("curl: saved %u bytes to %s\n", (uint32_t)wrote, outname);
 	} else if (!curl_mem) {
 		con_putc('\n');
 	}
@@ -1796,22 +1777,15 @@ int net_ping(const char *host)
 			print_rtt(icmp_rtt_us);
 			con_write(" ms\n");
 		} else {
-			con_write("request timeout for icmp_seq=");
-			con_write_dec((uint32_t)seq);
-			con_putc('\n');
+			con_printf("request timeout for icmp_seq=%u\n", (uint32_t)seq);
 		}
 
 		if (seq < 4)
 			timer_sleep(300);
 	}
 
-	con_write("--- ");
-	con_write(host);
-	con_write(" ping statistics ---\n");
-	con_write_dec(4);
-	con_write(" packets transmitted, ");
-	con_write_dec((uint32_t)recv);
-	con_write(" received\n");
+	con_printf("--- %s ping statistics ---\n%u packets transmitted, %u received\n",
+		   host, 4, (uint32_t)recv);
 	return recv > 0 ? 0 : -1;
 }
 
@@ -1966,9 +1940,7 @@ int net_ntp(const char *arg)
 	uint8_t ip[4];
 	if (!parse_ipv4(host, ip)) {
 		if (!dns_resolve(host, ip)) {
-			con_write("ntp: cannot resolve ");
-			con_write(host);
-			con_putc('\n');
+			con_printf("ntp: cannot resolve %s\n", host);
 			return -1;
 		}
 	}
@@ -1997,9 +1969,7 @@ int net_ntp(const char *arg)
 	}
 
 	if (!ntp_got) {
-		con_write("ntp: no reply from ");
-		con_write(host);
-		con_putc('\n');
+		con_printf("ntp: no reply from %s\n", host);
 		return -1;
 	}
 
@@ -2012,8 +1982,7 @@ int net_ntp(const char *arg)
 	unix_to_rtc(ntp_secs - NTP_UNIX_DELTA + (uint32_t)tz_secs, &t);
 	rtc_set(&t);
 
-	con_write("clock set: ");
-	con_write_dec(t.year);  con_putc('-');
+	con_printf("clock set: %u-", t.year);
 	ntp_print2(t.month);    con_putc('-');
 	ntp_print2(t.day);      con_putc(' ');
 	ntp_print2(t.hour);     con_putc(':');

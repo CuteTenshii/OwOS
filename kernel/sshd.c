@@ -115,26 +115,11 @@ static unsigned r32(const unsigned char *d, int *p)
 	*p += 4; return v;
 }
 
-/* Weak best-effort randomness (host-key seed, ephemeral key, padding). Mixes the
- * timer, the RTC and a counter through SHA-256. NOT a strong entropy source —
- * the same pragmatic compromise as the user-space TLS/QUIC/ssh client. */
+/* Randomness (host-key seed, ephemeral key, padding) from the kernel CSPRNG
+ * (crypto.c: RDRAND-backed when present, else a SHA-256 timing mix). */
 static void gen_random(unsigned char *out, int n)
 {
-	static uint32_t ctr;
-	int got = 0;
-	while (got < n) {
-		struct rtc_time t; rtc_now(&t);
-		uint32_t seed[6];
-		seed[0] = timer_ticks(); seed[1] = ctr++; seed[2] = (uint32_t)(uintptr_t)out;
-		seed[3] = ((uint32_t)t.hour << 16) | ((uint32_t)t.min << 8) | t.sec;
-		seed[4] = ((uint32_t)t.year << 16) | ((uint32_t)t.month << 8) | t.day;
-		seed[5] = (uint32_t)(uintptr_t)&got;
-		uint8_t h[32];
-		sha256(seed, sizeof seed, h);
-		int chunk = (n - got) < 32 ? (n - got) : 32;
-		memcpy(out + got, h, (uint32_t)chunk);
-		got += chunk;
-	}
+	if (n > 0) rng_bytes(out, (uint32_t)n);
 }
 
 static void incr_iv(unsigned char *iv) { for (int i = 11; i >= 4; i--) if (++iv[i] != 0) break; }

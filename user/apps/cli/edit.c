@@ -106,12 +106,8 @@ static void print_buffer(void)
 		puts("(empty)\n");
 		return;
 	}
-	for (int i = 0; i < nlines; i++) {
-		print_uint((unsigned)(i + 1));
-		puts("  ");
-		puts(lines[i]);
-		puts("\n");
-	}
+	for (int i = 0; i < nlines; i++)
+		printf("%u  %s\n", (unsigned)(i + 1), lines[i]);
 }
 
 /* Read lines from the user, inserting each starting at `at`, until a lone ".".*/
@@ -140,11 +136,7 @@ static void save_file(void)
 		savebuf[out++] = '\n';
 	}
 	if (writefile(filename, savebuf, out) == 0) {
-		puts("wrote ");
-		puts(filename);
-		puts(" (");
-		print_uint((unsigned)nlines);
-		puts(" lines)\n");
+		printf("wrote %s (%u lines)\n", filename, (unsigned)nlines);
 		dirty = 0;
 	} else {
 		puts("write failed\n");
@@ -177,16 +169,10 @@ int main(int argc, char **argv)
 	int n = readfile(filename, loadbuf, LOAD_MAX);
 	if (n > 0) {
 		load_lines(n);
-		puts("editing ");
-		puts(filename);
-		puts(" (");
-		print_uint((unsigned)nlines);
-		puts(" lines). type 'h' for help.\n");
+		printf("editing %s (%u lines). type 'h' for help.\n", filename, (unsigned)nlines);
 	} else {
 		nlines = 0;
-		puts("new file ");
-		puts(filename);
-		puts(". type 'h' for help.\n");
+		printf("new file %s. type 'h' for help.\n", filename);
 	}
 
 	char cmd[LINE_LEN];

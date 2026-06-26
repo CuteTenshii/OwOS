@@ -22,6 +22,18 @@ uint32_t fb_height(void);
 uint32_t *fb_ptr(void);            /* the back buffer drawing primitives target */
 uint32_t fb_pitch_pixels(void);    /* back buffer row stride in pixels (>= width) */
 
+/* Runtime resolution switching, available only on the DISPI path (fb_init): we
+ * can reprogram QEMU's std-vga adapter, but a framebuffer adopted from a
+ * bootloader (fb_adopt: GRUB/UEFI GOP) is fixed and fb_can_set_mode returns 0.
+ * fb_mode_get enumerates the offered modes (all <= the capacity mapped at init);
+ * fb_set_mode reprograms to one of them and returns 0, or -1 if the mode is
+ * unknown / mode-setting is unsupported. Must be called from the compositor
+ * thread — it reshapes the buffers the WM draws into. */
+int fb_can_set_mode(void);
+int fb_mode_count(void);
+int fb_mode_get(int i, uint32_t *w, uint32_t *h);
+int fb_set_mode(uint32_t w, uint32_t h);
+
 /* Copy the damaged region of the back buffer to the visible framebuffer.
  * Drawing happens off-screen (no tearing) and only the rectangle touched since
  * the last present is copied to VRAM — essential for speed on real GPUs, where

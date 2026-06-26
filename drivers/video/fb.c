@@ -39,9 +39,24 @@ static uint32_t *front;       /* the visible linear framebuffer (XRGB8888)    */
 static uint32_t *fb;          /* off-screen back buffer; primitives draw here */
 static uint32_t  fb_w, fb_h;
 static uint32_t  fb_pitch;    /* pixels per row                                */
-static uint32_t  fb_pixels;   /* total pixels in the mapped region (pitch*h)    */
+static uint32_t  fb_pixels;   /* visible pixels in the current mode (pitch*h)   */
+static uint32_t  fb_cap;      /* pixels mapped/allocated (>= fb_pixels)         */
 static int       active;
 static int       single;      /* 1 when there is no back buffer (draw direct)   */
+static int       can_mode;    /* 1 = DISPI path: the mode can be reprogrammed   */
+
+/* Resolutions offered for runtime switching (DISPI path only). The front buffer
+ * and back buffer are mapped/allocated at the largest of these once at init, so
+ * a mode change is just a DISPI reprogram — no remap, no realloc, no race with
+ * the compositor. Keep the last entry the largest (it sizes the capacity). */
+static const struct { uint16_t w, h; } fb_modes[] = {
+	{  800,  600 }, { 1024,  768 }, { 1280,  720 }, { 1280,  800 },
+	{ 1280, 1024 }, { 1366,  768 }, { 1440,  900 }, { 1600,  900 },
+	{ 1680, 1050 }, { 1920, 1080 },
+};
+#define FB_NMODES ((int)(sizeof fb_modes / sizeof fb_modes[0]))
+#define FB_MAX_W  1920u
+#define FB_MAX_H  1080u
 
 /* Display brightness, FB_BRIGHT_MIN..FB_BRIGHT_MAX (max = undimmed). Applied as
  * a per-channel scale when the back buffer is copied to the visible screen. */
@@ -144,12 +159,12 @@ static void enable_wc(void)
 
 	/* Drop any cached lines for the framebuffer, then switch it to WC. */
 	__asm__ volatile ("wbinvd" ::: "memory");
-	paging_mark_wc((uint32_t)front, fb_pixels * 4);
+	paging_mark_wc((uint32_t)front, fb_cap * 4);
 
 	/* PAT alone isn't enough on real UEFI hardware: a firmware MTRR can mark the
 	 * framebuffer UC, which overrides PAT-WC and leaves every store slow. Pin the
 	 * range WC with a variable MTRR too (no-op under QEMU / without MTRRs). */
-	mtrr_set_wc((uint32_t)front, fb_pixels * 4);
+	mtrr_set_wc((uint32_t)front, fb_cap * 4);
 }
 
 static void dispi_write(uint16_t index, uint16_t value)
@@ -213,6 +228,8 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
 	fb_h = h;
 	fb_pitch = pitch_px;
 	fb_pixels = pixels;
+	fb_cap = pixels;           /* a bootloader framebuffer is fixed-size        */
+	can_mode = 0;              /* cannot reprogram a GOP/adopted framebuffer    */
 
 	enable_wc();               /* write-combining on the framebuffer          */
 	alloc_backbuffer();        /* off-screen buffer in cached RAM              */
@@ -232,7 +249,7 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
  * to the framebuffer) only if no RAM is available. */
 static void alloc_backbuffer(void)
 {
-	uint32_t bytes = fb_pixels * 4;
+	uint32_t bytes = fb_cap * 4;
 	uint32_t bb = pmm_alloc_contig(bytes);
 	if (bb && paging_identity_map(bb, bytes) == 0) {
 		fb = (uint32_t *)bb;
@@ -277,14 +294,73 @@ int fb_init(uint32_t want_w, uint32_t want_h)
 	fb_pitch = want_w;
 	fb_pixels = want_w * want_h;
 
+	/* Map and back the LFB at the largest offered mode, not just the initial
+	 * one, so a later fb_set_mode is a pure DISPI reprogram with no remap/realloc
+	 * (and so no race with the compositor). QEMU's std-vga VRAM aperture (16 MiB)
+	 * comfortably holds 1920x1080x4. */
+	fb_cap = FB_MAX_W * FB_MAX_H;
+	if (fb_cap < fb_pixels) fb_cap = fb_pixels;
+
 	/* Map the visible framebuffer (one copy), then a RAM back buffer. */
-	if (paging_identity_map(lfb, fb_pixels * 4) < 0)
+	if (paging_identity_map(lfb, fb_cap * 4) < 0)
 		return -1;
 	front = (uint32_t *)lfb;
 	enable_wc();
 	alloc_backbuffer();
 
 	active = 1;
+	can_mode = 1;              /* DISPI: the mode can be reprogrammed at runtime */
+	fb_clip_full();
+	fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
+	fb_present();
+	return 0;
+}
+
+int fb_can_set_mode(void) { return active && can_mode; }
+int fb_mode_count(void)   { return FB_NMODES; }
+
+int fb_mode_get(int i, uint32_t *w, uint32_t *h)
+{
+	if (i < 0 || i >= FB_NMODES) return 0;
+	*w = fb_modes[i].w;
+	*h = fb_modes[i].h;
+	return 1;
+}
+
+/* Reprogram the DISPI adapter to one of the offered modes. The buffers are
+ * already sized for the largest mode (fb_init), so this only reshapes the
+ * geometry the primitives use, clears the screen, and presents. Must run on the
+ * compositor thread (it mutates fb_w/fb_h/fb_pitch the WM draws against). */
+int fb_set_mode(uint32_t w, uint32_t h)
+{
+	if (!active || !can_mode)
+		return -1;
+
+	int known = 0;
+	for (int i = 0; i < FB_NMODES; i++)
+		if (fb_modes[i].w == w && fb_modes[i].h == h) { known = 1; break; }
+	if (!known || w * h > fb_cap)
+		return -1;
+	if (w == fb_w && h == fb_h)
+		return 0;                              /* already there                  */
+
+	dispi_write(VBE_DISPI_ENABLE, 0);
+	dispi_write(VBE_DISPI_XRES, (uint16_t)w);
+	dispi_write(VBE_DISPI_YRES, (uint16_t)h);
+	dispi_write(VBE_DISPI_BPP, 32);
+	dispi_write(VBE_DISPI_VWIDTH, (uint16_t)w);
+	dispi_write(VBE_DISPI_VHEIGHT, (uint16_t)h);
+	dispi_write(VBE_DISPI_XOFF, 0);
+	dispi_write(VBE_DISPI_YOFF, 0);
+	dispi_write(VBE_DISPI_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED);
+	if (dispi_read(VBE_DISPI_XRES) != (uint16_t)w ||
+	    dispi_read(VBE_DISPI_YRES) != (uint16_t)h)
+		return -1;                             /* adapter rejected the geometry  */
+
+	fb_w = w;
+	fb_h = h;
+	fb_pitch = w;
+	fb_pixels = w * h;
 	fb_clip_full();
 	fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
 	fb_present();

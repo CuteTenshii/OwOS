@@ -8,6 +8,7 @@
  *
  *   Mouse / Touchpad  pointer speed  -> /sys/class/input/mouse0/speed  (1..5)
  *   Keyboard          layout         -> /sys/class/input/kbd0/layout   ("us"/"fr")
+ *   Display           resolution     -> /sys/class/graphics/fb0/{mode,modes}
  *   About             system info    -> /sys/class/dmi/id, /proc/cpuinfo, ...
  *
  * The sidebar owns its width as a resizable property (drag the divider). A `seq`
@@ -36,22 +37,48 @@ static int W = 480, H = 320;        /* client size; changes on resize */
 
 static struct sidebar sb;
 
-enum { CAT_MOUSE = 0, CAT_KEYBOARD, CAT_SOUND, CAT_ABOUT, NCATS };
+enum { CAT_MOUSE = 0, CAT_KEYBOARD, CAT_SOUND, CAT_DISPLAY, CAT_ABOUT, NCATS };
 static const char *const cat_name[NCATS] = {
-	"Mouse / Touchpad", "Keyboard", "Sound", "About",
+	"Mouse / Touchpad", "Keyboard", "Sound", "Display", "About",
 };
 
 static int      sel = CAT_MOUSE;    /* selected category */
 static unsigned seq = 1;            /* bump to request a repaint */
 
-/* Live state mirrored from /proc, re-read when a category is entered. */
+/* Live state mirrored from /proc, re-read when a category is entered. Each
+ * category presents its choices through one select (dropdown) widget. */
 static int  mouse_level = 3;        /* pointer-speed level 1..5 */
 static char kbd_layout[8] = "us";   /* "us" / "fr"              */
 
+/* Pointer-speed levels 1..5, by their dropdown labels. */
+static const char *const mouse_opts[5] = {
+	"Slowest", "Slow", "Normal", "Fast", "Fastest",
+};
+static struct select_box mouse_sel;
+
+/* Keyboard layouts: sysfs name + the label shown in the dropdown. */
+static const struct { const char *name, *label; } kbd_opts[] = {
+	{ "us", "US English" }, { "fr", "French" },
+};
+#define NKBD ((int)(sizeof kbd_opts / sizeof kbd_opts[0]))
+static const char *kbd_opt_lbl[NKBD];   /* select_box wants a char* array */
+static struct select_box kbd_sel;
+
 #define MAX_OUTS 6
 static char sound_name[MAX_OUTS][20]; /* audio output device names            */
+static const char *sound_opts[MAX_OUTS]; /* select_box array (-> sound_name)   */
 static int  sound_n;                  /* how many outputs the codec exposes   */
 static int  sound_cur;                /* index of the active output           */
+static struct select_box sound_sel;
+
+#define MAX_MODES 16
+static char disp_label[MAX_MODES][16]; /* "1280 x 720" per offered mode        */
+static const char *disp_opts[MAX_MODES]; /* select_box option array (-> labels) */
+static int  disp_w[MAX_MODES], disp_h[MAX_MODES];
+static int  disp_n;                    /* how many modes are offered           */
+static int  disp_cur;                  /* index of the active mode, -1 if none */
+static int  disp_fixed;                /* 1 = resolution can't be changed      */
+static struct select_box disp_sel;
 
 static char  about_line[10][72];    /* About: one formatted line per row */
 static int   about_n;
@@ -110,6 +137,7 @@ static void load_mouse(void)
 		for (const char *p = t; *p >= '0' && *p <= '9'; p++) v = v * 10 + (*p - '0');
 		if (v >= 1 && v <= 5) mouse_level = v;
 	}
+	select_init(&mouse_sel, mouse_opts, 5, mouse_level - 1);
 }
 
 static void load_kbd(void)
@@ -119,6 +147,12 @@ static void load_kbd(void)
 		t[sizeof kbd_layout - 1] = 0;
 		strcpy(kbd_layout, t);
 	}
+	int cur = 0;
+	for (int i = 0; i < NKBD; i++) {
+		kbd_opt_lbl[i] = kbd_opts[i].label;
+		if (streq(kbd_layout, kbd_opts[i].name)) cur = i;
+	}
+	select_init(&kbd_sel, kbd_opt_lbl, NKBD, cur);
 }
 
 static void load_sound(void)
@@ -137,13 +171,73 @@ static void load_sound(void)
 		sound_name[sound_n][i] = 0;
 		while (*p && *p != '\n') p++;       /* skip an over-long name's tail */
 		if (*p == '\n') p++;
-		if (i > 0) sound_n++;
+		if (i > 0) { sound_opts[sound_n] = sound_name[sound_n]; sound_n++; }
 	}
 
 	char cur[24];
 	if (read_proc("/sys/class/sound/card0/output", cur, sizeof cur) > 0)
 		for (int i = 0; i < sound_n; i++)
 			if (streq(sound_name[i], cur)) { sound_cur = i; break; }
+
+	select_init(&sound_sel, sound_opts, sound_n, sound_cur);
+}
+
+/* Build "WxH" (compact, for the sysfs write) and "W x H" (the menu label). */
+static void mode_str(int w, int h, char *out, int spaced)
+{
+	char t[12];
+	int i = 0;
+	uitoa((unsigned)w, t);
+	for (int j = 0; t[j]; j++) out[i++] = t[j];
+	if (spaced) { out[i++] = ' '; out[i++] = 'x'; out[i++] = ' '; }
+	else        out[i++] = 'x';
+	uitoa((unsigned)h, t);
+	for (int j = 0; t[j]; j++) out[i++] = t[j];
+	out[i] = 0;
+}
+
+/* Parse a leading "WxH" out of `s` into *w,*h (0 if absent). */
+static void parse_wh(const char *s, int *w, int *h)
+{
+	int a = 0, b = 0;
+	while (*s >= '0' && *s <= '9') a = a * 10 + (*s++ - '0');
+	if (*s == 'x' || *s == 'X') s++;
+	while (*s >= '0' && *s <= '9') b = b * 10 + (*s++ - '0');
+	*w = a; *h = b;
+}
+
+static void load_display(void)
+{
+	char buf[256];
+	disp_n = 0; disp_cur = -1;
+
+	int len = readfile("/sys/class/graphics/fb0/modes", buf, sizeof buf - 1);
+	if (len < 0) len = 0;
+	buf[len] = 0;
+	for (const char *p = buf; *p && disp_n < MAX_MODES; ) {
+		int w, h;
+		parse_wh(p, &w, &h);
+		while (*p && *p != '\n') p++;
+		if (*p == '\n') p++;
+		if (w > 0 && h > 0) {
+			disp_w[disp_n] = w; disp_h[disp_n] = h;
+			mode_str(w, h, disp_label[disp_n], 1);
+			disp_opts[disp_n] = disp_label[disp_n];
+			disp_n++;
+		}
+	}
+
+	char cur[24];
+	int cw = 0, ch = 0;
+	if (read_proc("/sys/class/graphics/fb0/mode", cur, sizeof cur) > 0)
+		parse_wh(cur, &cw, &ch);
+	for (int i = 0; i < disp_n; i++)
+		if (disp_w[i] == cw && disp_h[i] == ch) { disp_cur = i; break; }
+
+	/* A single offered mode means the kernel can't reprogram it (an adopted
+	 * GOP/bootloader framebuffer) — it just reports the current one. */
+	disp_fixed = (disp_n <= 1);
+	select_init(&disp_sel, disp_opts, disp_n, disp_cur < 0 ? 0 : disp_cur);
 }
 
 static void aline(const char *s)
@@ -203,6 +297,7 @@ static void load_category(int cat)
 	if      (cat == CAT_MOUSE)    load_mouse();
 	else if (cat == CAT_KEYBOARD) load_kbd();
 	else if (cat == CAT_SOUND)    load_sound();
+	else if (cat == CAT_DISPLAY)  load_display();
 	else if (cat == CAT_ABOUT)    load_about();
 }
 
@@ -233,6 +328,17 @@ static void set_sound_output(int i)
 		sound_cur = i;
 }
 
+static void set_display(int i)
+{
+	char t[16];
+	if (i < 0 || i >= disp_n) return;
+	mode_str(disp_w[i], disp_h[i], t, 0);
+	/* The kernel queues the switch for the compositor thread; the write succeeds
+	 * once it's accepted. Mirror the selection so the UI tracks it immediately. */
+	if (writefile("/sys/class/graphics/fb0/mode", t, strlen(t)) == 0)
+		disp_cur = i;
+}
+
 /* ------------------------------------------------------------- layout / paint */
 
 /* Width actually rendered this frame: the widget property, capped so the detail
@@ -245,77 +351,93 @@ static int sidebar_w(void)
 	return sbw;
 }
 
-/* Mouse speed option buttons: 5 cells starting at (ox,oy). The hit-test mirrors
- * this geometry. */
-#define SPD_BW  44
-#define SPD_GAP 8
-static int spd_ox(int cx) { return cx + 16; }
-static int spd_oy(void)   { return 80; }
-static int spd_bx(int cx, int i) { return spd_ox(cx) + i * (SPD_BW + SPD_GAP); }
+/* Every category's choices are shown through one select (dropdown) at this
+ * position; only the active category's widget is drawn/handled. */
+#define CTRL_Y 80
+static int ctrl_box_w(int cw)
+{
+	int w = 220;
+	if (w > cw - 32) w = cw - 32;
+	if (w < 80) w = 80;
+	return w;
+}
 
-/* Keyboard layout option buttons. */
-static const struct { const char *name, *label; } kbd_opts[] = {
-	{ "us", "US English" }, { "fr", "French" },
-};
-#define NKBD ((int)(sizeof kbd_opts / sizeof kbd_opts[0]))
-#define KBD_BW  120
-static int kbd_oy(void)        { return 80; }
-static int kbd_by(int i)       { return kbd_oy() + i * (GUI_BTN_H + 8); }
+/* The select widget for the active category, or NULL if it has none (About, or
+ * an empty Sound/Display list). */
+static struct select_box *cur_select(void)
+{
+	switch (sel) {
+	case CAT_MOUSE:    return &mouse_sel;
+	case CAT_KEYBOARD: return &kbd_sel;
+	case CAT_SOUND:    return sound_n ? &sound_sel : 0;
+	case CAT_DISPLAY:  return disp_n  ? &disp_sel  : 0;
+	default:           return 0;
+	}
+}
 
+/* Push the active category's new selection (index `idx`) to the kernel. */
+static void apply_select(int idx)
+{
+	switch (sel) {
+	case CAT_MOUSE:    set_mouse_level(idx + 1);            break;
+	case CAT_KEYBOARD: set_kbd_layout(kbd_opts[idx].name);  break;
+	case CAT_SOUND:    set_sound_output(idx);               break;
+	case CAT_DISPLAY:  set_display(idx);                    break;
+	}
+}
+
+/* Draw the active category's select LAST (its open list overlays the pane). */
+static void draw_select(int cx, int cw)
+{
+	struct select_box *s = cur_select();
+	if (s)
+		select_draw(s, cx + 16, CTRL_Y, ctrl_box_w(cw), GUI_SELECT_H);
+}
+
+/* Each category draws its own title/label/hint, then the shared select on top. */
 static void draw_mouse(int cx, int cw)
 {
-	(void)cw;
 	gfx_ui_text(cx + 16, 16, "Mouse / Touchpad", FG_WHITE);
 	gfx_ui_text(cx + 16, 52, "Pointer speed", FG_TEXT);
-
-	static const char *const lbl[5] = { "1", "2", "3", "4", "5" };
-	for (int i = 0; i < 5; i++) {
-		int st = (mouse_level == i + 1) ? BTN_PRESSED : BTN_NORMAL;
-		button_draw(spd_bx(cx, i), spd_oy(), SPD_BW, GUI_BTN_H, lbl[i], st);
-	}
-	int oy2 = spd_oy() + GUI_BTN_H + 6;
-	gfx_ui_text(spd_ox(cx), oy2, "Slow", FG_DIM);
-	const char *fast = "Fast";
-	gfx_ui_text(spd_bx(cx, 4) + SPD_BW - gfx_ui_width(fast), oy2, fast, FG_DIM);
-
-	gfx_ui_text(cx + 16, oy2 + 30,
+	gfx_ui_text(cx + 16, CTRL_Y + GUI_SELECT_H + 12,
 	            "Higher moves the pointer farther per motion.", FG_DIM);
+	draw_select(cx, cw);
 }
 
 static void draw_keyboard(int cx, int cw)
 {
-	(void)cw;
 	gfx_ui_text(cx + 16, 16, "Keyboard", FG_WHITE);
 	gfx_ui_text(cx + 16, 52, "Layout", FG_TEXT);
-
-	for (int i = 0; i < NKBD; i++) {
-		int st = streq(kbd_layout, kbd_opts[i].name) ? BTN_PRESSED : BTN_NORMAL;
-		button_draw(cx + 16, kbd_by(i), KBD_BW, GUI_BTN_H, kbd_opts[i].label, st);
-	}
-	gfx_ui_text(cx + 16, kbd_by(NKBD) + 12,
+	gfx_ui_text(cx + 16, CTRL_Y + GUI_SELECT_H + 12,
 	            "Affects the whole system.", FG_DIM);
+	draw_select(cx, cw);
 }
-
-/* Sound output buttons, one per available output device. */
-#define SND_BW 160
-static int snd_by(int i) { return 80 + i * (GUI_BTN_H + 8); }
 
 static void draw_sound(int cx, int cw)
 {
-	(void)cw;
 	gfx_ui_text(cx + 16, 16, "Sound", FG_WHITE);
 	gfx_ui_text(cx + 16, 52, "Output device", FG_TEXT);
-
 	if (sound_n == 0) {
 		gfx_ui_text(cx + 16, 84, "No audio output device.", FG_DIM);
 		return;
 	}
-	for (int i = 0; i < sound_n; i++) {
-		int st = (i == sound_cur) ? BTN_PRESSED : BTN_NORMAL;
-		button_draw(cx + 16, snd_by(i), SND_BW, GUI_BTN_H, sound_name[i], st);
-	}
-	gfx_ui_text(cx + 16, snd_by(sound_n) + 12,
+	gfx_ui_text(cx + 16, CTRL_Y + GUI_SELECT_H + 12,
 	            "Routes playback to the selected output.", FG_DIM);
+	draw_select(cx, cw);
+}
+
+static void draw_display(int cx, int cw)
+{
+	gfx_ui_text(cx + 16, 16, "Display", FG_WHITE);
+	gfx_ui_text(cx + 16, 52, "Resolution", FG_TEXT);
+	if (disp_n == 0) {
+		gfx_ui_text(cx + 16, 84, "No framebuffer.", FG_DIM);
+		return;
+	}
+	gfx_ui_text(cx + 16, CTRL_Y + GUI_SELECT_H + 12,
+	            disp_fixed ? "Resolution is fixed by the bootloader."
+	                       : "Applies immediately.", FG_DIM);
+	draw_select(cx, cw);
 }
 
 /* Draw `s` at (x,y), truncated to fit `maxw` pixels so a long line (a verbose
@@ -365,6 +487,7 @@ static void render(void)
 	if      (sel == CAT_MOUSE)    draw_mouse(cx, cw);
 	else if (sel == CAT_KEYBOARD) draw_keyboard(cx, cw);
 	else if (sel == CAT_SOUND)    draw_sound(cx, cw);
+	else if (sel == CAT_DISPLAY)  draw_display(cx, cw);
 	else                          draw_about(cx, cw);
 }
 
@@ -389,23 +512,13 @@ static void click(int id, int mx, int my)
 		return;
 	}
 
-	/* Detail-pane controls. */
-	int cx = sbw + 1;
-	if (sel == CAT_MOUSE) {
-		for (int i = 0; i < 5; i++)
-			if (button_hit(spd_bx(cx, i), spd_oy(), SPD_BW, GUI_BTN_H, mx, my)) {
-				set_mouse_level(i + 1); seq++; return;
-			}
-	} else if (sel == CAT_KEYBOARD) {
-		for (int i = 0; i < NKBD; i++)
-			if (button_hit(cx + 16, kbd_by(i), KBD_BW, GUI_BTN_H, mx, my)) {
-				set_kbd_layout(kbd_opts[i].name); seq++; return;
-			}
-	} else if (sel == CAT_SOUND) {
-		for (int i = 0; i < sound_n; i++)
-			if (button_hit(cx + 16, snd_by(i), SND_BW, GUI_BTN_H, mx, my)) {
-				set_sound_output(i); seq++; return;
-			}
+	/* Detail-pane controls: the active category's select widget. */
+	int cx = sbw + 1, cw = W - sbw - 1;
+	struct select_box *s = cur_select();
+	if (s) {
+		int r = select_click(s, cx + 16, CTRL_Y, ctrl_box_w(cw), GUI_SELECT_H, mx, my);
+		if (r == 1)       { apply_select(s->selected); seq++; }
+		else if (r == -1) { seq++; }
 	}
 }
 
@@ -415,9 +528,15 @@ static void drag(int mx)
 		seq++;
 }
 
-/* Up/Down move the selected category; the change re-reads its live state. */
+/* Up/Down move the selected category; an open dropdown captures keys instead. */
 static void key(int k)
 {
+	struct select_box *s = cur_select();
+	if (s && s->open) {
+		int r = select_key(s, (char)k);
+		if (r == 1)       { apply_select(s->selected); seq++; return; }
+		else if (r == -1) { seq++; return; }
+	}
 	if (k == KEY_UP || k == KEY_DOWN) {
 		sel += (k == KEY_DOWN) ? 1 : -1;
 		if (sel < 0) sel = NCATS - 1;
@@ -439,6 +558,7 @@ int main(void)
 	load_mouse();
 	load_kbd();
 	load_sound();
+	load_display();
 	load_about();
 
 	int last = -1;
@@ -448,6 +568,16 @@ int main(void)
 			if      (ev.type == WEV_CLOSE)  { win_close(id); return 0; }
 			else if (ev.type == WEV_MOUSE)  click(id, ev.a, ev.b);
 			else if (ev.type == WEV_DRAG)   drag(ev.a);
+			else if (ev.type == WEV_MOVE)   {
+				/* Track hover for an open dropdown. */
+				struct select_box *s = cur_select();
+				if (s && s->open) {
+					int sbw = sidebar_w(), cx = sbw + 1, cw = W - sbw - 1;
+					if (select_motion(s, cx + 16, CTRL_Y,
+					                  ctrl_box_w(cw), GUI_SELECT_H, ev.a, ev.b))
+						seq++;
+				}
+			}
 			else if (ev.type == WEV_KEY)    key(ev.a);
 			else if (ev.type == WEV_RESIZE) {
 				W = ev.a; H = ev.b;

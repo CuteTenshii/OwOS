@@ -112,24 +112,8 @@ static unsigned r32(const unsigned char *d, int *p)
 	return v;
 }
 
-/* Weak best-effort randomness (cookie, ephemeral key, padding). Not a real
- * entropy source -- the same compromise the QUIC/TLS user client makes. */
-static void gen_random(unsigned char *out, int n)
-{
-	static unsigned ctr;
-	int got = 0;
-	while (got < n) {
-		unsigned a = msec(), b = uptime(), c = now_hms(), d = ctr++;
-		unsigned char seed[16];
-		int sp = 0;
-		w32(seed, &sp, a); w32(seed, &sp, b); w32(seed, &sp, c); w32(seed, &sp, d);
-		unsigned char h[32];
-		sha256(seed, 16, h);
-		int chunk = (n - got) < 32 ? (n - got) : 32;
-		memcpy(out + got, h, (unsigned)chunk);
-		got += chunk;
-	}
-}
+/* cookie, ephemeral key and padding from the shared userspace CSPRNG. */
+static void gen_random(unsigned char *out, int n) { if (n > 0) rng_bytes(out, n); }
 
 static void incr_iv(unsigned char *iv)        /* the GCM invocation counter */
 {

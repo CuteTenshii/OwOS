@@ -1,6 +1,6 @@
 /* fetch.c — the browser's main page transaction: the buffered reader, response-
  * header parsing, the HTTP/1.1 + HTTP/2 fetch, downloads (an attachment response
- * streamed to disk instead of B->raw — kept here because it shares this file's
+ * streamed to disk instead of B->pg->raw — kept here because it shares this file's
  * body reader), the redirect follower, the file:/data: schemes, and do_fetch.
  * Separately-fetched sub-resources (inline images, favicon, external stylesheets)
  * live in resource.c; the cookie/HSTS jar in jar.c. Runs on the worker thread
@@ -33,7 +33,7 @@ static void h3_remember(const char *host)
 	h3_nhosts++;
 }
 
-/* One body pipeline for every transport: each fills B->raw with the raw (maybe
+/* One body pipeline for every transport: each fills B->pg->raw with the raw (maybe
  * compressed) body, then raw_decode() decodes Content-Encoding in place and
  * route_body() decides render vs download. (No per-transport decode paths.)
  *
@@ -64,15 +64,15 @@ static unsigned char *body_decompress(const unsigned char *in, int in_len, int e
 	return w.buf ? w.buf : malloc(1);
 }
 
-/* Decode the body already collected in B->raw per its content-encoding, in
- * place. A failed decode empties B->raw (never show the compressed bytes). */
+/* Decode the body already collected in B->pg->raw per its content-encoding, in
+ * place. A failed decode empties B->pg->raw (never show the compressed bytes). */
 static void raw_decode(int enc)
 {
-	if (!enc || B->raw_len <= 0) return;
+	if (!enc || B->pg->raw_len <= 0) return;
 	int ol = 0;
-	unsigned char *o = body_decompress((unsigned char *)B->raw, B->raw_len, enc, &ol);
-	B->raw_len = 0;
-	if (o) { if (ensure_raw(ol)) { memcpy(B->raw, o, ol); B->raw_len = ol; } free(o); }
+	unsigned char *o = body_decompress((unsigned char *)B->pg->raw, B->pg->raw_len, enc, &ol);
+	B->pg->raw_len = 0;
+	if (o) { if (ensure_raw(ol)) { memcpy(B->pg->raw, o, ol); B->pg->raw_len = ol; } free(o); }
 }
 
 static int rgetc(void)
@@ -94,9 +94,9 @@ static int rgetc(void)
  * typed, ready to edit and retry. */
 void show_error(const char *m)
 {
-	B->mode = MODE_TEXT;
-	B->scroll = 0;
-	B->cur_url[0] = '\0';
+	B->pg->mode = MODE_TEXT;
+	B->pg->scroll = 0;
+	B->pg->cur_url[0] = '\0';
 	doc_message(m);
 	B->seq++;
 }
@@ -184,10 +184,10 @@ static int is_download(const char *url)
 {
 	if (B->cdisp_attach) return 1;
 	if (url_is_download_ext(url)) return 1;
-	if (B->ctype[0] == '\0') return 0;
-	if (has_sub(B->ctype, "html")) return 0;
-	if (starts_ci(B->ctype, "text/")) return 0;
-	if (starts_ci(B->ctype, "image/")) return 0;
+	if (B->pg->ctype[0] == '\0') return 0;
+	if (has_sub(B->pg->ctype, "html")) return 0;
+	if (starts_ci(B->pg->ctype, "text/")) return 0;
+	if (starts_ci(B->pg->ctype, "image/")) return 0;
 	return 1;
 }
 
@@ -315,9 +315,9 @@ static void pick_dl_path(const char *url, char *path, int cap)
  * path (and byte count) or a failure notice. Shared by the 1.1 and h2 paths. */
 static void download_finished(const char *url, const char *path, int wrote, int fail)
 {
-	B->mode = MODE_TEXT;
-	{ int ci = 0; sapp(B->cur_url, &ci, sizeof B->cur_url, url); }
-	B->scroll = 0;
+	B->pg->mode = MODE_TEXT;
+	{ int ci = 0; sapp(B->pg->cur_url, &ci, sizeof B->pg->cur_url, url); }
+	B->pg->scroll = 0;
 
 	char msg[256]; int m = 0;
 	if (!fail && wrote >= 0) {
@@ -342,6 +342,9 @@ static void download_finished(const char *url, const char *path, int wrote, int 
 static void ext_css_clear(void)
 {
 	struct css_link *c = B->ext_css;
+	/* Defensive: the head is always NULL or a heap node (>= USER_BASE). A lower
+	 * value is a stray write from elsewhere — drop the list rather than fault. */
+	if ((unsigned)c && (unsigned)c < 0x40000000u) { B->ext_css = 0; return; }
 	while (c) { struct css_link *n = c->next; free(c->url); free(c); c = n; }
 	B->ext_css = 0;
 }
@@ -415,7 +418,7 @@ static void parse_link_header(const char *v, const char *base)
 
 /* Parse a response header block (an HTTP/1.1 block, or the HTTP/2-synthesized
  * "HTTP/x NNN\r\nname: value\r\n…" equivalent) into the browser state: sets
- * B->ctype / B->dl_name / B->cdisp_attach, stores cookies for `host`, notes
+ * B->pg->ctype / B->dl_name / B->cdisp_attach, stores cookies for `host`, notes
  * HSTS, collects Link: stylesheets, resolves any Location into `loc`, and reports
  * the body framing (chunked / content-length / gzip — moot over h2, which sends
  * none). Returns the status code. Shared by the HTTP/1.1 and HTTP/2 fetch paths.*/
@@ -450,9 +453,9 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 	const char *ct = http_headers_get(&H, "content-type");
 	if (ct) {
 		int k = 0;
-		for (const char *v = ct; *v && *v != ';' && k < (int)sizeof B->ctype - 1; v++)
-			B->ctype[k++] = lower(*v);
-		B->ctype[k] = '\0';
+		for (const char *v = ct; *v && *v != ';' && k < (int)sizeof B->pg->ctype - 1; v++)
+			B->pg->ctype[k++] = lower(*v);
+		B->pg->ctype[k] = '\0';
 	}
 	html_set_charset(ct);   /* charset param drives html.c transcoding (NULL = reset) */
 
@@ -508,12 +511,12 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 	/* Content-Security-Policy: build the page's enforced policy set — each header
 	 * is one policy and a load must satisfy them all. Report-Only is deliberately
 	 * not enforced, so it is left out. (The final hop after redirects wins.) */
-	if (B->csp) { csp_free(B->csp); B->csp = 0; }
+	if (B->pg->csp) { csp_free(B->pg->csp); B->pg->csp = 0; }
 	int ncsp = http_headers_count(&H, "content-security-policy");
 	if (ncsp > 0) {
-		B->csp = csp_new();
+		B->pg->csp = csp_new();
 		for (int i = 0; i < ncsp; i++)
-			csp_add(B->csp, http_headers_at(&H, "content-security-policy", i));
+			csp_add(B->pg->csp, http_headers_at(&H, "content-security-policy", i));
 	}
 
 	http_headers_free(&H);
@@ -521,9 +524,9 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 	return status;
 }
 
-/* Route the fully-received, already-content-decoded body in B->raw: a download
+/* Route the fully-received, already-content-decoded body in B->pg->raw: a download
  * (attachment / non-renderable type on a 2xx) is written to ~/Downloads and
- * B->raw cleared; anything else stays in B->raw for rendering. The single place
+ * B->pg->raw cleared; anything else stays in B->pg->raw for rendering. The single place
  * the download decision lives, shared by every transport. Returns `status`. */
 static int route_body(const char *full_url, int status, int allow_dl)
 {
@@ -532,12 +535,12 @@ static int route_body(const char *full_url, int status, int allow_dl)
 		pick_dl_path(full_url, path, sizeof path);
 		int wrote = -1, fail = 0;
 		if (stream_begin(path) == 0) {
-			if (B->raw_len > 0 && stream_write((const unsigned char *)B->raw, B->raw_len) < 0)
+			if (B->pg->raw_len > 0 && stream_write((const unsigned char *)B->pg->raw, B->pg->raw_len) < 0)
 				fail = 1;
 			wrote = stream_end();
 		}
 		download_finished(full_url, path, wrote, fail);
-		B->raw_len = 0;
+		B->pg->raw_len = 0;
 	}
 	return status;
 }
@@ -558,18 +561,18 @@ static int h2_headers_cb(void *ctx, const char *block, int len)
 	return 0;
 }
 
-/* Body sink: append the raw DATA payload to B->raw (decoded once, after). */
+/* Body sink: append the raw DATA payload to B->pg->raw (decoded once, after). */
 static int h2_body_cb(void *ctx, const unsigned char *p, int n)
 {
 	(void)ctx;
 	if (B->abort_load) return 1;                    /* Stop: tell h2_run to bail */
-	if (!ensure_raw(B->raw_len + n)) return 1;      /* out of memory: stop */
-	for (int i = 0; i < n; i++) B->raw[B->raw_len++] = (char)p[i];
+	if (!ensure_raw(B->pg->raw_len + n)) return 1;      /* out of memory: stop */
+	for (int i = 0; i < n; i++) B->pg->raw[B->pg->raw_len++] = (char)p[i];
 	return 0;
 }
 
 /* Run the request over HTTP/2 (sock already open + ALPN-confirmed h2). Fills
- * B->raw with the raw body; raw_decode + route_body finish it the common way. */
+ * B->pg->raw with the raw body; raw_decode + route_body finish it the common way. */
 static int h2_txn(const struct purl *u, const char *full_url, char *loc,
                   int loc_cap, int allow_dl)
 {
@@ -605,13 +608,13 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 
 /* ---- HTTP/3 transaction (QUIC; used for Alt-Svc-advertised origins) ------- */
 
-/* Body sink: append to B->raw (decoded once, after — same as h2/h1.1). */
+/* Body sink: append to B->pg->raw (decoded once, after — same as h2/h1.1). */
 static int h3_body_cb(void *ctx, const unsigned char *p, int n)
 {
 	(void)ctx;
 	if (B->abort_load) return 1;                    /* Stop: tell h3_run to bail */
-	if (!ensure_raw(B->raw_len + n)) return 1;
-	for (int i = 0; i < n; i++) B->raw[B->raw_len++] = (char)p[i];
+	if (!ensure_raw(B->pg->raw_len + n)) return 1;
+	for (int i = 0; i < n; i++) B->pg->raw[B->pg->raw_len++] = (char)p[i];
 	return 0;
 }
 
@@ -621,7 +624,7 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc,
                   int loc_cap, int allow_dl)
 {
 	loc[0] = '\0';
-	B->ctype[0] = '\0'; B->dl_name[0] = '\0'; B->cdisp_attach = 0; B->raw_len = 0;
+	B->pg->ctype[0] = '\0'; B->dl_name[0] = '\0'; B->cdisp_attach = 0; B->pg->raw_len = 0;
 
 	char auth[URL_HOST_MAX + 8]; int an = 0;
 	sapp(auth, &an, sizeof auth, u->host);
@@ -651,19 +654,19 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
                     int loc_cap, int allow_dl)
 {
 	loc[0] = '\0';
-	B->ctype[0] = '\0';
+	B->pg->ctype[0] = '\0';
 	B->dl_name[0] = '\0';
 	B->cdisp_attach = 0;
 	B->rpos = B->rlen = B->reof = 0;
-	B->raw_len = 0;
+	B->pg->raw_len = 0;
 
 	/* If this https origin previously advertised HTTP/3 (Alt-Svc), try QUIC
 	 * first; on any failure fall through to the TLS h2/h1.1 path below. */
 	if (u->tls && u->port == 443 && h3_known(u->host)) {
 		int st = h3_txn(u, full_url, loc, loc_cap, allow_dl);
 		if (st > 0) return st;
-		loc[0] = '\0'; B->ctype[0] = '\0'; B->dl_name[0] = '\0';
-		B->cdisp_attach = 0; B->raw_len = 0;
+		loc[0] = '\0'; B->pg->ctype[0] = '\0'; B->dl_name[0] = '\0';
+		B->cdisp_attach = 0; B->pg->raw_len = 0;
 	}
 
 	/* Over TLS, offer ALPN "h2" (SK_TLS_H2); if the server selects it, run the
@@ -721,12 +724,12 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	struct bodysrc bs = { chunked, have_len, 0, 0,
 	                      have_len ? content_len : 0 };
 
-	/* Read the whole (framed) body into B->raw, then the common pipeline decodes
+	/* Read the whole (framed) body into B->pg->raw, then the common pipeline decodes
 	 * Content-Encoding and routes render-vs-download. */
 	int c;
 	while ((c = body_src(&bs)) >= 0) {
-		if (!ensure_raw(B->raw_len + 1)) break;       /* out of memory: stop */
-		B->raw[B->raw_len++] = (char)c;
+		if (!ensure_raw(B->pg->raw_len + 1)) break;       /* out of memory: stop */
+		B->pg->raw[B->pg->raw_len++] = (char)c;
 	}
 	net_close(B->sock);
 
@@ -755,7 +758,7 @@ static int b64val(int c)
 }
 
 
-/* Render whatever is in B->raw (with B->ctype already set) as the page body —
+/* Render whatever is in B->pg->raw (with B->pg->ctype already set) as the page body —
  * HTML, plain text, or a PNG. Shared by the network, file:, and data: paths so
  * all three pick the display mode the same way. HTML pulls external stylesheets
  * (via css_batch) before layout; other sub-resources are fetched by do_fetch. */
@@ -765,21 +768,21 @@ static void render_raw(const char *url)
 	 * servers). But X-Content-Type-Options: nosniff forbids that guess: with it
 	 * set, render as HTML ONLY when the server explicitly declared an HTML type,
 	 * otherwise fall through to plain text. */
-	int as_html = has_sub(B->ctype, "html") ||
-	              (B->ctype[0] == '\0' && !B->nosniff);
+	int as_html = has_sub(B->pg->ctype, "html") ||
+	              (B->pg->ctype[0] == '\0' && !B->nosniff);
 	if (as_html) {
-		B->mode = MODE_HTML; html_to_text(url, css_batch);
-	} else if (starts_ci(B->ctype, "image/png")) {
-		B->mode = MODE_IMAGE;
-		B->text_len = 0; B->nlinks = 0; B->doc_title[0] = '\0';
-	} else if (starts_ci(B->ctype, "image/")) {
-		B->mode = MODE_TEXT;
+		B->pg->mode = MODE_HTML; html_to_text(url, css_batch);
+	} else if (starts_ci(B->pg->ctype, "image/png")) {
+		B->pg->mode = MODE_IMAGE;
+		B->pg->text_len = 0; B->pg->nlinks = 0; B->pg->doc_title[0] = '\0';
+	} else if (starts_ci(B->pg->ctype, "image/")) {
+		B->pg->mode = MODE_TEXT;
 		doc_message("[unsupported image type - only PNG can be shown]");
 	} else {
-		B->mode = MODE_TEXT; plain_to_text();
+		B->pg->mode = MODE_TEXT; plain_to_text();
 	}
-	B->scroll = 0;
-	{ int ci = 0; sapp(B->cur_url, &ci, sizeof B->cur_url, url); }
+	B->pg->scroll = 0;
+	{ int ci = 0; sapp(B->pg->cur_url, &ci, sizeof B->pg->cur_url, url); }
 }
 
 /* Pick a Content-Type for a local file from its extension — only the
@@ -797,10 +800,10 @@ static void ctype_from_ext(const char *path)
 		if      (streq_ci(ext, "html") || streq_ci(ext, "htm")) t = "text/html";
 		else if (streq_ci(ext, "png"))                          t = "image/png";
 	}
-	int k = 0; sapp(B->ctype, &k, sizeof B->ctype, t);
+	int k = 0; sapp(B->pg->ctype, &k, sizeof B->pg->ctype, t);
 }
 
-/* file:// — read a file from the local FS (owofs or a /media mount) into B->raw,
+/* file:// — read a file from the local FS (owofs or a /media mount) into B->pg->raw,
  * streamed and grown on demand so a file of any size loads (bounded only by
  * memory). Accepts file:/path, file://host/path (host ignored), file:///path; a
  * trailing ?query or #fragment is dropped. Returns 0, or -1 if it can't open. */
@@ -819,22 +822,22 @@ static int load_file_url(const char *url)
 		path[pn++] = *q;
 	path[pn] = '\0';
 
-	B->raw_len = 0;
+	B->pg->raw_len = 0;
 	unsigned off = 0;
 	for (;;) {
-		if (!ensure_raw(B->raw_len + 4096)) break;   /* out of memory: stop */
-		int got = readfile_at(path, off, B->raw + B->raw_len, 4096);
+		if (!ensure_raw(B->pg->raw_len + 4096)) break;   /* out of memory: stop */
+		int got = readfile_at(path, off, B->pg->raw + B->pg->raw_len, 4096);
 		if (got < 0) return -1;
 		if (got == 0) break;            /* end of file                       */
-		B->raw_len += got;
+		B->pg->raw_len += got;
 		off        += (unsigned)got;
 	}
 	ctype_from_ext(path);
 	return 0;
 }
 
-/* data:[<mediatype>][;base64],<data> — decode an inline document into B->raw.
- * The media type (default text/plain) sets B->ctype so render_raw shows HTML/
+/* data:[<mediatype>][;base64],<data> — decode an inline document into B->pg->raw.
+ * The media type (default text/plain) sets B->pg->ctype so render_raw shows HTML/
  * text/PNG correctly; the payload is base64- or percent-decoded. A non-base64
  * body keeps '+' literal (unlike form-encoding). Returns 0, or -1 if malformed. */
 static int load_data_url(const char *url)
@@ -860,11 +863,11 @@ static int load_data_url(const char *url)
 	}
 
 	int k = 0;
-	B->ctype[0] = '\0';
-	sapp(B->ctype, &k, sizeof B->ctype, mt[0] ? mt : "text/plain");
+	B->pg->ctype[0] = '\0';
+	sapp(B->pg->ctype, &k, sizeof B->pg->ctype, mt[0] ? mt : "text/plain");
 
 	const char *d = comma + 1;
-	B->raw_len = 0;
+	B->pg->raw_len = 0;
 	if (base64) {
 		int acc = 0, nb = 0;
 		for (; *d && *d != '='; d++) {
@@ -873,20 +876,20 @@ static int load_data_url(const char *url)
 			acc = (acc << 6) | v; nb += 6;
 			if (nb >= 8) {
 				nb -= 8;
-				if (!ensure_raw(B->raw_len + 1)) break;
-				B->raw[B->raw_len++] = (char)((acc >> nb) & 0xff);
+				if (!ensure_raw(B->pg->raw_len + 1)) break;
+				B->pg->raw[B->pg->raw_len++] = (char)((acc >> nb) & 0xff);
 			}
 		}
 	} else {
 		for (; *d; d++) {
-			if (!ensure_raw(B->raw_len + 1)) break;
+			if (!ensure_raw(B->pg->raw_len + 1)) break;
 			int c = (unsigned char)*d;
 			if (c == '%') {
 				int hi = hexval((unsigned char)d[1]);
 				int lo = hi < 0 ? -1 : hexval((unsigned char)d[2]);
 				if (lo >= 0) { c = hi * 16 + lo; d += 2; }
 			}
-			B->raw[B->raw_len++] = (char)c;
+			B->pg->raw[B->pg->raw_len++] = (char)c;
 		}
 	}
 	return 0;
@@ -895,25 +898,28 @@ static int load_data_url(const char *url)
 void do_fetch(void)
 {
 	char url[URL_MAX]; int n = 0;
+	/* Capture the page we're leaving as the referrer for the page we're about to
+	 * load (cur_url still holds the old URL until render_raw overwrites it). */
+	{ int k = 0; B->referrer[0] = '\0'; sapp(B->referrer, &k, sizeof B->referrer, B->pg->cur_url); }
 	/* Free the previous page's live DOM/CSS/JS before building the new one. This
 	 * covers every navigation (incl. plain-text/image/error paths that don't go
 	 * through html_to_text); html_to_text repeats it harmlessly for HTML pages. */
 	html_page_teardown();
-	if (B->csp) { csp_free(B->csp); B->csp = 0; }   /* drop the old page's CSP; parse_response/meta rebuild it */
+	if (B->pg->csp) { csp_free(B->pg->csp); B->pg->csp = 0; }   /* drop the old page's CSP; parse_response/meta rebuild it */
 	devtools_net_reset();       /* a new top-level navigation starts a fresh net log */
 	sapp(url, &n, sizeof url, B->req_url);
 	B->dl_saved = 0;
-	B->favicon_ok = 0;          /* cleared per navigation; refilled on success */
+	B->pg->favicon_ok = 0;          /* cleared per navigation; refilled on success */
 	ext_css_clear();            /* Link: stylesheets refilled by parse_response  */
 
 	/* Local / inline schemes never touch the network: file:// reads the local
-	 * FS, data: decodes an embedded document. Both fill B->raw + B->ctype and
+	 * FS, data: decodes an embedded document. Both fill B->pg->raw + B->pg->ctype and
 	 * render through the same path as a fetched page (no sub-resource fetch). */
 	if (starts_ci(url, "file:") || starts_ci(url, "data:")) {
 		int data = starts_ci(url, "data:");
-		B->ctype[0] = '\0'; B->dl_name[0] = '\0'; B->cdisp_attach = 0;
+		B->pg->ctype[0] = '\0'; B->dl_name[0] = '\0'; B->cdisp_attach = 0;
 		B->rpos = B->rlen = B->reof = 0;
-		B->n_imgs = 0;
+		B->pg->n_imgs = 0;
 		int rc = data ? load_data_url(url) : load_file_url(url);
 		if (rc < 0) {
 			show_error(data ? "Malformed data: URL"
@@ -921,7 +927,7 @@ void do_fetch(void)
 			return;
 		}
 		render_raw(url);
-		devtools_net_add("GET", url, 200, B->ctype, B->raw_len);
+		devtools_net_add("GET", url, 200, B->pg->ctype, B->pg->raw_len);
 		return;
 	}
 
@@ -978,10 +984,10 @@ void do_fetch(void)
 
 		/* Log the document request in the devtools Network tab (the final response
 		 * after any redirects; a streamed download has raw_len 0). */
-		devtools_net_add("GET", url, st, B->ctype, B->dl_saved ? 0 : B->raw_len);
+		devtools_net_add("GET", url, st, B->pg->ctype, B->dl_saved ? 0 : B->pg->raw_len);
 
 		/* A download was streamed straight to ~/Downloads inside http_txn (it
-		 * never touched B->raw), so there is nothing to render. */
+		 * never touched B->pg->raw), so there is nothing to render. */
 		if (B->dl_saved)
 			return;
 
@@ -990,18 +996,18 @@ void do_fetch(void)
 		 * type is shown verbatim so line breaks survive; image/png is decoded. */
 		render_raw(url);
 		/* The title bar is updated by the main thread (only the window's owner
-		 * task may call win_settitle); it reads B->doc_title / B->cur_url. */
+		 * task may call win_settitle); it reads B->pg->doc_title / B->pg->cur_url. */
 
 		/* HTML pages may carry inline <img>: the parallel fetchers (resource.c)
-		 * pull each over its own socket into img_pool — B->raw is untouched. Each
+		 * pull each over its own socket into img_pool — B->pg->raw is untouched. Each
 		 * landed image bumps B->seq so the UI re-lays-out as they arrive. */
-		if (B->mode == MODE_HTML && B->n_imgs > 0 && !B->abort_load)
+		if (B->pg->mode == MODE_HTML && B->pg->n_imgs > 0 && !B->abort_load)
 			fetch_inline_images(url);
 
 		/* Pull the site favicon for the tab strip. Skipped for a directly-rendered
-		 * image page, whose pixels are in B->raw (the favicon fetch uses its own
+		 * image page, whose pixels are in B->pg->raw (the favicon fetch uses its own
 		 * buffer, but the page is already the image, so there's nothing to fetch). */
-		if (B->mode != MODE_IMAGE && !B->abort_load)
+		if (B->pg->mode != MODE_IMAGE && !B->abort_load)
 			fetch_favicon(url);
 		return;
 	}

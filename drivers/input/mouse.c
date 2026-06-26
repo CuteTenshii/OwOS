@@ -281,3 +281,18 @@ void mouse_set_speed(int level)
 }
 
 int mouse_speed(void) { return speed; }
+
+/* Update the cursor's clamp box after a resolution change (the hardware stays
+ * initialised; only the bounds move). Clamps the current position into the new
+ * box so the cursor can't be stranded off-screen. */
+void mouse_set_bounds(int max_x, int max_y)
+{
+	bound_x = max_x;
+	bound_y = max_y;
+	if (cur_x > bound_x) cur_x = bound_x;
+	if (cur_y > bound_y) cur_y = bound_y;
+	/* The absolute pointers scale onto their own copy of the bounds — keep them
+	 * in step, or the cursor can't reach the new screen's far edges. */
+	vmmouse_set_bounds(max_x, max_y);
+	synaptics_set_bounds(max_x, max_y);
+}

@@ -8,9 +8,17 @@
  */
 #include "browser.h"
 #include "font.h"   /* custom @font-face faces (user/lib/font) */
+#include "clipboard.h"   /* clip_put_text for Copy */
+#include "layout.h"  /* the CSS box tree (backgrounds/borders behind the text) */
 
 static struct browser binst;
 struct browser *B = &binst;
+
+/* Content-pane text selection (drag to select, Ctrl+C to copy). The gfx_sel model
+ * works in (display-line, byte-in-line) coordinates; g_selecting is set between a
+ * press on plain text and the end of the drag. */
+static struct gfx_sel g_sel;
+static int g_selecting;
 
 int BW = 600, BH = 368;        /* client size; grows/shrinks on resize */
 
@@ -48,53 +56,56 @@ static int grow_cap(int cap, int init, int need)
 /* raw / img_pool: byte buffers. Lock only around the relocating realloc. */
 int ensure_raw(int need)
 {
-	if (need <= B->raw_cap) return 1;
-	int nc = grow_cap(B->raw_cap, RAW_INIT, need);
+	if (need <= B->pg->raw_cap) return 1;
+	int nc = grow_cap(B->pg->raw_cap, RAW_INIT, need);
 	blk_lock();
-	char *p = realloc(B->raw, (unsigned)nc);
-	if (p) { B->raw = p; B->raw_cap = nc; }
+	char *p = realloc(B->pg->raw, (unsigned)nc);
+	if (p) { B->pg->raw = p; B->pg->raw_cap = nc; }
 	blk_unlock();
 	return p != 0;
 }
 
-/* text + attr share one capacity so draw_styled_line can index both. Only
- * advance text_cap when BOTH reallocs succeed, so the two stay consistent. */
+/* text + attr (+ bp + fg + bg) share one capacity so draw_styled_line can index
+ * them together. Only advance text_cap when ALL reallocs succeed, so they stay
+ * consistent. */
 int ensure_text(int need)
 {
-	if (need <= B->text_cap) return 1;
-	int nc = grow_cap(B->text_cap, TEXT_INIT, need);
+	if (need <= B->pg->text_cap) return 1;
+	int nc = grow_cap(B->pg->text_cap, TEXT_INIT, need);
 	blk_lock();
-	char          *t = realloc(B->text, (unsigned)nc);
-	unsigned char *a = realloc(B->attr, (unsigned)nc);
-	unsigned char *p = realloc(B->bp,  (unsigned)nc);
-	unsigned char *g = realloc(B->bgi, (unsigned)nc);
-	if (t) B->text = t;
-	if (a) B->attr = a;
-	if (p) B->bp  = p;
-	if (g) B->bgi = g;
-	if (t && a && p && g) B->text_cap = nc;
+	char          *t = realloc(B->pg->text, (unsigned)nc);
+	unsigned char *a = realloc(B->pg->attr, (unsigned)nc);
+	unsigned char *p = realloc(B->pg->bp,  (unsigned)nc);
+	unsigned      *f = realloc(B->pg->fg,  (unsigned)nc * sizeof *f);
+	unsigned      *g = realloc(B->pg->bg,  (unsigned)nc * sizeof *g);
+	if (t) B->pg->text = t;
+	if (a) B->pg->attr = a;
+	if (p) B->pg->bp  = p;
+	if (f) B->pg->fg  = f;
+	if (g) B->pg->bg  = g;
+	if (t && a && p && f && g) B->pg->text_cap = nc;
 	blk_unlock();
-	return t && a && p && g;
+	return t && a && p && f && g;
 }
 
 int ensure_links(int need)
 {
-	if (need <= B->links_cap) return 1;
-	int nc = grow_cap(B->links_cap, LINKS_INIT, need);
+	if (need <= B->pg->links_cap) return 1;
+	int nc = grow_cap(B->pg->links_cap, LINKS_INIT, need);
 	blk_lock();
-	struct link *p = realloc(B->links, (unsigned)nc * sizeof *p);
-	if (p) { B->links = p; B->links_cap = nc; }
+	struct link *p = realloc(B->pg->links, (unsigned)nc * sizeof *p);
+	if (p) { B->pg->links = p; B->pg->links_cap = nc; }
 	blk_unlock();
 	return p != 0;
 }
 
 int ensure_imgs(int need)
 {
-	if (need <= B->imgs_cap) return 1;
-	int nc = grow_cap(B->imgs_cap, IMGS_INIT, need);
+	if (need <= B->pg->imgs_cap) return 1;
+	int nc = grow_cap(B->pg->imgs_cap, IMGS_INIT, need);
 	blk_lock();
-	struct inl_img *p = realloc(B->imgs, (unsigned)nc * sizeof *p);
-	if (p) { B->imgs = p; B->imgs_cap = nc; }
+	struct inl_img *p = realloc(B->pg->imgs, (unsigned)nc * sizeof *p);
+	if (p) { B->pg->imgs = p; B->pg->imgs_cap = nc; }
 	blk_unlock();
 	return p != 0;
 }
@@ -107,10 +118,14 @@ int ensure_lines(int need)
 	int nc = grow_cap(B->line_cap, LINES_INIT, need);
 	int *off = realloc(B->line_off, (unsigned)nc * sizeof *off);
 	int *len = realloc(B->line_len, (unsigned)nc * sizeof *len);
+	int *lx  = realloc(B->line_x,   (unsigned)nc * sizeof *lx);
+	int *lw  = realloc(B->line_w,   (unsigned)nc * sizeof *lw);
 	if (off) B->line_off = off;
 	if (len) B->line_len = len;
-	if (off && len) B->line_cap = nc;
-	return off && len;
+	if (lx)  B->line_x   = lx;
+	if (lw)  B->line_w   = lw;
+	if (off && len && lx && lw) B->line_cap = nc;
+	return off && len && lx && lw;
 }
 
 /* The app menu bar: "Page" and "View" laid out on one bar via the gfx menubar
@@ -136,8 +151,16 @@ static struct menu *const  view_subs[]  = { 0, &scrollmenu };
 static struct menu viewmenu = { "View", view_items, 2, 0,
                                 0, 0, view_flags, view_subs };
 
-static struct menu *const bar_menus[] = { &pagemenu, &viewmenu };
-static struct menubar menubar = { bar_menus, 2, 2, 0 };
+/* "Edit" menu: Copy (the text selection) + Select All. Copy dims with no selection
+ * (render() updates edit_flags[0]). copy_selection/select_all are defined below. */
+static void copy_selection(void);
+static void select_all(void);
+static const char *const edit_items[] = { "Copy", "Select All" };
+static unsigned char       edit_flags[] = { MENU_DISABLED, 0 };
+static struct menu editmenu = { "Edit", edit_items, 2, 0, 0, 0, edit_flags, 0 };
+
+static struct menu *const bar_menus[] = { &pagemenu, &editmenu, &viewmenu };
+static struct menubar menubar = { bar_menus, 3, 2, 0 };
 
 /* --- tabs ------------------------------------------------------------------ */
 /* Each tab keeps its URL, label and scroll offset, plus — when it isn't the
@@ -155,24 +178,10 @@ static struct menubar menubar = { bar_menus, 2, 2, 0 };
 #define MAX_TABS 8
 #define HIST_MAX 32      /* per-tab back/forward history depth */
 struct tab {
-	char url[URL_MAX];
-	char label[40];
-	int  scroll;
-
-	int  cached;                 /* 1 = a page snapshot blob is held           */
-	unsigned char *blob;         /* malloc'd snapshot, NULL when not cached     */
-	int  blob_len;               /* its size in bytes                          */
-
-	/* snapshot of B's per-page metadata (the buffers themselves go in blob) */
-	char cur_url[URL_MAX];
-	char doc_title[128];
-	char ctype[80];
-	int  mode, text_len, raw_len, img_pool_len, nlinks, n_imgs;
-
-	/* the tab's favicon (decoded 16x16 ARGB), shown in the strip even while the
-	 * tab is inactive — small enough to keep inline rather than in the blob. */
-	unsigned favicon[FAVICON_W * FAVICON_H];
-	int      favicon_ok;
+	char url[URL_MAX];           /* address-bar / navigation target               */
+	char label[40];              /* tab-strip label (page title or host)          */
+	struct page page;            /* this tab's whole page; B->pg points here when
+	                              * active, so a switch is a pointer swap (no copy) */
 
 	/* Per-tab navigation history: URLs landed on, with hist_i the current entry.
 	 * Back/Next move hist_i and re-navigate; a fresh navigation truncates any
@@ -187,7 +196,7 @@ static struct tab tabs[MAX_TABS];
 static int n_tabs = 1;
 static int active_tab = 0;
 
-static void update_title(int id);   /* defined below; called from tab restore */
+static void update_title(int id);   /* defined below; called from tab reveal */
 
 static void copy_str(char *d, const char *s, int cap)
 {
@@ -196,11 +205,40 @@ static void copy_str(char *d, const char *s, int cap)
 	d[i] = '\0';
 }
 
-/* Release a tab's cached snapshot. */
-static void tab_drop(struct tab *t)
+/* Free every heap buffer a page owns and zero it (so a reused slot starts clean).
+ * Each tab owns its page, so this runs when a tab closes or a slot is recycled. */
+static void page_free(struct page *p)
 {
-	if (t->blob) { free(t->blob); t->blob = 0; }
-	t->cached = 0; t->blob_len = 0;
+	free(p->raw); free(p->text); free(p->attr); free(p->bp);
+	free(p->fg); free(p->bg); free(p->links); free(p->imgs); free(p->img_save);
+	for (int i = 0; i < p->n_faces; i++) {
+		if (p->faces[i].font) font_free(p->faces[i].font);
+		free(p->faces[i].data);
+	}
+	free(p->faces);
+	if (p->csp) csp_free(p->csp);
+	memset(p, 0, sizeof *p);
+}
+
+/* The shared 16 MiB image scratch holds only the ACTIVE tab's images. Save/restore
+ * a tab's bytes around a switch so a backgrounded tab keeps its images (compactly,
+ * sized to what it used) without refetching. */
+static void page_save_images(struct page *p)
+{
+	int n = B->img_pool_len;
+	if (n <= 0) { p->img_save_len = 0; return; }
+	unsigned char *s = realloc(p->img_save, (unsigned)n);
+	if (!s) { p->img_save_len = 0; return; }      /* OOM: images show their alt box */
+	memcpy(s, B->img_pool, (unsigned)n);
+	p->img_save = s; p->img_save_len = n;
+}
+static void page_restore_images(struct page *p)
+{
+	B->img_pool_len = 0;
+	if (p->img_save_len > 0 && p->img_save_len <= (int)sizeof B->img_pool) {
+		memcpy(B->img_pool, p->img_save, (unsigned)p->img_save_len);
+		B->img_pool_len = p->img_save_len;
+	}
 }
 
 /* Set while a fetch was started by Back/Next so its completion doesn't push a new
@@ -241,93 +279,29 @@ static void hist_push(struct tab *t, const char *url)
 static int hist_can_back(const struct tab *t) { return t->hist_i > 0; }
 static int hist_can_fwd(const struct tab *t)  { return t->hist_i < t->hist_n - 1; }
 
-/* Snapshot the active tab's current page into its own heap blob (no-op while a
- * fetch is in flight or the page is blank — those just re-fetch on return). */
-static void tab_cache_active(int i)
+/* Stop any in-flight load and wait for the worker to go idle, so it's safe for
+ * the main thread to repoint B->pg at another tab (the worker only ever writes
+ * the active tab's page). Bounded: a load aborts as soon as its next read bails. */
+static void load_quiesce(void)
+{
+	B->req_pending = 0;
+	B->abort_load = 1;
+	while (B->loading) msleep(2);
+	B->abort_load = 0;
+}
+
+/* Leaving the active tab: its page (buffers, colours, everything) stays put in
+ * tabs[i].page — only the shared image scratch and the live DOM are tied to "the
+ * active tab", so save the images and drop the DOM (the page becomes static until
+ * revealed again). No buffer copy: the swap of B->pg in reveal_tab does the rest. */
+static void tab_leave(int i)
 {
 	struct tab *t = &tabs[i];
-	/* We're leaving this page; its live DOM/JS go away (the worker frees them).
-	 * Snapshots are of the flat buffers only, so interactivity doesn't persist. */
-	B->drop_dom = 1; B->events_live = 0;
-	t->scroll = B->scroll;
+	B->drop_dom = 1; B->events_live = 0;     /* worker frees the live DOM; page goes static */
 	devtools_view_save(&t->dt);              /* remember this tab's devtools view */
-	if (B->loading || (B->mode == MODE_HTML && B->text_len == 0 && !B->cur_url[0])) {
-		tab_drop(t);
-		return;
-	}
-
-	int tl = B->text_len;
-	int link_b = B->nlinks * (int)sizeof(struct link);
-	int img_b  = B->n_imgs * (int)sizeof(struct inl_img);
-	int need   = tl * 2 + B->img_pool_len + B->raw_len + link_b + img_b;
-
-	tab_drop(t);
-	unsigned char *blob = malloc((unsigned)(need > 0 ? need : 1));
-	if (!blob) { t->cached = 0; return; }            /* too big: re-fetch later  */
-
-	int o = 0;
-	memcpy(blob + o, B->text,     tl);              o += tl;
-	memcpy(blob + o, B->attr,     tl);              o += tl;
-	memcpy(blob + o, B->img_pool, B->img_pool_len); o += B->img_pool_len;
-	memcpy(blob + o, B->raw,      B->raw_len);       o += B->raw_len;
-	memcpy(blob + o, B->links,    link_b);           o += link_b;
-	memcpy(blob + o, B->imgs,     img_b);            o += img_b;
-
-	t->cached = 1; t->blob = blob; t->blob_len = need;
-	t->mode = B->mode; t->text_len = B->text_len; t->raw_len = B->raw_len;
-	t->img_pool_len = B->img_pool_len; t->nlinks = B->nlinks; t->n_imgs = B->n_imgs;
-	memcpy(t->cur_url, B->cur_url, sizeof t->cur_url);
-	memcpy(t->doc_title, B->doc_title, sizeof t->doc_title);
-	memcpy(t->ctype, B->ctype, sizeof t->ctype);
-	memcpy(t->favicon, B->favicon, sizeof t->favicon);
-	t->favicon_ok = B->favicon_ok;
+	page_save_images(&t->page);
 }
 
-/* Restore tab `i`'s snapshot into B (instant, no network), growing B's buffers
- * to fit. Frees the blob — the page is live in B now and re-cached on the next
- * switch away. A failed grow leaves a blank page (it'll re-fetch on demand). */
-static void tab_restore(int i)
-{
-	struct tab *t = &tabs[i];
-	int tl = t->text_len;
-	B->drop_dom = 1; B->events_live = 0;   /* restored from a snapshot: static page */
-	int link_b = t->nlinks * (int)sizeof(struct link);
-	int img_b  = t->n_imgs * (int)sizeof(struct inl_img);
-
-	if (!ensure_text(tl) || !ensure_raw(t->raw_len) ||
-	    !ensure_links(t->nlinks) || !ensure_imgs(t->n_imgs)) {
-		tab_drop(t);
-		B->mode = MODE_HTML; B->text_len = 0; B->nlines = 0;
-		B->n_imgs = 0; B->nlinks = 0; B->wrap_seq = 0xFFFFFFFFu; B->seq++;
-		return;
-	}
-
-	int o = 0;
-	memcpy(B->text,     t->blob + o, tl);              o += tl;
-	memcpy(B->attr,     t->blob + o, tl);              o += tl;
-	memcpy(B->img_pool, t->blob + o, t->img_pool_len); o += t->img_pool_len;
-	memcpy(B->raw,      t->blob + o, t->raw_len);       o += t->raw_len;
-	memcpy(B->links,    t->blob + o, link_b);           o += link_b;
-	memcpy(B->imgs,     t->blob + o, img_b);            o += img_b;
-
-	B->mode = t->mode; B->text_len = t->text_len; B->raw_len = t->raw_len;
-	B->img_pool_len = t->img_pool_len; B->nlinks = t->nlinks; B->n_imgs = t->n_imgs;
-	memcpy(B->cur_url, t->cur_url, sizeof B->cur_url);
-	memcpy(B->doc_title, t->doc_title, sizeof B->doc_title);
-	memcpy(B->ctype, t->ctype, sizeof B->ctype);
-	memcpy(B->favicon, t->favicon, sizeof B->favicon);
-	B->favicon_ok = t->favicon_ok;
-
-	B->loading = 0; B->req_pending = 0;
-	B->scroll = t->scroll;
-	B->wrap_seq = 0xFFFFFFFFu;            /* force a re-wrap at the live width */
-	B->seq++;
-
-	tab_drop(t);                          /* it's live in B now */
-
-	textfield_set(&B->addr_tf, B->cur_url[0] ? B->cur_url : t->url);
-	update_title(B->win_id);
-}
 
 /* --- worker thread: drains req_pending, fetches, bumps seq for the UI ----- */
 /* 64 KiB: http_txn holds hdr[4096] + req[2048] + a cookie buffer, and the
@@ -438,7 +412,7 @@ static void worker_dispatch_event(void)
 
 	if (dom_mutation_seq != mseq || need_relayout) {
 		html_relayout();
-		if (B->n_imgs > 0) fetch_inline_images(B->cur_url);
+		if (B->pg->n_imgs > 0) fetch_inline_images(B->pg->cur_url);
 	}
 	B->events_live = js_has_listeners() || html_has_controls();
 }
@@ -456,7 +430,7 @@ static void worker_fn(void)
 		if (B->recascade) {                  /* window resized: re-run the cascade  */
 			B->recascade = 0;
 			html_relayout();                 /* re-evaluates @media at the new size */
-			if (B->n_imgs > 0) fetch_inline_images(B->cur_url);
+			if (B->pg->n_imgs > 0) fetch_inline_images(B->pg->cur_url);
 			B->seq++;
 		}
 		if (B->req_pending) {
@@ -480,7 +454,7 @@ static void worker_fn(void)
 			if (js_timers_pump() + js_websockets_pump()) {
 				if (dom_mutation_seq != mseq) {
 					html_relayout();
-					if (B->n_imgs > 0) fetch_inline_images(B->cur_url);
+					if (B->pg->n_imgs > 0) fetch_inline_images(B->pg->cur_url);
 				}
 				B->seq++;
 			}
@@ -492,7 +466,7 @@ static void worker_fn(void)
 		if (!B->req_pending && !B->loading && html_iframes_pending()) {
 			fetch_iframes();
 			html_relayout();
-			if (B->n_imgs > 0) fetch_inline_images(B->cur_url);
+			if (B->pg->n_imgs > 0) fetch_inline_images(B->pg->cur_url);
 			B->seq++;
 		}
 
@@ -517,11 +491,11 @@ static void worker_fn(void)
  * otherwise it falls back to the baked gfx_ui font. Custom glyphs are rasterized
  * on demand and cached per ASCII codepoint (the body text is folded to 7-bit), at
  * a fixed pixel size, so a repaint only blits. The cache is main-thread-only;
- * B->body_font is swapped by the worker under blk_lock (see html.c). */
-/* B->text holds UTF-8; the renderer decodes a codepoint at a time via the shared
+ * B->pg->body_font is swapped by the worker under blk_lock (see html.c). */
+/* B->pg->text holds UTF-8; the renderer decodes a codepoint at a time via the shared
  * utf8_decode/utf8_seqlen (user/lib). Per-codepoint glyph cache for the active
  * direct-mapped table (evict on collision, so a CJK page with hundreds of glyphs
- * stays bounded and a repaint only blits). Main-thread-only; B->body_font is
+ * stays bounded and a repaint only blits). Main-thread-only; B->pg->body_font is
  * swapped by the worker under blk_lock (see html.c). */
 #define BODY_PX 15.0f
 #define GCACHE_N 1024
@@ -532,11 +506,11 @@ static int           g_baseline;      /* baseline offset (px) within a line */
 
 static void gcache_sync(void)
 {
-	if (g_gf == B->body_font) return;
+	if (g_gf == B->pg->body_font) return;
 	for (int i = 0; i < GCACHE_N; i++) {
 		free(g_glyph[i].bm); g_glyph[i].bm = 0; g_glyph[i].valid = 0;
 	}
-	g_gf = B->body_font;
+	g_gf = B->pg->body_font;
 	if (g_gf) { int asc = 0; font_vmetrics(g_gf, BODY_PX, &asc, 0, 0); g_baseline = asc; }
 }
 
@@ -545,8 +519,8 @@ static struct gcache *gcache_get(unsigned cp)
 	struct gcache *g = &g_glyph[cp & (GCACHE_N - 1)];
 	if (g->valid && g->cp == cp) return g;
 	if (g->valid) { free(g->bm); g->bm = 0; }
-	int gi = font_glyph_index(B->body_font, (int)cp);
-	g->bm = font_render_glyph(B->body_font, gi, BODY_PX, &g->w, &g->h, &g->ox, &g->oy, &g->adv);
+	int gi = font_glyph_index(B->pg->body_font, (int)cp);
+	g->bm = font_render_glyph(B->pg->body_font, gi, BODY_PX, &g->w, &g->h, &g->ox, &g->oy, &g->adv);
 	g->cp = cp; g->valid = 1;
 	return g;
 }
@@ -570,7 +544,7 @@ static int cur_bhr;                   /* this line is a horizontal rule      */
 
 static void set_block(int off)
 {
-	unsigned char bp = (off >= 0 && off < B->text_len) ? B->bp[off] : 0;
+	unsigned char bp = (off >= 0 && off < B->pg->text_len) ? B->pg->bp[off] : 0;
 	int size = bp & BP_SIZE;
 	cur_bhr     = (size == 7);
 	cur_bpx     = (size >= 1 && size <= 6) ? g_size_px[size] : 0;
@@ -584,12 +558,12 @@ static void set_block(int off)
 /* Raw, non-HTML content (text/plain, source, etc.) renders in the fixed-width
  * monospace cell font, not the proportional UI font — only HTML gets the latter.
  * A <pre> block (cur_bmono) is monospace too, even inside an HTML page. */
-static int body_mono(void) { return B->mode == MODE_TEXT || cur_bmono; }
+static int body_mono(void) { return B->pg->mode == MODE_TEXT || cur_bmono; }
 
 static int body_cp_adv(unsigned cp)
 {
 	if (body_mono()) return GLYPH_W;              /* monospace cell             */
-	if (!B->body_font) {                          /* the gfx system-ui font     */
+	if (!B->pg->body_font) {                          /* the gfx system-ui font     */
 		return cur_bpx ? gfx_ui_cw_cp_px(cp, cur_bpx) : gfx_ui_cw_cp(cp);
 	}
 	gcache_sync();
@@ -599,7 +573,7 @@ static int body_cp_adv(unsigned cp)
 static int body_width(const char *s)
 {
 	const char *end = s + strlen(s);
-	if (!body_mono() && B->body_font) gcache_sync();
+	if (!body_mono() && B->pg->body_font) gcache_sync();
 	int w = 0; unsigned cp;
 	while (s < end) { s += utf8_decode(s, end, &cp); w += body_cp_adv(cp); }
 	return w;
@@ -651,7 +625,7 @@ static int body_draw(int x, int y, const char *s, unsigned fg, int ct, int cb)
 		gfx_text(x, y, s, fg, GFX_TRANSPARENT);
 		return x + body_width(s);
 	}
-	if (B->body_font) {
+	if (B->pg->body_font) {
 		gcache_sync();
 		while (s < end) {
 			s += utf8_decode(s, end, &cp);
@@ -670,12 +644,14 @@ static int body_draw(int x, int y, const char *s, unsigned fg, int ct, int cb)
 	return x + gfx_ui_width(s);
 }
 
-static void add_line(int off, int len)
+static void add_line(int off, int len, int x, int w)
 {
 	if (!ensure_lines(B->nlines + 1))
 		return;                       /* out of memory: stop adding lines */
 	B->line_off[B->nlines] = off;
 	B->line_len[B->nlines] = len;
+	B->line_x[B->nlines]   = x;
+	B->line_w[B->nlines]   = w;
 	B->nlines++;
 }
 
@@ -722,6 +698,7 @@ static int img_rows(const struct inl_img *im, int paw)
 }
 
 static void pane_metrics(int *py, int *phh, int *rows);
+static void sel_hl_rect(int x, int y, int w, int h);   /* selection highlight (defined below) */
 
 /* Highest valid scroll line: the last `rows` lines fill the pane exactly, so the
  * bottom stop can't scroll content up into blank space below it. */
@@ -760,8 +737,8 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
 	}
 	/* Inline images anchored inside the span: the <img> element itself (whose span
 	 * ends at its anchor) and any ancestor block enclosing it. */
-	for (int q = 0; q < B->n_imgs; q++) {
-		struct inl_img *im = &B->imgs[q];
+	for (int q = 0; q < B->pg->n_imgs; q++) {
+		struct inl_img *im = &B->pg->imgs[q];
 		if (im->start_row < 0 || im->text_pos < start || im->text_pos > end) continue;
 		int s0 = im->start_row, s1 = s0 + (im->rows > 0 ? im->rows : 1) - 1;
 		if (first < 0 || s0 < first) first = s0;
@@ -771,17 +748,17 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
 	}
 	if (first < 0) { blk_unlock(); return 0; }
 
-	int x = 4, w = paw, y = first * LINE_H, h = (last - first + 1) * LINE_H;
+	int x = B->line_x[first], w = B->line_w[first], y = first * LINE_H, h = (last - first + 1) * LINE_H;
 	if (first == last && text_rows == 1) {        /* one text line: exact x + width */
 		int rs = B->line_off[first], re = rs + B->line_len[first];
-		const char *t = B->text;
+		const char *t = B->pg->text;
 		unsigned cp;
 		set_block(rs);
 		x += cur_bindent * INDENT_PX;
 		if (cur_bcenter) {
 			int lw = 0;
 			for (int p = rs; p < re; ) { p += utf8_decode(&t[p], &t[re], &cp); lw += body_cp_adv(cp); }
-			int room = (paw - cur_bindent * INDENT_PX) - lw;
+			int room = (B->line_w[first] - cur_bindent * INDENT_PX) - lw;
 			if (room > 0) x += room / 2;
 		}
 		int a = start > rs ? start : rs, b = end < re ? end : re;
@@ -789,19 +766,19 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
 		w = 0;
 		for (int p = a;  p < b; ) { p += utf8_decode(&t[p], &t[re], &cp); w += body_cp_adv(cp); }
 		if (w < 1) w = 1;
-	} else if (text_rows == 0 && img_w > 0) {     /* image-only box (drawn at x=4) */
-		x = 4; w = img_w;
+	} else if (text_rows == 0 && img_w > 0) {     /* image-only box */
+		w = img_w;
 	} else {                                      /* block / multi-line: content col */
 		set_block(B->line_off[first]);
-		x = 4 + cur_bindent * INDENT_PX;
-		w = paw - cur_bindent * INDENT_PX; if (w < 1) w = 1;
+		x = B->line_x[first] + cur_bindent * INDENT_PX;
+		w = B->line_w[first] - cur_bindent * INDENT_PX; if (w < 1) w = 1;
 	}
 	blk_unlock();
 	*ox = x; *oy = y; *ow = w; *oh = h;
 	return 1;
 }
 
-int browser_scroll_px(void) { return B->scroll * LINE_H; }   /* window.scrollY */
+int browser_scroll_px(void) { return B->pg->scroll * LINE_H; }   /* window.scrollY */
 
 void browser_viewport_px(int *w, int *h)
 {
@@ -811,76 +788,155 @@ void browser_viewport_px(int *w, int *h)
 	if (h) *h = phh;
 }
 
-/* Word-wrap B->text into display lines that fit `paw` pixels wide (proportional
- * font), reserving rows for inline images. wrap_cols caches the pane width. */
-static void rewrap(int paw)
+/* The CSS box layer. Behind a flag so a regression is one flip back to the pure
+ * flat text renderer. The box tree (layout.c) supplies each block's content
+ * origin/width; inline text still flows through the shared wrap below, and
+ * vertical spacing is quantised to text rows (Stage 6 moves to pixel scrolling). */
+static int g_box_layout = 1;
+
+static int rows_for(int px) { return px > 0 ? (px + LINE_H - 1) / LINE_H : 0; }
+static int max0(int v) { return v > 0 ? v : 0; }
+static void add_n_blanks(int n, int off, int x, int w)
+{ while (n-- > 0) add_line(off, 0, x, w); }
+
+/* Wrap the glyph slice [t0,t1) at content origin `base_x` px / width `w` px,
+ * appending display lines (and reserving inline-image rows). The per-glyph bp byte
+ * still governs heading size / monospace / centring / list indent within the line;
+ * the box tree supplies base_x/w. Shared by the flat renderer (the whole stream)
+ * and the box layout (one slice per block). */
+static void flow_slice(int t0, int t1, int base_x, int w)
 {
-	if (paw < 8) paw = 8;
-	if (B->wrap_seq == B->seq && B->wrap_cols == paw)
-		return;
-	for (int q = 0; q < B->n_imgs; q++) B->imgs[q].start_row = -1;
-	B->nlines = 0;
-	int i = 0;
-	while (i < B->text_len) {
+	if (w < 8) w = 8;
+	int i = t0;
+	while (i < t1) {
 		int j = i;
-		while (j < B->text_len && B->text[j] != '\n') j++;
-		/* Block context of this paragraph governs font size/monospace and how
-		 * much of the pane width its indent leaves for text. */
+		while (j < t1 && B->pg->text[j] != '\n') j++;
 		set_block(i);
-		int avail = paw - cur_bindent * INDENT_PX;
+		int avail = w - cur_bindent * INDENT_PX;
 		if (avail < 8) avail = 8;
-		if (j == i) {
+		if (j == i) {                                 /* blank line / image anchor */
 			int img = -1;
-			for (int q = 0; q < B->n_imgs; q++)
-				if (B->imgs[q].text_pos == i) { img = q; break; }
-			if (img >= 0) {                           /* reserve the image rows  */
-				struct inl_img *im = &B->imgs[img];
-				im->rows = img_rows(im, paw);
+			for (int q = 0; q < B->pg->n_imgs; q++)
+				if (B->pg->imgs[q].text_pos == i) { img = q; break; }
+			if (img >= 0) {
+				struct inl_img *im = &B->pg->imgs[img];
+				im->rows = img_rows(im, w);
 				im->start_row = B->nlines;
-				for (int r = 0; r < im->rows; r++)
-					add_line(i, 0);
+				for (int r = 0; r < im->rows; r++) add_line(i, 0, base_x, w);
 			} else {
-				add_line(i, 0);
+				add_line(i, 0, base_x, w);
 			}
 		} else {
 			int ls = i;
 			while (ls < j) {
 				/* greedy fit by pixel width; break at the last space if a word
 				 * would overflow, else hard-break (one char always fits). */
-				int w = 0, e = ls, lastsp = -1;
+				int wd = 0, e = ls, lastsp = -1;
 				while (e < j) {
 					unsigned cp;
-					int nb = utf8_decode(&B->text[e], &B->text[j], &cp);
+					int nb = utf8_decode(&B->pg->text[e], &B->pg->text[j], &cp);
 					int cw = body_cp_adv(cp);
-					if (w + cw > avail && e > ls) break;
+					if (wd + cw > avail && e > ls) break;
 					if (cp == ' ') lastsp = e;
-					w += cw; e += nb;
+					wd += cw; e += nb;
 				}
 				int brk = (e < j && lastsp > ls) ? lastsp : e;
-				add_line(ls, brk - ls);
+				add_line(ls, brk - ls, base_x, w);
 				ls = brk;
-				while (ls < j && B->text[ls] == ' ') ls++;
+				while (ls < j && B->pg->text[ls] == ' ') ls++;
 			}
 		}
 		i = j + 1;
 	}
+}
+
+/* Lay out one box: blank rows for top margin/border/padding, then its own inline
+ * text interleaved with child boxes (each recursively laid out), then bottom
+ * spacing. Geometry is stored in document px; vertical position is the row cursor
+ * (B->nlines) * LINE_H. `x`/`avail_w` are the box's margin-box left and width. */
+static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
+{
+	struct lbox *b = &bx[idx];
+	int box_x = x + max0(b->margin.l);
+	int box_w = avail_w - max0(b->margin.l) - max0(b->margin.r);
+	if (box_w < 16) box_w = 16;
+	int content_x = box_x + b->border.l + b->padding.l;
+	int content_w = box_w - b->border.l - b->border.r - b->padding.l - b->padding.r;
+	if (content_w < 8) content_w = 8;
+
+	add_n_blanks(rows_for(max0(b->margin.t)), b->t0, box_x, box_w);
+	int box_top = B->nlines;
+	add_n_blanks(rows_for(b->border.t + b->padding.t), b->t0, content_x, content_w);
+	int content_top = B->nlines;
+
+	b->x = box_x; b->w = box_w; b->cx = content_x; b->cw = content_w;
+
+	int pos = b->t0;
+	for (int j = idx + 1; j < b->end; ) {
+		if (bx[j].parent != idx) { j++; continue; }       /* not a direct child */
+		flow_slice(pos, bx[j].t0, content_x, content_w);  /* inline text before it */
+		flow_box(bx, j, content_x, content_w);
+		pos = bx[j].t1;
+		j = bx[j].end;                                    /* skip its descendants */
+	}
+	flow_slice(pos, b->t1, content_x, content_w);
+
+	int content_bot = B->nlines;
+	add_n_blanks(rows_for(b->padding.b + b->border.b), b->t1, content_x, content_w);
+	int box_bot = B->nlines;
+	add_n_blanks(rows_for(max0(b->margin.b)), b->t1, box_x, box_w);
+
+	b->y  = box_top * LINE_H;
+	b->h  = (box_bot - box_top) * LINE_H;
+	b->cy = content_top * LINE_H;
+	b->ch = (content_bot - content_top) * LINE_H;
+}
+
+/* Lay out the whole box tree (top-level boxes stacked, with any stray text outside
+ * them flowed full width). Appends to the line table; sets every box's geometry. */
+static void layout_flow(int paw)
+{
+	int n; struct lbox *bx = layout_pool(&n);
+	int pos = 0;
+	for (int j = 0; j < n; ) {
+		if (bx[j].parent != -1) { j++; continue; }
+		flow_slice(pos, bx[j].t0, 4, paw);
+		flow_box(bx, j, 4, paw);
+		pos = bx[j].t1;
+		j = bx[j].end;
+	}
+	flow_slice(pos, B->pg->text_len, 4, paw);
+}
+
+/* Word-wrap B->pg->text into display lines that fit `paw` pixels wide (proportional
+ * font), reserving rows for inline images. wrap_cols caches the pane width. */
+static void rewrap(int paw)
+{
+	if (paw < 8) paw = 8;
+	if (B->wrap_seq == B->seq && B->wrap_cols == paw)
+		return;
+	for (int q = 0; q < B->pg->n_imgs; q++) B->pg->imgs[q].start_row = -1;
+	B->nlines = 0;
+	int n; layout_pool(&n);
+	if (g_box_layout && n > 0) layout_flow(paw);                 /* box-driven layout */
+	else                       flow_slice(0, B->pg->text_len, 4, paw);  /* flat flow  */
 	B->wrap_seq = B->seq;
 	B->wrap_cols = paw;
 	int max = scroll_max();
-	if (B->scroll > max) B->scroll = max;
-	if (B->scroll < 0) B->scroll = 0;
+	if (B->pg->scroll > max) B->pg->scroll = max;
+	if (B->pg->scroll < 0) B->pg->scroll = 0;
 }
 
 /* ------------------------------------------------------------- image draw */
 
 /* PNG byte source: pulls straight out of the already-fetched body buffer, so
- * the decoder streams from B->raw without a second copy. */
+ * the decoder streams from B->pg->raw without a second copy. */
 struct rawrd { int pos; };
 static int rawrd_get(void *c)
 {
 	struct rawrd *r = c;
-	if (r->pos >= B->raw_len) return -1;
-	return (unsigned char)B->raw[r->pos++];
+	if (r->pos >= B->pg->raw_len) return -1;
+	return (unsigned char)B->pg->raw[r->pos++];
 }
 
 /* Decode state: a fit-to-pane letterbox, blitting each PNG scanline directly
@@ -922,7 +978,7 @@ static int img_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 	return 0;
 }
 
-/* Decode B->raw as a PNG into the content pane (px,py,pw,ph), fit-to-pane with
+/* Decode B->pg->raw as a PNG into the content pane (px,py,pw,ph), fit-to-pane with
  * aspect preserved. Re-decoded each repaint — cheap enough, and keeps no whole
  * decoded image in RAM. */
 static void draw_image(int px, int py, int pw, int ph, unsigned bg)
@@ -989,6 +1045,53 @@ static int inl_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 	return 0;
 }
 
+/* Decoded-PNG cache: an inline PNG would otherwise re-inflate on every scroll
+ * frame (SVGs are raw RGBA and blit directly). Each PNG's full RGBA is decoded
+ * once, keyed by its session-unique uid, then scaled-blitted thereafter. Bounded
+ * by slot count + a per-image pixel cap; cleared when the active page changes or a
+ * new page loads. Main-thread-only (render owns it). */
+#define IMGC_N 6
+#define IMGC_MAX_PX (1024u * 1024u)        /* don't cache images bigger than this */
+struct imgc_ent { int uid; unsigned iw, ih; unsigned char *rgba; };
+static struct imgc_ent g_imgc[IMGC_N];
+static struct page    *g_imgc_pg;
+
+static void imgc_clear(void)
+{
+	for (int i = 0; i < IMGC_N; i++) { free(g_imgc[i].rgba); g_imgc[i].rgba = 0; g_imgc[i].uid = 0; }
+}
+
+struct imgc_fill { unsigned char *buf; unsigned iw, ih; };
+static int imgc_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
+{
+	struct imgc_fill *d = c;
+	if (y < d->ih) { unsigned n = (w < d->iw ? w : d->iw) * 4; memcpy(d->buf + (unsigned long)y * d->iw * 4, rgba, n); }
+	return 0;
+}
+
+/* Full decoded RGBA for inline PNG `im` (decoding + caching on first use), or NULL
+ * if it can't be decoded / is too large — the caller then streams it once. */
+static const unsigned char *imgc_get(struct inl_img *im)
+{
+	if (g_imgc_pg != B->pg) { imgc_clear(); g_imgc_pg = B->pg; }
+	if (!im->uid || !im->iw || !im->ih) return 0;
+	for (int i = 0; i < IMGC_N; i++)
+		if (g_imgc[i].uid == im->uid && g_imgc[i].rgba) return g_imgc[i].rgba;
+	if ((unsigned long)im->iw * im->ih > IMGC_MAX_PX) return 0;
+	unsigned char *buf = malloc((unsigned long)im->iw * im->ih * 4);
+	if (!buf) return 0;
+	memset(buf, 0, (unsigned long)im->iw * im->ih * 4);
+	struct poolrd r = { 0, im->coff, im->clen };
+	struct imgc_fill f = { buf, im->iw, im->ih };
+	if (upng_decode(poolrd_get, &r, imgc_row, &f, 0, 0) != 0) { free(buf); return 0; }
+	int slot = -1;
+	for (int i = 0; i < IMGC_N; i++) if (!g_imgc[i].rgba) { slot = i; break; }
+	static int rr = 0;
+	if (slot < 0) { slot = rr; rr = (rr + 1) % IMGC_N; free(g_imgc[slot].rgba); }
+	g_imgc[slot].uid = im->uid; g_imgc[slot].iw = im->iw; g_imgc[slot].ih = im->ih; g_imgc[slot].rgba = buf;
+	return buf;
+}
+
 static void draw_inline_image(struct inl_img *im, int py, int phh, int paw)
 {
 	if (paw < 1) paw = 1;
@@ -996,22 +1099,19 @@ static void draw_inline_image(struct inl_img *im, int py, int phh, int paw)
 	img_disp_size(im, paw, &dw, &dh);
 	if (dw < 1) dw = 1;
 	if (dh < 1) dh = 1;
+	int x0 = 4, y0 = py + (im->start_row - B->pg->scroll) * LINE_H, ct = py, cb = py + phh;
 
-	struct inlblit v;
-	v.x0 = 4;
-	v.y0 = py + (im->start_row - B->scroll) * LINE_H;
-	v.dw = dw; v.dh = dh; v.clip_top = py; v.clip_bot = py + phh;
-	v.iw = im->iw; v.ih = im->ih; v.next_r = 0;
-
-	if (im->is_argb) {                 /* SVG: raw RGBA in img_pool, scaled blit */
-		const unsigned char *src = B->img_pool + im->coff;
+	/* One scaled blit from a full RGBA source: SVGs live raw in img_pool; PNGs come
+	 * from the decode cache (decoded once, not per frame). */
+	const unsigned char *src = im->is_argb ? (B->img_pool + im->coff) : imgc_get(im);
+	if (src) {
 		unsigned *fb = win_fb();
 		for (int ry = 0; ry < dh; ry++) {
-			int dy = v.y0 + ry;
-			if (dy < v.clip_top || dy >= v.clip_bot) continue;
+			int dy = y0 + ry;
+			if (dy < ct || dy >= cb) continue;
 			unsigned sy = (unsigned)ry * im->ih / (unsigned)dh;
 			const unsigned char *srow = src + (unsigned long)sy * im->iw * 4;
-			unsigned *drow = fb + (unsigned long)dy * BW + v.x0;
+			unsigned *drow = fb + (unsigned long)dy * BW + x0;
 			for (int x = 0; x < dw; x++) {
 				const unsigned char *p = srow + ((unsigned)x * im->iw / (unsigned)dw) * 4;
 				drow[x] = blend_px(p, drow[x]);
@@ -1019,7 +1119,8 @@ static void draw_inline_image(struct inl_img *im, int py, int phh, int paw)
 		}
 		return;
 	}
-
+	/* Fallback (image too large to cache / decode failed): stream it once. */
+	struct inlblit v = { x0, y0, dw, dh, ct, cb, im->iw, im->ih, 0 };
 	struct poolrd r = { 0, im->coff, im->clen };
 	upng_decode(poolrd_get, &r, inl_row, &v, 0, 0);
 }
@@ -1027,7 +1128,7 @@ static void draw_inline_image(struct inl_img *im, int py, int phh, int paw)
 /* A placeholder box for an image that couldn't be fetched/decoded. */
 static void draw_alt_box(struct inl_img *im, int py, int phh)
 {
-	int y0 = py + (im->start_row - B->scroll) * LINE_H;
+	int y0 = py + (im->start_row - B->pg->scroll) * LINE_H;
 	if (y0 < py || y0 + LINE_H > py + phh) return;         /* keep it in-pane    */
 	const char *t = im->alt[0] ? im->alt : "[image]";
 	int w = gfx_ui_width(t) + 8;
@@ -1058,30 +1159,49 @@ static void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
 	if (cur_bcenter) {                             /* text-align:center         */
 		int lw = 0, p = off, end = off + len;
 		unsigned cp;
-		while (p < end) { p += utf8_decode(&B->text[p], &B->text[end], &cp); lw += body_cp_adv(cp); }
+		while (p < end) { p += utf8_decode(&B->pg->text[p], &B->pg->text[end], &cp); lw += body_cp_adv(cp); }
 		int room = (paw - cur_bindent * INDENT_PX) - lw;
 		if (room > 0) x += room / 2;
 	}
+	int x0 = x;                                    /* line content origin (for selection) */
 
 	int i = 0;
 	while (i < len) {
-		unsigned char a = B->attr[off + i];
+		unsigned char a  = B->pg->attr[off + i];
+		unsigned      fg = B->pg->fg[off + i];
+		unsigned      bgc = B->pg->bg[off + i];
 		char run[260]; int rl = 0;
-		/* Accumulate whole codepoints (a multibyte char's bytes share one attr),
-		 * so the run boundary never splits a UTF-8 sequence into garbage. */
-		while (i < len && B->attr[off + i] == a) {
-			int nb = utf8_seqlen((unsigned char)B->text[off + i]);
+		/* Accumulate whole codepoints sharing one (attr,fg,bg) so a colour change
+		 * starts a new run; never split a UTF-8 sequence into garbage. */
+		while (i < len && B->pg->attr[off + i] == a &&
+		       B->pg->fg[off + i] == fg && B->pg->bg[off + i] == bgc) {
+			int nb = utf8_seqlen((unsigned char)B->pg->text[off + i]);
 			if (i + nb > len) nb = 1;
 			if (rl + nb > (int)sizeof run - 1) break;
-			for (int b = 0; b < nb; b++) run[rl++] = B->text[off + i++];
+			for (int b = 0; b < nb; b++) run[rl++] = B->pg->text[off + i++];
 		}
 		run[rl] = '\0';
-		unsigned col = palette[a & ST_COLOR];
-		body_draw(x, y, run, col, ct, cb);
-		if (a & ST_BOLD) body_draw(x + 1, y, run, col, ct, cb);
 		int rw = body_width(run);
-		if (a & ST_UNDER) gfx_fill_rect(x, y + LINE_H - 4, rw, 1, col);
+		if (bgc != BG_NONE) gfx_fill_rect(x, y, rw, LINE_H, bgc);
+		body_draw(x, y, run, fg, ct, cb);
+		if (a & ST_BOLD) body_draw(x + 1, y, run, fg, ct, cb);
+		if (a & ST_UNDER) gfx_fill_rect(x, y + LINE_H - 4, rw, 1, fg);
 		x += rw;
+	}
+
+	/* Text selection: tint the selected byte span [s,e) of this display line. */
+	int l0, c0, l1, c1;
+	if (gfx_sel_range(&g_sel, &l0, &c0, &l1, &c1) && idx >= l0 && idx <= l1) {
+		int s = (idx == l0) ? c0 : 0, e = (idx == l1) ? c1 : len;
+		if (s < 0) s = 0;
+		if (e > len) e = len;
+		if (e > s) {
+			int xs = x0, xe; unsigned cp;
+			for (int p = off; p < off + s; ) { p += utf8_decode(&B->pg->text[p], &B->pg->text[off + len], &cp); xs += body_cp_adv(cp); }
+			xe = xs;
+			for (int p = off + s; p < off + e; ) { p += utf8_decode(&B->pg->text[p], &B->pg->text[off + len], &cp); xe += body_cp_adv(cp); }
+			sel_hl_rect(xs, y, xe - xs, LINE_H);
+		}
 	}
 }
 
@@ -1155,6 +1275,8 @@ static char hover_url[URL_MAX];
 /* Last pointer Y (from WEV_MOVE/clicks), so the wheel scrolls whichever surface
  * it's over: the devtools dock when the pointer is inside it, else the page. */
 static int last_my = -1;
+static int last_mx = -1;
+static int dt_resizing = 0;          /* dragging the devtools panel's resize edge */
 
 /* Set when only the address-bar chrome changed (a URL-field keystroke): the main
  * loop then repaints just that strip instead of re-wrapping and re-blitting the
@@ -1186,10 +1308,43 @@ static void fit_ui(char *dst, int cap, const char *src, int maxpx)
 	sapp(dst, &n, cap, "...");
 }
 
+/* Paint visible block-box backgrounds and borders from the box tree's resolved
+ * geometry. Called with blk_lock held, after the pane is cleared and rewrap()
+ * laid out the tree, before the text lines are drawn. Boxes are in pre-order, so
+ * a child paints over its parent. Box `y` is document px (row*LINE_H). */
+static void paint_boxes(int py, int pw, int phh)
+{
+	if (!g_box_layout || B->nlines == 0) return;
+	int n; struct lbox *bx = layout_pool(&n);
+	int top_doc = B->pg->scroll * LINE_H;
+	for (int i = 0; i < n; i++) {
+		struct lbox *b = &bx[i];
+		int has_bg = b->bg != BG_NONE;
+		int has_bd = b->border_color != BG_NONE &&
+		             (b->border.t || b->border.r || b->border.b || b->border.l);
+		if (!has_bg && !has_bd) continue;
+		int sy = py + b->y - top_doc;          /* box top, screen y */
+		int by = sy, bh = b->h;
+		if (by < py) { bh -= py - by; by = py; }
+		if (by + bh > py + phh) bh = py + phh - by;
+		if (bh <= 0) continue;
+		if (has_bg) gfx_fill_rect(b->x, by, b->w, bh, b->bg);
+		if (has_bd) {                          /* 4 edges, clipped to the visible band */
+			unsigned c = b->border_color;
+			if (b->border.t && sy >= py && sy < py + phh)
+				gfx_fill_rect(b->x, sy, b->w, b->border.t, c);
+			int bot = sy + b->h - b->border.b;
+			if (b->border.b && bot >= py && bot < py + phh)
+				gfx_fill_rect(b->x, bot, b->w, b->border.b, c);
+			if (b->border.l) gfx_fill_rect(b->x, by, b->border.l, bh, c);
+			if (b->border.r) gfx_fill_rect(b->x + b->w - b->border.r, by, b->border.r, bh, c);
+		}
+	}
+}
+
 static void render(void)
 {
-	unsigned bg = 0xf4f5f7;
-
+	unsigned bg = B->pg->page_bg;
 	/* Hold off any buffer-relocating realloc on the worker thread while we read
 	 * text/attr/line_off/img_pool/imgs/raw below (see blk_lock in browser.h).
 	 * render() does only in-memory gfx work — no syscalls that block — so the
@@ -1202,7 +1357,7 @@ static void render(void)
 	const unsigned *icons[MAX_TABS];
 	for (int i = 0; i < n_tabs; i++) {
 		labels[i] = tabs[i].label[0] ? tabs[i].label : "New Tab";
-		icons[i]  = tabs[i].favicon_ok ? tabs[i].favicon : 0;
+		icons[i]  = tabs[i].page.favicon_ok ? tabs[i].page.favicon : 0;
 	}
 	tabbar_draw(0, MENU_H, BW, labels, icons, n_tabs, active_tab);
 
@@ -1220,13 +1375,14 @@ static void render(void)
 	reload_btn_draw(&rrl);
 	textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
 
-	/* content pane */
-	int py = MENU_H + TAB_H + ADDR_H, pw = BW - SCROLL_W;
+	/* content pane — shrinks to the left of the devtools dock when it is open */
+	int right = devtools_visible() ? devtools_left() : BW;
+	int py = MENU_H + TAB_H + ADDR_H, pw = right - SCROLL_W;
 	int phh = BH - MENU_H - TAB_H - ADDR_H; if (phh < 0) phh = 0;
 	gfx_fill_rect(0, py, pw, phh, bg);
 	int rows = phh / LINE_H;
 
-	if (B->mode == MODE_IMAGE) {
+	if (B->pg->mode == MODE_IMAGE) {
 		if (B->loading)
 			gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
 		else
@@ -1235,6 +1391,7 @@ static void render(void)
 	} else {
 		int paw = pw - 8;                          /* content width, px */
 		rewrap(paw);
+		paint_boxes(py, pw, phh);                  /* block backgrounds behind the text */
 		if (B->loading && B->nlines == 0) {
 			gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
 		} else if (B->nlines == 0) {
@@ -1243,18 +1400,18 @@ static void render(void)
 			            0x9098a0);
 		}
 		for (int r = 0; r < rows; r++) {
-			int idx = B->scroll + r;
+			int idx = B->pg->scroll + r;
 			if (idx >= B->nlines) break;
-			draw_styled_line(4, py + r * LINE_H, idx, paw, py, py + phh);
+			draw_styled_line(B->line_x[idx], py + r * LINE_H, idx, B->line_w[idx], py, py + phh);
 		}
 
 		/* inline images, over their reserved (blank) rows */
-		for (int q = 0; q < B->n_imgs; q++) {
-			struct inl_img *im = &B->imgs[q];
+		for (int q = 0; q < B->pg->n_imgs; q++) {
+			struct inl_img *im = &B->pg->imgs[q];
 			if (im->start_row < 0) continue;
 			int r0 = im->start_row;
 			int r1 = r0 + (im->rows > 0 ? im->rows : 1);
-			if (r1 <= B->scroll || r0 >= B->scroll + rows) continue;  /* off-screen */
+			if (r1 <= B->pg->scroll || r0 >= B->pg->scroll + rows) continue;  /* off-screen */
 			/* On-screen now: a deferred loading="lazy" image gets flagged so the
 			 * worker fetches it (no-op once fetched). */
 			if (im->lazy && !im->fetched && show_images) im->want = 1;
@@ -1263,7 +1420,7 @@ static void render(void)
 		}
 
 		/* scrollbar */
-		scrollbar_draw(pw, py, SCROLL_W, phh, B->scroll, B->nlines, rows);
+		scrollbar_draw(pw, py, SCROLL_W, phh, B->pg->scroll, B->nlines, rows);
 	}
 
 	/* Hovered-link status: a small flat box pinned to the content pane's bottom-
@@ -1273,7 +1430,7 @@ static void render(void)
 		int sy0 = MENU_H + TAB_H + ADDR_H;
 		int sh = UIFONT_H + 6;
 		int by = BH - sh; if (by < sy0) by = sy0;
-		int maxw = BW - 2;
+		int maxw = (devtools_visible() ? devtools_left() : BW) - 2;
 		char shown[URL_MAX];
 		fit_ui(shown, sizeof shown, hover_url, maxw - 12);
 		int sw = gfx_ui_width(shown) + 12; if (sw > maxw) sw = maxw;
@@ -1282,14 +1439,15 @@ static void render(void)
 		gfx_ui_text(6, by + 3, shown, 0xe8eaee);
 	}
 
-	/* Developer tools overlay (F12 / Ctrl+Shift+I): a bottom dock drawn over the
-	 * page but under the menu dropdowns. A no-op when closed. */
+	/* Developer tools (F12 / Ctrl+Shift+I): a right-side dock beside the page
+	 * content (drawn after the page, before the menu dropdowns). No-op when closed. */
 	devtools_render();
 
 	/* App menu bar over the top, then the dropdowns last so they overlay the page.
 	 * "Stop" is only meaningful while a fetch is in flight, so disable it when
 	 * idle — the widget dims it and ignores clicks/accelerators. */
 	page_flags[2] = is_loading() ? 0 : MENU_DISABLED;
+	edit_flags[0] = gfx_sel_has(&g_sel) ? 0 : MENU_DISABLED;   /* Copy: only with a selection */
 	gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
 	menubar_draw(&menubar);
 
@@ -1343,7 +1501,7 @@ static void scroll_set(int target)
 	int max = scroll_max();
 	if (target > max) target = max;
 	if (target < 0) target = 0;
-	if (target != B->scroll) { B->scroll = target; B->seq++; }
+	if (target != B->pg->scroll) { B->pg->scroll = target; B->seq++; }
 }
 
 static void navigate(const char *url)
@@ -1369,7 +1527,7 @@ static void submit(void)
  * blank tab, matching Page>Reload. */
 static void do_reload(void)
 {
-	if (B->cur_url[0]) navigate(B->cur_url);
+	if (B->pg->cur_url[0]) navigate(B->pg->cur_url);
 }
 
 /* Stop the in-flight load: drop the queued request and signal the worker to bail
@@ -1406,51 +1564,60 @@ static void show_blank(void)
 {
 	B->drop_dom = 1; B->events_live = 0;
 	textfield_set(&B->addr_tf, "");
-	B->cur_url[0] = '\0'; B->doc_title[0] = '\0';
-	B->mode = MODE_HTML;
-	B->text_len = 0; B->nlines = 0; B->n_imgs = 0; B->nlinks = 0;
+	B->pg->cur_url[0] = '\0'; B->pg->doc_title[0] = '\0';
+	B->pg->mode = MODE_HTML;
+	B->pg->text_len = 0; B->nlines = 0; B->pg->n_imgs = 0; B->pg->nlinks = 0;
+	B->pg->page_bg = 0xffffff; B->pg->page_fg = 0x202830;   /* default canvas, not the last page's */
+	B->img_pool_len = 0;
 	B->wrap_seq = 0xFFFFFFFF;
-	B->favicon_ok = 0;                          /* a blank tab shows the globe */
-	tabs[active_tab].favicon_ok = 0;
+	B->pg->favicon_ok = 0;                          /* a blank tab shows the globe */
 	B->seq++;
 }
 
-/* Pull the freshly-loaded page's url + a label back into the active tab (called
- * when a fetch finishes — only the active tab ever loads). */
+/* Pull the freshly-loaded page's url + a label into the active tab (called when a
+ * fetch finishes — only the active tab ever loads). The favicon already lives in
+ * the page, so the tab strip reads it from tabs[i].page directly. */
 static void tab_sync_active(void)
 {
 	struct tab *t = &tabs[active_tab];
-	copy_str(t->url, B->cur_url, sizeof t->url);
-	if (B->doc_title[0]) {
-		copy_str(t->label, B->doc_title, sizeof t->label);
+	copy_str(t->url, B->pg->cur_url, sizeof t->url);
+	if (B->pg->doc_title[0]) {
+		copy_str(t->label, B->pg->doc_title, sizeof t->label);
 	} else {
 		struct purl u;
-		if (B->cur_url[0] && parse_url(B->cur_url, &u))
+		if (B->pg->cur_url[0] && parse_url(B->pg->cur_url, &u))
 			copy_str(t->label, u.host, sizeof t->label);
 		else
 			copy_str(t->label, "Untitled", sizeof t->label);
 	}
-	memcpy(t->favicon, B->favicon, sizeof t->favicon);   /* freshly decoded icon */
-	t->favicon_ok = B->favicon_ok;
 }
 
-/* Reveal tab `i`: restore its cached page instantly, else (re)load or blank. */
+/* Reveal tab `i`: point B at its page (instant, no copy), bring its images back
+ * into the shared scratch, and repaint. The page is static (its live DOM was
+ * dropped when it was last left); a tab interrupted mid-load (no rendered text)
+ * is re-fetched. */
 static void reveal_tab(int i)
 {
-	B->scroll = tabs[i].scroll;
+	B->pg = &tabs[i].page;                   /* the swap — buffers already live here */
 	devtools_view_load(&tabs[i].dt);         /* this tab's devtools view; drops old capture */
-	if (tabs[i].cached)        tab_restore(i);
-	else if (tabs[i].url[0])   navigate(tabs[i].url);
-	else                       show_blank();
+	page_restore_images(&tabs[i].page);
+	B->events_live = 0;                      /* revealed page has no live DOM        */
+	B->loading = 0; B->req_pending = 0;
+	B->wrap_seq = 0xFFFFFFFFu;               /* force a re-wrap at the live width     */
+	textfield_set(&B->addr_tf, tabs[i].url[0] ? tabs[i].url : tabs[i].page.cur_url);
+	update_title(B->win_id);
+	B->seq++;
+	if (tabs[i].page.text_len == 0 && tabs[i].url[0]) navigate(tabs[i].url);
 }
 
-/* Make tab `i` the active one. The page we're leaving is snapshotted so coming
- * back is instant; the one we're entering is restored from its snapshot (no
- * network) when present, or loaded as before. */
+/* Make tab `i` the active one. Switching is a pointer swap: the page we leave
+ * stays put in its tab (DOM dropped, images saved); the one we enter is revealed
+ * from its own buffers with no network. */
 static void select_tab(int i)
 {
 	if (i < 0 || i >= n_tabs || i == active_tab) return;
-	tab_cache_active(active_tab);            /* remember where we were */
+	load_quiesce();                          /* worker idle before we move B->pg     */
+	tab_leave(active_tab);
 	active_tab = i;
 	reveal_tab(i);
 }
@@ -1458,19 +1625,20 @@ static void select_tab(int i)
 static void new_tab(void)
 {
 	if (n_tabs >= MAX_TABS) { B->seq++; return; }
-	tab_cache_active(active_tab);
+	load_quiesce();
+	tab_leave(active_tab);
 	active_tab = n_tabs++;
-	tabs[active_tab].url[0] = '\0';
-	tabs[active_tab].scroll = 0;
-	tabs[active_tab].cached = 0;
-	tabs[active_tab].blob = 0;
-	tabs[active_tab].blob_len = 0;
-	tabs[active_tab].hist_n = 0; tabs[active_tab].hist_i = 0;   /* fresh history */
-	for (int k = 0; k < HIST_MAX; k++) tabs[active_tab].hist[k] = 0;
-	tabs[active_tab].dt.open = 0; tabs[active_tab].dt.tab = 0;  /* devtools closed   */
-	for (int k = 0; k < DT_PANELS; k++) tabs[active_tab].dt.scroll[k] = 0;
-	devtools_view_load(&tabs[active_tab].dt);
-	copy_str(tabs[active_tab].label, "New Tab", sizeof tabs[active_tab].label);
+	struct tab *t = &tabs[active_tab];
+	page_free(&t->page);                     /* recycle the slot: free any stale page, zero it */
+	devtools_view_free(&t->dt);              /* and any stale devtools capture */
+	t->url[0] = '\0';
+	t->hist_n = 0; t->hist_i = 0;
+	for (int k = 0; k < HIST_MAX; k++) t->hist[k] = 0;
+	t->dt.open = 0; t->dt.tab = 0;           /* devtools closed   */
+	for (int k = 0; k < DT_PANELS; k++) t->dt.scroll[k] = 0;
+	B->pg = &t->page;                        /* swap to the fresh page */
+	devtools_view_load(&t->dt);
+	copy_str(t->label, "New Tab", sizeof t->label);
 	show_blank();
 }
 
@@ -1478,22 +1646,19 @@ static void close_tab(int i)
 {
 	if (i < 0 || i >= n_tabs || n_tabs <= 1) return;   /* keep at least one */
 	int was_active = (i == active_tab);
-	if (was_active) do_stop();    /* only the active tab loads: cancel its fetch */
-	tab_drop(&tabs[i]);                           /* free its snapshot first */
-	hist_clear(&tabs[i]);                         /* and its history strings  */
-	for (int j = i; j < n_tabs - 1; j++) {       /* shift the rest down a slot */
-		char *d = (char *)&tabs[j], *s = (char *)&tabs[j + 1];
-		for (int k = 0; k < (int)sizeof(struct tab); k++) d[k] = s[k];
-	}
-	tabs[n_tabs - 1].blob = 0;                    /* vacated slot now aliases the */
-	tabs[n_tabs - 1].cached = 0;                  /* moved blob — drop the alias  */
-	for (int k = 0; k < HIST_MAX; k++) tabs[n_tabs - 1].hist[k] = 0;  /* + history */
-	tabs[n_tabs - 1].hist_n = 0; tabs[n_tabs - 1].hist_i = 0;
+	if (was_active) load_quiesce();    /* only the active tab loads: stop its fetch first */
+	if (was_active) devtools_reset_live();   /* its live devtools capture isn't in .cap */
+	page_free(&tabs[i].page);                     /* free its page buffers   */
+	devtools_view_free(&tabs[i].dt);              /* and its devtools capture */
+	hist_clear(&tabs[i]);                         /* and its history strings */
+	for (int j = i; j < n_tabs - 1; j++)         /* shift the rest down a slot (moves pages) */
+		memcpy(&tabs[j], &tabs[j + 1], sizeof(struct tab));
+	memset(&tabs[n_tabs - 1], 0, sizeof(struct tab));   /* vacated slot: drop the aliases */
 	n_tabs--;
-	if (active_tab > i)          active_tab--;
+	if (active_tab > i)            active_tab--;
 	else if (active_tab >= n_tabs) active_tab = n_tabs - 1;
-	if (was_active)                                   /* reveal the neighbour */
-		reveal_tab(active_tab);
+	B->pg = &tabs[active_tab].page;               /* tabs moved: repoint at the active page */
+	if (was_active) reveal_tab(active_tab);       /* reveal the neighbour */
 	B->seq++;
 }
 
@@ -1510,6 +1675,9 @@ static void menu_action(struct menu *m, int item)
 		case 1: navigate("example.com"); break;  /* Home                    */
 		case 2: do_stop(); break;                /* Stop the in-flight load */
 		}
+	} else if (m == &editmenu) {
+		if (item == 0) copy_selection();         /* Copy                    */
+		else if (item == 1) select_all();        /* Select All              */
 	} else if (m == &viewmenu) {
 		if (item == 0) {                         /* Show Images checkbox    */
 			view_flags[0] ^= MENU_CHECKED;
@@ -1520,8 +1688,8 @@ static void menu_action(struct menu *m, int item)
 		switch (item) {
 		case 0: scroll_set(0); break;                    /* Top      */
 		case 1: scroll_set(B->nlines - rows); break;     /* Bottom   */
-		case 2: scroll_set(B->scroll - rows); break;     /* Page Up  */
-		case 3: scroll_set(B->scroll + rows); break;     /* Page Down */
+		case 2: scroll_set(B->pg->scroll - rows); break;     /* Page Up  */
+		case 3: scroll_set(B->pg->scroll + rows); break;     /* Page Down */
 		}
 	}
 }
@@ -1531,37 +1699,102 @@ static void menu_action(struct menu *m, int item)
  * copies the absolute href of any <a> covering it into `url` ("" if none). Holds
  * blk_lock across the walk + resolve, since the worker can move the text/line/
  * link tables with a realloc mid-load. Shared by the click and hover handlers. */
-static void pane_hit(int mx, int my, int *off, char *url, int cap)
+static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
 {
 	*off = -1;
 	if (cap) url[0] = '\0';
+	if (newtab) *newtab = 0;
 	int py, phh, rows;
 	pane_metrics(&py, &phh, &rows);
 	if (my < py || my >= py + phh) return;
-	int row = B->scroll + (my - py) / LINE_H;
+	int row = B->pg->scroll + (my - py) / LINE_H;
 	blk_lock();
 	if (row >= 0 && row < B->nlines) {
 		/* proportional: walk the line's glyphs to find which char the point
 		 * (mx, relative to the 4px left margin) falls on. */
-		int len = B->line_len[row], px = mx - 4, acc = 0, col = -1;
+		int len = B->line_len[row], px = mx - B->line_x[row], acc = 0, col = -1;
 		int base = B->line_off[row];
 		for (int k = 0; k < len; ) {
 			unsigned cp;
-			int nb = utf8_decode(&B->text[base + k], &B->text[base + len], &cp);
+			int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
 			int cw = body_cp_adv(cp);
 			if (px < acc + cw) { col = k; break; }
 			acc += cw; k += nb;
 		}
-		if (col >= 0) {
-			*off = base + col;
-			for (int i = 0; i < B->nlinks; i++)
-				if (*off >= B->links[i].start && *off < B->links[i].end) {
-					resolve_url(B->cur_url, B->links[i].href, url, cap);
-					break;
-				}
+		if (col >= 0) *off = base + col;
+	}
+	/* An inline image (incl. inline <svg>) occupies its own blank reserved row, so
+	 * the glyph walk above finds no column there — map a click on the image to its
+	 * anchor offset, so an <a> wrapping the image resolves to that link. */
+	if (*off < 0) {
+		for (int i = 0; i < B->pg->n_imgs; i++) {
+			struct inl_img *im = &B->pg->imgs[i];
+			if (im->start_row < 0) continue;
+			int r1 = im->start_row + (im->rows > 0 ? im->rows : 1);
+			if (row >= im->start_row && row < r1) { *off = im->text_pos; break; }
 		}
 	}
+	if (*off >= 0) {
+		for (int i = 0; i < B->pg->nlinks; i++)
+			if (*off >= B->pg->links[i].start && *off < B->pg->links[i].end) {
+				resolve_url(B->pg->cur_url, B->pg->links[i].href, url, cap);
+				if (newtab) *newtab = B->pg->links[i].newtab;
+				break;
+			}
+	}
 	blk_unlock();
+}
+
+/* Map a pane pixel to (display line, byte offset within that line), clamped so a
+ * drag past the text edge selects to the line/end. Used for text selection. */
+static void pane_linecol(int mx, int my, int *line, int *col)
+{
+	int py, phh, rows;
+	pane_metrics(&py, &phh, &rows);
+	int row = B->pg->scroll + (my - py) / LINE_H;
+	if (row < 0) row = 0;
+	if (row >= B->nlines) row = B->nlines > 0 ? B->nlines - 1 : 0;
+	*line = row;
+	*col = 0;
+	if (row >= B->nlines) return;
+	int len = B->line_len[row], base = B->line_off[row];
+	set_block(base);
+	int x = B->line_x[row] + cur_bindent * INDENT_PX;
+	if (cur_bcenter) {                                   /* match draw_styled_line */
+		int lw = 0; unsigned cp;
+		for (int p = base; p < base + len; ) { p += utf8_decode(&B->pg->text[p], &B->pg->text[base + len], &cp); lw += body_cp_adv(cp); }
+		int paw = B->line_w[row];
+		int room = (paw - cur_bindent * INDENT_PX) - lw;
+		if (room > 0) x += room / 2;
+	}
+	int c = len;                                         /* default: end of line */
+	for (int k = 0; k < len; ) {
+		unsigned cp;
+		int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
+		int cw = body_cp_adv(cp);
+		if (mx < x + cw / 2) { c = k; break; }           /* nearest char edge */
+		x += cw; k += nb;
+	}
+	*col = c;
+}
+
+/* Alpha-blend a translucent selection highlight over the frame buffer rect. */
+static void sel_hl_rect(int x, int y, int w, int h)
+{
+	unsigned *fb = win_fb();
+	const unsigned sr = 0x33, sg = 0x66, sb = 0xcc, a = 110, ia = 255 - a;  /* ~43% blue */
+	for (int yy = y; yy < y + h; yy++) {
+		if (yy < 0 || yy >= BH) continue;
+		unsigned *row = fb + (unsigned long)yy * BW;
+		for (int xx = x; xx < x + w; xx++) {
+			if (xx < 0 || xx >= BW) continue;
+			unsigned d = row[xx];
+			unsigned r = (sr * a + ((d >> 16) & 0xff) * ia) / 255;
+			unsigned g = (sg * a + ((d >> 8) & 0xff) * ia) / 255;
+			unsigned b = (sb * a + (d & 0xff) * ia) / 255;
+			row[xx] = (r << 16) | (g << 8) | b;
+		}
+	}
 }
 
 static void handle_click(int mx, int my)
@@ -1610,17 +1843,20 @@ static void handle_click(int mx, int my)
 	int sbpart = scrollbar_hit(BW - SCROLL_W, py, SCROLL_W, phh, mx, my);
 	if (sbpart != SCROLLBAR_NONE) {                          /* scrollbar */
 		int target;
-		if (sbpart == SCROLLBAR_UP)        target = B->scroll - 3;
-		else if (sbpart == SCROLLBAR_DOWN) target = B->scroll + 3;
+		if (sbpart == SCROLLBAR_UP)        target = B->pg->scroll - 3;
+		else if (sbpart == SCROLLBAR_DOWN) target = B->pg->scroll + 3;
 		else target = scrollbar_pos(BW - SCROLL_W, py, SCROLL_W, phh, mx, my,
-		                            B->scroll, B->nlines, rows);
+		                            B->pg->scroll, B->nlines, rows);
 		scroll_set(target);
 		return;
 	}
 	if (my >= py && my < py + phh) {                        /* content pane click */
 		char res[URL_MAX];
-		int off;
-		pane_hit(mx, my, &off, res, sizeof res);
+		int off, nt = 0;
+		pane_hit(mx, my, &off, res, sizeof res, &nt);
+		/* A press clears any previous selection. */
+		if (gfx_sel_has(&g_sel)) { gfx_sel_clear(&g_sel); B->seq++; }
+		g_selecting = 0;
 		/* If the page registered JS listeners, hand the click to the worker to
 		 * dispatch through the live DOM (it follows the link `res` afterwards
 		 * unless a handler calls preventDefault). Otherwise take the fast path and
@@ -1634,22 +1870,112 @@ static void handle_click(int mx, int my)
 			B->evt_pending = 1; B->seq++;
 			return;
 		}
-		if (res[0]) { navigate(res); return; }
+		if (res[0]) {
+			if (nt) new_tab();        /* target="_blank": open + switch to a new tab */
+			navigate(res);
+			return;
+		}
+		/* Plain text (no link): begin a selection; a following drag extends it. */
+		int line, col;
+		pane_linecol(mx, my, &line, &col);
+		gfx_sel_start(&g_sel, line, col);
+		g_selecting = 1;
 	}
+}
+
+/* All cursor-shape changes funnel through here so the per-element hover shape and
+ * the loading spinner share one source of truth; a syscall fires only on a real
+ * change (the WM applies w->cursor across the whole client area, so the app must
+ * re-pick the shape per pointer position to get element-specific cursors). */
+static int cur_cursor = WIN_CURSOR_ARROW;
+static void set_cursor(int id, int shape)
+{
+	if (shape != cur_cursor) { win_cursor(id, shape); cur_cursor = shape; }
+}
+
+static int in_rect(int mx, int my, const struct rect *r)
+{ return mx >= r->x && mx < r->x + r->w && my >= r->y && my < r->y + r->h; }
+
+/* Pick the cursor for the element under (mx,my): I-beam in the address field,
+ * hand over links and the clickable chrome (nav buttons, tab strip), else arrow. */
+static int cursor_for(int mx, int my, const char *link)
+{
+	if (mx < 0) return WIN_CURSOR_ARROW;
+	if (my >= MENU_H && my < MENU_H + TAB_H) return WIN_CURSOR_HAND;   /* tab strip */
+	if (my >= MENU_H + TAB_H && my < MENU_H + TAB_H + ADDR_H) {        /* address bar */
+		struct rect rb, rf, rrl, rtf;
+		addr_layout(&rb, &rf, &rrl, &rtf);
+		if (in_rect(mx, my, &rtf)) return WIN_CURSOR_TEXT;
+		if (in_rect(mx, my, &rb) || in_rect(mx, my, &rf) || in_rect(mx, my, &rrl))
+			return WIN_CURSOR_HAND;
+		return WIN_CURSOR_ARROW;
+	}
+	/* Content pane: I-beam over selectable text, hand over a link, arrow on the
+	 * scrollbar. */
+	if (mx >= (devtools_visible() ? devtools_left() : BW) - SCROLL_W) return WIN_CURSOR_ARROW;
+	return link[0] ? WIN_CURSOR_HAND : WIN_CURSOR_TEXT;
 }
 
 /* Pointer moved over the content pane with no button held (WEV_MOVE; mx<0 when it
  * left the window): show the hovered link's target in the bottom-left status box,
  * or clear it. Only repaints when the shown URL actually changes. */
 static void handle_move(int mx, int my)
-{
-	char url[URL_MAX];
+{	char url[URL_MAX];
 	int off;
 	last_my = mx < 0 ? -1 : my;         /* track for wheel routing (devtools vs page) */
+	last_mx = mx;
 	if (mx < 0) url[0] = '\0';          /* pointer left the window: clear */
-	else        pane_hit(mx, my, &off, url, sizeof url);
+	else        pane_hit(mx, my, &off, url, sizeof url, 0);
+
+	/* Per-element cursor; the loading spinner (event loop) outranks it. */
+	if (!B->loading) set_cursor(B->win_id, cursor_for(mx, my, url));
+
 	if (streq(url, hover_url)) return;
 	int k = 0; sapp(hover_url, &k, sizeof hover_url, url);
+	B->seq++;
+}
+
+/* Left-button drag in the content pane (WEV_DRAG): extend an in-progress text
+ * selection; otherwise treated as a hover move. */
+static void handle_drag(int mx, int my)
+{
+	if (g_selecting) {
+		int line, col;
+		pane_linecol(mx, my, &line, &col);
+		gfx_sel_extend(&g_sel, line, col);
+		B->seq++;
+		return;
+	}
+	handle_move(mx, my);
+}
+
+/* Copy the current text selection to the clipboard. The display lines are
+ * contiguous in B->pg->text, so the selection is one byte span [a,b) — which
+ * preserves real newlines (wrap points are spaces, not '\n'). */
+static void copy_selection(void)
+{
+	int l0, c0, l1, c1;
+	if (!gfx_sel_range(&g_sel, &l0, &c0, &l1, &c1)) return;
+	blk_lock();
+	char *buf = 0; int n = 0;
+	if (l0 < B->nlines && l1 < B->nlines) {
+		int a = B->line_off[l0] + c0, b = B->line_off[l1] + c1;
+		if (a < 0) a = 0;
+		if (b > B->pg->text_len) b = B->pg->text_len;
+		n = b - a;
+		if (n > 0 && (buf = malloc((unsigned)n + 1))) { memcpy(buf, B->pg->text + a, (unsigned)n); buf[n] = '\0'; }
+	}
+	blk_unlock();
+	if (buf) { clip_put_text(buf, n); free(buf); }
+}
+
+/* Select the whole rendered page (Edit > Select All). */
+static void select_all(void)
+{
+	if (B->nlines <= 0) return;
+	gfx_sel_start(&g_sel, 0, 0);
+	gfx_sel_extend(&g_sel, B->nlines - 1, B->line_len[B->nlines - 1]);
+	g_selecting = 0;
 	B->seq++;
 }
 
@@ -1675,6 +2001,9 @@ static void handle_key(char c, int mods)
 	/* Ctrl+R reloads (the keyboard delivers the unshifted letter + KMOD_CTRL).
 	 * Checked before the address field so it isn't typed into the URL. */
 	if ((mods & KMOD_CTRL) && (c == 'r' || c == 'R')) { do_reload(); return; }
+
+	/* Ctrl+C (delivered as KEY_INTR) copies the text selection when there is one. */
+	if ((unsigned char)c == KEY_INTR && gfx_sel_has(&g_sel)) { copy_selection(); return; }
 
 	/* Menu accelerator (F5 = Reload): fire the item like a click. */
 	struct menu *leaf;
@@ -1712,17 +2041,17 @@ static void handle_key(char c, int mods)
 
 	switch ((unsigned char)c) {
 	case '\n': case '\r': submit(); return;
-	case KEY_UP:   scroll_set(B->scroll - 3); return;
-	case KEY_DOWN: scroll_set(B->scroll + 3); return;
+	case KEY_UP:   scroll_set(B->pg->scroll - 3); return;
+	case KEY_DOWN: scroll_set(B->pg->scroll + 3); return;
 	}
 }
 
 /* The window's owner sets the title once a fetch finishes (worker can't). */
 static void update_title(int id)
 {
-	if (B->doc_title[0]) { win_settitle(id, B->doc_title); return; }
+	if (B->pg->doc_title[0]) { win_settitle(id, B->pg->doc_title); return; }
 	struct purl u;
-	if (parse_url(B->cur_url, &u)) {
+	if (parse_url(B->pg->cur_url, &u)) {
 		char t[80]; int ti = 0;
 		sapp(t, &ti, sizeof t, "browser - ");
 		sapp(t, &ti, sizeof t, u.host);
@@ -1732,22 +2061,25 @@ static void update_title(int id)
 
 int main(int argc, char **argv)
 {
-	const char *start = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : "example.com";
+	const char *start = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : 0;
+	B->pg = &tabs[active_tab].page;          /* point at the first tab's page */
 	int id = win_create(BW, BH, "browser");
 	if (id < 0) { puts("browser: no window\n"); return 1; }
 	B->win_id = id;
 	gfx_init(win_fb(), BW, BH);
+	B->pg->page_bg = 0xffffff; B->pg->page_fg = 0x202830;   /* until a page sets them */
 
 	textfield_init(&B->addr_tf, B->addr, URL_MAX);
-	textfield_set(&B->addr_tf, start);
+	if (start) textfield_set(&B->addr_tf, start);   /* else a blank New Tab (empty bar) */
 	B->wrap_seq = 0xFFFFFFFF;
 
 	jar_load();   /* restore cookies + HSTS from the persistent SQLite db */
 
 	int wtid = thread_create(worker_fn, &worker_stack[sizeof worker_stack]);
 
-	/* Launched with a URL (e.g. `browser http://host/page`): load it at startup. */
-	if (argc > 1 && argv[1] && argv[1][0]) navigate(argv[1]);
+	/* Launched with a URL (e.g. `browser http://host/page`): load it at startup;
+	 * otherwise open on a blank New Tab rather than prefilling a default site. */
+	if (start) navigate(start);
 
 	unsigned last = B->seq - 1;
 	int prev_loading = 0;
@@ -1762,16 +2094,21 @@ int main(int argc, char **argv)
 			} else if (ev.type == WEV_KEY) {
 				handle_key((char)ev.a, ev.b);
 			} else if (ev.type == WEV_MOUSE) {
-				handle_click(ev.a, ev.b);
+				if (devtools_on_splitter(ev.a, ev.b)) { dt_resizing = 1; }   /* start a panel resize */
+				else { dt_resizing = 0; handle_click(ev.a, ev.b); }
+			} else if (ev.type == WEV_DRAG) {
+				if (dt_resizing) devtools_set_width(BW - ev.a);              /* docked right: width = BW - x */
+				else handle_drag(ev.a, ev.b);
 			} else if (ev.type == WEV_MOVE) {
 				handle_move(ev.a, ev.b);
 			} else if (ev.type == WEV_SCROLL) {
 				/* The wheel scrolls whichever surface the pointer is over: the
 				 * devtools dock when inside it, otherwise the page. */
-				if (devtools_visible() && last_my >= devtools_top()) {
+				if (devtools_visible() && last_mx >= devtools_left()
+				    && last_my >= devtools_top()) {
 					devtools_handle_scroll(ev.a);
 				} else {
-					scroll_set(B->scroll - ev.a * 3);  /* wheel up scrolls back */
+					scroll_set(B->pg->scroll - ev.a * 3);  /* wheel up scrolls back */
 				}
 			} else if (ev.type == WEV_RESIZE) {
 				BW = ev.a; BH = ev.b;
@@ -1807,16 +2144,17 @@ int main(int argc, char **argv)
 		B->hist_len = tabs[active_tab].hist_n;
 
 		if (B->loading && !prev_loading)             /* fetch started */
-			win_cursor(id, WIN_CURSOR_BUSY);         /* spinner while loading */
+			set_cursor(id, WIN_CURSOR_BUSY);         /* spinner while loading */
 		if (prev_loading && !B->loading) {           /* fetch finished */
-			win_cursor(id, WIN_CURSOR_ARROW);
+			set_cursor(id, WIN_CURSOR_ARROW);
+			imgc_clear();                            /* drop the old page's decoded images */
 			tab_sync_active();                       /* refresh the tab label */
 			update_title(id);
-			if (B->cur_url[0])                       /* show the resolved URL */
-				textfield_set(&B->addr_tf, B->cur_url);  /* (incl. the scheme) */
+			if (B->pg->cur_url[0])                       /* show the resolved URL */
+				textfield_set(&B->addr_tf, B->pg->cur_url);  /* (incl. the scheme) */
 			/* Record the page we landed on, unless this load was itself a
 			 * Back/Next move (then we only walked the existing history). */
-			if (!nav_from_history) hist_push(&tabs[active_tab], B->cur_url);
+			if (!nav_from_history) hist_push(&tabs[active_tab], B->pg->cur_url);
 			nav_from_history = 0;
 		}
 		prev_loading = B->loading;

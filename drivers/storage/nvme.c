@@ -300,14 +300,10 @@ void nvme_init(void)
 	found = 1;
 	con_write("nvme: namespace 1 ready");
 	if (model[0]) {
-		con_write(" [");
-		con_write(model);
-		con_putc(']');
+		con_printf(" [%s]", model);
 	}
 	if (cap_sectors) {
-		con_write(", ");
-		con_write_dec(cap_sectors / 2048);    /* 512-B blocks -> MiB              */
-		con_write(" MiB");
+		con_printf(", %u MiB", cap_sectors / 2048);    /* 512-B blocks -> MiB              */
 	}
 	con_putc('\n');
 }

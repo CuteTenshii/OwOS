@@ -208,17 +208,15 @@ void isr_handler(struct registers *r)
 	}
 
 	con_set_color(CON_WHITE, CON_RED);
-	con_write("\n*** CPU EXCEPTION: ");
-	con_write(r->int_no < 32 ? exception_messages[r->int_no] : "Unknown");
-	con_write(" ***\n");
+	con_printf("\n*** CPU EXCEPTION: %s ***\n",
+	           r->int_no < 32 ? exception_messages[r->int_no] : "Unknown");
 
-	con_write("  vector="); con_write_hex(r->int_no);
-	con_write("  err=");    con_write_hex(r->err_code);
-	con_write("  eip=");    con_write_hex(r->eip);
+	con_printf("  vector=0x%08X  err=0x%08X  eip=0x%08X",
+	           r->int_no, r->err_code, r->eip);
 
 	if (r->int_no == 14) {         /* page fault: CR2 holds the bad address    */
 		uint32_t cr2 = (uint32_t)read_cr2();
-		con_write("  cr2="); con_write_hex(cr2);
+		con_printf("  cr2=0x%08X", cr2);
 	}
 
 	con_write("\n  system halted.\n");

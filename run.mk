@@ -156,7 +156,7 @@ $(ISO): $(KERNEL)
 	cp $(KERNEL) $(ISODIR)/boot/$(KERNEL)
 	printf 'set timeout=0\nset default=0\ninsmod all_video\nset gfxmode=1920x1080x32,1366x768x32,1280x1024x32,1024x768x32,800x600x32,auto\nmenuentry "OwOS" {\n\tinsmod all_video\n\tmultiboot2 /boot/$(KERNEL) verbose\n\tboot\n}\n' \
 		> $(ISODIR)/boot/grub/grub.cfg
-	grub-mkrescue -o $(ISO) $(ISODIR)
+	$(GRUB_MKRESCUE) -o $(ISO) $(ISODIR)
 
 iso: $(ISO)
 

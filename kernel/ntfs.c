@@ -906,10 +906,9 @@ static int list_cb(void *vctx, const struct index_entry *e)
 
 	if (c->want_idx < 0) {                            /* print mode */
 		con_write(isd ? "  <DIR>  " : "         ");
-		if (!isd) { con_write_dec(fsz); con_write("  "); }
+		if (!isd) { con_printf("%u  ", fsz); }
 		else      { con_write("  "); }
-		con_write(e->name);
-		con_putc('\n');
+		con_printf("%s\n", e->name);
 		return 0;
 	}
 	if (c->seen == c->want_idx) {                     /* index mode */

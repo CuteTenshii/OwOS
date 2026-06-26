@@ -382,27 +382,19 @@ void pci_list(void)
 	con_write("bus:slot.fn vendor:device class description\n");
 	for (int i = 0; i < device_count; i++) {
 		struct pci_device *d = &devices[i];
-		con_put_hex(d->bus, 2);  con_putc(':');
-		con_put_hex(d->slot, 2); con_putc('.');
-		con_put_hex(d->func, 1);
-		con_write("    ");
-		con_put_hex(d->vendor, 4); con_putc(':');
-		con_put_hex(d->device, 4);
-		con_write("   ");
-		con_put_hex(d->class_code, 2);
-		con_put_hex(d->subclass, 2);
-		con_write("  ");
+		con_printf("%02x:%02x.%01x    %04x:%04x   %02x%02x  ",
+			   d->bus, d->slot, d->func, d->vendor, d->device,
+			   d->class_code, d->subclass);
 		/* Prefer the exact chip name; otherwise "<Vendor> <class>"; otherwise
 		 * just the class. So a known card reads "Realtek RTL8139 Fast
 		 * Ethernet", an unknown one "Intel Network controller". */
 		const char *model  = device_model(d->vendor, d->device);
 		const char *vendor = vendor_name(d->vendor);
 		if (model) {
-			if (vendor) { con_write(vendor); con_putc(' '); }
+			if (vendor) { con_printf("%s ", vendor); }
 			con_write(model);
 		} else if (vendor) {
-			con_write(vendor); con_putc(' ');
-			con_write(class_name(d->class_code, d->subclass));
+			con_printf("%s %s", vendor, class_name(d->class_code, d->subclass));
 		} else {
 			con_write(class_name(d->class_code, d->subclass));
 		}

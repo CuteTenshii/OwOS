@@ -33,6 +33,8 @@ static js_object *g_module_cache;      /* ES module registry: abs URL -> namespa
 static js_object *g_document_proto;    /* shared by the live doc + DOMParser docs    */
 static js_object *g_response_proto;    /* fetch() Response.prototype                  */
 static js_object *g_ws_proto;          /* WebSocket.prototype                          */
+static js_object *g_xhr_proto;         /* XMLHttpRequest.prototype                     */
+static js_object *g_blob_proto;        /* Blob.prototype                               */
 static js_object *g_websockets;        /* rooted array of live WebSocket wrappers      */
 static js_object *g_abortsignal_proto; /* AbortSignal.prototype                        */
 static js_object *g_abortcontroller_proto; /* AbortController.prototype                */
@@ -606,7 +608,7 @@ static js_value win_queuemicrotask(js_ctx *ctx, js_value t, js_value *args, int 
 
 /* --- Content-Security-Policy hooks ----------------------------------------- *
  * Script execution, fetch()/WebSocket connections and dynamic code generation are
- * gated against the page's policy (B->csp). Violations log to the devtools console
+ * gated against the page's policy (B->pg->csp). Violations log to the devtools console
  * (where CSP reports normally surface). */
 static void js_csp_log(const char *what, const char *url, const char *reason)
 {
@@ -659,30 +661,52 @@ static js_value hdr_has(js_ctx *ctx, js_value t, js_value *args, int argc) {
     js_value v = hdr_get(ctx, t, args, argc);
     return js_bool(v.type == JV_STR);
 }
+static const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap);  /* defined with Blob */
 static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char url[URL_MAX], method[16], req_ctype[64], resp_ctype[160];
-    char *reqbody = 0;
-    int reqlen = 0, status = 0, outlen = 0;
+    char extra_hdrs[1024];
+    const char *reqbody = 0;
+    int reqlen = 0, status = 0, outlen = 0, eh = 0;
     unsigned char *body;
     js_object *resp, *hdrs;
     js_value rv;
     (void)t;
     resolve_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
-    if (B->csp) {                                  /* CSP connect-src */
+    if (B->pg->csp) {                                  /* CSP connect-src */
         char use[URL_MAX], reason[64];
-        if (!csp_check_url(B->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
+        if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
             js_csp_log("connection to", url, reason);
             return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Refused to connect (Content-Security-Policy)"));
         }
         copy_str(url, sizeof url, use);            /* use the upgraded URL */
     }
-    method[0] = '\0'; req_ctype[0] = '\0';
+    method[0] = '\0'; req_ctype[0] = '\0'; extra_hdrs[0] = '\0';
     if (argc >= 2 && A(1).type == JV_OBJ) {
         js_value m = js_get(ctx, A(1), "method");
         js_value b = js_get(ctx, A(1), "body");
         js_value sig = js_get(ctx, A(1), "signal");
+        js_value h = js_get(ctx, A(1), "headers");
         if (m.type == JV_STR) copy_str(method, sizeof method, m.u.str->data);
-        if (b.type == JV_STR) { reqbody = b.u.str->data; reqlen = b.u.str->len; copy_str(req_ctype, sizeof req_ctype, "text/plain;charset=UTF-8"); }
+        (void)js_to_boolean(js_get(ctx, A(1), "keepalive"));   /* sync fetch: inherently satisfied */
+        /* Request headers: a plain { name: value } object (a Headers instance is a
+         * plain object here too). Content-Type folds into the body's ctype slot to
+         * avoid a duplicate header; the rest become a "Name: value\r\n" blob. */
+        if (h.type == JV_OBJ) {
+            pmap *pm = &h.u.obj->props;
+            int i;
+            for (i = 0; i < pm->n; i++) {
+                const char *k = pm->e[i].key;
+                js_value v;
+                if (!k || k[0] == '@' || (pm->e[i].flags & P_ACCESSOR)) continue;
+                v = js_to_string(ctx, js_get(ctx, h, k));
+                if (v.type != JV_STR) continue;
+                if (streq_ci(k, "content-type")) { copy_str(req_ctype, sizeof req_ctype, v.u.str->data); continue; }
+                sapp(extra_hdrs, &eh, sizeof extra_hdrs, k);
+                sapp(extra_hdrs, &eh, sizeof extra_hdrs, ": ");
+                sapp(extra_hdrs, &eh, sizeof extra_hdrs, v.u.str->data);
+                sapp(extra_hdrs, &eh, sizeof extra_hdrs, "\r\n");
+            }
+        }
         /* An already-aborted signal short-circuits before touching the network
          * (the fetch runs synchronously, so this is the only cancellation point). */
         if (sig.type == JV_OBJ && js_to_boolean(js_get(ctx, sig, "aborted"))) {
@@ -691,10 +715,15 @@ static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
                 reason = js_make_error(ctx, ctx->error_proto, "AbortError", "The operation was aborted");
             return js_promise_rejected(ctx, reason);
         }
+        /* Body last, just before the request: body_bytes may hand back a pointer
+         * into a transient string (URLSearchParams), so no JS allocation must run
+         * between here and browser_fetch_url. */
+        if (b.type != JV_UNDEF && b.type != JV_NULL) reqbody = body_bytes(ctx, b, &reqlen, req_ctype, sizeof req_ctype);  /* string/Blob/ArrayBuffer/TypedArray/URLSearchParams */
     }
     body = browser_fetch_url(url, method[0] ? method : "GET",
-                             (const unsigned char *)reqbody, reqlen, reqbody ? req_ctype : 0,
-                             "*/*", &status, resp_ctype, sizeof resp_ctype, &outlen);
+                             (const unsigned char *)reqbody, reqlen, req_ctype[0] ? req_ctype : 0,
+                             "*/*", &status, resp_ctype, sizeof resp_ctype, &outlen,
+                             extra_hdrs[0] ? extra_hdrs : 0);
     if (!body)
         return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Failed to fetch"));
     gc_push_scope();
@@ -879,6 +908,85 @@ static js_value el_get_bounding_rect(js_ctx *ctx, js_value t, js_value *args, in
         gc_pop_scope();
         return js_obj_value(r);
     }
+}
+
+/* ------------------------------------------------------- iframe content --- */
+
+/* Wrap a DOM tree root as a Document object (host = root, root->wrapper = doc),
+ * tracked in g_parsed so page teardown frees it. The document methods are
+ * root-relative, so the returned object answers createElement/getElementsByTagName/
+ * head/body against `root`. Returns js_null on OOM. */
+static js_value wrap_document(js_ctx *ctx, struct dom_node *root) {
+    js_object *doc;
+    js_value dv;
+    if (!root) return js_null();
+    if (g_nparsed >= 64) { dom_free(root); return js_null(); }
+    g_parsed[g_nparsed++] = root;
+    gc_push_scope();
+    doc = (js_object *)gc_keep(js_new_object(ctx, g_document_proto));
+    doc->host = root;
+    root->wrapper = doc;
+    dv = js_obj_value(doc);
+    gc_pop_scope();
+    return dv;
+}
+
+/* A script-created or src-less <iframe> exposes a live, initially-empty document
+ * (#document > html > head + body) so framework shims that inject into
+ * a.contentDocument.head — e.g. the Cloudflare challenge bootstrap — work. The
+ * sub-document is cached on the iframe wrapper (hidden "@cdoc" key) so each access
+ * returns the SAME Document; we never load the frame's src here. */
+static js_value el_content_document(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t), *root, *html, *head, *body;
+    js_value dv;
+    (void)args; (void)argc;
+    if (!n || !streq(n->tag, "iframe") || t.type != JV_OBJ) return js_null();
+    if (js_has_own(t.u.obj, "@cdoc")) return js_get(ctx, t, "@cdoc");
+
+    root = dom_new_element("#document");
+    html = dom_new_element("html");
+    head = dom_new_element("head");
+    body = dom_new_element("body");
+    if (!root || !html || !head || !body) {
+        if (root) dom_free(root);
+        if (html) dom_free(html);
+        if (head) dom_free(head);
+        if (body) dom_free(body);
+        return js_null();
+    }
+    dom_append_child(root, html);
+    dom_append_child(html, head);
+    dom_append_child(html, body);
+
+    dv = wrap_document(ctx, root);                 /* roots `root` in g_parsed */
+    if (dv.type != JV_OBJ) return js_null();
+    js_def(t.u.obj, "@cdoc", dv, P_WRITABLE | P_CONFIGURABLE);
+    return dv;
+}
+
+/* contentWindow: a thin window over the same content document, with the usual
+ * self-referential window/self/document so `a.contentWindow.document` resolves to
+ * the same Document as `a.contentDocument`. Cached on the wrapper ("@cwin"). */
+static js_value el_content_window(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    js_value docv;
+    js_object *fw;
+    js_value wv;
+    (void)args; (void)argc;
+    if (!n || !streq(n->tag, "iframe") || t.type != JV_OBJ) return js_null();
+    if (js_has_own(t.u.obj, "@cwin")) return js_get(ctx, t, "@cwin");
+
+    docv = el_content_document(ctx, t, 0, 0);
+    if (docv.type != JV_OBJ) return js_null();
+    gc_push_scope();
+    fw = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    wv = js_obj_value(fw);
+    js_def(fw, "document", docv, P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
+    js_def(fw, "window", wv, P_WRITABLE | P_CONFIGURABLE);
+    js_def(fw, "self", wv, P_WRITABLE | P_CONFIGURABLE);
+    js_def(t.u.obj, "@cwin", wv, P_WRITABLE | P_CONFIGURABLE);
+    gc_pop_scope();
+    return wv;
 }
 
 /* ------------------------------------------------------- document natives - */
@@ -1292,6 +1400,64 @@ static void fill_url_props(js_ctx *ctx, js_object *o, const char *abs) {
     if (href.b) free(href.b);
     gc_pop_scope();
 }
+
+/* Anchor (and any href-bearing element) URL decomposition: .protocol/.host/
+ * .hostname/.port/.pathname/.search/.hash/.origin, computed from the element's
+ * href resolved against the page URL (read-only — the common DOM use). */
+enum { AURL_PROTOCOL, AURL_HOSTNAME, AURL_PORT, AURL_HOST, AURL_ORIGIN, AURL_PATHNAME, AURL_SEARCH, AURL_HASH };
+static js_value anchor_url_part(js_ctx *ctx, js_value t, int part) {
+    struct dom_node *n = node_of(t);
+    const char *href = n ? dom_get_attr(n, "href") : 0;
+    char abs[URL_MAX];
+    struct purl pu;
+    const char *path_s, *path_e, *query, *frag;
+    char buf[URL_PATH_MAX];
+    unsigned defport;
+    if (!href || !*href) return js_mk_cstring(ctx, "");
+    resolve_url(g_page_url_buf, href, abs, sizeof abs);
+    if (!parse_url(abs, &pu)) return js_mk_cstring(ctx, "");
+    defport = pu.tls ? 443u : 80u;
+    switch (part) {
+        case AURL_PROTOCOL: return js_mk_cstring(ctx, pu.tls ? "https:" : "http:");
+        case AURL_HOSTNAME: return js_mk_cstring(ctx, pu.host);
+        case AURL_PORT: {
+            char p[12];
+            if ((unsigned)pu.port == defport) return js_mk_cstring(ctx, "");
+            uint_to_str(p, (unsigned)pu.port); return js_mk_cstring(ctx, p);
+        }
+        case AURL_HOST: {
+            char host[URL_HOST_MAX + 8];
+            copy_str(host, sizeof host, pu.host);
+            if ((unsigned)pu.port != defport) { int l = (int)strlen(host); host[l] = ':'; uint_to_str(host + l + 1, (unsigned)pu.port); }
+            return js_mk_cstring(ctx, host);
+        }
+        case AURL_ORIGIN: {
+            char o[URL_HOST_MAX + 24]; int l;
+            copy_str(o, sizeof o, pu.tls ? "https://" : "http://"); l = (int)strlen(o);
+            copy_str(o + l, (int)sizeof o - l, pu.host);
+            if ((unsigned)pu.port != defport) { int m = (int)strlen(o); o[m] = ':'; uint_to_str(o + m + 1, (unsigned)pu.port); }
+            return js_mk_cstring(ctx, o);
+        }
+        default: break;
+    }
+    url_parts(abs, &path_s, &path_e, &query, &frag);
+    if (part == AURL_PATHNAME) { if (path_e > path_s) span_copy(buf, sizeof buf, path_s, path_e); else copy_str(buf, sizeof buf, "/"); }
+    else if (part == AURL_SEARCH) { if (query) span_copy(buf, sizeof buf, query, frag ? frag : query + strlen(query)); else buf[0] = '\0'; }
+    else if (part == AURL_HASH) { if (frag) copy_str(buf, sizeof buf, frag); else buf[0] = '\0'; }
+    else buf[0] = '\0';
+    return js_mk_cstring(ctx, buf);
+}
+#define AURL_ACC(name, code) \
+static js_value el_get_##name(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)args; (void)argc; return anchor_url_part(ctx, t, code); }
+AURL_ACC(protocol, AURL_PROTOCOL)
+AURL_ACC(hostname, AURL_HOSTNAME)
+AURL_ACC(port,     AURL_PORT)
+AURL_ACC(host,     AURL_HOST)
+AURL_ACC(origin,   AURL_ORIGIN)
+AURL_ACC(pathname, AURL_PATHNAME)
+AURL_ACC(search,   AURL_SEARCH)
+AURL_ACC(hash,     AURL_HASH)
+#undef AURL_ACC
 
 static js_value url_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
     char input[URL_MAX], abs[URL_MAX];
@@ -1974,9 +2140,10 @@ static ws_conn *ws_of(js_value t) {
     return (t.type == JV_OBJ) ? (ws_conn *)t.u.obj->host : 0;
 }
 
-/* Fire `type` on a WebSocket wrapper: the on<type> handler property and any
- * addEventListener listeners. For "message", `data` becomes event.data. */
-static void ws_emit(js_object *w, const char *type, js_value data) {
+/* Fire a non-bubbling `type` event on a target object: its on<type> handler
+ * property and any addEventListener listeners. For "message", `data` becomes
+ * event.data. Shared by WebSocket, XMLHttpRequest, AbortSignal. */
+static void emit_event(js_object *w, const char *type, js_value data) {
     js_value ev;
     char on[24];
     gc_push_scope();
@@ -2053,12 +2220,12 @@ static js_value ws_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
     gc_push_scope();
     o = (js_object *)gc_keep(js_new_object(ctx, g_ws_proto));
     int ws_blocked = 0;
-    if (B->csp) {                               /* CSP connect-src (ws->http for matching) */
+    if (B->pg->csp) {                               /* CSP connect-src (ws->http for matching) */
         char norm[URL_MAX], use[URL_MAX], reason[64]; int k = 0; norm[0] = '\0';
         if (starts_ci(url, "wss://"))     { sapp(norm, &k, sizeof norm, "https://"); sapp(norm, &k, sizeof norm, url + 6); }
         else if (starts_ci(url, "ws://")) { sapp(norm, &k, sizeof norm, "http://");  sapp(norm, &k, sizeof norm, url + 5); }
         else                              { sapp(norm, &k, sizeof norm, url); }
-        if (!csp_check_url(B->csp, CSP_CONNECT, norm, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
+        if (!csp_check_url(B->pg->csp, CSP_CONNECT, norm, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
             js_csp_log("WebSocket to", url, reason);
             ws_blocked = 1;
         }
@@ -2103,8 +2270,8 @@ int js_websockets_pump(void) {
             if (js_to_boolean(js_get(g_ctx, wv, "@dead"))) {
                 js_set(g_ctx, wv, "@dead", js_bool(0));
                 js_set(g_ctx, wv, "readyState", js_number(WS_CLOSED));
-                ws_emit(w, "error", js_undef());
-                ws_emit(w, "close", js_undef());
+                emit_event(w, "error", js_undef());
+                emit_event(w, "close", js_undef());
                 fired++;
             }
             continue;
@@ -2113,7 +2280,7 @@ int js_websockets_pump(void) {
         if (!js_to_boolean(js_get(g_ctx, wv, "@open_sent"))) {
             js_set(g_ctx, wv, "@open_sent", js_bool(1));
             js_set(g_ctx, wv, "readyState", js_number(WS_OPEN));
-            ws_emit(w, "open", js_undef());
+            emit_event(w, "open", js_undef());
             fired++;
             c = (ws_conn *)w->host;             /* a handler may have closed it */
             if (!c) continue;
@@ -2124,15 +2291,15 @@ int js_websockets_pump(void) {
             int dlen = 0, is_text = 0, ev;
             ev = ws_poll(c, &data, &dlen, &is_text);
             if (ev == WS_EV_MESSAGE) {
-                ws_emit(w, "message", js_mk_string(g_ctx, (const char *)data, dlen));
+                emit_event(w, "message", js_mk_string(g_ctx, (const char *)data, dlen));
                 fired++;
                 if (w->host != c) break;        /* handler closed it mid-drain */
                 continue;
             }
             if (ev == WS_EV_CLOSE || ev == WS_EV_ERROR) {
-                if (ev == WS_EV_ERROR) ws_emit(w, "error", js_undef());
+                if (ev == WS_EV_ERROR) emit_event(w, "error", js_undef());
                 js_set(g_ctx, wv, "readyState", js_number(WS_CLOSED));
-                ws_emit(w, "close", js_undef());
+                emit_event(w, "close", js_undef());
                 ws_free(c);
                 w->host = 0;
                 fired++;
@@ -2141,6 +2308,327 @@ int js_websockets_pump(void) {
         }
     }
     return fired;
+}
+
+/* ------------------------------------------------------- crypto ----------- *
+ * crypto.getRandomValues / crypto.randomUUID over the shared userspace CSPRNG
+ * (rng_bytes in the libc: RDRAND directly, no kernel trap). */
+
+/* Fill an integer TypedArray's backing bytes in place; returns the same array. */
+static js_value crypto_getrandomvalues(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value v = A(0);
+    js_typedarray *ta;
+    js_arraybuffer *ab;
+    int nbytes;
+    (void)t;
+    if (v.type != JV_OBJ || v.u.obj->kind != OBJ_TYPEDARRAY) return js_throw_type(ctx, "Failed to execute 'getRandomValues': argument is not an integer-typed TypedArray");
+    ta = (js_typedarray *)v.u.obj->host;
+    if (!ta || ta->type < 0 || ta->type == TA_F32 || ta->type == TA_F64)
+        return js_make_error(ctx, ctx->type_error_proto, "TypeMismatchError", "getRandomValues requires an integer-typed TypedArray");
+    nbytes = ta->length * ta_elem_size(ta->type);
+    if (nbytes > 65536) return js_make_error(ctx, ctx->error_proto, "QuotaExceededError", "getRandomValues can only generate a maximum of 65536 bytes");
+    ab = (js_arraybuffer *)ta->buffer->host;
+    if (ab && nbytes > 0) rng_bytes(ab->data + ta->offset, nbytes);
+    return v;
+}
+static js_value crypto_randomuuid(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    unsigned char b[16];
+    char s[37];
+    static const char hx[] = "0123456789abcdef";
+    int i, p = 0;
+    (void)t; (void)args; (void)argc;
+    rng_bytes(b, 16);
+    b[6] = (unsigned char)((b[6] & 0x0f) | 0x40);   /* version 4 */
+    b[8] = (unsigned char)((b[8] & 0x3f) | 0x80);   /* variant 1 */
+    for (i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) s[p++] = '-';
+        s[p++] = hx[b[i] >> 4]; s[p++] = hx[b[i] & 15];
+    }
+    s[p] = '\0';
+    return js_mk_cstring(ctx, s);
+}
+
+/* ------------------------------------------------------- XMLHttpRequest ---- *
+ * The classic XHR transport, over the same synchronous browser_fetch_url path as
+ * fetch() (the engine has no event loop). open() records the verb/URL; each
+ * setRequestHeader() appends to a header blob; send() runs the request to
+ * completion, then walks readyState 1->2->3->4 firing readystatechange + the
+ * load/error/loadend events. So even "async" XHR settles within send(), which
+ * suits a page's settle-immediately expectations here. */
+
+static js_value xhr_open(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    char method[16], url[URL_MAX];
+    if (t.type != JV_OBJ) return js_undef();
+    copy_str(method, sizeof method, arg_str(ctx, A(0)));
+    resolve_url(g_page_url_buf, arg_str(ctx, A(1)), url, sizeof url);
+    js_def(t.u.obj, "@method", js_mk_cstring(ctx, method[0] ? method : "GET"), 0);
+    js_def(t.u.obj, "@url", js_mk_cstring(ctx, url), 0);
+    js_def(t.u.obj, "@hdrs", js_mk_cstring(ctx, ""), 0);
+    js_def(t.u.obj, "@ctype", js_mk_cstring(ctx, ""), 0);
+    js_set(ctx, t, "readyState", js_number(1));            /* OPENED */
+    emit_event(t.u.obj, "readystatechange", js_undef());
+    return js_undef();
+}
+static js_value xhr_setheader(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    const char *name = arg_str(ctx, A(0));
+    char val[1024];
+    if (t.type != JV_OBJ) return js_undef();
+    copy_str(val, sizeof val, arg_str(ctx, A(1)));
+    if (streq_ci(name, "content-type")) { js_def(t.u.obj, "@ctype", js_mk_cstring(ctx, val), 0); return js_undef(); }
+    {   /* append "Name: value\r\n" to the accumulated request-header blob */
+        js_value cur = js_get(ctx, t, "@hdrs");
+        sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
+        if (cur.type == JV_STR) sb_putn(&sb, cur.u.str->data, cur.u.str->len);
+        sb_puts(&sb, name); sb_puts(&sb, ": "); sb_puts(&sb, val); sb_puts(&sb, "\r\n");
+        js_def(t.u.obj, "@hdrs", js_mk_string(ctx, sb.b ? sb.b : "", sb.n), 0);
+        if (sb.b) free(sb.b);
+    }
+    return js_undef();
+}
+static js_value xhr_setrt(js_ctx *ctx, js_value t, int state) {
+    js_set(ctx, t, "readyState", js_number(state));
+    emit_event(t.u.obj, "readystatechange", js_undef());
+    return js_undef();
+}
+static js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    char url[URL_MAX], method[16], req_ctype[160], resp_ctype[160];
+    char *reqbody = 0;
+    int reqlen = 0, status = 0, outlen = 0;
+    unsigned char *body;
+    const char *hdrs;
+    if (t.type != JV_OBJ) return js_undef();
+    copy_str(url, sizeof url, arg_str(ctx, js_get(ctx, t, "@url")));
+    copy_str(method, sizeof method, arg_str(ctx, js_get(ctx, t, "@method")));
+    copy_str(req_ctype, sizeof req_ctype, arg_str(ctx, js_get(ctx, t, "@ctype")));
+    if (B->pg->csp) {                                          /* CSP connect-src */
+        char use[URL_MAX], reason[64];
+        if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
+            js_csp_log("connection to", url, reason);
+            js_set(ctx, t, "status", js_number(0));
+            xhr_setrt(ctx, t, 4);
+            emit_event(t.u.obj, "error", js_undef());
+            emit_event(t.u.obj, "loadend", js_undef());
+            return js_undef();
+        }
+        copy_str(url, sizeof url, use);
+    }
+    if (argc >= 1 && A(0).type == JV_STR) {
+        reqbody = A(0).u.str->data; reqlen = A(0).u.str->len;
+        if (!req_ctype[0]) copy_str(req_ctype, sizeof req_ctype, "text/plain;charset=UTF-8");
+    }
+    { js_value h = js_get(ctx, t, "@hdrs"); hdrs = h.type == JV_STR ? h.u.str->data : 0; }
+    body = browser_fetch_url(url, method[0] ? method : "GET",
+                             (const unsigned char *)reqbody, reqlen, req_ctype[0] ? req_ctype : 0,
+                             "*/*", &status, resp_ctype, sizeof resp_ctype, &outlen,
+                             hdrs && hdrs[0] ? hdrs : 0);
+    gc_push_scope(); gc_keep(t.u.obj);
+    js_def(t.u.obj, "@respctype", js_mk_cstring(ctx, resp_ctype), 0);
+    js_set(ctx, t, "responseURL", js_mk_cstring(ctx, url));
+    if (!body) {                                           /* network error */
+        js_set(ctx, t, "status", js_number(0));
+        xhr_setrt(ctx, t, 4);
+        emit_event(t.u.obj, "error", js_undef());
+        emit_event(t.u.obj, "loadend", js_undef());
+        gc_pop_scope();
+        return js_undef();
+    }
+    {
+        js_value text = js_mk_string(ctx, (const char *)body, outlen);
+        gc_keep(text.u.str);
+        free(body);
+        js_set(ctx, t, "status", js_number(status ? status : 200));
+        js_set(ctx, t, "statusText", js_mk_cstring(ctx, status == 200 ? "OK" : status == 204 ? "No Content" : ""));
+        js_set(ctx, t, "responseText", text);
+        {   /* .response honours responseType: "json" parses, else the text */
+            js_value rt = js_get(ctx, t, "responseType");
+            if (rt.type == JV_STR && streq(rt.u.str->data, "json")) {
+                js_value jsonobj = js_get(ctx, js_obj_value(ctx->global), "JSON");
+                js_value parsefn = js_get(ctx, jsonobj, "parse");
+                js_value parsed = js_is_callable(parsefn) ? js_call(ctx, parsefn, jsonobj, &text, 1) : js_null();
+                if (ctx->has_exc) { ctx->has_exc = 0; ctx->exc_root = 0; parsed = js_null(); }
+                js_set(ctx, t, "response", parsed);
+            } else {
+                js_set(ctx, t, "response", text);
+            }
+        }
+        xhr_setrt(ctx, t, 2);                              /* HEADERS_RECEIVED */
+        xhr_setrt(ctx, t, 3);                              /* LOADING */
+        xhr_setrt(ctx, t, 4);                              /* DONE */
+        emit_event(t.u.obj, "load", js_undef());
+        emit_event(t.u.obj, "loadend", js_undef());
+    }
+    gc_pop_scope();
+    return js_undef();
+}
+static js_value xhr_getheader(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    const char *name = arg_str(ctx, A(0));
+    if (t.type == JV_OBJ && streq_ci(name, "content-type")) {
+        js_value c = js_get(ctx, t, "@respctype");
+        if (c.type == JV_STR && c.u.str->len) return c;
+    }
+    return js_null();
+}
+static js_value xhr_getallheaders(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value c = t.type == JV_OBJ ? js_get(ctx, t, "@respctype") : js_undef();
+    (void)args; (void)argc;
+    if (c.type == JV_STR && c.u.str->len) {
+        sbuf sb; js_value r; sb.b = 0; sb.n = 0; sb.cap = 0;
+        sb_puts(&sb, "content-type: "); sb_putn(&sb, c.u.str->data, c.u.str->len); sb_puts(&sb, "\r\n");
+        r = js_mk_string(ctx, sb.b ? sb.b : "", sb.n); if (sb.b) free(sb.b);
+        return r;
+    }
+    return js_mk_cstring(ctx, "");
+}
+static js_value xhr_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+    js_object *o;
+    js_value ov;
+    (void)thisv; (void)args; (void)argc;
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, g_xhr_proto));
+    js_def(o, "readyState", js_number(0), P_WRITABLE | P_ENUMERABLE);   /* UNSENT */
+    js_def(o, "status", js_number(0), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "statusText", js_mk_cstring(ctx, ""), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "responseText", js_mk_cstring(ctx, ""), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "response", js_mk_cstring(ctx, ""), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "responseType", js_mk_cstring(ctx, ""), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "responseURL", js_mk_cstring(ctx, ""), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "timeout", js_number(0), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "withCredentials", js_bool(0), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "onreadystatechange", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "onload", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "onloadend", js_null(), P_WRITABLE | P_ENUMERABLE);
+    ov = js_obj_value(o);
+    gc_pop_scope();
+    return ov;
+}
+
+/* ------------------------------------------------------- Blob + sendBeacon */
+
+/* Append the raw bytes of one Blob "part" (string, ArrayBuffer, TypedArray, Blob,
+ * else its String() form) to `sb`. */
+static void blob_append_part(js_ctx *ctx, sbuf *sb, js_value v) {
+    if (v.type == JV_STR) { sb_putn(sb, v.u.str->data, v.u.str->len); return; }
+    if (v.type == JV_OBJ) {
+        js_object *o = v.u.obj;
+        if (o->proto == g_blob_proto) { js_value b = js_get(ctx, v, "@bytes"); if (b.type == JV_STR) sb_putn(sb, b.u.str->data, b.u.str->len); return; }
+        if (o->kind == OBJ_ARRAYBUFFER && o->host) { js_arraybuffer *ab = (js_arraybuffer *)o->host; sb_putn(sb, (const char *)ab->data, ab->byteLength); return; }
+        if (o->kind == OBJ_TYPEDARRAY && o->host) { js_typedarray *ta = (js_typedarray *)o->host; js_arraybuffer *ab = (js_arraybuffer *)ta->buffer->host; sb_putn(sb, (const char *)ab->data + ta->offset, ta->length * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type)); return; }
+    }
+    { js_value s = js_to_string(ctx, v); if (s.type == JV_STR) sb_putn(sb, s.u.str->data, s.u.str->len); }
+}
+
+/* Make a Blob object holding `data[0..len)` with content type `type`. */
+static js_value make_blob(js_ctx *ctx, const char *data, int len, const char *type) {
+    js_object *o;
+    js_value ov;
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, g_blob_proto));
+    js_def(o, "@bytes", js_mk_string(ctx, data ? data : "", len), 0);
+    js_def(o, "size", js_number(len), P_ENUMERABLE);
+    js_def(o, "type", js_mk_cstring(ctx, type ? type : ""), P_ENUMERABLE);
+    ov = js_obj_value(o);
+    gc_pop_scope();
+    return ov;
+}
+static js_value blob_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+    sbuf sb; js_value parts = A(0), rv; char type[128];
+    (void)thisv;
+    sb.b = 0; sb.n = 0; sb.cap = 0;
+    type[0] = '\0';
+    gc_push_scope();
+    if (parts.type == JV_OBJ) {                            /* an array (or array-like) of parts */
+        unsigned i, n = parts.u.obj->kind == OBJ_ARRAY ? parts.u.obj->elen : js_to_uint32(ctx, js_get(ctx, parts, "length"));
+        for (i = 0; i < n; i++) blob_append_part(ctx, &sb, js_get_index(ctx, parts, i));
+    }
+    if (argc >= 2 && A(1).type == JV_OBJ) { js_value tp = js_get(ctx, A(1), "type"); if (tp.type == JV_STR) copy_str(type, sizeof type, tp.u.str->data); }
+    rv = make_blob(ctx, sb.b ? sb.b : "", sb.n, type);
+    if (sb.b) free(sb.b);
+    gc_pop_scope();
+    return rv;
+}
+static js_value blob_text(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)args; (void)argc;
+    return js_promise_resolved(ctx, js_get(ctx, t, "@bytes"));
+}
+static js_value blob_arraybuffer(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value b = js_get(ctx, t, "@bytes"), u8ctor, lenarg, view, buf;
+    int i, len;
+    (void)args; (void)argc;
+    if (b.type != JV_STR) return js_promise_resolved(ctx, js_undef());
+    len = b.u.str->len;
+    gc_push_scope(); gc_keep(b.u.str);
+    u8ctor = js_get(ctx, js_obj_value(ctx->global), "Uint8Array");
+    lenarg = js_number(len);
+    view = js_construct(ctx, u8ctor, &lenarg, 1);          /* a fresh Uint8Array(len) */
+    if (view.type == JV_OBJ) { gc_keep(view.u.obj); for (i = 0; i < len; i++) js_set_index(ctx, view, (unsigned)i, js_number((unsigned char)b.u.str->data[i])); }
+    buf = js_get(ctx, view, "buffer");
+    gc_pop_scope();
+    return js_promise_resolved(ctx, buf);
+}
+static js_value blob_slice(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value b = js_get(ctx, t, "@bytes");
+    int len = b.type == JV_STR ? b.u.str->len : 0;
+    int s = argc > 0 && A(0).type != JV_UNDEF ? (int)js_to_number(ctx, A(0)) : 0;
+    int e = argc > 1 && A(1).type != JV_UNDEF ? (int)js_to_number(ctx, A(1)) : len;
+    char type[128]; type[0] = '\0';
+    if (s < 0) s += len;
+    if (s < 0) s = 0;
+    else if (s > len) s = len;
+    if (e < 0) e += len;
+    if (e < 0) e = 0;
+    else if (e > len) e = len;
+    if (e < s) e = s;
+    if (argc > 2 && A(2).type == JV_STR) copy_str(type, sizeof type, A(2).u.str->data);
+    return make_blob(ctx, b.u.str->data + s, e - s, type);
+}
+
+/* Extract the request bytes + a default content-type from a body value (string,
+ * Blob, ArrayBuffer/TypedArray, URLSearchParams). `ctype` is left untouched when
+ * the body implies none. Bytes point into a GC object the caller must keep. */
+static const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap) {
+    if (v.type == JV_STR) { *len = v.u.str->len; if (ctype && !ctype[0]) copy_str(ctype, ctcap, "text/plain;charset=UTF-8"); return v.u.str->data; }
+    if (v.type == JV_OBJ) {
+        js_object *o = v.u.obj;
+        if (o->proto == g_blob_proto) {
+            js_value b = js_get(ctx, v, "@bytes"), tp = js_get(ctx, v, "type");
+            if (ctype && !ctype[0] && tp.type == JV_STR && tp.u.str->len) copy_str(ctype, ctcap, tp.u.str->data);
+            *len = b.type == JV_STR ? b.u.str->len : 0;
+            return b.type == JV_STR ? b.u.str->data : "";
+        }
+        if (o->kind == OBJ_ARRAYBUFFER && o->host) { js_arraybuffer *ab = (js_arraybuffer *)o->host; *len = ab->byteLength; return (const char *)ab->data; }
+        if (o->kind == OBJ_TYPEDARRAY && o->host) { js_typedarray *ta = (js_typedarray *)o->host; js_arraybuffer *ab = (js_arraybuffer *)ta->buffer->host; *len = ta->length * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type); return (const char *)ab->data + ta->offset; }
+        if (o->proto == g_sp_proto) { js_value s = sp_tostring(ctx, v, 0, 0); if (ctype && !ctype[0]) copy_str(ctype, ctcap, "application/x-www-form-urlencoded;charset=UTF-8"); *len = s.type == JV_STR ? s.u.str->len : 0; return s.type == JV_STR ? s.u.str->data : ""; }
+    }
+    *len = 0;
+    return "";
+}
+
+/* navigator.sendBeacon(url, data) -> boolean. A fire-and-forget POST (the
+ * response is discarded). Runs synchronously on the worker like fetch/XHR. */
+static js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    char url[URL_MAX], ctype[160];
+    const char *body;
+    int len = 0, status = 0, outlen = 0;
+    unsigned char *resp;
+    js_value data = A(1);
+    (void)t;
+    if (argc < 1) return js_bool(0);
+    resolve_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
+    if (B->pg->csp) {
+        char use[URL_MAX], reason[64];
+        if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) { js_csp_log("beacon to", url, reason); return js_bool(0); }
+        copy_str(url, sizeof url, use);
+    }
+    ctype[0] = '\0';
+    gc_push_scope();
+    if (data.type == JV_OBJ) gc_keep(data.u.obj); else if (data.type == JV_STR) gc_keep(data.u.str);
+    body = (argc >= 2 && data.type != JV_UNDEF && data.type != JV_NULL) ? body_bytes(ctx, data, &len, ctype, sizeof ctype) : "";
+    resp = browser_fetch_url(url, "POST", (const unsigned char *)body, len, ctype[0] ? ctype : 0,
+                             "*/*", &status, 0, 0, &outlen, 0);
+    gc_pop_scope();
+    if (resp) free(resp);
+    return js_bool(resp != 0);                             /* queued (sent) */
 }
 
 static void setup_dom(js_ctx *ctx, const char *page_url) {
@@ -2157,6 +2645,8 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     g_document_proto = js_new_object(ctx, ctx->object_proto);
     g_response_proto = js_new_object(ctx, ctx->object_proto);
     g_ws_proto = js_new_object(ctx, ctx->object_proto);
+    g_xhr_proto = js_new_object(ctx, ctx->object_proto);
+    g_blob_proto = js_new_object(ctx, ctx->object_proto);
     g_abortsignal_proto = js_new_object(ctx, ctx->object_proto);
     g_abortcontroller_proto = js_new_object(ctx, ctx->object_proto);
     g_document = js_new_object(ctx, g_document_proto);
@@ -2176,6 +2666,8 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     gc_add_root((void **)&g_document_proto);
     gc_add_root((void **)&g_response_proto);
     gc_add_root((void **)&g_ws_proto);
+    gc_add_root((void **)&g_xhr_proto);
+    gc_add_root((void **)&g_blob_proto);
     gc_add_root((void **)&g_abortsignal_proto);
     gc_add_root((void **)&g_abortcontroller_proto);
     gc_add_root((void **)&g_document);
@@ -2227,6 +2719,17 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_acc(g_element_proto, "childNodes", el_children, 0);
     def_acc(g_element_proto, "src", el_get_src, el_set_src);
     def_acc(g_element_proto, "href", el_get_href, el_set_href);
+    /* HTMLAnchorElement/HTMLAreaElement URL decomposition (read-only) */
+    def_acc(g_element_proto, "protocol", el_get_protocol, 0);
+    def_acc(g_element_proto, "host",     el_get_host, 0);
+    def_acc(g_element_proto, "hostname", el_get_hostname, 0);
+    def_acc(g_element_proto, "port",     el_get_port, 0);
+    def_acc(g_element_proto, "pathname", el_get_pathname, 0);
+    def_acc(g_element_proto, "search",   el_get_search, 0);
+    def_acc(g_element_proto, "hash",     el_get_hash, 0);
+    def_acc(g_element_proto, "origin",   el_get_origin, 0);
+    def_acc(g_element_proto, "contentDocument", el_content_document, 0);
+    def_acc(g_element_proto, "contentWindow", el_content_window, 0);
     def_acc(g_element_proto, "style", el_get_style, 0);
     def_acc(g_element_proto, "dataset", el_get_dataset, 0);
     def_acc(g_element_proto, "offsetWidth",  el_offsetWidth, 0);
@@ -2279,6 +2782,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     js_def(g_document, "visibilityState", js_mk_cstring(ctx, "visible"), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
     js_def(g_document, "hidden", js_bool(0), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
     js_def(g_document, "currentScript", js_null(), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
+    js_def(g_document, "referrer", js_mk_cstring(ctx, B->referrer), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
     def_method(g_document, "hasFocus", el_true, 0);
 
     /* window / globals */
@@ -2328,7 +2832,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         js_def(nav, "webdriver", js_bool(0), P_ENUMERABLE);
         def_method(nav, "javaEnabled", nav_false, 0);
         def_method(nav, "taintEnabled", nav_false, 0);
-        def_method(nav, "sendBeacon", nav_false, 2);
+        def_method(nav, "sendBeacon", nav_sendbeacon, 2);
         def_method(nav, "vibrate", nav_false, 1);
         {
             js_object *conn = js_new_object(ctx, ctx->object_proto);   /* NetworkInformation */
@@ -2341,6 +2845,16 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
             js_def(nav, "connection", js_obj_value(conn), P_ENUMERABLE);
         }
         js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+    /* crypto: getRandomValues (RDRAND-backed) + randomUUID. window.crypto and the
+     * bare `crypto` global resolve to the same object (window IS the global). */
+    {
+        js_object *cr = js_new_object(ctx, ctx->object_proto);
+        gc_push_scope(); gc_keep(cr);
+        def_method(cr, "getRandomValues", crypto_getrandomvalues, 1);
+        def_method(cr, "randomUUID", crypto_randomuuid, 0);
+        js_def(win, "crypto", js_obj_value(cr), P_WRITABLE | P_CONFIGURABLE);
         gc_pop_scope();
     }
     /* URL + URLSearchParams (WHATWG Web APIs over curl/url.h) */
@@ -2428,6 +2942,49 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         js_def(wc, "CLOSING", js_number(WS_CLOSING), P_ENUMERABLE);
         js_def(wc, "CLOSED", js_number(WS_CLOSED), P_ENUMERABLE);
         js_def(win, "WebSocket", js_obj_value(wc), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+
+    /* XMLHttpRequest (synchronous transport over browser_fetch_url) */
+    def_method(g_xhr_proto, "open", xhr_open, 2);
+    def_method(g_xhr_proto, "setRequestHeader", xhr_setheader, 2);
+    def_method(g_xhr_proto, "send", xhr_send, 1);
+    def_method(g_xhr_proto, "abort", el_noop, 0);
+    def_method(g_xhr_proto, "overrideMimeType", el_noop, 1);
+    def_method(g_xhr_proto, "getResponseHeader", xhr_getheader, 1);
+    def_method(g_xhr_proto, "getAllResponseHeaders", xhr_getallheaders, 0);
+    def_method(g_xhr_proto, "addEventListener", el_add_listener, 3);
+    def_method(g_xhr_proto, "removeEventListener", el_remove_listener, 3);
+    def_method(g_xhr_proto, "dispatchEvent", el_dispatch, 1);
+    js_def(g_xhr_proto, "UNSENT", js_number(0), P_ENUMERABLE);
+    js_def(g_xhr_proto, "OPENED", js_number(1), P_ENUMERABLE);
+    js_def(g_xhr_proto, "HEADERS_RECEIVED", js_number(2), P_ENUMERABLE);
+    js_def(g_xhr_proto, "LOADING", js_number(3), P_ENUMERABLE);
+    js_def(g_xhr_proto, "DONE", js_number(4), P_ENUMERABLE);
+    {
+        js_object *xc = js_new_native(ctx, xhr_ctor, "XMLHttpRequest", 0);
+        gc_push_scope(); gc_keep(xc);
+        js_def(xc, "prototype", js_obj_value(g_xhr_proto), 0);
+        js_def(g_xhr_proto, "constructor", js_obj_value(xc), P_WRITABLE | P_CONFIGURABLE);
+        js_def(xc, "UNSENT", js_number(0), P_ENUMERABLE);
+        js_def(xc, "OPENED", js_number(1), P_ENUMERABLE);
+        js_def(xc, "HEADERS_RECEIVED", js_number(2), P_ENUMERABLE);
+        js_def(xc, "LOADING", js_number(3), P_ENUMERABLE);
+        js_def(xc, "DONE", js_number(4), P_ENUMERABLE);
+        js_def(win, "XMLHttpRequest", js_obj_value(xc), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+
+    /* Blob (bytes + type), enough for sendBeacon / fetch bodies */
+    def_method(g_blob_proto, "text", blob_text, 0);
+    def_method(g_blob_proto, "arrayBuffer", blob_arraybuffer, 0);
+    def_method(g_blob_proto, "slice", blob_slice, 2);
+    {
+        js_object *bc = js_new_native(ctx, blob_ctor, "Blob", 1);
+        gc_push_scope(); gc_keep(bc);
+        js_def(bc, "prototype", js_obj_value(g_blob_proto), 0);
+        js_def(g_blob_proto, "constructor", js_obj_value(bc), P_WRITABLE | P_CONFIGURABLE);
+        js_def(win, "Blob", js_obj_value(bc), P_WRITABLE | P_CONFIGURABLE);
         gc_pop_scope();
     }
 
@@ -2660,9 +3217,9 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
         if (src && *src) {
             char abs[URL_MAX];
             resolve_url(page_url, src, abs, sizeof abs);
-            if (B->csp) {                          /* CSP script-src for external scripts */
+            if (B->pg->csp) {                          /* CSP script-src for external scripts */
                 char use[URL_MAX], reason[64];
-                if (!csp_check_url(B->csp, CSP_SCRIPT, abs, page_url, use, sizeof use, reason, sizeof reason)) {
+                if (!csp_check_url(B->pg->csp, CSP_SCRIPT, abs, page_url, use, sizeof use, reason, sizeof reason)) {
                     js_csp_log("the script", abs, reason);
                     body_idx[i] = -2;              /* blocked: skip fetch + execution */
                     continue;
@@ -2694,7 +3251,7 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
 
     /* CSP: without 'unsafe-eval', neutralise the dynamic-code globals so the page's
      * own scripts can't generate code from strings. */
-    if (B->csp && !csp_allows_eval(B->csp)) {
+    if (B->pg->csp && !csp_allows_eval(B->pg->csp)) {
         js_def_native(g_ctx, g_ctx->global, "eval", dyncode_blocked, 1);
         js_def_native(g_ctx, g_ctx->global, "Function", dyncode_blocked, 1);
     }
@@ -2737,9 +3294,9 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
         }
         if (!code) continue;
         if (!*code) { free(code); continue; }
-        if (body_idx[i] < 0 && B->csp) {            /* CSP script-src for inline scripts */
+        if (body_idx[i] < 0 && B->pg->csp) {            /* CSP script-src for inline scripts */
             char reason[64];
-            if (!csp_check_inline(B->csp, CSP_SCRIPT, dom_get_attr(scripts[i], "nonce"),
+            if (!csp_check_inline(B->pg->csp, CSP_SCRIPT, dom_get_attr(scripts[i], "nonce"),
                                   (const unsigned char *)code, (int)strlen(code), reason, sizeof reason)) {
                 js_csp_log("an inline script", g_cur_script, reason);
                 free(code);
@@ -2818,6 +3375,8 @@ void js_page_end(void) {
     gc_remove_root((void **)&g_document_proto);
     gc_remove_root((void **)&g_response_proto);
     gc_remove_root((void **)&g_ws_proto);
+    gc_remove_root((void **)&g_xhr_proto);
+    gc_remove_root((void **)&g_blob_proto);
     gc_remove_root((void **)&g_abortsignal_proto);
     gc_remove_root((void **)&g_abortcontroller_proto);
     gc_remove_root((void **)&g_document);
@@ -2831,6 +3390,8 @@ void js_page_end(void) {
     g_event_proto = g_html_proto = g_custom_elements = g_document = g_live_wrappers = 0;
     g_module_cache = g_document_proto = g_response_proto = 0;
     g_ws_proto = g_websockets = 0;
+    g_xhr_proto = 0;
+    g_blob_proto = 0;
     g_abortsignal_proto = g_abortcontroller_proto = 0;
     g_fetch = 0;
     if (g_ctx) { js_ctx_free(g_ctx); g_ctx = 0; }    /* frees the whole JS heap         */

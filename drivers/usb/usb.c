@@ -325,9 +325,7 @@ static void uhci_enumerate(uint16_t io, uint16_t portsc_off)
 	uint8_t  cls = desc[4];
 	uint8_t  iproduct = desc[15];
 
-	con_write("      ");
-	con_put_hex(vid, 4); con_putc(':'); con_put_hex(pid, 4);
-	con_write("  class "); con_put_hex(cls, 2);
+	con_printf("      %04x:%04x  class %02x", vid, pid, cls);
 	uhci_print_string(io, lowspeed, maxpacket, iproduct);
 	con_putc('\n');
 }
@@ -336,9 +334,7 @@ static void uhci_enumerate(uint16_t io, uint16_t portsc_off)
 static void uhci_probe_port(uint16_t io_base, uint16_t offset, int port)
 {
 	uint16_t status = inw(io_base + offset);
-	con_write("    port ");
-	con_write_dec((uint32_t)port);
-	con_write(": ");
+	con_printf("    port %u: ", (uint32_t)port);
 	if (!(status & UHCI_PORT_CONNECTED)) {
 		con_write("no device\n");
 		return;
@@ -392,15 +388,9 @@ void usb_list(int detail_port)
 					continue;
 
 				found++;
-				con_put_hex(bus, 2);  con_putc(':');
-				con_put_hex(slot, 2); con_putc('.');
-				con_put_hex(f, 1);
-				con_write("  ");
-				con_put_hex(id & 0xFFFF, 4); con_putc(':');
-				con_put_hex((id >> 16) & 0xFFFF, 4);
-				con_write("  ");
-				con_write(controller_type(prog_if));
-				con_putc('\n');
+				con_printf("%02x:%02x.%01x  %04x:%04x  %s\n",
+					   bus, slot, f, id & 0xFFFF,
+					   (id >> 16) & 0xFFFF, controller_type(prog_if));
 
 				if (prog_if == USB_PROGIF_UHCI)
 					uhci_probe(bus, slot, f);

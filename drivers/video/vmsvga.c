@@ -178,10 +178,8 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
 		return -1;
 	}
 
-	con_write("vmsvga: mode ");
-	con_write_dec(want_w); con_putc('x'); con_write_dec(want_h);
-	con_write("x32, pitch="); con_write_dec(pitch);
-	con_write(" fifo="); con_write_dec(fifo_sz >> 10); con_write("KiB.\n");
+	con_printf("vmsvga: mode %ux%ux32, pitch=%u fifo=%uKiB.\n",
+	           want_w, want_h, pitch, fifo_sz >> 10);
 
 	/* Map and initialise the FIFO ring. Device memory: map it uncached so our
 	 * pointer writes reach the host without lingering in a cache line. */

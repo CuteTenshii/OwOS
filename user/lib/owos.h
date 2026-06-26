@@ -2,6 +2,8 @@
 #ifndef OWOS_USER_H
 #define OWOS_USER_H
 
+#include <stdarg.h>
+
 /* Build version: the Makefile passes -DOWOS_VERSION="<git describe>". This is the
  * fallback for an editor/standalone compile with no -D. */
 #ifndef OWOS_VERSION
@@ -106,6 +108,15 @@ void puts(const char *s);                     /* write a NUL-terminated string *
 void print_uint(unsigned v);                  /* write a decimal number        */
 int  readline(char *buf, int max);            /* echoed line input, returns len*/
 
+/* Formatted output. Conversions: %s (NULL -> "(null)"), %c, %d/%i, %u, %x, %X,
+ * %p, %%; with an optional '0' flag and a decimal field width (e.g. %08x, %4u).
+ * No floats, no length modifiers — everything is 32-bit. printf writes to fd 1;
+ * snprintf always NUL-terminates when size > 0 and returns the length that would
+ * have been written (C99), so truncation is detectable. */
+int printf(const char *fmt, ...);
+int snprintf(char *buf, unsigned size, const char *fmt, ...);
+int vsnprintf(char *buf, unsigned size, const char *fmt, va_list ap);
+
 /* ----------------------------------------------------------- windowing API */
 /*
  * A program creates one window, gets a shared client pixel buffer mapped at
@@ -151,6 +162,10 @@ int win_resizable(int id, int on);   /* opt the window in/out of user resizing *
 #define WIN_CURSOR_HAND   1    /* pointing hand — over clickable items */
 #define WIN_CURSOR_TEXT   2    /* I-beam — over editable text          */
 #define WIN_CURSOR_BUSY   3    /* spinner — a slow operation is running */
+#define WIN_CURSOR_RESIZE_NWSE 4 /* ↖↘ diagonal resize (corner)              */
+#define WIN_CURSOR_RESIZE_NESW 5 /* ↗↙ diagonal resize (corner)        */
+#define WIN_CURSOR_RESIZE_NS   6 /* ↕ vertical resize (top/bottom edge) */
+#define WIN_CURSOR_RESIZE_EW   7 /* ↔ horizontal resize (left/right)    */
 int win_cursor(int id, int shape);
 
 /* Wall-clock time, packed as (hour<<16)|(min<<8)|sec. */
@@ -176,6 +191,10 @@ void *malloc(unsigned size);
 void *calloc(unsigned nmemb, unsigned size);
 void *realloc(void *ptr, unsigned size);
 void  free(void *ptr);
+
+/* Fill `buf` with `len` cryptographically-strong random bytes (RDRAND, the CPU
+ * hardware RNG; a clock/TSC mix only on CPUs lacking it). Shared by crypto. */
+void  rng_bytes(void *buf, int len);
 
 /* Directory enumeration: fill *out with the idx-th child of `path`
  * (NULL/""/"/" = root). Returns 1 if it exists, 0 past the end, -1 on error. */

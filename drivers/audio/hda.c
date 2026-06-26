@@ -508,13 +508,8 @@ void hda_init(void)
 	sd_off = SD_BASE + (uint32_t)num_iss * SD_STRIDE;
 
 	present = 1;
-	con_write("hda: HD Audio ready (codec ");
-	con_write_dec(codec);
-	con_write(", dac nid ");
-	con_write_dec(dac_nid);
-	con_write(", pin nid ");
-	con_write_dec(pin_nid);
-	con_write(")\n");
+	con_printf("hda: HD Audio ready (codec %u, dac nid %u, pin nid %u)\n",
+	           codec, dac_nid, pin_nid);
 }
 
 int hda_present(void) { return present; }

@@ -51,8 +51,7 @@
 static void print_hex2(uint8_t v)
 {
 	static const char h[] = "0123456789abcdef";
-	con_putc(h[v >> 4]);
-	con_putc(h[v & 0xF]);
+	con_printf("%c%c", h[v >> 4], h[v & 0xF]);
 }
 
 /* Interrupt-free millisecond delay using PIT channel 2 in one-shot (mode 0),
@@ -492,9 +491,7 @@ static int igb_probe(void)
 	uint32_t mmio_phys = bar0 & ~0xFu;    /* BAR0 is a memory BAR (maybe 64-bit) */
 
 	if (mmio_phys == 0 || mmio_phys == 0xFFFFFFF0) {
-		con_write("net: Intel ");
-		con_write(model_name(device_id));
-		con_write(" BAR0 unassigned; skipping\n");
+		con_printf("net: Intel %s BAR0 unassigned; skipping\n", model_name(device_id));
 		return 0;
 	}
 
@@ -546,18 +543,13 @@ static int igb_probe(void)
 
 	present = 1;
 
-	con_write("net: Intel ");
-	con_write(model_name(device_id));
-	con_write(" at mmio ");
-	con_write_hex(mmio_phys);
-	con_write(" mac ");
+	con_printf("net: Intel %s at mmio 0x%08X mac ", model_name(device_id), mmio_phys);
 	for (int i = 0; i < 6; i++) {
 		print_hex2(mac[i]);
 		if (i < 5)
 			con_putc(':');
 	}
-	con_write(" link ");
-	con_write((reg_read(IGB_STATUS) & STATUS_LU) ? "up\n" : "down (cable?)\n");
+	con_printf(" link %s", (reg_read(IGB_STATUS) & STATUS_LU) ? "up\n" : "down (cable?)\n");
 	return 1;
 }
 

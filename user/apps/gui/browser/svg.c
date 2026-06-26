@@ -2,15 +2,17 @@
  * this walks it, accumulating affine transforms and paint, and rasterizes the
  * shapes into an ARGB bitmap with a scanline polygon filler.
  *
- * Supported: rect, circle, ellipse, line, polyline, polygon, path (M/L/H/V/C/S/
- * Q/T/Z, abs+rel; A and complex grammar omitted); fill (nonzero) + stroke;
- * fill/stroke/style colours (#hex, rgb(), named, none, currentColor); transforms
- * (translate/scale/rotate/matrix); viewBox + width/height with aspect preserved.
- * Not supported: gradients, patterns, filters, text, clipping, arcs. Edges are
+ * Supported: rect (incl. rx/ry rounded corners), circle, ellipse, line, polyline,
+ * polygon, path (M/L/H/V/C/S/Q/T/A/Z, abs+rel); fill (nonzero + evenodd via
+ * fill-rule) + stroke; fill/stroke/style colours (#hex, rgb(), hsl(), oklch(),
+ * named, none, currentColor); transforms (translate/scale/rotate/matrix); viewBox
+ * + width/height with aspect preserved.
+ * Not supported: gradients, patterns, filters, text, clipping. Edges are
  * antialiased by rendering at SS× and box-downsampling. */
 #include "owos.h"
 #include "dom.h"
 #include "svg.h"
+#include "color.h"
 #include "math.h"
 #include "fmt.h"
 
@@ -81,55 +83,21 @@ static float attr_len(const struct dom_node *n, const char *name, float def)
 }
 
 /* ------------------------------------------------ colour ------------------- */
-static int hexnib(char c)
-{
-	if (c >= '0' && c <= '9') return c - '0';
-	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-	return -1;
-}
+/* What `currentColor` resolves to for the SVG currently being rendered; set at
+ * the top of svg_render from its current_color argument (the element's CSS color
+ * for inline <svg>). 0xRRGGBB. */
+static int g_current_color = 0x000000;
 
-/* Returns 0xRRGGBB, -1 for "none", -2 for "not a colour / inherit". */
+/* Returns 0xRRGGBB, -1 for "none"/transparent, -2 for "not a colour / inherit".
+ * Hex/rgb/hsl/named parsing is shared via color.c; only the SVG-specific keywords
+ * (none/transparent/currentColor) are handled here. */
 static int parse_paint(const char *v)
 {
 	while (*v == ' ' || *v == '\t') v++;
-	if (starts_ci(v, "none"))        return -1;
-	if (starts_ci(v, "transparent")) return -1;
-	if (starts_ci(v, "currentColor"))return 0x000000;
-	if (*v == '#') {
-		v++;
-		int d[6], n = 0;
-		while (n < 6 && hexnib(v[n]) >= 0) { d[n] = hexnib(v[n]); n++; }
-		if (n >= 6) return (d[0]*16+d[1])<<16 | (d[2]*16+d[3])<<8 | (d[4]*16+d[5]);
-		if (n >= 3) return (d[0]*17)<<16 | (d[1]*17)<<8 | (d[2]*17);
-		return -2;
-	}
-	if (starts_ci(v, "rgb")) {
-		const char *p = v + 3;
-		if (*p == 'a' || *p == 'A') p++;
-		while (*p == ' ' || *p == '(') p++;
-		int c[3] = { 0, 0, 0 };
-		for (int i = 0; i < 3; i++) {
-			while (*p == ' ') p++;
-			int val = 0, got = 0;
-			while (*p >= '0' && *p <= '9') { val = val*10 + (*p++ - '0'); got = 1; }
-			if (!got) return -2;
-			c[i] = val > 255 ? 255 : val;
-			while (*p == ' ' || *p == ',') p++;
-		}
-		return (c[0]<<16)|(c[1]<<8)|c[2];
-	}
-	static const struct { const char *n; int rgb; } named[] = {
-		{ "black", 0x000000 }, { "white", 0xffffff }, { "red", 0xff0000 },
-		{ "green", 0x008000 }, { "blue", 0x0000ff }, { "yellow", 0xffff00 },
-		{ "gray", 0x808080 }, { "grey", 0x808080 }, { "silver", 0xc0c0c0 },
-		{ "orange", 0xffa500 }, { "purple", 0x800080 }, { "navy", 0x000080 },
-		{ "lime", 0x00ff00 }, { "teal", 0x008080 }, { "aqua", 0x00ffff },
-		{ "cyan", 0x00ffff }, { "magenta", 0xff00ff }, { "maroon", 0x800000 },
-		{ "olive", 0x808000 }, { "pink", 0xffc0cb }, { "gold", 0xffd700 }, { 0, 0 }
-	};
-	for (int i = 0; named[i].n; i++) if (streq_ci(v, named[i].n)) return named[i].rgb;
-	return -2;
+	if (starts_ci(v, "none") || starts_ci(v, "transparent")) return -1;
+	if (starts_ci(v, "currentColor")) return g_current_color;
+	int c = color_parse(v);
+	return c >= 0 ? c : -2;
 }
 
 /* Pull a property out of a style="" string (e.g. "fill:#fff;stroke:none"). */
@@ -154,7 +122,7 @@ static int style_prop(const char *style, const char *prop, char *out, int cap)
 }
 
 /* ------------------------------------------------ paint state -------------- */
-struct paint { int fill; int stroke; float stroke_w; };
+struct paint { int fill; int stroke; float stroke_w; int evenodd; };
 
 /* Resolve an element's paint over the inherited one. */
 static struct paint resolve_paint(const struct dom_node *n, struct paint in)
@@ -169,6 +137,7 @@ static struct paint resolve_paint(const struct dom_node *n, struct paint in)
 		const char *q = v, *e = v + strlen(v); float w;
 		if (parse_num(&q, e, &w)) p.stroke_w = w;
 	}
+	if ((v = dom_get_attr(n, "fill-rule"))) p.evenodd = starts_ci(v, "evenodd");
 	const char *st = dom_get_attr(n, "style");
 	if (st) {
 		if (style_prop(st, "fill", buf, sizeof buf))   { int c = parse_paint(buf); if (c != -2) p.fill = c; }
@@ -177,6 +146,7 @@ static struct paint resolve_paint(const struct dom_node *n, struct paint in)
 			const char *q = buf, *e = buf + strlen(buf); float w;
 			if (parse_num(&q, e, &w)) p.stroke_w = w;
 		}
+		if (style_prop(st, "fill-rule", buf, sizeof buf)) p.evenodd = starts_ci(buf, "evenodd");
 	}
 	return p;
 }
@@ -262,7 +232,7 @@ static unsigned blend(unsigned dst, int rgb)
 }
 
 /* Scanline nonzero fill of the current subpaths in colour `rgb`. */
-static void fill_path(struct ras *r, int rgb)
+static void fill_path(struct ras *r, int rgb, int evenodd)
 {
 	if (r->ns == 0 || rgb < 0) return;
 	float ymin = 1e9f, ymax = -1e9f;
@@ -306,7 +276,8 @@ static void fill_path(struct ras *r, int rgb)
 		int wind = 0;
 		for (int i = 0; i + 1 < nx; i++) {
 			wind += wd[i];
-			if (wind != 0) {
+			int inside = evenodd ? ((i & 1) == 0) : (wind != 0);
+			if (inside) {
 				int xa = (int)(xs[i] + 0.5f), xb = (int)(xs[i+1] + 0.5f);
 				if (xa < 0) xa = 0;
 				if (xb > r->w) xb = r->w;
@@ -350,7 +321,7 @@ static void stroke_path(struct ras *r, int rgb, float w, int closed)
 			ras_begin_sub(r);
 			ras_pt(r, x0 + nx, y0 + ny); ras_pt(r, x1 + nx, y1 + ny);
 			ras_pt(r, x1 - nx, y1 - ny); ras_pt(r, x0 - nx, y0 - ny);
-			fill_path(r, rgb);
+			fill_path(r, rgb, 0);
 		}
 	}
 	free(px); free(py); free(sb);
@@ -405,6 +376,53 @@ static void bez2(struct ras *r, struct mat m, float x0, float y0, float x1, floa
 		float by = u*u*y0 + 2*u*t*y1 + t*t*y2;
 		float dx, dy; mat_apply(m, bx, by, &dx, &dy);
 		ras_pt(r, dx, dy);
+	}
+}
+
+/* Flatten an SVG elliptical arc (endpoint parameterization) from the current
+ * point to (x,y) into line segments. rx/ry radii, phi x-axis rotation (deg),
+ * large/sweep the arc flags. The standard endpoint->center conversion. */
+#define SVG_PI 3.14159265358979f
+static void arc_to(struct ras *r, struct mat m, float x0, float y0,
+                   float rx, float ry, float phi_deg, int large, int sweep,
+                   float x, float y)
+{
+	if (rx == 0 || ry == 0) {            /* degenerate -> straight line */
+		float dx, dy; mat_apply(m, x, y, &dx, &dy); ras_pt(r, dx, dy); return;
+	}
+	if (rx < 0) rx = -rx;
+	if (ry < 0) ry = -ry;
+	float phi = phi_deg * SVG_PI / 180.0f;
+	float cosp = (float)cos(phi), sinp = (float)sin(phi);
+	float dx2 = (x0 - x) * 0.5f, dy2 = (y0 - y) * 0.5f;
+	float x1p =  cosp * dx2 + sinp * dy2;
+	float y1p = -sinp * dx2 + cosp * dy2;
+	float rx2 = rx * rx, ry2 = ry * ry, x1p2 = x1p * x1p, y1p2 = y1p * y1p;
+	float lam = x1p2 / rx2 + y1p2 / ry2;
+	if (lam > 1) { float s = (float)sqrt(lam); rx *= s; ry *= s; rx2 = rx*rx; ry2 = ry*ry; }
+	float num = rx2 * ry2 - rx2 * y1p2 - ry2 * x1p2;
+	float den = rx2 * y1p2 + ry2 * x1p2;
+	float co = (num > 0 && den > 0) ? (float)sqrt(num / den) : 0;
+	if (large == sweep) co = -co;
+	float cxp =  co * (rx * y1p / ry);
+	float cyp = -co * (ry * x1p / rx);
+	float cx = cosp * cxp - sinp * cyp + (x0 + x) * 0.5f;
+	float cy = sinp * cxp + cosp * cyp + (y0 + y) * 0.5f;
+	float ux = (x1p - cxp) / rx, uy = (y1p - cyp) / ry;
+	float vx = (-x1p - cxp) / rx, vy = (-y1p - cyp) / ry;
+	float th1 = (float)atan2(uy, ux);
+	float dth = (float)atan2(vy, vx) - th1;
+	if (!sweep && dth > 0) dth -= 2 * SVG_PI;
+	else if (sweep && dth < 0) dth += 2 * SVG_PI;
+	int N = (int)((dth < 0 ? -dth : dth) / (SVG_PI / 16.0f)) + 2;
+	if (N < 2) N = 2;
+	if (N > 96) N = 96;
+	for (int i = 1; i <= N; i++) {
+		float t = th1 + dth * (float)i / N;
+		float ct = (float)cos(t), st = (float)sin(t);
+		float ex = cx + rx * ct * cosp - ry * st * sinp;
+		float ey = cy + rx * ct * sinp + ry * st * cosp;
+		float dx, dy; mat_apply(m, ex, ey, &dx, &dy); ras_pt(r, dx, dy);
 	}
 }
 
@@ -480,8 +498,15 @@ static void emit_path(struct ras *r, struct mat m, const char *d)
 		} else if (c == 'Z') {
 			cx = sx; cy = sy;
 			prev = cmd;
-		} else if (c == 'A') {                 /* arcs unsupported: skip 7 params */
-			for (int i = 0; i < 7; i++) parse_num(&p, e, &a[0]);
+		} else if (c == 'A') {                 /* elliptical arc */
+			float rx, ry, rot, large, sweep, ex, ey;
+			parse_num(&p,e,&rx); parse_num(&p,e,&ry); parse_num(&p,e,&rot);
+			parse_num(&p,e,&large); parse_num(&p,e,&sweep);
+			parse_num(&p,e,&ex); parse_num(&p,e,&ey);
+			if (rel) { ex += cx; ey += cy; }
+			if (!have_sub) { ras_begin_sub(r); have_sub = 1; }
+			arc_to(r, m, cx, cy, rx, ry, rot, (int)large != 0, (int)sweep != 0, ex, ey);
+			pcx = ex; pcy = ey; cx = ex; cy = ey;
 			prev = cmd;
 		} else {
 			p++;                               /* unknown: advance to avoid stall */
@@ -505,20 +530,39 @@ static void render_node(struct dom_node *n, struct ras *r, struct mat ctm, struc
 			float x = attr_len(c,"x",0), y = attr_len(c,"y",0);
 			float w = attr_len(c,"width",0), h = attr_len(c,"height",0);
 			if (w > 0 && h > 0) {
+				float rx = attr_len(c,"rx",-1), ry = attr_len(c,"ry",-1);
+				if (rx < 0) rx = ry;                 /* one given -> both     */
+				if (ry < 0) ry = rx;
+				if (rx < 0) rx = 0;
+				if (ry < 0) ry = 0;
+				if (rx > w / 2) rx = w / 2;
+				if (ry > h / 2) ry = h / 2;
 				ras_reset(r); ras_begin_sub(r);
-				float dx,dy;
-				mat_apply(m,x,  y,  &dx,&dy); ras_pt(r,dx,dy);
-				mat_apply(m,x+w,y,  &dx,&dy); ras_pt(r,dx,dy);
-				mat_apply(m,x+w,y+h,&dx,&dy); ras_pt(r,dx,dy);
-				mat_apply(m,x,  y+h,&dx,&dy); ras_pt(r,dx,dy);
-				fill_path(r, pp.fill);
+				float dx, dy;
+				if (rx <= 0 || ry <= 0) {            /* sharp corners */
+					mat_apply(m,x,  y,  &dx,&dy); ras_pt(r,dx,dy);
+					mat_apply(m,x+w,y,  &dx,&dy); ras_pt(r,dx,dy);
+					mat_apply(m,x+w,y+h,&dx,&dy); ras_pt(r,dx,dy);
+					mat_apply(m,x,  y+h,&dx,&dy); ras_pt(r,dx,dy);
+				} else {                             /* rounded: sides + corner arcs */
+					mat_apply(m, x+rx, y, &dx,&dy); ras_pt(r,dx,dy);
+					mat_apply(m, x+w-rx, y, &dx,&dy); ras_pt(r,dx,dy);
+					arc_to(r,m, x+w-rx,y, rx,ry,0,0,1, x+w,y+ry);
+					mat_apply(m, x+w, y+h-ry, &dx,&dy); ras_pt(r,dx,dy);
+					arc_to(r,m, x+w,y+h-ry, rx,ry,0,0,1, x+w-rx,y+h);
+					mat_apply(m, x+rx, y+h, &dx,&dy); ras_pt(r,dx,dy);
+					arc_to(r,m, x+rx,y+h, rx,ry,0,0,1, x,y+h-ry);
+					mat_apply(m, x, y+ry, &dx,&dy); ras_pt(r,dx,dy);
+					arc_to(r,m, x,y+ry, rx,ry,0,0,1, x+rx,y);
+				}
+				fill_path(r, pp.fill, pp.evenodd);
 				stroke_path(r, pp.stroke, pp.stroke_w * mat_scale(m), 1);
 			}
 		} else if (streq(tag, "circle")) {
 			float cx = attr_len(c,"cx",0), cy = attr_len(c,"cy",0), rr = attr_len(c,"r",0);
 			if (rr > 0) {
 				emit_ellipse(r, m, cx, cy, rr, rr);
-				fill_path(r, pp.fill);
+				fill_path(r, pp.fill, pp.evenodd);
 				stroke_path(r, pp.stroke, pp.stroke_w * mat_scale(m), 1);
 			}
 		} else if (streq(tag, "ellipse")) {
@@ -526,7 +570,7 @@ static void render_node(struct dom_node *n, struct ras *r, struct mat ctm, struc
 			float rx = attr_len(c,"rx",0), ry = attr_len(c,"ry",0);
 			if (rx > 0 && ry > 0) {
 				emit_ellipse(r, m, cx, cy, rx, ry);
-				fill_path(r, pp.fill);
+				fill_path(r, pp.fill, pp.evenodd);
 				stroke_path(r, pp.stroke, pp.stroke_w * mat_scale(m), 1);
 			}
 		} else if (streq(tag, "line")) {
@@ -542,14 +586,14 @@ static void render_node(struct dom_node *n, struct ras *r, struct mat ctm, struc
 			if (pts) {
 				int poly = streq(tag, "polygon");
 				emit_points(r, m, pts);
-				if (poly) fill_path(r, pp.fill);
+				if (poly) fill_path(r, pp.fill, pp.evenodd);
 				stroke_path(r, pp.stroke, pp.stroke_w * mat_scale(m), poly);
 			}
 		} else if (streq(tag, "path")) {
 			const char *d = dom_get_attr(c, "d");
 			if (d) {
 				emit_path(r, m, d);
-				fill_path(r, pp.fill);
+				fill_path(r, pp.fill, pp.evenodd);
 				stroke_path(r, pp.stroke, pp.stroke_w * mat_scale(m), 0);
 			}
 		}
@@ -602,9 +646,11 @@ int svg_size(const char *data, int len, int *w, int *h)
 	return ok;
 }
 
-int svg_render(const char *data, int len, int w, int h, unsigned *out)
+int svg_render(const char *data, int len, int w, int h, unsigned *out,
+               unsigned current_color)
 {
 	if (w <= 0 || h <= 0 || !out) return 0;
+	g_current_color = (int)(current_color & 0xFFFFFF);
 
 	struct dom_node *root = dom_parse(data, len);
 	if (!root) return 0;
@@ -645,7 +691,9 @@ int svg_render(const char *data, int len, int w, int h, unsigned *out)
 	ctm.a = s; ctm.d = s;
 	ctm.e = ox - vbx * s; ctm.f = oy - vby * s;
 
-	struct paint base = { 0x000000, -1, 1.0f };   /* default fill black, no stroke */
+	/* Default paint is black fill / no stroke, but the root <svg>'s own fill/stroke
+	 * (incl. the CSS values html.c bakes onto it) must inherit to its children. */
+	struct paint base = resolve_paint(svg, (struct paint){ 0x000000, -1, 1.0f, 0 });
 	render_node(svg, &r, ctm, base);
 
 	/* box-downsample SS -> 1, averaging colour and alpha */

@@ -40,38 +40,9 @@
 
 /* ------------------------------------------------------------------ helpers */
 
-static uint32_t rdtsc_mix(void)
-{
-	uint32_t lo, hi;
-	__asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
-	return lo ^ hi;
-}
-
-/* A weak best-effort CSPRNG: hash together the cycle counter, PIT time and the
- * RTC, chained through a counter. Adequate to keep ClientHello.random and the
- * ephemeral key unpredictable on this hobby kernel; not a real entropy source. */
-static void gen_random(uint8_t *out, uint32_t n)
-{
-	static uint32_t ctr;
-	while (n) {
-		struct sha256 s;
-		sha256_init(&s);
-		uint32_t a = timer_us(), b = timer_ticks(), c = rdtsc_mix(), d = ctr++;
-		struct rtc_time t;
-		rtc_now(&t);
-		sha256_update(&s, &a, 4);
-		sha256_update(&s, &b, 4);
-		sha256_update(&s, &c, 4);
-		sha256_update(&s, &d, 4);
-		sha256_update(&s, &t, sizeof t);
-		uint8_t h[32];
-		sha256_final(&s, h);
-		uint32_t take = n < 32 ? n : 32;
-		memcpy(out, h, take);
-		out += take;
-		n -= take;
-	}
-}
+/* ClientHello.random + the ephemeral X25519 key come from the kernel CSPRNG
+ * (crypto.c: RDRAND-backed when the CPU has it). */
+static void gen_random(uint8_t *out, uint32_t n) { rng_bytes(out, n); }
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static void put64be(uint8_t *p, uint64_t v)
@@ -705,8 +676,16 @@ int tls_connect(const uint8_t ip[4], uint16_t port, const char *sni, int offer_h
 			kfree(c);
 			return -1;
 		}
-		if (r < 0 || mt != HS_SERVER_HELLO) {
-			con_write("tls: expected ServerHello\n");
+		if (r < 0) {
+			/* No record came back: peer closed/RST, or tcp_read's idle
+			 * timeout fired before the ServerHello arrived. */
+			con_write("tls: no ServerHello (connection closed or timed out)\n");
+			tcp_close(c->tcp);
+			kfree(c);
+			return -1;
+		}
+		if (mt != HS_SERVER_HELLO) {
+			con_printf("tls: expected ServerHello, got handshake type %u\n", mt);
 			tcp_close(c->tcp);
 			kfree(c);
 			return -1;

@@ -45,14 +45,12 @@ int main(int argc, char **argv)
 
 	int h = net_connect(host, 0, SK_ICMP);
 	if (h < 0) {
-		if (h == -2) { puts("ping: cannot resolve "); puts(host); puts("\n"); }
+		if (h == -2) { printf("ping: cannot resolve %s\n", host); }
 		else         puts("ping: no network device\n");
 		return 1;
 	}
 
-	puts("PING ");
-	puts(host);
-	puts(" : 56 data bytes\n");
+	printf("PING %s : 56 data bytes\n", host);
 
 	int id = (int)(msec() & 0xFFFF);
 	int sent = 0, recv = 0, interrupted = 0;
@@ -86,17 +84,9 @@ int main(int argc, char **argv)
 		if (got) {
 			recv++;
 			unsigned rtt = msec() - t0;
-			puts("64 bytes from ");
-			puts(host);
-			puts(": icmp_seq=");
-			print_uint((unsigned)seq);
-			puts(" time=");
-			print_uint(rtt);
-			puts(" ms\n");
+			printf("64 bytes from %s: icmp_seq=%u time=%u ms\n", host, (unsigned)seq, rtt);
 		} else {
-			puts("request timeout for icmp_seq=");
-			print_uint((unsigned)seq);
-			puts("\n");
+			printf("request timeout for icmp_seq=%u\n", (unsigned)seq);
 		}
 		if (intr_take()) { interrupted = 1; break; }
 		if (count == 0 || seq < count)
@@ -104,12 +94,7 @@ int main(int argc, char **argv)
 	}
 
 	net_close(h);
-	puts("--- ");
-	puts(host);
-	puts(" ping statistics ---\n");
-	print_uint((unsigned)sent);
-	puts(" packets transmitted, ");
-	print_uint((unsigned)recv);
-	puts(" received\n");
+	printf("--- %s ping statistics ---\n", host);
+	printf("%u packets transmitted, %u received\n", (unsigned)sent, (unsigned)recv);
 	return interrupted ? EXIT_SIGINT : (recv > 0 ? 0 : 1);
 }

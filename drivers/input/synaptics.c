@@ -279,6 +279,16 @@ int synaptics_active(void)
 	return active;
 }
 
+/* Move the clamp box after a resolution change (relative motion is scaled into
+ * this box). */
+void synaptics_set_bounds(int max_x, int max_y)
+{
+	bound_x = max_x;
+	bound_y = max_y;
+	if (cur_x > bound_x) cur_x = bound_x;
+	if (cur_y > bound_y) cur_y = bound_y;
+}
+
 const char *synaptics_status(void)
 {
 	return status;

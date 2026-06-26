@@ -327,17 +327,12 @@ void ahci_init(void)
 	found = 1;
 	cap_sectors = identify_drive();
 
-	con_write("ahci: SATA disk on port ");
-	con_write_dec((uint32_t)port);
+	con_printf("ahci: SATA disk on port %u", (uint32_t)port);
 	if (model[0]) {
-		con_write(" [");
-		con_write(model);
-		con_putc(']');
+		con_printf(" [%s]", model);
 	}
 	if (cap_sectors) {
-		con_write(", ");
-		con_write_dec(cap_sectors / 2048);    /* 512-B sectors -> MiB           */
-		con_write(" MiB");
+		con_printf(", %u MiB", cap_sectors / 2048);    /* 512-B sectors -> MiB           */
 	}
 	con_putc('\n');
 }

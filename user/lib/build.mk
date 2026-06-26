@@ -11,7 +11,7 @@
 # user/lib root.
 ULIBDIRS := curl torrent crypto gfx zlib png mp3 sqlite clipboard mime font brotli math gc js websocket
 UCFLAGS  := -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall \
-           -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) \
+           -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
 
 # Base every program links: crt + the syscall/libc lib. GUI (windowed) apps also
@@ -74,3 +74,8 @@ user/lib/lib.o: user/lib/lib.c
 # Everything under user/ (the libs and the apps trees) compiles with UCFLAGS.
 user/%.o: user/%.c
 	$(UCC) $(UCFLAGS) -c $< -o $@
+
+# Header dependencies: -MMD -MP (above) emits a .d beside each .o listing the
+# headers it includes, so editing a header (e.g. browser.h's struct layout)
+# recompiles every .o that includes it — no stale object with a mismatched ABI.
+-include $(shell find user -name '*.d' 2>/dev/null)

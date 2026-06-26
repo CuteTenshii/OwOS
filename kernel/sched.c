@@ -43,7 +43,7 @@
 enum { TASK_FREE = 0, TASK_RUNNABLE, TASK_WAITING, TASK_ZOMBIE };
 
 typedef struct task {
-	uint32_t      esp;         /* saved kernel stack pointer (the context)     */
+	uintptr_t     esp;         /* saved kernel stack pointer (the context)     */
 	uint32_t      cr3;         /* page directory physical address              */
 	uint32_t     *dir;         /* process page dir to free (0 for threads)     */
 	void         *kstack;      /* kernel stack to free (0 for the main task)   */
@@ -104,7 +104,7 @@ static void fds_close_all(task_t *t)
 }
 
 /* From switch.S. */
-extern void context_switch(uint32_t *old_esp, uint32_t new_esp);
+extern void context_switch(uintptr_t *old_esp, uintptr_t new_esp);
 extern void thread_start(void);
 extern void enter_user_task(void);
 extern void fork_child_entry(void);
@@ -202,12 +202,23 @@ void sched_create_thread(const char *name, void (*entry)(void))
 	uint8_t *stack = kmalloc(KSTACK_SIZE);
 	t->intr = 0;
 	t->kstack = stack;
+#ifdef __x86_64__
+	/* context_switch rets into thread_start, which rets into `entry`; when the
+	 * thread body returns it rets into thread_exit. Six zeroed callee slots
+	 * (rbp,rbx,r12-r15) feed context_switch's pop sequence. 8-byte slots. */
+	uint64_t *sp = (uint64_t *)(stack + KSTACK_SIZE);
+	*--sp = (uint64_t)(uintptr_t)thread_exit;
+	*--sp = (uint64_t)(uintptr_t)entry;
+	*--sp = (uint64_t)(uintptr_t)thread_start;
+	for (int i = 0; i < 6; i++) *--sp = 0;
+#else
 	uint32_t *sp = (uint32_t *)(stack + KSTACK_SIZE);
 	*--sp = (uint32_t)thread_exit;
 	*--sp = (uint32_t)entry;
 	*--sp = (uint32_t)thread_start;
 	*--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;   /* ebp,ebx,esi,edi          */
-	t->esp = (uint32_t)sp;
+#endif
+	t->esp = (uintptr_t)sp;
 
 	enqueue(t);
 }
@@ -244,6 +255,16 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
 
 	/* Craft the kernel stack so the first schedule restores it, rets into
 	 * enter_user_task, and irets to ring 3 at `entry`. */
+#ifdef __x86_64__
+	uint64_t *sp = (uint64_t *)(uintptr_t)t->kstack_top;
+	*--sp = 0x23;                   /* user SS                                 */
+	*--sp = user_esp;               /* user RSP (points at argc)               */
+	*--sp = 0x202;                  /* RFLAGS (IF set)                         */
+	*--sp = 0x1B;                   /* user CS (32-bit compat, DPL3)           */
+	*--sp = entry;                  /* user RIP                                */
+	*--sp = (uint64_t)(uintptr_t)enter_user_task;
+	for (int i = 0; i < 6; i++) *--sp = 0;        /* rbp,rbx,r12-r15           */
+#else
 	uint32_t *sp = (uint32_t *)t->kstack_top;
 	*--sp = 0x23;                   /* user SS                                 */
 	*--sp = user_esp;               /* user ESP (points at argc)               */
@@ -252,7 +273,8 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
 	*--sp = entry;                  /* user EIP                                */
 	*--sp = (uint32_t)enter_user_task;
 	*--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;   /* ebp,ebx,esi,edi          */
-	t->esp = (uint32_t)sp;
+#endif
+	t->esp = (uintptr_t)sp;
 
 	enqueue(t);
 	return (int)t->id;
@@ -334,6 +356,16 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
 	t->kstack = kstack;
 	t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
 
+#ifdef __x86_64__
+	uint64_t *sp = (uint64_t *)(uintptr_t)t->kstack_top;
+	*--sp = 0x23;                   /* user SS                                 */
+	*--sp = user_esp;               /* user RSP                                */
+	*--sp = 0x202;                  /* RFLAGS (IF set)                         */
+	*--sp = 0x1B;                   /* user CS (32-bit compat, DPL3)           */
+	*--sp = entry;                  /* user RIP                                */
+	*--sp = (uint64_t)(uintptr_t)enter_user_task;
+	for (int i = 0; i < 6; i++) *--sp = 0;        /* rbp,rbx,r12-r15           */
+#else
 	uint32_t *sp = (uint32_t *)t->kstack_top;
 	*--sp = 0x23;                   /* user SS                                 */
 	*--sp = user_esp;               /* user ESP                                */
@@ -342,7 +374,8 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
 	*--sp = entry;                  /* user EIP                                */
 	*--sp = (uint32_t)enter_user_task;
 	*--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;   /* ebp,ebx,esi,edi          */
-	t->esp = (uint32_t)sp;
+#endif
+	t->esp = (uintptr_t)sp;
 
 	enqueue(t);
 	return (int)t->id;
@@ -399,10 +432,18 @@ int sched_fork(struct registers *r)
 			t->fds[i].type = FD_NONE;      /* a listen port stays single-owner */
 	}
 
-	/* Copy the parent's 16-dword syscall trap frame to the top of the child's
-	 * kernel stack, forcing the child's saved eax (index 8) to 0 so fork()
-	 * returns 0 in the child. Then a context_switch frame that lands in
-	 * fork_child_entry. */
+	/* Copy the parent's syscall trap frame to the top of the child's kernel
+	 * stack, forcing the child's saved eax to 0 so fork() returns 0 in the child.
+	 * Then a context_switch frame that lands in fork_child_entry. */
+#ifdef __x86_64__
+	struct registers *cf =
+		(struct registers *)((uint8_t *)(uintptr_t)t->kstack_top - sizeof *cf);
+	*cf = *r;
+	cf->eax = 0;                    /* rax = 0 in the child                    */
+	uint64_t *sp = (uint64_t *)cf;
+	*--sp = (uint64_t)(uintptr_t)fork_child_entry;
+	for (int i = 0; i < 6; i++) *--sp = 0;        /* rbp,rbx,r12-r15           */
+#else
 	uint32_t *frame = (uint32_t *)t->kstack_top - 16;
 	const uint32_t *src = (const uint32_t *)r;
 	for (int i = 0; i < 16; i++)
@@ -412,7 +453,8 @@ int sched_fork(struct registers *r)
 	uint32_t *sp = frame;
 	*--sp = (uint32_t)fork_child_entry;
 	*--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;   /* ebp,ebx,esi,edi          */
-	t->esp = (uint32_t)sp;
+#endif
+	t->esp = (uintptr_t)sp;
 
 	enqueue(t);
 	return (int)t->id;
@@ -771,12 +813,7 @@ void sched_dump(void)
 	con_write("id  name        runs\n");
 	task_t *t = &main_task;
 	do {
-		con_write_dec(t->id);
-		con_write("   ");
-		con_write(t->name);
-		con_write("\t");
-		con_write_dec(t->runs);
-		con_putc('\n');
+		con_printf("%u   %s\t%u\n", t->id, t->name, t->runs);
 		t = t->next;
 	} while (t != &main_task);
 }

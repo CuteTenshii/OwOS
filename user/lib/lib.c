@@ -726,6 +726,117 @@ void print_uint(unsigned v)
 		write(1, &tmp[i], 1);
 }
 
+/* ----------------------------------------------------------- printf family */
+
+/* A minimal freestanding printf, shared by snprintf and printf — it writes one
+ * byte at a time through `sink` so callers needn't size a buffer. Mirrors the
+ * kernel's kvformat (kstring.c); see owos.h for the supported conversions. */
+static void emit_uint(void (*sink)(char, void *), void *ctx, unsigned v,
+                      unsigned base, int upper, int width, int zero, int neg)
+{
+	const char *digs = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+	char tmp[32];
+	int n = 0;
+	do { tmp[n++] = digs[v % base]; v /= base; } while (v);
+	int total = n + (neg ? 1 : 0);
+	if (zero) {                       /* "-0007": sign, then zero padding */
+		if (neg) sink('-', ctx);
+		for (int pad = width - total; pad > 0; pad--) sink('0', ctx);
+	} else {                          /* "  -7": space padding, then sign */
+		for (int pad = width - total; pad > 0; pad--) sink(' ', ctx);
+		if (neg) sink('-', ctx);
+	}
+	while (n--)
+		sink(tmp[n], ctx);
+}
+
+static void vfmt(void (*sink)(char, void *), void *ctx, const char *fmt, va_list ap)
+{
+	for (; *fmt; fmt++) {
+		if (*fmt != '%') { sink(*fmt, ctx); continue; }
+		fmt++;
+		int zero = 0, width = 0;
+		if (*fmt == '0') { zero = 1; fmt++; }
+		while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+		switch (*fmt) {
+		case 's': {
+			const char *s = va_arg(ap, const char *);
+			if (!s) s = "(null)";
+			while (*s) sink(*s++, ctx);
+			break;
+		}
+		case 'c': sink((char)va_arg(ap, int), ctx); break;
+		case 'd': case 'i': {
+			int v = va_arg(ap, int), neg = v < 0;
+			emit_uint(sink, ctx, neg ? -(unsigned)v : (unsigned)v, 10, 0, width, zero, neg);
+			break;
+		}
+		case 'u': emit_uint(sink, ctx, va_arg(ap, unsigned), 10, 0, width, zero, 0); break;
+		case 'x': emit_uint(sink, ctx, va_arg(ap, unsigned), 16, 0, width, zero, 0); break;
+		case 'X': emit_uint(sink, ctx, va_arg(ap, unsigned), 16, 1, width, zero, 0); break;
+		case 'p':
+			sink('0', ctx); sink('x', ctx);
+			emit_uint(sink, ctx, (unsigned)(__SIZE_TYPE__)va_arg(ap, void *), 16, 0, 8, 1, 0);
+			break;
+		case '%': sink('%', ctx); break;
+		case '\0': return;                      /* trailing '%' — stop */
+		default:  sink('%', ctx); sink(*fmt, ctx); break;
+		}
+	}
+}
+
+/* snprintf sink: write into a buffer, but keep counting past the end so the
+ * return value reports the would-be length (C99). */
+struct fmt_buf { char *p; unsigned len, cap; };
+static void buf_put(char c, void *ctx)
+{
+	struct fmt_buf *b = ctx;
+	if (b->len + 1 < b->cap)          /* leave room for the NUL */
+		b->p[b->len] = c;
+	b->len++;
+}
+
+int vsnprintf(char *buf, unsigned size, const char *fmt, va_list ap)
+{
+	struct fmt_buf b = { buf, 0, size };
+	vfmt(buf_put, &b, fmt, ap);
+	if (size)
+		buf[b.len < size ? b.len : size - 1] = '\0';
+	return (int)b.len;
+}
+
+int snprintf(char *buf, unsigned size, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(buf, size, fmt, ap);
+	va_end(ap);
+	return n;
+}
+
+/* printf sink: accumulate into a buffer and write(1) in chunks, so an arbitrary-
+ * length format costs a handful of syscalls instead of one per character. */
+struct out_buf { char b[256]; int n; int total; };
+static void out_flush(struct out_buf *o) { if (o->n) { write(1, o->b, o->n); o->n = 0; } }
+static void out_put(char c, void *ctx)
+{
+	struct out_buf *o = ctx;
+	o->b[o->n++] = c;
+	o->total++;
+	if (o->n == (int)sizeof o->b) out_flush(o);
+}
+
+int printf(const char *fmt, ...)
+{
+	struct out_buf o = { .n = 0, .total = 0 };
+	va_list ap;
+	va_start(ap, fmt);
+	vfmt(out_put, &o, fmt, ap);
+	va_end(ap);
+	out_flush(&o);
+	return o.total;
+}
+
 int readline(char *buf, int max)
 {
 	int len = 0;
@@ -751,4 +862,67 @@ int readline(char *buf, int max)
 	}
 	buf[len] = '\0';
 	return len;
+}
+
+/* ------------------------------------------------------- randomness ------- *
+ * rng_bytes — the userspace CSPRNG. The real source is the CPU's on-die RNG
+ * (RDRAND, the Intel DRNG), a ring-3 instruction we run directly: no kernel trap,
+ * since the kernel guards no entropy a userspace RDRAND can't reach. Only a CPU
+ * without RDRAND falls back to a clock/TSC-seeded SplitMix64 stream (best-effort,
+ * NOT cryptographic). One source for crypto.getRandomValues, QUIC/TLS, torrent IDs. */
+static int rng_have_rdrand(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		unsigned a, b, c, d;
+		__asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
+		cached = (int)((c >> 30) & 1u);          /* CPUID.01H:ECX.RDRAND[bit 30] */
+	}
+	return cached;
+}
+static int rng_rdrand32(unsigned *out)
+{
+	unsigned char ok = 0;
+	for (int i = 0; i < 10; i++) {               /* retry a momentarily-stalled RDRAND */
+		__asm__ volatile ("rdrand %0; setc %1" : "=r"(*out), "=qm"(ok));
+		if (ok) return 1;
+	}
+	return 0;
+}
+static unsigned long long rng_tsc(void) { unsigned lo, hi; __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi)); return ((unsigned long long)hi << 32) | lo; }
+
+void rng_bytes(void *out, int n)
+{
+	static unsigned long long st;
+	static int seeded;
+	unsigned char *p = (unsigned char *)out;
+	int i = 0;
+	if (n <= 0) return;
+	if (rng_have_rdrand()) {                      /* hardware CSPRNG: the real path */
+		while (i < n) {
+			unsigned r;
+			int k = n - i < 4 ? n - i : 4;
+			if (!rng_rdrand32(&r)) break;          /* persistent stall: finish via fallback */
+			memcpy(p + i, &r, (unsigned)k);
+			i += k;
+		}
+		if (i >= n) return;
+	}
+	if (!seeded) {                                /* fallback seed: every clock + the TSC */
+		unsigned long long s = (unsigned long long)now_ms();
+		s ^= ((unsigned long long)msec() << 21) ^ ((unsigned long long)uptime() << 32) ^ ((unsigned long long)rtc_epoch() << 13);
+		s ^= rng_tsc() ^ (unsigned long long)(unsigned long)(void *)&s;
+		st = s ? s : 0x9E3779B97F4A7C15ULL;
+		seeded = 1;
+	}
+	st ^= rng_tsc() ^ (unsigned long long)now_ms();
+	while (i < n) {
+		unsigned long long z = (st += 0x9E3779B97F4A7C15ULL);
+		int k = n - i < 8 ? n - i : 8;
+		z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+		z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+		z ^= z >> 31;
+		memcpy(p + i, &z, (unsigned)k);
+		i += k;
+	}
 }

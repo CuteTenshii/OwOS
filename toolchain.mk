@@ -64,6 +64,12 @@ UCC      := $(UCROSS)gcc
 ULD      := $(UCROSS)ld
 UOBJCOPY := $(UCROSS)objcopy
 
+# grub-mkrescue builds the bootable ISO (`make iso`). Linux ships it under the
+# plain name; the macOS Homebrew GRUB formulas install it arch-prefixed
+# (x86_64-elf-grub-mkrescue / i686-elf-grub-mkrescue). Prefer the plain name, else
+# fall back to whichever prefixed build is on PATH. Override with `make GRUB_MKRESCUE=...`.
+GRUB_MKRESCUE ?= $(firstword $(foreach g,grub-mkrescue x86_64-elf-grub-mkrescue i686-elf-grub-mkrescue,$(shell command -v $(g) >/dev/null 2>&1 && echo $(g))) grub-mkrescue)
+
 # Per-arch knobs. KELF/KBFD are objcopy's output ELF format and BFD architecture
 # for wrapping a user blob (or font) into a KERNEL object. LINKER is the kernel
 # linker script; KERNEL the image name (so both arches' images coexist).

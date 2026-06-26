@@ -300,9 +300,7 @@ static int iso_list(struct iso_mount *m, const char *path)
 		con_write(r.is_dir ? "  <DIR>  " : "         ");
 		if (!r.is_dir)
 			con_write_dec(r.size);
-		con_write("  ");
-		con_write(name);
-		con_putc('\n');
+		con_printf("  %s\n", name);
 	}
 	return 0;
 }

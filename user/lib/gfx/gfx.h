@@ -336,4 +336,22 @@ int  select_motion(struct select_box *s, int x, int y, int w, int h, int mx, int
  * select_click: 1 = selection changed, -1 = consumed, 0 = key not handled. */
 int  select_key(struct select_box *s, char key);
 
+/* --- text selection helper ------------------------------------------------ *
+ * A reusable selection model in abstract (line, col) coordinates. The app maps
+ * pixels <-> (line,col), draws the highlight, and does the clipboard copy; this
+ * owns the anchor/extent, drag state, ordering and hit-testing. Both a wrapped
+ * text view (line = display row, col = byte offset in that row) and a fixed char
+ * grid (line = row, col = cell) fit the model. Coordinates compare lexically. */
+struct gfx_sel { int active, has; int al, ac, el, ec; };
+void gfx_sel_clear(struct gfx_sel *s);
+void gfx_sel_start(struct gfx_sel *s, int line, int col);   /* mousedown: set anchor */
+void gfx_sel_extend(struct gfx_sel *s, int line, int col);  /* drag: move the extent */
+void gfx_sel_end(struct gfx_sel *s);                        /* mouseup: stop dragging */
+int  gfx_sel_active(const struct gfx_sel *s);               /* currently dragging     */
+int  gfx_sel_has(const struct gfx_sel *s);                  /* a non-empty selection  */
+/* Ordered range (l0,c0) <= (l1,c1); returns 1 if the selection is non-empty. */
+int  gfx_sel_range(const struct gfx_sel *s, int *l0, int *c0, int *l1, int *c1);
+/* 1 if (line,col) lies within the selection (half-open at the end). */
+int  gfx_sel_contains(const struct gfx_sel *s, int line, int col);
+
 #endif /* OWOS_GFX_H */

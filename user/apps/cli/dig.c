@@ -86,19 +86,12 @@ static void put_rdata(const unsigned char *msg, int end, int type, int rd, int r
 	switch (type) {
 	case 1:                                          /* A                        */
 		if (rdlen >= 4) {
-			for (int i = 0; i < 4; i++) { print_uint(msg[rd+i]); if (i<3) puts("."); }
+			for (int i = 0; i < 4; i++) printf(i < 3 ? "%u." : "%u", msg[rd+i]);
 		}
 		break;
 	case 28:                                         /* AAAA                     */
 		for (int i = 0; i < 16 && i + 1 < rdlen + 1; i += 2) {
-			unsigned g = be16(msg + rd + i);
-			static const char hx[] = "0123456789abcdef";
-			char b[5]; int n = 0;
-			if (g >= 0x1000) b[n++] = hx[(g>>12)&0xF];
-			if (g >= 0x100)  b[n++] = hx[(g>>8)&0xF];
-			if (g >= 0x10)   b[n++] = hx[(g>>4)&0xF];
-			b[n++] = hx[g&0xF]; b[n] = '\0';
-			puts(b);
+			printf("%x", be16(msg + rd + i));
 			if (i < 14) puts(":");
 		}
 		break;
@@ -106,7 +99,7 @@ static void put_rdata(const unsigned char *msg, int end, int type, int rd, int r
 		name_str(msg, end, rd, nm, sizeof nm); puts(nm);
 		break;
 	case 15:                                          /* MX: pref + name         */
-		print_uint(be16(msg + rd)); puts(" ");
+		printf("%u ", be16(msg + rd));
 		name_str(msg, end, rd + 2, nm, sizeof nm); puts(nm);
 		break;
 	case 16:                                          /* TXT: length-prefixed    */
@@ -114,10 +107,8 @@ static void put_rdata(const unsigned char *msg, int end, int type, int rd, int r
 			int i = 0;
 			while (i < rdlen) {
 				int l = msg[rd + i++];
-				for (int k = 0; k < l && i < rdlen; k++, i++) {
-					char c[2] = { (char)msg[rd + i], 0 };
-					puts(c);
-				}
+				for (int k = 0; k < l && i < rdlen; k++, i++)
+					printf("%c", (char)msg[rd + i]);
 			}
 		}
 		break;
@@ -174,7 +165,7 @@ int main(int argc, char **argv)
 
 	int h = net_connect(server, 53, SK_UDP);
 	if (h < 0) {
-		if (h == -2) { puts("dig: cannot resolve resolver "); puts(server); puts("\n"); }
+		if (h == -2) { printf("dig: cannot resolve resolver %s\n", server); }
 		else         puts("dig: no network device\n");
 		return 1;
 	}
@@ -186,7 +177,7 @@ int main(int argc, char **argv)
 	int rn = net_recv(h, r, (int)sizeof r);
 	net_close(h);
 	if (rn == NET_EINTR) return EXIT_SIGINT;
-	if (rn < 12) { puts(";; no response from "); puts(server); puts("\n"); return 1; }
+	if (rn < 12) { printf(";; no response from %s\n", server); return 1; }
 
 	unsigned qd = be16(r + 4), an = be16(r + 6);
 	int pos = 12;
@@ -195,7 +186,7 @@ int main(int argc, char **argv)
 		pos += l + 4;
 	}
 
-	puts("; OwOS dig  "); puts(host); puts("  "); puts(type_name(qtype)); puts("\n");
+	printf("; OwOS dig  %s  %s\n", host, type_name(qtype));
 	if (an == 0) {
 		puts(";; no records\n");
 	} else {
@@ -210,15 +201,12 @@ int main(int argc, char **argv)
 			if (pos + rdlen > rn) break;
 			char nm[256];
 			name_str(r, rn, 12, nm, sizeof nm);   /* the queried name           */
-			puts(host); puts(".  ");
-			print_uint(ttl); puts("  IN  ");
-			puts(type_name(type)); puts("  ");
+			printf("%s.  %u  IN  %s  ", host, ttl, type_name(type));
 			put_rdata(r, rn, type, pos, rdlen);
 			puts("\n");
 			pos += rdlen;
 		}
 	}
-	puts(";; Query time: "); print_uint(msec() - t0); puts(" ms   server ");
-	puts(server); puts("#53\n");
+	printf(";; Query time: %u ms   server %s#53\n", msec() - t0, server);
 	return an > 0 ? 0 : 1;
 }

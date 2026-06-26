@@ -81,6 +81,9 @@ typedef struct {
     int         saw_newline;    /* newline seen since the last token          */
     unsigned char brace[128];   /* brace-context stack: 0 = {, 1 = ${         */
     int         brace_sp;
+    unsigned char paren[128];   /* per-'(' flag: 1 = control-flow header paren */
+    int         paren_sp;
+    int         prev_rparen_ctrl; /* last token was a ')' closing if/for/while/with */
     const char *err;            /* set on a lexical error; token kind T_ERROR */
 } jlexer;
 

@@ -82,3 +82,91 @@ uint32_t strlcpy(char *dst, const char *src, uint32_t size)
 	while (src[n]) n++;
 	return n;
 }
+
+/* --------------------------------------------------------------- formatting */
+
+/* Emit an unsigned value in `base` (10 or 16), `upper` for hex case, padded to
+ * `width` with '0' (zero) or ' ' (space). `neg` prepends a '-': with zero
+ * padding the sign leads ("-007"); with space padding the spaces lead ("  -7"). */
+static void emit_uint(void (*sink)(char, void *), void *ctx, uint32_t v,
+                      uint32_t base, int upper, int width, int zero, int neg)
+{
+	const char *digs = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+	char tmp[32];
+	int n = 0;
+	do { tmp[n++] = digs[v % base]; v /= base; } while (v);
+	int total = n + (neg ? 1 : 0);
+	if (zero) {
+		if (neg) sink('-', ctx);
+		for (int pad = width - total; pad > 0; pad--) sink('0', ctx);
+	} else {
+		for (int pad = width - total; pad > 0; pad--) sink(' ', ctx);
+		if (neg) sink('-', ctx);
+	}
+	while (n--)
+		sink(tmp[n], ctx);
+}
+
+void kvformat(void (*sink)(char, void *), void *ctx, const char *fmt, va_list ap)
+{
+	for (; *fmt; fmt++) {
+		if (*fmt != '%') { sink(*fmt, ctx); continue; }
+		fmt++;
+		int zero = 0, width = 0;
+		if (*fmt == '0') { zero = 1; fmt++; }
+		while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+		switch (*fmt) {
+		case 's': {
+			const char *s = va_arg(ap, const char *);
+			if (!s) s = "(null)";
+			while (*s) sink(*s++, ctx);
+			break;
+		}
+		case 'c': sink((char)va_arg(ap, int), ctx); break;
+		case 'd': case 'i': {
+			int v = va_arg(ap, int), neg = v < 0;
+			emit_uint(sink, ctx, neg ? -(uint32_t)v : (uint32_t)v, 10, 0, width, zero, neg);
+			break;
+		}
+		case 'u': emit_uint(sink, ctx, va_arg(ap, uint32_t), 10, 0, width, zero, 0); break;
+		case 'x': emit_uint(sink, ctx, va_arg(ap, uint32_t), 16, 0, width, zero, 0); break;
+		case 'X': emit_uint(sink, ctx, va_arg(ap, uint32_t), 16, 1, width, zero, 0); break;
+		case 'p':
+			sink('0', ctx); sink('x', ctx);
+			emit_uint(sink, ctx, (uint32_t)va_arg(ap, void *), 16, 0, 8, 1, 0);
+			break;
+		case '%': sink('%', ctx); break;
+		case '\0': return;                      /* trailing '%' — stop */
+		default:  sink('%', ctx); sink(*fmt, ctx); break;
+		}
+	}
+}
+
+/* ksnprintf sink: write into a buffer, but keep counting past the end so the
+ * return value reports the would-be length (C99). */
+struct buf_sink { char *p; uint32_t len, cap; };
+static void buf_put(char c, void *ctx)
+{
+	struct buf_sink *b = ctx;
+	if (b->len + 1 < b->cap)        /* leave room for the NUL */
+		b->p[b->len] = c;
+	b->len++;
+}
+
+int kvsnprintf(char *buf, uint32_t size, const char *fmt, va_list ap)
+{
+	struct buf_sink b = { buf, 0, size };
+	kvformat(buf_put, &b, fmt, ap);
+	if (size)
+		buf[b.len < size ? b.len : size - 1] = '\0';
+	return (int)b.len;
+}
+
+int ksnprintf(char *buf, uint32_t size, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int n = kvsnprintf(buf, size, fmt, ap);
+	va_end(ap);
+	return n;
+}

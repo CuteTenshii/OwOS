@@ -30,6 +30,11 @@ void sha256_update(struct sha256 *s, const void *data, uint32_t len);
 void sha256_final(struct sha256 *s, uint8_t out[SHA256_DIGEST]);
 void sha256(const void *data, uint32_t len, uint8_t out[SHA256_DIGEST]);
 
+/* The kernel CSPRNG (crypto.c): fills `out` with `n` random bytes from RDRAND
+ * (the CPU hardware RNG) when available, else a SHA-256 timing mix. The single
+ * entropy source for TLS/SSH key material and the user-space getrandom(). */
+void rng_bytes(void *out, uint32_t n);
+
 /* ------------------------------------------------------------------ SHA-512 */
 /* One-shot only (all the kernel needs: Ed25519 in ed25519.c hashes whole
  * messages). RFC 6234 / FIPS 180-4. */

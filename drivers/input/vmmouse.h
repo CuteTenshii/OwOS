@@ -16,6 +16,9 @@ int vmmouse_init(int max_x, int max_y);
 /* 1 once vmmouse_init succeeded. */
 int vmmouse_active(void);
 
+/* Rescale the absolute range onto a new screen size after a resolution change. */
+void vmmouse_set_bounds(int max_x, int max_y);
+
 /* Drain the device's packet queue. On a state change, writes the latest absolute
  * position into x and y, the button mask into btn, and the summed wheel delta
  * into dz, then returns 1. Returns 0 if the

@@ -358,8 +358,7 @@ static volatile uint8_t *find_and_map(void)
 				if (paging_identity_map(phys, size) != 0)
 					return NULL;
 				paging_mark_uc(phys, size);
-				con_write("xhci: controller at "); con_put_hex(phys, 8);
-				con_write(" size "); con_put_hex(size, 8); con_putc('\n');
+				con_printf("xhci: controller at %08x size %08x\n", phys, size);
 				return (volatile uint8_t *)phys;
 			}
 		}
@@ -496,8 +495,7 @@ static int address_device(int slot_id, int port, int speed)
 	          TRB_TYPE(TRB_ADDRESS_DEVICE) | ((uint32_t)slot_id << 24));
 	int cc = cmd_submit();
 	if (cc != CC_SUCCESS) {
-		con_write("xhci: address-device failed cc="); con_write_dec(cc);
-		con_putc('\n');
+		con_printf("xhci: address-device failed cc=%u\n", cc);
 		return -1;
 	}
 	return 0;
@@ -875,13 +873,9 @@ static int bring_up_net(struct usbdev *d, int port)
 		con_write("rndis: configure-endpoint failed\n");
 		return -1;
 	}
-	con_write("rndis: data path up (in ep=");
-	con_put_hex(d->bulk_in, 2);  con_write(" dci="); con_write_dec(net_in_dci);
-	con_write(" mps="); con_write_dec(d->bulk_in_mps);
-	con_write(", out ep="); con_put_hex(d->bulk_out, 2);
-	con_write(" dci="); con_write_dec(net_out_dci);
-	con_write(" mps="); con_write_dec(d->bulk_out_mps);
-	con_write(")\n");
+	con_printf("rndis: data path up (in ep=%02x dci=%u mps=%u, out ep=%02x dci=%u mps=%u)\n",
+	           d->bulk_in, net_in_dci, d->bulk_in_mps,
+	           d->bulk_out, net_out_dci, d->bulk_out_mps);
 
 	net_rx_buf = palloc();
 	net_tx_buf = palloc();
@@ -967,10 +961,8 @@ static void data_loop(void)
 				 * RNDIS message type) so a stuck phone path is debuggable. */
 				if (dbg_rx < 4) {
 					dbg_rx++;
-					con_write("usbnet: rx cc="); con_write_dec(cc);
-					con_write(" len="); con_write_dec(got);
-					con_write(" type="); con_put_hex(load_le32(net_rx_buf), 8);
-					con_putc('\n');
+					con_printf("usbnet: rx cc=%u len=%u type=%08x\n",
+					           cc, got, load_le32(net_rx_buf));
 				}
 				if (cc == CC_STALL || cc == CC_BABBLE || cc == CC_USB_TXN_ERR) {
 					/* These halt the endpoint — reset it and retry rather than
@@ -992,15 +984,14 @@ static void data_loop(void)
 			} else if (epid == net_out_dci) {
 				if (dbg_tx < 2) {
 					dbg_tx++;
-					con_write("usbnet: tx cc="); con_write_dec(cc); con_putc('\n');
+					con_printf("usbnet: tx cc=%u\n", cc);
 				}
 				net_out_pending = 0;
 			} else if (epid == net_intr_dci) {
 				if (dbg_intr < 4) {
 					dbg_intr++;
-					con_write("usbnet: intr cc="); con_write_dec(cc);
-					con_write(" note="); con_put_hex(load_le32(net_intr_buf), 8);
-					con_putc('\n');
+					con_printf("usbnet: intr cc=%u note=%08x\n",
+					           cc, load_le32(net_intr_buf));
 				}
 				net_intr_pending = 0;
 				if (cc == CC_SUCCESS || cc == CC_SHORT_PKT)
@@ -1310,14 +1301,13 @@ static int bring_up_msc(struct usbdev *d, int port)
 		return -1;
 	}
 	if (blk != 512) {
-		con_write("usbmsc: unsupported block size "); con_write_dec(blk); con_putc('\n');
+		con_printf("usbmsc: unsupported block size %u\n", blk);
 		return -1;
 	}
 	msc_capacity = last + 1;
 	msc_ready = 1;
-	con_write("usbmsc: ");
-	con_write(msc_model[0] ? msc_model : "USB disk");
-	con_write(" "); con_write_dec(msc_capacity / 2048); con_write(" MiB ready\n");
+	con_printf("usbmsc: %s %u MiB ready\n",
+	           msc_model[0] ? msc_model : "USB disk", msc_capacity / 2048);
 	return 0;
 }
 
@@ -1759,14 +1749,13 @@ static int bring_up_mtp(struct usbdev *d, int port)
 	uint32_t sp[1] = { 1 };                      /* session id (non-zero)         */
 	if (mtp_do_transaction(MTP_OP_OPEN_SESSION, sp, 1, 0, 0, &rc) != 0 &&
 	    rc != 0x201E /* SessionAlreadyOpen */) {
-		con_write("mtp: OpenSession failed rc="); con_put_hex(rc, 4); con_putc('\n');
+		con_printf("mtp: OpenSession failed rc=%04x\n", rc);
 		return -1;
 	}
 
 	mtp_ready = 1;
-	con_write("mtp: ");
-	con_write(mtp_model[0] ? mtp_model : "device");
-	con_write(" ready (file transfer)\n");
+	con_printf("mtp: %s ready (file transfer)\n",
+	           mtp_model[0] ? mtp_model : "device");
 	return 0;
 }
 
@@ -1898,19 +1887,15 @@ static void print_config(const uint8_t *cfg, int total)
 			break;
 		uint8_t btype = cfg[i + 1];
 		if (btype == 0x04 && i + 9 <= total) {            /* interface         */
-			con_write("         if "); con_write_dec(cfg[i + 2]);
-			con_write(" class "); con_put_hex(cfg[i + 5], 2);
-			con_putc('/'); con_put_hex(cfg[i + 6], 2);
-			con_putc('/'); con_put_hex(cfg[i + 7], 2);
-			con_putc('\n');
+			con_printf("         if %u class %02x/%02x/%02x\n",
+			           cfg[i + 2], cfg[i + 5], cfg[i + 6], cfg[i + 7]);
 		} else if (btype == 0x05 && i + 7 <= total) {     /* endpoint          */
 			uint8_t addr = cfg[i + 2];
 			uint8_t attr = cfg[i + 3] & 0x3;
 			const char *t = attr == 2 ? "bulk" : attr == 3 ? "intr"
 			              : attr == 1 ? "isoc" : "ctrl";
-			con_write("           ep "); con_put_hex(addr, 2);
-			con_write((addr & 0x80) ? " IN  " : " OUT ");
-			con_write(t); con_putc('\n');
+			con_printf("           ep %02x%s%s\n", addr,
+			           (addr & 0x80) ? " IN  " : " OUT ", t);
 		}
 		i += blen;
 	}
@@ -2016,10 +2001,8 @@ static void print_devs(int detail_port)
 		if (!d->active)
 			continue;
 		any = 1;
-		con_write("xhci: port "); con_write_dec(p); con_write(": ");
-		con_put_hex(d->vid, 4); con_putc(':'); con_put_hex(d->pid, 4);
-		con_write(" class "); con_put_hex(d->cls, 2);
-		con_write(" speed "); con_write_dec(d->speed);
+		con_printf("xhci: port %u: %04x:%04x class %02x speed %u",
+		           p, d->vid, d->pid, d->cls, d->speed);
 		if (d->mac_ok)                 /* only devices RNDIS actually answered  */
 			con_write(" [net]");
 		if (d->is_mtp)

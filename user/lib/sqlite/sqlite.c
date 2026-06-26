@@ -216,6 +216,11 @@ static void render_leaf(u8 *page, int hdr_off, struct cell *cells,
 	int content = PAGESIZE;
 	for (int i = 0; i < count; i++) {
 		const struct cell *c = &cells[first + i];
+		/* Defensive: a cell that would start before the cell-pointer array (or
+		 * before the page) must never be written — that would corrupt the heap
+		 * below the page buffer. The caller (build_btree) already rejects an
+		 * oversized record, so this only guards against a packing miscount. */
+		if (content - c->len < (int)(ptr + 2 - page)) break;
 		content -= c->len;
 		memcpy(page + content, c->buf, (__SIZE_TYPE__)c->len);
 		put16(ptr, (unsigned)content);
@@ -280,6 +285,12 @@ static int build_btree(struct builder *b, struct cell *cells, int ncells)
 			long long maxkey = cells[i].key;
 			while (i < ncells) {
 				int need = 2 + cells[i].len;
+				/* A single record too big for one leaf page can't be stored:
+				 * this format has no overflow pages. Fail the whole save rather
+				 * than let render_leaf memcpy past the start of the page buffer
+				 * (content = PAGESIZE - len would go negative). The caller is
+				 * best-effort, so the in-memory data is left untouched. */
+				if (need > PAGESIZE - 8) { free(level); b->err = 1; return 0; }
 				if (used + need > PAGESIZE && i > first) break;
 				used += need;
 				maxkey = cells[i].key;

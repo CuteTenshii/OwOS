@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include "console.h"
+#include "kstring.h"
 #include "log.h"
 #include "fb.h"
 #include "serial.h"
@@ -321,6 +322,16 @@ uint32_t        con_dirty(void)      { return dirty; }
 const uint16_t *con_shadow(void)     { return shadow; }
 int             con_cols(void)       { return VGA_WIDTH; }
 int             con_rows(void)       { return VGA_HEIGHT; }
+
+static void con_putc_sink(char c, void *ctx) { (void)ctx; con_putc(c); }
+
+void con_printf(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	kvformat(con_putc_sink, 0, fmt, ap);
+	va_end(ap);
+}
 
 void con_write_hex(uint32_t value)
 {

@@ -233,8 +233,7 @@ static void print_prompt(void)
 	for (size_t i = 0; i < hlen; i++)
 		if (cwd[i] != HOME_DIR[i]) { in_home = 0; break; }
 	if (in_home && (cwd[hlen] == '\0' || cwd[hlen] == '/')) {
-		con_putc('~');
-		con_write(cwd + hlen);                 /* the path below home, if any */
+		con_printf("~%s", cwd + hlen);         /* the path below home, if any */
 	} else {
 		con_write(cwd);
 	}
@@ -256,9 +255,7 @@ static void cmd_help(const char *a);
 
 static void print_kib(const char *label, uint32_t kib)
 {
-	con_write(label);
-	con_write_dec(kib);
-	con_write(" KiB\n");
+	con_printf("%s%u KiB\n", label, kib);
 }
 
 /* List every storage device the kernel brought up, with its capacity, and do a
@@ -270,13 +267,9 @@ static void write_capacity(uint32_t sectors)
 	uint32_t mib = sectors / 2048;
 	if (mib >= 1024) {
 		uint32_t tenths = (mib * 10) / 1024;   /* MiB -> tenths of a GiB        */
-		con_write_dec(tenths / 10);
-		con_putc('.');
-		con_write_dec(tenths % 10);
-		con_write(" GiB");
+		con_printf("%u.%u GiB", tenths / 10, tenths % 10);
 	} else {
-		con_write_dec(mib);
-		con_write(" MiB");
+		con_printf("%u MiB", mib);
 	}
 }
 
@@ -286,35 +279,27 @@ static void cmd_storage(void)
 	int n = 0;
 
 	if (ata_present()) {
-		con_write("  IDE/ATA    ");
-		con_write(ata_model());
-		con_write("  ");
+		con_printf("  IDE/ATA    %s  ", ata_model());
 		write_capacity(ata_sectors());
 		con_write(" (PIO, primary master)\n");
 		n++;
 	}
 	if (ahci_present()) {
-		con_write("  SATA/AHCI  ");
-		con_write(ahci_model());
-		con_write("  ");
+		con_printf("  SATA/AHCI  %s  ", ahci_model());
 		write_capacity(ahci_sectors());
 		con_write(" (DMA) -- read LBA0: ");
 		con_write(ahci_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
 		n++;
 	}
 	if (nvme_present()) {
-		con_write("  NVMe       ");
-		con_write(nvme_model());
-		con_write("  ");
+		con_printf("  NVMe       %s  ", nvme_model());
 		write_capacity(nvme_sectors());
 		con_write(" (ns 1) -- read LBA0: ");
 		con_write(nvme_read_sector(0, buf) == 0 ? "ok\n" : "FAIL\n");
 		n++;
 	}
 	if (xhci_msc_present()) {
-		con_write("  USB        ");
-		con_write(xhci_msc_model());
-		con_write("  ");
+		con_printf("  USB        %s  ", xhci_msc_model());
 		write_capacity(xhci_msc_sectors());
 		con_write(" (xHCI BOT) -- read LBA0: ");
 		/* Safe even on a flaky adapter: every wait in the read is bounded
@@ -430,11 +415,7 @@ static void wait_reap(int pid)
 		}
 		__asm__ volatile ("sti; hlt");
 	}
-	con_write("[pid ");
-	con_write_dec((uint32_t)pid);
-	con_write(" exited, status ");
-	con_write_dec((uint32_t)status);
-	con_write("]\n");
+	con_printf("[pid %u exited, status %u]\n", (uint32_t)pid, (uint32_t)status);
 }
 
 static void cmd_run(char *args)
@@ -520,8 +501,7 @@ static void grep_emit(const char *pattern, char *buf)
 		int had_newline = (*p == '\n');
 		*p = '\0';
 		if (str_contains(line_start, pattern)) {
-			con_write(line_start);
-			con_putc('\n');
+			con_printf("%s\n", line_start);
 		}
 		if (had_newline)
 			p++;
@@ -678,11 +658,11 @@ static void cmd_cd(const char *arg)
 	}
 	int d = fs_isdir(target);
 	if (d < 0) {
-		con_write("cd: no such directory: "); con_write(a); con_putc('\n');
+		con_printf("cd: no such directory: %s\n", a);
 		return;
 	}
 	if (d == 0) {
-		con_write("cd: not a directory: "); con_write(a); con_putc('\n');
+		con_printf("cd: not a directory: %s\n", a);
 		return;
 	}
 	int i = 0;
@@ -694,8 +674,7 @@ static void cmd_cd(const char *arg)
 /* "pwd" — print the working directory. */
 static void cmd_pwd(void)
 {
-	con_write(cwd);
-	con_putc('\n');
+	con_printf("%s\n", cwd);
 }
 
 /* "cp <src> <dst>" — copy a file's contents into a new (or overwritten) file.
@@ -719,7 +698,7 @@ static void cmd_cp(const char *arg)
 	}
 	int sz = fs_size(rsrc);
 	if (sz < 0) {
-		con_write("cp: no such file: "); con_write(src); con_putc('\n');
+		con_printf("cp: no such file: %s\n", src);
 		return;
 	}
 	uint8_t *buf = kmalloc(sz ? (uint32_t)sz : 1);
@@ -733,7 +712,7 @@ static void cmd_cp(const char *arg)
 	else if (fs_create(rdst, buf, (uint32_t)n) != 0)
 		con_write("cp: write failed (disk or directory full?)\n");
 	else {
-		con_write(rsrc); con_write(" -> "); con_write(rdst); con_putc('\n');
+		con_printf("%s -> %s\n", rsrc, rdst);
 	}
 	kfree(buf);
 }
@@ -759,7 +738,7 @@ static void cmd_mv(const char *arg)
 		con_write("mv: failed (no such source, or illegal move)\n");
 		return;
 	}
-	con_write(rsrc); con_write(" -> "); con_write(rdst); con_putc('\n');
+	con_printf("%s -> %s\n", rsrc, rdst);
 }
 
 /* "rm <file> [file...]" — delete one or more files (sectors leak). */
@@ -776,12 +755,11 @@ static void cmd_rm(const char *arg)
 	} else {
 		int r = fs_delete(rpath);
 		if (r == 0) {
-			con_write("removed "); con_write(rpath); con_putc('\n');
+			con_printf("removed %s\n", rpath);
 		} else if (r == -2) {
-			con_write("rm: is a directory (use rmdir): ");
-			con_write(name); con_putc('\n');
+			con_printf("rm: is a directory (use rmdir): %s\n", name);
 		} else {
-			con_write("rm: no such file: "); con_write(name); con_putc('\n');
+			con_printf("rm: no such file: %s\n", name);
 		}
 	}
 	if (extra[0])                                   /* a courtesy for "rm a b"  */
@@ -800,7 +778,7 @@ static void cmd_mkdir(const char *arg)
 	if (path_resolve(name, rpath) != 0)
 		con_write("mkdir: path too long\n");
 	else if (fs_mkdir(rpath) == 0) {
-		con_write("created "); con_write(rpath); con_putc('\n');
+		con_printf("created %s\n", rpath);
 	} else
 		con_write("mkdir: cannot create (exists, bad path, or directory full)\n");
 	if (extra[0])
@@ -821,13 +799,13 @@ static void cmd_rmdir(const char *arg)
 	} else {
 		int r = fs_rmdir(rpath);
 		if (r == 0) {
-			con_write("removed "); con_write(rpath); con_putc('\n');
+			con_printf("removed %s\n", rpath);
 		} else if (r == -2) {
-			con_write("rmdir: not a directory: "); con_write(name); con_putc('\n');
+			con_printf("rmdir: not a directory: %s\n", name);
 		} else if (r == -3) {
-			con_write("rmdir: directory not empty: "); con_write(name); con_putc('\n');
+			con_printf("rmdir: directory not empty: %s\n", name);
 		} else {
-			con_write("rmdir: no such directory: "); con_write(name); con_putc('\n');
+			con_printf("rmdir: no such directory: %s\n", name);
 		}
 	}
 	if (extra[0])
@@ -910,14 +888,14 @@ static void bi_umount(const char *a)
 {
 	while (*a == ' ') a++;
 	if (*a) {
-		if (fs_unmount(a) == 0) { con_write("umount: detached "); con_write(a); con_putc('\n'); }
+		if (fs_unmount(a) == 0) { con_printf("umount: detached %s\n", a); }
 		else                      con_write("umount: nothing mounted there\n");
 		return;
 	}
 	struct fs_mountinfo mi;
 	if (fs_mount_enum(0, &mi) == 1) {
 		fs_unmount(mi.point);
-		con_write("umount: detached "); con_write(mi.point); con_putc('\n');
+		con_printf("umount: detached %s\n", mi.point);
 	} else con_write("umount: nothing mounted\n");
 }
 
@@ -936,7 +914,7 @@ static void bi_mount(const char *a)
 
 	if (dev[0]) {
 		if (!point[0]) media_point(dev, point);
-		if (fs_mount(dev, point) == 0) { con_write("mount: "); con_write(dev); con_write(" -> "); con_write(point); con_putc('\n'); }
+		if (fs_mount(dev, point) == 0) { con_printf("mount: %s -> %s\n", dev, point); }
 		else                             con_write("mount: cannot mount (unknown device or filesystem)\n");
 		return;
 	}
@@ -949,8 +927,8 @@ static void bi_mount(const char *a)
 			if (streq(mi.dev, devs[k].dev)) { mounted = 1; break; }
 		if (!mounted) {
 			media_point(devs[k].dev, point);
-			if (fs_mount(devs[k].dev, point) == 0) { con_write("mount: "); con_write(devs[k].dev); con_write(" -> "); con_write(point); con_putc('\n'); }
-			else                                     con_write("mount: no recognised filesystem on "), con_write(devs[k].dev), con_putc('\n');
+			if (fs_mount(devs[k].dev, point) == 0) { con_printf("mount: %s -> %s\n", devs[k].dev, point); }
+			else                                     con_printf("mount: no recognised filesystem on %s\n", devs[k].dev);
 			return;
 		}
 	}
@@ -958,7 +936,7 @@ static void bi_mount(const char *a)
 }
 /* `play` is now the program /bin/play (streaming WAV player); the kernel
  * no longer has a play builtin. is_capture_cli() routes it like neofetch/curl. */
-static void bi_echo(const char *a)       { con_write(a); con_putc('\n'); }
+static void bi_echo(const char *a)       { con_printf("%s\n", a); }
 /* clip: with text, copy it to the clipboard (pushed to the host on VMware);
  * with no argument, print the current clipboard contents. */
 static void bi_poweroff(const char *a)
@@ -1022,9 +1000,7 @@ static void cmd_help(const char *a)
 	for (const struct builtin *b = builtins; b->name || b->help; b++) {
 		if (!b->help)
 			continue;
-		con_write("  ");
-		con_write(b->help);
-		con_putc('\n');
+		con_printf("  %s\n", b->help);
 	}
 }
 
@@ -1064,11 +1040,7 @@ static void run(char *cmd)
 		run(cmd);                              /* no '>' left: dispatches  */
 		uint32_t n = con_capture_end();
 		if (fs_create(fname, cap, n) == 0) {
-			con_write("wrote ");
-			con_write_dec(n);
-			con_write(" bytes to ");
-			con_write(fname);
-			con_putc('\n');
+			con_printf("wrote %u bytes to %s\n", n, fname);
 		} else {
 			con_write("redirect: write failed\n");
 		}
@@ -1162,9 +1134,7 @@ static void run(char *cmd)
 	if (pid >= 0) {
 		wait_reap(pid);
 	} else if (ac > 0) {
-		con_write("unknown command: ");
-		con_write(av[0]);
-		con_write("\ntype 'help'\n");
+		con_printf("unknown command: %s\ntype 'help'\n", av[0]);
 	}
 }
 

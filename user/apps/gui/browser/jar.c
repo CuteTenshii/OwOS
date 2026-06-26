@@ -191,6 +191,13 @@ void jar_save(void)
 	struct sql_table *t = sql_create_table(db, "cookies", COOKIE_SQL, 3);
 	if (t) {
 		for (struct cookie *c = B->cookies; c; c = c->next) {
+			/* The jar's SQLite format has no overflow pages, so one row must fit a
+			 * 4 KiB page. A cookie at/near the 4 KiB browser limit can't be
+			 * persisted — skip it (it still works in memory this session) rather
+			 * than fail the whole save. Conservative budget leaves page+record
+			 * overhead headroom. */
+			if (strlen(c->host) + strlen(c->name) + strlen(c->val) > 4000)
+				continue;
 			struct sql_value v[3];
 			v[0] = sqlv_text(c->host);
 			v[1] = sqlv_text(c->name);

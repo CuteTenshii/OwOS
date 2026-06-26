@@ -27,6 +27,9 @@ int synaptics_init(int max_x, int max_y);
 /* 1 once synaptics_init succeeded. */
 int synaptics_active(void);
 
+/* Move the clamp box onto a new screen size after a resolution change. */
+void synaptics_set_bounds(int max_x, int max_y);
+
 /* Feed one aux byte drained in the mouse IRQ. Accumulates a 6-byte absolute
  * packet; when a packet completes and the resulting cursor/buttons/wheel differ
  * from the last reported state, updates the cursor and returns 1, writing the

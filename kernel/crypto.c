@@ -9,6 +9,8 @@
 #include "crypto.h"
 #include "console.h"
 #include "kstring.h"
+#include "timer.h"
+#include "rtc.h"
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -945,4 +947,68 @@ int crypto_selftest(void)
 
 	con_write(all ? "crypto: ALL PASS\n" : "crypto: FAILURES\n");
 	return all ? 0 : -1;
+}
+
+/* ------------------------------------------------------------------ CSPRNG */
+
+/* CPUID.01H:ECX.RDRAND[bit 30] — does the CPU expose the on-die hardware RNG? */
+static int rng_have_rdrand(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		uint32_t a, b, c, d;
+		__asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
+		cached = (int)((c >> 30) & 1u);
+	}
+	return cached;
+}
+static int rng_rdrand(uint32_t *out)
+{
+	unsigned char ok = 0;
+	for (int i = 0; i < 10; i++) {            /* Intel guidance: retry a stalled RDRAND */
+		__asm__ volatile ("rdrand %0; setc %1" : "=r"(*out), "=qm"(ok));
+		if (ok) return 1;
+	}
+	return 0;
+}
+static uint64_t rng_rdtsc(void)
+{
+	uint32_t lo, hi;
+	__asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+	return ((uint64_t)hi << 32) | lo;
+}
+
+/* The kernel CSPRNG: SHA-256 over the CPU hardware RNG (RDRAND, when present)
+ * plus the TSC, the PIT, the RTC and a chained counter. With RDRAND this is real
+ * hardware entropy whitened through SHA-256; without it the timing mix is a
+ * best-effort hobby-kernel compromise. The single entropy source for TLS/SSH key
+ * material and the user-space getrandom()/crypto.getRandomValues. */
+void rng_bytes(void *out, uint32_t n)
+{
+	static uint32_t ctr;
+	uint8_t *p = (uint8_t *)out;
+	int have = rng_have_rdrand();
+	while (n) {
+		struct sha256 s;
+		uint8_t h[SHA256_DIGEST];
+		uint64_t tsc = rng_rdtsc();
+		uint32_t a = timer_us(), b = timer_ticks(), c = ctr++;
+		struct rtc_time t;
+		uint32_t take, i;
+		rtc_now(&t);
+		sha256_init(&s);
+		sha256_update(&s, &tsc, sizeof tsc);
+		sha256_update(&s, &a, 4);
+		sha256_update(&s, &b, 4);
+		sha256_update(&s, &c, 4);
+		sha256_update(&s, &t, sizeof t);
+		sha256_update(&s, &p, sizeof p);          /* a touch of address variation */
+		if (have)
+			for (i = 0; i < 8; i++) { uint32_t r; if (rng_rdrand(&r)) sha256_update(&s, &r, 4); }
+		sha256_final(&s, h);
+		take = n < SHA256_DIGEST ? n : SHA256_DIGEST;
+		memcpy(p, h, take);
+		p += take;
+		n -= take;
+	}
 }

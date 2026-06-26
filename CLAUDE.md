@@ -95,8 +95,8 @@ These change how you edit; they are the rules most likely to be violated.
 
 ## Code conventions
 
-- **Build general components, not single-use ones.** A file written while working
-  toward feature X is built *because of* X, not *for* X: keep its API
+- **Build general components, not single-use ones (unless you think it could be re-used, example: UUIDs).**
+  A file written while working toward feature X is built *because of* X, not *for* X: keep its API
   consumer-agnostic and put feature-specific logic in the caller (e.g. the GC
   takes a generic tracer/finalizer; JS-specific marking lives in the engine).
 - **Name for what a thing is, not its first consumer** — no `js_`-style prefixes

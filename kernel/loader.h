@@ -17,7 +17,11 @@
                                           (3 GiB). Physical RAM (make run -m) is the
                                           real ceiling now, not this boundary. */
 #define USER_STACK_TOP  (USER_REGION_END - 0x1000u)  /* stack grows down from the top */
-#define USER_STACK_PAGES 4u            /* 16 KiB of user stack                  */
+#define USER_STACK_PAGES 256u           /* 1 MiB of user stack: the recursive-descent
+                                          JS parser nests one frame-ladder per source
+                                          nesting level (~900 B each at -O0), so a real
+                                          minified bundle needs far more than a few KiB.
+                                          Backed by pmm high memory; RAM is the ceiling. */
 #define USER_GUARD_PAGES 1u            /* unmapped gap below the stack (overflow trap) */
 /* The heap (SYS_SBRK) grows up from the image end toward — but never into — the
  * fixed user stack at the top of the window. One page below the stack is left

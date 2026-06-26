@@ -54,15 +54,12 @@
 
 /* Boot-stage breadcrumb shown on the panic screen. On a laptop there is no COM1
  * to capture the serial log and the panic clears the boot log off screen, so the
- * panic must carry "how far did boot get" itself. Updated by bootmark(). TEMP
- * diagnostic for the wm-thread boot crash. */
+ * panic must carry "how far did boot get" itself (idt.c prints it as boot=...).
+ * Updated by bootmark(). */
 const char *g_boot_stage = "early";
 static void bootmark(const char *s)
 {
 	g_boot_stage = s;
-	con_write("BOOTMARK: ");
-	con_write(s);
-	con_write("\n");
 }
 
 /* Install an embedded program/asset blob to owofs, (re)creating it when absent
@@ -275,25 +272,17 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	idt_init();
 	irq_init();
 
-	con_write("mmdbg: path=");
-	con_write(magic == MULTIBOOT2_BOOTLOADER_MAGIC ? "mb2" : "mb1");
-	con_write(" mmapflag=");
-	con_write_dec((mbi->flags & MULTIBOOT_FLAG_MMAP) ? 1 : 0);
-	con_write(" entries=");
-	con_write_dec(mbi->mmap_length / 24);   /* synth/E820 entries are 24 bytes  */
-	con_write(" firmware=");
-	con_write(firmware_name());
-	con_putc('\n');
+	con_printf("mmdbg: path=%s mmapflag=%u entries=%u firmware=%s\n",
+	           magic == MULTIBOOT2_BOOTLOADER_MAGIC ? "mb2" : "mb1",
+	           (mbi->flags & MULTIBOOT_FLAG_MMAP) ? 1 : 0,
+	           mbi->mmap_length / 24,   /* synth/E820 entries are 24 bytes  */
+	           firmware_name());
 
 	pmm_init(mbi);                 /* read the memory map, track frames       */
-	con_write("pmm: ");
-	con_write_dec(pmm_installed_kib() / 1024);
-	con_write(" MiB RAM detected");
+	con_printf("pmm: %u MiB RAM detected", pmm_installed_kib() / 1024);
 	if (pmm_installed_kib() > pmm_total_kib()) {
 		/* 32-bit, no PAE: we can only manage the low 4 GiB of it. */
-		con_write(" (");
-		con_write_dec(pmm_total_kib() / 1024);
-		con_write(" MiB usable)");
+		con_printf(" (%u MiB usable)", pmm_total_kib() / 1024);
 	}
 	con_write(".\n");
 
@@ -306,9 +295,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	smbios_init();                 /* read DMI vendor/product for the splash  */
 
 	pci_init();                    /* enumerate the PCI bus                   */
-	con_write("pci: ");
-	con_write_dec((uint32_t)pci_count());
-	con_write(" devices found.\n");
+	con_printf("pci: %u devices found.\n", (uint32_t)pci_count());
 
 	smp_init();                    /* discover CPUs via ACPI MADT (no AP bring-up yet) */
 
@@ -338,6 +325,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		if (rc != 0)
 			rc = fb_init(1024, 768);   /* VBE DISPI fallback (QEMU -kernel) */
 
+
 		/* On a verbose boot, catch the framebuffer console up with everything
 		 * logged before graphics mode existed (banner, pmm, paging, ...), which
 		 * until now only reached the 0xB8000 text the graphics mode hides. After
@@ -346,9 +334,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			journal_to_fb();
 
 		if (adopted) {
-			con_write("fb: adopted bootloader framebuffer ");
-			con_write_dec(mbi->framebuffer_width);  con_putc('x');
-			con_write_dec(mbi->framebuffer_height); con_write("x32.\n");
+			con_printf("fb: adopted bootloader framebuffer %ux%ux32.\n",
+			           mbi->framebuffer_width, mbi->framebuffer_height);
 		}
 		if (svga)
 			con_write("fb: VMware SVGA II adopted.\n");

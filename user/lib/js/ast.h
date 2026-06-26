@@ -72,7 +72,7 @@ enum js_node_type {
 /* object-literal / object-pattern property kinds */
 enum { JS_PROP_INIT, JS_PROP_GET, JS_PROP_SET, JS_PROP_METHOD, JS_PROP_SPREAD };
 /* class member kinds */
-enum { JS_M_METHOD, JS_M_GET, JS_M_SET, JS_M_FIELD, JS_M_CTOR };
+enum { JS_M_METHOD, JS_M_GET, JS_M_SET, JS_M_FIELD, JS_M_CTOR, JS_M_STATIC_BLOCK };
 /* var-declaration kinds */
 enum { JS_DECL_VAR, JS_DECL_LET, JS_DECL_CONST };
 

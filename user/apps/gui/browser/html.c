@@ -1,10 +1,12 @@
 /* html.c — the renderer. Walks the DOM (parsed by dom.c) into styled text in
- * B->text/B->attr, collecting links, inline images, the favicon and title.
+ * B->pg->text/B->pg->attr, collecting links, inline images, the favicon and title.
  * Element styling comes from the css.c engine (sheet + inline + attrs); this file
  * maps the computed style onto the text renderer and does the HTML-entity work. */
 #include "browser.h"
 #include "css.h"
 #include "font.h"
+#include "svg.h"
+#include "layout.h"
 
 static css_sheet *g_sheet;     /* the page's collected <style> rules, per render */
 
@@ -25,7 +27,7 @@ static char g_base_url[URL_MAX];
 static int  g_frame_depth;
 static int  g_link_nav = 1;
 
-/* CSP enforcement runs against the top document (B->csp); frame sub-documents
+/* CSP enforcement runs against the top document (B->pg->csp); frame sub-documents
  * have their own policy we don't track, so checks are skipped inside frames
  * (g_frame_depth > 0). g_csp_report gates console logging to the initial load so
  * the per-relayout walk doesn't spam duplicate violations. */
@@ -49,12 +51,12 @@ static void csp_report(const char *what, const char *url, const char *reason)
  * policy asks). Returns 1 = allowed. No-op (allow) inside frames or with no CSP. */
 static int csp_url_ok(int type, const char *abs, const char *what, char *out, int outcap)
 {
-	if (g_frame_depth > 0 || !B->csp) {
+	if (g_frame_depth > 0 || !B->pg->csp) {
 		int k = 0; out[0] = '\0'; while (abs[k] && k < outcap - 1) { out[k] = abs[k]; k++; } out[k] = '\0';
 		return 1;
 	}
 	char reason[64];
-	if (csp_check_url(B->csp, type, abs, g_cur_page_url, out, outcap, reason, sizeof reason)) return 1;
+	if (csp_check_url(B->pg->csp, type, abs, g_cur_page_url, out, outcap, reason, sizeof reason)) return 1;
 	csp_report(what, abs, reason);
 	return 0;
 }
@@ -62,23 +64,8 @@ static int csp_url_ok(int type, const char *abs, const char *what, char *out, in
 /* style-src gate for an inline style="" attribute (no nonce/hash for attrs). */
 static int csp_style_attr_ok(void)
 {
-	if (g_frame_depth > 0 || !B->csp) return 1;
-	return csp_check_inline(B->csp, CSP_STYLE, 0, 0, 0, 0, 0);
-}
-
-/* Nearest of the 16-colour palette to an 0xRRGGBB value. */
-static int nearest_palette(unsigned rgb)
-{
-	int r = (rgb >> 16) & 0xff, g = (rgb >> 8) & 0xff, b = rgb & 0xff;
-	int best = 0; long bestd = 1L << 30;
-	for (int i = 0; i < 16; i++) {
-		int pr = (palette[i] >> 16) & 0xff, pg = (palette[i] >> 8) & 0xff,
-		    pb = palette[i] & 0xff;
-		long d = (long)(r - pr) * (r - pr) + (long)(g - pg) * (g - pg) +
-		         (long)(b - pb) * (b - pb);
-		if (d < bestd) { bestd = d; best = i; }
-	}
-	return best;
+	if (g_frame_depth > 0 || !B->pg->csp) return 1;
+	return csp_check_inline(B->pg->csp, CSP_STYLE, 0, 0, 0, 0, 0);
 }
 
 /* Computed style for one element: presentational attrs (lowest), sheet rules,
@@ -99,6 +86,9 @@ struct dom_node *html_dom_root(void) { return g_live_dom; }
 void html_compute_style(struct dom_node *el, struct css_style *out) { compute_style(el, out); }
 int html_match_styles(struct dom_node *el, struct css_match *out, int cap)
 { return css_matches(g_sheet, el, out, cap); }
+/* 1 if `el` has a ::before/::after (CSS_PSEUDO_*) with content — for devtools. */
+int html_has_pseudo(struct dom_node *el, int which)
+{ struct css_style cs; return css_pseudo_content(g_sheet, el, which, &cs); }
 
 /* True when `s` already carries a URL scheme that resolve_url won't expand, so it
  * must be used verbatim rather than joined onto a base (resolve_url only treats
@@ -155,7 +145,7 @@ void html_set_charset(const char *content_type)
 static void detect_meta_charset(void)
 {
 	if (g_charset_from_header) return;
-	const char *p = B->raw, *end = B->raw + B->raw_len;
+	const char *p = B->pg->raw, *end = B->pg->raw + B->pg->raw_len;
 	for (; p < end; p++) {
 		if (*p != '<' || !starts_ci(p, "<meta")) continue;
 		const char *q = p, *tend = p;
@@ -196,43 +186,46 @@ static int read_char(const char **pp, const char *end)
 }
 
 /* Current text style. The walk saves/restores it around each element (via the C
- * call stack), so style nesting needs no explicit stack. */
-struct sty { unsigned char fg, bold, under; };
+ * call stack), so style nesting needs no explicit stack. fg is a full 0xRRGGBB. */
+struct sty { unsigned fg; unsigned char bold, under; };
 static struct sty sty_cur;
 
 static unsigned char sty_byte(void)
 {
-	unsigned char a = sty_cur.fg & ST_COLOR;
+	unsigned char a = 0;
 	if (sty_cur.bold)  a |= ST_BOLD;
 	if (sty_cur.under) a |= ST_UNDER;
 	return a;
 }
 
-/* User-agent default style for a tag (the lowest layer; author CSS overrides). */
+/* User-agent default style for a tag (the lowest layer; author CSS overrides).
+ * The colour substitutes (italic grey, link blue, code brown, mark red) stand in
+ * for renderings the engine can't otherwise show; headings inherit their colour
+ * (so they stay readable on a dark page) and carry weight via bold. */
 static void apply_ua_style(const char *name)
 {
 	if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) {
-		sty_cur.fg = 8; sty_cur.bold = 1;
+		sty_cur.bold = 1;
 	} else if (streq(name, "b") || streq(name, "strong")) {
 		sty_cur.bold = 1;
 	} else if (streq(name, "i") || streq(name, "em")) {
-		sty_cur.fg = 7;
+		sty_cur.fg = 0x586070;
 	} else if (streq(name, "a")) {
-		sty_cur.fg = 1; sty_cur.under = 1;
+		sty_cur.fg = 0x1a4fbf; sty_cur.under = 1;
 	} else if (streq(name, "u") || streq(name, "ins")) {
 		sty_cur.under = 1;
 	} else if (streq(name, "code") || streq(name, "kbd") ||
 	           streq(name, "samp") || streq(name, "tt")) {
-		sty_cur.fg = 5;
+		sty_cur.fg = 0x9a6020;
 	} else if (streq(name, "mark")) {
-		sty_cur.fg = 2;
+		sty_cur.fg = 0xc01818;
 	}
 }
 
 /* Layer a computed CSS style over the UA defaults already in sty_cur. */
 static void apply_css(const struct css_style *cs)
 {
-	if (cs->color >= 0) sty_cur.fg = (unsigned char)nearest_palette((unsigned)cs->color);
+	if (cs->color >= 0) sty_cur.fg = (unsigned)cs->color;
 	if (cs->bold >= 0)  sty_cur.bold = cs->bold ? 1 : 0;
 	if (cs->under >= 0) sty_cur.under = cs->under ? 1 : 0;
 }
@@ -467,7 +460,7 @@ static void decode_entities(char *s)
 /* Current block context, saved/restored around each element like sty_cur
  * (BP_* layout in browser.h). */
 static unsigned char W_size, W_center, W_mono, W_indent, W_pre;
-static unsigned char W_bg = 0xFF;   /* background palette index, 0xFF = none    */
+static unsigned W_bg = BG_NONE;     /* current background 0xRRGGBB, BG_NONE = none */
 static char W_listtype;             /* 'u' / 'o' / 0 — the enclosing list kind  */
 static int  W_olnum;                /* <ol> item counter                        */
 
@@ -480,10 +473,11 @@ static unsigned char block_byte(void)
 static int text_put(int n, char c, unsigned char a)
 {
 	if (!ensure_text(n + 1)) return n;
-	B->text[n] = c;
-	B->attr[n] = a;
-	B->bp[n]  = block_byte();
-	B->bgi[n] = W_bg;
+	B->pg->text[n] = c;
+	B->pg->attr[n] = a;
+	B->pg->bp[n]   = block_byte();
+	B->pg->fg[n]   = sty_cur.fg;
+	B->pg->bg[n]   = W_bg;
 	return n + 1;
 }
 
@@ -607,7 +601,7 @@ static void block_break(void)
 static void capture_title(struct dom_node *el)
 {
 	int tl = 0, t_pend = 0;
-	B->doc_title[0] = '\0';
+	B->pg->doc_title[0] = '\0';
 	for (struct dom_node *c = el->first_child; c; c = c->next) {
 		if (c->type != DOM_TEXT || !c->text) continue;
 		const char *p = c->text, *end = p + strlen(c->text);
@@ -624,11 +618,11 @@ static void capture_title(struct dom_node *el)
 			}
 			if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') { t_pend = 1; continue; }
 			if (ch < 0x20 || ch >= 0x7f) continue;
-			if (t_pend && tl > 0 && tl < (int)sizeof B->doc_title - 1)
-				B->doc_title[tl++] = ' ';
+			if (t_pend && tl > 0 && tl < (int)sizeof B->pg->doc_title - 1)
+				B->pg->doc_title[tl++] = ' ';
 			t_pend = 0;
-			if (tl < (int)sizeof B->doc_title - 1) B->doc_title[tl++] = (char)ch;
-			B->doc_title[tl] = '\0';
+			if (tl < (int)sizeof B->pg->doc_title - 1) B->pg->doc_title[tl++] = (char)ch;
+			B->pg->doc_title[tl] = '\0';
 		}
 	}
 }
@@ -638,7 +632,7 @@ static void capture_title(struct dom_node *el)
 static int open_link(struct dom_node *el)
 {
 	if (!g_link_nav) return 0;        /* sandboxed frame: link isn't navigable */
-	if (!ensure_links(B->nlinks + 1)) return 0;
+	if (!ensure_links(B->pg->nlinks + 1)) return 0;
 	const char *href = dom_get_attr(el, "href");
 	if (!href || !href[0]) return 0;
 	char buf[URL_MAX];
@@ -649,7 +643,7 @@ static int open_link(struct dom_node *el)
 	if (!buf[0] || buf[0] == '#' || starts_ci(buf, "javascript:") ||
 	    starts_ci(buf, "mailto:"))
 		return 0;
-	struct link *L = &B->links[B->nlinks];
+	struct link *L = &B->pg->links[B->pg->nlinks];
 	L->start = W_n;
 	/* Inside a frame, store the absolute href (resolved against the frame's own
 	 * URL): the click handler resolves L->href against the top page, so a frame's
@@ -660,23 +654,114 @@ static int open_link(struct dom_node *el)
 	int j = 0;
 	for (; put[j] && j < (int)sizeof L->href - 1; j++) L->href[j] = put[j];
 	L->href[j] = '\0';
-	W_cur_link = B->nlinks++;
+	/* target="_blank"/"_new" → open in a new tab (the click handler honors this). */
+	const char *tgt = dom_get_attr(el, "target");
+	L->newtab = (tgt && (streq_ci(tgt, "_blank") || streq_ci(tgt, "_new"))) ? 1 : 0;
+	W_cur_link = B->pg->nlinks++;
 	return 1;
 }
 
 static void close_link(void)
 {
 	if (W_cur_link >= 0) {
-		B->links[W_cur_link].end = W_n;
+		B->pg->links[W_cur_link].end = W_n;
 		W_cur_link = -1;
 	}
 }
 
-/* Append an inline <img> to B->imgs on its own line (box from the computed CSS
+/* Append an inline <img> to B->pg->imgs on its own line (box from the computed CSS
  * width/height). data: URIs are skipped. */
+/* Serialize a DOM subtree back into SVG/XML text: `<tag attr="v" ...>kids</tag>`,
+ * or `<tag .../>` when childless. Bounded append; values are emitted raw (the DOM
+ * keeps them undecoded), which is what the SVG parser wants. Reuses the existing
+ * svg.c rasterizer rather than teaching the layout engine SVG geometry. */
+static void svg_put(char *b, int *n, int cap, const char *s)
+{
+	while (*s && *n < cap - 1) b[(*n)++] = *s++;
+}
+/* Emit ` name="value"` for a baked SVG paint: -1 skip, -2 none, -3 currentColor,
+ * else #rrggbb. Prepended before the element's own attrs so a CSS-resolved paint
+ * wins over a presentation attribute (svg.c reads the first matching attr). */
+static void svg_put_paint(char *b, int *n, int cap, const char *name, int v)
+{
+	if (v == -1) return;
+	svg_put(b, n, cap, " "); svg_put(b, n, cap, name); svg_put(b, n, cap, "=\"");
+	if (v == -2)      svg_put(b, n, cap, "none");
+	else if (v == -3) svg_put(b, n, cap, "currentColor");
+	else {
+		char h[8] = "#"; const char *d = "0123456789abcdef";
+		h[1] = d[(v >> 20) & 0xf]; h[2] = d[(v >> 16) & 0xf];
+		h[3] = d[(v >> 12) & 0xf]; h[4] = d[(v >> 8) & 0xf];
+		h[5] = d[(v >> 4) & 0xf];  h[6] = d[v & 0xf]; h[7] = '\0';
+		svg_put(b, n, cap, h);
+	}
+	svg_put(b, n, cap, "\"");
+}
+static void svg_serialize(struct dom_node *el, char *b, int *n, int cap)
+{
+	if (el->type == DOM_TEXT) { if (el->text) svg_put(b, n, cap, el->text); return; }
+	svg_put(b, n, cap, "<"); svg_put(b, n, cap, el->tag);
+	/* Bake the element's cascaded fill/stroke so CSS (e.g. Tailwind fill-* classes,
+	 * `svg{fill:…}`) colours the icon — svg.c only reads attrs/inline-style. */
+	{
+		struct css_style ecs;
+		compute_style(el, &ecs);
+		svg_put_paint(b, n, cap, "fill", ecs.fill);
+		svg_put_paint(b, n, cap, "stroke", ecs.stroke);
+	}
+	for (struct dom_attr *a = el->attrs; a; a = a->next) {
+		svg_put(b, n, cap, " "); svg_put(b, n, cap, a->name);
+		svg_put(b, n, cap, "=\""); svg_put(b, n, cap, a->value ? a->value : "");
+		svg_put(b, n, cap, "\"");
+	}
+	if (!el->first_child) { svg_put(b, n, cap, "/>"); return; }
+	svg_put(b, n, cap, ">");
+	for (struct dom_node *c = el->first_child; c; c = c->next)
+		svg_serialize(c, b, n, cap);
+	svg_put(b, n, cap, "</"); svg_put(b, n, cap, el->tag); svg_put(b, n, cap, ">");
+}
+
+/* Inline <svg>…</svg>: serialize the subtree and hand it to the SVG rasterizer
+ * as a self-contained document, emitted as an inline image (same machinery as
+ * <img src=.svg>). The bytes are committed synchronously here on the parse/walk
+ * thread — no network fetch — and the slot is exposed only once committed. */
+static void handle_svg(struct dom_node *el, const struct css_style *cs)
+{
+	if (!ensure_imgs(B->pg->n_imgs + 1)) return;
+	int cap = 32768;
+	char *buf = malloc((unsigned)cap);
+	if (!buf) return;
+	int len = 0;
+	svg_serialize(el, buf, &len, cap);
+	buf[len] = '\0';
+	if (len < 5 || !svg_probe(buf, len)) { free(buf); return; }
+
+	if (W_run_nl < 1 && W_n > 0) W_n = text_put(W_n, '\n', 0);
+
+	int idx = B->pg->n_imgs;
+	struct inl_img *im = &B->pg->imgs[idx];
+	im->href[0] = '\0'; im->alt[0] = '\0';
+	im->lazy = 0; im->want = 0; im->fetched = 1;   /* nothing to fetch */
+	im->cw = (cs->width  >= 0) ? cs->width  : 0;
+	im->ch = (cs->height >= 0) ? cs->height : 0;
+	im->text_pos = W_n;
+	im->ok = 0; im->rows = 0; im->start_row = -1;
+	im->iw = im->ih = 0; im->coff = im->clen = 0;
+	im->is_argb = 0; im->uid = 0;
+
+	/* currentColor resolves to the SVG's own CSS color if it sets one, else the
+	 * inherited text colour (sty_cur.fg) — icons are usually `fill="currentColor"`
+	 * coloured by `color` on an ancestor link/element, not on the <svg> itself. */
+	resource_commit_inline(idx, (const unsigned char *)buf, len,
+	                        cs->color >= 0 ? (unsigned)cs->color : sty_cur.fg);
+	B->pg->n_imgs++;                                                   /* expose once committed */
+	W_n = text_put(W_n, '\n', 0); W_run_nl = 1;
+	free(buf);
+}
+
 static void handle_img(struct dom_node *el, const struct css_style *cs)
 {
-	if (!ensure_imgs(B->n_imgs + 1)) return;
+	if (!ensure_imgs(B->pg->n_imgs + 1)) return;
 	const char *src = dom_get_attr(el, "src");
 	if (!src || !src[0]) return;
 	char srcbuf[URL_MAX];
@@ -697,7 +782,7 @@ static void handle_img(struct dom_node *el, const struct css_style *cs)
 
 	if (W_run_nl < 1 && W_n > 0) W_n = text_put(W_n, '\n', 0);
 
-	struct inl_img *im = &B->imgs[B->n_imgs];
+	struct inl_img *im = &B->pg->imgs[B->pg->n_imgs];
 	int j = 0;
 	for (; imgurl[j] && j < (int)sizeof im->href - 1; j++) im->href[j] = imgurl[j];
 	im->href[j] = '\0';
@@ -721,7 +806,7 @@ static void handle_img(struct dom_node *el, const struct css_style *cs)
 	im->ok = 0; im->rows = 0; im->start_row = -1;
 	im->iw = im->ih = 0; im->coff = im->clen = 0;
 	im->is_argb = 0; im->uid = 0;
-	B->n_imgs++;
+	B->pg->n_imgs++;
 	W_n = text_put(W_n, '\n', 0);
 	W_run_nl = 1;
 }
@@ -732,7 +817,7 @@ static void handle_favicon(struct dom_node *el)
 	const char *rel = dom_get_attr(el, "rel");
 	if (!rel || !contains_ci(rel, "icon") || contains_ci(rel, "mask-icon")) return;
 	int pri = contains_ci(rel, "apple-touch") ? 1 : 2;
-	if (pri < B->favicon_pri) return;
+	if (pri < B->pg->favicon_pri) return;
 	const char *href = dom_get_attr(el, "href");
 	if (!href || !href[0] || starts_ci(href, "data:")) return;
 	char buf[URL_MAX];
@@ -741,9 +826,9 @@ static void handle_favicon(struct dom_node *el)
 	buf[k] = '\0';
 	decode_entities(buf);
 	int j = 0;
-	for (; buf[j] && j < (int)sizeof B->favicon_href - 1; j++) B->favicon_href[j] = buf[j];
-	B->favicon_href[j] = '\0';
-	B->favicon_pri = pri;
+	for (; buf[j] && j < (int)sizeof B->pg->favicon_href - 1; j++) B->pg->favicon_href[j] = buf[j];
+	B->pg->favicon_href[j] = '\0';
+	B->pg->favicon_pri = pri;
 }
 
 /* Emit a literal ASCII/UTF-8 run with attr `a`, no whitespace collapsing — used
@@ -915,9 +1000,9 @@ static void handle_iframe(struct dom_node *el)
 
 	/* CSP frame-src (top document only; falls back to child-src then default-src).
 	 * upgrade-insecure-requests also rewrites the frame URL here. */
-	if (g_frame_depth == 0 && B->csp) {
+	if (g_frame_depth == 0 && B->pg->csp) {
 		char fu[URL_MAX], reason[64];
-		if (!csp_check_url(B->csp, CSP_FRAME, abs, g_cur_page_url, fu, sizeof fu, reason, sizeof reason)) {
+		if (!csp_check_url(B->pg->csp, CSP_FRAME, abs, g_cur_page_url, fu, sizeof fu, reason, sizeof reason)) {
 			csp_report("frame", abs, reason);
 			frame_chrome(host, "blocked by CSP frame-src", sbx, allow);
 			return;
@@ -1112,9 +1197,9 @@ int html_form_submit_url(struct dom_node *control, char *out, int cap)
 
 	/* CSP form-action: refuse a submission whose target the policy forbids. Logged
 	 * unconditionally (this is a user action, not the spammy per-relayout walk). */
-	if (B->csp) {
+	if (B->pg->csp) {
 		char fa[URL_MAX], reason[64];
-		if (!csp_check_url(B->csp, CSP_FORM, out, g_cur_page_url, fa, sizeof fa, reason, sizeof reason)) {
+		if (!csp_check_url(B->pg->csp, CSP_FORM, out, g_cur_page_url, fa, sizeof fa, reason, sizeof reason)) {
 			char m[URL_MAX + 96]; int n = 0;
 			sapp(m, &n, sizeof m, "[CSP] refused form submission to ");
 			sapp(m, &n, sizeof m, out);
@@ -1203,6 +1288,19 @@ static void walk_element_inner(struct dom_node *el);
 /* Record this element's covered text range as a span (for click hit-testing),
  * then walk it. Wrapping the whole body means every early return still closes the
  * span, and nested elements naturally produce narrower (deeper) spans. */
+/* Emit a ::before / ::after pseudo-element's generated content as inline text,
+ * styled by the pseudo rule's colour/weight/decoration. No-op when the element
+ * has no such rule (or its content is empty/non-string). */
+static void emit_pseudo(struct dom_node *el, int which)
+{
+	struct css_style pcs;
+	if (!css_pseudo_content(g_sheet, el, which, &pcs)) return;
+	struct sty sv = sty_cur;
+	apply_css(&pcs);
+	emit_text(pcs.content);
+	sty_cur = sv;
+}
+
 static void walk_element(struct dom_node *el)
 {
 	int si = span_begin(el);
@@ -1228,6 +1326,7 @@ static void walk_element_inner(struct dom_node *el)
 	if (cs.disp == CSS_DISP_NONE) return;                        /* display:none */
 
 	if (streq(name, "img"))    { handle_img(el, &cs); return; }
+	if (streq(name, "svg"))    { handle_svg(el, &cs); return; }
 	if (streq(name, "iframe")) { handle_iframe(el); return; }
 	if (streq(name, "link")) { if (g_frame_depth == 0) handle_favicon(el); return; }
 	if (streq(name, "br")) { block_break(); return; }
@@ -1250,13 +1349,14 @@ static void walk_element_inner(struct dom_node *el)
 
 	struct sty saved = sty_cur;
 	unsigned char sv_size = W_size, sv_center = W_center, sv_mono = W_mono,
-	              sv_indent = W_indent, sv_pre = W_pre, sv_bg = W_bg;
+	              sv_indent = W_indent, sv_pre = W_pre;
+	unsigned sv_bg = W_bg;
 	char sv_lt = W_listtype; int sv_ol = W_olnum;
 	int linked = streq(name, "a") ? open_link(el) : 0;
 
 	apply_ua_style(name);
 	apply_css(&cs);
-	if (cs.bg >= 0) W_bg = (unsigned char)nearest_palette((unsigned)cs.bg);
+	if (cs.bg >= 0) W_bg = (unsigned)cs.bg;
 
 	/* Block-level browser defaults. */
 	if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) W_size = (unsigned char)(name[1] - '0');
@@ -1281,7 +1381,11 @@ static void walk_element_inner(struct dom_node *el)
 			emit_lit("\xe2\x80\xa2 ", a);                       /* bullet "• "  */
 		}
 	}
+	if (blk) layout_box_open(el, &cs, W_n);     /* a block/flex box for the layout tree */
+	emit_pseudo(el, CSS_PSEUDO_BEFORE);
 	walk(el);
+	emit_pseudo(el, CSS_PSEUDO_AFTER);
+	if (blk) layout_box_close(W_n);
 	if (blk) block_break();
 
 	if (linked) close_link();
@@ -1370,8 +1474,8 @@ static void collect_styles(struct dom_node *node)
 				buf[bl] = '\0';
 			}
 			char reason[64];
-			int ok = (!B->csp) ? 1 :
-			         csp_check_inline(B->csp, CSP_STYLE, dom_get_attr(c, "nonce"),
+			int ok = (!B->pg->csp) ? 1 :
+			         csp_check_inline(B->pg->csp, CSP_STYLE, dom_get_attr(c, "nonce"),
 			                          (const unsigned char *)buf, bl, reason, sizeof reason);
 			if (ok) {
 				for (struct dom_node *t = c->first_child; t; t = t->next)
@@ -1419,8 +1523,8 @@ static void scan_meta_csp(struct dom_node *node)
 			const char *he = dom_get_attr(c, "http-equiv");
 			const char *ct = dom_get_attr(c, "content");
 			if (he && ct && ct[0] && streq_ci(he, "content-security-policy")) {
-				if (!B->csp) B->csp = csp_new();
-				csp_add(B->csp, ct);
+				if (!B->pg->csp) B->pg->csp = csp_new();
+				csp_add(B->pg->csp, ct);
 			}
 		} else {
 			scan_meta_csp(c);
@@ -1464,7 +1568,7 @@ static struct font *load_face_file(const char *path, struct loaded_face *slot)
  * page, batch-fetched (multiplexed like the stylesheets), and parsed by
  * user/lib/font; the kept face owns its file bytes (the parser points into them),
  * so unloaded bodies are freed. The result is swapped into B under blk_lock
- * because render() reads B->body_font and B->faces on the main thread while this
+ * because render() reads B->pg->body_font and B->pg->faces on the main thread while this
  * runs on the fetch worker. */
 /* Is `family` one of the comma-separated names in the font-family `stack`? Uses
  * the same naive split as the picker below, so the faces we fetch are exactly the
@@ -1483,16 +1587,16 @@ static int family_in_stack(const char *stack, const char *family)
 	return 0;
 }
 
-/* Ensure B->faces holds `need` entries (grows on demand). render() reads only
- * B->body_font, never the array, so the realloc is safe under blk_lock. */
+/* Ensure B->pg->faces holds `need` entries (grows on demand). render() reads only
+ * B->pg->body_font, never the array, so the realloc is safe under blk_lock. */
 static int faces_room(int need)
 {
-	if (need <= B->faces_cap) return 1;
-	int nc = B->faces_cap ? B->faces_cap : 4;
+	if (need <= B->pg->faces_cap) return 1;
+	int nc = B->pg->faces_cap ? B->pg->faces_cap : 4;
 	while (nc < need) nc *= 2;
-	struct loaded_face *n = realloc(B->faces, (unsigned)nc * sizeof *n);
+	struct loaded_face *n = realloc(B->pg->faces, (unsigned)nc * sizeof *n);
 	if (!n) return 0;
-	B->faces = n; B->faces_cap = nc;
+	B->pg->faces = n; B->pg->faces_cap = nc;
 	return 1;
 }
 
@@ -1589,22 +1693,22 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
 
 	/* Publish: drop the previous page's faces, install the new set. */
 	blk_lock();
-	for (int i = 0; i < B->n_faces; i++) {
-		if (B->faces[i].font) font_free(B->faces[i].font);
-		free(B->faces[i].data);
+	for (int i = 0; i < B->pg->n_faces; i++) {
+		if (B->pg->faces[i].font) font_free(B->pg->faces[i].font);
+		free(B->pg->faces[i].data);
 	}
 	if (nn > 0 && faces_room(nn)) {
-		for (int i = 0; i < nn; i++) B->faces[i] = nf[i];
-		B->n_faces = nn;
-		B->body_font = chosen;
+		for (int i = 0; i < nn; i++) B->pg->faces[i] = nf[i];
+		B->pg->n_faces = nn;
+		B->pg->body_font = chosen;
 	} else {
-		B->n_faces = 0;
-		B->body_font = 0;                  /* faces_room OOM: free below, fall back */
+		B->pg->n_faces = 0;
+		B->pg->body_font = 0;                  /* faces_room OOM: free below, fall back */
 	}
 	blk_unlock();
 
 	if (nf) {
-		if (B->n_faces == 0)               /* publish failed: don't leak parsed faces */
+		if (B->pg->n_faces == 0)               /* publish failed: don't leak parsed faces */
 			for (int i = 0; i < nn; i++) { if (nf[i].font) font_free(nf[i].font); free(nf[i].data); }
 		free(nf);
 	}
@@ -1612,22 +1716,60 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
 
 /* Reset the render buffers and re-flatten the live DOM into them. Shared by the
  * initial html_to_text and by html_relayout (after an event mutates the tree). */
+/* Alpha-composite src (0xAARRGGBB) over the opaque dst (0xRRGGBB). */
+static unsigned composite_over(unsigned dst, unsigned src)
+{
+	unsigned a = (src >> 24) & 0xff;
+	if (a == 0)   return dst;
+	if (a == 255) return src & 0xFFFFFF;
+	unsigned sr = (src >> 16) & 0xff, sg = (src >> 8) & 0xff, sb = src & 0xff;
+	unsigned dr = (dst >> 16) & 0xff, dg = (dst >> 8) & 0xff, db = dst & 0xff;
+	unsigned ia = 255 - a;
+	unsigned r = (sr * a + dr * ia) / 255, g = (sg * a + dg * ia) / 255, b = (sb * a + db * ia) / 255;
+	return (r << 16) | (g << 8) | b;
+}
+
+/* The canvas background and default text colour, from the <html>/<body> cascade.
+ * The canvas starts white; each of <html> then <body>'s background composites over
+ * it (so a translucent tint blends instead of overriding), matching how a browser
+ * propagates the root/body background to the canvas. Defaults: white page, near-
+ * black text. The main thread reads B->pg->page_bg/fg. */
+static void compute_page_colors(struct dom_node *root)
+{
+	unsigned canvas = 0xffffff;
+	B->pg->page_fg = 0x202830;
+	struct css_style cs;
+	const char *who[] = { "html", "body" };
+	for (int i = 0; i < 2; i++) {
+		struct dom_node *el = find_tag(root, who[i]);
+		if (!el) continue;
+		compute_style(el, &cs);
+		if (cs.color >= 0) B->pg->page_fg = (unsigned)cs.color;
+		unsigned argb;
+		if (css_bg_argb(g_sheet, el, &argb)) canvas = composite_over(canvas, argb);
+	}
+	B->pg->page_bg = canvas;
+}
+
 static void layout_dom(void)
 {
 	css_set_viewport(BW, BH);        /* so @media re-evaluates at the current size */
-	B->nlinks = 0;
-	B->n_imgs = 0;
+	B->pg->nlinks = 0;
+	B->pg->n_imgs = 0;
 	B->img_pool_len = 0;
-	sty_cur.fg = sty_cur.bold = sty_cur.under = 0;
+	compute_page_colors(g_live_dom);
+	sty_cur.fg = B->pg->page_fg; sty_cur.bold = sty_cur.under = 0;
+	W_bg = BG_NONE;
 	W_n = 0; W_pend_sp = 0; W_run_nl = 1; W_cur_link = -1;
 	g_nspans = 0;
+	layout_reset();                  /* fresh box tree for this walk */
 	g_has_controls = 0;
 	/* Reset the frame walk context to the top document (the cache itself persists
 	 * across relayouts; only the per-walk base/depth/nav reset here). */
 	g_frame_depth = 0; g_link_nav = 1;
 	{ int k = 0; g_base_url[0] = '\0'; sapp(g_base_url, &k, sizeof g_base_url, g_cur_page_url); }
 	if (g_live_dom) walk(g_live_dom);
-	B->text_len = W_n;
+	B->pg->text_len = W_n;
 }
 
 /* Free the current page's live DOM, CSS sheet and JS context. Called on every
@@ -1640,6 +1782,7 @@ void html_page_teardown(void)
 	if (g_live_dom) { dom_free(g_live_dom); g_live_dom = 0; }
 	if (g_sheet)    { css_free(g_sheet);    g_sheet = 0; }
 	frames_free();                     /* drop this page's iframe sub-documents */
+	layout_free();                     /* drop the box tree */
 	g_nspans = 0;
 	g_focus = 0; B->focus_kind = 0;
 }
@@ -1712,12 +1855,12 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 {
 	html_page_teardown();           /* reclaim the previous page's live DOM/CSS/JS */
 
-	B->doc_title[0] = '\0';
-	B->nlinks = 0;
-	B->n_imgs = 0;
+	B->pg->doc_title[0] = '\0';
+	B->pg->nlinks = 0;
+	B->pg->n_imgs = 0;
 	B->img_pool_len = 0;
-	B->favicon_href[0] = '\0';
-	B->favicon_pri = 0;
+	B->pg->favicon_href[0] = '\0';
+	B->pg->favicon_pri = 0;
 
 	{ int k = 0; sapp(g_cur_page_url, &k, sizeof g_cur_page_url, page_url ? page_url : ""); }
 	g_page_url = g_cur_page_url;    /* persists with the page (was a caller pointer) */
@@ -1727,11 +1870,11 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 	detect_meta_charset();          /* header charset (if any) already set by fetch.c */
 	g_csp_report = 1;               /* log CSP violations for this initial load only */
 
-	struct dom_node *root = dom_parse(B->raw, B->raw_len);
+	struct dom_node *root = dom_parse(B->pg->raw, B->pg->raw_len);
 	g_sheet = css_new();
 	g_live_dom = root;              /* the live tree — kept until the next teardown  */
 	if (root) {
-		scan_meta_csp(root);    /* fold <meta http-equiv=CSP> into B->csp before any load */
+		scan_meta_csp(root);    /* fold <meta http-equiv=CSP> into B->pg->csp before any load */
 		/* Link:-header sheets come before the document's own (then tree order). */
 		for (struct css_link *L = B->ext_css; L; L = L->next) src_link(L->url);
 		collect_styles(root);
@@ -1753,7 +1896,7 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 		free(bodies); free(lens);
 
 		/* @font-face: load declared faces and pick the body font (before walk so
-		 * the renderer sees B->body_font for this page's text). */
+		 * the renderer sees B->pg->body_font for this page's text). */
 		load_faces(root, g_page_url, fetch);
 
 		/* Lay out and paint the parsed page BEFORE running scripts: a slow or
@@ -1771,7 +1914,7 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 		if (dom_mutation_seq != mseq)
 			layout_dom();
 	} else {
-		B->text_len = 0;
+		B->pg->text_len = 0;
 	}
 	g_csp_report = 0;               /* later relayouts re-decide silently (no log spam) */
 	/* DOM + sheet + JS context are NOT freed here — they live until the next
@@ -1784,12 +1927,15 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
  * pages, whose line breaks the HTML reducer would otherwise collapse. */
 void plain_to_text(void)
 {
-	const char *p = B->raw, *pend = B->raw + B->raw_len;
+	const char *p = B->pg->raw, *pend = B->pg->raw + B->pg->raw_len;
 	int n = 0, col = 0;
 
-	B->doc_title[0] = '\0';
-	B->nlinks = 0;
-	B->n_imgs = 0;
+	B->pg->doc_title[0] = '\0';
+	B->pg->nlinks = 0;
+	B->pg->n_imgs = 0;
+	B->pg->page_bg = 0xffffff; B->pg->page_fg = 0x202830;
+	sty_cur.fg = B->pg->page_fg; sty_cur.bold = sty_cur.under = 0;
+	W_bg = BG_NONE; W_size = W_center = W_mono = W_indent = W_pre = 0;
 
 	while (p < pend) {
 		unsigned char c = (unsigned char)*p;
@@ -1811,7 +1957,7 @@ void plain_to_text(void)
 			col++;
 		}
 	}
-	B->text_len = n;
+	B->pg->text_len = n;
 }
 
 /* Fill the styled-text buffer with a literal one-off message (e.g. "unsupported
@@ -1819,12 +1965,15 @@ void plain_to_text(void)
 void doc_message(const char *m)
 {
 	int n = 0;
+	B->pg->page_bg = 0xffffff; B->pg->page_fg = 0x202830;
 	while (m[n]) {
 		if (!ensure_text(n + 1)) break;
-		B->text[n] = m[n]; B->attr[n] = 0; n++;
+		B->pg->text[n] = m[n]; B->pg->attr[n] = 0;
+		B->pg->bp[n] = 0; B->pg->fg[n] = B->pg->page_fg; B->pg->bg[n] = BG_NONE;
+		n++;
 	}
-	B->text_len = n;
-	B->doc_title[0] = '\0';
-	B->nlinks = 0;
-	B->n_imgs = 0;
+	B->pg->text_len = n;
+	B->pg->doc_title[0] = '\0';
+	B->pg->nlinks = 0;
+	B->pg->n_imgs = 0;
 }

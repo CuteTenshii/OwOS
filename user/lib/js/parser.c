@@ -26,7 +26,14 @@ typedef struct {
     int       in_generator;     /* inside a generator body (yield is a kw)        */
     int       pending_async;    /* the function/arrow about to be parsed is async */
     int       pending_generator;/* the method about to be parsed is a generator   */
+    int       depth;            /* live recursion depth, bounded to spare the stack */
 } js_parser;
+
+/* The recursive-descent core costs one frame-ladder per source nesting level
+ * (~900 B at -O0). Cap nesting so a pathological/minified-to-death input fails
+ * with a clean SyntaxError instead of overflowing the user stack and faulting.
+ * Kept comfortably under USER_STACK_PAGES worth of frames (see kernel/loader.h). */
+#define JS_MAX_DEPTH 700
 
 /* ------------------------------------------------------- token stream ----- */
 
@@ -457,7 +464,15 @@ static js_node *finish_arrow(js_parser *p, js_node **params, int nparams, int li
     return p->failed ? NULL : fn;
 }
 
+static js_node *parse_assignment_inner(js_parser *p, int no_in);
 static js_node *parse_assignment(js_parser *p, int no_in) {
+    js_node *r;
+    if (++p->depth > JS_MAX_DEPTH) { --p->depth; return perr(p, "expression nesting too deep"); }
+    r = parse_assignment_inner(p, no_in);
+    --p->depth;
+    return r;
+}
+static js_node *parse_assignment_inner(js_parser *p, int no_in) {
     js_node *left;
 
     /* yield / yield* (only inside a generator body) */
@@ -766,7 +781,16 @@ static js_node *parse_primary(js_parser *p) {
     case T_NULL:  { js_node *n = mk(p, JS_NULL);  advance(p); return n; }
     case T_THIS:  { js_node *n = mk(p, JS_THIS);  advance(p); return n; }
     case T_SUPER: { js_node *n = mk(p, JS_SUPER); advance(p); return n; }
-    case T_IDENT: return eat_ident(p);
+    case T_IDENT:
+        /* `#name` (a private brand) only appears in expression position as the
+         * left of `#x in obj`; emit it as the string key it maps to. */
+        if (p->cur.value && p->cur.value[0] == '#') {
+            js_node *k = mk(p, JS_STR);
+            k->u.str.s = p->cur.value; k->u.str.len = p->cur.value_len;
+            advance(p);
+            return k;
+        }
+        return eat_ident(p);
     case T_LBRACK: return parse_array_literal(p);
     case T_LBRACE: return parse_object_literal(p);
     case T_LPAREN: return parse_paren_or_arrow(p);
@@ -909,6 +933,16 @@ static js_node *parse_class(js_parser *p, int is_decl) {
             m.is_static = 1;
             advance(p);
         }
+        if (m.is_static && at(p, T_LBRACE)) {     /* static initialization block */
+            js_node *fn = js_node_new(p->arena, JS_FUNC, line);
+            fn->u.func.name = NULL; fn->u.func.params = NULL; fn->u.func.nparams = 0;
+            fn->u.func.is_arrow = fn->u.func.is_expr_body = fn->u.func.is_async = fn->u.func.is_generator = 0;
+            fn->u.func.body = parse_block(p);
+            m.kind = JS_M_STATIC_BLOCK; m.value = fn;
+            if (n + 1 > cap) { cap = cap ? cap * 2 : 4; members = (js_member *)realloc(members, (unsigned)cap * sizeof(js_member)); }
+            members[n++] = m;
+            continue;
+        }
         {
         int ismeth = method_prefix(p);            /* async / * generator method   */
         if (!ismeth && starts_accessor(p)) {
@@ -995,6 +1029,7 @@ static js_node *parse_for(js_parser *p) {
     int line = p->cur.line;
     js_node *init = NULL;
     advance(p);                                   /* 'for' */
+    if (at(p, T_IDENT) && word_is(&p->cur, "await", 5)) advance(p);   /* `for await` (async iteration) — parsed like for-of */
     expect(p, T_LPAREN, "expected '(' after 'for'");
 
     if (at(p, T_SEMI)) {
@@ -1243,7 +1278,15 @@ static js_node *parse_export_decl(js_parser *p) {
     return p->failed ? NULL : n;
 }
 
+static js_node *parse_statement_inner(js_parser *p);
 static js_node *parse_statement(js_parser *p) {
+    js_node *r;
+    if (++p->depth > JS_MAX_DEPTH) { --p->depth; return perr(p, "statement nesting too deep"); }
+    r = parse_statement_inner(p);
+    --p->depth;
+    return r;
+}
+static js_node *parse_statement_inner(js_parser *p) {
     switch (p->cur.kind) {
     case T_LBRACE: return parse_block(p);
     case T_SEMI:   { js_node *n = mk(p, JS_EMPTY); advance(p); return n; }
@@ -1340,6 +1383,7 @@ js_node *js_parse(const char *src, js_arena *arena, js_parse_error *err) {
     p.errmsg = NULL;
     p.errline = 0;
     p.in_async = p.in_generator = p.pending_async = p.pending_generator = 0;
+    p.depth = 0;
     js_lexer_init(&p.lx, src, arena);
     advance(&p);
 
