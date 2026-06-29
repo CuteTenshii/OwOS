@@ -5,15 +5,24 @@
  * even under -ffreestanding, so the freestanding kernel must provide one — with
  * the standard signature, since that's what the compiler emits calls to.
  *
- * A byte-loop memcpy is only a footgun at -O2+, where the loop-idiom pass would
- * rewrite it into a self-call; this kernel builds at -O0, so the loop lives here
- * directly rather than behind a differently-named worker. */
+ * A byte-loop memcpy is a footgun at -O2+, where the loop-idiom pass would
+ * rewrite it into a self-call; the kernel builds with
+ * -fno-tree-loop-distribute-patterns (see toolchain.mk) precisely so this loop
+ * can live here directly rather than behind a differently-named worker. */
+/* Word-at-a-time copy: `rep movsl` for the dword bulk, `rep movsb` for the
+ * 0..3 trailing bytes. Byte-at-a-time was ~4-8x slower and dominated every
+ * framebuffer blit/present at -O1 (the compositor copies whole windows). */
 void *memcpy(void *dst, const void *src, uint32_t n)
 {
-	uint8_t *d = dst;
-	const uint8_t *s = src;
-	while (n--)
-		*d++ = *s++;
+	int d0, d1, d2;
+	__asm__ volatile(
+		"rep ; movsl\n\t"
+		"movl %4, %%ecx\n\t"
+		"andl $3, %%ecx\n\t"
+		"rep ; movsb"
+		: "=&c"(d0), "=&D"(d1), "=&S"(d2)
+		: "0"(n >> 2), "g"(n), "1"(dst), "2"(src)
+		: "memory");
 	return dst;
 }
 
@@ -38,9 +47,17 @@ void *memmove(void *dst, const void *src, uint32_t n)
 /* The other primitive gcc emits implicitly (e.g. for `struct x = {0}`). */
 void *memset(void *dst, int c, uint32_t n)
 {
-	uint8_t *d = dst;
-	while (n--)
-		*d++ = (uint8_t)c;
+	int d0, d1;
+	unsigned cc = (unsigned char)c;
+	unsigned pat = cc | (cc << 8) | (cc << 16) | (cc << 24);
+	__asm__ volatile(
+		"rep ; stosl\n\t"
+		"movl %4, %%ecx\n\t"
+		"andl $3, %%ecx\n\t"
+		"rep ; stosb"
+		: "=&c"(d0), "=&D"(d1)
+		: "a"(pat), "0"(n >> 2), "g"(n), "1"(dst)
+		: "memory");
 	return dst;
 }
 

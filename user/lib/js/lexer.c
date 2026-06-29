@@ -117,6 +117,7 @@ void js_lexer_init(jlexer *lx, const char *src, js_arena *arena) {
     lx->brace_sp = 0;
     lx->paren_sp = 0;
     lx->prev_rparen_ctrl = 0;
+    lx->prev_rbrace_block = 0;
     lx->err = NULL;
 }
 
@@ -147,6 +148,20 @@ static void skip_trivia(jlexer *lx) {
                 lx->p++;
             }
             if (*lx->p) lx->p += 2;     /* consume the closing star-slash */
+            continue;
+        }
+        /* Annex B HTML-like comments (legacy inline-script wrappers): `<!--`
+         * opens a single-line comment anywhere; `-->` is one only at line start
+         * (saw_newline => only whitespace/comments precede it on this line, so a
+         * real `a-->b` post-decrement stays tokenized as `--` `>`). */
+        if (c == '<' && lx->p[1] == '!' && lx->p[2] == '-' && lx->p[3] == '-') {
+            lx->p += 4;
+            while (*lx->p && *lx->p != '\n') lx->p++;
+            continue;
+        }
+        if (c == '-' && lx->p[1] == '-' && lx->p[2] == '>' && lx->saw_newline) {
+            lx->p += 3;
+            while (*lx->p && *lx->p != '\n') lx->p++;
             continue;
         }
         return;
@@ -322,6 +337,37 @@ static int regex_allowed(int prev) {
     }
 }
 
+/* True if a `{` in this position opens an object literal rather than a block.
+ * Decided from the previous significant token: a `{` is an object literal only
+ * in expression-operand position (after an operator, `(`/`[`/`,`/`:`/`?`, or an
+ * expression-introducing keyword like return/typeof/new). Everywhere else —
+ * statement start, after `;`/`}`/`)`/`=>`/`else`, a function or control body —
+ * it opens a block. This drives the regex-vs-divide choice after the matching
+ * `}`: a `/` after a block-`}` is a regex; after an object-literal `}`, divide. */
+static int lbrace_is_object(int prev) {
+    switch (prev) {
+    case T_LPAREN: case T_LBRACK: case T_COMMA: case T_COLON: case T_QUESTION:
+    case T_EQ: case T_PLUS_EQ: case T_MINUS_EQ: case T_STAR_EQ:
+    case T_SLASH_EQ: case T_PERCENT_EQ: case T_STARSTAR_EQ:
+    case T_LTLT_EQ: case T_GTGT_EQ: case T_GTGTGT_EQ:
+    case T_AMP_EQ: case T_BAR_EQ: case T_CARET_EQ:
+    case T_AMPAMP_EQ: case T_BARBAR_EQ: case T_QQ_EQ:
+    case T_PLUS: case T_MINUS: case T_STAR: case T_PERCENT: case T_STARSTAR:
+    case T_EQEQ: case T_NE: case T_EQEQEQ: case T_NEEQ:
+    case T_LT: case T_GT: case T_LE: case T_GE:
+    case T_LTLT: case T_GTGT: case T_GTGTGT:
+    case T_AMP: case T_BAR: case T_CARET:
+    case T_AMPAMP: case T_BARBAR: case T_QQ:
+    case T_BANG: case T_TILDE: case T_ELLIPSIS:
+    case T_IN: case T_INSTANCEOF:
+    case T_RETURN: case T_TYPEOF: case T_VOID: case T_DELETE:
+    case T_NEW: case T_THROW: case T_CASE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static void scan_regex(jlexer *lx, jtoken *out) {
     cbuf pat, flags;
     int in_class = 0;
@@ -349,7 +395,7 @@ static void scan_regex(jlexer *lx, jtoken *out) {
 
 void js_lex_next(jlexer *lx, jtoken *out) {
     char c;
-    int rparen_ctrl;
+    int rparen_ctrl, rbrace_block;
     out->kind = T_EOF; out->newline_before = 0; out->num = 0;
     out->value = NULL; out->value_len = 0; out->flags = NULL; out->len = 0;
 
@@ -366,6 +412,7 @@ void js_lex_next(jlexer *lx, jtoken *out) {
      * trivia between that ')' and this token, then clear it; re-set below only
      * when this token is itself such a ')'. */
     rparen_ctrl = lx->prev_rparen_ctrl; lx->prev_rparen_ctrl = 0;
+    rbrace_block = lx->prev_rbrace_block; lx->prev_rbrace_block = 0;
     if (c == 0) { out->kind = T_EOF; lx->prev_kind = T_EOF; return; }
 
     if (is_id_start(c)) {
@@ -424,11 +471,12 @@ void js_lex_next(jlexer *lx, jtoken *out) {
             if (out->kind != T_ERROR) lx->prev_kind = out->kind;
             return;
         }
+        if (lx->brace_sp > 0 && lx->brace[lx->brace_sp - 1] == 2) lx->prev_rbrace_block = 1;
         if (lx->brace_sp > 0) lx->brace_sp--;
         lx->p++; out->kind = T_RBRACE; out->len = 1; lx->prev_kind = T_RBRACE; return;
     }
 
-    if (c == '/' && (regex_allowed(lx->prev_kind) || rparen_ctrl)) {
+    if (c == '/' && (regex_allowed(lx->prev_kind) || rparen_ctrl || rbrace_block)) {
         scan_regex(lx, out);
         out->len = (int)(lx->p - out->start);
         if (out->kind != T_ERROR) lx->prev_kind = out->kind;
@@ -439,7 +487,7 @@ void js_lex_next(jlexer *lx, jtoken *out) {
     {
         char d = lx->p[1];
         switch (c) {
-        case '{': if (lx->brace_sp < (int)sizeof(lx->brace)) lx->brace[lx->brace_sp++] = 0; ADV(1, T_LBRACE);
+        case '{': if (lx->brace_sp < (int)sizeof(lx->brace)) lx->brace[lx->brace_sp++] = lbrace_is_object(lx->prev_kind) ? 0 : 2; ADV(1, T_LBRACE);
         case '(': {
             /* Remember whether this '(' is an if/for/while/with header: a ')'
              * closing it is followed by a statement, so a '/' there is a regex. */

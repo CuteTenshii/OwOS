@@ -479,6 +479,24 @@ static task_t *find_task(uint32_t id)
 static void reap_task(task_t *t)
 {
 	uintptr_t fl = irq_save();
+
+	/* An address-space owner (dir != 0) shares its page directory with the
+	 * threads it spawned (same cr3, dir == 0). Releasing the dir below frees
+	 * those page tables and user frames; a thread still on the run queue would
+	 * then be scheduled onto a freed CR3 -> triple fault. Mark every such
+	 * sibling zombie now, under the same lock, so no tick can pick one before
+	 * we drain them. (Kernel threads/main_task use the kernel CR3 and forked
+	 * children own their own dir, so neither matches.) */
+	if (t->dir) {
+		task_t *s = t->next;
+		while (s != t) {
+			if (s != &main_task && s != current &&
+			    s->cr3 == t->cr3 && !s->dir && s->state != TASK_FREE)
+				s->state = TASK_ZOMBIE;
+			s = s->next;
+		}
+	}
+
 	task_t *p = &main_task;
 	while (p->next != t)
 		p = p->next;
@@ -487,8 +505,36 @@ static void reap_task(task_t *t)
 	if (fl & 0x200)
 		__asm__ volatile ("sti");
 
-	if (t->dir)
+	if (t->dir) {
+		/* Drain the owner's threads before releasing the shared address space:
+		 * close their fds (a fetch worker's socket/TCB would otherwise leak),
+		 * unlink, and free their nodes -- all while the dir is still valid. */
+		for (;;) {
+			task_t *th = 0, *s = main_task.next;
+			while (s != &main_task) {
+				if (s != current && s->cr3 == t->cr3 && !s->dir) {
+					th = s;
+					break;
+				}
+				s = s->next;
+			}
+			if (!th)
+				break;
+			fds_close_all(th);
+			fl = irq_save();
+			task_t *q = &main_task;
+			while (q->next != th)
+				q = q->next;
+			q->next = th->next;
+			count--;
+			if (fl & 0x200)
+				__asm__ volatile ("sti");
+			if (th->kstack)
+				kfree(th->kstack);
+			kfree(th);
+		}
 		paging_free_process_dir(t->dir);
+	}
 	if (t->kstack)
 		kfree(t->kstack);
 	kfree(t);

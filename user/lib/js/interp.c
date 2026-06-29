@@ -104,6 +104,18 @@ js_value js_throw_type(js_ctx *ctx, const char *msg)  { return js_throw_error(ct
 js_value js_throw_range(js_ctx *ctx, const char *msg) { return js_throw_error(ctx, ctx->range_error_proto, "RangeError", msg); }
 static js_value throw_ref(js_ctx *ctx, const char *msg) { return js_throw_error(ctx, ctx->ref_error_proto, "ReferenceError", msg); }
 
+void js_set_stack_limit(js_ctx *ctx, void *low_limit) { ctx->stack_limit = (char *)low_limit; }
+
+/* Native-stack overflow guard. The evaluator and native callbacks recurse on the
+ * C stack, so deep recursion (or a deeply nested AST) would smash past a bounded
+ * thread stack. `sp` is the caller's own frame address; the limit is the floor
+ * the embedder reserved headroom above. A fixed call-count cap can't catch this:
+ * per-frame stack cost varies, and expression recursion never bumps the count. */
+static int stack_overflow(js_ctx *ctx, void *sp)
+{
+    return ctx->stack_limit && (char *)sp < ctx->stack_limit;
+}
+
 void js_def_native(js_ctx *ctx, js_object *o, const char *name, js_native fn, int arity) {
     gc_push_scope();
     {
@@ -228,7 +240,7 @@ static js_value apply_binop(js_ctx *ctx, int op, js_value l, js_value r) {
     case T_GTGTGT: return js_number((double)(js_to_uint32(ctx, l) >> (js_to_uint32(ctx, r) & 31)));
     case T_IN:
         if (r.type != JV_OBJ) return js_throw_type(ctx, "'in' requires an object");
-        { js_value k = js_to_string(ctx, l); if (ctx->has_exc) return js_undef(); return js_bool(has_property(ctx, r.u.obj, k.u.str->data)); }
+        { js_value hold; const char *key = to_prop_key(ctx, l, &hold); if (ctx->has_exc) return js_undef(); return js_bool(has_property(ctx, r.u.obj, key)); }
     case T_INSTANCEOF: {
         js_value proto;
         js_object *o;
@@ -455,7 +467,7 @@ static js_value eval_assign(js_ctx *ctx, js_node *n) {
                 js_value obj = evaluate(ctx, target->u.member.obj);
                 if (ctx->has_exc) return js_undef();
                 if (!target->u.member.computed) js_set(ctx, obj, target->u.member.prop->u.str.s, rhs);
-                else { js_value k = js_to_string(ctx, evaluate(ctx, target->u.member.prop)); if (!ctx->has_exc) js_set(ctx, obj, k.u.str->data, rhs); }
+                else { js_value kv = evaluate(ctx, target->u.member.prop), hold; if (!ctx->has_exc) { const char *key = to_prop_key(ctx, kv, &hold); if (!ctx->has_exc) js_set(ctx, obj, key, rhs); } }
             }
             return rhs;
         }
@@ -481,19 +493,16 @@ static js_value eval_assign(js_ctx *ctx, js_node *n) {
         if (target->type == JS_MEMBER) {
             js_value obj = evaluate(ctx, target->u.member.obj);
             js_value res;
-            char keybuf[DTOA_MAX];
             const char *key;
             js_value cur, rhs;
             if (ctx->has_exc) return js_undef();
             gc_push_scope(); KEEP(obj);
             if (target->u.member.computed) {
-                js_value k = evaluate(ctx, target->u.member.prop);
-                js_value ks;
+                js_value k = evaluate(ctx, target->u.member.prop), hold;
                 if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
-                ks = js_to_string(ctx, k);
+                key = to_prop_key(ctx, k, &hold);
                 if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
-                KEEP(ks);
-                { int n2 = ks.u.str->len < DTOA_MAX - 1 ? ks.u.str->len : DTOA_MAX - 1; memcpy(keybuf, ks.u.str->data, (unsigned)n2); keybuf[n2] = 0; key = keybuf; }
+                KEEP(hold);
             } else key = target->u.member.prop->u.str.s;
             cur = js_get(ctx, obj, key); KEEP(cur);
             rhs = evaluate(ctx, n->u.bin.right);
@@ -782,7 +791,9 @@ static js_value eval_class(js_ctx *ctx, js_node *node) {
 /* ------------------------------------------------------- evaluate --------- */
 
 static js_value evaluate(js_ctx *ctx, js_node *n) {
+    char probe;
     if (ctx->has_exc) return js_undef();
+    if (stack_overflow(ctx, &probe)) return js_throw_range(ctx, "maximum call stack size exceeded");
     switch (n->type) {
     case JS_NUM:   return js_number(n->u.num);
     case JS_STR:   return js_mk_string(ctx, n->u.str.s, n->u.str.len);
@@ -796,7 +807,22 @@ static js_value evaluate(js_ctx *ctx, js_node *n) {
     case JS_TAGGED_TEMPLATE: return build_tagged(ctx, n);
     case JS_ARRAY:  return build_array(ctx, n);
     case JS_OBJECT: return build_object(ctx, n);
-    case JS_FUNC:   return js_obj_value(js_new_function(ctx, n, ctx->cur_env));
+    case JS_FUNC:
+        /* A named function expression binds its own name in a dedicated scope
+         * that wraps its closure, so the body can recurse by name (the staple of
+         * UMD/browserify bundles) without leaking the name to the enclosing
+         * scope. Arrows have no name and skip this. */
+        if (n->u.func.name && !n->u.func.is_arrow) {
+            js_object *fn;
+            js_env *fenv;
+            gc_push_scope();
+            fenv = (js_env *)gc_keep(js_new_env(ctx, ctx->cur_env, 0));
+            fn = (js_object *)gc_keep(js_new_function(ctx, n, fenv));
+            js_env_define(fenv, n->u.func.name, js_obj_value(fn), P_WRITABLE);
+            gc_pop_scope();
+            return js_obj_value(fn);
+        }
+        return js_obj_value(js_new_function(ctx, n, ctx->cur_env));
     case JS_IMPORT_META: {
         js_object *o = js_new_object(ctx, ctx->object_proto);
         gc_push_scope(); gc_keep(o);
@@ -860,7 +886,10 @@ static js_value evaluate(js_ctx *ctx, js_node *n) {
                 js_value obj = evaluate(ctx, opd->u.member.obj);
                 if (ctx->has_exc) return js_undef();
                 if (obj.type == JV_OBJ) {
-                    if (opd->u.member.computed) { js_value k = js_to_string(ctx, evaluate(ctx, opd->u.member.prop)); if (!ctx->has_exc) js_delete(obj.u.obj, k.u.str->data); }
+                    if (opd->u.member.computed) {
+                        js_value kv = evaluate(ctx, opd->u.member.prop), hold;
+                        if (!ctx->has_exc) { const char *key = to_prop_key(ctx, kv, &hold); if (!ctx->has_exc) js_delete(obj.u.obj, key); }
+                    }
                     else js_delete(obj.u.obj, opd->u.member.prop->u.str.s);
                 }
             }
@@ -1062,6 +1091,12 @@ static void hoist_functions(js_ctx *ctx, js_node **items, int count) {
 
 static completion exec_var_decl(js_ctx *ctx, js_node *n) {
     int i;
+    /* `var` names are hoisted to the function scope already, so a `var` initializer
+     * must ASSIGN to that hoisted binding (declare=0) — not define a fresh one in
+     * the current (possibly block/for) scope, which would leave the function-scope
+     * var untouched once the inner scope pops. `let`/`const` are block-scoped, so
+     * they declare in the current scope. */
+    int is_var = n->u.var.kind == JS_DECL_VAR;
     unsigned char flags = n->u.var.kind == JS_DECL_CONST ? P_ENUMERABLE : (P_WRITABLE | P_ENUMERABLE);
     for (i = 0; i < n->u.var.count; i++) {
         js_declor *d = &n->u.var.decls[i];
@@ -1069,11 +1104,11 @@ static completion exec_var_decl(js_ctx *ctx, js_node *n) {
         if (d->init) {
             init = evaluate(ctx, d->init);
             if (ctx->has_exc) return cnorm();
-        } else if (n->u.var.kind == JS_DECL_VAR && d->id->type == JS_IDENT) {
-            if (js_env_lookup(ctx->cur_env, d->id->u.str.s)) continue;   /* keep hoisted value */
+        } else if (is_var) {
+            continue;                              /* no initializer: keep the hoisted binding's value */
         }
         gc_push_scope(); KEEP(init);
-        bind_pattern(ctx, d->id, init, 1, flags);
+        bind_pattern(ctx, d->id, init, is_var ? 0 : 1, flags);
         gc_pop_scope();
         if (ctx->has_exc) return cnorm();
     }
@@ -1456,6 +1491,11 @@ static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_va
     completion c;
     int i, ai;
     int pushed = 0;
+    char probe;
+
+    /* Guard before the native dispatch below — a native callback (forEach, JSON
+     * reviver, sort comparator ...) recurses on the C stack without bumping depth. */
+    if (stack_overflow(ctx, &probe)) return js_throw_range(ctx, "maximum call stack size exceeded");
 
     if (ctx->nframes < 64) { ctx->frames[ctx->nframes++] = (f->name && f->name[0]) ? f->name : "<anonymous>"; pushed = 1; }
 
@@ -1752,6 +1792,8 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
     gc_add_root((void **)&ctx->range_error_proto);
     gc_add_root((void **)&ctx->syntax_error_proto);
     gc_add_root((void **)&ctx->ref_error_proto);
+    gc_add_root((void **)&ctx->sym_registry);
+    gc_add_root((void **)&ctx->sym_for_reg);
     gc_add_root(&ctx->exc_root);
 
     ctx->object_proto   = js_new_object(ctx, NULL);
@@ -1784,6 +1826,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
     ctx->global_env->thisv = js_obj_value(ctx->global);
     ctx->cur_env = ctx->global_env;
 
+    ctx->sym_registry = js_new_array(ctx, 0);   /* must exist before js_mk_symbol runs */
     js_setup_builtins(ctx);
     return ctx;
 }

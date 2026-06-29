@@ -12,6 +12,17 @@ static int       g_w, g_h;
 
 void gfx_init(unsigned *fb, int w, int h) { g_fb = fb; g_w = w; g_h = h; }
 
+/* 32-bpp run fill (`rep stosl`): solid rows are the inner loop of every rect
+ * fill and the per-frame content-pane clear; a scalar store loop dominated paint. */
+static inline void fill32(unsigned *d, unsigned v, int n)
+{
+	int d0, d1;
+	__asm__ volatile("rep ; stosl"
+		: "=&D"(d0), "=&c"(d1)
+		: "a"(v), "0"(d), "1"(n)
+		: "memory");
+}
+
 void gfx_pixel(int x, int y, unsigned color)
 {
 	if ((unsigned)x < (unsigned)g_w && (unsigned)y < (unsigned)g_h)
@@ -24,11 +35,9 @@ void gfx_fill_rect(int x, int y, int w, int h, unsigned color)
 	if (y < 0) { h += y; y = 0; }
 	if (x + w > g_w) w = g_w - x;
 	if (y + h > g_h) h = g_h - y;
-	for (int r = 0; r < h; r++) {
-		unsigned *p = g_fb + (long)(y + r) * g_w + x;
-		for (int c = 0; c < w; c++)
-			p[c] = color;
-	}
+	if (w <= 0 || h <= 0) return;
+	for (int r = 0; r < h; r++)
+		fill32(g_fb + (long)(y + r) * g_w + x, color, w);
 }
 
 void gfx_clear(unsigned color) { gfx_fill_rect(0, 0, g_w, g_h, color); }
@@ -184,12 +193,16 @@ static int sans_view(int px, struct face_view *v)
 }
 
 /* Blit a cached glyph with its top-left at (x + ox, baseline + oy). */
-static void face_blit(int x, int baseline, const struct gcache_e *g, unsigned fg)
+/* Blit one glyph at `baseline`, additionally clipping rows to [ct,cb). ct>=cb
+ * means "no vertical clip" (only the framebuffer bounds apply). */
+static void face_blit_clip(int x, int baseline, const struct gcache_e *g,
+                           unsigned fg, int ct, int cb)
 {
 	if (!g->bm) return;
 	for (int gy = 0; gy < g->h; gy++) {
 		int sy = baseline + g->oy + gy;
 		if ((unsigned)sy >= (unsigned)g_h) continue;
+		if (ct < cb && (sy < ct || sy >= cb)) continue;
 		const unsigned char *srow = g->bm + gy * g->w;
 		for (int gx = 0; gx < g->w; gx++) {
 			int sx = x + g->ox + gx;
@@ -198,6 +211,11 @@ static void face_blit(int x, int baseline, const struct gcache_e *g, unsigned fg
 			if (a) { unsigned *px = &g_fb[sy * g_w + sx]; *px = gfx_blend(fg, *px, a); }
 		}
 	}
+}
+
+static void face_blit(int x, int baseline, const struct gcache_e *g, unsigned fg)
+{
+	face_blit_clip(x, baseline, g, fg, 0, 0);
 }
 
 /* One monospace cell: optional opaque background, then the glyph centred in the
@@ -238,6 +256,11 @@ static unsigned char uni_to_cp437(unsigned cp)
 	case 0x201C: case 0x201D: return '"';
 	case 0x2013: case 0x2014: return '-';
 	case 0x2026: return '.';
+	/* Geometric shapes that exist in the CP437 cell font (used for tree toggles). */
+	case 0x25B6: case 0x25BA: return 0x10;     /* ► right-pointing triangle */
+	case 0x25C0: case 0x25C4: return 0x11;     /* ◄ left-pointing triangle  */
+	case 0x25B2: case 0x25B4: return 0x1E;     /* ▲ up-pointing triangle    */
+	case 0x25BC: case 0x25BE: return 0x1F;     /* ▼ down-pointing triangle  */
 	}
 	return '?';
 }
@@ -289,7 +312,10 @@ int gfx_ui_ascent_px(int px)
  * other sizes are cached per the size-keyed pool above — so headings repaint by
  * blitting too, not re-rasterizing. With no sans font, falls back to the fixed
  * monospace cell. */
-void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px)
+/* Sized UI text, rows clipped to [ct,cb); ct>=cb disables the vertical clip. The
+ * mono fallback (no sans face) is not clipped — it only fires when no TTF loaded. */
+void gfx_ui_text_px_clip(int x, int y, const char *s, unsigned fg, int px,
+                         int ct, int cb)
 {
 	const char *end = s + strlen(s);
 	unsigned cp;
@@ -298,7 +324,7 @@ void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px)
 		while (s < end) {
 			s += utf8_decode(s, end, &cp);
 			struct gcache_e *g = cache_glyph(v.font, v.px, v.cache, v.n, cp);
-			face_blit(x, y + v.baseline, g, fg);
+			face_blit_clip(x, y + v.baseline, g, fg, ct, cb);
 			x += g->adv;
 		}
 		return;
@@ -308,6 +334,11 @@ void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px)
 		gfx_glyph(x, y, cp < 0x80 ? (unsigned char)cp : '?', fg, GFX_TRANSPARENT);
 		x += GFX_FONT_W;
 	}
+}
+
+void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px)
+{
+	gfx_ui_text_px_clip(x, y, s, fg, px, 0, 0);
 }
 
 void gfx_ui_text(int x, int y, const char *s, unsigned fg)

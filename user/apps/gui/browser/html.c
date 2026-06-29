@@ -7,8 +7,14 @@
 #include "font.h"
 #include "svg.h"
 #include "layout.h"
+#include "upng.h"      /* decode url() background images to RGBA */
+#include "bmedia.h"    /* <audio>/<video> element registration */
 
 static css_sheet *g_sheet;     /* the page's collected <style> rules, per render */
+
+/* url() background loader/lookup — defined lower, used during the layout walk. */
+static int  bg_image_index(const char *raw_url, const char *page_url);
+static void load_bg_images(struct dom_node *root, const char *page_url, res_batch_fn fetch);
 
 /* The DOM + CSS sheet now persist for the whole page lifetime (the JS context in
  * js.c does too), so event listeners can fire and mutate the tree after load.
@@ -99,14 +105,6 @@ static int url_absolute(const char *s)
 	       starts_ci(s, "file:")   || starts_ci(s, "blob:")    || starts_ci(s, "mailto:");
 }
 
-/* Case-insensitive substring test (for matching tokens inside a rel= list). */
-static int contains_ci(const char *hay, const char *needle)
-{
-	for (; *hay; hay++)
-		if (starts_ci(hay, needle)) return 1;
-	return 0;
-}
-
 /* Source charset for the document being parsed. We render Unicode, so non-UTF-8
  * input is transcoded as it is read. Default UTF-8; the HTTP Content-Type charset
  * (set by fetch.c) wins, else a <meta charset> in the document, else the default.
@@ -187,14 +185,16 @@ static int read_char(const char **pp, const char *end)
 
 /* Current text style. The walk saves/restores it around each element (via the C
  * call stack), so style nesting needs no explicit stack. fg is a full 0xRRGGBB. */
-struct sty { unsigned fg; unsigned char bold, under; };
+struct sty { unsigned fg; unsigned char bold, under, italic, nowrap, ttx; };
 static struct sty sty_cur;
 
 static unsigned char sty_byte(void)
 {
 	unsigned char a = 0;
-	if (sty_cur.bold)  a |= ST_BOLD;
-	if (sty_cur.under) a |= ST_UNDER;
+	if (sty_cur.bold)   a |= ST_BOLD;
+	if (sty_cur.under)  a |= ST_UNDER;
+	if (sty_cur.italic) a |= ST_ITALIC;
+	if (sty_cur.nowrap) a |= ST_NOWRAP;
 	return a;
 }
 
@@ -209,7 +209,7 @@ static void apply_ua_style(const char *name)
 	} else if (streq(name, "b") || streq(name, "strong")) {
 		sty_cur.bold = 1;
 	} else if (streq(name, "i") || streq(name, "em")) {
-		sty_cur.fg = 0x586070;
+		sty_cur.italic = 1;
 	} else if (streq(name, "a")) {
 		sty_cur.fg = 0x1a4fbf; sty_cur.under = 1;
 	} else if (streq(name, "u") || streq(name, "ins")) {
@@ -228,6 +228,8 @@ static void apply_css(const struct css_style *cs)
 	if (cs->color >= 0) sty_cur.fg = (unsigned)cs->color;
 	if (cs->bold >= 0)  sty_cur.bold = cs->bold ? 1 : 0;
 	if (cs->under >= 0) sty_cur.under = cs->under ? 1 : 0;
+	if (cs->italic >= 0) sty_cur.italic = cs->italic ? 1 : 0;
+	if (cs->ttx >= 0)   sty_cur.ttx = (unsigned char)cs->ttx;
 }
 
 /* The renderer's line-break set (distinct from dom.c's CSS-block set: this one
@@ -460,9 +462,19 @@ static void decode_entities(char *s)
 /* Current block context, saved/restored around each element like sty_cur
  * (BP_* layout in browser.h). */
 static unsigned char W_size, W_center, W_mono, W_indent, W_pre;
+static unsigned char W_fontpx;      /* current CSS font-size px (0 = default body) */
 static unsigned W_bg = BG_NONE;     /* current background 0xRRGGBB, BG_NONE = none */
 static char W_listtype;             /* 'u' / 'o' / 0 — the enclosing list kind  */
 static int  W_olnum;                /* <ol> item counter                        */
+static unsigned char W_lineheight;  /* current CSS line-height px (0 = font-derived) */
+static signed char   W_liststyle = CSS_LST_DEFAULT;  /* inherited list-style-type    */
+
+/* CSS base font (px) that percent/relative sizes resolve against, plus the heading
+ * UA sizes (h1..h6) — now real, since pixel scroll lets a line exceed LINE_H. */
+#define HTML_BASE_FONT 16
+static const unsigned char ua_h_px[6] = { 32, 24, 19, 16, 13, 11 };
+static unsigned char clamp_fontpx(int px)
+{ return (unsigned char)(px < 8 ? 8 : (px > 120 ? 120 : px)); }
 
 static unsigned char block_byte(void)
 {
@@ -476,6 +488,8 @@ static int text_put(int n, char c, unsigned char a)
 	B->pg->text[n] = c;
 	B->pg->attr[n] = a;
 	B->pg->bp[n]   = block_byte();
+	B->pg->fsz[n]  = W_fontpx;
+	B->pg->lh[n]   = W_lineheight;
 	B->pg->fg[n]   = sty_cur.fg;
 	B->pg->bg[n]   = W_bg;
 	return n + 1;
@@ -555,11 +569,33 @@ static int cp_drop(unsigned cp)
 	return 0;
 }
 
+/* Apply text-transform to one codepoint. ASCII + Latin-1 letters are cased; the
+ * `*word` flag (set after a non-letter) drives capitalize's first-letter rule. */
+static unsigned ttx_apply(unsigned cp, unsigned char ttx, int *word)
+{
+	int alpha = (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') ||
+	            (cp >= 0xC0 && cp <= 0xFF && cp != 0xD7 && cp != 0xF7);
+	unsigned up = cp, lo = cp;
+	if (cp >= 'a' && cp <= 'z') up = cp - 32;
+	else if (cp >= 0xE0 && cp <= 0xFE && cp != 0xF7) up = cp - 0x20;
+	if (cp >= 'A' && cp <= 'Z') lo = cp + 32;
+	else if (cp >= 0xC0 && cp <= 0xDE && cp != 0xD7) lo = cp + 0x20;
+	unsigned r = cp;
+	switch (ttx) {
+	case CSS_TT_UPPER:      r = up; break;
+	case CSS_TT_LOWER:      r = lo; break;
+	case CSS_TT_CAPITALIZE: r = (*word && alpha) ? up : cp; break;
+	}
+	*word = alpha ? 0 : 1;
+	return r;
+}
+
 /* Emit text-node data: decode entities AND raw UTF-8, collapse whitespace, drop
  * control/zero-width codepoints, and store the rest as UTF-8. */
 static void emit_text(const char *s)
 {
 	const char *p = s, *end = s + strlen(s);
+	int ws = 1;                                          /* at a word start (for capitalize) */
 	while (p < end) {
 		int c;
 		if (*p == '&') {
@@ -572,21 +608,21 @@ static void emit_text(const char *s)
 			c = read_char(&p, end);
 		}
 		if (W_pre) {                                        /* <pre>: keep spacing */
-			if (c == '\n') { W_n = text_put(W_n, '\n', 0); W_run_nl = 1; continue; }
+			if (c == '\n') { W_n = text_put(W_n, '\n', 0); W_run_nl = 1; ws = 1; continue; }
 			if (c == '\r') continue;
-			if (c == '\t') { for (int t = 0; t < 4; t++) W_n = text_put(W_n, ' ', sty_byte()); W_run_nl = 0; continue; }
+			if (c == '\t') { for (int t = 0; t < 4; t++) W_n = text_put(W_n, ' ', sty_byte()); W_run_nl = 0; ws = 1; continue; }
 			if (cp_drop((unsigned)c)) continue;
-			W_n = utf8_emit(W_n, (unsigned)c, sty_byte());
+			W_n = utf8_emit(W_n, ttx_apply((unsigned)c, sty_cur.ttx, &ws), sty_byte());
 			W_run_nl = 0;
 			continue;
 		}
-		if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { W_pend_sp = 1; continue; }
+		if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { W_pend_sp = 1; ws = 1; continue; }
 		if (cp_drop((unsigned)c)) continue;
 		if (W_pend_sp) {
 			if (W_n > 0 && W_run_nl == 0) W_n = text_put(W_n, ' ', 0);
 			W_pend_sp = 0;
 		}
-		W_n = utf8_emit(W_n, (unsigned)c, sty_byte());
+		W_n = utf8_emit(W_n, ttx_apply((unsigned)c, sty_cur.ttx, &ws), sty_byte());
 		W_run_nl = 0;
 	}
 }
@@ -811,6 +847,25 @@ static void handle_img(struct dom_node *el, const struct css_style *cs)
 	W_run_nl = 1;
 }
 
+/* <audio>/<video>: register the media element and, when it has a visible widget
+ * (any <video>, or an <audio controls>), anchor a blank reserved row at the text
+ * cursor — exactly as handle_img does for an inline image. The element's <source>
+ * children and fallback content are not walked: a supported media element hides
+ * them, matching browsers. Anchor at -1 (no widget) for a bare <audio>. */
+static void handle_media(struct dom_node *el)
+{
+	int is_video = streq(el->tag, "video");
+	int controls = dom_get_attr(el, "controls") != 0;
+	int widget = is_video || controls;
+	int text_pos = -1;
+	if (widget) {
+		if (W_run_nl < 1 && W_n > 0) W_n = text_put(W_n, '\n', 0);
+		text_pos = W_n;
+	}
+	media_register_element(el, text_pos, g_base_url);
+	if (widget) { W_n = text_put(W_n, '\n', 0); W_run_nl = 1; }
+}
+
 /* <link rel="icon">: standard icon outranks apple-touch; mask-icon (SVG) skipped. */
 static void handle_favicon(struct dom_node *el)
 {
@@ -900,16 +955,16 @@ static void frames_free(void)
 
 /* Collect a sub-document's inline <style> blocks into `sheet` (frames don't pull
  * external stylesheets — only the page's own walk does the batched <link> fetch). */
-static void collect_inline_styles(struct dom_node *node, css_sheet *sheet)
+static void collect_inline_styles(struct dom_node *node, css_sheet *sheet, const char *base)
 {
 	for (struct dom_node *c = node->first_child; c; c = c->next) {
 		if (c->type != DOM_ELEMENT) continue;
 		if (streq(c->tag, "style")) {
 			for (struct dom_node *t = c->first_child; t; t = t->next)
 				if (t->type == DOM_TEXT && t->text)
-					css_add(sheet, t->text, strlen(t->text));
+					css_add(sheet, t->text, strlen(t->text), base);
 		} else {
-			collect_inline_styles(c, sheet);
+			collect_inline_styles(c, sheet, base);
 		}
 	}
 }
@@ -1301,11 +1356,74 @@ static void emit_pseudo(struct dom_node *el, int which)
 	sty_cur = sv;
 }
 
+/* The render walk recurses one stack frame per DOM level, each carrying a ~552-byte
+ * `struct css_style` by value, so a pathologically deep document would overflow the
+ * worker stack and corrupt the heap (a browser fault + a worker free() crash). Bound
+ * the depth: content nested past this is dropped, not rendered — far better than a
+ * crash, and well beyond any real page's nesting. */
+#define WALK_DEPTH_MAX 256
+static int g_walk_depth;
+
+/* Decimal/alpha/roman numeral writers for ordered <li> markers (1-based). */
+static int li_decimal(int n, char *b, int pad)
+{
+	char t[12]; int k = 0, v = n < 0 ? 0 : n;
+	if (v == 0) t[k++] = '0';
+	while (v) { t[k++] = (char)('0' + v % 10); v /= 10; }
+	while (k < pad) t[k++] = '0';
+	int j = 0; while (k) b[j++] = t[--k];
+	return j;
+}
+static int li_alpha(int n, char *b, int upper)
+{
+	char t[12]; int k = 0;
+	if (n < 1) n = 1;
+	while (n > 0) { n--; t[k++] = (char)((upper ? 'A' : 'a') + n % 26); n /= 26; }
+	int j = 0; while (k) b[j++] = t[--k];
+	return j;
+}
+static int li_roman(int n, char *b, int upper)
+{
+	static const int v[] = { 1000,900,500,400,100,90,50,40,10,9,5,4,1 };
+	static const char *const su[] = { "M","CM","D","CD","C","XC","L","XL","X","IX","V","IV","I" };
+	static const char *const sl[] = { "m","cm","d","cd","c","xc","l","xl","x","ix","v","iv","i" };
+	if (n < 1 || n > 3999) return li_decimal(n, b, 0);     /* out of range: fall back */
+	int j = 0;
+	for (int i = 0; i < 13; i++)
+		while (n >= v[i]) { const char *s = upper ? su[i] : sl[i]; while (*s) b[j++] = *s++; n -= v[i]; }
+	return j;
+}
+
+/* Build the <li> marker text for `ls` (resolved, not DEFAULT) and item number `n`.
+ * Returns 1 with NUL-terminated `out` filled, or 0 for CSS_LST_NONE (no marker). */
+static int li_marker(signed char ls, int n, char *out, int cap)
+{
+	if (ls == CSS_LST_NONE || cap < 8) return 0;
+	int n0 = 0;
+	if (ls == CSS_LST_DISC)   { out[0] = '\0'; sapp(out, &n0, cap, "\xe2\x80\xa2 "); return 1; }  /* • */
+	if (ls == CSS_LST_CIRCLE) { out[0] = '\0'; sapp(out, &n0, cap, "\xe2\x97\xa6 "); return 1; }  /* ◦ */
+	if (ls == CSS_LST_SQUARE) { out[0] = '\0'; sapp(out, &n0, cap, "\xe2\x96\xaa "); return 1; }  /* ▪ */
+	int k = 0;
+	switch (ls) {
+	case CSS_LST_DECIMAL_ZERO: k = li_decimal(n, out, 2); break;
+	case CSS_LST_LOWER_ALPHA:  k = li_alpha(n, out, 0); break;
+	case CSS_LST_UPPER_ALPHA:  k = li_alpha(n, out, 1); break;
+	case CSS_LST_LOWER_ROMAN:  k = li_roman(n, out, 0); break;
+	case CSS_LST_UPPER_ROMAN:  k = li_roman(n, out, 1); break;
+	default:                   k = li_decimal(n, out, 0); break;   /* CSS_LST_DECIMAL */
+	}
+	out[k++] = '.'; out[k++] = ' '; out[k] = '\0';
+	return 1;
+}
+
 static void walk_element(struct dom_node *el)
 {
+	if (g_walk_depth >= WALK_DEPTH_MAX) return;
+	g_walk_depth++;
 	int si = span_begin(el);
 	walk_element_inner(el);
 	span_end(si);
+	g_walk_depth--;
 }
 
 static void walk_element_inner(struct dom_node *el)
@@ -1313,6 +1431,7 @@ static void walk_element_inner(struct dom_node *el)
 	const char *name = el->tag;
 
 	if (streq(name, "script") || streq(name, "style")) return;   /* not rendered */
+	if (streq(name, "noscript")) return;                         /* scripting is on, so its fallback is hidden */
 	if (streq(name, "title")) {                                  /* the document title... */
 		struct dom_node *a;
 		for (a = el->parent; a; a = a->parent)
@@ -1326,6 +1445,7 @@ static void walk_element_inner(struct dom_node *el)
 	if (cs.disp == CSS_DISP_NONE) return;                        /* display:none */
 
 	if (streq(name, "img"))    { handle_img(el, &cs); return; }
+	if (streq(name, "audio") || streq(name, "video")) { handle_media(el); return; }
 	if (streq(name, "svg"))    { handle_svg(el, &cs); return; }
 	if (streq(name, "iframe")) { handle_iframe(el); return; }
 	if (streq(name, "link")) { if (g_frame_depth == 0) handle_favicon(el); return; }
@@ -1349,9 +1469,10 @@ static void walk_element_inner(struct dom_node *el)
 
 	struct sty saved = sty_cur;
 	unsigned char sv_size = W_size, sv_center = W_center, sv_mono = W_mono,
-	              sv_indent = W_indent, sv_pre = W_pre;
+	              sv_indent = W_indent, sv_pre = W_pre, sv_fontpx = W_fontpx;
 	unsigned sv_bg = W_bg;
 	char sv_lt = W_listtype; int sv_ol = W_olnum;
+	unsigned char sv_lh = W_lineheight; signed char sv_ls = W_liststyle;
 	int linked = streq(name, "a") ? open_link(el) : 0;
 
 	apply_ua_style(name);
@@ -1360,11 +1481,37 @@ static void walk_element_inner(struct dom_node *el)
 
 	/* Block-level browser defaults. */
 	if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) W_size = (unsigned char)(name[1] - '0');
+
+	/* font-size: an explicit CSS value wins; a percent scales the inherited size;
+	 * else a heading's UA default; else inherit the parent's W_fontpx. */
+	if (cs.font_px >= 0)        W_fontpx = clamp_fontpx(cs.font_px);
+	else if (cs.font_pct >= 0)  W_fontpx = clamp_fontpx((W_fontpx ? W_fontpx : HTML_BASE_FONT) * cs.font_pct / 100);
+	else if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) W_fontpx = ua_h_px[name[1] - '1'];
 	if (streq(name, "center") || cs.center > 0) W_center = 1;
 	if (streq(name, "pre")) { W_mono = 1; W_pre = 1; }
 	if (streq(name, "blockquote")) W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7);
 	if (streq(name, "ul")) { W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7); W_listtype = 'u'; }
 	if (streq(name, "ol")) { W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7); W_listtype = 'o'; W_olnum = 0; }
+
+	/* white-space: nowrap suppresses line breaks; pre/pre-wrap/pre-line preserve
+	 * spaces+newlines (pre also doesn't wrap). nowrap inherits through sty_cur. */
+	if      (cs.white_space == CSS_WS_NOWRAP)   sty_cur.nowrap = 1;
+	else if (cs.white_space == CSS_WS_PRE)      { W_pre = 1; sty_cur.nowrap = 1; }
+	else if (cs.white_space == CSS_WS_PRE_WRAP ||
+	         cs.white_space == CSS_WS_PRE_LINE) W_pre = 1;
+	else if (cs.white_space == CSS_WS_NORMAL)   { W_pre = 0; sty_cur.nowrap = 0; }
+
+	/* line-height: a px value, else a percent/unitless multiple of the resolved
+	 * font-size (which the block above just settled). 0 leaves the font-derived height. */
+	if (cs.line_height >= 0)
+		W_lineheight = (unsigned char)(cs.line_height > 255 ? 255 : cs.line_height);
+	else if (cs.lh_pct >= 0) {
+		int base = W_fontpx ? W_fontpx : HTML_BASE_FONT;
+		int lh = base * cs.lh_pct / 100;
+		W_lineheight = (unsigned char)(lh > 255 ? 255 : (lh < 0 ? 0 : lh));
+	}
+
+	if (cs.list_style != CSS_LST_DEFAULT) W_liststyle = cs.list_style;
 
 	int blk = (cs.disp == CSS_DISP_BLOCK) ? 1 :
 	          (cs.disp == CSS_DISP_INLINE) ? 0 : is_block_tag(name);
@@ -1372,16 +1519,19 @@ static void walk_element_inner(struct dom_node *el)
 	if (blk) block_break();
 	if (streq(name, "li")) {                                     /* list marker  */
 		unsigned char a = sty_byte();
-		if (W_listtype == 'o') {
-			char num[16]; int k = 0, v = ++W_olnum;
-			char d[8]; int z = 0; if (v == 0) d[z++] = '0'; while (v) { d[z++] = (char)('0' + v % 10); v /= 10; }
-			while (z) num[k++] = d[--z]; num[k++] = '.'; num[k++] = ' '; num[k] = '\0';
-			emit_lit(num, a);
-		} else {
-			emit_lit("\xe2\x80\xa2 ", a);                       /* bullet "• "  */
-		}
+		signed char ls = W_liststyle;
+		if (ls == CSS_LST_DEFAULT)                              /* no explicit type: ul/ol default */
+			ls = (W_listtype == 'o') ? CSS_LST_DECIMAL : CSS_LST_DISC;
+		int ordered = (ls >= CSS_LST_DECIMAL);                  /* numbered kinds advance a counter */
+		int num = ordered ? ++W_olnum : 0;
+		char mark[24];
+		if (li_marker(ls, num, mark, sizeof mark)) emit_lit(mark, a);
 	}
-	if (blk) layout_box_open(el, &cs, W_n);     /* a block/flex box for the layout tree */
+	if (blk) {
+		if (cs.bgi.kind == CSS_BGK_URL)         /* resolve its decoded-image index */
+			cs.bgi.img_idx = bg_image_index(cs.bgi.url, g_base_url);
+		layout_box_open(el, &cs, W_n);          /* a block/flex box for the layout tree */
+	}
 	emit_pseudo(el, CSS_PSEUDO_BEFORE);
 	walk(el);
 	emit_pseudo(el, CSS_PSEUDO_AFTER);
@@ -1391,8 +1541,8 @@ static void walk_element_inner(struct dom_node *el)
 	if (linked) close_link();
 	sty_cur = saved;
 	W_size = sv_size; W_center = sv_center; W_mono = sv_mono;
-	W_indent = sv_indent; W_pre = sv_pre; W_bg = sv_bg;
-	W_listtype = sv_lt; W_olnum = sv_ol;
+	W_indent = sv_indent; W_pre = sv_pre; W_bg = sv_bg; W_fontpx = sv_fontpx;
+	W_listtype = sv_lt; W_olnum = sv_ol; W_lineheight = sv_lh; W_liststyle = sv_ls;
 }
 
 static void walk(struct dom_node *node)
@@ -1618,13 +1768,15 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
 	if (nfaces && (!urls || !fams)) { free(urls); free(fams); urls = 0; fams = 0; nfaces = 0; }
 
 	for (int i = 0; i < nfaces; i++) {
-		const char *family = 0, *url = 0;
-		css_fontface_at(g_sheet, i, &family, &url);
+		const char *family = 0, *url = 0, *base = 0;
+		css_fontface_at(g_sheet, i, &family, &url, &base);
 		if (!family || !family[0] || !url || !url[0]) continue;
 		if (!family_in_stack(stack, family)) continue;        /* body can't use it */
 
+		/* A relative src resolves against the sheet that declared it (so an external
+		 * sheet's "../media/x.woff2" lands next to the sheet, not at the page root). */
 		char abs[URL_MAX], use[URL_MAX];
-		resolve_url(page_url, url, abs, sizeof abs);
+		resolve_url(base && base[0] ? base : page_url, url, abs, sizeof abs);
 		if (!csp_url_ok(CSP_FONT, abs, "font", use, sizeof use)) continue;  /* font-src */
 		int L = strlen(use);
 		char *u = malloc((unsigned)L + 1);
@@ -1714,6 +1866,135 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
 	}
 }
 
+/* ---------------------------------------------------- url() backgrounds ---- *
+ * Mirrors load_faces: walk the DOM once, collect every element's url() background
+ * (resolved + img-src checked + deduped), batch-fetch and PNG-decode them into the
+ * page's bgimgs table. A box records its entry's index (bg_image_index); paint_boxes
+ * blits with background-size/-position/-repeat. Built before the layout walk so an
+ * index is resolvable as each box opens. */
+#define BGIMG_MAX 32
+static char g_bgabs[BGIMG_MAX][URL_MAX];   /* table key: resolved abs URL          */
+static char g_bguse[BGIMG_MAX][URL_MAX];   /* fetch URL (post-CSP, maybe upgraded)  */
+
+struct memrd { const unsigned char *d; int len, pos; };
+static int memrd_get(void *c) { struct memrd *r = c; return r->pos < r->len ? r->d[r->pos++] : -1; }
+
+struct bgfill { unsigned char *buf; unsigned iw, ih; };
+static int bgfill_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
+{
+	struct bgfill *f = c;
+	if (y < f->ih) { unsigned n = (w < f->iw ? w : f->iw) * 4; memcpy(f->buf + (unsigned long)y * f->iw * 4, rgba, n); }
+	return 0;
+}
+
+/* Decode a PNG buffer into a fresh RGBA image (NULL on failure / non-PNG). */
+static unsigned char *decode_png_rgba(const unsigned char *data, int len, unsigned *ow, unsigned *oh)
+{
+	struct memrd r = { data, len, 0 };
+	unsigned w = 0, h = 0;
+	if (upng_dimensions(memrd_get, &r, &w, &h) != UPNG_OK || !w || !h) return 0;
+	if ((unsigned long)w * h > 4096u * 4096u) return 0;             /* sanity cap */
+	unsigned char *buf = malloc((unsigned long)w * h * 4);
+	if (!buf) return 0;
+	memset(buf, 0, (unsigned long)w * h * 4);
+	r.pos = 0;
+	struct bgfill f = { buf, w, h };
+	if (upng_decode(memrd_get, &r, bgfill_row, &f, 0, 0) != UPNG_OK) { free(buf); return 0; }
+	*ow = w; *oh = h;
+	return buf;
+}
+
+/* The per-node body, kept OUT of the recursive frame below: compute_style plus
+ * the two URL_MAX (2 KiB each) scratch buffers and the css_style live here, so
+ * they sit on the stack only for the node being examined — not once per DOM
+ * level. Inline, they made each collect_bg_urls frame ~5 KiB, so a page nested
+ * deeper than ~12 elements overflowed the fixed 64 KiB worker stack into .bss
+ * (corrupting tabs/active_tab and crashing). */
+static void bg_collect_node(struct dom_node *c, const char *page_url, int *nu)
+{
+	struct css_style cs;
+	compute_style(c, &cs);
+	if (cs.disp != CSS_DISP_NONE && cs.bgi.kind == CSS_BGK_URL && cs.bgi.url[0] && *nu < BGIMG_MAX) {
+		char abs[URL_MAX], use[URL_MAX];
+		resolve_url(page_url, cs.bgi.url, abs, sizeof abs);
+		if (csp_url_ok(CSP_IMG, abs, "image", use, sizeof use)) {
+			int dup = 0;
+			for (int i = 0; i < *nu; i++) if (streq(g_bgabs[i], abs)) { dup = 1; break; }
+			if (!dup) {
+				int k = 0; for (; abs[k] && k < URL_MAX - 1; k++) g_bgabs[*nu][k] = abs[k]; g_bgabs[*nu][k] = '\0';
+				k = 0; for (; use[k] && k < URL_MAX - 1; k++) g_bguse[*nu][k] = use[k]; g_bguse[*nu][k] = '\0';
+				(*nu)++;
+			}
+		}
+	}
+}
+
+/* Hard ceiling on DOM-recursion depth: even with a tiny per-frame footprint, an
+ * adversarially (or accidentally) deep tree shouldn't be able to exhaust the
+ * worker stack. Real documents nest far shallower; deeper subtrees simply don't
+ * contribute background images. */
+#define BG_MAX_DEPTH 256
+static void collect_bg_urls(struct dom_node *node, const char *page_url, int *nu, int depth)
+{
+	if (depth >= BG_MAX_DEPTH) return;
+	for (struct dom_node *c = node->first_child; c; c = c->next) {
+		if (c->type != DOM_ELEMENT) continue;
+		bg_collect_node(c, page_url, nu);
+		collect_bg_urls(c, page_url, nu, depth + 1);
+	}
+}
+
+static void load_bg_images(struct dom_node *root, const char *page_url, res_batch_fn fetch)
+{
+	for (int i = 0; i < B->pg->n_bgimgs; i++) free(B->pg->bgimgs[i].rgba);   /* drop the old page's */
+	free(B->pg->bgimgs);
+	B->pg->bgimgs = 0; B->pg->n_bgimgs = B->pg->bgimgs_cap = 0;
+
+	int nu = 0;
+	collect_bg_urls(root, page_url, &nu, 0);
+	if (nu == 0) return;
+
+	struct bg_img *tab = malloc((unsigned)nu * sizeof *tab);
+	char **furls = malloc((unsigned)nu * sizeof *furls);
+	if (!tab || !furls) { free(tab); free(furls); return; }
+	for (int i = 0; i < nu; i++) furls[i] = g_bguse[i];
+
+	unsigned char **bodies = calloc((unsigned)nu, sizeof *bodies);
+	int           *lens   = calloc((unsigned)nu, sizeof *lens);
+	int n = 0;
+	if (bodies && lens) {
+		if (fetch) fetch(furls, nu, bodies, lens);
+		for (int i = 0; i < nu; i++) {
+			int k = 0; for (; g_bgabs[i][k] && k < URL_MAX - 1; k++) tab[n].url[k] = g_bgabs[i][k];
+			tab[n].url[k] = '\0';
+			tab[n].iw = tab[n].ih = 0; tab[n].rgba = 0;
+			if (bodies[i] && lens[i] > 0) {
+				unsigned w, h; unsigned char *rg = decode_png_rgba(bodies[i], lens[i], &w, &h);
+				if (rg) { tab[n].rgba = rg; tab[n].iw = w; tab[n].ih = h; }
+			}
+			free(bodies[i]);
+			n++;                       /* keep even a failed/undecodable entry so the index still maps */
+		}
+	}
+	free(bodies); free(lens); free(furls);
+
+	blk_lock();
+	B->pg->bgimgs = tab; B->pg->n_bgimgs = n; B->pg->bgimgs_cap = nu;
+	blk_unlock();
+}
+
+/* The decoded-background index for a box's url() (resolve + match the table key).
+ * No CSP re-check here — the table only holds approved URLs — so the layout walk
+ * doesn't re-log violations the collection pass already reported. */
+static int bg_image_index(const char *raw_url, const char *page_url)
+{
+	if (!raw_url || !raw_url[0] || B->pg->n_bgimgs == 0) return -1;
+	char abs[URL_MAX];
+	resolve_url(page_url, raw_url, abs, sizeof abs);
+	for (int i = 0; i < B->pg->n_bgimgs; i++) if (streq(B->pg->bgimgs[i].url, abs)) return i;
+	return -1;
+}
+
 /* Reset the render buffers and re-flatten the live DOM into them. Shared by the
  * initial html_to_text and by html_relayout (after an event mutates the tree). */
 /* Alpha-composite src (0xAARRGGBB) over the opaque dst (0xRRGGBB). */
@@ -1759,17 +2040,19 @@ static void layout_dom(void)
 	B->img_pool_len = 0;
 	compute_page_colors(g_live_dom);
 	sty_cur.fg = B->pg->page_fg; sty_cur.bold = sty_cur.under = 0;
-	W_bg = BG_NONE;
+	sty_cur.italic = sty_cur.nowrap = sty_cur.ttx = 0;
+	W_bg = BG_NONE; W_lineheight = 0; W_liststyle = CSS_LST_DEFAULT;
 	W_n = 0; W_pend_sp = 0; W_run_nl = 1; W_cur_link = -1;
 	g_nspans = 0;
 	layout_reset();                  /* fresh box tree for this walk */
 	g_has_controls = 0;
 	/* Reset the frame walk context to the top document (the cache itself persists
 	 * across relayouts; only the per-walk base/depth/nav reset here). */
-	g_frame_depth = 0; g_link_nav = 1;
+	g_frame_depth = 0; g_link_nav = 1; g_walk_depth = 0;
 	{ int k = 0; g_base_url[0] = '\0'; sapp(g_base_url, &k, sizeof g_base_url, g_cur_page_url); }
 	if (g_live_dom) walk(g_live_dom);
 	B->pg->text_len = W_n;
+	B->layout_dirty = 1;             /* box tree + text rebuilt → main thread must re-wrap */
 }
 
 /* Free the current page's live DOM, CSS sheet and JS context. Called on every
@@ -1779,6 +2062,7 @@ static void layout_dom(void)
 void html_page_teardown(void)
 {
 	js_page_end();
+	media_page_teardown();             /* stop playback + free this page's media */
 	if (g_live_dom) { dom_free(g_live_dom); g_live_dom = 0; }
 	if (g_sheet)    { css_free(g_sheet);    g_sheet = 0; }
 	frames_free();                     /* drop this page's iframe sub-documents */
@@ -1825,7 +2109,7 @@ void html_iframe_resolve(const char *url, const char *parent, int verdict,
 		if (as_html && body && len > 0) {
 			f->doc = dom_parse((const char *)body, len);
 			f->sheet = css_new();
-			if (f->doc && f->sheet) collect_inline_styles(f->doc, f->sheet);
+			if (f->doc && f->sheet) collect_inline_styles(f->doc, f->sheet, f->url);
 			if (!f->doc) {
 				f->verdict = FRAME_ERROR;
 				int k = 0; f->reason[0] = '\0'; sapp(f->reason, &k, sizeof f->reason, "could not parse");
@@ -1846,8 +2130,7 @@ void html_iframe_resolve(const char *url, const char *parent, int verdict,
 void html_relayout(void)
 {
 	if (!g_live_dom) return;
-	layout_dom();
-	B->wrap_seq = 0xFFFFFFFFu;
+	layout_dom();                   /* sets B->layout_dirty so the main thread re-wraps */
 	B->seq++;
 }
 
@@ -1886,10 +2169,11 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 
 		for (int s = 0; s < g_nsrc; s++) {
 			if (g_src[s].text) {
-				css_add(g_sheet, g_src[s].text, g_src[s].len);
+				css_add(g_sheet, g_src[s].text, g_src[s].len, g_page_url);
 			} else {
 				int ui = g_src[s].url_i;
-				if (ui >= 0 && bodies && bodies[ui]) css_add(g_sheet, (char *)bodies[ui], lens[ui]);
+				if (ui >= 0 && bodies && bodies[ui])
+					css_add(g_sheet, (char *)bodies[ui], lens[ui], g_css_url[ui]);
 			}
 		}
 		for (int i = 0; i < g_n_css_url; i++) { free(g_css_url[i]); if (bodies) free(bodies[i]); }
@@ -1898,6 +2182,10 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 		/* @font-face: load declared faces and pick the body font (before walk so
 		 * the renderer sees B->pg->body_font for this page's text). */
 		load_faces(root, g_page_url, fetch);
+
+		/* url() backgrounds: fetch+decode before the walk so each box can resolve its
+		 * decoded-image index as it opens. */
+		load_bg_images(root, g_page_url, fetch);
 
 		/* Lay out and paint the parsed page BEFORE running scripts: a slow or
 		 * long-running script (e.g. a setInterval-heavy SPA) must not keep the
@@ -1935,7 +2223,7 @@ void plain_to_text(void)
 	B->pg->n_imgs = 0;
 	B->pg->page_bg = 0xffffff; B->pg->page_fg = 0x202830;
 	sty_cur.fg = B->pg->page_fg; sty_cur.bold = sty_cur.under = 0;
-	W_bg = BG_NONE; W_size = W_center = W_mono = W_indent = W_pre = 0;
+	W_bg = BG_NONE; W_size = W_center = W_mono = W_indent = W_pre = W_fontpx = 0;
 
 	while (p < pend) {
 		unsigned char c = (unsigned char)*p;
@@ -1958,6 +2246,7 @@ void plain_to_text(void)
 		}
 	}
 	B->pg->text_len = n;
+	B->layout_dirty = 1;
 }
 
 /* Fill the styled-text buffer with a literal one-off message (e.g. "unsupported
@@ -1969,11 +2258,12 @@ void doc_message(const char *m)
 	while (m[n]) {
 		if (!ensure_text(n + 1)) break;
 		B->pg->text[n] = m[n]; B->pg->attr[n] = 0;
-		B->pg->bp[n] = 0; B->pg->fg[n] = B->pg->page_fg; B->pg->bg[n] = BG_NONE;
+		B->pg->bp[n] = 0; B->pg->fsz[n] = 0; B->pg->lh[n] = 0; B->pg->fg[n] = B->pg->page_fg; B->pg->bg[n] = BG_NONE;
 		n++;
 	}
 	B->pg->text_len = n;
 	B->pg->doc_title[0] = '\0';
 	B->pg->nlinks = 0;
 	B->pg->n_imgs = 0;
+	B->layout_dirty = 1;
 }

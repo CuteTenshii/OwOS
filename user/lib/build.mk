@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto gfx zlib png mp3 sqlite clipboard mime font brotli math gc js websocket
+ULIBDIRS := curl torrent crypto gfx zlib png webp mp3 sqlite clipboard mime font brotli math gc js websocket notify media json
 UCFLAGS  := -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -27,6 +27,7 @@ GUILIB  := user/lib/gfx/gfx.o $(FONT)
 # doesn't carry the 32 KiB inflate window or the decoder buffers).
 INFLATE := user/lib/zlib/inflate.o    # zlib: streaming DEFLATE (gzip/png)
 UPNG    := user/lib/png/upng.o        # libpng: streaming PNG decode (uses zlib)
+WEBP    := user/lib/webp/webp.o        # WebP lossless (VP8L) decode + encode (no deps)
 URL     := user/lib/curl/url.o        # shared URL parse/resolve (curl + browser)
 HTTP    := user/lib/curl/http.o       # libcurl: HTTP/1.1 over net_* (curl + torrent tracker)
 HEADERS := user/lib/curl/headers.o    # libcurl: HTTP response header parser (curl + browser)
@@ -34,6 +35,10 @@ H2      := user/lib/curl/h2.o         # libcurl: HTTP/2 engine (HPACK + framing)
 QUIC    := user/lib/curl/quic.o       # libcurl: QUIC v1 transport (RFC 9000/9001)
 H3      := user/lib/curl/h3.o         # libcurl: HTTP/3 framing + QPACK (RFC 9114/9204)
 MP3     := user/lib/mp3/mp3.o         # streaming MPEG audio decoder (.mp3/.mp2/.mp1)
+# media: file decoder (WAV/MPEG -> 48 kHz/S16/stereo, seekable) + a software
+# mixer thread that blends several sources into the one kernel PCM stream. Used
+# by the media player and the browser's <audio>/<video>. Needs $(MP3) + $(LIBGCC).
+MEDIA   := user/lib/media/media.o $(MP3)
 LIBGCC  := $(shell $(UCC) -m32 -print-libgcc-file-name)  # 64-bit div helpers etc.
 CRYPTO  := user/lib/crypto/crypto.o   # SHA-1/SHA-256/x25519/AES-GCM (torrent, ssh, curl)
 WEBSOCKET := user/lib/websocket/websocket.o  # RFC 6455 client (browser JS WebSocket); needs $(CRYPTO)
@@ -41,6 +46,10 @@ TORLIB  := user/lib/torrent/bencode.o user/lib/torrent/torrent.o   # libtorrent
 SQLITE  := user/lib/sqlite/sqlite.o   # real SQLite3 file-format DB (browser cookie jar)
 CLIPBOARD := user/lib/clipboard/clipboard.o  # clipd client (multi-item clipboard)
 MIME    := user/lib/mime/mime.o       # filename/content -> MIME type helper
+# json: standalone RFC 8259 value tree (parse + builder + encode). Pure
+# computation, no syscalls; needs $(MATH) for dtoa/strtod and $(LIBGCC).
+JSON    := user/lib/json/json.o
+NOTIFY  := user/lib/notify/notify.o   # notifyd client (desktop notifications)
 # math: freestanding x87 libm + shortest-round-trip number<->string (Dragon4).
 # Pure computation, no syscalls; links with $(LIBGCC) for 64-bit integer divides.
 MATH    := user/lib/math/math.o user/lib/math/fmt.o

@@ -28,6 +28,19 @@ else
   QEMU_AUDIODEV ?= pipewire
 endif
 
+# Hardware acceleration. Without it QEMU interprets every instruction (TCG), and
+# every framebuffer write takes the dirty-tracking softmmu slow path — measured
+# ~11x the cost of a back-buffer write, which is what makes the desktop feel like
+# a slideshow. KVM (Linux) / HVF (macOS) run the guest on the host CPU with
+# hardware dirty tracking, ~10-50x faster overall. The `:tcg` suffix is a
+# graceful fallback when /dev/kvm is absent or unprivileged. Override with
+# `make run ACCEL=tcg` to force pure emulation.
+ifeq ($(shell uname -s),Darwin)
+  ACCEL ?= hvf:tcg
+else
+  ACCEL ?= kvm:tcg
+endif
+
 # A 64 MiB raw disk image for the filesystem; persists across reboots. owofs
 # sizes itself to the disk's capacity (capped at 64 MiB in fs.c).
 $(DISK):
@@ -120,7 +133,7 @@ endif
 run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 $(STORAGE) -serial stdio \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22 -device $(NIC),netdev=net0 \
-		-audiodev $(QEMU_AUDIODEV),id=snd0 -machine pcspk-audiodev=snd0 \
+		-audiodev $(QEMU_AUDIODEV),id=snd0 -machine pcspk-audiodev=snd0,accel=$(ACCEL) \
 		-device sb16,audiodev=snd0 \
 		-device intel-hda -device hda-output,audiodev=snd0 \
 		-usb -device usb-tablet
@@ -128,6 +141,7 @@ run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 # Headless: no window, console comes out on the terminal via COM1.
 debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 -display none $(STORAGE) -serial stdio \
+		-machine accel=$(ACCEL) \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22 -device $(NIC),netdev=net0 \
 		-usb -device usb-tablet
 

@@ -139,63 +139,79 @@ static const char *const ST_VAL[62] = {
  * HPACK size accounting (name+value+32 per entry) bounds it at dt_max. */
 #define DT_ARENA  8192
 #define DT_MAXENT 256
-static unsigned char dt_arena[DT_ARENA];
-static struct dtent { int noff, nlen, voff, vlen; } dt[DT_MAXENT];
-static int      dt_n, dt_top;
-static unsigned dt_size, dt_max;
+#define FRAMECAP  16384
 
-static void dt_reset(void) { dt_n = dt_top = 0; dt_size = 0; dt_max = 4096; }
+struct dtent { int noff, nlen, voff, vlen; };
 
-static void dt_evict_oldest(void)
+/* All of the engine's mutable per-connection state: the HPACK dynamic table,
+ * the inbound-frame + reassembled-header buffers, the request-block builder, and
+ * the literal-string scratch. Heap-allocated per request (h2_run_body /
+ * h2_fetch_many), so any number of h2 connections can run concurrently on
+ * different threads — the engine keeps no other mutable global state. */
+struct h2_conn {
+	unsigned char dt_arena[DT_ARENA];
+	struct dtent  dt[DT_MAXENT];
+	int           dt_n, dt_top;
+	unsigned      dt_size, dt_max;
+	unsigned char framebuf[FRAMECAP];    /* current inbound frame payload      */
+	unsigned char hblock[FRAMECAP];      /* reassembled response header block  */
+	unsigned char reqhb[4096];           /* request header block builder       */
+	char          nbuf[512];             /* hpack_decode literal name scratch  */
+	char          vbuf[16384];           /* hpack_decode literal value scratch */
+};
+
+static void dt_reset(struct h2_conn *c) { c->dt_n = c->dt_top = 0; c->dt_size = 0; c->dt_max = 4096; }
+
+static void dt_evict_oldest(struct h2_conn *c)
 {
-	if (dt_n <= 0)
+	if (c->dt_n <= 0)
 		return;
-	dt_size -= (unsigned)(dt[0].nlen + dt[0].vlen + 32);
-	for (int i = 1; i < dt_n; i++)
-		dt[i - 1] = dt[i];
-	dt_n--;
+	c->dt_size -= (unsigned)(c->dt[0].nlen + c->dt[0].vlen + 32);
+	for (int i = 1; i < c->dt_n; i++)
+		c->dt[i - 1] = c->dt[i];
+	c->dt_n--;
 }
 
-static void dt_setmax(unsigned m)
+static void dt_setmax(struct h2_conn *c, unsigned m)
 {
-	dt_max = m;
-	while (dt_size > dt_max && dt_n > 0)
-		dt_evict_oldest();
+	c->dt_max = m;
+	while (c->dt_size > c->dt_max && c->dt_n > 0)
+		dt_evict_oldest(c);
 }
 
-static void dt_add(const char *nm, int nl, const char *vl, int vlen)
+static void dt_add(struct h2_conn *c, const char *nm, int nl, const char *vl, int vlen)
 {
 	unsigned need = (unsigned)(nl + vlen + 32);
-	if (need > dt_max) {                 /* too big to ever fit: table empties */
-		dt_n = dt_top = 0; dt_size = 0;
+	if (need > c->dt_max) {              /* too big to ever fit: table empties */
+		c->dt_n = c->dt_top = 0; c->dt_size = 0;
 		return;
 	}
-	while (dt_size + need > dt_max && dt_n > 0)
-		dt_evict_oldest();
-	if (dt_n >= DT_MAXENT)
-		dt_evict_oldest();
-	if (dt_top + nl + vlen > DT_ARENA) { /* compact live bytes to the front */
+	while (c->dt_size + need > c->dt_max && c->dt_n > 0)
+		dt_evict_oldest(c);
+	if (c->dt_n >= DT_MAXENT)
+		dt_evict_oldest(c);
+	if (c->dt_top + nl + vlen > DT_ARENA) { /* compact live bytes to the front */
 		int w = 0;
-		for (int i = 0; i < dt_n; i++) {
-			memmove(dt_arena + w, dt_arena + dt[i].noff, dt[i].nlen);
-			dt[i].noff = w; w += dt[i].nlen;
-			memmove(dt_arena + w, dt_arena + dt[i].voff, dt[i].vlen);
-			dt[i].voff = w; w += dt[i].vlen;
+		for (int i = 0; i < c->dt_n; i++) {
+			memmove(c->dt_arena + w, c->dt_arena + c->dt[i].noff, c->dt[i].nlen);
+			c->dt[i].noff = w; w += c->dt[i].nlen;
+			memmove(c->dt_arena + w, c->dt_arena + c->dt[i].voff, c->dt[i].vlen);
+			c->dt[i].voff = w; w += c->dt[i].vlen;
 		}
-		dt_top = w;
-		if (dt_top + nl + vlen > DT_ARENA)
+		c->dt_top = w;
+		if (c->dt_top + nl + vlen > DT_ARENA)
 			return;                      /* unreachable with dt_max<=4096 */
 	}
-	dt[dt_n].noff = dt_top; dt[dt_n].nlen = nl;
-	memcpy(dt_arena + dt_top, nm, nl); dt_top += nl;
-	dt[dt_n].voff = dt_top; dt[dt_n].vlen = vlen;
-	memcpy(dt_arena + dt_top, vl, vlen); dt_top += vlen;
-	dt_n++;
-	dt_size += need;
+	c->dt[c->dt_n].noff = c->dt_top; c->dt[c->dt_n].nlen = nl;
+	memcpy(c->dt_arena + c->dt_top, nm, nl); c->dt_top += nl;
+	c->dt[c->dt_n].voff = c->dt_top; c->dt[c->dt_n].vlen = vlen;
+	memcpy(c->dt_arena + c->dt_top, vl, vlen); c->dt_top += vlen;
+	c->dt_n++;
+	c->dt_size += need;
 }
 
 /* Resolve an HPACK index to its name (and value, for fully-indexed fields). */
-static int idx_lookup(long idx, const char **nm, int *nl,
+static int idx_lookup(struct h2_conn *c, long idx, const char **nm, int *nl,
                       const char **vl, int *vlen)
 {
 	if (idx >= 1 && idx <= 61) {
@@ -204,11 +220,11 @@ static int idx_lookup(long idx, const char **nm, int *nl,
 		return 0;
 	}
 	int pos = (int)(idx - 62);           /* 0 = most recently added */
-	if (pos < 0 || pos >= dt_n)
+	if (pos < 0 || pos >= c->dt_n)
 		return -1;
-	struct dtent *e = &dt[dt_n - 1 - pos];
-	*nm = (const char *)dt_arena + e->noff; *nl = e->nlen;
-	*vl = (const char *)dt_arena + e->voff; *vlen = e->vlen;
+	struct dtent *e = &c->dt[c->dt_n - 1 - pos];
+	*nm = (const char *)c->dt_arena + e->noff; *nl = e->nlen;
+	*vl = (const char *)c->dt_arena + e->voff; *vlen = e->vlen;
 	return 0;
 }
 
@@ -308,62 +324,61 @@ static void hs_emit(struct hsink *s, const char *nm, int nl,
 }
 
 /* Decode one HPACK header block (RFC 7541 §6) into the sink, keeping the
- * dynamic table in sync. Returns 0, or -1 on a malformed block. */
-static int hpack_decode(const unsigned char *b, int len, struct hsink *s)
+ * dynamic table in sync. Returns 0, or -1 on a malformed block. The literal
+ * name/value scratch (c->nbuf/c->vbuf) is big enough for real-world response
+ * headers (a long Set-Cookie, CSP, or a data: value); a larger field fails the
+ * decode and h2_run then salvages the response if the status line came through. */
+static int hpack_decode(struct h2_conn *c, const unsigned char *b, int len, struct hsink *s)
 {
-	/* Big enough for real-world response headers (a long Set-Cookie, CSP, or a
-	 * data: value). A field larger than this fails the decode; h2_run then
-	 * salvages the response if the status line already came through. */
-	static char nbuf[512], vbuf[16384];
 	int pos = 0;
 	while (pos < len) {
-		unsigned char c = b[pos];
+		unsigned char ch = b[pos];
 		const char *nm, *vl;
 		int nl, vlen;
-		if (c & 0x80) {                            /* indexed header field */
+		if (ch & 0x80) {                           /* indexed header field */
 			long idx = dec_int(b, &pos, len, 7);
-			if (idx <= 0 || idx_lookup(idx, &nm, &nl, &vl, &vlen) < 0)
+			if (idx <= 0 || idx_lookup(c, idx, &nm, &nl, &vl, &vlen) < 0)
 				return -1;
 			hs_emit(s, nm, nl, vl, vlen);
-		} else if (c & 0x40) {                     /* literal, incr. indexing */
+		} else if (ch & 0x40) {                    /* literal, incr. indexing */
 			long idx = dec_int(b, &pos, len, 6);
 			if (idx < 0)
 				return -1;
 			if (idx == 0) {
-				if (dec_str(b, &pos, len, nbuf, sizeof nbuf, &nl))
+				if (dec_str(b, &pos, len, c->nbuf, sizeof c->nbuf, &nl))
 					return -1;
-				nm = nbuf;
+				nm = c->nbuf;
 			} else {
 				const char *dv; int dvl;
-				if (idx_lookup(idx, &nm, &nl, &dv, &dvl) < 0)
+				if (idx_lookup(c, idx, &nm, &nl, &dv, &dvl) < 0)
 					return -1;
 			}
-			if (dec_str(b, &pos, len, vbuf, sizeof vbuf, &vlen))
+			if (dec_str(b, &pos, len, c->vbuf, sizeof c->vbuf, &vlen))
 				return -1;
-			vl = vbuf;
-			dt_add(nm, nl, vl, vlen);
+			vl = c->vbuf;
+			dt_add(c, nm, nl, vl, vlen);
 			hs_emit(s, nm, nl, vl, vlen);
-		} else if (c & 0x20) {                     /* dynamic table size update */
+		} else if (ch & 0x20) {                    /* dynamic table size update */
 			long m = dec_int(b, &pos, len, 5);
 			if (m < 0)
 				return -1;
-			dt_setmax((unsigned)m);
+			dt_setmax(c, (unsigned)m);
 		} else {                                   /* literal, no indexing */
 			long idx = dec_int(b, &pos, len, 4);
 			if (idx < 0)
 				return -1;
 			if (idx == 0) {
-				if (dec_str(b, &pos, len, nbuf, sizeof nbuf, &nl))
+				if (dec_str(b, &pos, len, c->nbuf, sizeof c->nbuf, &nl))
 					return -1;
-				nm = nbuf;
+				nm = c->nbuf;
 			} else {
 				const char *dv; int dvl;
-				if (idx_lookup(idx, &nm, &nl, &dv, &dvl) < 0)
+				if (idx_lookup(c, idx, &nm, &nl, &dv, &dvl) < 0)
 					return -1;
 			}
-			if (dec_str(b, &pos, len, vbuf, sizeof vbuf, &vlen))
+			if (dec_str(b, &pos, len, c->vbuf, sizeof c->vbuf, &vlen))
 				return -1;
-			vl = vbuf;
+			vl = c->vbuf;
 			hs_emit(s, nm, nl, vl, vlen);
 		}
 	}
@@ -487,11 +502,6 @@ static int build_request(unsigned char *hb, int https, const char *method,
 #define FL_PADDED      0x08
 #define FL_PRIORITY    0x20
 
-#define FRAMECAP 16384
-
-static unsigned char framebuf[FRAMECAP];     /* current inbound frame payload */
-static unsigned char hblock[FRAMECAP];       /* reassembled response header block */
-
 struct frd { int sock; unsigned char buf[4096]; int pos, len; };
 
 /* send all `n` bytes; 0 ok, -2 transport error, -3 interrupted. */
@@ -571,7 +581,7 @@ static int read_frame(struct frd *r, int *type, int *flags, unsigned *sid,
 
 /* Gather a full header block: strip the first HEADERS frame's pad/priority,
  * then append CONTINUATION frames until END_HEADERS. Returns 0/-2/-3. */
-static int collect_header_block(struct frd *r, const unsigned char *firstpay,
+static int collect_header_block(struct h2_conn *c, struct frd *r, const unsigned char *firstpay,
                                 int firstlen, int firstflags, int *hblen)
 {
 	int start = 0, padlen = 0;
@@ -580,15 +590,15 @@ static int collect_header_block(struct frd *r, const unsigned char *firstpay,
 	int frag = firstlen - start - padlen;
 	if (frag < 0 || frag > FRAMECAP)
 		return -2;
-	memcpy(hblock, firstpay + start, frag);
+	memcpy(c->hblock, firstpay + start, frag);
 	int o = frag, flags = firstflags;
 	while (!(flags & FL_END_HEADERS)) {
 		int t, fl, pl; unsigned sid;
-		int rc = read_frame(r, &t, &fl, &sid, framebuf, &pl);
+		int rc = read_frame(r, &t, &fl, &sid, c->framebuf, &pl);
 		if (rc < 0) return rc;
 		if (t != F_CONT) return -2;
 		if (o + pl > FRAMECAP) return -2;
-		memcpy(hblock + o, framebuf, pl);
+		memcpy(c->hblock + o, c->framebuf, pl);
 		o += pl; flags = fl;
 	}
 	*hblen = o;
@@ -646,31 +656,32 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
                 char *hdr, int hdrcap, int *hdrlen,
                 http_body_fn body, void *ctx)
 {
-	dt_reset();
+	struct h2_conn *c = malloc(sizeof *c);
+	if (!c) return HTTP_ENORESP;
+	dt_reset(c);
 	if (!method) method = "GET";
 
 	/* Preface + our SETTINGS (no push; a wide stream window) + a connection
 	 * WINDOW_UPDATE so the whole response flows without per-DATA updates. */
 	if (send_all(sock, PREFACE, 24) < 0)
-		return HTTP_ESEND;
+		{ free(c); return HTTP_ESEND; }
 	unsigned char st[12] = {
 		0x00, 0x02, 0x00, 0x00, 0x00, 0x00,        /* ENABLE_PUSH = 0 */
 		0x00, 0x04, 0x7f, 0xff, 0xff, 0xff,        /* INITIAL_WINDOW_SIZE max */
 	};
 	if (put_frame(sock, F_SETTINGS, 0, 0, st, 12) < 0)
-		return HTTP_ESEND;
+		{ free(c); return HTTP_ESEND; }
 	unsigned char wu[4] = { 0x7f, 0xff, 0x00, 0x00 };  /* +~2 GiB conn window */
 	if (put_frame(sock, F_WINUP, 0, 0, wu, 4) < 0)
-		return HTTP_ESEND;
+		{ free(c); return HTTP_ESEND; }
 
 	int has_body = reqbody && reqlen > 0;
-	static unsigned char reqhb[4096];
-	int rl = build_request(reqhb, scheme_https, method, authority, path, opts);
+	int rl = build_request(c->reqhb, scheme_https, method, authority, path, opts);
 	/* When a request body follows, the HEADERS frame must NOT end the stream; the
 	 * body rides in flow-controlled DATA frames sent below (and replenished from the
 	 * peer's SETTINGS/WINDOW_UPDATE in the loop), so a body of any size streams. */
-	if (put_frame(sock, F_HEADERS, FL_END_HEADERS | (has_body ? 0 : FL_END_STREAM), 1, reqhb, rl) < 0)
-		return HTTP_ESEND;
+	if (put_frame(sock, F_HEADERS, FL_END_HEADERS | (has_body ? 0 : FL_END_STREAM), 1, c->reqhb, rl) < 0)
+		{ free(c); return HTTP_ESEND; }
 
 	/* Request-body flow control. Stream + connection send-windows start at the h2
 	 * default 65535 and grow via the peer's SETTINGS(INITIAL_WINDOW_SIZE) and
@@ -679,7 +690,7 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 	int boff = 0;
 	long swnd = 65535, cwnd = 65535, applied_iws = 65535;
 	if (has_body && h2_send_body(sock, reqbody, reqlen, &boff, &swnd, &cwnd) < 0)
-		return HTTP_ESEND;
+		{ free(c); return HTTP_ESEND; }
 
 	struct frd r; r.sock = sock; r.pos = r.len = 0;
 	struct hsink hs; hs.buf = hdr; hs.cap = (hdr ? hdrcap : 0); hs.len = 0; hs.status = 0;
@@ -690,7 +701,7 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 
 	while (!done) {
 		int type, flags, paylen; unsigned sid;
-		int fr = read_frame(&r, &type, &flags, &sid, framebuf, &paylen);
+		int fr = read_frame(&r, &type, &flags, &sid, c->framebuf, &paylen);
 		if (fr == -3) { rc = HTTP_EINTR;  goto out; }
 		if (fr < 0) {
 			/* Connection closed/errored. If the response headers already arrived,
@@ -707,8 +718,8 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 			if (!(flags & FL_ACK)) {
 				int i;                            /* apply INITIAL_WINDOW_SIZE to our send window */
 				for (i = 0; i + 6 <= paylen; i += 6)
-					if (((framebuf[i] << 8) | framebuf[i + 1]) == 0x0004) {
-						long niw = ((long)framebuf[i + 2] << 24) | (framebuf[i + 3] << 16) | (framebuf[i + 4] << 8) | framebuf[i + 5];
+					if (((c->framebuf[i] << 8) | c->framebuf[i + 1]) == 0x0004) {
+						long niw = ((long)c->framebuf[i + 2] << 24) | (c->framebuf[i + 3] << 16) | (c->framebuf[i + 4] << 8) | c->framebuf[i + 5];
 						swnd += niw - applied_iws; applied_iws = niw;
 					}
 				if (put_frame(sock, F_SETTINGS, FL_ACK, 0, 0, 0) < 0) { rc = HTTP_ENORESP; goto out; }
@@ -717,7 +728,7 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 			break;
 		case F_PING:
 			if (!(flags & FL_ACK))
-				if (put_frame(sock, F_PING, FL_ACK, 0, framebuf, paylen) < 0)
+				if (put_frame(sock, F_PING, FL_ACK, 0, c->framebuf, paylen) < 0)
 					{ rc = HTTP_ENORESP; goto out; }
 			break;
 		case F_HEADERS:
@@ -727,10 +738,10 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 				 * optional, so just note END_STREAM and keep going for the body. */
 				if (hpack_broken) { if (flags & FL_END_STREAM) done = 1; break; }
 				int hbl;
-				int cr = collect_header_block(&r, framebuf, paylen, flags, &hbl);
+				int cr = collect_header_block(c, &r, c->framebuf, paylen, flags, &hbl);
 				if (cr == -3) { rc = HTTP_EINTR;  goto out; }
 				if (cr < 0)   { rc = HTTP_ENORESP; goto out; }
-				if (hpack_decode(hblock, hbl, &hs) < 0) {
+				if (hpack_decode(c, c->hblock, hbl, &hs) < 0) {
 					/* A header block we couldn't fully decode (HPACK state we don't
 					 * model). Oversized fields are no longer fatal — dec_str
 					 * truncates and keeps decoding, so a giant Set-Cookie/CSP no
@@ -765,9 +776,9 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 		case F_DATA:
 			if (sid == 1) {
 				int start = 0, padlen = 0;
-				if (flags & FL_PADDED) padlen = framebuf[start++];
+				if (flags & FL_PADDED) padlen = c->framebuf[start++];
 				int dlen = paylen - start - padlen;
-				if (dlen > 0) emit(&e, framebuf + start, dlen);
+				if (dlen > 0) emit(&e, c->framebuf + start, dlen);
 				if (e.aborted) { rc = HTTP_EABORT; goto out; }
 				if (flags & FL_END_STREAM) done = 1;
 			}
@@ -787,7 +798,7 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 			break;
 		case F_WINUP:                              /* peer opened the send window */
 			if (has_body && boff < reqlen && paylen >= 4) {
-				long inc = ((long)(framebuf[0] & 0x7f) << 24) | (framebuf[1] << 16) | (framebuf[2] << 8) | framebuf[3];
+				long inc = ((long)(c->framebuf[0] & 0x7f) << 24) | (c->framebuf[1] << 16) | (c->framebuf[2] << 8) | c->framebuf[3];
 				if (sid == 0) cwnd += inc; else if (sid == 1) swnd += inc;
 				if (h2_send_body(sock, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) { rc = HTTP_ESEND; goto out; }
 			}
@@ -816,6 +827,7 @@ out:
 		hdr[hs.len] = '\0';
 		if (hdrlen) *hdrlen = hs.len;
 	}
+	free(c);
 	return rc;
 }
 
@@ -870,16 +882,18 @@ int h2_fetch_many(int sock, int scheme_https, const char *authority,
                   void *cb_ctx)
 {
 	if (nreq <= 0 || nreq > H2_FETCH_MAX) return HTTP_ENORESP;
-	dt_reset();
+	struct h2_conn *c = malloc(sizeof *c);
+	if (!c) return HTTP_ENORESP;
+	dt_reset(c);
 
-	if (send_all(sock, PREFACE, 24) < 0) return HTTP_ESEND;
+	if (send_all(sock, PREFACE, 24) < 0) { free(c); return HTTP_ESEND; }
 	unsigned char st[12] = {
 		0x00, 0x02, 0x00, 0x00, 0x00, 0x00,        /* ENABLE_PUSH = 0          */
 		0x00, 0x04, 0x7f, 0xff, 0xff, 0xff,        /* INITIAL_WINDOW_SIZE max  */
 	};
-	if (put_frame(sock, F_SETTINGS, 0, 0, st, 12) < 0) return HTTP_ESEND;
+	if (put_frame(sock, F_SETTINGS, 0, 0, st, 12) < 0) { free(c); return HTTP_ESEND; }
 	unsigned char wu[4] = { 0x7f, 0xff, 0x00, 0x00 };  /* +~2 GiB conn window */
-	if (put_frame(sock, F_WINUP, 0, 0, wu, 4) < 0) return HTTP_ESEND;
+	if (put_frame(sock, F_WINUP, 0, 0, wu, 4) < 0) { free(c); return HTTP_ESEND; }
 
 	struct h2_mstream sm[H2_FETCH_MAX];
 	for (int i = 0; i < nreq; i++) {
@@ -889,21 +903,20 @@ int h2_fetch_many(int sock, int scheme_https, const char *authority,
 
 	/* Send every request's HEADERS up front (END_STREAM: no request body), each
 	 * on its own odd stream id. The server interleaves the responses. */
-	static unsigned char reqhb[4096];
 	for (int i = 0; i < nreq; i++) {
 		unsigned sid = 1u + 2u * (unsigned)i;
-		int rl = build_request(reqhb, scheme_https, "GET", authority, reqs[i].path, opts);
-		if (put_frame(sock, F_HEADERS, FL_END_HEADERS | FL_END_STREAM, sid, reqhb, rl) < 0)
-			return HTTP_ESEND;
+		int rl = build_request(c->reqhb, scheme_https, "GET", authority, reqs[i].path, opts);
+		if (put_frame(sock, F_HEADERS, FL_END_HEADERS | FL_END_STREAM, sid, c->reqhb, rl) < 0)
+			{ free(c); return HTTP_ESEND; }
 	}
 
 	struct frd r; r.sock = sock; r.pos = r.len = 0;
-	static char statusbuf[64];
+	char statusbuf[64];
 	int ndone = 0, rc = 0;
 
 	while (ndone < nreq) {
 		int type, flags, paylen; unsigned sid;
-		int fr = read_frame(&r, &type, &flags, &sid, framebuf, &paylen);
+		int fr = read_frame(&r, &type, &flags, &sid, c->framebuf, &paylen);
 		if (fr < 0) { rc = (fr == -3) ? HTTP_EINTR : HTTP_ENORESP; goto out; }
 
 		switch (type) {
@@ -913,16 +926,16 @@ int h2_fetch_many(int sock, int scheme_https, const char *authority,
 			break;
 		case F_PING:
 			if (!(flags & FL_ACK))
-				if (put_frame(sock, F_PING, FL_ACK, 0, framebuf, paylen) < 0) { rc = HTTP_ENORESP; goto out; }
+				if (put_frame(sock, F_PING, FL_ACK, 0, c->framebuf, paylen) < 0) { rc = HTTP_ENORESP; goto out; }
 			break;
 		case F_HEADERS: {
 			int hbl;
-			int cr = collect_header_block(&r, framebuf, paylen, flags, &hbl);
+			int cr = collect_header_block(c, &r, c->framebuf, paylen, flags, &hbl);
 			if (cr < 0) { rc = (cr == -3) ? HTTP_EINTR : HTTP_ENORESP; goto out; }
 			/* HPACK is connection-scoped: every block must decode in wire order,
 			 * even for a stream we don't track — statusbuf is a throwaway sink. */
 			struct hsink hs; hs.buf = statusbuf; hs.cap = sizeof statusbuf; hs.len = 0; hs.status = 0;
-			if (hpack_decode(hblock, hbl, &hs) < 0) { rc = HTTP_ENORESP; goto out; }
+			if (hpack_decode(c, c->hblock, hbl, &hs) < 0) { rc = HTTP_ENORESP; goto out; }
 			int idx = h2m_idx(sid, nreq);
 			if (idx >= 0 && !sm[idx].done) {
 				sm[idx].status = hs.status;
@@ -936,12 +949,12 @@ int h2_fetch_many(int sock, int scheme_https, const char *authority,
 		case F_DATA: {
 			int idx = h2m_idx(sid, nreq);
 			int start = 0, padlen = 0;
-			if (flags & FL_PADDED) padlen = framebuf[start++];
+			if (flags & FL_PADDED) padlen = c->framebuf[start++];
 			int dlen = paylen - start - padlen;
 			if (idx >= 0 && !sm[idx].done) {
 				if (dlen > 0) {
 					if (!h2m_grow(&sm[idx], sm[idx].blen + dlen)) sm[idx].failed = 1;
-					else { memcpy(sm[idx].body + sm[idx].blen, framebuf + start, dlen);
+					else { memcpy(sm[idx].body + sm[idx].blen, c->framebuf + start, dlen);
 					       sm[idx].blen += dlen; }
 				}
 				if (flags & FL_END_STREAM) {
@@ -976,5 +989,6 @@ out:
 		reqs[i].status = sm[i].status;
 		reqs[i].failed = sm[i].failed || (!sm[i].done) || sm[i].status != 200;
 	}
+	free(c);
 	return rc;
 }

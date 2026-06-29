@@ -6,7 +6,18 @@
 #include "browser.h"
 #include "fetchint.h"
 #include "headers.h"   /* HTTP response headers (iframe X-Frame-Options / CSP)  */
+#include "cors.h"      /* CORS request orchestration + CORP sub-resource guard  */
 #include "svg.h"       /* SVG -> ARGB rasterizer (favicons, inline images) */
+#include "webp.h"      /* WebP (lossless VP8L) -> RGBA decoder              */
+
+/* The origin that owns the sub-resources currently being fetched (the page, set
+ * by do_fetch). Cross-origin no-cors loads are checked against it for CORP. */
+static char g_embedder[URL_MAX];
+void resource_set_page(const char *page_url)
+{
+	int k = 0; g_embedder[0] = '\0';
+	if (page_url) sapp(g_embedder, &k, sizeof g_embedder, page_url);
+}
 
 /* --------------------------------------------------- inline image fetching */
 
@@ -100,7 +111,7 @@ static void parse_resp_headers(const char *hdr, struct resp_meta *meta, int *chu
 static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp_meta *meta,
                                      char *hdr_out, int hdr_cap)
 {
-	char hdr[4096]; int hl = 0, m = 0;
+	char hdr[RESP_HDR_MAX]; int hl = 0, m = 0;
 	for (;;) {
 		int c = ir_getc(r);
 		if (c < 0) return 0;
@@ -158,16 +169,29 @@ static int is_redirect(int s)
 { return s == 301 || s == 302 || s == 303 || s == 307 || s == 308; }
 
 /* Fetch an absolute URL as a sub-resource (GET, follow redirects): the 200 body
- * (caller frees) + *outlen, or NULL. A thin wrapper over browser_fetch_url (the
- * one single-request transport: h2 when the server offers it, else h1.1), which
- * also gives sub-resources HTTP/2. Sends cookies, HSTS-upgrades, runs concurrently
- * (the kernel TLS is multi-flow). */
+ * (caller frees) + *outlen, or NULL. A thin wrapper over browser_fetch (the one
+ * single-request transport: h2 when the server offers it, else h1.1), which also
+ * gives sub-resources HTTP/2. Sends cookies, HSTS-upgrades, runs concurrently (the
+ * kernel TLS is multi-flow), and drops a cross-origin response the server's
+ * Cross-Origin-Resource-Policy forbids this page from using. */
 static unsigned char *subres_get(const char *absurl, const char *accept, int *outlen)
 {
-	int status = 0;
-	unsigned char *body = browser_fetch_url(absurl, "GET", 0, 0, 0, accept,
-	                                        &status, 0, 0, outlen, 0);
-	if (body && status != 200) { free(body); return 0; }
+	char hdr[RESP_HDR_MAX];
+	struct http_req rq = { 0 }; rq.url = absurl; rq.accept = accept;
+	struct http_resp rs = { 0 }; rs.hdr = hdr; rs.hdr_cap = sizeof hdr;
+	*outlen = 0;
+	unsigned char *body = browser_fetch(&rq, &rs);
+	if (!body) return 0;
+	if (rs.status != 200) { free(body); return 0; }
+
+	/* CORP: a cross-origin no-cors resource may forbid this document embedding it. */
+	if (g_embedder[0] && !cors_same_origin(g_embedder, absurl)) {
+		struct http_headers H; http_headers_parse(&H, hdr);
+		int blocked = !corp_allows(&H, g_embedder, absurl, 0, 0);
+		http_headers_free(&H);
+		if (blocked) { free(body); return 0; }
+	}
+	*outlen = rs.len;
 	return body;
 }
 
@@ -189,8 +213,7 @@ static void h2_append_headers(char *xh, int *xn, int cap, const char *extra)
 }
 
 static void build_request(char *req, int *n, int cap, const struct purl *u,
-                          const char *method, const char *accept, const char *ctype, int blen,
-                          const char *extra_hdrs)
+                          const char *method, const char *accept, const struct http_req *rq)
 {
 	sapp(req, n, cap, method); sapp(req, n, cap, " ");
 	sapp(req, n, cap, u->path);
@@ -199,17 +222,17 @@ static void build_request(char *req, int *n, int cap, const struct purl *u,
 	if (!((u->tls && u->port == 443) || (!u->tls && u->port == 80))) {
 		sapp(req, n, cap, ":"); uapp(req, n, cap, (unsigned)u->port);
 	}
-	{ char ck[1024]; if (cookie_header(u->host, ck, sizeof ck) > 0) { sapp(req, n, cap, "\r\nCookie: "); sapp(req, n, cap, ck); } }
+	if (!rq->no_cookies) { char ck[1024]; if (cookie_header(u->host, ck, sizeof ck) > 0) { sapp(req, n, cap, "\r\nCookie: "); sapp(req, n, cap, ck); } }
 	sapp(req, n, cap, "\r\nUser-Agent: " BR_UA "\r\nAccept: ");
-	sapp(req, n, cap, accept && accept[0] ? accept : "*/*");
-	if (ctype && ctype[0]) { sapp(req, n, cap, "\r\nContent-Type: "); sapp(req, n, cap, ctype); }
-	if (blen > 0) { sapp(req, n, cap, "\r\nContent-Length: "); uapp(req, n, cap, (unsigned)blen); }
+	sapp(req, n, cap, accept);
+	if (rq->ctype && rq->ctype[0]) { sapp(req, n, cap, "\r\nContent-Type: "); sapp(req, n, cap, rq->ctype); }
+	if (rq->body_len > 0) { sapp(req, n, cap, "\r\nContent-Length: "); uapp(req, n, cap, (unsigned)rq->body_len); }
 	sapp(req, n, cap, "\r\nConnection: close\r\n");
-	if (extra_hdrs && extra_hdrs[0]) sapp(req, n, cap, extra_hdrs);   /* caller-supplied, each "Name: value\r\n" */
+	if (rq->extra_hdrs && rq->extra_hdrs[0]) sapp(req, n, cap, rq->extra_hdrs);   /* caller-supplied, each "Name: value\r\n" */
 	sapp(req, n, cap, "\r\n");
 }
 
-/* h2 response body sink for browser_fetch_url: append DATA into a growable buffer. */
+/* h2 response body sink for browser_fetch: append DATA into a growable buffer. */
 struct h2buf { unsigned char *body; int cap, blen; };
 static int h2buf_cb(void *ctx, const unsigned char *p, int n)
 {
@@ -219,29 +242,29 @@ static int h2buf_cb(void *ctx, const unsigned char *p, int n)
 }
 
 /* The single-request transport core: one GET/POST (h2 when offered, else h1.1),
- * following redirects, returning the body for ANY final status. The final hop's
- * response metadata, absolute URL and raw header block are reported out so a
- * caller that needs more than status+ctype (the iframe path, which reads
- * X-Frame-Options / CSP) gets them without a second request. NULL on a
- * connection/OOM error. Worker-thread only. */
-static unsigned char *fetch_loop(const char *url, const char *method,
-                                 const unsigned char *reqbody, int reqlen, const char *req_ctype,
-                                 const char *accept, struct resp_meta *meta_out,
-                                 char *final_url, int fu_cap, char *hdr_out, int hdr_cap, int *outlen,
-                                 const char *extra_hdrs)
+ * following redirects, returning the body for ANY final status. The optional out
+ * fields of `rs` (final URL after redirects, the raw header block) let a caller
+ * that needs more than status+ctype (the iframe path reads X-Frame-Options/CSP,
+ * the CORS path reads Access-Control-*) get them without a second request. NULL on
+ * a connection/OOM error. Worker-thread only. */
+unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 {
-	char full[URL_MAX]; { int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, url); }
-	int is_get = !method || streq_ci(method, "GET") || streq_ci(method, "HEAD");
-	if (!method) method = "GET";
-	if (!accept || !accept[0]) accept = "*/*";
-	*outlen = 0;
+	const char *method = (rq->method && rq->method[0]) ? rq->method : "GET";
+	const char *accept = (rq->accept && rq->accept[0]) ? rq->accept : "*/*";
+	int is_get = streq_ci(method, "GET") || streq_ci(method, "HEAD");
+	unsigned t0 = msec();          /* devtools Network duration of this exchange */
+	char full[URL_MAX]; { int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, rq->url); }
+
+	rs->status = 0; rs->len = 0; rs->ctype[0] = '\0';
+	if (rs->final_url && rs->final_cap) rs->final_url[0] = '\0';
+	if (rs->hdr && rs->hdr_cap) rs->hdr[0] = '\0';
 
 	for (int hop = 0; hop <= MAX_REDIR; hop++) {
 		struct purl u;
 		struct resp_meta meta;
 		unsigned char *body = 0;
 		int blen = 0;
-		char rawhdr[4096]; rawhdr[0] = '\0';
+		char rawhdr[RESP_HDR_MAX]; rawhdr[0] = '\0';
 		if (!parse_url(full, &u)) return 0;
 		if (!u.tls && hsts_has(u.host)) { u.tls = 1; if (u.port == 80) u.port = 443; }
 
@@ -255,15 +278,15 @@ static unsigned char *fetch_loop(const char *url, const char *method,
 			sapp(auth, &an, sizeof auth, u.host);
 			if (u.port != 443) { sapp(auth, &an, sizeof auth, ":"); uapp(auth, &an, sizeof auth, (unsigned)u.port); }
 			char xh[1408]; int xn = 0; char ck[1024];
-			if (cookie_header(u.host, ck, sizeof ck) > 0) { sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n"); }
+			if (!rq->no_cookies && cookie_header(u.host, ck, sizeof ck) > 0) { sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n"); }
 			sapp(xh, &xn, sizeof xh, "accept: "); sapp(xh, &xn, sizeof xh, accept); sapp(xh, &xn, sizeof xh, "\r\n");
-			if (req_ctype && req_ctype[0]) { sapp(xh, &xn, sizeof xh, "content-type: "); sapp(xh, &xn, sizeof xh, req_ctype); sapp(xh, &xn, sizeof xh, "\r\n"); }
-			if (extra_hdrs && extra_hdrs[0]) h2_append_headers(xh, &xn, sizeof xh, extra_hdrs);
+			if (rq->ctype && rq->ctype[0]) { sapp(xh, &xn, sizeof xh, "content-type: "); sapp(xh, &xn, sizeof xh, rq->ctype); sapp(xh, &xn, sizeof xh, "\r\n"); }
+			if (rq->extra_hdrs && rq->extra_hdrs[0]) h2_append_headers(xh, &xn, sizeof xh, rq->extra_hdrs);
 			struct h2_opts opts = { BR_UA, xh, 0 };
 			struct h2buf hb; hb.cap = 65536; hb.blen = 0; hb.body = malloc((unsigned)hb.cap);
 			if (!hb.body) { net_close(sock); return 0; }
 			int hlen = 0;
-			int rc = h2_run_body(sock, 1, auth, method, u.path, &opts, reqbody, reqlen,
+			int rc = h2_run_body(sock, 1, auth, method, u.path, &opts, rq->body, rq->body_len,
 			                     rawhdr, sizeof rawhdr, &hlen, h2buf_cb, &hb);
 			net_close(sock);
 			if (rc < 0) { if (hb.body) free(hb.body); return 0; }
@@ -273,9 +296,9 @@ static unsigned char *fetch_loop(const char *url, const char *method,
 			blen = hb.blen;
 		} else {
 			char req[2048]; int n = 0;
-			build_request(req, &n, sizeof req, &u, method, accept, req_ctype, reqlen, extra_hdrs);
+			build_request(req, &n, sizeof req, &u, method, accept, rq);
 			if (net_send(sock, req, n) < 0) { net_close(sock); return 0; }
-			if (reqbody && reqlen > 0 && net_send(sock, (const char *)reqbody, reqlen) < 0) { net_close(sock); return 0; }
+			if (rq->body && rq->body_len > 0 && net_send(sock, (const char *)rq->body, rq->body_len) < 0) { net_close(sock); return 0; }
 			struct ireader r = { sock, { 0 }, 0, 0, 0 };
 			body = read_http_body(&r, &blen, &meta, rawhdr, sizeof rawhdr);
 			net_close(sock);
@@ -289,33 +312,161 @@ static unsigned char *fetch_loop(const char *url, const char *method,
 			free(body);
 			continue;
 		}
-		if (meta_out) *meta_out = meta;
-		if (final_url && fu_cap) { int k = 0; final_url[0] = '\0'; sapp(final_url, &k, fu_cap, full); }
-		if (hdr_out && hdr_cap) { int k = 0; for (; rawhdr[k] && k < hdr_cap - 1; k++) hdr_out[k] = rawhdr[k]; hdr_out[k] = '\0'; }
-		*outlen = blen;
-		devtools_net_add(method, full, meta.status, meta.ctype, blen);
+		rs->status = meta.status;
+		rs->len = blen;
+		{ int k = 0; rs->ctype[0] = '\0'; sapp(rs->ctype, &k, sizeof rs->ctype, meta.ctype); }
+		if (rs->final_url && rs->final_cap) { int k = 0; sapp(rs->final_url, &k, rs->final_cap, full); }
+		if (rs->hdr && rs->hdr_cap) { int k = 0; for (; rawhdr[k] && k < rs->hdr_cap - 1; k++) rs->hdr[k] = rawhdr[k]; rs->hdr[k] = '\0'; }
+		{ struct net_log e = { method, full, meta.status, meta.ctype, blen,
+		                       (int)(msec() - t0), rawhdr };
+		  devtools_net_add(&e); }
 		return body;
 	}
 	return 0;
 }
 
-/* The browser's single-request transport (sub-resources via subres_get, and the JS
- * fetch()): one request with `method` (+ optional body), returning the response
- * body (caller frees) for ANY status, with the status and Content-Type reported so
- * fetch()'s Response is real. A thin wrapper over fetch_loop. Worker-thread only. */
-unsigned char *browser_fetch_url(const char *url, const char *method,
-                                 const unsigned char *reqbody, int reqlen, const char *req_ctype,
-                                 const char *accept, int *status, char *out_ctype, int oc_cap, int *outlen,
-                                 const char *extra_hdrs)
+/* The CORS transport for fetch()/XMLHttpRequest. A same-origin request behaves
+ * like browser_fetch (cookies sent, no extra checks). A cross-origin request
+ * carries an Origin header; a non-simple one is gated by a preflight OPTIONS, and
+ * the response is only handed back if its Access-Control-Allow-* headers admit
+ * `page_url`'s origin. Cookies ride only when `with_credentials` (fetch
+ * credentials:"include" / XHR withCredentials), per the CORS credentials rules.
+ *
+ * Returns the body (caller frees) with `rs` filled; NULL on a transport error OR
+ * a CORS denial — the JS layer surfaces both as a network error (TypeError / xhr
+ * "error"), so they need not be distinguished. The page-set "Name: value\r\n"
+ * headers in `rq->extra_hdrs` classify the request and seed the preflight's
+ * Access-Control-Request-Headers. */
+unsigned char *browser_cors_fetch(const char *page_url, int with_credentials,
+                                  const struct http_req *rq, struct http_resp *rs)
 {
-	struct resp_meta meta;
-	*status = 0; *outlen = 0; if (out_ctype && oc_cap) out_ctype[0] = '\0';
-	unsigned char *body = fetch_loop(url, method, reqbody, reqlen, req_ctype, accept,
-	                                 &meta, 0, 0, 0, 0, outlen, extra_hdrs);
+	const char *method = (rq->method && rq->method[0]) ? rq->method : "GET";
+	const char *author = rq->extra_hdrs;
+
+	/* Same-origin: ordinary credentialed request, no CORS dance. */
+	if (cors_same_origin(page_url, rq->url))
+		return browser_fetch(rq, rs);
+
+	char origin[URL_HOST_MAX + 24];
+	cors_origin(page_url, origin, sizeof origin);
+
+	/* Build the cross-origin request headers: Origin first, then the page's. */
+	char xh[1280]; int xn = 0;
+	sapp(xh, &xn, sizeof xh, "Origin: "); sapp(xh, &xn, sizeof xh, origin); sapp(xh, &xn, sizeof xh, "\r\n");
+	if (author && author[0]) sapp(xh, &xn, sizeof xh, author);
+
+	/* Non-simple request: a preflight must clear it first. The preflight is never
+	 * credentialed and carries no author headers of its own — just the intended
+	 * method and the list of non-simple header names. */
+	if (cors_needs_preflight(method, rq->ctype, author)) {
+		char ph[1280]; int pn = 0;
+		sapp(ph, &pn, sizeof ph, "Origin: "); sapp(ph, &pn, sizeof ph, origin);
+		sapp(ph, &pn, sizeof ph, "\r\nAccess-Control-Request-Method: "); sapp(ph, &pn, sizeof ph, method);
+		sapp(ph, &pn, sizeof ph, "\r\n");
+		if (author && author[0]) {
+			char names[512];
+			cors_request_header_names(author, names, sizeof names);
+			if (names[0]) { sapp(ph, &pn, sizeof ph, "Access-Control-Request-Headers: "); sapp(ph, &pn, sizeof ph, names); sapp(ph, &pn, sizeof ph, "\r\n"); }
+		}
+		char phdr[4096];
+		struct http_req prq = { 0 };
+		prq.url = rq->url; prq.method = "OPTIONS"; prq.accept = "*/*"; prq.extra_hdrs = ph; prq.no_cookies = 1;
+		struct http_resp prs = { 0 }; prs.hdr = phdr; prs.hdr_cap = sizeof phdr;
+		unsigned char *pbody = browser_fetch(&prq, &prs);
+		if (!pbody) return 0;
+		free(pbody);
+		struct http_headers PH; http_headers_parse(&PH, phdr);
+		char reason[64];
+		int ok = cors_check_preflight(&PH, origin, method, author, with_credentials, reason, sizeof reason);
+		http_headers_free(&PH);
+		if (!ok) return 0;
+	}
+
+	/* The actual cross-origin request: same base, but Origin'd headers and cookies
+	 * gated on the credentials mode. */
+	struct http_req areq = *rq;
+	areq.method = method;
+	areq.accept = "*/*";
+	areq.extra_hdrs = xh;
+	areq.no_cookies = !with_credentials;
+	char rawhdr[RESP_HDR_MAX];
+	struct http_resp ars = { 0 }; ars.hdr = rawhdr; ars.hdr_cap = sizeof rawhdr;
+	unsigned char *body = browser_fetch(&areq, &ars);
 	if (!body) return 0;
-	*status = meta.status;
-	if (out_ctype && oc_cap) { int k = 0; for (; meta.ctype[k] && k < oc_cap - 1; k++) out_ctype[k] = meta.ctype[k]; out_ctype[k] = '\0'; }
+
+	struct http_headers H; http_headers_parse(&H, rawhdr);
+	char reason[64];
+	int ok = cors_check_response(&H, origin, with_credentials, reason, sizeof reason);
+	http_headers_free(&H);
+	if (!ok) { free(body); return 0; }
+
+	rs->status = ars.status;
+	rs->len = ars.len;
+	{ int k = 0; rs->ctype[0] = '\0'; sapp(rs->ctype, &k, sizeof rs->ctype, ars.ctype); }
 	return body;
+}
+
+/* --- generic parallel sub-resource fetch pool -----------------------------
+ * A small fan-out helper: run fn(ctx, i) for every i in [0,n) across a few
+ * worker threads plus this one, joining before return. Each job must fetch over
+ * its own socket(s) and write disjoint state (or lock its own) — the transport
+ * engines (h1.1, and the now per-connection h2) are re-entrant, so the jobs run
+ * truly concurrently. Worker-thread only and non-nested: the spawned threads
+ * find the active job through g_par (thread_create takes no argument), and
+ * par_fetch joins them before returning, so the pointer stays live throughout. */
+#define PAR_FETCHERS    4
+#define PAR_FETCH_STACK (32 * 1024)
+
+struct par_job {
+	volatile int next;          /* next index to claim                       */
+	volatile int lock;          /* guards `next`                             */
+	int          n;
+	void       (*fn)(void *ctx, int i);
+	void        *ctx;
+};
+static struct par_job *g_par;
+
+static int par_xchg(volatile int *p, int v)
+{ __asm__ volatile ("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory"); return v; }
+static void par_spin_lock(volatile int *l)   { while (par_xchg(l, 1)) msleep(0); }
+static void par_spin_unlock(volatile int *l) { __asm__ volatile ("" ::: "memory"); *l = 0; }
+
+static int par_claim(struct par_job *j)
+{
+	int got = -1;
+	par_spin_lock(&j->lock);
+	if (j->next < j->n) got = j->next++;
+	par_spin_unlock(&j->lock);
+	return got;
+}
+
+static void par_run_loop(struct par_job *j)
+{
+	int i;
+	while ((i = par_claim(j)) >= 0) j->fn(j->ctx, i);
+}
+
+static void par_thread(void) { par_run_loop(g_par); exit(0); }   /* a thread fn must not return */
+
+static void par_fetch(int n, void (*fn)(void *ctx, int i), void *ctx)
+{
+	if (n <= 0) return;
+	struct par_job job = { 0, 0, n, fn, ctx };
+	g_par = &job;
+
+	int want = n - 1;
+	if (want > PAR_FETCHERS - 1) want = PAR_FETCHERS - 1;
+	int tids[PAR_FETCHERS - 1]; char *stks[PAR_FETCHERS - 1]; int nthr = 0;
+	for (int t = 0; t < want; t++) {
+		char *stk = malloc(PAR_FETCH_STACK);
+		if (!stk) break;
+		int tid = thread_create(par_thread, stk + PAR_FETCH_STACK);
+		if (tid < 0) { free(stk); break; }
+		stks[nthr] = stk; tids[nthr] = tid; nthr++;
+	}
+	par_run_loop(&job);                 /* this thread fetches too */
+	for (int t = 0; t < nthr; t++) { thread_join(tids[t]); free(stks[t]); }
+	g_par = 0;
 }
 
 /* --- iframe fetching + embedding policy ------------------------------------ *
@@ -329,12 +480,6 @@ static int origin_eq(const char *a, const char *b)
 	struct purl ua, ub;
 	if (!parse_url(a, &ua) || !parse_url(b, &ub)) return 0;
 	return ua.tls == ub.tls && ua.port == ub.port && streq_ci(ua.host, ub.host);
-}
-
-static int contains_seq(const char *hay, const char *needle)
-{
-	for (; *hay; hay++) if (starts_ci(hay, needle)) return 1;
-	return 0;
 }
 
 /* The value of CSP directive `name` (case-insensitive, at a ';'/start boundary),
@@ -368,7 +513,7 @@ static int csp_src_admits(const char *tok, const char *tend, const char *parent,
 	s[k] = '\0';
 	struct purl pp;
 	if (!parse_url(parent, &pp)) return 0;
-	if (contains_seq(s, "://")) return origin_eq(parent, s);   /* full origin */
+	if (contains_ci(s, "://")) return origin_eq(parent, s);   /* full origin */
 	if (s[0] == '*' && s[1] == '.') {                          /* host suffix */
 		const char *suf = s + 1;
 		int hl = (int)strlen(pp.host), sl = (int)strlen(suf);
@@ -495,46 +640,90 @@ static unsigned char *decode_data_url(const char *url, int *outlen, char *ctype,
 	return out;
 }
 
-/* Drain the page's pending iframes: fetch each (data: inline, else GET), apply
- * the X-Frame-Options / CSP frame-ancestors policy against its embedder, and hand
- * the result back to the cache (html.c re-flattens the page to show it). Runs on
- * the worker thread, one frame at a time; nested frames surface on the next pass. */
+#define IFRAME_BATCH 16
+
+/* One pending iframe's fetched result, filled by a pool thread and consumed on
+ * the worker thread (only it may mutate the DOM via html_iframe_resolve). */
+struct iframe_res {
+	char           url[URL_MAX];
+	char           parent[URL_MAX];
+	int            kind;          /* FRAME_OK / FRAME_ERROR / FRAME_BLOCKED   */
+	char           reason[96];
+	unsigned char *body;          /* malloc'd (freed after resolve), or NULL  */
+	int            len;
+	char           ctype[160];
+};
+
+/* Fetch + run the embedding policy for one pending iframe (network + pure header
+ * checks only, no DOM mutation), storing the verdict in res[i]. Safe to run on
+ * several threads at once: each touches only its own res entry and own sockets. */
+static void iframe_job(void *vctx, int i)
+{
+	struct iframe_res *r = &((struct iframe_res *)vctx)[i];
+	r->body = 0; r->len = 0; r->ctype[0] = '\0'; r->reason[0] = '\0';
+
+	if (starts_ci(r->url, "data:")) {
+		int len = 0;
+		unsigned char *body = decode_data_url(r->url, &len, r->ctype, sizeof r->ctype);
+		if (body) { r->kind = FRAME_OK; r->body = body; r->len = len; }
+		else { r->kind = FRAME_ERROR; int k = 0; sapp(r->reason, &k, sizeof r->reason, "bad data: URL"); }
+		return;
+	}
+	if (!starts_ci(r->url, "http://") && !starts_ci(r->url, "https://")) {
+		r->kind = FRAME_ERROR; int k = 0; sapp(r->reason, &k, sizeof r->reason, "unsupported scheme");
+		return;
+	}
+
+	char final[URL_MAX]; char hdr[RESP_HDR_MAX];
+	struct http_req rq = { 0 }; rq.url = r->url; rq.method = "GET"; rq.accept = "text/html,*/*";
+	struct http_resp rs = { 0 };
+	rs.final_url = final; rs.final_cap = sizeof final; rs.hdr = hdr; rs.hdr_cap = sizeof hdr;
+	unsigned char *body = browser_fetch(&rq, &rs);
+	if (!body) { r->kind = FRAME_ERROR; int k = 0; sapp(r->reason, &k, sizeof r->reason, "no response"); return; }
+	if (rs.status < 200 || rs.status >= 300) {
+		int k = 0; sapp(r->reason, &k, sizeof r->reason, "HTTP "); uapp(r->reason, &k, sizeof r->reason, (unsigned)rs.status);
+		r->kind = FRAME_ERROR; free(body); return;
+	}
+
+	struct http_headers H; http_headers_parse(&H, hdr);
+	const char *xfo = http_headers_get(&H, "x-frame-options");
+	const char *csp = http_headers_get(&H, "content-security-policy");
+	const char *framed = final[0] ? final : r->url;
+	int ok = frame_embedding_allowed(r->parent, framed, xfo, csp, r->reason, sizeof r->reason);
+	if (ok && !cors_same_origin(r->parent, framed))   /* CORP also guards a framed resource */
+		ok = corp_allows(&H, r->parent, framed, r->reason, sizeof r->reason);
+	http_headers_free(&H);
+
+	r->kind = ok ? FRAME_OK : FRAME_BLOCKED;
+	r->body = body; r->len = rs.len;
+	{ int k = 0; sapp(r->ctype, &k, sizeof r->ctype, rs.ctype); }
+}
+
+/* Drain a batch of the page's pending iframes and fetch them in PARALLEL (data:
+ * inline, else GET + X-Frame-Options / CSP frame-ancestors / CORP policy), then
+ * hand each verdict back to the cache on this (worker) thread, which alone may
+ * touch the DOM (html.c re-flattens to show the allowed ones). More than
+ * IFRAME_BATCH pending, or nested frames, surface on the worker's next pass. */
 void fetch_iframes(void)
 {
-	char url[URL_MAX], parent[URL_MAX];
-	while (html_iframe_next_pending(url, sizeof url, parent, sizeof parent)) {
-		if (starts_ci(url, "data:")) {
-			char ctype[160]; int len = 0;
-			unsigned char *body = decode_data_url(url, &len, ctype, sizeof ctype);
-			if (body) { html_iframe_resolve(url, parent, FRAME_OK, "", body, len, ctype); free(body); }
-			else        html_iframe_resolve(url, parent, FRAME_ERROR, "bad data: URL", 0, 0, 0);
-			continue;
-		}
-		if (!starts_ci(url, "http://") && !starts_ci(url, "https://")) {
-			html_iframe_resolve(url, parent, FRAME_ERROR, "unsupported scheme", 0, 0, 0);
-			continue;
-		}
+	struct iframe_res *res = malloc(sizeof *res * IFRAME_BATCH);
+	if (!res) return;
 
-		struct resp_meta meta; char final[URL_MAX]; char hdr[4096]; int len = 0;
-		unsigned char *body = fetch_loop(url, "GET", 0, 0, 0, "text/html,*/*",
-		                                 &meta, final, sizeof final, hdr, sizeof hdr, &len, 0);
-		if (!body) { html_iframe_resolve(url, parent, FRAME_ERROR, "no response", 0, 0, 0); continue; }
-		if (meta.status < 200 || meta.status >= 300) {
-			char r[40]; int k = 0; sapp(r, &k, sizeof r, "HTTP "); uapp(r, &k, sizeof r, (unsigned)meta.status);
-			html_iframe_resolve(url, parent, FRAME_ERROR, r, 0, 0, 0);
-			free(body); continue;
-		}
+	int n = 0;
+	while (n < IFRAME_BATCH &&
+	       html_iframe_next_pending(res[n].url, sizeof res[n].url,
+	                                res[n].parent, sizeof res[n].parent))
+		n++;
+	if (n == 0) { free(res); return; }
 
-		struct http_headers H; http_headers_parse(&H, hdr);
-		const char *xfo = http_headers_get(&H, "x-frame-options");
-		const char *csp = http_headers_get(&H, "content-security-policy");
-		char reason[96];
-		int ok = frame_embedding_allowed(parent, final[0] ? final : url, xfo, csp, reason, sizeof reason);
-		http_headers_free(&H);
+	par_fetch(n, iframe_job, res);
 
-		html_iframe_resolve(url, parent, ok ? FRAME_OK : FRAME_BLOCKED, reason, body, len, meta.ctype);
-		free(body);
+	for (int i = 0; i < n; i++) {
+		html_iframe_resolve(res[i].url, res[i].parent, res[i].kind, res[i].reason,
+		                    res[i].body, res[i].len, res[i].body ? res[i].ctype : 0);
+		free(res[i].body);
 	}
+	free(res);
 }
 
 /* Normalise a URL's origin (HSTS-upgrades http->https) into *u; returns 0 on a
@@ -546,82 +735,119 @@ static int origin_of(const char *url, struct purl *u)
 	return 1;
 }
 
+/* Shared state for a parallel subres batch: the URL list + its output arrays,
+ * the per-URL claim bitmap and the lock guarding the origin-group claim. */
+struct subres_batch {
+	char *const  *urls;
+	int           n;
+	const char   *accept;
+	unsigned char **bodies;
+	int          *lens;
+	char         *handled;
+	volatile int  lock;
+};
+
+/* Fetch one origin-group, starting from the URL `i` a pool thread just claimed:
+ * gather every still-unclaimed same-origin HTTPS URL (up to H2_FETCH_MAX) and
+ * multiplex them over one h2 connection (h1.1 per failed stream / no-h2 origin);
+ * a plain-http URL is fetched alone over h1.1. Only the group claim is locked;
+ * the network I/O and the disjoint bodies[]/lens[] writes need none. Several
+ * groups run at once — each opens its own connection and the engines are
+ * re-entrant — so distinct origins fetch concurrently. */
+static void subres_job(void *vctx, int i)
+{
+	struct subres_batch *c = vctx;
+	struct purl u;
+	int grp[H2_FETCH_MAX], ng = 0;
+
+	par_spin_lock(&c->lock);
+	if (c->handled[i]) { par_spin_unlock(&c->lock); return; }   /* claimed by another group */
+	if (!origin_of(c->urls[i], &u)) { c->handled[i] = 1; par_spin_unlock(&c->lock); return; }
+	if (!u.tls) {
+		c->handled[i] = 1; grp[ng++] = i;                       /* plain http: this one */
+	} else {
+		for (int j = i; j < c->n && ng < H2_FETCH_MAX; j++) {   /* same-origin HTTPS group */
+			if (c->handled[j]) continue;
+			struct purl v;
+			if (!origin_of(c->urls[j], &v)) { c->handled[j] = 1; continue; }
+			if (!v.tls || !streq_ci(v.host, u.host) || v.port != u.port) continue;
+			c->handled[j] = 1; grp[ng++] = j;
+		}
+	}
+	par_spin_unlock(&c->lock);
+
+	if (!u.tls) {                                  /* plain http: single h1.1 */
+		c->bodies[grp[0]] = subres_get(c->urls[grp[0]], c->accept, &c->lens[grp[0]]);
+		return;
+	}
+
+	char (*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
+	if (!paths) {                                  /* OOM: fall back to h1.1 each */
+		for (int g = 0; g < ng; g++)
+			c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]);
+		return;
+	}
+	struct h2_fetch reqs[H2_FETCH_MAX];
+	for (int g = 0; g < ng; g++) {
+		struct purl v; origin_of(c->urls[grp[g]], &v);
+		int k = 0; for (; v.path[k] && k < URL_MAX - 1; k++) paths[g][k] = v.path[k];
+		paths[g][k] = '\0';
+		reqs[g].path = paths[g];
+		reqs[g].status = 0; reqs[g].body = 0; reqs[g].blen = 0; reqs[g].failed = 0;
+	}
+
+	int sock = net_connect(u.host, u.port, SK_TLS_H2);
+	if (sock >= 0 && net_alpn(sock) == ALPN_H2) {
+		char auth[URL_HOST_MAX + 8]; int an = 0;
+		sapp(auth, &an, sizeof auth, u.host);
+		if (u.port != 443) { sapp(auth, &an, sizeof auth, ":"); uapp(auth, &an, sizeof auth, (unsigned)u.port); }
+		char xh[1280]; int xn = 0; char ck[1024];
+		if (cookie_header(u.host, ck, sizeof ck) > 0) {
+			sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n");
+		}
+		sapp(xh, &xn, sizeof xh, "accept: "); sapp(xh, &xn, sizeof xh, c->accept); sapp(xh, &xn, sizeof xh, "\r\n");
+		struct h2_opts o = { BR_UA, xh, 0 };
+		h2_fetch_many(sock, 1, auth, &o, reqs, ng, 0, 0);   /* accumulate */
+		net_close(sock);
+		for (int g = 0; g < ng; g++) {
+			if (!reqs[g].failed && reqs[g].body) {
+				c->bodies[grp[g]] = reqs[g].body; c->lens[grp[g]] = reqs[g].blen;
+				{ struct net_log e = { "GET", c->urls[grp[g]], reqs[g].status, "", reqs[g].blen, 0, 0 };
+				  devtools_net_add(&e); }
+			} else { if (reqs[g].body) free(reqs[g].body);   /* h1.1 retry (logs itself) */
+			       c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]); }
+		}
+	} else {
+		if (sock >= 0) net_close(sock);
+		for (int g = 0; g < ng; g++)                       /* no h2: h1.1 each */
+			c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]);
+	}
+	free(paths);
+}
+
 /* Fetch n absolute URLs into bodies[i] (malloc'd, caller frees, NULL on failure)
- * + lens[i]. Same-origin HTTPS URLs are multiplexed over one h2 connection each
- * (h1.1 fallback per failed stream / no-h2 origin); plain-http URLs go over
- * HTTP/1.1 one at a time. Single-threaded — the h2 engine's state is global — so
- * it suits a small set of already-sequential sub-resources (stylesheets). */
+ * + lens[i], in PARALLEL across a thread pool: same-origin HTTPS URLs are still
+ * multiplexed over one h2 connection (h1.1 fallback per failed stream / no-h2
+ * origin) and plain-http URLs go over h1.1, but distinct origin-groups now fetch
+ * concurrently — each on its own connection, the engines being re-entrant. */
 void subres_get_batch(char *const *urls, int n, const char *accept,
                       unsigned char **bodies, int *lens)
 {
 	if (n <= 0) return;
 	for (int i = 0; i < n; i++) { bodies[i] = 0; lens[i] = 0; }
 
-	/* `handled` tracks which URLs a same-origin h2 batch already pulled. Sized to
-	 * n (no fixed cap): a page may reference any number of sub-resources. Each h2
-	 * round still gathers at most H2_FETCH_MAX same-origin streams per connection
-	 * and opens another connection for the rest, so this stays unbounded. */
+	/* `handled` tracks which URLs an origin-group already claimed. Sized to n (no
+	 * fixed cap): a page may reference any number of sub-resources. Each h2 group
+	 * still gathers at most H2_FETCH_MAX same-origin streams per connection and
+	 * leaves the rest for another claimed group, so this stays unbounded. */
 	char *handled = calloc((unsigned)n, 1);
 	if (!handled) {                          /* OOM: degrade to one fetch at a time */
 		for (int i = 0; i < n; i++) bodies[i] = subres_get(urls[i], accept, &lens[i]);
 		return;
 	}
 
-	for (int i = 0; i < n; i++) {
-		if (handled[i]) continue;
-		struct purl u;
-		if (!origin_of(urls[i], &u)) { handled[i] = 1; continue; }
-		if (!u.tls) {                                  /* plain http: one at a time */
-			bodies[i] = subres_get(urls[i], accept, &lens[i]);
-			handled[i] = 1;
-			continue;
-		}
-
-		/* Gather every same-origin HTTPS URL into one h2 batch. */
-		char (*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
-		if (!paths) { bodies[i] = subres_get(urls[i], accept, &lens[i]); handled[i] = 1; continue; }
-		struct h2_fetch reqs[H2_FETCH_MAX];
-		int bi[H2_FETCH_MAX], nb = 0;
-		for (int j = i; j < n && nb < H2_FETCH_MAX; j++) {
-			if (handled[j]) continue;
-			struct purl v;
-			if (!origin_of(urls[j], &v)) { handled[j] = 1; continue; }
-			if (!v.tls || !streq_ci(v.host, u.host) || v.port != u.port) continue;
-			int k = 0;
-			for (; v.path[k] && k < URL_MAX - 1; k++) paths[nb][k] = v.path[k];
-			paths[nb][k] = '\0';
-			reqs[nb].path = paths[nb];
-			reqs[nb].status = 0; reqs[nb].body = 0; reqs[nb].blen = 0; reqs[nb].failed = 0;
-			bi[nb] = j; handled[j] = 1; nb++;
-		}
-
-		int sock = net_connect(u.host, u.port, SK_TLS_H2);
-		if (sock >= 0 && net_alpn(sock) == ALPN_H2) {
-			char auth[URL_HOST_MAX + 8]; int an = 0;
-			sapp(auth, &an, sizeof auth, u.host);
-			if (u.port != 443) { sapp(auth, &an, sizeof auth, ":"); uapp(auth, &an, sizeof auth, (unsigned)u.port); }
-			char xh[1280]; int xn = 0; char ck[1024];
-			if (cookie_header(u.host, ck, sizeof ck) > 0) {
-				sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n");
-			}
-			sapp(xh, &xn, sizeof xh, "accept: "); sapp(xh, &xn, sizeof xh, accept); sapp(xh, &xn, sizeof xh, "\r\n");
-			struct h2_opts o = { BR_UA, xh, 0 };
-			h2_fetch_many(sock, 1, auth, &o, reqs, nb, 0, 0);   /* accumulate */
-			net_close(sock);
-			for (int b = 0; b < nb; b++) {
-				if (!reqs[b].failed && reqs[b].body) {
-					bodies[bi[b]] = reqs[b].body; lens[bi[b]] = reqs[b].blen;
-					devtools_net_add("GET", urls[bi[b]], reqs[b].status, "", reqs[b].blen);
-				} else { if (reqs[b].body) free(reqs[b].body);   /* h1.1 retry (logs itself) */
-				       bodies[bi[b]] = subres_get(urls[bi[b]], accept, &lens[bi[b]]); }
-			}
-		} else {
-			if (sock >= 0) net_close(sock);
-			for (int b = 0; b < nb; b++)                       /* no h2: h1.1 each */
-				bodies[bi[b]] = subres_get(urls[bi[b]], accept, &lens[bi[b]]);
-		}
-		free(paths);
-	}
+	struct subres_batch ctx = { urls, n, accept, bodies, lens, handled, 0 };
+	par_fetch(n, subres_job, &ctx);
 	free(handled);
 }
 
@@ -705,6 +931,29 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
 		return;
 	}
 
+	if (blen >= 12 && body[0] == 'R' && body[1] == 'I' && body[2] == 'F' &&
+	    body[3] == 'F' && body[8] == 'W' && body[9] == 'E' && body[10] == 'B' &&
+	    body[11] == 'P') {                             /* WebP -> decode to RGBA */
+		unsigned char *rgba; unsigned ww = 0, hh = 0;
+		if (webp_decode(body, blen, &rgba, &ww, &hh) == WEBP_OK) {
+			int bytes = (int)(ww * hh * 4u);
+			int off = -1;
+			img_lock();
+			if (B->img_pool_len + bytes <= IMG_POOL) { off = B->img_pool_len; B->img_pool_len += bytes; }
+			img_unlock();
+			if (off >= 0) {
+				memcpy(B->img_pool + off, rgba, (unsigned)bytes);
+				im->coff = off; im->clen = bytes;
+				im->iw = ww; im->ih = hh;
+				im->is_argb = 1;          /* raw RGBA, like the SVG path */
+				im->ok = 1;               /* set last: the UI draws once ok is seen */
+				B->seq++;
+			}
+			free(rgba);
+		}
+		return;
+	}
+
 	if (blen >= 8 && body[0] == 0x89 && body[1] == 'P' &&
 	    body[2] == 'N' && body[3] == 'G') {            /* PNG only */
 		struct memrd mr = { body, 0, blen };
@@ -745,7 +994,7 @@ static void fetch_image(int i, const char *page_url)
 	char full[URL_MAX];
 	resolve_url(page_url, B->pg->imgs[i].href, full, sizeof full);
 	int blen = 0;
-	unsigned char *body = subres_get(full, "image/png,image/svg+xml,*/*", &blen);
+	unsigned char *body = subres_get(full, "image/png,image/webp,image/svg+xml,*/*", &blen);
 	if (!body) return;
 	commit_image(i, body, blen, 0x000000);
 	free(body);
@@ -764,11 +1013,11 @@ static void h2img_commit(void *ctx, int b, const unsigned char *body, int blen)
 	char full[URL_MAX];
 	if (c->idxs[b] == FAV_IDX) {
 		resolve_url(g_img_page, B->pg->favicon_href[0] ? B->pg->favicon_href : "/favicon.ico", full, sizeof full);
-		devtools_net_add("GET", full, 200, "", blen);
+		{ struct net_log e = { "GET", full, 200, "", blen, 0, 0 }; devtools_net_add(&e); }
 		if (favicon_decode(body, blen)) { B->pg->favicon_ok = 1; B->seq++; }
 	} else {
 		resolve_url(g_img_page, B->pg->imgs[c->idxs[b]].href, full, sizeof full);
-		devtools_net_add("GET", full, 200, "image/*", blen);
+		{ struct net_log e = { "GET", full, 200, "image/*", blen, 0, 0 }; devtools_net_add(&e); }
 		commit_image(c->idxs[b], body, blen, 0x000000);
 	}
 }
@@ -843,7 +1092,7 @@ static void h2_prefetch(const char *page_url)
 		sapp(xh, &xn, sizeof xh, ck);
 		sapp(xh, &xn, sizeof xh, "\r\n");
 	}
-	sapp(xh, &xn, sizeof xh, "accept: image/png,image/svg+xml,*/*\r\n");
+	sapp(xh, &xn, sizeof xh, "accept: image/png,image/webp,image/svg+xml,*/*\r\n");
 	struct h2_opts opts = { BR_UA, xh, 0 };
 
 	/* Commit each image the moment its stream finishes (h2_fetch_many's on_done),

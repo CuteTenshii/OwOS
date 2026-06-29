@@ -63,6 +63,8 @@ int  fb_brightness(void);          /* current level FB_BRIGHT_MIN..FB_BRIGHT_MAX
  * presented. fb_clip_full restores the whole screen. */
 void fb_set_clip(int x, int y, int w, int h);
 void fb_clip_full(void);
+/* Read back the active (clamped) clip rectangle. */
+void fb_get_clip(int *x, int *y, int *w, int *h);
 
 /* Pack 8-bit channels into the framebuffer's XRGB8888 pixel format. */
 static inline uint32_t fb_rgb(uint8_t r, uint8_t g, uint8_t b)

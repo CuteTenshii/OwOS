@@ -39,6 +39,8 @@ int  gfx_ui_cw_cp(unsigned cp);    /* one Unicode codepoint's pen advance       
 /* Sized UI text — the sans face at an arbitrary px, uncached (for headings). y is
  * the line top; the baseline is derived from the px ascent. */
 void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px);
+void gfx_ui_text_px_clip(int x, int y, const char *s, unsigned fg, int px,
+                         int ct, int cb);   /* rows clipped to [ct,cb); ct>=cb = none */
 int  gfx_ui_width_px(const char *s, int px);
 int  gfx_ui_cw_cp_px(unsigned cp, int px);
 int  gfx_ui_ascent_px(int px);

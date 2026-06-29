@@ -98,12 +98,15 @@ struct css_rule {
 	struct css_rule   *hnext;              /* chain within its index bucket                */
 };
 
-/* An @font-face: a declared family name + the raw TTF/OTF src url. */
-struct css_face { char family[CSS_FAM_MAX]; char *url; struct css_face *next; };
+/* An @font-face: a declared family name, the raw TTF/OTF src url, and the base
+ * URL of the stylesheet that declared it (a relative src resolves against this,
+ * not the page — an external sheet's fonts live next to the sheet). */
+struct css_face { char family[CSS_FAM_MAX]; char *url; char *base; struct css_face *next; };
 
 #define CSS_NBUCK 256
 struct css_sheet {
 	struct css_rule *head, *tail; int order; int gen; struct css_face *faces;
+	const char *cur_base;   /* base URL for faces added by the in-progress css_add */
 	/* Rule index (rebuilt lazily when `gen` changes; see ensure_index). */
 	struct css_rule *id_b[CSS_NBUCK], *cls_b[CSS_NBUCK], *tag_b[CSS_NBUCK], *uni;
 	int idx_gen;
@@ -132,24 +135,193 @@ void css_set_viewport(int width, int height)
 /* Colour parsing lives in color.c now (shared with svg.c). */
 static int parse_color(const char *v) { return color_parse(v); }
 
+/* Root font size: the px basis for font-relative units (rem; em too — we don't
+ * track an element-local font-size, so em uses the same basis). Keep in sync with
+ * the renderer's default text size. */
+#define CSS_ROOT_FONT_PX 16
 
-/* Parse a CSS length. Returns px>=0 (also for unitless). For "N%", returns -1 and
- * sets *pct = N. For auto/em/rem/vw/calc and anything unsupported, returns -1 with
- * *pct = -1. (Fractions are floored — we render integer px.) */
+/* calc()/min()/max()/clamp() evaluation. CSS forbids multiplying two lengths, so
+ * any sub-expression stays a linear length a*px + b*% (plus a dimensionless-number
+ * case for the scalar side of * and /). Percentages can't be resolved to px at
+ * parse time (no containing block is known), so a result keeps px and % separate
+ * and the caller maps it onto its box; for min/max/clamp comparisons a % is
+ * measured against the viewport width as a heuristic. */
+struct calcval { double px, pct, num; int dimless; };
+struct calcctx { const char *p, *e; int ok, depth; };
+
+static void calc_skip(struct calcctx *c)
+{ while (c->p < c->e && (*c->p==' '||*c->p=='\t'||*c->p=='\n'||*c->p=='\r')) c->p++; }
+
+/* Parse a signed decimal at *pp into *out; 1 if at least one digit was consumed. */
+static int calc_number(const char **pp, double *out)
+{
+	const char *p = *pp;
+	int neg = 0;
+	if (*p == '-') { neg = 1; p++; } else if (*p == '+') p++;
+	double n = 0; int any = 0;
+	while (*p >= '0' && *p <= '9') { n = n*10 + (*p++ - '0'); any = 1; }
+	if (*p == '.') { p++; double f = 0.1; while (*p >= '0' && *p <= '9') { n += (*p++ - '0')*f; f *= 0.1; any = 1; } }
+	if (!any) return 0;
+	*out = neg ? -n : n;
+	*pp = p;
+	return 1;
+}
+
+/* A number + unit -> a calcval. Unknown units degrade to a dimensionless number. */
+static void unit_value(double n, const char *u, struct calcval *o)
+{
+	o->px = o->pct = o->num = 0; o->dimless = 0;
+	if      (u[0] == '%')         o->pct = n;
+	else if (!u[0])               { o->dimless = 1; o->num = n; }
+	else if (starts_ci(u, "px"))  o->px = n;
+	else if (starts_ci(u, "rem")) o->px = n * CSS_ROOT_FONT_PX;
+	else if (starts_ci(u, "em"))  o->px = n * CSS_ROOT_FONT_PX;
+	else if (starts_ci(u, "ex"))  o->px = n * (CSS_ROOT_FONT_PX / 2.0);
+	else if (starts_ci(u, "ch"))  o->px = n * (CSS_ROOT_FONT_PX / 2.0);
+	else if (starts_ci(u, "vmin")) o->px = n * (g_vw < g_vh ? g_vw : g_vh) / 100.0;
+	else if (starts_ci(u, "vmax")) o->px = n * (g_vw > g_vh ? g_vw : g_vh) / 100.0;
+	else if (starts_ci(u, "vw"))  o->px = n * g_vw / 100.0;
+	else if (starts_ci(u, "vh"))  o->px = n * g_vh / 100.0;
+	else if (starts_ci(u, "cm"))  o->px = n * 96.0 / 2.54;
+	else if (starts_ci(u, "mm"))  o->px = n * 96.0 / 25.4;
+	else if (starts_ci(u, "in"))  o->px = n * 96.0;
+	else if (starts_ci(u, "pt"))  o->px = n * 96.0 / 72.0;
+	else if (starts_ci(u, "pc"))  o->px = n * 16.0;
+	else                          { o->dimless = 1; o->num = n; }
+}
+
+/* A length magnitude for comparing min()/max()/clamp() arguments: a % is measured
+ * against the viewport width (a heuristic — the real containing block is unknown). */
+static double calc_mag(const struct calcval *v)
+{
+	if (v->dimless) return v->num;
+	double ref = g_vw > 0 ? g_vw : 800;
+	return v->px + v->pct * 0.01 * ref;
+}
+
+static struct calcval calc_expr(struct calcctx *c);   /* additive, the entry point */
+
+/* Read comma-separated expression arguments up to (and past) the closing ')'. */
+static int calc_args(struct calcctx *c, struct calcval *out, int maxn)
+{
+	int n = 0;
+	for (;;) {
+		struct calcval v = calc_expr(c);
+		if (n < maxn) out[n++] = v;
+		calc_skip(c);
+		if (c->p < c->e && *c->p == ',') { c->p++; continue; }
+		break;
+	}
+	calc_skip(c);
+	if (c->p < c->e && *c->p == ')') c->p++; else c->ok = 0;
+	return n;
+}
+
+static struct calcval calc_factor(struct calcctx *c)
+{
+	struct calcval v = { 0, 0, 0, 0 };
+	calc_skip(c);
+	if (c->p >= c->e || c->depth > 24) { c->ok = 0; return v; }
+	if (*c->p == '(') {
+		c->p++; c->depth++;
+		v = calc_expr(c);
+		c->depth--;
+		calc_skip(c);
+		if (c->p < c->e && *c->p == ')') c->p++; else c->ok = 0;
+		return v;
+	}
+	int fn = 0;                       /* 1 calc, 2 min, 3 max, 4 clamp */
+	if      (starts_ci(c->p, "calc("))  { fn = 1; c->p += 5; }
+	else if (starts_ci(c->p, "min("))   { fn = 2; c->p += 4; }
+	else if (starts_ci(c->p, "max("))   { fn = 3; c->p += 4; }
+	else if (starts_ci(c->p, "clamp(")) { fn = 4; c->p += 6; }
+	if (fn) {
+		struct calcval args[8];
+		c->depth++;
+		int n = calc_args(c, args, 8);
+		c->depth--;
+		if (fn == 1) return n ? args[0] : v;
+		if (fn == 4) {                /* clamp(MIN, VAL, MAX) */
+			if (n < 3) return n ? args[0] : v;
+			double lo = calc_mag(&args[0]), mid = calc_mag(&args[1]), hi = calc_mag(&args[2]);
+			return mid < lo ? args[0] : (mid > hi ? args[2] : args[1]);
+		}
+		if (!n) return v;             /* min / max: pick the winning argument */
+		int best = 0;
+		for (int i = 1; i < n; i++) {
+			double m = calc_mag(&args[i]), bm = calc_mag(&args[best]);
+			if ((fn == 2 && m < bm) || (fn == 3 && m > bm)) best = i;
+		}
+		return args[best];
+	}
+	double num;
+	if (!calc_number(&c->p, &num)) { c->ok = 0; return v; }
+	const char *us = c->p;
+	while (c->p < c->e && (((*c->p|32) >= 'a' && (*c->p|32) <= 'z') || *c->p == '%')) c->p++;
+	char unit[8]; int k = 0;
+	for (const char *q = us; q < c->p && k < 7; q++) unit[k++] = *q;
+	unit[k] = '\0';
+	unit_value(num, unit, &v);
+	return v;
+}
+
+static struct calcval calc_term(struct calcctx *c)
+{
+	struct calcval a = calc_factor(c);
+	for (;;) {
+		calc_skip(c);
+		if (c->p >= c->e || (*c->p != '*' && *c->p != '/')) break;
+		char op = *c->p++;
+		struct calcval b = calc_factor(c);
+		if (op == '*') {
+			if (a.dimless)      { double k = a.num; a = b; a.px *= k; a.pct *= k; a.num *= k; }
+			else if (b.dimless) { double k = b.num; a.px *= k; a.pct *= k; a.num *= k; }
+			else c->ok = 0;       /* length * length is invalid */
+		} else {
+			if (b.dimless && b.num != 0) { double k = 1.0 / b.num; a.px *= k; a.pct *= k; a.num *= k; }
+			else c->ok = 0;
+		}
+	}
+	return a;
+}
+
+static struct calcval calc_expr(struct calcctx *c)
+{
+	struct calcval a = calc_term(c);
+	for (;;) {
+		calc_skip(c);
+		if (c->p >= c->e || (*c->p != '+' && *c->p != '-')) break;
+		char op = *c->p++;
+		struct calcval b = calc_term(c);
+		if (a.dimless != b.dimless) c->ok = 0;
+		if (op == '+') { a.px += b.px; a.pct += b.pct; a.num += b.num; }
+		else           { a.px -= b.px; a.pct -= b.pct; a.num -= b.num; }
+	}
+	return a;
+}
+
+/* Map a calcval onto parse_len2's representation: px>=0 via return, else a percent
+ * via *pct. A mixed px+% result (e.g. calc(100% - 1rem)) keeps only the percent —
+ * we can't store an offset — which is the dominant term in practice. */
+static int calc_result(const struct calcval *r, int ok, int *pct)
+{
+	if (!ok) return -1;
+	if (r->dimless) { int n = (int)(r->num + (r->num < 0 ? -0.5 : 0.5)); return n >= 0 ? n : -1; }
+	if (r->pct != 0) { int p = (int)(r->pct + 0.5); if (p >= 0) *pct = p; return -1; }
+	int n = (int)(r->px + 0.5);
+	return n >= 0 ? n : -1;
+}
+
+/* Parse a CSS length. Returns px>=0 (resolving px/rem/em/vw/vh/physical units and
+ * calc()/min()/max()/clamp()); for "N%" or a percent-valued result, returns -1 and
+ * sets *pct = N. For auto and anything unresolvable, returns -1 with *pct = -1. */
 static int parse_len2(const char *v, int *pct)
 {
 	*pct = -1;
 	while (*v == ' ' || *v == '\t') v++;
-	int neg = (*v == '-'); if (*v == '-' || *v == '+') v++;
-	int n = 0, any = 0;
-	while (*v >= '0' && *v <= '9') { n = n * 10 + (*v++ - '0'); any = 1; }
-	if (*v == '.') { v++; while (*v >= '0' && *v <= '9') v++; }   /* drop fraction */
-	if (!any) return -1;
-	while (*v == ' ') v++;
-	if (*v == '%') { if (!neg) *pct = n; return -1; }
-	if (*v == 'e' || *v == 'r' || *v == 'v' || *v == 'c')   /* em/ex, rem, vw, cm/ch */
-		return -1;
-	return neg ? -1 : n;   /* negative px (rare, e.g. margins) treated as unset */
+	struct calcctx c = { v, v + strlen(v), 1, 0 };
+	struct calcval r = calc_factor(&c);   /* one length token, or a calc/min/max/clamp */
+	return calc_result(&r, c.ok, pct);
 }
 
 /* Parse a CSS length: integer px (or unitless), else -1 (%, em, auto, calc...). */
@@ -278,6 +450,329 @@ static int parse_disp(const char *v)
 	return CSS_DISP_BLOCK;                                /* block/flex/grid/table */
 }
 
+/* ------------------------------------------------ backgrounds -------------- */
+void css_bgi_reset(struct css_bg_image *b)
+{
+	b->kind = -1; b->repeat = -1; b->size_kind = -1; b->rad_circle = 0;
+	b->angle = 180; b->size_w = b->size_h = -1; b->pos_x = b->pos_y = -1;
+	b->nstops = 0; b->img_idx = -1; b->url[0] = '\0';
+}
+
+/* True if `p` begins a CSS gradient function (any flavour we model). */
+static int is_grad_prefix(const char *p)
+{
+	return starts_ci(p, "linear-gradient(") || starts_ci(p, "radial-gradient(") ||
+	       starts_ci(p, "repeating-linear-gradient(") || starts_ci(p, "repeating-radial-gradient(");
+}
+
+/* background-repeat: a value (one or two keywords); -1 if none recognised. */
+static int parse_bg_repeat(const char *v)
+{
+	if (has_ci(v, "repeat-x"))  return CSS_BGR_REPEAT_X;
+	if (has_ci(v, "repeat-y"))  return CSS_BGR_REPEAT_Y;
+	if (has_ci(v, "no-repeat")) return CSS_BGR_NO_REPEAT;
+	if (has_ci(v, "repeat") || has_ci(v, "round") || has_ci(v, "space")) return CSS_BGR_REPEAT;
+	return -1;
+}
+
+/* background-size: cover/contain or 1-2 lengths (auto). */
+static void parse_bg_size(const char *v, signed char *kind, short *sw, short *sh)
+{
+	*kind = -1; *sw = *sh = -1;
+	while (*v == ' ' || *v == '\t') v++;
+	if (starts_ci(v, "cover"))   { *kind = CSS_BGS_COVER;   return; }
+	if (starts_ci(v, "contain")) { *kind = CSS_BGS_CONTAIN; return; }
+	short vals[2]; int nv = 0;
+	while (*v && nv < 2) {
+		while (*v == ' ' || *v == '\t') v++;
+		if (!*v) break;
+		if (starts_ci(v, "auto")) vals[nv++] = -1;
+		else { int pct, px = parse_len2(v, &pct); vals[nv++] = (short)(px >= 0 ? px : -1); }
+		while (*v && *v != ' ' && *v != '\t') v++;
+	}
+	if (nv == 0) return;
+	*kind = CSS_BGS_LEN; *sw = vals[0]; *sh = (nv >= 2) ? vals[1] : -1;
+}
+
+/* background-position: 1-2 keyword/percentage tokens -> percent on each axis. A
+ * pixel/length token degrades to 0% (we lack the box size at parse time). */
+static void parse_bg_position(const char *v, short *px, short *py)
+{
+	*px = *py = -1;
+	char toks[2][32]; int nt = 0;
+	while (*v && nt < 2) {
+		while (*v == ' ' || *v == '\t') v++;
+		if (!*v) break;
+		int k = 0;
+		while (*v && *v != ' ' && *v != '\t' && k < 31) toks[nt][k++] = *v++;
+		toks[nt][k] = '\0'; nt++;
+	}
+	int xset = 0, yset = 0;
+	for (int i = 0; i < nt; i++) {
+		const char *t = toks[i];
+		if      (starts_ci(t, "left"))   { *px = 0;   xset = 1; }
+		else if (starts_ci(t, "right"))  { *px = 100; xset = 1; }
+		else if (starts_ci(t, "top"))    { *py = 0;   yset = 1; }
+		else if (starts_ci(t, "bottom")) { *py = 100; yset = 1; }
+		else if (starts_ci(t, "center")) { /* assigned to a free axis below */ }
+		else {
+			int pct; int dpx = parse_len2(t, &pct);
+			short p = (short)(pct >= 0 ? (pct > 100 ? 100 : pct) : (dpx > 0 ? 0 : 0));
+			if (i == 0 && !xset) { *px = p; xset = 1; }
+			else if (!yset)      { *py = p; yset = 1; }
+		}
+	}
+	for (int i = 0; i < nt; i++)
+		if (starts_ci(toks[i], "center")) {
+			if (!xset) { *px = 50; xset = 1; }
+			else if (!yset) { *py = 50; yset = 1; }
+		}
+	if (xset && !yset) *py = 50;
+	if (yset && !xset) *px = 50;
+}
+
+/* One position token -> percent along its axis (0 horizontal, 1 vertical), or -1. */
+static int bg_pos_single(const char *t, int axis)
+{
+	while (*t == ' ' || *t == '\t') t++;
+	if (starts_ci(t, "center")) return 50;
+	if (axis == 0) { if (starts_ci(t, "left")) return 0; if (starts_ci(t, "right"))  return 100; }
+	else           { if (starts_ci(t, "top"))  return 0; if (starts_ci(t, "bottom")) return 100; }
+	int pct; parse_len2(t, &pct);
+	return pct >= 0 ? (pct > 100 ? 100 : pct) : -1;
+}
+
+/* A linear-gradient direction token ("to bottom right", "45deg", "1turn") -> a CSS
+ * angle in *angle (0 = to top, 90 = to right). Returns 1 if consumed. */
+static int parse_lin_dir(const char *a, short *angle)
+{
+	while (*a == ' ') a++;
+	if (starts_ci(a, "to ")) {
+		a += 3;
+		int top = has_ci(a, "top"), bot = has_ci(a, "bottom"),
+		    left = has_ci(a, "left"), right = has_ci(a, "right");
+		int ang;
+		if      (top && right) ang = 45;
+		else if (bot && right) ang = 135;
+		else if (bot && left)  ang = 225;
+		else if (top && left)  ang = 315;
+		else if (top)   ang = 0;
+		else if (bot)   ang = 180;
+		else if (right) ang = 90;
+		else if (left)  ang = 270;
+		else return 0;
+		*angle = (short)ang;
+		return 1;
+	}
+	const char *p = a; int neg = 0;
+	if (*p == '-') { neg = 1; p++; } else if (*p == '+') p++;
+	if (!(*p >= '0' && *p <= '9')) return 0;
+	int n = 0;
+	while (*p >= '0' && *p <= '9') n = n * 10 + (*p++ - '0');
+	if (*p == '.') { p++; while (*p >= '0' && *p <= '9') p++; }   /* drop fraction */
+	int deg;
+	if      (starts_ci(p, "deg"))  deg = n;
+	else if (starts_ci(p, "turn")) deg = n * 360;
+	else if (starts_ci(p, "grad")) deg = n * 9 / 10;
+	else if (starts_ci(p, "rad"))  deg = n * 57;       /* ~180/pi, integer-approx */
+	else return 0;
+	if (neg) deg = -deg;
+	deg %= 360; if (deg < 0) deg += 360;
+	*angle = (short)deg;
+	return 1;
+}
+
+/* A radial-gradient leading token (shape/size/position), e.g. "circle at center".
+ * We only honour the shape; size/position degrade to a centred fill. */
+static int parse_rad_dir(const char *a, struct css_bg_image *b)
+{
+	if (has_ci(a, "circle"))  { b->rad_circle = 1; return 1; }
+	if (has_ci(a, "ellipse")) { b->rad_circle = 0; return 1; }
+	if (has_ci(a, "at ") || has_ci(a, "closest") || has_ci(a, "farthest")) return 1;
+	return 0;
+}
+
+/* Append one "color [position]" gradient stop to b. */
+static void add_gradient_stop(const char *arg, struct css_bg_image *b)
+{
+	if (b->nstops >= CSS_BG_STOPS) return;
+	while (*arg == ' ' || *arg == '\t') arg++;
+	/* A trailing space-separated number/percentage (at paren depth 0) is the stop's
+	 * position; everything before it is the colour (which may itself hold spaces). */
+	const char *lastsp = 0; int depth = 0;
+	for (const char *q = arg; *q; q++) {
+		if (*q == '(') depth++;
+		else if (*q == ')') depth--;
+		else if (*q == ' ' && depth == 0) lastsp = q;
+	}
+	const char *pos = 0;
+	if (lastsp) {
+		const char *t = lastsp + 1; while (*t == ' ') t++;
+		if ((*t >= '0' && *t <= '9') || *t == '.' || *t == '-' || *t == '+') pos = t;
+	}
+	char cbuf[80];
+	int cl = pos ? (int)(lastsp - arg) : (int)strlen(arg);
+	if (cl > (int)sizeof cbuf - 1) cl = (int)sizeof cbuf - 1;
+	for (int i = 0; i < cl; i++) cbuf[i] = arg[i];
+	cbuf[cl] = '\0';
+	while (cl > 0 && (cbuf[cl-1] == ' ' || cbuf[cl-1] == '\t')) cbuf[--cl] = '\0';
+	int a; int c = color_parse_a(cbuf, &a);
+	if (c < 0) return;                                  /* skip an unparseable stop */
+	short pp = -1;
+	if (pos) { int pct; parse_len2(pos, &pct); if (pct >= 0) pp = (short)(pct > 100 ? 100 : pct); }
+	b->stops[b->nstops].color = (int)(((unsigned)a << 24) | (unsigned)c);
+	b->stops[b->nstops].pos   = pp;
+	b->nstops++;
+}
+
+/* Parse a linear-/radial-gradient() value into b. Returns 1 on success. */
+static int parse_gradient(const char *v, struct css_bg_image *b)
+{
+	while (*v == ' ') v++;
+	const char *p = v;
+	if (starts_ci(p, "repeating-")) p += 10;            /* treated as non-repeating */
+	int linear;
+	if      (starts_ci(p, "linear-gradient(")) { linear = 1; p += 16; }
+	else if (starts_ci(p, "radial-gradient(")) { linear = 0; p += 16; }
+	else return 0;
+	const char *e = p; int depth = 1;
+	while (*e && depth) { if (*e == '(') depth++; else if (*e == ')') { depth--; if (!depth) break; } e++; }
+
+	b->kind = linear ? CSS_BGK_LINEAR : CSS_BGK_RADIAL;
+	b->angle = linear ? 180 : 0;
+	b->rad_circle = 0;
+	b->nstops = 0;
+	const char *a = p; int first = 1;
+	while (a < e) {
+		const char *c = a; int d2 = 0;                  /* split on top-level commas */
+		while (c < e && !(*c == ',' && d2 == 0)) { if (*c == '(') d2++; else if (*c == ')') d2--; c++; }
+		const char *as = a, *ae = c;
+		while (as < ae && (*as == ' ' || *as == '\t')) as++;
+		while (ae > as && (ae[-1] == ' ' || ae[-1] == '\t')) ae--;
+		char arg[96];
+		int al = (int)(ae - as); if (al > (int)sizeof arg - 1) al = (int)sizeof arg - 1;
+		for (int i = 0; i < al; i++) arg[i] = as[i];
+		arg[al] = '\0';
+		int consumed = 0;
+		if (first) consumed = linear ? parse_lin_dir(arg, &b->angle) : parse_rad_dir(arg, b);
+		if (!consumed) add_gradient_stop(arg, b);
+		first = 0;
+		a = (c < e) ? c + 1 : e;
+	}
+	return b->nstops > 0;
+}
+
+/* background-image: none / url(...) / a gradient. Takes the FIRST comma layer. */
+static void parse_bg_image(const char *v, struct css_bg_image *b)
+{
+	while (*v == ' ' || *v == '\t') v++;
+	if (starts_ci(v, "none")) { b->kind = CSS_BGK_NONE; return; }
+	if (starts_ci(v, "url(")) {
+		const char *u = v + 4;
+		while (*u == ' ' || *u == '"' || *u == '\'') u++;
+		int k = 0;
+		while (*u && *u != ')' && *u != '"' && *u != '\'' && k < CSS_BG_URL - 1) b->url[k++] = *u++;
+		b->url[k] = '\0';
+		b->kind = CSS_BGK_URL;
+		return;
+	}
+	if (is_grad_prefix(v)) parse_gradient(v, b);
+}
+
+/* Skip past a url()/gradient() function starting at *pp (which begins it). */
+static const char *skip_bg_func(const char *p)
+{
+	while (*p && *p != '(') p++;
+	if (!*p) return p;
+	int depth = 0;
+	for (; *p; p++) { if (*p == '(') depth++; else if (*p == ')') { depth--; if (depth == 0) { p++; break; } } }
+	return p;
+}
+
+/* Find the first colour token in a background value, skipping url()/gradient()
+ * functions and non-colour keywords. Returns 0xRRGGBB (+ alpha via *alpha) or -1. */
+static int bg_value_color(const char *v, int *alpha)
+{
+	const char *p = v;
+	while (*p) {
+		while (*p == ' ' || *p == '\t' || *p == ',' || *p == '/') p++;
+		if (!*p) break;
+		if (starts_ci(p, "url(") || is_grad_prefix(p)) { p = skip_bg_func(p); continue; }
+		char tok[64]; int k = 0, depth = 0;             /* a token keeps its own parens */
+		while (*p && (depth > 0 || (*p != ' ' && *p != '\t' && *p != ',' && *p != '/'))) {
+			if (*p == '(') depth++; else if (*p == ')') depth--;
+			if (k < (int)sizeof tok - 1) tok[k++] = *p;
+			p++;
+		}
+		tok[k] = '\0';
+		int a; int c = color_parse_a(tok, &a);
+		if (c >= 0) { *alpha = a; return c; }
+	}
+	*alpha = 255;
+	return -1;
+}
+
+/* Collect the position-relevant tokens (keywords + percentages, before any '/')
+ * out of a background shorthand and resolve them into b->pos_x/pos_y. */
+static void bg_shorthand_position(const char *rest, struct css_bg_image *b)
+{
+	char pos[48]; int pl = 0;
+	for (const char *p = rest; *p; ) {
+		while (*p == ' ' || *p == '\t') p++;
+		if (!*p) break;
+		char tok[32]; int k = 0;
+		while (*p && *p != ' ' && *p != '\t') { if (k < 31) tok[k++] = *p; p++; }
+		tok[k] = '\0';
+		int is_pos = starts_ci(tok, "left") || starts_ci(tok, "right") || starts_ci(tok, "top") ||
+		             starts_ci(tok, "bottom") || starts_ci(tok, "center");
+		if (!is_pos) { const char *q = tok; if (*q == '-' || *q == '+') q++; if (*q >= '0' && *q <= '9') is_pos = 1; }
+		if (is_pos && pl + k + 1 < (int)sizeof pos) {
+			if (pl) pos[pl++] = ' ';
+			for (int i = 0; i < k; i++) pos[pl++] = tok[i];
+		}
+	}
+	pos[pl] = '\0';
+	if (pl) {
+		short px, py; parse_bg_position(pos, &px, &py);
+		if (px >= 0) b->pos_x = px;
+		if (py >= 0) b->pos_y = py;
+	}
+}
+
+/* The `background` shorthand: image + colour + repeat + position [/ size]. */
+static void parse_bg_shorthand(const char *v, struct css_style *out)
+{
+	struct css_bg_image *b = &out->bgi;
+	const char *im = 0, *iend = 0;
+	for (const char *p = v; *p; p++)
+		if (starts_ci(p, "url(") || is_grad_prefix(p)) { im = p; iend = skip_bg_func(p); break; }
+	if (im) parse_bg_image(im, b);
+	else    b->kind = CSS_BGK_NONE;                     /* shorthand with no image resets it */
+
+	int a; int c = bg_value_color(v, &a);
+	if (c >= 0) out->bg = c;                            /* the cascade keeps colour as 0xRRGGBB */
+
+	char rest[160]; int rl = 0;                         /* the value minus the image function */
+	for (const char *p = v; *p && rl < (int)sizeof rest - 1; ) {
+		if (p == im) { p = iend; continue; }
+		rest[rl++] = *p++;
+	}
+	rest[rl] = '\0';
+
+	int rep = parse_bg_repeat(rest);
+	if (rep >= 0) b->repeat = rep;
+
+	for (int i = 0; i < rl; i++)                        /* size sits after a '/' */
+		if (rest[i] == '/') {
+			signed char sk; short sw, sh;
+			parse_bg_size(rest + i + 1, &sk, &sw, &sh);
+			if (sk >= 0) { b->size_kind = sk; b->size_w = sw; b->size_h = sh; }
+			rest[i] = '\0'; rl = i;
+			break;
+		}
+	bg_shorthand_position(rest, b);
+}
+
 /* ------------------------------------------------ declarations ------------- */
 void css_style_reset(struct css_style *s)
 {
@@ -287,17 +782,37 @@ void css_style_reset(struct css_style *s)
 	s->center = -1;
 	s->width = s->height = -1;
 	s->max_w = s->max_h = -1;
-	s->pct_w = s->pct_h = s->pct_maxw = s->pct_maxh = -1;
+	s->min_w = s->min_h = -1;
+	s->pct_w = s->pct_h = s->pct_maxw = s->pct_maxh = s->pct_minw = s->pct_minh = -1;
+	s->box_sizing = -1;
+	s->font_px = -1; s->font_pct = -1;
+	s->radius = -1; s->sh_color = -1;
+	s->sh_dx = s->sh_dy = s->sh_blur = s->sh_spread = 0;
 	s->margin[0] = s->margin[1] = s->margin[2] = s->margin[3] = -1;
 	s->padding[0] = s->padding[1] = s->padding[2] = s->padding[3] = -1;
 	s->border_w[0] = s->border_w[1] = s->border_w[2] = s->border_w[3] = -1;
 	s->border_color = -1;
 	s->pos = -1;
 	s->top = s->right = s->bottom = s->left = -1;
-	s->flex = s->flex_dir = -1;
-	s->flex_grow = -1;
+	s->flex = s->flex_dir = s->flex_wrap = -1;
+	s->flex_grow = s->flex_shrink = -1;
+	s->flex_basis = -1;
+	s->pct_basis = -1;
+	s->justify = s->align_items = -1;
+	s->gap_row = s->gap_col = -1;
 	s->overflow = -1;
+	s->italic = -1;
+	s->ttx = -1;
+	s->white_space = -1;
+	s->list_style = CSS_LST_DEFAULT;
+	s->opacity = -1;
+	s->line_height = -1;
+	s->lh_pct = -1;
+	s->outline_w = -1;
+	s->outline_color = -1;
+	s->z_index = CSS_Z_AUTO;
 	s->fill = s->stroke = -1;
+	css_bgi_reset(&s->bgi);
 	s->content[0] = '\0';
 	s->fam[0] = '\0';
 }
@@ -360,6 +875,160 @@ static int span_is(const char *a, const char *ae, const char *lit)
 	return a == ae && !*lit;
 }
 
+/* justify-content keyword -> enum css_justify (longest/most-specific first so
+ * "flex-start" isn't mistaken for the "start" suffix of nothing, etc.). */
+static signed char parse_justify(const char *v)
+{
+	if (has_ci(v, "space-between")) return CSS_JUST_BETWEEN;
+	if (has_ci(v, "space-around"))  return CSS_JUST_AROUND;
+	if (has_ci(v, "space-evenly"))  return CSS_JUST_EVENLY;
+	if (has_ci(v, "center"))        return CSS_JUST_CENTER;
+	if (has_ci(v, "flex-end") || has_ci(v, "right") || has_ci(v, "end")) return CSS_JUST_END;
+	return CSS_JUST_START;          /* flex-start / start / left / normal */
+}
+
+/* align-items keyword -> enum css_align (baseline approximated as start/top). */
+static signed char parse_align(const char *v)
+{
+	if (has_ci(v, "center")) return CSS_ALIGN_CENTER;
+	if (has_ci(v, "flex-end") || has_ci(v, "end")) return CSS_ALIGN_END;
+	if (has_ci(v, "flex-start") || has_ci(v, "baseline") || has_ci(v, "start")) return CSS_ALIGN_START;
+	return CSS_ALIGN_STRETCH;       /* stretch / normal */
+}
+
+/* `gap: <row> [<col>]` (also row-gap/column-gap longhands handled by the caller). */
+static void parse_gap(const char *v, struct css_style *o)
+{
+	const char *s = v; while (*s == ' ' || *s == '\t') s++;
+	int g1 = parse_len(s);
+	while (*s && *s != ' ' && *s != '\t') s++;
+	while (*s == ' ' || *s == '\t') s++;
+	int g2 = *s ? parse_len(s) : -1;
+	if (g1 >= 0) { o->gap_row = (short)g1; o->gap_col = (short)(g2 >= 0 ? g2 : g1); }
+}
+
+/* `flex: none | auto | <grow> [<shrink>] [<basis>]`. A unitless token is grow then
+ * shrink; a token carrying a unit/percent (or auto) is the basis. */
+static void parse_flex_shorthand(const char *v, struct css_style *o)
+{
+	const char *f = v; while (*f == ' ' || *f == '\t') f++;
+	if (starts_ci(f, "none"))    { o->flex_grow = 0; o->flex_shrink = 0; o->flex_basis = -1; o->pct_basis = -1; return; }
+	if (starts_ci(f, "initial")) { o->flex_grow = 0; o->flex_shrink = 1; o->flex_basis = -1; o->pct_basis = -1; return; }
+	if (starts_ci(f, "auto"))    { o->flex_grow = 1; o->flex_shrink = 1; o->flex_basis = -1; o->pct_basis = -1; return; }
+
+	int seen_grow = 0, seen_shrink = 0, pct;
+	while (*f) {
+		while (*f == ' ' || *f == '\t') f++;
+		if (!*f) break;
+		int has_unit = 0;
+		for (const char *q = f; *q && *q != ' ' && *q != '\t'; q++)
+			if (*q == '%' || *q == 'p' || *q == 'e' || *q == 'r' || *q == 'v' || *q == 'c') { has_unit = 1; break; }
+		int isnum = (*f >= '0' && *f <= '9') || *f == '.';
+		if (isnum && !has_unit) {                    /* unitless: grow, then shrink */
+			int n = parse_len(f);
+			if (!seen_grow)   { o->flex_grow   = (short)(n < 0 ? 0 : n); seen_grow = 1; }
+			else              { o->flex_shrink = (short)(n < 0 ? 0 : n); seen_shrink = 1; }
+		} else if (starts_ci(f, "auto") || starts_ci(f, "content")) {
+			o->flex_basis = -1; o->pct_basis = -1;
+		} else {
+			o->flex_basis = parse_len2(f, &pct); o->pct_basis = (short)pct;
+		}
+		while (*f && *f != ' ' && *f != '\t') f++;
+	}
+	if (!seen_grow)   o->flex_grow = 1;              /* `flex: <basis>` == 1 1 <basis> */
+	if (!seen_shrink) o->flex_shrink = 1;
+}
+
+/* box-shadow: parse the FIRST layer's "[inset] dx dy [blur] [spread] color" into o.
+ * inset (inner) shadows aren't drawn — skipped. A missing colour defaults to a soft
+ * black, the usual look. Lengths are signed px (units beyond px are ignored). */
+static int sh_is_len(const char *t) { return (*t >= '0' && *t <= '9') || *t == '-' || *t == '+' || *t == '.'; }
+static int sh_len(const char *t)
+{
+	int neg = 0; if (*t == '-') { neg = 1; t++; } else if (*t == '+') t++;
+	int n = 0; while (*t >= '0' && *t <= '9') n = n * 10 + (*t++ - '0');
+	return neg ? -n : n;
+}
+static void parse_box_shadow(const char *v, struct css_style *o)
+{
+	while (*v == ' ' || *v == '\t') v++;
+	if (starts_ci(v, "none")) return;
+	const char *e = v; int depth = 0;                 /* first top-level comma layer */
+	while (*e && !(*e == ',' && depth == 0)) { if (*e == '(') depth++; else if (*e == ')') depth--; e++; }
+	int lens[4], nl = 0, col = -1, alpha = 255;
+	const char *p = v;
+	while (p < e) {
+		while (p < e && (*p == ' ' || *p == '\t')) p++;
+		if (p >= e) break;
+		char tok[64]; int k = 0, dep = 0;
+		while (p < e && (dep > 0 || (*p != ' ' && *p != '\t'))) {
+			if (*p == '(') dep++; else if (*p == ')') dep--;
+			if (k < (int)sizeof tok - 1) tok[k++] = *p;
+			p++;
+		}
+		tok[k] = '\0';
+		if (starts_ci(tok, "inset")) return;          /* inner shadow: not drawn */
+		if (sh_is_len(tok)) { if (nl < 4) lens[nl++] = sh_len(tok); }
+		else { int a; int c = color_parse_a(tok, &a); if (c >= 0) { col = c; alpha = a; } }
+	}
+	if (nl >= 2) {
+		o->sh_dx = (short)lens[0]; o->sh_dy = (short)lens[1];
+		o->sh_blur   = (short)(nl >= 3 ? lens[2] : 0);
+		o->sh_spread = (short)(nl >= 4 ? lens[3] : 0);
+		o->sh_color  = col >= 0 ? (int)(((unsigned)alpha << 24) | (unsigned)col) : (int)0x40000000;
+	}
+}
+
+/* list-style[-type]: the marker shape/number style. Returns CSS_LST_DEFAULT when
+ * the value names no type keyword (e.g. a bare `list-style: inside`). */
+static signed char parse_list_style(const char *v)
+{
+	if (has_ci(v, "decimal-leading-zero")) return CSS_LST_DECIMAL_ZERO;
+	if (has_ci(v, "lower-alpha") || has_ci(v, "lower-latin")) return CSS_LST_LOWER_ALPHA;
+	if (has_ci(v, "upper-alpha") || has_ci(v, "upper-latin")) return CSS_LST_UPPER_ALPHA;
+	if (has_ci(v, "lower-roman")) return CSS_LST_LOWER_ROMAN;
+	if (has_ci(v, "upper-roman")) return CSS_LST_UPPER_ROMAN;
+	if (has_ci(v, "decimal"))     return CSS_LST_DECIMAL;
+	if (has_ci(v, "circle"))      return CSS_LST_CIRCLE;
+	if (has_ci(v, "square"))      return CSS_LST_SQUARE;
+	if (has_ci(v, "disc"))        return CSS_LST_DISC;
+	if (has_ci(v, "none"))        return CSS_LST_NONE;
+	return CSS_LST_DEFAULT;
+}
+
+/* line-height: normal -> unset; a unitless multiplier -> lh_pct = N*100; a length
+ * -> px; a percent -> lh_pct. The unset case leaves the renderer's font-derived height. */
+static void parse_line_height(const char *v, struct css_style *o)
+{
+	while (*v == ' ' || *v == '\t') v++;
+	if (starts_ci(v, "normal") || starts_ci(v, "inherit") || starts_ci(v, "initial")) {
+		o->line_height = -1; o->lh_pct = -1; return;
+	}
+	int has_unit = 0;
+	for (const char *q = v; *q && *q != ' ' && *q != '\t'; q++)
+		if (*q == '%' || ((*q | 32) >= 'a' && (*q | 32) <= 'z')) { has_unit = 1; break; }
+	if (!has_unit && ((*v >= '0' && *v <= '9') || *v == '.')) {   /* unitless multiplier */
+		const char *p = v; double n;
+		if (calc_number(&p, &n) && n >= 0) { o->lh_pct = (short)(n * 100 + 0.5); o->line_height = -1; }
+		return;
+	}
+	int pct, px = parse_len2(v, &pct);
+	if (px >= 0)       { o->line_height = (short)px; o->lh_pct = -1; }
+	else if (pct >= 0) { o->lh_pct = (short)pct; o->line_height = -1; }
+}
+
+/* opacity: a 0..1 number (or an N% form) -> 0..100 percent, -1 if unparseable. */
+static signed char parse_opacity(const char *v)
+{
+	while (*v == ' ' || *v == '\t') v++;
+	const char *p = v; double n;
+	if (!calc_number(&p, &n)) return -1;
+	while (*p == ' ') p++;
+	if (*p == '%') n /= 100.0;
+	if (n < 0) n = 0; if (n > 1) n = 1;
+	return (signed char)(n * 100 + 0.5);
+}
+
 static void apply_decl(const char *p, const char *pe, const char *v, const char *ve,
                        struct css_style *out, int *important)
 {
@@ -386,8 +1055,24 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 	}
 
 	if (span_is(p, pe, "color"))                out->color  = parse_color(val);
-	else if (span_is(p, pe, "background-color") ||
-	         span_is(p, pe, "background"))       out->bg     = parse_color(val);
+	else if (span_is(p, pe, "background-color")) out->bg     = parse_color(val);
+	else if (span_is(p, pe, "background"))       parse_bg_shorthand(val, out);
+	else if (span_is(p, pe, "background-image")) parse_bg_image(val, &out->bgi);
+	else if (span_is(p, pe, "background-repeat")) { int r = parse_bg_repeat(val); if (r >= 0) out->bgi.repeat = (signed char)r; }
+	else if (span_is(p, pe, "background-position")) {
+		short bx, by; parse_bg_position(val, &bx, &by);
+		if (bx >= 0) out->bgi.pos_x = bx;
+		if (by >= 0) out->bgi.pos_y = by;
+	}
+	else if (span_is(p, pe, "background-position-x")) { int q = bg_pos_single(val, 0); if (q >= 0) out->bgi.pos_x = (short)q; }
+	else if (span_is(p, pe, "background-position-y")) { int q = bg_pos_single(val, 1); if (q >= 0) out->bgi.pos_y = (short)q; }
+	else if (span_is(p, pe, "background-size")) {
+		signed char sk; short sw, sh; parse_bg_size(val, &sk, &sw, &sh);
+		if (sk >= 0) { out->bgi.size_kind = sk; out->bgi.size_w = sw; out->bgi.size_h = sh; }
+	}
+	/* background-attachment / -origin / -clip parse-and-ignore (no box-model effect here) */
+	else if (span_is(p, pe, "background-attachment") || span_is(p, pe, "background-origin") ||
+	         span_is(p, pe, "background-clip")) { }
 	else if (span_is(p, pe, "font-weight"))      out->bold   = parse_weight(val);
 	else if (span_is(p, pe, "text-decoration") ||
 	         span_is(p, pe, "text-decoration-line"))
@@ -399,6 +1084,9 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 	else if (span_is(p, pe, "height"))           { out->height = parse_len2(val, &pct); out->pct_h = (short)pct; }
 	else if (span_is(p, pe, "max-width"))        { out->max_w  = parse_len2(val, &pct); out->pct_maxw = (short)pct; }
 	else if (span_is(p, pe, "max-height"))       { out->max_h  = parse_len2(val, &pct); out->pct_maxh = (short)pct; }
+	else if (span_is(p, pe, "min-width"))        { out->min_w  = parse_len2(val, &pct); out->pct_minw = (short)pct; }
+	else if (span_is(p, pe, "min-height"))       { out->min_h  = parse_len2(val, &pct); out->pct_minh = (short)pct; }
+	else if (span_is(p, pe, "box-sizing"))       out->box_sizing = has_ci(val, "border-box") ? 1 : has_ci(val, "content-box") ? 0 : out->box_sizing;
 	else if (span_is(p, pe, "margin"))           parse_box4(val, out->margin, 1);
 	else if (span_is(p, pe, "margin-top"))       out->margin[0]  = one_len(val, 1);
 	else if (span_is(p, pe, "margin-right"))     out->margin[1]  = one_len(val, 1);
@@ -424,12 +1112,23 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 	else if (span_is(p, pe, "border-bottom-width")) out->border_w[2] = one_len(val, 0);
 	else if (span_is(p, pe, "border-left-width"))   out->border_w[3] = one_len(val, 0);
 	else if (span_is(p, pe, "flex-direction"))   out->flex_dir = has_ci(val, "column") ? 1 : 0;
-	else if (span_is(p, pe, "flex-grow"))        { int g = parse_len(val); if (g >= 0) out->flex_grow = (short)g; }
-	else if (span_is(p, pe, "flex")) {
-		const char *f = val; while (*f == ' ') f++;
-		if (starts_ci(f, "none")) out->flex_grow = 0;
-		else { int g = parse_len(f); out->flex_grow = (short)(g >= 0 ? g : 1); }   /* flex:1 / auto -> grow 1 */
+	else if (span_is(p, pe, "flex-wrap"))        out->flex_wrap = has_ci(val, "nowrap") ? 0 : (has_ci(val, "wrap") ? 1 : out->flex_wrap);
+	else if (span_is(p, pe, "flex-flow")) {
+		if (has_ci(val, "column")) out->flex_dir = 1; else if (has_ci(val, "row")) out->flex_dir = 0;
+		if (has_ci(val, "nowrap")) out->flex_wrap = 0; else if (has_ci(val, "wrap")) out->flex_wrap = 1;
 	}
+	else if (span_is(p, pe, "flex-grow"))        { int g = parse_len(val); if (g >= 0) out->flex_grow = (short)g; }
+	else if (span_is(p, pe, "flex-shrink"))      { int g = parse_len(val); if (g >= 0) out->flex_shrink = (short)g; }
+	else if (span_is(p, pe, "flex-basis")) {
+		if (has_ci(val, "auto") || has_ci(val, "content")) { out->flex_basis = -1; out->pct_basis = -1; }
+		else { int q; out->flex_basis = parse_len2(val, &q); out->pct_basis = (short)q; }
+	}
+	else if (span_is(p, pe, "flex"))             parse_flex_shorthand(val, out);
+	else if (span_is(p, pe, "justify-content"))  out->justify = parse_justify(val);
+	else if (span_is(p, pe, "align-items"))      out->align_items = parse_align(val);
+	else if (span_is(p, pe, "gap"))              parse_gap(val, out);
+	else if (span_is(p, pe, "row-gap"))          { int g = parse_len(val); if (g >= 0) out->gap_row = (short)g; }
+	else if (span_is(p, pe, "column-gap"))       { int g = parse_len(val); if (g >= 0) out->gap_col = (short)g; }
 	else if (span_is(p, pe, "position")) {
 		const char *f = val; while (*f == ' ') f++;
 		out->pos = starts_ci(f, "relative") ? CSS_POS_REL : starts_ci(f, "absolute") ? CSS_POS_ABS :
@@ -445,6 +1144,71 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 	else if (span_is(p, pe, "stroke"))           out->stroke = parse_paint_val(val);
 	else if (span_is(p, pe, "content"))          parse_content(val, out->content, sizeof out->content);
 	else if (span_is(p, pe, "font-family"))      copy_family_stack(val, out->fam, CSS_FAM_STACK);
+	else if (span_is(p, pe, "font-size")) {
+		/* keyword scale (most-specific first), else a length/percent. em/rem resolve
+		 * via parse_len2 (rem against the 16px root; em approximated likewise). */
+		if      (has_ci(val, "xx-small")) out->font_px = 9;
+		else if (has_ci(val, "x-small"))  out->font_px = 10;
+		else if (has_ci(val, "smaller"))  out->font_pct = 80;
+		else if (has_ci(val, "small"))    out->font_px = 13;
+		else if (has_ci(val, "xx-large")) out->font_px = 32;
+		else if (has_ci(val, "x-large"))  out->font_px = 24;
+		else if (has_ci(val, "larger"))   out->font_pct = 120;
+		else if (has_ci(val, "large"))    out->font_px = 18;
+		else if (has_ci(val, "medium"))   out->font_px = 16;
+		else { int q; int px = parse_len2(val, &q);
+		       if (px >= 0) out->font_px = px; else if (q >= 0) out->font_pct = (short)q; }
+	}
+	else if (span_is(p, pe, "border-radius") || span_is(p, pe, "border-top-left-radius") ||
+	         span_is(p, pe, "border-top-right-radius") || span_is(p, pe, "border-bottom-left-radius") ||
+	         span_is(p, pe, "border-bottom-right-radius")) {
+		int q; int px = parse_len2(val, &q);          /* first value, uniform */
+		if (px >= 0) out->radius = px;
+		else if (q >= 0) out->radius = 9999;          /* % -> pill (clamped to half) */
+	}
+	else if (span_is(p, pe, "box-shadow") || span_is(p, pe, "-webkit-box-shadow"))
+		parse_box_shadow(val, out);
+	else if (span_is(p, pe, "font-style"))
+		out->italic = (has_ci(val, "italic") || has_ci(val, "oblique")) ? 1 :
+		              has_ci(val, "normal") ? 0 : out->italic;
+	else if (span_is(p, pe, "font")) {              /* the `font` shorthand: pull style/weight/size */
+		out->italic = (has_ci(val, "italic") || has_ci(val, "oblique")) ? 1 : out->italic;
+		if (has_ci(val, "bold")) out->bold = 1;
+	}
+	else if (span_is(p, pe, "text-transform")) {
+		if      (has_ci(val, "uppercase"))  out->ttx = CSS_TT_UPPER;
+		else if (has_ci(val, "lowercase"))  out->ttx = CSS_TT_LOWER;
+		else if (has_ci(val, "capitalize")) out->ttx = CSS_TT_CAPITALIZE;
+		else if (has_ci(val, "none"))       out->ttx = CSS_TT_NONE;
+	}
+	else if (span_is(p, pe, "white-space")) {
+		if      (has_ci(val, "pre-wrap"))  out->white_space = CSS_WS_PRE_WRAP;
+		else if (has_ci(val, "pre-line"))  out->white_space = CSS_WS_PRE_LINE;
+		else if (has_ci(val, "nowrap"))    out->white_space = CSS_WS_NOWRAP;
+		else if (has_ci(val, "pre"))       out->white_space = CSS_WS_PRE;
+		else if (has_ci(val, "normal"))    out->white_space = CSS_WS_NORMAL;
+	}
+	else if (span_is(p, pe, "list-style") || span_is(p, pe, "list-style-type"))
+		out->list_style = parse_list_style(val);
+	else if (span_is(p, pe, "line-height"))      parse_line_height(val, out);
+	else if (span_is(p, pe, "opacity"))          out->opacity = parse_opacity(val);
+	else if (span_is(p, pe, "outline") || span_is(p, pe, "outline-width") ||
+	         span_is(p, pe, "outline-color") || span_is(p, pe, "outline-style")) {
+		int w, c; parse_border_val(val, &w, &c);
+		if (w >= 0) out->outline_w = (short)w;
+		if (c >= 0) out->outline_color = c;
+	}
+	else if (span_is(p, pe, "z-index")) {
+		const char *f = val; while (*f == ' ' || *f == '\t') f++;
+		if (starts_ci(f, "auto")) out->z_index = CSS_Z_AUTO;
+		else {
+			int neg = 0; if (*f == '-') { neg = 1; f++; } else if (*f == '+') f++;
+			if (*f >= '0' && *f <= '9') {
+				int n = 0; while (*f >= '0' && *f <= '9') n = n * 10 + (*f++ - '0');
+				out->z_index = (short)(neg ? -n : n);
+			}
+		}
+	}
 }
 
 /* Parse a `prop: value; ...` block [s,end) into *out. */
@@ -476,10 +1240,103 @@ void css_apply_inline(const char *decls, struct css_style *out)
 static int is_sel_name(char c)
 { return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_'; }
 
+/* ------------------------------------------------ pseudo-classes ----------- *
+ * Structural/state pseudo-classes are matched against the DOM; dynamic ones
+ * (:hover/:focus/…) and anything we can't evaluate become PC_NEVER so their rule
+ * can't apply to a static render; :is()/:where() are passed through (no added
+ * test) so the low-specificity resets that wrap selectors in them still match. */
+
+/* an+b microsyntax (odd|even|<int>|an+b|-n+b) for the :nth-* pseudo-classes. */
+static void parse_anb(const char *s, const char *e, int *a, int *b)
+{
+	*a = 0; *b = 0;
+	while (s < e && (*s == ' ' || *s == '\t')) s++;
+	while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+	if (span_is(s, e, "odd"))  { *a = 2; *b = 1; return; }
+	if (span_is(s, e, "even")) { *a = 2; *b = 0; return; }
+	int sign = 1, has1 = 0, num1 = 0;
+	if (s < e && (*s == '+' || *s == '-')) { if (*s == '-') sign = -1; s++; }
+	while (s < e && *s >= '0' && *s <= '9') { num1 = num1 * 10 + (*s++ - '0'); has1 = 1; }
+	if (s < e && (*s == 'n' || *s == 'N')) {
+		s++;
+		*a = sign * (has1 ? num1 : 1);
+		while (s < e && (*s == ' ' || *s == '\t')) s++;
+		int bsign = 1, has2 = 0, num2 = 0;
+		if (s < e && (*s == '+' || *s == '-')) { if (*s == '-') bsign = -1; s++; }
+		while (s < e && (*s == ' ' || *s == '\t')) s++;
+		while (s < e && *s >= '0' && *s <= '9') { num2 = num2 * 10 + (*s++ - '0'); has2 = 1; }
+		*b = has2 ? bsign * num2 : 0;
+	} else {
+		*b = sign * num1;
+	}
+}
+
+/* Parse a single simple selector (tag / #id / .class…, no combinators) for :not(). */
+static void parse_simple_sel(const char *s, const char *e, struct simple_sel *ss)
+{
+	ss->tag[0] = '\0'; ss->id[0] = '\0'; ss->ncls = 0;
+	while (s < e) {
+		if (*s == '.') {
+			s++; char *d = ss->ncls < MAX_NOTCLS ? ss->cls[ss->ncls] : 0; int k = 0;
+			while (s < e && is_sel_name(*s)) { if (d && k < 23) d[k++] = *s; s++; }
+			if (d) { d[k] = '\0'; if (k) ss->ncls++; }
+		} else if (*s == '#') {
+			s++; int k = 0;
+			while (s < e && is_sel_name(*s)) { if (k < 23) ss->id[k++] = *s; s++; }
+			ss->id[k] = '\0';
+		} else if (*s == '*') {
+			s++;
+		} else if (is_sel_name(*s)) {
+			int k = 0;
+			while (s < e && is_sel_name(*s)) { if (k < 15) ss->tag[k++] = lower(*s); s++; }
+			ss->tag[k] = '\0';
+		} else s++;
+	}
+}
+
+/* Classify a pseudo-class name span [ns,ne) (+ optional arg [as,ae)) into *pc.
+ * Returns 1 to record *pc, 0 to ignore the pseudo entirely (:is()/:where()). */
+static int classify_pseudo(const char *ns, const char *ne, const char *as, const char *ae,
+                           struct pseudo *pc)
+{
+	pc->kind = PC_NEVER; pc->a = 0; pc->b = 0;
+	pc->arg.tag[0] = pc->arg.id[0] = '\0'; pc->arg.ncls = 0;
+
+	if (span_is(ns, ne, "not")) { pc->kind = PC_NOT; if (as) parse_simple_sel(as, ae, &pc->arg); return 1; }
+	if (span_is(ns, ne, "first-child"))      { pc->kind = PC_FIRST_CHILD;   return 1; }
+	if (span_is(ns, ne, "last-child"))       { pc->kind = PC_LAST_CHILD;    return 1; }
+	if (span_is(ns, ne, "only-child"))       { pc->kind = PC_ONLY_CHILD;    return 1; }
+	if (span_is(ns, ne, "first-of-type"))    { pc->kind = PC_FIRST_OF_TYPE; return 1; }
+	if (span_is(ns, ne, "last-of-type"))     { pc->kind = PC_LAST_OF_TYPE;  return 1; }
+	if (span_is(ns, ne, "only-of-type"))     { pc->kind = PC_ONLY_OF_TYPE;  return 1; }
+	if (span_is(ns, ne, "nth-child"))        { pc->kind = PC_NTH_CHILD;        if (as) parse_anb(as, ae, &pc->a, &pc->b); return 1; }
+	if (span_is(ns, ne, "nth-last-child"))   { pc->kind = PC_NTH_LAST_CHILD;   if (as) parse_anb(as, ae, &pc->a, &pc->b); return 1; }
+	if (span_is(ns, ne, "nth-of-type"))      { pc->kind = PC_NTH_OF_TYPE;      if (as) parse_anb(as, ae, &pc->a, &pc->b); return 1; }
+	if (span_is(ns, ne, "nth-last-of-type")) { pc->kind = PC_NTH_LAST_OF_TYPE; if (as) parse_anb(as, ae, &pc->a, &pc->b); return 1; }
+	if (span_is(ns, ne, "root"))     { pc->kind = PC_ROOT;     return 1; }
+	if (span_is(ns, ne, "empty"))    { pc->kind = PC_EMPTY;    return 1; }
+	if (span_is(ns, ne, "checked"))  { pc->kind = PC_CHECKED;  return 1; }
+	if (span_is(ns, ne, "disabled")) { pc->kind = PC_DISABLED; return 1; }
+	if (span_is(ns, ne, "enabled"))  { pc->kind = PC_ENABLED;  return 1; }
+	if (span_is(ns, ne, "required")) { pc->kind = PC_REQUIRED; return 1; }
+	if (span_is(ns, ne, "optional")) { pc->kind = PC_OPTIONAL; return 1; }
+	if (span_is(ns, ne, "link") || span_is(ns, ne, "any-link")) { pc->kind = PC_LINK; return 1; }
+	if (span_is(ns, ne, "is") || span_is(ns, ne, "where")) return 0;   /* pass-through */
+	return 1;   /* dynamic state / :has() / unsupported -> PC_NEVER */
+}
+
+static void add_pseudo_class(struct sel_step *st, const char *ns, const char *ne,
+                             const char *as, const char *ae)
+{
+	if (st->npc >= MAX_PC) return;
+	struct pseudo pc;
+	if (classify_pseudo(ns, ne, as, ae, &pc)) st->pc[st->npc++] = pc;
+}
+
 /* Parse one compound selector token (between combinators) into *st. */
 static void parse_compound(const char *s, const char *e, struct sel_step *st)
 {
-	st->tag[0] = '\0'; st->id[0] = '\0'; st->ncls = 0; st->pseudo_el = 0;
+	st->tag[0] = '\0'; st->id[0] = '\0'; st->ncls = 0; st->npc = 0; st->pseudo_el = 0;
 	while (s < e) {
 		if (*s == '.') {
 			s++;
@@ -492,22 +1349,30 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
 			int k = 0;
 			while (s < e && is_sel_name(*s)) { if (k < 23) st->id[k++] = *s; s++; }
 			st->id[k] = '\0';
-		} else if (*s == ':') {                 /* pseudo: skip, but flag elements */
+		} else if (*s == ':') {
 			s++;
 			int dbl = 0;
 			if (s < e && *s == ':') { s++; dbl = 1; }
 			const char *ns = s;
 			while (s < e && is_sel_name(*s)) s++;
-			/* A pseudo-ELEMENT styles generated content / selection / a part, not
-			 * the element's own box. ::before/::after generate renderable content
-			 * (PE_BEFORE/PE_AFTER); the rest (::selection, ::placeholder, ::first-
-			 * line, …) we don't render, so the rule must not match a real element
-			 * (e.g. `html::selection{background:…}` is NOT the page background). */
-			if (span_is(ns, s, "before"))           st->pseudo_el = PE_BEFORE;
-			else if (span_is(ns, s, "after"))       st->pseudo_el = PE_AFTER;
-			else if (dbl || span_is(ns, s, "first-line") || span_is(ns, s, "first-letter"))
+			const char *ne = s;
+			const char *as = 0, *ae = 0;             /* an optional ( ... ) argument */
+			if (s < e && *s == '(') {
+				int depth = 1; s++; as = s;
+				while (s < e && depth) { if (*s == '(') depth++; else if (*s == ')') { depth--; if (!depth) break; } s++; }
+				ae = s;
+				if (s < e) s++;
+			}
+			/* A pseudo-ELEMENT styles generated content / a part, not the element's
+			 * own box: ::before/::after render content (PE_BEFORE/PE_AFTER); the rest
+			 * (::selection/::first-line/…) we don't render, so the rule must not match
+			 * a real element. A single-colon pseudo-CLASS is matched against the DOM
+			 * (structural/state) or flagged PC_NEVER (dynamic/unsupported). */
+			if (span_is(ns, ne, "before"))      st->pseudo_el = PE_BEFORE;
+			else if (span_is(ns, ne, "after"))  st->pseudo_el = PE_AFTER;
+			else if (dbl || span_is(ns, ne, "first-line") || span_is(ns, ne, "first-letter"))
 				st->pseudo_el = PE_OTHER;
-			if (s < e && *s == '(') { while (s < e && *s != ')') s++; if (s < e) s++; }
+			else add_pseudo_class(st, ns, ne, as, ae);
 		} else if (*s == '*') {
 			s++;                                 /* universal: no constraint */
 		} else if (is_sel_name(*s)) {
@@ -546,9 +1411,20 @@ static int selector_spec(const struct selector *sel)
 {
 	int a = 0, b = 0, c = 0;
 	for (int i = 0; i < sel->n; i++) {
-		if (sel->step[i].id[0]) a++;
-		b += sel->step[i].ncls;
-		if (sel->step[i].tag[0]) c++;
+		const struct sel_step *st = &sel->step[i];
+		if (st->id[0]) a++;
+		b += st->ncls;
+		if (st->tag[0]) c++;
+		for (int j = 0; j < st->npc; j++) {       /* pseudo-classes add specificity */
+			const struct pseudo *pc = &st->pc[j];
+			if (pc->kind == PC_NOT) {             /* :not() contributes its argument's */
+				if (pc->arg.id[0]) a++;
+				b += pc->arg.ncls;
+				if (pc->arg.tag[0]) c++;
+			} else {
+				b++;                             /* a pseudo-class counts like a class */
+			}
+		}
 	}
 	return a * 10000 + b * 100 + c;
 }
@@ -573,7 +1449,102 @@ static int node_has_class(const struct dom_node *n, const char *cls)
 	return 0;
 }
 
-/* Match a step's tag/id/class against `n` (ignoring any pseudo-element). */
+/* ------------------------------------------------ pseudo-class matching ---- */
+static int elem_index(const struct dom_node *n)        /* 1-based among element siblings */
+{
+	int i = 0;
+	if (!n->parent) return 1;
+	for (const struct dom_node *c = n->parent->first_child; c; c = c->next) {
+		if (c->type != DOM_ELEMENT) continue;
+		i++;
+		if (c == n) return i;
+	}
+	return i;
+}
+static int elem_count(const struct dom_node *n)        /* element siblings, self included */
+{
+	int i = 0;
+	if (!n->parent) return 1;
+	for (const struct dom_node *c = n->parent->first_child; c; c = c->next)
+		if (c->type == DOM_ELEMENT) i++;
+	return i;
+}
+static int type_index(const struct dom_node *n)        /* 1-based among same-tag siblings */
+{
+	int i = 0;
+	if (!n->parent) return 1;
+	for (const struct dom_node *c = n->parent->first_child; c; c = c->next) {
+		if (c->type != DOM_ELEMENT || !streq(c->tag, n->tag)) continue;
+		i++;
+		if (c == n) return i;
+	}
+	return i;
+}
+static int type_count(const struct dom_node *n)
+{
+	int i = 0;
+	if (!n->parent) return 1;
+	for (const struct dom_node *c = n->parent->first_child; c; c = c->next)
+		if (c->type == DOM_ELEMENT && streq(c->tag, n->tag)) i++;
+	return i;
+}
+/* idx satisfies an+b for some integer k >= 0. */
+static int anb_match(int a, int b, int idx)
+{
+	int d = idx - b;
+	if (a == 0) return d == 0;
+	if ((a > 0 && d < 0) || (a < 0 && d > 0)) return 0;
+	return d % a == 0;
+}
+static int is_form_control(const char *tag)
+{
+	return streq(tag, "input") || streq(tag, "button") || streq(tag, "select") ||
+	       streq(tag, "textarea") || streq(tag, "option") || streq(tag, "optgroup") ||
+	       streq(tag, "fieldset");
+}
+static int simple_match(const struct simple_sel *ss, const struct dom_node *n)
+{
+	if (!n || n->type != DOM_ELEMENT) return 0;
+	if (ss->tag[0] && !streq(ss->tag, n->tag)) return 0;
+	if (ss->id[0]) { const char *id = dom_get_attr(n, "id"); if (!id || !streq_ci(id, ss->id)) return 0; }
+	for (int i = 0; i < ss->ncls; i++) if (!node_has_class(n, ss->cls[i])) return 0;
+	return 1;
+}
+static int pseudo_match(const struct pseudo *pc, const struct dom_node *n)
+{
+	switch (pc->kind) {
+	case PC_FIRST_CHILD:      return elem_index(n) == 1;
+	case PC_LAST_CHILD:       return elem_index(n) == elem_count(n);
+	case PC_ONLY_CHILD:       return elem_count(n) == 1;
+	case PC_FIRST_OF_TYPE:    return type_index(n) == 1;
+	case PC_LAST_OF_TYPE:     return type_index(n) == type_count(n);
+	case PC_ONLY_OF_TYPE:     return type_count(n) == 1;
+	case PC_NTH_CHILD:        return anb_match(pc->a, pc->b, elem_index(n));
+	case PC_NTH_LAST_CHILD:   return anb_match(pc->a, pc->b, elem_count(n) - elem_index(n) + 1);
+	case PC_NTH_OF_TYPE:      return anb_match(pc->a, pc->b, type_index(n));
+	case PC_NTH_LAST_OF_TYPE: return anb_match(pc->a, pc->b, type_count(n) - type_index(n) + 1);
+	case PC_ROOT:             return n->parent && !n->parent->parent;
+	case PC_EMPTY:
+		for (const struct dom_node *c = n->first_child; c; c = c->next) {
+			if (c->type == DOM_ELEMENT) return 0;
+			if (c->type == DOM_TEXT && c->text)
+				for (const char *t = c->text; *t; t++)
+					if (*t != ' ' && *t != '\t' && *t != '\n' && *t != '\r' && *t != '\f') return 0;
+		}
+		return 1;
+	case PC_CHECKED:  return dom_get_attr(n, "checked") != 0 || dom_get_attr(n, "selected") != 0;
+	case PC_DISABLED: return dom_get_attr(n, "disabled") != 0;
+	case PC_ENABLED:  return dom_get_attr(n, "disabled") == 0 && is_form_control(n->tag);
+	case PC_REQUIRED: return dom_get_attr(n, "required") != 0;
+	case PC_OPTIONAL: return dom_get_attr(n, "required") == 0 && is_form_control(n->tag);
+	case PC_LINK:     return (streq(n->tag, "a") || streq(n->tag, "area") || streq(n->tag, "link")) &&
+	                         dom_get_attr(n, "href") != 0;
+	case PC_NOT:      return !simple_match(&pc->arg, n);
+	default:          return 0;   /* PC_NEVER */
+	}
+}
+
+/* Match a step's tag/id/class/pseudo-class against `n` (ignoring any pseudo-element). */
 static int step_box_match(const struct sel_step *st, const struct dom_node *n)
 {
 	if (!n || n->type != DOM_ELEMENT) return 0;
@@ -584,6 +1555,8 @@ static int step_box_match(const struct sel_step *st, const struct dom_node *n)
 	}
 	for (int i = 0; i < st->ncls; i++)
 		if (!node_has_class(n, st->cls[i])) return 0;
+	for (int i = 0; i < st->npc; i++)
+		if (!pseudo_match(&st->pc[i], n)) return 0;
 	return 1;
 }
 
@@ -651,15 +1624,33 @@ static int kw(const char **pp, const char *e, const char *lit)
 	return 1;
 }
 
-/* Parse a pixel length at *pp (digits then an optional unit); -1 if no number. */
-static int parse_px(const char **pp, const char *e)
+/* Parse a media length operand in [s,e) -> px (rounded to int); -1 if no number.
+ * Width/height media features carry an integer px, so font- and physical-unit
+ * lengths (em/rem, cm/mm/in/pt — common in framework breakpoints) resolve against
+ * the same bases the cascade uses, and decimals (37.5em) survive. */
+static int parse_len_px(const char *s, const char *e)
 {
-	const char *p = skip_sp(*pp, e);
-	int n = 0, any = 0;
-	while (p < e && *p >= '0' && *p <= '9') { n = n * 10 + (*p++ - '0'); any = 1; }
-	while (p < e && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) p++;
-	*pp = p;
-	return any ? n : -1;
+	s = skip_sp(s, e);
+	int neg = 0;
+	if (s < e && (*s == '+' || *s == '-')) { neg = (*s == '-'); s++; }
+	double n = 0; int any = 0;
+	while (s < e && *s >= '0' && *s <= '9') { n = n * 10 + (*s++ - '0'); any = 1; }
+	if (s < e && *s == '.') { s++; double f = 0.1; while (s < e && *s >= '0' && *s <= '9') { n += (*s++ - '0') * f; f *= 0.1; any = 1; } }
+	if (!any) return -1;
+	if (neg) n = -n;
+	const char *u = skip_sp(s, e);
+	double px;
+	if      (u >= e)              px = n;                  /* unitless -> px */
+	else if (starts_ci(u, "px"))  px = n;
+	else if (starts_ci(u, "rem")) px = n * CSS_ROOT_FONT_PX;
+	else if (starts_ci(u, "em"))  px = n * CSS_ROOT_FONT_PX;
+	else if (starts_ci(u, "cm"))  px = n * 96.0 / 2.54;
+	else if (starts_ci(u, "mm"))  px = n * 96.0 / 25.4;
+	else if (starts_ci(u, "in"))  px = n * 96.0;
+	else if (starts_ci(u, "pt"))  px = n * 96.0 / 72.0;
+	else if (starts_ci(u, "pc"))  px = n * 16.0;
+	else                          px = n;                  /* unknown unit -> px */
+	return (int)(px < 0 ? px - 0.5 : px + 0.5);
 }
 
 /* True if [a,e) trimmed equals lowercase literal `lit`. */
@@ -670,35 +1661,125 @@ static int span_eq_trim(const char *a, const char *e, const char *lit)
 	return span_is(a, e, lit);
 }
 
-/* Parse one `(feature: value)` starting at *pp (which points at '('); always
- * advances past the matching ')'. A feature we don't support stays MF_UNKNOWN,
- * which evaluates false — per CSS, an unrecognised feature makes its query false
- * (so a block gated only on one we can't test won't apply). */
+/* ------- modern range syntax: (width >= 600px), (400px <= width <= 900px) --- */
+enum { OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ };
+
+/* width/height keyword in [s,e) -> 'w' / 'h' (0 = neither). */
+static int range_dim(const char *s, const char *e)
+{
+	s = skip_sp(s, e);
+	while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+	if (span_is(s, e, "width"))  return 'w';
+	if (span_is(s, e, "height")) return 'h';
+	return 0;
+}
+
+static int op_flip(int op)
+{
+	switch (op) {
+	case OP_LT: return OP_GT; case OP_LE: return OP_GE;
+	case OP_GT: return OP_LT; case OP_GE: return OP_LE;
+	default:    return OP_EQ;
+	}
+}
+
+/* Read a comparison operator at *pp (`<` `<=` `>` `>=` `=` `==`); -1 if none. */
+static int read_op(const char **pp, const char *e)
+{
+	const char *p = *pp; int op = -1;
+	if (p < e && *p == '<')      { p++; if (p < e && *p == '=') { p++; op = OP_LE; } else op = OP_LT; }
+	else if (p < e && *p == '>') { p++; if (p < e && *p == '=') { p++; op = OP_GE; } else op = OP_GT; }
+	else if (p < e && *p == '=') { p++; if (p < e && *p == '=') p++; op = OP_EQ; }
+	*pp = p;
+	return op;
+}
+
+/* Add one bound `<feature> op <len>` (op as written with the feature on the LEFT)
+ * to *c as a min/max/exact feature. Strict </> nudge the integer px boundary by 1
+ * so a viewport exactly on the edge compares correctly. */
+static void range_bound(struct media_cond *c, int dim, int op, int len)
+{
+	if (len < 0 || c->nfeat >= MAX_FEAT) return;
+	struct media_feature f = { MF_UNKNOWN, len };
+	switch (op) {
+	case OP_GE: f.kind = (dim == 'w') ? MF_MIN_W : MF_MIN_H; break;
+	case OP_GT: f.kind = (dim == 'w') ? MF_MIN_W : MF_MIN_H; f.val = len + 1; break;
+	case OP_LE: f.kind = (dim == 'w') ? MF_MAX_W : MF_MAX_H; break;
+	case OP_LT: f.kind = (dim == 'w') ? MF_MAX_W : MF_MAX_H; f.val = len - 1; break;
+	case OP_EQ: f.kind = (dim == 'w') ? MF_W     : MF_H;     break;
+	}
+	if (f.kind != MF_UNKNOWN) c->feat[c->nfeat++] = f;
+}
+
+/* Parse range syntax inside the parens [s,e): one comparison (feature on either
+ * side) or a two-sided interval, emitting one or two min/max/exact features. */
+static void parse_range(const char *s, const char *e, struct media_cond *c)
+{
+	const char *part_s[3], *part_e[3]; int np = 0;
+	int ops[2], no = 0;
+	const char *p = skip_sp(s, e), *ts = p;
+	while (p < e) {
+		if (*p == '<' || *p == '>' || *p == '=') {
+			if (np < 3) { part_s[np] = ts; part_e[np] = p; np++; }
+			int op = read_op(&p, e);
+			if (no < 2 && op >= 0) ops[no++] = op;
+			ts = skip_sp(p, e);
+			continue;
+		}
+		p++;
+	}
+	if (np < 3) { part_s[np] = ts; part_e[np] = e; np++; }
+
+	if (np == 2 && no == 1) {                 /* A op B — feature on one side */
+		int d0 = range_dim(part_s[0], part_e[0]);
+		if (d0) range_bound(c, d0, ops[0], parse_len_px(part_s[1], part_e[1]));
+		else {
+			int d1 = range_dim(part_s[1], part_e[1]);
+			if (d1) range_bound(c, d1, op_flip(ops[0]), parse_len_px(part_s[0], part_e[0]));
+		}
+	} else if (np == 3 && no == 2) {          /* A op0 B op1 C — B the feature */
+		int d = range_dim(part_s[1], part_e[1]);
+		if (d) {
+			range_bound(c, d, op_flip(ops[0]), parse_len_px(part_s[0], part_e[0]));
+			range_bound(c, d, ops[1],          parse_len_px(part_s[2], part_e[2]));
+		}
+	}
+}
+
+/* Parse one parenthesised media feature starting at *pp (which points at '(');
+ * always advances past the matching ')'. Handles classic `(feature: value)` and
+ * modern range syntax. A feature we don't support stays MF_UNKNOWN, which
+ * evaluates false — per CSS, an unrecognised feature makes its query false (so a
+ * block gated only on one we can't test won't apply). */
 static void parse_feature(const char **pp, const char *e, struct media_cond *c)
 {
 	const char *p = *pp;
 	if (p >= e || *p != '(') { *pp = e; return; }
 	p++;
-	const char *ns = skip_sp(p, e), *ne = ns;
-	while (ne < e && *ne != ':' && *ne != ')') ne++;
-	const char *nend = ne;
-	while (nend > ns && (nend[-1] == ' ' || nend[-1] == '\t')) nend--;
-	const char *vs = ne, *ve = ne;
-	if (ne < e && *ne == ':') { vs = ne + 1; ve = vs; while (ve < e && *ve != ')') ve++; }
-	const char *after = (ne < e && *ne == ':') ? ve : ne;
-	while (after < e && *after != ')') after++;
-	if (after < e) after++;
-	*pp = after;
+	const char *is = p;
+	while (p < e && *p != ')') p++;
+	const char *ie = p;
+	if (p < e) p++;
+	*pp = p;
+
+	/* Distinguish classic (a ':') from range (a comparison operator). */
+	const char *q = is;
+	while (q < ie && *q != ':' && *q != '<' && *q != '>' && *q != '=') q++;
+	if (q < ie && *q != ':') { parse_range(is, ie, c); return; }
 
 	if (c->nfeat >= MAX_FEAT) return;
+	const char *ns = skip_sp(is, ie), *ne = (q < ie) ? q : ie;
+	const char *nend = ne;
+	while (nend > ns && (nend[-1] == ' ' || nend[-1] == '\t')) nend--;
+	const char *vs = (q < ie) ? q + 1 : ie, *ve = ie;
+
 	struct media_feature f = { MF_UNKNOWN, 0 };
-	const char *vp = vs;
-	if      (span_is(ns, nend, "min-width"))  { f.kind = MF_MIN_W; f.val = parse_px(&vp, ve); }
-	else if (span_is(ns, nend, "max-width"))  { f.kind = MF_MAX_W; f.val = parse_px(&vp, ve); }
-	else if (span_is(ns, nend, "width"))      { f.kind = MF_W;     f.val = parse_px(&vp, ve); }
-	else if (span_is(ns, nend, "min-height")) { f.kind = MF_MIN_H; f.val = parse_px(&vp, ve); }
-	else if (span_is(ns, nend, "max-height")) { f.kind = MF_MAX_H; f.val = parse_px(&vp, ve); }
-	else if (span_is(ns, nend, "height"))     { f.kind = MF_H;     f.val = parse_px(&vp, ve); }
+	if      (span_is(ns, nend, "min-width"))  { f.kind = MF_MIN_W; f.val = parse_len_px(vs, ve); }
+	else if (span_is(ns, nend, "max-width"))  { f.kind = MF_MAX_W; f.val = parse_len_px(vs, ve); }
+	else if (span_is(ns, nend, "width"))      { f.kind = MF_W;     f.val = parse_len_px(vs, ve); }
+	else if (span_is(ns, nend, "min-height")) { f.kind = MF_MIN_H; f.val = parse_len_px(vs, ve); }
+	else if (span_is(ns, nend, "max-height")) { f.kind = MF_MAX_H; f.val = parse_len_px(vs, ve); }
+	else if (span_is(ns, nend, "height"))     { f.kind = MF_H;     f.val = parse_len_px(vs, ve); }
 	else if (span_is(ns, nend, "orientation")) {
 		if (span_eq_trim(vs, ve, "portrait"))  f.kind = MF_ORIENT_PORTRAIT;
 		else if (span_eq_trim(vs, ve, "landscape")) f.kind = MF_ORIENT_LANDSCAPE;
@@ -860,6 +1941,12 @@ static void parse_fontface(css_sheet *sh, const char *s, const char *end)
 	fc->url = malloc((unsigned)ul + 1);
 	if (!fc->url) { free(fc); return; }
 	for (i = 0; i <= ul; i++) fc->url[i] = url[i];
+	fc->base = 0;
+	if (sh->cur_base && sh->cur_base[0]) {
+		int bl = strlen(sh->cur_base);
+		fc->base = malloc((unsigned)bl + 1);
+		if (fc->base) for (i = 0; i <= bl; i++) fc->base[i] = sh->cur_base[i];
+	}
 	fc->next = sh->faces;
 	sh->faces = fc;
 }
@@ -1019,11 +2106,13 @@ static void add_rules(css_sheet *sh, const char *p, const char *end,
 	}
 }
 
-void css_add(css_sheet *sh, const char *src, int len)
+void css_add(css_sheet *sh, const char *src, int len, const char *base)
 {
 	if (!sh) return;
+	sh->cur_base = base;                  /* @font-face src resolves against this */
 	struct media_query none = { .n = 0 };
 	add_rules(sh, src, src + len, &none);
+	sh->cur_base = 0;
 	sh->gen++;                            /* custom-property table is now stale */
 }
 
@@ -1034,7 +2123,7 @@ void css_free(css_sheet *sh)
 	struct css_rule *r = sh->head;
 	while (r) { struct css_rule *n = r->next; free(r); r = n; }
 	struct css_face *fc = sh->faces;
-	while (fc) { struct css_face *n = fc->next; free(fc->url); free(fc); fc = n; }
+	while (fc) { struct css_face *n = fc->next; free(fc->url); free(fc->base); free(fc); fc = n; }
 	free(sh);
 }
 
@@ -1045,12 +2134,13 @@ int css_fontface_count(const css_sheet *sh)
 	return n;
 }
 
-void css_fontface_at(const css_sheet *sh, int i, const char **family, const char **url)
+void css_fontface_at(const css_sheet *sh, int i, const char **family,
+                     const char **url, const char **base)
 {
-	*family = 0; *url = 0;
+	*family = 0; *url = 0; if (base) *base = 0;
 	if (!sh) return;
 	for (struct css_face *fc = sh->faces; fc; fc = fc->next, i--)
-		if (i == 0) { *family = fc->family; *url = fc->url; return; }
+		if (i == 0) { *family = fc->family; *url = fc->url; if (base) *base = fc->base; return; }
 }
 
 /* ------------------------------------------------ cascade ------------------ */
@@ -1070,6 +2160,19 @@ static void fold(struct css_style *out, const struct css_style *d)
 	else if (d->pct_maxw >= 0) { out->pct_maxw = d->pct_maxw; out->max_w = -1; }
 	if (d->max_h >= 0)       { out->max_h = d->max_h; out->pct_maxh = -1; }
 	else if (d->pct_maxh >= 0) { out->pct_maxh = d->pct_maxh; out->max_h = -1; }
+	if (d->min_w >= 0)       { out->min_w = d->min_w; out->pct_minw = -1; }
+	else if (d->pct_minw >= 0) { out->pct_minw = d->pct_minw; out->min_w = -1; }
+	if (d->min_h >= 0)       { out->min_h = d->min_h; out->pct_minh = -1; }
+	else if (d->pct_minh >= 0) { out->pct_minh = d->pct_minh; out->min_h = -1; }
+	if (d->box_sizing >= 0)  out->box_sizing = d->box_sizing;
+	if (d->font_px >= 0)       { out->font_px = d->font_px; out->font_pct = -1; }
+	else if (d->font_pct >= 0) { out->font_pct = d->font_pct; out->font_px = -1; }
+	if (d->radius >= 0) out->radius = d->radius;
+	if (d->sh_color >= 0) {
+		out->sh_color = d->sh_color;
+		out->sh_dx = d->sh_dx; out->sh_dy = d->sh_dy;
+		out->sh_blur = d->sh_blur; out->sh_spread = d->sh_spread;
+	}
 	for (int i = 0; i < 4; i++) {
 		if (d->margin[i]   != -1) out->margin[i]   = d->margin[i];
 		if (d->padding[i]  != -1) out->padding[i]  = d->padding[i];
@@ -1083,10 +2186,43 @@ static void fold(struct css_style *out, const struct css_style *d)
 	if (d->left != -1)      out->left     = d->left;
 	if (d->flex >= 0)       out->flex     = d->flex;
 	if (d->flex_dir >= 0)   out->flex_dir = d->flex_dir;
+	if (d->flex_wrap >= 0)  out->flex_wrap = d->flex_wrap;
 	if (d->flex_grow >= 0)  out->flex_grow = d->flex_grow;
+	if (d->flex_shrink >= 0) out->flex_shrink = d->flex_shrink;
+	if (d->flex_basis >= 0)    { out->flex_basis = d->flex_basis; out->pct_basis = -1; }
+	else if (d->pct_basis >= 0) { out->pct_basis = d->pct_basis; out->flex_basis = -1; }
+	if (d->justify >= 0)    out->justify = d->justify;
+	if (d->align_items >= 0) out->align_items = d->align_items;
+	if (d->gap_row >= 0)    out->gap_row = d->gap_row;
+	if (d->gap_col >= 0)    out->gap_col = d->gap_col;
 	if (d->overflow >= 0)   out->overflow = d->overflow;
+	if (d->italic >= 0)     out->italic = d->italic;
+	if (d->ttx >= 0)        out->ttx = d->ttx;
+	if (d->white_space >= 0) out->white_space = d->white_space;
+	if (d->list_style != CSS_LST_DEFAULT) out->list_style = d->list_style;
+	if (d->opacity >= 0)    out->opacity = d->opacity;
+	if (d->line_height >= 0)   { out->line_height = d->line_height; out->lh_pct = -1; }
+	else if (d->lh_pct >= 0)   { out->lh_pct = d->lh_pct; out->line_height = -1; }
+	if (d->outline_w >= 0)     out->outline_w = d->outline_w;
+	if (d->outline_color >= 0) out->outline_color = d->outline_color;
+	if (d->z_index != CSS_Z_AUTO) out->z_index = d->z_index;
 	if (d->fill != -1)   out->fill   = d->fill;
 	if (d->stroke != -1) out->stroke = d->stroke;
+	/* background image layer: the image identity (kind + gradient/url) folds as a
+	 * unit; repeat/size/position are independent longhands with their own sentinels. */
+	if (d->bgi.kind >= 0) {
+		out->bgi.kind       = d->bgi.kind;
+		out->bgi.angle      = d->bgi.angle;
+		out->bgi.rad_circle = d->bgi.rad_circle;
+		out->bgi.nstops     = d->bgi.nstops;
+		for (int i = 0; i < d->bgi.nstops; i++) out->bgi.stops[i] = d->bgi.stops[i];
+		int i = 0; for (; d->bgi.url[i] && i < CSS_BG_URL - 1; i++) out->bgi.url[i] = d->bgi.url[i];
+		out->bgi.url[i] = '\0';
+	}
+	if (d->bgi.repeat >= 0)    out->bgi.repeat = d->bgi.repeat;
+	if (d->bgi.size_kind >= 0) { out->bgi.size_kind = d->bgi.size_kind; out->bgi.size_w = d->bgi.size_w; out->bgi.size_h = d->bgi.size_h; }
+	if (d->bgi.pos_x >= 0)     out->bgi.pos_x = d->bgi.pos_x;
+	if (d->bgi.pos_y >= 0)     out->bgi.pos_y = d->bgi.pos_y;
 	if (d->content[0]) { int i = 0; for (; d->content[i] && i < (int)sizeof out->content - 1; i++) out->content[i] = d->content[i]; out->content[i] = '\0'; }
 	if (d->fam[0]) { int i = 0; for (; d->fam[i] && i < CSS_FAM_STACK - 1; i++) out->fam[i] = d->fam[i]; out->fam[i] = '\0'; }
 }
@@ -1377,7 +2513,7 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
 	/* highest priority first: inline style="", then sheet rules, then bgcolor="" */
 	const char *inl = dom_get_attr(el, "style");
 	if (inl && extract_bg(inl, val, sizeof val)) {
-		int a; int c = color_parse_a(val, &a); if (c >= 0) { *out = ((unsigned)a << 24) | (unsigned)c; return 1; }
+		int a; int c = bg_value_color(val, &a); if (c >= 0) { *out = ((unsigned)a << 24) | (unsigned)c; return 1; }
 	}
 
 	struct css_rule *cand[512]; struct css_rule *match[256];
@@ -1397,7 +2533,7 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
 	}
 	for (int i = 0; i < nm; i++)
 		if (extract_bg(match[i]->raw, val, sizeof val)) {
-			int a; int c = color_parse_a(val, &a); if (c >= 0) { *out = ((unsigned)a << 24) | (unsigned)c; return 1; }
+			int a; int c = bg_value_color(val, &a); if (c >= 0) { *out = ((unsigned)a << 24) | (unsigned)c; return 1; }
 		}
 
 	const char *bgc = dom_get_attr(el, "bgcolor");

@@ -489,13 +489,19 @@ static int taskbar_hit(int mx, int my)
 
 static void draw_background(void)
 {
-	/* A smooth vertical gradient: deep indigo at top to slate at the bottom. */
-	for (int y = 0; y < screen_h; y++) {
+	/* A smooth vertical gradient: deep indigo at top to slate at the bottom.
+	 * The gradient is purely a function of y, so confine the scan to the clip
+	 * band's rows — at 1080p an unclipped full-height repaint ran every frame a
+	 * tiny rect (cursor, clock) was damaged, scaling the idle cost with the
+	 * panel height for no visible benefit. */
+	int bx, by, bw, bh;
+	fb_get_clip(&bx, &by, &bw, &bh);
+	for (int y = by; y < by + bh; y++) {
 		int t = y * 255 / screen_h;
 		uint8_t r = (uint8_t)(24 + t * 40 / 255);
 		uint8_t g = (uint8_t)(26 + t * 56 / 255);
 		uint8_t b = (uint8_t)(54 + t * 70 / 255);
-		fb_fill_rect(0, y, screen_w, 1, fb_rgb(r, g, b));
+		fb_fill_rect(bx, y, bw, 1, fb_rgb(r, g, b));
 	}
 }
 
@@ -1526,6 +1532,21 @@ static void damage_add(int x, int y, int w, int h)
 	}
 }
 
+/* Damage the bounding box of two rects as a SINGLE region. A moved window's old
+ * and new rects must clear-and-redraw in one compose+present, or the per-rect
+ * present loop updates the visible buffer in two steps and a drag tears: the old
+ * position shows cleared before the new one is drawn. Coalescing is right here
+ * (one window, old≈new each frame) even though unrelated rects stay separate. */
+static void damage_add_union(int x0, int y0, int w0, int h0,
+                             int x1, int y1, int w1, int h1)
+{
+	int ax0 = x0 < x1 ? x0 : x1;
+	int ay0 = y0 < y1 ? y0 : y1;
+	int ax1 = (x0 + w0) > (x1 + w1) ? (x0 + w0) : (x1 + w1);
+	int ay1 = (y0 + h0) > (y1 + h1) ? (y0 + h0) : (y1 + h1);
+	damage_add(ax0, ay0, ax1 - ax0, ay1 - ay0);
+}
+
 extern const char *g_boot_stage;   /* breadcrumb shown on the panic screen     */
 
 /* Super+V clipboard history: the keyboard IRQ raises `cliphist_req`; the WM
@@ -1696,13 +1717,13 @@ static void wm_thread(void)
 				full = 1;
 			prev_tb_menu = tb_menu_open;
 
-			/* Windows that moved or resized: damage old and new rectangles. */
+			/* Windows that moved or resized: damage old∪new as one region so the
+			 * drag updates atomically (a two-rect present tears, see above). */
 			for (int i = 0; i < nwin; i++)
 				if (wins[i]->x != pf[i].x || wins[i]->y != pf[i].y ||
-				    wins[i]->w != pf[i].w || wins[i]->h != pf[i].h) {
-					damage_add(pf[i].x, pf[i].y, pf[i].w, pf[i].h);
-					damage_add(wins[i]->x, wins[i]->y, wins[i]->w, wins[i]->h);
-				}
+				    wins[i]->w != pf[i].w || wins[i]->h != pf[i].h)
+					damage_add_union(pf[i].x, pf[i].y, pf[i].w, pf[i].h,
+					                 wins[i]->x, wins[i]->y, wins[i]->w, wins[i]->h);
 			/* The cursor moved, changed shape, or is animating (the spinner):
 			 * damage where it was and where it is. */
 			int cur_kind = pick_cursor(mx, my);
@@ -1740,22 +1761,22 @@ static void wm_thread(void)
 			compose(mx, my);
 			fb_present();
 		} else if (ndmg > 0) {
-			/* Coalesce every damaged rectangle into one bounding box, then
-			 * compose the scene and present once. The old loop walked the whole
-			 * window stack and drained the WC buffer per rect — and a drag
-			 * dirties 3-4 rects a frame (old + new window rect + cursor), so
-			 * that was 3-4x the work for one logical update. */
-			int x0 = dmg[0].x, y0 = dmg[0].y;
-			int x1 = dmg[0].x + dmg[0].w, y1 = dmg[0].y + dmg[0].h;
-			for (int k = 1; k < ndmg; k++) {
-				if (dmg[k].x < x0)             x0 = dmg[k].x;
-				if (dmg[k].y < y0)             y0 = dmg[k].y;
-				if (dmg[k].x + dmg[k].w > x1)  x1 = dmg[k].x + dmg[k].w;
-				if (dmg[k].y + dmg[k].h > y1)  y1 = dmg[k].y + dmg[k].h;
+			/* Compose and present each damaged rectangle on its own. Coalescing
+			 * them into a single bounding box (as this once did) is pathological
+			 * when the rects are far apart: a terminal printing in one corner
+			 * while the cursor sits in another would union to nearly the whole
+			 * screen, so every such frame recomposed and copied a full
+			 * 1920x1080 — the dominant cause of high-resolution stutter. Per-rect,
+			 * the compose and the back->front copy both touch only genuinely
+			 * damaged pixels; the dead gap between rects is never paid for.
+			 * Overlapping rects (a slow drag's old/new frame) just recompose the
+			 * shared pixels twice, which is idempotent and far cheaper than the
+			 * gap. fb_present's own sfence drains the WC buffer per rect (<=16). */
+			for (int k = 0; k < ndmg; k++) {
+				fb_set_clip(dmg[k].x, dmg[k].y, dmg[k].w, dmg[k].h);
+				compose(mx, my);
+				fb_present();
 			}
-			fb_set_clip(x0, y0, x1 - x0, y1 - y0);
-			compose(mx, my);
-			fb_present();
 		}
 
 		/* Snapshot for next frame's diff. */

@@ -62,17 +62,40 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
 	b->node     = el;
 	b->kind     = (cs->flex == 1) ? LB_FLEX : LB_BLOCK;
 	b->flex_dir = (unsigned char)(cs->flex_dir == 1 ? 1 : 0);
+	b->flex_wrap = (unsigned char)(cs->flex_wrap == 1 ? 1 : 0);
+	b->justify  = cs->justify;
+	b->align_items = cs->align_items;
+	b->gap_row  = (short)(cs->gap_row > 0 ? cs->gap_row : 0);
+	b->gap_col  = (short)(cs->gap_col > 0 ? cs->gap_col : 0);
 	b->pos      = cs->pos;
 	b->overflow = cs->overflow;
-	b->margin   = edge4(cs->margin);   /* -2 auto folded to 0 here; resolved in stage 3 */
+	b->margin   = edge4(cs->margin);   /* auto (-2) folds to 0; the auto flags drive centring */
+	b->ml_auto  = (unsigned char)(cs->margin[3] == -2);   /* margin[] is T,R,B,L */
+	b->mr_auto  = (unsigned char)(cs->margin[1] == -2);
 	b->border   = edge4(cs->border_w);
 	b->padding  = edge4(cs->padding);
 	b->border_color = cs->border_color >= 0 ? (unsigned)cs->border_color : BG_NONE;
 	b->bg       = cs->bg >= 0 ? (unsigned)cs->bg : BG_NONE;
+	b->bgi      = cs->bgi;
+	b->border_box = (unsigned char)(cs->box_sizing == 1);
+	b->radius   = cs->radius > 0 ? cs->radius : 0;
+	b->sh_color = cs->sh_color >= 0 ? (unsigned)cs->sh_color : BG_NONE;
+	b->sh_dx = cs->sh_dx; b->sh_dy = cs->sh_dy;
+	b->sh_blur = cs->sh_blur; b->sh_spread = cs->sh_spread;
 	b->spec_w   = cs->width;   b->pct_w = cs->pct_w;
 	b->spec_h   = cs->height;  b->pct_h = cs->pct_h;
 	b->max_w    = cs->max_w;   b->max_h = cs->max_h;
+	b->min_w    = cs->min_w;   b->min_h = cs->min_h;
+	b->pct_maxw = cs->pct_maxw; b->pct_maxh = cs->pct_maxh;
+	b->pct_minw = cs->pct_minw; b->pct_minh = cs->pct_minh;
 	b->flex_grow = cs->flex_grow;
+	b->flex_shrink = cs->flex_shrink;
+	b->flex_basis = cs->flex_basis; b->pct_basis = cs->pct_basis;
+	b->off_t = cs->top; b->off_r = cs->right; b->off_b = cs->bottom; b->off_l = cs->left;
+	b->opacity = cs->opacity;
+	b->outline_w = cs->outline_w > 0 ? cs->outline_w : 0;
+	b->outline_color = cs->outline_color >= 0 ? (unsigned)cs->outline_color : BG_NONE;
+	b->z_index = cs->z_index;
 	b->t0 = t0; b->t1 = t0;
 	b->img_idx = -1;
 	b->parent = g_cur;

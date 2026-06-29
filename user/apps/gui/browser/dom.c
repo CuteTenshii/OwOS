@@ -458,6 +458,24 @@ void dom_append_child(struct dom_node *parent, struct dom_node *child)
 	node_append(parent, child);
 }
 
+/* Insert `child` before `ref` among `parent`'s children. A NULL `ref` (or one
+ * not actually a child of `parent`) appends, matching Node.insertBefore. */
+void dom_insert_before(struct dom_node *parent, struct dom_node *child, struct dom_node *ref)
+{
+	if (!parent || !child) return;
+	if (!ref || ref->parent != parent) { dom_append_child(parent, child); return; }
+	dom_mutation_seq++;
+	if (child->parent) dom_remove_child(child->parent, child);
+	child->parent = parent;
+	{
+		struct dom_node *prev = 0, *c = parent->first_child;
+		while (c && c != ref) { prev = c; c = c->next; }
+		child->next = ref;
+		if (prev) prev->next = child; else parent->first_child = child;
+		/* ref is not last (it has child before it now), so last_child is unchanged. */
+	}
+}
+
 void dom_set_attr(struct dom_node *el, const char *name, const char *value)
 {
 	if (!el || el->type != DOM_ELEMENT || !name) return;

@@ -594,14 +594,30 @@ void *realloc(void *ptr, unsigned size)
  * these at -O0) and by libs like minimp3 and the HTTP/2 HPACK tables. */
 void *memcpy(void *d, const void *s, __SIZE_TYPE__ n)
 {
-	unsigned char *a = d; const unsigned char *b = s;
-	while (n--) *a++ = *b++;
+	int d0, d1, d2;
+	__asm__ volatile(
+		"rep ; movsl\n\t"
+		"movl %4, %%ecx\n\t"
+		"andl $3, %%ecx\n\t"
+		"rep ; movsb"
+		: "=&c"(d0), "=&D"(d1), "=&S"(d2)
+		: "0"((unsigned)n >> 2), "g"((unsigned)n), "1"(d), "2"(s)
+		: "memory");
 	return d;
 }
 void *memset(void *d, int c, __SIZE_TYPE__ n)
 {
-	unsigned char *a = d;
-	while (n--) *a++ = (unsigned char)c;
+	int d0, d1;
+	unsigned cc = (unsigned char)c;
+	unsigned pat = cc | (cc << 8) | (cc << 16) | (cc << 24);
+	__asm__ volatile(
+		"rep ; stosl\n\t"
+		"movl %4, %%ecx\n\t"
+		"andl $3, %%ecx\n\t"
+		"rep ; stosb"
+		: "=&c"(d0), "=&D"(d1)
+		: "a"(pat), "0"((unsigned)n >> 2), "g"((unsigned)n), "1"(d)
+		: "memory");
 	return d;
 }
 void *memmove(void *d, const void *s, __SIZE_TYPE__ n)

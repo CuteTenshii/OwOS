@@ -133,7 +133,7 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir,
 	return 0;
 }
 
-#define MAX_ARGS 8
+#define MAX_ARGS 16   /* must be >= SYS_SPAWN_CAP's MAXARGS (syscall.c) */
 #define ARG_TOP  USER_STACK_TOP   /* args live in the top mapped stack page    */
 
 uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
@@ -145,8 +145,10 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 	 * we hold the scratch slot across it. */
 	uint32_t page = ARG_TOP - 4096;
 	uint32_t pa = paging_user_phys(dir, page);
-	if (!pa || argc > MAX_ARGS)
+	if (!pa)                                   /* no stack page (unrecoverable) */
 		return USER_STACK_TOP;
+	if (argc > MAX_ARGS)                        /* clamp; never fault on excess */
+		argc = MAX_ARGS;
 
 	uint32_t fl = irq_save();
 	uint8_t *fp = paging_scratch_map(0, pa);
@@ -154,15 +156,16 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 	uint32_t sp = ARG_TOP;
 
 	for (int i = 0; i < argc; i++) {           /* copy the strings            */
-		int len = strlen(argv[i]) + 1;
-		sp -= (uint32_t)len;
-		if (sp < page) {                       /* args too big; bail safely   */
-			paging_scratch_unmap(0);
-			irq_restore(fl);
-			return USER_STACK_TOP;
+		uint32_t len = (uint32_t)strlen(argv[i]) + 1;
+		/* Out of room in the arg page: keep the args that fit (argv[0..i)) and
+		 * stop, rather than returning an unmapped esp the program would fault on. */
+		if (sp - len < page) {
+			argc = i;
+			break;
 		}
-		for (int k = 0; k < len; k++)
-			fp[sp - page + (uint32_t)k] = (uint8_t)argv[i][k];
+		sp -= len;
+		for (uint32_t k = 0; k < len; k++)
+			fp[sp - page + k] = (uint8_t)argv[i][k];
 		uargv[i] = sp;
 	}
 	sp &= ~3u;

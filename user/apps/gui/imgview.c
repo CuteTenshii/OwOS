@@ -17,6 +17,7 @@
 #include "owos.h"
 #include "gfx.h"
 #include "upng.h"
+#include "webp.h"
 
 /* ---- layout --------------------------------------------------------------- */
 #define MENU_H    GUI_BAR_H        /* top menu bar                              */
@@ -34,6 +35,7 @@ static int  wid;                   /* window id                                 
 static char curpath[256];          /* path of the image currently shown         */
 static unsigned iw, ih;            /* its pixel dimensions                      */
 static int  load_ok;               /* a valid image is loaded                   */
+static int  is_webp;               /* the loaded image is WebP, not PNG         */
 
 static struct upng_meta meta;      /* probed metadata for curpath               */
 static int  meta_valid;            /* meta + the props list match curpath       */
@@ -109,6 +111,42 @@ static int fr_get(void *c)
 		f->off += (unsigned)n; f->len = (unsigned)n; f->pos = 0;
 	}
 	return fr_buffer[f->pos++];
+}
+
+/* Read a whole file into a fresh malloc'd buffer (WebP is not a streaming format,
+ * so the decoder needs it all at once). NULL on any error; *len set on success. */
+static unsigned char *read_whole(const char *path, int *len)
+{
+	struct statinfo st;
+	if (stat(path, &st) != 0 || st.size == 0) return 0;
+	unsigned char *buf = malloc(st.size);
+	if (!buf) return 0;
+	unsigned off = 0;
+	while (off < st.size) {
+		int n = readfile_at(path, off, buf + off, st.size - off);
+		if (n <= 0) break;
+		off += (unsigned)n;
+	}
+	if (off != st.size) { free(buf); return 0; }
+	*len = (int)st.size;
+	return buf;
+}
+
+/* Probe dimensions + format from a file: a RIFF/WEBP header routes to the WebP
+ * reader, anything else to the streaming PNG reader. Returns 0 on success. */
+static int probe_image(const char *path, unsigned *w, unsigned *h, int *webp)
+{
+	unsigned char hdr[64];
+	int n = readfile_at(path, 0, hdr, sizeof hdr);
+	if (n >= 12 && hdr[0] == 'R' && hdr[1] == 'I' && hdr[2] == 'F' && hdr[3] == 'F' &&
+	    hdr[8] == 'W' && hdr[9] == 'E' && hdr[10] == 'B' && hdr[11] == 'P') {
+		*webp = 1;
+		return webp_dimensions(hdr, n, w, h) == WEBP_OK ? 0 : -1;
+	}
+	*webp = 0;
+	struct freader fr;
+	fr_init(&fr, path);
+	return (upng_dimensions(fr_get, &fr, w, h) == 0 && *w && *h) ? 0 : -1;
 }
 
 /* ---- scaled blit into the backing canvas ---------------------------------- */
@@ -211,9 +249,25 @@ static void decode_to_canvas(void)
 	blit_canvas();
 	win_present(wid);
 
-	struct freader fr;
-	fr_init(&fr, curpath);
-	upng_decode(fr_get, &fr, v_row, &v, 0, 0);
+	if (is_webp) {
+		/* WebP needs the whole file in memory; decode it, then push each row
+		 * through the same scaled-blit callback the PNG path uses. */
+		int flen = 0;
+		unsigned char *file = read_whole(curpath, &flen);
+		if (file) {
+			unsigned char *rgba; unsigned dw = 0, dh = 0;
+			if (webp_decode(file, flen, &rgba, &dw, &dh) == WEBP_OK) {
+				for (unsigned y = 0; y < dh; y++)
+					v_row(&v, y, rgba + (unsigned long)y * dw * 4u, dw);
+				free(rgba);
+			}
+			free(file);
+		}
+	} else {
+		struct freader fr;
+		fr_init(&fr, curpath);
+		upng_decode(fr_get, &fr, v_row, &v, 0, 0);
+	}
 }
 
 /* ---- properties list ------------------------------------------------------ */
@@ -248,6 +302,46 @@ static const char *color_name(unsigned color)
 	}
 }
 
+/* Format curpath's size, human-readable, into b. */
+static void fmt_size(char *b)
+{
+	struct statinfo st;
+	unsigned sz = (stat(curpath, &st) == 0) ? st.size : 0;
+	char *p = b;
+	if (sz < 1024) { p = au(p, sz); as(p, " B"); }
+	else if (sz < 1024u * 1024u) {
+		unsigned t = sz * 10 / 1024;
+		p = au(p, t / 10); *p++ = '.'; p = au(p, t % 10); as(p, " KB");
+	} else {
+		unsigned t = sz * 10 / (1024u * 1024u);
+		p = au(p, t / 10); *p++ = '.'; p = au(p, t % 10); as(p, " MB");
+	}
+}
+
+/* Properties for a WebP image (probed from its container header). */
+static void build_props_webp(void)
+{
+	char b[UPNG_VAL_MAX], *p;
+	n_props = 0;
+	padd("File", basename_of(curpath));
+	if (!load_ok) { padd("Status", "not a readable image"); return; }
+	fmt_size(b); padd("Size", b);
+	p = b; p = au(p, iw); p = as(p, " x "); p = au(p, ih); as(p, " px");
+	padd("Dimensions", b);
+
+	unsigned char hdr[64];
+	int n = readfile_at(curpath, 0, hdr, sizeof hdr);
+	struct webp_info info;
+	if (n > 0 && webp_probe(hdr, n, &info) == WEBP_OK) {
+		padd("Format", info.lossless ? "WebP lossless (VP8L)" : "WebP lossy (VP8)");
+		padd("Transparency", info.has_alpha ? "Yes (alpha channel)" : "No");
+		padd("Container", info.extended ? "Extended (VP8X)" : "Simple");
+		if (info.animation) padd("Animation", "Yes");
+	} else {
+		padd("Format", "WebP");
+	}
+}
+
 /* Rebuild the key/value list from `meta` (assumed valid) + a stat() of curpath. */
 static void build_props(void)
 {
@@ -258,20 +352,7 @@ static void build_props(void)
 
 	if (!load_ok) { padd("Status", "not a readable PNG"); return; }
 
-	{   /* file size, human-readable */
-		struct statinfo st;
-		unsigned sz = (stat(curpath, &st) == 0) ? st.size : 0;
-		p = b;
-		if (sz < 1024) { p = au(p, sz); p = as(p, " B"); }
-		else if (sz < 1024u * 1024u) {
-			unsigned t = sz * 10 / 1024;
-			p = au(p, t / 10); *p++ = '.'; p = au(p, t % 10); as(p, " KB");
-		} else {
-			unsigned t = sz * 10 / (1024u * 1024u);
-			p = au(p, t / 10); *p++ = '.'; p = au(p, t % 10); as(p, " MB");
-		}
-		padd("Size", b);
-	}
+	fmt_size(b); padd("Size", b);
 
 	p = b; p = au(p, meta.w); p = as(p, " x "); p = au(p, meta.h); as(p, " px");
 	padd("Dimensions", b);
@@ -343,6 +424,11 @@ static void build_props(void)
 static void ensure_meta(void)
 {
 	if (meta_valid) return;
+	if (is_webp) {
+		build_props_webp();
+		meta_valid = 1;
+		return;
+	}
 	if (load_ok) {
 		struct freader fr;
 		fr_init(&fr, curpath);
@@ -356,19 +442,20 @@ static void ensure_meta(void)
 
 static void load(const char *path)
 {
-	struct freader fr;
-	fr_init(&fr, path);
 	unsigned w = 0, h = 0;
-	if (upng_dimensions(fr_get, &fr, &w, &h) != 0 || w == 0 || h == 0) {
+	int webp = 0;
+	if (probe_image(path, &w, &h, &webp) != 0 || w == 0 || h == 0) {
 		load_ok = 0;
+		is_webp = 0;
 		meta_valid = 0;
 		scopy(curpath, path, sizeof curpath);     /* set, so the UI says which file */
 		decode_to_canvas();
-		set_status("not a readable PNG");
+		set_status("not a readable image");
 		win_settitle(wid, "imgview");
 		return;
 	}
 	scopy(curpath, path, sizeof curpath);
+	is_webp = webp;
 	iw = w; ih = h;
 	load_ok = 1;
 	meta_valid = 0;
@@ -521,7 +608,8 @@ static void render(void)
 		p = as(line, load_ok ? basename_of(curpath) : "[no image]");
 		if (load_ok) {
 			p = as(p, "   "); p = au(p, iw); p = as(p, "x"); p = au(p, ih);
-			p = as(p, "  "); p = as(p, color_name(meta_valid ? meta.color : 2));
+			p = as(p, "  ");
+			p = as(p, is_webp ? "WebP" : color_name(meta_valid ? meta.color : 2));
 		}
 		status_set(&bar, line);
 		status_draw(&bar, 0, sy, W, 0x9fb0c4, 0x161d28);
@@ -589,10 +677,9 @@ int main(int argc, char **argv)
 	const char *arg = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : 0;
 	unsigned w0 = CW_MIN, h0 = CH_MIN;
 	if (arg) {
-		struct freader fr;
-		fr_init(&fr, arg);
 		unsigned w = 0, h = 0;
-		if (upng_dimensions(fr_get, &fr, &w, &h) == 0 && w && h) {
+		int webp = 0;
+		if (probe_image(arg, &w, &h, &webp) == 0 && w && h) {
 			w0 = w; h0 = h;        /* a readable image: fit the window to it       */
 		}
 	}

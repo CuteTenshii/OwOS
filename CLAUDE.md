@@ -1,24 +1,34 @@
 # CLAUDE.md
 
-OwOS is a 32-bit x86 Unix-like hobby kernel written from scratch in C + GAS
-assembly, booted by QEMU's Multiboot loader. README.md has the feature list and
+OwOS is an x86 Unix-like hobby kernel written from scratch in C + GAS
+assembly, booted by QEMU's Multiboot loader. One source tree builds both 32-bit
+(`i386`, the default and primary target) and 64-bit (`make ARCH=x86_64`); these
+notes assume the 32-bit build unless stated. README.md has the feature list and
 per-file layout; this file covers only what spans multiple files or isn't
 obvious from one read.
 
 **Source layout:** drivers live under `drivers/<type>/`
 (`storage net audio usb input video acpi bus`); the core kernel, filesystems
-(`fs/fat/hfs/ext/iso9660`), block dispatch (`blk`), and the network stack
-(`net/tcp/tls/crypto`) stay in `kernel/`.
+(`fat/hfs/ext/iso9660/ntfs`), block dispatch (`blk`), and the network stack
+(`net/tcp/tls/crypto`) stay in `kernel/`. User space is split:
+`user/lib/<name>/` holds reusable libraries (libc, gfx, js, media, webp, json,
+notify, curl, crypto, sqlite, …); programs live in `user/apps/gui/` (windowed)
+and `user/apps/cli/` (terminal tools), each embedded in the kernel as a blob.
 
-- Includes are **flat** (`#include "fb.h"`, never a path): the Makefile puts
-  `kernel/` and every `drivers/` subdir on `-I` (`DRVDIRS`).
+- Includes are **flat** (`#include "fb.h"`, never a path): the build puts
+  `kernel/` and every `drivers/` subdir on `-I` (`DRVDIRS`, in toolchain.mk).
 - Moving a driver between folders is an OBJS path change only — no include edits.
 - **Header basenames must stay unique.**
+- **The build is split by concern:** the root `Makefile` `include`s
+  `toolchain.mk` (flags + arch select), `user/lib/build.mk`, `user/apps/build.mk`,
+  `kernel/build.mk` (OBJS + link), and `run.mk` (QEMU targets) — one
+  non-recursive graph, all paths root-relative.
 
 ## Build & run
 
 ```sh
-make            # build owos.bin (host gcc -m32, no cross-compiler)
+make            # build owos.bin (32-bit, host gcc -m32, no cross-compiler)
+make ARCH=x86_64    # build owos-x86_64.bin (64-bit long mode)
 make run        # QEMU window + COM1 mirrored to the terminal
 make debug      # headless: console on the terminal via COM1
 make iso        # wrap in GRUB -> hybrid BIOS+UEFI owos.iso (real VMs/HW)
@@ -27,10 +37,14 @@ make run-iso-uefi   # boot the same ISO through UEFI (OVMF)
 make usb USB=/dev/sdX   # flash owos.iso to a removable stick (guarded; erases it)
 make clean      # keeps disk.img;  make distclean  also wipes it
 make run NIC=e1000  # attach the Intel 82540EM instead of the default RTL8139
+make run SMP=8      # expose 8 cores to the guest (default 4; SMP=1 = uniprocessor)
+make run ACCEL=tcg  # force pure emulation (default uses KVM/HVF, ~10-50x faster)
 ```
 
-- No cross-compiler: freestanding 32-bit ELF (`gcc -m32 -ffreestanding
-  -nostdlib`) linked at 1 MiB by `linker.ld`, loaded via QEMU `-kernel`.
+- No cross-compiler on Linux: freestanding ELF (`gcc -m32`/`-m64
+  -ffreestanding -nostdlib`) linked at 1 MiB by `linker.ld`/`linker64.ld`, loaded
+  via QEMU `-kernel`. **User programs are always 32-bit** even under an x64 kernel
+  (the kernel embeds each as an opaque blob), so user code uses the i686 toolchain.
 - `make run`/`debug` auto-create every disk a storage driver exercises (IDE
   `disk.img`, AHCI, NVMe, USB stick, SD card, ISO 9660 `cd.iso` on ATAPI CD),
   a SLIRP NIC, and a USB tablet; `make run` also adds SB16 + PC speaker.
@@ -61,8 +75,9 @@ cat -v /tmp/s.log
   (`sendkey a`), a capital is `shift-a`, `.` is `dot`, space is `spc`, `|` is
   `shift-backslash`. Always send those by name.
 - **macOS:** `timeout` is GNU-only — use `gtimeout` (`brew install coreutils`), or
-  run QEMU in the background and `kill` it after a `sleep`. The build needs the
-  `i686-elf-` cross-toolchain (the Makefile auto-selects it on Darwin); see README.
+  run QEMU in the background and `kill` it after a `sleep`. The build needs an
+  ELF cross-toolchain — `i686-elf-` for the default build, `x86_64-elf-` for
+  `ARCH=x86_64` (toolchain.mk auto-selects per ARCH on Darwin); see README.
 - A reboot loop is a triple fault: rerun with `-no-reboot -d int,cpu_reset`.
 - On a fault, idt.c panics (vector, error code, EIP, CR2 for #PF) to COM1 and as
   a heapless framebuffer screen; the error-code present/write/**user** bits say
@@ -111,11 +126,16 @@ These change how you edit; they are the rules most likely to be violated.
 `kernel_main`, which brings subsystems up in dependency order:
 
 serial → vga → gdt → idt → irq (PIC remap) → pmm → **paging** → heap → smbios →
-pci → **fb** → net (NIC dispatch + IPv4) → ahci/nvme probes → **blk (pick owofs
-disk)** → fs → syscalls (+install user programs) → timer → keyboard → sb16 →
-scheduler + workers → services → **wm** → screenshot worker → `sti` → **shell**.
+pci → **smp_init (MADT CPU discovery)** → **fb** → net (NIC dispatch + IPv4) →
+ahci/nvme probes → **blk (pick owofs disk)** → fs → syscalls (+install user
+programs) → timer → keyboard → sb16/hda → scheduler + workers → services →
+**wm** → screenshot worker → **smp_start_aps** → `sti` → **shell**.
 
 - **IDT before any IRQ.**
+- **SMP (smp.c + smp_ap.S):** `smp_init` discovers cores via the ACPI MADT early;
+  `smp_start_aps` wakes the application processors just before `sti` — they
+  currently **park** (boot stays effectively uniprocessor; per-core scheduling is
+  the remaining work). `make run SMP=N` sets the core count QEMU exposes.
 - **PIC remapped (master→32, slave→40) before `sti`**, or the timer IRQ lands on
   a CPU exception vector.
 - **`blk_init` after ahci/nvme** (needs their `_present()`) **and before fs_init**.
@@ -212,15 +232,19 @@ took a laptop from 2 fps to smooth:
 
 ## Desktop apps & windowing (apps.c + uwin.c + crash.c + screenshot.c)
 
-- Only **`/bin/term`** opens at boot; everything else launches from the taskbar
-  Start menu (`app_menu[]`). Apps are `/bin` programs spawned detached and reaped
-  by the WM (term/clock/files/editor/browser/imgview); the only kernel-side window
-  is the About box.
-- **The terminal *is* the shell (`user/term.c`)** — own line editing, history,
-  cwd, dispatch; **no kernel-shell bridge.** Commands run three ways: builtins
-  over syscalls; CLI tools (neofetch/curl/lspci/ping/dig/play/torrent) spawned with
-  stdout captured via `spawn_cap` and rendered inline like a pty; any other `/bin`
-  program detached.
+- **`apps_start()` (apps.c) launches three programs at boot:** `clipd` (clipboard
+  server, windowless), `notifyd` (notification server, resident; draws the
+  Notification Center on demand), then `/bin/term`. Everything else launches from
+  the taskbar Start menu (`app_menu[]`: Terminal, Files, Editor, Browser, Media
+  Player, Clock, Calculator, Notifications, Settings, About). Apps are `/bin`
+  programs spawned detached and reaped by the WM; the only kernel-side window is
+  the About box. (imgview is built and installed but reached via Files / browser,
+  not the Start menu.)
+- **The terminal *is* the shell (`user/apps/gui/term.c`)** — own line editing,
+  history, cwd, dispatch; **no kernel-shell bridge.** Commands run three ways:
+  builtins over syscalls; CLI tools (neofetch/curl/lspci/ping/dig/play/torrent)
+  spawned with stdout captured via `spawn_cap` and rendered inline like a pty; any
+  other `/bin` program detached.
 - The kernel `shell.c` survives only as the COM1/text **recovery console** (its
   builtin table still has kernel-only ops like `format`, `mtp`).
 - **GUI apps own a window via uwin.c** (the user-window server): create a window,
@@ -269,7 +293,7 @@ and the only normal entry to a context switch.
 - ABI: `int 0x80`, number in `eax`, args in `ebx/ecx/edx`, return in `eax`. All
   user pointers are bounds-checked against the user window.
 - The net-* calls are a thin connect/send/recv/close handle layer (`net_sock_*`)
-  — the only user-facing network API; `user/curl.c` is the client. `net_connect`'s
+  — the only user-facing network API; `user/apps/cli/curl.c` is the client. `net_connect`'s
   `proto` arg selects TCP/TLS/UDP/raw-ICMP, so ping/dig/DNS are user-space code
   over sockets, not bespoke syscalls.
 - **Kernel state is exposed through two synthetic filesystems** (the Unix way),
@@ -300,11 +324,14 @@ and the only normal entry to a context switch.
 - Each task carries a **cwd** (`task_t.cwd`); a parent sets a child's via
   `sched_set_cwd`, fork/`spawn_cap` inherit it, `SYS_CHDIR` sets the caller's, and
   path syscalls `join_cwd` relative names before hitting owofs.
-- User programs are freestanding ELF32 (`user/*.c`) linked at `0x200000`. Build:
-  compile → `user/NAME.elf` → objcopy into `kernel/NAME_blob.o` → linked in.
-  **Adding a program = two edits** (the `*_blob.o` in Makefile OBJS + the install
-  block in `kernel_main`); no shell wiring — `run()`'s final `else` spawns any
-  non-builtin as a `/bin` program.
+- User programs are freestanding ELF32 (`user/apps/{gui,cli}/NAME.c`) linked at
+  `0x40000000` (`user/user.ld`). Build: compile → `user/apps/.../NAME.elf` →
+  objcopy renames the blob symbols to `_binary_app_NAME_{start,end}` →
+  `kernel/NAME_blob.o` → linked in. **Adding a program = two edits** (`NAME_blob.o`
+  in `kernel/build.mk` OBJS + an `INSTALL_APP(NAME)` line in `kernel_main`); a
+  generic `%.elf` rule covers plain apps, so a *third* edit (a link rule in
+  `user/apps/build.mk`) is needed only if the program pulls in extra libs. No
+  shell wiring — `run()`'s final `else` spawns any non-builtin as a `/bin` program.
 - **Install/refresh:** owofs (`disk.img`) persists installed `/bin` programs.
   `install_blob()` reinstalls when absent **or its on-disk size differs from the
   built-in blob**, so a rebuild replaces the persisted binary next boot — no
@@ -349,9 +376,9 @@ Per-driver pointers (internals live in the source):
 ## Network stack (nic.c → net.c → tcp.c → tls.c, with crypto.c)
 
 - Kernel-side stack; `ping`/`dig` are `/bin` tools over `net_sock_*`. The one
-  user-space client is **curl** (`user/curl.c`): HTTP/1.1, HTTP/2 (`--http2`,
-  `user/lib/curl/h2.c`), HTTP/3 (`--http3`, `user/lib/curl/{quic,h3}.c`), all in
-  user space (no Berkeley sockets; doesn't advertise gzip).
+  user-space client is **curl** (`user/apps/cli/curl.c`): HTTP/1.1, HTTP/2
+  (`--http2`, `user/lib/curl/h2.c`), HTTP/3 (`--http3`, `user/lib/curl/{quic,h3}.c`),
+  all in user space (no Berkeley sockets; doesn't advertise gzip).
 - **nic.c — link-layer dispatch.** Each driver exports `struct nic_ops`;
   `nic_init` probes `{ igb, e1000, rtl8139 }` and keeps the first present.
   `nic_set()` installs a hot-plugged driver at runtime.
@@ -410,10 +437,35 @@ Headless daemons in a fixed enum-indexed registry (`on_start`/`on_stop`/`tick`).
   file format; in-memory model (whole-file `sql_open`/`sql_save`). Scope: table
   b-trees + NULL/int/float/TEXT/BLOB; **no index b-trees, overflow pages, or WAL**
   (one record must fit a 4 KiB page). First user is the browser cookie+HSTS jar
-  (`user/browser/jar.c`, `/home/root/cookies.db`); SQL stays out of fetch.c.
+  (`user/apps/gui/browser/jar.c`, `/home/root/cookies.db`); SQL stays out of fetch.c.
 - **HTTP headers (user/lib/curl/headers.c)** — response headers parsed once into a
   k/v object (case-insensitive, repeats kept in order), shared by curl + browser.
   The browser also honors `X-Content-Type-Options: nosniff`.
+- **Notifications (user/lib/notify + notifyd + notify-send)** — `user/lib/notify`
+  is the client lib; `notifyd` (`user/apps/gui/notifyd.c`) is a resident daemon
+  listening on the `notify` IPC port, keeping history and drawing the Notification
+  Center; `notify-send` (`user/apps/cli/notifysend.c`) is the shell client. Wire
+  protocol is length-prefixed strings; a button can run a shell command on click.
+  A second `notifyd` launch just asks the resident one to open its window.
+- **Media (user/lib/media + player + browser `<audio>`/`<video>`)** — two layers:
+  a decoder (WAV/MPEG → 48 kHz/S16/stereo) + a **user-space software mixer** that
+  merges concurrent sources on a background thread, because the kernel exposes a
+  single exclusive PCM stream. `user/apps/gui/player.c` is the standalone player;
+  the browser wires it through `bmedia.h`. Files decode incrementally; video
+  elements are accepted but not decoded (black frame). Decode faults are
+  user-space crashes only.
+- **WebP (user/lib/webp + webp CLI)** — from-scratch VP8L **lossless** codec
+  (encode + decode), in-memory; wired into imgview, the browser, and the `webp`
+  CLI (info/encode-from-PNG/verify). Lossy VP8 and animation are rejected
+  (`WEBP_EUNSUP`).
+- **JSON (user/lib/json + json CLI)** — RFC 8259 parser/encoder building a
+  malloc'd value tree (numbers are IEEE-754 doubles); `json` CLI
+  validates/pretty-prints/minifies. Pure libc + libmath, no engine coupling.
+- **CORS (user/apps/gui/browser/cors.{c,h})** — pure stateless policy logic (origin
+  extraction, same-origin/same-site, preflight validation) for the browser's two
+  guards: CORS (cross-origin read) + CORP (cross-origin sub-resource embedding);
+  `resource.c` orchestrates fetch/XHR around it. Registrable-domain check
+  approximates the public suffix list with the last two dotted labels.
 - **Brotli (user/lib/brotli)** — from-scratch RFC 7932 decoder + encoder, user
   space, whole-buffer, for the HTTP `br` content-coding; verified vs the system
   `brotli` CLI. The browser's HTTP/1.1 path advertises and decodes `br`.

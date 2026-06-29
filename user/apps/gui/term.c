@@ -566,7 +566,7 @@ static void bi_grep(int argc, char **argv)
 static int is_cli(const char *name)
 {
 	static const char *const cli[] = {
-		"neofetch", "curl", "lspci", "ping", "dig", "torrent",
+		"neofetch", "curl", "lspci", "ping", "dig", "torrent", "notify-send",
 	};
 	for (unsigned i = 0; i < sizeof cli / sizeof cli[0]; i++)
 		if (!strcmp(name, cli[i])) return 1;

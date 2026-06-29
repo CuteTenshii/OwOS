@@ -25,20 +25,45 @@ user/apps/gui/cliphist.elf: user/apps/gui/cliphist.o $(CLIPBOARD) $(MIME) $(ULIB
 
 # The browser is a multi-file user program (user/apps/gui/browser/*.c), linked
 # flat: streaming inflate (gzip/deflate), the PNG decoder, HTTP/2, the SQLite jar.
-BROWSER_OBJS := user/apps/gui/browser/main.o user/apps/gui/browser/fetch.o user/apps/gui/browser/resource.o user/apps/gui/browser/html.o user/apps/gui/browser/dom.o user/apps/gui/browser/css.o user/apps/gui/browser/color.o user/apps/gui/browser/layout.o user/apps/gui/browser/svg.o user/apps/gui/browser/jar.o user/apps/gui/browser/js.o user/apps/gui/browser/devtools.o user/apps/gui/browser/csp.o
-user/apps/gui/browser.elf: $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(CLIPBOARD) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(CLIPBOARD) $(GUILIB) $(ULIB) $(LIBGCC)
+BROWSER_OBJS := user/apps/gui/browser/main.o user/apps/gui/browser/fetch.o user/apps/gui/browser/resource.o user/apps/gui/browser/html.o user/apps/gui/browser/dom.o user/apps/gui/browser/css.o user/apps/gui/browser/color.o user/apps/gui/browser/layout.o user/apps/gui/browser/svg.o user/apps/gui/browser/jar.o user/apps/gui/browser/js.o user/apps/gui/browser/devtools.o user/apps/gui/browser/csp.o user/apps/gui/browser/cors.o user/apps/gui/browser/media.o
+user/apps/gui/browser.elf: $(BROWSER_OBJS) $(UPNG) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(CLIPBOARD) $(ULIB) $(GUILIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(CLIPBOARD) $(GUILIB) $(ULIB) $(LIBGCC)
 
-# the image viewer links the streaming PNG decoder; player links the MPEG decoder.
-user/apps/gui/imgview.elf: user/apps/gui/imgview.o $(UPNG) $(INFLATE) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/imgview.o $(UPNG) $(INFLATE) $(GUILIB) $(ULIB) $(LIBGCC)
-user/apps/gui/player.elf: user/apps/gui/player.o $(MP3) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/player.o $(MP3) $(GUILIB) $(ULIB) $(LIBGCC)
+# notifyd (the notification daemon) decodes notification thumbnails with the
+# streaming PNG decoder; it serves the "notify" port and draws the Notification
+# Center in its own window.
+user/apps/gui/notifyd.elf: user/apps/gui/notifyd.o $(UPNG) $(INFLATE) $(ULIB) $(GUILIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/notifyd.o $(UPNG) $(INFLATE) $(GUILIB) $(ULIB) $(LIBGCC)
+
+# the calculator links the math lib for dtoa/strtod (double <-> shortest-decimal).
+user/apps/gui/calc.elf: user/apps/gui/calc.o $(MATH) $(ULIB) $(GUILIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/calc.o $(MATH) $(GUILIB) $(ULIB) $(LIBGCC)
+
+# the image viewer links the streaming PNG decoder + the WebP codec; player links
+# the media engine (decoder + mixer, which bundles the MPEG decoder).
+user/apps/gui/imgview.elf: user/apps/gui/imgview.o $(UPNG) $(WEBP) $(INFLATE) $(ULIB) $(GUILIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/imgview.o $(UPNG) $(WEBP) $(INFLATE) $(GUILIB) $(ULIB) $(LIBGCC)
+user/apps/gui/player.elf: user/apps/gui/player.o $(MEDIA) $(ULIB) $(GUILIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/player.o $(MEDIA) $(GUILIB) $(ULIB) $(LIBGCC)
 
 # --- CLI apps that pull in extra libs ---------------------------------------
 # clipd (clipboard server) links the clipboard client lib + the MIME helper.
 user/apps/cli/clipd.elf: user/apps/cli/clipd.o $(CLIPBOARD) $(MIME) $(ULIB) user/user.ld
 	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/clipd.o $(CLIPBOARD) $(MIME) $(ULIB) $(LIBGCC)
+
+# notify-send: the client CLI links the notifyd client lib.
+user/apps/cli/notifysend.elf: user/apps/cli/notifysend.o $(NOTIFY) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/notifysend.o $(NOTIFY) $(ULIB) $(LIBGCC)
+
+# webp: the WebP codec CLI (info / encode a PNG to WebP / verify a lossless round
+# trip). Links the WebP codec + the streaming PNG decoder it converts from.
+user/apps/cli/webp.elf: user/apps/cli/webp.o $(WEBP) $(UPNG) $(INFLATE) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/webp.o $(WEBP) $(UPNG) $(INFLATE) $(ULIB) $(LIBGCC)
+
+# json: the JSON CLI (validate / pretty-print / minify). Links the JSON value-tree
+# lib + the math lib it needs for dtoa/strtod.
+user/apps/cli/json.elf: user/apps/cli/json.o $(JSON) $(MATH) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/json.o $(JSON) $(MATH) $(ULIB) $(LIBGCC)
 
 # curl: libcurl (HTTP/1.1 + HTTP/2 + HTTP/3 over QUIC) + URL + crypto (AES-GCM/x25519).
 user/apps/cli/curl.elf: user/apps/cli/curl.o $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(CRYPTO) $(BROTLI) $(ULIB) user/user.ld

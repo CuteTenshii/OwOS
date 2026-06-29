@@ -1,14 +1,6 @@
-/* url.c — shared URL parsing and resolution (see url.h). Self-contained string
- * helpers, so it links into any user program without dragging in other deps. */
+/* url.c — shared URL parsing and resolution (see url.h). */
 #include "url.h"
-
-static char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
-static int starts_ci(const char *s, const char *pre)
-{
-	while (*pre) { if (lower(*s) != lower(*pre)) return 0; s++; pre++; }
-	return 1;
-}
+#include "owos.h"   /* lower/starts_ci case-insensitive helpers */
 
 static void sapp(char *d, int *n, int cap, const char *s)
 { while (*s && *n < cap - 1) d[(*n)++] = *s++; d[*n] = '\0'; }
@@ -51,6 +43,38 @@ int parse_url(const char *url, struct purl *u)
 	return 1;
 }
 
+/* Collapse "." and ".." segments in the absolute path `in` (RFC 3986 §5.2.4).
+ * `in` must begin with '/'; a query/fragment (from the first '?' or '#') is
+ * copied through untouched. Each kept segment carries its trailing '/', so ".."
+ * pops back to — but never above — the leading slash. */
+static void normalize_path(const char *in, char *out, int cap)
+{
+	int plen = 0;
+	while (in[plen] && in[plen] != '?' && in[plen] != '#') plen++;
+
+	int n = 0;
+	if (cap > 1) out[n++] = '/';
+	const char *p = in;
+	if (*p == '/') p++;
+	while (p < in + plen) {
+		const char *segend = p;
+		while (segend < in + plen && *segend != '/') segend++;
+		int seglen = (int)(segend - p);
+		if (seglen == 1 && p[0] == '.') {
+			/* current dir — drop */
+		} else if (seglen == 2 && p[0] == '.' && p[1] == '.') {
+			if (n > 1) { n--; while (n > 0 && out[n - 1] != '/') n--; }
+		} else {
+			for (int i = 0; i < seglen && n < cap - 1; i++) out[n++] = p[i];
+			if (segend < in + plen && n < cap - 1) out[n++] = '/';
+		}
+		p = (segend < in + plen) ? segend + 1 : segend;
+	}
+	out[n] = '\0';
+	for (const char *t = in + plen; *t && n < cap - 1; ) out[n++] = *t++;
+	out[n] = '\0';
+}
+
 void resolve_url(const char *base, const char *loc, char *out, int cap)
 {
 	int n = 0;
@@ -74,20 +98,22 @@ void resolve_url(const char *base, const char *loc, char *out, int cap)
 	if (loc[0] == '/' && loc[1] == '/') {            /* scheme-relative "//host" */
 		sapp(out, &n, cap, scheme);
 		sapp(out, &n, cap, loc + 2);
-	} else if (loc[0] == '/') {                      /* absolute path            */
+	} else {                                         /* abs path or base-relative */
+		char raw[URL_PATH_MAX]; int r = 0;
+		if (loc[0] == '/') {                         /* absolute path */
+			sapp(raw, &r, sizeof raw, loc);
+		} else {                                     /* relative to base's dir */
+			int slash = 0;
+			for (int i = 0; b.path[i]; i++) if (b.path[i] == '/') slash = i;
+			for (int i = 0; i <= slash && r < (int)sizeof raw - 1; i++)
+				raw[r++] = b.path[i];
+			raw[r] = '\0';
+			sapp(raw, &r, sizeof raw, loc);
+		}
+		char norm[URL_PATH_MAX];
+		normalize_path(raw, norm, sizeof norm);
 		sapp(out, &n, cap, scheme);
 		sapp(out, &n, cap, hostport);
-		sapp(out, &n, cap, loc);
-	} else {                                         /* relative to base's dir   */
-		sapp(out, &n, cap, scheme);
-		sapp(out, &n, cap, hostport);
-		int slash = 0;
-		for (int i = 0; b.path[i]; i++) if (b.path[i] == '/') slash = i;
-		char dir[URL_PATH_MAX]; int d = 0;
-		for (int i = 0; i <= slash && d < (int)sizeof(dir) - 1; i++)
-			dir[d++] = b.path[i];
-		dir[d] = '\0';
-		sapp(out, &n, cap, dir);
-		sapp(out, &n, cap, loc);
+		sapp(out, &n, cap, norm);
 	}
 }

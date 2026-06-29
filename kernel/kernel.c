@@ -388,12 +388,15 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			fs_create("/etc/group", "root:0:\n", 8);
 		users_init();
 		INSTALL_APP(edit);     INSTALL_APP(curl);     INSTALL_APP(editor);
-		INSTALL_APP(about);    INSTALL_APP(clock);    INSTALL_APP(files);
+		INSTALL_APP(about);    INSTALL_APP(clock);    INSTALL_APP(calc);
+		INSTALL_APP(files);
 		INSTALL_APP(browser);  INSTALL_APP(imgview);  INSTALL_APP(term);
 		INSTALL_APP(neofetch); INSTALL_APP(lspci);    INSTALL_APP(ping);
 		INSTALL_APP(dig);      INSTALL_APP(torrent);  INSTALL_APP(player);
 		INSTALL_APP(settings); INSTALL_APP(ssh);      INSTALL_APP(clipd);
-		INSTALL_APP(cliphist);
+		INSTALL_APP(cliphist); INSTALL_APP(notifyd);  INSTALL_APP(webp);
+		INSTALL_APP(json);
+		INSTALL_FILE("/bin/notify-send", _binary_app_notifysend);
 	}
 	con_write("usermode: ready ('run curl <url>').\n");
 

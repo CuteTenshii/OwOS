@@ -15,7 +15,8 @@ This list is not filtered, there's no priority.
 - [ ] NTFS support
 - [x] Media player app.
 - [x] GUI: buttons, progress bar.
-- [ ] JPEG, WebP, MP4 encoder/decoder
+- [x] WebP (lossless VP8L) encoder/decoder (user/lib/webp; wired into imgview, browser, `webp` CLI)
+- [ ] JPEG, MP4 encoder/decoder; WebP lossy (VP8) decode
 - [ ] Dialog box GUI: sub- [ ]window linked to its parent.
 - [ ] "Properties" dialog for files and folders in Files app (accessible with right- [ ]click item)
 - [ ] Browser: view source, developer tools (page structure, Network reqs)

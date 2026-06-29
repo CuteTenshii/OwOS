@@ -684,8 +684,12 @@ js_value js_mk_symbol(js_ctx *ctx, const char *desc) {
     ks[2 + n] = 0;
     o->host = ks;
     js_def(o, "@desc", desc ? js_mk_cstring(ctx, desc) : js_undef(), 0);
-    gc_pop_scope();
     v.type = JV_SYMBOL; v.u.obj = o;
+    /* Record it so Object.getOwnPropertySymbols can map a property's internal
+     * key string back to its Symbol. (The registry is created in js_ctx_new
+     * just before the first symbol; guard for the brief window before that.) */
+    if (ctx->sym_registry) js_array_push(ctx, ctx->sym_registry, v);
+    gc_pop_scope();
     return v;
 }
 

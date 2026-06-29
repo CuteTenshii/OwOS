@@ -50,11 +50,14 @@ int apps_open_cliphist(void)
 static void launch_editor(void)  { launch_bin("editor"); }
 static void launch_files(void)   { launch_bin("files"); }
 static void launch_clock(void)   { launch_bin("clock"); }
+static void launch_calc(void)    { launch_bin("calc"); }
 static void launch_about(void)   { launch_bin("about"); }
 static void launch_browser(void) { launch_bin("browser"); }
 static void launch_term(void)    { launch_bin("term"); }
 static void launch_player(void)  { launch_bin("player"); }
 static void launch_settings(void){ launch_bin("settings"); }
+/* A second notifyd just asks the resident one to open its window (see notifyd.c). */
+static void launch_notifications(void){ launch_bin("notifyd"); }
 
 /* The Start menu. Every entry spawns a program from /bin. */
 static const struct { const char *name; void (*launch)(void); } app_menu[] = {
@@ -64,6 +67,8 @@ static const struct { const char *name; void (*launch)(void); } app_menu[] = {
 	{ "Browser", launch_browser   },
 	{ "Media Player", launch_player },
 	{ "Clock",   launch_clock     },
+	{ "Calculator", launch_calc   },
+	{ "Notifications", launch_notifications },
 	{ "Settings", launch_settings },
 	{ "About",   launch_about     },
 };
@@ -90,6 +95,10 @@ void apps_start(void)
 	 * "clipboard" IPC port. Start it before the terminal so it's registered by
 	 * the time any app copies or pastes. */
 	launch_bin("clipd");
+
+	/* notifyd is the notification server: a resident daemon that owns the
+	 * "notify" port, keeps the history, and draws the popups in its own window. */
+	launch_bin("notifyd");
 
 	/* The terminal is now the /bin/term (a real user-space shell), opened
 	 * at boot like a Start-menu app. The old kernel-side app_term window is no

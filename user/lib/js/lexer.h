@@ -84,6 +84,7 @@ typedef struct {
     unsigned char paren[128];   /* per-'(' flag: 1 = control-flow header paren */
     int         paren_sp;
     int         prev_rparen_ctrl; /* last token was a ')' closing if/for/while/with */
+    int         prev_rbrace_block; /* last token was a '}' closing a block (not an object literal) */
     const char *err;            /* set on a lexical error; token kind T_ERROR */
 } jlexer;
 

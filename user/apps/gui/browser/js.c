@@ -17,6 +17,8 @@
 #include "parser.h"       /* js_parse, js_arena                                   */
 #include "gc.h"           /* gc_add_root / gc_remove_root / scopes                */
 #include "websocket.h"    /* ws_open / ws_poll / ws_send / ws_close (RFC 6455)    */
+#include "bmedia.h"       /* HTMLMediaElement: <audio>/<video> + new Audio()      */
+#include "clipboard.h"    /* clip_put / clip_get for navigator.clipboard          */
 
 #define A(i) ((i) < argc ? args[i] : js_undef())
 
@@ -28,6 +30,7 @@ static js_object *g_url_proto;
 static js_object *g_sp_proto;
 static js_object *g_event_proto;
 static js_object *g_html_proto;        /* HTMLElement.prototype (chains to element) */
+static js_object *g_media_proto;       /* HTMLMediaElement.prototype (audio/video)  */
 static js_object *g_custom_elements;   /* registry: tag name -> class constructor   */
 static js_object *g_module_cache;      /* ES module registry: abs URL -> namespace  */
 static js_object *g_document_proto;    /* shared by the live doc + DOMParser docs    */
@@ -35,6 +38,7 @@ static js_object *g_response_proto;    /* fetch() Response.prototype            
 static js_object *g_ws_proto;          /* WebSocket.prototype                          */
 static js_object *g_xhr_proto;         /* XMLHttpRequest.prototype                     */
 static js_object *g_blob_proto;        /* Blob.prototype                               */
+static js_object *g_clipitem_proto;    /* ClipboardItem.prototype                      */
 static js_object *g_websockets;        /* rooted array of live WebSocket wrappers      */
 static js_object *g_abortsignal_proto; /* AbortSignal.prototype                        */
 static js_object *g_abortcontroller_proto; /* AbortController.prototype                */
@@ -101,11 +105,15 @@ static struct dom_node *node_of(js_value v) {
  * the SAME object — node identity, which event listeners depend on. Every wrapper
  * is pinned in g_live_wrappers so its listener closures survive GC for the page. */
 static js_value wrap_node(struct dom_node *n) {
-    js_object *o;
+    js_object *o, *proto;
     if (!n) return js_null();
     if (n->wrapper) return js_obj_value((js_object *)n->wrapper);
+    proto = g_element_proto;
+    if (g_media_proto && n->type == DOM_ELEMENT &&
+        (streq(n->tag, "audio") || streq(n->tag, "video")))
+        proto = g_media_proto;                 /* HTMLMediaElement props/methods */
     gc_push_scope();
-    o = (js_object *)gc_keep(js_new_object(g_ctx, g_element_proto));
+    o = (js_object *)gc_keep(js_new_object(g_ctx, proto));
     o->host = n;
     n->wrapper = o;
     if (g_live_wrappers) js_array_push(g_ctx, g_live_wrappers, js_obj_value(o));
@@ -356,6 +364,14 @@ static js_value el_rm_attr(js_ctx *ctx, js_value t, js_value *args, int argc) {
     if (n) dom_remove_attr(n, arg_str(ctx, A(0)));
     return js_undef();
 }
+/* A script inserted into the live document by these DOM bindings (the analytics/
+ * widget loader idiom: createElement('script') + appendChild) must fetch+run, the
+ * way a browser does. Defined near the page runner; forward-declared here. */
+static void run_inserted_script(struct dom_node *node);
+static int node_connected(struct dom_node *n) {
+    for (; n; n = n->parent) if (n == g_doc_root) return 1;
+    return 0;
+}
 static js_value el_append(js_ctx *ctx, js_value t, js_value *args, int argc) {
     struct dom_node *n = node_of(t), *c = node_of(A(0));
     (void)ctx;
@@ -365,6 +381,7 @@ static js_value el_append(js_ctx *ctx, js_value t, js_value *args, int argc) {
             js_value cls = ce_lookup(c->tag);
             if (cls.type == JV_OBJ) ce_upgrade_node(c, cls);
             ce_connect(c);
+            if (node_connected(c)) run_inserted_script(c);
         }
     }
     return A(0);
@@ -373,6 +390,20 @@ static js_value el_remove_child(js_ctx *ctx, js_value t, js_value *args, int arg
     struct dom_node *n = node_of(t), *c = node_of(A(0));
     (void)ctx;
     if (n && c) dom_remove_child(n, c);
+    return A(0);
+}
+static js_value el_insert_before(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t), *c = node_of(A(0)), *ref = node_of(A(1));
+    (void)ctx;
+    if (n && c) {
+        dom_insert_before(n, c, ref);            /* null/absent ref => append */
+        if (c->type == DOM_ELEMENT) {            /* upgrade + connect a custom el */
+            js_value cls = ce_lookup(c->tag);
+            if (cls.type == JV_OBJ) ce_upgrade_node(c, cls);
+            ce_connect(c);
+            if (node_connected(c)) run_inserted_script(c);
+        }
+    }
     return A(0);
 }
 static js_value el_parent(js_ctx *ctx, js_value t, js_value *args, int argc) {
@@ -475,6 +506,10 @@ static js_value style_set_##JSN(js_ctx *ctx, js_value t, js_value *args, int arg
 STYLE_PROP(color, "color")
 STYLE_PROP(background, "background")
 STYLE_PROP(backgroundColor, "background-color")
+STYLE_PROP(backgroundImage, "background-image")
+STYLE_PROP(backgroundPosition, "background-position")
+STYLE_PROP(backgroundSize, "background-size")
+STYLE_PROP(backgroundRepeat, "background-repeat")
 STYLE_PROP(display, "display")
 STYLE_PROP(width, "width")
 STYLE_PROP(height, "height")
@@ -564,6 +599,12 @@ static js_value win_innerHeight(js_ctx *ctx, js_value t, js_value *args, int arg
 }
 static js_value win_scrollX(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_number(0); }
 static js_value win_scrollY(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_number(browser_scroll_px()); }
+
+/* window.screen — no separate display metric exists, so the resizable window's
+ * client size stands in for the screen (sites use it for analytics/feature
+ * sniffing, e.g. screen.width/height). Accessors so a resize is reflected. */
+static js_value screen_width(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_number(BW); }
+static js_value screen_height(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_number(BH); }
 
 static js_value el_noop(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_undef(); }
 static js_value nav_false(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_bool(0); }
@@ -666,7 +707,7 @@ static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char url[URL_MAX], method[16], req_ctype[64], resp_ctype[160];
     char extra_hdrs[1024];
     const char *reqbody = 0;
-    int reqlen = 0, status = 0, outlen = 0, eh = 0;
+    int reqlen = 0, status = 0, outlen = 0, eh = 0, with_creds = 0;
     unsigned char *body;
     js_object *resp, *hdrs;
     js_value rv;
@@ -688,6 +729,10 @@ static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
         js_value h = js_get(ctx, A(1), "headers");
         if (m.type == JV_STR) copy_str(method, sizeof method, m.u.str->data);
         (void)js_to_boolean(js_get(ctx, A(1), "keepalive"));   /* sync fetch: inherently satisfied */
+        {   /* credentials: "include" sends cookies cross-origin (default "same-origin" doesn't) */
+            js_value cr = js_get(ctx, A(1), "credentials");
+            if (cr.type == JV_STR && streq(cr.u.str->data, "include")) with_creds = 1;
+        }
         /* Request headers: a plain { name: value } object (a Headers instance is a
          * plain object here too). Content-Type folds into the body's ctype slot to
          * avoid a duplicate header; the rest become a "Name: value\r\n" blob. */
@@ -717,13 +762,22 @@ static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
         }
         /* Body last, just before the request: body_bytes may hand back a pointer
          * into a transient string (URLSearchParams), so no JS allocation must run
-         * between here and browser_fetch_url. */
+         * between here and browser_cors_fetch. */
         if (b.type != JV_UNDEF && b.type != JV_NULL) reqbody = body_bytes(ctx, b, &reqlen, req_ctype, sizeof req_ctype);  /* string/Blob/ArrayBuffer/TypedArray/URLSearchParams */
     }
-    body = browser_fetch_url(url, method[0] ? method : "GET",
-                             (const unsigned char *)reqbody, reqlen, req_ctype[0] ? req_ctype : 0,
-                             "*/*", &status, resp_ctype, sizeof resp_ctype, &outlen,
-                             extra_hdrs[0] ? extra_hdrs : 0);
+    {
+        struct http_req rq = { 0 };
+        struct http_resp rs = { 0 };
+        rq.url = url;
+        rq.method = method[0] ? method : "GET";
+        rq.body = (const unsigned char *)reqbody;
+        rq.body_len = reqlen;
+        rq.ctype = req_ctype[0] ? req_ctype : 0;
+        rq.extra_hdrs = extra_hdrs[0] ? extra_hdrs : 0;
+        body = browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
+        status = rs.status; outlen = rs.len;
+        copy_str(resp_ctype, sizeof resp_ctype, rs.ctype);
+    }
     if (!body)
         return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Failed to fetch"));
     gc_push_scope();
@@ -2349,7 +2403,7 @@ static js_value crypto_randomuuid(js_ctx *ctx, js_value t, js_value *args, int a
 }
 
 /* ------------------------------------------------------- XMLHttpRequest ---- *
- * The classic XHR transport, over the same synchronous browser_fetch_url path as
+ * The classic XHR transport, over the same synchronous browser_cors_fetch path as
  * fetch() (the engine has no event loop). open() records the verb/URL; each
  * setRequestHeader() appends to a header blob; send() runs the request to
  * completion, then walks readyState 1->2->3->4 firing readystatechange + the
@@ -2417,10 +2471,20 @@ static js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc) {
         if (!req_ctype[0]) copy_str(req_ctype, sizeof req_ctype, "text/plain;charset=UTF-8");
     }
     { js_value h = js_get(ctx, t, "@hdrs"); hdrs = h.type == JV_STR ? h.u.str->data : 0; }
-    body = browser_fetch_url(url, method[0] ? method : "GET",
-                             (const unsigned char *)reqbody, reqlen, req_ctype[0] ? req_ctype : 0,
-                             "*/*", &status, resp_ctype, sizeof resp_ctype, &outlen,
-                             hdrs && hdrs[0] ? hdrs : 0);
+    {
+        int with_creds = js_to_boolean(js_get(ctx, t, "withCredentials"));
+        struct http_req rq = { 0 };
+        struct http_resp rs = { 0 };
+        rq.url = url;
+        rq.method = method[0] ? method : "GET";
+        rq.body = (const unsigned char *)reqbody;
+        rq.body_len = reqlen;
+        rq.ctype = req_ctype[0] ? req_ctype : 0;
+        rq.extra_hdrs = hdrs && hdrs[0] ? hdrs : 0;
+        body = browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
+        status = rs.status; outlen = rs.len;
+        copy_str(resp_ctype, sizeof resp_ctype, rs.ctype);
+    }
     gc_push_scope(); gc_keep(t.u.obj);
     js_def(t.u.obj, "@respctype", js_mk_cstring(ctx, resp_ctype), 0);
     js_set(ctx, t, "responseURL", js_mk_cstring(ctx, url));
@@ -2609,7 +2673,7 @@ static const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, in
 static js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char url[URL_MAX], ctype[160];
     const char *body;
-    int len = 0, status = 0, outlen = 0;
+    int len = 0;
     unsigned char *resp;
     js_value data = A(1);
     (void)t;
@@ -2624,11 +2688,328 @@ static js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc
     gc_push_scope();
     if (data.type == JV_OBJ) gc_keep(data.u.obj); else if (data.type == JV_STR) gc_keep(data.u.str);
     body = (argc >= 2 && data.type != JV_UNDEF && data.type != JV_NULL) ? body_bytes(ctx, data, &len, ctype, sizeof ctype) : "";
-    resp = browser_fetch_url(url, "POST", (const unsigned char *)body, len, ctype[0] ? ctype : 0,
-                             "*/*", &status, 0, 0, &outlen, 0);
+    {   /* no-cors fire-and-forget: send and discard, no CORS gating on the reply */
+        struct http_req rq = { 0 };
+        struct http_resp rs = { 0 };
+        rq.url = url; rq.method = "POST";
+        rq.body = (const unsigned char *)body; rq.body_len = len;
+        rq.ctype = ctype[0] ? ctype : 0;
+        resp = browser_fetch(&rq, &rs);
+    }
     gc_pop_scope();
     if (resp) free(resp);
     return js_bool(resp != 0);                             /* queued (sent) */
+}
+
+/* ------------------------------------------------- Async Clipboard API */
+
+/* clip_get tags every clip with a MIME type; readText() only surfaces text. */
+static int clip_mime_is_text(const char *m) {
+    return m[0] == 't' && m[1] == 'e' && m[2] == 'x' && m[3] == 't' && m[4] == '/';
+}
+
+/* Resolve a ClipboardItem entry (a Blob, a string, or a settled Promise of
+ * either) to its raw bytes. Returns the backing js_string (caller keeps it via
+ * the GC scope) and copies the entry's MIME into `type` when it carries one. */
+static js_string *clip_entry_bytes(js_ctx *ctx, js_value v, char *type, int tcap) {
+    js_value settled;
+    if (v.type == JV_OBJ && js_promise_inspect(ctx, v, &settled) == 1) v = settled;
+    if (v.type == JV_OBJ && v.u.obj->proto == g_blob_proto) {
+        js_value b = js_get(ctx, v, "@bytes"), tp = js_get(ctx, v, "type");
+        if (type && tp.type == JV_STR && tp.u.str->len) copy_str(type, tcap, tp.u.str->data);
+        return b.type == JV_STR ? b.u.str : 0;
+    }
+    { js_value s = js_to_string(ctx, v); return s.type == JV_STR ? s.u.str : 0; }
+}
+
+/* new ClipboardItem({ "text/plain": blobOrString, ... }) — keeps the dictionary
+ * verbatim (@data) so getType() can hand back each representation lazily. */
+static js_value clipitem_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+    js_object *o, *types, *dict;
+    js_value items = A(0), ov;
+    int i;
+    (void)thisv;
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, g_clipitem_proto));
+    types = (js_object *)gc_keep(js_new_array(ctx, 0));
+    dict = items.type == JV_OBJ ? items.u.obj : js_new_object(ctx, ctx->object_proto);
+    gc_keep(dict);
+    js_def(o, "@data", js_obj_value(dict), 0);
+    for (i = 0; i < dict->props.n; i++) {
+        pentry *pe = &dict->props.e[i];
+        if (!(pe->flags & P_ENUMERABLE) || (unsigned char)pe->key[0] < ' ') continue;  /* skip symbol keys */
+        js_array_push(ctx, types, js_mk_cstring(ctx, pe->key));
+    }
+    js_def(o, "types", js_obj_value(types), P_ENUMERABLE);
+    js_def(o, "presentationStyle", js_mk_cstring(ctx, "unspecified"), P_ENUMERABLE);
+    ov = js_obj_value(o);
+    gc_pop_scope();
+    return ov;
+}
+
+/* item.getType(mime) -> Promise<Blob> of that representation. */
+static js_value clipitem_gettype(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value data = js_get(ctx, t, "@data"), e, settled;
+    const char *m = arg_str(ctx, A(0));
+    if (data.type != JV_OBJ)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotFoundError", "The type was not found"));
+    e = js_get(ctx, data, m);
+    if (e.type == JV_OBJ && js_promise_inspect(ctx, e, &settled) == 1) e = settled;
+    if (e.type == JV_UNDEF || e.type == JV_NULL)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotFoundError", "The type was not found"));
+    if (e.type == JV_OBJ && e.u.obj->proto == g_blob_proto) return js_promise_resolved(ctx, e);
+    { js_value s = js_to_string(ctx, e);
+      return js_promise_resolved(ctx, make_blob(ctx, s.type == JV_STR ? s.u.str->data : "",
+                                                s.type == JV_STR ? s.u.str->len : 0, m)); }
+}
+
+/* ClipboardItem.supports(type) — the formats the clipboard server round-trips. */
+static js_value clipitem_supports(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    const char *m = arg_str(ctx, A(0));
+    (void)t;
+    return js_bool(streq(m, "text/plain") || streq(m, "text/html") || streq(m, "image/png"));
+}
+
+/* navigator.clipboard.writeText(text) -> Promise<undefined>. */
+static js_value clip_writetext(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value s = js_to_string(ctx, A(0));
+    (void)t;
+    if (s.type != JV_STR)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "writeText: invalid text"));
+    if (clip_put_text(s.u.str->data, s.u.str->len) != 0)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Clipboard write failed"));
+    return js_promise_resolved(ctx, js_undef());
+}
+
+/* navigator.clipboard.readText() -> Promise<string> of the newest text clip
+ * (empty string when the clipboard holds no text, mirroring real browsers). */
+static js_value clip_readtext(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    char mime[64];
+    void *data = 0;
+    int len = 0;
+    js_value rv;
+    (void)t; (void)args; (void)argc;
+    if (clip_get(0, mime, sizeof mime, &data, &len) != 0)
+        return js_promise_resolved(ctx, js_mk_cstring(ctx, ""));
+    rv = clip_mime_is_text(mime) ? js_mk_string(ctx, data ? (const char *)data : "", len)
+                                 : js_mk_cstring(ctx, "");
+    if (data) free(data);
+    return js_promise_resolved(ctx, rv);
+}
+
+/* navigator.clipboard.write([ClipboardItem,...]) -> Promise<undefined>. The
+ * kernel clipboard stores one blob per clip, so we write a single
+ * representation per item — text/plain when offered (best cross-app paste),
+ * else the item's first format. */
+static js_value clip_write(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value items = A(0), item, data, entry;
+    js_string *bytes;
+    char mime[64];
+    int rc, i;
+    (void)t;
+    if (items.type != JV_OBJ)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "write: expected ClipboardItems"));
+    item = items.u.obj->kind == OBJ_ARRAY ? js_get_index(ctx, items, 0) : items;
+    if (item.type != JV_OBJ)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "write: empty ClipboardItem list"));
+    data = js_get(ctx, item, "@data");
+    if (data.type != JV_OBJ) data = item;                  /* tolerate a bare dict */
+    entry = js_get(ctx, data, "text/plain");
+    if (entry.type != JV_UNDEF && entry.type != JV_NULL) {
+        copy_str(mime, sizeof mime, "text/plain");
+    } else {
+        js_object *d = data.u.obj;
+        mime[0] = '\0';
+        for (i = 0; i < d->props.n; i++) {
+            pentry *pe = &d->props.e[i];
+            if (!(pe->flags & P_ENUMERABLE) || (unsigned char)pe->key[0] < ' ') continue;
+            if (streq(pe->key, "@data")) continue;
+            copy_str(mime, sizeof mime, pe->key);
+            entry = js_get(ctx, data, pe->key);
+            break;
+        }
+        if (!mime[0]) return js_promise_resolved(ctx, js_undef());   /* nothing to write */
+    }
+    gc_push_scope();
+    bytes = clip_entry_bytes(ctx, entry, 0, 0);
+    if (bytes) gc_keep(bytes);
+    rc = bytes ? clip_put(mime, bytes->data, bytes->len) : clip_put(mime, "", 0);
+    gc_pop_scope();
+    if (rc != 0)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Clipboard write failed"));
+    return js_promise_resolved(ctx, js_undef());
+}
+
+/* navigator.clipboard.read() -> Promise<ClipboardItem[]> of the newest clip. */
+static js_value clip_read(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    char mime[64];
+    void *data = 0;
+    int len = 0;
+    js_object *arr;
+    js_value rv;
+    (void)t; (void)args; (void)argc;
+    gc_push_scope();
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (clip_get(0, mime, sizeof mime, &data, &len) == 0) {
+        js_object *dict = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+        js_value dictarg, item;
+        js_def(dict, mime, make_blob(ctx, data ? (const char *)data : "", len, mime),
+               P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        dictarg = js_obj_value(dict);
+        item = clipitem_ctor(ctx, js_undef(), &dictarg, 1);
+        if (item.type == JV_OBJ) js_array_push(ctx, arr, item);
+    }
+    if (data) free(data);
+    rv = js_obj_value(arr);
+    gc_pop_scope();
+    return js_promise_resolved(ctx, rv);
+}
+
+/* ------------------------------------------------- HTMLMediaElement -------
+ * <audio>/<video> elements (and `new Audio()`) get g_media_proto, which chains
+ * to the element prototype and adds the media properties/methods. The state and
+ * playback live in media.c (bmedia.h); these are thin bindings over it. */
+static struct media_el *mel_of(js_value t) {
+    struct dom_node *n = node_of(t);
+    return n ? media_for_node(n) : 0;
+}
+static js_value mel_get_src(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    char buf[URL_MAX]; (void)args; (void)argc;
+    buf[0] = '\0'; media_get_src(mel_of(t), buf, sizeof buf);
+    return js_mk_cstring(ctx, buf);
+}
+static js_value mel_set_src(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    const char *raw = arg_str(ctx, A(0));
+    char abs[URL_MAX];
+    if (!n) return js_undef();
+    dom_set_attr(n, "src", raw);
+    resolve_url(g_page_url_buf, raw, abs, sizeof abs);
+    media_set_src(media_for_node(n), abs);
+    return js_undef();
+}
+static js_value mel_get_currentTime(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)args; (void)argc; return js_number(media_current_time(mel_of(t))); }
+static js_value mel_set_currentTime(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ media_set_current_time(mel_of(t), js_to_number(ctx, A(0))); return js_undef(); }
+static js_value mel_get_duration(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; return js_number(media_duration(mel_of(t))); }
+static js_value mel_get_paused(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; return js_bool(media_paused(mel_of(t))); }
+static js_value mel_get_ended(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; return js_bool(media_ended(mel_of(t))); }
+static js_value mel_get_volume(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; return js_number(media_volume(mel_of(t))); }
+static js_value mel_set_volume(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ media_set_volume(mel_of(t), js_to_number(ctx, A(0))); return js_undef(); }
+static js_value mel_get_muted(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; return js_bool(media_muted(mel_of(t))); }
+static js_value mel_set_muted(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ media_set_muted(mel_of(t), js_to_boolean(A(0))); return js_undef(); }
+static js_value mel_get_loop(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; return js_bool(media_loop_get(mel_of(t))); }
+static js_value mel_set_loop(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    int on = js_to_boolean(A(0));
+    media_set_loop(media_for_node(n), on);
+    if (n) { if (on) dom_set_attr(n, "loop", ""); else dom_remove_attr(n, "loop"); }
+    return js_undef();
+}
+static js_value mel_get_autoplay(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; return js_bool(media_autoplay_get(mel_of(t))); }
+static js_value mel_set_autoplay(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    int on = js_to_boolean(A(0));
+    media_set_autoplay(media_for_node(n), on);
+    if (n) { if (on) dom_set_attr(n, "autoplay", ""); else dom_remove_attr(n, "autoplay"); }
+    return js_undef();
+}
+static js_value mel_get_controls(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t); (void)ctx; (void)args; (void)argc;
+    return js_bool(n && dom_get_attr(n, "controls") != 0);
+}
+static js_value mel_set_controls(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t); (void)ctx;
+    if (n) { if (js_to_boolean(A(0))) dom_set_attr(n, "controls", ""); else dom_remove_attr(n, "controls"); }
+    return js_undef();
+}
+static js_value mel_get_readyState(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; return js_number(media_ready_state(mel_of(t))); }
+static js_value mel_get_networkState(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; return js_number(media_network_state(mel_of(t))); }
+
+static js_value mel_play(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)args; (void)argc; media_play(mel_of(t)); return js_promise_resolved(ctx, js_undef()); }
+static js_value mel_pause(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; media_pause(mel_of(t)); return js_undef(); }
+static js_value mel_load(js_ctx *ctx, js_value t, js_value *args, int argc)
+{ (void)ctx; (void)args; (void)argc; media_load(mel_of(t)); return js_undef(); }
+static js_value mel_can_play_type(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    int v = media_can_play_type(arg_str(ctx, A(0))); (void)t;
+    return js_mk_cstring(ctx, v == MEDIA_PROBABLY ? "probably" : v == MEDIA_MAYBE ? "maybe" : "");
+}
+
+/* The Audio() constructor: a detached HTMLAudioElement, optionally with a src
+ * (which is preloaded). new Audio(src) === document.createElement('audio'). */
+static js_value audio_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+    struct dom_node *n;
+    js_value w;
+    (void)thisv;
+    n = dom_new_element("audio");
+    if (!n) return js_throw_type(ctx, "Audio");
+    media_new_audio(n);
+    w = wrap_node(n);                                  /* g_media_proto, pinned alive */
+    if (argc >= 1 && A(0).type != JV_UNDEF && A(0).type != JV_NULL) {
+        const char *raw = arg_str(ctx, A(0));
+        char abs[URL_MAX];
+        struct media_el *m = media_for_node(n);
+        dom_set_attr(n, "src", raw);
+        resolve_url(g_page_url_buf, raw, abs, sizeof abs);
+        media_set_src(m, abs);
+        media_load(m);                                 /* new Audio(src) preloads */
+    }
+    return w;
+}
+
+/* Define the HTMLMediaElement surface on g_media_proto (chains to element). */
+static void setup_media_proto(js_ctx *ctx) {
+    def_acc(g_media_proto, "src", mel_get_src, mel_set_src);
+    def_acc(g_media_proto, "currentSrc", mel_get_src, 0);
+    def_acc(g_media_proto, "currentTime", mel_get_currentTime, mel_set_currentTime);
+    def_acc(g_media_proto, "duration", mel_get_duration, 0);
+    def_acc(g_media_proto, "paused", mel_get_paused, 0);
+    def_acc(g_media_proto, "ended", mel_get_ended, 0);
+    def_acc(g_media_proto, "volume", mel_get_volume, mel_set_volume);
+    def_acc(g_media_proto, "muted", mel_get_muted, mel_set_muted);
+    def_acc(g_media_proto, "loop", mel_get_loop, mel_set_loop);
+    def_acc(g_media_proto, "autoplay", mel_get_autoplay, mel_set_autoplay);
+    def_acc(g_media_proto, "controls", mel_get_controls, mel_set_controls);
+    def_acc(g_media_proto, "readyState", mel_get_readyState, 0);
+    def_acc(g_media_proto, "networkState", mel_get_networkState, 0);
+    def_method(g_media_proto, "play", mel_play, 0);
+    def_method(g_media_proto, "pause", mel_pause, 0);
+    def_method(g_media_proto, "load", mel_load, 0);
+    def_method(g_media_proto, "canPlayType", mel_can_play_type, 1);
+    js_def(g_media_proto, "HAVE_NOTHING", js_number(MRS_NOTHING), P_ENUMERABLE);
+    js_def(g_media_proto, "HAVE_METADATA", js_number(MRS_METADATA), P_ENUMERABLE);
+    js_def(g_media_proto, "HAVE_CURRENT_DATA", js_number(MRS_CURRENT), P_ENUMERABLE);
+    js_def(g_media_proto, "HAVE_FUTURE_DATA", js_number(MRS_FUTURE), P_ENUMERABLE);
+    js_def(g_media_proto, "HAVE_ENOUGH_DATA", js_number(MRS_ENOUGH), P_ENUMERABLE);
+    {
+        js_object *ac = js_new_native(ctx, audio_ctor, "Audio", 1);
+        gc_push_scope(); gc_keep(ac);
+        js_def(ac, "prototype", js_obj_value(g_media_proto), 0);
+        js_def(g_media_proto, "constructor", js_obj_value(ac), P_WRITABLE | P_CONFIGURABLE);
+        js_def(ctx->global, "Audio", js_obj_value(ac), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+}
+
+/* media.c (worker thread) asks us to fire a (non-bubbling) media event on an
+ * element's wrapper — both its on<type> handler and addEventListener listeners. */
+void js_media_fire(struct dom_node *node, const char *type) {
+    if (!g_page_live || !g_ctx || !node || !node->wrapper) return;
+    emit_event((js_object *)node->wrapper, type, js_undef());
 }
 
 static void setup_dom(js_ctx *ctx, const char *page_url) {
@@ -2640,6 +3021,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     g_sp_proto = js_new_object(ctx, ctx->object_proto);
     g_event_proto = js_new_object(ctx, ctx->object_proto);
     g_html_proto = js_new_object(ctx, g_element_proto);     /* HTMLElement.prototype */
+    g_media_proto = js_new_object(ctx, g_element_proto);    /* HTMLMediaElement.prototype */
     g_custom_elements = js_new_object(ctx, ctx->object_proto);
     g_module_cache = js_new_object(ctx, ctx->object_proto);
     g_document_proto = js_new_object(ctx, ctx->object_proto);
@@ -2661,6 +3043,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     gc_add_root((void **)&g_sp_proto);
     gc_add_root((void **)&g_event_proto);
     gc_add_root((void **)&g_html_proto);
+    gc_add_root((void **)&g_media_proto);
     gc_add_root((void **)&g_custom_elements);
     gc_add_root((void **)&g_module_cache);
     gc_add_root((void **)&g_document_proto);
@@ -2687,6 +3070,10 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_acc(g_style_proto, "color", style_get_color, style_set_color);
     def_acc(g_style_proto, "background", style_get_background, style_set_background);
     def_acc(g_style_proto, "backgroundColor", style_get_backgroundColor, style_set_backgroundColor);
+    def_acc(g_style_proto, "backgroundImage", style_get_backgroundImage, style_set_backgroundImage);
+    def_acc(g_style_proto, "backgroundPosition", style_get_backgroundPosition, style_set_backgroundPosition);
+    def_acc(g_style_proto, "backgroundSize", style_get_backgroundSize, style_set_backgroundSize);
+    def_acc(g_style_proto, "backgroundRepeat", style_get_backgroundRepeat, style_set_backgroundRepeat);
     def_acc(g_style_proto, "display", style_get_display, style_set_display);
     def_acc(g_style_proto, "width", style_get_width, style_set_width);
     def_acc(g_style_proto, "height", style_get_height, style_set_height);
@@ -2749,6 +3136,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_method(g_element_proto, "appendChild", el_append, 1);
     def_method(g_element_proto, "append", el_append, 1);
     def_method(g_element_proto, "removeChild", el_remove_child, 1);
+    def_method(g_element_proto, "insertBefore", el_insert_before, 2);
     def_method(g_element_proto, "getElementsByTagName", el_get_by_tag, 1);
     def_method(g_element_proto, "querySelector", el_query, 1);
     def_method(g_element_proto, "querySelectorAll", el_query_all, 1);
@@ -2760,6 +3148,8 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_method(g_element_proto, "removeEventListener", el_remove_listener, 3);
     def_method(g_element_proto, "dispatchEvent", el_dispatch, 1);
     def_method(g_element_proto, "getBoundingClientRect", el_get_bounding_rect, 0);
+
+    setup_media_proto(ctx);     /* HTMLMediaElement props/methods + the Audio ctor */
 
     /* document: methods on the shared proto so DOMParser documents inherit them
      * (they're root-relative — they query whichever document is `this`). */
@@ -2844,7 +3234,46 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
             def_method(conn, "addEventListener", el_noop, 2);
             js_def(nav, "connection", js_obj_value(conn), P_ENUMERABLE);
         }
+        {
+            js_object *clip = js_new_object(ctx, ctx->object_proto);   /* navigator.clipboard */
+            gc_keep(clip);
+            def_method(clip, "writeText", clip_writetext, 1);
+            def_method(clip, "readText", clip_readtext, 0);
+            def_method(clip, "write", clip_write, 1);
+            def_method(clip, "read", clip_read, 0);
+            def_method(clip, "addEventListener", el_noop, 2);
+            def_method(clip, "removeEventListener", el_noop, 2);
+            js_def(nav, "clipboard", js_obj_value(clip), P_ENUMERABLE);
+        }
         js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+    {
+        js_object *scr = js_new_object(ctx, ctx->object_proto);   /* window.screen */
+        gc_push_scope(); gc_keep(scr);
+        def_acc(scr, "width", screen_width, 0);
+        def_acc(scr, "height", screen_height, 0);
+        def_acc(scr, "availWidth", screen_width, 0);
+        def_acc(scr, "availHeight", screen_height, 0);
+        js_def(scr, "availLeft", js_number(0), P_ENUMERABLE);
+        js_def(scr, "availTop", js_number(0), P_ENUMERABLE);
+        js_def(scr, "colorDepth", js_number(24), P_ENUMERABLE);
+        js_def(scr, "pixelDepth", js_number(24), P_ENUMERABLE);
+        js_def(win, "screen", js_obj_value(scr), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+    /* ClipboardItem (window global) — pairs with navigator.clipboard.read/write */
+    {
+        js_object *cic;
+        g_clipitem_proto = js_new_object(ctx, ctx->object_proto);
+        gc_add_root((void **)&g_clipitem_proto);
+        gc_push_scope();
+        def_method(g_clipitem_proto, "getType", clipitem_gettype, 1);
+        cic = (js_object *)gc_keep(js_new_native(ctx, clipitem_ctor, "ClipboardItem", 1));
+        def_method(cic, "supports", clipitem_supports, 1);
+        js_def(cic, "prototype", js_obj_value(g_clipitem_proto), 0);
+        js_def(g_clipitem_proto, "constructor", js_obj_value(cic), P_WRITABLE | P_CONFIGURABLE);
+        js_def(win, "ClipboardItem", js_obj_value(cic), P_WRITABLE | P_CONFIGURABLE);
         gc_pop_scope();
     }
     /* crypto: getRandomValues (RDRAND-backed) + randomUUID. window.crypto and the
@@ -2945,7 +3374,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         gc_pop_scope();
     }
 
-    /* XMLHttpRequest (synchronous transport over browser_fetch_url) */
+    /* XMLHttpRequest (synchronous transport over browser_cors_fetch) */
     def_method(g_xhr_proto, "open", xhr_open, 2);
     def_method(g_xhr_proto, "setRequestHeader", xhr_setheader, 2);
     def_method(g_xhr_proto, "send", xhr_send, 1);
@@ -3117,6 +3546,57 @@ static void report_exc(js_ctx *ctx) {
 }
 static js_value report_exc_v(js_ctx *ctx) { report_exc(ctx); return js_undef(); }
 
+/* Devtools console REPL: parse and run one expression/statement against the live
+ * page context, echoing the input and the result (or exception) to the console.
+ * Worker-thread only — g_ctx is worker-owned. The AST arena is retained for the
+ * page's lifetime (a typed closure/timer may outlive this call), matching how
+ * page scripts keep their arenas. A page with no script context gets a note. */
+void js_repl_run(const char *src) {
+    js_arena *ar;
+    js_node *prog;
+    js_parse_error pe;
+    js_value res;
+
+    if (!src || !*src) return;
+
+    { sbuf in; in.b = 0; in.n = 0; in.cap = 0;          /* echo the prompt line */
+      sb_puts(&in, "> "); sb_puts(&in, src); sb_putc(&in, '\n');
+      devtools_console_append(DT_LOG, in.b, in.n);
+      if (in.b) free(in.b); }
+
+    if (!g_page_live || !g_ctx) {
+        static const char note[] = "(no page script context — open a page that runs JS first)\n";
+        devtools_console_append(DT_WARN, note, (int)sizeof note - 1);
+        return;
+    }
+
+    ar = (js_arena *)malloc(sizeof *ar);
+    if (!ar) return;
+    js_arena_init(ar);
+    prog = js_parse(src, ar, &pe);
+    if (!prog) {
+        sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
+        sb_puts(&sb, "SyntaxError: ");
+        sb_puts(&sb, pe.msg ? pe.msg : "parse error");
+        sb_putc(&sb, '\n');
+        devtools_console_append(DT_ERROR, sb.b, sb.n);
+        if (sb.b) free(sb.b);
+        js_arena_free(ar); free(ar);
+        return;
+    }
+    if (!arenas_push(ar)) { js_arena_free(ar); free(ar); return; }   /* keep the AST alive */
+
+    if (js_run(g_ctx, prog, &res) != 0) { report_exc(g_ctx); return; }
+
+    { js_value s = js_to_string(g_ctx, res);            /* may itself throw (toString) */
+      if (g_ctx->has_exc) { report_exc(g_ctx); return; }
+      sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
+      if (s.type == JV_STR && s.u.str) sb_puts(&sb, s.u.str->data);
+      sb_putc(&sb, '\n');
+      devtools_console_append(DT_LOG, sb.b, sb.n);
+      if (sb.b) free(sb.b); }
+}
+
 /* ci substring test, for the <script type=...> filter */
 static int ci_has(const char *hay, const char *needle) {
     int nl = strlen(needle);
@@ -3161,6 +3641,95 @@ static char *script_text(struct dom_node *s) {
     for (c = s->first_child; c; c = c->next) if (c->type == DOM_TEXT && c->text) sb_puts(&sb, c->text);
     if (!sb.b) { sb.b = (char *)malloc(1); if (sb.b) sb.b[0] = 0; }
     return sb.b;
+}
+
+/* Execute a <script> connected to the live document via the JS DOM API
+ * (createElement + appendChild/insertBefore) — the loader idiom for analytics,
+ * widgets and polyfills. Classic + module; an external `src` is fetched
+ * synchronously like a module. Runs at most once per node (an "@scriptRan" marker
+ * on the wrapper). Scripts produced by innerHTML go through the C tree API, not
+ * these bindings, so they correctly never reach here. */
+static void run_inserted_script(struct dom_node *node) {
+    js_value w;
+    char *code = 0;
+    const char *src;
+    js_arena *ar;
+    js_parse_error pe;
+    js_node *prog;
+    int is_module;
+
+    if (!g_page_live || !g_ctx || !node || node->type != DOM_ELEMENT) return;
+    if (!streq(node->tag, "script")) return;
+    if (!script_is_js(node) && !script_is_module(node)) return;   /* data block, e.g. application/json */
+
+    w = wrap_node(node);
+    if (w.type == JV_OBJ && js_has_own(w.u.obj, "@scriptRan")) return;
+    if (w.type == JV_OBJ) js_def(w.u.obj, "@scriptRan", js_bool(1), 0);
+
+    is_module = script_is_module(node);
+    src = dom_get_attr(node, "src");
+
+    if (src && *src) {
+        char abs[URL_MAX];
+        unsigned char *bodies[1];
+        int lens[1];
+        char *urls[1];
+        resolve_url(g_page_url_buf, src, abs, sizeof abs);
+        if (B->pg->csp) {
+            char use[URL_MAX], reason[64];
+            if (!csp_check_url(B->pg->csp, CSP_SCRIPT, abs, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
+                js_csp_log("a script", abs, reason);
+                return;
+            }
+        }
+        if (!g_fetch) return;
+        urls[0] = abs; bodies[0] = 0; lens[0] = 0;
+        g_fetch(urls, 1, bodies, lens);
+        if (!bodies[0] || lens[0] <= 0) {
+            sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
+            sb_puts(&sb, "[js] failed to load script "); sb_puts(&sb, abs); sb_putc(&sb, '\n');
+            devtools_console_append(DT_ERROR, sb.b, sb.n);
+            if (sb.b) free(sb.b);
+            if (bodies[0]) free(bodies[0]);
+            return;
+        }
+        code = (char *)malloc((unsigned)lens[0] + 1);
+        if (code) { memcpy(code, bodies[0], (unsigned)lens[0]); code[lens[0]] = 0; }
+        free(bodies[0]);
+        js_set_cur_script(abs);
+    } else {
+        code = script_text(node);
+        js_set_cur_script("(dynamic inline script)");
+    }
+    if (!code) return;
+    if (!*code) { free(code); return; }
+
+    ar = (js_arena *)malloc(sizeof *ar);
+    if (!ar) { free(code); return; }
+    js_arena_init(ar);
+    prog = js_parse(code, ar, &pe);
+    free(code);
+    if (!prog) {
+        sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
+        sb_puts(&sb, "[js] SyntaxError: "); sb_puts(&sb, pe.msg ? pe.msg : "parse error"); sb_putc(&sb, '\n');
+        devtools_console_append(DT_ERROR, sb.b, sb.n);
+        if (sb.b) free(sb.b);
+        js_arena_free(ar); free(ar);
+        return;
+    }
+    if (!arenas_push(ar)) { js_arena_free(ar); free(ar); return; }
+    if (is_module) {
+        js_object *exports;
+        gc_push_scope();
+        exports = (js_object *)gc_keep(js_new_object(g_ctx, g_ctx->object_proto));
+        if (js_run_module(g_ctx, prog, exports, g_page_url_buf) != 0) report_exc(g_ctx);
+        gc_pop_scope();
+    } else {
+        js_value res;
+        js_set(g_ctx, js_obj_value(g_document), "currentScript", wrap_node(node));
+        if (js_run(g_ctx, prog, &res) != 0) report_exc(g_ctx);
+        js_set(g_ctx, js_obj_value(g_document), "currentScript", js_null());
+    }
 }
 
 /* Fire DOMContentLoaded on the document and load on the window, advancing
@@ -3243,6 +3812,7 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
         return;
     }
     g_ctx->now_ms = now_ms;
+    js_set_stack_limit(g_ctx, browser_js_stack_floor());   /* bound recursion to the worker stack */
     g_has_listeners = 0;
     setup_dom(g_ctx, page_url);
     g_fetch = fetch;                                /* the loader uses it for modules */
@@ -3370,6 +3940,7 @@ void js_page_end(void) {
     gc_remove_root((void **)&g_sp_proto);
     gc_remove_root((void **)&g_event_proto);
     gc_remove_root((void **)&g_html_proto);
+    gc_remove_root((void **)&g_media_proto);
     gc_remove_root((void **)&g_custom_elements);
     gc_remove_root((void **)&g_module_cache);
     gc_remove_root((void **)&g_document_proto);
@@ -3386,6 +3957,7 @@ void js_page_end(void) {
     g_timers = 0;
     if (g_tmeta) { free(g_tmeta); g_tmeta = 0; }
     g_tcap = 0; g_ntimers = 0;
+    g_media_proto = 0;
     g_element_proto = g_style_proto = g_url_proto = g_sp_proto = 0;
     g_event_proto = g_html_proto = g_custom_elements = g_document = g_live_wrappers = 0;
     g_module_cache = g_document_proto = g_response_proto = 0;

@@ -317,6 +317,9 @@ static void full_path(const char *name, char *out, int max)
  * (e.g. another image type -> "imgview"). */
 static const struct { const char *ext; const char *prog; } assoc[] = {
 	{ "png", "imgview" },
+	{ "webp", "imgview" },
+	{ "wav", "player" },
+	{ "mp3", "player" },
 };
 
 /* Case-insensitive compare of `a` against the lowercase literal `b`. */

@@ -14,6 +14,10 @@
 
 #define ARG(i) ((i) < n ? a[i] : js_undef())
 
+static js_object *as_array(js_ctx *ctx, js_value t);            /* fwd */
+static js_value   iter_self(js_ctx *ctx, js_value t, js_value *a, int n);  /* fwd */
+static int        define_one(js_ctx *ctx, js_object *target, const char *key, js_value desc);  /* fwd */
+
 static int memcmp_(const void *a, const void *b, int n) {
     const unsigned char *x = (const unsigned char *)a, *y = (const unsigned char *)b;
     int i;
@@ -214,7 +218,13 @@ static js_value native_object(js_ctx *ctx, js_value t, js_value *a, int n) {
     js_value x = ARG(0); (void)t;
     if (x.type == JV_OBJ) return x;
     if (x.type == JV_UNDEF || x.type == JV_NULL) return js_obj_value(js_new_object(ctx, ctx->object_proto));
-    return x;                                    /* primitives: leave as-is (no boxing) */
+    /* Box a Symbol into its wrapper object (its internal OBJ_SYMBOL already has
+     * Symbol.prototype as [[Prototype]]). Real-world feature tests rely on
+     * `typeof Object(sym) === "object"` and `Object(sym) instanceof Symbol`
+     * (e.g. core-js's NATIVE_SYMBOL check); failing them sends libraries down a
+     * fake string-Symbol fallback that then breaks. */
+    if (x.type == JV_SYMBOL) return js_obj_value(x.u.obj);
+    return x;                                    /* other primitives: leave as-is (no boxing) */
 }
 static js_value obj_keys_impl(js_ctx *ctx, js_value o, int mode) {
     /* mode: 0 keys, 1 values, 2 entries */
@@ -265,9 +275,23 @@ static js_value object_assign(js_ctx *ctx, js_value t, js_value *a, int n) {
     return target;
 }
 static js_value object_create(js_ctx *ctx, js_value t, js_value *a, int n) {
-    js_value proto = ARG(0);
+    js_value proto = ARG(0), props = ARG(1);
+    js_object *o;
     (void)t;
-    return js_obj_value(js_new_object(ctx, proto.type == JV_OBJ ? proto.u.obj : NULL));
+    if (proto.type != JV_OBJ && proto.type != JV_NULL) return js_throw_type(ctx, "Object.create proto must be an object or null");
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, proto.type == JV_OBJ ? proto.u.obj : NULL));
+    if (props.type == JV_OBJ) {
+        int i;
+        KEEP(props);
+        for (i = 0; i < props.u.obj->props.n && !ctx->has_exc; i++) {
+            pentry *pe = &props.u.obj->props.e[i];
+            if (!(pe->flags & P_ENUMERABLE)) continue;
+            define_one(ctx, o, pe->key, js_get(ctx, props, pe->key));
+        }
+    }
+    gc_pop_scope();
+    return js_obj_value(o);
 }
 static js_value object_getproto(js_ctx *ctx, js_value t, js_value *a, int n) {
     js_value x = ARG(0); (void)t;
@@ -289,36 +313,528 @@ static js_value object_isfrozen(js_ctx *ctx, js_value t, js_value *a, int n) {
     if (x.type != JV_OBJ) return js_bool(1);
     return js_bool(!x.u.obj->extensible);
 }
-static js_value object_defprop(js_ctx *ctx, js_value t, js_value *a, int n) {
-    js_value o = ARG(0), desc = ARG(2), keyv = ARG(1);
-    js_value getter, setter, val, en, wr, ks = js_undef();
-    const char *key;
-    unsigned char flags = 0;
-    (void)t;
-    if (o.type != JV_OBJ || desc.type != JV_OBJ) return js_throw_type(ctx, "defineProperty requires objects");
-    if (keyv.type == JV_SYMBOL) {
-        key = js_symbol_key(keyv);                 /* a Symbol key: use its internal key */
-    } else {
-        ks = js_to_string(ctx, keyv);
-        if (ctx->has_exc) return js_undef();
-        if (ks.type != JV_STR) return js_throw_type(ctx, "invalid property key");
-        key = ks.u.str->data;
-    }
+/* HasProperty (walks the prototype chain), as ToPropertyDescriptor uses: an
+ * attribute absent from the descriptor must be left unchanged when redefining an
+ * existing property, which is indistinguishable from "present but undefined"
+ * without this presence test. */
+static int desc_has(js_object *o, const char *key) {
+    for (; o; o = o->proto) if (pmap_find_pub(o, key)) return 1;
+    return 0;
+}
+/* Core of Object.defineProperty: apply descriptor `desc` to own property `key`
+ * of `target`, preserving any attribute the descriptor omits. Returns -1 with a
+ * pending exception on a bad descriptor, else 0. The caller must root `desc` and
+ * keep `key` alive across the call. */
+static int define_one(js_ctx *ctx, js_object *target, const char *key, js_value desc) {
+    js_value getter = js_undef(), setter = js_undef(), val = js_undef();
+    pentry *cur;
+    int has_value, has_writable, has_get, has_set, has_enum, has_conf, accessor;
+    unsigned char flags;
+    if (desc.type != JV_OBJ) { js_throw_type(ctx, "property descriptor must be an object"); return -1; }
     gc_push_scope();
-    KEEP(o); KEEP(desc); KEEP(keyv); if (ks.type == JV_STR) KEEP(ks);   /* hold across js_get allocations */
-    en = js_get(ctx, desc, "enumerable"); wr = js_get(ctx, desc, "writable");
-    if (js_to_boolean(en)) flags |= P_ENUMERABLE;
-    if (js_to_boolean(wr)) flags |= P_WRITABLE;
-    flags |= P_CONFIGURABLE;
-    getter = js_get(ctx, desc, "get"); setter = js_get(ctx, desc, "set");
-    if (js_is_callable(getter) || js_is_callable(setter)) {
-        js_def_accessor(o.u.obj, key, js_is_callable(getter) ? getter.u.obj : NULL, js_is_callable(setter) ? setter.u.obj : NULL, flags);
+    KEEP(desc);
+
+    has_value    = desc_has(desc.u.obj, "value");
+    has_writable = desc_has(desc.u.obj, "writable");
+    has_get      = desc_has(desc.u.obj, "get");
+    has_set      = desc_has(desc.u.obj, "set");
+    has_enum     = desc_has(desc.u.obj, "enumerable");
+    has_conf     = desc_has(desc.u.obj, "configurable");
+    if ((has_get || has_set) && (has_value || has_writable)) {
+        gc_pop_scope();
+        js_throw_type(ctx, "property descriptor cannot be both accessor and data");
+        return -1;
+    }
+
+    cur = pmap_find_pub(target, key);              /* existing own property, or NULL */
+    flags = cur ? cur->flags : 0;                  /* omitted attributes: keep existing, else default off */
+
+    if (has_enum) { if (js_to_boolean(js_get(ctx, desc, "enumerable")))   flags |= P_ENUMERABLE;   else flags &= (unsigned char)~P_ENUMERABLE; }
+    if (has_conf) { if (js_to_boolean(js_get(ctx, desc, "configurable"))) flags |= P_CONFIGURABLE; else flags &= (unsigned char)~P_CONFIGURABLE; }
+
+    /* Accessor if the descriptor supplies get/set, or it's silent on kind and the
+     * existing property is already an accessor. */
+    accessor = has_get || has_set || (!has_value && !has_writable && cur && (cur->flags & P_ACCESSOR));
+
+    if (accessor) {
+        if (has_get) getter = js_get(ctx, desc, "get");
+        else if (cur && (cur->flags & P_ACCESSOR) && cur->getter) getter = js_obj_value(cur->getter);
+        KEEP(getter);
+        if (has_set) setter = js_get(ctx, desc, "set");
+        else if (cur && (cur->flags & P_ACCESSOR) && cur->setter) setter = js_obj_value(cur->setter);
+        KEEP(setter);
+        js_def_accessor(target, key,
+                        js_is_callable(getter) ? getter.u.obj : NULL,
+                        js_is_callable(setter) ? setter.u.obj : NULL, flags);
     } else {
-        val = js_get(ctx, desc, "value");
-        js_def(o.u.obj, key, val, flags);
+        if (has_value) val = js_get(ctx, desc, "value");
+        else if (cur && !(cur->flags & P_ACCESSOR)) val = cur->value;   /* preserve existing value */
+        KEEP(val);
+        if (has_writable) { if (js_to_boolean(js_get(ctx, desc, "writable"))) flags |= P_WRITABLE; else flags &= (unsigned char)~P_WRITABLE; }
+        flags &= (unsigned char)~P_ACCESSOR;
+        js_def(target, key, val, flags);
+    }
+    gc_pop_scope();
+    return 0;
+}
+/* Resolve a property-key value (Symbol or ToString) to its key string; *ks holds
+ * a ToString result that must be kept alive while the key is used. */
+static const char *to_key(js_ctx *ctx, js_value keyv, js_value *ks) {
+    *ks = js_undef();
+    if (keyv.type == JV_SYMBOL) return js_symbol_key(keyv);
+    *ks = js_to_string(ctx, keyv);
+    if (ctx->has_exc || ks->type != JV_STR) return NULL;
+    return ks->u.str->data;
+}
+static js_value object_defprop(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), desc = ARG(2), keyv = ARG(1), ks;
+    const char *key;
+    (void)t;
+    if (o.type != JV_OBJ) return js_throw_type(ctx, "defineProperty requires objects");
+    gc_push_scope();
+    KEEP(o); KEEP(desc); KEEP(keyv);
+    key = to_key(ctx, keyv, &ks);
+    if (ks.type == JV_STR) KEEP(ks);
+    if (!key) { gc_pop_scope(); return ctx->has_exc ? js_undef() : js_throw_type(ctx, "invalid property key"); }
+    define_one(ctx, o.u.obj, key, desc);
+    gc_pop_scope();
+    return o;
+}
+static js_value object_defineprops(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), props = ARG(1);
+    int i;
+    (void)t;
+    if (o.type != JV_OBJ) return js_throw_type(ctx, "defineProperties requires an object");
+    if (props.type != JV_OBJ) return o;
+    gc_push_scope();
+    KEEP(o); KEEP(props);
+    for (i = 0; i < props.u.obj->props.n && !ctx->has_exc; i++) {
+        pentry *pe = &props.u.obj->props.e[i];
+        if (!(pe->flags & P_ENUMERABLE)) continue;
+        define_one(ctx, o.u.obj, pe->key, js_get(ctx, props, pe->key));
     }
     gc_pop_scope();
     return o;
+}
+/* Build a property-descriptor object for own property `key`, or undefined if it
+ * isn't an own property. */
+static js_value make_desc(js_ctx *ctx, js_object *o, const char *key) {
+    pentry *pe = pmap_find_pub(o, key);
+    js_object *d;
+    js_value v;
+    if (!pe && !js_has_own(o, key)) return js_undef();
+    gc_push_scope();
+    d = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    if (pe && (pe->flags & P_ACCESSOR)) {
+        js_def(d, "get", pe->getter ? js_obj_value(pe->getter) : js_undef(), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(d, "set", pe->setter ? js_obj_value(pe->setter) : js_undef(), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(d, "enumerable",   js_bool(pe->flags & P_ENUMERABLE),   P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(d, "configurable", js_bool(pe->flags & P_CONFIGURABLE), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+    } else {
+        int is_len = o->kind == OBJ_ARRAY && strcmp(key, "length") == 0;
+        unsigned char f = pe ? pe->flags : (unsigned char)(P_WRITABLE | (is_len ? 0 : (P_ENUMERABLE | P_CONFIGURABLE)));
+        v = pe ? pe->value : js_get(ctx, js_obj_value(o), key);
+        gc_keep(refp(v));
+        js_def(d, "value",        v,                          P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(d, "writable",     js_bool(f & P_WRITABLE),     P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(d, "enumerable",   js_bool(f & P_ENUMERABLE),   P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(d, "configurable", js_bool(f & P_CONFIGURABLE), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+    }
+    gc_pop_scope();
+    return js_obj_value(d);
+}
+static js_value object_getownpropdesc(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), keyv = ARG(1), ks;
+    const char *key;
+    (void)t;
+    if (o.type != JV_OBJ) return js_undef();
+    gc_push_scope(); KEEP(o); KEEP(keyv);
+    key = to_key(ctx, keyv, &ks);
+    if (ks.type == JV_STR) KEEP(ks);
+    if (!key) { gc_pop_scope(); return js_undef(); }
+    { js_value r = make_desc(ctx, o.u.obj, key); gc_pop_scope(); return r; }
+}
+static js_value object_getownpropdescs(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0);
+    js_object *out;
+    int i;
+    (void)t;
+    gc_push_scope(); KEEP(o);
+    out = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    if (o.type == JV_OBJ)
+        for (i = 0; i < o.u.obj->props.n; i++) {
+            const char *k = o.u.obj->props.e[i].key;
+            js_value d = make_desc(ctx, o.u.obj, k);
+            if (d.type == JV_OBJ) js_def(out, k, d, P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        }
+    gc_pop_scope();
+    return js_obj_value(out);
+}
+static js_value object_isextensible(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); (void)t; (void)ctx; (void)n;
+    return js_bool(x.type == JV_OBJ && x.u.obj->extensible);
+}
+static js_value object_preventext(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); (void)t; (void)ctx; (void)n;
+    if (x.type == JV_OBJ) x.u.obj->extensible = 0;
+    return x;
+}
+static js_value object_seal(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); int i; (void)t; (void)ctx; (void)n;
+    if (x.type == JV_OBJ) { x.u.obj->extensible = 0; for (i = 0; i < x.u.obj->props.n; i++) x.u.obj->props.e[i].flags &= (unsigned char)~P_CONFIGURABLE; }
+    return x;
+}
+static js_value object_issealed(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); int i; (void)t; (void)ctx; (void)n;
+    if (x.type != JV_OBJ) return js_bool(1);
+    if (x.u.obj->extensible) return js_bool(0);
+    for (i = 0; i < x.u.obj->props.n; i++) if (x.u.obj->props.e[i].flags & P_CONFIGURABLE) return js_bool(0);
+    return js_bool(1);
+}
+static js_value object_is(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0), y = ARG(1); (void)t; (void)ctx; (void)n;
+    if (x.type == JV_NUM && y.type == JV_NUM) {
+        double dx = x.u.num, dy = y.u.num;
+        if (dx != dx && dy != dy) return js_bool(1);            /* NaN is NaN */
+        if (dx == 0 && dy == 0) return js_bool(signbit(dx) == signbit(dy));  /* +0 / -0 differ */
+        return js_bool(dx == dy);
+    }
+    return js_bool(js_strict_eq(x, y));
+}
+static js_value object_hasown(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), keyv = ARG(1), ks;
+    const char *key; int r;
+    (void)t;
+    if (o.type != JV_OBJ) return js_bool(0);
+    gc_push_scope(); KEEP(o); KEEP(keyv);
+    key = to_key(ctx, keyv, &ks);
+    if (ks.type == JV_STR) KEEP(ks);
+    r = key ? js_has_own(o.u.obj, key) : 0;
+    gc_pop_scope();
+    return js_bool(r);
+}
+static js_value proto_propisenum(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value keyv = ARG(0), ks;
+    const char *key; pentry *pe;
+    if (t.type != JV_OBJ) return js_bool(0);
+    gc_push_scope(); KEEP(t); KEEP(keyv);
+    key = to_key(ctx, keyv, &ks);
+    if (ks.type == JV_STR) KEEP(ks);
+    pe = key ? pmap_find_pub(t.u.obj, key) : NULL;
+    { int r = pe ? (pe->flags & P_ENUMERABLE) != 0
+               : (key && t.u.obj->kind == OBJ_ARRAY && js_has_own(t.u.obj, key) && strcmp(key, "length") != 0);
+      gc_pop_scope(); return js_bool(r); }
+}
+static js_value object_groupby(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value items = ARG(0), fn = ARG(1);
+    js_object *out, *arr;
+    unsigned i;
+    (void)t;
+    if (!js_is_callable(fn)) return js_throw_type(ctx, "groupBy callback is not a function");
+    arr = as_array(ctx, items);
+    gc_push_scope(); KEEP(items); KEEP(fn);
+    out = (js_object *)gc_keep(js_new_object(ctx, NULL));   /* null-prototype object */
+    if (arr)
+        for (i = 0; i < arr->elen && !ctx->has_exc; i++) {
+            js_value cargs[2], kv, ks, bucket;
+            const char *key;
+            cargs[0] = arr->elems[i]; cargs[1] = js_number(i);
+            kv = js_call(ctx, fn, js_undef(), cargs, 2);
+            if (ctx->has_exc) break;
+            ks = js_to_string(ctx, kv);
+            if (ctx->has_exc) break;
+            key = ks.u.str->data;
+            bucket = js_get(ctx, js_obj_value(out), key);
+            if (bucket.type != JV_OBJ || bucket.u.obj->kind != OBJ_ARRAY) {
+                bucket = js_obj_value(js_new_array(ctx, 0));
+                js_def(out, key, bucket, P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+            }
+            js_array_push(ctx, bucket.u.obj, arr->elems[i]);
+        }
+    gc_pop_scope();
+    return js_obj_value(out);
+}
+
+/* ------------------------------------------------------- Reflect ---------- */
+
+static int has_in_chain(js_object *o, const char *key) {
+    for (; o; o = o->proto) if (js_has_own(o, key)) return 1;
+    return 0;
+}
+static js_value reflect_get(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), keyv = ARG(1), ks; const char *key; (void)t;
+    if (o.type != JV_OBJ) return js_throw_type(ctx, "Reflect.get on non-object");
+    gc_push_scope(); KEEP(o); KEEP(keyv);
+    key = to_key(ctx, keyv, &ks); if (ks.type == JV_STR) KEEP(ks);
+    { js_value r = key ? js_get(ctx, o, key) : js_undef(); gc_pop_scope(); return r; }
+}
+static js_value reflect_set(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), keyv = ARG(1), v = ARG(2), ks; const char *key; (void)t;
+    if (o.type != JV_OBJ) return js_throw_type(ctx, "Reflect.set on non-object");
+    gc_push_scope(); KEEP(o); KEEP(keyv); KEEP(v);
+    key = to_key(ctx, keyv, &ks); if (ks.type == JV_STR) KEEP(ks);
+    if (key) js_set(ctx, o, key, v);
+    gc_pop_scope();
+    return js_bool(key != NULL && !ctx->has_exc);
+}
+static js_value reflect_has(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), keyv = ARG(1), ks; const char *key; int r; (void)t;
+    if (o.type != JV_OBJ) return js_throw_type(ctx, "Reflect.has on non-object");
+    gc_push_scope(); KEEP(o); KEEP(keyv);
+    key = to_key(ctx, keyv, &ks); if (ks.type == JV_STR) KEEP(ks);
+    r = key ? has_in_chain(o.u.obj, key) : 0;
+    gc_pop_scope();
+    return js_bool(r);
+}
+static js_value reflect_deleteprop(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), keyv = ARG(1), ks; const char *key; int r; (void)t;
+    if (o.type != JV_OBJ) return js_throw_type(ctx, "Reflect.deleteProperty on non-object");
+    gc_push_scope(); KEEP(o); KEEP(keyv);
+    key = to_key(ctx, keyv, &ks); if (ks.type == JV_STR) KEEP(ks);
+    r = key ? js_delete(o.u.obj, key) : 0;
+    gc_pop_scope();
+    return js_bool(r);
+}
+static js_value reflect_ownkeys(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0);
+    js_object *arr, *s;
+    int i;
+    (void)t;
+    if (o.type != JV_OBJ) return js_throw_type(ctx, "Reflect.ownKeys on non-object");
+    s = o.u.obj;
+    gc_push_scope(); KEEP(o);
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (s->kind == OBJ_ARRAY) {
+        unsigned e;
+        for (e = 0; e < s->elen; e++) { char ib[24]; u64toa((unsigned long long)e, ib, 10); js_array_push(ctx, arr, js_mk_cstring(ctx, ib)); }
+        js_array_push(ctx, arr, js_mk_cstring(ctx, "length"));
+    }
+    for (i = 0; i < s->props.n; i++) { const char *k = s->props.e[i].key; if ((unsigned char)k[0] >= 0x20) js_array_push(ctx, arr, js_mk_cstring(ctx, k)); }
+    if (ctx->sym_registry)
+        for (i = 0; i < s->props.n; i++) {
+            const char *k = s->props.e[i].key; unsigned r;
+            if (!(k[0] == 1 && k[1] == 's')) continue;
+            for (r = 0; r < ctx->sym_registry->elen; r++)
+                if (strcmp(js_symbol_key(ctx->sym_registry->elems[r]), k) == 0) { js_array_push(ctx, arr, ctx->sym_registry->elems[r]); break; }
+        }
+    gc_pop_scope();
+    return js_obj_value(arr);
+}
+static js_value reflect_defineprop(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0), keyv = ARG(1), desc = ARG(2), ks; const char *key; int rc; (void)t;
+    if (o.type != JV_OBJ) return js_throw_type(ctx, "Reflect.defineProperty on non-object");
+    gc_push_scope(); KEEP(o); KEEP(keyv); KEEP(desc);
+    key = to_key(ctx, keyv, &ks); if (ks.type == JV_STR) KEEP(ks);
+    rc = key ? define_one(ctx, o.u.obj, key, desc) : -1;
+    gc_pop_scope();
+    if (rc < 0 && ctx->has_exc) { ctx->has_exc = 0; return js_bool(0); }
+    return js_bool(rc == 0);
+}
+static js_value reflect_getownpropdesc(js_ctx *ctx, js_value t, js_value *a, int n) {
+    return object_getownpropdesc(ctx, t, a, n);
+}
+static js_value reflect_getproto(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); (void)t; (void)n;
+    if (x.type != JV_OBJ) return js_throw_type(ctx, "Reflect.getPrototypeOf on non-object");
+    return x.u.obj->proto ? js_obj_value(x.u.obj->proto) : js_null();
+}
+static js_value reflect_setproto(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0), p = ARG(1); (void)t; (void)n;
+    if (x.type != JV_OBJ) return js_throw_type(ctx, "Reflect.setPrototypeOf on non-object");
+    x.u.obj->proto = p.type == JV_OBJ ? p.u.obj : NULL;
+    return js_bool(1);
+}
+static js_value reflect_isext(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); (void)t; (void)n;
+    if (x.type != JV_OBJ) return js_throw_type(ctx, "Reflect.isExtensible on non-object");
+    return js_bool(x.u.obj->extensible);
+}
+static js_value reflect_preventext(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value x = ARG(0); (void)t; (void)n;
+    if (x.type != JV_OBJ) return js_throw_type(ctx, "Reflect.preventExtensions on non-object");
+    x.u.obj->extensible = 0;
+    return js_bool(1);
+}
+/* Spread an array-like's elements into a fresh argv; caller frees. */
+static js_value *spread_args(js_ctx *ctx, js_value list, int *argc) {
+    js_object *arr = list.type == JV_OBJ ? as_array(ctx, list) : NULL;
+    js_value *argv;
+    unsigned i;
+    *argc = arr ? (int)arr->elen : 0;
+    argv = (js_value *)malloc((unsigned)(*argc > 0 ? *argc : 1) * sizeof(js_value));
+    for (i = 0; arr && i < arr->elen; i++) argv[i] = arr->elems[i];
+    return argv;
+}
+static js_value reflect_apply(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value fn = ARG(0), thisv = ARG(1), list = ARG(2), r;
+    js_value *argv; int argc; (void)t;
+    if (!js_is_callable(fn)) return js_throw_type(ctx, "Reflect.apply target is not a function");
+    gc_push_scope(); KEEP(fn); KEEP(thisv); KEEP(list);
+    argv = spread_args(ctx, list, &argc);
+    { int i; for (i = 0; i < argc; i++) gc_keep(refp(argv[i])); }
+    r = js_call(ctx, fn, thisv, argv, argc);
+    free(argv);
+    gc_pop_scope();
+    return r;
+}
+static js_value reflect_construct(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value fn = ARG(0), list = ARG(1), r;
+    js_value *argv; int argc; (void)t;
+    if (!js_is_callable(fn)) return js_throw_type(ctx, "Reflect.construct target is not a function");
+    gc_push_scope(); KEEP(fn); KEEP(list);
+    argv = spread_args(ctx, list, &argc);
+    { int i; for (i = 0; i < argc; i++) gc_keep(refp(argv[i])); }
+    r = js_construct(ctx, fn, argv, argc);
+    free(argv);
+    gc_pop_scope();
+    return r;
+}
+
+/* ------------------------------------------------------- Array (iterators + ES2022/2023) -- */
+
+static js_value array_iter_next(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value tgt = js_get(ctx, t, "@t");
+    int i = (int)js_to_number(ctx, js_get(ctx, t, "@i"));
+    int kind = (int)js_to_number(ctx, js_get(ctx, t, "@i2"));
+    js_object *arr = (tgt.type == JV_OBJ && tgt.u.obj->kind == OBJ_ARRAY) ? tgt.u.obj : NULL;
+    js_object *res;
+    (void)a; (void)n;
+    gc_push_scope();
+    res = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    if (!arr || i >= (int)arr->elen) {
+        js_def(res, "value", js_undef(), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(res, "done", js_bool(1), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+        return js_obj_value(res);
+    }
+    js_set(ctx, t, "@i", js_number(i + 1));
+    {
+        js_value val;
+        if (kind == 1) val = js_number(i);
+        else if (kind == 2) { js_object *pair = js_new_array(ctx, 0); gc_keep(pair); js_array_push(ctx, pair, js_number(i)); js_array_push(ctx, pair, arr->elems[i]); val = js_obj_value(pair); }
+        else val = arr->elems[i];
+        js_def(res, "value", val, P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+        js_def(res, "done", js_bool(0), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+    }
+    gc_pop_scope();
+    return js_obj_value(res);
+}
+static js_value make_array_iter(js_ctx *ctx, js_value target, int kind) {
+    js_object *it;
+    gc_push_scope();
+    it = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    KEEP(target);
+    js_def(it, "@t", target, P_WRITABLE);
+    js_def(it, "@i", js_number(0), P_WRITABLE);
+    js_def(it, "@i2", js_number(kind), P_WRITABLE);
+    js_def_native(ctx, it, "next", array_iter_next, 0);
+    { js_object *f = js_new_native(ctx, iter_self, "", 0); js_def(it, js_symbol_key(ctx->sym_iterator), js_obj_value(f), 0); }
+    gc_pop_scope();
+    return js_obj_value(it);
+}
+static js_value array_values_m(js_ctx *ctx, js_value t, js_value *a, int n)  { (void)a; (void)n; return make_array_iter(ctx, t, 0); }
+static js_value array_keys_m(js_ctx *ctx, js_value t, js_value *a, int n)    { (void)a; (void)n; return make_array_iter(ctx, t, 1); }
+static js_value array_entries_m(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return make_array_iter(ctx, t, 2); }
+static js_value array_at(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t);
+    int i;
+    if (!arr) return js_undef();
+    i = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    if (i < 0) i += (int)arr->elen;
+    if (i < 0 || i >= (int)arr->elen) return js_undef();
+    return arr->elems[i];
+}
+static js_value array_flatmap(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t), *out;
+    js_value fn = ARG(0), self = ARG(1);
+    unsigned i;
+    if (!arr) return js_undef();
+    if (!js_is_callable(fn)) return js_throw_type(ctx, "flatMap callback is not a function");
+    gc_push_scope(); KEEP(t); KEEP(fn); KEEP(self);
+    out = (js_object *)gc_keep(js_new_array(ctx, 0));
+    for (i = 0; i < arr->elen && !ctx->has_exc; i++) {
+        js_value cargs[3], r;
+        cargs[0] = arr->elems[i]; cargs[1] = js_number(i); cargs[2] = t;
+        r = js_call(ctx, fn, self, cargs, 3);
+        if (ctx->has_exc) break;
+        if (r.type == JV_OBJ && r.u.obj->kind == OBJ_ARRAY) { unsigned j; for (j = 0; j < r.u.obj->elen; j++) js_array_push(ctx, out, r.u.obj->elems[j]); }
+        else js_array_push(ctx, out, r);
+    }
+    gc_pop_scope();
+    return js_obj_value(out);
+}
+static js_value array_findlast(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t);
+    js_value fn = ARG(0), self = ARG(1);
+    int i;
+    if (!arr) return js_undef();
+    if (!js_is_callable(fn)) return js_throw_type(ctx, "findLast callback is not a function");
+    gc_push_scope(); KEEP(t); KEEP(fn); KEEP(self);
+    for (i = (int)arr->elen - 1; i >= 0 && !ctx->has_exc; i--) {
+        js_value cargs[3], r;
+        cargs[0] = arr->elems[i]; cargs[1] = js_number(i); cargs[2] = t;
+        r = js_call(ctx, fn, self, cargs, 3);
+        if (!ctx->has_exc && js_to_boolean(r)) { js_value v = arr->elems[i]; gc_pop_scope(); return v; }
+    }
+    gc_pop_scope();
+    return js_undef();
+}
+static js_value array_findlastindex(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t);
+    js_value fn = ARG(0), self = ARG(1);
+    int i;
+    if (!arr) return js_number(-1);
+    if (!js_is_callable(fn)) return js_throw_type(ctx, "findLastIndex callback is not a function");
+    gc_push_scope(); KEEP(t); KEEP(fn); KEEP(self);
+    for (i = (int)arr->elen - 1; i >= 0 && !ctx->has_exc; i--) {
+        js_value cargs[3], r;
+        cargs[0] = arr->elems[i]; cargs[1] = js_number(i); cargs[2] = t;
+        r = js_call(ctx, fn, self, cargs, 3);
+        if (!ctx->has_exc && js_to_boolean(r)) { gc_pop_scope(); return js_number(i); }
+    }
+    gc_pop_scope();
+    return js_number(-1);
+}
+static js_value array_reduceright(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t);
+    js_value fn = ARG(0), acc;
+    int i;
+    if (!arr) return js_undef();
+    if (!js_is_callable(fn)) return js_throw_type(ctx, "reduceRight callback is not a function");
+    gc_push_scope(); KEEP(t); KEEP(fn);
+    i = (int)arr->elen - 1;
+    if (n > 1) acc = a[1];
+    else { if (arr->elen == 0) { gc_pop_scope(); return js_throw_type(ctx, "reduce of empty array with no initial value"); } acc = arr->elems[i]; i--; }
+    gc_keep(refp(acc));
+    for (; i >= 0 && !ctx->has_exc; i--) {
+        js_value cargs[4];
+        cargs[0] = acc; cargs[1] = arr->elems[i]; cargs[2] = js_number(i); cargs[3] = t;
+        acc = js_call(ctx, fn, js_undef(), cargs, 4);
+        KEEP(acc);
+    }
+    gc_pop_scope();
+    return acc;
+}
+static js_value array_copywithin(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *arr = as_array(ctx, t);
+    int len, target, start, end;
+    js_value *tmp;
+    int i, count;
+    if (!arr) return t;
+    len = (int)arr->elen;
+    target = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+    start  = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
+    end    = n > 2 && a[2].type != JV_UNDEF ? (int)js_to_number(ctx, a[2]) : len;
+    if (target < 0) target += len; if (target < 0) target = 0; if (target > len) target = len;
+    if (start < 0)  start  += len; if (start  < 0) start  = 0; if (start  > len) start  = len;
+    if (end < 0)    end    += len; if (end    < 0) end    = 0; if (end    > len) end    = len;
+    count = end - start; if (count > len - target) count = len - target;
+    if (count <= 0) return t;
+    tmp = (js_value *)malloc((unsigned)count * sizeof(js_value));
+    for (i = 0; i < count; i++) tmp[i] = arr->elems[start + i];
+    for (i = 0; i < count; i++) arr->elems[target + i] = tmp[i];
+    free(tmp);
+    return t;
 }
 static js_value object_ownnames(js_ctx *ctx, js_value t, js_value *a, int n) {
     js_value o = ARG(0);
@@ -330,7 +846,34 @@ static js_value object_ownnames(js_ctx *ctx, js_value t, js_value *a, int n) {
     gc_push_scope(); KEEP(o);
     arr = (js_object *)gc_keep(js_new_array(ctx, 0));
     if (s->kind == OBJ_ARRAY) { unsigned e; for (e = 0; e < s->elen; e++) { char ib[24]; u64toa((unsigned long long)e, ib, 10); js_array_push(ctx, arr, js_mk_cstring(ctx, ib)); } js_array_push(ctx, arr, js_mk_cstring(ctx, "length")); }
-    for (i = 0; i < s->props.n; i++) js_array_push(ctx, arr, js_mk_cstring(ctx, s->props.e[i].key));
+    for (i = 0; i < s->props.n; i++) {
+        const char *k = s->props.e[i].key;
+        if (k[0] == 1) continue;                 /* a Symbol key — not a string name */
+        js_array_push(ctx, arr, js_mk_cstring(ctx, k));
+    }
+    gc_pop_scope();
+    return js_obj_value(arr);
+}
+
+/* Object.getOwnPropertySymbols: the Symbol-keyed own properties, as Symbols.
+ * Internal keys are the symbol's host string ("\x01s<id>"); the per-context
+ * registry maps each such string back to the live Symbol object. */
+static js_value object_getownsymbols(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value o = ARG(0);
+    js_object *arr, *s, *reg = ctx->sym_registry;
+    int i;
+    (void)t;
+    gc_push_scope(); KEEP(o);
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (o.type != JV_OBJ || !reg) { gc_pop_scope(); return js_obj_value(arr); }
+    s = o.u.obj;
+    for (i = 0; i < s->props.n; i++) {
+        const char *key = s->props.e[i].key;
+        unsigned r;
+        if (!(key[0] == 1 && key[1] == 's')) continue;     /* not a Symbol key */
+        for (r = 0; r < reg->elen; r++)
+            if (strcmp(js_symbol_key(reg->elems[r]), key) == 0) { js_array_push(ctx, arr, reg->elems[r]); break; }
+    }
     gc_pop_scope();
     return js_obj_value(arr);
 }
@@ -363,10 +906,44 @@ static js_value op_hasown(js_ctx *ctx, js_value t, js_value *a, int n) {
     }
     return js_bool(js_has_own(t.u.obj, key));
 }
+/* Object.prototype.toString: "[object Tag]" per the spec's builtinTag, with a
+ * string Symbol.toStringTag overriding it. */
 static js_value op_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
+    const char *tag = "Object";
+    char buf[80]; int i = 0; const char *p;
     (void)a; (void)n;
-    if (t.type == JV_OBJ && t.u.obj->kind == OBJ_ARRAY) return js_undef();   /* array overrides */
-    return js_mk_cstring(ctx, "[object Object]");
+    if (t.type == JV_UNDEF) tag = "Undefined";
+    else if (t.type == JV_NULL) tag = "Null";
+    else if (t.type == JV_NUM) tag = "Number";
+    else if (t.type == JV_BOOL) tag = "Boolean";
+    else if (t.type == JV_STR) tag = "String";
+    else if (t.type == JV_SYMBOL) tag = "Symbol";
+    else if (t.type == JV_OBJ) {
+        js_object *o = t.u.obj;
+        if (o->kind == OBJ_ARRAY) tag = "Array";
+        else if (o->kind == OBJ_FUNCTION) tag = "Function";
+        else if (o->kind == OBJ_ERROR) tag = "Error";
+        if (ctx->sym_tostringtag.type == JV_SYMBOL) {
+            js_value tt = js_get(ctx, t, js_symbol_key(ctx->sym_tostringtag));
+            if (tt.type == JV_STR) tag = tt.u.str->data;   /* copied into buf below before any alloc */
+        }
+    }
+    for (p = "[object "; *p; p++) buf[i++] = *p;
+    for (p = tag; *p && i < 70; p++) buf[i++] = *p;
+    buf[i++] = ']'; buf[i] = 0;
+    return js_mk_cstring(ctx, buf);
+}
+static js_value function_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
+    char buf[160]; int i = 0; const char *p, *nm = "";
+    (void)a; (void)n;
+    if (t.type != JV_OBJ || t.u.obj->kind != OBJ_FUNCTION)
+        return js_throw_type(ctx, "Function.prototype.toString requires a function");
+    if (t.u.obj->fn && t.u.obj->fn->name) nm = t.u.obj->fn->name;
+    for (p = "function "; *p; p++) buf[i++] = *p;
+    for (p = nm; *p && i < 130; p++) buf[i++] = *p;
+    for (p = "() { [native code] }"; *p; p++) buf[i++] = *p;
+    buf[i] = 0;
+    return js_mk_cstring(ctx, buf);
 }
 static js_value op_valueof(js_ctx *ctx, js_value t, js_value *a, int n) { (void)ctx; (void)a; (void)n; return t; }
 static js_value op_isproto(js_ctx *ctx, js_value t, js_value *a, int n) {
@@ -405,6 +982,30 @@ static js_value array_from(js_ctx *ctx, js_value t, js_value *a, int n) {
     (void)t;
     gc_push_scope(); KEEP(src); KEEP(fn);
     arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    /* Iterable (has a callable Symbol.iterator) that isn't a plain Array/String:
+     * drive the iterator protocol — Map/Set, generators, the array iterators. */
+    if (src.type == JV_OBJ && src.u.obj->kind != OBJ_ARRAY) {
+        js_value itfn = js_get(ctx, src, js_symbol_key(ctx->sym_iterator));
+        if (js_is_callable(itfn)) {
+            js_value iter = js_call(ctx, itfn, src, NULL, 0);
+            unsigned idx = 0;
+            KEEP(iter);
+            while (!ctx->has_exc && iter.type == JV_OBJ) {
+                js_value nextfn = js_get(ctx, iter, "next"), res, val;
+                if (!js_is_callable(nextfn)) break;
+                res = js_call(ctx, nextfn, iter, NULL, 0);
+                if (ctx->has_exc || res.type != JV_OBJ) break;
+                if (js_to_boolean(js_get(ctx, res, "done"))) break;
+                val = js_get(ctx, res, "value");
+                KEEP(val);
+                if (has_fn) { js_value cargs[2]; cargs[0] = val; cargs[1] = js_number(idx); val = js_call(ctx, fn, js_undef(), cargs, 2); }
+                js_array_push(ctx, arr, val);
+                idx++;
+            }
+            gc_pop_scope();
+            return js_obj_value(arr);
+        }
+    }
     if (src.type == JV_OBJ && src.u.obj->kind == OBJ_ARRAY) len = src.u.obj->elen;
     else if (src.type == JV_STR) len = (unsigned)src.u.str->len;
     else if (src.type == JV_OBJ) { js_value l = js_get(ctx, src, "length"); len = js_to_uint32(ctx, l); }
@@ -2165,20 +2766,40 @@ static js_value symbol_ctor(js_ctx *ctx, js_value t, js_value *a, int n) {
 }
 static js_value symbol_for(js_ctx *ctx, js_value t, js_value *a, int n) {
     js_value key = js_to_string(ctx, ARG(0)), reg, existing;
-    (void)n;
-    reg = js_get(ctx, t, "@reg");                     /* the global symbol registry */
-    if (reg.type != JV_OBJ) return js_undef();
+    (void)t; (void)n;
+    if (!ctx->sym_for_reg) return js_undef();
+    reg = js_obj_value(ctx->sym_for_reg);             /* the shared global registry (not `this`) */
     existing = js_get(ctx, reg, key.u.str->data);
     if (existing.type == JV_SYMBOL) return existing;
     gc_push_scope(); KEEP(key);
     { js_value sym = js_mk_symbol(ctx, key.u.str->data); js_set(ctx, reg, key.u.str->data, sym); gc_pop_scope(); return sym; }
 }
+/* Symbol.keyFor: the registry key for a symbol made by Symbol.for, else undefined. */
+static js_value symbol_keyfor(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = ARG(0);
+    js_object *reg = ctx->sym_for_reg;
+    int i;
+    (void)t; (void)n;
+    if (s.type != JV_SYMBOL) return js_throw_type(ctx, "Symbol.keyFor requires a symbol");
+    if (!reg) return js_undef();
+    for (i = 0; i < reg->props.n; i++)
+        if (reg->props.e[i].value.type == JV_SYMBOL && reg->props.e[i].value.u.obj == s.u.obj)
+            return js_mk_cstring(ctx, reg->props.e[i].key);
+    return js_undef();
+}
+/* Accept either a primitive Symbol or a boxed one (Object(sym), an OBJ_SYMBOL
+ * exposed as JV_OBJ), so Symbol.prototype methods work on both receivers. */
+static int symbol_this(js_value t, js_object **o) {
+    if (t.type == JV_SYMBOL || (t.type == JV_OBJ && t.u.obj->kind == OBJ_SYMBOL)) { *o = t.u.obj; return 1; }
+    return 0;
+}
 static js_value symbol_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
     js_value d;
     sbuf sb;
+    js_object *so;
     (void)a; (void)n;
-    if (t.type != JV_SYMBOL) return js_mk_cstring(ctx, "Symbol()");
-    d = js_get(ctx, js_obj_value(t.u.obj), "@desc");
+    if (!symbol_this(t, &so)) return js_mk_cstring(ctx, "Symbol()");
+    d = js_get(ctx, js_obj_value(so), "@desc");
     sb.b = 0; sb.n = 0; sb.cap = 0;
     sb_puts(&sb, "Symbol(");
     if (d.type == JV_STR) sb_put(&sb, d.u.str->data, d.u.str->len);
@@ -2186,11 +2807,17 @@ static js_value symbol_tostring(js_ctx *ctx, js_value t, js_value *a, int n) {
     { js_value r = str_of(ctx, sb.b ? sb.b : "Symbol()", sb.n); if (sb.b) free(sb.b); return r; }
 }
 static js_value symbol_desc_get(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *so;
     (void)a; (void)n;
-    if (t.type != JV_SYMBOL) return js_undef();
-    return js_get(ctx, js_obj_value(t.u.obj), "@desc");
+    if (!symbol_this(t, &so)) return js_undef();
+    return js_get(ctx, js_obj_value(so), "@desc");
 }
-static js_value symbol_valueof(js_ctx *ctx, js_value t, js_value *a, int n) { (void)ctx; (void)a; (void)n; return t; }
+static js_value symbol_valueof(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_object *so;
+    (void)ctx; (void)a; (void)n;
+    if (symbol_this(t, &so)) { js_value v; v.type = JV_SYMBOL; v.u.obj = so; return v; }
+    return t;
+}
 
 /* ------------------------------------------------------- Map / Set -------- */
 
@@ -3018,11 +3645,44 @@ void js_setup_builtins(js_ctx *ctx) {
         js_def_native(ctx, octor, "isFrozen", object_isfrozen, 1);
         js_def_native(ctx, octor, "defineProperty", object_defprop, 3);
         js_def_native(ctx, octor, "getOwnPropertyNames", object_ownnames, 1);
+        js_def_native(ctx, octor, "getOwnPropertySymbols", object_getownsymbols, 1);
         js_def_native(ctx, octor, "fromEntries", object_fromentries, 1);
+        js_def_native(ctx, octor, "defineProperties", object_defineprops, 2);
+        js_def_native(ctx, octor, "getOwnPropertyDescriptor", object_getownpropdesc, 2);
+        js_def_native(ctx, octor, "getOwnPropertyDescriptors", object_getownpropdescs, 1);
+        js_def_native(ctx, octor, "isExtensible", object_isextensible, 1);
+        js_def_native(ctx, octor, "preventExtensions", object_preventext, 1);
+        js_def_native(ctx, octor, "seal", object_seal, 1);
+        js_def_native(ctx, octor, "isSealed", object_issealed, 1);
+        js_def_native(ctx, octor, "is", object_is, 2);
+        js_def_native(ctx, octor, "hasOwn", object_hasown, 2);
+        js_def_native(ctx, octor, "groupBy", object_groupby, 2);
+        js_def_native(ctx, ctx->object_proto, "propertyIsEnumerable", proto_propisenum, 1);
+    }
+
+    /* Reflect */
+    {
+        js_object *refl = js_new_object(ctx, ctx->object_proto);
+        gc_push_scope(); gc_keep(refl);
+        js_def(ctx->global, "Reflect", js_obj_value(refl), P_WRITABLE | P_CONFIGURABLE);
+        js_def_native(ctx, refl, "get", reflect_get, 2);
+        js_def_native(ctx, refl, "set", reflect_set, 3);
+        js_def_native(ctx, refl, "has", reflect_has, 2);
+        js_def_native(ctx, refl, "deleteProperty", reflect_deleteprop, 2);
+        js_def_native(ctx, refl, "ownKeys", reflect_ownkeys, 1);
+        js_def_native(ctx, refl, "defineProperty", reflect_defineprop, 3);
+        js_def_native(ctx, refl, "getOwnPropertyDescriptor", reflect_getownpropdesc, 2);
+        js_def_native(ctx, refl, "getPrototypeOf", reflect_getproto, 1);
+        js_def_native(ctx, refl, "setPrototypeOf", reflect_setproto, 2);
+        js_def_native(ctx, refl, "isExtensible", reflect_isext, 1);
+        js_def_native(ctx, refl, "preventExtensions", reflect_preventext, 1);
+        js_def_native(ctx, refl, "apply", reflect_apply, 3);
+        js_def_native(ctx, refl, "construct", reflect_construct, 2);
+        gc_pop_scope();
     }
 
     /* Function.prototype (minimal) */
-    js_def_native(ctx, ctx->function_proto, "toString", op_tostring, 0);
+    js_def_native(ctx, ctx->function_proto, "toString", function_tostring, 0);
     js_def_native(ctx, ctx->function_proto, "call", fn_call, 1);
     js_def_native(ctx, ctx->function_proto, "apply", fn_apply, 2);
     js_def_native(ctx, ctx->function_proto, "bind", fn_bind, 1);
@@ -3052,6 +3712,15 @@ void js_setup_builtins(js_ctx *ctx) {
     js_def_native(ctx, ctx->array_proto, "fill", array_fill, 1);
     js_def_native(ctx, ctx->array_proto, "flat", array_flat, 0);
     js_def_native(ctx, ctx->array_proto, "sort", array_sort, 1);
+    js_def_native(ctx, ctx->array_proto, "at", array_at, 1);
+    js_def_native(ctx, ctx->array_proto, "flatMap", array_flatmap, 1);
+    js_def_native(ctx, ctx->array_proto, "findLast", array_findlast, 1);
+    js_def_native(ctx, ctx->array_proto, "findLastIndex", array_findlastindex, 1);
+    js_def_native(ctx, ctx->array_proto, "reduceRight", array_reduceright, 1);
+    js_def_native(ctx, ctx->array_proto, "copyWithin", array_copywithin, 2);
+    js_def_native(ctx, ctx->array_proto, "values", array_values_m, 0);
+    js_def_native(ctx, ctx->array_proto, "keys", array_keys_m, 0);
+    js_def_native(ctx, ctx->array_proto, "entries", array_entries_m, 0);
     {
         js_object *actor = make_ctor(ctx, "Array", native_array, ctx->array_proto);
         js_def_native(ctx, actor, "isArray", array_isarray, 1);
@@ -3190,14 +3859,17 @@ void js_setup_builtins(js_ctx *ctx) {
     {
         js_object *sctor = make_ctor(ctx, "Symbol", symbol_ctor, ctx->symbol_proto);
         gc_push_scope(); gc_keep(sctor);
-        js_def(sctor, "@reg", js_obj_value(js_new_object(ctx, ctx->object_proto)), 0);
+        ctx->sym_for_reg = js_new_object(ctx, ctx->object_proto);
+        js_def(sctor, "@reg", js_obj_value(ctx->sym_for_reg), 0);
         js_def_native(ctx, sctor, "for", symbol_for, 1);
+        js_def_native(ctx, sctor, "keyFor", symbol_keyfor, 1);
         ctx->sym_iterator = js_mk_symbol(ctx, "Symbol.iterator");
         js_def(sctor, "iterator", ctx->sym_iterator, 0);
         js_def(sctor, "asyncIterator", js_mk_symbol(ctx, "Symbol.asyncIterator"), 0);
         js_def(sctor, "hasInstance", js_mk_symbol(ctx, "Symbol.hasInstance"), 0);
         js_def(sctor, "toPrimitive", js_mk_symbol(ctx, "Symbol.toPrimitive"), 0);
-        js_def(sctor, "toStringTag", js_mk_symbol(ctx, "Symbol.toStringTag"), 0);
+        ctx->sym_tostringtag = js_mk_symbol(ctx, "Symbol.toStringTag");
+        js_def(sctor, "toStringTag", ctx->sym_tostringtag, 0);
         gc_pop_scope();
     }
     { js_object *f = js_new_native(ctx, set_values, "[Symbol.iterator]", 0); js_def(ctx->array_proto, js_symbol_key(ctx->sym_iterator), js_obj_value(f), 0); }

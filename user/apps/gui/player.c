@@ -6,23 +6,22 @@
  * since OwOS has no file-open dialog yet — the load path is `player <file>` from
  * the terminal, the same way imgview/play take their argument.
  *
- * Like /bin/play, being a user program is the point: the file is pulled off disk in
- * small reads (a 30 MiB song never lives in memory), decoded/resampled to the
- * device's canonical 48 kHz / 16-bit / stereo here in user space, and pushed to
- * the kernel one bounded chunk at a time — which back-pressures. The whole
- * multi-minute playback is a normal preemptible process, so a decode bug is a
- * contained crash, not a kernel hang. The decode core (decode_next + the 16.16
- * fixed-point resampler) mirrors play.c; the difference is that the chunk loop
- * is driven by the window event loop so the UI stays live during playback.
+ * Decoding, resampling to the device's 48 kHz / 16-bit / stereo, and seeking all
+ * live in user/lib/media (shared with the browser's <audio>/<video>): the file is
+ * pulled off disk in small reads (a 30 MiB song never lives in memory), so the
+ * whole multi-minute playback is a normal preemptible process and a decode bug is
+ * a contained crash, not a kernel hang. The player keeps the kernel audio stream
+ * itself (a single foreground song needs no mixing) and drives the decode->write
+ * chunk loop from the window event loop, so the UI stays live during playback.
  *
- * The two new gfx widgets drive the UI: progress_draw for the bar (click it to
- * seek) and button_draw/button_hit for the transport. There are no mouse-move
- * events (WEV_MOUSE is a click), so BTN_HOVER is never used; a click flashes
- * BTN_PRESSED for a few frames, and the empty player draws BTN_DISABLED.
+ * The two gfx widgets drive the UI: progress_draw for the bar (click it to seek)
+ * and button_draw/button_hit for the transport. There are no mouse-move events
+ * (WEV_MOUSE is a click), so BTN_HOVER is never used; a click flashes BTN_PRESSED
+ * for a few frames, and the empty player draws BTN_DISABLED.
  */
 #include "owos.h"
 #include "gfx.h"
-#include "mp3.h"
+#include "media.h"
 
 /* ---- window geometry ---------------------------------------------------- */
 #define CW 440
@@ -49,205 +48,37 @@ static int g_press = -1, g_press_ticks;
 static int g_bx[3], g_bw[3];
 static const char *g_blabel[3];    /* [1] swaps Play/Pause with state */
 
-/* ---- source: WAV stream or MPEG decoder (mirrors play.c) ----------------- */
-static int          src_is_mp3;
-static const char  *src_fn;
-static unsigned     src_size;      /* whole-file size                         */
-static unsigned     src_rate;      /* native sample rate, Hz                  */
+/* ---- source: the shared media decoder ----------------------------------- */
+static media_decoder *g_dec;
+static char           g_fn[256];   /* loaded file path, for the header title  */
 
-/* WAV cursor */
-static unsigned     w_data_off, w_data_len, w_bits, w_channels, w_frame;
-static unsigned     w_filepos;     /* byte cursor into the data region        */
-static unsigned char w_in[65536];  /* raw source PCM, refilled by readfile_at */
-static unsigned     w_inlen, w_inpos;
-
-/* MPEG decoder */
-static mp3_t        m3;
-
-/* shared decode/resample cursor */
-static short        curL, curR;    /* current (held) source frame            */
-static int          eof;
-static unsigned long pos_frames;   /* source frames consumed (for the clock)  */
-static unsigned long total_frames; /* WAV: exact; MP3: 0 (unknown)            */
-static unsigned     step, acc;     /* 16.16 input-frames-per-output-frame     */
-static int          primed;
-
-static unsigned rd_le32(const unsigned char *p)
-{ return p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned)p[3] << 24); }
-static unsigned rd_le16(const unsigned char *p) { return p[0] | (p[1] << 8); }
-static int tageq(const unsigned char *p, const char *s)
-{ return p[0]==s[0] && p[1]==s[1] && p[2]==s[2] && p[3]==s[3]; }
-
-/* Decode the next source frame into curL/curR; sets eof at end of data. */
-static void decode_next(void)
+/* ---- file loading ------------------------------------------------------- */
+static int load_file(const char *fn)
 {
-	if (eof) { curL = curR = 0; return; }
-
-	if (src_is_mp3) {
-		short f[2];
-		if (mp3_read(&m3, f, 1) <= 0) { eof = 1; curL = curR = 0; return; }
-		curL = f[0]; curR = f[1];
-		pos_frames++;
-		return;
-	}
-
-	if (w_inpos + w_frame > w_inlen) {                  /* refill input buffer */
-		if (w_filepos >= w_data_len) { eof = 1; curL = curR = 0; return; }
-		unsigned want = w_data_len - w_filepos;
-		if (want > sizeof w_in) want = sizeof w_in;
-		want -= want % w_frame;
-		if (want == 0) want = w_frame;
-		int got = readfile_at(src_fn, w_data_off + w_filepos, w_in, want);
-		if (got <= 0 || (unsigned)got < w_frame) { eof = 1; curL = curR = 0; return; }
-		w_inlen = (unsigned)got; w_inpos = 0; w_filepos += (unsigned)got;
-	}
-
-	const unsigned char *s = w_in + w_inpos;
-	w_inpos += w_frame;
-	if (w_bits == 8) {
-		int l = ((int)s[0] - 128) << 8;
-		curL = (short)l;
-		curR = (short)((w_channels == 2) ? (((int)s[1] - 128) << 8) : l);
-	} else {
-		curL = (short)rd_le16(s);
-		curR = (w_channels == 2) ? (short)rd_le16(s + 2) : curL;
-	}
-	pos_frames++;
+	media_decoder *d = media_open(fn);
+	int i;
+	if (!d)
+		return -1;
+	if (g_dec) media_close(g_dec);
+	g_dec = d;
+	for (i = 0; i < (int)sizeof g_fn - 1 && fn[i]; i++) g_fn[i] = fn[i];
+	g_fn[i] = '\0';
+	g_state = ST_STOPPED;
+	return 0;
 }
 
-/* Produce one chunk of `outframes` 48 kHz/S16/stereo frames into out (2 shorts
- * each). Returns frames produced, or 0 at end of stream. acc/step persist across
- * calls so resampling is continuous. */
-static unsigned produce_chunk(short *out, unsigned outframes)
-{
-	if (!primed) { decode_next(); primed = 1; acc = 0; }
-	if (eof) return 0;
-	unsigned produced = 0;
-	while (produced < outframes) {
-		out[produced * 2 + 0] = curL;
-		out[produced * 2 + 1] = curR;
-		produced++;
-		if (eof) break;
-		acc += step;
-		while (acc >= 0x10000u && !eof) { decode_next(); acc -= 0x10000u; }
-	}
-	return produced;
-}
-
-/* Reset the read cursor to source fraction f (0..1), seeking the active source.
- * WAV seeks sample-accurately; MP3 seeks by byte offset (minimp3 resyncs on the
- * next frame). Keeps the current play/pause state. */
-static unsigned long est_total_frames(void); /* fwd */
-
+/* Seek to source fraction num/den (0..1), clamped. Needs a known duration; an
+ * MPEG stream's duration sharpens after a little has played. */
 static void seek_fraction(int num, int den)
 {
+	unsigned dur = media_duration_ms(g_dec);
 	if (den <= 0) den = 1;
 	if (num < 0) num = 0;
 	if (num > den) num = den;
-
-	if (src_is_mp3) {
-		/* byte-offset seek */
-		unsigned off = (unsigned)((unsigned long)src_size * (unsigned)num / (unsigned)den);
-		m3.file_off = off;
-		m3.in_len   = 0;
-		m3.out_pos  = m3.out_frames;   /* force a refill on the next read */
-		m3.src_eof  = 0;
-		/* Baseline the clock against the running duration estimate, if any. */
-		unsigned long tf = est_total_frames();
-		pos_frames = tf ? tf * (unsigned)num / (unsigned)den : 0;
-	} else {
-		unsigned long tgt = total_frames * (unsigned)num / (unsigned)den;
-		w_filepos = (unsigned)tgt * w_frame;
-		if (w_filepos > w_data_len) w_filepos = w_data_len - (w_data_len % w_frame);
-		w_inlen = w_inpos = 0;
-		pos_frames = tgt;
-	}
-	eof = 0;
-	primed = 0;          /* re-prime curL/curR from the new position */
-	acc = 0;
-}
-
-/* WAV: exact total frames. MP3: extrapolate from how far we've decoded so far
- * (bytes consumed vs. file size), or 0 before anything has played. */
-static unsigned long est_total_frames(void)
-{
-	if (!src_is_mp3) return total_frames;
-	if (pos_frames == 0 || m3.file_off == 0 || src_size == 0) return 0;
-	unsigned elapsed = (unsigned)(pos_frames / (src_rate ? src_rate : 1));
-	if (elapsed == 0) return 0;
-	unsigned bps = m3.file_off / elapsed;       /* source bytes per second */
-	if (bps == 0) return 0;
-	return (unsigned long)(src_size / bps) * (src_rate ? src_rate : 1);
-}
-
-/* ---- file loading ------------------------------------------------------- */
-static int load_wav(const char *fn, unsigned size)
-{
-	unsigned char hdr[256];
-	int got = readfile_at(fn, 0, hdr, sizeof hdr);
-	if (got < 44 || !tageq(hdr, "RIFF") || !tageq(hdr + 8, "WAVE"))
-		return -1;
-
-	unsigned fmt = 0, channels = 0, bits = 0, rate = 0, data_off = 0, data_len = 0;
-	for (unsigned pos = 12; pos + 8 <= (unsigned)got; ) {
-		const unsigned char *c = hdr + pos;
-		unsigned sz = rd_le32(c + 4);
-		if (tageq(c, "fmt ")) {
-			fmt = rd_le16(c + 8); channels = rd_le16(c + 10);
-			rate = rd_le32(c + 12); bits = rd_le16(c + 22);
-		} else if (tageq(c, "data")) {
-			data_off = pos + 8; data_len = sz; break;
-		}
-		pos += 8 + sz + (sz & 1);
-	}
-	if (!data_off || fmt != 1 || (bits != 8 && bits != 16) || channels < 1 || channels > 2)
-		return -1;
-	if (data_off + data_len > size)
-		data_len = size - data_off;
-
-	src_is_mp3 = 0;
-	src_fn = fn; src_size = size; src_rate = rate;
-	w_data_off = data_off; w_data_len = data_len; w_filepos = 0;
-	w_bits = bits; w_channels = channels; w_frame = channels * (bits / 8);
-	w_inlen = w_inpos = 0;
-	total_frames = w_frame ? w_data_len / w_frame : 0;
-	return 0;
-}
-
-static int load_mp3(const char *fn, unsigned size)
-{
-	if (mp3_open(&m3, fn, size) != 0)
-		return -1;
-	src_is_mp3 = 1;
-	src_fn = fn; src_size = size; src_rate = mp3_rate(&m3);
-	total_frames = 0;     /* unknown for MPEG */
-	return 0;
-}
-
-/* Open `fn`, route by content (RIFF/WAVE -> WAV, else MPEG). Returns 0 on ok. */
-static int load_file(const char *fn)
-{
-	struct statinfo st;
-	if (stat(fn, &st) != 0 || st.is_dir)
-		return -1;
-	unsigned char sn[12];
-	int g = readfile_at(fn, 0, sn, sizeof sn);
-	int rc;
-	if (g >= 12 && tageq(sn, "RIFF") && tageq(sn + 8, "WAVE"))
-		rc = load_wav(fn, st.size);
+	if (dur)
+		media_seek_ms(g_dec, (unsigned)((unsigned long long)dur * (unsigned)num / (unsigned)den));
 	else
-		rc = load_mp3(fn, st.size);
-	if (rc != 0)
-		return -1;
-
-	if (src_rate < 4000)   src_rate = 4000;
-	if (src_rate > 192000) src_rate = 192000;
-	step = ((src_rate / 48000u) << 16) + (((src_rate % 48000u) << 16) / 48000u);
-	pos_frames = 0;
-	eof = 0;
-	primed = 0;
-	g_state = ST_STOPPED;
-	return 0;
+		media_seek_ms(g_dec, 0);
 }
 
 /* ---- transport ---------------------------------------------------------- */
@@ -272,14 +103,14 @@ static void transport_stop(void)
 {
 	if (g_state == ST_EMPTY) return;
 	if (audio_live) { audio_close(); audio_live = 0; }
-	seek_fraction(0, 1);
+	media_seek_ms(g_dec, 0);
 	g_state = ST_STOPPED;
 }
 
 static void transport_restart(void)
 {
 	if (g_state == ST_EMPTY) return;
-	seek_fraction(0, 1);                     /* back to the start, keep playing */
+	media_seek_ms(g_dec, 0);                 /* back to the start, keep playing */
 }
 
 static void transport_toggle(void)
@@ -344,7 +175,7 @@ static void render(void)
 
 	/* header: filename (or empty hint) */
 	gfx_fill_rect(0, 0, CW, HDR_H, COL_HDR);
-	const char *title = have ? basename_of(src_fn) : "No file loaded";
+	const char *title = have ? basename_of(g_fn) : "No file loaded";
 	gfx_ui_text((CW - gfx_ui_width(title)) / 2, (HDR_H - UIFONT_H) / 2, title, COL_TITLE);
 
 	if (!have) {
@@ -353,23 +184,17 @@ static void render(void)
 		gfx_ui_text((CW - gfx_ui_width(h1)) / 2, 78, h1, COL_DIM);
 		gfx_ui_text((CW - gfx_ui_width(h2)) / 2, 78 + UIFONT_H + 4, h2, COL_TITLE);
 	} else {
-		/* progress bar + elapsed/total time */
-		unsigned long tf = est_total_frames();
-		int vnum, vden;
-		if (src_is_mp3) {                     /* MP3 bar tracks bytes consumed */
-			vnum = (int)(src_size ? m3.file_off : 0);
-			vden = (int)(src_size ? src_size : 1);
-		} else {
-			vnum = (int)(pos_frames > total_frames ? total_frames : pos_frames);
-			vden = (int)(total_frames ? total_frames : 1);
-		}
-		progress_draw(BAR_X, BAR_Y, BAR_W, GUI_PROGRESS_H, vnum, vden, 0);
+		/* progress bar + elapsed/total time, both in playback milliseconds */
+		unsigned pos = media_position_ms(g_dec);
+		unsigned dur = media_duration_ms(g_dec);
+		progress_draw(BAR_X, BAR_Y, BAR_W, GUI_PROGRESS_H,
+		              (int)(dur && pos > dur ? dur : pos), (int)(dur ? dur : 1), 0);
 
 		char el[8], tt[8];
-		fmt_time((unsigned)(pos_frames / (src_rate ? src_rate : 1)), el);
+		fmt_time(pos / 1000, el);
 		gfx_ui_text(BAR_X, TIME_Y, el, COL_DIM);
-		if (tf) {
-			fmt_time((unsigned)(tf / (src_rate ? src_rate : 1)), tt);
+		if (dur) {
+			fmt_time(dur / 1000, tt);
 		} else {
 			tt[0] = '-'; tt[1] = '-'; tt[2] = ':';
 			tt[3] = '-'; tt[4] = '-'; tt[5] = '\0';
@@ -437,6 +262,7 @@ int main(int argc, char **argv)
 		while (win_poll(g_win, &ev)) {
 			if (ev.type == WEV_CLOSE) {
 				if (audio_live) audio_close();
+				if (g_dec) media_close(g_dec);
 				win_close(g_win);
 				return 0;
 			}
@@ -447,7 +273,7 @@ int main(int argc, char **argv)
 		}
 
 		if (g_state == ST_PLAYING) {
-			unsigned produced = produce_chunk(buf, OUT);
+			unsigned produced = media_read(g_dec, buf, (int)OUT);
 			if (produced == 0) {               /* reached the end */
 				transport_stop();
 			} else {

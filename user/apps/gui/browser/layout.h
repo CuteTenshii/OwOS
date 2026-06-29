@@ -27,16 +27,38 @@ struct lbox {
 	struct dom_node *node;        /* source element (NULL = anon), for spans/devtools */
 	unsigned char    kind;
 	unsigned char    flex_dir;    /* 0 row / 1 column, when kind==LB_FLEX */
+	unsigned char    flex_wrap;   /* 0 nowrap / 1 wrap, when kind==LB_FLEX */
+	signed char      justify;     /* enum css_justify (main axis), or -1   */
+	signed char      align_items; /* enum css_align (cross axis), or -1    */
+	short            gap_row, gap_col; /* flex gaps, px (0 if unset)       */
 	signed char      pos;         /* enum css_pos, or -1 (static/unset)   */
 	signed char      overflow;    /* 0 visible / 1 clipped / -1 unset     */
 
 	struct ledge margin, border, padding;
+	unsigned char ml_auto, mr_auto; /* left/right margin was `auto` (centring) */
 	unsigned     border_color;    /* 0xRRGGBB, or BG_NONE = none */
 	unsigned     bg;              /* 0xRRGGBB, or BG_NONE = none */
+	struct css_bg_image bgi;      /* background image/gradient layer (kind<=0 = none) */
+	unsigned char border_box;     /* box-sizing: border-box (width/height span the
+	                               * border box, not the content box) */
+	int          radius;          /* border-radius px (0 = square corners) */
+	short        sh_dx, sh_dy, sh_blur, sh_spread;  /* box-shadow geometry, px */
+	unsigned     sh_color;        /* box-shadow 0xAARRGGBB, BG_NONE = no shadow */
 	int          spec_w, spec_h;  /* >=0 px, -1 auto/unset */
 	short        pct_w, pct_h;    /* width/height as a percent, else -1 */
 	int          max_w, max_h;    /* px, or -1 */
+	int          min_w, min_h;    /* px, or -1 */
+	short        pct_maxw, pct_maxh; /* max-width/height as a percent, else -1 */
+	short        pct_minw, pct_minh; /* min-width/height as a percent, else -1 */
 	short        flex_grow;       /* >=0, -1 unset */
+	short        flex_shrink;     /* >=0, -1 unset (default 1 at layout) */
+	int          flex_basis;      /* main-size px, -1 auto/unset */
+	short        pct_basis;       /* flex-basis as a percent, else -1 */
+	int          off_t, off_r, off_b, off_l;  /* position offsets, px or -1 unset */
+	signed char  opacity;         /* 0..100 percent, -1 unset (= fully opaque) */
+	short        outline_w;       /* outline width px (0 = none) */
+	unsigned     outline_color;   /* outline 0xRRGGBB, or BG_NONE */
+	short        z_index;         /* stacking level, CSS_Z_AUTO = auto */
 
 	int          t0, t1;          /* glyph-stream slice (t0==t1 => no own text) */
 	int          img_idx;         /* LB_REPLACED -> B->pg->imgs index, else -1 */

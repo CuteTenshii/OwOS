@@ -37,6 +37,14 @@ struct js_ctx {
               *symbol_proto, *map_proto, *set_proto, *weakmap_proto, *weakset_proto, *date_proto,
               *regexp_proto;
     js_value   sym_iterator;    /* the well-known Symbol.iterator                 */
+    js_value   sym_tostringtag; /* the well-known Symbol.toStringTag              */
+    js_object *sym_registry;    /* array of every Symbol created, so
+                                 * Object.getOwnPropertySymbols can recover the
+                                 * symbol object behind a property's internal key */
+    js_object *sym_for_reg;     /* the GlobalSymbolRegistry (Symbol.for/keyFor):
+                                 * a string-key -> Symbol map, shared and not
+                                 * bound to `this` (the methods are often called
+                                 * detached, e.g. `var f = Symbol.for; f(x)`)     */
     /* typed arrays: the shared %TypedArray%.prototype, the per-view prototypes
      * (indexed by TA_*), plus ArrayBuffer/DataView prototypes. */
     js_object *typedarray_proto, *arraybuffer_proto, *dataview_proto;
@@ -53,6 +61,10 @@ struct js_ctx {
                                  * sets it; NULL -> Date treats the epoch as 0)     */
 
     int        depth;           /* call recursion guard                          */
+    char      *stack_limit;     /* lowest native SP the tree-walk may use; below
+                                 * it a RangeError is thrown instead of smashing
+                                 * past the C stack (NULL = no check). Set by the
+                                 * embedder via js_set_stack_limit.               */
     const char *frames[64];     /* active call frames (function names), innermost
                                  * last — captured into an Error's .stack         */
     int        nframes;
@@ -78,6 +90,13 @@ struct js_ctx {
  * NOTE: js_ctx_new resets the GC heap, so only one context may be live at once. */
 js_ctx  *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len));
 void     js_ctx_free(js_ctx *ctx);
+
+/* Set the lowest native stack address the interpreter may recurse to before it
+ * throws a RangeError. The tree-walk evaluator and native callbacks recurse on
+ * the C stack, so an embedder with a fixed/bounded thread stack must pass a limit
+ * (its stack floor + headroom for the throw path) or a deeply recursive script
+ * overflows the stack into neighbouring memory. NULL disables the check. */
+void     js_set_stack_limit(js_ctx *ctx, void *low_limit);
 
 /* Run a parsed program. Returns 0 on normal completion (the last expression
  * value, if any, in *result when non-NULL); returns -1 if an exception escaped

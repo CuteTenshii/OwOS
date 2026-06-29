@@ -422,10 +422,18 @@ static void parse_link_header(const char *v, const char *base)
  * HSTS, collects Link: stylesheets, resolves any Location into `loc`, and reports
  * the body framing (chunked / content-length / gzip — moot over h2, which sends
  * none). Returns the status code. Shared by the HTTP/1.1 and HTTP/2 fetch paths.*/
+/* The most recent document response's raw header block + the tick http_txn began,
+ * captured here / in http_txn so do_fetch can log them to the devtools Network tab
+ * (the transport functions return only the status, not the header block or timing).
+ * Document-only: sub-resources are logged from resource.c's own transport. */
+static char     g_doc_hdr[RESP_HDR_MAX];
+static unsigned g_doc_t0;
+
 static int parse_response(const char *hdr, const char *host, const char *full_url,
                           char *loc, int loc_cap, int *chunked, int *have_len,
                           unsigned *content_len, int *enc_gz)
 {
+	{ int k = 0; for (; hdr[k] && k < (int)sizeof g_doc_hdr - 1; k++) g_doc_hdr[k] = hdr[k]; g_doc_hdr[k] = '\0'; }
 	*chunked = 0; *have_len = 0; *enc_gz = 0; *content_len = 0;
 	B->nosniff = false;
 	ext_css_clear();        /* this response's Link: stylesheets replace the last */
@@ -598,7 +606,7 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 
 	struct h2tx h = { full_url, u->host, loc, loc_cap, 0, 0 };
 	struct h2_opts opts = { BR_UA, xh, h2_headers_cb };
-	char hdrbuf[4096]; int hlen = 0;
+	char hdrbuf[RESP_HDR_MAX]; int hlen = 0;
 	h2_run(B->sock, 1, auth, "GET", u->path, &opts,
 	       hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
 
@@ -638,7 +646,7 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc,
 		sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n");
 	}
 
-	char hdrbuf[4096]; int hlen = 0;
+	char hdrbuf[RESP_HDR_MAX]; int hlen = 0;
 	int st = h3_run(u->host, u->port, auth, "GET", u->path, xh,
 	                hdrbuf, sizeof hdrbuf, &hlen, h3_body_cb, 0);
 	if (st <= 0) return st;                          /* QUIC failed -> caller falls back */
@@ -653,6 +661,7 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc,
 static int http_txn(const struct purl *u, const char *full_url, char *loc,
                     int loc_cap, int allow_dl)
 {
+	g_doc_t0 = msec();          /* for the devtools Network duration of this response */
 	loc[0] = '\0';
 	B->pg->ctype[0] = '\0';
 	B->dl_name[0] = '\0';
@@ -704,7 +713,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 
 	if (net_send(B->sock, req, n) < 0) { net_close(B->sock); return -4; }
 
-	char hdr[4096]; int hlen = 0, match = 0;
+	char hdr[RESP_HDR_MAX]; int hlen = 0, match = 0;
 	for (;;) {
 		int ci = rgetc();
 		if (ci < 0) { net_close(B->sock); return -5; }
@@ -926,8 +935,10 @@ void do_fetch(void)
 			                : "Cannot open file (not found or not absolute)");
 			return;
 		}
+		resource_set_page(url);
 		render_raw(url);
-		devtools_net_add("GET", url, 200, B->pg->ctype, B->pg->raw_len);
+		{ struct net_log e = { "GET", url, 200, B->pg->ctype, B->pg->raw_len, 0, 0 };
+		  devtools_net_add(&e); }
 		return;
 	}
 
@@ -984,7 +995,10 @@ void do_fetch(void)
 
 		/* Log the document request in the devtools Network tab (the final response
 		 * after any redirects; a streamed download has raw_len 0). */
-		devtools_net_add("GET", url, st, B->pg->ctype, B->dl_saved ? 0 : B->pg->raw_len);
+		{ struct net_log e = { "GET", url, st, B->pg->ctype,
+		                       B->dl_saved ? 0 : B->pg->raw_len,
+		                       (int)(msec() - g_doc_t0), g_doc_hdr };
+		  devtools_net_add(&e); }
 
 		/* A download was streamed straight to ~/Downloads inside http_txn (it
 		 * never touched B->pg->raw), so there is nothing to render. */
@@ -994,6 +1008,7 @@ void do_fetch(void)
 		/* Render according to the response type. An empty Content-Type is
 		 * treated as HTML (the common case for sloppy servers); a plain text
 		 * type is shown verbatim so line breaks survive; image/png is decoded. */
+		resource_set_page(url);     /* attribute this page's sub-resources for CORP */
 		render_raw(url);
 		/* The title bar is updated by the main thread (only the window's owner
 		 * task may call win_settitle); it reads B->pg->doc_title / B->pg->cur_url. */

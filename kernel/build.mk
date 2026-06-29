@@ -1,10 +1,10 @@
 # kernel/build.mk — the kernel image itself: the object list and the final link.
 # Program blobs (kernel/*_blob.o) are built by user/apps/build.mk; the font blobs too.
 
-# Generic kernel compile rules. Defined here, not in toolchain.mk, so they come
-# *after* user/lib/build.mk's `user/%.o` rule in definition order — macOS's GNU
-# Make 3.81 resolves overlapping pattern rules by definition order, so the user
-# rule must be seen first (see the note in toolchain.mk).
+# Generic kernel compile rules. Defined here, not toolchain.mk, so they come after
+# user/lib's `user/%.o` rule: macOS GNU Make 3.81 resolves overlapping pattern rules
+# by definition order (3.82+/Linux picks the shortest stem), so the user rule must be
+# seen first or kernel CFLAGS would wrongly compile user code.
 %.o: %.S
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -15,11 +15,9 @@
 ISO    := owos.iso
 ISODIR := isodir
 
-# Objects are emitted in place (kernel/foo.o), so the same path serves both
-# arches; this stamp makes an ARCH switch rebuild them. Touched whenever the
-# selected ARCH differs from the last build, it is a prerequisite of every object,
-# so `make` then `make ARCH=x86_64` recompiles rather than re-linking 32-bit
-# objects into a 64-bit image. clean removes the stamps.
+# Objects are emitted in place (kernel/foo.o), shared by both arches. This stamp is a
+# prerequisite of every object and is re-touched when ARCH changes, so switching ARCH
+# forces a recompile instead of linking stale objects into the other image.
 ARCH_STAMP := .arch.$(ARCH)
 $(ARCH_STAMP):
 	@rm -f .arch.* && touch $@
@@ -44,12 +42,14 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/apps.o \
         kernel/edit_blob.o kernel/curl_blob.o \
         kernel/editor_blob.o kernel/about_blob.o \
-        kernel/clock_blob.o kernel/files_blob.o kernel/browser_blob.o \
+        kernel/clock_blob.o kernel/calc_blob.o kernel/files_blob.o kernel/browser_blob.o \
         kernel/imgview_blob.o kernel/term_blob.o \
         kernel/neofetch_blob.o kernel/lspci_blob.o \
         kernel/ping_blob.o kernel/dig_blob.o kernel/torrent_blob.o \
         kernel/player_blob.o kernel/settings_blob.o kernel/ssh_blob.o \
         kernel/clipd_blob.o kernel/cliphist_blob.o \
+        kernel/notifyd_blob.o kernel/notifysend_blob.o \
+        kernel/webp_blob.o kernel/json_blob.o \
         kernel/uifont_blob.o kernel/monofont_blob.o
 
 $(KERNEL): $(OBJS) $(LINKER)

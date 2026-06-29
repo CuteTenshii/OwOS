@@ -18,6 +18,7 @@
 #include "mtrr.h"
 #include "font_aa.h"
 #include "font_ui.h"
+#include "kstring.h"
 
 /* DISPI index/data ports and register indices. */
 #define VBE_DISPI_INDEX   0x01CE
@@ -73,6 +74,18 @@ static inline uint32_t dim_px(uint32_t p)
 	return (r << 16) | (g << 8) | b;
 }
 
+/* 32-bpp run fill (`rep stosl`): a solid-colour row is the inner loop of every
+ * rect fill, so a scalar per-pixel store at -O1 wasted most of a full-screen
+ * clear. memset can't do this (it broadcasts a byte, not a 32-bit pixel). */
+static inline void fill32(uint32_t *d, uint32_t v, int n)
+{
+	int d0, d1;
+	__asm__ volatile("rep ; stosl"
+		: "=&D"(d0), "=&c"(d1)
+		: "a"(v), "0"(d), "1"(n)
+		: "memory");
+}
+
 /* Clip rectangle: drawing primitives only touch pixels inside it, so the
  * compositor can redraw just a damaged region by clipping to it. Half-open
  * [cl_x0,cl_x1) x [cl_y0,cl_y1). */
@@ -97,6 +110,17 @@ void fb_set_clip(int x, int y, int w, int h)
 	cl_y1 = (y + h > (int)fb_h) ? (int)fb_h : y + h;
 	if (cl_x1 < cl_x0) cl_x1 = cl_x0;
 	if (cl_y1 < cl_y0) cl_y1 = cl_y0;
+}
+
+/* Current (clamped) clip rectangle, so a caller that iterates the whole screen
+ * to render — the desktop background — can confine its loop to the damaged band
+ * instead of every row at the panel's full height. */
+void fb_get_clip(int *x, int *y, int *w, int *h)
+{
+	if (x) *x = cl_x0;
+	if (y) *y = cl_y0;
+	if (w) *w = cl_x1 - cl_x0;
+	if (h) *h = cl_y1 - cl_y0;
 }
 
 /* Intersect (x,y,w,h) with the clip rect into out[], returns 0 if empty. */
@@ -387,8 +411,12 @@ void fb_present(void)
 		for (int y = dirty_y0; y < dirty_y1; y++) {
 			const uint32_t *s = fb    + (uint32_t)y * fb_pitch + dirty_x0;
 			uint32_t       *d = front + (uint32_t)y * fb_pitch + dirty_x0;
-			for (int x = 0; x < rw; x++)
-				d[x] = dim ? dim_px(s[x]) : s[x];
+			if (dim) {
+				for (int x = 0; x < rw; x++)
+					d[x] = dim_px(s[x]);
+			} else {
+				memcpy(d, s, (uint32_t)rw * 4);
+			}
 		}
 		/* Drain the write-combining buffer to VRAM. The front buffer is WC
 		 * (enable_wc), so these stores otherwise linger in the CPU's WC buffer
@@ -458,8 +486,7 @@ void fb_fill_rect(int x, int y, int w, int h, uint32_t color)
 		return;
 	for (int row = 0; row < ch; row++) {
 		uint32_t *p = fb + (cy + row) * (int)fb_pitch + cx;
-		for (int col = 0; col < cw; col++)
-			p[col] = color;
+		fill32(p, color, cw);
 	}
 	mark(cx, cy, cw, ch);
 }
@@ -480,8 +507,7 @@ void fb_blit(int x, int y, int w, int h, const uint32_t *src, int src_pitch)
 	for (int row = 0; row < ch; row++) {
 		const uint32_t *s = src + (cy - y + row) * src_pitch + (cx - x);
 		uint32_t *d = fb + (cy + row) * (int)fb_pitch + cx;
-		for (int col = 0; col < cw; col++)
-			d[col] = s[col];
+		memcpy(d, s, (uint32_t)cw * 4);
 	}
 	mark(cx, cy, cw, ch);
 }

@@ -53,6 +53,12 @@ extern int BW, BH;         /* client size (mutable: the window is resizable)    
  * malloc a doubling buffer up to this). The page body itself is unbounded (it
  * grows B->raw); this only stops a single runaway sub-resource. */
 #define RAW_MAX    (32 * 1024 * 1024)   /* a big page decompresses to several MB */
+/* Buffer for a response's full header block (the synthesized "HTTP/x NNN\r\n…"
+ * text both transports hand to parse_response). Must hold every header, not just
+ * the first few KiB: a large CSP or several Set-Cookie can push content-encoding
+ * past a stingy cap, and a lost content-encoding renders the compressed body raw
+ * (e.g. github.com's CSP shoved "content-encoding: gzip" past the old 4 KiB). */
+#define RESP_HDR_MAX  16384
 /* The address-bar/URL buffer size. Unlike the cookie and HSTS jars (now uncapped
  * heap lists), URLs flow through two SHARED, buffer-based APIs — the gfx
  * textfield widget (the address bar, edited in place) and resolve_url(base, rel,
@@ -68,8 +74,10 @@ extern int BW, BH;         /* client size (mutable: the window is resizable)    
 #define FAVICON_H  16      /* shown in the page's tab (0xAARRGGBB per pixel)   */
 
 #define ST_COLOR   0x0F            /* legacy; color is now full 0xRRGGBB (B->fg) */
+#define ST_NOWRAP  0x01            /* white-space:nowrap — this glyph's line must not wrap */
 #define ST_BOLD    0x10
 #define ST_UNDER   0x20
+#define ST_ITALIC  0x40            /* font-style:italic — drawn with a faux-italic shear */
 
 /* Per-glyph background sentinel: B->bg[i] == BG_NONE means "no background"
  * (a real CSS colour is 0x000000..0xFFFFFF, so the high byte is free). */
@@ -147,6 +155,8 @@ struct page {
 	char         *text;
 	unsigned char *attr;     int text_len, text_cap;
 	unsigned char *bp;
+	unsigned char *fsz;      /* per-glyph CSS font-size px (0 = default body font) */
+	unsigned char *lh;       /* per-glyph CSS line-height px (0 = font-derived default) */
 	unsigned      *fg;
 	unsigned      *bg;
 	/* Page canvas colours from the <html>/<body> cascade (worker sets, render
@@ -155,6 +165,12 @@ struct page {
 
 	struct link *links;      int nlinks,  links_cap;
 	struct inl_img *imgs;    int n_imgs,  imgs_cap;   /* inline <img> list */
+
+	/* Decoded url() background images for this page: built by load_bg_images during
+	 * load, blitted by paint_boxes (a box's css_bg_image.img_idx indexes here), freed
+	 * on teardown. rgba is iw*ih straight RGBA, or NULL if the fetch/decode failed. */
+	struct bg_img { char url[URL_MAX]; unsigned iw, ih; unsigned char *rgba; } *bgimgs;
+	int      n_bgimgs, bgimgs_cap;
 	int      img_uid_next;   /* monotonic id source for inl_img.uid (never reused) */
 	unsigned char *img_save; int img_save_len;        /* backgrounded image bytes */
 
@@ -166,7 +182,7 @@ struct page {
 	unsigned favicon[FAVICON_W * FAVICON_H];
 	int      favicon_ok;
 
-	int      scroll;                 /* vertical scroll position (display lines) */
+	int      scroll;                 /* vertical scroll position, document pixels */
 
 	struct csp *csp;                 /* the page's Content-Security-Policy set    */
 
@@ -176,6 +192,12 @@ struct page {
 	int          n_faces, faces_cap;
 	struct font *body_font;
 };
+
+/* One wrapped text run of a flex-row item. Side-by-side items can't share a main
+ * line-table row (that table is one slice per row), so a row flex container reserves
+ * a blank band in the line table and its items' wrapped lines live here instead,
+ * each tagged with the absolute band row it paints on and its own column x/width. */
+struct fslice { int row, off, len, x, w; };
 
 struct browser {
 	struct page *pg;             /* the active tab's page (tabs[active_tab].page) */
@@ -211,9 +233,16 @@ struct browser {
 	int     *line_len;
 	int     *line_x;
 	int     *line_w;
+	int     *line_y;         /* per-line document-pixel top (running sum of heights) */
+	int     *line_h;         /* per-line pixel height                                */
 	int      nlines, line_cap;
 	int      wrap_cols;
-	unsigned wrap_seq;
+	int      layout_dirty;   /* 1 = box tree/text changed, re-wrap needed (NOT bumped by scroll) */
+
+	/* Flex-row item text (see struct fslice), rebuilt with the line table and drawn
+	 * over the reserved band; never freed (grows like the line table). */
+	struct fslice *fslices;
+	int      n_fslices, fslice_cap;
 
 	int      sb_drag;
 	unsigned seq;
@@ -300,6 +329,11 @@ int  ensure_lines(int need);
 void blk_lock(void);
 void blk_unlock(void);
 
+/* Lowest safe native stack address for JS recursion on the worker thread, passed
+ * to js_set_stack_limit so a deeply recursive script throws instead of smashing
+ * the worker stack into .bss. Defined in main.c (it owns the worker stack). */
+void *browser_js_stack_floor(void);
+
 /* --- cross-module API ----------------------------------------------------- */
 /* parse_url / resolve_url live in user/lib/url.h (shared with curl). */
 /* Render B->raw as HTML into the styled-text buffers. `page_url` resolves
@@ -319,6 +353,9 @@ int  js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int
 int  js_has_listeners(void);                               /* any listener registered */
 int  js_timers_pump(void);     /* fire due setTimeout/Interval/rAF; -> # callbacks fired */
 int  js_websockets_pump(void); /* drain live WebSockets -> open/message/close/error events */
+/* Run one devtools-console REPL command against the live page context, echoing
+ * the input + result/exception to the console. Worker-thread only (owns g_ctx). */
+void js_repl_run(const char *src);
 
 /* html.c: tear down the live DOM + CSS sheet + JS context of the current page
  * (called on every page replacement), re-flatten the live DOM into B's buffers
@@ -381,19 +418,41 @@ int  hsts_has(const char *host);
 enum { DT_LOG, DT_WARN, DT_ERROR };
 void devtools_toggle(void);
 int  devtools_visible(void);
+/* Inspect-element picker (page→tree): toggle arms it; the main thread feeds the
+ * pane text offset under the pointer (hover) and at a click (commit), the worker
+ * resolves each to the enclosing element and highlights / selects it. */
+void devtools_pick_toggle(void);
+int  devtools_picking(void);
+void devtools_pick_hover(int off);   /* pointer at pane offset (-1 = left the pane) */
+void devtools_pick_commit(int off);  /* click at pane offset: select + end picking  */
 int  devtools_top(void);          /* panel's top y (main thread)                */
 int  devtools_left(void);         /* panel's left x; BW if hidden (right-dock)  */
 void devtools_render(void);       /* main thread: draw the panel                */
 int  devtools_handle_click(int mx, int my);  /* 1 = consumed                    */
 int  devtools_handle_scroll(int delta);      /* 1 = consumed                    */
+int  devtools_handle_key(char c, int mods);  /* Console REPL input; 1 = consumed */
+/* The selected element's page-overlay box (DOCUMENT px) + label, 0 if none. The
+ * caller translates y by the page scroll and clips to the content pane. */
+int  devtools_highlight(int *x, int *y, int *w, int *h, const char **label);
 int  devtools_on_splitter(int mx, int my);   /* 1 = pointer is on the resize edge */
 void devtools_set_width(int w);              /* drag-resize the docked panel      */
 void devtools_console_append(int level, const char *s, int len);  /* worker     */
 void devtools_worker_tick(void);  /* worker: rebuild DOM/Styles snapshot if open */
 /* Network tab: each HTTP response the page made (logged from the fetch paths),
- * reset on each top-level navigation. Worker/image-thread callers. */
-void devtools_net_add(const char *method, const char *url, int status,
-                      const char *ctype, int size);
+ * reset on each top-level navigation. Worker/image-thread callers. The strings
+ * are borrowed (devtools copies what it keeps); `resp_hdr` is the raw response
+ * header block (NULL when the transport didn't surface it) and `ms` the request
+ * duration in milliseconds (0 = unknown). */
+struct net_log {
+	const char *method;
+	const char *url;
+	int         status;
+	const char *ctype;
+	int         size;
+	int         ms;
+	const char *resp_hdr;
+};
+void devtools_net_add(const struct net_log *e);
 void devtools_net_reset(void);
 
 /* Per-tab devtools view state: which panel is open and where each is scrolled, so
@@ -401,7 +460,7 @@ void devtools_net_reset(void);
  * handle (the Elements/Console/Network content), owned by devtools.c — frozen
  * when the tab is backgrounded and restored on reveal, so switching tabs no longer
  * wipes the panel. devtools_view_free releases it when a tab closes. */
-#define DT_PANELS 4
+#define DT_PANELS 5
 struct dt_view { int open; int tab; int scroll[DT_PANELS]; void *cap; };
 void devtools_view_save(struct dt_view *v);        /* active view+capture -> v       */
 void devtools_view_load(const struct dt_view *v);  /* v -> active, restoring capture */
@@ -417,13 +476,50 @@ int  html_match_styles(struct dom_node *el, struct css_match *out, int cap);
 int  html_has_pseudo(struct dom_node *el, int which);   /* ::before/::after present? */
 
 void do_fetch(void);
-/* The JS fetch() transport (resource.c): one HTTP request, returns the body
- * (caller frees) for any status with *status + *out_ctype filled, NULL on a
- * connection error. Worker-thread only. */
-unsigned char *browser_fetch_url(const char *url, const char *method,
-                                 const unsigned char *reqbody, int reqlen, const char *req_ctype,
-                                 const char *accept, int *status, char *out_ctype, int oc_cap, int *outlen,
-                                 const char *extra_hdrs);
+
+/* One HTTP request the browser transport performs. Only `url` is required; the
+ * rest default (method -> GET, accept -> all types, no body/headers, cookies
+ * sent). `extra_hdrs` is a "Name: value\r\n" blob; `no_cookies` omits the Cookie
+ * header (the CORS uncredentialed case). */
+struct http_req {
+	const char          *url;
+	const char          *method;
+	const unsigned char *body;
+	int                  body_len;
+	const char          *ctype;       /* request Content-Type */
+	const char          *accept;
+	const char          *extra_hdrs;
+	int                  no_cookies;
+};
+
+/* What a request reports back. The optional out buffers (`final_url` after
+ * redirects, the raw `hdr` block) are filled only when the caller supplies the
+ * pointer + cap; leave them NULL / 0 to skip. */
+struct http_resp {
+	int   status;                     /* out: HTTP status, 0 on transport failure */
+	int   len;                        /* out: body length                         */
+	char  ctype[160];                 /* out: response Content-Type               */
+	char *final_url; int final_cap;   /* out (opt): final URL after redirects     */
+	char *hdr;       int hdr_cap;     /* out (opt): raw response header block      */
+};
+
+/* The browser's single-request transport (sub-resources, the JS fetch()): one
+ * request following redirects, returning the body (caller frees) for ANY final
+ * status with `rs` filled, NULL on a transport/OOM error. Worker-thread only. */
+unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs);
+
+/* The CORS-aware transport for fetch()/XMLHttpRequest: on a cross-origin request
+ * it adds the Origin header, runs a preflight OPTIONS for a non-simple one, and
+ * only returns the body if the response's Access-Control-Allow-* headers admit
+ * `page_url`'s origin. Cookies ride only when `with_credentials` (fetch
+ * credentials:"include" / XHR withCredentials). NULL on a transport error OR a
+ * CORS denial (the JS layer reports both as a network error). The page-set
+ * request headers travel in `rq->extra_hdrs`. Worker-thread only. */
+unsigned char *browser_cors_fetch(const char *page_url, int with_credentials,
+                                  const struct http_req *rq, struct http_resp *rs);
+
+/* Attribute subsequent sub-resource loads to `page_url`'s origin for CORP. */
+void resource_set_page(const char *page_url);
 void fetch_inline_images(const char *page_url);  /* re-pull inline <img> after relayout */
 int  fetch_lazy_visible(void);   /* worker: load one in-view loading=lazy <img> */
 
