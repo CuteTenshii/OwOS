@@ -11,6 +11,7 @@
  */
 
 #include "owos.h"
+#include "resolve.h"
 
 static int eq_ci(const char *a, const char *b)
 {
@@ -26,7 +27,7 @@ static int eq_ci(const char *a, const char *b)
 
 static const struct { const char *name; int num; } types[] = {
 	{ "A", 1 }, { "NS", 2 }, { "CNAME", 5 }, { "SOA", 6 },
-	{ "PTR", 12 }, { "MX", 15 }, { "TXT", 16 }, { "AAAA", 28 },
+	{ "PTR", 12 }, { "MX", 15 }, { "TXT", 16 }, { "AAAA", 28 }, { "SRV", 33 },
 };
 static int type_num(const char *s)
 {
@@ -112,6 +113,12 @@ static void put_rdata(const unsigned char *msg, int end, int type, int rd, int r
 			}
 		}
 		break;
+	case 33:                                          /* SRV: prio wt port target */
+		if (rdlen >= 7) {
+			printf("%u %u %u ", be16(msg + rd), be16(msg + rd + 2), be16(msg + rd + 4));
+			name_str(msg, end, rd + 6, nm, sizeof nm); puts(nm);
+		}
+		break;
 	case 6:                                           /* SOA: mname rname + 5 u32 */
 		name_str(msg, end, rd, nm, sizeof nm); puts(nm); puts(" ");
 		{
@@ -135,7 +142,7 @@ int main(int argc, char **argv)
 		else if (!typestr)          typestr = argv[i];
 	}
 	if (!host) {
-		puts("usage: dig [@server] <host> [type]   (A AAAA NS CNAME MX TXT PTR SOA)\n");
+		puts("usage: dig [@server] <host> [type]   (A AAAA NS CNAME MX TXT PTR SOA SRV)\n");
 		return 1;
 	}
 	int qtype = 1;
@@ -163,7 +170,7 @@ int main(int argc, char **argv)
 	q[n++] = qtype >> 8; q[n++] = qtype; /* QTYPE                               */
 	q[n++] = 0; q[n++] = 1;              /* QCLASS=IN                           */
 
-	int h = net_connect(server, 53, SK_UDP);
+	int h = net_dial(server, 53, SK_UDP);   /* @server may be a name; resolve it */
 	if (h < 0) {
 		if (h == -2) { printf("dig: cannot resolve resolver %s\n", server); }
 		else         puts("dig: no network device\n");

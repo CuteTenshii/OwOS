@@ -6,11 +6,12 @@
 #include "headers.h"
 #include "h2.h"
 #include "h3.h"
+#include "netconn.h"
 
 /* ---- buffered transport reader ----------------------------------------- */
 
 struct rdr {
-	int           sock;
+	netconn      *conn;
 	unsigned char buf[2048];
 	int           pos, len, eof;
 };
@@ -21,7 +22,7 @@ static int rgetc(struct rdr *r)
 	if (r->pos >= r->len) {
 		if (r->eof)
 			return -1;
-		int n = net_recv(r->sock, r->buf, (int)sizeof r->buf);
+		int n = nc_read(r->conn, r->buf, (int)sizeof r->buf);
 		if (n == NET_EINTR)
 			return -3;
 		if (n < 0)
@@ -75,10 +76,10 @@ static void emit_byte(struct emitter *e, int b)
 
 /* ---- HTTP/1.1 exchange over an already-open socket --------------------- */
 
-/* Send the request line + headers and stream the response over `sock` (which
+/* Send the request line + headers and stream the response over `conn` (which
  * the caller opened and will close). Identical framing for plaintext and TLS.
  * Returns the HTTP status or a negative HTTP_E* code. */
-static int http1_exchange(int sock, const char *method, const struct purl *u,
+static int http1_exchange(netconn *conn, const char *method, const struct purl *u,
                           const char *extra_headers, char *hdr, int hdrcap,
                           int *hdrlen, http_body_fn body, void *ctx)
 {
@@ -98,11 +99,11 @@ static int http1_exchange(int sock, const char *method, const struct purl *u,
 	if (extra_headers)                              /* curl -H lines (\r\n-terminated) */
 		sapp(req, &n, (int)sizeof req, extra_headers);
 	sapp(req, &n, (int)sizeof req, "\r\n");
-	if (net_send(sock, req, n) < 0)
+	if (nc_write(conn, req, n) < 0)
 		return HTTP_ESEND;
 
 	struct rdr r;
-	r.sock = sock; r.pos = r.len = r.eof = 0;
+	r.conn = conn; r.pos = r.len = r.eof = 0;
 
 	/* Read the header block through the blank line ("\r\n\r\n"). */
 	char hbuf[4096];
@@ -238,29 +239,36 @@ int http_request_ex(const char *method, const char *url, int want_h2, int want_h
 		              extra_headers, hdr, hdrcap, hdrlen, body, ctx);
 	}
 
-	int proto = u.tls ? (want_h2 ? SK_TLS_H2 : SK_TLS) : SK_TCP;
-	int sock = net_connect(u.host, u.port, proto);
-	if (sock < 0) {
-		if (sock == NET_EINTR) return HTTP_EINTR;
-		if (sock == -2)        return HTTP_ERESOLVE;
+	/* HTTP/2 runs over a netconn (user-space TLS via user/lib/tls, or plain TCP
+	 * for h2c); offering ALPN "h2" when the origin is https. When ALPN falls back
+	 * to HTTP/1.1, run the h1.1 exchange over the SAME netconn. */
+	if (want_h2) {
+		netconn *conn = nc_open(u.host, u.port, u.tls, /*offer_h2=*/1);
+		if (!conn)
+			return HTTP_ECONNECT;
+		/* h2 for h2c (plaintext), or when ALPN selected it over TLS. */
+		int use_h2 = !u.tls || nc_alpn(conn) == ALPN_H2;
+		int rc;
+		if (use_h2) {
+			char auth[URL_HOST_MAX + 8];
+			build_authority(auth, (int)sizeof auth, &u);
+			struct h2_opts opts = { 0, extra_headers, 0 };
+			rc = h2_run(conn, u.tls, auth, method ? method : "GET", u.path, &opts,
+			            hdr, hdrcap, hdrlen, body, ctx);
+		} else {
+			rc = http1_exchange(conn, method, &u, extra_headers,
+			                    hdr, hdrcap, hdrlen, body, ctx);
+		}
+		nc_close(conn);
+		return rc;
+	}
+
+	netconn *conn = nc_open(u.host, u.port, u.tls, 0);
+	if (!conn)
 		return HTTP_ECONNECT;
-	}
-
-	/* h2 for h2c (plaintext + want_h2), or when ALPN selected it over TLS. */
-	int use_h2 = want_h2 && (!u.tls || net_alpn(sock) == ALPN_H2);
-
-	int rc;
-	if (use_h2) {
-		char auth[URL_HOST_MAX + 8];
-		build_authority(auth, (int)sizeof auth, &u);
-		struct h2_opts opts = { 0, extra_headers, 0 };
-		rc = h2_run(sock, u.tls, auth, method ? method : "GET", u.path, &opts,
-		            hdr, hdrcap, hdrlen, body, ctx);
-	} else {
-		rc = http1_exchange(sock, method, &u, extra_headers,
-		                    hdr, hdrcap, hdrlen, body, ctx);
-	}
-	net_close(sock);
+	int rc = http1_exchange(conn, method, &u, extra_headers,
+	                        hdr, hdrcap, hdrlen, body, ctx);
+	nc_close(conn);
 	return rc;
 }
 

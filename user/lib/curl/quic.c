@@ -10,6 +10,7 @@
 #include "owos.h"
 #include "crypto.h"
 #include "quic.h"
+#include "resolve.h"
 
 /* ----------------------------------------------------------------- helpers */
 
@@ -844,7 +845,7 @@ int quic_connect(const char *host, uint16_t port, const char *alpn)
 	got_sh = app_done = hs_sent_fin = hs_confirmed = 0;
 	retry_token_len = 0; pending_fin_len = 0;
 
-	sock = net_connect(host, port, SK_UDP);
+	sock = net_dial(host, port, SK_UDP);   /* resolve to IP; SNI stays `host` below */
 	if (sock < 0)
 		return sock == NET_EINTR ? QUIC_EINTR :
 		       sock == -2 ? QUIC_ERESOLVE : QUIC_ESOCK;

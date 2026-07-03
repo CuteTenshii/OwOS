@@ -13,6 +13,7 @@
 #include "irqflags.h"
 #include "ipc.h"
 #include "uwin.h"
+#include "signal.h"
 #include <stdint.h>
 
 /* Tasks are HEAP-ALLOCATED — a `kmalloc`'d task_t per task, linked into the
@@ -55,7 +56,11 @@ typedef struct task {
 	uint32_t      wake_tick;   /* if WAITING for a timed sleep: tick to wake at
 	                            * (0 = not a timed sleep, e.g. a waitpid waiter) */
 	int           exit_status; /* set on exit, read by waitpid                 */
-	volatile int  intr;        /* cooperative-interrupt latch (Ctrl+C / SIGINT) */
+	uint32_t      sig_pending; /* bitset of posted-but-undelivered signals       */
+	uint32_t      sig_blocked; /* bitset currently masked from delivery          */
+	uint32_t      sig_handler[NSIG]; /* disposition per signal (SIG_DFL/IGN/addr) */
+	uint32_t      sig_mask[NSIG];    /* extra signals blocked while a handler runs */
+	uint32_t      sig_flags[NSIG];   /* per-signal SA_* flags                     */
 	const char   *name;
 	char          namebuf[16]; /* owns `name` for spawned programs (argv[0])    */
 	uint32_t      runs;
@@ -84,6 +89,19 @@ static void fds_init_console(task_t *t)
 	for (int i = 0; i < MAX_FD; i++)
 		t->fds[i].type = FD_NONE;
 	t->fds[0].type = t->fds[1].type = t->fds[2].type = FD_CONSOLE;
+}
+
+/* Reset a task's signal state to the fresh-program default: nothing pending,
+ * nothing blocked, every disposition SIG_DFL (0). Also the exec-reset. */
+static void sig_init(task_t *t)
+{
+	t->sig_pending = 0;
+	t->sig_blocked = 0;
+	for (int i = 0; i < NSIG; i++) {
+		t->sig_handler[i] = SIG_DFL;
+		t->sig_mask[i] = 0;
+		t->sig_flags[i] = 0;
+	}
 }
 
 /* Drop references this task held on any pipe ends. */
@@ -174,7 +192,7 @@ void sched_init(void)
 	t->kstack_top = 0;             /* a kernel thread: never traps to ring 0   */
 	t->state = TASK_RUNNABLE;
 	t->wake_tick = 0;
-	t->intr = 0;
+	sig_init(t);
 	t->brk = t->brk_base = 0;      /* no user heap                             */
 	t->uid = t->gid = 0;           /* the boot session runs as root            */
 	cwd_set(t->cwd, "/");
@@ -200,7 +218,7 @@ void sched_create_thread(const char *name, void (*entry)(void))
 	t->brk = t->brk_base = 0;       /* kernel thread: no user heap             */
 
 	uint8_t *stack = kmalloc(KSTACK_SIZE);
-	t->intr = 0;
+	sig_init(t);
 	t->kstack = stack;
 #ifdef __x86_64__
 	/* context_switch rets into thread_start, which rets into `entry`; when the
@@ -243,7 +261,7 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
 	t->dir = dir;
 	t->parent = current->id;
 	t->state = TASK_RUNNABLE;
-	t->intr = 0;
+	sig_init(t);
 	fds_init_console(t);
 	cwd_set(t->cwd, current->cwd);   /* inherit the spawner's cwd by default */
 	t->uid = current->uid;           /* and its credentials (uid/gid)         */
@@ -345,7 +363,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
 	t->brk = t->brk_base = 0;       /* heap belongs to the process; sbrk redirects */
 	t->parent = current->id;
 	t->state = TASK_RUNNABLE;
-	t->intr = 0;
+	sig_init(t);
 	fds_init_console(t);
 	cwd_set(t->cwd, current->cwd);
 	t->uid = current->uid;
@@ -409,7 +427,15 @@ int sched_fork(struct registers *r)
 	t->kstack = kstack;
 	t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
 	t->state = TASK_RUNNABLE;
-	t->intr = 0;
+	sig_init(t);
+	/* fork inherits the parent's signal dispositions + blocked mask (POSIX); the
+	 * pending set does NOT carry over (sig_init already cleared it). */
+	t->sig_blocked = current->sig_blocked;
+	for (int i = 0; i < NSIG; i++) {
+		t->sig_handler[i] = current->sig_handler[i];
+		t->sig_mask[i] = current->sig_mask[i];
+		t->sig_flags[i] = current->sig_flags[i];
+	}
 	/* The child owns a private copy of the parent's address space (paging_fork_dir
 	 * duplicated every window page, heap included), so it inherits the break. */
 	{	task_t *o = heap_owner_of(current);
@@ -545,11 +571,16 @@ struct fd *sched_fds(void)
 	return current->fds;
 }
 
-/* The current task's page directory (for the windowing layer to map a shared
- * buffer into the calling process's user window). */
+/* The active address space's page directory (for the windowing layer and the
+ * guarded-thread-stack allocator to map into the calling process's user window).
+ * Resolve it from cr3, NOT current->dir: a thread shares its owner's address
+ * space but carries dir==0 (it doesn't own it), so returning ->dir would hand a
+ * NULL directory to callers like user_stack_alloc/uwin invoked from a thread —
+ * they'd map into a bogus dir and the mapping would be invisible to the running
+ * cr3. For an owner cr3 == (uint32_t)dir; for a thread cr3 == its owner's dir. */
 uint32_t *sched_current_dir(void)
 {
-	return current->dir;
+	return (uint32_t *)current->cr3;
 }
 
 /* The current task's pid (owner id for windowing-layer bookkeeping). */
@@ -714,27 +745,215 @@ int sched_kill_child(int pid)
 	return 0;
 }
 
-/* Cooperative interrupt (a minimal SIGINT). sched_set_intr raises the latch on a
- * task (Ctrl+C targets the foreground child); blocking kernel waits peek it via
- * sched_intr_pending() and bail with an EINTR sentinel; the program clears it
- * with sched_intr_take() (the SYS_INTR syscall) once it has handled the abort. */
-void sched_set_intr(int pid)
+/* ---- signals ------------------------------------------------------------- *
+ * A minimal POSIX signal model, and the ONLY interrupt mechanism for user
+ * processes (it replaced the old cooperative intr latch). Signals are POSTED to a
+ * task's sig_pending bitset (sched_signal_send) and DELIVERED when that task is
+ * next about to return to ring 3 (sched_signal_deliver, from the isr/irq tail): a
+ * caught signal runs its user handler on a kernel-built stack frame whose return
+ * address is a tiny trampoline that invokes SYS_SIGRETURN to restore the
+ * interrupted context; SIG_DFL falls back to the default action (terminate for
+ * most, ignore for a few). A blocking kernel wait bails with EINTR whenever a
+ * deliverable signal is pending (sched_intr_pending). */
+
+/* Default action for a SIG_DFL disposition: 1 = ignore, 0 = terminate. The job-
+ * control stops default to ignore until Phase B wires process groups + a tty. */
+static int sig_default_ignore(int sig)
 {
+	switch (sig) {
+	case SIGCHLD: case SIGCONT:
+	case SIGSTOP: case SIGTSTP: case SIGTTIN: case SIGTTOU:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+/* Lowest-numbered signal that is pending, unblocked, and would actually act (a
+ * handler, or a terminating default) — 0 if none. Drives both delivery and the
+ * EINTR decision (an ignored-by-default signal never interrupts a blocking wait). */
+static int sig_next(task_t *t)
+{
+	uint32_t d = t->sig_pending & ~t->sig_blocked;
+	for (int s = 1; s < NSIG; s++) {
+		if (!(d & SIGBIT(s)))
+			continue;
+		if (s == SIGKILL)
+			return s;                        /* forced terminate, never masked  */
+		uint32_t h = t->sig_handler[s];
+		if (h == SIG_IGN)
+			continue;
+		if (h == SIG_DFL && sig_default_ignore(s))
+			continue;
+		return s;
+	}
+	return 0;
+}
+
+/* A blocking kernel wait (tcp/net reads, waitpid, timer sleep, audio drain) polls
+ * this and bails with an EINTR sentinel when a signal wants delivery, so control
+ * reaches a return-to-ring-3 boundary where sched_signal_deliver runs. */
+int sched_intr_pending(void)
+{
+	return sig_next(current) != 0;
+}
+
+/* Post signal `sig` to task `pid` (the kill(2) primitive). Permission: root, the
+ * caller itself, or a child of the caller. sig 0 only probes existence/perm.
+ * Returns 0, or -1 (no such task / not permitted / bad signal). */
+int sched_signal_send(int pid, int sig)
+{
+	if (sig < 0 || sig >= NSIG)
+		return -1;
 	task_t *t = find_task((uint32_t)pid);
-	if (t)
-		t->intr = 1;
+	if (!t || t->state == TASK_FREE || t->state == TASK_ZOMBIE)
+		return -1;
+	if (current->uid != 0 && t->id != current->id && t->parent != current->id)
+		return -1;
+	if (sig == 0)
+		return 0;
+	t->sig_pending |= SIGBIT(sig);
+	/* A blocked/sleeping target must become runnable to reach a delivery boundary
+	 * (this also interrupts a timer sleep, like a signal does on Unix). */
+	if (t->state == TASK_WAITING)
+		t->state = TASK_RUNNABLE;
+	return 0;
 }
 
-int sched_intr_pending(void)        /* peek the current task's latch          */
+/* sigaction for the current task. SIGKILL/SIGSTOP can't be caught or ignored. */
+int sched_sigaction(int sig, const struct k_sigaction *act, struct k_sigaction *old)
 {
-	return current->intr;
+	if (sig <= 0 || sig >= NSIG || sig == SIGKILL || sig == SIGSTOP)
+		return -1;
+	if (old) {
+		old->handler = current->sig_handler[sig];
+		old->mask    = current->sig_mask[sig];
+		old->flags   = current->sig_flags[sig];
+	}
+	if (act) {
+		current->sig_handler[sig] = act->handler;
+		current->sig_mask[sig]    = act->mask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+		current->sig_flags[sig]   = act->flags;
+	}
+	return 0;
 }
 
-int sched_intr_take(void)           /* read and clear it (acknowledge)        */
+/* sigprocmask for the current task; returns the previous blocked set. When
+ * have_set is 0 it just reports the mask (how: SIG_BLOCK/UNBLOCK/SETMASK). */
+uint32_t sched_sigprocmask(int how, uint32_t set, int have_set)
 {
-	int v = current->intr;
-	current->intr = 0;
-	return v;
+	uint32_t old = current->sig_blocked;
+	if (have_set) {
+		set &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));   /* never blockable */
+		if (how == SIG_BLOCK)        current->sig_blocked |= set;
+		else if (how == SIG_UNBLOCK) current->sig_blocked &= ~set;
+		else if (how == SIG_SETMASK) current->sig_blocked = set;
+	}
+	return old;
+}
+
+/* The user context saved for sigreturn — always 32-bit (user mode is 32-bit even
+ * under an x86_64 kernel), so this is arch-neutral. */
+struct sig_uctx {
+	uint32_t eip, eflags, esp;
+	uint32_t eax, ecx, edx, ebx, ebp, esi, edi;
+};
+
+/* What the kernel pushes on the user stack to run a handler. cdecl entry sees
+ * [pretcode][sig], so pretcode is the handler's return address and sig its arg;
+ * the handler ret's into `tramp`, which invokes SYS_SIGRETURN. */
+struct sigframe {
+	uint32_t pretcode;             /* -> tramp                                */
+	uint32_t sig;                  /* handler argument                        */
+	uint32_t saved_blocked;        /* mask to restore on sigreturn            */
+	struct sig_uctx uc;            /* interrupted context to resume           */
+	uint8_t  tramp[8];             /* mov $SYS_SIGRETURN,%eax ; int $0x80      */
+};
+
+/* Build a signal-handler frame on the user stack (current CR3 is this process's,
+ * so the user window is directly writable). Returns 0, or -1 if the stack won't
+ * hold it. */
+static int sigframe_setup(task_t *t, struct registers *r, int sig)
+{
+	uint32_t sp = (uint32_t)r->useresp;
+	uint32_t base = (sp - sizeof(struct sigframe)) & ~3u;
+	if (base < USER_BASE || base + sizeof(struct sigframe) > USER_REGION_END ||
+	    base > sp)                                   /* underflow guard        */
+		return -1;
+
+	struct sigframe *f = (struct sigframe *)base;
+	uint32_t tramp = base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
+	f->pretcode      = tramp;
+	f->sig           = (uint32_t)sig;
+	f->saved_blocked = t->sig_blocked;
+	f->uc.eip    = (uint32_t)r->eip;
+	f->uc.eflags = (uint32_t)r->eflags;
+	f->uc.esp    = (uint32_t)r->useresp;
+	f->uc.eax = (uint32_t)r->eax; f->uc.ecx = (uint32_t)r->ecx;
+	f->uc.edx = (uint32_t)r->edx; f->uc.ebx = (uint32_t)r->ebx;
+	f->uc.ebp = (uint32_t)r->ebp; f->uc.esi = (uint32_t)r->esi;
+	f->uc.edi = (uint32_t)r->edi;
+	f->tramp[0] = 0xB8;                              /* mov $imm32, %eax        */
+	f->tramp[1] = (uint8_t)(SYS_SIGRETURN);
+	f->tramp[2] = (uint8_t)(SYS_SIGRETURN >> 8);
+	f->tramp[3] = (uint8_t)(SYS_SIGRETURN >> 16);
+	f->tramp[4] = (uint8_t)(SYS_SIGRETURN >> 24);
+	f->tramp[5] = 0xCD;                              /* int $0x80               */
+	f->tramp[6] = 0x80;
+	f->tramp[7] = 0x90;                              /* nop pad                 */
+
+	r->useresp = base;
+	r->eip     = t->sig_handler[sig];
+	return 0;
+}
+
+/* Deliver at most one pending signal to the current task as it returns to ring 3.
+ * A default-terminate never returns (sched_exit); a handler is set up and iret
+ * runs it. Called from the isr/irq tail. */
+void sched_signal_deliver(struct registers *r)
+{
+	if ((r->cs & 3) != 3)              /* only when returning to a user context */
+		return;
+	task_t *t = current;
+	int sig = sig_next(t);
+	if (!sig)
+		return;
+	t->sig_pending &= ~SIGBIT(sig);
+
+	uint32_t h = t->sig_handler[sig];
+	if (sig == SIGKILL || h == SIG_DFL) {
+		/* sig_next already dropped ignore-by-default signals, so a SIG_DFL that
+		 * reaches here terminates (128 + sig, the shell's "killed by" convention). */
+		sched_exit(128 + sig);         /* never returns */
+	}
+	if (sigframe_setup(t, r, sig) < 0)
+		sched_exit(128 + sig);         /* unusable stack: fall back to terminate */
+	/* Mask this signal (+ the handler's own mask) while the handler runs; sigreturn
+	 * restores the previous mask. One handler per boundary — the rest deliver on
+	 * the next return to ring 3. */
+	t->sig_blocked |= SIGBIT(sig) | t->sig_mask[sig];
+}
+
+/* SYS_SIGRETURN: the trampoline lands here after the handler returned. The
+ * handler's ret popped the 4-byte pretcode, so useresp points just past it — the
+ * frame base is useresp-4. Restore the saved context + mask so the interrupted
+ * code resumes exactly where it was. */
+int sched_sigreturn(struct registers *r)
+{
+	uint32_t base = (uint32_t)r->useresp - 4;
+	if (base < USER_BASE || base + sizeof(struct sigframe) > USER_REGION_END)
+		return -1;
+	struct sigframe *f = (struct sigframe *)base;
+
+	current->sig_blocked = f->saved_blocked;
+	r->eip     = f->uc.eip;
+	r->useresp = f->uc.esp;
+	/* Restore user flags but sanitize: keep only arithmetic/DF/TF bits, force IF on
+	 * + reserved bit1 — a crafted frame must not gain IOPL/NT. */
+	r->eflags  = (f->uc.eflags & 0x00000DD5u) | 0x00000202u;
+	r->eax = f->uc.eax; r->ecx = f->uc.ecx; r->edx = f->uc.edx;
+	r->ebx = f->uc.ebx; r->ebp = f->uc.ebp; r->esi = f->uc.esi; r->edi = f->uc.edi;
+	return 0;
 }
 
 /* Find an exited child of `current` matching pid (-1 = any). */
@@ -801,6 +1020,16 @@ void sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp,
 	current->cr3 = (uint32_t)new_dir;
 	if (old)
 		paging_free_process_dir(old);
+
+	/* exec resets caught handlers to SIG_DFL and drops pending signals; the blocked
+	 * mask is preserved (POSIX). The new image can't keep the old code's handlers —
+	 * their addresses point into the freed address space. */
+	current->sig_pending = 0;
+	for (int i = 0; i < NSIG; i++) {
+		current->sig_handler[i] = SIG_DFL;
+		current->sig_mask[i] = 0;
+		current->sig_flags[i] = 0;
+	}
 
 	r->eip = entry;
 	r->cs = 0x1B;

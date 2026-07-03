@@ -197,3 +197,75 @@ int exec_program(const void *image, uint32_t size, int argc, char *const argv[])
 		paging_free_process_dir(dir);
 	return pid;
 }
+
+/* ---- guarded thread stacks (SYS_STACK_ALLOC/FREE) ------------------------- *
+ * A per-address-space (CR3) bitmap of the fixed slots in the [TSTACK_LOW,
+ * TSTACK_TOP) region. Each slot maps its top `pages` frames and leaves the rest
+ * (down to and including its lowest page) unmapped, so a thread stack overflow
+ * faults. Freeing keeps the mapping and just clears the bit — the frames are
+ * reused by the next alloc of that slot (bounded to 8 MiB/process) and reclaimed
+ * with the address space on exit; a per-page unmap isn't available (the range
+ * unmap is 2 MiB-granular and would clobber neighbouring slots). */
+#define TSTACK_OWNERS 8
+static struct { uint32_t *dir; uint32_t used; } tstack_tab[TSTACK_OWNERS];
+
+static uint32_t *tstack_mask_for(uint32_t *dir)
+{
+	for (int i = 0; i < TSTACK_OWNERS; i++)
+		if (tstack_tab[i].dir == dir) return &tstack_tab[i].used;
+	for (int i = 0; i < TSTACK_OWNERS; i++)
+		if (!tstack_tab[i].dir) { tstack_tab[i].dir = dir; tstack_tab[i].used = 0; return &tstack_tab[i].used; }
+	return 0;                          /* table full: caller falls back to a heap stack */
+}
+
+static void tstack_zero(uint32_t phys)
+{
+	uint32_t fl = irq_save();
+	uint32_t *kv = paging_scratch_map(0, phys);
+	for (int k = 0; k < 1024; k++) kv[k] = 0;
+	paging_scratch_unmap(0);
+	irq_restore(fl);
+}
+
+uint32_t user_stack_alloc(int pages)
+{
+	uint32_t *dir = sched_current_dir();
+	uint32_t *mask;
+	int slot = -1;
+	if (pages <= 0 || pages > (int)(TSTACK_SLOT_PAGES - 1)) return 0;
+	mask = tstack_mask_for(dir);
+	if (!mask) return 0;
+	for (unsigned i = 0; i < TSTACK_SLOTS; i++)
+		if (!(*mask & (1u << i))) { slot = (int)i; break; }
+	if (slot < 0) return 0;            /* all slots in use */
+	uint32_t top = TSTACK_TOP - (uint32_t)slot * TSTACK_SLOT_PAGES * 4096u;
+	for (int p = 0; p < pages; p++) {
+		uint32_t va = top - (uint32_t)(p + 1) * 4096u;
+		uint32_t phys = paging_user_phys(dir, va);   /* reuse a prior mapping of this slot */
+		if (!phys) {
+			phys = pmm_alloc_frame();
+			if (!phys) return 0;                      /* OOM: earlier pages of this slot leak until exit */
+			if (paging_map_user_at(dir, va, phys, 1) < 0) { pmm_free_frame(phys); return 0; }
+		}
+		tstack_zero(phys);
+	}
+	*mask |= (1u << slot);
+	return top;
+}
+
+void user_stack_free(uint32_t top)
+{
+	uint32_t *mask = tstack_mask_for(sched_current_dir());
+	uint32_t off, slot;
+	if (!mask || top <= TSTACK_LOW || top > TSTACK_TOP) return;
+	off = TSTACK_TOP - top;
+	if (off % (TSTACK_SLOT_PAGES * 4096u)) return;   /* not a slot top */
+	slot = off / (TSTACK_SLOT_PAGES * 4096u);
+	if (slot < TSTACK_SLOTS) *mask &= ~(1u << slot); /* keep the mapping for reuse */
+}
+
+void user_stack_reset_owner(uint32_t *dir)
+{
+	for (int i = 0; i < TSTACK_OWNERS; i++)
+		if (tstack_tab[i].dir == dir) { tstack_tab[i].dir = 0; tstack_tab[i].used = 0; }
+}

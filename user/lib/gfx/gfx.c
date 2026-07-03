@@ -10,7 +10,29 @@
 static unsigned *g_fb;
 static int       g_w, g_h;
 
-void gfx_init(unsigned *fb, int w, int h) { g_fb = fb; g_w = w; g_h = h; }
+/* Optional rectangular clip: all primitives additionally confine writes to
+ * [g_cx0,g_cx1) x [g_cy0,g_cy1). Defaults to the whole buffer; a compositor that
+ * repaints one damage rect at a time sets it so an unclipped full-scene redraw
+ * touches only the damaged pixels (like the kernel fb clip). */
+static int g_cx0, g_cy0, g_cx1, g_cy1;
+
+void gfx_init(unsigned *fb, int w, int h)
+{
+	g_fb = fb; g_w = w; g_h = h;
+	g_cx0 = 0; g_cy0 = 0; g_cx1 = w; g_cy1 = h;
+}
+
+void gfx_clip_none(void) { g_cx0 = 0; g_cy0 = 0; g_cx1 = g_w; g_cy1 = g_h; }
+
+void gfx_set_clip(int x, int y, int w, int h)
+{
+	int x1 = x + w, y1 = y + h;
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+	if (x1 > g_w) x1 = g_w;
+	if (y1 > g_h) y1 = g_h;
+	g_cx0 = x; g_cy0 = y; g_cx1 = x1 > x ? x1 : x; g_cy1 = y1 > y ? y1 : y;
+}
 
 /* 32-bpp run fill (`rep stosl`): solid rows are the inner loop of every rect
  * fill and the per-frame content-pane clear; a scalar store loop dominated paint. */
@@ -25,6 +47,7 @@ static inline void fill32(unsigned *d, unsigned v, int n)
 
 void gfx_pixel(int x, int y, unsigned color)
 {
+	if (x < g_cx0 || x >= g_cx1 || y < g_cy0 || y >= g_cy1) return;
 	if ((unsigned)x < (unsigned)g_w && (unsigned)y < (unsigned)g_h)
 		g_fb[y * g_w + x] = color;
 }
@@ -35,6 +58,11 @@ void gfx_fill_rect(int x, int y, int w, int h, unsigned color)
 	if (y < 0) { h += y; y = 0; }
 	if (x + w > g_w) w = g_w - x;
 	if (y + h > g_h) h = g_h - y;
+	/* intersect with the active clip rect */
+	if (x < g_cx0) { w -= g_cx0 - x; x = g_cx0; }
+	if (y < g_cy0) { h -= g_cy0 - y; y = g_cy0; }
+	if (x + w > g_cx1) w = g_cx1 - x;
+	if (y + h > g_cy1) h = g_cy1 - y;
 	if (w <= 0 || h <= 0) return;
 	for (int r = 0; r < h; r++)
 		fill32(g_fb + (long)(y + r) * g_w + x, color, w);
@@ -69,11 +97,13 @@ void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb)
 	for (int r = 0; r < h; r++) {
 		int sy = y + r;
 		if ((unsigned)sy >= (unsigned)g_h) continue;
+		if (sy < g_cy0 || sy >= g_cy1) continue;
 		const unsigned *src = argb + (long)r * w;
 		unsigned *drow = g_fb + (long)sy * g_w;
 		for (int c = 0; c < w; c++) {
 			int sx = x + c;
 			if ((unsigned)sx >= (unsigned)g_w) continue;
+			if (sx < g_cx0 || sx >= g_cx1) continue;
 			unsigned px = src[c], a = px >> 24;
 			if (a == 0) continue;
 			drow[sx] = (a == 255) ? (px & 0xffffff)
@@ -202,11 +232,13 @@ static void face_blit_clip(int x, int baseline, const struct gcache_e *g,
 	for (int gy = 0; gy < g->h; gy++) {
 		int sy = baseline + g->oy + gy;
 		if ((unsigned)sy >= (unsigned)g_h) continue;
+		if (sy < g_cy0 || sy >= g_cy1) continue;
 		if (ct < cb && (sy < ct || sy >= cb)) continue;
 		const unsigned char *srow = g->bm + gy * g->w;
 		for (int gx = 0; gx < g->w; gx++) {
 			int sx = x + g->ox + gx;
 			if ((unsigned)sx >= (unsigned)g_w) continue;
+			if (sx < g_cx0 || sx >= g_cx1) continue;
 			unsigned a = srow[gx];
 			if (a) { unsigned *px = &g_fb[sy * g_w + sx]; *px = gfx_blend(fg, *px, a); }
 		}

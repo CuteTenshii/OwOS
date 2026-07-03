@@ -84,6 +84,96 @@ void sha1(const void *data, uint32_t len, uint8_t out[SHA1_DIGEST])
 	sha1_final(&s, out);
 }
 
+/* ================================================================= SHA-512 */
+/* One-shot SHA-512 (FIPS 180-4). Used by Ed25519 (ed25519.c). */
+
+static uint64_t sha512_dl(const uint8_t *x)
+{
+	uint64_t u = 0;
+	for (int i = 0; i < 8; i++) u = (u << 8) | x[i];
+	return u;
+}
+static void sha512_ts(uint8_t *x, uint64_t u)
+{
+	for (int i = 7; i >= 0; i--) { x[i] = (uint8_t)u; u >>= 8; }
+}
+
+#define SHA512_ROR(x, c) (((x) >> (c)) | ((x) << (64 - (c))))
+#define SHA512_CH(x, y, z)  (((x) & (y)) ^ (~(x) & (z)))
+#define SHA512_MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define SHA512_S0(x) (SHA512_ROR(x, 28) ^ SHA512_ROR(x, 34) ^ SHA512_ROR(x, 39))
+#define SHA512_S1(x) (SHA512_ROR(x, 14) ^ SHA512_ROR(x, 18) ^ SHA512_ROR(x, 41))
+#define SHA512_s0(x) (SHA512_ROR(x, 1)  ^ SHA512_ROR(x, 8)  ^ ((x) >> 7))
+#define SHA512_s1(x) (SHA512_ROR(x, 19) ^ SHA512_ROR(x, 61) ^ ((x) >> 6))
+
+static const uint64_t sha512_K[80] = {
+	0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL,
+	0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL, 0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL,
+	0xd807aa98a3030242ULL, 0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+	0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL, 0xc19bf174cf692694ULL,
+	0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL, 0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL,
+	0x2de92c6f592b0275ULL, 0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+	0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL, 0xbf597fc7beef0ee4ULL,
+	0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL, 0x06ca6351e003826fULL, 0x142929670a0e6e70ULL,
+	0x27b70a8546d22ffcULL, 0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+	0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL, 0x92722c851482353bULL,
+	0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL, 0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL,
+	0xd192e819d6ef5218ULL, 0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+	0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL, 0x34b0bcb5e19b48a8ULL,
+	0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL, 0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL,
+	0x748f82ee5defb2fcULL, 0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+	0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL, 0xc67178f2e372532bULL,
+	0xca273eceea26619cULL, 0xd186b8c721c0c207ULL, 0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL,
+	0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+	0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL,
+	0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL, 0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL
+};
+
+static void sha512_blocks(uint64_t st[8], const uint8_t *m, uint32_t blocks)
+{
+	for (uint32_t b = 0; b < blocks; b++, m += 128) {
+		uint64_t w[80], a[8];
+		for (int i = 0; i < 16; i++) w[i] = sha512_dl(m + 8 * i);
+		for (int i = 16; i < 80; i++)
+			w[i] = w[i - 16] + SHA512_s0(w[i - 15]) + w[i - 7] + SHA512_s1(w[i - 2]);
+		for (int i = 0; i < 8; i++) a[i] = st[i];
+		for (int i = 0; i < 80; i++) {
+			uint64_t t1 = a[7] + SHA512_S1(a[4]) + SHA512_CH(a[4], a[5], a[6]) + sha512_K[i] + w[i];
+			uint64_t t2 = SHA512_S0(a[0]) + SHA512_MAJ(a[0], a[1], a[2]);
+			a[7] = a[6]; a[6] = a[5]; a[5] = a[4]; a[4] = a[3] + t1;
+			a[3] = a[2]; a[2] = a[1]; a[1] = a[0]; a[0] = t1 + t2;
+		}
+		for (int i = 0; i < 8; i++) st[i] += a[i];
+	}
+}
+
+void sha512(const void *data, uint32_t len, uint8_t out[SHA512_DIGEST])
+{
+	static const uint64_t iv[8] = {
+		0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+		0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL, 0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
+	};
+	uint64_t st[8];
+	for (int i = 0; i < 8; i++) st[i] = iv[i];
+
+	const uint8_t *m = (const uint8_t *)data;
+	uint32_t full = len / 128;
+	sha512_blocks(st, m, full);
+
+	uint8_t tail[256];
+	uint32_t rem = len - full * 128;
+	for (uint32_t i = 0; i < rem; i++) tail[i] = m[full * 128 + i];
+	tail[rem] = 0x80;
+	uint32_t pad = (rem < 112) ? 128 : 256;
+	for (uint32_t i = rem + 1; i < pad; i++) tail[i] = 0;
+	/* Trailing 128-bit big-endian bit length. The high 64 bits sit in the zeroed
+	 * region above (len < 2^29 fits in the low 64); write only the low half. */
+	sha512_ts(tail + pad - 8, (uint64_t)len << 3);
+	sha512_blocks(st, tail, pad / 128);
+
+	for (int i = 0; i < 8; i++) sha512_ts(out + 8 * i, st[i]);
+}
+
 /* ================================================================= SHA-256 */
 
 static const uint32_t sha256_k[64] = {
@@ -184,7 +274,7 @@ void sha256(const void *data, uint32_t len, uint8_t out[SHA256_DIGEST])
 	sha256_final(&s, out);
 }
 
-/* ============================================================ HMAC + HKDF */
+/* ============================================================ HMAC + PRF + HKDF */
 
 void hmac_sha256(const uint8_t *key, uint32_t keylen,
                  const uint8_t *msg, uint32_t msglen,
@@ -214,6 +304,44 @@ void hmac_sha256(const uint8_t *key, uint32_t keylen,
 	sha256_update(&s, opad, SHA256_BLOCK);
 	sha256_update(&s, inner, SHA256_DIGEST);
 	sha256_final(&s, out);
+}
+
+/* P_SHA256 (RFC 5246 §5): the TLS 1.2 PRF's HMAC expansion. */
+static void p_sha256(const uint8_t *secret, uint32_t secretlen,
+                     const uint8_t *seed, uint32_t seedlen,
+                     uint8_t *out, uint32_t outlen)
+{
+	uint8_t a[SHA256_DIGEST];
+	/* A(1) = HMAC(secret, seed) */
+	hmac_sha256(secret, secretlen, seed, seedlen, a);
+
+	uint8_t buf[SHA256_DIGEST + 512];   /* A(i) || seed; seed is small in TLS */
+	while (outlen) {
+		memcpy(buf, a, SHA256_DIGEST);
+		memcpy(buf + SHA256_DIGEST, seed, seedlen);
+		uint8_t block[SHA256_DIGEST];
+		hmac_sha256(secret, secretlen, buf, SHA256_DIGEST + seedlen, block);
+		uint32_t take = outlen < SHA256_DIGEST ? outlen : SHA256_DIGEST;
+		memcpy(out, block, take);
+		out += take;
+		outlen -= take;
+		/* A(i+1) = HMAC(secret, A(i)) */
+		hmac_sha256(secret, secretlen, a, SHA256_DIGEST, a);
+	}
+}
+
+void tls12_prf(const uint8_t *secret, uint32_t secretlen,
+               const char *label,
+               const uint8_t *seed, uint32_t seedlen,
+               uint8_t *out, uint32_t outlen)
+{
+	uint8_t fullseed[512];
+	uint32_t labellen = 0;
+	while (label[labellen])
+		labellen++;
+	memcpy(fullseed, label, labellen);
+	memcpy(fullseed + labellen, seed, seedlen);
+	p_sha256(secret, secretlen, fullseed, labellen + seedlen, out, outlen);
 }
 
 void hkdf_extract(const uint8_t *salt, uint32_t saltlen,

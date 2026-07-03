@@ -22,6 +22,17 @@ uint32_t fb_height(void);
 uint32_t *fb_ptr(void);            /* the back buffer drawing primitives target */
 uint32_t fb_pitch_pixels(void);    /* back buffer row stride in pixels (>= width) */
 
+/* Phase-1 primitives for a user-space compositor (SYS_FB_*). fb_backbuffer_phys
+ * is the physical base of the cached-RAM back buffer (0 in text/single-buffered
+ * mode); a compositor maps it and draws into it. fb_backbuffer_bytes is its
+ * mapped size. fb_dims reports the active geometry. fb_present_rect flushes one
+ * back-buffer rectangle to VRAM through the normal device path (damage-rect
+ * present), keeping the WC/SVGA logic in ring 0. */
+uint32_t fb_backbuffer_phys(void);
+uint32_t fb_backbuffer_bytes(void);
+void     fb_dims(int *w, int *h, int *pitch, int *bpp);
+void     fb_present_rect(int x, int y, int w, int h);
+
 /* Runtime resolution switching, available only on the DISPI path (fb_init): we
  * can reprogram QEMU's std-vga adapter, but a framebuffer adopted from a
  * bootloader (fb_adopt: GRUB/UEFI GOP) is fixed and fb_can_set_mode returns 0.

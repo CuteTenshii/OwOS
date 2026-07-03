@@ -31,11 +31,8 @@
 #include "pipe.h"
 #include "power.h"
 #include "net.h"
-#include "crypto.h"
 #include "keyboard.h"
-#include "wm.h"
 #include "serial.h"
-#include "services.h"
 #include "vmtools.h"
 
 #define LINE_MAX 128
@@ -402,17 +399,10 @@ static void wait_reap(int pid)
 {
 	int status;
 	while (!sched_try_reap(pid, &status)) {
-		/* While a foreground child runs, the main loop is parked here and isn't
-		 * draining the keyboard. If a GUI window holds focus (e.g. an app
-		 * the child spawned), pump input to it; otherwise leave keystrokes in
-		 * the ring for a console program's own read()/readline. */
-		if (wm_focus_takes_keys()) {
-			char c; unsigned char mods;
-			while (keyboard_poll(&c, &mods))
-				wm_feed_key(c, mods);
-			while (serial_poll(&c))
-				wm_feed_key(c, 0);          /* serial carries no modifier state */
-		}
+		/* While a foreground child runs, the recovery console's main loop is parked
+		 * here; leave keystrokes in the ring for a console program's own
+		 * read()/readline. (The desktop's keyboard is drained by the user-space
+		 * compositor, not this path.) */
 		__asm__ volatile ("sti; hlt");
 	}
 	con_printf("[pid %u exited, status %u]\n", (uint32_t)pid, (uint32_t)status);
@@ -953,7 +943,7 @@ static void bi_restart(const char *a)    { (void)a; con_write("restarting...\n")
  * fn == NULL rows are help-only notes for things that aren't bare commands. */
 /* The recovery console is deliberately minimal: enough to inspect and repair the
  * system over COM1 when the desktop isn't up. Everything else (info commands,
- * codecs, clipboard, torrent, services management, ...) lives in the
+ * codecs, clipboard, torrent, ...) lives in the
  * terminal `/bin/term`. A bare non-builtin name still spawns a /bin program, so
  * `curl`, `play`, `neofetch`, etc. remain runnable here -- they're just not
  * listed. `mtp` stays because it's kernel-only with nowhere else to live. */

@@ -12,6 +12,12 @@
 
 void gfx_init(unsigned *fb, int w, int h);
 void gfx_clear(unsigned color);
+/* Confine all subsequent primitives to a rectangle (intersected with the buffer),
+ * or gfx_clip_none() to restore the full buffer. A compositor uses this to repaint
+ * one damage rect at a time without touching pixels outside it. gfx_init resets it
+ * to the whole buffer. */
+void gfx_set_clip(int x, int y, int w, int h);
+void gfx_clip_none(void);
 void gfx_pixel(int x, int y, unsigned color);
 void gfx_fill_rect(int x, int y, int w, int h, unsigned color);
 void gfx_rect(int x, int y, int w, int h, unsigned color);   /* 1px outline */

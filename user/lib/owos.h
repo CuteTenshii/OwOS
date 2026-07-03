@@ -26,6 +26,7 @@ int      fork(void);                          /* 0 in child, child pid in parent
 int      execp(const char *name);             /* replace this image; -1 on error */
 int      execp1(const char *name, const char *arg); /* + one argv[1] string      */
 int      waitpid(int pid);                     /* block for a child; its status  */
+int      waitpid_nb(int pid, int *status);     /* non-blocking reap: 1 reaped/0 none */
 unsigned uptime(void);                        /* seconds since boot            */
 unsigned msec(void);                          /* milliseconds since boot       */
 unsigned rtc_epoch(void);                     /* Unix epoch seconds (UTC)      */
@@ -55,19 +56,19 @@ int      stream_end(void);
  * down and exit). Check it with `r == NET_EINTR`. */
 #define NET_EINTR (-4)
 
-/* Networking: a small Berkeley-ish socket API. net_connect resolves `host` and
- * opens a transport selected by `proto` (SK_*): TCP, TLS (handshake, SNI=host),
- * a UDP datagram socket to host:port, or a raw ICMP socket to host (the program
- * builds/parses the ICMP message itself). Returns a handle >= 0, or a negative
- * error (-1 no NIC/slot, -2 resolve failed, -3 connect failed, -4 interrupted).
- * net_send writes (a datagram, for UDP/ICMP). net_recv blocks: TCP/TLS -> >0
- * bytes / 0 EOF; UDP/ICMP -> >0 datagram bytes / 0 timeout; both -1 error, -4
- * interrupted. ping/dig/resolution are code over these sockets. */
+/* Networking: a small Berkeley-ish socket API. net_connect takes an IP literal
+ * (`host` is a dotted-quad — name resolution is user/lib/resolve, the getaddrinfo
+ * analog) and opens a transport selected by `proto` (SK_*): TCP, a UDP datagram
+ * socket to host:port, or a raw ICMP socket (the program builds/parses the ICMP
+ * message itself). Returns a handle >= 0, or a negative error (-1 no NIC/slot,
+ * -2 not an IP, -3 connect failed, -4 interrupted). net_send writes (a datagram,
+ * for UDP/ICMP). net_recv blocks: TCP -> >0 bytes / 0 EOF; UDP/ICMP -> >0
+ * datagram bytes / 0 timeout; both -1 error, -4 interrupted. TLS/ping/dig/
+ * resolution are code over these sockets (user/lib/{tls,resolve}, ping/dig). */
 #define SK_TCP    0
-#define SK_TLS    1
 #define SK_UDP    2
 #define SK_ICMP   3
-#define SK_TLS_H2 4   /* TLS that offers ALPN "h2" (check the result with net_alpn) */
+#define SK_RAWETH 4   /* raw L2: send/recv full Ethernet frames (root-only) */
 int      net_connect(const char *host, int port, int proto);
 int      net_send(int h, const void *buf, int len);
 int      net_recv(int h, void *buf, int max);
@@ -76,13 +77,40 @@ int      net_recv(int h, void *buf, int max);
  * alongside stdin without the blocking recv's idle timeout closing the link. */
 int      net_recv_nb(int h, void *buf, int max);
 int      net_close(int h);
-/* For a TLS socket, the ALPN protocol the server negotiated (we always offer
- * "h2","http/1.1"): ALPN_H2, ALPN_HTTP11 (or no ALPN), or ALPN_NONE for a
- * non-TLS socket. Lets a client pick HTTP/2 vs HTTP/1.1. */
+/* ALPN protocol a TLS conn negotiated (user-space TLS returns these): ALPN_H2,
+ * ALPN_HTTP11, or ALPN_NONE for a plain (non-TLS) connection. */
 #define ALPN_NONE   0
 #define ALPN_HTTP11 1
 #define ALPN_H2     2
-int      net_alpn(int h);
+/* Outgoing IP TTL for a UDP socket (the IP_MULTICAST_TTL analog); mDNS/SSDP
+ * need 255. Range 1..255; returns 0 / -1. */
+int      net_set_ttl(int h, int ttl);
+
+/* Server sockets — the passive/bound counterpart to net_connect, over the same
+ * handle space. TCP: net_listen opens a listener on `port`; net_accept blocks
+ * for a client and returns a NEW handle for the connection, driven with the
+ * ordinary net_send/net_recv/net_close (net_close on the listener stops it).
+ * UDP: net_bind binds a datagram socket to `port`; net_recvfrom blocks for one
+ * datagram and reports the sender's IP/port (src_ip/src_port may be NULL);
+ * net_sendto replies to any ip:port. Returns >=0 handle/bytes/ok, or negative
+ * (-1 no NIC/slot/bad fd, NET_EINTR on Ctrl+C). */
+int      net_listen(int port);
+int      net_accept(int listen_fd);
+int      net_bind(int port);
+int      net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[4], int *src_port);
+int      net_sendto(int fd, const unsigned char ip[4], int port, const void *buf, int len);
+
+/* Raw Ethernet socket (the AF_PACKET analog) + interface config — both root-only,
+ * for /bin/dhcpcd. net_raw_open returns a fd usable with net_send (transmit a
+ * full L2 frame verbatim) / net_recv / net_recv_nb (dequeue one inbound frame,
+ * unfiltered) / net_close. ifconfig sets the kernel IPv4 config. -1 if not root. */
+int      net_raw_open(void);
+int      ifconfig(const unsigned char ip[4], const unsigned char mask[4],
+                  const unsigned char gw[4], const unsigned char dns[4]);
+
+/* Set the wall clock from a Unix timestamp (UTC seconds). Root-only: -1 if the
+ * caller isn't uid 0. Any time source (e.g. /bin/ntpd) can drive it. */
+int      setrtc(unsigned secs);
 
 /* Freestanding string helpers — shared so each program doesn't re-roll its own.
  * Standard libc names, matching the kernel's kstring.h convention. */
@@ -187,6 +215,78 @@ int win_resizable(int id, int on);   /* opt the window in/out of user resizing *
 #define WIN_CURSOR_RESIZE_EW   7 /* ↔ horizontal resize (left/right)    */
 int win_cursor(int id, int shape);
 
+/* ---- User-space compositor API (Phase 1; all root-only, -1 if not uid 0) ----
+ * A /bin/compositor maps the shared framebuffer back buffer, reads raw input,
+ * and brokers the windows the kernel WM exposes. Fixed VAs (loader.h): the back
+ * buffer maps at COMPOSITOR_FB_ADDR; a window id's buffer maps at
+ * WIN_MAP_ADDR(id). Unconsumed by ordinary apps. */
+#define COMPOSITOR_FB_ADDR   0xD0000000u
+#define WIN_MAP_BASE_ADDR    0xE0000000u
+#define WIN_MAP_SLOT         0x00800000u    /* 8 MiB per window slot */
+static inline unsigned *win_map_ptr(int id)
+{ return (unsigned *)(WIN_MAP_BASE_ADDR + (unsigned)id * WIN_MAP_SLOT); }
+
+struct fbinfo { int w, h, pitch, bpp; };    /* pitch = pixels per row */
+int fb_info(struct fbinfo *out);            /* 0/-1 */
+unsigned *fb_map(void);                     /* the back buffer (COMPOSITOR_FB_ADDR), or 0 */
+int fb_present_rect(int x, int y, int w, int h);   /* flush a rect to VRAM; 0/-1 */
+
+/* Raw input for the compositor: current pointer state + drained key events
+ * (non-blocking — whatever is pending now). keys[i].mods is a KMOD_* set. */
+#define INPUT_KEYS 32
+struct inputstate {
+	int mx, my, buttons, wheel;             /* buttons: bit0 L, bit1 R, bit2 M */
+	int nkeys;
+	struct { int c, mods; } keys[INPUT_KEYS];
+};
+int input_poll(struct inputstate *out);     /* 0/-1 */
+int input_set_bounds(int w, int h);         /* clamp box after a mode change; 0/-1 */
+
+/* Window brokering. win_enum fills `out` (up to `max`) with the live windows in
+ * ascending z (bottom first) and returns the count. win_map maps a window's
+ * client buffer at WIN_MAP_ADDR(id) and fills *m; win_unmap drops it. win_set_geom
+ * moves/resizes; win_deliver pushes a hit-tested, client-relative event into the
+ * window's ring; win_set_focus raises a window (id <= 0 = none). */
+struct winrec {
+	int id, x, y, w, h;
+	unsigned flags;                         /* UWIN_F_* */
+	unsigned present_seq;
+	int owner_pid, z;
+	int buf_w, buf_h;                       /* client buffer size (stride = buf_w) */
+	char title[64];
+};
+#define UWIN_F_VISIBLE   0x01
+#define UWIN_F_FOCUSED   0x02
+#define UWIN_F_MINIMIZED 0x04
+#define UWIN_F_MAXIMIZED 0x08
+#define UWIN_F_RESIZABLE 0x10
+struct winmap { unsigned vaddr; int w, h, stride; };
+struct winevent { unsigned type; int a, b; };   /* type = WEV_*, client-relative */
+
+int win_enum(struct winrec *out, int max);          /* count / -1 */
+int win_map(int id, struct winmap *m);               /* 0/-1 */
+int win_unmap(int id);                               /* 0/-1 */
+int win_set_geom(int id, int x, int y, int w, int h);/* 0/-1 */
+int win_deliver(int id, const struct winevent *ev);  /* 0/-1 */
+int win_set_focus(int id);                           /* 0/-1 */
+/* Free slots in a window's key/input event ring (a huge number if the window
+ * doesn't queue). Paste flow control: don't push keys faster than the app drains
+ * or events past the ring depth are dropped. */
+int win_key_space(int id);
+
+/* Pending user-process crash reports, for the compositor to render "<app> has
+ * crashed" windows (the kernel captures them in the fault handler). crash_poll
+ * drains up to `max` into `out`, consuming each, and returns the count (root). */
+#define CRASH_TRACE_MAX 12
+struct crash_rec {
+	char     name[24];
+	unsigned vector, err, eip, cr2;
+	unsigned eax, ebx, ecx, edx, esi, edi, ebp, esp;
+	unsigned trace[CRASH_TRACE_MAX];
+	int      ntrace;
+};
+int crash_poll(struct crash_rec *out, int max);      /* count / -1 */
+
 /* Wall-clock time, packed as (hour<<16)|(min<<8)|sec. */
 unsigned now_hms(void);
 
@@ -198,6 +298,8 @@ void msleep(unsigned ms);
  * return (loop, then call exit()); join it with thread_join (== waitpid) before
  * the process exits, so the shared address space outlives every thread. */
 int thread_create(void (*fn)(void), void *stack_top);
+void *thread_stack_alloc(int bytes);   /* guarded thread stack (unmapped guard page below); 0 on fail */
+void  thread_stack_free(void *top);
 static inline int thread_join(int tid) { return waitpid(tid); }
 
 /* User-space heap. sbrk() moves the process break by `inc` bytes (negative to
@@ -222,12 +324,20 @@ int readdir(const char *path, int idx, struct dirent_u *out);
 
 /* Filesystem management (paths join onto the process cwd; the shell passes
  * absolute paths). All return 0 on success, -1 on failure. */
-struct statinfo { int is_dir; unsigned size; };
+/* `mtime` is owofs's packed wall-clock stamp (0 = unstamped/unknown):
+ * [year-2000:6][month:4][day:5][hour:5][min:6][sec:6]. */
+struct statinfo { int is_dir; unsigned size; unsigned mtime; };
 int mkdir(const char *path);
 int rmdir(const char *path);
 int unlink(const char *path);                       /* delete a file          */
 int rename(const char *old, const char *neu);
 int stat(const char *path, struct statinfo *out);   /* -1 if path absent      */
+
+/* Filesystem usage of the volume backing `path` (any path selects the one
+ * owofs volume today). total_bytes/free_bytes are the disk capacity and the
+ * space still allocatable. Returns 0, or -1 if the fs isn't mounted. */
+struct statfs_info { unsigned long long total_bytes; unsigned long long free_bytes; };
+int statfs(const char *path, struct statfs_info *out);
 
 /* Launch a program (resolved /bin path or absolute) as a detached process,
  * with an optional single argument. Returns the child pid, or -1. */
@@ -243,9 +353,15 @@ int spawn_cap(const char *path, char *const argv[], int argc, int *rfd);
  * (write keystrokes into it; the child reads fd 0). For interactive children
  * (ssh) the terminal forwards its own keystrokes through *wfd. */
 int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *wfd);
+/* Like spawn_cap_io, but also sets the child's uid/gid and cwd (uid/gid < 0 or
+ * cwd == 0 = inherit). Changing to another uid/gid is root-only: the privileged
+ * spawn-as-user primitive (a root daemon dropping to the logged-in user). */
+int spawn_cap_io_as(const char *path, char *const argv[], int argc,
+                    int uid, int gid, const char *cwd, int *rfd, int *wfd);
 int read_nb(int fd, void *buf, int len);  /* >0 bytes / 0 would-block / -1 EOF */
 int chdir(const char *path);              /* set this process's cwd; 0/-1      */
-int kill(int pid);                        /* terminate a child of this process */
+int kill(int pid, int sig);               /* post a signal to a task; 0/-1     */
+int getpid(void);                         /* this process's pid                */
 int power(int action);                    /* 0 = shut down, 1 = reboot         */
 
 /* Identity: numeric ids from the kernel; name/home resolved from /etc/passwd. */
@@ -262,7 +378,57 @@ int sethostname(const char *name);        /* persist /etc/hostname; 0/-1        
 int port_open(const char *name, int as_server);
 int port_accept(int listen_fd);
 
-int intr_take(void);   /* 1 (and clear) if Ctrl+C arrived; for CPU-bound loops */
+/* Signals (the kernel's minimal POSIX model — see kernel/signal.h). A process
+ * installs a disposition with signal()/sigaction(); an uncaught signal takes its
+ * default action (terminate for most, ignore for SIGCHLD/SIGCONT). Delivery
+ * interrupts a blocking syscall (it returns the interrupted/-error value) and then
+ * runs the handler. Masks are uint32 bitsets (bit n = signal n); build with
+ * sigmask(n). Numbers/flags mirror kernel/signal.h — keep them in sync. */
+#define SIGHUP 1
+#define SIGINT 2
+#define SIGQUIT 3
+#define SIGILL 4
+#define SIGTRAP 5
+#define SIGABRT 6
+#define SIGBUS 7
+#define SIGFPE 8
+#define SIGKILL 9
+#define SIGUSR1 10
+#define SIGSEGV 11
+#define SIGUSR2 12
+#define SIGPIPE 13
+#define SIGALRM 14
+#define SIGTERM 15
+#define SIGCHLD 17
+#define SIGCONT 18
+#define SIGSTOP 19
+#define SIGTSTP 20
+#define SIGTTIN 21
+#define SIGTTOU 22
+
+typedef void (*sighandler_t)(int);
+#define SIG_DFL ((sighandler_t)0)
+#define SIG_IGN ((sighandler_t)1)
+#define SIG_ERR ((sighandler_t)-1)
+
+#define SA_RESTART 0x10000000u
+
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
+#define sigmask(n) (1u << (n))
+
+struct sigaction {
+	unsigned handler;   /* a sighandler_t, or SIG_DFL / SIG_IGN */
+	unsigned mask;      /* extra signals blocked while the handler runs */
+	unsigned flags;     /* SA_* */
+};
+
+sighandler_t signal(int sig, sighandler_t handler);   /* prev disposition / SIG_ERR */
+int sigaction(int sig, const struct sigaction *act, struct sigaction *old);  /* 0/-1 */
+unsigned sigprocmask(int how, const unsigned *set, unsigned *old); /* new blocked mask */
+int raise(int sig);                                   /* send `sig` to ourselves */
 
 /* Audio PCM sink (streaming): open a stream, push 48 kHz / 16-bit / signed /
  * stereo frames (4 bytes each), then close. audio_write blocks (back-pressure)
@@ -304,6 +470,7 @@ int umount(const char *point);
 #define KEY_F12    0x1D   /* F12: the app decides (the browser opens devtools) */
 #define KEY_SUPER  0x11   /* Windows key: WM-consumed (Start menu), never reaches apps;
                              defined only to keep 0x11 reserved and this table in sync */
+#define KEY_CLIPHIST 0x1E /* Super+V: the compositor opens the clipboard-history viewer */
 #define KEY_NEW    0x0F   /* Ctrl+N  \                                         */
 #define KEY_OPEN   0x10   /* Ctrl+O   > menu accelerators (see menu_shortcut)  */
 #define KEY_SAVE   0x13   /* Ctrl+S  /                                         */

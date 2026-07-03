@@ -601,7 +601,7 @@ static void render_child(const char *path, char **argv, int argc, int interactiv
 			char k;
 			int kn = read_nb(0, &k, 1);
 			if (kn > 0) {
-				if ((unsigned char)k == 0x03) { kill(pid); }     /* ^C */
+				if ((unsigned char)k == 0x03) { kill(pid, SIGINT); }     /* ^C */
 				else if (wfd >= 0) write(wfd, &k, 1);            /* forward to child */
 			}
 			int n = read_nb(rfd, iobuf, sizeof iobuf);
@@ -621,13 +621,13 @@ static void render_child(const char *path, char **argv, int argc, int interactiv
 	for (;;) {
 		struct win_event ev;
 		while (win_poll(win, &ev)) {                 /* stay responsive mid-command */
-			if (ev.type == WEV_CLOSE && !closing) { closing = 1; kill(pid); }
+			if (ev.type == WEV_CLOSE && !closing) { closing = 1; kill(pid, SIGKILL); }
 			else if (ev.type == WEV_KEY && interactive && !closing) {
 				char b = (char)ev.a;                /* forward the keystroke raw   */
 				if (wfd >= 0) write(wfd, &b, 1);
 			}
 			else if (ev.type == WEV_KEY && (unsigned char)ev.a == KEY_INTR && !intr && !closing) {
-				intr = 1; kill(pid); tputs("^C\n"); redraw();   /* Ctrl+C: abort */
+				intr = 1; kill(pid, SIGINT); tputs("^C\n"); redraw();   /* Ctrl+C: abort */
 			}
 		}
 		int n = read_nb(rfd, iobuf, sizeof iobuf);

@@ -7,6 +7,7 @@
  * present) are made by this, the owning, thread.
  */
 #include "browser.h"
+#include "cache.h"  /* persistent HTTP response cache: load at startup */
 #include "font.h"   /* custom @font-face faces (user/lib/font) */
 #include "clipboard.h"   /* clip_put_text for Copy */
 #include "layout.h"  /* the CSS box tree (backgrounds/borders behind the text) */
@@ -22,6 +23,32 @@ static struct gfx_sel g_sel;
 static int g_selecting;
 
 int BW = 600, BH = 368;        /* client size; grows/shrinks on resize */
+
+/* Double buffering: all rendering targets a private back buffer (surface()); a
+ * finished frame is copied into the live window buffer by blit_present() right
+ * before SYS_WIN_PRESENT. Without this the browser drew straight into the shared
+ * window buffer, so the compositor could blit a half-finished full repaint —
+ * torn / cut-off text. The back buffer grows with the client area (never shrinks). */
+static unsigned *g_surface;
+static int       g_surface_px;
+static unsigned *surface(void)
+{
+	int need = BW * BH;
+	if (need > g_surface_px) {
+		unsigned *n = realloc(g_surface, (unsigned)need * 4);
+		if (n) { g_surface = n; g_surface_px = need; }
+	}
+	return g_surface ? g_surface : (unsigned *)WIN_FB_ADDR;   /* OOM: draw direct */
+}
+static void blit_present(int id)
+{
+	if (g_surface) {
+		int px = BW * BH;
+		if (px > g_surface_px) px = g_surface_px;
+		memcpy((unsigned *)WIN_FB_ADDR, g_surface, (unsigned)px * 4);
+	}
+	win_present(id);
+}
 
 const unsigned palette[16] = {
 	0x202830, 0x1a4fbf, 0xc01818, 0x108010, 0x9020a0, 0x9a6020, 0x107c90,
@@ -329,6 +356,7 @@ static void tab_leave(int i)
 
 
 /* --- worker thread: drains req_pending, fetches, bumps seq for the UI ----- */
+static void rewrap(int paw);   /* line-table flow; owned by the worker (see below) */
 /* 256 KiB: http_txn holds hdr[4096] + req[2048] + a cookie buffer, and the
  * redirect follower stacks several URL_MAX (2 KiB) scratch URLs. But the deeper
  * consumer is the recursive DOM render walk (walk_element_inner): it carries a
@@ -511,6 +539,19 @@ static void worker_fn(void)
 		/* Rebuild the devtools DOM/Styles snapshot from the live tree (this thread
 		 * owns it) when the panel is open and the page changed. No-op when closed. */
 		devtools_worker_tick();
+
+		/* Flow the line table on THIS thread, not in render(). A big page's reflow
+		 * (layout_flow over the whole document) is the one expensive step; keeping it
+		 * off the main thread means render() only paints the built table and the
+		 * event loop never stalls ("Not Responding"). Re-flow when the box tree/text
+		 * changed (layout_dirty) or the main thread published a new width (resize).
+		 * Held under blk_lock so render() never observes a half-built table. */
+		if (B->want_paw > 0 && (B->layout_dirty || B->wrap_cols != B->want_paw)) {
+			blk_lock();
+			rewrap(B->want_paw);
+			blk_unlock();
+			B->seq++;
+		}
 		msleep(30);
 	}
 }
@@ -642,7 +683,7 @@ static int body_width(const char *s, int px)
 static void blit_glyph(int x, int y, const struct gcache *g, unsigned fg, int ct, int cb, int italic)
 {
 	if (!g->bm) return;
-	unsigned *fb = win_fb();
+	unsigned *fb = surface();
 	unsigned fr = (fg >> 16) & 0xff, fgc = (fg >> 8) & 0xff, fbb = fg & 0xff;
 	for (int gy = 0; gy < g->h; gy++) {
 		int py = y + g->oy + gy;
@@ -953,6 +994,11 @@ static int block_line_h(void)
  * and the box layout (one slice per block). */
 static void flow_slice(int t0, int t1, int base_x, int w)
 {
+	/* Text/attr buffers are (re)built together by the layout walk; a relayout
+	 * triggered mid-flight (e.g. by a script mutating the DOM) can reach here
+	 * before they exist. Never scan a NULL buffer, and clamp to what's built. */
+	if (!B->pg->text || !B->pg->attr) return;
+	if (t1 > B->pg->text_len) t1 = B->pg->text_len;
 	if (w < 8) w = 8;
 	int i = t0;
 	while (i < t1) {
@@ -1346,6 +1392,13 @@ static void layout_flow(int paw)
 static void rewrap(int paw)
 {
 	if (paw < 8) paw = 8;
+	/* Single consistency guard for the whole layout+paint below: the worker
+	 * rebuilds text/attr/box-tree during a (re)layout, and although render() holds
+	 * blk_lock (so nothing changes mid-frame), it can still observe the instant
+	 * where the buffers aren't built yet. Don't lay out or paint over a NULL text
+	 * buffer — drop to an empty page this frame and force a re-wrap once it's
+	 * ready. This replaces per-reader NULL checks across every flow/measure fn. */
+	if (!B->pg->text) { B->nlines = 0; B->layout_dirty = 1; return; }
 	if (!B->layout_dirty && B->wrap_cols == paw)
 		return;
 	for (int q = 0; q < B->pg->n_imgs; q++) B->pg->imgs[q].start_row = -1;
@@ -1400,7 +1453,7 @@ static int img_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 {
 	(void)w;
 	struct imgblit *v = c;
-	unsigned *fb = win_fb();
+	unsigned *fb = surface();
 	while (v->next_r < v->dh && (v->next_r * v->ih / v->dh) == y) {
 		unsigned *drow = fb + (unsigned long)(v->py + v->oy + v->next_r) * BW
 		                 + v->px + v->ox;
@@ -1465,7 +1518,7 @@ static int inl_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 {
 	(void)w;
 	struct inlblit *v = c;
-	unsigned *fb = win_fb();
+	unsigned *fb = surface();
 	while (v->next_r < (unsigned)v->dh && (v->next_r * v->ih / (unsigned)v->dh) == y) {
 		int dy = v->y0 + (int)v->next_r;
 		if (dy >= v->clip_top && dy < v->clip_bot) {
@@ -1547,7 +1600,7 @@ static void draw_inline_image(struct inl_img *im, int py, int phh, int paw)
 	 * from the decode cache (decoded once, not per frame). */
 	const unsigned char *src = im->is_argb ? (B->img_pool + im->coff) : imgc_get(im);
 	if (src) {
-		unsigned *fb = win_fb();
+		unsigned *fb = surface();
 		for (int ry = 0; ry < dh; ry++) {
 			int dy = y0 + ry;
 			if (dy < ct || dy >= cb) continue;
@@ -1856,7 +1909,7 @@ static void paint_gradient(const struct css_bg_image *bi, int bx, int sy, int bw
 	if (bw <= 0 || bh_full <= 0) return;
 	struct gstops g; resolve_stops(bi, &g);
 	if (g.n == 0) return;
-	unsigned *fb = win_fb();
+	unsigned *fb = surface();
 	int x0 = bx < 0 ? 0 : bx, x1 = bx + bw; if (x1 > clipw) x1 = clipw;
 	int cx = bw / 2, cy = bh_full / 2;
 
@@ -1934,7 +1987,7 @@ static void paint_bg_image(const struct bg_img *im, const struct css_bg_image *b
 	int tilex = (rep == CSS_BGR_REPEAT || rep == CSS_BGR_REPEAT_X);
 	int tiley = (rep == CSS_BGR_REPEAT || rep == CSS_BGR_REPEAT_Y);
 
-	unsigned *fb = win_fb();
+	unsigned *fb = surface();
 	int x0 = bx < 0 ? 0 : bx, x1 = bx + bw; if (x1 > clipw) x1 = clipw;
 	for (int yy = by; yy < by + bh; yy++) {
 		int ry = yy - sy - offy;
@@ -1973,7 +2026,7 @@ static void fill_round_rect(int x, int y, int w, int h, int r, unsigned rgb, int
 	if (r < 0) r = 0;
 	if (r * 2 > w) r = w / 2;
 	if (r * 2 > h) r = h / 2;
-	unsigned *fb = win_fb();
+	unsigned *fb = surface();
 	unsigned sr = (rgb >> 16) & 0xff, sg = (rgb >> 8) & 0xff, sb = rgb & 0xff, ia = 255 - alpha;
 	for (int yy = 0; yy < h; yy++) {
 		int p_y = y + yy;
@@ -2182,7 +2235,11 @@ static void render(void)
 		scrollbar_draw(pw, py, SCROLL_W, phh, 0, 0, 0);  /* inert scrollbar */
 	} else {
 		int paw = pw - 8;                          /* content width, px */
-		rewrap(paw);
+		/* The worker owns the line-table flow (see worker_fn). render() only paints
+		 * the table it built — never reflows — so a heavy page can't stall the event
+		 * loop here. If the worker hasn't caught up to the current width yet, we paint
+		 * the existing table for this frame; the worker re-flows within a tick. */
+		if (!B->pg->text) { B->nlines = 0; B->layout_dirty = 1; }
 		paint_boxes(py, pw, phh);                  /* block backgrounds behind the text */
 		if (B->loading && B->nlines == 0) {
 			gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
@@ -2464,6 +2521,7 @@ static void new_tab(void)
 	devtools_view_load(&t->dt);
 	copy_str(t->label, "New Tab", sizeof t->label);
 	show_blank();
+	update_title(B->win_id);                 /* clear the previous tab's title */
 }
 
 static void close_tab(int i)
@@ -2605,7 +2663,7 @@ static void pane_linecol(int mx, int my, int *line, int *col)
 /* Alpha-blend a translucent selection highlight over the frame buffer rect. */
 static void sel_hl_rect(int x, int y, int w, int h)
 {
-	unsigned *fb = win_fb();
+	unsigned *fb = surface();
 	const unsigned sr = 0x33, sg = 0x66, sb = 0xcc, a = 110, ia = 255 - a;  /* ~43% blue */
 	for (int yy = y; yy < y + h; yy++) {
 		if (yy < 0 || yy >= BH) continue;
@@ -2917,12 +2975,14 @@ static void update_title(int id)
 {
 	if (B->pg->doc_title[0]) { win_settitle(id, B->pg->doc_title); return; }
 	struct purl u;
-	if (parse_url(B->pg->cur_url, &u)) {
+	if (B->pg->cur_url[0] && parse_url(B->pg->cur_url, &u)) {
 		char t[80]; int ti = 0;
 		sapp(t, &ti, sizeof t, "browser - ");
 		sapp(t, &ti, sizeof t, u.host);
 		win_settitle(id, t);
+		return;
 	}
+	win_settitle(id, "New Tab");   /* blank tab: match the tab-strip label */
 }
 
 int main(int argc, char **argv)
@@ -2932,7 +2992,7 @@ int main(int argc, char **argv)
 	int id = win_create(BW, BH, "browser");
 	if (id < 0) { puts("browser: no window\n"); return 1; }
 	B->win_id = id;
-	gfx_init(win_fb(), BW, BH);
+	gfx_init(surface(), BW, BH);
 	B->pg->page_bg = 0xffffff; B->pg->page_fg = 0x202830;   /* until a page sets them */
 
 	textfield_init(&B->addr_tf, B->addr, URL_MAX);
@@ -2940,12 +3000,14 @@ int main(int argc, char **argv)
 	B->layout_dirty = 1;
 
 	jar_load();   /* restore cookies + HSTS from the persistent SQLite db */
+	cache_load(); /* restore the persistent HTTP response cache from disk */
 
 	int wtid = thread_create(worker_fn, &worker_stack[sizeof worker_stack]);
 
 	/* Launched with a URL (e.g. `browser http://host/page`): load it at startup;
 	 * otherwise open on a blank New Tab rather than prefilling a default site. */
 	if (start) navigate(start);
+	else       update_title(id);   /* blank launch tab: title matches "New Tab" */
 
 	unsigned last = B->seq - 1;
 	int prev_loading = 0;
@@ -2985,7 +3047,7 @@ int main(int argc, char **argv)
 				}
 			} else if (ev.type == WEV_RESIZE) {
 				BW = ev.a; BH = ev.b;
-				gfx_init(win_fb(), BW, BH);
+				gfx_init(surface(), BW, BH);
 				B->recascade = 1;    /* @media may change → worker re-cascades  */
 				B->seq++;            /* re-wrap + repaint at the new width */
 			}
@@ -3037,11 +3099,20 @@ int main(int argc, char **argv)
 		if (media_active() && (frame - last_paint_frame) >= LOAD_REDRAW_FRAMES)
 			B->seq++;
 
+		/* Publish the content-pane pixel width for the worker's line-table flow
+		 * (must match render()'s paw below: pane width minus the scrollbar and the
+		 * 8 px left inset). The worker re-wraps when this changes (resize). */
+		{
+			int right = devtools_visible() ? devtools_left() : BW;
+			int wpaw = right - SCROLL_W - 8; if (wpaw < 8) wpaw = 8;
+			B->want_paw = wpaw;
+		}
+
 		int due = !B->loading || (frame - last_paint_frame) >= LOAD_REDRAW_FRAMES;
 		if (B->seq != last && due) {
-			render(); win_present(id); last = B->seq; last_paint_frame = frame; addr_dirty = 0;
+			render(); blit_present(id); last = B->seq; last_paint_frame = frame; addr_dirty = 0;
 		} else if (addr_dirty) {                     /* address-bar keystroke only */
-			render_addr(); win_present(id); addr_dirty = 0;
+			render_addr(); blit_present(id); addr_dirty = 0;
 		}
 		frame++;
 		win_wait(id);

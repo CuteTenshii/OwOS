@@ -23,11 +23,16 @@ user/apps/gui/editor.elf: user/apps/gui/editor.o $(CLIPBOARD) $(MIME) $(ULIB) $(
 user/apps/gui/cliphist.elf: user/apps/gui/cliphist.o $(CLIPBOARD) $(MIME) $(ULIB) $(GUILIB) user/user.ld
 	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/cliphist.o $(CLIPBOARD) $(MIME) $(GUILIB) $(ULIB) $(LIBGCC)
 
+# the compositor pastes clipboard text into the focused window (Ctrl+V / Super+V),
+# so it links the clipboard client lib.
+user/apps/gui/compositor.elf: user/apps/gui/compositor.o $(CLIPBOARD) $(ULIB) $(GUILIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/compositor.o $(CLIPBOARD) $(GUILIB) $(ULIB) $(LIBGCC)
+
 # The browser is a multi-file user program (user/apps/gui/browser/*.c), linked
 # flat: streaming inflate (gzip/deflate), the PNG decoder, HTTP/2, the SQLite jar.
-BROWSER_OBJS := user/apps/gui/browser/main.o user/apps/gui/browser/fetch.o user/apps/gui/browser/resource.o user/apps/gui/browser/html.o user/apps/gui/browser/dom.o user/apps/gui/browser/css.o user/apps/gui/browser/color.o user/apps/gui/browser/layout.o user/apps/gui/browser/svg.o user/apps/gui/browser/jar.o user/apps/gui/browser/js.o user/apps/gui/browser/devtools.o user/apps/gui/browser/csp.o user/apps/gui/browser/cors.o user/apps/gui/browser/media.o
-user/apps/gui/browser.elf: $(BROWSER_OBJS) $(UPNG) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(CLIPBOARD) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(CLIPBOARD) $(GUILIB) $(ULIB) $(LIBGCC)
+BROWSER_OBJS := user/apps/gui/browser/main.o user/apps/gui/browser/fetch.o user/apps/gui/browser/resource.o user/apps/gui/browser/html.o user/apps/gui/browser/dom.o user/apps/gui/browser/css.o user/apps/gui/browser/color.o user/apps/gui/browser/layout.o user/apps/gui/browser/svg.o user/apps/gui/browser/jar.o user/apps/gui/browser/cache.o user/apps/gui/browser/js.o user/apps/gui/browser/devtools.o user/apps/gui/browser/csp.o user/apps/gui/browser/cors.o user/apps/gui/browser/media.o
+user/apps/gui/browser.elf: $(BROWSER_OBJS) $(UPNG) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(HTTPCACHE) $(NETCONN) $(TLS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(CLIPBOARD) $(RESOLVE) $(ULIB) $(GUILIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(HTTPCACHE) $(NETCONN) $(TLS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(CLIPBOARD) $(RESOLVE) $(GUILIB) $(ULIB) $(LIBGCC)
 
 # notifyd (the notification daemon) decodes notification thumbnails with the
 # streaming PNG decoder; it serves the "notify" port and draws the Notification
@@ -47,9 +52,25 @@ user/apps/gui/player.elf: user/apps/gui/player.o $(MEDIA) $(ULIB) $(GUILIB) user
 	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/player.o $(MEDIA) $(GUILIB) $(ULIB) $(LIBGCC)
 
 # --- CLI apps that pull in extra libs ---------------------------------------
+# ping / dig resolve their target in user space now (kernel connect takes an IP
+# only): link the resolver ($(RESOLVE) bundles the mDNS client for .local names).
+user/apps/cli/ping.elf: user/apps/cli/ping.o $(RESOLVE) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/ping.o $(RESOLVE) $(ULIB) $(LIBGCC)
+user/apps/cli/dig.elf: user/apps/cli/dig.o $(RESOLVE) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/dig.o $(RESOLVE) $(ULIB) $(LIBGCC)
+
+# ntpd resolves its server host in user space (kernel connect takes an IP only).
+user/apps/cli/ntpd.elf: user/apps/cli/ntpd.o $(RESOLVE) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/ntpd.o $(RESOLVE) $(ULIB) $(LIBGCC)
+
 # clipd (clipboard server) links the clipboard client lib + the MIME helper.
 user/apps/cli/clipd.elf: user/apps/cli/clipd.o $(CLIPBOARD) $(MIME) $(ULIB) user/user.ld
 	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/clipd.o $(CLIPBOARD) $(MIME) $(ULIB) $(LIBGCC)
+
+# vmclipd bridges the VMware host clipboard (/proc/hostclip) to clipd; links the
+# clipboard client lib.
+user/apps/cli/vmclipd.elf: user/apps/cli/vmclipd.o $(CLIPBOARD) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/vmclipd.o $(CLIPBOARD) $(ULIB) $(LIBGCC)
 
 # notify-send: the client CLI links the notifyd client lib.
 user/apps/cli/notifysend.elf: user/apps/cli/notifysend.o $(NOTIFY) $(ULIB) user/user.ld
@@ -65,17 +86,28 @@ user/apps/cli/webp.elf: user/apps/cli/webp.o $(WEBP) $(UPNG) $(INFLATE) $(ULIB) 
 user/apps/cli/json.elf: user/apps/cli/json.o $(JSON) $(MATH) $(ULIB) user/user.ld
 	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/json.o $(JSON) $(MATH) $(ULIB) $(LIBGCC)
 
+# alac: the Apple Lossless codec CLI (info / encode WAV->CAF / decode CAF->WAV /
+# verify a bit-exact round trip). Links the ALAC codec; the WAV/CAF containers
+# live in the CLI itself.
+user/apps/cli/alac.elf: user/apps/cli/alac.o $(ALAC) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/alac.o $(ALAC) $(ULIB) $(LIBGCC)
+
 # curl: libcurl (HTTP/1.1 + HTTP/2 + HTTP/3 over QUIC) + URL + crypto (AES-GCM/x25519).
-user/apps/cli/curl.elf: user/apps/cli/curl.o $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(CRYPTO) $(BROTLI) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/curl.o $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(CRYPTO) $(BROTLI) $(ULIB) $(LIBGCC)
+user/apps/cli/curl.elf: user/apps/cli/curl.o $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(NETCONN) $(TLS) $(CRYPTO) $(BROTLI) $(RESOLVE) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/curl.o $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(NETCONN) $(TLS) $(CRYPTO) $(BROTLI) $(RESOLVE) $(ULIB) $(LIBGCC)
 
 # torrent: libtorrent (bencode/torrent/tracker/peer) + libcurl + crypto (SHA-1).
 user/apps/cli/torrent.elf: user/apps/cli/torrent.o $(TORLIB) $(CRYPTO) $(ULIB) user/user.ld
 	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/torrent.o $(TORLIB) $(CRYPTO) $(ULIB) $(LIBGCC)
 
 # ssh: from-scratch SSH-2 over net_* sockets + crypto (x25519/SHA-256/AES-128-GCM).
-user/apps/cli/ssh.elf: user/apps/cli/ssh.o $(CRYPTO) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/ssh.o $(CRYPTO) $(ULIB) $(LIBGCC)
+# Resolves its target host in user space ($(RESOLVE)).
+user/apps/cli/ssh.elf: user/apps/cli/ssh.o $(CRYPTO) $(RESOLVE) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/ssh.o $(CRYPTO) $(RESOLVE) $(ULIB) $(LIBGCC)
+
+# sshd: the SSH-2 server (ed25519 host-key sign + the x25519/GCM transport).
+user/apps/cli/sshd.elf: user/apps/cli/sshd.o $(CRYPTO) $(ULIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/sshd.o $(CRYPTO) $(ULIB) $(LIBGCC)
 
 # Embed each program ELF as an object. The path-derived symbol is renamed to the
 # stable _binary_app_<name>_{start,end} the kernel installer references. Two
@@ -88,6 +120,20 @@ kernel/%_blob.o: user/apps/cli/%.elf
 	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) \
 	  --redefine-sym _binary_user_apps_cli_$*_elf_start=_binary_app_$*_start \
 	  --redefine-sym _binary_user_apps_cli_$*_elf_end=_binary_app_$*_end $< $@
+
+# Combined function-symbol table (one text blob, sections keyed by app name) so
+# the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"…
+# per app, sorted by address. Regenerated whenever any listed app's .elf changes.
+SYM_APPS := browser files editor term calc imgview player settings notifyd about clock cliphist
+kernel/appsyms.o: $(addprefix user/apps/gui/,$(addsuffix .elf,$(SYM_APPS)))
+	@: > kernel/appsyms.dat
+	@for e in $^; do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \
+	  $(UCROSS)nm -n --defined-only $$e | awk '$$2 ~ /^[tT]$$/ {print $$1" "$$3}' >> kernel/appsyms.dat; done
+	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) \
+	  --redefine-sym _binary_kernel_appsyms_dat_start=_binary_appsyms_start \
+	  --redefine-sym _binary_kernel_appsyms_dat_end=_binary_appsyms_end \
+	  kernel/appsyms.dat $@
+	@rm -f kernel/appsyms.dat
 
 # The shared UI fonts shipped on disk (installed to /etc/fonts at boot); gfx loads
 # them at runtime instead of every app baking in a bitmap atlas. Give

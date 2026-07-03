@@ -12,6 +12,7 @@
 #include "owos.h"
 #include "http.h"
 #include "h2.h"
+#include "netconn.h"
 
 /* ------------------------------------------------------------ HPACK Huffman */
 
@@ -502,15 +503,15 @@ static int build_request(unsigned char *hb, int https, const char *method,
 #define FL_PADDED      0x08
 #define FL_PRIORITY    0x20
 
-struct frd { int sock; unsigned char buf[4096]; int pos, len; };
+struct frd { netconn *conn; unsigned char buf[4096]; int pos, len; };
 
 /* send all `n` bytes; 0 ok, -2 transport error, -3 interrupted. */
-static int send_all(int sock, const void *p, int n)
+static int send_all(netconn *conn, const void *p, int n)
 {
 	const unsigned char *b = p;
 	int s = 0;
 	while (s < n) {
-		int k = net_send(sock, b + s, n - s);
+		int k = nc_write(conn, b + s, n - s);
 		if (k == NET_EINTR) return -3;
 		if (k <= 0)         return -2;
 		s += k;
@@ -518,7 +519,7 @@ static int send_all(int sock, const void *p, int n)
 	return 0;
 }
 
-static int put_frame(int sock, int type, int flags, unsigned sid,
+static int put_frame(netconn *conn, int type, int flags, unsigned sid,
                      const unsigned char *pay, int len)
 {
 	unsigned char h[9];
@@ -527,17 +528,17 @@ static int put_frame(int sock, int type, int flags, unsigned sid,
 	h[3] = (unsigned char)type; h[4] = (unsigned char)flags;
 	h[5] = (unsigned char)((sid >> 24) & 0x7f); h[6] = (unsigned char)(sid >> 16);
 	h[7] = (unsigned char)(sid >> 8); h[8] = (unsigned char)sid;
-	int rc = send_all(sock, h, 9);
+	int rc = send_all(conn, h, 9);
 	if (rc) return rc;
-	if (len) return send_all(sock, pay, len);
+	if (len) return send_all(conn, pay, len);
 	return 0;
 }
 
-/* Fill the reader from the socket. >0 bytes, -2 error/EOF, -3 interrupted. */
+/* Fill the reader from the transport. >0 bytes, -2 error/EOF, -3 interrupted. */
 static int frd_raw(struct frd *r)
 {
 	r->pos = 0;
-	int n = net_recv(r->sock, r->buf, (int)sizeof r->buf);
+	int n = nc_read(r->conn, r->buf, (int)sizeof r->buf);
 	if (n == NET_EINTR) return -3;
 	if (n <= 0)         return -2;
 	r->len = n;
@@ -635,7 +636,7 @@ static const unsigned char PREFACE[24] =
  * send-windows allow, in DATA frames split to the max frame size (END_STREAM on the
  * final byte). Returns 0, or -1 on a send error. Called after HEADERS and again
  * whenever a WINDOW_UPDATE/SETTINGS opens the window. */
-static int h2_send_body(int sock, const unsigned char *reqbody, int reqlen,
+static int h2_send_body(netconn *conn, const unsigned char *reqbody, int reqlen,
                         int *boff, long *swnd, long *cwnd)
 {
 	while (*boff < reqlen && *swnd > 0 && *cwnd > 0) {
@@ -644,13 +645,13 @@ static int h2_send_body(int sock, const unsigned char *reqbody, int reqlen,
 		if (chunk > 16384) chunk = 16384;
 		if (chunk > room) chunk = (int)room;
 		int last = (*boff + chunk >= reqlen);
-		if (put_frame(sock, F_DATA, last ? FL_END_STREAM : 0, 1, reqbody + *boff, chunk) < 0) return -1;
+		if (put_frame(conn, F_DATA, last ? FL_END_STREAM : 0, 1, reqbody + *boff, chunk) < 0) return -1;
 		*boff += chunk; *swnd -= chunk; *cwnd -= chunk;
 	}
 	return 0;
 }
 
-int h2_run_body(int sock, int scheme_https, const char *authority,
+int h2_run_body(netconn *conn, int scheme_https, const char *authority,
                 const char *method, const char *path, const struct h2_opts *opts,
                 const unsigned char *reqbody, int reqlen,
                 char *hdr, int hdrcap, int *hdrlen,
@@ -663,16 +664,16 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 
 	/* Preface + our SETTINGS (no push; a wide stream window) + a connection
 	 * WINDOW_UPDATE so the whole response flows without per-DATA updates. */
-	if (send_all(sock, PREFACE, 24) < 0)
+	if (send_all(conn, PREFACE, 24) < 0)
 		{ free(c); return HTTP_ESEND; }
 	unsigned char st[12] = {
 		0x00, 0x02, 0x00, 0x00, 0x00, 0x00,        /* ENABLE_PUSH = 0 */
 		0x00, 0x04, 0x7f, 0xff, 0xff, 0xff,        /* INITIAL_WINDOW_SIZE max */
 	};
-	if (put_frame(sock, F_SETTINGS, 0, 0, st, 12) < 0)
+	if (put_frame(conn, F_SETTINGS, 0, 0, st, 12) < 0)
 		{ free(c); return HTTP_ESEND; }
 	unsigned char wu[4] = { 0x7f, 0xff, 0x00, 0x00 };  /* +~2 GiB conn window */
-	if (put_frame(sock, F_WINUP, 0, 0, wu, 4) < 0)
+	if (put_frame(conn, F_WINUP, 0, 0, wu, 4) < 0)
 		{ free(c); return HTTP_ESEND; }
 
 	int has_body = reqbody && reqlen > 0;
@@ -680,7 +681,7 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 	/* When a request body follows, the HEADERS frame must NOT end the stream; the
 	 * body rides in flow-controlled DATA frames sent below (and replenished from the
 	 * peer's SETTINGS/WINDOW_UPDATE in the loop), so a body of any size streams. */
-	if (put_frame(sock, F_HEADERS, FL_END_HEADERS | (has_body ? 0 : FL_END_STREAM), 1, c->reqhb, rl) < 0)
+	if (put_frame(conn, F_HEADERS, FL_END_HEADERS | (has_body ? 0 : FL_END_STREAM), 1, c->reqhb, rl) < 0)
 		{ free(c); return HTTP_ESEND; }
 
 	/* Request-body flow control. Stream + connection send-windows start at the h2
@@ -689,10 +690,10 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 	 * the max frame size, END_STREAM on the last byte. */
 	int boff = 0;
 	long swnd = 65535, cwnd = 65535, applied_iws = 65535;
-	if (has_body && h2_send_body(sock, reqbody, reqlen, &boff, &swnd, &cwnd) < 0)
+	if (has_body && h2_send_body(conn, reqbody, reqlen, &boff, &swnd, &cwnd) < 0)
 		{ free(c); return HTTP_ESEND; }
 
-	struct frd r; r.sock = sock; r.pos = r.len = 0;
+	struct frd r; r.conn = conn; r.pos = r.len = 0;
 	struct hsink hs; hs.buf = hdr; hs.cap = (hdr ? hdrcap : 0); hs.len = 0; hs.status = 0;
 	struct emitter e; e.fn = body; e.ctx = ctx; e.len = 0; e.aborted = 0;
 
@@ -722,13 +723,13 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 						long niw = ((long)c->framebuf[i + 2] << 24) | (c->framebuf[i + 3] << 16) | (c->framebuf[i + 4] << 8) | c->framebuf[i + 5];
 						swnd += niw - applied_iws; applied_iws = niw;
 					}
-				if (put_frame(sock, F_SETTINGS, FL_ACK, 0, 0, 0) < 0) { rc = HTTP_ENORESP; goto out; }
-				if (has_body && h2_send_body(sock, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) { rc = HTTP_ESEND; goto out; }
+				if (put_frame(conn, F_SETTINGS, FL_ACK, 0, 0, 0) < 0) { rc = HTTP_ENORESP; goto out; }
+				if (has_body && h2_send_body(conn, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) { rc = HTTP_ESEND; goto out; }
 			}
 			break;
 		case F_PING:
 			if (!(flags & FL_ACK))
-				if (put_frame(sock, F_PING, FL_ACK, 0, c->framebuf, paylen) < 0)
+				if (put_frame(conn, F_PING, FL_ACK, 0, c->framebuf, paylen) < 0)
 					{ rc = HTTP_ENORESP; goto out; }
 			break;
 		case F_HEADERS:
@@ -800,7 +801,7 @@ int h2_run_body(int sock, int scheme_https, const char *authority,
 			if (has_body && boff < reqlen && paylen >= 4) {
 				long inc = ((long)(c->framebuf[0] & 0x7f) << 24) | (c->framebuf[1] << 16) | (c->framebuf[2] << 8) | c->framebuf[3];
 				if (sid == 0) cwnd += inc; else if (sid == 1) swnd += inc;
-				if (h2_send_body(sock, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) { rc = HTTP_ESEND; goto out; }
+				if (h2_send_body(conn, reqbody, reqlen, &boff, &swnd, &cwnd) < 0) { rc = HTTP_ESEND; goto out; }
 			}
 			break;
 		default:                                   /* PRIORITY, PUSH_PROMISE: ignore */
@@ -831,20 +832,20 @@ out:
 	return rc;
 }
 
-int h2_run(int sock, int scheme_https, const char *authority,
+int h2_run(netconn *conn, int scheme_https, const char *authority,
            const char *method, const char *path, const struct h2_opts *opts,
            char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx)
 {
-	return h2_run_body(sock, scheme_https, authority, method, path, opts,
+	return h2_run_body(conn, scheme_https, authority, method, path, opts,
 	                   0, 0, hdr, hdrcap, hdrlen, body, ctx);
 }
 
-int h2_request(int sock, int scheme_https, const char *authority,
+int h2_request(netconn *conn, int scheme_https, const char *authority,
                const char *method, const char *path,
                char *hdr, int hdrcap, int *hdrlen,
                http_body_fn body, void *ctx)
 {
-	return h2_run(sock, scheme_https, authority, method, path, 0,
+	return h2_run(conn, scheme_https, authority, method, path, 0,
 	              hdr, hdrcap, hdrlen, body, ctx);
 }
 
@@ -876,7 +877,7 @@ static int h2m_idx(unsigned sid, int nreq)
 	return (i < nreq) ? i : -1;
 }
 
-int h2_fetch_many(int sock, int scheme_https, const char *authority,
+int h2_fetch_many(netconn *conn, int scheme_https, const char *authority,
                   const struct h2_opts *opts, struct h2_fetch *reqs, int nreq,
                   void (*on_done)(void *ctx, int i, const unsigned char *body, int blen),
                   void *cb_ctx)
@@ -886,14 +887,14 @@ int h2_fetch_many(int sock, int scheme_https, const char *authority,
 	if (!c) return HTTP_ENORESP;
 	dt_reset(c);
 
-	if (send_all(sock, PREFACE, 24) < 0) { free(c); return HTTP_ESEND; }
+	if (send_all(conn, PREFACE, 24) < 0) { free(c); return HTTP_ESEND; }
 	unsigned char st[12] = {
 		0x00, 0x02, 0x00, 0x00, 0x00, 0x00,        /* ENABLE_PUSH = 0          */
 		0x00, 0x04, 0x7f, 0xff, 0xff, 0xff,        /* INITIAL_WINDOW_SIZE max  */
 	};
-	if (put_frame(sock, F_SETTINGS, 0, 0, st, 12) < 0) { free(c); return HTTP_ESEND; }
+	if (put_frame(conn, F_SETTINGS, 0, 0, st, 12) < 0) { free(c); return HTTP_ESEND; }
 	unsigned char wu[4] = { 0x7f, 0xff, 0x00, 0x00 };  /* +~2 GiB conn window */
-	if (put_frame(sock, F_WINUP, 0, 0, wu, 4) < 0) { free(c); return HTTP_ESEND; }
+	if (put_frame(conn, F_WINUP, 0, 0, wu, 4) < 0) { free(c); return HTTP_ESEND; }
 
 	struct h2_mstream sm[H2_FETCH_MAX];
 	for (int i = 0; i < nreq; i++) {
@@ -906,11 +907,11 @@ int h2_fetch_many(int sock, int scheme_https, const char *authority,
 	for (int i = 0; i < nreq; i++) {
 		unsigned sid = 1u + 2u * (unsigned)i;
 		int rl = build_request(c->reqhb, scheme_https, "GET", authority, reqs[i].path, opts);
-		if (put_frame(sock, F_HEADERS, FL_END_HEADERS | FL_END_STREAM, sid, c->reqhb, rl) < 0)
+		if (put_frame(conn, F_HEADERS, FL_END_HEADERS | FL_END_STREAM, sid, c->reqhb, rl) < 0)
 			{ free(c); return HTTP_ESEND; }
 	}
 
-	struct frd r; r.sock = sock; r.pos = r.len = 0;
+	struct frd r; r.conn = conn; r.pos = r.len = 0;
 	char statusbuf[64];
 	int ndone = 0, rc = 0;
 
@@ -922,21 +923,29 @@ int h2_fetch_many(int sock, int scheme_https, const char *authority,
 		switch (type) {
 		case F_SETTINGS:
 			if (!(flags & FL_ACK))
-				if (put_frame(sock, F_SETTINGS, FL_ACK, 0, 0, 0) < 0) { rc = HTTP_ENORESP; goto out; }
+				if (put_frame(conn, F_SETTINGS, FL_ACK, 0, 0, 0) < 0) { rc = HTTP_ENORESP; goto out; }
 			break;
 		case F_PING:
 			if (!(flags & FL_ACK))
-				if (put_frame(sock, F_PING, FL_ACK, 0, c->framebuf, paylen) < 0) { rc = HTTP_ENORESP; goto out; }
+				if (put_frame(conn, F_PING, FL_ACK, 0, c->framebuf, paylen) < 0) { rc = HTTP_ENORESP; goto out; }
 			break;
 		case F_HEADERS: {
 			int hbl;
 			int cr = collect_header_block(c, &r, c->framebuf, paylen, flags, &hbl);
 			if (cr < 0) { rc = (cr == -3) ? HTTP_EINTR : HTTP_ENORESP; goto out; }
 			/* HPACK is connection-scoped: every block must decode in wire order,
-			 * even for a stream we don't track — statusbuf is a throwaway sink. */
-			struct hsink hs; hs.buf = statusbuf; hs.cap = sizeof statusbuf; hs.len = 0; hs.status = 0;
-			if (hpack_decode(c, c->hblock, hbl, &hs) < 0) { rc = HTTP_ENORESP; goto out; }
+			 * even for a stream we don't track — statusbuf is a throwaway sink.
+			 * For a tracked stream whose caller wants the headers, decode straight
+			 * into its buffer (first HEADERS only; a later trailer block keeps the
+			 * throwaway sink so it can't clobber the captured response headers). */
 			int idx = h2m_idx(sid, nreq);
+			struct hsink hs;
+			int capture = idx >= 0 && reqs[idx].hdr && reqs[idx].hdrcap > 0 && reqs[idx].hdrlen == 0;
+			if (capture) { hs.buf = reqs[idx].hdr; hs.cap = reqs[idx].hdrcap; }
+			else         { hs.buf = statusbuf;     hs.cap = sizeof statusbuf; }
+			hs.len = 0; hs.status = 0;
+			if (hpack_decode(c, c->hblock, hbl, &hs) < 0) { rc = HTTP_ENORESP; goto out; }
+			if (capture) { hs.buf[hs.len] = '\0'; reqs[idx].hdrlen = hs.len; }
 			if (idx >= 0 && !sm[idx].done) {
 				sm[idx].status = hs.status;
 				if (flags & FL_END_STREAM) {

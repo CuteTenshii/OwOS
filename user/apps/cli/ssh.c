@@ -26,6 +26,7 @@
 
 #include "owos.h"
 #include "crypto.h"
+#include "resolve.h"
 
 /* ---- SSH-2 message numbers (RFC 4253 / 4252 / 4254) ---------------------- */
 #define MSG_DISCONNECT       1
@@ -796,7 +797,7 @@ int main(int argc, char **argv)
 	}
 
 	say("ssh: connecting to "); say(host); say("...\n");
-	sock = net_connect(host, port, SK_TCP);
+	sock = net_dial(host, port, SK_TCP);   /* resolve in user space, then connect */
 	if (sock < 0) {
 		switch (sock) {
 		case -2: say("ssh: could not resolve "); say(host); say("\n"); break;

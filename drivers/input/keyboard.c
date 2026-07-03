@@ -10,8 +10,6 @@
 #include "sb16.h"
 #include "hda.h"
 #include "fb.h"
-#include "kclip.h"
-#include "wm.h"
 
 #define KBD_DATA_PORT   0x60
 #define KBD_STATUS_PORT 0x64
@@ -213,52 +211,6 @@ static volatile uint8_t ring_tail;
  * which is busy in a loop and never draining the ring. Consumers poll it. */
 static volatile int int_pending;
 
-/* A clipboard paste can be far larger than the 128-byte key ring, so it is fed
- * to the consumer (the main input loop) directly by keyboard_poll() rather than
- * pushed through the ring. Single producer (the Ctrl+V handler, in the IRQ) /
- * single consumer (the main loop), like the ring: paste_len is published last
- * and gates the drain, so a half-filled buffer is never read. */
-#define PASTE_BUF_SIZE 8192
-static char          paste_buf[PASTE_BUF_SIZE];
-static volatile int  paste_len;
-static volatile int  paste_pos;
-static volatile int  paste_request;    /* Ctrl+V sets this in the IRQ; keyboard_poll
-                                        * services it off-IRQ (clipd needs to block) */
-
-/* Pull the clipboard and arm it for injection. Pasted text is normalized to the
- * line editor's expectations: CRLF/CR -> LF (so a multi-line paste submits each
- * line), tabs and newlines kept, other control bytes dropped. Runs off-IRQ
- * (from keyboard_poll) because it talks to clipd over a blocking channel. */
-/* Arm a clipboard paste from outside the keyboard (the WM, after the Super+V
- * history viewer picks a clip): same path as Ctrl+V, serviced off-IRQ. */
-void keyboard_request_paste(void)
-{
-	paste_request = 1;
-}
-
-static void keyboard_paste_clipboard(void)
-{
-	static char raw[PASTE_BUF_SIZE];
-	if (paste_pos < paste_len)
-		return;                        /* a paste is still draining; ignore       */
-
-	int n = kclip_get_text(raw, sizeof raw);
-	int out = 0;
-	for (int i = 0; i < n; i++) {
-		char c = raw[i];
-		if (c == '\r') {               /* fold CR and CRLF down to a single LF     */
-			if (i + 1 < n && raw[i + 1] == '\n')
-				i++;
-			c = '\n';
-		}
-		if (c != '\n' && c != '\t' && (unsigned char)c < 0x20)
-			continue;                  /* drop stray control bytes                */
-		paste_buf[out++] = c;
-	}
-	paste_pos = 0;
-	paste_len = out;                   /* publish last                            */
-}
-
 /* The modifier set currently held, as KMOD_* flags. Sampled when a key is queued
  * so the consumer learns which chord produced it. */
 static uint8_t cur_mods(void)
@@ -284,25 +236,6 @@ static void ring_push(char c)
 
 int keyboard_poll(char *out, unsigned char *mods)
 {
-	/* Service a Ctrl+V request here, off the IRQ that raised it: arming the
-	 * paste means reading clipd over a blocking channel, impossible from the
-	 * interrupt. Only re-arm when the previous paste has fully drained. */
-	if (paste_request && paste_pos >= paste_len) {
-		paste_request = 0;
-		keyboard_paste_clipboard();
-	}
-
-	/* Drain a pending paste ahead of typed keys, but only while the focused
-	 * window's event queue has room: a paste is far faster than an app
-	 * drains, so without this back-pressure everything past the queue depth is
-	 * silently dropped (a long URL pasted only partway). When the queue is full
-	 * we hold the paste and fall through, so the caller idles (hlt) and the app
-	 * gets scheduled to drain — then the rest flows on a later poll. */
-	if (paste_pos < paste_len && wm_focus_key_space() > 1) {
-		*out = paste_buf[paste_pos++];
-		if (mods) *mods = 0;                  /* injected paste carries no chord */
-		return 1;
-	}
 	if (ring_head == ring_tail)
 		return 0;
 	*out = ring[ring_tail];
@@ -479,14 +412,16 @@ static int process_keypad(uint8_t sc)
 static int process_chords(uint8_t sc)
 {
 	if (super_held && active_map[sc] == 'v') {
-		wm_request_cliphist();
+		/* Consume Super+V so releasing Super doesn't toggle the Start menu, and
+		 * emit KEY_CLIPHIST — the user-space compositor opens the clipboard-history
+		 * viewer (the kernel no longer runs a WM to spawn it). */
 		super_chorded = 1;
+		ring_push(KEY_CLIPHIST);
 		return 1;
 	}
 	if (ctrl_held) {
 		char m = active_map[sc];                 /* the unshifted key, layout-aware */
 		if      (m == 'c') int_pending = 1;      /* interrupt (latched)             */
-		else if (m == 'v') paste_request = 1;    /* paste: serviced off-IRQ         */
 		else if (m)        ring_push(m);         /* letter + KMOD_CTRL via cur_mods */
 		return 1;
 	}

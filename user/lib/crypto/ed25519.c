@@ -1,18 +1,17 @@
-/* ed25519.c — Ed25519 signatures + SHA-512, for the SSH server's host key.
+/* ed25519.c — Ed25519 signatures + SHA-512, user-space port of kernel/ed25519.c
+ * for a user-space SSH server host key.
  *
- * The SSH *server* (unlike the client) MUST sign the key-exchange hash with its
- * host private key; clients verify it. OwOS's host key is `ssh-ed25519`, so we
- * need Ed25519 signing and the SHA-512 it is built on — neither of which the
- * rest of the kernel needs (the KEX hash is SHA-256, in crypto.c). Rather than
- * re-derive the (error-prone) curve arithmetic, this is the public-domain
- * TweetNaCl reference (Bernstein et al.), trimmed to sign + hash and wrapped in
- * a small SSH-friendly API. Verified against the RFC 8032 test vectors.
+ * A server MUST sign the key-exchange hash with its host private key; clients
+ * verify it. The host key is `ssh-ed25519`, so we need Ed25519 signing and the
+ * SHA-512 it is built on. Rather than re-derive the (error-prone) curve
+ * arithmetic, this is the public-domain TweetNaCl reference (Bernstein et al.),
+ * trimmed to sign + verify and wrapped in a small SSH-friendly API. Verified
+ * against the RFC 8032 test vectors.
  *
  * Freestanding: only fixed-width ints and 64-bit math (libgcc supplies the
  * helpers); no libc. The field element `gf` is i64[16]; arithmetic is the usual
- * TweetNaCl reduced-radix form.
+ * TweetNaCl reduced-radix form. sha512() comes from this lib's crypto.c.
  */
-
 #include <stdint.h>
 #include "ed25519.h"
 #include "crypto.h"   /* sha512() — the hash Ed25519 is built on lives in crypto.c */

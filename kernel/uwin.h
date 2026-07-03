@@ -1,10 +1,11 @@
-/* uwin.h — the windowing layer (user-window server).
+/* uwin.h — the kernel windowing broker (user-window server).
  *
  * Lets a user process own a desktop window: it creates one, gets a shared
  * client-area pixel buffer mapped into its address space (at WIN_FB_VADDR),
- * draws into it, presents frames, and reads input events. The kernel side
- * keeps a struct window in the WM whose draw() blits the user's buffer and
- * whose click/key callbacks enqueue events for the process to poll.
+ * draws into it, presents frames, and reads input events. The kernel records the
+ * window's frame geometry, focus flag, and event ring; the user-space compositor
+ * (/bin/compositor) draws the chrome, blits the buffer, and routes input back in
+ * through the brokering backends below.
  *
  * Reached from user space through the SYS_WIN_* syscalls (see syscall.c); the
  * functions here run in the calling process's context, so user pointers are
@@ -38,6 +39,37 @@ struct win_event {
 	int32_t  a, b;
 };
 
+/* ---- window brokering for the user-space compositor ----
+ * A root compositor enumerates live windows, maps their client buffers to blit
+ * them zero-copy, positions them, and routes hit-tested input back in.
+ * struct winrec must match user/lib/owos.h. */
+
+/* One live window, as reported by uwin_enum. */
+struct winrec {
+	int      id;             /* window id (index into the uwin table)          */
+	int      x, y, w, h;     /* frame geometry on screen (top-left + full size) */
+	uint32_t flags;          /* UWIN_F_* below                                 */
+	uint32_t present_seq;    /* bumped on each present -> the compositor's dirty tag */
+	int      owner_pid;      /* owning task id                                 */
+	int      z;              /* z-order: 0 = bottom, higher = nearer the top   */
+	int      buf_w, buf_h;   /* client buffer size in pixels (stride = buf_w)   */
+	char     title[64];      /* window title (NUL-terminated)                  */
+};
+
+#define UWIN_F_VISIBLE   0x01
+#define UWIN_F_FOCUSED   0x02
+#define UWIN_F_MINIMIZED 0x04
+#define UWIN_F_MAXIMIZED 0x08
+#define UWIN_F_RESIZABLE 0x10
+
+/* One routed input event the compositor delivers into a window's event ring
+ * (client-relative). `type` is a WEV_*; a,b carry its payload (see the WEV_*
+ * comments). Matches user/lib/owos.h. */
+struct winevent {
+	uint32_t type;
+	int32_t  a, b;
+};
+
 /* Syscall backends (all run in the caller's process context). */
 int  uwin_create(int w, int h, const char *title);   /* -> window id or -1     */
 int  uwin_present(int id);                            /* -> 0 / -1              */
@@ -48,28 +80,57 @@ int  uwin_set_resizable(int id, int on);              /* app opts into resizing 
 int  uwin_set_cursor(int id, int cursor);             /* enum wm_cursor for the
                                                          window's client area     */
 
-/* Free slots in a window's input event ring (1<<30 for non-uwin windows). The
- * WM uses it for clipboard-paste flow control — see uwin_key_space() / wm.c. */
-struct window;
-int  uwin_key_space(struct window *w);
+/* Free slots in a window's input event ring (1<<30 for a bad/unknown id). Used
+ * for clipboard-paste flow control. */
+int  uwin_key_space(int id);
 
-/* 1 if `w` is a GUI-app window whose owner has stopped servicing it (events are
- * queued but it hasn't polled within the hang timeout); 0 for a responsive
- * window or any non-uwin (kernel) window. The WM shows "(Not Responding)" and
- * turns the close box into a force-kill. */
-int  uwin_not_responding(struct window *w);
-
-/* Owning task id of a GUI-app window, or 0 for a non-uwin (kernel) window — the
- * WM force-kills a hung app by this pid. */
-uint32_t uwin_owner_pid(struct window *w);
-
-/* Called from sched_exit(): detach every window owned by the exiting task. The
- * client buffer is freed later by the WM via uwin_reap() (see uwin.c). */
+/* Called from sched_exit()/sched_kill(): detach every window owned by the
+ * exiting task (and, if that task is the compositor, clear the compositor-active
+ * flag so kernel_main reverts to driving the recovery console). */
 void uwin_task_exiting(uint32_t owner_id);
 
-/* Called once per frame from the WM compositor thread: reclaim the client
- * buffers of windows detached from another context. Must run in the WM thread,
- * where it's serialized with uw_draw/fb_blit. */
+/* Called when a pin is dropped (uwin_unmap): reclaim the client buffers of
+ * windows that were closed while the compositor still held them mapped. */
 void uwin_reap(void);
+
+/* Compositor liveness. uwin_compositor_register(pid) marks `pid` as the running
+ * compositor on its first SYS_FB_MAP; uwin_compositor_active() is 1 while a
+ * compositor owns the display. kernel_main uses it to decide whether to drain
+ * the physical keyboard into the recovery console (it must not while the
+ * compositor is draining input via SYS_INPUT_POLL). Cleared by
+ * uwin_task_exiting when the compositor task exits. */
+void uwin_compositor_register(uint32_t pid);
+int  uwin_compositor_active(void);
+
+/* ---- compositor brokering backends (SYS_WIN_ENUM/MAP/UNMAP/SET_GEOM/DELIVER/
+ * SET_FOCUS). All run in the caller's (compositor) context; the caller
+ * root-gates and bounds-checks. */
+
+/* Fill up to `max` winrecs for live windows, sorted by ascending z (bottom
+ * first). Returns the count written (may be < the number of live windows if the
+ * table has more than `max`). */
+int uwin_enum(struct winrec *out, int max);
+
+/* Map window `id`'s client buffer into the caller at vaddr `at` (npages of it),
+ * pinning the frames so a concurrent close can't free them under the compositor
+ * (see uwin_reap). Fills bw/bh/stride with the buffer geometry. Returns 0, or
+ * -1 (bad id / gone / map failed). Idempotent: re-mapping a pinned window just
+ * refreshes the mapping. */
+int uwin_map(int id, uint32_t at, int *bw, int *bh, int *stride);
+
+/* Drop the compositor's pin on window `id` and unmap it from `dir` at `at`. Once
+ * unpinned, a closed window's frames are reclaimed by the next uwin_reap. */
+int uwin_unmap(int id, uint32_t *dir, uint32_t at);
+
+/* Compositor sets a window's on-screen geometry (frame top-left + full size). */
+int uwin_set_geom(int id, int x, int y, int w, int h);
+
+/* Compositor pushes a routed, client-relative input event into window `id`'s
+ * event ring (it did the hit-testing). */
+int uwin_deliver(int id, const struct winevent *ev);
+
+/* Compositor records which window has focus (raise it to the top). id <= 0 =
+ * none. */
+int uwin_set_focus(int id);
 
 #endif /* OWOS_UWIN_H */

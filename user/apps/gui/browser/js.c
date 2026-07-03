@@ -24,6 +24,7 @@
 
 
 static js_ctx    *g_ctx;
+static js_object *g_node_proto;         /* Node.prototype (ancestor of element/document) */
 static js_object *g_element_proto;
 static js_object *g_style_proto;
 static js_object *g_url_proto;
@@ -33,6 +34,7 @@ static js_object *g_html_proto;        /* HTMLElement.prototype (chains to eleme
 static js_object *g_media_proto;       /* HTMLMediaElement.prototype (audio/video)  */
 static js_object *g_custom_elements;   /* registry: tag name -> class constructor   */
 static js_object *g_module_cache;      /* ES module registry: abs URL -> namespace  */
+static js_object *g_module_src;         /* prefetched module sources: abs URL -> text */
 static js_object *g_document_proto;    /* shared by the live doc + DOMParser docs    */
 static js_object *g_response_proto;    /* fetch() Response.prototype                  */
 static js_object *g_ws_proto;          /* WebSocket.prototype                          */
@@ -550,6 +552,25 @@ static js_value style_removeprop(js_ctx *ctx, js_value t, js_value *args, int ar
     return old;
 }
 
+/* <style>/<link> .sheet: a minimal CSSStyleSheet stub with an empty cssRules
+ * list. We don't yet parse the element's text into a live CSSOM, but this keeps
+ * feature-detectors that read `style.sheet.cssRules` from throwing (they just
+ * report those rule-based features as unsupported). Non-stylesheet nodes: null. */
+static js_value el_get_sheet(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    js_object *sheet;
+    js_value rules;
+    (void)args; (void)argc;
+    if (!n || n->type != DOM_ELEMENT || !(streq(n->tag, "style") || streq(n->tag, "link")))
+        return js_null();
+    gc_push_scope();
+    sheet = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    rules = js_obj_value(js_new_array(ctx, 0));
+    js_def(sheet, "cssRules", rules, P_ENUMERABLE);
+    js_def(sheet, "rules", rules, P_ENUMERABLE);
+    gc_pop_scope();
+    return js_obj_value(sheet);
+}
 static js_value el_get_style(js_ctx *ctx, js_value t, js_value *args, int argc) {
     js_object *o = js_new_object(ctx, g_style_proto);
     (void)args; (void)argc;
@@ -1577,12 +1598,11 @@ static void ev_fire_on(js_object *obj, js_value ev, int want_capture) {
     js_object *list = listeners_of(obj, 0);
     js_value evty;
     unsigned i, n;
-    if (!list) return;
     gc_push_scope();
-    gc_keep(list);                       /* a handler may replace @ev; pin this copy */
+    if (list) gc_keep(list);             /* a handler may replace @ev; pin this copy */
     js_set(g_ctx, ev, "currentTarget", js_obj_value(obj));
     evty = js_get(g_ctx, ev, "type");
-    n = js_array_len(list);
+    n = list ? js_array_len(list) : 0;
     for (i = 0; i < n; i++) {
         js_value e = js_get_index(g_ctx, js_obj_value(list), i);
         js_value ty, fn, a;
@@ -1596,6 +1616,23 @@ static void ev_fire_on(js_object *obj, js_value ev, int want_capture) {
         js_set_event_script(evty.type == JV_STR ? evty.u.str->data : 0);
         js_call(g_ctx, fn, js_obj_value(obj), &a, 1);
         if (g_ctx->has_exc) report_exc_v(g_ctx);
+    }
+    /* on<type> property handler (onload/onclick/onchange/…): a plain callable
+     * property, fired in the non-capture phase alongside addEventListener
+     * listeners. Many pages wire their entry point via `onload = fn` (a property),
+     * not addEventListener — without this it never runs. */
+    if (!want_capture && evty.type == JV_STR && evty.u.str->len > 0 && evty.u.str->len < 40) {
+        char onname[48]; int k = 0; const char *ty = evty.u.str->data;
+        onname[k++] = 'o'; onname[k++] = 'n';
+        while (*ty && k < 47) onname[k++] = *ty++;
+        onname[k] = 0;
+        js_value h = js_get(g_ctx, js_obj_value(obj), onname);
+        if (js_is_callable(h)) {
+            js_value a = ev;
+            js_set_event_script(evty.u.str->data);
+            js_call(g_ctx, h, js_obj_value(obj), &a, 1);
+            if (g_ctx->has_exc) report_exc_v(g_ctx);
+        }
     }
     gc_pop_scope();
 }
@@ -1942,28 +1979,103 @@ static js_node *module_compile(const char *code, const char *url) {
     return prog;
 }
 
+/* True if the identifier word `w` (with a word boundary before it) ends at `q`,
+ * skipping whitespace — used to spot `from '…'` / `import '…'` specifiers. */
+static char *sdup(const char *s);      /* defined below */
+static int mod_word_before(const char *src, const char *q, const char *w) {
+    const char *e = q;
+    while (e > src && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r')) e--;
+    int wl = (int)strlen(w);
+    if (e - src < wl) return 0;
+    for (int i = 0; i < wl; i++) if (e[-wl + i] != w[i]) return 0;
+    if (e - src > wl) { char c = e[-wl - 1];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9')) return 0; }
+    return 1;
+}
+
+/* Scan a module's source for its static import specifiers and batch-fetch the
+ * uncached ones in ONE parallel g_fetch (multiplexed like stylesheets), caching
+ * the sources in g_module_src. This turns a deep import graph from N serial
+ * fetches into breadth-first parallel ones. Best-effort: a missed or spurious
+ * hit just yields a serial fetch (or a wasted one) at import time — the loader's
+ * own fetch fallback keeps it correct regardless of what the scan finds. */
+#define MODULE_PREFETCH_MAX 192
+static void module_prefetch_deps(const char *base, const char *src) {
+    char *urls[MODULE_PREFETCH_MAX]; int n = 0;
+    if (!g_fetch) return;
+    for (const char *p = src; *p && n < MODULE_PREFETCH_MAX; p++) {
+        if (*p != '\'' && *p != '"') continue;
+        char qc = *p; const char *s = p + 1; const char *e = s;
+        while (*e && *e != qc) e++;
+        if (*e != qc) break;                       /* unterminated: stop scanning */
+        if (e > s && (*s == '.' || *s == '/') &&
+            (mod_word_before(src, p, "from") || mod_word_before(src, p, "import"))) {
+            char spec[URL_MAX]; int k = 0;
+            for (const char *c = s; c < e && k < URL_MAX - 1; c++) spec[k++] = *c;
+            spec[k] = 0;
+            char abs[URL_MAX];
+            resolve_url(base, spec, abs, sizeof abs);
+            if (!pmap_find_pub(g_module_src, abs) && !pmap_find_pub(g_module_cache, abs)) {
+                int dup = 0;
+                for (int i = 0; i < n; i++) if (streq(urls[i], abs)) { dup = 1; break; }
+                if (!dup) urls[n++] = sdup(abs);
+            }
+        }
+        p = e;                                     /* skip the string body */
+    }
+    if (n) {
+        unsigned char *bodies[MODULE_PREFETCH_MAX]; int lens[MODULE_PREFETCH_MAX];
+        for (int i = 0; i < n; i++) { bodies[i] = 0; lens[i] = 0; }
+        g_fetch(urls, n, bodies, lens);
+        for (int i = 0; i < n; i++) {
+            if (bodies[i] && lens[i] > 0) {
+                char *code = (char *)malloc((unsigned)lens[i] + 1);
+                if (code) {
+                    memcpy(code, bodies[i], (unsigned)lens[i]); code[lens[i]] = 0;
+                    js_def(g_module_src, urls[i], js_mk_cstring(g_ctx, code), 0);
+                    free(code);
+                }
+            }
+            if (bodies[i]) free(bodies[i]);
+            free(urls[i]);
+        }
+    }
+}
+
 static js_object *browser_load_module(js_ctx *ctx, const char *spec, void *ud) {
     char abs[URL_MAX];
     const char *referrer = ctx->cur_module_url ? ctx->cur_module_url : g_page_url_buf;
-    pentry *cached;
+    pentry *cached, *srcent;
     unsigned char *bodies[1];
     int lens[1];
     char *urls[1];
     js_node *prog;
     js_object *exports;
-    char *code;
+    char *code = 0;
     (void)ud;
     resolve_url(referrer, spec, abs, sizeof abs);
     cached = pmap_find_pub(g_module_cache, abs);
     if (cached && cached->value.type == JV_OBJ) return cached->value.u.obj;
-    if (!g_fetch) return 0;
-    urls[0] = abs; bodies[0] = 0; lens[0] = 0;
-    g_fetch(urls, 1, bodies, lens);
-    if (!bodies[0] || lens[0] <= 0) { if (bodies[0]) free(bodies[0]); return 0; }
-    code = (char *)malloc((unsigned)lens[0] + 1);
-    if (!code) { free(bodies[0]); return 0; }
-    memcpy(code, bodies[0], (unsigned)lens[0]); code[lens[0]] = 0;
-    free(bodies[0]);
+
+    /* source: use the prefetched copy (batched with its siblings) if present,
+     * else fall back to a serial fetch. */
+    srcent = pmap_find_pub(g_module_src, abs);
+    if (srcent && srcent->value.type == JV_STR) {
+        int L = srcent->value.u.str->len;
+        code = (char *)malloc((unsigned)L + 1);
+        if (code) { memcpy(code, srcent->value.u.str->data, (unsigned)L); code[L] = 0; }
+    }
+    if (!code) {
+        if (!g_fetch) return 0;
+        urls[0] = abs; bodies[0] = 0; lens[0] = 0;
+        g_fetch(urls, 1, bodies, lens);
+        if (!bodies[0] || lens[0] <= 0) { if (bodies[0]) free(bodies[0]); return 0; }
+        code = (char *)malloc((unsigned)lens[0] + 1);
+        if (!code) { free(bodies[0]); return 0; }
+        memcpy(code, bodies[0], (unsigned)lens[0]); code[lens[0]] = 0;
+        free(bodies[0]);
+    }
+    module_prefetch_deps(abs, code);     /* parallel breadth-first fetch of its imports */
     prog = module_compile(code, abs);
     free(code);
     if (!prog) return 0;
@@ -3012,10 +3124,207 @@ void js_media_fire(struct dom_node *node, const char *type) {
     emit_event((js_object *)node->wrapper, type, js_undef());
 }
 
+/* The DOM `Node` interface: not constructable, but exposed for the `Node.*`
+ * nodeType constants and `x instanceof Node` (feature-detected by many libs). */
+static js_value node_ctor(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)ctx; (void)t; (void)args; (void)argc;
+    return js_undef();
+}
+static void def_node_consts(js_object *o) {
+    js_def(o, "ELEMENT_NODE", js_number(1), 0);
+    js_def(o, "ATTRIBUTE_NODE", js_number(2), 0);
+    js_def(o, "TEXT_NODE", js_number(3), 0);
+    js_def(o, "CDATA_SECTION_NODE", js_number(4), 0);
+    js_def(o, "ENTITY_REFERENCE_NODE", js_number(5), 0);
+    js_def(o, "ENTITY_NODE", js_number(6), 0);
+    js_def(o, "PROCESSING_INSTRUCTION_NODE", js_number(7), 0);
+    js_def(o, "COMMENT_NODE", js_number(8), 0);
+    js_def(o, "DOCUMENT_NODE", js_number(9), 0);
+    js_def(o, "DOCUMENT_TYPE_NODE", js_number(10), 0);
+    js_def(o, "DOCUMENT_FRAGMENT_NODE", js_number(11), 0);
+    js_def(o, "NOTATION_NODE", js_number(12), 0);
+}
+
+/* --- CSSStyleDeclaration: generic property access backed by the element's
+ * style="" attribute. One getter/setter template, bound via fn->data to each
+ * property's CSS name, so `prop in style`, `style[prop]`, `style[prop]=v` and
+ * `style.length` behave like a real CSSStyleDeclaration for the standard set
+ * (feature-detection libs like css3test's Supports rely on exactly this). */
+static js_value style_gen_get(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value d = ctx->native_data; (void)a; (void)n;
+    return style_read(ctx, node_of(t), d.type == JV_STR ? d.u.str->data : "");
+}
+static js_value style_gen_set(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value d = ctx->native_data; (void)argc;
+    style_write(node_of(t), d.type == JV_STR ? d.u.str->data : "", arg_str(ctx, A(0)));
+    return js_undef();
+}
+static js_value style_gen_length(js_ctx *ctx, js_value t, js_value *a, int n) {
+    struct dom_node *nd = node_of(t);
+    const char *p = nd ? dom_get_attr(nd, "style") : 0;
+    int count = 0; (void)ctx; (void)a; (void)n;
+    while (p && *p) {
+        const char *seg = p, *colon;
+        while (*p && *p != ';') p++;
+        colon = seg; while (colon < p && *colon != ':') colon++;
+        if (colon < p) {                       /* count only "name : value" pairs */
+            const char *ns = seg, *ne = colon, *vs = colon + 1, *ve = p;
+            while (ns < ne && is_sp(*ns)) ns++;  while (ne > ns && is_sp(ne[-1])) ne--;
+            while (vs < ve && is_sp(*vs)) vs++;  while (ve > vs && is_sp(ve[-1])) ve--;
+            if (ns < ne && vs < ve) count++;
+        }
+        if (*p == ';') p++;
+    }
+    return js_number(count);
+}
+/* camelCase JS property name -> CSS dash-case (cssFloat -> float). */
+static void style_js_to_css(const char *js, char *out, int cap) {
+    int o = 0;
+    if (streq(js, "cssFloat")) { const char *f = "float"; while (*f && o < cap - 1) out[o++] = *f++; out[o] = 0; return; }
+    for (int i = 0; js[i] && o < cap - 2; i++) {
+        char c = js[i];
+        if (c >= 'A' && c <= 'Z') { out[o++] = '-'; out[o++] = (char)(c + 32); }
+        else out[o++] = c;
+    }
+    out[o] = 0;
+}
+static void def_style_prop(const char *jsName) {
+    char css[64]; style_js_to_css(jsName, css, sizeof css);
+    gc_push_scope();
+    {
+        js_object *g = (js_object *)gc_keep(js_new_native(g_ctx, style_gen_get, jsName, 0));
+        js_object *s = (js_object *)gc_keep(js_new_native(g_ctx, style_gen_set, jsName, 1));
+        g->fn->data = js_mk_cstring(g_ctx, css);
+        s->fn->data = js_mk_cstring(g_ctx, css);
+        js_def_accessor(g_style_proto, jsName, g, s, P_CONFIGURABLE | P_ENUMERABLE);
+    }
+    gc_pop_scope();
+}
+/* The standard CSS property set exposed on CSSStyleDeclaration (camelCase). Not
+ * exhaustive, but broad enough that `prop in style` answers correctly for the
+ * common properties; the ~16 with layout-specific accessors are refined below. */
+static const char *const k_css_props[] = {
+    "alignContent","alignItems","alignSelf","all","animation","animationDelay",
+    "animationDirection","animationDuration","animationFillMode","animationIterationCount",
+    "animationName","animationPlayState","animationTimingFunction","appearance","aspectRatio",
+    "backdropFilter","backfaceVisibility","background","backgroundAttachment","backgroundBlendMode",
+    "backgroundClip","backgroundColor","backgroundImage","backgroundOrigin","backgroundPosition",
+    "backgroundRepeat","backgroundSize","blockSize","border","borderBottom","borderBottomColor",
+    "borderBottomLeftRadius","borderBottomRightRadius","borderBottomStyle","borderBottomWidth",
+    "borderCollapse","borderColor","borderImage","borderImageOutset","borderImageRepeat",
+    "borderImageSlice","borderImageSource","borderImageWidth","borderLeft","borderLeftColor",
+    "borderLeftStyle","borderLeftWidth","borderRadius","borderRight","borderRightColor",
+    "borderRightStyle","borderRightWidth","borderSpacing","borderStyle","borderTop","borderTopColor",
+    "borderTopLeftRadius","borderTopRightRadius","borderTopStyle","borderTopWidth","borderWidth",
+    "bottom","boxDecorationBreak","boxShadow","boxSizing","breakAfter","breakBefore","breakInside",
+    "captionSide","caretColor","clear","clip","clipPath","color","columnCount","columnFill",
+    "columnGap","columnRule","columnRuleColor","columnRuleStyle","columnRuleWidth","columnSpan",
+    "columnWidth","columns","content","counterIncrement","counterReset","cursor","direction",
+    "display","emptyCells","filter","flex","flexBasis","flexDirection","flexFlow","flexGrow",
+    "flexShrink","flexWrap","cssFloat","float","font","fontFamily","fontFeatureSettings",
+    "fontKerning","fontSize","fontSizeAdjust","fontStretch","fontStyle","fontVariant","fontWeight",
+    "gap","grid","gridArea","gridAutoColumns","gridAutoFlow","gridAutoRows","gridColumn",
+    "gridColumnEnd","gridColumnGap","gridColumnStart","gridGap","gridRow","gridRowEnd","gridRowGap",
+    "gridRowStart","gridTemplate","gridTemplateAreas","gridTemplateColumns","gridTemplateRows",
+    "height","hyphens","inlineSize","inset","justifyContent","justifyItems","justifySelf","left",
+    "letterSpacing","lineHeight","listStyle","listStyleImage","listStylePosition","listStyleType",
+    "margin","marginBottom","marginLeft","marginRight","marginTop","mask","maxHeight","maxWidth",
+    "minHeight","minWidth","mixBlendMode","objectFit","objectPosition","opacity","order","outline",
+    "outlineColor","outlineOffset","outlineStyle","outlineWidth","overflow","overflowWrap",
+    "overflowX","overflowY","padding","paddingBottom","paddingLeft","paddingRight","paddingTop",
+    "pageBreakAfter","pageBreakBefore","pageBreakInside","perspective","perspectiveOrigin",
+    "placeContent","placeItems","placeSelf","pointerEvents","position","quotes","resize","right",
+    "rowGap","scrollBehavior","tabSize","tableLayout","textAlign","textAlignLast",
+    "textCombineUpright","textDecoration","textDecorationColor","textDecorationLine",
+    "textDecorationStyle","textIndent","textJustify","textOrientation","textOverflow","textShadow",
+    "textTransform","top","transform","transformOrigin","transformStyle","transition",
+    "transitionDelay","transitionDuration","transitionProperty","transitionTimingFunction",
+    "unicodeBidi","userSelect","verticalAlign","visibility","whiteSpace","width","willChange",
+    "wordBreak","wordSpacing","wordWrap","writingMode","zIndex",
+};
+
+/* Web Storage (localStorage/sessionStorage): in-memory only — not persisted
+ * across reloads, but enough for pages that stash a preference (items live in a
+ * hidden "@items" backing object). getItem returns null for a missing key. */
+static js_value storage_getitem(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value items = js_get(ctx, t, "@items"), v; (void)argc;
+    if (items.type != JV_OBJ) return js_null();
+    v = js_get(ctx, items, arg_str(ctx, A(0)));
+    return v.type == JV_UNDEF ? js_null() : js_to_string(ctx, v);
+}
+static js_value storage_setitem(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value items = js_get(ctx, t, "@items"); (void)argc;
+    if (items.type == JV_OBJ) js_set(ctx, items, arg_str(ctx, A(0)), js_to_string(ctx, A(1)));
+    return js_undef();
+}
+static js_value storage_removeitem(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value items = js_get(ctx, t, "@items"); (void)argc;
+    if (items.type == JV_OBJ) js_set(ctx, items, arg_str(ctx, A(0)), js_undef());
+    return js_undef();
+}
+static js_value storage_clear(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)args; (void)argc;
+    js_set(ctx, t, "@items", js_obj_value(js_new_object(ctx, ctx->object_proto)));
+    return js_undef();
+}
+static js_value make_storage(js_ctx *ctx) {
+    js_object *s = js_new_object(ctx, ctx->object_proto);
+    gc_push_scope(); gc_keep(s);
+    js_def(s, "@items", js_obj_value(js_new_object(ctx, ctx->object_proto)), P_WRITABLE);
+    def_method(s, "getItem", storage_getitem, 1);
+    def_method(s, "setItem", storage_setitem, 2);
+    def_method(s, "removeItem", storage_removeitem, 1);
+    def_method(s, "clear", storage_clear, 0);
+    gc_pop_scope();
+    return js_obj_value(s);
+}
+
+/* CSS.supports(): recognise a property by name (values aren't validated — we
+ * report a known property as supported, matching the style-object behaviour).
+ * `selector(...)` conditions report false (no selector-support detection yet). */
+static int ci_has(const char *hay, const char *needle);   /* defined below */
+static void css_norm(const char *s, char *out, int cap) {
+    int o = 0;                                    /* lowercase, strip dashes */
+    for (int i = 0; s[i] && o < cap - 1; i++) {
+        char c = s[i];
+        if (c == '-') continue;
+        out[o++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    out[o] = 0;
+}
+static int css_prop_known(const char *prop) {
+    char pn[64], kn[64];
+    css_norm(prop, pn, sizeof pn);
+    if (!pn[0]) return 0;
+    for (unsigned i = 0; i < sizeof k_css_props / sizeof k_css_props[0]; i++) {
+        css_norm(k_css_props[i], kn, sizeof kn);
+        if (streq(pn, kn)) return 1;
+    }
+    return 0;
+}
+static js_value css_supports(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)t;
+    if (argc >= 2)                                 /* CSS.supports(prop, value) */
+        return js_bool(css_prop_known(arg_str(ctx, A(0))));
+    {                                              /* CSS.supports("cond string") */
+        const char *cond = arg_str(ctx, A(0));
+        char prop[64]; int i = 0;
+        const char *p = cond;
+        if (ci_has(cond, "selector(")) return js_bool(0);
+        while (*p == ' ' || *p == '(') p++;
+        while (*p && *p != ':' && i < 63) prop[i++] = *p++;
+        while (i > 0 && prop[i - 1] == ' ') i--;
+        prop[i] = 0;
+        if (*p != ':' || i == 0) return js_bool(0);
+        return js_bool(css_prop_known(prop));
+    }
+}
+
 static void setup_dom(js_ctx *ctx, const char *page_url) {
     js_object *win = ctx->global;
 
-    g_element_proto = js_new_object(ctx, ctx->object_proto);
+    g_node_proto = js_new_object(ctx, ctx->object_proto);   /* Node.prototype */
+    g_element_proto = js_new_object(ctx, g_node_proto);
     g_style_proto = js_new_object(ctx, ctx->object_proto);
     g_url_proto = js_new_object(ctx, ctx->object_proto);
     g_sp_proto = js_new_object(ctx, ctx->object_proto);
@@ -3024,7 +3333,8 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     g_media_proto = js_new_object(ctx, g_element_proto);    /* HTMLMediaElement.prototype */
     g_custom_elements = js_new_object(ctx, ctx->object_proto);
     g_module_cache = js_new_object(ctx, ctx->object_proto);
-    g_document_proto = js_new_object(ctx, ctx->object_proto);
+    g_module_src = js_new_object(ctx, ctx->object_proto);
+    g_document_proto = js_new_object(ctx, g_node_proto);
     g_response_proto = js_new_object(ctx, ctx->object_proto);
     g_ws_proto = js_new_object(ctx, ctx->object_proto);
     g_xhr_proto = js_new_object(ctx, ctx->object_proto);
@@ -3037,6 +3347,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     g_timers = js_new_array(ctx, 0);
     g_tmeta = 0; g_tcap = 0; g_ntimers = 0;
     g_nparsed = 0;
+    gc_add_root((void **)&g_node_proto);
     gc_add_root((void **)&g_element_proto);
     gc_add_root((void **)&g_style_proto);
     gc_add_root((void **)&g_url_proto);
@@ -3046,6 +3357,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     gc_add_root((void **)&g_media_proto);
     gc_add_root((void **)&g_custom_elements);
     gc_add_root((void **)&g_module_cache);
+    gc_add_root((void **)&g_module_src);
     gc_add_root((void **)&g_document_proto);
     gc_add_root((void **)&g_response_proto);
     gc_add_root((void **)&g_ws_proto);
@@ -3067,6 +3379,12 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     dom_on_free_wrapper = wrapper_detach;
 
     /* CSSStyleDeclaration-lite: accessors + methods over the style="" attribute */
+    /* Full standard CSS property set (generic style-attr backed accessors) +
+     * length, so `prop in style` / `style[prop]` / `style.length` work. The
+     * layout-specific accessors below then refine the handful that matter. */
+    for (unsigned pi = 0; pi < sizeof k_css_props / sizeof k_css_props[0]; pi++)
+        def_style_prop(k_css_props[pi]);
+    def_acc(g_style_proto, "length", style_gen_length, 0);
     def_acc(g_style_proto, "color", style_get_color, style_set_color);
     def_acc(g_style_proto, "background", style_get_background, style_set_background);
     def_acc(g_style_proto, "backgroundColor", style_get_backgroundColor, style_set_backgroundColor);
@@ -3090,6 +3408,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_acc(g_element_proto, "tagName", el_tagName, 0);
     def_acc(g_element_proto, "nodeName", el_nodeName, 0);
     def_acc(g_element_proto, "nodeType", el_nodeType, 0);
+    def_acc(g_element_proto, "sheet", el_get_sheet, 0);
     def_acc(g_element_proto, "id", el_get_id, el_set_id);
     def_acc(g_element_proto, "className", el_get_class, el_set_class);
     def_acc(g_element_proto, "textContent", el_get_text, el_set_text);
@@ -3330,6 +3649,16 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
 
     /* Web components: HTMLElement (the base custom classes extend) + customElements */
     {
+        js_object *nc = js_new_native(ctx, node_ctor, "Node", 0);
+        gc_push_scope(); gc_keep(nc);
+        js_def(nc, "prototype", js_obj_value(g_node_proto), 0);
+        js_def(g_node_proto, "constructor", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
+        def_node_consts(nc);            /* Node.ELEMENT_NODE etc. (on the interface)  */
+        def_node_consts(g_node_proto);  /* and inherited by instances (node.TEXT_NODE) */
+        js_def(win, "Node", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+    {
         js_object *he = js_new_native(ctx, htmlelement_ctor, "HTMLElement", 0);
         js_object *ce = js_new_object(ctx, ctx->object_proto);
         gc_push_scope(); gc_keep(he); gc_keep(ce);
@@ -3467,6 +3796,15 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         gc_pop_scope();
     }
     def_method(win, "matchMedia", win_matchmedia, 1);
+    js_def(win, "localStorage", make_storage(ctx), P_WRITABLE | P_CONFIGURABLE);
+    js_def(win, "sessionStorage", make_storage(ctx), P_WRITABLE | P_CONFIGURABLE);
+    {                                              /* CSS.supports() */
+        js_object *css = js_new_object(ctx, ctx->object_proto);
+        gc_push_scope(); gc_keep(css);
+        def_method(css, "supports", css_supports, 2);
+        js_def(win, "CSS", js_obj_value(css), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
     def_method(win, "queueMicrotask", win_queuemicrotask, 1);
     def_method(win, "requestIdleCallback", el_noop, 1);
     def_method(win, "cancelIdleCallback", el_noop, 1);
@@ -3755,6 +4093,20 @@ static void fire_lifecycle(void) {
  * (so listeners + closures survive). Reclaimed by js_page_end() on the next
  * navigation. A page with no scripts builds no context — the zero-overhead path
  * for static pages, which keeps today's navigation behaviour unchanged. */
+/* Script execution ordering (HTML spec, simplified for a fully-fetched batch):
+ * pass 0 runs classic scripts (inline or external, no defer) and `async` externals
+ * in document order; pass 1 runs deferred scripts — external `defer` plus every
+ * module — after them, still in document order. `async` overrides defer/module
+ * (runs in pass 0); defer/async are ignored on inline non-module scripts. */
+static int script_deferred(struct dom_node *s) {
+    const char *src = dom_get_attr(s, "src");
+    int external = src && *src;
+    if (external && dom_get_attr(s, "async")) return 0;   /* async: first pass, as-fetched */
+    if (script_is_module(s))                  return 1;   /* modules default to deferred    */
+    if (external && dom_get_attr(s, "defer")) return 1;   /* defer: external scripts only   */
+    return 0;
+}
+
 void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn fetch) {
     struct dom_node **scripts;
     int *body_idx;                                  /* script i -> index in urls[], or -1 */
@@ -3827,12 +4179,16 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
     }
 
     int inline_n = 0;
+    /* Two ordered passes: pass 0 = classic + async (document order), pass 1 =
+     * deferred scripts + modules (document order). See script_deferred(). */
+    for (int pass = 0; pass < 2; pass++)
     for (i = 0; i < ns; i++) {
         char *code;
         js_parse_error pe;
         js_node *prog;
         js_arena *ar;
         if (body_idx[i] == -2) continue;            /* CSP-blocked external (already logged) */
+        if (script_deferred(scripts[i]) != pass) continue;   /* run in its ordering pass */
         /* Label this script for error attribution: its src URL, or the page URL
          * plus an inline-script ordinal. */
         if (body_idx[i] >= 0 && urls[body_idx[i]]) {
@@ -3943,6 +4299,7 @@ void js_page_end(void) {
     gc_remove_root((void **)&g_media_proto);
     gc_remove_root((void **)&g_custom_elements);
     gc_remove_root((void **)&g_module_cache);
+    gc_remove_root((void **)&g_module_src);
     gc_remove_root((void **)&g_document_proto);
     gc_remove_root((void **)&g_response_proto);
     gc_remove_root((void **)&g_ws_proto);
@@ -3961,6 +4318,7 @@ void js_page_end(void) {
     g_element_proto = g_style_proto = g_url_proto = g_sp_proto = 0;
     g_event_proto = g_html_proto = g_custom_elements = g_document = g_live_wrappers = 0;
     g_module_cache = g_document_proto = g_response_proto = 0;
+    g_module_src = 0;
     g_ws_proto = g_websockets = 0;
     g_xhr_proto = 0;
     g_blob_proto = 0;

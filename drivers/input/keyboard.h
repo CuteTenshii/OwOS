@@ -56,6 +56,7 @@
 /* Alt+Tab is delivered as KEY_TAB+KMOD_ALT (+KMOD_SHIFT reverses); the WM owns
  * switching. KEY_ALT_UP is emitted on Alt-release to commit the selection. */
 #define KEY_ALT_UP      0x1F
+#define KEY_CLIPHIST    0x1E   /* Super+V: request the clipboard-history viewer (compositor) */
 
 /* Modifier state delivered alongside each key. Every key event carries the set
  * of modifiers held when it was pressed, so an app can act on chords (e.g. a
@@ -72,7 +73,7 @@ void keyboard_init(void);
 
 /* Non-blocking: stores the next buffered character in *out and returns 1,
  * or returns 0 if no input is waiting. When `mods` is non-NULL it receives the
- * KMOD_* modifier set held when that key was pressed (0 for injected paste). */
+ * KMOD_* modifier set held when that key was pressed. */
 int keyboard_poll(char *out, unsigned char *mods);
 
 /* Switch the active keyboard layout by name ("us" or "fr"). Returns 0 on
@@ -87,9 +88,5 @@ int keyboard_take_interrupt(void);
 /* Raise the interrupt latch from non-IRQ context (used by the serial console
  * so a Ctrl+C typed in the host terminal interrupts a running command). */
 void keyboard_signal_interrupt(void);
-
-/* Arm a clipboard paste from outside the keyboard (the WM, after the Super+V
- * history viewer picks a clip) — same injection path as Ctrl+V. */
-void keyboard_request_paste(void);
 
 #endif /* OWOS_KEYBOARD_H */

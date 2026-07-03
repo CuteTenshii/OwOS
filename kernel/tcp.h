@@ -40,7 +40,8 @@ int  tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
 int  tcp_read_nb(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
 void tcp_close(tcp_conn_t *c);
 
-/* Server API, for headless TCP daemons (kernel/services.c). tcp_listen() marks
+/* Server API, for headless TCP daemons (now user-space, via net_sock_*).
+ * tcp_listen() marks
  * a port open: a SYN arriving on it is accepted from interrupt context (the
  * three-way handshake completes there), pre-allocating receive buffers so the
  * IRQ path never allocates. tcp_accept() runs in a daemon thread and blocks
@@ -52,6 +53,6 @@ void tcp_close(tcp_conn_t *c);
  * structurally identical to a connected one once it reaches ESTAB. */
 int          tcp_listen(uint16_t port);          /* 0 ok, -1 no slot/buffers */
 void         tcp_unlisten(uint16_t port);
-tcp_conn_t  *tcp_accept(uint16_t port, volatile int *stop);  /* NULL if *stop */
+tcp_conn_t  *tcp_accept(uint16_t port);  /* NULL if interrupted by a signal */
 
 #endif /* OWOS_TCP_H */

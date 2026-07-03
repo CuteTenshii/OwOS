@@ -441,6 +441,20 @@ Headless daemons in a fixed enum-indexed registry (`on_start`/`on_stop`/`tick`).
 - **HTTP headers (user/lib/curl/headers.c)** — response headers parsed once into a
   k/v object (case-insensitive, repeats kept in order), shared by curl + browser.
   The browser also honors `X-Content-Type-Options: nosniff`.
+- **HTTP cache (user/lib/curl/httpcache.{c,h} + browser cache.{c,h})** — the RFC 7234
+  caching *policy* (HTTP-date parse, Cache-Control/Expires/Age/Date/ETag/Last-Modified
+  → storable/freshness/current-age) is a pure, host-testable lib; the browser's
+  `cache.c` is the store built on it (LRU, size-capped, spinlocked for the parallel
+  sub-resource pool). Wired into `fetch.c` (document, all transports, incl. 304
+  conditional revalidation) and `resource.c` (`browser_fetch` + the h2-multiplex
+  `subres_job`/`h2_prefetch` — `h2_fetch_many` gained optional per-stream header
+  capture so multiplexed sub-resources are cacheable). **Persistent across sessions:**
+  each entry's body is **one file per entry** under `/home/root/.cache/browser` (NOT
+  SQLite — its jar records cap at a 4 KiB page, too small for bodies), with an
+  in-memory metadata index. owofs allows one open write stream at a time, so disk
+  writes/deletes are **deferred to `cache_flush()`** on the single worker thread after
+  a navigation (jar.c's flush pattern); `cache_load()` restores at browser startup.
+  Verify the policy with `scripts/httpcache_test.c`.
 - **Notifications (user/lib/notify + notifyd + notify-send)** — `user/lib/notify`
   is the client lib; `notifyd` (`user/apps/gui/notifyd.c`) is a resident daemon
   listening on the `notify` IPC port, keeping history and drawing the Notification

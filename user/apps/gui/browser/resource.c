@@ -6,6 +6,7 @@
 #include "browser.h"
 #include "fetchint.h"
 #include "headers.h"   /* HTTP response headers (iframe X-Frame-Options / CSP)  */
+#include "cache.h"     /* the HTTP response cache (RFC 7234, honours headers)   */
 #include "cors.h"      /* CORS request orchestration + CORP sub-resource guard  */
 #include "svg.h"       /* SVG -> ARGB rasterizer (favicons, inline images) */
 #include "webp.h"      /* WebP (lossless VP8L) -> RGBA decoder              */
@@ -30,15 +31,15 @@ static int memrd_get(void *c)
 }
 
 /* Self-contained per-thread HTTP reader: several images fetch in parallel, each
- * over its OWN socket/buffer, so they never touch B->sock/B->pg->raw (which only the
- * page fetch uses). The kernel TLS is multi-flow, so the HTTPS handshakes run
- * concurrently. */
-struct ireader { int sock; unsigned char buf[2048]; int pos, len, eof; };
+ * over its OWN netconn/buffer, so they never touch B->sock/B->pg->raw (which only
+ * the page fetch uses). The user-space TLS is per-connection, so the HTTPS
+ * handshakes run concurrently. */
+struct ireader { netconn *conn; unsigned char buf[2048]; int pos, len, eof; };
 static int ir_getc(struct ireader *r)
 {
 	if (r->pos >= r->len) {
 		if (r->eof) return -1;
-		int n = net_recv(r->sock, r->buf, (int)sizeof r->buf);
+		int n = nc_read(r->conn, r->buf, (int)sizeof r->buf);
 		if (n <= 0) { r->eof = 1; return -1; }
 		r->pos = 0; r->len = n;
 	}
@@ -259,6 +260,38 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 	if (rs->final_url && rs->final_cap) rs->final_url[0] = '\0';
 	if (rs->hdr && rs->hdr_cap) rs->hdr[0] = '\0';
 
+	/* HTTP cache: only a bodyless GET is cacheable. A fresh copy skips the wire
+	 * entirely; a stale one rides a conditional GET (the `cond` headers) and a 304
+	 * reuses the stored body. Keyed on the requested URL (origurl), so a repeat
+	 * hits the cache before re-walking any redirect chain. */
+	int   cacheable = streq_ci(method, "GET") && !(rq->body && rq->body_len > 0);
+	long  now = (long)rtc_epoch();
+	int   revalidating = 0;
+	char  cond[512]; cond[0] = '\0';
+	char  origurl[URL_MAX]; { int k = 0; origurl[0] = '\0'; sapp(origurl, &k, sizeof origurl, rq->url); }
+	struct http_req rqc;               /* request copy carrying the cond headers */
+	char  combined[1408];
+	if (cacheable) {
+		unsigned char *cbody = 0; int clen = 0;
+		int cv = cache_lookup(method, origurl, now, &cbody, &clen,
+		                      rs->ctype, sizeof rs->ctype, rs->hdr, rs->hdr_cap,
+		                      cond, sizeof cond);
+		if (cv == CACHE_FRESH) {
+			rs->status = 200; rs->len = clen;
+			if (rs->final_url && rs->final_cap) { int k = 0; sapp(rs->final_url, &k, rs->final_cap, origurl); }
+			struct net_log e = { method, origurl, 200, rs->ctype, clen, 0, rs->hdr };
+			devtools_net_add(&e);
+			return cbody;
+		}
+		if (cv == CACHE_REVALIDATE) {
+			revalidating = 1;
+			int n = 0;
+			if (rq->extra_hdrs && rq->extra_hdrs[0]) sapp(combined, &n, sizeof combined, rq->extra_hdrs);
+			sapp(combined, &n, sizeof combined, cond);
+			rqc = *rq; rqc.extra_hdrs = combined; rq = &rqc;
+		}
+	}
+
 	for (int hop = 0; hop <= MAX_REDIR; hop++) {
 		struct purl u;
 		struct resp_meta meta;
@@ -268,10 +301,10 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 		if (!parse_url(full, &u)) return 0;
 		if (!u.tls && hsts_has(u.host)) { u.tls = 1; if (u.port == 80) u.port = 443; }
 
-		int sock = net_connect(u.host, u.port, u.tls ? SK_TLS_H2 : SK_TCP);
-		if (sock < 0) return 0;
+		netconn *conn = nc_open(u.host, u.port, u.tls, /*offer_h2=*/1);
+		if (!conn) return 0;
 
-		if (u.tls && net_alpn(sock) == ALPN_H2) {
+		if (u.tls && nc_alpn(conn) == ALPN_H2) {
 			/* HTTP/2. :authority + lowercased headers; no accept-encoding so the
 			 * body comes back plain (no decompression needed here). */
 			char auth[URL_HOST_MAX + 8]; int an = 0;
@@ -284,11 +317,11 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 			if (rq->extra_hdrs && rq->extra_hdrs[0]) h2_append_headers(xh, &xn, sizeof xh, rq->extra_hdrs);
 			struct h2_opts opts = { BR_UA, xh, 0 };
 			struct h2buf hb; hb.cap = 65536; hb.blen = 0; hb.body = malloc((unsigned)hb.cap);
-			if (!hb.body) { net_close(sock); return 0; }
+			if (!hb.body) { nc_close(conn); return 0; }
 			int hlen = 0;
-			int rc = h2_run_body(sock, 1, auth, method, u.path, &opts, rq->body, rq->body_len,
+			int rc = h2_run_body(conn, 1, auth, method, u.path, &opts, rq->body, rq->body_len,
 			                     rawhdr, sizeof rawhdr, &hlen, h2buf_cb, &hb);
-			net_close(sock);
+			nc_close(conn);
 			if (rc < 0) { if (hb.body) free(hb.body); return 0; }
 			int dchunk; long dclen;
 			parse_resp_headers(rawhdr, &meta, &dchunk, &dclen);
@@ -297,11 +330,11 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 		} else {
 			char req[2048]; int n = 0;
 			build_request(req, &n, sizeof req, &u, method, accept, rq);
-			if (net_send(sock, req, n) < 0) { net_close(sock); return 0; }
-			if (rq->body && rq->body_len > 0 && net_send(sock, (const char *)rq->body, rq->body_len) < 0) { net_close(sock); return 0; }
-			struct ireader r = { sock, { 0 }, 0, 0, 0 };
+			if (nc_write(conn, req, n) < 0) { nc_close(conn); return 0; }
+			if (rq->body && rq->body_len > 0 && nc_write(conn, (const char *)rq->body, rq->body_len) < 0) { nc_close(conn); return 0; }
+			struct ireader r = { conn, { 0 }, 0, 0, 0 };
 			body = read_http_body(&r, &blen, &meta, rawhdr, sizeof rawhdr);
-			net_close(sock);
+			nc_close(conn);
 		}
 		if (!body) return 0;
 
@@ -312,6 +345,27 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 			free(body);
 			continue;
 		}
+
+		/* A revalidation that came back 304: reuse the stored body (its freshness
+		 * refreshed from the 304's headers). */
+		if (revalidating && meta.status == 304) {
+			unsigned char *rb = 0; int rl = 0;
+			if (cache_revalidated(origurl, now, rawhdr, &rb, &rl,
+			                      rs->ctype, sizeof rs->ctype, rs->hdr, rs->hdr_cap)) {
+				free(body);
+				rs->status = 200; rs->len = rl;
+				if (rs->final_url && rs->final_cap) { int k = 0; sapp(rs->final_url, &k, rs->final_cap, origurl); }
+				struct net_log e = { method, origurl, 304, rs->ctype, rl, (int)(msec() - t0), rawhdr };
+				devtools_net_add(&e);
+				return rb;
+			}
+			/* Entry vanished (evicted mid-flight): fall through and hand back the
+			 * 304 as-is; the caller treats a non-200 as a miss and refetches. */
+		}
+		/* Store a fresh 200 under the requested URL (cache_store vets the headers). */
+		if (cacheable && meta.status == 200)
+			cache_store(method, origurl, 200, now, rawhdr, meta.ctype, body, blen);
+
 		rs->status = meta.status;
 		rs->len = blen;
 		{ int k = 0; rs->ctype[0] = '\0'; sapp(rs->ctype, &k, sizeof rs->ctype, meta.ctype); }
@@ -415,7 +469,7 @@ unsigned char *browser_cors_fetch(const char *page_url, int with_credentials,
  * find the active job through g_par (thread_create takes no argument), and
  * par_fetch joins them before returning, so the pointer stays live throughout. */
 #define PAR_FETCHERS    4
-#define PAR_FETCH_STACK (32 * 1024)
+#define PAR_FETCH_STACK (128 * 1024)
 
 struct par_job {
 	volatile int next;          /* next index to claim                       */
@@ -456,16 +510,23 @@ static void par_fetch(int n, void (*fn)(void *ctx, int i), void *ctx)
 
 	int want = n - 1;
 	if (want > PAR_FETCHERS - 1) want = PAR_FETCHERS - 1;
-	int tids[PAR_FETCHERS - 1]; char *stks[PAR_FETCHERS - 1]; int nthr = 0;
+	int tids[PAR_FETCHERS - 1]; char *stks[PAR_FETCHERS - 1]; void *tops[PAR_FETCHERS - 1]; int nthr = 0;
 	for (int t = 0; t < want; t++) {
-		char *stk = malloc(PAR_FETCH_STACK);
-		if (!stk) break;
-		int tid = thread_create(par_thread, stk + PAR_FETCH_STACK);
-		if (tid < 0) { free(stk); break; }
-		stks[nthr] = stk; tids[nthr] = tid; nthr++;
+		/* Prefer a kernel-guarded stack (unmapped guard page below, so an overflow
+		 * in the user-space TLS/h2 path faults cleanly instead of scribbling the
+		 * heap); fall back to a plain malloc'd stack if none are free. */
+		char *stk = 0;
+		void *top = thread_stack_alloc(PAR_FETCH_STACK);
+		if (!top) { stk = malloc(PAR_FETCH_STACK); if (!stk) break; top = stk + PAR_FETCH_STACK; }
+		int tid = thread_create(par_thread, top);
+		if (tid < 0) { if (stk) free(stk); else thread_stack_free(top); break; }
+		stks[nthr] = stk; tops[nthr] = top; tids[nthr] = tid; nthr++;
 	}
 	par_run_loop(&job);                 /* this thread fetches too */
-	for (int t = 0; t < nthr; t++) { thread_join(tids[t]); free(stks[t]); }
+	for (int t = 0; t < nthr; t++) {
+		thread_join(tids[t]);
+		if (stks[t]) free(stks[t]); else thread_stack_free(tops[t]);
+	}
 	g_par = 0;
 }
 
@@ -787,6 +848,10 @@ static void subres_job(void *vctx, int i)
 			c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]);
 		return;
 	}
+	/* Per-stream response-header buffers, so a fetched 200 can be cached (the h2
+	 * batch otherwise surfaces no headers). NULL on OOM = fetch without caching. */
+	char (*hdrs)[RESP_HDR_MAX] = malloc((unsigned)ng * RESP_HDR_MAX);
+	long now = (long)rtc_epoch();
 	struct h2_fetch reqs[H2_FETCH_MAX];
 	for (int g = 0; g < ng; g++) {
 		struct purl v; origin_of(c->urls[grp[g]], &v);
@@ -794,10 +859,11 @@ static void subres_job(void *vctx, int i)
 		paths[g][k] = '\0';
 		reqs[g].path = paths[g];
 		reqs[g].status = 0; reqs[g].body = 0; reqs[g].blen = 0; reqs[g].failed = 0;
+		reqs[g].hdr = hdrs ? hdrs[g] : 0; reqs[g].hdrcap = hdrs ? RESP_HDR_MAX : 0; reqs[g].hdrlen = 0;
 	}
 
-	int sock = net_connect(u.host, u.port, SK_TLS_H2);
-	if (sock >= 0 && net_alpn(sock) == ALPN_H2) {
+	netconn *conn = nc_open(u.host, u.port, /*tls=*/1, /*offer_h2=*/1);
+	if (conn && nc_alpn(conn) == ALPN_H2) {
 		char auth[URL_HOST_MAX + 8]; int an = 0;
 		sapp(auth, &an, sizeof auth, u.host);
 		if (u.port != 443) { sapp(auth, &an, sizeof auth, ":"); uapp(auth, &an, sizeof auth, (unsigned)u.port); }
@@ -807,22 +873,26 @@ static void subres_job(void *vctx, int i)
 		}
 		sapp(xh, &xn, sizeof xh, "accept: "); sapp(xh, &xn, sizeof xh, c->accept); sapp(xh, &xn, sizeof xh, "\r\n");
 		struct h2_opts o = { BR_UA, xh, 0 };
-		h2_fetch_many(sock, 1, auth, &o, reqs, ng, 0, 0);   /* accumulate */
-		net_close(sock);
+		h2_fetch_many(conn, 1, auth, &o, reqs, ng, 0, 0);   /* accumulate */
+		nc_close(conn);
 		for (int g = 0; g < ng; g++) {
 			if (!reqs[g].failed && reqs[g].body) {
 				c->bodies[grp[g]] = reqs[g].body; c->lens[grp[g]] = reqs[g].blen;
+				if (reqs[g].hdr && reqs[g].hdrlen > 0)      /* cache the fetched 200 */
+					cache_store("GET", c->urls[grp[g]], reqs[g].status, now,
+					            reqs[g].hdr, "", reqs[g].body, reqs[g].blen);
 				{ struct net_log e = { "GET", c->urls[grp[g]], reqs[g].status, "", reqs[g].blen, 0, 0 };
 				  devtools_net_add(&e); }
 			} else { if (reqs[g].body) free(reqs[g].body);   /* h1.1 retry (logs itself) */
 			       c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]); }
 		}
 	} else {
-		if (sock >= 0) net_close(sock);
+		if (conn) nc_close(conn);
 		for (int g = 0; g < ng; g++)                       /* no h2: h1.1 each */
 			c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]);
 	}
 	free(paths);
+	free(hdrs);
 }
 
 /* Fetch n absolute URLs into bodies[i] (malloc'd, caller frees, NULL on failure)
@@ -846,6 +916,19 @@ void subres_get_batch(char *const *urls, int n, const char *accept,
 		return;
 	}
 
+	/* Serve fresh cache hits up front (single-threaded here, before the pool):
+	 * marking a URL `handled` excludes it from every fetch group below. Runs on
+	 * this worker thread, so no fetch thread is racing `handled` yet. */
+	long now = (long)rtc_epoch();
+	for (int i = 0; i < n; i++) {
+		unsigned char *cb = 0; int cl = 0;
+		if (cache_lookup("GET", urls[i], now, &cb, &cl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
+			bodies[i] = cb; lens[i] = cl; handled[i] = 1;
+			struct net_log e = { "GET", urls[i], 200, "", cl, 0, 0 };
+			devtools_net_add(&e);
+		}
+	}
+
 	struct subres_batch ctx = { urls, n, accept, bodies, lens, handled, 0 };
 	par_fetch(n, subres_job, &ctx);
 	free(handled);
@@ -863,7 +946,7 @@ void css_batch(char *const *urls, int n, unsigned char **bodies, int *lens)
  * img_pool: a short lock guards only the bump of img_pool_len; the byte copy and
  * the per-image metadata go to disjoint regions, so they need no lock. */
 #define IMG_FETCHERS    4
-#define IMG_FETCH_STACK (32 * 1024)
+#define IMG_FETCH_STACK (128 * 1024)
 
 static char         g_img_page[URL_MAX];   /* page URL the fetchers resolve against */
 static volatile int g_img_next;            /* next image index to claim             */
@@ -1006,7 +1089,7 @@ static int favicon_decode(const unsigned char *r, int n);   /* defined below */
  * (idxs[]) and consume that resource as its stream lands. An index of FAV_IDX is
  * the page favicon (decoded into B->pg->favicon); anything else is an image index. */
 #define FAV_IDX (-1)
-struct h2img_ctx { const int *idxs; };
+struct h2img_ctx { const int *idxs; struct h2_fetch *reqs; long now; };
 static void h2img_commit(void *ctx, int b, const unsigned char *body, int blen)
 {
 	const struct h2img_ctx *c = ctx;
@@ -1020,6 +1103,9 @@ static void h2img_commit(void *ctx, int b, const unsigned char *body, int blen)
 		{ struct net_log e = { "GET", full, 200, "image/*", blen, 0, 0 }; devtools_net_add(&e); }
 		commit_image(c->idxs[b], body, blen, 0x000000);
 	}
+	/* Cache the fetched 200 (the batch surfaced its headers into reqs[b].hdr). */
+	if (c->reqs[b].hdr && c->reqs[b].hdrlen > 0)
+		cache_store("GET", full, 200, c->now, c->reqs[b].hdr, "", body, blen);
 }
 
 /* Multiplex the page's same-origin HTTPS eager images over ONE h2 connection
@@ -1034,6 +1120,9 @@ static void h2_prefetch(const char *page_url)
 
 	char (*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
 	if (!paths) return;
+	/* Per-stream header buffers so a fetched 200 can be cached (h2img_commit). */
+	char (*hdrs)[RESP_HDR_MAX] = malloc((unsigned)H2_FETCH_MAX * RESP_HDR_MAX);
+	long now = (long)rtc_epoch();
 	struct h2_fetch reqs[H2_FETCH_MAX];
 	int idxs[H2_FETCH_MAX], nb = 0;
 
@@ -1052,6 +1141,7 @@ static void h2_prefetch(const char *page_url)
 		paths[nb][k] = '\0';
 		reqs[nb].path = paths[nb];
 		reqs[nb].status = 0; reqs[nb].body = 0; reqs[nb].blen = 0; reqs[nb].failed = 0;
+		reqs[nb].hdr = hdrs ? hdrs[nb] : 0; reqs[nb].hdrcap = hdrs ? RESP_HDR_MAX : 0; reqs[nb].hdrlen = 0;
 		idxs[nb] = i;
 		nb++;
 	}
@@ -1060,27 +1150,34 @@ static void h2_prefetch(const char *page_url)
 	 * rides the images' h2 stream batch instead of opening its own. Cross-origin /
 	 * http favicons (and a failed stream) are left for fetch_favicon's h1.1 path,
 	 * which runs only when favicon_ok is still 0. */
-	if (nb < H2_FETCH_MAX) {
+	if (nb < H2_FETCH_MAX && !B->pg->favicon_ok) {
 		char fav[URL_MAX];
 		resolve_url(page_url, B->pg->favicon_href[0] ? B->pg->favicon_href : "/favicon.ico",
 		            fav, sizeof fav);
+		/* A fresh cached favicon skips the batch entirely. */
+		unsigned char *fb = 0; int fl = 0;
+		if (cache_lookup("GET", fav, now, &fb, &fl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
+			if (favicon_decode(fb, fl)) { B->pg->favicon_ok = 1; B->seq++; }
+			free(fb);
+		}
 		struct purl fu;
-		if (parse_url(fav, &fu) && fu.tls &&
+		if (!B->pg->favicon_ok && parse_url(fav, &fu) && fu.tls &&
 		    streq_ci(fu.host, pu.host) && fu.port == pu.port) {
 			int k = 0;
 			for (; fu.path[k] && k < URL_MAX - 1; k++) paths[nb][k] = fu.path[k];
 			paths[nb][k] = '\0';
 			reqs[nb].path = paths[nb];
 			reqs[nb].status = 0; reqs[nb].body = 0; reqs[nb].blen = 0; reqs[nb].failed = 0;
+			reqs[nb].hdr = hdrs ? hdrs[nb] : 0; reqs[nb].hdrcap = hdrs ? RESP_HDR_MAX : 0; reqs[nb].hdrlen = 0;
 			idxs[nb] = FAV_IDX;
 			nb++;
 		}
 	}
-	if (nb == 0) { free(paths); return; }
+	if (nb == 0) { free(paths); free(hdrs); return; }
 
-	int sock = net_connect(pu.host, pu.port, SK_TLS_H2);
-	if (sock < 0) { free(paths); return; }
-	if (net_alpn(sock) != ALPN_H2) { net_close(sock); free(paths); return; }   /* pool handles */
+	netconn *conn = nc_open(pu.host, pu.port, /*tls=*/1, /*offer_h2=*/1);
+	if (!conn) { free(paths); free(hdrs); return; }
+	if (nc_alpn(conn) != ALPN_H2) { nc_close(conn); free(paths); free(hdrs); return; }   /* pool handles */
 
 	char auth[URL_HOST_MAX + 8]; int an = 0;
 	sapp(auth, &an, sizeof auth, pu.host);
@@ -1099,10 +1196,11 @@ static void h2_prefetch(const char *page_url)
 	 * so they pop in progressively rather than all at once after the batch. Each
 	 * commit sets ok=1 + bumps B->seq, so the UI re-lays-out as they land; a
 	 * failed/empty stream leaves ok=0 and the h1.1 pool retries it. */
-	struct h2img_ctx hc = { idxs };
-	h2_fetch_many(sock, 1, auth, &opts, reqs, nb, h2img_commit, &hc);
-	net_close(sock);
+	struct h2img_ctx hc = { idxs, reqs, now };
+	h2_fetch_many(conn, 1, auth, &opts, reqs, nb, h2img_commit, &hc);
+	nc_close(conn);
 	free(paths);
+	free(hdrs);
 }
 
 /* The fetch loop each pool thread (and the worker itself) runs: claim images
@@ -1131,26 +1229,47 @@ void fetch_inline_images(const char *page_url)
 	{ int k = 0; g_img_page[0] = '\0'; sapp(g_img_page, &k, sizeof g_img_page, page_url); }
 	g_img_next = 0;
 
+	/* Serve fresh cached eager images up front (single-threaded, before the pool):
+	 * commit_image sets im->ok, so both h2_prefetch and the h1.1 pool skip them. */
+	{
+		long now = (long)rtc_epoch();
+		for (int i = 0; i < B->pg->n_imgs; i++) {
+			struct inl_img *im = &B->pg->imgs[i];
+			if (im->lazy || im->ok) continue;
+			char full[URL_MAX];
+			resolve_url(page_url, im->href, full, sizeof full);
+			unsigned char *cb = 0; int cl = 0;
+			if (cache_lookup("GET", full, now, &cb, &cl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
+				commit_image(i, cb, cl, 0x000000);
+				free(cb);
+				struct net_log e = { "GET", full, 200, "image/*", cl, 0, 0 };
+				devtools_net_add(&e);
+			}
+		}
+	}
+
 	/* First multiplex the same-origin HTTPS images over one h2 connection; the
 	 * rest (cross-origin, http, or h2-unavailable) go through the h1.1 pool. */
 	h2_prefetch(page_url);
 
 	int   tids[IMG_FETCHERS - 1];
 	char *stks[IMG_FETCHERS - 1];
+	void *tops[IMG_FETCHERS - 1];
 	int   nthr = 0;
 	for (int t = 0; t < IMG_FETCHERS - 1; t++) {
-		char *stk = malloc(IMG_FETCH_STACK);
-		if (!stk) break;
-		int tid = thread_create(img_fetcher_thread, stk + IMG_FETCH_STACK);
-		if (tid < 0) { free(stk); break; }
-		stks[nthr] = stk; tids[nthr] = tid; nthr++;
+		char *stk = 0;                 /* guarded stack preferred; malloc fallback */
+		void *top = thread_stack_alloc(IMG_FETCH_STACK);
+		if (!top) { stk = malloc(IMG_FETCH_STACK); if (!stk) break; top = stk + IMG_FETCH_STACK; }
+		int tid = thread_create(img_fetcher_thread, top);
+		if (tid < 0) { if (stk) free(stk); else thread_stack_free(top); break; }
+		stks[nthr] = stk; tops[nthr] = top; tids[nthr] = tid; nthr++;
 	}
 
 	img_fetch_loop();                  /* this thread fetches too */
 
 	for (int t = 0; t < nthr; t++) {   /* wait for the helpers, free their stacks */
 		thread_join(tids[t]);
-		free(stks[t]);
+		if (stks[t]) free(stks[t]); else thread_stack_free(tops[t]);
 	}
 }
 
@@ -1169,6 +1288,7 @@ int fetch_lazy_visible(void)
 		fetch_image(i, B->pg->cur_url);
 		im->fetched = 1; im->want = 0;
 		B->seq++;                  /* re-layout now that the image has landed   */
+		cache_flush();             /* persist the lazily-fetched image (worker thread) */
 		return 1;
 	}
 	return 0;

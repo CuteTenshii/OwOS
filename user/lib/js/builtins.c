@@ -1279,6 +1279,15 @@ static js_value str_charcode(js_ctx *ctx, js_value t, js_value *a, int n) {
     if (i < 0 || i >= s.u.str->len) return js_number(0.0 / 0.0);
     return js_number((unsigned char)s.u.str->data[i]);
 }
+static js_value str_localecompare(js_ctx *ctx, js_value t, js_value *a, int n) {
+    js_value s = this_str(ctx, t), o = js_to_string(ctx, ARG(0)); (void)n;
+    const unsigned char *pa = (const unsigned char *)s.u.str->data;
+    const unsigned char *pb = (const unsigned char *)o.u.str->data;
+    int la = s.u.str->len, lb = o.u.str->len, i;
+    for (i = 0; i < la && i < lb; i++)
+        if (pa[i] != pb[i]) return js_number(pa[i] < pb[i] ? -1 : 1);
+    return js_number(la < lb ? -1 : la > lb ? 1 : 0);
+}
 static js_value str_indexof(js_ctx *ctx, js_value t, js_value *a, int n) {
     js_value s = this_str(ctx, t), needle = js_to_string(ctx, ARG(0));
     int from = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
@@ -3734,6 +3743,7 @@ void js_setup_builtins(js_ctx *ctx) {
     js_def_native(ctx, ctx->string_proto, "codePointAt", str_charcode, 1);
     js_def_native(ctx, ctx->string_proto, "at", str_at, 1);
     js_def_native(ctx, ctx->string_proto, "indexOf", str_indexof, 1);
+    js_def_native(ctx, ctx->string_proto, "localeCompare", str_localecompare, 1);
     js_def_native(ctx, ctx->string_proto, "lastIndexOf", str_lastindexof, 1);
     js_def_native(ctx, ctx->string_proto, "includes", str_includes, 1);
     js_def_native(ctx, ctx->string_proto, "startsWith", str_startswith, 1);

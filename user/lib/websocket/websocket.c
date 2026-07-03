@@ -2,6 +2,7 @@
 #include "websocket.h"
 #include "owos.h"
 #include "crypto.h"
+#include "netconn.h"
 
 /* Per-frame and per-message payload ceilings. A single frame must fit the rx
  * buffer (we wait for the whole payload before parsing), so the rx buffer is
@@ -18,7 +19,7 @@
 #define WS_EV_CONTINUE 100
 
 struct ws_conn {
-    int  sock;
+    netconn *conn;               /* TCP (ws) or user-space TLS (wss) transport */
     int  state;
     char protocol[64];           /* negotiated subprotocol (or "") */
 
@@ -173,7 +174,7 @@ static int ws_send_frame(ws_conn *c, int opcode, const void *data, int len) {
     uint8_t *frame;
     const uint8_t *p = (const uint8_t *)data;
     int hn = 0, i, r;
-    if (!c || c->sock < 0) return -1;
+    if (!c || !c->conn) return -1;
 
     hdr[hn++] = (uint8_t)(0x80 | (opcode & 0x0f));         /* FIN + opcode */
     if (len < 126) {
@@ -193,7 +194,7 @@ static int ws_send_frame(ws_conn *c, int opcode, const void *data, int len) {
     if (!frame) return -1;
     memcpy(frame, hdr, (unsigned)hn);
     for (i = 0; i < len; i++) frame[hn + i] = (uint8_t)(p[i] ^ mask[i & 3]);
-    r = net_send(c->sock, frame, hn + len);
+    r = nc_write(c->conn, frame, hn + len);
     free(frame);
     return r < 0 ? -1 : 0;
 }
@@ -246,7 +247,7 @@ static int read_handshake(ws_conn *c, char **resp, int *resp_len, int *body_off)
             if (!nb) { free(buf); return -1; }
             buf = nb;
         }
-        n = net_recv(c->sock, buf + len, cap - len);
+        n = nc_read(c->conn, buf + len, cap - len);
         if (n <= 0) { free(buf); return -1; }
         len += n;
         for (i = (len - n >= 3 ? len - n - 3 : 0); i + 3 < len; i++) {
@@ -275,14 +276,14 @@ ws_conn *ws_open(const char *url, const char *protocols) {
 
     c = (ws_conn *)calloc(1, sizeof *c);
     if (!c) return 0;
-    c->sock = -1;
+    c->conn = 0;
     c->state = WS_CONNECTING;
     c->protocol[0] = 0;
     c->rng = (uint32_t)(now_ms() & 0xffffffffu) ^ ((uint32_t)msec() * 2654435761u);
     if (!c->rng) c->rng = 0xC0FFEEu;
 
-    c->sock = net_connect(host, port, tls ? SK_TLS : SK_TCP);
-    if (c->sock < 0) { free(c); return 0; }
+    c->conn = nc_open(host, port, tls, 0);
+    if (!c->conn) { free(c); return 0; }
 
     for (i = 0; i < 16; i++) keybytes[i] = ws_rand_byte(c);
     b64_encode(keybytes, 16, key);
@@ -312,17 +313,17 @@ ws_conn *ws_open(const char *url, const char *protocols) {
         rn = n;
     }
 
-    if (net_send(c->sock, req, rn) < 0) { net_close(c->sock); free(c); return 0; }
+    if (nc_write(c->conn, req, rn) < 0) { nc_close(c->conn); free(c); return 0; }
 
     if (read_handshake(c, &resp, &resp_len, &body_off) != 0) {
-        net_close(c->sock); free(c); return 0;
+        nc_close(c->conn); free(c); return 0;
     }
-    if (!status_is_101(resp, resp_len)) { free(resp); net_close(c->sock); free(c); return 0; }
+    if (!status_is_101(resp, resp_len)) { free(resp); nc_close(c->conn); free(c); return 0; }
 
     compute_accept(key, accept);
     if (!header_value(resp, body_off, "Sec-WebSocket-Accept", got, sizeof got) ||
         ws_strlen(got) != ws_strlen(accept) || !ci_eq_n(got, accept, ws_strlen(accept))) {
-        free(resp); net_close(c->sock); free(c); return 0;
+        free(resp); nc_close(c->conn); free(c); return 0;
     }
     header_value(resp, body_off, "Sec-WebSocket-Protocol", c->protocol, sizeof c->protocol);
 
@@ -435,7 +436,7 @@ int ws_poll(ws_conn *c, const uint8_t **out, int *outlen, int *is_text) {
         if (!rx_reserve(c, 4096)) break;            /* at the frame cap: parse what we have */
         room = c->rxcap - c->rxlen;
         if (room <= 0) break;
-        n = net_recv_nb(c->sock, c->rx + c->rxlen, room);
+        n = nc_read_nb(c->conn, c->rx + c->rxlen, room);
         if (n > 0) { c->rxlen += n; continue; }
         if (n == 0) break;                          /* would-block */
         c->state = WS_CLOSED;                       /* EOF / error / interrupted */
@@ -484,7 +485,7 @@ const char *ws_protocol(const ws_conn *c) { return c ? c->protocol : ""; }
 
 void ws_free(ws_conn *c) {
     if (!c) return;
-    if (c->sock >= 0) net_close(c->sock);
+    if (c->conn) nc_close(c->conn);
     if (c->rx) free(c->rx);
     if (c->msg) free(c->msg);
     free(c);

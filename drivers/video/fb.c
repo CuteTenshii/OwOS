@@ -471,6 +471,44 @@ uint32_t fb_height(void) { return fb_h; }
 uint32_t *fb_ptr(void)   { return fb; }
 uint32_t fb_pitch_pixels(void) { return fb_pitch; }
 
+/* Phase-1 compositor primitives (SYS_FB_*). The back buffer is a contiguous PMM
+ * run identity-mapped into the kernel, so its physical base equals fb_ptr(); 0 in
+ * text mode or single-buffered fallback (nothing safe to hand a compositor). */
+uint32_t fb_backbuffer_phys(void)
+{
+	return (active && !single) ? (uint32_t)fb : 0;
+}
+
+uint32_t fb_backbuffer_bytes(void)
+{
+	return fb_cap * 4u;
+}
+
+void fb_dims(int *w, int *h, int *pitch, int *bpp)
+{
+	if (w)     *w     = (int)fb_w;
+	if (h)     *h     = (int)fb_h;
+	if (pitch) *pitch = (int)fb_pitch;    /* pixels per row (stride) */
+	if (bpp)   *bpp   = 32;
+}
+
+/* Flush just [x,y,w,h) of the back buffer to VRAM, reusing fb_present's device
+ * path (WC drain + SVGA hook). Clipped to the screen; a compositor supplies its
+ * own damage rect. */
+void fb_present_rect(int x, int y, int w, int h)
+{
+	if (!active || w <= 0 || h <= 0)
+		return;
+	int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+	int x1 = x + w, y1 = y + h;
+	if (x1 > (int)fb_w) x1 = (int)fb_w;
+	if (y1 > (int)fb_h) y1 = (int)fb_h;
+	if (x1 <= x0 || y1 <= y0)
+		return;
+	dirty_x0 = x0; dirty_y0 = y0; dirty_x1 = x1; dirty_y1 = y1;
+	fb_present();
+}
+
 void fb_pixel(int x, int y, uint32_t color)
 {
 	if (x < cl_x0 || x >= cl_x1 || y < cl_y0 || y >= cl_y1)

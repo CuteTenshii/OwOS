@@ -1,35 +1,44 @@
-/* smb.c — a minimal read-only SMB2 server (see smb.h).
+/* smbd.c — a minimal read-only SMB2 server, in user space.
+ *
+ * Ported from the former in-kernel kernel/smb.c: the SMB2 wire protocol is a
+ * pure byte-stream server over TCP/445 plus file reads, so it needs no ring-0
+ * privilege and lives here as a windowless /bin daemon. main() opens a listener
+ * and loops accept -> serve -> close; run it detached (e.g. `smbd &`).
  *
  * Scope and shape: one client per connection, dialect 2.0.2 only, guest
  * authentication (no password check), a single hard-coded read-only share
- * ("owofs") backed by the kernel filesystem. It implements just the command
- * set a stock client walks through to browse and read files:
+ * ("owofs") backed by owofs. It implements just the command set a stock client
+ * walks through to browse and read files:
  *
  *   NEGOTIATE -> SESSION_SETUP (NTLMSSP, granted as guest) -> TREE_CONNECT
  *   -> CREATE -> QUERY_DIRECTORY / QUERY_INFO / READ -> CLOSE -> ...
  *
  * Everything is little-endian on the wire (SMB2), framed by the NetBIOS
  * session header (a 4-byte big-endian length) on direct TCP/445. The server is
- * synchronous: smb_serve() reads one request, builds one response, writes it,
- * and repeats — driven from the smbd daemon thread, so blocking in tcp_read is
- * fine. No signing, no encryption, no compound requests, no async.
+ * synchronous: serve() reads one request, builds one response, writes it, and
+ * repeats — blocking in net_recv is fine.
  *
  * The certificate-equivalent caveat: authentication is cosmetic. The server
  * completes the NTLMSSP handshake but accepts ANY credentials as guest and
- * never verifies them — like the TLS client's unverified certificate, this is
- * deliberate and documented. Good for serving files to yourself over QEMU's
- * NAT, not a security boundary.
+ * never verifies them. Good for serving files to yourself over QEMU's NAT, not
+ * a security boundary.
  */
 
 #include <stdint.h>
-#include <stddef.h>
-
-#include "smb.h"
-#include "endian.h"
-#include "tcp.h"
-#include "fs.h"
+#include "owos.h"
 
 /* ------------------------------------------------------------- LE accessors */
+
+static uint16_t load_le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t load_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t load_le64(const uint8_t *p)
+{
+	return (uint64_t)load_le32(p) | ((uint64_t)load_le32(p + 4) << 32);
+}
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 static void put32(uint8_t *p, uint32_t v)
@@ -96,7 +105,7 @@ struct smb_handle {
 };
 
 struct smb_conn {
-	tcp_conn_t       *c;
+	int               fd;
 	uint8_t           rx[SMB_MSG_MAX];
 	uint8_t           tx[SMB_MSG_MAX];
 	uint64_t          session_id;
@@ -109,15 +118,10 @@ static int read_full(struct smb_conn *s, uint8_t *buf, uint32_t n)
 {
 	uint32_t got = 0;
 	while (got < n) {
-		int closed = 0;
-		int r = tcp_read(s->c, buf + got, n - got, &closed);
-		if (r < 0)
+		int r = net_recv(s->fd, buf + got, (int)(n - got));
+		if (r <= 0)          /* 0 = EOF, <0 = error/interrupted (NET_EINTR) */
 			return -1;
 		got += (uint32_t)r;
-		if (r == 0 && closed)
-			return -1;
-		if (r == 0 && got < n && closed)
-			return -1;
 	}
 	return 0;
 }
@@ -138,6 +142,19 @@ static int read_msg(struct smb_conn *s)
 	return (int)len;
 }
 
+/* Write all of buf[0..n); returns 0 on success, -1 on error. */
+static int write_full(struct smb_conn *s, const uint8_t *buf, uint32_t n)
+{
+	uint32_t sent = 0;
+	while (sent < n) {
+		int r = net_send(s->fd, buf + sent, (int)(n - sent));
+		if (r <= 0)
+			return -1;
+		sent += (uint32_t)r;
+	}
+	return 0;
+}
+
 /* Send body[0..len) wrapped in a NetBIOS session header. */
 static int send_msg(struct smb_conn *s, const uint8_t *body, uint32_t len)
 {
@@ -146,9 +163,9 @@ static int send_msg(struct smb_conn *s, const uint8_t *body, uint32_t len)
 	nbt[1] = (uint8_t)(len >> 16);
 	nbt[2] = (uint8_t)(len >> 8);
 	nbt[3] = (uint8_t)len;
-	if (tcp_write(s->c, nbt, 4) < 0)
+	if (write_full(s, nbt, 4) < 0)
 		return -1;
-	if (tcp_write(s->c, body, len) < 0)
+	if (write_full(s, body, len) < 0)
 		return -1;
 	return 0;
 }
@@ -176,11 +193,12 @@ static void build_header(struct smb_conn *s, const uint8_t *req, uint32_t status
 }
 
 /* Fallback Windows FILETIME (100ns ticks since 1601, ~2015) for entries with no
- * recorded time, e.g. the "." / ".." pseudo-directories. */
+ * recorded time (owofs mtime == 0, e.g. never stamped or a generated pseudo-fs
+ * node). Real entries use their converted owofs stamp (see owofs_filetime). */
 #define FAKE_FILETIME 0x01D0000000000000ull
 
 /* Convert an owofs packed mtime ([year-2000:6][month:4][day:5][hour:5][min:6]
- * [sec:6], see fs.c) to a Windows FILETIME. Returns FAKE_FILETIME if unset. */
+ * [sec:6]) to a Windows FILETIME. Returns FAKE_FILETIME if unset (m == 0). */
 static uint64_t owofs_filetime(uint32_t m)
 {
 	if (m == 0)
@@ -480,7 +498,25 @@ static int dir_entry_at(const char *dirpath, int idx, char *name, int *is_dir,
 	*mtime = 0;
 	if (idx == 0) { name[0] = '.'; name[1] = 0; *is_dir = 1; *size = 0; return 1; }
 	if (idx == 1) { name[0] = '.'; name[1] = '.'; name[2] = 0; *is_dir = 1; *size = 0; return 1; }
-	return fs_enum_dir(dirpath, idx - 2, name, is_dir, size, mtime);
+	struct dirent_u de;
+	int r = readdir(dirpath, idx - 2, &de);
+	if (r != 1)
+		return 0;
+	int i = 0; for (; de.name[i] && i < 63; i++) name[i] = de.name[i];
+	name[i] = 0;
+	*is_dir = de.is_dir;
+	*size = de.size;
+	/* readdir carries no mtime; stat the child to recover its owofs stamp. */
+	char child[192];
+	uint32_t n = 0;
+	for (const char *q = dirpath; *q && n + 1 < sizeof child; q++) child[n++] = *q;
+	if (n == 0 || child[n - 1] != '/') child[n++] = '/';
+	for (int j = 0; name[j] && n + 1 < sizeof child; j++) child[n++] = name[j];
+	child[n] = 0;
+	struct statinfo cst;
+	if (stat(child, &cst) == 0)
+		*mtime = cst.mtime;
+	return 1;
 }
 
 /* ------------------------------------------------------------- CREATE */
@@ -495,10 +531,11 @@ static int do_create(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 		smb_to_path(req + noff, nlen, path, sizeof path);
 	else { path[0] = '/'; path[1] = 0; }     /* empty name -> share root */
 
-	int is_dir = 0;
-	uint32_t size = 0, mtime = 0;
-	if (fs_stat(path, &is_dir, &size, &mtime) != 0)
+	struct statinfo st;
+	if (stat(path, &st) != 0)
 		return do_error(s, req, STATUS_OBJECT_NAME_NOTFOUND);
+	int is_dir = st.is_dir;
+	uint32_t size = st.size;
 
 	int idx = handle_alloc(s);
 	if (idx < 0)
@@ -506,7 +543,7 @@ static int do_create(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 	struct smb_handle *h = &s->handles[idx];
 	h->is_dir = is_dir;
 	h->size = is_dir ? 0 : size;
-	h->mtime = mtime;
+	h->mtime = st.mtime;
 	h->enum_pos = 0;
 	int i = 0; for (; i < (int)sizeof h->path - 1 && path[i]; i++) h->path[i] = path[i];
 	h->path[i] = 0;
@@ -616,7 +653,7 @@ static int do_read(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 	if (n > cap) n = cap;
 
 	uint8_t *data = s->tx + SMB2_HDR + 16;
-	int r = fs_read_at(h->path, (uint32_t)off, data, n);
+	int r = readfile_at(h->path, (uint32_t)off, data, n);
 	if (r < 0)
 		return do_error(s, req, STATUS_END_OF_FILE);
 	n = (uint32_t)r;
@@ -727,9 +764,15 @@ static int do_query_info(struct smb_conn *s, const uint8_t *req, uint32_t reqlen
 		default: status = STATUS_NOT_SUPPORTED; break;
 		}
 	} else if (itype == 0x02) {             /* FILESYSTEM info */
-		uint32_t total = 32768;                 /* 16 MiB / 512-byte units */
-		uint32_t used = fs_used_bytes() / 512 + 4;
-		uint32_t avail = total > used ? total - used : 0;
+		/* Real owofs capacity/free, reported in 512-byte allocation units. */
+		struct statfs_info fs;
+		uint64_t total_u = 32768, avail_u = 32764;   /* fallback if statfs fails */
+		if (statfs("/", &fs) == 0) {
+			total_u = fs.total_bytes / 512;
+			avail_u = fs.free_bytes / 512;
+		}
+		uint32_t total = (uint32_t)total_u;
+		uint32_t avail = (uint32_t)avail_u;
 		switch (cls) {
 		case 1:                                 /* FileFsVolumeInformation */
 			put64(out, FAKE_FILETIME); put32(out + 8, 0x4F574F53);
@@ -766,11 +809,12 @@ static int do_query_info(struct smb_conn *s, const uint8_t *req, uint32_t reqlen
 
 /* ------------------------------------------------------------- dispatch */
 
-void smb_serve(tcp_conn_t *c)
+static struct smb_conn conn;                /* one connection at a time */
+
+static void serve(int fd)
 {
-	static struct smb_conn conn;            /* one connection at a time */
 	struct smb_conn *s = &conn;
-	s->c = c;
+	s->fd = fd;
 	s->session_id = 0;
 	s->closed = 0;
 	for (int i = 0; i < SMB_MAX_HANDLES; i++)
@@ -824,4 +868,25 @@ void smb_serve(tcp_conn_t *c)
 		if (rc < 0)
 			return;
 	}
+}
+
+int main(void)
+{
+	int lfd = net_listen(445);
+	if (lfd < 0) {
+		puts("smbd: cannot listen on port 445\n");
+		return 1;
+	}
+	for (;;) {
+		int c = net_accept(lfd);
+		if (c < 0) {
+			if (c == NET_EINTR)
+				break;
+			continue;
+		}
+		serve(c);
+		net_close(c);
+	}
+	net_close(lfd);
+	return 0;
 }

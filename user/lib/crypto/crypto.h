@@ -2,11 +2,20 @@
  * allocation-free). SHA-1 backs the torrent infohash + piece verification;
  * SHA-256/HMAC/HKDF + AES-128-GCM + X25519 back the QUIC/TLS-1.3 client
  * (user/lib/curl/quic.c) — QUIC's key schedule and packet protection need the
- * same primitives the kernel TLS stack uses, but in user space. */
+ * same primitives the kernel TLS stack uses, but in user space. SHA-512 +
+ * TLS-1.2 PRF + Ed25519 (ed25519.h) back user-space TLS 1.2 / an SSH server. */
 #ifndef OWOS_USER_CRYPTO_H
 #define OWOS_USER_CRYPTO_H
 
 #include <stdint.h>
+
+/* ------------------------------------------------------------------ SHA-512 */
+/* One-shot only (all consumers hash whole messages: Ed25519 in ed25519.c).
+ * FIPS 180-4. */
+
+#define SHA512_DIGEST 64
+
+void sha512(const void *data, uint32_t len, uint8_t out[SHA512_DIGEST]);
 
 /* -------------------------------------------------------------------- SHA-1 */
 
@@ -47,6 +56,14 @@ void sha256(const void *data, uint32_t len, uint8_t out[SHA256_DIGEST]);
 void hmac_sha256(const uint8_t *key, uint32_t keylen,
                  const uint8_t *msg, uint32_t msglen,
                  uint8_t out[SHA256_DIGEST]);
+
+/* TLS 1.2 PRF (RFC 5246 §5), instantiated with P_SHA256. Expands
+ * secret+label+seed into `outlen` bytes; label/seed are concatenated as the
+ * PRF seed. Backs the user-space TLS 1.2 fallback. */
+void tls12_prf(const uint8_t *secret, uint32_t secretlen,
+               const char *label,
+               const uint8_t *seed, uint32_t seedlen,
+               uint8_t *out, uint32_t outlen);
 
 /* HKDF-SHA256 (RFC 5869), the TLS 1.3 / QUIC key-derivation core. */
 void hkdf_extract(const uint8_t *salt, uint32_t saltlen,

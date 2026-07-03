@@ -10,6 +10,7 @@
  */
 #include "owos.h"
 #include "mp3.h"
+#include "alac.h"
 #include "media.h"
 
 /* ---- small spinlock (mirrors the user malloc/blk_lock pattern) ------------ */
@@ -23,6 +24,7 @@ static void munlock(void) { __asm__ volatile ("" ::: "memory"); g_lock = 0; }
 /* ---- decoder ------------------------------------------------------------- */
 struct media_decoder {
 	int          is_mp3;
+	int          is_alac;
 	char         path[256];
 	unsigned     size;            /* whole-file bytes                         */
 	unsigned     rate;            /* native sample rate, Hz                   */
@@ -34,6 +36,19 @@ struct media_decoder {
 	unsigned     w_inlen, w_inpos;
 
 	mp3_t        m3;              /* MPEG decoder state                       */
+
+	/* ALAC (.caf) cursor: one packet decoded to native PCM at a time */
+	alac_decoder  *a_dec;
+	alac_config    a_cfg;
+	unsigned      *a_pkt_size;    /* per-packet byte sizes (malloc'd)         */
+	unsigned       a_num_packets;
+	unsigned       a_pkt;         /* next packet index to decode              */
+	unsigned       a_pkt_off;     /* file offset of packet a_pkt              */
+	unsigned       a_data_off;    /* file offset of the first packet          */
+	unsigned       a_bpf;         /* native bytes per interleaved frame       */
+	unsigned char *a_in;          /* one raw packet (malloc'd)                */
+	unsigned char *a_pcm;         /* one decoded packet, native PCM (malloc'd)*/
+	unsigned       a_have, a_pos; /* frames decoded in a_pcm, and the cursor  */
 
 	/* shared decode/resample cursor */
 	short        curL, curR;      /* current (held) source frame              */
@@ -47,12 +62,50 @@ struct media_decoder {
 static unsigned rd_le32(const unsigned char *p)
 { return p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned)p[3] << 24); }
 static unsigned rd_le16(const unsigned char *p) { return p[0] | (p[1] << 8); }
+static unsigned rd_be32(const unsigned char *p)
+{ return ((unsigned)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
+static unsigned long long rd_be64(const unsigned char *p)
+{ return ((unsigned long long)rd_be32(p) << 32) | rd_be32(p + 4); }
+static double rd_bef64(const unsigned char *p)
+{ union { double f; unsigned long long u; } x; x.u = rd_be64(p); return x.f; }
 static int tageq(const unsigned char *p, const char *s)
 { return p[0]==s[0] && p[1]==s[1] && p[2]==s[2] && p[3]==s[3]; }
 
 static void decode_next(media_decoder *d)
 {
 	if (d->eof) { d->curL = d->curR = 0; return; }
+
+	if (d->is_alac) {
+		if (d->a_pos >= d->a_have) {                       /* decode next packet */
+			unsigned ps;
+			uint32_t frames = 0;
+			if (d->a_pkt >= d->a_num_packets) { d->eof = 1; d->curL = d->curR = 0; return; }
+			ps = d->a_pkt_size[d->a_pkt];
+			if (ps == 0 || (int)readfile_at(d->path, d->a_pkt_off, d->a_in, ps) < (int)ps ||
+			    alac_decode(d->a_dec, d->a_in, ps, d->a_pcm, &frames) != ALAC_OK || frames == 0)
+			{ d->eof = 1; d->curL = d->curR = 0; return; }
+			d->a_have = frames; d->a_pos = 0;
+			d->a_pkt++; d->a_pkt_off += ps;
+		}
+		{
+			unsigned ch = d->a_cfg.num_channels, bits = d->a_cfg.bit_depth;
+			int L, R;
+			if (bits == 16) {
+				short *p = (short *)d->a_pcm + (unsigned)d->a_pos * ch;
+				L = p[0]; R = (ch == 2) ? p[1] : L;
+			} else if (bits == 32) {                       /* take top 16 bits */
+				int *p = (int *)d->a_pcm + (unsigned)d->a_pos * ch;
+				L = p[0] >> 16; R = (ch == 2) ? (p[1] >> 16) : L;
+			} else {                                       /* 20/24: 3-byte LE, top 16 bits */
+				unsigned char *s = d->a_pcm + (unsigned)d->a_pos * ch * 3;
+				L = (short)(s[1] | (s[2] << 8));
+				R = (ch == 2) ? (short)(s[4] | (s[5] << 8)) : L;
+			}
+			d->curL = (short)L; d->curR = (short)R;
+		}
+		d->a_pos++; d->pos_frames++;
+		return;
+	}
 
 	if (d->is_mp3) {
 		short f[2];
@@ -134,7 +187,16 @@ void media_seek_ms(media_decoder *d, unsigned ms)
 	if (!d || !d->rate) return;
 	unsigned tgt = (unsigned)((unsigned long long)ms * d->rate / 1000ull);  /* native frame */
 
-	if (d->is_mp3) {
+	if (d->is_alac) {
+		/* seek to a packet boundary (frame_length granularity, like MPEG's coarse seek) */
+		unsigned fl = d->a_cfg.frame_length ? d->a_cfg.frame_length : 4096;
+		unsigned pkt = tgt / fl, i, off = d->a_data_off;
+		if (pkt > d->a_num_packets) pkt = d->a_num_packets;
+		for (i = 0; i < pkt; i++) off += d->a_pkt_size[i];
+		d->a_pkt = pkt; d->a_pkt_off = off;
+		d->a_have = d->a_pos = 0;
+		d->pos_frames = pkt * fl;
+	} else if (d->is_mp3) {
 		unsigned dur = media_duration_ms(d);
 		unsigned off = dur ? (unsigned)((unsigned long long)d->size * ms / dur) : 0;
 		if (off > d->size) off = d->size;
@@ -199,6 +261,103 @@ static int load_mp3(media_decoder *d, unsigned size)
 	return 0;
 }
 
+/* CAF packet-table variable-length integer (base-128, big-endian, 0x80 = more). */
+static unsigned caf_varint(const unsigned char *p, const unsigned char *end, int *used)
+{
+	unsigned v = 0; int n = 0; unsigned char b;
+	do { if (p + n >= end) { *used = 0; return 0; } b = p[n++]; v = (v << 7) | (b & 0x7f); } while (b & 0x80);
+	*used = n; return v;
+}
+
+/* Read a whole file region into a fresh buffer (for the small CAF chunks). */
+static unsigned char *read_range(const char *path, unsigned off, unsigned len)
+{
+	unsigned char *b = malloc(len ? len : 1);
+	unsigned p = 0;
+	if (!b) return 0;
+	while (p < len) {
+		int n = readfile_at(path, off + p, b + p, len - p);
+		if (n <= 0) break;
+		p += (unsigned)n;
+	}
+	if (p != len) { free(b); return 0; }
+	return b;
+}
+
+/* Apple Lossless in a CAF container: walk the chunk list for desc/kuki/pakt/data,
+ * build the packet-size table, and open the codec. Packets are then pulled and
+ * decoded one at a time by decode_next (a long song never sits in memory). */
+static int load_alac(media_decoder *d, unsigned size)
+{
+	unsigned char hdr[8];
+	unsigned pos, valid = 0;
+	int have_desc = 0, have_kuki = 0, have_pakt = 0;
+
+	if (readfile_at(d->path, 0, hdr, 8) < 8 || !tageq(hdr, "caff")) return -1;
+	pos = 8;
+	while (pos + 12 <= size) {
+		unsigned char ch[12];
+		unsigned long long sz;
+		unsigned body;
+		if (readfile_at(d->path, pos, ch, 12) < 12) return -1;
+		sz = rd_be64(ch + 4);
+		body = pos + 12;
+		if (tageq(ch, "desc")) {
+			unsigned char de[32];
+			if (sz < 32 || readfile_at(d->path, body, de, 32) < 32) return -1;
+			if (!tageq(de + 8, "alac")) return -1;
+			d->a_cfg.sample_rate = (unsigned)rd_bef64(de);
+			d->a_cfg.frame_length = rd_be32(de + 20);
+			d->a_cfg.num_channels = rd_be32(de + 24);
+			have_desc = 1;
+		} else if (tageq(ch, "kuki")) {
+			unsigned char *k = read_range(d->path, body, (unsigned)sz);
+			int rc;
+			if (!k) return -1;
+			rc = alac_parse_cookie(k, (unsigned)sz, &d->a_cfg);
+			free(k);
+			if (rc != ALAC_OK) return -1;
+			have_kuki = 1;
+		} else if (tageq(ch, "pakt")) {
+			unsigned char *pk = read_range(d->path, body, (unsigned)sz), *p, *end;
+			unsigned i;
+			if (!pk || sz < 24) { free(pk); return -1; }
+			d->a_num_packets = (unsigned)rd_be64(pk + 0);
+			valid = (unsigned)rd_be64(pk + 8);
+			d->a_pkt_size = malloc((d->a_num_packets ? d->a_num_packets : 1) * sizeof(unsigned));
+			if (!d->a_pkt_size) { free(pk); return -1; }
+			p = pk + 24; end = pk + sz;
+			for (i = 0; i < d->a_num_packets; i++) {
+				int used;
+				d->a_pkt_size[i] = caf_varint(p, end, &used);
+				if (!used) { free(pk); return -1; }
+				p += used;
+			}
+			free(pk);
+			have_pakt = 1;
+		} else if (tageq(ch, "data")) {
+			d->a_data_off = body + 4;        /* skip 4-byte mEditCount */
+		}
+		if (sz == (unsigned long long)-1) break;
+		pos = body + (unsigned)sz;
+	}
+	if (!have_desc || !have_kuki || !have_pakt || !d->a_data_off) return -1;
+	if (d->a_cfg.num_channels < 1 || d->a_cfg.num_channels > 2) return -1;
+
+	d->a_dec = alac_decoder_open(&d->a_cfg);
+	d->a_bpf = alac_bytes_per_frame(&d->a_cfg);
+	d->a_in  = malloc(alac_max_packet_size(&d->a_cfg));
+	d->a_pcm = malloc(d->a_cfg.frame_length * d->a_bpf);
+	if (!d->a_dec || !d->a_in || !d->a_pcm) return -1;
+
+	d->is_alac = 1;
+	d->size = size;
+	d->rate = d->a_cfg.sample_rate;
+	d->total_frames = valid;
+	d->a_pkt = 0; d->a_pkt_off = d->a_data_off; d->a_have = d->a_pos = 0;
+	return 0;
+}
+
 media_decoder *media_open(const char *path)
 {
 	struct statinfo st;
@@ -217,6 +376,8 @@ media_decoder *media_open(const char *path)
 	int rc;
 	if (g >= 12 && tageq(sn, "RIFF") && tageq(sn + 8, "WAVE"))
 		rc = load_wav(d, st.size);
+	else if (g >= 8 && tageq(sn, "caff"))
+		rc = load_alac(d, st.size);
 	else
 		rc = load_mp3(d, st.size);
 	if (rc != 0) { free(d); return 0; }
@@ -235,6 +396,7 @@ void media_close(media_decoder *d)
 {
 	if (!d) return;
 	if (d->is_mp3) mp3_close(&d->m3);
+	if (d->is_alac) { alac_decoder_close(d->a_dec); free(d->a_pkt_size); free(d->a_in); free(d->a_pcm); }
 	free(d);
 }
 

@@ -32,11 +32,11 @@
 #include "nvme.h"
 #include "log.h"
 #include "power.h"
-#include "services.h"
 #include "xhci.h"
 #include "usb.h"
 #include "console.h"
 #include "users.h"
+#include "vmware.h"
 
 /* bounded text builder */
 struct pb { char *p; char *end; };
@@ -128,16 +128,9 @@ static void gen_journal(struct pb *b)
 	b->p += journal_copy(b->p, (int)(b->end - b->p));
 }
 
-/* services and usb only know how to print to the console, so capture that into
- * the /proc buffer. con_capture is global but procfs_read is called
- * synchronously by the reader, so the window is tiny. */
-static void gen_services(struct pb *b)
-{
-	con_capture_begin(b->p, (uint32_t)(b->end - b->p));
-	services_cmd("status");
-	b->p += con_capture_end();
-}
-
+/* usb only knows how to print to the console, so capture that into the /proc
+ * buffer. con_capture is global but procfs_read is called synchronously by the
+ * reader, so the window is tiny. */
 static void gen_usb(struct pb *b)
 {
 	con_capture_begin(b->p, (uint32_t)(b->end - b->p));
@@ -151,7 +144,7 @@ static const char *const entries[] = {
 	"arch",
 	"owofs", "storage", "pci",
 	"journal",
-	"services", "usb",
+	"usb",
 };
 #define NENTRIES ((int)(sizeof entries / sizeof entries[0]))
 
@@ -181,6 +174,7 @@ int procfs_kind(const char *sub)
 {
 	if (sub[0] == '/') sub++;
 	if (!sub[0]) return 1;                 /* /proc itself                      */
+	if (streq(sub, "hostclip")) return 0;  /* hidden VMware-clipboard device node */
 	for (int i = 0; i < NENTRIES; i++)
 		if (streq(sub, entries[i])) return 0;
 	return -1;
@@ -194,6 +188,18 @@ int procfs_read(const char *sub, char *buf, int max)
 	 * int 0x80 gate left IF=0, so enable interrupts or they'd spin forever. */
 	__asm__ volatile ("sti");
 	if (sub[0] == '/') sub++;
+
+	/* /proc/hostclip — the VMware host clipboard as a device channel (not a listed
+	 * file). A read returns the newest host selection text, 0 bytes when nothing is
+	 * new, or -1 off VMware so /bin/vmclipd knows to bow out. The backdoor GET is
+	 * stateful (a success consumes the host's "new selection" flag), so it is meant
+	 * to be polled by vmclipd alone — hence unlisted, to keep `ls /proc` off it. */
+	if (streq(sub, "hostclip")) {
+		if (!vmware_present()) return -1;
+		int n = vmware_clip_recv(buf, max);
+		return n > 0 ? n : 0;
+	}
+
 	struct pb b = { buf, buf + max };
 
 	if      (streq(sub, "cpuinfo"))  gen_cpuinfo(&b);
@@ -206,7 +212,6 @@ int procfs_read(const char *sub, char *buf, int max)
 	else if (streq(sub, "storage"))  gen_storage(&b);
 	else if (streq(sub, "pci"))      gen_pci(&b);
 	else if (streq(sub, "journal"))  gen_journal(&b);
-	else if (streq(sub, "services")) gen_services(&b);
 	else if (streq(sub, "usb"))      gen_usb(&b);
 	else                             return -1;
 
@@ -222,6 +227,11 @@ int procfs_write(const char *sub, const char *buf, int len)
 	__asm__ volatile ("sti");                 /* dhcp/ntp wait on the timer/IRQs   */
 	if (sub[0] == '/') sub++;
 
+	/* /proc/hostclip write pushes guest text up to the VMware host clipboard. Use
+	 * the raw payload (a clip is arbitrary text, may exceed the trimmed arg[]). */
+	if (streq(sub, "hostclip"))
+		return vmware_clip_send(buf, len) < 0 ? -1 : len;
+
 	/* Trim a trailing newline and bound the payload into a NUL-terminated copy. */
 	char arg[256];
 	int n = len;
@@ -230,10 +240,6 @@ int procfs_write(const char *sub, const char *buf, int len)
 	arg[n] = '\0';
 	while (n > 0 && (arg[n - 1] == '\n' || arg[n - 1] == '\r')) arg[--n] = '\0';
 
-	if (streq(sub, "services")) {            /* "start X" / "stop X" / "restart X" */
-		services_cmd(arg);
-		return len;
-	}
 	/* Switch the session: payload is "name" or "name password" (one space). The
 	 * kernel hashes the plaintext and checks it against /etc/passwd, so this is
 	 * the one trusted step user space can't fake. Returns len on success; -1 if

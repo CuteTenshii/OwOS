@@ -320,6 +320,7 @@ static const struct { const char *ext; const char *prog; } assoc[] = {
 	{ "webp", "imgview" },
 	{ "wav", "player" },
 	{ "mp3", "player" },
+	{ "caf", "player" },
 };
 
 /* Case-insensitive compare of `a` against the lowercase literal `b`. */

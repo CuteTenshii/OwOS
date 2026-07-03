@@ -24,6 +24,7 @@
 #define SYS_WIN_CLOSE  20
 #define SYS_RTC        21
 #define SYS_RTC_EPOCH  58
+#define SYS_NET_SET_TTL 59
 #define SYS_READDIR    22
 #define SYS_WIN_TITLE  23
 #define SYS_THREAD     24
@@ -47,8 +48,8 @@
 #define SYS_AUDIO_OPEN 42
 #define SYS_AUDIO_WRITE 43
 #define SYS_AUDIO_CLOSE 44
-#define SYS_INTR       45
-#define SYS_NET_ALPN   46
+/* 45 unused (was SYS_INTR — replaced by signals) */
+/* 46 unused (was SYS_NET_ALPN) — keep in sync with kernel/syscall.c */
 #define SYS_SPAWN_CAP  47
 #define SYS_READ_NB    48
 #define SYS_CHDIR      49
@@ -60,6 +61,36 @@
 #define SYS_GETGID     55
 #define SYS_PORT_OPEN  56
 #define SYS_PORT_ACCEPT 57
+#define SYS_NET_LISTEN   60
+#define SYS_NET_ACCEPT   61
+#define SYS_NET_BIND     62
+#define SYS_NET_RECVFROM 63
+#define SYS_NET_SENDTO   64
+#define SYS_STATFS       65
+#define SYS_NET_RAW_OPEN 66
+#define SYS_IFCONFIG     67
+#define SYS_SETRTC       68
+/* Phase 1 user-space compositor primitives (root-only). Keep in sync with
+ * kernel/syscall.c. */
+#define SYS_FB_INFO          69
+#define SYS_FB_MAP           70
+#define SYS_FB_PRESENT       71
+#define SYS_INPUT_POLL       72
+#define SYS_INPUT_SET_BOUNDS 73
+#define SYS_WIN_ENUM         74
+#define SYS_WIN_MAP          75
+#define SYS_WIN_UNMAP        76
+#define SYS_WIN_SET_GEOM     77
+#define SYS_WIN_DELIVER      78
+#define SYS_WIN_SET_FOCUS    79
+#define SYS_CRASH_POLL       80
+#define SYS_WIN_KEY_SPACE    81
+#define SYS_WAITPID_NB       82
+#define SYS_STACK_ALLOC      84
+#define SYS_STACK_FREE       85
+#define SYS_SIGACTION        86
+#define SYS_SIGPROCMASK      87
+#define SYS_GETPID           89
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -116,6 +147,11 @@ int execp1(const char *name, const char *arg)
 int waitpid(int pid)
 {
 	return syscall(SYS_WAITPID, pid, 0, 0);
+}
+
+int waitpid_nb(int pid, int *status)
+{
+	return syscall(SYS_WAITPID_NB, pid, (int)status, 0);
 }
 
 unsigned uptime(void)
@@ -199,9 +235,58 @@ int net_close(int h)
 	return syscall(SYS_NET_CLOSE, h, 0, 0);
 }
 
-int net_alpn(int h)
+int net_set_ttl(int h, int ttl)
 {
-	return syscall(SYS_NET_ALPN, h, 0, 0);
+	return syscall(SYS_NET_SET_TTL, h, ttl, 0);
+}
+
+int net_raw_open(void)
+{
+	return syscall(SYS_NET_RAW_OPEN, 0, 0, 0);
+}
+
+int ifconfig(const unsigned char ip[4], const unsigned char mask[4],
+             const unsigned char gw[4], const unsigned char dns[4])
+{
+	unsigned char rest[12];   /* {mask, gw, dns} packed for the single ecx ptr */
+	for (int i = 0; i < 4; i++) {
+		rest[i]     = mask[i];
+		rest[4 + i] = gw[i];
+		rest[8 + i] = dns[i];
+	}
+	return syscall(SYS_IFCONFIG, (int)ip, (int)rest, 0);
+}
+
+int setrtc(unsigned secs)
+{
+	return syscall(SYS_SETRTC, (int)secs, 0, 0);
+}
+
+int net_listen(int port)
+{
+	return syscall(SYS_NET_LISTEN, port, 0, 0);
+}
+
+int net_accept(int listen_fd)
+{
+	return syscall(SYS_NET_ACCEPT, listen_fd, 0, 0);
+}
+
+int net_bind(int port)
+{
+	return syscall(SYS_NET_BIND, port, 0, 0);
+}
+
+int net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[4], int *src_port)
+{
+	int a[5] = { fd, (int)buf, max, (int)src_ip, (int)src_port };
+	return syscall(SYS_NET_RECVFROM, (int)a, 0, 0);
+}
+
+int net_sendto(int fd, const unsigned char ip[4], int port, const void *buf, int len)
+{
+	int a[5] = { fd, (int)ip, port, (int)buf, len };
+	return syscall(SYS_NET_SENDTO, (int)a, 0, 0);
 }
 
 int win_create(int w, int h, const char *title)
@@ -244,6 +329,75 @@ int win_cursor(int id, int shape)
 	return syscall(SYS_WIN_CURSOR, id, shape, 0);
 }
 
+/* ---- Phase 1 user-space compositor wrappers (root-only) ---- */
+int fb_info(struct fbinfo *out)
+{
+	return syscall(SYS_FB_INFO, (int)out, 0, 0);
+}
+
+unsigned *fb_map(void)
+{
+	int v = syscall(SYS_FB_MAP, 0, 0, 0);
+	return v == -1 ? (unsigned *)0 : (unsigned *)v;
+}
+
+int fb_present_rect(int x, int y, int w, int h)
+{
+	int a[4] = { x, y, w, h };
+	return syscall(SYS_FB_PRESENT, (int)a, 0, 0);
+}
+
+int input_poll(struct inputstate *out)
+{
+	return syscall(SYS_INPUT_POLL, (int)out, 0, 0);
+}
+
+int input_set_bounds(int w, int h)
+{
+	return syscall(SYS_INPUT_SET_BOUNDS, w, h, 0);
+}
+
+int win_enum(struct winrec *out, int max)
+{
+	return syscall(SYS_WIN_ENUM, (int)out, max, 0);
+}
+
+int win_map(int id, struct winmap *m)
+{
+	return syscall(SYS_WIN_MAP, id, (int)m, 0);
+}
+
+int win_unmap(int id)
+{
+	return syscall(SYS_WIN_UNMAP, id, 0, 0);
+}
+
+int win_set_geom(int id, int x, int y, int w, int h)
+{
+	int g[4] = { x, y, w, h };
+	return syscall(SYS_WIN_SET_GEOM, id, (int)g, 0);
+}
+
+int win_deliver(int id, const struct winevent *ev)
+{
+	return syscall(SYS_WIN_DELIVER, id, (int)ev, 0);
+}
+
+int win_set_focus(int id)
+{
+	return syscall(SYS_WIN_SET_FOCUS, id, 0, 0);
+}
+
+int win_key_space(int id)
+{
+	return syscall(SYS_WIN_KEY_SPACE, id, 0, 0);
+}
+
+int crash_poll(struct crash_rec *out, int max)
+{
+	return syscall(SYS_CRASH_POLL, (int)out, max, 0);
+}
+
 unsigned now_hms(void)
 {
 	return (unsigned)syscall(SYS_RTC, 0, 0, 0);
@@ -267,6 +421,11 @@ int stat(const char *path, struct statinfo *out)
 	return syscall(SYS_STAT, (int)path, (int)out, 0);
 }
 
+int statfs(const char *path, struct statfs_info *out)
+{
+	return syscall(SYS_STATFS, (int)path, (int)out, 0);
+}
+
 int spawn(const char *path, const char *arg)
 {
 	return syscall(SYS_SPAWN, (int)path, (int)arg, 0);
@@ -278,8 +437,9 @@ int spawn(const char *path, const char *arg)
  * stores the read-end fd in *rfd; drain it with read_nb until EOF. */
 int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
 {
-	struct { const char *path; char *const *argv; int argc; int *rfd; int *wfd; } req =
-		{ path, argv, argc, rfd, 0 };
+	struct { const char *path; char *const *argv; int argc; int *rfd; int *wfd;
+	         int uid; int gid; const char *cwd; } req =
+		{ path, argv, argc, rfd, 0, -1, -1, 0 };
 	return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
 }
 
@@ -289,8 +449,24 @@ int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
  * whose input the terminal forwards from its own keystrokes. */
 int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *wfd)
 {
-	struct { const char *path; char *const *argv; int argc; int *rfd; int *wfd; } req =
-		{ path, argv, argc, rfd, wfd };
+	struct { const char *path; char *const *argv; int argc; int *rfd; int *wfd;
+	         int uid; int gid; const char *cwd; } req =
+		{ path, argv, argc, rfd, wfd, -1, -1, 0 };
+	*wfd = -1;
+	return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
+}
+
+/* Like spawn_cap_io, but also sets the child's uid/gid and cwd. uid/gid < 0 or
+ * cwd == 0 mean "inherit" (as spawn_cap_io). Changing uid/gid to something other
+ * than the caller's own is root-only (the kernel rejects it otherwise): the
+ * privileged spawn-as-user primitive /bin/sshd uses to drop to the logged-in
+ * user for a session. */
+int spawn_cap_io_as(const char *path, char *const argv[], int argc,
+                    int uid, int gid, const char *cwd, int *rfd, int *wfd)
+{
+	struct { const char *path; char *const *argv; int argc; int *rfd; int *wfd;
+	         int uid; int gid; const char *cwd; } req =
+		{ path, argv, argc, rfd, wfd, uid, gid, cwd };
 	*wfd = -1;
 	return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
 }
@@ -306,9 +482,9 @@ int chdir(const char *path)
 	return syscall(SYS_CHDIR, (int)path, 0, 0);
 }
 
-int kill(int pid)
+int kill(int pid, int sig)
 {
-	return syscall(SYS_KILL, pid, 0, 0);
+	return syscall(SYS_KILL, pid, sig, 0);
 }
 
 /* action: 0 = shut down, 1 = reboot. Does not return on success. */
@@ -317,10 +493,37 @@ int power(int action)
 	return syscall(SYS_POWER, action, 0, 0);
 }
 
-int intr_take(void)
+int getpid(void) { return syscall(SYS_GETPID, 0, 0, 0); }
+
+/* Signals. sigaction installs a disposition (SIG_DFL/SIG_IGN or a handler); signal
+ * is the simple form. sigprocmask changes the blocked set (set==NULL just queries,
+ * reporting the current mask via *old). raise sends a signal to ourselves. */
+int sigaction(int sig, const struct sigaction *act, struct sigaction *old)
 {
-	return syscall(SYS_INTR, 0, 0, 0);
+	return syscall(SYS_SIGACTION, sig, (int)act, (int)old);
 }
+
+sighandler_t signal(int sig, sighandler_t handler)
+{
+	struct sigaction act, old;
+	act.handler = (unsigned)handler;
+	act.mask = 0;
+	act.flags = 0;
+	if (sigaction(sig, &act, &old) < 0)
+		return SIG_ERR;
+	return (sighandler_t)old.handler;
+}
+
+unsigned sigprocmask(int how, const unsigned *set, unsigned *old)
+{
+	unsigned prev = (unsigned)syscall(SYS_SIGPROCMASK, how, set ? (int)*set : 0,
+	                                  set ? 1 : 0);
+	if (old)
+		*old = prev;
+	return prev;
+}
+
+int raise(int sig) { return kill(getpid(), sig); }
 
 
 int volumes(int idx, struct volinfo *out)
@@ -363,6 +566,20 @@ void msleep(unsigned ms)
 int thread_create(void (*fn)(void), void *stack_top)
 {
 	return syscall(SYS_THREAD, (int)fn, (int)stack_top, 0);
+}
+
+/* Guarded thread stack: the kernel maps `bytes` (rounded to pages) with an
+ * unmapped guard page below, so an overflow faults cleanly instead of scribbling
+ * the heap. Returns the stack top for thread_create(), or 0 (caller falls back to
+ * a malloc'd stack). thread_stack_free releases it. */
+void *thread_stack_alloc(int bytes)
+{
+	int pages = (bytes + 4095) / 4096;
+	return (void *)syscall(SYS_STACK_ALLOC, pages, 0, 0);
+}
+void thread_stack_free(void *top)
+{
+	if (top) syscall(SYS_STACK_FREE, (int)top, 0, 0);
 }
 
 /* ------------------------------------------------------- identity / hostname */

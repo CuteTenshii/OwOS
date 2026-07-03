@@ -35,7 +35,6 @@
 #include "pmm.h"
 #include "power.h"
 #include "sched.h"
-#include "services.h"
 #include "syscall.h"
 #include "serial.h"
 #include "shell.h"
@@ -45,10 +44,10 @@
 #include "timer.h"
 #include "console.h"
 #include "fb.h"
+#include "mouse.h"
 #include "vmsvga.h"
 #include "vmtools.h"
-#include "wm.h"
-#include "apps.h"
+#include "uwin.h"
 #include "screenshot.h"
 #include "xhci.h"
 
@@ -96,6 +95,21 @@ static void spinner(void)
 		__asm__ volatile ("");
 }
 
+/* Load a /bin program and run it as a detached root process (the WM reaps it).
+ * Used to launch PID 1 (/bin/init) at boot. */
+static void spawn_bin_detached(const char *path, char *arg0)
+{
+	int sz = fs_size(path);
+	uint8_t *buf = sz > 0 ? kmalloc((uint32_t)sz) : 0;
+	if (!buf)
+		return;
+	int n = fs_read(path, buf, (uint32_t)sz);
+	char *argv[1] = { arg0 };
+	if (n > 0)
+		exec_program(buf, (uint32_t)n, 1, argv);
+	kfree(buf);
+}
+
 /* Slow post-`sti` device bring-up, run as a background thread so the shell input
  * loop in kernel_main starts immediately. On real hardware DHCP retransmits and
  * xHCI port resets (both timer_sleep-based) take seconds; doing them inline left
@@ -104,8 +118,13 @@ static void spinner(void)
  * thread runs with IF=1, so the "must run after sti" timer_sleep paths are happy. */
 static void boot_bringup(void)
 {
-	/* DHCP is now the autostart "dhcp" service (services.c), so the boot lease
-	 * happens there; this thread only does the slow USB bring-up. */
+	/* Launch PID 1: /bin/init, detached from this post-sti boot thread, as root
+	 * (init inherits uid 0, so the daemons it spawns get the privileges dhcpcd's
+	 * raw socket / sshd's spawn-as-user need). init reads /etc/inittab and brings
+	 * up the user daemons (dhcpcd/mdnsd/sshd) -- the kernel no longer does init's
+	 * job. Non-blocking here (init detaches its own children). */
+	spawn_bin_detached("/bin/init", "init");
+
 	bootmark("xhci");
 	xhci_boot();                   /* USB host up + devices configured.            */
 
@@ -386,16 +405,32 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 			fs_create("/etc/passwd", "root::0:0:/home/root\n", 21);
 		if (fs_read("/etc/group", &probe, 0) < 0)
 			fs_create("/etc/group", "root:0:\n", 8);
+		/* mDNS/DNS-SD advertisements for /bin/mdnsd: one "type port [txt...]" per
+		 * line. Seeds ssh + smb so they're announced on the .local link again;
+		 * install-if-absent so a user's edits persist. */
+		if (fs_read("/etc/mdns.conf", &probe, 0) < 0)
+			fs_create("/etc/mdns.conf", "_ssh._tcp 22\n_smb._tcp 445\n", 26);
+		/* init's service table: one /bin daemon per line (blank/# ignored). PID 1
+		 * (/bin/init) spawns each at boot -- the kernel no longer autostarts any
+		 * daemon itself. The compositor is first so the desktop comes up before the
+		 * network daemons. Install-if-absent so a user's edits persist. */
+		if (fs_read("/etc/inittab", &probe, 0) < 0)
+			fs_create("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\n", 29);
 		users_init();
 		INSTALL_APP(edit);     INSTALL_APP(curl);     INSTALL_APP(editor);
 		INSTALL_APP(about);    INSTALL_APP(clock);    INSTALL_APP(calc);
 		INSTALL_APP(files);
 		INSTALL_APP(browser);  INSTALL_APP(imgview);  INSTALL_APP(term);
+		INSTALL_APP(compositor);   /* the user-space desktop; launched first by init */
 		INSTALL_APP(neofetch); INSTALL_APP(lspci);    INSTALL_APP(ping);
 		INSTALL_APP(dig);      INSTALL_APP(torrent);  INSTALL_APP(player);
-		INSTALL_APP(settings); INSTALL_APP(ssh);      INSTALL_APP(clipd);
+		INSTALL_APP(settings); INSTALL_APP(ssh);      INSTALL_APP(sshd);
+		INSTALL_APP(clipd);      INSTALL_APP(vmclipd);
 		INSTALL_APP(cliphist); INSTALL_APP(notifyd);  INSTALL_APP(webp);
-		INSTALL_APP(json);
+		INSTALL_APP(json);     INSTALL_APP(alac);     INSTALL_APP(smbd);
+		INSTALL_APP(dhcpcd);   INSTALL_APP(ntpd);     INSTALL_APP(mdnsd);
+		INSTALL_APP(init);
+		INSTALL_APP(sigtest);   /* TEMP: signal smoke test — remove after verify */
 		INSTALL_FILE("/bin/notify-send", _binary_app_notifysend);
 	}
 	con_write("usermode: ready ('run curl <url>').\n");
@@ -410,10 +445,11 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	sched_create_thread("spin-b", spinner);
 	con_write("scheduler: 2 worker threads spawned.\n");
 
-	services_init();               /* supervisor thread + auto-start daemons   */
-
-	bootmark("wm_init");
-	wm_init();                     /* graphics desktop + mouse, if fb is up    */
+	/* PS/2 mouse: force the i8042 IRQ/clock bits so the pointer works before the
+	 * user-space compositor comes up. The compositor sets the pointer bounds to
+	 * the screen size via SYS_INPUT_SET_BOUNDS; seed them from the framebuffer. */
+	if (fb_active())
+		mouse_init((int)fb_width() - 1, (int)fb_height() - 1);
 
 	bootmark("screenshot_init");
 	screenshot_init();             /* Print Screen worker (off the WM thread)  */
@@ -433,20 +469,25 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	shell_init();
 
 	for (;;) {
-		if (keyboard_take_interrupt()) {   /* Ctrl+C                           */
-			/* A focused app gets KEY_INTR delivered as a key event so its
-			 * own shell cancels the line / kills the captured child (a real
-			 * Konsole-style Ctrl+C); only the bare text/serial recovery console
-			 * falls through to the kernel shell. */
-			if (wm_focus_takes_keys())
-				wm_feed_key(KEY_INTR, 0);   /* focused app handles it */
-			else
-				shell_interrupt();          /* serial recovery console      */
-		}
 		char c; unsigned char mods;
-		while (keyboard_poll(&c, &mods))   /* PS/2 keyboard (the QEMU window)  */
-			if (!wm_feed_key(c, mods))     /* focused GUI app first, else shell */
+		/* Physical keyboard (the QEMU/HW window). While the user-space compositor
+		 * is alive it owns the keyboard: it drains it via SYS_INPUT_POLL and routes
+		 * keys to the focused window (Ctrl+C reaches the window the same way). The
+		 * kernel must NOT also drain it here, or input would split/race. When no
+		 * compositor is running (not started yet, or it died), the physical
+		 * keyboard falls through to the recovery console — the failsafe that keeps
+		 * the machine usable. The COM1 serial path below is independent of this and
+		 * always drives the shell (it's the debug console + test harness). */
+		if (!uwin_compositor_active()) {
+			if (keyboard_take_interrupt())     /* Ctrl+C -> cancel the shell line */
+				shell_interrupt();
+			while (keyboard_poll(&c, &mods))
 				shell_feed(c);
+		}
+		/* else: the compositor owns the keyboard — it drains both the keys AND the
+		 * Ctrl+C latch itself via SYS_INPUT_POLL (which surfaces the interrupt as a
+		 * KEY_INTR event to the focused window). The kernel must not consume either
+		 * here, or it would race the compositor for them. */
 		while (serial_poll(&c))            /* host terminal (-serial stdio)    */
 			shell_feed(c);                 /* the debug console always drives shell */
 		__asm__ volatile ("hlt");  /* sleep until the next interrupt          */

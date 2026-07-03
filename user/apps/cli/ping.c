@@ -1,15 +1,16 @@
 /* ping.c — an ICMP echo client over a raw ICMP socket.
  *
- * The kernel only lends a raw ICMP transport (net_connect(host, 0, SK_ICMP) +
- * net_send/net_recv): this program builds the echo request (type 8, id, seq,
- * checksum), sends it, and matches the reply's id itself. Ctrl+C is cooperative
- * (net_recv -> NET_EINTR).
+ * The kernel only lends a raw ICMP transport (net_connect(ip, 0, SK_ICMP) +
+ * net_send/net_recv): this program resolves the host in user space (net_dial),
+ * builds the echo request (type 8, id, seq, checksum), sends it, and matches the
+ * reply's id itself. Ctrl+C is cooperative (net_recv -> NET_EINTR).
  *
  *   ping 10.0.2.2        continuous until Ctrl+C
  *   ping -c 4 host       stop after 4
  */
 
 #include "owos.h"
+#include "resolve.h"
 
 /* Internet checksum (RFC 1071): ones-complement sum of 16-bit big-endian words. */
 static unsigned short icmp_csum(const unsigned char *d, int n)
@@ -24,10 +25,18 @@ static unsigned short icmp_csum(const unsigned char *d, int n)
 	return (unsigned short)(~s & 0xFFFF);
 }
 
+/* Ctrl+C arrives as SIGINT (the terminal posts it to us). Catch it so we print
+ * the summary and exit cleanly instead of being terminated by the default action;
+ * a blocking net_recv also returns NET_EINTR when the signal is pending. */
+static volatile int g_interrupted;
+static void on_sigint(int s) { (void)s; g_interrupted = 1; }
+
 int main(int argc, char **argv)
 {
 	int count = 0;                 /* 0 = continuous                          */
 	const char *host = 0;
+
+	signal(SIGINT, on_sigint);
 
 	for (int i = 1; i < argc; i++) {
 		if (streq(argv[i], "-c") && i + 1 < argc) {
@@ -43,7 +52,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	int h = net_connect(host, 0, SK_ICMP);
+	int h = net_dial(host, 0, SK_ICMP);   /* resolve in user space, then connect */
 	if (h < 0) {
 		if (h == -2) { printf("ping: cannot resolve %s\n", host); }
 		else         puts("ping: no network device\n");
@@ -88,7 +97,7 @@ int main(int argc, char **argv)
 		} else {
 			printf("request timeout for icmp_seq=%u\n", (unsigned)seq);
 		}
-		if (intr_take()) { interrupted = 1; break; }
+		if (g_interrupted) { interrupted = 1; break; }
 		if (count == 0 || seq < count)
 			msleep(800);
 	}

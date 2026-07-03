@@ -6,6 +6,7 @@
 #include "gdt.h"
 #include "io.h"
 #include "smp.h"
+#include "sched.h"
 
 /* 8259 PIC ports. Two chips: a master and a slave cascaded onto IRQ2. */
 #define PIC1_CMD   0x20
@@ -87,6 +88,11 @@ void irq_handler(struct registers *r)
 
 	if (irq < 16 && handlers[irq])
 		handlers[irq](r);
+
+	/* If we're headed back to a user context, deliver any signal now — this is how
+	 * a signal reaches a CPU-bound process that makes no syscalls (e.g. SIGKILL a
+	 * spinning task): the next timer tick preempts it and delivers here. */
+	sched_signal_deliver(r);
 }
 
 void irq_init(void)

@@ -10,6 +10,7 @@
 #include "headers.h"   /* libcurl: HTTP response header parsing               */
 #include "brotli.h"    /* RFC 7932 `br` content-coding (whole-buffer decode)   */
 #include "h3.h"        /* HTTP/3 over QUIC (libcurl engine)                    */
+#include "cache.h"     /* the HTTP response cache (RFC 7234, honours headers)  */
 
 /* Content-encoding of a response body. */
 enum { ENC_NONE = 0, ENC_ZLIB = 1, ENC_BR = 2 };
@@ -80,7 +81,7 @@ static int rgetc(void)
 	if (B->abort_load) return -2;            /* Stop / tab-close: bail the read */
 	if (B->rpos >= B->rlen) {
 		if (B->reof) return -1;
-		int n = net_recv(B->sock, B->rbuf, (int)sizeof B->rbuf);
+		int n = nc_read(B->sock, B->rbuf, (int)sizeof B->rbuf);
 		if (n < 0) return -2;
 		if (n == 0) { B->reof = 1; return -1; }
 		B->rpos = 0; B->rlen = n;
@@ -428,6 +429,10 @@ static void parse_link_header(const char *v, const char *base)
  * Document-only: sub-resources are logged from resource.c's own transport. */
 static char     g_doc_hdr[RESP_HDR_MAX];
 static unsigned g_doc_t0;
+/* Conditional-request header lines ("if-none-match"/"if-modified-since") for a
+ * stale cached document, filled by http_txn's cache_lookup and appended by each
+ * transport's request builder. Lowercased, so one string serves h1.1/h2/h3. */
+static char     g_doc_cond[512];
 
 static int parse_response(const char *hdr, const char *host, const char *full_url,
                           char *loc, int loc_cap, int *chunked, int *have_len,
@@ -603,6 +608,7 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 	sapp(xh, &xn, sizeof xh,
 	     "accept: " BR_ACCEPT "\r\naccept-language: " BR_ACCLNG "\r\n"
 	     "accept-encoding: gzip, deflate, br\r\n");
+	if (g_doc_cond[0]) sapp(xh, &xn, sizeof xh, g_doc_cond);   /* revalidation */
 
 	struct h2tx h = { full_url, u->host, loc, loc_cap, 0, 0 };
 	struct h2_opts opts = { BR_UA, xh, h2_headers_cb };
@@ -645,6 +651,7 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc,
 	if (cookie_header(u->host, ck, sizeof ck) > 0) {
 		sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n");
 	}
+	if (g_doc_cond[0]) sapp(xh, &xn, sizeof xh, g_doc_cond);   /* revalidation */
 
 	char hdrbuf[RESP_HDR_MAX]; int hlen = 0;
 	int st = h3_run(u->host, u->port, auth, "GET", u->path, xh,
@@ -658,6 +665,29 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc,
 	return route_body(full_url, status, allow_dl);
 }
 
+/* Apply the HTTP cache to a finished document response (any transport): a
+ * revalidation that came back 304 reuses the stored body (rendered as 200); a
+ * fresh, non-download 200 is stored (already content-decoded, in B->pg->raw).
+ * Returns the status do_fetch should act on. */
+static int doc_cache_finish(const char *full_url, long now, int revalidating, int status)
+{
+	if (revalidating && status == 304) {
+		unsigned char *rb = 0; int rl = 0;
+		if (cache_revalidated(full_url, now, g_doc_hdr, &rb, &rl,
+		                      B->pg->ctype, sizeof B->pg->ctype, 0, 0)) {
+			B->pg->raw_len = 0;
+			if (ensure_raw(rl)) { memcpy(B->pg->raw, rb, (unsigned)rl); B->pg->raw_len = rl; }
+			free(rb);
+			return 200;
+		}
+		return status;   /* entry evicted mid-flight: render the (empty) 304 */
+	}
+	if (status == 200 && !B->dl_saved && B->pg->raw_len > 0)
+		cache_store("GET", full_url, 200, now, g_doc_hdr, B->pg->ctype,
+		            (const unsigned char *)B->pg->raw, B->pg->raw_len);
+	return status;
+}
+
 static int http_txn(const struct purl *u, const char *full_url, char *loc,
                     int loc_cap, int allow_dl)
 {
@@ -669,24 +699,46 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	B->rpos = B->rlen = B->reof = 0;
 	B->pg->raw_len = 0;
 
+	/* HTTP cache (RFC 7234): a fresh copy of this document skips the wire; a stale
+	 * one with a validator revalidates via g_doc_cond and reuses the body on 304.
+	 * The body pipeline stores already-decoded bytes + Content-Type, so a hit
+	 * needs no re-decode. Downloads (route_body empties raw) are never cached. */
+	long now = (long)rtc_epoch();
+	int  revalidating = 0;
+	g_doc_cond[0] = '\0';
+	{
+		unsigned char *cbody = 0; int clen = 0;
+		int cv = cache_lookup("GET", full_url, now, &cbody, &clen,
+		                      B->pg->ctype, sizeof B->pg->ctype,
+		                      g_doc_hdr, sizeof g_doc_hdr, g_doc_cond, sizeof g_doc_cond);
+		if (cv == CACHE_FRESH) {
+			B->pg->raw_len = 0;
+			if (ensure_raw(clen)) { memcpy(B->pg->raw, cbody, (unsigned)clen); B->pg->raw_len = clen; }
+			free(cbody);
+			return 200;
+		}
+		revalidating = (cv == CACHE_REVALIDATE);
+	}
+
 	/* If this https origin previously advertised HTTP/3 (Alt-Svc), try QUIC
 	 * first; on any failure fall through to the TLS h2/h1.1 path below. */
 	if (u->tls && u->port == 443 && h3_known(u->host)) {
 		int st = h3_txn(u, full_url, loc, loc_cap, allow_dl);
-		if (st > 0) return st;
+		if (st > 0) return doc_cache_finish(full_url, now, revalidating, st);
 		loc[0] = '\0'; B->pg->ctype[0] = '\0'; B->dl_name[0] = '\0';
 		B->cdisp_attach = 0; B->pg->raw_len = 0;
 	}
 
-	/* Over TLS, offer ALPN "h2" (SK_TLS_H2); if the server selects it, run the
-	 * request over HTTP/2 instead of the HTTP/1.1 code below. */
-	B->sock = net_connect(u->host, u->port, u->tls ? SK_TLS_H2 : SK_TCP);
-	if (B->sock < 0) return B->sock;
+	/* Over TLS, offer ALPN "h2"; if the server selects it, run the request over
+	 * HTTP/2 instead of the HTTP/1.1 code below. The netconn owns a user-space TLS
+	 * connection (or a plain TCP socket). */
+	B->sock = nc_open(u->host, u->port, u->tls, /*offer_h2=*/1);
+	if (!B->sock) return -3;
 
-	if (u->tls && net_alpn(B->sock) == ALPN_H2) {
+	if (u->tls && nc_alpn(B->sock) == ALPN_H2) {
 		int st = h2_txn(u, full_url, loc, loc_cap, allow_dl);
-		net_close(B->sock);
-		return st;
+		nc_close(B->sock); B->sock = 0;
+		return doc_cache_finish(full_url, now, revalidating, st);
 	}
 
 	char req[2048]; int n = 0;
@@ -709,14 +761,16 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	     "\r\nUser-Agent: " BR_UA "\r\nAccept: " BR_ACCEPT "\r\n"
 	     "Accept-Language: " BR_ACCLNG "\r\n"
 	     "Accept-Encoding: gzip, deflate, br\r\n"
-	     "Connection: close\r\n\r\n");
+	     "Connection: close\r\n");
+	if (g_doc_cond[0]) sapp(req, &n, sizeof req, g_doc_cond);   /* revalidation */
+	sapp(req, &n, sizeof req, "\r\n");
 
-	if (net_send(B->sock, req, n) < 0) { net_close(B->sock); return -4; }
+	if (nc_write(B->sock, req, n) < 0) { nc_close(B->sock); B->sock = 0; return -4; }
 
 	char hdr[RESP_HDR_MAX]; int hlen = 0, match = 0;
 	for (;;) {
 		int ci = rgetc();
-		if (ci < 0) { net_close(B->sock); return -5; }
+		if (ci < 0) { nc_close(B->sock); B->sock = 0; return -5; }
 		char c = (char)ci;
 		if (hlen < (int)sizeof hdr - 1) hdr[hlen++] = c;
 		if      (c == '\r') match = (match == 2) ? 3 : 1;
@@ -740,10 +794,10 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 		if (!ensure_raw(B->pg->raw_len + 1)) break;       /* out of memory: stop */
 		B->pg->raw[B->pg->raw_len++] = (char)c;
 	}
-	net_close(B->sock);
+	nc_close(B->sock); B->sock = 0;
 
 	raw_decode(enc_gz);
-	return route_body(full_url, status, allow_dl);
+	return doc_cache_finish(full_url, now, revalidating, route_body(full_url, status, allow_dl));
 }
 
 /* ----------------------------------------------- local & inline URL schemes */
@@ -1024,6 +1078,12 @@ void do_fetch(void)
 		 * buffer, but the page is already the image, so there's nothing to fetch). */
 		if (B->pg->mode != MODE_IMAGE && !B->abort_load)
 			fetch_favicon(url);
+
+		/* Persist everything this navigation cached (document + stylesheets +
+		 * images + favicon). Deferred to here — the single worker thread, with the
+		 * sub-resource pools already joined — because owofs allows one open write
+		 * stream at a time. */
+		cache_flush();
 		return;
 	}
 }

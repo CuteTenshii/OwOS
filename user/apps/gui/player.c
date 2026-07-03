@@ -1,6 +1,6 @@
 /* player.c — a graphical media player.
  *
- * `player <file.wav|.mp3>` opens a window with a seekable progress bar and
+ * `player <file.wav|.mp3|.caf>` opens a window with a seekable progress bar and
  * Restart / Play-Pause / Stop buttons, and streams the song to the sound device.
  * Launched bare from the Start menu it opens empty (the transport disabled)
  * since OwOS has no file-open dialog yet — the load path is `player <file>` from

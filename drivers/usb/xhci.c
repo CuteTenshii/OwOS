@@ -896,7 +896,7 @@ static int bring_up_net(struct usbdev *d, int port)
 	/* NB: the bulk/interrupt INs are armed in data_loop, NOT here — arming them
 	 * now would post transfer events onto the shared event ring while the boot
 	 * scan is still enumerating other devices, corrupting their command waits. */
-	net_dhcp_start();                    /* lease an IP from the phone/router    */
+	net_dhcp_spawn();                    /* lease an IP from the phone/router    */
 	return 0;
 }
 

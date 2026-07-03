@@ -615,6 +615,10 @@ uint32_t *paging_new_process_dir(void)
 
 void paging_free_process_dir(uint32_t *dir)
 {
+	/* Retire any guarded thread-stack slots this address space owned, so the
+	 * per-CR3 slot table can't later match a stale dir pointer (loader.c). */
+	extern void user_stack_reset_owner(uint32_t *dir);
+	user_stack_reset_owner(dir);
 	/* Free the user window: each present PDE in the window range is a private
 	 * page table; free its pmm-backed frames, then the table itself (pool). */
 	for (uint32_t pdi = USER_PDI_LO; pdi < USER_PDI_HI; pdi++) {

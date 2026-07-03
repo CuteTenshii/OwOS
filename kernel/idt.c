@@ -196,6 +196,7 @@ void isr_handler(struct registers *r)
 {
 	if (r->int_no == 0x80) {       /* system call, not an exception            */
 		syscall_dispatch(r);
+		sched_signal_deliver(r);   /* run any pending signal on the way to ring 3 */
 		return;
 	}
 

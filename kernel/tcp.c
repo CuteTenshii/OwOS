@@ -568,7 +568,7 @@ static void tcp_reap_halfopen(void)
 	}
 }
 
-tcp_conn_t *tcp_accept(uint16_t port, volatile int *stop)
+tcp_conn_t *tcp_accept(uint16_t port)
 {
 	for (;;) {
 		for (int i = 0; i < TCP_MAX_CONNS; i++) {
@@ -584,7 +584,7 @@ tcp_conn_t *tcp_accept(uint16_t port, volatile int *stop)
 			irq_restore(f);
 		}
 		tcp_reap_halfopen();
-		if (stop && *stop)
+		if (sched_intr_pending())      /* a signal wants delivery: bail (EINTR) */
 			return NULL;
 		__asm__ volatile ("sti\n\thlt");  /* never halt with IF clear */
 	}

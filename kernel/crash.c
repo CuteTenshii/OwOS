@@ -1,15 +1,20 @@
-/* crash.c — crash reporter (see crash.h). */
+/* crash.c — crash reporter (see crash.h).
+ *
+ * A user process fault never panics: the IDT handler calls crash_record() in the
+ * faulting task's context (capturing registers + a backtrace and dumping to
+ * COM1), and the process is killed. The user-space compositor drains the pending
+ * reports via SYS_CRASH_POLL (crash_poll) and renders its own "<app> has crashed"
+ * window. */
 #include <stdint.h>
 #include "crash.h"
 #include "creg.h"
 #include "idt.h"
-#include "wm.h"
-#include "fb.h"
 #include "paging.h"
 #include "loader.h"
+#include "serial.h"
 
 #define MAXCRASH    4
-#define CRASH_TRACE 10
+#define CRASH_TRACE CRASH_TRACE_MAX
 
 struct crash_info {
 	int      state;            /* 0 free, 1 pending (needs window), 2 shown   */
@@ -30,6 +35,126 @@ static const char *hex8(uint32_t v, char *out)
 		out[i] = d[(v >> ((7 - i) * 4)) & 0xF];
 	out[8] = '\0';
 	return out;
+}
+
+static const char *vec_name(uint32_t v)
+{
+	return v == 14 ? "page fault" :
+	       v == 13 ? "general protection fault" :
+	       v == 6  ? "invalid opcode" :
+	       v == 0  ? "divide error" :
+	       v == 1  ? "debug" :
+	       v == 3  ? "breakpoint" :
+	       v == 8  ? "double fault" :
+	       v == 12 ? "stack fault" : "exception";
+}
+
+/* Plain-English page-fault cause from the error code + faulting address, so the
+ * window says what happened instead of leaving the reader to decode err bits. */
+static const char *pf_cause(uint32_t vec, uint32_t err, uint32_t cr2, char *buf)
+{
+	int i = 0;
+	const char *parts[4];
+	buf[0] = '\0';
+	if (vec != 14)
+		return buf;
+	parts[0] = (err & 4)  ? "user-mode "     : "kernel ";
+	parts[1] = (err & 16) ? "instruction fetch from " :
+	           (err & 2)  ? "write to "      : "read of ";
+	parts[2] = (err & 1)  ? "a protected page" : "unmapped memory";
+	parts[3] = cr2 < 0x1000 ? " (NULL dereference)" :
+	           (cr2 >= USER_BASE && cr2 < USER_REGION_END)
+	               ? " (bad heap/stack pointer — likely corruption or use-after-free)"
+	               : "";
+	for (int p = 0; p < 4; p++)
+		for (const char *s = parts[p]; *s && i < 126; s++)
+			buf[i++] = *s;
+	buf[i] = '\0';
+	return buf;
+}
+
+/* Combined per-app function-symbol table (built by user/apps/build.mk): text,
+ * sections ">app\n" then "<hexaddr> name\n" lines sorted by address. */
+extern const char _binary_appsyms_start[], _binary_appsyms_end[];
+
+/* Resolve `addr` to "func+0xNN" within `app`'s symbol section (largest symbol
+ * address <= addr). Returns 1 and fills out on success, 0 if unknown. */
+static int crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
+{
+	const char *p = _binary_appsyms_start, *end = _binary_appsyms_end;
+	int in = 0;
+	uint32_t best = 0; const char *bn = 0; int bl = 0;
+	out[0] = '\0';
+	if (!app || !app[0]) return 0;
+	while (p < end) {
+		if (*p == '>') {                          /* section header ">app" */
+			const char *s = ++p; while (p < end && *p != '\n') p++;
+			int L = (int)(p - s), i = 0;
+			while (i < L && app[i] && app[i] == s[i]) i++;
+			int match = (i == L && !app[i]);
+			if (in && !match) break;              /* left our section */
+			in = match;
+		} else if (in) {                          /* "<hexaddr> name" */
+			uint32_t a = 0;
+			while (p < end && *p != ' ' && *p != '\n') {
+				int c = *p, d = (c>='0'&&c<='9')?c-'0':(c>='a'&&c<='f')?c-'a'+10:
+				                (c>='A'&&c<='F')?c-'A'+10:-1;
+				if (d < 0) break;
+				a = a * 16 + (uint32_t)d; p++;
+			}
+			if (p < end && *p == ' ') {
+				const char *ns = ++p; while (p < end && *p != '\n') p++;
+				if (a <= addr && a >= best) { best = a; bn = ns; bl = (int)(p - ns); }
+			}
+		}
+		while (p < end && *p != '\n') p++;         /* to end of line */
+		if (p < end) p++;
+	}
+	if (!bn) return 0;
+	int o = 0;
+	for (int i = 0; i < bl && o < cap - 12; i++) out[o++] = bn[i];
+	uint32_t off = addr - best;
+	out[o++] = '+'; out[o++] = '0'; out[o++] = 'x';
+	{ static const char hd[] = "0123456789abcdef"; int st = 0;
+	  for (int sh = 28; sh >= 0; sh -= 4) { int nb = (off >> sh) & 0xF; if (nb || st || sh == 0) { out[o++] = hd[nb]; st = 1; } } }
+	out[o] = '\0';
+	return 1;
+}
+
+/* Emit the full report to COM1 as text — capturable in logs and addr2line-able,
+ * unlike squinting at the on-screen window. serial_* is heapless/lockless, so
+ * it's safe from the faulting task's context. */
+static void crash_dump_serial(const struct crash_info *c)
+{
+	char hx[12], cb[128];
+	serial_write("\n=== CRASH: ");
+	serial_write(c->name[0] ? c->name : "?");
+	serial_write(" — ");
+	serial_write(vec_name(c->vector));
+	serial_write(" ===\n");
+	if (c->vector == 14) {
+		serial_write("cause: "); serial_write(pf_cause(c->vector, c->err, c->cr2, cb)); serial_write("\n");
+	}
+	serial_write("eip="); serial_write(hex8(c->eip, hx));
+	if (c->vector == 14) { serial_write(" cr2="); serial_write(hex8(c->cr2, hx)); }
+	serial_write(" err="); serial_write(hex8(c->err, hx)); serial_write("\n");
+	serial_write("eax="); serial_write(hex8(c->eax, hx));
+	serial_write(" ebx="); serial_write(hex8(c->ebx, hx));
+	serial_write(" ecx="); serial_write(hex8(c->ecx, hx));
+	serial_write(" edx="); serial_write(hex8(c->edx, hx)); serial_write("\n");
+	serial_write("esi="); serial_write(hex8(c->esi, hx));
+	serial_write(" edi="); serial_write(hex8(c->edi, hx));
+	serial_write(" ebp="); serial_write(hex8(c->ebp, hx));
+	serial_write(" esp="); serial_write(hex8(c->esp, hx)); serial_write("\n");
+	serial_write("trace (addr2line -e user/apps/gui/");
+	serial_write(c->name[0] ? c->name : "app");
+	serial_write(".elf):\n");
+	for (int i = 0; i < c->ntrace; i++) {
+		char sym[96];
+		serial_write("  "); serial_write(hex8(c->trace[i], hx));
+		if (crash_symbolize(c->name, c->trace[i], sym, sizeof sym)) { serial_write("  "); serial_write(sym); }
+		serial_write(i == 0 ? "  <- fault\n" : "\n");
+	}
 }
 
 void crash_record(const char *name, struct registers *r)
@@ -71,83 +196,29 @@ void crash_record(const char *name, struct registers *r)
 		bp = nbp;
 	}
 	c->state = 1;
+	crash_dump_serial(c);             /* text report to COM1 for capture       */
 }
 
-/* ------------------------------------------------------------- the window */
 
-static void crash_draw(struct window *w, int cx, int cy, int cw, int ch,
-                       int focused)
+/* SYS_CRASH_POLL: hand pending reports to the user-space compositor, which
+ * renders its own crash windows. Consumes each report (state 1 -> free). */
+int crash_poll(struct crash_rec *out, int max)
 {
-	(void)focused; (void)cw; (void)ch;
-	struct crash_info *c = w->state;
-	if (!c) return;
-	uint32_t bg = 0x1a1020;
-	fb_fill_rect(cx, cy, cw, ch, bg);
-
-	char hx[12];
-	int x = cx + 10, y = cy + 8, lh = 16;
-
-	char title[48];
-	int t = 0;
-	for (; c->name[t] && t < 23; t++) title[t] = c->name[t];
-	const char *suf = " has crashed.";
-	for (int k = 0; suf[k] && t < 47; k++) title[t++] = suf[k];
-	title[t] = '\0';
-	fb_text(x, y, title, 0xff8080, bg); y += lh * 2;
-
-	fb_text(x, y, "fault: ", 0x9098a0, bg);
-	fb_text(x + 7 * 8, y, c->vector == 14 ? "page fault" :
-	        c->vector == 13 ? "general protection" :
-	        c->vector == 6  ? "invalid opcode" :
-	        c->vector == 0  ? "divide error" : "exception", 0xe0e6ee, bg);
-	y += lh;
-
-	fb_text(x, y, "eip=", 0x9098a0, bg);  fb_text(x + 4 * 8, y, hex8(c->eip, hx), 0x66ddff, bg);
-	if (c->vector == 14) {
-		fb_text(x + 16 * 8, y, "cr2=", 0x9098a0, bg);
-		fb_text(x + 20 * 8, y, hex8(c->cr2, hx), 0xffe08a, bg);
-	}
-	y += lh;
-	fb_text(x, y, "err=", 0x9098a0, bg);  fb_text(x + 4 * 8, y, hex8(c->err, hx), 0xc8d0dc, bg);
-	y += lh + 6;
-
-	fb_text(x, y, "eax", 0x707880, bg); fb_text(x + 4 * 8, y, hex8(c->eax, hx), 0xc8d0dc, bg);
-	fb_text(x + 14 * 8, y, "ebx", 0x707880, bg); fb_text(x + 18 * 8, y, hex8(c->ebx, hx), 0xc8d0dc, bg);
-	y += lh;
-	fb_text(x, y, "ecx", 0x707880, bg); fb_text(x + 4 * 8, y, hex8(c->ecx, hx), 0xc8d0dc, bg);
-	fb_text(x + 14 * 8, y, "edx", 0x707880, bg); fb_text(x + 18 * 8, y, hex8(c->edx, hx), 0xc8d0dc, bg);
-	y += lh;
-	fb_text(x, y, "esp", 0x707880, bg); fb_text(x + 4 * 8, y, hex8(c->esp, hx), 0xc8d0dc, bg);
-	fb_text(x + 14 * 8, y, "ebp", 0x707880, bg); fb_text(x + 18 * 8, y, hex8(c->ebp, hx), 0xc8d0dc, bg);
-	y += lh + 6;
-
-	fb_text(x, y, "stack trace:", 0x9098a0, bg); y += lh;
-	for (int i = 0; i < c->ntrace; i++) {
-		fb_text(x + 12, y, hex8(c->trace[i], hx), 0xb0c0d0, bg);
-		if (i == 0) fb_text(x + 12 + 9 * 8, y, "<- fault", 0x707880, bg);
-		y += lh;
-	}
-}
-
-static void crash_close(struct window *w)
-{
-	struct crash_info *c = w->state;
-	if (c) c->state = 0;              /* free the slot */
-	wm_destroy_window(w);
-}
-
-void crash_pump(void)
-{
-	for (int i = 0; i < MAXCRASH; i++) {
+	int n = 0;
+	for (int i = 0; i < MAXCRASH && n < max; i++) {
 		if (reports[i].state != 1)
 			continue;
-		struct window *win = wm_create_window(140 + i * 22, 120 + i * 22,
-		                                      420, 300, "crash", 1);
-		if (!win)
-			return;                  /* no slot now; try again next frame     */
-		reports[i].state = 2;
-		win->draw = crash_draw;
-		win->on_close = crash_close;
-		win->state = &reports[i];
+		const struct crash_info *c = &reports[i];
+		struct crash_rec *o = &out[n++];
+		for (int k = 0; k < (int)sizeof o->name; k++)
+			o->name[k] = c->name[k];
+		o->vector = c->vector; o->err = c->err; o->eip = c->eip; o->cr2 = c->cr2;
+		o->eax = c->eax; o->ebx = c->ebx; o->ecx = c->ecx; o->edx = c->edx;
+		o->esi = c->esi; o->edi = c->edi; o->ebp = c->ebp; o->esp = c->esp;
+		o->ntrace = c->ntrace;
+		for (int k = 0; k < CRASH_TRACE_MAX; k++)
+			o->trace[k] = c->trace[k];
+		reports[i].state = 0;            /* consumed */
 	}
+	return n;
 }

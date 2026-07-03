@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include "file.h"
+#include "signal.h"
 
 struct registers;
 
@@ -40,9 +41,18 @@ int  sched_fork(struct registers *r);
 void sched_exit(int status);          /* terminate current task; never returns  */
 void sched_kill(int pid);             /* terminate another task by pid          */
 int  sched_kill_child(int pid);       /* terminate a child of the caller; 0/-1  */
-void sched_set_intr(int pid);         /* raise the cooperative-interrupt latch  */
-int  sched_intr_pending(void);        /* peek the caller's latch (blocking waits) */
-int  sched_intr_take(void);           /* read + clear the caller's latch         */
+
+/* Signals (see signal.h + sched.c). sched_signal_send is the kill(2) primitive;
+ * sigaction/sigprocmask act on the caller; deliver/sigreturn are the ring-3
+ * boundary hooks (isr/irq tail + the SYS_SIGRETURN trampoline). sched_intr_pending
+ * is the EINTR query for blocking kernel waits — true when a deliverable signal is
+ * pending on the caller. */
+int  sched_signal_send(int pid, int sig);
+int  sched_sigaction(int sig, const struct k_sigaction *act, struct k_sigaction *old);
+uint32_t sched_sigprocmask(int how, uint32_t set, int have_set);
+void sched_signal_deliver(struct registers *r);
+int  sched_sigreturn(struct registers *r);
+int  sched_intr_pending(void);        /* a signal wants delivery (blocking waits) */
 int  sched_waitpid(int pid);          /* block for a child; returns its status  */
 int  sched_try_reap(int pid, int *status);   /* non-blocking reap (kernel side) */
 void sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp,

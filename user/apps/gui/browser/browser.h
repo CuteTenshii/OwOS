@@ -23,6 +23,7 @@
 #include "upng.h"
 #include "url.h"     /* struct purl, parse_url, resolve_url (shared with curl) */
 #include "h2.h"      /* HTTP/2 engine: h2_run + struct h2_opts (TLS+ALPN path) */
+#include "netconn.h" /* TCP-or-TLS transport wrapper (h2/h1.1 over user-space TLS) */
 #include "dom.h"     /* DOM tree + the shared lower/starts_ci/streq_ci helpers  */
 #include "csp.h"     /* Content-Security-Policy engine (per-page enforcement)   */
 
@@ -260,6 +261,10 @@ struct browser {
 	volatile int drop_dom;           /* main asks the worker to free the live page  */
 	volatile int recascade;          /* main asks the worker to re-run the cascade
 	                                  * (window resized → @media may change)        */
+	volatile int want_paw;           /* main -> worker: current content-pane pixel
+	                                  * width. The worker owns the line-table flow
+	                                  * (rewrap); the main thread only paints, so it
+	                                  * never blocks the event loop on a big reflow.  */
 	volatile int events_live;        /* worker -> main: page has listeners, so the
 	                                  * main thread should route clicks as events   */
 	volatile int focus_kind;         /* worker -> main: 0 none, 1 text input,
@@ -284,7 +289,7 @@ struct browser {
 	struct hsts_host *hsts;          /* head of the HSTS host list (no cap)    */
 	struct css_link *ext_css;        /* stylesheet URLs from the Link: header   */
 
-	int           sock;
+	netconn      *sock;              /* the page fetch transport (TCP or user-space TLS) */
 	unsigned char rbuf[2048];
 	int           rpos, rlen, reof;
 };

@@ -37,7 +37,6 @@
 #include "edid.h"
 #include "smbios.h"
 #include "hda.h"
-#include "wm.h"
 
 /* The single NIC's sysfs name (we keep one card; nic.c is driver-agnostic). */
 #define NET_IFACE "eth0"
@@ -431,7 +430,9 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
 	}
 	if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") &&
 	    eq(seg[2], "fb0") && eq(seg[3], "mode")) {
-		/* "WxH": validate the shape here, hand the switch to the compositor. */
+		/* "WxH": reprogram the adapter directly (only DISPI is switchable, gated by
+		 * fb_can_set_mode). The compositor re-queries fb_info each frame and rebinds
+		 * its surface on a change, so a live resolution switch takes effect at once. */
 		int w = 0, h = 0;
 		const char *p = arg;
 		while (*p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
@@ -439,8 +440,7 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
 		p++;
 		while (*p >= '0' && *p <= '9') h = h * 10 + (*p++ - '0');
 		if (w <= 0 || h <= 0 || !fb_can_set_mode()) return -1;
-		wm_request_mode(w, h);
-		return 0;
+		return fb_set_mode((uint32_t)w, (uint32_t)h);
 	}
 	return -1;
 }
