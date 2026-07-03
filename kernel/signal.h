@@ -68,6 +68,6 @@ struct k_sigaction {
  * interrupted context. Baked into the trampoline machine code, so it lives here
  * (shared by sched.c's frame builder and syscall.c's dispatch). MUST match the
  * SYS_SIGRETURN slot in kernel/syscall.c. User code never calls it directly. */
-#define SYS_SIGRETURN 88
+#define SYS_SIGRETURN 85
 
 #endif /* OWOS_SIGNAL_H */

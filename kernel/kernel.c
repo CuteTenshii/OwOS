@@ -430,7 +430,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		INSTALL_APP(json);     INSTALL_APP(alac);     INSTALL_APP(smbd);
 		INSTALL_APP(dhcpcd);   INSTALL_APP(ntpd);     INSTALL_APP(mdnsd);
 		INSTALL_APP(init);
-		INSTALL_APP(sigtest);   /* TEMP: signal smoke test — remove after verify */
 		INSTALL_FILE("/bin/notify-send", _binary_app_notifysend);
 	}
 	con_write("usermode: ready ('run curl <url>').\n");

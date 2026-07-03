@@ -48,7 +48,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/notifyd_blob.o kernel/notifysend_blob.o \
         kernel/webp_blob.o kernel/json_blob.o kernel/alac_blob.o kernel/smbd_blob.o \
         kernel/dhcpcd_blob.o kernel/ntpd_blob.o kernel/mdnsd_blob.o \
-        kernel/init_blob.o kernel/sigtest_blob.o \
+        kernel/init_blob.o \
         kernel/uifont_blob.o kernel/monofont_blob.o kernel/appsyms.o
 
 $(KERNEL): $(OBJS) $(LINKER)

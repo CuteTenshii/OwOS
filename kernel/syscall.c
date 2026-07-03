@@ -68,8 +68,8 @@
 #define SYS_WIN_WAIT   19 /* win_wait(id=ebx) -> 0 (sleep ~a frame for events)  */
 #define SYS_WIN_CLOSE  20 /* win_close(id=ebx) -> 0/-1                          */
 #define SYS_RTC        21 /* rtc() -> packed (hour<<16)|(min<<8)|sec            */
-#define SYS_RTC_EPOCH  58 /* rtc_epoch() -> Unix epoch seconds (UTC)            */
-#define SYS_NET_SET_TTL 59 /* net_set_ttl(h=ebx, ttl=ecx) -> 0/-1. Outgoing IP  */
+#define SYS_RTC_EPOCH  56 /* rtc_epoch() -> Unix epoch seconds (UTC)            */
+#define SYS_NET_SET_TTL 57 /* net_set_ttl(h=ebx, ttl=ecx) -> 0/-1. Outgoing IP  */
                            /* TTL for a UDP socket (IP_MULTICAST_TTL analog).   */
 #define SYS_READDIR    22 /* readdir(path=ebx, idx=ecx, out=edx) -> 1/0/-1      */
 #define SYS_WIN_TITLE  23 /* win_settitle(id=ebx, str=ecx) -> 0/-1              */
@@ -98,78 +98,78 @@
  * a caught SIGINT / default terminate, see SYS_SIGACTION below). */
 /* 46 unused (was SYS_NET_ALPN; TLS + ALPN moved to user space) — do not reuse
  * without bumping every consumer, the numbers stay in sync with user/lib/lib.c */
-#define SYS_SPAWN_CAP  47 /* spawn_cap(req=ebx) -> pid/-1. Packed request (see the
+#define SYS_SPAWN_CAP  45 /* spawn_cap(req=ebx) -> pid/-1. Packed request (see the
                            * cap_req struct) spawns a /bin child with its stdout (and
                            * optionally stdin) wired to fresh pipe(s); optional uid/gid/
                            * cwd set the child's identity/dir (uid/gid change is root-only). */
-#define SYS_READ_NB    48 /* read_nb(fd=ebx, buf=ecx, len=edx) -> >0 bytes / 0 would-block
+#define SYS_READ_NB    46 /* read_nb(fd=ebx, buf=ecx, len=edx) -> >0 bytes / 0 would-block
                            * / -1 EOF or error. Non-blocking sibling of SYS_READ, so a GUI
                            * program can poll a pipe and still service window events. */
-#define SYS_CHDIR      49 /* chdir(path=ebx) -> 0/-1: set the caller's own kernel cwd, so
+#define SYS_CHDIR      47 /* chdir(path=ebx) -> 0/-1: set the caller's own kernel cwd, so
                            * children it spawns resolve relative paths from there. */
-#define SYS_KILL       50 /* kill(pid=ebx, sig=ecx) -> 0/-1: post a signal to a task
+#define SYS_KILL       48 /* kill(pid=ebx, sig=ecx) -> 0/-1: post a signal to a task
                            * (root, self, or a child of the caller). sig 0 probes. */
-#define SYS_POWER      51 /* power(action=ebx): 0 = shut down (ACPI S5), 1 = reboot. Does not
+#define SYS_POWER      49 /* power(action=ebx): 0 = shut down (ACPI S5), 1 = reboot. Does not
                            * return on success. A real action, so a syscall -- not a /proc file. */
-#define SYS_SBRK       52 /* sbrk(inc=ebx) -> previous break / (uint32_t)-1: grow or shrink the
+#define SYS_SBRK       50 /* sbrk(inc=ebx) -> previous break / (uint32_t)-1: grow or shrink the
                            * caller's heap by `inc` bytes. The user-space malloc primitive. */
-#define SYS_NET_RECV_NB 53 /* net_recv_nb(h=ebx, buf=ecx, max=edx) -> >0 bytes / 0 would-block /
+#define SYS_NET_RECV_NB 51 /* net_recv_nb(h=ebx, buf=ecx, max=edx) -> >0 bytes / 0 would-block /
                             * -1 EOF|err / -4 intr. Non-blocking recv for interactive clients
                             * (ssh) that multiplex the socket with stdin. */
-#define SYS_GETUID     54 /* getuid() -> the calling task's user id (per-process credentials, */
-#define SYS_GETGID     55 /* getgid() -> its group id; user space resolves the name/home from */
+#define SYS_GETUID     52 /* getuid() -> the calling task's user id (per-process credentials, */
+#define SYS_GETGID     53 /* getgid() -> its group id; user space resolves the name/home from */
                           /* /etc/passwd itself, so there's no /proc identity file.           */
-#define SYS_PORT_OPEN  56 /* port_open(name=ebx, as_server=ecx) -> fd/-1. A named local-IPC   */
+#define SYS_PORT_OPEN  54 /* port_open(name=ebx, as_server=ecx) -> fd/-1. A named local-IPC   */
                           /* port: server registers + accept()s, client connects (ipc.c).    */
-#define SYS_PORT_ACCEPT 57 /* port_accept(listen_fd=ebx) -> channel fd/-1 (blocks for a conn) */
+#define SYS_PORT_ACCEPT 55 /* port_accept(listen_fd=ebx) -> channel fd/-1 (blocks for a conn) */
 
 /* Server sockets (Stage 3): the passive/bound side of the net_sock_* handle
  * table. LISTEN/ACCEPT are TCP; BIND/RECVFROM/SENDTO are UDP. RECVFROM/SENDTO
  * pass their extra args via a small struct pointer (ebx) since the ABI has only
  * 3 registers. */
-#define SYS_NET_LISTEN   60 /* net_listen(port=ebx) -> listener fd/-1              */
-#define SYS_NET_ACCEPT   61 /* net_accept(listen_fd=ebx) -> conn fd/-1/-4 (blocks) */
-#define SYS_NET_BIND     62 /* net_bind(port=ebx) -> bound UDP fd/-1               */
-#define SYS_NET_RECVFROM 63 /* net_recvfrom(ebx -> {fd,buf,max,ip,port}) -> bytes/0/-1/-4 */
-#define SYS_NET_SENDTO   64 /* net_sendto(ebx -> {fd,ip,port,buf,len}) -> len/-1   */
-#define SYS_STATFS       65 /* statfs(path=ebx, out=ecx -> {u64 total,u64 free}) -> 0/-1 */
-#define SYS_NET_RAW_OPEN 66 /* net_raw_open() -> raw-Ethernet fd/-1 (root-only, AF_PACKET) */
-#define SYS_IFCONFIG     67 /* ifconfig(ip=ebx, ecx -> {mask,gw,dns} 3x u8[4]) -> 0/-1 (root) */
-#define SYS_SETRTC       68 /* setrtc(unix_secs=ebx) -> 0/-1. Set the wall clock; root-only */
+#define SYS_NET_LISTEN   58 /* net_listen(port=ebx) -> listener fd/-1              */
+#define SYS_NET_ACCEPT   59 /* net_accept(listen_fd=ebx) -> conn fd/-1/-4 (blocks) */
+#define SYS_NET_BIND     60 /* net_bind(port=ebx) -> bound UDP fd/-1               */
+#define SYS_NET_RECVFROM 61 /* net_recvfrom(ebx -> {fd,buf,max,ip,port}) -> bytes/0/-1/-4 */
+#define SYS_NET_SENDTO   62 /* net_sendto(ebx -> {fd,ip,port,buf,len}) -> len/-1   */
+#define SYS_STATFS       63 /* statfs(path=ebx, out=ecx -> {u64 total,u64 free}) -> 0/-1 */
+#define SYS_NET_RAW_OPEN 64 /* net_raw_open() -> raw-Ethernet fd/-1 (root-only, AF_PACKET) */
+#define SYS_IFCONFIG     65 /* ifconfig(ip=ebx, ecx -> {mask,gw,dns} 3x u8[4]) -> 0/-1 (root) */
+#define SYS_SETRTC       66 /* setrtc(unix_secs=ebx) -> 0/-1. Set the wall clock; root-only */
 
 /* Phase 1 of the user-space compositor: additive primitives a /bin/compositor
  * needs. All root-only (uid 0), like SYS_IFCONFIG — the compositor runs as root.
  * Unconsumed until the compositor exists; the in-kernel WM still drives the
  * display. */
-#define SYS_FB_INFO         69 /* fb_info(out=ebx -> struct fbinfo) -> 0/-1 (root)   */
-#define SYS_FB_MAP          70 /* fb_map() -> COMPOSITOR_FB_VADDR / (uint)-1 (root): maps
+#define SYS_FB_INFO         67 /* fb_info(out=ebx -> struct fbinfo) -> 0/-1 (root)   */
+#define SYS_FB_MAP          68 /* fb_map() -> COMPOSITOR_FB_VADDR / (uint)-1 (root): maps
                                 * the shared cached-RAM BACK buffer into the caller.  */
-#define SYS_FB_PRESENT      71 /* fb_present(ebx -> {x,y,w,h}) -> 0/-1 (root): flush a
+#define SYS_FB_PRESENT      69 /* fb_present(ebx -> {x,y,w,h}) -> 0/-1 (root): flush a
                                 * back-buffer rect to VRAM (damage-rect present).      */
-#define SYS_INPUT_POLL      72 /* input_poll(out=ebx -> struct inputstate) -> 0/-1 (root):
+#define SYS_INPUT_POLL      70 /* input_poll(out=ebx -> struct inputstate) -> 0/-1 (root):
                                 * pointer state + drained key events, non-blocking.    */
-#define SYS_INPUT_SET_BOUNDS 73 /* input_set_bounds(w=ebx, h=ecx) -> 0/-1 (root)      */
-#define SYS_WIN_ENUM        74 /* win_enum(ebx -> winrec[], ecx=max) -> count/-1 (root) */
-#define SYS_WIN_MAP         75 /* win_map(id=ebx, out=ecx -> struct winmap) -> 0/-1 (root):
+#define SYS_INPUT_SET_BOUNDS 71 /* input_set_bounds(w=ebx, h=ecx) -> 0/-1 (root)      */
+#define SYS_WIN_ENUM        72 /* win_enum(ebx -> winrec[], ecx=max) -> count/-1 (root) */
+#define SYS_WIN_MAP         73 /* win_map(id=ebx, out=ecx -> struct winmap) -> 0/-1 (root):
                                 * maps window id's buffer at WIN_MAP_BASE+id*slot.      */
-#define SYS_WIN_UNMAP       76 /* win_unmap(id=ebx) -> 0/-1 (root): drop the map+pin   */
-#define SYS_WIN_SET_GEOM    77 /* win_set_geom(id=ebx, ecx -> {x,y,w,h}) -> 0/-1 (root) */
-#define SYS_WIN_DELIVER     78 /* win_deliver(id=ebx, ev=ecx -> struct winevent) -> 0/-1 (root) */
-#define SYS_WIN_SET_FOCUS   79 /* win_set_focus(id=ebx) -> 0/-1 (root; id<=0 = none)   */
-#define SYS_WIN_KEY_SPACE   81 /* win_key_space(id=ebx) -> free slots in a window's event
+#define SYS_WIN_UNMAP       74 /* win_unmap(id=ebx) -> 0/-1 (root): drop the map+pin   */
+#define SYS_WIN_SET_GEOM    75 /* win_set_geom(id=ebx, ecx -> {x,y,w,h}) -> 0/-1 (root) */
+#define SYS_WIN_DELIVER     76 /* win_deliver(id=ebx, ev=ecx -> struct winevent) -> 0/-1 (root) */
+#define SYS_WIN_SET_FOCUS   77 /* win_set_focus(id=ebx) -> 0/-1 (root; id<=0 = none)   */
+#define SYS_WIN_KEY_SPACE   79 /* win_key_space(id=ebx) -> free slots in a window's event
                                 * ring (huge if not queued): paste flow control, root-only */
-#define SYS_WAITPID_NB      82 /* waitpid_nb(pid=ebx, status_out=ecx) -> 1 reaped / 0 none:
+#define SYS_WAITPID_NB      80 /* waitpid_nb(pid=ebx, status_out=ecx) -> 1 reaped / 0 none:
                                 * non-blocking reap (the compositor reaps its detached apps) */
-#define SYS_STACK_ALLOC     84 /* stack_alloc(pages=ebx) -> guarded thread-stack top / 0    */
-#define SYS_STACK_FREE      85 /* stack_free(top=ebx) -> 0: release a guarded thread stack   */
-#define SYS_CRASH_POLL      80 /* crash_poll(out=ebx -> crash_rec[], ecx=max) -> count/-1
+#define SYS_STACK_ALLOC     81 /* stack_alloc(pages=ebx) -> guarded thread-stack top / 0    */
+#define SYS_STACK_FREE      82 /* stack_free(top=ebx) -> 0: release a guarded thread stack   */
+#define SYS_CRASH_POLL      78 /* crash_poll(out=ebx -> crash_rec[], ecx=max) -> count/-1
                                 * (root): drain pending user-crash reports for the
                                 * compositor to render as crash windows.             */
-#define SYS_SIGACTION       86 /* sigaction(sig=ebx, act=ecx -> k_sigaction, old=edx) -> 0/-1 */
-#define SYS_SIGPROCMASK     87 /* sigprocmask(how=ebx, set=ecx, have_set=edx) -> old blocked mask */
+#define SYS_SIGACTION       83 /* sigaction(sig=ebx, act=ecx -> k_sigaction, old=edx) -> 0/-1 */
+#define SYS_SIGPROCMASK     84 /* sigprocmask(how=ebx, set=ecx, have_set=edx) -> old blocked mask */
 /* SYS_SIGRETURN (88) is defined in signal.h — it's baked into the kernel-built
  * signal trampoline; user code never issues it directly. */
-#define SYS_GETPID          89 /* getpid() -> the caller's pid                            */
+#define SYS_GETPID          86 /* getpid() -> the caller's pid                            */
 
 /* Net transports are general sockets: SYS_NET_CONNECT's `proto` arg selects
  * TCP/TLS/UDP/raw-ICMP, so ping/dig/resolve are libs over sockets, not
