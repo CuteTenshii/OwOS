@@ -28,6 +28,7 @@
 #include "fat.h"
 #include "net.h"
 #include "heap.h"
+#include "entropy.h"
 #include "loader.h"
 #include "paging.h"
 #include "pci.h"
@@ -48,7 +49,6 @@
 #include "vmsvga.h"
 #include "vmtools.h"
 #include "uwin.h"
-#include "screenshot.h"
 #include "xhci.h"
 
 /* Boot-stage breadcrumb shown on the panic screen. On a laptop there is no COM1
@@ -311,6 +311,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	heap_init();                   /* kmalloc/kfree over [4 MiB, 16 MiB)      */
 	con_write("heap: ready.\n");
 
+	entropy_init();                /* seed the RNG pool before any consumer    */
+
 	smbios_init();                 /* read DMI vendor/product for the splash  */
 
 	pci_init();                    /* enumerate the PCI bus                   */
@@ -422,13 +424,14 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 		INSTALL_APP(files);
 		INSTALL_APP(browser);  INSTALL_APP(imgview);  INSTALL_APP(term);
 		INSTALL_APP(compositor);   /* the user-space desktop; launched first by init */
-		INSTALL_APP(neofetch); INSTALL_APP(lspci);    INSTALL_APP(ping);
-		INSTALL_APP(dig);      INSTALL_APP(torrent);  INSTALL_APP(player);
+		INSTALL_APP(neofetch); INSTALL_APP(lspci);    INSTALL_APP(uname);    INSTALL_APP(ping);
+		INSTALL_APP(dig);      INSTALL_APP(stun);     INSTALL_APP(torrent);  INSTALL_APP(player);
 		INSTALL_APP(settings); INSTALL_APP(ssh);      INSTALL_APP(sshd);
 		INSTALL_APP(clipd);      INSTALL_APP(vmclipd);
 		INSTALL_APP(cliphist); INSTALL_APP(notifyd);  INSTALL_APP(webp);
-		INSTALL_APP(json);     INSTALL_APP(alac);     INSTALL_APP(smbd);
+		INSTALL_APP(json);     INSTALL_APP(base64);   INSTALL_APP(alac);     INSTALL_APP(aac);      INSTALL_APP(mpeg);     INSTALL_APP(h264);     INSTALL_APP(smbd);
 		INSTALL_APP(dhcpcd);   INSTALL_APP(ntpd);     INSTALL_APP(mdnsd);
+		INSTALL_APP(cast);
 		INSTALL_APP(init);
 		INSTALL_FILE("/bin/notify-send", _binary_app_notifysend);
 	}
@@ -449,9 +452,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 	 * the screen size via SYS_INPUT_SET_BOUNDS; seed them from the framebuffer. */
 	if (fb_active())
 		mouse_init((int)fb_width() - 1, (int)fb_height() - 1);
-
-	bootmark("screenshot_init");
-	screenshot_init();             /* Print Screen worker (off the WM thread)  */
 
 	bootmark("sti");
 	__asm__ volatile ("sti");      /* interrupts on; preemption begins        */

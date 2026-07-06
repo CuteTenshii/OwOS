@@ -244,6 +244,8 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
 					return S_FILE_RO;
 				if (eq(seg[3], "mode"))     /* rw only where we can drive the mode */
 					return fb_can_set_mode() ? S_FILE_RW : S_FILE_RO;
+				if (eq(seg[3], "rate"))     /* compositor frame-pacing target (Hz) */
+					return S_FILE_RW;
 			}
 			return S_NONE;
 		}
@@ -328,6 +330,9 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
 				ps(b, mon); pc(b, '\n'); return;
 			}
 			if (eq(seg[3], "internal")) { ps(b, edid_internal() ? "1" : "0"); pc(b, '\n'); return; }
+			if (eq(seg[3], "rate")) {     /* compositor frame-pacing target (Hz)  */
+				pu(b, (uint32_t)fb_target_hz()); pc(b, '\n'); return;
+			}
 			if (eq(seg[3], "mode")) {     /* the current mode, "WxH"             */
 				pu(b, fb_active() ? fb_width() : 0); pc(b, 'x');
 				pu(b, fb_active() ? fb_height() : 0); pc(b, '\n'); return;
@@ -441,6 +446,15 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
 		while (*p >= '0' && *p <= '9') h = h * 10 + (*p++ - '0');
 		if (w <= 0 || h <= 0 || !fb_can_set_mode()) return -1;
 		return fb_set_mode((uint32_t)w, (uint32_t)h);
+	}
+	if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") &&
+	    eq(seg[2], "fb0") && eq(seg[3], "rate")) {
+		int hz = 0;
+		const char *p = arg;
+		while (*p >= '0' && *p <= '9') hz = hz * 10 + (*p++ - '0');
+		if (hz <= 0) return -1;
+		fb_set_target_hz(hz);   /* clamps; the compositor polls it and re-paces */
+		return 0;
 	}
 	return -1;
 }
@@ -589,8 +603,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
 	}
 	if (n == 3 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0")) {
 		static const char *const k[] = { "width", "height", "refresh", "monitor",
-		                                 "internal", "mode", "modes" };
-		hit = from_list(idx, name, max, k, 7);
+		                                 "internal", "mode", "modes", "rate" };
+		hit = from_list(idx, name, max, k, 8);
 		if (hit && is_dir) *is_dir = 0;
 		return hit;
 	}

@@ -306,21 +306,88 @@ void hmac_sha256(const uint8_t *key, uint32_t keylen,
 	sha256_final(&s, out);
 }
 
-/* P_SHA256 (RFC 5246 §5): the TLS 1.2 PRF's HMAC expansion. */
+void hmac_sha1(const uint8_t *key, uint32_t keylen,
+               const uint8_t *msg, uint32_t msglen,
+               uint8_t out[SHA1_DIGEST])
+{
+	uint8_t k[SHA1_BLOCK];
+	memset(k, 0, SHA1_BLOCK);
+	if (keylen > SHA1_BLOCK)
+		sha1(key, keylen, k);
+	else
+		memcpy(k, key, keylen);
+
+	uint8_t ipad[SHA1_BLOCK], opad[SHA1_BLOCK];
+	for (int i = 0; i < SHA1_BLOCK; i++) {
+		ipad[i] = k[i] ^ 0x36;
+		opad[i] = k[i] ^ 0x5c;
+	}
+
+	uint8_t inner[SHA1_DIGEST];
+	struct sha1 s;
+	sha1_init(&s);
+	sha1_update(&s, ipad, SHA1_BLOCK);
+	sha1_update(&s, msg, msglen);
+	sha1_final(&s, inner);
+
+	sha1_init(&s);
+	sha1_update(&s, opad, SHA1_BLOCK);
+	sha1_update(&s, inner, SHA1_DIGEST);
+	sha1_final(&s, out);
+}
+
+/* HMAC-SHA256 over up to three concatenated message parts, hashed by streaming
+ * update (no concatenation buffer), so message length is unbounded and there is
+ * no fixed-scratch limit to overflow. A NULL/zero-length part is skipped. */
+static void hmac_sha256_v(const uint8_t *key, uint32_t keylen,
+                          const uint8_t *m0, uint32_t l0,
+                          const uint8_t *m1, uint32_t l1,
+                          const uint8_t *m2, uint32_t l2,
+                          uint8_t out[SHA256_DIGEST])
+{
+	uint8_t k[SHA256_BLOCK];
+	memset(k, 0, SHA256_BLOCK);
+	if (keylen > SHA256_BLOCK)
+		sha256(key, keylen, k);
+	else
+		memcpy(k, key, keylen);
+
+	uint8_t ipad[SHA256_BLOCK], opad[SHA256_BLOCK];
+	for (int i = 0; i < SHA256_BLOCK; i++) {
+		ipad[i] = k[i] ^ 0x36;
+		opad[i] = k[i] ^ 0x5c;
+	}
+
+	struct sha256 s;
+	uint8_t inner[SHA256_DIGEST];
+	sha256_init(&s);
+	sha256_update(&s, ipad, SHA256_BLOCK);
+	if (l0) sha256_update(&s, m0, l0);
+	if (l1) sha256_update(&s, m1, l1);
+	if (l2) sha256_update(&s, m2, l2);
+	sha256_final(&s, inner);
+
+	sha256_init(&s);
+	sha256_update(&s, opad, SHA256_BLOCK);
+	sha256_update(&s, inner, SHA256_DIGEST);
+	sha256_final(&s, out);
+}
+
+/* P_SHA256 (RFC 5246 §5): the TLS 1.2 PRF's HMAC expansion. The PRF "seed" is
+ * label || seed, passed here as two parts and streamed — no fixed buffer. */
 static void p_sha256(const uint8_t *secret, uint32_t secretlen,
-                     const uint8_t *seed, uint32_t seedlen,
+                     const uint8_t *s0, uint32_t l0,
+                     const uint8_t *s1, uint32_t l1,
                      uint8_t *out, uint32_t outlen)
 {
 	uint8_t a[SHA256_DIGEST];
 	/* A(1) = HMAC(secret, seed) */
-	hmac_sha256(secret, secretlen, seed, seedlen, a);
+	hmac_sha256_v(secret, secretlen, s0, l0, s1, l1, 0, 0, a);
 
-	uint8_t buf[SHA256_DIGEST + 512];   /* A(i) || seed; seed is small in TLS */
 	while (outlen) {
-		memcpy(buf, a, SHA256_DIGEST);
-		memcpy(buf + SHA256_DIGEST, seed, seedlen);
 		uint8_t block[SHA256_DIGEST];
-		hmac_sha256(secret, secretlen, buf, SHA256_DIGEST + seedlen, block);
+		/* block = HMAC(secret, A(i) || seed) */
+		hmac_sha256_v(secret, secretlen, a, SHA256_DIGEST, s0, l0, s1, l1, block);
 		uint32_t take = outlen < SHA256_DIGEST ? outlen : SHA256_DIGEST;
 		memcpy(out, block, take);
 		out += take;
@@ -335,13 +402,11 @@ void tls12_prf(const uint8_t *secret, uint32_t secretlen,
                const uint8_t *seed, uint32_t seedlen,
                uint8_t *out, uint32_t outlen)
 {
-	uint8_t fullseed[512];
 	uint32_t labellen = 0;
 	while (label[labellen])
 		labellen++;
-	memcpy(fullseed, label, labellen);
-	memcpy(fullseed + labellen, seed, seedlen);
-	p_sha256(secret, secretlen, fullseed, labellen + seedlen, out, outlen);
+	p_sha256(secret, secretlen,
+	         (const uint8_t *)label, labellen, seed, seedlen, out, outlen);
 }
 
 void hkdf_extract(const uint8_t *salt, uint32_t saltlen,
@@ -360,14 +425,8 @@ void hkdf_expand(const uint8_t prk[SHA256_DIGEST],
 	uint8_t counter = 1;
 	uint32_t done = 0;
 	while (done < outlen) {
-		uint8_t buf[SHA256_DIGEST + 512 + 1];
-		uint32_t p = 0;
-		memcpy(buf, t, tlen);
-		p = tlen;
-		memcpy(buf + p, info, infolen);
-		p += infolen;
-		buf[p++] = counter;
-		hmac_sha256(prk, SHA256_DIGEST, buf, p, t);
+		/* T(i) = HMAC(prk, T(i-1) || info || i), streamed — info is unbounded. */
+		hmac_sha256_v(prk, SHA256_DIGEST, t, tlen, info, infolen, &counter, 1, t);
 		tlen = SHA256_DIGEST;
 		uint32_t take = outlen - done < SHA256_DIGEST ? outlen - done : SHA256_DIGEST;
 		memcpy(out + done, t, take);
@@ -472,13 +531,16 @@ static void gcm_mul(const uint8_t x[16], const uint8_t y[16], uint8_t z[16])
 	memcpy(v, y, 16);
 	memset(z, 0, 16);
 	for (int i = 0; i < 128; i++) {
-		if (x[i / 8] & (0x80 >> (i % 8)))
-			for (int j = 0; j < 16; j++)
-				z[j] ^= v[j];
-		int lsb = v[15] & 1;
+		/* Branchless on the secret-dependent bits: expand each control bit to a
+		 * 0x00/0xFF mask so the XORs run in constant time (no data-dependent
+		 * branch, matching the already-constant-time tag compare). */
+		uint8_t xbit  = (uint8_t)((x[i / 8] >> (7 - (i % 8))) & 1);
+		uint8_t xmask = (uint8_t)(0u - xbit);
+		for (int j = 0; j < 16; j++)
+			z[j] ^= (uint8_t)(v[j] & xmask);
+		uint8_t lsb = (uint8_t)(v[15] & 1);
 		gcm_rshift1(v);
-		if (lsb)
-			v[0] ^= 0xe1;
+		v[0] ^= (uint8_t)(0xe1 & (uint8_t)(0u - lsb));
 	}
 }
 
@@ -607,6 +669,33 @@ int aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12],
 			out[off + j] = in[off + j] ^ ks[j];
 	}
 	return 0;
+}
+
+/* =============================================================== AES-128-CTR */
+
+static void ctr_inc(uint8_t c[16])
+{
+	for (int i = 15; i >= 0; i--)
+		if (++c[i])
+			break;
+}
+
+void aes128_ctr(const uint8_t key[16], const uint8_t ctr[16],
+                const uint8_t *in, uint32_t len, uint8_t *out)
+{
+	struct aes128 aes;
+	aes128_init(&aes, key);
+
+	uint8_t c[16];
+	memcpy(c, ctr, 16);
+	for (uint32_t off = 0; off < len; off += 16) {
+		uint8_t ks[16];
+		aes128_encrypt_block(&aes, c, ks);
+		ctr_inc(c);
+		uint32_t n = len - off < 16 ? len - off : 16;
+		for (uint32_t j = 0; j < n; j++)
+			out[off + j] = in[off + j] ^ ks[j];
+	}
 }
 
 /* ================================================================= X25519 */

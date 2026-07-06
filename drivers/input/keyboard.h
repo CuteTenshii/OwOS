@@ -25,38 +25,29 @@
 #define KEY_F5      0x0E   /* F5: app-defined refresh/reload                   */
 #define KEY_F12     0x1D   /* F12: app-defined (devtools)                      */
 #define KEY_SUPER   0x11   /* left/right Windows (GUI) key: toggle Start menu  */
+#define KEY_PRTSC   0x80   /* Print Screen: a real key, WM-consumed like KEY_SUPER, but
+                            * latch-delivered because the IRQ can't capture the framebuffer.
+                            * 0x80, not a control code, because every value < 0x20 is taken. */
 
-/* KEY_KILL/KEY_CLEAR remain ONLY as line-editor codes for the serial recovery
- * console (serial.c maps Ctrl+U/L to them — serial has no modifier channel). The
- * PS/2 keyboard no longer emits them: it sends the bare letter + KMOD_CTRL and
- * the consumer (shell/editor) decides. */
-/* Menu accelerators: Ctrl+<letter> chords a windowed app binds to its menu
- * items (the keyboard forwards them like any other editing key; the focused
- * app decides what each means -- typically New/Open/Save). The shell ignores
- * them, as it does any unrecognised control byte. */
-#define KEY_NEW     0x0F   /* Ctrl+N                                           */
-#define KEY_OPEN    0x10   /* Ctrl+O                                           */
-#define KEY_SAVE    0x13   /* Ctrl+S                                           */
-/* Ctrl+C is not queued here -- it is a latch read via keyboard_take_interrupt
- * so it can interrupt a running command, not just the line being typed.       */
-/* Text-editing chords for a windowed editor (Ctrl+A select-all, Ctrl+X cut).
- * The shell's line editor treats KEY_SELALL like Home (beginning of line). */
-#define KEY_SELALL  0x12   /* Ctrl+A: select all                               */
-#define KEY_CUT     0x14   /* Ctrl+X: cut the selection                        */
-/* Shift+navigation: the same arrow/Home/End cluster with Shift held, so an app
- * can extend a selection toward the new caret position. The shell ignores them. */
-#define KEY_SLEFT   0x15
-#define KEY_SRIGHT  0x16
-#define KEY_SUP     0x17
-#define KEY_SDOWN   0x19
-#define KEY_SHOME   0x1A
-#define KEY_SEND    0x1C
+/* This header defines only the bytes the driver actually emits. Chords are NOT
+ * given per-chord codes: the driver delivers the base key + its KMOD_* set (see
+ * cur_mods in keyboard.c), and the consumer decides what the chord means. So
+ * Ctrl+S is 's' + KMOD_CTRL, Super+V is 'v' + KMOD_SUPER, Shift+arrow is the
+ * arrow + KMOD_SHIFT — the driver never names "Save"/"cliphist"/"extend
+ * selection". Those application accelerators are synthesised app-side and live
+ * in owos.h (menu_shortcut), not in this driver header.
+ *
+ * KEY_KILL/KEY_CLEAR are the exception: the serial recovery console has no
+ * modifier channel, so serial.c maps Ctrl+U/L to these single bytes for the
+ * kernel line editor (shell.c). The PS/2 path still delivers letter + KMOD_CTRL.
+ *
+ * Ctrl+C isn't queued at all — it's a latch (keyboard_take_interrupt) so it can
+ * interrupt a running command, not just the line being typed. */
 #define KEY_TAB         '\t'   /* WM keys off KEY_TAB + KMOD_ALT for Alt+Tab      */
 
 /* Alt+Tab is delivered as KEY_TAB+KMOD_ALT (+KMOD_SHIFT reverses); the WM owns
  * switching. KEY_ALT_UP is emitted on Alt-release to commit the selection. */
 #define KEY_ALT_UP      0x1F
-#define KEY_CLIPHIST    0x1E   /* Super+V: request the clipboard-history viewer (compositor) */
 
 /* Modifier state delivered alongside each key. Every key event carries the set
  * of modifiers held when it was pressed, so an app can act on chords (e.g. a
@@ -88,5 +79,9 @@ int keyboard_take_interrupt(void);
 /* Raise the interrupt latch from non-IRQ context (used by the serial console
  * so a Ctrl+C typed in the host terminal interrupts a running command). */
 void keyboard_signal_interrupt(void);
+
+/* Returns 1 and clears the latch if Print Screen has been pressed since the last
+ * call; 0 otherwise. SYS_INPUT_POLL reads it and hands the compositor KEY_PRTSC. */
+int keyboard_take_screenshot(void);
 
 #endif /* OWOS_KEYBOARD_H */

@@ -60,7 +60,15 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
 	if (i < 0) return;
 	struct lbox *b = &g_pool[i];
 	b->node     = el;
-	b->kind     = (cs->flex == 1) ? LB_FLEX : LB_BLOCK;
+	b->kind     = (cs->grid == 1) ? LB_GRID : (cs->flex == 1) ? LB_FLEX : LB_BLOCK;
+	b->grid_flow = (signed char)(cs->grid_flow == 1 ? 1 : 0);
+	b->n_cols   = cs->n_cols;
+	b->n_rows   = cs->n_rows;
+	b->col_span = (signed char)(cs->col_span > 0 ? cs->col_span : 1);
+	b->row_span = (signed char)(cs->row_span > 0 ? cs->row_span : 1);
+	b->justify_items = cs->justify_items;
+	if (cs->n_cols > 0) for (int i = 0; i < cs->n_cols && i < CSS_GRID_MAX; i++) b->cols_t[i] = cs->grid_cols[i];
+	if (cs->n_rows > 0) for (int i = 0; i < cs->n_rows && i < CSS_GRID_MAX; i++) b->rows_t[i] = cs->grid_rows[i];
 	b->flex_dir = (unsigned char)(cs->flex_dir == 1 ? 1 : 0);
 	b->flex_wrap = (unsigned char)(cs->flex_wrap == 1 ? 1 : 0);
 	b->justify  = cs->justify;

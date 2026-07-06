@@ -8,6 +8,7 @@
  */
 #include "owos.h"
 #include "gfx.h"
+#include "dialog.h"
 
 static int W = 320, H = 380;    /* client size; changes on resize */
 #define MENU_H   18             /* top menu bar (above the sidebar + list) */
@@ -368,6 +369,152 @@ static void open_with(const char *name, const char *prog)
 
 static void open_file(const char *name) { open_with(name, app_for(name)); }
 
+/* Confirm and remove the entry `name` in the current directory — a file via
+ * unlink, a folder via rmdir (which only succeeds when empty). The confirm and any
+ * error report are modal dialogs parented on this window. */
+static void delete_entry(int id, const char *name, int is_dir)
+{
+	if (feq(name, "..")) return;
+	char msg[128];
+	snprintf(msg, sizeof msg, "Delete %s '%s'?", is_dir ? "folder" : "file", name);
+	if (dialog_msg(id, "Delete", msg, DLG_ICON_WARN | DLG_YESNO) != DLG_R_YES)
+		return;
+	char fp[256];
+	full_path(name, fp, sizeof fp);
+	int ok = is_dir ? rmdir(fp) : unlink(fp);
+	if (ok == 0) { sel = -1; force_relist = 1; }
+	else dialog_message(id, "Delete failed",
+	                    is_dir ? "The folder could not be removed (is it empty?)."
+	                           : "The file could not be removed.");
+	seq++;
+}
+
+/* ----------------------------------------------------------- Properties window
+ * A rich dialog's content is app-specific, so the app builds it itself (the dialog
+ * lib only ships the modal message box). Properties is a MODELESS transient child
+ * window we own: created with win_set_parent(..., 0) so it doesn't block the
+ * explorer, drawn with gfx into its own buffer, and pumped from our main loop
+ * (props_pump) alongside the file list — so you can keep browsing with it open. */
+#define PROP_ROWH   22
+#define PROP_PAD    14
+#define PROP_LABELW 118
+#define PROP_BTN_H  26
+
+static int      prop_id = -1;      /* the Properties window, or -1 when closed */
+static unsigned *prop_fb;
+static int      prop_w, prop_h, prop_scroll, prop_nrows;
+static unsigned prop_seq, prop_last;
+static struct { const char *label; char value[256]; } prop_rows[6];
+
+static void prop_add(const char *label, const char *value)
+{
+	if (prop_nrows >= (int)(sizeof prop_rows / sizeof prop_rows[0])) return;
+	prop_rows[prop_nrows].label = label;
+	int i = 0;
+	for (; value[i] && i < (int)sizeof prop_rows[0].value - 1; i++)
+		prop_rows[prop_nrows].value[i] = value[i];
+	prop_rows[prop_nrows].value[i] = 0;
+	prop_nrows++;
+}
+
+static void prop_close_rect(int *bx, int *by, int *bw)
+{
+	*bw = 74;
+	*bx = prop_w - PROP_PAD - *bw;
+	*by = prop_h - PROP_PAD - PROP_BTN_H;
+}
+
+/* Open (or replace) the Properties window for `name`, built from its facts. */
+static void show_properties(int mainid, const char *name, int is_dir, unsigned size)
+{
+	prop_nrows = 0;
+	prop_add("Name", name);
+	prop_add("Location", path);
+	prop_add("Type", is_dir ? "Folder" : "File");
+	if (!is_dir) { char b[24]; size_str(size, b); prop_add("Size", b); }
+	char fp[256];
+	full_path(name, fp, sizeof fp);
+	prop_add("Full path", fp);
+
+	if (prop_id >= 0) { win_close(prop_id); prop_id = -1; }
+	int h = PROP_PAD + prop_nrows * PROP_ROWH + (PROP_PAD + PROP_BTN_H + PROP_PAD);
+	if (h > 420) h = 420;
+	prop_w = 340; prop_h = h;
+	prop_id = win_create(prop_w, prop_h, "Properties");
+	if (prop_id < 0) return;
+	prop_fb = win_fb_of(prop_id);
+	win_set_parent(prop_id, mainid, 0);   /* modeless: doesn't block the explorer */
+	win_resizable(prop_id, 0);
+	prop_scroll = 0; prop_seq = 1; prop_last = 0;
+}
+
+/* Repaint the Properties window into its own buffer, then restore our main gfx
+ * surface (the explorer's window) so the rest of the app draws as usual. */
+static void render_props(void)
+{
+	gfx_init(prop_fb, prop_w, prop_h);
+	gfx_fill_rect(0, 0, prop_w, prop_h, 0x161d28);
+
+	int listy = PROP_PAD;
+	int listh = prop_h - listy - (PROP_PAD + PROP_BTN_H + PROP_PAD);
+	int vis = listh / PROP_ROWH; if (vis < 1) vis = 1;
+	int maxscroll = prop_nrows > vis ? prop_nrows - vis : 0;
+	if (prop_scroll > maxscroll) prop_scroll = maxscroll;
+	if (prop_scroll < 0) prop_scroll = 0;
+
+	for (int r = 0; r < vis; r++) {
+		int e = prop_scroll + r;
+		if (e >= prop_nrows) break;
+		int y = listy + r * PROP_ROWH;
+		if (r & 1) gfx_fill_rect(0, y, prop_w, PROP_ROWH, 0x1b2330);
+		int ty = y + (PROP_ROWH - UIFONT_H) / 2;
+		gfx_ui_text(PROP_PAD, ty, prop_rows[e].label, 0x9fb0c4);
+		gfx_set_clip(PROP_PAD + PROP_LABELW, y,
+		             prop_w - PROP_PAD - (PROP_PAD + PROP_LABELW), PROP_ROWH);
+		gfx_ui_text(PROP_PAD + PROP_LABELW, ty, prop_rows[e].value, 0xd6deea);
+		gfx_clip_none();
+	}
+	if (maxscroll > 0) {
+		int knob = listh * vis / prop_nrows; if (knob < 12) knob = 12;
+		int ky = listy + (listh - knob) * prop_scroll / maxscroll;
+		gfx_fill_rect(prop_w - 5, listy, 3, listh, 0x0e1420);
+		gfx_fill_rect(prop_w - 5, ky, 3, knob, 0x3a4658);
+	}
+	int bx, by, bw;
+	prop_close_rect(&bx, &by, &bw);
+	gfx_fill_rect(bx, by, bw, PROP_BTN_H, 0x2f6fb0);
+	gfx_rect(bx, by, bw, PROP_BTN_H, 0x05070a);
+	gfx_ui_text(bx + (bw - gfx_ui_width("Close")) / 2,
+	            by + (PROP_BTN_H - UIFONT_H) / 2, "Close", 0xffffff);
+
+	win_present(prop_id);
+	gfx_init(win_fb(), W, H);   /* hand the surface back to the explorer window */
+}
+
+/* Service the Properties window each frame: drain its events, repaint on change. */
+static void props_pump(void)
+{
+	if (prop_id < 0) return;
+	struct win_event ev;
+	while (win_poll(prop_id, &ev)) {
+		if (ev.type == WEV_CLOSE) { win_close(prop_id); prop_id = -1; return; }
+		else if (ev.type == WEV_KEY) {
+			if (ev.a == 27 || ev.a == '\n') { win_close(prop_id); prop_id = -1; return; }
+			else if (ev.a == KEY_UP)   { prop_scroll--; prop_seq++; }
+			else if (ev.a == KEY_DOWN) { prop_scroll++; prop_seq++; }
+		} else if (ev.type == WEV_SCROLL) {
+			prop_scroll -= ev.a; prop_seq++;
+		} else if (ev.type == WEV_MOUSE) {
+			int bx, by, bw;
+			prop_close_rect(&bx, &by, &bw);
+			if (ev.a >= bx && ev.a < bx + bw && ev.b >= by && ev.b < by + PROP_BTN_H) {
+				win_close(prop_id); prop_id = -1; return;
+			}
+		}
+	}
+	if (prop_seq != prop_last) { render_props(); prop_last = prop_seq; }
+}
+
 static int list_hit(int mx, int my);   /* list row under (mx,my), or -1 */
 
 /* ----------------------------------------------------------- context menu */
@@ -380,11 +527,14 @@ static int list_hit(int mx, int my);   /* list row under (mx,my), or -1 */
  * left-press to an item or dismisses the menu.
  */
 enum ctx_kind { CTX_BG, CTX_FILE, CTX_DIR, CTX_PLACE, CTX_DEVICE };
-enum ctx_act  { A_OPEN, A_EDIT, A_EJECT, A_CONNECT, A_REFRESH, A_UP, A_HOME };
+enum ctx_act  { A_OPEN, A_EDIT, A_DELETE, A_PROPS, A_EJECT, A_CONNECT,
+                A_REFRESH, A_UP, A_HOME };
 
 struct ctx_item { const char *label; int act; };
-static const struct ctx_item ci_file[]   = { {"Open", A_OPEN}, {"Edit", A_EDIT} };
-static const struct ctx_item ci_dir[]     = { {"Open", A_OPEN} };
+static const struct ctx_item ci_file[]   = { {"Open", A_OPEN}, {"Edit", A_EDIT},
+                                             {"Delete", A_DELETE}, {"Properties", A_PROPS} };
+static const struct ctx_item ci_dir[]     = { {"Open", A_OPEN},
+                                             {"Delete", A_DELETE}, {"Properties", A_PROPS} };
 static const struct ctx_item ci_place[]   = { {"Open", A_OPEN} };
 static const struct ctx_item ci_device[]  = { {"Open", A_OPEN}, {"Unmount", A_EJECT} };
 static const struct ctx_item ci_device_off[] = { {"Connect", A_CONNECT} };
@@ -399,15 +549,15 @@ static struct {
 	char name[64];             /* file / dir entry name (owofs FS_NAME_LEN) */
 } ctx;
 
-#define CTX_W   96
+#define CTX_W   110
 #define CTX_ROW 16
 
 /* The item table + count for the menu's current kind. */
 static const struct ctx_item *ctx_items(int *n)
 {
 	switch (ctx.kind) {
-	case CTX_FILE:   *n = 2; return ci_file;
-	case CTX_DIR:    *n = 1; return ci_dir;
+	case CTX_FILE:   *n = 4; return ci_file;
+	case CTX_DIR:    *n = 3; return ci_dir;
 	case CTX_PLACE:  *n = 1; return ci_place;
 	case CTX_DEVICE:
 		if (ctx.target >= 0 && ctx.target < nvols && !vols[ctx.target].mounted) {
@@ -466,6 +616,15 @@ static void ctx_run(int act, int id)
 		}
 		break;
 	case A_EDIT:   open_with(ctx.name, "editor"); break;
+	case A_DELETE: delete_entry(id, ctx.name, ctx.kind == CTX_DIR); break;
+	case A_PROPS: {
+		unsigned sz = 0;
+		if (ctx.target >= 0 && ctx.target < fent_count &&
+		    feq(fent_buf[ctx.target].name, ctx.name))
+			sz = fent_buf[ctx.target].size;
+		show_properties(id, ctx.name, ctx.kind == CTX_DIR, sz);
+		break;
+	}
 	case A_CONNECT:
 		if (ctx.target >= 0 && ctx.target < nvols) {
 			char pt[40]; strcpy(pt, "/media/"); strcat(pt, vols[ctx.target].dev);
@@ -689,6 +848,11 @@ static void key(int id, int k)
 		seq++;
 	} else if (k == '\n') {
 		activate(id);
+	} else if (k == KEY_DELETE) {
+		if (sel >= 0 && sel < fent_count) {
+			struct fent *fe = &fent_buf[sel];
+			delete_entry(id, fe->name, fe->is_dir);
+		}
 	}
 }
 
@@ -717,6 +881,7 @@ int main(void)
 			}
 		}
 		if ((int)seq != last) { render(); win_present(id); last = seq; }
+		props_pump();          /* service the modeless Properties window, if open */
 		win_wait(id);
 	}
 }

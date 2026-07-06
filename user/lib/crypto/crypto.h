@@ -57,6 +57,12 @@ void hmac_sha256(const uint8_t *key, uint32_t keylen,
                  const uint8_t *msg, uint32_t msglen,
                  uint8_t out[SHA256_DIGEST]);
 
+/* HMAC-SHA1 (RFC 2104). Backs the SRTP AES_CM_128_HMAC_SHA1 auth tag, whose
+ * keystream comes from aes128_ctr below. */
+void hmac_sha1(const uint8_t *key, uint32_t keylen,
+               const uint8_t *msg, uint32_t msglen,
+               uint8_t out[SHA1_DIGEST]);
+
 /* TLS 1.2 PRF (RFC 5246 §5), instantiated with P_SHA256. Expands
  * secret+label+seed into `outlen` bytes; label/seed are concatenated as the
  * PRF seed. Backs the user-space TLS 1.2 fallback. */
@@ -94,6 +100,16 @@ int  aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12],
                      const uint8_t *aad, uint32_t aadlen,
                      const uint8_t *in, uint32_t len, uint8_t *out,
                      const uint8_t tag[16]);
+
+/* --------------------------------------------------------- AES-128-CTR */
+
+/* NIST SP 800-38A counter mode: keystream block i = AES(key, ctr + i), the
+ * 128-bit counter block incremented big-endian, XORed into the data.
+ * Encryption and decryption are the same call. `ctr` is the initial 16-byte
+ * counter block, built by the caller (SRTP AES-CM forms it from the session
+ * salt, SSRC and packet index per RFC 3711 §4.1.1). in/out may alias. */
+void aes128_ctr(const uint8_t key[16], const uint8_t ctr[16],
+                const uint8_t *in, uint32_t len, uint8_t *out);
 
 /* ------------------------------------------------------------------ X25519 */
 

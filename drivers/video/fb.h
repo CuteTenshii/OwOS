@@ -33,6 +33,12 @@ uint32_t fb_backbuffer_bytes(void);
 void     fb_dims(int *w, int *h, int *pitch, int *bpp);
 void     fb_present_rect(int x, int y, int w, int h);
 
+/* Compositor frame-pacing target in Hz — the software present cadence, not a
+ * hardware mode. Tunable through /sys/class/graphics/fb0/rate and read by
+ * /bin/compositor to pace its loop; fb_set_target_hz clamps to a sane band. */
+int      fb_target_hz(void);
+void     fb_set_target_hz(int hz);
+
 /* Runtime resolution switching, available only on the DISPI path (fb_init): we
  * can reprogram QEMU's std-vga adapter, but a framebuffer adopted from a
  * bootloader (fb_adopt: GRUB/UEFI GOP) is fixed and fb_can_set_mode returns 0.

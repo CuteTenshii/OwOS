@@ -177,9 +177,10 @@ static uint64_t rd(const uint8_t *p, int n)
 
 /* PkgLength: returns the length value (which counts itself) and advances *p
  * past the length bytes. */
-static uint32_t pkglength(const uint8_t **p)
+static uint32_t pkglength(const uint8_t **p, const uint8_t *end)
 {
 	const uint8_t *q = *p;
+	if (q >= end) { *p = q; return 0; }        /* nothing to read                 */
 	uint8_t b0 = q[0];
 	uint32_t extra = b0 >> 6;
 	uint32_t len;
@@ -187,8 +188,9 @@ static uint32_t pkglength(const uint8_t **p)
 		len = b0 & 0x3F;
 	else {
 		len = b0 & 0x0F;
-		for (uint32_t i = 0; i < extra; i++)
-			len |= (uint32_t)q[1 + i] << (4 + 8 * i);
+		for (uint32_t i = 0; i < extra; i++)   /* bound each extension byte to end */
+			if (q + 1 + i < end)
+				len |= (uint32_t)q[1 + i] << (4 + 8 * i);
 	}
 	*p = q + 1 + extra;
 	return len;
@@ -322,7 +324,7 @@ static struct ns_node *new_node(uint8_t kind, const uint32_t *seg, int depth)
 }
 
 static void ns_walk(const uint8_t *p, const uint8_t *end,
-                    const uint32_t *scope, int sdepth);
+                    const uint32_t *scope, int sdepth, int depth);
 static const uint8_t *skip_dataobject(const uint8_t *p, const uint8_t *end);
 static const uint8_t *read_int_arg(const uint8_t *p, const uint8_t *end, uint64_t *out);
 static const uint8_t *skip_term(const uint8_t *p, const uint8_t *end);
@@ -341,7 +343,7 @@ static void parse_field_list(const uint8_t *p, const uint8_t *end, int region,
 		uint8_t b = *p;
 		if (b == 0x00) {                 /* ReservedField: 0x00 PkgLength       */
 			p++;
-			uint32_t bits = pkglength(&p);
+			uint32_t bits = pkglength(&p, end);
 			bit += bits;
 		} else if (b == 0x01) {          /* AccessField: 0x01 type attrib       */
 			p += 3;
@@ -353,7 +355,7 @@ static void parse_field_list(const uint8_t *p, const uint8_t *end, int region,
 			if (p + 4 > end) return;
 			uint32_t seg = (uint32_t)rd(p, 4);
 			p += 4;
-			uint32_t width = pkglength(&p);
+			uint32_t width = pkglength(&p, end);
 			uint32_t path[MAX_DEPTH]; int d = 0;
 			for (int i = 0; i < sdepth && d < MAX_DEPTH; i++)
 				path[d++] = scope[i];
@@ -370,8 +372,11 @@ static void parse_field_list(const uint8_t *p, const uint8_t *end, int region,
 }
 
 static void ns_walk(const uint8_t *p, const uint8_t *end,
-                    const uint32_t *scope, int sdepth)
+                    const uint32_t *scope, int sdepth, int depth)
 {
+	/* Malformed nested Scope/Device blocks recurse here with no natural bound;
+	 * cap the C recursion so a crafted table can't overflow the kernel stack. */
+	if (depth > MAX_RDEPTH) return;
 	while (p < end) {
 		uint8_t op = *p;
 
@@ -385,17 +390,17 @@ static void ns_walk(const uint8_t *p, const uint8_t *end,
 		} else if (op == 0x10) {             /* ScopeOp PkgLen NameString Terms  */
 			const uint8_t *q = p + 1;
 			const uint8_t *pkgstart = q;
-			uint32_t len = pkglength(&q);
+			uint32_t len = pkglength(&q, end);
 			const uint8_t *body_end = pkgstart + len;
 			if (body_end > end) body_end = end;
 			uint32_t seg[MAX_DEPTH]; int d;
 			parse_name(&q, body_end, scope, sdepth, seg, &d);
-			ns_walk(q, body_end, seg, d);
+			ns_walk(q, body_end, seg, d, depth + 1);
 			p = body_end;
 		} else if (op == 0x14) {             /* MethodOp PkgLen Name flags Terms */
 			const uint8_t *q = p + 1;
 			const uint8_t *pkgstart = q;
-			uint32_t len = pkglength(&q);
+			uint32_t len = pkglength(&q, end);
 			const uint8_t *body_end = pkgstart + len;
 			if (body_end > end) body_end = end;
 			uint32_t seg[MAX_DEPTH]; int d;
@@ -423,7 +428,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end,
 			} else if (ext == 0x81) {        /* Field PkgLen Name flags FieldList*/
 				const uint8_t *q = p + 2;
 				const uint8_t *pkgstart = q;
-				uint32_t len = pkglength(&q);
+				uint32_t len = pkglength(&q, end);
 				const uint8_t *fend = pkgstart + len;
 				if (fend > end) fend = end;
 				struct ns_node *reg = resolve_ref(&q, fend, scope, sdepth);
@@ -435,7 +440,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end,
 				/* Device/Processor/PowerRes/ThermalZone: PkgLen Name <extra> Terms */
 				const uint8_t *q = p + 2;
 				const uint8_t *pkgstart = q;
-				uint32_t len = pkglength(&q);
+				uint32_t len = pkglength(&q, end);
 				const uint8_t *body_end = pkgstart + len;
 				if (body_end > end) body_end = end;
 				uint32_t seg[MAX_DEPTH]; int d;
@@ -443,7 +448,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end,
 				if (ext == 0x83) q += 6;     /* ProcID(1)+PblkAddr(4)+PblkLen(1) */
 				else if (ext == 0x84) q += 3;/* SystemLevel(1)+ResourceOrder(2)  */
 				if (ext == 0x82) new_node(NS_DEVICE, seg, d);
-				ns_walk(q, body_end, seg, d);
+				ns_walk(q, body_end, seg, d, depth + 1);
 				p = body_end;
 			} else if (ext == 0x01) {        /* Mutex: Name SyncFlags            */
 				const uint8_t *q = p + 2;
@@ -460,7 +465,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end,
 			} else if (ext == 0x86 || ext == 0x87) {  /* IndexField/BankField    */
 				const uint8_t *q = p + 2;
 				const uint8_t *pkgstart = q;
-				uint32_t len = pkglength(&q);
+				uint32_t len = pkglength(&q, end);
 				p = pkgstart + len;          /* skip (unsupported)               */
 			} else if (ext == 0x13) {        /* CreateField: Src BitIdx Num Name  */
 				const uint8_t *q = skip_term(p + 2, end);
@@ -478,7 +483,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end,
 			/* If/Else/While at namespace scope: skip by package length. */
 			const uint8_t *q = p + 1;
 			const uint8_t *pkgstart = q;
-			uint32_t len = pkglength(&q);
+			uint32_t len = pkglength(&q, end);
 			p = pkgstart + len;
 		} else if (op == 0x15) {             /* External: Name type argcount     */
 			/* SSDTs almost always open with a run of these forward declarations;
@@ -531,7 +536,7 @@ static const uint8_t *skip_dataobject(const uint8_t *p, const uint8_t *end)
 	case 0x11: case 0x12: case 0x13: {                        /* Buffer/Package   */
 		const uint8_t *q = p + 1;
 		const uint8_t *pkgstart = q;
-		uint32_t len = pkglength(&q);
+		uint32_t len = pkglength(&q, end);
 		return pkgstart + len;
 	}
 	case 0x5B: return (p + 1 < end && p[1] == 0x30) ? p + 2 : p + 2;  /* Revision */
@@ -548,10 +553,12 @@ static const uint8_t *read_int_arg(const uint8_t *p, const uint8_t *end, uint64_
 	case 0x00: *out = 0; return p + 1;
 	case 0x01: *out = 1; return p + 1;
 	case 0xFF: *out = ~0ull; return p + 1;
-	case 0x0A: *out = rd(p + 1, 1); return p + 2;
-	case 0x0B: *out = rd(p + 1, 2); return p + 3;
-	case 0x0C: *out = rd(p + 1, 4); return p + 5;
-	case 0x0E: *out = rd(p + 1, 8); return p + 9;
+	/* Bound each width against `end`: a truncated initializer must not read past
+	 * it. Stop safely (0, at end) rather than run off the buffer. */
+	case 0x0A: if (p + 2 > end) { *out = 0; return end; } *out = rd(p + 1, 1); return p + 2;
+	case 0x0B: if (p + 3 > end) { *out = 0; return end; } *out = rd(p + 1, 2); return p + 3;
+	case 0x0C: if (p + 5 > end) { *out = 0; return end; } *out = rd(p + 1, 4); return p + 5;
+	case 0x0E: if (p + 9 > end) { *out = 0; return end; } *out = rd(p + 1, 8); return p + 9;
 	default:   *out = 0; return p + 1;   /* non-constant: treat as 0 */
 	}
 }
@@ -559,11 +566,17 @@ static const uint8_t *read_int_arg(const uint8_t *p, const uint8_t *end, uint64_
 /* Skip exactly one TermArg, advancing past its whole structure — including
  * NameStrings and nested expressions. The namespace pass needs this for an
  * OperationRegion's offset/length, which may be more than a literal; getting the
- * length wrong desyncs the entire rest of the table. Bounded by recursion on a
- * finite byte range. */
-static const uint8_t *skip_term(const uint8_t *p, const uint8_t *end)
+ * length wrong desyncs the entire rest of the table.
+ *
+ * `depth` bounds the C recursion: a crafted table of deeply nested single-byte
+ * prefix operators would otherwise recurse as deep as the table is long and
+ * overflow the kernel stack. At the cap we stop descending (advancing one byte so
+ * a caller's loop can't stall) — a desync, but graceful, matching aml.c's
+ * never-crash contract. */
+static const uint8_t *skip_term_d(const uint8_t *p, const uint8_t *end, int depth)
 {
 	if (p >= end) return p;
+	if (depth > MAX_RDEPTH) return p + 1;
 	uint8_t op = *p;
 	switch (op) {
 	case 0x00: case 0x01: case 0xFF: return p + 1;
@@ -573,7 +586,7 @@ static const uint8_t *skip_term(const uint8_t *p, const uint8_t *end)
 	case 0x0E: return p + 9;
 	case 0x0D: { p++; while (p < end && *p) p++; return (p < end) ? p + 1 : p; }
 	case 0x11: case 0x12: case 0x13: {                 /* Buffer / Package         */
-		const uint8_t *q = p + 1, *s = q; uint32_t len = pkglength(&q); return s + len;
+		const uint8_t *q = p + 1, *s = q; uint32_t len = pkglength(&q, end); return s + len;
 	}
 	case 0x60: case 0x61: case 0x62: case 0x63:        /* Local0..7               */
 	case 0x64: case 0x65: case 0x66: case 0x67:
@@ -581,29 +594,31 @@ static const uint8_t *skip_term(const uint8_t *p, const uint8_t *end)
 	case 0x6C: case 0x6D: case 0x6E:
 		return p + 1;
 	case 0x70:                                          /* Store(src, dst)         */
-		p = skip_term(p + 1, end); return skip_term(p, end);
+		p = skip_term_d(p + 1, end, depth + 1); return skip_term_d(p, end, depth + 1);
 	case 0x72: case 0x74: case 0x77: case 0x79: case 0x7A:  /* binary: a, b, target */
 	case 0x7B: case 0x7C: case 0x7D: case 0x7E: case 0x7F: case 0x85:
-		p = skip_term(p + 1, end); p = skip_term(p, end); return skip_term(p, end);
+		p = skip_term_d(p + 1, end, depth + 1); p = skip_term_d(p, end, depth + 1);
+		return skip_term_d(p, end, depth + 1);
 	case 0x78:                                          /* Divide: a,b,rem,quot    */
-		p = skip_term(p + 1, end); p = skip_term(p, end);
-		p = skip_term(p, end); return skip_term(p, end);
+		p = skip_term_d(p + 1, end, depth + 1); p = skip_term_d(p, end, depth + 1);
+		p = skip_term_d(p, end, depth + 1); return skip_term_d(p, end, depth + 1);
 	case 0x80: case 0x81: case 0x82:                    /* Not/FindSet: a, target  */
-		p = skip_term(p + 1, end); return skip_term(p, end);
+		p = skip_term_d(p + 1, end, depth + 1); return skip_term_d(p, end, depth + 1);
 	case 0x75: case 0x76:                               /* Increment/Decrement     */
 	case 0x83: case 0x87:                               /* DerefOf / SizeOf        */
-		return skip_term(p + 1, end);
+		return skip_term_d(p + 1, end, depth + 1);
 	case 0x88:                                          /* Index: src, idx, target */
-		p = skip_term(p + 1, end); p = skip_term(p, end); return skip_term(p, end);
+		p = skip_term_d(p + 1, end, depth + 1); p = skip_term_d(p, end, depth + 1);
+		return skip_term_d(p, end, depth + 1);
 	case 0x90: case 0x91: case 0x93: case 0x94: case 0x95:  /* logical: a, b       */
-		p = skip_term(p + 1, end); return skip_term(p, end);
+		p = skip_term_d(p + 1, end, depth + 1); return skip_term_d(p, end, depth + 1);
 	case 0x92: {                                        /* LNot / LNotEqual etc.   */
 		p++;
 		uint8_t nx = (p < end) ? *p : 0;
 		if (nx == 0x93 || nx == 0x94 || nx == 0x95) {
-			p = skip_term(p + 1, end); return skip_term(p, end);
+			p = skip_term_d(p + 1, end, depth + 1); return skip_term_d(p, end, depth + 1);
 		}
-		return skip_term(p, end);
+		return skip_term_d(p, end, depth + 1);
 	}
 	case 0x5B: return (p + 1 < end && p[1] == 0x30) ? p + 2 : p + 2;   /* Revision */
 	default:
@@ -618,6 +633,11 @@ static const uint8_t *skip_term(const uint8_t *p, const uint8_t *end)
 		}
 		return p + 1;                                  /* unknown: best effort     */
 	}
+}
+
+static const uint8_t *skip_term(const uint8_t *p, const uint8_t *end)
+{
+	return skip_term_d(p, end, 0);
 }
 
 /* Get a constant integer if the term is one; otherwise skip the whole term and
@@ -718,7 +738,11 @@ static int region_read(struct ns_node *reg, uint32_t bit_off, uint32_t width,
 		} else {
 			return 0;
 		}
-		raw |= (uint64_t)b << (8 * i);
+		/* nbytes can be 9 for a 64-bit field at a non-byte-aligned offset; the
+		 * 9th byte's shift would be << 64 (UB) and contributes nothing after the
+		 * later >> shift, so skip any byte whose shift reaches 64. */
+		if (8 * i < 64)
+			raw |= (uint64_t)b << (8 * i);
 	}
 	raw >>= shift;
 	if (width < 64) raw &= ((uint64_t)1 << width) - 1;
@@ -971,7 +995,7 @@ static void store_through(struct obj target, struct obj val, struct frame *fr)
 static struct obj eval_package(struct frame *fr)
 {
 	const uint8_t *pkgstart = g_p;
-	uint32_t len = pkglength(&g_p);
+	uint32_t len = pkglength(&g_p, g_end);
 	const uint8_t *pend = pkgstart + len;
 	if (pend > g_end) pend = g_end;
 	uint32_t n = (g_p < pend) ? *g_p++ : 0;
@@ -1057,13 +1081,14 @@ static struct obj eval_string(void)
 	struct obj o; o.type = T_STR; o.ival = 0; o.elems = 0; o.nelems = 0;
 	o.reftype = 0; o.ref = 0; o.data = arena_alloc(l + 1); o.dlen = l;
 	if (o.data) { for (uint32_t i = 0; i < l; i++) o.data[i] = s[i]; o.data[l] = 0; }
+	else o.dlen = 0;                 /* arena exhausted: don't advertise data we lack */
 	return o;
 }
 
 static struct obj eval_buffer(struct frame *fr)
 {
 	const uint8_t *pkgstart = g_p;
-	uint32_t len = pkglength(&g_p);
+	uint32_t len = pkglength(&g_p, g_end);
 	const uint8_t *bend = pkgstart + len;
 	if (bend > g_end) bend = g_end;
 	const uint8_t *save_end = g_end; g_end = bend;
@@ -1076,6 +1101,7 @@ static struct obj eval_buffer(struct frame *fr)
 	o.reftype = 0; o.ref = 0; o.dlen = (uint32_t)size;
 	o.data = arena_alloc((uint32_t)size + 1);
 	if (o.data) for (uint32_t i = 0; i < size; i++) o.data[i] = databytes[i];
+	else o.dlen = 0;                 /* arena exhausted: don't advertise data we lack */
 	g_p = bend;
 	return o;
 }
@@ -1256,10 +1282,16 @@ static struct obj aml_eval_inner(struct frame *fr)
 	case 0x00: return mk_int(0);
 	case 0x01: return mk_int(1);
 	case 0xFF: return mk_int(~0ull);
-	case 0x0A: { uint64_t v = rd(g_p, 1); g_p += 1; return mk_int(v); }
-	case 0x0B: { uint64_t v = rd(g_p, 2); g_p += 2; return mk_int(v); }
-	case 0x0C: { uint64_t v = rd(g_p, 4); g_p += 4; return mk_int(v); }
-	case 0x0E: { uint64_t v = rd(g_p, 8); g_p += 8; return mk_int(v); }
+	/* Constant width bytes may run past g_end in a truncated method — the entry
+	 * check only guarantees one byte — so bound each rd() before reading. */
+	case 0x0A: { if (g_p + 1 > g_end) { fail("truncated"); return mk_int(0); }
+		     uint64_t v = rd(g_p, 1); g_p += 1; return mk_int(v); }
+	case 0x0B: { if (g_p + 2 > g_end) { fail("truncated"); return mk_int(0); }
+		     uint64_t v = rd(g_p, 2); g_p += 2; return mk_int(v); }
+	case 0x0C: { if (g_p + 4 > g_end) { fail("truncated"); return mk_int(0); }
+		     uint64_t v = rd(g_p, 4); g_p += 4; return mk_int(v); }
+	case 0x0E: { if (g_p + 8 > g_end) { fail("truncated"); return mk_int(0); }
+		     uint64_t v = rd(g_p, 8); g_p += 8; return mk_int(v); }
 	case 0x0D: return eval_string();          /* String */
 	case 0x11: return eval_buffer(fr);        /* Buffer */
 	case 0x12: case 0x13: return eval_package(fr);   /* Package / VarPackage */
@@ -1348,7 +1380,7 @@ static void exec_list(struct frame *fr, const uint8_t *start, const uint8_t *end
 		if (op == 0xA0) {                     /* If: PkgLen Predicate Body */
 			g_p++;
 			const uint8_t *pkgstart = g_p;
-			uint32_t len = pkglength(&g_p);
+			uint32_t len = pkglength(&g_p, end);
 			const uint8_t *bend = pkgstart + len;
 			if (bend > end) bend = end;
 			uint64_t pred = to_int(aml_eval(fr));
@@ -1358,7 +1390,7 @@ static void exec_list(struct frame *fr, const uint8_t *start, const uint8_t *end
 			if (after < end && *after == 0xA1) {
 				const uint8_t *q = after + 1;
 				const uint8_t *es = q;
-				uint32_t elen = pkglength(&q);
+				uint32_t elen = pkglength(&q, end);
 				else_body = q; else_end = es + elen;
 				if (else_end > end) else_end = end;
 				after = es + elen;
@@ -1369,12 +1401,12 @@ static void exec_list(struct frame *fr, const uint8_t *start, const uint8_t *end
 		} else if (op == 0xA1) {              /* stray Else: skip */
 			g_p++;
 			const uint8_t *es = g_p;
-			uint32_t elen = pkglength(&g_p);
+			uint32_t elen = pkglength(&g_p, end);
 			g_p = es + elen;
 		} else if (op == 0xA2) {              /* While: PkgLen Predicate Body */
 			g_p++;
 			const uint8_t *pkgstart = g_p;
-			uint32_t len = pkglength(&g_p);
+			uint32_t len = pkglength(&g_p, end);
 			const uint8_t *bend = pkgstart + len;
 			if (bend > end) bend = end;
 			const uint8_t *pred_at = g_p;
@@ -1410,7 +1442,7 @@ static void build_one(const uint8_t *body, uint32_t len, void *ctx)
 {
 	(void)ctx;
 	uint32_t root[1] = { 0 };                 /* depth 0 = root "\" (unused)  */
-	ns_walk(body, body + len, root, 0);
+	ns_walk(body, body + len, root, 0, 0);
 }
 
 static void ns_map_only(const uint8_t *b, uint32_t l, void *c)

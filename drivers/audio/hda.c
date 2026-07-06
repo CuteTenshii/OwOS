@@ -120,7 +120,7 @@ static int      hda_muted;
 static volatile uint32_t *corb;    /* CORB_N dwords                          */
 static volatile uint32_t *rirb;    /* RIRB_N * 2 dwords (resp, resp_ex)      */
 static volatile uint32_t *bdl;     /* buffer descriptor list                 */
-static uint8_t           *audio;   /* the 32 KiB stereo S16 cyclic buffer    */
+static uint8_t           *audio;   /* the 192 KiB stereo S16 cyclic buffer    */
 static uint32_t corb_phys, rirb_phys, bdl_phys;
 static uint16_t corb_wp;
 
@@ -151,7 +151,7 @@ static uint32_t codec_cmd(uint16_t nid, uint32_t payload)
 	corb[corb_wp] = cmd;
 	wr16(R_CORBWP, corb_wp);
 
-	uint32_t resp = 0;
+	uint32_t resp = 0xFFFFFFFF;            /* sentinel: no response (distinct from 0) */
 	for (int t = 0; t < 100000; t++) {
 		if ((rd16(R_RIRBWP) & 0xFF) == corb_wp) {
 			resp = rirb[corb_wp * 2];     /* response = first dword of entry  */
@@ -172,18 +172,53 @@ static uint32_t get_param(uint16_t nid, uint8_t p)
 
 /* One connection-list entry. Robust to codecs that round the requested index
  * down to a group boundary: fetch the aligned group, then pick our slot. The
- * list is "long form" (16-bit nids) when CONNLEN bit7 is set. */
-static uint16_t conn_entry(uint16_t nid, int longform, int i)
+ * list is "long form" (16-bit nids) when CONNLEN bit7 is set. The entry's top
+ * bit (bit7 short / bit15 long) is the *range* flag, not part of the node id: it
+ * is stripped here and reported via *is_range so the caller can expand the run. */
+static uint16_t conn_entry(uint16_t nid, int longform, int i, int *is_range)
 {
+	uint16_t e;
 	if (longform) {
 		uint32_t r = codec_cmd(nid, V_GET_CONN | (uint32_t)(i & ~1));
-		return (i & 1) ? (uint16_t)(r >> 16) : (uint16_t)(r & 0xFFFF);
+		e = (i & 1) ? (uint16_t)(r >> 16) : (uint16_t)(r & 0xFFFF);
+		if (is_range) *is_range = (e >> 15) & 1;
+		return e & 0x7FFF;
 	}
 	uint32_t r = codec_cmd(nid, V_GET_CONN | (uint32_t)(i & ~3));
-	return (uint16_t)((r >> ((i & 3) * 8)) & 0xFF);
+	e = (uint16_t)((r >> ((i & 3) * 8)) & 0xFF);
+	if (is_range) *is_range = (e >> 7) & 1;
+	return e & 0x7F;
 }
 
-static int widget_type(uint16_t nid) { return (int)((get_param(nid, P_AWCAP) >> 20) & 0xF); }
+/* Expand a widget's connection list into `out` (up to `max`) source node ids,
+ * resolving HDA range entries — a set range bit means "the run from the previous
+ * entry's nid + 1 up to this entry's nid" rather than a literal node. The output
+ * position is the effective connection index (what input-amp routing keys off). */
+static int conn_list(uint16_t nid, uint16_t *out, int max)
+{
+	uint32_t cl = get_param(nid, P_CONNLEN);
+	if (cl == 0xFFFFFFFFu)                    /* codec_cmd timed out: no usable list */
+		return 0;
+	int longf = (cl >> 7) & 1, n = (int)(cl & 0x7F), cnt = 0;
+	uint16_t prev = 0;
+	for (int i = 0; i < n && cnt < max; i++) {
+		int isr = 0;
+		uint16_t e = conn_entry(nid, longf, i, &isr);
+		if (isr && e >= prev)
+			for (uint16_t s = (uint16_t)(prev + 1); s <= e && cnt < max; s++) out[cnt++] = s;
+		else
+			out[cnt++] = e;
+		prev = e;
+	}
+	return cnt;
+}
+
+static int widget_type(uint16_t nid)
+{
+	uint32_t cap = get_param(nid, P_AWCAP);
+	if (cap == 0xFFFFFFFFu) return -1;    /* codec_cmd timed out: not a real widget */
+	return (int)((cap >> 20) & 0xF);
+}
 
 /* Output-amp num-steps (loudest gain value) a widget supports; 0 = no amp. */
 static uint32_t out_steps(uint16_t nid) { return (get_param(nid, P_OUTAMPCAP) >> 8) & 0x7F; }
@@ -211,28 +246,25 @@ static void amp_in_unmute(uint16_t nid, int idx)
  * mixer/selector hop. Fills path_mix/mix_in_idx/pin_sel_idx/mix_is_sel. */
 static int find_dac_path(uint16_t pin)
 {
-	uint32_t cl = get_param(pin, P_CONNLEN);
-	int longf = (cl >> 7) & 1;
-	int n = (int)(cl & 0x7F);
+	uint16_t src[16];
+	int n = conn_list(pin, src, 16);
 
 	for (int i = 0; i < n; i++) {                 /* direct pin -> DAC        */
-		uint16_t src = conn_entry(pin, longf, i);
-		if (src && widget_type(src) == WT_DAC) {
-			dac_nid = src; path_mix = 0; pin_sel_idx = i;
+		if (src[i] && widget_type(src[i]) == WT_DAC) {
+			dac_nid = src[i]; path_mix = 0; pin_sel_idx = i;
 			return 1;
 		}
 	}
 	for (int i = 0; i < n; i++) {                 /* pin -> mixer/sel -> DAC  */
-		uint16_t mid = conn_entry(pin, longf, i);
+		uint16_t mid = src[i];
 		if (!mid) continue;
 		int wt = widget_type(mid);
 		if (wt != WT_MIXER && wt != WT_SEL) continue;
-		uint32_t mcl = get_param(mid, P_CONNLEN);
-		int mlongf = (mcl >> 7) & 1, mn = (int)(mcl & 0x7F);
+		uint16_t msrc[16];
+		int mn = conn_list(mid, msrc, 16);
 		for (int j = 0; j < mn; j++) {
-			uint16_t src = conn_entry(mid, mlongf, j);
-			if (src && widget_type(src) == WT_DAC) {
-				dac_nid = src; path_mix = mid; mix_in_idx = j;
+			if (msrc[j] && widget_type(msrc[j]) == WT_DAC) {
+				dac_nid = msrc[j]; path_mix = mid; mix_in_idx = j;
 				mix_is_sel = (wt == WT_SEL); pin_sel_idx = i;
 				return 1;
 			}
@@ -651,6 +683,8 @@ int hda_stream_write(const void *pcm, uint32_t bytes)
 		return -1;
 	const uint8_t *p = pcm;
 	uint32_t off = 0;
+	uint32_t last_lpib = 0;
+	int stall = 0;               /* consecutive sleeps with LPIB not advancing   */
 	while (off < bytes) {
 		if (keyboard_take_interrupt())
 			return -2;
@@ -668,6 +702,7 @@ int hda_stream_write(const void *pcm, uint32_t bytes)
 			s_wpos += n;
 			off += n;
 			if (s_wpos >= AUDIO_BYTES) {
+				__asm__ volatile ("" ::: "memory");   /* buffer stores complete before RUN */
 				wr8(sd_off + SD_CTL, (uint8_t)(rd8(sd_off + SD_CTL) | 0x02));
 				s_started = 1;
 				s_wpos = 0;
@@ -677,13 +712,19 @@ int hda_stream_write(const void *pcm, uint32_t bytes)
 
 		/* Steady state: write into the bytes the play head has already passed. */
 		uint32_t rpos = rd32(sd_off + SD_LPIB);
+		/* Watchdog: a wedged/lazy controller can leave LPIB frozen (the driver
+		 * doesn't program the DMA position buffer), which would spin us forever.
+		 * Bail after ~4 s of no play-head progress rather than hang the producer. */
+		if (rpos != last_lpib) { last_lpib = rpos; stall = 0; }
 		uint32_t freebytes = (rpos + AUDIO_BYTES - s_wpos) % AUDIO_BYTES;
 		if (freebytes <= STREAM_GUARD) {      /* DMA hasn't freed room yet       */
+			if (++stall > 2000) return off ? (int)off : -1;
 			timer_sleep(2);
 			continue;
 		}
 		uint32_t can = (freebytes - STREAM_GUARD) & ~3u;   /* frame-aligned      */
 		if (can == 0) {
+			if (++stall > 2000) return off ? (int)off : -1;
 			timer_sleep(2);
 			continue;
 		}

@@ -62,6 +62,7 @@ enum jtok {
 typedef struct {
     int         kind;           /* enum jtok                                  */
     int         line;
+    int         col;            /* 1-based column of the token's first char   */
     int         newline_before; /* a line terminator preceded this token (ASI)*/
     const char *start;          /* raw slice into source                      */
     int         len;            /* raw slice length                           */
@@ -76,6 +77,7 @@ typedef struct {
     const char *p;
     const char *end;
     int         line;
+    const char *line_start;     /* first char of the current line, for columns */
     js_arena   *arena;
     int         prev_kind;      /* last non-trivial token kind, for regex test*/
     int         saw_newline;    /* newline seen since the last token          */

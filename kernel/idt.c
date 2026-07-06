@@ -8,6 +8,7 @@
 #include "fb.h"
 #include "syscall.h"
 #include "sched.h"
+#include "signal.h"
 #include "crash.h"
 
 #ifdef __x86_64__
@@ -101,6 +102,38 @@ static char *p_hex(char *p, uint32_t v)
 	return p;
 }
 
+/* Is `a` a present page in the current address space? Unlike paging_user_mapped
+ * this does NOT require the USER bit — the panic stack is a supervisor kernel
+ * stack — so the panic handler can probe a word before dereferencing it and not
+ * double-fault on a corrupt ESP. Walks the live page tables via CR3. */
+#ifdef __x86_64__
+static int addr_present(uint64_t a)
+{
+	uint64_t *t = (uint64_t *)(uintptr_t)((uint64_t)read_cr3() & ~0xFFFull);
+	for (int lvl = 39; lvl >= 12; lvl -= 9) {
+		uint64_t e = t[(a >> lvl) & 0x1FF];
+		if (!(e & 1))
+			return 0;
+		if ((e & 0x80) && lvl > 12)          /* 1 GiB / 2 MiB large page: present */
+			return 1;
+		t = (uint64_t *)(uintptr_t)(e & 0x000FFFFFFFFFF000ull);
+	}
+	return 1;
+}
+#else
+static int addr_present(uint32_t a)
+{
+	uint32_t *pd = (uint32_t *)((uint32_t)read_cr3() & ~0xFFFu);
+	uint32_t pde = pd[a >> 22];
+	if (!(pde & 1))
+		return 0;
+	if (pde & 0x80)                          /* 4 MiB large page: present */
+		return 1;
+	uint32_t *pt = (uint32_t *)(pde & ~0xFFFu);
+	return pt[(a >> 12) & 0x3FF] & 1;
+}
+#endif
+
 /* Render a full-screen crash report to the framebuffer. Under UEFI there is no
  * VGA text console, so without this a fault is an information-free frozen screen
  * (it just looks like a hang). Draws straight to the framebuffer with the
@@ -177,18 +210,33 @@ static void panic_screen(struct registers *r)
 	*p = 0; fb_text(x, y, line, fg, bg); y += lh;
 
 	/* Dump a few words around ESP: the smashed thread frame, to see the full
-	 * corruption pattern (e.g. back-buffer pointers + small ints). Reading the
-	 * faulting stack is safe — it is mapped. TEMP. */
+	 * corruption pattern (e.g. back-buffer pointers + small ints). Probe each word
+	 * first — a fault that corrupted ESP would otherwise double-fault here. TEMP. */
 	p = line; p = p_str(p, "stk:");
 	for (int i = -2; i <= 5; i++) {
-		uint32_t a = r->esp + (uint32_t)(i * 4);
-		p = p_str(p, " "); p = p_hex(p, *(volatile uint32_t *)a);
+		uint32_t a = (uint32_t)r->esp + (uint32_t)(i * 4);
+		p = p_str(p, " ");
+		if (addr_present(a))
+			p = p_hex(p, *(volatile uint32_t *)a);
+		else
+			p = p_str(p, "--------");
 	}
 	*p = 0; fb_text(x, y, line, fg, bg); y += lh * 2;
 
 	fb_text(x, y, "system halted. photograph this screen.", hi, bg);
 
 	fb_present();
+}
+
+/* The signal a ring-3 CPU exception is reported as, mirroring POSIX: #DE -> SIGFPE,
+ * #UD -> SIGILL, everything memory-ish (#PF/#GP/#SS/bounds) -> SIGSEGV. */
+static int fault_signal(uint32_t vec)
+{
+	switch (vec) {
+	case 0:  return SIGFPE;    /* divide error                                  */
+	case 6:  return SIGILL;    /* invalid opcode                                */
+	default: return SIGSEGV;   /* #PF, #GP, #SS, and the rest                    */
+	}
 }
 
 /* Called from isr_common_stub for every CPU exception. */
@@ -201,9 +249,13 @@ void isr_handler(struct registers *r)
 	}
 
 	/* A fault that came from ring 3 (CS RPL = 3) is a user-program bug, not a
-	 * kernel one: record it for a crash window and terminate just that process
-	 * instead of panicking the whole system. */
+	 * kernel one. If the task installed a handler for the matching signal, deliver
+	 * it so the program can recover (e.g. a browser turning a JS-runtime OOM into a
+	 * "tab crashed" page instead of losing the whole app); otherwise record it for a
+	 * crash window and terminate just that process instead of panicking the system. */
 	if (r->int_no < 32 && (r->cs & 3) == 3) {
+		if (sched_fault_signal(r, fault_signal(r->int_no)))
+			return;                /* iret runs the user handler               */
 		crash_record(sched_current_name(), r);
 		sched_exit(139);           /* kill the faulting task; never returns    */
 	}

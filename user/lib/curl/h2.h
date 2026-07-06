@@ -28,7 +28,8 @@ int h2_request(netconn *conn, int scheme_https, const char *authority,
                http_body_fn body, void *ctx);
 
 /* Richer entry point for callers that need more than a bare GET (the browser).
- *   user_agent    overrides the User-Agent (NULL -> "owos-curl").
+ *   user_agent    the User-Agent to send (NULL -> none; a caller wanting one
+ *                 either sets this or puts a user-agent line in extra_headers).
  *   extra_headers a "name: value\r\n…" block of request headers (e.g. Cookie,
  *                 Accept, Accept-Language) — names are lowercased on encode, as
  *                 HTTP/2 requires; when set it replaces the default Accept.

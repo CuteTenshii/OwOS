@@ -112,8 +112,11 @@ static void rx_poll(void)
 		uint16_t status = (uint16_t)(p[0] | (p[1] << 8));
 		uint16_t len    = (uint16_t)(p[2] | (p[3] << 8));
 
-		if (len < 14 || len > 2000 || !(status & 0x01))
-			break;                  /* runt / error / DMA-in-progress  */
+		/* Bound to a real (VLAN-tagged) Ethernet frame. The old 2000 cap
+		 * exceeded the ring's WRAP slack, so an oversized DMA'd length read
+		 * past the buffer allocation. */
+		if (len < 14 || len > 1522 || !(status & 0x01))
+			break;                  /* runt / oversize / error / DMA-in-progress */
 
 		net_rx_frame(p + 4, (uint32_t)len - 4);   /* drop the 4-byte FCS */
 

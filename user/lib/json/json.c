@@ -13,9 +13,13 @@ typedef struct { char *b; int n, cap; } sbuf;
 static int sb_grow(sbuf *s, int need) {
     int nc;
     char *nb;
+    if (need < 0 || s->n > 2147483647 - need) return -1;   /* n+need would overflow int */
     if (s->n + need <= s->cap) return 0;
     nc = s->cap ? s->cap : 64;
-    while (nc < s->n + need) nc *= 2;
+    while (nc < s->n + need) {
+        if (nc > 2147483647 / 2) { nc = s->n + need; break; }   /* avoid *2 wrapping negative */
+        nc *= 2;
+    }
     nb = realloc(s->b, (unsigned)nc);
     if (!nb) return -1;
     s->b = nb; s->cap = nc;

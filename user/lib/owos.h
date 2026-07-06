@@ -26,6 +26,7 @@ int      fork(void);                          /* 0 in child, child pid in parent
 int      execp(const char *name);             /* replace this image; -1 on error */
 int      execp1(const char *name, const char *arg); /* + one argv[1] string      */
 int      waitpid(int pid);                     /* block for a child; its status  */
+#define  WNOHANG 1                             /* waitpid flag (see waitpid_nb)  */
 int      waitpid_nb(int pid, int *status);     /* non-blocking reap: 1 reaped/0 none */
 unsigned uptime(void);                        /* seconds since boot            */
 unsigned msec(void);                          /* milliseconds since boot       */
@@ -75,6 +76,7 @@ int      net_recv(int h, void *buf, int max);
 /* Non-blocking recv: >0 bytes, 0 would-block (no data yet, still open), -1
  * EOF/error, -4 interrupted. Lets an interactive client poll the socket
  * alongside stdin without the blocking recv's idle timeout closing the link. */
+#define  MSG_DONTWAIT 1   /* internal recv flag (net_recv_nb); the wrappers set it */
 int      net_recv_nb(int h, void *buf, int max);
 int      net_close(int h);
 /* ALPN protocol a TLS conn negotiated (user-space TLS returns these): ALPN_H2,
@@ -84,6 +86,7 @@ int      net_close(int h);
 #define ALPN_H2     2
 /* Outgoing IP TTL for a UDP socket (the IP_MULTICAST_TTL analog); mDNS/SSDP
  * need 255. Range 1..255; returns 0 / -1. */
+#define  NET_OPT_TTL 1    /* net_set_ttl option id (the only socket option today)  */
 int      net_set_ttl(int h, int ttl);
 
 /* Server sockets — the passive/bound counterpart to net_connect, over the same
@@ -118,6 +121,12 @@ int  strlen(const char *s);
 int  strcmp(const char *a, const char *b);    /* <0 / 0 / >0                    */
 void strcpy(char *d, const char *s);          /* caller sizes d                 */
 void strcat(char *d, const char *s);          /* caller sizes d                 */
+/* Bounded copy (BSD strlcpy): src into dst, writing at most size-1 bytes and
+ * always NUL-terminating (dst[0]='' when size<=0). Truncates rather than
+ * overflowing — the safe default when the source length isn't provably bounded
+ * (URLs, header/attribute values); prefer over strcpy in those cases. Returns
+ * void here (unlike BSD's size_t), matching this header's strcpy/strcat. */
+void strlcpy(char *dst, const char *src, int size);
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 
 /* Case-insensitive ASCII helpers — shared so each program (browser, curl, the
@@ -148,6 +157,7 @@ int utf8_encode(unsigned cp, char *out);
  * __SIZE_TYPE__ is gcc's builtin for size_t — no header needed. */
 void *memcpy(void *d, const void *s, __SIZE_TYPE__ n);
 void *memset(void *d, int c, __SIZE_TYPE__ n);
+int   memcmp(const void *a, const void *b, __SIZE_TYPE__ n);
 void *memmove(void *d, const void *s, __SIZE_TYPE__ n);
 
 /* Conveniences built on the above. */
@@ -195,11 +205,27 @@ int  win_present(int id);                           /* flush the buffer to scree
 int  win_poll(int id, struct win_event *ev);        /* 1 = got event, 0 = none  */
 void win_wait(int id);                              /* sleep ~a frame for events */
 int  win_close(int id);
+/* 1 if process `pid` owns at least one window, else 0. The terminal uses this to
+ * detach a windowed child (return to the prompt) vs. stream a CLI's output —
+ * so it needs no hardcoded list of which /bin programs are GUI apps. */
+int  win_owned(int pid);
 
 static inline unsigned *win_fb(void) { return (unsigned *)WIN_FB_ADDR; }
 
 int win_settitle(int id, const char *title);   /* set the window's title bar */
 int win_resizable(int id, int on);   /* opt the window in/out of user resizing */
+
+/* Make window `id` a transient (dialog) child of `parent` — both owned by this
+ * process. The compositor stacks `id` above `parent`, moves them together, and
+ * hides `id` from the taskbar/Alt+Tab. `modal` non-zero also blocks pointer/key
+ * input to the rest of the parent's window family until `id` closes. parent < 0
+ * clears the link. Returns 0/-1. See user/lib/dialog for ready-made dialogs. */
+int win_set_parent(int id, int parent, int modal);
+
+/* The client pixel buffer of a window this process owns, in its own address space.
+ * A single-window app just uses win_fb() (WIN_FB_ADDR); a second window (a dialog)
+ * lands in its own slot, whose address this returns (0 if `id` isn't owned). */
+unsigned *win_fb_of(int id);
 
 /* Cursor shape shown while the pointer is over this window's client area (the
  * WM still overrides it with the resize arrow over a grip / hand over the close
@@ -246,7 +272,7 @@ int input_set_bounds(int w, int h);         /* clamp box after a mode change; 0/
  * ascending z (bottom first) and returns the count. win_map maps a window's
  * client buffer at WIN_MAP_ADDR(id) and fills *m; win_unmap drops it. win_set_geom
  * moves/resizes; win_deliver pushes a hit-tested, client-relative event into the
- * window's ring; win_set_focus raises a window (id <= 0 = none). */
+ * window's ring. */
 struct winrec {
 	int id, x, y, w, h;
 	unsigned flags;                         /* UWIN_F_* */
@@ -254,12 +280,14 @@ struct winrec {
 	int owner_pid, z;
 	int buf_w, buf_h;                       /* client buffer size (stride = buf_w) */
 	char title[64];
+	int parent;                             /* transient parent window id, or -1  */
 };
 #define UWIN_F_VISIBLE   0x01
 #define UWIN_F_FOCUSED   0x02
 #define UWIN_F_MINIMIZED 0x04
 #define UWIN_F_MAXIMIZED 0x08
 #define UWIN_F_RESIZABLE 0x10
+#define UWIN_F_MODAL     0x20    /* transient child that blocks its parent family */
 struct winmap { unsigned vaddr; int w, h, stride; };
 struct winevent { unsigned type; int a, b; };   /* type = WEV_*, client-relative */
 
@@ -268,7 +296,6 @@ int win_map(int id, struct winmap *m);               /* 0/-1 */
 int win_unmap(int id);                               /* 0/-1 */
 int win_set_geom(int id, int x, int y, int w, int h);/* 0/-1 */
 int win_deliver(int id, const struct winevent *ev);  /* 0/-1 */
-int win_set_focus(int id);                           /* 0/-1 */
 /* Free slots in a window's key/input event ring (a huge number if the window
  * doesn't queue). Paste flow control: don't push keys faster than the app drains
  * or events past the ring depth are dropped. */
@@ -313,9 +340,14 @@ void *calloc(unsigned nmemb, unsigned size);
 void *realloc(void *ptr, unsigned size);
 void  free(void *ptr);
 
-/* Fill `buf` with `len` cryptographically-strong random bytes (RDRAND, the CPU
- * hardware RNG; a clock/TSC mix only on CPUs lacking it). Shared by crypto. */
+/* Fill `buf` with `len` cryptographically-strong random bytes: RDRAND when the
+ * CPU has it, else the kernel entropy pool (getrandom). Shared by crypto. */
 void  rng_bytes(void *buf, int len);
+
+/* Raw access to the kernel entropy pool (interrupt jitter, SHA-256 ratchet).
+ * Fills buf with up to 256 CSPRNG bytes; returns bytes written or -1. Prefer
+ * rng_bytes, which layers RDRAND on top. */
+int   getrandom(void *buf, int len);
 
 /* Directory enumeration: fill *out with the idx-th child of `path`
  * (NULL/""/"/" = root). Returns 1 if it exists, 0 past the end, -1 on error. */
@@ -364,12 +396,23 @@ int kill(int pid, int sig);               /* post a signal to a task; 0/-1     *
 int getpid(void);                         /* this process's pid                */
 int power(int action);                    /* 0 = shut down, 1 = reboot         */
 
-/* Identity: numeric ids from the kernel; name/home resolved from /etc/passwd. */
+/* Identity: numeric uid from the kernel; name/home resolved from /etc/passwd. */
 int getuid(void);
-int getgid(void);
 int user_ident(char *name, int nmax, char *home, int hmax); /* 1 if found       */
 int gethostname(char *buf, int max);      /* /etc/hostname (default "owos")     */
 int sethostname(const char *name);        /* persist /etc/hostname; 0/-1        */
+
+/* POSIX uname(2): system identity. `machine` is kernel-authoritative (a 32-bit
+ * user program can't read the kernel's arch from its own ELF); `nodename` is the
+ * hostname. Field sizes mirror the kernel's SYS_UNAME struct exactly. */
+struct utsname {
+	char sysname[65];    /* "OwOS"                        */
+	char nodename[65];   /* hostname (/etc/hostname)      */
+	char release[65];    /* OWOS_VERSION                  */
+	char version[65];    /* build/version string          */
+	char machine[65];    /* "i386" | "x86_64"             */
+};
+int uname(struct utsname *out);           /* 0/-1                               */
 
 /* Named local IPC ports (the unix-socket analog). Server: port_open(name,1) ->
  * listen fd, then port_accept(listen) -> a connection fd per client. Client:
@@ -411,7 +454,7 @@ typedef void (*sighandler_t)(int);
 #define SIG_IGN ((sighandler_t)1)
 #define SIG_ERR ((sighandler_t)-1)
 
-#define SA_RESTART 0x10000000u
+/* sa_flags is accepted but unused: an interrupted blocking syscall returns EINTR. */
 
 #define SIG_BLOCK   0
 #define SIG_UNBLOCK 1
@@ -429,6 +472,18 @@ sighandler_t signal(int sig, sighandler_t handler);   /* prev disposition / SIG_
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old);  /* 0/-1 */
 unsigned sigprocmask(int how, const unsigned *set, unsigned *old); /* new blocked mask */
 int raise(int sig);                                   /* send `sig` to ourselves */
+
+/* setjmp/longjmp — non-local jump (start.S). jmp_buf saves the callee-saved regs +
+ * the resume point; longjmp unwinds the stack back to the setjmp call, which then
+ * appears to return `val` (or 1 if val==0). Used for crash recovery. */
+typedef unsigned jmp_buf[6];
+int  setjmp(jmp_buf env);
+void longjmp(jmp_buf env, int val);
+
+/* Force-release the malloc heap spinlock. Only for crash recovery: after a fault
+ * is unwound with longjmp, the interrupted code may have held the lock, so a
+ * recovering handler resets it before allocating again. Never call in normal code. */
+void heap_lock_reset(void);
 
 /* Audio PCM sink (streaming): open a stream, push 48 kHz / 16-bit / signed /
  * stereo frames (4 bytes each), then close. audio_write blocks (back-pressure)
@@ -457,7 +512,10 @@ int mount(const char *dev, const char *point);
 int umount(const char *point);
 
 
-/* Editing key codes delivered via WEV_KEY (mirror kernel/keyboard.h). */
+/* Key codes delivered via WEV_KEY. Two groups. First: bytes the kernel keyboard
+ * driver actually emits — these mirror kernel/keyboard.h exactly (a mismatch
+ * misroutes keys). Chords arrive as base key + KMOD_* (Super+V is 'v'+KMOD_SUPER,
+ * Ctrl+S is 's'+KMOD_CTRL), never a per-chord code. */
 #define KEY_INTR   0x18   /* Ctrl+C: interrupt the running command / cancel line */
 #define KEY_UP     0x01
 #define KEY_DOWN   0x02
@@ -468,9 +526,15 @@ int umount(const char *point);
 #define KEY_DELETE 0x07
 #define KEY_F5     0x0E   /* refresh/reload (the app decides what that means)  */
 #define KEY_F12    0x1D   /* F12: the app decides (the browser opens devtools) */
-#define KEY_SUPER  0x11   /* Windows key: WM-consumed (Start menu), never reaches apps;
-                             defined only to keep 0x11 reserved and this table in sync */
-#define KEY_CLIPHIST 0x1E /* Super+V: the compositor opens the clipboard-history viewer */
+#define KEY_SUPER  0x11   /* Windows key: WM-consumed (Start menu); apps never see it */
+#define KEY_PRTSC  0x80   /* Print Screen: a real key, WM-consumed (compositor captures the
+                             fb); 0x80 because every control code < 0x20 is already taken */
+
+/* Second group: menu/editing accelerators an app synthesises from a chord (via
+ * menu_shortcut); the driver never emits these — they exist so apps agree on one
+ * code per action, and must not collide with the driver-emitted codes above.
+ * (Super+V opens clipboard history, but the compositor reads it as 'v'+KMOD_SUPER
+ * directly, so it needs no code here.) */
 #define KEY_NEW    0x0F   /* Ctrl+N  \                                         */
 #define KEY_OPEN   0x10   /* Ctrl+O   > menu accelerators (see menu_shortcut)  */
 #define KEY_SAVE   0x13   /* Ctrl+S  /                                         */

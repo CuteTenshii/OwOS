@@ -27,6 +27,16 @@ struct js_node;
  * colours warn yellow and error red). */
 enum js_log_level { JS_LOG_LOG, JS_LOG_INFO, JS_LOG_WARN, JS_LOG_ERROR, JS_LOG_DEBUG };
 
+/* `console.log("%c...", css)` styling is carried in-band in the print stream, so
+ * the hook stays a plain (level, text) contract: a `%c` emits JS_STYLE_ON, the
+ * (opaque) CSS text, then JS_STYLE_OFF. Subsequent output is styled by that CSS
+ * until the next directive. The engine passes the CSS through verbatim — the sink
+ * interprets it (the browser devtools maps color/background/font-weight; a plain
+ * terminal sink strips the markers). Newlines/these bytes are removed from the CSS
+ * payload, so a directive never spans a line. */
+#define JS_STYLE_ON  0x01
+#define JS_STYLE_OFF 0x02
+
 struct js_ctx {
     js_object *global;
     js_env    *global_env;
@@ -34,7 +44,7 @@ struct js_ctx {
 
     js_object *object_proto, *function_proto, *array_proto, *string_proto,
               *number_proto, *boolean_proto, *error_proto, *promise_proto,
-              *symbol_proto, *map_proto, *set_proto, *weakmap_proto, *weakset_proto, *date_proto,
+              *symbol_proto, *bigint_proto, *map_proto, *set_proto, *weakmap_proto, *weakset_proto, *date_proto,
               *regexp_proto;
     js_value   sym_iterator;    /* the well-known Symbol.iterator                 */
     js_value   sym_tostringtag; /* the well-known Symbol.toStringTag              */
@@ -50,7 +60,8 @@ struct js_ctx {
     js_object *typedarray_proto, *arraybuffer_proto, *dataview_proto;
     js_object *typed_protos[9];
     /* error subclass prototypes (TypeError, RangeError, ...) chain to error_proto */
-    js_object *type_error_proto, *range_error_proto, *syntax_error_proto, *ref_error_proto;
+    js_object *type_error_proto, *range_error_proto, *syntax_error_proto, *ref_error_proto,
+              *eval_error_proto, *uri_error_proto, *aggregate_error_proto;
 
     int        has_exc;         /* a throw is propagating                        */
     js_value   exc;
@@ -67,8 +78,31 @@ struct js_ctx {
                                  * embedder via js_set_stack_limit.               */
     const char *frames[64];     /* active call frames (function names), innermost
                                  * last — captured into an Error's .stack         */
+    int        frame_line[64];  /* source line of each frame's active call site   */
+    int        frame_col[64];
     int        nframes;
+    int        cur_line, cur_col; /* location of the node currently evaluating —
+                                 * the innermost frame's spot in a stack trace    */
+    char      *async_stack;     /* while a deferred callback runs (a timer/event
+                                 * job), the formatted frames captured at the point
+                                 * it was scheduled; capture_stack appends them so a
+                                 * throw names the scheduling site, not just the
+                                 * callback body. Not owned — the embedder installs
+                                 * and clears it around the call (js_async_*).      */
+    const char *cur_script;     /* embedder-set label of the top-level script or
+                                 * async entry currently executing (a source URL, or
+                                 * "<timer callback>"/"<click listener>"). The engine
+                                 * emits it as the outermost frame of every captured
+                                 * stack, so a trace bottoms out at its origin even
+                                 * when no JS function is on the stack (a timer armed
+                                 * at script top level). Snapshotted into each async
+                                 * capture, so a grafted "scheduled from" segment
+                                 * names the script that armed it. Not owned; the
+                                 * embedder keeps the storage valid (js_set_script). */
     unsigned   rng;             /* Math.random state                             */
+    unsigned   ident_cache_gen; /* generation for the JS_IDENT inline cache; bumped
+                                 * by direct eval, which can inject a binding into an
+                                 * existing scope and so invalidate cached slots     */
     js_value   native_data;     /* the called native's fn->data (bound closure);
                                  * a native reads it at entry before any sub-call */
 
@@ -113,6 +147,24 @@ int      js_run_module(js_ctx *ctx, struct js_node *program, js_object *exports,
  * ctx->has_exc set; callers in native code must check and propagate. */
 js_value js_call(js_ctx *ctx, js_value fn, js_value thisv, js_value *args, int argc);
 js_value js_construct(js_ctx *ctx, js_value fn, js_value *args, int argc);
+
+/* Async stack chaining, for embedders that defer a callback (a timer job, a queued
+ * event) past the call that scheduled it. js_async_capture() snapshots the current
+ * call frames — plus any async parent already installed, so nested deferrals chain —
+ * into a malloc'd string the embedder stores next to the callback (free it when the
+ * scheduled entry is discarded). Right before invoking the callback the embedder
+ * installs it with js_async_enter() and restores the previous with js_async_leave();
+ * any Error created while the callback runs then carries the scheduling frames after
+ * its own, so an uncaught error names the code that armed the callback. */
+char    *js_async_capture(js_ctx *ctx);
+char    *js_async_enter(js_ctx *ctx, char *captured);   /* returns the previous, for js_async_leave */
+void     js_async_leave(js_ctx *ctx, char *prev);
+
+/* Label the top-level script / async entry now executing, so it appears as the
+ * outermost frame of any stack captured from here (see js_ctx.cur_script). The
+ * engine stores the pointer, not a copy — keep `label` valid until the next call
+ * (a stable buffer or a string literal). Pass NULL to clear. */
+void     js_set_script(js_ctx *ctx, const char *label);
 
 /* Exceptions. js_throw sets the pending exception; the *_error helpers build and
  * throw a standard Error subclass and return undefined for convenient `return`. */

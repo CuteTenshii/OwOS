@@ -11,6 +11,8 @@
 #include "owos.h"
 #include "mp3.h"
 #include "alac.h"
+#include "aac.h"
+#include "mp4.h"
 #include "media.h"
 
 /* ---- small spinlock (mirrors the user malloc/blk_lock pattern) ------------ */
@@ -25,9 +27,25 @@ static void munlock(void) { __asm__ volatile ("" ::: "memory"); g_lock = 0; }
 struct media_decoder {
 	int          is_mp3;
 	int          is_alac;
+	int          is_aac;
 	char         path[256];
 	unsigned     size;            /* whole-file bytes                         */
 	unsigned     rate;            /* native sample rate, Hz                   */
+
+	/* AAC (ADTS .aac streamed, or .m4a/.mp4 demuxed) decoded one AU at a time */
+	aac_decoder   *aac;
+	unsigned       aac_channels;
+	short         *aac_pcm;       /* one decoded AU, interleaved int16        */
+	unsigned       aac_have, aac_pos;
+	unsigned char *aac_buf;       /* ADTS sliding input window                */
+	unsigned       aac_bufcap, aac_buflen, aac_bufpos;
+	unsigned       aac_fileoff;   /* next file byte for the ADTS window       */
+	int            aac_src_eof;
+	int            aac_is_mp4;
+	unsigned char *mp4_data;      /* whole-file buffer (mp4 needs random I/O) */
+	mp4           *mp4h;
+	const mp4_track *aac_trk;
+	unsigned       aac_samp, aac_nsamp;
 
 	/* WAV cursor (PCM s8/s16, mono/stereo) */
 	unsigned     w_data_off, w_data_len, w_bits, w_channels, w_frame;
@@ -71,6 +89,80 @@ static double rd_bef64(const unsigned char *p)
 static int tageq(const unsigned char *p, const char *s)
 { return p[0]==s[0] && p[1]==s[1] && p[2]==s[2] && p[3]==s[3]; }
 
+/* Slide unconsumed ADTS bytes to the front of the window and top it up from the
+ * file. Bounds the largest peekable frame to the window capacity. */
+static void aac_refill_adts(media_decoder *d)
+{
+	if (d->aac_bufpos > 0) {
+		unsigned rem = d->aac_buflen - d->aac_bufpos;
+		memmove(d->aac_buf, d->aac_buf + d->aac_bufpos, rem);
+		d->aac_buflen = rem;
+		d->aac_bufpos = 0;
+	}
+	while (d->aac_buflen < d->aac_bufcap && !d->aac_src_eof) {
+		int n = readfile_at(d->path, d->aac_fileoff,
+		                    d->aac_buf + d->aac_buflen, d->aac_bufcap - d->aac_buflen);
+		if (n <= 0) { d->aac_src_eof = 1; break; }
+		d->aac_fileoff += (unsigned)n;
+		d->aac_buflen += (unsigned)n;
+	}
+}
+
+/* Decode the next access unit into d->aac_pcm; returns 1 on success, 0 at EOS. */
+static int aac_next_au(media_decoder *d)
+{
+	uint32_t ns = 0, nc = 0;
+
+	if (d->aac_is_mp4) {
+		const unsigned char *data;
+		unsigned sz = 0;
+		if (d->aac_samp >= d->aac_nsamp) return 0;
+		data = mp4_sample_data(d->mp4h, d->aac_trk, d->aac_samp, &sz);
+		d->aac_samp++;
+		if (!data || sz == 0) return 0;
+		if (aac_decode(d->aac, data, sz, d->aac_pcm, &ns, &nc) != AAC_OK || ns == 0)
+			return 0;
+		d->aac_have = ns; d->aac_pos = 0; d->aac_channels = nc;
+		return 1;
+	}
+
+	/* ADTS: make sure a whole frame is buffered, then decode it. */
+	for (;;) {
+		unsigned avail = d->aac_buflen - d->aac_bufpos;
+		const unsigned char *p = d->aac_buf + d->aac_bufpos;
+		unsigned flen;
+		uint32_t consumed = 0;
+
+		if (avail < 7) {
+			if (d->aac_src_eof && avail < 7) return 0;
+			aac_refill_adts(d);
+			if (d->aac_buflen < 7) return 0;
+			continue;
+		}
+		/* resync to the 0xFFFx sync word if the window drifted */
+		if (p[0] != 0xFF || (p[1] & 0xF6) != 0xF0) {
+			d->aac_bufpos++;
+			continue;
+		}
+		flen = ((unsigned)(p[3] & 3) << 11) | ((unsigned)p[4] << 3) | (p[5] >> 5);
+		if (flen < 7) { d->aac_bufpos++; continue; }
+		if (avail < flen) {
+			if (d->aac_src_eof) return 0;
+			aac_refill_adts(d);
+			continue;
+		}
+		if (aac_decode_adts(d->aac, p, avail, &consumed, d->aac_pcm, &ns, &nc) != AAC_OK
+		    || consumed == 0) {
+			d->aac_bufpos++;             /* skip a byte and try to resync */
+			continue;
+		}
+		d->aac_bufpos += consumed;
+		if (ns == 0) continue;
+		d->aac_have = ns; d->aac_pos = 0; d->aac_channels = nc;
+		return 1;
+	}
+}
+
 static void decode_next(media_decoder *d)
 {
 	if (d->eof) { d->curL = d->curR = 0; return; }
@@ -81,7 +173,12 @@ static void decode_next(media_decoder *d)
 			uint32_t frames = 0;
 			if (d->a_pkt >= d->a_num_packets) { d->eof = 1; d->curL = d->curR = 0; return; }
 			ps = d->a_pkt_size[d->a_pkt];
-			if (ps == 0 || (int)readfile_at(d->path, d->a_pkt_off, d->a_in, ps) < (int)ps ||
+			/* A truncated packet (e.g. a stereo frame carrying only one element)
+			 * leaves some channels unwritten; zero first so those play as silence
+			 * rather than leaking stale heap into the output. */
+			memset(d->a_pcm, 0, (unsigned)d->a_cfg.frame_length * d->a_bpf);
+			if (ps == 0 || ps > alac_max_packet_size(&d->a_cfg) ||
+			    (int)readfile_at(d->path, d->a_pkt_off, d->a_in, ps) < (int)ps ||
 			    alac_decode(d->a_dec, d->a_in, ps, d->a_pcm, &frames) != ALAC_OK || frames == 0)
 			{ d->eof = 1; d->curL = d->curR = 0; return; }
 			d->a_have = frames; d->a_pos = 0;
@@ -104,6 +201,20 @@ static void decode_next(media_decoder *d)
 			d->curL = (short)L; d->curR = (short)R;
 		}
 		d->a_pos++; d->pos_frames++;
+		return;
+	}
+
+	if (d->is_aac) {
+		if (d->aac_pos >= d->aac_have) {                  /* decode the next AU */
+			if (!aac_next_au(d)) { d->eof = 1; d->curL = d->curR = 0; return; }
+		}
+		{
+			unsigned ch = d->aac_channels ? d->aac_channels : 1;
+			const short *p = d->aac_pcm + d->aac_pos * ch;
+			d->curL = p[0];
+			d->curR = (ch >= 2) ? p[1] : p[0];
+		}
+		d->aac_pos++; d->pos_frames++;
 		return;
 	}
 
@@ -187,7 +298,24 @@ void media_seek_ms(media_decoder *d, unsigned ms)
 	if (!d || !d->rate) return;
 	unsigned tgt = (unsigned)((unsigned long long)ms * d->rate / 1000ull);  /* native frame */
 
-	if (d->is_alac) {
+	if (d->is_aac) {
+		if (d->aac_is_mp4) {
+			unsigned ts = d->aac_trk->timescale ? d->aac_trk->timescale : d->rate;
+			long long pts = (long long)((unsigned long long)tgt * ts / (d->rate ? d->rate : 1));
+			unsigned si = mp4_seek_sample(d->aac_trk, pts);
+			d->aac_samp = si;
+			d->pos_frames = si * 1024;          /* ~1024 samples per AU        */
+		} else {
+			unsigned dur = media_duration_ms(d);   /* 0 for raw ADTS -> to start */
+			unsigned off = dur ? (unsigned)((unsigned long long)d->size * ms / dur) : 0;
+			if (off > d->size) off = d->size;
+			d->aac_fileoff = off;
+			d->aac_buflen = d->aac_bufpos = 0;
+			d->aac_src_eof = 0;
+			d->pos_frames = tgt;
+		}
+		d->aac_have = d->aac_pos = 0;
+	} else if (d->is_alac) {
 		/* seek to a packet boundary (frame_length granularity, like MPEG's coarse seek) */
 		unsigned fl = d->a_cfg.frame_length ? d->a_cfg.frame_length : 4096;
 		unsigned pkt = tgt / fl, i, off = d->a_data_off;
@@ -230,16 +358,20 @@ static int load_wav(media_decoder *d, unsigned size)
 		const unsigned char *c = hdr + pos;
 		unsigned sz = rd_le32(c + 4);
 		if (tageq(c, "fmt ")) {
-			fmt = rd_le16(c + 8); channels = rd_le16(c + 10);
-			rate = rd_le32(c + 12); bits = rd_le16(c + 22);
+			if (pos + 24 <= (unsigned)got && sz >= 16) {   /* fmt reads up to c+23 */
+				fmt = rd_le16(c + 8); channels = rd_le16(c + 10);
+				rate = rd_le32(c + 12); bits = rd_le16(c + 22);
+			}
 		} else if (tageq(c, "data")) {
 			data_off = pos + 8; data_len = sz; break;
 		}
-		pos += 8 + sz + (sz & 1);
+		unsigned long long next = (unsigned long long)pos + 8 + sz + (sz & 1);
+		if (next <= pos || next > (unsigned)got) break;    /* untrusted sz: must advance and stay in buffer */
+		pos = (unsigned)next;
 	}
 	if (!data_off || fmt != 1 || (bits != 8 && bits != 16) || channels < 1 || channels > 2)
 		return -1;
-	if (data_off + data_len > size)
+	if (data_len > size - data_off)     /* subtraction form: the add could wrap */
 		data_len = size - data_off;
 
 	d->is_mp3 = 0;
@@ -293,19 +425,19 @@ static int load_alac(media_decoder *d, unsigned size)
 	unsigned pos, valid = 0;
 	int have_desc = 0, have_kuki = 0, have_pakt = 0;
 
-	if (readfile_at(d->path, 0, hdr, 8) < 8 || !tageq(hdr, "caff")) return -1;
+	if (readfile_at(d->path, 0, hdr, 8) < 8 || !tageq(hdr, "caff")) goto fail;
 	pos = 8;
 	while (pos + 12 <= size) {
 		unsigned char ch[12];
 		unsigned long long sz;
 		unsigned body;
-		if (readfile_at(d->path, pos, ch, 12) < 12) return -1;
+		if (readfile_at(d->path, pos, ch, 12) < 12) goto fail;
 		sz = rd_be64(ch + 4);
 		body = pos + 12;
 		if (tageq(ch, "desc")) {
 			unsigned char de[32];
-			if (sz < 32 || readfile_at(d->path, body, de, 32) < 32) return -1;
-			if (!tageq(de + 8, "alac")) return -1;
+			if (sz < 32 || readfile_at(d->path, body, de, 32) < 32) goto fail;
+			if (!tageq(de + 8, "alac")) goto fail;
 			d->a_cfg.sample_rate = (unsigned)rd_bef64(de);
 			d->a_cfg.frame_length = rd_be32(de + 20);
 			d->a_cfg.num_channels = rd_be32(de + 24);
@@ -313,24 +445,29 @@ static int load_alac(media_decoder *d, unsigned size)
 		} else if (tageq(ch, "kuki")) {
 			unsigned char *k = read_range(d->path, body, (unsigned)sz);
 			int rc;
-			if (!k) return -1;
+			if (!k) goto fail;
 			rc = alac_parse_cookie(k, (unsigned)sz, &d->a_cfg);
 			free(k);
-			if (rc != ALAC_OK) return -1;
+			if (rc != ALAC_OK) goto fail;
 			have_kuki = 1;
 		} else if (tageq(ch, "pakt")) {
 			unsigned char *pk = read_range(d->path, body, (unsigned)sz), *p, *end;
 			unsigned i;
-			if (!pk || sz < 24) { free(pk); return -1; }
+			if (!pk || sz < 24) { free(pk); goto fail; }
 			d->a_num_packets = (unsigned)rd_be64(pk + 0);
 			valid = (unsigned)rd_be64(pk + 8);
+			/* a_num_packets is untrusted: reject counts that overflow the size-
+			 * table alloc, or exceed the chunk (each varint is >= 1 byte, table
+			 * starts at pk+24). */
+			if (d->a_num_packets > (0xFFFFFFFFu / sizeof(unsigned)) ||
+			    d->a_num_packets > (sz - 24)) { free(pk); goto fail; }
 			d->a_pkt_size = malloc((d->a_num_packets ? d->a_num_packets : 1) * sizeof(unsigned));
-			if (!d->a_pkt_size) { free(pk); return -1; }
+			if (!d->a_pkt_size) { free(pk); goto fail; }
 			p = pk + 24; end = pk + sz;
 			for (i = 0; i < d->a_num_packets; i++) {
 				int used;
 				d->a_pkt_size[i] = caf_varint(p, end, &used);
-				if (!used) { free(pk); return -1; }
+				if (!used) { free(pk); goto fail; }
 				p += used;
 			}
 			free(pk);
@@ -338,17 +475,19 @@ static int load_alac(media_decoder *d, unsigned size)
 		} else if (tageq(ch, "data")) {
 			d->a_data_off = body + 4;        /* skip 4-byte mEditCount */
 		}
-		if (sz == (unsigned long long)-1) break;
-		pos = body + (unsigned)sz;
+		if (sz == (unsigned long long)-1) break;           /* data-to-EOF sentinel */
+		unsigned long long next = (unsigned long long)body + sz;
+		if (next <= pos || next > size) break;             /* untrusted sz: must advance and stay in file */
+		pos = (unsigned)next;
 	}
-	if (!have_desc || !have_kuki || !have_pakt || !d->a_data_off) return -1;
-	if (d->a_cfg.num_channels < 1 || d->a_cfg.num_channels > 2) return -1;
+	if (!have_desc || !have_kuki || !have_pakt || !d->a_data_off) goto fail;
+	if (d->a_cfg.num_channels < 1 || d->a_cfg.num_channels > 2) goto fail;
 
 	d->a_dec = alac_decoder_open(&d->a_cfg);
 	d->a_bpf = alac_bytes_per_frame(&d->a_cfg);
 	d->a_in  = malloc(alac_max_packet_size(&d->a_cfg));
 	d->a_pcm = malloc(d->a_cfg.frame_length * d->a_bpf);
-	if (!d->a_dec || !d->a_in || !d->a_pcm) return -1;
+	if (!d->a_dec || !d->a_in || !d->a_pcm) goto fail;
 
 	d->is_alac = 1;
 	d->size = size;
@@ -356,6 +495,82 @@ static int load_alac(media_decoder *d, unsigned size)
 	d->total_frames = valid;
 	d->a_pkt = 0; d->a_pkt_off = d->a_data_off; d->a_have = d->a_pos = 0;
 	return 0;
+
+	/* A malformed .caf can fail after partial allocation; free it here so media_open
+	 * only has to free `d` (pointers are zeroed so media_close stays double-free safe). */
+fail:
+	if (d->a_dec) alac_decoder_close(d->a_dec);
+	free(d->a_pkt_size); free(d->a_in); free(d->a_pcm);
+	d->a_dec = 0; d->a_pkt_size = 0; d->a_in = 0; d->a_pcm = 0;
+	return -1;
+}
+
+/* Raw ADTS AAC: open a streaming decoder and prime the first access unit so the
+ * native rate/channels are known (a long song is pulled through a small window). */
+static int load_aac_adts(media_decoder *d, unsigned size)
+{
+	aac_info info;
+	d->aac = aac_open_adts();
+	if (!d->aac) return -1;
+	d->aac_bufcap = 16384;
+	d->aac_buf = malloc(d->aac_bufcap);
+	d->aac_pcm = malloc((unsigned)1024 * AAC_MAX_CHANNELS * sizeof(short));
+	if (!d->aac_buf || !d->aac_pcm) goto fail;
+	d->aac_is_mp4 = 0;
+	d->aac_fileoff = d->aac_buflen = d->aac_bufpos = 0;
+	d->aac_src_eof = 0;
+	aac_refill_adts(d);
+	if (!aac_next_au(d)) goto fail;             /* prime + learn the format    */
+	aac_get_info(d->aac, &info);
+	d->rate = info.sample_rate;
+	d->size = size;
+	d->total_frames = 0;                        /* raw ADTS has no duration    */
+	d->is_aac = 1;
+	return 0;
+fail:
+	if (d->aac) aac_close(d->aac);
+	free(d->aac_buf); free(d->aac_pcm);
+	d->aac = 0; d->aac_buf = 0; d->aac_pcm = 0;
+	return -1;
+}
+
+/* AAC in an MP4/.m4a container: demux the whole file, take the AAC audio track,
+ * and configure the decoder from its AudioSpecificConfig. Samples (access units)
+ * are then pulled one at a time by decode_next. */
+static int load_aac_mp4(media_decoder *d, unsigned size)
+{
+	aac_info info;
+	const mp4_track *t;
+	d->mp4_data = read_range(d->path, 0, size);
+	if (!d->mp4_data) return -1;
+	if (mp4_open(d->mp4_data, size, &d->mp4h) != MP4_OK) goto fail;
+	t = mp4_audio_track(d->mp4h);
+	if (!t || t->codec != MP4_CODEC_AAC || !t->extradata || t->extradata_len == 0)
+		goto fail;
+	d->aac = aac_open(t->extradata, t->extradata_len, &info);
+	if (!d->aac) goto fail;
+	d->aac_pcm = malloc((unsigned)1024 * AAC_MAX_CHANNELS * sizeof(short));
+	if (!d->aac_pcm) goto fail;
+	d->aac_is_mp4 = 1;
+	d->aac_trk = t;
+	d->aac_nsamp = t->n_samples;
+	d->aac_samp = 0;
+	d->aac_channels = info.channels;
+	d->rate = info.sample_rate ? info.sample_rate
+	        : (t->samplerate ? t->samplerate : 44100);
+	d->size = size;
+	if (t->timescale)
+		d->total_frames = (unsigned)((unsigned long long)t->duration * d->rate / t->timescale);
+	else
+		d->total_frames = t->n_samples * 1024;
+	d->is_aac = 1;
+	return 0;
+fail:
+	if (d->aac) aac_close(d->aac);
+	if (d->mp4h) mp4_close(d->mp4h);
+	free(d->mp4_data); free(d->aac_pcm);
+	d->aac = 0; d->mp4h = 0; d->mp4_data = 0; d->aac_pcm = 0;
+	return -1;
 }
 
 media_decoder *media_open(const char *path)
@@ -378,6 +593,10 @@ media_decoder *media_open(const char *path)
 		rc = load_wav(d, st.size);
 	else if (g >= 8 && tageq(sn, "caff"))
 		rc = load_alac(d, st.size);
+	else if (g >= 8 && tageq(sn + 4, "ftyp"))            /* .m4a / .mp4 (AAC)   */
+		rc = load_aac_mp4(d, st.size);
+	else if (g >= 2 && sn[0] == 0xFF && (sn[1] & 0xF6) == 0xF0)  /* ADTS .aac    */
+		rc = load_aac_adts(d, st.size);
 	else
 		rc = load_mp3(d, st.size);
 	if (rc != 0) { free(d); return 0; }
@@ -397,6 +616,11 @@ void media_close(media_decoder *d)
 	if (!d) return;
 	if (d->is_mp3) mp3_close(&d->m3);
 	if (d->is_alac) { alac_decoder_close(d->a_dec); free(d->a_pkt_size); free(d->a_in); free(d->a_pcm); }
+	if (d->is_aac) {
+		aac_close(d->aac);
+		if (d->mp4h) mp4_close(d->mp4h);
+		free(d->mp4_data); free(d->aac_buf); free(d->aac_pcm);
+	}
 	free(d);
 }
 
@@ -509,10 +733,17 @@ static void mixer_thread(void)
 			if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
 			g_out[i] = (short)v;
 		}
-		if (audio_write(g_out, max_filled * MEDIA_CH * 2) < 0) {
-			/* device error or a stray Ctrl+C latch: drop the stream and retry. */
-			audio_close(); g_stream_open = 0;
-			msleep(10);
+		/* audio_write may accept fewer bytes than offered; feed the remainder
+		 * rather than dropping the tail. w <= 0 is a device error / Ctrl+C latch. */
+		int total = max_filled * MEDIA_CH * 2, off = 0;
+		while (off < total) {
+			int w = audio_write((unsigned char *)g_out + off, total - off);
+			if (w <= 0) {
+				audio_close(); g_stream_open = 0;
+				msleep(10);
+				break;
+			}
+			off += w;
 		}
 	}
 }

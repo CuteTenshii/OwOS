@@ -22,6 +22,13 @@ void gfx_init(unsigned *fb, int w, int h)
 	g_cx0 = 0; g_cy0 = 0; g_cx1 = w; g_cy1 = h;
 }
 
+void gfx_get(unsigned **fb, int *w, int *h)
+{
+	if (fb) *fb = g_fb;
+	if (w)  *w  = g_w;
+	if (h)  *h  = g_h;
+}
+
 void gfx_clip_none(void) { g_cx0 = 0; g_cy0 = 0; g_cx1 = g_w; g_cy1 = g_h; }
 
 void gfx_set_clip(int x, int y, int w, int h)
@@ -54,18 +61,22 @@ void gfx_pixel(int x, int y, unsigned color)
 
 void gfx_fill_rect(int x, int y, int w, int h, unsigned color)
 {
-	if (x < 0) { w += x; x = 0; }
-	if (y < 0) { h += y; y = 0; }
-	if (x + w > g_w) w = g_w - x;
-	if (y + h > g_h) h = g_h - y;
+	/* Edges in 64-bit: a hostile w/h near INT_MAX would otherwise wrap x+w
+	 * negative, skip the clamp, and let fill32 run off the framebuffer. */
+	long long rx0 = x, ry0 = y, rx1 = (long long)x + w, ry1 = (long long)y + h;
+	if (rx0 < 0) rx0 = 0;
+	if (ry0 < 0) ry0 = 0;
+	if (rx1 > g_w) rx1 = g_w;
+	if (ry1 > g_h) ry1 = g_h;
 	/* intersect with the active clip rect */
-	if (x < g_cx0) { w -= g_cx0 - x; x = g_cx0; }
-	if (y < g_cy0) { h -= g_cy0 - y; y = g_cy0; }
-	if (x + w > g_cx1) w = g_cx1 - x;
-	if (y + h > g_cy1) h = g_cy1 - y;
-	if (w <= 0 || h <= 0) return;
-	for (int r = 0; r < h; r++)
-		fill32(g_fb + (long)(y + r) * g_w + x, color, w);
+	if (rx0 < g_cx0) rx0 = g_cx0;
+	if (ry0 < g_cy0) ry0 = g_cy0;
+	if (rx1 > g_cx1) rx1 = g_cx1;
+	if (ry1 > g_cy1) ry1 = g_cy1;
+	if (rx1 <= rx0 || ry1 <= ry0) return;
+	int xx = (int)rx0, yy = (int)ry0, ww = (int)(rx1 - rx0), hh = (int)(ry1 - ry0);
+	for (int r = 0; r < hh; r++)
+		fill32(g_fb + (long)(yy + r) * g_w + xx, color, ww);
 }
 
 void gfx_clear(unsigned color) { gfx_fill_rect(0, 0, g_w, g_h, color); }

@@ -16,6 +16,7 @@
 #include "gfx.h"
 #include "clipboard.h"
 #include "mime.h"
+#include "dialog.h"
 
 static int W = 560, H = 360;    /* client size; grows/shrinks on resize */
 #define MAXLINES  200
@@ -304,12 +305,25 @@ static void start_prompt(int mode)
 	prompt_buf[0] = 0;
 }
 
+static int g_win = -1;   /* the editor's window id, for parenting modal dialogs */
+
+/* 1 if it's safe to throw away the current buffer (nothing unsaved, or the user
+ * chose to discard). Guards New / Open, which replace the buffer wholesale. */
+static int confirm_discard(void)
+{
+	if (!modified)
+		return 1;
+	return dialog_confirm(g_win, "Editor", "Discard unsaved changes?");
+}
+
 static void file_action(int item)
 {
 	switch (item) {
-	case 0: ed_clear(); has_name = 0; fname[0] = 0;
+	case 0: if (!confirm_discard()) break;
+	        ed_clear(); has_name = 0; fname[0] = 0;
 	        set_status("new file"); break;
-	case 1: start_prompt(PROMPT_OPEN); break;
+	case 1: if (!confirm_discard()) break;
+	        start_prompt(PROMPT_OPEN); break;
 	case 2: if (has_name) ed_save(fname);
 	        else start_prompt(PROMPT_SAVEAS);
 	        break;
@@ -629,6 +643,7 @@ int main(int argc, char **argv)
 		puts("editor: win_create failed\n");
 		return 1;
 	}
+	g_win = id;
 	gfx_init(win_fb(), W, H);
 	win_cursor(id, WIN_CURSOR_TEXT);   /* I-beam over the text area */
 
@@ -642,7 +657,9 @@ int main(int argc, char **argv)
 		struct win_event ev;
 		while (win_poll(id, &ev)) {
 			need = 1;
-			if (ev.type == WEV_CLOSE) { win_close(id); return 0; }
+			if (ev.type == WEV_CLOSE) {
+				if (confirm_discard()) { win_close(id); return 0; }
+			}
 			else if (ev.type == WEV_KEY) key(id, (char)ev.a);
 			else if (ev.type == WEV_MOUSE) click(ev.a, ev.b);
 			else if (ev.type == WEV_RESIZE) {

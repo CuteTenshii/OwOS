@@ -56,12 +56,13 @@ char *js_arena_strndup(js_arena *a, const char *s, int n) {
     return d;
 }
 
-js_node *js_node_new(js_arena *a, int type, int line) {
+js_node *js_node_new(js_arena *a, int type, int line, int col) {
     js_node *n = (js_node *)js_arena_alloc(a, sizeof(js_node));
     if (!n) return NULL;
     n->type = type;
     n->op = 0;
     n->line = line;
+    n->col = col;
     return n;
 }
 
@@ -141,6 +142,7 @@ static void dump(sbuf *s, js_node *n) {
     sb_putc(s, '(');
     switch (n->type) {
     case JS_NUM:   dtoa(n->u.num, tmp); sb_puts(s, "num "); sb_puts(s, tmp); break;
+    case JS_BIGINT: sb_puts(s, "bigint "); sb_puts(s, n->u.str.s); sb_putc(s, 'n'); break;
     case JS_STR:   sb_puts(s, "str "); sb_quote(s, n->u.str.s, n->u.str.len); break;
     case JS_REGEX: sb_puts(s, "regex /"); sb_puts(s, n->u.regex.pattern); sb_putc(s, '/');
                    sb_puts(s, n->u.regex.flags); break;

@@ -52,13 +52,18 @@ struct cache_entry {
 
 	char           disk[24];         /* on-disk filename (hash of url), or "" */
 	int            dirty;            /* body/headers not yet written to disk */
-	unsigned       lru;              /* bumped on every access; oldest evicts */
-	struct cache_entry *next;
+	unsigned long long hash;         /* url_hash(url): hash-index + bucket key */
+	struct cache_entry *next, *prev; /* LRU list (head = most-recently-used)   */
+	struct cache_entry *hnext;       /* next entry sharing this url's bucket   */
 };
 
-static struct cache_entry *g_cache;
+/* LRU list (head = most-recently-used, tail = eviction victim) for ordering, plus
+ * a URL-hash bucket index over the same entries so lookup is O(1) average instead
+ * of a full-list scan. Both are kept in sync on every insert/access/evict. */
+static struct cache_entry *g_head, *g_tail;
+#define CACHE_BUCKETS 256                          /* power of two: url-hash index */
+static struct cache_entry *g_bucket[CACHE_BUCKETS];
 static long                g_bytes;
-static unsigned            g_tick;
 static int                 g_disk_ok;              /* CACHE_DIR is writable      */
 
 /* Files whose entries were evicted; deleted by the next cache_flush (owofs
@@ -67,7 +72,7 @@ static char g_unlink[PEND_UNLINK_MAX][24];
 static int  g_nunlink;
 
 /* Spinlock (xchg + yield), matching resource.c's pool locks. Guards the list,
- * g_bytes, g_tick and the pending-unlink array against the fetch threads. */
+ * the bucket index, g_bytes and the pending-unlink array against the fetch threads. */
 static volatile int g_lock;
 static int lk_xchg(volatile int *p, int v)
 { __asm__ volatile ("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory"); return v; }
@@ -89,15 +94,67 @@ static int is_get(const char *method)
 	return !method || !method[0] || streq_ci(method, "GET");
 }
 
-/* FNV-1a of the URL -> 16 hex chars: the entry's stable on-disk filename, so a
- * re-store overwrites the same file and a reload maps back to it. */
-static void disk_name(const char *url, char *out)
+/* FNV-1a of the URL: keys both the on-disk filename and the in-memory bucket. */
+static unsigned long long url_hash(const char *url)
 {
 	unsigned long long h = 1469598103934665603ULL;
 	for (const char *p = url; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+	return h;
+}
+
+/* The URL hash -> 16 hex chars: the entry's stable on-disk filename, so a
+ * re-store overwrites the same file and a reload maps back to it. */
+static void disk_name(const char *url, char *out)
+{
+	unsigned long long h = url_hash(url);
 	static const char hex[] = "0123456789abcdef";
 	for (int i = 0; i < 16; i++) out[i] = hex[(h >> ((15 - i) * 4)) & 0xf];
 	out[16] = '\0';
+}
+
+static unsigned bucket_of(unsigned long long h) { return (unsigned)(h & (CACHE_BUCKETS - 1)); }
+
+/* Doubly-linked LRU list: push at the head, evict from the tail, move-to-front
+ * on access — so the victim is always g_tail (O(1), no min-scan). */
+static void lru_push_front(struct cache_entry *e)
+{
+	e->prev = 0; e->next = g_head;
+	if (g_head) g_head->prev = e; else g_tail = e;
+	g_head = e;
+}
+static void lru_remove(struct cache_entry *e)
+{
+	if (e->prev) e->prev->next = e->next; else g_head = e->next;
+	if (e->next) e->next->prev = e->prev; else g_tail = e->prev;
+	e->prev = e->next = 0;
+}
+static void lru_touch(struct cache_entry *e)
+{
+	if (g_head == e) return;
+	lru_remove(e);
+	lru_push_front(e);
+}
+
+/* Hash-bucket index (intrusive hnext chain per bucket). */
+static void idx_insert(struct cache_entry *e)
+{
+	unsigned b = bucket_of(e->hash);
+	e->hnext = g_bucket[b]; g_bucket[b] = e;
+}
+static void idx_remove(struct cache_entry *e)
+{
+	struct cache_entry **pp = &g_bucket[bucket_of(e->hash)];
+	while (*pp && *pp != e) pp = &(*pp)->hnext;
+	if (*pp) *pp = e->hnext;
+	e->hnext = 0;
+}
+
+/* Link a fully-populated entry into both the LRU list (front) and the index. */
+static void entry_link(struct cache_entry *e)
+{
+	e->hash = url_hash(e->url);
+	idx_insert(e);
+	lru_push_front(e);
 }
 
 static void disk_path(const char *name, char *out, int cap)
@@ -109,8 +166,9 @@ static void disk_path(const char *name, char *out, int cap)
 
 static struct cache_entry *find(const char *url)
 {
-	for (struct cache_entry *e = g_cache; e; e = e->next)
-		if (streq(e->url, url)) return e;
+	unsigned long long h = url_hash(url);
+	for (struct cache_entry *e = g_bucket[bucket_of(h)]; e; e = e->hnext)
+		if (e->hash == h && streq(e->url, url)) return e;
 	return 0;
 }
 
@@ -131,26 +189,23 @@ static void queue_unlink(const char *name)
 	g_nunlink++;
 }
 
-/* Unlink `e` from the list, queue its file for deletion, and free it. */
+/* Unlink `e` from the LRU list and the index, queue its file for deletion, free
+ * it. Both the list and the index are O(1)-ish (no scan of the whole store). */
 static void unlink_free(struct cache_entry *e)
 {
-	struct cache_entry **pp = &g_cache;
-	while (*pp && *pp != e) pp = &(*pp)->next;
-	if (!*pp) return;
-	*pp = e->next; g_bytes -= e->len;
+	lru_remove(e);
+	idx_remove(e);
+	g_bytes -= e->len;
 	queue_unlink(e->disk);
 	entry_free(e);
 }
 
-/* Evict least-recently-used entries until the new body would fit the budget. */
+/* Evict least-recently-used entries (the list tail) until `incoming` fits the
+ * budget. O(1) per eviction now the victim is the tail, not a full min-scan. */
 static void evict_for(int incoming)
 {
-	while (g_cache && g_bytes + incoming > CACHE_MAX_BYTES) {
-		struct cache_entry *oldest = g_cache;
-		for (struct cache_entry *e = g_cache->next; e; e = e->next)
-			if (e->lru < oldest->lru) oldest = e;
-		unlink_free(oldest);
-	}
+	while (g_tail && g_bytes + incoming > CACHE_MAX_BYTES)
+		unlink_free(g_tail);
 }
 
 /* Current age of a stored entry now (RFC 7234 §4.2.3), from its frozen Age/Date
@@ -219,7 +274,7 @@ int cache_lookup(const char *method, const char *url, long now,
 	lk_lock();
 	struct cache_entry *e = find(url);
 	if (!e) { lk_unlock(); return CACHE_MISS; }
-	e->lru = ++g_tick;
+	lru_touch(e);
 
 	int has_validator = e->etag || e->last_mod;
 	int fresh = !e->no_cache && entry_current_age(e, now) < e->freshness;
@@ -271,14 +326,17 @@ void cache_store(const char *method, const char *url, int status, long now,
 		unsigned char *nb = malloc((unsigned)(len ? len : 1));
 		if (!nb) { lk_unlock(); http_headers_free(&H); return; }
 		if (len) memcpy(nb, body, (unsigned)len);
+		/* Drop the old body from the budget, mark e most-recent so it can't be
+		 * its own victim, then evict others so a larger replacement still fits. */
 		g_bytes -= e->len;
+		lru_touch(e);
+		evict_for(len);
 		free(e->body); e->body = nb; e->len = len;
 		free(e->ctype); e->ctype = sdup(ctype);
 		free(e->hdr);   e->hdr   = sdup(hdr_block);
 		e->status = status;
 		set_freshness(e, &cc, now);
 		e->dirty = 1;
-		e->lru = ++g_tick;
 		g_bytes += len;
 		lk_unlock();
 		http_headers_free(&H);
@@ -300,9 +358,7 @@ void cache_store(const char *method, const char *url, int status, long now,
 	set_freshness(e, &cc, now);
 	disk_name(url, e->disk);
 	e->dirty  = 1;
-	e->lru    = ++g_tick;
-	e->next   = g_cache;
-	g_cache   = e;
+	entry_link(e);
 	g_bytes  += len;
 	lk_unlock();
 	http_headers_free(&H);
@@ -324,7 +380,7 @@ int cache_revalidated(const char *url, long now, const char *hdr_block,
 	if (!e) { lk_unlock(); http_headers_free(&H); return 0; }
 	set_freshness(e, &cc, now);          /* refresh freshness from the 304 */
 	e->dirty = 1;                        /* freshness changed: rewrite front matter */
-	e->lru = ++g_tick;
+	lru_touch(e);
 	fill_out(e, body, len, ctype, ctype_cap, hdr, hdr_cap);
 	int ok = *body != 0;
 	lk_unlock();
@@ -363,7 +419,7 @@ void cache_flush(void)
 {
 	if (!g_disk_ok) return;
 	lk_lock();
-	for (struct cache_entry *e = g_cache; e; e = e->next)
+	for (struct cache_entry *e = g_head; e; e = e->next)
 		if (e->dirty && e->disk[0]) { if (write_entry(e) == 0) e->dirty = 0; }
 	for (int i = 0; i < g_nunlink; i++) {
 		char path[128]; disk_path(g_unlink[i], path, sizeof path);
@@ -404,13 +460,14 @@ static int parse_front(const char *fm, int fmlen, char *url, int url_cap,
 	k = 0; for (int i = 0; i < cl && k < ctype_cap - 1; i++) ctype[k++] = c[i]; ctype[k] = '\0';
 
 	*text_len = (int)(nl[3] + 1 - fm);
-	if (*hdr_len < 0 || *body_len < 0 || *body_len > CACHE_MAX_ONE) return -1;
+	if (*hdr_len < 0 || *hdr_len > RESP_HDR_MAX ||
+	    *body_len < 0 || *body_len > CACHE_MAX_ONE) return -1;
 	return 0;
 }
 
-/* Load one cache file into an in-memory entry. Returns the entry (inserted into
- * g_cache, g_bytes updated) or NULL on any problem (the caller then unlinks the
- * bad/oversized file). Single-threaded startup, so no lock. */
+/* Load one cache file into an in-memory entry. Returns the entry (linked into the
+ * LRU list + index, g_bytes updated) or NULL on any problem (the caller then
+ * unlinks the bad/oversized file). Single-threaded startup, so no lock. */
 static struct cache_entry *load_file(const char *name)
 {
 	char path[128]; disk_path(name, path, sizeof path);
@@ -451,8 +508,8 @@ static struct cache_entry *load_file(const char *name)
 	set_freshness(e, &cc, stored_at);
 	http_headers_free(&H);
 
-	e->lru = ++g_tick;
-	e->next = g_cache; g_cache = e; g_bytes += body_len;
+	entry_link(e);
+	g_bytes += body_len;
 	return e;
 }
 

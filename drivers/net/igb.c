@@ -409,7 +409,7 @@ static void rx_poll(void)
 		uint32_t se  = rx_ring[rx_cur].wb.status_error;
 		uint16_t len = rx_ring[rx_cur].wb.length;
 
-		if ((se & RXD_STAT_EOP) && !(se & RXD_ERR_MASK) && len >= 14)
+		if ((se & RXD_STAT_EOP) && !(se & RXD_ERR_MASK) && len >= 14 && len <= BUF_SIZE)
 			net_rx_frame(rx_bufs[rx_cur], len);   /* SECRC already dropped FCS  */
 
 		rx_ring[rx_cur].read.pkt_addr = (uint32_t)rx_bufs[rx_cur]; /* re-arm     */

@@ -14,6 +14,7 @@
 #include "ipc.h"
 #include "uwin.h"
 #include "signal.h"
+#include "syscall.h"
 #include <stdint.h>
 
 /* Tasks are HEAP-ALLOCATED — a `kmalloc`'d task_t per task, linked into the
@@ -52,6 +53,8 @@ typedef struct task {
 	int           state;
 	uint32_t      id;
 	uint32_t      parent;      /* pid of the task that created it              */
+	int           self_reap;   /* detached kernel thread: no parent waitpid's it, so
+	                            * schedule() frees its zombie instead of leaking it */
 	int           wait_pid;    /* pid being waited on while WAITING            */
 	uint32_t      wake_tick;   /* if WAITING for a timed sleep: tick to wake at
 	                            * (0 = not a timed sleep, e.g. a waitpid waiter) */
@@ -131,6 +134,7 @@ static task_t main_task;       /* permanent head of the circular run queue (neve
 static int    count;
 static uint32_t next_id;
 static task_t *current;
+static int    detached_zombies; /* self_reap threads that have exited, awaiting free */
 
 /* Allocate a zeroed task node off the kernel heap (NOT yet on the run queue —
  * the creator fills it in and calls enqueue()). Returns 0 if the heap is full,
@@ -173,10 +177,15 @@ static void enqueue(task_t *t)
 	count++;
 }
 
+/* Return trampoline for a kernel thread whose body returned. Exit cleanly rather
+ * than spinning on a bare hlt: sched_exit marks us a zombie and switches away, so
+ * the task is descheduled (never round-robined, never burning a tick) and we can't
+ * halt the CPU forever if the body happened to return with IF clear. */
 void thread_exit(void)
 {
+	sched_exit(0);
 	for (;;)
-		__asm__ volatile ("hlt");
+		__asm__ volatile ("sti\n\thlt");   /* unreachable; sti keeps hlt safe */
 }
 
 void sched_init(void)
@@ -215,9 +224,14 @@ void sched_create_thread(const char *name, void (*entry)(void))
 	t->dir = 0;
 	t->kstack_top = 0;
 	t->state = TASK_RUNNABLE;
+	t->self_reap = 1;               /* main_task never waitpid's us: self-reap on exit */
 	t->brk = t->brk_base = 0;       /* kernel thread: no user heap             */
 
 	uint8_t *stack = kmalloc(KSTACK_SIZE);
+	if (!stack) {                   /* heap exhausted: don't enqueue a bogus stack */
+		kfree(t);
+		return;
+	}
 	sig_init(t);
 	t->kstack = stack;
 #ifdef __x86_64__
@@ -268,6 +282,11 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir,
 	t->gid = current->gid;
 
 	uint8_t *kstack = kmalloc(UKSTACK_SIZE);
+	if (!kstack) {                  /* heap exhausted: fail rather than enqueue a
+	                                 * task whose saved esp points into low memory */
+		kfree(t);
+		return -1;
+	}
 	t->kstack = kstack;
 	t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
 
@@ -566,6 +585,30 @@ static void reap_task(task_t *t)
 	kfree(t);
 }
 
+/* Free any detached kernel thread that has exited. Such a thread's parent is
+ * main_task, which never waitpid's it, so its node + 64 KiB kstack would leak as
+ * a permanent zombie. It can't free itself (it runs on that kstack), so the
+ * exiting thread only marks itself and the NEXT task to run schedule() reaps it.
+ * `current` is skipped — the exiting thread is still current until it switches
+ * away. Called from schedule() with interrupts already off. */
+static void reap_detached(void)
+{
+	while (detached_zombies > 0) {
+		task_t *z = 0, *t = main_task.next;
+		while (t != &main_task) {
+			if (t != current && t->self_reap && t->state == TASK_ZOMBIE) {
+				z = t;
+				break;
+			}
+			t = t->next;
+		}
+		if (!z)
+			break;
+		reap_task(z);
+		detached_zombies--;
+	}
+}
+
 struct fd *sched_fds(void)
 {
 	return current->fds;
@@ -666,6 +709,10 @@ void sched_sleep_until(uint32_t wake)
 {
 	if (!current)                      /* called before the scheduler exists */
 		return;
+	if (wake == 0)                     /* 0 is the "not a timed sleep" sentinel; a
+	                                    * deadline that wrapped to exactly 0 would never
+	                                    * wake, so nudge it to the next tick */
+		wake = 1;
 	uintptr_t flags = irq_save();      /* set the state + switch atomically vs the IRQ */
 	current->wake_tick = wake;
 	current->state = TASK_WAITING;
@@ -694,55 +741,32 @@ void sched_wake_due(uint32_t now)
 void sched_exit(int status)
 {
 	uwin_task_exiting(current->id);   /* tear down any GUI windows it owns */
+	audio_task_exiting(current->id);  /* release the PCM stream if it held it */
 	fds_close_all(current);
 	current->exit_status = status;
 	current->state = TASK_ZOMBIE;
+	if (current->self_reap)           /* nobody waitpid's us: queue for schedule() to free */
+		detached_zombies++;
 
-	/* Wake the parent if it is blocked waiting for us. */
+	/* Notify the parent of our death. Post SIGCHLD only if the parent installed a
+	 * real handler (default disposition is ignore — posting it then would just leave
+	 * a stale pending bit); wake it if it's blocked in waitpid for us, or if that
+	 * SIGCHLD handler now wants delivery. */
 	task_t *parent = find_task(current->parent);
-	if (parent && parent->state == TASK_WAITING &&
-	    (parent->wait_pid < 0 || parent->wait_pid == (int)current->id))
-		parent->state = TASK_RUNNABLE;
+	if (parent && parent->state != TASK_FREE && parent->state != TASK_ZOMBIE) {
+		uint32_t h = parent->sig_handler[SIGCHLD];
+		int chld = (h != SIG_DFL && h != SIG_IGN);   /* a caught SIGCHLD */
+		int chld_wake = chld && !(parent->sig_blocked & SIGBIT(SIGCHLD));
+		if (chld)
+			parent->sig_pending |= SIGBIT(SIGCHLD);
+		if (parent->state == TASK_WAITING &&
+		    (parent->wait_pid < 0 || parent->wait_pid == (int)current->id || chld_wake))
+			parent->state = TASK_RUNNABLE;
+	}
 
 	schedule();                    /* switch away; never returns               */
 	for (;;)
 		;                          /* unreachable                              */
-}
-
-/* Terminate another task by pid (the streaming bridge aborts a CLI child on
- * Ctrl+C / window close). Make it a zombie so the scheduler stops running it and
- * its parent reaps it; tear down the windows and fds it owns. The task isn't
- * `current` (the killer runs in another context) and this OS is cooperative with
- * no kernel locks, so abandoning its in-kernel state is safe -- it never resumes.
- * Done with interrupts off so a tick can't schedule it mid-teardown. */
-void sched_kill(int pid)
-{
-	uintptr_t fl = irq_save();
-	task_t *t = find_task((uint32_t)pid);
-	if (t && t != current && t->state != TASK_FREE && t->state != TASK_ZOMBIE) {
-		t->exit_status = -1;
-		t->state = TASK_ZOMBIE;       /* unschedulable from here on            */
-		uwin_task_exiting(t->id);
-		fds_close_all(t);
-		task_t *parent = find_task(t->parent);
-		if (parent && parent->state == TASK_WAITING &&
-		    (parent->wait_pid < 0 || parent->wait_pid == (int)t->id))
-			parent->state = TASK_RUNNABLE;
-	}
-	if (fl & 0x200) __asm__ volatile ("sti");
-}
-
-/* Kill a task only if it is a child of the caller -- the guard behind SYS_KILL,
- * so a process can abort a command it spawned (e.g. on window close) but
- * not an unrelated task. Returns 0 on a kill, -1 if pid isn't our live child. */
-int sched_kill_child(int pid)
-{
-	task_t *t = find_task((uint32_t)pid);
-	if (!t || t->parent != current->id ||
-	    t->state == TASK_FREE || t->state == TASK_ZOMBIE)
-		return -1;
-	sched_kill(pid);
-	return 0;
 }
 
 /* ---- signals ------------------------------------------------------------- *
@@ -767,6 +791,17 @@ static int sig_default_ignore(int sig)
 	default:
 		return 0;
 	}
+}
+
+/* Whether task `t`'s current disposition for `sig` is "ignore" (explicit SIG_IGN,
+ * or a default action that is ignore). SIGKILL/SIGSTOP are never ignorable. POSIX:
+ * a signal generated while ignored is discarded, not left pending. */
+static int sig_ignored(task_t *t, int sig)
+{
+	if (sig == SIGKILL || sig == SIGSTOP)
+		return 0;
+	uint32_t h = t->sig_handler[sig];
+	return h == SIG_IGN || (h == SIG_DFL && sig_default_ignore(sig));
 }
 
 /* Lowest-numbered signal that is pending, unblocked, and would actually act (a
@@ -812,9 +847,13 @@ int sched_signal_send(int pid, int sig)
 		return -1;
 	if (sig == 0)
 		return 0;
+	if (sig_ignored(t, sig))
+		return 0;                  /* POSIX: an ignored signal is discarded, not queued */
 	t->sig_pending |= SIGBIT(sig);
 	/* A blocked/sleeping target must become runnable to reach a delivery boundary
-	 * (this also interrupts a timer sleep, like a signal does on Unix). */
+	 * (this also interrupts a timer sleep, like a signal does on Unix). Only a
+	 * deliverable (non-ignored, handled above) signal gets here, so no ignored
+	 * signal ever spuriously wakes a sleeper. */
 	if (t->state == TASK_WAITING)
 		t->state = TASK_RUNNABLE;
 	return 0;
@@ -834,6 +873,8 @@ int sched_sigaction(int sig, const struct k_sigaction *act, struct k_sigaction *
 		current->sig_handler[sig] = act->handler;
 		current->sig_mask[sig]    = act->mask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
 		current->sig_flags[sig]   = act->flags;
+		if (sig_ignored(current, sig))
+			current->sig_pending &= ~SIGBIT(sig);  /* POSIX: setting SIG_IGN discards pending */
 	}
 	return 0;
 }
@@ -934,6 +975,30 @@ void sched_signal_deliver(struct registers *r)
 	t->sig_blocked |= SIGBIT(sig) | t->sig_mask[sig];
 }
 
+/* Turn a synchronous CPU fault (page fault, GP fault, #DE, #UD …) into a delivered
+ * signal when the faulting task has a real handler installed for it, so a program
+ * can recover from its own fault instead of being killed. Returns 1 when the frame
+ * was built (isr_handler iret's into the handler), or 0 when the fault is uncaught
+ * (no handler, or blocked, or an unusable stack) and the caller must crash+exit.
+ *
+ * Unlike an asynchronous kill(2) signal this delivers immediately in the fault's
+ * own context; the saved EIP points AT the faulting instruction, so a handler that
+ * returns via sigreturn re-runs it and re-faults. A crash handler must therefore
+ * not return normally — it longjmp()s out to a recovery point. */
+int sched_fault_signal(struct registers *r, int sig)
+{
+	task_t *t = current;
+	uint32_t h = t->sig_handler[sig];
+	if (h == SIG_DFL || h == SIG_IGN)     /* no user handler: fatal, as before   */
+		return 0;
+	if (t->sig_blocked & SIGBIT(sig))     /* fault while the signal is blocked    */
+		return 0;                         /* -> can't deliver safely: terminate   */
+	if (sigframe_setup(t, r, sig) < 0)    /* stack won't hold the frame           */
+		return 0;
+	t->sig_blocked |= SIGBIT(sig) | t->sig_mask[sig];
+	return 1;
+}
+
 /* SYS_SIGRETURN: the trampoline lands here after the handler returned. The
  * handler's ret popped the 4-byte pretcode, so useresp points just past it — the
  * frame base is useresp-4. Restore the saved context + mask so the interrupted
@@ -945,7 +1010,9 @@ int sched_sigreturn(struct registers *r)
 		return -1;
 	struct sigframe *f = (struct sigframe *)base;
 
-	current->sig_blocked = f->saved_blocked;
+	/* The frame is user-writable: strip SIGKILL/SIGSTOP so a crafted saved mask
+	 * can't make the process unkillable (same guarantee as sched_sigprocmask). */
+	current->sig_blocked = f->saved_blocked & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
 	r->eip     = f->uc.eip;
 	r->useresp = f->uc.esp;
 	/* Restore user flags but sanitize: keep only arithmetic/DF/TF bits, force IF on
@@ -995,6 +1062,8 @@ int sched_waitpid(int pid)
 		current->state = TASK_WAITING;
 		current->wait_pid = pid;
 		schedule();                /* yield; woken when a child exits          */
+		if (sched_intr_pending())  /* a signal wants delivery: bail (EINTR)    */
+			return -1;
 	}
 }
 
@@ -1059,6 +1128,8 @@ void schedule(void)
 	 * context_switch does not touch EFLAGS, so IF stays cleared across the swap
 	 * until this restore (or thread_start's own `sti` for a first run). */
 	uintptr_t flags = irq_save();
+
+	reap_detached();               /* free any exited detached kernel thread    */
 
 	task_t *prev = current;
 	task_t *next = prev->next;

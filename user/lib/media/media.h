@@ -83,4 +83,29 @@ int      media_source_ended(const media_source *s);    /* reached EOS, not loopi
 unsigned media_source_position_ms(const media_source *s);
 unsigned media_source_duration_ms(const media_source *s);
 
+/* ---- video decoder: a local H.264 file -> timed RGB frames ---------------- *
+ * A thin front end over user/lib/h264 (+ user/lib/mp4 for MP4/MOV containers):
+ * it holds the whole file in memory (the demuxer needs random access), decodes
+ * pictures in display order, and hands each back as packed RGB with a
+ * presentation timestamp so a player can pace them against a wall clock. Audio in
+ * a video file is a separate track the caller handles on its own (an MP4's AAC is
+ * not decoded here); this is the picture path only. Compiled into its own object
+ * so only video consumers drag in the H.264 decoder. */
+typedef struct media_video media_video;
+
+/* Open a `.mp4`/`.mov`/`.m4v` (H.264 track) or a raw Annex-B `.264`/`.h264`
+ * elementary stream. Returns a decoder or NULL (missing / not H.264 / unsupported
+ * tool). */
+media_video *media_video_open(const char *path);
+void         media_video_close(media_video *v);
+
+int      media_video_width(const media_video *v);
+int      media_video_height(const media_video *v);
+unsigned media_video_duration_ms(const media_video *v);   /* 0 if unknown */
+
+/* Decode the next picture (display order) into `rgb`, which must hold
+ * width*height*3 bytes (R,G,B). On a frame, sets *pts_ms to its presentation time
+ * and returns 1; returns 0 at end of stream, -1 on a decode error. */
+int media_video_next(media_video *v, unsigned char *rgb, unsigned *pts_ms);
+
 #endif /* OWOS_MEDIA_H */

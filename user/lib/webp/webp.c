@@ -125,14 +125,29 @@ static int htree_build(struct htree *t, const int *len, int n)
 {
 	htree_init(t);
 	int used = 0, last = -1, maxlen = 0;
+	long total_len = 0;
 	for (int i = 0; i < n; i++)
-		if (len[i] > 0) { used++; last = i; if (len[i] > maxlen) maxlen = len[i]; }
+		if (len[i] > 0) { used++; last = i; total_len += len[i]; if (len[i] > maxlen) maxlen = len[i]; }
 	if (used == 0) return 0;                 /* empty code: legal if never used */
 	t->empty = 0;
 	if (used == 1) { t->single = last; return 0; }
 	if (maxlen > 15) return -1;
 
-	t->nodes = malloc((unsigned)(2 * used + 2) * sizeof *t->nodes);
+	/* Reject an over-subscribed code (Kraft inequality). A canonical prefix
+	 * code satisfies sum(2^(maxlen-len)) <= 2^maxlen; a malformed one that
+	 * exceeds it would otherwise build a chain longer than the node pool. */
+	long avail = 1L << maxlen;
+	for (int i = 0; i < n; i++)
+		if (len[i] > 0) {
+			avail -= 1L << (maxlen - len[i]);
+			if (avail < 0) return -1;
+		}
+
+	/* Descending a symbol of length L creates at most L new nodes, so the tree
+	 * never exceeds 1 (root) + sum(len) nodes — the bound below is exact for a
+	 * chain and generous for a complete code. The old 2*used+2 under-counted
+	 * sparse codes and let ht_newnode write past the pool. */
+	t->nodes = malloc((unsigned)(1 + total_len) * sizeof *t->nodes);
 	if (!t->nodes) return -1;
 	ht_newnode(t);                           /* root = node 0                   */
 
@@ -639,20 +654,24 @@ static int scan_container(const unsigned char *buf, int len, struct scan *s)
 	memset(s, 0, sizeof *s);
 	if (len < 12 || !tag_is(buf, "RIFF") || !tag_is(buf + 8, "WEBP"))
 		return WEBP_EBADSIG;
-	int pos = 12;
-	while (pos + 8 <= len) {
+	/* All chunk arithmetic is unsigned: a chunk size with the high bit set must
+	 * not become a negative int and either alias forever or produce a negative
+	 * psize downstream. */
+	unsigned pos = 12;
+	while (pos + 8 <= (unsigned)len) {
 		const unsigned char *c = buf + pos;
 		unsigned size = le32(c + 4);
-		int payload = pos + 8;
-		if (payload > len) break;
-		int avail = len - payload;
-		int psize = (int)size < avail ? (int)size : avail;
-		if (tag_is(c, "VP8X")) { s->has_vp8x = 1; s->vp8x_off = payload; }
+		unsigned payload = pos + 8;
+		unsigned avail = (unsigned)len - payload;
+		int psize = (int)(size < avail ? size : avail);
+		if (tag_is(c, "VP8X")) { s->has_vp8x = 1; s->vp8x_off = (int)payload; }
 		else if (tag_is(c, "ANIM") || tag_is(c, "ANMF")) s->has_anim = 1;
 		else if (tag_is(c, "ALPH")) s->has_alph = 1;
-		else if (tag_is(c, "VP8 ")) { s->has_vp8 = 1; s->vp8_off = payload; s->vp8_size = psize; }
-		else if (tag_is(c, "VP8L")) { s->has_vp8l = 1; s->vp8l_off = payload; s->vp8l_size = psize; }
-		pos = payload + (int)size + ((int)size & 1);
+		else if (tag_is(c, "VP8 ")) { s->has_vp8 = 1; s->vp8_off = (int)payload; s->vp8_size = psize; }
+		else if (tag_is(c, "VP8L")) { s->has_vp8l = 1; s->vp8l_off = (int)payload; s->vp8l_size = psize; }
+		unsigned next = payload + size + (size & 1);
+		if (next <= pos) break;             /* wrap or no forward progress      */
+		pos = next;
 	}
 	return WEBP_OK;
 }

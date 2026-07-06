@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "deflate.h"
+#include "crc32.h"
 
 /* endian.h replacement: load a little-endian uint32 (the only helper used). */
 static inline uint32_t load_le32(const uint8_t *p)
@@ -77,32 +78,6 @@ static void put_u32(uint8_t *p, uint32_t v)
 }
 
 
-/* ---- CRC32 (gzip's polynomial, lazily-built table) --------------------- */
-
-static uint32_t crc_table[256];
-static int crc_ready;
-
-static void crc_build(void)
-{
-	for (uint32_t i = 0; i < 256; i++) {
-		uint32_t c = i;
-		for (int k = 0; k < 8; k++)
-			c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-		crc_table[i] = c;
-	}
-	crc_ready = 1;
-}
-
-static uint32_t crc32(const uint8_t *data, uint32_t n)
-{
-	if (!crc_ready)
-		crc_build();
-	uint32_t c = 0xFFFFFFFFu;
-	for (uint32_t i = 0; i < n; i++)
-		c = crc_table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
-	return c ^ 0xFFFFFFFFu;
-}
-
 /* ---- inflate (DEFLATE decoder) ----------------------------------------- */
 
 struct inbits {
@@ -141,7 +116,7 @@ static uint32_t get_bits(struct inbits *s, int n)
 
 struct huff {
 	short count[MAXBITS + 1];  /* number of codes of each length              */
-	short symbol[MAXLCODES];   /* symbols sorted by (length, value)           */
+	short symbol[FIXLCODES];   /* must hold all 288 fixed codes, not just 286 */
 };
 
 /* Build a canonical Huffman decoding table from per-symbol code lengths. */
@@ -867,7 +842,7 @@ int gzip_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap
 	if (o.err || o.pos + 8 > dcap)
 		return -1;
 
-	put_u32(dst + o.pos, crc32(src, slen));
+	put_u32(dst + o.pos, crc32(0, src, slen));
 	put_u32(dst + o.pos + 4, slen);
 	return (int)(o.pos + 8);
 }
@@ -910,7 +885,7 @@ int gzip_decompress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dc
 	int n = inflate(src, pos, slen - 8, dst, dcap);
 	if (n < 0 || (uint32_t)n != (uint32_t)orig)
 		return -1;
-	if (crc32(dst, (uint32_t)n) != load_le32(src + slen - 8))
+	if (crc32(0, dst, (uint32_t)n) != load_le32(src + slen - 8))
 		return -1;
 	return n;
 }

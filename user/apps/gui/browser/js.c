@@ -12,53 +12,114 @@
  * yet — a known first-cut simplification. console output goes to stdout (fd 1);
  * timers (setTimeout/...) are accepted but do not fire (no event loop yet).
  */
-#include "browser.h"      /* owos.h, dom.h (DOM + lower/streq_ci), struct browser */
-#include "interp.h"       /* js_ctx, js_run, js_call, js_ctx_new, js_def_native   */
-#include "parser.h"       /* js_parse, js_arena                                   */
-#include "gc.h"           /* gc_add_root / gc_remove_root / scopes                */
+#include "jsint.h"        /* internal shared surface (engine ctx + helpers + A())  */
 #include "websocket.h"    /* ws_open / ws_poll / ws_send / ws_close (RFC 6455)    */
 #include "bmedia.h"       /* HTMLMediaElement: <audio>/<video> + new Audio()      */
 #include "clipboard.h"    /* clip_put / clip_get for navigator.clipboard          */
+#include "cast.h"         /* Google Cast sender: HTMLMediaElement.remote backend  */
+#include "notify.h"       /* notify_send: surface Notification() on the desktop    */
+#include "cors.h"          /* cors_origin / cors_same_origin: SW scope + cache keys */
 
-#define A(i) ((i) < argc ? args[i] : js_undef())
-
-
-static js_ctx    *g_ctx;
+js_ctx    *g_ctx;
 static js_object *g_node_proto;         /* Node.prototype (ancestor of element/document) */
 static js_object *g_element_proto;
 static js_object *g_style_proto;
+static js_object *g_classlist_proto;   /* DOMTokenList.prototype (element.classList) */
 static js_object *g_url_proto;
 static js_object *g_sp_proto;
+static js_object *g_formdata_proto;    /* FormData.prototype (shares URLSearchParams' @k/@v) */
 static js_object *g_event_proto;
 static js_object *g_html_proto;        /* HTMLElement.prototype (chains to element) */
-static js_object *g_media_proto;       /* HTMLMediaElement.prototype (audio/video)  */
+js_object *g_media_proto;              /* HTMLMediaElement.prototype (audio/video)  */
+
+/* Standard HTMLxxxElement interfaces: the interface name, the space-separated tag
+ * list it wraps, and (filled at setup) its prototype. Each is exposed as a global
+ * constructor so scripts can reference/extend it (e.g. `class X extends
+ * HTMLScriptElement`), and wrap_node gives a matching element its interface
+ * prototype so `el instanceof HTMLScriptElement` holds. Every prototype chains to
+ * HTMLElement.prototype; tags not listed here wrap as a plain HTMLElement. */
+struct html_iface { const char *name; const char *tags; int media; js_object *proto; };
+static struct html_iface g_html_ifaces[] = {
+    /* `media` = 1 chains to HTMLMediaElement.prototype instead of HTMLElement's,
+     * so <audio>/<video> inherit the media methods and instanceof reflects the
+     * HTMLMediaElement base. Everything else chains straight to HTMLElement. */
+    { "HTMLScriptElement",     "script",             0, 0 },
+    { "HTMLAnchorElement",     "a",                  0, 0 },
+    { "HTMLImageElement",      "img",                0, 0 },
+    { "HTMLInputElement",      "input",              0, 0 },
+    { "HTMLButtonElement",     "button",             0, 0 },
+    { "HTMLFormElement",       "form",               0, 0 },
+    { "HTMLDivElement",        "div",                0, 0 },
+    { "HTMLSpanElement",       "span",               0, 0 },
+    { "HTMLParagraphElement",  "p",                  0, 0 },
+    { "HTMLHeadingElement",    "h1 h2 h3 h4 h5 h6",  0, 0 },
+    { "HTMLUListElement",      "ul",                 0, 0 },
+    { "HTMLOListElement",      "ol",                 0, 0 },
+    { "HTMLLIElement",         "li",                 0, 0 },
+    { "HTMLLinkElement",       "link",               0, 0 },
+    { "HTMLStyleElement",      "style",              0, 0 },
+    { "HTMLMetaElement",       "meta",               0, 0 },
+    { "HTMLTitleElement",      "title",              0, 0 },
+    { "HTMLHeadElement",       "head",               0, 0 },
+    { "HTMLBodyElement",       "body",               0, 0 },
+    { "HTMLHtmlElement",       "html",               0, 0 },
+    { "HTMLIFrameElement",     "iframe",             0, 0 },
+    { "HTMLCanvasElement",     "canvas",             0, 0 },
+    { "HTMLSelectElement",     "select",             0, 0 },
+    { "HTMLOptionElement",     "option",             0, 0 },
+    { "HTMLTextAreaElement",   "textarea",           0, 0 },
+    { "HTMLLabelElement",      "label",              0, 0 },
+    { "HTMLTableElement",      "table",              0, 0 },
+    { "HTMLTableRowElement",   "tr",                 0, 0 },
+    { "HTMLTableCellElement",  "td th",              0, 0 },
+    { "HTMLTableSectionElement","thead tbody tfoot", 0, 0 },
+    { "HTMLPreElement",        "pre",                0, 0 },
+    { "HTMLBRElement",         "br",                 0, 0 },
+    { "HTMLHRElement",         "hr",                 0, 0 },
+    { "HTMLSourceElement",     "source",             0, 0 },
+    { "HTMLTemplateElement",   "template",           0, 0 },
+    { "HTMLPictureElement",    "picture",            0, 0 },
+    { "HTMLDataListElement",   "datalist",           0, 0 },
+    { "HTMLProgressElement",   "progress",           0, 0 },
+    { "HTMLObjectElement",     "object",             0, 0 },
+    { "HTMLVideoElement",      "video",              1, 0 },
+    { "HTMLAudioElement",      "audio",              1, 0 },
+};
 static js_object *g_custom_elements;   /* registry: tag name -> class constructor   */
 static js_object *g_module_cache;      /* ES module registry: abs URL -> namespace  */
 static js_object *g_module_src;         /* prefetched module sources: abs URL -> text */
 static js_object *g_document_proto;    /* shared by the live doc + DOMParser docs    */
-static js_object *g_response_proto;    /* fetch() Response.prototype                  */
+js_object *g_response_proto;    /* fetch() Response.prototype                  */
 static js_object *g_ws_proto;          /* WebSocket.prototype                          */
 static js_object *g_xhr_proto;         /* XMLHttpRequest.prototype                     */
 static js_object *g_blob_proto;        /* Blob.prototype                               */
 static js_object *g_clipitem_proto;    /* ClipboardItem.prototype                      */
+js_object *g_remote_proto;            /* RemotePlayback.prototype (media.remote)      */
+js_object *g_remotes;                      /* rooted array of live RemotePlayback wrappers  */
 static js_object *g_websockets;        /* rooted array of live WebSocket wrappers      */
+static js_object *g_bchannel_proto;    /* BroadcastChannel.prototype                   */
+static js_object *g_bchannels;         /* rooted array of open BroadcastChannel wrappers */
+static js_object *g_notification_proto; /* Notification.prototype                       */
+static js_object *g_notifications;     /* rooted array of wrappers pending show/close   */
 static js_object *g_abortsignal_proto; /* AbortSignal.prototype                        */
 static js_object *g_abortcontroller_proto; /* AbortController.prototype                */
+static js_object *g_rtc_proto;         /* RTCPeerConnection.prototype (inert stub)     */
 static js_object *g_document;
 static struct dom_node *g_doc_root;
 static struct dom_node *g_parsed[64];  /* DOMParser trees, freed at page teardown    */
 static int g_nparsed;
 static res_batch_fn g_fetch;           /* the batch fetch used to pull modules       */
-static char g_page_url_buf[URL_MAX];   /* the page URL (module-resolution referrer)  */
+char g_page_url_buf[URL_MAX];          /* the page URL (module-resolution referrer)  */
 
 /* The JS context now lives for the whole page (not just the initial script run),
  * so registered listeners + closures survive until the next navigation. These
  * hold that persistent state; html_page_teardown() reclaims it. */
 static js_object *g_live_wrappers;     /* rooted array pinning every node wrapper  */
 static int        g_has_listeners;     /* any addEventListener fired this page      */
-static int        g_page_live;         /* a page context is currently alive         */
+int               g_page_live;         /* a page context is currently alive         */
 static js_arena **g_arenas;            /* per-script AST arenas (closures need them); grows */
 static int        g_narenas, g_arenas_cap;
+
 
 /* Timer queue (setTimeout/setInterval/requestAnimationFrame). The engine has no
  * event loop, so timers are driven cooperatively: the worker calls js_timers_pump
@@ -71,13 +132,15 @@ static js_object *g_timers;            /* rooted: slot -> [callback, ...args] or
 static struct timer_meta {
     unsigned char active, repeat, raf;
     long long      due, period;        /* ms; due is the next fire time (now_ms scale) */
+    char          *async;              /* frames captured at the arming call site, so a
+                                        * throw in the callback names who scheduled it
+                                        * (js_async_capture; freed in timer_drop)       */
 } *g_tmeta;
 static int        g_tcap;              /* allocated slots in g_tmeta                  */
 static int        g_ntimers;           /* active count (fast empty-check for the pump) */
 
 /* ------------------------------------------------------- small buffer ----- */
 
-typedef struct { char *b; int n, cap; } sbuf;
 static void sb_need(sbuf *s, int extra) {
     if (s->n + extra + 1 > s->cap) {
         int c = s->cap ? s->cap * 2 : 128;
@@ -86,9 +149,9 @@ static void sb_need(sbuf *s, int extra) {
         s->cap = c;
     }
 }
-static void sb_putc(sbuf *s, char c) { sb_need(s, 1); s->b[s->n++] = c; s->b[s->n] = 0; }
-static void sb_puts(sbuf *s, const char *t) { int n = strlen(t); sb_need(s, n); memcpy(s->b + s->n, t, (unsigned)n); s->n += n; s->b[s->n] = 0; }
-static void sb_putn(sbuf *s, const char *t, int n) { sb_need(s, n); memcpy(s->b + s->n, t, (unsigned)n); s->n += n; s->b[s->n] = 0; }
+void sb_putc(sbuf *s, char c) { sb_need(s, 1); s->b[s->n++] = c; s->b[s->n] = 0; }
+void sb_puts(sbuf *s, const char *t) { int n = strlen(t); sb_need(s, n); memcpy(s->b + s->n, t, (unsigned)n); s->n += n; s->b[s->n] = 0; }
+void sb_putn(sbuf *s, const char *t, int n) { sb_need(s, n); memcpy(s->b + s->n, t, (unsigned)n); s->n += n; s->b[s->n] = 0; }
 
 /* ------------------------------------------------------- node wrappers ---- */
 
@@ -98,7 +161,7 @@ static int memcmp_js(const char *a, const char *b, int n) {
     return 0;
 }
 
-static struct dom_node *node_of(js_value v) {
+struct dom_node *node_of(js_value v) {
     if (v.type != JV_OBJ) return 0;
     return (struct dom_node *)v.u.obj->host;
 }
@@ -106,14 +169,37 @@ static struct dom_node *node_of(js_value v) {
  * The wrapper is cached on the node (dom_node.wrapper) so repeated lookups return
  * the SAME object — node identity, which event listeners depend on. Every wrapper
  * is pinned in g_live_wrappers so its listener closures survive GC for the page. */
-static js_value wrap_node(struct dom_node *n) {
+/* whole-word match of `tag` within the space-separated `list` */
+static int tag_in_list(const char *list, const char *tag) {
+    int tl = strlen(tag);
+    const char *p = list;
+    while (*p) {
+        const char *s = p;
+        while (*p && *p != ' ') p++;
+        if (p - s == tl && memcmp_js(s, tag, tl) == 0) return 1;
+        while (*p == ' ') p++;
+    }
+    return 0;
+}
+
+/* interface prototype for an element tag, or NULL for a plain HTMLElement */
+static js_object *iface_proto_for_tag(const char *tag) {
+    unsigned i;
+    for (i = 0; i < sizeof g_html_ifaces / sizeof g_html_ifaces[0]; i++)
+        if (g_html_ifaces[i].proto && tag_in_list(g_html_ifaces[i].tags, tag))
+            return g_html_ifaces[i].proto;
+    return 0;
+}
+
+js_value wrap_node(struct dom_node *n) {
     js_object *o, *proto;
     if (!n) return js_null();
     if (n->wrapper) return js_obj_value((js_object *)n->wrapper);
-    proto = g_element_proto;
-    if (g_media_proto && n->type == DOM_ELEMENT &&
-        (streq(n->tag, "audio") || streq(n->tag, "video")))
-        proto = g_media_proto;                 /* HTMLMediaElement props/methods */
+    proto = g_html_proto ? g_html_proto : g_element_proto;
+    if (n->type == DOM_ELEMENT) {
+        js_object *ip = iface_proto_for_tag(n->tag);   /* HTMLScriptElement etc.  */
+        if (ip) proto = ip;
+    }
     gc_push_scope();
     o = (js_object *)gc_keep(js_new_object(g_ctx, proto));
     o->host = n;
@@ -130,7 +216,7 @@ static void wrapper_detach(void *wrapper) {
     if (wrapper) ((js_object *)wrapper)->host = 0;
 }
 
-static const char *arg_str(js_ctx *ctx, js_value v) {
+const char *arg_str(js_ctx *ctx, js_value v) {
     js_value s = js_to_string(ctx, v);
     return s.type == JV_STR ? s.u.str->data : "";
 }
@@ -140,7 +226,6 @@ static js_value ce_lookup(const char *tag);
 static void     ce_upgrade_node(struct dom_node *n, js_value cls);
 static void     ce_connect(struct dom_node *n);
 static void     ce_attr_changed(struct dom_node *n, const char *name, const char *oldv, const char *newv);
-static void     copy_str(char *dst, int cap, const char *s);
 
 /* lowercase copy into a fixed buffer */
 static void lower_into(char *dst, int cap, const char *src) {
@@ -273,6 +358,21 @@ static js_value el_set_id(js_ctx *ctx, js_value t, js_value *args, int argc) {
     if (n) dom_set_attr(n, "id", arg_str(ctx, A(0)));
     return js_undef();
 }
+/* .nonce reflects the content attribute. Script loaders (Cloudflare's challenge
+ * bootstrap among them) copy the CSP nonce onto an injected <script> via this IDL
+ * property, not setAttribute; without reflection the content attribute stays empty
+ * and the element's script-src nonce check fails. */
+static js_value el_get_nonce(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t); const char *v;
+    (void)args; (void)argc;
+    v = n ? dom_get_attr(n, "nonce") : 0;
+    return js_mk_cstring(ctx, v ? v : "");
+}
+static js_value el_set_nonce(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    if (n) dom_set_attr(n, "nonce", arg_str(ctx, A(0)));
+    return js_undef();
+}
 static js_value el_get_class(js_ctx *ctx, js_value t, js_value *args, int argc) {
     struct dom_node *n = node_of(t); const char *v;
     (void)args; (void)argc;
@@ -283,6 +383,245 @@ static js_value el_set_class(js_ctx *ctx, js_value t, js_value *args, int argc) 
     struct dom_node *n = node_of(t);
     if (n) dom_set_attr(n, "class", arg_str(ctx, A(0)));
     return js_undef();
+}
+
+/* ------------------------------------------------------- classList --------- */
+/* DOMTokenList over the element's class="" attribute. A fresh wrapper (host =
+ * node) is returned per `.classList` access, like `.style`; the mutating methods
+ * read and rewrite the live class attr, so they never go stale. Mutations
+ * re-serialize the normalized ordered set (whitespace collapsed, duplicates
+ * dropped), matching the DOM's token-list update steps. */
+
+static int cl_is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
+
+/* the node's current class string, or "" (never NULL) */
+static const char *cl_class_of(js_value t) {
+    struct dom_node *n = node_of(t);
+    const char *v = n ? dom_get_attr(n, "class") : 0;
+    return v ? v : "";
+}
+
+/* whole-token membership test over a whitespace-separated list */
+static int cl_has(const char *s, const char *tok, int tl) {
+    if (!s || tl <= 0) return 0;
+    while (*s) {
+        const char *b;
+        while (cl_is_ws(*s)) s++;
+        b = s;
+        while (*s && !cl_is_ws(*s)) s++;
+        if (s - b == tl && memcmp_js(b, tok, tl) == 0) return 1;
+    }
+    return 0;
+}
+
+static int cl_count(const char *s) {
+    int n = 0;
+    while (*s) {
+        while (cl_is_ws(*s)) s++;
+        if (!*s) break;
+        n++;
+        while (*s && !cl_is_ws(*s)) s++;
+    }
+    return n;
+}
+
+/* start pointer + length of the idx-th token, or NULL past the end */
+static const char *cl_nth(const char *s, int idx, int *len) {
+    int n = 0;
+    while (*s) {
+        const char *b;
+        while (cl_is_ws(*s)) s++;
+        if (!*s) break;
+        b = s;
+        while (*s && !cl_is_ws(*s)) s++;
+        if (n == idx) { *len = (int)(s - b); return b; }
+        n++;
+    }
+    return 0;
+}
+
+/* append `tok` to the class sbuf, deduping against what's already there */
+static void cl_emit(sbuf *sb, const char *tok, int tl) {
+    if (tl <= 0) return;
+    if (sb->b && cl_has(sb->b, tok, tl)) return;
+    if (sb->n) sb_putc(sb, ' ');
+    sb_putn(sb, tok, tl);
+}
+
+/* rebuild `n`'s class attr as the current tokens (deduped) with `tok` appended */
+static void cl_write_add(struct dom_node *n, const char *tok, int tl) {
+    const char *cur = dom_get_attr(n, "class"); const char *b; int len, i;
+    sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
+    if (!cur) cur = "";
+    for (i = 0; (b = cl_nth(cur, i, &len)); i++) cl_emit(&sb, b, len);
+    cl_emit(&sb, tok, tl);
+    dom_set_attr(n, "class", sb.b ? sb.b : "");
+    if (sb.b) free(sb.b);
+}
+
+/* rebuild `n`'s class attr as the current tokens minus every copy of `tok` */
+static void cl_write_remove(struct dom_node *n, const char *tok, int tl) {
+    const char *cur = dom_get_attr(n, "class"); const char *b; int len, i;
+    sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
+    if (!cur) cur = "";
+    for (i = 0; (b = cl_nth(cur, i, &len)); i++)
+        if (!(len == tl && memcmp_js(b, tok, len) == 0)) cl_emit(&sb, b, len);
+    dom_set_attr(n, "class", sb.b ? sb.b : "");
+    if (sb.b) free(sb.b);
+}
+
+static js_value cl_add(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    int i;
+    if (!n) return js_undef();
+    for (i = 0; i < argc; i++) {
+        js_value s = js_to_string(ctx, args[i]);
+        const char *tok = s.type == JV_STR ? s.u.str->data : "";
+        int tl = (int)strlen(tok);
+        if (tl) cl_write_add(n, tok, tl);
+    }
+    return js_undef();
+}
+
+static js_value cl_remove(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    int i;
+    if (!n) return js_undef();
+    for (i = 0; i < argc; i++) {
+        js_value s = js_to_string(ctx, args[i]);
+        const char *tok = s.type == JV_STR ? s.u.str->data : "";
+        int tl = (int)strlen(tok);
+        if (tl) cl_write_remove(n, tok, tl);
+    }
+    return js_undef();
+}
+
+/* toggle(token[, force]): with `force` given, force==true adds / false removes
+ * (idempotently) and returns force; otherwise flips and returns the new state. */
+static js_value cl_toggle(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    js_value s = js_to_string(ctx, A(0));
+    const char *tok = s.type == JV_STR ? s.u.str->data : "";
+    int tl = (int)strlen(tok), present;
+    if (!n || tl == 0) return js_bool(0);
+    present = cl_has(cl_class_of(t), tok, tl);
+    if (argc >= 2) {
+        int force = js_to_boolean(args[1]);
+        if (force && !present) cl_write_add(n, tok, tl);
+        else if (!force && present) cl_write_remove(n, tok, tl);
+        return js_bool(force);
+    }
+    if (present) { cl_write_remove(n, tok, tl); return js_bool(0); }
+    cl_write_add(n, tok, tl);
+    return js_bool(1);
+}
+
+/* replace(old, new): swap the first `old` for `new` (dropping duplicates of
+ * either), returning whether `old` was present. */
+static js_value cl_replace(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    js_value ov = js_to_string(ctx, A(0)), nv = js_to_string(ctx, A(1));
+    const char *oldt = ov.type == JV_STR ? ov.u.str->data : "";
+    const char *newt = nv.type == JV_STR ? nv.u.str->data : "";
+    int ol = (int)strlen(oldt), nl = (int)strlen(newt);
+    const char *cur, *b; int len, i;
+    sbuf sb;
+    (void)argc;
+    if (!n || ol == 0 || nl == 0) return js_bool(0);
+    cur = dom_get_attr(n, "class"); if (!cur) cur = "";
+    if (!cl_has(cur, oldt, ol)) return js_bool(0);
+    sb.b = 0; sb.n = 0; sb.cap = 0;
+    for (i = 0; (b = cl_nth(cur, i, &len)); i++) {
+        if (len == ol && memcmp_js(b, oldt, len) == 0) cl_emit(&sb, newt, nl);
+        else cl_emit(&sb, b, len);
+    }
+    dom_set_attr(n, "class", sb.b ? sb.b : "");
+    if (sb.b) free(sb.b);
+    return js_bool(1);
+}
+
+static js_value cl_contains(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value s = js_to_string(ctx, A(0));
+    const char *tok = s.type == JV_STR ? s.u.str->data : "";
+    (void)args; (void)argc;
+    return js_bool(cl_has(cl_class_of(t), tok, (int)strlen(tok)));
+}
+
+static js_value cl_item(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    int idx = (int)js_to_number(ctx, A(0)), len;
+    const char *b;
+    (void)args; (void)argc;
+    b = idx >= 0 ? cl_nth(cl_class_of(t), idx, &len) : 0;
+    return b ? js_mk_string(ctx, b, len) : js_null();
+}
+
+static js_value cl_length(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)ctx; (void)args; (void)argc;
+    return js_number(cl_count(cl_class_of(t)));
+}
+
+static js_value cl_get_value(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)args; (void)argc;
+    return js_mk_cstring(ctx, cl_class_of(t));
+}
+static js_value cl_set_value(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    if (n) dom_set_attr(n, "class", arg_str(ctx, A(0)));
+    return js_undef();
+}
+
+static js_value cl_foreach(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value cb = A(0), thisArg = argc >= 2 ? args[1] : js_undef();
+    const char *b; int i, len;
+    if (!js_is_callable(cb)) return js_undef();
+    for (i = 0; (b = cl_nth(cl_class_of(t), i, &len)); i++) {
+        js_value a[3];
+        a[0] = js_mk_string(ctx, b, len);   /* copied before the callback may mutate */
+        a[1] = js_number(i);
+        a[2] = t;
+        js_call(ctx, cb, thisArg, a, 3);
+    }
+    return js_undef();
+}
+
+/* values/keys/entries + Symbol.iterator: snapshot the tokens into a real array
+ * and delegate to its iterator, so token order and pair shape match the DOM. */
+static js_value cl_iter_kind(js_ctx *ctx, js_value t, const char *method) {
+    js_object *arr; const char *b; int i, len;
+    js_value av, fn;
+    gc_push_scope();
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    for (i = 0; (b = cl_nth(cl_class_of(t), i, &len)); i++)
+        js_array_push(ctx, arr, js_mk_string(ctx, b, len));
+    av = js_obj_value(arr);
+    fn = js_get(ctx, av, method);
+    gc_pop_scope();
+    return js_call(ctx, fn, av, 0, 0);
+}
+static js_value cl_values(js_ctx *ctx, js_value t, js_value *a, int n)  { (void)a; (void)n; return cl_iter_kind(ctx, t, "values"); }
+static js_value cl_keys(js_ctx *ctx, js_value t, js_value *a, int n)    { (void)a; (void)n; return cl_iter_kind(ctx, t, "keys"); }
+static js_value cl_entries(js_ctx *ctx, js_value t, js_value *a, int n) { (void)a; (void)n; return cl_iter_kind(ctx, t, "entries"); }
+
+static js_value el_get_classlist(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_object *o;
+    struct dom_node *n = node_of(t);
+    const char *cur, *b; int i, len;
+    (void)args; (void)argc;
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, g_classlist_proto));
+    o->host = n;
+    /* Snapshot numeric index properties (classList[0]) — the engine has no
+     * index-getter hook, and the wrapper is fresh per access so this is current. */
+    cur = n ? dom_get_attr(n, "class") : 0; if (!cur) cur = "";
+    for (i = 0; (b = cl_nth(cur, i, &len)); i++) {
+        char key[12]; int k = 0, d = i, p;
+        if (d == 0) key[k++] = '0';
+        else { char tmp[12]; int m = 0; while (d) { tmp[m++] = (char)('0' + d % 10); d /= 10; } for (p = m - 1; p >= 0; p--) key[k++] = tmp[p]; }
+        key[k] = '\0';
+        js_def(o, key, js_mk_string(ctx, b, len), P_ENUMERABLE | P_CONFIGURABLE);
+    }
+    gc_pop_scope();
+    return js_obj_value(o);
 }
 /* .src / .href reflect the attribute resolved to an absolute URL (as the real DOM
  * does — e.g. `new URL(script.src)` needs an absolute value). Setters write the
@@ -348,10 +687,10 @@ static js_value el_set_attr(js_ctx *ctx, js_value t, js_value *args, int argc) {
     if (n) {
         char name[64], oldv[256], val[1024];
         const char *ov;
-        copy_str(name, sizeof name, arg_str(ctx, A(0)));
+        strlcpy(name, arg_str(ctx, A(0)), sizeof name);
         ov = dom_get_attr(n, name);
-        copy_str(oldv, sizeof oldv, ov ? ov : "");
-        copy_str(val, sizeof val, arg_str(ctx, A(1)));
+        strlcpy(oldv, ov ? ov : "", sizeof oldv);
+        strlcpy(val, arg_str(ctx, A(1)), sizeof val);
         dom_set_attr(n, name, val);
         ce_attr_changed(n, name, ov ? oldv : 0, val);     /* observedAttributes hook */
     }
@@ -411,7 +750,7 @@ static js_value el_insert_before(js_ctx *ctx, js_value t, js_value *args, int ar
 static js_value el_parent(js_ctx *ctx, js_value t, js_value *args, int argc) {
     struct dom_node *n = node_of(t);
     (void)ctx; (void)args; (void)argc;
-    return n && n->parent && n->parent != g_doc_root ? wrap_node(n->parent) : (n && n->parent ? wrap_node(n->parent) : js_null());
+    return (n && n->parent) ? wrap_node(n->parent) : js_null();
 }
 static js_value el_first_child(js_ctx *ctx, js_value t, js_value *args, int argc) { struct dom_node *n = node_of(t); (void)ctx; (void)args; (void)argc; return n ? wrap_node(n->first_child) : js_null(); }
 static js_value el_last_child(js_ctx *ctx, js_value t, js_value *args, int argc) { struct dom_node *n = node_of(t); (void)ctx; (void)args; (void)argc; return n ? wrap_node(n->last_child) : js_null(); }
@@ -627,10 +966,129 @@ static js_value win_scrollY(js_ctx *ctx, js_value t, js_value *args, int argc) {
 static js_value screen_width(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_number(BW); }
 static js_value screen_height(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_number(BH); }
 
-static js_value el_noop(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_undef(); }
+js_value el_noop(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_undef(); }
 static js_value nav_false(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_bool(0); }
 static js_value el_true(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)ctx; (void)t; (void)args; (void)argc; return js_bool(1); }
 static js_value el_empty_array(js_ctx *ctx, js_value t, js_value *args, int argc) { (void)t; (void)args; (void)argc; return js_obj_value(js_new_array(ctx, 0)); }
+
+/* --- window.alert / confirm / prompt --------------------------------------
+ * JS runs on the worker thread, but the modal dialog must run on the MAIN thread:
+ * the gfx surface is main-thread-only, and the dialog is parented to the browser
+ * window the main task owns. So we hand the request to main via B->dlg_* and block
+ * this thread until it finishes — which is exactly window.alert's blocking semantics.
+ * (main services B->dlg_req in its event loop; see browser/main.c.) */
+static void dlg_scopy(char *d, const char *s, int cap)
+{
+    int i = 0;
+    if (s) for (; s[i] && i < cap - 1; i++) d[i] = s[i];
+    d[i] = 0;
+}
+static int worker_dialog(int kind, const char *msg, const char *deflt, char *out, int outsz)
+{
+    if (B->win_id < 0) return 0;
+    B->dlg_title[0] = 0;
+    dlg_scopy(B->dlg_msg, msg, sizeof B->dlg_msg);
+    dlg_scopy(B->dlg_text, deflt ? deflt : "", sizeof B->dlg_text);
+    B->dlg_ok = 0;
+    B->dlg_done = 0;
+    B->dlg_req = kind;                    /* publish last: main sees a complete request */
+    while (!B->dlg_done) msleep(10);      /* block JS; main sets dlg_done (also on window close) */
+    B->dlg_req = 0;
+    if (out && outsz > 0) dlg_scopy(out, B->dlg_text, outsz);
+    return B->dlg_ok;
+}
+static js_value win_alert(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+    (void)t;
+    worker_dialog(1, arg_str(ctx, A(0)), 0, 0, 0);
+    return js_undef();
+}
+static js_value win_confirm(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+    (void)t;
+    return js_bool(worker_dialog(2, arg_str(ctx, A(0)), 0, 0, 0));
+}
+static js_value win_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+    (void)t;
+    char msg[512], deflt[512];
+    dlg_scopy(msg, arg_str(ctx, A(0)), sizeof msg);       /* copy before the next arg_str */
+    js_value dv = A(1);
+    dlg_scopy(deflt, (dv.type != JV_UNDEF && dv.type != JV_NULL) ? arg_str(ctx, dv) : "",
+              sizeof deflt);
+    char out[512];
+    if (worker_dialog(3, msg, deflt, out, sizeof out))
+        return js_mk_cstring(ctx, out);
+    return js_null();
+}
+
+/* --- per-origin permissions (Notification / Geolocation / Camera / Microphone)
+ * The requesting document's origin is g_page_url_buf (worker-thread local). A
+ * powerful feature is gated in three stages: the site's own Permissions-Policy
+ * (a blocked feature is denied silently), a remembered decision, else a modal
+ * Refuse/Allow-once/Allow-always prompt driven on the main thread (dlg_req 4,
+ * same handshake as alert/confirm). "Allow always" persists; the rest are
+ * session-only. See permissions.c. */
+static int page_origin(char *origin, int ocap, char *host, int hcap)
+{
+    struct purl pu;
+    char h[URL_HOST_MAX];
+    if (!parse_url(g_page_url_buf, &pu) || !pu.host[0]) return 0;
+    lower_into(h, sizeof h, pu.host);
+    dlg_scopy(host, h, hcap);
+    { int k = 0; origin[0] = 0;
+      sapp(origin, &k, ocap, pu.tls ? "https://" : "http://");
+      sapp(origin, &k, ocap, h); }
+    return 1;
+}
+
+static const char *perm_state_str(int st)
+{
+    return st == PERM_GRANTED ? "granted" : st == PERM_DENIED ? "denied" : "default";
+}
+
+/* The remembered/policy state for a feature WITHOUT prompting (for
+ * Notification.permission and navigator.permissions.query). */
+int perm_state_now(int feature)
+{
+    char origin[URL_MAX], host[URL_HOST_MAX];
+    if (!page_origin(origin, sizeof origin, host, sizeof host)) return PERM_ASK;
+    if (B->pg && perm_policy_blocks(B->pg->perm_policy, feature)) return PERM_DENIED;
+    return perm_lookup(origin, feature);
+}
+
+/* Resolve a permission, prompting the user if there is no prior decision.
+ * Returns PERM_GRANTED / PERM_DENIED and records the choice. */
+static int worker_permission(int feature)
+{
+    char origin[URL_MAX], host[URL_HOST_MAX];
+    if (!page_origin(origin, sizeof origin, host, sizeof host))
+        return PERM_DENIED;                         /* no attributable origin */
+    if (B->pg && perm_policy_blocks(B->pg->perm_policy, feature))
+        return PERM_DENIED;                         /* the site's own policy blocks it */
+    int st = perm_lookup(origin, feature);
+    if (st != PERM_ASK) return st;
+    if (B->win_id < 0) return PERM_DENIED;
+
+    { int k = 0; B->dlg_title[0] = 0; sapp(B->dlg_title, &k, sizeof B->dlg_title, host); }
+    { int k = 0; B->dlg_msg[0] = 0;
+      sapp(B->dlg_msg, &k, sizeof B->dlg_msg, host);
+      sapp(B->dlg_msg, &k, sizeof B->dlg_msg, " wants to ");
+      sapp(B->dlg_msg, &k, sizeof B->dlg_msg, perm_feature_verb(feature));
+      sapp(B->dlg_msg, &k, sizeof B->dlg_msg, "."); }
+    B->dlg_text[0] = 0;
+    B->dlg_ok = -1;                                  /* default (also on browser close) = no answer */
+    B->dlg_done = 0;
+    B->dlg_req = 4;                                  /* publish last: main sees it complete */
+    while (!B->dlg_done) msleep(10);
+    B->dlg_req = 0;
+
+    int choice = B->dlg_ok;                          /* -1=no answer 0=Refuse 1=Once 2=Always */
+    if (choice < 0) return PERM_DENIED;              /* dismissed/timed out: deny once, re-ask later */
+    int state = choice >= 1 ? PERM_GRANTED : PERM_DENIED;
+    perm_remember(origin, feature, state, choice == 2 /* persist only "always" */);
+    return state;
+}
 
 /* The Observer family (Mutation/Intersection/Resize/Performance): a constructor
  * returning an inert observer. We have no observation event loop, so observe()/
@@ -713,34 +1171,76 @@ static js_value resp_clone(js_ctx *ctx, js_value t, js_value *args, int argc) {
     (void)ctx; (void)args; (void)argc;
     return t;                                 /* body isn't consumed here, so self works */
 }
-static js_value hdr_get(js_ctx *ctx, js_value t, js_value *args, int argc) {
+js_value hdr_get(js_ctx *ctx, js_value t, js_value *args, int argc) {
     const char *name = arg_str(ctx, A(0));
     (void)argc;
     if (streq_ci(name, "content-type")) return js_get(ctx, t, "@ctype");
     return js_null();
 }
-static js_value hdr_has(js_ctx *ctx, js_value t, js_value *args, int argc) {
+js_value hdr_has(js_ctx *ctx, js_value t, js_value *args, int argc) {
     js_value v = hdr_get(ctx, t, args, argc);
     return js_bool(v.type == JV_STR);
 }
 static const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap);  /* defined with Blob */
-static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
+
+/* Build a Response on g_response_proto from raw bytes. Shared by fetch(), the
+ * Cache API and the Response constructor. The returned object is live in the
+ * caller's current gc scope only — a caller that allocates afterward must gc_keep
+ * it first. `len` < 0 means an empty body. */
+js_object *make_response(js_ctx *ctx, const char *url, int status,
+                               const char *statustext, const char *ctype,
+                               const char *body, int len) {
+    js_object *resp, *hdrs;
+    gc_push_scope();
+    resp = (js_object *)gc_keep(js_new_object(ctx, g_response_proto));
+    js_def(resp, "@body", js_mk_string(ctx, body ? body : "", len < 0 ? 0 : len), 0);
+    js_def(resp, "status", js_number(status ? status : 200), P_ENUMERABLE);
+    js_def(resp, "ok", js_bool(status >= 200 && status < 300), P_ENUMERABLE);
+    js_def(resp, "statusText", js_mk_cstring(ctx, statustext ? statustext : ""), P_ENUMERABLE);
+    js_def(resp, "url", js_mk_cstring(ctx, url ? url : ""), P_ENUMERABLE);
+    js_def(resp, "redirected", js_bool(0), P_ENUMERABLE);
+    js_def(resp, "type", js_mk_cstring(ctx, "basic"), P_ENUMERABLE);
+    js_def(resp, "bodyUsed", js_bool(0), P_WRITABLE | P_ENUMERABLE);
+    hdrs = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_def(hdrs, "@ctype", js_mk_cstring(ctx, ctype ? ctype : ""), 0);
+    js_def_native(ctx, hdrs, "get", hdr_get, 1);
+    js_def_native(ctx, hdrs, "has", hdr_has, 1);
+    js_def(resp, "headers", js_obj_value(hdrs), P_ENUMERABLE);
+    gc_pop_scope();
+    return resp;
+}
+
+/* The controlling service worker (if any) answers a fetch() from the page: it
+ * dispatches a FetchEvent and, if a handler called respondWith, sets *out to a
+ * resolved Promise of the Response and returns 1. Defined in the SW section. */
+
+js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char url[URL_MAX], method[16], req_ctype[64], resp_ctype[160];
     char extra_hdrs[1024];
     const char *reqbody = 0;
     int reqlen = 0, status = 0, outlen = 0, eh = 0, with_creds = 0;
     unsigned char *body;
-    js_object *resp, *hdrs;
+    js_object *resp;
     js_value rv;
     (void)t;
-    resolve_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
+    {   /* input is a URL string or a Request object (fetch(new Request(...))) */
+        js_value in = A(0);
+        const char *s;
+        if (in.type == JV_OBJ) {
+            js_value u = js_get(ctx, in, "url");
+            s = (u.type == JV_STR) ? u.u.str->data : arg_str(ctx, in);
+        } else {
+            s = arg_str(ctx, in);
+        }
+        resolve_url(g_page_url_buf, s, url, sizeof url);
+    }
     if (B->pg->csp) {                                  /* CSP connect-src */
         char use[URL_MAX], reason[64];
         if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
             js_csp_log("connection to", url, reason);
             return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Refused to connect (Content-Security-Policy)"));
         }
-        copy_str(url, sizeof url, use);            /* use the upgraded URL */
+        strlcpy(url, use, sizeof url);            /* use the upgraded URL */
     }
     method[0] = '\0'; req_ctype[0] = '\0'; extra_hdrs[0] = '\0';
     if (argc >= 2 && A(1).type == JV_OBJ) {
@@ -748,7 +1248,7 @@ static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
         js_value b = js_get(ctx, A(1), "body");
         js_value sig = js_get(ctx, A(1), "signal");
         js_value h = js_get(ctx, A(1), "headers");
-        if (m.type == JV_STR) copy_str(method, sizeof method, m.u.str->data);
+        if (m.type == JV_STR) strlcpy(method, m.u.str->data, sizeof method);
         (void)js_to_boolean(js_get(ctx, A(1), "keepalive"));   /* sync fetch: inherently satisfied */
         {   /* credentials: "include" sends cookies cross-origin (default "same-origin" doesn't) */
             js_value cr = js_get(ctx, A(1), "credentials");
@@ -766,7 +1266,7 @@ static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
                 if (!k || k[0] == '@' || (pm->e[i].flags & P_ACCESSOR)) continue;
                 v = js_to_string(ctx, js_get(ctx, h, k));
                 if (v.type != JV_STR) continue;
-                if (streq_ci(k, "content-type")) { copy_str(req_ctype, sizeof req_ctype, v.u.str->data); continue; }
+                if (streq_ci(k, "content-type")) { strlcpy(req_ctype, v.u.str->data, sizeof req_ctype); continue; }
                 sapp(extra_hdrs, &eh, sizeof extra_hdrs, k);
                 sapp(extra_hdrs, &eh, sizeof extra_hdrs, ": ");
                 sapp(extra_hdrs, &eh, sizeof extra_hdrs, v.u.str->data);
@@ -786,6 +1286,15 @@ static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
          * between here and browser_cors_fetch. */
         if (b.type != JV_UNDEF && b.type != JV_NULL) reqbody = body_bytes(ctx, b, &reqlen, req_ctype, sizeof req_ctype);  /* string/Blob/ArrayBuffer/TypedArray/URLSearchParams */
     }
+    if (!method[0] && A(0).type == JV_OBJ) {          /* method carried on a Request */
+        js_value m = js_get(ctx, A(0), "method");
+        if (m.type == JV_STR) strlcpy(method, m.u.str->data, sizeof method);
+    }
+    /* A controlling service worker gets first crack at the request. If it answered
+     * (respondWith), skip the network entirely. Reentrancy is guarded so the SW's
+     * own network fallback — fetch(event.request) — reaches the wire. */
+    if (sw_intercept_fetch(ctx, url, method[0] ? method : "GET", &rv))
+        return rv;
     {
         struct http_req rq = { 0 };
         struct http_resp rs = { 0 };
@@ -797,25 +1306,14 @@ static js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc) {
         rq.extra_hdrs = extra_hdrs[0] ? extra_hdrs : 0;
         body = browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
         status = rs.status; outlen = rs.len;
-        copy_str(resp_ctype, sizeof resp_ctype, rs.ctype);
+        strlcpy(resp_ctype, rs.ctype, sizeof resp_ctype);
     }
     if (!body)
         return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Failed to fetch"));
     gc_push_scope();
-    resp = (js_object *)gc_keep(js_new_object(ctx, g_response_proto));
-    js_def(resp, "@body", js_mk_string(ctx, (const char *)body, outlen), 0);
+    resp = (js_object *)gc_keep(make_response(ctx, url, status, status == 200 ? "OK" : "",
+                                              resp_ctype, (const char *)body, outlen));
     free(body);
-    js_def(resp, "status", js_number(status ? status : 200), P_ENUMERABLE);
-    js_def(resp, "ok", js_bool(status >= 200 && status < 300), P_ENUMERABLE);
-    js_def(resp, "statusText", js_mk_cstring(ctx, status == 200 ? "OK" : ""), P_ENUMERABLE);
-    js_def(resp, "url", js_mk_cstring(ctx, url), P_ENUMERABLE);
-    js_def(resp, "redirected", js_bool(0), P_ENUMERABLE);
-    js_def(resp, "type", js_mk_cstring(ctx, "basic"), P_ENUMERABLE);
-    hdrs = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-    js_def(hdrs, "@ctype", js_mk_cstring(ctx, resp_ctype), 0);
-    js_def_native(ctx, hdrs, "get", hdr_get, 1);
-    js_def_native(ctx, hdrs, "has", hdr_has, 1);
-    js_def(resp, "headers", js_obj_value(hdrs), P_ENUMERABLE);
     rv = js_promise_resolved(ctx, js_obj_value(resp));
     gc_pop_scope();
     return rv;
@@ -865,7 +1363,7 @@ static js_value loc_assign(js_ctx *ctx, js_value t, js_value *args, int argc) {
 }
 static js_value loc_reload(js_ctx *ctx, js_value t, js_value *args, int argc) {
     (void)ctx; (void)t; (void)args; (void)argc;
-    copy_str(B->loc_url, sizeof B->loc_url, g_page_url_buf);
+    strlcpy(B->loc_url, g_page_url_buf, sizeof B->loc_url);
     B->loc_nav = 1; B->seq++;
     return js_undef();
 }
@@ -913,7 +1411,7 @@ static js_value el_matches(js_ctx *ctx, js_value t, js_value *args, int argc) {
 static js_value el_closest(js_ctx *ctx, js_value t, js_value *args, int argc) {
     struct dom_node *n = node_of(t);
     char sel[128];
-    copy_str(sel, sizeof sel, arg_str(ctx, A(0)));
+    strlcpy(sel, arg_str(ctx, A(0)), sizeof sel);
     for (; n; n = n->parent)
         if (n->type == DOM_ELEMENT && node_matches_sel(n, sel)) return wrap_node(n);
     return js_null();
@@ -1117,6 +1615,13 @@ static js_value doc_create_text(js_ctx *ctx, js_value t, js_value *args, int arg
     (void)ctx; (void)t;
     return wrap_node(dom_new_text(arg_str(ctx, A(0))));
 }
+/* createElementNS(ns, qualifiedName): the DOM tracks no namespace, so the
+ * element is keyed by its qualified name (arg 1); custom-element upgrade is
+ * HTML-only, so skip it for a namespaced create. */
+static js_value doc_create_el_ns(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)t;
+    return wrap_node(dom_new_element(arg_str(ctx, A(1))));
+}
 static js_value doc_body(js_ctx *ctx, js_value t, js_value *args, int argc) {
     struct dom_node *root = doc_root_of(t), *b = doc_first_tag_in(root, "body");
     (void)ctx; (void)args; (void)argc;
@@ -1160,7 +1665,8 @@ static js_value domparser_parse(js_ctx *ctx, js_value t, js_value *args, int arg
     (void)t;
     root = dom_parse(html, html ? (int)strlen(html) : 0);
     if (!root) return js_null();
-    if (g_nparsed < 64) g_parsed[g_nparsed++] = root;       /* freed in js_page_end */
+    if (g_nparsed >= 64) { dom_free(root); return js_null(); }   /* table full: don't leak */
+    g_parsed[g_nparsed++] = root;                               /* freed in js_page_end */
     gc_push_scope();
     doc = (js_object *)gc_keep(js_new_object(ctx, g_document_proto));
     doc->host = root;
@@ -1187,11 +1693,6 @@ static js_value domparser_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
  * is a detached copy of the query (mutating it does not update the URL). That
  * covers the overwhelmingly common read path real pages use. */
 
-static void copy_str(char *dst, int cap, const char *s) {
-    int i = 0;
-    for (; s[i] && i < cap - 1; i++) dst[i] = s[i];
-    dst[i] = '\0';
-}
 static void span_copy(char *dst, int cap, const char *s, const char *e) {
     int n = (int)(e - s), i;
     if (n > cap - 1) n = cap - 1;
@@ -1278,7 +1779,7 @@ static js_value make_search_params(js_ctx *ctx, const char *query) {
 static js_value sp_get(js_ctx *ctx, js_value t, js_value *args, int argc) {
     js_object *ka = sp_arr(ctx, t, "@k"), *va = sp_arr(ctx, t, "@v");
     char name[256]; unsigned i, n;
-    copy_str(name, sizeof name, arg_str(ctx, A(0)));
+    strlcpy(name, arg_str(ctx, A(0)), sizeof name);
     if (!ka || !va) return js_null();
     n = js_array_len(ka);
     for (i = 0; i < n; i++) {
@@ -1290,7 +1791,7 @@ static js_value sp_get(js_ctx *ctx, js_value t, js_value *args, int argc) {
 static js_value sp_get_all(js_ctx *ctx, js_value t, js_value *args, int argc) {
     js_object *ka = sp_arr(ctx, t, "@k"), *va = sp_arr(ctx, t, "@v"), *out;
     char name[256]; unsigned i, n;
-    copy_str(name, sizeof name, arg_str(ctx, A(0)));
+    strlcpy(name, arg_str(ctx, A(0)), sizeof name);
     gc_push_scope();
     out = (js_object *)gc_keep(js_new_array(ctx, 0));
     if (ka && va) {
@@ -1348,7 +1849,7 @@ static void sp_rebuild(js_ctx *ctx, js_value t, const char *name, int keepfirst,
 static js_value sp_set(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char name[256];
     js_value repl;
-    copy_str(name, sizeof name, arg_str(ctx, A(0)));
+    strlcpy(name, arg_str(ctx, A(0)), sizeof name);
     gc_push_scope();
     repl = js_to_string(ctx, A(1));
     if (repl.type == JV_STR) gc_keep(repl.u.str);
@@ -1358,7 +1859,7 @@ static js_value sp_set(js_ctx *ctx, js_value t, js_value *args, int argc) {
 }
 static js_value sp_delete(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char name[256];
-    copy_str(name, sizeof name, arg_str(ctx, A(0)));
+    strlcpy(name, arg_str(ctx, A(0)), sizeof name);
     sp_rebuild(ctx, t, name, 0, js_undef());
     return js_undef();
 }
@@ -1404,6 +1905,102 @@ static js_value sp_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
     return make_search_params(ctx, q);
 }
 
+/* --------------------------------------------------------------- FormData --
+ * FormData is a name/value multimap — the same shape as URLSearchParams — so it
+ * reuses the @k/@v arrays and the sp_* methods. `new FormData(formEl)` seeds it
+ * from the form's successful controls. Serialized as urlencoded when used as a
+ * fetch body: there is no file input here, so multipart carries no benefit. */
+static void fd_collect(js_ctx *ctx, struct dom_node *n, js_object *ka, js_object *va) {
+    for (struct dom_node *c = n->first_child; c; c = c->next) {
+        if (c->type == DOM_ELEMENT) {
+            const char *tag = c->tag, *name = dom_get_attr(c, "name");
+            const char *type = dom_get_attr(c, "type");
+            if (name && name[0] && (streq(tag, "input") || streq(tag, "select") || streq(tag, "textarea"))) {
+                int skip = type && (streq(type, "submit") || streq(type, "button") ||
+                                    streq(type, "reset") || streq(type, "file") || streq(type, "image"));
+                if (!skip) {
+                    if (type && (streq(type, "checkbox") || streq(type, "radio"))) {
+                        if (dom_get_attr(c, "checked")) {
+                            const char *v = dom_get_attr(c, "value");
+                            js_array_push(ctx, ka, js_mk_cstring(ctx, name));
+                            js_array_push(ctx, va, js_mk_cstring(ctx, v ? v : "on"));
+                        }
+                    } else {
+                        const char *v = dom_get_attr(c, "value");
+                        js_array_push(ctx, ka, js_mk_cstring(ctx, name));
+                        js_array_push(ctx, va, js_mk_cstring(ctx, v ? v : ""));
+                    }
+                }
+            }
+        }
+        fd_collect(ctx, c, ka, va);
+    }
+}
+static js_value fd_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+    js_object *fd, *ka, *va;
+    (void)thisv;
+    gc_push_scope();
+    fd = (js_object *)gc_keep(js_new_object(ctx, g_formdata_proto));
+    ka = (js_object *)gc_keep(js_new_array(ctx, 0));
+    va = (js_object *)gc_keep(js_new_array(ctx, 0));
+    js_def(fd, "@k", js_obj_value(ka), 0);
+    js_def(fd, "@v", js_obj_value(va), 0);
+    if (argc >= 1 && A(0).type == JV_OBJ) {
+        struct dom_node *form = node_of(A(0));
+        if (form && streq(form->tag, "form")) fd_collect(ctx, form, ka, va);
+    }
+    gc_pop_scope();
+    return js_obj_value(fd);
+}
+
+/* ------------------------------------------------------- HTMLFormElement ---
+ * form.submit() navigates without firing 'submit'; requestSubmit() fires it
+ * first (and honors an optional submitter's formaction/formmethod). Both defer
+ * to the worker's browser_form_submit, which builds the GET query / POST body. */
+static js_value form_submit(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    (void)ctx; (void)args; (void)argc;
+    if (n) browser_form_submit(n, 0);
+    return js_undef();
+}
+static js_value form_request_submit(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t), *submitter = 0;
+    (void)ctx;
+    if (argc >= 1 && A(0).type == JV_OBJ) submitter = node_of(A(0));
+    if (submitter) browser_form_submit(submitter, 1);
+    else if (n)    browser_form_submit(n, 1);
+    return js_undef();
+}
+/* form.elements: a fresh array of the form's listed controls, also keyed by each
+ * control's name/id for named access (form.elements.foo). */
+static void fe_collect(js_ctx *ctx, struct dom_node *n, js_object *arr) {
+    for (struct dom_node *c = n->first_child; c; c = c->next) {
+        if (c->type == DOM_ELEMENT) {
+            const char *tag = c->tag;
+            if (streq(tag, "input") || streq(tag, "select") || streq(tag, "textarea") ||
+                streq(tag, "button") || streq(tag, "fieldset") || streq(tag, "output") ||
+                streq(tag, "object")) {
+                js_value w = wrap_node(c);
+                const char *nm = dom_get_attr(c, "name"), *id = dom_get_attr(c, "id");
+                js_array_push(ctx, arr, w);
+                if (nm && nm[0] && !streq(nm, "length")) js_def(arr, nm, w, 0);
+                else if (id && id[0] && !streq(id, "length")) js_def(arr, id, w, 0);
+            }
+        }
+        fe_collect(ctx, c, arr);
+    }
+}
+static js_value form_elements(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    struct dom_node *n = node_of(t);
+    js_object *arr;
+    (void)args; (void)argc;
+    gc_push_scope();
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (n) fe_collect(ctx, n, arr);
+    gc_pop_scope();
+    return js_obj_value(arr);
+}
+
 /* locate the path/query/fragment of an absolute URL (pointers into `abs`) */
 static void url_parts(const char *abs, const char **path_s, const char **path_e,
                       const char **query, const char **frag) {
@@ -1438,23 +2035,23 @@ static void fill_url_props(js_ctx *ctx, js_object *o, const char *abs) {
     sbuf href;
     if (!parse_url(abs, &pu)) { pu.tls = 0; pu.host[0] = '\0'; pu.port = 80; }
 
-    copy_str(protocol, sizeof protocol, pu.tls ? "https:" : "http:");
+    strlcpy(protocol, pu.tls ? "https:" : "http:", sizeof protocol);
     defport = pu.tls ? 443u : 80u;
     if ((unsigned)pu.port == defport) port[0] = '\0';
     else uint_to_str(port, (unsigned)pu.port);
 
-    if (port[0]) { copy_str(host, sizeof host, pu.host); { int l = (int)strlen(host); host[l] = ':'; copy_str(host + l + 1, (int)sizeof host - l - 1, port); } }
-    else copy_str(host, sizeof host, pu.host);
+    if (port[0]) { strlcpy(host, pu.host, sizeof host); { int l = (int)strlen(host); host[l] = ':'; strlcpy(host + l + 1, port, (int)sizeof host - l - 1); } }
+    else strlcpy(host, pu.host, sizeof host);
 
     url_parts(abs, &path_s, &path_e, &query, &frag);
     if (path_e > path_s) span_copy(pathbuf, sizeof pathbuf, path_s, path_e);
-    else copy_str(pathbuf, sizeof pathbuf, "/");
+    else strlcpy(pathbuf, "/", sizeof pathbuf);
     if (query) span_copy(searchbuf, sizeof searchbuf, query, frag ? frag : query + strlen(query));
     else searchbuf[0] = '\0';
-    if (frag) copy_str(hashbuf, sizeof hashbuf, frag);
+    if (frag) strlcpy(hashbuf, frag, sizeof hashbuf);
     else hashbuf[0] = '\0';
 
-    { int l; copy_str(origin, sizeof origin, protocol); l = (int)strlen(origin); origin[l] = '/'; origin[l + 1] = '/'; copy_str(origin + l + 2, (int)sizeof origin - l - 2, host); }
+    { int l; strlcpy(origin, protocol, sizeof origin); l = (int)strlen(origin); origin[l] = '/'; origin[l + 1] = '/'; strlcpy(origin + l + 2, host, (int)sizeof origin - l - 2); }
 
     gc_push_scope();
     gc_keep(o);
@@ -1502,23 +2099,23 @@ static js_value anchor_url_part(js_ctx *ctx, js_value t, int part) {
         }
         case AURL_HOST: {
             char host[URL_HOST_MAX + 8];
-            copy_str(host, sizeof host, pu.host);
+            strlcpy(host, pu.host, sizeof host);
             if ((unsigned)pu.port != defport) { int l = (int)strlen(host); host[l] = ':'; uint_to_str(host + l + 1, (unsigned)pu.port); }
             return js_mk_cstring(ctx, host);
         }
         case AURL_ORIGIN: {
             char o[URL_HOST_MAX + 24]; int l;
-            copy_str(o, sizeof o, pu.tls ? "https://" : "http://"); l = (int)strlen(o);
-            copy_str(o + l, (int)sizeof o - l, pu.host);
+            strlcpy(o, pu.tls ? "https://" : "http://", sizeof o); l = (int)strlen(o);
+            strlcpy(o + l, pu.host, (int)sizeof o - l);
             if ((unsigned)pu.port != defport) { int m = (int)strlen(o); o[m] = ':'; uint_to_str(o + m + 1, (unsigned)pu.port); }
             return js_mk_cstring(ctx, o);
         }
         default: break;
     }
     url_parts(abs, &path_s, &path_e, &query, &frag);
-    if (part == AURL_PATHNAME) { if (path_e > path_s) span_copy(buf, sizeof buf, path_s, path_e); else copy_str(buf, sizeof buf, "/"); }
+    if (part == AURL_PATHNAME) { if (path_e > path_s) span_copy(buf, sizeof buf, path_s, path_e); else strlcpy(buf, "/", sizeof buf); }
     else if (part == AURL_SEARCH) { if (query) span_copy(buf, sizeof buf, query, frag ? frag : query + strlen(query)); else buf[0] = '\0'; }
-    else if (part == AURL_HASH) { if (frag) copy_str(buf, sizeof buf, frag); else buf[0] = '\0'; }
+    else if (part == AURL_HASH) { if (frag) strlcpy(buf, frag, sizeof buf); else buf[0] = '\0'; }
     else buf[0] = '\0';
     return js_mk_cstring(ctx, buf);
 }
@@ -1540,13 +2137,13 @@ static js_value url_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) 
     js_object *o;
     js_value ov;
     (void)thisv;
-    copy_str(input, sizeof input, arg_str(ctx, A(0)));
+    strlcpy(input, arg_str(ctx, A(0)), sizeof input);
     if (argc >= 2 && A(1).type != JV_UNDEF && A(1).type != JV_NULL) {
         char base[URL_MAX];
-        copy_str(base, sizeof base, arg_str(ctx, A(1)));
+        strlcpy(base, arg_str(ctx, A(1)), sizeof base);
         resolve_url(base, input, abs, sizeof abs);
     } else {
-        copy_str(abs, sizeof abs, input);
+        strlcpy(abs, input, sizeof abs);
     }
     if (!parse_url(abs, &pu)) return js_throw_type(ctx, "Invalid URL");
     gc_push_scope();
@@ -1570,7 +2167,6 @@ static js_value url_tostring(js_ctx *ctx, js_value t, js_value *args, int argc) 
  * thing runs on the worker thread (the only thread that touches the engine). */
 
 static js_value report_exc_v(js_ctx *ctx);   /* fwd: defined with the runner below */
-static void js_set_cur_script(const char *label);     /* error attribution (below)  */
 static void js_set_event_script(const char *type);
 
 /* The own "@ev" listener array of `target`, created on demand when `create`. */
@@ -1588,13 +2184,13 @@ static js_object *listeners_of(js_object *target, int create) {
     }
 }
 
-static int ev_flag(js_value ev, const char *k) {
+int ev_flag(js_value ev, const char *k) {
     return js_to_boolean(js_get(g_ctx, ev, k));
 }
 
 /* Invoke the listeners on `obj` whose capture flag equals `want_capture` and whose
  * type matches the event's. currentTarget is set to `obj` for the duration. */
-static void ev_fire_on(js_object *obj, js_value ev, int want_capture) {
+void ev_fire_on(js_object *obj, js_value ev, int want_capture) {
     js_object *list = listeners_of(obj, 0);
     js_value evty;
     unsigned i, n;
@@ -1680,7 +2276,7 @@ static js_value ev_stop(js_ctx *ctx, js_value t, js_value *args, int argc) {
 
 /* Build an Event object on g_event_proto. `init` (or undefined) supplies bubbles/
  * cancelable/detail when present (CustomEvent / new Event(type, init)). */
-static js_value make_event(const char *type, int x, int y, js_value init) {
+js_value make_event(const char *type, int x, int y, js_value init) {
     js_object *e;
     int bubbles = 1, cancelable = 1;
     js_value detail = js_undef();
@@ -1709,12 +2305,12 @@ static js_value make_event(const char *type, int x, int y, js_value init) {
     return js_obj_value(e);
 }
 
-static js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int argc) {
+js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char type[64];
     js_value fn = A(1);
     int capture = 0;
     if (t.type != JV_OBJ || !js_is_callable(fn)) return js_undef();
-    copy_str(type, sizeof type, arg_str(ctx, A(0)));
+    strlcpy(type, arg_str(ctx, A(0)), sizeof type);
     if (argc >= 3) {
         js_value o = A(2);
         if (o.type == JV_BOOL) capture = o.u.boolean;
@@ -1737,14 +2333,14 @@ static js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int arg
     g_has_listeners = 1;
     return js_undef();
 }
-static js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc) {
+js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char type[64];
     js_value fn = A(1);
     js_object *list, *nl;
     unsigned i, n;
     int capture = 0;
     if (t.type != JV_OBJ) return js_undef();
-    copy_str(type, sizeof type, arg_str(ctx, A(0)));
+    strlcpy(type, arg_str(ctx, A(0)), sizeof type);
     if (argc >= 3) {
         js_value o = A(2);
         if (o.type == JV_BOOL) capture = o.u.boolean;
@@ -1769,7 +2365,7 @@ static js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int 
     gc_pop_scope();
     return js_undef();
 }
-static js_value el_dispatch(js_ctx *ctx, js_value t, js_value *args, int argc) {
+js_value el_dispatch(js_ctx *ctx, js_value t, js_value *args, int argc) {
     js_value ev = A(0);
     (void)argc;
     if (t.type != JV_OBJ || ev.type != JV_OBJ) return js_bool(1);
@@ -1778,6 +2374,41 @@ static js_value el_dispatch(js_ctx *ctx, js_value t, js_value *args, int argc) {
 static js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
     (void)thisv;
     return make_event(arg_str(ctx, A(0)), 0, 0, A(1));
+}
+
+/* The init-dict fields carried by the Event subclasses (UIEvent/MouseEvent/
+ * KeyboardEvent/WheelEvent/...). Each has the same name on the event object, so
+ * event_sub_ctor overlays whichever the caller supplied onto the base Event. */
+static const char *const k_event_init_keys[] = {
+    "view", "detail", "clientX", "clientY", "screenX", "screenY",
+    "pageX", "pageY", "movementX", "movementY", "button", "buttons",
+    "ctrlKey", "shiftKey", "altKey", "metaKey", "relatedTarget",
+    "key", "code", "keyCode", "which", "charCode", "repeat", "location",
+    "deltaX", "deltaY", "deltaZ", "deltaMode",
+    "pointerId", "pointerType", "pressure", "isPrimary", "data",
+};
+
+/* Constructor shared by every Event subclass. It builds a base Event, re-parents
+ * it to the subclass prototype (carried in fn->data) so instanceof reflects the
+ * concrete interface, then overlays the interface-specific init-dict fields. */
+static js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+    js_value ev = make_event(arg_str(ctx, A(0)), 0, 0, A(1));
+    js_value proto = ctx->native_data;
+    (void)thisv;
+    if (ev.type != JV_OBJ) return ev;
+    if (proto.type == JV_OBJ) ev.u.obj->proto = proto.u.obj;
+    if (argc >= 2 && A(1).type == JV_OBJ) {
+        unsigned i;
+        gc_push_scope();
+        gc_keep(ev.u.obj); gc_keep(A(1).u.obj);
+        for (i = 0; i < sizeof k_event_init_keys / sizeof k_event_init_keys[0]; i++) {
+            js_value v = js_get(ctx, A(1), k_event_init_keys[i]);
+            if (v.type != JV_UNDEF)
+                js_def(ev.u.obj, k_event_init_keys[i], v, P_WRITABLE | P_ENUMERABLE);
+        }
+        gc_pop_scope();
+    }
+    return ev;
 }
 
 /* C entry: the worker resolved a content click to `target`; fire `type` on it.
@@ -1912,7 +2543,7 @@ static js_value ce_define(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char name[64];
     js_value cls = A(1);
     (void)t;
-    copy_str(name, sizeof name, arg_str(ctx, A(0)));
+    strlcpy(name, arg_str(ctx, A(0)), sizeof name);
     if (!name[0] || !js_is_callable(cls)) return js_undef();
     js_def(g_custom_elements, name, cls, 0);
     if (g_doc_root) ce_upgrade_tree(g_doc_root, name, cls);
@@ -1922,7 +2553,7 @@ static js_value ce_get(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char name[64];
     pentry *pe;
     (void)t;
-    copy_str(name, sizeof name, arg_str(ctx, A(0)));
+    strlcpy(name, arg_str(ctx, A(0)), sizeof name);
     pe = pmap_find_pub(g_custom_elements, name);
     return pe ? pe->value : js_undef();
 }
@@ -1943,7 +2574,7 @@ static js_value report_exc_v(js_ctx *ctx);   /* (defined with the runner below) 
 
 /* Keep a parsed script's arena alive for the page (closures reference its AST).
  * The list grows on demand — a page may load any number of scripts/modules. */
-static int arenas_push(js_arena *ar) {
+int arenas_push(js_arena *ar) {
     if (g_narenas == g_arenas_cap) {
         int nc = g_arenas_cap ? g_arenas_cap * 2 : 16;
         js_arena **na = (js_arena **)realloc(g_arenas, (unsigned)nc * sizeof *na);
@@ -1952,6 +2583,16 @@ static int arenas_push(js_arena *ar) {
     }
     g_arenas[g_narenas++] = ar;
     return 1;
+}
+
+/* Append a ":line:col" (or ":line") source position to `sb`, for SyntaxError
+ * reports. Nothing is written when the parser gave no line. */
+static void sb_put_pos(sbuf *sb, int line, int col) {
+    char n[16]; int i;
+    if (line <= 0) return;
+    i = 0; uapp(n, &i, sizeof n, (unsigned)line);
+    sb_putc(sb, ':'); sb_puts(sb, n);
+    if (col > 0) { i = 0; uapp(n, &i, sizeof n, (unsigned)col); sb_putc(sb, ':'); sb_puts(sb, n); }
 }
 
 static js_node *module_compile(const char *code, const char *url) {
@@ -1966,7 +2607,7 @@ static js_node *module_compile(const char *code, const char *url) {
         sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
         sb_puts(&sb, "[js] module SyntaxError in ");
         sb_puts(&sb, url ? url : "(inline)");
-        if (pe.line > 0) { char ln[16]; int li = 0; uapp(ln, &li, sizeof ln, (unsigned)pe.line); sb_putc(&sb, ':'); sb_puts(&sb, ln); }
+        sb_put_pos(&sb, pe.line, pe.col);
         sb_puts(&sb, ": ");
         sb_puts(&sb, pe.msg ? pe.msg : "parse error");
         sb_putc(&sb, '\n');
@@ -2090,8 +2731,8 @@ static js_object *browser_load_module(js_ctx *ctx, const char *spec, void *ud) {
 
 /* ------------------------------------------------------- setup ------------ */
 
-static void def_method(js_object *o, const char *name, js_native fn, int arity) { js_def_native(g_ctx, o, name, fn, arity); }
-static void def_acc(js_object *proto, const char *name, js_native get, js_native set) {
+void def_method(js_object *o, const char *name, js_native fn, int arity) { js_def_native(g_ctx, o, name, fn, arity); }
+void def_acc(js_object *proto, const char *name, js_native get, js_native set) {
     gc_push_scope();
     {
         js_object *g = get ? (js_object *)gc_keep(js_new_native(g_ctx, get, name, 0)) : 0;
@@ -2103,7 +2744,6 @@ static void def_acc(js_object *proto, const char *name, js_native get, js_native
 
 /* ------------------------------------------------------- timers ----------- */
 
-static void report_exc(js_ctx *ctx);   /* defined below, near the page runner */
 
 /* Register a timer; returns its id (slot+1), or 0 if the table is full or the
  * callback isn't callable. `raf` requests requestAnimationFrame semantics (the
@@ -2132,12 +2772,14 @@ static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int 
     g_tmeta[i].raf = raf ? 1 : 0;
     g_tmeta[i].period = delay < 0 ? 0 : delay;
     g_tmeta[i].due = now_ms() + g_tmeta[i].period;
+    g_tmeta[i].async = js_async_capture(ctx);   /* who armed this timer */
     g_ntimers++;
     return i + 1;
 }
 static void timer_drop(int i) {
     if (i < 0 || i >= g_tcap || !g_tmeta[i].active) return;
     g_tmeta[i].active = 0;
+    if (g_tmeta[i].async) { free(g_tmeta[i].async); g_tmeta[i].async = 0; }
     if (g_timers) js_set_index(g_ctx, js_obj_value(g_timers), (unsigned)i, js_null());
     if (g_ntimers > 0) g_ntimers--;
 }
@@ -2184,15 +2826,23 @@ int js_timers_pump(void) {
             unsigned bl = js_array_len(bundle.u.obj), k;
             for (k = 1; k < bl && nargs < 8; k++) argv[nargs++] = js_get_index(g_ctx, bundle, k);
         }
+        int raf = g_tmeta[i].raf;
+        char *async = g_tmeta[i].async;   /* scheduling-site frames; realloc-safe local */
+        int oneshot = !g_tmeta[i].repeat;
         if (g_tmeta[i].repeat)
             g_tmeta[i].due = now + g_tmeta[i].period;   /* reschedule from now (no drift pileup) */
-        else
+        else {
+            g_tmeta[i].async = 0;                       /* take ownership before the drop frees it */
             timer_drop(i);                              /* one-shot: free the slot before firing */
+        }
         if (js_is_callable(cb)) {
-            js_set_cur_script(g_tmeta[i].raf ? "<requestAnimationFrame callback>" : "<timer callback>");
+            char *prev = js_async_enter(g_ctx, async);  /* callback throws → stack names the arm site */
+            js_set_cur_script(raf ? "<requestAnimationFrame callback>" : "<timer callback>");
             js_call(g_ctx, cb, js_obj_value(g_ctx->global), argv, nargs);
+            js_async_leave(g_ctx, prev);
             if (g_ctx->has_exc) report_exc(g_ctx);
         }
+        if (oneshot) free(async);                       /* repeat timers keep it in the slot */
         gc_pop_scope();
         fired++;
     }
@@ -2294,6 +2944,104 @@ static js_value ctrl_abort(js_ctx *ctx, js_value t, js_value *args, int argc) {
     return js_undef();
 }
 
+/* ------------------------------------------------- RTCPeerConnection ------- */
+/* OwOS has no WebRTC/ICE stack. Sites `new` RTCPeerConnection to feature-detect,
+ * probe for local IPs, or start a video call; a missing constructor makes the
+ * `||` vendor-prefix chain resolve to undefined and `new undefined()` aborts the
+ * page with "value is not a constructor". This inert stub lets those scripts run
+ * to completion — no ICE candidate is ever emitted, so nothing is gathered. */
+
+static js_value rtc_noop(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)ctx; (void)t; (void)args; (void)argc; return js_undef();
+}
+
+static js_value rtc_create_data_channel(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_object *dc;
+    js_value rv;
+    (void)t;
+    gc_push_scope();
+    dc = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_def(dc, "label", argc > 0 ? js_to_string(ctx, A(0)) : js_mk_cstring(ctx, ""), P_ENUMERABLE);
+    js_def(dc, "readyState", js_mk_cstring(ctx, "connecting"), P_ENUMERABLE);
+    js_def(dc, "onopen", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(dc, "onmessage", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(dc, "onclose", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def_native(ctx, dc, "send", rtc_noop, 1);
+    js_def_native(ctx, dc, "close", rtc_noop, 0);
+    js_def_native(ctx, dc, "addEventListener", rtc_noop, 3);
+    js_def_native(ctx, dc, "removeEventListener", rtc_noop, 3);
+    rv = js_obj_value(dc);
+    gc_pop_scope();
+    return rv;
+}
+
+/* createOffer/createAnswer: the legacy (successCb, failureCb) form stays inert —
+ * never invoking the callback means no description is applied and no candidates
+ * gather. The modern promise form resolves with an empty session description the
+ * page can hand to setLocalDescription. */
+static js_value rtc_offer_like(js_ctx *ctx, js_value *args, int argc, const char *type) {
+    js_object *o;
+    js_value rv;
+    if (js_is_callable(A(0))) return js_undef();
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_def(o, "type", js_mk_cstring(ctx, type), P_ENUMERABLE);
+    js_def(o, "sdp", js_mk_cstring(ctx, ""), P_ENUMERABLE);
+    rv = js_promise_resolved(ctx, js_obj_value(o));
+    gc_pop_scope();
+    return rv;
+}
+static js_value rtc_create_offer(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)t; return rtc_offer_like(ctx, args, argc, "offer");
+}
+static js_value rtc_create_answer(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)t; return rtc_offer_like(ctx, args, argc, "answer");
+}
+
+/* setLocalDescription/setRemoteDescription/addIceCandidate: inert for the legacy
+ * (desc, successCb, failureCb) form; a resolved promise for the modern form. */
+static js_value rtc_set_desc(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)t;
+    if (js_is_callable(A(1))) return js_undef();
+    return js_promise_resolved(ctx, js_undef());
+}
+
+static js_value rtc_get_stats(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_object *o;
+    js_value rv;
+    (void)t; (void)args; (void)argc;
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_def_native(ctx, o, "forEach", rtc_noop, 1);   /* an empty stats report */
+    js_def_native(ctx, o, "values", rtc_noop, 0);
+    rv = js_promise_resolved(ctx, js_obj_value(o));
+    gc_pop_scope();
+    return rv;
+}
+
+static js_value rtc_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+    js_object *self;
+    js_value rv;
+    (void)thisv; (void)args; (void)argc;      /* native ctor builds its own object */
+    gc_push_scope();
+    self = (js_object *)gc_keep(js_new_object(ctx, g_rtc_proto));
+    js_def(self, "iceGatheringState", js_mk_cstring(ctx, "new"), P_ENUMERABLE);
+    js_def(self, "iceConnectionState", js_mk_cstring(ctx, "new"), P_ENUMERABLE);
+    js_def(self, "connectionState", js_mk_cstring(ctx, "new"), P_ENUMERABLE);
+    js_def(self, "signalingState", js_mk_cstring(ctx, "stable"), P_ENUMERABLE);
+    js_def(self, "localDescription", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(self, "remoteDescription", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(self, "onicecandidate", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(self, "ondatachannel", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(self, "oniceconnectionstatechange", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(self, "onconnectionstatechange", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(self, "onsignalingstatechange", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(self, "onnegotiationneeded", js_null(), P_WRITABLE | P_ENUMERABLE);
+    rv = js_obj_value(self);
+    gc_pop_scope();
+    return rv;
+}
+
 /* ------------------------------------------------------- WebSocket -------- */
 /* A WebSocket wrapper's `host` slot points at the ws_conn (NULL once closed or
  * if the connect failed). Every wrapper is pinned in g_websockets so it stays
@@ -2309,7 +3057,7 @@ static ws_conn *ws_of(js_value t) {
 /* Fire a non-bubbling `type` event on a target object: its on<type> handler
  * property and any addEventListener listeners. For "message", `data` becomes
  * event.data. Shared by WebSocket, XMLHttpRequest, AbortSignal. */
-static void emit_event(js_object *w, const char *type, js_value data) {
+void emit_event(js_object *w, const char *type, js_value data) {
     js_value ev;
     char on[24];
     gc_push_scope();
@@ -2321,7 +3069,7 @@ static void emit_event(js_object *w, const char *type, js_value data) {
         js_set(g_ctx, ev, "currentTarget", js_obj_value(w));
         if (data.type != JV_UNDEF) js_def(ev.u.obj, "data", data, P_WRITABLE | P_ENUMERABLE);
     }
-    on[0] = 'o'; on[1] = 'n'; copy_str(on + 2, (int)sizeof on - 2, type);
+    on[0] = 'o'; on[1] = 'n'; strlcpy(on + 2, type, (int)sizeof on - 2);
     {
         js_value h = js_get(g_ctx, js_obj_value(w), on);
         if (js_is_callable(h)) {
@@ -2371,14 +3119,15 @@ static js_value ws_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
     if (argc > 1) {                             /* a subprotocol string or array */
         js_value p = A(1);
         if (p.type == JV_STR) {
-            copy_str(protos, sizeof protos, p.u.str->data);
+            strlcpy(protos, p.u.str->data, sizeof protos);
         } else if (p.type == JV_OBJ) {
             unsigned n = js_array_len(p.u.obj), i;
+            int k = 0;                              /* page-controlled: bound each append */
             for (i = 0; i < n; i++) {
                 const char *s = arg_str(ctx, js_get_index(ctx, p, i));
                 if (!*s) continue;
-                if (protos[0]) strcat(protos, ",");
-                strcat(protos, s);
+                if (k) sapp(protos, &k, sizeof protos, ",");
+                sapp(protos, &k, sizeof protos, s);
             }
         }
     }
@@ -2476,6 +3225,355 @@ int js_websockets_pump(void) {
     return fired;
 }
 
+/* ------------------------------------------------------- BroadcastChannel - *
+ * Same-context BroadcastChannel: every open channel is pinned in g_bchannels;
+ * postMessage delivers a MessageEvent to every OTHER open channel sharing the
+ * name (never back to the sender, per spec). Cross-process delivery is out of
+ * scope — one page's JS context is the whole "bus". Delivery is synchronous:
+ * the engine has no event loop, matching how WebSocket/XHR events are fired.
+ * A closed channel stays in the array (filtered by @closed at post time), the
+ * same convention g_websockets uses for dead sockets. */
+
+/* A MessageEvent over the shared Event.prototype (so preventDefault/stopPropagation
+ * exist), carrying the standard message fields. `origin` is the page's origin. */
+js_value make_message_event(js_value data) {
+    js_object *e;
+    js_value loc, org;
+    const char *origin;
+    loc = js_get(g_ctx, js_obj_value(g_ctx->global), "location");
+    org = (loc.type == JV_OBJ) ? js_get(g_ctx, loc, "origin") : js_undef();
+    origin = (org.type == JV_STR) ? org.u.str->data : "";
+    gc_push_scope();
+    if (data.type == JV_OBJ) gc_keep(data.u.obj);
+    e = (js_object *)gc_keep(js_new_object(g_ctx, g_event_proto));
+    js_def(e, "type", js_mk_cstring(g_ctx, "message"), P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "data", data, P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "origin", js_mk_cstring(g_ctx, origin), P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "lastEventId", js_mk_cstring(g_ctx, ""), P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "source", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "bubbles", js_bool(0), P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "cancelable", js_bool(0), P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "defaultPrevented", js_bool(0), P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "target", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "currentTarget", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(e, "@dp", js_bool(0), P_WRITABLE);
+    js_def(e, "@sp", js_bool(0), P_WRITABLE);
+    gc_pop_scope();
+    return js_obj_value(e);
+}
+
+/* Deliver a fresh message event to one receiving channel. ev_fire_on runs both
+ * its addEventListener("message") listeners and the onmessage property handler. */
+static void bc_deliver(js_object *w, js_value data) {
+    js_value ev;
+    gc_push_scope();
+    gc_keep(w);
+    if (data.type == JV_OBJ) gc_keep(data.u.obj);
+    ev = make_message_event(data);
+    if (ev.type == JV_OBJ) {
+        gc_keep(ev.u.obj);
+        js_set(g_ctx, ev, "target", js_obj_value(w));
+        js_set(g_ctx, ev, "currentTarget", js_obj_value(w));
+        ev_fire_on(w, ev, 0);
+    }
+    gc_pop_scope();
+}
+
+/* postMessage(msg): fan out to every other open same-named channel. The payload
+ * is passed by reference — the engine has no structuredClone for cross-channel
+ * cloning here, so receivers share the sender's object (adequate for feature
+ * detection and single-page use). */
+static js_value bc_post_m(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value data = A(0), namev;
+    const char *name;
+    unsigned i, n;
+    (void)argc;
+    if (t.type != JV_OBJ || !g_bchannels) return js_undef();
+    if (js_to_boolean(js_get(ctx, t, "@closed"))) return js_undef();   /* no-op after close */
+    namev = js_get(ctx, t, "name");
+    name = namev.type == JV_STR ? namev.u.str->data : "";
+    gc_push_scope();
+    gc_keep(t.u.obj);
+    if (data.type == JV_OBJ) gc_keep(data.u.obj);
+    n = js_array_len(g_bchannels);
+    for (i = 0; i < n; i++) {
+        js_value cv = js_get_index(ctx, js_obj_value(g_bchannels), i);
+        js_value wn;
+        js_object *w;
+        if (cv.type != JV_OBJ) continue;
+        w = cv.u.obj;
+        if (w == t.u.obj) continue;                                    /* never self */
+        if (js_to_boolean(js_get(ctx, cv, "@closed"))) continue;
+        wn = js_get(ctx, cv, "name");
+        if (!(wn.type == JV_STR && streq(wn.u.str->data, name))) continue;
+        bc_deliver(w, data);
+    }
+    gc_pop_scope();
+    return js_undef();
+}
+
+static js_value bc_close_m(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)args; (void)argc;
+    if (t.type == JV_OBJ) js_set(ctx, t, "@closed", js_bool(1));
+    return js_undef();
+}
+
+static js_value bchannel_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+    const char *name = arg_str(ctx, A(0));
+    js_object *o;
+    js_value ov;
+    (void)thisv; (void)argc;                       /* native ctor builds its own object */
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, g_bchannel_proto));
+    js_def(o, "name", js_mk_cstring(ctx, name), P_ENUMERABLE);         /* readonly */
+    js_def(o, "onmessage", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "onmessageerror", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "@closed", js_bool(0), P_WRITABLE);
+    if (g_bchannels) js_array_push(ctx, g_bchannels, js_obj_value(o));
+    ov = js_obj_value(o);
+    gc_pop_scope();
+    return ov;
+}
+
+/* ------------------------------------------------------- Notification ----- *
+ * The W3C Notification API over notifyd (the desktop notification daemon). A
+ * `new Notification(title, options)` immediately posts to the "notify" port so
+ * the notification pops on the desktop, then the wrapper is queued in
+ * g_notifications for its asynchronous "show" event (fired next worker tick,
+ * like WebSocket's deferred "open", so a handler assigned right after
+ * construction still receives it). close() queues a "close" event.
+ *
+ * Permission is per-origin (permissions.c): Notification.permission and
+ * requestPermission() consult the store, the latter prompting when undecided.
+ * notifyd owns the click UI and runs no callback back into the page, so
+ * "click"/"error" never fire (spec-permitted: both are best-effort). Web content
+ * must not drive notifyd's shell-command buttons, so notifications are posted
+ * button-less regardless of `actions`. */
+
+/* The page's host as the notification's sender label, or "Browser". */
+void notif_app_name(char *buf, int cap) {
+    struct purl pu;
+    if (parse_url(g_page_url_buf, &pu) && pu.host[0]) strlcpy(buf, pu.host, cap);
+    else strlcpy(buf, "Browser", cap);
+}
+
+/* An options-bag string field, or `dflt` when absent/null/undefined. */
+static const char *notif_opt_str(js_ctx *ctx, js_value opts, const char *key, const char *dflt) {
+    js_value v;
+    if (opts.type != JV_OBJ) return dflt;
+    v = js_get(ctx, opts, key);
+    if (v.type == JV_UNDEF || v.type == JV_NULL) return dflt;
+    return arg_str(ctx, v);
+}
+
+static int notif_opt_bool(js_ctx *ctx, js_value opts, const char *key) {
+    if (opts.type != JV_OBJ) return 0;
+    return js_to_boolean(js_get(ctx, opts, key));
+}
+
+static js_value notification_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+    js_object *o;
+    js_value opts, ov;
+    const char *title, *body, *icon, *dir;
+    char app[NOTIFY_APP_MAX];
+    (void)thisv;
+    if (argc < 1)
+        return js_throw_type(ctx, "Failed to construct 'Notification': 1 argument required, but only 0 present.");
+    title = arg_str(ctx, A(0));
+    opts  = A(1);
+    body  = notif_opt_str(ctx, opts, "body", "");
+    icon  = notif_opt_str(ctx, opts, "icon", "");
+    dir   = notif_opt_str(ctx, opts, "dir", "auto");
+
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, g_notification_proto));
+    js_def(o, "title", js_mk_cstring(ctx, title), P_ENUMERABLE);
+    js_def(o, "body", js_mk_cstring(ctx, body), P_ENUMERABLE);
+    js_def(o, "icon", js_mk_cstring(ctx, icon), P_ENUMERABLE);
+    js_def(o, "badge", js_mk_cstring(ctx, notif_opt_str(ctx, opts, "badge", "")), P_ENUMERABLE);
+    js_def(o, "image", js_mk_cstring(ctx, notif_opt_str(ctx, opts, "image", "")), P_ENUMERABLE);
+    js_def(o, "tag", js_mk_cstring(ctx, notif_opt_str(ctx, opts, "tag", "")), P_ENUMERABLE);
+    js_def(o, "lang", js_mk_cstring(ctx, notif_opt_str(ctx, opts, "lang", "")), P_ENUMERABLE);
+    js_def(o, "dir", js_mk_cstring(ctx, dir), P_ENUMERABLE);
+    js_def(o, "data", opts.type == JV_OBJ ? js_get(ctx, opts, "data") : js_null(), P_ENUMERABLE);
+    js_def(o, "requireInteraction", js_bool(notif_opt_bool(ctx, opts, "requireInteraction")), P_ENUMERABLE);
+    js_def(o, "silent", js_bool(notif_opt_bool(ctx, opts, "silent")), P_ENUMERABLE);
+    js_def(o, "renotify", js_bool(notif_opt_bool(ctx, opts, "renotify")), P_ENUMERABLE);
+    js_def(o, "onclick", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "onclose", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "onshow", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def(o, "@shown", js_bool(0), P_WRITABLE);        /* "show" delivered (pump)  */
+    js_def(o, "@close_req", js_bool(0), P_WRITABLE);    /* close() requested        */
+    js_def(o, "@closed", js_bool(0), P_WRITABLE);       /* "close" delivered        */
+
+    /* Constructing does NOT prompt (per spec); it shows only if already granted. */
+    if (perm_state_now(PERM_NOTIFICATIONS) == PERM_GRANTED && title[0]) {
+        struct notification n = { 0 };
+        notif_app_name(app, sizeof app);
+        n.app   = app;
+        n.title = title;
+        n.body  = body[0] ? body : 0;
+        n.image = 0;                                    /* remote icons unreachable to notifyd */
+        n.nbuttons = 0;                                 /* never expose shell-command buttons  */
+        notify_send(&n);                                /* graceful no-op if notifyd is down   */
+    }
+    if (g_notifications) js_array_push(ctx, g_notifications, js_obj_value(o));
+    ov = js_obj_value(o);
+    gc_pop_scope();
+    return ov;
+}
+
+static js_value notif_close_m(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)args; (void)argc;
+    if (t.type == JV_OBJ) js_set(ctx, t, "@close_req", js_bool(1));
+    return js_undef();
+}
+
+/* Notification.permission — the remembered/policy state, without prompting. */
+static js_value notif_get_permission(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)t; (void)args; (void)argc;
+    return js_mk_cstring(ctx, perm_state_str(perm_state_now(PERM_NOTIFICATIONS)));
+}
+
+/* Notification.requestPermission([callback]) -> Promise<permission>. Prompts the
+ * user when undecided (worker_permission), then resolves with "granted"/"denied"
+ * and invokes the legacy callback form if one was passed. */
+static js_value notif_request_permission(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value cb = A(0), perm;
+    (void)t;
+    perm = js_mk_cstring(ctx, perm_state_str(worker_permission(PERM_NOTIFICATIONS)));
+    if (js_is_callable(cb)) {
+        js_value a = perm;
+        js_call(ctx, cb, js_undef(), &a, 1);
+        if (ctx->has_exc) report_exc(ctx);
+    }
+    return js_promise_resolved(ctx, perm);
+}
+
+/* --- navigator.geolocation ------------------------------------------------
+ * Gated by PERM_GEOLOCATION. OwOS has no GPS, so a granted request still fails
+ * the fix with POSITION_UNAVAILABLE; a denied one reports PERMISSION_DENIED —
+ * both spec-correct outcomes routed to the error callback. */
+static js_value geo_error_obj(js_ctx *ctx, int code, const char *msg) {
+    js_object *e = js_new_object(ctx, ctx->object_proto);
+    js_def(e, "code", js_number(code), P_ENUMERABLE);
+    js_def(e, "message", js_mk_cstring(ctx, msg), P_ENUMERABLE);
+    js_def(e, "PERMISSION_DENIED", js_number(1), P_ENUMERABLE);
+    js_def(e, "POSITION_UNAVAILABLE", js_number(2), P_ENUMERABLE);
+    js_def(e, "TIMEOUT", js_number(3), P_ENUMERABLE);
+    return js_obj_value(e);
+}
+static js_value geo_get_current(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value err_cb = A(1), e;
+    (void)t;
+    int st = worker_permission(PERM_GEOLOCATION);
+    gc_push_scope();
+    e = st == PERM_GRANTED ? geo_error_obj(ctx, 2, "Location information is unavailable.")
+                           : geo_error_obj(ctx, 1, "User denied Geolocation");
+    if (e.type == JV_OBJ) gc_keep(e.u.obj);
+    if (js_is_callable(err_cb)) {
+        js_value a = e;
+        js_call(ctx, err_cb, js_undef(), &a, 1);
+        if (ctx->has_exc) report_exc(ctx);
+    }
+    gc_pop_scope();
+    return js_undef();
+}
+static js_value geo_watch(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    geo_get_current(ctx, t, args, argc);   /* one fix attempt, same as a single call */
+    return js_number(1);                   /* a watch id; clearWatch is a no-op       */
+}
+
+/* --- navigator.mediaDevices.getUserMedia ----------------------------------
+ * Gated by PERM_CAMERA (video) + PERM_MICROPHONE (audio): a denied feature ->
+ * NotAllowedError; all granted but no capture hardware -> NotFoundError. */
+static js_value md_get_user_media(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value c = A(0);
+    int want_audio = 0, want_video = 0;
+    (void)t;
+    if (c.type == JV_OBJ) {
+        want_audio = js_to_boolean(js_get(ctx, c, "audio"));
+        want_video = js_to_boolean(js_get(ctx, c, "video"));
+    }
+    if (!want_audio && !want_video)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError",
+            "At least one of audio and video must be requested"));
+    if (want_video && worker_permission(PERM_CAMERA) != PERM_GRANTED)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Permission denied"));
+    if (want_audio && worker_permission(PERM_MICROPHONE) != PERM_GRANTED)
+        return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Permission denied"));
+    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotFoundError",
+        "Requested device not found"));
+}
+static js_value md_get_display_media(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)t; (void)args; (void)argc;
+    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError",
+        "Permission denied"));
+}
+static js_value md_enumerate(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    (void)t; (void)args; (void)argc;
+    return js_promise_resolved(ctx, js_obj_value(js_new_array(ctx, 0)));   /* no devices */
+}
+
+/* --- navigator.permissions.query ------------------------------------------
+ * Reports the remembered state, never prompts (per spec). Unknown feature names
+ * resolve "prompt" (clipboard is granted — the browser backs it). */
+static js_value perm_query(js_ctx *ctx, js_value t, js_value *args, int argc) {
+    js_value d = A(0), rv;
+    const char *name = d.type == JV_OBJ ? arg_str(ctx, js_get(ctx, d, "name")) : "";
+    const char *state = "prompt";
+    int f = perm_feature_from_token(name);
+    js_object *ps;
+    (void)t;
+    if (f >= 0) {
+        int st = perm_state_now(f);
+        state = st == PERM_GRANTED ? "granted" : st == PERM_DENIED ? "denied" : "prompt";
+    } else if (streq_ci(name, "clipboard-read") || streq_ci(name, "clipboard-write")) {
+        state = "granted";
+    }
+    gc_push_scope();
+    ps = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_def(ps, "state", js_mk_cstring(ctx, state), P_ENUMERABLE);
+    js_def(ps, "name", js_mk_cstring(ctx, name), P_ENUMERABLE);
+    js_def(ps, "onchange", js_null(), P_WRITABLE | P_ENUMERABLE);
+    js_def_native(ctx, ps, "addEventListener", el_noop, 2);
+    js_def_native(ctx, ps, "removeEventListener", el_noop, 2);
+    rv = js_promise_resolved(ctx, js_obj_value(ps));
+    gc_pop_scope();
+    return rv;
+}
+
+/* Deliver each notification's deferred "show", then any requested "close".
+ * Mirrors js_websockets_pump: settled wrappers stay in the array (guarded by
+ * @shown/@closed so an event fires once) rather than being spliced out — a
+ * "show" handler may create a fresh Notification, and compacting mid-iteration
+ * would truncate it. The array is bounded per page and freed at teardown. */
+int js_notifications_pump(void) {
+    int fired = 0;
+    unsigned i, n;
+    if (!g_page_live || !g_ctx || !g_notifications) return 0;
+    n = js_array_len(g_notifications);
+    for (i = 0; i < n; i++) {
+        js_value nv = js_get_index(g_ctx, js_obj_value(g_notifications), i);
+        js_object *w;
+        if (nv.type != JV_OBJ) continue;
+        w = nv.u.obj;
+        if (!js_to_boolean(js_get(g_ctx, nv, "@shown"))) {
+            js_set(g_ctx, nv, "@shown", js_bool(1));
+            emit_event(w, "show", js_undef());
+            fired++;
+        }
+        if (js_to_boolean(js_get(g_ctx, nv, "@close_req")) &&
+            !js_to_boolean(js_get(g_ctx, nv, "@closed"))) {
+            js_set(g_ctx, nv, "@closed", js_bool(1));
+            emit_event(w, "close", js_undef());
+            fired++;
+        }
+    }
+    return fired;
+}
+
 /* ------------------------------------------------------- crypto ----------- *
  * crypto.getRandomValues / crypto.randomUUID over the shared userspace CSPRNG
  * (rng_bytes in the libc: RDRAND directly, no kernel trap). */
@@ -2525,7 +3623,7 @@ static js_value crypto_randomuuid(js_ctx *ctx, js_value t, js_value *args, int a
 static js_value xhr_open(js_ctx *ctx, js_value t, js_value *args, int argc) {
     char method[16], url[URL_MAX];
     if (t.type != JV_OBJ) return js_undef();
-    copy_str(method, sizeof method, arg_str(ctx, A(0)));
+    strlcpy(method, arg_str(ctx, A(0)), sizeof method);
     resolve_url(g_page_url_buf, arg_str(ctx, A(1)), url, sizeof url);
     js_def(t.u.obj, "@method", js_mk_cstring(ctx, method[0] ? method : "GET"), 0);
     js_def(t.u.obj, "@url", js_mk_cstring(ctx, url), 0);
@@ -2539,7 +3637,7 @@ static js_value xhr_setheader(js_ctx *ctx, js_value t, js_value *args, int argc)
     const char *name = arg_str(ctx, A(0));
     char val[1024];
     if (t.type != JV_OBJ) return js_undef();
-    copy_str(val, sizeof val, arg_str(ctx, A(1)));
+    strlcpy(val, arg_str(ctx, A(1)), sizeof val);
     if (streq_ci(name, "content-type")) { js_def(t.u.obj, "@ctype", js_mk_cstring(ctx, val), 0); return js_undef(); }
     {   /* append "Name: value\r\n" to the accumulated request-header blob */
         js_value cur = js_get(ctx, t, "@hdrs");
@@ -2563,9 +3661,9 @@ static js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc) {
     unsigned char *body;
     const char *hdrs;
     if (t.type != JV_OBJ) return js_undef();
-    copy_str(url, sizeof url, arg_str(ctx, js_get(ctx, t, "@url")));
-    copy_str(method, sizeof method, arg_str(ctx, js_get(ctx, t, "@method")));
-    copy_str(req_ctype, sizeof req_ctype, arg_str(ctx, js_get(ctx, t, "@ctype")));
+    strlcpy(url, arg_str(ctx, js_get(ctx, t, "@url")), sizeof url);
+    strlcpy(method, arg_str(ctx, js_get(ctx, t, "@method")), sizeof method);
+    strlcpy(req_ctype, arg_str(ctx, js_get(ctx, t, "@ctype")), sizeof req_ctype);
     if (B->pg->csp) {                                          /* CSP connect-src */
         char use[URL_MAX], reason[64];
         if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
@@ -2576,11 +3674,11 @@ static js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc) {
             emit_event(t.u.obj, "loadend", js_undef());
             return js_undef();
         }
-        copy_str(url, sizeof url, use);
+        strlcpy(url, use, sizeof url);
     }
     if (argc >= 1 && A(0).type == JV_STR) {
         reqbody = A(0).u.str->data; reqlen = A(0).u.str->len;
-        if (!req_ctype[0]) copy_str(req_ctype, sizeof req_ctype, "text/plain;charset=UTF-8");
+        if (!req_ctype[0]) strlcpy(req_ctype, "text/plain;charset=UTF-8", sizeof req_ctype);
     }
     { js_value h = js_get(ctx, t, "@hdrs"); hdrs = h.type == JV_STR ? h.u.str->data : 0; }
     {
@@ -2595,7 +3693,7 @@ static js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc) {
         rq.extra_hdrs = hdrs && hdrs[0] ? hdrs : 0;
         body = browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
         status = rs.status; outlen = rs.len;
-        copy_str(resp_ctype, sizeof resp_ctype, rs.ctype);
+        strlcpy(resp_ctype, rs.ctype, sizeof resp_ctype);
     }
     gc_push_scope(); gc_keep(t.u.obj);
     js_def(t.u.obj, "@respctype", js_mk_cstring(ctx, resp_ctype), 0);
@@ -2717,7 +3815,7 @@ static js_value blob_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
         unsigned i, n = parts.u.obj->kind == OBJ_ARRAY ? parts.u.obj->elen : js_to_uint32(ctx, js_get(ctx, parts, "length"));
         for (i = 0; i < n; i++) blob_append_part(ctx, &sb, js_get_index(ctx, parts, i));
     }
-    if (argc >= 2 && A(1).type == JV_OBJ) { js_value tp = js_get(ctx, A(1), "type"); if (tp.type == JV_STR) copy_str(type, sizeof type, tp.u.str->data); }
+    if (argc >= 2 && A(1).type == JV_OBJ) { js_value tp = js_get(ctx, A(1), "type"); if (tp.type == JV_STR) strlcpy(type, tp.u.str->data, sizeof type); }
     rv = make_blob(ctx, sb.b ? sb.b : "", sb.n, type);
     if (sb.b) free(sb.b);
     gc_pop_scope();
@@ -2755,7 +3853,7 @@ static js_value blob_slice(js_ctx *ctx, js_value t, js_value *args, int argc) {
     if (e < 0) e = 0;
     else if (e > len) e = len;
     if (e < s) e = s;
-    if (argc > 2 && A(2).type == JV_STR) copy_str(type, sizeof type, A(2).u.str->data);
+    if (argc > 2 && A(2).type == JV_STR) strlcpy(type, A(2).u.str->data, sizeof type);
     return make_blob(ctx, b.u.str->data + s, e - s, type);
 }
 
@@ -2763,18 +3861,20 @@ static js_value blob_slice(js_ctx *ctx, js_value t, js_value *args, int argc) {
  * Blob, ArrayBuffer/TypedArray, URLSearchParams). `ctype` is left untouched when
  * the body implies none. Bytes point into a GC object the caller must keep. */
 static const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap) {
-    if (v.type == JV_STR) { *len = v.u.str->len; if (ctype && !ctype[0]) copy_str(ctype, ctcap, "text/plain;charset=UTF-8"); return v.u.str->data; }
+    if (v.type == JV_STR) { *len = v.u.str->len; if (ctype && !ctype[0]) strlcpy(ctype, "text/plain;charset=UTF-8", ctcap); return v.u.str->data; }
     if (v.type == JV_OBJ) {
         js_object *o = v.u.obj;
         if (o->proto == g_blob_proto) {
             js_value b = js_get(ctx, v, "@bytes"), tp = js_get(ctx, v, "type");
-            if (ctype && !ctype[0] && tp.type == JV_STR && tp.u.str->len) copy_str(ctype, ctcap, tp.u.str->data);
+            if (ctype && !ctype[0] && tp.type == JV_STR && tp.u.str->len) strlcpy(ctype, tp.u.str->data, ctcap);
             *len = b.type == JV_STR ? b.u.str->len : 0;
             return b.type == JV_STR ? b.u.str->data : "";
         }
         if (o->kind == OBJ_ARRAYBUFFER && o->host) { js_arraybuffer *ab = (js_arraybuffer *)o->host; *len = ab->byteLength; return (const char *)ab->data; }
         if (o->kind == OBJ_TYPEDARRAY && o->host) { js_typedarray *ta = (js_typedarray *)o->host; js_arraybuffer *ab = (js_arraybuffer *)ta->buffer->host; *len = ta->length * ta_elem_size(ta->type < 0 ? TA_U8 : ta->type); return (const char *)ab->data + ta->offset; }
-        if (o->proto == g_sp_proto) { js_value s = sp_tostring(ctx, v, 0, 0); if (ctype && !ctype[0]) copy_str(ctype, ctcap, "application/x-www-form-urlencoded;charset=UTF-8"); *len = s.type == JV_STR ? s.u.str->len : 0; return s.type == JV_STR ? s.u.str->data : ""; }
+        if (o->proto == g_sp_proto) { js_value s = sp_tostring(ctx, v, 0, 0); if (ctype && !ctype[0]) strlcpy(ctype, "application/x-www-form-urlencoded;charset=UTF-8", ctcap); *len = s.type == JV_STR ? s.u.str->len : 0; return s.type == JV_STR ? s.u.str->data : ""; }
+        /* FormData: no file input here, so serialize as urlencoded rather than multipart. */
+        if (o->proto == g_formdata_proto) { js_value s = sp_tostring(ctx, v, 0, 0); if (ctype && !ctype[0]) strlcpy(ctype, "application/x-www-form-urlencoded;charset=UTF-8", ctcap); *len = s.type == JV_STR ? s.u.str->len : 0; return s.type == JV_STR ? s.u.str->data : ""; }
     }
     *len = 0;
     return "";
@@ -2794,7 +3894,7 @@ static js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc
     if (B->pg->csp) {
         char use[URL_MAX], reason[64];
         if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) { js_csp_log("beacon to", url, reason); return js_bool(0); }
-        copy_str(url, sizeof url, use);
+        strlcpy(url, use, sizeof url);
     }
     ctype[0] = '\0';
     gc_push_scope();
@@ -2828,7 +3928,7 @@ static js_string *clip_entry_bytes(js_ctx *ctx, js_value v, char *type, int tcap
     if (v.type == JV_OBJ && js_promise_inspect(ctx, v, &settled) == 1) v = settled;
     if (v.type == JV_OBJ && v.u.obj->proto == g_blob_proto) {
         js_value b = js_get(ctx, v, "@bytes"), tp = js_get(ctx, v, "type");
-        if (type && tp.type == JV_STR && tp.u.str->len) copy_str(type, tcap, tp.u.str->data);
+        if (type && tp.type == JV_STR && tp.u.str->len) strlcpy(type, tp.u.str->data, tcap);
         return b.type == JV_STR ? b.u.str : 0;
     }
     { js_value s = js_to_string(ctx, v); return s.type == JV_STR ? s.u.str : 0; }
@@ -2928,7 +4028,7 @@ static js_value clip_write(js_ctx *ctx, js_value t, js_value *args, int argc) {
     if (data.type != JV_OBJ) data = item;                  /* tolerate a bare dict */
     entry = js_get(ctx, data, "text/plain");
     if (entry.type != JV_UNDEF && entry.type != JV_NULL) {
-        copy_str(mime, sizeof mime, "text/plain");
+        strlcpy(mime, "text/plain", sizeof mime);
     } else {
         js_object *d = data.u.obj;
         mime[0] = '\0';
@@ -2936,7 +4036,7 @@ static js_value clip_write(js_ctx *ctx, js_value t, js_value *args, int argc) {
             pentry *pe = &d->props.e[i];
             if (!(pe->flags & P_ENUMERABLE) || (unsigned char)pe->key[0] < ' ') continue;
             if (streq(pe->key, "@data")) continue;
-            copy_str(mime, sizeof mime, pe->key);
+            strlcpy(mime, pe->key, sizeof mime);
             entry = js_get(ctx, data, pe->key);
             break;
         }
@@ -2977,152 +4077,6 @@ static js_value clip_read(js_ctx *ctx, js_value t, js_value *args, int argc) {
     return js_promise_resolved(ctx, rv);
 }
 
-/* ------------------------------------------------- HTMLMediaElement -------
- * <audio>/<video> elements (and `new Audio()`) get g_media_proto, which chains
- * to the element prototype and adds the media properties/methods. The state and
- * playback live in media.c (bmedia.h); these are thin bindings over it. */
-static struct media_el *mel_of(js_value t) {
-    struct dom_node *n = node_of(t);
-    return n ? media_for_node(n) : 0;
-}
-static js_value mel_get_src(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    char buf[URL_MAX]; (void)args; (void)argc;
-    buf[0] = '\0'; media_get_src(mel_of(t), buf, sizeof buf);
-    return js_mk_cstring(ctx, buf);
-}
-static js_value mel_set_src(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    struct dom_node *n = node_of(t);
-    const char *raw = arg_str(ctx, A(0));
-    char abs[URL_MAX];
-    if (!n) return js_undef();
-    dom_set_attr(n, "src", raw);
-    resolve_url(g_page_url_buf, raw, abs, sizeof abs);
-    media_set_src(media_for_node(n), abs);
-    return js_undef();
-}
-static js_value mel_get_currentTime(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)args; (void)argc; return js_number(media_current_time(mel_of(t))); }
-static js_value mel_set_currentTime(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ media_set_current_time(mel_of(t), js_to_number(ctx, A(0))); return js_undef(); }
-static js_value mel_get_duration(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; return js_number(media_duration(mel_of(t))); }
-static js_value mel_get_paused(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; return js_bool(media_paused(mel_of(t))); }
-static js_value mel_get_ended(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; return js_bool(media_ended(mel_of(t))); }
-static js_value mel_get_volume(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; return js_number(media_volume(mel_of(t))); }
-static js_value mel_set_volume(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ media_set_volume(mel_of(t), js_to_number(ctx, A(0))); return js_undef(); }
-static js_value mel_get_muted(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; return js_bool(media_muted(mel_of(t))); }
-static js_value mel_set_muted(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ media_set_muted(mel_of(t), js_to_boolean(A(0))); return js_undef(); }
-static js_value mel_get_loop(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; return js_bool(media_loop_get(mel_of(t))); }
-static js_value mel_set_loop(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    struct dom_node *n = node_of(t);
-    int on = js_to_boolean(A(0));
-    media_set_loop(media_for_node(n), on);
-    if (n) { if (on) dom_set_attr(n, "loop", ""); else dom_remove_attr(n, "loop"); }
-    return js_undef();
-}
-static js_value mel_get_autoplay(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; return js_bool(media_autoplay_get(mel_of(t))); }
-static js_value mel_set_autoplay(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    struct dom_node *n = node_of(t);
-    int on = js_to_boolean(A(0));
-    media_set_autoplay(media_for_node(n), on);
-    if (n) { if (on) dom_set_attr(n, "autoplay", ""); else dom_remove_attr(n, "autoplay"); }
-    return js_undef();
-}
-static js_value mel_get_controls(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    struct dom_node *n = node_of(t); (void)ctx; (void)args; (void)argc;
-    return js_bool(n && dom_get_attr(n, "controls") != 0);
-}
-static js_value mel_set_controls(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    struct dom_node *n = node_of(t); (void)ctx;
-    if (n) { if (js_to_boolean(A(0))) dom_set_attr(n, "controls", ""); else dom_remove_attr(n, "controls"); }
-    return js_undef();
-}
-static js_value mel_get_readyState(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; return js_number(media_ready_state(mel_of(t))); }
-static js_value mel_get_networkState(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; return js_number(media_network_state(mel_of(t))); }
-
-static js_value mel_play(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)args; (void)argc; media_play(mel_of(t)); return js_promise_resolved(ctx, js_undef()); }
-static js_value mel_pause(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; media_pause(mel_of(t)); return js_undef(); }
-static js_value mel_load(js_ctx *ctx, js_value t, js_value *args, int argc)
-{ (void)ctx; (void)args; (void)argc; media_load(mel_of(t)); return js_undef(); }
-static js_value mel_can_play_type(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    int v = media_can_play_type(arg_str(ctx, A(0))); (void)t;
-    return js_mk_cstring(ctx, v == MEDIA_PROBABLY ? "probably" : v == MEDIA_MAYBE ? "maybe" : "");
-}
-
-/* The Audio() constructor: a detached HTMLAudioElement, optionally with a src
- * (which is preloaded). new Audio(src) === document.createElement('audio'). */
-static js_value audio_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
-    struct dom_node *n;
-    js_value w;
-    (void)thisv;
-    n = dom_new_element("audio");
-    if (!n) return js_throw_type(ctx, "Audio");
-    media_new_audio(n);
-    w = wrap_node(n);                                  /* g_media_proto, pinned alive */
-    if (argc >= 1 && A(0).type != JV_UNDEF && A(0).type != JV_NULL) {
-        const char *raw = arg_str(ctx, A(0));
-        char abs[URL_MAX];
-        struct media_el *m = media_for_node(n);
-        dom_set_attr(n, "src", raw);
-        resolve_url(g_page_url_buf, raw, abs, sizeof abs);
-        media_set_src(m, abs);
-        media_load(m);                                 /* new Audio(src) preloads */
-    }
-    return w;
-}
-
-/* Define the HTMLMediaElement surface on g_media_proto (chains to element). */
-static void setup_media_proto(js_ctx *ctx) {
-    def_acc(g_media_proto, "src", mel_get_src, mel_set_src);
-    def_acc(g_media_proto, "currentSrc", mel_get_src, 0);
-    def_acc(g_media_proto, "currentTime", mel_get_currentTime, mel_set_currentTime);
-    def_acc(g_media_proto, "duration", mel_get_duration, 0);
-    def_acc(g_media_proto, "paused", mel_get_paused, 0);
-    def_acc(g_media_proto, "ended", mel_get_ended, 0);
-    def_acc(g_media_proto, "volume", mel_get_volume, mel_set_volume);
-    def_acc(g_media_proto, "muted", mel_get_muted, mel_set_muted);
-    def_acc(g_media_proto, "loop", mel_get_loop, mel_set_loop);
-    def_acc(g_media_proto, "autoplay", mel_get_autoplay, mel_set_autoplay);
-    def_acc(g_media_proto, "controls", mel_get_controls, mel_set_controls);
-    def_acc(g_media_proto, "readyState", mel_get_readyState, 0);
-    def_acc(g_media_proto, "networkState", mel_get_networkState, 0);
-    def_method(g_media_proto, "play", mel_play, 0);
-    def_method(g_media_proto, "pause", mel_pause, 0);
-    def_method(g_media_proto, "load", mel_load, 0);
-    def_method(g_media_proto, "canPlayType", mel_can_play_type, 1);
-    js_def(g_media_proto, "HAVE_NOTHING", js_number(MRS_NOTHING), P_ENUMERABLE);
-    js_def(g_media_proto, "HAVE_METADATA", js_number(MRS_METADATA), P_ENUMERABLE);
-    js_def(g_media_proto, "HAVE_CURRENT_DATA", js_number(MRS_CURRENT), P_ENUMERABLE);
-    js_def(g_media_proto, "HAVE_FUTURE_DATA", js_number(MRS_FUTURE), P_ENUMERABLE);
-    js_def(g_media_proto, "HAVE_ENOUGH_DATA", js_number(MRS_ENOUGH), P_ENUMERABLE);
-    {
-        js_object *ac = js_new_native(ctx, audio_ctor, "Audio", 1);
-        gc_push_scope(); gc_keep(ac);
-        js_def(ac, "prototype", js_obj_value(g_media_proto), 0);
-        js_def(g_media_proto, "constructor", js_obj_value(ac), P_WRITABLE | P_CONFIGURABLE);
-        js_def(ctx->global, "Audio", js_obj_value(ac), P_WRITABLE | P_CONFIGURABLE);
-        gc_pop_scope();
-    }
-}
-
-/* media.c (worker thread) asks us to fire a (non-bubbling) media event on an
- * element's wrapper — both its on<type> handler and addEventListener listeners. */
-void js_media_fire(struct dom_node *node, const char *type) {
-    if (!g_page_live || !g_ctx || !node || !node->wrapper) return;
-    emit_event((js_object *)node->wrapper, type, js_undef());
-}
 
 /* The DOM `Node` interface: not constructable, but exposed for the `Node.*`
  * nodeType constants and `x instanceof Node` (feature-detected by many libs). */
@@ -3243,6 +4197,7 @@ static const char *const k_css_props[] = {
     "wordBreak","wordSpacing","wordWrap","writingMode","zIndex",
 };
 
+
 /* Web Storage (localStorage/sessionStorage): in-memory only — not persisted
  * across reloads, but enough for pages that stash a preference (items live in a
  * hidden "@items" backing object). getItem returns null for a missing key. */
@@ -3293,13 +4248,19 @@ static void css_norm(const char *s, char *out, int cap) {
     out[o] = 0;
 }
 static int css_prop_known(const char *prop) {
-    char pn[64], kn[64];
+    /* The table is a compile-time constant, so normalize it once and reuse. */
+    static char norm_props[sizeof k_css_props / sizeof k_css_props[0]][64];
+    static int  norm_built;
+    char pn[64];
     css_norm(prop, pn, sizeof pn);
     if (!pn[0]) return 0;
-    for (unsigned i = 0; i < sizeof k_css_props / sizeof k_css_props[0]; i++) {
-        css_norm(k_css_props[i], kn, sizeof kn);
-        if (streq(pn, kn)) return 1;
+    if (!norm_built) {
+        for (unsigned i = 0; i < sizeof k_css_props / sizeof k_css_props[0]; i++)
+            css_norm(k_css_props[i], norm_props[i], sizeof norm_props[i]);
+        norm_built = 1;
     }
+    for (unsigned i = 0; i < sizeof k_css_props / sizeof k_css_props[0]; i++)
+        if (streq(pn, norm_props[i])) return 1;
     return 0;
 }
 static js_value css_supports(js_ctx *ctx, js_value t, js_value *args, int argc) {
@@ -3320,38 +4281,63 @@ static js_value css_supports(js_ctx *ctx, js_value t, js_value *args, int argc) 
     }
 }
 
+/* Expose a DOM interface constructor `name` on the global, wired to `proto`:
+ * name.prototype === proto and proto.constructor === name. The body is the no-op
+ * HTMLElement base ctor — only the prototype chain matters for reference/instanceof. */
+void define_iface(js_ctx *ctx, js_object *win, const char *name, js_object *proto) {
+    js_object *ctor = js_new_native(ctx, htmlelement_ctor, name, 0);
+    gc_push_scope(); gc_keep(ctor); gc_keep(proto);
+    js_def(ctor, "prototype", js_obj_value(proto), 0);
+    js_def(proto, "constructor", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
+    js_def(win, name, js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
+    gc_pop_scope();
+}
+
+
+
 static void setup_dom(js_ctx *ctx, const char *page_url) {
     js_object *win = ctx->global;
 
     g_node_proto = js_new_object(ctx, ctx->object_proto);   /* Node.prototype */
     g_element_proto = js_new_object(ctx, g_node_proto);
     g_style_proto = js_new_object(ctx, ctx->object_proto);
+    g_classlist_proto = js_new_object(ctx, ctx->object_proto);
     g_url_proto = js_new_object(ctx, ctx->object_proto);
     g_sp_proto = js_new_object(ctx, ctx->object_proto);
+    g_formdata_proto = js_new_object(ctx, ctx->object_proto);
     g_event_proto = js_new_object(ctx, ctx->object_proto);
     g_html_proto = js_new_object(ctx, g_element_proto);     /* HTMLElement.prototype */
-    g_media_proto = js_new_object(ctx, g_element_proto);    /* HTMLMediaElement.prototype */
+    g_media_proto = js_new_object(ctx, g_html_proto);       /* HTMLMediaElement.prototype */
     g_custom_elements = js_new_object(ctx, ctx->object_proto);
     g_module_cache = js_new_object(ctx, ctx->object_proto);
     g_module_src = js_new_object(ctx, ctx->object_proto);
     g_document_proto = js_new_object(ctx, g_node_proto);
     g_response_proto = js_new_object(ctx, ctx->object_proto);
     g_ws_proto = js_new_object(ctx, ctx->object_proto);
+    g_notification_proto = js_new_object(ctx, ctx->object_proto);
     g_xhr_proto = js_new_object(ctx, ctx->object_proto);
     g_blob_proto = js_new_object(ctx, ctx->object_proto);
+    g_remote_proto = js_new_object(ctx, ctx->object_proto);  /* RemotePlayback.prototype */
+    g_remotes = js_new_array(ctx, 0);
     g_abortsignal_proto = js_new_object(ctx, ctx->object_proto);
     g_abortcontroller_proto = js_new_object(ctx, ctx->object_proto);
+    g_rtc_proto = js_new_object(ctx, ctx->object_proto);
     g_document = js_new_object(ctx, g_document_proto);
     g_live_wrappers = js_new_array(ctx, 0);
     g_websockets = js_new_array(ctx, 0);
+    g_bchannel_proto = js_new_object(ctx, ctx->object_proto);
+    g_bchannels = js_new_array(ctx, 0);
+    g_notifications = js_new_array(ctx, 0);
     g_timers = js_new_array(ctx, 0);
     g_tmeta = 0; g_tcap = 0; g_ntimers = 0;
     g_nparsed = 0;
     gc_add_root((void **)&g_node_proto);
     gc_add_root((void **)&g_element_proto);
     gc_add_root((void **)&g_style_proto);
+    gc_add_root((void **)&g_classlist_proto);
     gc_add_root((void **)&g_url_proto);
     gc_add_root((void **)&g_sp_proto);
+    gc_add_root((void **)&g_formdata_proto);
     gc_add_root((void **)&g_event_proto);
     gc_add_root((void **)&g_html_proto);
     gc_add_root((void **)&g_media_proto);
@@ -3363,11 +4349,18 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     gc_add_root((void **)&g_ws_proto);
     gc_add_root((void **)&g_xhr_proto);
     gc_add_root((void **)&g_blob_proto);
+    gc_add_root((void **)&g_remote_proto);
+    gc_add_root((void **)&g_remotes);
     gc_add_root((void **)&g_abortsignal_proto);
     gc_add_root((void **)&g_abortcontroller_proto);
+    gc_add_root((void **)&g_rtc_proto);
     gc_add_root((void **)&g_document);
     gc_add_root((void **)&g_live_wrappers);
     gc_add_root((void **)&g_websockets);
+    gc_add_root((void **)&g_bchannel_proto);
+    gc_add_root((void **)&g_bchannels);
+    gc_add_root((void **)&g_notification_proto);
+    gc_add_root((void **)&g_notifications);
     gc_add_root((void **)&g_timers);
     js_set_module_loader(ctx, browser_load_module, 0);
 
@@ -3404,13 +4397,32 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_method(g_style_proto, "getPropertyValue", style_getprop, 1);
     def_method(g_style_proto, "removeProperty", style_removeprop, 1);
 
+    /* DOMTokenList prototype (element.classList) */
+    def_acc(g_classlist_proto, "length", cl_length, 0);
+    def_acc(g_classlist_proto, "value", cl_get_value, cl_set_value);
+    def_method(g_classlist_proto, "add", cl_add, 1);
+    def_method(g_classlist_proto, "remove", cl_remove, 1);
+    def_method(g_classlist_proto, "toggle", cl_toggle, 1);
+    def_method(g_classlist_proto, "replace", cl_replace, 2);
+    def_method(g_classlist_proto, "contains", cl_contains, 1);
+    def_method(g_classlist_proto, "item", cl_item, 1);
+    def_method(g_classlist_proto, "forEach", cl_foreach, 1);
+    def_method(g_classlist_proto, "values", cl_values, 0);
+    def_method(g_classlist_proto, "keys", cl_keys, 0);
+    def_method(g_classlist_proto, "entries", cl_entries, 0);
+    def_method(g_classlist_proto, "toString", cl_get_value, 0);
+    { js_object *f = js_new_native(ctx, cl_values, "[Symbol.iterator]", 0);
+      js_def(g_classlist_proto, js_symbol_key(ctx->sym_iterator), js_obj_value(f), P_CONFIGURABLE); }
+
     /* element prototype */
     def_acc(g_element_proto, "tagName", el_tagName, 0);
     def_acc(g_element_proto, "nodeName", el_nodeName, 0);
     def_acc(g_element_proto, "nodeType", el_nodeType, 0);
     def_acc(g_element_proto, "sheet", el_get_sheet, 0);
     def_acc(g_element_proto, "id", el_get_id, el_set_id);
+    def_acc(g_element_proto, "nonce", el_get_nonce, el_set_nonce);
     def_acc(g_element_proto, "className", el_get_class, el_set_class);
+    def_acc(g_element_proto, "classList", el_get_classlist, 0);
     def_acc(g_element_proto, "textContent", el_get_text, el_set_text);
     def_acc(g_element_proto, "innerText", el_get_text, el_set_text);
     def_acc(g_element_proto, "innerHTML", el_get_html, el_set_html);
@@ -3469,6 +4481,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_method(g_element_proto, "getBoundingClientRect", el_get_bounding_rect, 0);
 
     setup_media_proto(ctx);     /* HTMLMediaElement props/methods + the Audio ctor */
+    setup_remote_proto(ctx);    /* RemotePlayback (media.remote) methods + events   */
 
     /* document: methods on the shared proto so DOMParser documents inherit them
      * (they're root-relative — they query whichever document is `this`). */
@@ -3477,6 +4490,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_method(g_document_proto, "querySelector", doc_query, 1);
     def_method(g_document_proto, "querySelectorAll", doc_query_all, 1);
     def_method(g_document_proto, "createElement", doc_create_el, 1);
+    def_method(g_document_proto, "createElementNS", doc_create_el_ns, 2);
     def_method(g_document_proto, "createTextNode", doc_create_text, 1);
     def_method(g_document_proto, "addEventListener", el_add_listener, 3);
     def_method(g_document_proto, "removeEventListener", el_remove_listener, 3);
@@ -3515,10 +4529,10 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         js_object *nav = js_new_object(ctx, ctx->object_proto);
         js_object *langs;
         gc_push_scope(); gc_keep(nav);
-        js_def(nav, "userAgent", js_mk_cstring(ctx, "Mozilla/5.0 (OwOS; x86) OwOSBrowser/1.0"), P_ENUMERABLE);
+        js_def(nav, "userAgent", js_mk_cstring(ctx, browser_ua()), P_ENUMERABLE);
         js_def(nav, "appName", js_mk_cstring(ctx, "Netscape"), P_ENUMERABLE);     /* legacy, widely sniffed */
         js_def(nav, "appCodeName", js_mk_cstring(ctx, "Mozilla"), P_ENUMERABLE);
-        js_def(nav, "appVersion", js_mk_cstring(ctx, "5.0 (OwOS)"), P_ENUMERABLE);
+        js_def(nav, "appVersion", js_mk_cstring(ctx, browser_ua_version()), P_ENUMERABLE);  /* UA minus "Mozilla/" */
         js_def(nav, "product", js_mk_cstring(ctx, "Gecko"), P_ENUMERABLE);
         js_def(nav, "productSub", js_mk_cstring(ctx, "20030107"), P_ENUMERABLE);
         js_def(nav, "vendor", js_mk_cstring(ctx, "OwOS"), P_ENUMERABLE);
@@ -3564,6 +4578,30 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
             def_method(clip, "removeEventListener", el_noop, 2);
             js_def(nav, "clipboard", js_obj_value(clip), P_ENUMERABLE);
         }
+        {
+            js_object *geo = js_new_object(ctx, ctx->object_proto);   /* navigator.geolocation */
+            gc_keep(geo);
+            def_method(geo, "getCurrentPosition", geo_get_current, 3);
+            def_method(geo, "watchPosition", geo_watch, 3);
+            def_method(geo, "clearWatch", el_noop, 1);
+            js_def(nav, "geolocation", js_obj_value(geo), P_ENUMERABLE);
+        }
+        {
+            js_object *md = js_new_object(ctx, ctx->object_proto);    /* navigator.mediaDevices */
+            gc_keep(md);
+            def_method(md, "getUserMedia", md_get_user_media, 1);
+            def_method(md, "getDisplayMedia", md_get_display_media, 1);
+            def_method(md, "enumerateDevices", md_enumerate, 0);
+            def_method(md, "addEventListener", el_noop, 2);
+            def_method(md, "removeEventListener", el_noop, 2);
+            js_def(nav, "mediaDevices", js_obj_value(md), P_ENUMERABLE);
+        }
+        {
+            js_object *perm = js_new_object(ctx, ctx->object_proto);  /* navigator.permissions */
+            gc_keep(perm);
+            def_method(perm, "query", perm_query, 1);
+            js_def(nav, "permissions", js_obj_value(perm), P_ENUMERABLE);
+        }
         js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
         gc_pop_scope();
     }
@@ -3605,6 +4643,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         js_def(win, "crypto", js_obj_value(cr), P_WRITABLE | P_CONFIGURABLE);
         gc_pop_scope();
     }
+    js_webapi_setup(ctx, win);
     /* URL + URLSearchParams (WHATWG Web APIs over curl/url.h) */
     def_method(g_url_proto, "toString", url_tostring, 0);
     def_method(g_url_proto, "toJSON", url_tostring, 0);
@@ -3629,6 +4668,34 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         gc_pop_scope();
     }
 
+    /* FormData — a name/value multimap over the same @k/@v arrays as
+     * URLSearchParams, so it shares the sp_* accessors. */
+    def_method(g_formdata_proto, "get", sp_get, 1);
+    def_method(g_formdata_proto, "getAll", sp_get_all, 1);
+    def_method(g_formdata_proto, "has", sp_has, 1);
+    def_method(g_formdata_proto, "append", sp_append, 2);
+    def_method(g_formdata_proto, "set", sp_set, 2);
+    def_method(g_formdata_proto, "delete", sp_delete, 1);
+    def_method(g_formdata_proto, "forEach", sp_for_each, 1);
+    {
+        js_object *fc = js_new_native(ctx, fd_ctor, "FormData", 1);
+        gc_push_scope(); gc_keep(fc);
+        js_def(fc, "prototype", js_obj_value(g_formdata_proto), 0);
+        js_def(g_formdata_proto, "constructor", js_obj_value(fc), P_WRITABLE | P_CONFIGURABLE);
+        js_def(win, "FormData", js_obj_value(fc), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+
+    /* HTMLFormElement: programmatic submission + the elements collection. */
+    {
+        js_object *fp = iface_proto_for_tag("form");
+        if (fp) {
+            def_method(fp, "submit", form_submit, 0);
+            def_method(fp, "requestSubmit", form_request_submit, 1);
+            def_acc(fp, "elements", form_elements, 0);
+        }
+    }
+
     /* DOM events: Event prototype, the Event/CustomEvent constructors, and the
      * window-level listener API (document + element protos got theirs above). */
     def_method(g_event_proto, "preventDefault", ev_prevent, 0);
@@ -3642,6 +4709,37 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         js_def(win, "Event", js_obj_value(ec), P_WRITABLE | P_CONFIGURABLE);
         js_def(win, "CustomEvent", js_obj_value(ec), P_WRITABLE | P_CONFIGURABLE);
         gc_pop_scope();
+    }
+    /* Event subclasses. Each gets a prototype chaining to its parent interface's
+     * (so `mouseEvent instanceof UIEvent` holds up the whole DOM event hierarchy)
+     * and a constructor sharing event_sub_ctor, with its prototype in fn->data. */
+    {
+        static const struct { const char *name; int parent; } subs[] = {
+            { "UIEvent",       -1 },   /* -> Event.prototype       */
+            { "MouseEvent",     0 },   /* -> UIEvent.prototype     */
+            { "KeyboardEvent",  0 },
+            { "FocusEvent",     0 },
+            { "InputEvent",     0 },
+            { "CompositionEvent", 0 },
+            { "PointerEvent",   1 },   /* -> MouseEvent.prototype  */
+            { "WheelEvent",     1 },
+            { "DragEvent",      1 },
+        };
+        js_object *protos[sizeof subs / sizeof subs[0]];
+        unsigned i;
+        for (i = 0; i < sizeof subs / sizeof subs[0]; i++) {
+            js_object *parent = subs[i].parent < 0 ? g_event_proto : protos[subs[i].parent];
+            js_object *proto = js_new_object(ctx, parent);
+            js_object *ctor;
+            gc_push_scope(); gc_keep(proto);
+            ctor = (js_object *)gc_keep(js_new_native(ctx, event_sub_ctor, subs[i].name, 1));
+            ctor->fn->data = js_obj_value(proto);      /* the re-parent target */
+            js_def(ctor, "prototype", js_obj_value(proto), 0);
+            js_def(proto, "constructor", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
+            js_def(win, subs[i].name, js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
+            protos[i] = proto;                         /* reachable via win from here on */
+            gc_pop_scope();
+        }
     }
     def_method(win, "addEventListener", el_add_listener, 3);
     def_method(win, "removeEventListener", el_remove_listener, 3);
@@ -3670,6 +4768,41 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         def_method(ce, "whenDefined", ce_when_defined, 1);
         js_def(win, "customElements", js_obj_value(ce), P_WRITABLE | P_CONFIGURABLE);
         gc_pop_scope();
+    }
+
+    /* Standard DOM interface constructors (Element/Document, HTMLMediaElement and
+     * the HTMLxxxElement family) so pages can reference and extend them; wrap_node
+     * hands each element its matching prototype so `el instanceof HTMLScriptElement`
+     * holds. Every HTMLxxxElement.prototype chains to HTMLElement.prototype. */
+    {
+        /* Element/Document/HTMLMediaElement are the shared bases the family chains
+         * to (they map to no single tag, so they stay out of the registry). */
+        define_iface(ctx, win, "Element", g_element_proto);
+        define_iface(ctx, win, "Document", g_document_proto);
+        define_iface(ctx, win, "HTMLMediaElement", g_media_proto);
+
+        unsigned i;
+        for (i = 0; i < sizeof g_html_ifaces / sizeof g_html_ifaces[0]; i++) {
+            js_object *parent = g_html_ifaces[i].media ? g_media_proto : g_html_proto;
+            js_object *proto = js_new_object(ctx, parent);
+            gc_push_scope(); gc_keep(proto);
+            define_iface(ctx, win, g_html_ifaces[i].name, proto);
+            g_html_ifaces[i].proto = proto;
+            gc_add_root((void **)&g_html_ifaces[i].proto);
+            gc_pop_scope();
+        }
+        /* Image is a global alias constructing an <img>; its prototype is
+         * HTMLImageElement.prototype so `new Image() instanceof HTMLImageElement`
+         * (and instanceof Image) both hold. */
+        for (i = 0; i < sizeof g_html_ifaces / sizeof g_html_ifaces[0]; i++) {
+            if (!streq(g_html_ifaces[i].name, "HTMLImageElement")) continue;
+            js_object *ic = js_new_native(ctx, image_ctor, "Image", 2);
+            gc_push_scope(); gc_keep(ic);
+            js_def(ic, "prototype", js_obj_value(g_html_ifaces[i].proto), 0);
+            js_def(win, "Image", js_obj_value(ic), P_WRITABLE | P_CONFIGURABLE);
+            gc_pop_scope();
+            break;
+        }
     }
     js_def_native(ctx, win, "DOMParser", domparser_ctor, 0);   /* new DOMParser().parseFromString */
 
@@ -3700,6 +4833,40 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         js_def(wc, "CLOSING", js_number(WS_CLOSING), P_ENUMERABLE);
         js_def(wc, "CLOSED", js_number(WS_CLOSED), P_ENUMERABLE);
         js_def(win, "WebSocket", js_obj_value(wc), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+
+    /* BroadcastChannel: same-context message bus (postMessage fans out to other
+     * open same-named channels via the shared EventTarget machinery). */
+    def_method(g_bchannel_proto, "postMessage", bc_post_m, 1);
+    def_method(g_bchannel_proto, "close", bc_close_m, 0);
+    def_method(g_bchannel_proto, "addEventListener", el_add_listener, 3);
+    def_method(g_bchannel_proto, "removeEventListener", el_remove_listener, 3);
+    def_method(g_bchannel_proto, "dispatchEvent", el_dispatch, 1);
+    {
+        js_object *bc = js_new_native(ctx, bchannel_ctor, "BroadcastChannel", 1);
+        gc_push_scope(); gc_keep(bc);
+        js_def(bc, "prototype", js_obj_value(g_bchannel_proto), 0);
+        js_def(g_bchannel_proto, "constructor", js_obj_value(bc), P_WRITABLE | P_CONFIGURABLE);
+        js_def(win, "BroadcastChannel", js_obj_value(bc), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+
+    /* Notification (W3C): posts to notifyd, events driven by js_notifications_pump */
+    def_method(g_notification_proto, "close", notif_close_m, 0);
+    def_method(g_notification_proto, "addEventListener", el_add_listener, 3);
+    def_method(g_notification_proto, "removeEventListener", el_remove_listener, 3);
+    def_method(g_notification_proto, "dispatchEvent", el_dispatch, 1);
+    {
+        js_object *nc = js_new_native(ctx, notification_ctor, "Notification", 1);
+        gc_push_scope(); gc_keep(nc);
+        js_def(nc, "prototype", js_obj_value(g_notification_proto), 0);
+        js_def(g_notification_proto, "constructor", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
+        js_object *pg = (js_object *)gc_keep(js_new_native(ctx, notif_get_permission, "permission", 0));
+        js_def_accessor(nc, "permission", pg, 0, P_CONFIGURABLE);
+        js_def_native(ctx, nc, "requestPermission", notif_request_permission, 1);
+        js_def(nc, "maxActions", js_number(NOTIFY_MAX_BUTTONS), P_ENUMERABLE);
+        js_def(win, "Notification", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
         gc_pop_scope();
     }
 
@@ -3766,6 +4933,38 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         gc_pop_scope();
     }
 
+    /* RTCPeerConnection: inert (no WebRTC/ICE in OwOS). Present under all vendor
+     * prefixes so IP-leak probes and video-chat feature detection run past
+     * `new RTCPeerConnection(...)` instead of throwing "not a constructor"; it
+     * simply never gathers ICE candidates. */
+    def_method(g_rtc_proto, "createDataChannel", rtc_create_data_channel, 1);
+    def_method(g_rtc_proto, "createOffer", rtc_create_offer, 0);
+    def_method(g_rtc_proto, "createAnswer", rtc_create_answer, 0);
+    def_method(g_rtc_proto, "setLocalDescription", rtc_set_desc, 1);
+    def_method(g_rtc_proto, "setRemoteDescription", rtc_set_desc, 1);
+    def_method(g_rtc_proto, "addIceCandidate", rtc_set_desc, 1);
+    def_method(g_rtc_proto, "getStats", rtc_get_stats, 0);
+    def_method(g_rtc_proto, "addTrack", rtc_noop, 2);
+    def_method(g_rtc_proto, "removeTrack", rtc_noop, 1);
+    def_method(g_rtc_proto, "getSenders", el_empty_array, 0);
+    def_method(g_rtc_proto, "getReceivers", el_empty_array, 0);
+    def_method(g_rtc_proto, "getTransceivers", el_empty_array, 0);
+    def_method(g_rtc_proto, "restartIce", rtc_noop, 0);
+    def_method(g_rtc_proto, "close", rtc_noop, 0);
+    def_method(g_rtc_proto, "addEventListener", el_add_listener, 3);
+    def_method(g_rtc_proto, "removeEventListener", el_remove_listener, 3);
+    def_method(g_rtc_proto, "dispatchEvent", el_dispatch, 1);
+    {
+        js_object *rc = js_new_native(ctx, rtc_ctor, "RTCPeerConnection", 1);
+        gc_push_scope(); gc_keep(rc);
+        js_def(rc, "prototype", js_obj_value(g_rtc_proto), 0);
+        js_def(g_rtc_proto, "constructor", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
+        js_def(win, "RTCPeerConnection", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
+        js_def(win, "webkitRTCPeerConnection", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
+        js_def(win, "mozRTCPeerConnection", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
+        gc_pop_scope();
+    }
+
     /* history (SPA routers lean on it): inert but present so pushState/back don't
      * throw. The page doesn't re-route, but its scripts run past these calls. */
     {
@@ -3797,6 +4996,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     }
     def_method(win, "matchMedia", win_matchmedia, 1);
     js_def(win, "localStorage", make_storage(ctx), P_WRITABLE | P_CONFIGURABLE);
+    js_idb_setup(ctx, win);
     js_def(win, "sessionStorage", make_storage(ctx), P_WRITABLE | P_CONFIGURABLE);
     {                                              /* CSS.supports() */
         js_object *css = js_new_object(ctx, ctx->object_proto);
@@ -3816,7 +5016,9 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_method(win, "clearInterval", win_clear_timer, 1);
     def_method(win, "requestAnimationFrame", win_request_anim, 1);
     def_method(win, "cancelAnimationFrame", win_clear_timer, 1);
-    def_method(win, "alert", el_noop, 1);
+    def_method(win, "alert", win_alert, 1);
+    def_method(win, "confirm", win_confirm, 1);
+    def_method(win, "prompt", win_prompt, 2);
     def_method(win, "getComputedStyle", win_getcomputedstyle, 1);
     def_acc(win, "innerWidth", win_innerWidth, 0);
     def_acc(win, "innerHeight", win_innerHeight, 0);
@@ -3824,6 +5026,11 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
     def_acc(win, "pageXOffset", win_scrollX, 0);
     def_acc(win, "scrollY", win_scrollY, 0);
     def_acc(win, "pageYOffset", win_scrollY, 0);
+
+    /* navigator.serviceWorker + caches + Response/Request; re-instates a
+     * controlling worker registered on a previous page (must run last, after
+     * fetch/Promise/etc. are on the global). */
+    sw_install(ctx, win, page_url);
 }
 
 /* ------------------------------------------------------- runner ----------- */
@@ -3843,10 +5050,14 @@ static void js_print(js_ctx *ctx, int level, const char *s, int len)
  * Console — a script URL, "<page> (inline script #N)", or an async label like
  * "<event listener>"/"<timer callback>". Set at each execution entry point. */
 static char g_cur_script[URL_MAX];
-static void js_set_cur_script(const char *label)
+void js_set_cur_script(const char *label)
 {
     int k = 0; g_cur_script[0] = '\0';
     if (label) sapp(g_cur_script, &k, sizeof g_cur_script, label);
+    /* Point the engine at the same buffer so a captured stack's outermost frame
+     * names this script/async entry (the sites that build g_cur_script inline
+     * mutate the same storage, so this one binding tracks them all). */
+    if (g_ctx) js_set_script(g_ctx, g_cur_script);
 }
 /* Attribute the current execution to a named event's listener, e.g. a thrown
  * error inside an onclick shows "in <click listener>". */
@@ -3859,7 +5070,7 @@ static void js_set_event_script(const char *type)
     js_set_cur_script(buf);
 }
 
-static void report_exc(js_ctx *ctx) {
+void report_exc(js_ctx *ctx) {
     js_value e = ctx->exc;
     sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
     int have_stack = 0;
@@ -3878,7 +5089,10 @@ static void report_exc(js_ctx *ctx) {
     } else if (e.type == JV_STR) sb_puts(&sb, e.u.str->data);
     else sb_puts(&sb, "exception");
     if (!have_stack) sb_putc(&sb, '\n');
-    if (g_cur_script[0]) { sb_puts(&sb, "    in "); sb_puts(&sb, g_cur_script); sb_putc(&sb, '\n'); }
+    /* A captured .stack already ends in its "    at <script>" origin line (and, for
+     * a deferred callback, the "scheduled from" chain back to the arming script), so
+     * only a bare throw (a string/number with no stack) needs the script footer. */
+    if (!have_stack && g_cur_script[0]) { sb_puts(&sb, "    in "); sb_puts(&sb, g_cur_script); sb_putc(&sb, '\n'); }
     devtools_console_append(DT_ERROR, sb.b, sb.n);
     if (sb.b) free(sb.b);
 }
@@ -3916,6 +5130,7 @@ void js_repl_run(const char *src) {
         sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
         sb_puts(&sb, "SyntaxError: ");
         sb_puts(&sb, pe.msg ? pe.msg : "parse error");
+        sb_put_pos(&sb, pe.line, pe.col);
         sb_putc(&sb, '\n');
         devtools_console_append(DT_ERROR, sb.b, sb.n);
         if (sb.b) free(sb.b);
@@ -4015,10 +5230,13 @@ static void run_inserted_script(struct dom_node *node) {
         resolve_url(g_page_url_buf, src, abs, sizeof abs);
         if (B->pg->csp) {
             char use[URL_MAX], reason[64];
-            if (!csp_check_url(B->pg->csp, CSP_SCRIPT, abs, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
+            if (!csp_check_script_el(B->pg->csp, abs, g_page_url_buf,
+                                     dom_get_attr(node, "nonce"), 0,
+                                     use, sizeof use, reason, sizeof reason)) {
                 js_csp_log("a script", abs, reason);
                 return;
             }
+            strlcpy(abs, use, sizeof abs);        /* upgraded URL */
         }
         if (!g_fetch) return;
         urls[0] = abs; bodies[0] = 0; lens[0] = 0;
@@ -4049,7 +5267,8 @@ static void run_inserted_script(struct dom_node *node) {
     free(code);
     if (!prog) {
         sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
-        sb_puts(&sb, "[js] SyntaxError: "); sb_puts(&sb, pe.msg ? pe.msg : "parse error"); sb_putc(&sb, '\n');
+        sb_puts(&sb, "[js] SyntaxError: "); sb_puts(&sb, pe.msg ? pe.msg : "parse error");
+        sb_put_pos(&sb, pe.line, pe.col); sb_putc(&sb, '\n');
         devtools_console_append(DT_ERROR, sb.b, sb.n);
         if (sb.b) free(sb.b);
         js_arena_free(ar); free(ar);
@@ -4140,12 +5359,14 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
             resolve_url(page_url, src, abs, sizeof abs);
             if (B->pg->csp) {                          /* CSP script-src for external scripts */
                 char use[URL_MAX], reason[64];
-                if (!csp_check_url(B->pg->csp, CSP_SCRIPT, abs, page_url, use, sizeof use, reason, sizeof reason)) {
+                if (!csp_check_script_el(B->pg->csp, abs, page_url,
+                                         dom_get_attr(scripts[i], "nonce"), 1,
+                                         use, sizeof use, reason, sizeof reason)) {
                     js_csp_log("the script", abs, reason);
                     body_idx[i] = -2;              /* blocked: skip fetch + execution */
                     continue;
                 }
-                copy_str(abs, sizeof abs, use);    /* upgraded URL */
+                strlcpy(abs, use, sizeof abs);    /* upgraded URL */
             }
             urls[nurls] = sdup(abs);
             body_idx[i] = nurls;
@@ -4165,10 +5386,11 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
     }
     g_ctx->now_ms = now_ms;
     js_set_stack_limit(g_ctx, browser_js_stack_floor());   /* bound recursion to the worker stack */
+    js_set_script(g_ctx, g_cur_script);                    /* origin frame for captured stacks */
     g_has_listeners = 0;
     setup_dom(g_ctx, page_url);
     g_fetch = fetch;                                /* the loader uses it for modules */
-    copy_str(g_page_url_buf, sizeof g_page_url_buf, page_url ? page_url : "");
+    strlcpy(g_page_url_buf, page_url ? page_url : "", sizeof g_page_url_buf);
     g_page_live = 1;
 
     /* CSP: without 'unsafe-eval', neutralise the dynamic-code globals so the page's
@@ -4240,7 +5462,7 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
             sb_puts(&sb, pe.msg ? pe.msg : "parse error");
             if (g_cur_script[0]) {
                 sb_puts(&sb, "\n    in "); sb_puts(&sb, g_cur_script);
-                if (pe.line > 0) { char ln[16]; int li = 0; uapp(ln, &li, sizeof ln, (unsigned)pe.line); sb_putc(&sb, ':'); sb_puts(&sb, ln); }
+                sb_put_pos(&sb, pe.line, pe.col);
             }
             sb_putc(&sb, '\n');
             devtools_console_append(DT_ERROR, sb.b, sb.n);
@@ -4280,6 +5502,7 @@ void js_page_end(void) {
     int i;
     if (!g_page_live) return;
     dom_on_free_wrapper = 0;                         /* DOM teardown shouldn't call back */
+    js_cast_page_end();                              /* stop casting before the ctx dies */
     if (g_websockets && g_ctx) {                     /* close + free live sockets first */
         unsigned n = js_array_len(g_websockets), k;
         for (k = 0; k < n; k++) {
@@ -4290,10 +5513,13 @@ void js_page_end(void) {
             }
         }
     }
+    gc_remove_root((void **)&g_node_proto);
     gc_remove_root((void **)&g_element_proto);
     gc_remove_root((void **)&g_style_proto);
+    gc_remove_root((void **)&g_classlist_proto);
     gc_remove_root((void **)&g_url_proto);
     gc_remove_root((void **)&g_sp_proto);
+    gc_remove_root((void **)&g_formdata_proto);
     gc_remove_root((void **)&g_event_proto);
     gc_remove_root((void **)&g_html_proto);
     gc_remove_root((void **)&g_media_proto);
@@ -4305,24 +5531,49 @@ void js_page_end(void) {
     gc_remove_root((void **)&g_ws_proto);
     gc_remove_root((void **)&g_xhr_proto);
     gc_remove_root((void **)&g_blob_proto);
+    gc_remove_root((void **)&g_remote_proto);
+    gc_remove_root((void **)&g_remotes);
+    gc_remove_root((void **)&g_clipitem_proto);
     gc_remove_root((void **)&g_abortsignal_proto);
     gc_remove_root((void **)&g_abortcontroller_proto);
+    gc_remove_root((void **)&g_rtc_proto);
     gc_remove_root((void **)&g_document);
     gc_remove_root((void **)&g_live_wrappers);
     gc_remove_root((void **)&g_websockets);
+    gc_remove_root((void **)&g_bchannel_proto);
+    gc_remove_root((void **)&g_bchannels);
+    gc_remove_root((void **)&g_notification_proto);
+    gc_remove_root((void **)&g_notifications);
     gc_remove_root((void **)&g_timers);
+    js_idb_teardown();
+    js_webapi_teardown();
+    {
+        unsigned k;
+        for (k = 0; k < sizeof g_html_ifaces / sizeof g_html_ifaces[0]; k++) {
+            gc_remove_root((void **)&g_html_ifaces[k].proto);
+            g_html_ifaces[k].proto = 0;
+        }
+    }
     g_timers = 0;
-    if (g_tmeta) { free(g_tmeta); g_tmeta = 0; }
+    if (g_tmeta) {
+        int i;
+        for (i = 0; i < g_tcap; i++) if (g_tmeta[i].async) free(g_tmeta[i].async);
+        free(g_tmeta); g_tmeta = 0;
+    }
     g_tcap = 0; g_ntimers = 0;
     g_media_proto = 0;
-    g_element_proto = g_style_proto = g_url_proto = g_sp_proto = 0;
+    g_node_proto = g_clipitem_proto = 0;
+    g_element_proto = g_style_proto = g_classlist_proto = g_url_proto = g_sp_proto = g_formdata_proto = 0;
     g_event_proto = g_html_proto = g_custom_elements = g_document = g_live_wrappers = 0;
     g_module_cache = g_document_proto = g_response_proto = 0;
     g_module_src = 0;
     g_ws_proto = g_websockets = 0;
+    g_bchannel_proto = g_bchannels = 0;
     g_xhr_proto = 0;
     g_blob_proto = 0;
     g_abortsignal_proto = g_abortcontroller_proto = 0;
+    g_rtc_proto = 0;
+    sw_teardown();                                    /* SW roots/objects (C store persists) */
     g_fetch = 0;
     if (g_ctx) { js_ctx_free(g_ctx); g_ctx = 0; }    /* frees the whole JS heap         */
     for (i = 0; i < g_narenas; i++) { js_arena_free(g_arenas[i]); free(g_arenas[i]); }

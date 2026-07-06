@@ -168,6 +168,10 @@ uint32_t pmm_alloc_frame(void)
 
 uint32_t pmm_alloc_contig(uint32_t bytes)
 {
+	/* Reject an absurd size before the round-up overflows uint32 and yields a
+	 * tiny `need` that would hand back a run far shorter than asked for. */
+	if (bytes > 0xFFFFFFFFu - (FRAME_SIZE - 1))
+		return 0;
 	uint32_t need = (bytes + FRAME_SIZE - 1) / FRAME_SIZE;
 	if (need == 0)
 		return 0;
@@ -207,6 +211,8 @@ void pmm_free_frame(uint32_t phys)
  * tracks frames individually, so a contiguous run is just freed frame by frame. */
 void pmm_free_contig(uint32_t phys, uint32_t bytes)
 {
+	if (bytes > 0xFFFFFFFFu - (FRAME_SIZE - 1))   /* never allocated (see alloc) */
+		return;
 	uint32_t need = (bytes + FRAME_SIZE - 1) / FRAME_SIZE;
 	for (uint32_t i = 0; i < need; i++)
 		pmm_free_frame(phys + i * FRAME_SIZE);

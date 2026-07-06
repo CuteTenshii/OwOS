@@ -43,6 +43,9 @@ static const struct chan chans[2] = { { 0x1F0, 0x3F6 }, { 0x170, 0x376 } };
 #define SCSI_INQUIRY         0x12
 
 #define POLL_LIMIT 1000000u
+#define MAX_PACKET_BYTES 65536u   /* cap the DRQ stream: a wedged drive can keep
+                                     re-asserting DRQ forever (largest legit reply
+                                     is a 2048-byte sector, so this is ample)      */
 
 /* The first CD/DVD drive atapi_init() latched onto, if any. One is plenty —
  * mirrors ata.c's single-disk model. */
@@ -121,6 +124,8 @@ static int packet(const uint8_t cdb[12], void *buf, uint32_t buflen)
 	uint8_t  *p   = buf;
 	uint32_t  got = 0;
 	for (;;) {
+		if (got > MAX_PACKET_BYTES)                       /* wedged drive          */
+			return -1;
 		/* Settle ~400 ns first: right after the CDB (and after each data block)
 		 * the drive needs a moment to raise BSY before its status is meaningful.
 		 * Without this the first read sees stale BSY=0/DRQ=0 and quits early. */

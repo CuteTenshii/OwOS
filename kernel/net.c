@@ -30,6 +30,7 @@
 #include "gzip.h"
 #include "heap.h"
 #include "sched.h"
+#include "entropy.h"
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -114,6 +115,39 @@ static struct arp_entry {
 	int     valid;
 } arp_cache[ARP_CACHE];
 
+/* IPs we have an outstanding ARP request for. A reply is only trusted if it
+ * answers a request we actually sent, so an unsolicited (gratuitous) reply
+ * can't poison the cache for a host we're already talking to. */
+#define ARP_PENDING 8
+static struct { uint8_t ip[4]; int valid; } arp_pending[ARP_PENDING];
+
+static void arp_pending_add(const uint8_t ip[4])
+{
+	for (int i = 0; i < ARP_PENDING; i++)
+		if (arp_pending[i].valid && memcmp(arp_pending[i].ip, ip, 4) == 0)
+			return;
+	for (int i = 0; i < ARP_PENDING; i++)
+		if (!arp_pending[i].valid) {
+			memcpy(arp_pending[i].ip, ip, 4);
+			arp_pending[i].valid = 1;
+			return;
+		}
+	memcpy(arp_pending[0].ip, ip, 4);       /* all in use: evict the oldest slot */
+	arp_pending[0].valid = 1;
+}
+
+/* Consume a pending request for `ip`; returns 1 if one existed (a reply is then
+ * solicited and may be cached). */
+static int arp_pending_take(const uint8_t ip[4])
+{
+	for (int i = 0; i < ARP_PENDING; i++)
+		if (arp_pending[i].valid && memcmp(arp_pending[i].ip, ip, 4) == 0) {
+			arp_pending[i].valid = 0;
+			return 1;
+		}
+	return 0;
+}
+
 /* Apply an IPv4 config (SYS_IFCONFIG, from /bin/dhcpcd). Any arg may be NULL.
  * Flushes the ARP cache since the subnet may have changed. */
 void net_ifconfig(const uint8_t ip[4], const uint8_t mask[4],
@@ -125,6 +159,8 @@ void net_ifconfig(const uint8_t ip[4], const uint8_t mask[4],
 	if (dns)  memcpy(dns_ip, dns, 4);
 	for (int i = 0; i < ARP_CACHE; i++)
 		arp_cache[i].valid = 0;
+	for (int i = 0; i < ARP_PENDING; i++)
+		arp_pending[i].valid = 0;
 }
 
 /* Reply slots written by the RX interrupt, polled by the command context. */
@@ -135,6 +171,11 @@ static volatile uint32_t icmp_send_us;  /* set just before the echo goes out  */
 static volatile uint32_t icmp_rtt_us;   /* recv timestamp - send, set by IRQ  */
 
 static uint16_t ip_ident = 1;
+
+/* Nonzero while inside net_rx_frame (NIC RX / poll interrupt context). Used to
+ * keep arp_resolve from blocking on hlt inside the IRQ, which would stall RX
+ * and — since the wait re-enables interrupts — let the line re-enter unbounded. */
+static volatile int net_rx_depth;
 
 /* ----------------------------------------------------------------- transmit */
 
@@ -207,6 +248,7 @@ static void arp_request(const uint8_t ip[4])
 	static const uint8_t zero[6]  = { 0 };
 	uint8_t pkt[28];
 	arp_build(pkt, 1, zero, ip);
+	arp_pending_add(ip);            /* remember we asked, so the reply is trusted */
 	eth_send(bcast, ETH_ARP, pkt, 28);
 }
 
@@ -219,8 +261,9 @@ static void arp_recv(const uint8_t *p, uint32_t len)
 		return;
 
 	uint16_t op = ntohs(a->oper);
-	if (op == 2) {                          /* reply: learn the sender         */
-		arp_cache_put(a->spa, a->sha);
+	if (op == 2) {                          /* reply: trust it only if solicited */
+		if (arp_pending_take(a->spa))
+			arp_cache_put(a->spa, a->sha);
 	} else if (op == 1 && memcmp(a->tpa, my_ip, 4) == 0) {
 		arp_cache_put(a->spa, a->sha);  /* someone is asking for us: answer */
 		uint8_t pkt[28];
@@ -234,6 +277,15 @@ static int arp_resolve(const uint8_t ip[4], uint8_t out[6])
 {
 	if (arp_lookup(ip, out))
 		return 1;
+	/* In RX-interrupt context (e.g. a passive-open SYN|ACK whose peer MAC isn't
+	 * cached) we must not spin: blocking with hlt inside the NIC IRQ stalls RX
+	 * and, because the wait re-enables interrupts, lets the same line re-enter
+	 * without bound. Kick a request and fail; the solicited reply arrives in a
+	 * later IRQ and the peer's TCP retransmit then resolves. */
+	if (net_rx_depth > 0) {
+		arp_request(ip);
+		return 0;
+	}
 	for (int tries = 0; tries < 4; tries++) {
 		arp_request(ip);
 		uint32_t deadline = timer_ticks() + TIMER_HZ / 4;   /* ~250 ms        */
@@ -280,7 +332,10 @@ static void ip_send_ttl(const uint8_t dst[4], uint8_t proto,
 	if (!next_hop_mac(dst, nh))
 		return;
 
-	static uint8_t buf[1500];
+	/* Stack-local, not static: this runs in both command context (UDP/ICMP/TCP
+	 * write) and the RX IRQ (TCP ACKs), so a shared buffer would let the IRQ
+	 * corrupt a datagram a thread is mid-assembly on. Mirrors eth_send. */
+	uint8_t buf[1500];
 	if (20 + plen > sizeof(buf))
 		return;
 
@@ -452,6 +507,29 @@ static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
 
 /* ----------------------------------------------------------- receive bottom */
 
+/* Is `dst` an address we should accept a packet for: our unicast, limited or
+ * directed broadcast, or multicast? While unconfigured (no lease yet) accept
+ * everything so the DHCP path still works. */
+static int ip_dst_ok(const uint8_t dst[4])
+{
+	if (!net_have_ip())
+		return 1;
+	if (memcmp(dst, my_ip, 4) == 0)
+		return 1;
+	if (dst[0] == 255 && dst[1] == 255 && dst[2] == 255 && dst[3] == 255)
+		return 1;                       /* limited broadcast */
+	if (dst[0] >= 224 && dst[0] <= 239)
+		return 1;                       /* multicast */
+	int net_match = 1, host_ones = 1;       /* directed subnet broadcast */
+	for (int i = 0; i < 4; i++) {
+		if ((dst[i] & netmask[i]) != (my_ip[i] & netmask[i]))
+			net_match = 0;
+		if ((uint8_t)(dst[i] | netmask[i]) != 0xFF)
+			host_ones = 0;
+	}
+	return net_match && host_ones;
+}
+
 static void ip_recv(const uint8_t *p, uint32_t len)
 {
 	if (len < 20)
@@ -462,6 +540,15 @@ static void ip_recv(const uint8_t *p, uint32_t len)
 	uint32_t ihl = (uint32_t)(ip->ver_ihl & 0x0F) * 4;
 	uint32_t total = ntohs(ip->len);
 	if (ihl < 20 || ihl > len)
+		return;
+	if (inet_csum(p, ihl) != 0)             /* reject a corrupt header */
+		return;
+	/* We don't reassemble, so a fragment (offset != 0 or MF set) must never be
+	 * parsed as though it carried a full transport header. */
+	uint16_t frag = ntohs(ip->frag);
+	if ((frag & 0x2000) || (frag & 0x1FFF))
+		return;
+	if (!ip_dst_ok(ip->dst))                /* not addressed to us */
 		return;
 	if (total > len)
 		total = len;
@@ -483,6 +570,8 @@ void net_rx_frame(const uint8_t *f, uint32_t len)
 {
 	if (len < 14)
 		return;
+	net_rx_depth++;
+	entropy_stir(len);              /* packet-arrival timing feeds the CSPRNG */
 	usock_raw_deliver(f, len);      /* additive tap: raw sockets see every frame */
 	const struct eth_hdr *e = (const struct eth_hdr *)f;
 	uint16_t type = ntohs(e->type);
@@ -490,6 +579,7 @@ void net_rx_frame(const uint8_t *f, uint32_t len)
 		arp_recv(f + 14, len - 14);
 	else if (type == ETH_IP)
 		ip_recv(f + 14, len - 14);
+	net_rx_depth--;
 }
 
 /* ------------------------------------------------------------------ command */
@@ -677,8 +767,8 @@ static int sock_raw_recv(struct usock *s, void *buf, uint32_t max, int block)
 	}
 }
 
-/* Open a raw Ethernet socket (SYS_NET_RAW_OPEN). Root-gated in the syscall
- * layer. Returns a handle or -1 (no NIC/slot). */
+/* Open a raw Ethernet socket (reached via net_sock_connect with SK_RAWETH; root-
+ * gated in the syscall layer). Returns a handle or -1 (no NIC/slot). */
 int net_raw_open(void)
 {
 	if (!nic_present())
@@ -703,6 +793,8 @@ int net_raw_open(void)
  * or -1 no slot/NIC, -2 not an IP, -3 connect, -4 Ctrl+C. */
 int net_sock_connect(const char *host, uint16_t port, int proto)
 {
+	if (proto == SK_RAWETH)          /* raw L2 socket: no host/peer */
+		return net_raw_open();
 	if (!nic_present())
 		return -1;
 	int h = -1;
@@ -760,6 +852,8 @@ int net_sock_send(int h, const void *buf, uint32_t len)
 	switch (s->proto) {
 	case SK_TCP:  return tcp_write(s->conn, buf, len);
 	case SK_UDP:
+		if (len > 1472)          /* one IPv4/UDP datagram won't hold more */
+			return -1;
 		net_udp_send_ttl(s->peer, s->rport, s->lport, buf, len, s->ttl);
 		return (int)len;
 	case SK_ICMP:                            /* program built the ICMP message */
@@ -941,6 +1035,8 @@ int net_sock_sendto(int h, const uint8_t ip[4], int port,
                     const void *buf, uint32_t len)
 {
 	if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || usocks[h].proto != SK_UDP)
+		return -1;
+	if (len > 1472)                  /* one IPv4/UDP datagram won't hold more */
 		return -1;
 	struct usock *s = &usocks[h];
 	net_udp_send_ttl(ip, (uint16_t)port, s->lport, buf, len, s->ttl);

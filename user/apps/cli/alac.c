@@ -142,6 +142,10 @@ static int caf_parse(const char *path, struct caf *c)
 		if (readfile_at(path, pos, ch, 12) < 12) return -1;
 		sz = get_be64(ch + 4);
 		body = pos + 12;
+		/* Reject a 64-bit size that truncates to unsigned or runs past EOF; the
+		   read_range/end math below is all 32-bit. -1 is the data-to-EOF sentinel. */
+		if (sz != (unsigned long long)-1 &&
+		    (sz > 0xFFFFFFFFu || (unsigned long long)body + sz > st.size)) return -1;
 		if (tag4(ch, "desc")) {
 			uint8_t d[32];
 			if (sz < 32 || readfile_at(path, body, d, 32) < 32) return -1;
@@ -162,11 +166,16 @@ static int caf_parse(const char *path, struct caf *c)
 			uint8_t *pk = read_range(path, body, (unsigned)sz), *p, *end;
 			unsigned i;
 			if (!pk) return -1;
+			if (sz < 24) { free(pk); return -1; }   /* header: 2x be64 + 2x be32 */
 			c->num_packets = (unsigned)get_be64(pk + 0);
 			c->valid_frames = get_be64(pk + 8);
+			/* Cap the count: the table starts at pk+24 and each varint is >=1 byte,
+			   so it can't exceed sz-24; also guard the malloc against 32-bit wrap. */
+			if (c->num_packets > 0xFFFFFFFFu / sizeof(unsigned) ||
+			    c->num_packets > (unsigned)(sz - 24)) { free(pk); return -1; }
 			c->pkt_size = malloc((c->num_packets ? c->num_packets : 1) * sizeof(unsigned));
 			if (!c->pkt_size) { free(pk); return -1; }
-			p = pk + 24; end = pk + sz;
+			p = pk + 24; end = pk + (unsigned)sz;
 			for (i = 0; i < c->num_packets; i++) {
 				int used;
 				c->pkt_size[i] = caf_varint_get(p, end, &used);
@@ -179,7 +188,12 @@ static int caf_parse(const char *path, struct caf *c)
 			c->data_off = body + 4;      /* skip 4-byte mEditCount */
 		}
 		if (sz == (unsigned long long)-1) break;   /* data-to-EOF, must be last */
-		pos = body + (unsigned)sz;
+		/* Advance in 64-bit: a truncated add could fail to move pos and spin. */
+		{
+			unsigned long long next = (unsigned long long)body + sz;
+			if (next <= pos || next > st.size) break;
+			pos = (unsigned)next;
+		}
 	}
 	if (!have_desc || !have_kuki || !have_pakt || !c->data_off) return -1;
 	if (c->cfg.num_channels < 1 || c->cfg.num_channels > 2) return -1;

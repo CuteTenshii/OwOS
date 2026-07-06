@@ -173,6 +173,7 @@ static void br_init(struct br *b, const unsigned char *in, int len)
 static unsigned br_peek(struct br *b, int n)             /* n <= 24 */
 {
 	long bp = b->bitpos;
+	if (bp < 0) { b->error = 1; return 0; }   /* bitpos wrapped past 2^31 via a huge skip */
 	long byte = bp >> 3;
 	int bit = (int)(bp & 7);
 	unsigned long long acc = 0;
@@ -192,7 +193,7 @@ static int br_byte(struct br *b)                         /* precondition: aligne
 {
 	long by = b->bitpos >> 3;
 	b->bitpos += 8;
-	return (by < b->len) ? b->in[by] : 0;
+	return (by >= 0 && by < b->len) ? b->in[by] : 0;
 }
 
 /* ------------------------------------------------------------ huffman ------- *
@@ -550,6 +551,23 @@ static void block_switch(struct br *b, struct blockcat *c)
 	c->len = newlen;
 }
 
+/* Grow `out` so `need` bytes fit. The doubling is done in 64-bit with a hard
+ * ceiling: on -m32 `long` is 32-bit, so a decompression bomb pushing the size
+ * past ~1 GiB would otherwise wrap `(need)*2+64` small/negative and hand realloc
+ * an undersized buffer the copy loops then overflow. Returns NULL on OOM/overflow. */
+#define BROTLI_MAX_OUT (256L * 1024 * 1024)
+static unsigned char *grow_out(unsigned char *out, long *cap, long need)
+{
+	if (need < 0 || need > BROTLI_MAX_OUT) return 0;
+	if (need <= *cap) return out;
+	long long nc = (long long)need * 2 + 64;
+	if (nc > BROTLI_MAX_OUT) nc = BROTLI_MAX_OUT;
+	unsigned char *n = realloc(out, (unsigned long)nc);
+	if (!n) return 0;
+	*cap = (long)nc;
+	return n;
+}
+
 /* =============================================================== decode ==== */
 unsigned char *brotli_decompress(const unsigned char *in, int in_len, int *out_len)
 {
@@ -599,8 +617,7 @@ unsigned char *brotli_decompress(const unsigned char *in, int in_len, int *out_l
 		if (is_uncompressed) {
 			br_align(&b);
 			if (pos + mlen > cap) {
-				cap = (pos + mlen) * 2 + 64;
-				out = realloc(out, cap);
+				out = grow_out(out, &cap, pos + mlen);
 				if (!out) return 0;
 			}
 			for (long i = 0; i < mlen; i++) out[pos++] = (unsigned char)br_byte(&b);
@@ -710,7 +727,7 @@ unsigned char *brotli_decompress(const unsigned char *in, int in_len, int *out_l
 				int ctx = lut[p1] | lut[256 + p2];
 				int lit = huff_decode(&b, &lit_tr[lslice[ctx]]);
 				if (b.error) goto fail_body;
-				if (pos + 1 > cap) { cap = (pos + 1) * 2 + 64; out = realloc(out, cap); if (!out) goto fail_body_noout; }
+				if (pos + 1 > cap) { out = grow_out(out, &cap, pos + 1); if (!out) goto fail_body_noout; }
 				out[pos++] = (unsigned char)lit;
 				if (--remaining == 0) break;
 			}
@@ -765,7 +782,7 @@ unsigned char *brotli_decompress(const unsigned char *in, int in_len, int *out_l
 				if (transform_idx >= NUM_TRANSFORMS) goto fail_body;
 				dist_rb_idx += distance_context;
 				const unsigned char *word = DICT + DICT_OFFSET[wl] + (long)word_idx * wl;
-				if (pos + 64 > cap) { cap = (pos + 64) * 2 + 64; out = realloc(out, cap); if (!out) goto fail_body_noout; }
+				if (pos + 64 > cap) { out = grow_out(out, &cap, pos + 64); if (!out) goto fail_body_noout; }
 				int wn = transform_word(out + pos, word, wl, transform_idx);
 				if (wn == 0) goto fail_body;
 				pos += wn;
@@ -774,7 +791,7 @@ unsigned char *brotli_decompress(const unsigned char *in, int in_len, int *out_l
 				/* LZ77 back-reference. */
 				dist_rb[dist_rb_idx & 3] = (int)distance;
 				dist_rb_idx++;
-				if (pos + copy_len > cap) { cap = (pos + copy_len) * 2 + 64; out = realloc(out, cap); if (!out) goto fail_body_noout; }
+				if (pos + copy_len > cap) { out = grow_out(out, &cap, pos + copy_len); if (!out) goto fail_body_noout; }
 				long src = pos - distance;
 				if (src < 0) goto fail_body;
 				for (long k = 0; k < copy_len; k++) out[pos + k] = out[src + k];

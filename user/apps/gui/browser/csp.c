@@ -5,6 +5,7 @@
 #include "url.h"
 #include "dom.h"       /* lower / starts_ci / streq_ci */
 #include "crypto.h"    /* sha256 for 'sha256-...' inline hashes */
+#include "base64.h"    /* shared base64 for the digest encoding */
 
 /* One policy = a value string per directive (NULL = unset) + the two flag
  * directives. The whole CSP is the set of policies; a load must pass them all. */
@@ -298,28 +299,50 @@ static int sources_admit_url(const char *val, const char *url, const char *page_
 	return found;
 }
 
-/* --- base64 (for sha256 hashes) -------------------------------------------- */
-static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/* Does the source list `val` carry a 'nonce-<nonce>' matching `nonce`? A nonce on
+ * a <script src>/<link> element admits it regardless of the host-source list. */
+static int sources_admit_nonce(const char *val, const char *nonce)
+{
+	if (!nonce || !*nonce) return 0;
+	int nl = (int)strlen(nonce);
+	const char *p = val, *ts, *te;
+	while ((p = tok_next(p, &ts, &te)) != 0) {
+		if (tok_starts(ts, te, "'nonce-")) {
+			const char *vs = ts + 7;                /* after "'nonce-" */
+			const char *ve = te; if (ve > vs && ve[-1] == '\'') ve--;
+			if (ve - vs == nl) {
+				int eq = 1;
+				for (int i = 0; i < nl; i++) if (vs[i] != nonce[i]) { eq = 0; break; }
+				if (eq) return 1;
+			}
+		}
+		p = te;
+	}
+	return 0;
+}
 
-/* Canonical (padless, +/ alphabet) base64 of a digest, into dst. */
+/* Does the source list `val` carry 'strict-dynamic'? When present, host-source and
+ * scheme-source expressions (and 'self') are ignored for scripts: only nonces,
+ * hashes, and scripts injected by an already-trusted script are admitted. */
+static int sources_strict_dynamic(const char *val)
+{
+	const char *p = val, *ts, *te;
+	while ((p = tok_next(p, &ts, &te)) != 0) {
+		if (tok_is(ts, te, "'strict-dynamic'")) return 1;
+		p = te;
+	}
+	return 0;
+}
+
+/* --- base64 (for sha256 hashes) -------------------------------------------- */
+
+/* Canonical (padless, +/ alphabet) base64 of a digest, into dst — the form CSP
+ * 'sha256-...' tokens are compared in after b64_canon_token normalizes them. */
 static void b64_canon_digest(const unsigned char *d, int n, char *dst)
 {
-	int o = 0, i = 0;
-	for (; i + 3 <= n; i += 3) {
-		dst[o++] = B64[d[i] >> 2];
-		dst[o++] = B64[((d[i] & 3) << 4) | (d[i + 1] >> 4)];
-		dst[o++] = B64[((d[i + 1] & 15) << 2) | (d[i + 2] >> 6)];
-		dst[o++] = B64[d[i + 2] & 63];
-	}
-	if (n - i == 1) {
-		dst[o++] = B64[d[i] >> 2];
-		dst[o++] = B64[(d[i] & 3) << 4];
-	} else if (n - i == 2) {
-		dst[o++] = B64[d[i] >> 2];
-		dst[o++] = B64[((d[i] & 3) << 4) | (d[i + 1] >> 4)];
-		dst[o++] = B64[(d[i + 1] & 15) << 2];
-	}
-	dst[o] = '\0';
+	int l = base64_encode(d, n, dst);
+	while (l > 0 && dst[l - 1] == '=') l--;      /* CSP hashes carry no padding */
+	dst[l] = '\0';
 }
 
 /* Canonicalise a CSP hash payload: map base64url to base64 and drop '='. */
@@ -418,13 +441,13 @@ int csp_check_url(const csp *c, int type, const char *abs_url, const char *page_
 	int upgrade = 0;
 	for (int i = 0; i < c->n; i++) if (c->p[i].upgrade) upgrade = 1;
 	if (upgrade && starts_ci(out, "http://") && !is_local_host(out)) {
-		char tmp[2048]; int k = 0;
-		const char *rest = out + 7;             /* past "http://" */
-		while ("https://"[k]) { if (k < (int)sizeof tmp - 1) tmp[k] = "https://"[k]; k++; }
-		int o = 8;
-		for (int j = 0; rest[j] && o < (int)sizeof tmp - 1; j++) tmp[o++] = rest[j];
-		tmp[o] = '\0';
-		int m = 0; for (; tmp[m] && m < out_cap - 1; m++) out[m] = tmp[m]; out[m] = '\0';
+		/* Insert the 's' in place ("http://" -> "https://"): one char longer, so
+		 * only rewrite when it fits — never truncate a long URL into a broken one. */
+		int len = 0; while (out[len]) len++;
+		if (len + 1 < out_cap) {
+			for (int j = len; j >= 4; j--) out[j + 1] = out[j];
+			out[4] = 's';
+		}
 	}
 
 	struct purl pu;
@@ -442,6 +465,51 @@ int csp_check_url(const csp *c, int type, const char *abs_url, const char *page_
 		if (!val) continue;
 		if (!sources_admit_url(val, out, page_url)) {
 			if (reason && rcap) { int k = 0; const char *m = dir_name(type);
+				while (m[k] && k < rcap - 1) { reason[k] = m[k]; k++; } reason[k] = '\0'; }
+			return 0;
+		}
+	}
+	return 1;
+}
+
+int csp_check_script_el(const csp *c, const char *abs_url, const char *page_url,
+                        const char *nonce, int parser_inserted,
+                        char *out, int out_cap, char *reason, int rcap)
+{
+	/* csp_check_url fills `out` (upgrade rewrite applied) even when it blocks, and
+	 * gives the host-source-only verdict. If that already admits, we're done. */
+	if (csp_check_url(c, CSP_SCRIPT, abs_url, page_url, out, out_cap, reason, rcap)) return 1;
+	if (!c || csp_empty(c)) return 1;
+
+	/* Host-source failed under some policy. Re-decide with the two things
+	 * csp_check_url can't express for a <script> element: a matching nonce, and
+	 * 'strict-dynamic' (which trusts scripts injected by an already-run script).
+	 * The element must still satisfy EVERY policy. */
+	struct purl pu;
+	int page_https = parse_url(page_url, &pu) && pu.tls;
+	int out_http = starts_ci(out, "http://");
+
+	for (int i = 0; i < c->n; i++) {
+		struct policy *pol = &c->p[i];
+		if (pol->block_mixed && page_https && out_http) {
+			if (reason && rcap) { int k = 0; const char *m = "blocked: mixed content";
+				while (m[k] && k < rcap - 1) { reason[k] = m[k]; k++; } reason[k] = '\0'; }
+			return 0;
+		}
+		const char *val = effective(pol, CSP_SCRIPT);
+		if (!val) continue;                          /* unrestricted by this policy */
+
+		int admit = sources_admit_nonce(val, nonce);
+		if (!admit && sources_strict_dynamic(val)) {
+			/* strict-dynamic ignores host/scheme sources: a parser-inserted script
+			 * needs a nonce/hash (nonce already tried); a script-injected one is
+			 * trusted by its injector. */
+			if (!parser_inserted) admit = 1;
+		} else if (!admit) {
+			admit = sources_admit_url(val, out, page_url);
+		}
+		if (!admit) {
+			if (reason && rcap) { int k = 0; const char *m = "script-src";
 				while (m[k] && k < rcap - 1) { reason[k] = m[k]; k++; } reason[k] = '\0'; }
 			return 0;
 		}

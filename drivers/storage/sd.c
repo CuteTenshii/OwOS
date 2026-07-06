@@ -303,6 +303,10 @@ static int do_transfer(uint32_t lba, void *buf, int write)
 	if (!found && card_bring_up() != 0)
 		return -1;
 
+	/* SDSC cards are byte-addressed (arg = lba*512); a large lba would wrap the
+	 * 32-bit argument and target the wrong block, so fail out of range instead. */
+	if (!high_capacity && lba > 0xFFFFFFFFu / 512u)
+		return -1;
 	uint32_t arg = high_capacity ? lba : lba * 512u;
 
 	wr16(R_BLOCK_SIZE, 512);

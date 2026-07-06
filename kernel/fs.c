@@ -124,6 +124,9 @@ static int is_media_root(const char *path)
 #define SUPER_LBA       0
 #define RESERVED_SECTORS 1             /* only sector 0 (the superblock) is fixed */
 #define DIR_INIT_ENTRIES 256           /* directory starts this big, then grows  */
+#define FS_MAX_DIR_SECTORS 16384u      /* 8 MiB directory extent (~100k entries):
+                                          bounds the untrusted on-disk dir_sectors
+                                          so the extent byte-size can't overflow   */
 #define FS_MAX_CLUSTERS 262144         /* allocation-bitmap size: a fixed 32 KiB.
                                           The cluster size scales with the disk
                                           (sectors/cluster = ceil(disk capacity /
@@ -307,6 +310,14 @@ static uint32_t largest_free_run(uint32_t *start)
  * overrun it. Returns 0, or -1 if the allocation failed. */
 static int dir_load(void)
 {
+	/* sb.dir_sectors is untrusted (from the on-disk superblock); a crafted value
+	 * would overflow the byte computation and undersize the mirror while the read
+	 * loop writes a full extent. Reject anything that overflows, exceeds the design
+	 * ceiling, or doesn't fit the backing device. */
+	if (sb.dir_sectors == 0 || sb.dir_sectors > FS_MAX_DIR_SECTORS ||
+	    sb.dir_start >= fs_total_sectors ||
+	    sb.dir_sectors > fs_total_sectors - sb.dir_start)
+		return -1;
 	uint32_t bytes = sb.dir_sectors * SECTOR_SIZE;
 	dir = kmalloc(bytes);
 	if (!dir)
@@ -470,7 +481,8 @@ static int resolve_path(const char *path, int *parent, char *leaf)
 		}
 		if (s_eq(comp, "..")) {
 			if (cur != FS_ROOT)
-				cur = dir[cur].parent;
+				cur = (dir[cur].parent == FS_ROOT ||
+				       dir[cur].parent < dir_cap) ? dir[cur].parent : FS_ROOT;
 			if (last) { leaf[0] = '\0'; *parent = cur; return 0; }
 			continue;
 		}

@@ -229,14 +229,21 @@ static int parse_sleep(struct fadt *f, const char *name,
 		return 0;
 
 	p += 5;                          /* skip the name and the PackageOp byte */
+	if (p >= end) return 0;
 	p += ((*p & 0xC0) >> 6) + 2;     /* skip PkgLength + element count       */
+	if (p >= end) return 0;
 
-	if (*p == 0x0A)                  /* BytePrefix before SLP_TYPa           */
+	if (*p == 0x0A) {                /* BytePrefix before SLP_TYPa           */
 		p++;
+		if (p >= end) return 0;
+	}
 	*slp_a = (uint16_t)(*p++) << 10;
+	if (p >= end) return 0;
 
-	if (*p == 0x0A)                  /* BytePrefix before SLP_TYPb           */
+	if (*p == 0x0A) {                /* BytePrefix before SLP_TYPb           */
 		p++;
+		if (p >= end) return 0;
+	}
 	*slp_b = (uint16_t)(*p) << 10;
 	return 1;
 }

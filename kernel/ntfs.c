@@ -374,8 +374,10 @@ static int find_data(struct ntfs_mount *m, const uint8_t *rec,
 		uint32_t alen = load_le32(a + 4);
 		if (alen < 8 || off + alen > used)
 			return -1;
-		if (atype == ATTR_DATA && a[9] == 0) {       /* name length 0 = unnamed */
+		if (alen >= 0x10 && atype == ATTR_DATA && a[9] == 0) {  /* unnamed $DATA */
 			if (a[8] == 0) {                          /* resident */
+				if (alen < 0x18)                      /* value header must fit */
+					return -1;
 				uint32_t vlen = load_le32(a + 0x10);
 				uint16_t voff = load_le16(a + 0x14);
 				if (voff + (uint64_t)vlen > alen)
@@ -386,6 +388,8 @@ static int find_data(struct ntfs_mount *m, const uint8_t *rec,
 				*size     = vlen;
 				return 0;
 			} else {                                  /* non-resident */
+				if (alen < 0x40)                      /* non-res header must fit */
+					return -1;
 				uint16_t mp_off  = load_le16(a + 0x20);
 				uint64_t real_sz = load_le64(a + 0x30);   /* real size of data */
 				if (mp_off < 0x40 || mp_off >= alen)
@@ -537,10 +541,12 @@ static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec,
 	const uint8_t *ia = find_attr(rec, m->mft_rec_size, ATTR_INDEX_ALLOC);
 	if (!ia)
 		return 0;                        /* small dir: no external index blocks */
+	uint32_t alen   = load_le32(ia + 4);
+	if (alen < 0x40)                     /* non-resident header must fit */
+		return 0;
 	if (ia[8] == 0)                      /* must be non-resident */
 		return 0;
 	uint16_t mp_off = load_le16(ia + 0x20);
-	uint32_t alen   = load_le32(ia + 4);
 	uint64_t alloc_sz = load_le64(ia + 0x28);   /* allocated size of the attr */
 	if (mp_off < 0x40 || mp_off >= alen)
 		return 0;

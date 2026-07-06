@@ -3,6 +3,7 @@
 #include "owos.h"
 #include "crypto.h"
 #include "netconn.h"
+#include "base64.h"
 
 /* Per-frame and per-message payload ceilings. A single frame must fit the rx
  * buffer (we wait for the whole payload before parsing), so the rx buffer is
@@ -13,6 +14,17 @@
 #define WS_RX_MAX    (WS_MAX_FRAME + 64)
 
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+/* RFC 6455 §5.2 opcodes. Opcodes with bit 0x8 set (0x8..0xF) are control frames;
+ * WS_OP_CTRL_BIT tests that class — note it equals WS_OP_CLOSE's value by
+ * coincidence, it is a mask, not the Close opcode. */
+#define WS_OP_CONT      0x0
+#define WS_OP_TEXT      0x1
+#define WS_OP_BINARY    0x2
+#define WS_OP_CLOSE     0x8
+#define WS_OP_PING      0x9
+#define WS_OP_PONG      0xA
+#define WS_OP_CTRL_BIT  0x8
 
 /* Internal ws_poll continuation: a control/non-final frame was consumed; keep
  * parsing. Not a public WS_EV_* code. */
@@ -48,31 +60,6 @@ static int ci_eq_n(const char *a, const char *b, int n) {
     return 1;
 }
 
-static const char B64[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/* Standard base64 with padding. `out` must hold ((n+2)/3)*4 + 1 bytes. */
-static void b64_encode(const uint8_t *in, int n, char *out) {
-    int i = 0, o = 0;
-    for (; i + 2 < n; i += 3) {
-        unsigned v = ((unsigned)in[i] << 16) | ((unsigned)in[i + 1] << 8) | in[i + 2];
-        out[o++] = B64[(v >> 18) & 63];
-        out[o++] = B64[(v >> 12) & 63];
-        out[o++] = B64[(v >> 6) & 63];
-        out[o++] = B64[v & 63];
-    }
-    if (i < n) {
-        int rem = n - i;
-        unsigned v = (unsigned)in[i] << 16;
-        if (rem == 2) v |= (unsigned)in[i + 1] << 8;
-        out[o++] = B64[(v >> 18) & 63];
-        out[o++] = B64[(v >> 12) & 63];
-        out[o++] = (rem == 2) ? B64[(v >> 6) & 63] : '=';
-        out[o++] = '=';
-    }
-    out[o] = 0;
-}
-
 static uint32_t ws_rand(ws_conn *c) {
     uint32_t x = c->rng;
     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
@@ -89,7 +76,7 @@ static void compute_accept(const char *key, char *out /* >=29 */) {
     for (i = 0; key[i] && n < (int)sizeof in - 1; i++) in[n++] = key[i];
     for (i = 0; WS_GUID[i] && n < (int)sizeof in - 1; i++) in[n++] = WS_GUID[i];
     sha1(in, (uint32_t)n, digest);
-    b64_encode(digest, SHA1_DIGEST, out);
+    base64_encode(digest, SHA1_DIGEST, out);
 }
 
 /* --------------------------------------------------------------- URL parse */
@@ -286,7 +273,7 @@ ws_conn *ws_open(const char *url, const char *protocols) {
     if (!c->conn) { free(c); return 0; }
 
     for (i = 0; i < 16; i++) keybytes[i] = ws_rand_byte(c);
-    b64_encode(keybytes, 16, key);
+    base64_encode(keybytes, 16, key);
 
     /* Build the Upgrade request. */
     {
@@ -369,6 +356,12 @@ static int ws_parse_one(ws_conn *c, const uint8_t **out, int *outlen, int *is_te
         hn = 10;
     }
     if (plen < 0 || plen > WS_MAX_FRAME) return WS_EV_ERROR;
+    /* RFC 6455 §5.5: control frames carry ≤125 bytes and are never fragmented.
+     * Enforce it so a hostile server can't force a multi-hundred-KiB
+     * allocate-mask-echo per ping. */
+    if (opcode & WS_OP_CTRL_BIT) {
+        if (plen > 125 || !fin) return WS_EV_ERROR;
+    }
     if (masked) {
         if (c->rxlen < hn + 4) return WS_EV_NONE;
         memcpy(mk, b + hn, 4);
@@ -381,26 +374,26 @@ static int ws_parse_one(ws_conn *c, const uint8_t **out, int *outlen, int *is_te
     total = hn + (int)plen;
 
     switch (opcode) {
-    case 0x9:                                       /* ping -> pong */
-        ws_send_frame(c, 0xA, payload, (int)plen);
+    case WS_OP_PING:                                /* ping -> pong */
+        ws_send_frame(c, WS_OP_PONG, payload, (int)plen);
         ret = WS_EV_CONTINUE;
         break;
-    case 0xA:                                       /* pong: ignore */
+    case WS_OP_PONG:                                /* pong: ignore */
         ret = WS_EV_CONTINUE;
         break;
-    case 0x8:                                       /* close */
-        if (!c->close_sent) { ws_send_frame(c, 0x8, payload, (int)(plen <= 125 ? plen : 0)); c->close_sent = 1; }
+    case WS_OP_CLOSE:                               /* close */
+        if (!c->close_sent) { ws_send_frame(c, WS_OP_CLOSE, payload, (int)(plen <= 125 ? plen : 0)); c->close_sent = 1; }
         ret = WS_EV_CLOSE;
         break;
-    case 0x1:                                       /* text (start) */
-    case 0x2:                                       /* binary (start) */
+    case WS_OP_TEXT:                                /* text (start) */
+    case WS_OP_BINARY:                              /* binary (start) */
         c->msglen = 0;
         c->in_frag = 1;
-        c->msg_is_text = (opcode == 0x1);
+        c->msg_is_text = (opcode == WS_OP_TEXT);
         if (msg_append(c, payload, (int)plen) != 0) { ret = WS_EV_ERROR; break; }
         ret = WS_EV_CONTINUE;
         goto maybe_deliver;
-    case 0x0:                                       /* continuation */
+    case WS_OP_CONT:                                /* continuation */
         if (msg_append(c, payload, (int)plen) != 0) { ret = WS_EV_ERROR; break; }
         ret = WS_EV_CONTINUE;
     maybe_deliver:
@@ -457,7 +450,7 @@ int ws_poll(ws_conn *c, const uint8_t **out, int *outlen, int *is_text) {
 
 int ws_send(ws_conn *c, const void *data, int len, int is_text) {
     if (!c || c->state != WS_OPEN || len < 0) return -1;
-    return ws_send_frame(c, is_text ? 0x1 : 0x2, data, len);
+    return ws_send_frame(c, is_text ? WS_OP_TEXT : WS_OP_BINARY, data, len);
 }
 
 void ws_close(ws_conn *c, int code, const char *reason) {
@@ -473,7 +466,7 @@ void ws_close(ws_conn *c, int code, const char *reason) {
                 for (i = 0; i < rl && pl < 125; i++) payload[pl++] = (uint8_t)reason[i];
             }
         }
-        ws_send_frame(c, 0x8, payload, pl);
+        ws_send_frame(c, WS_OP_CLOSE, payload, pl);
         c->close_sent = 1;
     }
     c->state = WS_CLOSING;

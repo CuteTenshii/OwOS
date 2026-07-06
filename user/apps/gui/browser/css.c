@@ -38,13 +38,20 @@ enum {
 	PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_NTH_OF_TYPE, PC_NTH_LAST_OF_TYPE,
 	PC_ROOT, PC_EMPTY, PC_NOT,
 	PC_CHECKED, PC_DISABLED, PC_ENABLED, PC_REQUIRED, PC_OPTIONAL, PC_LINK,
+	PC_MATCHES,               /* :is()/:where(): matches if any sub-selector does  */
 	PC_NEVER,
 };
 
+/* :is()/:where() argument: a heap list of full sub-selectors (each may carry its
+ * own combinators and nested :is()). Held by pointer so struct pseudo — embedded
+ * in every rule's struct selector — stays fixed-size and can nest arbitrarily. */
+struct sel_list;
+
 struct pseudo {
 	int kind;
-	int a, b;                 /* an+b for the nth-* kinds */
+	int a, b;                 /* an+b for the nth-* kinds; a=1 marks :where (spec 0) */
 	struct simple_sel arg;    /* :not() argument (kind == PC_NOT) */
+	struct sel_list *list;    /* :is()/:where() sub-selectors (kind == PC_MATCHES), else 0 */
 };
 
 struct sel_step {
@@ -60,6 +67,9 @@ struct sel_step {
 enum { PE_NONE = 0, PE_BEFORE = CSS_PSEUDO_BEFORE, PE_AFTER = CSS_PSEUDO_AFTER, PE_OTHER = 3 };
 
 struct selector { struct sel_step step[MAX_STEPS]; int n; };
+
+/* The concrete :is()/:where() argument list (forward-declared above). */
+struct sel_list { int n; struct selector *sels; };
 
 /* A parsed @media query the rule lives under (n == 0 → no query, always applies).
  * A query is an OR of comma-separated conditions; each condition is a media type
@@ -83,7 +93,12 @@ struct media_query { struct media_cond cond[MAX_COND]; int n; };
 /* Rule index key: a rule is bucketed by its rightmost compound's most specific
  * simple selector (id, else a class, else tag, else universal), so an element
  * only ever tests rules that can match it — without this, Tailwind's thousands of
- * utility rules made the cascade O(elements × all-rules) and pegged the CPU. */
+ * utility rules made the cascade O(elements × all-rules) and pegged the CPU.
+ *
+ * A rule is filed under one or more keys (see rule_keys): a plain compound gives a
+ * single id/class/tag key; a subject-position :is()/:where() with no key of its own
+ * gives one key per branch (e.g. :is(a.x, b.y) -> classes x and y), so it leaves
+ * the universal bucket and is tested only by elements those branches can match. */
 enum { KK_UNIV = 0, KK_ID, KK_CLS, KK_TAG };
 struct css_rule {
 	struct selector    sel;
@@ -92,10 +107,17 @@ struct css_rule {
 	int                spec, order, important;
 	unsigned char      has_var;            /* a declaration uses var() -> resolve at fold */
 	char               raw[CSS_RAW_MAX];   /* authored declaration text (for devtools) */
-	int                keykind;            /* KK_* — which bucket table this rule lives in */
-	char               keystr[24];         /* the id/class/tag string for that bucket      */
+	unsigned           visit;              /* collect_candidates de-dup stamp (multi-key) */
 	struct css_rule   *next;               /* document order (build + fallback iteration)  */
-	struct css_rule   *hnext;              /* chain within its index bucket                */
+};
+
+/* One index entry: a rule filed in a bucket under a specific key. `key` points into
+ * the rule's own selector tree (stable for the rule's lifetime), so a rule keyed
+ * under several selectors needs no string copies. */
+struct css_idx {
+	struct css_rule *rule;
+	const char      *key;                  /* the id/class/tag string, or 0 for universal */
+	struct css_idx  *next;
 };
 
 /* An @font-face: a declared family name, the raw TTF/OTF src url, and the base
@@ -103,12 +125,29 @@ struct css_rule {
  * not the page — an external sheet's fonts live next to the sheet). */
 struct css_face { char family[CSS_FAM_MAX]; char *url; char *base; struct css_face *next; };
 
+/* A parsed @keyframes block: a name plus a set of stops, each an offset (permille,
+ * 0..1000) and the declaration delta that applies at it, kept sorted by offset. The
+ * animation engine (anim.c) finds the two stops bracketing a progress and
+ * interpolates their animatable properties. */
+#define CSS_KF_STOPS 16
+struct css_keyframes {
+	char             name[CSS_ANIM_NAME];
+	int              nstops;
+	short            off[CSS_KF_STOPS];       /* permille 0..1000, ascending */
+	struct css_style stop[CSS_KF_STOPS];
+	struct css_keyframes *next;
+};
+
 #define CSS_NBUCK 256
 struct css_sheet {
 	struct css_rule *head, *tail; int order; int gen; struct css_face *faces;
+	struct css_keyframes *keyframes;   /* @keyframes blocks (name -> stops) */
+	int has_pseudo_el;      /* set once any ::before/::after rule is pushed */
 	const char *cur_base;   /* base URL for faces added by the in-progress css_add */
-	/* Rule index (rebuilt lazily when `gen` changes; see ensure_index). */
-	struct css_rule *id_b[CSS_NBUCK], *cls_b[CSS_NBUCK], *tag_b[CSS_NBUCK], *uni;
+	/* Rule index (rebuilt lazily when `gen` changes; see ensure_index). Buckets hold
+	 * css_idx entries so one rule can be filed under several keys; every entry lives
+	 * in exactly one bucket chain, so teardown just walks them. */
+	struct css_idx *id_b[CSS_NBUCK], *cls_b[CSS_NBUCK], *tag_b[CSS_NBUCK], *uni;
 	int idx_gen;
 };
 
@@ -516,8 +555,8 @@ static void parse_bg_position(const char *v, short *px, short *py)
 		else if (starts_ci(t, "bottom")) { *py = 100; yset = 1; }
 		else if (starts_ci(t, "center")) { /* assigned to a free axis below */ }
 		else {
-			int pct; int dpx = parse_len2(t, &pct);
-			short p = (short)(pct >= 0 ? (pct > 100 ? 100 : pct) : (dpx > 0 ? 0 : 0));
+			int pct; parse_len2(t, &pct);   /* pixel positions aren't supported (no box size here) -> 0% */
+			short p = (short)(pct >= 0 ? (pct > 100 ? 100 : pct) : 0);
 			if (i == 0 && !xset) { *px = p; xset = 1; }
 			else if (!yset)      { *py = p; yset = 1; }
 		}
@@ -800,11 +839,17 @@ void css_style_reset(struct css_style *s)
 	s->pct_basis = -1;
 	s->justify = s->align_items = -1;
 	s->gap_row = s->gap_col = -1;
+	s->grid = s->grid_flow = -1;
+	s->n_cols = s->n_rows = -1;
+	s->col_span = s->row_span = -1;
+	s->justify_items = -1;
 	s->overflow = -1;
 	s->italic = -1;
+	s->small_caps = -1;
 	s->ttx = -1;
 	s->white_space = -1;
 	s->list_style = CSS_LST_DEFAULT;
+	s->list_pos = CSS_LSP_DEFAULT;
 	s->opacity = -1;
 	s->line_height = -1;
 	s->lh_pct = -1;
@@ -812,6 +857,10 @@ void css_style_reset(struct css_style *s)
 	s->outline_color = -1;
 	s->z_index = CSS_Z_AUTO;
 	s->fill = s->stroke = -1;
+	s->anim_name[0] = '\0';
+	s->anim_dur = -1; s->anim_delay = -1; s->anim_iter = -2;
+	s->anim_dir = -1; s->anim_fill = -1; s->anim_timing = -1;
+	s->trans_mask = 0; s->trans_dur = -1; s->trans_delay = -1; s->trans_timing = -1;
 	css_bgi_reset(&s->bgi);
 	s->content[0] = '\0';
 	s->fam[0] = '\0';
@@ -897,6 +946,102 @@ static signed char parse_align(const char *v)
 }
 
 /* `gap: <row> [<col>]` (also row-gap/column-gap longhands handled by the caller). */
+/* Copy a token span [a,b) into a bounded, NUL-terminated stack buffer. */
+static void tok_copy(const char *a, const char *b, char *buf, int cap)
+{
+	int k = 0;
+	while (a < b && k < cap - 1) buf[k++] = *a++;
+	buf[k] = '\0';
+}
+
+/* Classify one grid track token ("100px" / "1fr" / "20%" / "auto" / min-/max-
+ * content) into *t. Unrecognised tokens fall back to an auto (content) track. */
+static void parse_track_token(const char *a, const char *b, struct css_track *t)
+{
+	char buf[32];
+	tok_copy(a, b, buf, sizeof buf);
+	t->kind = CSS_TRK_AUTO; t->v = 0;
+	if (starts_ci(buf, "auto") || starts_ci(buf, "min-content") ||
+	    starts_ci(buf, "max-content") || starts_ci(buf, "fit-content"))
+		return;
+	int n = (int)strlen(buf);
+	if (n >= 2 && (buf[n-1] == 'r' || buf[n-1] == 'R') &&
+	              (buf[n-2] == 'f' || buf[n-2] == 'F')) {   /* <n>fr */
+		int fr = 0; const char *s = buf;
+		while (*s >= '0' && *s <= '9') fr = fr * 10 + (*s++ - '0');
+		t->kind = CSS_TRK_FR; t->v = (short)(fr > 0 ? fr : 1);
+		return;
+	}
+	int pct; int px = parse_len2(buf, &pct);
+	if (pct >= 0)     { t->kind = CSS_TRK_PCT; t->v = (short)pct; }
+	else if (px >= 0) { t->kind = CSS_TRK_PX;  t->v = (short)px; }
+	/* else: leave as auto */
+}
+
+/* Parse a grid track list ("100px 1fr auto repeat(3, 1fr) 20%") into out[max],
+ * expanding repeat(<count>, <tracks>). Returns the number of tracks emitted. */
+static int parse_tracks(const char *v, struct css_track *out, int max)
+{
+	int n = 0;
+	const char *s = v;
+	while (*s && n < max) {
+		while (*s == ' ' || *s == '\t' || *s == ',') s++;
+		if (!*s) break;
+		if (starts_ci(s, "repeat(")) {
+			s += 7;
+			while (*s == ' ') s++;
+			int cnt = 0;
+			while (*s >= '0' && *s <= '9') cnt = cnt * 10 + (*s++ - '0');
+			while (*s && *s != ',' && *s != ')') s++;
+			if (*s == ',') s++;
+			const char *inner = s;
+			int depth = 0;
+			while (*s && !(*s == ')' && depth == 0)) { if (*s == '(') depth++; else if (*s == ')') depth--; s++; }
+			char ibuf[96];
+			tok_copy(inner, s, ibuf, sizeof ibuf);
+			if (*s == ')') s++;
+			if (cnt < 1) cnt = 1;
+			struct css_track tmpl[CSS_GRID_MAX];
+			int tn = parse_tracks(ibuf, tmpl, CSS_GRID_MAX);
+			for (int r = 0; r < cnt && n < max; r++)
+				for (int t = 0; t < tn && n < max; t++) out[n++] = tmpl[t];
+			continue;
+		}
+		if (*s == '[') { while (*s && *s != ']') s++; if (*s == ']') s++; continue; }  /* skip line names */
+		const char *tok = s;
+		while (*s && *s != ' ' && *s != '\t' && *s != ',' && *s != '[') s++;
+		if (s > tok) parse_track_token(tok, s, &out[n++]);
+	}
+	return n;
+}
+
+/* grid-column / grid-row -> a span count (>=1). Handles `span <n>`, `<a> / <b>`
+ * (span = b-a), `<a> / span <n>`, and bare/auto (span 1). */
+static signed char parse_grid_span(const char *v)
+{
+	while (*v == ' ') v++;
+	if (starts_ci(v, "span")) {
+		v += 4; while (*v == ' ') v++;
+		int n = 0; while (*v >= '0' && *v <= '9') n = n * 10 + (*v++ - '0');
+		return (signed char)(n > 0 ? n : 1);
+	}
+	int a = 0, hasA = 0;
+	while (*v >= '0' && *v <= '9') { a = a * 10 + (*v++ - '0'); hasA = 1; }
+	while (*v == ' ') v++;
+	if (*v == '/') {
+		v++; while (*v == ' ') v++;
+		if (starts_ci(v, "span")) {
+			v += 4; while (*v == ' ') v++;
+			int n = 0; while (*v >= '0' && *v <= '9') n = n * 10 + (*v++ - '0');
+			return (signed char)(n > 0 ? n : 1);
+		}
+		int b = 0, hasB = 0;
+		while (*v >= '0' && *v <= '9') { b = b * 10 + (*v++ - '0'); hasB = 1; }
+		if (hasA && hasB && b > a) return (signed char)(b - a);
+	}
+	return 1;
+}
+
 static void parse_gap(const char *v, struct css_style *o)
 {
 	const char *s = v; while (*s == ' ' || *s == '\t') s++;
@@ -996,6 +1141,15 @@ static signed char parse_list_style(const char *v)
 	return CSS_LST_DEFAULT;
 }
 
+/* list-style[-position]: inside/outside. Returns CSS_LSP_DEFAULT when the value
+ * names no position keyword (e.g. a bare `list-style: square`). */
+static signed char parse_list_position(const char *v)
+{
+	if (has_ci(v, "inside"))  return CSS_LSP_INSIDE;
+	if (has_ci(v, "outside")) return CSS_LSP_OUTSIDE;
+	return CSS_LSP_DEFAULT;
+}
+
 /* line-height: normal -> unset; a unitless multiplier -> lh_pct = N*100; a length
  * -> px; a percent -> lh_pct. The unset case leaves the renderer's font-derived height. */
 static void parse_line_height(const char *v, struct css_style *o)
@@ -1017,6 +1171,109 @@ static void parse_line_height(const char *v, struct css_style *o)
 	else if (pct >= 0) { o->lh_pct = (short)pct; o->line_height = -1; }
 }
 
+/* font-size: the CSS absolute/relative keyword scale (most-specific first), else a
+ * length/percent. em/rem resolve via parse_len2 (rem against the 16px root; em
+ * approximated likewise, since no element-local size is tracked). smaller/larger
+ * map to a percent of the inherited size. Leaves *o untouched if unparseable. */
+static void parse_font_size(const char *v, struct css_style *o)
+{
+	if      (has_ci(v, "xx-small")) o->font_px = 9;
+	else if (has_ci(v, "x-small"))  o->font_px = 10;
+	else if (has_ci(v, "smaller"))  o->font_pct = 80;
+	else if (has_ci(v, "small"))    o->font_px = 13;
+	else if (has_ci(v, "xx-large")) o->font_px = 32;
+	else if (has_ci(v, "x-large"))  o->font_px = 24;
+	else if (has_ci(v, "larger"))   o->font_pct = 120;
+	else if (has_ci(v, "large"))    o->font_px = 18;
+	else if (has_ci(v, "medium"))   o->font_px = 16;
+	else { int q; int px = parse_len2(v, &q);
+	       if (px >= 0) o->font_px = px; else if (q >= 0) o->font_pct = (short)q; }
+}
+
+/* Does the whitespace-delimited token at p read as the `font` shorthand's
+ * font-size, as opposed to a preceding numeric font-weight like `400`? A font-size
+ * carries a unit, a decimal point, a percent, or a `/line-height`; a bare 100..900
+ * integer is a weight. Size keywords are matched by the caller. */
+static int font_tok_is_size(const char *p)
+{
+	int digits = 0, dot = 0;
+	const char *q = p;
+	while ((*q >= '0' && *q <= '9') || *q == '.') { if (*q == '.') dot = 1; else digits++; q++; }
+	if (!digits && !dot) return 0;                            /* not numeric */
+	if (dot || *q == '/' || *q == '%') return 1;              /* decimal / lh / percent */
+	if (((*q | 32) >= 'a' && (*q | 32) <= 'z')) return 1;     /* carries a unit */
+	return 0;                                                 /* bare integer: a weight */
+}
+
+/* The `font` shorthand: `[ style || variant || weight || stretch ]? size[/lh]
+ * family`, plus the system-font keywords (caption/menu/…). Per spec the shorthand
+ * resets its longhands, so an omitted style/variant/weight becomes normal (not
+ * inherited) — but only once a valid font-size + family have been recognised; a
+ * value we can't parse leaves the style untouched. */
+static void parse_font_shorthand(const char *v, struct css_style *out)
+{
+	while (*v == ' ' || *v == '\t') v++;
+	if (!*v) return;
+
+	/* System fonts collapse to the UI default face (size + sans-serif). */
+	if (starts_ci(v, "caption") || starts_ci(v, "icon") || starts_ci(v, "menu") ||
+	    starts_ci(v, "message-box") || starts_ci(v, "small-caption") ||
+	    starts_ci(v, "status-bar")) {
+		out->font_px = starts_ci(v, "small-caption") ? 13 : 15;
+		out->italic = 0; out->small_caps = 0; out->bold = 0;
+		copy_family_stack("sans-serif", out->fam, CSS_FAM_STACK);
+		return;
+	}
+
+	signed char italic = -1, scaps = -1, bold = -1;
+	const char *size_tok = 0;
+	const char *p = v;
+	for (;;) {
+		while (*p == ' ' || *p == '\t') p++;
+		if (!*p) break;
+		if (starts_ci(p, "small-caps"))                     scaps = 1;
+		else if (starts_ci(p, "italic") || starts_ci(p, "oblique")) italic = 1;
+		else if (starts_ci(p, "bold"))                      bold = 1;   /* bold, bolder */
+		else if (starts_ci(p, "lighter"))                   bold = 0;
+		else if (font_tok_is_size(p) ||
+		         starts_ci(p, "xx-small") || starts_ci(p, "x-small") ||
+		         starts_ci(p, "smaller")  || starts_ci(p, "small")   ||
+		         starts_ci(p, "xx-large") || starts_ci(p, "x-large") ||
+		         starts_ci(p, "larger")   || starts_ci(p, "large")   ||
+		         starts_ci(p, "medium")) { size_tok = p; break; }
+		else if (*p >= '0' && *p <= '9') { int w = parse_weight(p); if (w >= 0) bold = w; }
+		/* normal / stretch (condensed/expanded/…) / unknown: neutral, skip */
+		while (*p && *p != ' ' && *p != '\t') p++;
+	}
+	if (!size_tok) return;                                   /* invalid: no font-size */
+
+	/* Isolate the size token; split off an optional `/line-height`. */
+	const char *se = size_tok;
+	while (*se && *se != ' ' && *se != '\t') se++;
+	char sizebuf[48]; int sn = 0;
+	const char *slash = 0;
+	for (const char *q = size_tok; q < se && sn < (int)sizeof sizebuf - 1; q++) {
+		if (*q == '/') { slash = q + 1; break; }
+		sizebuf[sn++] = *q;
+	}
+	sizebuf[sn] = '\0';
+	parse_font_size(sizebuf, out);
+	if (slash) {
+		char lhbuf[48]; int ln = 0;
+		for (const char *q = slash; q < se && ln < (int)sizeof lhbuf - 1; q++) lhbuf[ln++] = *q;
+		lhbuf[ln] = '\0';
+		parse_line_height(lhbuf, out);
+	}
+
+	const char *fam = se;
+	while (*fam == ' ' || *fam == '\t') fam++;
+	if (*fam) copy_family_stack(fam, out->fam, CSS_FAM_STACK);
+
+	out->italic     = (italic >= 0) ? italic : 0;
+	out->small_caps = (scaps  >= 0) ? scaps  : 0;
+	out->bold       = (bold   >= 0) ? bold   : 0;
+}
+
 /* opacity: a 0..1 number (or an N% form) -> 0..100 percent, -1 if unparseable. */
 static signed char parse_opacity(const char *v)
 {
@@ -1027,6 +1284,160 @@ static signed char parse_opacity(const char *v)
 	if (*p == '%') n /= 100.0;
 	if (n < 0) n = 0; if (n > 1) n = 1;
 	return (signed char)(n * 100 + 0.5);
+}
+
+/* ------------------------------------------------ animation/transition ----- */
+/* A CSS <time> in ms (`1.5s`, `300ms`); -1 if `s` isn't a time (unitless etc.). */
+static int parse_time_ms(const char *s, const char *e)
+{
+	while (s < e && (*s == ' ' || *s == '\t')) s++;
+	const char *p = s; double n = 0; int any = 0, neg = 0;
+	if (p < e && (*p == '-' || *p == '+')) { if (*p == '-') neg = 1; p++; }
+	while (p < e && *p >= '0' && *p <= '9') { n = n * 10 + (*p++ - '0'); any = 1; }
+	if (p < e && *p == '.') { p++; double f = 0.1; while (p < e && *p >= '0' && *p <= '9') { n += (*p++ - '0') * f; f *= 0.1; any = 1; } }
+	if (!any) return -1;
+	if (p + 1 < e && (p[0] == 'm' || p[0] == 'M') && (p[1] == 's' || p[1] == 'S')) { /* ms */ }
+	else if (p < e && (*p == 's' || *p == 'S')) n *= 1000.0;
+	else return -1;                 /* no time unit -> not a <time> */
+	if (neg) return -1;
+	return (int)(n + 0.5);
+}
+
+/* A CSS <easing-function> keyword span -> enum css_easing, or -1 if unrecognised.
+ * cubic-bezier()/steps() degrade to the nearest preset (we don't carry params on
+ * the style; anim.c re-derives bezier control points from the preset). */
+static int parse_easing(const char *s, const char *e)
+{
+	while (s < e && (*s == ' ' || *s == '\t')) s++;
+	if (span_is(s, e, "linear"))      return CSS_EASE_LINEAR;
+	if (span_is(s, e, "ease-in-out")) return CSS_EASE_IN_OUT;
+	if (span_is(s, e, "ease-in"))     return CSS_EASE_IN;
+	if (span_is(s, e, "ease-out"))    return CSS_EASE_OUT;
+	if (span_is(s, e, "ease"))        return CSS_EASE;
+	if (span_is(s, e, "step-start"))  return CSS_EASE_STEP_START;
+	if (span_is(s, e, "step-end"))    return CSS_EASE_STEP_END;
+	/* function forms carry parenthesised args; match by prefix and approximate */
+	if (s < e && starts_ci(s, "steps"))        return CSS_EASE_STEP_END;
+	if (s < e && starts_ci(s, "cubic-bezier"))  return CSS_EASE;
+	return -1;
+}
+
+/* A transition-property name span -> a mask of (1<<ANP_*) bits (a shorthand like
+ * `margin` expands to all four sides). `all` -> TRANS_ALL, `none`/unknown -> 0. */
+static unsigned trans_prop_bit(const char *s, const char *e)
+{
+	while (s < e && (*s == ' ' || *s == '\t')) s++;
+	while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+	if (span_is(s, e, "all"))              return TRANS_ALL;
+	if (span_is(s, e, "none") || s >= e)   return 0;
+	if (span_is(s, e, "color"))            return 1u << ANP_COLOR;
+	if (span_is(s, e, "background-color") || span_is(s, e, "background")) return 1u << ANP_BG;
+	if (span_is(s, e, "border-color"))     return 1u << ANP_BORDER_COLOR;
+	if (span_is(s, e, "outline-color"))    return 1u << ANP_OUTLINE_COLOR;
+	if (span_is(s, e, "outline-width"))    return 1u << ANP_OUTLINE_W;
+	if (span_is(s, e, "opacity"))          return 1u << ANP_OPACITY;
+	if (span_is(s, e, "width"))            return 1u << ANP_WIDTH;
+	if (span_is(s, e, "height"))           return 1u << ANP_HEIGHT;
+	if (span_is(s, e, "min-width"))        return 1u << ANP_MIN_W;
+	if (span_is(s, e, "min-height"))       return 1u << ANP_MIN_H;
+	if (span_is(s, e, "max-width"))        return 1u << ANP_MAX_W;
+	if (span_is(s, e, "max-height"))       return 1u << ANP_MAX_H;
+	if (span_is(s, e, "margin"))           return (1u<<ANP_MARGIN_T)|(1u<<ANP_MARGIN_R)|(1u<<ANP_MARGIN_B)|(1u<<ANP_MARGIN_L);
+	if (span_is(s, e, "margin-top"))       return 1u << ANP_MARGIN_T;
+	if (span_is(s, e, "margin-right"))     return 1u << ANP_MARGIN_R;
+	if (span_is(s, e, "margin-bottom"))    return 1u << ANP_MARGIN_B;
+	if (span_is(s, e, "margin-left"))      return 1u << ANP_MARGIN_L;
+	if (span_is(s, e, "padding"))          return (1u<<ANP_PADDING_T)|(1u<<ANP_PADDING_R)|(1u<<ANP_PADDING_B)|(1u<<ANP_PADDING_L);
+	if (span_is(s, e, "padding-top"))      return 1u << ANP_PADDING_T;
+	if (span_is(s, e, "padding-right"))    return 1u << ANP_PADDING_R;
+	if (span_is(s, e, "padding-bottom"))   return 1u << ANP_PADDING_B;
+	if (span_is(s, e, "padding-left"))     return 1u << ANP_PADDING_L;
+	if (span_is(s, e, "top"))              return 1u << ANP_TOP;
+	if (span_is(s, e, "right"))            return 1u << ANP_RIGHT;
+	if (span_is(s, e, "bottom"))           return 1u << ANP_BOTTOM;
+	if (span_is(s, e, "left"))             return 1u << ANP_LEFT;
+	if (span_is(s, e, "border-radius"))    return 1u << ANP_RADIUS;
+	if (span_is(s, e, "font-size"))        return 1u << ANP_FONT_SIZE;
+	return 0;                              /* transform/other unsupported: ignore */
+}
+
+/* animation-direction / -fill-mode / -iteration-count keyword classifiers. */
+static int parse_anim_dir(const char *s, const char *e)
+{
+	if (span_is(s, e, "reverse"))           return CSS_ADIR_REVERSE;
+	if (span_is(s, e, "alternate-reverse")) return CSS_ADIR_ALTERNATE_REVERSE;
+	if (span_is(s, e, "alternate"))         return CSS_ADIR_ALTERNATE;
+	if (span_is(s, e, "normal"))            return CSS_ADIR_NORMAL;
+	return -1;
+}
+static int parse_anim_fill(const char *s, const char *e)
+{
+	if (span_is(s, e, "forwards"))  return CSS_AFILL_FORWARDS;
+	if (span_is(s, e, "backwards")) return CSS_AFILL_BACKWARDS;
+	if (span_is(s, e, "both"))      return CSS_AFILL_BOTH;
+	if (span_is(s, e, "none"))      return CSS_AFILL_NONE;
+	return -1;
+}
+
+/* Split a value on top-level whitespace (never inside parentheses, so
+ * `cubic-bezier(0, 0, 1, 1)` stays one token), calling `tok` per token. */
+static void for_each_token(const char *s, const char *e,
+                           void (*tok)(const char *, const char *, void *), void *ud)
+{
+	while (s < e) {
+		while (s < e && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) s++;
+		if (s >= e) break;
+		const char *ts = s; int par = 0;
+		while (s < e && (par > 0 || (*s != ' ' && *s != '\t' && *s != '\n' && *s != '\r'))) {
+			if (*s == '(') par++; else if (*s == ')' && par > 0) par--;
+			s++;
+		}
+		tok(ts, s, ud);
+	}
+}
+
+struct anim_sh { struct css_style *out; int ntime; };
+static void anim_token(const char *s, const char *e, void *ud)
+{
+	struct anim_sh *a = ud;
+	int t = parse_time_ms(s, e);
+	if (t >= 0) { if (a->ntime == 0) a->out->anim_dur = t; else if (a->ntime == 1) a->out->anim_delay = t; a->ntime++; return; }
+	int ez = parse_easing(s, e);       if (ez >= 0) { a->out->anim_timing = (signed char)ez; return; }
+	int dir = parse_anim_dir(s, e);    if (dir >= 0) { a->out->anim_dir = (signed char)dir; return; }
+	int fl = parse_anim_fill(s, e);    if (fl >= 0) { a->out->anim_fill = (signed char)fl; return; }
+	if (span_is(s, e, "infinite")) { a->out->anim_iter = -1; return; }
+	/* a bare number is the iteration count */
+	{ const char *p = s; int any = 0; double n = 0;
+	  while (p < e && *p >= '0' && *p <= '9') { n = n * 10 + (*p++ - '0'); any = 1; }
+	  if (p < e && *p == '.') { p++; double f = 0.1; while (p < e && *p >= '0' && *p <= '9') { n += (*p++ - '0') * f; f *= 0.1; any = 1; } }
+	  if (any && p >= e) { a->out->anim_iter = (int)(n + 0.5); return; } }
+	if (span_is(s, e, "none")) { a->out->anim_name[0] = '\0'; return; }
+	/* otherwise the animation-name */
+	if (!span_is(s, e, "running") && !span_is(s, e, "paused")) {
+		int n = 0; const char *p = s;
+		if (e - s >= 2 && (*s == '"' || *s == '\'') && e[-1] == s[0]) { p = s + 1; e--; }
+		for (; p < e && n < CSS_ANIM_NAME - 1; p++) a->out->anim_name[n++] = *p;
+		a->out->anim_name[n] = '\0';
+	}
+}
+
+struct trans_sh { struct css_style *out; unsigned mask; int ntime; };
+static void trans_token(const char *s, const char *e, void *ud)
+{
+	struct trans_sh *t = ud;
+	int ms = parse_time_ms(s, e);
+	if (ms >= 0) { if (t->ntime == 0) t->out->trans_dur = ms; else if (t->ntime == 1) t->out->trans_delay = ms; t->ntime++; return; }
+	int ez = parse_easing(s, e);   if (ez >= 0) { t->out->trans_timing = (signed char)ez; return; }
+	t->mask |= trans_prop_bit(s, e);
+}
+
+/* Parse one comma-separated `transition` segment [s,e). */
+static void parse_transition_segment(const char *s, const char *e, struct css_style *out)
+{
+	struct trans_sh t = { out, 0, 0 };
+	for_each_token(s, e, trans_token, &t);
+	if (t.mask == 0) t.mask = TRANS_ALL;   /* only a duration given -> `all` */
+	out->trans_mask |= t.mask;
 }
 
 static void apply_decl(const char *p, const char *pe, const char *v, const char *ve,
@@ -1077,7 +1488,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 	else if (span_is(p, pe, "text-decoration") ||
 	         span_is(p, pe, "text-decoration-line"))
 		out->under = has_ci(val, "underline") ? 1 : (has_ci(val, "none") ? 0 : out->under);
-	else if (span_is(p, pe, "display"))          { out->disp = parse_disp(val); out->flex = has_ci(val, "flex") ? 1 : 0; }
+	else if (span_is(p, pe, "display"))          { out->disp = parse_disp(val); out->flex = has_ci(val, "flex") ? 1 : 0; out->grid = has_ci(val, "grid") ? 1 : 0; }
 	else if (span_is(p, pe, "text-align"))
 		out->center = has_ci(val, "center") ? 1 : (has_ci(val, "left") || has_ci(val, "right") || has_ci(val, "justify") ? 0 : out->center);
 	else if (span_is(p, pe, "width"))            { out->width  = parse_len2(val, &pct); out->pct_w = (short)pct; }
@@ -1126,9 +1537,20 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 	else if (span_is(p, pe, "flex"))             parse_flex_shorthand(val, out);
 	else if (span_is(p, pe, "justify-content"))  out->justify = parse_justify(val);
 	else if (span_is(p, pe, "align-items"))      out->align_items = parse_align(val);
-	else if (span_is(p, pe, "gap"))              parse_gap(val, out);
-	else if (span_is(p, pe, "row-gap"))          { int g = parse_len(val); if (g >= 0) out->gap_row = (short)g; }
-	else if (span_is(p, pe, "column-gap"))       { int g = parse_len(val); if (g >= 0) out->gap_col = (short)g; }
+	else if (span_is(p, pe, "gap") || span_is(p, pe, "grid-gap")) parse_gap(val, out);
+	else if (span_is(p, pe, "row-gap") || span_is(p, pe, "grid-row-gap"))       { int g = parse_len(val); if (g >= 0) out->gap_row = (short)g; }
+	else if (span_is(p, pe, "column-gap") || span_is(p, pe, "grid-column-gap")) { int g = parse_len(val); if (g >= 0) out->gap_col = (short)g; }
+	else if (span_is(p, pe, "grid-template-columns")) out->n_cols = (signed char)parse_tracks(val, out->grid_cols, CSS_GRID_MAX);
+	else if (span_is(p, pe, "grid-template-rows"))    out->n_rows = (signed char)parse_tracks(val, out->grid_rows, CSS_GRID_MAX);
+	else if (span_is(p, pe, "grid-auto-flow"))   out->grid_flow = has_ci(val, "column") ? 1 : 0;
+	else if (span_is(p, pe, "grid-column") || span_is(p, pe, "grid-column-start") || span_is(p, pe, "grid-column-end")) out->col_span = parse_grid_span(val);
+	else if (span_is(p, pe, "grid-row") || span_is(p, pe, "grid-row-start") || span_is(p, pe, "grid-row-end")) out->row_span = parse_grid_span(val);
+	else if (span_is(p, pe, "justify-items"))    out->justify_items = parse_align(val);
+	else if (span_is(p, pe, "place-items")) {    /* align-items [justify-items] */
+		out->align_items = parse_align(val);
+		const char *q = val; while (*q && *q != ' ') q++; while (*q == ' ') q++;
+		out->justify_items = parse_align(*q ? q : val);
+	}
 	else if (span_is(p, pe, "position")) {
 		const char *f = val; while (*f == ' ') f++;
 		out->pos = starts_ci(f, "relative") ? CSS_POS_REL : starts_ci(f, "absolute") ? CSS_POS_ABS :
@@ -1144,21 +1566,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 	else if (span_is(p, pe, "stroke"))           out->stroke = parse_paint_val(val);
 	else if (span_is(p, pe, "content"))          parse_content(val, out->content, sizeof out->content);
 	else if (span_is(p, pe, "font-family"))      copy_family_stack(val, out->fam, CSS_FAM_STACK);
-	else if (span_is(p, pe, "font-size")) {
-		/* keyword scale (most-specific first), else a length/percent. em/rem resolve
-		 * via parse_len2 (rem against the 16px root; em approximated likewise). */
-		if      (has_ci(val, "xx-small")) out->font_px = 9;
-		else if (has_ci(val, "x-small"))  out->font_px = 10;
-		else if (has_ci(val, "smaller"))  out->font_pct = 80;
-		else if (has_ci(val, "small"))    out->font_px = 13;
-		else if (has_ci(val, "xx-large")) out->font_px = 32;
-		else if (has_ci(val, "x-large"))  out->font_px = 24;
-		else if (has_ci(val, "larger"))   out->font_pct = 120;
-		else if (has_ci(val, "large"))    out->font_px = 18;
-		else if (has_ci(val, "medium"))   out->font_px = 16;
-		else { int q; int px = parse_len2(val, &q);
-		       if (px >= 0) out->font_px = px; else if (q >= 0) out->font_pct = (short)q; }
-	}
+	else if (span_is(p, pe, "font-size"))        parse_font_size(val, out);
 	else if (span_is(p, pe, "border-radius") || span_is(p, pe, "border-top-left-radius") ||
 	         span_is(p, pe, "border-top-right-radius") || span_is(p, pe, "border-bottom-left-radius") ||
 	         span_is(p, pe, "border-bottom-right-radius")) {
@@ -1171,10 +1579,26 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 	else if (span_is(p, pe, "font-style"))
 		out->italic = (has_ci(val, "italic") || has_ci(val, "oblique")) ? 1 :
 		              has_ci(val, "normal") ? 0 : out->italic;
-	else if (span_is(p, pe, "font")) {              /* the `font` shorthand: pull style/weight/size */
-		out->italic = (has_ci(val, "italic") || has_ci(val, "oblique")) ? 1 : out->italic;
-		if (has_ci(val, "bold")) out->bold = 1;
+	else if (span_is(p, pe, "font"))             parse_font_shorthand(val, out);
+	else if (span_is(p, pe, "font-variant") || span_is(p, pe, "font-variant-caps")) {
+		/* only the caps axis is renderable (as an uppercase approximation); the
+		 * ligature/numeric/east-asian/etc. sub-values are inert here. */
+		if      (has_ci(val, "small-caps") || has_ci(val, "all-small-caps") ||
+		         has_ci(val, "petite-caps") || has_ci(val, "all-petite-caps") ||
+		         has_ci(val, "unicase") || has_ci(val, "titling-caps")) out->small_caps = 1;
+		else if (has_ci(val, "normal") || has_ci(val, "none"))          out->small_caps = 0;
 	}
+	/* Font longhands with no effect in this line-based renderer: parsed-and-ignored
+	 * so they neither error nor fall through to an unrelated branch. */
+	else if (span_is(p, pe, "font-stretch") || span_is(p, pe, "font-kerning") ||
+	         span_is(p, pe, "font-feature-settings") || span_is(p, pe, "font-variation-settings") ||
+	         span_is(p, pe, "font-optical-sizing") || span_is(p, pe, "font-size-adjust") ||
+	         span_is(p, pe, "font-language-override") || span_is(p, pe, "font-synthesis") ||
+	         span_is(p, pe, "font-smooth") || span_is(p, pe, "-webkit-font-smoothing") ||
+	         span_is(p, pe, "-moz-osx-font-smoothing") ||
+	         span_is(p, pe, "font-variant-ligatures") || span_is(p, pe, "font-variant-numeric") ||
+	         span_is(p, pe, "font-variant-east-asian") || span_is(p, pe, "font-variant-alternates") ||
+	         span_is(p, pe, "font-variant-position")) { }
 	else if (span_is(p, pe, "text-transform")) {
 		if      (has_ci(val, "uppercase"))  out->ttx = CSS_TT_UPPER;
 		else if (has_ci(val, "lowercase"))  out->ttx = CSS_TT_LOWER;
@@ -1188,8 +1612,18 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 		else if (has_ci(val, "pre"))       out->white_space = CSS_WS_PRE;
 		else if (has_ci(val, "normal"))    out->white_space = CSS_WS_NORMAL;
 	}
-	else if (span_is(p, pe, "list-style") || span_is(p, pe, "list-style-type"))
+	else if (span_is(p, pe, "list-style")) {
+		/* shorthand: a type keyword and/or a position keyword, any order. The
+		 * image component (none/url()) is captured by the type parse — a bare
+		 * url() leaves the type at DEFAULT so the ul/ol default marker shows as
+		 * the fallback, which is all this line-based renderer can draw. */
 		out->list_style = parse_list_style(val);
+		out->list_pos   = parse_list_position(val);
+	}
+	else if (span_is(p, pe, "list-style-type"))
+		out->list_style = parse_list_style(val);
+	else if (span_is(p, pe, "list-style-position"))
+		out->list_pos = parse_list_position(val);
 	else if (span_is(p, pe, "line-height"))      parse_line_height(val, out);
 	else if (span_is(p, pe, "opacity"))          out->opacity = parse_opacity(val);
 	else if (span_is(p, pe, "outline") || span_is(p, pe, "outline-width") ||
@@ -1209,6 +1643,66 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 			}
 		}
 	}
+	else if (span_is(p, pe, "animation") || span_is(p, pe, "-webkit-animation")) {
+		struct anim_sh a = { out, 0 };
+		for_each_token(val, val + strlen(val), anim_token, &a);
+	}
+	else if (span_is(p, pe, "animation-name") || span_is(p, pe, "-webkit-animation-name")) {
+		const char *f = val; while (*f == ' ' || *f == '\t') f++;
+		const char *e = f; while (*e) e++;
+		while (e > f && (e[-1] == ' ' || e[-1] == '\t')) e--;
+		if (span_is(f, e, "none")) out->anim_name[0] = '\0';
+		else {
+			if (e - f >= 2 && (*f == '"' || *f == '\'') && e[-1] == f[0]) { f++; e--; }
+			int n = 0; for (; f < e && n < CSS_ANIM_NAME - 1; f++) out->anim_name[n++] = *f;
+			out->anim_name[n] = '\0';
+		}
+	}
+	else if (span_is(p, pe, "animation-duration") || span_is(p, pe, "-webkit-animation-duration"))
+		{ int t = parse_time_ms(val, val + strlen(val)); if (t >= 0) out->anim_dur = t; }
+	else if (span_is(p, pe, "animation-delay") || span_is(p, pe, "-webkit-animation-delay"))
+		{ int t = parse_time_ms(val, val + strlen(val)); if (t >= 0) out->anim_delay = t; }
+	else if (span_is(p, pe, "animation-timing-function") || span_is(p, pe, "-webkit-animation-timing-function"))
+		{ int ez = parse_easing(val, val + strlen(val)); if (ez >= 0) out->anim_timing = (signed char)ez; }
+	else if (span_is(p, pe, "animation-iteration-count") || span_is(p, pe, "-webkit-animation-iteration-count")) {
+		const char *f = val; while (*f == ' ') f++;
+		if (starts_ci(f, "infinite")) out->anim_iter = -1;
+		else { int any = 0; double n = 0;
+		       while (*f >= '0' && *f <= '9') { n = n * 10 + (*f++ - '0'); any = 1; }
+		       if (*f == '.') { f++; double fr = 0.1; while (*f >= '0' && *f <= '9') { n += (*f++ - '0') * fr; fr *= 0.1; any = 1; } }
+		       if (any) out->anim_iter = (int)(n + 0.5); }
+	}
+	else if (span_is(p, pe, "animation-direction") || span_is(p, pe, "-webkit-animation-direction"))
+		{ int d = parse_anim_dir(val, val + strlen(val)); if (d >= 0) out->anim_dir = (signed char)d; }
+	else if (span_is(p, pe, "animation-fill-mode") || span_is(p, pe, "-webkit-animation-fill-mode"))
+		{ int fm = parse_anim_fill(val, val + strlen(val)); if (fm >= 0) out->anim_fill = (signed char)fm; }
+	/* animation-play-state / -timeline parse-and-ignore (no paused state modelled) */
+	else if (span_is(p, pe, "animation-play-state") || span_is(p, pe, "animation-timeline") ||
+	         span_is(p, pe, "-webkit-animation-play-state")) { }
+	else if (span_is(p, pe, "transition") || span_is(p, pe, "-webkit-transition")) {
+		const char *seg = val, *end = val + strlen(val);
+		out->trans_mask = 0;              /* the shorthand resets the property set */
+		while (seg < end) {
+			const char *comma = seg; while (comma < end && *comma != ',') comma++;
+			parse_transition_segment(seg, comma, out);
+			seg = (comma < end) ? comma + 1 : end;
+		}
+	}
+	else if (span_is(p, pe, "transition-property") || span_is(p, pe, "-webkit-transition-property")) {
+		const char *seg = val, *end = val + strlen(val);
+		out->trans_mask = 0;
+		while (seg < end) {
+			const char *comma = seg; while (comma < end && *comma != ',') comma++;
+			out->trans_mask |= trans_prop_bit(seg, comma);
+			seg = (comma < end) ? comma + 1 : end;
+		}
+	}
+	else if (span_is(p, pe, "transition-duration") || span_is(p, pe, "-webkit-transition-duration"))
+		{ int t = parse_time_ms(val, val + strlen(val)); if (t >= 0) out->trans_dur = t; }
+	else if (span_is(p, pe, "transition-delay") || span_is(p, pe, "-webkit-transition-delay"))
+		{ int t = parse_time_ms(val, val + strlen(val)); if (t >= 0) out->trans_delay = t; }
+	else if (span_is(p, pe, "transition-timing-function") || span_is(p, pe, "-webkit-transition-timing-function"))
+		{ int ez = parse_easing(val, val + strlen(val)); if (ez >= 0) out->trans_timing = (signed char)ez; }
 }
 
 /* Parse a `prop: value; ...` block [s,end) into *out. */
@@ -1237,14 +1731,39 @@ void css_apply_inline(const char *decls, struct css_style *out)
 }
 
 /* ------------------------------------------------ selectors ---------------- */
+static int  parse_selector(const char *s, const char *e, struct selector *sel);
+static struct sel_list *parse_sel_list(const char *s, const char *e);
+static int  selector_match(const struct selector *sel, const struct dom_node *el);
+static void free_selector_lists(struct selector *sel);
+
+/* True if byte c is in the NUL-terminated set. */
+static int chr_in(const char *set, char c) { for (; *set; set++) if (*set == c) return 1; return 0; }
+
+/* Advance from s to the first byte in `stop` that sits at bracket-nesting depth 0.
+ * (…) and […] are skipped as a unit, so a comma / whitespace / '>' inside an
+ * :is()/:not() argument list or an [attr="…"] value never splits a selector.
+ * The one scanner shared by the selector-list, compound and :is()-list splitters. */
+static const char *scan_top(const char *s, const char *e, const char *stop)
+{
+	int depth = 0;
+	for (; s < e; s++) {
+		char c = *s;
+		if (c == '(' || c == '[') depth++;
+		else if (c == ')' || c == ']') { if (depth) depth--; }
+		else if (depth == 0 && chr_in(stop, c)) break;
+	}
+	return s;
+}
+
 static int is_sel_name(char c)
 { return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_'; }
 
 /* ------------------------------------------------ pseudo-classes ----------- *
  * Structural/state pseudo-classes are matched against the DOM; dynamic ones
  * (:hover/:focus/…) and anything we can't evaluate become PC_NEVER so their rule
- * can't apply to a static render; :is()/:where() are passed through (no added
- * test) so the low-specificity resets that wrap selectors in them still match. */
+ * can't apply to a static render; :is()/:where() parse their argument into a list
+ * of sub-selectors matched recursively (PC_MATCHES), matching nothing — never the
+ * universal fallback — when the argument is empty or unparsable. */
 
 /* an+b microsyntax (odd|even|<int>|an+b|-n+b) for the :nth-* pseudo-classes. */
 static void parse_anb(const char *s, const char *e, int *a, int *b)
@@ -1299,7 +1818,7 @@ static void parse_simple_sel(const char *s, const char *e, struct simple_sel *ss
 static int classify_pseudo(const char *ns, const char *ne, const char *as, const char *ae,
                            struct pseudo *pc)
 {
-	pc->kind = PC_NEVER; pc->a = 0; pc->b = 0;
+	pc->kind = PC_NEVER; pc->a = 0; pc->b = 0; pc->list = 0;
 	pc->arg.tag[0] = pc->arg.id[0] = '\0'; pc->arg.ncls = 0;
 
 	if (span_is(ns, ne, "not")) { pc->kind = PC_NOT; if (as) parse_simple_sel(as, ae, &pc->arg); return 1; }
@@ -1321,7 +1840,17 @@ static int classify_pseudo(const char *ns, const char *ne, const char *as, const
 	if (span_is(ns, ne, "required")) { pc->kind = PC_REQUIRED; return 1; }
 	if (span_is(ns, ne, "optional")) { pc->kind = PC_OPTIONAL; return 1; }
 	if (span_is(ns, ne, "link") || span_is(ns, ne, "any-link")) { pc->kind = PC_LINK; return 1; }
-	if (span_is(ns, ne, "is") || span_is(ns, ne, "where")) return 0;   /* pass-through */
+	if (span_is(ns, ne, "is") || span_is(ns, ne, "where")) {
+		/* :is()/:where() match if any sub-selector matches the element as its
+		 * subject. An empty or wholly-unparsable argument matches NOTHING (its rule
+		 * simply can't apply) — never the universal fallback a pass-through gave. */
+		struct sel_list *l = (as && as < ae) ? parse_sel_list(as, ae) : 0;
+		if (!l) return 1;                       /* PC_NEVER (matches nothing) */
+		pc->kind = PC_MATCHES;
+		pc->list = l;
+		pc->a = span_is(ns, ne, "where");       /* :where() carries zero specificity */
+		return 1;
+	}
 	return 1;   /* dynamic state / :has() / unsupported -> PC_NEVER */
 }
 
@@ -1394,9 +1923,12 @@ static int parse_selector(const char *s, const char *e, struct selector *sel)
 		while (s < e && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) s++;
 		if (s >= e) break;
 		if (*s == '>') { pending_child = 1; s++; continue; }
+		/* A compound runs to the next top-level combinator (space/'>'); one inside
+		 * (…)/[…] belongs to a pseudo argument or [attr] value — scan_top skips it,
+		 * so :is(.a > .b) and [x="a b"] stay a single compound. */
 		const char *tok = s;
-		while (s < e && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r' && *s != '>') s++;
-		if (sel->n >= MAX_STEPS) return sel->n > 0;   /* cap depth, keep what we have */
+		s = scan_top(s, e, " \t\n\r>");
+		if (sel->n >= MAX_STEPS) return sel->n > 0;   /* cap depth, keep what we have (token dropped, unparsed) */
 		struct sel_step *st = &sel->step[sel->n];
 		parse_compound(tok, s, st);
 		st->child = 0;
@@ -1405,6 +1937,58 @@ static int parse_selector(const char *s, const char *e, struct selector *sel)
 		sel->n++;
 	}
 	return sel->n > 0;
+}
+
+/* Recursively free the heap :is()/:where() sub-selector lists a selector owns. */
+static void free_sel_list(struct sel_list *l);
+static void free_selector_lists(struct selector *sel)
+{
+	for (int i = 0; i < sel->n; i++) {
+		struct sel_step *st = &sel->step[i];
+		for (int j = 0; j < st->npc; j++)
+			if (st->pc[j].kind == PC_MATCHES && st->pc[j].list) {
+				free_sel_list(st->pc[j].list);
+				st->pc[j].list = 0;
+			}
+	}
+}
+static void free_sel_list(struct sel_list *l)
+{
+	if (!l) return;
+	for (int i = 0; i < l->n; i++) free_selector_lists(&l->sels[i]);
+	free(l->sels);
+	free(l);
+}
+
+/* Split [s,e) on top-level commas (respecting ()/[]) and parse each piece as a
+ * full selector, collecting the ones that parse into a heap list. Returns 0 if
+ * none parse — so an :is()/:where() with no usable argument matches nothing, not
+ * everything. A depth guard bounds nested :is(:is(:is(…))) against a hostile sheet. */
+static int g_is_depth;
+static struct sel_list *parse_sel_list(const char *s, const char *e)
+{
+	if (g_is_depth >= 8) return 0;
+	int cap = 1;                                     /* pieces = top-level commas + 1 */
+	for (const char *p = s; p < e; ) {
+		const char *c = scan_top(p, e, ",");
+		if (c < e) cap++;
+		p = (c < e) ? c + 1 : e;
+	}
+	struct selector *sels = malloc((unsigned)cap * sizeof *sels);
+	if (!sels) return 0;
+	int n = 0;
+	g_is_depth++;
+	for (const char *q = s; q < e && n < cap; ) {
+		const char *comma = scan_top(q, e, ",");
+		if (parse_selector(q, comma, &sels[n])) n++;
+		q = (comma < e) ? comma + 1 : e;
+	}
+	g_is_depth--;
+	if (n == 0) { free(sels); return 0; }
+	struct sel_list *l = malloc(sizeof *l);
+	if (!l) { for (int i = 0; i < n; i++) free_selector_lists(&sels[i]); free(sels); return 0; }
+	l->n = n; l->sels = sels;
+	return l;
 }
 
 static int selector_spec(const struct selector *sel)
@@ -1421,6 +2005,17 @@ static int selector_spec(const struct selector *sel)
 				if (pc->arg.id[0]) a++;
 				b += pc->arg.ncls;
 				if (pc->arg.tag[0]) c++;
+			} else if (pc->kind == PC_MATCHES) {
+				/* :is() takes the specificity of its most-specific argument; :where()
+				 * (pc->a) contributes nothing at all. */
+				if (!pc->a && pc->list) {
+					int best = 0;
+					for (int k = 0; k < pc->list->n; k++) {
+						int s = selector_spec(&pc->list->sels[k]);
+						if (s > best) best = s;
+					}
+					a += best / 10000; b += (best / 100) % 100; c += best % 100;
+				}
 			} else {
 				b++;                             /* a pseudo-class counts like a class */
 			}
@@ -1540,6 +2135,11 @@ static int pseudo_match(const struct pseudo *pc, const struct dom_node *n)
 	case PC_LINK:     return (streq(n->tag, "a") || streq(n->tag, "area") || streq(n->tag, "link")) &&
 	                         dom_get_attr(n, "href") != 0;
 	case PC_NOT:      return !simple_match(&pc->arg, n);
+	case PC_MATCHES:
+		if (!pc->list) return 0;
+		for (int i = 0; i < pc->list->n; i++)
+			if (selector_match(&pc->list->sels[i], n)) return 1;
+		return 0;
 	default:          return 0;   /* PC_NEVER */
 	}
 }
@@ -1566,22 +2166,30 @@ static int step_match(const struct sel_step *st, const struct dom_node *n)
 	return step_box_match(st, n);
 }
 
-static int selector_match(const struct selector *sel, const struct dom_node *el)
+/* Match steps [0, top] of `sel` against the ancestors of `subject` (right to
+ * left): a '>' step must match the immediate parent, a descendant step the
+ * nearest matching ancestor. Greedy, no backtracking — enough for ordinary
+ * selectors. Shared by the normal and ::before/::after matchers. */
+static int match_ancestors(const struct selector *sel, int top, const struct dom_node *subject)
 {
-	int i = sel->n - 1;
-	if (!step_match(&sel->step[i], el)) return 0;
-	const struct dom_node *cur = el;
-	for (i = sel->n - 2; i >= 0; i--) {
+	const struct dom_node *cur = subject;
+	for (int i = top; i >= 0; i--) {
+		cur = cur ? cur->parent : 0;
 		if (sel->step[i].child) {
-			cur = cur->parent;
 			if (!step_match(&sel->step[i], cur)) return 0;
 		} else {
-			cur = cur ? cur->parent : 0;
 			while (cur && !step_match(&sel->step[i], cur)) cur = cur->parent;
 			if (!cur) return 0;
 		}
 	}
 	return 1;
+}
+
+static int selector_match(const struct selector *sel, const struct dom_node *el)
+{
+	int i = sel->n - 1;
+	if (!step_match(&sel->step[i], el)) return 0;
+	return match_ancestors(sel, i - 1, el);
 }
 
 /* Match a ::before / ::after rule against its originating element `el`: the
@@ -1592,18 +2200,7 @@ static int selector_match_pseudo(const struct selector *sel, const struct dom_no
 	int i = sel->n - 1;
 	if (sel->step[i].pseudo_el != which) return 0;
 	if (!step_box_match(&sel->step[i], el)) return 0;
-	const struct dom_node *cur = el;
-	for (i = sel->n - 2; i >= 0; i--) {
-		if (sel->step[i].child) {
-			cur = cur->parent;
-			if (!step_match(&sel->step[i], cur)) return 0;
-		} else {
-			cur = cur ? cur->parent : 0;
-			while (cur && !step_match(&sel->step[i], cur)) cur = cur->parent;
-			if (!cur) return 0;
-		}
-	}
-	return 1;
+	return match_ancestors(sel, i - 1, el);
 }
 
 /* ------------------------------------------------ @media ------------------- */
@@ -1872,6 +2469,9 @@ css_sheet *css_new(void)
 	s->order = 0;
 	s->gen = 0;
 	s->faces = 0;
+	s->keyframes = 0;
+	s->has_pseudo_el = 0;
+	s->cur_base = 0;
 	for (int i = 0; i < CSS_NBUCK; i++) { s->id_b[i] = s->cls_b[i] = s->tag_b[i] = 0; }
 	s->uni = 0;
 	s->idx_gen = -1;             /* index is stale until first ensure_index */
@@ -1951,6 +2551,106 @@ static void parse_fontface(css_sheet *sh, const char *s, const char *end)
 	sh->faces = fc;
 }
 
+static const char *skip_ws_com(const char *p, const char *end);   /* defined below */
+
+/* A @keyframes stop selector: `from` -> 0, `to` -> 1000, `N%` -> N*10 permille;
+ * -1 if it isn't a valid keyframe offset. */
+static int keyframe_offset(const char *s, const char *e)
+{
+	while (s < e && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) s++;
+	while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r')) e--;
+	if (span_is(s, e, "from")) return 0;
+	if (span_is(s, e, "to"))   return 1000;
+	double n = 0; int any = 0; const char *p = s;
+	while (p < e && *p >= '0' && *p <= '9') { n = n * 10 + (*p++ - '0'); any = 1; }
+	if (p < e && *p == '.') { p++; double f = 0.1; while (p < e && *p >= '0' && *p <= '9') { n += (*p++ - '0') * f; f *= 0.1; any = 1; } }
+	if (!any || p >= e || *p != '%') return -1;
+	int pm = (int)(n * 10 + 0.5);
+	if (pm < 0) pm = 0;
+	if (pm > 1000) pm = 1000;
+	return pm;
+}
+
+/* Insert one stop (offset + declaration delta) into *kf, keeping off[]/stop[]
+ * ascending by offset; a duplicate offset is overwritten (last wins, like CSS). */
+static void keyframes_add_stop(struct css_keyframes *kf, int pm, const struct css_style *decl)
+{
+	for (int i = 0; i < kf->nstops; i++) {
+		if (kf->off[i] == pm) { kf->stop[i] = *decl; return; }
+	}
+	if (kf->nstops >= CSS_KF_STOPS) return;
+	int i = kf->nstops;
+	while (i > 0 && kf->off[i - 1] > pm) { kf->off[i] = kf->off[i - 1]; kf->stop[i] = kf->stop[i - 1]; i--; }
+	kf->off[i] = (short)pm; kf->stop[i] = *decl; kf->nstops++;
+}
+
+/* Parse a @keyframes block: `name` is [ns,ne); the brace body is [bs,be). Each
+ * inner rule is a comma-separated list of offset selectors + a declaration block,
+ * folded via the ordinary declaration parser. Registers the block on the sheet if
+ * it yields at least one stop. */
+static void parse_keyframes(css_sheet *sh, const char *ns, const char *ne,
+                            const char *bs, const char *be)
+{
+	while (ns < ne && (*ns == ' ' || *ns == '\t' || *ns == '\n' || *ns == '\r')) ns++;
+	while (ne > ns && (ne[-1] == ' ' || ne[-1] == '\t' || ne[-1] == '\n' || ne[-1] == '\r')) ne--;
+	/* an animation-name may be quoted ("spin"); dequote it */
+	if (ne - ns >= 2 && (*ns == '"' || *ns == '\'') && ne[-1] == ns[0]) { ns++; ne--; }
+	if (ns >= ne || (int)(ne - ns) >= CSS_ANIM_NAME) return;
+
+	struct css_keyframes *kf = malloc(sizeof *kf);
+	if (!kf) return;
+	int ni = 0; for (; ns + ni < ne; ni++) kf->name[ni] = ns[ni]; kf->name[ni] = '\0';
+	kf->nstops = 0; kf->next = 0;
+
+	const char *p = bs;
+	while (p < be) {
+		p = skip_ws_com(p, be);
+		if (p >= be) break;
+		const char *sel_s = p;
+		while (p < be && *p != '{' && *p != '}') p++;
+		if (p >= be || *p != '{') break;
+		const char *sel_e = p++;
+		const char *dec_s = p; int depth = 1;
+		while (p < be && depth) { if (*p == '{') depth++; else if (*p == '}') depth--; if (depth) p++; }
+		const char *dec_e = p; if (p < be) p++;
+
+		struct css_style decl;
+		css_style_reset(&decl);
+		int imp = 0;
+		parse_decls(dec_s, dec_e, &decl, &imp);
+
+		const char *q = sel_s;
+		while (q < sel_e) {
+			const char *comma = q; while (comma < sel_e && *comma != ',') comma++;
+			int pm = keyframe_offset(q, comma);
+			if (pm >= 0) keyframes_add_stop(kf, pm, &decl);
+			q = (comma < sel_e) ? comma + 1 : sel_e;
+		}
+	}
+
+	if (kf->nstops == 0) { free(kf); return; }
+	kf->next = sh->keyframes;
+	sh->keyframes = kf;
+}
+
+/* ---- @keyframes public accessors (the animation engine, anim.c) ---- */
+const struct css_keyframes *css_keyframes_find(css_sheet *sh, const char *name)
+{
+	if (!sh || !name || !name[0]) return 0;
+	for (struct css_keyframes *kf = sh->keyframes; kf; kf = kf->next)
+		if (streq(kf->name, name)) return kf;
+	return 0;
+}
+int css_keyframes_count(const struct css_keyframes *kf) { return kf ? kf->nstops : 0; }
+int css_keyframes_stop(const struct css_keyframes *kf, int i, int *permille,
+                       const struct css_style **decl)
+{
+	if (!kf || i < 0 || i >= kf->nstops) return 0;
+	if (permille) *permille = kf->off[i];
+	if (decl)     *decl     = &kf->stop[i];
+	return 1;
+}
+
 static void sheet_push(css_sheet *sh, const struct selector *sel,
                        const struct css_style *decl, int important,
                        const struct media_query *media,
@@ -1964,17 +2664,10 @@ static void sheet_push(css_sheet *sh, const struct selector *sel,
 	r->spec = selector_spec(sel);
 	r->order = sh->order++;
 	r->important = important;
-	{   /* index key = the rightmost compound's most specific simple selector */
-		const struct sel_step *st = &sel->step[sel->n - 1];
-		const char *ks = 0;
-		if (st->id[0])        { r->keykind = KK_ID;  ks = st->id; }
-		else if (st->ncls)    { r->keykind = KK_CLS; ks = st->cls[0]; }
-		else if (st->tag[0])  { r->keykind = KK_TAG; ks = st->tag; }
-		else                  { r->keykind = KK_UNIV; }
-		int k = 0;
-		if (ks) for (; ks[k] && k < (int)sizeof r->keystr - 1; k++) r->keystr[k] = ks[k];
-		r->keystr[k] = '\0';
-	}
+	if (sel->step[sel->n - 1].pseudo_el == PE_BEFORE ||
+	    sel->step[sel->n - 1].pseudo_el == PE_AFTER)
+		sh->has_pseudo_el = 1;              /* a ::before/::after rule exists in this sheet */
+	r->visit = 0;                          /* the index (ensure_index) files it by key */
 	{   /* copy the authored declarations, collapsing runs of whitespace */
 		int k = 0, sp = 0;
 		const char *q = dec_s;
@@ -2045,6 +2738,18 @@ static void add_rules(css_sheet *sh, const char *p, const char *end,
 					continue;
 				}
 			}
+			if (starts_ci(p, "@keyframes") || starts_ci(p, "@-webkit-keyframes")) {
+				const char *ns = p + (starts_ci(p, "@-webkit-keyframes") ? 18 : 10);
+				const char *b = ns;
+				while (b < end && *b != '{' && *b != ';') b++;
+				if (b < end && *b == '{') {
+					const char *db = b + 1, *de = db; int depth = 1;
+					while (de < end && depth) { if (*de == '{') depth++; else if (*de == '}') depth--; if (depth) de++; }
+					parse_keyframes(sh, ns, b, db, de);
+					p = (de < end) ? de + 1 : end;
+					continue;
+				}
+			}
 			if (starts_ci(p, "@media")) {
 				const char *hdr = p + 6, *b = hdr;
 				while (b < end && *b != '{' && *b != '}' && *b != ';') b++;
@@ -2095,12 +2800,13 @@ static void add_rules(css_sheet *sh, const char *p, const char *end,
 		int important = 0;
 		parse_decls(dec_s, dec_e, &decl, &important);
 
-		const char *q = sel_s;                  /* split the selector list on ',' */
-		while (q < sel_e) {
-			const char *comma = q;
-			while (comma < sel_e && *comma != ',') comma++;
+		/* Split the selector list on top-level commas only (scan_top skips a comma
+		 * inside an :is()/:not() list or an [attr] value). */
+		for (const char *q = sel_s; q < sel_e; ) {
+			const char *comma = scan_top(q, sel_e, ",");
 			struct selector sel;
 			if (parse_selector(q, comma, &sel)) sheet_push(sh, &sel, &decl, important, mq, dec_s, dec_e);
+			else                                free_selector_lists(&sel);   /* discard: reclaim any parsed :is() lists */
 			q = (comma < sel_e) ? comma + 1 : sel_e;
 		}
 	}
@@ -2116,14 +2822,19 @@ void css_add(css_sheet *sh, const char *src, int len, const char *base)
 	sh->gen++;                            /* custom-property table is now stale */
 }
 
+static void index_clear(css_sheet *sh);   /* defined with the rule index */
+
 void css_free(css_sheet *sh)
 {
 	if (!sh) return;
 	if (sh == g_vars_sheet) { g_vars_sheet = 0; g_vars_gen = -1; g_nvars = 0; }   /* drop stale var cache */
+	index_clear(sh);                       /* free the css_idx entries before their rules */
 	struct css_rule *r = sh->head;
-	while (r) { struct css_rule *n = r->next; free(r); r = n; }
+	while (r) { struct css_rule *n = r->next; free_selector_lists(&r->sel); free(r); r = n; }
 	struct css_face *fc = sh->faces;
 	while (fc) { struct css_face *n = fc->next; free(fc->url); free(fc->base); free(fc); fc = n; }
+	struct css_keyframes *kf = sh->keyframes;
+	while (kf) { struct css_keyframes *n = kf->next; free(kf); kf = n; }
 	free(sh);
 }
 
@@ -2195,11 +2906,20 @@ static void fold(struct css_style *out, const struct css_style *d)
 	if (d->align_items >= 0) out->align_items = d->align_items;
 	if (d->gap_row >= 0)    out->gap_row = d->gap_row;
 	if (d->gap_col >= 0)    out->gap_col = d->gap_col;
+	if (d->grid >= 0)       out->grid = d->grid;
+	if (d->grid_flow >= 0)  out->grid_flow = d->grid_flow;
+	if (d->n_cols >= 0)  { out->n_cols = d->n_cols; for (int i = 0; i < d->n_cols && i < CSS_GRID_MAX; i++) out->grid_cols[i] = d->grid_cols[i]; }
+	if (d->n_rows >= 0)  { out->n_rows = d->n_rows; for (int i = 0; i < d->n_rows && i < CSS_GRID_MAX; i++) out->grid_rows[i] = d->grid_rows[i]; }
+	if (d->col_span >= 0)   out->col_span = d->col_span;
+	if (d->row_span >= 0)   out->row_span = d->row_span;
+	if (d->justify_items >= 0) out->justify_items = d->justify_items;
 	if (d->overflow >= 0)   out->overflow = d->overflow;
 	if (d->italic >= 0)     out->italic = d->italic;
+	if (d->small_caps >= 0) out->small_caps = d->small_caps;
 	if (d->ttx >= 0)        out->ttx = d->ttx;
 	if (d->white_space >= 0) out->white_space = d->white_space;
 	if (d->list_style != CSS_LST_DEFAULT) out->list_style = d->list_style;
+	if (d->list_pos != CSS_LSP_DEFAULT)   out->list_pos   = d->list_pos;
 	if (d->opacity >= 0)    out->opacity = d->opacity;
 	if (d->line_height >= 0)   { out->line_height = d->line_height; out->lh_pct = -1; }
 	else if (d->lh_pct >= 0)   { out->lh_pct = d->lh_pct; out->line_height = -1; }
@@ -2208,6 +2928,17 @@ static void fold(struct css_style *out, const struct css_style *d)
 	if (d->z_index != CSS_Z_AUTO) out->z_index = d->z_index;
 	if (d->fill != -1)   out->fill   = d->fill;
 	if (d->stroke != -1) out->stroke = d->stroke;
+	if (d->anim_name[0]) { int i = 0; for (; d->anim_name[i] && i < CSS_ANIM_NAME - 1; i++) out->anim_name[i] = d->anim_name[i]; out->anim_name[i] = '\0'; }
+	if (d->anim_dur >= 0)     out->anim_dur = d->anim_dur;
+	if (d->anim_delay >= 0)   out->anim_delay = d->anim_delay;
+	if (d->anim_iter != -2)   out->anim_iter = d->anim_iter;
+	if (d->anim_dir >= 0)     out->anim_dir = d->anim_dir;
+	if (d->anim_fill >= 0)    out->anim_fill = d->anim_fill;
+	if (d->anim_timing >= 0)  out->anim_timing = d->anim_timing;
+	if (d->trans_mask)        out->trans_mask = d->trans_mask;
+	if (d->trans_dur >= 0)    out->trans_dur = d->trans_dur;
+	if (d->trans_delay >= 0)  out->trans_delay = d->trans_delay;
+	if (d->trans_timing >= 0) out->trans_timing = d->trans_timing;
 	/* background image layer: the image identity (kind + gradient/url) folds as a
 	 * unit; repeat/size/position are independent longhands with their own sentinels. */
 	if (d->bgi.kind >= 0) {
@@ -2332,23 +3063,70 @@ static unsigned css_hash(const char *s)
 	for (; *s; s++) h = h * 33u + (unsigned char)*s;
 	return h % CSS_NBUCK;
 }
+/* Append the index key(s) under which the rightmost compound `st` must be filed,
+ * each pointing into the selector tree (stable for the rule's life). Returns 1 with
+ * >=1 keys appended, or 0 if the compound can match an element with no usable key
+ * (explicit *, an [attr]-only or bare dynamic-pseudo subject) — the caller then
+ * files the whole rule universally. A subject :is()/:where() with no key of its own
+ * contributes one key per branch, so :is(a.x, b.y) is filed under classes x and y;
+ * if any branch is itself universal the whole rule falls back to universal. */
+struct idx_key { int kind; const char *str; };
+static int compound_keys(const struct sel_step *st, struct idx_key *out, int max, int *n)
+{
+	if (st->id[0])   { if (*n < max) { out[*n].kind = KK_ID;  out[*n].str = st->id;     (*n)++; } return 1; }
+	if (st->ncls)    { if (*n < max) { out[*n].kind = KK_CLS; out[*n].str = st->cls[0]; (*n)++; } return 1; }
+	if (st->tag[0])  { if (*n < max) { out[*n].kind = KK_TAG; out[*n].str = st->tag;    (*n)++; } return 1; }
+	const struct pseudo *pm = 0;
+	for (int i = 0; i < st->npc; i++)
+		if (st->pc[i].kind == PC_MATCHES && st->pc[i].list) { pm = &st->pc[i]; break; }
+	if (!pm) return 0;                     /* :hover-only / [attr] / * subject -> universal */
+	for (int i = 0; i < pm->list->n; i++) {
+		const struct selector *sub = &pm->list->sels[i];
+		if (!compound_keys(&sub->step[sub->n - 1], out, max, n)) return 0;   /* a branch matches anything */
+	}
+	return 1;
+}
+
+static void index_clear(css_sheet *sh)
+{
+	struct css_idx **tabs[3] = { sh->id_b, sh->cls_b, sh->tag_b };
+	for (int t = 0; t < 3; t++)
+		for (int i = 0; i < CSS_NBUCK; i++) {
+			for (struct css_idx *e = tabs[t][i]; e; ) { struct css_idx *nx = e->next; free(e); e = nx; }
+			tabs[t][i] = 0;
+		}
+	for (struct css_idx *e = sh->uni; e; ) { struct css_idx *nx = e->next; free(e); e = nx; }
+	sh->uni = 0;
+}
+
+static void index_put(struct css_idx **head, struct css_rule *r, const char *key)
+{
+	struct css_idx *e = malloc(sizeof *e);
+	if (!e) return;                        /* OOM: the rule just isn't indexed here */
+	e->rule = r; e->key = key; e->next = *head; *head = e;
+}
+
 static void ensure_index(css_sheet *sh)
 {
 	if (sh->idx_gen == sh->gen) return;
-	for (int i = 0; i < CSS_NBUCK; i++) { sh->id_b[i] = sh->cls_b[i] = sh->tag_b[i] = 0; }
-	sh->uni = 0;
+	index_clear(sh);
 	for (struct css_rule *r = sh->head; r; r = r->next) {
-		struct css_rule **head =
-			r->keykind == KK_ID  ? &sh->id_b[css_hash(r->keystr)] :
-			r->keykind == KK_CLS ? &sh->cls_b[css_hash(r->keystr)] :
-			r->keykind == KK_TAG ? &sh->tag_b[css_hash(r->keystr)] : &sh->uni;
-		r->hnext = *head; *head = r;
+		struct idx_key keys[32]; int nk = 0;
+		if (!compound_keys(&r->sel.step[r->sel.n - 1], keys, 32, &nk) || nk == 0) {
+			index_put(&sh->uni, r, 0);
+			continue;
+		}
+		for (int i = 0; i < nk; i++) {
+			struct css_idx **tab = keys[i].kind == KK_ID  ? sh->id_b
+			                     : keys[i].kind == KK_CLS ? sh->cls_b : sh->tag_b;
+			index_put(&tab[css_hash(keys[i].str)], r, keys[i].str);
+		}
 	}
 	sh->idx_gen = sh->gen;
 }
 
-/* Copy `s` truncated to 23 chars (the rule keystr width) into out[24] so element
- * keys hash to the same bucket as the rules that were truncated at parse time. */
+/* Copy `s` truncated to 23 chars (the max stored key width) into out[24] so element
+ * keys hash to the same bucket as the rule keys, which are capped the same at parse. */
 static void key23(const char *s, char *out)
 {
 	int k = 0;
@@ -2356,23 +3134,27 @@ static void key23(const char *s, char *out)
 	out[k] = '\0';
 }
 
-/* Candidate rules for `el`: the universal bucket + its tag/id/class buckets. A
- * rule lives in exactly one bucket, so there are no duplicates; selector_match
- * still confirms each (the buckets are a superset filter). */
+/* Candidate rules for `el`: the universal bucket + its tag/id/class buckets. A rule
+ * may be filed under several keys (an :is()/:where() subject), so a per-rule visit
+ * stamp de-dups; selector_match still confirms each (the buckets are a superset). */
+static unsigned g_visit;
 static int collect_candidates(css_sheet *sh, const struct dom_node *el,
                               struct css_rule **out, int cap)
 {
 	ensure_index(sh);
+	unsigned stamp = ++g_visit;
 	int n = 0;
-	for (struct css_rule *r = sh->uni; r && n < cap; r = r->hnext) out[n++] = r;
+#define ADD(rp) do { struct css_rule *rr = (rp); \
+	if (rr->visit != stamp) { rr->visit = stamp; if (n < cap) out[n++] = rr; } } while (0)
+	for (struct css_idx *e = sh->uni; e; e = e->next) ADD(e->rule);
 	if (el->tag[0])
-		for (struct css_rule *r = sh->tag_b[css_hash(el->tag)]; r && n < cap; r = r->hnext)
-			if (streq(r->keystr, el->tag)) out[n++] = r;
+		for (struct css_idx *e = sh->tag_b[css_hash(el->tag)]; e; e = e->next)
+			if (streq(e->key, el->tag)) ADD(e->rule);
 	const char *id = dom_get_attr(el, "id");
 	if (id && id[0]) {
 		char b[24]; key23(id, b);
-		for (struct css_rule *r = sh->id_b[css_hash(b)]; r && n < cap; r = r->hnext)
-			if (streq_ci(r->keystr, b)) out[n++] = r;
+		for (struct css_idx *e = sh->id_b[css_hash(b)]; e; e = e->next)
+			if (streq_ci(e->key, b)) ADD(e->rule);
 	}
 	const char *cl = dom_get_attr(el, "class");
 	if (cl) for (const char *p = cl; *p; ) {
@@ -2380,9 +3162,10 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el,
 		char b[24]; int k = 0;
 		while (*p && *p != ' ' && *p != '\t') { if (k < 23) b[k++] = *p; p++; }
 		b[k] = '\0';
-		if (k) for (struct css_rule *r = sh->cls_b[css_hash(b)]; r && n < cap; r = r->hnext)
-			if (streq(r->keystr, b)) out[n++] = r;
+		if (k) for (struct css_idx *e = sh->cls_b[css_hash(b)]; e; e = e->next)
+			if (streq(e->key, b)) ADD(e->rule);
 	}
+#undef ADD
 	return n;
 }
 
@@ -2459,6 +3242,8 @@ int css_pseudo_content(css_sheet *sh, const struct dom_node *el, int which,
 	}
 	return out->content[0] != '\0';
 }
+
+int css_sheet_has_pseudo(const css_sheet *sh) { return sh && sh->has_pseudo_el; }
 
 void css_apply_attrs(const struct dom_node *el, struct css_style *out)
 {	if (!el || el->type != DOM_ELEMENT) return;
@@ -2566,6 +3351,16 @@ static void sel_text(const struct selector *sel, char *o, int cap)
 		if (st->tag[0]) cm_ap(o, &k, cap, st->tag);
 		if (st->id[0]) { cm_ap(o, &k, cap, "#"); cm_ap(o, &k, cap, st->id); }
 		for (int c = 0; c < st->ncls; c++) { cm_ap(o, &k, cap, "."); cm_ap(o, &k, cap, st->cls[c]); }
+		for (int j = 0; j < st->npc; j++)   /* keep :is()/:where() visible, not a bare * */
+			if (st->pc[j].kind == PC_MATCHES && st->pc[j].list) {
+				cm_ap(o, &k, cap, st->pc[j].a ? ":where(" : ":is(");
+				for (int m = 0; m < st->pc[j].list->n; m++) {
+					if (m) cm_ap(o, &k, cap, ", ");
+					char sub[128]; sel_text(&st->pc[j].list->sels[m], sub, (int)sizeof sub);
+					cm_ap(o, &k, cap, sub);
+				}
+				cm_ap(o, &k, cap, ")");
+			}
 		if (k == start) cm_ap(o, &k, cap, "*");
 	}
 }

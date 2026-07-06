@@ -336,6 +336,7 @@ static int lfn_chars(const uint8_t *e, char *dst, int *term)
  * FAT12/16 fixed root. */
 struct dir_iter {
 	uint32_t cluster;       /* current cluster (0 => fixed root region)      */
+	uint32_t clus_seen;     /* clusters hopped, to break a cyclic chain      */
 	uint32_t sector_in;     /* sector index within the cluster/root region   */
 	uint32_t ent_in;        /* entry index within the current sector         */
 	uint32_t root_left;     /* remaining root sectors (fixed-root mode)      */
@@ -373,6 +374,11 @@ static const uint8_t *diter_next(struct fat_mount *m, struct dir_iter *it)
 				if (it->sector_in == m->sec_per_clus) {
 					uint32_t nxt = fat_next(m, it->cluster);
 					if (nxt < 2 || is_eoc(m, nxt)) { it->done = 1; return NULL; }
+					/* a cyclic/corrupt chain has no EOC: cap hops at the
+					 * cluster count so traversal can't spin forever */
+					if (++it->clus_seen > m->total_clusters + 2) {
+						it->done = 1; return NULL;
+					}
 					it->cluster = nxt;
 					it->sector_in = 0;
 				}
@@ -869,8 +875,9 @@ static int dir_alloc_slot(struct fat_mount *m, uint32_t dir_cluster,
 		return -1;                       /* root directory full */
 	}
 
-	uint32_t c = dir_cluster, prev = 0;
-	while (c >= 2 && c != BAD_CLUSTER && !is_eoc(m, c)) {
+	uint32_t c = dir_cluster, prev = 0, guard = 0;
+	while (c >= 2 && c != BAD_CLUSTER && !is_eoc(m, c) &&
+	       guard++ < m->total_clusters + 2) {   /* cap hops on a cyclic chain */
 		uint32_t first = cluster_first_sector(m, c);
 		for (uint32_t s = 0; s < m->sec_per_clus; s++) {
 			const uint8_t *sec;

@@ -94,9 +94,8 @@ static int http1_exchange(netconn *conn, const char *method, const struct purl *
 	sapp(req, &n, (int)sizeof req, u->path);
 	sapp(req, &n, (int)sizeof req, " HTTP/1.1\r\nHost: ");
 	sapp(req, &n, (int)sizeof req, u->host);
-	sapp(req, &n, (int)sizeof req,
-	     "\r\nUser-Agent: owos-curl\r\nConnection: close\r\n");
-	if (extra_headers)                              /* curl -H lines (\r\n-terminated) */
+	sapp(req, &n, (int)sizeof req, "\r\nConnection: close\r\n");
+	if (extra_headers)                              /* curl -H lines, incl. User-Agent */
 		sapp(req, &n, (int)sizeof req, extra_headers);
 	sapp(req, &n, (int)sizeof req, "\r\n");
 	if (nc_write(conn, req, n) < 0)

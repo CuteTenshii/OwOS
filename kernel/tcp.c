@@ -42,6 +42,7 @@
 #include "timer.h"
 #include "kstring.h"
 #include "sched.h"    /* sched_intr_pending: cooperative Ctrl+C abort */
+#include "entropy.h"  /* unpredictable initial sequence numbers */
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -257,7 +258,8 @@ static void tcp_accept_syn(const uint8_t src[4], const struct tcp_hdr *t)
 		c->peer_ip[i] = src[i];
 	c->lport  = ntohs(t->dport);
 	c->rport  = ntohs(t->sport);
-	uint32_t isn = timer_us();
+	uint32_t isn;
+	entropy_get(&isn, 4);                    /* unpredictable ISN (anti-spoofing)  */
 	c->snd_nxt = isn + 1;                    /* our SYN consumes isn               */
 	c->rcv_nxt = ntohl(t->seq) + 1;          /* their SYN consumes one             */
 	c->wlen    = 0;
@@ -270,9 +272,26 @@ static void tcp_accept_syn(const uint8_t src[4], const struct tcp_hdr *t)
 	tcp_send_ctl(c, TCP_SYN | TCP_ACK, isn);
 }
 
+/* Is `seq` within our current receive window? Used to reject off-path segments
+ * (notably a forged RST) whose sequence number we never advertised. Serial
+ * arithmetic so it survives 32-bit sequence-space wraparound. */
+static int seq_in_rcv_window(const struct tcp_conn *c, uint32_t seq)
+{
+	uint32_t wnd = TCP_RXBUF - (c->wlen - c->rlen);
+	if (wnd == 0)
+		wnd = 1;
+	return (int32_t)(seq - c->rcv_nxt) >= 0 &&
+	       (int32_t)(seq - (c->rcv_nxt + wnd)) < 0;
+}
+
 void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len)
 {
 	if (len < 20)
+		return;
+
+	/* Verify the TCP checksum (pseudo-header + segment). A valid segment folds
+	 * to zero; drop anything that doesn't rather than trusting corrupt bytes. */
+	if (tcp_checksum(src, net_my_ip(), seg, len) != 0)
 		return;
 
 	const struct tcp_hdr *t = (const struct tcp_hdr *)seg;
@@ -290,20 +309,32 @@ void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len)
 
 	uint8_t  flags = t->flags;
 	uint32_t seq   = ntohl(t->seq);
+	uint32_t ack   = ntohl(t->ack);
 	uint32_t hlen  = (uint32_t)(t->off >> 4) * 4;
 	if (hlen < 20 || hlen > len)
 		return;
 	const uint8_t *data = seg + hlen;
 	uint32_t dlen = len - hlen;
 
+	/* Accept a RST only if it fits the connection (RFC 5961): in SYN_SENT it must
+	 * acknowledge our SYN; otherwise its sequence must be inside our receive
+	 * window. This blocks blind off-path reset injection. */
 	if (flags & TCP_RST) {
-		c->reset = 1;
-		c->state = ST_DONE;
+		int ok = (c->state == ST_SYN_SENT)
+		             ? ((flags & TCP_ACK) && ack == c->snd_nxt)
+		             : seq_in_rcv_window(c, seq);
+		if (ok) {
+			c->reset = 1;
+			c->state = ST_DONE;
+		}
 		return;
 	}
 
 	if (c->state == ST_SYN_SENT) {
-		if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
+		/* A SYN|ACK is only ours if it acknowledges the exact SYN we sent —
+		 * without this an off-path SYN|ACK could complete a spoofed handshake. */
+		if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) &&
+		    ack == c->snd_nxt) {
 			c->rcv_nxt = seq + 1;            /* their SYN consumes one seq */
 			c->state   = ST_ESTAB;
 			tcp_send_ctl(c, TCP_ACK, c->snd_nxt);
@@ -317,7 +348,14 @@ void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len)
 			return;
 		}
 		if (flags & TCP_ACK) {                   /* third leg of the handshake   */
+			/* Must acknowledge the exact SYN we sent (snd_nxt == isn+1), matching
+			 * the SYN_SENT path — otherwise an off-path ACK on the right 4-tuple
+			 * could complete a spoofed handshake without echoing our ISN. */
+			if (ack != c->snd_nxt)
+				return;
 			c->state = ST_ESTAB;
+		} else {
+			return;                          /* no ACK: not a valid third leg */
 		}
 		/* fall through: the ACK may piggyback the first data byte(s) */
 	}
@@ -378,7 +416,8 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport)
 	/* Each slot owns a distinct 0x400-wide local-port band, so two live
 	 * connections never collide even if the low bits wrap. */
 	c->lport  = (uint16_t)(0xC000 + slot * 0x400 + (lport_seq++ & 0x3FF));
-	uint32_t isn = timer_us();
+	uint32_t isn;
+	entropy_get(&isn, 4);           /* unpredictable ISN (anti-spoofing)       */
 	c->snd_nxt = isn + 1;           /* our SYN consumes isn                    */
 	c->rcv_nxt = 0;
 	c->wlen    = 0;

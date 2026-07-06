@@ -1,7 +1,7 @@
 /* ast.h — JavaScript abstract syntax tree + arena for the OwOS JS engine.
  *
  * Every node is one `js_node`: a type tag, an operator field (a jtok kind, for
- * the operator nodes), a source line, and a union of the per-type payload. A
+ * the operator nodes), a source line/column, and a union of the per-type payload. A
  * tree-walk interpreter wants uniform, long-lived nodes more than it wants a
  * distinct struct per production, so this is deliberately one tagged union.
  *
@@ -31,7 +31,7 @@ char *js_arena_strndup(js_arena *a, const char *s, int n);
 
 enum js_node_type {
     /* literals & primaries */
-    JS_NUM, JS_STR, JS_REGEX, JS_BOOL, JS_NULL, JS_IDENT, JS_THIS, JS_SUPER,
+    JS_NUM, JS_BIGINT, JS_STR, JS_REGEX, JS_BOOL, JS_NULL, JS_IDENT, JS_THIS, JS_SUPER,
     JS_TEMPLATE, JS_TAGGED_TEMPLATE, JS_ARRAY, JS_OBJECT,
 
     /* operators */
@@ -113,9 +113,17 @@ struct js_node {
     int type;                 /* enum js_node_type                             */
     int op;                   /* jtok kind for UNARY/UPDATE/BINARY/LOGICAL/ASSIGN */
     int line;
+    int col;                  /* 1-based source column, for error locations    */
     union {
         double num;                                   /* NUM; BOOL (0/1)       */
-        struct { const char *s; int len; } str;       /* STR, IDENT, LABELED via str */
+        struct { const char *s; int len;
+                 /* IDENT inline cache: resolves a variable reference to a scope
+                  * position so repeated evaluations skip the scope-chain walk.
+                  * cslot is (entry index + 1), 0 = cold; cdepth = parent hops;
+                  * cgen must match ctx->ident_cache_gen (bumped by direct eval).
+                  * Every hit is revalidated by a key compare at the slot. Fits in
+                  * the union for free (the `func` variant is larger). */
+                 int cdepth, cslot; unsigned cgen; } str;  /* STR, IDENT */
         struct { const char *pattern, *flags; } regex;
 
         struct { js_node **items; int count; } list;  /* PROGRAM/BLOCK/ARRAY/SEQUENCE */
@@ -150,7 +158,7 @@ struct js_node {
     } u;
 };
 
-js_node *js_node_new(js_arena *a, int type, int line);
+js_node *js_node_new(js_arena *a, int type, int line, int col);
 
 /* Render a tree as a compact, parenthesized s-expression into a freshly
  * malloc()'d NUL-terminated string (caller free()s). For tests and debugging;

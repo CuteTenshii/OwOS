@@ -126,15 +126,33 @@ struct catrec {
 	const uint8_t *data;      /* record body (after the key) */
 };
 
-static void parse_rec(struct hfs_mount *m, int i, struct catrec *c)
+/* Parse record `i`, validating every offset against the untrusted node's size.
+ * Returns 0 on success, -1 if any derived pointer would fall outside nodebuf. */
+static int parse_rec(struct hfs_mount *m, int i, struct catrec *c)
 {
+	uint32_t ns = m->node_size;
+	/* the offset array grows down from the node end; entry i needs 2*(i+1) bytes */
+	if ((uint32_t)(2 * (i + 1)) > ns)
+		return -1;
 	uint32_t ro = rec_off(m, i);
+	if (ro + 8 > ns)                             /* keyLen(2)+parent(4)+namelen(2) */
+		return -1;
 	uint16_t keyLen = load_be16(m->nodebuf + ro);
 	c->parent  = load_be32(m->nodebuf + ro + 2);
 	c->namelen = load_be16(m->nodebuf + ro + 6);
 	c->name    = m->nodebuf + ro + 8;
-	c->data    = m->nodebuf + ro + 2 + keyLen;   /* key length excludes its field */
-	c->type    = load_be16(c->data);
+	if ((uint32_t)ro + 8 + (uint32_t)c->namelen * 2 > ns)   /* name units */
+		return -1;
+	uint32_t body = (uint32_t)ro + 2 + keyLen;   /* key length excludes its field */
+	if (body + 2 > ns)                           /* at least the 2-byte type */
+		return -1;
+	c->data = m->nodebuf + body;
+	c->type = load_be16(c->data);
+	/* rec_to_obj reads a folder body to +12 and a file body (fork data) to +168 */
+	uint32_t need = (c->type == 1) ? 12u : (c->type == 2) ? 168u : 0u;
+	if (need && body + need > ns)
+		return -1;
+	return 0;
 }
 
 /* Hidden if the name is empty or begins with a control character -- this skips
@@ -183,9 +201,13 @@ static int for_each_leaf(struct hfs_mount *m,
 			return 0;
 		int nrec = load_be16(m->nodebuf + 10);
 		uint32_t fLink = load_be32(m->nodebuf + 0);
+		/* cap the untrusted record count by the offset array's capacity */
+		if (nrec < 0 || (uint32_t)nrec > m->node_size / 2)
+			nrec = (int)(m->node_size / 2);
 		for (int i = 0; i < nrec; i++) {
 			struct catrec c;
-			parse_rec(m, i, &c);
+			if (parse_rec(m, i, &c) != 0)
+				continue;                 /* malformed record: skip it */
 			int r = visit(m, &c, ctx);
 			if (r)
 				return r;

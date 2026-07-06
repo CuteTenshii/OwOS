@@ -19,7 +19,7 @@
 #include "dom.h"
 #include "css.h"
 
-enum lbox_kind { LB_BLOCK, LB_FLEX, LB_TEXT, LB_REPLACED };
+enum lbox_kind { LB_BLOCK, LB_FLEX, LB_GRID, LB_TEXT, LB_REPLACED };
 
 struct ledge { short t, r, b, l; };   /* margin / border / padding, px (resolved) */
 
@@ -30,7 +30,15 @@ struct lbox {
 	unsigned char    flex_wrap;   /* 0 nowrap / 1 wrap, when kind==LB_FLEX */
 	signed char      justify;     /* enum css_justify (main axis), or -1   */
 	signed char      align_items; /* enum css_align (cross axis), or -1    */
-	short            gap_row, gap_col; /* flex gaps, px (0 if unset)       */
+	short            gap_row, gap_col; /* flex/grid gaps, px (0 if unset)  */
+	/* CSS grid (kind==LB_GRID container / any item). n_cols/n_rows are the explicit
+	 * template counts (<=0 = none); grid_flow 0 row / 1 column; col_span/row_span
+	 * >=1 (item's cell span); justify_items enum css_align (-1 unset). */
+	signed char      grid_flow;
+	signed char      n_cols, n_rows;
+	signed char      col_span, row_span;
+	signed char      justify_items;
+	struct css_track cols_t[CSS_GRID_MAX], rows_t[CSS_GRID_MAX];
 	signed char      pos;         /* enum css_pos, or -1 (static/unset)   */
 	signed char      overflow;    /* 0 visible / 1 clipped / -1 unset     */
 

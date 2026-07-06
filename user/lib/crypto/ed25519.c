@@ -246,8 +246,10 @@ void ed25519_sign(uint8_t sig[64], const uint8_t *m, uint32_t n,
 
 	/* SSH only ever signs the 32-byte exchange hash, so n is tiny; a fixed
 	 * scratch (sized for n <= 64) avoids the heap. sshd serves one client at a
-	 * time, so the statics are safe. */
+	 * time, so the statics are safe. Refuse anything larger rather than let the
+	 * message copies at sc[64+i]/sc[32+i] run off the buffer. */
 	static u8 sc[64 + 64];                   /* prefix(32)||m  or  R(32)||A(32)||m */
+	if (n > 64) return;
 
 	crypto_hash(d, seed, 32);
 	d[0] &= 248; d[31] &= 127; d[31] |= 64;  /* d[0..32] = scalar a; d[32..] = prefix */
@@ -283,6 +285,8 @@ int ed25519_verify(const uint8_t sig[64], const uint8_t *m, uint32_t n,
 	u8 h[64], t[32];
 	gf p[4], q[4];
 	u64 i;
+
+	if (n > 64) return -1;   /* sm2[64+i] copy is bounded to a 128-byte scratch */
 
 	/* unpack A into q */
 	{

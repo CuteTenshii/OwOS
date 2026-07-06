@@ -8,8 +8,10 @@
 #include "headers.h"   /* HTTP response headers (iframe X-Frame-Options / CSP)  */
 #include "cache.h"     /* the HTTP response cache (RFC 7234, honours headers)   */
 #include "cors.h"      /* CORS request orchestration + CORP sub-resource guard  */
-#include "svg.h"       /* SVG -> ARGB rasterizer (favicons, inline images) */
-#include "webp.h"      /* WebP (lossless VP8L) -> RGBA decoder              */
+#include "svg.h"       /* SVG -> ARGB rasterizer (favicon path) */
+#include "imgdec.h"    /* shared image decoder (SVG/WebP/PNG) for <img> */
+#include "base64.h"    /* shared base64 for data: URL decoding */
+#include "clienthints.h" /* Accept-CH: per-origin Client Hints opt-in        */
 
 /* The origin that owns the sub-resources currently being fetched (the page, set
  * by do_fetch). Cross-origin no-cors loads are checked against it for CORP. */
@@ -62,6 +64,126 @@ static int body_put(unsigned char **body, int *cap, int *blen, int c)
 	return 0;
 }
 
+/* Grow *body (doubling, capped at RAW_MAX) so it holds at least `need` bytes.
+ * Returns the resulting capacity, which is < need only when the cap or OOM stops
+ * the growth. */
+static int body_reserve(unsigned char **body, int *cap, int need)
+{
+	if (need <= *cap) return *cap;
+	int ncap = *cap;
+	while (ncap < need) {
+		if (ncap >= (int)RAW_MAX) { ncap = RAW_MAX; break; }
+		ncap *= 2;
+		if (ncap > (int)RAW_MAX) ncap = RAW_MAX;
+	}
+	if (ncap > *cap) {
+		unsigned char *nb = realloc(*body, (unsigned)ncap);
+		if (!nb) return *cap;
+		*body = nb; *cap = ncap;
+	}
+	return *cap;
+}
+
+/* Bulk-copy up to `want` body bytes from the reader into *body, taking whole
+ * buffered runs (memcpy) instead of a call per byte. Refills from the socket as
+ * needed. Returns the count copied; short of `want` means EOF or the RAW_MAX cap. */
+static long ir_drain(struct ireader *r, unsigned char **body, int *cap, int *blen, long want)
+{
+	long done = 0;
+	while (done < want) {
+		if (r->pos >= r->len) {
+			if (r->eof) break;
+			int n = nc_read(r->conn, r->buf, (int)sizeof r->buf);
+			if (n <= 0) { r->eof = 1; break; }
+			r->pos = 0; r->len = n;
+		}
+		long avail = r->len - r->pos, need = want - done;
+		int run = (int)(avail < need ? avail : need);
+		int room = body_reserve(body, cap, *blen + run);
+		if (room < *blen + run) run = room - *blen;    /* cap/OOM: take what fits */
+		if (run <= 0) break;
+		memcpy(*body + *blen, r->buf + r->pos, (unsigned)run);
+		r->pos += run; *blen += run; done += run;
+		if (*blen >= (int)RAW_MAX && done < want) break;   /* hit the hard cap */
+	}
+	return done;
+}
+
+/* Read a response header block (up to the blank line) into `hdr`, NUL-terminated.
+ * Returns its length, or -1 if the connection closed before the block completed. */
+static int ir_read_header_block(struct ireader *r, char *hdr, int cap)
+{
+	int hl = 0, m = 0;
+	for (;;) {
+		int c = ir_getc(r);
+		if (c < 0) return -1;
+		if (hl < cap - 1) hdr[hl++] = (char)c;
+		if      (c == '\r') m = (m == 2) ? 3 : 1;
+		else if (c == '\n') m = (m == 1) ? 2 : (m == 3 ? 4 : 0);
+		else                m = 0;
+		if (m == 4) break;
+	}
+	hdr[hl] = '\0';
+	return hl;
+}
+
+/* Pump up to `want` body bytes from the reader to `sink` (whole buffered runs at
+ * a time), refilling from the socket as needed. `want < 0` means read to close.
+ * Returns the count pumped (short of `want` = EOF), or -1 if the sink aborts. */
+static long ir_pump_n(struct ireader *r, long want, http_body_fn sink, void *ctx)
+{
+	long done = 0;
+	while (want < 0 || done < want) {
+		if (r->pos >= r->len) {
+			if (r->eof) break;
+			int n = nc_read(r->conn, r->buf, (int)sizeof r->buf);
+			if (n <= 0) { r->eof = 1; break; }
+			r->pos = 0; r->len = n;
+		}
+		long avail = r->len - r->pos;
+		long need  = (want < 0) ? avail : (want - done);
+		int  run   = (int)(avail < need ? avail : need);
+		if (run <= 0) break;
+		if (sink(ctx, r->buf + r->pos, run)) return -1;
+		r->pos += run; done += run;
+	}
+	return done;
+}
+
+/* Stream a response's framed body (chunked / content-length / read-to-close) to
+ * `sink`, undoing the transfer framing. Returns the content byte count, or -1 if
+ * the sink aborts (a disk error). `clen < 0` with !chunked means read to close. */
+static long ir_pump_body(struct ireader *r, int chunked, long clen,
+                         http_body_fn sink, void *ctx)
+{
+	long total = 0;
+	if (chunked) {
+		for (;;) {
+			unsigned sz = 0; int c, any = 0;
+			while ((c = ir_getc(r)) >= 0 && c != '\r' && c != ';') {
+				int d;
+				if      (c >= '0' && c <= '9') d = c - '0';
+				else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+				else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+				else break;
+				sz = sz * 16 + (unsigned)d; any = 1;
+			}
+			while (c >= 0 && c != '\n') c = ir_getc(r);
+			if (!any || sz == 0) break;
+			long got = ir_pump_n(r, (long)sz, sink, ctx);
+			if (got < 0) return -1;
+			total += got;
+			if (got != (long)sz) break;              /* short: connection died */
+			c = ir_getc(r); if (c == '\r') ir_getc(r);   /* trailing CRLF */
+		}
+	} else {
+		long got = ir_pump_n(r, clen >= 0 ? clen : -1, sink, ctx);
+		if (got < 0) return -1;
+		total += got;
+	}
+	return total;
+}
+
 /* Response line/header facts a sub-resource fetch needs: the status code and a
  * Location (for redirects). */
 struct resp_meta { int status; char location[URL_MAX]; char ctype[160]; };
@@ -112,17 +234,8 @@ static void parse_resp_headers(const char *hdr, struct resp_meta *meta, int *chu
 static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp_meta *meta,
                                      char *hdr_out, int hdr_cap)
 {
-	char hdr[RESP_HDR_MAX]; int hl = 0, m = 0;
-	for (;;) {
-		int c = ir_getc(r);
-		if (c < 0) return 0;
-		if (hl < (int)sizeof hdr - 1) hdr[hl++] = (char)c;
-		if      (c == '\r') m = (m == 2) ? 3 : 1;
-		else if (c == '\n') m = (m == 1) ? 2 : (m == 3 ? 4 : 0);
-		else                m = 0;
-		if (m == 4) break;
-	}
-	hdr[hl] = '\0';
+	char hdr[RESP_HDR_MAX];
+	if (ir_read_header_block(r, hdr, (int)sizeof hdr) < 0) return 0;
 	if (hdr_out && hdr_cap > 0) {           /* hand the raw block to the caller */
 		int k = 0; for (; hdr[k] && k < hdr_cap - 1; k++) hdr_out[k] = hdr[k]; hdr_out[k] = '\0';
 	}
@@ -148,18 +261,12 @@ static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp
 			}
 			while (c >= 0 && c != '\n') c = ir_getc(r);
 			if (!any || sz == 0) break;
-			for (unsigned k = 0; k < sz; k++) {
-				c = ir_getc(r);
-				if (c < 0 || body_put(&body, &cap, &blen, c) < 0) goto done;
-			}
+			if (ir_drain(r, &body, &cap, &blen, (long)sz) != (long)sz) goto done;
 			c = ir_getc(r); if (c == '\r') ir_getc(r);   /* trailing CRLF */
 		}
 	} else {
 		long limit = (clen >= 0) ? clen : (long)RAW_MAX;
-		while (blen < limit) {
-			int c = ir_getc(r);
-			if (c < 0 || body_put(&body, &cap, &blen, c) < 0) break;
-		}
+		ir_drain(r, &body, &cap, &blen, limit);
 	}
 done:
 	*outlen = blen;
@@ -224,11 +331,13 @@ static void build_request(char *req, int *n, int cap, const struct purl *u,
 		sapp(req, n, cap, ":"); uapp(req, n, cap, (unsigned)u->port);
 	}
 	if (!rq->no_cookies) { char ck[1024]; if (cookie_header(u->host, ck, sizeof ck) > 0) { sapp(req, n, cap, "\r\nCookie: "); sapp(req, n, cap, ck); } }
-	sapp(req, n, cap, "\r\nUser-Agent: " BR_UA "\r\nAccept: ");
+	sapp(req, n, cap, "\r\nUser-Agent: "); sapp(req, n, cap, browser_ua());
+	sapp(req, n, cap, "\r\nAccept: ");
 	sapp(req, n, cap, accept);
 	if (rq->ctype && rq->ctype[0]) { sapp(req, n, cap, "\r\nContent-Type: "); sapp(req, n, cap, rq->ctype); }
 	if (rq->body_len > 0) { sapp(req, n, cap, "\r\nContent-Length: "); uapp(req, n, cap, (unsigned)rq->body_len); }
 	sapp(req, n, cap, "\r\nConnection: close\r\n");
+	{ char ch[512]; if (ch_request_headers(u->host, ch, sizeof ch) > 0) sapp(req, n, cap, ch); }
 	if (rq->extra_hdrs && rq->extra_hdrs[0]) sapp(req, n, cap, rq->extra_hdrs);   /* caller-supplied, each "Name: value\r\n" */
 	sapp(req, n, cap, "\r\n");
 }
@@ -248,12 +357,21 @@ static int h2buf_cb(void *ctx, const unsigned char *p, int n)
  * that needs more than status+ctype (the iframe path reads X-Frame-Options/CSP,
  * the CORS path reads Access-Control-*) get them without a second request. NULL on
  * a connection/OOM error. Worker-thread only. */
-unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
+/* Log an unfinished request as cancelled (the user stopped the load) or failed (a
+ * connectivity / transport error), resolving the in-flight row `id`. */
+static void net_fail(int id, const char *method, const char *url)
+{
+	struct net_log e = { method, url, 0, 0, 0, 0, 0,
+	                     B->abort_load ? NET_CANCELLED : NET_FAILED,
+	                     B->abort_load ? 0 : "Load failed" };
+	devtools_net_update(id, &e);
+}
+
+static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_resp *rs)
 {
 	const char *method = (rq->method && rq->method[0]) ? rq->method : "GET";
 	const char *accept = (rq->accept && rq->accept[0]) ? rq->accept : "*/*";
 	int is_get = streq_ci(method, "GET") || streq_ci(method, "HEAD");
-	unsigned t0 = msec();          /* devtools Network duration of this exchange */
 	char full[URL_MAX]; { int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, rq->url); }
 
 	rs->status = 0; rs->len = 0; rs->ctype[0] = '\0';
@@ -279,8 +397,6 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 		if (cv == CACHE_FRESH) {
 			rs->status = 200; rs->len = clen;
 			if (rs->final_url && rs->final_cap) { int k = 0; sapp(rs->final_url, &k, rs->final_cap, origurl); }
-			struct net_log e = { method, origurl, 200, rs->ctype, clen, 0, rs->hdr };
-			devtools_net_add(&e);
 			return cbody;
 		}
 		if (cv == CACHE_REVALIDATE) {
@@ -313,9 +429,10 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 			char xh[1408]; int xn = 0; char ck[1024];
 			if (!rq->no_cookies && cookie_header(u.host, ck, sizeof ck) > 0) { sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n"); }
 			sapp(xh, &xn, sizeof xh, "accept: "); sapp(xh, &xn, sizeof xh, accept); sapp(xh, &xn, sizeof xh, "\r\n");
+			{ char ch[512]; if (ch_request_headers(u.host, ch, sizeof ch) > 0) sapp(xh, &xn, sizeof xh, ch); }
 			if (rq->ctype && rq->ctype[0]) { sapp(xh, &xn, sizeof xh, "content-type: "); sapp(xh, &xn, sizeof xh, rq->ctype); sapp(xh, &xn, sizeof xh, "\r\n"); }
 			if (rq->extra_hdrs && rq->extra_hdrs[0]) h2_append_headers(xh, &xn, sizeof xh, rq->extra_hdrs);
-			struct h2_opts opts = { BR_UA, xh, 0 };
+			struct h2_opts opts = { browser_ua(), xh, 0 };
 			struct h2buf hb; hb.cap = 65536; hb.blen = 0; hb.body = malloc((unsigned)hb.cap);
 			if (!hb.body) { nc_close(conn); return 0; }
 			int hlen = 0;
@@ -355,8 +472,6 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 				free(body);
 				rs->status = 200; rs->len = rl;
 				if (rs->final_url && rs->final_cap) { int k = 0; sapp(rs->final_url, &k, rs->final_cap, origurl); }
-				struct net_log e = { method, origurl, 304, rs->ctype, rl, (int)(msec() - t0), rawhdr };
-				devtools_net_add(&e);
 				return rb;
 			}
 			/* Entry vanished (evicted mid-flight): fall through and hand back the
@@ -371,12 +486,208 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 		{ int k = 0; rs->ctype[0] = '\0'; sapp(rs->ctype, &k, sizeof rs->ctype, meta.ctype); }
 		if (rs->final_url && rs->final_cap) { int k = 0; sapp(rs->final_url, &k, rs->final_cap, full); }
 		if (rs->hdr && rs->hdr_cap) { int k = 0; for (; rawhdr[k] && k < rs->hdr_cap - 1; k++) rs->hdr[k] = rawhdr[k]; rs->hdr[k] = '\0'; }
-		{ struct net_log e = { method, full, meta.status, meta.ctype, blen,
-		                       (int)(msec() - t0), rawhdr };
-		  devtools_net_add(&e); }
 		return body;
 	}
 	return 0;
+}
+
+/* Public transport entry. browser_fetch_raw does the HTTP work; this frames every
+ * request in the devtools Network panel: an in-flight (pending) row logged the
+ * moment it starts, resolved to done / failed / cancelled when raw returns — so a
+ * request shows while loading and however it ends, not only on success. */
+unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
+{
+	const char *method = (rq->method && rq->method[0]) ? rq->method : "GET";
+	unsigned t0 = msec();
+	int nid = devtools_net_begin(method, rq->url);
+	unsigned char *body = browser_fetch_raw(rq, rs);
+	if (body) {
+		const char *url = (rs->final_url && rs->final_cap && rs->final_url[0])
+		                  ? rs->final_url : rq->url;
+		struct net_log e = { method, url, rs->status, rs->ctype, rs->len,
+		                     (int)(msec() - t0), rs->hdr, NET_DONE, 0 };
+		devtools_net_update(nid, &e);
+	} else {
+		net_fail(nid, method, rq->url);
+	}
+	return body;
+}
+
+/* A body sink over the open owofs write stream: append each run, tracking the
+ * total and latching a disk error (which aborts the pump). */
+struct filesink { long written; int err; };
+static int filesink_cb(void *ctx, const unsigned char *p, int n)
+{
+	struct filesink *f = ctx;
+	if (n <= 0) return 0;
+	if (stream_write(p, n) < 0) { f->err = 1; return 1; }   /* abort the pump */
+	f->written += n;
+	return 0;
+}
+
+/* HTTP/2 media streaming: the h2 engine delivers the response headers (once,
+ * before any DATA) to mstream_headers, then each DATA payload to mstream_body.
+ * On a 2xx the header hook opens the disk stream so DATA writes straight to it;
+ * a redirect is noted (its target resolved) and its body discarded. */
+struct mstream {
+	const char *file;      /* temp path to stream a 2xx body into        */
+	const char *full;      /* current request URL (for Location resolve) */
+	char       *loc; int loc_cap;
+	struct filesink fs;
+	int   status;
+	int   began;           /* stream_begin done (a 2xx is being written) */
+	int   redirect;        /* saw a 3xx with a Location                  */
+	char  ctype[160];
+};
+static int mstream_headers(void *ctx, const char *block, int len)
+{
+	(void)len;
+	struct mstream *m = ctx;
+	struct resp_meta meta; int ch; long cl;
+	parse_resp_headers(block, &meta, &ch, &cl);
+	m->status = meta.status;
+	{ int k = 0; for (; meta.ctype[k] && k < (int)sizeof m->ctype - 1; k++) m->ctype[k] = meta.ctype[k]; m->ctype[k] = '\0'; }
+	if (is_redirect(meta.status) && meta.location[0]) {
+		m->redirect = 1;
+		resolve_url(m->full, meta.location, m->loc, m->loc_cap);
+	} else if (meta.status >= 200 && meta.status < 300 && !m->began && !m->fs.err) {
+		if (stream_begin(m->file) == 0) m->began = 1; else m->fs.err = 1;
+	}
+	return 0;
+}
+static int mstream_body(void *ctx, const unsigned char *p, int n)
+{
+	struct mstream *m = ctx;
+	if (m->began && !m->fs.err) return filesink_cb(&m->fs, p, n);
+	return 0;                                    /* redirect / error body: discard */
+}
+
+long browser_fetch_media(const char *url, const char *accept, const char *file, int *status)
+{
+	char full[URL_MAX]; { int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, url); }
+	if (!accept || !accept[0]) accept = "*/*";
+	if (status) *status = 0;
+	unsigned t0 = msec();
+	int nid = devtools_net_begin("GET", full);   /* in-flight until the download resolves */
+
+	for (int hop = 0; hop <= MAX_REDIR; hop++) {
+		struct purl u;
+		if (!parse_url(full, &u)) { net_fail(nid, "GET", full); return -1; }
+		if (!u.tls && hsts_has(u.host)) { u.tls = 1; if (u.port == 80) u.port = 443; }
+
+		/* Offer h2 like every other sub-resource load: whichever the server picks,
+		 * the body streams straight to disk (h2 via the DATA callback, h1.1 via the
+		 * framed body pump). h3 is document-only in this browser, so media matches
+		 * the h2/h1.1 sub-resource path. */
+		netconn *conn = nc_open(u.host, u.port, u.tls, /*offer_h2=*/1);
+		if (!conn) { net_fail(nid, "GET", full); return -1; }
+
+		if (u.tls && nc_alpn(conn) == ALPN_H2) {
+			/* HTTP/2: :authority + lowercased headers, DATA streamed to disk by the
+			 * mstream callbacks. No Connection/Transfer-Encoding (forbidden in h2). */
+			char auth[URL_HOST_MAX + 8]; int an = 0;
+			sapp(auth, &an, sizeof auth, u.host);
+			if (u.port != 443) { sapp(auth, &an, sizeof auth, ":"); uapp(auth, &an, sizeof auth, (unsigned)u.port); }
+			char xh[1408]; int xn = 0; char ck[1024];
+			if (cookie_header(u.host, ck, sizeof ck) > 0) {
+				sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n"); }
+			sapp(xh, &xn, sizeof xh, "accept: "); sapp(xh, &xn, sizeof xh, accept); sapp(xh, &xn, sizeof xh, "\r\n");
+			{ char ch[512]; if (ch_request_headers(u.host, ch, sizeof ch) > 0) sapp(xh, &xn, sizeof xh, ch); }
+			sapp(xh, &xn, sizeof xh, "accept-encoding: identity\r\nrange: bytes=0-\r\n");
+
+			char rawhdr[RESP_HDR_MAX]; rawhdr[0] = '\0';
+			char loc[URL_MAX]; loc[0] = '\0';
+			struct mstream m = { file, full, loc, sizeof loc, { 0, 0 }, 0, 0, 0, { 0 } };
+			struct h2_opts opts = { browser_ua(), xh, mstream_headers };
+			int hlen = 0;
+			int rc = h2_run(conn, 1, auth, "GET", u.path, &opts,
+			                rawhdr, sizeof rawhdr, &hlen, mstream_body, &m);
+			nc_close(conn);
+
+			if (m.redirect && !m.began) {           /* follow the redirect */
+				int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, loc);
+				continue;
+			}
+			if (status) *status = m.status;
+			if (rc < 0 || m.fs.err) {               /* stream reset or disk error */
+				if (m.began) stream_end();
+				net_fail(nid, "GET", full);
+				return -1;
+			}
+			if (!m.began) {                         /* a real non-2xx response */
+				struct net_log e = { "GET", full, m.status, m.ctype, 0,
+				                     (int)(msec() - t0), rawhdr, NET_DONE, 0 };
+				devtools_net_update(nid, &e);
+				return -1;
+			}
+			long committed = stream_end();
+			if (committed < 0) { net_fail(nid, "GET", full); return -1; }
+			struct net_log e = { "GET", full, m.status, m.ctype, (int)committed,
+			                     (int)(msec() - t0), rawhdr, NET_DONE, 0 };
+			devtools_net_update(nid, &e);
+			return committed;
+		}
+
+		/* GET with an open-ended Range so a partial-content server answers 206;
+		 * identity coding so the body writes to disk verbatim (media is already
+		 * compressed and this path does not decode Content-Encoding). */
+		char req[2048]; int n = 0;
+		sapp(req, &n, sizeof req, "GET "); sapp(req, &n, sizeof req, u.path);
+		sapp(req, &n, sizeof req, " HTTP/1.1\r\nHost: "); sapp(req, &n, sizeof req, u.host);
+		if (!((u.tls && u.port == 443) || (!u.tls && u.port == 80))) {
+			sapp(req, &n, sizeof req, ":"); uapp(req, &n, sizeof req, (unsigned)u.port);
+		}
+		{ char ck[1024]; if (cookie_header(u.host, ck, sizeof ck) > 0) {
+			sapp(req, &n, sizeof req, "\r\nCookie: "); sapp(req, &n, sizeof req, ck); } }
+		sapp(req, &n, sizeof req, "\r\nUser-Agent: "); sapp(req, &n, sizeof req, browser_ua());
+		sapp(req, &n, sizeof req, "\r\nAccept: ");
+		sapp(req, &n, sizeof req, accept);
+		{ char ch[512]; if (ch_request_headers(u.host, ch, sizeof ch) > 0) sapp(req, &n, sizeof req, ch); }
+		sapp(req, &n, sizeof req,
+		     "\r\nAccept-Encoding: identity\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n");
+		if (nc_write(conn, req, n) < 0) { nc_close(conn); net_fail(nid, "GET", full); return -1; }
+
+		struct ireader r = { conn, { 0 }, 0, 0, 0 };
+		char rawhdr[RESP_HDR_MAX];
+		if (ir_read_header_block(&r, rawhdr, sizeof rawhdr) < 0) { nc_close(conn); net_fail(nid, "GET", full); return -1; }
+		struct resp_meta meta; int chunked; long clen;
+		parse_resp_headers(rawhdr, &meta, &chunked, &clen);
+
+		if (is_redirect(meta.status) && meta.location[0]) {
+			char next[URL_MAX];
+			resolve_url(full, meta.location, next, sizeof next);
+			int k = 0; full[0] = '\0'; sapp(full, &k, sizeof full, next);
+			nc_close(conn);
+			continue;
+		}
+		if (status) *status = meta.status;
+		if (meta.status < 200 || meta.status >= 300) {
+			nc_close(conn);
+			/* A real HTTP response arrived (4xx/5xx): record it as completed with its
+			 * status, not a connectivity failure. */
+			struct net_log e = { "GET", full, meta.status, meta.ctype, 0,
+			                     (int)(msec() - t0), rawhdr, NET_DONE, 0 };
+			devtools_net_update(nid, &e);
+			return -1;
+		}
+
+		/* 2xx (200 whole-body or 206 partial): stream the body straight to disk.
+		 * stream_begin is deferred to here so a redirect chain reserves no disk. */
+		if (stream_begin(file) != 0) { nc_close(conn); net_fail(nid, "GET", full); return -1; }
+		struct filesink fs = { 0, 0 };
+		long got = ir_pump_body(&r, chunked, clen, filesink_cb, &fs);
+		nc_close(conn);
+		if (got < 0 || fs.err) { stream_end(); net_fail(nid, "GET", full); return -1; }   /* commit-close, then fail */
+		long committed = stream_end();
+		if (committed < 0) { net_fail(nid, "GET", full); return -1; }
+
+		{ struct net_log e = { "GET", full, meta.status, meta.ctype, (int)committed,
+		                       (int)(msec() - t0), rawhdr, NET_DONE, 0 };
+		  devtools_net_update(nid, &e); }
+		return committed;
+	}
+	net_fail(nid, "GET", full);
+	return -1;
 }
 
 /* The CORS transport for fetch()/XMLHttpRequest. A same-origin request behaves
@@ -646,16 +957,7 @@ static int rhex(int c)
 	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
 	return -1;
 }
-static int rb64(int c)
-{
-	if (c >= 'A' && c <= 'Z') return c - 'A';
-	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-	if (c >= '0' && c <= '9') return c - '0' + 52;
-	if (c == '+') return 62;
-	if (c == '/') return 63;
-	return -1;
-}
-static unsigned char *decode_data_url(const char *url, int *outlen, char *ctype, int cap)
+unsigned char *decode_data_url(const char *url, int *outlen, char *ctype, int cap)
 {
 	const char *p = url + 5;                          /* past "data:" */
 	const char *comma = p;
@@ -675,27 +977,26 @@ static unsigned char *decode_data_url(const char *url, int *outlen, char *ctype,
 	{ int k = 0; ctype[0] = '\0'; sapp(ctype, &k, cap, mt[0] ? mt : "text/plain"); }
 
 	const char *d = comma + 1;
-	int cap2 = 4096, len = 0;
+	if (base64) {                                     /* shared base64 decoder */
+		int plen = (int)strlen(d);
+		unsigned char *out = malloc((unsigned)(base64_decoded_cap(plen) + 1));
+		if (!out) return 0;
+		int m = base64_decode(d, plen, out);
+		if (m < 0) { free(out); return 0; }
+		*outlen = m;
+		return out;
+	}
+	int cap2 = 4096, len = 0;                          /* percent-decode into a growable buffer */
 	unsigned char *out = malloc((unsigned)cap2);
 	if (!out) return 0;
-	if (base64) {
-		int acc = 0, nb = 0;
-		for (; *d && *d != '='; d++) {
-			int v = rb64((unsigned char)*d);
-			if (v < 0) continue;
-			acc = (acc << 6) | v; nb += 6;
-			if (nb >= 8) { nb -= 8; if (body_put(&out, &cap2, &len, (acc >> nb) & 0xff) < 0) break; }
+	for (; *d; d++) {
+		int c = (unsigned char)*d;
+		if (c == '%') {
+			int hi = rhex((unsigned char)d[1]);
+			int lo = hi < 0 ? -1 : rhex((unsigned char)d[2]);
+			if (lo >= 0) { c = hi * 16 + lo; d += 2; }
 		}
-	} else {
-		for (; *d; d++) {
-			int c = (unsigned char)*d;
-			if (c == '%') {
-				int hi = rhex((unsigned char)d[1]);
-				int lo = hi < 0 ? -1 : rhex((unsigned char)d[2]);
-				if (lo >= 0) { c = hi * 16 + lo; d += 2; }
-			}
-			if (body_put(&out, &cap2, &len, c) < 0) break;
-		}
+		if (body_put(&out, &cap2, &len, c) < 0) break;
 	}
 	*outlen = len;
 	return out;
@@ -872,11 +1173,15 @@ static void subres_job(void *vctx, int i)
 			sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n");
 		}
 		sapp(xh, &xn, sizeof xh, "accept: "); sapp(xh, &xn, sizeof xh, c->accept); sapp(xh, &xn, sizeof xh, "\r\n");
-		struct h2_opts o = { BR_UA, xh, 0 };
+		{ char ch[512]; if (ch_request_headers(u.host, ch, sizeof ch) > 0) sapp(xh, &xn, sizeof xh, ch); }
+		struct h2_opts o = { browser_ua(), xh, 0 };
 		h2_fetch_many(conn, 1, auth, &o, reqs, ng, 0, 0);   /* accumulate */
 		nc_close(conn);
 		for (int g = 0; g < ng; g++) {
-			if (!reqs[g].failed && reqs[g].body) {
+			/* Only a 200 body is usable; a non-200 (redirect/error) is dropped
+			 * and retried over h1.1, exactly as the single-request subres_get
+			 * path treats it (subres_get returns NULL for any non-200). */
+			if (!reqs[g].failed && reqs[g].status == 200 && reqs[g].body) {
 				c->bodies[grp[g]] = reqs[g].body; c->lens[grp[g]] = reqs[g].blen;
 				if (reqs[g].hdr && reqs[g].hdrlen > 0)      /* cache the fetched 200 */
 					cache_store("GET", c->urls[grp[g]], reqs[g].status, now,
@@ -914,6 +1219,17 @@ void subres_get_batch(char *const *urls, int n, const char *accept,
 	if (!handled) {                          /* OOM: degrade to one fetch at a time */
 		for (int i = 0; i < n; i++) bodies[i] = subres_get(urls[i], accept, &lens[i]);
 		return;
+	}
+
+	/* data: URLs decode inline (no network, no origin) — the fetch groups below key
+	 * on origin_of, which rejects data:, so a data: sub-resource (e.g. a background
+	 * image) would otherwise never produce a body. Mark handled even on failure. */
+	for (int i = 0; i < n; i++) {
+		if (starts_ci(urls[i], "data:")) {
+			char ct[64];
+			bodies[i] = decode_data_url(urls[i], &lens[i], ct, sizeof ct);
+			handled[i] = 1;
+		}
 	}
 
 	/* Serve fresh cache hits up front (single-threaded here, before the pool):
@@ -980,55 +1296,26 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
 {
 	struct inl_img *im = &B->pg->imgs[idx];
 
-	if (svg_probe((const char *)body, blen)) {         /* SVG -> rasterize to RGBA */
-		int sw = 0, sh = 0;
-		if (!svg_size((const char *)body, blen, &sw, &sh) || sw <= 0 || sh <= 0) { sw = 128; sh = 128; }
-		int maxe = sw > sh ? sw : sh;                  /* bound source resolution  */
-		if (maxe > 256) { sw = sw * 256 / maxe; sh = sh * 256 / maxe; }
-		if (sw < 1) sw = 1;
-		if (sh < 1) sh = 1;
-		unsigned *argb = malloc((unsigned)sw * sh * 4);
-		if (argb && svg_render((const char *)body, blen, sw, sh, argb, current_color)) {
-			int bytes = sw * sh * 4;
+	/* SVG / WebP -> decode to RGBA in the shared pool. The shared decoder produces
+	 * RGBA bytes; ww/hh are decoder-controlled, so size the copy in 64-bit and reject
+	 * absurd dimensions before touching the pool (no 32-bit wrap past the bound). */
+	if (image_sniff(body, blen) != IMG_FMT_PNG) {
+		unsigned ww = 0, hh = 0;
+		unsigned char *rgba = image_decode_rgba(body, blen, current_color, 256, &ww, &hh);
+		if (rgba) {
+			long long bytes = (long long)ww * hh * 4;
 			int off = -1;
 			img_lock();
-			if (B->img_pool_len + bytes <= IMG_POOL) { off = B->img_pool_len; B->img_pool_len += bytes; }
-			img_unlock();
-			if (off >= 0) {
-				unsigned char *dst = B->img_pool + off;   /* ARGB int -> RGBA bytes */
-				for (int i = 0; i < sw * sh; i++) {
-					unsigned p = argb[i];
-					dst[i*4+0] = (p >> 16) & 0xff;
-					dst[i*4+1] = (p >> 8) & 0xff;
-					dst[i*4+2] = p & 0xff;
-					dst[i*4+3] = (p >> 24) & 0xff;
-				}
-				im->coff = off; im->clen = bytes;
-				im->iw = (unsigned)sw; im->ih = (unsigned)sh;
-				im->is_argb = 1;
-				im->ok = 1;                /* set last: the UI draws once ok is seen */
-				B->seq++;
+			if (ww && hh && ww <= 16384 && hh <= 16384 &&
+			    bytes <= (long long)(IMG_POOL - B->img_pool_len)) {
+				off = B->img_pool_len; B->img_pool_len += (int)bytes;
 			}
-		}
-		free(argb);
-		return;
-	}
-
-	if (blen >= 12 && body[0] == 'R' && body[1] == 'I' && body[2] == 'F' &&
-	    body[3] == 'F' && body[8] == 'W' && body[9] == 'E' && body[10] == 'B' &&
-	    body[11] == 'P') {                             /* WebP -> decode to RGBA */
-		unsigned char *rgba; unsigned ww = 0, hh = 0;
-		if (webp_decode(body, blen, &rgba, &ww, &hh) == WEBP_OK) {
-			int bytes = (int)(ww * hh * 4u);
-			int off = -1;
-			img_lock();
-			if (B->img_pool_len + bytes <= IMG_POOL) { off = B->img_pool_len; B->img_pool_len += bytes; }
 			img_unlock();
 			if (off >= 0) {
 				memcpy(B->img_pool + off, rgba, (unsigned)bytes);
-				im->coff = off; im->clen = bytes;
+				im->coff = off; im->clen = (int)bytes;
 				im->iw = ww; im->ih = hh;
-				im->is_argb = 1;          /* raw RGBA, like the SVG path */
+				im->is_argb = 1;          /* raw RGBA */
 				im->ok = 1;               /* set last: the UI draws once ok is seen */
 				B->seq++;
 			}
@@ -1038,7 +1325,7 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
 	}
 
 	if (blen >= 8 && body[0] == 0x89 && body[1] == 'P' &&
-	    body[2] == 'N' && body[3] == 'G') {            /* PNG only */
+	    body[2] == 'N' && body[3] == 'G') {            /* PNG stored verbatim (lazy decode) */
 		struct memrd mr = { body, 0, blen };
 		unsigned iw = 0, ih = 0;
 		int okdim = (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih);
@@ -1190,7 +1477,8 @@ static void h2_prefetch(const char *page_url)
 		sapp(xh, &xn, sizeof xh, "\r\n");
 	}
 	sapp(xh, &xn, sizeof xh, "accept: image/png,image/webp,image/svg+xml,*/*\r\n");
-	struct h2_opts opts = { BR_UA, xh, 0 };
+	{ char ch[512]; if (ch_request_headers(pu.host, ch, sizeof ch) > 0) sapp(xh, &xn, sizeof xh, ch); }
+	struct h2_opts opts = { browser_ua(), xh, 0 };
 
 	/* Commit each image the moment its stream finishes (h2_fetch_many's on_done),
 	 * so they pop in progressively rather than all at once after the batch. Each

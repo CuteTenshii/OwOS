@@ -12,7 +12,8 @@
  * full), inflation halts cleanly and returns 0 — a natural, lossless way to cap
  * output without an all-or-nothing failure.
  *
- * Not reentrant: one decode at a time (a single static window backs it).
+ * Reentrant: each call allocates its own back-reference window + flush buffer,
+ * so concurrent decodes on separate threads don't interfere.
  */
 #ifndef OWOS_INFLATE_H
 #define OWOS_INFLATE_H

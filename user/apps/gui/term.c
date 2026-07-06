@@ -266,7 +266,7 @@ static void bi_help(void)
 	tputs_c("OwOS shell.  Ctrl+C cancels the line / aborts a command.\n", FG_DIR);
 	tputs("files    ls cat cp mv rm mkdir rmdir stat pwd cd grep\n");
 	tputs("archive  zip unzip gzip gunzip\n");
-	tputs("system   uptime uname hostname whoami id cpuinfo meminfo date ps journal which\n");
+	tputs("system   uptime hostname whoami id cpuinfo meminfo date ps journal which\n");
 	tputs("users    useradd userdel passwd usermod groupadd groupdel users groups\n");
 	tputs("session  su login logout    (su alice [password]; logout -> root)\n");
 	tputs("device   storage lsusb mount umount loadkeys clip\n");
@@ -274,8 +274,8 @@ static void bi_help(void)
 	tputs("power    poweroff restart\n");
 	tputs("shell    help clear echo sleep exit\n");
 	tputs("remote   ssh user@host (interactive SSH-2 session)\n");
-	tputs("CLI tools (neofetch curl lspci ping dig torrent) run inline; other /bin\n");
-	tputs("programs (editor files clock browser ...) open their own window.\n");
+	tputs("Any /bin program runs here: its output streams inline; if it opens a\n");
+	tputs("window (editor files clock browser ...) the prompt returns.\n");
 }
 
 static void bi_ls(int argc, char **argv)
@@ -355,26 +355,12 @@ static void bi_uptime(void)
 	tdec(s % 60); tputs("s\n");
 }
 
-static void bi_uname(int argc, char **argv)
-{
-	int all = argc > 1 && !strcmp(argv[1], "-a");
-	if (all) {
-		/* Machine arch from the kernel (/proc/arch); the shell is 32-bit ELF and
-		 * can't infer the kernel's arch from its own build. */
-		char a[16];
-		int n = readfile("/proc/arch", a, sizeof a - 1);
-		if (n > 0) { while (n && (a[n-1]=='\n' || a[n-1]=='\r' || a[n-1]==' ')) n--; a[n] = '\0'; }
-		else { a[0]='i'; a[1]='3'; a[2]='8'; a[3]='6'; a[4]='\0'; }
-		tputs("OwOS owos " OWOS_VERSION " "); tputs(a); tputs("\n");
-	}
-	else     tputs("OwOS\n");
-}
 
 static void bi_which(int argc, char **argv)
 {
 	static const char *const ring3[] = {
 		"help", "clear", "echo", "pwd", "cd", "ls", "cat", "cp", "mv",
-		"stat", "mkdir", "rmdir", "rm", "exit", "uptime", "uname", "hostname", "whoami",
+		"stat", "mkdir", "rmdir", "rm", "exit", "uptime", "hostname", "whoami",
 		"which", "cpuinfo", "meminfo", "date", "storage", "sleep",
 		"id", "useradd", "userdel", "passwd", "usermod", "groupadd",
 		"groupdel", "users", "groups", "su", "login", "logout",
@@ -561,18 +547,6 @@ static void bi_grep(int argc, char **argv)
 	}
 }
 
-/* /bin programs whose stdout we capture and render inline (CLI tools), rather
- * than launching as a detached window. Anything else under /bin is a GUI app. */
-static int is_cli(const char *name)
-{
-	static const char *const cli[] = {
-		"neofetch", "curl", "lspci", "ping", "dig", "torrent", "notify-send",
-	};
-	for (unsigned i = 0; i < sizeof cli / sizeof cli[0]; i++)
-		if (!strcmp(name, cli[i])) return 1;
-	return 0;
-}
-
 /* /bin programs that drive an interactive session (read keystrokes, not just
  * emit output): their stdin is wired to a pipe and the window's keystrokes are
  * forwarded into it. ssh is the one such tool. */
@@ -587,6 +561,36 @@ static int is_interactive(const char *name) { return !strcmp(name, "ssh"); }
  * delivers is forwarded raw into the child's stdin pipe (no local echo -- the
  * remote side echoes), Ctrl+C included (the child turns it into a remote ^C)
  * rather than aborting the child. Closing the window still kills it. */
+/* Backgrounded windowed children. A child that opens its own window is handed
+ * off here so the prompt returns immediately (our stdout-capture model would
+ * otherwise block on a long-lived window). We keep draining its stray stdout so
+ * a full pipe can't wedge it, and reap it once it exits. No app list is needed:
+ * the kernel reports which children own a window (win_owned), the same way a
+ * Unix terminal never classifies its children at all. */
+#define BG_MAX 16
+static struct { int pid, rfd, active; } bg_jobs[BG_MAX];
+
+static void bg_add(int pid, int rfd)
+{
+	for (int i = 0; i < BG_MAX; i++)
+		if (!bg_jobs[i].active) { bg_jobs[i].pid = pid; bg_jobs[i].rfd = rfd; bg_jobs[i].active = 1; return; }
+	close(rfd);   /* table full: drop the pipe; the child is reparented + reaped on our exit */
+}
+
+static void bg_service(void)
+{
+	char drain[512];
+	for (int i = 0; i < BG_MAX; i++) {
+		if (!bg_jobs[i].active) continue;
+		if (bg_jobs[i].rfd >= 0) {
+			int n;
+			do { n = read_nb(bg_jobs[i].rfd, drain, sizeof drain); } while (n > 0);
+			if (n < 0) { close(bg_jobs[i].rfd); bg_jobs[i].rfd = -1; }   /* child closed stdout */
+		}
+		if (bg_jobs[i].rfd < 0 && waitpid_nb(bg_jobs[i].pid, 0)) bg_jobs[i].active = 0;
+	}
+}
+
 static void render_child(const char *path, char **argv, int argc, int interactive)
 {
 	int rfd = -1, wfd = -1;
@@ -629,6 +633,13 @@ static void render_child(const char *path, char **argv, int argc, int interactiv
 			else if (ev.type == WEV_KEY && (unsigned char)ev.a == KEY_INTR && !intr && !closing) {
 				intr = 1; kill(pid, SIGINT); tputs("^C\n"); redraw();   /* Ctrl+C: abort */
 			}
+		}
+		/* A windowed app (opened its own window): hand it off and return to the
+		 * prompt. This is what replaces the hardcoded CLI/GUI list — any program,
+		 * shipped or third-party, is classified by behavior, not by name. */
+		if (!interactive && !closing && !intr && win_owned(pid)) {
+			bg_add(pid, rfd);
+			return;
 		}
 		int n = read_nb(rfd, iobuf, sizeof iobuf);
 		if (n > 0) {
@@ -1165,12 +1176,15 @@ static void run_other(const char *orig, int argc, char **argv)
 	if (argv[0][0] == '/') strcpy(path, argv[0]);
 	else { strcpy(path, "/bin/"); strcat(path, argv[0]); }
 
-	if (is_cli(argv[0]))         { render_child(path, argv, argc, 0); return; }
 	if (is_interactive(argv[0])) { render_child(path, argv, argc, 1); return; }
 
 	struct statinfo st;
-	if (stat(path, &st) == 0 && !st.is_dir) {           /* a detached GUI app    */
-		if (spawn(path, argc > 1 ? argv[1] : 0) < 0) err("failed to launch", 0);
+	if (stat(path, &st) == 0 && !st.is_dir) {
+		/* Run every program the same way: captured, streaming its output inline.
+		 * If it opens a window, render_child hands it off (bg_service) and the
+		 * prompt returns. No CLI/GUI allowlist — the window is the signal, so a
+		 * new or third-party program behaves correctly with no term.c edit. */
+		render_child(path, argv, argc, 0);
 		return;
 	}
 
@@ -1226,7 +1240,6 @@ static void run(const char *orig)
 	else if (!strcmp(c, "mv"))    { if (argc < 3) tputs("usage: mv <src> <dst>\n"); else { char a[256], b[256]; abspath(argv[1], a); abspath(argv[2], b); if (rename(a, b) < 0) err("mv: failed", 0); } }
 	else if (!strcmp(c, "exit"))  { win_close(win); exit(0); }
 	else if (!strcmp(c, "uptime"))  bi_uptime();
-	else if (!strcmp(c, "uname"))   bi_uname(argc, argv);
 	else if (!strcmp(c, "whoami"))  bi_whoami();
 	else if (!strcmp(c, "hostname")) bi_hostname(argc, argv);
 	else if (!strcmp(c, "useradd")) cmd_useradd(argc, argv);
@@ -1476,6 +1489,7 @@ int main(int argc, char **argv)
 			case WEV_RESIZE: on_resize(ev.a, ev.b); break;
 			}
 		}
+		bg_service();               /* drain + reap handed-off windowed children */
 		if (dirty) redraw();
 		win_wait(win);
 	}

@@ -75,6 +75,24 @@ static int read_block(struct ext_mount *m, uint32_t block, uint8_t *buf)
 	return dev_read(m, (uint64_t)block * m->block_size, buf, m->block_size);
 }
 
+/* Straddle-safe read of `len` bytes from an absolute device byte offset using a
+ * raw callback (used while probing, before an ext_mount's read/base are set). */
+static int raw_read(blk_read_fn read, uint64_t byteoff, uint8_t *buf, uint32_t len)
+{
+	uint8_t s[512];
+	while (len) {
+		uint32_t lba  = (uint32_t)(byteoff / 512);
+		uint32_t soff = (uint32_t)(byteoff % 512);
+		if (read(lba, s) != 0)
+			return -1;
+		uint32_t n = 512 - soff;
+		if (n > len) n = len;
+		memcpy(buf, s + soff, n);
+		buf += n; byteoff += n; len -= n;
+	}
+	return 0;
+}
+
 /* The inode-table start block of a given block group. */
 static uint64_t group_inode_table(struct ext_mount *m, uint32_t group)
 {
@@ -117,14 +135,20 @@ static uint64_t inode_size(const uint8_t *ibuf)
 
 /* Walk an extent tree to map logical block `lblk` -> physical block (0 = hole).
  * `node` points at an ext4_extent_header (inline in the inode, or a tree node
- * read into blk_scratch). */
-static uint32_t extent_lookup(struct ext_mount *m, const uint8_t *node, uint32_t lblk)
+ * read into blk_scratch); `node_bytes` is the usable size of that buffer, so an
+ * untrusted eh_entries can't drive the entry scan past it. A guard counter caps
+ * tree depth against a cyclic/self-referential tree. */
+static uint32_t extent_lookup(struct ext_mount *m, const uint8_t *node,
+                              uint32_t node_bytes, uint32_t lblk)
 {
-	for (;;) {
-		if (load_le16(node) != EXT_EXTENT_MAGIC)
+	for (int guard = 0; guard < 32; guard++) {
+		if (node_bytes < 12 || load_le16(node) != EXT_EXTENT_MAGIC)
 			return 0;
 		uint16_t entries = load_le16(node + 2);
 		uint16_t depth   = load_le16(node + 6);
+		uint32_t maxent  = (node_bytes - 12) / 12;     /* entries that fit */
+		if (entries > maxent)
+			entries = (uint16_t)maxent;
 
 		if (depth == 0) {                              /* leaf: ext4_extent */
 			for (int i = 0; i < entries; i++) {
@@ -151,7 +175,9 @@ static uint32_t extent_lookup(struct ext_mount *m, const uint8_t *node, uint32_t
 		if (read_block(m, leaf, m->blk_scratch) != 0)
 			return 0;
 		node = m->blk_scratch;
+		node_bytes = m->block_size;
 	}
+	return 0;                                                    /* depth guard tripped */
 }
 
 /* Classic ext2/3 block map: 12 direct + single/double/triple indirect. */
@@ -186,7 +212,7 @@ static uint32_t indirect_lookup(struct ext_mount *m, const uint8_t *ibuf, uint32
 static uint32_t map_block(struct ext_mount *m, const uint8_t *ibuf, uint32_t lblk)
 {
 	if (load_le32(ibuf + 32) & INODE_EXTENTS_FL)
-		return extent_lookup(m, ibuf + 40, lblk);
+		return extent_lookup(m, ibuf + 40, 60, lblk);   /* i_block[15] = 60 bytes */
 	return indirect_lookup(m, ibuf, lblk);
 }
 
@@ -212,6 +238,7 @@ static uint32_t dir_find(struct ext_mount *m, const uint8_t *dirbuf, const char 
 			uint16_t rec = load_le16(e + 4);
 			uint8_t  nl  = e[6];
 			if (rec < 8) break;
+			if (off + 8 + nl > m->block_size) break;   /* name runs past the block */
 			if (ino && nl == nlen) {
 				int match = 1;
 				for (uint32_t i = 0; i < nlen; i++)
@@ -333,15 +360,15 @@ static int probe_dev(struct ext_mount *m, blk_read_fn read)
 		if (ent_cnt > 128) ent_cnt = 128;
 		uint8_t ent[128];
 		for (uint32_t i = 0; i < ent_cnt; i++) {
-			uint64_t b = ent_lba * 512 + (uint64_t)i * ent_sz;
-			uint8_t es[512];
-			if (read((uint32_t)(b / 512), es) != 0) break;
-			const uint8_t *e = es + (b % 512);
+			/* ent_sz is untrusted (only floored to 128), so an entry can straddle
+			 * a sector boundary and its tail runs past a single 512-byte read.
+			 * Read exactly one 128-byte entry straddle-safe and index that. */
+			if (raw_read(read, ent_lba * 512 + (uint64_t)i * ent_sz, ent, 128) != 0)
+				break;
 			int empty = 1;
-			for (int k = 0; k < 16; k++) if (e[k]) { empty = 0; break; }
+			for (int k = 0; k < 16; k++) if (ent[k]) { empty = 0; break; }
 			if (empty) continue;
-			(void)ent;
-			uint64_t first = (uint64_t)load_le32(e + 32) | ((uint64_t)load_le32(e + 36) << 32);
+			uint64_t first = (uint64_t)load_le32(ent + 32) | ((uint64_t)load_le32(ent + 36) << 32);
 			if (first && try_mount(m, read, (uint32_t)first) == 0)
 				return 0;
 		}
@@ -394,6 +421,7 @@ static int dir_walk(struct ext_mount *m, const char *path, int want_idx, char *n
 			uint16_t rec = load_le16(e + 4);
 			uint8_t  nl  = e[6];
 			if (rec < 8) break;
+			if (off + 8 + nl > m->block_size) break;   /* name runs past the block */
 			if (ino && nl) {
 				char nm[256];
 				int j = 0;

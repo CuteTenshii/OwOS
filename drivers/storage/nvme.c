@@ -214,6 +214,10 @@ void nvme_init(void)
 		con_write("nvme: could not map MMIO\n");
 		return;
 	}
+	/* Registers are MMIO: mark the BAR uncached or, on real silicon, a doorbell
+	 * write can sit in the write-back cache and the controller never sees the
+	 * submission (the polled completion then times out). QEMU hides this. */
+	paging_mark_uc(bar0, 0x2000);
 	bar = (volatile uint32_t *)bar0;
 
 	dstrd = reg_rd(REG_CAP + 4) & 0xF;        /* CAP bits 35:32 = doorbell stride */
@@ -295,6 +299,18 @@ void nvme_init(void)
 	if (submit(&admin_q, c) == 0) {
 		const volatile uint32_t *idns = (const volatile uint32_t *)dbuf;
 		cap_sectors = idns[0];                /* low 32 bits of NSZE is plenty    */
+		/* The block layer addresses this device in 512-byte sectors. Confirm the
+		 * namespace is actually 512-byte formatted: FLBAS (byte 26) selects an LBA
+		 * format whose LBADS (2^n byte size) is bits 16-23 of the entry at
+		 * byte 128 + 4*index. A 4K-formatted drive would otherwise report 8x the
+		 * capacity and every read would return a fraction of a block. */
+		uint32_t flbas = ((const volatile uint8_t *)dbuf)[26] & 0xF;
+		uint32_t lbads = (idns[(128 / 4) + flbas] >> 16) & 0xFF;
+		if (lbads != 9) {
+			con_printf("nvme: unsupported LBA size %u bytes; ignoring device\n",
+			           1u << lbads);
+			return;                           /* leave found=0 so blk won't use it */
+		}
 	}
 
 	found = 1;

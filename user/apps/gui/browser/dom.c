@@ -81,6 +81,7 @@ static struct dom_node *node_new(struct parser *ps, enum dom_type type)
 	n->tag[0] = '\0';
 	n->text = 0;
 	n->attrs = 0;
+	n->last_attr = 0;
 	n->parent = n->first_child = n->last_child = n->next = 0;
 	n->wrapper = 0;
 	return n;
@@ -102,8 +103,9 @@ static void attr_append(struct dom_node *el, char *name, char *value)
 	a->name = name;
 	a->value = value;
 	a->next = 0;
-	if (!el->attrs) el->attrs = a;
-	else { struct dom_attr *t = el->attrs; while (t->next) t = t->next; t->next = a; }
+	if (el->last_attr) el->last_attr->next = a;
+	else el->attrs = a;
+	el->last_attr = a;
 }
 
 /* Close cur up to and including the nearest ancestor in `targets`, unless a
@@ -346,6 +348,7 @@ struct dom_node *dom_parse(const char *html, int len)
 	{ const char *r = "#document"; int i = 0; for (; r[i] && i < 15; i++) ps.root->tag[i] = r[i]; ps.root->tag[i] = '\0'; }
 	ps.root->text = 0;
 	ps.root->attrs = 0;
+	ps.root->last_attr = 0;
 	ps.root->parent = 0;
 	ps.root->first_child = ps.root->last_child = ps.root->next = 0;
 	ps.root->wrapper = 0;
@@ -418,6 +421,7 @@ struct dom_node *dom_new_element(const char *tag)
 	n->type = DOM_ELEMENT;
 	n->text = 0;
 	n->attrs = 0;
+	n->last_attr = 0;
 	n->parent = n->first_child = n->last_child = n->next = 0;
 	n->wrapper = 0;
 	{ int i = 0; for (; tag && tag[i] && i < 15; i++) n->tag[i] = lower(tag[i]); n->tag[i] = '\0'; }
@@ -431,6 +435,7 @@ struct dom_node *dom_new_text(const char *text)
 	n->type = DOM_TEXT;
 	n->tag[0] = '\0';
 	n->attrs = 0;
+	n->last_attr = 0;
 	n->parent = n->first_child = n->last_child = n->next = 0;
 	n->wrapper = 0;
 	n->text = dupn(text ? text : "", text ? (int)strlen(text) : 0);
@@ -502,6 +507,7 @@ void dom_remove_attr(struct dom_node *el, const char *name)
 	while (a) {
 		if (streq_ci(a->name, name)) {
 			if (prev) prev->next = a->next; else el->attrs = a->next;
+			if (el->last_attr == a) el->last_attr = prev;
 			free(a->name); free(a->value); free(a);
 			return;
 		}

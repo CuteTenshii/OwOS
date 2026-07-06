@@ -7,14 +7,16 @@
 #include "font.h"
 #include "svg.h"
 #include "layout.h"
-#include "upng.h"      /* decode url() background images to RGBA */
+#include "anim.h"      /* CSS @keyframes / transition engine */
+#include "imgdec.h"    /* shared image decoder for url() background images */
 #include "bmedia.h"    /* <audio>/<video> element registration */
 
 static css_sheet *g_sheet;     /* the page's collected <style> rules, per render */
 
 /* url() background loader/lookup — defined lower, used during the layout walk. */
 static int  bg_image_index(const char *raw_url, const char *page_url);
-static void load_bg_images(struct dom_node *root, const char *page_url, res_batch_fn fetch);
+static void bg_note_url(const char *raw_url);
+static void load_bg_images(const char *page_url, res_batch_fn fetch);
 
 /* The DOM + CSS sheet now persist for the whole page lifetime (the JS context in
  * js.c does too), so event listeners can fire and mutate the tree after load.
@@ -153,7 +155,6 @@ static void detect_meta_charset(void)
 				if (charset_is_latin1(q)) g_charset = CS_LATIN1;
 				return;                                  /* first one wins */
 			}
-		if (starts_ci(p + 5, " charset") || tend >= end) { /* keep scanning <head> */ }
 		p = tend;
 	}
 }
@@ -185,7 +186,7 @@ static int read_char(const char **pp, const char *end)
 
 /* Current text style. The walk saves/restores it around each element (via the C
  * call stack), so style nesting needs no explicit stack. fg is a full 0xRRGGBB. */
-struct sty { unsigned fg; unsigned char bold, under, italic, nowrap, ttx; };
+struct sty { unsigned fg; unsigned char bold, under, italic, strike, nowrap, ttx, smallcaps; };
 static struct sty sty_cur;
 
 static unsigned char sty_byte(void)
@@ -194,6 +195,7 @@ static unsigned char sty_byte(void)
 	if (sty_cur.bold)   a |= ST_BOLD;
 	if (sty_cur.under)  a |= ST_UNDER;
 	if (sty_cur.italic) a |= ST_ITALIC;
+	if (sty_cur.strike) a |= ST_STRIKE;
 	if (sty_cur.nowrap) a |= ST_NOWRAP;
 	return a;
 }
@@ -208,15 +210,20 @@ static void apply_ua_style(const char *name)
 		sty_cur.bold = 1;
 	} else if (streq(name, "b") || streq(name, "strong")) {
 		sty_cur.bold = 1;
-	} else if (streq(name, "i") || streq(name, "em")) {
+	} else if (streq(name, "i") || streq(name, "em") || streq(name, "cite") ||
+	           streq(name, "var") || streq(name, "dfn") || streq(name, "address")) {
 		sty_cur.italic = 1;
 	} else if (streq(name, "a")) {
 		sty_cur.fg = 0x1a4fbf; sty_cur.under = 1;
 	} else if (streq(name, "u") || streq(name, "ins")) {
 		sty_cur.under = 1;
+	} else if (streq(name, "del") || streq(name, "s") || streq(name, "strike")) {
+		sty_cur.strike = 1;
 	} else if (streq(name, "code") || streq(name, "kbd") ||
 	           streq(name, "samp") || streq(name, "tt")) {
 		sty_cur.fg = 0x9a6020;
+	} else if (streq(name, "legend")) {
+		sty_cur.bold = 1;
 	} else if (streq(name, "mark")) {
 		sty_cur.fg = 0xc01818;
 	}
@@ -229,6 +236,7 @@ static void apply_css(const struct css_style *cs)
 	if (cs->bold >= 0)  sty_cur.bold = cs->bold ? 1 : 0;
 	if (cs->under >= 0) sty_cur.under = cs->under ? 1 : 0;
 	if (cs->italic >= 0) sty_cur.italic = cs->italic ? 1 : 0;
+	if (cs->small_caps >= 0) sty_cur.smallcaps = cs->small_caps ? 1 : 0;
 	if (cs->ttx >= 0)   sty_cur.ttx = (unsigned char)cs->ttx;
 }
 
@@ -240,7 +248,9 @@ static int is_block_tag(const char *name)
 		"p", "br", "div", "li", "tr", "ul", "ol", "h1", "h2", "h3",
 		"h4", "h5", "h6", "table", "hr", "section", "article", "header",
 		"footer", "nav", "blockquote", "pre", "head", "form",
-		"dd", "dt", "dl", "figure", "main", "aside", 0
+		"dd", "dt", "dl", "figure", "figcaption", "main", "aside",
+		"details", "dialog", "fieldset", "legend",
+		"caption", "address", 0
 	};
 	for (int i = 0; blk[i]; i++) if (streq(name, blk[i])) return 1;
 	return 0;
@@ -422,11 +432,24 @@ static int decode_entity(const char *p, const char *end, int *adv)
 		{ "Phi", 0x3A6 }, { "Chi", 0x3A7 }, { "Psi", 0x3A8 }, { "Omega", 0x3A9 },
 		{ 0, 0 }
 	};
-	for (int i = 0; ent[i].name; i++) {
-		const char *nm = ent[i].name;
+	/* Bucket the table by first letter on first use, so each &name; only scans the
+	 * handful of entries sharing its initial rather than the whole ~300-row table. */
+	static short ent_head[256];                       /* first char -> entry index + 1 (0 = empty) */
+	static short ent_next[sizeof ent / sizeof ent[0]];/* chain within a bucket */
+	static int   ent_built;
+	if (!ent_built) {
+		for (int i = 0; ent[i].name; i++) {
+			unsigned char fc = (unsigned char)ent[i].name[0];
+			ent_next[i] = ent_head[fc];
+			ent_head[fc] = (short)(i + 1);
+		}
+		ent_built = 1;
+	}
+	for (int e = ent_head[(unsigned char)body[0]]; e; e = ent_next[e - 1]) {
+		const char *nm = ent[e - 1].name;
 		int k = 0;
 		while (nm[k] && k < blen && nm[k] == body[k]) k++;
-		if (!nm[k] && k == blen) { *adv = n + 1; return ent[i].ch; }
+		if (!nm[k] && k == blen) { *adv = n + 1; return ent[e - 1].ch; }
 	}
 	*adv = 1;
 	return '&';
@@ -465,7 +488,9 @@ static unsigned char W_size, W_center, W_mono, W_indent, W_pre;
 static unsigned char W_fontpx;      /* current CSS font-size px (0 = default body) */
 static unsigned W_bg = BG_NONE;     /* current background 0xRRGGBB, BG_NONE = none */
 static char W_listtype;             /* 'u' / 'o' / 0 — the enclosing list kind  */
-static int  W_olnum;                /* <ol> item counter                        */
+static int  W_olnum;                /* <ol> running item number (last assigned) */
+static signed char   W_listrev;     /* <ol reversed>: -1 counts down, +1 up     */
+static signed char   W_listdef = CSS_LST_DEFAULT;  /* list's presentational default (type="") */
 static unsigned char W_lineheight;  /* current CSS line-height px (0 = font-derived) */
 static signed char   W_liststyle = CSS_LST_DEFAULT;  /* inherited list-style-type    */
 
@@ -569,9 +594,12 @@ static int cp_drop(unsigned cp)
 	return 0;
 }
 
-/* Apply text-transform to one codepoint. ASCII + Latin-1 letters are cased; the
- * `*word` flag (set after a non-letter) drives capitalize's first-letter rule. */
-static unsigned ttx_apply(unsigned cp, unsigned char ttx, int *word)
+/* Apply text-transform (and font-variant small-caps) to one codepoint. ASCII +
+ * Latin-1 letters are cased; the `*word` flag (set after a non-letter) drives
+ * capitalize's first-letter rule. small-caps is approximated as uppercase — this
+ * line renderer can't draw reduced-size capitals mid-run — and applies after the
+ * transform, so a lowercasing text-transform still ends up capitalised. */
+static unsigned ttx_apply(unsigned cp, unsigned char ttx, int smallcaps, int *word)
 {
 	int alpha = (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') ||
 	            (cp >= 0xC0 && cp <= 0xFF && cp != 0xD7 && cp != 0xF7);
@@ -585,6 +613,10 @@ static unsigned ttx_apply(unsigned cp, unsigned char ttx, int *word)
 	case CSS_TT_UPPER:      r = up; break;
 	case CSS_TT_LOWER:      r = lo; break;
 	case CSS_TT_CAPITALIZE: r = (*word && alpha) ? up : cp; break;
+	}
+	if (smallcaps) {
+		if (r >= 'a' && r <= 'z') r -= 32;
+		else if (r >= 0xE0 && r <= 0xFE && r != 0xF7) r -= 0x20;
 	}
 	*word = alpha ? 0 : 1;
 	return r;
@@ -612,7 +644,7 @@ static void emit_text(const char *s)
 			if (c == '\r') continue;
 			if (c == '\t') { for (int t = 0; t < 4; t++) W_n = text_put(W_n, ' ', sty_byte()); W_run_nl = 0; ws = 1; continue; }
 			if (cp_drop((unsigned)c)) continue;
-			W_n = utf8_emit(W_n, ttx_apply((unsigned)c, sty_cur.ttx, &ws), sty_byte());
+			W_n = utf8_emit(W_n, ttx_apply((unsigned)c, sty_cur.ttx, sty_cur.smallcaps, &ws), sty_byte());
 			W_run_nl = 0;
 			continue;
 		}
@@ -622,7 +654,7 @@ static void emit_text(const char *s)
 			if (W_n > 0 && W_run_nl == 0) W_n = text_put(W_n, ' ', 0);
 			W_pend_sp = 0;
 		}
-		W_n = utf8_emit(W_n, ttx_apply((unsigned)c, sty_cur.ttx, &ws), sty_byte());
+		W_n = utf8_emit(W_n, ttx_apply((unsigned)c, sty_cur.ttx, sty_cur.smallcaps, &ws), sty_byte());
 		W_run_nl = 0;
 	}
 }
@@ -733,8 +765,14 @@ static void svg_put_paint(char *b, int *n, int cap, const char *name, int v)
 	}
 	svg_put(b, n, cap, "\"");
 }
-static void svg_serialize(struct dom_node *el, char *b, int *n, int cap)
+/* Bound the recursion like the DOM walk (WALK_DEPTH_MAX): each frame carries a
+ * css_style plus a compute_style call, so an adversarially deep inline <svg> would
+ * otherwise overflow the 64 KiB worker stack. Content nested past the cap is dropped
+ * rather than crashing the worker. */
+#define SVG_MAX_DEPTH 256
+static void svg_serialize(struct dom_node *el, char *b, int *n, int cap, int depth)
 {
+	if (depth >= SVG_MAX_DEPTH) return;
 	if (el->type == DOM_TEXT) { if (el->text) svg_put(b, n, cap, el->text); return; }
 	svg_put(b, n, cap, "<"); svg_put(b, n, cap, el->tag);
 	/* Bake the element's cascaded fill/stroke so CSS (e.g. Tailwind fill-* classes,
@@ -753,7 +791,7 @@ static void svg_serialize(struct dom_node *el, char *b, int *n, int cap)
 	if (!el->first_child) { svg_put(b, n, cap, "/>"); return; }
 	svg_put(b, n, cap, ">");
 	for (struct dom_node *c = el->first_child; c; c = c->next)
-		svg_serialize(c, b, n, cap);
+		svg_serialize(c, b, n, cap, depth + 1);
 	svg_put(b, n, cap, "</"); svg_put(b, n, cap, el->tag); svg_put(b, n, cap, ">");
 }
 
@@ -768,7 +806,7 @@ static void handle_svg(struct dom_node *el, const struct css_style *cs)
 	char *buf = malloc((unsigned)cap);
 	if (!buf) return;
 	int len = 0;
-	svg_serialize(el, buf, &len, cap);
+	svg_serialize(el, buf, &len, cap, 0);
 	buf[len] = '\0';
 	if (len < 5 || !svg_probe(buf, len)) { free(buf); return; }
 
@@ -1111,7 +1149,8 @@ int html_control_kind(struct dom_node *n)
 	if (streq(n->tag, "select"))   return CTRL_SELECT;
 	if (streq(n->tag, "button")) {
 		const char *t = dom_get_attr(n, "type");
-		return (t && streq(t, "submit")) ? CTRL_SUBMIT : CTRL_BUTTON;
+		/* A <button> defaults to type=submit; only explicit button/reset don't. */
+		return (t && (streq(t, "button") || streq(t, "reset"))) ? CTRL_BUTTON : CTRL_SUBMIT;
 	}
 	if (streq(n->tag, "input")) {
 		const char *t = dom_get_attr(n, "type");
@@ -1207,71 +1246,134 @@ struct dom_node *html_focus_edit(int ch)
 	return g_focus;
 }
 
-/* Build the GET URL a submit would navigate to (action + a query from the form's
- * named controls). Returns 1 with `out` filled, 0 if there's no submittable form. */
-static void q_field(char *q, int *qn, int cap, const char *name, const char *val)
+/* application/x-www-form-urlencoded component encoding: a space becomes '+' and
+ * every byte outside the unreserved set is percent-encoded, so a value holding
+ * '&', '=', ' ' or UTF-8 can't corrupt the field separators. */
+static int form_unreserved(unsigned char c)
 {
-	if (*qn && *qn < cap - 1) q[(*qn)++] = '&';
-	sapp(q, qn, cap, name);
-	if (*qn < cap - 1) q[(*qn)++] = '=';
-	sapp(q, qn, cap, val ? val : "");
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+	       (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '*';
+}
+static void enc_field(char *q, int *qn, int cap, const char *s)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	for (; s && *s; s++) {
+		unsigned char c = (unsigned char)*s;
+		if (c == ' ') { if (*qn < cap - 1) q[(*qn)++] = '+'; }
+		else if (form_unreserved(c)) { if (*qn < cap - 1) q[(*qn)++] = (char)c; }
+		else if (*qn < cap - 4) { q[(*qn)++] = '%'; q[(*qn)++] = hex[c >> 4]; q[(*qn)++] = hex[c & 15]; }
+	}
 	q[*qn] = '\0';
 }
-static void form_fields(struct dom_node *n, char *q, int *qn, int cap)
+
+/* Append one "name=value" pair to the encoded field set. FE_PLAIN (enctype
+ * text/plain) writes the raw bytes with no escaping and '\n' separators; the
+ * default urlencoded form percent-encodes both sides and joins with '&'. */
+enum { FE_URLENC, FE_PLAIN };
+static void q_field(char *q, int *qn, int cap, const char *name, const char *val, int enc)
+{
+	if (*qn && *qn < cap - 1) q[(*qn)++] = (enc == FE_PLAIN) ? '\n' : '&';
+	if (enc == FE_PLAIN) {
+		sapp(q, qn, cap, name);
+		if (*qn < cap - 1) q[(*qn)++] = '=';
+		sapp(q, qn, cap, val ? val : "");
+		q[*qn] = '\0';
+	} else {
+		enc_field(q, qn, cap, name);
+		if (*qn < cap - 1) q[(*qn)++] = '=';
+		enc_field(q, qn, cap, val ? val : "");
+	}
+}
+
+/* Collect the successful controls of a form into an encoded field set. `clicked`
+ * is the activated submit control, whose own name/value is a successful field
+ * (other submit/button/reset controls are not). Checkboxes/radios contribute only
+ * when checked; a select contributes its value; hidden inputs contribute. */
+static void form_fields(struct dom_node *n, char *q, int *qn, int cap,
+                        struct dom_node *clicked, int enc)
 {
 	for (struct dom_node *c = n->first_child; c; c = c->next) {
 		if (c->type != DOM_ELEMENT) continue;
 		const char *tag = c->tag, *name = dom_get_attr(c, "name");
 		const char *type = dom_get_attr(c, "type");
-		if (name && name[0] && (streq(tag, "input") || streq(tag, "select") || streq(tag, "textarea"))) {
-			int skip = type && (streq(type, "submit") || streq(type, "button") || streq(type, "reset"));
-			if (!skip) {
-				if (type && (streq(type, "checkbox") || streq(type, "radio"))) {
-					if (dom_get_attr(c, "checked")) {
-						const char *v = dom_get_attr(c, "value");
-						q_field(q, qn, cap, name, v ? v : "on");
-					}
-				} else {
-					q_field(q, qn, cap, name, dom_get_attr(c, "value"));
+		if (name && name[0] && (streq(tag, "input") || streq(tag, "select") || streq(tag, "textarea") || streq(tag, "button"))) {
+			int is_btn = streq(tag, "button")
+			           ? !(type && (streq(type, "reset") || streq(type, "button")))   /* default type=submit */
+			           : (type && (streq(type, "submit") || streq(type, "button") || streq(type, "reset")));
+			if (is_btn) {
+				/* Only the activated submit control is a successful field. */
+				if (c == clicked && !(type && (streq(type, "button") || streq(type, "reset"))))
+					q_field(q, qn, cap, name, dom_get_attr(c, "value"), enc);
+			} else if (type && (streq(type, "checkbox") || streq(type, "radio"))) {
+				if (dom_get_attr(c, "checked")) {
+					const char *v = dom_get_attr(c, "value");
+					q_field(q, qn, cap, name, v ? v : "on", enc);
 				}
+			} else {
+				q_field(q, qn, cap, name, dom_get_attr(c, "value"), enc);
 			}
 		}
-		form_fields(c, q, qn, cap);
+		form_fields(c, q, qn, cap, clicked, enc);
 	}
 }
-int html_form_submit_url(struct dom_node *control, char *out, int cap)
+
+int html_form_build(struct dom_node *control, struct form_submission *fs)
 {
 	struct dom_node *form = form_of(control);
-	const char *action, *method;
-	char q[URL_MAX]; int qn = 0, on = 0;
+	const char *action, *method, *enctype;
+	char q[POST_BODY_MAX]; int qn = 0, on = 0;
+	int is_post, enc;
 	if (!form) return 0;
-	action = dom_get_attr(form, "action");
-	method = dom_get_attr(form, "method");
-	if (action && action[0]) resolve_url(g_cur_page_url, action, out, cap);
-	else                     { sapp(out, &on, cap, g_cur_page_url); }
+	fs->url[0] = '\0'; fs->body[0] = '\0'; fs->body_len = 0;
+	fs->ctype[0] = '\0'; strcpy(fs->method, "GET");
+
+	/* A submit control may override the form's action/method/enctype via its
+	 * formaction/formmethod/formenctype attributes (HTML "attributes for form
+	 * submission"). Fall back to the form's own attributes otherwise. */
+	action  = control ? dom_get_attr(control, "formaction")  : 0;
+	method  = control ? dom_get_attr(control, "formmethod")  : 0;
+	enctype = control ? dom_get_attr(control, "formenctype") : 0;
+	if (!action  || !action[0])  action  = dom_get_attr(form, "action");
+	if (!method  || !method[0])  method  = dom_get_attr(form, "method");
+	if (!enctype || !enctype[0]) enctype = dom_get_attr(form, "enctype");
+
+	if (action && action[0]) resolve_url(g_cur_page_url, action, fs->url, sizeof fs->url);
+	else                     { sapp(fs->url, &on, sizeof fs->url, g_cur_page_url); }
 
 	/* CSP form-action: refuse a submission whose target the policy forbids. Logged
 	 * unconditionally (this is a user action, not the spammy per-relayout walk). */
 	if (B->pg->csp) {
 		char fa[URL_MAX], reason[64];
-		if (!csp_check_url(B->pg->csp, CSP_FORM, out, g_cur_page_url, fa, sizeof fa, reason, sizeof reason)) {
+		if (!csp_check_url(B->pg->csp, CSP_FORM, fs->url, g_cur_page_url, fa, sizeof fa, reason, sizeof reason)) {
 			char m[URL_MAX + 96]; int n = 0;
 			sapp(m, &n, sizeof m, "[CSP] refused form submission to ");
-			sapp(m, &n, sizeof m, out);
+			sapp(m, &n, sizeof m, fs->url);
 			sapp(m, &n, sizeof m, " ("); sapp(m, &n, sizeof m, reason); sapp(m, &n, sizeof m, ")\n");
 			devtools_console_append(DT_ERROR, m, n);
 			return 0;
 		}
-		{ int k = 0; out[0] = '\0'; sapp(out, &k, cap, fa); }   /* use upgraded action */
+		strcpy(fs->url, fa);   /* use upgraded action */
 	}
 
-	if (method && streq_ci(method, "post")) return 1;   /* no body support: hit action */
+	is_post = method && streq_ci(method, "post");
+	/* multipart/form-data needs file uploads (no file picker here), so a POST that
+	 * asks for it degrades to urlencoded; text/plain is honored for both methods. */
+	enc = (enctype && streq_ci(enctype, "text/plain")) ? FE_PLAIN : FE_URLENC;
+
 	q[0] = '\0';
-	form_fields(form, q, &qn, sizeof q);
-	if (qn > 0) {
-		on = (int)strlen(out);
-		sapp(out, &on, cap, "?");
-		sapp(out, &on, cap, q);
+	form_fields(form, q, &qn, sizeof q, control, enc);
+
+	if (is_post) {
+		strcpy(fs->method, "POST");
+		if (qn > (int)sizeof fs->body - 1) qn = (int)sizeof fs->body - 1;
+		memcpy(fs->body, q, (unsigned)qn); fs->body[qn] = '\0';
+		fs->body_len = qn;
+		strcpy(fs->ctype, enc == FE_PLAIN ? "text/plain;charset=UTF-8"
+		                                  : "application/x-www-form-urlencoded");
+	} else if (qn > 0) {
+		on = (int)strlen(fs->url);
+		sapp(fs->url, &on, sizeof fs->url, "?");
+		sapp(fs->url, &on, sizeof fs->url, q);
 	}
 	return 1;
 }
@@ -1326,7 +1428,7 @@ static void emit_select(struct dom_node *el)
 {
 	struct dom_node *pick = 0;
 	for (struct dom_node *o = el->first_child; o; o = o->next) {
-		if (o->type == DOM_TEXT || !o->tag || !streq(o->tag, "option")) continue;
+		if (o->type == DOM_TEXT || !streq(o->tag, "option")) continue;
 		if (!pick) pick = o;
 		if (dom_get_attr(o, "selected")) { pick = o; break; }
 	}
@@ -1335,6 +1437,76 @@ static void emit_select(struct dom_node *el)
 		for (struct dom_node *t = pick->first_child; t; t = t->next)
 			if (t->type == DOM_TEXT && t->text) emit_text(t->text);
 	emit_lit(" \xe2\x96\xbe ]", ST_BOLD);   /* small down triangle */
+}
+
+/* Parse a numeric attribute (value/min/max) into thousandths, so "0.6" -> 600 and
+ * "8" -> 8000; missing or non-numeric yields `def`. Keeps <progress>/<meter> math
+ * in integers (no float attr parsing needed). */
+static long attr_milli(struct dom_node *el, const char *name, long def)
+{
+	const char *s = dom_get_attr(el, name);
+	if (!s) return def;
+	while (*s == ' ' || *s == '\t') s++;
+	int neg = 0;
+	if      (*s == '+') s++;
+	else if (*s == '-') { neg = 1; s++; }
+	if (!((*s >= '0' && *s <= '9') || *s == '.')) return def;
+	long ip = 0;
+	while (*s >= '0' && *s <= '9') ip = ip * 10 + (*s++ - '0');
+	long frac = 0, place = 100;             /* first fractional digit is worth 100 milli */
+	if (*s == '.') {
+		s++;
+		while (*s >= '0' && *s <= '9') {
+			if (place > 0) { frac += (long)(*s - '0') * place; place /= 10; }
+			s++;
+		}
+	}
+	long v = ip * 1000 + frac;
+	return neg ? -v : v;
+}
+
+/* Draw a fixed-width fill bar for <progress>/<meter>: fill_milli is 0..1000. */
+static void emit_bar(long fill_milli)
+{
+	if (fill_milli < 0)    fill_milli = 0;
+	if (fill_milli > 1000) fill_milli = 1000;
+	const int cells = 12;
+	int filled = (int)((fill_milli * cells + 500) / 1000);
+	emit_lit("\xe2\x96\x8f", ST_BOLD);              /* ▏ left cap */
+	for (int i = 0; i < cells; i++)
+		emit_lit(i < filled ? "\xe2\x96\x88"    /* █ full block  */
+		                    : "\xe2\x96\x91", 0);  /* ░ light shade */
+	emit_lit("\xe2\x96\x95", ST_BOLD);              /* ▕ right cap */
+	int pct = (int)((fill_milli + 5) / 10);
+	char buf[8]; int k = 0;
+	buf[k++] = ' ';
+	if (pct >= 100) { buf[k++] = '1'; buf[k++] = '0'; buf[k++] = '0'; }
+	else { if (pct >= 10) buf[k++] = (char)('0' + pct / 10); buf[k++] = (char)('0' + pct % 10); }
+	buf[k++] = '%'; buf[k] = 0;
+	emit_lit(buf, 0);
+}
+
+static void emit_progress(struct dom_node *el)
+{
+	if (!dom_get_attr(el, "value")) {               /* indeterminate: a flat striped bar */
+		emit_lit("\xe2\x96\x8f", ST_BOLD);
+		for (int i = 0; i < 12; i++) emit_lit("\xe2\x96\x92", 0);   /* ▒ */
+		emit_lit("\xe2\x96\x95", ST_BOLD);
+		return;
+	}
+	long val = attr_milli(el, "value", 0);
+	long max = attr_milli(el, "max", 1000);
+	if (max <= 0) max = 1000;
+	emit_bar(val * 1000 / max);
+}
+
+static void emit_meter(struct dom_node *el)
+{
+	long val = attr_milli(el, "value", 0);
+	long min = attr_milli(el, "min", 0);
+	long max = attr_milli(el, "max", 1000);
+	if (max <= min) max = min + 1000;
+	emit_bar((val - min) * 1000 / (max - min));
 }
 
 static void walk(struct dom_node *node);
@@ -1348,6 +1520,7 @@ static void walk_element_inner(struct dom_node *el);
  * has no such rule (or its content is empty/non-string). */
 static void emit_pseudo(struct dom_node *el, int which)
 {
+	if (!css_sheet_has_pseudo(g_sheet)) return;   /* no ::before/::after rules -> skip the extra cascade */
 	struct css_style pcs;
 	if (!css_pseudo_content(g_sheet, el, which, &pcs)) return;
 	struct sty sv = sty_cur;
@@ -1416,6 +1589,52 @@ static int li_marker(signed char ls, int n, char *out, int cap)
 	return 1;
 }
 
+/* Map an HTML presentational marker attribute — `type` on ul/ol/li, e.g.
+ * `<ol type="a">` or `<ul type="square">` — to a css_list. A single-letter ol/li
+ * type (1/a/A/i/I) is the ordered form; disc/circle/square the unordered form.
+ * Returns CSS_LST_DEFAULT for an unrecognized value. */
+static signed char list_type_from_attr(const char *v)
+{
+	if (!v || !v[0]) return CSS_LST_DEFAULT;
+	if (!v[1]) switch (v[0]) {                       /* single-letter ordered forms */
+		case '1': return CSS_LST_DECIMAL;
+		case 'a': return CSS_LST_LOWER_ALPHA;
+		case 'A': return CSS_LST_UPPER_ALPHA;
+		case 'i': return CSS_LST_LOWER_ROMAN;
+		case 'I': return CSS_LST_UPPER_ROMAN;
+	}
+	if (streq_ci(v, "disc"))   return CSS_LST_DISC;
+	if (streq_ci(v, "circle")) return CSS_LST_CIRCLE;
+	if (streq_ci(v, "square")) return CSS_LST_SQUARE;
+	if (streq_ci(v, "none"))   return CSS_LST_NONE;
+	return CSS_LST_DEFAULT;
+}
+
+/* Parse a signed integer attribute (`<ol start>` / `<li value>`), returning `dflt`
+ * when the attribute is absent or names no digits. */
+static int attr_int(struct dom_node *el, const char *name, int dflt)
+{
+	const char *v = dom_get_attr(el, name);
+	if (!v) return dflt;
+	while (*v == ' ' || *v == '\t') v++;
+	int neg = 0;
+	if (*v == '-') { neg = 1; v++; } else if (*v == '+') v++;
+	if (*v < '0' || *v > '9') return dflt;
+	int n = 0;
+	for (; *v >= '0' && *v <= '9'; v++) n = n * 10 + (*v - '0');
+	return neg ? -n : n;
+}
+
+/* Count direct <li> element children of a list — the starting ordinal for
+ * `<ol reversed>` with no explicit start. */
+static int count_list_items(struct dom_node *list)
+{
+	int n = 0;
+	for (struct dom_node *c = list->first_child; c; c = c->next)
+		if (c->type == DOM_ELEMENT && streq(c->tag, "li")) n++;
+	return n;
+}
+
 static void walk_element(struct dom_node *el)
 {
 	if (g_walk_depth >= WALK_DEPTH_MAX) return;
@@ -1443,6 +1662,9 @@ static void walk_element_inner(struct dom_node *el)
 	struct css_style cs;
 	compute_style(el, &cs);
 	if (cs.disp == CSS_DISP_NONE) return;                        /* display:none */
+	anim_apply(g_sheet, el, &cs, msec());                        /* overlay @keyframes / transition */
+	if (streq(name, "dialog") && !dom_get_attr(el, "open")) return;   /* closed modal is hidden */
+	if (streq(name, "colgroup") || streq(name, "col")) return;   /* table column metadata, no box */
 
 	if (streq(name, "img"))    { handle_img(el, &cs); return; }
 	if (streq(name, "audio") || streq(name, "video")) { handle_media(el); return; }
@@ -1466,12 +1688,38 @@ static void walk_element_inner(struct dom_node *el)
 		sty_cur = sv; return;
 	}
 	if (streq(name, "textarea")) { g_has_controls = 1; emit_textarea(el); return; }
+	if (streq(name, "progress")) { g_has_controls = 1; emit_progress(el); return; }
+	if (streq(name, "meter"))    { g_has_controls = 1; emit_meter(el);    return; }
+	if (streq(name, "rp"))       return;                         /* ruby fallback parens, hidden */
+	if (streq(name, "q")) {                                      /* auto quotation marks */
+		emit_lit("\xe2\x80\x9c", sty_byte());                /* “ */
+		walk(el);
+		emit_lit("\xe2\x80\x9d", sty_byte());                /* ” */
+		return;
+	}
+	if (streq(name, "rt")) {                                     /* ruby annotation, in parens */
+		unsigned char sv_px = W_fontpx;
+		W_fontpx = clamp_fontpx((W_fontpx ? W_fontpx : HTML_BASE_FONT) * 3 / 4);
+		emit_lit("(", sty_byte()); walk(el); emit_lit(")", sty_byte());
+		W_fontpx = sv_px;
+		return;
+	}
+	if (streq(name, "summary")) {                               /* disclosure heading */
+		block_break();
+		struct sty sv = sty_cur; sty_cur.bold = 1;
+		emit_lit("\xe2\x96\xbe ", ST_BOLD);                  /* ▾ marker */
+		walk(el);
+		sty_cur = sv;
+		block_break();
+		return;
+	}
 
 	struct sty saved = sty_cur;
 	unsigned char sv_size = W_size, sv_center = W_center, sv_mono = W_mono,
 	              sv_indent = W_indent, sv_pre = W_pre, sv_fontpx = W_fontpx;
 	unsigned sv_bg = W_bg;
 	char sv_lt = W_listtype; int sv_ol = W_olnum;
+	signed char sv_lrev = W_listrev, sv_ldef = W_listdef;
 	unsigned char sv_lh = W_lineheight; signed char sv_ls = W_liststyle;
 	int linked = streq(name, "a") ? open_link(el) : 0;
 
@@ -1487,11 +1735,26 @@ static void walk_element_inner(struct dom_node *el)
 	if (cs.font_px >= 0)        W_fontpx = clamp_fontpx(cs.font_px);
 	else if (cs.font_pct >= 0)  W_fontpx = clamp_fontpx((W_fontpx ? W_fontpx : HTML_BASE_FONT) * cs.font_pct / 100);
 	else if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) W_fontpx = ua_h_px[name[1] - '1'];
-	if (streq(name, "center") || cs.center > 0) W_center = 1;
+	else if (streq(name, "small"))                     W_fontpx = clamp_fontpx((W_fontpx ? W_fontpx : HTML_BASE_FONT) * 5 / 6);
+	else if (streq(name, "sub") || streq(name, "sup")) W_fontpx = clamp_fontpx((W_fontpx ? W_fontpx : HTML_BASE_FONT) * 3 / 4);
+	if (streq(name, "center") || streq(name, "caption") || cs.center > 0) W_center = 1;
 	if (streq(name, "pre")) { W_mono = 1; W_pre = 1; }
 	if (streq(name, "blockquote")) W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7);
-	if (streq(name, "ul")) { W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7); W_listtype = 'u'; }
-	if (streq(name, "ol")) { W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7); W_listtype = 'o'; W_olnum = 0; }
+	if (streq(name, "ul") || streq(name, "ol")) {
+		int ordered = name[0] == 'o';
+		W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7);
+		W_listtype = ordered ? 'o' : 'u';
+		W_listdef = list_type_from_attr(dom_get_attr(el, "type"));  /* presentational default */
+		W_listrev = (ordered && dom_get_attr(el, "reversed")) ? -1 : 1;
+		/* Seed the running number so the first item (no `value`) lands on `start`
+		 * (item count for a reversed list, 1 otherwise). W_olnum tracks the LAST
+		 * assigned number; each ordered item steps by W_listrev before use. `start`
+		 * is an <ol> attribute, but the counter resets for a <ul> too so a
+		 * `list-style-type: decimal` unordered list numbers from 1. */
+		int start = ordered ? attr_int(el, "start", W_listrev < 0 ? count_list_items(el) : 1)
+		                    : 1;
+		W_olnum = start - W_listrev;
+	}
 
 	/* white-space: nowrap suppresses line breaks; pre/pre-wrap/pre-line preserve
 	 * spaces+newlines (pre also doesn't wrap). nowrap inherits through sty_cur. */
@@ -1519,17 +1782,28 @@ static void walk_element_inner(struct dom_node *el)
 	if (blk) block_break();
 	if (streq(name, "li")) {                                     /* list marker  */
 		unsigned char a = sty_byte();
+		/* Marker type precedence: author CSS list-style-type (inherited via
+		 * W_liststyle) wins; else the item's own `type` attr; else the list's
+		 * presentational `type`; else the ul/ol default. */
 		signed char ls = W_liststyle;
-		if (ls == CSS_LST_DEFAULT)                              /* no explicit type: ul/ol default */
+		if (ls == CSS_LST_DEFAULT) ls = list_type_from_attr(dom_get_attr(el, "type"));
+		if (ls == CSS_LST_DEFAULT) ls = W_listdef;
+		if (ls == CSS_LST_DEFAULT)
 			ls = (W_listtype == 'o') ? CSS_LST_DECIMAL : CSS_LST_DISC;
 		int ordered = (ls >= CSS_LST_DECIMAL);                  /* numbered kinds advance a counter */
-		int num = ordered ? ++W_olnum : 0;
+		int num = 0;
+		if (ordered) {
+			num = attr_int(el, "value", W_olnum + W_listrev);  /* `value` reseeds the sequence */
+			W_olnum = num;
+		}
 		char mark[24];
 		if (li_marker(ls, num, mark, sizeof mark)) emit_lit(mark, a);
 	}
 	if (blk) {
-		if (cs.bgi.kind == CSS_BGK_URL)         /* resolve its decoded-image index */
+		if (cs.bgi.kind == CSS_BGK_URL) {       /* note the url() for the batched fetch, resolve its index */
+			if (g_frame_depth == 0) bg_note_url(cs.bgi.url);   /* frames don't pull background images */
 			cs.bgi.img_idx = bg_image_index(cs.bgi.url, g_base_url);
+		}
 		layout_box_open(el, &cs, W_n);          /* a block/flex box for the layout tree */
 	}
 	emit_pseudo(el, CSS_PSEUDO_BEFORE);
@@ -1542,7 +1816,12 @@ static void walk_element_inner(struct dom_node *el)
 	sty_cur = saved;
 	W_size = sv_size; W_center = sv_center; W_mono = sv_mono;
 	W_indent = sv_indent; W_pre = sv_pre; W_bg = sv_bg; W_fontpx = sv_fontpx;
-	W_listtype = sv_lt; W_olnum = sv_ol; W_lineheight = sv_lh; W_liststyle = sv_ls;
+	W_listtype = sv_lt; W_listrev = sv_lrev; W_listdef = sv_ldef;
+	W_lineheight = sv_lh; W_liststyle = sv_ls;
+	/* The ordered-list counter is list-scoped, not element-scoped: only a list
+	 * container rolls it back (so a nested list restores the outer running count),
+	 * while sibling <li> increments must persist through their per-element scope. */
+	if (streq(name, "ul") || streq(name, "ol")) W_olnum = sv_ol;
 }
 
 static void walk(struct dom_node *node)
@@ -1565,6 +1844,7 @@ static int   g_nsrc, g_src_cap;
 static char **g_css_url;
 static int   g_n_css_url, g_css_url_cap;
 static const char *g_page_url;
+static res_batch_fn g_page_fetch;    /* batch fetcher stashed for the deferred script pass */
 
 static int css_src_room(void)        /* ensure one free slot in g_src */
 {
@@ -1673,8 +1953,19 @@ static void scan_meta_csp(struct dom_node *node)
 			const char *he = dom_get_attr(c, "http-equiv");
 			const char *ct = dom_get_attr(c, "content");
 			if (he && ct && ct[0] && streq_ci(he, "content-security-policy")) {
-				if (!B->pg->csp) B->pg->csp = csp_new();
-				csp_add(B->pg->csp, ct);
+				/* The DOM keeps attribute values raw, so a meta CSP's quote-
+				 * keywords arrive entity-encoded ('none' as &#39;none&#39;). Decode
+				 * on a copy before parsing, or every 'self'/'nonce-'/'unsafe-inline'
+				 * fails the source grammar and the policy blocks its own inline. */
+				int cl = (int)strlen(ct);
+				char *dec = malloc((unsigned)cl + 1);
+				if (dec) {
+					for (int i = 0; i <= cl; i++) dec[i] = ct[i];
+					decode_entities(dec);
+					if (!B->pg->csp) B->pg->csp = csp_new();
+					csp_add(B->pg->csp, dec);
+					free(dec);
+				}
 			}
 		} else {
 			scan_meta_csp(c);
@@ -1867,91 +2158,42 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
 }
 
 /* ---------------------------------------------------- url() backgrounds ---- *
- * Mirrors load_faces: walk the DOM once, collect every element's url() background
- * (resolved + img-src checked + deduped), batch-fetch and PNG-decode them into the
- * page's bgimgs table. A box records its entry's index (bg_image_index); paint_boxes
- * blits with background-size/-position/-repeat. Built before the layout walk so an
- * index is resolvable as each box opens. */
+ * Each url() background is collected once, during the single layout walk (bg_note_url,
+ * from the cascade the walk already ran — no second compute_style pass over the DOM),
+ * then load_bg_images batch-fetches + PNG-decodes them into the page's bgimgs table
+ * and points each box at its decoded entry (bg_image_index); paint_boxes blits with
+ * background-size/-position/-repeat. */
 #define BGIMG_MAX 32
 static char g_bgabs[BGIMG_MAX][URL_MAX];   /* table key: resolved abs URL          */
 static char g_bguse[BGIMG_MAX][URL_MAX];   /* fetch URL (post-CSP, maybe upgraded)  */
+static int  g_nbg;                         /* urls collected by the walk this pass  */
 
-struct memrd { const unsigned char *d; int len, pos; };
-static int memrd_get(void *c) { struct memrd *r = c; return r->pos < r->len ? r->d[r->pos++] : -1; }
-
-struct bgfill { unsigned char *buf; unsigned iw, ih; };
-static int bgfill_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
+/* Note one block box's url() background for the batched fetch: resolve against the
+ * page base, apply img-src CSP, dedup. Called by the walk for top-document boxes,
+ * reusing the box's already-cascaded bgi rather than re-running the cascade. */
+static void bg_note_url(const char *raw_url)
 {
-	struct bgfill *f = c;
-	if (y < f->ih) { unsigned n = (w < f->iw ? w : f->iw) * 4; memcpy(f->buf + (unsigned long)y * f->iw * 4, rgba, n); }
-	return 0;
+	if (!raw_url || !raw_url[0] || g_nbg >= BGIMG_MAX) return;
+	char abs[URL_MAX], use[URL_MAX];
+	resolve_url(g_base_url, raw_url, abs, sizeof abs);
+	if (!csp_url_ok(CSP_IMG, abs, "image", use, sizeof use)) return;
+	for (int i = 0; i < g_nbg; i++) if (streq(g_bgabs[i], abs)) return;
+	int k = 0; for (; abs[k] && k < URL_MAX - 1; k++) g_bgabs[g_nbg][k] = abs[k]; g_bgabs[g_nbg][k] = '\0';
+	k = 0;     for (; use[k] && k < URL_MAX - 1; k++) g_bguse[g_nbg][k] = use[k]; g_bguse[g_nbg][k] = '\0';
+	g_nbg++;
 }
 
-/* Decode a PNG buffer into a fresh RGBA image (NULL on failure / non-PNG). */
-static unsigned char *decode_png_rgba(const unsigned char *data, int len, unsigned *ow, unsigned *oh)
-{
-	struct memrd r = { data, len, 0 };
-	unsigned w = 0, h = 0;
-	if (upng_dimensions(memrd_get, &r, &w, &h) != UPNG_OK || !w || !h) return 0;
-	if ((unsigned long)w * h > 4096u * 4096u) return 0;             /* sanity cap */
-	unsigned char *buf = malloc((unsigned long)w * h * 4);
-	if (!buf) return 0;
-	memset(buf, 0, (unsigned long)w * h * 4);
-	r.pos = 0;
-	struct bgfill f = { buf, w, h };
-	if (upng_decode(memrd_get, &r, bgfill_row, &f, 0, 0) != UPNG_OK) { free(buf); return 0; }
-	*ow = w; *oh = h;
-	return buf;
-}
-
-/* The per-node body, kept OUT of the recursive frame below: compute_style plus
- * the two URL_MAX (2 KiB each) scratch buffers and the css_style live here, so
- * they sit on the stack only for the node being examined — not once per DOM
- * level. Inline, they made each collect_bg_urls frame ~5 KiB, so a page nested
- * deeper than ~12 elements overflowed the fixed 64 KiB worker stack into .bss
- * (corrupting tabs/active_tab and crashing). */
-static void bg_collect_node(struct dom_node *c, const char *page_url, int *nu)
-{
-	struct css_style cs;
-	compute_style(c, &cs);
-	if (cs.disp != CSS_DISP_NONE && cs.bgi.kind == CSS_BGK_URL && cs.bgi.url[0] && *nu < BGIMG_MAX) {
-		char abs[URL_MAX], use[URL_MAX];
-		resolve_url(page_url, cs.bgi.url, abs, sizeof abs);
-		if (csp_url_ok(CSP_IMG, abs, "image", use, sizeof use)) {
-			int dup = 0;
-			for (int i = 0; i < *nu; i++) if (streq(g_bgabs[i], abs)) { dup = 1; break; }
-			if (!dup) {
-				int k = 0; for (; abs[k] && k < URL_MAX - 1; k++) g_bgabs[*nu][k] = abs[k]; g_bgabs[*nu][k] = '\0';
-				k = 0; for (; use[k] && k < URL_MAX - 1; k++) g_bguse[*nu][k] = use[k]; g_bguse[*nu][k] = '\0';
-				(*nu)++;
-			}
-		}
-	}
-}
-
-/* Hard ceiling on DOM-recursion depth: even with a tiny per-frame footprint, an
- * adversarially (or accidentally) deep tree shouldn't be able to exhaust the
- * worker stack. Real documents nest far shallower; deeper subtrees simply don't
- * contribute background images. */
-#define BG_MAX_DEPTH 256
-static void collect_bg_urls(struct dom_node *node, const char *page_url, int *nu, int depth)
-{
-	if (depth >= BG_MAX_DEPTH) return;
-	for (struct dom_node *c = node->first_child; c; c = c->next) {
-		if (c->type != DOM_ELEMENT) continue;
-		bg_collect_node(c, page_url, nu);
-		collect_bg_urls(c, page_url, nu, depth + 1);
-	}
-}
-
-static void load_bg_images(struct dom_node *root, const char *page_url, res_batch_fn fetch)
+/* Fetch + decode the url() backgrounds collected during the layout walk (g_bgabs/
+ * g_bguse), then point each box at its decoded entry. Runs once per navigation, AFTER
+ * the walk built the box tree — the walk's first pass resolved img_idx against an
+ * empty table (-1), so the fix-up loop below re-resolves once the table exists. */
+static void load_bg_images(const char *page_url, res_batch_fn fetch)
 {
 	for (int i = 0; i < B->pg->n_bgimgs; i++) free(B->pg->bgimgs[i].rgba);   /* drop the old page's */
 	free(B->pg->bgimgs);
 	B->pg->bgimgs = 0; B->pg->n_bgimgs = B->pg->bgimgs_cap = 0;
 
-	int nu = 0;
-	collect_bg_urls(root, page_url, &nu, 0);
+	int nu = g_nbg;
 	if (nu == 0) return;
 
 	struct bg_img *tab = malloc((unsigned)nu * sizeof *tab);
@@ -1969,7 +2211,7 @@ static void load_bg_images(struct dom_node *root, const char *page_url, res_batc
 			tab[n].url[k] = '\0';
 			tab[n].iw = tab[n].ih = 0; tab[n].rgba = 0;
 			if (bodies[i] && lens[i] > 0) {
-				unsigned w, h; unsigned char *rg = decode_png_rgba(bodies[i], lens[i], &w, &h);
+				unsigned w, h; unsigned char *rg = image_decode_rgba(bodies[i], lens[i], 0, 512, &w, &h);
 				if (rg) { tab[n].rgba = rg; tab[n].iw = w; tab[n].ih = h; }
 			}
 			free(bodies[i]);
@@ -1980,6 +2222,13 @@ static void load_bg_images(struct dom_node *root, const char *page_url, res_batc
 
 	blk_lock();
 	B->pg->bgimgs = tab; B->pg->n_bgimgs = n; B->pg->bgimgs_cap = nu;
+	/* Re-resolve each box's decoded-image index now the table exists (the walk's
+	 * first pass ran with an empty table). */
+	int nboxes = 0;
+	struct lbox *boxes = layout_pool(&nboxes);
+	for (int i = 0; i < nboxes; i++)
+		if (boxes[i].bgi.kind == CSS_BGK_URL && boxes[i].bgi.url[0])
+			boxes[i].bgi.img_idx = bg_image_index(boxes[i].bgi.url, page_url);
 	blk_unlock();
 }
 
@@ -2035,15 +2284,18 @@ static void compute_page_colors(struct dom_node *root)
 static void layout_dom(void)
 {
 	css_set_viewport(BW, BH);        /* so @media re-evaluates at the current size */
+	anim_frame_begin(msec());        /* advance the animation clock for this walk */
 	B->pg->nlinks = 0;
 	B->pg->n_imgs = 0;
 	B->img_pool_len = 0;
 	compute_page_colors(g_live_dom);
 	sty_cur.fg = B->pg->page_fg; sty_cur.bold = sty_cur.under = 0;
-	sty_cur.italic = sty_cur.nowrap = sty_cur.ttx = 0;
+	sty_cur.italic = sty_cur.nowrap = sty_cur.ttx = sty_cur.smallcaps = 0;
 	W_bg = BG_NONE; W_lineheight = 0; W_liststyle = CSS_LST_DEFAULT;
+	W_listtype = 0; W_olnum = 0; W_listrev = 1; W_listdef = CSS_LST_DEFAULT;
 	W_n = 0; W_pend_sp = 0; W_run_nl = 1; W_cur_link = -1;
 	g_nspans = 0;
+	g_nbg = 0;                       /* url() backgrounds re-collected during this walk */
 	layout_reset();                  /* fresh box tree for this walk */
 	g_has_controls = 0;
 	/* Reset the frame walk context to the top document (the cache itself persists
@@ -2067,6 +2319,7 @@ void html_page_teardown(void)
 	if (g_sheet)    { css_free(g_sheet);    g_sheet = 0; }
 	frames_free();                     /* drop this page's iframe sub-documents */
 	layout_free();                     /* drop the box tree */
+	anim_reset();                      /* drop per-element animation/transition state */
 	g_nspans = 0;
 	g_focus = 0; B->focus_kind = 0;
 }
@@ -2183,30 +2436,40 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 		 * the renderer sees B->pg->body_font for this page's text). */
 		load_faces(root, g_page_url, fetch);
 
-		/* url() backgrounds: fetch+decode before the walk so each box can resolve its
-		 * decoded-image index as it opens. */
-		load_bg_images(root, g_page_url, fetch);
-
-		/* Lay out and paint the parsed page BEFORE running scripts: a slow or
-		 * long-running script (e.g. a setInterval-heavy SPA) must not keep the
-		 * page blank. The main thread repaints from B->seq within a frame while
-		 * JS keeps running on this worker thread. */
+		/* Lay out the parsed page now; the worker publishes + paints it before any
+		 * script runs (see below), so a slow or long-running script never keeps the
+		 * page blank — the HTML shows as soon as it is parsed, as Chrome does. */
 		layout_dom();
+
+		/* url() backgrounds: fetch+decode the urls the walk just collected, then
+		 * point each box at its decoded entry (no second cascade over the DOM). */
+		load_bg_images(g_page_url, fetch);
 		B->seq++;
 
-		/* Then run scripts (`fetch` pulls external <script src>); the JS context
-		 * stays alive past this call so listeners/timers fire later. Relayout only
-		 * if a script actually mutated the DOM — listener-only scripts need none. */
-		unsigned mseq = dom_mutation_seq;
-		js_run_document(root, g_page_url, fetch);
-		if (dom_mutation_seq != mseq)
-			layout_dom();
+		/* Defer the page's <script>s. Running them here would keep `loading` set and
+		 * the line table unbuilt until every script finished, so the whole page
+		 * would sit on "Loading ..." for the duration of the JS. Instead the worker
+		 * paints this laid-out page first, then calls html_run_page_scripts() on its
+		 * next pass (see worker_fn). */
+		g_page_fetch = fetch;
+		B->scripts_pending = 1;
 	} else {
 		B->pg->text_len = 0;
 	}
 	g_csp_report = 0;               /* later relayouts re-decide silently (no log spam) */
 	/* DOM + sheet + JS context are NOT freed here — they live until the next
 	 * navigation (html_page_teardown), so events keep working after load. */
+}
+
+/* Run the current page's <script>s (`fetch` pulls external <script src>). Split
+ * out of html_to_text and invoked by the worker only AFTER the parsed page has
+ * been laid out and painted, so JS never blocks the first paint. The JS context
+ * stays alive past this call so listeners/timers fire later; a script that
+ * mutates the DOM is re-laid-out by the caller (worker_fn). */
+void html_run_page_scripts(void)
+{
+	if (!g_live_dom) return;
+	js_run_document(g_live_dom, g_page_url, g_page_fetch);
 }
 
 /* Render a non-HTML text body verbatim into the styled-text buffer: newlines

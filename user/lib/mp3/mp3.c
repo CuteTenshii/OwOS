@@ -7,9 +7,9 @@
  *
  * minimp3 is freestanding: no libm (it ships precomputed gain/window tables), no
  * malloc, no 64-bit division — exactly what the OwOS user libc can link (bare ld,
- * no libgcc). Its only libc dependency is memcpy/memset/memmove, provided below
- * so the linker and the compiler's struct-copy lowering both resolve. SIMD is
- * compiled out (MINIMP3_NO_SIMD).
+ * no libgcc). Its only libc dependency is memcpy/memset/memmove, resolved by the
+ * OwOS user libc (lib.c) for both the explicit calls and the compiler's
+ * struct-copy lowering. SIMD is compiled out (MINIMP3_NO_SIMD).
  */
 
 #include <stddef.h>
@@ -53,12 +53,21 @@ static int mp3_decode_one(mp3_t *m)
 		} else if (m->src_eof) {
 			return 0;                      /* no frame and no more data */
 		} else if (m->in_len >= (int)sizeof m->in) {
-			/* full window, no progress: drop a byte to resync */
-			memmove(m->in, m->in + 1, (unsigned)(m->in_len - 1));
-			m->in_len -= 1;
+			/* Full window, no frame: skip past this byte to the next 0xFF.
+			 * An MPEG frame sync starts with 0xFF, so nothing decodable can
+			 * begin before it; scanning there (vs dropping one byte and
+			 * rescanning the whole window) keeps garbage resync ~linear. */
+			int skip = 1;
+			while (skip < m->in_len && m->in[skip] != 0xFF)
+				skip++;
+			memmove(m->in, m->in + skip, (unsigned)(m->in_len - skip));
+			m->in_len -= skip;
 		}
 
 		if (samples > 0) {
+			/* Per-frame rate/channels, but /bin/play (via media.c) latches
+			 * the open-time rate for its resampler — a mid-stream rate change
+			 * plays at the wrong pitch. Fine for the CBR target; known limit. */
 			m->rate       = (unsigned)info.hz;
 			m->channels   = (unsigned)info.channels;
 			m->out_ch     = info.channels;

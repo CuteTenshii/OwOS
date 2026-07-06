@@ -5,7 +5,6 @@
 #include "keyboard.h"
 #include "irq.h"
 #include "io.h"
-#include "screenshot.h"
 #include "serial.h"
 #include "sb16.h"
 #include "hda.h"
@@ -179,7 +178,7 @@ static int altgr_held;
 static int ctrl_held;
 static int alt_held;               /* left Alt, for Alt+Tab window switching   */
 static int alt_tabbed;             /* Tab was pressed during this Alt hold     */
-static int super_held;             /* GUI/Win key, for Super+V (clipboard history) */
+static int super_held;             /* GUI/Win key held; folds into KMOD_SUPER on any chord */
 static int super_chorded;          /* a Super+key fired during this Super hold */
 static int expecting_extended;
 static int num_lock = 1;           /* on by default, like most BIOSes        */
@@ -210,6 +209,11 @@ static volatile uint8_t ring_tail;
 /* Ctrl+C is a latch, not a queued key: it must interrupt a running command,
  * which is busy in a loop and never draining the ring. Consumers poll it. */
 static volatile int int_pending;
+
+/* Print Screen is a latch too: the IRQ can't capture the framebuffer, so it just
+ * flags the request; SYS_INPUT_POLL drains it into a KEY_PRTSC event and the
+ * compositor (which owns the framebuffer) takes the shot. */
+static volatile int scrshot_pending;
 
 /* The modifier set currently held, as KMOD_* flags. Sampled when a key is queued
  * so the consumer learns which chord produced it. */
@@ -254,6 +258,15 @@ int keyboard_take_interrupt(void)
 	return v;
 }
 
+/* Returns 1 (and clears the latch) if Print Screen has been pressed since the
+ * last call. SYS_INPUT_POLL polls it and surfaces KEY_PRTSC to the compositor. */
+int keyboard_take_screenshot(void)
+{
+	int v = scrshot_pending;
+	scrshot_pending = 0;
+	return v;
+}
+
 /* Raise the interrupt latch from outside the IRQ handler -- the serial console
  * uses this so a Ctrl+C typed in the host terminal stops a running command too. */
 void keyboard_signal_interrupt(void)
@@ -281,7 +294,7 @@ static void process_extended(uint8_t sc)
 		return;
 	}
 	if (sc == 0x37) {          /* Print Screen make (E0 2A E0 37)        */
-		screenshot_request();
+		scrshot_pending = 1;   /* compositor drains it via SYS_INPUT_POLL */
 		return;
 	}
 	if (sc == 0x5B || sc == 0x5C) {        /* GUI/Win key down            */
@@ -408,21 +421,26 @@ static int process_keypad(uint8_t sc)
 	return 0;
 }
 
-/* Super+V (cliphist) and Ctrl chords. 1 if consumed. */
+/* Super+ and Ctrl+ chords: forward the base key carrying its modifier (cur_mods)
+ * and let the consumer map the chord. The driver names no chord — it doesn't know
+ * "cliphist" or "save"; it just delivers key + KMOD_*. 1 if consumed. */
 static int process_chords(uint8_t sc)
 {
-	if (super_held && active_map[sc] == 'v') {
-		/* Consume Super+V so releasing Super doesn't toggle the Start menu, and
-		 * emit KEY_CLIPHIST — the user-space compositor opens the clipboard-history
-		 * viewer (the kernel no longer runs a WM to spawn it). */
+	if (super_held && active_map[sc]) {
+		/* Any Super+<key>: forward the key with KMOD_SUPER; the compositor decides
+		 * what it means (Super+V opens clipboard history, etc.). Mark super chorded
+		 * so releasing Super doesn't also toggle the Start menu. */
 		super_chorded = 1;
-		ring_push(KEY_CLIPHIST);
+		ring_push(active_map[sc]);
 		return 1;
 	}
 	if (ctrl_held) {
 		char m = active_map[sc];                 /* the unshifted key, layout-aware */
-		if      (m == 'c') int_pending = 1;      /* interrupt (latched)             */
-		else if (m)        ring_push(m);         /* letter + KMOD_CTRL via cur_mods */
+		/* Ctrl+C stays a kernel concern — it's a latch (not a chord code) so it can
+		 * interrupt a busy kernel loop that never drains the ring. Everything else
+		 * is the letter + KMOD_CTRL for the consumer to interpret. */
+		if      (m == 'c') int_pending = 1;
+		else if (m)        ring_push(m);
 		return 1;
 	}
 	return 0;

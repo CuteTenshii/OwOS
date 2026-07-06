@@ -13,6 +13,7 @@
 typedef struct {
     const char *msg;    /* NULL when parsing succeeded */
     int         line;
+    int         col;    /* 1-based column of the offending token */
 } js_parse_error;
 
 /* Parse NUL-terminated UTF-8 `src` into a JS_PROGRAM node allocated from

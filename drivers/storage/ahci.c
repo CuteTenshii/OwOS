@@ -276,6 +276,9 @@ void ahci_init(void)
 		con_write("ahci: could not map MMIO\n");
 		return;
 	}
+	/* MMIO must be uncached, or on real hardware a command-list/doorbell write can
+	 * linger in the write-back cache and the HBA never sees it. QEMU hides this. */
+	paging_mark_uc(bar5, 0x2000);
 	abar = (volatile uint32_t *)bar5;
 
 	hba_wr(HBA_GHC, hba_rd(HBA_GHC) | GHC_AE); /* take the HBA out of legacy mode */

@@ -78,6 +78,7 @@ typedef struct {
 	uint8_t  *end;
 	uint32_t  bitIndex;
 	uint32_t  byteSize;
+	int       error;      /* latched once a read/advance would cross `end` */
 } BitBuffer;
 
 static void BitBufferInit(BitBuffer *bits, uint8_t *buffer, uint32_t byteSize)
@@ -86,11 +87,21 @@ static void BitBufferInit(BitBuffer *bits, uint8_t *buffer, uint32_t byteSize)
 	bits->end = buffer + byteSize;
 	bits->bitIndex = 0;
 	bits->byteSize = byteSize;
+	bits->error = 0;
+}
+
+/* Bits still readable from the current position to `end`; 0 once exhausted. */
+static uint32_t BitBufferRemaining(const BitBuffer *bits)
+{
+	if (bits->cur >= bits->end) return 0;
+	return (uint32_t)(bits->end - bits->cur) * 8 - bits->bitIndex;
 }
 
 static uint32_t BitBufferRead(BitBuffer *bits, uint8_t numBits)   /* <= 16 bits */
 {
-	uint32_t returnBits = ((uint32_t)bits->cur[0] << 16) | ((uint32_t)bits->cur[1] << 8) | bits->cur[2];
+	uint32_t returnBits;
+	if (BitBufferRemaining(bits) < numBits) { bits->error = 1; return 0; }
+	returnBits = ((uint32_t)bits->cur[0] << 16) | ((uint32_t)bits->cur[1] << 8) | bits->cur[2];
 	returnBits = returnBits << bits->bitIndex;
 	returnBits &= 0x00FFFFFF;
 	bits->bitIndex += numBits;
@@ -102,7 +113,9 @@ static uint32_t BitBufferRead(BitBuffer *bits, uint8_t numBits)   /* <= 16 bits 
 
 static uint8_t BitBufferReadSmall(BitBuffer *bits, uint8_t numBits)   /* <= 8 bits */
 {
-	uint16_t returnBits = (bits->cur[0] << 8) | bits->cur[1];
+	uint16_t returnBits;
+	if (BitBufferRemaining(bits) < numBits) { bits->error = 1; return 0; }
+	returnBits = (bits->cur[0] << 8) | bits->cur[1];
 	returnBits = returnBits << bits->bitIndex;
 	bits->bitIndex += numBits;
 	returnBits = returnBits >> (16 - numBits);
@@ -113,7 +126,9 @@ static uint8_t BitBufferReadSmall(BitBuffer *bits, uint8_t numBits)   /* <= 8 bi
 
 static uint8_t BitBufferReadOne(BitBuffer *bits)
 {
-	uint8_t returnBits = (bits->cur[0] >> (7 - bits->bitIndex)) & 1;
+	uint8_t returnBits;
+	if (BitBufferRemaining(bits) < 1) { bits->error = 1; return 0; }
+	returnBits = (bits->cur[0] >> (7 - bits->bitIndex)) & 1;
 	bits->bitIndex++;
 	bits->cur += (bits->bitIndex >> 3);
 	bits->bitIndex &= 7;
@@ -129,6 +144,8 @@ static uint32_t BitBufferGetPosition(BitBuffer *bits)
 static void BitBufferAdvance(BitBuffer *bits, uint32_t numBits)
 {
 	if (numBits) {
+		uint32_t remaining = BitBufferRemaining(bits);
+		if (numBits > remaining) { numBits = remaining; bits->error = 1; }
 		bits->bitIndex += numBits;
 		bits->cur += (bits->bitIndex >> 3);
 		bits->bitIndex &= 7;
@@ -533,9 +550,16 @@ static void unpc_block(int32_t *pc1, int32_t *out, int32_t num, int16_t *coefs,
 		}
 		return;
 	}
-	for (j = 1; j <= numactive; j++) {
-		del = pc1[j] + out[j - 1];
-		out[j] = (del << chanshift) >> chanshift;
+	/* Warmup writes out[1..numactive] unconditionally. In a valid stream num is
+	 * always > numactive, but both num (numSamples) and numactive (numU/numV) are
+	 * attacker-controlled and only bounded by frame_length; a hostile packet with
+	 * numactive >= num would run this loop past the num-sized buffer. Clamp it. */
+	{
+		int32_t warm = (numactive < num) ? numactive : (num - 1);
+		for (j = 1; j <= warm; j++) {
+			del = pc1[j] + out[j - 1];
+			out[j] = (del << chanshift) >> chanshift;
+		}
 	}
 	lim = numactive + 1;
 	for (j = lim; j < num; j++) {
@@ -669,7 +693,10 @@ static int dyn_decomp(AGParamRec *params, BitBuffer *bitstream, int32_t *pc,
 	*outNumBits = 0;
 	in = bitstream->cur;
 	startPos = bitstream->bitIndex;
-	maxPos = bitstream->byteSize * 8;
+	/* dyn_get* read via read32bit(in + bitPos/8) — relative to `in`, which has
+	 * already advanced. Bound bitPos by the bits left from `in` to `end` (not from
+	 * the buffer start) or the guard `bitPos >= maxPos` lets reads run past end. */
+	maxPos = (uint32_t)(bitstream->end - in) * 8;
 	bitPos = startPos;
 	mb = params->mb0;
 	zmode = 0;
@@ -893,6 +920,7 @@ int alac_parse_cookie(const uint8_t *cookie, uint32_t len, alac_config *out)
 	    out->bit_depth != 24 && out->bit_depth != 32) return ALAC_EFORMAT;
 	if (out->num_channels < 1 || out->num_channels > 2) return ALAC_EFORMAT;
 	if (out->frame_length == 0 || out->frame_length > (1u << 20)) return ALAC_EFORMAT;
+	if (out->kb > 31) return ALAC_EFORMAT;   /* used as `1u << kb` in set_ag_params */
 	return ALAC_OK;
 }
 
@@ -939,6 +967,9 @@ alac_decoder *alac_decoder_open(const alac_config *c)
 	uint32_t fl;
 	if (!c || (c->num_channels < 1) || (c->num_channels > 2)) return NULL;
 	if (c->bit_depth != 16 && c->bit_depth != 20 && c->bit_depth != 24 && c->bit_depth != 32) return NULL;
+	/* Bound frame_length here too (not only in parse_cookie): a direct caller with a
+	 * huge value overflows alac_max_packet_size (frame_length*channels*n) in 32-bit. */
+	if (c->frame_length == 0 || c->frame_length > (1u << 20)) return NULL;
 	d = (alac_decoder *)malloc(sizeof *d);
 	if (!d) return NULL;
 	memset(d, 0, sizeof *d);
@@ -989,6 +1020,7 @@ int alac_decode(alac_decoder *d, const uint8_t *packet, uint32_t packet_bytes,
 
 	while (status == ALAC_OK) {
 		if (bits.cur >= bits.end) { status = ALAC_EFORMAT; goto Exit; }
+		if (bits.error) { status = ALAC_EFORMAT; goto Exit; }   /* a read crossed end */
 		pb = d->cfg.pb;
 		tag = BitBufferReadSmall(&bits, 3);
 		if (tag == ID_SCE || tag == ID_LFE) {
@@ -1002,6 +1034,7 @@ int alac_decode(alac_decoder *d, const uint8_t *packet, uint32_t packet_bytes,
 			shift = bytesShifted * 8;
 			escapeFlag = headerByte & 0x1;
 			chanBits = d->cfg.bit_depth - (bytesShifted * 8);
+			if (chanBits == 0 || chanBits > 32) { status = ALAC_EFORMAT; goto Exit; }
 			if (partialFrame != 0) {
 				numSamples = BitBufferRead(&bits, 16) << 16;
 				numSamples |= BitBufferRead(&bits, 16);
@@ -1085,6 +1118,7 @@ int alac_decode(alac_decoder *d, const uint8_t *packet, uint32_t packet_bytes,
 			shift = bytesShifted * 8;
 			escapeFlag = headerByte & 0x1;
 			chanBits = d->cfg.bit_depth - (bytesShifted * 8) + 1;
+			if (chanBits == 0 || chanBits > 32) { status = ALAC_EFORMAT; goto Exit; }
 			if (partialFrame != 0) {
 				numSamples = BitBufferRead(&bits, 16) << 16;
 				numSamples |= BitBufferRead(&bits, 16);

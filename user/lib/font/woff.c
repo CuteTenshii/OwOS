@@ -435,7 +435,7 @@ static int reconstruct_glyf(const unsigned char *data, int tlen,
 			int total = 0;
 			int npc[256]; int *npv = npc;
 			if (nc > 256) { npv = malloc(sizeof(int) * nc); if (!npv) goto fail; }
-			for (int j = 0; j < nc; j++) { npv[j] = r255(&n_points); total += npv[j]; }
+			for (int j = 0; j < nc; j++) { npv[j] = r255(&n_points); total += npv[j]; if (total < 0) { if (npv != npc) free(npv); goto fail; } }
 			if (n_points.err) { if (npv != npc) free(npv); goto fail; }
 			if (total > flag_s.len - flag_s.pos) { if (npv != npc) free(npv); goto fail; }
 			const unsigned char *fb = flag_s.p + flag_s.pos;
@@ -568,6 +568,7 @@ static unsigned char *woff2_to_sfnt(const unsigned char *data, int len, int *out
 			tflags[i] = transformed;
 			src_off[i] = acc;
 			src_len[i] = tlen;
+			if (acc + tlen < acc) goto hdr_fail;   /* cumulative-length overflow */
 			acc += tlen;
 		}
 		/* combined brotli stream follows the directory */
@@ -598,6 +599,7 @@ static unsigned char *woff2_to_sfnt(const unsigned char *data, int len, int *out
 				if (reconstruct_glyf(sp, (int)src_len[i], &glyf_buf, &glyf_len, &loca_buf, &loca_len, &num_glyphs, &xmins) != 0) { free(unc); goto hdr_fail; }
 				t[i].data = glyf_buf; t[i].len = glyf_len; t[i].owned = 1;
 				t[i].checksum = table_checksum(glyf_buf, glyf_len);
+				glyf_buf = 0;   /* owned by t[i] now; hdr_fail frees it — don't double-free */
 			} else if (t[i].tag == TAG_LOCA) {
 				/* produced alongside glyf; filled in below once both exist */
 				t[i].data = 0; t[i].owned = 0;

@@ -26,6 +26,18 @@
 #include "netconn.h" /* TCP-or-TLS transport wrapper (h2/h1.1 over user-space TLS) */
 #include "dom.h"     /* DOM tree + the shared lower/starts_ci/streq_ci helpers  */
 #include "csp.h"     /* Content-Security-Policy engine (per-page enforcement)   */
+#include "permissions.h" /* per-origin permission store + Permissions-Policy    */
+
+/* One canonical User-Agent, shared by the HTTP transport and the JS navigator
+ * (userAgent/appVersion), so the string a site sees over the wire and the one it
+ * reads from script never disagree. It keeps OwOS's own identity but carries a
+ * well-formed WebKit/Chrome/Safari token chain so UA parsers that gate on a known
+ * engine (Cloudflare et al.) don't reject it as malformed. The machine arch comes
+ * from uname(2) and the version from OWOS_VERSION — neither is hardcoded; both are
+ * resolved once at first use. browser_ua() is the full "Mozilla/..." string;
+ * browser_ua_version() is it minus "Mozilla/" (navigator.appVersion). */
+const char *browser_ua(void);
+const char *browser_ua_version(void);
 
 extern int BW, BH;         /* client size (mutable: the window is resizable)    */
 #define MENU_H    18       /* top app-menu bar height (above the address bar)  */
@@ -70,6 +82,7 @@ extern int BW, BH;         /* client size (mutable: the window is resizable)    
  * with curl) and the html.c link store; see worker_stack below for the matching
  * stack headroom. */
 #define URL_MAX   2048
+#define POST_BODY_MAX 8192   /* cap on a form/POST request body (see struct form_submission) */
 #define MAX_REDIR 5
 #define FAVICON_W  16      /* favicon decoded to a fixed 16x16 ARGB bitmap and */
 #define FAVICON_H  16      /* shown in the page's tab (0xAARRGGBB per pixel)   */
@@ -79,6 +92,7 @@ extern int BW, BH;         /* client size (mutable: the window is resizable)    
 #define ST_BOLD    0x10
 #define ST_UNDER   0x20
 #define ST_ITALIC  0x40            /* font-style:italic — drawn with a faux-italic shear */
+#define ST_STRIKE  0x80            /* line-through (del/s/strike, text-decoration) */
 
 /* Per-glyph background sentinel: B->bg[i] == BG_NONE means "no background"
  * (a real CSS colour is 0x000000..0xFFFFFF, so the high byte is free). */
@@ -186,6 +200,7 @@ struct page {
 	int      scroll;                 /* vertical scroll position, document pixels */
 
 	struct csp *csp;                 /* the page's Content-Security-Policy set    */
+	unsigned perm_policy;            /* Permissions-Policy: bitmap of blocked features (permissions.h) */
 
 	/* @font-face faces loaded for this page (family + parsed font + owned bytes);
 	 * body_font is the face the body text uses, or NULL for the baked UI font. */
@@ -206,12 +221,30 @@ struct browser {
 	char     addr[URL_MAX];      /* address-bar buffer (owned by addr_tf)       */
 	struct textfield addr_tf;    /* editable address-bar field (caret + scroll) */
 	char     req_url[URL_MAX];
+	/* The queued navigation's HTTP method + body. Empty req_method means GET (the
+	 * common case); a form POST fills these alongside req_url. Set and consumed on
+	 * the worker thread (do_fetch clears req_method after capturing it), so no
+	 * lock is needed; the GET navigation setters clear req_method so a prior POST
+	 * never leaks into the next GET. */
+	char     req_method[8];
+	char     req_body[POST_BODY_MAX];
+	int      req_body_len;
+	char     req_ctype[80];
 	int      req_pending;
 	int      loading;
 	volatile int abort_load;     /* main -> worker: cancel the in-flight fetch
 	                              * (Stop button / Page>Stop / closing the tab). The
 	                              * body readers poll it and bail; cleared when the
 	                              * worker picks up the next navigation.            */
+	volatile int scripts_pending;/* worker: the page is parsed, laid out and painted
+	                              * with all its assets fetched; run its <script>s on
+	                              * the NEXT worker pass. `loading` clears there (the
+	                              * load is complete once assets are in), before the
+	                              * scripts execute — so JS never blocks first paint
+	                              * nor the "loaded" state.                           */
+	volatile int in_scripts;     /* worker is executing the deferred script pass with
+	                              * `loading` already clear; load_quiesce waits on this
+	                              * too so a tab switch can't swap the page mid-script.*/
 
 	bool     nosniff;               /* X-Content-Type-Options: nosniff       */
 	char     dl_name[128];           /* filename from Content-Disposition     */
@@ -247,6 +280,10 @@ struct browser {
 
 	int      sb_drag;
 	unsigned seq;
+	unsigned layout_seq;     /* reflow generation: bumped whenever rewrap re-flows the
+	                          * line table (resize, late image, @font-face). Lets the
+	                          * devtools snapshot track geometry without rebuilding on
+	                          * every unrelated repaint. */
 
 	/* A content-pane interaction the main thread hands to the worker to dispatch
 	 * through the live JS DOM (the engine is single-threaded, worker-owned). The
@@ -259,6 +296,13 @@ struct browser {
 	char     evt_text[URL_MAX];      /* payload: the link href for click default,
 	                                  * or the new field value for input/change    */
 	volatile int drop_dom;           /* main asks the worker to free the live page  */
+	volatile int drop_dom_tab;       /* the tab that owned the DOM being torn down, so
+	                                  * a teardown fault is blamed on it and not on
+	                                  * whatever tab B->pg was swapped to meanwhile   */
+	volatile int worker_pause;       /* main -> worker: park at the top of the loop so
+	                                  * the page set (B->pg / active_tab / tabs[]) can
+	                                  * be mutated with the worker guaranteed idle     */
+	volatile int worker_idle;        /* worker -> main: parked, safe to mutate the set */
 	volatile int recascade;          /* main asks the worker to re-run the cascade
 	                                  * (window resized → @media may change)        */
 	volatile int want_paw;           /* main -> worker: current content-pane pixel
@@ -282,6 +326,18 @@ struct browser {
 	volatile int loc_nav;            /* worker -> main: location.assign/replace/reload */
 	char     loc_url[URL_MAX];       /* its target URL                               */
 	char     referrer[URL_MAX];      /* the page navigated away from (document.referrer) */
+
+	/* window.alert/confirm/prompt. JS runs on the worker, but the modal dialog must
+	 * run on the MAIN thread — the gfx surface is main-thread-only and the dialog is
+	 * parented to the browser window the main task owns. The worker fills these, posts
+	 * dlg_req, and busy-waits on dlg_done; the main loop runs the dialog (dialog lib)
+	 * and returns dlg_ok + (for prompt) the entered text back in dlg_text. */
+	volatile int dlg_req;            /* worker -> main: 0 none, 1 alert, 2 confirm, 3 prompt, 4 permission */
+	volatile int dlg_done;           /* main -> worker: the dialog closed                    */
+	int      dlg_ok;                 /* main -> worker: confirm/prompt accepted (OK/Yes); permission: chosen button index (0=Refuse,1=Once,2=Always) */
+	char     dlg_title[64];
+	char     dlg_msg[512];
+	char     dlg_text[512];          /* prompt: default text in, entered text out            */
 
 	int      win_id;                 /* the window handle (for title updates) */
 
@@ -345,6 +401,7 @@ void *browser_js_stack_floor(void);
  * relative stylesheet hrefs; `fetch` (may be NULL) batch-pulls external <link
  * rel=stylesheet> + Link-header sheets so the CSS is complete before layout. */
 void html_to_text(const char *page_url, res_batch_fn fetch);
+void html_run_page_scripts(void);   /* deferred <script> pass; run after first paint */
 void html_set_charset(const char *content_type);          /* charset from HTTP CT */
 
 /* js.c: run every inline <script> in `root` (document order) against a fresh JS
@@ -358,6 +415,9 @@ int  js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int
 int  js_has_listeners(void);                               /* any listener registered */
 int  js_timers_pump(void);     /* fire due setTimeout/Interval/rAF; -> # callbacks fired */
 int  js_websockets_pump(void); /* drain live WebSockets -> open/message/close/error events */
+int  js_notifications_pump(void); /* deliver deferred Notification show/close events */
+int  js_cast_pump(void);       /* deliver Remote Playback availability + connect/disconnect */
+int  js_idb_pump(void);        /* deliver IndexedDB request events + commit/abort transactions */
 /* Run one devtools-console REPL command against the live page context, echoing
  * the input + result/exception to the console. Worker-thread only (owns g_ctx). */
 void js_repl_run(const char *src);
@@ -394,7 +454,25 @@ void html_radio_select(struct dom_node *c);
 void html_select_cycle(struct dom_node *sel);
 void html_seed_textarea(struct dom_node *ta);
 struct dom_node *html_focus_edit(int ch);       /* edit focused field; returns it */
-int  html_form_submit_url(struct dom_node *control, char *out, int cap);
+
+/* A resolved form submission: the target URL, the HTTP method, and (for POST) the
+ * request body + its Content-Type. html_form_build walks the form enclosing a
+ * control, applies action/method/enctype (with the submit control's formaction/
+ * formmethod/formenctype overrides), enforces CSP form-action, and fills this.
+ * A GET folds the field set into url's query string and leaves body empty. */
+struct form_submission {
+	char url[URL_MAX];
+	char method[8];              /* "GET" or "POST" */
+	char body[POST_BODY_MAX];    /* request body for POST (empty for GET) */
+	int  body_len;
+	char ctype[80];              /* Content-Type for the POST body */
+};
+int  html_form_build(struct dom_node *control, struct form_submission *fs);
+/* Submit the form enclosing `node` (a control or the <form> itself): optionally
+ * fire the 'submit' event first (requestSubmit / interactive submit do, the bare
+ * form.submit() does not), then navigate to the built target unless a handler
+ * called preventDefault. Returns 1 if a form was found. Worker-thread only. */
+int  browser_form_submit(struct dom_node *node, int fire_event);
 
 void plain_to_text(void);                                  /* html.c */
 void doc_message(const char *m);
@@ -433,6 +511,7 @@ void devtools_pick_commit(int off);  /* click at pane offset: select + end picki
 int  devtools_top(void);          /* panel's top y (main thread)                */
 int  devtools_left(void);         /* panel's left x; BW if hidden (right-dock)  */
 void devtools_render(void);       /* main thread: draw the panel                */
+int  devtools_take_paint(void);   /* main: 1 = repaint only the dock (log line)  */
 int  devtools_handle_click(int mx, int my);  /* 1 = consumed                    */
 int  devtools_handle_scroll(int delta);      /* 1 = consumed                    */
 int  devtools_handle_key(char c, int mods);  /* Console REPL input; 1 = consumed */
@@ -448,6 +527,10 @@ void devtools_worker_tick(void);  /* worker: rebuild DOM/Styles snapshot if open
  * are borrowed (devtools copies what it keeps); `resp_hdr` is the raw response
  * header block (NULL when the transport didn't surface it) and `ms` the request
  * duration in milliseconds (0 = unknown). */
+/* net_log.state — a request's lifecycle in the Network panel. NET_DONE MUST be 0
+ * so the completed-response callers (positional net_log initializers, which omit
+ * the trailing fields) default to a finished request. */
+enum { NET_DONE, NET_PENDING, NET_FAILED, NET_CANCELLED };
 struct net_log {
 	const char *method;
 	const char *url;
@@ -456,7 +539,15 @@ struct net_log {
 	int         size;
 	int         ms;
 	const char *resp_hdr;
+	int         state;      /* NET_* — 0 (NET_DONE) for the completed-response callers */
+	const char *reason;     /* NET_FAILED failure text (e.g. "Connection failed"); else NULL */
 };
+/* A request shows the moment it starts, not only when it finishes: devtools_net_begin
+ * logs an in-flight (NET_PENDING) row and returns an id; devtools_net_update resolves
+ * that row to its outcome (done / failed / cancelled). devtools_net_add is the one-shot
+ * form for requests already complete when logged (cache hits, file:/data:). */
+int  devtools_net_begin(const char *method, const char *url);
+void devtools_net_update(int id, const struct net_log *e);
 void devtools_net_add(const struct net_log *e);
 void devtools_net_reset(void);
 
@@ -512,6 +603,16 @@ struct http_resp {
  * request following redirects, returning the body (caller frees) for ANY final
  * status with `rs` filled, NULL on a transport/OOM error. Worker-thread only. */
 unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs);
+
+/* Stream a media resource (<audio>/<video> src) to the temp file `file`, issuing
+ * an open-ended Range request so a partial-content server answers 206 and the
+ * body is written straight to disk — a clip of any size loads without ever
+ * holding the whole thing in memory (unlike browser_fetch, which buffers it and
+ * caps at RAW_MAX). A server that ignores Range answers 200 with the full body;
+ * both stream identically. Follows redirects, sends cookies, HSTS-upgrades.
+ * Returns the byte count written on a 2xx (with *status set to it), or -1 on a
+ * transport, non-2xx, or disk error. Worker/loader-thread only. */
+long browser_fetch_media(const char *url, const char *accept, const char *file, int *status);
 
 /* The CORS-aware transport for fetch()/XMLHttpRequest: on a cross-origin request
  * it adds the Origin header, runs a preflight OPTIONS for a non-simple one, and

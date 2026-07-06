@@ -190,13 +190,16 @@ static void build_info(void)
 	field("----------------");                                       endrow();
 	field("OS:      "); as("OwOS " OWOS_VERSION);                    endrow();
 	{
-		/* Kernel build arch comes from the kernel via /proc/arch (this program
-		 * is always 32-bit ELF, so it can't tell the kernel's arch by itself). */
-		char a[16];
-		if (readproc("/proc/arch", a, sizeof a) > 0) rstrip(a);
-		else { a[0]='i'; a[1]='3'; a[2]='8'; a[3]='6'; a[4]='\0'; }
+		/* Kernel arch is authoritative via uname() — this program is 32-bit ELF
+		 * and can't infer the kernel's arch from its own build. */
+		struct utsname u;
 		field("Kernel:  ");
-		as("owos ("); as(a); as(a[0] == 'x' ? ", 64-bit)" : ", 32-bit)");
+		if (uname(&u) == 0) {
+			as("owos ("); as(u.machine);
+			as(u.machine[0] == 'x' ? ", 64-bit)" : ", 32-bit)");
+		} else {
+			as("owos");
+		}
 		endrow();
 	}
 

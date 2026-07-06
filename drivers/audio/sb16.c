@@ -14,6 +14,7 @@
 #include "endian.h"
 #include "io.h"
 #include "irq.h"
+#include "irqflags.h"
 #include "console.h"
 #include "keyboard.h"
 #include "timer.h"
@@ -61,15 +62,27 @@ static int muted;
 
 static void dsp_write(uint8_t v)
 {
-	while (inb(SB_WRITE) & 0x80)           /* wait for the write buffer        */
-		;
-	outb(SB_WRITE, v);
+	/* Bound the busy-wait: a wedged/absent DSP never clears bit7, and an
+	 * unbounded spin would hang the CPU (every software wait must be bounded).
+	 * On expiry mark the card gone so callers stop poking it. */
+	for (int tries = 0; tries < 100000; tries++) {
+		if (!(inb(SB_WRITE) & 0x80)) {     /* write buffer ready               */
+			outb(SB_WRITE, v);
+			return;
+		}
+	}
+	present = 0;
 }
 
 static void mixer_write(uint8_t reg, uint8_t v)
 {
+	/* Index (0x224) then data (0x225) is a two-port latch; a keyboard IRQ that
+	 * pokes the mixer (volume keys) between the writes would clobber the index.
+	 * Mask interrupts across the pair and restore the caller's prior IF. */
+	uintptr_t flags = irq_save();
 	outb(SB_MIX_ADDR, reg);
 	outb(SB_MIX_DATA, v);
+	irq_restore(flags);
 }
 
 /* Push the current volume/mute state to the SB16 mixer. The master (0x22) and
@@ -110,12 +123,19 @@ int sb16_volume(void)
 static int dsp_reset(void)
 {
 	outb(SB_RESET, 1);
-	for (volatile int i = 0; i < 10000; i++)   /* hold reset >= 3 us           */
-		;
+	/* Hold RESET high >= 3 us. sb16_init runs before the timer, so no PIT sleep:
+	 * pace with ISA io_wait bounces (a 0x80 port write, ~1 us each on real HW)
+	 * rather than a raw CPU-speed-dependent spin that could under-delay on a
+	 * fast core and flake the probe. */
+	for (int i = 0; i < 10; i++)
+		io_wait();
 	outb(SB_RESET, 0);
+	/* Read data bytes until the 0xAA ready-marker or the budget expires; a present
+	 * DSP may present other bytes first, so don't judge only the first one. */
 	for (int tries = 0; tries < 100000; tries++)
 		if (inb(SB_RSTAT) & 0x80)
-			return inb(SB_READ) == 0xAA;       /* DSP reports ready            */
+			if (inb(SB_READ) == 0xAA)
+				return 1;
 	return 0;
 }
 
@@ -200,9 +220,13 @@ static void sb_start(void)
  * Returns -2 if Ctrl+C is pressed. The card plays half (irq_count & 1). */
 static int sb_wait_half_free(int H)
 {
+	int stall = 0;
 	while ((irq_count & 1) == H) {
 		if (keyboard_take_interrupt())
 			return -2;
+		if (++stall > 2000)             /* ~4 s: IRQ 5 lost or DSP wedged — give up
+		                                 * rather than block the thread forever    */
+			return -1;
 		timer_sleep(2);
 	}
 	return 0;

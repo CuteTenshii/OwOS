@@ -11,6 +11,45 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+/* Byte-exact string compare, matching user/lib/owos.h's inline version. */
+static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
+
+/* Whole-file I/O over host stdio, mirroring the guest libc signatures so
+ * storage libs (sqlite.c) that persist through readfile/writefile compile and
+ * run natively. writefile truncates; readfile_at reads `len` bytes from `off`. */
+static inline int writefile(const char *name, const void *buf, int len)
+{
+	FILE *f = fopen(name, "wb");
+	if (!f) return -1;
+	int wrote = (len > 0) ? (int)fwrite(buf, 1, (size_t)len, f) : 0;
+	fclose(f);
+	return (wrote == len) ? 0 : -1;
+}
+static inline int readfile_at(const char *name, unsigned off, void *buf, unsigned len)
+{
+	FILE *f = fopen(name, "rb");
+	if (!f) return -1;
+	if (fseek(f, (long)off, SEEK_SET) != 0) { fclose(f); return -1; }
+	int got = (int)fread(buf, 1, (size_t)len, f);
+	fclose(f);
+	return got;
+}
+
+/* File metadata, mirroring user/lib/owos.h so storage/media libs that stat a file
+ * before slurping it (media_video, mpeg/h264 front ends) compile natively. */
+struct statinfo { int is_dir; unsigned size; unsigned mtime; };
+static inline int stat(const char *path, struct statinfo *out)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) return -1;
+	fseek(f, 0, SEEK_END);
+	out->size = (unsigned)ftell(f);
+	out->is_dir = 0; out->mtime = 0;
+	fclose(f);
+	return 0;
+}
 
 /* Case-insensitive ASCII helpers, matching user/lib/owos.h's inline versions. */
 static inline char lower(char c)
@@ -19,5 +58,29 @@ static inline int starts_ci(const char *s, const char *pre)
 { while (*pre) { if (lower(*s) != lower(*pre)) return 0; s++; pre++; } return 1; }
 static inline int streq_ci(const char *a, const char *b)
 { while (*a && lower(*a) == lower(*b)) { a++; b++; } return lower(*a) == lower(*b); }
+
+/* UTF-8 encode a code point into `out` (up to 4 bytes); returns the byte count.
+ * Mirrors user/lib/owos.h so the freestanding lexer/builtins compile on the host. */
+static inline int utf8_encode(unsigned cp, char *out) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) { out[0] = (char)(0xC0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+    if (cp < 0x10000) { out[0] = (char)(0xE0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[2] = (char)(0x80 | (cp & 0x3F)); return 3; }
+    out[0] = (char)(0xF0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F)); return 4;
+}
+
+/* Guest network + CSPRNG decls the freestanding net libs (stun.c, resolve.c)
+ * pull from the real owos.h. Host tests exercise only the wire codecs, so the
+ * test binary supplies stub definitions; these mirror the guest signatures.
+ * Codes and SK_* match user/lib/owos.h. */
+#define NET_EINTR (-4)
+#define SK_TCP    1
+#define SK_UDP    2
+#define SK_ICMP   3
+int getrandom(void *buf, int len);
+int net_dial(const char *host, int port, int proto);
+int net_send(int h, const void *buf, int len);
+int net_recv(int h, void *buf, int max);
+int net_close(int h);
 
 #endif /* OWOS_HOST_TEST_SHIM_H */

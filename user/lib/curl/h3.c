@@ -374,15 +374,7 @@ static uint32_t build_request(uint8_t *b, const char *method, const char *path,
 	enc_int(b, &p, 0, 4, 0x50);                 /* name ref ":authority" */
 	enc_str(b, &p, authority, (int)strlen(authority));
 
-	/* user-agent (literal name + literal value) */
-	{
-		const char *ua = "user-agent", *uv = "owos-curl";
-		enc_int(b, &p, (uint64_t)strlen(ua), 3, 0x20);
-		memcpy(b + p, ua, strlen(ua)); p += (uint32_t)strlen(ua);
-		enc_str(b, &p, uv, (int)strlen(uv));
-	}
-
-	/* extra "Name: value\r\n" lines (curl -H), as literal name + value */
+	/* extra "Name: value\r\n" lines (curl -H, incl. User-Agent), literal name + value */
 	for (const char *s = extra; s && *s; ) {
 		const char *eol = s;
 		while (*eol && *eol != '\n') eol++;

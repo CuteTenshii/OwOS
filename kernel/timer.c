@@ -6,6 +6,7 @@
 #include "nic.h"
 #include "sched.h"
 #include "irqflags.h"
+#include "entropy.h"
 
 #define PIT_BASE_HZ   1193182      /* the PIT's fixed input frequency        */
 #define PIT_CH0_DATA  0x40
@@ -29,6 +30,7 @@ static void timer_handler(struct registers *r)
 {
 	(void)r;
 	ticks++;
+	entropy_stir(ticks);           /* interrupt-latency jitter feeds the CSPRNG */
 	sched_wake_due(ticks);         /* promote timed sleepers that are now due  */
 	nic_poll();                    /* IRQ-independent NIC RX drain (VMware etc.) */
 	if (tick_cb)
@@ -96,8 +98,9 @@ uint32_t timer_seconds(void)
 
 void timer_sleep(uint32_t ms)
 {
-	/* Round up so a short sleep never returns early. */
-	uint32_t wait = (ms * TIMER_HZ + 999) / 1000;
+	/* Round up so a short sleep never returns early. 64-bit math so a large ms
+	 * can't overflow the multiply and wrap to a tiny (or zero) wait. */
+	uint32_t wait = (uint32_t)(((uint64_t)ms * TIMER_HZ + 999) / 1000);
 	if (wait == 0)
 		return;
 	/* Block fully off the run queue until the deadline, rather than staying

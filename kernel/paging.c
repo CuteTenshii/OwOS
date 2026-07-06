@@ -631,6 +631,19 @@ void paging_free_process_dir(uint32_t *dir)
 		pfree(pt);
 		dir[pdi] = 0;
 	}
+	/* Reclaim private page tables above the 2 GiB window: the high-vaddr client
+	 * buffers (WIN_FB / COMPOSITOR_FB / WIN_MAP) that paging_map_user_at installs
+	 * carry PAGE_USER on their PDE, while every shared kernel/heap/pool/MMIO PDE
+	 * is supervisor-only — so a PAGE_USER PDE here is always process-private. Free
+	 * only the page table (pool page); the frames themselves are window/back-buffer
+	 * memory owned by uwin/fb and freed there. Without this the pool leaked one
+	 * page table per mapped window buffer at every process exit. */
+	for (uint32_t pdi = USER_PDI_HI; pdi < PD_ENTRIES; pdi++) {
+		if ((dir[pdi] & PAGE_PRESENT) && (dir[pdi] & PAGE_USER)) {
+			pfree((void *)(dir[pdi] & ~0xFFFu));
+			dir[pdi] = 0;
+		}
+	}
 	pfree(dir);
 }
 

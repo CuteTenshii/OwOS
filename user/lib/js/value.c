@@ -6,6 +6,7 @@
 #include "fmt.h"
 #include "math.h"
 #include "gc.h"
+#include "bigint.h"
 
 /* ------------------------------------------------------- small helpers ---- */
 
@@ -55,12 +56,63 @@ js_value js_obj_value(js_object *o) { js_value v; if (!o) return js_null(); v.ty
 
 /* ------------------------------------------------------- property map ----- */
 
-static pentry *pmap_find(pmap *m, const char *key) {
-    int i;
-    for (i = 0; i < m->n; i++)
-        if (strcmp(m->e[i].key, key) == 0) return &m->e[i];
-    return NULL;
+/* Build the hash index once a map is large enough for the linear scan to hurt:
+ * property lookup dominates JS-heavy pages, and objects like the global scope,
+ * `window`, `document` and script-side caches accumulate hundreds of keys. Below
+ * this many entries a linear scan of the cache-hot `e` array wins. */
+#define PMAP_HASH_MIN 16
+
+static unsigned pmap_keyhash(const char *k) {
+    unsigned h = 2166136261u;                    /* FNV-1a over the key bytes */
+    for (; *k; k++) { h ^= (unsigned char)*k; h *= 16777619u; }
+    return h;
 }
+
+/* (Re)build idx from the current entry array. Entry indices are stable across the
+ * `e` realloc in pmap_insert, so callers never need to touch idx on grow. On OOM
+ * the map degrades to linear scan (idx stays NULL). */
+static void pmap_reindex(pmap *m) {
+    int cap = 16, i;
+    unsigned mask;
+    int *idx;
+    while (cap < m->n * 2) cap <<= 1;
+    idx = (int *)malloc((unsigned)cap * sizeof(int));
+    if (!idx) { free(m->idx); m->idx = NULL; m->idxcap = 0; return; }
+    for (i = 0; i < cap; i++) idx[i] = 0;
+    free(m->idx); m->idx = idx; m->idxcap = cap;
+    mask = (unsigned)cap - 1;
+    for (i = 0; i < m->n; i++) {
+        unsigned b = pmap_keyhash(m->e[i].key) & mask;
+        while (idx[b]) b = (b + 1) & mask;
+        idx[b] = i + 1;
+    }
+}
+
+static int pmap_find_idx(pmap *m, const char *key) {
+    int i;
+    if (m->idx) {
+        unsigned mask = (unsigned)m->idxcap - 1;
+        unsigned b = pmap_keyhash(key) & mask;
+        for (;;) {
+            int slot = m->idx[b];
+            if (!slot) return -1;
+            if (strcmp(m->e[slot - 1].key, key) == 0) return slot - 1;
+            b = (b + 1) & mask;
+        }
+    }
+    for (i = 0; i < m->n; i++)
+        if (strcmp(m->e[i].key, key) == 0) return i;
+    return -1;
+}
+
+static pentry *pmap_find(pmap *m, const char *key) {
+    int i = pmap_find_idx(m, key);
+    return i < 0 ? NULL : &m->e[i];
+}
+
+/* Public: entry index of `key` (or -1). Backs the interpreter's identifier
+ * inline cache, which records the slot to skip future scope-chain scans. */
+int pmap_index(pmap *m, const char *key) { return pmap_find_idx(m, key); }
 
 static pentry *pmap_insert(pmap *m, const char *key) {
     pentry *pe;
@@ -75,6 +127,20 @@ static pentry *pmap_insert(pmap *m, const char *key) {
     pe->value = js_undef();
     pe->getter = pe->setter = NULL;
     pe->flags = 0;
+    /* Keep the hash index current: build it once the map crosses the threshold,
+     * grow+rehash before it passes half full, else drop the new entry into its
+     * bucket. The entry's array index is stable across the realloc above. */
+    if (m->idx) {
+        if (m->n * 2 > m->idxcap) pmap_reindex(m);
+        else {
+            unsigned mask = (unsigned)m->idxcap - 1;
+            unsigned b = pmap_keyhash(pe->key) & mask;
+            while (m->idx[b]) b = (b + 1) & mask;
+            m->idx[b] = m->n;                    /* (n-1) + 1 */
+        }
+    } else if (m->n >= PMAP_HASH_MIN) {
+        pmap_reindex(m);
+    }
     return pe;
 }
 
@@ -82,13 +148,14 @@ static void pmap_free(pmap *m) {
     int i;
     for (i = 0; i < m->n; i++) free(m->e[i].key);
     if (m->e) free(m->e);
-    m->e = NULL; m->n = m->cap = 0;
+    if (m->idx) free(m->idx);
+    m->e = NULL; m->idx = NULL; m->n = m->cap = m->idxcap = 0;
 }
 
 /* ------------------------------------------------------- GC tracer -------- */
 
 static void mark_value(js_value v) {
-    if (v.type == JV_OBJ || v.type == JV_SYMBOL) gc_mark(v.u.obj);
+    if (v.type == JV_OBJ || v.type == JV_SYMBOL || v.type == JV_BIGINT) gc_mark(v.u.obj);
     else if (v.type == JV_STR) gc_mark(v.u.str);
 }
 
@@ -130,12 +197,25 @@ static void finalize(void *obj, int kind) {
         if (o->elems) free(o->elems);
         if (o->fn) free(o->fn);
         if (o->kind == OBJ_SYMBOL && o->host) free(o->host);   /* the symbol key string */
+        if (o->kind == OBJ_BIGINT && o->host) bi_free((bigint *)o->host);
         if (o->kind == OBJ_ARRAYBUFFER && o->host) { js_arraybuffer *ab = (js_arraybuffer *)o->host; if (ab->data) free(ab->data); free(ab); }
         if (o->kind == OBJ_TYPEDARRAY && o->host) free(o->host);  /* the view; its buffer is GC'd separately */
     }
 }
 
-void js_gc_setup(void) { gc_init(trace, finalize); }
+void js_gc_setup(void) {
+	/* One shared GC heap underlies every js_ctx. An embedder may keep several
+	 * contexts live at once (the browser holds one per tab, all coexisting, each
+	 * rooting its own world) — so initialize the heap exactly once. A later
+	 * js_ctx_new must not re-init it, or it would wipe the other contexts' roots
+	 * and objects. js_ctx_free drops a context's roots and collects, draining its
+	 * objects from the shared heap. */
+	static int inited = 0;
+	if (inited) return;
+	inited = 1;
+	gc_init(trace, finalize);
+	gc_set_rescan_kind(GCK_ARRAY);
+}
 
 /* ------------------------------------------------------- creators --------- */
 
@@ -152,6 +232,27 @@ js_value js_mk_string(js_ctx *ctx, const char *s, int len) {
 
 js_value js_mk_cstring(js_ctx *ctx, const char *s) { return js_mk_string(ctx, s, s ? strlen(s) : 0); }
 
+/* Wrap a bignum as the JV_BIGINT primitive. Takes ownership of `b`: the OBJ_BIGINT
+ * cell that carries it is GC-managed and its finalizer bi_free()s `b`. A NULL `b`
+ * (an arithmetic size-cap / OOM signal) surfaces as a RangeError. */
+js_value js_mk_bigint(js_ctx *ctx, bigint *b) {
+    js_object *o;
+    js_value v;
+    if (!b) { js_throw_range(ctx, "Maximum BigInt size exceeded"); return js_undef(); }
+    o = js_new_object(ctx, ctx->bigint_proto);
+    o->kind = OBJ_BIGINT;
+    o->host = b;
+    v.type = JV_BIGINT; v.u.obj = o;
+    return v;
+}
+
+/* The bignum behind a JV_BIGINT primitive or an Object(bigint) box, else NULL. */
+bigint *js_bigint_of(js_value v) {
+    if (v.type == JV_BIGINT) return (bigint *)v.u.obj->host;
+    if (v.type == JV_OBJ && v.u.obj->kind == OBJ_BIGINT) return (bigint *)v.u.obj->host;
+    return NULL;
+}
+
 js_object *js_new_object(js_ctx *ctx, js_object *proto) {
     js_object *o = (js_object *)gc_alloc(sizeof(js_object), GCK_OBJECT);
     (void)ctx;
@@ -164,7 +265,7 @@ js_object *js_new_object(js_ctx *ctx, js_object *proto) {
 js_object *js_new_array(js_ctx *ctx, unsigned len) {
     js_object *o;
     gc_push_scope();
-    o = (js_object *)gc_keep(gc_alloc(sizeof(js_object), GCK_OBJECT));
+    o = (js_object *)gc_keep(gc_alloc(sizeof(js_object), GCK_ARRAY));
     o->kind = OBJ_ARRAY;
     o->extensible = 1;
     o->proto = ctx->array_proto;
@@ -200,6 +301,16 @@ js_object *js_new_function(js_ctx *ctx, js_node *node, js_env *closure) {
         js_def(o, "prototype", js_obj_value(proto), P_WRITABLE);
     }
     js_def(o, "name", js_mk_cstring(ctx, f->name), P_CONFIGURABLE);
+    /* .length is the count of leading params before the first default or rest */
+    {
+        int arity = 0, i;
+        for (i = 0; node && i < node->u.func.nparams; i++) {
+            js_node *p = node->u.func.params[i];
+            if (p->type == JS_REST || p->type == JS_ASSIGN_PATTERN) break;
+            arity++;
+        }
+        js_def(o, "length", js_number(arity), P_CONFIGURABLE);
+    }
     gc_pop_scope();
     return o;
 }
@@ -247,6 +358,7 @@ void js_env_define(js_env *e, const char *name, js_value v, unsigned char flags)
     pe->value = v;
     pe->getter = pe->setter = NULL;
     pe->flags = flags;
+    gc_write_barrier(e);   /* an old scope may now hold a young binding value */
 }
 
 js_value js_env_get_this(js_env *e) {
@@ -270,6 +382,7 @@ void js_def(js_object *o, const char *key, js_value val, unsigned char flags) {
     pe->value = val;
     pe->getter = pe->setter = NULL;
     pe->flags = flags;
+    gc_write_barrier(o);   /* an old object may now hold a young property value */
 }
 
 void js_def_accessor(js_object *o, const char *key, js_object *get, js_object *set, unsigned char flags) {
@@ -279,6 +392,7 @@ void js_def_accessor(js_object *o, const char *key, js_object *get, js_object *s
     pe->value = js_undef();
     pe->getter = get; pe->setter = set;
     pe->flags = (unsigned char)(flags | P_ACCESSOR);
+    gc_write_barrier(o);   /* an old object may now hold a young getter/setter */
 }
 
 int js_has_own(js_object *o, const char *key) {
@@ -300,6 +414,12 @@ int js_delete(js_object *o, const char *key) {
             free(m->e[i].key);
             for (; i < m->n - 1; i++) m->e[i] = m->e[i + 1];
             m->n--;
+            /* Compaction shifted every later entry's index, so the hash index is
+             * stale: rebuild it if the map is still large, else drop it. */
+            if (m->idx) {
+                if (m->n >= PMAP_HASH_MIN) pmap_reindex(m);
+                else { free(m->idx); m->idx = NULL; m->idxcap = 0; }
+            }
             return 1;
         }
     return 1;
@@ -423,6 +543,7 @@ static js_object *proto_for_primitive(js_ctx *ctx, js_value v) {
     if (v.type == JV_NUM)    return ctx->number_proto;
     if (v.type == JV_BOOL)   return ctx->boolean_proto;
     if (v.type == JV_SYMBOL) return ctx->symbol_proto;
+    if (v.type == JV_BIGINT) return ctx->bigint_proto;
     return NULL;
 }
 
@@ -434,10 +555,11 @@ js_value js_get(js_ctx *ctx, js_value obj, const char *key) {
         if (strcmp(key, "length") == 0) return js_number(obj.u.str->len);
         if (as_index(key, &idx)) return js_get_index(ctx, obj, idx);
         o = ctx->string_proto;
-    } else if (obj.type == JV_NUM || obj.type == JV_BOOL || obj.type == JV_SYMBOL) {
+    } else if (obj.type == JV_NUM || obj.type == JV_BOOL || obj.type == JV_SYMBOL || obj.type == JV_BIGINT) {
         o = proto_for_primitive(ctx, obj);
     } else if (obj.type == JV_OBJ) {
         o = obj.u.obj;
+        if (o->kind == OBJ_PROXY) return js_proxy_get(ctx, o, key, obj);
         if (o->kind == OBJ_ARRAY) {
             if (strcmp(key, "length") == 0) return js_number(o->elen);
             if (as_index(key, &idx)) return js_get_index(ctx, obj, idx);
@@ -473,6 +595,7 @@ void js_set(js_ctx *ctx, js_value obj, const char *key, js_value val) {
     if (obj.type != JV_OBJ) return;             /* set on a primitive is a no-op */
     o = obj.u.obj;
 
+    if (o->kind == OBJ_PROXY) { js_proxy_set(ctx, o, key, val, obj); return; }
     if (o->kind == OBJ_ARRAY) {
         if (strcmp(key, "length") == 0) { js_array_set_len(ctx, o, js_to_uint32(ctx, val)); return; }
         if (as_index(key, &idx)) { js_set_index(ctx, obj, idx, val); return; }
@@ -484,7 +607,7 @@ void js_set(js_ctx *ctx, js_value obj, const char *key, js_value val) {
         pentry *pe = pmap_find(&o->props, key);
         if (pe) {
             if (pe->flags & P_ACCESSOR) { if (pe->setter) js_call(ctx, js_obj_value(pe->setter), obj, &val, 1); return; }
-            if (pe->flags & P_WRITABLE) pe->value = val;
+            if (pe->flags & P_WRITABLE) { pe->value = val; gc_write_barrier(o); }
             return;
         }
     }
@@ -495,6 +618,102 @@ void js_set(js_ctx *ctx, js_value obj, const char *key, js_value val) {
     }
     /* define a new own property */
     if (o->extensible) js_def(o, key, val, P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+}
+
+/* ------------------------------------------------------- Proxy ------------ */
+
+int js_is_proxy(js_object *o) { return o->kind == OBJ_PROXY; }
+static js_value proxy_target(js_object *p) { pentry *pe = pmap_find(&p->props, "@t"); return pe ? pe->value : js_undef(); }
+static js_value proxy_handler(js_object *p) { pentry *pe = pmap_find(&p->props, "@h"); return pe ? pe->value : js_undef(); }
+js_object *js_proxy_ownkeys_target(js_object *p) { js_value t = proxy_target(p); return t.type == JV_OBJ ? t.u.obj : 0; }
+int js_proxy_callable(js_object *o) {
+    js_value t = proxy_target(o);
+    if (t.type != JV_OBJ) return 0;
+    if (t.u.obj->kind == OBJ_FUNCTION) return 1;
+    if (t.u.obj->kind == OBJ_PROXY) return js_proxy_callable(t.u.obj);
+    return 0;
+}
+/* the named trap function from the handler, or undefined (missing/revoked) */
+static js_value proxy_trap(js_ctx *ctx, js_object *p, const char *name) {
+    js_value h = proxy_handler(p);
+    if (h.type != JV_OBJ) return js_undef();
+    return js_get(ctx, h, name);
+}
+static int proxy_live(js_ctx *ctx, js_object *p, js_value *target) {
+    js_value t = proxy_target(p);
+    if (t.type != JV_OBJ) { js_throw_type(ctx, "Cannot perform operation on a proxy that has been revoked"); return 0; }
+    *target = t; return 1;
+}
+js_value js_proxy_get(js_ctx *ctx, js_object *p, const char *key, js_value receiver) {
+    js_value t, trap;
+    if (!proxy_live(ctx, p, &t)) return js_undef();
+    trap = proxy_trap(ctx, p, "get");
+    if (js_is_callable(trap)) { js_value a[3]; a[0] = t; a[1] = js_mk_cstring(ctx, key); a[2] = receiver; return js_call(ctx, trap, proxy_handler(p), a, 3); }
+    return js_get(ctx, t, key);
+}
+void js_proxy_set(js_ctx *ctx, js_object *p, const char *key, js_value val, js_value receiver) {
+    js_value t, trap;
+    if (!proxy_live(ctx, p, &t)) return;
+    trap = proxy_trap(ctx, p, "set");
+    if (js_is_callable(trap)) { js_value a[4]; a[0] = t; a[1] = js_mk_cstring(ctx, key); a[2] = val; a[3] = receiver; js_call(ctx, trap, proxy_handler(p), a, 4); return; }
+    js_set(ctx, t, key, val);
+}
+int js_proxy_has(js_ctx *ctx, js_object *p, const char *key) {
+    js_value t, trap;
+    if (!proxy_live(ctx, p, &t)) return 0;
+    trap = proxy_trap(ctx, p, "has");
+    if (js_is_callable(trap)) { js_value a[2]; a[0] = t; a[1] = js_mk_cstring(ctx, key); return js_to_boolean(js_call(ctx, trap, proxy_handler(p), a, 2)); }
+    { js_object *o; for (o = t.u.obj; o; o = o->proto) { if (js_has_own(o, key)) return 1; if (o->kind == OBJ_PROXY) return js_proxy_has(ctx, o, key); } }
+    return 0;
+}
+int js_proxy_delete(js_ctx *ctx, js_object *p, const char *key) {
+    js_value t, trap;
+    if (!proxy_live(ctx, p, &t)) return 0;
+    trap = proxy_trap(ctx, p, "deleteProperty");
+    if (js_is_callable(trap)) { js_value a[2]; a[0] = t; a[1] = js_mk_cstring(ctx, key); return js_to_boolean(js_call(ctx, trap, proxy_handler(p), a, 2)); }
+    return t.u.obj->kind == OBJ_PROXY ? js_proxy_delete(ctx, t.u.obj, key) : js_delete(t.u.obj, key);
+}
+js_value js_proxy_apply(js_ctx *ctx, js_object *p, js_value thisv, js_value *args, int argc) {
+    js_value t, trap;
+    if (!proxy_live(ctx, p, &t)) return js_undef();
+    trap = proxy_trap(ctx, p, "apply");
+    if (js_is_callable(trap)) {
+        js_object *arr; js_value a[3]; int i;
+        gc_push_scope(); gc_keep(p); gc_keep(t.u.obj); if (thisv.type == JV_OBJ) gc_keep(thisv.u.obj);
+        arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+        for (i = 0; i < argc; i++) js_array_push(ctx, arr, args[i]);
+        a[0] = t; a[1] = thisv; a[2] = js_obj_value(arr);
+        { js_value r = js_call(ctx, trap, proxy_handler(p), a, 3); gc_pop_scope(); return r; }
+    }
+    return js_call(ctx, t, thisv, args, argc);
+}
+js_value js_proxy_construct(js_ctx *ctx, js_object *p, js_value *args, int argc) {
+    js_value t, trap;
+    if (!proxy_live(ctx, p, &t)) return js_undef();
+    trap = proxy_trap(ctx, p, "construct");
+    if (js_is_callable(trap)) {
+        js_object *arr; js_value a[3]; int i;
+        gc_push_scope(); gc_keep(p); gc_keep(t.u.obj);
+        arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+        for (i = 0; i < argc; i++) js_array_push(ctx, arr, args[i]);
+        a[0] = t; a[1] = js_obj_value(arr); a[2] = js_obj_value(p);   /* target, argsList, newTarget */
+        { js_value r = js_call(ctx, trap, proxy_handler(p), a, 3); gc_pop_scope(); return r; }
+    }
+    return js_construct(ctx, t, args, argc);
+}
+js_value js_proxy_ownkeys(js_ctx *ctx, js_object *p) {
+    js_value t, trap;
+    js_object *arr, *o;
+    if (!proxy_live(ctx, p, &t)) return js_obj_value(js_new_array(ctx, 0));
+    trap = proxy_trap(ctx, p, "ownKeys");
+    if (js_is_callable(trap)) { js_value a[1]; a[0] = t; return js_call(ctx, trap, proxy_handler(p), a, 1); }
+    o = t.u.obj;                                 /* default: the target's own string keys */
+    gc_push_scope(); gc_keep(o);
+    arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+    if (o->kind == OBJ_ARRAY) { unsigned e; char ib[24]; for (e = 0; e < o->elen; e++) { u64toa((unsigned long long)e, ib, 10); js_array_push(ctx, arr, js_mk_cstring(ctx, ib)); } }
+    { int i; for (i = 0; i < o->props.n; i++) { pentry *pe = &o->props.e[i]; if ((unsigned char)pe->key[0] >= 0x20) js_array_push(ctx, arr, js_mk_cstring(ctx, pe->key)); } }
+    gc_pop_scope();
+    return js_obj_value(arr);
 }
 
 /* ------------------------------------------------------- strings ---------- */
@@ -530,6 +749,7 @@ int js_to_boolean(js_value v) {
     case JV_BOOL:  return v.u.boolean;
     case JV_NUM:   return !(v.u.num == 0.0 || v.u.num != v.u.num);   /* 0/-0/NaN -> false */
     case JV_STR:   return v.u.str->len != 0;
+    case JV_BIGINT: return bi_to_bool(js_bigint_of(v));
     default:       return 1;
     }
 }
@@ -577,6 +797,7 @@ double js_to_number(js_ctx *ctx, js_value v) {
     case JV_NUM:   return v.u.num;
     case JV_STR:   return js_str_to_num(v.u.str->data, v.u.str->len);
     case JV_SYMBOL: js_throw_type(ctx, "cannot convert a Symbol value to a number"); return 0.0 / 0.0;
+    case JV_BIGINT: js_throw_type(ctx, "Cannot convert a BigInt value to a number"); return 0.0 / 0.0;
     default: {
         js_value p = js_to_primitive(ctx, v, 1);
         if (p.type == JV_OBJ) return 0.0 / 0.0;
@@ -594,6 +815,14 @@ js_value js_to_string(js_ctx *ctx, js_value v) {
     case JV_NUM:   dtoa(v.u.num, buf); return js_mk_cstring(ctx, buf);
     case JV_STR:   return v;
     case JV_SYMBOL: js_throw_type(ctx, "cannot convert a Symbol value to a string"); return js_undef();
+    case JV_BIGINT: {
+        char *s = bi_to_str(js_bigint_of(v), 10);
+        js_value r;
+        if (!s) { js_throw_range(ctx, "out of memory"); return js_undef(); }
+        r = js_mk_cstring(ctx, s);
+        free(s);
+        return r;
+    }
     default: {
         js_value p = js_to_primitive(ctx, v, 0);
         if (ctx->has_exc) return js_undef();
@@ -648,7 +877,8 @@ const char *js_typeof(js_value v) {
     case JV_NUM:   return "number";
     case JV_STR:   return "string";
     case JV_SYMBOL: return "symbol";
-    default:       return v.u.obj->kind == OBJ_FUNCTION ? "function" : "object";
+    case JV_BIGINT: return "bigint";
+    default:       return js_is_callable(v) ? "function" : "object";
     }
 }
 
@@ -661,6 +891,7 @@ int js_strict_eq(js_value a, js_value b) {
     case JV_BOOL:  return a.u.boolean == b.u.boolean;
     case JV_NUM:   return a.u.num == b.u.num;       /* NaN!=NaN, +0==-0 fall out */
     case JV_STR:   return js_same_string(a.u.str, b.u.str);
+    case JV_BIGINT: return bi_cmp(js_bigint_of(a), js_bigint_of(b)) == 0;
     default:       return a.u.obj == b.u.obj;
     }
 }
@@ -707,14 +938,40 @@ int js_same_value_zero(js_value a, js_value b) {
 
 /* ------------------------------------------------------- equality --------- */
 
+/* exact BigInt == Number: true only when the number is the same integer value */
+static int bigint_eq_double(const bigint *b, double d) {
+    int ok, eq;
+    bigint *bd;
+    if (d != d || d == 1.0 / 0.0 || d == -1.0 / 0.0 || floor(d) != d) return 0;
+    bd = bi_from_double(d, &ok);
+    if (!ok || !bd) { if (bd) bi_free(bd); return 0; }
+    eq = bi_cmp(b, bd) == 0;
+    bi_free(bd);
+    return eq;
+}
+
+/* exact BigInt == String: parse the string as a BigInt, then compare */
+static int bigint_eq_string(const bigint *b, js_string *s) {
+    int ok, eq;
+    bigint *t = bi_from_str(s->data, s->len, &ok);
+    if (!ok || !t) { if (t) bi_free(t); return 0; }
+    eq = bi_cmp(b, t) == 0;
+    bi_free(t);
+    return eq;
+}
+
 int js_loose_eq(js_ctx *ctx, js_value a, js_value b) {
     if (a.type == b.type) return js_strict_eq(a, b);
     if ((a.type == JV_NULL && b.type == JV_UNDEF) || (a.type == JV_UNDEF && b.type == JV_NULL)) return 1;
     if (a.type == JV_NUM && b.type == JV_STR) return a.u.num == js_to_number(ctx, b);
     if (a.type == JV_STR && b.type == JV_NUM) return js_to_number(ctx, a) == b.u.num;
+    if (a.type == JV_BIGINT && b.type == JV_NUM) return bigint_eq_double(js_bigint_of(a), b.u.num);
+    if (a.type == JV_NUM && b.type == JV_BIGINT) return bigint_eq_double(js_bigint_of(b), a.u.num);
+    if (a.type == JV_BIGINT && b.type == JV_STR) return bigint_eq_string(js_bigint_of(a), b.u.str);
+    if (a.type == JV_STR && b.type == JV_BIGINT) return bigint_eq_string(js_bigint_of(b), a.u.str);
     if (a.type == JV_BOOL) { js_value na = js_number(a.u.boolean ? 1 : 0); return js_loose_eq(ctx, na, b); }
     if (b.type == JV_BOOL) { js_value nb = js_number(b.u.boolean ? 1 : 0); return js_loose_eq(ctx, a, nb); }
-    if ((a.type == JV_NUM || a.type == JV_STR) && b.type == JV_OBJ) return js_loose_eq(ctx, a, js_to_primitive(ctx, b, 0));
-    if (a.type == JV_OBJ && (b.type == JV_NUM || b.type == JV_STR)) return js_loose_eq(ctx, js_to_primitive(ctx, a, 0), b);
+    if ((a.type == JV_NUM || a.type == JV_STR || a.type == JV_BIGINT) && b.type == JV_OBJ) return js_loose_eq(ctx, a, js_to_primitive(ctx, b, 0));
+    if (a.type == JV_OBJ && (b.type == JV_NUM || b.type == JV_STR || b.type == JV_BIGINT)) return js_loose_eq(ctx, js_to_primitive(ctx, a, 0), b);
     return 0;
 }

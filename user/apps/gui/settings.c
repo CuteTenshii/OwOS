@@ -9,9 +9,12 @@
  *   Mouse / Touchpad  pointer speed  -> /sys/class/input/mouse0/speed  (1..5)
  *   Keyboard          layout         -> /sys/class/input/kbd0/layout   ("us"/"fr")
  *   Display           resolution     -> /sys/class/graphics/fb0/{mode,modes}
+ *                     refresh rate   -> /sys/class/graphics/fb0/{rate,refresh}
  *   About             system info    -> /sys/class/dmi/id, /proc/cpuinfo, ...
  *
- * The sidebar owns its width as a resizable property (drag the divider). A `seq`
+ * A category owns a list of `control`s (label + dropdown + apply callback), laid
+ * out top to bottom, so a pane can carry several settings (Display has two). The
+ * sidebar owns its width as a resizable property (drag the divider). A `seq`
  * counter bumps on every change so the loop repaints only when something moved.
  */
 #include "owos.h"
@@ -80,6 +83,17 @@ static int  disp_cur;                  /* index of the active mode, -1 if none *
 static int  disp_fixed;                /* 1 = resolution can't be changed      */
 static struct select_box disp_sel;
 
+/* Refresh rate: a second Display control over /sys/class/graphics/fb0/rate (the
+ * compositor's frame-pacing target). The list is capped at the panel's real
+ * refresh (fb0/refresh, from EDID) — above it there's no vblank to sync to. */
+#define MAX_RATES 8
+static char rate_label[MAX_RATES][12]; /* "60 Hz" per offered rate             */
+static const char *rate_opts[MAX_RATES];
+static int  rate_val[MAX_RATES];       /* the numeric Hz behind each option    */
+static int  rate_n;
+static int  rate_cur;                  /* index of the active rate, -1 if none */
+static struct select_box rate_sel;
+
 static char  about_line[10][72];    /* About: one formatted line per row */
 static int   about_n;
 
@@ -94,6 +108,14 @@ static void uitoa(unsigned v, char *out)
 	int i = 0;
 	while (n) out[i++] = t[--n];
 	out[i] = 0;
+}
+
+static int patoi(const char *s)
+{
+	int v = 0;
+	while (*s == ' ') s++;
+	while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+	return v;
 }
 
 /* Read a /proc file into `buf` (NUL-terminated, trailing newline trimmed).
@@ -240,6 +262,49 @@ static void load_display(void)
 	select_init(&disp_sel, disp_opts, disp_n, disp_cur < 0 ? 0 : disp_cur);
 }
 
+/* Append hz to the offered-rate list as "N Hz" if there's room and it's new. */
+static void add_rate(int hz)
+{
+	if (hz <= 0 || rate_n >= MAX_RATES) return;
+	for (int i = 0; i < rate_n; i++)
+		if (rate_val[i] == hz) return;
+	char *o = rate_label[rate_n];
+	uitoa((unsigned)hz, o);
+	int k = strlen(o);
+	o[k++] = ' '; o[k++] = 'H'; o[k++] = 'z'; o[k] = 0;
+	rate_val[rate_n]  = hz;
+	rate_opts[rate_n] = rate_label[rate_n];
+	rate_n++;
+}
+
+static void load_rate(void)
+{
+	char t[24];
+	rate_n = 0; rate_cur = -1;
+
+	/* Cap the list at the panel's real refresh (EDID); without EDID (QEMU) fall
+	 * back to the safe 30/60 pair. Above the panel rate there's no vblank to sync
+	 * to, so a higher pacing target would only tear. */
+	int cap = 0;
+	if (read_proc("/sys/class/graphics/fb0/refresh", t, sizeof t) > 0)
+		cap = patoi(t);
+	if (cap <= 0) cap = 60;
+
+	static const int cand[] = { 30, 60, 90, 120, 144, 165, 240 };
+	for (int i = 0; i < (int)(sizeof cand / sizeof cand[0]); i++)
+		if (cand[i] <= cap) add_rate(cand[i]);
+	add_rate(cap);   /* include an odd panel rate (e.g. 75) not among the candidates */
+
+	int cur = 0;
+	if (read_proc("/sys/class/graphics/fb0/rate", t, sizeof t) > 0)
+		cur = patoi(t);
+	add_rate(cur);   /* the live value may be outside the candidate set — show it */
+	for (int i = 0; i < rate_n; i++)
+		if (rate_val[i] == cur) { rate_cur = i; break; }
+
+	select_init(&rate_sel, rate_opts, rate_n, rate_cur < 0 ? 0 : rate_cur);
+}
+
 static void aline(const char *s)
 {
 	if (about_n >= 10) return;
@@ -292,13 +357,16 @@ static void load_about(void)
 
 /* Re-read the state the given category displays so it reflects the live kernel
  * value (it may have changed via the terminal or hotkeys since last shown). */
+static void build_controls(int cat);
+
 static void load_category(int cat)
 {
 	if      (cat == CAT_MOUSE)    load_mouse();
 	else if (cat == CAT_KEYBOARD) load_kbd();
 	else if (cat == CAT_SOUND)    load_sound();
-	else if (cat == CAT_DISPLAY)  load_display();
+	else if (cat == CAT_DISPLAY)  { load_display(); load_rate(); }
 	else if (cat == CAT_ABOUT)    load_about();
+	build_controls(cat);
 }
 
 /* ------------------------------------------------------------- apply changes */
@@ -339,6 +407,17 @@ static void set_display(int i)
 		disp_cur = i;
 }
 
+static void set_rate(int i)
+{
+	char t[8];
+	if (i < 0 || i >= rate_n) return;
+	uitoa((unsigned)rate_val[i], t);
+	/* The kernel clamps and stores it; the compositor polls the node and re-paces,
+	 * then persists the choice to /etc/display.conf. */
+	if (writefile("/sys/class/graphics/fb0/rate", t, strlen(t)) == 0)
+		rate_cur = i;
+}
+
 /* ------------------------------------------------------------- layout / paint */
 
 /* Width actually rendered this frame: the widget property, capped so the detail
@@ -351,9 +430,6 @@ static int sidebar_w(void)
 	return sbw;
 }
 
-/* Every category's choices are shown through one select (dropdown) at this
- * position; only the active category's widget is drawn/handled. */
-#define CTRL_Y 80
 static int ctrl_box_w(int cw)
 {
 	int w = 220;
@@ -362,82 +438,96 @@ static int ctrl_box_w(int cw)
 	return w;
 }
 
-/* The select widget for the active category, or NULL if it has none (About, or
- * an empty Sound/Display list). */
-static struct select_box *cur_select(void)
+/* A detail-pane control: a labelled dropdown plus the callback that pushes its
+ * value to the kernel. Each category owns a list of these, laid out top to
+ * bottom — the generalisation (over one hardcoded select per category) is what
+ * lets Display carry both Resolution and Refresh rate. */
+struct control {
+	const char *label, *hint;
+	struct select_box *sel;
+	void (*apply)(int idx);
+};
+static struct control ctrls[3];
+static int nctrl;
+
+/* Per-control vertical geometry: label, then the box, then a dim hint under it. */
+#define CONTROLS_Y0   44
+#define CONTROL_PITCH 84
+static int ctrl_label_y(int i) { return CONTROLS_Y0 + i * CONTROL_PITCH; }
+static int ctrl_box_y(int i)   { return ctrl_label_y(i) + 24; }
+static int ctrl_hint_y(int i)  { return ctrl_box_y(i) + GUI_SELECT_H + 8; }
+
+/* Bridge each control's (int idx) selection to its typed setter. */
+static void ap_mouse(int i)   { set_mouse_level(i + 1); }
+static void ap_kbd(int i)     { set_kbd_layout(kbd_opts[i].name); }
+static void ap_sound(int i)   { set_sound_output(i); }
+static void ap_display(int i) { set_display(i); }
+static void ap_rate(int i)    { set_rate(i); }
+
+static void addc(const char *label, const char *hint,
+                 struct select_box *sel, void (*apply)(int))
 {
-	switch (sel) {
-	case CAT_MOUSE:    return &mouse_sel;
-	case CAT_KEYBOARD: return &kbd_sel;
-	case CAT_SOUND:    return sound_n ? &sound_sel : 0;
-	case CAT_DISPLAY:  return disp_n  ? &disp_sel  : 0;
-	default:           return 0;
+	if (nctrl >= (int)(sizeof ctrls / sizeof ctrls[0])) return;
+	ctrls[nctrl].label = label;
+	ctrls[nctrl].hint  = hint;
+	ctrls[nctrl].sel   = sel;
+	ctrls[nctrl].apply = apply;
+	nctrl++;
+}
+
+/* Populate ctrls[] for the active category from its freshly loaded state. */
+static void build_controls(int cat)
+{
+	nctrl = 0;
+	switch (cat) {
+	case CAT_MOUSE:
+		addc("Pointer speed", "Higher moves the pointer farther per motion.",
+		     &mouse_sel, ap_mouse);
+		break;
+	case CAT_KEYBOARD:
+		addc("Layout", "Affects the whole system.", &kbd_sel, ap_kbd);
+		break;
+	case CAT_SOUND:
+		if (sound_n)
+			addc("Output device", "Routes playback to the selected output.",
+			     &sound_sel, ap_sound);
+		break;
+	case CAT_DISPLAY:
+		if (disp_n) {
+			addc("Resolution",
+			     disp_fixed ? "Resolution is fixed by the bootloader."
+			                : "Resolution applies immediately.",
+			     &disp_sel, ap_display);
+			addc("Refresh rate", "Frame rate the desktop renders at.",
+			     &rate_sel, ap_rate);
+		}
+		break;
 	}
 }
 
-/* Push the active category's new selection (index `idx`) to the kernel. */
-static void apply_select(int idx)
+/* Draw the active category's controls: labels and hints first, then the boxes —
+ * the open one last so its expanded list overlays the controls below it. */
+static void draw_controls(int cx, int cw)
 {
-	switch (sel) {
-	case CAT_MOUSE:    set_mouse_level(idx + 1);            break;
-	case CAT_KEYBOARD: set_kbd_layout(kbd_opts[idx].name);  break;
-	case CAT_SOUND:    set_sound_output(idx);               break;
-	case CAT_DISPLAY:  set_display(idx);                    break;
-	}
-}
-
-/* Draw the active category's select LAST (its open list overlays the pane). */
-static void draw_select(int cx, int cw)
-{
-	struct select_box *s = cur_select();
-	if (s)
-		select_draw(s, cx + 16, CTRL_Y, ctrl_box_w(cw), GUI_SELECT_H);
-}
-
-/* Each category draws its own title/label/hint, then the shared select on top. */
-static void draw_mouse(int cx, int cw)
-{
-	gfx_ui_text(cx + 16, 16, "Mouse / Touchpad", FG_WHITE);
-	gfx_ui_text(cx + 16, 52, "Pointer speed", FG_TEXT);
-	gfx_ui_text(cx + 16, CTRL_Y + GUI_SELECT_H + 12,
-	            "Higher moves the pointer farther per motion.", FG_DIM);
-	draw_select(cx, cw);
-}
-
-static void draw_keyboard(int cx, int cw)
-{
-	gfx_ui_text(cx + 16, 16, "Keyboard", FG_WHITE);
-	gfx_ui_text(cx + 16, 52, "Layout", FG_TEXT);
-	gfx_ui_text(cx + 16, CTRL_Y + GUI_SELECT_H + 12,
-	            "Affects the whole system.", FG_DIM);
-	draw_select(cx, cw);
-}
-
-static void draw_sound(int cx, int cw)
-{
-	gfx_ui_text(cx + 16, 16, "Sound", FG_WHITE);
-	gfx_ui_text(cx + 16, 52, "Output device", FG_TEXT);
-	if (sound_n == 0) {
-		gfx_ui_text(cx + 16, 84, "No audio output device.", FG_DIM);
+	if (nctrl == 0) {
+		const char *msg = sel == CAT_SOUND   ? "No audio output device." :
+		                  sel == CAT_DISPLAY ? "No framebuffer." :
+		                                       "No options available.";
+		gfx_ui_text(cx + 16, CONTROLS_Y0, msg, FG_DIM);
 		return;
 	}
-	gfx_ui_text(cx + 16, CTRL_Y + GUI_SELECT_H + 12,
-	            "Routes playback to the selected output.", FG_DIM);
-	draw_select(cx, cw);
-}
-
-static void draw_display(int cx, int cw)
-{
-	gfx_ui_text(cx + 16, 16, "Display", FG_WHITE);
-	gfx_ui_text(cx + 16, 52, "Resolution", FG_TEXT);
-	if (disp_n == 0) {
-		gfx_ui_text(cx + 16, 84, "No framebuffer.", FG_DIM);
-		return;
+	int bw = ctrl_box_w(cw), open = -1;
+	for (int i = 0; i < nctrl; i++) {
+		gfx_ui_text(cx + 16, ctrl_label_y(i), ctrls[i].label, FG_TEXT);
+		if (ctrls[i].hint)
+			gfx_ui_text(cx + 16, ctrl_hint_y(i), ctrls[i].hint, FG_DIM);
 	}
-	gfx_ui_text(cx + 16, CTRL_Y + GUI_SELECT_H + 12,
-	            disp_fixed ? "Resolution is fixed by the bootloader."
-	                       : "Applies immediately.", FG_DIM);
-	draw_select(cx, cw);
+	for (int i = 0; i < nctrl; i++) {
+		if (ctrls[i].sel->open) { open = i; continue; }
+		select_draw(ctrls[i].sel, cx + 16, ctrl_box_y(i), bw, GUI_SELECT_H);
+	}
+	if (open >= 0)
+		select_draw(ctrls[open].sel, cx + 16, ctrl_box_y(open), bw, GUI_SELECT_H);
 }
 
 /* Draw `s` at (x,y), truncated to fit `maxw` pixels so a long line (a verbose
@@ -481,14 +571,16 @@ static void render(void)
 		            here ? FG_WHITE : FG_TEXT);
 	}
 
-	/* Detail pane. */
+	/* Detail pane: About renders its own text block; every other category shows
+	 * the category title over its generic control stack. */
 	int cx = sbw + 1, cw = W - sbw - 1;
 	gfx_fill_rect(cx, 0, cw, H, BG_PANEL);
-	if      (sel == CAT_MOUSE)    draw_mouse(cx, cw);
-	else if (sel == CAT_KEYBOARD) draw_keyboard(cx, cw);
-	else if (sel == CAT_SOUND)    draw_sound(cx, cw);
-	else if (sel == CAT_DISPLAY)  draw_display(cx, cw);
-	else                          draw_about(cx, cw);
+	if (sel == CAT_ABOUT) {
+		draw_about(cx, cw);
+	} else {
+		gfx_ui_text(cx + 16, 16, cat_name[sel], FG_WHITE);
+		draw_controls(cx, cw);
+	}
 }
 
 /* ------------------------------------------------------------- input */
@@ -512,13 +604,24 @@ static void click(int id, int mx, int my)
 		return;
 	}
 
-	/* Detail-pane controls: the active category's select widget. */
+	/* Detail-pane controls: route to the open dropdown first (its list overlays
+	 * the boxes below it), then the rest. Acting on one closes the others. */
 	int cx = sbw + 1, cw = W - sbw - 1;
-	struct select_box *s = cur_select();
-	if (s) {
-		int r = select_click(s, cx + 16, CTRL_Y, ctrl_box_w(cw), GUI_SELECT_H, mx, my);
-		if (r == 1)       { apply_select(s->selected); seq++; }
-		else if (r == -1) { seq++; }
+	int bw = ctrl_box_w(cw), opened = -1;
+	for (int i = 0; i < nctrl; i++) if (ctrls[i].sel->open) opened = i;
+
+	int order[3], no = 0;
+	if (opened >= 0) order[no++] = opened;
+	for (int i = 0; i < nctrl; i++) if (i != opened) order[no++] = i;
+
+	for (int k = 0; k < no; k++) {
+		int i = order[k];
+		int r = select_click(ctrls[i].sel, cx + 16, ctrl_box_y(i), bw, GUI_SELECT_H, mx, my);
+		if (r == 0) continue;
+		if (r == 1) ctrls[i].apply(ctrls[i].sel->selected);
+		for (int j = 0; j < nctrl; j++) if (j != i) ctrls[j].sel->open = 0;
+		seq++;
+		return;
 	}
 }
 
@@ -531,11 +634,12 @@ static void drag(int mx)
 /* Up/Down move the selected category; an open dropdown captures keys instead. */
 static void key(int k)
 {
-	struct select_box *s = cur_select();
-	if (s && s->open) {
-		int r = select_key(s, (char)k);
-		if (r == 1)       { apply_select(s->selected); seq++; return; }
+	for (int i = 0; i < nctrl; i++) {
+		if (!ctrls[i].sel->open) continue;
+		int r = select_key(ctrls[i].sel, (char)k);
+		if (r == 1)       { ctrls[i].apply(ctrls[i].sel->selected); seq++; return; }
 		else if (r == -1) { seq++; return; }
+		break;                        /* open but unhandled: fall through to nav */
 	}
 	if (k == KEY_UP || k == KEY_DOWN) {
 		sel += (k == KEY_DOWN) ? 1 : -1;
@@ -559,7 +663,9 @@ int main(void)
 	load_kbd();
 	load_sound();
 	load_display();
+	load_rate();
 	load_about();
+	build_controls(sel);
 
 	int last = -1;
 	for (;;) {
@@ -569,13 +675,14 @@ int main(void)
 			else if (ev.type == WEV_MOUSE)  click(id, ev.a, ev.b);
 			else if (ev.type == WEV_DRAG)   drag(ev.a);
 			else if (ev.type == WEV_MOVE)   {
-				/* Track hover for an open dropdown. */
-				struct select_box *s = cur_select();
-				if (s && s->open) {
-					int sbw = sidebar_w(), cx = sbw + 1, cw = W - sbw - 1;
-					if (select_motion(s, cx + 16, CTRL_Y,
-					                  ctrl_box_w(cw), GUI_SELECT_H, ev.a, ev.b))
+				/* Track hover for whichever dropdown is open. */
+				int sbw = sidebar_w(), cx = sbw + 1, cw = W - sbw - 1, bw = ctrl_box_w(cw);
+				for (int i = 0; i < nctrl; i++) {
+					if (!ctrls[i].sel->open) continue;
+					if (select_motion(ctrls[i].sel, cx + 16, ctrl_box_y(i),
+					                  bw, GUI_SELECT_H, ev.a, ev.b))
 						seq++;
+					break;
 				}
 			}
 			else if (ev.type == WEV_KEY)    key(ev.a);

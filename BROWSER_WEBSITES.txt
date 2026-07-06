@@ -1,0 +1,4 @@
+- X/Twitter won't load (bundles errors)
+- Crunchyroll won't load (bundles errors)
+- Discord won't load (bundles errors)
+

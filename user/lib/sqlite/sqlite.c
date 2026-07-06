@@ -3,13 +3,14 @@
  * Writer: build each table as a table b-tree bottom-up. Rows become records
  * (record header of serial-type varints + the column bodies); records become
  * table-leaf cells; cells pack into leaf pages; if a table spills more than one
- * leaf, interior pages are stacked on top until a single root remains. The
- * schema table (sqlite_schema) is one leaf rooted on page 1, after the 100-byte
- * database header.
+ * leaf, interior pages are stacked on top until a single root remains. A record
+ * too large for one leaf keeps OVF_X bytes local and spills the rest onto a
+ * chain of overflow pages. The schema table (sqlite_schema) is one leaf rooted
+ * on page 1, after the 100-byte database header.
  *
  * Reader: parse the header, walk the schema b-tree to discover tables and their
  * root pages, then walk each table's b-tree (leaf and interior) decoding every
- * record back into sql_value columns.
+ * record back into sql_value columns, reassembling overflow chains as needed.
  *
  * All multi-byte on-disk integers are big-endian. Varints are SQLite's 1-9 byte
  * big-endian form (high bit = continuation; the 9th byte uses all 8 bits).
@@ -23,6 +24,15 @@
 
 #define BT_LEAF        0x0D          /* table b-tree leaf                       */
 #define BT_INTERIOR    0x05          /* table b-tree interior                   */
+
+/* Overflow thresholds for a table b-tree leaf, per the SQLite file format. We
+ * always write (and only read) pages with zero reserved bytes, so the usable
+ * page size U equals PAGESIZE. X is the most payload a leaf cell may keep local
+ * before spilling; M is the minimum kept local once it does. The 64/32/32
+ * payload fractions the header records are baked into these constants. */
+#define OVF_U          PAGESIZE
+#define OVF_X          (OVF_U - 35)
+#define OVF_M          (((OVF_U - 12) * 32 / 255) - 23)
 
 typedef unsigned char  u8;
 typedef unsigned short u16;
@@ -56,6 +66,16 @@ static int put_varint(u8 *p, u64 v)
 }
 
 static int varint_len(u64 v) { u8 t[9]; return put_varint(t, v); }
+
+/* How many bytes of a `plen`-byte table-leaf payload stay on the leaf page. When
+ * the return value is < plen the remainder spills onto overflow pages, with a
+ * 4-byte overflow-page pointer following the local bytes. */
+static int leaf_local(int plen)
+{
+	if (plen <= OVF_X) return plen;
+	int k = OVF_M + (plen - OVF_M) % (OVF_U - 4);
+	return (k <= OVF_X) ? k : OVF_M;
+}
 
 /* Decode a varint from p (at most maxlen bytes). Returns bytes consumed, or 0
  * if it runs off the end. */
@@ -285,11 +305,11 @@ static int build_btree(struct builder *b, struct cell *cells, int ncells)
 			long long maxkey = cells[i].key;
 			while (i < ncells) {
 				int need = 2 + cells[i].len;
-				/* A single record too big for one leaf page can't be stored:
-				 * this format has no overflow pages. Fail the whole save rather
-				 * than let render_leaf memcpy past the start of the page buffer
-				 * (content = PAGESIZE - len would go negative). The caller is
-				 * best-effort, so the in-memory data is left untouched. */
+				/* Every cell is built by build_leaf_cell, which caps the local
+				 * payload at OVF_X and spills the rest to overflow pages, so a
+				 * cell can never exceed a page. This stays only as defense: were
+				 * an over-large cell to slip through, render_leaf would memcpy
+				 * past the page buffer (content = PAGESIZE - len going negative). */
 				if (need > PAGESIZE - 8) { free(level); b->err = 1; return 0; }
 				if (used + need > PAGESIZE && i > first) break;
 				used += need;
@@ -468,6 +488,51 @@ struct sql_value sqlv_text(const char *s)
 
 /* ----------------------------------------------------------------- writer */
 
+/* Build a table-leaf cell from an already-encoded record payload, spilling the
+ * remainder onto a chain of overflow pages when the payload exceeds the leaf
+ * capacity. The cell is varint(payload len) + varint(rowid) + local bytes, plus
+ * a 4-byte first-overflow-page pointer when it spills. Overflow pages are
+ * allocated from the builder here (before the b-tree pages), each carrying a
+ * 4-byte next-page pointer (0 at the tail) then up to OVF_U-4 payload bytes.
+ * Returns a malloc'd cell buffer and its length via *outlen, or 0 (b->err set). */
+static u8 *build_leaf_cell(struct builder *b, const u8 *payload, int plen,
+                           long long rowid, int *outlen)
+{
+	int local = leaf_local(plen);
+	int spills = local < plen;
+	int celllen = varint_len((u64)plen) + varint_len((u64)rowid) + local
+	              + (spills ? 4 : 0);
+	u8 *cb = (u8 *)malloc((unsigned)celllen);
+	if (!cb) { b->err = 1; return 0; }
+
+	int o = put_varint(cb, (u64)plen);
+	o += put_varint(cb + o, (u64)rowid);
+	memcpy(cb + o, payload, (__SIZE_TYPE__)local);
+	o += local;
+
+	if (spills) {
+		int first = b->next_page++;
+		put32(cb + o, (u32)first);
+
+		int rem = plen - local;
+		const u8 *src = payload + local;
+		int page_no = first;
+		while (rem > 0) {
+			u8 *pg = add_page(b, page_no);
+			if (!pg) { free(cb); return 0; }   /* b->err set by add_page */
+			int chunk = rem > OVF_U - 4 ? OVF_U - 4 : rem;
+			int next = rem > chunk ? b->next_page++ : 0;
+			put32(pg, (u32)next);
+			memcpy(pg + 4, src, (__SIZE_TYPE__)chunk);
+			src += chunk; rem -= chunk;
+			page_no = next;
+		}
+	}
+
+	*outlen = celllen;
+	return cb;
+}
+
 int sql_save(struct sql_db *db, const char *path)
 {
 	struct builder b;
@@ -497,15 +562,12 @@ int sql_save(struct sql_db *db, const char *path)
 			int reclen;
 			u8 *rec = build_record(r->col, r->ncol, &reclen);
 			if (!rec) { b.err = 1; break; }
-			/* leaf cell = varint(payload len) + varint(rowid) + payload */
-			u8 *cb = (u8 *)malloc((unsigned)(reclen + 18));
-			if (!cb) { free(rec); b.err = 1; break; }
-			int o = put_varint(cb, (u64)reclen);
-			o += put_varint(cb + o, (u64)r->rowid);
-			memcpy(cb + o, rec, (__SIZE_TYPE__)reclen);
+			int celllen;
+			u8 *cb = build_leaf_cell(&b, rec, reclen, r->rowid, &celllen);
 			free(rec);
+			if (!cb) { b.err = 1; break; }
 			cells[nc].buf = cb;
-			cells[nc].len = o + reclen;
+			cells[nc].len = celllen;
 			cells[nc].key = r->rowid;
 			nc++;
 			rid = r->rowid;
@@ -538,14 +600,12 @@ int sql_save(struct sql_db *db, const char *path)
 			int reclen;
 			u8 *rec = build_record(sv, 5, &reclen);
 			if (!rec) { b.err = 1; break; }
-			u8 *cb = (u8 *)malloc((unsigned)(reclen + 18));
-			if (!cb) { free(rec); b.err = 1; break; }
-			int o = put_varint(cb, (u64)reclen);
-			o += put_varint(cb + o, (u64)(sn + 1));    /* schema rowid 1,2,... */
-			memcpy(cb + o, rec, (__SIZE_TYPE__)reclen);
+			int celllen;                               /* schema rowid 1,2,... */
+			u8 *cb = build_leaf_cell(&b, rec, reclen, sn + 1, &celllen);
 			free(rec);
+			if (!cb) { b.err = 1; break; }
 			scells[sn].buf = cb;
-			scells[sn].len = o + reclen;
+			scells[sn].len = celllen;
 			scells[sn].key = sn + 1;
 			sn++;
 		}
@@ -645,9 +705,10 @@ static int decode_record(const u8 *payload, int plen,
 		} else if (st == 9) {
 			v.type = SQL_INT; v.i = 1;
 		} else if (st >= 12) {
-			int len = (int)((st - 12) / 2);
+			u64 slen = (st - 12) / 2;
 			int isText = (st & 1);
-			if (len > brem) break;
+			if (slen > (u64)brem) break;   /* also rejects huge st that would go negative as int */
+			int len = (int)slen;
 			char *d = (char *)malloc((unsigned)(len + 1));
 			if (!d) break;
 			if (len) memcpy(d, bp, (__SIZE_TYPE__)len);
@@ -666,12 +727,50 @@ static int decode_record(const u8 *payload, int plen,
 /* Per-cell callback while walking a table b-tree. */
 typedef void (*row_fn)(void *ctx, long long rowid, const u8 *payload, int plen);
 
-static void walk_table(const u8 *file, unsigned filelen, int page_no,
-                       int depth, row_fn fn, void *ctx)
+/* Reassemble an overflowing table-leaf payload into one contiguous buffer.
+ * `local_ptr` points at the local payload on the leaf; `local` bytes are there,
+ * immediately followed by a 4-byte first-overflow-page pointer. The chain is
+ * walked, each page contributing up to OVF_U-4 bytes after its own 4-byte
+ * next-page pointer, until `plen` bytes are gathered. `visited` guards against a
+ * cyclic or file-overrunning chain. Returns a malloc'd buffer of plen bytes
+ * (caller frees) or 0 on OOM/corruption. */
+static u8 *read_overflow(const u8 *file, unsigned filelen, const u8 *local_ptr,
+                         int plen, int local, u8 *visited)
+{
+	u8 *buf = (u8 *)malloc((unsigned)plen);
+	if (!buf) return 0;
+	memcpy(buf, local_ptr, (__SIZE_TYPE__)local);
+	int got = local;
+	int next = (int)get32(local_ptr + local);
+
+	while (got < plen) {
+		if (next < 1) { free(buf); return 0; }
+		u64 off = (u64)(next - 1) * PAGESIZE;
+		if (off + PAGESIZE > filelen) { free(buf); return 0; }
+		if (visited[next >> 3] & (1 << (next & 7))) { free(buf); return 0; }
+		visited[next >> 3] |= (u8)(1 << (next & 7));
+
+		const u8 *op = file + off;
+		int chunk = plen - got;
+		if (chunk > OVF_U - 4) chunk = OVF_U - 4;
+		memcpy(buf + got, op + 4, (__SIZE_TYPE__)chunk);
+		got += chunk;
+		next = (int)get32(op);
+	}
+	return buf;
+}
+
+static void walk_r(const u8 *file, unsigned filelen, int page_no,
+                   int depth, row_fn fn, void *ctx, u8 *visited)
 {
 	if (depth > 32 || page_no < 1) return;
-	unsigned off = (unsigned)(page_no - 1) * PAGESIZE;
+	/* 64-bit so a hostile page number can't wrap the bounds check. */
+	u64 off = (u64)(page_no - 1) * PAGESIZE;
 	if (off + PAGESIZE > filelen) return;
+	/* page_no is now known <= filelen/PAGESIZE, so the bitmap index is in range;
+	 * refuse to re-descend a page to kill cyclic/DAG b-trees (exponential walk). */
+	if (visited[page_no >> 3] & (1 << (page_no & 7))) return;
+	visited[page_no >> 3] |= (u8)(1 << (page_no & 7));
 
 	const u8 *pg = file + off;
 	int hdr_off = (page_no == 1) ? HDR_BYTES : 0;
@@ -681,6 +780,8 @@ static void walk_table(const u8 *file, unsigned filelen, int page_no,
 
 	if (type == BT_LEAF) {
 		const u8 *cptr = h + 8;
+		int maxcell = (PAGESIZE - hdr_off - 8) / 2;   /* cell-ptr array must fit the page */
+		if (ncell > maxcell) ncell = maxcell;
 		for (int i = 0; i < ncell; i++) {
 			int cp = (int)get16(cptr + i * 2);
 			if (cp < hdr_off || cp >= PAGESIZE) continue;
@@ -693,20 +794,43 @@ static void walk_table(const u8 *file, unsigned filelen, int page_no,
 			int k2 = get_varint(c, rem, &rowid);
 			if (!k2) continue;
 			c += k2; rem -= k2;
-			if (plen > (u64)rem) continue;       /* overflow unsupported       */
-			fn(ctx, (long long)rowid, c, (int)plen);
+			if (plen > (u64)filelen) continue;   /* payload can't exceed file  */
+			int P = (int)plen;
+			int local = leaf_local(P);
+			if (local == P) {
+				if (P > rem) continue;           /* corrupt: claims to fit      */
+				fn(ctx, (long long)rowid, c, P);
+			} else {
+				if (local + 4 > rem) continue;   /* local + ovf ptr must be here */
+				u8 *asm_buf = read_overflow(file, filelen, c, P, local, visited);
+				if (!asm_buf) continue;
+				fn(ctx, (long long)rowid, asm_buf, P);
+				free(asm_buf);
+			}
 		}
 	} else if (type == BT_INTERIOR) {
 		const u8 *cptr = h + 12;
+		int maxcell = (PAGESIZE - hdr_off - 12) / 2;
+		if (ncell > maxcell) ncell = maxcell;
 		for (int i = 0; i < ncell; i++) {
 			int cp = (int)get16(cptr + i * 2);
 			if (cp < hdr_off || cp + 4 > PAGESIZE) continue;
 			int child = (int)get32(pg + cp);
-			walk_table(file, filelen, child, depth + 1, fn, ctx);
+			walk_r(file, filelen, child, depth + 1, fn, ctx, visited);
 		}
 		int right = (int)get32(h + 8);
-		walk_table(file, filelen, right, depth + 1, fn, ctx);
+		walk_r(file, filelen, right, depth + 1, fn, ctx, visited);
 	}
+}
+
+static void walk_table(const u8 *file, unsigned filelen, int page_no,
+                       row_fn fn, void *ctx)
+{
+	unsigned npages = filelen / PAGESIZE;
+	u8 *visited = (u8 *)calloc(1, npages / 8 + 1);
+	if (!visited) return;
+	walk_r(file, filelen, page_no, 0, fn, ctx, visited);
+	free(visited);
 }
 
 /* Count top-level columns in a "CREATE TABLE x(...)" string (best effort). */
@@ -797,14 +921,17 @@ struct sql_db *sql_open(const char *path)
 	unsigned want = (ps == 1) ? 65536 : ps;
 	if (want != PAGESIZE) { free(file); sql_close(db); return 0; }
 	if ((unsigned)n < PAGESIZE) { free(file); sql_close(db); return 0; }
+	/* Reserved bytes per page shrink the usable size U; our overflow thresholds
+	 * assume U == PAGESIZE, so a file that reserves any can't be read correctly. */
+	if (file[20] != 0) { free(file); sql_close(db); return 0; }
 
 	struct schema_ctx sc; sc.db = db;
-	walk_table(file, (unsigned)n, 1, 0, schema_cb, &sc);
+	walk_table(file, (unsigned)n, 1, schema_cb, &sc);
 
 	for (struct sql_table *t = db->tables; t; t = t->next) {
 		if (t->load_root > 0) {
 			struct load_ctx lc; lc.table = t;
-			walk_table(file, (unsigned)n, t->load_root, 0, row_cb, &lc);
+			walk_table(file, (unsigned)n, t->load_root, row_cb, &lc);
 		}
 	}
 

@@ -11,7 +11,10 @@
 #include "font.h"   /* custom @font-face faces (user/lib/font) */
 #include "clipboard.h"   /* clip_put_text for Copy */
 #include "layout.h"  /* the CSS box tree (backgrounds/borders behind the text) */
+#include "anim.h"    /* CSS @keyframes / transition engine (drives per-frame relayout) */
 #include "bmedia.h"  /* <audio>/<video> controls widget + playback state */
+#include "bookmarks.h"  /* persistent (url,title) bookmarks store */
+#include "dialog.h"  /* window.alert/confirm/prompt run on the main thread here */
 
 static struct browser binst;
 struct browser *B = &binst;
@@ -209,8 +212,19 @@ static const char *const edit_items[] = { "Copy", "Select All" };
 static unsigned char       edit_flags[] = { MENU_DISABLED, 0 };
 static struct menu editmenu = { "Edit", edit_items, 2, 0, 0, 0, edit_flags, 0 };
 
-static struct menu *const bar_menus[] = { &pagemenu, &editmenu, &viewmenu };
-static struct menubar menubar = { bar_menus, 3, 2, 0 };
+/* "Bookmarks" menu. The favicon/folder tree lives in a dedicated panel (drawn by
+ * this file), not the flat gfx dropdown; this bar menu just holds the quick
+ * commands. Item 0 toggles the current page's bookmark, item 1 shows/hides the
+ * panel, item 2 makes a new top-level folder. The two toggle labels + item 0's
+ * enabled state are refreshed per-open by bookmarks_menu_sync. */
+static const char  *bm_items[3];
+static unsigned char bm_flags[3];
+static char          bm_toggle_label[24];   /* "Add"/"Remove Bookmark"  */
+static char          bm_show_label[20];     /* "Show"/"Hide Bookmarks"  */
+static struct menu bmarkmenu = { "Bookmarks", bm_items, 3, 0, 0, 0, bm_flags, 0 };
+
+static struct menu *const bar_menus[] = { &pagemenu, &editmenu, &viewmenu, &bmarkmenu };
+static struct menubar menubar = { bar_menus, 4, 2, 0 };
 
 /* --- tabs ------------------------------------------------------------------ */
 /* Each tab keeps its URL, label and scroll offset, plus — when it isn't the
@@ -241,19 +255,21 @@ struct tab {
 	int      hist_i;             /* index of the current page (0..hist_n-1)     */
 
 	struct dt_view dt;           /* this tab's devtools view (panel/scroll/open) */
+
+	/* Set when this tab's page faulted (JS-runtime/GC OOM, a use-after-free, deep
+	 * recursion overrun): the worker caught the CPU fault, tore the page down, and
+	 * flagged it so render() shows the "tab crashed" page instead of the browser
+	 * dying. Cleared when the tab is navigated/reloaded. crash_sig is the fault
+	 * signal (SIGSEGV/SIGILL/SIGFPE …) that fired, used to label the page. */
+	int crashed;
+	int crash_sig;
 };
 static struct tab tabs[MAX_TABS];
 static int n_tabs = 1;
 static int active_tab = 0;
 
 static void update_title(int id);   /* defined below; called from tab reveal */
-
-static void copy_str(char *d, const char *s, int cap)
-{
-	int i = 0;
-	for (; s[i] && i < cap - 1; i++) d[i] = s[i];
-	d[i] = '\0';
-}
+static void navigate(const char *url);   /* defined below; called from panels/handlers */
 
 /* Free every heap buffer a page owns and zero it (so a reused slot starts clean).
  * Each tab owns its page, so this runs when a tab closes or a slot is recycled. */
@@ -338,8 +354,23 @@ static void load_quiesce(void)
 {
 	B->req_pending = 0;
 	B->abort_load = 1;
-	while (B->loading) msleep(2);
+	while (B->loading || B->in_scripts) msleep(2);   /* also wait out a background script pass */
 	B->abort_load = 0;
+}
+
+/* Park the worker at the top of its loop so the main thread can mutate the page
+ * set (B->pg, active_tab, tabs[]) with the worker guaranteed not to be reading it.
+ * Call after load_quiesce(): that stops any in-flight fetch/script pass, so the
+ * worker reaches the park point promptly; this then also fences the timer/event/
+ * media pump, the live window load_quiesce leaves open. Pair with worker_unpark(). */
+static void worker_park(void)
+{
+	B->worker_pause = 1;
+	while (!B->worker_idle) msleep(1);
+}
+static void worker_unpark(void)
+{
+	B->worker_pause = 0;
 }
 
 /* Leaving the active tab: its page (buffers, colours, everything) stays put in
@@ -349,6 +380,7 @@ static void load_quiesce(void)
 static void tab_leave(int i)
 {
 	struct tab *t = &tabs[i];
+	B->drop_dom_tab = i;                     /* the tab whose DOM the worker is about to free */
 	B->drop_dom = 1; B->events_live = 0;     /* worker frees the live DOM; page goes static */
 	devtools_view_save(&t->dt);              /* remember this tab's devtools view */
 	page_save_images(&t->page);
@@ -375,27 +407,114 @@ static volatile int worker_quit;
 #define JS_STACK_HEADROOM 32768
 void *browser_js_stack_floor(void) { return &worker_stack[JS_STACK_HEADROOM]; }
 
+/* --- crash recovery: keep one tab's fault from taking down the whole browser --- *
+ * All page work — parse, layout, and the JS runtime + GC — runs on the worker
+ * thread. A JS-runtime/GC OOM dereferences a NULL allocation and page-faults; a
+ * pathological page can also blow the stack or trip a use-after-free. Left alone
+ * that fault kills the whole browser process (every tab). Instead the worker
+ * installs a fault-signal handler (the kernel now delivers a ring-3 fault as
+ * SIGSEGV/SIGILL/SIGFPE when a handler is set) that longjmp()s back to a recovery
+ * point at the top of the worker loop, where the crashed tab is flagged and its
+ * page torn down. The main (UI) thread never runs JS, so it stays responsive. */
+static jmp_buf      worker_recovery;
+static volatile int worker_in_recovery;   /* re-entrancy guard: a fault while tearing
+                                           * a crashed page down must not loop forever */
+
+/* The tab whose page the worker is operating on this loop iteration — derived from
+ * B->pg (the page the work actually touches), NOT the UI thread's `active_tab`.
+ * The recovery point must flag THIS tab, because the main thread can advance
+ * `active_tab` (opening/switching a tab) while a fault unwinds: a page's own
+ * timer/event/media callback can fault in the pump section where `load_quiesce`
+ * doesn't block the UI thread, so `active_tab` may already point at a fresh tab by
+ * the time recovery runs. Snapshotting the worker's tab keeps the sad page on the
+ * tab that actually crashed. */
+static volatile int worker_tab;
+
+/* The tab slot backing page `p` (B->pg always points into some tabs[i].page). */
+static int tab_of_page(const struct page *p)
+{
+	for (int i = 0; i < n_tabs; i++)
+		if (&tabs[i].page == p) return i;
+	return active_tab;   /* unreachable: B->pg is always a live tab's page */
+}
+
+static void worker_crash_handler(int sig)
+{
+	/* Carry the signal out as the setjmp return value so the recovery point knows
+	 * WHICH fault fired (OOM/bad access vs illegal instruction vs FP error) and can
+	 * label the crash page. Every fault signal is non-zero, so setjmp reads it as
+	 * "crashed". Never returns — the faulting instruction would just re-fault. */
+	longjmp(worker_recovery, sig);
+}
+
+static void worker_install_crash_handlers(void)
+{
+	signal(SIGSEGV, worker_crash_handler);
+	signal(SIGILL,  worker_crash_handler);
+	signal(SIGFPE,  worker_crash_handler);
+	signal(SIGBUS,  worker_crash_handler);
+	signal(SIGABRT, worker_crash_handler);
+}
+
+/* After a longjmp out of a fault: re-arm delivery and release any lock the unwound
+ * frame was holding, so the browser doesn't deadlock on the next allocation/paint.
+ * Ordered so nothing here can itself fault before delivery is re-armed. */
+static void worker_after_crash(void)
+{
+	blk_unlock();                          /* the realloc/render interlock       */
+	heap_lock_reset();                     /* the malloc spinlock                */
+	/* The kernel masked the fault signal to run the (never-returning) handler;
+	 * unblock it or the next tab crash would be uncatchable and fatal. */
+	unsigned m = sigmask(SIGSEGV) | sigmask(SIGILL) | sigmask(SIGFPE) |
+	             sigmask(SIGBUS)  | sigmask(SIGABRT);
+	sigprocmask(SIG_UNBLOCK, &m, 0);
+}
+
 static void worker_navigate(const char *url)
 {
 	int k = 0;
 	for (; url[k] && k < URL_MAX - 1; k++) B->req_url[k] = url[k];
 	B->req_url[k] = '\0';
+	B->req_method[0] = '\0';       /* GET: clear any prior POST */
+	B->req_body_len = 0; B->req_body[0] = '\0'; B->req_ctype[0] = '\0';
 	B->req_pending = 1; B->seq++;
 }
 
-/* Submit the form enclosing `from`: fire 'submit', and unless prevented navigate
- * to the action with the form's field values. Returns 1 if a form was found. */
-static int worker_submit(struct dom_node *from)
+/* Queue a POST navigation (a form submission). Same handoff as worker_navigate,
+ * plus the request body + its Content-Type; do_fetch sends them and clears the
+ * method afterward so the next navigation defaults back to GET. */
+static void worker_navigate_post(const char *url, const char *body, int blen, const char *ctype)
 {
-	char url[URL_MAX];
+	int k = 0;
+	for (; url[k] && k < URL_MAX - 1; k++) B->req_url[k] = url[k];
+	B->req_url[k] = '\0';
+	strcpy(B->req_method, "POST");
+	if (blen > (int)sizeof B->req_body - 1) blen = (int)sizeof B->req_body - 1;
+	if (blen < 0) blen = 0;
+	memcpy(B->req_body, body, (unsigned)blen); B->req_body[blen] = '\0';
+	B->req_body_len = blen;
+	strcpy(B->req_ctype, ctype ? ctype : "application/x-www-form-urlencoded");
+	B->req_pending = 1; B->seq++;
+}
+
+/* Submit the form enclosing `node`: optionally fire 'submit', and unless a handler
+ * prevented it, navigate (GET query or POST body) to the built target. Returns 1
+ * if a form was found. Shared by interactive submits and the JS form API. */
+int browser_form_submit(struct dom_node *node, int fire_event)
+{
+	struct form_submission fs;
 	struct dom_node *form;
-	for (form = from; form; form = form->parent) if (streq(form->tag, "form")) break;
+	for (form = node; form; form = form->parent) if (streq(form->tag, "form")) break;
 	if (!form) return 0;
-	if (!js_dispatch_dom_event(form, "submit", 0, 0) &&
-	    html_form_submit_url(from, url, sizeof url) && url[0])
-		worker_navigate(url);
+	if (fire_event && js_dispatch_dom_event(form, "submit", 0, 0)) return 1;  /* preventDefault */
+	if (html_form_build(node, &fs) && fs.url[0]) {
+		if (streq(fs.method, "POST")) worker_navigate_post(fs.url, fs.body, fs.body_len, fs.ctype);
+		else                          worker_navigate(fs.url);
+	}
 	return 1;
 }
+
+static int worker_submit(struct dom_node *from) { return browser_form_submit(from, 1); }
 
 /* Perform a clicked control's default action: toggle/cycle/focus/submit, firing
  * the matching DOM events. Returns 1 if the page should re-flatten afterwards. */
@@ -483,12 +602,59 @@ static void worker_dispatch_event(void)
 
 static void worker_fn(void)
 {
+	worker_install_crash_handlers();
+
+	/* Recovery point. A CPU fault anywhere in the page work below (JS/GC OOM, a
+	 * stack overrun, a use-after-free) delivers a signal whose handler longjmp()s
+	 * here. Flag the tab the worker was actually rendering (worker_tab, not the UI
+	 * thread's active_tab) so render() shows the "tab crashed" page on the tab that
+	 * crashed, then reclaim the (now-dead) page so the browser keeps running. */
+	int crash_sig = setjmp(worker_recovery);
+	if (crash_sig) {
+		worker_after_crash();
+		tabs[worker_tab].crashed = 1;
+		tabs[worker_tab].crash_sig = crash_sig;
+		B->loading = 0; B->abort_load = 0;
+		B->scripts_pending = 0; B->in_scripts = 0;
+		B->evt_pending = 0; B->events_live = 0;
+		B->pg->text_len = 0; B->nlines = 0;   /* the sad-tab page ignores these */
+		B->seq++;
+		if (!worker_in_recovery) {
+			/* First fault for this page: reclaim its DOM/JS heap. Guarded — if the
+			 * teardown itself refaults on a corrupted heap we land back here with the
+			 * flag set and skip it, leaking the page rather than looping forever. */
+			worker_in_recovery = 1;
+			html_page_teardown();
+			worker_in_recovery = 0;
+		} else {
+			worker_in_recovery = 0;           /* give up on teardown; stay alive */
+		}
+	}
+
 	for (;;) {
 		if (worker_quit)
 			exit(0);
+		/* Park here when the main thread is mutating the page set (opening/switching/
+		 * closing a tab): it needs B->pg / active_tab / tabs[] to hold still while the
+		 * worker is guaranteed not to be reading them. This is the fence load_quiesce
+		 * can't provide on its own — it stops in-flight loads but not the pump below,
+		 * so without this a B->pg swap could land mid-timer/-event/-media callback. */
+		if (B->worker_pause) {
+			B->worker_idle = 1;
+			while (B->worker_pause) msleep(1);
+			B->worker_idle = 0;
+		}
+		/* Record which tab this iteration's work belongs to (the page B->pg touches)
+		 * before doing anything that can fault, so the recovery point above flags the
+		 * right tab even if the UI thread advances active_tab meanwhile. */
+		worker_tab = tab_of_page(B->pg);
 		if (B->drop_dom) {                   /* main switched away: free the page  */
 			B->drop_dom = 0;
 			B->events_live = 0;
+			/* This frees the DEPARTING tab's live DOM, but B->pg already points at the
+			 * tab we switched to — so blame a teardown fault on the tab that owned the
+			 * DOM, never the freshly-revealed one. */
+			worker_tab = B->drop_dom_tab;
 			html_page_teardown();
 		}
 		if (B->recascade) {                  /* window resized: re-run the cascade  */
@@ -500,10 +666,42 @@ static void worker_fn(void)
 		if (B->req_pending) {
 			B->req_pending = 0;
 			B->abort_load = 0;            /* a fresh navigation clears any pending Stop */
+			tabs[worker_tab].crashed = 0; /* reloading/navigating clears the crash page */
 			B->loading = 1; B->seq++;
 			do_fetch();
-			B->loading = 0; B->abort_load = 0;
-			B->events_live = js_has_listeners() || html_has_controls();
+			/* An HTML page's scripts run on the NEXT pass (html_run_page_scripts),
+			 * once this laid-out page has been published + painted. Keep `loading`
+			 * set until then so load_quiesce still waits out the whole load. */
+			if (!B->scripts_pending) {
+				B->loading = 0; B->abort_load = 0;
+				B->events_live = js_has_listeners() || html_has_controls();
+			}
+			B->seq++;
+		} else if (B->scripts_pending) {
+			/* Deferred <script> pass. The page painted on the previous pass with all
+			 * its assets (HTML, CSS, fonts, inline images, favicon) already fetched,
+			 * so the load is COMPLETE now — clearing `loading` finalizes it on the
+			 * main thread (title, URL, history, spinner off). The scripts then run in
+			 * the background with `loading` already cleared; `in_scripts` keeps
+			 * load_quiesce waiting so a tab switch can't swap the page mid-script.
+			 * A fresh navigation or Stop (abort_load) requested meanwhile skips them. */
+			B->scripts_pending = 0;
+			if (!B->abort_load) {
+				B->in_scripts = 1;                /* worker busy: load_quiesce must wait */
+				B->loading = 0; B->abort_load = 0;
+				B->seq++;                         /* main thread finalizes the load now */
+				unsigned mseq = dom_mutation_seq;
+				html_run_page_scripts();
+				if (dom_mutation_seq != mseq) {   /* a script mutated the DOM */
+					html_relayout();
+					if (B->pg->n_imgs > 0) fetch_inline_images(B->pg->cur_url);
+				}
+				cache_flush();                    /* persist anything the scripts cached */
+				B->events_live = js_has_listeners() || html_has_controls();
+				B->in_scripts = 0;
+			} else {
+				B->loading = 0;                   /* aborted: just release load_quiesce */
+			}
 			B->seq++;
 		} else if (B->evt_pending) {
 			worker_dispatch_event();
@@ -517,7 +715,7 @@ static void worker_fn(void)
 			unsigned mseq = dom_mutation_seq;
 			/* media_pump fires HTMLMediaElement events (play/timeupdate/ended/...)
 			 * from the worker, the only thread allowed to touch the JS engine. */
-			if (js_timers_pump() + js_websockets_pump() + media_pump()) {
+			if (js_timers_pump() + js_websockets_pump() + js_notifications_pump() + media_pump() + js_cast_pump() + js_idb_pump()) {
 				if (dom_mutation_seq != mseq) {
 					html_relayout();
 					if (B->pg->n_imgs > 0) fetch_inline_images(B->pg->cur_url);
@@ -525,6 +723,15 @@ static void worker_fn(void)
 				B->seq++;
 			}
 		}
+		/* Drive CSS animations/transitions: while any @keyframes animation or
+		 * transition is mid-flight, re-flatten the live DOM so anim_apply() samples
+		 * the next frame. The loop's msleep(30) below paces this to ~30fps; when
+		 * nothing is animating anim_active() is false and no work is done. */
+		if (!B->loading && anim_active()) {
+			html_relayout();
+			B->seq++;
+		}
+
 		/* Load any <iframe> documents the last layout discovered: fetch each,
 		 * check it against X-Frame-Options / CSP frame-ancestors, then re-flatten
 		 * so the allowed ones render in place of their placeholders. A frame's own
@@ -552,6 +759,7 @@ static void worker_fn(void)
 			blk_unlock();
 			B->seq++;
 		}
+		bookmarks_flush();          /* persist a changed bookmarks tree (deferred) */
 		msleep(30);
 	}
 }
@@ -1285,6 +1493,194 @@ static void flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
 	add_n_blanks(band_h, cont->t0, content_x, content_w);
 }
 
+/* --- grid (display:grid) ------------------------------------------------------ *
+ * Like flex-row, a grid needs items placed at arbitrary columns within a band the
+ * row-quantised line table can't express, so it reuses the same band overlay: the
+ * container reserves a blank band (keeping scroll/height row-indexed) and each
+ * cell's wrapped text is stashed in the overlay at the cell's column x, drawn over
+ * the band. Column tracks are sized (px / % / fr / auto→max-content) within the
+ * content box; items auto-flow row-by-row honouring grid-column/row spans; each
+ * grid row's height is its tallest cell (row-quantised). Item box geometry is set
+ * so paint_boxes draws each cell's background/border. Cells stretch to fill their
+ * track span by default (align-items/justify-items:stretch). Limits: dense packing
+ * of row-spanning items isn't tracked (a cell a rowspan reserves may be reused by
+ * the next row); a cell's inline text is its own glyph slice — nested block boxes
+ * inside a cell don't get their own side-by-side geometry (same limit as flex). */
+#define GRID_MAX_ITEMS 128
+#define GRID_MAX_ROWS  64
+
+static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
+{
+	struct lbox *cont = &bx[idx];
+	int ncols = cont->n_cols > 0 ? cont->n_cols : 1;
+	if (ncols > CSS_GRID_MAX) ncols = CSS_GRID_MAX;
+
+	int items[GRID_MAX_ITEMS], nit = 0;
+	for (int j = idx + 1; j < cont->end && nit < GRID_MAX_ITEMS; ) {
+		if (bx[j].parent == idx) { items[nit++] = j; j = bx[j].end; }
+		else j++;
+	}
+	if (nit == 0) return;
+
+	int gcol = cont->gap_col > 0 ? cont->gap_col : 0;
+	int grow_gap = cont->gap_row > 0 ? cont->gap_row : 0;
+
+	/* --- auto-placement: assign each item a (col,row) + span (grid-auto-flow:row).
+	 * A span wider than the remaining columns wraps to the next row. Row spans are
+	 * honoured for height/geometry but not tracked as occupied cells (v1 limit). */
+	int it_col[GRID_MAX_ITEMS], it_row[GRID_MAX_ITEMS], it_cs[GRID_MAX_ITEMS], it_rs[GRID_MAX_ITEMS];
+	int cur_c = 0, cur_r = 0, nrows = 0;
+	for (int k = 0; k < nit; k++) {
+		struct lbox *it = &bx[items[k]];
+		int cs = it->col_span > 0 ? it->col_span : 1; if (cs > ncols) cs = ncols;
+		int rs = it->row_span > 0 ? it->row_span : 1;
+		if (cur_c + cs > ncols) { cur_c = 0; cur_r++; }
+		it_col[k] = cur_c; it_row[k] = cur_r; it_cs[k] = cs; it_rs[k] = rs;
+		if (cur_r + rs > nrows) nrows = cur_r + rs;
+		cur_c += cs;
+		if (cur_c >= ncols) { cur_c = 0; cur_r++; }
+	}
+	if (nrows < 1) nrows = 1;
+	if (nrows > GRID_MAX_ROWS) nrows = GRID_MAX_ROWS;
+
+	/* --- column track sizing: resolve fixed (px/%) tracks and auto tracks
+	 * (max-content of their single-column items), then share the leftover across
+	 * fr tracks (or grow auto tracks if there are none), and scale down on overflow. */
+	int colw[CSS_GRID_MAX], is_fr[CSS_GRID_MAX], fr_w[CSS_GRID_MAX], is_auto[CSS_GRID_MAX];
+	int total_gap = gcol * (ncols - 1);
+	int avail = content_w - total_gap; if (avail < ncols) avail = ncols;
+	long fr_sum = 0, fixed = 0; int auto_cnt = 0;
+	for (int c = 0; c < ncols; c++) {
+		struct css_track t = cont->n_cols > 0 ? cont->cols_t[c] : (struct css_track){ CSS_TRK_FR, 1 };
+		is_fr[c] = is_auto[c] = 0; fr_w[c] = 0; colw[c] = 0;
+		if (t.kind == CSS_TRK_PX)       { colw[c] = t.v > 0 ? t.v : 0; fixed += colw[c]; }
+		else if (t.kind == CSS_TRK_PCT) { colw[c] = (int)((long)content_w * t.v / 100); if (colw[c] < 0) colw[c] = 0; fixed += colw[c]; }
+		else if (t.kind == CSS_TRK_FR)  { is_fr[c] = 1; fr_w[c] = t.v > 0 ? t.v : 1; fr_sum += fr_w[c]; }
+		else                            { is_auto[c] = 1; auto_cnt++; }
+	}
+	for (int c = 0; c < ncols; c++) {
+		if (!is_auto[c]) continue;
+		int best = 0;
+		for (int k = 0; k < nit; k++) {
+			if (it_cs[k] != 1 || it_col[k] != c) continue;
+			struct lbox *it = &bx[items[k]];
+			int frame = it->border.l + it->border.r + it->padding.l + it->padding.r;
+			int mc = slice_maxcontent(it->t0, it->t1) + frame;
+			if (mc > best) best = mc;
+		}
+		colw[c] = best; fixed += best;
+	}
+	long leftover = avail - fixed; if (leftover < 0) leftover = 0;
+	if (fr_sum > 0) {
+		for (int c = 0; c < ncols; c++) if (is_fr[c]) colw[c] = (int)(leftover * fr_w[c] / fr_sum);
+	} else if (leftover > 0 && auto_cnt > 0) {
+		int add = (int)(leftover / auto_cnt);
+		for (int c = 0; c < ncols; c++) if (is_auto[c]) colw[c] += add;
+	}
+	long tot = 0;
+	for (int c = 0; c < ncols; c++) { if (colw[c] < 0) colw[c] = 0; tot += colw[c]; }
+	if (tot > avail && tot > 0)
+		for (int c = 0; c < ncols; c++) colw[c] = (int)((long)colw[c] * avail / tot);
+	for (int c = 0; c < ncols; c++) if (colw[c] < 1) colw[c] = 1;
+
+	int track_x[CSS_GRID_MAX + 1];
+	track_x[0] = content_x;
+	for (int c = 0; c < ncols; c++) track_x[c + 1] = track_x[c] + colw[c] + gcol;
+
+	/* --- flow each item into the overlay (top of band for now), measuring its
+	 * content rows, its column x and its border-box main width. */
+	int band_top = B->nlines;
+	int band_top_y = doc_px();
+	int rows_of[GRID_MAX_ITEMS], ov_start[GRID_MAX_ITEMS], toppad[GRID_MAX_ITEMS];
+	int it_x[GRID_MAX_ITEMS], it_w[GRID_MAX_ITEMS];
+	for (int k = 0; k < nit; k++) {
+		struct lbox *it = &bx[items[k]];
+		int cs = it_cs[k];
+		int iw = 0;
+		for (int c = it_col[k]; c < it_col[k] + cs && c < ncols; c++) iw += colw[c];
+		iw += gcol * (cs - 1);
+		it_x[k] = track_x[it_col[k]]; it_w[k] = iw;
+		int fl = it->border.l + it->padding.l, fr = it->border.r + it->padding.r;
+		int cw = iw - fl - fr; if (cw < 4) cw = 4;
+		ov_start[k] = B->n_fslices;
+		g_ov_active = 1; g_ov_base = band_top; g_ov_n = 0;
+		flow_slice(it->t0, it->t1, it_x[k] + fl, cw);
+		g_ov_active = 0;
+		int vframe = it->border.t + it->border.b + it->padding.t + it->padding.b;
+		int content_px = g_ov_n * LINE_H;
+		int minch = box_min_content_h(it, vframe);
+		if (minch > content_px) content_px = minch;
+		int orows = rows_for(content_px + vframe); if (orows < 1) orows = 1;
+		rows_of[k] = orows;
+		toppad[k] = rows_for(it->border.t + it->padding.t);
+	}
+
+	/* --- row-track heights (rows): a px grid-template-rows entry is a floor; a
+	 * single-row item raises its row; a row-spanning item extends its last row. */
+	int rowh[GRID_MAX_ROWS];
+	for (int r = 0; r < nrows; r++) {
+		rowh[r] = 0;
+		if (cont->n_rows > 0 && r < cont->n_rows && cont->rows_t[r].kind == CSS_TRK_PX) {
+			int rr = rows_for(cont->rows_t[r].v);
+			if (rr > rowh[r]) rowh[r] = rr;
+		}
+	}
+	for (int k = 0; k < nit; k++)
+		if (it_rs[k] == 1 && it_row[k] < nrows && rows_of[k] > rowh[it_row[k]])
+			rowh[it_row[k]] = rows_of[k];
+	for (int r = 0; r < nrows; r++) if (rowh[r] < 1) rowh[r] = 1;
+
+	int gap_rows = rows_for(grow_gap);
+	int row_off[GRID_MAX_ROWS + 1];
+	row_off[0] = 0;
+	for (int r = 0; r < nrows; r++) row_off[r + 1] = row_off[r] + rowh[r] + (r + 1 < nrows ? gap_rows : 0);
+	for (int k = 0; k < nit; k++) {          /* extend last spanned row for tall row-span items */
+		if (it_rs[k] <= 1) continue;
+		int r0 = it_row[k], r1 = r0 + it_rs[k]; if (r1 > nrows) r1 = nrows;
+		int have = row_off[r1] - row_off[r0] - (r1 < nrows ? gap_rows : 0);
+		if (rows_of[k] > have && r1 - 1 >= 0 && r1 - 1 < nrows) {
+			rowh[r1 - 1] += rows_of[k] - have;
+			for (int r = r1 - 1; r < nrows; r++) row_off[r + 1] = row_off[r] + rowh[r] + (r + 1 < nrows ? gap_rows : 0);
+		}
+	}
+	int band_h = row_off[nrows];
+	int cvframe = cont->border.t + cont->border.b + cont->padding.t + cont->padding.b;
+	int cminch = box_min_content_h(cont, cvframe);
+	if (cminch > 0 && rows_for(cminch) > band_h) band_h = rows_for(cminch);
+	if (band_h < 1) band_h = 1;
+
+	/* --- place: shift each cell's overlay text to its row (align-items on the block
+	 * axis) + top padding, and record geometry so paint_boxes draws its bg/border. */
+	signed char ai = cont->align_items < 0 ? CSS_ALIGN_STRETCH : cont->align_items;
+	for (int k = 0; k < nit; k++) {
+		struct lbox *it = &bx[items[k]];
+		int r0 = it_row[k], r1 = r0 + it_rs[k]; if (r1 > nrows) r1 = nrows;
+		int cell_rows = row_off[r1] - row_off[r0] - (r1 < nrows ? gap_rows : 0);
+		if (cell_rows < 1) cell_rows = 1;
+		int h_rows = (ai == CSS_ALIGN_STRETCH) ? cell_rows : rows_of[k];
+		if (h_rows > cell_rows) h_rows = cell_rows;
+		int off_rows = 0;
+		if (ai == CSS_ALIGN_CENTER)   off_rows = (cell_rows - h_rows) / 2;
+		else if (ai == CSS_ALIGN_END) off_rows = cell_rows - h_rows;
+		int base_row = row_off[r0] + off_rows;
+		int shift = base_row + toppad[k];
+		if (shift) {
+			int end = (k + 1 < nit) ? ov_start[k + 1] : B->n_fslices;
+			for (int s = ov_start[k]; s < end; s++) B->fslices[s].row += shift;
+		}
+		int fl = it->border.l + it->padding.l, fr = it->border.r + it->padding.r;
+		int ft = it->border.t + it->padding.t;
+		int vframe = ft + it->border.b + it->padding.b;
+		it->x  = it_x[k];   it->w  = it_w[k];
+		it->y  = band_top_y + base_row * LINE_H;
+		it->h  = h_rows * LINE_H;
+		it->cx = it_x[k] + fl; it->cw = it_w[k] - fl - fr; if (it->cw < 4) it->cw = 4;
+		it->cy = it->y + ft;   it->ch = it->h - vframe; if (it->ch < 0) it->ch = 0;
+	}
+
+	add_n_blanks(band_h, cont->t0, content_x, content_w);
+}
+
 /* Lay out one box: blank rows for top margin/border/padding, then its own inline
  * text interleaved with child boxes (each recursively laid out), then bottom
  * spacing. Geometry is stored in document px; vertical position is the row cursor
@@ -1335,7 +1731,10 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
 
 	b->x = box_x; b->w = box_w; b->cx = content_x; b->cw = content_w;
 
-	if (b->kind == LB_FLEX && b->flex_dir == 0) {
+	if (b->kind == LB_GRID) {
+		/* grid: children placed into a 2-D track band via the overlay. */
+		flow_grid(bx, idx, content_x, content_w);
+	} else if (b->kind == LB_FLEX && b->flex_dir == 0) {
 		/* row flex: children laid side by side via the band overlay (column flex
 		 * keeps the block-stacking path below — vertical stacking is already right). */
 		flow_flex_row(bx, idx, content_x, content_w);
@@ -1410,6 +1809,7 @@ static void rewrap(int paw)
 	else                       flow_slice(0, B->pg->text_len, 4, paw);  /* flat flow  */
 	B->layout_dirty = 0;
 	B->wrap_cols = paw;
+	B->layout_seq++;                 /* geometry changed: devtools box model + highlight */
 	int max = scroll_max();
 	if (B->pg->scroll > max) B->pg->scroll = max;
 	if (B->pg->scroll < 0) B->pg->scroll = 0;
@@ -1466,10 +1866,30 @@ static int img_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 	return 0;
 }
 
-/* Decode B->pg->raw as a PNG into the content pane (px,py,pw,ph), fit-to-pane with
- * aspect preserved. Re-decoded each repaint — cheap enough, and keeps no whole
- * decoded image in RAM. */
-static void draw_image(int px, int py, int pw, int ph, unsigned bg)
+/* Row-copy sink: write each decoded PNG scanline into a full RGBA buffer. Shared
+ * by the inline-image cache (imgc_get) and the full-page image cache below. */
+struct imgc_fill { unsigned char *buf; unsigned iw, ih; };
+static int imgc_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
+{
+	struct imgc_fill *d = c;
+	if (y < d->ih) { unsigned n = (w < d->iw ? w : d->iw) * 4; memcpy(d->buf + (unsigned long)y * d->iw * 4, rgba, n); }
+	return 0;
+}
+
+/* Decoded full-page image cache (MODE_IMAGE): the image page would otherwise
+ * re-inflate the whole PNG on every repaint (hover, resize, scrollbar). Decode
+ * once into RGBA, keyed by the page + its raw buffer, then scale-blit thereafter.
+ * Images past DIMG_MAX_PX aren't held — they stream each frame. Cleared on a page
+ * change (imgc_clear) or when the raw buffer changes. Main-thread-only. */
+#define DIMG_MAX_PX (16u * 1024 * 1024)
+static struct {
+	struct page *pg; const char *src; int src_len;
+	unsigned iw, ih; unsigned char *rgba;
+} g_dimg;
+
+/* Streaming decode straight to the pane (no held copy): the cache's fallback for
+ * an image too large to buffer, and the unreadable-image error path. */
+static void draw_image_stream(int px, int py, int pw, int ph)
 {
 	struct rawrd r = { 0 };
 	unsigned iw = 0, ih = 0;
@@ -1495,6 +1915,55 @@ static void draw_image(int px, int py, int pw, int ph, unsigned bg)
 
 	struct rawrd r2 = { 0 };
 	upng_decode(rawrd_get, &r2, img_row, &v, 0, 0);
+}
+
+/* Draw B->pg->raw as a PNG into the content pane (px,py,pw,ph), fit-to-pane with
+ * aspect preserved. Decoded once into g_dimg and scale-blitted on later repaints;
+ * only a new page / raw buffer forces a re-decode. */
+static void draw_image(int px, int py, int pw, int ph, unsigned bg)
+{
+	(void)bg;
+	if (g_dimg.pg != B->pg || g_dimg.src != B->pg->raw || g_dimg.src_len != B->pg->raw_len) {
+		free(g_dimg.rgba); g_dimg.rgba = 0; g_dimg.iw = g_dimg.ih = 0;
+		g_dimg.pg = B->pg; g_dimg.src = B->pg->raw; g_dimg.src_len = B->pg->raw_len;
+		struct rawrd r = { 0 };
+		unsigned iw = 0, ih = 0;
+		if (upng_dimensions(rawrd_get, &r, &iw, &ih) == 0 && iw && ih &&
+		    (unsigned long)iw * ih <= DIMG_MAX_PX) {
+			unsigned char *buf = malloc((unsigned long)iw * ih * 4);
+			if (buf) {
+				memset(buf, 0, (unsigned long)iw * ih * 4);
+				struct rawrd r2 = { 0 };
+				struct imgc_fill f = { buf, iw, ih };
+				if (upng_decode(rawrd_get, &r2, imgc_row, &f, 0, 0) == 0) {
+					g_dimg.rgba = buf; g_dimg.iw = iw; g_dimg.ih = ih;
+				} else free(buf);
+			}
+		}
+	}
+	if (!g_dimg.rgba) { draw_image_stream(px, py, pw, ph); return; }   /* too big / unreadable */
+
+	unsigned iw = g_dimg.iw, ih = g_dimg.ih, dw, dh;
+	if (iw <= (unsigned)pw && ih <= (unsigned)ph) {
+		dw = iw; dh = ih;                              /* fits: show 1:1     */
+	} else if ((unsigned long)iw * ph > (unsigned long)ih * pw) {
+		dw = pw; dh = ih * pw / iw;                    /* width-bound        */
+	} else {
+		dh = ph; dw = iw * ph / ih;                    /* height-bound       */
+	}
+	if (!dw) dw = 1;
+	if (!dh) dh = 1;
+	unsigned ox = ((unsigned)pw - dw) / 2, oy = ((unsigned)ph - dh) / 2;
+	unsigned *fb = surface();
+	for (unsigned ry = 0; ry < dh; ry++) {
+		unsigned sy = ry * ih / dh;
+		const unsigned char *srow = g_dimg.rgba + (unsigned long)sy * iw * 4;
+		unsigned *drow = fb + (unsigned long)(py + oy + ry) * BW + px + ox;
+		for (unsigned x = 0; x < dw; x++) {
+			const unsigned char *p = srow + (unsigned long)(x * iw / dw) * 4;
+			drow[x] = blend_px(p, drow[x]);
+		}
+	}
 }
 
 /* ------------------------------------------------------- inline page images */
@@ -1547,14 +2016,8 @@ static struct page    *g_imgc_pg;
 static void imgc_clear(void)
 {
 	for (int i = 0; i < IMGC_N; i++) { free(g_imgc[i].rgba); g_imgc[i].rgba = 0; g_imgc[i].uid = 0; }
-}
-
-struct imgc_fill { unsigned char *buf; unsigned iw, ih; };
-static int imgc_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
-{
-	struct imgc_fill *d = c;
-	if (y < d->ih) { unsigned n = (w < d->iw ? w : d->iw) * 4; memcpy(d->buf + (unsigned long)y * d->iw * 4, rgba, n); }
-	return 0;
+	free(g_dimg.rgba); g_dimg.rgba = 0;
+	g_dimg.pg = 0; g_dimg.src = 0; g_dimg.src_len = 0; g_dimg.iw = g_dimg.ih = 0;
 }
 
 /* Full decoded RGBA for inline PNG `im` (decoding + caching on first use), or NULL
@@ -1689,6 +2152,7 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
 		body_draw(x, y, run, fg, ct, cb, rpx, base, ital);
 		if (a & ST_BOLD) body_draw(x + 1, y, run, fg, ct, cb, rpx, base, ital);
 		if (a & ST_UNDER) gfx_fill_rect(x, y + base + 1, rw, 1, fg);
+		if (a & ST_STRIKE) gfx_fill_rect(x, y + base - rpx / 3, rw, 1, fg);
 		x += rw;
 	}
 	return x0;
@@ -1716,20 +2180,23 @@ static void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
 	}
 }
 
-/* Address-bar row layout: two nav buttons (Back, Forward) at the left, then the
- * URL text field filling the rest. One source of truth for both render() and the
- * click handler, so the drawn rects and hit rects never drift. */
+/* Address-bar row layout: three nav buttons (Back, Forward, Reload) at the left,
+ * the URL text field filling the middle, and the bookmark (star) button pinned to
+ * the right. One source of truth for render() and the click handler, so the drawn
+ * rects and hit rects never drift. */
 struct rect { int x, y, w, h; };
 #define NAV_BTN_W 28
 
-static void addr_layout(struct rect *back, struct rect *fwd, struct rect *rel, struct rect *tf)
+static void addr_layout(struct rect *back, struct rect *fwd, struct rect *rel,
+                        struct rect *tf, struct rect *star)
 {
 	int y0 = MENU_H + TAB_H;
 	back->x = 4;                       back->y = y0 + 3; back->w = NAV_BTN_W; back->h = ADDR_H - 6;
 	fwd->x  = back->x + NAV_BTN_W + 2;  fwd->y = back->y; fwd->w  = NAV_BTN_W; fwd->h  = back->h;
 	rel->x  = fwd->x + NAV_BTN_W + 2;   rel->y = back->y; rel->w  = NAV_BTN_W; rel->h  = back->h;
+	star->x = BW - NAV_BTN_W - 4;      star->y = back->y; star->w = NAV_BTN_W; star->h = back->h;
 	int tx  = rel->x + NAV_BTN_W + 6;
-	tf->x = tx; tf->y = y0 + 4; tf->w = BW - tx - 6; tf->h = ADDR_H - 8;
+	tf->x = tx; tf->y = y0 + 4; tf->w = star->x - tx - 6; tf->h = ADDR_H - 8;
 	if (tf->w < 32) tf->w = 32;       /* keep the field usable on a narrow window */
 }
 
@@ -1776,6 +2243,111 @@ static void reload_btn_draw(const struct rect *r)
 	button_draw(r->x, r->y, r->w, r->h, "", BTN_NORMAL);
 	if (is_loading()) icon_stop(x0, y0, d, 0xe06a5a);
 	else              icon_reload(x0, y0, d, 0xe6ebf2);
+}
+
+/* A bookmark-ribbon glyph in a d×d box at (x0,y0): a flag with a V-notch tail,
+ * either solid-filled (the page is bookmarked) or a hollow outline (it isn't).
+ * Hand-rasterized like the reload/stop icons rather than relying on a font glyph. */
+static void icon_bookmark(int x0, int y0, int d, unsigned col, int filled)
+{
+	int half = d / 2, notch = d / 3;
+	for (int y = 0; y < d; y++)
+		for (int x = 0; x < d; x++) {
+			int ax = x - half; if (ax < 0) ax = -ax;
+			int bottom = (d - 1) - notch + (half ? notch * ax / half : 0);
+			if (y > bottom) continue;                     /* below the ribbon / in the tail cut */
+			int edge = (x == 0 || x == d - 1 || y == 0 || y == bottom);
+			if (filled || edge) gfx_pixel(x0 + x, y0 + y, col);
+		}
+}
+
+/* Draw the bookmark (star) button: a solid gold ribbon when the current page is
+ * bookmarked, a hollow grey one otherwise. The button dims on a blank tab (no URL
+ * to bookmark), matching the Bookmarks menu's disabled toggle. */
+static void star_btn_draw(const struct rect *r)
+{
+	int has_url = B->pg->cur_url[0] != '\0';
+	int marked  = has_url && bookmark_find(B->pg->cur_url) != 0;
+	int d = 13, x0 = r->x + (r->w - d) / 2, y0 = r->y + (r->h - d) / 2;
+	button_draw(r->x, r->y, r->w, r->h, "", has_url ? BTN_NORMAL : BTN_DISABLED);
+	if (marked) icon_bookmark(x0, y0, d, 0xf2c14e, 1);   /* filled gold  */
+	else        icon_bookmark(x0, y0, d, 0x9098a0, 0);   /* hollow grey  */
+}
+
+/* A display title for the current page: its <title>, else the host, else the URL. */
+static void current_page_title(char *out, int cap)
+{
+	if (B->pg->doc_title[0]) { strlcpy(out, B->pg->doc_title, cap); return; }
+	struct purl u;
+	if (B->pg->cur_url[0] && parse_url(B->pg->cur_url, &u)) strlcpy(out, u.host, cap);
+	else strlcpy(out, B->pg->cur_url[0] ? B->pg->cur_url : "Untitled", cap);
+}
+
+/* --- bookmarks panel state -------------------------------------------------- *
+ * The favicon/folder tree is shown in a left-side panel drawn over the content
+ * pane (bookmarks_panel_render below). These track its open state, scroll, the
+ * selected node (highlight + the target folder for new bookmarks/folders), and an
+ * inline text field used to name a new folder. */
+#define BM_PANEL_W 250
+#define BM_ROW_H   20
+static int             bm_panel_open;
+static int             bm_panel_scroll;              /* first visible row index */
+static struct bm_node *bm_selected;                  /* highlighted node, or NULL */
+static struct textfield bm_name_tf;                  /* inline new-folder name entry */
+static char            bm_name_buf[64];
+static int             bm_naming;                     /* 1 = the name field is active */
+static struct bm_node *bm_name_parent;               /* folder the new folder joins */
+
+/* The folder new bookmarks/folders should join: the selected folder when the panel
+ * is open and a folder is picked, else the root. */
+static struct bm_node *bm_target_folder(void)
+{
+	if (bm_panel_open && bm_selected && bm_selected->is_folder) return bm_selected;
+	return bookmarks_root();
+}
+
+/* Add or remove the current page's bookmark (the star button and the Bookmarks
+ * menu's item 0 both call this). No-op on a blank tab. A new bookmark captures the
+ * page's favicon and joins the target folder. */
+static void toggle_current_bookmark(void)
+{
+	const char *url = B->pg->cur_url;
+	if (!url[0]) return;
+	if (bookmark_find(url)) {
+		bookmark_remove(url);
+	} else {
+		char title[128];
+		current_page_title(title, sizeof title);
+		bookmark_add(bm_target_folder(), url, title,
+		             B->pg->favicon_ok ? B->pg->favicon : 0);
+	}
+	B->seq++;                        /* repaint: the star + panel reflect the change */
+}
+
+/* Start naming a new folder inside `parent` (root if NULL): open the panel, focus
+ * an empty inline text field. Enter creates it (handle_key), Esc cancels. */
+static void begin_new_folder(struct bm_node *parent)
+{
+	bm_panel_open = 1;
+	bm_name_parent = parent ? parent : bookmarks_root();
+	bm_naming = 1;
+	textfield_set(&bm_name_tf, "");
+	B->seq++;
+}
+
+/* Refresh the Bookmarks bar menu's dynamic labels + item-0 state. Runs on the main
+ * thread right before the menu is drawn or clicked. */
+static void bookmarks_menu_sync(void)
+{
+	int marked = B->pg->cur_url[0] && bookmark_find(B->pg->cur_url) != 0;
+	strlcpy(bm_toggle_label, marked ? "Remove Bookmark" : "Add Bookmark", sizeof bm_toggle_label);
+	strlcpy(bm_show_label, bm_panel_open ? "Hide Bookmarks" : "Show Bookmarks", sizeof bm_show_label);
+	bm_items[0] = bm_toggle_label;
+	bm_items[1] = bm_show_label;
+	bm_items[2] = "New Folder";
+	bm_flags[0] = B->pg->cur_url[0] ? 0 : MENU_DISABLED;
+	bm_flags[1] = 0;
+	bm_flags[2] = 0;
 }
 
 /* The absolute URL of the link currently under the cursor, shown in a status box
@@ -2157,7 +2729,23 @@ static void paint_boxes(int py, int pw, int phh)
 			int z = bx[i].z_index;
 			int ez = (z == CSS_Z_AUTO) ? 0 : z;
 			int g = ez < 0 ? 0 : (ez == 0 ? 1 : 2);
-			if (g == band) paint_one_box(&bx[i], py, pw, phh, top_doc);
+			if (g != band) continue;
+			/* Cheap vertical cull before the per-box geometry work: skip a box
+			 * whose extent doesn't reach the visible band [top_doc, top_doc+phh).
+			 * A shadow/outline spills past the border box, so widen the test by
+			 * that much to keep an off-screen box's spill correct. */
+			struct lbox *b = &bx[i];
+			int top = b->y, bot = b->y + b->h;
+			if (b->outline_w > 0) { top -= b->outline_w; bot += b->outline_w; }
+			if (b->sh_color != BG_NONE) {
+				int bl = b->sh_blur < 0 ? 0 : b->sh_blur;
+				int ext = b->sh_spread + bl;
+				int st = b->y + b->sh_dy - ext, sb = b->y + b->h + b->sh_dy + ext;
+				if (st < top) top = st;
+				if (sb > bot) bot = sb;
+			}
+			if (bot <= top_doc || top >= top_doc + phh) continue;
+			paint_one_box(b, py, pw, phh, top_doc);
 		}
 }
 
@@ -2188,6 +2776,178 @@ static void draw_dt_highlight(int x, int y, int w, int h,
 	}
 }
 
+/* Human-readable cause for the "tab crashed" page, from the fault signal. */
+static const char *crash_reason(int sig)
+{
+	switch (sig) {
+	case SIGSEGV:
+	case SIGBUS:  return "It ran out of memory or accessed invalid memory.";
+	case SIGILL:  return "It executed an illegal instruction.";
+	case SIGFPE:  return "It hit an arithmetic error.";
+	case SIGABRT: return "It aborted unexpectedly.";
+	default:      return "Something went wrong while displaying this page.";
+	}
+}
+
+/* Reload button on the crash page, remembered so handle_click can hit-test it. */
+static struct rect crash_reload_rect;
+
+/* Draw the "Aw, snap"-style crashed-tab page over the content pane (py..py+phh),
+ * replacing the dead page. Centred: a sad face, a heading, the cause, and a Reload
+ * button. Its rect is stashed in crash_reload_rect for the click handler. */
+static void draw_crash_page(int py, int pw, int phh)
+{
+	gfx_fill_rect(0, py, pw, phh, 0xf2f3f5);      /* neutral canvas, not the dead page's */
+
+	const char *reason = crash_reason(tabs[active_tab].crash_sig);
+	const char *head = "This tab has crashed";
+	int cx = pw / 2;
+	int cy = py + phh / 2;
+
+	int face_px = 64;
+	int fw = gfx_ui_width_px(":(", face_px);
+	gfx_ui_text_px(cx - fw / 2, cy - 96, ":(", 0xb0b6be, face_px);
+
+	int hw = gfx_ui_width(head);
+	gfx_ui_text(cx - hw / 2, cy - 12, head, 0x303840);
+
+	int rw = gfx_ui_width(reason);
+	gfx_ui_text(cx - rw / 2, cy + 12, reason, 0x707880);
+
+	int bw = 96, bh = 30;
+	crash_reload_rect.x = cx - bw / 2;
+	crash_reload_rect.y = cy + 44;
+	crash_reload_rect.w = bw;
+	crash_reload_rect.h = bh;
+	button_draw(crash_reload_rect.x, crash_reload_rect.y, bw, bh, "Reload", BTN_NORMAL);
+}
+
+/* --- bookmarks panel: a left-side tree of folders + favicon bookmarks --------
+ * Drawn over the content pane when open (below the address bar), so it never
+ * reflows the page. Folders expand/collapse; a bookmark shows its 16x16 favicon
+ * and navigates on click. New folders (with an inline typed name), the selected-
+ * node highlight, delete, and wheel scroll are handled here + in the click/key
+ * paths. */
+
+/* Panel geometry: the panel rect, the two header buttons, the inline name field,
+ * and the y where the tree rows begin. One source of truth for render + click. */
+static void bm_layout(struct rect *nf, struct rect *del, struct rect *name,
+                      struct rect *panel, int *list_y)
+{
+	int top = MENU_H + TAB_H + ADDR_H;
+	panel->x = 0; panel->y = top; panel->w = BM_PANEL_W;
+	panel->h = BH - top; if (panel->h < 0) panel->h = 0;
+	int by = top + 24;                                   /* below the header title */
+	nf->x = 6;   nf->y = by; nf->w = 96; nf->h = 20;
+	del->x = 108; del->y = by; del->w = 60; del->h = 20;
+	int ny = by + 26;
+	name->x = 6; name->y = ny; name->w = BM_PANEL_W - 12; name->h = 20;
+	*list_y = ny + (bm_naming ? 26 : 0);
+}
+
+/* Flatten the visible tree (a folder contributes its children only when expanded)
+ * into a row list shared by the renderer and hit-testing. */
+struct bm_row { struct bm_node *node; int depth; };
+static struct bm_row bm_rows[1024];
+static int bm_nrows;
+static void bm_flatten_into(struct bm_node *folder, int depth)
+{
+	for (struct bm_node *n = folder->child; n; n = n->next) {
+		if (bm_nrows < (int)(sizeof bm_rows / sizeof bm_rows[0]))
+			{ bm_rows[bm_nrows].node = n; bm_rows[bm_nrows].depth = depth; bm_nrows++; }
+		if (n->is_folder && n->expanded) bm_flatten_into(n, depth + 1);
+	}
+}
+static void bm_flatten(void) { bm_nrows = 0; bm_flatten_into(bookmarks_root(), 0); }
+
+/* A small disclosure triangle: right-pointing (collapsed) or down-pointing (open),
+ * centred on row-centre `cy`. */
+static void bm_tri(int x, int cy, int open, unsigned col)
+{
+	for (int i = 0; i <= 3; i++)
+		for (int j = -(3 - i); j <= (3 - i); j++)
+			gfx_pixel(open ? x + j : x + i - 1, open ? cy - 1 + i : cy + j, col);
+}
+
+/* A tiny folder glyph anchored at (x,y). */
+static void bm_folder_glyph(int x, int y, unsigned col)
+{
+	gfx_fill_rect(x, y + 1, 5, 2, col);       /* the tab  */
+	gfx_fill_rect(x, y + 3, 13, 9, col);      /* the body */
+}
+
+static void bookmarks_panel_render(void)
+{
+	struct rect nf, del, name, panel; int list_y;
+	bm_layout(&nf, &del, &name, &panel, &list_y);
+	int top = panel.y, bottom = panel.y + panel.h;
+
+	gfx_fill_rect(panel.x, panel.y, panel.w, panel.h, 0x1b2129);
+	gfx_fill_rect(0, top, BM_PANEL_W, 24, 0x232c38);            /* header */
+	gfx_ui_text(8, top + 3, "Bookmarks", 0xe8eaee);
+	button_draw(nf.x, nf.y, nf.w, nf.h, "New Folder", BTN_NORMAL);
+	button_draw(del.x, del.y, del.w, del.h, "Delete",
+	            bm_selected ? BTN_NORMAL : BTN_DISABLED);
+	if (bm_naming)
+		textfield_draw(&bm_name_tf, name.x, name.y, name.w, name.h, 1);
+
+	bm_flatten();
+	int cap = (bottom - list_y) / BM_ROW_H; if (cap < 0) cap = 0;
+	int maxscroll = bm_nrows - cap; if (maxscroll < 0) maxscroll = 0;
+	if (bm_panel_scroll > maxscroll) bm_panel_scroll = maxscroll;
+	if (bm_panel_scroll < 0) bm_panel_scroll = 0;
+
+	int y = list_y;
+	for (int i = bm_panel_scroll; i < bm_nrows && y + BM_ROW_H <= bottom; i++, y += BM_ROW_H) {
+		struct bm_node *n = bm_rows[i].node;
+		int rx = 6 + bm_rows[i].depth * 14;
+		if (n == bm_selected) gfx_fill_rect(0, y, BM_PANEL_W, BM_ROW_H, 0x2c4a6e);
+		char label[128];
+		int tx;
+		if (n->is_folder) {
+			bm_tri(rx + 2, y + BM_ROW_H / 2, n->expanded, 0xb8c0cc);
+			bm_folder_glyph(rx + 10, y + 3, 0xd9a441);
+			tx = rx + 28;
+		} else {
+			if (n->icon) gfx_blit_argb(rx + 10, y + 2, FAVICON_W, FAVICON_H, n->icon);
+			else { gfx_fill_rect(rx + 12, y + 4, 12, 12, 0x4a5568);   /* globe placeholder */
+			       gfx_rect(rx + 12, y + 4, 12, 12, 0x6b7688); }
+			tx = rx + 30;
+		}
+		fit_ui(label, sizeof label, n->title ? n->title : "", BM_PANEL_W - tx - 6);
+		gfx_ui_text(tx, y + 2, label, n->is_folder ? 0xe8eaee : 0xd2d7dd);
+	}
+	gfx_fill_rect(BM_PANEL_W - 1, top, 1, panel.h, 0x0f1319);   /* right border */
+}
+
+/* Route a click inside the bookmarks panel. Returns 1 if it was inside the panel
+ * (consumed), 0 to let it fall through to the page. */
+static int bm_panel_click(int mx, int my)
+{
+	struct rect nf, del, name, panel; int list_y;
+	bm_layout(&nf, &del, &name, &panel, &list_y);
+	if (mx < panel.x || mx >= panel.x + panel.w || my < panel.y || my >= panel.y + panel.h)
+		return 0;
+	if (bm_naming) return 1;                              /* naming: keys, not clicks */
+	if (button_hit(nf.x, nf.y, nf.w, nf.h, mx, my)) { begin_new_folder(bm_target_folder()); return 1; }
+	if (bm_selected && button_hit(del.x, del.y, del.w, del.h, mx, my)) {
+		bm_delete(bm_selected); bm_selected = 0; B->seq++; return 1;
+	}
+	if (my >= list_y) {
+		bm_flatten();
+		int idx = bm_panel_scroll + (my - list_y) / BM_ROW_H;
+		if (idx >= 0 && idx < bm_nrows) {
+			struct bm_node *n = bm_rows[idx].node;
+			int rx = 6 + bm_rows[idx].depth * 14;
+			if (n->is_folder && mx >= rx && mx < rx + 10) { folder_toggle(n); B->seq++; return 1; }
+			bm_selected = n;
+			if (!n->is_folder && n->url) navigate(n->url);
+			else B->seq++;
+		} else { bm_selected = 0; B->seq++; }
+	}
+	return 1;
+}
+
 static void render(void)
 {
 	unsigned bg = B->pg->page_bg;
@@ -2211,8 +2971,8 @@ static void render(void)
 	 * The buttons dim when their direction has no history (button_hit also refuses
 	 * a disabled button, so a click on a dim arrow does nothing). */
 	gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
-	struct rect rb, rf, rrl, rtf;
-	addr_layout(&rb, &rf, &rrl, &rtf);
+	struct rect rb, rf, rrl, rtf, rst;
+	addr_layout(&rb, &rf, &rrl, &rtf, &rst);
 	struct tab *at = &tabs[active_tab];
 	button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90",   /* ← */
 	            hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED);
@@ -2220,6 +2980,7 @@ static void render(void)
 	            hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED);
 	reload_btn_draw(&rrl);
 	textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
+	star_btn_draw(&rst);
 
 	/* content pane — shrinks to the left of the devtools dock when it is open */
 	int right = devtools_visible() ? devtools_left() : BW;
@@ -2227,7 +2988,10 @@ static void render(void)
 	int phh = BH - MENU_H - TAB_H - ADDR_H; if (phh < 0) phh = 0;
 	gfx_fill_rect(0, py, pw, phh, bg);
 
-	if (B->pg->mode == MODE_IMAGE) {
+	if (tabs[active_tab].crashed) {
+		draw_crash_page(py, pw, phh);
+		scrollbar_draw(pw, py, SCROLL_W, phh, 0, 0, 0);   /* inert scrollbar */
+	} else if (B->pg->mode == MODE_IMAGE) {
 		if (B->loading)
 			gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
 		else
@@ -2243,7 +3007,9 @@ static void render(void)
 		paint_boxes(py, pw, phh);                  /* block backgrounds behind the text */
 		if (B->loading && B->nlines == 0) {
 			gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
-		} else if (B->nlines == 0) {
+		} else if (B->nlines == 0 && !B->pg->cur_url[0]) {
+			/* No page loaded — a fresh tab: prompt for a URL. A page that
+			 * loaded but produced no lines just stays its blank canvas. */
 			gfx_ui_text(8, py + 8, "Type a URL above and press Enter.", 0x707880);
 			gfx_ui_text(8, py + 8 + UIFONT_H, "e.g. example.com  or  https://example.com",
 			            0x9098a0);
@@ -2324,11 +3090,15 @@ static void render(void)
 	 * content (drawn after the page, before the menu dropdowns). No-op when closed. */
 	devtools_render();
 
+	/* Bookmarks panel over the content pane (below the menu dropdowns). */
+	if (bm_panel_open) bookmarks_panel_render();
+
 	/* App menu bar over the top, then the dropdowns last so they overlay the page.
 	 * "Stop" is only meaningful while a fetch is in flight, so disable it when
 	 * idle — the widget dims it and ignores clicks/accelerators. */
 	page_flags[2] = is_loading() ? 0 : MENU_DISABLED;
 	edit_flags[0] = gfx_sel_has(&g_sel) ? 0 : MENU_DISABLED;   /* Copy: only with a selection */
+	bookmarks_menu_sync();
 	gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
 	menubar_draw(&menubar);
 
@@ -2353,8 +3123,8 @@ static int menu_any_open(void)
 static void render_addr(void)
 {
 	gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
-	struct rect rb, rf, rrl, rtf;
-	addr_layout(&rb, &rf, &rrl, &rtf);
+	struct rect rb, rf, rrl, rtf, rst;
+	addr_layout(&rb, &rf, &rrl, &rtf, &rst);
 	struct tab *at = &tabs[active_tab];
 	button_draw(rb.x, rb.y, rb.w, rb.h, "\xe2\x86\x90",
 	            hist_can_back(at) ? BTN_NORMAL : BTN_DISABLED);
@@ -2362,6 +3132,7 @@ static void render_addr(void)
 	            hist_can_fwd(at) ? BTN_NORMAL : BTN_DISABLED);
 	reload_btn_draw(&rrl);
 	textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
+	star_btn_draw(&rst);
 }
 
 /* --------------------------------------------------------------- input */
@@ -2392,6 +3163,7 @@ static void navigate(const char *url)
 	int i = 0;
 	for (; url[i] && i < URL_MAX - 1; i++) B->req_url[i] = url[i];
 	B->req_url[i] = '\0';
+	B->req_method[0] = '\0'; B->req_body_len = 0;   /* GET */
 	B->req_pending = 1; B->seq++;
 }
 
@@ -2401,6 +3173,7 @@ static void submit(void)
 	int i = 0;
 	for (; B->addr[i] && i < URL_MAX - 1; i++) B->req_url[i] = B->addr[i];
 	B->req_url[i] = '\0';
+	B->req_method[0] = '\0'; B->req_body_len = 0;   /* GET */
 	B->req_pending = 1; B->seq++;
 }
 
@@ -2461,15 +3234,15 @@ static void show_blank(void)
 static void tab_sync_active(void)
 {
 	struct tab *t = &tabs[active_tab];
-	copy_str(t->url, B->pg->cur_url, sizeof t->url);
+	strlcpy(t->url, B->pg->cur_url, sizeof t->url);
 	if (B->pg->doc_title[0]) {
-		copy_str(t->label, B->pg->doc_title, sizeof t->label);
+		strlcpy(t->label, B->pg->doc_title, sizeof t->label);
 	} else {
 		struct purl u;
 		if (B->pg->cur_url[0] && parse_url(B->pg->cur_url, &u))
-			copy_str(t->label, u.host, sizeof t->label);
+			strlcpy(t->label, u.host, sizeof t->label);
 		else
-			copy_str(t->label, "Untitled", sizeof t->label);
+			strlcpy(t->label, "Untitled", sizeof t->label);
 	}
 }
 
@@ -2488,7 +3261,9 @@ static void reveal_tab(int i)
 	textfield_set(&B->addr_tf, tabs[i].url[0] ? tabs[i].url : tabs[i].page.cur_url);
 	update_title(B->win_id);
 	B->seq++;
-	if (tabs[i].page.text_len == 0 && tabs[i].url[0]) navigate(tabs[i].url);
+	/* A crashed tab keeps its sad page (its empty text isn't "interrupted mid-load"),
+	 * so don't auto-refetch it — the user reloads it explicitly. */
+	if (!tabs[i].crashed && tabs[i].page.text_len == 0 && tabs[i].url[0]) navigate(tabs[i].url);
 }
 
 /* Make tab `i` the active one. Switching is a pointer swap: the page we leave
@@ -2498,15 +3273,18 @@ static void select_tab(int i)
 {
 	if (i < 0 || i >= n_tabs || i == active_tab) return;
 	load_quiesce();                          /* worker idle before we move B->pg     */
+	worker_park();                           /* ...and fenced out of the pump too    */
 	tab_leave(active_tab);
 	active_tab = i;
 	reveal_tab(i);
+	worker_unpark();
 }
 
 static void new_tab(void)
 {
 	if (n_tabs >= MAX_TABS) { B->seq++; return; }
 	load_quiesce();
+	worker_park();
 	tab_leave(active_tab);
 	active_tab = n_tabs++;
 	struct tab *t = &tabs[active_tab];
@@ -2519,7 +3297,7 @@ static void new_tab(void)
 	for (int k = 0; k < DT_PANELS; k++) t->dt.scroll[k] = 0;
 	B->pg = &t->page;                        /* swap to the fresh page */
 	devtools_view_load(&t->dt);
-	copy_str(t->label, "New Tab", sizeof t->label);
+	strlcpy(t->label, "New Tab", sizeof t->label);
 	show_blank();
 	update_title(B->win_id);                 /* clear the previous tab's title */
 }
@@ -2529,6 +3307,10 @@ static void close_tab(int i)
 	if (i < 0 || i >= n_tabs || n_tabs <= 1) return;   /* keep at least one */
 	int was_active = (i == active_tab);
 	if (was_active) load_quiesce();    /* only the active tab loads: stop its fetch first */
+	/* Fence the worker: the shift below moves every tab's page struct (and B->pg),
+	 * which the worker reads each iteration — even a background close relocates the
+	 * active page's slot. Park regardless of which tab is being closed. */
+	worker_park();
 	if (was_active) devtools_reset_live();   /* its live devtools capture isn't in .cap */
 	page_free(&tabs[i].page);                     /* free its page buffers   */
 	devtools_view_free(&tabs[i].dt);              /* and its devtools capture */
@@ -2541,6 +3323,7 @@ static void close_tab(int i)
 	else if (active_tab >= n_tabs) active_tab = n_tabs - 1;
 	B->pg = &tabs[active_tab].page;               /* tabs moved: repoint at the active page */
 	if (was_active) reveal_tab(active_tab);       /* reveal the neighbour */
+	worker_unpark();
 	B->seq++;
 }
 
@@ -2573,7 +3356,41 @@ static void menu_action(struct menu *m, int item)
 		case 2: scroll_set(B->pg->scroll - phh); break;        /* Page Up  */
 		case 3: scroll_set(B->pg->scroll + phh); break;        /* Page Down */
 		}
+	} else if (m == &bmarkmenu) {
+		switch (item) {
+		case 0: toggle_current_bookmark(); break;                  /* Add/Remove Bookmark */
+		case 1: bm_panel_open = !bm_panel_open; B->seq++; break;    /* Show/Hide panel     */
+		case 2: begin_new_folder(bookmarks_root()); break;         /* New top-level folder */
+		}
 	}
+}
+
+/* Hover link-scan cache: the span [hov_lo,hov_hi) of the last resolved link (or
+ * of the last empty gap between links) on display row hov_row, valid while the
+ * page + its content version (B->pg / B->seq) are unchanged. A pointer move that
+ * lands in the same span reuses hov_link instead of rescanning all links — the
+ * common case over long link lists / large link-free text areas. */
+static struct page *hov_pg;
+static unsigned     hov_seq;
+static int          hov_row = -1, hov_link = -1, hov_lo, hov_hi;
+
+/* Line-relative x where display line `row`'s glyphs begin: its left edge plus the
+ * block indent and, for a centered block, the centering offset — the same origin
+ * draw_slice_core paints from. Calls set_block, so callers must hold blk_lock and
+ * the line index must be in range. Shared by the hit-test and selection mappers so
+ * neither can drift from the painted position. */
+static int line_content_x(int row)
+{
+	int len = B->line_len[row], base = B->line_off[row];
+	set_block(base);
+	int x = B->line_x[row] + cur_bindent * INDENT_PX;
+	if (cur_bcenter) {
+		int lw = 0; unsigned cp;
+		for (int p = base; p < base + len; ) { int gp = p; p += utf8_decode(&B->pg->text[p], &B->pg->text[base + len], &cp); lw += body_cp_adv(cp, glyph_px(gp)); }
+		int room = (B->line_w[row] - cur_bindent * INDENT_PX) - lw;
+		if (room > 0) x += room / 2;
+	}
+	return x;
 }
 
 /* Resolve a content-pane hit at client coords (mx,my): sets *off to the text
@@ -2588,20 +3405,23 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
 	if (newtab) *newtab = 0;
 	int py, phh, rows;
 	pane_metrics(&py, &phh, &rows);
-	if (my < py || my >= py + phh) return;
+	int right = devtools_visible() ? devtools_left() : BW;
+	if (my < py || my >= py + phh || mx < 0 || mx >= right - SCROLL_W)
+		return;                        /* outside the content pane: skip the lock */
 	int row = line_at_px(B->pg->scroll + (my - py));
 	blk_lock();
 	if (row >= 0 && row < B->nlines) {
-		/* proportional: walk the line's glyphs to find which char the point
-		 * (mx, relative to the 4px left margin) falls on. */
-		int len = B->line_len[row], px = mx - B->line_x[row], acc = 0, col = -1;
-		int base = B->line_off[row];
-		for (int k = 0; k < len; ) {
+		/* proportional: walk the line's glyphs from the painted origin (block
+		 * indent + centering, via line_content_x) to find which char the point
+		 * falls on. A point left of the glyphs is not on any char. */
+		int len = B->line_len[row], base = B->line_off[row], col = -1;
+		int x = line_content_x(row);
+		for (int k = 0; mx >= x && k < len; ) {
 			unsigned cp;
 			int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
 			int cw = body_cp_adv(cp, glyph_px(base + k));
-			if (px < acc + cw) { col = k; break; }
-			acc += cw; k += nb;
+			if (mx < x + cw) { col = k; break; }
+			x += cw; k += nb;
 		}
 		if (col >= 0) *off = base + col;
 	}
@@ -2617,12 +3437,31 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
 		}
 	}
 	if (*off >= 0) {
-		for (int i = 0; i < B->pg->nlinks; i++)
-			if (*off >= B->pg->links[i].start && *off < B->pg->links[i].end) {
-				resolve_url(B->pg->cur_url, B->pg->links[i].href, url, cap);
-				if (newtab) *newtab = B->pg->links[i].newtab;
-				break;
+		int cache_ok = (hov_pg == B->pg && hov_seq == B->seq && row == hov_row);
+		if (cache_ok && *off >= hov_lo && *off < hov_hi) {
+			/* Same row + same link/gap span as the last move: reuse it. */
+			if (hov_link >= 0 && hov_link < B->pg->nlinks) {
+				resolve_url(B->pg->cur_url, B->pg->links[hov_link].href, url, cap);
+				if (newtab) *newtab = B->pg->links[hov_link].newtab;
 			}
+		} else {
+			/* Scan once, and cache both the covering link and, on a miss, the
+			 * link-free gap around *off (bounded by the nearest link edges) so
+			 * an idle move over plain text also short-circuits next time. */
+			int found = -1, lo = 0, hi = B->pg->text_len;
+			for (int i = 0; i < B->pg->nlinks; i++) {
+				int s = B->pg->links[i].start, e = B->pg->links[i].end;
+				if (*off >= s && *off < e) { found = i; lo = s; hi = e; break; }
+				if (e <= *off && e > lo) lo = e;
+				if (s >  *off && s < hi) hi = s;
+			}
+			if (found >= 0) {
+				resolve_url(B->pg->cur_url, B->pg->links[found].href, url, cap);
+				if (newtab) *newtab = B->pg->links[found].newtab;
+			}
+			hov_pg = B->pg; hov_seq = B->seq;
+			hov_row = row; hov_link = found; hov_lo = lo; hov_hi = hi;
+		}
 	}
 	blk_unlock();
 }
@@ -2633,31 +3472,30 @@ static void pane_linecol(int mx, int my, int *line, int *col)
 {
 	int py, phh, rows;
 	pane_metrics(&py, &phh, &rows);
-	int row = line_at_px(B->pg->scroll + (my - py));
-	if (row < 0) row = 0;
-	if (row >= B->nlines) row = B->nlines > 0 ? B->nlines - 1 : 0;
-	*line = row;
+	*line = 0;
 	*col = 0;
-	if (row >= B->nlines) return;
-	int len = B->line_len[row], base = B->line_off[row];
-	set_block(base);
-	int x = B->line_x[row] + cur_bindent * INDENT_PX;
-	if (cur_bcenter) {                                   /* match draw_styled_line */
-		int lw = 0; unsigned cp;
-		for (int p = base; p < base + len; ) { int gp = p; p += utf8_decode(&B->pg->text[p], &B->pg->text[base + len], &cp); lw += body_cp_adv(cp, glyph_px(gp)); }
-		int paw = B->line_w[row];
-		int room = (paw - cur_bindent * INDENT_PX) - lw;
-		if (room > 0) x += room / 2;
+	/* The worker rebuilds the line table and B->pg->text under blk_lock; take it
+	 * so a mid-navigation free/rewrap can't hand this drag a stale nlines>0 with
+	 * a freed text buffer (utf8_decode would then deref a NULL/dangling pointer). */
+	blk_lock();
+	if (B->pg->text && B->nlines > 0) {
+		int row = line_at_px(B->pg->scroll + (my - py));
+		if (row < 0) row = 0;
+		if (row >= B->nlines) row = B->nlines - 1;
+		*line = row;
+		int len = B->line_len[row], base = B->line_off[row];
+		int x = line_content_x(row);                     /* match draw_styled_line */
+		int c = len;                                     /* default: end of line */
+		for (int k = 0; k < len; ) {
+			unsigned cp;
+			int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
+			int cw = body_cp_adv(cp, glyph_px(base + k));
+			if (mx < x + cw / 2) { c = k; break; }       /* nearest char edge */
+			x += cw; k += nb;
+		}
+		*col = c;
 	}
-	int c = len;                                         /* default: end of line */
-	for (int k = 0; k < len; ) {
-		unsigned cp;
-		int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
-		int cw = body_cp_adv(cp, glyph_px(base + k));
-		if (mx < x + cw / 2) { c = k; break; }           /* nearest char edge */
-		x += cw; k += nb;
-	}
-	*col = c;
+	blk_unlock();
 }
 
 /* Alpha-blend a translucent selection highlight over the frame buffer rect. */
@@ -2681,7 +3519,8 @@ static void sel_hl_rect(int x, int y, int w, int h)
 
 static void handle_click(int mx, int my)
 {
-	if (my < MENU_H || pagemenu.open || viewmenu.open) {   /* menu bar / dropdown */
+	if (my < MENU_H || menu_any_open()) {   /* menu bar / dropdown */
+		bookmarks_menu_sync();
 		struct menu *leaf;
 		int item;
 		if (menubar_click(&menubar, mx, my, &leaf, &item)) {
@@ -2705,8 +3544,8 @@ static void handle_click(int mx, int my)
 		return;
 	}
 	if (my >= MENU_H + TAB_H && my < MENU_H + TAB_H + ADDR_H) {   /* address bar */
-		struct rect rb, rf, rrl, rtf;
-		addr_layout(&rb, &rf, &rrl, &rtf);
+		struct rect rb, rf, rrl, rtf, rst;
+		addr_layout(&rb, &rf, &rrl, &rtf, &rst);
 		struct tab *at = &tabs[active_tab];
 		if (hist_can_back(at) && button_hit(rb.x, rb.y, rb.w, rb.h, mx, my)) {
 			go_back();
@@ -2714,12 +3553,15 @@ static void handle_click(int mx, int my)
 			go_fwd();
 		} else if (button_hit(rrl.x, rrl.y, rrl.w, rrl.h, mx, my)) {
 			if (is_loading()) do_stop(); else do_reload();
+		} else if (B->pg->cur_url[0] && button_hit(rst.x, rst.y, rst.w, rst.h, mx, my)) {
+			toggle_current_bookmark();
 		} else {
 			textfield_click(&B->addr_tf, mx, my, rtf.x, rtf.y, rtf.w, rtf.h);
 		}
 		B->seq++;
 		return;
 	}
+	if (bm_panel_open && bm_panel_click(mx, my)) return;
 	int py, phh, rows;
 	pane_metrics(&py, &phh, &rows);
 	int sbpart = scrollbar_hit(BW - SCROLL_W, py, SCROLL_W, phh, mx, my);
@@ -2733,6 +3575,13 @@ static void handle_click(int mx, int my)
 		return;
 	}
 	if (my >= py && my < py + phh) {                        /* content pane click */
+		/* Crashed tab: the only thing in the pane is the Reload button. */
+		if (tabs[active_tab].crashed) {
+			if (button_hit(crash_reload_rect.x, crash_reload_rect.y,
+			               crash_reload_rect.w, crash_reload_rect.h, mx, my))
+				do_reload();
+			return;
+		}
 		/* Inspect-element picker armed: a click selects the element under the
 		 * cursor in devtools instead of following links / starting a selection. */
 		if (devtools_picking()) {
@@ -2812,16 +3661,23 @@ static int cursor_for(int mx, int my, const char *link)
 	if (mx < 0) return WIN_CURSOR_ARROW;
 	if (my >= MENU_H && my < MENU_H + TAB_H) return WIN_CURSOR_HAND;   /* tab strip */
 	if (my >= MENU_H + TAB_H && my < MENU_H + TAB_H + ADDR_H) {        /* address bar */
-		struct rect rb, rf, rrl, rtf;
-		addr_layout(&rb, &rf, &rrl, &rtf);
+		struct rect rb, rf, rrl, rtf, rst;
+		addr_layout(&rb, &rf, &rrl, &rtf, &rst);
 		if (in_rect(mx, my, &rtf)) return WIN_CURSOR_TEXT;
-		if (in_rect(mx, my, &rb) || in_rect(mx, my, &rf) || in_rect(mx, my, &rrl))
+		if (in_rect(mx, my, &rb) || in_rect(mx, my, &rf) || in_rect(mx, my, &rrl) ||
+		    in_rect(mx, my, &rst))
 			return WIN_CURSOR_HAND;
 		return WIN_CURSOR_ARROW;
 	}
+	if (bm_panel_open && mx < BM_PANEL_W && my >= MENU_H + TAB_H + ADDR_H)
+		return WIN_CURSOR_HAND;
 	/* Content pane: I-beam over selectable text, hand over a link, arrow on the
 	 * scrollbar. */
 	if (mx >= (devtools_visible() ? devtools_left() : BW) - SCROLL_W) return WIN_CURSOR_ARROW;
+	/* Crashed tab: hand over the Reload button, plain arrow elsewhere (nothing to
+	 * select). */
+	if (tabs[active_tab].crashed)
+		return in_rect(mx, my, &crash_reload_rect) ? WIN_CURSOR_HAND : WIN_CURSOR_ARROW;
 	return link[0] ? WIN_CURSOR_HAND : WIN_CURSOR_TEXT;
 }
 
@@ -2895,6 +3751,17 @@ static void select_all(void)
 
 static void handle_key(char c, int mods)
 {
+	/* Naming a new bookmark folder: the inline field captures every key; Enter
+	 * commits it, Esc cancels. */
+	if (bm_naming) {
+		unsigned char uc = (unsigned char)c;
+		if (uc == '\n' || uc == '\r') { folder_add(bm_name_parent, bm_name_buf); bm_naming = 0; B->seq++; }
+		else if (uc == 27)             { bm_naming = 0; B->seq++; }
+		else                           { textfield_key(&bm_name_tf, c); B->seq++; }
+		return;
+	}
+	/* Ctrl+B toggles the bookmarks panel. */
+	if ((mods & KMOD_CTRL) && (c == 'b' || c == 'B')) { bm_panel_open = !bm_panel_open; B->seq++; return; }
 	/* Developer tools: toggle on F12 or Ctrl+Shift+I; Esc closes an open panel.
 	 * Ctrl+Shift+I arrives as a bare 'i' char with the CTRL|SHIFT modifier bits. */
 	if ((unsigned char)c == KEY_F12 ||
@@ -2996,11 +3863,14 @@ int main(int argc, char **argv)
 	B->pg->page_bg = 0xffffff; B->pg->page_fg = 0x202830;   /* until a page sets them */
 
 	textfield_init(&B->addr_tf, B->addr, URL_MAX);
+	textfield_init(&bm_name_tf, bm_name_buf, sizeof bm_name_buf);
 	if (start) textfield_set(&B->addr_tf, start);   /* else a blank New Tab (empty bar) */
 	B->layout_dirty = 1;
 
 	jar_load();   /* restore cookies + HSTS from the persistent SQLite db */
+	perm_load();  /* restore "Allow always" permission grants */
 	cache_load(); /* restore the persistent HTTP response cache from disk */
+	bookmarks_load(); /* restore the bookmarks tree from disk */
 
 	int wtid = thread_create(worker_fn, &worker_stack[sizeof worker_stack]);
 
@@ -3023,6 +3893,7 @@ int main(int argc, char **argv)
 		while (win_poll(id, &ev)) {
 			if (ev.type == WEV_CLOSE) {
 				worker_quit = 1;
+				B->dlg_done = 1;   /* release the worker if it's blocked in a dialog */
 				if (wtid >= 0) thread_join(wtid);   /* let the worker exit first */
 				win_close(id);
 				return 0;
@@ -3038,15 +3909,27 @@ int main(int argc, char **argv)
 				handle_move(ev.a, ev.b);
 			} else if (ev.type == WEV_SCROLL) {
 				/* The wheel scrolls whichever surface the pointer is over: the
-				 * devtools dock when inside it, otherwise the page. */
-				if (devtools_visible() && last_mx >= devtools_left()
+				 * bookmarks panel, the devtools dock, else the page. */
+				if (bm_panel_open && last_mx >= 0 && last_mx < BM_PANEL_W
+				    && last_my >= MENU_H + TAB_H + ADDR_H) {
+					bm_panel_scroll -= ev.a; if (bm_panel_scroll < 0) bm_panel_scroll = 0;
+					B->seq++;
+				} else if (devtools_visible() && last_mx >= devtools_left()
 				    && last_my >= devtools_top()) {
 					devtools_handle_scroll(ev.a);
 				} else {
 					scroll_set(B->pg->scroll - ev.a * 3 * LINE_H);  /* wheel up scrolls back */
 				}
 			} else if (ev.type == WEV_RESIZE) {
+				int prev_w = BW, prev_h = BH;
 				BW = ev.a; BH = ev.b;
+				/* Grow the back buffer BEFORE committing the new size: a failed
+				 * realloc leaves it smaller than BW*BH, and drawing at the new
+				 * dims would then write past its end (heap OOB). Keep the old
+				 * size when the grow can't happen — the frame stays at the
+				 * previous resolution rather than corrupting the heap. */
+				surface();
+				if (g_surface && BW * BH > g_surface_px) { BW = prev_w; BH = prev_h; }
 				gfx_init(surface(), BW, BH);
 				B->recascade = 1;    /* @media may change → worker re-cascades  */
 				B->seq++;            /* re-wrap + repaint at the new width */
@@ -3076,6 +3959,32 @@ int main(int argc, char **argv)
 			B->loc_nav = 0;
 			navigate(B->loc_url);
 		}
+		/* window.alert/confirm/prompt: the JS worker filled B->dlg_* and is blocked on
+		 * dlg_done. Run the modal dialog HERE, on the main thread (the gfx surface is
+		 * main-thread-only; the dialog is parented to our window). While the nested
+		 * dialog loop runs the browser is frozen — correct modal-dialog behaviour. */
+		if (B->dlg_req && !B->dlg_done) {
+			int req = B->dlg_req, ok = 0;
+			if (req == 1) {                          /* alert */
+				dialog_msg(id, B->dlg_title, B->dlg_msg, DLG_ICON_INFO | DLG_OK);
+				ok = 1;
+			} else if (req == 2) {                   /* confirm */
+				ok = dialog_msg(id, B->dlg_title, B->dlg_msg,
+				                DLG_ICON_QUESTION | DLG_OKCANCEL) == DLG_R_OK;
+			} else if (req == 4) {                   /* permission: Refuse/Once/Always */
+				static const char *const perm_btns[3] = { "Refuse", "Allow once", "Allow always" };
+				/* A locked modal (no close/min/max, not draggable); waits for an answer. */
+				int r = dialog_choose(id, B->dlg_title, B->dlg_msg, perm_btns, 3, DLG_ICON_QUESTION);
+				ok = r;                              /* -1 = dismissed via Esc (worker: ask again later) */
+			} else {                                 /* prompt */
+				ok = dialog_prompt(id, B->dlg_title, B->dlg_msg,
+				                   B->dlg_text, B->dlg_text, sizeof B->dlg_text);
+			}
+			gfx_init(surface(), BW, BH);             /* dialog borrowed the surface */
+			B->dlg_ok = ok;
+			B->dlg_done = 1;                         /* release the worker (publish last) */
+			B->seq++;                                /* repaint the browser window */
+		}
 		B->hist_len = tabs[active_tab].hist_n;
 
 		if (B->loading && !prev_loading)             /* fetch started */
@@ -3091,6 +4000,8 @@ int main(int argc, char **argv)
 			 * Back/Next move (then we only walked the existing history). */
 			if (!nav_from_history) hist_push(&tabs[active_tab], B->pg->cur_url);
 			nav_from_history = 0;
+			if (B->pg->favicon_ok && B->pg->cur_url[0])   /* update a saved bookmark's icon */
+				bookmark_set_icon(B->pg->cur_url, B->pg->favicon);
 		}
 		prev_loading = B->loading;
 
@@ -3109,10 +4020,13 @@ int main(int argc, char **argv)
 		}
 
 		int due = !B->loading || (frame - last_paint_frame) >= LOAD_REDRAW_FRAMES;
+		int dt_paint = devtools_take_paint();        /* devtools-local change (log line) */
 		if (B->seq != last && due) {
 			render(); blit_present(id); last = B->seq; last_paint_frame = frame; addr_dirty = 0;
-		} else if (addr_dirty) {                     /* address-bar keystroke only */
-			render_addr(); blit_present(id); addr_dirty = 0;
+		} else if (addr_dirty || dt_paint) {         /* partial repaints: addr bar / devtools dock */
+			if (addr_dirty) { render_addr(); addr_dirty = 0; }
+			if (dt_paint)   devtools_render();       /* opaque right-side split: dock only */
+			blit_present(id);
 		}
 		frame++;
 		win_wait(id);

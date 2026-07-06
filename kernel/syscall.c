@@ -22,6 +22,7 @@
 #include "blk.h"
 #include "loader.h"
 #include "sched.h"
+#include "entropy.h"
 #include "heap.h"
 #include "file.h"
 #include "pipe.h"
@@ -47,129 +48,138 @@
 #include "crash.h"
 #include "paging.h"
 
+/* Build stamp for SYS_UNAME's release/version; the Makefile passes it, this is
+ * the fallback so a stray build path still compiles. */
+#ifndef OWOS_VERSION
+#define OWOS_VERSION "dev"
+#endif
+
 #define SYS_WRITE    1   /* write(fd=ebx, buf=ecx, len=edx) -> bytes          */
 #define SYS_EXIT     2   /* exit(code=ebx) -- terminates the process          */
 #define SYS_READ     3   /* read(fd=ebx, buf=ecx, len=edx) -> bytes (0=EOF)   */
 #define SYS_FORK     4   /* fork() -> child pid in parent, 0 in child         */
-#define SYS_UPTIME   5   /* uptime() -- seconds since boot                    */
-#define SYS_READFILE 6   /* readfile(name=ebx, buf=ecx, max=edx) -> bytes     */
-#define SYS_EXEC     7   /* run a new program image (name=ebx)                */
-#define SYS_WAITPID  8   /* waitpid(pid=ebx) -> child's exit status           */
-#define SYS_PIPE     9   /* pipe(int fds[2]=ebx) -> 0/-1                       */
-#define SYS_CLOSE    10  /* close(fd=ebx) -> 0/-1                             */
-#define SYS_WRITEFILE 11 /* writefile(name=ebx, buf=ecx, len=edx) -> 0/-1     */
-#define SYS_NET_CONNECT 12 /* net_connect(host=ebx, port=ecx, tls=edx) -> h/-e */
-#define SYS_NET_SEND   13 /* net_send(h=ebx, buf=ecx, len=edx) -> bytes/-1     */
-#define SYS_NET_RECV   14 /* net_recv(h=ebx, buf=ecx, max=edx) -> bytes(0=EOF) */
-#define SYS_NET_CLOSE  15 /* net_close(h=ebx) -> 0/-1                          */
-#define SYS_WIN_CREATE 16 /* win_create(w=ebx, h=ecx, title=edx) -> id/-1      */
-#define SYS_WIN_PRESENT 17 /* win_present(id=ebx) -> 0/-1                       */
-#define SYS_WIN_POLL   18 /* win_poll(id=ebx, evt=ecx) -> 1 event/0 none/-1     */
-#define SYS_WIN_WAIT   19 /* win_wait(id=ebx) -> 0 (sleep ~a frame for events)  */
-#define SYS_WIN_CLOSE  20 /* win_close(id=ebx) -> 0/-1                          */
-#define SYS_RTC        21 /* rtc() -> packed (hour<<16)|(min<<8)|sec            */
-#define SYS_RTC_EPOCH  56 /* rtc_epoch() -> Unix epoch seconds (UTC)            */
-#define SYS_NET_SET_TTL 57 /* net_set_ttl(h=ebx, ttl=ecx) -> 0/-1. Outgoing IP  */
-                           /* TTL for a UDP socket (IP_MULTICAST_TTL analog).   */
-#define SYS_READDIR    22 /* readdir(path=ebx, idx=ecx, out=edx) -> 1/0/-1      */
-#define SYS_WIN_TITLE  23 /* win_settitle(id=ebx, str=ecx) -> 0/-1              */
-#define SYS_THREAD     24 /* thread_create(entry=ebx, stacktop=ecx) -> tid/-1   */
-#define SYS_SLEEP      25 /* msleep(ms=ebx) -> 0                                */
-#define SYS_WIN_RESIZABLE 26 /* win_resizable(id=ebx, on=ecx) -> 0/-1           */
-#define SYS_MSEC       27 /* msec() -> milliseconds since boot                  */
-#define SYS_READFILE_AT 28 /* pread(args=ebx -> {name,off,buf,len}) -> bytes/0/-1 */
-#define SYS_VOLUMES    29 /* volumes(idx=ebx, out=ecx -> struct volinfo) -> 1/0/-1 */
-#define SYS_UMOUNT     30 /* umount(point=ebx) -> 0/-1 (unmount the volume at point) */
-#define SYS_WIN_CURSOR 31 /* win_cursor(id=ebx, shape=ecx) -> 0/-1 (enum wm_cursor)   */
-#define SYS_STREAM_BEGIN 32 /* stream_begin(name=ebx) -> 0/-1 (open a streaming write) */
-#define SYS_STREAM_WRITE 33 /* stream_write(buf=ebx, len=ecx) -> 0/-1 (append a chunk) */
-#define SYS_STREAM_END   34 /* stream_end() -> bytes committed / -1 (commit + close)   */
-#define SYS_MKDIR      35 /* mkdir(path=ebx) -> 0/-1                                    */
-#define SYS_RMDIR      36 /* rmdir(path=ebx) -> 0/-1                                    */
-#define SYS_DELETE     37 /* delete(path=ebx) -> 0/-1 (rm a file)                       */
-#define SYS_RENAME     38 /* rename(old=ebx, new=ecx) -> 0/-1                           */
-#define SYS_STAT       39 /* stat(path=ebx, out=ecx -> {int is_dir; u32 size}) -> 0/-1  */
-#define SYS_SPAWN      40 /* spawn(path=ebx, arg=ecx|0) -> pid/-1 (detached, like the WM) */
-#define SYS_MOUNT      41 /* mount(kind=ebx) -> 0/-1 (mount a present removable device at /media) */
-#define SYS_AUDIO_OPEN 42 /* audio_open() -> 0/-1 (open a 48k/S16/stereo PCM stream)       */
-#define SYS_AUDIO_WRITE 43 /* audio_write(buf=ebx, len=ecx) -> bytes / -1 / -2 (Ctrl+C)    */
-#define SYS_AUDIO_CLOSE 44 /* audio_close() -> 0 (drain + stop the stream)                 */
-/* 45 unused (was SYS_INTR, the old per-task Ctrl+C latch — replaced by signals:
- * a caught SIGINT / default terminate, see SYS_SIGACTION below). */
-/* 46 unused (was SYS_NET_ALPN; TLS + ALPN moved to user space) — do not reuse
- * without bumping every consumer, the numbers stay in sync with user/lib/lib.c */
-#define SYS_SPAWN_CAP  45 /* spawn_cap(req=ebx) -> pid/-1. Packed request (see the
+#define SYS_READFILE 5   /* readfile(name=ebx, buf=ecx, max=edx) -> bytes     */
+#define SYS_EXEC     6   /* run a new program image (name=ebx)                */
+#define SYS_WAITPID  7   /* waitpid(pid=ebx, status=ecx, flags=edx): flags&WNOHANG ->
+                          * 1 reaped/0 none (status via *ecx); else block -> exit status */
+#define SYS_PIPE     8   /* pipe(int fds[2]=ebx) -> 0/-1                       */
+#define SYS_CLOSE    9   /* close(fd=ebx) -> 0/-1                             */
+#define SYS_WRITEFILE 10 /* writefile(name=ebx, buf=ecx, len=edx) -> 0/-1     */
+#define SYS_NET_CONNECT 11 /* net_connect(host=ebx, port=ecx, proto=edx) -> h/-e.
+                            * proto SK_RAWETH opens a raw socket (no host, root-only). */
+#define SYS_NET_SEND   12 /* net_send(ebx -> {fd,buf,len,flags,ip|0,port}) -> bytes/-1.
+                            * ip non-NULL = sendto; else connected/stream send. */
+#define SYS_NET_RECV   13 /* net_recv(ebx -> {fd,buf,max,flags,ip|0,port|0}) -> bytes.
+                            * ip/port = recvfrom; else flags&MSG_DONTWAIT = non-blocking. */
+#define SYS_NET_CLOSE  14 /* net_close(h=ebx) -> 0/-1                          */
+#define SYS_WIN_CREATE 15 /* win_create(w=ebx, h=ecx, title=edx) -> id/-1      */
+#define SYS_WIN_PRESENT 16 /* win_present(id=ebx) -> 0/-1                       */
+#define SYS_WIN_POLL   17 /* win_poll(id=ebx, evt=ecx|0, block=edx) -> 1 event/0 none/-1.
+                           * block sleeps ~a frame when no event is queued. */
+#define SYS_WIN_CLOSE  18 /* win_close(id=ebx) -> 0/-1                          */
+#define SYS_READDIR    19 /* readdir(path=ebx, idx=ecx, out=edx) -> 1/0/-1      */
+#define SYS_WIN_TITLE  20 /* win_settitle(id=ebx, str=ecx) -> 0/-1              */
+#define SYS_THREAD     21 /* thread_create(entry=ebx, stacktop=ecx) -> tid/-1   */
+#define SYS_SLEEP      22 /* msleep(ms=ebx) -> 0                                */
+#define SYS_WIN_RESIZABLE 23 /* win_resizable(id=ebx, on=ecx) -> 0/-1           */
+#define SYS_MSEC       24 /* msec() -> milliseconds since boot                  */
+#define SYS_READFILE_AT 25 /* pread(args=ebx -> {name,off,buf,len}) -> bytes/0/-1 */
+#define SYS_VOLUMES    26 /* volumes(idx=ebx, out=ecx -> struct volinfo) -> 1/0/-1 */
+#define SYS_UMOUNT     27 /* umount(point=ebx) -> 0/-1 (unmount the volume at point) */
+#define SYS_WIN_CURSOR 28 /* win_cursor(id=ebx, shape=ecx) -> 0/-1 (enum wm_cursor)   */
+#define SYS_STREAM_BEGIN 29 /* stream_begin(name=ebx) -> 0/-1 (open a streaming write) */
+#define SYS_STREAM_WRITE 30 /* stream_write(buf=ebx, len=ecx) -> 0/-1 (append a chunk) */
+#define SYS_STREAM_END   31 /* stream_end() -> bytes committed / -1 (commit + close)   */
+#define SYS_MKDIR      32 /* mkdir(path=ebx) -> 0/-1                                    */
+#define SYS_RMDIR      33 /* rmdir(path=ebx) -> 0/-1                                    */
+#define SYS_DELETE     34 /* delete(path=ebx) -> 0/-1 (rm a file)                       */
+#define SYS_RENAME     35 /* rename(old=ebx, new=ecx) -> 0/-1                           */
+#define SYS_STAT       36 /* stat(path=ebx, out=ecx -> {int is_dir; u32 size}) -> 0/-1  */
+#define SYS_SPAWN      37 /* spawn(path=ebx, arg=ecx|0) -> pid/-1 (detached)            */
+#define SYS_MOUNT      38 /* mount(kind=ebx) -> 0/-1 (mount a present removable device at /media) */
+#define SYS_AUDIO_OPEN 39 /* audio_open() -> 0/-1 (open a 48k/S16/stereo PCM stream)       */
+#define SYS_AUDIO_WRITE 40 /* audio_write(buf=ebx, len=ecx) -> bytes / -1 / -2 (Ctrl+C)    */
+#define SYS_AUDIO_CLOSE 41 /* audio_close() -> 0 (drain + stop the stream)                 */
+#define SYS_SPAWN_CAP  42 /* spawn_cap(req=ebx) -> pid/-1. Packed request (see the
                            * cap_req struct) spawns a /bin child with its stdout (and
                            * optionally stdin) wired to fresh pipe(s); optional uid/gid/
                            * cwd set the child's identity/dir (uid/gid change is root-only). */
-#define SYS_READ_NB    46 /* read_nb(fd=ebx, buf=ecx, len=edx) -> >0 bytes / 0 would-block
+#define SYS_READ_NB    43 /* read_nb(fd=ebx, buf=ecx, len=edx) -> >0 bytes / 0 would-block
                            * / -1 EOF or error. Non-blocking sibling of SYS_READ, so a GUI
                            * program can poll a pipe and still service window events. */
-#define SYS_CHDIR      47 /* chdir(path=ebx) -> 0/-1: set the caller's own kernel cwd, so
+#define SYS_CHDIR      44 /* chdir(path=ebx) -> 0/-1: set the caller's own kernel cwd, so
                            * children it spawns resolve relative paths from there. */
-#define SYS_KILL       48 /* kill(pid=ebx, sig=ecx) -> 0/-1: post a signal to a task
+#define SYS_KILL       45 /* kill(pid=ebx, sig=ecx) -> 0/-1: post a signal to a task
                            * (root, self, or a child of the caller). sig 0 probes. */
-#define SYS_POWER      49 /* power(action=ebx): 0 = shut down (ACPI S5), 1 = reboot. Does not
+#define SYS_POWER      46 /* power(action=ebx): 0 = shut down (ACPI S5), 1 = reboot. Does not
                            * return on success. A real action, so a syscall -- not a /proc file. */
-#define SYS_SBRK       50 /* sbrk(inc=ebx) -> previous break / (uint32_t)-1: grow or shrink the
+#define SYS_SBRK       47 /* sbrk(inc=ebx) -> previous break / (uint32_t)-1: grow or shrink the
                            * caller's heap by `inc` bytes. The user-space malloc primitive. */
-#define SYS_NET_RECV_NB 51 /* net_recv_nb(h=ebx, buf=ecx, max=edx) -> >0 bytes / 0 would-block /
-                            * -1 EOF|err / -4 intr. Non-blocking recv for interactive clients
-                            * (ssh) that multiplex the socket with stdin. */
-#define SYS_GETUID     52 /* getuid() -> the calling task's user id (per-process credentials, */
-#define SYS_GETGID     53 /* getgid() -> its group id; user space resolves the name/home from */
-                          /* /etc/passwd itself, so there's no /proc identity file.           */
-#define SYS_PORT_OPEN  54 /* port_open(name=ebx, as_server=ecx) -> fd/-1. A named local-IPC   */
+#define SYS_GETUID     48 /* getuid() -> the calling task's user id (per-process credentials;
+                           * user space resolves the name/home from /etc/passwd itself). */
+#define SYS_PORT_OPEN  49 /* port_open(name=ebx, as_server=ecx) -> fd/-1. A named local-IPC   */
                           /* port: server registers + accept()s, client connects (ipc.c).    */
-#define SYS_PORT_ACCEPT 55 /* port_accept(listen_fd=ebx) -> channel fd/-1 (blocks for a conn) */
+#define SYS_PORT_ACCEPT 50 /* port_accept(listen_fd=ebx) -> channel fd/-1 (blocks for a conn) */
+#define SYS_RTC_EPOCH  51 /* rtc_epoch() -> Unix epoch seconds (UTC)            */
+#define SYS_NET_SETOPT 52 /* net_setopt(fd=ebx, opt=ecx, val=edx) -> 0/-1. Socket option;
+                           * NET_OPT_TTL sets a UDP socket's outgoing IP TTL. */
 
-/* Server sockets (Stage 3): the passive/bound side of the net_sock_* handle
- * table. LISTEN/ACCEPT are TCP; BIND/RECVFROM/SENDTO are UDP. RECVFROM/SENDTO
- * pass their extra args via a small struct pointer (ebx) since the ABI has only
- * 3 registers. */
-#define SYS_NET_LISTEN   58 /* net_listen(port=ebx) -> listener fd/-1              */
-#define SYS_NET_ACCEPT   59 /* net_accept(listen_fd=ebx) -> conn fd/-1/-4 (blocks) */
-#define SYS_NET_BIND     60 /* net_bind(port=ebx) -> bound UDP fd/-1               */
-#define SYS_NET_RECVFROM 61 /* net_recvfrom(ebx -> {fd,buf,max,ip,port}) -> bytes/0/-1/-4 */
-#define SYS_NET_SENDTO   62 /* net_sendto(ebx -> {fd,ip,port,buf,len}) -> len/-1   */
-#define SYS_STATFS       63 /* statfs(path=ebx, out=ecx -> {u64 total,u64 free}) -> 0/-1 */
-#define SYS_NET_RAW_OPEN 64 /* net_raw_open() -> raw-Ethernet fd/-1 (root-only, AF_PACKET) */
-#define SYS_IFCONFIG     65 /* ifconfig(ip=ebx, ecx -> {mask,gw,dns} 3x u8[4]) -> 0/-1 (root) */
-#define SYS_SETRTC       66 /* setrtc(unix_secs=ebx) -> 0/-1. Set the wall clock; root-only */
+/* Server sockets: the passive/bound side of the net_sock_* handle table.
+ * LISTEN/ACCEPT are TCP; BIND is UDP (recv/send-to go through the unified
+ * NET_RECV/NET_SEND with a source/dest address). */
+#define SYS_NET_LISTEN   53 /* net_listen(port=ebx) -> listener fd/-1              */
+#define SYS_NET_ACCEPT   54 /* net_accept(listen_fd=ebx) -> conn fd/-1/-4 (blocks) */
+#define SYS_NET_BIND     55 /* net_bind(port=ebx) -> bound UDP fd/-1               */
+#define SYS_STATFS       56 /* statfs(path=ebx, out=ecx -> {u64 total,u64 free}) -> 0/-1 */
+#define SYS_IFCONFIG     57 /* ifconfig(ip=ebx, ecx -> {mask,gw,dns} 3x u8[4]) -> 0/-1 (root) */
+#define SYS_SETRTC       58 /* setrtc(unix_secs=ebx) -> 0/-1. Set the wall clock; root-only */
 
-/* Phase 1 of the user-space compositor: additive primitives a /bin/compositor
- * needs. All root-only (uid 0), like SYS_IFCONFIG — the compositor runs as root.
- * Unconsumed until the compositor exists; the in-kernel WM still drives the
- * display. */
-#define SYS_FB_INFO         67 /* fb_info(out=ebx -> struct fbinfo) -> 0/-1 (root)   */
-#define SYS_FB_MAP          68 /* fb_map() -> COMPOSITOR_FB_VADDR / (uint)-1 (root): maps
+/* User-space compositor primitives. All root-only (uid 0), like SYS_IFCONFIG. */
+#define SYS_FB_INFO         59 /* fb_info(out=ebx -> struct fbinfo) -> 0/-1 (root)   */
+#define SYS_FB_MAP          60 /* fb_map() -> COMPOSITOR_FB_VADDR / (uint)-1 (root): maps
                                 * the shared cached-RAM BACK buffer into the caller.  */
-#define SYS_FB_PRESENT      69 /* fb_present(ebx -> {x,y,w,h}) -> 0/-1 (root): flush a
+#define SYS_FB_PRESENT      61 /* fb_present(ebx -> {x,y,w,h}) -> 0/-1 (root): flush a
                                 * back-buffer rect to VRAM (damage-rect present).      */
-#define SYS_INPUT_POLL      70 /* input_poll(out=ebx -> struct inputstate) -> 0/-1 (root):
+#define SYS_INPUT_POLL      62 /* input_poll(out=ebx -> struct inputstate) -> 0/-1 (root):
                                 * pointer state + drained key events, non-blocking.    */
-#define SYS_INPUT_SET_BOUNDS 71 /* input_set_bounds(w=ebx, h=ecx) -> 0/-1 (root)      */
-#define SYS_WIN_ENUM        72 /* win_enum(ebx -> winrec[], ecx=max) -> count/-1 (root) */
-#define SYS_WIN_MAP         73 /* win_map(id=ebx, out=ecx -> struct winmap) -> 0/-1 (root):
+#define SYS_INPUT_SET_BOUNDS 63 /* input_set_bounds(w=ebx, h=ecx) -> 0/-1 (root)      */
+#define SYS_WIN_ENUM        64 /* win_enum(ebx -> winrec[], ecx=max) -> count/-1 (root) */
+#define SYS_WIN_MAP         65 /* win_map(id=ebx, out=ecx -> struct winmap) -> 0/-1 (root):
                                 * maps window id's buffer at WIN_MAP_BASE+id*slot.      */
-#define SYS_WIN_UNMAP       74 /* win_unmap(id=ebx) -> 0/-1 (root): drop the map+pin   */
-#define SYS_WIN_SET_GEOM    75 /* win_set_geom(id=ebx, ecx -> {x,y,w,h}) -> 0/-1 (root) */
-#define SYS_WIN_DELIVER     76 /* win_deliver(id=ebx, ev=ecx -> struct winevent) -> 0/-1 (root) */
-#define SYS_WIN_SET_FOCUS   77 /* win_set_focus(id=ebx) -> 0/-1 (root; id<=0 = none)   */
-#define SYS_WIN_KEY_SPACE   79 /* win_key_space(id=ebx) -> free slots in a window's event
-                                * ring (huge if not queued): paste flow control, root-only */
-#define SYS_WAITPID_NB      80 /* waitpid_nb(pid=ebx, status_out=ecx) -> 1 reaped / 0 none:
-                                * non-blocking reap (the compositor reaps its detached apps) */
-#define SYS_STACK_ALLOC     81 /* stack_alloc(pages=ebx) -> guarded thread-stack top / 0    */
-#define SYS_STACK_FREE      82 /* stack_free(top=ebx) -> 0: release a guarded thread stack   */
-#define SYS_CRASH_POLL      78 /* crash_poll(out=ebx -> crash_rec[], ecx=max) -> count/-1
+#define SYS_WIN_UNMAP       66 /* win_unmap(id=ebx) -> 0/-1 (root): drop the map+pin   */
+#define SYS_WIN_SET_GEOM    67 /* win_set_geom(id=ebx, ecx -> {x,y,w,h}) -> 0/-1 (root) */
+#define SYS_WIN_DELIVER     68 /* win_deliver(id=ebx, ev=ecx -> struct winevent) -> 0/-1 (root) */
+#define SYS_CRASH_POLL      69 /* crash_poll(out=ebx -> crash_rec[], ecx=max) -> count/-1
                                 * (root): drain pending user-crash reports for the
                                 * compositor to render as crash windows.             */
-#define SYS_SIGACTION       83 /* sigaction(sig=ebx, act=ecx -> k_sigaction, old=edx) -> 0/-1 */
-#define SYS_SIGPROCMASK     84 /* sigprocmask(how=ebx, set=ecx, have_set=edx) -> old blocked mask */
-/* SYS_SIGRETURN (88) is defined in signal.h — it's baked into the kernel-built
+#define SYS_WIN_KEY_SPACE   70 /* win_key_space(id=ebx) -> free slots in a window's event
+                                * ring (huge if not queued): paste flow control, root-only */
+#define SYS_STACK_ALLOC     71 /* stack_alloc(pages=ebx) -> guarded thread-stack top / 0    */
+#define SYS_STACK_FREE      72 /* stack_free(top=ebx) -> 0: release a guarded thread stack   */
+#define SYS_SIGACTION       73 /* sigaction(sig=ebx, act=ecx -> k_sigaction, old=edx) -> 0/-1 */
+#define SYS_SIGPROCMASK     74 /* sigprocmask(how=ebx, set=ecx, have_set=edx) -> old blocked mask */
+/* SYS_SIGRETURN (75) is defined in signal.h — it's baked into the kernel-built
  * signal trampoline; user code never issues it directly. */
-#define SYS_GETPID          86 /* getpid() -> the caller's pid                            */
+#define SYS_GETPID          76 /* getpid() -> the caller's pid                            */
+#define SYS_GETRANDOM       77 /* getrandom(buf=ebx, len=ecx) -> len/-1: CSPRNG bytes from
+                                * the kernel entropy pool (not the clock-seeded fallback). */
+#define SYS_WIN_OWNS        78 /* win_owned(pid=ebx) -> 1 if that pid owns a window, else 0.
+                                * Lets the terminal detach windowed apps with no app list. */
+#define SYS_WIN_SET_PARENT  79 /* win_set_parent(id=ebx, parent=ecx, modal=edx) -> 0/-1:
+                                * make `id` a transient (dialog) child of `parent`; modal
+                                * blocks input to the rest of the parent's window family. */
+#define SYS_WIN_FB          80 /* win_fb_of(id=ebx) -> the client buffer's user vaddr, or 0.
+                                * The first window is always at WIN_FB_VADDR; a dialog's
+                                * second window lands in its own slot, fetched here.       */
+#define SYS_UNAME           81 /* uname(out=ebx -> struct utsname) -> 0/-1. POSIX system
+                                * identity; the kernel is the only authority for `machine`
+                                * (user programs are always 32-bit ELF). libc fills nodename
+                                * from the hostname afterwards.                            */
+
+/* Syscall argument flags / options (mirror user/lib/owos.h). */
+#define WNOHANG       1   /* SYS_WAITPID: non-blocking reap                     */
+#define MSG_DONTWAIT  1   /* SYS_NET_RECV: non-blocking recv                    */
+#define NET_OPT_TTL   1   /* SYS_NET_SETOPT: outgoing IP TTL                    */
 
 /* Net transports are general sockets: SYS_NET_CONNECT's `proto` arg selects
  * TCP/TLS/UDP/raw-ICMP, so ping/dig/resolve are libs over sockets, not
@@ -270,6 +280,25 @@ static int user_range(uint32_t addr, uint32_t len)
 	    && addr + len >= addr;          /* no overflow                       */
 }
 
+/* Copy a NUL-terminated user string at `uaddr` into `out` (`cap` bytes),
+ * validating each byte stays inside the user window before it is read. Returns
+ * 0 on success, -1 if the pointer leaves the window before a terminator or the
+ * string doesn't fit. Path syscalls must use this rather than passing the raw
+ * user pointer to join_cwd(), which would otherwise walk an unterminated string
+ * off the end of the mapped region and fault the kernel in the int 0x80 gate. */
+static int copy_user_str(uint32_t uaddr, char *out, int cap)
+{
+	for (int i = 0; i < cap; i++) {
+		if (!user_range(uaddr + (uint32_t)i, 1))
+			return -1;
+		char ch = ((const char *)(uintptr_t)uaddr)[i];
+		out[i] = ch;
+		if (ch == '\0')
+			return 0;
+	}
+	return -1;                          /* no terminator within cap          */
+}
+
 extern void isr128(void);          /* the int 0x80 stub (isr.S)               */
 
 /* Unix seconds (UTC) -> civil date/time (Howard Hinnant's days-from-civil
@@ -304,9 +333,23 @@ void syscall_init(void)
 	idt_set_gate(0x80, (uint32_t)isr128, GDT_KERNEL_CODE, 0xEE);
 }
 
-/* Which audio back end the open stream is using: 0 none, 1 HDA, 2 SB16. Global
- * because owofs-style there is one audio stream at a time across the system. */
-static int audio_be;
+/* Which audio back end the open stream is using: 0 none, 1 HDA, 2 SB16. There is
+ * one PCM stream at a time across the system (owofs-style), owned by the task that
+ * opened it: only that task may write or close it, and it is released if the task
+ * exits (audio_task_exiting), so a crash/kill can't leave the DMA looping forever. */
+static int      audio_be;
+static uint32_t audio_owner;
+
+/* Release the PCM stream if `id` owns it. Called from sched_exit so an abnormal
+ * exit (crash/kill) frees the stream instead of leaking the latch + running DMA. */
+void audio_task_exiting(uint32_t id)
+{
+	if (audio_be == 0 || audio_owner != id) return;
+	if (audio_be == 1)      hda_stream_close();
+	else if (audio_be == 2) sb16_stream_close();
+	audio_be = 0;
+	audio_owner = 0;
+}
 
 void syscall_dispatch(struct registers *r)
 {
@@ -340,17 +383,18 @@ void syscall_dispatch(struct registers *r)
 		r->eax = (uint32_t)sched_fork(r);   /* child pid to parent, 0 to child */
 		break;
 	case SYS_WAITPID:
-		r->eax = (uint32_t)sched_waitpid((int)r->ebx);
+		/* edx & WNOHANG -> non-blocking reap: return 1 reaped / 0 none, exit status
+		 * via *ecx. Otherwise block and return the child's exit status directly. */
+		if ((int)r->edx & WNOHANG) {
+			int status = 0;
+			int got = sched_try_reap((int)r->ebx, &status);
+			if (got && r->ecx && user_range(r->ecx, 4))
+				*(int *)r->ecx = status;
+			r->eax = (uint32_t)got;
+		} else {
+			r->eax = (uint32_t)sched_waitpid((int)r->ebx);
+		}
 		break;
-	case SYS_WAITPID_NB: {
-		/* Non-blocking reap: status via *ecx (if given), returns 1 reaped / 0 none. */
-		int status = 0;
-		int got = sched_try_reap((int)r->ebx, &status);
-		if (got && r->ecx && user_range(r->ecx, 4))
-			*(int *)r->ecx = status;
-		r->eax = (uint32_t)got;
-		break;
-	}
 	case SYS_PIPE: {
 		if (!user_range(r->ebx, 8)) {
 			r->eax = (uint32_t)-1;
@@ -479,12 +523,22 @@ void syscall_dispatch(struct registers *r)
 		struct fd *f = &sched_fds()[fd];
 		if (f->type == FD_CONSOLE) {
 			/* Block for the first key (interrupts on so the timer/keyboard
-			 * keep firing), then drain whatever else is buffered. */
+			 * keep firing), then drain whatever else is buffered. A pending
+			 * signal breaks the wait with EINTR; keep sti;hlt (context_switch
+			 * doesn't restore EFLAGS, so a bare hlt could halt forever). */
 			char c;
+			int got = 0;
 			__asm__ volatile ("sti");
-			while (!keyboard_poll(&c, 0))
+			while (!(got = keyboard_poll(&c, 0))) {
+				if (sched_intr_pending())
+					break;
 				__asm__ volatile ("hlt");
+			}
 			__asm__ volatile ("cli");
+			if (!got) {
+				r->eax = (uint32_t)-1;      /* interrupted before any input (EINTR) */
+				break;
+			}
 			uint32_t n = 0;
 			buf[n++] = c;
 			while (n < len && keyboard_poll(&c, 0))
@@ -499,17 +553,11 @@ void syscall_dispatch(struct registers *r)
 		}
 		break;
 	}
-	case SYS_UPTIME:
-		r->eax = timer_seconds();
-		break;
 	case SYS_MSEC:
 		r->eax = timer_us() / 1000u;   /* ms since boot (wraps ~49.7 days) */
 		break;
 	case SYS_GETUID:
 		r->eax = sched_uid();          /* per-process credentials (see sched.c) */
-		break;
-	case SYS_GETGID:
-		r->eax = sched_gid();
 		break;
 	case SYS_PORT_OPEN: {
 		const char *name = (const char *)r->ebx;
@@ -550,9 +598,9 @@ void syscall_dispatch(struct registers *r)
 		break;
 	}
 	case SYS_READFILE: {
-		const char *name = (const char *)r->ebx;
+		char name[SYS_PATH_MAX];
 		uint32_t buf = r->ecx, max = r->edx;
-		if (!user_range(r->ebx, 24) || !user_range(buf, max)) {
+		if (copy_user_str(r->ebx, name, sizeof name) != 0 || !user_range(buf, max)) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
@@ -560,9 +608,9 @@ void syscall_dispatch(struct registers *r)
 		break;
 	}
 	case SYS_WRITEFILE: {
-		const char *name = (const char *)r->ebx;
+		char name[SYS_PATH_MAX];
 		uint32_t buf = r->ecx, len = r->edx;
-		if (!user_range(r->ebx, 24) || !user_range(buf, len)) {
+		if (copy_user_str(r->ebx, name, sizeof name) != 0 || !user_range(buf, len)) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
@@ -585,8 +633,8 @@ void syscall_dispatch(struct registers *r)
 	 * user buffer (a browser download). Mirrors fs_stream_* one-to-one; owofs
 	 * allows a single open stream at a time. */
 	case SYS_STREAM_BEGIN: {
-		const char *name = (const char *)r->ebx;
-		if (!user_range(r->ebx, 24)) {
+		char name[SYS_PATH_MAX];
+		if (copy_user_str(r->ebx, name, sizeof name) != 0) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
@@ -608,6 +656,11 @@ void syscall_dispatch(struct registers *r)
 		r->eax = (uint32_t)fs_stream_end();
 		break;
 	case SYS_NET_CONNECT: {
+		if ((int)r->edx == SK_RAWETH) {   /* raw L2 socket: no host, root-only */
+			r->eax = sched_uid() != 0 ? (uint32_t)-1
+			                          : (uint32_t)net_sock_connect(0, 0, SK_RAWETH);
+			break;
+		}
 		/* Copy the host string out of user memory, bounded. */
 		if (!user_range(r->ebx, 1)) {
 			r->eax = (uint32_t)-1;
@@ -630,42 +683,69 @@ void syscall_dispatch(struct registers *r)
 		break;
 	}
 	case SYS_NET_SEND: {
-		uint32_t len = r->edx;
-		if (len == 0 || !user_range(r->ecx, len)) {
+		/* ebx -> {int fd, const void *buf, u32 len, u32 flags, const u8 *ip[4]|0,
+		 * int port}: ip non-NULL selects sendto (datagram to ip:port), else a
+		 * connected/stream send. */
+		if (!user_range(r->ebx, 24)) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
-		r->eax = (uint32_t)net_sock_send((int)r->ebx,
-		                                 (const void *)r->ecx, len);
+		const uint32_t *a = (const uint32_t *)r->ebx;
+		uint32_t fd = a[0], bp = a[1], len = a[2], ipp = a[4], port = a[5];
+		if (len == 0 || !user_range(bp, len) || (ipp && !user_range(ipp, 4))) {
+			r->eax = (uint32_t)-1;
+			break;
+		}
+		if (ipp) {
+			uint8_t ip[4];
+			for (int i = 0; i < 4; i++) ip[i] = ((const uint8_t *)ipp)[i];
+			r->eax = (uint32_t)net_sock_sendto((int)fd, ip, (int)port,
+			                                   (const void *)bp, len);
+		} else {
+			r->eax = (uint32_t)net_sock_send((int)fd, (const void *)bp, len);
+		}
 		break;
 	}
 	case SYS_NET_RECV: {
-		uint32_t max = r->edx;
-		if (max == 0 || !user_range(r->ecx, max)) {
+		/* ebx -> {int fd, void *buf, u32 max, u32 flags, u8 *ip[4]|0, int *port|0}:
+		 * ip/port non-NULL fills the datagram source; else flags&MSG_DONTWAIT
+		 * selects a non-blocking recv. */
+		if (!user_range(r->ebx, 24)) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
-		r->eax = (uint32_t)net_sock_recv((int)r->ebx, (void *)r->ecx, max);
-		break;
-	}
-	case SYS_NET_RECV_NB: {
-		uint32_t max = r->edx;
-		if (max == 0 || !user_range(r->ecx, max)) {
+		const uint32_t *a = (const uint32_t *)r->ebx;
+		uint32_t fd = a[0], bp = a[1], max = a[2], flags = a[3], ipp = a[4], portp = a[5];
+		if (max == 0 || !user_range(bp, max) ||
+		    (ipp && !user_range(ipp, 4)) || (portp && !user_range(portp, 4))) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
-		r->eax = (uint32_t)net_sock_recv_nb((int)r->ebx, (void *)r->ecx, max);
+		int n;
+		if (ipp || portp) {
+			uint8_t ip[4];
+			uint16_t port = 0;
+			n = net_sock_recvfrom((int)fd, (void *)bp, max, ipp ? ip : 0, &port);
+			if (n > 0) {
+				if (ipp)
+					for (int i = 0; i < 4; i++) ((uint8_t *)ipp)[i] = ip[i];
+				if (portp)
+					*(int *)portp = port;
+			}
+		} else if (flags & MSG_DONTWAIT) {
+			n = net_sock_recv_nb((int)fd, (void *)bp, max);
+		} else {
+			n = net_sock_recv((int)fd, (void *)bp, max);
+		}
+		r->eax = (uint32_t)n;
 		break;
 	}
 	case SYS_NET_CLOSE:
 		r->eax = (uint32_t)net_sock_close((int)r->ebx);
 		break;
-	case SYS_NET_SET_TTL:
-		r->eax = (uint32_t)net_sock_set_ttl((int)r->ebx, (int)r->ecx);
-		break;
-	case SYS_NET_RAW_OPEN:                     /* AF_PACKET analog: root-only */
-		r->eax = sched_uid() != 0 ? (uint32_t)-1
-		                          : (uint32_t)net_raw_open();
+	case SYS_NET_SETOPT:                       /* ebx=fd, ecx=opt, edx=val */
+		r->eax = (uint32_t)((int)r->ecx == NET_OPT_TTL
+		                    ? net_sock_set_ttl((int)r->ebx, (int)r->edx) : -1);
 		break;
 	case SYS_IFCONFIG: {                       /* set kernel IPv4 config: root-only */
 		/* ebx -> ip[4]; ecx -> {mask[4], gw[4], dns[4]} (12 bytes). */
@@ -698,58 +778,29 @@ void syscall_dispatch(struct registers *r)
 		break;
 	}
 	case SYS_NET_LISTEN:
-		r->eax = (uint32_t)net_sock_listen((int)r->ebx);
+		/* A well-known port (<1024) may only be claimed by root, as on Unix. */
+		if ((int)r->ebx < 1024 && sched_uid() != 0)
+			r->eax = (uint32_t)-1;
+		else
+			r->eax = (uint32_t)net_sock_listen((int)r->ebx);
 		break;
 	case SYS_NET_ACCEPT:
 		r->eax = (uint32_t)net_sock_accept((int)r->ebx);
 		break;
 	case SYS_NET_BIND:
-		r->eax = (uint32_t)net_sock_bind((int)r->ebx);
+		if ((int)r->ebx < 1024 && sched_uid() != 0)
+			r->eax = (uint32_t)-1;
+		else
+			r->eax = (uint32_t)net_sock_bind((int)r->ebx);
 		break;
-	case SYS_NET_RECVFROM: {
-		/* ebx -> {int fd, void *buf, u32 max, u8 *ip[4], int *port}: recv one
-		 * datagram, then copy the sender's IP/port out to the user pointers. */
-		if (!user_range(r->ebx, 20)) {
+	case SYS_GETRANDOM: {
+		uint32_t buf = r->ebx, len = r->ecx;
+		if (len == 0 || len > 256 || !user_range(buf, len)) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
-		const uint32_t *a = (const uint32_t *)r->ebx;
-		uint32_t max = a[2], bp = a[1], ipp = a[3], portp = a[4];
-		if (max == 0 || !user_range(bp, max) ||
-		    (ipp && !user_range(ipp, 4)) ||
-		    (portp && !user_range(portp, 4))) {
-			r->eax = (uint32_t)-1;
-			break;
-		}
-		uint8_t ip[4];
-		uint16_t port = 0;
-		int n = net_sock_recvfrom((int)a[0], (void *)bp, max,
-		                          ipp ? ip : NULL, &port);
-		if (n > 0) {
-			if (ipp)
-				for (int i = 0; i < 4; i++) ((uint8_t *)ipp)[i] = ip[i];
-			if (portp)
-				*(int *)portp = port;
-		}
-		r->eax = (uint32_t)n;
-		break;
-	}
-	case SYS_NET_SENDTO: {
-		/* ebx -> {int fd, const u8 ip[4], int port, const void *buf, u32 len}. */
-		if (!user_range(r->ebx, 20)) {
-			r->eax = (uint32_t)-1;
-			break;
-		}
-		const uint32_t *a = (const uint32_t *)r->ebx;
-		uint32_t ipp = a[1], len = a[4], bp = a[3];
-		if (len == 0 || !user_range(bp, len) || !user_range(ipp, 4)) {
-			r->eax = (uint32_t)-1;
-			break;
-		}
-		uint8_t ip[4];
-		for (int i = 0; i < 4; i++) ip[i] = ((const uint8_t *)ipp)[i];
-		r->eax = (uint32_t)net_sock_sendto((int)a[0], ip, (int)a[2],
-		                                   (const void *)bp, len);
+		entropy_get((void *)buf, len);
+		r->eax = len;
 		break;
 	}
 	case SYS_WIN_CREATE: {
@@ -771,32 +822,27 @@ void syscall_dispatch(struct registers *r)
 	case SYS_WIN_PRESENT:
 		r->eax = (uint32_t)uwin_present((int)r->ebx);
 		break;
-	case SYS_WIN_POLL:
-		if (!user_range(r->ecx, sizeof(struct win_event))) {
+	case SYS_WIN_POLL: {
+		/* ecx -> win_event (or 0 to just wait); edx = block flag. Poll one event if a
+		 * buffer was given; if none and block is set, sleep ~one frame. The int 0x80
+		 * gate runs IF=0, so sti before timer_sleep or a bare hlt wedges the CPU
+		 * (the timer couldn't wake it). */
+		struct win_event *ev = (struct win_event *)r->ecx;
+		if (ev && !user_range(r->ecx, sizeof(struct win_event))) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
-		r->eax = (uint32_t)uwin_poll((int)r->ebx,
-		                             (struct win_event *)r->ecx);
+		int got = ev ? uwin_poll((int)r->ebx, ev) : 0;
+		if (!got && (int)r->edx) {
+			__asm__ volatile ("sti");
+			timer_sleep(15);
+		}
+		r->eax = (uint32_t)got;
 		break;
-	case SYS_WIN_WAIT:
-		/* The int 0x80 gate runs with IF=0; timer_sleep() halts on a bare hlt,
-		 * which would wedge the CPU forever (the timer couldn't wake it). Enable
-		 * interrupts first so the tick fires, other tasks (the WM!) run, and the
-		 * sleep returns. */
-		__asm__ volatile ("sti");
-		timer_sleep(15);           /* sleep ~one frame; events poll after */
-		r->eax = 0;
-		break;
+	}
 	case SYS_WIN_CLOSE:
 		r->eax = (uint32_t)uwin_close((int)r->ebx);
 		break;
-	case SYS_RTC: {
-		struct rtc_time t;
-		rtc_now(&t);
-		r->eax = ((uint32_t)t.hour << 16) | ((uint32_t)t.min << 8) | t.sec;
-		break;
-	}
 	case SYS_RTC_EPOCH:
 		r->eax = rtc_epoch();                      /* Unix epoch seconds (UTC) */
 		break;
@@ -862,6 +908,12 @@ void syscall_dispatch(struct registers *r)
 		break;
 	case SYS_WIN_CURSOR:
 		r->eax = (uint32_t)uwin_set_cursor((int)r->ebx, (int)r->ecx);
+		break;
+	case SYS_WIN_SET_PARENT:
+		r->eax = (uint32_t)uwin_set_parent((int)r->ebx, (int)r->ecx, (int)r->edx);
+		break;
+	case SYS_WIN_FB:
+		r->eax = uwin_fb_vaddr((int)r->ebx);
 		break;
 	case SYS_READFILE_AT: {
 		/* ebx -> {name, offset, buf, len}. Copy the name in with a per-byte
@@ -973,34 +1025,35 @@ void syscall_dispatch(struct registers *r)
 	/* Filesystem management for a shell. Each joins a relative name onto
 	 * the caller's cwd (like readfile/writefile) before hitting owofs. */
 	case SYS_MKDIR: {
-		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
-		char abs[SYS_PATH_MAX];
-		join_cwd((const char *)r->ebx, abs, sizeof abs);
+		char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
+		if (copy_user_str(r->ebx, name, sizeof name) != 0) { r->eax = (uint32_t)-1; break; }
+		join_cwd(name, abs, sizeof abs);
 		r->eax = (uint32_t)fs_mkdir(abs);
 		break;
 	}
 	case SYS_RMDIR: {
-		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
-		char abs[SYS_PATH_MAX];
-		join_cwd((const char *)r->ebx, abs, sizeof abs);
+		char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
+		if (copy_user_str(r->ebx, name, sizeof name) != 0) { r->eax = (uint32_t)-1; break; }
+		join_cwd(name, abs, sizeof abs);
 		r->eax = (uint32_t)fs_rmdir(abs);
 		break;
 	}
 	case SYS_DELETE: {
-		if (!user_range(r->ebx, 1)) { r->eax = (uint32_t)-1; break; }
-		char abs[SYS_PATH_MAX];
-		join_cwd((const char *)r->ebx, abs, sizeof abs);
+		char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
+		if (copy_user_str(r->ebx, name, sizeof name) != 0) { r->eax = (uint32_t)-1; break; }
+		join_cwd(name, abs, sizeof abs);
 		r->eax = (uint32_t)fs_delete(abs);
 		break;
 	}
 	case SYS_RENAME: {
-		if (!user_range(r->ebx, 1) || !user_range(r->ecx, 1)) {
+		char na[SYS_PATH_MAX], nb[SYS_PATH_MAX], a[SYS_PATH_MAX], b[SYS_PATH_MAX];
+		if (copy_user_str(r->ebx, na, sizeof na) != 0 ||
+		    copy_user_str(r->ecx, nb, sizeof nb) != 0) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
-		char a[SYS_PATH_MAX], b[SYS_PATH_MAX];
-		join_cwd((const char *)r->ebx, a, sizeof a);
-		join_cwd((const char *)r->ecx, b, sizeof b);
+		join_cwd(na, a, sizeof a);
+		join_cwd(nb, b, sizeof b);
 		r->eax = (uint32_t)fs_rename(a, b);
 		break;
 	}
@@ -1232,6 +1285,9 @@ void syscall_dispatch(struct registers *r)
 	case SYS_GETPID:
 		r->eax = sched_current_id();
 		break;
+	case SYS_WIN_OWNS:
+		r->eax = (uint32_t)uwin_pid_has_window((uint32_t)r->ebx);
+		break;
 	case SYS_SIGACTION: {
 		struct k_sigaction kact, kold;
 		const struct k_sigaction *ap = 0;
@@ -1240,11 +1296,12 @@ void syscall_dispatch(struct registers *r)
 			kact = *(const struct k_sigaction *)r->ecx;
 			ap = &kact;
 		}
+		/* Validate the oldact output pointer BEFORE mutating the disposition, so a
+		 * bogus oldact can't leave the handler installed while reporting failure. */
+		if (r->edx && !user_range(r->edx, sizeof kold)) { r->eax = (uint32_t)-1; break; }
 		int rc = sched_sigaction((int)r->ebx, ap, r->edx ? &kold : 0);
-		if (rc == 0 && r->edx) {
-			if (!user_range(r->edx, sizeof kold)) { r->eax = (uint32_t)-1; break; }
+		if (rc == 0 && r->edx)
 			*(struct k_sigaction *)r->edx = kold;
-		}
 		r->eax = (uint32_t)rc;
 		break;
 	}
@@ -1258,12 +1315,13 @@ void syscall_dispatch(struct registers *r)
 		break;
 	case SYS_STAT: {
 		struct st_out { int is_dir; uint32_t size; uint32_t mtime; } *o;
-		if (!user_range(r->ebx, 1) || !user_range(r->ecx, sizeof *o)) {
+		char name[SYS_PATH_MAX];
+		if (copy_user_str(r->ebx, name, sizeof name) != 0 || !user_range(r->ecx, sizeof *o)) {
 			r->eax = (uint32_t)-1;
 			break;
 		}
 		char abs[SYS_PATH_MAX];
-		join_cwd((const char *)r->ebx, abs, sizeof abs);
+		join_cwd(name, abs, sizeof abs);
 		int isd = 0;
 		uint32_t sz = 0, mt = 0;
 		int rc = fs_stat(abs, &isd, &sz, &mt);
@@ -1293,19 +1351,51 @@ void syscall_dispatch(struct registers *r)
 		break;
 	}
 
+	case SYS_UNAME: {
+		/* struct utsname (mirror in owos.h): five fixed 65-byte fields. The
+		 * kernel owns everything but nodename, which libc adds from the
+		 * hostname; `machine` is authoritative here — a 32-bit user program
+		 * can't tell the kernel's arch from its own ELF class. */
+		struct k_utsname {
+			char sysname[65], nodename[65], release[65], version[65], machine[65];
+		} *o;
+		if (!user_range(r->ebx, sizeof *o)) { r->eax = (uint32_t)-1; break; }
+		o = (struct k_utsname *)r->ebx;
+		memset(o, 0, sizeof *o);
+		strlcpy(o->sysname, "OwOS", sizeof o->sysname);
+		strlcpy(o->release, OWOS_VERSION, sizeof o->release);
+		strlcpy(o->version, OWOS_VERSION, sizeof o->version);
+#if defined(__x86_64__)
+		strlcpy(o->machine, "x86_64", sizeof o->machine);
+#elif defined(__aarch64__)
+		strlcpy(o->machine, "aarch64", sizeof o->machine);
+#elif defined(__arm__)
+		strlcpy(o->machine, "arm", sizeof o->machine);
+#else
+		strlcpy(o->machine, "i386", sizeof o->machine);
+#endif
+		r->eax = 0;
+		break;
+	}
+
 
 	/* Streaming audio: /bin/play resamples a WAV to 48 kHz/S16/stereo in user space
 	 * and pushes it here in bounded chunks. One stream at a time (like the file
 	 * stream); the chosen back end is latched at open. */
 	case SYS_AUDIO_OPEN:
+		/* One stream system-wide: refuse if another live task already owns it. The
+		 * current owner may re-open (the close+reopen just resets its DMA). */
+		if (audio_be != 0 && audio_owner != sched_current_id()) { r->eax = (uint32_t)-1; break; }
 		if (hda_present())       audio_be = (hda_stream_open()  == 0) ? 1 : 0;
 		else if (sb16_present()) audio_be = (sb16_stream_open() == 0) ? 2 : 0;
 		else                     audio_be = 0;
+		audio_owner = audio_be ? sched_current_id() : 0;
 		r->eax = audio_be ? 0 : (uint32_t)-1;
 		break;
 	case SYS_AUDIO_WRITE: {
 		uint32_t buf = r->ebx, len = r->ecx;
 		if (len == 0 || !user_range(buf, len)) { r->eax = (uint32_t)-1; break; }
+		if (audio_be == 0 || audio_owner != sched_current_id()) { r->eax = (uint32_t)-1; break; }
 		__asm__ volatile ("sti");          /* back-pressure waits need the tick */
 		if (audio_be == 1)      r->eax = (uint32_t)hda_stream_write((const void *)buf, len);
 		else if (audio_be == 2) r->eax = (uint32_t)sb16_stream_write((const void *)buf, len);
@@ -1313,10 +1403,14 @@ void syscall_dispatch(struct registers *r)
 		break;
 	}
 	case SYS_AUDIO_CLOSE:
+		/* Only the owner tears the stream down; a stray close from any other task
+		 * is a harmless no-op rather than yanking someone else's playback. */
+		if (audio_be == 0 || audio_owner != sched_current_id()) { r->eax = 0; break; }
 		__asm__ volatile ("sti");
 		if (audio_be == 1)      hda_stream_close();
 		else if (audio_be == 2) sb16_stream_close();
 		audio_be = 0;
+		audio_owner = 0;
 		r->eax = 0;
 		break;
 
@@ -1398,6 +1492,13 @@ void syscall_dispatch(struct registers *r)
 			o->keys[nk].mods = 0;
 			nk++;
 		}
+		/* Print Screen is latched the same way (the IRQ can't touch the
+		 * framebuffer); hand it to the compositor as KEY_PRTSC to capture. */
+		if (nk < INPUT_KEYS && keyboard_take_screenshot()) {
+			o->keys[nk].c = KEY_PRTSC;
+			o->keys[nk].mods = 0;
+			nk++;
+		}
 		o->nkeys = nk;
 		r->eax = 0;
 		#undef INPUT_KEYS
@@ -1410,6 +1511,7 @@ void syscall_dispatch(struct registers *r)
 		break;
 	case SYS_WIN_ENUM: {
 		int max = (int)r->ecx;
+		if (max > 4096) max = 4096;    /* cap so the size math can't overflow */
 		if (sched_uid() != 0 || max <= 0 ||
 		    !user_range(r->ebx, (uint32_t)max * sizeof(struct winrec))) {
 			r->eax = (uint32_t)-1;
@@ -1462,16 +1564,13 @@ void syscall_dispatch(struct registers *r)
 		r->eax = (uint32_t)uwin_deliver((int)r->ebx, &ev);
 		break;
 	}
-	case SYS_WIN_SET_FOCUS:
-		if (sched_uid() != 0) { r->eax = (uint32_t)-1; break; }
-		r->eax = (uint32_t)uwin_set_focus((int)r->ebx);
-		break;
 	case SYS_WIN_KEY_SPACE:
 		if (sched_uid() != 0) { r->eax = (uint32_t)-1; break; }
 		r->eax = (uint32_t)uwin_key_space((int)r->ebx);
 		break;
 	case SYS_CRASH_POLL: {
 		int max = (int)r->ecx;
+		if (max > 4096) max = 4096;    /* cap so the size math can't overflow */
 		if (sched_uid() != 0 || max <= 0 ||
 		    !user_range(r->ebx, (uint32_t)max * sizeof(struct crash_rec))) {
 			r->eax = (uint32_t)-1;

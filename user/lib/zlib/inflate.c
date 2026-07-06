@@ -7,6 +7,7 @@
  * scales with the body size — only the window and a small flush buffer.
  */
 #include "inflate.h"
+#include "owos.h"           /* malloc/free — per-call state, so decodes are reentrant */
 #include <stdint.h>
 
 #define MAXBITS   15
@@ -46,8 +47,6 @@ struct state {
 	uint8_t  ob[OUTBUF];      /* pending output, flushed to wr() in batches     */
 	uint32_t obn;
 };
-
-static struct state S;        /* single static instance (not reentrant)        */
 
 struct huff {
 	short count[MAXBITS + 1];
@@ -94,7 +93,7 @@ static void emit(struct state *s, uint8_t b)
 	s->win[s->total & WINMASK] = b;
 	s->total++;
 	s->ob[s->obn++] = b;
-	if (s->obn == OUTBUF)
+	if (s->obn >= OUTBUF)
 		flush(s);
 }
 
@@ -258,15 +257,8 @@ static int dynamic_tables(struct state *s, struct huff *lit, struct huff *dist)
 
 /* ---- top level --------------------------------------------------------- */
 
-int inflate_stream(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
+static int inflate_run(struct state *s)
 {
-	struct state *s = &S;
-	s->rd = rd; s->rctx = rctx;
-	s->wr = wr; s->wctx = wctx;
-	s->bitbuf = 0; s->bitcnt = 0;
-	s->err = 0; s->stop = 0;
-	s->total = 0; s->obn = 0;
-
 	int last;
 	do {
 		last = get_bit(s);
@@ -291,6 +283,24 @@ int inflate_stream(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
 
 	flush(s);
 	return s->err ? -1 : 0;
+}
+
+int inflate_stream(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
+{
+	/* Per-call state (~37 KiB: window + flush buffer) so concurrent decodes on
+	 * separate threads — e.g. the browser's per-image workers — never share the
+	 * window or the output cursor. */
+	struct state *s = malloc(sizeof *s);
+	if (!s) return -1;
+	s->rd = rd; s->rctx = rctx;
+	s->wr = wr; s->wctx = wctx;
+	s->bitbuf = 0; s->bitcnt = 0;
+	s->err = 0; s->stop = 0;
+	s->total = 0; s->obn = 0;
+
+	int rc = inflate_run(s);
+	free(s);
+	return rc;
 }
 
 /* Read exactly one byte or flag EOF. */
@@ -347,8 +357,10 @@ int inflate_http(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
 		return inflate_stream(rd, rctx, wr, wctx);
 	}
 
-	/* Raw DEFLATE: replay the two peeked bytes, then the rest of the stream. */
-	static struct prefix_rd pr;
+	/* Raw DEFLATE: replay the two peeked bytes, then the rest of the stream.
+	 * Local (not static): prefix_reader only runs synchronously below, and a
+	 * shared static would corrupt a concurrent decode. */
+	struct prefix_rd pr;
 	pr.rd = rd; pr.ctx = rctx; pr.pre[0] = b0; pr.pre[1] = b1; pr.n = 0;
 	return inflate_stream(prefix_reader, &pr, wr, wctx);
 }

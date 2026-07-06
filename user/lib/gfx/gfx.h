@@ -11,6 +11,9 @@
 #define GFX_TRANSPARENT 0x01000000u
 
 void gfx_init(unsigned *fb, int w, int h);
+/* Read back the current surface (buffer + dimensions), so a helper that borrows
+ * gfx for its own window (e.g. a modal dialog) can gfx_init back to it after. */
+void gfx_get(unsigned **fb, int *w, int *h);
 void gfx_clear(unsigned color);
 /* Confine all subsequent primitives to a rectangle (intersected with the buffer),
  * or gfx_clip_none() to restore the full buffer. A compositor uses this to repaint

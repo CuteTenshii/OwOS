@@ -118,12 +118,13 @@ int color_parse_a(const char *v, int *alpha)
 		v++;
 		int d[8], n = 0;
 		while (n < 8 && hexnib(v[n]) >= 0) { d[n] = hexnib(v[n]); n++; }
-		if (n >= 8) { if (alpha) *alpha = d[6] * 16 + d[7];
+		/* Only the standard 3/4/6/8-nibble forms; 5 or 7 nibbles is invalid CSS. */
+		if (n == 8) { if (alpha) *alpha = d[6] * 16 + d[7];
 		              return (d[0]*16+d[1]) << 16 | (d[2]*16+d[3]) << 8 | (d[4]*16+d[5]); }
-		if (n >= 6) return (d[0]*16+d[1]) << 16 | (d[2]*16+d[3]) << 8 | (d[4]*16+d[5]);
-		if (n >= 4) { if (alpha) *alpha = d[3] * 17;
+		if (n == 6) return (d[0]*16+d[1]) << 16 | (d[2]*16+d[3]) << 8 | (d[4]*16+d[5]);
+		if (n == 4) { if (alpha) *alpha = d[3] * 17;
 		              return (d[0]*17) << 16 | (d[1]*17) << 8 | (d[2]*17); }
-		if (n >= 3) return (d[0]*17) << 16 | (d[1]*17) << 8 | (d[2]*17);
+		if (n == 3) return (d[0]*17) << 16 | (d[1]*17) << 8 | (d[2]*17);
 		return -1;
 	}
 

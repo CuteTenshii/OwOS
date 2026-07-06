@@ -63,6 +63,14 @@ static const struct { uint16_t w, h; } fb_modes[] = {
  * a per-channel scale when the back buffer is copied to the visible screen. */
 static int       brightness = FB_BRIGHT_MAX;
 
+/* Compositor frame-pacing target (Hz) — the desktop's software present cadence,
+ * NOT a hardware mode. Settings writes it via /sys/class/graphics/fb0/rate and
+ * /bin/compositor polls it to pace its loop. The panel's real refresh caps the
+ * useful upper end but isn't enforced here (Settings offers the sensible list). */
+#define FB_HZ_MIN 20
+#define FB_HZ_MAX 240
+static int       target_hz = 60;
+
 /* Scale a back-buffer pixel by the current brightness. FB_BRIGHT_MAX is 8, so
  * the divide is a >>3 the compiler can fold; callers skip this entirely at full
  * brightness (the common case) to keep the per-frame copy a plain memory move. */
@@ -490,6 +498,14 @@ void fb_dims(int *w, int *h, int *pitch, int *bpp)
 	if (h)     *h     = (int)fb_h;
 	if (pitch) *pitch = (int)fb_pitch;    /* pixels per row (stride) */
 	if (bpp)   *bpp   = 32;
+}
+
+int  fb_target_hz(void) { return target_hz; }
+void fb_set_target_hz(int hz)
+{
+	if (hz < FB_HZ_MIN) hz = FB_HZ_MIN;
+	if (hz > FB_HZ_MAX) hz = FB_HZ_MAX;
+	target_hz = hz;
 }
 
 /* Flush just [x,y,w,h) of the back buffer to VRAM, reusing fb_present's device

@@ -15,6 +15,8 @@
 #define NULL ((void *)0)
 #endif
 
+#include "bigint.h"             /* the bignum behind the JV_BIGINT primitive    */
+
 struct js_node;                 /* ast.h — function bodies are AST nodes        */
 typedef struct js_ctx js_ctx;   /* interp.h — the engine context                */
 
@@ -22,7 +24,7 @@ typedef struct js_object js_object;
 typedef struct js_string js_string;
 typedef struct js_env    js_env;
 
-typedef enum { JV_UNDEF, JV_NULL, JV_BOOL, JV_NUM, JV_STR, JV_OBJ, JV_SYMBOL } js_type;
+typedef enum { JV_UNDEF, JV_NULL, JV_BOOL, JV_NUM, JV_STR, JV_OBJ, JV_SYMBOL, JV_BIGINT } js_type;
 
 typedef struct {
     js_type type;
@@ -35,7 +37,7 @@ typedef struct {
 } js_value;
 
 /* object "kind" — refines a js_object */
-enum { OBJ_PLAIN, OBJ_ARRAY, OBJ_FUNCTION, OBJ_ERROR, OBJ_SYMBOL, OBJ_ARRAYBUFFER, OBJ_TYPEDARRAY };
+enum { OBJ_PLAIN, OBJ_ARRAY, OBJ_FUNCTION, OBJ_ERROR, OBJ_SYMBOL, OBJ_ARRAYBUFFER, OBJ_TYPEDARRAY, OBJ_BIGINT, OBJ_PROXY };
 
 /* typed-array element kinds (index into ta_elem_size). DataView uses type -1. */
 enum { TA_I8, TA_U8, TA_U8C, TA_I16, TA_U16, TA_I32, TA_U32, TA_F32, TA_F64 };
@@ -61,6 +63,12 @@ typedef struct {
 typedef struct {
     pentry  *e;                 /* malloc'd, insertion-ordered                   */
     int      n, cap;
+    /* Optional open-addressing hash index over `e`, built lazily once the map
+     * grows past a small threshold so tiny scopes/objects (the common case) pay
+     * nothing. Buckets hold (entry index + 1); 0 means empty. Lookups fall back
+     * to a linear scan of `e` while idx is NULL. */
+    int     *idx;
+    int      idxcap;            /* bucket count (power of two), 0 = no index      */
 } pmap;
 
 struct js_string {
@@ -107,8 +115,11 @@ struct js_env {
     unsigned char is_fn_scope;  /* target scope for `var` hoisting                */
 };
 
-/* GC object kinds passed to gc_alloc */
-enum { GCK_OBJECT, GCK_STRING, GCK_ENV };
+/* GC object kinds passed to gc_alloc. GCK_ARRAY is traced/finalized exactly like
+ * GCK_OBJECT (it is a js_object), but the collector treats it as the "rescan kind":
+ * an old array's dense `elems` are re-scanned every minor GC, so element stores
+ * (scattered across the Array builtins) need no write barrier. */
+enum { GCK_OBJECT, GCK_STRING, GCK_ENV, GCK_ARRAY };
 
 /* ---- construction ------------------------------------------------------- */
 
@@ -120,6 +131,10 @@ js_value   js_bool(int b);
 js_value   js_number(double n);
 js_value   js_mk_string(js_ctx *ctx, const char *s, int len);  /* copies bytes  */
 js_value   js_mk_cstring(js_ctx *ctx, const char *s);          /* strlen-sized   */
+
+/* the JV_BIGINT primitive: wrap a bignum (ownership transfers), or read it back */
+js_value   js_mk_bigint(js_ctx *ctx, bigint *b);
+bigint    *js_bigint_of(js_value v);
 
 js_object *js_new_object(js_ctx *ctx, js_object *proto);
 js_object *js_new_array(js_ctx *ctx, unsigned len);
@@ -145,10 +160,24 @@ js_object *js_env_get_home(js_env *e);                  /* nearest [[HomeObject]
 /* ---- predicates --------------------------------------------------------- */
 
 static inline int js_is_undef(js_value v) { return v.type == JV_UNDEF; }
+int js_proxy_callable(js_object *o);   /* a proxy is callable iff its target is */
 static inline int js_is_null(js_value v)  { return v.type == JV_NULL; }
 static inline int js_is_object(js_value v){ return v.type == JV_OBJ; }
-static inline int js_is_callable(js_value v) { return v.type == JV_OBJ && v.u.obj->kind == OBJ_FUNCTION; }
+static inline int js_is_callable(js_value v) { return v.type == JV_OBJ && (v.u.obj->kind == OBJ_FUNCTION || (v.u.obj->kind == OBJ_PROXY && js_proxy_callable(v.u.obj))); }
 static inline int js_is_array(js_value v) { return v.type == JV_OBJ && v.u.obj->kind == OBJ_ARRAY; }
+
+/* Proxy dispatch — traps in the handler, falling back to the target. Internals
+ * live in own props @t (target) / @h (handler), read via direct pmap lookup so
+ * dispatch never recurses through js_get on the proxy itself. */
+int      js_is_proxy(js_object *o);
+js_value js_proxy_get(js_ctx *ctx, js_object *p, const char *key, js_value receiver);
+void     js_proxy_set(js_ctx *ctx, js_object *p, const char *key, js_value val, js_value receiver);
+int      js_proxy_has(js_ctx *ctx, js_object *p, const char *key);
+int      js_proxy_delete(js_ctx *ctx, js_object *p, const char *key);
+js_value js_proxy_apply(js_ctx *ctx, js_object *p, js_value thisv, js_value *args, int argc);
+js_value js_proxy_construct(js_ctx *ctx, js_object *p, js_value *args, int argc);
+js_object *js_proxy_ownkeys_target(js_object *p);   /* target for enumeration fallbacks */
+js_value   js_proxy_ownkeys(js_ctx *ctx, js_object *p);   /* string keys (ownKeys trap or target) */
 
 /* ---- properties --------------------------------------------------------- */
 
@@ -162,6 +191,7 @@ void     js_def_accessor(js_object *o, const char *key, js_object *get, js_objec
 int      js_has_own(js_object *o, const char *key);
 int      js_delete(js_object *o, const char *key);
 pentry  *pmap_find_pub(js_object *o, const char *key);   /* own property entry, or NULL */
+int      pmap_index(pmap *m, const char *key);           /* entry index, or -1 (ident cache) */
 
 /* indexed access (arrays + string chars + generic) */
 js_value js_get_index(js_ctx *ctx, js_value obj, unsigned i);

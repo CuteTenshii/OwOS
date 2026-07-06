@@ -45,6 +45,21 @@ void *gc_alloc(unsigned size, int kind);
  * tracer; do not pass interior or non-GC pointers). */
 void gc_mark(void *obj);
 
+/* Generational write barrier. Call AFTER storing a GC pointer into `container`
+ * (an object returned by gc_alloc). It records old->young edges so a minor
+ * collection — which does not trace the old generation — still keeps a young
+ * object reachable only from an old one. Cheap: a no-op unless `container` is old.
+ * Stores into a freshly allocated (young) container need no barrier, but calling
+ * it there is harmless. Containers of the "rescan kind" (see below) are exempt —
+ * they are scanned wholesale every minor collection instead. */
+void gc_write_barrier(void *container);
+
+/* Register one object kind whose instances, once old, are re-scanned in full on
+ * every minor collection instead of relying on the write barrier. Use it for a
+ * kind whose GC pointers are stored through many scattered call sites (e.g. a
+ * dense array's elements), where a per-store barrier would be error-prone. */
+void gc_set_rescan_kind(int kind);
+
 /* Roots. */
 void gc_add_root(void **slot);
 void gc_remove_root(void **slot);
@@ -65,6 +80,19 @@ unsigned gc_collect(void);
 
 /* Live payload bytes currently tracked. */
 unsigned gc_bytes(void);
+
+/* Cumulative collector statistics (for profiling). */
+typedef struct {
+	unsigned long collections;   /* gc_collect() calls                          */
+	unsigned long marked;        /* objects blackened (traced) across all cycles */
+	unsigned long swept;         /* all-objects-list nodes visited in sweep      */
+	unsigned long freed;         /* objects reclaimed                            */
+	unsigned long minors;        /* minor (young-only) collections               */
+	unsigned long majors;        /* major (full) collections                     */
+	double        ms;            /* wall-clock spent collecting (profiling)      */
+	double        max_ms;        /* longest single collection (pause time)       */
+} gc_stats_t;
+void gc_get_stats(gc_stats_t *out);
 /* Collect automatically once this many bytes have been allocated since the last
  * collection. The collector also raises this adaptively to ~2x the live set. */
 void gc_set_threshold(unsigned bytes);

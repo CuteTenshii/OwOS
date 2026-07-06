@@ -58,6 +58,8 @@ int main(int argc, char **argv)
 	const char *method = "GET";
 	const char *outname = 0;
 	const char *url = 0;
+	const char *user_agent = 0;            /* -A: overrides the default UA           */
+	int         ua_in_headers = 0;         /* set if a -H line already gives one      */
 	char xhdr[2048]; int xhlen = 0;        /* -H request headers ("name: value\r\n"…) */
 
 	for (int i = 1; i < argc; i++) {
@@ -67,8 +69,11 @@ int main(int argc, char **argv)
 		else if (streq(a, "--http3") || streq(a, "-3")) http3 = 1;
 		else if (streq(a, "-X") && i + 1 < argc) method = argv[++i];
 		else if (streq(a, "-o") && i + 1 < argc) outname = argv[++i];
+		else if ((streq(a, "-A") || streq(a, "--user-agent")) && i + 1 < argc)
+			user_agent = argv[++i];
 		else if (streq(a, "-H") && i + 1 < argc) {
 			const char *h = argv[++i];
+			if (starts_ci(h, "user-agent:")) ua_in_headers = 1;
 			for (int k = 0; h[k] && xhlen < (int)sizeof xhdr - 3; k++)
 				xhdr[xhlen++] = h[k];
 			xhdr[xhlen++] = '\r'; xhdr[xhlen++] = '\n';
@@ -78,8 +83,21 @@ int main(int argc, char **argv)
 	}
 
 	if (!url) {
-		puts("usage: curl [-i] [--http2] [--http3|-3] [-X method] [-H \"Name: value\"] [-o file] <url>\n");
+		puts("usage: curl [-i] [--http2] [--http3|-3] [-X method] [-A ua] "
+		     "[-H \"Name: value\"] [-o file] <url>\n");
 		return 1;
+	}
+
+	/* The User-Agent is the tool's to send, not libcurl's (as on a real system):
+	 * add "-A" if given, else a default — unless a -H line already carries one. */
+	if (!ua_in_headers) {
+		const char *ua = user_agent ? user_agent : "owos-curl/1.0";
+		for (const char *s = "User-Agent: "; *s && xhlen < (int)sizeof xhdr - 3; s++)
+			xhdr[xhlen++] = *s;
+		for (const char *s = ua; *s && xhlen < (int)sizeof xhdr - 3; s++)
+			xhdr[xhlen++] = *s;
+		xhdr[xhlen++] = '\r'; xhdr[xhlen++] = '\n';
+		xhdr[xhlen] = '\0';
 	}
 
 	char hdr[4096];

@@ -44,6 +44,14 @@ static unsigned find_table(const unsigned char *d, int len, const char *tag)
 	return 0;
 }
 
+/* True if reading `need` bytes starting at table offset `off` stays inside the
+ * SFNT. All table offsets come straight from the (untrusted) directory, so every
+ * fixed-field read below is gated through this. */
+static int off_ok(unsigned off, int need, int len)
+{
+	return off <= (unsigned)len && (unsigned)len - off >= (unsigned)need;
+}
+
 /* Pick the most useful cmap subtable: Windows-Unicode-full (3,10), Windows-BMP
  * (3,1), Unicode (0,*), then symbol (3,0). Stores its offset + format. */
 static void pick_cmap(struct font *f)
@@ -106,6 +114,13 @@ struct font *font_load(const unsigned char *data, int len)
 	f->glyf = find_table(data, len, "glyf");
 	if (!f->head || !f->maxp || !f->hhea || !f->hmtx || !f->loca || !f->glyf) { free(f->owned); free(f); return 0; }
 
+	/* The directory offsets are untrusted: reject any that puts a fixed field we
+	 * read below (or a table base) outside the file before dereferencing. */
+	if (!off_ok(f->head, 54, len) || !off_ok(f->maxp, 6, len) || !off_ok(f->hhea, 36, len) ||
+	    f->hmtx > (unsigned)len || f->loca > (unsigned)len || f->glyf > (unsigned)len) {
+		free(f->owned); free(f); return 0;
+	}
+
 	f->upem    = (int)rd16(data + f->head + 18);
 	f->loc_long = rds16(data + f->head + 50);
 	if (f->upem <= 0) f->upem = 1000;
@@ -126,14 +141,17 @@ int font_glyph_index(const struct font *f, int cp)
 {
 	if (!f || !f->cmap_sub || cp < 0) return 0;
 	const unsigned char *t = f->d + f->cmap_sub;
+	const unsigned char *end = f->d + f->len;
 
 	if (f->cmap_fmt == 4) {
+		if (t + 14 > end) return 0;
 		int segX2 = (int)rd16(t + 6);
 		int segc = segX2 / 2;
 		const unsigned char *endC = t + 14;
 		const unsigned char *startC = endC + segX2 + 2;
 		const unsigned char *idD = startC + segX2;
 		const unsigned char *idR = idD + segX2;
+		if (segc <= 0 || idR + segX2 > end) return 0;   /* all four segment arrays must fit */
 		for (int s = 0; s < segc; s++) {
 			int end = (int)rd16(endC + s * 2);
 			if (cp > end) continue;
@@ -150,9 +168,11 @@ int font_glyph_index(const struct font *f, int cp)
 		return 0;
 	}
 	if (f->cmap_fmt == 12) {
+		if (t + 16 > end) return 0;
 		unsigned ng = rd32(t + 12);
 		const unsigned char *g = t + 16;
 		for (unsigned i = 0; i < ng; i++, g += 12) {
+			if (g + 12 > end) return 0;
 			unsigned s = rd32(g), e = rd32(g + 4);
 			if ((unsigned)cp < s) return 0;
 			if ((unsigned)cp <= e) return rd32(g + 8) + ((unsigned)cp - s);
@@ -160,12 +180,15 @@ int font_glyph_index(const struct font *f, int cp)
 		return 0;
 	}
 	if (f->cmap_fmt == 6) {
+		if (t + 10 > end) return 0;
 		int first = (int)rd16(t + 6), count = (int)rd16(t + 8);
 		if (cp < first || cp >= first + count) return 0;
+		if (t + 10 + (cp - first) * 2 + 2 > end) return 0;
 		return (int)rd16(t + 10 + (cp - first) * 2);
 	}
 	if (f->cmap_fmt == 0) {
 		if (cp < 0 || cp > 255) return 0;
+		if (t + 6 + cp + 1 > end) return 0;
 		return t[6 + cp];
 	}
 	return 0;
@@ -177,6 +200,7 @@ static int glyph_advance_units(const struct font *f, int gi)
 	if (gi < 0) return 0;
 	int idx = gi < f->n_hmetrics ? gi : f->n_hmetrics - 1;
 	if (idx < 0) return 0;
+	if (!off_ok(f->hmtx, idx * 4 + 2, f->len)) return 0;
 	return (int)rd16(f->d + f->hmtx + idx * 4);
 }
 
@@ -186,7 +210,8 @@ void font_glyph_hmetrics(const struct font *f, int gi, float px, int *advance, i
 	if (advance) *advance = (int)(glyph_advance_units(f, gi) * s + 0.5f);
 	if (lsb) {
 		int idx = gi < f->n_hmetrics ? gi : -1;
-		*lsb = idx >= 0 ? (int)(rds16(f->d + f->hmtx + idx * 4 + 2) * s) : 0;
+		*lsb = (idx >= 0 && off_ok(f->hmtx, idx * 4 + 4, f->len))
+		       ? (int)(rds16(f->d + f->hmtx + idx * 4 + 2) * s) : 0;
 	}
 }
 
@@ -265,7 +290,7 @@ static void load_simple(const struct font *f, const unsigned char *g, int glen,
 	if (nc > 256) { ce_heap = malloc((unsigned)nc * sizeof(int)); if (!ce_heap) return; ce = ce_heap; }
 	for (int i = 0; i < nc; i++) ce[i] = (int)rd16(p + i * 2);
 	p += nc * 2;
-	int insLen = (int)rd16(p); p += 2 + insLen;
+	int insLen = (p + 2 <= f->d + f->len) ? (int)rd16(p) : 0; p += 2 + insLen;
 
 	unsigned char *flags = malloc((unsigned)npts);
 	float *xs = malloc((unsigned)npts * sizeof(float));
@@ -352,16 +377,21 @@ static void load_composite(const struct font *f, const unsigned char *g, int gle
 		int flags = (int)rd16(p); int cgi = (int)rd16(p + 2); p += 4;
 		float dx, dy;
 		if (flags & 0x0001) {                 /* ARG_1_AND_2_ARE_WORDS */
+			if (p + 4 > end) break;
 			dx = (float)rds16(p); dy = (float)rds16(p + 2); p += 4;
 		} else {
+			if (p + 2 > end) break;
 			dx = (float)(signed char)p[0]; dy = (float)(signed char)p[1]; p += 2;
 		}
 		float a = 1, b = 0, c = 0, d = 1;
 		if (flags & 0x0008) {                 /* WE_HAVE_A_SCALE */
+			if (p + 2 > end) break;
 			a = d = rds16(p) / 16384.0f; p += 2;
 		} else if (flags & 0x0040) {          /* X_AND_Y_SCALE */
+			if (p + 4 > end) break;
 			a = rds16(p) / 16384.0f; d = rds16(p + 2) / 16384.0f; p += 4;
 		} else if (flags & 0x0080) {          /* 2x2 */
+			if (p + 8 > end) break;
 			a = rds16(p) / 16384.0f; b = rds16(p + 2) / 16384.0f;
 			c = rds16(p + 4) / 16384.0f; d = rds16(p + 6) / 16384.0f; p += 8;
 		}
@@ -384,16 +414,21 @@ static void load_glyph(const struct font *f, int gi, struct ras *r, struct xf m,
 	if (depth > 5 || gi < 0 || gi >= f->num_glyphs) return;
 	unsigned o0, o1;
 	if (f->loc_long) {
+		if (!off_ok(f->loca, gi * 4 + 8, f->len)) return;
 		o0 = rd32(f->d + f->loca + gi * 4);
 		o1 = rd32(f->d + f->loca + gi * 4 + 4);
 	} else {
+		if (!off_ok(f->loca, gi * 2 + 4, f->len)) return;
 		o0 = (unsigned)rd16(f->d + f->loca + gi * 2) * 2;
 		o1 = (unsigned)rd16(f->d + f->loca + gi * 2 + 2) * 2;
 	}
 	if (o1 <= o0) return;                       /* empty glyph (e.g. space) */
+	/* [o0,o1) is relative to the glyf table; require it to lie within glyf..EOF so
+	 * the record pointer + length can't run past the buffer (or overflow). */
+	if (o1 > (unsigned)f->len - f->glyf) return;
 	const unsigned char *g = f->d + f->glyf + o0;
 	int glen = (int)(o1 - o0);
-	if (g + 10 > f->d + f->len) return;
+	if (glen < 10) return;
 	int nc = rds16(g);
 	if (nc >= 0) load_simple(f, g, glen, r, m);
 	else         load_composite(f, g, glen, r, m, depth);
@@ -443,8 +478,9 @@ unsigned char *font_render_glyph(const struct font *f, int gi, float px,
 		r.py[i] = (-r.py[i] * scale - y0) * SS;
 	}
 
-	/* scanline nonzero fill */
-	static float xs[1024]; static int wd[1024];
+	/* scanline nonzero fill (locals, not static: the browser rasterizes glyphs
+	 * from multiple worker threads and must not share scanline scratch) */
+	float xs[1024]; int wd[1024];
 	for (int y = 0; y < dh; y++) {
 		float yc = y + 0.5f; int nx = 0;
 		for (int s = 0; s < r.ns && nx < 1024; s++) {

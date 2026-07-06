@@ -151,6 +151,7 @@ static int dns_lookup(const char *host, const unsigned char ns[4], unsigned char
 		for (unsigned i = 0; i < an && pos + 10 <= rn; i++) {
 			int l = name_len(r, pos, rn); if (!l) break;
 			pos += l;
+			if (pos + 10 > rn) break;             /* RR header follows the name */
 			int type  = (int)be16(r + pos);
 			int rdlen = (int)be16(r + pos + 8);
 			pos += 10;

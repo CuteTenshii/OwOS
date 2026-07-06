@@ -361,7 +361,7 @@ static int hpack_decode(struct h2_conn *c, const unsigned char *b, int len, stru
 			hs_emit(s, nm, nl, vl, vlen);
 		} else if (ch & 0x20) {                    /* dynamic table size update */
 			long m = dec_int(b, &pos, len, 5);
-			if (m < 0)
+			if (m < 0 || m > 4096)     /* never advertised a table larger than the default */
 				return -1;
 			dt_setmax(c, (unsigned)m);
 		} else {                                   /* literal, no indexing */
@@ -416,8 +416,9 @@ static int enc_str(unsigned char *o, const char *s)
 }
 
 /* Build the request header block: method/scheme indexed where possible, path
- * and authority as no-index literals on their static names, plus user-agent and
- * accept. No-index keeps unique values (the path) out of the server's table. */
+ * and authority as no-index literals on their static names, then the caller's
+ * user-agent (if any) and extra_headers. No-index keeps unique values (the path)
+ * out of the server's table. */
 /* Connection-specific (and pseudo-) headers that HTTP/2 forbids in a normal
  * field block (RFC 7540 §8.1.2.2) — skipped if a caller's extra_headers list
  * them, so a stray "Connection: close" can't make the request malformed. */
@@ -433,7 +434,7 @@ static int build_request(unsigned char *hb, int https, const char *method,
                          const struct h2_opts *opts)
 {
 	int n = 0;
-	const char *ua = (opts && opts->user_agent) ? opts->user_agent : "owos-curl";
+	const char *ua = (opts && opts->user_agent) ? opts->user_agent : 0;
 
 	if (streq(method, "GET"))       hb[n++] = 0x82;   /* :method GET  (idx 2) */
 	else if (streq(method, "POST")) hb[n++] = 0x83;   /* :method POST (idx 3) */
@@ -445,8 +446,10 @@ static int build_request(unsigned char *hb, int https, const char *method,
 	else { hb[n++] = 0x04; n += enc_str(hb + n, path); }    /* no-index idx 4 */
 
 	hb[n++] = 0x01; n += enc_str(hb + n, authority);  /* :authority (no-index)*/
-	hb[n++] = 0x0f; hb[n++] = 43;                     /* user-agent (idx 58)  */
-	n += enc_str(hb + n, ua);
+	if (ua) {                                         /* user-agent (idx 58)  */
+		hb[n++] = 0x0f; hb[n++] = 43;
+		n += enc_str(hb + n, ua);
+	}
 
 	if (opts && opts->extra_headers) {
 		/* Each "name: value" line becomes a literal-without-indexing header with
@@ -592,12 +595,13 @@ static int collect_header_block(struct h2_conn *c, struct frd *r, const unsigned
 	if (frag < 0 || frag > FRAMECAP)
 		return -2;
 	memcpy(c->hblock, firstpay + start, frag);
-	int o = frag, flags = firstflags;
+	int o = frag, flags = firstflags, conts = 0;
 	while (!(flags & FL_END_HEADERS)) {
 		int t, fl, pl; unsigned sid;
 		int rc = read_frame(r, &t, &fl, &sid, c->framebuf, &pl);
 		if (rc < 0) return rc;
 		if (t != F_CONT) return -2;
+		if (++conts > 64) return -2;   /* CONTINUATION flood: END_HEADERS never arrives */
 		if (o + pl > FRAMECAP) return -2;
 		memcpy(c->hblock + o, c->framebuf, pl);
 		o += pl; flags = fl;
@@ -762,6 +766,17 @@ int h2_run_body(netconn *conn, int scheme_https, const char *authority,
 					if (flags & FL_END_STREAM) done = 1;
 					break;
 				}
+				/* A 1xx interim response (e.g. 103 Early Hints) precedes the final
+				 * one: hand it to the caller, reset the sink, and keep reading so the
+				 * next HEADERS block decodes clean. */
+				if (hs.status >= 100 && hs.status < 200) {
+					if (opts && opts->on_headers && hs.buf && hs.cap > 0) {
+						hs.buf[hs.len < hs.cap ? hs.len : hs.cap - 1] = '\0';
+						opts->on_headers(ctx, hs.buf, hs.len);
+					}
+					hs.len = 0; hs.status = 0;
+					break;
+				}
 				headers_done = 1;
 				/* Hand the decoded header block to the caller before any DATA,
 				 * so it can pick a body sink (browser: render vs download). */
@@ -822,7 +837,7 @@ out:
 	if (rc == HTTP_ENORESP && headers_done && hs.status > 0)
 		rc = hs.status;
 	if (hdr && hdrcap > 0) {
-		if (hs.len < hdrcap - 1) {              /* terminate the header block */
+		if (hs.len + 2 < hdrcap) {              /* room for CRLF *and* the NUL */
 			hdr[hs.len++] = '\r'; hdr[hs.len++] = '\n';
 		}
 		hdr[hs.len] = '\0';

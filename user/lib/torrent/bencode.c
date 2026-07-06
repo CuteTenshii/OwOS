@@ -43,16 +43,25 @@ static int parse_value(struct bencode *b, uint32_t *pos, int depth)
 		if (*pos < b->srclen && b->src[*pos] == '-') { neg = 1; (*pos)++; }
 		if (*pos >= b->srclen || b->src[*pos] < '0' || b->src[*pos] > '9')
 			return -1;                          /* need at least one digit */
-		int64_t v = 0;
+		uint64_t v = 0; int nd = 0;
 		while (*pos < b->srclen && b->src[*pos] >= '0' && b->src[*pos] <= '9') {
-			v = v * 10 + (b->src[*pos] - '0');
+			if (++nd > 19) return -1;           /* longer than any int64: reject */
+			v = v * 10 + (uint64_t)(b->src[*pos] - '0');   /* ≤19 digits < 10^19 < 2^64: no overflow */
 			(*pos)++;
 		}
 		if (*pos >= b->srclen || b->src[*pos] != 'e')
 			return -1;
 		(*pos)++;
+		/* A 19-digit value can still exceed the int64 range (e.g. i9999999999999999999e);
+		 * reject rather than invoke signed-overflow UB in the final store. */
+		if (neg) {
+			if (v > (uint64_t)INT64_MAX + 1) return -1;
+			b->nodes[idx].ival = (v == (uint64_t)INT64_MAX + 1) ? INT64_MIN : -(int64_t)v;
+		} else {
+			if (v > (uint64_t)INT64_MAX) return -1;
+			b->nodes[idx].ival = (int64_t)v;
+		}
 		b->nodes[idx].type = BEN_INT;
-		b->nodes[idx].ival = neg ? -v : v;
 
 	} else if (c >= '0' && c <= '9') {              /* <len>:<bytes>          */
 		uint32_t len = 0;

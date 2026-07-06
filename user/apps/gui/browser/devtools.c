@@ -15,6 +15,13 @@
  * buffers. The main thread only reads the prepared snapshots and draws them. */
 #include "browser.h"
 #include "css.h"
+#include "color.h"    /* color_parse: %c styling maps CSS colours to console spans */
+
+/* The in-band `%c` style markers the JS engine embeds in console output. Kept in
+ * sync with JS_STYLE_ON/OFF in user/lib/js/interp.h (that header pulls the whole
+ * engine type graph, so it isn't included here). */
+#define CON_STYLE_ON  0x01
+#define CON_STYLE_OFF 0x02
 #include "layout.h"   /* struct lbox: computed box geometry for the Styles box model */
 
 /* --- the snapshot/console interlock (worker writes, main reads) ------------ */
@@ -34,7 +41,17 @@ static int dt_open;
 static int dt_tab;
 static int dt_scroll[N_TABS];
 static volatile int dt_dirty;       /* main asks the worker to rebuild snapshots  */
-static unsigned dt_seen_seq;        /* last B->seq the snapshot was built for      */
+/* A devtools-local change that repaints ONLY the dock, not the whole page: a logged
+ * network request or console line. The dock is an opaque right-side split, so
+ * redrawing just its region is a correct frame — a chatty page logging hundreds of
+ * requests would otherwise re-lay-out and re-paint the entire page per entry (via
+ * B->seq++), which is the lag. Set on the worker/fetch threads, drained each frame
+ * by the main render loop (devtools_take_paint). */
+static volatile int dt_paint_only;
+static unsigned dt_seen_mut;        /* last dom_mutation_seq the snapshot was built for */
+static unsigned dt_seen_layout;     /* last B->layout_seq (reflow generation)           */
+static unsigned dt_seen_app_sig;    /* last cookie/HSTS jar signature (app tab)          */
+static struct dom_node *dt_seen_root; /* live root the snapshot was built for (see gate) */
 
 #define DT_HDR   22                 /* tab-strip height at the panel top           */
 /* A code view is monospace: rows use the fixed cell font via gfx_text_utf8, which
@@ -82,7 +99,8 @@ static int dt_pick_reveal;               /* worker: scroll Elements to the new s
 /* Collapsed subtrees, keyed by pre-order node index (stable while the tree is). A
  * collapsed node renders as "<tag…>…</tag>" on one line; the Elements walk still
  * advances the index through its hidden descendants so click->node mapping holds.
- * Global (not per-tab): cleared whenever the page capture resets. */
+ * Per-tab: swapped with the tab's frozen capture in cap_swap (pre-order indices are
+ * page-specific), and cleared whenever the page capture resets. */
 static int *dt_collapsed, dt_collapsed_n, dt_collapsed_cap;
 static int is_collapsed(int idx)
 {
@@ -167,8 +185,13 @@ static int tb_line(const struct textblk *t, int i, char *out, int max)
  * bytes between newlines (console.log sends a whole line, but write() chunks are
  * not guaranteed to land on a boundary). */
 #define CON_MAX 400
-struct conline { char *text; unsigned char level; };
+/* A `%c` style span: from byte `off` in the line's (marker-stripped) text, apply
+ * these overrides until the next run. Parsed out of the JS_STYLE_ON/OFF markers
+ * the engine embeds (see interp.h) when con_push stores the line. */
+struct crun { int off; unsigned fg, bg; unsigned char has_fg, has_bg, bold; };
+struct conline { char *text; unsigned char level; struct crun *runs; int nruns; };
 static struct conline con[CON_MAX];
+static void con_free_runs(int slot);
 static int con_start, con_count;
 static char *con_pend; static int con_pend_len, con_pend_cap;
 static int con_pend_level;
@@ -189,7 +212,7 @@ static int con_visible_count(void)
 static void con_clear(void)
 {
 	dt_lock();
-	for (int i = 0; i < con_count; i++) { int s = (con_start + i) % CON_MAX; free(con[s].text); con[s].text = 0; }
+	for (int i = 0; i < con_count; i++) { int s = (con_start + i) % CON_MAX; free(con[s].text); con[s].text = 0; con_free_runs(s); }
 	con_start = con_count = 0;
 	free(con_pend); con_pend = 0; con_pend_len = con_pend_cap = 0;
 	con_follow = 1;
@@ -243,26 +266,111 @@ static void dt_hist_recall(int dir)
 	textfield_set(&dt_input_tf, p >= dt_hist_cnt ? "" : dt_hist[p]);
 }
 
+/* Parse one `%c` CSS block into the overrides of `r` (its off is preset). Only
+ * the properties the console can actually render: color, background-color and a
+ * bold/normal font-weight. An empty block leaves `r` a plain reset run. */
+static void con_style_parse(struct crun *r, const char *css, int n)
+{
+	int i = 0;
+	while (i < n) {
+		int ns = i; while (i < n && css[i] != ':') i++;
+		int ne = i; if (i < n) i++;                    /* skip ':' */
+		int vs = i; while (i < n && css[i] != ';') i++;
+		int ve = i; if (i < n) i++;                    /* skip ';' */
+		while (ns < ne && (css[ns] == ' ' || css[ns] == '\t')) ns++;
+		while (ne > ns && (css[ne - 1] == ' ' || css[ne - 1] == '\t')) ne--;
+		while (vs < ve && (css[vs] == ' ' || css[vs] == '\t')) vs++;
+		while (ve > vs && (css[ve - 1] == ' ' || css[ve - 1] == '\t')) ve--;
+		if (ne <= ns || ve <= vs) continue;
+		char name[24], val[80];
+		int nl = ne - ns; if (nl > (int)sizeof name - 1) nl = (int)sizeof name - 1;
+		for (int k = 0; k < nl; k++) name[k] = lower(css[ns + k]); name[nl] = '\0';
+		int vl = ve - vs; if (vl > (int)sizeof val - 1) vl = (int)sizeof val - 1;
+		memcpy(val, css + vs, (unsigned)vl); val[vl] = '\0';
+		if (streq(name, "color")) { int c = color_parse(val); if (c >= 0) { r->fg = (unsigned)c; r->has_fg = 1; } }
+		else if (streq(name, "background-color") || streq(name, "background")) { int c = color_parse(val); if (c >= 0) { r->bg = (unsigned)c; r->has_bg = 1; } }
+		else if (streq(name, "font-weight")) {
+			if (starts_ci(val, "bold")) r->bold = 1;
+			else { int w = 0, k = 0; while (val[k] >= '0' && val[k] <= '9') w = w * 10 + (val[k++] - '0'); if (w >= 600) r->bold = 1; }
+		}
+	}
+}
+
+static void con_free_runs(int slot) { free(con[slot].runs); con[slot].runs = 0; con[slot].nruns = 0; }
+
+/* Store one console line: strip the in-band %c markers into plain display text,
+ * recording each style directive as a run keyed by its offset in that text. */
 static void con_push(int level, const char *s, int len)
 {
 	char *dup = malloc((unsigned)len + 1);
 	if (!dup) return;
-	memcpy(dup, s, (unsigned)len); dup[len] = '\0';
+	struct crun *runs = 0;
+	int nruns = 0, cap = 0, dn = 0, i = 0;
+	while (i < len) {
+		if (s[i] == CON_STYLE_ON) {
+			int j = i + 1;
+			while (j < len && s[j] != CON_STYLE_OFF) j++;   /* css payload is [i+1, j) */
+			if (nruns == cap) {
+				int nc = cap ? cap * 2 : 4;
+				struct crun *nr = realloc(runs, (unsigned)nc * sizeof *nr);
+				if (nr) { runs = nr; cap = nc; }
+			}
+			if (nruns < cap) {
+				struct crun *r = &runs[nruns++];
+				r->off = dn; r->fg = r->bg = 0; r->has_fg = r->has_bg = r->bold = 0;
+				con_style_parse(r, s + i + 1, j - (i + 1));
+			}
+			i = j < len ? j + 1 : j;                        /* skip the closing marker */
+		} else {
+			dup[dn++] = s[i++];
+		}
+	}
+	dup[dn] = '\0';
 	int slot;
 	if (con_count < CON_MAX) {
 		slot = (con_start + con_count) % CON_MAX;
 		con_count++;
 	} else {                                        /* full: drop the oldest */
 		slot = con_start;
-		free(con[slot].text);
+		free(con[slot].text); con_free_runs(slot);
 		con_start = (con_start + 1) % CON_MAX;
 	}
 	con[slot].text = dup; con[slot].level = (unsigned char)level;
+	con[slot].runs = runs; con[slot].nruns = nruns;
+}
+
+/* Draw the wrapped row s[off,end) at (x,y) applying %c style runs: each run
+ * overrides colour/background/weight from its offset onward; the default fg (the
+ * level colour) fills gaps a run leaves unset. Bold is faked by a 1px overstrike
+ * (the monospace face has no bold cut). Runs are in ascending-offset order. */
+static void con_draw_runs(int x, int y, const char *s, int off, int end,
+                          unsigned deffg, const struct crun *runs, int nruns)
+{
+	char buf[256];
+	int p = off;
+	while (p < end) {
+		const struct crun *r = 0;
+		for (int k = 0; k < nruns; k++) { if (runs[k].off <= p) r = &runs[k]; else break; }
+		int seg = end;
+		for (int k = 0; k < nruns; k++) if (runs[k].off > p && runs[k].off < seg) seg = runs[k].off;
+		int n = 0;
+		for (int q = p; q < seg && n < (int)sizeof buf - 1; q++) buf[n++] = s[q];
+		buf[n] = '\0';
+		unsigned fg = (r && r->has_fg) ? r->fg : deffg;
+		if (r && r->has_bg) gfx_fill_rect(x, y, n * GLYPH_W, ROW_H, r->bg);
+		int nx = gfx_text_utf8(x, y, buf, fg, GFX_TRANSPARENT);
+		if (r && r->bold) gfx_text_utf8(x + 1, y, buf, fg, GFX_TRANSPARENT);
+		x = nx;
+		p = seg;
+	}
 }
 
 void devtools_console_append(int level, const char *s, int len)
 {
-	if (!dt_open) return;                            /* don't capture while the panel is closed */
+	/* Capture into the ring even while the panel is closed: errors thrown during
+	 * page load (before the user opens devtools) would otherwise be lost, leaving
+	 * an empty console. The ring is a bounded static, so this can't grow unbounded;
+	 * only the repaint is gated on the panel being open. */
 	dt_lock();
 	for (int i = 0; i < len; i++) {
 		char c = s[i];
@@ -282,7 +390,7 @@ void devtools_console_append(int level, const char *s, int len)
 	}
 	con_follow = 1;                                 /* a new line: jump to the bottom    */
 	dt_unlock();
-	if (dt_open) B->seq++;                           /* repaint the console panel         */
+	if (dt_open && dt_tab == TAB_CONSOLE) dt_paint_only = 1;   /* repaint only if visible */
 }
 
 /* --- network ring ---------------------------------------------------------- *
@@ -290,20 +398,26 @@ void devtools_console_append(int level, const char *s, int len)
  * paths on the worker / image-fetch threads), reset on each top-level navigation
  * (devtools_net_reset). Same circular-buffer shape as the console. */
 #define NET_MAX 256
+/* A conline `level` used only by net rows for the dim NET_PENDING colour — never a
+ * console level (those are DT_LOG/WARN/ERROR), so the console filter is unaffected. */
+#define DT_NET_PENDING_LVL 3
 static struct conline net[NET_MAX];
 static int net_start, net_count;
 /* Structured request fields, parallel to net[] (same slot/start/count), backing
  * the click-to-expand detail view. The summary string in net[] drives the list;
  * these drive the detail panel. url is heap (full, untruncated). */
-struct netinfo { int status, size, ms; char method[8]; char ctype[80]; char *url; char *resp_hdr; };
+struct netinfo { int id, state, status, size, ms; char method[8]; char ctype[80];
+                 char err[64]; char *url; char *resp_hdr; };
 static struct netinfo netinfo[NET_MAX];
 static int dt_net_sel = -1;             /* logical index of the expanded request, -1 none */
+static int net_next_id = 1;             /* monotonic id: the begin -> update handshake key */
 
 static void netinfo_clear(struct netinfo *ni)
 {
 	free(ni->url); ni->url = 0;
 	free(ni->resp_hdr); ni->resp_hdr = 0;
-	ni->status = ni->size = ni->ms = 0; ni->method[0] = '\0'; ni->ctype[0] = '\0';
+	ni->id = ni->state = ni->status = ni->size = ni->ms = 0;
+	ni->method[0] = ni->ctype[0] = ni->err[0] = '\0';
 }
 
 /* Heap-dup a possibly-NULL string (the borrowed net_log fields), or NULL. */
@@ -314,25 +428,6 @@ static char *dt_strdup(const char *s)
 	char *d = malloc((unsigned)n + 1);
 	if (d) memcpy(d, s, (unsigned)n + 1);
 	return d;
-}
-
-static void net_push(int level, const char *s, int len, const struct net_log *e)
-{
-	char *dup = malloc((unsigned)len + 1);
-	if (!dup) return;
-	memcpy(dup, s, (unsigned)len); dup[len] = '\0';
-	int slot;
-	if (net_count < NET_MAX) { slot = (net_start + net_count) % NET_MAX; net_count++; }
-	else { slot = net_start; free(net[slot].text); netinfo_clear(&netinfo[slot]); net_start = (net_start + 1) % NET_MAX; }
-	net[slot].text = dup; net[slot].level = (unsigned char)level;
-
-	struct netinfo *ni = &netinfo[slot];
-	netinfo_clear(ni);
-	ni->status = e->status; ni->size = e->size; ni->ms = e->ms;
-	{ int k = 0; sapp(ni->method, &k, sizeof ni->method, e->method ? e->method : "GET"); }
-	{ int k = 0; sapp(ni->ctype, &k, sizeof ni->ctype, e->ctype ? e->ctype : ""); }
-	ni->url = dt_strdup(e->url);
-	ni->resp_hdr = dt_strdup(e->resp_hdr);
 }
 
 void devtools_net_reset(void)
@@ -356,27 +451,138 @@ static void net_putsize(char *b, int *n, int cap, int size)
 	sapp(b, n, cap, " "); sapp(b, n, cap, suf);
 }
 
-void devtools_net_add(const struct net_log *e)
+/* One-line list summary for a request in state e->state. */
+static void net_line(char *buf, int cap, int *np, const struct net_log *e)
+{
+	int n = 0;
+	const char *method = e->method ? e->method : "GET";
+	if (e->state == NET_PENDING) {
+		sapp(buf, &n, cap, "...  "); sapp(buf, &n, cap, method);
+		sapp(buf, &n, cap, "  "); sapp(buf, &n, cap, e->url ? e->url : "");
+		*np = n; return;
+	}
+	if (e->state == NET_CANCELLED || e->state == NET_FAILED) {
+		sapp(buf, &n, cap, e->state == NET_CANCELLED ? "(cancelled)  " : "(failed)  ");
+		sapp(buf, &n, cap, method);
+		sapp(buf, &n, cap, "  "); sapp(buf, &n, cap, e->url ? e->url : "");
+		if (e->state == NET_FAILED && e->reason && e->reason[0]) {
+			sapp(buf, &n, cap, "  - "); sapp(buf, &n, cap, e->reason);
+		}
+		*np = n; return;
+	}
+	if (e->status > 0) uapp(buf, &n, cap, (unsigned)e->status);
+	else               sapp(buf, &n, cap, "ERR");
+	sapp(buf, &n, cap, "  "); sapp(buf, &n, cap, method);
+	sapp(buf, &n, cap, "  "); net_putsize(buf, &n, cap, e->size);
+	if (e->ms > 0) { sapp(buf, &n, cap, "  "); uapp(buf, &n, cap, (unsigned)e->ms); sapp(buf, &n, cap, " ms"); }
+	sapp(buf, &n, cap, "  "); sapp(buf, &n, cap, e->url ? e->url : "");
+	if (e->ctype && e->ctype[0]) { sapp(buf, &n, cap, "  ["); sapp(buf, &n, cap, e->ctype); sapp(buf, &n, cap, "]"); }
+	*np = n;
+}
+
+/* Colour bucket (a conline level) for a request in state e->state. */
+static int net_level(const struct net_log *e)
+{
+	switch (e->state) {
+	case NET_PENDING:   return DT_NET_PENDING_LVL;
+	case NET_FAILED:    return DT_ERROR;
+	case NET_CANCELLED: return DT_WARN;
+	default: return (e->status == 0 || e->status >= 400) ? DT_ERROR
+	              : (e->status >= 300)                    ? DT_WARN : DT_LOG;
+	}
+}
+
+/* (Re)write ring slot `slot` — its list line + structured detail — from e, freeing
+ * any prior heap strings. The slot's id is preserved (begin assigns it once; update
+ * keeps it), so a pending row resolves in place. Caller holds dt_lock. */
+static void net_fill(int slot, const struct net_log *e)
 {
 	char buf[URL_MAX + 200]; int n = 0;
-	if (e->status > 0) uapp(buf, &n, sizeof buf, (unsigned)e->status);
-	else               sapp(buf, &n, sizeof buf, "ERR");
-	sapp(buf, &n, sizeof buf, "  ");
-	sapp(buf, &n, sizeof buf, e->method ? e->method : "GET");
-	sapp(buf, &n, sizeof buf, "  ");
-	net_putsize(buf, &n, sizeof buf, e->size);
-	if (e->ms > 0) { sapp(buf, &n, sizeof buf, "  "); uapp(buf, &n, sizeof buf, (unsigned)e->ms); sapp(buf, &n, sizeof buf, " ms"); }
-	sapp(buf, &n, sizeof buf, "  ");
-	sapp(buf, &n, sizeof buf, e->url ? e->url : "");
-	if (e->ctype && e->ctype[0]) { sapp(buf, &n, sizeof buf, "  ["); sapp(buf, &n, sizeof buf, e->ctype); sapp(buf, &n, sizeof buf, "]"); }
+	net_line(buf, sizeof buf, &n, e);
+	char *dup = malloc((unsigned)n + 1);
+	if (dup) { memcpy(dup, buf, (unsigned)n); dup[n] = '\0'; }
+	free(net[slot].text); net[slot].text = dup;
+	net[slot].level = (unsigned char)net_level(e);
 
-	if (!dt_open) return;                            /* don't capture while the panel is closed */
-	int level = (e->status == 0 || e->status >= 400) ? DT_ERROR
-	          : (e->status >= 300)                   ? DT_WARN : DT_LOG;
+	struct netinfo *ni = &netinfo[slot];
+	int id = ni->id;
+	netinfo_clear(ni);
+	ni->id = id;
+	ni->state = e->state;
+	ni->status = e->status; ni->size = e->size; ni->ms = e->ms;
+	{ int k = 0; sapp(ni->method, &k, sizeof ni->method, e->method ? e->method : "GET"); }
+	{ int k = 0; sapp(ni->ctype, &k, sizeof ni->ctype, e->ctype ? e->ctype : ""); }
+	if (e->reason) { int k = 0; sapp(ni->err, &k, sizeof ni->err, e->reason); }
+	ni->url = dt_strdup(e->url);
+	ni->resp_hdr = dt_strdup(e->resp_hdr);
+}
+
+/* Reserve the next ring slot, evicting the oldest when full. Caller holds dt_lock. */
+static int net_alloc_slot(void)
+{
+	int slot;
+	if (net_count < NET_MAX) { slot = (net_start + net_count) % NET_MAX; net_count++; }
+	else {
+		slot = net_start; free(net[slot].text); net[slot].text = 0; netinfo_clear(&netinfo[slot]);
+		net_start = (net_start + 1) % NET_MAX;
+		/* dt_net_sel is a logical index off net_start: shift it as the oldest drops so
+		 * the expanded detail keeps pointing at the same request (or closes if evicted). */
+		if (dt_net_sel == 0)      dt_net_sel = -1;
+		else if (dt_net_sel > 0)  dt_net_sel--;
+	}
+	return slot;
+}
+
+/* Append a fresh request row from e and return its id. Caller holds dt_lock. */
+static int net_push_e(const struct net_log *e)
+{
+	int slot = net_alloc_slot();
+	netinfo[slot].id = net_next_id++;
+	int id = netinfo[slot].id;
+	net_fill(slot, e);             /* preserves the id just assigned */
+	return id;
+}
+
+/* Capture into the ring even while the panel is closed (bounded static), so the
+ * requests a page issues during load are still there when devtools is opened
+ * afterwards; only the repaint is gated on the panel being visible. */
+static void net_repaint(void)
+{
+	if (dt_open && dt_tab == TAB_NETWORK) dt_paint_only = 1;
+}
+
+void devtools_net_add(const struct net_log *e)
+{
 	dt_lock();
-	net_push(level, buf, n, e);
+	net_push_e(e);
 	dt_unlock();
-	if (dt_open) B->seq++;
+	net_repaint();
+}
+
+int devtools_net_begin(const char *method, const char *url)
+{
+	struct net_log e = { method, url, 0, 0, 0, 0, 0, NET_PENDING, 0 };
+	dt_lock();
+	int id = net_push_e(&e);
+	dt_unlock();
+	net_repaint();
+	return id;
+}
+
+/* Resolve the in-flight row `id` to its final state (e->state). If it was already
+ * evicted from the bounded ring, the outcome is appended fresh so it is never lost. */
+void devtools_net_update(int id, const struct net_log *e)
+{
+	dt_lock();
+	int slot = -1;
+	for (int i = 0; i < net_count; i++) {
+		int s = (net_start + i) % NET_MAX;
+		if (netinfo[s].id == id) { slot = s; break; }
+	}
+	if (slot >= 0) net_fill(slot, e);
+	else           net_push_e(e);
+	dt_unlock();
+	net_repaint();
 }
 
 /* --- network type filter + response-header iteration ----------------------- */
@@ -470,7 +676,7 @@ static int hdr_line(const char *h, int idx, char *out, int max)
  * are shared with the worker/render threads). */
 static void dt_reset_content(void)
 {
-	for (int i = 0; i < con_count; i++) { int s = (con_start + i) % CON_MAX; free(con[s].text); con[s].text = 0; }
+	for (int i = 0; i < con_count; i++) { int s = (con_start + i) % CON_MAX; free(con[s].text); con[s].text = 0; con_free_runs(s); }
 	con_start = con_count = 0;
 	free(con_pend); con_pend = 0; con_pend_len = 0; con_pend_cap = 0;
 	for (int i = 0; i < net_count; i++) { int s = (net_start + i) % NET_MAX; free(net[s].text); net[s].text = 0; netinfo_clear(&netinfo[s]); }
@@ -489,6 +695,7 @@ struct dt_cap {
 	struct conline net[NET_MAX]; int net_start, net_count;
 	struct netinfo netinfo[NET_MAX]; int net_sel;
 	struct textblk dom, sty; int *dom_node, dom_node_cap, sel;
+	int *collapsed, collapsed_n, collapsed_cap;
 };
 
 /* Swap the live capture (the statics above) with *c, field for field. */
@@ -511,6 +718,9 @@ static void cap_swap(struct dt_cap *c)
 	{ int *t = dt_dom_node;    dt_dom_node = c->dom_node;            c->dom_node = t; }
 	{ int t = dt_dom_node_cap; dt_dom_node_cap = c->dom_node_cap;    c->dom_node_cap = t; }
 	{ int t = dt_sel;          dt_sel = c->sel;                      c->sel = t; }
+	{ int *t = dt_collapsed;   dt_collapsed = c->collapsed;          c->collapsed = t; }
+	{ int t = dt_collapsed_n;  dt_collapsed_n = c->collapsed_n;      c->collapsed_n = t; }
+	{ int t = dt_collapsed_cap; dt_collapsed_cap = c->collapsed_cap; c->collapsed_cap = t; }
 }
 
 void devtools_view_save(struct dt_view *v)
@@ -535,6 +745,7 @@ void devtools_view_load(const struct dt_view *v)
 	if (v->cap) cap_swap((struct dt_cap *)v->cap);   /* restore this tab's frozen capture */
 	else { dt_reset_content(); dt_sel = -1; }        /* never captured: empty devtools     */
 	dt_unlock();
+	dt_dirty = 1;    /* re-resolve crumbs/highlight against the restored tab's live DOM */
 	B->seq++;
 }
 
@@ -543,12 +754,13 @@ void devtools_view_free(struct dt_view *v)
 {
 	struct dt_cap *c = v->cap;
 	if (!c) return;
-	for (int i = 0; i < CON_MAX; i++) free(c->con[i].text);
+	for (int i = 0; i < CON_MAX; i++) { free(c->con[i].text); free(c->con[i].runs); }
 	free(c->con_pend);
 	for (int i = 0; i < NET_MAX; i++) { free(c->net[i].text); free(c->netinfo[i].url); free(c->netinfo[i].resp_hdr); }
 	free(c->dom.buf); free(c->dom.off);
 	free(c->sty.buf); free(c->sty.off);
 	free(c->dom_node);
+	free(c->collapsed);
 	free(c);
 	v->cap = 0;
 }
@@ -803,9 +1015,6 @@ static void style_emit_box(struct dom_node *n)
 	sty_edge(&dt_sty, "padding", lb->padding);
 	sty_edge(&dt_sty, "border", lb->border);
 	sty_edge(&dt_sty, "margin", lb->margin);
-
-	const char *disp = lb->kind == LB_FLEX ? "flex" : lb->kind == LB_REPLACED ? "replaced" : "block";
-	tb_puts(&dt_sty, "  display: "); tb_puts(&dt_sty, disp); tb_newline(&dt_sty);
 	sty_color(&dt_sty, "background", lb->bg);
 	if (lb->border.t || lb->border.r || lb->border.b || lb->border.l)
 		sty_color(&dt_sty, "border-color", lb->border_color);
@@ -827,6 +1036,22 @@ static void sty_kv_str(struct textblk *t, const char *label, const char *val)
 	tb_puts(t, b); tb_newline(t);
 }
 
+/* Append "  label: <track> <track> ...\n" reconstructing a grid track template. */
+static void sty_tracks(struct textblk *t, const char *label, const struct css_track *tr, int n)
+{
+	if (n <= 0) return;
+	char b[112]; int k = 0;
+	sapp(b, &k, sizeof b, "  "); sapp(b, &k, sizeof b, label); sapp(b, &k, sizeof b, ": ");
+	for (int i = 0; i < n && i < CSS_GRID_MAX; i++) {
+		if (i) sapp(b, &k, sizeof b, " ");
+		if (tr[i].kind == CSS_TRK_PX)       { uapp(b, &k, sizeof b, (unsigned)tr[i].v); sapp(b, &k, sizeof b, "px"); }
+		else if (tr[i].kind == CSS_TRK_PCT) { uapp(b, &k, sizeof b, (unsigned)tr[i].v); sapp(b, &k, sizeof b, "%"); }
+		else if (tr[i].kind == CSS_TRK_FR)  { uapp(b, &k, sizeof b, (unsigned)tr[i].v); sapp(b, &k, sizeof b, "fr"); }
+		else                                  sapp(b, &k, sizeof b, "auto");
+	}
+	tb_puts(t, b); tb_newline(t);
+}
+
 /* A flat "Computed" list of the resolved values css.c models for `n` (the cascade
  * result from html_compute_style), shown after the box model like a real devtools
  * Computed pane. Only set properties are listed — most fields use -1 for unset. */
@@ -844,10 +1069,16 @@ static void style_emit_computed(struct dom_node *n)
 	if (s.bold == 1)        sty_kv_str(&dt_sty, "font-weight", "bold");
 	if (s.under == 1)       sty_kv_str(&dt_sty, "text-decoration", "underline");
 	if (s.center == 1)      sty_kv_str(&dt_sty, "text-align", "center");
-	if (s.flex == 1) {
+	if (s.grid == 1) {
+		sty_kv_str(&dt_sty, "display", "grid");
+		sty_tracks(&dt_sty, "grid-template-columns", s.grid_cols, s.n_cols);
+		sty_tracks(&dt_sty, "grid-template-rows", s.grid_rows, s.n_rows);
+		if (s.grid_flow == 1) sty_kv_str(&dt_sty, "grid-auto-flow", "column");
+	} else if (s.flex == 1) {
 		sty_kv_str(&dt_sty, "display", "flex");
 		if (s.flex_dir >= 0) sty_kv_str(&dt_sty, "flex-direction", s.flex_dir == 1 ? "column" : "row");
-	}
+	} else if (s.disp == CSS_DISP_INLINE) sty_kv_str(&dt_sty, "display", "inline");
+	else if (s.disp == CSS_DISP_NONE)     sty_kv_str(&dt_sty, "display", "none");
 	sty_kv_px(&dt_sty, "width", s.width);
 	sty_kv_px(&dt_sty, "height", s.height);
 	if (s.box_sizing >= 0)  sty_kv_str(&dt_sty, "box-sizing", s.box_sizing == 1 ? "border-box" : "content-box");
@@ -861,6 +1092,26 @@ static void style_emit_computed(struct dom_node *n)
 /* --- Application tab snapshot (worker thread; it owns cookie/HSTS writes) ---- *
  * Cookies + HSTS-pinned hosts straight from the live jars (B->cookies/B->hsts).
  * Rebuilt in the worker tick like the DOM/Styles snapshots, read under dt_lock. */
+
+/* A cheap FNV-1a content signature of the live cookie/HSTS jars. The jars have no
+ * mutation counter (unlike the DOM), so the worker uses this to rebuild the
+ * Application snapshot only when it actually changes, not on every tick. */
+static unsigned app_fnv(unsigned h, const char *s)
+{
+	if (s) for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+	return h;
+}
+static unsigned app_sig(void)
+{
+	unsigned h = 2166136261u;
+	for (struct cookie *c = B->cookies; c; c = c->next) {
+		h = app_fnv(h, c->name); h = app_fnv(h, c->val); h = app_fnv(h, c->host);
+		h ^= 0x9e3779b9u;
+	}
+	for (struct hsts_host *hh = B->hsts; hh; hh = hh->next) { h = app_fnv(h, hh->host); h ^= 0x85ebca6bu; }
+	return h;
+}
+
 static void app_emit(void)
 {
 	tb_reset(&dt_app);
@@ -1098,28 +1349,48 @@ void devtools_worker_tick(void)
 	 * tick while armed. A commit sets dt_sel + dt_dirty, falling into the rebuild. */
 	if (dt_pick || dt_pick_commit >= 0) devtools_pick_tick(root);
 
-	if (!dt_dirty && B->seq == dt_seen_seq) return;
+	/* Rebuild the expensive Elements/Styles snapshot only when something relevant
+	 * changed — NOT on every global B->seq bump (cursor blink, network log, scrolling
+	 * the panel itself), which used to force a full DOM re-walk every tick. The DOM's
+	 * own mutation_seq covers structure + attributes; layout_seq covers reflow (resize,
+	 * late image, @font-face) so the box model and page highlight track geometry; and
+	 * dt_dirty covers selection/tab/collapse/find/REPL. The cookie/HSTS jar has no
+	 * counter, so a cheap content signature gates the Application snapshot separately.
+	 * The root pointer catches a whole new document (navigation / first paint / a page
+	 * going non-NULL): the parser builds the tree with node_append, which does NOT bump
+	 * dom_mutation_seq, so without this a fresh page could leave the stale "(no document
+	 * loaded)" placeholder or a previous page's tree in the panel. */
+	unsigned mut = dom_mutation_seq, lay = B->layout_seq, asig = app_sig();
+	int rebuild = dt_dirty || root != dt_seen_root || mut != dt_seen_mut || lay != dt_seen_layout;
+	int app_changed = asig != dt_seen_app_sig;
+	if (!rebuild && !app_changed) return;
 
 	dt_lock();
-	if (root) {                          /* live page: rebuild Elements + Styles */
-		tb_reset(&dt_dom);
-		int idx = 0; dom_emit(&dt_dom, root, 0, &idx, 0);
-		if (dt_sel >= dt_dom_node_cap) dt_sel = -1;
-		style_emit(root);
-		dt_ncrumbs = 0;
-		if (dt_sel >= 0) {
-			int i2 = 0;
-			struct dom_node *sn = dom_node_at(root, dt_sel, &i2);
-			if (sn) build_crumbs(root, sn);
-		}
-	} else if (dt_dom.nlines == 0) {     /* no doc and nothing frozen: placeholder */
-		tb_reset(&dt_dom);
-		tb_puts(&dt_dom, "(no document loaded)"); tb_newline(&dt_dom);
-		dt_ncrumbs = 0;
-	}                                    /* else: keep the frozen snapshot of a backgrounded tab */
-	app_emit();                          /* cookies/HSTS — global, no document needed */
+	if (rebuild) {
+		if (root) {                      /* live page: rebuild Elements + Styles */
+			tb_reset(&dt_dom);
+			int idx = 0; dom_emit(&dt_dom, root, 0, &idx, 0);
+			/* idx is now the live pre-order node count; a selection at or past it no
+			 * longer exists (the tree shrank). Compare against the node count, NOT the
+			 * per-line array capacity — node indices count whitespace/collapsed nodes
+			 * that get no line, so they routinely exceed dt_dom_node_cap. */
+			if (dt_sel >= idx) dt_sel = -1;
+			style_emit(root);
+			dt_ncrumbs = 0;
+			if (dt_sel >= 0) {
+				int i2 = 0;
+				struct dom_node *sn = dom_node_at(root, dt_sel, &i2);
+				if (sn) build_crumbs(root, sn);
+			}
+		} else if (dt_dom.nlines == 0) { /* no doc and nothing frozen: placeholder */
+			tb_reset(&dt_dom);
+			tb_puts(&dt_dom, "(no document loaded)"); tb_newline(&dt_dom);
+			dt_ncrumbs = 0;
+		}                                /* else: keep the frozen snapshot of a backgrounded tab */
+	}
+	if (app_changed) app_emit();         /* cookies/HSTS — global, no document needed */
 	/* Reveal a freshly picked node: centre its row in the Elements view. */
-	if (dt_pick_reveal && root && dt_sel >= 0) {
+	if (rebuild && dt_pick_reveal && root && dt_sel >= 0) {
 		dt_pick_reveal = 0;
 		int rows = content_rows(devtools_top());
 		for (int i = 0; i < dt_dom.nlines && i < dt_dom_node_cap; i++)
@@ -1134,7 +1405,7 @@ void devtools_worker_tick(void)
 
 	/* Selected-element highlight box (outside dt_lock; browser_range_box locks blk).
 	 * While picking, the hover highlight owns dt_hl_* — don't clobber it here. */
-	if (!dt_pick) {
+	if (rebuild && !dt_pick) {
 		dt_hl_active = 0;
 		if (root && dt_sel >= 0 && (dt_tab == TAB_ELEMENTS || dt_tab == TAB_STYLES)) {
 			int idx = 0;
@@ -1143,8 +1414,8 @@ void devtools_worker_tick(void)
 		}
 	}
 
+	dt_seen_mut = mut; dt_seen_layout = lay; dt_seen_app_sig = asig; dt_seen_root = root;
 	B->seq++;                       /* repaint with the refreshed snapshot */
-	dt_seen_seq = B->seq;           /* set AFTER the bump so the tick settles */
 }
 
 /* The selected element's page-overlay box (document px) + its label, for the main
@@ -1171,6 +1442,16 @@ void devtools_toggle(void)
 }
 
 int devtools_visible(void) { return dt_open; }
+
+/* Consume a pending dock-only repaint request (see dt_paint_only). The main render
+ * loop calls this each frame: a non-zero return means redraw just the devtools dock
+ * — a network/console log line changed, but nothing on the page did. */
+int devtools_take_paint(void)
+{
+	int v = dt_paint_only;
+	dt_paint_only = 0;
+	return v;
+}
 
 /* Inspect-element picker (page→tree). Arming it opens the panel; the main thread
  * feeds hovered/clicked pane offsets, the worker resolves + selects (see above). */
@@ -1439,9 +1720,12 @@ void devtools_render(void)
 			if (vi < *sc) { vi++; continue; }              /* scrolled above the viewport */
 			vi++;
 			unsigned fg = ring[slot].level == DT_ERROR ? 0xf08080
-			            : ring[slot].level == DT_WARN  ? 0xe0c060 : 0xcdd3de;
+			            : ring[slot].level == DT_WARN  ? 0xe0c060
+			            : ring[slot].level == DT_NET_PENDING_LVL ? 0x8a93a0 : 0xcdd3de;
 			int iserr = ring[slot].level == DT_ERROR;
 			const char *s = ring[slot].text;
+			struct crun *runs = isconsole ? ring[slot].runs : 0;
+			int nruns = isconsole ? ring[slot].nruns : 0;
 			int len = 0, off = 0;
 			while (s && s[len]) len++;
 			int netsel = (!isconsole && i == dt_net_sel);
@@ -1451,7 +1735,8 @@ void devtools_render(void)
 				line[n] = '\0';
 				unsigned rowbg = netsel ? 0x09415f : iserr ? 0x3a2222 : 0;
 				if (rowbg) gfx_fill_rect(left, y, cw, ROW_H, rowbg);
-				gfx_text_utf8(tx, y, line, fg, GFX_TRANSPARENT);
+				if (nruns) con_draw_runs(tx, y, s, off, off + n, fg, runs, nruns);
+				else gfx_text_utf8(tx, y, line, fg, GFX_TRANSPARENT);
 				off += n; y += ROW_H;
 			} while (off < len && y + ROW_H <= bottom);
 		}
@@ -1523,9 +1808,16 @@ void devtools_render(void)
 			int lx = left + 8, ly = dy + 4;
 			char b[256]; int k;
 			k = 0; sapp(b, &k, sizeof b, "Status: ");
-			if (ni->status > 0) uapp(b, &k, sizeof b, (unsigned)ni->status); else sapp(b, &k, sizeof b, "(failed)");
+			if      (ni->state == NET_PENDING)   sapp(b, &k, sizeof b, "(pending)");
+			else if (ni->state == NET_CANCELLED) sapp(b, &k, sizeof b, "(cancelled)");
+			else if (ni->status > 0)             uapp(b, &k, sizeof b, (unsigned)ni->status);
+			else                                 sapp(b, &k, sizeof b, "(failed)");
+			if (ni->state == NET_FAILED && ni->err[0]) { sapp(b, &k, sizeof b, " - "); sapp(b, &k, sizeof b, ni->err); }
 			if (ni->ms > 0) { sapp(b, &k, sizeof b, "    "); uapp(b, &k, sizeof b, (unsigned)ni->ms); sapp(b, &k, sizeof b, " ms"); }
-			gfx_text_utf8(lx, ly, b, (ni->status == 0 || ni->status >= 400) ? 0xf08080 : 0x9bce8a, GFX_TRANSPARENT); ly += GLYPH_H;
+			unsigned stcol = ni->state == NET_PENDING   ? 0x8a93a0
+			               : ni->state == NET_CANCELLED ? 0xe0c060
+			               : (ni->status == 0 || ni->status >= 400) ? 0xf08080 : 0x9bce8a;
+			gfx_text_utf8(lx, ly, b, stcol, GFX_TRANSPARENT); ly += GLYPH_H;
 			k = 0; sapp(b, &k, sizeof b, "Method: "); sapp(b, &k, sizeof b, ni->method[0] ? ni->method : "GET");
 			sapp(b, &k, sizeof b, "    "); net_putsize(b, &k, sizeof b, ni->size);
 			gfx_text_utf8(lx, ly, b, 0xcdd3de, GFX_TRANSPARENT); ly += GLYPH_H;
@@ -1568,20 +1860,24 @@ void devtools_render(void)
 		int fbw = 56;
 		button_draw(left + 2, by + 1, fbw, DT_NETBAR_H - 2,
 		            net_filter_names[dt_net_filter], dt_net_filter ? BTN_PRESSED : BTN_NORMAL);
-		int nshow = 0, failed = 0; long bytes = 0;
+		int nshow = 0, failed = 0, pending = 0; long bytes = 0;
 		for (int i = 0; i < net_count; i++) {
 			int slot = (net_start + i) % NET_MAX;
 			if (!net_pass_slot(slot)) continue;
 			nshow++;
-			if (netinfo[slot].size > 0) bytes += netinfo[slot].size;
-			if (netinfo[slot].status == 0 || netinfo[slot].status >= 400) failed++;
+			struct netinfo *si = &netinfo[slot];
+			if (si->size > 0) bytes += si->size;
+			if (si->state == NET_PENDING) pending++;
+			else if (si->state == NET_FAILED || si->state == NET_CANCELLED ||
+			         si->status == 0 || si->status >= 400) failed++;
 		}
 		char sb[96]; int k = 0;
 		uapp(sb, &k, sizeof sb, (unsigned)nshow); sapp(sb, &k, sizeof sb, nshow == 1 ? " req   " : " reqs   ");
 		net_putsize(sb, &k, sizeof sb, bytes > 0x7fffffff ? 0x7fffffff : (int)bytes);
-		if (failed) { sapp(sb, &k, sizeof sb, "   "); uapp(sb, &k, sizeof sb, (unsigned)failed); sapp(sb, &k, sizeof sb, " failed"); }
+		if (pending) { sapp(sb, &k, sizeof sb, "   "); uapp(sb, &k, sizeof sb, (unsigned)pending); sapp(sb, &k, sizeof sb, " pending"); }
+		if (failed)  { sapp(sb, &k, sizeof sb, "   "); uapp(sb, &k, sizeof sb, (unsigned)failed);  sapp(sb, &k, sizeof sb, " failed"); }
 		gfx_text_utf8(left + fbw + 12, by + (DT_NETBAR_H - GLYPH_H) / 2, sb,
-		              failed ? 0xe0a060 : 0xcdd3de, GFX_TRANSPARENT);
+		              failed ? 0xe0a060 : pending ? 0x8a93a0 : 0xcdd3de, GFX_TRANSPARENT);
 	}
 	dt_unlock();
 }
@@ -1698,7 +1994,14 @@ int devtools_handle_click(int mx, int my)
 		int by = BH - DT_NETBAR_H, fbw = 56;
 		if (button_hit(left + 2, by + 1, fbw, DT_NETBAR_H - 2, mx, my)) {
 			dt_net_filter = (dt_net_filter + 1) % NF_N;   /* cycle the resource-type filter */
-			dt_scroll[TAB_NETWORK] = 0; B->seq++;
+			dt_scroll[TAB_NETWORK] = 0;
+			if (dt_net_sel >= 0) {                        /* close the detail if it's now hidden */
+				dt_lock();
+				if (dt_net_sel >= net_count || !net_pass_slot((net_start + dt_net_sel) % NET_MAX))
+					dt_net_sel = -1;
+				dt_unlock();
+			}
+			B->seq++;
 		}
 		return 1;
 	}
@@ -1743,7 +2046,10 @@ int devtools_handle_click(int mx, int my)
 		}
 		dt_unlock();
 		if (ok) {
-			if (tri >= 0 && cell >= 0 && cell <= tri + 1) toggle_collapsed(node);  /* hit the triangle */
+			/* toggle_collapsed reallocs dt_collapsed, which the worker reads under
+			 * dt_lock in dom_emit->is_collapsed — take the lock so we can't free it
+			 * out from under a concurrent snapshot walk. */
+			if (tri >= 0 && cell >= 0 && cell <= tri + 1) { dt_lock(); toggle_collapsed(node); dt_unlock(); }  /* hit the triangle */
 			else dt_sel = node;
 			dt_dirty = 1; B->seq++;
 		}
@@ -1770,13 +2076,25 @@ int devtools_handle_scroll(int delta)
 		return 1;
 	}
 	int rows = content_rows(devtools_top());
-	dt_lock();
-	int total = active_lines();
-	dt_unlock();
-	int prev = dt_scroll[dt_tab];
-	int next = clamp_scroll(prev - delta * 3, total, rows);
-	if (dt_tab == TAB_CONSOLE)
-		con_follow = (next >= total - rows);
+	int prev = dt_scroll[dt_tab], next;
+	if (dt_tab == TAB_CONSOLE || dt_tab == TAB_NETWORK) {
+		/* Lines wrap here, so the max scroll is the wrap-aware tail (matching render),
+		 * not total-minus-rows — otherwise a wheel step near the bottom moves the value
+		 * only for render to clamp it straight back. */
+		int cols = (content_w() - 8) / GLYPH_W; if (cols > 255) cols = 255; if (cols < 1) cols = 1;
+		dt_lock();
+		int maxstart = dt_tab == TAB_CONSOLE ? con_ftail(rows, cols) : net_ftail(rows, cols);
+		dt_unlock();
+		next = prev - delta * 3;
+		if (next > maxstart) next = maxstart;
+		if (next < 0) next = 0;
+		if (dt_tab == TAB_CONSOLE) con_follow = (next >= maxstart);
+	} else {
+		dt_lock();
+		int total = active_lines();
+		dt_unlock();
+		next = clamp_scroll(prev - delta * 3, total, rows);
+	}
 	if (next != prev) { dt_scroll[dt_tab] = next; B->seq++; }  /* repaint only on real move */
 	return 1;
 }
@@ -1814,8 +2132,12 @@ int devtools_handle_key(char c, int mods)
 		}
 		return 1;
 	}
-	if (uc == KEY_UP)   { dt_hist_recall(-1); B->seq++; return 1; }
-	if (uc == KEY_DOWN) { dt_hist_recall(+1); B->seq++; return 1; }
-	if (textfield_key(&dt_input_tf, c)) { B->seq++; return 1; }
+	/* These edit only the REPL input field in the dock, not the page: request a
+	 * dock-only repaint (dt_paint_only), not a full-page render (B->seq++). A full
+	 * render per keystroke re-lays-out/repaints the whole document — seconds of lag
+	 * on a heavy page. (Enter keeps B->seq++: its eval may mutate the DOM.) */
+	if (uc == KEY_UP)   { dt_hist_recall(-1); dt_paint_only = 1; return 1; }
+	if (uc == KEY_DOWN) { dt_hist_recall(+1); dt_paint_only = 1; return 1; }
+	if (textfield_key(&dt_input_tf, c)) { dt_paint_only = 1; return 1; }
 	return 0;                                                          /* not an edit key: fall through */
 }

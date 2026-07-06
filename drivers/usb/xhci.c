@@ -228,6 +228,8 @@ static void ring_init(struct ring *r)
 	r->base  = palloc();
 	r->enq   = 0;
 	r->cycle = 1;
+	if (!r->base)                    /* palloc pool exhausted: caller checks base */
+		return;
 	struct trb *link = &r->base[RING_TRBS - 1];
 	link->p0      = (uint32_t)r->base;
 	link->p1      = 0;
@@ -471,6 +473,11 @@ static int address_device(int slot_id, int port, int speed)
 {
 	uint8_t *input  = palloc();      /* input control(0) + slot(1) + EP0(2)    */
 	uint8_t *output = palloc();      /* device context for the controller      */
+	if (!input || !output) {         /* palloc pool exhausted: fail gracefully */
+		if (input) pfree(input);
+		if (output) pfree(output);
+		return -1;
+	}
 
 	uint32_t *icc  = (uint32_t *)(input);                 /* input control ctx */
 	uint32_t *sctx = (uint32_t *)(input + ctx_sz * 1);    /* slot context      */
@@ -485,17 +492,31 @@ static int address_device(int slot_id, int port, int speed)
 	/* EP0: control endpoint, default max packet by speed, its transfer ring. */
 	uint32_t mps = (speed >= 4) ? 512 : (speed == 3 ? 64 : 8); /* SS/HS/FS-LS  */
 	ring_init(&ep0_ring);
+	if (!ep0_ring.base) {
+		pfree(input);
+		pfree(output);
+		return -1;
+	}
 	ep0[1] = (4u << 3) | (mps << 16);                /* EP type 4 = control     */
 	ep0[2] = (uint32_t)ep0_ring.base | 1;            /* TR dequeue ptr | DCS=1  */
 	ep0[3] = 0;
 
+	/* Re-enumerating a slot: release the previous device context first, or it
+	 * leaks a page every hot-plug cycle until the palloc pool is exhausted. */
+	if (dcbaa[slot_id])
+		pfree((void *)dcbaa[slot_id]);
 	dcbaa[slot_id] = (uint32_t)output;
 
 	ring_push(&cmd_ring, (uint32_t)input, 0, 0,
 	          TRB_TYPE(TRB_ADDRESS_DEVICE) | ((uint32_t)slot_id << 24));
 	int cc = cmd_submit();
+	pfree(input);                    /* transient: the controller has consumed it */
 	if (cc != CC_SUCCESS) {
 		con_printf("xhci: address-device failed cc=%u\n", cc);
+		dcbaa[slot_id] = 0;
+		pfree(output);
+		pfree(ep0_ring.base);
+		ep0_ring.base = 0;
 		return -1;
 	}
 	return 0;
@@ -508,6 +529,8 @@ static int address_device(int slot_id, int port, int speed)
 static int eval_context_mps(int slot_id, uint32_t mps)
 {
 	uint8_t *input = palloc();
+	if (!input)
+		return -1;
 	uint32_t *icc  = (uint32_t *)input;
 	uint32_t *ep0  = (uint32_t *)(input + ctx_sz * 2);
 
@@ -516,7 +539,9 @@ static int eval_context_mps(int slot_id, uint32_t mps)
 
 	ring_push(&cmd_ring, (uint32_t)input, 0, 0,
 	          TRB_TYPE(TRB_EVAL_CONTEXT) | ((uint32_t)slot_id << 24));
-	return cmd_submit() == CC_SUCCESS ? 0 : -1;
+	int cc = cmd_submit();
+	pfree(input);                         /* transient: consumed by the command */
+	return cc == CC_SUCCESS ? 0 : -1;
 }
 
 /* General control-IN transfer over EP0: SETUP (immediate 8-byte request) ->
@@ -526,6 +551,8 @@ static int control_in(int slot_id, uint8_t bmReqType, uint8_t bReq,
                       uint16_t wValue, uint16_t wIndex, uint8_t *out, int len)
 {
 	uint8_t *buf = palloc();
+	if (!buf)                        /* palloc pool exhausted: fail gracefully */
+		return -1;
 	uint32_t setup_lo = bmReqType | ((uint32_t)bReq << 8) | ((uint32_t)wValue << 16);
 	uint32_t setup_hi = (uint32_t)wIndex | ((uint32_t)len << 16);
 	ring_push(&ep0_ring, setup_lo, setup_hi, 8,
@@ -573,6 +600,8 @@ static int control_out(int slot_id, uint8_t bmReqType, uint8_t bReq,
                        uint16_t wValue, uint16_t wIndex, const uint8_t *data, int len)
 {
 	uint8_t *buf = palloc();
+	if (!buf)                        /* palloc pool exhausted: fail gracefully */
+		return -1;
 	for (int i = 0; i < len; i++)
 		buf[i] = data[i];
 
@@ -653,8 +682,11 @@ static int rndis_setup(struct usbdev *d)
 	int n = rndis_cmd(d->slot, d->ctrl_iface, msg, 28, resp, sizeof resp);
 	if (n < 24 || load_le32(resp + 12) != 0) /* QUERY_CMPLT status                   */
 		return -1;
-	uint32_t off = 8 + load_le32(resp + 20); /* InfoBufferOffset is from byte 8      */
-	if ((int)off + 6 > n)
+	/* InfoBufferOffset is device-controlled and measured from byte 8. Compute in
+	 * 64-bit and compare unsigned so a huge offset can't go negative under the
+	 * signed check and read past the response buffer. */
+	uint64_t off = (uint64_t)8 + load_le32(resp + 20);
+	if (off + 6 > (uint32_t)n)
 		return -1;
 	for (int i = 0; i < 6; i++)
 		d->mac[i] = resp[off + i];
@@ -682,8 +714,8 @@ static void parse_net(struct usbdev *d)
 			uint8_t attr = d->cfg[i + 3] & 0x3;
 			uint16_t mps = (d->cfg[i + 4] | (d->cfg[i + 5] << 8)) & 0x7FF;
 			if (attr == 2) {                              /* bulk              */
-				if (addr & 0x80) { d->bulk_in  = addr; d->bulk_in_mps  = mps; }
-				else             { d->bulk_out = addr; d->bulk_out_mps = mps; }
+				if (addr & 0x80) { d->bulk_in  = addr; d->bulk_in_mps  = mps ? mps : 64; }
+				else             { d->bulk_out = addr; d->bulk_out_mps = mps ? mps : 64; }
 			} else if (attr == 3 && (addr & 0x80)) {      /* interrupt IN      */
 				d->intr_in = addr;
 				d->intr_in_mps = mps ? mps : 16;
@@ -740,6 +772,14 @@ static int configure_bulk(struct usbdev *d, int port)
 	if (intr_dci) ring_init(&net_intr_ring);
 
 	uint8_t *input = palloc();
+	if (!input || !net_in_ring.base || !net_out_ring.base ||
+	    (intr_dci && !net_intr_ring.base)) {
+		if (input) pfree(input);
+		if (net_in_ring.base)  { pfree(net_in_ring.base);  net_in_ring.base = 0; }
+		if (net_out_ring.base) { pfree(net_out_ring.base); net_out_ring.base = 0; }
+		if (net_intr_ring.base) { pfree(net_intr_ring.base); net_intr_ring.base = 0; }
+		return -1;
+	}
 	uint32_t *icc  = (uint32_t *)input;
 	uint32_t *sctx = (uint32_t *)(input + ctx_sz * 1);
 	uint32_t *epin  = (uint32_t *)(input + ctx_sz * (1 + in_dci));
@@ -780,8 +820,14 @@ static int configure_bulk(struct usbdev *d, int port)
 
 	ring_push(&cmd_ring, (uint32_t)input, 0, 0,
 	          TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
-	if (cmd_submit() != CC_SUCCESS)
+	int cc = cmd_submit();
+	pfree(input);                    /* transient: consumed by the command */
+	if (cc != CC_SUCCESS) {          /* config failed: free the transfer rings */
+		pfree(net_in_ring.base);  net_in_ring.base = 0;
+		pfree(net_out_ring.base); net_out_ring.base = 0;
+		if (net_intr_ring.base) { pfree(net_intr_ring.base); net_intr_ring.base = 0; }
 		return -1;
+	}
 
 	net_slot     = d->slot;
 	net_in_dci   = in_dci;
@@ -972,10 +1018,14 @@ static void data_loop(void)
 					/* Unwrap the RNDIS packet message -> Ethernet frame. */
 					if (got >= RNDIS_HDR &&
 					    load_le32(net_rx_buf) == RNDIS_PACKET_MSG) {
-						uint32_t off = 8 + load_le32(net_rx_buf + 8);
+						uint32_t off = load_le32(net_rx_buf + 8);
 						uint32_t dl  = load_le32(net_rx_buf + 12);
-						if (off + dl <= (uint32_t)got)
-							net_rx_frame(net_rx_buf + off, dl);
+						/* off/dl come from the device: use 64-bit math so the frame
+						 * start (8 + off) and end can't wrap past net_rx_buf. */
+						uint64_t start = (uint64_t)8 + off;
+						uint64_t g     = (uint32_t)got;
+						if (start <= g && dl <= g - start)
+							net_rx_frame(net_rx_buf + start, dl);
 					}
 					net_stall_retries = 0;       /* a good transfer resets it    */
 					net_in_pending = 0;
@@ -1105,6 +1155,12 @@ static int configure_bulk_msc(struct usbdev *d)
 	ring_init(&msc_out_ring);
 
 	uint8_t *input = palloc();
+	if (!input || !msc_in_ring.base || !msc_out_ring.base) {
+		if (input) pfree(input);
+		if (msc_in_ring.base)  { pfree(msc_in_ring.base);  msc_in_ring.base = 0; }
+		if (msc_out_ring.base) { pfree(msc_out_ring.base); msc_out_ring.base = 0; }
+		return -1;
+	}
 	uint32_t *icc  = (uint32_t *)input;
 	uint32_t *sctx = (uint32_t *)(input + ctx_sz * 1);
 	uint32_t *epin  = (uint32_t *)(input + ctx_sz * (1 + in_dci));
@@ -1126,8 +1182,13 @@ static int configure_bulk_msc(struct usbdev *d)
 
 	ring_push(&cmd_ring, (uint32_t)input, 0, 0,
 	          TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
-	if (cmd_submit() != CC_SUCCESS)
+	int cc = cmd_submit();
+	pfree(input);                    /* transient: consumed by the command */
+	if (cc != CC_SUCCESS) {          /* config failed: free the transfer rings */
+		pfree(msc_in_ring.base);  msc_in_ring.base = 0;
+		pfree(msc_out_ring.base); msc_out_ring.base = 0;
 		return -1;
+	}
 
 	msc_slot = d->slot;
 	msc_in_dci = in_dci;   msc_out_dci = out_dci;
@@ -1519,6 +1580,12 @@ static int configure_bulk_mtp(struct usbdev *d)
 	ring_init(&mtp_out_ring);
 
 	uint8_t *input = palloc();
+	if (!input || !mtp_in_ring.base || !mtp_out_ring.base || !dcbaa[d->slot]) {
+		if (input) pfree(input);
+		if (mtp_in_ring.base)  { pfree(mtp_in_ring.base);  mtp_in_ring.base = 0; }
+		if (mtp_out_ring.base) { pfree(mtp_out_ring.base); mtp_out_ring.base = 0; }
+		return -1;
+	}
 	uint32_t *icc  = (uint32_t *)input;
 	uint32_t *sctx = (uint32_t *)(input + ctx_sz * 1);
 	uint32_t *epin  = (uint32_t *)(input + ctx_sz * (1 + in_dci));
@@ -1540,8 +1607,13 @@ static int configure_bulk_mtp(struct usbdev *d)
 
 	ring_push(&cmd_ring, (uint32_t)input, 0, 0,
 	          TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
-	if (cmd_submit() != CC_SUCCESS)
+	int cc = cmd_submit();
+	pfree(input);                    /* transient: consumed by the command */
+	if (cc != CC_SUCCESS) {          /* config failed: free the transfer rings */
+		pfree(mtp_in_ring.base);  mtp_in_ring.base = 0;
+		pfree(mtp_out_ring.base); mtp_out_ring.base = 0;
 		return -1;
+	}
 
 	mtp_slot = d->slot;
 	mtp_in_dci = in_dci;   mtp_out_dci = out_dci;
@@ -1694,7 +1766,11 @@ static void mtp_skip_array(const uint8_t *buf, int len, int *off, int stride)
 {
 	if (*off + 4 > len) { *off = len; return; }
 	uint32_t cnt = load_le32(buf + *off);
-	*off += 4 + (int)(cnt * (uint32_t)stride);
+	/* cnt is device-controlled: compute the next offset in 64-bit and clamp to
+	 * len, so an overflowing count can't drive *off negative and let a later
+	 * signed `*off >= len` check pass on an out-of-bounds index. */
+	uint64_t next = (uint64_t)*off + 4 + (uint64_t)cnt * (uint32_t)stride;
+	*off = (next > (uint64_t)len) ? len : (int)next;
 }
 /* Skip an MTP string. */
 static void mtp_skip_string(const uint8_t *buf, int len, int *off)

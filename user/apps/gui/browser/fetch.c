@@ -11,9 +11,58 @@
 #include "brotli.h"    /* RFC 7932 `br` content-coding (whole-buffer decode)   */
 #include "h3.h"        /* HTTP/3 over QUIC (libcurl engine)                    */
 #include "cache.h"     /* the HTTP response cache (RFC 7234, honours headers)  */
+#include "jar.h"       /* scheme/path-aware cookie header (Secure/Path)        */
+#include "clienthints.h" /* Accept-CH: per-origin Client Hints opt-in           */
+
+/* The machine token for the UA platform, from uname(2), normalized the way
+ * browsers present it: i386/i686 collapse to "x86", x86_64/amd64 to "x86_64",
+ * 64-bit ARM to "aarch64", 32-bit ARM to "arm". Cached — arch can't change at
+ * runtime, and uname() is authoritative so there's no hardcoded fallback. */
+static const char *ua_arch(void)
+{
+	static char tok[12];
+	if (!tok[0]) {
+		struct utsname u;
+		const char *m = (uname(&u) == 0) ? u.machine : "";
+		if      (starts_ci(m, "x86_64") || starts_ci(m, "amd64"))  strlcpy(tok, "x86_64",  sizeof tok);
+		else if (starts_ci(m, "aarch64") || starts_ci(m, "arm64")) strlcpy(tok, "aarch64", sizeof tok);
+		else if (starts_ci(m, "arm"))                              strlcpy(tok, "arm",     sizeof tok);
+		else                                                       strlcpy(tok, "x86",     sizeof tok);
+	}
+	return tok;
+}
+
+/* navigator.appVersion — the UA minus "Mozilla/". Built once from ua_arch() +
+ * OWOS_VERSION (the browser version), so neither arch nor version is hardcoded. */
+const char *browser_ua_version(void)
+{
+	static char buf[160];
+	if (!buf[0])
+		snprintf(buf, sizeof buf,
+		         "5.0 (OwOS; %s) AppleWebKit/537.36 (KHTML, like Gecko) "
+		         "Chrome/131.0.0.0 OwOSBrowser/%s Safari/537.36",
+		         ua_arch(), OWOS_VERSION);
+	return buf;
+}
+
+/* The full User-Agent, "Mozilla/" + browser_ua_version(). Shared by the HTTP
+ * transport and the JS navigator so wire and script never disagree. */
+const char *browser_ua(void)
+{
+	static char buf[168];
+	if (!buf[0]) snprintf(buf, sizeof buf, "Mozilla/%s", browser_ua_version());
+	return buf;
+}
 
 /* Content-encoding of a response body. */
 enum { ENC_NONE = 0, ENC_ZLIB = 1, ENC_BR = 2 };
+
+/* Hard ceiling on a single decompressed body. A small gzip/deflate/br response
+ * can expand enormously (a decompression bomb); without a cap the sink grows
+ * until it exhausts memory, and the old (len+n)*2 size math overflowed to a
+ * negative int near ~1 GiB. RAW_MAX (browser.h) bounds the *compressed* body we
+ * read; this bounds the decompressed output at a generous multiple of it. */
+#define DECOMP_MAX (RAW_MAX * 2)   /* 64 MiB */
 
 /* Origins observed to advertise HTTP/3 via Alt-Svc; the next request to one is
  * tried over h3 first (how browsers bootstrap h3 without an extra round trip). */
@@ -46,18 +95,31 @@ struct memwr { unsigned char *buf; int cap, len, oom; };
 static int memwr_fn(void *c, const unsigned char *p, unsigned n)
 {
 	struct memwr *w = c;
+	/* Bomb guard: refuse a write that pushes the output past the cap. Unsigned
+	 * math throughout so the size can't wrap negative near the ceiling. */
+	if (n > (unsigned)DECOMP_MAX || (unsigned)w->len + n > (unsigned)DECOMP_MAX) {
+		w->oom = 1; return -1;
+	}
 	if (w->len + (int)n > w->cap) {
-		int nc = (w->len + (int)n) * 2 + 4096;
-		unsigned char *nb = realloc(w->buf, (unsigned)nc);
+		unsigned want = (unsigned)w->len + n;
+		unsigned nc = want + want / 2 + 4096;   /* ~1.5x with headroom */
+		if (nc > (unsigned)DECOMP_MAX) nc = (unsigned)DECOMP_MAX;
+		unsigned char *nb = realloc(w->buf, nc);
 		if (!nb) { w->oom = 1; return -1; }
-		w->buf = nb; w->cap = nc;
+		w->buf = nb; w->cap = (int)nc;
 	}
 	for (unsigned i = 0; i < n; i++) w->buf[w->len++] = p[i];
 	return 0;
 }
 static unsigned char *body_decompress(const unsigned char *in, int in_len, int enc, int *out_len)
 {
-	if (enc == ENC_BR) return brotli_decompress(in, in_len, out_len);
+	if (enc == ENC_BR) {
+		/* brotli decodes whole-buffer inside the lib; the most we can enforce
+		 * here is to reject (and free) an over-cap result before it's adopted. */
+		unsigned char *o = brotli_decompress(in, in_len, out_len);
+		if (o && *out_len > DECOMP_MAX) { free(o); return 0; }
+		return o;
+	}
 	struct memrd r = { in, in_len, 0 };
 	struct memwr w = { 0, 0, 0, 0 };
 	if (inflate_http(memrd_fn, &r, memwr_fn, &w) < 0 || w.oom) { free(w.buf); return 0; }
@@ -72,8 +134,17 @@ static void raw_decode(int enc)
 	if (!enc || B->pg->raw_len <= 0) return;
 	int ol = 0;
 	unsigned char *o = body_decompress((unsigned char *)B->pg->raw, B->pg->raw_len, enc, &ol);
-	B->pg->raw_len = 0;
-	if (o) { if (ensure_raw(ol)) { memcpy(B->pg->raw, o, ol); B->pg->raw_len = ol; } free(o); }
+	if (!o) { B->pg->raw_len = 0; return; }   /* failed decode: never show the compressed bytes */
+	/* Adopt the decoded buffer directly rather than copying it back into raw:
+	 * both come from the same malloc/realloc/free family (ensure_raw and the
+	 * memwr/brotli sinks). blk_lock guards the swap against the main thread's
+	 * concurrent reads of B->pg->raw, matching ensure_raw's discipline. */
+	blk_lock();
+	free(B->pg->raw);
+	B->pg->raw     = (char *)o;
+	B->pg->raw_len = ol;
+	B->pg->raw_cap = ol;
+	blk_unlock();
 }
 
 static int rgetc(void)
@@ -362,11 +433,17 @@ static void ext_css_add(const char *url)
 	B->ext_css = c;
 }
 
-/* True if "stylesheet" appears as a token of the rel value within [q,end). */
+/* True if "stylesheet" appears as a whitespace-delimited token of the rel value
+ * within [q,end) — so rel="not-a-stylesheet" or "stylesheet-alt" doesn't match.
+ * A trailing '"' (from a quoted rel="stylesheet") is treated as a separator. */
 static int rel_has_stylesheet(const char *q, const char *end)
 {
-	for (const char *s = q; s + 10 <= end; s++)
-		if (starts_ci(s, "stylesheet")) return 1;
+	for (const char *s = q; s < end; ) {
+		while (s < end && (*s == ' ' || *s == '\t' || *s == '"')) s++;
+		const char *tok = s;
+		while (s < end && *s != ' ' && *s != '\t' && *s != '"') s++;
+		if (s - tok == 10 && starts_ci(tok, "stylesheet")) return 1;
+	}
 	return 0;
 }
 
@@ -414,6 +491,52 @@ static void parse_link_header(const char *v, const char *base)
 			ext_css_add(abs);
 		}
 		v = (*eend == ',') ? eend + 1 : eend;
+	}
+}
+
+/* Status code of a raw header block: "HTTP/x.y NNN …" -> NNN (0 if unparseable). */
+static int hdr_status(const char *hdr)
+{
+	const char *p = hdr;
+	while (*p && *p != ' ') p++;            /* skip the "HTTP/x.y" token */
+	while (*p == ' ') p++;
+	int s = 0, any = 0;
+	while (*p >= '0' && *p <= '9') { s = s * 10 + (*p++ - '0'); any = 1; }
+	return any ? s : 0;
+}
+
+/* 103 Early Hints: a 1xx interim response precedes the final one and may carry
+ * Link: rel=stylesheet hints. Its Link values are stashed here (joined by '\n')
+ * because the final response's parse_response clears ext_css; early_apply merges
+ * them back afterwards. Reset per request in http_txn. */
+static char g_early[2048];
+static int  g_early_len;
+
+static void early_reset(void) { g_early_len = 0; g_early[0] = '\0'; }
+
+static void early_collect(const char *hdr)
+{
+	struct http_headers H;
+	http_headers_parse(&H, hdr);
+	int n = http_headers_count(&H, "link");
+	for (int i = 0; i < n; i++) {
+		const char *v = http_headers_at(&H, "link", i);
+		for (; *v && g_early_len < (int)sizeof g_early - 2; v++) g_early[g_early_len++] = *v;
+		if (g_early_len < (int)sizeof g_early - 1) g_early[g_early_len++] = '\n';
+	}
+	g_early[g_early_len] = '\0';
+	http_headers_free(&H);
+}
+
+static void early_apply(const char *base)
+{
+	char line[1024];
+	for (const char *p = g_early; *p; ) {
+		int k = 0;
+		while (*p && *p != '\n' && k < (int)sizeof line - 1) line[k++] = *p++;
+		line[k] = '\0';
+		if (*p == '\n') p++;
+		if (k) parse_link_header(line, base);
 	}
 }
 
@@ -501,6 +624,11 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 
 	if (http_headers_get(&H, "strict-transport-security")) hsts_add(host);
 
+	/* Accept-CH (Client Hints opt-in): record which hints this origin wants so
+	 * later requests to it carry them. Honoured on https only (spec: secure). */
+	const char *ach = http_headers_get(&H, "accept-ch");
+	if (ach && starts_ci(full_url, "https://")) ch_accept(host, ach);
+
 	/* Alt-Svc advertising HTTP/3 (h3=… or h3-NN=…) — remember the origin so the
 	 * next request to it goes over QUIC. */
 	const char *as = http_headers_get(&H, "alt-svc");
@@ -531,6 +659,16 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 		for (int i = 0; i < ncsp; i++)
 			csp_add(B->pg->csp, http_headers_at(&H, "content-security-policy", i));
 	}
+
+	/* Permissions-Policy (and the legacy Feature-Policy): a feature the site's
+	 * own policy disallows for this document is blocked with no prompt. Multiple
+	 * headers combine (OR the blocked bitmaps); the final hop after redirects
+	 * defines the page, so overwrite rather than accumulate across responses. */
+	B->pg->perm_policy = 0;
+	for (int i = 0, np = http_headers_count(&H, "permissions-policy"); i < np; i++)
+		B->pg->perm_policy |= perm_policy_parse(http_headers_at(&H, "permissions-policy", i), host);
+	for (int i = 0, nf = http_headers_count(&H, "feature-policy"); i < nf; i++)
+		B->pg->perm_policy |= perm_policy_parse(http_headers_at(&H, "feature-policy", i), host);
 
 	http_headers_free(&H);
 	jar_flush();   /* persist cookies/HSTS once, if this response changed them */
@@ -568,6 +706,7 @@ static int h2_headers_cb(void *ctx, const char *block, int len)
 {
 	(void)len;
 	struct h2tx *h = ctx;
+	if (hdr_status(block) < 200) { early_collect(block); return 0; }   /* 103 etc. */
 	int chunked, have_len; unsigned clen;
 	h->status = parse_response(block, h->host, h->full_url, h->loc, h->loc_cap,
 	                           &chunked, &have_len, &clen, &h->enc);
@@ -587,7 +726,8 @@ static int h2_body_cb(void *ctx, const unsigned char *p, int n)
 /* Run the request over HTTP/2 (sock already open + ALPN-confirmed h2). Fills
  * B->pg->raw with the raw body; raw_decode + route_body finish it the common way. */
 static int h2_txn(const struct purl *u, const char *full_url, char *loc,
-                  int loc_cap, int allow_dl)
+                  int loc_cap, int allow_dl, const char *method,
+                  const unsigned char *body, int blen, const char *bctype)
 {
 	char auth[URL_HOST_MAX + 8]; int an = 0;        /* :authority = host[:port] */
 	sapp(auth, &an, sizeof auth, u->host);
@@ -597,10 +737,11 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 	}
 
 	/* cookies + accept + accept-encoding. No Connection/Transfer-Encoding
-	 * (forbidden in HTTP/2). The User-Agent rides in h2_opts. */
+	 * (forbidden in HTTP/2). The User-Agent rides in h2_opts. A POST body carries
+	 * its own content-type header (h2 has no separate request line for it). */
 	char xh[1408]; int xn = 0;
 	char ck[1024];
-	if (cookie_header(u->host, ck, sizeof ck) > 0) {
+	if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
 		sapp(xh, &xn, sizeof xh, "cookie: ");
 		sapp(xh, &xn, sizeof xh, ck);
 		sapp(xh, &xn, sizeof xh, "\r\n");
@@ -608,14 +749,25 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc,
 	sapp(xh, &xn, sizeof xh,
 	     "accept: " BR_ACCEPT "\r\naccept-language: " BR_ACCLNG "\r\n"
 	     "accept-encoding: gzip, deflate, br\r\n");
+	{ char ch[512]; if (ch_request_headers(u->host, ch, sizeof ch) > 0) sapp(xh, &xn, sizeof xh, ch); }
+	if (body && blen > 0) {
+		sapp(xh, &xn, sizeof xh, "content-type: ");
+		sapp(xh, &xn, sizeof xh, bctype ? bctype : "application/x-www-form-urlencoded");
+		sapp(xh, &xn, sizeof xh, "\r\n");
+	}
 	if (g_doc_cond[0]) sapp(xh, &xn, sizeof xh, g_doc_cond);   /* revalidation */
 
 	struct h2tx h = { full_url, u->host, loc, loc_cap, 0, 0 };
-	struct h2_opts opts = { BR_UA, xh, h2_headers_cb };
+	struct h2_opts opts = { browser_ua(), xh, h2_headers_cb };
 	char hdrbuf[RESP_HDR_MAX]; int hlen = 0;
-	h2_run(B->sock, 1, auth, "GET", u->path, &opts,
-	       hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
+	if (body && blen > 0)
+		h2_run_body(B->sock, 1, auth, method, u->path, &opts, body, blen,
+		            hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
+	else
+		h2_run(B->sock, 1, auth, method, u->path, &opts,
+		       hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
 
+	early_apply(full_url);   /* merge any 103 Early-Hints stylesheets into ext_css */
 	raw_decode(h.enc);
 	return route_body(full_url, h.status > 0 ? h.status : -5, allow_dl);
 }
@@ -645,10 +797,12 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc,
 	if (u->port != 443) { sapp(auth, &an, sizeof auth, ":"); uapp(auth, &an, sizeof auth, (unsigned)u->port); }
 
 	char xh[1408]; int xn = 0;
-	sapp(xh, &xn, sizeof xh, "user-agent: " BR_UA "\r\naccept: " BR_ACCEPT
+	sapp(xh, &xn, sizeof xh, "user-agent: "); sapp(xh, &xn, sizeof xh, browser_ua());
+	sapp(xh, &xn, sizeof xh, "\r\naccept: " BR_ACCEPT
 	     "\r\naccept-language: " BR_ACCLNG "\r\naccept-encoding: gzip, deflate, br\r\n");
+	{ char ch[512]; if (ch_request_headers(u->host, ch, sizeof ch) > 0) sapp(xh, &xn, sizeof xh, ch); }
 	char ck[1024];
-	if (cookie_header(u->host, ck, sizeof ck) > 0) {
+	if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
 		sapp(xh, &xn, sizeof xh, "cookie: "); sapp(xh, &xn, sizeof xh, ck); sapp(xh, &xn, sizeof xh, "\r\n");
 	}
 	if (g_doc_cond[0]) sapp(xh, &xn, sizeof xh, g_doc_cond);   /* revalidation */
@@ -689,8 +843,10 @@ static int doc_cache_finish(const char *full_url, long now, int revalidating, in
 }
 
 static int http_txn(const struct purl *u, const char *full_url, char *loc,
-                    int loc_cap, int allow_dl)
+                    int loc_cap, int allow_dl, const char *method,
+                    const unsigned char *body, int blen, const char *bctype)
 {
+	int is_get = streq(method, "GET");
 	g_doc_t0 = msec();          /* for the devtools Network duration of this response */
 	loc[0] = '\0';
 	B->pg->ctype[0] = '\0';
@@ -698,6 +854,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	B->cdisp_attach = 0;
 	B->rpos = B->rlen = B->reof = 0;
 	B->pg->raw_len = 0;
+	early_reset();
 
 	/* HTTP cache (RFC 7234): a fresh copy of this document skips the wire; a stale
 	 * one with a validator revalidates via g_doc_cond and reuses the body on 304.
@@ -706,7 +863,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	long now = (long)rtc_epoch();
 	int  revalidating = 0;
 	g_doc_cond[0] = '\0';
-	{
+	if (is_get) {   /* only GET is cacheable / revalidatable */
 		unsigned char *cbody = 0; int clen = 0;
 		int cv = cache_lookup("GET", full_url, now, &cbody, &clen,
 		                      B->pg->ctype, sizeof B->pg->ctype,
@@ -721,8 +878,9 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	}
 
 	/* If this https origin previously advertised HTTP/3 (Alt-Svc), try QUIC
-	 * first; on any failure fall through to the TLS h2/h1.1 path below. */
-	if (u->tls && u->port == 443 && h3_known(u->host)) {
+	 * first; on any failure fall through to the TLS h2/h1.1 path below. HTTP/3
+	 * here has no request-body path, so a POST skips it straight to h2/h1.1. */
+	if (is_get && u->tls && u->port == 443 && h3_known(u->host)) {
 		int st = h3_txn(u, full_url, loc, loc_cap, allow_dl);
 		if (st > 0) return doc_cache_finish(full_url, now, revalidating, st);
 		loc[0] = '\0'; B->pg->ctype[0] = '\0'; B->dl_name[0] = '\0';
@@ -736,13 +894,14 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	if (!B->sock) return -3;
 
 	if (u->tls && nc_alpn(B->sock) == ALPN_H2) {
-		int st = h2_txn(u, full_url, loc, loc_cap, allow_dl);
+		int st = h2_txn(u, full_url, loc, loc_cap, allow_dl, method, body, blen, bctype);
 		nc_close(B->sock); B->sock = 0;
 		return doc_cache_finish(full_url, now, revalidating, st);
 	}
 
 	char req[2048]; int n = 0;
-	sapp(req, &n, sizeof req, "GET ");
+	sapp(req, &n, sizeof req, method);
+	sapp(req, &n, sizeof req, " ");
 	sapp(req, &n, sizeof req, u->path);
 	sapp(req, &n, sizeof req, " HTTP/1.1\r\nHost: ");
 	sapp(req, &n, sizeof req, u->host);
@@ -752,37 +911,60 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 	}
 	{
 		char ck[1024];
-		if (cookie_header(u->host, ck, sizeof ck) > 0) {
+		if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
 			sapp(req, &n, sizeof req, "\r\nCookie: ");
 			sapp(req, &n, sizeof req, ck);
 		}
 	}
+	sapp(req, &n, sizeof req, "\r\nUser-Agent: "); sapp(req, &n, sizeof req, browser_ua());
 	sapp(req, &n, sizeof req,
-	     "\r\nUser-Agent: " BR_UA "\r\nAccept: " BR_ACCEPT "\r\n"
+	     "\r\nAccept: " BR_ACCEPT "\r\n"
 	     "Accept-Language: " BR_ACCLNG "\r\n"
-	     "Accept-Encoding: gzip, deflate, br\r\n"
-	     "Connection: close\r\n");
+	     "Accept-Encoding: gzip, deflate, br\r\n");
+	{ char ch[512]; if (ch_request_headers(u->host, ch, sizeof ch) > 0) sapp(req, &n, sizeof req, ch); }
+	sapp(req, &n, sizeof req, "Connection: close\r\n");
 	if (g_doc_cond[0]) sapp(req, &n, sizeof req, g_doc_cond);   /* revalidation */
+	if (body && blen > 0) {                                     /* POST/PUT body */
+		sapp(req, &n, sizeof req, "Content-Type: ");
+		sapp(req, &n, sizeof req, bctype ? bctype : "application/x-www-form-urlencoded");
+		sapp(req, &n, sizeof req, "\r\nContent-Length: ");
+		uapp(req, &n, sizeof req, (unsigned)blen);
+		sapp(req, &n, sizeof req, "\r\n");
+	}
 	sapp(req, &n, sizeof req, "\r\n");
 
 	if (nc_write(B->sock, req, n) < 0) { nc_close(B->sock); B->sock = 0; return -4; }
-
-	char hdr[RESP_HDR_MAX]; int hlen = 0, match = 0;
-	for (;;) {
-		int ci = rgetc();
-		if (ci < 0) { nc_close(B->sock); B->sock = 0; return -5; }
-		char c = (char)ci;
-		if (hlen < (int)sizeof hdr - 1) hdr[hlen++] = c;
-		if      (c == '\r') match = (match == 2) ? 3 : 1;
-		else if (c == '\n') match = (match == 1) ? 2 : (match == 3 ? 4 : 0);
-		else                match = 0;
-		if (match == 4) break;
+	if (body && blen > 0 && nc_write(B->sock, (const char *)body, blen) < 0) {
+		nc_close(B->sock); B->sock = 0; return -4;
 	}
-	hdr[hlen] = '\0';
+
+	/* Read the response header block, skipping any 1xx interim response. A 103
+	 * Early Hints response carries Link: rel=stylesheet hints (stashed now, merged
+	 * after the final response is parsed); other 1xx are just skipped. */
+	char hdr[RESP_HDR_MAX]; int hlen = 0;
+	for (int interim = 0; ; ) {
+		hlen = 0; int match = 0;
+		for (;;) {
+			int ci = rgetc();
+			if (ci < 0) { nc_close(B->sock); B->sock = 0; return -5; }
+			char c = (char)ci;
+			if (hlen < (int)sizeof hdr - 1) hdr[hlen++] = c;
+			if      (c == '\r') match = (match == 2) ? 3 : 1;
+			else if (c == '\n') match = (match == 1) ? 2 : (match == 3 ? 4 : 0);
+			else                match = 0;
+			if (match == 4) break;
+		}
+		hdr[hlen] = '\0';
+		int s = hdr_status(hdr);
+		if (s < 100 || s >= 200) break;              /* the final response */
+		if (s == 103) early_collect(hdr);
+		if (++interim >= 16) { nc_close(B->sock); B->sock = 0; return -5; }
+	}
 
 	int chunked, have_len, enc_gz; unsigned content_len;
 	int status = parse_response(hdr, u->host, full_url, loc, loc_cap,
 	                            &chunked, &have_len, &content_len, &enc_gz);
+	early_apply(full_url);   /* merge any 103 Early-Hints stylesheets into ext_css */
 
 	struct bodysrc bs = { chunked, have_len, 0, 0,
 	                      have_len ? content_len : 0 };
@@ -801,25 +983,6 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc,
 }
 
 /* ----------------------------------------------- local & inline URL schemes */
-
-static int hexval(int c)
-{
-	if (c >= '0' && c <= '9') return c - '0';
-	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-	return -1;
-}
-
-static int b64val(int c)
-{
-	if (c >= 'A' && c <= 'Z') return c - 'A';
-	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-	if (c >= '0' && c <= '9') return c - '0' + 52;
-	if (c == '+') return 62;
-	if (c == '/') return 63;
-	return -1;
-}
-
 
 /* Render whatever is in B->pg->raw (with B->pg->ctype already set) as the page body —
  * HTML, plain text, or a PNG. Shared by the network, file:, and data: paths so
@@ -900,61 +1063,21 @@ static int load_file_url(const char *url)
 }
 
 /* data:[<mediatype>][;base64],<data> — decode an inline document into B->pg->raw.
- * The media type (default text/plain) sets B->pg->ctype so render_raw shows HTML/
- * text/PNG correctly; the payload is base64- or percent-decoded. A non-base64
- * body keeps '+' literal (unlike form-encoding). Returns 0, or -1 if malformed. */
+ * The media type sets B->pg->ctype so render_raw picks the display mode. Uses the
+ * shared decode_data_url (resource.c) so the base64/percent logic lives once, then
+ * copies the payload into the streaming raw buffer. Returns 0, or -1 if malformed. */
 static int load_data_url(const char *url)
 {
-	const char *p = url + 5;            /* past "data:" */
-	const char *comma = p;
-	while (*comma && *comma != ',') comma++;
-	if (*comma != ',') return -1;       /* a data URL must have a comma       */
-
-	char mt[80]; int mi = 0, base64 = 0;
-	const char *h = p;
-	while (h < comma && *h != ';') {    /* the media type "type/subtype"      */
-		if (mi < (int)sizeof mt - 1) mt[mi++] = lower(*h);
-		h++;
-	}
-	mt[mi] = '\0';
-	while (h < comma) {                 /* ';'-separated params               */
-		h++;
-		const char *tok = h;
-		while (h < comma && *h != ';') h++;
-		if (h - tok == 6 && starts_ci(tok, "base64")) base64 = 1;
-		/* charset= and other params are ignored                             */
-	}
-
-	int k = 0;
+	int len = 0;
 	B->pg->ctype[0] = '\0';
-	sapp(B->pg->ctype, &k, sizeof B->pg->ctype, mt[0] ? mt : "text/plain");
-
-	const char *d = comma + 1;
+	unsigned char *buf = decode_data_url(url, &len, B->pg->ctype, sizeof B->pg->ctype);
+	if (!buf) return -1;
 	B->pg->raw_len = 0;
-	if (base64) {
-		int acc = 0, nb = 0;
-		for (; *d && *d != '='; d++) {
-			int v = b64val((unsigned char)*d);
-			if (v < 0) continue;        /* skip whitespace/newlines           */
-			acc = (acc << 6) | v; nb += 6;
-			if (nb >= 8) {
-				nb -= 8;
-				if (!ensure_raw(B->pg->raw_len + 1)) break;
-				B->pg->raw[B->pg->raw_len++] = (char)((acc >> nb) & 0xff);
-			}
-		}
-	} else {
-		for (; *d; d++) {
-			if (!ensure_raw(B->pg->raw_len + 1)) break;
-			int c = (unsigned char)*d;
-			if (c == '%') {
-				int hi = hexval((unsigned char)d[1]);
-				int lo = hi < 0 ? -1 : hexval((unsigned char)d[2]);
-				if (lo >= 0) { c = hi * 16 + lo; d += 2; }
-			}
-			B->pg->raw[B->pg->raw_len++] = (char)c;
-		}
+	for (int i = 0; i < len; i++) {
+		if (!ensure_raw(B->pg->raw_len + 1)) break;
+		B->pg->raw[B->pg->raw_len++] = (char)buf[i];
 	}
+	free(buf);
 	return 0;
 }
 
@@ -969,11 +1092,23 @@ void do_fetch(void)
 	 * through html_to_text); html_to_text repeats it harmlessly for HTML pages. */
 	html_page_teardown();
 	if (B->pg->csp) { csp_free(B->pg->csp); B->pg->csp = 0; }   /* drop the old page's CSP; parse_response/meta rebuild it */
+	B->pg->perm_policy = 0;     /* drop the old Permissions-Policy; parse_response rebuilds it */
 	devtools_net_reset();       /* a new top-level navigation starts a fresh net log */
 	sapp(url, &n, sizeof url, B->req_url);
 	B->dl_saved = 0;
+	B->scripts_pending = 0;         /* only an HTML render (html_to_text) re-arms it */
 	B->pg->favicon_ok = 0;          /* cleared per navigation; refilled on success */
 	ext_css_clear();            /* Link: stylesheets refilled by parse_response  */
+
+	/* Capture this navigation's HTTP method + body (a form POST fills them). Point
+	 * at B->req_body rather than copying to a big stack buffer — the bytes stay put
+	 * through the fetch, and render_raw's deep HTML parse runs on this same frame.
+	 * Clear req_method so the NEXT navigation defaults back to GET. */
+	char method[8]; strcpy(method, B->req_method[0] ? B->req_method : "GET");
+	const unsigned char *body = (const unsigned char *)B->req_body;
+	int blen = B->req_body_len;
+	const char *bctype = B->req_ctype[0] ? B->req_ctype : 0;
+	B->req_method[0] = '\0'; B->req_body_len = 0;
 
 	/* Local / inline schemes never touch the network: file:// reads the local
 	 * FS, data: decodes an embedded document. Both fill B->pg->raw + B->pg->ctype and
@@ -985,8 +1120,11 @@ void do_fetch(void)
 		B->pg->n_imgs = 0;
 		int rc = data ? load_data_url(url) : load_file_url(url);
 		if (rc < 0) {
-			show_error(data ? "Malformed data: URL"
-			                : "Cannot open file (not found or not absolute)");
+			const char *msg = data ? "Malformed data: URL"
+			                       : "Cannot open file (not found or not absolute)";
+			show_error(msg);
+			{ struct net_log e = { "GET", url, 0, 0, 0, 0, 0, NET_FAILED, msg };
+			  devtools_net_add(&e); }
 			return;
 		}
 		resource_set_page(url);
@@ -1008,10 +1146,26 @@ void do_fetch(void)
 		implicit_scheme = 1;
 	}
 
+	/* Log the document as in-flight up front, so a slow or failing navigation shows
+	 * in the Network panel while it loads — not only once (if) it completes.
+	 * Seed the duration clock here too (http_txn re-stamps it per hop) so a bail
+	 * before the first hop reports a sane elapsed time. */
+	g_doc_t0 = msec();
+	int docnid = devtools_net_begin(method, url);
+
 	for (int hop = 0; hop <= MAX_REDIR; hop++) {
-		if (B->abort_load) return;          /* stopped before this hop: leave as-is */
+		if (B->abort_load) {                /* stopped before this hop: leave as-is */
+			struct net_log e = { method, url, 0, 0, 0, (int)(msec() - g_doc_t0), 0, NET_CANCELLED, 0 };
+			devtools_net_update(docnid, &e);
+			return;
+		}
 		struct purl u;
-		if (!parse_url(url, &u)) { show_error("Bad URL"); return; }
+		if (!parse_url(url, &u)) {
+			show_error("Bad URL");
+			struct net_log e = { method, url, 0, 0, 0, (int)(msec() - g_doc_t0), 0, NET_FAILED, "Bad URL" };
+			devtools_net_update(docnid, &e);
+			return;
+		}
 
 		/* HSTS: a host that previously sent Strict-Transport-Security is only
 		 * ever contacted over HTTPS, even if the URL says http://. */
@@ -1021,9 +1175,13 @@ void do_fetch(void)
 		}
 
 		char loc[URL_MAX];
-		int st = http_txn(&u, url, loc, sizeof loc, 1);
+		int st = http_txn(&u, url, loc, sizeof loc, 1, method, body, blen, bctype);
 		if (st < 0) {
-			if (B->abort_load) return;       /* user stopped: no error page */
+			if (B->abort_load) {             /* user stopped: no error page */
+				struct net_log e = { method, url, 0, 0, 0, (int)(msec() - g_doc_t0), 0, NET_CANCELLED, 0 };
+				devtools_net_update(docnid, &e);
+				return;
+			}
 			/* Secure connect failed for an auto-https URL (host has no TLS, or a
 			 * plain dev server) — retry the same URL over http once. */
 			if (implicit_scheme && st == -3 && starts_ci(url, "https://")) {
@@ -1034,25 +1192,39 @@ void do_fetch(void)
 				implicit_scheme = 0;
 				continue;
 			}
-			if      (st == -2) show_error("Could not resolve host");
-			else if (st == -1) show_error("No network device / out of sockets");
-			else if (st == -3) show_error("Connection failed");
-			else if (st == -4) show_error("Failed to send request");
-			else               show_error("No response from server");
+			const char *msg = st == -2 ? "Could not resolve host"
+			                : st == -1 ? "No network device / out of sockets"
+			                : st == -3 ? "Connection failed"
+			                : st == -4 ? "Failed to send request"
+			                :            "No response from server";
+			show_error(msg);
+			{ struct net_log e = { method, url, 0, 0, 0, (int)(msec() - g_doc_t0), 0, NET_FAILED, msg };
+			  devtools_net_update(docnid, &e); }
 			return;
 		}
 		if ((st == 301 || st == 302 || st == 303 || st == 307 || st == 308) && loc[0]) {
-			if (hop == MAX_REDIR) { show_error("Too many redirects"); return; }
+			if (hop == MAX_REDIR) {
+				show_error("Too many redirects");
+				struct net_log e = { method, url, st, 0, 0, (int)(msec() - g_doc_t0), g_doc_hdr, NET_FAILED, "Too many redirects" };
+				devtools_net_update(docnid, &e);
+				return;
+			}
+			/* A POST redirected by 301/302/303 becomes a bodyless GET (browser
+			 * convention; 303 mandates it). 307/308 preserve the method + body. */
+			if (!streq(method, "GET") && st != 307 && st != 308) {
+				strcpy(method, "GET");
+				body = 0; blen = 0; bctype = 0;
+			}
 			n = 0; sapp(url, &n, sizeof url, loc);
 			continue;
 		}
 
-		/* Log the document request in the devtools Network tab (the final response
-		 * after any redirects; a streamed download has raw_len 0). */
-		{ struct net_log e = { "GET", url, st, B->pg->ctype,
+		/* Resolve the in-flight document row with the final response (after any
+		 * redirects; a streamed download has raw_len 0). */
+		{ struct net_log e = { method, url, st, B->pg->ctype,
 		                       B->dl_saved ? 0 : B->pg->raw_len,
-		                       (int)(msec() - g_doc_t0), g_doc_hdr };
-		  devtools_net_add(&e); }
+		                       (int)(msec() - g_doc_t0), g_doc_hdr, NET_DONE, 0 };
+		  devtools_net_update(docnid, &e); }
 
 		/* A download was streamed straight to ~/Downloads inside http_txn (it
 		 * never touched B->pg->raw), so there is nothing to render. */

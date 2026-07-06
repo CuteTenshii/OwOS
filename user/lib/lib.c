@@ -2,95 +2,88 @@
 
 #include "owos.h"
 
+/* Syscall numbers — MUST stay in sync with kernel/syscall.c (and SIGRETURN in
+ * kernel/signal.h). */
 #define SYS_WRITE    1
 #define SYS_EXIT     2
 #define SYS_READ     3
 #define SYS_FORK     4
-#define SYS_UPTIME   5
-#define SYS_READFILE 6
-#define SYS_EXEC     7
-#define SYS_WAITPID  8
-#define SYS_PIPE     9
-#define SYS_CLOSE    10
-#define SYS_WRITEFILE 11
-#define SYS_NET_CONNECT 12
-#define SYS_NET_SEND   13
-#define SYS_NET_RECV   14
-#define SYS_NET_CLOSE  15
-#define SYS_WIN_CREATE 16
-#define SYS_WIN_PRESENT 17
-#define SYS_WIN_POLL   18
-#define SYS_WIN_WAIT   19
-#define SYS_WIN_CLOSE  20
-#define SYS_RTC        21
-#define SYS_RTC_EPOCH  56
-#define SYS_NET_SET_TTL 57
-#define SYS_READDIR    22
-#define SYS_WIN_TITLE  23
-#define SYS_THREAD     24
-#define SYS_SLEEP      25
-#define SYS_WIN_RESIZABLE 26
-#define SYS_MSEC       27
-#define SYS_READFILE_AT 28
-#define SYS_VOLUMES    29
-#define SYS_UMOUNT     30
-#define SYS_WIN_CURSOR 31
-#define SYS_STREAM_BEGIN 32
-#define SYS_STREAM_WRITE 33
-#define SYS_STREAM_END   34
-#define SYS_MKDIR      35
-#define SYS_RMDIR      36
-#define SYS_DELETE     37
-#define SYS_RENAME     38
-#define SYS_STAT       39
-#define SYS_SPAWN      40
-#define SYS_MOUNT      41
-#define SYS_AUDIO_OPEN 42
-#define SYS_AUDIO_WRITE 43
-#define SYS_AUDIO_CLOSE 44
-/* 45 unused (was SYS_INTR — replaced by signals) */
-/* 46 unused (was SYS_NET_ALPN) — keep in sync with kernel/syscall.c */
-#define SYS_SPAWN_CAP  45
-#define SYS_READ_NB    46
-#define SYS_CHDIR      47
-#define SYS_KILL       48
-#define SYS_POWER      49
-#define SYS_SBRK       50
-#define SYS_NET_RECV_NB 51
-#define SYS_GETUID     52
-#define SYS_GETGID     53
-#define SYS_PORT_OPEN  54
-#define SYS_PORT_ACCEPT 55
-#define SYS_NET_LISTEN   58
-#define SYS_NET_ACCEPT   59
-#define SYS_NET_BIND     60
-#define SYS_NET_RECVFROM 61
-#define SYS_NET_SENDTO   62
-#define SYS_STATFS       63
-#define SYS_NET_RAW_OPEN 64
-#define SYS_IFCONFIG     65
-#define SYS_SETRTC       66
-/* Phase 1 user-space compositor primitives (root-only). Keep in sync with
- * kernel/syscall.c. */
-#define SYS_FB_INFO          67
-#define SYS_FB_MAP           68
-#define SYS_FB_PRESENT       69
-#define SYS_INPUT_POLL       70
-#define SYS_INPUT_SET_BOUNDS 71
-#define SYS_WIN_ENUM         72
-#define SYS_WIN_MAP          73
-#define SYS_WIN_UNMAP        74
-#define SYS_WIN_SET_GEOM     75
-#define SYS_WIN_DELIVER      76
-#define SYS_WIN_SET_FOCUS    77
-#define SYS_CRASH_POLL       78
-#define SYS_WIN_KEY_SPACE    79
-#define SYS_WAITPID_NB       80
-#define SYS_STACK_ALLOC      81
-#define SYS_STACK_FREE       82
-#define SYS_SIGACTION        83
-#define SYS_SIGPROCMASK      84
-#define SYS_GETPID           86
+#define SYS_READFILE 5
+#define SYS_EXEC     6
+#define SYS_WAITPID  7
+#define SYS_PIPE     8
+#define SYS_CLOSE    9
+#define SYS_WRITEFILE 10
+#define SYS_NET_CONNECT 11
+#define SYS_NET_SEND   12
+#define SYS_NET_RECV   13
+#define SYS_NET_CLOSE  14
+#define SYS_WIN_CREATE 15
+#define SYS_WIN_PRESENT 16
+#define SYS_WIN_POLL   17
+#define SYS_WIN_CLOSE  18
+#define SYS_READDIR    19
+#define SYS_WIN_TITLE  20
+#define SYS_THREAD     21
+#define SYS_SLEEP      22
+#define SYS_WIN_RESIZABLE 23
+#define SYS_MSEC       24
+#define SYS_READFILE_AT 25
+#define SYS_VOLUMES    26
+#define SYS_UMOUNT     27
+#define SYS_WIN_CURSOR 28
+#define SYS_STREAM_BEGIN 29
+#define SYS_STREAM_WRITE 30
+#define SYS_STREAM_END   31
+#define SYS_MKDIR      32
+#define SYS_RMDIR      33
+#define SYS_DELETE     34
+#define SYS_RENAME     35
+#define SYS_STAT       36
+#define SYS_SPAWN      37
+#define SYS_MOUNT      38
+#define SYS_AUDIO_OPEN 39
+#define SYS_AUDIO_WRITE 40
+#define SYS_AUDIO_CLOSE 41
+#define SYS_SPAWN_CAP  42
+#define SYS_READ_NB    43
+#define SYS_CHDIR      44
+#define SYS_KILL       45
+#define SYS_POWER      46
+#define SYS_SBRK       47
+#define SYS_GETUID     48
+#define SYS_PORT_OPEN  49
+#define SYS_PORT_ACCEPT 50
+#define SYS_RTC_EPOCH  51
+#define SYS_NET_SETOPT 52
+#define SYS_NET_LISTEN   53
+#define SYS_NET_ACCEPT   54
+#define SYS_NET_BIND     55
+#define SYS_STATFS       56
+#define SYS_IFCONFIG     57
+#define SYS_SETRTC       58
+#define SYS_FB_INFO          59
+#define SYS_FB_MAP           60
+#define SYS_FB_PRESENT       61
+#define SYS_INPUT_POLL       62
+#define SYS_INPUT_SET_BOUNDS 63
+#define SYS_WIN_ENUM         64
+#define SYS_WIN_MAP          65
+#define SYS_WIN_UNMAP        66
+#define SYS_WIN_SET_GEOM     67
+#define SYS_WIN_DELIVER      68
+#define SYS_CRASH_POLL       69
+#define SYS_WIN_KEY_SPACE    70
+#define SYS_STACK_ALLOC      71
+#define SYS_STACK_FREE       72
+#define SYS_SIGACTION        73
+#define SYS_SIGPROCMASK      74
+#define SYS_GETPID           76
+#define SYS_GETRANDOM        77
+#define SYS_WIN_OWNS         78
+#define SYS_WIN_SET_PARENT   79
+#define SYS_WIN_FB           80
+#define SYS_UNAME            81
 
 static inline int syscall(int num, int a, int b, int c)
 {
@@ -151,12 +144,12 @@ int waitpid(int pid)
 
 int waitpid_nb(int pid, int *status)
 {
-	return syscall(SYS_WAITPID_NB, pid, (int)status, 0);
+	return syscall(SYS_WAITPID, pid, (int)status, WNOHANG);
 }
 
 unsigned uptime(void)
 {
-	return (unsigned)syscall(SYS_UPTIME, 0, 0, 0);
+	return msec() / 1000u;   /* seconds since boot, derived from the ms counter */
 }
 
 unsigned msec(void)
@@ -215,19 +208,26 @@ int net_connect(const char *host, int port, int tls)
 	return syscall(SYS_NET_CONNECT, (int)host, port, tls);
 }
 
+/* net_send/net_recv and their addressed (sendto/recvfrom) and non-blocking
+ * variants all funnel through the two unified syscalls, packing a 6-word request:
+ * {fd, buf, len, flags, ip|0, port}. ip non-NULL selects the datagram addressed
+ * form; flags&MSG_DONTWAIT selects a non-blocking recv. */
 int net_send(int h, const void *buf, int len)
 {
-	return syscall(SYS_NET_SEND, h, (int)buf, len);
+	unsigned a[6] = { (unsigned)h, (unsigned)buf, (unsigned)len, 0, 0, 0 };
+	return syscall(SYS_NET_SEND, (int)a, 0, 0);
 }
 
 int net_recv(int h, void *buf, int max)
 {
-	return syscall(SYS_NET_RECV, h, (int)buf, max);
+	unsigned a[6] = { (unsigned)h, (unsigned)buf, (unsigned)max, 0, 0, 0 };
+	return syscall(SYS_NET_RECV, (int)a, 0, 0);
 }
 
 int net_recv_nb(int h, void *buf, int max)
 {
-	return syscall(SYS_NET_RECV_NB, h, (int)buf, max);
+	unsigned a[6] = { (unsigned)h, (unsigned)buf, (unsigned)max, MSG_DONTWAIT, 0, 0 };
+	return syscall(SYS_NET_RECV, (int)a, 0, 0);
 }
 
 int net_close(int h)
@@ -237,12 +237,12 @@ int net_close(int h)
 
 int net_set_ttl(int h, int ttl)
 {
-	return syscall(SYS_NET_SET_TTL, h, ttl, 0);
+	return syscall(SYS_NET_SETOPT, h, NET_OPT_TTL, ttl);
 }
 
 int net_raw_open(void)
 {
-	return syscall(SYS_NET_RAW_OPEN, 0, 0, 0);
+	return net_connect(0, 0, SK_RAWETH);   /* raw L2 socket via the unified connect */
 }
 
 int ifconfig(const unsigned char ip[4], const unsigned char mask[4],
@@ -279,14 +279,16 @@ int net_bind(int port)
 
 int net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[4], int *src_port)
 {
-	int a[5] = { fd, (int)buf, max, (int)src_ip, (int)src_port };
-	return syscall(SYS_NET_RECVFROM, (int)a, 0, 0);
+	unsigned a[6] = { (unsigned)fd, (unsigned)buf, (unsigned)max, 0,
+	                  (unsigned)src_ip, (unsigned)src_port };
+	return syscall(SYS_NET_RECV, (int)a, 0, 0);
 }
 
 int net_sendto(int fd, const unsigned char ip[4], int port, const void *buf, int len)
 {
-	int a[5] = { fd, (int)ip, port, (int)buf, len };
-	return syscall(SYS_NET_SENDTO, (int)a, 0, 0);
+	unsigned a[6] = { (unsigned)fd, (unsigned)buf, (unsigned)len, 0,
+	                  (unsigned)ip, (unsigned)port };
+	return syscall(SYS_NET_SEND, (int)a, 0, 0);
 }
 
 int win_create(int w, int h, const char *title)
@@ -306,12 +308,28 @@ int win_poll(int id, struct win_event *ev)
 
 void win_wait(int id)
 {
-	syscall(SYS_WIN_WAIT, id, 0, 0);
+	syscall(SYS_WIN_POLL, id, 0, 1);   /* ev=NULL, block=1: sleep ~one frame */
 }
 
 int win_close(int id)
 {
 	return syscall(SYS_WIN_CLOSE, id, 0, 0);
+}
+
+int win_owned(int pid)
+{
+	return syscall(SYS_WIN_OWNS, pid, 0, 0);
+}
+
+int win_set_parent(int id, int parent, int modal)
+{
+	return syscall(SYS_WIN_SET_PARENT, id, parent, modal);
+}
+
+unsigned *win_fb_of(int id)
+{
+	unsigned v = (unsigned)syscall(SYS_WIN_FB, id, 0, 0);
+	return v ? (unsigned *)v : (unsigned *)0;
 }
 
 int win_settitle(int id, const char *title)
@@ -383,11 +401,6 @@ int win_deliver(int id, const struct winevent *ev)
 	return syscall(SYS_WIN_DELIVER, id, (int)ev, 0);
 }
 
-int win_set_focus(int id)
-{
-	return syscall(SYS_WIN_SET_FOCUS, id, 0, 0);
-}
-
 int win_key_space(int id)
 {
 	return syscall(SYS_WIN_KEY_SPACE, id, 0, 0);
@@ -398,9 +411,13 @@ int crash_poll(struct crash_rec *out, int max)
 	return syscall(SYS_CRASH_POLL, (int)out, max, 0);
 }
 
+/* Packed (hour<<16)|(min<<8)|sec, UTC — decoded in user space from the epoch
+ * primitive rather than a dedicated syscall. */
 unsigned now_hms(void)
 {
-	return (unsigned)syscall(SYS_RTC, 0, 0, 0);
+	unsigned s = rtc_epoch();
+	unsigned sec = s % 60u, min = (s / 60u) % 60u, hour = (s / 3600u) % 24u;
+	return (hour << 16) | (min << 8) | sec;
 }
 
 int readdir(const char *path, int idx, struct dirent_u *out)
@@ -586,7 +603,6 @@ void thread_stack_free(void *top)
 /* Per-process credentials. The kernel only hands out the numeric ids; the login
  * name and home are resolved here from /etc/passwd, the Unix way. */
 int getuid(void) { return syscall(SYS_GETUID, 0, 0, 0); }
-int getgid(void) { return syscall(SYS_GETGID, 0, 0, 0); }
 
 /* Copy the ':'-separated field #idx (0-based) of the line [s,end) into out. */
 static void passwd_field(const char *s, const char *end, int idx, char *out, int max)
@@ -648,6 +664,16 @@ int sethostname(const char *name)
 	return writefile("/etc/hostname", name, (int)strlen(name)) < 0 ? -1 : 0;
 }
 
+/* POSIX uname(2). The kernel fills sysname/release/version/machine (machine is
+ * its compile-time arch — the one fact a 32-bit user program can't know); we add
+ * nodename from the hostname, keeping /etc/hostname the single source. */
+int uname(struct utsname *out)
+{
+	if (syscall(SYS_UNAME, (int)out, 0, 0) != 0) return -1;
+	gethostname(out->nodename, (int)sizeof out->nodename);
+	return 0;
+}
+
 /* ----------------------------------------------------------- IPC: local ports */
 /* A named local port (the unix-socket analog). A server opens its name with
  * as_server=1 then port_accept()s connections; a client opens the same name
@@ -682,6 +708,19 @@ typedef union header Header;
 static Header  base;                       /* degenerate block: starts the list */
 static Header *freep;                       /* roving free-list pointer          */
 
+/* Size-segregated free bins for small blocks. The K&R free list below is kept
+ * address-ordered so it can coalesce, which makes free() O(free-list length) — a
+ * killer under high churn (a GC sweep freeing tens of thousands of objects becomes
+ * O(n^2), which froze the browser on DOM-heavy pages). So small blocks (<= SBIN_MAX
+ * header units) are recycled through per-exact-size LIFO bins instead: free() pushes
+ * (O(1), no walk, no coalesce) and malloc() pops an exact-size match (O(1)). Blocks
+ * bigger than the cap, and fresh heap from morecore, still use the coalescing list,
+ * so the address space can't fragment into permanently-stranded large holes. Same-
+ * size churn (the common case: JS objects, strings, pmap entries) reuses bins
+ * perfectly, so memory stays bounded by the per-size peak. */
+#define SBIN_MAX 1024u
+static Header *sbins[SBIN_MAX + 1];
+
 /* Spinlock guarding the free list. xchg is atomic; on contention we yield to the
  * lock holder (single CPU — the timer also preempts a spinner as a backstop). */
 static volatile int heap_lock;
@@ -693,12 +732,20 @@ static inline int xchg32(volatile int *p, int v)
 static void hlock(void)   { while (xchg32(&heap_lock, 1)) msleep(0); }
 static void hunlock(void) { __asm__ volatile ("" ::: "memory"); heap_lock = 0; }
 
+/* Crash recovery only: drop the heap lock a longjmp'd-over frame may have held. */
+void heap_lock_reset(void) { __asm__ volatile ("" ::: "memory"); heap_lock = 0; }
+
 #define NALLOC 2048u                       /* min header-units to request at once */
 
 /* free() body without the lock (so morecore can reuse it under the held lock). */
 static void free_nolock(void *ap)
 {
 	Header *bp = (Header *)ap - 1, *p;
+	if (bp->s.size <= SBIN_MAX) {          /* small block: O(1) bin push, no coalesce */
+		bp->s.ptr = sbins[bp->s.size];
+		sbins[bp->s.size] = bp;
+		return;
+	}
 	for (p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr)
 		if (p >= p->s.ptr && (bp > p || bp < p->s.ptr))
 			break;                         /* freed block at the list's edge   */
@@ -740,6 +787,12 @@ void *malloc(unsigned nbytes)
 		return 0;
 	unsigned nunits = (nbytes + sizeof(Header) - 1) / sizeof(Header) + 1;
 	hlock();
+	if (nunits <= SBIN_MAX && sbins[nunits]) {   /* exact-size bin hit: O(1) reuse */
+		Header *p = sbins[nunits];
+		sbins[nunits] = p->s.ptr;
+		hunlock();
+		return (void *)(p + 1);
+	}
 	Header *prevp = freep;
 	if (prevp == 0) {                      /* first call: one empty block       */
 		base.s.ptr = freep = prevp = &base;
@@ -845,6 +898,14 @@ void *memmove(void *d, const void *s, __SIZE_TYPE__ n)
 	return d;
 }
 
+int memcmp(const void *a, const void *b, __SIZE_TYPE__ n)
+{
+	const unsigned char *p = a, *q = b;
+	for (; n; n--, p++, q++)
+		if (*p != *q) return (int)*p - (int)*q;
+	return 0;
+}
+
 int strlen(const char *s)
 {
 	int n = 0;
@@ -863,6 +924,14 @@ void strcpy(char *d, const char *s)
 {
 	while ((*d++ = *s++))
 		;
+}
+
+void strlcpy(char *dst, const char *src, int size)
+{
+	int i = 0;
+	if (size <= 0) return;
+	if (src) for (; src[i] && i < size - 1; i++) dst[i] = src[i];
+	dst[i] = '\0';
 }
 
 void strcat(char *d, const char *s)
@@ -1124,6 +1193,10 @@ static int rng_rdrand32(unsigned *out)
 }
 static unsigned long long rng_tsc(void) { unsigned lo, hi; __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi)); return ((unsigned long long)hi << 32) | lo; }
 
+/* getrandom(buf, len): CSPRNG bytes from the kernel entropy pool (interrupt
+ * jitter, ratcheted through SHA-256). Returns bytes written, or -1. */
+int getrandom(void *buf, int len) { return syscall(SYS_GETRANDOM, (int)buf, len, 0); }
+
 void rng_bytes(void *out, int n)
 {
 	static unsigned long long st;
@@ -1135,12 +1208,22 @@ void rng_bytes(void *out, int n)
 		while (i < n) {
 			unsigned r;
 			int k = n - i < 4 ? n - i : 4;
-			if (!rng_rdrand32(&r)) break;          /* persistent stall: finish via fallback */
+			if (!rng_rdrand32(&r)) break;          /* persistent stall: top up below */
 			memcpy(p + i, &r, (unsigned)k);
 			i += k;
 		}
 		if (i >= n) return;
 	}
+	/* No RDRAND, or it stalled mid-buffer: fill the rest from the kernel entropy
+	 * pool. This is the CSPRNG path on hardware without RDRAND — the clock-seeded
+	 * SplitMix below is not cryptographic and must never carry key material. */
+	while (i < n) {
+		int k = n - i < 256 ? n - i : 256;
+		if (getrandom(p + i, k) != k)
+			break;                                 /* syscall unavailable: last resort */
+		i += k;
+	}
+	if (i >= n) return;
 	if (!seeded) {                                /* fallback seed: every clock + the TSC */
 		unsigned long long s = (unsigned long long)now_ms();
 		s ^= ((unsigned long long)msec() << 21) ^ ((unsigned long long)uptime() << 32) ^ ((unsigned long long)rtc_epoch() << 13);

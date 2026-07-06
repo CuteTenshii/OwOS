@@ -39,8 +39,6 @@ int  sched_create_user_thread(uint32_t entry, uint32_t user_esp);
 int  sched_fork(struct registers *r);
 
 void sched_exit(int status);          /* terminate current task; never returns  */
-void sched_kill(int pid);             /* terminate another task by pid          */
-int  sched_kill_child(int pid);       /* terminate a child of the caller; 0/-1  */
 
 /* Signals (see signal.h + sched.c). sched_signal_send is the kill(2) primitive;
  * sigaction/sigprocmask act on the caller; deliver/sigreturn are the ring-3
@@ -51,6 +49,7 @@ int  sched_signal_send(int pid, int sig);
 int  sched_sigaction(int sig, const struct k_sigaction *act, struct k_sigaction *old);
 uint32_t sched_sigprocmask(int how, uint32_t set, int have_set);
 void sched_signal_deliver(struct registers *r);
+int  sched_fault_signal(struct registers *r, int sig); /* deliver a CPU fault as a signal */
 int  sched_sigreturn(struct registers *r);
 int  sched_intr_pending(void);        /* a signal wants delivery (blocking waits) */
 int  sched_waitpid(int pid);          /* block for a child; returns its status  */

@@ -15,7 +15,7 @@
 #define MAX_DEPTH 800
 
 static void *refp(js_value v) {
-    if (v.type == JV_OBJ || v.type == JV_SYMBOL) return v.u.obj;
+    if (v.type == JV_OBJ || v.type == JV_SYMBOL || v.type == JV_BIGINT) return v.u.obj;
     if (v.type == JV_STR) return v.u.str;
     return NULL;
 }
@@ -57,32 +57,135 @@ void js_throw(js_ctx *ctx, js_value err) {
     ctx->has_exc = 1;
     ctx->exc = err;
     ctx->exc_root = refp(err);
+#ifdef JS_TRACE_THROW
+    /* Debug build only: log EVERY thrown exception (even ones that get caught) with
+     * its captured stack, so a swallowed failure — e.g. a module whose init aborts,
+     * leaving a later access to throw a misleading downstream error — is visible at
+     * the point it actually happened. Off in release (no JS_TRACE_THROW). */
+    if (ctx->print && err.type == JV_OBJ) {
+        pentry *st = pmap_find_pub(err.u.obj, "stack");
+        if (st && st->value.type == JV_STR) {
+            js_string *s = st->value.u.str;
+            char *buf = (char *)malloc((unsigned)s->len + 10);
+            if (buf) {
+                int k = 0; const char *p;
+                for (p = "[throw] "; *p; p++) buf[k++] = *p;
+                memcpy(buf + k, s->data, (unsigned)s->len); k += s->len;
+                ctx->print(ctx, JS_LOG_ERROR, buf, k);
+                free(buf);
+            }
+        }
+    }
+#endif
 }
 
-/* Build "Name: message\n    at fn\n    at fn2\n..." from the active call frames
- * (innermost first) and store it as the error's `.stack` — captured at creation,
- * like a real engine. `o` must already be GC-rooted by the caller. */
+/* Build "Name: message\n    at fn (line:col)\n    at fn2 (line:col)\n..." from the
+ * active call frames (innermost first) and store it as the error's `.stack` —
+ * captured at creation, like a real engine. `o` must already be GC-rooted. */
+static char *put_uint(char *p, unsigned v) {
+    char tmp[12]; int n = 0;
+    do { tmp[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) *p++ = tmp[--n];
+    return p;
+}
+
+/* Upper bound on the bytes emit_frames writes for the current frames plus the
+ * trailing script-origin line. */
+static int frames_bytes(js_ctx *ctx) {
+    int i, total = 0;
+    /* per frame: "    at " + name + " (line:col)\n" — 32 bytes fixed/number slack */
+    for (i = 0; i < ctx->nframes; i++) total += 32 + (int)strlen(ctx->frames[i]);
+    /* the outermost frame is the script/async entry itself: "    at <label>\n" */
+    if (ctx->cur_script && ctx->cur_script[0])
+        total += 8 + (int)strlen(ctx->cur_script);
+    return total;
+}
+
+/* Write the "    at fn (line:col)\n" lines for the active frames (innermost last),
+ * then the "    at <script>\n" origin line, to `p` and return the new write cursor.
+ * The origin line makes every captured segment bottom out at the script (or async
+ * entry) that produced it, even when no JS function is on the stack. */
+static char *emit_frames(js_ctx *ctx, char *p) {
+    int i;
+    const char *s;
+    for (i = ctx->nframes - 1; i >= 0; i--) {
+        /* the innermost frame sits at the throw site (cur_line/col); every outer
+         * frame sits at the call that entered the frame below it. */
+        int line = (i == ctx->nframes - 1) ? ctx->cur_line : ctx->frame_line[i];
+        int col  = (i == ctx->nframes - 1) ? ctx->cur_col  : ctx->frame_col[i];
+        for (s = "    at "; *s; s++) *p++ = *s;
+        for (s = ctx->frames[i]; *s; s++) *p++ = *s;
+        if (line > 0) {
+            *p++ = ' '; *p++ = '(';
+            p = put_uint(p, (unsigned)line);
+            *p++ = ':';
+            p = put_uint(p, (unsigned)(col > 0 ? col : 1));
+            *p++ = ')';
+        }
+        *p++ = '\n';
+    }
+    if (ctx->cur_script && ctx->cur_script[0]) {
+        for (s = "    at "; *s; s++) *p++ = *s;
+        for (s = ctx->cur_script; *s; s++) *p++ = *s;
+        *p++ = '\n';
+    }
+    return p;
+}
+
+/* Separator that precedes the frames of an async (deferred) parent in a stack. */
+static const char ASYNC_SEP[] = "    --- scheduled from ---\n";
+
 static void capture_stack(js_ctx *ctx, js_object *o, const char *name, const char *msg) {
-    int total, i;
+    int total;
     char *buf, *p;
     const char *s;
+    const char *async = ctx->async_stack;
     total = (int)strlen(name ? name : "Error") + 2 + (int)strlen(msg ? msg : "") + 2;
-    for (i = 0; i < ctx->nframes; i++) total += 8 + (int)strlen(ctx->frames[i]);
+    total += frames_bytes(ctx);
+    if (async) total += (int)sizeof ASYNC_SEP + (int)strlen(async);
     buf = (char *)malloc((unsigned)total + 1);
     if (!buf) return;
     p = buf;
     for (s = name ? name : "Error"; *s; s++) *p++ = *s;
     if (msg && *msg) { *p++ = ':'; *p++ = ' '; for (s = msg; *s; s++) *p++ = *s; }
     *p++ = '\n';
-    for (i = ctx->nframes - 1; i >= 0; i--) {
-        for (s = "    at "; *s; s++) *p++ = *s;
-        for (s = ctx->frames[i]; *s; s++) *p++ = *s;
-        *p++ = '\n';
+    p = emit_frames(ctx, p);
+    if (async) {                                /* graft the scheduling site's frames */
+        for (s = ASYNC_SEP; *s; s++) *p++ = *s;
+        for (s = async; *s; s++) *p++ = *s;     /* already newline-terminated */
     }
     *p = '\0';
     js_def(o, "stack", js_mk_string(ctx, buf, (int)(p - buf)), P_WRITABLE | P_CONFIGURABLE);
     free(buf);
 }
+
+char *js_async_capture(js_ctx *ctx) {
+    int total;
+    char *buf, *p;
+    const char *s;
+    const char *prev = ctx->async_stack;
+    total = frames_bytes(ctx);
+    if (prev) total += (int)sizeof ASYNC_SEP + (int)strlen(prev);
+    buf = (char *)malloc((unsigned)total + 1);
+    if (!buf) return 0;
+    p = emit_frames(ctx, buf);
+    if (prev) {                                 /* chain the already-installed parent */
+        for (s = ASYNC_SEP; *s; s++) *p++ = *s;
+        for (s = prev; *s; s++) *p++ = *s;
+    }
+    *p = '\0';
+    return buf;
+}
+
+char *js_async_enter(js_ctx *ctx, char *captured) {
+    char *prev = ctx->async_stack;
+    ctx->async_stack = captured;
+    return prev;
+}
+
+void js_async_leave(js_ctx *ctx, char *prev) { ctx->async_stack = prev; }
+
+void js_set_script(js_ctx *ctx, const char *label) { ctx->cur_script = label; }
 
 js_value js_make_error(js_ctx *ctx, js_object *proto, const char *name, const char *msg) {
     js_object *o;
@@ -135,8 +238,46 @@ static int has_global(js_ctx *ctx, const char *name) {
     return 0;
 }
 
-static js_value read_ident(js_ctx *ctx, const char *name) {
-    pentry *pe = js_env_lookup(ctx->cur_env, name);
+/* Resolve an identifier reference to its binding, using the node's inline cache.
+ * The cache records how far up the scope chain the binding sits (cdepth) and its
+ * slot in that scope's variable map (cslot). It is only ever a hint: a hit walks
+ * to the cached scope and revalidates by comparing the key at the slot, so a stale
+ * entry (delete/rehash, or a scope that no longer nests the same way) simply falls
+ * through to a full walk and re-records. Direct eval, which can inject a binding
+ * into an existing scope, bumps ctx->ident_cache_gen to drop every cache at once. */
+static pentry *resolve_ident(js_ctx *ctx, js_node *node, js_env **owner) {
+    const char *name = node->u.str.s;
+    js_env *e;
+    int depth;
+
+    if (node->u.str.cslot && node->u.str.cgen == ctx->ident_cache_gen) {
+        js_env *t = ctx->cur_env;
+        int d = node->u.str.cdepth;
+        while (d > 0 && t) { t = t->parent; d--; }
+        if (t && d == 0) {
+            int idx = node->u.str.cslot - 1;
+            if (idx < t->vars.n && strcmp(t->vars.e[idx].key, name) == 0) {
+                if (owner) *owner = t;
+                return &t->vars.e[idx];
+            }
+        }
+    }
+    for (e = ctx->cur_env, depth = 0; e; e = e->parent, depth++) {
+        int idx = pmap_index(&e->vars, name);
+        if (idx >= 0) {
+            node->u.str.cdepth = depth;
+            node->u.str.cslot = idx + 1;
+            node->u.str.cgen = ctx->ident_cache_gen;
+            if (owner) *owner = e;
+            return &e->vars.e[idx];
+        }
+    }
+    return NULL;
+}
+
+static js_value read_ident(js_ctx *ctx, js_node *node) {
+    const char *name = node->u.str.s;
+    pentry *pe = resolve_ident(ctx, node, NULL);
     if (pe) return pe->value;
     if (has_global(ctx, name)) return js_get(ctx, js_obj_value(ctx->global), name);
     {
@@ -149,14 +290,16 @@ static js_value read_ident(js_ctx *ctx, const char *name) {
     }
 }
 
-static void assign_ident(js_ctx *ctx, const char *name, js_value val) {
-    pentry *pe = js_env_lookup(ctx->cur_env, name);
+static void assign_ident(js_ctx *ctx, js_node *node, js_value val) {
+    js_env *owner = NULL;
+    pentry *pe = resolve_ident(ctx, node, &owner);
     if (pe) {
         if (!(pe->flags & P_WRITABLE)) { js_throw_type(ctx, "assignment to constant variable"); return; }
         pe->value = val;
+        gc_write_barrier(owner);   /* an old scope may now hold a young value */
         return;
     }
-    js_set(ctx, js_obj_value(ctx->global), name, val);
+    js_set(ctx, js_obj_value(ctx->global), node->u.str.s, val);
 }
 
 /* ------------------------------------------------------- operators -------- */
@@ -188,12 +331,98 @@ static int js_compare(js_ctx *ctx, js_value l, js_value r) {
 }
 
 static int has_property(js_ctx *ctx, js_object *o, const char *key) {
-    (void)ctx;
-    for (; o; o = o->proto) if (js_has_own(o, key)) return 1;
+    for (; o; o = o->proto) {
+        if (o->kind == OBJ_PROXY) return js_proxy_has(ctx, o, key);   /* has trap (+ proto walk) */
+        if (js_has_own(o, key)) return 1;
+    }
     return 0;
 }
 
+/* Compare a BigInt against a Number/String/BigInt operand for the relational
+ * operators: -1/0/1 ordering, or 2 when unordered (a NaN / non-numeric string). */
+static int cmp_bigint_double(const bigint *b, double d) {
+    if (d != d) return 2;
+    if (floor(d) == d && d != 1.0 / 0.0 && d != -1.0 / 0.0) {
+        int ok; bigint *bd = bi_from_double(d, &ok);
+        if (ok && bd) { int c = bi_cmp(b, bd); bi_free(bd); return c; }
+        if (bd) bi_free(bd);
+    }
+    { double bv = bi_to_double(b); return bv < d ? -1 : (bv > d ? 1 : 0); }
+}
+static int bigint_compare(js_ctx *ctx, js_value l, js_value r) {
+    bigint *lb = js_bigint_of(l), *rb = js_bigint_of(r);
+    if (lb && rb) return bi_cmp(lb, rb);
+    if (lb) {
+        if (r.type == JV_STR) { int ok; bigint *t = bi_from_str(r.u.str->data, r.u.str->len, &ok); int c; if (!ok || !t) { if (t) bi_free(t); return 2; } c = bi_cmp(lb, t); bi_free(t); return c; }
+        return cmp_bigint_double(lb, js_to_number(ctx, r));
+    }
+    if (l.type == JV_STR) { int ok; bigint *t = bi_from_str(l.u.str->data, l.u.str->len, &ok); int c; if (!ok || !t) { if (t) bi_free(t); return 2; } c = bi_cmp(t, rb); bi_free(t); return c; }
+    { int c = cmp_bigint_double(rb, js_to_number(ctx, l)); return c == 2 ? 2 : -c; }
+}
+
+/* BigInt operators. Returns 1 if it handled `op` (setting *out, which may be a
+ * thrown value), 0 for ops the generic path owns (==, ===, in, instanceof, and
+ * `+` with a string operand, which coerces to string concatenation). */
+static int bigint_binop(js_ctx *ctx, int op, js_value l, js_value r, js_value *out) {
+    bigint *lb, *rb, *res;
+
+    /* `+` is BigInt addition only when both sides are BigInt; otherwise the
+     * generic path runs ToPrimitive and either concatenates (a string/stringy
+     * object operand) or throws the mix TypeError via ToNumber. */
+    if (op == T_PLUS && !(js_bigint_of(l) && js_bigint_of(r))) return 0;
+    if (op == T_EQEQ || op == T_NE || op == T_EQEQEQ || op == T_NEEQ || op == T_IN || op == T_INSTANCEOF) return 0;
+
+    if (op == T_LT || op == T_GT || op == T_LE || op == T_GE) {
+        int c = bigint_compare(ctx, l, r), b;
+        if (ctx->has_exc) { *out = js_undef(); return 1; }
+        switch (op) {
+        case T_LT: b = (c == -1); break;
+        case T_GT: b = (c == 1); break;
+        case T_LE: b = (c == -1 || c == 0); break;
+        default:   b = (c == 1 || c == 0); break;
+        }
+        if (c == 2) b = 0;
+        *out = js_bool(b);
+        return 1;
+    }
+
+    lb = js_bigint_of(l); rb = js_bigint_of(r);
+    if (!lb || !rb) { *out = js_throw_type(ctx, "Cannot mix BigInt and other types, use explicit conversions"); return 1; }
+
+    res = NULL;
+    switch (op) {
+    case T_PLUS:  res = bi_add(lb, rb); break;
+    case T_MINUS: res = bi_sub(lb, rb); break;
+    case T_STAR:  res = bi_mul(lb, rb); break;
+    case T_SLASH:
+        if (bi_is_zero(rb)) { *out = js_throw_range(ctx, "Division by zero"); return 1; }
+        bi_divmod(lb, rb, &res, NULL); break;
+    case T_PERCENT:
+        if (bi_is_zero(rb)) { *out = js_throw_range(ctx, "Division by zero"); return 1; }
+        bi_divmod(lb, rb, NULL, &res); break;
+    case T_STARSTAR: {
+        int rc; res = bi_pow(lb, rb, &rc);
+        if (rc == -1) { *out = js_throw_range(ctx, "Exponent must be non-negative"); return 1; }
+        break;
+    }
+    case T_AMP:   res = bi_and(lb, rb); break;
+    case T_BAR:   res = bi_or(lb, rb);  break;
+    case T_CARET: res = bi_xor(lb, rb); break;
+    case T_LTLT:  { int ok; long long k = bi_to_i64(rb, &ok); res = ok ? bi_shl(lb, k) : NULL; break; }
+    case T_GTGT:  { int ok; long long k = bi_to_i64(rb, &ok); res = ok ? bi_shr(lb, k) : NULL; break; }
+    case T_GTGTGT: *out = js_throw_type(ctx, "BigInts have no unsigned right shift"); return 1;
+    default: return 0;
+    }
+    if (!res) { *out = js_throw_range(ctx, "Maximum BigInt size exceeded"); return 1; }
+    *out = js_mk_bigint(ctx, res);
+    return 1;
+}
+
 static js_value apply_binop(js_ctx *ctx, int op, js_value l, js_value r) {
+    if (l.type == JV_BIGINT || r.type == JV_BIGINT) {
+        js_value out;
+        if (bigint_binop(ctx, op, l, r, &out)) return out;
+    }
     switch (op) {
     case T_PLUS: {
         js_value lp, rp;
@@ -257,13 +486,20 @@ static js_value apply_binop(js_ctx *ctx, int op, js_value l, js_value r) {
 
 /* ------------------------------------------------------- member access ---- */
 
-static js_value access(js_ctx *ctx, js_value objv, js_node *m) {
+/* Access m off objv. When keyout != NULL (and cap > 0) the resolved property
+ * key is copied there — used to render "obj[\"key\"] is not a function" for a
+ * computed callee, where the static AST no longer carries the runtime name. */
+static js_value access_ex(js_ctx *ctx, js_value objv, js_node *m, char *keyout, int cap) {
     if (m->u.member.computed) {
         js_value k = evaluate(ctx, m->u.member.prop);
         if (ctx->has_exc) return js_undef();
         if (k.type == JV_NUM) {
             double d = k.u.num;
-            if (d >= 0 && d == floor(d) && d < 4294967296.0) return js_get_index(ctx, objv, (unsigned)d);
+            if (d >= 0 && d == floor(d) && d < 4294967296.0) {
+                if (keyout && cap > 66) u64toa((unsigned)d, keyout, 10);
+                else if (keyout && cap > 0) keyout[0] = '\0';
+                return js_get_index(ctx, objv, (unsigned)d);
+            }
         }
         gc_push_scope(); KEEP(objv); KEEP(k);
         {
@@ -272,12 +508,17 @@ static js_value access(js_ctx *ctx, js_value objv, js_node *m) {
             js_value out;
             if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
             KEEP(hold);
+            if (keyout && cap > 0) strlcpy(keyout, key, (unsigned)cap);
             out = js_get(ctx, objv, key);
             gc_pop_scope();
             return out;
         }
     }
     return js_get(ctx, objv, m->u.member.prop->u.str.s);
+}
+
+static js_value access(js_ctx *ctx, js_value objv, js_node *m) {
+    return access_ex(ctx, objv, m, NULL, 0);
 }
 
 /* evaluate a member/call chain, threading optional-chaining short-circuit */
@@ -331,6 +572,48 @@ static js_value *eval_args(js_ctx *ctx, js_node **anodes, int an, int *out_argc)
     return argv;
 }
 
+/* Append the source-ish name of a callee AST to `buf` for a "<x> is not a
+ * function" TypeError, so a failing call names the culprit instead of the opaque
+ * "value". Bounded and best-effort: idents and dotted/indexed members render, the
+ * rest degrade to a placeholder. */
+static void callee_desc(js_node *callee, char *buf, int cap)
+{
+	int n = 0;
+	buf[0] = '\0';
+	if (!callee) { strlcpy(buf, "value", (unsigned)cap); return; }
+	switch (callee->type) {
+	case JS_IDENT:
+	case JS_STR: {
+		int l = callee->u.str.len; if (l > cap - 1) l = cap - 1;
+		for (int i = 0; i < l; i++) buf[n++] = callee->u.str.s[i];
+		buf[n] = '\0';
+		break;
+	}
+	case JS_THIS: strlcpy(buf, "this", (unsigned)cap); break;
+	case JS_MEMBER: {
+		callee_desc(callee->u.member.obj, buf, cap);
+		n = (int)strlen(buf);
+		if (callee->u.member.computed) {
+			if (n < cap - 3) { buf[n++] = '['; buf[n++] = ']'; buf[n] = '\0'; }
+		} else if (n < cap - 2) {
+			buf[n++] = '.';
+			js_node *p = callee->u.member.prop;
+			if (p && (p->type == JS_IDENT || p->type == JS_STR)) {
+				int l = p->u.str.len; if (l > cap - 1 - n) l = cap - 1 - n;
+				for (int i = 0; i < l; i++) buf[n++] = p->u.str.s[i];
+			}
+			buf[n] = '\0';
+		}
+		break;
+	}
+	case JS_CALL: callee_desc(callee->u.call.callee, buf, cap);
+		n = (int)strlen(buf); if (n < cap - 3) { buf[n++] = '('; buf[n++] = ')'; buf[n] = '\0'; }
+		break;
+	default: strlcpy(buf, "value", (unsigned)cap); break;
+	}
+	if (!buf[0]) strlcpy(buf, "value", (unsigned)cap);
+}
+
 static js_value eval_chain(js_ctx *ctx, js_node *n, int *shorted) {
     if (n->type == JS_MEMBER) {
         js_value obj = eval_chain_obj(ctx, n->u.member.obj, shorted);
@@ -345,6 +628,7 @@ static js_value eval_chain(js_ctx *ctx, js_node *n, int *shorted) {
         js_value *argv;
         int argc = 0;
         js_value result;
+        char keybuf[64]; keybuf[0] = '\0';
 
         if (callee->type == JS_MEMBER && callee->u.member.obj->type == JS_SUPER) {
             js_object *hp = super_home_proto(ctx);       /* super.method() — this stays current this */
@@ -359,7 +643,7 @@ static js_value eval_chain(js_ctx *ctx, js_node *n, int *shorted) {
             if (callee->u.member.optional && nullish(obj)) { *shorted = 1; return js_undef(); }
             thisv = obj;
             gc_push_scope(); KEEP(obj);
-            fnv = access(ctx, obj, callee);
+            fnv = access_ex(ctx, obj, callee, keybuf, sizeof keybuf);
             gc_pop_scope();
         } else if (callee->type == JS_SUPER) {           /* super(...) — call parent ctor on this */
             js_object *home = js_env_get_home(ctx->cur_env);
@@ -378,9 +662,28 @@ static js_value eval_chain(js_ctx *ctx, js_node *n, int *shorted) {
         if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
         { int i; for (i = 0; i < argc; i++) KEEP(argv[i]); }
         if (!js_is_callable(fnv)) {
+            char desc[96], msg[192];
+            int m = 0;
             free(argv);
             gc_pop_scope();
-            return js_throw_type(ctx, "value is not a function");
+            if (callee->type == JS_MEMBER && callee->u.member.computed && keybuf[0]) {
+                /* runtime key recovered: render obj["key"] instead of obj[] */
+                callee_desc(callee->u.member.obj, desc, sizeof desc);
+                for (const char *q = desc; *q && m < (int)sizeof msg - 40; q++) msg[m++] = *q;
+                msg[m++] = '['; msg[m++] = '"';
+                for (const char *q = keybuf; *q && m < (int)sizeof msg - 24; q++) msg[m++] = *q;
+                msg[m++] = '"'; msg[m++] = ']';
+            } else {
+                callee_desc(callee, desc, sizeof desc);
+                for (const char *q = desc; *q && m < (int)sizeof msg - 20; q++) msg[m++] = *q;
+            }
+            for (const char *q = " is not a function"; *q; q++) msg[m++] = *q;
+            msg[m] = '\0';
+            return js_throw_type(ctx, msg);
+        }
+        if (ctx->nframes > 0 && n->line > 0) {   /* pin the caller frame to this call site */
+            ctx->frame_line[ctx->nframes - 1] = n->line;
+            ctx->frame_col[ctx->nframes - 1] = n->col;
         }
         result = call_function(ctx, fnv, thisv, argv, argc);
         free(argv);
@@ -419,7 +722,7 @@ static js_value eval_assign(js_ctx *ctx, js_node *n) {
         if (target->type == JS_IDENT) {
             rhs = evaluate(ctx, n->u.bin.right);
             if (ctx->has_exc) return js_undef();
-            assign_ident(ctx, target->u.str.s, rhs);
+            assign_ident(ctx, target, rhs);
             return rhs;
         }
         if (target->type == JS_MEMBER) {
@@ -454,7 +757,7 @@ static js_value eval_assign(js_ctx *ctx, js_node *n) {
         int doit;
         if (target->type != JS_IDENT && target->type != JS_MEMBER)
             return js_throw_type(ctx, "invalid assignment target");
-        if (target->type == JS_IDENT) cur = read_ident(ctx, target->u.str.s);
+        if (target->type == JS_IDENT) cur = read_ident(ctx, target);
         else cur = access(ctx, evaluate(ctx, target->u.member.obj), target);
         if (ctx->has_exc) return js_undef();
         doit = op == T_AMPAMP_EQ ? js_to_boolean(cur) : op == T_BARBAR_EQ ? !js_to_boolean(cur) : nullish(cur);
@@ -462,7 +765,7 @@ static js_value eval_assign(js_ctx *ctx, js_node *n) {
         {
             js_value rhs = evaluate(ctx, n->u.bin.right);
             if (ctx->has_exc) return js_undef();
-            if (target->type == JS_IDENT) assign_ident(ctx, target->u.str.s, rhs);
+            if (target->type == JS_IDENT) assign_ident(ctx, target, rhs);
             else {
                 js_value obj = evaluate(ctx, target->u.member.obj);
                 if (ctx->has_exc) return js_undef();
@@ -477,7 +780,7 @@ static js_value eval_assign(js_ctx *ctx, js_node *n) {
     {
         int base = compound_base_op(op);
         if (target->type == JS_IDENT) {
-            js_value cur = read_ident(ctx, target->u.str.s);
+            js_value cur = read_ident(ctx, target);
             js_value rhs, res;
             if (ctx->has_exc) return js_undef();
             gc_push_scope(); KEEP(cur);
@@ -487,7 +790,7 @@ static js_value eval_assign(js_ctx *ctx, js_node *n) {
             res = apply_binop(ctx, base, cur, rhs);
             gc_pop_scope();
             if (ctx->has_exc) return js_undef();
-            assign_ident(ctx, target->u.str.s, res);
+            assign_ident(ctx, target, res);
             return res;
         }
         if (target->type == JS_MEMBER) {
@@ -519,17 +822,35 @@ static js_value eval_assign(js_ctx *ctx, js_node *n) {
 
 /* ------------------------------------------------------- update (++/--) --- */
 
+/* Step a value by ±1 for ++/--. `*oldout` receives the ToNumeric'd operand (a
+ * BigInt stays a BigInt, everything else becomes a Number), the return is the
+ * stepped value. Sets ctx->has_exc on a BigInt size-cap / conversion failure. */
+static js_value inc_dec(js_ctx *ctx, js_value cur, int inc, js_value *oldout) {
+    if (cur.type == JV_BIGINT) {
+        bigint *one = bi_from_i64(1), *nv;
+        *oldout = cur;
+        if (!one) { js_throw_range(ctx, "out of memory"); return js_undef(); }
+        nv = inc ? bi_add(js_bigint_of(cur), one) : bi_sub(js_bigint_of(cur), one);
+        bi_free(one);
+        return js_mk_bigint(ctx, nv);          /* NULL nv -> throws inside */
+    }
+    { double o = js_to_number(ctx, cur); *oldout = js_number(o); return js_number(inc ? o + 1 : o - 1); }
+}
+
 static js_value eval_update(js_ctx *ctx, js_node *n) {
     js_node *t = n->u.unary.operand;
-    double oldv, newv;
+    js_value oldv, newv;
     int inc = n->op == T_PLUSPLUS;
     if (t->type == JS_IDENT) {
-        js_value cur = read_ident(ctx, t->u.str.s);
+        js_value cur = read_ident(ctx, t);
         if (ctx->has_exc) return js_undef();
-        oldv = js_to_number(ctx, cur);
-        newv = inc ? oldv + 1 : oldv - 1;
-        assign_ident(ctx, t->u.str.s, js_number(newv));
-        return js_number(n->u.unary.prefix ? newv : oldv);
+        gc_push_scope(); KEEP(cur);
+        newv = inc_dec(ctx, cur, inc, &oldv);
+        if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
+        KEEP(newv); KEEP(oldv);
+        assign_ident(ctx, t, newv);
+        gc_pop_scope();
+        return n->u.unary.prefix ? newv : oldv;
     }
     if (t->type == JS_MEMBER) {
         js_value obj = evaluate(ctx, t->u.member.obj);
@@ -544,11 +865,14 @@ static js_value eval_update(js_ctx *ctx, js_node *n) {
             { int n2 = ks.u.str->len < DTOA_MAX - 1 ? ks.u.str->len : DTOA_MAX - 1; memcpy(keybuf, ks.u.str->data, (unsigned)n2); keybuf[n2] = 0; key = keybuf; }
         } else key = t->u.member.prop->u.str.s;
         cur = js_get(ctx, obj, key);
-        oldv = js_to_number(ctx, cur);
-        newv = inc ? oldv + 1 : oldv - 1;
-        if (!ctx->has_exc) js_set(ctx, obj, key, js_number(newv));
+        if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
+        KEEP(cur);
+        newv = inc_dec(ctx, cur, inc, &oldv);
+        if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
+        KEEP(newv); KEEP(oldv);
+        js_set(ctx, obj, key, newv);
         gc_pop_scope();
-        return js_number(n->u.unary.prefix ? newv : oldv);
+        return n->u.unary.prefix ? newv : oldv;
     }
     return js_throw_type(ctx, "invalid update target");
 }
@@ -637,6 +961,7 @@ static js_value build_object(js_ctx *ctx, js_node *n) {
             pe = pmap_find_pub(obj, key);
             if (pe && (pe->flags & P_ACCESSOR)) {
                 if (pr->kind == JS_PROP_GET) pe->getter = fn.u.obj; else pe->setter = fn.u.obj;
+                gc_write_barrier(obj);
             } else {
                 js_def_accessor(obj, key, pr->kind == JS_PROP_GET ? fn.u.obj : NULL,
                                 pr->kind == JS_PROP_SET ? fn.u.obj : NULL, P_ENUMERABLE | P_CONFIGURABLE);
@@ -736,9 +1061,10 @@ static js_value eval_class(js_ctx *ctx, js_node *node) {
     ctor = (js_object *)gc_keep(js_new_function(ctx, ctor_node, ctx->cur_env));
     ctor->fn->class_node = node;
     ctor->fn->home = proto;
+    gc_write_barrier(ctor);
     js_def(ctor, "prototype", js_obj_value(proto), 0);
     js_def(proto, "constructor", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
-    if (superctor) ctor->proto = superctor;                  /* static inheritance */
+    if (superctor) { ctor->proto = superctor; gc_write_barrier(ctor); }   /* static inheritance */
     if (node->u.cls.id) js_def(ctor, "name", js_mk_cstring(ctx, node->u.cls.id->u.str.s), P_CONFIGURABLE);
 
     for (i = 0; i < node->u.cls.nmembers; i++) {
@@ -751,7 +1077,7 @@ static js_value eval_class(js_ctx *ctx, js_node *node) {
         if (m->kind == JS_M_STATIC_BLOCK) {           /* run `static { … }` with this = the class */
             js_object *fn = js_new_function(ctx, m->value, ctx->cur_env);
             gc_push_scope(); gc_keep(fn);
-            fn->fn->home = ctor;
+            fn->fn->home = ctor; gc_write_barrier(fn);
             js_call(ctx, js_obj_value(fn), js_obj_value(ctor), 0, 0);
             gc_pop_scope();
             if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
@@ -771,11 +1097,12 @@ static js_value eval_class(js_ctx *ctx, js_node *node) {
         {
             js_object *fn = js_new_function(ctx, m->value, ctx->cur_env);
             gc_keep(fn);
-            fn->fn->home = target;
+            fn->fn->home = target; gc_write_barrier(fn);
             if (m->kind == JS_M_GET || m->kind == JS_M_SET) {
                 pentry *pe = pmap_find_pub(target, key);
                 if (pe && (pe->flags & P_ACCESSOR)) {
                     if (m->kind == JS_M_GET) pe->getter = fn; else pe->setter = fn;
+                    gc_write_barrier(target);
                 } else {
                     js_def_accessor(target, key, m->kind == JS_M_GET ? fn : NULL, m->kind == JS_M_SET ? fn : NULL, P_CONFIGURABLE);
                 }
@@ -794,15 +1121,22 @@ static js_value evaluate(js_ctx *ctx, js_node *n) {
     char probe;
     if (ctx->has_exc) return js_undef();
     if (stack_overflow(ctx, &probe)) return js_throw_range(ctx, "maximum call stack size exceeded");
+    if (n->line > 0) { ctx->cur_line = n->line; ctx->cur_col = n->col; }   /* throw-site location for stack traces */
     switch (n->type) {
     case JS_NUM:   return js_number(n->u.num);
+    case JS_BIGINT: {
+        int ok = 0;
+        bigint *b = bi_from_str(n->u.str.s, n->u.str.len, &ok);
+        if (!b || !ok) { bi_free(b); return js_throw_range(ctx, "invalid BigInt literal"); }
+        return js_mk_bigint(ctx, b);
+    }
     case JS_STR:   return js_mk_string(ctx, n->u.str.s, n->u.str.len);
     case JS_BOOL:  return js_bool(n->u.num != 0);
     case JS_NULL:  return js_null();
     case JS_THIS:  return js_env_get_this(ctx->cur_env);
     case JS_IDENT:
         if (n->u.str.len == 10 && strcmp(n->u.str.s, "new.target") == 0) return js_undef();
-        return read_ident(ctx, n->u.str.s);
+        return read_ident(ctx, n);
     case JS_TEMPLATE: return build_template(ctx, n);
     case JS_TAGGED_TEMPLATE: return build_tagged(ctx, n);
     case JS_ARRAY:  return build_array(ctx, n);
@@ -886,10 +1220,12 @@ static js_value evaluate(js_ctx *ctx, js_node *n) {
                 js_value obj = evaluate(ctx, opd->u.member.obj);
                 if (ctx->has_exc) return js_undef();
                 if (obj.type == JV_OBJ) {
+                    int prox = obj.u.obj->kind == OBJ_PROXY;
                     if (opd->u.member.computed) {
                         js_value kv = evaluate(ctx, opd->u.member.prop), hold;
-                        if (!ctx->has_exc) { const char *key = to_prop_key(ctx, kv, &hold); if (!ctx->has_exc) js_delete(obj.u.obj, key); }
+                        if (!ctx->has_exc) { const char *key = to_prop_key(ctx, kv, &hold); if (!ctx->has_exc) { if (prox) js_proxy_delete(ctx, obj.u.obj, key); else js_delete(obj.u.obj, key); } }
                     }
+                    else if (prox) js_proxy_delete(ctx, obj.u.obj, opd->u.member.prop->u.str.s);
                     else js_delete(obj.u.obj, opd->u.member.prop->u.str.s);
                 }
             }
@@ -901,9 +1237,15 @@ static js_value evaluate(js_ctx *ctx, js_node *n) {
             if (ctx->has_exc) return js_undef();
             switch (n->op) {
             case T_BANG:  return js_bool(!js_to_boolean(v));
-            case T_TILDE: return js_number(~js_to_int32(ctx, v));
-            case T_PLUS:  return js_number(js_to_number(ctx, v));
-            case T_MINUS: return js_number(-js_to_number(ctx, v));
+            case T_TILDE:
+                if (v.type == JV_BIGINT) return js_mk_bigint(ctx, bi_not(js_bigint_of(v)));
+                return js_number(~js_to_int32(ctx, v));
+            case T_PLUS:
+                if (v.type == JV_BIGINT) return js_throw_type(ctx, "Cannot convert a BigInt value to a number");
+                return js_number(js_to_number(ctx, v));
+            case T_MINUS:
+                if (v.type == JV_BIGINT) return js_mk_bigint(ctx, bi_neg(js_bigint_of(v)));
+                return js_number(-js_to_number(ctx, v));
             default: return js_undef();
             }
         }
@@ -921,6 +1263,10 @@ static js_value evaluate(js_ctx *ctx, js_node *n) {
         argv = eval_args(ctx, n->u.call.args, n->u.call.nargs, &argc);
         if (ctx->has_exc) { gc_pop_scope(); return js_undef(); }
         { int i; for (i = 0; i < argc; i++) KEEP(argv[i]); }
+        if (ctx->nframes > 0 && n->line > 0) {   /* pin the caller frame to this `new` site */
+            ctx->frame_line[ctx->nframes - 1] = n->line;
+            ctx->frame_col[ctx->nframes - 1] = n->col;
+        }
         result = js_construct(ctx, fnv, argv, argc);
         free(argv);
         gc_pop_scope();
@@ -959,7 +1305,7 @@ static void bind_pattern(js_ctx *ctx, js_node *pat, js_value val, int declare, u
     switch (pat->type) {
     case JS_IDENT:
         if (declare) js_env_define(ctx->cur_env, pat->u.str.s, val, flags);
-        else assign_ident(ctx, pat->u.str.s, val);
+        else assign_ident(ctx, pat, val);
         return;
     case JS_MEMBER: {
         js_value obj = evaluate(ctx, pat->u.member.obj);
@@ -1087,6 +1433,33 @@ static void hoist_functions(js_ctx *ctx, js_node **items, int count) {
     }
 }
 
+/* Annex B (sloppy-mode) legacy function hoisting: a function declared inside a
+ * block also gets a var-scoped binding of the same name in the enclosing
+ * function/program scope. We pre-declare those names (undefined) here; the
+ * block-level declaration copies its value up when execution reaches it (see
+ * the JS_FUNC case in exec_stmt). Names already bound at function scope (e.g. a
+ * `var` or a top-level function of the same name) are left untouched. This
+ * engine has no strict mode, so the rule is applied uniformly. */
+static void hoist_block_funcs(js_ctx *ctx, js_env *fnenv, js_node *n) {
+    if (!n) return;
+    switch (n->type) {
+    case JS_FUNC:
+        if (n->u.func.name && !pmap_find_in_env(fnenv, n->u.func.name))
+            js_env_define(fnenv, n->u.func.name, js_undef(), P_WRITABLE | P_ENUMERABLE);
+        return;
+    case JS_BLOCK: { int i; for (i = 0; i < n->u.list.count; i++) hoist_block_funcs(ctx, fnenv, n->u.list.items[i]); return; }
+    case JS_IF: hoist_block_funcs(ctx, fnenv, n->u.iff.cons); hoist_block_funcs(ctx, fnenv, n->u.iff.alt); return;
+    case JS_FOR: hoist_block_funcs(ctx, fnenv, n->u.forc.body); return;
+    case JS_FOR_IN: hoist_block_funcs(ctx, fnenv, n->u.forin.body); return;
+    case JS_WHILE: case JS_DO_WHILE: hoist_block_funcs(ctx, fnenv, n->u.loop.body); return;
+    case JS_TRY: hoist_block_funcs(ctx, fnenv, n->u.tc.block); hoist_block_funcs(ctx, fnenv, n->u.tc.handler); hoist_block_funcs(ctx, fnenv, n->u.tc.finalizer); return;
+    case JS_SWITCH: { int i, j; for (i = 0; i < n->u.sw.count; i++) for (j = 0; j < n->u.sw.cases[i].nbody; j++) hoist_block_funcs(ctx, fnenv, n->u.sw.cases[i].body[j]); return; }
+    case JS_LABELED: hoist_block_funcs(ctx, fnenv, n->u.labeled.body); return;
+    case JS_EXPORT: hoist_block_funcs(ctx, fnenv, n->u.exp.decl); return;
+    default: return;                            /* don't descend into nested functions */
+    }
+}
+
 /* ------------------------------------------------------- statements ------- */
 
 static completion exec_var_decl(js_ctx *ctx, js_node *n) {
@@ -1159,8 +1532,13 @@ static completion exec_for(js_ctx *ctx, js_node *n, const char *label) {
 }
 
 static void bind_for_target(js_ctx *ctx, js_node *left, js_value item) {
-    if (left->type == JS_VAR_DECL) bind_pattern(ctx, left->u.var.decls[0].id, item, 1, P_WRITABLE | P_ENUMERABLE);
-    else bind_pattern(ctx, left, item, 0, 0);
+    if (left->type == JS_VAR_DECL) {
+        /* `var` assigns to the hoisted function-scope binding (declare=0) so the
+         * loop variable survives the loop; `let`/`const` bind fresh in the
+         * per-iteration block scope. */
+        int declare = left->u.var.kind != JS_DECL_VAR;
+        bind_pattern(ctx, left->u.var.decls[0].id, item, declare, P_WRITABLE | P_ENUMERABLE);
+    } else bind_pattern(ctx, left, item, 0, 0);
 }
 
 /* the iteration protocol: obj[Symbol.iterator]() then repeated .next() */
@@ -1361,7 +1739,20 @@ static completion exec_stmt(js_ctx *ctx, js_node *n, const char *label) {
     case JS_VAR_DECL:  return exec_var_decl(ctx, n);
     case JS_BLOCK:     return exec_block(ctx, n->u.list.items, n->u.list.count);
     case JS_EMPTY:     return cnorm();
-    case JS_FUNC:      return cnorm();           /* hoisted */
+    case JS_FUNC:
+        /* Annex B: a block-level function declaration copies its block-scoped
+         * value up to the pre-declared function-scope legacy binding when
+         * execution reaches it. Top-level declarations (cur_env is already the
+         * function scope) were fully bound by hoist_functions and need no copy. */
+        if (n->u.func.name && ctx->cur_env && !ctx->cur_env->is_fn_scope) {
+            js_env *fe = ctx->cur_env->parent;
+            while (fe && !fe->is_fn_scope) fe = fe->parent;
+            if (fe && pmap_find_in_env(fe, n->u.func.name)) {
+                pentry *bpe = js_env_lookup(ctx->cur_env, n->u.func.name);
+                if (bpe) js_env_define(fe, n->u.func.name, bpe->value, P_WRITABLE | P_ENUMERABLE);
+            }
+        }
+        return cnorm();
     case JS_DEBUGGER:  return cnorm();
     case JS_IF:
         if (js_to_boolean(evaluate(ctx, n->u.iff.test))) { if (ctx->has_exc) return cnorm(); return exec_stmt(ctx, n->u.iff.cons, NULL); }
@@ -1484,8 +1875,11 @@ static completion exec_stmt(js_ctx *ctx, js_node *n, const char *label) {
 
 static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_value *args, int argc) {
     js_object *o = fnval.u.obj;
-    js_func *f = o->fn;
+    js_func *f;
     js_node *node;
+
+    if (o->kind == OBJ_PROXY) return js_proxy_apply(ctx, o, thisv, args, argc);   /* apply trap */
+    f = o->fn;
     js_env *env, *saved;
     js_value result = js_undef();
     completion c;
@@ -1564,6 +1958,7 @@ static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_va
             else {
                 js_node *body = node->u.func.body;        /* JS_BLOCK */
                 hoist_vars(ctx, env, body);
+                hoist_block_funcs(ctx, env, body);
                 hoist_functions(ctx, body->u.list.items, body->u.list.count);
                 c = exec_list(ctx, body->u.list.items, body->u.list.count);
                 if (!ctx->has_exc && c.kind == C_RETURN) result = c.value;
@@ -1600,6 +1995,7 @@ js_value js_construct(js_ctx *ctx, js_value fnval, js_value *args, int argc) {
     js_value proto, thisobj, result;
     if (!js_is_callable(fnval)) return js_throw_type(ctx, "value is not a constructor");
     fn = fnval.u.obj;
+    if (fn->kind == OBJ_PROXY) return js_proxy_construct(ctx, fn, args, argc);   /* construct trap */
     {   /* a bound function (Function.prototype.bind) constructs its target with the
          * bound partial args prepended, ignoring the bound `this`. */
         pentry *pb = pmap_find_pub(fn, "@bound");
@@ -1643,7 +2039,7 @@ js_value js_construct(js_ctx *ctx, js_value fnval, js_value *args, int argc) {
 static js_node *compile_dyn(js_ctx *ctx, const char *src, js_parse_error *err) {
     js_arena *a = (js_arena *)malloc(sizeof *a);
     js_node *prog;
-    if (!a) { if (err) { err->msg = "out of memory"; err->line = 0; } return NULL; }
+    if (!a) { if (err) { err->msg = "out of memory"; err->line = 0; err->col = 0; } return NULL; }
     js_arena_init(a);
     prog = js_parse(src, a, err);
     if (!prog) { js_arena_free(a); free(a); return NULL; }
@@ -1665,8 +2061,11 @@ js_value js_builtin_eval(js_ctx *ctx, js_value thisv, js_value *args, int argc) 
     if (args[0].type != JV_STR) return args[0];        /* eval of a non-string -> itself */
     prog = compile_dyn(ctx, args[0].u.str->data, &e);
     if (!prog) return js_throw_error(ctx, ctx->syntax_error_proto, "SyntaxError", e.msg ? e.msg : "parse error");
-    /* direct: declarations land in the current scope */
+    /* direct: declarations land in the current scope. That can inject a binding
+     * into a scope some identifier cache already resolved past, so drop all caches. */
+    ctx->ident_cache_gen++;
     { int i; for (i = 0; i < prog->u.list.count; i++) hoist_vars(ctx, ctx->cur_env, prog->u.list.items[i]); }
+    { int i; for (i = 0; i < prog->u.list.count; i++) hoist_block_funcs(ctx, ctx->cur_env, prog->u.list.items[i]); }
     hoist_functions(ctx, prog->u.list.items, prog->u.list.count);
     c = exec_list(ctx, prog->u.list.items, prog->u.list.count);
     return ctx->has_exc ? js_undef() : c.value;
@@ -1720,6 +2119,7 @@ int js_run(js_ctx *ctx, js_node *program, js_value *result) {
     int i;
     ctx->cur_env = ctx->global_env;
     for (i = 0; i < program->u.list.count; i++) hoist_vars(ctx, ctx->global_env, program->u.list.items[i]);
+    for (i = 0; i < program->u.list.count; i++) hoist_block_funcs(ctx, ctx->global_env, program->u.list.items[i]);
     hoist_functions(ctx, program->u.list.items, program->u.list.count);
     c = exec_list(ctx, program->u.list.items, program->u.list.count);
     if (ctx->has_exc) return -1;
@@ -1743,10 +2143,15 @@ int js_run_module(js_ctx *ctx, js_node *program, js_object *exports, const char 
     js_env *menv;
     gc_push_scope();
     menv = (js_env *)gc_keep(js_new_env(ctx, ctx->global_env, 1));
+    /* Pin exports in this module's scope: it must survive GC for the whole body
+     * AND every nested import it triggers (this scope pops only after exec_list),
+     * so the engine doesn't rely on the embedder rooting it separately. */
+    if (exports) gc_keep(exports);
     ctx->cur_env = menv;
     ctx->cur_module_exports = exports;
     ctx->cur_module_url = url;
     for (i = 0; i < program->u.list.count; i++) hoist_vars(ctx, menv, program->u.list.items[i]);
+    for (i = 0; i < program->u.list.count; i++) hoist_block_funcs(ctx, menv, program->u.list.items[i]);
     hoist_functions(ctx, program->u.list.items, program->u.list.count);
     c = exec_list(ctx, program->u.list.items, program->u.list.count);
     (void)c;
@@ -1764,6 +2169,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
     memset(ctx, 0, sizeof(js_ctx));
     ctx->print = print;
     ctx->rng = 0x9e3779b9u;
+    ctx->ident_cache_gen = 1;
 
     js_gc_setup();
     gc_add_root((void **)&ctx->global);
@@ -1778,6 +2184,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
     gc_add_root((void **)&ctx->error_proto);
     gc_add_root((void **)&ctx->promise_proto);
     gc_add_root((void **)&ctx->symbol_proto);
+    gc_add_root((void **)&ctx->bigint_proto);
     gc_add_root((void **)&ctx->map_proto);
     gc_add_root((void **)&ctx->set_proto);
     gc_add_root((void **)&ctx->weakmap_proto);
@@ -1792,6 +2199,9 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
     gc_add_root((void **)&ctx->range_error_proto);
     gc_add_root((void **)&ctx->syntax_error_proto);
     gc_add_root((void **)&ctx->ref_error_proto);
+    gc_add_root((void **)&ctx->eval_error_proto);
+    gc_add_root((void **)&ctx->uri_error_proto);
+    gc_add_root((void **)&ctx->aggregate_error_proto);
     gc_add_root((void **)&ctx->sym_registry);
     gc_add_root((void **)&ctx->sym_for_reg);
     gc_add_root(&ctx->exc_root);
@@ -1805,6 +2215,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
     ctx->error_proto    = js_new_object(ctx, ctx->object_proto);
     ctx->promise_proto  = js_new_object(ctx, ctx->object_proto);
     ctx->symbol_proto   = js_new_object(ctx, ctx->object_proto);
+    ctx->bigint_proto   = js_new_object(ctx, ctx->object_proto);
     ctx->map_proto      = js_new_object(ctx, ctx->object_proto);
     ctx->set_proto      = js_new_object(ctx, ctx->object_proto);
     ctx->weakmap_proto  = js_new_object(ctx, ctx->object_proto);
@@ -1819,6 +2230,9 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
     ctx->range_error_proto  = js_new_object(ctx, ctx->error_proto);
     ctx->syntax_error_proto = js_new_object(ctx, ctx->error_proto);
     ctx->ref_error_proto    = js_new_object(ctx, ctx->error_proto);
+    ctx->eval_error_proto   = js_new_object(ctx, ctx->error_proto);
+    ctx->uri_error_proto    = js_new_object(ctx, ctx->error_proto);
+    ctx->aggregate_error_proto = js_new_object(ctx, ctx->error_proto);
 
     ctx->global = js_new_object(ctx, ctx->object_proto);
     ctx->global_env = js_new_env(ctx, NULL, 1);
@@ -1848,14 +2262,26 @@ void js_ctx_free(js_ctx *ctx) {
     gc_remove_root((void **)&ctx->error_proto);
     gc_remove_root((void **)&ctx->promise_proto);
     gc_remove_root((void **)&ctx->symbol_proto);
+    gc_remove_root((void **)&ctx->bigint_proto);
     gc_remove_root((void **)&ctx->map_proto);
     gc_remove_root((void **)&ctx->set_proto);
     gc_remove_root((void **)&ctx->weakmap_proto);
     gc_remove_root((void **)&ctx->weakset_proto);
+    gc_remove_root((void **)&ctx->date_proto);
+    gc_remove_root((void **)&ctx->regexp_proto);
+    gc_remove_root((void **)&ctx->typedarray_proto);
+    gc_remove_root((void **)&ctx->arraybuffer_proto);
+    gc_remove_root((void **)&ctx->dataview_proto);
+    { int i; for (i = 0; i < 9; i++) gc_remove_root((void **)&ctx->typed_protos[i]); }
     gc_remove_root((void **)&ctx->type_error_proto);
     gc_remove_root((void **)&ctx->range_error_proto);
     gc_remove_root((void **)&ctx->syntax_error_proto);
     gc_remove_root((void **)&ctx->ref_error_proto);
+    gc_remove_root((void **)&ctx->eval_error_proto);
+    gc_remove_root((void **)&ctx->uri_error_proto);
+    gc_remove_root((void **)&ctx->aggregate_error_proto);
+    gc_remove_root((void **)&ctx->sym_registry);
+    gc_remove_root((void **)&ctx->sym_for_reg);
     gc_remove_root(&ctx->exc_root);
     ctx->has_exc = 0;
     gc_collect();

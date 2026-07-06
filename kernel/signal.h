@@ -43,9 +43,8 @@
 #define SIG_DFL  0u             /* default action for the signal                   */
 #define SIG_IGN  1u             /* ignore the signal                               */
 
-/* sa_flags bits. Only SA_RESTART is meaningful today (unset = interrupted slow
- * syscalls return EINTR, which is what the blocking net/tcp waits already do). */
-#define SA_RESTART 0x10000000u
+/* sa_flags is stored per-signal but unused: an interrupted blocking syscall
+ * always returns EINTR. */
 
 /* sigprocmask() `how`. */
 #define SIG_BLOCK   0
@@ -68,6 +67,6 @@ struct k_sigaction {
  * interrupted context. Baked into the trampoline machine code, so it lives here
  * (shared by sched.c's frame builder and syscall.c's dispatch). MUST match the
  * SYS_SIGRETURN slot in kernel/syscall.c. User code never calls it directly. */
-#define SYS_SIGRETURN 85
+#define SYS_SIGRETURN 75
 
 #endif /* OWOS_SIGNAL_H */

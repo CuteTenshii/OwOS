@@ -22,6 +22,7 @@ typedef struct {
     int       failed;
     const char *errmsg;
     int       errline;
+    int       errcol;
     int       in_async;         /* inside an async function body (await is a kw)  */
     int       in_generator;     /* inside a generator body (yield is a kw)        */
     int       pending_async;    /* the function/arrow about to be parsed is async */
@@ -44,6 +45,7 @@ static void advance(js_parser *p) {
         p->failed = 1;
         p->errmsg = p->lx.err ? p->lx.err : "lexical error";
         p->errline = p->cur.line;
+        p->errcol = p->cur.col;
     }
 }
 
@@ -58,7 +60,7 @@ static jtoken *peek2(js_parser *p) {
 }
 
 static void *perr(js_parser *p, const char *msg) {
-    if (!p->failed) { p->failed = 1; p->errmsg = msg; p->errline = p->cur.line; }
+    if (!p->failed) { p->failed = 1; p->errmsg = msg; p->errline = p->cur.line; p->errcol = p->cur.col; }
     return NULL;
 }
 
@@ -90,17 +92,17 @@ static int node_word_is(js_node *n, const char *w) {
 
 /* ------------------------------------------------------- node helpers ----- */
 
-static js_node *mk(js_parser *p, int type) { return js_node_new(p->arena, type, p->cur.line); }
+static js_node *mk(js_parser *p, int type) { return js_node_new(p->arena, type, p->cur.line, p->cur.col); }
 
-static js_node *ident_from(js_parser *p, const char *s, int len, int line) {
-    js_node *n = js_node_new(p->arena, JS_IDENT, line);
+static js_node *ident_from(js_parser *p, const char *s, int len, int line, int col) {
+    js_node *n = js_node_new(p->arena, JS_IDENT, line, col);
     n->u.str.s = s; n->u.str.len = len;
     return n;
 }
 
 /* consume the current identifier-like token as an identifier node */
 static js_node *eat_ident(js_parser *p) {
-    js_node *n = ident_from(p, p->cur.value, p->cur.value_len, p->cur.line);
+    js_node *n = ident_from(p, p->cur.value, p->cur.value_len, p->cur.line, p->cur.col);
     advance(p);
     return n;
 }
@@ -343,18 +345,18 @@ static js_node *parse_tail(js_parser *p, js_node *e, int allow_call) {
 
 static js_node *parse_new(js_parser *p) {
     js_node *node, *callee;
-    int line = p->cur.line;
+    int line = p->cur.line, col = p->cur.col;
     advance(p);                                   /* 'new' */
     if (at(p, T_DOT)) {                           /* new.target */
         advance(p);
         if (!word_is(&p->cur, "target", 6)) return perr(p, "expected 'target' after 'new.'");
         advance(p);
-        return ident_from(p, "new.target", 10, line);
+        return ident_from(p, "new.target", 10, line, col);
     }
     if (at(p, T_NEW)) callee = parse_new(p);
     else callee = parse_tail(p, parse_primary(p), 0);   /* member access, but not a call */
     if (p->failed) return NULL;
-    node = js_node_new(p->arena, JS_NEW, line);
+    node = js_node_new(p->arena, JS_NEW, line, col);
     node->u.call.callee = callee;
     if (at(p, T_LPAREN)) parse_arguments(p, &node->u.call.args, &node->u.call.nargs);
     return node;
@@ -414,15 +416,15 @@ static js_node *parse_binary(js_parser *p, int min_prec, int no_in) {
     for (;;) {
         int op = p->cur.kind;
         int prec = binop_prec(op, no_in);
-        int next_min, line;
+        int next_min, line, col;
         js_node *right, *node;
         if (prec == 0 || prec <= min_prec) break;
-        line = p->cur.line;
+        line = p->cur.line; col = p->cur.col;
         advance(p);
         next_min = (op == T_STARSTAR) ? prec - 1 : prec;   /* ** is right-associative */
         right = parse_binary(p, next_min, no_in);
         if (p->failed) return NULL;
-        node = js_node_new(p->arena, (op == T_AMPAMP || op == T_BARBAR || op == T_QQ) ? JS_LOGICAL : JS_BINARY, line);
+        node = js_node_new(p->arena, (op == T_AMPAMP || op == T_BARBAR || op == T_QQ) ? JS_LOGICAL : JS_BINARY, line, col);
         node->op = op;
         node->u.bin.left = left;
         node->u.bin.right = right;
@@ -449,8 +451,8 @@ static js_node *parse_conditional(js_parser *p, int no_in) {
 static int is_assign_op(int k) { return k == T_EQ || (k >= T_PLUS_EQ && k <= T_QQ_EQ); }
 
 /* arrow body after the '=>' has been consumed */
-static js_node *finish_arrow(js_parser *p, js_node **params, int nparams, int line) {
-    js_node *fn = js_node_new(p->arena, JS_FUNC, line);
+static js_node *finish_arrow(js_parser *p, js_node **params, int nparams, int line, int col) {
+    js_node *fn = js_node_new(p->arena, JS_FUNC, line, col);
     int saved = p->in_async;
     fn->u.func.is_arrow = 1;
     fn->u.func.is_async = p->pending_async;
@@ -490,18 +492,20 @@ static js_node *parse_assignment_inner(js_parser *p, int no_in) {
     /* async function expression / async arrow */
     if (at(p, T_IDENT) && word_is(&p->cur, "async", 5) && !peek(p)->newline_before) {
         int pk = peek(p)->kind;
-        if (pk == T_FUNCTION) { advance(p); p->pending_async = 1; return parse_function(p, 0); }
-        if (pk == T_LPAREN)   { advance(p); p->pending_async = 1; /* -> primary's paren arrow */ }
+        /* Only the async *arrow* forms are handled here; `async function` exprs
+         * are parsed at the primary level (parse_primary) so they also work as a
+         * unary operand / call callee (`!async function(){}()`). */
+        if (pk == T_LPAREN) { advance(p); p->pending_async = 1; /* -> primary's paren arrow */ }
         else if (pk == T_IDENT && peek2(p)->kind == T_ARROW) { advance(p); p->pending_async = 1; /* -> single-ident arrow */ }
     }
 
     /* x => ...  (single-identifier arrow) */
     if (at(p, T_IDENT) && peek(p)->kind == T_ARROW) {
-        int line = p->cur.line;
+        int line = p->cur.line, col = p->cur.col;
         js_node **params = (js_node **)js_arena_alloc(p->arena, sizeof(js_node *));
         params[0] = eat_ident(p);
         advance(p);                               /* '=>' */
-        return finish_arrow(p, params, 1, line);
+        return finish_arrow(p, params, 1, line, col);
     }
 
     left = parse_conditional(p, no_in);
@@ -509,14 +513,14 @@ static js_node *parse_assignment_inner(js_parser *p, int no_in) {
 
     if (is_assign_op(p->cur.kind)) {
         int op = p->cur.kind;
-        int line = p->cur.line;
+        int line = p->cur.line, col = p->cur.col;
         js_node *n;
         if (op == T_EQ && (left->type == JS_ARRAY || left->type == JS_OBJECT)) {
             left = reinterpret_pattern(p, left);  /* destructuring assignment target */
             if (p->failed) return NULL;
         }
         advance(p);
-        n = js_node_new(p->arena, JS_ASSIGN, line);
+        n = js_node_new(p->arena, JS_ASSIGN, line, col);
         n->op = op;
         n->u.bin.left = left;
         n->u.bin.right = parse_assignment(p, no_in);
@@ -542,7 +546,7 @@ static js_node *parse_expression(js_parser *p, int no_in) {
 
 /* '(' ... — parenthesized expression or arrow parameter list (cover grammar) */
 static js_node *parse_paren_or_arrow(js_parser *p) {
-    int line = p->cur.line;
+    int line = p->cur.line, col = p->cur.col;
     nvec items; items.a = NULL; items.n = 0; items.cap = 0;
     int saw_rest = 0;
     advance(p);                                   /* '(' */
@@ -569,7 +573,7 @@ static js_node *parse_paren_or_arrow(js_parser *p) {
             params[i] = reinterpret_pattern(p, params[i]);
             if (p->failed) return NULL;
         }
-        return finish_arrow(p, params, nparams, line);
+        return finish_arrow(p, params, nparams, line, col);
     }
 
     /* not an arrow: a parenthesized expression (drop any pending `async`) */
@@ -578,7 +582,7 @@ static js_node *parse_paren_or_arrow(js_parser *p) {
     if (items.n == 0) { if (items.a) free(items.a); return perr(p, "expected expression"); }
     if (items.n == 1) { js_node *e = items.a[0]; free(items.a); return e; }
     {
-        js_node *seq = js_node_new(p->arena, JS_SEQUENCE, line);
+        js_node *seq = js_node_new(p->arena, JS_SEQUENCE, line, col);
         seq->u.list.items = nv_freeze(p, &items, &seq->u.list.count);
         return seq;
     }
@@ -753,9 +757,18 @@ static js_node *parse_template(js_parser *p) {
 
 static js_node *parse_primary(js_parser *p) {
     switch (p->cur.kind) {
-    case T_NUM: case T_BIGINT: {
+    case T_NUM: {
         js_node *n = mk(p, JS_NUM);
         n->u.num = p->cur.num;
+        advance(p);
+        return n;
+    }
+    case T_BIGINT: {
+        /* keep the source digits (sans the trailing 'n') so the interpreter can
+         * build the exact bignum — the token's double approximation would lose it */
+        js_node *n = mk(p, JS_BIGINT);
+        n->u.str.s = js_arena_strndup(p->arena, p->cur.start, p->cur.len > 0 ? p->cur.len - 1 : 0);
+        n->u.str.len = p->cur.len > 0 ? p->cur.len - 1 : 0;
         advance(p);
         return n;
     }
@@ -782,6 +795,15 @@ static js_node *parse_primary(js_parser *p) {
     case T_THIS:  { js_node *n = mk(p, JS_THIS);  advance(p); return n; }
     case T_SUPER: { js_node *n = mk(p, JS_SUPER); advance(p); return n; }
     case T_IDENT:
+        /* `async function(){}` as an expression. Handled here (the primary level)
+         * so it works in every expression context — as a unary operand or call
+         * callee too, e.g. `!async function(){}()`. The async *arrow* forms stay
+         * at assignment precedence (parse_assignment_inner). */
+        if (p->cur.value && word_is(&p->cur, "async", 5) && peek(p)->kind == T_FUNCTION && !peek(p)->newline_before) {
+            advance(p);                           /* `async` */
+            p->pending_async = 1;
+            return parse_function(p, 0);
+        }
         /* `#name` (a private brand) only appears in expression position as the
          * left of `#x in obj`; emit it as the string key it maps to. */
         if (p->cur.value && p->cur.value[0] == '#') {
@@ -834,7 +856,7 @@ static js_node *reinterpret_pattern(js_parser *p, js_node *n) {
     case JS_ASSIGN:
         if (n->op != T_EQ) return perr(p, "invalid destructuring target");
         {
-            js_node *d = js_node_new(p->arena, JS_ASSIGN_PATTERN, n->line);
+            js_node *d = js_node_new(p->arena, JS_ASSIGN_PATTERN, n->line, n->col);
             d->u.assignpat.id = reinterpret_pattern(p, n->u.bin.left);
             d->u.assignpat.init = n->u.bin.right;
             return p->failed ? NULL : d;
@@ -896,13 +918,13 @@ static js_node *parse_params_into(js_parser *p, js_node ***out, int *count) {
 
 static js_node *parse_function(js_parser *p, int is_decl) {
     js_node *fn;
-    int line = p->cur.line;
+    int line = p->cur.line, col = p->cur.col;
     int sa = p->in_async, sg = p->in_generator;
     int is_async = p->pending_async, is_gen = 0;
     p->pending_async = 0;
     advance(p);                                   /* 'function' */
     if (at(p, T_STAR)) { is_gen = 1; advance(p); }
-    fn = js_node_new(p->arena, JS_FUNC, line);
+    fn = js_node_new(p->arena, JS_FUNC, line, col);
     fn->u.func.is_async = is_async;
     fn->u.func.is_generator = is_gen;
     if (at(p, T_IDENT)) { fn->u.func.name = p->cur.value; advance(p); }
@@ -918,9 +940,9 @@ static js_node *parse_function(js_parser *p, int is_decl) {
 static js_node *parse_class(js_parser *p, int is_decl) {
     js_node *node;
     js_member *members = NULL; int n = 0, cap = 0;
-    int line = p->cur.line;
+    int line = p->cur.line, col = p->cur.col;
     advance(p);                                   /* 'class' */
-    node = js_node_new(p->arena, JS_CLASS, line);
+    node = js_node_new(p->arena, JS_CLASS, line, col);
     if (at(p, T_IDENT)) node->u.cls.id = eat_ident(p);
     else if (is_decl) return perr(p, "class declaration requires a name");
     if (eat(p, T_EXTENDS)) { node->u.cls.super = parse_lhs(p); if (p->failed) return NULL; }
@@ -934,7 +956,7 @@ static js_node *parse_class(js_parser *p, int is_decl) {
             advance(p);
         }
         if (m.is_static && at(p, T_LBRACE)) {     /* static initialization block */
-            js_node *fn = js_node_new(p->arena, JS_FUNC, line);
+            js_node *fn = js_node_new(p->arena, JS_FUNC, line, col);
             fn->u.func.name = NULL; fn->u.func.params = NULL; fn->u.func.nparams = 0;
             fn->u.func.is_arrow = fn->u.func.is_expr_body = fn->u.func.is_async = fn->u.func.is_generator = 0;
             fn->u.func.body = parse_block(p);
@@ -1026,7 +1048,7 @@ static js_node *parse_var_decl(js_parser *p, int kind, int consume_semi, int no_
 
 static js_node *parse_for(js_parser *p) {
     js_node *node;
-    int line = p->cur.line;
+    int line = p->cur.line, col = p->cur.col;
     js_node *init = NULL;
     advance(p);                                   /* 'for' */
     if (at(p, T_IDENT) && word_is(&p->cur, "await", 5)) advance(p);   /* `for await` (async iteration) — parsed like for-of */
@@ -1041,7 +1063,7 @@ static js_node *parse_for(js_parser *p) {
         if (at(p, T_IN) || is_of(p)) {
             int of = is_of(p);
             advance(p);
-            node = js_node_new(p->arena, JS_FOR_IN, line);
+            node = js_node_new(p->arena, JS_FOR_IN, line, col);
             node->u.forin.of = of;
             node->u.forin.left = init;
             node->u.forin.right = of ? parse_assignment(p, 0) : parse_expression(p, 0);
@@ -1057,7 +1079,7 @@ static js_node *parse_for(js_parser *p) {
             js_node *left = reinterpret_pattern(p, init);
             if (p->failed) return NULL;
             advance(p);
-            node = js_node_new(p->arena, JS_FOR_IN, line);
+            node = js_node_new(p->arena, JS_FOR_IN, line, col);
             node->u.forin.of = of;
             node->u.forin.left = left;
             node->u.forin.right = of ? parse_assignment(p, 0) : parse_expression(p, 0);
@@ -1069,7 +1091,7 @@ static js_node *parse_for(js_parser *p) {
     }
 
     expect(p, T_SEMI, "expected ';' in for-header");
-    node = js_node_new(p->arena, JS_FOR, line);
+    node = js_node_new(p->arena, JS_FOR, line, col);
     node->u.forc.init = init;
     node->u.forc.test = at(p, T_SEMI) ? NULL : parse_expression(p, 0);
     expect(p, T_SEMI, "expected ';' in for-header");
@@ -1116,7 +1138,7 @@ static js_node *parse_switch(js_parser *p) {
     js_node *node;
     js_case *cases = NULL; int n = 0, cap = 0;
     js_node *disc;
-    int line = p->cur.line;
+    int line = p->cur.line, col = p->cur.col;
     advance(p);                                   /* 'switch' */
     expect(p, T_LPAREN, "expected '(' after 'switch'");
     disc = parse_expression(p, 0);
@@ -1136,7 +1158,7 @@ static js_node *parse_switch(js_parser *p) {
         cases[n++] = c;
     }
     expect(p, T_RBRACE, "expected '}' to close switch body");
-    node = js_node_new(p->arena, JS_SWITCH, line);
+    node = js_node_new(p->arena, JS_SWITCH, line, col);
     if (p->failed) { if (cases) free(cases); return NULL; }
     node->u.sw.disc = disc;
     node->u.sw.count = n;
@@ -1382,6 +1404,7 @@ js_node *js_parse(const char *src, js_arena *arena, js_parse_error *err) {
     p.failed = 0;
     p.errmsg = NULL;
     p.errline = 0;
+    p.errcol = 0;
     p.in_async = p.in_generator = p.pending_async = p.pending_generator = 0;
     p.depth = 0;
     js_lexer_init(&p.lx, src, arena);
@@ -1392,11 +1415,11 @@ js_node *js_parse(const char *src, js_arena *arena, js_parse_error *err) {
 
     if (p.failed) {
         if (body.a) free(body.a);
-        if (err) { err->msg = p.errmsg ? p.errmsg : "syntax error"; err->line = p.errline; }
+        if (err) { err->msg = p.errmsg ? p.errmsg : "syntax error"; err->line = p.errline; err->col = p.errcol; }
         return NULL;
     }
-    prog = js_node_new(arena, JS_PROGRAM, 1);
+    prog = js_node_new(arena, JS_PROGRAM, 1, 1);
     prog->u.list.items = nv_freeze(&p, &body, &prog->u.list.count);
-    if (err) { err->msg = NULL; err->line = 0; }
+    if (err) { err->msg = NULL; err->line = 0; err->col = 0; }
     return prog;
 }

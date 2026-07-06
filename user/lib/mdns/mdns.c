@@ -163,6 +163,7 @@ static int harvest_response(const unsigned char *r, int rn,
 		if (!l) break;
 		name_str(r, rn, pos, owner, sizeof owner);
 		pos += l;
+		if (pos + 10 > rn) break;   /* the 10-byte RR header sits *after* the owner name */
 		int type = (int)be16(r + pos);
 		int rdlen = (int)be16(r + pos + 8);
 		int rd = pos + 10;
@@ -237,7 +238,9 @@ int mdns_resolve(const char *host, uint8_t ip[4])
 
 	struct mdns_service s;
 	memset(&s, 0, sizeof s);
-	strcpy(s.host, host);                      /* seed so an A owner-matches     */
+	int hl = (int)strlen(host);
+	if (hl >= (int)sizeof s.host) { net_close(h); return 0; }  /* can't be a .local we'd match */
+	memcpy(s.host, host, hl + 1);              /* seed so an A owner-matches     */
 	int count = 1;
 	unsigned deadline = msec() + 1500;
 	unsigned char r[MDNS_MAX_PKT];

@@ -30,8 +30,8 @@ int  net_sock_close(int h);
 /* Set the outgoing IP TTL for a UDP socket (IP_MULTICAST_TTL analog). 0/-1. */
 int  net_sock_set_ttl(int h, int ttl);
 
-/* Raw Ethernet socket (the AF_PACKET analog), driven by SYS_NET_RAW_OPEN. A
- * SK_RAWETH slot in the same handle table: net_sock_send transmits the caller's
+/* Raw Ethernet socket (the AF_PACKET analog), reached via net_sock_connect with
+ * SK_RAWETH. A raw slot in the same handle table: net_sock_send transmits the caller's
  * full L2 frame verbatim, net_sock_recv/_nb dequeues one received frame. Returns
  * a handle or -1 (no slot/NIC). Root-gating lives in the syscall layer. */
 int  net_raw_open(void);

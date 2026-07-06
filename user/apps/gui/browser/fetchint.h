@@ -7,8 +7,8 @@
 #include "browser.h"
 
 /* Request-header values, shared so the browser presents itself identically on
- * the page request and every sub-resource request. */
-#define BR_UA     "Mozilla/5.0 (OwOS; x86) OwOS-Browser/1.0"
+ * the page request and every sub-resource request. The User-Agent is browser_ua()
+ * (browser.h), also read by the JS navigator, so wire and script never disagree. */
 #define BR_ACCEPT "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 #define BR_ACCLNG "en-US,en;q=0.9"
 
@@ -20,5 +20,11 @@ void  fetch_favicon(const char *page_url);          /* page favicon -> B->favico
 /* Batch-fetch external stylesheets (html.c hook): same-origin HTTPS multiplexed
  * over h2, the rest over h1.1. Fills bodies[i] (malloc'd, caller frees) + lens[i].*/
 void  css_batch(char *const *urls, int n, unsigned char **bodies, int *lens);
+
+/* Decode a data:[<mediatype>][;base64],<payload> URL into a fresh malloc'd buffer
+ * (caller frees), setting *outlen and copying the media type (default text/plain)
+ * into `ctype` (capped at `cap`). NULL on a malformed URL / OOM. Shared by the
+ * sub-resource batch (resource.c) and the top-level document loader (fetch.c). */
+unsigned char *decode_data_url(const char *url, int *outlen, char *ctype, int cap);
 
 #endif /* OWOS_BROWSER_FETCHINT_H */

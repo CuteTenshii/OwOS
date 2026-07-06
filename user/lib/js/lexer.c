@@ -111,6 +111,7 @@ void js_lexer_init(jlexer *lx, const char *src, js_arena *arena) {
     lx->p = src;
     lx->end = src + strlen(src);
     lx->line = 1;
+    lx->line_start = src;
     lx->arena = arena;
     lx->prev_kind = 0;
     lx->saw_newline = 0;
@@ -134,7 +135,7 @@ static void skip_trivia(jlexer *lx) {
     for (;;) {
         char c = *lx->p;
         if (c == 0) return;
-        if (c == '\n') { lx->line++; lx->saw_newline = 1; lx->p++; continue; }
+        if (c == '\n') { lx->line++; lx->saw_newline = 1; lx->p++; lx->line_start = lx->p; continue; }
         if (is_space(c)) { lx->p++; continue; }
         if (c == '/' && lx->p[1] == '/') {
             lx->p += 2;
@@ -144,7 +145,7 @@ static void skip_trivia(jlexer *lx) {
         if (c == '/' && lx->p[1] == '*') {
             lx->p += 2;
             while (*lx->p && !(*lx->p == '*' && lx->p[1] == '/')) {
-                if (*lx->p == '\n') { lx->line++; lx->saw_newline = 1; }
+                if (*lx->p == '\n') { lx->line++; lx->saw_newline = 1; lx->line_start = lx->p + 1; }
                 lx->p++;
             }
             if (*lx->p) lx->p += 2;     /* consume the closing star-slash */
@@ -185,7 +186,7 @@ static int decode_escape(jlexer *lx, cbuf *cook) {
     case 'f': cb_push(cook, '\f'); lx->p++; return 1;
     case 'v': cb_push(cook, '\v'); lx->p++; return 1;
     case '\r': if (lx->p[1] == '\n') lx->p++; /* fall through */
-    case '\n': lx->line++; lx->p++; return 1;   /* line continuation: emit nothing */
+    case '\n': lx->line++; lx->p++; lx->line_start = lx->p; return 1;   /* line continuation: emit nothing */
     case 'x': {
         if (!is_hex(lx->p[1]) || !is_hex(lx->p[2])) return 0;
         cb_push_cp(cook, (unsigned)(hexval(lx->p[1]) * 16 + hexval(lx->p[2])));
@@ -262,8 +263,8 @@ static void scan_template(jlexer *lx, jtoken *out, int after_sub) {
             break;
         }
         if (c == '\\') { if (!decode_escape(lx, &cook)) { cb_free(&cook); fail(lx, out, "bad escape sequence"); return; } continue; }
-        if (c == '\r') { lx->line++; if (lx->p[1] == '\n') lx->p++; cb_push(&cook, '\n'); lx->p++; continue; }
-        if (c == '\n') { lx->line++; cb_push(&cook, '\n'); lx->p++; continue; }
+        if (c == '\r') { lx->line++; if (lx->p[1] == '\n') lx->p++; cb_push(&cook, '\n'); lx->p++; lx->line_start = lx->p; continue; }
+        if (c == '\n') { lx->line++; cb_push(&cook, '\n'); lx->p++; lx->line_start = lx->p; continue; }
         cb_push(&cook, c);
         lx->p++;
     }
@@ -391,6 +392,56 @@ static void scan_regex(jlexer *lx, jtoken *out) {
     cb_free(&pat); cb_free(&flags);
 }
 
+/* ------------------------------------------------------- identifiers ------ */
+
+/* Decode a '\uXXXX' or '\u{...}' escape at lx->p (pointing at the '\\') — the
+ * only escape legal inside an IdentifierName — appending its UTF-8 form to cook.
+ * Returns 0 on a non-'\u' or malformed escape. */
+static int decode_ident_escape(jlexer *lx, cbuf *cook) {
+    unsigned cp = 0;
+    if (lx->p[0] != '\\' || lx->p[1] != 'u') return 0;
+    lx->p += 2;
+    if (*lx->p == '{') {
+        lx->p++;
+        if (!is_hex(*lx->p)) return 0;
+        while (is_hex(*lx->p)) { cp = cp * 16 + (unsigned)hexval(*lx->p); lx->p++; }
+        if (*lx->p != '}') return 0;
+        lx->p++;
+    } else {
+        int i;
+        for (i = 0; i < 4; i++) { if (!is_hex(*lx->p)) return 0; cp = cp * 16 + (unsigned)hexval(*lx->p); lx->p++; }
+    }
+    cb_push_cp(cook, cp);
+    return 1;
+}
+
+/* Scan an identifier containing one or more '\uXXXX' escapes (the slow path;
+ * plain names take the raw-slice fast path in js_lex_next). Re-scans from `s`,
+ * decoding each escape into its UTF-8 bytes so the cooked name is the identifier's
+ * StringValue. An escaped identifier is never a keyword (e.g. `if` is the
+ * name "if", not the `if` keyword). */
+static void scan_ident_escaped(jlexer *lx, jtoken *out, const char *s) {
+    cbuf cook;
+    int first = 1;
+    cb_init(&cook);
+    lx->p = s;
+    for (;;) {
+        char c = *lx->p;
+        if (c == '\\' && lx->p[1] == 'u') {
+            if (!decode_ident_escape(lx, &cook)) { cb_free(&cook); fail(lx, out, "invalid Unicode escape in identifier"); return; }
+        } else if (first ? is_id_start((unsigned char)c) : is_id_cont((unsigned char)c)) {
+            cb_push(&cook, c);
+            lx->p++;
+        } else break;
+        first = 0;
+    }
+    out->len = (int)(lx->p - s);
+    out->value = js_arena_strndup(lx->arena, cook.b ? cook.b : "", cook.len);
+    out->value_len = cook.len;
+    out->kind = T_IDENT;
+    cb_free(&cook);
+}
+
 /* ------------------------------------------------------- main scan -------- */
 
 void js_lex_next(jlexer *lx, jtoken *out) {
@@ -398,6 +449,7 @@ void js_lex_next(jlexer *lx, jtoken *out) {
     int rparen_ctrl, rbrace_block;
     out->kind = T_EOF; out->newline_before = 0; out->num = 0;
     out->value = NULL; out->value_len = 0; out->flags = NULL; out->len = 0;
+    out->col = 1;
 
     if (lx->err) { out->kind = T_ERROR; return; }
 
@@ -405,6 +457,7 @@ void js_lex_next(jlexer *lx, jtoken *out) {
     out->newline_before = lx->saw_newline;
     lx->saw_newline = 0;
     out->line = lx->line;
+    out->col = (int)(lx->p - lx->line_start) + 1;
     out->start = lx->p;
 
     c = *lx->p;
@@ -418,11 +471,24 @@ void js_lex_next(jlexer *lx, jtoken *out) {
     if (is_id_start(c)) {
         const char *s = lx->p;
         while (is_id_cont(*lx->p)) lx->p++;
+        if (*lx->p == '\\' && lx->p[1] == 'u') {   /* embedded \uXXXX: cook the name */
+            scan_ident_escaped(lx, out, s);
+            if (out->kind != T_ERROR) lx->prev_kind = out->kind;
+            return;
+        }
         out->len = (int)(lx->p - s);
         out->value = js_arena_strndup(lx->arena, s, out->len);
         out->value_len = out->len;
         out->kind = keyword_kind(s, out->len);
         lx->prev_kind = out->kind;
+        return;
+    }
+
+    /* An identifier that begins with a Unicode escape (e.g. `Ā` as an object
+     * key — real-world minifiers/transliteration maps emit these). */
+    if (c == '\\' && lx->p[1] == 'u') {
+        scan_ident_escaped(lx, out, lx->p);
+        if (out->kind != T_ERROR) lx->prev_kind = out->kind;
         return;
     }
 

@@ -16,6 +16,7 @@
 
 #include "heap.h"
 #include "pmm.h"
+#include "console.h"
 #include <stdint.h>
 
 /* Defined by linker.ld as the first byte past the kernel image (end of .bss). */
@@ -40,6 +41,15 @@ static block_t *head;
 void heap_init(void)
 {
 	uint32_t start = ALIGN_UP((uint32_t)(uintptr_t)kernel_end, 4096u);
+	/* The kernel image grows as user-program blobs are embedded; if it ever
+	 * reaches the page-table pool there is no room for a heap. Halt loudly rather
+	 * than let the unsigned subtraction below wrap to a ~4 GiB first block that
+	 * would hand out kernel/pool memory as kmalloc payloads. */
+	if (start >= KHEAP_END || (KHEAP_END - start) <= sizeof(block_t) + 8) {
+		con_write("heap: no room between kernel image and page-table pool -- halting.\n");
+		for (;;)
+			__asm__ volatile ("cli; hlt");
+	}
 	head = (block_t *)start;
 	head->size = (KHEAP_END - start) - sizeof(block_t);
 	head->free = 1;

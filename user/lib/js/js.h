@@ -35,8 +35,8 @@
  * builtin (Error/Array) doesn't fully initialise the builtin's internal state.
  *
  * Known simplifications: strings are byte- (not UTF-16-) indexed, so .length and
- * indexing are exact for ASCII and count bytes for multibyte text; BigInt is
- * tokenized but evaluated as a double; for-of iterates arrays and strings only.
+ * indexing are exact for ASCII and count bytes for multibyte text; for-of
+ * iterates arrays and strings only.
  *
  * Parse usage:
  *   js_arena a; js_arena_init(&a);

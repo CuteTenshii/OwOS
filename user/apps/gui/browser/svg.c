@@ -83,19 +83,16 @@ static float attr_len(const struct dom_node *n, const char *name, float def)
 }
 
 /* ------------------------------------------------ colour ------------------- */
-/* What `currentColor` resolves to for the SVG currently being rendered; set at
- * the top of svg_render from its current_color argument (the element's CSS color
- * for inline <svg>). 0xRRGGBB. */
-static int g_current_color = 0x000000;
-
 /* Returns 0xRRGGBB, -1 for "none"/transparent, -2 for "not a colour / inherit".
  * Hex/rgb/hsl/named parsing is shared via color.c; only the SVG-specific keywords
- * (none/transparent/currentColor) are handled here. */
-static int parse_paint(const char *v)
+ * (none/transparent/currentColor) are handled here. `cur_color` (0xRRGGBB) is what
+ * `currentColor` resolves to for this render — threaded through so concurrent
+ * per-image renders don't share it. */
+static int parse_paint(const char *v, int cur_color)
 {
 	while (*v == ' ' || *v == '\t') v++;
 	if (starts_ci(v, "none") || starts_ci(v, "transparent")) return -1;
-	if (starts_ci(v, "currentColor")) return g_current_color;
+	if (starts_ci(v, "currentColor")) return cur_color;
 	int c = color_parse(v);
 	return c >= 0 ? c : -2;
 }
@@ -125,14 +122,14 @@ static int style_prop(const char *style, const char *prop, char *out, int cap)
 struct paint { int fill; int stroke; float stroke_w; int evenodd; };
 
 /* Resolve an element's paint over the inherited one. */
-static struct paint resolve_paint(const struct dom_node *n, struct paint in)
+static struct paint resolve_paint(const struct dom_node *n, struct paint in, int cur_color)
 {
 	struct paint p = in;
 	char buf[64];
 	const char *v;
 
-	if ((v = dom_get_attr(n, "fill")))   { int c = parse_paint(v); if (c != -2) p.fill = c; }
-	if ((v = dom_get_attr(n, "stroke"))) { int c = parse_paint(v); if (c != -2) p.stroke = c; }
+	if ((v = dom_get_attr(n, "fill")))   { int c = parse_paint(v, cur_color); if (c != -2) p.fill = c; }
+	if ((v = dom_get_attr(n, "stroke"))) { int c = parse_paint(v, cur_color); if (c != -2) p.stroke = c; }
 	if ((v = dom_get_attr(n, "stroke-width"))) {
 		const char *q = v, *e = v + strlen(v); float w;
 		if (parse_num(&q, e, &w)) p.stroke_w = w;
@@ -140,8 +137,8 @@ static struct paint resolve_paint(const struct dom_node *n, struct paint in)
 	if ((v = dom_get_attr(n, "fill-rule"))) p.evenodd = starts_ci(v, "evenodd");
 	const char *st = dom_get_attr(n, "style");
 	if (st) {
-		if (style_prop(st, "fill", buf, sizeof buf))   { int c = parse_paint(buf); if (c != -2) p.fill = c; }
-		if (style_prop(st, "stroke", buf, sizeof buf)) { int c = parse_paint(buf); if (c != -2) p.stroke = c; }
+		if (style_prop(st, "fill", buf, sizeof buf))   { int c = parse_paint(buf, cur_color); if (c != -2) p.fill = c; }
+		if (style_prop(st, "stroke", buf, sizeof buf)) { int c = parse_paint(buf, cur_color); if (c != -2) p.stroke = c; }
 		if (style_prop(st, "stroke-width", buf, sizeof buf)) {
 			const char *q = buf, *e = buf + strlen(buf); float w;
 			if (parse_num(&q, e, &w)) p.stroke_w = w;
@@ -197,6 +194,9 @@ struct ras {
 	unsigned *buf; int w, h;     /* device buffer (SS resolution) */
 	float *px, *py; int np, cap; /* current path's points */
 	int   *sub;    int ns, csub; /* subpath start indices */
+	int    cur_color;            /* what currentColor resolves to (0xRRGGBB)  */
+	float  xs[1024];             /* per-render scanline x-crossings scratch    */
+	int    wd[1024];             /* winding direction for each crossing        */
 };
 
 static int ras_pt(struct ras *r, float x, float y)
@@ -243,9 +243,8 @@ static void fill_path(struct ras *r, int rgb, int evenodd)
 	int y0 = (int)ymin; if (y0 < 0) y0 = 0;
 	int y1 = (int)ymax + 1; if (y1 > r->h) y1 = r->h;
 
-	/* x-crossings buffer */
-	static float xs[1024];
-	static int   wd[1024];
+	float *xs = r->xs;   /* per-render scratch (see struct ras) */
+	int   *wd = r->wd;
 
 	for (int y = y0; y < y1; y++) {
 		float yc = y + 0.5f;
@@ -522,7 +521,7 @@ static void render_node(struct dom_node *n, struct ras *r, struct mat ctm, struc
 		const char *tag = c->tag;
 
 		struct mat m = mat_mul(ctm, parse_transform(dom_get_attr(c, "transform")));
-		struct paint pp = resolve_paint(c, pin);
+		struct paint pp = resolve_paint(c, pin, r->cur_color);
 
 		if (streq(tag, "g") || streq(tag, "svg") || streq(tag, "a")) {
 			render_node(c, r, m, pp);
@@ -650,7 +649,6 @@ int svg_render(const char *data, int len, int w, int h, unsigned *out,
                unsigned current_color)
 {
 	if (w <= 0 || h <= 0 || !out) return 0;
-	g_current_color = (int)(current_color & 0xFFFFFF);
 
 	struct dom_node *root = dom_parse(data, len);
 	if (!root) return 0;
@@ -680,6 +678,7 @@ int svg_render(const char *data, int len, int w, int h, unsigned *out,
 	r.px = r.py = 0; r.np = r.cap = 0;
 	r.sub = 0; r.ns = r.csub = 0;
 	r.w = dw; r.h = dh;
+	r.cur_color = (int)(current_color & 0xFFFFFF);
 	if (!r.buf) { dom_free(root); return 0; }
 	for (int i = 0; i < dw * dh; i++) r.buf[i] = 0;
 
@@ -693,7 +692,7 @@ int svg_render(const char *data, int len, int w, int h, unsigned *out,
 
 	/* Default paint is black fill / no stroke, but the root <svg>'s own fill/stroke
 	 * (incl. the CSS values html.c bakes onto it) must inherit to its children. */
-	struct paint base = resolve_paint(svg, (struct paint){ 0x000000, -1, 1.0f, 0 });
+	struct paint base = resolve_paint(svg, (struct paint){ 0x000000, -1, 1.0f, 0 }, r.cur_color);
 	render_node(svg, &r, ctm, base);
 
 	/* box-downsample SS -> 1, averaging colour and alpha */

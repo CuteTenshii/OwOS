@@ -5,16 +5,17 @@
  * pages built bottom-up — leaves plus interior pages when a table outgrows one
  * page, the record/serial-type encoding, and varints), and sql_open() parses
  * one back. A file written here opens in the host `sqlite3` shell, and a real
- * SQLite file (UTF-8, no overflow/index pages) loads here.
+ * SQLite file (UTF-8, no index pages) loads here.
  *
  * It is deliberately scoped to what an embedded app needs and what fits OwOS's
  * whole-file I/O (readfile/writefile, no random writes): an in-memory model.
  * sql_open() reads the entire file and parses it into tables and rows; you
  * mutate that model in RAM; sql_save() serialises the whole thing back out.
- * Supported on read: table b-trees (leaf + interior), records of NULL / integer
- * / IEEE-float / TEXT / BLOB columns. Not supported: index b-trees, overflow
- * pages (so a single record must fit on one page — true for everything we
- * write), the WAL, and incremental/random updates. UTF-8 text only.
+ * Supported on read: table b-trees (leaf + interior), overflow-page chains (a
+ * record larger than one page spills onto them, both written and read), and
+ * records of NULL / integer / IEEE-float / TEXT / BLOB columns. Not supported:
+ * index b-trees, the WAL, incremental/random updates, and non-zero reserved
+ * bytes per page. UTF-8 text only.
  *
  * The browser uses it as a persistent cookie jar (a `cookies` table); it is a
  * general library, not cookie-specific.

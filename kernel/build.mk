@@ -28,8 +28,8 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/pmm.o kernel/paging.o kernel/heap.o kernel/kstring.o \
         kernel/sched.o kernel/switch.o \
         drivers/storage/ata.o drivers/storage/ahci.o drivers/storage/nvme.o drivers/storage/sd.o drivers/storage/atapi.o kernel/blk.o kernel/fs.o kernel/procfs.o kernel/sysfs.o kernel/users.o kernel/fat.o kernel/hfs.o kernel/ext.o kernel/iso9660.o kernel/ntfs.o drivers/bus/pci.o drivers/usb/usb.o drivers/usb/xhci.o \
-        drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o drivers/net/igb.o kernel/net.o kernel/tcp.o kernel/crypto.o \
-        kernel/gzip.o kernel/png.o kernel/screenshot.o \
+        drivers/net/nic.o drivers/net/rtl8139.o drivers/net/e1000.o drivers/net/igb.o kernel/net.o kernel/tcp.o kernel/crypto.o kernel/entropy.o \
+        kernel/crc32.o kernel/gzip.o \
         drivers/audio/sb16.o drivers/audio/hda.o \
         kernel/cpu.o kernel/smp.o kernel/smp_ap.o kernel/rtc.o drivers/acpi/power.o drivers/acpi/s3_wake.o drivers/acpi/battery.o \
         kernel/firmware.o kernel/smbios.o drivers/acpi/aml.o drivers/video/edid.o \
@@ -41,13 +41,14 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/clock_blob.o kernel/calc_blob.o kernel/files_blob.o kernel/browser_blob.o \
         kernel/compositor_blob.o \
         kernel/imgview_blob.o kernel/term_blob.o \
-        kernel/neofetch_blob.o kernel/lspci_blob.o \
-        kernel/ping_blob.o kernel/dig_blob.o kernel/torrent_blob.o \
+        kernel/neofetch_blob.o kernel/lspci_blob.o kernel/uname_blob.o \
+        kernel/ping_blob.o kernel/dig_blob.o kernel/stun_blob.o kernel/torrent_blob.o \
         kernel/player_blob.o kernel/settings_blob.o kernel/ssh_blob.o kernel/sshd_blob.o \
         kernel/clipd_blob.o kernel/cliphist_blob.o kernel/vmclipd_blob.o \
         kernel/notifyd_blob.o kernel/notifysend_blob.o \
-        kernel/webp_blob.o kernel/json_blob.o kernel/alac_blob.o kernel/smbd_blob.o \
+        kernel/webp_blob.o kernel/json_blob.o kernel/base64_blob.o kernel/alac_blob.o kernel/aac_blob.o kernel/mpeg_blob.o kernel/h264_blob.o kernel/smbd_blob.o \
         kernel/dhcpcd_blob.o kernel/ntpd_blob.o kernel/mdnsd_blob.o \
+        kernel/cast_blob.o \
         kernel/init_blob.o \
         kernel/uifont_blob.o kernel/monofont_blob.o kernel/appsyms.o
 

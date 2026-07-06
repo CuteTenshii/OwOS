@@ -934,7 +934,7 @@ static void rx_poll(void)
 		struct rx_desc *d = &rx_ring[rx_cur];
 		uint16_t len = d->length;
 
-		if ((d->status & RXD_EOP) && d->errors == 0 && len >= 14)
+		if ((d->status & RXD_EOP) && d->errors == 0 && len >= 14 && len <= BUF_SIZE)
 			net_rx_frame(rx_bufs[rx_cur], len);   /* SECRC already dropped FCS  */
 
 		d->status = 0;

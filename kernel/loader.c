@@ -91,13 +91,23 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir,
 	if (!dir)
 		return -1;
 
+	/* The program-header table is unvalidated user input; reject one whose
+	 * entries are undersized or that runs past the image before indexing it —
+	 * otherwise the phdr loop is a ring-0 out-of-bounds read. 64-bit math so the
+	 * offset+count product can't wrap. */
+	if (eh->e_phentsize < sizeof(Elf32_Phdr) ||
+	    (uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > size) {
+		paging_free_process_dir(dir);
+		return -1;
+	}
+
 	for (int i = 0; i < eh->e_phnum; i++) {
 		const Elf32_Phdr *ph =
 			(const Elf32_Phdr *)(file + eh->e_phoff + (uint32_t)i * eh->e_phentsize);
 		if (ph->p_type != PT_LOAD)
 			continue;
 		if (!in_user_window(ph->p_vaddr, ph->p_memsz) ||
-		    ph->p_offset + ph->p_filesz > size ||
+		    (uint64_t)ph->p_offset + ph->p_filesz > size ||
 		    load_segment(dir, ph->p_vaddr, file + ph->p_offset,
 		                 ph->p_filesz, ph->p_memsz) != 0) {
 			paging_free_process_dir(dir);
@@ -155,11 +165,17 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 	uint32_t uargv[MAX_ARGS];
 	uint32_t sp = ARG_TOP;
 
+	/* Reserve room at the bottom of the page for the argv pointer vector that the
+	 * push phase writes below the strings: argc+1 pointers (NULL-terminated) plus
+	 * the argc word, at most (MAX_ARGS+2) dwords. Keeping the strings above this
+	 * floor guarantees the unguarded PUSHes below never underflow past `page`. */
+	const uint32_t floor = page + (uint32_t)(MAX_ARGS + 2) * 4;
+
 	for (int i = 0; i < argc; i++) {           /* copy the strings            */
 		uint32_t len = (uint32_t)strlen(argv[i]) + 1;
 		/* Out of room in the arg page: keep the args that fit (argv[0..i)) and
 		 * stop, rather than returning an unmapped esp the program would fault on. */
-		if (sp - len < page) {
+		if (sp - len < floor) {
 			argc = i;
 			break;
 		}

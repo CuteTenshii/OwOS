@@ -39,6 +39,35 @@
  * (rng_bytes: RDRAND-backed when the CPU has it). */
 static void gen_random(uint8_t *out, uint32_t n) { rng_bytes(out, (int)n); }
 
+/* Overwrite secret material so freed heap / dead stack frames don't retain live
+ * keys. volatile store the optimizer can't elide (no memset_s here). */
+static void secure_wipe(void *p, uint32_t n)
+{
+	volatile uint8_t *v = p;
+	while (n--)
+		*v++ = 0;
+}
+
+/* Constant-time equality of two `n`-byte buffers: 1 if equal, 0 otherwise.
+ * No data-dependent branch, so comparing a secret-derived MAC leaks no timing. */
+static int ct_equal(const uint8_t *a, const uint8_t *b, uint32_t n)
+{
+	uint8_t diff = 0;
+	for (uint32_t i = 0; i < n; i++)
+		diff |= a[i] ^ b[i];
+	return diff == 0;
+}
+
+/* An all-zero X25519 output means the peer forced a small-order point; the
+ * shared secret would be attacker-known, so reject it (RFC 7748 §6.1). */
+static int is_all_zero(const uint8_t *p, uint32_t n)
+{
+	uint8_t acc = 0;
+	for (uint32_t i = 0; i < n; i++)
+		acc |= p[i];
+	return acc == 0;
+}
+
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static void put64be(uint8_t *p, uint64_t v)
 {
@@ -104,8 +133,12 @@ struct tls_conn {
 
 static void set_alpn(struct tls_conn *c, const uint8_t *p, uint32_t n)
 {
-	if (n > sizeof c->neg_alpn) n = sizeof c->neg_alpn;
+	/* Keep one byte for a NUL so neg_alpn is always a valid C string, even if a
+	 * server sends a name that fills the buffer. Callers use neg_alpn_len today,
+	 * but the terminator guards any future string use. */
+	if (n > sizeof c->neg_alpn - 1) n = sizeof c->neg_alpn - 1;
 	memcpy(c->neg_alpn, p, n);
+	c->neg_alpn[n] = '\0';
 	c->neg_alpn_len = n;
 }
 
@@ -400,6 +433,11 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
 	if (sni)
 		while (sni[namelen])
 			namelen++;
+	if (namelen > 255)                    /* a DNS name is <=253 bytes; anything
+	                                       * longer can't be a real host, and would
+	                                       * overrun the caller's fixed ClientHello
+	                                       * buffer — clamp it out. */
+		namelen = 255;
 
 	uint8_t *p = out + 4;                 /* leave room for the HS header */
 
@@ -544,6 +582,8 @@ static int tls13_handshake(struct tls_conn *c, const uint8_t our_priv[32],
 	hkdf_extract(zero, 32, zero, 32, early);
 	hkdf_expand_label(early, "derived", empty_hash, 32, derived, 32);
 	x25519(shared, our_priv, server_pub);
+	if (is_all_zero(shared, 32))             /* small-order point: reject */
+		return 0;
 	hkdf_extract(derived, 32, shared, 32, hs_secret);
 
 	uint8_t th[32];
@@ -574,9 +614,8 @@ static int tls13_handshake(struct tls_conn *c, const uint8_t our_priv[32],
 			sha256_final(&before, thcv);  /* ..CertificateVerify */
 			hkdf_expand_label(s_hs, "finished", 0, 0, fk, 32);
 			hmac_sha256(fk, 32, thcv, 32, expect);
-			for (int i = 0; i < 32; i++)
-				if (body[i] != expect[i])
-					return 0;             /* server Finished mismatch */
+			if (!ct_equal(body, expect, 32))
+				return 0;                     /* server Finished mismatch */
 			break;
 		}
 		if (mt == HS_ENC_EXT && bl >= 2) {
@@ -618,6 +657,18 @@ static int tls13_handshake(struct tls_conn *c, const uint8_t our_priv[32],
 	derive_secret(master, "c ap traffic", th_sf, c_ap);
 	derive_secret(master, "s ap traffic", th_sf, s_ap);
 	install_keys(c, c_ap, s_ap);
+
+	/* Every derived secret is now in c->{client,server}_key/iv; wipe the rest. */
+	secure_wipe(shared, sizeof shared);
+	secure_wipe(early, sizeof early);
+	secure_wipe(derived, sizeof derived);
+	secure_wipe(derived2, sizeof derived2);
+	secure_wipe(hs_secret, sizeof hs_secret);
+	secure_wipe(master, sizeof master);
+	secure_wipe(c_hs, sizeof c_hs);
+	secure_wipe(s_hs, sizeof s_hs);
+	secure_wipe(c_ap, sizeof c_ap);
+	secure_wipe(s_ap, sizeof s_ap);
 
 	c->established = 1;
 	return 1;
@@ -704,7 +755,23 @@ tls_conn *tls_client(const char *host, int port, int offer_h2)
 				free(c);
 				return NULL;
 			}
+			secure_wipe(our_priv, sizeof our_priv);   /* ephemeral key done */
 			return c;
+		}
+		/* RFC 8446 §4.1.3 downgrade protection: this client always offers TLS 1.3,
+		 * so a server that answers with 1.2 while itself supporting 1.3 stamps a
+		 * sentinel into the last 8 bytes of its random ("DOWNGRD" + 01/00). Its
+		 * presence means the 1.3 offer was stripped in flight — abort. (Extra
+		 * defense today given certs aren't verified; load-bearing once they are.) */
+		{
+			static const uint8_t dg12[8] = {0x44,0x4F,0x57,0x4E,0x47,0x52,0x44,0x01};
+			static const uint8_t dg11[8] = {0x44,0x4F,0x57,0x4E,0x47,0x52,0x44,0x00};
+			if (ct_equal(server_random + 24, dg12, 8) ||
+			    ct_equal(server_random + 24, dg11, 8)) {
+				net_close(c->tcp);
+				free(c);
+				return NULL;
+			}
 		}
 		if (suite != CIPHER_ECDHE_RSA_AES128_GCM) {
 			net_close(c->tcp);
@@ -752,6 +819,11 @@ tls_conn *tls_client(const char *host, int port, int offer_h2)
 	/* --- key schedule --- */
 	uint8_t pre_master[32];
 	x25519(pre_master, our_priv, server_pub);
+	if (is_all_zero(pre_master, 32)) {       /* small-order point: reject */
+		net_close(c->tcp);
+		free(c);
+		return NULL;
+	}
 
 	uint8_t seed[64], master[48], keyblock[40];
 	memcpy(seed, client_random, 32);
@@ -828,13 +900,18 @@ tls_conn *tls_client(const char *host, int port, int offer_h2)
 		free(c);
 		return NULL;
 	}
-	for (int i = 0; i < 12; i++) {
-		if (body[i] != server_verify[i]) {   /* server Finished mismatch */
-			net_close(c->tcp);
-			free(c);
-			return NULL;
-		}
+	if (!ct_equal(body, server_verify, 12)) {   /* server Finished mismatch */
+		net_close(c->tcp);
+		free(c);
+		return NULL;
 	}
+
+	/* Handshake secrets are done with; wipe them before returning. */
+	secure_wipe(our_priv, sizeof our_priv);
+	secure_wipe(pre_master, sizeof pre_master);
+	secure_wipe(master, sizeof master);
+	secure_wipe(keyblock, sizeof keyblock);
+	secure_wipe(seed, sizeof seed);
 
 	c->established = 1;
 	return c;
@@ -907,5 +984,7 @@ void tls_close(tls_conn *c)
 	}
 	c->established = 0;
 	net_close(c->tcp);
+	/* Wipe the session keys/IVs before the heap block is reused. */
+	secure_wipe(c, sizeof *c);
 	free(c);
 }

@@ -103,9 +103,10 @@ int pb_read_message(pb_reader *r, pb_reader *sub)
     return 1;
 }
 
-int pb_skip(pb_reader *r, int wire_type)
+static int pb_skip_d(pb_reader *r, int wire_type, int depth)
 {
     if (r->error) return -1;
+    if (depth > 64) { r->error = 1; return -1; }   /* group nesting too deep -> stack guard */
     switch (wire_type) {
     case PB_VARINT: { uint64_t v; return read_varint(r, &v); }
     case PB_I64:    { uint64_t v; return pb_read_i64(r, &v); }
@@ -117,13 +118,15 @@ int pb_skip(pb_reader *r, int wire_type)
             int t = pb_read_tag(r, &f, &wt);
             if (t <= 0) { r->error = 1; return -1; }
             if (wt == PB_EGROUP) return 1;
-            if (pb_skip(r, wt) < 0) return -1;  /* nested groups recurse */
+            if (pb_skip_d(r, wt, depth + 1) < 0) return -1;  /* nested groups recurse */
         }
     default:                                    /* stray EGROUP or bad type */
         r->error = 1;
         return -1;
     }
 }
+
+int pb_skip(pb_reader *r, int wire_type) { return pb_skip_d(r, wire_type, 0); }
 
 int32_t pb_zigzag32(uint64_t v)
 {

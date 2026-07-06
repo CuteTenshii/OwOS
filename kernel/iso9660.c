@@ -118,6 +118,11 @@ static int ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct 
 			it->pos = (sec + 1) * ISO_SECTOR;
 			continue;
 		}
+		if (reclen < 34) {                     /* too short for the 33-byte header
+		                                        * + a 1-byte name; skip it        */
+			it->pos += reclen;
+			continue;
+		}
 
 		const uint8_t *p = m->dbuf + off;
 		it->pos += reclen;
@@ -126,13 +131,18 @@ static int ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct 
 		out->size   = load_le32(p + 10);
 		out->is_dir = (p[25] & FLAG_DIR) ? 1 : 0;
 
-		uint8_t fil = p[32];
+		/* Clamp the untrusted identifier length to what the record actually holds
+		 * (reclen >= 34 here, and off + reclen <= ISO_SECTOR), so decode_name
+		 * can't read past dbuf into the adjacent buffer. */
+		uint32_t fil = p[32];
+		if (33 + fil > reclen)
+			fil = reclen - 33;
 		if (fil == 1 && p[33] == 0x00) {       /* "." (self)                     */
 			name[0] = '.'; name[1] = '\0';
 		} else if (fil == 1 && p[33] == 0x01) {/* ".." (parent)                  */
 			name[0] = '.'; name[1] = '.'; name[2] = '\0';
 		} else {
-			decode_name(m, name, p + 33, fil);
+			decode_name(m, name, p + 33, (int)fil);
 		}
 		return 1;
 	}

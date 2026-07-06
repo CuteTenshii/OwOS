@@ -35,6 +35,15 @@ int  csp_empty(const csp *c);               /* 1 = nothing to enforce          *
 int  csp_check_url(const csp *c, int type, const char *abs_url, const char *page_url,
                    char *out, int out_cap, char *reason, int rcap);
 
+/* Check an external <script src> element against script-src. Beyond the host-source
+ * match csp_check_url does, this honours the element's `nonce` and 'strict-dynamic'
+ * (which trusts scripts injected by an already-run script — `parser_inserted` is 0
+ * for those, 1 for scripts that came straight from the HTML parser). `out` receives
+ * the URL to use (upgrade rewrite applied). Returns 1 = allowed. */
+int  csp_check_script_el(const csp *c, const char *abs_url, const char *page_url,
+                         const char *nonce, int parser_inserted,
+                         char *out, int out_cap, char *reason, int rcap);
+
 /* Check an inline <script>/<style> (type CSP_SCRIPT or CSP_STYLE). `nonce` is the
  * element's nonce attribute (or NULL); `body`/`len` is the inline source, hashed
  * for 'sha256-...' matching. Returns 1 = allowed. */

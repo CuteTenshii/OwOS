@@ -22,6 +22,7 @@ static int month_num(const char *s)
 {
 	static const char *const m[12] = { "jan","feb","mar","apr","may","jun",
 	                                    "jul","aug","sep","oct","nov","dec" };
+	if (!s[0] || !s[1] || !s[2]) return 0;   /* don't read past a truncated header */
 	for (int i = 0; i < 12; i++)
 		if (lower(s[0]) == m[i][0] && lower(s[1]) == m[i][1] && lower(s[2]) == m[i][2])
 			return i + 1;
