@@ -9,7 +9,7 @@
  * the host opens and queries it.
  *
  * Mutations (add/remove/delete/toggle) come from the UI thread; the deferred
- * save runs on the worker thread. Both take blk_lock (main.c's realloc/render
+ * save runs on the worker thread. Both take browser_buf_lock (buffers.c's realloc/render
  * interlock) around the tree so the worker never walks a half-linked node, and
  * a delete frees its subtree under the same lock. The save copies the tree into
  * the SQLite model under the lock, then releases it before the (blocking) disk
@@ -122,9 +122,9 @@ struct bm_node *bookmark_add(struct bm_node *folder, const char *url, const char
     free(n);
     return 0;
   }
-  blk_lock();
+  browser_buf_lock();
   link_child(folder, n);
-  blk_unlock();
+  browser_buf_unlock();
   bm_dirty = true;
   return n;
 }
@@ -141,10 +141,10 @@ void bookmark_set_icon(const char *url, const unsigned *icon)
   unsigned *cp = icon_dup(icon);
   if (!cp)
     return;
-  blk_lock();
+  browser_buf_lock();
   free(n->icon);
   n->icon = cp;
-  blk_unlock();
+  browser_buf_unlock();
   bm_dirty = true;
 }
 
@@ -163,14 +163,14 @@ struct bm_node *folder_add(struct bm_node *folder, const char *name)
     free(n);
     return 0;
   }
-  blk_lock();
+  browser_buf_lock();
   link_child(folder, n);
-  blk_unlock();
+  browser_buf_unlock();
   bm_dirty = true;
   return n;
 }
 
-/* Free a node and, for a folder, its whole subtree. Caller holds blk_lock. */
+/* Free a node and, for a folder, its whole subtree. Caller holds browser_buf_lock. */
 static void free_subtree(struct bm_node *n)
 {
   struct bm_node *c = n->child;
@@ -185,7 +185,7 @@ static void free_subtree(struct bm_node *n)
   free(n);
 }
 
-/* Unlink `n` from its parent's child list. Caller holds blk_lock. */
+/* Unlink `n` from its parent's child list. Caller holds browser_buf_lock. */
 static void unlink_node(struct bm_node *n)
 {
   if (!n->parent)
@@ -204,10 +204,10 @@ void bm_delete(struct bm_node *node)
 {
   if (!node || node == &bm_root)
     return;
-  blk_lock();
+  browser_buf_lock();
   unlink_node(node);
   free_subtree(node);
-  blk_unlock();
+  browser_buf_unlock();
   bm_dirty = true;
 }
 
@@ -265,12 +265,12 @@ void bookmarks_flush(void)
     return;
   } /* stays dirty */
 
-  blk_lock();
+  browser_buf_lock();
   int next = 1;
   for (struct bm_node *n = bm_root.child; n; n = n->next)
     emit_node(t, n, 0, &next);
   bm_dirty = false;
-  blk_unlock();
+  browser_buf_unlock();
 
   sql_save(db, BM_DB); /* writefile outside the lock */
   sql_close(db);

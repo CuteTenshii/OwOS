@@ -5167,39 +5167,50 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el)
   return failed ? -1 : n;
 }
 
+/* Collect rules matching an element. `pseudo` selects ::before/::after when
+ * nonzero. Results are ordered by cascade priority, lowest first. */
+static int collect_matches(css_sheet *sh, const struct dom_node *el, int pseudo)
+{
+  int nc = collect_candidates(sh, el), nm = 0;
+  if (nc < 0)
+    return -1;
+  for (int i = 0; i < nc; i++) {
+    struct css_rule *r = sh->cand[i];
+    int matches = pseudo ? selector_match_pseudo(&r->sel, el, pseudo) : selector_match(&r->sel, el);
+    if (!media_matches(&r->media) || !matches)
+      continue;
+    if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
+      return -1;
+    sh->match[nm++] = r;
+  }
+  for (int i = 1; i < nm; i++) {
+    struct css_rule *key = sh->match[i];
+    int j = i - 1;
+    while (j >= 0) {
+      struct css_rule *r = sh->match[j];
+      int after = (r->important != key->important) ? (r->important > key->important)
+                  : (r->spec != key->spec)         ? (r->spec > key->spec)
+                                                   : (r->order > key->order);
+      if (!after)
+        break;
+      sh->match[j + 1] = r;
+      j--;
+    }
+    sh->match[j + 1] = key;
+  }
+  return nm;
+}
+
 void css_apply_sheet(css_sheet *sh, const struct dom_node *el, struct css_style *out)
 {
   if (!sh || !el || el->type != DOM_ELEMENT)
     return;
   ensure_vars(sh);
 
-  /* Collect matches, then fold in ascending priority (important, spec, order)
-   * so the winner is applied last. */
-  int nc = collect_candidates(sh, el), nm = 0;
-  if (nc < 0)
+  /* Fold in ascending priority so the winner is applied last. */
+  int nm = collect_matches(sh, el, 0);
+  if (nm < 0)
     return;
-  for (int i = 0; i < nc; i++)
-    if (media_matches(&sh->cand[i]->media) && selector_match(&sh->cand[i]->sel, el)) {
-      if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
-        return;
-      sh->match[nm++] = sh->cand[i];
-    }
-
-  for (int i = 1; i < nm; i++) { /* insertion sort, stable enough */
-    struct css_rule *k = sh->match[i];
-    int j = i - 1;
-    while (j >= 0) {
-      struct css_rule *m = sh->match[j];
-      int hi = (m->important != k->important) ? (m->important > k->important)
-               : (m->spec != k->spec)         ? (m->spec > k->spec)
-                                              : (m->order > k->order);
-      if (!hi)
-        break;
-      sh->match[j + 1] = m;
-      j--;
-    }
-    sh->match[j + 1] = k;
-  }
   for (int i = 0; i < nm; i++) {
     struct css_rule *r = sh->match[i];
     if (r->has_var) { /* re-parse with var() substituted */
@@ -5222,30 +5233,9 @@ int css_pseudo_content(css_sheet *sh, const struct dom_node *el, int which, stru
   if (!sh || !el || el->type != DOM_ELEMENT)
     return 0;
   ensure_vars(sh);
-  int nc = collect_candidates(sh, el), nm = 0;
-  if (nc < 0)
+  int nm = collect_matches(sh, el, which);
+  if (nm < 0)
     return 0;
-  for (int i = 0; i < nc; i++)
-    if (media_matches(&sh->cand[i]->media) && selector_match_pseudo(&sh->cand[i]->sel, el, which)) {
-      if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
-        return 0;
-      sh->match[nm++] = sh->cand[i];
-    }
-  for (int i = 1; i < nm; i++) { /* ascending priority: winner folds last */
-    struct css_rule *k = sh->match[i];
-    int j = i - 1;
-    while (j >= 0) {
-      struct css_rule *m = sh->match[j];
-      int hi = (m->important != k->important) ? (m->important > k->important)
-               : (m->spec != k->spec)         ? (m->spec > k->spec)
-                                              : (m->order > k->order);
-      if (!hi)
-        break;
-      sh->match[j + 1] = m;
-      j--;
-    }
-    sh->match[j + 1] = k;
-  }
   for (int i = 0; i < nm; i++) {
     struct css_rule *r = sh->match[i];
     if (r->has_var) {
@@ -5359,31 +5349,10 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
     }
   }
 
-  int nc = collect_candidates(sh, el), nm = 0;
-  if (nc < 0)
+  int nm = collect_matches(sh, el, 0);
+  if (nm < 0)
     return 0;
-  for (int i = 0; i < nc; i++)
-    if (media_matches(&sh->cand[i]->media) && selector_match(&sh->cand[i]->sel, el)) {
-      if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
-        return 0;
-      sh->match[nm++] = sh->cand[i];
-    }
-  for (int i = 1; i < nm; i++) { /* sort highest priority first */
-    struct css_rule *k = sh->match[i];
-    int j = i - 1;
-    while (j >= 0) {
-      struct css_rule *m = sh->match[j];
-      int klo = (m->important != k->important) ? (k->important > m->important)
-                : (m->spec != k->spec)         ? (k->spec > m->spec)
-                                               : (k->order > m->order);
-      if (!klo)
-        break;
-      sh->match[j + 1] = m;
-      j--;
-    }
-    sh->match[j + 1] = k;
-  }
-  for (int i = 0; i < nm; i++)
+  for (int i = nm - 1; i >= 0; i--)
     if (extract_bg(sh->match[i]->raw, val, sizeof val)) {
       int a;
       int c = bg_value_color(val, &a);

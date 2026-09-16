@@ -9,7 +9,7 @@
  * table.
  *
  * Mutations run on the UI thread; the deferred save runs on the worker thread
- * (bookmarks_flush), both under blk_lock so the worker never walks a
+ * (bookmarks_flush), both under browser_buf_lock so the worker never walks a
  * half-linked tree. Every operation is best-effort — a failed alloc/read/write
  * leaves the in-memory tree intact, so the browser still runs without a
  * writable home dir. */
@@ -30,7 +30,7 @@ struct bm_node {
 /* Restore the tree from the SQLite db at startup (before the worker starts). */
 void bookmarks_load(void);
 /* Persist the tree to disk only if it changed since the last flush.
- * Worker-thread only (it briefly holds blk_lock while copying the tree). */
+ * Worker-thread only (it briefly holds browser_buf_lock while copying the tree). */
 void bookmarks_flush(void);
 
 /* The implicit root folder; its `child` list is the top level. Never NULL. */

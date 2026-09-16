@@ -122,7 +122,7 @@ static struct media_el *loader_pick(void)
 {
   struct media_el *job = 0;
   int i;
-  blk_lock();
+  browser_buf_lock();
   for (i = 0; i < MEDIA_MAX; i++) {
     struct media_el *m = &g_media[i];
     if (m->in_use && m->net == MNS_LOADING && !m->fetching && !m->ms && !m->vid && m->src[0]) {
@@ -131,7 +131,7 @@ static struct media_el *loader_pick(void)
       break;
     }
   }
-  blk_unlock();
+  browser_buf_unlock();
   return job;
 }
 
@@ -147,12 +147,12 @@ static void loader_run(struct media_el *job)
   int vw = 0, vh = 0;
   unsigned vdur = 0;
 
-  blk_lock();
+  browser_buf_lock();
   mstrcpy(src, job->src, sizeof src);
   mstrcpy(file, job->file, sizeof file);
   gen = job->load_gen;
   kind = job->kind;
-  blk_unlock();
+  browser_buf_unlock();
 
   /* Fetch the clip with a Range request, streamed straight to `file` (bounded
    * memory, any size). Returns the byte count on a 2xx, having already written
@@ -186,7 +186,7 @@ static void loader_run(struct media_el *job)
   if (vv)
     video_ensure();
 
-  blk_lock();
+  browser_buf_lock();
   if (job->load_gen != gen) { /* a newer src superseded this load */
     if (s)
       media_source_free(s);
@@ -232,7 +232,7 @@ static void loader_run(struct media_el *job)
     job->ev |= MEV_ERROR;
   }
   job->fetching = 0;
-  blk_unlock();
+  browser_buf_unlock();
   B->seq++; /* request a repaint */
 }
 
@@ -250,12 +250,12 @@ static void loader_thread(void)
 
 static void loader_ensure(void)
 {
-  blk_lock();
+  browser_buf_lock();
   if (!g_loader_started) {
     g_loader_started = 1;
     thread_create(loader_thread, &g_loader_stack[sizeof g_loader_stack]);
   }
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 /* ---- the video thread: decode <video> frames ahead of their play time ------
@@ -274,13 +274,13 @@ static int video_service(struct media_el *m)
 {
   long long clk;
   int back, r;
-  blk_lock();
+  browser_buf_lock();
   if (m->vgone || !m->vid || !m->vplaying) {
-    blk_unlock();
+    browser_buf_unlock();
     return 0;
   }
   m->vbusy = 1;
-  blk_unlock();
+  browser_buf_unlock();
 
   back = 1 - m->vfront;
   r = 1;
@@ -291,12 +291,12 @@ static int video_service(struct media_el *m)
   }
   clk = m->ms ? (long long)media_source_position_ms(m->ms) : ((long long)msec() - m->vclock_origin);
 
-  blk_lock();
+  browser_buf_lock();
   if (r != 1) { /* end of stream / decode error */
     m->vended = 1;
     m->vplaying = 0;
     m->vbusy = 0;
-    blk_unlock();
+    browser_buf_unlock();
     return 0;
   }
   if ((long long)m->vpending_pts <= clk) { /* frame is due: show it */
@@ -305,11 +305,11 @@ static int video_service(struct media_el *m)
     m->vpos_ms = m->vpending_pts;
     m->vpending = 0;
     m->vbusy = 0;
-    blk_unlock();
+    browser_buf_unlock();
     return 1;
   }
   m->vbusy = 0;
-  blk_unlock();
+  browser_buf_unlock();
   return 0;
 }
 
@@ -333,12 +333,12 @@ static void video_thread(void)
 
 static void video_ensure(void)
 {
-  blk_lock();
+  browser_buf_lock();
   if (!g_vthread_started) {
     g_vthread_started = 1;
     thread_create(video_thread, &g_vthread_stack[sizeof g_vthread_stack]);
   }
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 /* Tear down an element's video decoder, waiting out any in-flight decode so the
@@ -347,10 +347,10 @@ static void video_dispose(struct media_el *m)
 {
   if (!m->vid && !m->vbuf[0])
     return;
-  blk_lock();
+  browser_buf_lock();
   m->vgone = 1;
   m->vplaying = 0;
-  blk_unlock();
+  browser_buf_unlock();
   while (m->vbusy)
     msleep(1);
   if (m->vid) {
@@ -362,9 +362,9 @@ static void video_dispose(struct media_el *m)
   m->vbuf[0] = m->vbuf[1] = 0;
   m->vshown = m->vpending = m->vended = 0;
   m->vfront = 0;
-  blk_lock();
+  browser_buf_lock();
   m->vgone = 0;
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 /* Reopen the video decoder from the (still-resident) temp file — used to replay
@@ -376,9 +376,9 @@ static void video_reopen(struct media_el *m)
   media_video *nv;
   unsigned char *b0, *b1;
   int vw, vh;
-  blk_lock();
+  browser_buf_lock();
   mstrcpy(file, m->file, sizeof file);
-  blk_unlock();
+  browser_buf_unlock();
   video_dispose(m);
   nv = media_video_open(file);
   if (!nv)
@@ -393,7 +393,7 @@ static void video_reopen(struct media_el *m)
     free(b1);
     return;
   }
-  blk_lock();
+  browser_buf_lock();
   m->vid = nv;
   m->vw = vw;
   m->vh = vh;
@@ -405,7 +405,7 @@ static void video_reopen(struct media_el *m)
   m->vpending = 0;
   m->vended = 0;
   m->vpos_ms = 0;
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 /* Begin (or restart) loading this element's current source. */
@@ -424,7 +424,7 @@ static struct media_el *slot_alloc(struct dom_node *node, int kind)
 {
   struct media_el *m = 0;
   int i;
-  blk_lock();
+  browser_buf_lock();
   for (i = 0; i < MEDIA_MAX; i++)
     if (!g_media[i].in_use) {
       m = &g_media[i];
@@ -447,7 +447,7 @@ static struct media_el *slot_alloc(struct dom_node *node, int kind)
     __asm__ volatile("" ::: "memory");
     m->in_use = 1;
   }
-  blk_unlock();
+  browser_buf_unlock();
   return m;
 }
 
@@ -604,7 +604,7 @@ void media_set_src(struct media_el *m, const char *abs_url)
     return; /* unchanged */
   if (m->vid || m->vbuf[0])
     video_dispose(m); /* off-lock: waits vbusy */
-  blk_lock();
+  browser_buf_lock();
   mstrcpy(m->src, abs_url, sizeof m->src);
   if (m->ms) {
     media_source_free(m->ms);
@@ -616,7 +616,7 @@ void media_set_src(struct media_el *m, const char *abs_url)
   m->want_play = 0;
   m->start_ms = 0;
   m->net = m->src[0] ? MNS_IDLE : MNS_EMPTY;
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 void media_get_src(struct media_el *m, char *out, int cap) { mstrcpy(out, m ? m->src : "", cap); }
@@ -633,7 +633,7 @@ void media_play(struct media_el *m)
     return;
   if (m->vid && m->vended)
     video_reopen(m); /* replay a finished clip */
-  blk_lock();
+  browser_buf_lock();
   if (m->ms || m->vid) {
     if (m->vid) {
       m->vplaying = 1;
@@ -653,7 +653,7 @@ void media_play(struct media_el *m)
   } else {
     m->want_play = 1;
   }
-  blk_unlock();
+  browser_buf_unlock();
   if (!m->ms && !m->vid)
     media_kick_load(m);
 }
@@ -662,7 +662,7 @@ void media_pause(struct media_el *m)
 {
   if (!m)
     return;
-  blk_lock();
+  browser_buf_lock();
   m->want_play = 0;
   if (m->ms)
     media_source_pause(m->ms);
@@ -672,7 +672,7 @@ void media_pause(struct media_el *m)
     m->ev |= MEV_PAUSE;
     m->playing_state = 0;
   }
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 int media_paused(struct media_el *m)
@@ -808,18 +808,18 @@ int media_pump(void)
      * no seek). Done off the big lock since video_reopen reads the file. */
     if (m->vid && m->loop && m->vended && !m->ms) {
       video_reopen(m);
-      blk_lock();
+      browser_buf_lock();
       m->vplaying = 1;
       m->vended = 0;
       m->vpos_ms = 0;
       m->vclock_origin = (long long)msec();
-      blk_unlock();
+      browser_buf_unlock();
       continue;
     }
 
-    blk_lock();
+    browser_buf_lock();
     /* Derive transitions from the live source, then drain the queue — all
-     * under blk_lock so a non-atomic m->ev |= can't clobber a bit the loader
+     * under browser_buf_lock so a non-atomic m->ev |= can't clobber a bit the loader
      * thread just set under the same lock. */
     if (m->ms) {
       if (media_source_ended(m->ms) && !m->reported_ended) {
@@ -848,7 +848,7 @@ int media_pump(void)
     m->ev = 0;
     if (ev & MEV_LOADEDMETA)
       m->reported_meta = 1;
-    blk_unlock();
+    browser_buf_unlock();
     if (!ev)
       continue;
 
@@ -1043,7 +1043,7 @@ static void fmt_clock(unsigned ms, char *buf)
 }
 
 /* Blit the current decoded video frame into the poster rect, letterboxed to the
- * native aspect. The caller (paint) already holds blk_lock, which the video
+ * native aspect. The caller (paint) already holds browser_buf_lock, which the video
  * thread also takes to swap the front buffer — so vfront is stable here and the
  * front buffer can be read directly (the thread only decodes into the back
  * buffer). */
@@ -1129,21 +1129,25 @@ static void media_draw(struct media_el *m, int x0, int y0, int w, int ct, int cb
   draw_speaker_glyph(r.vol_x + 3, r.vol_y + 5, m->muted, 0xe6ebf2, ct, cb);
 }
 
-/* Enumerate the laid-out media widgets of the current page (those with a widget
- * anchor): media_doc_nth(0,1,2,...) until NULL. main.c maps start_row -> screen
- * y itself (it owns the scroll model), so this layer never touches the line
- * table. */
-struct media_el *media_doc_nth(int n)
+static struct media_el *media_doc_find(int start)
 {
-  int i, k = 0;
-  for (i = 0; i < MEDIA_MAX; i++) {
+  for (int i = start; i < MEDIA_MAX; i++) {
     struct media_el *m = &g_media[i];
     if (!m->in_use || m->owner != B->pg || m->text_pos < 0)
       continue;
-    if (k++ == n)
-      return m;
+    return m;
   }
   return 0;
+}
+
+struct media_el *media_doc_first(void) { return media_doc_find(0); }
+
+struct media_el *media_doc_next(struct media_el *m)
+{
+  if (!m)
+    return media_doc_first();
+  int i = (int)(m - g_media) + 1;
+  return i >= 0 && i < MEDIA_MAX ? media_doc_find(i) : 0;
 }
 
 int media_el_start_row(struct media_el *m) { return m ? m->start_row : -1; }
@@ -1207,7 +1211,7 @@ void media_page_teardown(void)
       continue;
     if (m->vid || m->vbuf[0])
       video_dispose(m); /* off-lock: waits out a decode */
-    blk_lock();
+    browser_buf_lock();
     if (m->ms) {
       media_source_free(m->ms);
       m->ms = 0;
@@ -1217,6 +1221,6 @@ void media_page_teardown(void)
     if (m->detached)
       dom_free(m->detached);
     memset(m, 0, sizeof *m);
-    blk_unlock();
+    browser_buf_unlock();
   }
 }

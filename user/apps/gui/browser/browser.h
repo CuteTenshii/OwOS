@@ -11,7 +11,7 @@
  * on the user-space heap and grow on demand — there is no fixed page/image size
  * cap, only available memory. The small fixed-shape state (the address bar, the
  * cookie jar, the favicon bitmap, the socket reader) stays inline in `struct
- * browser`. See ensure_*() in main.c for the grow helpers and blk_lock() for
+ * browser`. See browser_ensure_*() in buffers.c for the grow helpers and browser_buf_lock() for
  * the realloc/render interlock.
  */
 #ifndef OWOS_BROWSER_H
@@ -186,7 +186,7 @@ struct page {
   int mode;       /* enum render_mode for the current body */
   char cur_url[URL_MAX];
 
-  /* Growable, heap-backed (ensure_raw/ensure_text in main.c). raw is the
+  /* Growable, heap-backed (browser_ensure_raw/browser_ensure_text in buffers.c). raw is the
    * fetched body or one inline image; text/attr/bp/fg/bg are the rendered
    * styled glyphs kept at one shared capacity so draw_styled_line indexes them
    * together. bp packs block layout (BP_* in html.c); fg/bg are 0xRRGGBB per
@@ -311,8 +311,9 @@ struct browser {
   int *line_len;
   int *line_x;
   int *line_w;
-  int *line_y; /* per-line document-pixel top (running sum of heights) */
-  int *line_h; /* per-line pixel height                                */
+  int *line_y;  /* per-line document-pixel top (running sum of heights) */
+  int *line_h;  /* per-line pixel height                                */
+  int *line_px; /* largest effective glyph size per line                */
   int nlines, line_cap;
   int wrap_cols;
   int layout_dirty; /* 1 = box tree/text changed, re-wrap needed (NOT bumped by
@@ -430,8 +431,8 @@ static inline void uapp(char *d, int *n, int cap, unsigned v)
   d[*n] = '\0';
 }
 
-/* --- growable buffers + the realloc/render interlock (main.c) -------------- *
- * Each ensure_*(need) grows the matching B buffer so it holds at least `need`
+/* --- growable buffers + the realloc/render interlock (buffers.c) ----------- *
+ * Each browser_ensure_*(need) grows the matching B buffer so it holds at least `need`
  * elements (bytes, or entries for lines/links/imgs), reallocating ~1.5x and
  * never shrinking. They return 1 on success, 0 if the heap is exhausted — a
  * caller that gets 0 stops appending, so an out-of-memory page is truncated
@@ -440,18 +441,24 @@ static inline void uapp(char *d, int *n, int cap, unsigned v)
  * The worker thread fills these buffers while the main thread renders from
  * them. Appends into existing capacity are pointer-stable and safe to race (the
  * reader may see a half-written glyph, never a bad pointer); only a realloc
- * that MOVES a buffer is dangerous. So ensure_raw/text/img_pool/links/imgs take
- * blk_lock around the realloc, and render() (plus the click hit-test) hold
- * blk_lock while they read — serialising the move against any in-flight read.
- * ensure_lines is unlocked: the line table is written and read only by the main
+ * that MOVES a buffer is dangerous. So browser_ensure_raw/text/img_pool/links/imgs take
+ * browser_buf_lock around the realloc, and render() (plus the click hit-test) hold
+ * browser_buf_lock while they read — serialising the move against any in-flight read.
+ * browser_ensure_lines is unlocked: the line table is written and read only by the main
  * thread. */
-int ensure_raw(int need);
-int ensure_text(int need);
-int ensure_links(int need);
-int ensure_imgs(int need);
-int ensure_lines(int need);
-void blk_lock(void);
-void blk_unlock(void);
+int browser_ensure_raw(int need);
+int browser_grow_cap(int cap, int init, int need);
+int browser_ensure_text(int need);
+int browser_ensure_links(int need);
+int browser_ensure_imgs(int need);
+int browser_ensure_lines(int need);
+void browser_ov_add(int row, int off, int len, int x, int w);
+unsigned *browser_surface(void);
+int browser_surface_ready(void);
+void browser_present(int id);
+void browser_blit_rect(int x, int y, int w, int h);
+void browser_buf_lock(void);
+void browser_buf_unlock(void);
 
 /* Lowest safe native stack address for JS recursion on the worker thread,
  * passed to js_set_stack_limit so a deeply recursive script throws instead of
@@ -503,7 +510,7 @@ int html_node_span(struct dom_node *node, int *start, int *end);
 /* Approximate element box geometry for the DOM geometry APIs (js.c). The
  * line-flow renderer has no per-element layout, so a box is reconstructed from
  * the wrapped line table; browser_range_box returns a document-relative px box
- * (0 if the range renders to nothing). Takes blk_lock internally, so it is
+ * (0 if the range renders to nothing). Takes browser_buf_lock internally, so it is
  * worker-thread-safe. */
 int browser_range_box(int start, int end, int *x, int *y, int *w, int *h);
 int browser_scroll_px(void);              /* page vertical scroll, px (window.scrollY) */

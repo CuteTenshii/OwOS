@@ -5,7 +5,7 @@
  * table and paints backgrounds behind the text. Later stages make the box
  * geometry authoritative (it drives text wrapping, then scrolling). */
 #include "layout.h"
-#include "browser.h" /* BG_NONE, blk_lock/blk_unlock */
+#include "browser.h" /* BG_NONE, browser_buf_lock/browser_buf_unlock */
 #include "owos.h"
 
 static struct lbox *g_pool;
@@ -20,12 +20,12 @@ void layout_reset(void)
 
 void layout_free(void)
 {
-  blk_lock();
+  browser_buf_lock();
   free(g_pool);
   g_pool = 0;
   g_n = g_cap = 0;
   g_cur = -1;
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 struct lbox *layout_pool(int *n)
@@ -35,20 +35,20 @@ struct lbox *layout_pool(int *n)
 }
 
 /* Grow the arena to hold one more box. The realloc may MOVE the arena, so guard
- * it against a concurrent render read with blk_lock (links are indices, so a
+ * it against a concurrent render read with browser_buf_lock (links are indices, so a
  * move is otherwise harmless). Returns the new slot, or -1 on OOM (box
  * dropped). */
 static int box_alloc(void)
 {
   if (g_n >= g_cap) {
     int nc = g_cap ? g_cap * 2 : 256;
-    blk_lock();
+    browser_buf_lock();
     struct lbox *p = realloc(g_pool, (unsigned)nc * sizeof *p);
     if (p) {
       g_pool = p;
       g_cap = nc;
     }
-    blk_unlock();
+    browser_buf_unlock();
     if (!p)
       return -1;
   }

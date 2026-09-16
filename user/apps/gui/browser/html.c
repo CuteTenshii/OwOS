@@ -880,7 +880,7 @@ static unsigned char block_byte(void)
 
 static int text_put(int n, char c, unsigned char a)
 {
-  if (!ensure_text(n + 1))
+  if (!browser_ensure_text(n + 1))
     return n;
   B->pg->text[n] = c;
   B->pg->attr[n] = a;
@@ -1153,7 +1153,7 @@ static int open_link(struct dom_node *el)
 {
   if (!g_link_nav)
     return 0; /* sandboxed frame: link isn't navigable */
-  if (!ensure_links(B->pg->nlinks + 1))
+  if (!browser_ensure_links(B->pg->nlinks + 1))
     return 0;
   const char *href = dom_get_attr(el, "href");
   if (!href || !href[0])
@@ -1288,7 +1288,7 @@ static void svg_serialize(struct dom_node *el, char *b, int *n, int cap, int dep
  * thread — no network fetch — and the slot is exposed only once committed. */
 static void handle_svg(struct dom_node *el, const struct css_style *cs)
 {
-  if (!ensure_imgs(B->pg->n_imgs + 1))
+  if (!browser_ensure_imgs(B->pg->n_imgs + 1))
     return;
   int cap = 32768;
   char *buf = malloc((unsigned)cap);
@@ -1336,7 +1336,7 @@ static void handle_svg(struct dom_node *el, const struct css_style *cs)
 
 static void handle_img(struct dom_node *el, const struct css_style *cs)
 {
-  if (!ensure_imgs(B->pg->n_imgs + 1))
+  if (!browser_ensure_imgs(B->pg->n_imgs + 1))
     return;
   const char *src = dom_get_attr(el, "src");
   if (!src || !src[0])
@@ -2949,7 +2949,7 @@ static struct font *load_face_file(const char *path, struct loaded_face *slot)
  * against the page, batch-fetched (multiplexed like the stylesheets), and
  * parsed by user/lib/font; the kept face owns its file bytes (the parser points
  * into them), so unloaded bodies are freed. The result is swapped into B under
- * blk_lock because render() reads B->pg->body_font and B->pg->faces on the main
+ * browser_buf_lock because render() reads B->pg->body_font and B->pg->faces on the main
  * thread while this runs on the fetch worker. */
 /* Is `family` one of the comma-separated names in the font-family `stack`? Uses
  * the same naive split as the picker below, so the faces we fetch are exactly
@@ -2975,7 +2975,7 @@ static int family_in_stack(const char *stack, const char *family)
 
 /* Ensure B->pg->faces holds `need` entries (grows on demand). render() reads
  * only B->pg->body_font, never the array, so the realloc is safe under
- * blk_lock. */
+ * browser_buf_lock. */
 static int faces_room(int need)
 {
   if (need <= B->pg->faces_cap)
@@ -3130,7 +3130,7 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
   }
 
   /* Publish: drop the previous page's faces, install the new set. */
-  blk_lock();
+  browser_buf_lock();
   for (int i = 0; i < B->pg->n_faces; i++) {
     if (B->pg->faces[i].font)
       font_free(B->pg->faces[i].font);
@@ -3145,7 +3145,7 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
     B->pg->n_faces = 0;
     B->pg->body_font = 0; /* faces_room OOM: free below, fall back */
   }
-  blk_unlock();
+  browser_buf_unlock();
 
   if (nf) {
     if (B->pg->n_faces == 0) /* publish failed: don't leak parsed faces */
@@ -3253,7 +3253,7 @@ static void load_bg_images(const char *page_url, res_batch_fn fetch)
   free(lens);
   free(furls);
 
-  blk_lock();
+  browser_buf_lock();
   B->pg->bgimgs = tab;
   B->pg->n_bgimgs = n;
   B->pg->bgimgs_cap = nu;
@@ -3264,7 +3264,7 @@ static void load_bg_images(const char *page_url, res_batch_fn fetch)
   for (int i = 0; i < nboxes; i++)
     if (boxes[i].bgi.kind == CSS_BGK_URL && boxes[i].bgi.url[0])
       boxes[i].bgi.img_idx = bg_image_index(boxes[i].bgi.url, page_url);
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 /* The decoded-background index for a box's url() (resolve + match the table
@@ -3645,7 +3645,7 @@ void doc_message(const char *m)
   B->pg->page_bg = 0xffffff;
   B->pg->page_fg = 0x202830;
   while (m[n]) {
-    if (!ensure_text(n + 1))
+    if (!browser_ensure_text(n + 1))
       break;
     B->pg->text[n] = m[n];
     B->pg->attr[n] = 0;

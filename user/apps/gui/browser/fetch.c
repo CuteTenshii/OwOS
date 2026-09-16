@@ -175,15 +175,15 @@ static void raw_decode(int enc)
     return;
   } /* failed decode: never show the compressed bytes */
   /* Adopt the decoded buffer directly rather than copying it back into raw:
-   * both come from the same malloc/realloc/free family (ensure_raw and the
-   * memwr/brotli sinks). blk_lock guards the swap against the main thread's
-   * concurrent reads of B->pg->raw, matching ensure_raw's discipline. */
-  blk_lock();
+   * both come from the same malloc/realloc/free family (browser_ensure_raw and the
+   * memwr/brotli sinks). browser_buf_lock guards the swap against the main thread's
+   * concurrent reads of B->pg->raw, matching browser_ensure_raw's discipline. */
+  browser_buf_lock();
   free(B->pg->raw);
   B->pg->raw = (char *)o;
   B->pg->raw_len = ol;
   B->pg->raw_cap = ol;
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 static int rgetc(void)
@@ -909,7 +909,7 @@ static int h2_body_cb(void *ctx, const unsigned char *p, int n)
   (void)ctx;
   if (B->abort_load)
     return 1; /* Stop: tell h2_run to bail */
-  if (!ensure_raw(B->pg->raw_len + n))
+  if (!browser_ensure_raw(B->pg->raw_len + n))
     return 1; /* out of memory: stop */
   for (int i = 0; i < n; i++)
     B->pg->raw[B->pg->raw_len++] = (char)p[i];
@@ -980,7 +980,7 @@ static int h3_body_cb(void *ctx, const unsigned char *p, int n)
   (void)ctx;
   if (B->abort_load)
     return 1; /* Stop: tell h3_run to bail */
-  if (!ensure_raw(B->pg->raw_len + n))
+  if (!browser_ensure_raw(B->pg->raw_len + n))
     return 1;
   for (int i = 0; i < n; i++)
     B->pg->raw[B->pg->raw_len++] = (char)p[i];
@@ -1049,7 +1049,7 @@ static int doc_cache_finish(const char *full_url, long now, int revalidating, in
     int rl = 0;
     if (cache_revalidated(full_url, now, g_doc_hdr, &rb, &rl, B->pg->ctype, sizeof B->pg->ctype, 0, 0)) {
       B->pg->raw_len = 0;
-      if (ensure_raw(rl)) {
+      if (browser_ensure_raw(rl)) {
         memcpy(B->pg->raw, rb, (unsigned)rl);
         B->pg->raw_len = rl;
       }
@@ -1091,7 +1091,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
                           sizeof g_doc_hdr, g_doc_cond, sizeof g_doc_cond);
     if (cv == CACHE_FRESH) {
       B->pg->raw_len = 0;
-      if (ensure_raw(clen)) {
+      if (browser_ensure_raw(clen)) {
         memcpy(B->pg->raw, cbody, (unsigned)clen);
         B->pg->raw_len = clen;
       }
@@ -1232,7 +1232,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
    * decodes Content-Encoding and routes render-vs-download. */
   int c;
   while ((c = body_src(&bs)) >= 0) {
-    if (!ensure_raw(B->pg->raw_len + 1))
+    if (!browser_ensure_raw(B->pg->raw_len + 1))
       break; /* out of memory: stop */
     B->pg->raw[B->pg->raw_len++] = (char)c;
   }
@@ -1327,7 +1327,7 @@ static int load_file_url(const char *url)
   B->pg->raw_len = 0;
   unsigned off = 0;
   for (;;) {
-    if (!ensure_raw(B->pg->raw_len + 4096))
+    if (!browser_ensure_raw(B->pg->raw_len + 4096))
       break; /* out of memory: stop */
     int got = readfile_at(path, off, B->pg->raw + B->pg->raw_len, 4096);
     if (got < 0)
@@ -1355,7 +1355,7 @@ static int load_data_url(const char *url)
     return -1;
   B->pg->raw_len = 0;
   for (int i = 0; i < len; i++) {
-    if (!ensure_raw(B->pg->raw_len + 1))
+    if (!browser_ensure_raw(B->pg->raw_len + 1))
       break;
     B->pg->raw[B->pg->raw_len++] = (char)buf[i];
   }

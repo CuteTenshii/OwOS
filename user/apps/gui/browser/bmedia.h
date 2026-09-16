@@ -79,7 +79,8 @@ void media_reset_layout(void);                    /* rewrap start: clear placeme
 struct media_el *media_at_text_pos(int text_pos); /* doc media anchored at pos, or NULL */
 int media_widget_rows(struct media_el *m, int paw, int line_h);
 void media_set_layout(struct media_el *m, int start_row, int rows);
-struct media_el *media_doc_nth(int n); /* nth laid-out widget of the page */
+struct media_el *media_doc_first(void);
+struct media_el *media_doc_next(struct media_el *m);
 int media_el_start_row(struct media_el *m);
 int media_el_rows(struct media_el *m);
 int media_el_height(struct media_el *m, int paw); /* widget pixel height */

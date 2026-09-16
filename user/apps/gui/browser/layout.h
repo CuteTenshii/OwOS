@@ -12,7 +12,7 @@
  * realloc that moves the arena can't dangle them. Descendants are contiguous
  * (the walk is pre-order), so a box records `parent` and `end` (one past its
  * last descendant) and children are recovered by scanning [self+1, end). Worker
- * builds it under blk_lock; the render thread reads it under blk_lock; dropped
+ * builds it under browser_buf_lock; the render thread reads it under browser_buf_lock; dropped
  * on page teardown — same discipline as the glyph stream and span table. */
 #ifndef OWOS_LAYOUT_H
 #define OWOS_LAYOUT_H

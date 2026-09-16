@@ -11,7 +11,7 @@
  * is appended from the worker (js.c routes console.* + errors here) and read by
  * the main thread's render. A single spinlock (dt_lk) guards the snapshot text
  * and the console ring against the render thread; it is the same xchg pattern
- * as main.c's blk_lock, but a separate lock so console/DOM updates never
+ * as main.c's browser_buf_lock, but a separate lock so console/DOM updates never
  * serialise against the page buffers. The main thread only reads the prepared
  * snapshots and draws them. */
 #include "browser.h"
@@ -91,8 +91,8 @@ static int dt_sel = -1;       /* selected node's pre-order index (-1 = none)  */
 
 /* Selected-element highlight box for the page overlay, in DOCUMENT px (the main
  * thread translates by scroll and draws it). Computed by the worker OUTSIDE
- * dt_lock — browser_range_box takes blk_lock, and render() already holds
- * blk_lock when it calls devtools_render() (lock order blk->dt), so computing
+ * dt_lock — browser_range_box takes browser_buf_lock, and render() already holds
+ * browser_buf_lock when it calls devtools_render() (lock order browser_buf->dt), so computing
  * it under dt_lock too would deadlock. Plain ints: a torn read just mis-paints
  * one frame of an overlay. dt_hl_active is written last (and read first) so
  * coords settle. */
@@ -1836,8 +1836,8 @@ static int content_rows(int top); /* defined in the layout section below */
 /* Fill the page-overlay highlight (dt_hl_*) for element `sn`: its document-px
  * box from the laid-out line table + a "tag#id.class  WxH" label. Clears the
  * highlight when the node has no rendered box. MUST run outside dt_lock —
- * browser_range_box takes blk_lock and render() holds blk_lock when it reads
- * dt_hl_* (lock order blk->dt). Worker thread only. */
+ * browser_range_box takes browser_buf_lock and render() holds browser_buf_lock when it reads
+ * dt_hl_* (lock order browser_buf->dt). Worker thread only. */
 static void dt_set_highlight(struct dom_node *sn)
 {
   dt_hl_active = 0;

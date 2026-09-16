@@ -27,230 +27,10 @@ static int g_selecting;
 
 int BW = 600, BH = 368; /* client size; grows/shrinks on resize */
 
-/* Double buffering: all rendering targets a private back buffer (surface()); a
- * finished frame is copied into the live window buffer by blit_present() right
- * before SYS_WIN_PRESENT. Without this the browser drew straight into the
- * shared window buffer, so the compositor could blit a half-finished full
- * repaint — torn / cut-off text. The back buffer grows with the client area
- * (never shrinks). */
-static unsigned *g_surface;
-static int g_surface_px;
-static unsigned *surface(void)
-{
-  int need = BW * BH;
-  if (need > g_surface_px) {
-    unsigned *n = realloc(g_surface, (unsigned)need * 4);
-    if (n) {
-      g_surface = n;
-      g_surface_px = need;
-    }
-  }
-  return g_surface ? g_surface : (unsigned *)WIN_FB_ADDR; /* OOM: draw direct */
-}
-static void blit_present(int id)
-{
-  if (g_surface) {
-    int px = BW * BH;
-    if (px > g_surface_px)
-      px = g_surface_px;
-    memcpy((unsigned *)WIN_FB_ADDR, g_surface, (unsigned)px * 4);
-  }
-  win_present(id);
-}
-
-static void blit_rect(int x, int y, int w, int h)
-{
-  if (!g_surface)
-    return;
-  if (x < 0) {
-    w += x;
-    x = 0;
-  }
-  if (y < 0) {
-    h += y;
-    y = 0;
-  }
-  if (x + w > BW)
-    w = BW - x;
-  if (y + h > BH)
-    h = BH - y;
-  if (w > 0 && h > 0)
-    for (int row = 0; row < h; row++)
-      memcpy((unsigned *)WIN_FB_ADDR + (unsigned long)(y + row) * BW + x, g_surface + (unsigned long)(y + row) * BW + x,
-             (unsigned)w * 4);
-}
-
 const unsigned palette[16] = {
     0x202830, 0x1a4fbf, 0xc01818, 0x108010, 0x9020a0, 0x9a6020, 0x107c90, 0x586070,
     0x16387a, 0x000000, 0x707000, 0xd07000, 0x808890, 0x304060, 0x2050d0, 0xa0a0a0,
 };
-
-/* --- growable buffers + the realloc/render interlock ----------------------- *
- * The worker thread grows B's content buffers while the main thread renders
- * from them. A plain append never moves a buffer, so it races harmlessly (as it
- * did when these were fixed arrays); only a realloc that relocates a buffer can
- * hand the reader a dangling base pointer. blk_lock serialises those moves
- * against render() — the same xchg spinlock the user malloc uses, yielding to
- * the holder on contention (single CPU; the timer preempts a spinner anyway).
- */
-static volatile int blk_lk;
-static inline int blk_xchg(volatile int *p, int v)
-{
-  __asm__ volatile("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
-  return v;
-}
-void blk_lock(void)
-{
-  while (blk_xchg(&blk_lk, 1))
-    msleep(0);
-}
-void blk_unlock(void)
-{
-  __asm__ volatile("" ::: "memory");
-  blk_lk = 0;
-}
-
-/* Next capacity that holds at least `need` elements, growing ~1.5x from `cap`
- * (or `init` on the first allocation). */
-static int grow_cap(int cap, int init, int need)
-{
-  int nc = cap > 0 ? cap : init;
-  while (nc < need)
-    nc += nc / 2 + 1;
-  return nc;
-}
-
-/* raw / img_pool: byte buffers. Lock only around the relocating realloc. */
-int ensure_raw(int need)
-{
-  if (need <= B->pg->raw_cap)
-    return 1;
-  int nc = grow_cap(B->pg->raw_cap, RAW_INIT, need);
-  blk_lock();
-  char *p = realloc(B->pg->raw, (unsigned)nc);
-  if (p) {
-    B->pg->raw = p;
-    B->pg->raw_cap = nc;
-  }
-  blk_unlock();
-  return p != 0;
-}
-
-/* text + attr (+ bp + fg + bg) share one capacity so draw_styled_line can index
- * them together. Only advance text_cap when ALL reallocs succeed, so they stay
- * consistent. */
-int ensure_text(int need)
-{
-  if (need <= B->pg->text_cap)
-    return 1;
-  int nc = grow_cap(B->pg->text_cap, TEXT_INIT, need);
-  blk_lock();
-  char *t = realloc(B->pg->text, (unsigned)nc);
-  unsigned char *a = realloc(B->pg->attr, (unsigned)nc);
-  unsigned char *p = realloc(B->pg->bp, (unsigned)nc);
-  unsigned char *z = realloc(B->pg->fsz, (unsigned)nc);
-  unsigned char *l = realloc(B->pg->lh, (unsigned)nc);
-  unsigned *f = realloc(B->pg->fg, (unsigned)nc * sizeof *f);
-  unsigned *g = realloc(B->pg->bg, (unsigned)nc * sizeof *g);
-  if (t)
-    B->pg->text = t;
-  if (a)
-    B->pg->attr = a;
-  if (p)
-    B->pg->bp = p;
-  if (z)
-    B->pg->fsz = z;
-  if (l)
-    B->pg->lh = l;
-  if (f)
-    B->pg->fg = f;
-  if (g)
-    B->pg->bg = g;
-  if (t && a && p && z && l && f && g)
-    B->pg->text_cap = nc;
-  blk_unlock();
-  return t && a && p && z && l && f && g;
-}
-
-int ensure_links(int need)
-{
-  if (need <= B->pg->links_cap)
-    return 1;
-  int nc = grow_cap(B->pg->links_cap, LINKS_INIT, need);
-  blk_lock();
-  struct link *p = realloc(B->pg->links, (unsigned)nc * sizeof *p);
-  if (p) {
-    B->pg->links = p;
-    B->pg->links_cap = nc;
-  }
-  blk_unlock();
-  return p != 0;
-}
-
-int ensure_imgs(int need)
-{
-  if (need <= B->pg->imgs_cap)
-    return 1;
-  int nc = grow_cap(B->pg->imgs_cap, IMGS_INIT, need);
-  blk_lock();
-  struct inl_img *p = realloc(B->pg->imgs, (unsigned)nc * sizeof *p);
-  if (p) {
-    B->pg->imgs = p;
-    B->pg->imgs_cap = nc;
-  }
-  blk_unlock();
-  return p != 0;
-}
-
-/* The word-wrap line table is written and read only by the main thread, so it
- * grows without the lock (no cross-thread move to guard against). */
-int ensure_lines(int need)
-{
-  if (need <= B->line_cap)
-    return 1;
-  int nc = grow_cap(B->line_cap, LINES_INIT, need);
-  int *off = realloc(B->line_off, (unsigned)nc * sizeof *off);
-  int *len = realloc(B->line_len, (unsigned)nc * sizeof *len);
-  int *lx = realloc(B->line_x, (unsigned)nc * sizeof *lx);
-  int *lw = realloc(B->line_w, (unsigned)nc * sizeof *lw);
-  int *ly = realloc(B->line_y, (unsigned)nc * sizeof *ly);
-  int *lh = realloc(B->line_h, (unsigned)nc * sizeof *lh);
-  if (off)
-    B->line_off = off;
-  if (len)
-    B->line_len = len;
-  if (lx)
-    B->line_x = lx;
-  if (lw)
-    B->line_w = lw;
-  if (ly)
-    B->line_y = ly;
-  if (lh)
-    B->line_h = lh;
-  if (off && len && lx && lw && ly && lh)
-    B->line_cap = nc;
-  return off && len && lx && lw && ly && lh;
-}
-
-/* Stash one wrapped flex-item run on absolute band row `row` at column x/width
- * w. Grows the overlay like the line table (main-thread only, no lock). */
-static void ov_add(int row, int off, int len, int x, int w)
-{
-  if (B->n_fslices >= B->fslice_cap) {
-    int nc = grow_cap(B->fslice_cap, 256, B->n_fslices + 1);
-    struct fslice *p = realloc(B->fslices, (unsigned)nc * sizeof *p);
-    if (!p)
-      return;
-    B->fslices = p;
-    B->fslice_cap = nc;
-  }
-  struct fslice *f = &B->fslices[B->n_fslices++];
-  f->row = row;
-  f->off = off;
-  f->len = len;
-  f->x = x;
-  f->w = w;
-}
 
 /* The app menu bar: "Page" and "View" laid out on one bar via the gfx menubar
  * helper (one open at a time). It also exercises the widget's per-item states:
@@ -574,8 +354,8 @@ static void worker_install_crash_handlers(void)
  * re-armed. */
 static void worker_after_crash(void)
 {
-  blk_unlock();      /* the realloc/render interlock       */
-  heap_lock_reset(); /* the malloc spinlock                */
+  browser_buf_unlock(); /* the realloc/render interlock       */
+  heap_lock_reset();    /* the malloc spinlock                */
   /* The kernel masked the fault signal to run the (never-returning) handler;
    * unblock it or the next tab crash would be uncatchable and fatal. */
   unsigned m = sigmask(SIGSEGV) | sigmask(SIGILL) | sigmask(SIGFPE) | sigmask(SIGBUS) | sigmask(SIGABRT);
@@ -911,12 +691,12 @@ static void worker_fn(void)
      * it off the main thread means render() only paints the built table and the
      * event loop never stalls ("Not Responding"). Re-flow when the box
      * tree/text changed (layout_dirty) or the main thread published a new width
-     * (resize). Held under blk_lock so render() never observes a half-built
+     * (resize). Held under browser_buf_lock so render() never observes a half-built
      * table. */
     if (B->want_paw > 0 && (B->layout_dirty || B->wrap_cols != B->want_paw)) {
-      blk_lock();
+      browser_buf_lock();
       rewrap(B->want_paw);
-      blk_unlock();
+      browser_buf_unlock();
       B->seq++;
     }
     bookmarks_flush(); /* persist a changed bookmarks tree (deferred) */
@@ -939,12 +719,12 @@ static void worker_fn(void)
  * glyphs are rasterized on demand and cached per ASCII codepoint (the body text
  * is folded to 7-bit), at a fixed pixel size, so a repaint only blits. The
  * cache is main-thread-only; B->pg->body_font is swapped by the worker under
- * blk_lock (see html.c). */
+ * browser_buf_lock (see html.c). */
 /* B->pg->text holds UTF-8; the renderer decodes a codepoint at a time via the
  * shared utf8_decode/utf8_seqlen (user/lib). Per-codepoint glyph cache for the
  * active direct-mapped table (evict on collision, so a CJK page with hundreds
  * of glyphs stays bounded and a repaint only blits). Main-thread-only;
- * B->pg->body_font is swapped by the worker under blk_lock (see html.c). */
+ * B->pg->body_font is swapped by the worker under browser_buf_lock (see html.c). */
 #define BODY_PX 15.0f
 #define GCACHE_N 1024
 struct gcache {
@@ -1063,20 +843,6 @@ static int body_cp_adv(unsigned cp, int px)
   return gcache_get(cp)->adv;
 }
 
-static int body_width(const char *s, int px)
-{
-  const char *end = s + strlen(s);
-  if (!body_mono() && B->pg->body_font)
-    gcache_sync();
-  int w = 0;
-  unsigned cp;
-  while (s < end) {
-    s += utf8_decode(s, end, &cp);
-    w += body_cp_adv(cp, px);
-  }
-  return w;
-}
-
 /* Alpha-blend one cached glyph's coverage in colour fg, clipped to [ct,cb).
  * With `italic`, faux-slant: each row shifts horizontally by ~1/4 its height
  * above the baseline `y` (rows above the baseline lean right, below lean left).
@@ -1085,7 +851,7 @@ static void blit_glyph(int x, int y, const struct gcache *g, unsigned fg, int ct
 {
   if (!g->bm)
     return;
-  unsigned *fb = surface();
+  unsigned *fb = browser_surface();
   unsigned fr = (fg >> 16) & 0xff, fgc = (fg >> 8) & 0xff, fbb = fg & 0xff;
   for (int gy = 0; gy < g->h; gy++) {
     int py = y + g->oy + gy;
@@ -1129,16 +895,17 @@ static void draw_tofu(int x, int y, int w, unsigned fg)
 /* Draw a UTF-8 run of font size `px` (0 = default body), its baseline
  * `baseline` px below line-top `y` so runs of different sizes on one line share
  * a baseline. Clipped to [ct,cb); returns the pen x after the run. */
-static int body_draw(int x, int y, const char *s, unsigned fg, int ct, int cb, int px, int baseline, int italic)
+static int body_draw_run(int x, int y, const char *s, int len, int width, unsigned fg, int ct, int cb, int px,
+                         int baseline, int italic)
 {
-  const char *end = s + strlen(s);
+  const char *end = s + len;
   unsigned cp;
   if (body_mono()) { /* raw content: monospace cells */
     (void)ct;
     (void)cb;
     (void)baseline;
     gfx_text(x, y, s, fg, GFX_TRANSPARENT);
-    return x + body_width(s, px);
+    return x + width;
   }
   if (B->pg->body_font) {
     int by = y + baseline; /* screen baseline shared by runs */
@@ -1236,11 +1003,11 @@ static int g_ov_n;      /* lines emitted for the current item so far */
 static void add_line(int off, int len, int x, int w, int h)
 {
   if (g_ov_active) {
-    ov_add(g_ov_base + g_ov_n, off, len, x, w);
+    browser_ov_add(g_ov_base + g_ov_n, off, len, x, w);
     g_ov_n++;
     return;
   }
-  if (!ensure_lines(B->nlines + 1))
+  if (!browser_ensure_lines(B->nlines + 1))
     return; /* out of memory: stop adding lines */
   int n = B->nlines;
   B->line_off[n] = off;
@@ -1248,6 +1015,7 @@ static void add_line(int off, int len, int x, int w, int h)
   B->line_x[n] = x;
   B->line_w[n] = w;
   B->line_h[n] = h > 0 ? h : LINE_H;
+  B->line_px[n] = line_maxpx(off, off + len);
   B->line_y[n] = n > 0 ? B->line_y[n - 1] + B->line_h[n - 1] : 0;
   B->nlines++;
 }
@@ -1332,7 +1100,7 @@ static int scroll_max(void)
  * a document-relative box (x,y,w,h) for the rendered text range [start,end), 0
  * if the range produced no rows (unrendered/empty). Width is exact for a range
  * that lies on one text line; the content column otherwise. Runs on the worker
- * (JS) thread, so it holds blk_lock — render() rebuilds the line table and uses
+ * (JS) thread, so it holds browser_buf_lock — render() rebuilds the line table and uses
  * the glyph cache (set_block/body_cp_adv) under the same lock. */
 int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
 {
@@ -1343,7 +1111,7 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
   if (paw < 8)
     paw = 8;
 
-  blk_lock();
+  browser_buf_lock();
   int first = -1, last = -1, text_rows = 0, img_w = 0;
   for (int r = 0; r < B->nlines; r++) {
     int rs = B->line_off[r], rl = B->line_len[r];
@@ -1374,7 +1142,7 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
       img_w = dw;
   }
   if (first < 0) {
-    blk_unlock();
+    browser_buf_unlock();
     return 0;
   }
 
@@ -1420,7 +1188,7 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
     if (w < 1)
       w = 1;
   }
-  blk_unlock();
+  browser_buf_unlock();
   *ox = x;
   *oy = y;
   *ow = w;
@@ -2292,7 +2060,7 @@ static void rewrap(int paw)
     paw = 8;
   /* Single consistency guard for the whole layout+paint below: the worker
    * rebuilds text/attr/box-tree during a (re)layout, and although render()
-   * holds blk_lock (so nothing changes mid-frame), it can still observe the
+   * holds browser_buf_lock (so nothing changes mid-frame), it can still observe the
    * instant where the buffers aren't built yet. Don't lay out or paint over a
    * NULL text buffer — drop to an empty page this frame and force a re-wrap
    * once it's ready. This replaces per-reader NULL checks across every
@@ -2368,7 +2136,7 @@ static int img_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 {
   (void)w;
   struct imgblit *v = c;
-  unsigned *fb = surface();
+  unsigned *fb = browser_surface();
   while (v->next_r < v->dh && (v->next_r * v->ih / v->dh) == y) {
     unsigned *drow = fb + (unsigned long)(v->py + v->oy + v->next_r) * BW + v->px + v->ox;
     for (unsigned x = 0; x < v->dw; x++) {
@@ -2500,7 +2268,7 @@ static void draw_image(int px, int py, int pw, int ph, unsigned bg)
   if (!dh)
     dh = 1;
   unsigned ox = ((unsigned)pw - dw) / 2, oy = ((unsigned)ph - dh) / 2;
-  unsigned *fb = surface();
+  unsigned *fb = browser_surface();
   for (unsigned ry = 0; ry < dh; ry++) {
     unsigned sy = ry * ih / dh;
     const unsigned char *srow = g_dimg.rgba + (unsigned long)sy * iw * 4;
@@ -2535,7 +2303,7 @@ static int inl_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 {
   (void)w;
   struct inlblit *v = c;
-  unsigned *fb = surface();
+  unsigned *fb = browser_surface();
   while (v->next_r < (unsigned)v->dh && (v->next_r * v->ih / (unsigned)v->dh) == y) {
     int dy = v->y0 + (int)v->next_r;
     if (dy >= v->clip_top && dy < v->clip_bot) {
@@ -2648,7 +2416,7 @@ static void draw_inline_image(struct inl_img *im, int py, int phh, int paw)
    * come from the decode cache (decoded once, not per frame). */
   const unsigned char *src = im->is_argb ? (B->img_pool + im->coff) : imgc_get(im);
   if (src) {
-    unsigned *fb = surface();
+    unsigned *fb = browser_surface();
     for (int ry = 0; ry < dh; ry++) {
       int dy = y0 + ry;
       if (dy < ct || dy >= cb)
@@ -2693,7 +2461,7 @@ static void draw_alt_box(struct inl_img *im, int py, int phh)
  * horizontal rule). Returns the content origin x after indent/centring, for the
  * caller's selection highlight. Shared by the main line table and the flex-row
  * overlay. */
-static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int line_h)
+static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int line_h, int maxpx)
 {
   set_block(off);
 
@@ -2704,9 +2472,9 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
     return x + m;
   }
 
-  x += cur_bindent * INDENT_PX;                      /* blockquote / list indent  */
-  int base = run_ascent(line_maxpx(off, off + len)); /* baseline shared by the line's runs */
-  if (cur_bcenter) {                                 /* text-align:center         */
+  x += cur_bindent * INDENT_PX; /* blockquote / list indent  */
+  int base = run_ascent(maxpx); /* baseline shared by the line's runs */
+  if (cur_bcenter) {            /* text-align:center         */
     int lw = 0, p = off, end = off + len;
     unsigned cp;
     while (p < end) {
@@ -2727,7 +2495,7 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
     unsigned bgc = B->pg->bg[off + i];
     int rpx = glyph_px(off + i);
     char run[260];
-    int rl = 0;
+    int rl = 0, rw = 0;
     /* Accumulate codepoints sharing one (attr,fg,bg,size) so any change starts
      * a new run; never split a UTF-8 sequence into garbage. */
     while (i < len && B->pg->attr[off + i] == a && B->pg->fg[off + i] == fg && B->pg->bg[off + i] == bgc &&
@@ -2737,17 +2505,19 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
         nb = 1;
       if (rl + nb > (int)sizeof run - 1)
         break;
+      unsigned cp;
+      utf8_decode(&B->pg->text[off + i], &B->pg->text[off + len], &cp);
+      rw += body_cp_adv(cp, rpx);
       for (int b = 0; b < nb; b++)
         run[rl++] = B->pg->text[off + i++];
     }
     run[rl] = '\0';
-    int rw = body_width(run, rpx);
     if (bgc != BG_NONE)
       gfx_fill_rect(x, y, rw, line_h, bgc);
     int ital = (a & ST_ITALIC) ? 1 : 0;
-    body_draw(x, y, run, fg, ct, cb, rpx, base, ital);
+    body_draw_run(x, y, run, rl, rw, fg, ct, cb, rpx, base, ital);
     if (a & ST_BOLD)
-      body_draw(x + 1, y, run, fg, ct, cb, rpx, base, ital);
+      body_draw_run(x + 1, y, run, rl, rw, fg, ct, cb, rpx, base, ital);
     if (a & ST_UNDER)
       gfx_fill_rect(x, y + base + 1, rw, 1, fg);
     if (a & ST_STRIKE)
@@ -2760,7 +2530,7 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
 static void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
 {
   int off = B->line_off[idx], len = B->line_len[idx];
-  int x0 = draw_slice_core(x, y, off, len, paw, ct, cb, B->line_h[idx]);
+  int x0 = draw_slice_core(x, y, off, len, paw, ct, cb, B->line_h[idx], B->line_px[idx]);
   if (cur_bhr)
     return; /* rule: nothing to select   */
 
@@ -3180,7 +2950,7 @@ static void paint_gradient(const struct css_bg_image *bi, int bx, int sy, int bw
   resolve_stops(bi, &g);
   if (g.n == 0)
     return;
-  unsigned *fb = surface();
+  unsigned *fb = browser_surface();
   int x0 = bx < 0 ? 0 : bx, x1 = bx + bw;
   if (x1 > clipw)
     x1 = clipw;
@@ -3282,7 +3052,7 @@ static void paint_bg_image(const struct bg_img *im, const struct css_bg_image *b
   int tilex = (rep == CSS_BGR_REPEAT || rep == CSS_BGR_REPEAT_X);
   int tiley = (rep == CSS_BGR_REPEAT || rep == CSS_BGR_REPEAT_Y);
 
-  unsigned *fb = surface();
+  unsigned *fb = browser_surface();
   int x0 = bx < 0 ? 0 : bx, x1 = bx + bw;
   if (x1 > clipw)
     x1 = clipw;
@@ -3312,7 +3082,7 @@ static void paint_bg_image(const struct bg_img *im, const struct css_bg_image *b
 }
 
 /* Paint visible block-box backgrounds and borders from the box tree's resolved
- * geometry. Called with blk_lock held, after the pane is cleared and rewrap()
+ * geometry. Called with browser_buf_lock held, after the pane is cleared and rewrap()
  * laid out the tree, before the text lines are drawn. Boxes are in pre-order,
  * so a child paints over its parent. Box `y` is document px (row*LINE_H). */
 /* Integer sqrt for the rounded-corner geometry. */
@@ -3340,7 +3110,7 @@ static void fill_round_rect(int x, int y, int w, int h, int r, unsigned rgb, int
     r = w / 2;
   if (r * 2 > h)
     r = h / 2;
-  unsigned *fb = surface();
+  unsigned *fb = browser_surface();
   unsigned sr = (rgb >> 16) & 0xff, sg = (rgb >> 8) & 0xff, sb = rgb & 0xff, ia = 255 - alpha;
   for (int yy = 0; yy < h; yy++) {
     int p_y = y + yy;
@@ -3802,10 +3572,10 @@ static void render(void)
 {
   unsigned bg = B->pg->page_bg;
   /* Hold off any buffer-relocating realloc on the worker thread while we read
-   * text/attr/line_off/img_pool/imgs/raw below (see blk_lock in browser.h).
+   * text/attr/line_off/img_pool/imgs/raw below (see browser_buf_lock in browser.h).
    * render() does only in-memory gfx work — no syscalls that block — so the
    * worker is never stalled for long. */
-  blk_lock();
+  browser_buf_lock();
 
   /* tab strip (between the menu bar and the address bar). Each tab passes its
    * decoded favicon, or NULL so the widget draws the default globe. */
@@ -3885,7 +3655,8 @@ static void render(void)
       int sy = py + B->line_y[f->row] - sc;
       if (sy + B->line_h[f->row] <= py || sy >= py + phh)
         continue;
-      draw_slice_core(f->x, sy, f->off, f->len, f->w, py, py + phh, line_height_for(f->off, f->off + f->len));
+      draw_slice_core(f->x, sy, f->off, f->len, f->w, py, py + phh, line_height_for(f->off, f->off + f->len),
+                      line_maxpx(f->off, f->off + f->len));
     }
 
     /* inline images, over their reserved (blank) rows */
@@ -3910,10 +3681,7 @@ static void render(void)
     }
 
     /* <audio>/<video> control widgets, over their reserved rows */
-    for (int n = 0;; n++) {
-      struct media_el *me = media_doc_nth(n);
-      if (!me)
-        break;
+    for (struct media_el *me = media_doc_first(); me; me = media_doc_next(me)) {
       int sr = media_el_start_row(me);
       if (sr < 0)
         continue;
@@ -3978,7 +3746,7 @@ static void render(void)
   gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
   menubar_draw(&menubar);
 
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 /* True while any menu dropdown is expanded. Such a dropdown overlaps the
@@ -3996,7 +3764,7 @@ static int menu_any_open(void)
  * and the URL field) and leave the page untouched. The page below and the menu
  * bar above don't intersect this row, so a present's frame diff blits just this
  * strip — no rewrap, no line/image redraw. Touches no shared content buffers,
- * so unlike render() it needs no blk_lock. */
+ * so unlike render() it needs no browser_buf_lock. */
 static void render_addr(void)
 {
   gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
@@ -4330,7 +4098,7 @@ static int hov_row = -1, hov_link = -1, hov_lo, hov_hi;
 /* Line-relative x where display line `row`'s glyphs begin: its left edge plus
  * the block indent and, for a centered block, the centering offset — the same
  * origin draw_slice_core paints from. Calls set_block, so callers must hold
- * blk_lock and the line index must be in range. Shared by the hit-test and
+ * browser_buf_lock and the line index must be in range. Shared by the hit-test and
  * selection mappers so neither can drift from the painted position. */
 static int line_content_x(int row)
 {
@@ -4355,7 +4123,7 @@ static int line_content_x(int row)
 /* Resolve a content-pane hit at client coords (mx,my): sets *off to the text
  * offset under the cursor (-1 if outside the pane or past the line's glyphs)
  * and copies the absolute href of any <a> covering it into `url` ("" if none).
- * Holds blk_lock across the walk + resolve, since the worker can move the
+ * Holds browser_buf_lock across the walk + resolve, since the worker can move the
  * text/line/ link tables with a realloc mid-load. Shared by the click and hover
  * handlers. */
 static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
@@ -4371,7 +4139,7 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
   if (my < py || my >= py + phh || mx < 0 || mx >= right - SCROLL_W)
     return; /* outside the content pane: skip the lock */
   int row = line_at_px(B->pg->scroll + (my - py));
-  blk_lock();
+  browser_buf_lock();
   if (row >= 0 && row < B->nlines) {
     /* proportional: walk the line's glyphs from the painted origin (block
      * indent + centering, via line_content_x) to find which char the point
@@ -4447,7 +4215,7 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
       hov_hi = hi;
     }
   }
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 /* Map a pane pixel to (display line, byte offset within that line), clamped so
@@ -4459,11 +4227,11 @@ static void pane_linecol(int mx, int my, int *line, int *col)
   pane_metrics(&py, &phh, &rows);
   *line = 0;
   *col = 0;
-  /* The worker rebuilds the line table and B->pg->text under blk_lock; take it
+  /* The worker rebuilds the line table and B->pg->text under browser_buf_lock; take it
    * so a mid-navigation free/rewrap can't hand this drag a stale nlines>0 with
    * a freed text buffer (utf8_decode would then deref a NULL/dangling pointer).
    */
-  blk_lock();
+  browser_buf_lock();
   if (B->pg->text && B->nlines > 0) {
     int row = line_at_px(B->pg->scroll + (my - py));
     if (row < 0)
@@ -4487,13 +4255,13 @@ static void pane_linecol(int mx, int my, int *line, int *col)
     }
     *col = c;
   }
-  blk_unlock();
+  browser_buf_unlock();
 }
 
 /* Alpha-blend a translucent selection highlight over the frame buffer rect. */
 static void sel_hl_rect(int x, int y, int w, int h)
 {
-  unsigned *fb = surface();
+  unsigned *fb = browser_surface();
   const unsigned sr = 0x33, sg = 0x66, sb = 0xcc, a = 110, ia = 255 - a; /* ~43% blue */
   for (int yy = y; yy < y + h; yy++) {
     if (yy < 0 || yy >= BH)
@@ -4608,10 +4376,7 @@ static void handle_click(int mx, int my)
       int paw = (right - SCROLL_W) - 8;
       if (paw < 8)
         paw = 8;
-      for (int n = 0;; n++) {
-        struct media_el *me = media_doc_nth(n);
-        if (!me)
-          break;
+      for (struct media_el *me = media_doc_first(); me; me = media_doc_next(me)) {
         int sr = media_el_start_row(me);
         if (sr < 0)
           continue;
@@ -4771,7 +4536,7 @@ static void copy_selection(void)
   int l0, c0, l1, c1;
   if (!gfx_sel_range(&g_sel, &l0, &c0, &l1, &c1))
     return;
-  blk_lock();
+  browser_buf_lock();
   char *buf = 0;
   int n = 0;
   if (l0 < B->nlines && l1 < B->nlines) {
@@ -4786,7 +4551,7 @@ static void copy_selection(void)
       buf[n] = '\0';
     }
   }
-  blk_unlock();
+  browser_buf_unlock();
   if (buf) {
     clip_put_text(buf, n);
     free(buf);
@@ -4995,7 +4760,7 @@ int main(int argc, char **argv)
     return 1;
   }
   B->win_id = id;
-  gfx_init(surface(), BW, BH);
+  gfx_init(browser_surface(), BW, BH);
   B->pg->page_bg = 0xffffff;
   B->pg->page_fg = 0x202830; /* until a page sets them */
 
@@ -5080,12 +4845,12 @@ int main(int argc, char **argv)
          * dims would then write past its end (heap OOB). Keep the old
          * size when the grow can't happen — the frame stays at the
          * previous resolution rather than corrupting the heap. */
-        surface();
-        if (g_surface && BW * BH > g_surface_px) {
+        browser_surface();
+        if (!browser_surface_ready()) {
           BW = prev_w;
           BH = prev_h;
         }
-        gfx_init(surface(), BW, BH);
+        gfx_init(browser_surface(), BW, BH);
         B->recascade = 1; /* @media may change → worker re-cascades  */
         B->seq++;         /* re-wrap + repaint at the new width */
       }
@@ -5143,7 +4908,7 @@ int main(int argc, char **argv)
       } else {  /* prompt */
         ok = dialog_prompt(id, B->dlg_title, B->dlg_msg, B->dlg_text, B->dlg_text, sizeof B->dlg_text);
       }
-      gfx_init(surface(), BW, BH); /* dialog borrowed the surface */
+      gfx_init(browser_surface(), BW, BH); /* dialog borrowed the surface */
       B->dlg_ok = ok;
       B->dlg_done = 1; /* release the worker (publish last) */
       B->seq++;        /* repaint the browser window */
@@ -5190,7 +4955,7 @@ int main(int argc, char **argv)
     int dt_paint = devtools_take_paint(); /* devtools-local change (log line) */
     if (B->seq != last && due) {
       render();
-      blit_present(id);
+      browser_present(id);
       last = B->seq;
       last_paint_frame = frame;
       addr_dirty = 0;
@@ -5203,10 +4968,10 @@ int main(int argc, char **argv)
       if (dt_paint)
         devtools_render(); /* opaque right-side split: dock only */
       if (addr_paint)
-        blit_rect(0, MENU_H + TAB_H, BW, ADDR_H);
+        browser_blit_rect(0, MENU_H + TAB_H, BW, ADDR_H);
       if (dt_paint) {
         int left = devtools_left();
-        blit_rect(left, devtools_top(), BW - left, BH - devtools_top());
+        browser_blit_rect(left, devtools_top(), BW - left, BH - devtools_top());
       }
       win_present(id);
     }
