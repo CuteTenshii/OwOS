@@ -221,7 +221,7 @@ static js_node *reinterpret_pattern(js_parser *p, js_node *n);
 static js_node *parse_array_pattern(js_parser *p)
 {
   js_node *node;
-  nvec els;
+  nvec els = {0};
   els.a = NULL;
   els.n = 0;
   els.cap = 0;
@@ -415,7 +415,7 @@ static int binop_prec(int op, int no_in)
 
 static js_node *parse_arguments(js_parser *p, js_node ***out, int *count)
 {
-  nvec args;
+  nvec args = {0};
   args.a = NULL;
   args.n = 0;
   args.cap = 0;
@@ -737,7 +737,7 @@ static js_node *parse_expression(js_parser *p, int no_in)
     return first;
   {
     js_node *seq;
-    nvec v;
+    nvec v = {0};
     v.a = NULL;
     v.n = 0;
     v.cap = 0;
@@ -757,7 +757,7 @@ static js_node *parse_expression(js_parser *p, int no_in)
 static js_node *parse_paren_or_arrow(js_parser *p)
 {
   int line = p->cur.line, col = p->cur.col;
-  nvec items;
+  nvec items = {0};
   items.a = NULL;
   items.n = 0;
   items.cap = 0;
@@ -823,7 +823,7 @@ static js_node *parse_paren_or_arrow(js_parser *p)
 static js_node *parse_array_literal(js_parser *p)
 {
   js_node *node;
-  nvec els;
+  nvec els = {0};
   els.a = NULL;
   els.n = 0;
   els.cap = 0;
@@ -858,7 +858,7 @@ static js_node *parse_method_function(js_parser *p)
   js_node **params;
   int n;
   int sa = p->in_async, sg = p->in_generator;
-  nvec ps;
+  nvec ps = {0};
   ps.a = NULL;
   ps.n = 0;
   ps.cap = 0;
@@ -1008,7 +1008,7 @@ static js_node *parse_object_literal(js_parser *p)
 static js_node *parse_template(js_parser *p)
 {
   js_node *node;
-  nvec quasis, exprs;
+  nvec quasis = {0}, exprs = {0};
   quasis.a = NULL;
   quasis.n = 0;
   quasis.cap = 0;
@@ -1219,7 +1219,7 @@ static js_node *reinterpret_pattern(js_parser *p, js_node *n)
 
 static js_node *parse_params_into(js_parser *p, js_node ***out, int *count)
 {
-  nvec ps;
+  nvec ps = {0};
   ps.a = NULL;
   ps.n = 0;
   ps.cap = 0;
@@ -1407,7 +1407,7 @@ static int semicolon(js_parser *p)
 static js_node *parse_block(js_parser *p)
 {
   js_node *node;
-  nvec body;
+  nvec body = {0};
   body.a = NULL;
   body.n = 0;
   body.cap = 0;
@@ -1564,7 +1564,7 @@ static js_node *parse_switch(js_parser *p)
   expect(p, T_LBRACE, "expected '{' to open switch body");
   while (!at(p, T_RBRACE) && !at(p, T_EOF) && !p->failed) {
     js_case c;
-    nvec body;
+    nvec body = {0};
     body.a = NULL;
     body.n = 0;
     body.cap = 0;
@@ -1924,7 +1924,7 @@ js_node *js_parse(const char *src, js_arena *arena, js_parse_error *err)
 {
   js_parser p;
   js_node *prog;
-  nvec body;
+  nvec body = {0};
   body.a = NULL;
   body.n = 0;
   body.cap = 0;
