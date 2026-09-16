@@ -93,6 +93,9 @@ static struct dom_node *node_new(struct parser *ps, enum dom_type type)
   n->text = 0;
   n->attrs = 0;
   n->last_attr = 0;
+  for (int i = 0; i < 8; i++)
+    n->attr_cache[i] = 0;
+  n->attr_cache_seq = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
@@ -517,11 +520,29 @@ void dom_free(struct dom_node *root)
 
 const char *dom_get_attr(const struct dom_node *node, const char *name)
 {
+  static const char *const common[] = {"id", "class", "style", "type", "href", "src", "value", "name"};
+  int slot = -1;
   if (!node || node->type != DOM_ELEMENT)
     return 0;
+  for (int i = 0; i < (int)(sizeof common / sizeof common[0]); i++)
+    if (streq_ci(name, common[i])) {
+      slot = i;
+      break;
+    }
+  if (slot >= 0) {
+    if (node->attr_cache_seq == dom_mutation_seq)
+      return node->attr_cache[slot] ? node->attr_cache[slot]->value : 0;
+    for (int i = 0; i < 8; i++)
+      ((struct dom_node *)node)->attr_cache[i] = 0;
+    ((struct dom_node *)node)->attr_cache_seq = dom_mutation_seq;
+  }
   for (struct dom_attr *a = node->attrs; a; a = a->next)
     if (streq_ci(a->name, name))
-      return a->value;
+      {
+        if (slot >= 0)
+          ((struct dom_node *)node)->attr_cache[slot] = a;
+        return a->value;
+      }
   return 0;
 }
 
@@ -537,6 +558,9 @@ struct dom_node *dom_new_element(const char *tag)
   n->text = 0;
   n->attrs = 0;
   n->last_attr = 0;
+  for (int i = 0; i < 8; i++)
+    n->attr_cache[i] = 0;
+  n->attr_cache_seq = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
@@ -562,6 +586,9 @@ struct dom_node *dom_new_text(const char *text)
   n->tag[0] = '\0';
   n->attrs = 0;
   n->last_attr = 0;
+  for (int i = 0; i < 8; i++)
+    n->attr_cache[i] = 0;
+  n->attr_cache_seq = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;

@@ -19,6 +19,8 @@ struct dom_node {
   char *text;   /* character data (text node)           */
   struct dom_attr *attrs;
   struct dom_attr *last_attr; /* tail of attrs, for O(1) append       */
+  struct dom_attr *attr_cache[8];
+  unsigned attr_cache_seq;
   struct dom_node *parent;
   struct dom_node *first_child;
   struct dom_node *last_child;
