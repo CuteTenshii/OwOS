@@ -72,6 +72,34 @@ static inline void fill32(unsigned *d, unsigned v, int n)
   __asm__ volatile("rep ; stosl" : "=&D"(d0), "=&c"(d1) : "a"(v), "0"(d), "1"(n) : "memory");
 }
 
+struct gfx_rect {
+  int x0, y0, x1, y1;
+};
+
+static int clip_rect(int x, int y, int w, int h, struct gfx_rect *out)
+{
+  long long x1 = (long long)x + w, y1 = (long long)y + h;
+  int x0 = x > g_cx0 ? x : g_cx0;
+  int y0 = y > g_cy0 ? y : g_cy0;
+  int x2 = x1 <= 0 ? 0 : x1 >= g_cx1 ? g_cx1 : (int)x1;
+  int y2 = y1 <= 0 ? 0 : y1 >= g_cy1 ? g_cy1 : (int)y1;
+  if (x0 < 0)
+    x0 = 0;
+  if (y0 < 0)
+    y0 = 0;
+  if (x2 > g_w)
+    x2 = g_w;
+  if (y2 > g_h)
+    y2 = g_h;
+  if (w <= 0 || h <= 0 || x2 <= x0 || y2 <= y0)
+    return 0;
+  out->x0 = x0;
+  out->y0 = y0;
+  out->x1 = x2;
+  out->y1 = y2;
+  return 1;
+}
+
 void gfx_pixel(int x, int y, unsigned color)
 {
   if (x < g_cx0 || x >= g_cx1 || y < g_cy0 || y >= g_cy1)
@@ -82,37 +110,37 @@ void gfx_pixel(int x, int y, unsigned color)
 
 void gfx_fill_rect(int x, int y, int w, int h, unsigned color)
 {
-  /* Edges in 64-bit: a hostile w/h near INT_MAX would otherwise wrap x+w
-   * negative, skip the clamp, and let fill32 run off the framebuffer. */
-  long long rx0 = x, ry0 = y, rx1 = (long long)x + w, ry1 = (long long)y + h;
-  if (rx0 < 0)
-    rx0 = 0;
-  if (ry0 < 0)
-    ry0 = 0;
-  if (rx1 > g_w)
-    rx1 = g_w;
-  if (ry1 > g_h)
-    ry1 = g_h;
-  /* intersect with the active clip rect */
-  if (rx0 < g_cx0)
-    rx0 = g_cx0;
-  if (ry0 < g_cy0)
-    ry0 = g_cy0;
-  if (rx1 > g_cx1)
-    rx1 = g_cx1;
-  if (ry1 > g_cy1)
-    ry1 = g_cy1;
-  if (rx1 <= rx0 || ry1 <= ry0)
+  if (w > 0 && h > 0 && x >= 0 && y >= 0 && x <= g_w - w && y <= g_h - h && g_cx0 == 0 && g_cy0 == 0 && g_cx1 == g_w &&
+      g_cy1 == g_h) {
+    for (int r = 0; r < h; r++)
+      fill32(g_fb + (long)(y + r) * g_w + x, color, w);
     return;
-  int xx = (int)rx0, yy = (int)ry0, ww = (int)(rx1 - rx0), hh = (int)(ry1 - ry0);
-  for (int r = 0; r < hh; r++)
-    fill32(g_fb + (long)(yy + r) * g_w + xx, color, ww);
+  }
+
+  struct gfx_rect r;
+  if (!clip_rect(x, y, w, h, &r))
+    return;
+  int ww = r.x1 - r.x0;
+  for (int row = r.y0; row < r.y1; row++)
+    fill32(g_fb + (long)row * g_w + r.x0, color, ww);
 }
 
 void gfx_clear(unsigned color) { gfx_fill_rect(0, 0, g_w, g_h, color); }
 
 void gfx_rect(int x, int y, int w, int h, unsigned color)
 {
+  if (w > 0 && h > 0 && x >= 0 && y >= 0 && x <= g_w - w && y <= g_h - h && g_cx0 == 0 && g_cy0 == 0 && g_cx1 == g_w &&
+      g_cy1 == g_h) {
+    fill32(g_fb + (long)y * g_w + x, color, w);
+    if (h > 1)
+      fill32(g_fb + (long)(y + h - 1) * g_w + x, color, w);
+    if (w > 1)
+      for (int row = 1; row < h - 1; row++) {
+        g_fb[(long)(y + row) * g_w + x] = color;
+        g_fb[(long)(y + row) * g_w + x + w - 1] = color;
+      }
+    return;
+  }
   gfx_fill_rect(x, y, w, 1, color);
   gfx_fill_rect(x, y + h - 1, w, 1, color);
   gfx_fill_rect(x, y, 1, h, color);
@@ -137,24 +165,19 @@ static unsigned gfx_blend(unsigned fg, unsigned bg, unsigned a)
  * the framebuffer. Fully transparent pixels are skipped; clipped to bounds. */
 void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb)
 {
-  for (int r = 0; r < h; r++) {
-    int sy = y + r;
-    if ((unsigned)sy >= (unsigned)g_h)
-      continue;
-    if (sy < g_cy0 || sy >= g_cy1)
-      continue;
-    const unsigned *src = argb + (long)r * w;
-    unsigned *drow = g_fb + (long)sy * g_w;
-    for (int c = 0; c < w; c++) {
-      int sx = x + c;
-      if ((unsigned)sx >= (unsigned)g_w)
-        continue;
-      if (sx < g_cx0 || sx >= g_cx1)
-        continue;
-      unsigned px = src[c], a = px >> 24;
+  struct gfx_rect r;
+  if (!clip_rect(x, y, w, h, &r))
+    return;
+
+  int src_x = r.x0 - x;
+  for (int dy = r.y0; dy < r.y1; dy++) {
+    const unsigned *src = argb + (long)(dy - y) * w + src_x;
+    unsigned *drow = g_fb + (long)dy * g_w + r.x0;
+    for (int dx = r.x0; dx < r.x1; dx++, src++, drow++) {
+      unsigned px = *src, a = px >> 24;
       if (a == 0)
         continue;
-      drow[sx] = (a == 255) ? (px & 0xffffff) : gfx_blend(px & 0xffffff, drow[sx], a);
+      *drow = (a == 255) ? (px & 0xffffff) : gfx_blend(px & 0xffffff, *drow, a);
     }
   }
 }
@@ -362,8 +385,18 @@ void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg)
 
 void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg)
 {
+  int bulk_bg = 0;
+  if (!(bg & GFX_TRANSPARENT)) {
+    int n = 0;
+    while (s[n])
+      n++;
+    if (n > 0 && n <= 2147483647 / GFX_FONT_W) {
+      gfx_fill_rect(x, y, n * GFX_FONT_W, GFX_FONT_H, bg);
+      bulk_bg = 1;
+    }
+  }
   for (; *s; s++, x += GFX_FONT_W)
-    gfx_glyph(x, y, (unsigned char)*s, fg, bg);
+    gfx_glyph(x, y, (unsigned char)*s, fg, bulk_bg ? GFX_TRANSPARENT : bg);
 }
 
 /* Map a Unicode codepoint to the cell font's CP437 glyph (0 = no glyph). The
@@ -1304,87 +1337,6 @@ int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int to
   return s;
 }
 
-/* ------------------------------------------------------------- sidebar */
-
-#define SB_GRIP_DOT 0x33415au /* grip dimple colour, picked off the divider */
-
-static int sb_clamp(const struct sidebar *sb, int w)
-{
-  if (w < sb->min_w)
-    w = sb->min_w;
-  if (w > sb->max_w)
-    w = sb->max_w;
-  return w;
-}
-
-void sidebar_init(struct sidebar *sb, int w, int min_w, int max_w)
-{
-  if (max_w < min_w)
-    max_w = min_w;
-  sb->min_w = min_w;
-  sb->max_w = max_w;
-  sb->resizable = 1;
-  sb->dragging = 0;
-  sb->w = sb_clamp(sb, w);
-}
-
-void sidebar_set_width(struct sidebar *sb, int w) { sb->w = sb_clamp(sb, w); }
-
-void sidebar_draw(struct sidebar *sb, int x, int y, int w, int h, unsigned bg, unsigned divider)
-{
-  gfx_fill_rect(x, y, w, h, bg);
-  gfx_fill_rect(x + w, y, 1, h, divider);
-
-  /* A short centred column of dimples marks the divider as a drag handle. */
-  if (sb->resizable && h > 24) {
-    int cy = y + h / 2 - 9;
-    for (int i = 0; i < 4; i++)
-      gfx_fill_rect(x + w - 1, cy + i * 5, 2, 2, SB_GRIP_DOT);
-  }
-}
-
-int sidebar_press(struct sidebar *sb, int x, int y, int w, int h, int mx, int my)
-{
-  sb->dragging = 0;
-  if (!sb->resizable)
-    return 0;
-  int gx = x + w; /* the divider line            */
-  if (mx >= gx - SIDEBAR_GRIP / 2 && mx <= gx + SIDEBAR_GRIP / 2 && my >= y && my < y + h) {
-    sb->dragging = 1;
-    return 1;
-  }
-  return 0;
-}
-
-int sidebar_drag(struct sidebar *sb, int x, int mx)
-{
-  if (!sb->dragging)
-    return 0;
-  int nw = sb_clamp(sb, mx - x);
-  if (nw == sb->w)
-    return 0;
-  sb->w = nw;
-  return 1;
-}
-
-/* ------------------------------------------------------------- separator */
-
-/* A thin divider: a dark groove line with a faint highlight beside it, so it
- * reads on both light and dark panels. Horizontal spans [x, x+len) at y;
- * vertical spans [y, y+len) at x. */
-void gfx_separator(int x, int y, int len, int vertical)
-{
-  if (len <= 0)
-    return;
-  if (vertical) {
-    gfx_fill_rect(x, y, 1, len, 0x05070au);
-    gfx_fill_rect(x + 1, y, 1, len, 0x3a4658u);
-  } else {
-    gfx_fill_rect(x, y, len, 1, 0x05070au);
-    gfx_fill_rect(x, y + 1, len, 1, 0x3a4658u);
-  }
-}
-
 /* ------------------------------------------------------------- select */
 
 #define SEL_BG 0xffffffu     /* field + list background          */
@@ -1536,57 +1488,4 @@ int select_key(struct select_box *s, char key)
     return 0;
   }
   return 0;
-}
-
-/* --- text selection helper (see gfx.h) ------------------------------------ */
-static int gsel_le(int al, int ac, int bl, int bc) { return al < bl || (al == bl && ac <= bc); }
-
-void gfx_sel_clear(struct gfx_sel *s)
-{
-  s->active = s->has = 0;
-  s->al = s->ac = s->el = s->ec = 0;
-}
-void gfx_sel_start(struct gfx_sel *s, int line, int col)
-{
-  s->active = 1;
-  s->has = 0;
-  s->al = s->el = line;
-  s->ac = s->ec = col;
-}
-void gfx_sel_extend(struct gfx_sel *s, int line, int col)
-{
-  if (!s->active)
-    return;
-  s->el = line;
-  s->ec = col;
-  s->has = (s->al != s->el || s->ac != s->ec);
-}
-void gfx_sel_end(struct gfx_sel *s) { s->active = 0; }
-int gfx_sel_active(const struct gfx_sel *s) { return s->active; }
-int gfx_sel_has(const struct gfx_sel *s) { return s->has; }
-
-int gfx_sel_range(const struct gfx_sel *s, int *l0, int *c0, int *l1, int *c1)
-{
-  if (!s->has)
-    return 0;
-  if (gsel_le(s->al, s->ac, s->el, s->ec)) {
-    *l0 = s->al;
-    *c0 = s->ac;
-    *l1 = s->el;
-    *c1 = s->ec;
-  } else {
-    *l0 = s->el;
-    *c0 = s->ec;
-    *l1 = s->al;
-    *c1 = s->ac;
-  }
-  return 1;
-}
-
-int gfx_sel_contains(const struct gfx_sel *s, int line, int col)
-{
-  int l0, c0, l1, c1;
-  if (!gfx_sel_range(s, &l0, &c0, &l1, &c1))
-    return 0;
-  return gsel_le(l0, c0, line, col) && (line < l1 || (line == l1 && col < c1));
 }
