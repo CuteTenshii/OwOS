@@ -14,7 +14,7 @@ USB host support, and Sound Blaster audio. With no framebuffer it falls back to
 an 80×25 text console and everything still works.
 
 ```
-make            # build owos.bin (host gcc -m32, no cross-compiler)
+make            # build owos.bin with the i686-elf target toolchain
 make test       # compile and run the deterministic host test suite
 make format     # format C sources and headers with clang-format
 make format-check # verify C sources and headers are clang-format clean
@@ -28,26 +28,19 @@ make run NIC=e1000   # attach the Intel 82540EM instead of the default RTL8139
 
 ## Build & run
 
-You need a toolchain that emits 32-bit ELF plus `qemu-system-i386`. Building the
-bootable ISO additionally needs `grub-mkrescue`, `xorriso`, and `mtools`; the
-seeded FAT test disks need `mkfs.fat` (dosfstools).
+You need the target ELF toolchain `i686-elf-gcc` and `i686-elf-binutils`, plus
+`qemu-system-i386`. Building the bootable ISO additionally needs `grub-mkrescue`,
+`xorriso`, and `mtools`; the seeded FAT test disks need `mkfs.fat` (dosfstools).
 
-- **Linux:** the native `gcc`/`binutils` with 32-bit support — install `gcc-multilib`
-  (Debian/Ubuntu) or the equivalent — then `qemu`, and for the ISO/disks `grub`,
-  `xorriso`, `mtools`, `dosfstools`. The build uses bare `gcc`/`ld`/`objcopy`.
-- **macOS:** the system `gcc`/`ld` are Apple Clang and emit only Mach-O, so an ELF
-  **cross-toolchain** is required. With [Homebrew](https://brew.sh):
+The default build uses the `i686-elf-` toolchain. The 64-bit build uses
+`x86_64-elf-` for the kernel and still uses `i686-elf-` for embedded user programs.
+With [Homebrew](https://brew.sh), install the target toolchains and runtime tools:
 
   ```sh
   brew install i686-elf-gcc i686-elf-binutils   # the kernel toolchain
   brew install qemu mtools dosfstools xorriso    # run + seeded test disks
   ```
 
-  The Makefile auto-detects macOS (`uname -s` = Darwin) and prefixes the tools with
-  `i686-elf-`; override with `make CROSS=x86_64-elf-` if you installed that instead.
-  `make iso`/`make usb` stay Linux-only (`grub-mkrescue` and the `/sys/block`
-  removable-device check have no clean macOS equivalent); use QEMU's `-kernel`
-  (`make run`/`debug`) on macOS.
 
 | Target | What it does |
 | --- | --- |

@@ -5,6 +5,8 @@
 #ifndef OWOS_MPEG_BITS_H
 #define OWOS_MPEG_BITS_H
 
+#include "owos.h"
+
 /* ---- reader ---------------------------------------------------------------
  */
 typedef struct {

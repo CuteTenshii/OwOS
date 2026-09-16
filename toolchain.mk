@@ -16,18 +16,13 @@ ifeq ($(filter $(ARCH),i386 x86_64),)
   $(error unsupported ARCH '$(ARCH)' — use i386 or x86_64)
 endif
 
-# Kernel cross-compile prefix. Linux: native gcc/binutils emit target ELF with
-# -m32/-m64 (needs gcc-multilib), so CROSS is empty. macOS: Apple's gcc/ld emit only
-# Mach-O, so use an ELF cross-toolchain (brew install {i686,x86_64}-elf-gcc/-binutils)
-# — default the prefix per ARCH. Override with make CROSS=...
-ifeq ($(shell uname -s),Darwin)
-  ifeq ($(ARCH),x86_64)
-    CROSS ?= x86_64-elf-
-  else
-    CROSS ?= i686-elf-
-  endif
+# Kernel cross-compile prefix. The target is ELF, so select the target
+# toolchain from ARCH instead of inheriting the host compiler.
+ifeq ($(ARCH),x86_64)
+  CROSS ?= x86_64-elf-
+else
+  CROSS ?= i686-elf-
 endif
-CROSS ?=
 
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
@@ -36,23 +31,17 @@ OBJCOPY := $(CROSS)objcopy
 # Fail early with an actionable message rather than a cryptic "elf_i386" error
 # halfway through the link when the cross-toolchain isn't installed.
 ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
-  $(error C compiler '$(CC)' not found. On macOS run: brew install i686-elf-gcc i686-elf-binutils (32-bit) or x86_64-elf-gcc x86_64-elf-binutils (64-bit), or set CROSS=. On Linux install gcc-multilib.)
+  $(error C compiler '$(CC)' not found. Install the target ELF toolchain or override CROSS.)
 endif
 
-# User-space toolchain. User programs are ALWAYS 32-bit ELF regardless of kernel ARCH
-# (the kernel embeds each as an opaque blob). x86_64-elf-gcc has no 32-bit libgcc, so
-# even an x64 kernel links user code with the i686 toolchain; Linux gcc -m32 covers it.
-ifeq ($(shell uname -s),Darwin)
-  UCROSS ?= i686-elf-
-endif
-UCROSS ?=
+# User-space programs are always 32-bit ELF because the kernel embeds them as blobs.
+UCROSS ?= i686-elf-
 UCC      := $(UCROSS)gcc
 ULD      := $(UCROSS)ld
 UOBJCOPY := $(UCROSS)objcopy
 
-# grub-mkrescue builds the bootable ISO (make iso). Plain name on Linux; macOS
-# Homebrew installs it arch-prefixed. Prefer plain, else a prefixed build on PATH.
-GRUB_MKRESCUE ?= $(firstword $(foreach g,grub-mkrescue x86_64-elf-grub-mkrescue i686-elf-grub-mkrescue,$(shell command -v $(g) >/dev/null 2>&1 && echo $(g))) grub-mkrescue)
+# grub-mkrescue builds the bootable ISO (make iso).
+GRUB_MKRESCUE ?= grub-mkrescue
 
 # Per-arch knobs. KELF/KBFD are objcopy's output ELF format and BFD architecture
 # for wrapping a user blob (or font) into a KERNEL object. LINKER is the kernel
