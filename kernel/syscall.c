@@ -44,6 +44,7 @@
 #include "shell.h"
 #include "smbios.h"
 #include "syscall_fs.h"
+#include "syscall_net.h"
 #include "syscall_path.h"
 #include "syscall_process.h"
 #include "sysfs.h"
@@ -671,139 +672,39 @@ void syscall_dispatch(struct registers *r)
     syscall_fs_stream_end(r);
     break;
   case SYS_NET_CONNECT: {
-    if ((int)r->edx == SK_RAWETH) { /* raw L2 socket: no host, root-only */
-      r->eax = sched_uid() != 0 ? (uint32_t)-1 : (uint32_t)net_sock_connect(0, 0, SK_RAWETH);
-      break;
-    }
-    /* Copy the host string out of user memory, bounded. */
-    char host[NET_HOST_MAX];
-    if (copyin_str(r->ebx, host, sizeof host) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)net_sock_connect(host, (uint16_t)r->ecx, (int)r->edx);
+    syscall_net_connect(r);
     break;
   }
   case SYS_NET_SEND: {
-    /* ebx -> {int fd, const void *buf, u32 len, u32 flags, const u8 *ip[4]|0,
-     * int port}: ip non-NULL selects sendto (datagram to ip:port), else a
-     * connected/stream send. */
-    if (!user_range(r->ebx, 24)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint32_t a[6];
-    if (copyin(a, r->ebx, sizeof a) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint32_t fd = a[0], bp = a[1], len = a[2], ipp = a[4], port = a[5];
-    if (len == 0 || !user_range(bp, len) || (ipp && !user_range(ipp, 4))) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    if (ipp) {
-      uint8_t ip[4];
-      for (int i = 0; i < 4; i++)
-        ip[i] = ((const uint8_t *)ipp)[i];
-      r->eax = (uint32_t)net_sock_sendto((int)fd, ip, (int)port, (const void *)bp, len);
-    } else {
-      r->eax = (uint32_t)net_sock_send((int)fd, (const void *)bp, len);
-    }
+    syscall_net_send(r);
     break;
   }
   case SYS_NET_RECV: {
-    /* ebx -> {int fd, void *buf, u32 max, u32 flags, u8 *ip[4]|0, int *port|0}:
-     * ip/port non-NULL fills the datagram source; else flags&MSG_DONTWAIT
-     * selects a non-blocking recv. */
-    if (!user_range(r->ebx, 24)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint32_t a[6];
-    if (copyin(a, r->ebx, sizeof a) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint32_t fd = a[0], bp = a[1], max = a[2], flags = a[3], ipp = a[4], portp = a[5];
-    if (max == 0 || !user_out_range(bp, max) || (ipp && !user_out_range(ipp, 4)) ||
-        (portp && !user_out_range(portp, 4))) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    int n;
-    if (ipp || portp) {
-      uint8_t ip[4];
-      uint16_t port = 0;
-      n = net_sock_recvfrom((int)fd, (void *)bp, max, ipp ? ip : 0, &port);
-      if (n > 0) {
-        if (ipp && copyout(ipp, ip, 4) != 0)
-          n = -1;
-        if (portp && n > 0) {
-          int port_out = port;
-          if (copyout(portp, &port_out, sizeof port_out) != 0)
-            n = -1;
-        }
-      }
-    } else if (flags & MSG_DONTWAIT) {
-      n = net_sock_recv_nb((int)fd, (void *)bp, max);
-    } else {
-      n = net_sock_recv((int)fd, (void *)bp, max);
-    }
-    r->eax = (uint32_t)n;
+    syscall_net_recv(r);
     break;
   }
   case SYS_NET_CLOSE:
-    r->eax = (uint32_t)net_sock_close((int)r->ebx);
+    syscall_net_close(r);
     break;
   case SYS_NET_SETOPT: /* ebx=fd, ecx=opt, edx=val */
-    r->eax = (uint32_t)((int)r->ecx == NET_OPT_TTL ? net_sock_set_ttl((int)r->ebx, (int)r->edx) : -1);
+    syscall_net_setopt(r);
     break;
   case SYS_IFCONFIG: { /* set kernel IPv4 config: root-only */
-    /* ebx -> ip[4]; ecx -> {mask[4], gw[4], dns[4]} (12 bytes). */
-    if (sched_uid() != 0 || !user_range(r->ebx, 4) || !user_range(r->ecx, 12)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint8_t ip[4], mask[4], gw[4], dns[4];
-    const uint8_t *ipp = (const uint8_t *)r->ebx;
-    const uint8_t *rest = (const uint8_t *)r->ecx;
-    for (int i = 0; i < 4; i++) {
-      ip[i] = ipp[i];
-      mask[i] = rest[i];
-      gw[i] = rest[4 + i];
-      dns[i] = rest[8 + i];
-    }
-    net_ifconfig(ip, mask, gw, dns);
-    r->eax = 0;
+    syscall_net_ifconfig(r);
     break;
   }
   case SYS_SETRTC: { /* set the wall clock: root-only */
-    if (sched_uid() != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    struct rtc_time t;
-    epoch_to_rtc((uint32_t)r->ebx, &t);
-    rtc_set(&t);
-    r->eax = 0;
+    syscall_net_setrtc(r);
     break;
   }
   case SYS_NET_LISTEN:
-    /* A well-known port (<1024) may only be claimed by root, as on Unix. */
-    if ((int)r->ebx < 1024 && sched_uid() != 0)
-      r->eax = (uint32_t)-1;
-    else
-      r->eax = (uint32_t)net_sock_listen((int)r->ebx);
+    syscall_net_listen(r);
     break;
   case SYS_NET_ACCEPT:
-    r->eax = (uint32_t)net_sock_accept((int)r->ebx);
+    syscall_net_accept(r);
     break;
   case SYS_NET_BIND:
-    if ((int)r->ebx < 1024 && sched_uid() != 0)
-      r->eax = (uint32_t)-1;
-    else
-      r->eax = (uint32_t)net_sock_bind((int)r->ebx);
+    syscall_net_bind(r);
     break;
   case SYS_GETRANDOM: {
     uint32_t buf = r->ebx, len = r->ecx;
