@@ -734,7 +734,7 @@ int fetch_lazy_visible(void);                   /* worker: load one in-view load
  * attribute gates whether links inside the frame may navigate; `allow`
  * (Permissions Policy) is parsed and surfaced in the frame chrome. */
 enum { FRAME_OK = 1, FRAME_BLOCKED = 2, FRAME_ERROR = 3 }; /* embedding verdict */
-int html_iframes_pending(void); /* worker: any frame still needs fetching?  */
+int html_iframes_pending(void);                            /* worker: any frame still needs fetching?  */
 /* worker: copy the next unfetched frame's absolute src + its embedder URL out;
  * returns 1 when one was found, 0 when none remain. */
 int html_iframe_next_pending(char *url, int url_cap, char *parent, int parent_cap);

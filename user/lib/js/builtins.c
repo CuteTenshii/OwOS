@@ -359,11 +359,20 @@ MATH1(m_sqrt, sqrt)
 MATH1(m_cbrt, cbrt)
 MATH1(m_sin, sin)
 MATH1(m_cos, cos)
-MATH1(m_tan, tan) MATH1(m_asin, asin) MATH1(m_acos, acos) MATH1(m_atan, atan) MATH1(m_sinh, sinh) MATH1(m_cosh, cosh)
-    MATH1(m_tanh, tanh) MATH1(m_exp, exp) MATH1(m_log, log) MATH1(m_log2, log2) MATH1(m_log10, log10)
+MATH1(m_tan, tan)
+MATH1(m_asin, asin)
+MATH1(m_acos, acos)
+MATH1(m_atan, atan)
+MATH1(m_sinh, sinh)
+MATH1(m_cosh, cosh)
+MATH1(m_tanh, tanh)
+MATH1(m_exp, exp)
+MATH1(m_log, log)
+MATH1(m_log2, log2)
+MATH1(m_log10, log10)
 #undef MATH1
 
-        static js_value m_round(js_ctx *ctx, js_value t, js_value *a, int n)
+static js_value m_round(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   double x = js_to_number(ctx, ARG(0));
   (void)t;
@@ -7327,11 +7336,16 @@ DV_SET(dv_set_i16, TA_I16)
 DV_GET(dv_get_u16, TA_U16)
 DV_SET(dv_set_u16, TA_U16)
 DV_GET(dv_get_i32, TA_I32)
-DV_SET(dv_set_i32, TA_I32) DV_GET(dv_get_u32, TA_U32) DV_SET(dv_set_u32, TA_U32) DV_GET(dv_get_f32, TA_F32)
-    DV_SET(dv_set_f32, TA_F32) DV_GET(dv_get_f64, TA_F64) DV_SET(dv_set_f64, TA_F64)
+DV_SET(dv_set_i32, TA_I32)
+DV_GET(dv_get_u32, TA_U32)
+DV_SET(dv_set_u32, TA_U32)
+DV_GET(dv_get_f32, TA_F32)
+DV_SET(dv_set_f32, TA_F32)
+DV_GET(dv_get_f64, TA_F64)
+DV_SET(dv_set_f64, TA_F64)
 #undef DV_GET
 #undef DV_SET
-        static js_value dv_bytelength(js_ctx *ctx, js_value t, js_value *a, int n)
+static js_value dv_bytelength(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_typedarray *ta = as_ta(t);
   (void)ctx;
