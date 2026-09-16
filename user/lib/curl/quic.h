@@ -1,10 +1,11 @@
 /* quic.h — a minimal QUIC v1 client (RFC 9000/9001) for libcurl's HTTP/3.
  *
- * Runs entirely in user space over a SK_UDP socket (net_connect/net_send/net_recv):
- * QUIC packet protection (AES-128-GCM payload + AES-ECB header protection), a
- * TLS 1.3 handshake carried in CRYPTO frames (the same key schedule the kernel
- * TLS stack uses, mirrored here over user/lib/crypto), and the frame types a
- * one-request client needs (CRYPTO/ACK/STREAM/PADDING/CONNECTION_CLOSE/…).
+ * Runs entirely in user space over a SK_UDP socket
+ * (net_connect/net_send/net_recv): QUIC packet protection (AES-128-GCM payload
+ * + AES-ECB header protection), a TLS 1.3 handshake carried in CRYPTO frames
+ * (the same key schedule the kernel TLS stack uses, mirrored here over
+ * user/lib/crypto), and the frame types a one-request client needs
+ * (CRYPTO/ACK/STREAM/PADDING/CONNECTION_CLOSE/…).
  *
  * Scope, on purpose (matching the rest of OwOS's pragmatic net stack — see the
  * TCP notes in CLAUDE.md): one connection at a time (file-static state, like
@@ -21,12 +22,12 @@
 #include <stdint.h>
 
 /* Negative results mirror http.h's HTTP_E* spirit. */
-#define QUIC_OK        0
-#define QUIC_ESOCK   (-1)   /* no NIC / no socket / send failed         */
-#define QUIC_ERESOLVE (-2)  /* DNS resolution failed                    */
-#define QUIC_EHANDSHAKE (-3)/* QUIC/TLS handshake failed                */
-#define QUIC_EINTR   (-4)   /* Ctrl+C arrived mid-transfer              */
-#define QUIC_ECLOSED (-5)   /* peer closed the connection / fatal error */
+#define QUIC_OK 0
+#define QUIC_ESOCK (-1)      /* no NIC / no socket / send failed         */
+#define QUIC_ERESOLVE (-2)   /* DNS resolution failed                    */
+#define QUIC_EHANDSHAKE (-3) /* QUIC/TLS handshake failed                */
+#define QUIC_EINTR (-4)      /* Ctrl+C arrived mid-transfer              */
+#define QUIC_ECLOSED (-5)    /* peer closed the connection / fatal error */
 
 /* Open a QUIC connection to host:port and complete the TLS 1.3 handshake,
  * offering ALPN `alpn` (e.g. "h3"). Returns QUIC_OK or a negative QUIC_E*. */

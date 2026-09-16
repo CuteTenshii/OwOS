@@ -31,13 +31,14 @@ void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len);
  * successful tcp_connect() until tcp_close(); the read/write/close calls take
  * the connection they operate on. */
 tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport); /* NULL = fail */
-int  tcp_write(tcp_conn_t *c, const void *data, uint32_t len);    /* bytes, -1   */
-int  tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
-                                                                  /* bytes; sets
-                                                                   * *closed=EOF */
+int tcp_write(tcp_conn_t *c, const void *data, uint32_t len);     /* bytes, -1   */
+int tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
+/* bytes; sets
+ * *closed=EOF */
 /* Non-blocking variant: returns bytes now (>0), 0 if none yet, -1 on reset;
- * sets *closed at EOF. Lets one thread service many connections (no sleeping). */
-int  tcp_read_nb(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
+ * sets *closed at EOF. Lets one thread service many connections (no sleeping).
+ */
+int tcp_read_nb(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
 void tcp_close(tcp_conn_t *c);
 
 /* Server API, for headless TCP daemons (now user-space, via net_sock_*).
@@ -51,8 +52,8 @@ void tcp_close(tcp_conn_t *c);
  *
  * Reuses the same TCB table as the client side — an accepted connection is
  * structurally identical to a connected one once it reaches ESTAB. */
-int          tcp_listen(uint16_t port);          /* 0 ok, -1 no slot/buffers */
-void         tcp_unlisten(uint16_t port);
-tcp_conn_t  *tcp_accept(uint16_t port);  /* NULL if interrupted by a signal */
+int tcp_listen(uint16_t port); /* 0 ok, -1 no slot/buffers */
+void tcp_unlisten(uint16_t port);
+tcp_conn_t *tcp_accept(uint16_t port); /* NULL if interrupted by a signal */
 
 #endif /* OWOS_TCP_H */

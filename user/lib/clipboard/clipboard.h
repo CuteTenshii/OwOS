@@ -24,8 +24,8 @@ int clip_get(int idx, char *mime, int mimemax, void **out, int *len);
 int clip_count(void);
 
 /* Describe clip #idx without pulling its whole payload: copies the MIME type
- * into mime[mimemax], sets *full_len, and returns a malloc'd NUL-terminated text
- * *preview (empty for non-text types). Caller frees *preview. 0, or -1 on
+ * into mime[mimemax], sets *full_len, and returns a malloc'd NUL-terminated
+ * text *preview (empty for non-text types). Caller frees *preview. 0, or -1 on
  * out-of-range / clipd down. */
 int clip_list(int idx, char *mime, int mimemax, int *full_len, char **preview);
 

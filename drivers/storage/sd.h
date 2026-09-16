@@ -1,15 +1,16 @@
 /* sd.h — SD/MMC card driver over a PCI SDHCI host controller, polled PIO.
  *
  * SDHCI (SD Host Controller Interface) is the standard way an SD/MMC card slot
- * is exposed to software: a PCI device (class 0x08 / subclass 0x05) with an MMIO
- * register block through which the host issues SD commands and streams block
- * data. QEMU models one as `-device sdhci-pci` carrying an `-device sd-card`.
+ * is exposed to software: a PCI device (class 0x08 / subclass 0x05) with an
+ * MMIO register block through which the host issues SD commands and streams
+ * block data. QEMU models one as `-device sdhci-pci` carrying an `-device
+ * sd-card`.
  *
  * This driver brings up the first SDHCI controller with a card inserted, runs
  * the SD initialisation handshake (CMD0/CMD8/ACMD41/CMD2/CMD3/CMD9/CMD7), and
  * reads/writes one 512-byte block at a time by polling — the same
- * read/write/present/sectors/model contract as ata.c/ahci.c/nvme.c, so blk.c can
- * treat an SD card like any other block device.
+ * read/write/present/sectors/model contract as ata.c/ahci.c/nvme.c, so blk.c
+ * can treat an SD card like any other block device.
  */
 #ifndef OWOS_SD_H
 #define OWOS_SD_H

@@ -1,4 +1,5 @@
-/* httpcache.h — libcurl: the HTTP caching *policy*, RFC 7234 (no storage, no I/O).
+/* httpcache.h — libcurl: the HTTP caching *policy*, RFC 7234 (no storage, no
+ * I/O).
  *
  * This is the pure decision core an HTTP cache is built on: parse a response's
  * cache-relevant headers into a struct, decide whether the response may be
@@ -26,20 +27,20 @@ long http_date_parse(const char *s);
  * string pointers (etag / last_mod_str) point into the parsed `struct
  * http_headers` and are valid only as long as it is. */
 struct http_cc {
-	int  no_store;        /* Cache-Control: no-store — must not be stored      */
-	int  no_cache;        /* no-cache — may store but revalidate before EVERY use */
-	int  must_revalidate; /* must-revalidate — once stale, never serve stale   */
-	int  is_private;      /* private — a *shared* cache mustn't store; a single-
-	                       * user cache (ours) still may                        */
-	int  has_max_age;     /* a max-age directive was present                   */
-	long max_age;         /* its value in seconds                              */
-	int  has_expires;     /* an Expires header was present (even if invalid)   */
-	long expires;         /* its epoch, 0 if absent/unparseable                */
-	long date;            /* Date header epoch, 0 if absent                    */
-	long age;             /* Age header seconds, 0 if absent                   */
-	long last_modified;   /* Last-Modified epoch, 0 if absent/unparseable      */
-	const char *etag;         /* ETag value, or NULL                           */
-	const char *last_mod_str; /* raw Last-Modified value, or NULL              */
+  int no_store;             /* Cache-Control: no-store — must not be stored      */
+  int no_cache;             /* no-cache — may store but revalidate before EVERY use */
+  int must_revalidate;      /* must-revalidate — once stale, never serve stale   */
+  int is_private;           /* private — a *shared* cache mustn't store; a single-
+                             * user cache (ours) still may                        */
+  int has_max_age;          /* a max-age directive was present                   */
+  long max_age;             /* its value in seconds                              */
+  int has_expires;          /* an Expires header was present (even if invalid)   */
+  long expires;             /* its epoch, 0 if absent/unparseable                */
+  long date;                /* Date header epoch, 0 if absent                    */
+  long age;                 /* Age header seconds, 0 if absent                   */
+  long last_modified;       /* Last-Modified epoch, 0 if absent/unparseable      */
+  const char *etag;         /* ETag value, or NULL                           */
+  const char *last_mod_str; /* raw Last-Modified value, or NULL              */
 };
 
 /* Fill *cc from the parsed headers. */
@@ -49,7 +50,7 @@ void http_cc_parse(const struct http_headers *H, struct http_cc *cc);
  * a 200 that is not no-store. (Freshness/validator worth is a separate check —
  * see http_cc_freshness; a caller declines to store a 200 that is neither fresh
  * nor validatable.) */
-int  http_cc_storable(const struct http_cc *cc, int status);
+int http_cc_storable(const struct http_cc *cc, int status);
 
 /* The response's freshness lifetime in seconds: max-age, else Expires - Date,
  * else a Last-Modified heuristic (10% of the resource's age, capped at a day),

@@ -21,28 +21,27 @@ typedef int (*blk_write_fn)(uint32_t lba, const void *buf);
  * rmdir pointers NULL. Every op takes the instance from probe(). Paths are
  * relative to the volume root ("" or "/" is the root, "/dir/file" a child). */
 struct fs_ops {
-	const char *fsname;                         /* "FAT"/"HFS+"/"ext"/"ISO9660"  */
+  const char *fsname; /* "FAT"/"HFS+"/"ext"/"ISO9660"  */
 
-	/* Probe the device for this filesystem. Returns a freshly allocated mount
-	 * instance on a match, or NULL if the device isn't this filesystem. `write`
-	 * is NULL for a read-only mount (or an unwritable medium like a CD). */
-	void *(*probe)(blk_read_fn read, blk_write_fn write);
-	void  (*close)(void *inst);                 /* free the instance             */
+  /* Probe the device for this filesystem. Returns a freshly allocated mount
+   * instance on a match, or NULL if the device isn't this filesystem. `write`
+   * is NULL for a read-only mount (or an unwritable medium like a CD). */
+  void *(*probe)(blk_read_fn read, blk_write_fn write);
+  void (*close)(void *inst); /* free the instance             */
 
-	const char *(*label)(void *inst);           /* volume label, or ""           */
-	const char *(*type)(void *inst);            /* "FAT32"/"ext4"/... or "none"  */
+  const char *(*label)(void *inst); /* volume label, or ""           */
+  const char *(*type)(void *inst);  /* "FAT32"/"ext4"/... or "none"  */
 
-	int   (*list)(void *inst, const char *path);
-	int   (*stat)(void *inst, const char *path, int *is_dir, uint32_t *size);
-	int   (*read_at)(void *inst, const char *path, uint32_t off, void *buf, uint32_t len);
-	int   (*enum_dir)(void *inst, const char *path, int idx, char *name,
-	                  int *is_dir, uint32_t *size);
+  int (*list)(void *inst, const char *path);
+  int (*stat)(void *inst, const char *path, int *is_dir, uint32_t *size);
+  int (*read_at)(void *inst, const char *path, uint32_t off, void *buf, uint32_t len);
+  int (*enum_dir)(void *inst, const char *path, int idx, char *name, int *is_dir, uint32_t *size);
 
-	/* Write path -- NULL on a read-only driver. */
-	int   (*create)(void *inst, const char *path, const void *data, uint32_t size);
-	int   (*del)(void *inst, const char *path);
-	int   (*mkdir)(void *inst, const char *path);
-	int   (*rmdir)(void *inst, const char *path);
+  /* Write path -- NULL on a read-only driver. */
+  int (*create)(void *inst, const char *path, const void *data, uint32_t size);
+  int (*del)(void *inst, const char *path);
+  int (*mkdir)(void *inst, const char *path);
+  int (*rmdir)(void *inst, const char *path);
 };
 
 const struct fs_ops *fat_ops(void);

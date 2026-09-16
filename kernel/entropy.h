@@ -10,10 +10,10 @@
 
 #include <stdint.h>
 
-/* Seed the pool at boot so extraction before enough tick/packet stirring depends
- * on more than a single TSC read. Mixes in hardware RDRAND (when CPUID reports it)
- * plus a batch of TSC samples. Call once early in kernel_main, before any consumer
- * (TCP ISN, getrandom). */
+/* Seed the pool at boot so extraction before enough tick/packet stirring
+ * depends on more than a single TSC read. Mixes in hardware RDRAND (when CPUID
+ * reports it) plus a batch of TSC samples. Call once early in kernel_main,
+ * before any consumer (TCP ISN, getrandom). */
 void entropy_init(void);
 
 /* Mix `sample` plus a fresh TSC reading into the pool. Cheap and lock-free —

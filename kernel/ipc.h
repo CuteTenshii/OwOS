@@ -14,18 +14,19 @@
 #ifndef OWOS_IPC_H
 #define OWOS_IPC_H
 
-/* Server side: register a port by name -> port id >=0, or -1 (name taken / full).
- * ipc_port_destroy releases the port and any not-yet-accepted connection. */
-int  ipc_port_create(const char *name);
+/* Server side: register a port by name -> port id >=0, or -1 (name taken /
+ * full). ipc_port_destroy releases the port and any not-yet-accepted
+ * connection. */
+int ipc_port_create(const char *name);
 void ipc_port_destroy(int port_id);
 
 /* Client connect to a named server. On success returns 0 and fills rx/tx with
  * the client's channel pipe ends (read rx, write tx); -1 if no such server or
  * the pipe pool is exhausted. Blocks while a prior connection awaits accept. */
-int  ipc_connect(const char *name, int *rx, int *tx);
+int ipc_connect(const char *name, int *rx, int *tx);
 
 /* Server accept: block until a client connects to `port_id`, then return 0 and
  * fill rx/tx with the server's channel pipe ends; -1 if the port went away. */
-int  ipc_accept(int port_id, int *rx, int *tx);
+int ipc_accept(int port_id, int *rx, int *tx);
 
 #endif /* OWOS_IPC_H */

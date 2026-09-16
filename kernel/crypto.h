@@ -10,8 +10,8 @@
 #ifndef OWOS_CRYPTO_H
 #define OWOS_CRYPTO_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* ------------------------------------------------------------------ SHA-256 */
 
@@ -19,10 +19,10 @@
 #define SHA256_DIGEST 32
 
 struct sha256 {
-	uint32_t h[8];
-	uint64_t total;            /* message length so far, in bytes */
-	uint8_t  buf[SHA256_BLOCK];
-	uint32_t buflen;
+  uint32_t h[8];
+  uint64_t total; /* message length so far, in bytes */
+  uint8_t buf[SHA256_BLOCK];
+  uint32_t buflen;
 };
 
 void sha256_init(struct sha256 *s);

@@ -7,7 +7,8 @@
 #ifndef OWOS_COLOR_H
 #define OWOS_COLOR_H
 
-/* 0xRRGGBB, or -1 if `s` isn't a recognised colour. Leading space is skipped. */
+/* 0xRRGGBB, or -1 if `s` isn't a recognised colour. Leading space is skipped.
+ */
 int color_parse(const char *s);
 
 /* Same, and reports the alpha (0..255) via *alpha — 255 when opaque or

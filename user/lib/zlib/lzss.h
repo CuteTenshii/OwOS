@@ -10,7 +10,7 @@
 
 #include <stdint.h>
 
-#define ZIP_HEADER 8            /* magic (4) + original size (4) */
+#define ZIP_HEADER 8 /* magic (4) + original size (4) */
 
 uint32_t zip_bound(uint32_t src_len);
 int zip_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap);

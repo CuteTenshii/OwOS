@@ -31,12 +31,12 @@ typedef int (*upng_reader)(void *ctx);
 typedef int (*upng_row)(void *ctx, unsigned y, const unsigned char *rgba, unsigned w);
 
 enum {
-	UPNG_OK       =  0,
-	UPNG_EBADSIG  = -1,   /* not a PNG                                         */
-	UPNG_EBADHDR  = -2,   /* missing/zero IHDR                                 */
-	UPNG_EUNSUP   = -3,   /* valid PNG, unsupported form (palette/16-bit/…)    */
-	UPNG_EINFLATE = -4,   /* corrupt IDAT / bad filter                         */
-	UPNG_ETRUNC   = -5,   /* stream ended early                                */
+  UPNG_OK = 0,
+  UPNG_EBADSIG = -1,  /* not a PNG                                         */
+  UPNG_EBADHDR = -2,  /* missing/zero IHDR                                 */
+  UPNG_EUNSUP = -3,   /* valid PNG, unsupported form (palette/16-bit/…)    */
+  UPNG_EINFLATE = -4, /* corrupt IDAT / bad filter                         */
+  UPNG_ETRUNC = -5,   /* stream ended early                                */
 };
 
 /* Peek the image dimensions from IHDR (reads only the start of the stream). */
@@ -50,45 +50,46 @@ int upng_dimensions(upng_reader rd, void *rctx, unsigned *w, unsigned *h);
  * iTXt text records, and the eXIf EXIF block). upng_probe reads only the chunks
  * up to the first IDAT — where these all conventionally live — so it touches a
  * few KiB of header, never the (possibly multi-MiB) pixel data; a rare metadata
- * chunk placed after IDAT is not reported. The eXIf bytes are buffered verbatim;
- * decode them with upng_exif_emit, which walks the TIFF/EXIF structure and
- * reports one human-readable tag at a time.
+ * chunk placed after IDAT is not reported. The eXIf bytes are buffered
+ * verbatim; decode them with upng_exif_emit, which walks the TIFF/EXIF
+ * structure and reports one human-readable tag at a time.
  */
-#define UPNG_TEXT_MAX 16     /* most tEXt/iTXt records captured                 */
-#define UPNG_KEY_MAX  40     /* per-record keyword cap (incl. NUL)              */
-#define UPNG_VAL_MAX  128    /* per-record value cap (incl. NUL)               */
-#define UPNG_EXIF_MAX 16384  /* eXIf bytes we'll buffer for upng_exif_emit      */
+#define UPNG_TEXT_MAX 16    /* most tEXt/iTXt records captured                 */
+#define UPNG_KEY_MAX 40     /* per-record keyword cap (incl. NUL)              */
+#define UPNG_VAL_MAX 128    /* per-record value cap (incl. NUL)               */
+#define UPNG_EXIF_MAX 16384 /* eXIf bytes we'll buffer for upng_exif_emit      */
 
 struct upng_text {
-	char key[UPNG_KEY_MAX];
-	char val[UPNG_VAL_MAX];
+  char key[UPNG_KEY_MAX];
+  char val[UPNG_VAL_MAX];
 };
 
 struct upng_meta {
-	unsigned w, h;
-	unsigned depth;            /* IHDR bit depth per sample (1/2/4/8/16)        */
-	unsigned color;            /* IHDR colour type: 0/2/3/4/6                    */
-	unsigned channels;         /* samples per pixel implied by `color`          */
-	int      interlaced;       /* 1 if Adam7-interlaced                          */
-	int      has_alpha;        /* colour type carries an alpha channel (4/6)    */
-	int      has_trns;         /* a tRNS chunk is present                        */
-	unsigned palette_n;        /* PLTE entries (0 if not a palette image)       */
-	int      have_phys;        /* pHYs present                                   */
-	unsigned ppu_x, ppu_y;     /* pHYs pixels per unit, X and Y                  */
-	int      phys_metre;       /* pHYs unit == 1 (metre) -> ppu is per metre     */
-	int      have_gamma;       /* gAMA present                                   */
-	unsigned gamma;            /* gAMA value, file-encoded (gamma * 100000)      */
-	int      have_time;        /* tIME present                                   */
-	unsigned year, mon, day, hour, min, sec;
-	int      n_text;           /* captured tEXt/iTXt records                     */
-	struct upng_text text[UPNG_TEXT_MAX];
-	int      exif_len;         /* eXIf bytes in `exif` (0 none, -1 over-cap)     */
-	unsigned char exif[UPNG_EXIF_MAX];
+  unsigned w, h;
+  unsigned depth;        /* IHDR bit depth per sample (1/2/4/8/16)        */
+  unsigned color;        /* IHDR colour type: 0/2/3/4/6                    */
+  unsigned channels;     /* samples per pixel implied by `color`          */
+  int interlaced;        /* 1 if Adam7-interlaced                          */
+  int has_alpha;         /* colour type carries an alpha channel (4/6)    */
+  int has_trns;          /* a tRNS chunk is present                        */
+  unsigned palette_n;    /* PLTE entries (0 if not a palette image)       */
+  int have_phys;         /* pHYs present                                   */
+  unsigned ppu_x, ppu_y; /* pHYs pixels per unit, X and Y                  */
+  int phys_metre;        /* pHYs unit == 1 (metre) -> ppu is per metre     */
+  int have_gamma;        /* gAMA present                                   */
+  unsigned gamma;        /* gAMA value, file-encoded (gamma * 100000)      */
+  int have_time;         /* tIME present                                   */
+  unsigned year, mon, day, hour, min, sec;
+  int n_text; /* captured tEXt/iTXt records                     */
+  struct upng_text text[UPNG_TEXT_MAX];
+  int exif_len; /* eXIf bytes in `exif` (0 none, -1 over-cap)     */
+  unsigned char exif[UPNG_EXIF_MAX];
 };
 
 /* Fill *m from the stream. Returns UPNG_OK once IHDR is read (later chunks are
  * best-effort and never fail the call), or a UPNG_E* code if the signature/IHDR
- * is bad. *m is fully zeroed first. Large — give it a static, not a stack slot. */
+ * is bad. *m is fully zeroed first. Large — give it a static, not a stack slot.
+ */
 int upng_probe(upng_reader rd, void *rctx, struct upng_meta *m);
 
 /* One decoded EXIF tag: a human label and a formatted value string. */
@@ -99,10 +100,9 @@ typedef void (*upng_kv)(void *ctx, const char *key, const char *val);
  * bounds-checked; an unparsable block simply emits nothing. */
 void upng_exif_emit(const unsigned char *exif, int len, upng_kv emit, void *ctx);
 
-/* Stream-decode, invoking row() per scanline. Fills out_w / out_h (the width and
- * height pointers) if non-NULL. Returns UPNG_OK (incl. caller early-stop) or a
- * UPNG_E* code. */
-int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx,
-                unsigned *out_w, unsigned *out_h);
+/* Stream-decode, invoking row() per scanline. Fills out_w / out_h (the width
+ * and height pointers) if non-NULL. Returns UPNG_OK (incl. caller early-stop)
+ * or a UPNG_E* code. */
+int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx, unsigned *out_w, unsigned *out_h);
 
 #endif /* OWOS_UPNG_H */

@@ -19,14 +19,14 @@ void sha512(const void *data, uint32_t len, uint8_t out[SHA512_DIGEST]);
 
 /* -------------------------------------------------------------------- SHA-1 */
 
-#define SHA1_BLOCK  64
+#define SHA1_BLOCK 64
 #define SHA1_DIGEST 20
 
 struct sha1 {
-	uint32_t h[5];
-	uint64_t total;            /* message length so far, in bytes */
-	uint8_t  buf[SHA1_BLOCK];
-	uint32_t buflen;
+  uint32_t h[5];
+  uint64_t total; /* message length so far, in bytes */
+  uint8_t buf[SHA1_BLOCK];
+  uint32_t buflen;
 };
 
 void sha1_init(struct sha1 *s);
@@ -36,14 +36,14 @@ void sha1(const void *data, uint32_t len, uint8_t out[SHA1_DIGEST]);
 
 /* ------------------------------------------------------------------ SHA-256 */
 
-#define SHA256_BLOCK  64
+#define SHA256_BLOCK 64
 #define SHA256_DIGEST 32
 
 struct sha256 {
-	uint32_t h[8];
-	uint64_t total;
-	uint8_t  buf[SHA256_BLOCK];
-	uint32_t buflen;
+  uint32_t h[8];
+  uint64_t total;
+  uint8_t buf[SHA256_BLOCK];
+  uint32_t buflen;
 };
 
 void sha256_init(struct sha256 *s);
@@ -53,53 +53,40 @@ void sha256(const void *data, uint32_t len, uint8_t out[SHA256_DIGEST]);
 
 /* --------------------------------------------------------- HMAC + HKDF */
 
-void hmac_sha256(const uint8_t *key, uint32_t keylen,
-                 const uint8_t *msg, uint32_t msglen,
-                 uint8_t out[SHA256_DIGEST]);
+void hmac_sha256(const uint8_t *key, uint32_t keylen, const uint8_t *msg, uint32_t msglen, uint8_t out[SHA256_DIGEST]);
 
 /* HMAC-SHA1 (RFC 2104). Backs the SRTP AES_CM_128_HMAC_SHA1 auth tag, whose
  * keystream comes from aes128_ctr below. */
-void hmac_sha1(const uint8_t *key, uint32_t keylen,
-               const uint8_t *msg, uint32_t msglen,
-               uint8_t out[SHA1_DIGEST]);
+void hmac_sha1(const uint8_t *key, uint32_t keylen, const uint8_t *msg, uint32_t msglen, uint8_t out[SHA1_DIGEST]);
 
 /* TLS 1.2 PRF (RFC 5246 §5), instantiated with P_SHA256. Expands
  * secret+label+seed into `outlen` bytes; label/seed are concatenated as the
  * PRF seed. Backs the user-space TLS 1.2 fallback. */
-void tls12_prf(const uint8_t *secret, uint32_t secretlen,
-               const char *label,
-               const uint8_t *seed, uint32_t seedlen,
+void tls12_prf(const uint8_t *secret, uint32_t secretlen, const char *label, const uint8_t *seed, uint32_t seedlen,
                uint8_t *out, uint32_t outlen);
 
 /* HKDF-SHA256 (RFC 5869), the TLS 1.3 / QUIC key-derivation core. */
-void hkdf_extract(const uint8_t *salt, uint32_t saltlen,
-                  const uint8_t *ikm, uint32_t ikmlen,
+void hkdf_extract(const uint8_t *salt, uint32_t saltlen, const uint8_t *ikm, uint32_t ikmlen,
                   uint8_t prk[SHA256_DIGEST]);
-void hkdf_expand(const uint8_t prk[SHA256_DIGEST],
-                 const uint8_t *info, uint32_t infolen,
-                 uint8_t *out, uint32_t outlen);
+void hkdf_expand(const uint8_t prk[SHA256_DIGEST], const uint8_t *info, uint32_t infolen, uint8_t *out,
+                 uint32_t outlen);
 
 /* --------------------------------------------------------- AES-128-GCM */
 
 struct aes128 {
-	uint32_t rk[44];           /* 11 round keys, 4 words each */
+  uint32_t rk[44]; /* 11 round keys, 4 words each */
 };
 
 void aes128_init(struct aes128 *a, const uint8_t key[16]);
-void aes128_encrypt_block(const struct aes128 *a, const uint8_t in[16],
-                          uint8_t out[16]);
+void aes128_encrypt_block(const struct aes128 *a, const uint8_t in[16], uint8_t out[16]);
 
 /* AES-128-GCM AEAD. iv is the 12-byte nonce. seal produces `tag` (16 bytes);
  * open verifies it, returning 0 on success or -1 on auth failure. aad may be
  * NULL when aadlen is 0. in/out may alias. */
-void aes128_gcm_seal(const uint8_t key[16], const uint8_t iv[12],
-                     const uint8_t *aad, uint32_t aadlen,
-                     const uint8_t *in, uint32_t len, uint8_t *out,
-                     uint8_t tag[16]);
-int  aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12],
-                     const uint8_t *aad, uint32_t aadlen,
-                     const uint8_t *in, uint32_t len, uint8_t *out,
-                     const uint8_t tag[16]);
+void aes128_gcm_seal(const uint8_t key[16], const uint8_t iv[12], const uint8_t *aad, uint32_t aadlen,
+                     const uint8_t *in, uint32_t len, uint8_t *out, uint8_t tag[16]);
+int aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12], const uint8_t *aad, uint32_t aadlen, const uint8_t *in,
+                    uint32_t len, uint8_t *out, const uint8_t tag[16]);
 
 /* --------------------------------------------------------- AES-128-CTR */
 
@@ -108,8 +95,7 @@ int  aes128_gcm_open(const uint8_t key[16], const uint8_t iv[12],
  * Encryption and decryption are the same call. `ctr` is the initial 16-byte
  * counter block, built by the caller (SRTP AES-CM forms it from the session
  * salt, SSRC and packet index per RFC 3711 §4.1.1). in/out may alias. */
-void aes128_ctr(const uint8_t key[16], const uint8_t ctr[16],
-                const uint8_t *in, uint32_t len, uint8_t *out);
+void aes128_ctr(const uint8_t key[16], const uint8_t ctr[16], const uint8_t *in, uint32_t len, uint8_t *out);
 
 /* ------------------------------------------------------------------ X25519 */
 

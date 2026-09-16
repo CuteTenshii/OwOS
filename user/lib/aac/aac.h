@@ -26,31 +26,33 @@
 #include <stdint.h>
 
 enum {
-	AAC_OK      =  0,
-	AAC_EPARAM  = -1,   /* bad argument                                       */
-	AAC_ENOMEM  = -2,   /* allocation failed                                  */
-	AAC_EFORMAT = -3,   /* corrupt / truncated bitstream                      */
-	AAC_EUNSUP  = -4,   /* structurally valid but an unsupported tool/profile */
+  AAC_OK = 0,
+  AAC_EPARAM = -1,  /* bad argument                                       */
+  AAC_ENOMEM = -2,  /* allocation failed                                  */
+  AAC_EFORMAT = -3, /* corrupt / truncated bitstream                      */
+  AAC_EUNSUP = -4,  /* structurally valid but an unsupported tool/profile */
 };
 
-#define AAC_MAX_CHANNELS 8   /* SCE/CPE/LFE elements we will assemble          */
+#define AAC_MAX_CHANNELS 8 /* SCE/CPE/LFE elements we will assemble */
 
 /* Stream description. For an ASC-configured decoder this is known at open; for
  * an ADTS decoder sample_rate/channels are known after the first decoded frame
- * (0 before). frame_samples is 1024 (or 960 for the rare 960-length streams). */
+ * (0 before). frame_samples is 1024 (or 960 for the rare 960-length streams).
+ */
 typedef struct {
-	uint32_t sample_rate;    /* Hz (the LC base rate; SBR would double it)     */
-	uint8_t  channels;       /* decoded channel count                          */
-	uint16_t frame_samples;  /* samples per channel per decoded frame          */
-	uint8_t  object_type;    /* AudioObjectType (2 = LC)                       */
-	uint8_t  sbr_present;    /* 1 if an SBR extension was seen (base rate only) */
+  uint32_t sample_rate;   /* Hz (the LC base rate; SBR would double it)     */
+  uint8_t channels;       /* decoded channel count                          */
+  uint16_t frame_samples; /* samples per channel per decoded frame          */
+  uint8_t object_type;    /* AudioObjectType (2 = LC)                       */
+  uint8_t sbr_present;    /* 1 if an SBR extension was seen (base rate only) */
 } aac_info;
 
 typedef struct aac_decoder aac_decoder;
 
 /* Open a decoder from an AudioSpecificConfig (the MP4 esds "extradata"), e.g.
  * the extradata of an mp4_track whose codec is MP4_CODEC_AAC. Returns a decoder
- * or NULL on a bad/unsupported config. `info` (may be NULL) is filled on success. */
+ * or NULL on a bad/unsupported config. `info` (may be NULL) is filled on
+ * success. */
 aac_decoder *aac_open(const uint8_t *asc, uint32_t asc_len, aac_info *info);
 
 /* Open a decoder for a raw ADTS elementary stream. The config is learned from
@@ -71,15 +73,14 @@ uint32_t aac_max_pcm_samples(const aac_decoder *d);
  * interleaved int16 `pcm`, which must hold aac_max_pcm_samples() shorts. On
  * AAC_OK, *out_samples gets the per-channel sample count and *out_channels the
  * channel count. Returns a negative code on error. */
-int aac_decode(aac_decoder *d, const uint8_t *data, uint32_t len,
-               int16_t *pcm, uint32_t *out_samples, uint32_t *out_channels);
+int aac_decode(aac_decoder *d, const uint8_t *data, uint32_t len, int16_t *pcm, uint32_t *out_samples,
+               uint32_t *out_channels);
 
 /* Decode one ADTS frame beginning at data[0]. Locates the 0xFFF sync, validates
  * the header, decodes the payload, and reports the whole frame's byte length in
  * *consumed so the caller can advance. Same PCM contract as aac_decode. Returns
  * AAC_EFORMAT if no full frame is present in [data,len). */
-int aac_decode_adts(aac_decoder *d, const uint8_t *data, uint32_t len,
-                    uint32_t *consumed, int16_t *pcm,
+int aac_decode_adts(aac_decoder *d, const uint8_t *data, uint32_t len, uint32_t *consumed, int16_t *pcm,
                     uint32_t *out_samples, uint32_t *out_channels);
 
 #endif /* OWOS_AAC_H */

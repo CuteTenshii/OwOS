@@ -2,12 +2,13 @@
 #ifndef OWOS_BATTERY_H
 #define OWOS_BATTERY_H
 
-int battery_present(void);  /* 1 if the firmware exposes an ACPI battery */
+int battery_present(void); /* 1 if the firmware exposes an ACPI battery */
 
 /* Remaining charge as a percentage (0..100), or -1 if it can't be read (no
  * battery, or the _BST/_BIF AML couldn't be evaluated). On success, *charging
  * and *discharging (if non-NULL) are set from the _BST state bits, and *minutes
- * (if non-NULL) gets the estimated minutes to empty while discharging, else -1. */
+ * (if non-NULL) gets the estimated minutes to empty while discharging, else -1.
+ */
 int battery_percent(int *charging, int *discharging, int *minutes);
 
 /* Why the last battery_percent() returned -1 (e.g. "_BST not found",

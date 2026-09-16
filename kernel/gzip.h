@@ -49,8 +49,9 @@ int zlib_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap
  * LZ77 match-search cost. The output is ~the input size (no compression), but
  * it's produced in well under a second even at full-screen sizes — the right
  * trade for a screenshot key that must not stall the UI. Same envelope as
- * zlib_compress (decodable by zlib_inflate / any PNG reader). Returns the stream
- * length, or -1 if dst is too small. gzip_bound() is a safe upper bound. */
+ * zlib_compress (decodable by zlib_inflate / any PNG reader). Returns the
+ * stream length, or -1 if dst is too small. gzip_bound() is a safe upper bound.
+ */
 int zlib_store(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap);
 
 #endif /* OWOS_GZIP_H */

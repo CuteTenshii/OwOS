@@ -3,39 +3,40 @@
 #ifndef OWOS_DOM_H
 #define OWOS_DOM_H
 
-#include "owos.h"   /* lower/starts_ci/streq_ci/contains_ci case-insensitive helpers */
+#include "owos.h" /* lower/starts_ci/streq_ci/contains_ci case-insensitive helpers */
 
 enum dom_type { DOM_ELEMENT, DOM_TEXT };
 
 struct dom_attr {
-	char            *name;           /* lowercased                           */
-	char            *value;          /* raw (entities not decoded), "" if none */
-	struct dom_attr *next;
+  char *name;  /* lowercased                           */
+  char *value; /* raw (entities not decoded), "" if none */
+  struct dom_attr *next;
 };
 
 struct dom_node {
-	enum dom_type    type;
-	char             tag[16];        /* lowercased tag name (element)        */
-	char            *text;           /* character data (text node)           */
-	struct dom_attr *attrs;
-	struct dom_attr *last_attr;      /* tail of attrs, for O(1) append       */
-	struct dom_node *parent;
-	struct dom_node *first_child;
-	struct dom_node *last_child;
-	struct dom_node *next;           /* sibling                              */
-	void            *wrapper;        /* cached JS wrapper object (browser/js.c),
-	                                  * NULL until first exposed to script — gives
-	                                  * a node stable identity so listeners stick. */
+  enum dom_type type;
+  char tag[16]; /* lowercased tag name (element)        */
+  char *text;   /* character data (text node)           */
+  struct dom_attr *attrs;
+  struct dom_attr *last_attr; /* tail of attrs, for O(1) append       */
+  struct dom_node *parent;
+  struct dom_node *first_child;
+  struct dom_node *last_child;
+  struct dom_node *next; /* sibling                              */
+  void *wrapper;         /* cached JS wrapper object (browser/js.c),
+                          * NULL until first exposed to script — gives
+                          * a node stable identity so listeners stick. */
 };
 
-/* Parse `len` bytes into a tree under a synthetic "#document" root. Returns NULL
- * only on immediate OOM; a mid-parse OOM returns the partial tree. */
+/* Parse `len` bytes into a tree under a synthetic "#document" root. Returns
+ * NULL only on immediate OOM; a mid-parse OOM returns the partial tree. */
 struct dom_node *dom_parse(const char *html, int len);
 void dom_free(struct dom_node *root);
 const char *dom_get_attr(const struct dom_node *node, const char *name);
 
 /* Mutation API used by the JS DOM bindings (browser/js.c). Nodes are plain
- * malloc'd cells; appended nodes are owned by the tree and freed by dom_free. */
+ * malloc'd cells; appended nodes are owned by the tree and freed by dom_free.
+ */
 struct dom_node *dom_new_element(const char *tag);
 struct dom_node *dom_new_text(const char *text);
 void dom_append_child(struct dom_node *parent, struct dom_node *child);
@@ -45,10 +46,12 @@ void dom_set_attr(struct dom_node *el, const char *name, const char *value);
 void dom_remove_attr(struct dom_node *el, const char *name);
 void dom_clear_children(struct dom_node *el);
 
-/* Hook the JS layer installs so a freed node detaches its wrapper (see dom.c). */
+/* Hook the JS layer installs so a freed node detaches its wrapper (see dom.c).
+ */
 extern void (*dom_on_free_wrapper)(void *wrapper);
 
-/* Bumped on every tree mutation; the browser re-flattens only when it changes. */
+/* Bumped on every tree mutation; the browser re-flattens only when it changes.
+ */
 extern unsigned dom_mutation_seq;
 
 #endif /* OWOS_DOM_H */

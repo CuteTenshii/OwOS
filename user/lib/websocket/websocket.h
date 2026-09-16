@@ -18,18 +18,18 @@
 
 /* readyState values, mirroring the WHATWG WebSocket interface. */
 enum {
-    WS_CONNECTING = 0,
-    WS_OPEN       = 1,
-    WS_CLOSING    = 2,
-    WS_CLOSED     = 3,
+  WS_CONNECTING = 0,
+  WS_OPEN = 1,
+  WS_CLOSING = 2,
+  WS_CLOSED = 3,
 };
 
 /* ws_poll result codes. */
 enum {
-    WS_EV_NONE = 0,   /* nothing actionable this poll (drained)                  */
-    WS_EV_MESSAGE,    /* a complete message is available (see ws_poll out params)*/
-    WS_EV_CLOSE,      /* the peer closed / close handshake finished; conn is done*/
-    WS_EV_ERROR,      /* transport or protocol error; conn is done               */
+  WS_EV_NONE = 0, /* nothing actionable this poll (drained)                  */
+  WS_EV_MESSAGE,  /* a complete message is available (see ws_poll out params)*/
+  WS_EV_CLOSE,    /* the peer closed / close handshake finished; conn is done*/
+  WS_EV_ERROR,    /* transport or protocol error; conn is done               */
 };
 
 typedef struct ws_conn ws_conn;
@@ -43,11 +43,11 @@ ws_conn *ws_open(const char *url, const char *protocols);
 /* Non-blocking poll. Drains the socket, reassembles frames, and answers ping /
  * close control frames. Returns a WS_EV_* code:
  *   WS_EV_MESSAGE -> *out points at the message bytes (owned by the conn, valid
- *                    until the next ws_poll), *outlen its length, *is_text 1 for
- *                    a text message / 0 for binary.
- *   WS_EV_CLOSE / WS_EV_ERROR -> the conn is finished; ws_free it.
- * Call repeatedly until WS_EV_NONE to drain every buffered message. The out
- * pointers may be NULL if the caller doesn't need them. */
+ *                    until the next ws_poll), *outlen its length, *is_text 1
+ * for a text message / 0 for binary. WS_EV_CLOSE / WS_EV_ERROR -> the conn is
+ * finished; ws_free it. Call repeatedly until WS_EV_NONE to drain every
+ * buffered message. The out pointers may be NULL if the caller doesn't need
+ * them. */
 int ws_poll(ws_conn *c, const uint8_t **out, int *outlen, int *is_text);
 
 /* Send one message. is_text != 0 sends a text frame, 0 a binary frame. The
@@ -59,8 +59,8 @@ int ws_send(ws_conn *c, const void *data, int len, int is_text);
  * WS_EV_CLOSE once the peer's Close arrives or the link drops. */
 void ws_close(ws_conn *c, int code, const char *reason);
 
-int         ws_state(const ws_conn *c);      /* WS_CONNECTING/OPEN/CLOSING/CLOSED */
-const char *ws_protocol(const ws_conn *c);   /* negotiated subprotocol, or ""     */
+int ws_state(const ws_conn *c);            /* WS_CONNECTING/OPEN/CLOSING/CLOSED */
+const char *ws_protocol(const ws_conn *c); /* negotiated subprotocol, or "" */
 
 /* Close the socket and free every buffer. Safe on a NULL conn. */
 void ws_free(ws_conn *c);

@@ -15,7 +15,8 @@
  *
  * Multi-instance: all per-mount state lives in a heap-allocated `struct
  * hfs_mount`; the driver is reached only through the `struct fs_ops` vtable
- * (probe allocates an instance, close frees it), so N volumes can mount at once.
+ * (probe allocates an instance, close frees it), so N volumes can mount at
+ * once.
  */
 #ifndef OWOS_HFS_H
 #define OWOS_HFS_H

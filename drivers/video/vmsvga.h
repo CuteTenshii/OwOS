@@ -5,7 +5,8 @@
  * fb_adopt (the bootloader hands us no framebuffer on the QEMU `-kernel` path)
  * nor fb_init finds anything. This driver sets a 32-bpp linear mode, then hands
  * the framebuffer to fb_adopt and registers a present hook so the compositor's
- * damaged rectangles are flushed to the host through the device's command FIFO. */
+ * damaged rectangles are flushed to the host through the device's command FIFO.
+ */
 #ifndef OWOS_VMSVGA_H
 #define OWOS_VMSVGA_H
 

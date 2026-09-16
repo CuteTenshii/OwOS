@@ -15,7 +15,8 @@
 int woff_is_woff(const unsigned char *data, int len);
 
 /* Decode a WOFF/WOFF2 font to a raw SFNT. Returns NULL if `data` is not a WOFF
- * container (the caller should then treat it as an SFNT already) or on error. */
+ * container (the caller should then treat it as an SFNT already) or on error.
+ */
 unsigned char *woff_to_sfnt(const unsigned char *data, int len, int *out_len);
 
 #endif /* OWOS_WOFF_H */

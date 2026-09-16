@@ -4,15 +4,15 @@
 
 #include <stdint.h>
 
-void cpu_vendor(char *buf13);   /* 12-char vendor string + NUL ("GenuineIntel") */
-void cpu_brand(char *buf49);    /* up to 48-char brand string + NUL            */
+void cpu_vendor(char *buf13); /* 12-char vendor string + NUL ("GenuineIntel") */
+void cpu_brand(char *buf49);  /* up to 48-char brand string + NUL            */
 
 /* Family/model/stepping, decoded from CPUID leaf 1 EAX with the extended-field
  * fixups (so modern CPUs report a sane family/model, not 6/15). */
 struct cpu_signature {
-	uint32_t family;
-	uint32_t model;
-	uint32_t stepping;
+  uint32_t family;
+  uint32_t model;
+  uint32_t stepping;
 };
 void cpu_signature(struct cpu_signature *sig);
 

@@ -7,8 +7,8 @@
 #ifndef OWOS_IRQ_H
 #define OWOS_IRQ_H
 
+#include "idt.h" /* struct registers */
 #include <stdint.h>
-#include "idt.h"   /* struct registers */
 
 typedef void (*irq_handler_t)(struct registers *r);
 

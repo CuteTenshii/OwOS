@@ -13,6 +13,6 @@ void serial_write(const char *s);
 /* Non-blocking: translate one waiting COM1 input byte into a console key code
  * (see serial.c) and store it in *out, returning 1; or return 0 if none. Lets
  * the host terminal type into the shell over `qemu -serial stdio`. */
-int  serial_poll(char *out);
+int serial_poll(char *out);
 
 #endif /* OWOS_SERIAL_H */

@@ -7,8 +7,8 @@
  * they get their own driver rather than another branch in e1000.c.
  *
  * It speaks only Ethernet frames — inbound via net_rx_frame(), outbound via the
- * .send hook. Receive is drained off the timer tick (the .poll hook) rather than
- * an interrupt, so no per-queue MSI-X / GPIE / IVAR wiring is needed.
+ * .send hook. Receive is drained off the timer tick (the .poll hook) rather
+ * than an interrupt, so no per-queue MSI-X / GPIE / IVAR wiring is needed.
  */
 #ifndef OWOS_IGB_H
 #define OWOS_IGB_H

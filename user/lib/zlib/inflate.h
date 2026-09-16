@@ -4,9 +4,9 @@
  * computation, so it lives in the library the program links. Designed to stream
  * HTTP/HTTPS responses: it PULLS compressed bytes through a reader callback (so
  * the caller can feed straight from net_recv, never buffering the whole body)
- * and PUSHES decompressed bytes through a writer callback (so the caller renders
- * or stores as it arrives). Only the mandatory 32 KiB DEFLATE back-reference
- * window is held in memory, whatever the body size.
+ * and PUSHES decompressed bytes through a writer callback (so the caller
+ * renders or stores as it arrives). Only the mandatory 32 KiB DEFLATE
+ * back-reference window is held in memory, whatever the body size.
  *
  * Early stop: if the writer returns < 0 (e.g. the caller's render buffer is
  * full), inflation halts cleanly and returns 0 — a natural, lossless way to cap
@@ -30,7 +30,8 @@ int inflate_stream(inf_reader rd, void *rctx, inf_writer wr, void *wctx);
 
 /* Inflate an HTTP Content-Encoding body: auto-detects a gzip (1f 8b) or zlib
  * (0x78) wrapper, skips its header, inflates the DEFLATE body, and ignores the
- * trailer. A stream that is neither is treated as raw DEFLATE. Returns 0 / -1. */
+ * trailer. A stream that is neither is treated as raw DEFLATE. Returns 0 / -1.
+ */
 int inflate_http(inf_reader rd, void *rctx, inf_writer wr, void *wctx);
 
 #endif /* OWOS_INFLATE_H */

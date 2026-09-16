@@ -2,9 +2,9 @@
  *
  * The heap runs from just past the kernel image up to 12 MiB (12-16 MiB is the
  * page-frame pool); the identity map already covers the low 16 MiB, so kmalloc
- * never has to map pages itself yet. Blocks are a singly linked list of headers;
- * kmalloc splits a big-enough free block, kfree marks one free and coalesces it
- * with the following block.
+ * never has to map pages itself yet. Blocks are a singly linked list of
+ * headers; kmalloc splits a big-enough free block, kfree marks one free and
+ * coalesces it with the following block.
  *
  * The start is keyed off the linker's kernel_end, NOT a fixed 4 MiB: the kernel
  * embeds every user-program ELF as a blob in .data, so the image keeps growing
@@ -15,121 +15,123 @@
  */
 
 #include "heap.h"
-#include "pmm.h"
 #include "console.h"
+#include "pmm.h"
 #include <stdint.h>
 
-/* Defined by linker.ld as the first byte past the kernel image (end of .bss). */
+/* Defined by linker.ld as the first byte past the kernel image (end of .bss).
+ */
 extern char kernel_end[];
 
 /* Heap end = pmm_pool_start() (the page-table pool starts there). Both ends are
- * RAM-scaled at boot (see pmm.c): on a 256 MiB box this is the legacy 12 MiB, on
- * bigger machines it's far higher, so kmalloc — and the per-task 32 KiB kernel
- * stacks it backs — scale with RAM. heap_init runs after pmm_init, so the value
- * is ready. */
-#define KHEAP_END   (pmm_pool_start())
+ * RAM-scaled at boot (see pmm.c): on a 256 MiB box this is the legacy 12 MiB,
+ * on bigger machines it's far higher, so kmalloc — and the per-task 32 KiB
+ * kernel stacks it backs — scale with RAM. heap_init runs after pmm_init, so
+ * the value is ready. */
+#define KHEAP_END (pmm_pool_start())
 #define ALIGN_UP(n, a) (((n) + (a) - 1) & ~((a) - 1))
 
 typedef struct block {
-	size_t        size;            /* payload bytes, not counting the header  */
-	int           free;
-	struct block *next;
+  size_t size; /* payload bytes, not counting the header  */
+  int free;
+  struct block *next;
 } block_t;
 
 static block_t *head;
 
 void heap_init(void)
 {
-	uint32_t start = ALIGN_UP((uint32_t)(uintptr_t)kernel_end, 4096u);
-	/* The kernel image grows as user-program blobs are embedded; if it ever
-	 * reaches the page-table pool there is no room for a heap. Halt loudly rather
-	 * than let the unsigned subtraction below wrap to a ~4 GiB first block that
-	 * would hand out kernel/pool memory as kmalloc payloads. */
-	if (start >= KHEAP_END || (KHEAP_END - start) <= sizeof(block_t) + 8) {
-		con_write("heap: no room between kernel image and page-table pool -- halting.\n");
-		for (;;)
-			__asm__ volatile ("cli; hlt");
-	}
-	head = (block_t *)start;
-	head->size = (KHEAP_END - start) - sizeof(block_t);
-	head->free = 1;
-	head->next = 0;
+  uint32_t start = ALIGN_UP((uint32_t)(uintptr_t)kernel_end, 4096u);
+  /* The kernel image grows as user-program blobs are embedded; if it ever
+   * reaches the page-table pool there is no room for a heap. Halt loudly rather
+   * than let the unsigned subtraction below wrap to a ~4 GiB first block that
+   * would hand out kernel/pool memory as kmalloc payloads. */
+  if (start >= KHEAP_END || (KHEAP_END - start) <= sizeof(block_t) + 8) {
+    con_write("heap: no room between kernel image and page-table pool -- halting.\n");
+    for (;;)
+      __asm__ volatile("cli; hlt");
+  }
+  head = (block_t *)start;
+  head->size = (KHEAP_END - start) - sizeof(block_t);
+  head->free = 1;
+  head->next = 0;
 }
 
 void *kmalloc(size_t size)
 {
-	if (size == 0)
-		return 0;
-	size = ALIGN_UP(size, 8);
+  if (size == 0)
+    return 0;
+  size = ALIGN_UP(size, 8);
 
-	for (block_t *b = head; b; b = b->next) {
-		if (!b->free || b->size < size)
-			continue;
+  for (block_t *b = head; b; b = b->next) {
+    if (!b->free || b->size < size)
+      continue;
 
-		/* Split if the leftover can hold a header plus a little payload. */
-		if (b->size >= size + sizeof(block_t) + 8) {
-			block_t *rest = (block_t *)((uint8_t *)b + sizeof(block_t) + size);
-			rest->size = b->size - size - sizeof(block_t);
-			rest->free = 1;
-			rest->next = b->next;
-			b->size = size;
-			b->next = rest;
-		}
-		b->free = 0;
-		return (uint8_t *)b + sizeof(block_t);
-	}
-	return 0;   /* no block large enough */
+    /* Split if the leftover can hold a header plus a little payload. */
+    if (b->size >= size + sizeof(block_t) + 8) {
+      block_t *rest = (block_t *)((uint8_t *)b + sizeof(block_t) + size);
+      rest->size = b->size - size - sizeof(block_t);
+      rest->free = 1;
+      rest->next = b->next;
+      b->size = size;
+      b->next = rest;
+    }
+    b->free = 0;
+    return (uint8_t *)b + sizeof(block_t);
+  }
+  return 0; /* no block large enough */
 }
 
 void kfree(void *ptr)
 {
-	if (!ptr)
-		return;
-	block_t *b = (block_t *)((uint8_t *)ptr - sizeof(block_t));
+  if (!ptr)
+    return;
+  block_t *b = (block_t *)((uint8_t *)ptr - sizeof(block_t));
 
-	/* Robustness: ignore a pointer outside the heap window, or a double free
-	 * (either would corrupt the list / underflow the used count). */
-	if ((uintptr_t)b < (uintptr_t)head || (uintptr_t)b >= KHEAP_END)
-		return;
-	if (b->free)
-		return;
-	b->free = 1;
+  /* Robustness: ignore a pointer outside the heap window, or a double free
+   * (either would corrupt the list / underflow the used count). */
+  if ((uintptr_t)b < (uintptr_t)head || (uintptr_t)b >= KHEAP_END)
+    return;
+  if (b->free)
+    return;
+  b->free = 1;
 
-	/* Merge forward with adjacent free blocks. */
-	while (b->next && b->next->free) {
-		b->size += sizeof(block_t) + b->next->size;
-		b->next = b->next->next;
-	}
+  /* Merge forward with adjacent free blocks. */
+  while (b->next && b->next->free) {
+    b->size += sizeof(block_t) + b->next->size;
+    b->next = b->next->next;
+  }
 
-	/* Merge backward: absorb b into a free predecessor. The list is kept in
-	 * address order, so one walk from head finds the block whose next is b.
-	 * Without this, freeing blocks in any order but low-to-high left a trail of
-	 * small free blocks that never recombined — the heap fragmented over uptime. */
-	if (b != head) {
-		block_t *p = head;
-		while (p && p->next != b)
-			p = p->next;
-		if (p && p->free) {
-			p->size += sizeof(block_t) + b->size;
-			p->next  = b->next;
-		}
-	}
+  /* Merge backward: absorb b into a free predecessor. The list is kept in
+   * address order, so one walk from head finds the block whose next is b.
+   * Without this, freeing blocks in any order but low-to-high left a trail of
+   * small free blocks that never recombined — the heap fragmented over uptime.
+   */
+  if (b != head) {
+    block_t *p = head;
+    while (p && p->next != b)
+      p = p->next;
+    if (p && p->free) {
+      p->size += sizeof(block_t) + b->size;
+      p->next = b->next;
+    }
+  }
 }
 
 size_t heap_used_bytes(void)
 {
-	size_t used = 0;
-	for (block_t *b = head; b; b = b->next)
-		if (!b->free)
-			used += b->size + sizeof(block_t);
-	return used;
+  size_t used = 0;
+  for (block_t *b = head; b; b = b->next)
+    if (!b->free)
+      used += b->size + sizeof(block_t);
+  return used;
 }
 
 size_t heap_free_bytes(void)
 {
-	size_t freed = 0;
-	for (block_t *b = head; b; b = b->next)
-		if (b->free)
-			freed += b->size;
-	return freed;
+  size_t freed = 0;
+  for (block_t *b = head; b; b = b->next)
+    if (b->free)
+      freed += b->size;
+  return freed;
 }

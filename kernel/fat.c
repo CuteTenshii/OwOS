@@ -1,13 +1,13 @@
 /* fat.c — read-only-capable FAT12/16/32 driver (see fat.h, fsmount.h).
  *
  * Multi-instance: all mutable per-mount state lives in a heap-allocated
- * `struct fat_mount`, so N independent FAT volumes can be mounted at once. Every
- * operation takes the instance through a `void *inst` (a `struct fat_mount *`).
- * Everything is derived from the BIOS Parameter Block in the boot sector: the
- * reserved region, one or more FATs, a root-directory region (FAT12/16) or root
- * cluster (FAT32), and the cluster-addressed data region. The FAT type is
- * decided the canonical way -- by the count of data clusters -- not by the
- * (advisory) string in the BPB.
+ * `struct fat_mount`, so N independent FAT volumes can be mounted at once.
+ * Every operation takes the instance through a `void *inst` (a `struct
+ * fat_mount *`). Everything is derived from the BIOS Parameter Block in the
+ * boot sector: the reserved region, one or more FATs, a root-directory region
+ * (FAT12/16) or root cluster (FAT32), and the cluster-addressed data region.
+ * The FAT type is decided the canonical way -- by the count of data clusters --
+ * not by the (advisory) string in the BPB.
  *
  * Sector I/O goes through a one-sector LRU-of-1 cache (per mount). Walking a
  * cluster chain re-reads the same FAT sector for every link, and listing a
@@ -17,31 +17,27 @@
 
 #include <stddef.h>
 
-#include "fat.h"
-#include "endian.h"
 #include "console.h"
-#include "kstring.h"
+#include "endian.h"
+#include "fat.h"
 #include "heap.h"
+#include "kstring.h"
 
 /* ------------------------------------------------------------------ helpers */
 
-static char lc(char c)            /* ASCII lower-case */
-{
-	return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-}
+static char lc(char c) /* ASCII lower-case */ { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 
 /* Case-insensitive compare of a NUL-terminated name against a length-bounded
  * one. Returns 1 if equal. */
 static int name_eq(const char *a, const char *b, uint32_t blen)
 {
-	uint32_t i = 0;
-	for (; i < blen; i++) {
-		if (!a[i] || lc(a[i]) != lc(b[i]))
-			return 0;
-	}
-	return a[i] == '\0';
+  uint32_t i = 0;
+  for (; i < blen; i++) {
+    if (!a[i] || lc(a[i]) != lc(b[i]))
+      return 0;
+  }
+  return a[i] == '\0';
 }
-
 
 /* ----------------------------------------------------------------- mounting */
 
@@ -51,265 +47,264 @@ enum fat_kind { FAT_NONE, FAT12, FAT16, FAT32 };
  * field that used to be a mount-specific file-static global, including the
  * one-sector read cache, so concurrent mounts never clobber each other. */
 struct fat_mount {
-	blk_read_fn  read;
-	blk_write_fn write;     /* NULL => read-only mount                      */
-	uint32_t base;          /* absolute LBA of the boot sector              */
-	enum fat_kind kind;
-	uint32_t bytes_per_sec;
-	uint32_t sec_per_clus;
-	uint32_t reserved;      /* reserved sectors before the first FAT        */
-	uint32_t num_fats;
-	uint32_t fat_sectors;   /* sectors per FAT                              */
-	uint32_t root_entries;  /* FAT12/16 root-dir entry count (0 on FAT32)   */
-	uint32_t root_sectors;  /* FAT12/16 root-dir region length in sectors   */
-	uint32_t first_data;    /* volume-relative first data sector            */
-	uint32_t root_cluster;  /* FAT32 root cluster (0 on FAT12/16)           */
-	uint32_t total_clusters;
-	char label[12];
+  blk_read_fn read;
+  blk_write_fn write; /* NULL => read-only mount                      */
+  uint32_t base;      /* absolute LBA of the boot sector              */
+  enum fat_kind kind;
+  uint32_t bytes_per_sec;
+  uint32_t sec_per_clus;
+  uint32_t reserved; /* reserved sectors before the first FAT        */
+  uint32_t num_fats;
+  uint32_t fat_sectors;  /* sectors per FAT                              */
+  uint32_t root_entries; /* FAT12/16 root-dir entry count (0 on FAT32)   */
+  uint32_t root_sectors; /* FAT12/16 root-dir region length in sectors   */
+  uint32_t first_data;   /* volume-relative first data sector            */
+  uint32_t root_cluster; /* FAT32 root cluster (0 on FAT12/16)           */
+  uint32_t total_clusters;
+  char label[12];
 
-	/* One-sector cache, indexed by absolute LBA. */
-	uint8_t  cache[512];
-	uint32_t cache_lba;
-	int      cache_ok;
+  /* One-sector cache, indexed by absolute LBA. */
+  uint8_t cache[512];
+  uint32_t cache_lba;
+  int cache_ok;
 };
 
 static int read_abs(struct fat_mount *m, uint32_t lba, const uint8_t **out)
 {
-	if (!(m->cache_ok && m->cache_lba == lba)) {
-		if (m->read(lba, m->cache) != 0) {
-			m->cache_ok = 0;
-			return -1;
-		}
-		m->cache_lba = lba;
-		m->cache_ok = 1;
-	}
-	*out = m->cache;
-	return 0;
+  if (!(m->cache_ok && m->cache_lba == lba)) {
+    if (m->read(lba, m->cache) != 0) {
+      m->cache_ok = 0;
+      return -1;
+    }
+    m->cache_lba = lba;
+    m->cache_ok = 1;
+  }
+  *out = m->cache;
+  return 0;
 }
 
 /* Read a volume-relative sector (adds the partition base). */
-static int read_sec(struct fat_mount *m, uint32_t sec, const uint8_t **out)
-{
-	return read_abs(m, m->base + sec, out);
-}
+static int read_sec(struct fat_mount *m, uint32_t sec, const uint8_t **out) { return read_abs(m, m->base + sec, out); }
 
 /* Write-through one absolute sector and keep the read cache coherent. There is
  * deliberately no write-back buffering: every change reaches the medium before
  * the call returns, so a removal between operations can never lose data. */
 static int write_abs(struct fat_mount *m, uint32_t lba, const void *buf)
 {
-	if (!m->write)
-		return -1;
-	if (m->write(lba, buf) != 0)
-		return -1;
-	if (m->cache_ok && m->cache_lba == lba)
-		memcpy(m->cache, buf, 512);
-	return 0;
+  if (!m->write)
+    return -1;
+  if (m->write(lba, buf) != 0)
+    return -1;
+  if (m->cache_ok && m->cache_lba == lba)
+    memcpy(m->cache, buf, 512);
+  return 0;
 }
 
-static int write_sec(struct fat_mount *m, uint32_t sec, const void *buf)
-{
-	return write_abs(m, m->base + sec, buf);
-}
+static int write_sec(struct fat_mount *m, uint32_t sec, const void *buf) { return write_abs(m, m->base + sec, buf); }
 
 #define BAD_CLUSTER 0x0FFFFFFFu
 
-/* The next cluster after `clus` in the chain, or >= an end marker at the end. */
+/* The next cluster after `clus` in the chain, or >= an end marker at the end.
+ */
 static uint32_t fat_next(struct fat_mount *m, uint32_t clus)
 {
-	const uint8_t *s;
-	uint32_t fat_base = m->reserved;   /* sectors */
+  const uint8_t *s;
+  uint32_t fat_base = m->reserved; /* sectors */
 
-	if (m->kind == FAT16) {
-		uint32_t off = clus * 2;
-		if (read_sec(m, fat_base + off / m->bytes_per_sec, &s) != 0)
-			return BAD_CLUSTER;
-		return load_le16(s + off % m->bytes_per_sec);
-	}
-	if (m->kind == FAT32) {
-		uint32_t off = clus * 4;
-		if (read_sec(m, fat_base + off / m->bytes_per_sec, &s) != 0)
-			return BAD_CLUSTER;
-		return load_le32(s + off % m->bytes_per_sec) & 0x0FFFFFFFu;
-	}
-	/* FAT12: 1.5 bytes per entry, possibly straddling a sector boundary. */
-	uint32_t off = clus + clus / 2;
-	uint32_t sec = fat_base + off / m->bytes_per_sec;
-	uint32_t pos = off % m->bytes_per_sec;
-	uint8_t lo, hi;
-	if (read_sec(m, sec, &s) != 0)
-		return BAD_CLUSTER;
-	lo = s[pos];
-	if (pos + 1 < m->bytes_per_sec) {
-		hi = s[pos + 1];
-	} else {
-		if (read_sec(m, sec + 1, &s) != 0)   /* spills into the next sector */
-			return BAD_CLUSTER;
-		hi = s[0];
-	}
-	uint16_t v = (uint16_t)(lo | (hi << 8));
-	return (clus & 1) ? (uint32_t)(v >> 4) : (uint32_t)(v & 0x0FFF);
+  if (m->kind == FAT16) {
+    uint32_t off = clus * 2;
+    if (read_sec(m, fat_base + off / m->bytes_per_sec, &s) != 0)
+      return BAD_CLUSTER;
+    return load_le16(s + off % m->bytes_per_sec);
+  }
+  if (m->kind == FAT32) {
+    uint32_t off = clus * 4;
+    if (read_sec(m, fat_base + off / m->bytes_per_sec, &s) != 0)
+      return BAD_CLUSTER;
+    return load_le32(s + off % m->bytes_per_sec) & 0x0FFFFFFFu;
+  }
+  /* FAT12: 1.5 bytes per entry, possibly straddling a sector boundary. */
+  uint32_t off = clus + clus / 2;
+  uint32_t sec = fat_base + off / m->bytes_per_sec;
+  uint32_t pos = off % m->bytes_per_sec;
+  uint8_t lo, hi;
+  if (read_sec(m, sec, &s) != 0)
+    return BAD_CLUSTER;
+  lo = s[pos];
+  if (pos + 1 < m->bytes_per_sec) {
+    hi = s[pos + 1];
+  } else {
+    if (read_sec(m, sec + 1, &s) != 0) /* spills into the next sector */
+      return BAD_CLUSTER;
+    hi = s[0];
+  }
+  uint16_t v = (uint16_t)(lo | (hi << 8));
+  return (clus & 1) ? (uint32_t)(v >> 4) : (uint32_t)(v & 0x0FFF);
 }
 
 /* 1 if `clus` is an end-of-chain marker for the mounted FAT type. */
 static int is_eoc(struct fat_mount *m, uint32_t clus)
 {
-	switch (m->kind) {
-	case FAT12: return clus >= 0x0FF8u;
-	case FAT16: return clus >= 0xFFF8u;
-	case FAT32: return clus >= 0x0FFFFFF8u;
-	default:    return 1;
-	}
+  switch (m->kind) {
+  case FAT12:
+    return clus >= 0x0FF8u;
+  case FAT16:
+    return clus >= 0xFFF8u;
+  case FAT32:
+    return clus >= 0x0FFFFFF8u;
+  default:
+    return 1;
+  }
 }
 
 static uint32_t cluster_first_sector(struct fat_mount *m, uint32_t clus)
 {
-	return m->first_data + (clus - 2) * m->sec_per_clus;
+  return m->first_data + (clus - 2) * m->sec_per_clus;
 }
 
 /* Validate a candidate boot sector as a FAT BPB and, if good, populate `*m`.
  * Returns 0 on success. */
 static int parse_bpb(struct fat_mount *m, const uint8_t *bs)
 {
-	if (load_le16(bs + 510) != 0xAA55)
-		return -1;
+  if (load_le16(bs + 510) != 0xAA55)
+    return -1;
 
-	uint32_t bps  = load_le16(bs + 11);
-	uint32_t spc  = bs[13];
-	uint32_t rsvd = load_le16(bs + 14);
-	uint32_t nfat = bs[16];
-	uint32_t rootent = load_le16(bs + 17);
-	uint32_t totsec16 = load_le16(bs + 19);
-	uint32_t fatsz16  = load_le16(bs + 22);
-	uint32_t totsec32 = load_le32(bs + 32);
-	uint32_t fatsz32  = load_le32(bs + 36);
+  uint32_t bps = load_le16(bs + 11);
+  uint32_t spc = bs[13];
+  uint32_t rsvd = load_le16(bs + 14);
+  uint32_t nfat = bs[16];
+  uint32_t rootent = load_le16(bs + 17);
+  uint32_t totsec16 = load_le16(bs + 19);
+  uint32_t fatsz16 = load_le16(bs + 22);
+  uint32_t totsec32 = load_le32(bs + 32);
+  uint32_t fatsz32 = load_le32(bs + 36);
 
-	/* Our block back ends speak 512-byte sectors, and the cache is one such
-	 * sector, so only 512-byte-logical-sector volumes are supported (the
-	 * overwhelming common case). This doubles as the FAT signature check for a
-	 * whole-disk volume with no partition table. */
-	if (bps != 512)
-		return -1;
-	if (spc == 0 || (spc & (spc - 1)) != 0)
-		return -1;
-	if (nfat == 0 || nfat > 2 || rsvd == 0)
-		return -1;
+  /* Our block back ends speak 512-byte sectors, and the cache is one such
+   * sector, so only 512-byte-logical-sector volumes are supported (the
+   * overwhelming common case). This doubles as the FAT signature check for a
+   * whole-disk volume with no partition table. */
+  if (bps != 512)
+    return -1;
+  if (spc == 0 || (spc & (spc - 1)) != 0)
+    return -1;
+  if (nfat == 0 || nfat > 2 || rsvd == 0)
+    return -1;
 
-	uint32_t fatsz  = fatsz16 ? fatsz16 : fatsz32;
-	uint32_t totsec = totsec16 ? totsec16 : totsec32;
-	if (fatsz == 0 || totsec == 0)
-		return -1;
+  uint32_t fatsz = fatsz16 ? fatsz16 : fatsz32;
+  uint32_t totsec = totsec16 ? totsec16 : totsec32;
+  if (fatsz == 0 || totsec == 0)
+    return -1;
 
-	uint32_t root_sectors = ((rootent * 32) + (bps - 1)) / bps;
-	uint32_t data_start   = rsvd + nfat * fatsz + root_sectors;
-	if (data_start >= totsec)
-		return -1;
-	uint32_t data_sectors = totsec - data_start;
-	uint32_t clusters     = data_sectors / spc;
+  uint32_t root_sectors = ((rootent * 32) + (bps - 1)) / bps;
+  uint32_t data_start = rsvd + nfat * fatsz + root_sectors;
+  if (data_start >= totsec)
+    return -1;
+  uint32_t data_sectors = totsec - data_start;
+  uint32_t clusters = data_sectors / spc;
 
-	m->bytes_per_sec  = bps;
-	m->sec_per_clus   = spc;
-	m->reserved       = rsvd;
-	m->num_fats       = nfat;
-	m->fat_sectors    = fatsz;
-	m->root_entries   = rootent;
-	m->root_sectors   = root_sectors;
-	m->first_data     = data_start;
-	m->total_clusters = clusters;
+  m->bytes_per_sec = bps;
+  m->sec_per_clus = spc;
+  m->reserved = rsvd;
+  m->num_fats = nfat;
+  m->fat_sectors = fatsz;
+  m->root_entries = rootent;
+  m->root_sectors = root_sectors;
+  m->first_data = data_start;
+  m->total_clusters = clusters;
 
-	if (clusters < 4085)
-		m->kind = FAT12;
-	else if (clusters < 65525)
-		m->kind = FAT16;
-	else
-		m->kind = FAT32;
+  if (clusters < 4085)
+    m->kind = FAT12;
+  else if (clusters < 65525)
+    m->kind = FAT16;
+  else
+    m->kind = FAT32;
 
-	/* Root location and volume label live in different places per type. */
-	const uint8_t *lbl = NULL;
-	if (m->kind == FAT32) {
-		m->root_cluster = load_le32(bs + 44);
-		if (m->root_cluster < 2)
-			return -1;
-		if (bs[66] == 0x29)        /* extended boot signature */
-			lbl = bs + 71;
-	} else {
-		m->root_cluster = 0;
-		if (bs[38] == 0x29)
-			lbl = bs + 43;
-	}
+  /* Root location and volume label live in different places per type. */
+  const uint8_t *lbl = NULL;
+  if (m->kind == FAT32) {
+    m->root_cluster = load_le32(bs + 44);
+    if (m->root_cluster < 2)
+      return -1;
+    if (bs[66] == 0x29) /* extended boot signature */
+      lbl = bs + 71;
+  } else {
+    m->root_cluster = 0;
+    if (bs[38] == 0x29)
+      lbl = bs + 43;
+  }
 
-	m->label[0] = '\0';
-	if (lbl) {
-		int n = 11;
-		while (n > 0 && lbl[n - 1] == ' ')   /* trim trailing pad */
-			n--;
-		for (int i = 0; i < n; i++)
-			m->label[i] = (char)lbl[i];
-		m->label[n] = '\0';
-	}
-	return 0;
+  m->label[0] = '\0';
+  if (lbl) {
+    int n = 11;
+    while (n > 0 && lbl[n - 1] == ' ') /* trim trailing pad */
+      n--;
+    for (int i = 0; i < n; i++)
+      m->label[i] = (char)lbl[i];
+    m->label[n] = '\0';
+  }
+  return 0;
 }
 
 /* Mount the FAT volume whose boot sector sits at absolute LBA `base_lba`.
  * Returns 0 on success, -1 on failure (bad BPB, unsupported geometry, I/O). */
-static int fat_mount_at(struct fat_mount *m, blk_read_fn read,
-                        blk_write_fn write, uint32_t base_lba)
+static int fat_mount_at(struct fat_mount *m, blk_read_fn read, blk_write_fn write, uint32_t base_lba)
 {
-	uint8_t bs[512];
-	m->kind = FAT_NONE;
-	m->cache_ok = 0;
-	m->cache_lba = 0xFFFFFFFFu;
+  uint8_t bs[512];
+  m->kind = FAT_NONE;
+  m->cache_ok = 0;
+  m->cache_lba = 0xFFFFFFFFu;
 
-	if (!read || read(base_lba, bs) != 0)
-		return -1;
+  if (!read || read(base_lba, bs) != 0)
+    return -1;
 
-	m->read  = read;
-	m->write = write;
-	m->base  = base_lba;
-	if (parse_bpb(m, bs) != 0) {
-		m->kind = FAT_NONE;
-		return -1;
-	}
-	return 0;
+  m->read = read;
+  m->write = write;
+  m->base = base_lba;
+  if (parse_bpb(m, bs) != 0) {
+    m->kind = FAT_NONE;
+    return -1;
+  }
+  return 0;
 }
 
-/* --------------------------------------------------------- directory walking */
+/* --------------------------------------------------------- directory walking
+ */
 
 /* A resolved directory entry. The loc[] arrays record where the raw on-disk
  * records live -- the run of LFN slots followed by the 8.3 entry -- so a delete
  * can wipe every record that makes up the name, not just the 8.3 one. */
-#define MAX_RECS 21           /* up to 20 LFN slots + 1 short entry */
+#define MAX_RECS 21 /* up to 20 LFN slots + 1 short entry */
 struct dirent {
-	char     name[256];   /* long name if present, else 8.3                  */
-	uint32_t cluster;     /* first cluster (0 = empty file)                  */
-	uint32_t size;        /* bytes (0 for directories)                       */
-	int      is_dir;
-	uint32_t loc_lba[MAX_RECS];
-	uint32_t loc_off[MAX_RECS];
-	int      loc_n;
+  char name[256];   /* long name if present, else 8.3                  */
+  uint32_t cluster; /* first cluster (0 = empty file)                  */
+  uint32_t size;    /* bytes (0 for directories)                       */
+  int is_dir;
+  uint32_t loc_lba[MAX_RECS];
+  uint32_t loc_off[MAX_RECS];
+  int loc_n;
 };
 
 /* Build the displayable 8.3 name from a raw directory record into out[13]. */
 static void short_name(const uint8_t *e, char *out)
 {
-	int o = 0;
-	for (int i = 0; i < 8; i++) {
-		if (e[i] == ' ')
-			break;
-		out[o++] = (char)e[i];
-	}
-	if (e[8] != ' ') {
-		out[o++] = '.';
-		for (int i = 8; i < 11; i++) {
-			if (e[i] == ' ')
-				break;
-			out[o++] = (char)e[i];
-		}
-	}
-	out[o] = '\0';
-	/* A leading 0x05 stands in for a real 0xE5 first byte (KANJI escape). */
-	if ((uint8_t)out[0] == 0x05)
-		out[0] = (char)0xE5;
+  int o = 0;
+  for (int i = 0; i < 8; i++) {
+    if (e[i] == ' ')
+      break;
+    out[o++] = (char)e[i];
+  }
+  if (e[8] != ' ') {
+    out[o++] = '.';
+    for (int i = 8; i < 11; i++) {
+      if (e[i] == ' ')
+        break;
+      out[o++] = (char)e[i];
+    }
+  }
+  out[o] = '\0';
+  /* A leading 0x05 stands in for a real 0xE5 first byte (KANJI escape). */
+  if ((uint8_t)out[0] == 0x05)
+    out[0] = (char)0xE5;
 }
 
 /* Copy the 13 UCS-2 chars of one LFN slot (offsets 1,3,5,7,9,14..24,28,30) as
@@ -317,359 +312,379 @@ static void short_name(const uint8_t *e, char *out)
  * written (<=13) and sets *term if the name ended in this slot. */
 static int lfn_chars(const uint8_t *e, char *dst, int *term)
 {
-	static const int off[13] = {1,3,5,7,9, 14,16,18,20,22,24, 28,30};
-	int n = 0;
-	*term = 0;
-	for (int i = 0; i < 13; i++) {
-		uint16_t ch = load_le16(e + off[i]);
-		if (ch == 0x0000 || ch == 0xFFFF) {
-			*term = 1;
-			break;
-		}
-		dst[n++] = (ch < 0x80) ? (char)ch : '?';
-	}
-	return n;
+  static const int off[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+  int n = 0;
+  *term = 0;
+  for (int i = 0; i < 13; i++) {
+    uint16_t ch = load_le16(e + off[i]);
+    if (ch == 0x0000 || ch == 0xFFFF) {
+      *term = 1;
+      break;
+    }
+    dst[n++] = (ch < 0x80) ? (char)ch : '?';
+  }
+  return n;
 }
 
 /* Iterator over a directory's 32-byte records. FAT12/16 root is a fixed sector
  * region; everything else is a cluster chain. `start_cluster` is 0 for the
  * FAT12/16 fixed root. */
 struct dir_iter {
-	uint32_t cluster;       /* current cluster (0 => fixed root region)      */
-	uint32_t clus_seen;     /* clusters hopped, to break a cyclic chain      */
-	uint32_t sector_in;     /* sector index within the cluster/root region   */
-	uint32_t ent_in;        /* entry index within the current sector         */
-	uint32_t root_left;     /* remaining root sectors (fixed-root mode)      */
-	const uint8_t *sec;     /* cached current sector                         */
-	uint32_t sec_lba;       /* absolute LBA of `sec` (for in-place edits)    */
-	uint32_t cur_lba;       /* LBA of the record just returned by diter_next */
-	uint32_t cur_off;       /* byte offset of that record within its sector  */
-	int done;
+  uint32_t cluster;   /* current cluster (0 => fixed root region)      */
+  uint32_t clus_seen; /* clusters hopped, to break a cyclic chain      */
+  uint32_t sector_in; /* sector index within the cluster/root region   */
+  uint32_t ent_in;    /* entry index within the current sector         */
+  uint32_t root_left; /* remaining root sectors (fixed-root mode)      */
+  const uint8_t *sec; /* cached current sector                         */
+  uint32_t sec_lba;   /* absolute LBA of `sec` (for in-place edits)    */
+  uint32_t cur_lba;   /* LBA of the record just returned by diter_next */
+  uint32_t cur_off;   /* byte offset of that record within its sector  */
+  int done;
 };
 
-static void diter_init(struct fat_mount *m, struct dir_iter *it,
-                       uint32_t start_cluster)
+static void diter_init(struct fat_mount *m, struct dir_iter *it, uint32_t start_cluster)
 {
-	memset(it, 0, sizeof(*it));
-	it->cluster = start_cluster;
-	if (start_cluster == 0)
-		it->root_left = m->root_sectors;
+  memset(it, 0, sizeof(*it));
+  it->cluster = start_cluster;
+  if (start_cluster == 0)
+    it->root_left = m->root_sectors;
 }
 
 /* Fetch the next raw 32-byte record, or NULL at end-of-directory. */
 static const uint8_t *diter_next(struct fat_mount *m, struct dir_iter *it)
 {
-	uint32_t per_sec = m->bytes_per_sec / 32;
-	for (;;) {
-		if (it->done)
-			return NULL;
-		if (it->ent_in == 0) {
-			/* Need to (re)load the current sector. */
-			uint32_t lba;
-			if (it->cluster == 0) {            /* fixed FAT12/16 root */
-				if (it->root_left == 0) { it->done = 1; return NULL; }
-				lba = m->reserved + m->num_fats * m->fat_sectors +
-				      it->sector_in;
-			} else {
-				if (it->sector_in == m->sec_per_clus) {
-					uint32_t nxt = fat_next(m, it->cluster);
-					if (nxt < 2 || is_eoc(m, nxt)) { it->done = 1; return NULL; }
-					/* a cyclic/corrupt chain has no EOC: cap hops at the
-					 * cluster count so traversal can't spin forever */
-					if (++it->clus_seen > m->total_clusters + 2) {
-						it->done = 1; return NULL;
-					}
-					it->cluster = nxt;
-					it->sector_in = 0;
-				}
-				lba = cluster_first_sector(m, it->cluster) + it->sector_in;
-			}
-			if (read_sec(m, lba, &it->sec) != 0) { it->done = 1; return NULL; }
-			it->sec_lba = lba;
-		}
+  uint32_t per_sec = m->bytes_per_sec / 32;
+  for (;;) {
+    if (it->done)
+      return NULL;
+    if (it->ent_in == 0) {
+      /* Need to (re)load the current sector. */
+      uint32_t lba;
+      if (it->cluster == 0) { /* fixed FAT12/16 root */
+        if (it->root_left == 0) {
+          it->done = 1;
+          return NULL;
+        }
+        lba = m->reserved + m->num_fats * m->fat_sectors + it->sector_in;
+      } else {
+        if (it->sector_in == m->sec_per_clus) {
+          uint32_t nxt = fat_next(m, it->cluster);
+          if (nxt < 2 || is_eoc(m, nxt)) {
+            it->done = 1;
+            return NULL;
+          }
+          /* a cyclic/corrupt chain has no EOC: cap hops at the
+           * cluster count so traversal can't spin forever */
+          if (++it->clus_seen > m->total_clusters + 2) {
+            it->done = 1;
+            return NULL;
+          }
+          it->cluster = nxt;
+          it->sector_in = 0;
+        }
+        lba = cluster_first_sector(m, it->cluster) + it->sector_in;
+      }
+      if (read_sec(m, lba, &it->sec) != 0) {
+        it->done = 1;
+        return NULL;
+      }
+      it->sec_lba = lba;
+    }
 
-		uint32_t rec_off = it->ent_in * 32;
-		const uint8_t *e = it->sec + rec_off;
-		it->cur_lba = it->sec_lba;       /* remember where this record lives */
-		it->cur_off = rec_off;
-		/* advance the cursor for next time */
-		if (++it->ent_in == per_sec) {
-			it->ent_in = 0;
-			it->sector_in++;
-			if (it->cluster == 0 && it->root_left)
-				it->root_left--;
-		}
+    uint32_t rec_off = it->ent_in * 32;
+    const uint8_t *e = it->sec + rec_off;
+    it->cur_lba = it->sec_lba; /* remember where this record lives */
+    it->cur_off = rec_off;
+    /* advance the cursor for next time */
+    if (++it->ent_in == per_sec) {
+      it->ent_in = 0;
+      it->sector_in++;
+      if (it->cluster == 0 && it->root_left)
+        it->root_left--;
+    }
 
-		if (e[0] == 0x00) { it->done = 1; return NULL; }  /* end of dir */
-		if (e[0] == 0xE5)                                  /* deleted */
-			continue;
-		return e;
-	}
+    if (e[0] == 0x00) {
+      it->done = 1;
+      return NULL;
+    } /* end of dir */
+    if (e[0] == 0xE5) /* deleted */
+      continue;
+    return e;
+  }
 }
 
 /* Read the next *logical* entry (folding any preceding LFN slots into the
  * following 8.3 record) into `out`. Returns 1 on a yielded entry, 0 at end. */
 static int dir_read(struct fat_mount *m, struct dir_iter *it, struct dirent *out)
 {
-	char lfn[256];
-	int  have_lfn = 0;
-	uint32_t run_lba[MAX_RECS], run_off[MAX_RECS];
-	int      run_n = 0;              /* raw records seen for this logical entry */
+  char lfn[256];
+  int have_lfn = 0;
+  uint32_t run_lba[MAX_RECS], run_off[MAX_RECS];
+  int run_n = 0; /* raw records seen for this logical entry */
 
-	for (;;) {
-		const uint8_t *e = diter_next(m, it);
-		if (!e)
-			return 0;
+  for (;;) {
+    const uint8_t *e = diter_next(m, it);
+    if (!e)
+      return 0;
 
-		uint8_t attr = e[11];
-		if (attr == 0x0F) {                  /* LFN slot */
-			if (run_n < MAX_RECS) {
-				run_lba[run_n] = it->cur_lba;
-				run_off[run_n] = it->cur_off;
-				run_n++;
-			}
-			int idx = (e[0] & 0x3F) - 1;     /* 1-based sequence */
-			if (idx < 0 || idx >= 20)        /* 20*13 = 260 cap */
-				{ have_lfn = 0; continue; }
-			char part[13];
-			int term;
-			int n = lfn_chars(e, part, &term);
-			int base = idx * 13;
-			if (base + n < 256) {
-				for (int i = 0; i < n; i++)
-					lfn[base + i] = part[i];
-				if (e[0] & 0x40)             /* last (highest) slot */
-					lfn[base + n] = '\0';
-				else if (n < 13)
-					lfn[base + n] = '\0';
-				have_lfn = 1;
-			}
-			continue;
-		}
-		if (attr & 0x08) {                   /* volume label / not a file */
-			have_lfn = 0;
-			run_n = 0;
-			continue;
-		}
+    uint8_t attr = e[11];
+    if (attr == 0x0F) { /* LFN slot */
+      if (run_n < MAX_RECS) {
+        run_lba[run_n] = it->cur_lba;
+        run_off[run_n] = it->cur_off;
+        run_n++;
+      }
+      int idx = (e[0] & 0x3F) - 1; /* 1-based sequence */
+      if (idx < 0 || idx >= 20)    /* 20*13 = 260 cap */
+      {
+        have_lfn = 0;
+        continue;
+      }
+      char part[13];
+      int term;
+      int n = lfn_chars(e, part, &term);
+      int base = idx * 13;
+      if (base + n < 256) {
+        for (int i = 0; i < n; i++)
+          lfn[base + i] = part[i];
+        if (e[0] & 0x40) /* last (highest) slot */
+          lfn[base + n] = '\0';
+        else if (n < 13)
+          lfn[base + n] = '\0';
+        have_lfn = 1;
+      }
+      continue;
+    }
+    if (attr & 0x08) { /* volume label / not a file */
+      have_lfn = 0;
+      run_n = 0;
+      continue;
+    }
 
-		memset(out, 0, sizeof(*out));
-		if (have_lfn && lfn[0]) {
-			uint32_t k = 0;
-			while (k < 255 && lfn[k]) { out->name[k] = lfn[k]; k++; }
-			out->name[k] = '\0';
-		} else {
-			short_name(e, out->name);
-			run_n = 0;               /* no LFN slots belong to this entry */
-		}
-		out->is_dir  = (attr & 0x10) ? 1 : 0;
-		out->cluster = ((uint32_t)load_le16(e + 20) << 16) | load_le16(e + 26);
-		out->size    = out->is_dir ? 0 : load_le32(e + 28);
+    memset(out, 0, sizeof(*out));
+    if (have_lfn && lfn[0]) {
+      uint32_t k = 0;
+      while (k < 255 && lfn[k]) {
+        out->name[k] = lfn[k];
+        k++;
+      }
+      out->name[k] = '\0';
+    } else {
+      short_name(e, out->name);
+      run_n = 0; /* no LFN slots belong to this entry */
+    }
+    out->is_dir = (attr & 0x10) ? 1 : 0;
+    out->cluster = ((uint32_t)load_le16(e + 20) << 16) | load_le16(e + 26);
+    out->size = out->is_dir ? 0 : load_le32(e + 28);
 
-		for (int i = 0; i < run_n; i++) {     /* LFN slots, then the 8.3 entry */
-			out->loc_lba[i] = run_lba[i];
-			out->loc_off[i] = run_off[i];
-		}
-		out->loc_lba[run_n] = it->cur_lba;
-		out->loc_off[run_n] = it->cur_off;
-		out->loc_n = run_n + 1;
-		return 1;
-	}
+    for (int i = 0; i < run_n; i++) { /* LFN slots, then the 8.3 entry */
+      out->loc_lba[i] = run_lba[i];
+      out->loc_off[i] = run_off[i];
+    }
+    out->loc_lba[run_n] = it->cur_lba;
+    out->loc_off[run_n] = it->cur_off;
+    out->loc_n = run_n + 1;
+    return 1;
+  }
 }
 
 /* Find the child named [comp, comp+len) in the directory rooted at
  * `dir_cluster` (0 = FAT12/16 root). Returns 1 and fills *out on a hit. */
-static int dir_find(struct fat_mount *m, uint32_t dir_cluster, const char *comp,
-                    uint32_t len, struct dirent *out)
+static int dir_find(struct fat_mount *m, uint32_t dir_cluster, const char *comp, uint32_t len, struct dirent *out)
 {
-	struct dir_iter it;
-	struct dirent   d;
-	diter_init(m, &it, dir_cluster);
-	while (dir_read(m, &it, &d)) {
-		if (name_eq(d.name, comp, len)) {
-			memcpy(out, &d, sizeof(*out));
-			return 1;
-		}
-	}
-	return 0;
+  struct dir_iter it;
+  struct dirent d;
+  diter_init(m, &it, dir_cluster);
+  while (dir_read(m, &it, &d)) {
+    if (name_eq(d.name, comp, len)) {
+      memcpy(out, &d, sizeof(*out));
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /* Resolve `path` to a directory entry. On the root, returns is_dir with
  * cluster = root (0 for FAT12/16). Returns 0 on success, -1 if absent. */
 static int resolve(struct fat_mount *m, const char *path, struct dirent *out)
 {
-	/* Start at the root. */
-	memset(out, 0, sizeof(*out));
-	out->is_dir  = 1;
-	out->cluster = (m->kind == FAT32) ? m->root_cluster : 0;
-	out->size    = 0;
+  /* Start at the root. */
+  memset(out, 0, sizeof(*out));
+  out->is_dir = 1;
+  out->cluster = (m->kind == FAT32) ? m->root_cluster : 0;
+  out->size = 0;
 
-	if (!path)
-		return 0;
-	while (*path == '/')
-		path++;
+  if (!path)
+    return 0;
+  while (*path == '/')
+    path++;
 
-	while (*path) {
-		const char *comp = path;
-		uint32_t len = 0;
-		while (path[len] && path[len] != '/')
-			len++;
-		path += len;
-		while (*path == '/')
-			path++;
+  while (*path) {
+    const char *comp = path;
+    uint32_t len = 0;
+    while (path[len] && path[len] != '/')
+      len++;
+    path += len;
+    while (*path == '/')
+      path++;
 
-		if (len == 0)
-			continue;
-		if (len == 1 && comp[0] == '.')
-			continue;
+    if (len == 0)
+      continue;
+    if (len == 1 && comp[0] == '.')
+      continue;
 
-		if (!out->is_dir)            /* can't descend into a file */
-			return -1;
+    if (!out->is_dir) /* can't descend into a file */
+      return -1;
 
-		struct dirent child;
-		if (!dir_find(m, out->cluster, comp, len, &child))
-			return -1;
-		memcpy(out, &child, sizeof(*out));
-	}
-	return 0;
+    struct dirent child;
+    if (!dir_find(m, out->cluster, comp, len, &child))
+      return -1;
+    memcpy(out, &child, sizeof(*out));
+  }
+  return 0;
 }
 
 /* ------------------------------------------------------------- public reads */
 
 static const char *fat_type(struct fat_mount *m)
 {
-	switch (m->kind) {
-	case FAT12: return "FAT12";
-	case FAT16: return "FAT16";
-	case FAT32: return "FAT32";
-	default:    return "none";
-	}
+  switch (m->kind) {
+  case FAT12:
+    return "FAT12";
+  case FAT16:
+    return "FAT16";
+  case FAT32:
+    return "FAT32";
+  default:
+    return "none";
+  }
 }
 
 static const char *fat_label(struct fat_mount *m) { return m->label; }
 
-static int fat_stat(struct fat_mount *m, const char *path, int *is_dir,
-                    uint32_t *size)
+static int fat_stat(struct fat_mount *m, const char *path, int *is_dir, uint32_t *size)
 {
-	if (m->kind == FAT_NONE)
-		return -2;
-	struct dirent d;
-	if (resolve(m, path, &d) != 0)
-		return -1;
-	if (is_dir)
-		*is_dir = d.is_dir;
-	if (size)
-		*size = d.size;
-	return 0;
+  if (m->kind == FAT_NONE)
+    return -2;
+  struct dirent d;
+  if (resolve(m, path, &d) != 0)
+    return -1;
+  if (is_dir)
+    *is_dir = d.is_dir;
+  if (size)
+    *size = d.size;
+  return 0;
 }
 
 static int fat_list(struct fat_mount *m, const char *path)
 {
-	if (m->kind == FAT_NONE)
-		return -2;
-	struct dirent d;
-	if (resolve(m, path, &d) != 0)
-		return -1;
-	if (!d.is_dir)
-		return -1;
+  if (m->kind == FAT_NONE)
+    return -2;
+  struct dirent d;
+  if (resolve(m, path, &d) != 0)
+    return -1;
+  if (!d.is_dir)
+    return -1;
 
-	struct dir_iter it;
-	struct dirent   e;
-	diter_init(m, &it, d.cluster);
-	while (dir_read(m, &it, &e)) {
-		if (e.name[0] == '.' &&
-		    (e.name[1] == '\0' || (e.name[1] == '.' && e.name[2] == '\0')))
-			continue;                 /* hide "." and ".." */
-		con_write(e.is_dir ? "  <DIR>  " : "         ");
-		if (!e.is_dir) {
-			con_printf("%u  ", e.size);
-		} else {
-			con_write("  ");
-		}
-		con_printf("%s\n", e.name);
-	}
-	return 0;
+  struct dir_iter it;
+  struct dirent e;
+  diter_init(m, &it, d.cluster);
+  while (dir_read(m, &it, &e)) {
+    if (e.name[0] == '.' && (e.name[1] == '\0' || (e.name[1] == '.' && e.name[2] == '\0')))
+      continue; /* hide "." and ".." */
+    con_write(e.is_dir ? "  <DIR>  " : "         ");
+    if (!e.is_dir) {
+      con_printf("%u  ", e.size);
+    } else {
+      con_write("  ");
+    }
+    con_printf("%s\n", e.name);
+  }
+  return 0;
 }
 
-static int fat_read_at(struct fat_mount *m, const char *path, uint32_t offset,
-                       void *buf, uint32_t len)
+static int fat_read_at(struct fat_mount *m, const char *path, uint32_t offset, void *buf, uint32_t len)
 {
-	if (m->kind == FAT_NONE)
-		return -2;
-	struct dirent d;
-	if (resolve(m, path, &d) != 0 || d.is_dir)
-		return -1;
+  if (m->kind == FAT_NONE)
+    return -2;
+  struct dirent d;
+  if (resolve(m, path, &d) != 0 || d.is_dir)
+    return -1;
 
-	if (offset >= d.size)
-		return 0;
-	if (offset + len > d.size)
-		len = d.size - offset;
+  if (offset >= d.size)
+    return 0;
+  if (offset + len > d.size)
+    len = d.size - offset;
 
-	uint32_t cbytes = m->sec_per_clus * m->bytes_per_sec;
-	uint32_t clus   = d.cluster;
+  uint32_t cbytes = m->sec_per_clus * m->bytes_per_sec;
+  uint32_t clus = d.cluster;
 
-	/* Walk the chain to the cluster holding `offset`. */
-	uint32_t skip = offset / cbytes;
-	while (skip--) {
-		if (clus < 2 || is_eoc(m, clus))
-			return 0;
-		clus = fat_next(m, clus);
-	}
+  /* Walk the chain to the cluster holding `offset`. */
+  uint32_t skip = offset / cbytes;
+  while (skip--) {
+    if (clus < 2 || is_eoc(m, clus))
+      return 0;
+    clus = fat_next(m, clus);
+  }
 
-	uint8_t *dst = buf;
-	uint32_t got = 0;
-	uint32_t in_clus = offset % cbytes;     /* byte offset into first cluster */
+  uint8_t *dst = buf;
+  uint32_t got = 0;
+  uint32_t in_clus = offset % cbytes; /* byte offset into first cluster */
 
-	while (got < len) {
-		if (clus < 2 || is_eoc(m, clus))
-			break;
-		uint32_t first = cluster_first_sector(m, clus);
-		uint32_t sec   = in_clus / m->bytes_per_sec;
-		uint32_t soff  = in_clus % m->bytes_per_sec;
+  while (got < len) {
+    if (clus < 2 || is_eoc(m, clus))
+      break;
+    uint32_t first = cluster_first_sector(m, clus);
+    uint32_t sec = in_clus / m->bytes_per_sec;
+    uint32_t soff = in_clus % m->bytes_per_sec;
 
-		for (; sec < m->sec_per_clus && got < len; sec++, soff = 0) {
-			const uint8_t *s;
-			if (read_sec(m, first + sec, &s) != 0)
-				return got ? (int)got : -1;
-			uint32_t n = m->bytes_per_sec - soff;
-			if (n > len - got)
-				n = len - got;
-			memcpy(dst + got, s + soff, n);
-			got += n;
-		}
-		in_clus = 0;
-		clus = fat_next(m, clus);
-	}
-	return (int)got;
+    for (; sec < m->sec_per_clus && got < len; sec++, soff = 0) {
+      const uint8_t *s;
+      if (read_sec(m, first + sec, &s) != 0)
+        return got ? (int)got : -1;
+      uint32_t n = m->bytes_per_sec - soff;
+      if (n > len - got)
+        n = len - got;
+      memcpy(dst + got, s + soff, n);
+      got += n;
+    }
+    in_clus = 0;
+    clus = fat_next(m, clus);
+  }
+  return (int)got;
 }
 
-static int fat_enum_dir(struct fat_mount *m, const char *path, int idx,
-                        char *name, int *is_dir, uint32_t *size)
+static int fat_enum_dir(struct fat_mount *m, const char *path, int idx, char *name, int *is_dir, uint32_t *size)
 {
-	if (m->kind == FAT_NONE || idx < 0)
-		return 0;
-	struct dirent d;
-	if (resolve(m, path, &d) != 0 || !d.is_dir)
-		return 0;
+  if (m->kind == FAT_NONE || idx < 0)
+    return 0;
+  struct dirent d;
+  if (resolve(m, path, &d) != 0 || !d.is_dir)
+    return 0;
 
-	struct dir_iter it;
-	struct dirent   e;
-	int count = 0;
-	diter_init(m, &it, d.cluster);
-	while (dir_read(m, &it, &e)) {
-		if (e.name[0] == '.' &&
-		    (e.name[1] == '\0' || (e.name[1] == '.' && e.name[2] == '\0')))
-			continue;
-		if (count == idx) {
-			uint32_t k = 0;
-			while (k < 255 && e.name[k]) { name[k] = e.name[k]; k++; }
-			name[k] = '\0';
-			if (is_dir) *is_dir = e.is_dir;
-			if (size)   *size = e.size;
-			return 1;
-		}
-		count++;
-	}
-	return 0;
+  struct dir_iter it;
+  struct dirent e;
+  int count = 0;
+  diter_init(m, &it, d.cluster);
+  while (dir_read(m, &it, &e)) {
+    if (e.name[0] == '.' && (e.name[1] == '\0' || (e.name[1] == '.' && e.name[2] == '\0')))
+      continue;
+    if (count == idx) {
+      uint32_t k = 0;
+      while (k < 255 && e.name[k]) {
+        name[k] = e.name[k];
+        k++;
+      }
+      name[k] = '\0';
+      if (is_dir)
+        *is_dir = e.is_dir;
+      if (size)
+        *size = e.size;
+      return 1;
+    }
+    count++;
+  }
+  return 0;
 }
 
 /* ----------------------------------------------------------------- writes
@@ -679,429 +694,554 @@ static int fat_enum_dir(struct fat_mount *m, const char *path, int idx,
  * eject. Names are written as 8.3 short names (LFN generation is not done yet),
  * so a created file may surface under a generated short alias. */
 
-/* Read a (volume-relative) sector into a mutable buffer for a read-modify-write. */
+/* Read a (volume-relative) sector into a mutable buffer for a
+ * read-modify-write. */
 static int read_secbuf(struct fat_mount *m, uint32_t sec, uint8_t *buf)
 {
-	const uint8_t *s;
-	if (read_sec(m, sec, &s) != 0)
-		return -1;
-	memcpy(buf, s, 512);
-	return 0;
+  const uint8_t *s;
+  if (read_sec(m, sec, &s) != 0)
+    return -1;
+  memcpy(buf, s, 512);
+  return 0;
 }
 
 static uint32_t eoc_value(struct fat_mount *m)
 {
-	return m->kind == FAT12 ? 0x0FFFu
-	     : m->kind == FAT16 ? 0xFFFFu : 0x0FFFFFFFu;
+  return m->kind == FAT12 ? 0x0FFFu : m->kind == FAT16 ? 0xFFFFu : 0x0FFFFFFFu;
 }
 
 /* Set cluster `clus`'s FAT entry to `val`, in every FAT copy. */
 static int fat_set(struct fat_mount *m, uint32_t clus, uint32_t val)
 {
-	for (uint32_t f = 0; f < m->num_fats; f++) {
-		uint32_t fbase = m->reserved + f * m->fat_sectors;
-		uint8_t b[512];
+  for (uint32_t f = 0; f < m->num_fats; f++) {
+    uint32_t fbase = m->reserved + f * m->fat_sectors;
+    uint8_t b[512];
 
-		if (m->kind == FAT16) {
-			uint32_t off = clus * 2;
-			uint32_t sec = fbase + off / 512, pos = off % 512;
-			if (read_secbuf(m, sec, b) != 0) return -1;
-			b[pos] = val & 0xFF; b[pos + 1] = (val >> 8) & 0xFF;
-			if (write_sec(m, sec, b) != 0) return -1;
-		} else if (m->kind == FAT32) {
-			uint32_t off = clus * 4;
-			uint32_t sec = fbase + off / 512, pos = off % 512;
-			if (read_secbuf(m, sec, b) != 0) return -1;
-			uint32_t nv = (load_le32(b + pos) & 0xF0000000u) | (val & 0x0FFFFFFFu);
-			b[pos] = nv & 0xFF; b[pos + 1] = (nv >> 8) & 0xFF;
-			b[pos + 2] = (nv >> 16) & 0xFF; b[pos + 3] = (nv >> 24) & 0xFF;
-			if (write_sec(m, sec, b) != 0) return -1;
-		} else {                       /* FAT12: 1.5 bytes, may straddle */
-			uint32_t off = clus + clus / 2;
-			uint32_t sec = fbase + off / 512, pos = off % 512;
-			if (read_secbuf(m, sec, b) != 0) return -1;
-			int straddle = (pos + 1 >= 512);
-			uint8_t b1[512];
-			uint8_t lo = b[pos], hi;
-			if (straddle) {
-				if (read_secbuf(m, sec + 1, b1) != 0) return -1;
-				hi = b1[0];
-			} else {
-				hi = b[pos + 1];
-			}
-			uint16_t cur = (uint16_t)(lo | (hi << 8));
-			uint16_t nv = (clus & 1) ? (uint16_t)((cur & 0x000F) | ((val & 0x0FFF) << 4))
-			                         : (uint16_t)((cur & 0xF000) | (val & 0x0FFF));
-			b[pos] = nv & 0xFF;
-			if (straddle) {
-				b1[0] = (nv >> 8) & 0xFF;
-				if (write_sec(m, sec, b) != 0)     return -1;
-				if (write_sec(m, sec + 1, b1) != 0) return -1;
-			} else {
-				b[pos + 1] = (nv >> 8) & 0xFF;
-				if (write_sec(m, sec, b) != 0) return -1;
-			}
-		}
-	}
-	return 0;
+    if (m->kind == FAT16) {
+      uint32_t off = clus * 2;
+      uint32_t sec = fbase + off / 512, pos = off % 512;
+      if (read_secbuf(m, sec, b) != 0)
+        return -1;
+      b[pos] = val & 0xFF;
+      b[pos + 1] = (val >> 8) & 0xFF;
+      if (write_sec(m, sec, b) != 0)
+        return -1;
+    } else if (m->kind == FAT32) {
+      uint32_t off = clus * 4;
+      uint32_t sec = fbase + off / 512, pos = off % 512;
+      if (read_secbuf(m, sec, b) != 0)
+        return -1;
+      uint32_t nv = (load_le32(b + pos) & 0xF0000000u) | (val & 0x0FFFFFFFu);
+      b[pos] = nv & 0xFF;
+      b[pos + 1] = (nv >> 8) & 0xFF;
+      b[pos + 2] = (nv >> 16) & 0xFF;
+      b[pos + 3] = (nv >> 24) & 0xFF;
+      if (write_sec(m, sec, b) != 0)
+        return -1;
+    } else { /* FAT12: 1.5 bytes, may straddle */
+      uint32_t off = clus + clus / 2;
+      uint32_t sec = fbase + off / 512, pos = off % 512;
+      if (read_secbuf(m, sec, b) != 0)
+        return -1;
+      int straddle = (pos + 1 >= 512);
+      uint8_t b1[512];
+      uint8_t lo = b[pos], hi;
+      if (straddle) {
+        if (read_secbuf(m, sec + 1, b1) != 0)
+          return -1;
+        hi = b1[0];
+      } else {
+        hi = b[pos + 1];
+      }
+      uint16_t cur = (uint16_t)(lo | (hi << 8));
+      uint16_t nv =
+          (clus & 1) ? (uint16_t)((cur & 0x000F) | ((val & 0x0FFF) << 4)) : (uint16_t)((cur & 0xF000) | (val & 0x0FFF));
+      b[pos] = nv & 0xFF;
+      if (straddle) {
+        b1[0] = (nv >> 8) & 0xFF;
+        if (write_sec(m, sec, b) != 0)
+          return -1;
+        if (write_sec(m, sec + 1, b1) != 0)
+          return -1;
+      } else {
+        b[pos + 1] = (nv >> 8) & 0xFF;
+        if (write_sec(m, sec, b) != 0)
+          return -1;
+      }
+    }
+  }
+  return 0;
 }
 
-/* Reserve a free cluster (marks it end-of-chain). Returns 0 if the disk is full. */
+/* Reserve a free cluster (marks it end-of-chain). Returns 0 if the disk is
+ * full. */
 static uint32_t fat_alloc(struct fat_mount *m)
 {
-	for (uint32_t c = 2; c < m->total_clusters + 2; c++) {
-		if (fat_next(m, c) == 0) {            /* 0 == free */
-			if (fat_set(m, c, eoc_value(m)) != 0)
-				return 0;
-			return c;
-		}
-	}
-	return 0;
+  for (uint32_t c = 2; c < m->total_clusters + 2; c++) {
+    if (fat_next(m, c) == 0) { /* 0 == free */
+      if (fat_set(m, c, eoc_value(m)) != 0)
+        return 0;
+      return c;
+    }
+  }
+  return 0;
 }
 
 /* Free an entire cluster chain. */
 static void fat_free_chain(struct fat_mount *m, uint32_t c)
 {
-	uint32_t guard = 0;
-	while (c >= 2 && c != BAD_CLUSTER && !is_eoc(m, c) && guard++ < m->total_clusters + 2) {
-		uint32_t next = fat_next(m, c);
-		fat_set(m, c, 0);
-		c = next;
-	}
+  uint32_t guard = 0;
+  while (c >= 2 && c != BAD_CLUSTER && !is_eoc(m, c) && guard++ < m->total_clusters + 2) {
+    uint32_t next = fat_next(m, c);
+    fat_set(m, c, 0);
+    c = next;
+  }
 }
 
 static int zero_cluster(struct fat_mount *m, uint32_t c)
 {
-	uint8_t z[512];
-	memset(z, 0, 512);
-	uint32_t first = cluster_first_sector(m, c);
-	for (uint32_t s = 0; s < m->sec_per_clus; s++)
-		if (write_sec(m, first + s, z) != 0)
-			return -1;
-	return 0;
+  uint8_t z[512];
+  memset(z, 0, 512);
+  uint32_t first = cluster_first_sector(m, c);
+  for (uint32_t s = 0; s < m->sec_per_clus; s++)
+    if (write_sec(m, first + s, z) != 0)
+      return -1;
+  return 0;
 }
 
 /* ---- directory-entry writing ---- */
 
 static char up_clean(char c)
 {
-	if (c >= 'a' && c <= 'z') return (char)(c - 32);
-	if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
-	for (const char *ok = "!#$%&'()-@^_`{}~"; *ok; ok++)
-		if (*ok == c) return c;
-	return '_';                          /* map anything else to underscore */
+  if (c >= 'a' && c <= 'z')
+    return (char)(c - 32);
+  if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+    return c;
+  for (const char *ok = "!#$%&'()-@^_`{}~"; *ok; ok++)
+    if (*ok == c)
+      return c;
+  return '_'; /* map anything else to underscore */
 }
 
 /* Build a space-padded 11-byte 8.3 name from a path component. */
 static void make_83(const char *leaf, uint8_t out[11])
 {
-	for (int i = 0; i < 11; i++) out[i] = ' ';
-	int len = 0; while (leaf[len]) len++;
-	int dot = -1;
-	for (int i = len - 1; i > 0; i--)
-		if (leaf[i] == '.') { dot = i; break; }
-	int blen = (dot < 0) ? len : dot;
-	int o = 0;
-	for (int i = 0; i < blen && o < 8; i++) {
-		if (leaf[i] == '.' || leaf[i] == ' ') continue;
-		out[o++] = up_clean(leaf[i]);
-	}
-	if (dot >= 0) {
-		int e = 0;
-		for (int i = dot + 1; leaf[i] && e < 3; i++)
-			out[8 + e++] = up_clean(leaf[i]);
-	}
-	if (out[0] == ' ') out[0] = '_';     /* never an empty base */
+  for (int i = 0; i < 11; i++)
+    out[i] = ' ';
+  int len = 0;
+  while (leaf[len])
+    len++;
+  int dot = -1;
+  for (int i = len - 1; i > 0; i--)
+    if (leaf[i] == '.') {
+      dot = i;
+      break;
+    }
+  int blen = (dot < 0) ? len : dot;
+  int o = 0;
+  for (int i = 0; i < blen && o < 8; i++) {
+    if (leaf[i] == '.' || leaf[i] == ' ')
+      continue;
+    out[o++] = up_clean(leaf[i]);
+  }
+  if (dot >= 0) {
+    int e = 0;
+    for (int i = dot + 1; leaf[i] && e < 3; i++)
+      out[8 + e++] = up_clean(leaf[i]);
+  }
+  if (out[0] == ' ')
+    out[0] = '_'; /* never an empty base */
 }
 
 static int rec83_eq(const uint8_t *e, const uint8_t name[11])
 {
-	for (int i = 0; i < 11; i++)
-		if (e[i] != name[i]) return 0;
-	return 1;
+  for (int i = 0; i < 11; i++)
+    if (e[i] != name[i])
+      return 0;
+  return 1;
 }
 
 /* 1 if a record with this exact 8.3 name already exists in the directory. */
 static int dir_has_83(struct fat_mount *m, uint32_t dir_cluster, const uint8_t name[11])
 {
-	struct dir_iter it;
-	const uint8_t *e;
-	diter_init(m, &it, dir_cluster);
-	while ((e = diter_next(m, &it))) {
-		uint8_t a = e[11];
-		if (a == 0x0F || (a & 0x08)) continue;
-		if (rec83_eq(e, name)) return 1;
-	}
-	return 0;
+  struct dir_iter it;
+  const uint8_t *e;
+  diter_init(m, &it, dir_cluster);
+  while ((e = diter_next(m, &it))) {
+    uint8_t a = e[11];
+    if (a == 0x0F || (a & 0x08))
+      continue;
+    if (rec83_eq(e, name))
+      return 1;
+  }
+  return 0;
 }
 
-/* Make `name` unique within the directory by appending ~1..~9 if it collides. */
+/* Make `name` unique within the directory by appending ~1..~9 if it collides.
+ */
 static void unique_83(struct fat_mount *m, uint32_t dir_cluster, uint8_t name[11])
 {
-	if (!dir_has_83(m, dir_cluster, name))
-		return;
-	int base = 0;
-	while (base < 8 && name[base] != ' ') base++;
-	int pos = base > 6 ? 6 : base;       /* leave room for "~N" */
-	for (int n = 1; n <= 9; n++) {
-		uint8_t cand[11];
-		for (int i = 0; i < 11; i++) cand[i] = name[i];
-		cand[pos] = '~'; cand[pos + 1] = (uint8_t)('0' + n);
-		for (int i = pos + 2; i < 8; i++) cand[i] = ' ';
-		if (!dir_has_83(m, dir_cluster, cand)) {
-			for (int i = 0; i < 11; i++) name[i] = cand[i];
-			return;
-		}
-	}
+  if (!dir_has_83(m, dir_cluster, name))
+    return;
+  int base = 0;
+  while (base < 8 && name[base] != ' ')
+    base++;
+  int pos = base > 6 ? 6 : base; /* leave room for "~N" */
+  for (int n = 1; n <= 9; n++) {
+    uint8_t cand[11];
+    for (int i = 0; i < 11; i++)
+      cand[i] = name[i];
+    cand[pos] = '~';
+    cand[pos + 1] = (uint8_t)('0' + n);
+    for (int i = pos + 2; i < 8; i++)
+      cand[i] = ' ';
+    if (!dir_has_83(m, dir_cluster, cand)) {
+      for (int i = 0; i < 11; i++)
+        name[i] = cand[i];
+      return;
+    }
+  }
 }
 
 /* Find a free directory slot, extending a cluster-chain directory if full.
  * Returns the (volume-relative) sector and byte offset of the slot. */
-static int dir_alloc_slot(struct fat_mount *m, uint32_t dir_cluster,
-                          uint32_t *out_sec, uint32_t *out_off)
+static int dir_alloc_slot(struct fat_mount *m, uint32_t dir_cluster, uint32_t *out_sec, uint32_t *out_off)
 {
-	const uint32_t per_sec = 512 / 32;
+  const uint32_t per_sec = 512 / 32;
 
-	if (dir_cluster == 0) {              /* fixed FAT12/16 root */
-		uint32_t base = m->reserved + m->num_fats * m->fat_sectors;
-		for (uint32_t s = 0; s < m->root_sectors; s++) {
-			const uint8_t *sec;
-			if (read_sec(m, base + s, &sec) != 0) return -1;
-			for (uint32_t i = 0; i < per_sec; i++)
-				if (sec[i * 32] == 0x00 || sec[i * 32] == 0xE5) {
-					*out_sec = base + s; *out_off = i * 32; return 0;
-				}
-		}
-		return -1;                       /* root directory full */
-	}
+  if (dir_cluster == 0) { /* fixed FAT12/16 root */
+    uint32_t base = m->reserved + m->num_fats * m->fat_sectors;
+    for (uint32_t s = 0; s < m->root_sectors; s++) {
+      const uint8_t *sec;
+      if (read_sec(m, base + s, &sec) != 0)
+        return -1;
+      for (uint32_t i = 0; i < per_sec; i++)
+        if (sec[i * 32] == 0x00 || sec[i * 32] == 0xE5) {
+          *out_sec = base + s;
+          *out_off = i * 32;
+          return 0;
+        }
+    }
+    return -1; /* root directory full */
+  }
 
-	uint32_t c = dir_cluster, prev = 0, guard = 0;
-	while (c >= 2 && c != BAD_CLUSTER && !is_eoc(m, c) &&
-	       guard++ < m->total_clusters + 2) {   /* cap hops on a cyclic chain */
-		uint32_t first = cluster_first_sector(m, c);
-		for (uint32_t s = 0; s < m->sec_per_clus; s++) {
-			const uint8_t *sec;
-			if (read_sec(m, first + s, &sec) != 0) return -1;
-			for (uint32_t i = 0; i < per_sec; i++)
-				if (sec[i * 32] == 0x00 || sec[i * 32] == 0xE5) {
-					*out_sec = first + s; *out_off = i * 32; return 0;
-				}
-		}
-		prev = c;
-		c = fat_next(m, c);
-	}
-	/* No free slot anywhere: append a fresh, zeroed cluster to the chain. */
-	uint32_t nc = fat_alloc(m);
-	if (!nc) return -1;
-	if (zero_cluster(m, nc) != 0 || fat_set(m, prev, nc) != 0) { fat_free_chain(m, nc); return -1; }
-	*out_sec = cluster_first_sector(m, nc); *out_off = 0;
-	return 0;
+  uint32_t c = dir_cluster, prev = 0, guard = 0;
+  while (c >= 2 && c != BAD_CLUSTER && !is_eoc(m, c) &&
+         guard++ < m->total_clusters + 2) { /* cap hops on a cyclic chain */
+    uint32_t first = cluster_first_sector(m, c);
+    for (uint32_t s = 0; s < m->sec_per_clus; s++) {
+      const uint8_t *sec;
+      if (read_sec(m, first + s, &sec) != 0)
+        return -1;
+      for (uint32_t i = 0; i < per_sec; i++)
+        if (sec[i * 32] == 0x00 || sec[i * 32] == 0xE5) {
+          *out_sec = first + s;
+          *out_off = i * 32;
+          return 0;
+        }
+    }
+    prev = c;
+    c = fat_next(m, c);
+  }
+  /* No free slot anywhere: append a fresh, zeroed cluster to the chain. */
+  uint32_t nc = fat_alloc(m);
+  if (!nc)
+    return -1;
+  if (zero_cluster(m, nc) != 0 || fat_set(m, prev, nc) != 0) {
+    fat_free_chain(m, nc);
+    return -1;
+  }
+  *out_sec = cluster_first_sector(m, nc);
+  *out_off = 0;
+  return 0;
 }
 
-static void fill_entry(uint8_t *e, const uint8_t name[11], uint8_t attr,
-                       uint32_t cluster, uint32_t size)
+static void fill_entry(uint8_t *e, const uint8_t name[11], uint8_t attr, uint32_t cluster, uint32_t size)
 {
-	for (int i = 0; i < 11; i++) e[i] = name[i];
-	e[11] = attr;
-	for (int i = 12; i < 32; i++) e[i] = 0;
-	e[20] = (cluster >> 16) & 0xFF; e[21] = (cluster >> 24) & 0xFF;  /* hi word */
-	e[26] = cluster & 0xFF;         e[27] = (cluster >> 8) & 0xFF;   /* lo word */
-	e[28] = size & 0xFF;       e[29] = (size >> 8) & 0xFF;
-	e[30] = (size >> 16) & 0xFF; e[31] = (size >> 24) & 0xFF;
+  for (int i = 0; i < 11; i++)
+    e[i] = name[i];
+  e[11] = attr;
+  for (int i = 12; i < 32; i++)
+    e[i] = 0;
+  e[20] = (cluster >> 16) & 0xFF;
+  e[21] = (cluster >> 24) & 0xFF; /* hi word */
+  e[26] = cluster & 0xFF;
+  e[27] = (cluster >> 8) & 0xFF; /* lo word */
+  e[28] = size & 0xFF;
+  e[29] = (size >> 8) & 0xFF;
+  e[30] = (size >> 16) & 0xFF;
+  e[31] = (size >> 24) & 0xFF;
 }
 
-static int dir_write_entry(struct fat_mount *m, uint32_t sec, uint32_t off,
-                           const uint8_t name[11], uint8_t attr,
+static int dir_write_entry(struct fat_mount *m, uint32_t sec, uint32_t off, const uint8_t name[11], uint8_t attr,
                            uint32_t cluster, uint32_t size)
 {
-	uint8_t b[512];
-	if (read_secbuf(m, sec, b) != 0) return -1;
-	fill_entry(b + off, name, attr, cluster, size);
-	return write_sec(m, sec, b);
+  uint8_t b[512];
+  if (read_secbuf(m, sec, b) != 0)
+    return -1;
+  fill_entry(b + off, name, attr, cluster, size);
+  return write_sec(m, sec, b);
 }
 
 /* Stamp a record's first byte 0xE5 (deleted). */
 static int wipe_record(struct fat_mount *m, uint32_t sec, uint32_t off)
 {
-	uint8_t b[512];
-	if (read_secbuf(m, sec, b) != 0) return -1;
-	b[off] = 0xE5;
-	return write_sec(m, sec, b);
+  uint8_t b[512];
+  if (read_secbuf(m, sec, b) != 0)
+    return -1;
+  b[off] = 0xE5;
+  return write_sec(m, sec, b);
 }
 
 /* Split `path` into its parent directory (resolved to a cluster; *is_root set
  * if the parent is the volume root) and the final component `leaf`. */
-static int split_parent(struct fat_mount *m, const char *path, uint32_t *pcluster,
-                        int *is_root, char *leaf, int cap)
+static int split_parent(struct fat_mount *m, const char *path, uint32_t *pcluster, int *is_root, char *leaf, int cap)
 {
-	while (*path == '/') path++;
-	if (!*path) return -1;
+  while (*path == '/')
+    path++;
+  if (!*path)
+    return -1;
 
-	const char *last = path, *p = path;
-	while (*p) { if (*p == '/' && p[1] && p[1] != '/') last = p + 1; p++; }
+  const char *last = path, *p = path;
+  while (*p) {
+    if (*p == '/' && p[1] && p[1] != '/')
+      last = p + 1;
+    p++;
+  }
 
-	int n = 0;
-	for (const char *q = last; *q; q++) {
-		if (*q == '/') return -1;        /* trailing slash -> not a leaf */
-		if (n >= cap - 1) return -1;
-		leaf[n++] = *q;
-	}
-	leaf[n] = '\0';
-	if (n == 0) return -1;
+  int n = 0;
+  for (const char *q = last; *q; q++) {
+    if (*q == '/')
+      return -1; /* trailing slash -> not a leaf */
+    if (n >= cap - 1)
+      return -1;
+    leaf[n++] = *q;
+  }
+  leaf[n] = '\0';
+  if (n == 0)
+    return -1;
 
-	char pbuf[256];
-	int pl = 0;
-	for (const char *q = path; q < last && pl < 255; q++) pbuf[pl++] = *q;
-	pbuf[pl] = '\0';
-	while (pl > 0 && pbuf[pl - 1] == '/') pbuf[--pl] = '\0';
+  char pbuf[256];
+  int pl = 0;
+  for (const char *q = path; q < last && pl < 255; q++)
+    pbuf[pl++] = *q;
+  pbuf[pl] = '\0';
+  while (pl > 0 && pbuf[pl - 1] == '/')
+    pbuf[--pl] = '\0';
 
-	struct dirent pd;
-	if (resolve(m, pbuf, &pd) != 0 || !pd.is_dir) return -1;
-	*pcluster = pd.cluster;
-	*is_root  = (pbuf[0] == '\0');
-	return 0;
+  struct dirent pd;
+  if (resolve(m, pbuf, &pd) != 0 || !pd.is_dir)
+    return -1;
+  *pcluster = pd.cluster;
+  *is_root = (pbuf[0] == '\0');
+  return 0;
 }
 
 static int fat_delete(struct fat_mount *m, const char *path);
 
-static int fat_create(struct fat_mount *m, const char *path, const void *data,
-                      uint32_t size)
+static int fat_create(struct fat_mount *m, const char *path, const void *data, uint32_t size)
 {
-	if (m->kind == FAT_NONE || !m->write) return -2;
+  if (m->kind == FAT_NONE || !m->write)
+    return -2;
 
-	struct dirent ex;                    /* overwrite an existing file */
-	if (resolve(m, path, &ex) == 0) {
-		if (ex.is_dir) return -1;
-		if (fat_delete(m, path) != 0) return -1;
-	}
+  struct dirent ex; /* overwrite an existing file */
+  if (resolve(m, path, &ex) == 0) {
+    if (ex.is_dir)
+      return -1;
+    if (fat_delete(m, path) != 0)
+      return -1;
+  }
 
-	uint32_t pcluster; int is_root; char leaf[256];
-	if (split_parent(m, path, &pcluster, &is_root, leaf, sizeof leaf) != 0)
-		return -1;
+  uint32_t pcluster;
+  int is_root;
+  char leaf[256];
+  if (split_parent(m, path, &pcluster, &is_root, leaf, sizeof leaf) != 0)
+    return -1;
 
-	/* Allocate and fill the data cluster chain. */
-	uint32_t first = 0, prev = 0, written = 0;
-	const uint8_t *src = data;
-	while (written < size) {
-		uint32_t c = fat_alloc(m);
-		if (!c) { fat_free_chain(m, first); return -1; }
-		if (first == 0) first = c;
-		else if (fat_set(m, prev, c) != 0) { fat_free_chain(m, first); return -1; }
+  /* Allocate and fill the data cluster chain. */
+  uint32_t first = 0, prev = 0, written = 0;
+  const uint8_t *src = data;
+  while (written < size) {
+    uint32_t c = fat_alloc(m);
+    if (!c) {
+      fat_free_chain(m, first);
+      return -1;
+    }
+    if (first == 0)
+      first = c;
+    else if (fat_set(m, prev, c) != 0) {
+      fat_free_chain(m, first);
+      return -1;
+    }
 
-		uint32_t fsec = cluster_first_sector(m, c);
-		for (uint32_t s = 0; s < m->sec_per_clus && written < size; s++) {
-			uint8_t b[512];
-			memset(b, 0, 512);
-			uint32_t chunk = size - written < 512 ? size - written : 512;
-			memcpy(b, src + written, chunk);
-			if (write_sec(m, fsec + s, b) != 0) { fat_free_chain(m, first); return -1; }
-			written += chunk;
-		}
-		prev = c;
-	}
+    uint32_t fsec = cluster_first_sector(m, c);
+    for (uint32_t s = 0; s < m->sec_per_clus && written < size; s++) {
+      uint8_t b[512];
+      memset(b, 0, 512);
+      uint32_t chunk = size - written < 512 ? size - written : 512;
+      memcpy(b, src + written, chunk);
+      if (write_sec(m, fsec + s, b) != 0) {
+        fat_free_chain(m, first);
+        return -1;
+      }
+      written += chunk;
+    }
+    prev = c;
+  }
 
-	uint8_t name[11];
-	make_83(leaf, name);
-	unique_83(m, pcluster, name);
+  uint8_t name[11];
+  make_83(leaf, name);
+  unique_83(m, pcluster, name);
 
-	uint32_t sec, off;
-	if (dir_alloc_slot(m, pcluster, &sec, &off) != 0) { fat_free_chain(m, first); return -1; }
-	if (dir_write_entry(m, sec, off, name, 0x20, first, size) != 0) {
-		fat_free_chain(m, first); return -1;
-	}
-	return 0;
+  uint32_t sec, off;
+  if (dir_alloc_slot(m, pcluster, &sec, &off) != 0) {
+    fat_free_chain(m, first);
+    return -1;
+  }
+  if (dir_write_entry(m, sec, off, name, 0x20, first, size) != 0) {
+    fat_free_chain(m, first);
+    return -1;
+  }
+  return 0;
 }
 
 static int fat_delete(struct fat_mount *m, const char *path)
 {
-	if (m->kind == FAT_NONE || !m->write) return -2;
+  if (m->kind == FAT_NONE || !m->write)
+    return -2;
 
-	uint32_t pcluster; int is_root; char leaf[256];
-	if (split_parent(m, path, &pcluster, &is_root, leaf, sizeof leaf) != 0)
-		return -1;
+  uint32_t pcluster;
+  int is_root;
+  char leaf[256];
+  if (split_parent(m, path, &pcluster, &is_root, leaf, sizeof leaf) != 0)
+    return -1;
 
-	uint32_t ll = 0; while (leaf[ll]) ll++;
-	struct dir_iter it; struct dirent d;
-	diter_init(m, &it, pcluster);
-	int found = 0;
-	while (dir_read(m, &it, &d))
-		if (name_eq(d.name, leaf, ll)) { found = 1; break; }
-	if (!found) return -1;
-	if (d.is_dir) return -3;             /* a directory -> fat_rmdir */
+  uint32_t ll = 0;
+  while (leaf[ll])
+    ll++;
+  struct dir_iter it;
+  struct dirent d;
+  diter_init(m, &it, pcluster);
+  int found = 0;
+  while (dir_read(m, &it, &d))
+    if (name_eq(d.name, leaf, ll)) {
+      found = 1;
+      break;
+    }
+  if (!found)
+    return -1;
+  if (d.is_dir)
+    return -3; /* a directory -> fat_rmdir */
 
-	if (d.cluster >= 2) fat_free_chain(m, d.cluster);
-	for (int i = 0; i < d.loc_n; i++)
-		wipe_record(m, d.loc_lba[i], d.loc_off[i]);
-	return 0;
+  if (d.cluster >= 2)
+    fat_free_chain(m, d.cluster);
+  for (int i = 0; i < d.loc_n; i++)
+    wipe_record(m, d.loc_lba[i], d.loc_off[i]);
+  return 0;
 }
 
 static int fat_mkdir(struct fat_mount *m, const char *path)
 {
-	if (m->kind == FAT_NONE || !m->write) return -2;
+  if (m->kind == FAT_NONE || !m->write)
+    return -2;
 
-	struct dirent ex;
-	if (resolve(m, path, &ex) == 0) return -1;   /* already exists */
+  struct dirent ex;
+  if (resolve(m, path, &ex) == 0)
+    return -1; /* already exists */
 
-	uint32_t pcluster; int is_root; char leaf[256];
-	if (split_parent(m, path, &pcluster, &is_root, leaf, sizeof leaf) != 0)
-		return -1;
+  uint32_t pcluster;
+  int is_root;
+  char leaf[256];
+  if (split_parent(m, path, &pcluster, &is_root, leaf, sizeof leaf) != 0)
+    return -1;
 
-	uint32_t dc = fat_alloc(m);
-	if (!dc) return -1;
-	if (zero_cluster(m, dc) != 0) { fat_free_chain(m, dc); return -1; }
+  uint32_t dc = fat_alloc(m);
+  if (!dc)
+    return -1;
+  if (zero_cluster(m, dc) != 0) {
+    fat_free_chain(m, dc);
+    return -1;
+  }
 
-	/* "." -> self, ".." -> parent (0 when the parent is the root). */
-	uint8_t dot[11], dotdot[11];
-	for (int i = 0; i < 11; i++) { dot[i] = ' '; dotdot[i] = ' '; }
-	dot[0] = '.'; dotdot[0] = '.'; dotdot[1] = '.';
-	uint8_t b[512];
-	memset(b, 0, 512);
-	fill_entry(b + 0,  dot,    0x10, dc, 0);
-	fill_entry(b + 32, dotdot, 0x10, is_root ? 0 : pcluster, 0);
-	if (write_sec(m, cluster_first_sector(m, dc), b) != 0) { fat_free_chain(m, dc); return -1; }
+  /* "." -> self, ".." -> parent (0 when the parent is the root). */
+  uint8_t dot[11], dotdot[11];
+  for (int i = 0; i < 11; i++) {
+    dot[i] = ' ';
+    dotdot[i] = ' ';
+  }
+  dot[0] = '.';
+  dotdot[0] = '.';
+  dotdot[1] = '.';
+  uint8_t b[512];
+  memset(b, 0, 512);
+  fill_entry(b + 0, dot, 0x10, dc, 0);
+  fill_entry(b + 32, dotdot, 0x10, is_root ? 0 : pcluster, 0);
+  if (write_sec(m, cluster_first_sector(m, dc), b) != 0) {
+    fat_free_chain(m, dc);
+    return -1;
+  }
 
-	uint8_t name[11];
-	make_83(leaf, name);
-	unique_83(m, pcluster, name);
+  uint8_t name[11];
+  make_83(leaf, name);
+  unique_83(m, pcluster, name);
 
-	uint32_t sec, off;
-	if (dir_alloc_slot(m, pcluster, &sec, &off) != 0) { fat_free_chain(m, dc); return -1; }
-	if (dir_write_entry(m, sec, off, name, 0x10, dc, 0) != 0) { fat_free_chain(m, dc); return -1; }
-	return 0;
+  uint32_t sec, off;
+  if (dir_alloc_slot(m, pcluster, &sec, &off) != 0) {
+    fat_free_chain(m, dc);
+    return -1;
+  }
+  if (dir_write_entry(m, sec, off, name, 0x10, dc, 0) != 0) {
+    fat_free_chain(m, dc);
+    return -1;
+  }
+  return 0;
 }
 
 static int fat_rmdir(struct fat_mount *m, const char *path)
 {
-	if (m->kind == FAT_NONE || !m->write) return -2;
+  if (m->kind == FAT_NONE || !m->write)
+    return -2;
 
-	struct dirent d;
-	if (resolve(m, path, &d) != 0) return -1;
-	if (!d.is_dir) return -2;
+  struct dirent d;
+  if (resolve(m, path, &d) != 0)
+    return -1;
+  if (!d.is_dir)
+    return -2;
 
-	struct dir_iter it; struct dirent e;
-	diter_init(m, &it, d.cluster);
-	while (dir_read(m, &it, &e)) {           /* must be empty but for "." / ".." */
-		if (e.name[0] == '.' &&
-		    (e.name[1] == '\0' || (e.name[1] == '.' && e.name[2] == '\0')))
-			continue;
-		return -3;                        /* not empty */
-	}
+  struct dir_iter it;
+  struct dirent e;
+  diter_init(m, &it, d.cluster);
+  while (dir_read(m, &it, &e)) { /* must be empty but for "." / ".." */
+    if (e.name[0] == '.' && (e.name[1] == '\0' || (e.name[1] == '.' && e.name[2] == '\0')))
+      continue;
+    return -3; /* not empty */
+  }
 
-	uint32_t pcluster; int is_root; char leaf[256];
-	if (split_parent(m, path, &pcluster, &is_root, leaf, sizeof leaf) != 0)
-		return -1;
-	uint32_t ll = 0; while (leaf[ll]) ll++;
-	struct dir_iter pit; struct dirent pd;
-	diter_init(m, &pit, pcluster);
-	int found = 0;
-	while (dir_read(m, &pit, &pd))
-		if (name_eq(pd.name, leaf, ll)) { found = 1; break; }
-	if (!found) return -1;
+  uint32_t pcluster;
+  int is_root;
+  char leaf[256];
+  if (split_parent(m, path, &pcluster, &is_root, leaf, sizeof leaf) != 0)
+    return -1;
+  uint32_t ll = 0;
+  while (leaf[ll])
+    ll++;
+  struct dir_iter pit;
+  struct dirent pd;
+  diter_init(m, &pit, pcluster);
+  int found = 0;
+  while (dir_read(m, &pit, &pd))
+    if (name_eq(pd.name, leaf, ll)) {
+      found = 1;
+      break;
+    }
+  if (!found)
+    return -1;
 
-	if (pd.cluster >= 2) fat_free_chain(m, pd.cluster);
-	for (int i = 0; i < pd.loc_n; i++)
-		wipe_record(m, pd.loc_lba[i], pd.loc_off[i]);
-	return 0;
+  if (pd.cluster >= 2)
+    fat_free_chain(m, pd.cluster);
+  for (int i = 0; i < pd.loc_n; i++)
+    wipe_record(m, pd.loc_lba[i], pd.loc_off[i]);
+  return 0;
 }
 
 /* ----------------------------------------------------------------- probe + ops
@@ -1114,94 +1254,76 @@ static int fat_rmdir(struct fat_mount *m, const char *path)
 
 static void *fat_probe(blk_read_fn read, blk_write_fn write)
 {
-	struct fat_mount *m = kmalloc(sizeof *m);
-	if (!m)
-		return NULL;
+  struct fat_mount *m = kmalloc(sizeof *m);
+  if (!m)
+    return NULL;
 
-	if (fat_mount_at(m, read, write, 0) == 0)    /* whole disk: BPB at LBA 0 */
-		return m;
+  if (fat_mount_at(m, read, write, 0) == 0) /* whole disk: BPB at LBA 0 */
+    return m;
 
-	/* Otherwise look for an MBR partition table and try each FAT partition. */
-	uint8_t mbr[512];
-	if (read && read(0, mbr) == 0 && load_le16(mbr + 510) == 0xAA55) {
-		for (int i = 0; i < 4; i++) {
-			const uint8_t *p = mbr + 446 + i * 16;
-			uint8_t type = p[4];
-			uint32_t lba = load_le32(p + 8);
-			if (type == 0x00 || lba == 0)
-				continue;
-			/* 0x01 FAT12, 0x04/0x06 FAT16, 0x0B/0x0C FAT32, 0x0E FAT16 LBA */
-			if (type == 0x01 || type == 0x04 || type == 0x06 || type == 0x0B ||
-			    type == 0x0C || type == 0x0E) {
-				if (fat_mount_at(m, read, write, lba) == 0)
-					return m;
-			}
-		}
-	}
+  /* Otherwise look for an MBR partition table and try each FAT partition. */
+  uint8_t mbr[512];
+  if (read && read(0, mbr) == 0 && load_le16(mbr + 510) == 0xAA55) {
+    for (int i = 0; i < 4; i++) {
+      const uint8_t *p = mbr + 446 + i * 16;
+      uint8_t type = p[4];
+      uint32_t lba = load_le32(p + 8);
+      if (type == 0x00 || lba == 0)
+        continue;
+      /* 0x01 FAT12, 0x04/0x06 FAT16, 0x0B/0x0C FAT32, 0x0E FAT16 LBA */
+      if (type == 0x01 || type == 0x04 || type == 0x06 || type == 0x0B || type == 0x0C || type == 0x0E) {
+        if (fat_mount_at(m, read, write, lba) == 0)
+          return m;
+      }
+    }
+  }
 
-	kfree(m);
-	return NULL;
+  kfree(m);
+  return NULL;
 }
 
-static void fat_close(void *inst)
-{
-	kfree(inst);
-}
+static void fat_close(void *inst) { kfree(inst); }
 
 /* ---- fs_ops wrappers: cast void *inst to struct fat_mount *. ---- */
 
 static const char *fat_op_label(void *inst) { return fat_label((struct fat_mount *)inst); }
-static const char *fat_op_type(void *inst)  { return fat_type((struct fat_mount *)inst); }
+static const char *fat_op_type(void *inst) { return fat_type((struct fat_mount *)inst); }
 
-static int fat_op_list(void *inst, const char *path)
-{
-	return fat_list((struct fat_mount *)inst, path);
-}
+static int fat_op_list(void *inst, const char *path) { return fat_list((struct fat_mount *)inst, path); }
 static int fat_op_stat(void *inst, const char *path, int *is_dir, uint32_t *size)
 {
-	return fat_stat((struct fat_mount *)inst, path, is_dir, size);
+  return fat_stat((struct fat_mount *)inst, path, is_dir, size);
 }
-static int fat_op_read_at(void *inst, const char *path, uint32_t off, void *buf,
-                          uint32_t len)
+static int fat_op_read_at(void *inst, const char *path, uint32_t off, void *buf, uint32_t len)
 {
-	return fat_read_at((struct fat_mount *)inst, path, off, buf, len);
+  return fat_read_at((struct fat_mount *)inst, path, off, buf, len);
 }
-static int fat_op_enum_dir(void *inst, const char *path, int idx, char *name,
-                           int *is_dir, uint32_t *size)
+static int fat_op_enum_dir(void *inst, const char *path, int idx, char *name, int *is_dir, uint32_t *size)
 {
-	return fat_enum_dir((struct fat_mount *)inst, path, idx, name, is_dir, size);
+  return fat_enum_dir((struct fat_mount *)inst, path, idx, name, is_dir, size);
 }
 static int fat_op_create(void *inst, const char *path, const void *data, uint32_t size)
 {
-	return fat_create((struct fat_mount *)inst, path, data, size);
+  return fat_create((struct fat_mount *)inst, path, data, size);
 }
-static int fat_op_del(void *inst, const char *path)
-{
-	return fat_delete((struct fat_mount *)inst, path);
-}
-static int fat_op_mkdir(void *inst, const char *path)
-{
-	return fat_mkdir((struct fat_mount *)inst, path);
-}
-static int fat_op_rmdir(void *inst, const char *path)
-{
-	return fat_rmdir((struct fat_mount *)inst, path);
-}
+static int fat_op_del(void *inst, const char *path) { return fat_delete((struct fat_mount *)inst, path); }
+static int fat_op_mkdir(void *inst, const char *path) { return fat_mkdir((struct fat_mount *)inst, path); }
+static int fat_op_rmdir(void *inst, const char *path) { return fat_rmdir((struct fat_mount *)inst, path); }
 
 static const struct fs_ops fat_fs_ops = {
-	.fsname   = "FAT",
-	.probe    = fat_probe,
-	.close    = fat_close,
-	.label    = fat_op_label,
-	.type     = fat_op_type,
-	.list     = fat_op_list,
-	.stat     = fat_op_stat,
-	.read_at  = fat_op_read_at,
-	.enum_dir = fat_op_enum_dir,
-	.create   = fat_op_create,
-	.del      = fat_op_del,
-	.mkdir    = fat_op_mkdir,
-	.rmdir    = fat_op_rmdir,
+    .fsname = "FAT",
+    .probe = fat_probe,
+    .close = fat_close,
+    .label = fat_op_label,
+    .type = fat_op_type,
+    .list = fat_op_list,
+    .stat = fat_op_stat,
+    .read_at = fat_op_read_at,
+    .enum_dir = fat_op_enum_dir,
+    .create = fat_op_create,
+    .del = fat_op_del,
+    .mkdir = fat_op_mkdir,
+    .rmdir = fat_op_rmdir,
 };
 
 const struct fs_ops *fat_ops(void) { return &fat_fs_ops; }

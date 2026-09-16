@@ -26,8 +26,8 @@ int edid_height(void);
 
 /* The attached monitor's brand+model decoded from EDID ("<brand> <model>", e.g.
  * "Dell U2412M"), written NUL-terminated into out; "" if no EDID was read. The
- * model half (the 0xFC monitor-name descriptor) is optional, so a bare panel may
- * yield brand only. Shares the one-shot probe. */
+ * model half (the 0xFC monitor-name descriptor) is optional, so a bare panel
+ * may yield brand only. Shares the one-shot probe. */
 void edid_model(char *out, int len);
 
 /* 1 if the display's PNP manufacturer id belongs to a known laptop-panel vendor

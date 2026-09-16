@@ -16,11 +16,11 @@ int fb_init(uint32_t want_w, uint32_t want_h);
  * on real hardware, where we cannot drive the GPU to set a mode ourselves. */
 int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32_t bpp);
 
-int      fb_active(void);          /* 1 once a graphics mode is up            */
+int fb_active(void); /* 1 once a graphics mode is up            */
 uint32_t fb_width(void);
 uint32_t fb_height(void);
-uint32_t *fb_ptr(void);            /* the back buffer drawing primitives target */
-uint32_t fb_pitch_pixels(void);    /* back buffer row stride in pixels (>= width) */
+uint32_t *fb_ptr(void);         /* the back buffer drawing primitives target */
+uint32_t fb_pitch_pixels(void); /* back buffer row stride in pixels (>= width) */
 
 /* Phase-1 primitives for a user-space compositor (SYS_FB_*). fb_backbuffer_phys
  * is the physical base of the cached-RAM back buffer (0 in text/single-buffered
@@ -30,21 +30,21 @@ uint32_t fb_pitch_pixels(void);    /* back buffer row stride in pixels (>= width
  * present), keeping the WC/SVGA logic in ring 0. */
 uint32_t fb_backbuffer_phys(void);
 uint32_t fb_backbuffer_bytes(void);
-void     fb_dims(int *w, int *h, int *pitch, int *bpp);
-void     fb_present_rect(int x, int y, int w, int h);
+void fb_dims(int *w, int *h, int *pitch, int *bpp);
+void fb_present_rect(int x, int y, int w, int h);
 
 /* Compositor frame-pacing target in Hz — the software present cadence, not a
  * hardware mode. Tunable through /sys/class/graphics/fb0/rate and read by
  * /bin/compositor to pace its loop; fb_set_target_hz clamps to a sane band. */
-int      fb_target_hz(void);
-void     fb_set_target_hz(int hz);
+int fb_target_hz(void);
+void fb_set_target_hz(int hz);
 
 /* Runtime resolution switching, available only on the DISPI path (fb_init): we
  * can reprogram QEMU's std-vga adapter, but a framebuffer adopted from a
  * bootloader (fb_adopt: GRUB/UEFI GOP) is fixed and fb_can_set_mode returns 0.
- * fb_mode_get enumerates the offered modes (all <= the capacity mapped at init);
- * fb_set_mode reprograms to one of them and returns 0, or -1 if the mode is
- * unknown / mode-setting is unsupported. Must be called from the compositor
+ * fb_mode_get enumerates the offered modes (all <= the capacity mapped at
+ * init); fb_set_mode reprograms to one of them and returns 0, or -1 if the mode
+ * is unknown / mode-setting is unsupported. Must be called from the compositor
  * thread — it reshapes the buffers the WM draws into. */
 int fb_can_set_mode(void);
 int fb_mode_count(void);
@@ -59,21 +59,22 @@ void fb_present(void);
 
 /* Register a callback invoked by fb_present (and the full-screen redraw paths)
  * with the rectangle that was just copied to the visible framebuffer, in screen
- * pixels. A paravirtual adapter that needs an explicit "flush this region to the
- * host" message — VMware SVGA II — uses this; pass NULL to clear it. A plain
- * LFB (QEMU DISPI, GRUB/UEFI adopt) needs no hook and leaves it unset. */
+ * pixels. A paravirtual adapter that needs an explicit "flush this region to
+ * the host" message — VMware SVGA II — uses this; pass NULL to clear it. A
+ * plain LFB (QEMU DISPI, GRUB/UEFI adopt) needs no hook and leaves it unset. */
 void fb_set_present_hook(void (*cb)(int x, int y, int w, int h));
 
 /* Software display brightness, driven by the keyboard's brightness keys (there
  * is no panel-backlight register we can reach, so fb_present dims pixels as it
- * copies the back buffer to the screen). Levels run FB_BRIGHT_MIN..FB_BRIGHT_MAX;
- * at MAX the copy is a verbatim fast path. fb_brightness_step adjusts the level
- * and re-renders the whole screen at once so the change shows immediately. Safe
- * to call from an IRQ; a no-op in text mode or single-buffered fallback. */
+ * copies the back buffer to the screen). Levels run
+ * FB_BRIGHT_MIN..FB_BRIGHT_MAX; at MAX the copy is a verbatim fast path.
+ * fb_brightness_step adjusts the level and re-renders the whole screen at once
+ * so the change shows immediately. Safe to call from an IRQ; a no-op in text
+ * mode or single-buffered fallback. */
 #define FB_BRIGHT_MAX 8
 #define FB_BRIGHT_MIN 2
-void fb_brightness_step(int dir);  /* +1 = brighter, -1 = dimmer (clamped)      */
-int  fb_brightness(void);          /* current level FB_BRIGHT_MIN..FB_BRIGHT_MAX */
+void fb_brightness_step(int dir); /* +1 = brighter, -1 = dimmer (clamped) */
+int fb_brightness(void);          /* current level FB_BRIGHT_MIN..FB_BRIGHT_MAX */
 
 /* Clip rectangle for drawing primitives. The compositor sets it to a damaged
  * region and redraws the scene clipped to it, so only that area is touched and
@@ -84,10 +85,7 @@ void fb_clip_full(void);
 void fb_get_clip(int *x, int *y, int *w, int *h);
 
 /* Pack 8-bit channels into the framebuffer's XRGB8888 pixel format. */
-static inline uint32_t fb_rgb(uint8_t r, uint8_t g, uint8_t b)
-{
-	return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
-}
+static inline uint32_t fb_rgb(uint8_t r, uint8_t g, uint8_t b) { return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b; }
 
 void fb_pixel(int x, int y, uint32_t color);
 void fb_fill_rect(int x, int y, int w, int h, uint32_t color);
@@ -119,7 +117,7 @@ void fb_text(int x, int y, const char *s, uint32_t fg, uint32_t bg);
 #define UIFONT_W 16
 #define UIFONT_H 18
 void fb_ui_text(int x, int y, const char *s, uint32_t fg);
-int  fb_ui_width(const char *s);
+int fb_ui_width(const char *s);
 
 /* Framebuffer boot console: draw one character to a scrolling text console on
  * the framebuffer. Used during boot (graphics mode, before the WM exists) to

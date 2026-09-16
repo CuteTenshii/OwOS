@@ -14,21 +14,22 @@ typedef struct netconn netconn;
 netconn *nc_open(const char *host, int port, int tls, int offer_h2);
 
 /* Wrap an already-open kernel socket fd as a plain (non-TLS) netconn. The
- * netconn owns the fd afterwards (nc_close closes it). NULL on alloc failure. */
+ * netconn owns the fd afterwards (nc_close closes it). NULL on alloc failure.
+ */
 netconn *nc_from_fd(int fd);
 
 /* Blocking read: >0 bytes / 0 EOF / <0 error (NET_EINTR passes through). */
-int  nc_read(netconn *c, void *buf, int max);
+int nc_read(netconn *c, void *buf, int max);
 
 /* Non-blocking read for a plain TCP conn (net_recv_nb: >0 / 0 would-block / -1
  * EOF/error / NET_EINTR). A TLS conn has no non-blocking read (the kernel
  * SK_TLS path never had one either), so this returns -1 for TLS. */
-int  nc_read_nb(netconn *c, void *buf, int max);
+int nc_read_nb(netconn *c, void *buf, int max);
 
-int  nc_write(netconn *c, const void *buf, int len);
+int nc_write(netconn *c, const void *buf, int len);
 
 /* The negotiated ALPN protocol (owos.h ALPN_*). */
-int  nc_alpn(netconn *c);
+int nc_alpn(netconn *c);
 
 void nc_close(netconn *c);
 

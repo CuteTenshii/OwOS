@@ -12,23 +12,24 @@
 
 void gfx_init(unsigned *fb, int w, int h);
 /* Read back the current surface (buffer + dimensions), so a helper that borrows
- * gfx for its own window (e.g. a modal dialog) can gfx_init back to it after. */
+ * gfx for its own window (e.g. a modal dialog) can gfx_init back to it after.
+ */
 void gfx_get(unsigned **fb, int *w, int *h);
 void gfx_clear(unsigned color);
-/* Confine all subsequent primitives to a rectangle (intersected with the buffer),
- * or gfx_clip_none() to restore the full buffer. A compositor uses this to repaint
- * one damage rect at a time without touching pixels outside it. gfx_init resets it
- * to the whole buffer. */
+/* Confine all subsequent primitives to a rectangle (intersected with the
+ * buffer), or gfx_clip_none() to restore the full buffer. A compositor uses
+ * this to repaint one damage rect at a time without touching pixels outside it.
+ * gfx_init resets it to the whole buffer. */
 void gfx_set_clip(int x, int y, int w, int h);
 void gfx_clip_none(void);
 void gfx_pixel(int x, int y, unsigned color);
 void gfx_fill_rect(int x, int y, int w, int h, unsigned color);
-void gfx_rect(int x, int y, int w, int h, unsigned color);   /* 1px outline */
+void gfx_rect(int x, int y, int w, int h, unsigned color); /* 1px outline */
 void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg);
 void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg);
 /* Monospace text that decodes UTF-8 (one CP437 cell per codepoint, columns stay
  * aligned; accents via Unicode->CP437). Returns the pen x after the string. */
-int  gfx_text_utf8(int x, int y, const char *s, unsigned fg, unsigned bg);
+int gfx_text_utf8(int x, int y, const char *s, unsigned fg, unsigned bg);
 
 /* Blit a w*h ARGB (0xAARRGGBB) bitmap at (x,y), alpha-blending over the buffer
  * (fully transparent pixels skipped). Used for tab favicons. */
@@ -40,162 +41,170 @@ void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb);
  * argument. gfx_ui_width gives a string's pixel width for layout/centring. */
 #define UIFONT_W 16
 #define UIFONT_H 18
-void gfx_ui_text(int x, int y, const char *s, unsigned fg);   /* UTF-8 */
-int  gfx_ui_width(const char *s);  /* UTF-8 string pixel width                    */
-int  gfx_ui_cw(unsigned char c);   /* one byte/ASCII glyph's pen advance          */
-int  gfx_ui_cw_cp(unsigned cp);    /* one Unicode codepoint's pen advance         */
+void gfx_ui_text(int x, int y, const char *s, unsigned fg); /* UTF-8 */
+int gfx_ui_width(const char *s);                            /* UTF-8 string pixel width */
+int gfx_ui_cw(unsigned char c);                             /* one byte/ASCII glyph's pen advance */
+int gfx_ui_cw_cp(unsigned cp);                              /* one Unicode codepoint's pen advance         */
 
-/* Sized UI text — the sans face at an arbitrary px, uncached (for headings). y is
- * the line top; the baseline is derived from the px ascent. */
+/* Sized UI text — the sans face at an arbitrary px, uncached (for headings). y
+ * is the line top; the baseline is derived from the px ascent. */
 void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px);
-void gfx_ui_text_px_clip(int x, int y, const char *s, unsigned fg, int px,
-                         int ct, int cb);   /* rows clipped to [ct,cb); ct>=cb = none */
-int  gfx_ui_width_px(const char *s, int px);
-int  gfx_ui_cw_cp_px(unsigned cp, int px);
-int  gfx_ui_ascent_px(int px);
+void gfx_ui_text_px_clip(int x, int y, const char *s, unsigned fg, int px, int ct,
+                         int cb); /* rows clipped to [ct,cb); ct>=cb = none */
+int gfx_ui_width_px(const char *s, int px);
+int gfx_ui_cw_cp_px(unsigned cp, int px);
+int gfx_ui_ascent_px(int px);
 
-/* --------------------------------------------------------------- GUI widgets */
+/* --------------------------------------------------------------- GUI widgets
+ */
 /*
  * Reusable pieces every windowed app tends to want, so they aren't reinvented
  * per app: a status line that owns its message, and a one-menu dropdown bar.
  * Standard metrics (8px glyphs):
  */
-#define GUI_BAR_H  18    /* menu / status bar height */
-#define GUI_ROW_H  16    /* dropdown item height     */
-#define GUI_MENU_W 140   /* dropdown width (wide enough for a "Ctrl+S" hint)  */
+#define GUI_BAR_H 18   /* menu / status bar height */
+#define GUI_ROW_H 16   /* dropdown item height     */
+#define GUI_MENU_W 140 /* dropdown width (wide enough for a "Ctrl+S" hint)  */
 
 /* A status line that owns its short message. */
-struct status_bar { char msg[64]; };
+struct status_bar {
+  char msg[64];
+};
 void status_set(struct status_bar *s, const char *msg);
-void status_draw(const struct status_bar *s, int x, int y, int w,
-                 unsigned fg, unsigned bg);   /* fills the bar and shows msg */
+void status_draw(const struct status_bar *s, int x, int y, int w, unsigned fg,
+                 unsigned bg); /* fills the bar and shows msg */
 
 /* Per-item state bits for the optional `flags` array (mutable — apps toggle
  * them at runtime). DISABLED items are dimmed and inert (no click, no
  * accelerator); CHECKED items show a checkmark in a left gutter. */
 #define MENU_DISABLED 0x01
-#define MENU_CHECKED  0x02
+#define MENU_CHECKED 0x02
 
-/* A drop-down menu (e.g. "File" with New/Open/Save/...). The owning app draws the
- * full-width bar background itself, then calls menu_draw() last so the popup
- * overlays the content. The same struct doubles as a submenu (see `subs`): a
- * submenu has no title bar of its own, just the popup, opened by its parent item.
+/* A drop-down menu (e.g. "File" with New/Open/Save/...). The owning app draws
+ * the full-width bar background itself, then calls menu_draw() last so the
+ * popup overlays the content. The same struct doubles as a submenu (see
+ * `subs`): a submenu has no title bar of its own, just the popup, opened by its
+ * parent item.
  *
  * Optional parallel arrays (NULL = absent), each indexed by item:
  *  - `hints`/`keys`: a keyboard accelerator — `hints[i]` is the right-aligned
  *    label ("Ctrl+S"), `keys[i]` the KEY_* byte fed to menu_shortcut().
  *  - `flags`: MENU_DISABLED|MENU_CHECKED state bits (mutable; reserves a check
  *    gutter for the whole menu when present).
- *  - `subs`: a child submenu per item (subs[i] != NULL makes item i a parent that
- *    opens subs[i] to its right instead of firing an action). */
+ *  - `subs`: a child submenu per item (subs[i] != NULL makes item i a parent
+ * that opens subs[i] to its right instead of firing an action). */
 struct menu {
-	const char *title;
-	const char *const *items;
-	int n;
-	int open;
-	const char *const  *hints;   /* optional: per-item accelerator label */
-	const unsigned char *keys;   /* optional: per-item KEY_* shortcut byte */
-	unsigned char       *flags;  /* optional: per-item MENU_DISABLED|MENU_CHECKED */
-	struct menu *const  *subs;   /* optional: per-item submenu (NULL = none)      */
+  const char *title;
+  const char *const *items;
+  int n;
+  int open;
+  const char *const *hints;  /* optional: per-item accelerator label */
+  const unsigned char *keys; /* optional: per-item KEY_* shortcut byte */
+  unsigned char *flags;      /* optional: per-item MENU_DISABLED|MENU_CHECKED */
+  struct menu *const *subs;  /* optional: per-item submenu (NULL = none)      */
 };
 void menu_draw(const struct menu *m, int x, int y);
-/* Route a click at (mx,my) given the menu title's top-left (x,y). Toggles/closes
- * m->open (and any submenus) as needed; returns the chosen item index of `m`, or
- * -1 if nothing in `m` fired (a disabled item, an opened submenu, a chosen
- * *submenu* item, or a miss). Use menu_click_ex to dispatch submenu items. */
-int  menu_click(struct menu *m, int mx, int my, int x, int y);
+/* Route a click at (mx,my) given the menu title's top-left (x,y).
+ * Toggles/closes m->open (and any submenus) as needed; returns the chosen item
+ * index of `m`, or -1 if nothing in `m` fired (a disabled item, an opened
+ * submenu, a chosen *submenu* item, or a miss). Use menu_click_ex to dispatch
+ * submenu items. */
+int menu_click(struct menu *m, int mx, int my, int x, int y);
 /* Like menu_click but reports the leaf menu that owns the fired item via *leaf
  * (which may be a submenu, not `m`). Returns that menu's item index, or -1. */
-int  menu_click_ex(struct menu *m, int mx, int my, int x, int y,
-                   struct menu **leaf);
-/* Map a pressed key to a menu item via the `keys` tables (searches submenus too,
- * skips disabled items): returns the item index, or -1 if none. */
-int  menu_shortcut(const struct menu *m, int key);
+int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **leaf);
+/* Map a pressed key to a menu item via the `keys` tables (searches submenus
+ * too, skips disabled items): returns the item index, or -1 if none. */
+int menu_shortcut(const struct menu *m, int key);
 
 /* A row of dropdown menus sharing one bar (File / Edit / View ...). Holds an
- * array of `struct menu` pointers laid out left-to-right from (x,y); the helpers
- * keep at most one dropdown open at a time, so the owning app gets a real menu
- * bar without re-implementing the open/close bookkeeping per app. */
+ * array of `struct menu` pointers laid out left-to-right from (x,y); the
+ * helpers keep at most one dropdown open at a time, so the owning app gets a
+ * real menu bar without re-implementing the open/close bookkeeping per app. */
 struct menubar {
-	struct menu *const *menus;
-	int n;
-	int x, y;          /* bar origin: the title row's top-left */
+  struct menu *const *menus;
+  int n;
+  int x, y; /* bar origin: the title row's top-left */
 };
 /* Draw every title on the bar, then the open menu's dropdown last (on top). The
- * app still fills the full-width bar background itself, then calls this last. */
+ * app still fills the full-width bar background itself, then calls this last.
+ */
 void menubar_draw(const struct menubar *mb);
-/* Route a click. Returns 1 if it hit the bar or an open dropdown (the app should
- * repaint and not process the click further), 0 if it was elsewhere. When an
- * item is chosen, *leaf and *item give the leaf menu (a bar menu OR one of its
- * submenus — dispatch by pointer) and its item index; otherwise *item is -1
- * (only open/close state changed). Clicking off an open menu closes it. */
-int  menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *item);
+/* Route a click. Returns 1 if it hit the bar or an open dropdown (the app
+ * should repaint and not process the click further), 0 if it was elsewhere.
+ * When an item is chosen, *leaf and *item give the leaf menu (a bar menu OR one
+ * of its submenus — dispatch by pointer) and its item index; otherwise *item is
+ * -1 (only open/close state changed). Clicking off an open menu closes it. */
+int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *item);
 /* Map a pressed key to any menu's accelerator (submenus included): returns the
  * item index and sets *leaf to the owning menu, or -1 (with *leaf = NULL). */
-int  menubar_shortcut(const struct menubar *mb, int key, struct menu **leaf);
-/* Close every dropdown on the bar and its submenus (after an accelerator/Esc). */
+int menubar_shortcut(const struct menubar *mb, int key, struct menu **leaf);
+/* Close every dropdown on the bar and its submenus (after an accelerator/Esc).
+ */
 void menubar_close(struct menubar *mb);
 
 /* --------------------------------------------------------------- text field */
 /*
  * A single-line editable text field — an address bar, a rename box, any "type a
  * string and press Enter" input — so apps don't re-roll caret/scroll/editing by
- * hand. The app owns the character buffer (NUL-terminated); the widget tracks the
- * caret and horizontal scroll, drawing the proportional UI font in a white field
- * that scrolls to keep the caret in view.
+ * hand. The app owns the character buffer (NUL-terminated); the widget tracks
+ * the caret and horizontal scroll, drawing the proportional UI font in a white
+ * field that scrolls to keep the caret in view.
  *
  * Bind once with textfield_init(&tf, buf, cap), set initial text with
- * textfield_set, then each frame draw it and feed WEV_KEY chars to textfield_key.
- * The current text is just tf.buf (NUL-terminated, tf.len chars).
+ * textfield_set, then each frame draw it and feed WEV_KEY chars to
+ * textfield_key. The current text is just tf.buf (NUL-terminated, tf.len
+ * chars).
  */
-#define TEXTFIELD_H 26   /* a comfortable single-line field height */
+#define TEXTFIELD_H 26 /* a comfortable single-line field height */
 
 struct textfield {
-	char *buf;     /* app-owned buffer, NUL-terminated         */
-	int   cap;     /* buffer capacity in bytes (incl. the NUL) */
-	int   len;     /* current text length                      */
-	int   caret;   /* insertion point, 0..len                  */
-	int   scroll;  /* leftmost visible char index (maintained by textfield_draw) */
+  char *buf;  /* app-owned buffer, NUL-terminated         */
+  int cap;    /* buffer capacity in bytes (incl. the NUL) */
+  int len;    /* current text length                      */
+  int caret;  /* insertion point, 0..len                  */
+  int scroll; /* leftmost visible char index (maintained by textfield_draw) */
 };
 
 void textfield_init(struct textfield *tf, char *buf, int cap);
-void textfield_set(struct textfield *tf, const char *s);   /* replace text; caret to end */
+void textfield_set(struct textfield *tf, const char *s); /* replace text; caret to end */
 /* Draw the field box filling [x,y,w,h]; `focused` shows a caret and a bright
  * border. Updates tf->scroll to keep the caret visible. */
 void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focused);
-/* Place the caret from a click and report focus: returns 1 if (mx,my) fell inside
- * [x,y,w,h] (the app should treat the field as focused), 0 otherwise. Uses the
- * scroll left by the last textfield_draw, so call draw first each frame. */
-int  textfield_click(struct textfield *tf, int mx, int my,
-                     int x, int y, int w, int h);
+/* Place the caret from a click and report focus: returns 1 if (mx,my) fell
+ * inside [x,y,w,h] (the app should treat the field as focused), 0 otherwise.
+ * Uses the scroll left by the last textfield_draw, so call draw first each
+ * frame. */
+int textfield_click(struct textfield *tf, int mx, int my, int x, int y, int w, int h);
 /* Feed a WEV_KEY char. Handles printable insert, Backspace, Delete, and
  * Left/Right/Home/End caret motion. Returns 1 if it consumed the key (repaint),
- * 0 if not — e.g. Enter/Esc/arrows the field doesn't use, which the app handles. */
-int  textfield_key(struct textfield *tf, char c);
+ * 0 if not — e.g. Enter/Esc/arrows the field doesn't use, which the app
+ * handles. */
+int textfield_key(struct textfield *tf, char c);
 
 /* --------------------------------------------------------------- tab strip */
 /*
- * A horizontal strip of tabs with per-tab close boxes and a trailing "+" button,
- * the way a tabbed browser/editor lays out documents. The widget is stateless:
- * the app owns the tab list and its bookkeeping; this only draws `labels[0..n)`
- * (highlighting `active`) and maps a click back to an action. Tabs share the
- * available width evenly (clamped), labels are truncated to fit, and the close
- * box appears only when more than one tab is open.
+ * A horizontal strip of tabs with per-tab close boxes and a trailing "+"
+ * button, the way a tabbed browser/editor lays out documents. The widget is
+ * stateless: the app owns the tab list and its bookkeeping; this only draws
+ * `labels[0..n)` (highlighting `active`) and maps a click back to an action.
+ * Tabs share the available width evenly (clamped), labels are truncated to fit,
+ * and the close box appears only when more than one tab is open.
  */
-#define GUI_TAB_H 24    /* tab strip height */
+#define GUI_TAB_H 24 /* tab strip height */
 
-/* tabbar_hit() outcomes. SELECT/CLOSE fill *index with the tab; NEW is the "+". */
+/* tabbar_hit() outcomes. SELECT/CLOSE fill *index with the tab; NEW is the "+".
+ */
 enum { TABBAR_NONE = 0, TABBAR_SELECT, TABBAR_CLOSE, TABBAR_NEW };
 
 /* Draw the strip filling [x, x+w) at height GUI_TAB_H from y. The app fills no
- * background itself — the widget paints the whole strip. icons[i] is an optional
- * 16x16 ARGB favicon for tab i (NULL -> a default globe); pass a NULL icons
- * array to give every tab the globe. */
-void tabbar_draw(int x, int y, int w, const char *const *labels,
-                 const unsigned *const *icons, int n, int active);
+ * background itself — the widget paints the whole strip. icons[i] is an
+ * optional 16x16 ARGB favicon for tab i (NULL -> a default globe); pass a NULL
+ * icons array to give every tab the globe. */
+void tabbar_draw(int x, int y, int w, const char *const *labels, const unsigned *const *icons, int n, int active);
 /* Hit-test a click at (mx,my) against the same geometry. Returns a TABBAR_*
  * code; for SELECT/CLOSE sets *index to the tab index. */
-int  tabbar_hit(int x, int y, int w, int n, int mx, int my, int *index);
+int tabbar_hit(int x, int y, int w, int n, int mx, int my, int *index);
 
 /* --------------------------------------------------------------- button */
 /*
@@ -209,51 +218,54 @@ int  tabbar_hit(int x, int y, int w, int n, int mx, int my, int *index);
  * and mouse-up on it, BTN_DISABLED for an inert/dimmed button (button_hit still
  * returns 0 for it so it can't fire), else BTN_NORMAL.
  */
-#define GUI_BTN_H 26    /* a comfortable button height */
+#define GUI_BTN_H 26 /* a comfortable button height */
 
 enum { BTN_NORMAL = 0, BTN_HOVER, BTN_PRESSED, BTN_DISABLED };
 
-/* Draw the button filling [x,y,w,h] with `label` centred, in the given state. */
+/* Draw the button filling [x,y,w,h] with `label` centred, in the given state.
+ */
 void button_draw(int x, int y, int w, int h, const char *label, int state);
 /* Returns 1 if (mx,my) falls inside [x,y,w,h], 0 otherwise (geometry only — the
  * app gates on its own disabled state before treating a hit as a press). */
-int  button_hit(int x, int y, int w, int h, int mx, int my);
+int button_hit(int x, int y, int w, int h, int mx, int my);
 
-/* --------------------------------------------------------------- progress bar */
+/* --------------------------------------------------------------- progress bar
+ */
 /*
  * A horizontal progress bar: a sunken trough with an accent-blue fill showing
  * `value`/`max` (clamped to 0..max), for a download/copy/load. Stateless — the
  * app passes the current counts each frame. With show_pct != 0 it overlays a
  * centred "NN%" label; a value/max of N/0 reads as 0%.
  */
-#define GUI_PROGRESS_H 16   /* a comfortable bar height */
+#define GUI_PROGRESS_H 16 /* a comfortable bar height */
 
 void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct);
 
 /* --------------------------------------------------------------- scrollbar */
 /*
- * A vertical scrollbar: an up arrow, a track groove with a draggable thumb sized
- * to the visible fraction of the content, and a down arrow — the way a scrolling
- * document pane (the browser, a long listing) wants one. Stateless like the
- * button/progress bar: the app owns the scroll position and passes the current
- * counts each frame; the widget draws the chrome and maps a click back to either
- * an arrow step or a new thumb position.
+ * A vertical scrollbar: an up arrow, a track groove with a draggable thumb
+ * sized to the visible fraction of the content, and a down arrow — the way a
+ * scrolling document pane (the browser, a long listing) wants one. Stateless
+ * like the button/progress bar: the app owns the scroll position and passes the
+ * current counts each frame; the widget draws the chrome and maps a click back
+ * to either an arrow step or a new thumb position.
  *
- * Units are caller-defined — whatever `scroll` counts in (lines, rows, pixels) —
- * as long as the three agree:
+ * Units are caller-defined — whatever `scroll` counts in (lines, rows, pixels)
+ * — as long as the three agree:
  *  - `total`    total content extent
  *  - `visible`  how much of it fits in the pane at once
  *  - `scroll`   current top position, 0..(total - visible)
  * When total <= visible the bar draws an empty (inert) track and scrollbar_pos
- * returns 0 (nothing to scroll). The arrows are drawn only when [x,y,w,h] is tall
- * enough to hold them plus a grabbable thumb; in a very short bar they collapse
- * to a plain track, and scrollbar_hit then reports the whole bar as the track.
+ * returns 0 (nothing to scroll). The arrows are drawn only when [x,y,w,h] is
+ * tall enough to hold them plus a grabbable thumb; in a very short bar they
+ * collapse to a plain track, and scrollbar_hit then reports the whole bar as
+ * the track.
  */
-#define GUI_SCROLL_W 10   /* a comfortable vertical scrollbar width */
+#define GUI_SCROLL_W 10 /* a comfortable vertical scrollbar width */
 
 /* scrollbar_hit() outcomes: which part of the bar a click landed on. The app
- * applies its own step for an arrow (one line/row), and uses scrollbar_pos for a
- * track grab. */
+ * applies its own step for an arrow (one line/row), and uses scrollbar_pos for
+ * a track grab. */
 enum { SCROLLBAR_NONE = 0, SCROLLBAR_UP, SCROLLBAR_DOWN, SCROLLBAR_TRACK };
 
 /* Draw the scrollbar filling [x,y,w,h]: arrows top/bottom, then the track and a
@@ -261,61 +273,61 @@ enum { SCROLLBAR_NONE = 0, SCROLLBAR_UP, SCROLLBAR_DOWN, SCROLLBAR_TRACK };
 void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible);
 /* Hit-test a click at (mx,my) against the same geometry: returns a SCROLLBAR_*
  * region code (SCROLLBAR_NONE when the point is off the bar). */
-int  scrollbar_hit(int x, int y, int w, int h, int mx, int my);
-/* Map a track click/drag at (mx,my) to a new scroll position, centring the thumb
- * on the cursor, clamped to 0..(total - visible). Returns the unchanged `scroll`
- * when (mx,my) is outside the track region, so it can be called unconditionally. */
-int  scrollbar_pos(int x, int y, int w, int h, int mx, int my,
-                   int scroll, int total, int visible);
+int scrollbar_hit(int x, int y, int w, int h, int mx, int my);
+/* Map a track click/drag at (mx,my) to a new scroll position, centring the
+ * thumb on the cursor, clamped to 0..(total - visible). Returns the unchanged
+ * `scroll` when (mx,my) is outside the track region, so it can be called
+ * unconditionally. */
+int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible);
 
 /* --------------------------------------------------------------- sidebar */
 /*
  * A resizable left navigation pane — the "Places / Devices" rail a file manager
  * (or any master/detail window) puts down the left edge. The widget owns the
  * pane's *width as a live property*: the app reads sb.w back to lay its content
- * out, sets it directly with sidebar_set_width() (so the width is customizable),
- * and — when `resizable` — the user drags the divider to change it, clamped to
- * [min_w, max_w]. The widget paints the panel background plus a 1px divider and
- * a grip dimple at the right edge; the app draws its own rows into [x, x+w).
+ * out, sets it directly with sidebar_set_width() (so the width is
+ * customizable), and — when `resizable` — the user drags the divider to change
+ * it, clamped to [min_w, max_w]. The widget paints the panel background plus a
+ * 1px divider and a grip dimple at the right edge; the app draws its own rows
+ * into [x, x+w).
  *
  * Bind once with sidebar_init(). Each frame: sidebar_draw() paints the panel +
  * grip, then the app lays out its rows within the pane. Route mouse events:
  *  - WEV_MOUSE  -> sidebar_press(): returns 1 if the press grabbed the divider
- *                  grip (begin a resize; the app must NOT also treat it as a row
- *                  click). A press that misses the grip clears any drag state.
+ *                  grip (begin a resize; the app must NOT also treat it as a
+ * row click). A press that misses the grip clears any drag state.
  *  - WEV_DRAG   -> sidebar_drag(): while a resize is live, sets the width from
  *                  the pointer x (clamped); returns 1 if the width changed.
  * The drag ends on its own when the button is released (no release event — the
  * stop of WEV_DRAG ends it, and the next WEV_MOUSE re-evaluates the grip).
  */
-#define SIDEBAR_GRIP 6   /* width of the divider's draggable hit zone (px) */
+#define SIDEBAR_GRIP 6 /* width of the divider's draggable hit zone (px) */
 
 struct sidebar {
-	int w;          /* current width — the live, app-readable property         */
-	int min_w;      /* lower clamp for a drag / set_width                       */
-	int max_w;      /* upper clamp for a drag / set_width                       */
-	int resizable;  /* 0 = a fixed pane: no grip, no drag (still has a divider) */
-	int dragging;   /* internal: a resize drag is in progress                   */
+  int w;         /* current width — the live, app-readable property         */
+  int min_w;     /* lower clamp for a drag / set_width                       */
+  int max_w;     /* upper clamp for a drag / set_width                       */
+  int resizable; /* 0 = a fixed pane: no grip, no drag (still has a divider) */
+  int dragging;  /* internal: a resize drag is in progress                   */
 };
 
-/* Initialise to width `w`, clamped into [min_w, max_w]; resizable by default. */
+/* Initialise to width `w`, clamped into [min_w, max_w]; resizable by default.
+ */
 void sidebar_init(struct sidebar *sb, int w, int min_w, int max_w);
 /* Set the width property directly (clamped to [min_w, max_w]). */
 void sidebar_set_width(struct sidebar *sb, int w);
-/* Paint the panel [x, x+w) x [y, y+h) in `bg`, the 1px divider at its right edge
- * in `divider`, and (when resizable) a centred grip dimple on the divider. Pass
- * the *effective* width the app is rendering (it may cap sb->w against the
+/* Paint the panel [x, x+w) x [y, y+h) in `bg`, the 1px divider at its right
+ * edge in `divider`, and (when resizable) a centred grip dimple on the divider.
+ * Pass the *effective* width the app is rendering (it may cap sb->w against the
  * window); the divider/grip land at x+w. */
-void sidebar_draw(struct sidebar *sb, int x, int y, int w, int h, unsigned bg,
-                  unsigned divider);
+void sidebar_draw(struct sidebar *sb, int x, int y, int w, int h, unsigned bg, unsigned divider);
 /* Hit-test a left-press at (mx,my) against the divider grip drawn at x+w over
  * [y, y+h). On a hit, begin a resize and return 1; otherwise clear any stale
  * drag and return 0. A non-resizable pane always returns 0. */
-int  sidebar_press(struct sidebar *sb, int x, int y, int w, int h,
-                   int mx, int my);
+int sidebar_press(struct sidebar *sb, int x, int y, int w, int h, int mx, int my);
 /* Feed a WEV_DRAG x while a resize is live: set the width to (mx - x), clamped
  * to [min_w, max_w]. Returns 1 if the width changed (repaint), else 0. */
-int  sidebar_drag(struct sidebar *sb, int x, int mx);
+int sidebar_drag(struct sidebar *sb, int x, int mx);
 
 /* --- separator ----------------------------------------------------------- *
  * A thin themed divider line. Horizontal spans [x, x+len) at row y; vertical
@@ -323,46 +335,51 @@ int  sidebar_drag(struct sidebar *sb, int x, int mx);
 void gfx_separator(int x, int y, int len, int vertical);
 
 /* --- select (dropdown) --------------------------------------------------- *
- * A combobox: a closed box showing the current option + a chevron, and an option
- * list that drops below when open. The app owns the `options` array (one
+ * A combobox: a closed box showing the current option + a chevron, and an
+ * option list that drops below when open. The app owns the `options` array (one
  * NUL-terminated label per entry) for the widget's lifetime. Draw the select
  * LAST so its open list overlays the rest of the UI (like a menu). */
-#define GUI_SELECT_H 24    /* a comfortable closed-box height */
+#define GUI_SELECT_H 24 /* a comfortable closed-box height */
 struct select_box {
-	const char *const *options;
-	int count;
-	int selected;      /* index of the chosen option (0..count-1)        */
-	int open;          /* 1 = list expanded                              */
-	int hover;         /* hovered row while open, or -1                  */
+  const char *const *options;
+  int count;
+  int selected; /* index of the chosen option (0..count-1)        */
+  int open;     /* 1 = list expanded                              */
+  int hover;    /* hovered row while open, or -1                  */
 };
 void select_init(struct select_box *s, const char *const *options, int count, int selected);
 void select_draw(struct select_box *s, int x, int y, int w, int h);
 /* Click: returns 1 if the selection changed (s->selected updated, list closed),
  * -1 if consumed (opened/closed), 0 if the click missed the widget entirely. */
-int  select_click(struct select_box *s, int x, int y, int w, int h, int mx, int my);
-/* Update the hovered row from pointer motion while open; returns 1 if it changed. */
-int  select_motion(struct select_box *s, int x, int y, int w, int h, int mx, int my);
+int select_click(struct select_box *s, int x, int y, int w, int h, int mx, int my);
+/* Update the hovered row from pointer motion while open; returns 1 if it
+ * changed. */
+int select_motion(struct select_box *s, int x, int y, int w, int h, int mx, int my);
 /* Keyboard control for a focused select: Up/Down (move, or change when closed),
  * Home/End (ends), Enter/Space (open / confirm), Esc (close). Same returns as
  * select_click: 1 = selection changed, -1 = consumed, 0 = key not handled. */
-int  select_key(struct select_box *s, char key);
+int select_key(struct select_box *s, char key);
 
 /* --- text selection helper ------------------------------------------------ *
  * A reusable selection model in abstract (line, col) coordinates. The app maps
  * pixels <-> (line,col), draws the highlight, and does the clipboard copy; this
  * owns the anchor/extent, drag state, ordering and hit-testing. Both a wrapped
- * text view (line = display row, col = byte offset in that row) and a fixed char
- * grid (line = row, col = cell) fit the model. Coordinates compare lexically. */
-struct gfx_sel { int active, has; int al, ac, el, ec; };
+ * text view (line = display row, col = byte offset in that row) and a fixed
+ * char grid (line = row, col = cell) fit the model. Coordinates compare
+ * lexically. */
+struct gfx_sel {
+  int active, has;
+  int al, ac, el, ec;
+};
 void gfx_sel_clear(struct gfx_sel *s);
-void gfx_sel_start(struct gfx_sel *s, int line, int col);   /* mousedown: set anchor */
-void gfx_sel_extend(struct gfx_sel *s, int line, int col);  /* drag: move the extent */
-void gfx_sel_end(struct gfx_sel *s);                        /* mouseup: stop dragging */
-int  gfx_sel_active(const struct gfx_sel *s);               /* currently dragging     */
-int  gfx_sel_has(const struct gfx_sel *s);                  /* a non-empty selection  */
+void gfx_sel_start(struct gfx_sel *s, int line, int col);  /* mousedown: set anchor */
+void gfx_sel_extend(struct gfx_sel *s, int line, int col); /* drag: move the extent */
+void gfx_sel_end(struct gfx_sel *s);                       /* mouseup: stop dragging */
+int gfx_sel_active(const struct gfx_sel *s);               /* currently dragging     */
+int gfx_sel_has(const struct gfx_sel *s);                  /* a non-empty selection  */
 /* Ordered range (l0,c0) <= (l1,c1); returns 1 if the selection is non-empty. */
-int  gfx_sel_range(const struct gfx_sel *s, int *l0, int *c0, int *l1, int *c1);
+int gfx_sel_range(const struct gfx_sel *s, int *l0, int *c0, int *l1, int *c1);
 /* 1 if (line,col) lies within the selection (half-open at the end). */
-int  gfx_sel_contains(const struct gfx_sel *s, int line, int col);
+int gfx_sel_contains(const struct gfx_sel *s, int line, int col);
 
 #endif /* OWOS_GFX_H */

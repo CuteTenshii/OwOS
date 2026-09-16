@@ -12,7 +12,6 @@
  * and Path-scoped cookies unless `path` is under their Path (NULL = no Path
  * filter). Domain-scoped cookies are suffix-matched against `host` in both
  * variants. Returns the header value length written to `out`. */
-int cookie_header_tls(const char *host, const char *path, int tls,
-                      char *out, int cap);
+int cookie_header_tls(const char *host, const char *path, int tls, char *out, int cap);
 
 #endif /* BROWSER_JAR_H */

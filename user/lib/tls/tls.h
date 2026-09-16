@@ -14,23 +14,24 @@
 #ifndef OWOS_USER_TLS_H
 #define OWOS_USER_TLS_H
 
-typedef struct tls_conn tls_conn;   /* opaque per-connection state */
+typedef struct tls_conn tls_conn; /* opaque per-connection state */
 
 /* Open a TLS client connection: resolves + TCP-connects to host:port (SK_TCP)
  * and runs the handshake with SNI=host. `offer_h2` adds "h2" to the ALPN offer
- * so the server may select HTTP/2 (read it back with tls_alpn). Returns a handle
- * or NULL on any failure. The certificate is NOT verified (see file header). */
+ * so the server may select HTTP/2 (read it back with tls_alpn). Returns a
+ * handle or NULL on any failure. The certificate is NOT verified (see file
+ * header). */
 tls_conn *tls_client(const char *host, int port, int offer_h2);
 
 /* Application-data I/O. read: >0 bytes / 0 EOF / <0 error (NET_EINTR passes
  * through as-is so the caller can tear down on Ctrl+C). write: bytes sent, or
  * <0 on error. */
-int  tls_read(tls_conn *c, void *buf, int max);
-int  tls_write(tls_conn *c, const void *buf, int len);
+int tls_read(tls_conn *c, void *buf, int max);
+int tls_write(tls_conn *c, const void *buf, int len);
 
 /* The ALPN protocol the server negotiated: ALPN_H2 / ALPN_HTTP11 / ALPN_NONE
  * (owos.h constants). Valid after a successful tls_client(). */
-int  tls_alpn(tls_conn *c);
+int tls_alpn(tls_conn *c);
 
 void tls_close(tls_conn *c);
 

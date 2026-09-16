@@ -12,9 +12,9 @@ struct multiboot_info;
  * the identity-mapped heap occupy. Frames above that become allocatable. */
 void pmm_init(const struct multiboot_info *mbi);
 
-uint32_t pmm_alloc_frame(void);        /* physical addr of a free frame, or 0 */
-void     pmm_free_frame(uint32_t phys);
-void     pmm_retain_frame(uint32_t phys);
+uint32_t pmm_alloc_frame(void); /* physical addr of a free frame, or 0 */
+void pmm_free_frame(uint32_t phys);
+void pmm_retain_frame(uint32_t phys);
 uint32_t pmm_frame_refs(uint32_t phys);
 
 /* Reserve a physically contiguous run of `bytes` (rounded up to whole frames)
@@ -24,7 +24,7 @@ uint32_t pmm_frame_refs(uint32_t phys);
 uint32_t pmm_alloc_contig(uint32_t bytes);
 
 /* Free a run returned by pmm_alloc_contig (frame by frame). */
-void     pmm_free_contig(uint32_t phys, uint32_t bytes);
+void pmm_free_contig(uint32_t phys, uint32_t bytes);
 
 /* The RAM-scaled low-memory layout (computed in pmm_init from detected RAM).
  * pmm_low_end()    = end of the identity-mapped/reserved low region (paging.c).

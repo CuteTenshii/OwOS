@@ -8,8 +8,8 @@
 #ifndef OWOS_SHELL_H
 #define OWOS_SHELL_H
 
-void shell_init(void);       /* print the banner and first prompt            */
-void shell_feed(char c);     /* process one input character                  */
-void shell_interrupt(void);  /* Ctrl+C at the prompt: cancel the current line */
+void shell_init(void);      /* print the banner and first prompt            */
+void shell_feed(char c);    /* process one input character                  */
+void shell_interrupt(void); /* Ctrl+C at the prompt: cancel the current line */
 
 #endif /* OWOS_SHELL_H */

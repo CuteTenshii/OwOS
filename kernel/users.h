@@ -1,13 +1,13 @@
 /* users.h — multi-user identity resolution over /etc/passwd.
  *
  * Credentials are PER PROCESS: every task carries a uid/gid (task_t.uid/gid in
- * sched.c, inherited across spawn/fork exactly like cwd), so two processes owned
- * by different users report different identities. `whoami` therefore reflects
- * the *calling* process, not a single global session.
+ * sched.c, inherited across spawn/fork exactly like cwd), so two processes
+ * owned by different users report different identities. `whoami` therefore
+ * reflects the *calling* process, not a single global session.
  *
  * This module maps between a uid and the human-readable account, and performs
- * the one privileged operation user space must not be able to fake: validating a
- * password before switching the caller's credentials. It is exposed through
+ * the one privileged operation user space must not be able to fake: validating
+ * a password before switching the caller's credentials. It is exposed through
  * /proc:
  *
  *   /proc/whoami  (read)   -> the calling task's user name
@@ -22,8 +22,8 @@
  *
  * /etc/passwd line:  name:pwhash:uid:gid:home
  *   pwhash is empty for a passwordless account, else the lowercase-hex SHA-256
- *   of the password. The kernel hashes the *plaintext* it receives and compares,
- *   so a process that can read the stored hash still cannot replay it.
+ *   of the password. The kernel hashes the *plaintext* it receives and
+ * compares, so a process that can read the stored hash still cannot replay it.
  */
 #ifndef OWOS_USERS_H
 #define OWOS_USERS_H
@@ -44,15 +44,15 @@ void users_name_of(uint32_t uid, char *buf, int max);
 void users_home_of(uint32_t uid, char *buf, int max);
 
 /* Switch the *calling task's* credentials to `name`. The account must exist in
- * /etc/passwd; if it has a password set, `pass` (plaintext, may be NULL/"") must
- * match. Returns 0 on success, -1 unknown user, -2 wrong password. */
+ * /etc/passwd; if it has a password set, `pass` (plaintext, may be NULL/"")
+ * must match. Returns 0 on success, -1 unknown user, -2 wrong password. */
 int users_login(const char *name, const char *pass);
 
 /* Validate name/pass against /etc/passwd WITHOUT changing the caller's
  * credentials, reporting the account's uid/gid/home (home may be NULL). For the
  * SSH server: it authenticates a remote login from a kernel thread, then spawns
- * the user's shell with these creds. 0 ok, -1 unknown user, -2 wrong password. */
-int users_authenticate(const char *name, const char *pass,
-                       uint32_t *uid, uint32_t *gid, char *home, int homesz);
+ * the user's shell with these creds. 0 ok, -1 unknown user, -2 wrong password.
+ */
+int users_authenticate(const char *name, const char *pass, uint32_t *uid, uint32_t *gid, char *home, int homesz);
 
 #endif /* OWOS_USERS_H */

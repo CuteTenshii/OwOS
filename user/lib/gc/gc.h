@@ -18,8 +18,9 @@
  * really returned to the heap; there is no separate GC arena.
  *
  *   THE ONE RULE: any GC pointer a C local holds across a gc_alloc() call must
- *   be reachable from a root at that moment (gc_alloc may collect first). Bracket
- *   such code with gc_push_scope()/gc_pop_scope() and gc_keep() each local.
+ *   be reachable from a root at that moment (gc_alloc may collect first).
+ * Bracket such code with gc_push_scope()/gc_pop_scope() and gc_keep() each
+ * local.
  */
 #ifndef OWOS_GC_H
 #define OWOS_GC_H
@@ -48,10 +49,10 @@ void gc_mark(void *obj);
 /* Generational write barrier. Call AFTER storing a GC pointer into `container`
  * (an object returned by gc_alloc). It records old->young edges so a minor
  * collection — which does not trace the old generation — still keeps a young
- * object reachable only from an old one. Cheap: a no-op unless `container` is old.
- * Stores into a freshly allocated (young) container need no barrier, but calling
- * it there is harmless. Containers of the "rescan kind" (see below) are exempt —
- * they are scanned wholesale every minor collection instead. */
+ * object reachable only from an old one. Cheap: a no-op unless `container` is
+ * old. Stores into a freshly allocated (young) container need no barrier, but
+ * calling it there is harmless. Containers of the "rescan kind" (see below) are
+ * exempt — they are scanned wholesale every minor collection instead. */
 void gc_write_barrier(void *container);
 
 /* Register one object kind whose instances, once old, are re-scanned in full on
@@ -71,11 +72,12 @@ void gc_remove_root_range(void **base);
 /* Handle scopes for C locals. push/pop bracket a scope (LIFO); gc_keep() pins a
  * pointer until the enclosing scope is popped, and returns it for inline use:
  *   gc_push_scope(); Obj *o = gc_keep(gc_alloc(...)); ...; gc_pop_scope(); */
-void  gc_push_scope(void);
-void  gc_pop_scope(void);
+void gc_push_scope(void);
+void gc_pop_scope(void);
 void *gc_keep(void *obj);
 
-/* Force a full collection now; returns the number of payload bytes reclaimed. */
+/* Force a full collection now; returns the number of payload bytes reclaimed.
+ */
 unsigned gc_collect(void);
 
 /* Live payload bytes currently tracked. */
@@ -83,14 +85,14 @@ unsigned gc_bytes(void);
 
 /* Cumulative collector statistics (for profiling). */
 typedef struct {
-	unsigned long collections;   /* gc_collect() calls                          */
-	unsigned long marked;        /* objects blackened (traced) across all cycles */
-	unsigned long swept;         /* all-objects-list nodes visited in sweep      */
-	unsigned long freed;         /* objects reclaimed                            */
-	unsigned long minors;        /* minor (young-only) collections               */
-	unsigned long majors;        /* major (full) collections                     */
-	double        ms;            /* wall-clock spent collecting (profiling)      */
-	double        max_ms;        /* longest single collection (pause time)       */
+  unsigned long collections; /* gc_collect() calls                          */
+  unsigned long marked;      /* objects blackened (traced) across all cycles */
+  unsigned long swept;       /* all-objects-list nodes visited in sweep      */
+  unsigned long freed;       /* objects reclaimed                            */
+  unsigned long minors;      /* minor (young-only) collections               */
+  unsigned long majors;      /* major (full) collections                     */
+  double ms;                 /* wall-clock spent collecting (profiling)      */
+  double max_ms;             /* longest single collection (pause time)       */
 } gc_stats_t;
 void gc_get_stats(gc_stats_t *out);
 /* Collect automatically once this many bytes have been allocated since the last

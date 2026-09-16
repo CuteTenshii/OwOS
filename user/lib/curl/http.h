@@ -9,14 +9,15 @@
 #ifndef OWOS_LIBHTTP_H
 #define OWOS_LIBHTTP_H
 
-/* Negative status codes; a non-negative return is the HTTP status (e.g. 200). */
-#define HTTP_EPARSE   (-2)   /* malformed URL                                  */
-#define HTTP_ERESOLVE (-3)   /* DNS lookup failed                              */
-#define HTTP_ECONNECT (-4)   /* TCP/TLS connect failed                         */
-#define HTTP_ESEND    (-5)   /* sending the request failed                     */
-#define HTTP_ENORESP  (-6)   /* connection closed before a full header block   */
-#define HTTP_EINTR    (-7)   /* Ctrl+C arrived mid-transfer                    */
-#define HTTP_EABORT   (-8)   /* the body sink asked to stop                    */
+/* Negative status codes; a non-negative return is the HTTP status (e.g. 200).
+ */
+#define HTTP_EPARSE (-2)   /* malformed URL                                  */
+#define HTTP_ERESOLVE (-3) /* DNS lookup failed */
+#define HTTP_ECONNECT (-4) /* TCP/TLS connect failed */
+#define HTTP_ESEND (-5)    /* sending the request failed                     */
+#define HTTP_ENORESP (-6)  /* connection closed before a full header block   */
+#define HTTP_EINTR (-7)    /* Ctrl+C arrived mid-transfer                    */
+#define HTTP_EABORT (-8)   /* the body sink asked to stop                    */
 
 /* Body sink: called with successive chunks of the response body. Return 0 to
  * keep going, non-zero to abort the transfer (http_request then returns
@@ -28,33 +29,28 @@ typedef int (*http_body_fn)(void *ctx, const unsigned char *buf, int len);
  * hdrcap-1 bytes) and *hdrlen set. Body bytes go to body(ctx, ...) as they
  * arrive (body/ctx may be NULL to discard). Returns the HTTP status code, or a
  * negative HTTP_E* code. */
-int http_request(const char *method, const char *url,
-                 char *hdr, int hdrcap, int *hdrlen,
-                 http_body_fn body, void *ctx);
+int http_request(const char *method, const char *url, char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx);
 
 /* Same contract as http_request, but speaks HTTP/2 where possible: over http://
  * it uses h2c "prior knowledge" (sends the HTTP/2 connection preface straight
  * away); over https:// it uses HTTP/2 when TLS ALPN negotiates "h2", else falls
  * back to HTTP/1.1. Returns the HTTP status or a negative HTTP_E* code. */
-int http_request2(const char *method, const char *url,
-                  char *hdr, int hdrcap, int *hdrlen,
-                  http_body_fn body, void *ctx);
+int http_request2(const char *method, const char *url, char *hdr, int hdrcap, int *hdrlen, http_body_fn body,
+                  void *ctx);
 
 /* Same contract, over HTTP/3: opens a QUIC connection (its own UDP socket) and
  * runs the request on stream 0. https-only — over http:// it returns
  * HTTP_ECONNECT. Returns the HTTP status or a negative HTTP_E* code. */
-int http_request3(const char *method, const char *url,
-                  char *hdr, int hdrcap, int *hdrlen,
-                  http_body_fn body, void *ctx);
+int http_request3(const char *method, const char *url, char *hdr, int hdrcap, int *hdrlen, http_body_fn body,
+                  void *ctx);
 
 /* The full request core the wrappers use. `want_h2` offers HTTP/2 (h2c over
  * http://, ALPN over https://); `want_h3` runs HTTP/3 over QUIC (https only,
  * takes precedence); `extra_headers` is an optional "name: value\r\n…" block
  * appended to the request (e.g. curl -H). Returns the HTTP status or a negative
  * HTTP_E* code. */
-int http_request_ex(const char *method, const char *url, int want_h2, int want_h3,
-                    const char *extra_headers, char *hdr, int hdrcap, int *hdrlen,
-                    http_body_fn body, void *ctx);
+int http_request_ex(const char *method, const char *url, int want_h2, int want_h3, const char *extra_headers, char *hdr,
+                    int hdrcap, int *hdrlen, http_body_fn body, void *ctx);
 
 /* Convenience: GET, body to the sink. */
 int http_get(const char *url, http_body_fn body, void *ctx);

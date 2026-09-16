@@ -16,11 +16,11 @@
 #include <stdint.h>
 
 struct mdns_service {
-	char     instance[128]; /* DNS-SD instance label (first, ".", of the PTR) */
-	char     host[128];     /* SRV target, usually <id>.local                 */
-	uint8_t  ip[4];         /* resolved A, 0.0.0.0 if unknown                 */
-	uint16_t port;          /* SRV port                                       */
-	char     txt[512];      /* raw TXT rdata, entries NUL-joined              */
+  char instance[128]; /* DNS-SD instance label (first, ".", of the PTR) */
+  char host[128];     /* SRV target, usually <id>.local                 */
+  uint8_t ip[4];      /* resolved A, 0.0.0.0 if unknown                 */
+  uint16_t port;      /* SRV port                                       */
+  char txt[512];      /* raw TXT rdata, entries NUL-joined              */
 };
 
 /* Resolve one ".local" name's A record. 1 = ip filled, 0 = miss/timeout,
@@ -30,7 +30,6 @@ int mdns_resolve(const char *host, uint8_t ip[4]);
 /* Discover instances of a DNS-SD service type (e.g. "_ipp._tcp.local").
  * Fills up to `max` entries, correlating SRV/TXT/A found in the responses;
  * returns the count (>=0), or <0 on error (NET_EINTR on Ctrl+C). */
-int mdns_browse(const char *service, struct mdns_service *out,
-                int max, int timeout_ms);
+int mdns_browse(const char *service, struct mdns_service *out, int max, int timeout_ms);
 
 #endif /* MDNS_H */

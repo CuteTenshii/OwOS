@@ -1,25 +1,27 @@
 /* vmware.h — VMware hypervisor backdoor I/O channel.
  *
- * VMware (and QEMU's `vmport`) expose a magic I/O port that the guest pokes with
- * a special `in` instruction: the hypervisor reads the general-purpose registers,
- * services the command in ECX, and writes the results back into the same
- * registers. It's the transport under vmmouse, time sync, the balloon, and the
- * guest RPC channel. We only use the low-bandwidth single-instruction form. */
+ * VMware (and QEMU's `vmport`) expose a magic I/O port that the guest pokes
+ * with a special `in` instruction: the hypervisor reads the general-purpose
+ * registers, services the command in ECX, and writes the results back into the
+ * same registers. It's the transport under vmmouse, time sync, the balloon, and
+ * the guest RPC channel. We only use the low-bandwidth single-instruction form.
+ */
 #ifndef OWOS_VMWARE_H
 #define OWOS_VMWARE_H
 
 #include <stdint.h>
 
-#define VMWARE_MAGIC 0x564D5868u   /* "VMXh" — EAX must hold this on every call  */
-#define VMWARE_PORT  0x5658        /* the backdoor I/O port (EDX)                 */
+#define VMWARE_MAGIC 0x564D5868u /* "VMXh" — EAX must hold this on every call  */
+#define VMWARE_PORT 0x5658       /* the backdoor I/O port (EDX)                 */
 
 #define VMWARE_CMD_GETVERSION 10
 
 /* The register file shuffled through the backdoor. EAX is the magic on the way
  * in and a status/result on the way out; EBX/ECX/EDX carry command parameters
- * and results; ESI/EDI are used only by the bulk RPC commands we don't issue. */
+ * and results; ESI/EDI are used only by the bulk RPC commands we don't issue.
+ */
 struct vmware_regs {
-	uint32_t eax, ebx, ecx, edx, esi, edi;
+  uint32_t eax, ebx, ecx, edx, esi, edi;
 };
 
 /* Raw backdoor call: execute the magic `in` with r preloaded; r is overwritten

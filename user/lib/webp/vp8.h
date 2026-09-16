@@ -15,15 +15,14 @@
 #define OWOS_VP8_H
 
 enum {
-	VP8_OK      =  0,
-	VP8_EFORMAT = -1,   /* not a valid VP8 key frame / corrupt bitstream */
-	VP8_ENOMEM  = -2,   /* allocation failed                            */
+  VP8_OK = 0,
+  VP8_EFORMAT = -1, /* not a valid VP8 key frame / corrupt bitstream */
+  VP8_ENOMEM = -2,  /* allocation failed                            */
 };
 
 /* Decode a raw VP8 key-frame payload (the bytes of a "VP8 " chunk) into a fresh
  * malloc'd RGBA buffer (4*w*h, byte order R,G,B,A; alpha set to 255). Fills *w
  * and *h. Returns VP8_OK or a VP8_E* code; on error *out is left NULL. */
-int vp8_decode(const unsigned char *data, int size,
-               unsigned char **out, unsigned *w, unsigned *h);
+int vp8_decode(const unsigned char *data, int size, unsigned char **out, unsigned *w, unsigned *h);
 
 #endif /* OWOS_VP8_H */

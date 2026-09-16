@@ -6,7 +6,7 @@
 #ifndef OWOS_LIBH3_H
 #define OWOS_LIBH3_H
 
-#include "http.h"   /* http_body_fn + HTTP_E* status/error codes */
+#include "http.h" /* http_body_fn + HTTP_E* status/error codes */
 
 /* Perform one HTTP/3 (always https) request: open a QUIC connection to
  * host:port, send the request on stream 0, and stream the response body to
@@ -14,10 +14,9 @@
  * :path; `extra_headers` an optional "name: value\r\n…" block (curl -H). The
  * decoded response header block ("HTTP/3 NNN\r\nname: value\r\n…", blank-line
  * terminated) is copied into hdr (NUL-terminated, up to hdrcap-1) with *hdrlen
- * set, mirroring http_request(). Returns the HTTP status or a negative HTTP_E*. */
-int h3_run(const char *host, int port, const char *authority,
-           const char *method, const char *path, const char *extra_headers,
-           char *hdr, int hdrcap, int *hdrlen,
-           http_body_fn body, void *ctx);
+ * set, mirroring http_request(). Returns the HTTP status or a negative HTTP_E*.
+ */
+int h3_run(const char *host, int port, const char *authority, const char *method, const char *path,
+           const char *extra_headers, char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx);
 
 #endif /* OWOS_LIBH3_H */

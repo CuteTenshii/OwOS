@@ -9,10 +9,10 @@
 #define OWOS_AML_H
 
 struct aml_battery {
-	int percent;        /* 0..100 remaining charge                              */
-	int charging;       /* 1 if the _BST state says charging                    */
-	int discharging;    /* 1 if discharging                                     */
-	int minutes;        /* est. minutes to empty when discharging, else -1      */
+  int percent;     /* 0..100 remaining charge                              */
+  int charging;    /* 1 if the _BST state says charging                    */
+  int discharging; /* 1 if discharging                                     */
+  int minutes;     /* est. minutes to empty when discharging, else -1      */
 };
 
 /* Evaluate the first ACPI battery's _BST/_BIF and fill *out. Returns 1 on

@@ -2,33 +2,34 @@
  *
  * js.c holds the core: the DOM/window/document bindings, the engine setup that
  * builds every prototype, the service-worker scope builder (which consumes the
- * whole API surface), and the document/REPL runners. Self-contained web-platform
- * subsystems (IndexedDB, ...) live in their own js_*.c files. They all share the
- * one per-page engine context and a handful of low-level helpers declared here;
- * the definitions live in js.c. Each subsystem exposes a setup entry (installs
- * its constructors onto `window`) plus, if it drives async delivery, a pump in
- * browser.h. This header is browser-internal — the public js_* entry points the
- * rest of the browser calls stay in browser.h. */
+ * whole API surface), and the document/REPL runners. Self-contained
+ * web-platform subsystems (IndexedDB, ...) live in their own js_*.c files. They
+ * all share the one per-page engine context and a handful of low-level helpers
+ * declared here; the definitions live in js.c. Each subsystem exposes a setup
+ * entry (installs its constructors onto `window`) plus, if it drives async
+ * delivery, a pump in browser.h. This header is browser-internal — the public
+ * js_* entry points the rest of the browser calls stay in browser.h. */
 #ifndef BROWSER_JSINT_H
 #define BROWSER_JSINT_H
 
-#include "browser.h"      /* owos.h, dom.h (DOM + lower/streq_ci), struct browser */
-#include "interp.h"       /* js_ctx, js_run, js_call, js_ctx_new, js_def_native   */
-#include "parser.h"       /* js_parse, js_arena                                   */
-#include "gc.h"           /* gc_add_root / gc_remove_root / scopes                */
+#include "browser.h" /* owos.h, dom.h (DOM + lower/streq_ci), struct browser */
+#include "gc.h"      /* gc_add_root / gc_remove_root / scopes                */
+#include "interp.h"  /* js_ctx, js_run, js_call, js_ctx_new, js_def_native   */
+#include "parser.h"  /* js_parse, js_arena                                   */
 
 /* Nth call argument or undefined — the ubiquitous native-function arg accessor.
- * Expands `args`/`argc` from the enclosing js_native, so every module gets it. */
+ * Expands `args`/`argc` from the enclosing js_native, so every module gets it.
+ */
 #define A(i) ((i) < argc ? args[i] : js_undef())
 
 /* ---- shared per-page state (defined in js.c) ---------------------------- */
-extern js_ctx    *g_ctx;         /* the engine context for the whole current page  */
-extern int        g_page_live;   /* a page context is currently alive              */
+extern js_ctx *g_ctx;               /* the engine context for the whole current page  */
+extern int g_page_live;             /* a page context is currently alive              */
 extern js_object *g_response_proto; /* fetch() Response.prototype (fetch + SW share) */
-extern char       g_page_url_buf[]; /* the current page URL (module + SW referrer)    */
+extern char g_page_url_buf[];       /* the current page URL (module + SW referrer) */
 extern js_object *g_media_proto;    /* HTMLMediaElement.prototype (core wraps <audio>/<video>) */
-extern js_object *g_remote_proto;   /* RemotePlayback.prototype (media.remote)          */
-extern js_object *g_remotes;        /* rooted array of live RemotePlayback wrappers      */
+extern js_object *g_remote_proto;   /* RemotePlayback.prototype (media.remote) */
+extern js_object *g_remotes;        /* rooted array of live RemotePlayback wrappers */
 
 /* ---- shared low-level helpers (defined in js.c) ------------------------- */
 
@@ -50,12 +51,15 @@ void def_acc(js_object *proto, const char *name, js_native get, js_native set);
 js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_dispatch(js_ctx *ctx, js_value t, js_value *args, int argc);
-int      ev_flag(js_value ev, const char *k);
-void     ev_fire_on(js_object *obj, js_value ev, int want_capture);
+int ev_flag(js_value ev, const char *k);
+void ev_fire_on(js_object *obj, js_value ev, int want_capture);
 js_value make_event(const char *type, int x, int y, js_value init);
 
 /* a growable byte buffer (NUL-terminated); realloc-backed, caller frees s->b */
-typedef struct { char *b; int n, cap; } sbuf;
+typedef struct {
+  char *b;
+  int n, cap;
+} sbuf;
 void sb_putc(sbuf *s, char c);
 void sb_puts(sbuf *s, const char *t);
 void sb_putn(sbuf *s, const char *t, int n);
@@ -67,41 +71,42 @@ const unsigned char *view_bytes(js_value v, int *len);
  * can reference/extend it and `x instanceof Foo` holds) */
 void define_iface(js_ctx *ctx, js_object *win, const char *name, js_object *proto);
 
-/* ---- shared helpers used by the service-worker module (defined in js.c) --- */
-int      arenas_push(js_arena *ar);             /* keep a script's AST arena alive  */
+/* ---- shared helpers used by the service-worker module (defined in js.c) ---
+ */
+int arenas_push(js_arena *ar);                                       /* keep a script's AST arena alive  */
 js_value el_noop(js_ctx *ctx, js_value t, js_value *args, int argc); /* no-op native */
 js_value hdr_get(js_ctx *ctx, js_value t, js_value *args, int argc); /* Headers.get   */
 js_value hdr_has(js_ctx *ctx, js_value t, js_value *args, int argc); /* Headers.has   */
-void     js_set_cur_script(const char *label);  /* current script name for exc attribution */
-js_value make_message_event(js_value data);     /* a MessageEvent carrying `data`   */
-js_object *make_response(js_ctx *ctx, const char *url, int status, const char *statustext,
-                         const char *ctype, const char *body, int len);  /* fetch Response */
-void     notif_app_name(char *buf, int cap);    /* the app name for a Notification  */
-int      perm_state_now(int feature);           /* current permission state (PERM_*) */
+void js_set_cur_script(const char *label);                           /* current script name for exc attribution */
+js_value make_message_event(js_value data);                          /* a MessageEvent carrying `data` */
+js_object *make_response(js_ctx *ctx, const char *url, int status, const char *statustext, const char *ctype,
+                         const char *body, int len); /* fetch Response */
+void notif_app_name(char *buf, int cap);             /* the app name for a Notification  */
+int perm_state_now(int feature);                     /* current permission state (PERM_*) */
 const char *perm_state_str(int state);
-int      worker_permission(int feature);
-void     report_exc(js_ctx *ctx);               /* print + clear a pending exception */
+int worker_permission(int feature);
+void report_exc(js_ctx *ctx);                                          /* print + clear a pending exception */
 js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc); /* window.fetch */
-void     emit_event(js_object *w, const char *type, js_value data); /* fire a plain Event on w */
+void emit_event(js_object *w, const char *type, js_value data);        /* fire a plain Event on w */
 
 /* ---- subsystem setup entry points --------------------------------------- */
-void js_idb_setup(js_ctx *ctx, js_object *win);   /* IndexedDB (js_indexeddb.c) */
-void js_idb_teardown(void);                       /* unroot the page's IDB state  */
+void js_idb_setup(js_ctx *ctx, js_object *win);    /* IndexedDB (js_indexeddb.c) */
+void js_idb_teardown(void);                        /* unroot the page's IDB state  */
 void js_webapi_setup(js_ctx *ctx, js_object *win); /* performance + Encoding (js_webapi.c) */
 void js_webapi_teardown(void);                     /* unroot the Encoding-API prototypes  */
 
 /* HTMLMediaElement + Remote Playback + new Image()/Audio() (js_media.c). The
  * media/remote prototypes are allocated in setup_dom's batch (above); these
  * configure them and own the Cast session state + pump. */
-void     setup_media_proto(js_ctx *ctx);
-void     setup_remote_proto(js_ctx *ctx);
+void setup_media_proto(js_ctx *ctx);
+void setup_remote_proto(js_ctx *ctx);
 js_value image_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
-void     js_cast_page_end(void);                   /* tear the page's Cast session down   */
+void js_cast_page_end(void); /* tear the page's Cast session down   */
 
 /* Service workers (js_serviceworker.c). The Cache API + registration store is
  * process-persistent C state; the JS surface is rebuilt per navigation. */
 void sw_install(js_ctx *ctx, js_object *win, const char *page_url);
-void sw_teardown(void);                           /* drop the per-page SW JS objects */
-int  sw_intercept_fetch(js_ctx *ctx, const char *url, const char *method, js_value *out);
+void sw_teardown(void); /* drop the per-page SW JS objects */
+int sw_intercept_fetch(js_ctx *ctx, const char *url, const char *method, js_value *out);
 
 #endif /* BROWSER_JSINT_H */

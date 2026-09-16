@@ -7,7 +7,8 @@
  *   - anything else is a unicast DNS A-record query to the nameserver in
  *     /etc/resolv.conf (a sane default if that's missing/unreadable).
  * The DNS wire build/parse mirrors dig.c (name-compression aware). Links with
- * $(RESOLVE), which pulls in $(MDNS). Interruptible: NET_EINTR (-4) on Ctrl+C. */
+ * $(RESOLVE), which pulls in $(MDNS). Interruptible: NET_EINTR (-4) on Ctrl+C.
+ */
 #ifndef RESOLVE_H
 #define RESOLVE_H
 
@@ -15,9 +16,10 @@
  * failure/timeout, or NET_EINTR (-4) if a cooperative Ctrl+C arrived. */
 int resolve(const char *host, unsigned char ip[4]);
 
-/* Convenience for the raw socket callers (ping's target, dig's @server): resolve
- * `host` then net_connect the resulting IP with (port, proto). Returns the socket
- * handle (>=0), or a negative net_connect-style error (-2 resolve, -4 intr). */
+/* Convenience for the raw socket callers (ping's target, dig's @server):
+ * resolve `host` then net_connect the resulting IP with (port, proto). Returns
+ * the socket handle (>=0), or a negative net_connect-style error (-2 resolve,
+ * -4 intr). */
 int net_dial(const char *host, int port, int proto);
 
 #endif /* RESOLVE_H */
