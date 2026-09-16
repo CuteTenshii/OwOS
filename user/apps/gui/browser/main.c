@@ -5069,7 +5069,7 @@ int main(int argc, char **argv)
         B->seq++;         /* re-wrap + repaint at the new width */
       }
     }
-    /* History API requests posted by JS on the worker (see browser/js.c).
+    /* History API requests posted by JS on the worker (see browser/js/bindings.c).
      * pushState/replaceState is applied before a back/forward posted in the
      * same script tick, so the entry it added is in place first. */
     if (B->hist_nav) { /* pushState / replaceState */

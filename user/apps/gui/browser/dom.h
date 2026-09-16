@@ -34,7 +34,7 @@ struct dom_node {
   void *computed_style;
   void *computed_style_sheet;
   unsigned computed_style_seq;
-  void *wrapper; /* cached JS wrapper object (browser/js.c),
+  void *wrapper; /* cached JS wrapper object (browser/js/bindings.c),
                   * NULL until first exposed to script — gives
                   * a node stable identity so listeners stick. */
 };
@@ -45,7 +45,7 @@ struct dom_node *dom_parse(const char *html, int len);
 void dom_free(struct dom_node *root);
 const char *dom_get_attr(const struct dom_node *node, const char *name);
 
-/* Mutation API used by the JS DOM bindings (browser/js.c). Nodes are plain
+/* Mutation API used by the JS DOM bindings (browser/js/bindings.c). Nodes are plain
  * malloc'd cells; appended nodes are owned by the tree and freed by dom_free.
  */
 struct dom_node *dom_new_element(const char *tag);

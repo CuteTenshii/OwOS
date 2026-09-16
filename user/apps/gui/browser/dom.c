@@ -465,7 +465,7 @@ struct dom_node *dom_parse(const char *html, int len)
   return ps.root;
 }
 
-/* Set by browser/js.c: invoked when a node that has a JS wrapper is freed, so
+/* Set by browser/js/bindings.c: invoked when a node that has a JS wrapper is freed, so
  * the wrapper can be detached (host cleared) instead of dangling. NULL when no
  * JS. */
 void (*dom_on_free_wrapper)(void *wrapper);
@@ -547,7 +547,7 @@ const char *dom_get_attr(const struct dom_node *node, const char *name)
   return 0;
 }
 
-/* --- mutation API (for the JS DOM bindings; see browser/js.c) --------------
+/* --- mutation API (for the JS DOM bindings; see browser/js/bindings.c) ------
  */
 
 struct dom_node *dom_new_element(const char *tag)
