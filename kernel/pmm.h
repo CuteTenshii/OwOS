@@ -14,6 +14,8 @@ void pmm_init(const struct multiboot_info *mbi);
 
 uint32_t pmm_alloc_frame(void);        /* physical addr of a free frame, or 0 */
 void     pmm_free_frame(uint32_t phys);
+void     pmm_retain_frame(uint32_t phys);
+uint32_t pmm_frame_refs(uint32_t phys);
 
 /* Reserve a physically contiguous run of `bytes` (rounded up to whole frames)
  * and return its base physical address, or 0 if no run that large is free. For

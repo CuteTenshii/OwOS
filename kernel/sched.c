@@ -455,8 +455,8 @@ int sched_fork(struct registers *r)
 		t->sig_mask[i] = current->sig_mask[i];
 		t->sig_flags[i] = current->sig_flags[i];
 	}
-	/* The child owns a private copy of the parent's address space (paging_fork_dir
-	 * duplicated every window page, heap included), so it inherits the break. */
+	/* The child shares the parent's user pages copy-on-write, so it inherits the
+	 * same heap break without copying the address space. */
 	{	task_t *o = heap_owner_of(current);
 		t->brk = o->brk; t->brk_base = o->brk_base; }
 	cwd_set(t->cwd, current->cwd);
@@ -576,6 +576,8 @@ static void reap_task(task_t *t)
 				__asm__ volatile ("sti");
 			if (th->kstack)
 				kfree(th->kstack);
+			if (th->self_reap && th->state == TASK_ZOMBIE && detached_zombies > 0)
+				detached_zombies--;
 			kfree(th);
 		}
 		paging_free_process_dir(t->dir);
@@ -747,6 +749,21 @@ void sched_exit(int status)
 	current->state = TASK_ZOMBIE;
 	if (current->self_reap)           /* nobody waitpid's us: queue for schedule() to free */
 		detached_zombies++;
+
+	/* Reparent live children to the permanent main task. Detached children are
+	 * marked for scheduler-side reaping because main never waits on them. */
+	task_t *child = &main_task;
+	do {
+		if (child != current && child->parent == current->id) {
+			child->parent = main_task.id;
+			if (child->self_reap == 0) {
+				child->self_reap = 1;
+				if (child->state == TASK_ZOMBIE)
+					detached_zombies++;
+			}
+		}
+		child = child->next;
+	} while (child != &main_task);
 
 	/* Notify the parent of our death. Post SIGCHLD only if the parent installed a
 	 * real handler (default disposition is ignore — posting it then would just leave

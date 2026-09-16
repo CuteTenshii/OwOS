@@ -275,9 +275,7 @@ static int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t
  * the call -- otherwise a program could make the kernel touch its memory. */
 static int user_range(uint32_t addr, uint32_t len)
 {
-	return addr >= USER_BASE
-	    && addr + len <= USER_REGION_END
-	    && addr + len >= addr;          /* no overflow                       */
+	return paging_user_range(addr, len, 0);
 }
 
 /* Copy a NUL-terminated user string at `uaddr` into `out` (`cap` bytes),

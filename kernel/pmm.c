@@ -15,6 +15,7 @@
 #define RESERVED_FRAMES (RESERVED_BYTES / FRAME_SIZE)
 
 static uint32_t bitmap[BITMAP_DWORDS];
+static uint16_t refs[MAX_FRAMES];
 static uint32_t total_frames;
 static uint32_t used_frames;
 
@@ -135,8 +136,8 @@ void pmm_init(const struct multiboot_info *mbi)
 	/* Reserve the low 16 MiB (kernel image + identity-mapped heap). */
 	for (uint32_t f = 0; f < (low_end_b / FRAME_SIZE) && f < total_frames; f++) {
 		if (!frame_test(f)) {
-			frame_set(f);
-			used_frames++;
+				frame_set(f);
+				used_frames++;
 		}
 	}
 
@@ -149,6 +150,7 @@ uint32_t pmm_alloc_frame(void)
 	for (uint32_t f = alloc_hint; f < total_frames; f++) {
 		if (!frame_test(f)) {
 			frame_set(f);
+			refs[f] = 1;
 			used_frames++;
 			alloc_hint = f + 1;
 			return f * FRAME_SIZE;
@@ -158,6 +160,7 @@ uint32_t pmm_alloc_frame(void)
 	for (uint32_t f = (low_end_b / FRAME_SIZE); f < alloc_hint; f++) {
 		if (!frame_test(f)) {
 			frame_set(f);
+			refs[f] = 1;
 			used_frames++;
 			alloc_hint = f + 1;
 			return f * FRAME_SIZE;
@@ -187,6 +190,7 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
 		if (run == need) {                 /* found a long-enough free run     */
 			for (uint32_t i = 0; i < need; i++) {
 				frame_set(f + i);
+				refs[f + i] = 1;
 				used_frames++;
 			}
 			return f * FRAME_SIZE;
@@ -200,11 +204,29 @@ void pmm_free_frame(uint32_t phys)
 {
 	uint32_t f = phys / FRAME_SIZE;
 	if (f < total_frames && frame_test(f)) {
+		if (refs[f] > 1) {
+			refs[f]--;
+			return;
+		}
+		refs[f] = 0;
 		frame_clear(f);
 		used_frames--;
 		if (f < alloc_hint)        /* let the next alloc reuse this frame */
 			alloc_hint = f;
 	}
+}
+
+void pmm_retain_frame(uint32_t phys)
+{
+	uint32_t f = phys / FRAME_SIZE;
+	if (f < total_frames && frame_test(f) && refs[f] != 0 && refs[f] != 0xFFFF)
+		refs[f]++;
+}
+
+uint32_t pmm_frame_refs(uint32_t phys)
+{
+	uint32_t f = phys / FRAME_SIZE;
+	return f < total_frames ? refs[f] : 0;
 }
 
 /* Release a run previously handed out by pmm_alloc_contig. The bitmap allocator

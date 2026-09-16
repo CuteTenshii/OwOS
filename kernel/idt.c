@@ -10,6 +10,7 @@
 #include "sched.h"
 #include "signal.h"
 #include "crash.h"
+#include "paging.h"
 
 #ifdef __x86_64__
 /* One 16-byte 64-bit interrupt gate descriptor. */
@@ -247,6 +248,9 @@ void isr_handler(struct registers *r)
 		sched_signal_deliver(r);   /* run any pending signal on the way to ring 3 */
 		return;
 	}
+	if (r->int_no == 14 &&
+	    paging_handle_page_fault((uint32_t)read_cr2(), r->err_code))
+		return;
 
 	/* A fault that came from ring 3 (CS RPL = 3) is a user-program bug, not a
 	 * kernel one. If the task installed a handler for the matching signal, deliver

@@ -29,6 +29,7 @@
 #define PAGE_USER    0x4
 #define PAGE_PWT     0x8   /* write-through bit; selects PAT entry 1 here      */
 #define PAGE_PCD     0x10  /* cache-disable bit; UC- mapping for MMIO regs     */
+#define PAGE_COW     0x200 /* software bit: user page is shared read-only     */
 
 /* Scratch mapping window: a single 4 KiB-granular page table installed into the
  * shared kernel mapping at boot, covering SCRATCH_VADDR.. so the kernel can
@@ -130,6 +131,10 @@ void paging_init(void)
 
 	/* Long mode is already on (boot.S); just install our tables. */
 	__asm__ volatile ("mov %0, %%cr3" : : "r"((uint64_t)(uintptr_t)master_pml4) : "memory");
+	{
+		uintptr_t cr0 = read_cr0();
+		write_cr0(cr0 | 0x10000);       /* CR0.WP: supervisor writes honor RO PTEs */
+	}
 }
 
 uint32_t paging_kernel_phys(void)
@@ -266,6 +271,23 @@ int paging_user_mapped(uint32_t vaddr)
 	return pte && (*pte & PAGE_PRESENT) && (*pte & PAGE_USER);
 }
 
+int paging_user_range(uint32_t vaddr, uint32_t len, int write)
+{
+	uint64_t end;
+	if (vaddr < USER_BASE || (uint64_t)vaddr + len > USER_REGION_END)
+		return 0;
+	if (!len)
+		return 1;
+	end = (uint64_t)vaddr + len;
+	for (uint64_t a = vaddr & ~0xFFFULL; a < end; a += 4096) {
+		uint64_t *pte = get_pte(current_pml4(), a);
+		if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER) ||
+		    (write && !(*pte & PAGE_RW)))
+			return 0;
+	}
+	return 1;
+}
+
 uint32_t paging_user_phys(uint32_t *dir, uint32_t vaddr)
 {
 	uint64_t *pte = get_pte((uint64_t *)(void *)dir, vaddr);
@@ -302,6 +324,39 @@ void paging_unmap_user_at(uint32_t *dir, uint32_t vaddr, uint32_t bytes)
 	}
 }
 
+int paging_handle_page_fault(uint32_t vaddr, uint32_t error)
+{
+	uint64_t *pte;
+	uint32_t old, fresh;
+	if (!(error & 2) || vaddr < USER_BASE || vaddr >= USER_REGION_END)
+		return 0;
+	pte = get_pte(current_pml4(), vaddr);
+	if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER) || !(*pte & PAGE_COW))
+		return 0;
+	old = (uint32_t)(*pte & PG_ADDR);
+	if (pmm_frame_refs(old) <= 1) {
+		*pte = (*pte | PAGE_RW) & ~PAGE_COW;
+		invlpg(vaddr);
+		return 1;
+	}
+	fresh = pmm_alloc_frame();
+	if (!fresh)
+		return 0;
+	{
+		uint32_t fl = irq_save();
+		uint32_t *src = paging_scratch_map(0, old);
+		uint32_t *dst = paging_scratch_map(1, fresh);
+		for (int i = 0; i < 1024; i++) dst[i] = src[i];
+		paging_scratch_unmap(1);
+		paging_scratch_unmap(0);
+		irq_restore(fl);
+	}
+	*pte = (fresh & PG_ADDR) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+	invlpg(vaddr);
+	pmm_free_frame(old);
+	return 1;
+}
+
 uint32_t *paging_fork_dir(uint32_t *parent)
 {
 	uint64_t *pp   = (uint64_t *)(void *)parent;
@@ -321,25 +376,17 @@ uint32_t *paging_fork_dir(uint32_t *parent)
 					continue;
 				uint64_t va = ((uint64_t)1 << 30)          /* PDPT slot 1 = 1 GiB    */
 				            + ((uint64_t)d << 21) + ((uint64_t)t << 12);
-				uint32_t cf = pmm_alloc_frame();
-				if (!cf) {
+				uint32_t phys = (uint32_t)(ppt[t] & PG_ADDR);
+				if (paging_map_user_at(cdir, (uint32_t)va, phys, 1) < 0) {
 					paging_free_process_dir(cdir);
 					return 0;
 				}
-				/* Both frames live above the identity map; copy the 4 KiB through
-				 * the supervisor scratch slots, IF off so they aren't stolen. */
-				uint32_t fl = irq_save();
-				uint32_t *pv = paging_scratch_map(0, (uint32_t)(ppt[t] & PG_ADDR));
-				uint32_t *cv = paging_scratch_map(1, cf);
-				for (int k = 0; k < 1024; k++)
-					cv[k] = pv[k];
-				paging_scratch_unmap(1);
-				paging_scratch_unmap(0);
-				irq_restore(fl);
-				if (paging_map_user_at(cdir, (uint32_t)va, cf, 1) < 0) {
-					pmm_free_frame(cf);
-					paging_free_process_dir(cdir);
-					return 0;
+				{
+					uint64_t *cpte = get_pte((uint64_t *)(void *)cdir, va);
+					ppt[t] = (ppt[t] & ~PAGE_RW) | PAGE_COW;
+					*cpte = (*cpte & ~PAGE_RW) | PAGE_COW;
+					invlpg(va);
+					pmm_retain_frame(phys);
 				}
 			}
 		}
@@ -540,7 +587,7 @@ void paging_init(void)
 	__asm__ volatile ("mov %0, %%cr3" : : "r"(page_directory));
 
 	uintptr_t cr0 = read_cr0();
-	cr0 |= 0x80000000;                 /* CR0.PG                              */
+	cr0 |= 0x80010000;                 /* CR0.PG + CR0.WP                     */
 	write_cr0(cr0);
 }
 
@@ -663,6 +710,29 @@ int paging_user_mapped(uint32_t vaddr)
 	return (pte & PAGE_PRESENT) && (pte & PAGE_USER);
 }
 
+int paging_user_range(uint32_t vaddr, uint32_t len, int write)
+{
+	uint64_t end;
+	if (vaddr < USER_BASE || (uint64_t)vaddr + len > USER_REGION_END)
+		return 0;
+	if (!len)
+		return 1;
+	end = (uint64_t)vaddr + len;
+	for (uint32_t a = vaddr & ~0xFFFu; (uint64_t)a < end; a += 4096) {
+		uint32_t pde = ((uint32_t *)read_cr3())[a >> 22];
+		uint32_t *pt;
+		uint32_t pte;
+		if (!(pde & PAGE_PRESENT))
+			return 0;
+		pt = (uint32_t *)(pde & ~0xFFFu);
+		pte = pt[(a >> 12) & 0x3FF];
+		if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER) ||
+		    (write && !(pte & PAGE_RW)))
+			return 0;
+	}
+	return 1;
+}
+
 uint32_t paging_user_phys(uint32_t *dir, uint32_t vaddr)
 {
 	uint32_t pde = dir[vaddr >> 22];
@@ -671,6 +741,43 @@ uint32_t paging_user_phys(uint32_t *dir, uint32_t vaddr)
 	uint32_t *pt = (uint32_t *)(pde & ~0xFFFu);
 	uint32_t pte = pt[(vaddr >> 12) & 0x3FF];
 	return (pte & PAGE_PRESENT) ? (pte & ~0xFFFu) : 0;
+}
+
+int paging_handle_page_fault(uint32_t vaddr, uint32_t error)
+{
+	uint32_t *pd, pde, *pt, pte, old, fresh;
+	if (!(error & 2) || vaddr < USER_BASE || vaddr >= USER_REGION_END)
+		return 0;
+	pd = (uint32_t *)(uintptr_t)read_cr3();
+	pde = pd[vaddr >> 22];
+	if (!(pde & PAGE_PRESENT) || !(pde & PAGE_USER))
+		return 0;
+	pt = (uint32_t *)(pde & ~0xFFFu);
+	pte = pt[(vaddr >> 12) & 0x3FF];
+	if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER) || !(pte & PAGE_COW))
+		return 0;
+	old = pte & ~0xFFFu;
+	if (pmm_frame_refs(old) <= 1) {
+		pt[(vaddr >> 12) & 0x3FF] = (pte | PAGE_RW) & ~PAGE_COW;
+		__asm__ volatile ("invlpg (%0)" : : "r"(vaddr) : "memory");
+		return 1;
+	}
+	fresh = pmm_alloc_frame();
+	if (!fresh)
+		return 0;
+	{
+		uint32_t fl = irq_save();
+		uint32_t *src = paging_scratch_map(0, old);
+		uint32_t *dst = paging_scratch_map(1, fresh);
+		for (int i = 0; i < 1024; i++) dst[i] = src[i];
+		paging_scratch_unmap(1);
+		paging_scratch_unmap(0);
+		irq_restore(fl);
+	}
+	pt[(vaddr >> 12) & 0x3FF] = fresh | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+	__asm__ volatile ("invlpg (%0)" : : "r"(vaddr) : "memory");
+	pmm_free_frame(old);
+	return 1;
 }
 
 uint32_t *paging_fork_dir(uint32_t *parent)
@@ -687,26 +794,19 @@ uint32_t *paging_fork_dir(uint32_t *parent)
 			if (!(ppt[i] & PAGE_PRESENT))
 				continue;
 			uint32_t vaddr = (pdi << 22) | ((uint32_t)i << 12);
-			uint32_t cf = pmm_alloc_frame();
-			if (!cf) {
-				paging_free_process_dir(child);
-				return 0;
-			}
-			/* Both frames live above the identity map; copy the 4 KiB through
-			 * the supervisor scratch slots, IF off so they aren't stolen. */
-			uint32_t fl = irq_save();
-			uint32_t *pv = paging_scratch_map(0, ppt[i] & ~0xFFFu);
-			uint32_t *cv = paging_scratch_map(1, cf);
-			for (int k = 0; k < 1024; k++)
-				cv[k] = pv[k];
-			paging_scratch_unmap(1);
-			paging_scratch_unmap(0);
-			irq_restore(fl);
-			if (paging_map_user_at(child, vaddr, cf, 1) < 0) {
-				pmm_free_frame(cf);
-				paging_free_process_dir(child);
-				return 0;
-			}
+				uint32_t phys = ppt[i] & ~0xFFFu;
+				if (paging_map_user_at(child, vaddr, phys, 1) < 0) {
+					paging_free_process_dir(child);
+					return 0;
+				}
+				{
+					uint32_t *cpt = (uint32_t *)(child[ vaddr >> 22] & ~0xFFFu);
+					ppt[i] = (ppt[i] & ~PAGE_RW) | PAGE_COW;
+					cpt[(vaddr >> 12) & 0x3FF] =
+						(cpt[(vaddr >> 12) & 0x3FF] & ~PAGE_RW) | PAGE_COW;
+					__asm__ volatile ("invlpg (%0)" : : "r"(vaddr) : "memory");
+					pmm_retain_frame(phys);
+				}
 		}
 	}
 	return child;
