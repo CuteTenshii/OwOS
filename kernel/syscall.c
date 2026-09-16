@@ -46,6 +46,7 @@
 #include "syscall_audio.h"
 #include "syscall_fs.h"
 #include "syscall_graphics.h"
+#include "syscall_io.h"
 #include "syscall_net.h"
 #include "syscall_path.h"
 #include "syscall_process.h"
@@ -345,27 +346,10 @@ void syscall_dispatch(struct registers *r)
 {
   switch (r->eax) {
   case SYS_WRITE: {
-    int fd = (int)r->ebx;
-    const char *buf = (const char *)r->ecx;
-    uint32_t len = r->edx;
-    if (fd < 0 || fd >= MAX_FD || !user_range(r->ecx, len)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    struct fd *f = &sched_fds()[fd];
-    if (f->type == FD_CONSOLE) {
-      for (uint32_t i = 0; i < len; i++)
-        con_putc(buf[i]);
-      r->eax = len;
-    } else if (f->type == FD_PIPE_WR) {
-      r->eax = (uint32_t)pipe_write(f->pipe, buf, (int)len);
-    } else if (f->type == FD_CHANNEL) {
-      r->eax = (uint32_t)pipe_write(f->tx, buf, (int)len);
-    } else {
-      r->eax = (uint32_t)-1;
-    }
+    syscall_io_write(r);
     break;
   }
+
   case SYS_EXIT:
     syscall_process_exit(r);
     break;
@@ -373,8 +357,7 @@ void syscall_dispatch(struct registers *r)
     syscall_process_fork(r);
     break;
   case SYS_WAITPID:
-    /* edx & WNOHANG -> non-blocking reap: return 1 reaped / 0 none, exit status
-     * via *ecx. Otherwise block and return the child's exit status directly. */
+    /* edx & WNOHANG returns a reap result and optionally writes status. */
     if ((int)r->edx & WNOHANG) {
       int status = 0;
       int got = sched_try_reap((int)r->ebx, &status);
@@ -385,70 +368,17 @@ void syscall_dispatch(struct registers *r)
       r->eax = (uint32_t)sched_waitpid((int)r->ebx);
     }
     break;
+
   case SYS_PIPE: {
-    if (!user_range(r->ebx, 8)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    int id = pipe_alloc();
-    if (id < 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    struct fd *fds = sched_fds();
-    int rfd = -1, wfd = -1;
-    for (int i = 0; i < MAX_FD; i++)
-      if (fds[i].type == FD_NONE) {
-        rfd = i;
-        break;
-      }
-    for (int i = 0; i < MAX_FD; i++)
-      if (fds[i].type == FD_NONE && i != rfd) {
-        wfd = i;
-        break;
-      }
-    if (rfd < 0 || wfd < 0) {
-      pipe_close(id, 0);
-      pipe_close(id, 1);
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    fds[rfd].type = FD_PIPE_RD;
-    fds[rfd].pipe = (uint8_t)id;
-    fds[wfd].type = FD_PIPE_WR;
-    fds[wfd].pipe = (uint8_t)id;
-    int out[2] = {rfd, wfd};
-    if (copyout(r->ebx, out, sizeof out) != 0) {
-      pipe_close(id, 0);
-      pipe_close(id, 1);
-      fds[rfd].type = FD_NONE;
-      fds[wfd].type = FD_NONE;
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = 0;
+    syscall_io_pipe(r);
     break;
   }
+
   case SYS_CLOSE: {
-    int fd = (int)r->ebx;
-    if (fd < 0 || fd >= MAX_FD) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    struct fd *f = &sched_fds()[fd];
-    if (f->type == FD_PIPE_RD)
-      pipe_close(f->pipe, 0);
-    else if (f->type == FD_PIPE_WR)
-      pipe_close(f->pipe, 1);
-    else if (f->type == FD_CHANNEL) {
-      pipe_close(f->pipe, 0); /* this end reads rx  */
-      pipe_close(f->tx, 1);   /* and writes tx      */
-    } else if (f->type == FD_PORT)
-      ipc_port_destroy(f->pipe);
-    f->type = FD_NONE;
-    r->eax = 0;
+    syscall_io_close(r);
     break;
   }
+
   case SYS_EXEC: {
     if (!user_range(r->ebx, 24)) {
       r->eax = (uint32_t)-1;
@@ -514,46 +444,10 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_READ: {
-    int fd = (int)r->ebx;
-    char *buf = (char *)r->ecx;
-    uint32_t len = r->edx;
-    if (fd < 0 || fd >= MAX_FD || len == 0 || !user_out_range(r->ecx, len)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    struct fd *f = &sched_fds()[fd];
-    if (f->type == FD_CONSOLE) {
-      /* Block for the first key (interrupts on so the timer/keyboard
-       * keep firing), then drain whatever else is buffered. A pending
-       * signal breaks the wait with EINTR; keep sti;hlt (context_switch
-       * doesn't restore EFLAGS, so a bare hlt could halt forever). */
-      char c;
-      int got = 0;
-      __asm__ volatile("sti");
-      while (!(got = keyboard_poll(&c, 0))) {
-        if (sched_intr_pending())
-          break;
-        __asm__ volatile("hlt");
-      }
-      __asm__ volatile("cli");
-      if (!got) {
-        r->eax = (uint32_t)-1; /* interrupted before any input (EINTR) */
-        break;
-      }
-      uint32_t n = 0;
-      buf[n++] = c;
-      while (n < len && keyboard_poll(&c, 0))
-        buf[n++] = c;
-      r->eax = n;
-    } else if (f->type == FD_PIPE_RD) {
-      r->eax = (uint32_t)pipe_read(f->pipe, buf, (int)len);
-    } else if (f->type == FD_CHANNEL) {
-      r->eax = (uint32_t)pipe_read(f->pipe, buf, (int)len);
-    } else {
-      r->eax = (uint32_t)-1;
-    }
+    syscall_io_read(r);
     break;
   }
+
   case SYS_MSEC:
     syscall_process_msec(r);
     break;
@@ -561,74 +455,15 @@ void syscall_dispatch(struct registers *r)
     syscall_process_getuid(r);
     break;
   case SYS_PORT_OPEN: {
-    const char *name = (const char *)r->ebx;
-    int as_server = (int)r->ecx;
-    if (!user_range(r->ebx, 16)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    struct fd *fds = sched_fds();
-    int nfd = -1;
-    for (int i = 0; i < MAX_FD; i++)
-      if (fds[i].type == FD_NONE) {
-        nfd = i;
-        break;
-      }
-    if (nfd < 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    if (as_server) {
-      int pid = ipc_port_create(name);
-      if (pid < 0) {
-        r->eax = (uint32_t)-1;
-        break;
-      }
-      fds[nfd].type = FD_PORT;
-      fds[nfd].pipe = (uint8_t)pid;
-    } else {
-      int rx = 0, tx = 0;
-      if (ipc_connect(name, &rx, &tx) < 0) {
-        r->eax = (uint32_t)-1;
-        break;
-      }
-      fds[nfd].type = FD_CHANNEL;
-      fds[nfd].pipe = (uint8_t)rx;
-      fds[nfd].tx = (uint8_t)tx;
-    }
-    r->eax = (uint32_t)nfd;
+    syscall_io_port_open(r);
     break;
   }
+
   case SYS_PORT_ACCEPT: {
-    int lfd = (int)r->ebx;
-    struct fd *fds = sched_fds();
-    if (lfd < 0 || lfd >= MAX_FD || fds[lfd].type != FD_PORT) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    int rx = 0, tx = 0;
-    if (ipc_accept(fds[lfd].pipe, &rx, &tx) < 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    int nfd = -1;
-    for (int i = 0; i < MAX_FD; i++)
-      if (fds[i].type == FD_NONE) {
-        nfd = i;
-        break;
-      }
-    if (nfd < 0) { /* no slot: don't leak the new channel   */
-      pipe_close(rx, 0);
-      pipe_close(tx, 1);
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    fds[nfd].type = FD_CHANNEL;
-    fds[nfd].pipe = (uint8_t)rx;
-    fds[nfd].tx = (uint8_t)tx;
-    r->eax = (uint32_t)nfd;
+    syscall_io_port_accept(r);
     break;
   }
+
   case SYS_READFILE: {
     syscall_fs_readfile(r);
     break;
@@ -1109,20 +944,10 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_READ_NB: {
-    int fd = (int)r->ebx;
-    char *buf = (char *)r->ecx;
-    uint32_t len = r->edx;
-    if (fd < 0 || fd >= MAX_FD || len == 0 || !user_out_range(r->ecx, len)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    struct fd *f = &sched_fds()[fd];
-    if (f->type == FD_PIPE_RD)
-      r->eax = (uint32_t)pipe_read_nb(f->pipe, buf, (int)len);
-    else
-      r->eax = (uint32_t)-1;
+    syscall_io_read_nb(r);
     break;
   }
+
   case SYS_CHDIR: {
     syscall_fs_chdir(r);
     break;
