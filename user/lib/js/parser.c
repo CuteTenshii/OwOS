@@ -137,6 +137,21 @@ static int node_word_is(js_node *n, const char *w)
 
 static js_node *mk(js_parser *p, int type) { return js_node_new(p->arena, type, p->cur.line, p->cur.col); }
 
+static int grow_array(void **ptr, int *cap, int need, unsigned item_size)
+{
+  if (need <= *cap)
+    return 1;
+  int next = *cap ? *cap * 2 : 8;
+  while (next < need)
+    next *= 2;
+  void *p = realloc(*ptr, (unsigned)next * item_size);
+  if (!p)
+    return 0;
+  *ptr = p;
+  *cap = next;
+  return 1;
+}
+
 static js_node *ident_from(js_parser *p, const char *s, int len, int line, int col)
 {
   js_node *n = js_node_new(p->arena, JS_IDENT, line, col);
@@ -157,18 +172,28 @@ static js_node *eat_ident(js_parser *p)
 typedef struct {
   js_node **a;
   int n, cap;
+  int failed;
 } nvec;
 static void nv_push(nvec *v, js_node *x)
 {
-  if (v->n + 1 > v->cap) {
-    v->cap = v->cap ? v->cap * 2 : 8;
-    v->a = (js_node **)realloc(v->a, (unsigned)v->cap * sizeof(js_node *));
+  if (v->failed || !grow_array((void **)&v->a, &v->cap, v->n + 1, sizeof *v->a)) {
+    v->failed = 1;
+    return;
   }
   v->a[v->n++] = x;
 }
 static js_node **nv_freeze(js_parser *p, nvec *v, int *count)
 {
   js_node **d = NULL;
+  if (v->failed) {
+    p->failed = 1;
+    if (!p->errmsg)
+      p->errmsg = "out of memory";
+    if (v->a)
+      free(v->a);
+    *count = 0;
+    return NULL;
+  }
   *count = v->n;
   if (v->n) {
     d = (js_node **)js_arena_alloc(p->arena, (unsigned)v->n * sizeof(js_node *));
@@ -280,9 +305,9 @@ static js_node *parse_object_pattern(js_parser *p)
       advance(p);
       pr.kind = JS_PROP_SPREAD;
       pr.value = parse_binding_target(p);
-      if (n + 1 > cap) {
-        cap = cap ? cap * 2 : 4;
-        props = (js_prop *)realloc(props, (unsigned)cap * sizeof(js_prop));
+      if (!grow_array((void **)&props, &cap, n + 1, sizeof *props)) {
+        perr(p, "out of memory");
+        break;
       }
       props[n++] = pr;
       break;
@@ -304,9 +329,9 @@ static js_node *parse_object_pattern(js_parser *p)
       d->u.assignpat.init = parse_assignment(p, 0);
       pr.value = d;
     }
-    if (n + 1 > cap) {
-      cap = cap ? cap * 2 : 4;
-      props = (js_prop *)realloc(props, (unsigned)cap * sizeof(js_prop));
+    if (!grow_array((void **)&props, &cap, n + 1, sizeof *props)) {
+      perr(p, "out of memory");
+      break;
     }
     props[n++] = pr;
     if (!eat(p, T_COMMA))
@@ -955,9 +980,9 @@ static js_node *parse_object_literal(js_parser *p)
         }
       }
     }
-    if (n + 1 > cap) {
-      cap = cap ? cap * 2 : 4;
-      props = (js_prop *)realloc(props, (unsigned)cap * sizeof(js_prop));
+    if (!grow_array((void **)&props, &cap, n + 1, sizeof *props)) {
+      perr(p, "out of memory");
+      break;
     }
     props[n++] = pr;
     if (!eat(p, T_COMMA))
@@ -1296,9 +1321,9 @@ static js_node *parse_class(js_parser *p, int is_decl)
       fn->u.func.body = parse_block(p);
       m.kind = JS_M_STATIC_BLOCK;
       m.value = fn;
-      if (n + 1 > cap) {
-        cap = cap ? cap * 2 : 4;
-        members = (js_member *)realloc(members, (unsigned)cap * sizeof(js_member));
+      if (!grow_array((void **)&members, &cap, n + 1, sizeof *members)) {
+        perr(p, "out of memory");
+        break;
       }
       members[n++] = m;
       continue;
@@ -1343,9 +1368,9 @@ static js_node *parse_class(js_parser *p, int is_decl)
         }
       }
     }
-    if (n + 1 > cap) {
-      cap = cap ? cap * 2 : 4;
-      members = (js_member *)realloc(members, (unsigned)cap * sizeof(js_member));
+    if (!grow_array((void **)&members, &cap, n + 1, sizeof *members)) {
+      perr(p, "out of memory");
+      break;
     }
     members[n++] = m;
   }
@@ -1407,9 +1432,9 @@ static js_node *parse_var_decl(js_parser *p, int kind, int consume_semi, int no_
     d.init = NULL;
     if (eat(p, T_EQ))
       d.init = parse_assignment(p, no_in);
-    if (n + 1 > cap) {
-      cap = cap ? cap * 2 : 4;
-      decls = (js_declor *)realloc(decls, (unsigned)cap * sizeof(js_declor));
+    if (!grow_array((void **)&decls, &cap, n + 1, sizeof *decls)) {
+      perr(p, "out of memory");
+      break;
     }
     decls[n++] = d;
   } while (eat(p, T_COMMA) && !p->failed);
@@ -1555,9 +1580,9 @@ static js_node *parse_switch(js_parser *p)
     while (!at(p, T_CASE) && !at(p, T_DEFAULT) && !at(p, T_RBRACE) && !at(p, T_EOF) && !p->failed)
       nv_push(&body, parse_statement(p));
     c.body = nv_freeze(p, &body, &c.nbody);
-    if (n + 1 > cap) {
-      cap = cap ? cap * 2 : 4;
-      cases = (js_case *)realloc(cases, (unsigned)cap * sizeof(js_case));
+    if (!grow_array((void **)&cases, &cap, n + 1, sizeof *cases)) {
+      perr(p, "out of memory");
+      break;
     }
     cases[n++] = c;
   }
@@ -1647,9 +1672,9 @@ static js_binding *parse_named_clause(js_parser *p, int *count)
     }
     if (p->failed)
       break;
-    if (n + 1 > cap) {
-      cap = cap ? cap * 2 : 4;
-      list = (js_binding *)realloc(list, (unsigned)cap * sizeof(js_binding));
+    if (!grow_array((void **)&list, &cap, n + 1, sizeof *list)) {
+      perr(p, "out of memory");
+      break;
     }
     list[n++] = b;
     if (!eat(p, T_COMMA))
