@@ -3159,12 +3159,23 @@ static void scroll_set(int target)
 static void navigate(const char *url)
 {
 	hover_url[0] = '\0';                      /* drop any stale hovered-link status */
+	if (gfx_sel_has(&g_sel)) gfx_sel_clear(&g_sel);
+	g_selecting = 0;
 	textfield_set(&B->addr_tf, url);          /* writes into B->addr (its buffer) */
 	int i = 0;
 	for (; url[i] && i < URL_MAX - 1; i++) B->req_url[i] = url[i];
 	B->req_url[i] = '\0';
 	B->req_method[0] = '\0'; B->req_body_len = 0;   /* GET */
 	B->req_pending = 1; B->seq++;
+}
+
+static void blur_content_control(void)
+{
+	if (!B->focus_kind) return;
+	int k = 0;
+	sapp(B->evt_type, &k, sizeof B->evt_type, "blur");
+	B->evt_pending = 1;
+	B->focus_kind = 0;
 }
 
 static void submit(void)
@@ -3534,6 +3545,7 @@ static void handle_click(int mx, int my)
 	 * Its rect sits below the address bar, so it never shadows the bars above. */
 	if (devtools_handle_click(mx, my)) return;
 	if (my >= MENU_H && my < MENU_H + TAB_H) {              /* tab strip */
+		blur_content_control();
 		int idx = 0;
 		switch (tabbar_hit(0, MENU_H, BW, n_tabs, mx, my, &idx)) {
 		case TABBAR_SELECT: select_tab(idx); break;
@@ -3544,6 +3556,7 @@ static void handle_click(int mx, int my)
 		return;
 	}
 	if (my >= MENU_H + TAB_H && my < MENU_H + TAB_H + ADDR_H) {   /* address bar */
+		blur_content_control();
 		struct rect rb, rf, rrl, rtf, rst;
 		addr_layout(&rb, &rf, &rrl, &rtf, &rst);
 		struct tab *at = &tabs[active_tab];
@@ -3564,12 +3577,13 @@ static void handle_click(int mx, int my)
 	if (bm_panel_open && bm_panel_click(mx, my)) return;
 	int py, phh, rows;
 	pane_metrics(&py, &phh, &rows);
-	int sbpart = scrollbar_hit(BW - SCROLL_W, py, SCROLL_W, phh, mx, my);
+	int right = devtools_visible() ? devtools_left() : BW;
+	int sbpart = scrollbar_hit(right - SCROLL_W, py, SCROLL_W, phh, mx, my);
 	if (sbpart != SCROLLBAR_NONE) {                          /* scrollbar */
 		int target;
 		if (sbpart == SCROLLBAR_UP)        target = B->pg->scroll - 3 * LINE_H;
 		else if (sbpart == SCROLLBAR_DOWN) target = B->pg->scroll + 3 * LINE_H;
-		else target = scrollbar_pos(BW - SCROLL_W, py, SCROLL_W, phh, mx, my,
+		else target = scrollbar_pos(right - SCROLL_W, py, SCROLL_W, phh, mx, my,
 		                            B->pg->scroll, doc_px(), phh);
 		scroll_set(target);
 		return;
@@ -3792,6 +3806,13 @@ static void handle_key(char c, int mods)
 	/* Ctrl+R reloads (the keyboard delivers the unshifted letter + KMOD_CTRL).
 	 * Checked before the address field so it isn't typed into the URL. */
 	if ((mods & KMOD_CTRL) && (c == 'r' || c == 'R')) { do_reload(); return; }
+	if ((mods & KMOD_CTRL) && (c == 't' || c == 'T')) { new_tab(); return; }
+	if ((mods & KMOD_CTRL) && (c == 'w' || c == 'W')) { close_tab(active_tab); return; }
+	if ((mods & KMOD_CTRL) && c >= '1' && c <= '8') {
+		int tab = c - '1';
+		if (tab < n_tabs) select_tab(tab);
+		return;
+	}
 
 	/* Ctrl+C (delivered as KEY_INTR) copies the text selection when there is one. */
 	if ((unsigned char)c == KEY_INTR && gfx_sel_has(&g_sel)) { copy_selection(); return; }
@@ -3900,6 +3921,7 @@ int main(int argc, char **argv)
 			} else if (ev.type == WEV_KEY) {
 				handle_key((char)ev.a, ev.b);
 			} else if (ev.type == WEV_MOUSE) {
+				last_mx = ev.a; last_my = ev.b;
 				if (devtools_on_splitter(ev.a, ev.b)) { dt_resizing = 1; }   /* start a panel resize */
 				else { dt_resizing = 0; handle_click(ev.a, ev.b); }
 			} else if (ev.type == WEV_DRAG) {
