@@ -388,6 +388,11 @@ static void scan_string(jlexer *lx, jtoken *out, char quote)
     return;
   }
   out->value = js_arena_strndup(lx->arena, cook.b ? cook.b : "", cook.len);
+  if (!out->value) {
+    cb_free(&cook);
+    fail(lx, out, "out of memory");
+    return;
+  }
   out->value_len = cook.len;
   cb_free(&cook);
 }
@@ -454,6 +459,11 @@ static void scan_template(jlexer *lx, jtoken *out, int after_sub)
     return;
   }
   out->value = js_arena_strndup(lx->arena, cook.b ? cook.b : "", cook.len);
+  if (!out->value) {
+    cb_free(&cook);
+    fail(lx, out, "out of memory");
+    return;
+  }
   out->value_len = cook.len;
   cb_free(&cook);
 }
@@ -718,8 +728,20 @@ static void scan_regex(jlexer *lx, jtoken *out)
   }
   out->kind = T_REGEX;
   out->value = js_arena_strndup(lx->arena, pat.b ? pat.b : "", pat.len);
+  if (!out->value) {
+    cb_free(&pat);
+    cb_free(&flags);
+    fail(lx, out, "out of memory");
+    return;
+  }
   out->value_len = pat.len;
   out->flags = js_arena_strndup(lx->arena, flags.b ? flags.b : "", flags.len);
+  if (!out->flags) {
+    cb_free(&pat);
+    cb_free(&flags);
+    fail(lx, out, "out of memory");
+    return;
+  }
   cb_free(&pat);
   cb_free(&flags);
 }
@@ -792,6 +814,11 @@ static void scan_ident_escaped(jlexer *lx, jtoken *out, const char *s)
     return;
   }
   out->value = js_arena_strndup(lx->arena, cook.b ? cook.b : "", cook.len);
+  if (!out->value) {
+    cb_free(&cook);
+    fail(lx, out, "out of memory");
+    return;
+  }
   out->value_len = cook.len;
   out->kind = T_IDENT;
   cb_free(&cook);
@@ -850,6 +877,10 @@ void js_lex_next(jlexer *lx, jtoken *out)
     }
     out->len = (int)(lx->p - s);
     out->value = js_arena_strndup(lx->arena, s, out->len);
+    if (!out->value) {
+      fail(lx, out, "out of memory");
+      return;
+    }
     out->value_len = out->len;
     out->kind = keyword_kind(s, out->len);
     lx->prev_kind = out->kind;
@@ -875,6 +906,10 @@ void js_lex_next(jlexer *lx, jtoken *out)
       lx->p++;
     out->len = (int)(lx->p - s);
     out->value = js_arena_strndup(lx->arena, s, out->len);
+    if (!out->value) {
+      fail(lx, out, "out of memory");
+      return;
+    }
     out->value_len = out->len;
     out->kind = T_IDENT;
     lx->prev_kind = out->kind;
