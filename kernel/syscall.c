@@ -44,11 +44,13 @@
 #include "shell.h"
 #include "smbios.h"
 #include "syscall_audio.h"
+#include "syscall_entropy.h"
 #include "syscall_exec.h"
 #include "syscall_fs.h"
 #include "syscall_graphics.h"
 #include "syscall_io.h"
 #include "syscall_net.h"
+#include "syscall_nr.h"
 #include "syscall_path.h"
 #include "syscall_process.h"
 #include "syscall_signal.h"
@@ -65,165 +67,9 @@
 #define OWOS_VERSION "dev"
 #endif
 
-#define SYS_WRITE 1    /* write(fd=ebx, buf=ecx, len=edx) -> bytes          */
-#define SYS_EXIT 2     /* exit(code=ebx) -- terminates the process          */
-#define SYS_READ 3     /* read(fd=ebx, buf=ecx, len=edx) -> bytes (0=EOF)   */
-#define SYS_FORK 4     /* fork() -> child pid in parent, 0 in child         */
-#define SYS_READFILE 5 /* readfile(name=ebx, buf=ecx, max=edx) -> bytes     */
-#define SYS_EXEC 6     /* run a new program image (name=ebx)                */
-#define SYS_WAITPID                                                                                                    \
-  7                      /* waitpid(pid=ebx, status=ecx, flags=edx): flags&WNOHANG ->                                  \
-                          * 1 reaped/0 none (status via *ecx); else block -> exit status */
-#define SYS_PIPE 8       /* pipe(int fds[2]=ebx) -> 0/-1                       */
-#define SYS_CLOSE 9      /* close(fd=ebx) -> 0/-1                             */
-#define SYS_WRITEFILE 10 /* writefile(name=ebx, buf=ecx, len=edx) -> 0/-1 */
-#define SYS_NET_CONNECT                                                                                                \
-  11 /* net_connect(host=ebx, port=ecx, proto=edx) -> h/-e.                                                            \
-      * proto SK_RAWETH opens a raw socket (no host, root-only). */
-#define SYS_NET_SEND                                                                                                   \
-  12 /* net_send(ebx -> {fd,buf,len,flags,ip|0,port}) -> bytes/-1.                                                     \
-      * ip non-NULL = sendto; else connected/stream send. */
-#define SYS_NET_RECV                                                                                                   \
-  13                       /* net_recv(ebx -> {fd,buf,max,flags,ip|0,port|0}) -> bytes.                                \
-                            * ip/port = recvfrom; else flags&MSG_DONTWAIT = non-blocking. */
-#define SYS_NET_CLOSE 14   /* net_close(h=ebx) -> 0/-1 */
-#define SYS_WIN_CREATE 15  /* win_create(w=ebx, h=ecx, title=edx) -> id/-1      */
-#define SYS_WIN_PRESENT 16 /* win_present(id=ebx) -> 0/-1                       */
-#define SYS_WIN_POLL                                                                                                   \
-  17                         /* win_poll(id=ebx, evt=ecx|0, block=edx) -> 1 event/0 none/-1.                           \
-                              * block sleeps ~a frame when no event is queued. */
-#define SYS_WIN_CLOSE 18     /* win_close(id=ebx) -> 0/-1                          */
-#define SYS_READDIR 19       /* readdir(path=ebx, idx=ecx, out=edx) -> 1/0/-1 */
-#define SYS_WIN_TITLE 20     /* win_settitle(id=ebx, str=ecx) -> 0/-1              */
-#define SYS_THREAD 21        /* thread_create(entry=ebx, stacktop=ecx) -> tid/-1   */
-#define SYS_SLEEP 22         /* msleep(ms=ebx) -> 0                                */
-#define SYS_WIN_RESIZABLE 23 /* win_resizable(id=ebx, on=ecx) -> 0/-1           */
-#define SYS_MSEC 24          /* msec() -> milliseconds since boot                  */
-#define SYS_READFILE_AT 25   /* pread(args=ebx -> {name,off,buf,len}) -> bytes/0/-1 */
-#define SYS_VOLUMES 26       /* volumes(idx=ebx, out=ecx -> struct volinfo) -> 1/0/-1 */
-#define SYS_UMOUNT 27        /* umount(point=ebx) -> 0/-1 (unmount the volume at point) */
-#define SYS_WIN_CURSOR 28    /* win_cursor(id=ebx, shape=ecx) -> 0/-1 (enum wm_cursor)   */
-#define SYS_STREAM_BEGIN 29  /* stream_begin(name=ebx) -> 0/-1 (open a streaming write) */
-#define SYS_STREAM_WRITE 30  /* stream_write(buf=ebx, len=ecx) -> 0/-1 (append a chunk) */
-#define SYS_STREAM_END 31    /* stream_end() -> bytes committed / -1 (commit + close)   */
-#define SYS_MKDIR 32         /* mkdir(path=ebx) -> 0/-1                                    */
-#define SYS_RMDIR 33         /* rmdir(path=ebx) -> 0/-1                                    */
-#define SYS_DELETE 34        /* delete(path=ebx) -> 0/-1 (rm a file)                       */
-#define SYS_RENAME 35        /* rename(old=ebx, new=ecx) -> 0/-1                           */
-#define SYS_STAT 36          /* stat(path=ebx, out=ecx -> {int is_dir; u32 size}) -> 0/-1  */
-#define SYS_SPAWN 37         /* spawn(path=ebx, arg=ecx|0) -> pid/-1 (detached)            */
-#define SYS_MOUNT                                                                                                      \
-  38                       /* mount(kind=ebx) -> 0/-1 (mount a present removable device at /media)                     \
-                            */
-#define SYS_AUDIO_OPEN 39  /* audio_open() -> 0/-1 (open a 48k/S16/stereo PCM stream)       */
-#define SYS_AUDIO_WRITE 40 /* audio_write(buf=ebx, len=ecx) -> bytes / -1 / -2 (Ctrl+C)    */
-#define SYS_AUDIO_CLOSE 41 /* audio_close() -> 0 (drain + stop the stream)                 */
-#define SYS_SPAWN_CAP                                                                                                  \
-  42 /* spawn_cap(req=ebx) -> pid/-1. Packed request (see the                                                          \
-      * cap_req struct) spawns a /bin child with its stdout (and                                                       \
-      * optionally stdin) wired to fresh pipe(s); optional uid/gid/                                                    \
-      * cwd set the child's identity/dir (uid/gid change is root-only). */
-#define SYS_READ_NB                                                                                                    \
-  43 /* read_nb(fd=ebx, buf=ecx, len=edx) -> >0 bytes / 0 would-block                                                  \
-      * / -1 EOF or error. Non-blocking sibling of SYS_READ, so a GUI                                                  \
-      * program can poll a pipe and still service window events. */
-#define SYS_CHDIR                                                                                                      \
-  44 /* chdir(path=ebx) -> 0/-1: set the caller's own kernel cwd, so                                                   \
-      * children it spawns resolve relative paths from there. */
-#define SYS_KILL                                                                                                       \
-  45 /* kill(pid=ebx, sig=ecx) -> 0/-1: post a signal to a task                                                        \
-      * (root, self, or a child of the caller). sig 0 probes. */
-#define SYS_POWER                                                                                                      \
-  46 /* power(action=ebx): 0 = shut down (ACPI S5), 1 = reboot. Does not                                               \
-      * return on success. A real action, so a syscall -- not a /proc file. */
-#define SYS_SBRK                                                                                                       \
-  47 /* sbrk(inc=ebx) -> previous break / (uint32_t)-1: grow or shrink the                                             \
-      * caller's heap by `inc` bytes. The user-space malloc primitive. */
-#define SYS_GETUID                                                                                                     \
-  48                     /* getuid() -> the calling task's user id (per-process credentials;                           \
-                          * user space resolves the name/home from /etc/passwd itself). */
-#define SYS_PORT_OPEN 49 /* port_open(name=ebx, as_server=ecx) -> fd/-1. A named local-IPC   */
-/* port: server registers + accept()s, client connects (ipc.c).    */
-#define SYS_PORT_ACCEPT 50 /* port_accept(listen_fd=ebx) -> channel fd/-1 (blocks for a conn) */
-#define SYS_RTC_EPOCH 51   /* rtc_epoch() -> Unix epoch seconds (UTC)            */
-#define SYS_NET_SETOPT                                                                                                 \
-  52 /* net_setopt(fd=ebx, opt=ecx, val=edx) -> 0/-1. Socket option;                                                   \
-      * NET_OPT_TTL sets a UDP socket's outgoing IP TTL. */
-
-/* Server sockets: the passive/bound side of the net_sock_* handle table.
- * LISTEN/ACCEPT are TCP; BIND is UDP (recv/send-to go through the unified
- * NET_RECV/NET_SEND with a source/dest address). */
-#define SYS_NET_LISTEN 53 /* net_listen(port=ebx) -> listener fd/-1              */
-#define SYS_NET_ACCEPT 54 /* net_accept(listen_fd=ebx) -> conn fd/-1/-4 (blocks) */
-#define SYS_NET_BIND 55   /* net_bind(port=ebx) -> bound UDP fd/-1               */
-#define SYS_STATFS 56     /* statfs(path=ebx, out=ecx -> {u64 total,u64 free}) -> 0/-1 */
-#define SYS_IFCONFIG 57   /* ifconfig(ip=ebx, ecx -> {mask,gw,dns} 3x u8[4]) -> 0/-1 (root) */
-#define SYS_SETRTC 58     /* setrtc(unix_secs=ebx) -> 0/-1. Set the wall clock; root-only */
-
-/* User-space compositor primitives. All root-only (uid 0), like SYS_IFCONFIG.
- */
-#define SYS_FB_INFO 59 /* fb_info(out=ebx -> struct fbinfo) -> 0/-1 (root) */
-#define SYS_FB_MAP                                                                                                     \
-  60 /* fb_map() -> COMPOSITOR_FB_VADDR / (uint)-1 (root): maps                                                        \
-      * the shared cached-RAM BACK buffer into the caller.  */
-#define SYS_FB_PRESENT                                                                                                 \
-  61 /* fb_present(ebx -> {x,y,w,h}) -> 0/-1 (root): flush a                                                           \
-      * back-buffer rect to VRAM (damage-rect present).      */
-#define SYS_INPUT_POLL                                                                                                 \
-  62                            /* input_poll(out=ebx -> struct inputstate) -> 0/-1 (root):                            \
-                                 * pointer state + drained key events, non-blocking.    */
-#define SYS_INPUT_SET_BOUNDS 63 /* input_set_bounds(w=ebx, h=ecx) -> 0/-1 (root)      */
-#define SYS_WIN_ENUM 64         /* win_enum(ebx -> winrec[], ecx=max) -> count/-1 (root) */
-#define SYS_WIN_MAP                                                                                                    \
-  65                        /* win_map(id=ebx, out=ecx -> struct winmap) -> 0/-1 (root):                               \
-                             * maps window id's buffer at WIN_MAP_BASE+id*slot.      */
-#define SYS_WIN_UNMAP 66    /* win_unmap(id=ebx) -> 0/-1 (root): drop the map+pin   */
-#define SYS_WIN_SET_GEOM 67 /* win_set_geom(id=ebx, ecx -> {x,y,w,h}) -> 0/-1 (root) */
-#define SYS_WIN_DELIVER 68  /* win_deliver(id=ebx, ev=ecx -> struct winevent) -> 0/-1 (root) */
-#define SYS_CRASH_POLL                                                                                                 \
-  69 /* crash_poll(out=ebx -> crash_rec[], ecx=max) -> count/-1                                                        \
-      * (root): drain pending user-crash reports for the                                                               \
-      * compositor to render as crash windows.             */
-#define SYS_WIN_KEY_SPACE                                                                                              \
-  70                       /* win_key_space(id=ebx) -> free slots in a window's event                                  \
-                            * ring (huge if not queued): paste flow control, root-only */
-#define SYS_STACK_ALLOC 71 /* stack_alloc(pages=ebx) -> guarded thread-stack top / 0    */
-#define SYS_STACK_FREE 72  /* stack_free(top=ebx) -> 0: release a guarded thread stack   */
-#define SYS_SIGACTION 73   /* sigaction(sig=ebx, act=ecx -> k_sigaction, old=edx) -> 0/-1 */
-#define SYS_SIGPROCMASK 74 /* sigprocmask(how=ebx, set=ecx, have_set=edx) -> old blocked mask */
-/* SYS_SIGRETURN (75) is defined in signal.h — it's baked into the kernel-built
- * signal trampoline; user code never issues it directly. */
-#define SYS_GETPID 76 /* getpid() -> the caller's pid                            */
-#define SYS_GETRANDOM                                                                                                  \
-  77 /* getrandom(buf=ebx, len=ecx) -> len/-1: CSPRNG bytes from                                                       \
-      * the kernel entropy pool (not the clock-seeded fallback). */
-#define SYS_WIN_OWNS                                                                                                   \
-  78 /* win_owned(pid=ebx) -> 1 if that pid owns a window, else 0.                                                     \
-      * Lets the terminal detach windowed apps with no app list. */
-#define SYS_WIN_SET_PARENT                                                                                             \
-  79 /* win_set_parent(id=ebx, parent=ecx, modal=edx) -> 0/-1:                                                         \
-      * make `id` a transient (dialog) child of `parent`; modal                                                        \
-      * blocks input to the rest of the parent's window family. */
-#define SYS_WIN_FB                                                                                                     \
-  80 /* win_fb_of(id=ebx) -> the client buffer's user vaddr, or 0.                                                     \
-      * The first window is always at WIN_FB_VADDR; a dialog's                                                         \
-      * second window lands in its own slot, fetched here.       */
-#define SYS_UNAME                                                                                                      \
-  81 /* uname(out=ebx -> struct utsname) -> 0/-1. POSIX system                                                         \
-      * identity; the kernel is the only authority for `machine`                                                       \
-      * (user programs are always 32-bit ELF). libc fills nodename                                                     \
-      * from the hostname afterwards.                            */
-
-/* Syscall argument flags / options (mirror user/lib/owos.h). */
-#define WNOHANG 1      /* SYS_WAITPID: non-blocking reap                     */
-#define MSG_DONTWAIT 1 /* SYS_NET_RECV: non-blocking recv */
-#define NET_OPT_TTL 1  /* SYS_NET_SETOPT: outgoing IP TTL                    */
-
 /* Net transports are general sockets: SYS_NET_CONNECT's `proto` arg selects
  * TCP/TLS/UDP/raw-ICMP, so ping/dig/resolve are libs over sockets, not
  * bespoke syscalls. */
-
-#define NET_HOST_MAX 128
 
 /* Turn a user-supplied name into an absolute owofs path: an absolute name
  * ("/foo/bar") passes through; a relative one is joined onto the calling
@@ -344,185 +190,98 @@ void syscall_init(void)
   idt_set_gate(0x80, (uint32_t)isr128, GDT_KERNEL_CODE, 0xEE);
 }
 
+typedef void (*syscall_handler_t)(struct registers *r);
+
+static const syscall_handler_t syscall_handlers[SYS_UNAME + 1] = {
+    [SYS_WRITE] = syscall_io_write,
+    [SYS_EXIT] = syscall_process_exit,
+    [SYS_READ] = syscall_io_read,
+    [SYS_FORK] = syscall_process_fork,
+    [SYS_READFILE] = syscall_fs_readfile,
+    [SYS_EXEC] = syscall_exec_replace,
+    [SYS_WAITPID] = syscall_process_waitpid,
+    [SYS_PIPE] = syscall_io_pipe,
+    [SYS_CLOSE] = syscall_io_close,
+    [SYS_WRITEFILE] = syscall_fs_writefile,
+    [SYS_NET_CONNECT] = syscall_net_connect,
+    [SYS_NET_SEND] = syscall_net_send,
+    [SYS_NET_RECV] = syscall_net_recv,
+    [SYS_NET_CLOSE] = syscall_net_close,
+    [SYS_WIN_CREATE] = syscall_window_create,
+    [SYS_WIN_PRESENT] = syscall_window_present,
+    [SYS_WIN_POLL] = syscall_window_poll,
+    [SYS_WIN_CLOSE] = syscall_window_close,
+    [SYS_READDIR] = syscall_fs_readdir,
+    [SYS_WIN_TITLE] = syscall_window_title,
+    [SYS_THREAD] = syscall_process_thread,
+    [SYS_SLEEP] = syscall_process_sleep,
+    [SYS_WIN_RESIZABLE] = syscall_window_resizable,
+    [SYS_MSEC] = syscall_process_msec,
+    [SYS_READFILE_AT] = syscall_fs_readfile_at,
+    [SYS_VOLUMES] = syscall_fs_volumes,
+    [SYS_UMOUNT] = syscall_fs_umount,
+    [SYS_WIN_CURSOR] = syscall_window_cursor,
+    [SYS_STREAM_BEGIN] = syscall_fs_stream_begin,
+    [SYS_STREAM_WRITE] = syscall_fs_stream_write,
+    [SYS_STREAM_END] = syscall_fs_stream_end,
+    [SYS_MKDIR] = syscall_fs_mkdir,
+    [SYS_RMDIR] = syscall_fs_rmdir,
+    [SYS_DELETE] = syscall_fs_delete,
+    [SYS_RENAME] = syscall_fs_rename,
+    [SYS_STAT] = syscall_fs_stat,
+    [SYS_SPAWN] = syscall_exec_spawn,
+    [SYS_MOUNT] = syscall_fs_mount,
+    [SYS_AUDIO_OPEN] = syscall_audio_open,
+    [SYS_AUDIO_WRITE] = syscall_audio_write,
+    [SYS_AUDIO_CLOSE] = syscall_audio_close,
+    [SYS_SPAWN_CAP] = syscall_exec_spawn_cap,
+    [SYS_READ_NB] = syscall_io_read_nb,
+    [SYS_CHDIR] = syscall_fs_chdir,
+    [SYS_KILL] = syscall_process_kill,
+    [SYS_POWER] = syscall_process_power,
+    [SYS_SBRK] = syscall_process_sbrk,
+    [SYS_GETUID] = syscall_process_getuid,
+    [SYS_PORT_OPEN] = syscall_io_port_open,
+    [SYS_PORT_ACCEPT] = syscall_io_port_accept,
+    [SYS_RTC_EPOCH] = syscall_fs_rtc_epoch,
+    [SYS_NET_SETOPT] = syscall_net_setopt,
+    [SYS_NET_LISTEN] = syscall_net_listen,
+    [SYS_NET_ACCEPT] = syscall_net_accept,
+    [SYS_NET_BIND] = syscall_net_bind,
+    [SYS_STATFS] = syscall_fs_statfs,
+    [SYS_IFCONFIG] = syscall_net_ifconfig,
+    [SYS_SETRTC] = syscall_net_setrtc,
+    [SYS_FB_INFO] = syscall_graphics_fb_info,
+    [SYS_FB_MAP] = syscall_graphics_fb_map,
+    [SYS_FB_PRESENT] = syscall_graphics_fb_present,
+    [SYS_INPUT_POLL] = syscall_graphics_input_poll,
+    [SYS_INPUT_SET_BOUNDS] = syscall_graphics_input_bounds,
+    [SYS_WIN_ENUM] = syscall_graphics_win_enum,
+    [SYS_WIN_MAP] = syscall_graphics_win_map,
+    [SYS_WIN_UNMAP] = syscall_graphics_win_unmap,
+    [SYS_WIN_SET_GEOM] = syscall_graphics_win_geom,
+    [SYS_WIN_DELIVER] = syscall_graphics_win_deliver,
+    [SYS_CRASH_POLL] = syscall_graphics_crash_poll,
+    [SYS_WIN_KEY_SPACE] = syscall_graphics_win_key_space,
+    [SYS_STACK_ALLOC] = syscall_process_stack_alloc,
+    [SYS_STACK_FREE] = syscall_process_stack_free,
+    [SYS_SIGACTION] = syscall_signal_action,
+    [SYS_SIGPROCMASK] = syscall_signal_procmask,
+    [SYS_SIGRETURN] = syscall_signal_return,
+    [SYS_GETPID] = syscall_process_getpid,
+    [SYS_GETRANDOM] = syscall_entropy_getrandom,
+    [SYS_WIN_OWNS] = syscall_window_owns,
+    [SYS_WIN_SET_PARENT] = syscall_window_set_parent,
+    [SYS_WIN_FB] = syscall_window_fb,
+    [SYS_UNAME] = syscall_fs_uname,
+};
+
 void syscall_dispatch(struct registers *r)
 {
-  switch (r->eax) {
-  case SYS_WRITE: {
-    syscall_io_write(r);
-    break;
-  }
-
-  case SYS_EXIT:
-    syscall_process_exit(r);
-    break;
-  case SYS_FORK:
-    syscall_process_fork(r);
-    break;
-  case SYS_WAITPID:
-    /* edx & WNOHANG returns a reap result and optionally writes status. */
-    if ((int)r->edx & WNOHANG) {
-      int status = 0;
-      int got = sched_try_reap((int)r->ebx, &status);
-      if (got && r->ecx && copyout(r->ecx, &status, sizeof status) != 0)
-        got = -1;
-      r->eax = (uint32_t)got;
-    } else {
-      r->eax = (uint32_t)sched_waitpid((int)r->ebx);
-    }
-    break;
-
-  case SYS_PIPE: {
-    syscall_io_pipe(r);
-    break;
-  }
-
-  case SYS_CLOSE: {
-    syscall_io_close(r);
-    break;
-  }
-
-  case SYS_EXEC: {
-    syscall_exec_replace(r);
-    break;
-  }
-
-  case SYS_SPAWN: {
-    syscall_exec_spawn(r);
-    break;
-  }
-
-  case SYS_SPAWN_CAP: {
-    syscall_exec_spawn_cap(r);
-    break;
-  }
-
-  case SYS_READ_NB: {
-    syscall_io_read_nb(r);
-    break;
-  }
-
-  case SYS_CHDIR: {
-    syscall_fs_chdir(r);
-    break;
-  }
-  case SYS_KILL:
-    syscall_process_kill(r);
-    break;
-  case SYS_POWER:
-    syscall_process_power(r);
-    break;
-  case SYS_SBRK:
-    syscall_process_sbrk(r);
-    break;
-  case SYS_GETPID:
-    syscall_process_getpid(r);
-    break;
-  case SYS_WIN_OWNS:
-    syscall_window_owns(r);
-    break;
-  case SYS_SIGACTION: {
-    syscall_signal_action(r);
-    break;
-  }
-  case SYS_SIGPROCMASK:
-    syscall_signal_procmask(r);
-    break;
-  case SYS_SIGRETURN:
-    syscall_signal_return(r);
-    break;
-
-  case SYS_STAT: {
-    syscall_fs_stat(r);
-    break;
-  }
-
-  case SYS_STATFS: {
-    syscall_fs_statfs(r);
-    break;
-  }
-
-  case SYS_UNAME: {
-    syscall_fs_uname(r);
-    break;
-  }
-
-  case SYS_AUDIO_OPEN:
-    syscall_audio_open(r);
-    break;
-  case SYS_AUDIO_WRITE: {
-    syscall_audio_write(r);
-    break;
-  }
-  case SYS_AUDIO_CLOSE:
-    syscall_audio_close(r);
-    break;
-
-  /* -------- Phase 1 user-space compositor primitives (all root-only) --------
-   */
-  case SYS_FB_INFO: {
-    syscall_graphics_fb_info(r);
-    break;
-  }
-  case SYS_FB_MAP: {
-    syscall_graphics_fb_map(r);
-    break;
-  }
-  case SYS_FB_PRESENT: {
-    syscall_graphics_fb_present(r);
-    break;
-  }
-  case SYS_INPUT_POLL: {
-    syscall_graphics_input_poll(r);
-    break;
-  }
-
-  case SYS_INPUT_SET_BOUNDS:
-    syscall_graphics_input_bounds(r);
-    break;
-
-  case SYS_WIN_ENUM: {
-    syscall_graphics_win_enum(r);
-    break;
-  }
-
-  case SYS_WIN_MAP: {
-    syscall_graphics_win_map(r);
-    break;
-  }
-
-  case SYS_WIN_UNMAP: {
-    syscall_graphics_win_unmap(r);
-    break;
-  }
-
-  case SYS_WIN_SET_GEOM: {
-    syscall_graphics_win_geom(r);
-    break;
-  }
-
-  case SYS_WIN_DELIVER: {
-    syscall_graphics_win_deliver(r);
-    break;
-  }
-
-  case SYS_WIN_KEY_SPACE:
-    syscall_graphics_win_key_space(r);
-    break;
-
-  case SYS_CRASH_POLL: {
-    syscall_graphics_crash_poll(r);
-    break;
-  }
-
-  case SYS_STACK_ALLOC:
-    syscall_process_stack_alloc(r);
-    break;
-  case SYS_STACK_FREE:
-    syscall_process_stack_free(r);
-    break;
-
-  default:
+  uint32_t number = r->eax;
+  if (number > SYS_UNAME || !syscall_handlers[number]) {
     r->eax = (uint32_t)-1;
-    break;
+    return;
   }
+  syscall_handlers[number](r);
 }

@@ -7,9 +7,24 @@
 #include "uaccess.h"
 #include <stdint.h>
 
+#define WNOHANG 1
+
 void syscall_process_exit(struct registers *r) { sched_exit((int)r->ebx); }
 
 void syscall_process_fork(struct registers *r) { r->eax = (uint32_t)sched_fork(r); }
+
+void syscall_process_waitpid(struct registers *r)
+{
+  if ((int)r->edx & WNOHANG) {
+    int status = 0;
+    int got = sched_try_reap((int)r->ebx, &status);
+    if (got && r->ecx && copyout(r->ecx, &status, sizeof status) != 0)
+      got = -1;
+    r->eax = (uint32_t)got;
+  } else {
+    r->eax = (uint32_t)sched_waitpid((int)r->ebx);
+  }
+}
 
 void syscall_process_msec(struct registers *r) { r->eax = timer_us() / 1000u; }
 

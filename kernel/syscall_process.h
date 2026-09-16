@@ -5,6 +5,7 @@ struct registers;
 
 void syscall_process_exit(struct registers *r);
 void syscall_process_fork(struct registers *r);
+void syscall_process_waitpid(struct registers *r);
 void syscall_process_msec(struct registers *r);
 void syscall_process_getuid(struct registers *r);
 void syscall_process_thread(struct registers *r);

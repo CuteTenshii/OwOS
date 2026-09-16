@@ -66,11 +66,4 @@ struct k_sigaction {
  * probes). */
 #define SIGBIT(s) (1u << (s))
 
-/* Syscall number the kernel-built signal-return trampoline invokes to restore
- * the interrupted context. Baked into the trampoline machine code, so it lives
- * here (shared by sched.c's frame builder and syscall.c's dispatch). MUST match
- * the SYS_SIGRETURN slot in kernel/syscall.c. User code never calls it
- * directly. */
-#define SYS_SIGRETURN 75
-
 #endif /* OWOS_SIGNAL_H */

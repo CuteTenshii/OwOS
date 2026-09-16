@@ -14,6 +14,7 @@
 #include "pipe.h"
 #include "signal.h"
 #include "syscall.h"
+#include "syscall_nr.h"
 #include "timer.h"
 #include "uwin.h"
 #include <stdint.h>
