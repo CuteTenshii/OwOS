@@ -609,7 +609,10 @@ void js_array_set_len(js_ctx *ctx, js_object *arr, unsigned len)
     unsigned nc = arr->ecap ? arr->ecap * 2 : 8;
     while (nc < len)
       nc *= 2;
-    arr->elems = (js_value *)realloc(arr->elems, nc * sizeof(js_value));
+    js_value *elems = (js_value *)realloc(arr->elems, nc * sizeof *elems);
+    if (!elems)
+      return;
+    arr->elems = elems;
     arr->ecap = nc;
   }
   while (arr->elen < len)
@@ -625,7 +628,12 @@ void js_array_push(js_ctx *ctx, js_object *arr, js_value v)
     gc_keep(v.u.str);
   if (arr->elen == arr->ecap) {
     unsigned nc = arr->ecap ? arr->ecap * 2 : 8;
-    arr->elems = (js_value *)realloc(arr->elems, nc * sizeof(js_value));
+    js_value *elems = (js_value *)realloc(arr->elems, nc * sizeof *elems);
+    if (!elems) {
+      gc_pop_scope();
+      return;
+    }
+    arr->elems = elems;
     arr->ecap = nc;
   }
   arr->elems[arr->elen++] = v;
