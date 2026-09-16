@@ -25,6 +25,7 @@ static int is_space(int c)
 typedef struct {
   char *b;
   int len, cap;
+  int failed;
 } cbuf;
 
 static void cb_init(cbuf *c)
@@ -32,6 +33,7 @@ static void cb_init(cbuf *c)
   c->b = NULL;
   c->len = 0;
   c->cap = 0;
+  c->failed = 0;
 }
 static void cb_free(cbuf *c)
 {
@@ -40,9 +42,16 @@ static void cb_free(cbuf *c)
 }
 static void cb_push(cbuf *c, int ch)
 {
+  if (c->failed)
+    return;
   if (c->len + 1 > c->cap) {
     int cap = c->cap ? c->cap * 2 : 32;
-    c->b = (char *)realloc(c->b, (unsigned)cap);
+    char *nb = (char *)realloc(c->b, (unsigned)cap);
+    if (!nb) {
+      c->failed = 1;
+      return;
+    }
+    c->b = nb;
     c->cap = cap;
   }
   c->b[c->len++] = (char)ch;
@@ -373,6 +382,11 @@ static void scan_string(jlexer *lx, jtoken *out, char quote)
     lx->p++;
   }
   out->kind = T_STR;
+  if (cook.failed) {
+    cb_free(&cook);
+    fail(lx, out, "out of memory");
+    return;
+  }
   out->value = js_arena_strndup(lx->arena, cook.b ? cook.b : "", cook.len);
   out->value_len = cook.len;
   cb_free(&cook);
@@ -433,6 +447,11 @@ static void scan_template(jlexer *lx, jtoken *out, int after_sub)
     }
     cb_push(&cook, c);
     lx->p++;
+  }
+  if (cook.failed) {
+    cb_free(&cook);
+    fail(lx, out, "out of memory");
+    return;
   }
   out->value = js_arena_strndup(lx->arena, cook.b ? cook.b : "", cook.len);
   out->value_len = cook.len;
@@ -691,6 +710,12 @@ static void scan_regex(jlexer *lx, jtoken *out)
     cb_push(&flags, *lx->p);
     lx->p++;
   }
+  if (pat.failed || flags.failed) {
+    cb_free(&pat);
+    cb_free(&flags);
+    fail(lx, out, "out of memory");
+    return;
+  }
   out->kind = T_REGEX;
   out->value = js_arena_strndup(lx->arena, pat.b ? pat.b : "", pat.len);
   out->value_len = pat.len;
@@ -761,6 +786,11 @@ static void scan_ident_escaped(jlexer *lx, jtoken *out, const char *s)
     first = 0;
   }
   out->len = (int)(lx->p - s);
+  if (cook.failed) {
+    cb_free(&cook);
+    fail(lx, out, "out of memory");
+    return;
+  }
   out->value = js_arena_strndup(lx->arena, cook.b ? cook.b : "", cook.len);
   out->value_len = cook.len;
   out->kind = T_IDENT;

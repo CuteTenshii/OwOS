@@ -67,17 +67,22 @@ const char *classlist_nth(const char *classes, int index, int *length)
   return 0;
 }
 
-static void append(char **out, int *length, int *capacity, const char *token, int token_length)
+static int append(char **out, int *length, int *capacity, const char *token, int token_length)
 {
   int need;
   if (token_length <= 0)
-    return;
+    return 1;
   need = *length + token_length + (*length ? 1 : 0) + 1;
   if (need > *capacity) {
     int next = *capacity ? *capacity * 2 : 32;
     while (next < need)
       next *= 2;
-    *out = realloc(*out, (unsigned)next);
+    {
+      char *grown = realloc(*out, (unsigned)next);
+      if (!grown)
+        return 0;
+      *out = grown;
+    }
     *capacity = next;
   }
   if (*length)
@@ -85,6 +90,7 @@ static void append(char **out, int *length, int *capacity, const char *token, in
   memcpy(*out + *length, token, (unsigned)token_length);
   *length += token_length;
   (*out)[*length] = 0;
+  return 1;
 }
 
 static void rebuild(char **classes, const char *replace, int replace_length, const char *remove, int remove_length)
@@ -100,7 +106,10 @@ static void rebuild(char **classes, const char *replace, int replace_length, con
     else if (remove && length == remove_length && !memcmp(token, remove, (unsigned)length))
       continue;
     if (!classlist_has(out, token, length))
-      append(&out, &out_length, &capacity, token, length);
+      if (!append(&out, &out_length, &capacity, token, length)) {
+        free(out);
+        return;
+      }
   }
   free(*classes);
   *classes = out ? out : dup_empty();
@@ -114,9 +123,15 @@ void classlist_add(char **classes, const char *token, int length)
   const char *item;
   for (index = 0; (item = classlist_nth(current, index, &token_length)); index++)
     if (!classlist_has(out, item, token_length))
-      append(&out, &out_length, &capacity, item, token_length);
+      if (!append(&out, &out_length, &capacity, item, token_length)) {
+        free(out);
+        return;
+      }
   if (token && length > 0 && !classlist_has(out, token, length))
-    append(&out, &out_length, &capacity, token, length);
+    if (!append(&out, &out_length, &capacity, token, length)) {
+      free(out);
+      return;
+    }
   free(*classes);
   *classes = out ? out : dup_empty();
 }
