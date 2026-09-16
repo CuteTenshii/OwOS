@@ -193,6 +193,10 @@ static pentry *pmap_insert(pmap *m, const char *key)
   }
   pe = &m->e[m->n++];
   pe->key = dupz(key, strlen(key));
+  if (!pe->key) {
+    m->n--;
+    return NULL;
+  }
   pe->value = js_undef();
   pe->getter = pe->setter = NULL;
   pe->flags = 0;
@@ -401,6 +405,10 @@ js_object *js_new_array(js_ctx *ctx, unsigned len)
   if (len) {
     unsigned i;
     o->elems = (js_value *)malloc(len * sizeof(js_value));
+    if (!o->elems) {
+      gc_pop_scope();
+      return o;
+    }
     o->ecap = len;
     o->elen = len;
     for (i = 0; i < len; i++)
