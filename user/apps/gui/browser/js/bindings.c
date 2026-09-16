@@ -13,13 +13,13 @@
  * timers (setTimeout/...) are accepted but do not fire (no event loop yet).
  */
 #include "../bmedia.h" /* HTMLMediaElement: <audio>/<video> + new Audio()      */
-#include "cast.h"   /* Google Cast sender: HTMLMediaElement.remote backend  */
+#include "../cors.h"   /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "../jsint.h"  /* internal shared surface (engine ctx + helpers + A())  */
+#include "cast.h"      /* Google Cast sender: HTMLMediaElement.remote backend  */
 #include "classlist.h"
 #include "clipboard.h" /* clip_put / clip_get for navigator.clipboard          */
-#include "../cors.h"      /* cors_origin / cors_same_origin: SW scope + cache keys */
-#include "notification.h"
-#include "../jsint.h"     /* internal shared surface (engine ctx + helpers + A())  */
 #include "dom_query.h"
+#include "notification.h"
 #include "notify.h"    /* notify_send: surface Notification() on the desktop    */
 #include "websocket.h" /* ws_open / ws_poll / ws_send / ws_close (RFC 6455)    */
 
@@ -152,33 +152,42 @@ static int g_ntimers; /* active count (fast empty-check for the pump) */
 
 /* ------------------------------------------------------- small buffer ----- */
 
-static void sb_need(sbuf *s, int extra)
+static int sb_need(sbuf *s, int extra)
 {
   if (s->n + extra + 1 > s->cap) {
     int c = s->cap ? s->cap * 2 : 128;
     while (c < s->n + extra + 1)
       c *= 2;
-    s->b = (char *)realloc(s->b, (unsigned)c);
+    char *b = (char *)realloc(s->b, (unsigned)c);
+    if (!b) {
+      s->failed = 1;
+      return 0;
+    }
+    s->b = b;
     s->cap = c;
   }
+  return 1;
 }
 void sb_putc(sbuf *s, char c)
 {
-  sb_need(s, 1);
+  if (!sb_need(s, 1))
+    return;
   s->b[s->n++] = c;
   s->b[s->n] = 0;
 }
 void sb_puts(sbuf *s, const char *t)
 {
   int n = strlen(t);
-  sb_need(s, n);
+  if (!sb_need(s, n))
+    return;
   memcpy(s->b + s->n, t, (unsigned)n);
   s->n += n;
   s->b[s->n] = 0;
 }
 void sb_putn(sbuf *s, const char *t, int n)
 {
-  sb_need(s, n);
+  if (!sb_need(s, n))
+    return;
   memcpy(s->b + s->n, t, (unsigned)n);
   s->n += n;
   s->b[s->n] = 0;
@@ -1799,10 +1808,7 @@ static js_value el_query_all(js_ctx *ctx, js_value t, js_value *args, int argc)
   gc_pop_scope();
   return js_obj_value(arr);
 }
-static int node_matches_sel(struct dom_node *n, const char *sel)
-{
-  return js_dom_matches(n, sel);
-}
+static int node_matches_sel(struct dom_node *n, const char *sel) { return js_dom_matches(n, sel); }
 static js_value el_matches(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -2028,10 +2034,7 @@ static struct dom_node *doc_root_of(js_value t)
   struct dom_node *r = node_of(t);
   return r ? r : g_doc_root;
 }
-static struct dom_node *doc_first_tag_in(struct dom_node *root, const char *tag)
-{
-  return js_dom_find_tag(root, tag);
-}
+static struct dom_node *doc_first_tag_in(struct dom_node *root, const char *tag) { return js_dom_find_tag(root, tag); }
 static struct dom_node *doc_first_tag(const char *tag) { return doc_first_tag_in(g_doc_root, tag); }
 
 static js_value doc_get_by_id(js_ctx *ctx, js_value t, js_value *args, int argc)

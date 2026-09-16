@@ -59,6 +59,7 @@ js_value make_event(const char *type, int x, int y, js_value init);
 typedef struct {
   char *b;
   int n, cap;
+  int failed;
 } sbuf;
 void sb_putc(sbuf *s, char c);
 void sb_puts(sbuf *s, const char *t);
