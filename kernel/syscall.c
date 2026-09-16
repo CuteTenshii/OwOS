@@ -45,6 +45,7 @@
 #include "smbios.h"
 #include "syscall_audio.h"
 #include "syscall_fs.h"
+#include "syscall_graphics.h"
 #include "syscall_net.h"
 #include "syscall_path.h"
 #include "syscall_process.h"
@@ -1268,216 +1269,60 @@ void syscall_dispatch(struct registers *r)
   /* -------- Phase 1 user-space compositor primitives (all root-only) --------
    */
   case SYS_FB_INFO: {
-    struct fbinfo {
-      int w, h, pitch, bpp;
-    } *o;
-    if (sched_uid() != 0 || !user_out_range(r->ebx, sizeof *o)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    o = (struct fbinfo *)r->ebx;
-    fb_dims(&o->w, &o->h, &o->pitch, &o->bpp);
-    r->eax = 0;
+    syscall_graphics_fb_info(r);
     break;
   }
   case SYS_FB_MAP: {
-    /* Map the shared cached-RAM BACK buffer (never VRAM) into the caller at the
-     * fixed COMPOSITOR_FB_VADDR; the compositor draws here, then SYS_FB_PRESENT
-     * flushes damaged rects. */
-    if (sched_uid() != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint32_t phys = fb_backbuffer_phys();
-    uint32_t bytes = fb_backbuffer_bytes();
-    if (!phys || !bytes) {
-      r->eax = (uint32_t)-1;
-      break;
-    } /* text/single-buffered */
-    int npages = (int)((bytes + 4095u) / 4096u);
-    uint32_t *dir = sched_current_dir();
-    if (paging_map_user_at(dir, COMPOSITOR_FB_VADDR, phys, npages) < 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    /* First mapper of the back buffer is the compositor: mark it active so
-     * kernel_main stops draining the physical keyboard into the recovery
-     * console (the compositor now owns input via SYS_INPUT_POLL). Cleared when
-     * the task exits (uwin_task_exiting). */
-    uwin_compositor_register(sched_current_id());
-    r->eax = COMPOSITOR_FB_VADDR;
+    syscall_graphics_fb_map(r);
     break;
   }
   case SYS_FB_PRESENT: {
-    struct fbrect {
-      int x, y, w, h;
-    } *rr;
-    if (sched_uid() != 0 || !user_out_range(r->ebx, sizeof *rr)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    rr = (struct fbrect *)r->ebx;
-    fb_present_rect(rr->x, rr->y, rr->w, rr->h);
-    r->eax = 0;
+    syscall_graphics_fb_present(r);
     break;
   }
   case SYS_INPUT_POLL: {
-/* {int mx,my,buttons,wheel; int nkeys; struct{int c,mods;} keys[K];}.
- * Non-blocking: current pointer state + whatever keys are buffered now. */
-#define INPUT_KEYS 32
-    struct inputstate {
-      int mx, my, buttons, wheel;
-      int nkeys;
-      struct {
-        int c, mods;
-      } keys[INPUT_KEYS];
-    } *o;
-    if (sched_uid() != 0 || !user_out_range(r->ebx, sizeof *o)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    o = (struct inputstate *)r->ebx;
-    o->mx = mouse_x();
-    o->my = mouse_y();
-    o->buttons = mouse_buttons();
-    o->wheel = mouse_wheel();
-    int nk = 0;
-    char c;
-    unsigned char mods;
-    while (nk < INPUT_KEYS && keyboard_poll(&c, &mods)) {
-      o->keys[nk].c = (unsigned char)c;
-      o->keys[nk].mods = (int)mods;
-      nk++;
-    }
-    /* Ctrl+C is a latch, not a queued key (it must also interrupt a busy kernel
-     * wait — a recovery-shell command or an audio DMA drain — that never reads
-     * the key ring). Surface it to the focused window as a KEY_INTR event too:
-     * the conversion the in-kernel WM used to do, now that the compositor owns
-     * input. This is the sole consumer of the latch while a compositor runs. */
-    if (nk < INPUT_KEYS && keyboard_take_interrupt()) {
-      o->keys[nk].c = KEY_INTR;
-      o->keys[nk].mods = 0;
-      nk++;
-    }
-    /* Print Screen is latched the same way (the IRQ can't touch the
-     * framebuffer); hand it to the compositor as KEY_PRTSC to capture. */
-    if (nk < INPUT_KEYS && keyboard_take_screenshot()) {
-      o->keys[nk].c = KEY_PRTSC;
-      o->keys[nk].mods = 0;
-      nk++;
-    }
-    o->nkeys = nk;
-    r->eax = 0;
-#undef INPUT_KEYS
+    syscall_graphics_input_poll(r);
     break;
   }
+
   case SYS_INPUT_SET_BOUNDS:
-    if (sched_uid() != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    mouse_set_bounds((int)r->ebx, (int)r->ecx);
-    r->eax = 0;
+    syscall_graphics_input_bounds(r);
     break;
+
   case SYS_WIN_ENUM: {
-    int max = (int)r->ecx;
-    if (max > 4096)
-      max = 4096; /* cap so the size math can't overflow */
-    if (sched_uid() != 0 || max <= 0 || !user_out_range(r->ebx, (uint32_t)max * sizeof(struct winrec))) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)uwin_enum((struct winrec *)r->ebx, max);
+    syscall_graphics_win_enum(r);
     break;
   }
+
   case SYS_WIN_MAP: {
-    struct winmap {
-      uint32_t vaddr;
-      int w, h, stride;
-    } *o;
-    if (sched_uid() != 0 || !user_out_range(r->ecx, sizeof *o)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    int id = (int)r->ebx;
-    if (id < 0 || (uint32_t)id >= WIN_MAP_MAX) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint32_t at = WIN_MAP_BASE + (uint32_t)id * WIN_MAP_SLOT_BYTES;
-    int bw = 0, bh = 0, stride = 0;
-    if (uwin_map(id, at, &bw, &bh, &stride) < 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    o = (struct winmap *)r->ecx;
-    o->vaddr = at;
-    o->w = bw;
-    o->h = bh;
-    o->stride = stride;
-    r->eax = 0;
+    syscall_graphics_win_map(r);
     break;
   }
+
   case SYS_WIN_UNMAP: {
-    if (sched_uid() != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    int id = (int)r->ebx;
-    if (id < 0 || (uint32_t)id >= WIN_MAP_MAX) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint32_t at = WIN_MAP_BASE + (uint32_t)id * WIN_MAP_SLOT_BYTES;
-    r->eax = (uint32_t)uwin_unmap(id, sched_current_dir(), at);
+    syscall_graphics_win_unmap(r);
     break;
   }
+
   case SYS_WIN_SET_GEOM: {
-    struct wg {
-      int x, y, w, h;
-    } geom;
-    if (sched_uid() != 0 || !user_range(r->ecx, sizeof geom)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    if (copyin(&geom, r->ecx, sizeof geom) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)uwin_set_geom((int)r->ebx, geom.x, geom.y, geom.w, geom.h);
+    syscall_graphics_win_geom(r);
     break;
   }
+
   case SYS_WIN_DELIVER: {
-    if (sched_uid() != 0 || !user_range(r->ecx, sizeof(struct winevent))) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    struct winevent ev;
-    if (copyin(&ev, r->ecx, sizeof ev) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)uwin_deliver((int)r->ebx, &ev);
+    syscall_graphics_win_deliver(r);
     break;
   }
+
   case SYS_WIN_KEY_SPACE:
-    if (sched_uid() != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)uwin_key_space((int)r->ebx);
+    syscall_graphics_win_key_space(r);
     break;
+
   case SYS_CRASH_POLL: {
-    int max = (int)r->ecx;
-    if (max > 4096)
-      max = 4096; /* cap so the size math can't overflow */
-    if (sched_uid() != 0 || max <= 0 || !user_out_range(r->ebx, (uint32_t)max * sizeof(struct crash_rec))) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)crash_poll((struct crash_rec *)r->ebx, max);
+    syscall_graphics_crash_poll(r);
     break;
   }
+
   case SYS_STACK_ALLOC:
     syscall_process_stack_alloc(r);
     break;
