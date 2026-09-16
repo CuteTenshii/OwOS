@@ -18,7 +18,6 @@ ISODIR := isodir
 # Objects are emitted in place (kernel/foo.o), shared by both arches. This stamp is a
 # prerequisite of every object and is re-touched when ARCH changes, so switching ARCH
 # forces a recompile instead of linking stale objects into the other image.
-ARCH_STAMP := .arch.$(ARCH)
 $(ARCH_STAMP):
 	@rm -f .arch.* && touch $@
 

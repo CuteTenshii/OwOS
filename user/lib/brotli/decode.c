@@ -314,9 +314,10 @@ static int read_huffman(struct br *b, int alphabet, struct huff *out)
     int symbits = bitlen(alphabet - 1);
     int syms[4];
     for (int i = 0; i < nsym; i++) {
-      syms[i] = br_read(b, symbits);
-      if (syms[i] >= alphabet)
+      int sym = br_read(b, symbits);
+      if (sym < 0 || sym >= alphabet)
         return -1;
+      syms[i] = sym;
     }
     if (nsym == 1) {
       out->bits = 0;

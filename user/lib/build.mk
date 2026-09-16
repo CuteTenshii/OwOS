@@ -10,7 +10,7 @@
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
 ULIBDIRS := curl torrent crypto tls netconn gfx zlib png webp mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64
-UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall \
+UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
 
@@ -149,13 +149,13 @@ $(BROTLIDICT): user/lib/brotli/dictionary.bin
 WOFF    := user/lib/font/woff.o
 TERMLIB := user/lib/zlib/lzss.o user/lib/zlib/deflate.o $(CRC32) $(CRYPTO) $(CLIPBOARD)  # the shell's codecs + crypto
 
-user/lib/start.o: user/lib/start.S
+user/lib/start.o: user/lib/start.S $(ARCH_STAMP)
 	$(UCC) $(UCFLAGS) -c $< -o $@
-user/lib/lib.o: user/lib/lib.c
+user/lib/lib.o: user/lib/lib.c $(ARCH_STAMP)
 	$(UCC) $(UCFLAGS) -c $< -o $@
 
 # Everything under user/ (the libs and the apps trees) compiles with UCFLAGS.
-user/%.o: user/%.c
+user/%.o: user/%.c $(ARCH_STAMP)
 	$(UCC) $(UCFLAGS) -c $< -o $@
 
 # Header dependencies: -MMD -MP (above) emits a .d beside each .o listing the

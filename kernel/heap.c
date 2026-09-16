@@ -35,10 +35,12 @@ extern char kernel_end[];
 typedef struct block {
   size_t size; /* payload bytes, not counting the header  */
   int free;
+  struct block *prev;
   struct block *next;
 } block_t;
 
 static block_t *head;
+static block_t *alloc_cursor;
 static volatile uint32_t heap_lock;
 
 static void heap_lock_acquire(void)
@@ -64,7 +66,9 @@ void heap_init(void)
   head = (block_t *)start;
   head->size = (KHEAP_END - start) - sizeof(block_t);
   head->free = 1;
+  head->prev = 0;
   head->next = 0;
+  alloc_cursor = head;
 }
 
 void *kmalloc(size_t size)
@@ -77,24 +81,34 @@ void *kmalloc(size_t size)
   size = ALIGN_UP(size, 8);
   heap_lock_acquire();
 
-  for (block_t *b = head; b; b = b->next) {
-    if (!b->free || b->size < size)
-      continue;
+  block_t *start = alloc_cursor ? alloc_cursor : head;
+  for (int pass = 0; pass < 2; pass++) {
+    for (block_t *b = start; b; b = b->next) {
+      if (!b->free || b->size < size)
+        continue;
 
-    /* Split if the leftover can hold a header plus a little payload. */
-    if (b->size >= size + sizeof(block_t) + 8) {
-      block_t *rest = (block_t *)((uint8_t *)b + sizeof(block_t) + size);
-      rest->size = b->size - size - sizeof(block_t);
-      rest->free = 1;
-      rest->next = b->next;
-      b->size = size;
-      b->next = rest;
+      /* Split if the leftover can hold a header plus a little payload. */
+      if (b->size >= size + sizeof(block_t) + 8) {
+        block_t *rest = (block_t *)((uint8_t *)b + sizeof(block_t) + size);
+        rest->size = b->size - size - sizeof(block_t);
+        rest->free = 1;
+        rest->prev = b;
+        rest->next = b->next;
+        if (rest->next)
+          rest->next->prev = rest;
+        b->size = size;
+        b->next = rest;
+      }
+      b->free = 0;
+      alloc_cursor = b->next ? b->next : head;
+      void *result = (uint8_t *)b + sizeof(block_t);
+      heap_lock_release();
+      irq_restore(flags);
+      return result;
     }
-    b->free = 0;
-    void *result = (uint8_t *)b + sizeof(block_t);
-    heap_lock_release();
-    irq_restore(flags);
-    return result;
+    if (start == head)
+      break;
+    start = head;
   }
   heap_lock_release();
   irq_restore(flags);
@@ -126,23 +140,23 @@ void kfree(void *ptr)
 
   /* Merge forward with adjacent free blocks. */
   while (b->next && b->next->free) {
+    if (alloc_cursor == b->next)
+      alloc_cursor = b;
     b->size += sizeof(block_t) + b->next->size;
     b->next = b->next->next;
+    if (b->next)
+      b->next->prev = b;
   }
 
-  /* Merge backward: absorb b into a free predecessor. The list is kept in
-   * address order, so one walk from head finds the block whose next is b.
-   * Without this, freeing blocks in any order but low-to-high left a trail of
-   * small free blocks that never recombined — the heap fragmented over uptime.
-   */
-  if (b != head) {
-    block_t *p = head;
-    while (p && p->next != b)
-      p = p->next;
-    if (p && p->free) {
-      p->size += sizeof(block_t) + b->size;
-      p->next = b->next;
-    }
+  /* Merge backward without walking from the head. */
+  if (b->prev && b->prev->free) {
+    block_t *p = b->prev;
+    if (alloc_cursor == b)
+      alloc_cursor = p;
+    p->size += sizeof(block_t) + b->size;
+    p->next = b->next;
+    if (p->next)
+      p->next->prev = p;
   }
   heap_lock_release();
   irq_restore(flags);
@@ -150,18 +164,26 @@ void kfree(void *ptr)
 
 size_t heap_used_bytes(void)
 {
+  uintptr_t flags = irq_save();
+  heap_lock_acquire();
   size_t used = 0;
   for (block_t *b = head; b; b = b->next)
     if (!b->free)
       used += b->size + sizeof(block_t);
+  heap_lock_release();
+  irq_restore(flags);
   return used;
 }
 
 size_t heap_free_bytes(void)
 {
+  uintptr_t flags = irq_save();
+  heap_lock_acquire();
   size_t freed = 0;
   for (block_t *b = head; b; b = b->next)
     if (b->free)
       freed += b->size;
+  heap_lock_release();
+  irq_restore(flags);
   return freed;
 }

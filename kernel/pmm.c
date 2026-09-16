@@ -202,24 +202,29 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
     return 0;
   uintptr_t flags = pmm_lock_acquire();
 
-  /* Start past the always-reserved low 16 MiB: those frames are permanently
-   * marked used, so no contiguous run can begin there. Scanning from 0 stepped
-   * through all ~4096 reserved frames one at a time (run=0 -> f+=1) on every
-   * call before reaching allocatable RAM. */
-  for (uint32_t f = (low_end_b / FRAME_SIZE); f + need <= total_frames;) {
-    uint32_t run = 0;
-    while (run < need && !frame_test(f + run))
-      run++;
-    if (run == need) { /* found a long-enough free run     */
-      for (uint32_t i = 0; i < need; i++) {
-        frame_set(f + i);
-        refs[f + i] = 1;
-        used_frames++;
+  /* Start at the allocation cursor and wrap once. The low region is permanently
+   * reserved, so a wrapped search starts at low_end_b rather than frame zero. */
+  uint32_t low = low_end_b / FRAME_SIZE;
+  uint32_t start = alloc_hint < low || alloc_hint >= total_frames ? low : alloc_hint;
+  for (int pass = 0; pass < 2; pass++) {
+    uint32_t begin = pass == 0 ? start : low;
+    uint32_t end = pass == 0 ? total_frames : start;
+    for (uint32_t f = begin; f + need <= end;) {
+      uint32_t run = 0;
+      while (run < need && !frame_test(f + run))
+        run++;
+      if (run == need) {
+        for (uint32_t i = 0; i < need; i++) {
+          frame_set(f + i);
+          refs[f + i] = 1;
+          used_frames++;
+        }
+        alloc_hint = f + need;
+        pmm_lock_release(flags);
+        return f * FRAME_SIZE;
       }
-      pmm_lock_release(flags);
-      return f * FRAME_SIZE;
+      f += run + 1;
     }
-    f += run + 1; /* skip past the blocking used frame */
   }
   pmm_lock_release(flags);
   return 0;
@@ -270,8 +275,22 @@ void pmm_free_contig(uint32_t phys, uint32_t bytes)
   if (bytes > 0xFFFFFFFFu - (FRAME_SIZE - 1)) /* never allocated (see alloc) */
     return;
   uint32_t need = (bytes + FRAME_SIZE - 1) / FRAME_SIZE;
-  for (uint32_t i = 0; i < need; i++)
-    pmm_free_frame(phys + i * FRAME_SIZE);
+  uintptr_t flags = pmm_lock_acquire();
+  for (uint32_t i = 0; i < need; i++) {
+    uint32_t f = phys / FRAME_SIZE + i;
+    if (f >= total_frames || !frame_test(f))
+      continue;
+    if (refs[f] > 1) {
+      refs[f]--;
+      continue;
+    }
+    refs[f] = 0;
+    frame_clear(f);
+    used_frames--;
+    if (f < alloc_hint)
+      alloc_hint = f;
+  }
+  pmm_lock_release(flags);
 }
 
 /* Reported in KiB, not bytes: a fully-populated 4 GiB machine is 4194304 KiB,

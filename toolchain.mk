@@ -12,6 +12,8 @@ VERSION_DEF  := -DOWOS_VERSION='"$(OWOS_VERSION)"'
 #   make             # 32-bit owos.bin
 #   make ARCH=x86_64  # 64-bit owos-x86_64.bin
 ARCH ?= i386
+OPT_LEVEL ?= 2
+ARCH_STAMP := .arch.$(ARCH).O$(OPT_LEVEL)
 ifeq ($(filter $(ARCH),i386 x86_64),)
   $(error unsupported ARCH '$(ARCH)' — use i386 or x86_64)
 endif
@@ -67,9 +69,10 @@ endif
 
 # Freestanding: no host libc/headers, no PIE/stack-protector/red-zone. -mno-sse/
 # -mno-mmx: the kernel never enables SSE, so GCC must not auto-vectorize into xmm/mmx
-# (#UD). -O1 is required and capped: -O0 leaves the compositor's per-pixel helpers
-# un-inlined (stutters); -O2 triple-faults at early boot (latent UB) — do not raise
-# without re-verifying a clean boot. The two -fno guards are no-ops at -O1 but kept so
+# (#UD). O2 is the default: O0 leaves the compositor's per-pixel helpers
+# un-inlined (stutters), and O2 has been boot-tested on the current kernel.
+# Override with OPT_LEVEL=1 for diagnosis.
+# The two -fno guards are no-ops at O1 but kept so
 # a future -O2 attempt can't regress:
 #   -fno-strict-aliasing                the kernel type-puns freely (mb2 tags, packet
 #                                       and on-disk structs).
@@ -79,7 +82,7 @@ endif
 # DRVDIRS: each driver subdir on -I so the flat #include "foo.h" convention resolves.
 DRVDIRS := storage net audio usb input video acpi bus
 CFLAGS  := $(ARCHFLAGS) -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
-           -O1 -fno-strict-aliasing -fno-tree-loop-distribute-patterns \
+           -O$(OPT_LEVEL) -fno-strict-aliasing -fno-tree-loop-distribute-patterns \
            -mno-sse -mno-mmx -Wall -Wextra $(VERSION_DEF) -Icommon -Ikernel $(addprefix -Idrivers/,$(DRVDIRS))
 LDFLAGS := $(ARCHFLAGS) -ffreestanding -nostdlib -no-pie -T $(LINKER)
 
