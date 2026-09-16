@@ -66,7 +66,7 @@ static match_fn parse_selector(const char *selector, char *value, int cap)
   return kind == '#' ? match_id : kind == '.' ? match_class : match_tag;
 }
 
-static struct dom_node *find_selector(struct dom_node *root, const char *selector)
+struct dom_node *js_dom_find_selector(struct dom_node *root, const char *selector)
 {
   char value[64];
   match_fn match = parse_selector(selector, value, sizeof value);
@@ -87,11 +87,6 @@ void js_dom_find_all_tag(struct dom_node *root, const char *tag, js_object *out)
 {
   if (root)
     find_all(root, match_tag, tag, out);
-}
-
-struct dom_node *js_dom_query(struct dom_node *root, const char *selector)
-{
-  return find_selector(root, selector);
 }
 
 void js_dom_query_all(struct dom_node *root, const char *selector, js_object *out)
