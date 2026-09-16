@@ -54,7 +54,7 @@ int sched_sigreturn(struct registers *r);
 int sched_intr_pending(void);             /* a signal wants delivery (blocking waits) */
 int sched_waitpid(int pid);               /* block for a child; returns its status  */
 int sched_try_reap(int pid, int *status); /* non-blocking reap (kernel side) */
-void sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, struct registers *r);
+int sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, uint32_t brk, struct registers *r);
 
 void schedule(void);    /* invoked from the timer tick                       */
 void sched_yield(void); /* voluntarily give up the CPU (stays runnable)      */
@@ -64,9 +64,10 @@ void sched_yield(void); /* voluntarily give up the CPU (stays runnable)      */
  */
 void sched_sleep_until(uint32_t wake);
 void sched_wake_due(uint32_t now);
-struct fd *sched_fds(void);           /* the current task's file descriptor table     */
-uint32_t *sched_current_dir(void);    /* current task's page dir (windowing layer) */
-uint32_t sched_current_id(void);      /* current task's pid                        */
+struct fd *sched_fds(void);        /* the current task's file descriptor table     */
+uint32_t *sched_current_dir(void); /* current task's page dir (windowing layer) */
+uint32_t sched_current_id(void);   /* current task's pid                        */
+uint32_t sched_current_process_id(void);
 const char *sched_current_name(void); /* current task's name (crash reporter) */
 void sched_set_pipe_fd(int pid, int fd, int writer, int pipe_id);
 void sched_set_cwd(int pid, const char *path); /* set a child's working dir */

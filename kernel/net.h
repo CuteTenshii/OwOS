@@ -27,6 +27,7 @@ int net_sock_recv(int h, void *buf, uint32_t max);
  * interactive clients (ssh) that multiplex the socket with stdin. */
 int net_sock_recv_nb(int h, void *buf, uint32_t max);
 int net_sock_close(int h);
+void net_sock_close_owner(uint32_t owner);
 /* Set the outgoing IP TTL for a UDP socket (IP_MULTICAST_TTL analog). 0/-1. */
 int net_sock_set_ttl(int h, int ttl);
 

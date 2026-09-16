@@ -12,7 +12,7 @@
 ULIBDIRS := curl torrent crypto tls netconn gfx zlib png webp mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
-           -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
+           -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
 
 # Debug build (make JSDEBUG=1 ...): the JS engine logs every thrown exception with
 # its stack to the console, so swallowed failures surface. Diagnostic only.

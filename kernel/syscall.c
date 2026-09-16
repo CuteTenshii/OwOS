@@ -45,6 +45,7 @@
 #include "smbios.h"
 #include "sysfs.h"
 #include "timer.h"
+#include "uaccess.h"
 #include "uwin.h"
 #include <stdint.h>
 
@@ -302,28 +303,6 @@ static int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t
 
 /* A user pointer must stay entirely within the user region, or we refuse
  * the call -- otherwise a program could make the kernel touch its memory. */
-static int user_range(uint32_t addr, uint32_t len) { return paging_user_range(addr, len, 0); }
-
-/* Copy a NUL-terminated user string at `uaddr` into `out` (`cap` bytes),
- * validating each byte stays inside the user window before it is read. Returns
- * 0 on success, -1 if the pointer leaves the window before a terminator or the
- * string doesn't fit. Path syscalls must use this rather than passing the raw
- * user pointer to join_cwd(), which would otherwise walk an unterminated string
- * off the end of the mapped region and fault the kernel in the int 0x80 gate.
- */
-static int copy_user_str(uint32_t uaddr, char *out, int cap)
-{
-  for (int i = 0; i < cap; i++) {
-    if (!user_range(uaddr + (uint32_t)i, 1))
-      return -1;
-    char ch = ((const char *)(uintptr_t)uaddr)[i];
-    out[i] = ch;
-    if (ch == '\0')
-      return 0;
-  }
-  return -1; /* no terminator within cap          */
-}
-
 extern void isr128(void); /* the int 0x80 stub (isr.S)               */
 
 /* Unix seconds (UTC) -> civil date/time (Howard Hinnant's days-from-civil
@@ -417,8 +396,8 @@ void syscall_dispatch(struct registers *r)
     if ((int)r->edx & WNOHANG) {
       int status = 0;
       int got = sched_try_reap((int)r->ebx, &status);
-      if (got && r->ecx && user_range(r->ecx, 4))
-        *(int *)r->ecx = status;
+      if (got && r->ecx && copyout(r->ecx, &status, sizeof status) != 0)
+        got = -1;
       r->eax = (uint32_t)got;
     } else {
       r->eax = (uint32_t)sched_waitpid((int)r->ebx);
@@ -456,9 +435,15 @@ void syscall_dispatch(struct registers *r)
     fds[rfd].pipe = (uint8_t)id;
     fds[wfd].type = FD_PIPE_WR;
     fds[wfd].pipe = (uint8_t)id;
-    int *out = (int *)r->ebx;
-    out[0] = rfd;
-    out[1] = wfd;
+    int out[2] = {rfd, wfd};
+    if (copyout(r->ebx, out, sizeof out) != 0) {
+      pipe_close(id, 0);
+      pipe_close(id, 1);
+      fds[rfd].type = FD_NONE;
+      fds[wfd].type = FD_NONE;
+      r->eax = (uint32_t)-1;
+      break;
+    }
     r->eax = 0;
     break;
   }
@@ -489,11 +474,10 @@ void syscall_dispatch(struct registers *r)
     }
     /* Copy the name out of the soon-to-be-freed user image. */
     char name[24];
-    const char *uname = (const char *)r->ebx;
-    int i = 0;
-    for (; i < 23 && uname[i]; i++)
-      name[i] = uname[i];
-    name[i] = '\0';
+    if (copyin_str(r->ebx, name, sizeof name) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
 
     /* Optional argv[1] (ecx): a single string argument, copied in before
      * we touch the new address space. NULL/0 means no argument. Bounds-check
@@ -503,14 +487,10 @@ void syscall_dispatch(struct registers *r)
     int have_arg = 0;
     uint32_t uarg = r->ecx;
     if (uarg) {
-      int j = 0;
-      while (j < (int)sizeof(arg) - 1 && user_range(uarg + (uint32_t)j, 1)) {
-        char ch = ((const char *)uarg)[j];
-        if (!ch)
-          break;
-        arg[j++] = ch;
+      if (copyin_str(uarg, arg, sizeof arg) != 0) {
+        r->eax = (uint32_t)-1;
+        break;
       }
-      arg[j] = '\0';
       have_arg = 1;
     }
 
@@ -545,15 +525,17 @@ void syscall_dispatch(struct registers *r)
     kfree(buf);
     char *argv[2] = {name, arg};
     uint32_t user_esp = setup_args(dir, have_arg ? 2 : 1, argv);
-    sched_set_brk(brk);                     /* the new image's heap base   */
-    sched_replace(dir, entry, user_esp, r); /* returns into the new image */
+    if (sched_replace(dir, entry, user_esp, brk, r) < 0) {
+      paging_free_process_dir(dir);
+      r->eax = (uint32_t)-1;
+    }
     break;
   }
   case SYS_READ: {
     int fd = (int)r->ebx;
     char *buf = (char *)r->ecx;
     uint32_t len = r->edx;
-    if (fd < 0 || fd >= MAX_FD || len == 0 || !user_range(r->ecx, len)) {
+    if (fd < 0 || fd >= MAX_FD || len == 0 || !user_out_range(r->ecx, len)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -668,7 +650,7 @@ void syscall_dispatch(struct registers *r)
   case SYS_READFILE: {
     char name[SYS_PATH_MAX];
     uint32_t buf = r->ecx, max = r->edx;
-    if (copy_user_str(r->ebx, name, sizeof name) != 0 || !user_range(buf, max)) {
+    if (copyin_str(r->ebx, name, sizeof name) != 0 || !user_out_range(buf, max)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -678,7 +660,7 @@ void syscall_dispatch(struct registers *r)
   case SYS_WRITEFILE: {
     char name[SYS_PATH_MAX];
     uint32_t buf = r->ecx, len = r->edx;
-    if (copy_user_str(r->ebx, name, sizeof name) != 0 || !user_range(buf, len)) {
+    if (copyin_str(r->ebx, name, sizeof name) != 0 || !user_range(buf, len)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -702,7 +684,7 @@ void syscall_dispatch(struct registers *r)
    * allows a single open stream at a time. */
   case SYS_STREAM_BEGIN: {
     char name[SYS_PATH_MAX];
-    if (copy_user_str(r->ebx, name, sizeof name) != 0) {
+    if (copyin_str(r->ebx, name, sizeof name) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -729,22 +711,11 @@ void syscall_dispatch(struct registers *r)
       break;
     }
     /* Copy the host string out of user memory, bounded. */
-    if (!user_range(r->ebx, 1)) {
+    char host[NET_HOST_MAX];
+    if (copyin_str(r->ebx, host, sizeof host) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
-    char host[NET_HOST_MAX];
-    const char *uh = (const char *)r->ebx;
-    int i = 0;
-    for (; i < NET_HOST_MAX - 1; i++) {
-      if (!user_range(r->ebx + (uint32_t)i, 1))
-        break;
-      char c = uh[i];
-      if (!c)
-        break;
-      host[i] = c;
-    }
-    host[i] = '\0';
     r->eax = (uint32_t)net_sock_connect(host, (uint16_t)r->ecx, (int)r->edx);
     break;
   }
@@ -756,7 +727,11 @@ void syscall_dispatch(struct registers *r)
       r->eax = (uint32_t)-1;
       break;
     }
-    const uint32_t *a = (const uint32_t *)r->ebx;
+    uint32_t a[6];
+    if (copyin(a, r->ebx, sizeof a) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
     uint32_t fd = a[0], bp = a[1], len = a[2], ipp = a[4], port = a[5];
     if (len == 0 || !user_range(bp, len) || (ipp && !user_range(ipp, 4))) {
       r->eax = (uint32_t)-1;
@@ -780,9 +755,14 @@ void syscall_dispatch(struct registers *r)
       r->eax = (uint32_t)-1;
       break;
     }
-    const uint32_t *a = (const uint32_t *)r->ebx;
+    uint32_t a[6];
+    if (copyin(a, r->ebx, sizeof a) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
     uint32_t fd = a[0], bp = a[1], max = a[2], flags = a[3], ipp = a[4], portp = a[5];
-    if (max == 0 || !user_range(bp, max) || (ipp && !user_range(ipp, 4)) || (portp && !user_range(portp, 4))) {
+    if (max == 0 || !user_out_range(bp, max) || (ipp && !user_out_range(ipp, 4)) ||
+        (portp && !user_out_range(portp, 4))) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -792,11 +772,13 @@ void syscall_dispatch(struct registers *r)
       uint16_t port = 0;
       n = net_sock_recvfrom((int)fd, (void *)bp, max, ipp ? ip : 0, &port);
       if (n > 0) {
-        if (ipp)
-          for (int i = 0; i < 4; i++)
-            ((uint8_t *)ipp)[i] = ip[i];
-        if (portp)
-          *(int *)portp = port;
+        if (ipp && copyout(ipp, ip, 4) != 0)
+          n = -1;
+        if (portp && n > 0) {
+          int port_out = port;
+          if (copyout(portp, &port_out, sizeof port_out) != 0)
+            n = -1;
+        }
       }
     } else if (flags & MSG_DONTWAIT) {
       n = net_sock_recv_nb((int)fd, (void *)bp, max);
@@ -860,7 +842,7 @@ void syscall_dispatch(struct registers *r)
     break;
   case SYS_GETRANDOM: {
     uint32_t buf = r->ebx, len = r->ecx;
-    if (len == 0 || len > 256 || !user_range(buf, len)) {
+    if (len == 0 || len > 256 || !user_out_range(buf, len)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -871,16 +853,13 @@ void syscall_dispatch(struct registers *r)
   case SYS_WIN_CREATE: {
     int w = (int)r->ebx, h = (int)r->ecx;
     char title[64];
-    int n = 0;
     uint32_t tp = r->edx;
-    if (tp)
-      while (n < 63 && user_range(tp + (uint32_t)n, 1)) {
-        char ch = ((const char *)tp)[n];
-        if (!ch)
-          break;
-        title[n++] = ch;
-      }
-    title[n] = '\0';
+    if (tp && copyin_str(tp, title, sizeof title) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
+    if (!tp)
+      title[0] = '\0';
     r->eax = (uint32_t)uwin_create(w, h, title);
     break;
   }
@@ -893,7 +872,7 @@ void syscall_dispatch(struct registers *r)
      * 0x80 gate runs IF=0, so sti before timer_sleep or a bare hlt wedges the
      * CPU (the timer couldn't wake it). */
     struct win_event *ev = (struct win_event *)r->ecx;
-    if (ev && !user_range(r->ecx, sizeof(struct win_event))) {
+    if (ev && !user_out_range(r->ecx, sizeof(struct win_event))) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -918,19 +897,15 @@ void syscall_dispatch(struct registers *r)
       int is_dir;
       uint32_t size;
     } *o;
-    if (!user_range(r->ebx, 1) || !user_range(r->edx, sizeof *o)) {
+    if (!user_out_range(r->edx, sizeof *o)) {
       r->eax = (uint32_t)-1;
       break;
     }
     char path[SYS_PATH_MAX];
-    int n = 0;
-    for (; n < SYS_PATH_MAX - 1 && user_range(r->ebx + (uint32_t)n, 1); n++) {
-      char c = ((const char *)r->ebx)[n];
-      if (!c)
-        break;
-      path[n] = c;
+    if (copyin_str(r->ebx, path, sizeof path) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
     }
-    path[n] = '\0';
     o = (struct rd_out *)r->edx;
     char nm[64];
     int isd = 0;
@@ -949,16 +924,13 @@ void syscall_dispatch(struct registers *r)
   }
   case SYS_WIN_TITLE: {
     char title[64];
-    int n = 0;
     uint32_t tp = r->ecx;
-    if (tp)
-      while (n < 63 && user_range(tp + (uint32_t)n, 1)) {
-        char c = ((const char *)tp)[n];
-        if (!c)
-          break;
-        title[n++] = c;
-      }
-    title[n] = '\0';
+    if (tp && copyin_str(tp, title, sizeof title) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
+    if (!tp)
+      title[0] = '\0';
     r->eax = (uint32_t)uwin_set_title((int)r->ebx, title);
     break;
   }
@@ -994,18 +966,18 @@ void syscall_dispatch(struct registers *r)
       r->eax = (uint32_t)-1;
       break;
     }
-    const uint32_t *a = (const uint32_t *)r->ebx;
+    uint32_t a[4];
+    if (copyin(a, r->ebx, sizeof a) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
     uint32_t np = a[0], off = a[1], bp = a[2], len = a[3];
     char name[SYS_PATH_MAX];
-    int k = 0;
-    while (k < SYS_PATH_MAX - 1 && user_range(np + (uint32_t)k, 1)) {
-      char ch = ((const char *)np)[k];
-      if (!ch)
-        break;
-      name[k++] = ch;
+    if (copyin_str(np, name, sizeof name) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
     }
-    name[k] = '\0';
-    if (len && !user_range(bp, len)) {
+    if (len && !user_out_range(bp, len)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1026,7 +998,7 @@ void syscall_dispatch(struct registers *r)
       char point[40];
       int mounted;
     } *o;
-    if (!user_range(r->ecx, sizeof *o)) {
+    if (!user_out_range(r->ecx, sizeof *o)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1074,27 +1046,11 @@ void syscall_dispatch(struct registers *r)
    * mount("usb0", "/media/usb0"). fs.c probes the device's filesystem and adds
    * it to the mount table. Both strings are bounds-checked per byte. */
   case SYS_MOUNT: {
-    if (!user_range(r->ebx, 1) || !user_range(r->ecx, 1)) {
+    char dev[16], point[48];
+    if (copyin_str(r->ebx, dev, sizeof dev) != 0 || copyin_str(r->ecx, point, sizeof point) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
-    char dev[16], point[48];
-    int j = 0;
-    for (; j < (int)sizeof(dev) - 1 && user_range(r->ebx + (uint32_t)j, 1); j++) {
-      char ch = ((const char *)r->ebx)[j];
-      if (!ch)
-        break;
-      dev[j] = ch;
-    }
-    dev[j] = '\0';
-    j = 0;
-    for (; j < (int)sizeof(point) - 1 && user_range(r->ecx + (uint32_t)j, 1); j++) {
-      char ch = ((const char *)r->ecx)[j];
-      if (!ch)
-        break;
-      point[j] = ch;
-    }
-    point[j] = '\0';
     __asm__ volatile("sti"); /* probing reads sectors (may wait on IRQ) */
     r->eax = (uint32_t)fs_mount(dev, point);
     break;
@@ -1102,19 +1058,11 @@ void syscall_dispatch(struct registers *r)
 
   /* Unmount the volume at a mount point: umount(point=ebx). */
   case SYS_UMOUNT: {
-    if (!user_range(r->ebx, 1)) {
+    char point[48];
+    if (copyin_str(r->ebx, point, sizeof point) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
-    char point[48];
-    int j = 0;
-    for (; j < (int)sizeof(point) - 1 && user_range(r->ebx + (uint32_t)j, 1); j++) {
-      char ch = ((const char *)r->ebx)[j];
-      if (!ch)
-        break;
-      point[j] = ch;
-    }
-    point[j] = '\0';
     r->eax = (uint32_t)fs_unmount(point);
     break;
   }
@@ -1123,7 +1071,7 @@ void syscall_dispatch(struct registers *r)
    * the caller's cwd (like readfile/writefile) before hitting owofs. */
   case SYS_MKDIR: {
     char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
-    if (copy_user_str(r->ebx, name, sizeof name) != 0) {
+    if (copyin_str(r->ebx, name, sizeof name) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1133,7 +1081,7 @@ void syscall_dispatch(struct registers *r)
   }
   case SYS_RMDIR: {
     char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
-    if (copy_user_str(r->ebx, name, sizeof name) != 0) {
+    if (copyin_str(r->ebx, name, sizeof name) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1143,7 +1091,7 @@ void syscall_dispatch(struct registers *r)
   }
   case SYS_DELETE: {
     char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
-    if (copy_user_str(r->ebx, name, sizeof name) != 0) {
+    if (copyin_str(r->ebx, name, sizeof name) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1153,7 +1101,7 @@ void syscall_dispatch(struct registers *r)
   }
   case SYS_RENAME: {
     char na[SYS_PATH_MAX], nb[SYS_PATH_MAX], a[SYS_PATH_MAX], b[SYS_PATH_MAX];
-    if (copy_user_str(r->ebx, na, sizeof na) != 0 || copy_user_str(r->ecx, nb, sizeof nb) != 0) {
+    if (copyin_str(r->ebx, na, sizeof na) != 0 || copyin_str(r->ecx, nb, sizeof nb) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1167,19 +1115,11 @@ void syscall_dispatch(struct registers *r)
    * resolved by the caller (the shell prepends /bin/ or passes an absolute
    * path); `arg` is an optional single argv[1]. Returns the child pid. */
   case SYS_SPAWN: {
-    if (!user_range(r->ebx, 1)) {
+    char path[SYS_PATH_MAX];
+    if (copyin_str(r->ebx, path, sizeof path) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
-    char path[SYS_PATH_MAX];
-    int n = 0;
-    for (; n < SYS_PATH_MAX - 1 && user_range(r->ebx + (uint32_t)n, 1); n++) {
-      char c = ((const char *)r->ebx)[n];
-      if (!c)
-        break;
-      path[n] = c;
-    }
-    path[n] = '\0';
     /* Size the buffer to the file (like apps.c launch_bin), not a fixed
      * 256 KiB -- a large fixed kmalloc fails on a pressured/fragmented heap
      * (real drivers, VMware) even when the smaller program would fit, which
@@ -1204,15 +1144,12 @@ void syscall_dispatch(struct registers *r)
     char *argv[2];
     int argc = 1;
     argv[0] = path;
-    if (r->ecx && user_range(r->ecx, 1)) {
-      int j = 0;
-      for (; j < SYS_PATH_MAX - 1 && user_range(r->ecx + (uint32_t)j, 1); j++) {
-        char c = ((const char *)r->ecx)[j];
-        if (!c)
-          break;
-        arg[j] = c;
+    if (r->ecx) {
+      if (copyin_str(r->ecx, arg, sizeof arg) != 0) {
+        kfree(buf);
+        r->eax = (uint32_t)-1;
+        break;
       }
-      arg[j] = '\0';
       argv[1] = arg;
       argc = 2;
     }
@@ -1258,13 +1195,17 @@ void syscall_dispatch(struct registers *r)
       r->eax = (uint32_t)-1;
       break;
     }
-    struct cap_req req = *(const struct cap_req *)r->ebx;
-    if (!user_range(req.path, 1) || !user_range(req.rfd, 4)) {
+    struct cap_req req;
+    if (copyin(&req, r->ebx, sizeof req) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
+    if (!user_range(req.path, 1) || !user_out_range(req.rfd, 4)) {
       r->eax = (uint32_t)-1;
       break;
     }
     int want_stdin = req.wfd != 0;
-    if (want_stdin && !user_range(req.wfd, 4)) {
+    if (want_stdin && !user_out_range(req.wfd, 4)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1285,25 +1226,17 @@ void syscall_dispatch(struct registers *r)
     }
     char cwdbuf[SYS_PATH_MAX];
     if (req.cwd) {
-      int ci = 0;
-      for (; ci < SYS_PATH_MAX - 1 && user_range(req.cwd + (uint32_t)ci, 1); ci++) {
-        char c = ((const char *)req.cwd)[ci];
-        if (!c)
-          break;
-        cwdbuf[ci] = c;
+      if (copyin_str(req.cwd, cwdbuf, sizeof cwdbuf) != 0) {
+        r->eax = (uint32_t)-1;
+        break;
       }
-      cwdbuf[ci] = '\0';
     }
 
     char path[SYS_PATH_MAX];
-    int n = 0;
-    for (; n < SYS_PATH_MAX - 1 && user_range(req.path + (uint32_t)n, 1); n++) {
-      char c = ((const char *)req.path)[n];
-      if (!c)
-        break;
-      path[n] = c;
+    if (copyin_str(req.path, path, sizeof path) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
     }
-    path[n] = '\0';
 
 /* Marshal argv: up to MAXARGS strings, each MAXARG bytes, copied out of the
  * user image (bounds-checked per byte) before we touch a new address space. */
@@ -1325,15 +1258,11 @@ void syscall_dispatch(struct registers *r)
         argc = ai;
         break;
       }
-      uint32_t sp = *(const uint32_t *)pp;
-      int j = 0;
-      for (; j < MAXARG - 1 && user_range(sp + (uint32_t)j, 1); j++) {
-        char c = ((const char *)sp)[j];
-        if (!c)
-          break;
-        argbuf[ai][j] = c;
+      uint32_t sp;
+      if (copyin(&sp, pp, sizeof sp) != 0 || copyin_str(sp, argbuf[ai], MAXARG) != 0) {
+        argc = ai;
+        break;
       }
-      argbuf[ai][j] = '\0';
     }
 
     int fsz = fs_size(path);
@@ -1383,7 +1312,10 @@ void syscall_dispatch(struct registers *r)
     if (set_uid || set_gid)
       sched_set_creds(pid, set_uid ? (uint32_t)req.uid : sched_uid(), set_gid ? (uint32_t)req.gid : sched_gid());
     sched_set_cwd(pid, req.cwd ? cwdbuf : sched_cwd()); /* explicit cwd, else inherit */
-    *(int *)req.rfd = rfd;
+    if (copyout(req.rfd, &rfd, sizeof rfd) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
     /* Optional stdin pipe: our write end -> child fd 0 (its read end). If we
      * can't allocate it, the child still runs (stdout-only); we just report no
      * write fd. The child already exists, so don't fail the whole spawn. */
@@ -1399,13 +1331,14 @@ void syscall_dispatch(struct registers *r)
         fds[wfd].type = FD_PIPE_WR;
         fds[wfd].pipe = (uint8_t)id2;
         sched_set_pipe_fd(pid, 0, 0, id2); /* child fd 0 (stdin) -> read end */
-        *(int *)req.wfd = wfd;
+        copyout(req.wfd, &wfd, sizeof wfd);
       } else {
         if (id2 >= 0) {
           pipe_close(id2, 0);
           pipe_close(id2, 1);
         }
-        *(int *)req.wfd = -1;
+        int nofd = -1;
+        copyout(req.wfd, &nofd, sizeof nofd);
       }
     }
     r->eax = (uint32_t)pid;
@@ -1417,7 +1350,7 @@ void syscall_dispatch(struct registers *r)
     int fd = (int)r->ebx;
     char *buf = (char *)r->ecx;
     uint32_t len = r->edx;
-    if (fd < 0 || fd >= MAX_FD || len == 0 || !user_range(r->ecx, len)) {
+    if (fd < 0 || fd >= MAX_FD || len == 0 || !user_out_range(r->ecx, len)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1429,19 +1362,11 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_CHDIR: {
-    if (!user_range(r->ebx, 1)) {
+    char path[SYS_PATH_MAX];
+    if (copyin_str(r->ebx, path, sizeof path) != 0) {
       r->eax = (uint32_t)-1;
       break;
     }
-    char path[SYS_PATH_MAX];
-    int n = 0;
-    for (; n < SYS_PATH_MAX - 1 && user_range(r->ebx + (uint32_t)n, 1); n++) {
-      char c = ((const char *)r->ebx)[n];
-      if (!c)
-        break;
-      path[n] = c;
-    }
-    path[n] = '\0';
     char abs[SYS_PATH_MAX];
     int isd = 0;
     if (resolve_path(path, abs, sizeof abs) != 0 || fs_stat(abs, &isd, 0, 0) != 0 || !isd) {
@@ -1479,19 +1404,22 @@ void syscall_dispatch(struct registers *r)
         r->eax = (uint32_t)-1;
         break;
       }
-      kact = *(const struct k_sigaction *)r->ecx;
+      if (copyin(&kact, r->ecx, sizeof kact) != 0) {
+        r->eax = (uint32_t)-1;
+        break;
+      }
       ap = &kact;
     }
     /* Validate the oldact output pointer BEFORE mutating the disposition, so a
      * bogus oldact can't leave the handler installed while reporting failure.
      */
-    if (r->edx && !user_range(r->edx, sizeof kold)) {
+    if (r->edx && !user_out_range(r->edx, sizeof kold)) {
       r->eax = (uint32_t)-1;
       break;
     }
     int rc = sched_sigaction((int)r->ebx, ap, r->edx ? &kold : 0);
-    if (rc == 0 && r->edx)
-      *(struct k_sigaction *)r->edx = kold;
+    if (rc == 0 && r->edx && copyout(r->edx, &kold, sizeof kold) != 0)
+      rc = -1;
     r->eax = (uint32_t)rc;
     break;
   }
@@ -1510,7 +1438,7 @@ void syscall_dispatch(struct registers *r)
       uint32_t mtime;
     } *o;
     char name[SYS_PATH_MAX];
-    if (copy_user_str(r->ebx, name, sizeof name) != 0 || !user_range(r->ecx, sizeof *o)) {
+    if (copyin_str(r->ebx, name, sizeof name) != 0 || !user_out_range(r->ecx, sizeof *o)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1534,7 +1462,7 @@ void syscall_dispatch(struct registers *r)
       uint64_t total;
       uint64_t free;
     } *o;
-    if (!user_range(r->ecx, sizeof *o)) {
+    if (!user_out_range(r->ecx, sizeof *o)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1556,7 +1484,7 @@ void syscall_dispatch(struct registers *r)
     struct k_utsname {
       char sysname[65], nodename[65], release[65], version[65], machine[65];
     } *o;
-    if (!user_range(r->ebx, sizeof *o)) {
+    if (!user_out_range(r->ebx, sizeof *o)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1639,7 +1567,7 @@ void syscall_dispatch(struct registers *r)
     struct fbinfo {
       int w, h, pitch, bpp;
     } *o;
-    if (sched_uid() != 0 || !user_range(r->ebx, sizeof *o)) {
+    if (sched_uid() != 0 || !user_out_range(r->ebx, sizeof *o)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1680,7 +1608,7 @@ void syscall_dispatch(struct registers *r)
     struct fbrect {
       int x, y, w, h;
     } *rr;
-    if (sched_uid() != 0 || !user_range(r->ebx, sizeof *rr)) {
+    if (sched_uid() != 0 || !user_out_range(r->ebx, sizeof *rr)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1700,7 +1628,7 @@ void syscall_dispatch(struct registers *r)
         int c, mods;
       } keys[INPUT_KEYS];
     } *o;
-    if (sched_uid() != 0 || !user_range(r->ebx, sizeof *o)) {
+    if (sched_uid() != 0 || !user_out_range(r->ebx, sizeof *o)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1751,7 +1679,7 @@ void syscall_dispatch(struct registers *r)
     int max = (int)r->ecx;
     if (max > 4096)
       max = 4096; /* cap so the size math can't overflow */
-    if (sched_uid() != 0 || max <= 0 || !user_range(r->ebx, (uint32_t)max * sizeof(struct winrec))) {
+    if (sched_uid() != 0 || max <= 0 || !user_out_range(r->ebx, (uint32_t)max * sizeof(struct winrec))) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1763,7 +1691,7 @@ void syscall_dispatch(struct registers *r)
       uint32_t vaddr;
       int w, h, stride;
     } *o;
-    if (sched_uid() != 0 || !user_range(r->ecx, sizeof *o)) {
+    if (sched_uid() != 0 || !user_out_range(r->ecx, sizeof *o)) {
       r->eax = (uint32_t)-1;
       break;
     }
@@ -1803,13 +1731,16 @@ void syscall_dispatch(struct registers *r)
   case SYS_WIN_SET_GEOM: {
     struct wg {
       int x, y, w, h;
-    } *g;
-    if (sched_uid() != 0 || !user_range(r->ecx, sizeof *g)) {
+    } geom;
+    if (sched_uid() != 0 || !user_range(r->ecx, sizeof geom)) {
       r->eax = (uint32_t)-1;
       break;
     }
-    g = (struct wg *)r->ecx;
-    r->eax = (uint32_t)uwin_set_geom((int)r->ebx, g->x, g->y, g->w, g->h);
+    if (copyin(&geom, r->ecx, sizeof geom) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
+    r->eax = (uint32_t)uwin_set_geom((int)r->ebx, geom.x, geom.y, geom.w, geom.h);
     break;
   }
   case SYS_WIN_DELIVER: {
@@ -1817,7 +1748,11 @@ void syscall_dispatch(struct registers *r)
       r->eax = (uint32_t)-1;
       break;
     }
-    struct winevent ev = *(const struct winevent *)r->ecx;
+    struct winevent ev;
+    if (copyin(&ev, r->ecx, sizeof ev) != 0) {
+      r->eax = (uint32_t)-1;
+      break;
+    }
     r->eax = (uint32_t)uwin_deliver((int)r->ebx, &ev);
     break;
   }
@@ -1832,7 +1767,7 @@ void syscall_dispatch(struct registers *r)
     int max = (int)r->ecx;
     if (max > 4096)
       max = 4096; /* cap so the size math can't overflow */
-    if (sched_uid() != 0 || max <= 0 || !user_range(r->ebx, (uint32_t)max * sizeof(struct crash_rec))) {
+    if (sched_uid() != 0 || max <= 0 || !user_out_range(r->ebx, (uint32_t)max * sizeof(struct crash_rec))) {
       r->eax = (uint32_t)-1;
       break;
     }

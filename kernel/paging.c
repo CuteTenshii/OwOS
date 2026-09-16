@@ -283,7 +283,7 @@ int paging_user_range(uint32_t vaddr, uint32_t len, int write)
   end = (uint64_t)vaddr + len;
   for (uint64_t a = vaddr & ~0xFFFULL; a < end; a += 4096) {
     uint64_t *pte = get_pte(current_pml4(), a);
-    if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER) || (write && !(*pte & PAGE_RW)))
+    if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER) || (write && !(*pte & PAGE_RW) && !(*pte & PAGE_COW)))
       return 0;
   }
   return 1;
@@ -731,7 +731,7 @@ int paging_user_range(uint32_t vaddr, uint32_t len, int write)
       return 0;
     pt = (uint32_t *)(pde & ~0xFFFu);
     pte = pt[(a >> 12) & 0x3FF];
-    if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER) || (write && !(pte & PAGE_RW)))
+    if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER) || (write && !(pte & PAGE_RW) && !(pte & PAGE_COW)))
       return 0;
   }
   return 1;

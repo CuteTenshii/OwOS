@@ -624,6 +624,7 @@ static struct usock {
   uint8_t proto;         /* SK_TCP / SK_UDP / SK_ICMP                    */
   uint8_t closed;        /* peer FIN already seen (TCP)                  */
   uint8_t listening;     /* TCP passive-open slot (accept()s on lport)   */
+  uint32_t owner;        /* task that opened the handle                  */
   tcp_conn_t *conn;      /* bare-TCP connection (TCP only)              */
   uint8_t peer[4];       /* UDP/ICMP destination                        */
   uint16_t lport, rport; /* UDP local / remote ports                    */
@@ -793,6 +794,7 @@ int net_raw_open(void)
     return -1;
   struct usock *s = &usocks[h];
   s->used = 1;
+  s->owner = sched_current_process_id();
   s->proto = SK_RAWETH;
   s->closed = s->listening = 0;
   s->conn = NULL;
@@ -824,6 +826,7 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
    * failure path below releases it. */
   struct usock *s = &usocks[h];
   s->used = 1;
+  s->owner = sched_current_process_id();
   s->proto = (uint8_t)proto;
   s->closed = 0;
   s->listening = 0;
@@ -951,6 +954,7 @@ int net_sock_close(int h)
   else if (s->proto == SK_TCP && s->conn)
     tcp_close(s->conn);
   s->used = s->closed = s->listening = 0;
+  s->owner = 0;
   s->conn = NULL;
   return 0;
 }
@@ -977,6 +981,7 @@ static int usock_alloc(void)
   for (int i = 0; i < NET_SOCK_MAX; i++)
     if (!usocks[i].used) {
       usocks[i].used = 1;
+      usocks[i].owner = sched_current_process_id();
       usocks[i].closed = usocks[i].listening = 0;
       usocks[i].conn = NULL;
       usocks[i].dg_head = usocks[i].dg_tail = 0;
@@ -1024,6 +1029,7 @@ int net_sock_accept(int h)
     return -1;
   }
   usocks[nh].proto = SK_TCP;
+  usocks[nh].owner = sched_current_process_id();
   usocks[nh].conn = c;
   return nh;
 }
@@ -1062,6 +1068,13 @@ int net_sock_sendto(int h, const uint8_t ip[4], int port, const void *buf, uint3
   struct usock *s = &usocks[h];
   net_udp_send_ttl(ip, (uint16_t)port, s->lport, buf, len, s->ttl);
   return (int)len;
+}
+
+void net_sock_close_owner(uint32_t owner)
+{
+  for (int i = 0; i < NET_SOCK_MAX; i++)
+    if (usocks[i].used && usocks[i].owner == owner)
+      net_sock_close(i);
 }
 
 void net_init(void)

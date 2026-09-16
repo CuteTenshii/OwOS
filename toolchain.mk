@@ -91,7 +91,7 @@ endif
 DRVDIRS := storage net audio usb input video acpi bus
 CFLAGS  := $(ARCHFLAGS) -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
            -O1 -fno-strict-aliasing -fno-tree-loop-distribute-patterns \
-           -mno-sse -mno-mmx -Wall -Wextra $(VERSION_DEF) -Ikernel $(addprefix -Idrivers/,$(DRVDIRS))
+           -mno-sse -mno-mmx -Wall -Wextra $(VERSION_DEF) -Icommon -Ikernel $(addprefix -Idrivers/,$(DRVDIRS))
 LDFLAGS := $(ARCHFLAGS) -ffreestanding -nostdlib -no-pie -T $(LINKER)
 
 # The generic kernel compile rules (%.o) live in kernel/build.mk, not here: they must

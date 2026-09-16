@@ -9,6 +9,7 @@
 #include "ipc.h"
 #include "irqflags.h"
 #include "loader.h"
+#include "net.h"
 #include "paging.h"
 #include "pipe.h"
 #include "signal.h"
@@ -46,14 +47,22 @@
 
 enum { TASK_FREE = 0, TASK_RUNNABLE, TASK_WAITING, TASK_ZOMBIE };
 
+typedef struct address_space {
+  uint32_t *dir;
+  uint32_t refs;
+  uint32_t brk;
+  uint32_t brk_base;
+} address_space_t;
+
 typedef struct task {
   uintptr_t esp;       /* saved kernel stack pointer (the context)     */
-  uint32_t cr3;        /* page directory physical address              */
-  uint32_t *dir;       /* process page dir to free (0 for threads)     */
+  address_space_t *as; /* shared by a process and its user threads      */
+  int as_owner;        /* this task owns the address-space object          */
   void *kstack;        /* kernel stack to free (0 for the main task)   */
   uint32_t kstack_top; /* TSS esp0 for this task (0 = leave it alone)  */
   int state;
   uint32_t id;
+  struct task *process;       /* process leader for user threads             */
   uint32_t parent;            /* pid of the task that created it              */
   int self_reap;              /* detached kernel thread: no parent waitpid's it, so
                                * schedule() frees its zombie instead of leaking it */
@@ -73,8 +82,6 @@ typedef struct task {
   char cwd[TASK_CWD_MAX]; /* working dir; relative path syscalls join here */
   uint32_t uid;           /* owning user id (credentials; inherited like cwd)    */
   uint32_t gid;           /* owning primary group id                             */
-  uint32_t brk;           /* user-space heap break; 0 = no heap (thread/kthread) */
-  uint32_t brk_base;      /* heap start (image end); sbrk can't shrink below it  */
   struct task *next;
 } task_t;
 
@@ -153,21 +160,25 @@ static task_t *alloc_task(void)
   return t;
 }
 
-/* The task that owns `t`'s heap: itself if it's a process (dir != 0), else the
- * process whose address space it shares (a thread, dir == 0, same cr3). The
- * heap (break + frames) is per-address-space, so every thread sbrk's the one
- * owner. */
-static task_t *heap_owner_of(task_t *t)
+/* Return the active page directory for a task. Kernel threads have no address
+ * space object and run under the shared kernel directory. */
+static uint32_t task_cr3(const task_t *t) { return t->as ? (uint32_t)t->as->dir : paging_kernel_phys(); }
+
+static void address_space_get(address_space_t *as)
 {
-  if (t->dir)
-    return t;
-  task_t *p = &main_task;
-  do {
-    if (p->dir && p->cr3 == t->cr3)
-      return p;
-    p = p->next;
-  } while (p != &main_task);
-  return t;
+  if (as)
+    as->refs++;
+}
+
+static void address_space_put(address_space_t *as)
+{
+  if (!as || as->refs == 0)
+    return;
+  as->refs--;
+  if (as->refs == 0) {
+    paging_free_process_dir(as->dir);
+    kfree(as);
+  }
 }
 
 /* Splice t into the run queue right after the main task. The single publishing
@@ -199,15 +210,15 @@ void sched_init(void)
   t->name = "main";
   t->runs = 1;
   t->esp = 0; /* filled in on the first switch away       */
-  t->cr3 = paging_kernel_phys();
-  t->dir = 0;
+  t->as = 0;
+  t->as_owner = 0;
+  t->process = t;
   t->kstack = 0;
   t->kstack_top = 0; /* a kernel thread: never traps to ring 0   */
   t->state = TASK_RUNNABLE;
   t->wake_tick = 0;
   sig_init(t);
-  t->brk = t->brk_base = 0; /* no user heap                             */
-  t->uid = t->gid = 0;      /* the boot session runs as root            */
+  t->uid = t->gid = 0; /* the boot session runs as root            */
   cwd_set(t->cwd, "/");
   t->next = t;
   current = t;
@@ -224,12 +235,12 @@ void sched_create_thread(const char *name, void (*entry)(void))
   t->id = next_id++;
   t->name = name;
   t->runs = 0;
-  t->cr3 = paging_kernel_phys();
-  t->dir = 0;
+  t->as = 0;
+  t->as_owner = 0;
+  t->process = t;
   t->kstack_top = 0;
   t->state = TASK_RUNNABLE;
-  t->self_reap = 1;         /* main_task never waitpid's us: self-reap on exit */
-  t->brk = t->brk_base = 0; /* kernel thread: no user heap             */
+  t->self_reap = 1; /* main_task never waitpid's us: self-reap on exit */
 
   uint8_t *stack = kmalloc(KSTACK_SIZE);
   if (!stack) { /* heap exhausted: don't enqueue a bogus stack */
@@ -266,11 +277,19 @@ void sched_create_thread(const char *name, void (*entry)(void))
 int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32_t user_esp, uint32_t brk)
 {
   task_t *t = alloc_task();
+  address_space_t *as;
   if (!t)
     return -1;
   t->id = next_id++;
-  t->brk = t->brk_base = brk; /* the process's heap (shared by its threads) */
-  {                           /* copy the program name so it persists (callers pass argv[0]) */
+  as = kmalloc(sizeof *as);
+  if (!as) {
+    kfree(t);
+    return -1;
+  }
+  as->dir = dir;
+  as->refs = 1;
+  as->brk = as->brk_base = brk;
+  { /* copy the program name so it persists (callers pass argv[0]) */
     int i = 0;
     for (; name && name[i] && i < (int)sizeof t->namebuf - 1; i++)
       t->namebuf[i] = name[i];
@@ -278,8 +297,9 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
     t->name = t->namebuf;
   }
   t->runs = 0;
-  t->cr3 = (uint32_t)dir;
-  t->dir = dir;
+  t->as = as;
+  t->as_owner = 1;
+  t->process = t;
   t->parent = current->id;
   t->state = TASK_RUNNABLE;
   sig_init(t);
@@ -291,6 +311,7 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
   uint8_t *kstack = kmalloc(UKSTACK_SIZE);
   if (!kstack) { /* heap exhausted: fail rather than enqueue a
                   * task whose saved esp points into low memory */
+    address_space_put(as);
     kfree(t);
     return -1;
   }
@@ -335,10 +356,10 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
  * heap — no lock needed on the kernel side. */
 uint32_t sched_sbrk(int inc)
 {
-  task_t *o = heap_owner_of(current);
-  if (o->brk == 0) /* not a process with a heap */
+  address_space_t *as = current->as;
+  if (!as || as->brk == 0) /* not a process with a heap */
     return (uint32_t)-1;
-  uint32_t old = o->brk;
+  uint32_t old = as->brk;
   if (inc == 0)
     return old;
   if (inc > 0) {
@@ -348,20 +369,20 @@ uint32_t sched_sbrk(int inc)
     uint32_t newbrk = old + add;
     uint32_t old_top = (old + 0xFFFu) & ~0xFFFu;
     uint32_t new_top = (newbrk + 0xFFFu) & ~0xFFFu;
-    if (new_top > old_top && paging_user_grow(o->dir, old_top, new_top) < 0)
+    if (new_top > old_top && paging_user_grow(as->dir, old_top, new_top) < 0)
       return (uint32_t)-1; /* out of physical memory */
-    o->brk = newbrk;
+    as->brk = newbrk;
     return old;
   }
   uint32_t dec = (uint32_t)(-inc);
-  if (dec > old - o->brk_base) /* never shrink below the heap base */
-    dec = old - o->brk_base;
+  if (dec > old - as->brk_base) /* never shrink below the heap base */
+    dec = old - as->brk_base;
   uint32_t newbrk = old - dec;
   uint32_t old_top = (old + 0xFFFu) & ~0xFFFu;
   uint32_t new_top = (newbrk + 0xFFFu) & ~0xFFFu;
   if (old_top > new_top)
-    paging_user_shrink(o->dir, new_top, old_top);
-  o->brk = newbrk;
+    paging_user_shrink(as->dir, new_top, old_top);
+  as->brk = newbrk;
   return old;
 }
 
@@ -369,14 +390,13 @@ uint32_t sched_sbrk(int inc)
  * swaps in a new program image whose end is the new heap start). */
 void sched_set_brk(uint32_t brk)
 {
-  task_t *o = heap_owner_of(current);
-  o->brk = o->brk_base = brk;
+  if (current->as)
+    current->as->brk = current->as->brk_base = brk;
 }
 
 /* Spawn a thread inside the CURRENT process: a new task that SHARES the
- * caller's address space (same CR3) and runs `entry` in ring 3 on the
- * caller-provided user stack. dir=0 so its reap never frees the shared address
- * space — that belongs to the process's main task. It is an ordinary child of
+ * caller's address space and runs `entry` in ring 3 on the caller-provided user
+ * stack. Its address-space reference keeps the shared tables alive. It is an ordinary child of
  * the caller (parent = current->id), so the caller joins it with waitpid()
  * before exiting (which is required: the threads must be gone before the main
  * task's reap tears down the address space they run in). Returns its tid. */
@@ -388,9 +408,10 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
   t->id = next_id++;
   t->name = "thread";
   t->runs = 0;
-  t->cr3 = current->cr3;    /* share the creator's address space      */
-  t->dir = 0;               /* not the owner: don't free it on reap    */
-  t->brk = t->brk_base = 0; /* heap belongs to the process; sbrk redirects */
+  t->as = current->as;
+  t->as_owner = 0;
+  t->process = current->process;
+  address_space_get(t->as);
   t->parent = current->id;
   t->state = TASK_RUNNABLE;
   sig_init(t);
@@ -401,6 +422,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
 
   uint8_t *kstack = kmalloc(UKSTACK_SIZE);
   if (!kstack) {
+    address_space_put(t->as);
     kfree(t);
     return -1;
   }
@@ -439,10 +461,13 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
 int sched_fork(struct registers *r)
 {
   task_t *t = alloc_task();
-  if (!t)
+  if (!t || !current->as) {
+    if (t)
+      kfree(t);
     return -1;
+  }
 
-  uint32_t *child_dir = paging_fork_dir(current->dir);
+  uint32_t *child_dir = paging_fork_dir(current->as ? current->as->dir : 0);
   if (!child_dir) {
     kfree(t);
     return -1;
@@ -458,8 +483,17 @@ int sched_fork(struct registers *r)
   t->id = next_id++;
   t->name = current->name;
   t->runs = 0;
-  t->cr3 = (uint32_t)child_dir;
-  t->dir = child_dir;
+  t->as = kmalloc(sizeof *t->as);
+  if (!t->as) {
+    paging_free_process_dir(child_dir);
+    kfree(kstack);
+    kfree(t);
+    return -1;
+  }
+  t->as->dir = child_dir;
+  t->as->refs = 1;
+  t->as_owner = 1;
+  t->process = t;
   t->parent = current->id;
   t->kstack = kstack;
   t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
@@ -475,10 +509,9 @@ int sched_fork(struct registers *r)
   }
   /* The child shares the parent's user pages copy-on-write, so it inherits the
    * same heap break without copying the address space. */
-  {
-    task_t *o = heap_owner_of(current);
-    t->brk = o->brk;
-    t->brk_base = o->brk_base;
+  if (current->as) {
+    t->as->brk = current->as->brk;
+    t->as->brk_base = current->as->brk_base;
   }
   cwd_set(t->cwd, current->cwd);
   t->uid = current->uid;
@@ -549,17 +582,17 @@ static void reap_task(task_t *t)
 {
   uintptr_t fl = irq_save();
 
-  /* An address-space owner (dir != 0) shares its page directory with the
-   * threads it spawned (same cr3, dir == 0). Releasing the dir below frees
+  /* An address-space owner shares its page directory with its
+   * threads. Releasing the directory below frees
    * those page tables and user frames; a thread still on the run queue would
    * then be scheduled onto a freed CR3 -> triple fault. Mark every such
    * sibling zombie now, under the same lock, so no tick can pick one before
    * we drain them. (Kernel threads/main_task use the kernel CR3 and forked
    * children own their own dir, so neither matches.) */
-  if (t->dir) {
+  if (t->as_owner) {
     task_t *s = t->next;
     while (s != t) {
-      if (s != &main_task && s != current && s->cr3 == t->cr3 && !s->dir && s->state != TASK_FREE)
+      if (s != &main_task && s != current && s->as == t->as && !s->as_owner && s->state != TASK_FREE)
         s->state = TASK_ZOMBIE;
       s = s->next;
     }
@@ -573,14 +606,14 @@ static void reap_task(task_t *t)
   if (fl & 0x200)
     __asm__ volatile("sti");
 
-  if (t->dir) {
+  if (t->as_owner) {
     /* Drain the owner's threads before releasing the shared address space:
      * close their fds (a fetch worker's socket/TCB would otherwise leak),
      * unlink, and free their nodes -- all while the dir is still valid. */
     for (;;) {
       task_t *th = 0, *s = main_task.next;
       while (s != &main_task) {
-        if (s != current && s->cr3 == t->cr3 && !s->dir) {
+        if (s != current && s->as == t->as && !s->as_owner) {
           th = s;
           break;
         }
@@ -601,10 +634,11 @@ static void reap_task(task_t *t)
         kfree(th->kstack);
       if (th->self_reap && th->state == TASK_ZOMBIE && detached_zombies > 0)
         detached_zombies--;
+      address_space_put(th->as);
       kfree(th);
     }
-    paging_free_process_dir(t->dir);
   }
+  address_space_put(t->as);
   if (t->kstack)
     kfree(t->kstack);
   kfree(t);
@@ -636,18 +670,14 @@ static void reap_detached(void)
 
 struct fd *sched_fds(void) { return current->fds; }
 
-/* The active address space's page directory (for the windowing layer and the
- * guarded-thread-stack allocator to map into the calling process's user
- * window). Resolve it from cr3, NOT current->dir: a thread shares its owner's
- * address space but carries dir==0 (it doesn't own it), so returning ->dir
- * would hand a NULL directory to callers like user_stack_alloc/uwin invoked
- * from a thread — they'd map into a bogus dir and the mapping would be
- * invisible to the running cr3. For an owner cr3 == (uint32_t)dir; for a thread
- * cr3 == its owner's dir. */
-uint32_t *sched_current_dir(void) { return (uint32_t *)current->cr3; }
+/* The active address space's page directory, shared by a process and its user
+ * threads. */
+uint32_t *sched_current_dir(void) { return (uint32_t *)task_cr3(current); }
 
 /* The current task's pid (owner id for windowing-layer bookkeeping). */
 uint32_t sched_current_id(void) { return current->id; }
+
+uint32_t sched_current_process_id(void) { return current->process ? current->process->id : current->id; }
 
 /* The current task's name (for the crash reporter). */
 const char *sched_current_name(void) { return current->name ? current->name : "task"; }
@@ -750,6 +780,8 @@ void sched_exit(int status)
 {
   uwin_task_exiting(current->id);  /* tear down any GUI windows it owns */
   audio_task_exiting(current->id); /* release the PCM stream if it held it */
+  if (!current->as || current->as_owner)
+    net_sock_close_owner(sched_current_process_id());
   fds_close_all(current);
   current->exit_status = status;
   current->state = TASK_ZOMBIE;
@@ -1122,14 +1154,20 @@ int sched_try_reap(int pid, int *status)
 
 /* Replace the current process's image: swap in a new address space and set up
  * the trap frame so the syscall returns into the new program's entry. */
-void sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, struct registers *r)
+int sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, uint32_t brk, struct registers *r)
 {
-  uint32_t *old = current->dir;
+  address_space_t *next = kmalloc(sizeof *next);
+  address_space_t *old = current->as;
+  if (!next)
+    return -1;
+  next->dir = new_dir;
+  next->refs = 1;
+  next->brk = next->brk_base = brk;
   paging_load(new_dir);
-  current->dir = new_dir;
-  current->cr3 = (uint32_t)new_dir;
-  if (old)
-    paging_free_process_dir(old);
+  current->as = next;
+  current->as_owner = 1;
+  current->process = current;
+  address_space_put(old);
 
   /* exec resets caught handlers to SIG_DFL and drops pending signals; the
    * blocked mask is preserved (POSIX). The new image can't keep the old code's
@@ -1149,6 +1187,7 @@ void sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, struct 
   r->ds = 0x23;
   r->eax = r->ebx = r->ecx = r->edx = 0;
   r->esi = r->edi = r->ebp = 0;
+  return 0;
 }
 
 void schedule(void)
@@ -1181,8 +1220,8 @@ void schedule(void)
     current->runs++;
     if (current->kstack_top)
       tss_set_kernel_stack(current->kstack_top);
-    if (current->cr3 != prev->cr3)
-      paging_load((uint32_t *)current->cr3);
+    if (task_cr3(current) != task_cr3(prev))
+      paging_load((uint32_t *)task_cr3(current));
     context_switch(&prev->esp, current->esp);
   }
 
