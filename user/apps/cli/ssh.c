@@ -123,13 +123,6 @@ static unsigned r32(const unsigned char *d, int *p)
   return v;
 }
 
-/* cookie, ephemeral key and padding from the shared userspace CSPRNG. */
-static void gen_random(unsigned char *out, int n)
-{
-  if (n > 0)
-    rng_bytes(out, n);
-}
-
 static void incr_iv(unsigned char *iv) /* the GCM invocation counter */
 {
   for (int i = 11; i >= 4; i--)
@@ -207,7 +200,7 @@ static int send_packet(const unsigned char *pl, int plen)
     w32(txbuf, &pos, pktlen);
     wb(txbuf, &pos, (unsigned)padlen);
     wbytes(txbuf, &pos, pl, plen);
-    gen_random(txbuf + pos, padlen);
+    rng_bytes(txbuf + pos, padlen);
     pos += padlen;
     return sock_send_all(txbuf, pos);
   }
@@ -221,7 +214,7 @@ static int send_packet(const unsigned char *pl, int plen)
   int pp = 0;
   wb(sealbuf, &pp, (unsigned)padlen);
   wbytes(sealbuf, &pp, pl, plen); /* pl may be `ptext` */
-  gen_random(sealbuf + pp, padlen);
+  rng_bytes(sealbuf + pp, padlen);
   pp += padlen; /* pp == pktlen */
 
   w32(txbuf, &pos, pktlen);
@@ -407,7 +400,7 @@ static void build_kexinit(void)
   int p = 0;
   wb(ic, &p, MSG_KEXINIT);
   unsigned char cookie[16];
-  gen_random(cookie, 16);
+  rng_bytes(cookie, 16);
   wbytes(ic, &p, cookie, 16);
   wcstr(ic, &p, "curve25519-sha256,curve25519-sha256@libssh.org"); /* kex */
   wcstr(ic, &p, "ssh-ed25519,rsa-sha2-256,rsa-sha2-512,ssh-rsa");  /* host key */
@@ -482,7 +475,7 @@ static int do_kex(const char *cident)
 
   /* Our ephemeral X25519 key pair. */
   unsigned char priv[32], qc[32];
-  gen_random(priv, 32);
+  rng_bytes(priv, 32);
   priv[0] &= 248;
   priv[31] &= 127;
   priv[31] |= 64; /* clamp (idempotent) */

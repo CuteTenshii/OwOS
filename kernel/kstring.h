@@ -21,6 +21,22 @@ uint32_t strlcpy(char *dst, const char *src, uint32_t size); /* bounded copy (BS
 /* The codebase's idiom for "are these two strings equal?" — built on strcmp so
  * call sites read `if (streq(a, b))` instead of `if (!strcmp(a, b))`. */
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
+static inline char k_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+static inline int k_streq_ci(const char *a, const char *b)
+{
+  while (*a && k_lower(*a) == k_lower(*b)) {
+    a++;
+    b++;
+  }
+  return k_lower(*a) == k_lower(*b);
+}
+static inline int k_eq_ci_n(const char *a, const char *b, uint32_t n)
+{
+  for (uint32_t i = 0; i < n; i++)
+    if (k_lower(a[i]) != k_lower(b[i]))
+      return 0;
+  return 1;
+}
 
 /* --------------------------------------------------------------- formatting */
 

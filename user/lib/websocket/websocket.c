@@ -45,40 +45,9 @@ struct ws_conn {
   int in_frag;     /* inside a fragmented message                   */
 
   int close_sent; /* a Close frame has been sent                   */
-  uint32_t rng;   /* xorshift32 state for keys + masks             */
 };
 
 /* ----------------------------------------------------------- small helpers */
-
-static int ws_strlen(const char *s)
-{
-  int n = 0;
-  while (s && s[n])
-    n++;
-  return n;
-}
-
-static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
-static int ci_eq_n(const char *a, const char *b, int n)
-{
-  int i;
-  for (i = 0; i < n; i++)
-    if (lc(a[i]) != lc(b[i]))
-      return 0;
-  return 1;
-}
-
-static uint32_t ws_rand(ws_conn *c)
-{
-  uint32_t x = c->rng;
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  c->rng = x ? x : 0x1234567u;
-  return c->rng;
-}
-static uint8_t ws_rand_byte(ws_conn *c) { return (uint8_t)(ws_rand(c) >> 7); }
 
 /* Sec-WebSocket-Accept = base64(SHA1(client_key + GUID)). */
 static void compute_accept(const char *key, char *out /* >=29 */)
@@ -100,10 +69,10 @@ static int ws_parse_url(const char *url, int *tls, char *host, int hostcap, int 
 {
   const char *p = url;
   int hi = 0, pi = 0;
-  if (ci_eq_n(p, "wss://", 6)) {
+  if (eq_ci_n(p, "wss://", 6)) {
     *tls = 1;
     p += 6;
-  } else if (ci_eq_n(p, "ws://", 5)) {
+  } else if (eq_ci_n(p, "ws://", 5)) {
     *tls = 0;
     p += 5;
   } else
@@ -226,8 +195,7 @@ static int ws_send_frame(ws_conn *c, int opcode, const void *data, int len)
     for (i = 7; i >= 0; i--)
       hdr[hn++] = (uint8_t)(((unsigned)len >> (i * 8)) & 0xff);
   }
-  for (i = 0; i < 4; i++)
-    mask[i] = ws_rand_byte(c);
+  rng_bytes(mask, sizeof mask);
   memcpy(hdr + hn, mask, 4);
   hn += 4;
 
@@ -258,7 +226,7 @@ static int status_is_101(const char *buf, int len)
 /* Extract the value of header `name` from the response block into `out`. */
 static int header_value(const char *buf, int len, const char *name, char *out, int outcap)
 {
-  int nl = ws_strlen(name), i = 0;
+  int nl = strlen(name), i = 0;
   while (i < len) {
     int ls = i, le, v, o = 0;
     while (i < len && buf[i] != '\n')
@@ -266,7 +234,7 @@ static int header_value(const char *buf, int len, const char *name, char *out, i
     le = i;
     if (le > ls && buf[le - 1] == '\r')
       le--;
-    if (le - ls > nl + 1 && buf[ls + nl] == ':' && ci_eq_n(buf + ls, name, nl)) {
+    if (le - ls > nl + 1 && buf[ls + nl] == ':' && eq_ci_n(buf + ls, name, nl)) {
       v = ls + nl + 1;
       while (v < le && (buf[v] == ' ' || buf[v] == '\t'))
         v++;
@@ -330,7 +298,7 @@ static int read_handshake(ws_conn *c, char **resp, int *resp_len, int *body_off)
 
 ws_conn *ws_open(const char *url, const char *protocols)
 {
-  int tls = 0, port = 0, i;
+  int tls = 0, port = 0;
   char host[256], path[600];
   char req[2048];
   char key[28], accept[40], got[40];
@@ -349,18 +317,13 @@ ws_conn *ws_open(const char *url, const char *protocols)
   c->conn = 0;
   c->state = WS_CONNECTING;
   c->protocol[0] = 0;
-  c->rng = (uint32_t)(now_ms() & 0xffffffffu) ^ ((uint32_t)msec() * 2654435761u);
-  if (!c->rng)
-    c->rng = 0xC0FFEEu;
-
   c->conn = nc_open(host, port, tls, 0);
   if (!c->conn) {
     free(c);
     return 0;
   }
 
-  for (i = 0; i < 16; i++)
-    keybytes[i] = ws_rand_byte(c);
+  rng_bytes(keybytes, sizeof keybytes);
   base64_encode(keybytes, 16, key);
 
   /* Build the Upgrade request. */
@@ -430,8 +393,8 @@ ws_conn *ws_open(const char *url, const char *protocols)
   }
 
   compute_accept(key, accept);
-  if (!header_value(resp, body_off, "Sec-WebSocket-Accept", got, sizeof got) || ws_strlen(got) != ws_strlen(accept) ||
-      !ci_eq_n(got, accept, ws_strlen(accept))) {
+  if (!header_value(resp, body_off, "Sec-WebSocket-Accept", got, sizeof got) || strlen(got) != strlen(accept) ||
+      !eq_ci_n(got, accept, strlen(accept))) {
     free(resp);
     nc_close(c->conn);
     free(c);
@@ -637,7 +600,7 @@ void ws_close(ws_conn *c, int code, const char *reason)
       payload[pl++] = (uint8_t)((code >> 8) & 0xff);
       payload[pl++] = (uint8_t)(code & 0xff);
       if (reason) {
-        int i, rl = ws_strlen(reason);
+        int i, rl = strlen(reason);
         for (i = 0; i < rl && pl < 125; i++)
           payload[pl++] = (uint8_t)reason[i];
       }

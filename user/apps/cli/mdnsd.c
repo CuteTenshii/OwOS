@@ -49,8 +49,6 @@ struct mdns_record {
 
 static unsigned be16(const unsigned char *p) { return ((unsigned)p[0] << 8) | p[1]; }
 
-static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
 /* Case-insensitive name compare, tolerating one optional trailing dot on either
  * side (our stored names carry none; a query name may). */
 static int name_eq(const char *a, const char *b)
@@ -59,7 +57,7 @@ static int name_eq(const char *a, const char *b)
     char ca = *a, cb = *b;
     if ((ca == '\0' || (ca == '.' && a[1] == '\0')) && (cb == '\0' || (cb == '.' && b[1] == '\0')))
       return 1;
-    if (lc(ca) != lc(cb))
+    if (lower(ca) != lower(cb))
       return 0;
     a++;
     b++;

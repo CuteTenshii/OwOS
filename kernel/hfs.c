@@ -22,8 +22,6 @@
 #include "hfs.h"
 #include "kstring.h"
 
-static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
 /* --------------------------------------------------------------- state */
 #define HFS_SIG 0x482Bu  /* 'H+' */
 #define HFSX_SIG 0x4858u /* 'HX' */
@@ -237,7 +235,7 @@ static int names_match(const char *want, const char *have)
 {
   int i = 0;
   for (; want[i] && have[i]; i++)
-    if (lc(want[i]) != lc(have[i]))
+    if (k_lower(want[i]) != k_lower(have[i]))
       return 0;
   return want[i] == '\0' && have[i] == '\0';
 }

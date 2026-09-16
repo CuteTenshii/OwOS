@@ -1,21 +1,7 @@
 /* mime.c — filename- and content-based MIME typing (see mime.h). Freestanding:
  * no libc calls, just byte comparisons, so it links into any program. */
 #include "mime.h"
-
-/* lowercase one ASCII byte */
-static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
-/* case-insensitive ASCII string compare */
-static int ieq(const char *a, const char *b)
-{
-  while (*a && *b) {
-    if (lc(*a) != lc(*b))
-      return 0;
-    a++;
-    b++;
-  }
-  return *a == *b;
-}
+#include "owos.h"
 
 /* the extension (after the last '.' in the last path component), or "" */
 static const char *ext_of(const char *path)
@@ -77,7 +63,7 @@ const char *mime_from_ext(const char *path)
   const char *e = ext_of(path);
   if (e[0])
     for (unsigned i = 0; i < sizeof ext_table / sizeof ext_table[0]; i++)
-      if (ieq(e, ext_table[i].ext))
+      if (streq_ci(e, ext_table[i].ext))
         return ext_table[i].mime;
   return "application/octet-stream";
 }
@@ -137,6 +123,6 @@ int mime_is_text(const char *mime)
     }
   if (pre)
     return 1;
-  return ieq(mime, "application/json") || ieq(mime, "application/javascript") || ieq(mime, "application/xml") ||
-         ieq(mime, "image/svg+xml");
+  return streq_ci(mime, "application/json") || streq_ci(mime, "application/javascript") ||
+         streq_ci(mime, "application/xml") || streq_ci(mime, "image/svg+xml");
 }

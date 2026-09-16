@@ -9,6 +9,7 @@
  * every record and correlate by owner name. */
 
 #include "mdns.h"
+#include "ascii.h"
 #ifndef MDNS_HOST_TEST
 #include "owos.h"
 #endif
@@ -72,22 +73,6 @@ static void first_label(const char *name, char *out, int outsz)
   out[i] = '\0';
 }
 
-static int ci_eq(const char *a, const char *b)
-{
-  while (*a && *b) {
-    char ca = *a, cb = *b;
-    if (ca >= 'A' && ca <= 'Z')
-      ca += 32;
-    if (cb >= 'A' && cb <= 'Z')
-      cb += 32;
-    if (ca != cb)
-      return 0;
-    a++;
-    b++;
-  }
-  return *a == *b;
-}
-
 /* Encode `name` as DNS QNAME labels into q, return bytes written (0 on error).
  */
 static int put_qname(unsigned char *q, const char *name)
@@ -146,7 +131,7 @@ static int slot_for(struct mdns_service *out, int *count, int max, const char *n
   char inst[128];
   first_label(name, inst, sizeof inst);
   for (int i = 0; i < *count; i++)
-    if (ci_eq(out[i].instance, inst))
+    if (streq_ci(out[i].instance, inst))
       return i;
   if (*count >= max)
     return -1;
@@ -207,7 +192,7 @@ static int harvest_response(const unsigned char *r, int rn, const char *service,
     if (type == T_PTR) {
       char target[256];
       name_str(r, rn, rd, target, sizeof target);
-      if (service && !ci_eq(owner, service))
+      if (service && !streq_ci(owner, service))
         continue;
       slot_for(out, &count, max, target);
     } else if (type == T_SRV && rdlen >= 7) {
@@ -225,7 +210,7 @@ static int harvest_response(const unsigned char *r, int rn, const char *service,
       /* An A record's owner is the SRV target (a host), not an
        * instance — fill any slot whose SRV host matches. */
       for (int s = 0; s < count; s++)
-        if (out[s].host[0] && ci_eq(out[s].host, owner))
+        if (out[s].host[0] && streq_ci(out[s].host, owner))
           memcpy(out[s].ip, r + rd, 4);
     }
   }

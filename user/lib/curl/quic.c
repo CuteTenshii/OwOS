@@ -66,8 +66,6 @@ static int varsize(uint64_t v) { return v < 0x40 ? 1 : v < 0x4000 ? 2 : v < 0x40
 
 /* ClientHello.random, the ephemeral x25519 key and the connection IDs come from
  * the shared userspace CSPRNG (rng_bytes: RDRAND-backed). */
-static void gen_random(uint8_t *out, uint32_t n) { rng_bytes(out, (int)n); }
-
 /* ------------------------------------------------------- connection state */
 
 enum { S_INIT = 0, S_HS = 1, S_APP = 2 }; /* packet-number spaces */
@@ -236,7 +234,7 @@ static uint32_t build_client_hello(uint8_t *out, const char *sni, const char *al
   uint32_t namelen = sni ? (uint32_t)strlen(sni) : 0;
   uint32_t alpnlen = (uint32_t)strlen(alpn);
   uint8_t client_random[32];
-  gen_random(client_random, 32);
+  rng_bytes(client_random, 32);
 
   uint8_t *p = out + 4;
   *p++ = 0x03;
@@ -1033,13 +1031,13 @@ int quic_connect(const char *host, uint16_t port, const char *alpn)
     return sock == NET_EINTR ? QUIC_EINTR : sock == -2 ? QUIC_ERESOLVE : QUIC_ESOCK;
 
   scid_len = 8;
-  gen_random(scid, 8);
+  rng_bytes(scid, 8);
   dcid_len = 8;
-  gen_random(dcid, 8);
+  rng_bytes(dcid, 8);
   derive_initial_keys(dcid, dcid_len);
 
   sha256_init(&transcript);
-  gen_random(our_priv, 32);
+  rng_bytes(our_priv, 32);
   x25519(our_pub, our_priv, x25519_base);
 
   chello_len = build_client_hello(chello, host, alpn);

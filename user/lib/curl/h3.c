@@ -385,17 +385,9 @@ static http_body_fn h3_body;
 static void *h3_ctx;
 static int h3_abort;
 
-static int ci_eq(const char *a, const uint8_t *b, int n)
-{
-  for (int i = 0; i < n; i++)
-    if (a[i] != (char)b[i] || a[i] == 0)
-      return 0;
-  return a[n] == 0;
-}
-
 static void emit_field(const uint8_t *name, int nl, const uint8_t *val, int vl)
 {
-  if (nl == 7 && ci_eq(":status", name, 7)) {
+  if (nl == 7 && eq_ci_n(":status", (const char *)name, 7)) {
     int s = 0;
     for (int i = 0; i < vl && val[i] >= '0' && val[i] <= '9'; i++)
       s = s * 10 + (val[i] - '0');
@@ -533,8 +525,6 @@ static void feed_stream0(const uint8_t *data, uint32_t n)
 
 /* ----------------------------------------------------- request encoding */
 
-static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
 /* QPACK-encode the request field section into b; returns its length. */
 static uint32_t build_request(uint8_t *b, const char *method, const char *path, const char *authority,
                               const char *extra)
@@ -581,7 +571,7 @@ static uint32_t build_request(uint8_t *b, const char *method, const char *path, 
       if (nl > 0 && nl < 200) {
         char lname[200];
         for (int i = 0; i < nl; i++)
-          lname[i] = lc(s[i]);
+          lname[i] = lower(s[i]);
         enc_int(b, &p, (uint64_t)nl, 3, 0x20);
         memcpy(b + p, lname, nl);
         p += nl;

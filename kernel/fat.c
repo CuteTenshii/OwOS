@@ -25,15 +25,13 @@
 
 /* ------------------------------------------------------------------ helpers */
 
-static char lc(char c) /* ASCII lower-case */ { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
 /* Case-insensitive compare of a NUL-terminated name against a length-bounded
  * one. Returns 1 if equal. */
 static int name_eq(const char *a, const char *b, uint32_t blen)
 {
   uint32_t i = 0;
   for (; i < blen; i++) {
-    if (!a[i] || lc(a[i]) != lc(b[i]))
+    if (!a[i] || k_lower(a[i]) != k_lower(b[i]))
       return 0;
   }
   return a[i] == '\0';

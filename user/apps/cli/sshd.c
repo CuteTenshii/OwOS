@@ -121,12 +121,6 @@ static unsigned r32(const unsigned char *d, int *p)
   return v;
 }
 
-static void gen_random(unsigned char *out, int n)
-{
-  if (n > 0)
-    rng_bytes(out, (unsigned)n);
-}
-
 static void incr_iv(unsigned char *iv)
 {
   for (int i = 11; i >= 4; i--)
@@ -191,7 +185,7 @@ static int send_packet(const unsigned char *pl, int plen)
     w32(S.tx, &pos, pktlen);
     wb(S.tx, &pos, (unsigned)padlen);
     wbytes(S.tx, &pos, pl, plen);
-    gen_random(S.tx + pos, padlen);
+    rng_bytes(S.tx + pos, padlen);
     pos += padlen;
     return sock_send(S.tx, pos);
   }
@@ -201,7 +195,7 @@ static int send_packet(const unsigned char *pl, int plen)
   int pp = 0;
   wb(S.sealbuf, &pp, (unsigned)padlen);
   wbytes(S.sealbuf, &pp, pl, plen);
-  gen_random(S.sealbuf + pp, padlen);
+  rng_bytes(S.sealbuf + pp, padlen);
   pp += padlen;
   w32(S.tx, &pos, pktlen);
   unsigned char tag[16];
@@ -308,7 +302,7 @@ static void host_key_init(void)
     return;
   int n = readfile(HOSTKEY_PATH, (char *)host_seed, 32);
   if (n != 32) {
-    gen_random(host_seed, 32);
+    rng_bytes(host_seed, 32);
     writefile(HOSTKEY_PATH, host_seed, 32); /* persist a fresh host key */
   }
   ed25519_pubkey(host_pub, host_seed);
@@ -322,7 +316,7 @@ static void build_kexinit(void)
   int p = 0;
   wb(S.is, &p, MSG_KEXINIT);
   unsigned char cookie[16];
-  gen_random(cookie, 16);
+  rng_bytes(cookie, 16);
   wbytes(S.is, &p, cookie, 16);
   wcstr(S.is, &p, "curve25519-sha256,curve25519-sha256@libssh.org");
   wcstr(S.is, &p, "ssh-ed25519");
@@ -408,7 +402,7 @@ static int do_kex(void)
 
   /* our ephemeral d_s / Q_S, shared K */
   unsigned char priv[32], qs[32], shared[32];
-  gen_random(priv, 32);
+  rng_bytes(priv, 32);
   priv[0] &= 248;
   priv[31] &= 127;
   priv[31] |= 64;

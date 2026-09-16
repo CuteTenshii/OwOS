@@ -634,27 +634,13 @@ struct lookup_ctx {
   int best_dos; /* the current match was a DOS-namespace name    */
 };
 
-static int ascii_ieq(const char *a, const char *b, uint32_t n)
-{
-  for (uint32_t i = 0; i < n; i++) {
-    char x = a[i], y = b[i];
-    if (x >= 'A' && x <= 'Z')
-      x += 32;
-    if (y >= 'A' && y <= 'Z')
-      y += 32;
-    if (x != y)
-      return 0;
-  }
-  return b[n] == '\0';
-}
-
 static int lookup_cb(void *vctx, const struct index_entry *e)
 {
   struct lookup_ctx *c = vctx;
   uint32_t enl = strlen(e->name);
   if (enl != c->nlen)
     return 0;
-  if (!ascii_ieq(e->name, c->name, c->nlen))
+  if (!k_eq_ci_n(e->name, c->name, c->nlen) || c->name[c->nlen] != '\0')
     return 0;
   int is_dos = (e->nspace == 2);
   /* Prefer a non-DOS (Win32/POSIX) name when both exist. */

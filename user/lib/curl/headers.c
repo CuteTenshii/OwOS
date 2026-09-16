@@ -7,17 +7,6 @@
 #include "headers.h"
 #include "owos.h"
 
-static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
-static int ieq(const char *a, const char *b)
-{
-  while (*a && lc(*a) == lc(*b)) {
-    a++;
-    b++;
-  }
-  return lc(*a) == lc(*b);
-}
-
 /* Heap copy of [s, s+n) as a NUL-terminated string. */
 static char *dupn(const char *s, int n)
 {
@@ -49,7 +38,7 @@ static int add_field(struct http_headers *h, const char *name, int nlen, const c
     return -1;
   }
   for (char *p = nm; *p; p++)
-    *p = lc(*p);
+    *p = lower(*p);
   h->fields[h->n].name = nm;
   h->fields[h->n].value = vl;
   h->n++;
@@ -117,7 +106,7 @@ int http_headers_parse(struct http_headers *h, const char *block)
 const char *http_headers_at(const struct http_headers *h, const char *name, int idx)
 {
   for (int i = 0; i < h->n; i++)
-    if (ieq(h->fields[i].name, name) && idx-- == 0)
+    if (streq_ci(h->fields[i].name, name) && idx-- == 0)
       return h->fields[i].value;
   return 0;
 }
@@ -128,7 +117,7 @@ int http_headers_count(const struct http_headers *h, const char *name)
 {
   int c = 0;
   for (int i = 0; i < h->n; i++)
-    if (ieq(h->fields[i].name, name))
+    if (streq_ci(h->fields[i].name, name))
       c++;
   return c;
 }
@@ -154,7 +143,7 @@ bool http_header_has_token(const char *value, const char *token)
     if (!*s)
       break;
     const char *a = s, *b = token;
-    while (*a && lc(*a) == lc(*b)) {
+    while (*a && lower(*a) == lower(*b)) {
       a++;
       b++;
     }

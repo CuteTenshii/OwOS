@@ -37,8 +37,6 @@
 
 /* ClientHello.random + the ephemeral X25519 key come from the userspace CSPRNG
  * (rng_bytes: RDRAND-backed when the CPU has it). */
-static void gen_random(uint8_t *out, uint32_t n) { rng_bytes(out, (int)n); }
-
 /* Overwrite secret material so freed heap / dead stack frames don't retain live
  * keys. volatile store the optimizer can't elide (no memset_s here). */
 static void secure_wipe(void *p, uint32_t n)
@@ -461,7 +459,7 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
   memcpy(p, client_random, 32);
   p += 32;
   *p++ = 32; /* legacy_session_id (compat) */
-  gen_random(p, 32);
+  rng_bytes(p, 32);
   p += 32;
 
   /* cipher_suites: TLS 1.3 AEAD, TLS 1.2 ECDHE-RSA, empty-reneg SCSV */
@@ -791,8 +789,8 @@ tls_conn *tls_client(const char *host, int port, int offer_h2)
 
   uint8_t client_random[32], server_random[32];
   uint8_t our_priv[32], our_pub[32];
-  gen_random(client_random, 32);
-  gen_random(our_priv, 32);
+  rng_bytes(client_random, 32);
+  rng_bytes(our_priv, 32);
   x25519(our_pub, our_priv, x25519_base);
 
   /* --- ClientHello --- */

@@ -20,6 +20,7 @@
 #include "endian.h"
 #include "heap.h"
 #include "iso9660.h"
+#include "kstring.h"
 
 /* ---------------------------------------------------------------- constants */
 #define ISO_SECTOR 2048u
@@ -49,19 +50,6 @@ struct iso_mount {
 };
 
 /* ------------------------------------------------------------ name helpers */
-static char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-
-static int ci_eq(const char *a, const char *b)
-{
-  while (*a && *b) {
-    if (lower(*a) != lower(*b))
-      return 0;
-    a++;
-    b++;
-  }
-  return *a == *b;
-}
-
 /* Decode an ISO/Joliet file identifier into a clean name: drop the ";version"
  * suffix and a bare trailing '.', and (Joliet) fold UCS-2BE down to its low
  * byte. `dst` must hold at least 256 bytes. */
@@ -170,7 +158,7 @@ static int dir_find(struct iso_mount *m, uint32_t lba, uint32_t size, const char
   while (ri_next(m, &it, name, &r)) {
     if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
       continue;
-    if (ci_eq(name, want)) {
+    if (k_streq_ci(name, want)) {
       *out = r;
       return 1;
     }

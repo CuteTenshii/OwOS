@@ -2,6 +2,7 @@
 #ifndef OWOS_USER_H
 #define OWOS_USER_H
 
+#include "ascii.h"
 #include <stdarg.h>
 
 /* The null pointer constant. Guarded so a TU that also pulls in <stddef.h>
@@ -131,37 +132,6 @@ void strcat(char *d, const char *s);      /* caller sizes d                 */
  * void here (unlike BSD's size_t), matching this header's strcpy/strcat. */
 void strlcpy(char *dst, const char *src, int size);
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
-
-/* Case-insensitive ASCII helpers — shared so each program (browser, curl, the
- * URL parser, …) doesn't re-roll its own. `lower` folds one byte; the _ci
- * variants compare/scan with that folding. Inline because `lower` is called
- * per-character in hot lexers. Non-ASCII bytes pass through unchanged. */
-static inline char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-static inline int starts_ci(const char *s, const char *pre)
-{
-  while (*pre) {
-    if (lower(*s) != lower(*pre))
-      return 0;
-    s++;
-    pre++;
-  }
-  return 1;
-}
-static inline int streq_ci(const char *a, const char *b)
-{
-  while (*a && lower(*a) == lower(*b)) {
-    a++;
-    b++;
-  }
-  return lower(*a) == lower(*b);
-}
-static inline int contains_ci(const char *hay, const char *needle)
-{
-  for (; *hay; hay++)
-    if (starts_ci(hay, needle))
-      return 1;
-  return 0;
-}
 
 /* UTF-8 codec — shared so the whole system handles multibyte / non-Latin text
  * the same way. utf8_seqlen: bytes a lead byte announces (1 for
