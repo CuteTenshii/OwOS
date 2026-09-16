@@ -96,6 +96,9 @@ static struct dom_node *node_new(struct parser *ps, enum dom_type type)
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
+  n->computed_style = 0;
+  n->computed_style_sheet = 0;
+  n->computed_style_seq = 0;
   n->wrapper = 0;
   return n;
 }
@@ -462,6 +465,7 @@ struct dom_node *dom_parse(const char *html, int len)
  * the wrapper can be detached (host cleared) instead of dangling. NULL when no
  * JS. */
 void (*dom_on_free_wrapper)(void *wrapper);
+void (*dom_on_free_style_cache)(void *cache);
 
 /* Bumped by every tree-mutating API below. The browser samples it around a JS
  * event so it only re-flattens the page when a handler actually changed the
@@ -472,6 +476,8 @@ static void node_free_one(struct dom_node *n)
 {
   if (n->wrapper && dom_on_free_wrapper)
     dom_on_free_wrapper(n->wrapper);
+  if (n->computed_style && dom_on_free_style_cache)
+    dom_on_free_style_cache(n->computed_style);
   struct dom_attr *a = n->attrs;
   while (a) {
     struct dom_attr *nx = a->next;
@@ -534,6 +540,9 @@ struct dom_node *dom_new_element(const char *tag)
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
+  n->computed_style = 0;
+  n->computed_style_sheet = 0;
+  n->computed_style_seq = 0;
   n->wrapper = 0;
   {
     int i = 0;
@@ -556,6 +565,9 @@ struct dom_node *dom_new_text(const char *text)
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
+  n->computed_style = 0;
+  n->computed_style_sheet = 0;
+  n->computed_style_seq = 0;
   n->wrapper = 0;
   n->text = dupn(text ? text : "", text ? (int)strlen(text) : 0);
   return n;

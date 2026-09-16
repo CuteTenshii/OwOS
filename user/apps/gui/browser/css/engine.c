@@ -223,11 +223,17 @@ static void resolve_vars(const char *in, int inlen, char *out, int *on, int cap,
 /* Viewport the @media features test against; the browser refreshes it per
  * cascade. */
 static int g_vw = 800, g_vh = 600;
+static unsigned g_viewport_gen;
 void css_set_viewport(int width, int height)
 {
-  g_vw = width > 0 ? width : 0;
-  g_vh = height > 0 ? height : 0;
+  int vw = width > 0 ? width : 0;
+  int vh = height > 0 ? height : 0;
+  if (vw != g_vw || vh != g_vh)
+    g_viewport_gen++;
+  g_vw = vw;
+  g_vh = vh;
 }
+unsigned css_viewport_generation(void) { return g_viewport_gen; }
 
 /* ------------------------------------------------ value parsing ------------
  */

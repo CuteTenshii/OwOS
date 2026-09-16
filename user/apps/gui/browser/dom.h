@@ -28,6 +28,9 @@ struct dom_node {
   int elem_count;
   int type_index;
   int type_count;
+  void *computed_style;
+  void *computed_style_sheet;
+  unsigned computed_style_seq;
   void *wrapper;         /* cached JS wrapper object (browser/js.c),
                           * NULL until first exposed to script — gives
                           * a node stable identity so listeners stick. */
@@ -54,6 +57,7 @@ void dom_clear_children(struct dom_node *el);
 /* Hook the JS layer installs so a freed node detaches its wrapper (see dom.c).
  */
 extern void (*dom_on_free_wrapper)(void *wrapper);
+extern void (*dom_on_free_style_cache)(void *cache);
 
 /* Bumped on every tree mutation; the browser re-flattens only when it changes.
  */

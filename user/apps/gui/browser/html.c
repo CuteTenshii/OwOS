@@ -37,6 +37,7 @@ static char g_cur_page_url[URL_MAX];
 static char g_base_url[URL_MAX];
 static int g_frame_depth;
 static int g_link_nav = 1;
+static void free_style_cache(void *cache) { free(cache); }
 
 /* CSP enforcement runs against the top document (B->pg->csp); frame
  * sub-documents have their own policy we don't track, so checks are skipped
@@ -98,12 +99,25 @@ static int csp_style_attr_ok(void)
  * then inline style="" (highest). */
 static void compute_style(struct dom_node *el, struct css_style *cs)
 {
+  unsigned seq = dom_mutation_seq ^ css_viewport_generation();
+  dom_on_free_style_cache = free_style_cache;
+  if (el->computed_style && el->computed_style_sheet == g_sheet && el->computed_style_seq == seq) {
+    *cs = *(struct css_style *)el->computed_style;
+    return;
+  }
   css_style_reset(cs);
   css_apply_attrs(el, cs);
   css_apply_sheet(g_sheet, el, cs);
   const char *inl = dom_get_attr(el, "style");
   if (inl && csp_style_attr_ok())
     css_apply_inline(inl, cs);
+  if (!el->computed_style)
+    el->computed_style = malloc(sizeof *cs);
+  if (el->computed_style) {
+    *(struct css_style *)el->computed_style = *cs;
+    el->computed_style_sheet = g_sheet;
+    el->computed_style_seq = seq;
+  }
 }
 
 /* devtools hooks: the live DOM root and a public wrapper over compute_style, so
@@ -3367,6 +3381,7 @@ void html_page_teardown(void)
     dom_free(g_live_dom);
     g_live_dom = 0;
   }
+  dom_on_free_style_cache = 0;
   if (g_sheet) {
     css_free(g_sheet);
     g_sheet = 0;

@@ -250,6 +250,7 @@ void css_free(css_sheet *sheet);
  * prefers-color-scheme test against. The browser sets it before each cascade
  * (and on resize, so media queries re-evaluate). Defaults to a sane size. */
 void css_set_viewport(int width, int height);
+unsigned css_viewport_generation(void);
 
 /* @font-face faces declared in the sheet: each a family name + a src URL (the
  * first raw TTF/OTF url; woff/woff2 entries are skipped — we can't decode
