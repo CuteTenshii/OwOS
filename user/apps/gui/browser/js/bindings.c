@@ -12,17 +12,19 @@
  * yet — a known first-cut simplification. console output goes to stdout (fd 1);
  * timers (setTimeout/...) are accepted but do not fire (no event loop yet).
  */
-#include "bmedia.h" /* HTMLMediaElement: <audio>/<video> + new Audio()      */
+#include "../bmedia.h" /* HTMLMediaElement: <audio>/<video> + new Audio()      */
 #include "cast.h"   /* Google Cast sender: HTMLMediaElement.remote backend  */
-#include "classlist.h"
+#include "../classlist.h"
 #include "clipboard.h" /* clip_put / clip_get for navigator.clipboard          */
-#include "cors.h"      /* cors_origin / cors_same_origin: SW scope + cache keys */
-#include "js_notification.h"
-#include "jsint.h"     /* internal shared surface (engine ctx + helpers + A())  */
+#include "../cors.h"      /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "../js_notification.h"
+#include "../jsint.h"     /* internal shared surface (engine ctx + helpers + A())  */
+#include "dom_query.h"
 #include "notify.h"    /* notify_send: surface Notification() on the desktop    */
 #include "websocket.h" /* ws_open / ws_poll / ws_send / ws_close (RFC 6455)    */
 
 js_ctx *g_ctx;
+static char *sdup(const char *s);
 static js_object *g_node_proto; /* Node.prototype (ancestor of element/document) */
 static js_object *g_element_proto;
 static js_object *g_style_proto;
@@ -284,75 +286,6 @@ static void lower_into(char *dst, int cap, const char *src)
   dst[i] = '\0';
 }
 
-/* ------------------------------------------------------- DOM queries ------ */
-
-typedef int (*match_fn)(struct dom_node *, const char *);
-
-static int match_id(struct dom_node *n, const char *v)
-{
-  const char *a = dom_get_attr(n, "id");
-  return a && streq(a, v);
-}
-static int match_tag(struct dom_node *n, const char *v) { return streq(v, "*") || streq(n->tag, v); }
-static int match_class(struct dom_node *n, const char *v)
-{
-  const char *a = dom_get_attr(n, "class");
-  int vl = strlen(v);
-  if (!a)
-    return 0;
-  while (*a) {
-    const char *s;
-    while (*a == ' ' || *a == '\t' || *a == '\n')
-      a++;
-    s = a;
-    while (*a && *a != ' ' && *a != '\t' && *a != '\n')
-      a++;
-    if (a - s == vl && memcmp_js(s, v, vl) == 0)
-      return 1;
-  }
-  return 0;
-}
-
-static struct dom_node *find_first(struct dom_node *n, match_fn m, const char *v)
-{
-  struct dom_node *c;
-  for (c = n->first_child; c; c = c->next) {
-    struct dom_node *r;
-    if (c->type == DOM_ELEMENT && m(c, v))
-      return c;
-    r = find_first(c, m, v);
-    if (r)
-      return r;
-  }
-  return 0;
-}
-static void find_all(struct dom_node *n, match_fn m, const char *v, js_object *arr)
-{
-  struct dom_node *c;
-  for (c = n->first_child; c; c = c->next) {
-    if (c->type == DOM_ELEMENT && m(c, v))
-      js_array_push(g_ctx, arr, wrap_node(c));
-    find_all(c, m, v, arr);
-  }
-}
-
-/* split a simple selector into (matcher, token-in-buf) */
-static match_fn parse_selector(const char *sel, char *buf, int cap)
-{
-  char kind = 0;
-  int i = 0;
-  while (*sel == ' ')
-    sel++;
-  if (*sel == '#' || *sel == '.') {
-    kind = *sel;
-    sel++;
-  }
-  for (; sel[i] && sel[i] != ' ' && sel[i] != '>' && i < cap - 1; i++)
-    buf[i] = kind ? sel[i] : lower(sel[i]);
-  buf[i] = '\0';
-  return kind == '#' ? match_id : kind == '.' ? match_class : match_tag;
-}
-
 /* ------------------------------------------------------- text content ----- */
 
 static void collect_text(struct dom_node *n, sbuf *sb)
@@ -540,7 +473,7 @@ static const char *cl_class_of(js_value t)
  */
 static void cl_write_add(struct dom_node *n, const char *tok, int tl)
 {
-  char *classes = strdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
+  char *classes = sdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
   classlist_add(&classes, tok, tl);
   dom_set_attr(n, "class", classes);
   free(classes);
@@ -549,7 +482,7 @@ static void cl_write_add(struct dom_node *n, const char *tok, int tl)
 /* rebuild `n`'s class attr as the current tokens minus every copy of `tok` */
 static void cl_write_remove(struct dom_node *n, const char *tok, int tl)
 {
-  char *classes = strdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
+  char *classes = sdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
   classlist_remove(&classes, tok, tl);
   dom_set_attr(n, "class", classes);
   free(classes);
@@ -628,7 +561,7 @@ static js_value cl_replace(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (!n || ol == 0 || nl == 0)
     return js_bool(0);
   {
-    char *classes = strdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
+    char *classes = sdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
     int replaced = classlist_replace(&classes, oldt, newt);
     dom_set_attr(n, "class", classes);
     free(classes);
@@ -1846,35 +1779,29 @@ static js_value el_get_by_tag(js_ctx *ctx, js_value t, js_value *args, int argc)
   gc_push_scope();
   arr = (js_object *)gc_keep(js_new_array(ctx, 0));
   if (n)
-    find_all(n, match_tag, tag, arr);
+    js_dom_find_all_tag(n, tag, arr);
   gc_pop_scope();
   return js_obj_value(arr);
 }
 static js_value el_query(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  char buf[64];
-  match_fn m = parse_selector(arg_str(ctx, A(0)), buf, sizeof buf);
-  return n ? wrap_node(find_first(n, m, buf)) : js_null();
+  return wrap_node(js_dom_query(n, arg_str(ctx, A(0))));
 }
 static js_value el_query_all(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  char buf[64];
   js_object *arr;
-  match_fn m = parse_selector(arg_str(ctx, A(0)), buf, sizeof buf);
   gc_push_scope();
   arr = (js_object *)gc_keep(js_new_array(ctx, 0));
   if (n)
-    find_all(n, m, buf, arr);
+    js_dom_query_all(n, arg_str(ctx, A(0)), arr);
   gc_pop_scope();
   return js_obj_value(arr);
 }
 static int node_matches_sel(struct dom_node *n, const char *sel)
 {
-  char buf[64];
-  match_fn m = parse_selector(sel, buf, sizeof buf);
-  return n && n->type == DOM_ELEMENT && m(n, buf);
+  return js_dom_matches(n, sel);
 }
 static js_value el_matches(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -2103,13 +2030,13 @@ static struct dom_node *doc_root_of(js_value t)
 }
 static struct dom_node *doc_first_tag_in(struct dom_node *root, const char *tag)
 {
-  return root ? find_first(root, match_tag, tag) : 0;
+  return js_dom_find_tag(root, tag);
 }
 static struct dom_node *doc_first_tag(const char *tag) { return doc_first_tag_in(g_doc_root, tag); }
 
 static js_value doc_get_by_id(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  return wrap_node(find_first(doc_root_of(t), match_id, arg_str(ctx, A(0))));
+  return wrap_node(js_dom_find_id(doc_root_of(t), arg_str(ctx, A(0))));
 }
 static js_value doc_get_by_tag(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -2118,24 +2045,20 @@ static js_value doc_get_by_tag(js_ctx *ctx, js_value t, js_value *args, int argc
   lower_into(tag, sizeof tag, arg_str(ctx, A(0)));
   gc_push_scope();
   arr = (js_object *)gc_keep(js_new_array(ctx, 0));
-  find_all(doc_root_of(t), match_tag, tag, arr);
+  js_dom_find_all_tag(doc_root_of(t), tag, arr);
   gc_pop_scope();
   return js_obj_value(arr);
 }
 static js_value doc_query(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  char buf[64];
-  match_fn m = parse_selector(arg_str(ctx, A(0)), buf, sizeof buf);
-  return wrap_node(find_first(doc_root_of(t), m, buf));
+  return wrap_node(js_dom_query(doc_root_of(t), arg_str(ctx, A(0))));
 }
 static js_value doc_query_all(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  char buf[64];
   js_object *arr;
-  match_fn m = parse_selector(arg_str(ctx, A(0)), buf, sizeof buf);
   gc_push_scope();
   arr = (js_object *)gc_keep(js_new_array(ctx, 0));
-  find_all(doc_root_of(t), m, buf, arr);
+  js_dom_query_all(doc_root_of(t), arg_str(ctx, A(0)), arr);
   gc_pop_scope();
   return js_obj_value(arr);
 }

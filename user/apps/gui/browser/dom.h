@@ -23,6 +23,11 @@ struct dom_node {
   struct dom_node *first_child;
   struct dom_node *last_child;
   struct dom_node *next; /* sibling                              */
+  unsigned sibling_meta_seq;
+  int elem_index;
+  int elem_count;
+  int type_index;
+  int type_count;
   void *wrapper;         /* cached JS wrapper object (browser/js.c),
                           * NULL until first exposed to script — gives
                           * a node stable identity so listeners stick. */

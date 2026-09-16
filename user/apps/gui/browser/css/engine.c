@@ -10,8 +10,9 @@
  * height (others parse-and-ignore, like any browser). Inline <style> and
  * style="" only — external <link rel=stylesheet> is not fetched. Descendant
  * matching is greedy (no backtracking), enough for ordinary selectors. */
-#include "css.h"
-#include "color.h" /* shared colour parser */
+#include "../css.h"
+#include "sibling.h"
+#include "../color.h" /* shared colour parser */
 #include "owos.h"
 
 #define MAX_CLS 6
@@ -199,6 +200,10 @@ struct css_sheet {
    * entry lives in exactly one bucket chain, so teardown just walks them. */
   struct css_idx *id_b[CSS_NBUCK], *cls_b[CSS_NBUCK], *tag_b[CSS_NBUCK], *uni;
   int idx_gen;
+  struct css_rule **cand;
+  int cand_cap;
+  struct css_rule **match;
+  int match_cap;
 };
 
 /* CSS custom-property table (built per active sheet; see "custom properties").
@@ -3366,54 +3371,6 @@ static int node_has_class(const struct dom_node *n, const char *cls)
 
 /* ------------------------------------------------ pseudo-class matching ----
  */
-static int elem_index(const struct dom_node *n) /* 1-based among element siblings */
-{
-  int i = 0;
-  if (!n->parent)
-    return 1;
-  for (const struct dom_node *c = n->parent->first_child; c; c = c->next) {
-    if (c->type != DOM_ELEMENT)
-      continue;
-    i++;
-    if (c == n)
-      return i;
-  }
-  return i;
-}
-static int elem_count(const struct dom_node *n) /* element siblings, self included */
-{
-  int i = 0;
-  if (!n->parent)
-    return 1;
-  for (const struct dom_node *c = n->parent->first_child; c; c = c->next)
-    if (c->type == DOM_ELEMENT)
-      i++;
-  return i;
-}
-static int type_index(const struct dom_node *n) /* 1-based among same-tag siblings */
-{
-  int i = 0;
-  if (!n->parent)
-    return 1;
-  for (const struct dom_node *c = n->parent->first_child; c; c = c->next) {
-    if (c->type != DOM_ELEMENT || !streq(c->tag, n->tag))
-      continue;
-    i++;
-    if (c == n)
-      return i;
-  }
-  return i;
-}
-static int type_count(const struct dom_node *n)
-{
-  int i = 0;
-  if (!n->parent)
-    return 1;
-  for (const struct dom_node *c = n->parent->first_child; c; c = c->next)
-    if (c->type == DOM_ELEMENT && streq(c->tag, n->tag))
-      i++;
-  return i;
-}
 /* idx satisfies an+b for some integer k >= 0. */
 static int anb_match(int a, int b, int idx)
 {
@@ -3449,25 +3406,25 @@ static int pseudo_match(const struct pseudo *pc, const struct dom_node *n)
 {
   switch (pc->kind) {
   case PC_FIRST_CHILD:
-    return elem_index(n) == 1;
+    return css_elem_index(n) == 1;
   case PC_LAST_CHILD:
-    return elem_index(n) == elem_count(n);
+    return css_elem_index(n) == css_elem_count(n);
   case PC_ONLY_CHILD:
-    return elem_count(n) == 1;
+    return css_elem_count(n) == 1;
   case PC_FIRST_OF_TYPE:
-    return type_index(n) == 1;
+    return css_type_index(n) == 1;
   case PC_LAST_OF_TYPE:
-    return type_index(n) == type_count(n);
+    return css_type_index(n) == css_type_count(n);
   case PC_ONLY_OF_TYPE:
-    return type_count(n) == 1;
+    return css_type_count(n) == 1;
   case PC_NTH_CHILD:
-    return anb_match(pc->a, pc->b, elem_index(n));
+    return anb_match(pc->a, pc->b, css_elem_index(n));
   case PC_NTH_LAST_CHILD:
-    return anb_match(pc->a, pc->b, elem_count(n) - elem_index(n) + 1);
+    return anb_match(pc->a, pc->b, css_elem_count(n) - css_elem_index(n) + 1);
   case PC_NTH_OF_TYPE:
-    return anb_match(pc->a, pc->b, type_index(n));
+    return anb_match(pc->a, pc->b, css_type_index(n));
   case PC_NTH_LAST_OF_TYPE:
-    return anb_match(pc->a, pc->b, type_count(n) - type_index(n) + 1);
+    return anb_match(pc->a, pc->b, css_type_count(n) - css_type_index(n) + 1);
   case PC_ROOT:
     return n->parent && !n->parent->parent;
   case PC_EMPTY:
@@ -4532,6 +4489,8 @@ void css_free(css_sheet *sh)
     g_vars_gen = -1;
     g_nvars = 0;
   } /* drop stale var cache */
+  free(sh->cand);
+  free(sh->match);
   index_clear(sh); /* free the css_idx entries before their rules */
   struct css_rule *r = sh->head;
   while (r) {
@@ -5109,23 +5068,40 @@ static void key23(const char *s, char *out)
   out[k] = '\0';
 }
 
+static int rule_ptr_room(struct css_rule ***buf, int *cap, int need)
+{
+  if (need <= *cap)
+    return 1;
+  int nc = *cap ? *cap * 2 : 64;
+  while (nc < need)
+    nc *= 2;
+  struct css_rule **p = realloc(*buf, (unsigned)nc * sizeof *p);
+  if (!p)
+    return 0;
+  *buf = p;
+  *cap = nc;
+  return 1;
+}
+
 /* Candidate rules for `el`: the universal bucket + its tag/id/class buckets. A
  * rule may be filed under several keys (an :is()/:where() subject), so a
  * per-rule visit stamp de-dups; selector_match still confirms each (the buckets
  * are a superset). */
 static unsigned g_visit;
-static int collect_candidates(css_sheet *sh, const struct dom_node *el, struct css_rule **out, int cap)
+static int collect_candidates(css_sheet *sh, const struct dom_node *el)
 {
   ensure_index(sh);
   unsigned stamp = ++g_visit;
-  int n = 0;
+  int n = 0, failed = 0;
 #define ADD(rp)                                                                                                        \
   do {                                                                                                                 \
     struct css_rule *rr = (rp);                                                                                        \
     if (rr->visit != stamp) {                                                                                          \
       rr->visit = stamp;                                                                                               \
-      if (n < cap)                                                                                                     \
-        out[n++] = rr;                                                                                                 \
+      if (rule_ptr_room(&sh->cand, &sh->cand_cap, n + 1))                                                              \
+        sh->cand[n++] = rr;                                                                                             \
+      else                                                                                                             \
+        failed = 1;                                                                                                    \
     }                                                                                                                  \
   } while (0)
   for (struct css_idx *e = sh->uni; e; e = e->next)
@@ -5161,7 +5137,7 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el, struct c
             ADD(e->rule);
     }
 #undef ADD
-  return n;
+  return failed ? -1 : n;
 }
 
 void css_apply_sheet(css_sheet *sh, const struct dom_node *el, struct css_style *out)
@@ -5172,30 +5148,33 @@ void css_apply_sheet(css_sheet *sh, const struct dom_node *el, struct css_style 
 
   /* Collect matches, then fold in ascending priority (important, spec, order)
    * so the winner is applied last. */
-  struct css_rule *cand[512];
-  struct css_rule *match[256];
-  int nc = collect_candidates(sh, el, cand, 512), nm = 0;
-  for (int i = 0; i < nc && nm < 256; i++)
-    if (media_matches(&cand[i]->media) && selector_match(&cand[i]->sel, el))
-      match[nm++] = cand[i];
+  int nc = collect_candidates(sh, el), nm = 0;
+  if (nc < 0)
+    return;
+  for (int i = 0; i < nc; i++)
+    if (media_matches(&sh->cand[i]->media) && selector_match(&sh->cand[i]->sel, el)) {
+      if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
+        return;
+      sh->match[nm++] = sh->cand[i];
+    }
 
   for (int i = 1; i < nm; i++) { /* insertion sort, stable enough */
-    struct css_rule *k = match[i];
+    struct css_rule *k = sh->match[i];
     int j = i - 1;
     while (j >= 0) {
-      struct css_rule *m = match[j];
+      struct css_rule *m = sh->match[j];
       int hi = (m->important != k->important) ? (m->important > k->important)
                : (m->spec != k->spec)         ? (m->spec > k->spec)
                                               : (m->order > k->order);
       if (!hi)
         break;
-      match[j + 1] = m;
+      sh->match[j + 1] = m;
       j--;
     }
-    match[j + 1] = k;
+    sh->match[j + 1] = k;
   }
   for (int i = 0; i < nm; i++) {
-    struct css_rule *r = match[i];
+    struct css_rule *r = sh->match[i];
     if (r->has_var) { /* re-parse with var() substituted */
       char buf[512];
       int bn = 0;
@@ -5216,29 +5195,32 @@ int css_pseudo_content(css_sheet *sh, const struct dom_node *el, int which, stru
   if (!sh || !el || el->type != DOM_ELEMENT)
     return 0;
   ensure_vars(sh);
-  struct css_rule *cand[512];
-  struct css_rule *match[256];
-  int nc = collect_candidates(sh, el, cand, 512), nm = 0;
-  for (int i = 0; i < nc && nm < 256; i++)
-    if (media_matches(&cand[i]->media) && selector_match_pseudo(&cand[i]->sel, el, which))
-      match[nm++] = cand[i];
+  int nc = collect_candidates(sh, el), nm = 0;
+  if (nc < 0)
+    return 0;
+  for (int i = 0; i < nc; i++)
+    if (media_matches(&sh->cand[i]->media) && selector_match_pseudo(&sh->cand[i]->sel, el, which)) {
+      if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
+        return 0;
+      sh->match[nm++] = sh->cand[i];
+    }
   for (int i = 1; i < nm; i++) { /* ascending priority: winner folds last */
-    struct css_rule *k = match[i];
+    struct css_rule *k = sh->match[i];
     int j = i - 1;
     while (j >= 0) {
-      struct css_rule *m = match[j];
+      struct css_rule *m = sh->match[j];
       int hi = (m->important != k->important) ? (m->important > k->important)
                : (m->spec != k->spec)         ? (m->spec > k->spec)
                                               : (m->order > k->order);
       if (!hi)
         break;
-      match[j + 1] = m;
+      sh->match[j + 1] = m;
       j--;
     }
-    match[j + 1] = k;
+    sh->match[j + 1] = k;
   }
   for (int i = 0; i < nm; i++) {
-    struct css_rule *r = match[i];
+    struct css_rule *r = sh->match[i];
     if (r->has_var) {
       char buf[512];
       int bn = 0;
@@ -5350,29 +5332,32 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
     }
   }
 
-  struct css_rule *cand[512];
-  struct css_rule *match[256];
-  int nc = collect_candidates(sh, el, cand, 512), nm = 0;
-  for (int i = 0; i < nc && nm < 256; i++)
-    if (media_matches(&cand[i]->media) && selector_match(&cand[i]->sel, el))
-      match[nm++] = cand[i];
+  int nc = collect_candidates(sh, el), nm = 0;
+  if (nc < 0)
+    return 0;
+  for (int i = 0; i < nc; i++)
+    if (media_matches(&sh->cand[i]->media) && selector_match(&sh->cand[i]->sel, el)) {
+      if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
+        return 0;
+      sh->match[nm++] = sh->cand[i];
+    }
   for (int i = 1; i < nm; i++) { /* sort highest priority first */
-    struct css_rule *k = match[i];
+    struct css_rule *k = sh->match[i];
     int j = i - 1;
     while (j >= 0) {
-      struct css_rule *m = match[j];
+      struct css_rule *m = sh->match[j];
       int klo = (m->important != k->important) ? (k->important > m->important)
                 : (m->spec != k->spec)         ? (k->spec > m->spec)
                                                : (k->order > m->order);
       if (!klo)
         break;
-      match[j + 1] = m;
+      sh->match[j + 1] = m;
       j--;
     }
-    match[j + 1] = k;
+    sh->match[j + 1] = k;
   }
   for (int i = 0; i < nm; i++)
-    if (extract_bg(match[i]->raw, val, sizeof val)) {
+    if (extract_bg(sh->match[i]->raw, val, sizeof val)) {
       int a;
       int c = bg_value_color(val, &a);
       if (c >= 0) {
@@ -5542,34 +5527,37 @@ int css_matches(css_sheet *sh, const struct dom_node *el, struct css_match *out,
 {
   if (!sh || !el || el->type != DOM_ELEMENT || cap <= 0)
     return 0;
-  struct css_rule *cand[512];
-  struct css_rule *match[256];
-  int nc = collect_candidates(sh, el, cand, 512), nm = 0;
-  for (int i = 0; i < nc && nm < 256; i++)
-    if (selector_match(&cand[i]->sel, el))
-      match[nm++] = cand[i];
+  int nc = collect_candidates(sh, el), nm = 0;
+  if (nc < 0)
+    return 0;
+  for (int i = 0; i < nc; i++)
+    if (selector_match(&sh->cand[i]->sel, el)) {
+      if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
+        return 0;
+      sh->match[nm++] = sh->cand[i];
+    }
 
   /* Most-specific / last-declared first (winner on top, like a real devtools).
    */
   for (int i = 1; i < nm; i++) {
-    struct css_rule *k = match[i];
+    struct css_rule *k = sh->match[i];
     int j = i - 1;
     while (j >= 0) {
-      struct css_rule *m = match[j];
+      struct css_rule *m = sh->match[j];
       int klo = (m->important != k->important) ? (k->important > m->important)
                 : (m->spec != k->spec)         ? (k->spec > m->spec)
                                                : (k->order > m->order);
       if (!klo)
         break;
-      match[j + 1] = m;
+      sh->match[j + 1] = m;
       j--;
     }
-    match[j + 1] = k;
+    sh->match[j + 1] = k;
   }
 
   int n = 0;
   for (int i = 0; i < nm && n < cap; i++) {
-    struct css_rule *r = match[i];
+    struct css_rule *r = sh->match[i];
     sel_text(&r->sel, out[n].selector, (int)sizeof out[n].selector);
     media_text(&r->media, out[n].media, (int)sizeof out[n].media);
     out[n].active = media_matches(&r->media);

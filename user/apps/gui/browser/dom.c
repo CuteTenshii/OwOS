@@ -94,6 +94,8 @@ static struct dom_node *node_new(struct parser *ps, enum dom_type type)
   n->attrs = 0;
   n->last_attr = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
+  n->sibling_meta_seq = 0;
+  n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
   n->wrapper = 0;
   return n;
 }
@@ -530,6 +532,8 @@ struct dom_node *dom_new_element(const char *tag)
   n->attrs = 0;
   n->last_attr = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
+  n->sibling_meta_seq = 0;
+  n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
   n->wrapper = 0;
   {
     int i = 0;
@@ -550,6 +554,8 @@ struct dom_node *dom_new_text(const char *text)
   n->attrs = 0;
   n->last_attr = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
+  n->sibling_meta_seq = 0;
+  n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
   n->wrapper = 0;
   n->text = dupn(text ? text : "", text ? (int)strlen(text) : 0);
   return n;
