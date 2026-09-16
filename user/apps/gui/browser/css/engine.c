@@ -10,10 +10,10 @@
  * height (others parse-and-ignore, like any browser). Inline <style> and
  * style="" only — external <link rel=stylesheet> is not fetched. Descendant
  * matching is greedy (no backtracking), enough for ordinary selectors. */
-#include "../css.h"
-#include "sibling.h"
 #include "../color.h" /* shared colour parser */
+#include "../css.h"
 #include "owos.h"
+#include "sibling.h"
 
 #define MAX_CLS 6
 #define MAX_STEPS 6
@@ -3970,6 +3970,11 @@ css_sheet *css_new(void)
   }
   s->uni = 0;
   s->idx_gen = -1; /* index is stale until first ensure_index */
+  s->idx_failed = 0;
+  s->cand = 0;
+  s->cand_cap = 0;
+  s->match = 0;
+  s->match_cap = 0;
   return s;
 }
 
@@ -5118,7 +5123,7 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el)
     if (rr->visit != stamp) {                                                                                          \
       rr->visit = stamp;                                                                                               \
       if (rule_ptr_room(&sh->cand, &sh->cand_cap, n + 1))                                                              \
-        sh->cand[n++] = rr;                                                                                             \
+        sh->cand[n++] = rr;                                                                                            \
       else                                                                                                             \
         failed = 1;                                                                                                    \
     }                                                                                                                  \

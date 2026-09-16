@@ -96,6 +96,7 @@ static struct dom_node *node_new(struct parser *ps, enum dom_type type)
   for (int i = 0; i < 8; i++)
     n->attr_cache[i] = 0;
   n->attr_cache_seq = ~0u;
+  n->attr_cache_valid = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
@@ -530,19 +531,19 @@ const char *dom_get_attr(const struct dom_node *node, const char *name)
       break;
     }
   if (slot >= 0) {
-    if (node->attr_cache_seq == dom_mutation_seq)
-      return node->attr_cache[slot] ? node->attr_cache[slot]->value : 0;
+    if (node->attr_cache_valid && node->attr_cache_seq == dom_mutation_seq && node->attr_cache[slot])
+      return node->attr_cache[slot]->value;
     for (int i = 0; i < 8; i++)
       ((struct dom_node *)node)->attr_cache[i] = 0;
     ((struct dom_node *)node)->attr_cache_seq = dom_mutation_seq;
+    ((struct dom_node *)node)->attr_cache_valid = 1;
   }
   for (struct dom_attr *a = node->attrs; a; a = a->next)
-    if (streq_ci(a->name, name))
-      {
-        if (slot >= 0)
-          ((struct dom_node *)node)->attr_cache[slot] = a;
-        return a->value;
-      }
+    if (streq_ci(a->name, name)) {
+      if (slot >= 0)
+        ((struct dom_node *)node)->attr_cache[slot] = a;
+      return a->value;
+    }
   return 0;
 }
 
@@ -561,6 +562,7 @@ struct dom_node *dom_new_element(const char *tag)
   for (int i = 0; i < 8; i++)
     n->attr_cache[i] = 0;
   n->attr_cache_seq = ~0u;
+  n->attr_cache_valid = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
@@ -589,6 +591,7 @@ struct dom_node *dom_new_text(const char *text)
   for (int i = 0; i < 8; i++)
     n->attr_cache[i] = 0;
   n->attr_cache_seq = ~0u;
+  n->attr_cache_valid = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;

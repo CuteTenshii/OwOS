@@ -5,66 +5,71 @@
  * font-variant-caps small-caps, all through css_apply_inline.
  *
  *   cc -std=c11 -Iscripts -Iuser/apps/gui/browser \
- *      tests/css_font_test.c user/apps/gui/browser/css.c \
+ *      tests/css_font_test.c user/apps/gui/browser/css/engine.c user/apps/gui/browser/css/sibling.c \
  *      user/apps/gui/browser/color.c user/apps/gui/browser/dom.c \
  *      -lm -o /tmp/css_font_test && /tmp/css_font_test
  */
 #include <stdio.h>
 #define OWOS_SUITE_TEST
-#include <string.h>
 #include "css.h"
+#include <string.h>
 
 /* Assert the fields the font-* work touches. Pass -1 for "don't care" on the
  * scalar sentinels; fam is compared only when non-NULL. */
-static void chk(const char *decls, int want_px, int want_pct, int want_bold,
-                int want_italic, int want_scaps, short want_lhpct, const char *want_fam)
+static void chk(const char *decls, int want_px, int want_pct, int want_bold, int want_italic, int want_scaps,
+                short want_lhpct, const char *want_fam)
 {
-	struct css_style s;
-	test(decls);
-	css_style_reset(&s);
-	css_apply_inline(decls, &s);
-	int ok = 1;
-	if (want_px    != -2 && s.font_px    != want_px)    ok = 0;
-	if (want_pct   != -2 && s.font_pct   != want_pct)   ok = 0;
-	if (want_bold  != -2 && s.bold       != want_bold)  ok = 0;
-	if (want_italic!= -2 && s.italic     != want_italic)ok = 0;
-	if (want_scaps != -2 && s.small_caps != want_scaps) ok = 0;
-	if (want_lhpct != -2 && s.lh_pct     != want_lhpct) ok = 0;
-	if (want_fam   && strcmp(s.fam, want_fam) != 0)     ok = 0;
-	expect(ok);
+  struct css_style s;
+  test(decls);
+  css_style_reset(&s);
+  css_apply_inline(decls, &s);
+  int ok = 1;
+  if (want_px != -2 && s.font_px != want_px)
+    ok = 0;
+  if (want_pct != -2 && s.font_pct != want_pct)
+    ok = 0;
+  if (want_bold != -2 && s.bold != want_bold)
+    ok = 0;
+  if (want_italic != -2 && s.italic != want_italic)
+    ok = 0;
+  if (want_scaps != -2 && s.small_caps != want_scaps)
+    ok = 0;
+  if (want_lhpct != -2 && s.lh_pct != want_lhpct)
+    ok = 0;
+  if (want_fam && strcmp(s.fam, want_fam) != 0)
+    ok = 0;
+  expect(ok);
 }
 
 int main(void)
 {
-	/* Bare shorthand: size + family, everything else resets to normal. */
-	chk("font: 14px Arial", 14, -1, 0, 0, 0, -1, "arial");
-	/* size/line-height + a quoted, multi-name family stack. */
-	chk("font: 16px/1.5 \"Helvetica Neue\", sans-serif",
-	    16, -1, 0, 0, 0, 150, "helvetica neue,sans-serif");
-	/* Full prelude: style + variant + weight before the size. */
-	chk("font: italic small-caps bold 18px/1.2 Georgia, serif",
-	    18, -1, 1, 1, 1, 120, "georgia,serif");
-	/* Numeric weight must NOT be mistaken for the font-size (the subtle case). */
-	chk("font: 400 13px monospace", 13, -1, 0, 0, 0, -1, "monospace");
-	chk("font: 700 20px Verdana",   20, -1, 1, 0, 0, -1, "verdana");
-	/* Keyword size in the shorthand. */
-	chk("font: bold large Tahoma", 18, -1, 1, 0, 0, -1, "tahoma");
-	/* System-font keyword collapses to the UI face. */
-	chk("font: menu", 15, -1, 0, 0, 0, -1, "sans-serif");
-	chk("font: small-caption", 13, -1, 0, 0, 0, -1, "sans-serif");
-	/* Invalid shorthand (no size) leaves the style untouched. */
-	chk("font: italic bold", -1, -1, -1, -1, -1, -1, "");
+  /* Bare shorthand: size + family, everything else resets to normal. */
+  chk("font: 14px Arial", 14, -1, 0, 0, 0, -1, "arial");
+  /* size/line-height + a quoted, multi-name family stack. */
+  chk("font: 16px/1.5 \"Helvetica Neue\", sans-serif", 16, -1, 0, 0, 0, 150, "helvetica neue,sans-serif");
+  /* Full prelude: style + variant + weight before the size. */
+  chk("font: italic small-caps bold 18px/1.2 Georgia, serif", 18, -1, 1, 1, 1, 120, "georgia,serif");
+  /* Numeric weight must NOT be mistaken for the font-size (the subtle case). */
+  chk("font: 400 13px monospace", 13, -1, 0, 0, 0, -1, "monospace");
+  chk("font: 700 20px Verdana", 20, -1, 1, 0, 0, -1, "verdana");
+  /* Keyword size in the shorthand. */
+  chk("font: bold large Tahoma", 18, -1, 1, 0, 0, -1, "tahoma");
+  /* System-font keyword collapses to the UI face. */
+  chk("font: menu", 15, -1, 0, 0, 0, -1, "sans-serif");
+  chk("font: small-caption", 13, -1, 0, 0, 0, -1, "sans-serif");
+  /* Invalid shorthand (no size) leaves the style untouched. */
+  chk("font: italic bold", -1, -1, -1, -1, -1, -1, "");
 
-	/* font-variant / font-variant-caps small-caps axis. */
-	chk("font-variant: small-caps",       -1, -1, -1, -1, 1, -1, NULL);
-	chk("font-variant-caps: all-small-caps", -1, -1, -1, -1, 1, -1, NULL);
-	chk("font-variant: normal",           -1, -1, -1, -1, 0, -1, NULL);
-	/* A ligature-only font-variant sets no caps. */
-	chk("font-variant: common-ligatures", -1, -1, -1, -1, -1, -1, NULL);
+  /* font-variant / font-variant-caps small-caps axis. */
+  chk("font-variant: small-caps", -1, -1, -1, -1, 1, -1, NULL);
+  chk("font-variant-caps: all-small-caps", -1, -1, -1, -1, 1, -1, NULL);
+  chk("font-variant: normal", -1, -1, -1, -1, 0, -1, NULL);
+  /* A ligature-only font-variant sets no caps. */
+  chk("font-variant: common-ligatures", -1, -1, -1, -1, -1, -1, NULL);
 
-	/* Longhand font-size keyword + percent forms still work. */
-	chk("font-size: x-large", 24, -1, -1, -1, -1, -1, NULL);
-	chk("font-size: 120%",    -1, 120, -1, -1, -1, -1, NULL);
+  /* Longhand font-size keyword + percent forms still work. */
+  chk("font-size: x-large", 24, -1, -1, -1, -1, -1, NULL);
+  chk("font-size: 120%", -1, 120, -1, -1, -1, -1, NULL);
 
-	return 0;
+  return 0;
 }

@@ -21,6 +21,7 @@ struct dom_node {
   struct dom_attr *last_attr; /* tail of attrs, for O(1) append       */
   struct dom_attr *attr_cache[8];
   unsigned attr_cache_seq;
+  unsigned char attr_cache_valid;
   struct dom_node *parent;
   struct dom_node *first_child;
   struct dom_node *last_child;
@@ -33,9 +34,9 @@ struct dom_node {
   void *computed_style;
   void *computed_style_sheet;
   unsigned computed_style_seq;
-  void *wrapper;         /* cached JS wrapper object (browser/js.c),
-                          * NULL until first exposed to script — gives
-                          * a node stable identity so listeners stick. */
+  void *wrapper; /* cached JS wrapper object (browser/js.c),
+                  * NULL until first exposed to script — gives
+                  * a node stable identity so listeners stick. */
 };
 
 /* Parse `len` bytes into a tree under a synthetic "#document" root. Returns

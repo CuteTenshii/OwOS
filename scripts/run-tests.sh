@@ -13,6 +13,7 @@ INCLUDES=(
 	-I"$ROOT/user/lib/zlib" -I"$ROOT/user/lib/stun" -I"$ROOT/user/lib/mp4"
 	-I"$ROOT/user/lib/sqlite" -I"$ROOT/user/lib/gfx" -I"$ROOT/user/lib/png"
 	-I"$ROOT/user/lib/netconn" -I"$ROOT/user/lib/notify" -I"$ROOT/user/apps/gui/browser"
+	-I"$ROOT/user/apps/gui/browser/js"
 )
 
 for source in "$ROOT"/tests/*_test.c; do
@@ -42,11 +43,11 @@ done
 	-o "$BUILD/test_runner.o" || exit 1
 
 "$CC" "${INCLUDES[@]}" "$BUILD"/*.o \
-	"$ROOT/user/apps/gui/browser/css.c" "$ROOT/user/apps/gui/browser/color.c" \
+	"$ROOT/user/apps/gui/browser/css/engine.c" "$ROOT/user/apps/gui/browser/css/sibling.c" "$ROOT/user/apps/gui/browser/color.c" \
 	"$ROOT/user/apps/gui/browser/dom.c" "$ROOT/user/apps/gui/browser/csp.c" \
-	"$ROOT/user/apps/gui/browser/classlist.c" \
-	"$ROOT/user/apps/gui/browser/js_webapi.c" \
-	"$ROOT/user/apps/gui/browser/js_notification.c" \
+	"$ROOT/user/apps/gui/browser/js/classlist.c" \
+	"$ROOT/user/apps/gui/browser/js/webapi.c" \
+	"$ROOT/user/apps/gui/browser/js/notification.c" \
 	"$ROOT/user/lib/curl/url.c" "$ROOT/user/lib/curl/httpcache.c" \
 	"$ROOT/user/lib/curl/headers.c" "$ROOT/user/lib/crypto/crypto.c" \
 	"$ROOT/user/lib/base64/base64.c" "$ROOT/user/lib/zlib/crc32.c" \
