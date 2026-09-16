@@ -16,6 +16,8 @@ an 80×25 text console and everything still works.
 ```
 make            # build owos.bin (host gcc -m32, no cross-compiler)
 make test       # compile and run the deterministic host test suite
+make format     # format C sources and headers with clang-format
+make format-check # verify C sources and headers are clang-format clean
 make run        # QEMU: graphical window + COM1 mirrored to the terminal
 make debug      # headless: console only, over COM1
 make run NIC=e1000   # attach the Intel 82540EM instead of the default RTL8139

@@ -13,3 +13,14 @@ jobs:
         uses: actions/checkout@v7
       - name: Run host test suite
         run: make test
+
+  format:
+    name: C formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Check C formatting
+        run: make format-check

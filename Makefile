@@ -17,7 +17,10 @@
 #   run.mk                  disk images + the QEMU run/debug/iso/usb targets
 
 .DEFAULT_GOAL := all
-.PHONY: all test run debug iso run-iso run-iso-uefi usb clean distclean
+.PHONY: all test format format-check run debug iso run-iso run-iso-uefi usb clean distclean
+
+FORMAT_FILES := $(shell find boot drivers kernel user -type f \( -name '*.c' -o -name '*.h' \))
+CLANG_FORMAT ?= clang-format
 
 include toolchain.mk
 include user/lib/build.mk
@@ -29,6 +32,14 @@ all: $(KERNEL)
 
 test:
 	./scripts/run-tests.sh
+
+format:
+	@command -v $(CLANG_FORMAT) >/dev/null 2>&1 || { echo "error: $(CLANG_FORMAT) not found" >&2; exit 1; }
+	$(CLANG_FORMAT) -i $(FORMAT_FILES)
+
+format-check:
+	@command -v $(CLANG_FORMAT) >/dev/null 2>&1 || { echo "error: $(CLANG_FORMAT) not found" >&2; exit 1; }
+	$(CLANG_FORMAT) --dry-run --Werror $(FORMAT_FILES)
 
 clean:
 	rm -f $(OBJS) owos.bin owos-x86_64.bin $(ISO) .arch.*
