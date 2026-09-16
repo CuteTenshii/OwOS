@@ -14,6 +14,21 @@
 
 #define MAX_DEPTH 800
 
+static int grow_values(js_value **values, int *cap, int need)
+{
+  if (need <= *cap)
+    return 1;
+  int next = *cap ? *cap * 2 : 1;
+  while (next < need)
+    next *= 2;
+  js_value *p = realloc(*values, (unsigned)next * sizeof *p);
+  if (!p)
+    return 0;
+  *values = p;
+  *cap = next;
+  return 1;
+}
+
 static void *refp(js_value v)
 {
   if (v.type == JV_OBJ || v.type == JV_SYMBOL || v.type == JV_BIGINT)
@@ -816,9 +831,10 @@ static js_value *eval_args(js_ctx *ctx, js_node **anodes, int an, int *out_argc)
         unsigned j, len = sv.type == JV_STR ? (unsigned)sv.u.str->len : sv.u.obj->elen;
         for (j = 0; j < len; j++) {
           js_value e = js_get_index(ctx, sv, j);
-          if (argc == cap) {
-            cap *= 2;
-            argv = (js_value *)realloc(argv, (unsigned)cap * sizeof(js_value));
+          if (!grow_values(&argv, &cap, argc + 1)) {
+            free(argv);
+            js_throw_range(ctx, "out of memory");
+            return NULL;
           }
           argv[argc++] = e;
           KEEP(e);
@@ -833,9 +849,10 @@ static js_value *eval_args(js_ctx *ctx, js_node **anodes, int an, int *out_argc)
         }
         KEEP(iter);
         while (iterator_step(ctx, iter, &e)) {
-          if (argc == cap) {
-            cap *= 2;
-            argv = (js_value *)realloc(argv, (unsigned)cap * sizeof(js_value));
+          if (!grow_values(&argv, &cap, argc + 1)) {
+            free(argv);
+            js_throw_range(ctx, "out of memory");
+            return NULL;
           }
           argv[argc++] = e;
           KEEP(e);
@@ -853,9 +870,10 @@ static js_value *eval_args(js_ctx *ctx, js_node **anodes, int an, int *out_argc)
         free(argv);
         return NULL;
       }
-      if (argc == cap) {
-        cap *= 2;
-        argv = (js_value *)realloc(argv, (unsigned)cap * sizeof(js_value));
+      if (!grow_values(&argv, &cap, argc + 1)) {
+        free(argv);
+        js_throw_range(ctx, "out of memory");
+        return NULL;
       }
       argv[argc++] = v;
       KEEP(v);
@@ -3114,7 +3132,18 @@ static js_node *compile_dyn(js_ctx *ctx, const char *src, js_parse_error *err)
   }
   if (ctx->dyn_n == ctx->dyn_cap) {
     int nc = ctx->dyn_cap ? ctx->dyn_cap * 2 : 4;
-    ctx->dyn_arenas = (js_arena **)realloc(ctx->dyn_arenas, (unsigned)nc * sizeof(js_arena *));
+    js_arena **arenas = (js_arena **)realloc(ctx->dyn_arenas, (unsigned)nc * sizeof *arenas);
+    if (!arenas) {
+      js_arena_free(a);
+      free(a);
+      if (err) {
+        err->msg = "out of memory";
+        err->line = 0;
+        err->col = 0;
+      }
+      return NULL;
+    }
+    ctx->dyn_arenas = arenas;
     ctx->dyn_cap = nc;
   }
   ctx->dyn_arenas[ctx->dyn_n++] = a;
@@ -3157,6 +3186,7 @@ js_value js_builtin_eval(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 typedef struct {
   char *b;
   int n, cap;
+  int failed;
 } srcbuf;
 static void srcb(srcbuf *s, const char *t, int n)
 {
@@ -3164,7 +3194,12 @@ static void srcb(srcbuf *s, const char *t, int n)
     int c = s->cap ? s->cap * 2 : 64;
     while (c < s->n + n + 1)
       c *= 2;
-    s->b = (char *)realloc(s->b, (unsigned)c);
+    char *b = (char *)realloc(s->b, (unsigned)c);
+    if (!b) {
+      s->failed = 1;
+      return;
+    }
+    s->b = b;
     s->cap = c;
   }
   memcpy(s->b + s->n, t, (unsigned)n);
@@ -3184,6 +3219,7 @@ js_value js_builtin_function(js_ctx *ctx, js_value thisv, js_value *args, int ar
   sb.b = 0;
   sb.n = 0;
   sb.cap = 0;
+  sb.failed = 0;
   srcb(&sb, "(function anonymous(", 20);
   for (i = 0; i + 1 < argc; i++) {
     js_value s = js_to_string(ctx, args[i]);
@@ -3207,6 +3243,11 @@ js_value js_builtin_function(js_ctx *ctx, js_value thisv, js_value *args, int ar
     srcb(&sb, body.u.str->data, body.u.str->len);
   }
   srcb(&sb, "\n})", 3);
+  if (sb.failed) {
+    if (sb.b)
+      free(sb.b);
+    return js_throw_range(ctx, "out of memory");
+  }
   prog = compile_dyn(ctx, sb.b ? sb.b : "(function(){})", &e);
   if (sb.b)
     free(sb.b);
