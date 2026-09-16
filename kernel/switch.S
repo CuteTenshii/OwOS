@@ -36,6 +36,7 @@ context_switch:
 .global thread_start
 .type thread_start, @function
 thread_start:
+	call sched_kernel_enter
 	sti
 	ret
 .size thread_start, . - thread_start
@@ -118,6 +119,7 @@ context_switch:
 .global thread_start
 .type thread_start, @function
 thread_start:
+	call sched_kernel_enter
 	sti
 	ret
 .size thread_start, . - thread_start

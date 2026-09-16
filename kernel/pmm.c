@@ -2,6 +2,7 @@
 
 #include "pmm.h"
 #include "console.h"
+#include "irqflags.h"
 #include "multiboot.h"
 
 #define FRAME_SIZE PMM_FRAME_SIZE
@@ -36,6 +37,21 @@ uint32_t pmm_pool_start(void) { return pool_start_b; } /* = kernel heap end */
  * forking) re-scanned every already-taken low frame on each allocation. A free
  * below the cursor pulls it back so the freed frame is reused. */
 static uint32_t alloc_hint;
+static volatile uint32_t pmm_lock;
+
+static uintptr_t pmm_lock_acquire(void)
+{
+  uintptr_t flags = irq_save();
+  while (__sync_lock_test_and_set(&pmm_lock, 1))
+    __asm__ volatile("pause");
+  return flags;
+}
+
+static void pmm_lock_release(uintptr_t flags)
+{
+  __sync_lock_release(&pmm_lock);
+  irq_restore(flags);
+}
 
 /* Frames backed by *real, allocatable RAM* (the available regions below 4 GiB).
  * Distinct from total_frames, which also spans the PCI/MMIO hole and reserved
@@ -149,12 +165,14 @@ void pmm_init(const struct multiboot_info *mbi)
 
 uint32_t pmm_alloc_frame(void)
 {
+  uintptr_t flags = pmm_lock_acquire();
   for (uint32_t f = alloc_hint; f < total_frames; f++) {
     if (!frame_test(f)) {
       frame_set(f);
       refs[f] = 1;
       used_frames++;
       alloc_hint = f + 1;
+      pmm_lock_release(flags);
       return f * FRAME_SIZE;
     }
   }
@@ -165,9 +183,11 @@ uint32_t pmm_alloc_frame(void)
       refs[f] = 1;
       used_frames++;
       alloc_hint = f + 1;
+      pmm_lock_release(flags);
       return f * FRAME_SIZE;
     }
   }
+  pmm_lock_release(flags);
   return 0; /* out of physical memory */
 }
 
@@ -180,6 +200,7 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
   uint32_t need = (bytes + FRAME_SIZE - 1) / FRAME_SIZE;
   if (need == 0)
     return 0;
+  uintptr_t flags = pmm_lock_acquire();
 
   /* Start past the always-reserved low 16 MiB: those frames are permanently
    * marked used, so no contiguous run can begin there. Scanning from 0 stepped
@@ -195,19 +216,23 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
         refs[f + i] = 1;
         used_frames++;
       }
+      pmm_lock_release(flags);
       return f * FRAME_SIZE;
     }
     f += run + 1; /* skip past the blocking used frame */
   }
+  pmm_lock_release(flags);
   return 0;
 }
 
 void pmm_free_frame(uint32_t phys)
 {
+  uintptr_t flags = pmm_lock_acquire();
   uint32_t f = phys / FRAME_SIZE;
   if (f < total_frames && frame_test(f)) {
     if (refs[f] > 1) {
       refs[f]--;
+      pmm_lock_release(flags);
       return;
     }
     refs[f] = 0;
@@ -216,19 +241,25 @@ void pmm_free_frame(uint32_t phys)
     if (f < alloc_hint) /* let the next alloc reuse this frame */
       alloc_hint = f;
   }
+  pmm_lock_release(flags);
 }
 
 void pmm_retain_frame(uint32_t phys)
 {
+  uintptr_t flags = pmm_lock_acquire();
   uint32_t f = phys / FRAME_SIZE;
   if (f < total_frames && frame_test(f) && refs[f] != 0 && refs[f] != 0xFFFF)
     refs[f]++;
+  pmm_lock_release(flags);
 }
 
 uint32_t pmm_frame_refs(uint32_t phys)
 {
+  uintptr_t flags = pmm_lock_acquire();
   uint32_t f = phys / FRAME_SIZE;
-  return f < total_frames ? refs[f] : 0;
+  uint32_t result = f < total_frames ? refs[f] : 0;
+  pmm_lock_release(flags);
+  return result;
 }
 
 /* Release a run previously handed out by pmm_alloc_contig. The bitmap allocator

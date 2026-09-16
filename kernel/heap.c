@@ -16,6 +16,7 @@
 
 #include "heap.h"
 #include "console.h"
+#include "irqflags.h"
 #include "pmm.h"
 #include <stdint.h>
 
@@ -38,6 +39,15 @@ typedef struct block {
 } block_t;
 
 static block_t *head;
+static volatile uint32_t heap_lock;
+
+static void heap_lock_acquire(void)
+{
+  while (__sync_lock_test_and_set(&heap_lock, 1))
+    __asm__ volatile("pause");
+}
+
+static void heap_lock_release(void) { __sync_lock_release(&heap_lock); }
 
 void heap_init(void)
 {
@@ -59,9 +69,13 @@ void heap_init(void)
 
 void *kmalloc(size_t size)
 {
-  if (size == 0)
+  uintptr_t flags = irq_save();
+  if (size == 0) {
+    irq_restore(flags);
     return 0;
+  }
   size = ALIGN_UP(size, 8);
+  heap_lock_acquire();
 
   for (block_t *b = head; b; b = b->next) {
     if (!b->free || b->size < size)
@@ -77,23 +91,37 @@ void *kmalloc(size_t size)
       b->next = rest;
     }
     b->free = 0;
-    return (uint8_t *)b + sizeof(block_t);
+    void *result = (uint8_t *)b + sizeof(block_t);
+    heap_lock_release();
+    irq_restore(flags);
+    return result;
   }
+  heap_lock_release();
+  irq_restore(flags);
   return 0; /* no block large enough */
 }
 
 void kfree(void *ptr)
 {
+  uintptr_t flags;
   if (!ptr)
     return;
+  flags = irq_save();
+  heap_lock_acquire();
   block_t *b = (block_t *)((uint8_t *)ptr - sizeof(block_t));
 
   /* Robustness: ignore a pointer outside the heap window, or a double free
    * (either would corrupt the list / underflow the used count). */
-  if ((uintptr_t)b < (uintptr_t)head || (uintptr_t)b >= KHEAP_END)
+  if ((uintptr_t)b < (uintptr_t)head || (uintptr_t)b >= KHEAP_END) {
+    heap_lock_release();
+    irq_restore(flags);
     return;
-  if (b->free)
+  }
+  if (b->free) {
+    heap_lock_release();
+    irq_restore(flags);
     return;
+  }
   b->free = 1;
 
   /* Merge forward with adjacent free blocks. */
@@ -116,6 +144,8 @@ void kfree(void *ptr)
       p->next = b->next;
     }
   }
+  heap_lock_release();
+  irq_restore(flags);
 }
 
 size_t heap_used_bytes(void)

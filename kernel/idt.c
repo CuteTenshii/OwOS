@@ -320,13 +320,20 @@ static int fault_signal(uint32_t vec)
 /* Called from isr_common_stub for every CPU exception. */
 void isr_handler(struct registers *r)
 {
+  int user_fault = (r->int_no == 0x80 || r->int_no < 32) && (r->cs & 3) == 3;
+  if (user_fault)
+    sched_kernel_enter();
   if (r->int_no == 0x80) { /* system call, not an exception            */
     syscall_dispatch(r);
     sched_signal_deliver(r); /* run any pending signal on the way to ring 3 */
+    sched_kernel_leave();
     return;
   }
-  if (r->int_no == 14 && paging_handle_page_fault((uint32_t)read_cr2(), r->err_code))
+  if (r->int_no == 14 && paging_handle_page_fault((uint32_t)read_cr2(), r->err_code)) {
+    if (user_fault)
+      sched_kernel_leave();
     return;
+  }
 
   /* A fault that came from ring 3 (CS RPL = 3) is a user-program bug, not a
    * kernel one. If the task installed a handler for the matching signal,
@@ -335,8 +342,10 @@ void isr_handler(struct registers *r)
    * record it for a crash window and terminate just that process instead of
    * panicking the system. */
   if (r->int_no < 32 && (r->cs & 3) == 3) {
-    if (sched_fault_signal(r, fault_signal(r->int_no)))
+    if (sched_fault_signal(r, fault_signal(r->int_no))) {
+      sched_kernel_leave();
       return; /* iret runs the user handler               */
+    }
     crash_record(sched_current_name(), r);
     sched_exit(139); /* kill the faulting task; never returns    */
   }

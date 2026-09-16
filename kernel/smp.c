@@ -8,6 +8,7 @@
 #include "idt.h"
 #include "paging.h"
 #include "power.h"
+#include "sched.h"
 #include "timer.h"
 
 /* MADT record types. */
@@ -225,31 +226,30 @@ static void lapic_timer_start(void)
 }
 
 /* AP C entry, reached from the trampoline with paging already on (kernel CR3).
- * It adopts the shared IDT and its own TSS, starts its Local APIC timer, then
- * idles — the timer fires smp_lapic_tick on this core. Touches no shared
- * subsystem yet. */
+ * It adopts the shared IDT and its own TSS, initializes the local scheduler,
+ * then starts its Local APIC timer. */
 void ap_main(uint32_t idx)
 {
   gdt_load_ap();
   idt_load();
   tss_load_ap();
   lapic_enable_local();
+  sched_init_cpu((int)idx);
   lapic_timer_start();
 
   __sync_fetch_and_or(&online_mask, 1u << idx);
   ap_started = 1;
   __asm__ volatile("sti");
-  for (;;)
-    __asm__ volatile("hlt");
+  sched_start_cpu((int)idx);
 }
 
-/* Per-core timer tick (vector LAPIC_TIMER_VEC), dispatched from irq_handler.
- * For now: account the tick and ack the Local APIC. */
+/* Per-core timer tick (vector LAPIC_TIMER_VEC), dispatched from irq_handler. */
 void smp_lapic_tick(struct registers *r)
 {
   (void)r;
   cpu_ticks[smp_this_cpu()]++;
   lapic_wr(LAPIC_EOI, 0);
+  schedule();
 }
 
 void smp_start_aps(void)

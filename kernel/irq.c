@@ -75,10 +75,12 @@ void irq_unmask(uint8_t irq)
 /* Called from irq_common_stub for every hardware interrupt. */
 void irq_handler(struct registers *r)
 {
+  sched_kernel_enter();
   /* The Local APIC timer (AP scheduler tick) shares this dispatch but acks the
    * LAPIC, not the PIC. */
   if (r->int_no == LAPIC_TIMER_VEC) {
     smp_lapic_tick(r);
+    sched_kernel_leave();
     return;
   }
 
@@ -101,6 +103,7 @@ void irq_handler(struct registers *r)
    * SIGKILL a spinning task): the next timer tick preempts it and delivers
    * here. */
   sched_signal_deliver(r);
+  sched_kernel_leave();
 }
 
 void irq_init(void)

@@ -15,6 +15,8 @@
 struct registers;
 
 void sched_init(void);
+void sched_init_cpu(int cpu);
+void sched_start_cpu(int cpu);
 void sched_create_thread(const char *name, void (*entry)(void));
 
 /* Spawn a user process from an already-built address space; returns its pid.
@@ -56,7 +58,10 @@ int sched_waitpid(int pid);               /* block for a child; returns its stat
 int sched_try_reap(int pid, int *status); /* non-blocking reap (kernel side) */
 int sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, uint32_t brk, struct registers *r);
 
-void schedule(void);    /* invoked from the timer tick                       */
+void schedule(void); /* invoked from the timer tick                       */
+void sched_kernel_enter(void);
+void sched_kernel_leave(void);
+void sched_kernel_switch_in(void);
 void sched_yield(void); /* voluntarily give up the CPU (stays runnable)      */
 /* Block the caller until absolute timer tick `wake`, fully off the run queue
  * (so sleeping tasks don't dilate other tasks' scheduling). timer_sleep() is

@@ -39,6 +39,25 @@
  * physaddr==addr). */
 #define SCRATCH_VADDR 0x10000000u
 
+static volatile uint32_t page_pool_lock;
+static volatile uint32_t scratch_lock;
+
+static void page_pool_acquire(void)
+{
+  while (__sync_lock_test_and_set(&page_pool_lock, 1))
+    __asm__ volatile("pause");
+}
+
+static void page_pool_release(void) { __sync_lock_release(&page_pool_lock); }
+
+static void scratch_acquire(void)
+{
+  while (__sync_lock_test_and_set(&scratch_lock, 1))
+    __asm__ volatile("pause");
+}
+
+static void scratch_release(void) { __sync_lock_release(&scratch_lock); }
+
 #ifdef __x86_64__
 /* ===========================================================================
  * 64-bit (long mode): four-level paging.
@@ -78,6 +97,8 @@ static inline void invlpg(uint64_t va) { __asm__ volatile("invlpg (%0)" : : "r"(
 
 void *palloc(void)
 {
+  uintptr_t flags = irq_save();
+  page_pool_acquire();
   uint32_t page;
   if (pool_free) {
     page = pool_free;
@@ -86,18 +107,26 @@ void *palloc(void)
     page = pool_next;
     pool_next += 4096;
   } else {
+    page_pool_release();
+    irq_restore(flags);
     return 0; /* pool exhausted                  */
   }
   uint64_t *p = (uint64_t *)(uintptr_t)page;
   for (int i = 0; i < 512; i++)
     p[i] = 0; /* hand out zeroed frames          */
+  page_pool_release();
+  irq_restore(flags);
   return p;
 }
 
 void pfree(void *page)
 {
+  uintptr_t flags = irq_save();
+  page_pool_acquire();
   *(uint32_t *)page = pool_free;
   pool_free = (uint32_t)(uintptr_t)page;
+  page_pool_release();
+  irq_restore(flags);
 }
 
 void paging_init(void)
@@ -486,6 +515,8 @@ void *paging_scratch_map(int slot, uint32_t phys)
 {
   if (slot < 0 || slot >= PAGING_SCRATCH_SLOTS)
     return 0;
+  if (slot == 0)
+    scratch_acquire();
   uint64_t va = SCRATCH_VADDR + (uint64_t)slot * 4096;
   scratch_pt[LVL1(va)] = ((uint64_t)phys & PG_ADDR) | PAGE_PRESENT | PAGE_RW;
   invlpg(va);
@@ -499,6 +530,8 @@ void paging_scratch_unmap(int slot)
   uint64_t va = SCRATCH_VADDR + (uint64_t)slot * 4096;
   scratch_pt[LVL1(va)] = 0;
   invlpg(va);
+  if (slot == 0)
+    scratch_release();
 }
 
 void paging_mark_wc(uint32_t virt, uint32_t len)
@@ -608,6 +641,8 @@ uint32_t paging_kernel_phys(void) { return (uint32_t)page_directory; }
 
 void *palloc(void)
 {
+  uintptr_t flags = irq_save();
+  page_pool_acquire();
   uint32_t page;
   if (pool_free) {
     page = pool_free;
@@ -616,23 +651,33 @@ void *palloc(void)
     page = pool_next;
     pool_next += 4096;
   } else {
+    page_pool_release();
+    irq_restore(flags);
     return 0; /* pool exhausted                  */
   }
   for (int i = 0; i < 1024; i++)
     ((uint32_t *)page)[i] = 0; /* hand out zeroed frames          */
+  page_pool_release();
+  irq_restore(flags);
   return (void *)page;
 }
 
 void pfree(void *page)
 {
+  uintptr_t flags = irq_save();
+  page_pool_acquire();
   *(uint32_t *)page = pool_free;
   pool_free = (uint32_t)page;
+  page_pool_release();
+  irq_restore(flags);
 }
 
 void *paging_scratch_map(int slot, uint32_t phys)
 {
   if (slot < 0 || slot >= PAGING_SCRATCH_SLOTS)
     return 0;
+  if (slot == 0)
+    scratch_acquire();
   uint32_t va = SCRATCH_VADDR + (uint32_t)slot * 4096;
   scratch_pt[(va >> 12) & 0x3FF] = (phys & ~0xFFFu) | PAGE_PRESENT | PAGE_RW;
   __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
@@ -646,6 +691,8 @@ void paging_scratch_unmap(int slot)
   uint32_t va = SCRATCH_VADDR + (uint32_t)slot * 4096;
   scratch_pt[(va >> 12) & 0x3FF] = 0;
   __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
+  if (slot == 0)
+    scratch_release();
 }
 
 /* --- per-process address spaces ------------------------------------------- */

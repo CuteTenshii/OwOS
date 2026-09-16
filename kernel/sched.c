@@ -13,6 +13,7 @@
 #include "paging.h"
 #include "pipe.h"
 #include "signal.h"
+#include "smp.h"
 #include "syscall.h"
 #include "syscall_nr.h"
 #include "timer.h"
@@ -84,6 +85,9 @@ typedef struct task {
   uint32_t uid;           /* owning user id (credentials; inherited like cwd)    */
   uint32_t gid;           /* owning primary group id                             */
   struct task *next;
+  int running_cpu;
+  uint8_t kernel_lock_depth;
+  uint8_t kernel_lock_reacquire;
 } task_t;
 
 /* Copy a path into a fixed buffer, NUL-terminating (truncates if too long). */
@@ -141,10 +145,78 @@ extern void enter_user_task(void);
 extern void fork_child_entry(void);
 
 static task_t main_task; /* permanent head of the circular run queue (never freed) */
+static task_t idle_tasks[SMP_MAX_CPUS];
+static task_t *current_tasks[SMP_MAX_CPUS];
+static task_t *switching_tasks[SMP_MAX_CPUS];
+static volatile uint32_t scheduler_lock;
+static volatile uint32_t kernel_lock;
+static volatile int kernel_lock_cpu = -1;
 static int count;
 static uint32_t next_id;
-static task_t *current;
 static int detached_zombies; /* self_reap threads that have exited, awaiting free */
+
+#define current (current_tasks[smp_this_cpu()])
+
+static int task_running(const task_t *task)
+{
+  for (int i = 0; i < SMP_MAX_CPUS; i++)
+    if (current_tasks[i] == task || switching_tasks[i] == task)
+      return 1;
+  return 0;
+}
+
+static void sched_lock(void)
+{
+  while (__sync_lock_test_and_set(&scheduler_lock, 1))
+    __asm__ volatile("pause");
+}
+
+static void sched_unlock(void) { __sync_lock_release(&scheduler_lock); }
+
+void sched_kernel_enter(void)
+{
+  int cpu = smp_this_cpu();
+  if (kernel_lock_cpu == cpu) {
+    current->kernel_lock_depth++;
+    return;
+  }
+  while (__sync_lock_test_and_set(&kernel_lock, 1))
+    __asm__ volatile("pause");
+  kernel_lock_cpu = cpu;
+  current->kernel_lock_depth = 1;
+}
+
+void sched_kernel_leave(void)
+{
+  if (!current || current->kernel_lock_depth == 0)
+    return;
+  if (--current->kernel_lock_depth == 0) {
+    kernel_lock_cpu = -1;
+    __sync_lock_release(&kernel_lock);
+  }
+}
+
+static void sched_kernel_switch_out(void)
+{
+  if (!current || current->kernel_lock_depth == 0)
+    return;
+  current->kernel_lock_reacquire = current->kernel_lock_depth;
+  current->kernel_lock_depth = 0;
+  kernel_lock_cpu = -1;
+  __sync_lock_release(&kernel_lock);
+}
+
+void sched_kernel_switch_in(void)
+{
+  uint8_t depth = current ? current->kernel_lock_reacquire : 0;
+  if (!depth)
+    return;
+  while (__sync_lock_test_and_set(&kernel_lock, 1))
+    __asm__ volatile("pause");
+  kernel_lock_cpu = smp_this_cpu();
+  current->kernel_lock_depth = depth;
+  current->kernel_lock_reacquire = 0;
+}
 
 /* Allocate a zeroed task node off the kernel heap (NOT yet on the run queue —
  * the creator fills it in and calls enqueue()). Returns 0 if the heap is full,
@@ -187,9 +259,14 @@ static void address_space_put(address_space_t *as)
  * the queue mid-enqueue always sees a consistent list. */
 static void enqueue(task_t *t)
 {
+  uintptr_t flags = irq_save();
+  sched_lock();
   t->next = main_task.next;
+  t->running_cpu = -1;
   main_task.next = t;
   count++;
+  sched_unlock();
+  irq_restore(flags);
 }
 
 /* Return trampoline for a kernel thread whose body returned. Exit cleanly
@@ -222,10 +299,38 @@ void sched_init(void)
   t->uid = t->gid = 0; /* the boot session runs as root            */
   cwd_set(t->cwd, "/");
   t->next = t;
-  current = t;
+  t->running_cpu = 0;
+  for (int i = 0; i < SMP_MAX_CPUS; i++)
+    current_tasks[i] = 0;
+  current_tasks[0] = t;
   count = 1;
 
   timer_on_tick(schedule);
+}
+
+void sched_init_cpu(int cpu)
+{
+  task_t *idle;
+  if (cpu <= 0 || cpu >= SMP_MAX_CPUS)
+    return;
+  idle = &idle_tasks[cpu];
+  for (unsigned i = 0; i < sizeof *idle; i++)
+    ((uint8_t *)idle)[i] = 0;
+  idle->name = "idle";
+  idle->state = TASK_RUNNABLE;
+  idle->running_cpu = cpu;
+  idle->process = idle;
+  current_tasks[cpu] = idle;
+}
+
+void sched_start_cpu(int cpu)
+{
+  if (cpu <= 0 || cpu >= SMP_MAX_CPUS)
+    return;
+  for (;;) {
+    schedule();
+    __asm__ volatile("hlt");
+  }
 }
 
 void sched_create_thread(const char *name, void (*entry)(void))
@@ -579,7 +684,7 @@ static task_t *find_task(uint32_t id)
  * off so a timer tick can't walk the queue mid-splice or touch the node as it's
  * removed; the page-dir/stack/node frees then run normally (t is already off
  * the queue and is never `current`, so nothing can reach it). */
-static void reap_task(task_t *t)
+static void reap_task_locked(task_t *t)
 {
   uintptr_t fl = irq_save();
 
@@ -593,7 +698,7 @@ static void reap_task(task_t *t)
   if (t->as_owner) {
     task_t *s = t->next;
     while (s != t) {
-      if (s != &main_task && s != current && s->as == t->as && !s->as_owner && s->state != TASK_FREE)
+      if (s != &main_task && !task_running(s) && s->as == t->as && !s->as_owner && s->state != TASK_FREE)
         s->state = TASK_ZOMBIE;
       s = s->next;
     }
@@ -614,7 +719,7 @@ static void reap_task(task_t *t)
     for (;;) {
       task_t *th = 0, *s = main_task.next;
       while (s != &main_task) {
-        if (s != current && s->as == t->as && !s->as_owner) {
+        if (!task_running(s) && s->as == t->as && !s->as_owner) {
           th = s;
           break;
         }
@@ -645,6 +750,15 @@ static void reap_task(task_t *t)
   kfree(t);
 }
 
+static void reap_task(task_t *t)
+{
+  uintptr_t flags = irq_save();
+  sched_lock();
+  reap_task_locked(t);
+  sched_unlock();
+  irq_restore(flags);
+}
+
 /* Free any detached kernel thread that has exited. Such a thread's parent is
  * main_task, which never waitpid's it, so its node + 64 KiB kstack would leak
  * as a permanent zombie. It can't free itself (it runs on that kstack), so the
@@ -656,7 +770,7 @@ static void reap_detached(void)
   while (detached_zombies > 0) {
     task_t *z = 0, *t = main_task.next;
     while (t != &main_task) {
-      if (t != current && t->self_reap && t->state == TASK_ZOMBIE) {
+      if (!task_running(t) && t->self_reap && t->state == TASK_ZOMBIE) {
         z = t;
         break;
       }
@@ -664,7 +778,7 @@ static void reap_detached(void)
     }
     if (!z)
       break;
-    reap_task(z);
+    reap_task_locked(z);
     detached_zombies--;
   }
 }
@@ -767,6 +881,7 @@ void sched_sleep_until(uint32_t wake)
  * alone. */
 void sched_wake_due(uint32_t now)
 {
+  sched_lock();
   task_t *t = &main_task;
   do {
     if (t->state == TASK_WAITING && t->wake_tick && (int32_t)(now - t->wake_tick) >= 0) {
@@ -775,6 +890,7 @@ void sched_wake_due(uint32_t now)
     }
     t = t->next;
   } while (t != &main_task);
+  sched_unlock();
 }
 
 void sched_exit(int status)
@@ -1104,7 +1220,7 @@ static task_t *zombie_child(int pid)
 {
   task_t *t = &main_task;
   do {
-    if (t->state == TASK_ZOMBIE && t->parent == current->id && (pid < 0 || (int)t->id == pid))
+    if (t->state == TASK_ZOMBIE && !task_running(t) && t->parent == current->id && (pid < 0 || (int)t->id == pid))
       return t;
     t = t->next;
   } while (t != &main_task);
@@ -1209,21 +1325,37 @@ void schedule(void)
    * context_switch does not touch EFLAGS, so IF stays cleared across the swap
    * until this restore (or thread_start's own `sti` for a first run). */
   uintptr_t flags = irq_save();
+  int cpu = smp_this_cpu();
 
+  sched_lock();
+  switching_tasks[cpu] = 0;
   reap_detached(); /* free any exited detached kernel thread    */
 
-  task_t *prev = current;
-  task_t *next = prev->next;
-  while (next->state != TASK_RUNNABLE)
+  task_t *prev = current_tasks[cpu];
+  task_t *idle = cpu == 0 ? &main_task : &idle_tasks[cpu];
+  prev->running_cpu = -1;
+  task_t *next = prev == idle ? main_task.next : prev->next;
+  while (next != &main_task && (next->state != TASK_RUNNABLE || task_running(next)))
     next = next->next; /* always finds main if nothing else        */
+  if (next == &main_task && (cpu != 0 || main_task.state != TASK_RUNNABLE || task_running(&main_task)))
+    next = 0;
+  if (!next)
+    next = idle;
+  next->running_cpu = cpu;
   if (next != prev) {
-    current = next;
+    sched_kernel_switch_out();
+    switching_tasks[cpu] = prev;
+    current_tasks[cpu] = next;
     current->runs++;
     if (current->kstack_top)
       tss_set_kernel_stack(current->kstack_top);
     if (task_cr3(current) != task_cr3(prev))
       paging_load((uint32_t *)task_cr3(current));
+    sched_unlock();
     context_switch(&prev->esp, current->esp);
+    sched_kernel_switch_in();
+  } else {
+    sched_unlock();
   }
 
   if (flags & 0x200) /* restore the caller's interrupt flag       */

@@ -23,6 +23,7 @@
 #include "hfs.h"
 #include "idt.h"
 #include "irq.h"
+#include "irqflags.h"
 #include "iso9660.h"
 #include "keyboard.h"
 #include "loader.h"
@@ -57,6 +58,24 @@
  * boot=...). Updated by bootmark(). */
 const char *g_boot_stage = "early";
 static void bootmark(const char *s) { g_boot_stage = s; }
+
+static void shell_feed_locked(char c)
+{
+  uintptr_t flags = irq_save();
+  sched_kernel_enter();
+  shell_feed(c);
+  sched_kernel_leave();
+  irq_restore(flags);
+}
+
+static void shell_interrupt_locked(void)
+{
+  uintptr_t flags = irq_save();
+  sched_kernel_enter();
+  shell_interrupt();
+  sched_kernel_leave();
+  irq_restore(flags);
+}
 
 /* Install an embedded program/asset blob to owofs, (re)creating it when absent
  * OR when the on-disk size differs from the built-in blob. The size check makes
@@ -473,7 +492,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   bootmark("sti");
   __asm__ volatile("sti"); /* interrupts on; preemption begins        */
 
-  smp_start_aps(); /* wake the other cores (they park for now) */
+  smp_start_aps(); /* wake the other cores and start their schedulers */
 
   /* DHCP + xHCI + /media mount are slow on real hardware (timer_sleep-based
    * retries/resets). Run them in a background thread so the shell input loop
@@ -497,16 +516,16 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
      * always drives the shell (it's the debug console + test harness). */
     if (!uwin_compositor_active()) {
       if (keyboard_take_interrupt()) /* Ctrl+C -> cancel the shell line */
-        shell_interrupt();
+        shell_interrupt_locked();
       while (keyboard_poll(&c, &mods))
-        shell_feed(c);
+        shell_feed_locked(c);
     }
     /* else: the compositor owns the keyboard — it drains both the keys AND the
      * Ctrl+C latch itself via SYS_INPUT_POLL (which surfaces the interrupt as a
      * KEY_INTR event to the focused window). The kernel must not consume either
      * here, or it would race the compositor for them. */
     while (serial_poll(&c))  /* host terminal (-serial stdio)    */
-      shell_feed(c);         /* the debug console always drives shell */
+      shell_feed_locked(c);  /* the debug console always drives shell */
     __asm__ volatile("hlt"); /* sleep until the next interrupt          */
   }
 }
