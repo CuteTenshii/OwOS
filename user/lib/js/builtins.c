@@ -44,25 +44,34 @@ static js_value symbol_tostring(js_ctx *ctx, js_value t, js_value *a, int n);
 typedef struct {
   char *b;
   int n, cap;
+  int failed;
 } sbuf;
-static void sb_need(sbuf *s, int extra)
+static int sb_need(sbuf *s, int extra)
 {
   if (s->n + extra + 1 > s->cap) {
     int c = s->cap ? s->cap * 2 : 64;
     while (c < s->n + extra + 1)
       c *= 2;
-    s->b = (char *)realloc(s->b, (unsigned)c);
+    char *b = (char *)realloc(s->b, (unsigned)c);
+    if (!b) {
+      s->failed = 1;
+      return 0;
+    }
+    s->b = b;
     s->cap = c;
   }
+  return 1;
 }
 static void sb_putc(sbuf *s, char c)
 {
-  sb_need(s, 1);
+  if (!sb_need(s, 1))
+    return;
   s->b[s->n++] = c;
 }
 static void sb_put(sbuf *s, const char *t, int n)
 {
-  sb_need(s, n);
+  if (!sb_need(s, n))
+    return;
   memcpy(s->b + s->n, t, (unsigned)n);
   s->n += n;
 }
