@@ -16,7 +16,7 @@ INCLUDES=(
 
 for source in "$ROOT"/tests/*_test.c; do
 	[ -f "$source" ] || continue
-	if ! rg -q '^#define OWOS_SUITE_TEST$' "$source"; then
+	if ! grep -q '^#define OWOS_SUITE_TEST$' "$source"; then
 		continue
 	fi
 	file=${source##*/}
