@@ -5,29 +5,22 @@
  * __int128; large values against known decimal strings.
  *
  *   cc -std=c11 -Iscripts -Iuser/lib -Iuser/lib/math \
- *      scripts/bigint_test.c user/lib/js/bigint.c -lm \
+ *      tests/bigint_test.c user/lib/js/bigint.c -lm \
  *      -o /tmp/bigint_test && /tmp/bigint_test
  */
 #include "bigint.h"
+#define OWOS_SUITE_TEST
+#include "test.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-static int fails = 0;
-static int checks = 0;
-
-static void fail(const char *what, const char *got, const char *want) {
-    printf("  FAIL %s: got %s, want %s\n", what, got, want);
-    fails++;
-}
-
 static void expect_str(bigint *b, int radix, const char *want, const char *what) {
     char *s;
-    checks++;
-    if (!b) { fail(what, "(null)", want); return; }
+    if (!b) { printf("  %s: null result\n", what); expect(0); return; }
     s = bi_to_str(b, radix);
-    if (!s) { fail(what, "(oom)", want); return; }
-    if (strcmp(s, want) != 0) fail(what, s, want);
+    if (!s) { printf("  %s: out of memory\n", what); expect(0); return; }
+    owos_expect_string(s, want, __FILE__, __LINE__, what);
     free(s);
 }
 
@@ -53,19 +46,21 @@ static void check_pair(long long x, long long y) {
         if (bi_divmod(a, b, &q, &r) == 1) {
             expect_str(q, 10, i128_str((__int128)x / y), "div");
             expect_str(r, 10, i128_str((__int128)x % y), "mod");
-        } else fail("divmod-rc", "err", "ok");
+        } else { printf("  divmod-rc: error\n"); expect(0); }
     }
     bi_free(a); bi_free(b);
 }
 
 int main(void) {
-    /* round trips */
+	/* round trips */
+	test("integer round-trips");
     expect_str(bi_from_i64(0), 10, "0", "zero");
     expect_str(bi_from_i64(-1), 10, "-1", "neg1");
     expect_str(bi_from_i64(9223372036854775807LL), 10, "9223372036854775807", "i64max");
     expect_str(bi_from_i64(-9223372036854775807LL - 1), 10, "-9223372036854775808", "i64min");
 
-    /* arithmetic vs __int128 over a deterministic grid */
+	/* arithmetic vs __int128 over a deterministic grid */
+	test("arithmetic and division grid");
     {
         long long v[] = { 0, 1, -1, 2, 7, -7, 255, 65536, -65536,
                           2147483647LL, -2147483648LL, 4294967296LL,
@@ -75,7 +70,8 @@ int main(void) {
         for (i = 0; i < n; i++) for (j = 0; j < n; j++) check_pair(v[i], v[j]);
     }
 
-    /* large exact values */
+	/* large exact values */
+	test("large exact values");
     {
         bigint *two = bi_from_i64(2), *e64 = bi_from_i64(64), *ten = bi_from_i64(10), *e20 = bi_from_i64(20);
         int rc;
@@ -84,7 +80,8 @@ int main(void) {
         bi_free(two); bi_free(e64); bi_free(ten); bi_free(e20);
     }
 
-    /* factorial 25! = 15511210043330985984000000 */
+	/* factorial 25! = 15511210043330985984000000 */
+	test("factorial");
     {
         bigint *acc = bi_from_i64(1);
         int i;
@@ -93,7 +90,8 @@ int main(void) {
         bi_free(acc);
     }
 
-    /* shifts */
+	/* shifts */
+	test("bit shifts");
     {
         bigint *one = bi_from_i64(1), *r;
         r = bi_shl(one, 64); expect_str(r, 10, "18446744073709551616", "1<<64"); bi_free(r);
@@ -111,7 +109,8 @@ int main(void) {
         }
     }
 
-    /* bitwise two's complement */
+	/* bitwise two's complement */
+	test("bitwise operations");
     {
         bigint *a = bi_from_i64(0xF0), *b = bi_from_i64(0x0F), *r;
         r = bi_and(a, b); expect_str(r, 10, "0", "0xF0 & 0x0F"); bi_free(r);
@@ -127,7 +126,8 @@ int main(void) {
         }
     }
 
-    /* asUintN / asIntN — snowflake-style wrapping */
+	/* asUintN / asIntN — snowflake-style wrapping */
+	test("fixed-width wrapping");
     {
         bigint *v = bi_from_i64(-1), *r;
         r = bi_as_uintn(64, v); expect_str(r, 10, "18446744073709551615", "asUintN(64,-1)"); bi_free(r);
@@ -150,9 +150,9 @@ int main(void) {
         expect_str(bi_from_str("1_000_000", (int)strlen("1_000_000"), &ok), 10, "1000000", "1_000_000");
         expect_str(bi_from_str("  -42  ", (int)strlen("  -42  "), &ok), 10, "-42", "trim -42");
         expect_str(bi_from_str("", 0, &ok), 10, "0", "empty->0");
-        checks++; if (ok != 1) fail("empty ok", "0", "1");
-        bi_from_str("12x", (int)strlen("12x"), &ok); checks++; if (ok != 0) fail("bad-str ok", "1", "0");
-        bi_from_str("0x", (int)strlen("0x"), &ok);  checks++; if (ok != 0) fail("lone-0x ok", "1", "0");
+        expect(ok == 1);
+        bi_from_str("12x", (int)strlen("12x"), &ok); expect(ok == 0);
+        bi_from_str("0x", (int)strlen("0x"), &ok);  expect(ok == 0);
     }
 
     /* from_double */
@@ -160,18 +160,17 @@ int main(void) {
         int ok;
         expect_str(bi_from_double(9007199254740992.0, &ok), 10, "9007199254740992", "double 2^53");
         expect_str(bi_from_double(1e21, &ok), 10, "1000000000000000000000", "double 1e21");
-        bi_from_double(1.5, &ok); checks++; if (ok != 0) fail("1.5 ok", "1", "0");
+        bi_from_double(1.5, &ok); expect(ok == 0);
     }
 
     /* divide by zero + cmp */
     {
         bigint *a = bi_from_i64(5), *z = bi_from_i64(0), *q, *r;
-        checks++; if (bi_divmod(a, z, &q, &r) != -1) fail("div0", "!=-1", "-1");
-        checks++; if (bi_cmp(bi_from_i64(-3), bi_from_i64(2)) != -1) fail("cmp -3<2", "?", "-1");
-        checks++; if (bi_cmp(bi_from_i64(100), bi_from_i64(100)) != 0) fail("cmp eq", "?", "0");
+        expect(bi_divmod(a, z, &q, &r) == -1);
+        expect(bi_cmp(bi_from_i64(-3), bi_from_i64(2)) == -1);
+        expect(bi_cmp(bi_from_i64(100), bi_from_i64(100)) == 0);
         bi_free(a); bi_free(z);
     }
 
-    printf("%d checks, %d failures\n", checks, fails);
-    return fails ? 1 : 0;
+    return 0;
 }

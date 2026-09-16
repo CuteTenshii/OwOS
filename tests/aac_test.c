@@ -8,7 +8,7 @@
  *
  * Build + run (see scripts/aac_gen.sh which generates the vectors):
  *   cc -std=c11 -Iscripts -Iuser/lib/math -Iuser/lib/aac \
- *      scripts/aac_test.c user/lib/aac/aac.c -lm -o /tmp/aac_test
+ *      tests/aac_test.c user/lib/aac/aac.c -lm -o /tmp/aac_test
  *   /tmp/aac_test in.aac ref.s16
  */
 #include "owos.h"
@@ -89,6 +89,6 @@ int main(int argc, char **argv)
 	/* A correct decoder differs from ffmpeg only by float rounding (and any PNS
 	 * bands, which are random): expect well above 60 dB on tonal content. */
 	int ok = psnr >= 60.0;
-	printf("%s\n", ok ? "PASS" : "FAIL");
-	return ok ? 0 : 1;
+	expect(ok);
+	return 0;
 }

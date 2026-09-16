@@ -29,8 +29,9 @@ make clean                   # Remove build artifacts, keeping disk images
 
 For integration checks, first build the kernel, then run for example:
 `scripts/qemu-test.sh -- "ls -l /home/root"`. Host unit tests are individual C
-programs in `scripts/`; each file documents its compile and execution command in
-its opening comment. No aggregate test or lint target exists.
+programs in `tests/`; each file documents its compile and execution command in
+its opening comment. `make test` runs the deterministic host suite. No aggregate
+lint target exists.
 
 ## Coding Style and Naming
 

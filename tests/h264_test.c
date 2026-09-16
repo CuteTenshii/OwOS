@@ -10,7 +10,7 @@
  *          -c:v libx264 -profile:v baseline -g 1 -pix_fmt yuv420p \
  *          -bsf:v h264_mp4toannexb -f h264 /tmp/h264_intra.264
  *   ffmpeg -y -i /tmp/h264_intra.264 -f rawvideo -pix_fmt yuv420p /tmp/h264_intra.yuv
- *   cc -std=c11 -Iscripts -Iuser/lib/h264 scripts/h264_test.c user/lib/h264/*.c \
+ *   cc -std=c11 -Iscripts -Iuser/lib/h264 tests/h264_test.c user/lib/h264/*.c \
  *      -lm -o /tmp/h264_test
  *   /tmp/h264_test /tmp/h264_intra.264 /tmp/h264_intra.yuv 176 144
  */

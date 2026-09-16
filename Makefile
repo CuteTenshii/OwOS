@@ -17,7 +17,7 @@
 #   run.mk                  disk images + the QEMU run/debug/iso/usb targets
 
 .DEFAULT_GOAL := all
-.PHONY: all run debug iso run-iso run-iso-uefi usb clean distclean
+.PHONY: all test run debug iso run-iso run-iso-uefi usb clean distclean
 
 include toolchain.mk
 include user/lib/build.mk
@@ -26,6 +26,9 @@ include kernel/build.mk
 include run.mk
 
 all: $(KERNEL)
+
+test:
+	./scripts/run-tests.sh
 
 clean:
 	rm -f $(OBJS) owos.bin owos-x86_64.bin $(ISO) .arch.*

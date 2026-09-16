@@ -8,13 +8,14 @@
  * "show"/"close" events are the real logic verified here.
  *
  *   cc -std=gnu11 -Iscripts -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc \
- *      scripts/notification_test.c user/lib/js/lexer.c user/lib/js/parser.c \
+ *      tests/notification_test.c user/lib/js/lexer.c user/lib/js/parser.c \
  *      user/lib/js/ast.c user/lib/js/value.c user/lib/js/interp.c \
  *      user/lib/js/builtins.c user/lib/js/bigint.c user/lib/math/math.c \
  *      user/lib/math/fmt.c user/lib/gc/gc.c -o /tmp/notification_test \
  *      && /tmp/notification_test
  */
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include <stdlib.h>
 #include <string.h>
 #include "ast.h"
@@ -233,21 +234,23 @@ static js_value host_promise_val(js_ctx *ctx, js_value t, js_value *a, int n) {
     return js_undef();
 }
 
-static int g_fail;
 static void con_print(js_ctx *ctx, int level, const char *s, int len) {
-    (void)ctx;
-    if (level >= 3 || (len >= 4 && !strncmp(s, "FAIL", 4))) g_fail = 1;
-    printf("%.*s\n", len, s);
+	(void)ctx; (void)level; (void)s; (void)len;
+}
+static js_value test_expect(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
+	(void)thisv;
+	expect(argc > 0 && js_to_boolean(args[0]));
+	return js_undef();
 }
 static void run(js_ctx *ctx, const char *src) {
     js_arena a; js_parse_error err = { 0, 0 }; js_node *prog; js_value result;
     js_arena_init(&a);
     prog = js_parse(src, &a, &err);
-    if (!prog) { printf("PARSE ERROR: %s\n", err.msg ? err.msg : "?"); g_fail = 1; js_arena_free(&a); return; }
+	if (!prog) { expect(0); js_arena_free(&a); return; }
     if (js_run(ctx, prog, &result) != 0) {
         js_value msg = js_get(ctx, ctx->exc, "message");
         printf("UNCAUGHT: %s\n", msg.type == JV_STR ? msg.u.str->data : "(err)");
-        g_fail = 1;
+		expect(0);
     }
     js_arena_free(&a);
 }
@@ -273,72 +276,68 @@ int main(void) {
     js_def(g_ctx->global, "Notification", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
     js_def_native(g_ctx, g_ctx->global, "__pump", host_pump, 0);
     js_def_native(g_ctx, g_ctx->global, "__promiseVal", host_promise_val, 1);
+	js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
 
+	test("Notification API and event lifecycle");
     run(g_ctx,
-        "function ok(c,m){ console.log((c?'ok  ':'FAIL ')+m); }\n"
+		"\n"
         /* surface */
-        "ok(typeof Notification==='function','Notification is a constructor');\n"
-        "ok(Notification.permission==='granted','permission is granted');\n"
-        "ok(Notification.maxActions===3,'maxActions === 3');\n"
-        "ok(typeof Notification.requestPermission==='function','requestPermission present');\n"
+        "expect(typeof Notification==='function','Notification is a constructor');\n"
+        "expect(Notification.permission==='granted','permission is granted');\n"
+        "expect(Notification.maxActions===3,'maxActions === 3');\n"
+        "expect(typeof Notification.requestPermission==='function','requestPermission present');\n"
         /* requestPermission: legacy callback + Promise both resolve granted */
         "var cbVal=null;\n"
         "var p=Notification.requestPermission(function(v){ cbVal=v; });\n"
-        "ok(cbVal==='granted','legacy callback got granted');\n"
-        "ok(typeof p.then==='function','requestPermission returns a thenable');\n"
-        "ok(__promiseVal(p)==='granted','requestPermission promise fulfils granted');\n"
+        "expect(cbVal==='granted','legacy callback got granted');\n"
+        "expect(typeof p.then==='function','requestPermission returns a thenable');\n"
+        "expect(__promiseVal(p)==='granted','requestPermission promise fulfils granted');\n"
         /* construction: title required */
         "var threw=false; try { new Notification(); } catch(e){ threw = e instanceof TypeError; }\n"
-        "ok(threw,'no-arg construction throws TypeError');\n"
+        "expect(threw,'no-arg construction throws TypeError');\n"
         /* options mapping + defaults */
         "var n=new Notification('Hello',{body:'World',icon:'/i.png',tag:'t',dir:'rtl',requireInteraction:true});\n"
-        "ok(n instanceof Notification,'instance is a Notification');\n"
-        "ok(n.title==='Hello','title set');\n"
-        "ok(n.body==='World','body set');\n"
-        "ok(n.icon==='/i.png','icon set');\n"
-        "ok(n.tag==='t','tag set');\n"
-        "ok(n.dir==='rtl','dir set');\n"
-        "ok(n.requireInteraction===true,'requireInteraction set');\n"
-        "ok(n.silent===false,'silent defaults false');\n"
+        "expect(n instanceof Notification,'instance is a Notification');\n"
+        "expect(n.title==='Hello','title set');\n"
+        "expect(n.body==='World','body set');\n"
+        "expect(n.icon==='/i.png','icon set');\n"
+        "expect(n.tag==='t','tag set');\n"
+        "expect(n.dir==='rtl','dir set');\n"
+        "expect(n.requireInteraction===true,'requireInteraction set');\n"
+        "expect(n.silent===false,'silent defaults false');\n"
         "var n2=new Notification('Bare');\n"
-        "ok(n2.body==='' && n2.dir==='auto' && n2.tag==='','defaults for omitted options');\n"
+        "expect(n2.body==='' && n2.dir==='auto' && n2.tag==='','defaults for omitted options');\n"
         /* events fire only after the pump, and exactly once */
         "var shows=0, closes=0;\n"
         "n.onshow=function(){ shows++; };\n"
         "n.addEventListener('show', function(){ shows++; });\n"
         "n.onclose=function(){ closes++; };\n"
-        "ok(shows===0,'show has not fired before pump');\n"
+        "expect(shows===0,'show has not fired before pump');\n"
         "__pump();\n"
-        "ok(shows===2,'show fired onshow + listener once each');\n"
+        "expect(shows===2,'show fired onshow + listener once each');\n"
         "__pump();\n"
-        "ok(shows===2,'show does not re-fire on a second pump');\n"
-        "ok(closes===0,'close not fired until close()');\n"
+        "expect(shows===2,'show does not re-fire on a second pump');\n"
+        "expect(closes===0,'close not fired until close()');\n"
         "n.close();\n"
-        "ok(closes===0,'close() defers the event to the pump');\n"
+        "expect(closes===0,'close() defers the event to the pump');\n"
         "__pump();\n"
-        "ok(closes===1,'close fired once after pump');\n"
+        "expect(closes===1,'close fired once after pump');\n"
         "__pump();\n"
-        "ok(closes===1,'close does not re-fire');\n"
+        "expect(closes===1,'close does not re-fire');\n"
         /* a show handler creating a new Notification is not lost */
         "var chain=0;\n"
         "var trigger=new Notification('Trigger');\n"
         "trigger.onshow=function(){ chain++; if(chain===1){ var x=new Notification('Child'); x.onshow=function(){ chain++; }; } };\n"
         "__pump();\n"          /* fires Trigger.show (creates Child) */
         "__pump();\n"          /* fires Child.show */
-        "ok(chain===2,'notification created inside a show handler still gets its show');\n"
+        "expect(chain===2,'notification created inside a show handler still gets its show');\n"
     );
 
     /* C-side: every granted-permission construction posted to (stubbed) notifyd
      * (Hello, Bare, Trigger, Child = 4); the last was Child. The no-arg attempt
      * threw before posting, so it is not counted. */
-    if (g_sent != 4 || !streqs(g_last_title, "Child")) {
-        printf("FAIL notify_send not invoked as expected (sent=%d last='%s')\n", g_sent, g_last_title);
-        g_fail = 1;
-    } else {
-        printf("ok  notify_send posted %d desktop notifications\n", g_sent);
-    }
+	expect(g_sent == 4 && streqs(g_last_title, "Child"));
 
-    js_ctx_free(g_ctx);
-    printf(g_fail ? "\n=== FAILED ===\n" : "\n=== ALL PASS ===\n");
-    return g_fail ? 1 : 0;
+	js_ctx_free(g_ctx);
+	return 0;
 }

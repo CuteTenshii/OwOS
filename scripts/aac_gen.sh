@@ -8,7 +8,7 @@ mkdir -p "$DIR"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 cc -std=c11 -Iscripts -Iuser/lib/math -Iuser/lib/aac \
-   "$ROOT/scripts/aac_test.c" "$ROOT/user/lib/aac/aac.c" -lm -o "$DIR/aac_test"
+   "$ROOT/tests/aac_test.c" "$ROOT/user/lib/aac/aac.c" -lm -o "$DIR/aac_test"
 
 # -aac_pns 0 keeps the comparison deterministic: perceptual noise substitution
 # fills bands with a decoder-private random sequence, so a PNS band never matches

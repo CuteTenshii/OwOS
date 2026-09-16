@@ -7,22 +7,15 @@
  * *built* request is only exact up to the first odd-length attribute's padding;
  * that structural prefix is checked explicitly.  Build:
  *   cc -std=c11 -Iscripts -Iuser/lib/stun -Iuser/lib/crypto -Iuser/lib/resolve \
- *      -Iuser/lib/zlib scripts/stun_test.c user/lib/stun/stun.c \
+ *      -Iuser/lib/zlib tests/stun_test.c user/lib/stun/stun.c \
  *      user/lib/crypto/crypto.c user/lib/zlib/crc32.c \
  *      -o /tmp/stun_test && /tmp/stun_test
  */
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include <string.h>
 #include "owos.h"
 #include "stun.h"
-
-static int fails = 0;
-
-static void ok(const char *name, int cond)
-{
-	printf("%s %s\n", cond ? "PASS" : "FAIL", name);
-	if (!cond) fails++;
-}
 
 /* Parse a hex string (spaces ignored) into out; returns the byte count. */
 static int hex(const char *s, unsigned char *out, int max)
@@ -55,31 +48,34 @@ int main(void)
 	int rn, pn;
 
 	pn = hex(RESP_HEX, resp, sizeof resp);
-	ok("resp length == 80", pn == 80);
+	expect(pn == 80);
 
 	/* --- §2.2 XOR-MAPPED-ADDRESS decode --- */
+	test("RFC 5769 response decode");
 	{
 		stun_addr a;
 		int got = stun_get_mapped(resp, pn, &a);
-		ok("resp is valid STUN", stun_valid(resp, pn));
-		ok("resp type == Binding success", stun_type(resp) == STUN_BINDING_SUCCESS);
-		ok("xor-mapped decodes", got &&
+		expect(stun_valid(resp, pn));
+		expect(stun_type(resp) == STUN_BINDING_SUCCESS);
+		expect(got &&
 		   a.ip[0] == 192 && a.ip[1] == 0 && a.ip[2] == 2 && a.ip[3] == 1 &&
 		   a.port == 32853);
 	}
 
 	/* --- §2.2 MESSAGE-INTEGRITY (HMAC-SHA1) verify against exact bytes --- */
-	ok("resp message-integrity verifies",
+	test("MESSAGE-INTEGRITY verification");
+	expect(
 	   stun_check_integrity(resp, pn, PASS, (int)strlen(PASS)) == 1);
 	{
 		unsigned char bad[STUN_MAX];
 		memcpy(bad, resp, (size_t)pn);
 		bad[24] ^= 0x01;   /* flip a byte inside SOFTWARE (covered by the HMAC) */
-		ok("resp message-integrity rejects tamper",
+		expect(
 		   stun_check_integrity(bad, pn, PASS, (int)strlen(PASS)) == 0);
 	}
 
 	/* --- §2.1 request: rebuild the exact bytes and verify integrity --- */
+	test("RFC 5769 request verification");
 	{
 		/* Assemble the RFC request byte-for-byte (0x20 USERNAME padding). */
 		static const unsigned char REQ[] = {
@@ -96,13 +92,14 @@ int main(void)
 		};
 		memcpy(req, REQ, sizeof REQ);
 		rn = (int)sizeof REQ;
-		ok("req is valid STUN", stun_valid(req, rn));
-		ok("req type == Binding request", stun_type(req) == STUN_BINDING_REQUEST);
-		ok("req message-integrity verifies",
+		expect(stun_valid(req, rn));
+		expect(stun_type(req) == STUN_BINDING_REQUEST);
+		expect(
 		   stun_check_integrity(req, rn, PASS, (int)strlen(PASS)) == 1);
 	}
 
 	/* --- build->parse round-trip through the encoder --- */
+	test("encode and parse round-trip");
 	{
 		unsigned char txid[12] = {0xb7,0xe7,0xa7,0x01,0xbc,0x34,0xd6,0x86,0xfa,0x87,0xdf,0xae};
 		stun_addr me = { {203,0,113,7}, 51234 };
@@ -117,17 +114,18 @@ int main(void)
 		stun_add_message_integrity(&m, PASS, (int)strlen(PASS));
 		stun_add_fingerprint(&m);
 
-		ok("built message is valid", stun_valid(m.buf, m.len));
-		ok("built txid matches", stun_txid_eq(m.buf, txid));
-		ok("built xor-mapped round-trips",
+		expect(stun_valid(m.buf, m.len));
+		expect(stun_txid_eq(m.buf, txid));
+		expect(
 		   stun_get_mapped(m.buf, m.len, &back) &&
 		   memcmp(back.ip, me.ip, 4) == 0 && back.port == me.port);
-		ok("built message-integrity self-verifies",
+		expect(
 		   stun_check_integrity(m.buf, m.len, PASS, (int)strlen(PASS)) == 1);
 	}
 
 	/* --- structural prefix of a built §2.1 request matches the RFC exactly up
 	 *     to the first zero-vs-space padding divergence (USERNAME padding). --- */
+	test("RFC 5769 request encoding");
 	{
 		unsigned char txid[12] = {0xb7,0xe7,0xa7,0x01,0xbc,0x34,0xd6,0x86,0xfa,0x87,0xdf,0xae};
 		static const unsigned char REQ_PREFIX[] = {
@@ -148,15 +146,14 @@ int main(void)
 		/* header length field must already read 0x58 as MI+FINGERPRINT get added */
 		stun_add_message_integrity(&m, PASS, (int)strlen(PASS));
 		stun_add_fingerprint(&m);
-		ok("built request length field == 0x58 (88)",
+		expect(
 		   (m.buf[2] << 8 | m.buf[3]) == 0x58);
-		ok("built request matches RFC 5769 §2.1 prefix",
+		expect(
 		   m.len >= (int)sizeof REQ_PREFIX &&
 		   memcmp(m.buf, REQ_PREFIX, sizeof REQ_PREFIX) == 0);
 	}
 
-	printf(fails ? "\n%d FAILED\n" : "\nALL PASS\n", fails);
-	return fails ? 1 : 0;
+	return 0;
 }
 
 /* Host stubs: the codec never touches the wire, but stun_query references these. */

@@ -3,7 +3,7 @@
  *
  *   cc -std=gnu11 -Iscripts -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc \
  *      -Iuser/lib/base64 \
- *      scripts/js_test.c user/lib/js/lexer.c user/lib/js/parser.c user/lib/js/ast.c \
+ *      tests/js_test.c user/lib/js/lexer.c user/lib/js/parser.c user/lib/js/ast.c \
  *      user/lib/js/value.c user/lib/js/interp.c user/lib/js/builtins.c \
  *      user/lib/js/bigint.c user/lib/math/math.c user/lib/math/fmt.c \
  *      user/lib/gc/gc.c user/lib/base64/base64.c -o /tmp/js_test \

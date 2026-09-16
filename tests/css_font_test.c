@@ -5,15 +5,14 @@
  * font-variant-caps small-caps, all through css_apply_inline.
  *
  *   cc -std=c11 -Iscripts -Iuser/apps/gui/browser \
- *      scripts/css_font_test.c user/apps/gui/browser/css.c \
+ *      tests/css_font_test.c user/apps/gui/browser/css.c \
  *      user/apps/gui/browser/color.c user/apps/gui/browser/dom.c \
  *      -lm -o /tmp/css_font_test && /tmp/css_font_test
  */
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include <string.h>
 #include "css.h"
-
-static int fails;
 
 /* Assert the fields the font-* work touches. Pass -1 for "don't care" on the
  * scalar sentinels; fam is compared only when non-NULL. */
@@ -21,6 +20,7 @@ static void chk(const char *decls, int want_px, int want_pct, int want_bold,
                 int want_italic, int want_scaps, short want_lhpct, const char *want_fam)
 {
 	struct css_style s;
+	test(decls);
 	css_style_reset(&s);
 	css_apply_inline(decls, &s);
 	int ok = 1;
@@ -31,10 +31,7 @@ static void chk(const char *decls, int want_px, int want_pct, int want_bold,
 	if (want_scaps != -2 && s.small_caps != want_scaps) ok = 0;
 	if (want_lhpct != -2 && s.lh_pct     != want_lhpct) ok = 0;
 	if (want_fam   && strcmp(s.fam, want_fam) != 0)     ok = 0;
-	if (!ok) fails++;
-	printf("[%s] \"%s\" -> px=%d pct=%d bold=%d italic=%d scaps=%d lh_pct=%d fam=\"%s\"\n",
-	       ok ? "PASS" : "FAIL", decls, s.font_px, s.font_pct, s.bold,
-	       s.italic, s.small_caps, s.lh_pct, s.fam);
+	expect(ok);
 }
 
 int main(void)
@@ -69,6 +66,5 @@ int main(void)
 	chk("font-size: x-large", 24, -1, -1, -1, -1, -1, NULL);
 	chk("font-size: 120%",    -1, 120, -1, -1, -1, -1, NULL);
 
-	printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
-	return fails ? 1 : 0;
+	return 0;
 }

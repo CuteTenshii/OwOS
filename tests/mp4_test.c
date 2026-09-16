@@ -6,21 +6,14 @@
  * mdat) and asserts the demuxer reads back every field it is meant to. Build:
  *
  *     cc -std=c11 -Iscripts -Iuser/lib/mp4 \
- *        scripts/mp4_test.c user/lib/mp4/mp4.c -o /tmp/mp4_test && /tmp/mp4_test
+ *        tests/mp4_test.c user/lib/mp4/mp4.c -o /tmp/mp4_test && /tmp/mp4_test
  *
  * scripts/owos.h supplies the libc decls (memset/malloc/...) the freestanding
  * source pulls, over the host libc. */
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include <string.h>
 #include "mp4.h"
-
-static int fails;
-#define CHECK(cond) do { \
-	if (!(cond)) { printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); fails++; } \
-} while (0)
-#define CHECK_EQ(a, b) do { long long _a = (long long)(a), _b = (long long)(b); \
-	if (_a != _b) { printf("FAIL %s:%d  %s == %s  (%lld vs %lld)\n", __FILE__, __LINE__, #a, #b, _a, _b); fails++; } \
-} while (0)
 
 /* ---- a tiny big-endian MP4 box builder ----------------------------------- */
 static unsigned char B[4096];
@@ -42,6 +35,7 @@ static const unsigned char PPS[] = { 0x68, 0xCE, 0x3C };
 
 int main(void)
 {
+	test("MP4 box and sample-table demux");
 	/* ftyp */
 	unsigned b = box_open("ftyp");
 	tag("isom"); u32(0x200); tag("isom"); tag("mp42");
@@ -145,74 +139,72 @@ int main(void)
 	/* ---- demux and verify ------------------------------------------------ */
 	mp4 *m = 0;
 	int rc = mp4_open(B, N, &m);
-	CHECK_EQ(rc, MP4_OK);
-	if (rc != MP4_OK) { printf("mp4_open failed\n"); return 1; }
+	expect((rc) == (MP4_OK));
+	if (rc != MP4_OK) { expect(0); return 0; }
 
-	CHECK_EQ(mp4_track_count(m), 1);
+	expect((mp4_track_count(m)) == (1));
 	const mp4_track *v = mp4_video_track(m);
-	CHECK(v != 0);
-	CHECK(mp4_audio_track(m) == 0);
+	expect(v != 0);
+	expect(mp4_audio_track(m) == 0);
 
-	CHECK_EQ(v->codec, MP4_CODEC_H264);
-	CHECK_EQ(v->is_video, 1);
-	CHECK_EQ(v->timescale, 1000);
-	CHECK_EQ(v->duration, 300);
-	CHECK_EQ(v->width, 320);
-	CHECK_EQ(v->height, 240);
-	CHECK_EQ(v->nal_length_size, 4);
-	CHECK_EQ(v->n_samples, 3);
+	expect((v->codec) == (MP4_CODEC_H264));
+	expect((v->is_video) == (1));
+	expect((v->timescale) == (1000));
+	expect((v->duration) == (300));
+	expect((v->width) == (320));
+	expect((v->height) == (240));
+	expect((v->nal_length_size) == (4));
+	expect((v->n_samples) == (3));
 
 	/* sizes, offsets laid end-to-end from data_off */
-	CHECK_EQ(v->samples[0].offset, data_off);
-	CHECK_EQ(v->samples[0].size, 10);
-	CHECK_EQ(v->samples[1].offset, data_off + 10);
-	CHECK_EQ(v->samples[1].size, 20);
-	CHECK_EQ(v->samples[2].offset, data_off + 30);
-	CHECK_EQ(v->samples[2].size, 30);
+	expect((v->samples[0].offset) == (data_off));
+	expect((v->samples[0].size) == (10));
+	expect((v->samples[1].offset) == (data_off + 10));
+	expect((v->samples[1].size) == (20));
+	expect((v->samples[2].offset) == (data_off + 30));
+	expect((v->samples[2].size) == (30));
 
 	/* dts from stts, pts from dts + ctts */
-	CHECK_EQ(v->samples[0].dts, 0);
-	CHECK_EQ(v->samples[1].dts, 100);
-	CHECK_EQ(v->samples[2].dts, 200);
-	CHECK_EQ(v->samples[0].pts, 200);
-	CHECK_EQ(v->samples[1].pts, 100);
-	CHECK_EQ(v->samples[2].pts, 300);
+	expect((v->samples[0].dts) == (0));
+	expect((v->samples[1].dts) == (100));
+	expect((v->samples[2].dts) == (200));
+	expect((v->samples[0].pts) == (200));
+	expect((v->samples[1].pts) == (100));
+	expect((v->samples[2].pts) == (300));
 
 	/* keyframes: only sample 0 (stss) */
-	CHECK_EQ(v->samples[0].keyframe, 1);
-	CHECK_EQ(v->samples[1].keyframe, 0);
-	CHECK_EQ(v->samples[2].keyframe, 0);
+	expect((v->samples[0].keyframe) == (1));
+	expect((v->samples[1].keyframe) == (0));
+	expect((v->samples[2].keyframe) == (0));
 
 	/* sample data points at the right bytes */
 	unsigned sz = 0;
 	const unsigned char *d0 = mp4_sample_data(m, v, 0, &sz);
-	CHECK(d0 && sz == 10 && d0[0] == 0xA0);
+	expect(d0 && sz == 10 && d0[0] == 0xA0);
 	const unsigned char *d1 = mp4_sample_data(m, v, 1, &sz);
-	CHECK(d1 && sz == 20 && d1[0] == 0xB0);
+	expect(d1 && sz == 20 && d1[0] == 0xB0);
 	const unsigned char *d2 = mp4_sample_data(m, v, 2, &sz);
-	CHECK(d2 && sz == 30 && d2[0] == 0xC0);
+	expect(d2 && sz == 30 && d2[0] == 0xC0);
 
 	/* avcC SPS/PPS come back verbatim */
 	const unsigned char *nal = 0; unsigned nlen = 0;
-	CHECK_EQ(mp4_h264_param_set(v, 0, 0, &nal, &nlen), MP4_OK);
-	CHECK(nlen == sizeof SPS && nal && memcmp(nal, SPS, sizeof SPS) == 0);
-	CHECK_EQ(mp4_h264_param_set(v, 1, 0, &nal, &nlen), MP4_OK);
-	CHECK(nlen == sizeof PPS && nal && memcmp(nal, PPS, sizeof PPS) == 0);
-	CHECK_EQ(mp4_h264_param_set(v, 0, 1, &nal, &nlen), MP4_EFORMAT);  /* no 2nd SPS */
+	expect((mp4_h264_param_set(v, 0, 0, &nal, &nlen)) == (MP4_OK));
+	expect(nlen == sizeof SPS && nal && memcmp(nal, SPS, sizeof SPS) == 0);
+	expect((mp4_h264_param_set(v, 1, 0, &nal, &nlen)) == (MP4_OK));
+	expect(nlen == sizeof PPS && nal && memcmp(nal, PPS, sizeof PPS) == 0);
+	expect((mp4_h264_param_set(v, 0, 1, &nal, &nlen)) == (MP4_EFORMAT));  /* no 2nd SPS */
 
 	/* seek: the only keyframe is sample 0 */
-	CHECK_EQ(mp4_seek_sample(v, 250), 0);
-	CHECK_EQ(mp4_seek_sample(v, 0), 0);
+	expect((mp4_seek_sample(v, 250)) == (0));
+	expect((mp4_seek_sample(v, 0)) == (0));
 
 	/* a non-MP4 buffer is rejected */
 	unsigned char junk[16] = { 'n','o','p','e' };
 	mp4 *bad = 0;
-	CHECK_EQ(mp4_open(junk, sizeof junk, &bad), MP4_EBADSIG);
-	CHECK(bad == 0);
+	expect((mp4_open(junk, sizeof junk, &bad)) == (MP4_EBADSIG));
+	expect(bad == 0);
 
 	mp4_close(m);
 
-	if (fails) { printf("%d CHECK(s) failed\n", fails); return 1; }
-	printf("all mp4 demuxer tests passed\n");
 	return 0;
 }

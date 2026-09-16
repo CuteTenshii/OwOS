@@ -1,6 +1,6 @@
 /* Host harness: run the real OwOS JS parser over files given on argv, report
  * syntax errors. Build:
- *   cc -std=c11 -Iscripts -Iuser/lib/js scripts/parse_test.c \
+ *   cc -std=c11 -Iscripts -Iuser/lib/js tests/parse_test.c \
  *      user/lib/js/lexer.c user/lib/js/parser.c user/lib/js/ast.c -o /tmp/parse_test
  */
 #include <stdio.h>

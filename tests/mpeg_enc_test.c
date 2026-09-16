@@ -5,7 +5,7 @@
  * so not exact). The written .m1v is also meant to be fed to ffmpeg to confirm a
  * conformant, independently-decodable stream. Build:
  *
- *     cc -std=c11 -Iscripts -Iuser/lib/mpeg scripts/mpeg_enc_test.c \
+ *     cc -std=c11 -Iscripts -Iuser/lib/mpeg tests/mpeg_enc_test.c \
  *        user/lib/mpeg/encode.c user/lib/mpeg/decode.c -lm -o /tmp/mpeg_enc_test
  *     /tmp/mpeg_enc_test in.yuv 176 144 out.m1v
  */

@@ -8,13 +8,14 @@
  * labelled with the script that scheduled it.
  *
  *   cc -std=gnu11 -Iscripts -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc \
- *      scripts/js_script_origin_test.c user/lib/js/lexer.c user/lib/js/parser.c \
+ *      tests/js_script_origin_test.c user/lib/js/lexer.c user/lib/js/parser.c \
  *      user/lib/js/ast.c user/lib/js/value.c user/lib/js/interp.c \
  *      user/lib/js/builtins.c user/lib/js/bigint.c user/lib/math/math.c \
  *      user/lib/math/fmt.c user/lib/gc/gc.c -o /tmp/js_script_origin_test \
  *      && /tmp/js_script_origin_test
  */
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include <stdlib.h>
 #include <string.h>
 #include "ast.h"
@@ -41,11 +42,8 @@ static js_value native_schedule(js_ctx *ctx, js_value thisv, js_value *args, int
     return js_undef();
 }
 
-static int fail;
 static void expect_contains(const char *hay, const char *needle) {
-    int ok = hay && strstr(hay, needle) != NULL;
-    printf("  %s contains \"%s\"\n", ok ? "PASS" : "FAIL", needle);
-    if (!ok) fail = 1;
+	expect(hay && strstr(hay, needle) != NULL);
 }
 
 /* run one script under a given origin label, then drain the (single) callback the
@@ -68,23 +66,27 @@ int main(void) {
 
     js_set_script(ctx, "https://example.com/app.js");   /* the running page script */
     prog = js_parse(src, &a, &err);
-    if (!prog) { printf("PARSE ERROR: %s\n", err.msg ? err.msg : "?"); return 2; }
-    if (js_run(ctx, prog, &result) != 0) { printf("unexpected top-level throw\n"); return 2; }
+    if (!prog) { expect(0); return 0; }
+    if (js_run(ctx, prog, &result) != 0) { expect(0); return 0; }
 
-    if (!g_cb || !g_async) { printf("nothing scheduled\n"); return 2; }
+    expect(g_cb && g_async);
+    if (!g_cb || !g_async) return 0;
     printf("captured async stack (armed at top level):\n%s\n", g_async);
 
     /* fire it under the timer-callback origin, exactly like js_timers_pump */
+	test("top-level script origin propagation");
     {
         char *prev = js_async_enter(ctx, g_async);
         js_set_script(ctx, "<timer callback>");
         js_call(ctx, js_obj_value(g_cb), js_obj_value(ctx->global), 0, 0);
         js_async_leave(ctx, prev);
     }
-    if (!ctx->has_exc) { printf("callback did not throw\n"); return 2; }
+    expect(ctx->has_exc);
+    if (!ctx->has_exc) return 0;
 
     stack = js_get(ctx, ctx->exc, "stack");
-    if (stack.type != JV_STR) { printf("error has no string .stack\n"); return 2; }
+    expect(stack.type == JV_STR);
+    if (stack.type != JV_STR) return 0;
     printf("\nthrown error .stack:\n%s\n", stack.u.str->data);
 
     /* The whole chain: the error, the callback's origin, the scheduled-from boundary,
@@ -97,6 +99,5 @@ int main(void) {
     if (g_async) free(g_async);
     js_ctx_free(ctx);
     js_arena_free(&a);
-    printf("\n%s\n", fail ? "FAILED" : "OK");
-    return fail;
+    return 0;
 }

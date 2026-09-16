@@ -1,10 +1,11 @@
 /* crypto_test.c — host KAT for the crypto.c paths touched by the audit fixes:
  * AES-128-GCM (constant-time gcm_mul rewrite) and HKDF-SHA256 / TLS1.2 PRF
  * (streamed-HMAC rewrite). Build:
- *   cc -std=c11 -Iscripts -Iuser/lib/crypto scripts/crypto_test.c \
+ *   cc -std=c11 -Iscripts -Iuser/lib/crypto tests/crypto_test.c \
  *      user/lib/crypto/crypto.c -o /tmp/crypto_test && /tmp/crypto_test
  */
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include <string.h>
 #include "crypto.h"
 
@@ -18,19 +19,9 @@ static int hex(const char *s, uint8_t *out, int max) {
 	return n;
 }
 
-static int fails = 0;
-static void check(const char *name, const uint8_t *got, const uint8_t *want, int n) {
-	if (memcmp(got, want, n) == 0) { printf("PASS %s\n", name); return; }
-	printf("FAIL %s\n  got : ", name);
-	for (int i = 0; i < n; i++) printf("%02x", got[i]);
-	printf("\n  want: ");
-	for (int i = 0; i < n; i++) printf("%02x", want[i]);
-	printf("\n");
-	fails++;
-}
-
 int main(void) {
 	/* --- AES-128-GCM, NIST GCM spec Test Case 3 (64-byte PT, no AAD) --- */
+	test("AES-128-GCM seal and open");
 	uint8_t key[16], iv[12], pt[64], ct[64], tag[16], out[64], gtag[16];
 	hex("feffe9928665731c6d6a8f9467308308", key, 16);
 	hex("cafebabefacedbaddecaf888", iv, 12);
@@ -39,20 +30,19 @@ int main(void) {
 	hex("4d5c2af327cd64a62cf35abd2ba6fab4", tag, 16);
 
 	aes128_gcm_seal(key, iv, 0, 0, pt, 64, out, gtag);
-	check("gcm seal ciphertext", out, ct, 64);
-	check("gcm seal tag", gtag, tag, 16);
+	expect(memcmp(out, ct, sizeof ct) == 0);
+	expect(memcmp(gtag, tag, sizeof tag) == 0);
 
 	int rc = aes128_gcm_open(key, iv, 0, 0, ct, 64, out, tag);
-	printf("%s gcm open (auth ok)\n", rc == 0 ? "PASS" : "FAIL");
-	if (rc != 0) fails++;
-	check("gcm open plaintext", out, pt, 64);
+	expect(rc == 0);
+	expect(memcmp(out, pt, sizeof pt) == 0);
 
 	uint8_t badtag[16]; memcpy(badtag, tag, 16); badtag[0] ^= 1;
 	rc = aes128_gcm_open(key, iv, 0, 0, ct, 64, out, badtag);
-	printf("%s gcm open rejects bad tag\n", rc != 0 ? "PASS" : "FAIL");
-	if (rc == 0) fails++;
+	expect(rc != 0);
 
 	/* --- HKDF-SHA256, RFC 5869 Test Case 1 --- */
+	test("HKDF-SHA256");
 	uint8_t ikm[22], salt[13], info[10], prk[32], okm[42];
 	uint8_t prk_want[32], okm_want[42];
 	hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", ikm, 22);
@@ -62,14 +52,15 @@ int main(void) {
 	hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865", okm_want, 42);
 
 	hkdf_extract(salt, 13, ikm, 22, prk);
-	check("hkdf-extract prk", prk, prk_want, 32);
+	expect(memcmp(prk, prk_want, sizeof prk) == 0);
 	hkdf_expand(prk, info, 10, okm, 42);
-	check("hkdf-expand okm", okm, okm_want, 42);
+	expect(memcmp(okm, okm_want, sizeof okm) == 0);
 
 	/* --- TLS 1.2 PRF equivalence: the streamed P_SHA256 rewrite must match the
 	 * original explicit-concatenation algorithm, computed here via the untouched
 	 * hmac_sha256 primitive. Validates the rewrite over a length that spills past
 	 * one HMAC block and needs an A(2). --- */
+	test("TLS 1.2 PRF");
 	{
 		const char *label = "key expansion";
 		uint8_t sec[20], seed2[40], prfout[70], ref[70];
@@ -91,19 +82,21 @@ int main(void) {
 			hmac_sha256(sec, 20, a, 32, a);
 		}
 		tls12_prf(sec, 20, label, seed2, 40, prfout, 70);
-		check("tls1.2 prf == reference", prfout, ref, 70);
+		expect(memcmp(prfout, ref, sizeof prfout) == 0);
 	}
 
 	/* --- HMAC-SHA1, RFC 2202 Test Case 2 ("Jefe" / "what do ya want ...") --- */
+	test("HMAC-SHA1");
 	{
 		uint8_t mac[20], want[20];
 		hex("effcdf6ae5eb2fa2d27416d5f184df9c259a7c79", want, 20);
 		hmac_sha1((const uint8_t *)"Jefe", 4,
 		          (const uint8_t *)"what do ya want for nothing?", 28, mac);
-		check("hmac-sha1 rfc2202 tc2", mac, want, 20);
+		expect(memcmp(mac, want, sizeof mac) == 0);
 	}
 
 	/* --- AES-128-CTR, NIST SP 800-38A F.5.1/F.5.2 (CTR-AES128) --- */
+	test("AES-128-CTR");
 	{
 		uint8_t ckey[16], ictr[16], cpt[64], cct[64], cout[64];
 		hex("2b7e151628aed2a6abf7158809cf4f3c", ckey, 16);
@@ -117,14 +110,13 @@ int main(void) {
 		    "5ae4df3edbd5d35e5b4f09020db03eab"
 		    "1e031dda2fbe03d1792170a0f3009cee", cct, 64);
 		aes128_ctr(ckey, ictr, cpt, 64, cout);
-		check("aes-128-ctr encrypt", cout, cct, 64);
+		expect(memcmp(cout, cct, sizeof cout) == 0);
 		aes128_ctr(ckey, ictr, cct, 64, cout);   /* decrypt = same op */
-		check("aes-128-ctr decrypt", cout, cpt, 64);
+		expect(memcmp(cout, cpt, sizeof cout) == 0);
 		/* non-block-multiple length exercises the tail path */
 		aes128_ctr(ckey, ictr, cpt, 20, cout);
-		check("aes-128-ctr partial block", cout, cct, 20);
+		expect(memcmp(cout, cct, 20) == 0);
 	}
 
-	printf(fails ? "\n%d FAILURES\n" : "\nALL PASS\n", fails);
-	return fails ? 1 : 0;
+	return 0;
 }

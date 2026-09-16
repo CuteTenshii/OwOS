@@ -3,7 +3,7 @@
  * known gradient, and the Python check below decodes it with the standard zlib
  * and verifies dimensions + exact pixels — validated by an independent decoder.
  *
- *   cc -std=c11 -Iscripts -Iuser/lib/png -Iuser/lib/zlib scripts/pngenc_test.c \
+ *   cc -std=c11 -Iscripts -Iuser/lib/png -Iuser/lib/zlib tests/pngenc_test.c \
  *      user/lib/png/pngenc.c user/lib/zlib/crc32.c -o /tmp/pngenc_test
  *   /tmp/pngenc_test /tmp/shot.png 64 48
  */

@@ -7,19 +7,14 @@
  * if a host `sqlite3` binary is present, that the emitted file opens there.
  *
  *   cc -std=c11 -Iscripts -Iuser/lib/sqlite \
- *      scripts/sqlite_test.c user/lib/sqlite/sqlite.c \
+ *      tests/sqlite_test.c user/lib/sqlite/sqlite.c \
  *      -o /tmp/sqlite_test && /tmp/sqlite_test
  */
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include <stdlib.h>
 #include <string.h>
 #include "sqlite.h"
-
-static int failures = 0;
-
-#define CHECK(cond, ...) do { \
-	if (!(cond)) { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); failures++; } \
-} while (0)
 
 /* Deterministic byte pattern of length n; distinct per seed. */
 static char *pattern(int n, int seed)
@@ -60,11 +55,12 @@ int main(void)
 
 	/* Build the source database: one BLOB column per row so arbitrary bytes
 	 * round-trip, plus a companion int to prove multi-column records. */
+	test("create and save blob rows");
 	struct sql_db *db = sql_new();
-	CHECK(db != 0, "sql_new");
+	expect(db != 0);
 	struct sql_table *t = sql_create_table(db, "blobs",
 	    "CREATE TABLE blobs(id INTEGER PRIMARY KEY, data BLOB, n INTEGER)", 3);
-	CHECK(t != 0, "create table");
+	expect(t != 0);
 
 	char *bodies[NSPEC];
 	for (int i = 0; i < NSPEC; i++) {
@@ -73,50 +69,46 @@ int main(void)
 		v[0] = sqlv_null();                    /* id aliases the rowid          */
 		v[1].type = SQL_BLOB; v[1].i = 0; v[1].text = bodies[i]; v[1].len = specs[i].len;
 		v[2] = sqlv_int(specs[i].len);
-		CHECK(sql_insert(t, v, 3) == 0, "insert row %d", i);
+		expect(sql_insert(t, v, 3) == 0);
 	}
 
-	CHECK(sql_save(db, path) == 0, "sql_save");
+	expect(sql_save(db, path) == 0);
 	sql_close(db);
 
 	/* Read it back and verify every row byte-for-byte. */
+	test("reload and verify blob rows");
 	struct sql_db *db2 = sql_open(path);
-	CHECK(db2 != 0, "sql_open");
+	expect(db2 != 0);
 	struct sql_table *t2 = sql_table_find(db2, "blobs");
-	CHECK(t2 != 0, "find table after reload");
+	expect(t2 != 0);
 	if (t2) {
-		CHECK(t2->nrows == NSPEC, "row count %d != %d", t2->nrows, NSPEC);
+		expect(t2->nrows == NSPEC);
 		int i = 0;
 		for (struct sql_row *r = t2->rows; r; r = r->next, i++) {
 			if (i >= NSPEC) break;
-			CHECK(r->rowid == i + 1, "rowid %lld != %d", r->rowid, i + 1);
-			CHECK(r->ncol == 3, "ncol %d row %d", r->ncol, i);
+			expect(r->rowid == i + 1);
+			expect(r->ncol == 3);
 			struct sql_value *d = &r->col[1];
-			CHECK(d->type == SQL_BLOB, "col1 type row %d", i);
-			CHECK(d->len == specs[i].len, "len %d != %d row %d",
-			      d->len, specs[i].len, i);
-			CHECK(specs[i].len == 0 ||
-			      memcmp(d->text, bodies[i], (size_t)specs[i].len) == 0,
-			      "body mismatch row %d (len %d)", i, specs[i].len);
-			CHECK(r->col[2].type == SQL_INT && r->col[2].i == specs[i].len,
-			      "n mismatch row %d", i);
+			expect(d->type == SQL_BLOB);
+			expect(d->len == specs[i].len);
+			expect(specs[i].len == 0 ||
+			       memcmp(d->text, bodies[i], (size_t)specs[i].len) == 0);
+			expect(r->col[2].type == SQL_INT && r->col[2].i == specs[i].len);
 		}
-		CHECK(i == NSPEC, "iterated %d rows", i);
+		expect(i == NSPEC);
 	}
 
 	/* Save/open fixpoint: re-saving the reloaded db must be byte-identical. */
+	test("save and reload is byte-identical");
 	const char *path2 = "/tmp/sqlite_test2.db";
-	CHECK(sql_save(db2, path2) == 0, "re-save");
+	expect(sql_save(db2, path2) == 0);
 	sql_close(db2);
 	long l1 = 0, l2 = 0;
 	unsigned char *f1 = slurp(path, &l1), *f2 = slurp(path2, &l2);
-	CHECK(f1 && f2 && l1 == l2 && memcmp(f1, f2, (size_t)l1) == 0,
-	      "save/open not a fixpoint (%ld vs %ld bytes)", l1, l2);
+	expect(f1 && f2 && l1 == l2 && memcmp(f1, f2, (size_t)l1) == 0);
 	free(f1); free(f2);
 
 	for (int i = 0; i < NSPEC; i++) free(bodies[i]);
 
-	if (failures == 0) printf("sqlite_test: all checks passed (%d rows)\n", NSPEC);
-	else printf("sqlite_test: %d FAILURES\n", failures);
-	return failures ? 1 : 0;
+	return 0;
 }

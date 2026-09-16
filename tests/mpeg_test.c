@@ -9,7 +9,7 @@
  *            -c:v mpeg1video -qscale:v 3 -g 3 -pix_fmt yuv420p /tmp/iframe.m1v
  *     ffmpeg -y -i /tmp/iframe.m1v -f rawvideo -pix_fmt yuv420p /tmp/iframe.yuv
  *     cc -std=c11 -Iscripts -Iuser/lib/mpeg \
- *        scripts/mpeg_test.c user/lib/mpeg/decode.c -lm -o /tmp/mpeg_test
+ *        tests/mpeg_test.c user/lib/mpeg/decode.c -lm -o /tmp/mpeg_test
  *     /tmp/mpeg_test /tmp/iframe.m1v /tmp/iframe.yuv 176 144
  */
 #include <stdio.h>

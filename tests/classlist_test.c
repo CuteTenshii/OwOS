@@ -1,6 +1,6 @@
 /* Host unit test for the browser classList (DOMTokenList) token algorithm.
  *
- *   cc -std=c11 scripts/classlist_test.c -o /tmp/classlist_test && /tmp/classlist_test
+ *   cc -std=c11 tests/classlist_test.c -o /tmp/classlist_test && /tmp/classlist_test
  *
  * Mirrors the pure string helpers from user/apps/gui/browser/js.c verbatim
  * (sbuf + cl_is_ws/cl_has/cl_count/cl_nth/cl_emit and the write ops), driving a
@@ -8,6 +8,7 @@
  * normalized serialization of add/remove/toggle/replace/contains/count/item. */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include <stdlib.h>
 #include <string.h>
 
@@ -112,76 +113,70 @@ static int cl_toggle(char **cls, const char *tok) {
     cl_write_add(cls, tok, tl); return 1;
 }
 
-static int fails;
-static void check_str(const char *what, const char *got, const char *want) {
-    if (strcmp(got, want) != 0) { printf("FAIL %s: got \"%s\" want \"%s\"\n", what, got, want); fails++; }
-    else printf("ok   %s = \"%s\"\n", what, got);
-}
-static void check_int(const char *what, int got, int want) {
-    if (got != want) { printf("FAIL %s: got %d want %d\n", what, got, want); fails++; }
-    else printf("ok   %s = %d\n", what, got);
-}
-
 int main(void) {
     char *cls;
 
     /* normalization: dupes + irregular whitespace collapse on first mutation */
+	test("normalization and mutation");
     cls = strdup("a  b\ta   b\nc");
     cl_write_add(&cls, "d", 1);
-    check_str("add d (normalize)", cls, "a b c d");
-    check_int("count", cl_count(cls), 4);
+    expect_string(cls, "a b c d");
+    expect((cl_count(cls)) == (4));
 
     /* add: existing token is a no-op */
     cl_write_add(&cls, "b", 1);
-    check_str("add existing b", cls, "a b c d");
+    expect_string(cls, "a b c d");
 
     /* remove middle + trailing */
     cl_write_remove(&cls, "b", 1);
-    check_str("remove b", cls, "a c d");
+    expect_string(cls, "a c d");
     cl_write_remove(&cls, "d", 1);
-    check_str("remove d", cls, "a c");
+    expect_string(cls, "a c");
 
     /* contains, whole-token only (no substring match) */
-    check_int("contains a", cl_has(cls, "a", 1), 1);
-    check_int("contains 'a c' (not a token)", cl_has(cls, "a c", 3), 0);
-    check_int("contains substring 'c'... yes", cl_has(cls, "c", 1), 1);
-    check_int("contains x", cl_has(cls, "x", 1), 0);
+	test("whole-token membership");
+    expect((cl_has(cls, "a", 1)) == (1));
+    expect((cl_has(cls, "a c", 3)) == (0));
+    expect((cl_has(cls, "c", 1)) == (1));
+    expect((cl_has(cls, "x", 1)) == (0));
 
     /* toggle off then on */
-    check_int("toggle a -> off", cl_toggle(&cls, "a"), 0);
-    check_str("after toggle a", cls, "c");
-    check_int("toggle a -> on", cl_toggle(&cls, "a"), 1);
-    check_str("after toggle a on", cls, "c a");
+    expect((cl_toggle(&cls, "a")) == (0));
+    expect_string(cls, "c");
+    expect((cl_toggle(&cls, "a")) == (1));
+    expect_string(cls, "c a");
 
     /* replace present token; dedupes if target already present */
+	test("replacement and deduplication");
     set_class(&cls, "one two three");
-    check_int("replace two->TWO", cl_replace(&cls, "two", "TWO"), 1);
-    check_str("after replace", cls, "one TWO three");
-    check_int("replace missing", cl_replace(&cls, "nope", "X"), 0);
-    check_str("after failed replace", cls, "one TWO three");
-    check_int("replace one->three (dedupe)", cl_replace(&cls, "one", "three"), 1);
-    check_str("after dedupe replace", cls, "three TWO");
+    expect((cl_replace(&cls, "two", "TWO")) == (1));
+    expect_string(cls, "one TWO three");
+    expect((cl_replace(&cls, "nope", "X")) == (0));
+    expect_string(cls, "one TWO three");
+    expect((cl_replace(&cls, "one", "three")) == (1));
+    expect_string(cls, "three TWO");
 
     /* item()/nth indexing */
+	test("indexed access");
     set_class(&cls, "  alpha beta   gamma ");
     { int len; const char *b; char tmp[32];
       b = cl_nth(cls, 0, &len); memcpy(tmp, b, len); tmp[len] = 0;
-      check_str("item0", tmp, "alpha");
+      expect_string(tmp, "alpha");
       b = cl_nth(cls, 2, &len); memcpy(tmp, b, len); tmp[len] = 0;
-      check_str("item2", tmp, "gamma");
-      b = cl_nth(cls, 3, &len); check_int("item3 oob", b ? 1 : 0, 0);
+      expect_string(tmp, "gamma");
+      b = cl_nth(cls, 3, &len); expect((b ? 1 : 0) == (0));
     }
-    check_int("count leading/trailing ws", cl_count(cls), 3);
+    expect((cl_count(cls)) == (3));
 
     /* empty attribute edge cases */
+	test("empty attribute");
     set_class(&cls, "");
-    check_int("empty count", cl_count(cls), 0);
+    expect((cl_count(cls)) == (0));
     cl_write_add(&cls, "first", 5);
-    check_str("add to empty", cls, "first");
+    expect_string(cls, "first");
     cl_write_remove(&cls, "first", 5);
-    check_str("remove last -> empty", cls, "");
+    expect_string(cls, "");
 
     free(cls);
-    printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
-    return fails ? 1 : 0;
+    return 0;
 }

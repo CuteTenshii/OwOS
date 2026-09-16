@@ -7,13 +7,14 @@
  * callback body.
  *
  *   cc -std=gnu11 -Iscripts -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc \
- *      scripts/js_async_stack_test.c user/lib/js/lexer.c user/lib/js/parser.c \
+ *      tests/js_async_stack_test.c user/lib/js/lexer.c user/lib/js/parser.c \
  *      user/lib/js/ast.c user/lib/js/value.c user/lib/js/interp.c \
  *      user/lib/js/builtins.c user/lib/js/bigint.c user/lib/math/math.c \
  *      user/lib/math/fmt.c user/lib/gc/gc.c -o /tmp/js_async_stack_test \
  *      && /tmp/js_async_stack_test
  */
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include <stdlib.h>
 #include <string.h>
 #include "ast.h"
@@ -41,11 +42,8 @@ static js_value native_schedule(js_ctx *ctx, js_value thisv, js_value *args, int
     return js_undef();
 }
 
-static int fail;
 static void expect_contains(const char *hay, const char *needle) {
-    int ok = hay && strstr(hay, needle) != NULL;
-    printf("  %s contains \"%s\"\n", ok ? "PASS" : "FAIL", needle);
-    if (!ok) fail = 1;
+	expect(hay && strstr(hay, needle) != NULL);
 }
 
 int main(void) {
@@ -71,12 +69,13 @@ int main(void) {
     js_def_native(ctx, ctx->global, "schedule", native_schedule, 1);
 
     prog = js_parse(src, &a, &err);
-    if (!prog) { printf("PARSE ERROR: %s\n", err.msg ? err.msg : "?"); return 2; }
-    if (js_run(ctx, prog, &result) != 0) { printf("unexpected top-level throw\n"); return 2; }
+    if (!prog) { expect(0); return 0; }
+    if (js_run(ctx, prog, &result) != 0) { expect(0); return 0; }
 
     /* drive the "event loop": fire each scheduled callback with its arming frames
      * installed, exactly like the timer pump does around js_call, until the queue
      * drains or a callback throws. */
+	test("deferred callback stack chain");
     while (g_cb && g_async && !ctx->has_exc) {
         js_object *cb = g_cb;
         char *async = g_async;
@@ -88,10 +87,12 @@ int main(void) {
         js_async_leave(ctx, prev);
         free(async);
     }
-    if (!ctx->has_exc) { printf("no callback threw\n"); return 2; }
+    expect(ctx->has_exc);
+    if (!ctx->has_exc) return 0;
 
     stack = js_get(ctx, ctx->exc, "stack");
-    if (stack.type != JV_STR) { printf("error has no string .stack\n"); return 2; }
+    expect(stack.type == JV_STR);
+    if (stack.type != JV_STR) return 0;
 
     printf("\nthrown error .stack:\n%s\n", stack.u.str->data);
 
@@ -105,13 +106,11 @@ int main(void) {
         const char *p = strstr(stack.u.str->data, "scheduled from");
         int n = 0;
         while (p) { n++; p = strstr(p + 1, "scheduled from"); }
-        printf("  %s two \"scheduled from\" boundaries (found %d)\n", n == 2 ? "PASS" : "FAIL", n);
-        if (n != 2) fail = 1;
+        expect(n == 2);
     }
 
     if (g_async) free(g_async);
     js_ctx_free(ctx);
     js_arena_free(&a);
-    printf("\n%s\n", fail ? "FAILED" : "OK");
-    return fail;
+    return 0;
 }

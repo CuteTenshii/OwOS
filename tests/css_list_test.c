@@ -5,14 +5,13 @@
  * new list_pos field through css_apply_sheet against a real <li> DOM node.
  *
  *   cc -std=c11 -Iscripts -Iuser/apps/gui/browser \
- *      scripts/css_list_test.c user/apps/gui/browser/css.c \
+ *      tests/css_list_test.c user/apps/gui/browser/css.c \
  *      user/apps/gui/browser/color.c user/apps/gui/browser/dom.c \
  *      -lm -o /tmp/css_list_test && /tmp/css_list_test
  */
 #include <stdio.h>
+#define OWOS_SUITE_TEST
 #include "css.h"
-
-static int fails;
 
 static const char *lst_name(int v)
 {
@@ -30,14 +29,10 @@ static const char *pos_name(int v)
 static void chk_inline(const char *decls, int want_type, int want_pos)
 {
 	struct css_style s;
+	test(decls);
 	css_style_reset(&s);
 	css_apply_inline(decls, &s);
-	int ok = s.list_style == want_type && s.list_pos == want_pos;
-	if (!ok) fails++;
-	printf("[%s] \"%s\" -> type=%s pos=%s (want type=%s pos=%s)\n",
-	       ok ? "PASS" : "FAIL", decls,
-	       lst_name(s.list_style), pos_name(s.list_pos),
-	       lst_name(want_type), pos_name(want_pos));
+	expect(s.list_style == want_type && s.list_pos == want_pos);
 }
 
 int main(void)
@@ -67,13 +62,9 @@ int main(void)
 	struct css_style s;
 	css_style_reset(&s);
 	css_apply_sheet(sheet, li, &s);
-	int ok = s.list_style == CSS_LST_UPPER_ROMAN && s.list_pos == CSS_LSP_INSIDE;
-	if (!ok) fails++;
-	printf("[%s] cascade li -> type=%s pos=%s (want upper-roman/inside)\n",
-	       ok ? "PASS" : "FAIL", lst_name(s.list_style), pos_name(s.list_pos));
+	expect(s.list_style == CSS_LST_UPPER_ROMAN && s.list_pos == CSS_LSP_INSIDE);
 	dom_free(li);
 	css_free(sheet);
 
-	printf(fails ? "\n%d FAILED\n" : "\nALL PASSED\n", fails);
-	return fails ? 1 : 0;
+	return 0;
 }
