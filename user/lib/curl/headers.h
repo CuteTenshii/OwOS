@@ -21,6 +21,8 @@
 #ifndef OWOS_LIBHEADERS_H
 #define OWOS_LIBHEADERS_H
 
+#include <stdbool.h>
+
 struct http_field {
   char *name;
   char *value;
