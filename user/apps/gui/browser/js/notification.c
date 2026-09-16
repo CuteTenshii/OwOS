@@ -6,6 +6,11 @@ static js_ctx *ctx;
 static js_object *proto;
 static js_object *queue;
 
+void notif_app_name(char *buf, int cap)
+{
+  strlcpy(buf, "Browser", cap);
+}
+
 static const char *option_string(js_value options, const char *name, const char *fallback)
 {
   js_value value;
