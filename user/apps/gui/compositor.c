@@ -603,21 +603,25 @@ static void draw_background(void)
  * directly for an opaque XRGB source with a source stride). */
 static void blit_client(int dx, int dy, const unsigned *src, int sw, int sh, int sstride)
 {
-  int cx0 = dx, cy0 = dy, cx1 = dx + sw, cy1 = dy + sh;
-  if (cx0 < clip_x0)
-    cx0 = clip_x0;
-  if (cy0 < clip_y0)
-    cy0 = clip_y0;
-  if (cx1 > clip_x1)
-    cx1 = clip_x1;
-  if (cy1 > clip_y1)
-    cy1 = clip_y1;
-  for (int y = cy0; y < cy1; y++) {
-    const unsigned *s = src + (long)(y - dy) * sstride + (cx0 - dx);
-    unsigned *d = back + (long)y * fb_pitch + cx0;
-    for (int x = cx0; x < cx1; x++)
-      *d++ = *s++;
-  }
+  long long x1 = (long long)dx + sw, y1 = (long long)dy + sh;
+  int x0 = dx > clip_x0 ? dx : clip_x0;
+  int y0 = dy > clip_y0 ? dy : clip_y0;
+  int x2 = x1 <= 0 ? 0 : x1 >= clip_x1 ? clip_x1 : (int)x1;
+  int y2 = y1 <= 0 ? 0 : y1 >= clip_y1 ? clip_y1 : (int)y1;
+  if (x0 < 0)
+    x0 = 0;
+  if (y0 < 0)
+    y0 = 0;
+  if (x2 > screen_w)
+    x2 = screen_w;
+  if (y2 > screen_h)
+    y2 = screen_h;
+  if (sw <= 0 || sh <= 0 || x2 <= x0 || y2 <= y0)
+    return;
+
+  int src_x = x0 - dx;
+  for (int y = y0; y < y2; y++)
+    memcpy(back + (long)y * fb_pitch + x0, src + (long)(y - dy) * sstride + src_x, (unsigned)(x2 - x0) * 4);
 }
 
 /* the per-window client buffer, pinned via win_map and kept mapped across
@@ -665,7 +669,8 @@ static void refresh_maps(void)
       found = ncmap++;
       cmap[found].id = id;
     }
-    cmap[found].valid = (win_map(id, &cmap[found].m) == 0);
+    if (!cmap[found].valid || cmap[found].m.w != cur[s].buf_w || cmap[found].m.h != cur[s].buf_h)
+      cmap[found].valid = (win_map(id, &cmap[found].m) == 0);
   }
   maxed_forget_gone(); /* clear maximize state for closed windows */
 }
@@ -1804,7 +1809,30 @@ static struct rect dmg[MAXDMG];
 static int ndmg;
 static void damage_add(int x, int y, int w, int h)
 {
-  if (w > 0 && h > 0 && ndmg < MAXDMG) {
+  if (w <= 0 || h <= 0)
+    return;
+  for (;;) {
+    int merged = 0;
+    for (int i = 0; i < ndmg; i++) {
+      struct rect *r = &dmg[i];
+      int x1 = x + w, y1 = y + h;
+      int r1 = r->x + r->w, r2 = r->y + r->h;
+      if (x >= r1 || r->x >= x1 || y >= r2 || r->y >= y1)
+        continue;
+      int nx = x < r->x ? x : r->x, ny = y < r->y ? y : r->y;
+      int nx1 = x1 > r1 ? x1 : r1, ny1 = y1 > r2 ? y1 : r2;
+      x = nx;
+      y = ny;
+      w = nx1 - nx;
+      h = ny1 - ny;
+      dmg[i] = dmg[--ndmg];
+      merged = 1;
+      break;
+    }
+    if (!merged)
+      break;
+  }
+  if (ndmg < MAXDMG) {
     dmg[ndmg].x = x;
     dmg[ndmg].y = y;
     dmg[ndmg].w = w;

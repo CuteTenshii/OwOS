@@ -58,6 +58,28 @@ static void blit_present(int id)
   win_present(id);
 }
 
+static void blit_rect(int x, int y, int w, int h)
+{
+  if (!g_surface)
+    return;
+  if (x < 0) {
+    w += x;
+    x = 0;
+  }
+  if (y < 0) {
+    h += y;
+    y = 0;
+  }
+  if (x + w > BW)
+    w = BW - x;
+  if (y + h > BH)
+    h = BH - y;
+  if (w > 0 && h > 0)
+    for (int row = 0; row < h; row++)
+      memcpy((unsigned *)WIN_FB_ADDR + (unsigned long)(y + row) * BW + x, g_surface + (unsigned long)(y + row) * BW + x,
+             (unsigned)w * 4);
+}
+
 const unsigned palette[16] = {
     0x202830, 0x1a4fbf, 0xc01818, 0x108010, 0x9020a0, 0x9a6020, 0x107c90, 0x586070,
     0x16387a, 0x000000, 0x707000, 0xd07000, 0x808890, 0x304060, 0x2050d0, 0xa0a0a0,
@@ -2671,7 +2693,7 @@ static void draw_alt_box(struct inl_img *im, int py, int phh)
  * horizontal rule). Returns the content origin x after indent/centring, for the
  * caller's selection highlight. Shared by the main line table and the flex-row
  * overlay. */
-static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb)
+static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int line_h)
 {
   set_block(off);
 
@@ -2682,8 +2704,7 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
     return x + m;
   }
 
-  x += cur_bindent * INDENT_PX; /* blockquote / list indent  */
-  int line_h = line_height_for(off, off + len);
+  x += cur_bindent * INDENT_PX;                      /* blockquote / list indent  */
   int base = run_ascent(line_maxpx(off, off + len)); /* baseline shared by the line's runs */
   if (cur_bcenter) {                                 /* text-align:center         */
     int lw = 0, p = off, end = off + len;
@@ -2739,7 +2760,7 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
 static void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
 {
   int off = B->line_off[idx], len = B->line_len[idx];
-  int x0 = draw_slice_core(x, y, off, len, paw, ct, cb);
+  int x0 = draw_slice_core(x, y, off, len, paw, ct, cb, B->line_h[idx]);
   if (cur_bhr)
     return; /* rule: nothing to select   */
 
@@ -3864,7 +3885,7 @@ static void render(void)
       int sy = py + B->line_y[f->row] - sc;
       if (sy + B->line_h[f->row] <= py || sy >= py + phh)
         continue;
-      draw_slice_core(f->x, sy, f->off, f->len, f->w, py, py + phh);
+      draw_slice_core(f->x, sy, f->off, f->len, f->w, py, py + phh, line_height_for(f->off, f->off + f->len));
     }
 
     /* inline images, over their reserved (blank) rows */
@@ -5174,13 +5195,20 @@ int main(int argc, char **argv)
       last_paint_frame = frame;
       addr_dirty = 0;
     } else if (addr_dirty || dt_paint) { /* partial repaints: addr bar / devtools dock */
+      int addr_paint = addr_dirty;
       if (addr_dirty) {
         render_addr();
         addr_dirty = 0;
       }
       if (dt_paint)
         devtools_render(); /* opaque right-side split: dock only */
-      blit_present(id);
+      if (addr_paint)
+        blit_rect(0, MENU_H + TAB_H, BW, ADDR_H);
+      if (dt_paint) {
+        int left = devtools_left();
+        blit_rect(left, devtools_top(), BW - left, BH - devtools_top());
+      }
+      win_present(id);
     }
     frame++;
     win_wait(id);
