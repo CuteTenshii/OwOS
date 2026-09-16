@@ -43,6 +43,7 @@
 #include "sched.h"
 #include "shell.h"
 #include "smbios.h"
+#include "syscall_audio.h"
 #include "syscall_fs.h"
 #include "syscall_net.h"
 #include "syscall_path.h"
@@ -337,29 +338,6 @@ void syscall_init(void)
 {
   /* 0xEE = present, DPL 3, 32-bit interrupt gate -- ring 3 may invoke it. */
   idt_set_gate(0x80, (uint32_t)isr128, GDT_KERNEL_CODE, 0xEE);
-}
-
-/* Which audio back end the open stream is using: 0 none, 1 HDA, 2 SB16. There
- * is one PCM stream at a time across the system (owofs-style), owned by the
- * task that opened it: only that task may write or close it, and it is released
- * if the task exits (audio_task_exiting), so a crash/kill can't leave the DMA
- * looping forever. */
-static int audio_be;
-static uint32_t audio_owner;
-
-/* Release the PCM stream if `id` owns it. Called from sched_exit so an abnormal
- * exit (crash/kill) frees the stream instead of leaking the latch + running
- * DMA. */
-void audio_task_exiting(uint32_t id)
-{
-  if (audio_be == 0 || audio_owner != id)
-    return;
-  if (audio_be == 1)
-    hda_stream_close();
-  else if (audio_be == 2)
-    sb16_stream_close();
-  audio_be = 0;
-  audio_owner = 0;
 }
 
 void syscall_dispatch(struct registers *r)
@@ -1277,55 +1255,14 @@ void syscall_dispatch(struct registers *r)
    * space and pushes it here in bounded chunks. One stream at a time (like the
    * file stream); the chosen back end is latched at open. */
   case SYS_AUDIO_OPEN:
-    /* One stream system-wide: refuse if another live task already owns it. The
-     * current owner may re-open (the close+reopen just resets its DMA). */
-    if (audio_be != 0 && audio_owner != sched_current_id()) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    if (hda_present())
-      audio_be = (hda_stream_open() == 0) ? 1 : 0;
-    else if (sb16_present())
-      audio_be = (sb16_stream_open() == 0) ? 2 : 0;
-    else
-      audio_be = 0;
-    audio_owner = audio_be ? sched_current_id() : 0;
-    r->eax = audio_be ? 0 : (uint32_t)-1;
+    syscall_audio_open(r);
     break;
   case SYS_AUDIO_WRITE: {
-    uint32_t buf = r->ebx, len = r->ecx;
-    if (len == 0 || !user_range(buf, len)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    if (audio_be == 0 || audio_owner != sched_current_id()) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    __asm__ volatile("sti"); /* back-pressure waits need the tick */
-    if (audio_be == 1)
-      r->eax = (uint32_t)hda_stream_write((const void *)buf, len);
-    else if (audio_be == 2)
-      r->eax = (uint32_t)sb16_stream_write((const void *)buf, len);
-    else
-      r->eax = (uint32_t)-1;
+    syscall_audio_write(r);
     break;
   }
   case SYS_AUDIO_CLOSE:
-    /* Only the owner tears the stream down; a stray close from any other task
-     * is a harmless no-op rather than yanking someone else's playback. */
-    if (audio_be == 0 || audio_owner != sched_current_id()) {
-      r->eax = 0;
-      break;
-    }
-    __asm__ volatile("sti");
-    if (audio_be == 1)
-      hda_stream_close();
-    else if (audio_be == 2)
-      sb16_stream_close();
-    audio_be = 0;
-    audio_owner = 0;
-    r->eax = 0;
+    syscall_audio_close(r);
     break;
 
   /* -------- Phase 1 user-space compositor primitives (all root-only) --------
