@@ -546,40 +546,14 @@ void syscall_dispatch(struct registers *r)
     syscall_window_close(r);
     break;
   case SYS_RTC_EPOCH:
-    r->eax = rtc_epoch(); /* Unix epoch seconds (UTC) */
+    syscall_fs_rtc_epoch(r);
     break;
+
   case SYS_READDIR: {
-    /* name[64] mirrors struct dirent_u (owos.h) / owofs FS_NAME_LEN. */
-    struct rd_out {
-      char name[64];
-      int is_dir;
-      uint32_t size;
-    } *o;
-    if (!user_out_range(r->edx, sizeof *o)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    char path[SYS_PATH_MAX];
-    if (copyin_str(r->ebx, path, sizeof path) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    o = (struct rd_out *)r->edx;
-    char nm[64];
-    int isd = 0;
-    uint32_t sz = 0;
-    int got = fs_enum_dir(path[0] ? path : "/", (int)r->ecx, nm, &isd, &sz, 0);
-    if (got) {
-      int i = 0;
-      for (; i < (int)sizeof o->name - 1 && nm[i]; i++)
-        o->name[i] = nm[i];
-      o->name[i] = '\0';
-      o->is_dir = isd;
-      o->size = sz;
-    }
-    r->eax = (uint32_t)got;
+    syscall_fs_readdir(r);
     break;
   }
+
   case SYS_WIN_TITLE: {
     syscall_window_title(r);
     break;
@@ -606,91 +580,22 @@ void syscall_dispatch(struct registers *r)
     syscall_fs_readfile_at(r);
     break;
   }
-  /* Report present removable devices, so the file explorer can list them as
-   * devices -- mounted OR not, so it can offer a "Connect" button. Indexed by
-   * ebx; returns 1 if that index exists, 0 past the end. `mounted` says whether
-   * the device currently backs /media (and so has a valid `path`). */
+
   case SYS_VOLUMES: {
-    /* One entry per present removable device; cross-referenced against the
-     * mount table so the UI knows whether it's mounted and where. */
-    struct vinfo {
-      char dev[16];
-      char kind[8];
-      char label[24];
-      char point[40];
-      int mounted;
-    } *o;
-    if (!user_out_range(r->ecx, sizeof *o)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    o = (struct vinfo *)r->ecx;
-    struct blk_devinfo devs[8];
-    int n = blk_dev_list(devs, 8);
-    int idx = (int)r->ebx;
-    if (idx < 0 || idx >= n) {
-      r->eax = 0;
-      break;
-    }
-    struct blk_devinfo *d = &devs[idx];
-    const char *point = "", *label = d->model;
-    int mounted = 0;
-    struct fs_mountinfo mi;
-    for (int i = 0; fs_mount_enum(i, &mi); i++)
-      if (streq(mi.dev, d->dev)) {
-        mounted = 1;
-        point = mi.point;
-        if (mi.label && mi.label[0])
-          label = mi.label;
-        break;
-      }
-    if (!label || !label[0])
-      label = d->kind;
-    int i = 0;
-    for (; i < 15 && d->dev[i]; i++)
-      o->dev[i] = d->dev[i];
-    o->dev[i] = '\0';
-    for (i = 0; i < 7 && d->kind[i]; i++)
-      o->kind[i] = d->kind[i];
-    o->kind[i] = '\0';
-    for (i = 0; i < 23 && label[i]; i++)
-      o->label[i] = label[i];
-    o->label[i] = '\0';
-    for (i = 0; i < 39 && point[i]; i++)
-      o->point[i] = point[i];
-    o->point[i] = '\0';
-    o->mounted = mounted;
-    r->eax = 1;
+    syscall_fs_volumes(r);
     break;
   }
 
-  /* Mount a removable device at a mount point: mount(dev=ebx, point=ecx), e.g.
-   * mount("usb0", "/media/usb0"). fs.c probes the device's filesystem and adds
-   * it to the mount table. Both strings are bounds-checked per byte. */
   case SYS_MOUNT: {
-    char dev[16], point[48];
-    if (copyin_str(r->ebx, dev, sizeof dev) != 0 || copyin_str(r->ecx, point, sizeof point) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    __asm__ volatile("sti"); /* probing reads sectors (may wait on IRQ) */
-    r->eax = (uint32_t)fs_mount(dev, point);
+    syscall_fs_mount(r);
     break;
   }
 
-  /* Unmount the volume at a mount point: umount(point=ebx). */
   case SYS_UMOUNT: {
-    char point[48];
-    if (copyin_str(r->ebx, point, sizeof point) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)fs_unmount(point);
+    syscall_fs_umount(r);
     break;
   }
 
-  /* Filesystem management for a shell. Each joins a relative name onto
-   * the caller's cwd (like readfile/writefile) before hitting owofs. */
   case SYS_MKDIR: {
     syscall_fs_mkdir(r);
     break;
@@ -1003,83 +908,20 @@ void syscall_dispatch(struct registers *r)
     sched_sigreturn(r);
     break;
   case SYS_STAT: {
-    struct st_out {
-      int is_dir;
-      uint32_t size;
-      uint32_t mtime;
-    } *o;
-    char name[SYS_PATH_MAX];
-    if (copyin_str(r->ebx, name, sizeof name) != 0 || !user_out_range(r->ecx, sizeof *o)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    char abs[SYS_PATH_MAX];
-    join_cwd(name, abs, sizeof abs);
-    int isd = 0;
-    uint32_t sz = 0, mt = 0;
-    int rc = fs_stat(abs, &isd, &sz, &mt);
-    o = (struct st_out *)r->ecx;
-    if (rc == 0) {
-      o->is_dir = isd;
-      o->size = sz;
-      o->mtime = mt; /* owofs packed wall-clock stamp (0 = unset) */
-    }
-    r->eax = (uint32_t)rc;
+    syscall_fs_stat(r);
     break;
   }
 
   case SYS_STATFS: {
-    struct sfs_out {
-      uint64_t total;
-      uint64_t free;
-    } *o;
-    if (!user_out_range(r->ecx, sizeof *o)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    /* One owofs volume today: `path` selects it, but every path maps to it. */
-    uint64_t total = (uint64_t)blk_sectors() * 512;
-    uint64_t used = fs_used_bytes();
-    o = (struct sfs_out *)r->ecx;
-    o->total = total;
-    o->free = total > used ? total - used : 0;
-    r->eax = 0;
+    syscall_fs_statfs(r);
     break;
   }
 
   case SYS_UNAME: {
-    /* struct utsname (mirror in owos.h): five fixed 65-byte fields. The
-     * kernel owns everything but nodename, which libc adds from the
-     * hostname; `machine` is authoritative here — a 32-bit user program
-     * can't tell the kernel's arch from its own ELF class. */
-    struct k_utsname {
-      char sysname[65], nodename[65], release[65], version[65], machine[65];
-    } *o;
-    if (!user_out_range(r->ebx, sizeof *o)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    o = (struct k_utsname *)r->ebx;
-    memset(o, 0, sizeof *o);
-    strlcpy(o->sysname, "OwOS", sizeof o->sysname);
-    strlcpy(o->release, OWOS_VERSION, sizeof o->release);
-    strlcpy(o->version, OWOS_VERSION, sizeof o->version);
-#if defined(__x86_64__)
-    strlcpy(o->machine, "x86_64", sizeof o->machine);
-#elif defined(__aarch64__)
-    strlcpy(o->machine, "aarch64", sizeof o->machine);
-#elif defined(__arm__)
-    strlcpy(o->machine, "arm", sizeof o->machine);
-#else
-    strlcpy(o->machine, "i386", sizeof o->machine);
-#endif
-    r->eax = 0;
+    syscall_fs_uname(r);
     break;
   }
 
-  /* Streaming audio: /bin/play resamples a WAV to 48 kHz/S16/stereo in user
-   * space and pushes it here in bounded chunks. One stream at a time (like the
-   * file stream); the chosen back end is latched at open. */
   case SYS_AUDIO_OPEN:
     syscall_audio_open(r);
     break;
