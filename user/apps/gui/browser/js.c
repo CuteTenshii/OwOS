@@ -19,6 +19,8 @@
 #include "cast.h"         /* Google Cast sender: HTMLMediaElement.remote backend  */
 #include "notify.h"       /* notify_send: surface Notification() on the desktop    */
 #include "cors.h"          /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "classlist.h"
+#include "js_notification.h"
 
 js_ctx    *g_ctx;
 static js_object *g_node_proto;         /* Node.prototype (ancestor of element/document) */
@@ -392,8 +394,6 @@ static js_value el_set_class(js_ctx *ctx, js_value t, js_value *args, int argc) 
  * re-serialize the normalized ordered set (whitespace collapsed, duplicates
  * dropped), matching the DOM's token-list update steps. */
 
-static int cl_is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
-
 /* the node's current class string, or "" (never NULL) */
 static const char *cl_class_of(js_value t) {
     struct dom_node *n = node_of(t);
@@ -401,73 +401,20 @@ static const char *cl_class_of(js_value t) {
     return v ? v : "";
 }
 
-/* whole-token membership test over a whitespace-separated list */
-static int cl_has(const char *s, const char *tok, int tl) {
-    if (!s || tl <= 0) return 0;
-    while (*s) {
-        const char *b;
-        while (cl_is_ws(*s)) s++;
-        b = s;
-        while (*s && !cl_is_ws(*s)) s++;
-        if (s - b == tl && memcmp_js(b, tok, tl) == 0) return 1;
-    }
-    return 0;
-}
-
-static int cl_count(const char *s) {
-    int n = 0;
-    while (*s) {
-        while (cl_is_ws(*s)) s++;
-        if (!*s) break;
-        n++;
-        while (*s && !cl_is_ws(*s)) s++;
-    }
-    return n;
-}
-
-/* start pointer + length of the idx-th token, or NULL past the end */
-static const char *cl_nth(const char *s, int idx, int *len) {
-    int n = 0;
-    while (*s) {
-        const char *b;
-        while (cl_is_ws(*s)) s++;
-        if (!*s) break;
-        b = s;
-        while (*s && !cl_is_ws(*s)) s++;
-        if (n == idx) { *len = (int)(s - b); return b; }
-        n++;
-    }
-    return 0;
-}
-
-/* append `tok` to the class sbuf, deduping against what's already there */
-static void cl_emit(sbuf *sb, const char *tok, int tl) {
-    if (tl <= 0) return;
-    if (sb->b && cl_has(sb->b, tok, tl)) return;
-    if (sb->n) sb_putc(sb, ' ');
-    sb_putn(sb, tok, tl);
-}
-
 /* rebuild `n`'s class attr as the current tokens (deduped) with `tok` appended */
 static void cl_write_add(struct dom_node *n, const char *tok, int tl) {
-    const char *cur = dom_get_attr(n, "class"); const char *b; int len, i;
-    sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
-    if (!cur) cur = "";
-    for (i = 0; (b = cl_nth(cur, i, &len)); i++) cl_emit(&sb, b, len);
-    cl_emit(&sb, tok, tl);
-    dom_set_attr(n, "class", sb.b ? sb.b : "");
-    if (sb.b) free(sb.b);
+    char *classes = strdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
+    classlist_add(&classes, tok, tl);
+    dom_set_attr(n, "class", classes);
+    free(classes);
 }
 
 /* rebuild `n`'s class attr as the current tokens minus every copy of `tok` */
 static void cl_write_remove(struct dom_node *n, const char *tok, int tl) {
-    const char *cur = dom_get_attr(n, "class"); const char *b; int len, i;
-    sbuf sb; sb.b = 0; sb.n = 0; sb.cap = 0;
-    if (!cur) cur = "";
-    for (i = 0; (b = cl_nth(cur, i, &len)); i++)
-        if (!(len == tl && memcmp_js(b, tok, len) == 0)) cl_emit(&sb, b, len);
-    dom_set_attr(n, "class", sb.b ? sb.b : "");
-    if (sb.b) free(sb.b);
+    char *classes = strdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
+    classlist_remove(&classes, tok, tl);
+    dom_set_attr(n, "class", classes);
+    free(classes);
 }
 
 static js_value cl_add(js_ctx *ctx, js_value t, js_value *args, int argc) {
@@ -504,7 +451,7 @@ static js_value cl_toggle(js_ctx *ctx, js_value t, js_value *args, int argc) {
     const char *tok = s.type == JV_STR ? s.u.str->data : "";
     int tl = (int)strlen(tok), present;
     if (!n || tl == 0) return js_bool(0);
-    present = cl_has(cl_class_of(t), tok, tl);
+    present = classlist_has(cl_class_of(t), tok, tl);
     if (argc >= 2) {
         int force = js_to_boolean(args[1]);
         if (force && !present) cl_write_add(n, tok, tl);
@@ -524,40 +471,35 @@ static js_value cl_replace(js_ctx *ctx, js_value t, js_value *args, int argc) {
     const char *oldt = ov.type == JV_STR ? ov.u.str->data : "";
     const char *newt = nv.type == JV_STR ? nv.u.str->data : "";
     int ol = (int)strlen(oldt), nl = (int)strlen(newt);
-    const char *cur, *b; int len, i;
-    sbuf sb;
     (void)argc;
     if (!n || ol == 0 || nl == 0) return js_bool(0);
-    cur = dom_get_attr(n, "class"); if (!cur) cur = "";
-    if (!cl_has(cur, oldt, ol)) return js_bool(0);
-    sb.b = 0; sb.n = 0; sb.cap = 0;
-    for (i = 0; (b = cl_nth(cur, i, &len)); i++) {
-        if (len == ol && memcmp_js(b, oldt, len) == 0) cl_emit(&sb, newt, nl);
-        else cl_emit(&sb, b, len);
+    {
+        char *classes = strdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
+        int replaced = classlist_replace(&classes, oldt, newt);
+        dom_set_attr(n, "class", classes);
+        free(classes);
+        return js_bool(replaced);
     }
-    dom_set_attr(n, "class", sb.b ? sb.b : "");
-    if (sb.b) free(sb.b);
-    return js_bool(1);
 }
 
 static js_value cl_contains(js_ctx *ctx, js_value t, js_value *args, int argc) {
     js_value s = js_to_string(ctx, A(0));
     const char *tok = s.type == JV_STR ? s.u.str->data : "";
     (void)args; (void)argc;
-    return js_bool(cl_has(cl_class_of(t), tok, (int)strlen(tok)));
+    return js_bool(classlist_has(cl_class_of(t), tok, (int)strlen(tok)));
 }
 
 static js_value cl_item(js_ctx *ctx, js_value t, js_value *args, int argc) {
     int idx = (int)js_to_number(ctx, A(0)), len;
     const char *b;
     (void)args; (void)argc;
-    b = idx >= 0 ? cl_nth(cl_class_of(t), idx, &len) : 0;
+    b = idx >= 0 ? classlist_nth(cl_class_of(t), idx, &len) : 0;
     return b ? js_mk_string(ctx, b, len) : js_null();
 }
 
 static js_value cl_length(js_ctx *ctx, js_value t, js_value *args, int argc) {
     (void)ctx; (void)args; (void)argc;
-    return js_number(cl_count(cl_class_of(t)));
+    return js_number(classlist_count(cl_class_of(t)));
 }
 
 static js_value cl_get_value(js_ctx *ctx, js_value t, js_value *args, int argc) {
@@ -574,7 +516,7 @@ static js_value cl_foreach(js_ctx *ctx, js_value t, js_value *args, int argc) {
     js_value cb = A(0), thisArg = argc >= 2 ? args[1] : js_undef();
     const char *b; int i, len;
     if (!js_is_callable(cb)) return js_undef();
-    for (i = 0; (b = cl_nth(cl_class_of(t), i, &len)); i++) {
+    for (i = 0; (b = classlist_nth(cl_class_of(t), i, &len)); i++) {
         js_value a[3];
         a[0] = js_mk_string(ctx, b, len);   /* copied before the callback may mutate */
         a[1] = js_number(i);
@@ -591,7 +533,7 @@ static js_value cl_iter_kind(js_ctx *ctx, js_value t, const char *method) {
     js_value av, fn;
     gc_push_scope();
     arr = (js_object *)gc_keep(js_new_array(ctx, 0));
-    for (i = 0; (b = cl_nth(cl_class_of(t), i, &len)); i++)
+    for (i = 0; (b = classlist_nth(cl_class_of(t), i, &len)); i++)
         js_array_push(ctx, arr, js_mk_string(ctx, b, len));
     av = js_obj_value(arr);
     fn = js_get(ctx, av, method);
@@ -613,7 +555,7 @@ static js_value el_get_classlist(js_ctx *ctx, js_value t, js_value *args, int ar
     /* Snapshot numeric index properties (classList[0]) — the engine has no
      * index-getter hook, and the wrapper is fresh per access so this is current. */
     cur = n ? dom_get_attr(n, "class") : 0; if (!cur) cur = "";
-    for (i = 0; (b = cl_nth(cur, i, &len)); i++) {
+    for (i = 0; (b = classlist_nth(cur, i, &len)); i++) {
         char key[12]; int k = 0, d = i, p;
         if (d == 0) key[k++] = '0';
         else { char tmp[12]; int m = 0; while (d) { tmp[m++] = (char)('0' + d % 10); d /= 10; } for (p = m - 1; p >= 0; p--) key[k++] = tmp[p]; }
@@ -1042,7 +984,7 @@ static int page_origin(char *origin, int ocap, char *host, int hcap)
     return 1;
 }
 
-static const char *perm_state_str(int st)
+const char *perm_state_str(int st)
 {
     return st == PERM_GRANTED ? "granted" : st == PERM_DENIED ? "denied" : "default";
 }
@@ -1059,7 +1001,7 @@ int perm_state_now(int feature)
 
 /* Resolve a permission, prompting the user if there is no prior decision.
  * Returns PERM_GRANTED / PERM_DENIED and records the choice. */
-static int worker_permission(int feature)
+int worker_permission(int feature)
 {
     char origin[URL_MAX], host[URL_HOST_MAX];
     if (!page_origin(origin, sizeof origin, host, sizeof host))
@@ -3335,122 +3277,6 @@ static js_value bchannel_ctor(js_ctx *ctx, js_value thisv, js_value *args, int a
     return ov;
 }
 
-/* ------------------------------------------------------- Notification ----- *
- * The W3C Notification API over notifyd (the desktop notification daemon). A
- * `new Notification(title, options)` immediately posts to the "notify" port so
- * the notification pops on the desktop, then the wrapper is queued in
- * g_notifications for its asynchronous "show" event (fired next worker tick,
- * like WebSocket's deferred "open", so a handler assigned right after
- * construction still receives it). close() queues a "close" event.
- *
- * Permission is per-origin (permissions.c): Notification.permission and
- * requestPermission() consult the store, the latter prompting when undecided.
- * notifyd owns the click UI and runs no callback back into the page, so
- * "click"/"error" never fire (spec-permitted: both are best-effort). Web content
- * must not drive notifyd's shell-command buttons, so notifications are posted
- * button-less regardless of `actions`. */
-
-/* The page's host as the notification's sender label, or "Browser". */
-void notif_app_name(char *buf, int cap) {
-    struct purl pu;
-    if (parse_url(g_page_url_buf, &pu) && pu.host[0]) strlcpy(buf, pu.host, cap);
-    else strlcpy(buf, "Browser", cap);
-}
-
-/* An options-bag string field, or `dflt` when absent/null/undefined. */
-static const char *notif_opt_str(js_ctx *ctx, js_value opts, const char *key, const char *dflt) {
-    js_value v;
-    if (opts.type != JV_OBJ) return dflt;
-    v = js_get(ctx, opts, key);
-    if (v.type == JV_UNDEF || v.type == JV_NULL) return dflt;
-    return arg_str(ctx, v);
-}
-
-static int notif_opt_bool(js_ctx *ctx, js_value opts, const char *key) {
-    if (opts.type != JV_OBJ) return 0;
-    return js_to_boolean(js_get(ctx, opts, key));
-}
-
-static js_value notification_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc) {
-    js_object *o;
-    js_value opts, ov;
-    const char *title, *body, *icon, *dir;
-    char app[NOTIFY_APP_MAX];
-    (void)thisv;
-    if (argc < 1)
-        return js_throw_type(ctx, "Failed to construct 'Notification': 1 argument required, but only 0 present.");
-    title = arg_str(ctx, A(0));
-    opts  = A(1);
-    body  = notif_opt_str(ctx, opts, "body", "");
-    icon  = notif_opt_str(ctx, opts, "icon", "");
-    dir   = notif_opt_str(ctx, opts, "dir", "auto");
-
-    gc_push_scope();
-    o = (js_object *)gc_keep(js_new_object(ctx, g_notification_proto));
-    js_def(o, "title", js_mk_cstring(ctx, title), P_ENUMERABLE);
-    js_def(o, "body", js_mk_cstring(ctx, body), P_ENUMERABLE);
-    js_def(o, "icon", js_mk_cstring(ctx, icon), P_ENUMERABLE);
-    js_def(o, "badge", js_mk_cstring(ctx, notif_opt_str(ctx, opts, "badge", "")), P_ENUMERABLE);
-    js_def(o, "image", js_mk_cstring(ctx, notif_opt_str(ctx, opts, "image", "")), P_ENUMERABLE);
-    js_def(o, "tag", js_mk_cstring(ctx, notif_opt_str(ctx, opts, "tag", "")), P_ENUMERABLE);
-    js_def(o, "lang", js_mk_cstring(ctx, notif_opt_str(ctx, opts, "lang", "")), P_ENUMERABLE);
-    js_def(o, "dir", js_mk_cstring(ctx, dir), P_ENUMERABLE);
-    js_def(o, "data", opts.type == JV_OBJ ? js_get(ctx, opts, "data") : js_null(), P_ENUMERABLE);
-    js_def(o, "requireInteraction", js_bool(notif_opt_bool(ctx, opts, "requireInteraction")), P_ENUMERABLE);
-    js_def(o, "silent", js_bool(notif_opt_bool(ctx, opts, "silent")), P_ENUMERABLE);
-    js_def(o, "renotify", js_bool(notif_opt_bool(ctx, opts, "renotify")), P_ENUMERABLE);
-    js_def(o, "onclick", js_null(), P_WRITABLE | P_ENUMERABLE);
-    js_def(o, "onclose", js_null(), P_WRITABLE | P_ENUMERABLE);
-    js_def(o, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
-    js_def(o, "onshow", js_null(), P_WRITABLE | P_ENUMERABLE);
-    js_def(o, "@shown", js_bool(0), P_WRITABLE);        /* "show" delivered (pump)  */
-    js_def(o, "@close_req", js_bool(0), P_WRITABLE);    /* close() requested        */
-    js_def(o, "@closed", js_bool(0), P_WRITABLE);       /* "close" delivered        */
-
-    /* Constructing does NOT prompt (per spec); it shows only if already granted. */
-    if (perm_state_now(PERM_NOTIFICATIONS) == PERM_GRANTED && title[0]) {
-        struct notification n = { 0 };
-        notif_app_name(app, sizeof app);
-        n.app   = app;
-        n.title = title;
-        n.body  = body[0] ? body : 0;
-        n.image = 0;                                    /* remote icons unreachable to notifyd */
-        n.nbuttons = 0;                                 /* never expose shell-command buttons  */
-        notify_send(&n);                                /* graceful no-op if notifyd is down   */
-    }
-    if (g_notifications) js_array_push(ctx, g_notifications, js_obj_value(o));
-    ov = js_obj_value(o);
-    gc_pop_scope();
-    return ov;
-}
-
-static js_value notif_close_m(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    (void)args; (void)argc;
-    if (t.type == JV_OBJ) js_set(ctx, t, "@close_req", js_bool(1));
-    return js_undef();
-}
-
-/* Notification.permission — the remembered/policy state, without prompting. */
-static js_value notif_get_permission(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    (void)t; (void)args; (void)argc;
-    return js_mk_cstring(ctx, perm_state_str(perm_state_now(PERM_NOTIFICATIONS)));
-}
-
-/* Notification.requestPermission([callback]) -> Promise<permission>. Prompts the
- * user when undecided (worker_permission), then resolves with "granted"/"denied"
- * and invokes the legacy callback form if one was passed. */
-static js_value notif_request_permission(js_ctx *ctx, js_value t, js_value *args, int argc) {
-    js_value cb = A(0), perm;
-    (void)t;
-    perm = js_mk_cstring(ctx, perm_state_str(worker_permission(PERM_NOTIFICATIONS)));
-    if (js_is_callable(cb)) {
-        js_value a = perm;
-        js_call(ctx, cb, js_undef(), &a, 1);
-        if (ctx->has_exc) report_exc(ctx);
-    }
-    return js_promise_resolved(ctx, perm);
-}
-
 /* --- navigator.geolocation ------------------------------------------------
  * Gated by PERM_GEOLOCATION. OwOS has no GPS, so a granted request still fails
  * the fix with POSITION_UNAVAILABLE; a denied one reports PERMISSION_DENIED —
@@ -3542,36 +3368,6 @@ static js_value perm_query(js_ctx *ctx, js_value t, js_value *args, int argc) {
     rv = js_promise_resolved(ctx, js_obj_value(ps));
     gc_pop_scope();
     return rv;
-}
-
-/* Deliver each notification's deferred "show", then any requested "close".
- * Mirrors js_websockets_pump: settled wrappers stay in the array (guarded by
- * @shown/@closed so an event fires once) rather than being spliced out — a
- * "show" handler may create a fresh Notification, and compacting mid-iteration
- * would truncate it. The array is bounded per page and freed at teardown. */
-int js_notifications_pump(void) {
-    int fired = 0;
-    unsigned i, n;
-    if (!g_page_live || !g_ctx || !g_notifications) return 0;
-    n = js_array_len(g_notifications);
-    for (i = 0; i < n; i++) {
-        js_value nv = js_get_index(g_ctx, js_obj_value(g_notifications), i);
-        js_object *w;
-        if (nv.type != JV_OBJ) continue;
-        w = nv.u.obj;
-        if (!js_to_boolean(js_get(g_ctx, nv, "@shown"))) {
-            js_set(g_ctx, nv, "@shown", js_bool(1));
-            emit_event(w, "show", js_undef());
-            fired++;
-        }
-        if (js_to_boolean(js_get(g_ctx, nv, "@close_req")) &&
-            !js_to_boolean(js_get(g_ctx, nv, "@closed"))) {
-            js_set(g_ctx, nv, "@closed", js_bool(1));
-            emit_event(w, "close", js_undef());
-            fired++;
-        }
-    }
-    return fired;
 }
 
 /* ------------------------------------------------------- crypto ----------- *
@@ -4852,23 +4648,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url) {
         gc_pop_scope();
     }
 
-    /* Notification (W3C): posts to notifyd, events driven by js_notifications_pump */
-    def_method(g_notification_proto, "close", notif_close_m, 0);
-    def_method(g_notification_proto, "addEventListener", el_add_listener, 3);
-    def_method(g_notification_proto, "removeEventListener", el_remove_listener, 3);
-    def_method(g_notification_proto, "dispatchEvent", el_dispatch, 1);
-    {
-        js_object *nc = js_new_native(ctx, notification_ctor, "Notification", 1);
-        gc_push_scope(); gc_keep(nc);
-        js_def(nc, "prototype", js_obj_value(g_notification_proto), 0);
-        js_def(g_notification_proto, "constructor", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
-        js_object *pg = (js_object *)gc_keep(js_new_native(ctx, notif_get_permission, "permission", 0));
-        js_def_accessor(nc, "permission", pg, 0, P_CONFIGURABLE);
-        js_def_native(ctx, nc, "requestPermission", notif_request_permission, 1);
-        js_def(nc, "maxActions", js_number(NOTIFY_MAX_BUTTONS), P_ENUMERABLE);
-        js_def(win, "Notification", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
-        gc_pop_scope();
-    }
+    js_notification_setup(ctx, win, g_notification_proto, g_notifications);
 
     /* XMLHttpRequest (synchronous transport over browser_cors_fetch) */
     def_method(g_xhr_proto, "open", xhr_open, 2);
@@ -5544,6 +5324,7 @@ void js_page_end(void) {
     gc_remove_root((void **)&g_bchannels);
     gc_remove_root((void **)&g_notification_proto);
     gc_remove_root((void **)&g_notifications);
+    js_notification_teardown();
     gc_remove_root((void **)&g_timers);
     js_idb_teardown();
     js_webapi_teardown();

@@ -78,6 +78,8 @@ js_object *make_response(js_ctx *ctx, const char *url, int status, const char *s
                          const char *ctype, const char *body, int len);  /* fetch Response */
 void     notif_app_name(char *buf, int cap);    /* the app name for a Notification  */
 int      perm_state_now(int feature);           /* current permission state (PERM_*) */
+const char *perm_state_str(int state);
+int      worker_permission(int feature);
 void     report_exc(js_ctx *ctx);               /* print + clear a pending exception */
 js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc); /* window.fetch */
 void     emit_event(js_object *w, const char *type, js_value data); /* fire a plain Event on w */

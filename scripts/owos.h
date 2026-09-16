@@ -68,6 +68,22 @@ static inline int utf8_encode(unsigned cp, char *out) {
     out[0] = (char)(0xF0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
     out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F)); return 4;
 }
+static inline int utf8_decode(const char *s, const char *end, unsigned *cp) {
+	unsigned char c = (unsigned char)s[0];
+	int n = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+	unsigned v = c & (n == 1 ? 0x7F : n == 2 ? 0x1F : n == 3 ? 0x0F : 0x07);
+	int i;
+	if (s + n > end) { *cp = 0xFFFD; return 1; }
+	for (i = 1; i < n; i++) {
+		if (((unsigned char)s[i] & 0xC0) != 0x80) { *cp = 0xFFFD; return 1; }
+		v = (v << 6) | ((unsigned char)s[i] & 0x3F);
+	}
+	*cp = v;
+	return n;
+}
+
+unsigned msec(void);
+long long now_ms(void);
 
 /* Guest network + CSPRNG decls the freestanding net libs (stun.c, resolve.c)
  * pull from the real owos.h. Host tests exercise only the wire codecs, so the
