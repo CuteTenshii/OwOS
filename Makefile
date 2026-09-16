@@ -19,7 +19,9 @@
 .DEFAULT_GOAL := all
 .PHONY: all test format format-check run debug iso run-iso run-iso-uefi usb clean distclean
 
-FORMAT_FILES := $(shell find boot drivers kernel user -type f \( -name '*.c' -o -name '*.h' \))
+FORMAT_FILES := $(shell find boot drivers kernel user -type f \( -name '*.c' -o -name '*.h' \) \
+	! -path 'kernel/font*.h' ! -path 'user/lib/gfx/font*.h' \
+	! -path 'user/lib/mp3/minimp3.h')
 CLANG_FORMAT ?= clang-format
 
 include toolchain.mk

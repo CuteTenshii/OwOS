@@ -1,17 +1,4 @@
 BasedOnStyle: LLVM
 Language: Cpp
-
-IndentWidth: 8
-TabWidth: 8
-UseTab: Always
-ColumnLimit: 100
 BreakBeforeBraces: Linux
-PointerAlignment: Right
-DerivePointerAlignment: false
-
-SortIncludes: Never
-ReflowComments: false
-IndentCaseLabels: false
-AllowShortFunctionsOnASingleLine: Empty
-AllowShortIfStatementsOnASingleLine: WithoutElse
-AllowShortLoopsOnASingleLine: true
+ColumnLimit: 120
