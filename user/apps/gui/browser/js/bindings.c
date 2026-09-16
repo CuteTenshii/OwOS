@@ -1795,7 +1795,7 @@ static js_value el_get_by_tag(js_ctx *ctx, js_value t, js_value *args, int argc)
 static js_value el_query(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  return wrap_node(js_dom_query(n, arg_str(ctx, A(0))));
+  return wrap_node(js_dom_find_selector(n, arg_str(ctx, A(0))));
 }
 static js_value el_query_all(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -2034,8 +2034,6 @@ static struct dom_node *doc_root_of(js_value t)
   struct dom_node *r = node_of(t);
   return r ? r : g_doc_root;
 }
-static struct dom_node *doc_first_tag_in(struct dom_node *root, const char *tag) { return js_dom_find_tag(root, tag); }
-static struct dom_node *doc_first_tag(const char *tag) { return doc_first_tag_in(g_doc_root, tag); }
 
 static js_value doc_get_by_id(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -2054,7 +2052,7 @@ static js_value doc_get_by_tag(js_ctx *ctx, js_value t, js_value *args, int argc
 }
 static js_value doc_query(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  return wrap_node(js_dom_query(doc_root_of(t), arg_str(ctx, A(0))));
+  return wrap_node(js_dom_find_selector(doc_root_of(t), arg_str(ctx, A(0))));
 }
 static js_value doc_query_all(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -2093,7 +2091,7 @@ static js_value doc_create_el_ns(js_ctx *ctx, js_value t, js_value *args, int ar
 }
 static js_value doc_body(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  struct dom_node *root = doc_root_of(t), *b = doc_first_tag_in(root, "body");
+  struct dom_node *root = doc_root_of(t), *b = js_dom_find_tag(root, "body");
   (void)ctx;
   (void)args;
   (void)argc;
@@ -2104,11 +2102,11 @@ static js_value doc_head(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)ctx;
   (void)args;
   (void)argc;
-  return wrap_node(doc_first_tag_in(doc_root_of(t), "head"));
+  return wrap_node(js_dom_find_tag(doc_root_of(t), "head"));
 }
 static js_value doc_active_element(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  struct dom_node *b = doc_first_tag_in(doc_root_of(t), "body"); /* no focus tracking */
+  struct dom_node *b = js_dom_find_tag(doc_root_of(t), "body"); /* no focus tracking */
   (void)ctx;
   (void)args;
   (void)argc;
@@ -2116,7 +2114,7 @@ static js_value doc_active_element(js_ctx *ctx, js_value t, js_value *args, int 
 }
 static js_value doc_root_el(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  struct dom_node *root = doc_root_of(t), *h = doc_first_tag_in(root, "html");
+  struct dom_node *root = doc_root_of(t), *h = js_dom_find_tag(root, "html");
   (void)ctx;
   (void)args;
   (void)argc;
@@ -2124,16 +2122,16 @@ static js_value doc_root_el(js_ctx *ctx, js_value t, js_value *args, int argc)
 }
 static js_value doc_get_title(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  struct dom_node *ti = doc_first_tag_in(doc_root_of(t), "title");
+  struct dom_node *ti = js_dom_find_tag(doc_root_of(t), "title");
   (void)args;
   (void)argc;
   return ti ? text_content_value(ctx, ti) : js_mk_cstring(ctx, "");
 }
 static js_value doc_set_title(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  struct dom_node *root = doc_root_of(t), *ti = doc_first_tag_in(root, "title");
+  struct dom_node *root = doc_root_of(t), *ti = js_dom_find_tag(root, "title");
   if (!ti) {
-    struct dom_node *head = doc_first_tag_in(root, "head");
+    struct dom_node *head = js_dom_find_tag(root, "head");
     ti = dom_new_element("title");
     if (ti)
       dom_append_child(head ? head : root, ti);
