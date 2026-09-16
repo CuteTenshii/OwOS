@@ -1,6 +1,14 @@
 #include "classlist.h"
 #include "owos.h"
 
+static char *dup_empty(void)
+{
+  char *s = malloc(1);
+  if (s)
+    s[0] = '\0';
+  return s;
+}
+
 static int is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
 
 int classlist_has(const char *classes, const char *token, int length)
@@ -14,7 +22,7 @@ int classlist_has(const char *classes, const char *token, int length)
     start = classes;
     while (*classes && !is_space(*classes))
       classes++;
-    if (classes - start == length && !memcmp(start, token, (size_t)length))
+    if (classes - start == length && !memcmp(start, token, (unsigned)length))
       return 1;
   }
   return 0;
@@ -69,12 +77,12 @@ static void append(char **out, int *length, int *capacity, const char *token, in
     int next = *capacity ? *capacity * 2 : 32;
     while (next < need)
       next *= 2;
-    *out = realloc(*out, (size_t)next);
+    *out = realloc(*out, (unsigned)next);
     *capacity = next;
   }
   if (*length)
     (*out)[(*length)++] = ' ';
-  memcpy(*out + *length, token, (size_t)token_length);
+  memcpy(*out + *length, token, (unsigned)token_length);
   *length += token_length;
   (*out)[*length] = 0;
 }
@@ -87,15 +95,15 @@ static void rebuild(char **classes, const char *replace, int replace_length, con
   const char *current = *classes ? *classes : "";
 
   for (index = 0; (token = classlist_nth(current, index, &length)); index++) {
-    if (replace && length == remove_length && !memcmp(token, remove, (size_t)length))
+    if (replace && length == remove_length && !memcmp(token, remove, (unsigned)length))
       token = replace, length = replace_length;
-    else if (remove && length == remove_length && !memcmp(token, remove, (size_t)length))
+    else if (remove && length == remove_length && !memcmp(token, remove, (unsigned)length))
       continue;
     if (!classlist_has(out, token, length))
       append(&out, &out_length, &capacity, token, length);
   }
   free(*classes);
-  *classes = out ? out : strdup("");
+  *classes = out ? out : dup_empty();
 }
 
 void classlist_add(char **classes, const char *token, int length)
@@ -110,7 +118,7 @@ void classlist_add(char **classes, const char *token, int length)
   if (token && length > 0 && !classlist_has(out, token, length))
     append(&out, &out_length, &capacity, token, length);
   free(*classes);
-  *classes = out ? out : strdup("");
+  *classes = out ? out : dup_empty();
 }
 
 void classlist_remove(char **classes, const char *token, int length) { rebuild(classes, 0, 0, token, length); }

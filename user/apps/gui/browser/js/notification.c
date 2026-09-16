@@ -1,5 +1,5 @@
-#include "js_notification.h"
-#include "jsint.h"
+#include "notification.h"
+#include "../jsint.h"
 #include "notify.h"
 
 static js_ctx *ctx;

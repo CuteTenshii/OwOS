@@ -14,10 +14,10 @@
  */
 #include "../bmedia.h" /* HTMLMediaElement: <audio>/<video> + new Audio()      */
 #include "cast.h"   /* Google Cast sender: HTMLMediaElement.remote backend  */
-#include "../classlist.h"
+#include "classlist.h"
 #include "clipboard.h" /* clip_put / clip_get for navigator.clipboard          */
 #include "../cors.h"      /* cors_origin / cors_same_origin: SW scope + cache keys */
-#include "../js_notification.h"
+#include "notification.h"
 #include "../jsint.h"     /* internal shared surface (engine ctx + helpers + A())  */
 #include "dom_query.h"
 #include "notify.h"    /* notify_send: surface Notification() on the desktop    */

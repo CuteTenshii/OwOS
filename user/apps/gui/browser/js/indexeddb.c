@@ -4,7 +4,7 @@
  * In-memory, per-page storage driven cooperatively by js_idb_pump (mirroring
  * js_timers_pump), installed onto `window` by js_idb_setup. Split out of js.c;
  * shares the page engine context and the DOM/event helpers via jsint.h. */
-#include "jsint.h"
+#include "../jsint.h"
 
 /* ---------------------------------------------------------- IndexedDB ------ *
  *

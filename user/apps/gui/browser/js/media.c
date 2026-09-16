@@ -4,9 +4,9 @@
  * media and remote prototypes are allocated in setup_dom's batch and configured
  * here (setup_media_proto/setup_remote_proto). Split out of js.c; shares the
  * page engine context + helpers via jsint.h. */
-#include "bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
+#include "../bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
 #include "cast.h"   /* Google Cast sender: RemotePlayback backend             */
-#include "jsint.h"
+#include "../jsint.h"
 
 /* The single active Cast session + its liveness state, private to this module
  * (only the media handlers, js_cast_pump and js_cast_page_end touch them). */

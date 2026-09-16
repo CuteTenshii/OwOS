@@ -7,8 +7,8 @@
  * sw_intercept_fetch lets the core fetch() consult a controlling worker. Split
  * out of js.c; shares the page engine context and the DOM/fetch/notification
  * helpers via jsint.h. */
-#include "cors.h" /* cors_origin / cors_same_origin: SW scope + cache keys */
-#include "jsint.h"
+#include "../cors.h" /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "../jsint.h"
 #include "notify.h" /* notify_send: a service worker's showNotification()    */
 
 /* ------------------------------------------------------- service workers --- *

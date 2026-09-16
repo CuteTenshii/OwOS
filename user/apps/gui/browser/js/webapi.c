@@ -3,7 +3,7 @@
  * over the engine's UTF-8 string bytes; installed onto `window` by
  * js_webapi_setup. Split out of js.c; shares the page engine context + helpers
  * via jsint.h. */
-#include "jsint.h"
+#include "../jsint.h"
 
 /* ---- performance / TextEncoder / TextDecoder (Web platform APIs) --------- *
  *
