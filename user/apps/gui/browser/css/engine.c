@@ -200,6 +200,7 @@ struct css_sheet {
    * entry lives in exactly one bucket chain, so teardown just walks them. */
   struct css_idx *id_b[CSS_NBUCK], *cls_b[CSS_NBUCK], *tag_b[CSS_NBUCK], *uni;
   int idx_gen;
+  int idx_failed;
   struct css_rule **cand;
   int cand_cap;
   struct css_rule **match;
@@ -5032,15 +5033,16 @@ static void index_clear(css_sheet *sh)
   sh->uni = 0;
 }
 
-static void index_put(struct css_idx **head, struct css_rule *r, const char *key)
+static int index_put(struct css_idx **head, struct css_rule *r, const char *key)
 {
   struct css_idx *e = malloc(sizeof *e);
   if (!e)
-    return; /* OOM: the rule just isn't indexed here */
+    return 0;
   e->rule = r;
   e->key = key;
   e->next = *head;
   *head = e;
+  return 1;
 }
 
 static void ensure_index(css_sheet *sh)
@@ -5048,18 +5050,29 @@ static void ensure_index(css_sheet *sh)
   if (sh->idx_gen == sh->gen)
     return;
   index_clear(sh);
+  sh->idx_failed = 0;
   for (struct css_rule *r = sh->head; r; r = r->next) {
     struct idx_key keys[32];
     int nk = 0;
     if (!compound_keys(&r->sel.step[r->sel.n - 1], keys, 32, &nk) || nk == 0) {
-      index_put(&sh->uni, r, 0);
+      if (!index_put(&sh->uni, r, 0)) {
+        sh->idx_failed = 1;
+        break;
+      }
       continue;
     }
     for (int i = 0; i < nk; i++) {
       struct css_idx **tab = keys[i].kind == KK_ID ? sh->id_b : keys[i].kind == KK_CLS ? sh->cls_b : sh->tag_b;
-      index_put(&tab[css_hash(keys[i].str)], r, keys[i].str);
+      if (!index_put(&tab[css_hash(keys[i].str)], r, keys[i].str)) {
+        sh->idx_failed = 1;
+        break;
+      }
     }
+    if (sh->idx_failed)
+      break;
   }
+  if (sh->idx_failed)
+    index_clear(sh);
   sh->idx_gen = sh->gen;
 }
 
@@ -5110,6 +5123,9 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el)
         failed = 1;                                                                                                    \
     }                                                                                                                  \
   } while (0)
+  if (sh->idx_failed)
+    for (struct css_rule *r = sh->head; r; r = r->next)
+      ADD(r);
   for (struct css_idx *e = sh->uni; e; e = e->next)
     ADD(e->rule);
   if (el->tag[0])
