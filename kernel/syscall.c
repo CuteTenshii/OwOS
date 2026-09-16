@@ -43,6 +43,8 @@
 #include "sched.h"
 #include "shell.h"
 #include "smbios.h"
+#include "syscall_fs.h"
+#include "syscall_path.h"
 #include "syscall_process.h"
 #include "sysfs.h"
 #include "timer.h"
@@ -216,14 +218,12 @@
 
 #define NET_HOST_MAX 128
 
-#define SYS_PATH_MAX 256
-
 /* Turn a user-supplied name into an absolute owofs path: an absolute name
  * ("/foo/bar") passes through; a relative one is joined onto the calling
  * process's cwd, so `curl -o out.txt` (and any program's readfile/writefile)
  * lands in the directory the user is actually in. owofs resolves "." / ".." in
  * the result, so the join can be naive. */
-static void join_cwd(const char *name, char *out, int outsz)
+void join_cwd(const char *name, char *out, int outsz)
 {
   int n = 0;
   if (name[0] != '/') {
@@ -242,7 +242,7 @@ static void join_cwd(const char *name, char *out, int outsz)
  * when a relative name isn't found -- the same PATH-style lookup the shell
  * does, so a program can read or run another by bare name (fork+run "curl" ->
  * /bin/curl). */
-static int read_with_path(const char *name, void *buf, uint32_t max)
+int read_with_path(const char *name, void *buf, uint32_t max)
 {
   char abs[SYS_PATH_MAX];
   join_cwd(name, abs, sizeof abs);
@@ -263,7 +263,7 @@ static int read_with_path(const char *name, void *buf, uint32_t max)
 
 /* Resolve `name` (cwd-relative, then /bin) to an absolute owofs path that
  * exists; fills `out`, returns 0 / -1. */
-static int resolve_path(const char *name, char *out, int outcap)
+int resolve_path(const char *name, char *out, int outcap)
 {
   uint32_t sz;
   join_cwd(name, out, (uint32_t)outcap);
@@ -284,7 +284,7 @@ static int resolve_path(const char *name, char *out, int outcap)
 /* pread: read up to `len` bytes at byte `off`. Clamps to the file size and
  * returns a short count (0 = EOF), so a program can stream a file far
  * larger than its 1.5 MiB window — e.g. an image viewer decoding a big PNG. */
-static int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t len)
+int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t len)
 {
   char abs[SYS_PATH_MAX];
   uint32_t size = 0;
@@ -309,7 +309,7 @@ extern void isr128(void); /* the int 0x80 stub (isr.S)               */
 /* Unix seconds (UTC) -> civil date/time (Howard Hinnant's days-from-civil
  * inverse). Any time source can drive SYS_SETRTC; rtc_set wants broken-down
  * fields, so the conversion lives here rather than in each caller. */
-static void epoch_to_rtc(uint32_t secs, struct rtc_time *t)
+void epoch_to_rtc(uint32_t secs, struct rtc_time *t)
 {
   uint32_t days = secs / 86400u, rem = secs % 86400u;
   t->hour = (uint8_t)(rem / 3600u);
@@ -649,62 +649,26 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_READFILE: {
-    char name[SYS_PATH_MAX];
-    uint32_t buf = r->ecx, max = r->edx;
-    if (copyin_str(r->ebx, name, sizeof name) != 0 || !user_out_range(buf, max)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)read_with_path(name, (void *)buf, max);
+    syscall_fs_readfile(r);
     break;
   }
   case SYS_WRITEFILE: {
-    char name[SYS_PATH_MAX];
-    uint32_t buf = r->ecx, len = r->edx;
-    if (copyin_str(r->ebx, name, sizeof name) != 0 || !user_range(buf, len)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    char abs[SYS_PATH_MAX];
-    join_cwd(name, abs, sizeof abs);
-    const char *proc = procfs_subpath(abs);
-    if (proc && proc[0]) { /* /proc/<x> is a control node, not a file */
-      r->eax = (uint32_t)procfs_write(proc, (const char *)buf, (int)len);
-      break;
-    }
-    const char *sysp = sysfs_subpath(abs); /* /sys/<...> writable attribute */
-    if (sysp && sysp[0]) {
-      r->eax = (uint32_t)sysfs_write(sysp, (const char *)buf, (int)len);
-      break;
-    }
-    r->eax = (uint32_t)fs_create(abs, (const void *)buf, len);
+    syscall_fs_writefile(r);
     break;
   }
   /* Streaming write: begin -> write* -> end, for a file too big to hold in one
    * user buffer (a browser download). Mirrors fs_stream_* one-to-one; owofs
    * allows a single open stream at a time. */
   case SYS_STREAM_BEGIN: {
-    char name[SYS_PATH_MAX];
-    if (copyin_str(r->ebx, name, sizeof name) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    char abs[SYS_PATH_MAX];
-    join_cwd(name, abs, sizeof abs);
-    r->eax = (uint32_t)fs_stream_begin(abs);
+    syscall_fs_stream_begin(r);
     break;
   }
   case SYS_STREAM_WRITE: {
-    uint32_t buf = r->ebx, len = r->ecx;
-    if (!user_range(buf, len)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)fs_stream_write((const void *)buf, len);
+    syscall_fs_stream_write(r);
     break;
   }
   case SYS_STREAM_END:
-    r->eax = (uint32_t)fs_stream_end();
+    syscall_fs_stream_end(r);
     break;
   case SYS_NET_CONNECT: {
     if ((int)r->edx == SK_RAWETH) { /* raw L2 socket: no host, root-only */
@@ -954,28 +918,7 @@ void syscall_dispatch(struct registers *r)
     r->eax = uwin_fb_vaddr((int)r->ebx);
     break;
   case SYS_READFILE_AT: {
-    /* ebx -> {name, offset, buf, len}. Copy the name in with a per-byte
-     * bounds check, validate the destination buffer, then stream-read. */
-    if (!user_range(r->ebx, 16)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint32_t a[4];
-    if (copyin(a, r->ebx, sizeof a) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    uint32_t np = a[0], off = a[1], bp = a[2], len = a[3];
-    char name[SYS_PATH_MAX];
-    if (copyin_str(np, name, sizeof name) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    if (len && !user_out_range(bp, len)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)read_at_with_path(name, off, (void *)bp, len);
+    syscall_fs_readfile_at(r);
     break;
   }
   /* Report present removable devices, so the file explorer can list them as
@@ -1064,44 +1007,19 @@ void syscall_dispatch(struct registers *r)
   /* Filesystem management for a shell. Each joins a relative name onto
    * the caller's cwd (like readfile/writefile) before hitting owofs. */
   case SYS_MKDIR: {
-    char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
-    if (copyin_str(r->ebx, name, sizeof name) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    join_cwd(name, abs, sizeof abs);
-    r->eax = (uint32_t)fs_mkdir(abs);
+    syscall_fs_mkdir(r);
     break;
   }
   case SYS_RMDIR: {
-    char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
-    if (copyin_str(r->ebx, name, sizeof name) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    join_cwd(name, abs, sizeof abs);
-    r->eax = (uint32_t)fs_rmdir(abs);
+    syscall_fs_rmdir(r);
     break;
   }
   case SYS_DELETE: {
-    char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
-    if (copyin_str(r->ebx, name, sizeof name) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    join_cwd(name, abs, sizeof abs);
-    r->eax = (uint32_t)fs_delete(abs);
+    syscall_fs_delete(r);
     break;
   }
   case SYS_RENAME: {
-    char na[SYS_PATH_MAX], nb[SYS_PATH_MAX], a[SYS_PATH_MAX], b[SYS_PATH_MAX];
-    if (copyin_str(r->ebx, na, sizeof na) != 0 || copyin_str(r->ecx, nb, sizeof nb) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    join_cwd(na, a, sizeof a);
-    join_cwd(nb, b, sizeof b);
-    r->eax = (uint32_t)fs_rename(a, b);
+    syscall_fs_rename(r);
     break;
   }
   /* Launch a /bin program as a DETACHED process (like the Start menu), rather
@@ -1356,19 +1274,7 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_CHDIR: {
-    char path[SYS_PATH_MAX];
-    if (copyin_str(r->ebx, path, sizeof path) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    char abs[SYS_PATH_MAX];
-    int isd = 0;
-    if (resolve_path(path, abs, sizeof abs) != 0 || fs_stat(abs, &isd, 0, 0) != 0 || !isd) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    sched_set_cwd_self(abs);
-    r->eax = 0;
+    syscall_fs_chdir(r);
     break;
   }
   case SYS_KILL:
