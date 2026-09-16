@@ -18,6 +18,7 @@ make            # build owos.bin (host gcc -m32, no cross-compiler)
 make test       # compile and run the deterministic host test suite
 make format     # format C sources and headers with clang-format
 make format-check # verify C sources and headers are clang-format clean
+make install-hooks # enable clang-format pre-commit and test pre-push hooks
 make run        # QEMU: graphical window + COM1 mirrored to the terminal
 make debug      # headless: console only, over COM1
 make run NIC=e1000   # attach the Intel 82540EM instead of the default RTL8139
@@ -54,6 +55,7 @@ seeded FAT test disks need `mkfs.fat` (dosfstools).
 | `make run` | Boot in QEMU with a graphical window; COM1 mirrored to the terminal. Adds Sound Blaster 16, the PC speaker, and a USB tablet. |
 | `make debug` | Headless — no window, the console comes out on the terminal over COM1, so a whole session can be driven and captured as text. |
 | `make test` | Compile and run the deterministic host-side tests in a temporary directory. |
+| `make install-hooks` | Enable the repository-managed pre-commit and pre-push hooks. |
 | `make iso` | Wrap the kernel in GRUB and emit a hybrid BIOS+UEFI `owos.iso`. |
 | `make run-iso` | Boot the ISO on legacy BIOS (SeaBIOS), CD only, the way a real VM would. |
 | `make run-iso-uefi` | Boot the same ISO through UEFI (OVMF firmware). |

@@ -1,0 +1,21 @@
+#!/bin/sh
+
+set -eu
+
+format_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.c' '*.h' '*.cc' '*.cpp' '*.cxx')
+[ -n "$format_files" ] || exit 0
+
+command -v clang-format >/dev/null 2>&1 || {
+	echo "error: clang-format is required for the pre-commit hook" >&2
+	exit 1
+}
+
+echo "$format_files" | while IFS= read -r file; do
+	case "$file" in
+		kernel/font*.h|user/lib/gfx/font*.h|user/lib/mp3/minimp3.h)
+			continue
+			;;
+	esac
+	clang-format -i -- "$file"
+	git add -- "$file"
+done
