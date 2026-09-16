@@ -748,8 +748,13 @@ void js_set_index(js_ctx *ctx, js_value obj, unsigned i, js_value val)
 {
   if (obj.type == JV_OBJ && obj.u.obj->kind == OBJ_ARRAY) {
     js_object *a = obj.u.obj;
-    if (i >= a->elen)
+    if (i >= a->elen) {
       js_array_set_len(ctx, a, i + 1);
+      if (i >= a->elen) {
+        js_throw_range(ctx, "out of memory");
+        return;
+      }
+    }
     a->elems[i] = val;
     return;
   }
