@@ -43,6 +43,7 @@
 #include "sched.h"
 #include "shell.h"
 #include "smbios.h"
+#include "syscall_process.h"
 #include "sysfs.h"
 #include "timer.h"
 #include "uaccess.h"
@@ -385,10 +386,10 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_EXIT:
-    sched_exit((int)r->ebx); /* terminates the task; does not return     */
+    syscall_process_exit(r);
     break;
   case SYS_FORK:
-    r->eax = (uint32_t)sched_fork(r); /* child pid to parent, 0 to child */
+    syscall_process_fork(r);
     break;
   case SYS_WAITPID:
     /* edx & WNOHANG -> non-blocking reap: return 1 reaped / 0 none, exit status
@@ -573,10 +574,10 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_MSEC:
-    r->eax = timer_us() / 1000u; /* ms since boot (wraps ~49.7 days) */
+    syscall_process_msec(r);
     break;
   case SYS_GETUID:
-    r->eax = sched_uid(); /* per-process credentials (see sched.c) */
+    syscall_process_getuid(r);
     break;
   case SYS_PORT_OPEN: {
     const char *name = (const char *)r->ebx;
@@ -935,17 +936,10 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_THREAD:
-    /* entry + stack top must both lie inside the caller's user window. */
-    if (!user_range(r->ebx, 1) || !user_range(r->ecx, 4)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    r->eax = (uint32_t)sched_create_user_thread(r->ebx, r->ecx);
+    syscall_process_thread(r);
     break;
   case SYS_SLEEP:
-    __asm__ volatile("sti"); /* int-gate IF=0; let the tick wake us */
-    timer_sleep(r->ebx);
-    r->eax = 0;
+    syscall_process_sleep(r);
     break;
   case SYS_WIN_RESIZABLE:
     r->eax = (uint32_t)uwin_set_resizable((int)r->ebx, (int)r->ecx);
@@ -1378,20 +1372,16 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_KILL:
-    r->eax = (uint32_t)sched_signal_send((int)r->ebx, (int)r->ecx);
+    syscall_process_kill(r);
     break;
   case SYS_POWER:
-    if (r->ebx == 1)
-      power_reset();
-    else
-      power_off();
-    r->eax = (uint32_t)-1; /* only reached if the action failed */
+    syscall_process_power(r);
     break;
   case SYS_SBRK:
-    r->eax = sched_sbrk((int)r->ebx); /* grow/shrink the caller's heap */
+    syscall_process_sbrk(r);
     break;
   case SYS_GETPID:
-    r->eax = sched_current_id();
+    syscall_process_getpid(r);
     break;
   case SYS_WIN_OWNS:
     r->eax = (uint32_t)uwin_pid_has_window((uint32_t)r->ebx);
@@ -1424,7 +1414,7 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_SIGPROCMASK:
-    r->eax = sched_sigprocmask((int)r->ebx, (uint32_t)r->ecx, (int)r->edx);
+    syscall_process_sigprocmask(r);
     break;
   case SYS_SIGRETURN:
     /* Restore the interrupted context from the trampoline's user frame; it sets
@@ -1775,11 +1765,10 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_STACK_ALLOC:
-    r->eax = user_stack_alloc((int)r->ebx);
+    syscall_process_stack_alloc(r);
     break;
   case SYS_STACK_FREE:
-    user_stack_free(r->ebx);
-    r->eax = 0;
+    syscall_process_stack_free(r);
     break;
 
   default:
