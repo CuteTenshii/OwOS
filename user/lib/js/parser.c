@@ -1068,6 +1068,8 @@ static js_node *parse_primary(js_parser *p)
      */
     js_node *n = mk(p, JS_BIGINT);
     n->u.str.s = js_arena_strndup(p->arena, p->cur.start, p->cur.len > 0 ? p->cur.len - 1 : 0);
+    if (!n->u.str.s)
+      p->failed = 1;
     n->u.str.len = p->cur.len > 0 ? p->cur.len - 1 : 0;
     advance(p);
     return n;
@@ -1625,7 +1627,13 @@ static js_node *parse_try(js_parser *p)
 
 /* ------------------------------------------------------- ES modules ------- */
 
-static const char *arena_str(js_parser *p, const char *s, int n) { return js_arena_strndup(p->arena, s, n); }
+static const char *arena_str(js_parser *p, const char *s, int n)
+{
+  const char *d = js_arena_strndup(p->arena, s, n);
+  if (!d)
+    p->failed = 1;
+  return d;
+}
 /* a name token inside an import/export clause: an identifier, or `default`. */
 static const char *read_name_token(js_parser *p)
 {
