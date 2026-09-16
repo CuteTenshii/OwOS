@@ -57,10 +57,10 @@ int blk_dev_io(const char *dev, blk_read_fn *r, blk_write_fn *w, int *iso);
 int blk_is_ide(void);
 
 int blk_read_sector(uint32_t lba, void *buf);
-/* Read `count` contiguous sectors at once. On IDE this batches into a single
- * READ SECTORS command; other backends fan out to blk_read_sector. */
+/* Read `count` contiguous sectors at once. */
 int blk_read(uint32_t lba, void *buf, uint32_t count);
 int blk_write_sector(uint32_t lba, const void *buf);
+int blk_write(uint32_t lba, const void *buf, uint32_t count);
 uint32_t blk_sectors(void);  /* capacity in 512-byte sectors (0 if none)*/
 const char *blk_model(void); /* backing drive's model string            */
 

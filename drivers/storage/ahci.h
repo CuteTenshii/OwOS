@@ -29,5 +29,7 @@ const char *ahci_model(void);
  * on error/timeout (no drive, DMA error). buf must hold 512 bytes. */
 int ahci_read_sector(uint32_t lba, void *buf);
 int ahci_write_sector(uint32_t lba, const void *buf);
+int ahci_read(uint32_t lba, void *buf, uint32_t count);
+int ahci_write(uint32_t lba, const void *buf, uint32_t count);
 
 #endif /* OWOS_AHCI_H */

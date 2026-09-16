@@ -28,5 +28,7 @@ const char *nvme_model(void);
  * error/timeout. buf must hold 512 bytes. */
 int nvme_read_sector(uint32_t lba, void *buf);
 int nvme_write_sector(uint32_t lba, const void *buf);
+int nvme_read(uint32_t lba, void *buf, uint32_t count);
+int nvme_write(uint32_t lba, const void *buf, uint32_t count);
 
 #endif /* OWOS_NVME_H */

@@ -127,34 +127,40 @@ static void build(uint32_t cmd[16], uint8_t opcode, uint32_t nsid, uint32_t prp1
 
 /* ---------------------------------------------------------------- I/O path */
 
-static int rw(uint32_t lba, int write)
+static int rw(uint32_t lba, uint32_t count, int write)
 {
+  if (count == 0 || count > 8)
+    return -1;
   uint32_t cmd[16];
   build(cmd, write ? IO_WRITE : IO_READ, 1, (uint32_t)dbuf);
-  cmd[10] = lba; /* CDW10: starting LBA (low)       */
-  cmd[11] = 0;   /* CDW11: starting LBA (high)      */
-  cmd[12] = 0;   /* CDW12: NLB = 0 -> 1 block       */
+  cmd[10] = lba;       /* CDW10: starting LBA (low)       */
+  cmd[11] = 0;         /* CDW11: starting LBA (high)      */
+  cmd[12] = count - 1; /* CDW12: NLB = count - 1            */
   return submit(&io_q, cmd) == 0 ? 0 : -1;
 }
 
-int nvme_read_sector(uint32_t lba, void *buf)
+int nvme_read_sector(uint32_t lba, void *buf) { return nvme_read(lba, buf, 1); }
+
+int nvme_write_sector(uint32_t lba, const void *buf) { return nvme_write(lba, buf, 1); }
+
+int nvme_read(uint32_t lba, void *buf, uint32_t count)
 {
-  if (!found || rw(lba, 0))
+  if (!found || count == 0 || count > 8 || rw(lba, count, 0))
     return -1;
   uint8_t *d = buf;
-  for (int i = 0; i < 512; i++)
+  for (uint32_t i = 0; i < count * 512; i++)
     d[i] = dbuf[i];
   return 0;
 }
 
-int nvme_write_sector(uint32_t lba, const void *buf)
+int nvme_write(uint32_t lba, const void *buf, uint32_t count)
 {
-  if (!found)
+  if (!found || count == 0 || count > 8)
     return -1;
   const uint8_t *s = buf;
-  for (int i = 0; i < 512; i++)
+  for (uint32_t i = 0; i < count * 512; i++)
     dbuf[i] = s[i];
-  return rw(lba, 1);
+  return rw(lba, count, 1);
 }
 
 int nvme_present(void) { return found; }

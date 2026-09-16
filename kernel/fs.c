@@ -345,19 +345,11 @@ static int dir_load(void)
   if (!dir)
     return -1;
   dir_cap = entries_for(sb.dir_sectors);
-  for (uint32_t s = 0; s < sb.dir_sectors; s++)
-    blk_read_sector(sb.dir_start + s, (uint8_t *)dir + s * SECTOR_SIZE);
-  return 0;
+  return blk_read(sb.dir_start, dir, sb.dir_sectors);
 }
 
 /* Write the whole directory extent back to disk. */
-static int dir_store(void)
-{
-  for (uint32_t s = 0; s < sb.dir_sectors; s++)
-    if (blk_write_sector(sb.dir_start + s, (uint8_t *)dir + s * SECTOR_SIZE) != 0)
-      return -1;
-  return 0;
-}
+static int dir_store(void) { return blk_write(sb.dir_start, dir, sb.dir_sectors); }
 
 /* Grow the directory by relocating it to a larger contiguous extent: allocate
  * double the sectors, copy the entries across, persist the new location in the
@@ -381,12 +373,11 @@ static int grow_dir(void)
   for (uint32_t i = 0; i < new_bytes; i++)
     d[i] = (i < old_bytes) ? s[i] : 0;
 
-  for (uint32_t k = 0; k < new_sectors; k++)
-    if (blk_write_sector(new_start + k, d + k * SECTOR_SIZE) != 0) {
-      kfree(nd);
-      run_mark(new_start, new_sectors, 0);
-      return -1;
-    }
+  if (blk_write(new_start, d, new_sectors) != 0) {
+    kfree(nd);
+    run_mark(new_start, new_sectors, 0);
+    return -1;
+  }
 
   uint32_t old_start = sb.dir_start, old_sectors = sb.dir_sectors;
   kfree(dir);
@@ -1100,35 +1091,7 @@ void fs_list(const char *path)
     con_write("(empty)\n");
 }
 
-int fs_read(const char *name, void *buf, uint32_t maxlen)
-{
-  const char *sub;
-  struct mnt *mv = mount_for(name, &sub);
-  if (mv) { /* /proc /sys file, /dev (-> -1), or a volume */
-    int r = rvol_read_at(mv, sub, 0, buf, maxlen);
-    return r < 0 ? -1 : r;
-  }
-  if (!mounted)
-    return -1;
-  int i = find_file(name);
-  if (i < 0)
-    return -1;
-
-  uint32_t want = dir[i].size < maxlen ? dir[i].size : maxlen;
-  uint32_t sectors = (want + SECTOR_SIZE - 1) / SECTOR_SIZE;
-  uint8_t tmp[SECTOR_SIZE];
-  uint32_t copied = 0;
-
-  for (uint32_t s = 0; s < sectors; s++) {
-    if (blk_read_sector(dir[i].start + s, tmp) != 0)
-      return -1;
-    uint32_t chunk = (want - copied) < SECTOR_SIZE ? (want - copied) : SECTOR_SIZE;
-    for (uint32_t k = 0; k < chunk; k++)
-      ((uint8_t *)buf)[copied + k] = tmp[k];
-    copied += chunk;
-  }
-  return (int)want;
-}
+int fs_read(const char *name, void *buf, uint32_t maxlen) { return fs_read_at(name, 0, buf, maxlen); }
 
 /* Size of a file in bytes, or -1 if it does not exist (or names a directory).
  */

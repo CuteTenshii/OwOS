@@ -30,8 +30,51 @@ static enum backend backend;
 static volatile uint8_t *ram_disk;
 static uint32_t ram_sectors;
 
+#define BLK_CACHE_LINES 32
+struct cache_line {
+  uint32_t lba;
+  uint8_t valid;
+  uint8_t data[512];
+};
+static struct cache_line cache[BLK_CACHE_LINES];
+
+static void cache_clear(void)
+{
+  for (int i = 0; i < BLK_CACHE_LINES; i++)
+    cache[i].valid = 0;
+}
+
+static struct cache_line *cache_slot(uint32_t lba) { return &cache[lba % BLK_CACHE_LINES]; }
+
+static int cache_read(uint32_t lba, void *buf)
+{
+  struct cache_line *c = cache_slot(lba);
+  if (!c->valid || c->lba != lba)
+    return 0;
+  memcpy(buf, c->data, sizeof c->data);
+  return 1;
+}
+
+static void cache_fill(uint32_t lba, const void *buf)
+{
+  struct cache_line *c = cache_slot(lba);
+  c->lba = lba;
+  memcpy(c->data, buf, sizeof c->data);
+  c->valid = 1;
+}
+
+static void cache_invalidate(uint32_t lba, uint32_t count)
+{
+  for (uint32_t i = 0; i < count; i++) {
+    struct cache_line *c = cache_slot(lba + i);
+    if (c->valid && c->lba == lba + i)
+      c->valid = 0;
+  }
+}
+
 void blk_init(void)
 {
+  cache_clear();
   if (ata_present())
     backend = BK_IDE;
   else if (ahci_present())
@@ -85,6 +128,7 @@ int blk_use_ram(void)
     for (uint32_t i = 0; i < bytes; i++) /* start clean (unformatted)      */
       ram_disk[i] = 0;
   }
+  cache_clear();
   backend = BK_RAM;
   return 0;
 }
@@ -160,32 +204,64 @@ int blk_dev_io(const char *dev, blk_read_fn *r, blk_write_fn *w, int *iso)
 
 int blk_read_sector(uint32_t lba, void *buf)
 {
+  if (cache_read(lba, buf))
+    return 0;
+  int rc;
   switch (backend) {
   case BK_IDE:
-    return ata_read_sector(lba, buf);
+    rc = ata_read_sector(lba, buf);
+    break;
   case BK_AHCI:
-    return ahci_read_sector(lba, buf);
+    rc = ahci_read_sector(lba, buf);
+    break;
   case BK_NVME:
-    return nvme_read_sector(lba, buf);
+    rc = nvme_read_sector(lba, buf);
+    break;
   case BK_RAM:
     if (lba >= ram_sectors)
       return -1;
     memcpy(buf, (const void *)(ram_disk + (uint32_t)lba * 512u), 512);
-    return 0;
+    rc = 0;
+    break;
   default:
     return -1;
   }
+  if (rc == 0)
+    cache_fill(lba, buf);
+  return rc;
 }
 
 int blk_read(uint32_t lba, void *buf, uint32_t count)
 {
   if (count == 0)
     return 0;
-  /* IDE gets the batched READ SECTORS path; the others have no multi-sector
-   * primitive here, so fan out to their per-sector read (RAM is a memcpy,
-   * AHCI/NVMe already issue one fast command each). */
+  /* Keep requests within the one-page DMA buffers used by AHCI and NVMe. */
   if (backend == BK_IDE)
     return ata_read(lba, buf, count);
+  if (backend == BK_AHCI) {
+    uint8_t *p = buf;
+    while (count) {
+      uint32_t n = count > 8 ? 8 : count;
+      if (ahci_read(lba, p, n) != 0)
+        return -1;
+      lba += n;
+      p += n * 512;
+      count -= n;
+    }
+    return 0;
+  }
+  if (backend == BK_NVME) {
+    uint8_t *p = buf;
+    while (count) {
+      uint32_t n = count > 8 ? 8 : count;
+      if (nvme_read(lba, p, n) != 0)
+        return -1;
+      lba += n;
+      p += n * 512;
+      count -= n;
+    }
+    return 0;
+  }
   uint8_t *p = buf;
   for (uint32_t i = 0; i < count; i++, p += 512)
     if (blk_read_sector(lba + i, p) != 0)
@@ -195,6 +271,7 @@ int blk_read(uint32_t lba, void *buf, uint32_t count)
 
 int blk_write_sector(uint32_t lba, const void *buf)
 {
+  cache_invalidate(lba, 1);
   switch (backend) {
   case BK_IDE:
     return ata_write_sector(lba, buf);
@@ -210,6 +287,47 @@ int blk_write_sector(uint32_t lba, const void *buf)
   default:
     return -1;
   }
+}
+
+int blk_write(uint32_t lba, const void *buf, uint32_t count)
+{
+  if (count == 0)
+    return 0;
+  cache_invalidate(lba, count);
+  if (backend == BK_IDE) {
+    for (uint32_t i = 0; i < count; i++)
+      if (ata_write_sector(lba + i, (const uint8_t *)buf + i * 512) != 0)
+        return -1;
+    return 0;
+  }
+  if (backend == BK_AHCI) {
+    const uint8_t *p = buf;
+    while (count) {
+      uint32_t n = count > 8 ? 8 : count;
+      if (ahci_write(lba, p, n) != 0)
+        return -1;
+      lba += n;
+      p += n * 512;
+      count -= n;
+    }
+    return 0;
+  }
+  if (backend == BK_NVME) {
+    const uint8_t *p = buf;
+    while (count) {
+      uint32_t n = count > 8 ? 8 : count;
+      if (nvme_write(lba, p, n) != 0)
+        return -1;
+      lba += n;
+      p += n * 512;
+      count -= n;
+    }
+    return 0;
+  }
+  for (uint32_t i = 0; i < count; i++, lba++, buf = (const uint8_t *)buf + 512)
+    if (blk_write_sector(lba, buf) != 0)
+      return -1;
+  return 0;
 }
 
 uint32_t blk_sectors(void)

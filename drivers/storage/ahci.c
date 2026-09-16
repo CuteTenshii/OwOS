@@ -83,7 +83,7 @@ static char model[41]; /* drive model from IDENTIFY                   */
 static volatile uint32_t *clb; /* command list (32 headers x 32 B)           */
 static volatile uint8_t *fis;  /* received-FIS area                          */
 static volatile uint8_t *ctab; /* one command table (CFIS + PRDT)            */
-static volatile uint8_t *dbuf; /* 512-byte DMA bounce buffer                 */
+static volatile uint8_t *dbuf; /* one-page DMA bounce buffer                 */
 
 /* ----------------------------------------------------------------- MMIO + I/O
  */
@@ -122,8 +122,10 @@ static void port_start(void)
 
 /* Build a one-sector READ/WRITE DMA EXT command in slot 0 and ring PxCI.
  * Returns 0 on success, -1 on timeout or task-file error. */
-static int issue(uint32_t lba, uint8_t ata_cmd, int write)
+static int issue(uint32_t lba, uint32_t count, uint8_t ata_cmd, int write)
 {
+  if (count == 0 || count > 8)
+    return -1;
   port_wr(PX_SERR, 0xFFFFFFFFu); /* clear sticky errors            */
   port_wr(PX_IS, 0xFFFFFFFFu);   /* clear port interrupt status    */
 
@@ -155,14 +157,14 @@ static int issue(uint32_t lba, uint8_t ata_cmd, int write)
   ct[6] = (lba >> 16) & 0xFF;
   ct[7] = 0x40; /* LBA mode                       */
   ct[8] = (lba >> 24) & 0xFF;
-  ct[12] = 1; /* sector count (low) = 1         */
+  ct[12] = (uint8_t)count; /* sector count (low)                 */
 
   /* PRDT entry 0 (at offset 0x80): point at the bounce buffer, 512 bytes. */
   volatile uint32_t *prdt = (volatile uint32_t *)(ctab + 0x80);
   prdt[0] = (uint32_t)dbuf; /* data base (phys)               */
   prdt[1] = 0;
   prdt[2] = 0;
-  prdt[3] = (512 - 1) & 0x3FFFFF; /* byte count - 1, no IRQ         */
+  prdt[3] = (count * 512 - 1) & 0x3FFFFF; /* byte count - 1, no IRQ */
 
   port_wr(PX_CI, 1); /* ring the doorbell for slot 0   */
 
@@ -179,26 +181,30 @@ static int issue(uint32_t lba, uint8_t ata_cmd, int write)
   return 0;
 }
 
-int ahci_read_sector(uint32_t lba, void *buf)
+int ahci_read_sector(uint32_t lba, void *buf) { return ahci_read(lba, buf, 1); }
+
+int ahci_write_sector(uint32_t lba, const void *buf) { return ahci_write(lba, buf, 1); }
+
+int ahci_read(uint32_t lba, void *buf, uint32_t count)
 {
-  if (!found)
-    return -1;
-  if (issue(lba, ATA_READ_DMA_EX, 0))
+  if (!found || count == 0 || count > 8 || issue(lba, count, ATA_READ_DMA_EX, 0))
     return -1;
   uint8_t *d = buf;
-  for (int i = 0; i < 512; i++)
+  for (uint32_t i = 0; i < count * 512; i++)
     d[i] = dbuf[i];
   return 0;
 }
 
-int ahci_write_sector(uint32_t lba, const void *buf)
+int ahci_write(uint32_t lba, const void *buf, uint32_t count)
 {
+  if (!found || count == 0 || count > 8)
+    return -1;
   if (!found)
     return -1;
   const uint8_t *s = buf;
-  for (int i = 0; i < 512; i++)
+  for (uint32_t i = 0; i < count * 512; i++)
     dbuf[i] = s[i];
-  return issue(lba, ATA_WRITE_DMA_EX, 1);
+  return issue(lba, count, ATA_WRITE_DMA_EX, 1);
 }
 
 int ahci_present(void) { return found; }
@@ -214,7 +220,7 @@ const char *ahci_model(void) { return model; }
 static uint32_t identify_drive(void)
 {
   model[0] = '\0';
-  if (issue(0, 0xEC, 0))
+  if (issue(0, 1, 0xEC, 0))
     return 0;
   const volatile uint16_t *id = (const volatile uint16_t *)dbuf;
 
