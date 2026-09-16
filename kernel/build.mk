@@ -34,7 +34,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         drivers/audio/sb16.o drivers/audio/hda.o \
         kernel/cpu.o kernel/smp.o kernel/smp_ap.o kernel/rtc.o drivers/acpi/power.o drivers/acpi/s3_wake.o drivers/acpi/battery.o \
         kernel/firmware.o kernel/smbios.o drivers/acpi/aml.o drivers/video/edid.o \
-        kernel/syscall.o kernel/syscall_process.o kernel/syscall_fs.o kernel/syscall_net.o kernel/syscall_window.o kernel/syscall_audio.o kernel/syscall_graphics.o kernel/syscall_io.o kernel/loader.o kernel/pipe.o kernel/ipc.o \
+        kernel/syscall.o kernel/syscall_process.o kernel/syscall_fs.o kernel/syscall_net.o kernel/syscall_window.o kernel/syscall_audio.o kernel/syscall_graphics.o kernel/syscall_io.o kernel/syscall_signal.o kernel/loader.o kernel/pipe.o kernel/ipc.o \
         drivers/bus/vmware.o drivers/bus/vmtools.o drivers/input/vmmouse.o drivers/input/synaptics.o drivers/video/vmsvga.o \
         drivers/video/fb.o drivers/video/mtrr.o drivers/input/mouse.o kernel/uwin.o kernel/crash.o \
         kernel/edit_blob.o kernel/curl_blob.o \

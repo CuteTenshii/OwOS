@@ -50,6 +50,7 @@
 #include "syscall_net.h"
 #include "syscall_path.h"
 #include "syscall_process.h"
+#include "syscall_signal.h"
 #include "syscall_window.h"
 #include "sysfs.h"
 #include "timer.h"
@@ -873,40 +874,16 @@ void syscall_dispatch(struct registers *r)
     syscall_window_owns(r);
     break;
   case SYS_SIGACTION: {
-    struct k_sigaction kact, kold;
-    const struct k_sigaction *ap = 0;
-    if (r->ecx) {
-      if (!user_range(r->ecx, sizeof kact)) {
-        r->eax = (uint32_t)-1;
-        break;
-      }
-      if (copyin(&kact, r->ecx, sizeof kact) != 0) {
-        r->eax = (uint32_t)-1;
-        break;
-      }
-      ap = &kact;
-    }
-    /* Validate the oldact output pointer BEFORE mutating the disposition, so a
-     * bogus oldact can't leave the handler installed while reporting failure.
-     */
-    if (r->edx && !user_out_range(r->edx, sizeof kold)) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    int rc = sched_sigaction((int)r->ebx, ap, r->edx ? &kold : 0);
-    if (rc == 0 && r->edx && copyout(r->edx, &kold, sizeof kold) != 0)
-      rc = -1;
-    r->eax = (uint32_t)rc;
+    syscall_signal_action(r);
     break;
   }
   case SYS_SIGPROCMASK:
-    syscall_process_sigprocmask(r);
+    syscall_signal_procmask(r);
     break;
   case SYS_SIGRETURN:
-    /* Restore the interrupted context from the trampoline's user frame; it sets
-     * r->eax itself (to the saved eax), so don't overwrite it below. */
-    sched_sigreturn(r);
+    syscall_signal_return(r);
     break;
+
   case SYS_STAT: {
     syscall_fs_stat(r);
     break;
