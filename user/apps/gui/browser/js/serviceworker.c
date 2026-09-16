@@ -154,6 +154,12 @@ static struct sw_cache *sw_cache_find(const char *origin, const char *name, int 
     c->id = g_swc_nextid++;
     c->origin = sw_strdup(origin);
     c->name = sw_strdup(name);
+    if (!c->origin || !c->name) {
+      free(c->origin);
+      free(c->name);
+      free(c);
+      return 0;
+    }
     g_swc[g_swc_n++] = c;
     return c;
   }
@@ -216,21 +222,25 @@ static struct sw_reg *sw_reg_find_scope(const char *origin, const char *scope)
 }
 static void sw_reg_set_src(struct sw_reg *r, const char *b, int n)
 {
-  free(r->src);
-  r->src = (char *)malloc((unsigned)(n > 0 ? n : 0) + 1);
-  if (r->src) {
+  char *src = (char *)malloc((unsigned)(n > 0 ? n : 0) + 1);
+  if (src) {
     if (n > 0)
-      memcpy(r->src, b, (unsigned)n);
-    r->src[n > 0 ? n : 0] = 0;
+      memcpy(src, b, (unsigned)n);
+    src[n > 0 ? n : 0] = 0;
+    free(r->src);
+    r->src = src;
+    r->slen = n > 0 ? n : 0;
   }
-  r->slen = n > 0 ? n : 0;
 }
 static struct sw_reg *sw_reg_add(const char *origin, const char *scope, const char *script_url)
 {
   struct sw_reg *r = sw_reg_find_scope(origin, scope);
   if (r) {
+    char *url = sw_strdup(script_url);
+    if (!url)
+      return 0;
     free(r->script_url);
-    r->script_url = sw_strdup(script_url);
+    r->script_url = url;
     return r;
   }
   if (g_swr_n == g_swr_cap) {
@@ -247,6 +257,13 @@ static struct sw_reg *sw_reg_add(const char *origin, const char *scope, const ch
   r->origin = sw_strdup(origin);
   r->scope = sw_strdup(scope);
   r->script_url = sw_strdup(script_url);
+  if (!r->origin || !r->scope || !r->script_url) {
+    free(r->origin);
+    free(r->scope);
+    free(r->script_url);
+    free(r);
+    return 0;
+  }
   g_swr[g_swr_n++] = r;
   return r;
 }
