@@ -964,9 +964,7 @@ static void rx_poll(void)
 static void e1000_irq(struct registers *r)
 {
   (void)r;
-  uint32_t icr = reg_read(E1000_ICR); /* reading the cause register clears it */
-  if (icr & (INT_RXT0 | INT_RXDMT0 | INT_RXO))
-    rx_poll();
+  (void)reg_read(E1000_ICR); /* acknowledge; netrx drains the ring */
 }
 
 /* IRQ-independent RX drain, called off the timer tick (see nic_poll). Some

@@ -478,6 +478,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   hda_init();      /* HD Audio / Realtek codec (no-op if absent) */
 
   sched_init(); /* current context becomes task "main"     */
+  net_start();
   sched_create_thread("spin-a", spinner);
   sched_create_thread("spin-b", spinner);
   con_write("scheduler: 2 worker threads spawned.\n");

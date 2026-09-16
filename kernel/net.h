@@ -13,6 +13,7 @@
 #define SK_RAWETH 4 /* raw L2: send/recv full Ethernet frames (root-only, AF_PACKET) */
 
 void net_init(void);       /* bring up the NIC and announce the IP config */
+void net_start(void);      /* start the deferred receive worker */
 void net_dhcp_spawn(void); /* launch /bin/dhcpcd detached (root) to lease a link */
 
 /* Socket handles (driven from kernel/syscall.c). The HTTP/protocol

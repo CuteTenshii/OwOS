@@ -12,7 +12,6 @@
 #include "console.h"
 #include "heap.h"
 #include "io.h"
-#include "irq.h"
 #include "kstring.h"
 #include "net.h"
 #include "pci.h"
@@ -125,13 +124,13 @@ static void rx_poll(void)
   }
 }
 
-static void rtl_irq(struct registers *r)
+static void rtl_poll(void)
 {
-  (void)r;
-  uint16_t st = inw(io_base + REG_ISR);
-  outw(io_base + REG_ISR, st); /* acknowledge                     */
-  if (st & ISR_ROK)
-    rx_poll();
+  if (!nic_found)
+    return;
+  uint32_t fl = irq_save();
+  rx_poll();
+  irq_restore(fl);
 }
 
 /* --------------------------------------------------------------------- init */
@@ -161,7 +160,6 @@ static int rtl8139_probe(void)
     return 0; /* silent: the dispatch layer reports "no NIC" */
 
   uint32_t bar0 = pci_read32(bus, slot, func, 0x10);
-  uint8_t irq = (uint8_t)(pci_read32(bus, slot, func, 0x3C) & 0xFF);
   io_base = (uint16_t)(bar0 & 0xFFFC);
 
   /* Enable I/O space and bus-mastering DMA in the PCI command register. */
@@ -191,7 +189,7 @@ static int rtl8139_probe(void)
   outl(io_base + REG_RBSTART, (uint32_t)rx_buf);
   rx_cur = 0;
   outw(io_base + REG_CAPR, 0xFFF0); /* read pointer = -16              */
-  outw(io_base + REG_IMR, ISR_ROK | ISR_TOK);
+  outw(io_base + REG_IMR, 0);       /* RX/TX are drained or polled by netrx */
   /* RCR: accept broadcast/multicast/phys-match/all, WRAP, max DMA burst,
    * no RX FIFO threshold (whole frame), 8K+16 ring. */
   outl(io_base + REG_RCR, 0x0000000F | (1 << 7) | (7 << 8) | (7 << 13));
@@ -200,14 +198,9 @@ static int rtl8139_probe(void)
   for (int i = 0; i < 6; i++)
     mac[i] = inb(io_base + REG_IDR0 + i);
 
-  irq_register(irq, rtl_irq);
-  irq_unmask(irq);
-  if (irq >= 8)
-    irq_unmask(2); /* cascade line for the slave PIC  */
-
   nic_found = 1;
 
-  con_printf("net: RTL8139 at io 0x%08X irq %u mac ", io_base, irq);
+  con_printf("net: RTL8139 at io 0x%08X mac ", io_base);
   for (int i = 0; i < 6; i++) {
     print_hex2(mac[i]);
     if (i < 5)
@@ -222,4 +215,5 @@ const struct nic_ops rtl8139_ops = {
     .probe = rtl8139_probe,
     .send = rtl8139_send,
     .mac = rtl8139_mac,
+    .poll = rtl_poll,
 };

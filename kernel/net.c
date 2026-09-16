@@ -1089,6 +1089,20 @@ void net_init(void)
   con_write("net: requesting address via DHCP\n");
 }
 
+static void net_poll_thread(void)
+{
+  for (;;) {
+    nic_poll();
+    timer_sleep(1);
+  }
+}
+
+void net_start(void)
+{
+  if (nic_present())
+    sched_create_thread("netrx", net_poll_thread);
+}
+
 /* Launch /bin/dhcpcd as a detached root process to lease a link. The general
  * "run the DHCP client" primitive: used at boot and when a hot-plugged NIC (the
  * RNDIS tether) registers. Must run post-sti with IF=1 (dhcpcd waits on the RX

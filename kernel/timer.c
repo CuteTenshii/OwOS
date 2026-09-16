@@ -5,7 +5,6 @@
 #include "io.h"
 #include "irq.h"
 #include "irqflags.h"
-#include "nic.h"
 #include "sched.h"
 
 #define PIT_BASE_HZ 1193182 /* the PIT's fixed input frequency        */
@@ -33,7 +32,6 @@ static void timer_handler(struct registers *r)
   ticks++;
   entropy_stir(ticks);   /* interrupt-latency jitter feeds the CSPRNG */
   sched_wake_due(ticks); /* promote timed sleepers that are now due  */
-  nic_poll();            /* IRQ-independent NIC RX drain (VMware etc.) */
   if (tick_cb)
     tick_cb(); /* e.g. the scheduler preempts here        */
 }
