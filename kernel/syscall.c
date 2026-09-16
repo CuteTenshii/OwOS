@@ -47,6 +47,7 @@
 #include "syscall_net.h"
 #include "syscall_path.h"
 #include "syscall_process.h"
+#include "syscall_window.h"
 #include "sysfs.h"
 #include "timer.h"
 #include "uaccess.h"
@@ -717,41 +718,18 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_WIN_CREATE: {
-    int w = (int)r->ebx, h = (int)r->ecx;
-    char title[64];
-    uint32_t tp = r->edx;
-    if (tp && copyin_str(tp, title, sizeof title) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    if (!tp)
-      title[0] = '\0';
-    r->eax = (uint32_t)uwin_create(w, h, title);
+    syscall_window_create(r);
     break;
   }
   case SYS_WIN_PRESENT:
-    r->eax = (uint32_t)uwin_present((int)r->ebx);
+    syscall_window_present(r);
     break;
   case SYS_WIN_POLL: {
-    /* ecx -> win_event (or 0 to just wait); edx = block flag. Poll one event if
-     * a buffer was given; if none and block is set, sleep ~one frame. The int
-     * 0x80 gate runs IF=0, so sti before timer_sleep or a bare hlt wedges the
-     * CPU (the timer couldn't wake it). */
-    struct win_event *ev = (struct win_event *)r->ecx;
-    if (ev && !user_out_range(r->ecx, sizeof(struct win_event))) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    int got = ev ? uwin_poll((int)r->ebx, ev) : 0;
-    if (!got && (int)r->edx) {
-      __asm__ volatile("sti");
-      timer_sleep(15);
-    }
-    r->eax = (uint32_t)got;
+    syscall_window_poll(r);
     break;
   }
   case SYS_WIN_CLOSE:
-    r->eax = (uint32_t)uwin_close((int)r->ebx);
+    syscall_window_close(r);
     break;
   case SYS_RTC_EPOCH:
     r->eax = rtc_epoch(); /* Unix epoch seconds (UTC) */
@@ -789,15 +767,7 @@ void syscall_dispatch(struct registers *r)
     break;
   }
   case SYS_WIN_TITLE: {
-    char title[64];
-    uint32_t tp = r->ecx;
-    if (tp && copyin_str(tp, title, sizeof title) != 0) {
-      r->eax = (uint32_t)-1;
-      break;
-    }
-    if (!tp)
-      title[0] = '\0';
-    r->eax = (uint32_t)uwin_set_title((int)r->ebx, title);
+    syscall_window_title(r);
     break;
   }
   case SYS_THREAD:
@@ -807,16 +777,16 @@ void syscall_dispatch(struct registers *r)
     syscall_process_sleep(r);
     break;
   case SYS_WIN_RESIZABLE:
-    r->eax = (uint32_t)uwin_set_resizable((int)r->ebx, (int)r->ecx);
+    syscall_window_resizable(r);
     break;
   case SYS_WIN_CURSOR:
-    r->eax = (uint32_t)uwin_set_cursor((int)r->ebx, (int)r->ecx);
+    syscall_window_cursor(r);
     break;
   case SYS_WIN_SET_PARENT:
-    r->eax = (uint32_t)uwin_set_parent((int)r->ebx, (int)r->ecx, (int)r->edx);
+    syscall_window_set_parent(r);
     break;
   case SYS_WIN_FB:
-    r->eax = uwin_fb_vaddr((int)r->ebx);
+    syscall_window_fb(r);
     break;
   case SYS_READFILE_AT: {
     syscall_fs_readfile_at(r);
@@ -1191,7 +1161,7 @@ void syscall_dispatch(struct registers *r)
     syscall_process_getpid(r);
     break;
   case SYS_WIN_OWNS:
-    r->eax = (uint32_t)uwin_pid_has_window((uint32_t)r->ebx);
+    syscall_window_owns(r);
     break;
   case SYS_SIGACTION: {
     struct k_sigaction kact, kold;
