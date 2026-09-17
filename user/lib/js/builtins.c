@@ -5045,7 +5045,7 @@ static js_value num_toexp(js_ctx *ctx, js_value t, js_value *a, int n)
   double x = js_to_number(ctx, t);
   int has = n > 0 && a[0].type != JV_UNDEF;
   int f = has ? (int)js_to_number(ctx, a[0]) : 0;
-  char buf[160], ds[128];
+  char buf[160], ds[128] = {0};
   int p = 0, neg = 0, expo = 0, sig, i;
   if (x != x)
     return js_mk_cstring(ctx, "NaN");

@@ -251,7 +251,7 @@ static int header_value(const char *buf, int len, const char *name, char *out, i
 }
 
 /* Read the response until the CRLFCRLF header terminator. On success returns 0
- * with *resp/*resp_len the whole buffer read and *body_off the offset just past
+ * with *resp and *resp_len describing the whole buffer, and *body_off the offset just past
  * the terminator (bytes there belong to the WebSocket stream). */
 static int read_handshake(ws_conn *c, char **resp, int *resp_len, int *body_off)
 {

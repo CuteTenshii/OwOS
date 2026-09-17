@@ -608,8 +608,6 @@ struct builtin {
   const char *help;
 };
 
-static int is_builtin(const char *name);
-
 /* "which <name>..." — for each name, report whether it resolves to a shell
  * built-in or to a runnable file in owofs (checked in that order, as run()
  * would). Prints a line per name; unresolved names get a "no <name>" notice. */

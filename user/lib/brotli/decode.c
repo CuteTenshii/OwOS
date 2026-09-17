@@ -311,6 +311,8 @@ static int read_huffman(struct br *b, int alphabet, struct huff *out)
   if (hskip == 1) {
     /* Simple prefix code: 1..4 directly-listed symbols. */
     int nsym = br_read(b, 2) + 1;
+    if (nsym < 1 || nsym > 4)
+      return -1;
     int symbits = bitlen(alphabet - 1);
     int syms[4];
     for (int i = 0; i < nsym; i++) {

@@ -393,21 +393,6 @@ static int usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t d
 static void usock_icmp_deliver(const uint8_t *msg, uint32_t len);
 static void usock_raw_deliver(const uint8_t *frame, uint32_t len);
 
-static void icmp_send_echo(const uint8_t dst[4], uint16_t id, uint16_t seq)
-{
-  uint8_t pkt[8 + 32];
-  struct icmp_hdr *ic = (struct icmp_hdr *)pkt;
-  ic->type = 8;
-  ic->code = 0;
-  ic->csum = 0;
-  ic->id = htons(id);
-  ic->seq = htons(seq);
-  for (int i = 0; i < 32; i++)
-    pkt[8 + i] = (uint8_t)('a' + (i % 26));
-  ic->csum = htons(inet_csum(pkt, sizeof(pkt)));
-  ip_send(dst, IP_ICMP, pkt, sizeof(pkt));
-}
-
 static void icmp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
 {
   if (len < 8)
