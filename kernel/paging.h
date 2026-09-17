@@ -7,7 +7,7 @@
 void paging_init(void);
 
 /* Physical address of the kernel's page directory (kernel threads' CR3). */
-uint32_t paging_kernel_phys(void);
+uintptr_t paging_kernel_phys(void);
 
 /* Page-aligned frame pool, carved from identity-mapped low memory so every
  * frame is directly addressable by the kernel (physical == virtual). */

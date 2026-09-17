@@ -548,8 +548,7 @@ static int ext_read_at(struct ext_mount *m, const char *path, uint32_t offset, v
     if (chunk > len - got)
       chunk = len - got;
     if (!phys) { /* sparse hole */
-      for (uint32_t i = 0; i < chunk; i++)
-        dst[got + i] = 0;
+      memset(dst + got, 0, chunk);
     } else {
       if (read_block(m, phys, m->data_blk) != 0)
         return got ? (int)got : -1;

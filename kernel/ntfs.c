@@ -228,8 +228,7 @@ static int read_runlist(struct ntfs_mount *m, const uint8_t *mp, const uint8_t *
       chunk = len - got;
 
     if (hole) {
-      for (uint32_t i = 0; i < chunk; i++)
-        dst[got + i] = 0;
+      memset(dst + got, 0, chunk);
     } else {
       uint64_t this_lcn = (uint64_t)lcn + (want_vcn - vcn);
       if (read_cluster(m, this_lcn, m->clbuf) != 0)

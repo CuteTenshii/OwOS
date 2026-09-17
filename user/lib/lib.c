@@ -627,10 +627,11 @@ void *realloc(void *ptr, unsigned size)
     free(ptr);
     return 0;
   }
-  /* Old payload = (block units - 1) header-sized cells. Copy the smaller of the
-   * old and new sizes into a fresh block, then release the old one. */
+  /* Old payload = (block units - 1) header-sized cells. */
   Header *h = (Header *)ptr - 1;
   unsigned oldbytes = (h->s.size - 1) * sizeof(Header);
+  if (size <= oldbytes)
+    return ptr;
   void *np = malloc(size);
   if (!np)
     return 0;
@@ -672,8 +673,7 @@ void *memmove(void *d, const void *s, __SIZE_TYPE__ n)
   unsigned char *a = d;
   const unsigned char *b = s;
   if (a < b) {
-    while (n--)
-      *a++ = *b++;
+    return memcpy(d, s, n);
   } else if (a > b) {
     a += n;
     b += n;

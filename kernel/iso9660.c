@@ -344,8 +344,7 @@ static int iso_read_at(struct iso_mount *m, const char *path, uint32_t offset, v
     uint32_t chunk = ISO_SECTOR - so;
     if (chunk > len - done)
       chunk = len - done;
-    for (uint32_t i = 0; i < chunk; i++)
-      out[done + i] = m->rbuf[so + i];
+    memcpy(out + done, m->rbuf + so, chunk);
     done += chunk;
   }
   return (int)done;

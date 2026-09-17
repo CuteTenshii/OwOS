@@ -33,8 +33,7 @@ void *memmove(void *dst, const void *src, uint32_t n)
   uint8_t *d = dst;
   const uint8_t *s = src;
   if (d < s) {
-    while (n--)
-      *d++ = *s++;
+    return memcpy(dst, src, n);
   } else {
     d += n;
     s += n;
@@ -186,7 +185,7 @@ void kvformat(void (*sink)(char, void *), void *ctx, const char *fmt, va_list ap
     case 'p':
       sink('0', ctx);
       sink('x', ctx);
-      emit_uint(sink, ctx, (uint32_t)va_arg(ap, void *), 16, 0, 8, 1, 0);
+      emit_uint(sink, ctx, (uint32_t)(uintptr_t)va_arg(ap, void *), 16, 0, 8, 1, 0);
       break;
     case '%':
       sink('%', ctx);

@@ -72,6 +72,25 @@ static int frame_test(uint32_t f) { return (bitmap[f / 32] >> (f % 32)) & 1u; }
 static void frame_set(uint32_t f) { bitmap[f / 32] |= (1u << (f % 32)); }
 static void frame_clear(uint32_t f) { bitmap[f / 32] &= ~(1u << (f % 32)); }
 
+static uint32_t find_free_frame(uint32_t start, uint32_t end)
+{
+  if (start >= end)
+    return end;
+  uint32_t first = start / 32;
+  uint32_t last = (end - 1) / 32;
+  for (uint32_t word = first; word <= last; word++) {
+    uint32_t mask = ~0u;
+    if (word == first)
+      mask &= ~0u << (start & 31);
+    if (word == last && (end & 31))
+      mask &= (1u << (end & 31)) - 1;
+    uint32_t free_bits = ~bitmap[word] & mask;
+    if (free_bits)
+      return word * 32 + __builtin_ctz(free_bits);
+  }
+  return end;
+}
+
 void pmm_init(const struct multiboot_info *mbi)
 {
   /* Without a memory map we can't know what's safe; refuse to guess. */
@@ -88,7 +107,7 @@ void pmm_init(const struct multiboot_info *mbi)
   uint32_t addr = mbi->mmap_addr;
   uint32_t end = mbi->mmap_addr + mbi->mmap_length;
   while (addr < end) {
-    const struct multiboot_mmap_entry *e = (const struct multiboot_mmap_entry *)addr;
+    const struct multiboot_mmap_entry *e = (const struct multiboot_mmap_entry *)(uintptr_t)addr;
     if (e->type == MULTIBOOT_MEMORY_AVAILABLE) {
       uint64_t top = e->addr + e->len;
       if (top > highest)
@@ -136,7 +155,7 @@ void pmm_init(const struct multiboot_info *mbi)
 
   addr = mbi->mmap_addr;
   while (addr < end) {
-    const struct multiboot_mmap_entry *e = (const struct multiboot_mmap_entry *)addr;
+    const struct multiboot_mmap_entry *e = (const struct multiboot_mmap_entry *)(uintptr_t)addr;
     if (e->type == MULTIBOOT_MEMORY_AVAILABLE) {
       uint32_t f0 = (e->addr + FRAME_SIZE - 1) / FRAME_SIZE; /* round up   */
       uint32_t f1 = (e->addr + e->len) / FRAME_SIZE;         /* round down */
@@ -166,26 +185,20 @@ void pmm_init(const struct multiboot_info *mbi)
 uint32_t pmm_alloc_frame(void)
 {
   uintptr_t flags = pmm_lock_acquire();
-  for (uint32_t f = alloc_hint; f < total_frames; f++) {
-    if (!frame_test(f)) {
-      frame_set(f);
-      refs[f] = 1;
-      used_frames++;
-      alloc_hint = f + 1;
-      pmm_lock_release(flags);
-      return f * FRAME_SIZE;
-    }
+  uint32_t f = find_free_frame(alloc_hint, total_frames);
+  if (f == total_frames) {
+    /* The cursor can outrun frames freed below it; sweep from the bottom once. */
+    f = find_free_frame(low_end_b / FRAME_SIZE, alloc_hint);
+    if (f == alloc_hint)
+      f = total_frames;
   }
-  /* The cursor can outrun frames freed below it; sweep from the bottom once. */
-  for (uint32_t f = (low_end_b / FRAME_SIZE); f < alloc_hint; f++) {
-    if (!frame_test(f)) {
-      frame_set(f);
-      refs[f] = 1;
-      used_frames++;
-      alloc_hint = f + 1;
-      pmm_lock_release(flags);
-      return f * FRAME_SIZE;
-    }
+  if (f < total_frames) {
+    frame_set(f);
+    refs[f] = 1;
+    used_frames++;
+    alloc_hint = f + 1;
+    pmm_lock_release(flags);
+    return f * FRAME_SIZE;
   }
   pmm_lock_release(flags);
   return 0; /* out of physical memory */
@@ -211,8 +224,16 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
     uint32_t end = pass == 0 ? total_frames : start;
     for (uint32_t f = begin; f + need <= end;) {
       uint32_t run = 0;
-      while (run < need && !frame_test(f + run))
+      while (run < need) {
+        uint32_t cur = f + run;
+        if (!(cur & 31) && need - run >= 32 && bitmap[cur / 32] == ~0u) {
+          run += 32;
+          continue;
+        }
+        if (frame_test(cur))
+          break;
         run++;
+      }
       if (run == need) {
         for (uint32_t i = 0; i < need; i++) {
           frame_set(f + i);
@@ -232,6 +253,8 @@ uint32_t pmm_alloc_contig(uint32_t bytes)
 
 void pmm_free_frame(uint32_t phys)
 {
+  if (!phys || (phys & (FRAME_SIZE - 1)) != 0)
+    return;
   uintptr_t flags = pmm_lock_acquire();
   uint32_t f = phys / FRAME_SIZE;
   if (f < total_frames && frame_test(f)) {
@@ -251,6 +274,8 @@ void pmm_free_frame(uint32_t phys)
 
 void pmm_retain_frame(uint32_t phys)
 {
+  if (!phys || (phys & (FRAME_SIZE - 1)) != 0)
+    return;
   uintptr_t flags = pmm_lock_acquire();
   uint32_t f = phys / FRAME_SIZE;
   if (f < total_frames && frame_test(f) && refs[f] != 0 && refs[f] != 0xFFFF)
@@ -260,6 +285,8 @@ void pmm_retain_frame(uint32_t phys)
 
 uint32_t pmm_frame_refs(uint32_t phys)
 {
+  if (!phys || (phys & (FRAME_SIZE - 1)) != 0)
+    return 0;
   uintptr_t flags = pmm_lock_acquire();
   uint32_t f = phys / FRAME_SIZE;
   uint32_t result = f < total_frames ? refs[f] : 0;
@@ -272,6 +299,8 @@ uint32_t pmm_frame_refs(uint32_t phys)
  */
 void pmm_free_contig(uint32_t phys, uint32_t bytes)
 {
+  if (!phys || (phys & (FRAME_SIZE - 1)) != 0)
+    return;
   if (bytes > 0xFFFFFFFFu - (FRAME_SIZE - 1)) /* never allocated (see alloc) */
     return;
   uint32_t need = (bytes + FRAME_SIZE - 1) / FRAME_SIZE;

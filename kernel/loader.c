@@ -43,16 +43,12 @@ static int load_segment(uint32_t *dir, uint32_t vaddr, const uint8_t *src, uint3
       hi = 4096;
     if (hi < lo)
       hi = lo;
-    uint32_t b = 0;
-    for (; b < lo; b++) /* pad before the segment start  */
-      kv[b] = 0;
-    uint32_t off = page + b - vaddr; /* segment offset at byte b      */
-    for (; b < hi; b++)              /* file data for this page       */
-      kv[b] = src[off++];
-    while (b < 4096 && (b & 3u)) /* align up, then word-fill zeros */
-      kv[b++] = 0;
-    for (; b + 4 <= 4096; b += 4)
-      *(uint32_t *)(kv + b) = 0;
+    if (lo)
+      memset(kv, 0, lo);
+    if (hi > lo)
+      memcpy(kv + lo, src + page + lo - vaddr, hi - lo);
+    if (hi < 4096)
+      memset(kv + hi, 0, 4096 - hi);
     paging_scratch_unmap(0);
     irq_restore(fl);
     if (paging_map_user_at(dir, page, phys, 1) < 0) { /* private tables   */
@@ -96,8 +92,8 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
     return -1;
   }
 
-  for (int i = 0; i < eh->e_phnum; i++) {
-    const Elf32_Phdr *ph = (const Elf32_Phdr *)(file + eh->e_phoff + (uint32_t)i * eh->e_phentsize);
+  for (uint32_t i = 0; i < eh->e_phnum; i++) {
+    const Elf32_Phdr *ph = (const Elf32_Phdr *)(file + eh->e_phoff + i * eh->e_phentsize);
     if (ph->p_type != PT_LOAD)
       continue;
     if (!in_user_window(ph->p_vaddr, ph->p_memsz) || (uint64_t)ph->p_offset + ph->p_filesz > size ||
@@ -109,7 +105,7 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
       image_end = ph->p_vaddr + ph->p_memsz;
   }
 
-  for (int p = 0; p < USER_STACK_PAGES; p++) {
+  for (uint32_t p = 0; p < USER_STACK_PAGES; p++) {
     uint32_t phys = pmm_alloc_frame();
     if (!phys) {
       paging_free_process_dir(dir);
@@ -117,8 +113,7 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
     }
     uint32_t fl = irq_save(); /* zero it: never leak prior data  */
     uint32_t *kv = paging_scratch_map(0, phys);
-    for (int k = 0; k < 1024; k++)
-      kv[k] = 0;
+    memset(kv, 0, 4096);
     paging_scratch_unmap(0);
     irq_restore(fl);
     if (paging_map_user_at(dir, USER_STACK_TOP - (uint32_t)(p + 1) * 4096, phys, 1) < 0) {

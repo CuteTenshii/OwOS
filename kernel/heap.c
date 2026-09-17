@@ -16,8 +16,8 @@
 
 #include "heap.h"
 #include "console.h"
-#include "irqflags.h"
 #include "pmm.h"
+#include "spinlock.h"
 #include <stdint.h>
 
 /* Defined by linker.ld as the first byte past the kernel image (end of .bss).
@@ -31,9 +31,11 @@ extern char kernel_end[];
  * the value is ready. */
 #define KHEAP_END (pmm_pool_start())
 #define ALIGN_UP(n, a) (((n) + (a) - 1) & ~((a) - 1))
+#define BLOCK_MAGIC 0x48454150u
 
 typedef struct block {
   size_t size; /* payload bytes, not counting the header  */
+  uint32_t magic;
   int free;
   struct block *prev;
   struct block *next;
@@ -41,15 +43,7 @@ typedef struct block {
 
 static block_t *head;
 static block_t *alloc_cursor;
-static volatile uint32_t heap_lock;
-
-static void heap_lock_acquire(void)
-{
-  while (__sync_lock_test_and_set(&heap_lock, 1))
-    __asm__ volatile("pause");
-}
-
-static void heap_lock_release(void) { __sync_lock_release(&heap_lock); }
+static spinlock_t heap_lock;
 
 void heap_init(void)
 {
@@ -63,8 +57,9 @@ void heap_init(void)
     for (;;)
       __asm__ volatile("cli; hlt");
   }
-  head = (block_t *)start;
+  head = (block_t *)(uintptr_t)start;
   head->size = (KHEAP_END - start) - sizeof(block_t);
+  head->magic = BLOCK_MAGIC;
   head->free = 1;
   head->prev = 0;
   head->next = 0;
@@ -73,13 +68,12 @@ void heap_init(void)
 
 void *kmalloc(size_t size)
 {
-  uintptr_t flags = irq_save();
+  uintptr_t flags = spin_lock_irqsave(&heap_lock);
   if (size == 0) {
-    irq_restore(flags);
+    spin_unlock_irqrestore(&heap_lock, flags);
     return 0;
   }
   size = ALIGN_UP(size, 8);
-  heap_lock_acquire();
 
   block_t *start = alloc_cursor ? alloc_cursor : head;
   for (int pass = 0; pass < 2; pass++) {
@@ -91,6 +85,7 @@ void *kmalloc(size_t size)
       if (b->size >= size + sizeof(block_t) + 8) {
         block_t *rest = (block_t *)((uint8_t *)b + sizeof(block_t) + size);
         rest->size = b->size - size - sizeof(block_t);
+        rest->magic = BLOCK_MAGIC;
         rest->free = 1;
         rest->prev = b;
         rest->next = b->next;
@@ -102,16 +97,14 @@ void *kmalloc(size_t size)
       b->free = 0;
       alloc_cursor = b->next ? b->next : head;
       void *result = (uint8_t *)b + sizeof(block_t);
-      heap_lock_release();
-      irq_restore(flags);
+      spin_unlock_irqrestore(&heap_lock, flags);
       return result;
     }
     if (start == head)
       break;
     start = head;
   }
-  heap_lock_release();
-  irq_restore(flags);
+  spin_unlock_irqrestore(&heap_lock, flags);
   return 0; /* no block large enough */
 }
 
@@ -120,20 +113,18 @@ void kfree(void *ptr)
   uintptr_t flags;
   if (!ptr)
     return;
-  flags = irq_save();
-  heap_lock_acquire();
+  flags = spin_lock_irqsave(&heap_lock);
   block_t *b = (block_t *)((uint8_t *)ptr - sizeof(block_t));
 
   /* Robustness: ignore a pointer outside the heap window, or a double free
    * (either would corrupt the list / underflow the used count). */
-  if ((uintptr_t)b < (uintptr_t)head || (uintptr_t)b >= KHEAP_END) {
-    heap_lock_release();
-    irq_restore(flags);
+  if (!head || ((uintptr_t)ptr & 7) != 0 || (uintptr_t)b < (uintptr_t)head || (uintptr_t)b >= KHEAP_END ||
+      b->magic != BLOCK_MAGIC) {
+    spin_unlock_irqrestore(&heap_lock, flags);
     return;
   }
   if (b->free) {
-    heap_lock_release();
-    irq_restore(flags);
+    spin_unlock_irqrestore(&heap_lock, flags);
     return;
   }
   b->free = 1;
@@ -158,32 +149,27 @@ void kfree(void *ptr)
     if (p->next)
       p->next->prev = p;
   }
-  heap_lock_release();
-  irq_restore(flags);
+  spin_unlock_irqrestore(&heap_lock, flags);
 }
 
 size_t heap_used_bytes(void)
 {
-  uintptr_t flags = irq_save();
-  heap_lock_acquire();
+  uintptr_t flags = spin_lock_irqsave(&heap_lock);
   size_t used = 0;
   for (block_t *b = head; b; b = b->next)
     if (!b->free)
       used += b->size + sizeof(block_t);
-  heap_lock_release();
-  irq_restore(flags);
+  spin_unlock_irqrestore(&heap_lock, flags);
   return used;
 }
 
 size_t heap_free_bytes(void)
 {
-  uintptr_t flags = irq_save();
-  heap_lock_acquire();
+  uintptr_t flags = spin_lock_irqsave(&heap_lock);
   size_t freed = 0;
   for (block_t *b = head; b; b = b->next)
     if (b->free)
       freed += b->size;
-  heap_lock_release();
-  irq_restore(flags);
+  spin_unlock_irqrestore(&heap_lock, flags);
   return freed;
 }

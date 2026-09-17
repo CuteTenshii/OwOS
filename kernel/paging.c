@@ -16,6 +16,7 @@
 #include "paging.h"
 #include "creg.h"
 #include "irqflags.h"
+#include "kstring.h"
 #include "loader.h" /* USER_BASE / USER_REGION_END: the per-process window  */
 #include "pmm.h"
 #include <stdint.h>
@@ -112,10 +113,9 @@ void *palloc(void)
     return 0; /* pool exhausted                  */
   }
   uint64_t *p = (uint64_t *)(uintptr_t)page;
-  for (int i = 0; i < 512; i++)
-    p[i] = 0; /* hand out zeroed frames          */
   page_pool_release();
   irq_restore(flags);
+  memset(p, 0, 4096); /* hand out zeroed frames          */
   return p;
 }
 
@@ -131,10 +131,11 @@ void pfree(void *page)
 
 void paging_init(void)
 {
-  for (int i = 0; i < 512; i++) {
-    master_pml4[i] = master_pdpt[i] = 0;
-    kern_pd0[i] = high_pd[i] = scratch_pt[i] = 0;
-  }
+  memset(master_pml4, 0, sizeof master_pml4);
+  memset(master_pdpt, 0, sizeof master_pdpt);
+  memset(kern_pd0, 0, sizeof kern_pd0);
+  memset(high_pd, 0, sizeof high_pd);
+  memset(scratch_pt, 0, sizeof scratch_pt);
 
   /* Identity-map [0, pmm_low_end()) with 2 MiB pages (one PD entry each). */
   int n2m = (int)(pmm_low_end() >> 21);
@@ -167,7 +168,7 @@ void paging_init(void)
   }
 }
 
-uint32_t paging_kernel_phys(void) { return (uint32_t)(uintptr_t)master_pml4; }
+uintptr_t paging_kernel_phys(void) { return (uintptr_t)master_pml4; }
 
 /* Walk pml4 down to the PTE for `va`, creating intermediate tables from the
  * pool with `iflags` (PAGE_USER set there propagates user access down the new
@@ -252,12 +253,10 @@ uint32_t *paging_new_process_dir(void)
 
   /* Share the kernel PDPT slots by pointer (kern_pd0 at [0]); the user window
    * at [1] starts empty and is filled per-process by paging_map_user_at. */
-  for (int i = 0; i < 512; i++)
-    pdpt[i] = master_pdpt[i];
+  memcpy(pdpt, master_pdpt, sizeof master_pdpt);
   /* The mixed high PD is private (copy the shared MMIO PT pointers in; the
    * process adds its own WIN_FB page tables, which carry the PAGE_USER bit). */
-  for (int i = 0; i < 512; i++)
-    hpd[i] = high_pd[i];
+  memcpy(hpd, high_pd, sizeof high_pd);
   pdpt[3] = ((uint64_t)(uintptr_t)hpd) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
   pml4[0] = ((uint64_t)(uintptr_t)pdpt) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
   return (uint32_t *)(void *)pml4;
@@ -375,8 +374,7 @@ int paging_handle_page_fault(uint32_t vaddr, uint32_t error)
     uint32_t fl = irq_save();
     uint32_t *src = paging_scratch_map(0, old);
     uint32_t *dst = paging_scratch_map(1, fresh);
-    for (int i = 0; i < 1024; i++)
-      dst[i] = src[i];
+    memcpy(dst, src, 4096);
     paging_scratch_unmap(1);
     paging_scratch_unmap(0);
     irq_restore(fl);
@@ -480,8 +478,7 @@ int paging_user_grow(uint32_t *dir, uint32_t old_top, uint32_t new_top)
     if (ok) {
       uint32_t fl = irq_save();
       uint32_t *kv = paging_scratch_map(0, phys);
-      for (int k = 0; k < 1024; k++)
-        kv[k] = 0;
+      memset(kv, 0, 4096);
       paging_scratch_unmap(0);
       irq_restore(fl);
       if (paging_map_user_at(dir, page, phys, 1) < 0) {
@@ -595,8 +592,7 @@ static uint32_t pool_free; /* freelist head (0 = empty)           */
 
 void paging_init(void)
 {
-  for (int i = 0; i < PD_ENTRIES; i++)
-    page_directory[i] = 0; /* not present                         */
+  memset(page_directory, 0, sizeof page_directory); /* not present */
 
   /* Identity-map [0, pmm_low_end()) — the RAM-scaled kernel/heap/pool region.
    * One table per 4 MiB, up to IDENTITY_TABLES. */
@@ -617,8 +613,7 @@ void paging_init(void)
    * lives in the shared kernel directory, so every later process dir inherits
    * it and the kernel can use scratch under any CR3. No PAGE_USER: ring 3 can
    * never reach SCRATCH_VADDR. */
-  for (int i = 0; i < PT_ENTRIES; i++)
-    scratch_pt[i] = 0;
+  memset(scratch_pt, 0, sizeof scratch_pt);
   page_directory[SCRATCH_VADDR >> 22] = (uint32_t)scratch_pt | PAGE_PRESENT | PAGE_RW;
 
   pool_next = pmm_pool_start(); /* page-table pool: [pool_start, low_end) */
@@ -630,7 +625,7 @@ void paging_init(void)
   write_cr0(cr0);
 }
 
-uint32_t paging_kernel_phys(void) { return (uint32_t)page_directory; }
+uintptr_t paging_kernel_phys(void) { return (uintptr_t)page_directory; }
 
 /* --- page-frame pool over [pmm_pool_start(), pmm_low_end()) (identity-mapped)
  * - RAM-scaled (see pmm.c); on a 256 MiB box that is the legacy [12 MiB, 16
@@ -655,10 +650,9 @@ void *palloc(void)
     irq_restore(flags);
     return 0; /* pool exhausted                  */
   }
-  for (int i = 0; i < 1024; i++)
-    ((uint32_t *)page)[i] = 0; /* hand out zeroed frames          */
   page_pool_release();
   irq_restore(flags);
+  memset((void *)(uintptr_t)page, 0, 4096); /* hand out zeroed frames          */
   return (void *)page;
 }
 
@@ -706,8 +700,7 @@ uint32_t *paging_new_process_dir(void)
    * supervisor-only). The whole low 4 MiB stays the shared identity table, so
    * ring 3 can't touch it. The user window PDEs are empty here and filled by
    * paging_map_user_at with this process's PRIVATE page tables. */
-  for (int i = 0; i < PD_ENTRIES; i++)
-    dir[i] = page_directory[i];
+  memcpy(dir, page_directory, sizeof page_directory);
   return dir;
 }
 
@@ -820,8 +813,7 @@ int paging_handle_page_fault(uint32_t vaddr, uint32_t error)
     uint32_t fl = irq_save();
     uint32_t *src = paging_scratch_map(0, old);
     uint32_t *dst = paging_scratch_map(1, fresh);
-    for (int i = 0; i < 1024; i++)
-      dst[i] = src[i];
+    memcpy(dst, src, 4096);
     paging_scratch_unmap(1);
     paging_scratch_unmap(0);
     irq_restore(fl);
@@ -987,8 +979,7 @@ int paging_user_grow(uint32_t *dir, uint32_t old_top, uint32_t new_top)
     if (ok) {
       uint32_t fl = irq_save();
       uint32_t *kv = paging_scratch_map(0, phys);
-      for (int k = 0; k < 1024; k++)
-        kv[k] = 0;
+      memset(kv, 0, 4096);
       paging_scratch_unmap(0);
       irq_restore(fl);
       if (paging_map_user_at(dir, page, phys, 1) < 0) {
