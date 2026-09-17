@@ -8,10 +8,16 @@
 
 typedef struct netconn netconn;
 
+#define NC_OPEN_RESOLVE 1
+#define NC_OPEN_CONNECT 2
+#define NC_OPEN_TLS 3
+
 /* Open a connection to host:port. tls!=0 uses user/lib/tls (offer_h2 adds "h2"
  * to the ALPN offer, readable back with nc_alpn); tls==0 opens net_connect with
  * SK_TCP. Returns a handle or NULL on failure. */
 netconn *nc_open(const char *host, int port, int tls, int offer_h2);
+
+int nc_last_error(void);
 
 /* Wrap an already-open kernel socket fd as a plain (non-TLS) netconn. The
  * netconn owns the fd afterwards (nc_close closes it). NULL on alloc failure.

@@ -219,21 +219,43 @@ void show_error(const char *m)
   B->seq++;
 }
 
-/* Case-insensitive substring test (used to spot "html" inside a Content-Type).
- * streq_ci lives in dom.h (via browser.h); the cookie/HSTS jar lives in jar.c.
- */
-static int has_sub(const char *s, const char *sub)
+static const char *fetch_error_message(int status)
 {
-  for (; *s; s++) {
-    const char *a = s, *b = sub;
-    while (*b && lower(*a) == lower(*b)) {
-      a++;
-      b++;
-    }
-    if (!*b)
-      return 1;
+  switch (status) {
+  case -1:
+    return "No network device / out of sockets";
+  case -2:
+    return "DNS lookup failed";
+  case -3:
+    return "TCP connection failed";
+  case -4:
+    return "Failed to send request";
+  case -6:
+    return "TLS handshake failed";
+  default:
+    return "No response from server";
   }
-  return 0;
+}
+
+static int mime_is(const char *ctype, const char *want)
+{
+  int n = 0;
+  while (ctype[n] && ctype[n] != ';' && ctype[n] != ' ' && ctype[n] != '\t')
+    n++;
+  int w = 0;
+  while (want[w])
+    w++;
+  if (n != w)
+    return 0;
+  for (int i = 0; i < n; i++)
+    if (lower(ctype[i]) != lower(want[i]))
+      return 0;
+  return 1;
+}
+
+static int is_html_type(const char *ctype)
+{
+  return mime_is(ctype, "text/html") || mime_is(ctype, "application/xhtml+xml");
 }
 
 /* --------------------------------------------------- body byte source/sink */
@@ -339,7 +361,7 @@ static int is_download(const char *url)
     return 1;
   if (B->pg->ctype[0] == '\0')
     return 0;
-  if (has_sub(B->pg->ctype, "html"))
+  if (is_html_type(B->pg->ctype))
     return 0;
   if (starts_ci(B->pg->ctype, "text/"))
     return 0;
@@ -1119,8 +1141,13 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
    * HTTP/2 instead of the HTTP/1.1 code below. The netconn owns a user-space
    * TLS connection (or a plain TCP socket). */
   B->sock = nc_open(u->host, u->port, u->tls, /*offer_h2=*/1);
-  if (!B->sock)
+  if (!B->sock) {
+    if (nc_last_error() == NC_OPEN_RESOLVE)
+      return -2;
+    if (nc_last_error() == NC_OPEN_TLS)
+      return -6;
     return -3;
+  }
 
   if (u->tls && nc_alpn(B->sock) == ALPN_H2) {
     int st = h2_txn(u, full_url, loc, loc_cap, allow_dl, method, body, blen, bctype);
@@ -1256,7 +1283,7 @@ static void render_raw(const char *url)
    * servers). But X-Content-Type-Options: nosniff forbids that guess: with it
    * set, render as HTML ONLY when the server explicitly declared an HTML type,
    * otherwise fall through to plain text. */
-  int as_html = has_sub(B->pg->ctype, "html") || (B->pg->ctype[0] == '\0' && !B->nosniff);
+  int as_html = is_html_type(B->pg->ctype) || (B->pg->ctype[0] == '\0' && !B->nosniff);
   if (as_html) {
     B->pg->mode = MODE_HTML;
     html_to_text(url, css_batch);
@@ -1498,11 +1525,7 @@ void do_fetch(void)
         implicit_scheme = 0;
         continue;
       }
-      const char *msg = st == -2   ? "Could not resolve host"
-                        : st == -1 ? "No network device / out of sockets"
-                        : st == -3 ? "Connection failed"
-                        : st == -4 ? "Failed to send request"
-                                   : "No response from server";
+      const char *msg = fetch_error_message(st);
       show_error(msg);
       {
         struct net_log e = {method, url, 0, 0, 0, (int)(msec() - g_doc_t0), 0, NET_FAILED, msg};

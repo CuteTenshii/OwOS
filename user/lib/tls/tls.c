@@ -753,9 +753,13 @@ static int tls13_handshake(struct tls_conn *c, const uint8_t our_priv[32], const
 /* --------------------------------------------------------------- connect */
 
 static const uint8_t x25519_base[32] = {9};
+static int g_tls_error;
+
+int tls_last_error(void) { return g_tls_error; }
 
 tls_conn *tls_client(const char *host, int port, int offer_h2)
 {
+  g_tls_error = TLS_OPEN_HANDSHAKE;
   /* Allocate this session's state (~92 KiB) with malloc; freed by tls_close.
    * The user heap serves multi-hundred-KiB allocations (e.g. the browser's
    * decode buffers), so a single 92 KiB struct is well within budget. */
@@ -769,6 +773,7 @@ tls_conn *tls_client(const char *host, int port, int offer_h2)
   unsigned char ip[4];
   char ipstr[16];
   if (resolve(host, ip) != 1) {
+    g_tls_error = TLS_OPEN_RESOLVE;
     free(c);
     return NULL;
   }
@@ -794,6 +799,7 @@ tls_conn *tls_client(const char *host, int port, int offer_h2)
 
   c->tcp = net_connect(ipstr, port, SK_TCP);
   if (c->tcp < 0) {
+    g_tls_error = TLS_OPEN_CONNECT;
     free(c);
     return NULL;
   }

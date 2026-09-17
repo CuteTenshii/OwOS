@@ -9,8 +9,13 @@ struct netconn {
   tls_conn *tls; /* user-space TLS conn, or NULL when plain TCP  */
 };
 
+static int g_nc_error;
+
+int nc_last_error(void) { return g_nc_error; }
+
 netconn *nc_open(const char *host, int port, int tls, int offer_h2)
 {
+  g_nc_error = NC_OPEN_CONNECT;
   netconn *c = (netconn *)malloc(sizeof *c);
   if (!c)
     return 0;
@@ -19,12 +24,16 @@ netconn *nc_open(const char *host, int port, int tls, int offer_h2)
   if (tls) {
     c->tls = tls_client(host, port, offer_h2); /* self-resolves + SNI=host */
     if (!c->tls) {
+      g_nc_error = tls_last_error() == TLS_OPEN_RESOLVE   ? NC_OPEN_RESOLVE
+                   : tls_last_error() == TLS_OPEN_CONNECT ? NC_OPEN_CONNECT
+                                                          : NC_OPEN_TLS;
       free(c);
       return 0;
     }
   } else {
     c->fd = net_dial(host, port, SK_TCP); /* resolve, then TCP-connect */
     if (c->fd < 0) {
+      g_nc_error = c->fd == -2 ? NC_OPEN_RESOLVE : NC_OPEN_CONNECT;
       free(c);
       return 0;
     }
