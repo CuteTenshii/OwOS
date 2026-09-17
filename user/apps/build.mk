@@ -31,8 +31,8 @@ user/apps/gui/files.elf: user/apps/gui/files.o $(DIALOG) $(ULIB) $(GUILIB) user/
 # the compositor pastes clipboard text into the focused window (Ctrl+V / Super+V),
 # so it links the clipboard client lib; it also owns the framebuffer, so Print
 # Screen capture (PNG encode) lives here — $(PNGENC) + the shared $(CRC32).
-user/apps/gui/compositor.elf: user/apps/gui/compositor.o $(CLIPBOARD) $(PNGENC) $(CRC32) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/compositor.o $(CLIPBOARD) $(PNGENC) $(CRC32) $(GUILIB) $(ULIB) $(LIBGCC)
+user/apps/gui/compositor.elf: user/apps/gui/compositor/compositor.o user/apps/gui/compositor/compositor_damage.o $(CLIPBOARD) $(PNGENC) $(CRC32) $(ULIB) $(GUILIB) user/user.ld
+	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/compositor/compositor.o user/apps/gui/compositor/compositor_damage.o $(CLIPBOARD) $(PNGENC) $(CRC32) $(GUILIB) $(ULIB) $(LIBGCC)
 
 # The browser is a multi-file user program (user/apps/gui/browser/*.c), linked
 # flat: streaming inflate (gzip/deflate), the PNG decoder, HTTP/2, the SQLite jar.
@@ -165,7 +165,7 @@ kernel/%_blob.o: user/apps/cli/%.elf
 # the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"…
 # per app, sorted by address. Regenerated whenever any listed app's .elf changes.
 SYM_APPS := browser files editor term calc imgview player settings notifyd about clock cliphist
-kernel/appsyms.o: $(addprefix user/apps/gui/,$(addsuffix .elf,$(SYM_APPS)))
+kernel/appsyms.o: $(addprefix user/apps/gui/,$(addsuffix .elf,$(SYM_APPS))) $(ARCH_STAMP)
 	@: > kernel/appsyms.dat
 	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \
 	  $(UCROSS)nm -n --defined-only $$e | awk '$$2 ~ /^[tT]$$/ {print $$1" "$$3}' >> kernel/appsyms.dat; done
@@ -178,7 +178,7 @@ kernel/appsyms.o: $(addprefix user/apps/gui/,$(addsuffix .elf,$(SYM_APPS)))
 # The shared UI fonts shipped on disk (installed to /etc/fonts at boot); gfx loads
 # them at runtime instead of every app baking in a bitmap atlas. Give
 # _binary_fonts_Liberation{Sans,Mono}_Regular_ttf_{start,end}.
-kernel/uifont_blob.o: fonts/LiberationSans-Regular.ttf
+kernel/uifont_blob.o: fonts/LiberationSans-Regular.ttf $(ARCH_STAMP)
 	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) $< $@
-kernel/monofont_blob.o: fonts/LiberationMono-Regular.ttf
+kernel/monofont_blob.o: fonts/LiberationMono-Regular.ttf $(ARCH_STAMP)
 	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) $< $@

@@ -50,7 +50,7 @@ clean:
 	rm -f $(OBJS) owos.bin owos-x86_64.bin $(ISO) .arch.*
 	rm -f user/lib/*.o user/lib/*/*.o
 	rm -f user/apps/cli/*.o user/apps/cli/*.elf
-	rm -f user/apps/gui/*.o user/apps/gui/*.elf user/apps/gui/browser/*.o
+	rm -f user/apps/gui/*.o user/apps/gui/*.elf user/apps/gui/browser/*.o user/apps/gui/compositor/*.o user/apps/gui/compositor/*.elf
 	find user -name '*.d' -delete
 	rm -rf $(ISODIR)
 
