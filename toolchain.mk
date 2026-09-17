@@ -18,12 +18,21 @@ ifeq ($(filter $(ARCH),i386 x86_64),)
   $(error unsupported ARCH '$(ARCH)' — use i386 or x86_64)
 endif
 
-# Kernel cross-compile prefix. The target is ELF, so select the target
-# toolchain from ARCH instead of inheriting the host compiler.
+# Linux can use its native GCC with the explicit architecture flags below. macOS
+# needs a cross-toolchain because its native compiler emits Mach-O, not ELF.
+HOST_OS := $(shell uname -s)
 ifeq ($(ARCH),x86_64)
-  CROSS ?= x86_64-elf-
+  ifeq ($(HOST_OS),Darwin)
+    CROSS ?= x86_64-elf-
+  else
+    CROSS ?=
+  endif
 else
-  CROSS ?= i686-elf-
+  ifeq ($(HOST_OS),Darwin)
+    CROSS ?= i686-elf-
+  else
+    CROSS ?=
+  endif
 endif
 
 CC      := $(CROSS)gcc
@@ -37,7 +46,11 @@ ifeq ($(shell command -v $(CC) >/dev/null 2>&1 && echo y),)
 endif
 
 # User-space programs are always 32-bit ELF because the kernel embeds them as blobs.
-UCROSS ?= i686-elf-
+ifeq ($(HOST_OS),Darwin)
+  UCROSS ?= i686-elf-
+else
+  UCROSS ?=
+endif
 UCC      := $(UCROSS)gcc
 ULD      := $(UCROSS)ld
 UOBJCOPY := $(UCROSS)objcopy
