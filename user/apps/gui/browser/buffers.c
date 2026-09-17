@@ -32,6 +32,7 @@ int browser_ensure_text(int need)
   char *t = realloc(B->pg->text, (unsigned)nc);
   unsigned char *a = realloc(B->pg->attr, (unsigned)nc);
   unsigned char *p = realloc(B->pg->bp, (unsigned)nc);
+  unsigned char *y = realloc(B->pg->align, (unsigned)nc);
   unsigned char *z = realloc(B->pg->fsz, (unsigned)nc);
   unsigned char *l = realloc(B->pg->lh, (unsigned)nc);
   unsigned *f = realloc(B->pg->fg, (unsigned)nc * sizeof *f);
@@ -42,6 +43,8 @@ int browser_ensure_text(int need)
     B->pg->attr = a;
   if (p)
     B->pg->bp = p;
+  if (y)
+    B->pg->align = y;
   if (z)
     B->pg->fsz = z;
   if (l)
@@ -50,10 +53,10 @@ int browser_ensure_text(int need)
     B->pg->fg = f;
   if (g)
     B->pg->bg = g;
-  if (t && a && p && z && l && f && g)
+  if (t && a && p && y && z && l && f && g)
     B->pg->text_cap = nc;
   browser_buf_unlock();
-  return t && a && p && z && l && f && g;
+  return t && a && p && y && z && l && f && g;
 }
 
 int browser_ensure_links(int need)

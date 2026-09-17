@@ -197,8 +197,9 @@ struct page {
   unsigned char *attr;
   int text_len, text_cap;
   unsigned char *bp;
-  unsigned char *fsz; /* per-glyph CSS font-size px (0 = default body font) */
-  unsigned char *lh;  /* per-glyph CSS line-height px (0 = font-derived default) */
+  unsigned char *align; /* per-glyph text alignment: 0 left, 1 center, 2 right, 3 justify */
+  unsigned char *fsz;   /* per-glyph CSS font-size px (0 = default body font) */
+  unsigned char *lh;    /* per-glyph CSS line-height px (0 = font-derived default) */
   unsigned *fg;
   unsigned *bg;
   /* Page canvas colours from the <html>/<body> cascade (worker sets, render

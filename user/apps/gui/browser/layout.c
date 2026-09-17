@@ -96,7 +96,13 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
   b->margin = edge4(cs->margin);                     /* auto (-2) folds to 0; the auto flags drive centring */
   b->ml_auto = (unsigned char)(cs->margin[3] == -2); /* margin[] is T,R,B,L */
   b->mr_auto = (unsigned char)(cs->margin[1] == -2);
-  b->border = edge4(cs->border_w);
+  short border_w[4];
+  for (int i = 0; i < 4; i++) {
+    b->border_style[i] = cs->border_style[i];
+    border_w[i] = cs->border_style[i] == CSS_BST_NONE ? 0 : cs->border_w[i];
+    b->border_side_color[i] = cs->border_side_color[i] >= 0 ? (unsigned)cs->border_side_color[i] : b->border_color;
+  }
+  b->border = edge4(border_w);
   b->padding = edge4(cs->padding);
   b->border_color = cs->border_color >= 0 ? (unsigned)cs->border_color : BG_NONE;
   b->bg = cs->bg >= 0 ? (unsigned)cs->bg : BG_NONE;

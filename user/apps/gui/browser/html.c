@@ -303,6 +303,8 @@ static void apply_css(const struct css_style *cs)
     sty_cur.bold = cs->bold ? 1 : 0;
   if (cs->under >= 0)
     sty_cur.under = cs->under ? 1 : 0;
+  if (cs->strike >= 0)
+    sty_cur.strike = cs->strike ? 1 : 0;
   if (cs->italic >= 0)
     sty_cur.italic = cs->italic ? 1 : 0;
   if (cs->small_caps >= 0)
@@ -885,6 +887,7 @@ static int text_put(int n, char c, unsigned char a)
   B->pg->text[n] = c;
   B->pg->attr[n] = a;
   B->pg->bp[n] = block_byte();
+  B->pg->align[n] = W_center;
   B->pg->fsz[n] = W_fontpx;
   B->pg->lh[n] = W_lineheight;
   B->pg->fg[n] = sty_cur.fg;
@@ -2607,8 +2610,10 @@ static void walk_element_inner(struct dom_node *el)
     W_fontpx = clamp_fontpx((W_fontpx ? W_fontpx : HTML_BASE_FONT) * 5 / 6);
   else if (streq(name, "sub") || streq(name, "sup"))
     W_fontpx = clamp_fontpx((W_fontpx ? W_fontpx : HTML_BASE_FONT) * 3 / 4);
-  if (streq(name, "center") || streq(name, "caption") || cs.center > 0)
+  if (streq(name, "center") || streq(name, "caption"))
     W_center = 1;
+  else if (cs.center >= 0)
+    W_center = (unsigned char)cs.center;
   if (streq(name, "pre")) {
     W_mono = 1;
     W_pre = 1;
@@ -3008,7 +3013,7 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
 
   int nfaces = css_fontface_count(g_sheet);
   char **urls = nfaces ? malloc((unsigned)nfaces * sizeof *urls) : 0;
-  char(*fams)[CSS_FAM_MAX] = nfaces ? malloc((unsigned)nfaces * sizeof *fams) : 0;
+  char (*fams)[CSS_FAM_MAX] = nfaces ? malloc((unsigned)nfaces * sizeof *fams) : 0;
   int nu = 0;
   if (nfaces && (!urls || !fams)) {
     free(urls);
@@ -3650,6 +3655,7 @@ void doc_message(const char *m)
     B->pg->text[n] = m[n];
     B->pg->attr[n] = 0;
     B->pg->bp[n] = 0;
+    B->pg->align[n] = 0;
     B->pg->fsz[n] = 0;
     B->pg->lh[n] = 0;
     B->pg->fg[n] = B->pg->page_fg;

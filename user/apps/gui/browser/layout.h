@@ -47,6 +47,8 @@ struct lbox {
   signed char overflow; /* 0 visible / 1 clipped / -1 unset     */
 
   struct ledge margin, border, padding;
+  signed char border_style[4];
+  unsigned border_side_color[4];
   unsigned char ml_auto, mr_auto;         /* left/right margin was `auto` (centring) */
   unsigned border_color;                  /* 0xRRGGBB, or BG_NONE = none */
   unsigned bg;                            /* 0xRRGGBB, or BG_NONE = none */

@@ -684,6 +684,64 @@ static int parse_weight(const char *v)
   return -1;
 }
 
+static int parse_border_style(const char *v)
+{
+  while (*v) {
+    while (*v == ' ' || *v == '\t')
+      v++;
+    const char *e = v;
+    while (*e && *e != ' ' && *e != '\t')
+      e++;
+    int n = (int)(e - v);
+    if ((n == 4 && starts_ci(v, "none")) || (n == 6 && starts_ci(v, "hidden")))
+      return CSS_BST_NONE;
+    if (n == 6 && starts_ci(v, "dashed"))
+      return CSS_BST_DASHED;
+    if (n == 6 && starts_ci(v, "dotted"))
+      return CSS_BST_DOTTED;
+    if (n == 5 && starts_ci(v, "solid"))
+      return CSS_BST_SOLID;
+    v = e;
+  }
+  return CSS_BST_UNSET;
+}
+
+static void parse_border_styles(const char *v, signed char out[4])
+{
+  signed char vals[4];
+  int n = 0;
+  while (*v && n < 4) {
+    while (*v == ' ' || *v == '\t')
+      v++;
+    if (!*v)
+      break;
+    const char *e = v;
+    while (*e && *e != ' ' && *e != '\t')
+      e++;
+    char tok[16];
+    int k = (int)(e - v);
+    if (k > (int)sizeof tok - 1)
+      k = sizeof tok - 1;
+    memcpy(tok, v, (unsigned)k);
+    tok[k] = '\0';
+    vals[n++] = (signed char)parse_border_style(tok);
+    v = e;
+  }
+  if (n == 1)
+    out[0] = out[1] = out[2] = out[3] = vals[0];
+  else if (n == 2) {
+    out[0] = out[2] = vals[0];
+    out[1] = out[3] = vals[1];
+  } else if (n == 3) {
+    out[0] = vals[0];
+    out[1] = out[3] = vals[1];
+    out[2] = vals[2];
+  } else if (n == 4) {
+    for (int i = 0; i < 4; i++)
+      out[i] = vals[i];
+  }
+}
+
 /* substring (ci) — for text-decoration:"underline" inside a multi-value list.
  */
 static int has_ci(const char *hay, const char *needle)
@@ -1323,7 +1381,7 @@ static void parse_bg_shorthand(const char *v, struct css_style *out)
 void css_style_reset(struct css_style *s)
 {
   s->color = s->bg = -1;
-  s->bold = s->under = -1;
+  s->bold = s->under = s->strike = -1;
   s->disp = CSS_DISP_UNSET;
   s->center = -1;
   s->width = s->height = -1;
@@ -1339,6 +1397,8 @@ void css_style_reset(struct css_style *s)
   s->margin[0] = s->margin[1] = s->margin[2] = s->margin[3] = -1;
   s->padding[0] = s->padding[1] = s->padding[2] = s->padding[3] = -1;
   s->border_w[0] = s->border_w[1] = s->border_w[2] = s->border_w[3] = -1;
+  s->border_style[0] = s->border_style[1] = s->border_style[2] = s->border_style[3] = CSS_BST_UNSET;
+  s->border_side_color[0] = s->border_side_color[1] = s->border_side_color[2] = s->border_side_color[3] = -1;
   s->border_color = -1;
   s->pos = -1;
   s->top = s->right = s->bottom = s->left = -1;
@@ -2433,17 +2493,29 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
            span_is(p, pe, "background-clip")) {
   } else if (span_is(p, pe, "font-weight"))
     out->bold = parse_weight(val);
-  else if (span_is(p, pe, "text-decoration") || span_is(p, pe, "text-decoration-line"))
-    out->under = has_ci(val, "underline") ? 1 : (has_ci(val, "none") ? 0 : out->under);
-  else if (span_is(p, pe, "display")) {
+  else if (span_is(p, pe, "text-decoration") || span_is(p, pe, "text-decoration-line")) {
+    if (has_ci(val, "underline"))
+      out->under = 1;
+    else if (has_ci(val, "none"))
+      out->under = 0;
+    if (has_ci(val, "line-through"))
+      out->strike = 1;
+    else if (has_ci(val, "none"))
+      out->strike = 0;
+  } else if (span_is(p, pe, "display")) {
     out->disp = parse_disp(val);
     out->flex = has_ci(val, "flex") ? 1 : 0;
     out->grid = has_ci(val, "grid") ? 1 : 0;
-  } else if (span_is(p, pe, "text-align"))
-    out->center = has_ci(val, "center")
-                      ? 1
-                      : (has_ci(val, "left") || has_ci(val, "right") || has_ci(val, "justify") ? 0 : out->center);
-  else if (span_is(p, pe, "width")) {
+  } else if (span_is(p, pe, "text-align")) {
+    if (has_ci(val, "center"))
+      out->center = 1;
+    else if (has_ci(val, "right"))
+      out->center = 2;
+    else if (has_ci(val, "justify"))
+      out->center = 3;
+    else if (has_ci(val, "left") || has_ci(val, "start"))
+      out->center = 0;
+  } else if (span_is(p, pe, "width")) {
     out->width = parse_len2(val, &pct);
     out->pct_w = (short)pct;
   } else if (span_is(p, pe, "height")) {
@@ -2489,6 +2561,31 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     int c = parse_color(val);
     if (c >= 0)
       out->border_color = c;
+  } else if (span_is(p, pe, "border-top-color") || span_is(p, pe, "border-right-color") ||
+             span_is(p, pe, "border-bottom-color") || span_is(p, pe, "border-left-color")) {
+    int c = parse_color(val);
+    if (c >= 0) {
+      int side = span_is(p, pe, "border-top-color")      ? 0
+                 : span_is(p, pe, "border-right-color")  ? 1
+                 : span_is(p, pe, "border-bottom-color") ? 2
+                                                         : 3;
+      out->border_side_color[side] = c;
+    }
+  } else if (span_is(p, pe, "border-style") || span_is(p, pe, "border-top-style") ||
+             span_is(p, pe, "border-right-style") || span_is(p, pe, "border-bottom-style") ||
+             span_is(p, pe, "border-left-style")) {
+    int side = span_is(p, pe, "border-top-style")      ? 0
+               : span_is(p, pe, "border-right-style")  ? 1
+               : span_is(p, pe, "border-bottom-style") ? 2
+               : span_is(p, pe, "border-left-style")   ? 3
+                                                       : -1;
+    if (side < 0)
+      parse_border_styles(val, out->border_style);
+    else {
+      int bs = parse_border_style(val);
+      if (bs >= 0)
+        out->border_style[side] = (signed char)bs;
+    }
   } else if (span_is(p, pe, "border") || span_is(p, pe, "border-top") || span_is(p, pe, "border-right") ||
              span_is(p, pe, "border-bottom") || span_is(p, pe, "border-left")) {
     int w, c;
@@ -2506,6 +2603,14 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     }
     if (c >= 0)
       out->border_color = c;
+    int bs = parse_border_style(val);
+    if (bs >= 0) {
+      if (s < 0)
+        for (int i = 0; i < 4; i++)
+          out->border_style[i] = (signed char)bs;
+      else
+        out->border_style[s] = (signed char)bs;
+    }
   } else if (span_is(p, pe, "border-top-width"))
     out->border_w[0] = one_len(val, 0);
   else if (span_is(p, pe, "border-right-width"))
@@ -4638,6 +4743,10 @@ static void fold(struct css_style *out, const struct css_style *d)
       out->padding[i] = d->padding[i];
     if (d->border_w[i] != -1)
       out->border_w[i] = d->border_w[i];
+    if (d->border_style[i] != CSS_BST_UNSET)
+      out->border_style[i] = d->border_style[i];
+    if (d->border_side_color[i] >= 0)
+      out->border_side_color[i] = d->border_side_color[i];
   }
   if (d->border_color >= 0)
     out->border_color = d->border_color;

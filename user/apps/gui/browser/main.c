@@ -132,6 +132,7 @@ static void page_free(struct page *p)
   free(p->text);
   free(p->attr);
   free(p->bp);
+  free(p->align);
   free(p->fsz);
   free(p->lh);
   free(p->fg);
@@ -799,7 +800,7 @@ static void set_block(int off)
   cur_bhr = (size == 7);
   cur_bpx = fpx ? fpx : ((size >= 1 && size <= 6) ? g_size_px[size] : 0);
   cur_bmono = (bp & BP_MONO) ? 1 : 0;
-  cur_bcenter = (bp & BP_CENTER) ? 1 : 0;
+  cur_bcenter = inb && B->pg->align ? B->pg->align[off] : ((bp & BP_CENTER) ? 1 : 0);
   cur_bindent = (bp & BP_INDENT) >> BP_INDENT_SH;
   cur_blh = inb ? B->pg->lh[off] : 0;
 }
@@ -1155,7 +1156,7 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
     unsigned cp;
     set_block(rs);
     x += cur_bindent * INDENT_PX;
-    if (cur_bcenter) {
+    if (cur_bcenter == 1 || cur_bcenter == 2) {
       int lw = 0;
       for (int p = rs; p < re;) {
         int gp = p;
@@ -1164,7 +1165,7 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
       }
       int room = (B->line_w[first] - cur_bindent * INDENT_PX) - lw;
       if (room > 0)
-        x += room / 2;
+        x += cur_bcenter == 1 ? room / 2 : room;
     }
     int a = start > rs ? start : rs, b = end < re ? end : re;
     for (int p = rs; p < a;) {
@@ -2475,7 +2476,7 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
 
   x += cur_bindent * INDENT_PX; /* blockquote / list indent  */
   int base = run_ascent(maxpx); /* baseline shared by the line's runs */
-  if (cur_bcenter) {            /* text-align:center         */
+  if (cur_bcenter == 1 || cur_bcenter == 2) {
     int lw = 0, p = off, end = off + len;
     unsigned cp;
     while (p < end) {
@@ -2485,9 +2486,26 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
     }
     int room = (paw - cur_bindent * INDENT_PX) - lw;
     if (room > 0)
-      x += room / 2;
+      x += cur_bcenter == 1 ? room / 2 : room;
   }
   int x0 = x; /* line content origin (for selection) */
+  int justify_extra = 0, justify_rem = 0, justify_spaces = 0;
+  if (cur_bcenter == 3) {
+    int lw = 0, p = off, end = off + len;
+    unsigned cp;
+    while (p < end) {
+      int gp = p;
+      p += utf8_decode(&B->pg->text[p], &B->pg->text[end], &cp);
+      lw += body_cp_adv(cp, glyph_px(gp));
+      if (cp == ' ')
+        justify_spaces++;
+    }
+    int room = paw - cur_bindent * INDENT_PX - lw;
+    if (justify_spaces > 0 && room > 0) {
+      justify_extra = room / justify_spaces;
+      justify_rem = room % justify_spaces;
+    }
+  }
 
   int i = 0;
   while (i < len) {
@@ -2524,6 +2542,23 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
     if (a & ST_STRIKE)
       gfx_fill_rect(x, y + base - rpx / 3, rw, 1, fg);
     x += rw;
+    if (cur_bcenter == 3 && justify_spaces > 0) {
+      int spaces = 0;
+      for (int p = 0; p < rl;) {
+        unsigned cp;
+        int n = utf8_decode(&run[p], &run[rl], &cp);
+        if (cp == ' ')
+          spaces++;
+        p += n;
+      }
+      for (int n = 0; n < spaces; n++) {
+        x += justify_extra;
+        if (justify_rem > 0) {
+          x++;
+          justify_rem--;
+        }
+      }
+    }
   }
   return x0;
 }
@@ -3179,6 +3214,38 @@ static void fill_clip(int x, int y, int w, int h, unsigned rgb, int ct, int cb)
     gfx_fill_rect(x, y0, w, y1 - y0, rgb);
 }
 
+static void draw_border_h(int x, int y, int w, int h, int style, unsigned color, int ct, int cb)
+{
+  if (style <= CSS_BST_SOLID) {
+    fill_clip(x, y, w, h, color, ct, cb);
+    return;
+  }
+  int period = style == CSS_BST_DOTTED ? h * 2 : h * 5;
+  int on = style == CSS_BST_DOTTED ? h : h * 3;
+  if (period < 1)
+    period = 1;
+  if (on < 1)
+    on = 1;
+  for (int p = 0; p < w; p += period)
+    fill_clip(x + p, y, on < w - p ? on : w - p, h, color, ct, cb);
+}
+
+static void draw_border_v(int x, int y, int w, int h, int style, unsigned color, int ct, int cb)
+{
+  if (style <= CSS_BST_SOLID) {
+    fill_clip(x, y, w, h, color, ct, cb);
+    return;
+  }
+  int period = style == CSS_BST_DOTTED ? w * 2 : w * 5;
+  int on = style == CSS_BST_DOTTED ? w : w * 3;
+  if (period < 1)
+    period = 1;
+  if (on < 1)
+    on = 1;
+  for (int p = 0; p < h; p += period)
+    fill_clip(x, y + p, w, on < h - p ? on : h - p, color, ct, cb);
+}
+
 /* Paint one box's shadow, background (colour/gradient/image), border and
  * outline. `alpha` (0..255) is the element's opacity applied to the solid
  * background/border (images/gradients/outline stay opaque — a pragmatic
@@ -3238,16 +3305,16 @@ static void paint_one_box(struct lbox *b, int py, int pw, int phh, int top_doc)
         paint_gradient(&b->bgi, b->x, sy, b->w, b->h, by, bh, pw);
     }
     if (has_bd) { /* 4 edges, clipped to the visible band */
-      unsigned c = b->border_color;
       if (b->border.t && sy >= py && sy < cb)
-        gfx_fill_rect(b->x, sy, b->w, b->border.t, c);
+        draw_border_h(b->x, sy, b->w, b->border.t, b->border_style[0], b->border_side_color[0], py, cb);
       int bot = sy + b->h - b->border.b;
       if (b->border.b && bot >= py && bot < cb)
-        gfx_fill_rect(b->x, bot, b->w, b->border.b, c);
+        draw_border_h(b->x, bot, b->w, b->border.b, b->border_style[2], b->border_side_color[2], py, cb);
       if (b->border.l)
-        gfx_fill_rect(b->x, by, b->border.l, bh, c);
+        draw_border_v(b->x, by, b->border.l, bh, b->border_style[3], b->border_side_color[3], py, cb);
       if (b->border.r)
-        gfx_fill_rect(b->x + b->w - b->border.r, by, b->border.r, bh, c);
+        draw_border_v(b->x + b->w - b->border.r, by, b->border.r, bh, b->border_style[1], b->border_side_color[1], py,
+                      cb);
     }
   }
   if (has_ol) { /* outline: a ring just outside the border box */
@@ -4105,7 +4172,7 @@ static int line_content_x(int row)
   int len = B->line_len[row], base = B->line_off[row];
   set_block(base);
   int x = B->line_x[row] + cur_bindent * INDENT_PX;
-  if (cur_bcenter) {
+  if (cur_bcenter == 1 || cur_bcenter == 2) {
     int lw = 0;
     unsigned cp;
     for (int p = base; p < base + len;) {
@@ -4115,7 +4182,7 @@ static int line_content_x(int row)
     }
     int room = (B->line_w[row] - cur_bindent * INDENT_PX) - lw;
     if (room > 0)
-      x += room / 2;
+      x += cur_bcenter == 1 ? room / 2 : room;
   }
   return x;
 }

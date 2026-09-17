@@ -51,6 +51,7 @@ enum css_list {
 /* list-style-position: whether the marker sits in the content box (inside) or
  * the margin gutter (outside, the CSS default). DEFAULT = unset/inherit. */
 enum css_list_pos { CSS_LSP_DEFAULT = 0, CSS_LSP_OUTSIDE, CSS_LSP_INSIDE };
+enum css_border_style { CSS_BST_UNSET = -1, CSS_BST_NONE = 0, CSS_BST_SOLID, CSS_BST_DASHED, CSS_BST_DOTTED };
 
 /* CSS timing functions (animation/transition easing). The bezier presets are
  * solved numerically by the animation engine (anim.c); the step forms
@@ -150,6 +151,7 @@ struct css_style {
   int bg;
   signed char bold;
   signed char under;
+  signed char strike;
   signed char disp;
   signed char center; /* text-align: 1 = center, 0 = left/other, -1 unset */
   int width, height;
@@ -167,7 +169,9 @@ struct css_style {
   short margin[4];                        /* T,R,B,L: px>=0, -2 auto, -1 unset */
   short padding[4];                       /* T,R,B,L: px>=0, -1 unset */
   short border_w[4];                      /* T,R,B,L: px>=0, -1 unset */
+  signed char border_style[4];            /* T,R,B,L: CSS_BST_*, -1 unset */
   int border_color;                       /* 0xRRGGBB or -1 */
+  int border_side_color[4];               /* T,R,B,L: colour or -1 unset */
   signed char pos;                        /* enum css_pos, or -1 unset */
   int top, right, bottom, left;           /* px or -1 */
   signed char flex;                       /* 1 = display:flex/inline-flex, 0 not, -1 unset */
