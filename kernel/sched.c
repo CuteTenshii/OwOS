@@ -57,11 +57,11 @@ typedef struct address_space {
 } address_space_t;
 
 typedef struct task {
-  uintptr_t esp;       /* saved kernel stack pointer (the context)     */
-  address_space_t *as; /* shared by a process and its user threads      */
-  int as_owner;        /* this task owns the address-space object          */
-  void *kstack;        /* kernel stack to free (0 for the main task)   */
-  uint32_t kstack_top; /* TSS esp0 for this task (0 = leave it alone)  */
+  uintptr_t esp;        /* saved kernel stack pointer (the context)     */
+  address_space_t *as;  /* shared by a process and its user threads      */
+  int as_owner;         /* this task owns the address-space object          */
+  void *kstack;         /* kernel stack to free (0 for the main task)   */
+  uintptr_t kstack_top; /* TSS stack top (0 = leave it alone)          */
   int state;
   uint32_t id;
   struct task *process;       /* process leader for user threads             */
@@ -235,7 +235,7 @@ static task_t *alloc_task(void)
 
 /* Return the active page directory for a task. Kernel threads have no address
  * space object and run under the shared kernel directory. */
-static uint32_t task_cr3(const task_t *t) { return t->as ? (uint32_t)t->as->dir : paging_kernel_phys(); }
+static uintptr_t task_cr3(const task_t *t) { return t->as ? (uintptr_t)t->as->dir : paging_kernel_phys(); }
 
 static void address_space_get(address_space_t *as)
 {
@@ -422,7 +422,7 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
     return -1;
   }
   t->kstack = kstack;
-  t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
+  t->kstack_top = (uintptr_t)(kstack + UKSTACK_SIZE);
 
   /* Craft the kernel stack so the first schedule restores it, rets into
    * enter_user_task, and irets to ring 3 at `entry`. */
@@ -533,7 +533,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
     return -1;
   }
   t->kstack = kstack;
-  t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
+  t->kstack_top = (uintptr_t)(kstack + UKSTACK_SIZE);
 
 #ifdef __x86_64__
   uint64_t *sp = (uint64_t *)(uintptr_t)t->kstack_top;
@@ -602,7 +602,7 @@ int sched_fork(struct registers *r)
   t->process = t;
   t->parent = current->id;
   t->kstack = kstack;
-  t->kstack_top = (uint32_t)(kstack + UKSTACK_SIZE);
+  t->kstack_top = (uintptr_t)(kstack + UKSTACK_SIZE);
   t->state = TASK_RUNNABLE;
   sig_init(t);
   /* fork inherits the parent's signal dispositions + blocked mask (POSIX); the
@@ -787,7 +787,7 @@ struct fd *sched_fds(void) { return current->fds; }
 
 /* The active address space's page directory, shared by a process and its user
  * threads. */
-uint32_t *sched_current_dir(void) { return (uint32_t *)task_cr3(current); }
+uint32_t *sched_current_dir(void) { return (uint32_t *)(uintptr_t)task_cr3(current); }
 
 /* The current task's pid (owner id for windowing-layer bookkeeping). */
 uint32_t sched_current_id(void) { return current->id; }
@@ -1102,7 +1102,7 @@ static int sigframe_setup(task_t *t, struct registers *r, int sig)
   if (base < USER_BASE || base + sizeof(struct sigframe) > USER_REGION_END || base > sp) /* underflow guard        */
     return -1;
 
-  struct sigframe *f = (struct sigframe *)base;
+  struct sigframe *f = (struct sigframe *)(uintptr_t)base;
   uint32_t tramp = base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
   f->pretcode = tramp;
   f->sig = (uint32_t)sig;
@@ -1194,7 +1194,7 @@ int sched_sigreturn(struct registers *r)
   uint32_t base = (uint32_t)r->useresp - 4;
   if (base < USER_BASE || base + sizeof(struct sigframe) > USER_REGION_END)
     return -1;
-  struct sigframe *f = (struct sigframe *)base;
+  struct sigframe *f = (struct sigframe *)(uintptr_t)base;
 
   /* The frame is user-writable: strip SIGKILL/SIGSTOP so a crafted saved mask
    * can't make the process unkillable (same guarantee as sched_sigprocmask). */
@@ -1350,7 +1350,7 @@ void schedule(void)
     if (current->kstack_top)
       tss_set_kernel_stack(current->kstack_top);
     if (task_cr3(current) != task_cr3(prev))
-      paging_load((uint32_t *)task_cr3(current));
+      paging_load((uint32_t *)(uintptr_t)task_cr3(current));
     sched_unlock();
     context_switch(&prev->esp, current->esp);
     sched_kernel_switch_in();

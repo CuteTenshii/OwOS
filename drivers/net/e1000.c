@@ -864,11 +864,11 @@ static int setup_rx(void)
     rx_bufs[i] = kmalloc(BUF_SIZE);
     if (!rx_bufs[i])
       return -1;
-    rx_ring[i].addr = (uint32_t)rx_bufs[i];
+    rx_ring[i].addr = (uint32_t)(uintptr_t)rx_bufs[i];
     rx_ring[i].status = 0;
   }
 
-  reg_write(E1000_RDBAL, (uint32_t)rx_ring);
+  reg_write(E1000_RDBAL, (uint32_t)(uintptr_t)rx_ring);
   reg_write(E1000_RDBAH, 0);
   reg_write(E1000_RDLEN, RX_DESCS * sizeof(struct rx_desc));
   reg_write(E1000_RDH, 0);
@@ -887,11 +887,11 @@ static int setup_tx(void)
     tx_bufs[i] = kmalloc(BUF_SIZE);
     if (!tx_bufs[i])
       return -1;
-    tx_ring[i].addr = (uint32_t)tx_bufs[i];
+    tx_ring[i].addr = (uint32_t)(uintptr_t)tx_bufs[i];
     tx_ring[i].status = 0;
   }
 
-  reg_write(E1000_TDBAL, (uint32_t)tx_ring);
+  reg_write(E1000_TDBAL, (uint32_t)(uintptr_t)tx_ring);
   reg_write(E1000_TDBAH, 0);
   reg_write(E1000_TDLEN, TX_DESCS * sizeof(struct tx_desc));
   reg_write(E1000_TDH, 0);
@@ -916,7 +916,7 @@ static void e1000_send(const uint8_t *frame, uint32_t len)
 
   uint32_t i = tx_cur;
   memcpy(tx_bufs[i], frame, len);
-  tx_ring[i].addr = (uint32_t)tx_bufs[i];
+  tx_ring[i].addr = (uint32_t)(uintptr_t)tx_bufs[i];
   tx_ring[i].length = (uint16_t)len; /* PSP pads runts to 60 in hardware   */
   tx_ring[i].cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS;
   tx_ring[i].status = 0;
@@ -1090,7 +1090,7 @@ static int e1000_probe(void)
     return 0;
   }
   paging_mark_uc(mmio_phys, 0x20000);
-  mmio = (volatile uint8_t *)mmio_phys;
+  mmio = (volatile uint8_t *)(uintptr_t)mmio_phys;
 
   /* The moment of truth on real hardware: the first CSR read. A dead/parked
    * window reads all-ones (a PCIe unsupported-request completion) — detectable
@@ -1250,7 +1250,7 @@ void e1000_txtest(void)
   }
 
   /* Re-initialize the TX ring from scratch. */
-  reg_write(E1000_TDBAL, (uint32_t)tx_ring);
+  reg_write(E1000_TDBAL, (uint32_t)(uintptr_t)tx_ring);
   reg_write(E1000_TDBAH, 0);
   reg_write(E1000_TDLEN, TX_DESCS * sizeof(struct tx_desc));
   reg_write(E1000_TDH, 0);

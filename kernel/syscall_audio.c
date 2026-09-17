@@ -47,9 +47,9 @@ void syscall_audio_write(struct registers *r)
   }
   __asm__ volatile("sti");
   if (audio_backend == 1)
-    r->eax = (uint32_t)hda_stream_write((const void *)buf, len);
+    r->eax = (uint32_t)hda_stream_write((const void *)(uintptr_t)buf, len);
   else if (audio_backend == 2)
-    r->eax = (uint32_t)sb16_stream_write((const void *)buf, len);
+    r->eax = (uint32_t)sb16_stream_write((const void *)(uintptr_t)buf, len);
   else
     r->eax = (uint32_t)-1;
 }

@@ -205,7 +205,7 @@ static void sb_start(void)
 {
   dsp_write(0xD1); /* speaker on                       */
   irq_count = 0;
-  dma_setup_autoinit((uint32_t)dma_buf, DMABUF);
+  dma_setup_autoinit((uint32_t)(uintptr_t)dma_buf, DMABUF);
   dsp_write(0x41); /* set output sample rate (Hz)      */
   dsp_write((48000 >> 8) & 0xFF);
   dsp_write(48000 & 0xFF);

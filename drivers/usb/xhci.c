@@ -225,7 +225,7 @@ static void ring_init(struct ring *r)
   if (!r->base) /* palloc pool exhausted: caller checks base */
     return;
   struct trb *link = &r->base[RING_TRBS - 1];
-  link->p0 = (uint32_t)r->base;
+  link->p0 = (uint32_t)(uintptr_t)r->base;
   link->p1 = 0;
   link->status = 0;
   link->control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE; /* cycle set on enqueue */
@@ -267,7 +267,7 @@ static struct trb *event_wait(void)
         event_cycle ^= 1;
       }
       /* Tell the controller where we are (set ERDP). */
-      w64(rt, XHCI_ERDP, (uint64_t)(uint32_t)&event_ring[event_idx]);
+      w64(rt, XHCI_ERDP, (uint64_t)(uintptr_t)&event_ring[event_idx]);
       /* Port reset/connect post Port Status Change Events we don't act
        * on here (we poll PORTSC directly); drain them so callers see the
        * command/transfer event they're actually waiting for. */
@@ -297,7 +297,7 @@ static struct trb *event_poll(void)
       event_idx = 0;
       event_cycle ^= 1;
     }
-    w64(rt, XHCI_ERDP, (uint64_t)(uint32_t)&event_ring[event_idx]);
+    w64(rt, XHCI_ERDP, (uint64_t)(uintptr_t)&event_ring[event_idx]);
     if (TRB_GET_TYPE(e->control) != TRB_PORT_STATUS)
       return e;
   }
@@ -356,7 +356,7 @@ static volatile uint8_t *find_and_map(void)
           return NULL;
         paging_mark_uc(phys, size);
         con_printf("xhci: controller at %08x size %08x\n", phys, size);
-        return (volatile uint8_t *)phys;
+        return (volatile uint8_t *)(uintptr_t)phys;
       }
     }
   }
@@ -436,8 +436,8 @@ static void setup_scratchpad(void)
     return;
   uint64_t *arr = palloc(); /* array of scratchpad page pointers */
   for (uint32_t i = 0; i < n && i < 512; i++)
-    arr[i] = (uint32_t)palloc();
-  dcbaa[0] = (uint32_t)arr; /* DCBAA slot 0 = scratchpad array   */
+    arr[i] = (uint64_t)(uintptr_t)palloc();
+  dcbaa[0] = (uint64_t)(uintptr_t)arr; /* DCBAA slot 0 = scratchpad array   */
 }
 
 /* Reset one connected port and return its speed id, or 0 if it didn't enable.
@@ -494,17 +494,17 @@ static int address_device(int slot_id, int port, int speed)
     pfree(output);
     return -1;
   }
-  ep0[1] = (4u << 3) | (mps << 16);     /* EP type 4 = control     */
-  ep0[2] = (uint32_t)ep0_ring.base | 1; /* TR dequeue ptr | DCS=1  */
+  ep0[1] = (4u << 3) | (mps << 16);                /* EP type 4 = control     */
+  ep0[2] = (uint32_t)(uintptr_t)ep0_ring.base | 1; /* TR dequeue ptr | DCS=1  */
   ep0[3] = 0;
 
   /* Re-enumerating a slot: release the previous device context first, or it
    * leaks a page every hot-plug cycle until the palloc pool is exhausted. */
   if (dcbaa[slot_id])
-    pfree((void *)dcbaa[slot_id]);
-  dcbaa[slot_id] = (uint32_t)output;
+    pfree((void *)(uintptr_t)dcbaa[slot_id]);
+  dcbaa[slot_id] = (uint64_t)(uintptr_t)output;
 
-  ring_push(&cmd_ring, (uint32_t)input, 0, 0, TRB_TYPE(TRB_ADDRESS_DEVICE) | ((uint32_t)slot_id << 24));
+  ring_push(&cmd_ring, (uint32_t)(uintptr_t)input, 0, 0, TRB_TYPE(TRB_ADDRESS_DEVICE) | ((uint32_t)slot_id << 24));
   int cc = cmd_submit();
   pfree(input); /* transient: the controller has consumed it */
   if (cc != CC_SUCCESS) {
@@ -533,7 +533,7 @@ static int eval_context_mps(int slot_id, uint32_t mps)
   icc[1] = 0x2;                     /* add EP0 (A1) only                  */
   ep0[1] = (4u << 3) | (mps << 16); /* control EP, new max packet size    */
 
-  ring_push(&cmd_ring, (uint32_t)input, 0, 0, TRB_TYPE(TRB_EVAL_CONTEXT) | ((uint32_t)slot_id << 24));
+  ring_push(&cmd_ring, (uint32_t)(uintptr_t)input, 0, 0, TRB_TYPE(TRB_EVAL_CONTEXT) | ((uint32_t)slot_id << 24));
   int cc = cmd_submit();
   pfree(input); /* transient: consumed by the command */
   return cc == CC_SUCCESS ? 0 : -1;
@@ -551,7 +551,7 @@ static int control_in(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t wVa
   uint32_t setup_lo = bmReqType | ((uint32_t)bReq << 8) | ((uint32_t)wValue << 16);
   uint32_t setup_hi = (uint32_t)wIndex | ((uint32_t)len << 16);
   ring_push(&ep0_ring, setup_lo, setup_hi, 8, TRB_TYPE(TRB_SETUP) | TRB_IDT | (3u << 16)); /* TRT=3 IN data   */
-  ring_push(&ep0_ring, (uint32_t)buf, 0, len, TRB_TYPE(TRB_DATA) | (1u << 16));            /* DIR=1 IN        */
+  ring_push(&ep0_ring, (uint32_t)(uintptr_t)buf, 0, len, TRB_TYPE(TRB_DATA) | (1u << 16)); /* DIR=1 IN        */
   ring_push(&ep0_ring, 0, 0, 0, TRB_TYPE(TRB_STATUS) | TRB_IOC);
   db[slot_id] = 1; /* device doorbell, target EP0 (DCI 1)     */
 
@@ -599,7 +599,7 @@ static int control_out(int slot_id, uint8_t bmReqType, uint8_t bReq, uint16_t wV
   uint32_t setup_lo = bmReqType | ((uint32_t)bReq << 8) | ((uint32_t)wValue << 16);
   uint32_t setup_hi = (uint32_t)wIndex | ((uint32_t)len << 16);
   ring_push(&ep0_ring, setup_lo, setup_hi, 8, TRB_TYPE(TRB_SETUP) | TRB_IDT | (2u << 16)); /* TRT=2 OUT data  */
-  ring_push(&ep0_ring, (uint32_t)buf, 0, len, TRB_TYPE(TRB_DATA));                         /* DIR=0 OUT       */
+  ring_push(&ep0_ring, (uint32_t)(uintptr_t)buf, 0, len, TRB_TYPE(TRB_DATA));              /* DIR=0 OUT       */
   ring_push(&ep0_ring, 0, 0, 0, TRB_TYPE(TRB_STATUS) | TRB_IOC | (1u << 16));              /* DIR=1 IN status */
   db[slot_id] = 1;
 
@@ -802,28 +802,28 @@ static int configure_bulk(struct usbdev *d, int port)
    * live context, then bump Context Entries (DWORD0 bits 27-31) to cover the
    * new endpoints; speed/port/address survive. */
   (void)port;
-  uint32_t *out_slot = (uint32_t *)dcbaa[d->slot];
+  uint32_t *out_slot = (uint32_t *)(uintptr_t)dcbaa[d->slot];
   for (uint32_t i = 0; i < ctx_sz / 4; i++)
     sctx[i] = out_slot[i];
   sctx[0] = (sctx[0] & ~(0x1Fu << 27)) | ((uint32_t)max_dci << 27);
 
   /* EP type: bulk OUT = 2, bulk IN = 6, interrupt IN = 7. CErr=3. */
   epin[1] = (3u << 1) | (6u << 3) | ((uint32_t)d->bulk_in_mps << 16);
-  epin[2] = (uint32_t)net_in_ring.base | 1; /* TR dequeue | DCS      */
-  epin[4] = d->bulk_in_mps;                 /* avg TRB length        */
+  epin[2] = (uint32_t)(uintptr_t)net_in_ring.base | 1; /* TR dequeue | DCS      */
+  epin[4] = d->bulk_in_mps;                            /* avg TRB length        */
   epout[1] = (3u << 1) | (2u << 3) | ((uint32_t)d->bulk_out_mps << 16);
-  epout[2] = (uint32_t)net_out_ring.base | 1;
+  epout[2] = (uint32_t)(uintptr_t)net_out_ring.base | 1;
   epout[4] = d->bulk_out_mps;
   if (intr_dci) {
     uint32_t *epi = (uint32_t *)(input + ctx_sz * (1 + intr_dci));
     uint32_t iv = d->intr_interval ? d->intr_interval - 1 : 6;
     epi[0] = iv << 16; /* Interval              */
     epi[1] = (3u << 1) | (7u << 3) | ((uint32_t)d->intr_in_mps << 16);
-    epi[2] = (uint32_t)net_intr_ring.base | 1;
+    epi[2] = (uint32_t)(uintptr_t)net_intr_ring.base | 1;
     epi[4] = d->intr_in_mps;
   }
 
-  ring_push(&cmd_ring, (uint32_t)input, 0, 0, TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
+  ring_push(&cmd_ring, (uint32_t)(uintptr_t)input, 0, 0, TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
   int cc = cmd_submit();
   pfree(input);           /* transient: consumed by the command */
   if (cc != CC_SUCCESS) { /* config failed: free the transfer rings */
@@ -883,7 +883,7 @@ static const struct nic_ops rndis_ops = {
 /* Post a bulk-IN request so the device can hand us the next packet. */
 static void post_bulk_in(void)
 {
-  ring_push(&net_in_ring, (uint32_t)net_rx_buf, 0, 2048, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+  ring_push(&net_in_ring, (uint32_t)(uintptr_t)net_rx_buf, 0, 2048, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
   db[net_slot] = net_in_dci;
   net_in_pending = 1;
 }
@@ -895,7 +895,7 @@ static void post_bulk_intr(void)
 {
   if (!net_intr_dci)
     return;
-  ring_push(&net_intr_ring, (uint32_t)net_intr_buf, 0, 16, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+  ring_push(&net_intr_ring, (uint32_t)(uintptr_t)net_intr_buf, 0, 16, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
   db[net_slot] = net_intr_dci;
   net_intr_pending = 1;
 }
@@ -911,7 +911,7 @@ static void post_bulk_out(const uint8_t *frame, int len)
   put_le32(net_tx_buf + 12, len);            /* data length                 */
   for (int i = 0; i < len; i++)
     net_tx_buf[RNDIS_HDR + i] = frame[i];
-  ring_push(&net_out_ring, (uint32_t)net_tx_buf, 0, RNDIS_HDR + len, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+  ring_push(&net_out_ring, (uint32_t)(uintptr_t)net_tx_buf, 0, RNDIS_HDR + len, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
   db[net_slot] = net_out_dci;
   net_out_pending = 1;
 }
@@ -972,7 +972,7 @@ static void recover_in_stall(void)
   ring_push(&cmd_ring, 0, 0, 0, TRB_TYPE(TRB_RESET_EP) | ((uint32_t)net_in_dci << 16) | ((uint32_t)net_slot << 24));
   cmd_submit();
   control_no_data(net_slot, 0x02, 0x01, 0, net_in_ep); /* CLEAR_FEATURE HALT */
-  uint32_t deq = (uint32_t)&net_in_ring.base[net_in_ring.enq] | net_in_ring.cycle;
+  uint32_t deq = (uint32_t)(uintptr_t)&net_in_ring.base[net_in_ring.enq] | net_in_ring.cycle;
   ring_push(&cmd_ring, deq, 0, 0, TRB_TYPE(TRB_SET_TRDQ) | ((uint32_t)net_in_dci << 16) | ((uint32_t)net_slot << 24));
   cmd_submit();
 
@@ -1188,19 +1188,19 @@ static int configure_bulk_msc(struct usbdev *d)
 
   icc[1] = (1u << 0) | (1u << in_dci) | (1u << out_dci);
 
-  uint32_t *out_slot = (uint32_t *)dcbaa[d->slot];
+  uint32_t *out_slot = (uint32_t *)(uintptr_t)dcbaa[d->slot];
   for (uint32_t i = 0; i < ctx_sz / 4; i++)
     sctx[i] = out_slot[i];
   sctx[0] = (sctx[0] & ~(0x1Fu << 27)) | ((uint32_t)max_dci << 27);
 
   epin[1] = (3u << 1) | (6u << 3) | ((uint32_t)d->bulk_in_mps << 16); /* bulk IN  */
-  epin[2] = (uint32_t)msc_in_ring.base | 1;
+  epin[2] = (uint32_t)(uintptr_t)msc_in_ring.base | 1;
   epin[4] = d->bulk_in_mps;
   epout[1] = (3u << 1) | (2u << 3) | ((uint32_t)d->bulk_out_mps << 16); /* bulk OUT */
-  epout[2] = (uint32_t)msc_out_ring.base | 1;
+  epout[2] = (uint32_t)(uintptr_t)msc_out_ring.base | 1;
   epout[4] = d->bulk_out_mps;
 
-  ring_push(&cmd_ring, (uint32_t)input, 0, 0, TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
+  ring_push(&cmd_ring, (uint32_t)(uintptr_t)input, 0, 0, TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
   int cc = cmd_submit();
   pfree(input);           /* transient: consumed by the command */
   if (cc != CC_SUCCESS) { /* config failed: free the transfer rings */
@@ -1226,7 +1226,7 @@ static int configure_bulk_msc(struct usbdev *d)
  * code. */
 static int bulk_xfer(int slot, struct ring *ring, int dci, uint8_t *buf, int len, int *cc)
 {
-  ring_push(ring, (uint32_t)buf, 0, len, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+  ring_push(ring, (uint32_t)(uintptr_t)buf, 0, len, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
   db[slot] = dci;
   struct trb *e = event_wait();
   if (!e || TRB_GET_TYPE(e->control) != TRB_TRANSFER_EVENT) {
@@ -1253,7 +1253,7 @@ static void msc_clear_stall(int dci, uint8_t ep_addr, struct ring *ring)
   control_no_data(msc_slot, 0x02, 0x01, 0, ep_addr); /* CLEAR_FEATURE HALT */
   ep0_ring = saved;
 
-  uint32_t deq = (uint32_t)&ring->base[ring->enq] | ring->cycle;
+  uint32_t deq = (uint32_t)(uintptr_t)&ring->base[ring->enq] | ring->cycle;
   ring_push(&cmd_ring, deq, 0, 0, TRB_TYPE(TRB_SET_TRDQ) | ((uint32_t)dci << 16) | ((uint32_t)msc_slot << 24));
   cmd_submit();
 }
@@ -1670,19 +1670,19 @@ static int configure_bulk_mtp(struct usbdev *d)
 
   icc[1] = (1u << 0) | (1u << in_dci) | (1u << out_dci);
 
-  uint32_t *out_slot = (uint32_t *)dcbaa[d->slot];
+  uint32_t *out_slot = (uint32_t *)(uintptr_t)dcbaa[d->slot];
   for (uint32_t i = 0; i < ctx_sz / 4; i++)
     sctx[i] = out_slot[i];
   sctx[0] = (sctx[0] & ~(0x1Fu << 27)) | ((uint32_t)max_dci << 27);
 
   epin[1] = (3u << 1) | (6u << 3) | ((uint32_t)d->bulk_in_mps << 16); /* bulk IN  */
-  epin[2] = (uint32_t)mtp_in_ring.base | 1;
+  epin[2] = (uint32_t)(uintptr_t)mtp_in_ring.base | 1;
   epin[4] = d->bulk_in_mps;
   epout[1] = (3u << 1) | (2u << 3) | ((uint32_t)d->bulk_out_mps << 16); /* bulk OUT */
-  epout[2] = (uint32_t)mtp_out_ring.base | 1;
+  epout[2] = (uint32_t)(uintptr_t)mtp_out_ring.base | 1;
   epout[4] = d->bulk_out_mps;
 
-  ring_push(&cmd_ring, (uint32_t)input, 0, 0, TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
+  ring_push(&cmd_ring, (uint32_t)(uintptr_t)input, 0, 0, TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot << 24));
   int cc = cmd_submit();
   pfree(input);           /* transient: consumed by the command */
   if (cc != CC_SUCCESS) { /* config failed: free the transfer rings */
@@ -2239,25 +2239,25 @@ static int setup_controller(void)
   /* Device context base array; tell the controller how many slots to enable. */
   dcbaa = palloc();
   setup_scratchpad();
-  w64(op, XHCI_DCBAAP, (uint32_t)dcbaa);
+  w64(op, XHCI_DCBAAP, (uint64_t)(uintptr_t)dcbaa);
   w32(op, XHCI_CONFIG, max_slots);
 
   /* Command ring. CRCR points at it with the ring cycle state (RCS=1). */
   ring_init(&cmd_ring);
-  w64(op, XHCI_CRCR, (uint32_t)cmd_ring.base | 1);
+  w64(op, XHCI_CRCR, (uint64_t)(uintptr_t)cmd_ring.base | 1);
 
   /* Event ring: one segment + a one-entry segment table. */
   event_ring = palloc();
   event_cycle = TRB_CYCLE;
   event_idx = 0;
   uint32_t *erst = palloc();
-  erst[0] = (uint32_t)event_ring; /* segment base low                    */
-  erst[1] = 0;                    /* segment base high                   */
-  erst[2] = RING_TRBS;            /* segment size                        */
+  erst[0] = (uint32_t)(uintptr_t)event_ring; /* segment base low                    */
+  erst[1] = 0;                               /* segment base high                   */
+  erst[2] = RING_TRBS;                       /* segment size                        */
   erst[3] = 0;
   w32(rt, XHCI_ERSTSZ, 1);
-  w64(rt, XHCI_ERDP, (uint32_t)event_ring);
-  w64(rt, XHCI_ERSTBA, (uint32_t)erst);
+  w64(rt, XHCI_ERDP, (uint64_t)(uintptr_t)event_ring);
+  w64(rt, XHCI_ERSTBA, (uint64_t)(uintptr_t)erst);
 
   /* Run, and leave it running. */
   w32(op, XHCI_USBCMD, r32(op, XHCI_USBCMD) | CMD_RS);

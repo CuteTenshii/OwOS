@@ -450,7 +450,7 @@ void sd_init(void)
     return;
   }
   paging_mark_uc(bar0, 0x1000);
-  mmio = (volatile uint8_t *)bar0;
+  mmio = (volatile uint8_t *)(uintptr_t)bar0;
 
   /* Full software reset, then wait for it to self-clear. */
   wr8(R_SW_RESET, SR_ALL);

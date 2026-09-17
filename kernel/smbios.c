@@ -94,7 +94,7 @@ static const uint8_t *map_phys(uint32_t phys, uint32_t len)
 {
   if (phys >= 0x1000000)
     paging_identity_map(phys, len);
-  return (const uint8_t *)phys;
+  return (const uint8_t *)(uintptr_t)phys;
 }
 
 /* Walk the structure table at `addr` (length `len`) for the first DMI type 1
@@ -257,7 +257,7 @@ void smbios_init(void)
 
   /* Legacy BIOS: the anchor is on a 16-byte boundary in the f-segment. */
   for (uint32_t a = 0xF0000; a < 0x100000; a += 16) {
-    const uint8_t *ep = (const uint8_t *)a;
+    const uint8_t *ep = (const uint8_t *)(uintptr_t)a;
     if (streq4(ep, '_', 'S', 'M', '_') || (streq4(ep, '_', 'S', 'M', '3') && ep[4] == '_')) {
       if (parse_entry(ep))
         goto build;

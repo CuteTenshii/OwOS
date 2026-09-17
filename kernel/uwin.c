@@ -315,7 +315,7 @@ int uwin_create(int w, int h, const char *title)
   }
   tlb_flush();
   for (uint32_t i = 0; i < (uint32_t)npages * 1024u; i++)
-    ((uint32_t *)user_vaddr)[i] = UWIN_BG;
+    ((uint32_t *)(uintptr_t)user_vaddr)[i] = UWIN_BG;
 
   /* Cascade the initial frame diagonally within the screen so a window never
    * opens off-screen; the compositor may move it later via SYS_WIN_SET_GEOM. */

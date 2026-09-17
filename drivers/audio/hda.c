@@ -508,13 +508,13 @@ static int ring_setup(void)
   uint32_t base = pmm_alloc_contig(0x40000);
   if (!base || paging_identity_map(base, 0x40000) != 0)
     return 0;
-  corb = (volatile uint32_t *)(base + 0x0000);
+  corb = (volatile uint32_t *)(uintptr_t)(base + 0x0000);
   corb_phys = base + 0x0000;
-  rirb = (volatile uint32_t *)(base + 0x0400);
+  rirb = (volatile uint32_t *)(uintptr_t)(base + 0x0400);
   rirb_phys = base + 0x0400;
-  bdl = (volatile uint32_t *)(base + 0x0C00);
+  bdl = (volatile uint32_t *)(uintptr_t)(base + 0x0C00);
   bdl_phys = base + 0x0C00;
-  audio = (uint8_t *)(base + 0x1000);
+  audio = (uint8_t *)(uintptr_t)(base + 0x1000);
 
   wr8(R_CORBCTL, 0);
   wr8(R_RIRBCTL, 0); /* stop the DMA engines    */
@@ -570,7 +570,7 @@ void hda_init(void)
     return;
   }
   paging_mark_uc(bar0, 0x4000);
-  mmio = (volatile uint8_t *)bar0;
+  mmio = (volatile uint8_t *)(uintptr_t)bar0;
 
   /* Controller reset: CRST low, then high, then wait for it to come up. */
   wr32(R_GCTL, rd32(R_GCTL) & ~1u);
@@ -732,11 +732,11 @@ static void stream_program_sd(void)
     spin(50);
   }
 
-  bdl[0] = (uint32_t)audio;
+  bdl[0] = (uint32_t)(uintptr_t)audio;
   bdl[1] = 0;
   bdl[2] = HALF;
   bdl[3] = 0;
-  bdl[4] = (uint32_t)audio + HALF;
+  bdl[4] = (uint32_t)(uintptr_t)audio + HALF;
   bdl[5] = 0;
   bdl[6] = HALF;
   bdl[7] = 0;

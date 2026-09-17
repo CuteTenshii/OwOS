@@ -40,9 +40,9 @@ void syscall_net_send(struct registers *r)
       r->eax = (uint32_t)-1;
       return;
     }
-    r->eax = (uint32_t)net_sock_sendto((int)fd, ip, (int)port, (const void *)buf, len);
+    r->eax = (uint32_t)net_sock_sendto((int)fd, ip, (int)port, (const void *)(uintptr_t)buf, len);
   } else {
-    r->eax = (uint32_t)net_sock_send((int)fd, (const void *)buf, len);
+    r->eax = (uint32_t)net_sock_send((int)fd, (const void *)(uintptr_t)buf, len);
   }
 }
 
@@ -64,7 +64,7 @@ void syscall_net_recv(struct registers *r)
   if (ip_ptr || port_ptr) {
     uint8_t ip[4];
     uint16_t port = 0;
-    n = net_sock_recvfrom((int)fd, (void *)buf, max, ip_ptr ? ip : 0, &port);
+    n = net_sock_recvfrom((int)fd, (void *)(uintptr_t)buf, max, ip_ptr ? ip : 0, &port);
     if (n > 0) {
       if (ip_ptr && copyout(ip_ptr, ip, sizeof ip) != 0)
         n = -1;
@@ -75,9 +75,9 @@ void syscall_net_recv(struct registers *r)
       }
     }
   } else if (flags & MSG_DONTWAIT) {
-    n = net_sock_recv_nb((int)fd, (void *)buf, max);
+    n = net_sock_recv_nb((int)fd, (void *)(uintptr_t)buf, max);
   } else {
-    n = net_sock_recv((int)fd, (void *)buf, max);
+    n = net_sock_recv((int)fd, (void *)(uintptr_t)buf, max);
   }
   r->eax = (uint32_t)n;
 }

@@ -915,7 +915,7 @@ static int region_read(struct ns_node *reg, uint32_t bit_off, uint32_t width, ui
     } else if (reg->space == 0) { /* SystemMemory */
       if (paging_identity_map((uint32_t)base, 1) != 0)
         return 0;
-      b = *(volatile uint8_t *)(uint32_t)base;
+      b = *(volatile uint8_t *)(uintptr_t)(uint32_t)base;
     } else if (reg->space == 2) { /* PCI_Config (mechanism #1) */
       uint32_t off = (uint32_t)base;
       uint32_t dw = pci_read32(pbus, pslot, pfunc, (uint8_t)(off & ~3u));

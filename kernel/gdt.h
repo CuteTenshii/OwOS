@@ -7,6 +7,8 @@
 #ifndef OWOS_GDT_H
 #define OWOS_GDT_H
 
+#include <stdint.h>
+
 /* Segment selectors = byte offset of the descriptor into the GDT.
  * These must match the order entries are filled in gdt_init(), and the
  * hardcoded values in gdt_flush.S. */
@@ -20,7 +22,7 @@ void gdt_init(void);
 
 /* Set the kernel stack the CPU loads on a ring3 -> ring0 trap (for the calling
  * CPU's own TSS). */
-void tss_set_kernel_stack(unsigned int esp0);
+void tss_set_kernel_stack(uintptr_t stack_top);
 
 /* An application processor switches from the trampoline GDT to the kernel GDT,
  * then loads its own per-CPU TSS into TR. */

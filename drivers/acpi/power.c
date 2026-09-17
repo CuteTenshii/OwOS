@@ -75,7 +75,7 @@ static int sig4(const char *a, const char *b) { return a[0] == b[0] && a[1] == b
 static struct rsdp *scan_rsdp(uint32_t start, uint32_t end)
 {
   for (uint32_t p = start; p < end; p += 16) {
-    struct rsdp *r = (struct rsdp *)p;
+    struct rsdp *r = (struct rsdp *)(uintptr_t)p;
     if (r->signature[0] == 'R' && r->signature[1] == 'S' && r->signature[2] == 'D' && r->signature[3] == ' ' &&
         r->signature[4] == 'P' && r->signature[5] == 'T' && r->signature[6] == 'R' && r->signature[7] == ' ')
       return r;
@@ -120,7 +120,10 @@ static struct rsdp *find_rsdp(void)
     return &boot_rsdp;
 
   /* The EBDA segment pointer lives at physical 0x40E (real-mode word). */
-  uint32_t ebda = (uint32_t)(*(uint16_t *)0x40E) << 4;
+  uintptr_t ebda_addr = 0x40E;
+  uint16_t ebda_word;
+  __asm__ volatile("movw (%[reg]), %[out]" : [out] "=r"(ebda_word) : [reg] "r"(ebda_addr) : "memory");
+  uint32_t ebda = (uint32_t)ebda_word << 4;
   struct rsdp *r = 0;
   if (ebda)
     r = scan_rsdp(ebda, ebda + 1024);
@@ -151,7 +154,7 @@ static int find_root_sdt(struct sdt_header **hdr, uint32_t *count, int *xsdt)
   if (!phys)
     return 0;
 
-  struct sdt_header *h = (struct sdt_header *)phys;
+  struct sdt_header *h = (struct sdt_header *)(uintptr_t)phys;
   if (paging_identity_map(phys, sizeof(*h)) != 0)
     return 0;
   if (!sig4(h->signature, is_xsdt ? "XSDT" : "RSDT"))
@@ -195,7 +198,7 @@ static uint32_t fadt_dsdt_phys(struct fadt *f)
 static int parse_sleep(struct fadt *f, const char *name, uint16_t *slp_a, uint16_t *slp_b)
 {
   uint32_t dphys = fadt_dsdt_phys(f);
-  struct sdt_header *dsdt = (struct sdt_header *)dphys;
+  struct sdt_header *dsdt = (struct sdt_header *)(uintptr_t)dphys;
   /* Map the header, then the whole table once its length is known. */
   if (paging_identity_map(dphys, sizeof(*dsdt)) != 0)
     return 0;
@@ -260,7 +263,7 @@ void *acpi_find_table(const char *sig)
     uint32_t phys = root_entry(root, i, xsdt);
     if (paging_identity_map(phys, sizeof(struct sdt_header)) != 0)
       continue;
-    struct sdt_header *h = (struct sdt_header *)phys;
+    struct sdt_header *h = (struct sdt_header *)(uintptr_t)phys;
     if (sig4(h->signature, sig)) {
       if (paging_identity_map(phys, h->length) != 0)
         return 0;
@@ -282,11 +285,11 @@ static struct fadt *find_fadt(void) { return (struct fadt *)acpi_find_table("FAC
  * span. */
 static int sdt_contains(struct sdt_header *h, const char *sig, const uint8_t *needle, uint32_t n)
 {
-  if (!h || paging_identity_map((uint32_t)h, sizeof(*h)) != 0)
+  if (!h || paging_identity_map((uint32_t)(uintptr_t)h, sizeof(*h)) != 0)
     return 0;
   if (!sig4(h->signature, sig) || h->length <= sizeof(*h) || n == 0)
     return 0;
-  if (paging_identity_map((uint32_t)h, h->length) != 0)
+  if (paging_identity_map((uint32_t)(uintptr_t)h, h->length) != 0)
     return 0;
 
   const uint8_t *body = (const uint8_t *)h + sizeof(*h);
@@ -319,7 +322,7 @@ int acpi_aml_contains(const uint8_t *needle, uint32_t n)
   /* The DSDT hangs off the FADT, not the root table, so reach it separately
    * (and via the 64-bit X_DSDT when the firmware uses it). */
   struct fadt *f = find_fadt();
-  if (f && sdt_contains((struct sdt_header *)fadt_dsdt_phys(f), "DSDT", needle, n))
+  if (f && sdt_contains((struct sdt_header *)(uintptr_t)fadt_dsdt_phys(f), "DSDT", needle, n))
     return 1;
 
   /* Every other table is a direct root-table entry; scan the SSDTs. */
@@ -327,7 +330,7 @@ int acpi_aml_contains(const uint8_t *needle, uint32_t n)
     uint32_t phys = root_entry(root, i, xsdt);
     if (paging_identity_map(phys, sizeof(struct sdt_header)) != 0)
       continue;
-    if (sdt_contains((struct sdt_header *)phys, "SSDT", needle, n))
+    if (sdt_contains((struct sdt_header *)(uintptr_t)phys, "SSDT", needle, n))
       return 1;
   }
   return 0;
@@ -348,7 +351,7 @@ void acpi_for_each_aml(void (*fn)(const uint8_t *body, uint32_t len, void *ctx),
   struct fadt *f = find_fadt();
   if (f) {
     uint32_t dphys = fadt_dsdt_phys(f);
-    struct sdt_header *d = (struct sdt_header *)dphys;
+    struct sdt_header *d = (struct sdt_header *)(uintptr_t)dphys;
     if (paging_identity_map(dphys, sizeof(*d)) == 0 && sig4(d->signature, "DSDT") &&
         paging_identity_map(dphys, d->length) == 0 && d->length > sizeof(*d))
       fn((const uint8_t *)d + sizeof(*d), d->length - sizeof(*d), ctx);
@@ -356,7 +359,7 @@ void acpi_for_each_aml(void (*fn)(const uint8_t *body, uint32_t len, void *ctx),
 
   for (uint32_t i = 0; i < count; i++) {
     uint32_t phys = root_entry(root, i, xsdt);
-    struct sdt_header *h = (struct sdt_header *)phys;
+    struct sdt_header *h = (struct sdt_header *)(uintptr_t)phys;
     if (paging_identity_map(phys, sizeof(*h)) != 0)
       continue;
     if (!sig4(h->signature, "SSDT"))
@@ -445,7 +448,7 @@ static void acpi_reset(void)
     outb((uint16_t)addr, value);
   } else if (space == 0) { /* memory-mapped reset register */
     if (addr < 0x100000000ull && paging_identity_map((uint32_t)addr, 1) == 0)
-      *(volatile uint8_t *)(uint32_t)addr = value;
+      *(volatile uint8_t *)(uintptr_t)(uint32_t)addr = value;
   }
 }
 
@@ -525,7 +528,7 @@ static uint8_t *find_facs(struct fadt *f)
   }
   if (!phys || paging_identity_map(phys, 64) != 0)
     return 0;
-  uint8_t *facs = (uint8_t *)phys;
+  uint8_t *facs = (uint8_t *)(uintptr_t)phys;
   if (!sig4((char *)facs, "FACS"))
     return 0;
   return facs;

@@ -15,11 +15,18 @@
 ISO    := owos.iso
 ISODIR := isodir
 
-# Objects are emitted in place (kernel/foo.o), shared by both arches. This stamp is a
-# prerequisite of every object and is re-touched when ARCH changes, so switching ARCH
-# forces a recompile instead of linking stale objects into the other image.
-$(ARCH_STAMP):
-	@rm -f .arch.* && touch $@
+# Objects are emitted in place (kernel/foo.o), shared by both arches. The stamp stores
+# the active compiler configuration, so switching ARCH or OPT_LEVEL rebuilds objects.
+.PHONY: FORCE
+FORCE:
+
+$(ARCH_STAMP): FORCE
+	@if [ ! -f $@ ] || [ "$$(cat $@)" != "$(ARCH):O$(OPT_LEVEL)" ]; then \
+		rm -f .arch.*; \
+		printf '%s\n' '$(ARCH):O$(OPT_LEVEL)' > $@; \
+		sleep 1; \
+		touch $@; \
+	fi
 
 OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flush.o \
         kernel/idt.o kernel/isr.o kernel/irq.o kernel/irq_stubs.o \
@@ -57,3 +64,7 @@ $(KERNEL): $(OBJS) $(LINKER)
 
 # Force a rebuild of every object when the target ARCH changes (see ARCH_STAMP).
 $(OBJS): $(ARCH_STAMP)
+
+# Blob objects have explicit rules in user/apps/build.mk. Keep their generated
+# object format tied to the same architecture stamp as compiled sources.
+$(filter %_blob.o,$(OBJS)): $(ARCH_STAMP)

@@ -191,7 +191,7 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
     return -1;
   }
   paging_mark_uc(fifo_phys, fifo_sz);
-  fifo = (volatile uint32_t *)fifo_phys;
+  fifo = (volatile uint32_t *)(uintptr_t)fifo_phys;
   fifo_words = fifo_sz / 4;
 
   fifo[SVGA_FIFO_MIN] = SVGA_FIFO_NUM_REGS * 4;

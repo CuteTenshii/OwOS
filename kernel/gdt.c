@@ -70,7 +70,7 @@ static struct gdt_entry gdt[5 + 2 * SMP_MAX_CPUS];
 static struct gdt_ptr gdt_ptr;
 static struct tss_entry tss[SMP_MAX_CPUS];
 
-void tss_set_kernel_stack(unsigned int rsp0) { tss[smp_this_cpu()].rsp0 = rsp0; }
+void tss_set_kernel_stack(uintptr_t stack_top) { tss[smp_this_cpu()].rsp0 = stack_top; }
 
 static void gdt_set_tss(int idx, const struct tss_entry *t)
 {
@@ -132,7 +132,7 @@ static struct gdt_entry gdt[5 + SMP_MAX_CPUS];
 static struct gdt_ptr gdt_ptr;
 static struct tss_entry tss[SMP_MAX_CPUS];
 
-void tss_set_kernel_stack(unsigned int esp0) { tss[smp_this_cpu()].esp0 = esp0; }
+void tss_set_kernel_stack(uintptr_t stack_top) { tss[smp_this_cpu()].esp0 = (uint32_t)stack_top; }
 
 void gdt_init(void)
 {

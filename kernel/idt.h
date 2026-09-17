@@ -43,6 +43,6 @@ void idt_init(void);
 void idt_load(void);
 
 /* Install one IDT gate. Exposed so the IRQ module can add its own gates. */
-void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags);
+void idt_set_gate(uint8_t num, uintptr_t base, uint16_t sel, uint8_t flags);
 
 #endif /* OWOS_IDT_H */

@@ -251,9 +251,9 @@ void crash_record(const char *name, struct registers *r)
   uint32_t bp = r->ebp;
   while (c->ntrace < CRASH_TRACE && bp >= USER_BASE && bp + 8 <= USER_REGION_END && paging_user_mapped(bp) &&
          paging_user_mapped(bp + 4)) {
-    uint32_t ret = *(volatile uint32_t *)(bp + 4);
+    uint32_t ret = *(volatile uint32_t *)(uintptr_t)(bp + 4);
     c->trace[c->ntrace++] = ret;
-    uint32_t nbp = *(volatile uint32_t *)bp;
+    uint32_t nbp = *(volatile uint32_t *)(uintptr_t)bp;
     if (nbp <= bp)
       break; /* frames must grow walking up           */
     bp = nbp;

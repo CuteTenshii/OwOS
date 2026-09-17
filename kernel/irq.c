@@ -111,7 +111,7 @@ void irq_init(void)
   pic_remap();
 
   for (int i = 0; i < 16; i++)
-    idt_set_gate(IRQ_BASE + i, (uint32_t)irq_stubs[i], GDT_KERNEL_CODE, 0x8E);
+    idt_set_gate(IRQ_BASE + i, (uintptr_t)irq_stubs[i], GDT_KERNEL_CODE, 0x8E);
 }
 
 /* Re-initialise the 8259 PIC after an ACPI S3 resume. The firmware's wake POST

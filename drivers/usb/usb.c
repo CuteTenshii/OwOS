@@ -206,7 +206,7 @@ static int uhci_control_in(uint16_t io, int lowspeed, uint8_t addr, uint8_t maxp
   /* SETUP stage: always DATA0, 8 bytes. */
   td[n].status = base;
   td[n].token = td_token(PID_SETUP, addr, 0, 0, 8);
-  td[n].buffer = (uint32_t)setup;
+  td[n].buffer = (uint32_t)(uintptr_t)setup;
   n++;
 
   /* DATA IN stage: alternate the toggle, starting at DATA1. */
@@ -215,7 +215,7 @@ static int uhci_control_in(uint16_t io, int lowspeed, uint8_t addr, uint8_t maxp
     int chunk = remaining < maxpacket ? remaining : maxpacket;
     td[n].status = base;
     td[n].token = td_token(PID_IN, addr, 0, toggle, chunk);
-    td[n].buffer = (uint32_t)(data + off);
+    td[n].buffer = (uint32_t)(uintptr_t)(data + off);
     toggle ^= 1;
     off += chunk;
     remaining -= chunk;
@@ -230,19 +230,19 @@ static int uhci_control_in(uint16_t io, int lowspeed, uint8_t addr, uint8_t maxp
 
   /* Chain the TDs depth-first; the last one terminates the queue. */
   for (int i = 0; i < n; i++)
-    td[i].link = (i + 1 < n) ? ((uint32_t)&td[i + 1] | LINK_DEPTH) : LINK_TERMINATE;
+    td[i].link = (i + 1 < n) ? ((uint32_t)(uintptr_t)&td[i + 1] | LINK_DEPTH) : LINK_TERMINATE;
 
-  qh->head = LINK_TERMINATE;      /* only one queue this frame   */
-  qh->element = (uint32_t)&td[0]; /* first TD (TD select)        */
+  qh->head = LINK_TERMINATE;                 /* only one queue this frame   */
+  qh->element = (uint32_t)(uintptr_t)&td[0]; /* first TD (TD select)        */
 
   /* Point every frame at our queue head so it runs regardless of FRNUM. */
   uint32_t *frames = (uint32_t *)fl;
   for (int i = 0; i < 1024; i++)
-    frames[i] = (uint32_t)qh | LINK_QH;
+    frames[i] = (uint32_t)(uintptr_t)qh | LINK_QH;
 
   /* Arm and start the schedule. */
   outw(io + UHCI_FRNUM, 0);
-  outl(io + UHCI_FRBASEADD, (uint32_t)fl);
+  outl(io + UHCI_FRBASEADD, (uint32_t)(uintptr_t)fl);
   outb(io + UHCI_SOFMOD, 0x40);
   outw(io + UHCI_USBSTS, 0x3F);
   outw(io + UHCI_USBCMD, CMD_RUN | CMD_CF | CMD_MAXP);

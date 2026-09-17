@@ -5,14 +5,21 @@
 
 ENTRY(_start)
 
+PHDRS
+{
+	text PT_LOAD FLAGS(5); /* read + execute */
+	data PT_LOAD FLAGS(6); /* read + write   */
+}
+
 SECTIONS
 {
 	. = 0x40000000;
 
-	.text : { *(.text.start) *(.text*) }
-	.rodata : { *(.rodata*) }
-	.data : { *(.data*) }
-	.bss : { *(.bss*) *(COMMON) }
+	.text : { *(.text.start) *(.text*) } :text
+	.rodata : { *(.rodata*) } :text
+	. = ALIGN(CONSTANT (MAXPAGESIZE));
+	.data : { *(.data*) } :data
+	.bss : { *(.bss*) *(COMMON) } :data
 
 	/DISCARD/ : { *(.note*) *(.comment) *(.eh_frame*) }
 }

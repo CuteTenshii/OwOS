@@ -33,7 +33,7 @@ void syscall_fs_stream_write(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  r->eax = (uint32_t)fs_stream_write((const void *)buf, len);
+  r->eax = (uint32_t)fs_stream_write((const void *)(uintptr_t)buf, len);
 }
 
 void syscall_fs_stream_end(struct registers *r) { r->eax = (uint32_t)fs_stream_end(); }
@@ -94,7 +94,7 @@ void syscall_fs_readfile(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  r->eax = (uint32_t)read_with_path(name, (void *)buf, max);
+  r->eax = (uint32_t)read_with_path(name, (void *)(uintptr_t)buf, max);
 }
 
 void syscall_fs_writefile(struct registers *r)
@@ -108,15 +108,15 @@ void syscall_fs_writefile(struct registers *r)
   join_cwd(name, abs, sizeof abs);
   const char *proc = procfs_subpath(abs);
   if (proc && proc[0]) {
-    r->eax = (uint32_t)procfs_write(proc, (const char *)buf, (int)len);
+    r->eax = (uint32_t)procfs_write(proc, (const char *)(uintptr_t)buf, (int)len);
     return;
   }
   const char *sys = sysfs_subpath(abs);
   if (sys && sys[0]) {
-    r->eax = (uint32_t)sysfs_write(sys, (const char *)buf, (int)len);
+    r->eax = (uint32_t)sysfs_write(sys, (const char *)(uintptr_t)buf, (int)len);
     return;
   }
-  r->eax = (uint32_t)fs_create(abs, (const void *)buf, len);
+  r->eax = (uint32_t)fs_create(abs, (const void *)(uintptr_t)buf, len);
 }
 
 void syscall_fs_readfile_at(struct registers *r)
@@ -128,7 +128,7 @@ void syscall_fs_readfile_at(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  r->eax = (uint32_t)read_at_with_path(name, args[1], (void *)args[2], args[3]);
+  r->eax = (uint32_t)read_at_with_path(name, args[1], (void *)(uintptr_t)args[2], args[3]);
 }
 
 void syscall_fs_rtc_epoch(struct registers *r) { r->eax = rtc_epoch(); }

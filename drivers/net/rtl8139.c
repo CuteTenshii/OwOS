@@ -87,7 +87,7 @@ static void rtl8139_send(const uint8_t *frame, uint32_t len)
   while (len < 60) /* pad runt frames to the 60-byte minimum  */
     b[len++] = 0;
 
-  outl(io_base + REG_TSAD0 + i * 4, (uint32_t)b);
+  outl(io_base + REG_TSAD0 + i * 4, (uint32_t)(uintptr_t)b);
   outl(io_base + REG_TSD0 + i * 4, len); /* OWN=0 starts transmission     */
 
   /* Wait for the card to report the frame out (bounded spin). */
@@ -186,7 +186,7 @@ static int rtl8139_probe(void)
     if (!(inb(io_base + REG_CR) & CR_RST))
       break;
 
-  outl(io_base + REG_RBSTART, (uint32_t)rx_buf);
+  outl(io_base + REG_RBSTART, (uint32_t)(uintptr_t)rx_buf);
   rx_cur = 0;
   outw(io_base + REG_CAPR, 0xFFF0); /* read pointer = -16              */
   outw(io_base + REG_IMR, 0);       /* RX/TX are drained or polled by netrx */

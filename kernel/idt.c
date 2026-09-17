@@ -94,12 +94,12 @@ static const char *const exception_messages[32] = {
     "Reserved",
 };
 
-void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags)
+void idt_set_gate(uint8_t num, uintptr_t base, uint16_t sel, uint8_t flags)
 {
 #ifdef __x86_64__
   idt[num].base_low = base & 0xFFFF;
   idt[num].base_mid = (base >> 16) & 0xFFFF;
-  idt[num].base_high = 0; /* handlers live below 4 GiB (uint32_t base) */
+  idt[num].base_high = (uint32_t)(base >> 32);
   idt[num].selector = sel;
   idt[num].ist = 0;
   idt[num].flags = flags;
@@ -289,7 +289,7 @@ static void panic_screen(struct registers *r)
     uint32_t a = (uint32_t)r->esp + (uint32_t)(i * 4);
     p = p_str(p, " ");
     if (addr_present(a))
-      p = p_hex(p, *(volatile uint32_t *)a);
+      p = p_hex(p, *(volatile uint32_t *)(uintptr_t)a);
     else
       p = p_str(p, "--------");
   }
@@ -375,7 +375,7 @@ void idt_init(void)
 
   /* 0x8E = present, ring 0, 32-bit interrupt gate (clears IF on entry). */
   for (int i = 0; i < 32; i++)
-    idt_set_gate(i, (uint32_t)isr_stubs[i], GDT_KERNEL_CODE, 0x8E);
+    idt_set_gate(i, (uintptr_t)isr_stubs[i], GDT_KERNEL_CODE, 0x8E);
 
   __asm__ volatile("lidt %0" : : "m"(idt_ptr));
 }

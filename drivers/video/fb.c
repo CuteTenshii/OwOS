@@ -211,12 +211,12 @@ static void enable_wc(void)
 
   /* Drop any cached lines for the framebuffer, then switch it to WC. */
   __asm__ volatile("wbinvd" ::: "memory");
-  paging_mark_wc((uint32_t)front, fb_cap * 4);
+  paging_mark_wc((uint32_t)(uintptr_t)front, fb_cap * 4);
 
   /* PAT alone isn't enough on real UEFI hardware: a firmware MTRR can mark the
    * framebuffer UC, which overrides PAT-WC and leaves every store slow. Pin the
    * range WC with a variable MTRR too (no-op under QEMU / without MTRRs). */
-  mtrr_set_wc((uint32_t)front, fb_cap * 4);
+  mtrr_set_wc((uint32_t)(uintptr_t)front, fb_cap * 4);
 }
 
 static void dispi_write(uint16_t index, uint16_t value)
@@ -276,7 +276,7 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
    * hardware; paging_identity_map allocates page tables as needed. */
   if (paging_identity_map(phys, pixels * 4) < 0)
     return -1;
-  front = (uint32_t *)phys;
+  front = (uint32_t *)(uintptr_t)phys;
 
   fb_w = w;
   fb_h = h;
@@ -306,7 +306,7 @@ static void alloc_backbuffer(void)
   uint32_t bytes = fb_cap * 4;
   uint32_t bb = pmm_alloc_contig(bytes);
   if (bb && paging_identity_map(bb, bytes) == 0) {
-    fb = (uint32_t *)bb;
+    fb = (uint32_t *)(uintptr_t)bb;
     single = 0;
   } else {
     fb = front; /* last resort: draw directly to VRAM           */
@@ -358,7 +358,7 @@ int fb_init(uint32_t want_w, uint32_t want_h)
   /* Map the visible framebuffer (one copy), then a RAM back buffer. */
   if (paging_identity_map(lfb, fb_cap * 4) < 0)
     return -1;
-  front = (uint32_t *)lfb;
+  front = (uint32_t *)(uintptr_t)lfb;
   enable_wc();
   alloc_backbuffer();
 
@@ -510,7 +510,7 @@ uint32_t fb_pitch_pixels(void) { return fb_pitch; }
  * run identity-mapped into the kernel, so its physical base equals fb_ptr(); 0
  * in text mode or single-buffered fallback (nothing safe to hand a compositor).
  */
-uint32_t fb_backbuffer_phys(void) { return (active && !single) ? (uint32_t)fb : 0; }
+uint32_t fb_backbuffer_phys(void) { return (active && !single) ? (uint32_t)(uintptr_t)fb : 0; }
 
 uint32_t fb_backbuffer_bytes(void) { return fb_cap * 4u; }
 

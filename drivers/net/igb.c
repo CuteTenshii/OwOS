@@ -313,12 +313,12 @@ static int setup_rx(void)
     rx_bufs[i] = kmalloc(BUF_SIZE);
     if (!rx_bufs[i])
       return -1;
-    rx_ring[i].read.pkt_addr = (uint32_t)rx_bufs[i];
+    rx_ring[i].read.pkt_addr = (uint32_t)(uintptr_t)rx_bufs[i];
     rx_ring[i].read.hdr_addr = 0;
   }
 
   reg_write(IGB_RXDCTL, 0); /* disable the queue while we set up */
-  reg_write(IGB_RDBAL, (uint32_t)rx_ring);
+  reg_write(IGB_RDBAL, (uint32_t)(uintptr_t)rx_ring);
   reg_write(IGB_RDBAH, 0);
   reg_write(IGB_RDLEN, RX_DESCS * sizeof(union igb_rx_desc));
   reg_write(IGB_SRRCTL, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_ADV_ONEBUF);
@@ -347,12 +347,12 @@ static int setup_tx(void)
     tx_bufs[i] = kmalloc(BUF_SIZE);
     if (!tx_bufs[i])
       return -1;
-    tx_ring[i].addr = (uint32_t)tx_bufs[i];
+    tx_ring[i].addr = (uint32_t)(uintptr_t)tx_bufs[i];
     tx_ring[i].olinfo_status = 0;
   }
 
   reg_write(IGB_TXDCTL, 0); /* disable the queue while we set up */
-  reg_write(IGB_TDBAL, (uint32_t)tx_ring);
+  reg_write(IGB_TDBAL, (uint32_t)(uintptr_t)tx_ring);
   reg_write(IGB_TDBAH, 0);
   reg_write(IGB_TDLEN, TX_DESCS * sizeof(struct igb_tx_desc));
   reg_write(IGB_TDH, 0);
@@ -379,7 +379,7 @@ static void igb_send(const uint8_t *frame, uint32_t len)
 
   uint32_t i = tx_cur;
   memcpy(tx_bufs[i], frame, len);
-  tx_ring[i].addr = (uint32_t)tx_bufs[i];
+  tx_ring[i].addr = (uint32_t)(uintptr_t)tx_bufs[i];
   /* Single-buffer advanced data descriptor. PSP pads runts to 60 in hardware,
    * so DTALEN/PAYLEN carry the real length. */
   tx_ring[i].cmd_type_len =
@@ -411,7 +411,7 @@ static void rx_poll(void)
     if ((se & RXD_STAT_EOP) && !(se & RXD_ERR_MASK) && len >= 14 && len <= BUF_SIZE)
       net_rx_frame(rx_bufs[rx_cur], len); /* SECRC already dropped FCS  */
 
-    rx_ring[rx_cur].read.pkt_addr = (uint32_t)rx_bufs[rx_cur]; /* re-arm     */
+    rx_ring[rx_cur].read.pkt_addr = (uint32_t)(uintptr_t)rx_bufs[rx_cur]; /* re-arm     */
     rx_ring[rx_cur].read.hdr_addr = 0;
 
     uint32_t done = rx_cur;
@@ -515,7 +515,7 @@ static int igb_probe(void)
     return 0;
   }
   paging_mark_uc(mmio_phys, 0x20000);
-  mmio = (volatile uint8_t *)mmio_phys;
+  mmio = (volatile uint8_t *)(uintptr_t)mmio_phys;
 
   igb_reset();
 

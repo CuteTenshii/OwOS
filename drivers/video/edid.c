@@ -259,7 +259,7 @@ static void probe(void)
     return;
   }
   paging_mark_uc(bar, 0x100000);
-  mmio = (volatile uint8_t *)bar;
+  mmio = (volatile uint8_t *)(uintptr_t)bar;
 
   uint8_t edid[EDID_LEN];
   for (uint32_t bi = 0; bi < sizeof(gmbus_bases) / sizeof(gmbus_bases[0]); bi++) {

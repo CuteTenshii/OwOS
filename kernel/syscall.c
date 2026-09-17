@@ -187,7 +187,7 @@ void epoch_to_rtc(uint32_t secs, struct rtc_time *t)
 void syscall_init(void)
 {
   /* 0xEE = present, DPL 3, 32-bit interrupt gate -- ring 3 may invoke it. */
-  idt_set_gate(0x80, (uint32_t)isr128, GDT_KERNEL_CODE, 0xEE);
+  idt_set_gate(0x80, (uintptr_t)isr128, GDT_KERNEL_CODE, 0xEE);
 }
 
 typedef void (*syscall_handler_t)(struct registers *r);

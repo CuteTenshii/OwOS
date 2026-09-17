@@ -126,8 +126,13 @@ uint32_t smp_ioapic_base(void) { return ioapic_base; }
 /* Trampoline blob + the slots the BSP stages for each AP before its SIPI. */
 extern uint8_t ap_trampoline_start[], ap_trampoline_end[];
 extern void lapic_timer_isr(void); /* irq_stubs.S, LAPIC_TIMER_VEC gate */
+#ifdef __x86_64__
+volatile uintptr_t ap_stack_top;
+volatile uintptr_t ap_arg;
+#else
 volatile uint32_t ap_stack_top;
 volatile uint32_t ap_arg;
+#endif
 volatile uint32_t ap_cr3; /* kernel page dir; AP enables paging */
 
 static volatile uint32_t ap_started;      /* AP -> BSP: "I'm in ap_main"     */
@@ -259,11 +264,11 @@ void smp_start_aps(void)
 
   paging_identity_map(lapic_base, 0x1000);
   paging_mark_uc(lapic_base, 0x1000);
-  lapic = (volatile uint32_t *)lapic_base;
+  lapic = (volatile uint32_t *)(uintptr_t)lapic_base;
 
   lapic_enable_local(); /* BSP's own Local APIC             */
   lapic_timer_count = lapic_timer_calibrate();
-  idt_set_gate(LAPIC_TIMER_VEC, (uint32_t)lapic_timer_isr, GDT_KERNEL_CODE, 0x8E);
+  idt_set_gate(LAPIC_TIMER_VEC, (uintptr_t)lapic_timer_isr, GDT_KERNEL_CODE, 0x8E);
 
   uint8_t bsp = (uint8_t)(lapic_rd(LAPIC_ID) >> 24);
 
@@ -280,8 +285,8 @@ void smp_start_aps(void)
     void *stack = kmalloc(AP_STACK);
     if (!stack)
       continue;
-    ap_stack_top = (uint32_t)stack + AP_STACK;
-    ap_arg = (uint32_t)i;
+    ap_stack_top = (uintptr_t)stack + AP_STACK;
+    ap_arg = (uintptr_t)i;
     ap_started = 0;
 
     send_ipi(aid, 0x4500); /* INIT, level-assert               */

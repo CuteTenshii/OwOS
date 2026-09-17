@@ -290,7 +290,7 @@ static unsigned intel_gpu_mhz(uint8_t bus, uint8_t slot, uint8_t func)
     return 0;
   paging_mark_uc(bar, 0x180000);
 
-  volatile uint32_t *cap = (volatile uint32_t *)(bar + 0x145998);
+  volatile uint32_t *cap = (volatile uint32_t *)(uintptr_t)(bar + 0x145998);
   uint32_t rp0 = *cap & 0xFF;
   return rp0 * 50u;
 }

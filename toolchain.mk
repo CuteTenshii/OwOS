@@ -13,7 +13,7 @@ VERSION_DEF  := -DOWOS_VERSION='"$(OWOS_VERSION)"'
 #   make ARCH=x86_64  # 64-bit owos-x86_64.bin
 ARCH ?= i386
 OPT_LEVEL ?= 2
-ARCH_STAMP := .arch.$(ARCH).O$(OPT_LEVEL)
+ARCH_STAMP := .arch.current
 ifeq ($(filter $(ARCH),i386 x86_64),)
   $(error unsupported ARCH '$(ARCH)' — use i386 or x86_64)
 endif

@@ -191,7 +191,7 @@ static struct multiboot_info synth_mbi;
  * regions, and if the bulk RAM block lands past the cutoff, pmm sees ~0 MiB. */
 static uint8_t synth_mmap[1024 * 24]; /* up to 1024 regions, 24 bytes each    */
 
-static struct multiboot_info *multiboot2_to_info(uint32_t info_addr)
+static struct multiboot_info *multiboot2_to_info(uintptr_t info_addr)
 {
   struct multiboot_info *m = &synth_mbi;
   uint8_t *mz = (uint8_t *)m;
@@ -201,7 +201,7 @@ static struct multiboot_info *multiboot2_to_info(uint32_t info_addr)
   int mmap_used = 0;
   int uefi = 0;
   /* The info block starts with total_size + reserved (8 bytes), then tags. */
-  uint8_t *p = (uint8_t *)info_addr + 8;
+  uint8_t *p = (uint8_t *)(uintptr_t)info_addr + 8;
   for (;;) {
     struct mb2_tag *tag = (struct mb2_tag *)p;
     if (tag->type == MB2_TAG_END)
@@ -258,7 +258,7 @@ static struct multiboot_info *multiboot2_to_info(uint32_t info_addr)
        * DMI (machine vendor/product for the splash's Host line). The
        * entry point starts at the tag's `tables` field. */
       struct mb2_tag_smbios *sm = (struct mb2_tag_smbios *)p;
-      smbios_set_entry((uint32_t)sm->tables);
+      smbios_set_entry((uint32_t)(uintptr_t)sm->tables);
     }
 
     p += (tag->size + 7) & ~7u; /* tags are 8-byte aligned             */
@@ -268,7 +268,7 @@ static struct multiboot_info *multiboot2_to_info(uint32_t info_addr)
 
   if (mmap_used) {
     m->flags |= MULTIBOOT_FLAG_MMAP;
-    m->mmap_addr = (uint32_t)synth_mmap;
+    m->mmap_addr = (uint32_t)(uintptr_t)synth_mmap;
     m->mmap_length = (uint32_t)(mmap_used * 24);
   }
   return m;
@@ -295,7 +295,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   if (magic == MULTIBOOT2_BOOTLOADER_MAGIC) {
     /* GRUB/UEFI path: ebx points at a multiboot2 tag chain, not an mbi. */
-    mbi = multiboot2_to_info((uint32_t)mbi);
+    mbi = multiboot2_to_info((uintptr_t)mbi);
   } else if (magic != MULTIBOOT_BOOTLOADER_MAGIC) {
     con_set_color(CON_WHITE, CON_RED);
     con_write("bad multiboot magic -- halting.\n");
