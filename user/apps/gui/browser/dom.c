@@ -96,6 +96,7 @@ static struct dom_node *node_new(struct parser *ps, enum dom_type type)
   for (int i = 0; i < 8; i++)
     n->attr_cache[i] = 0;
   n->attr_cache_seq = ~0u;
+  n->attr_seq = 0;
   n->attr_cache_valid = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
@@ -118,13 +119,13 @@ static void node_append(struct dom_node *parent, struct dom_node *child)
   parent->last_child = child;
 }
 
-static void attr_append(struct dom_node *el, char *name, char *value)
+static int attr_append(struct dom_node *el, char *name, char *value)
 {
   struct dom_attr *a = malloc(sizeof *a);
   if (!a) {
     free(name);
     free(value);
-    return;
+    return 0;
   }
   a->name = name;
   a->value = value;
@@ -134,6 +135,7 @@ static void attr_append(struct dom_node *el, char *name, char *value)
   else
     el->attrs = a;
   el->last_attr = a;
+  return 1;
 }
 
 /* Close cur up to and including the nearest ancestor in `targets`, unless a
@@ -451,8 +453,18 @@ struct dom_node *dom_parse(const char *html, int len)
   ps.root->text = 0;
   ps.root->attrs = 0;
   ps.root->last_attr = 0;
+  for (int i = 0; i < 8; i++)
+    ps.root->attr_cache[i] = 0;
+  ps.root->attr_cache_seq = ~0u;
+  ps.root->attr_seq = 0;
+  ps.root->attr_cache_valid = 0;
   ps.root->parent = 0;
   ps.root->first_child = ps.root->last_child = ps.root->next = 0;
+  ps.root->sibling_meta_seq = 0;
+  ps.root->elem_index = ps.root->elem_count = ps.root->type_index = ps.root->type_count = 0;
+  ps.root->computed_style = 0;
+  ps.root->computed_style_sheet = 0;
+  ps.root->computed_style_seq = 0;
   ps.root->wrapper = 0;
   ps.cur = ps.root;
 
@@ -531,12 +543,15 @@ const char *dom_get_attr(const struct dom_node *node, const char *name)
       break;
     }
   if (slot >= 0) {
-    if (node->attr_cache_valid && node->attr_cache_seq == dom_mutation_seq && node->attr_cache[slot])
-      return node->attr_cache[slot]->value;
-    for (int i = 0; i < 8; i++)
-      ((struct dom_node *)node)->attr_cache[i] = 0;
-    ((struct dom_node *)node)->attr_cache_seq = dom_mutation_seq;
-    ((struct dom_node *)node)->attr_cache_valid = 1;
+    struct dom_node *mutable = (struct dom_node *)node;
+    unsigned bit = 1u << slot;
+    if (mutable->attr_cache_seq != mutable->attr_seq) {
+      mutable->attr_cache_valid = 0;
+      mutable->attr_cache_seq = mutable->attr_seq;
+    }
+    if (mutable->attr_cache_valid & bit)
+      return mutable->attr_cache[slot] ? mutable->attr_cache[slot]->value : 0;
+    mutable->attr_cache_valid |= (unsigned char)bit;
   }
   for (struct dom_attr *a = node->attrs; a; a = a->next)
     if (streq_ci(a->name, name)) {
@@ -562,6 +577,7 @@ struct dom_node *dom_new_element(const char *tag)
   for (int i = 0; i < 8; i++)
     n->attr_cache[i] = 0;
   n->attr_cache_seq = ~0u;
+  n->attr_seq = 0;
   n->attr_cache_valid = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
@@ -591,6 +607,7 @@ struct dom_node *dom_new_text(const char *text)
   for (int i = 0; i < 8; i++)
     n->attr_cache[i] = 0;
   n->attr_cache_seq = ~0u;
+  n->attr_seq = 0;
   n->attr_cache_valid = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
   n->sibling_meta_seq = 0;
@@ -676,15 +693,17 @@ void dom_set_attr(struct dom_node *el, const char *name, const char *value)
       if (nv) {
         free(a->value);
         a->value = nv;
+        el->attr_seq++;
       }
       return;
     }
   {
     char *nn = dupn_lower(name, (int)strlen(name));
     char *nv = dupn(value ? value : "", value ? (int)strlen(value) : 0);
-    if (nn && nv)
-      attr_append(el, nn, nv);
-    else {
+    if (nn && nv) {
+      if (attr_append(el, nn, nv))
+        el->attr_seq++;
+    } else {
       if (nn)
         free(nn);
       if (nv)
@@ -710,6 +729,7 @@ void dom_remove_attr(struct dom_node *el, const char *name)
       free(a->name);
       free(a->value);
       free(a);
+      el->attr_seq++;
       return;
     }
     prev = a;

@@ -255,7 +255,7 @@ struct page {
  * lines live here instead, each tagged with the absolute band row it paints on
  * and its own column x/width. */
 struct fslice {
-  int row, off, len, x, w;
+  int row, off, len, x, w, h, maxpx;
 };
 
 struct browser {
@@ -452,7 +452,7 @@ int browser_ensure_text(int need);
 int browser_ensure_links(int need);
 int browser_ensure_imgs(int need);
 int browser_ensure_lines(int need);
-void browser_ov_add(int row, int off, int len, int x, int w);
+void browser_ov_add(int row, int off, int len, int x, int w, int h, int maxpx);
 unsigned *browser_surface(void);
 int browser_surface_ready(void);
 void browser_present(int id);

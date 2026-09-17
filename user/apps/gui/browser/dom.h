@@ -21,6 +21,7 @@ struct dom_node {
   struct dom_attr *last_attr; /* tail of attrs, for O(1) append       */
   struct dom_attr *attr_cache[8];
   unsigned attr_cache_seq;
+  unsigned attr_seq;
   unsigned char attr_cache_valid;
   struct dom_node *parent;
   struct dom_node *first_child;

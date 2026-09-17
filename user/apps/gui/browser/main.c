@@ -1003,7 +1003,8 @@ static int g_ov_n;      /* lines emitted for the current item so far */
 static void add_line(int off, int len, int x, int w, int h)
 {
   if (g_ov_active) {
-    browser_ov_add(g_ov_base + g_ov_n, off, len, x, w);
+    int lh = h > 0 ? h : LINE_H;
+    browser_ov_add(g_ov_base + g_ov_n, off, len, x, w, lh, line_maxpx(off, off + len));
     g_ov_n++;
     return;
   }
@@ -3655,8 +3656,7 @@ static void render(void)
       int sy = py + B->line_y[f->row] - sc;
       if (sy + B->line_h[f->row] <= py || sy >= py + phh)
         continue;
-      draw_slice_core(f->x, sy, f->off, f->len, f->w, py, py + phh, line_height_for(f->off, f->off + f->len),
-                      line_maxpx(f->off, f->off + f->len));
+      draw_slice_core(f->x, sy, f->off, f->len, f->w, py, py + phh, f->h, f->maxpx);
     }
 
     /* inline images, over their reserved (blank) rows */

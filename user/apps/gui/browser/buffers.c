@@ -117,7 +117,7 @@ int browser_ensure_lines(int need)
   return off && len && lx && lw && ly && lh && lp;
 }
 
-void browser_ov_add(int row, int off, int len, int x, int w)
+void browser_ov_add(int row, int off, int len, int x, int w, int h, int maxpx)
 {
   if (B->n_fslices >= B->fslice_cap) {
     int nc = browser_grow_cap(B->fslice_cap, 256, B->n_fslices + 1);
@@ -133,4 +133,6 @@ void browser_ov_add(int row, int off, int len, int x, int w)
   f->len = len;
   f->x = x;
   f->w = w;
+  f->h = h;
+  f->maxpx = maxpx;
 }
