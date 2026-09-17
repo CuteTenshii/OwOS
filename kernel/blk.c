@@ -18,6 +18,7 @@
 #include "paging.h"
 #include "pmm.h"
 #include "sd.h"
+#include "spinlock.h"
 #include "xhci.h"
 
 enum backend { BK_NONE, BK_IDE, BK_AHCI, BK_NVME, BK_SD, BK_RAM };
@@ -37,6 +38,7 @@ struct cache_line {
   uint8_t data[512];
 };
 static struct cache_line cache[BLK_CACHE_LINES];
+static spinlock_t blk_lock;
 
 static void cache_clear(void)
 {
@@ -45,6 +47,12 @@ static void cache_clear(void)
 }
 
 static struct cache_line *cache_slot(uint32_t lba) { return &cache[lba % BLK_CACHE_LINES]; }
+
+static int blk_range_valid(uint32_t lba, uint32_t count)
+{
+  uint32_t sectors = blk_sectors();
+  return count != 0 && lba < sectors && count <= sectors - lba;
+}
 
 static int cache_read(uint32_t lba, void *buf)
 {
@@ -65,9 +73,9 @@ static void cache_fill(uint32_t lba, const void *buf)
 
 static void cache_invalidate(uint32_t lba, uint32_t count)
 {
-  for (uint32_t i = 0; i < count; i++) {
-    struct cache_line *c = cache_slot(lba + i);
-    if (c->valid && c->lba == lba + i)
+  for (int i = 0; i < BLK_CACHE_LINES; i++) {
+    struct cache_line *c = &cache[i];
+    if (c->valid && c->lba >= lba && c->lba - lba < count)
       c->valid = 0;
   }
 }
@@ -123,7 +131,7 @@ int blk_use_ram(void)
       return -1;
     if (paging_identity_map(phys, bytes) != 0)
       return -1;
-    ram_disk = (volatile uint8_t *)phys;
+    ram_disk = (volatile uint8_t *)(uintptr_t)phys;
     ram_sectors = RAMDISK_SECTORS;
     for (uint32_t i = 0; i < bytes; i++) /* start clean (unformatted)      */
       ram_disk[i] = 0;
@@ -202,7 +210,7 @@ int blk_dev_io(const char *dev, blk_read_fn *r, blk_write_fn *w, int *iso)
   return -1;
 }
 
-int blk_read_sector(uint32_t lba, void *buf)
+static int blk_read_sector_locked(uint32_t lba, void *buf)
 {
   if (cache_read(lba, buf))
     return 0;
@@ -231,45 +239,78 @@ int blk_read_sector(uint32_t lba, void *buf)
   return rc;
 }
 
+int blk_read_sector(uint32_t lba, void *buf)
+{
+  uintptr_t flags = spin_lock_irqsave(&blk_lock);
+  if (!blk_range_valid(lba, 1)) {
+    spin_unlock_irqrestore(&blk_lock, flags);
+    return -1;
+  }
+  int rc = blk_read_sector_locked(lba, buf);
+  spin_unlock_irqrestore(&blk_lock, flags);
+  return rc;
+}
+
 int blk_read(uint32_t lba, void *buf, uint32_t count)
 {
+  uintptr_t flags;
+  int rc = 0;
+  uint32_t requested = count;
   if (count == 0)
     return 0;
+  flags = spin_lock_irqsave(&blk_lock);
+  if (!blk_range_valid(lba, count)) {
+    spin_unlock_irqrestore(&blk_lock, flags);
+    return -1;
+  }
   /* Keep requests within the one-page DMA buffers used by AHCI and NVMe. */
-  if (backend == BK_IDE)
-    return ata_read(lba, buf, count);
-  if (backend == BK_AHCI) {
+  if (backend == BK_IDE) {
+    rc = ata_read(lba, buf, count);
+    if (rc == 0 && requested <= BLK_CACHE_LINES) {
+      uint8_t *p = buf;
+      for (uint32_t i = 0; i < requested; i++, p += 512)
+        cache_fill(lba + i, p);
+    }
+  } else if (backend == BK_AHCI) {
     uint8_t *p = buf;
     while (count) {
       uint32_t n = count > 8 ? 8 : count;
       if (ahci_read(lba, p, n) != 0)
-        return -1;
+        goto fail;
+      if (requested <= BLK_CACHE_LINES)
+        for (uint32_t i = 0; i < n; i++)
+          cache_fill(lba + i, p + i * 512);
       lba += n;
       p += n * 512;
       count -= n;
     }
-    return 0;
-  }
-  if (backend == BK_NVME) {
+  } else if (backend == BK_NVME) {
     uint8_t *p = buf;
     while (count) {
       uint32_t n = count > 8 ? 8 : count;
       if (nvme_read(lba, p, n) != 0)
-        return -1;
+        goto fail;
+      if (requested <= BLK_CACHE_LINES)
+        for (uint32_t i = 0; i < n; i++)
+          cache_fill(lba + i, p + i * 512);
       lba += n;
       p += n * 512;
       count -= n;
     }
-    return 0;
+  } else {
+    uint8_t *p = buf;
+    for (uint32_t i = 0; i < count; i++, p += 512)
+      if (blk_read_sector_locked(lba + i, p) != 0)
+        goto fail;
   }
-  uint8_t *p = buf;
-  for (uint32_t i = 0; i < count; i++, p += 512)
-    if (blk_read_sector(lba + i, p) != 0)
-      return -1;
-  return 0;
+  spin_unlock_irqrestore(&blk_lock, flags);
+  return rc;
+fail:
+  spin_unlock_irqrestore(&blk_lock, flags);
+  return -1;
 }
 
-int blk_write_sector(uint32_t lba, const void *buf)
+static int blk_write_sector_locked(uint32_t lba, const void *buf)
 {
   cache_invalidate(lba, 1);
   switch (backend) {
@@ -289,45 +330,70 @@ int blk_write_sector(uint32_t lba, const void *buf)
   }
 }
 
+int blk_write_sector(uint32_t lba, const void *buf)
+{
+  uintptr_t flags = spin_lock_irqsave(&blk_lock);
+  if (!blk_range_valid(lba, 1)) {
+    spin_unlock_irqrestore(&blk_lock, flags);
+    return -1;
+  }
+  int rc = blk_write_sector_locked(lba, buf);
+  spin_unlock_irqrestore(&blk_lock, flags);
+  return rc;
+}
+
 int blk_write(uint32_t lba, const void *buf, uint32_t count)
 {
+  uintptr_t flags;
+  int rc = 0;
+  uint32_t requested = count;
+  uint32_t start_lba = lba;
+  const uint8_t *start_buf = buf;
   if (count == 0)
     return 0;
+  flags = spin_lock_irqsave(&blk_lock);
+  if (!blk_range_valid(lba, count)) {
+    spin_unlock_irqrestore(&blk_lock, flags);
+    return -1;
+  }
   cache_invalidate(lba, count);
   if (backend == BK_IDE) {
-    for (uint32_t i = 0; i < count; i++)
-      if (ata_write_sector(lba + i, (const uint8_t *)buf + i * 512) != 0)
-        return -1;
-    return 0;
-  }
-  if (backend == BK_AHCI) {
+    rc = ata_write(lba, buf, count);
+  } else if (backend == BK_AHCI) {
     const uint8_t *p = buf;
     while (count) {
       uint32_t n = count > 8 ? 8 : count;
       if (ahci_write(lba, p, n) != 0)
-        return -1;
+        goto fail;
       lba += n;
       p += n * 512;
       count -= n;
     }
-    return 0;
-  }
-  if (backend == BK_NVME) {
+  } else if (backend == BK_NVME) {
     const uint8_t *p = buf;
     while (count) {
       uint32_t n = count > 8 ? 8 : count;
       if (nvme_write(lba, p, n) != 0)
-        return -1;
+        goto fail;
       lba += n;
       p += n * 512;
       count -= n;
     }
-    return 0;
+  } else {
+    for (uint32_t i = 0; i < count; i++, lba++, buf = (const uint8_t *)buf + 512)
+      if (blk_write_sector_locked(lba, buf) != 0)
+        goto fail;
   }
-  for (uint32_t i = 0; i < count; i++, lba++, buf = (const uint8_t *)buf + 512)
-    if (blk_write_sector(lba, buf) != 0)
-      return -1;
-  return 0;
+  if (requested <= BLK_CACHE_LINES) {
+    const uint8_t *p = start_buf;
+    for (uint32_t i = 0; i < requested; i++, p += 512)
+      cache_fill(start_lba + i, p);
+  }
+  spin_unlock_irqrestore(&blk_lock, flags);
+  return rc;
+fail:
+  spin_unlock_irqrestore(&blk_lock, flags);
+  return -1;
 }
 
 uint32_t blk_sectors(void)

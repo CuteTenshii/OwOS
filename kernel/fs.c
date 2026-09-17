@@ -7,6 +7,7 @@
 #include "fs.h"
 #include "fsmount.h"
 #include "heap.h"
+#include "kstring.h"
 #include "procfs.h"
 #include "rtc.h"
 #include "sysfs.h"
@@ -290,6 +291,11 @@ static uint32_t alloc_run(uint32_t nsec)
   uint32_t first = ((uint32_t)RESERVED_SECTORS + clus_sectors - 1) / clus_sectors;
   uint32_t run = 0, start_c = 0;
   for (uint32_t c = first; c < clus_count; c++) {
+    if (!(c & 7) && need - run >= 8 && clus_used[c >> 3] == 0xFF) {
+      run = 0;
+      c += 7;
+      continue;
+    }
     if (clus_test(c)) {
       run = 0;
       continue;
@@ -313,6 +319,11 @@ static uint32_t largest_free_run(uint32_t *start)
   uint32_t first = ((uint32_t)RESERVED_SECTORS + clus_sectors - 1) / clus_sectors;
   uint32_t best = 0, best_c = 0, run = 0, rc = 0;
   for (uint32_t c = first; c < clus_count; c++) {
+    if (!(c & 7) && clus_used[c >> 3] == 0xFF) {
+      run = 0;
+      c += 7;
+      continue;
+    }
     if (clus_test(c)) {
       run = 0;
       continue;
@@ -370,8 +381,8 @@ static int grow_dir(void)
 
   uint8_t *d = (uint8_t *)nd, *s = (uint8_t *)dir;
   uint32_t old_bytes = dir_cap * (uint32_t)sizeof(struct dirent);
-  for (uint32_t i = 0; i < new_bytes; i++)
-    d[i] = (i < old_bytes) ? s[i] : 0;
+  memset(d, 0, new_bytes);
+  memcpy(d, s, old_bytes);
 
   if (blk_write(new_start, d, new_sectors) != 0) {
     kfree(nd);
@@ -1161,8 +1172,7 @@ int fs_read_at(const char *name, uint32_t offset, void *buf, uint32_t len)
     uint32_t chunk = SECTOR_SIZE - soff;
     if (chunk > left)
       chunk = left;
-    for (uint32_t k = 0; k < chunk; k++)
-      ((uint8_t *)buf)[copied + k] = tmp[soff + k];
+    memcpy((uint8_t *)buf + copied, tmp + soff, chunk);
     copied += chunk;
   }
   return (int)copied;
@@ -1209,18 +1219,20 @@ int fs_create(const char *name, const void *data, uint32_t size)
     return -1; /* disk full                */
 
   uint8_t tmp[SECTOR_SIZE];
-  uint32_t written = 0;
-  for (uint32_t s = 0; s < sectors; s++) {
-    for (int k = 0; k < SECTOR_SIZE; k++)
-      tmp[k] = 0;
+  uint32_t full = size / SECTOR_SIZE;
+  if (full && blk_write(start, data, full) != 0) {
+    run_mark(start, sectors, 0); /* roll back the reservation */
+    return -1;
+  }
+  uint32_t written = full * SECTOR_SIZE;
+  if (written < size) {
+    memset(tmp, 0, sizeof tmp);
     uint32_t chunk = (size - written) < SECTOR_SIZE ? (size - written) : SECTOR_SIZE;
-    for (uint32_t k = 0; k < chunk; k++)
-      tmp[k] = ((const uint8_t *)data)[written + k];
-    if (blk_write_sector(start + s, tmp) != 0) {
+    memcpy(tmp, (const uint8_t *)data + written, chunk);
+    if (blk_write_sector(start + full, tmp) != 0) {
       run_mark(start, sectors, 0); /* roll back the reservation */
       return -1;
     }
-    written += chunk;
   }
 
   name_copy(dir[slot].name, leaf);
@@ -1414,14 +1426,18 @@ int fs_prealloc(const char *name, uint32_t size)
   if (start == 0)
     return -1; /* disk full                */
 
-  uint8_t zero[SECTOR_SIZE];
-  for (int k = 0; k < SECTOR_SIZE; k++)
-    zero[k] = 0;
-  for (uint32_t s = 0; s < sectors; s++)
-    if (blk_write_sector(start + s, zero) != 0) {
+  uint8_t zero[SECTOR_SIZE * 8];
+  memset(zero, 0, sizeof zero);
+  for (uint32_t s = 0; s < sectors;) {
+    uint32_t n = sectors - s;
+    if (n > 8)
+      n = 8;
+    if (blk_write(start + s, zero, n) != 0) {
       run_mark(start, sectors, 0); /* roll back the reservation */
       return -1;
     }
+    s += n;
+  }
 
   name_copy(dir[slot].name, leaf);
   dir[slot].flags = 0;
@@ -1462,12 +1478,20 @@ int fs_write_at(const char *name, uint32_t offset, const void *data, uint32_t le
       if (chunk > len - written)
         chunk = len - written;
 
+      if (soff == 0 && chunk == SECTOR_SIZE) {
+        uint32_t n = (len - written) / SECTOR_SIZE;
+        if (n > 8)
+          n = 8;
+        if (blk_write(sec, p + written, n) != 0)
+          return -1;
+        written += n * SECTOR_SIZE;
+        continue;
+      }
       if (soff != 0 || chunk != SECTOR_SIZE) { /* partial: read-modify-write */
         if (blk_read_sector(sec, tmp) != 0)
           return -1;
       }
-      for (uint32_t k = 0; k < chunk; k++)
-        tmp[soff + k] = p[written + k];
+      memcpy(tmp + soff, p + written, chunk);
       if (blk_write_sector(sec, tmp) != 0)
         return -1;
       written += chunk;
@@ -1487,14 +1511,14 @@ int fs_write_at(const char *name, uint32_t offset, const void *data, uint32_t le
  * bounded only by the biggest free gap, and a stream that dies partway frees
  * its whole reservation -- nothing is leaked. */
 static int strm_active;
-static char strm_name[FS_NAME_LEN];   /* final path component (leaf)          */
-static int strm_parent;               /* slot of the directory to create it in */
-static uint32_t strm_start;           /* first data sector (reserved at begin) */
-static uint32_t strm_reserved;        /* sectors reserved for the stream       */
-static uint32_t strm_sectors;         /* full sectors flushed so far           */
-static uint32_t strm_size;            /* bytes accepted so far                 */
-static uint8_t strm_buf[SECTOR_SIZE]; /* the sector currently filling */
-static uint32_t strm_fill;            /* bytes pending in strm_buf             */
+static char strm_name[FS_NAME_LEN];       /* final path component (leaf)          */
+static int strm_parent;                   /* slot of the directory to create it in */
+static uint32_t strm_start;               /* first data sector (reserved at begin) */
+static uint32_t strm_reserved;            /* sectors reserved for the stream       */
+static uint32_t strm_sectors;             /* full sectors flushed so far           */
+static uint32_t strm_size;                /* bytes accepted so far                 */
+static uint8_t strm_buf[SECTOR_SIZE * 8]; /* the batch currently filling */
+static uint32_t strm_fill;                /* bytes pending in strm_buf             */
 
 int fs_stream_begin(const char *name)
 {
@@ -1523,16 +1547,22 @@ int fs_stream_write(const void *data, uint32_t size)
   if (!strm_active)
     return -1;
   const uint8_t *p = data;
-  for (uint32_t i = 0; i < size; i++) {
-    strm_buf[strm_fill++] = p[i];
-    strm_size++;
-    if (strm_fill == SECTOR_SIZE) {
-      if (strm_sectors >= strm_reserved || blk_write_sector(strm_start + strm_sectors, strm_buf) != 0) {
+  while (size) {
+    uint32_t n = sizeof strm_buf - strm_fill;
+    if (n > size)
+      n = size;
+    memcpy(strm_buf + strm_fill, p, n);
+    strm_fill += n;
+    strm_size += n;
+    p += n;
+    size -= n;
+    if (strm_fill == sizeof strm_buf) {
+      if (strm_reserved - strm_sectors < 8 || blk_write(strm_start + strm_sectors, strm_buf, 8) != 0) {
         run_mark(strm_start, strm_reserved, 0); /* release the gap */
         strm_active = 0;                        /* overran the reservation / I/O error */
         return -1;
       }
-      strm_sectors++;
+      strm_sectors += 8;
       strm_fill = 0;
     }
   }
@@ -1545,14 +1575,29 @@ int fs_stream_end(void)
     return -1;
   strm_active = 0;
 
-  if (strm_fill > 0) { /* flush the partial final sector   */
-    for (uint32_t k = strm_fill; k < SECTOR_SIZE; k++)
-      strm_buf[k] = 0;
-    if (strm_sectors >= strm_reserved || blk_write_sector(strm_start + strm_sectors, strm_buf) != 0) {
+  if (strm_fill > 0) { /* flush the partial final batch */
+    uint32_t full = strm_fill / SECTOR_SIZE;
+    if (full) {
+      if (strm_reserved - strm_sectors < full || blk_write(strm_start + strm_sectors, strm_buf, full) != 0) {
+        run_mark(strm_start, strm_reserved, 0); /* release the gap */
+        return -1;
+      }
+      strm_sectors += full;
+    }
+    uint32_t rem = strm_fill % SECTOR_SIZE;
+    if (rem) {
+      uint8_t *tail = strm_buf + full * SECTOR_SIZE;
+      memset(tail + rem, 0, SECTOR_SIZE - rem);
+      if (strm_sectors >= strm_reserved || blk_write_sector(strm_start + strm_sectors, tail) != 0) {
+        run_mark(strm_start, strm_reserved, 0); /* release the gap */
+        return -1;
+      }
+      strm_sectors++;
+    }
+    if (strm_sectors > strm_reserved) {
       run_mark(strm_start, strm_reserved, 0); /* release the gap */
       return -1;
     }
-    strm_sectors++;
     strm_fill = 0;
   }
 

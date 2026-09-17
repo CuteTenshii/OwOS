@@ -13,6 +13,7 @@ int ata_write_sector(uint32_t lba, const void *buf);
  * few READ SECTORS commands as the LBA28 256-sector limit allows. Same return
  * convention as ata_read_sector. */
 int ata_read(uint32_t lba, void *buf, uint32_t count);
+int ata_write(uint32_t lba, const void *buf, uint32_t count);
 
 /* Non-zero if a drive answers IDENTIFY on the primary master. */
 int ata_present(void);

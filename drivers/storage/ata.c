@@ -6,6 +6,7 @@
 
 #include "ata.h"
 #include "io.h"
+#include "spinlock.h"
 
 #define ATA_DATA 0x1F0
 #define ATA_SECCNT 0x1F2
@@ -25,6 +26,8 @@
 #define CMD_FLUSH 0xE7
 
 #define POLL_LIMIT 1000000u
+
+static spinlock_t io_lock;
 
 /* Reading the alternate status 4x gives the drive the ~400ns it needs after
  * a command before its status is meaningful. */
@@ -81,33 +84,58 @@ static int issue(uint32_t lba, uint8_t cmd, uint32_t count)
  * sector and amortizes the command setup across the whole run. */
 int ata_read(uint32_t lba, void *buf, uint32_t count)
 {
+  uintptr_t flags = spin_lock_irqsave(&io_lock);
   uint8_t *p = buf;
   while (count > 0) {
     uint32_t n = count > 256 ? 256 : count;
     if (issue(lba, CMD_READ, n))
-      return -1;
+      goto fail;
     for (uint32_t s = 0; s < n; s++) {
       if (wait_drq())
-        return -1;
+        goto fail;
       insw(ATA_DATA, p, 256);
       p += 512;
     }
     lba += n;
     count -= n;
   }
+  spin_unlock_irqrestore(&io_lock, flags);
   return 0;
+fail:
+  spin_unlock_irqrestore(&io_lock, flags);
+  return -1;
 }
 
 int ata_read_sector(uint32_t lba, void *buf) { return ata_read(lba, buf, 1); }
 
-int ata_write_sector(uint32_t lba, const void *buf)
+int ata_write(uint32_t lba, const void *buf, uint32_t count)
 {
-  if (issue(lba, CMD_WRITE, 1) || wait_drq())
-    return -1;
-  outsw(ATA_DATA, buf, 256);
-  outb(ATA_STATUS, CMD_FLUSH); /* commit to the platter               */
-  return wait_not_busy();
+  uintptr_t flags = spin_lock_irqsave(&io_lock);
+  const uint8_t *p = buf;
+  while (count > 0) {
+    uint32_t n = count > 256 ? 256 : count;
+    if (issue(lba, CMD_WRITE, n))
+      goto fail;
+    for (uint32_t s = 0; s < n; s++) {
+      if (wait_drq())
+        goto fail;
+      outsw(ATA_DATA, p, 256);
+      p += 512;
+    }
+    outb(ATA_STATUS, CMD_FLUSH);
+    if (wait_not_busy())
+      goto fail;
+    lba += n;
+    count -= n;
+  }
+  spin_unlock_irqrestore(&io_lock, flags);
+  return 0;
+fail:
+  spin_unlock_irqrestore(&io_lock, flags);
+  return -1;
 }
+
+int ata_write_sector(uint32_t lba, const void *buf) { return ata_write(lba, buf, 1); }
 
 #define CMD_IDENTIFY 0xEC
 

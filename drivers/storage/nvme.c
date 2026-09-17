@@ -23,6 +23,7 @@
 #include "console.h"
 #include "paging.h"
 #include "pci.h"
+#include "spinlock.h"
 
 #define NVME_CLASS 0x01
 #define NVME_SUBCLASS 0x08
@@ -76,6 +77,7 @@ struct queue {
 static struct queue admin_q, io_q;
 
 static volatile uint8_t *dbuf; /* 4 KiB page: DMA bounce + identify buffer  */
+static spinlock_t io_lock;
 
 /* ----------------------------------------------------------------- MMIO + I/O
  */
@@ -132,7 +134,7 @@ static int rw(uint32_t lba, uint32_t count, int write)
   if (count == 0 || count > 8)
     return -1;
   uint32_t cmd[16];
-  build(cmd, write ? IO_WRITE : IO_READ, 1, (uint32_t)dbuf);
+  build(cmd, write ? IO_WRITE : IO_READ, 1, (uint32_t)(uintptr_t)dbuf);
   cmd[10] = lba;       /* CDW10: starting LBA (low)       */
   cmd[11] = 0;         /* CDW11: starting LBA (high)      */
   cmd[12] = count - 1; /* CDW12: NLB = count - 1            */
@@ -145,11 +147,17 @@ int nvme_write_sector(uint32_t lba, const void *buf) { return nvme_write(lba, bu
 
 int nvme_read(uint32_t lba, void *buf, uint32_t count)
 {
-  if (!found || count == 0 || count > 8 || rw(lba, count, 0))
+  if (!found || count == 0 || count > 8)
     return -1;
+  uintptr_t flags = spin_lock_irqsave(&io_lock);
+  if (rw(lba, count, 0)) {
+    spin_unlock_irqrestore(&io_lock, flags);
+    return -1;
+  }
   uint8_t *d = buf;
   for (uint32_t i = 0; i < count * 512; i++)
     d[i] = dbuf[i];
+  spin_unlock_irqrestore(&io_lock, flags);
   return 0;
 }
 
@@ -157,10 +165,13 @@ int nvme_write(uint32_t lba, const void *buf, uint32_t count)
 {
   if (!found || count == 0 || count > 8)
     return -1;
+  uintptr_t flags = spin_lock_irqsave(&io_lock);
   const uint8_t *s = buf;
   for (uint32_t i = 0; i < count * 512; i++)
     dbuf[i] = s[i];
-  return rw(lba, count, 1);
+  int rc = rw(lba, count, 1);
+  spin_unlock_irqrestore(&io_lock, flags);
+  return rc;
 }
 
 int nvme_present(void) { return found; }
@@ -228,7 +239,7 @@ void nvme_init(void)
    * write can sit in the write-back cache and the controller never sees the
    * submission (the polled completion then times out). QEMU hides this. */
   paging_mark_uc(bar0, 0x2000);
-  bar = (volatile uint32_t *)bar0;
+  bar = (volatile uint32_t *)(uintptr_t)bar0;
 
   dstrd = reg_rd(REG_CAP + 4) & 0xF; /* CAP bits 35:32 = doorbell stride */
 
@@ -255,9 +266,9 @@ void nvme_init(void)
   admin_q.cq_db = cq_doorbell(0);
 
   reg_wr(REG_AQA, ((QDEPTH - 1) << 16) | (QDEPTH - 1));
-  reg_wr(REG_ASQ, (uint32_t)admin_q.sq);
+  reg_wr(REG_ASQ, (uint32_t)(uintptr_t)admin_q.sq);
   reg_wr(REG_ASQ + 4, 0);
-  reg_wr(REG_ACQ, (uint32_t)admin_q.cq);
+  reg_wr(REG_ACQ, (uint32_t)(uintptr_t)admin_q.cq);
   reg_wr(REG_ACQ + 4, 0);
 
   /* CC: IOSQES=6 (64-B SQ entries), IOCQES=4 (16-B CQ entries), MPS=0, EN=1. */
@@ -274,7 +285,7 @@ void nvme_init(void)
   io_q.cq_db = cq_doorbell(1);
 
   uint32_t c[16];
-  build(c, ADM_CREATE_CQ, 0, (uint32_t)io_q.cq);
+  build(c, ADM_CREATE_CQ, 0, (uint32_t)(uintptr_t)io_q.cq);
   c[10] = ((QDEPTH - 1) << 16) | 1; /* CDW10: queue size-1 | qid=1      */
   c[11] = 1;                        /* CDW11: PC=1, interrupts off      */
   if (submit(&admin_q, c) != 0) {
@@ -282,7 +293,7 @@ void nvme_init(void)
     return;
   }
 
-  build(c, ADM_CREATE_SQ, 0, (uint32_t)io_q.sq);
+  build(c, ADM_CREATE_SQ, 0, (uint32_t)(uintptr_t)io_q.sq);
   c[10] = ((QDEPTH - 1) << 16) | 1; /* CDW10: queue size-1 | qid=1      */
   c[11] = (1u << 16) | 1;           /* CDW11: CQID=1, PC=1              */
   if (submit(&admin_q, c) != 0) {
@@ -291,7 +302,7 @@ void nvme_init(void)
   }
 
   /* IDENTIFY controller (CNS=1): model number is ASCII at bytes 24..63. */
-  build(c, ADM_IDENTIFY, 0, (uint32_t)dbuf);
+  build(c, ADM_IDENTIFY, 0, (uint32_t)(uintptr_t)dbuf);
   c[10] = 1; /* CNS = 1: identify controller     */
   model[0] = '\0';
   if (submit(&admin_q, c) == 0) {
@@ -304,7 +315,7 @@ void nvme_init(void)
   }
 
   /* IDENTIFY namespace 1 (CNS=0): NSZE (bytes 0-7) is the block count. */
-  build(c, ADM_IDENTIFY, 1, (uint32_t)dbuf);
+  build(c, ADM_IDENTIFY, 1, (uint32_t)(uintptr_t)dbuf);
   c[10] = 0; /* CNS = 0: identify namespace      */
   if (submit(&admin_q, c) == 0) {
     const volatile uint32_t *idns = (const volatile uint32_t *)dbuf;

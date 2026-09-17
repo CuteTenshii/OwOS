@@ -24,6 +24,7 @@
 #include "console.h"
 #include "paging.h"
 #include "pci.h"
+#include "spinlock.h"
 
 /* ------------------------------------------------------- HBA / port registers
  */
@@ -84,6 +85,7 @@ static volatile uint32_t *clb; /* command list (32 headers x 32 B)           */
 static volatile uint8_t *fis;  /* received-FIS area                          */
 static volatile uint8_t *ctab; /* one command table (CFIS + PRDT)            */
 static volatile uint8_t *dbuf; /* one-page DMA bounce buffer                 */
+static spinlock_t io_lock;
 
 /* ----------------------------------------------------------------- MMIO + I/O
  */
@@ -139,8 +141,8 @@ static int issue(uint32_t lba, uint32_t count, uint8_t ata_cmd, int write)
 
   /* Command header 0: 5-dword command FIS, one PRDT entry, W bit for writes. */
   clb[0] = 5 | (write ? (1u << 6) : 0) | (1u << 16);
-  clb[1] = 0;              /* PRDBC (filled by HBA)          */
-  clb[2] = (uint32_t)ctab; /* command-table base (phys)      */
+  clb[1] = 0;                         /* PRDBC (filled by HBA)          */
+  clb[2] = (uint32_t)(uintptr_t)ctab; /* command-table base (phys)      */
   clb[3] = 0;
 
   /* Command table: zero the CFIS + PRDT region we touch. */
@@ -161,7 +163,7 @@ static int issue(uint32_t lba, uint32_t count, uint8_t ata_cmd, int write)
 
   /* PRDT entry 0 (at offset 0x80): point at the bounce buffer, 512 bytes. */
   volatile uint32_t *prdt = (volatile uint32_t *)(ctab + 0x80);
-  prdt[0] = (uint32_t)dbuf; /* data base (phys)               */
+  prdt[0] = (uint32_t)(uintptr_t)dbuf; /* data base (phys)               */
   prdt[1] = 0;
   prdt[2] = 0;
   prdt[3] = (count * 512 - 1) & 0x3FFFFF; /* byte count - 1, no IRQ */
@@ -187,11 +189,17 @@ int ahci_write_sector(uint32_t lba, const void *buf) { return ahci_write(lba, bu
 
 int ahci_read(uint32_t lba, void *buf, uint32_t count)
 {
-  if (!found || count == 0 || count > 8 || issue(lba, count, ATA_READ_DMA_EX, 0))
+  if (!found || count == 0 || count > 8)
     return -1;
+  uintptr_t flags = spin_lock_irqsave(&io_lock);
+  if (issue(lba, count, ATA_READ_DMA_EX, 0)) {
+    spin_unlock_irqrestore(&io_lock, flags);
+    return -1;
+  }
   uint8_t *d = buf;
   for (uint32_t i = 0; i < count * 512; i++)
     d[i] = dbuf[i];
+  spin_unlock_irqrestore(&io_lock, flags);
   return 0;
 }
 
@@ -199,12 +207,13 @@ int ahci_write(uint32_t lba, const void *buf, uint32_t count)
 {
   if (!found || count == 0 || count > 8)
     return -1;
-  if (!found)
-    return -1;
+  uintptr_t flags = spin_lock_irqsave(&io_lock);
   const uint8_t *s = buf;
   for (uint32_t i = 0; i < count * 512; i++)
     dbuf[i] = s[i];
-  return issue(lba, count, ATA_WRITE_DMA_EX, 1);
+  int rc = issue(lba, count, ATA_WRITE_DMA_EX, 1);
+  spin_unlock_irqrestore(&io_lock, flags);
+  return rc;
 }
 
 int ahci_present(void) { return found; }
@@ -287,7 +296,7 @@ void ahci_init(void)
    * can linger in the write-back cache and the HBA never sees it. QEMU hides
    * this. */
   paging_mark_uc(bar5, 0x2000);
-  abar = (volatile uint32_t *)bar5;
+  abar = (volatile uint32_t *)(uintptr_t)bar5;
 
   hba_wr(HBA_GHC, hba_rd(HBA_GHC) | GHC_AE); /* take the HBA out of legacy mode */
 
@@ -326,9 +335,9 @@ void ahci_init(void)
   }
 
   port_stop();
-  port_wr(PX_CLB, (uint32_t)clb);
+  port_wr(PX_CLB, (uint32_t)(uintptr_t)clb);
   port_wr(PX_CLBU, 0);
-  port_wr(PX_FB, (uint32_t)fis);
+  port_wr(PX_FB, (uint32_t)(uintptr_t)fis);
   port_wr(PX_FBU, 0);
   port_wr(PX_SERR, 0xFFFFFFFFu);
   port_wr(PX_IS, 0xFFFFFFFFu);
