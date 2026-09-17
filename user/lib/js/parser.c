@@ -12,6 +12,7 @@
 #include "parser.h"
 #include "lexer.h"
 #include "owos.h"
+#include "value.h"
 
 typedef struct {
   jlexer lx;
@@ -157,6 +158,7 @@ static js_node *ident_from(js_parser *p, const char *s, int len, int line, int c
   js_node *n = js_node_new(p->arena, JS_IDENT, line, col);
   n->u.str.s = s;
   n->u.str.len = len;
+  n->u.str.hash = js_str_hash(s, len);
   return n;
 }
 

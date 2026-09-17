@@ -361,7 +361,7 @@ static pentry *resolve_ident(js_ctx *ctx, js_node *node, js_env **owner)
     }
   }
   for (e = ctx->cur_env, depth = 0; e; e = e->parent, depth++) {
-    int idx = pmap_index(&e->vars, name);
+    int idx = pmap_index_hash(&e->vars, name, node->u.str.hash);
     if (idx >= 0) {
       node->u.str.cdepth = depth;
       node->u.str.cslot = idx + 1;

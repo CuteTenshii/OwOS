@@ -72,6 +72,7 @@ enum { P_ENUMERABLE = 1, P_WRITABLE = 2, P_CONFIGURABLE = 4, P_ACCESSOR = 8 };
 
 typedef struct {
   char *key;         /* malloc'd NUL-terminated property name         */
+  unsigned hash;     /* cached hash of key                              */
   js_value value;    /* data value (when !P_ACCESSOR)                 */
   js_object *getter; /* accessor get (or NULL)                        */
   js_object *setter; /* accessor set (or NULL)                        */
@@ -214,8 +215,9 @@ void js_def(js_object *o, const char *key, js_value val, unsigned char flags);
 void js_def_accessor(js_object *o, const char *key, js_object *get, js_object *set, unsigned char flags);
 int js_has_own(js_object *o, const char *key);
 int js_delete(js_object *o, const char *key);
-pentry *pmap_find_pub(js_object *o, const char *key); /* own property entry, or NULL */
-int pmap_index(pmap *m, const char *key);             /* entry index, or -1 (ident cache) */
+pentry *pmap_find_pub(js_object *o, const char *key);         /* own property entry, or NULL */
+int pmap_index(pmap *m, const char *key);                     /* entry index, or -1 (ident cache) */
+int pmap_index_hash(pmap *m, const char *key, unsigned hash); /* cached-key lookup */
 
 /* indexed access (arrays + string chars + generic) */
 js_value js_get_index(js_ctx *ctx, js_value obj, unsigned i);

@@ -142,33 +142,35 @@ static void pmap_reindex(pmap *m)
   m->idxcap = cap;
   mask = (unsigned)cap - 1;
   for (i = 0; i < m->n; i++) {
-    unsigned b = pmap_keyhash(m->e[i].key) & mask;
+    unsigned b = m->e[i].hash & mask;
     while (idx[b])
       b = (b + 1) & mask;
     idx[b] = i + 1;
   }
 }
 
-static int pmap_find_idx(pmap *m, const char *key)
+static int pmap_find_idx_hash(pmap *m, const char *key, unsigned hash)
 {
   int i;
   if (m->idx) {
     unsigned mask = (unsigned)m->idxcap - 1;
-    unsigned b = pmap_keyhash(key) & mask;
+    unsigned b = hash & mask;
     for (;;) {
       int slot = m->idx[b];
       if (!slot)
         return -1;
-      if (strcmp(m->e[slot - 1].key, key) == 0)
+      if (m->e[slot - 1].hash == hash && strcmp(m->e[slot - 1].key, key) == 0)
         return slot - 1;
       b = (b + 1) & mask;
     }
   }
   for (i = 0; i < m->n; i++)
-    if (strcmp(m->e[i].key, key) == 0)
+    if (m->e[i].hash == hash && strcmp(m->e[i].key, key) == 0)
       return i;
   return -1;
 }
+
+static int pmap_find_idx(pmap *m, const char *key) { return pmap_find_idx_hash(m, key, pmap_keyhash(key)); }
 
 static pentry *pmap_find(pmap *m, const char *key)
 {
@@ -179,6 +181,7 @@ static pentry *pmap_find(pmap *m, const char *key)
 /* Public: entry index of `key` (or -1). Backs the interpreter's identifier
  * inline cache, which records the slot to skip future scope-chain scans. */
 int pmap_index(pmap *m, const char *key) { return pmap_find_idx(m, key); }
+int pmap_index_hash(pmap *m, const char *key, unsigned hash) { return pmap_find_idx_hash(m, key, hash); }
 
 static pentry *pmap_insert(pmap *m, const char *key)
 {
@@ -198,6 +201,7 @@ static pentry *pmap_insert(pmap *m, const char *key)
     return NULL;
   }
   pe->value = js_undef();
+  pe->hash = pmap_keyhash(pe->key);
   pe->getter = pe->setter = NULL;
   pe->flags = 0;
   /* Keep the hash index current: build it once the map crosses the threshold,
@@ -208,7 +212,7 @@ static pentry *pmap_insert(pmap *m, const char *key)
       pmap_reindex(m);
     else {
       unsigned mask = (unsigned)m->idxcap - 1;
-      unsigned b = pmap_keyhash(pe->key) & mask;
+      unsigned b = pe->hash & mask;
       while (m->idx[b])
         b = (b + 1) & mask;
       m->idx[b] = m->n; /* (n-1) + 1 */

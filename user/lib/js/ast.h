@@ -168,6 +168,7 @@ struct js_node {
        * the union for free (the `func` variant is larger). */
       int cdepth, cslot;
       unsigned cgen;
+      unsigned hash;
     } str; /* STR, IDENT */
     struct {
       const char *pattern, *flags;
