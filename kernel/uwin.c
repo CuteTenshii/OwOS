@@ -615,42 +615,6 @@ static void uwin_clear_region(uint32_t phys, int stride, int x0, int y0, int x1,
   }
 }
 
-/* Re-lay-out the [0,copy_w) x [0,copy_h) sub-image of a single buffer from row
- * stride `ow` to `nw`, in place. A grow (nw>ow) shifts each row to a later
- * offset, so iterate rows bottom-up and pixels right-to-left; a shrink shifts
- * them earlier, so iterate top-down and left-to-right — either order guarantees
- * a destination never overwrites a source still to be read. Slot 0 maps the
- * source page, slot 1 the destination page (both in the same phys buffer), IRQs
- * off per scanline — exactly the transient-mapping discipline of the realloc
- * copy path below. */
-static void uwin_restride(uint32_t phys, int ow, int nw, int copy_w, int copy_h)
-{
-  int grow = nw > ow;
-  int ystart = grow ? copy_h - 1 : 0, yend = grow ? -1 : copy_h, ystep = grow ? -1 : 1;
-  int xstart = grow ? copy_w - 1 : 0, xend = grow ? -1 : copy_w, xstep = grow ? -1 : 1;
-  for (int y = ystart; y != yend; y += ystep) {
-    uintptr_t fl = irq_save();
-    uint32_t spg = ~0u, dpg = ~0u;
-    uint32_t *sv = 0, *dv = 0;
-    for (int x = xstart; x != xend; x += xstep) {
-      uint32_t si = (uint32_t)y * (uint32_t)ow + (uint32_t)x;
-      uint32_t di = (uint32_t)y * (uint32_t)nw + (uint32_t)x;
-      if ((si >> 10) != spg) {
-        spg = si >> 10;
-        sv = paging_scratch_map(0, phys + spg * 4096u);
-      }
-      if ((di >> 10) != dpg) {
-        dpg = di >> 10;
-        dv = paging_scratch_map(1, phys + dpg * 4096u);
-      }
-      dv[di & 1023] = sv[si & 1023];
-    }
-    paging_scratch_unmap(1);
-    paging_scratch_unmap(0);
-    irq_restore(fl);
-  }
-}
-
 /* Grow/shrink the client buffer to fit a new client size (frame minus chrome).
  * The buffer is a private, contiguous run of physical RAM, identity-mapped for
  * the compositor and mapped into the owner at WIN_FB_VADDR. Never shrinks the
@@ -682,23 +646,11 @@ static void uwin_resize_client(struct uwin *u, int id, int cw, int ch)
     return;
 
   if ((uint32_t)cw * (uint32_t)ch * 4u <= u->buf_bytes) {
-    int ow = u->w, oh = u->h;
-    int copy_w = ow < cw ? ow : cw;
-    int copy_h = oh < ch ? oh : ch;
-    /* A width change changes the row stride, so the retained pixels must be
-     * re-laid-out in place before the buffer is read at the new stride — else
-     * every row past the first is misaligned (the realloc path copies rows for
-     * the same reason). Do it while u->w still holds the old stride. */
-    if (cw != ow)
-      uwin_restride(u->buf_phys, ow, cw, copy_w, copy_h);
     u->w = cw;
     u->h = ch;
-    /* Re-striding leaves the L-shape beyond the old content undefined; clear
-     * it. */
-    if (cw > ow)
-      uwin_clear_region(u->buf_phys, cw, ow, 0, cw, copy_h);
-    if (ch > oh)
-      uwin_clear_region(u->buf_phys, cw, 0, oh, cw, ch);
+    /* The resize event makes the owner repaint. Clear the new logical buffer
+     * instead of moving the old image while holding the compositor syscall. */
+    uwin_clear_region(u->buf_phys, cw, 0, 0, cw, ch);
     u->present_seq++;
     evq_push(u, WEV_RESIZE, cw, ch);
     return;
@@ -727,36 +679,9 @@ static void uwin_resize_client(struct uwin *u, int id, int cw, int ch)
     paging_scratch_unmap(0);
     irq_restore(fl);
   }
-  /* Carry the old pixels into the new buffer (top-left aligned) so the window
-   * keeps showing its content until the app repaints. One scanline per critical
-   * section bounds the IRQ-off window; slot 0 = source, 1 = dest, re-mapped as
-   * a row crosses a 4 KiB page (1024 px) in either buffer. */
-  {
-    int copy_w = u->w < cw ? u->w : cw;
-    int copy_h = u->h < ch ? u->h : ch;
-    uint32_t sphys = u->buf_phys;
-    for (int y = 0; y < copy_h; y++) {
-      uintptr_t fl = irq_save();
-      uint32_t spg = ~0u, dpg = ~0u;
-      uint32_t *sv = 0, *dv = 0;
-      for (int x = 0; x < copy_w; x++) {
-        uint32_t si = (uint32_t)y * (uint32_t)u->w + (uint32_t)x;
-        uint32_t di = (uint32_t)y * (uint32_t)cw + (uint32_t)x;
-        if ((si >> 10) != spg) {
-          spg = si >> 10;
-          sv = paging_scratch_map(0, sphys + spg * 4096u);
-        }
-        if ((di >> 10) != dpg) {
-          dpg = di >> 10;
-          dv = paging_scratch_map(1, nphys + dpg * 4096u);
-        }
-        dv[di & 1023] = sv[si & 1023];
-      }
-      paging_scratch_unmap(1);
-      paging_scratch_unmap(0);
-      irq_restore(fl);
-    }
-  }
+  /* The resize event makes the owner repaint. Do not copy the old image here:
+   * that turns maximizing into a synchronous pixel migration in the compositor
+   * syscall. */
   /* Remap the owner's window slot to the new buffer IN PLACE (overwrite the
    * PTEs) rather than unmap-then-map: an unmapped gap here would fault a
    * concurrent paint (the owner draws on its own thread). */
