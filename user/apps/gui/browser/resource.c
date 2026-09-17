@@ -1681,7 +1681,7 @@ static void subres_job(void *vctx, int i)
     return;
   }
 
-  char (*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
+  char(*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
   if (!paths) { /* OOM: fall back to h1.1 each */
     for (int g = 0; g < ng; g++)
       c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]);
@@ -1690,7 +1690,7 @@ static void subres_job(void *vctx, int i)
   /* Per-stream response-header buffers, so a fetched 200 can be cached (the h2
    * batch otherwise surfaces no headers). NULL on OOM = fetch without caching.
    */
-  char (*hdrs)[RESP_HDR_MAX] = malloc((unsigned)ng * RESP_HDR_MAX);
+  char(*hdrs)[RESP_HDR_MAX] = malloc((unsigned)ng * RESP_HDR_MAX);
   long now = (long)rtc_epoch();
   struct h2_fetch reqs[H2_FETCH_MAX];
   for (int g = 0; g < ng; g++) {
@@ -2021,11 +2021,11 @@ static void h2_prefetch(const char *page_url)
   if (!parse_url(page_url, &pu) || !pu.tls)
     return;
 
-  char (*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
+  char(*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
   if (!paths)
     return;
   /* Per-stream header buffers so a fetched 200 can be cached (h2img_commit). */
-  char (*hdrs)[RESP_HDR_MAX] = malloc((unsigned)H2_FETCH_MAX * RESP_HDR_MAX);
+  char(*hdrs)[RESP_HDR_MAX] = malloc((unsigned)H2_FETCH_MAX * RESP_HDR_MAX);
   long now = (long)rtc_epoch();
   struct h2_fetch reqs[H2_FETCH_MAX];
   int idxs[H2_FETCH_MAX], nb = 0;

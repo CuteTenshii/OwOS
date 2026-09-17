@@ -610,7 +610,7 @@ static int res_decode(residue *r, codebook *books, int nbooks, bitr *b, int type
   int vch = (type == 2) ? 1 : ch;
 
   /* classifications[channel][partition] */
-  int (*cls)[512] = NULL;
+  int(*cls)[512] = NULL;
   static int clsbuf[VORBIS_MAX_CHANNELS][512];
   cls = clsbuf;
   if (ptr > 512)

@@ -202,7 +202,7 @@ static uint32_t clus_count;                    /* whole clusters on this disk   
 
 static int clus_test(uint32_t c) { return (clus_used[c >> 3] >> (c & 7)) & 1; }
 static void clus_set(uint32_t c) { clus_used[c >> 3] |= (uint8_t)(1u << (c & 7)); }
-static void clus_clr(uint32_t c) { clus_used[c >> 3] &= (uint8_t)~(1u << (c & 7)); }
+static void clus_clr(uint32_t c) { clus_used[c >> 3] &= (uint8_t) ~(1u << (c & 7)); }
 
 /* Sectors a file of `size` bytes occupies (always >= 1, matching fs_create). */
 static uint32_t size_to_sectors(uint32_t size)
@@ -1702,11 +1702,11 @@ int fs_selftest(void)
   for (uint32_t i = 0; i < SZ && rb_ok; i++) {
     uint8_t want = 0;
     if (i < 4)
-      want = (uint8_t)"ABCD"[i];
+      want = (uint8_t) "ABCD"[i];
     else if (i >= 510 && i < 514)
-      want = (uint8_t)"WXYZ"[i - 510];
+      want = (uint8_t) "WXYZ"[i - 510];
     else if (i >= 996)
-      want = (uint8_t)"1234"[i - 996];
+      want = (uint8_t) "1234"[i - 996];
     if (buf[i] != want)
       rb_ok = 0;
   }

@@ -528,45 +528,44 @@ static void scan_number(jlexer *lx, jtoken *out)
       goto decimal;
     }
   } else {
-  decimal:
-    {
-      char tmp[160];
-      int ti = 0;
+  decimal: {
+    char tmp[160];
+    int ti = 0;
+    while (is_digit(*lx->p) || *lx->p == '_') {
+      if (*lx->p != '_' && ti < 158)
+        tmp[ti++] = *lx->p;
+      lx->p++;
+    }
+    if (*lx->p == '.') {
+      is_int = 0;
+      if (ti < 158)
+        tmp[ti++] = '.';
+      lx->p++;
       while (is_digit(*lx->p) || *lx->p == '_') {
         if (*lx->p != '_' && ti < 158)
           tmp[ti++] = *lx->p;
         lx->p++;
       }
-      if (*lx->p == '.') {
-        is_int = 0;
-        if (ti < 158)
-          tmp[ti++] = '.';
-        lx->p++;
-        while (is_digit(*lx->p) || *lx->p == '_') {
-          if (*lx->p != '_' && ti < 158)
-            tmp[ti++] = *lx->p;
-          lx->p++;
-        }
-      }
-      if (*lx->p == 'e' || *lx->p == 'E') {
-        is_int = 0;
-        if (ti < 158)
-          tmp[ti++] = 'e';
-        lx->p++;
-        if (*lx->p == '+' || *lx->p == '-') {
-          if (ti < 158)
-            tmp[ti++] = *lx->p;
-          lx->p++;
-        }
-        while (is_digit(*lx->p) || *lx->p == '_') {
-          if (*lx->p != '_' && ti < 158)
-            tmp[ti++] = *lx->p;
-          lx->p++;
-        }
-      }
-      tmp[ti] = 0;
-      val = strtod(tmp, NULL);
     }
+    if (*lx->p == 'e' || *lx->p == 'E') {
+      is_int = 0;
+      if (ti < 158)
+        tmp[ti++] = 'e';
+      lx->p++;
+      if (*lx->p == '+' || *lx->p == '-') {
+        if (ti < 158)
+          tmp[ti++] = *lx->p;
+        lx->p++;
+      }
+      while (is_digit(*lx->p) || *lx->p == '_') {
+        if (*lx->p != '_' && ti < 158)
+          tmp[ti++] = *lx->p;
+        lx->p++;
+      }
+    }
+    tmp[ti] = 0;
+    val = strtod(tmp, NULL);
+  }
   }
 
   out->num = val;

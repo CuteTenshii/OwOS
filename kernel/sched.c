@@ -1103,7 +1103,7 @@ static int sigframe_setup(task_t *t, struct registers *r, int sig)
     return -1;
 
   struct sigframe *f = (struct sigframe *)(uintptr_t)base;
-  uint32_t tramp = base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
+  uint32_t tramp = base + (uint32_t) __builtin_offsetof(struct sigframe, tramp);
   f->pretcode = tramp;
   f->sig = (uint32_t)sig;
   f->saved_blocked = t->sig_blocked;

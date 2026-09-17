@@ -206,7 +206,7 @@ static int from_efi(void)
     const uint8_t *e = ct + (uint32_t)i * stride;
     if (!bytes_eq(e, SMBIOS_GUID, 16) && !bytes_eq(e, SMBIOS3_GUID, 16))
       continue;
-    uint64_t vt = g_efi_is64 ? *(const uint64_t *)(e + 16) : (uint64_t)*(const uint32_t *)(e + 16);
+    uint64_t vt = g_efi_is64 ? *(const uint64_t *)(e + 16) : (uint64_t) * (const uint32_t *)(e + 16);
     if (vt >> 32) {
       set_err("SMBIOS EP >4GB");
       continue;

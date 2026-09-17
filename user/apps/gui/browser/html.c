@@ -3008,7 +3008,7 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
 
   int nfaces = css_fontface_count(g_sheet);
   char **urls = nfaces ? malloc((unsigned)nfaces * sizeof *urls) : 0;
-  char (*fams)[CSS_FAM_MAX] = nfaces ? malloc((unsigned)nfaces * sizeof *fams) : 0;
+  char(*fams)[CSS_FAM_MAX] = nfaces ? malloc((unsigned)nfaces * sizeof *fams) : 0;
   int nu = 0;
   if (nfaces && (!urls || !fams)) {
     free(urls);
