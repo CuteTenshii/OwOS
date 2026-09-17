@@ -222,6 +222,10 @@ static int recv_record(struct tls_conn *c, uint8_t *type_out, uint8_t *out, uint
       return -1;
     uint8_t *h = c->rxraw + c->rxpos;
     uint8_t type = h[0];
+    if (h[1] != 0x03 || h[2] < 0x01 || h[2] > 0x03)
+      return -1;
+    if (type != REC_CCS && type != REC_ALERT && type != REC_HS && type != REC_APP)
+      return -1;
     uint32_t len = ((uint32_t)h[3] << 8) | h[4];
     if (len > TLS_RECMAX || raw_fill(c, 5 + len) < 0)
       return -1;
@@ -242,6 +246,8 @@ static int recv_record(struct tls_conn *c, uint8_t *type_out, uint8_t *out, uint
     }
 
     if (c->is13) {
+      if (type != REC_APP)
+        return -1;
       if (len < 16)
         return -1;
       uint8_t nonce[12];
@@ -257,7 +263,10 @@ static int recv_record(struct tls_conn *c, uint8_t *type_out, uint8_t *out, uint
         inner--;
       if (inner == 0)
         return -1;
-      *type_out = out[inner - 1]; /* real content type */
+      uint8_t inner_type = out[inner - 1];
+      if (inner_type != REC_ALERT && inner_type != REC_HS && inner_type != REC_APP)
+        return -1;
+      *type_out = inner_type; /* real content type */
       *outlen = inner - 1;
       return 0;
     }
@@ -289,6 +298,8 @@ static int recv_record(struct tls_conn *c, uint8_t *type_out, uint8_t *out, uint
 static int send_record(struct tls_conn *c, uint8_t type, const uint8_t *data, uint32_t len)
 {
   uint8_t hdr[5];
+  if (len > 16384 || (!data && len))
+    return -1;
   if (!c->send_encrypted) {
     hdr[0] = type;
     hdr[1] = 0x03;
@@ -309,6 +320,8 @@ static int send_record(struct tls_conn *c, uint8_t type, const uint8_t *data, ui
     c->sbuf[len] = type;
     uint32_t inner = len + 1;
     uint32_t rlen = inner + 16;
+    if (rlen > TLS_RECMAX)
+      return -1;
     uint8_t aad[5] = {REC_APP, 0x03, 0x03, (uint8_t)(rlen >> 8), (uint8_t)rlen};
     uint8_t tag[16];
     aes128_gcm_seal(c->client_key, nonce, aad, 5, c->sbuf, inner, c->sbuf, tag);

@@ -57,6 +57,24 @@ static uint16_t inet_csum(const uint8_t *p, uint32_t len)
   return (uint16_t)~sum;
 }
 
+static uint16_t udp_checksum(const uint8_t src[4], const uint8_t dst[4], const uint8_t *seg, uint32_t len)
+{
+  uint32_t sum = 0;
+  sum += ((uint32_t)src[0] << 8) | src[1];
+  sum += ((uint32_t)src[2] << 8) | src[3];
+  sum += ((uint32_t)dst[0] << 8) | dst[1];
+  sum += ((uint32_t)dst[2] << 8) | dst[3];
+  sum += 17; /* UDP */
+  sum += len;
+  for (uint32_t i = 0; i + 1 < len; i += 2)
+    sum += ((uint32_t)seg[i] << 8) | seg[i + 1];
+  if (len & 1)
+    sum += (uint32_t)seg[len - 1] << 8;
+  while (sum >> 16)
+    sum = (sum & 0xFFFF) + (sum >> 16);
+  return (uint16_t)~sum;
+}
+
 /* --------------------------------------------------------------- on-the-wire
  */
 
@@ -464,9 +482,11 @@ void net_udp_send_ttl(const uint8_t dst[4], uint16_t dport, uint16_t sport, cons
   u->sport = htons(sport);
   u->dport = htons(dport);
   u->len = htons((uint16_t)(8 + len));
-  u->csum = 0; /* checksum optional over IPv4      */
+  u->csum = 0;
   for (uint32_t i = 0; i < len; i++)
     pkt[8 + i] = data[i];
+  uint16_t csum = udp_checksum(my_ip, dst, pkt, 8 + len);
+  u->csum = htons(csum ? csum : 0xFFFF);
   ip_send_ttl(dst, IP_UDP, pkt, 8 + len, ttl);
 }
 
@@ -480,9 +500,11 @@ static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
   if (len < 8)
     return;
   const struct udp_hdr *u = (const struct udp_hdr *)p;
-  uint32_t ulen = ntohs(u->len); /* trust the smaller length     */
+  uint32_t ulen = ntohs(u->len);
   if (ulen < 8 || ulen > len)
-    ulen = len;
+    return;
+  if (u->csum && udp_checksum(src, my_ip, p, ulen) != 0)
+    return;
   /* A client/server socket (dig/resolve, or /bin/mdnsd bound to 5353 via
    * net_bind) gets the datagram; mDNS queries and responses both land here. */
   if (usock_udp_deliver(src, ntohs(u->sport), ntohs(u->dport), p + 8, ulen - 8))
@@ -538,9 +560,7 @@ static void ip_recv(const uint8_t *p, uint32_t len)
     return;
   if (!ip_dst_ok(ip->dst)) /* not addressed to us */
     return;
-  if (total > len)
-    total = len;
-  if (total < ihl)
+  if (total < ihl || total > len)
     return;
 
   const uint8_t *payload = p + ihl;
@@ -659,7 +679,8 @@ static int usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t d
 {
   for (int i = 0; i < NET_SOCK_MAX; i++) {
     struct usock *s = &usocks[i];
-    if (s->used && s->proto == SK_UDP && s->lport == dport) {
+    int peer_match = s->rport == 0 || (s->rport == sport && memcmp(s->peer, src_ip, 4) == 0);
+    if (s->used && s->proto == SK_UDP && s->lport == dport && peer_match) {
       uint32_t next = (s->dg_tail + 1) % SOCK_DGRING;
       if (next == s->dg_head)
         return 1; /* ring full: drop, but the port is ours */
@@ -796,6 +817,8 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
   if (proto == SK_RAWETH) /* raw L2 socket: no host/peer */
     return net_raw_open();
   if (!nic_present())
+    return -1;
+  if (port == 0)
     return -1;
   int h = -1;
   for (int i = 0; i < NET_SOCK_MAX; i++)
@@ -980,7 +1003,7 @@ static int usock_alloc(void)
  */
 int net_sock_listen(int port)
 {
-  if (!nic_present())
+  if (!nic_present() || port < 1 || port > 65535)
     return -1;
   int h = usock_alloc();
   if (h < 0)
@@ -1023,7 +1046,7 @@ int net_sock_accept(int h)
  * ring. Returns a handle or -1 (no NIC/slot). */
 int net_sock_bind(int port)
 {
-  if (!nic_present())
+  if (!nic_present() || port < 1 || port > 65535)
     return -1;
   int h = usock_alloc();
   if (h < 0)
@@ -1047,6 +1070,8 @@ int net_sock_recvfrom(int h, void *buf, uint32_t max, uint8_t out_ip[4], uint16_
 int net_sock_sendto(int h, const uint8_t ip[4], int port, const void *buf, uint32_t len)
 {
   if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || usocks[h].proto != SK_UDP)
+    return -1;
+  if (!ip || (!buf && len) || port < 1 || port > 65535)
     return -1;
   if (len > 1472) /* one IPv4/UDP datagram won't hold more */
     return -1;

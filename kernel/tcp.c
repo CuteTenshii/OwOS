@@ -292,6 +292,8 @@ void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len)
     return;
 
   const struct tcp_hdr *t = (const struct tcp_hdr *)seg;
+  if ((t->off & 0x0F) != 0)
+    return;
   struct tcp_conn *c = tcp_demux(src, ntohs(t->dport), ntohs(t->sport));
   if (!c) {
     /* No live TCB — a bare SYN to a listening port opens a server
@@ -447,7 +449,7 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport)
 
 int tcp_write(tcp_conn_t *c, const void *data, uint32_t len)
 {
-  if (!c || (c->state != ST_ESTAB && c->state != ST_CLOSE_WAIT))
+  if (!c || (!data && len) || (c->state != ST_ESTAB && c->state != ST_CLOSE_WAIT))
     return -1;
   const uint8_t *p = data;
   uint32_t sent = 0;
