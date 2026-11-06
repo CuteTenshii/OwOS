@@ -20,9 +20,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-      - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format-18 clang-tidy-18
+      - name: Install clang tools
+        run: sudo apt-get update && sudo apt-get install -y clang-format clang-tidy
       - name: Check C formatting
-        run: make CLANG_FORMAT=clang-format-18 format-check
+        run: make format-check
       - name: Run clang-tidy
-        run: make CLANG_TIDY=clang-tidy-18 tidy
+        run: make tidy
