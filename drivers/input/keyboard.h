@@ -8,6 +8,8 @@
 #ifndef OWOS_KEYBOARD_H
 #define OWOS_KEYBOARD_H
 
+#include <stdint.h>
+
 /* Editing keys are delivered through keyboard_poll() as single bytes, using
  * control-code values that none of the keymaps ever emit (so they can't be
  * confused with real typed characters). The shell's line editor interprets
@@ -86,10 +88,16 @@
 
 void keyboard_init(void);
 
+/* Act on a KEY_VOL_*, KEY_MUTE or KEY_BRIGHT_* code and queue any KEY_MEDIA_*..KEY_MIC_MUTE code for the compositor.
+ * Shared by the PS/2 IRQ and USB HID keyboards. */
+void keyboard_special_key(uint8_t key);
+
 /* Non-blocking: stores the next buffered character in *out and returns 1,
  * or returns 0 if no input is waiting. When `mods` is non-NULL it receives the
  * KMOD_* modifier set held when that key was pressed. */
 int keyboard_poll(char *out, unsigned char *mods);
+/* Like keyboard_poll but skips special keys (media/launcher), for text consumers. */
+int keyboard_poll_text(char *out, unsigned char *mods);
 
 /* Switch the active keyboard layout by name ("us" or "fr"). Returns 0 on
  * success, -1 if the name matches no known layout. */

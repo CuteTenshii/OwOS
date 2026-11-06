@@ -5,6 +5,7 @@
 #include "hda.h"
 #include "io.h"
 #include "irq.h"
+#include "keymap.h"
 #include "sb16.h"
 #include "serial.h"
 #include <stdbool.h>
@@ -33,13 +34,6 @@
 #define SC_E_END 0x4F
 #define SC_E_DELETE 0x53
 #define SC_ALT 0x38 /* extended 0xE0 0x38 is AltGr (right Alt)  */
-
-/* Extended media keys: standard AT consumer codes for volume, common PS/2 codes for brightness; handled in the IRQ. */
-#define SC_E_MUTE 0x20
-#define SC_E_VOL_DOWN 0x2E
-#define SC_E_VOL_UP 0x30
-#define SC_E_BRIGHT_DN 0x6B
-#define SC_E_BRIGHT_UP 0x6C
 
 /* This laptop sends volume/brightness as bare F5/F6/F8/F9 make codes, handled in the IRQ like the E0 cases (F5 sends no
  * KEY_F5). */
@@ -140,6 +134,7 @@ static bool alt_tabbed;    /* Tab was pressed during this Alt hold     */
 static bool super_held;    /* GUI/Win key held; folds into KMOD_SUPER on any chord */
 static bool super_chorded; /* a Super+key fired during this Super hold */
 static bool expecting_extended;
+static bool mute_held;       /* E0 20 make seen without its break, so typematic repeats don't re-toggle mute */
 static bool num_lock = true; /* on by default, like most BIOSes        */
 static bool caps_lock;       /* off by default                         */
 
@@ -205,6 +200,14 @@ int keyboard_poll(char *out, unsigned char *mods)
   return 1;
 }
 
+int keyboard_poll_text(char *out, unsigned char *mods)
+{
+  while (keyboard_poll(out, mods))
+    if ((unsigned char)*out < KEY_MEDIA_PLAY)
+      return 1;
+  return 0;
+}
+
 /* Returns 1 and clears the latch if Ctrl+C was pressed since the last call. */
 int keyboard_take_interrupt(void)
 {
@@ -223,6 +226,40 @@ int keyboard_take_screenshot(void)
 
 /* Raise the interrupt latch from outside the IRQ (serial console Ctrl+C). */
 void keyboard_signal_interrupt(void) { int_pending = true; }
+
+static void volume_step(int dir)
+{
+  if (hda_present())
+    hda_volume_step(dir);
+  else
+    sb16_volume_step(dir);
+}
+
+/* Volume and brightness act here so they work without a compositor; every special key is also queued for the OSD. */
+void keyboard_special_key(uint8_t key)
+{
+  switch (key) {
+  case KEY_MUTE:
+    if (hda_present())
+      hda_volume_mute();
+    else
+      sb16_volume_mute();
+    break;
+  case KEY_VOL_DOWN:
+    volume_step(-1);
+    break;
+  case KEY_VOL_UP:
+    volume_step(+1);
+    break;
+  case KEY_BRIGHT_DOWN:
+    fb_brightness_step(-1);
+    break;
+  case KEY_BRIGHT_UP:
+    fb_brightness_step(+1);
+    break;
+  }
+  ring_push((char)key);
+}
 
 /* The byte after a 0xE0 prefix; unmapped extended keys are swallowed. */
 static void process_extended(uint8_t sc)
@@ -259,8 +296,22 @@ static void process_extended(uint8_t sc)
     super_chorded = false;
     return;
   }
+  if (sc == (0x20 | SC_RELEASE)) { /* mute up */
+    mute_held = false;
+    return;
+  }
   if (sc & SC_RELEASE) /* other extended release: ignore         */
     return;
+  uint8_t special = kbd_e0_key(sc);
+  if (special) {
+    if (special == KEY_MUTE) {
+      if (mute_held)
+        return;
+      mute_held = true;
+    }
+    keyboard_special_key(special);
+    return;
+  }
   switch (sc) {
   case 0x1C:
     ring_push('\n');
@@ -268,32 +319,6 @@ static void process_extended(uint8_t sc)
   case 0x35:
     ring_push('/');
     break; /* keypad /      */
-  /* Media / Fn keys: act on the device directly, like Print Screen. */
-  /* Volume keys drive HDA when it owns output, else the SB16 mixer. */
-  case SC_E_MUTE:
-    if (hda_present())
-      hda_volume_mute();
-    else
-      sb16_volume_mute();
-    break;
-  case SC_E_VOL_DOWN:
-    if (hda_present())
-      hda_volume_step(-1);
-    else
-      sb16_volume_step(-1);
-    break;
-  case SC_E_VOL_UP:
-    if (hda_present())
-      hda_volume_step(+1);
-    else
-      sb16_volume_step(+1);
-    break;
-  case SC_E_BRIGHT_DN:
-    fb_brightness_step(-1);
-    break;
-  case SC_E_BRIGHT_UP:
-    fb_brightness_step(+1);
-    break;
   /* Navigation keys emit plain editing codes; Shift/Alt ride in cur_mods; a bare Alt+arrow sets no alt_tabbed. */
   case SC_E_UP:
     ring_push(KEY_UP);
@@ -369,27 +394,21 @@ static bool process_modifiers(uint8_t sc)
   return false;
 }
 
-/* Bare F-key media codes (see SC_F*); act on the device. 1 if consumed. */
+/* Bare F-key media codes (see SC_F*); 1 if consumed. */
 static bool process_media_fkey(uint8_t sc)
 {
   switch (sc) {
   case SC_F5:
-    fb_brightness_step(-1);
-    return true; /* brightness down          */
-  case SC_F6:
-    fb_brightness_step(+1);
-    return true; /* brightness up            */
-  case SC_F8:    /* volume down              */
-    if (hda_present())
-      hda_volume_step(-1);
-    else
-      sb16_volume_step(-1);
+    keyboard_special_key(KEY_BRIGHT_DOWN);
     return true;
-  case SC_F9: /* volume up                */
-    if (hda_present())
-      hda_volume_step(+1);
-    else
-      sb16_volume_step(+1);
+  case SC_F6:
+    keyboard_special_key(KEY_BRIGHT_UP);
+    return true;
+  case SC_F8:
+    keyboard_special_key(KEY_VOL_DOWN);
+    return true;
+  case SC_F9:
+    keyboard_special_key(KEY_VOL_UP);
     return true;
   }
   return false;

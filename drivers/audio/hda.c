@@ -583,6 +583,8 @@ void hda_volume_mute(void)
 }
 
 int hda_volume(void) { return hda_muted ? 0 : hda_vol; }
+int hda_volume_level(void) { return hda_vol; }
+int hda_is_muted(void) { return hda_muted; }
 
 static void configure_path(void)
 {

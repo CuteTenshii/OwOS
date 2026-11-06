@@ -27,6 +27,8 @@ int hda_present(void); /* 1 if a controller + usable codec was found   */
 void hda_volume_step(int dir); /* +1 = louder, -1 = quieter (clamped)        */
 void hda_volume_mute(void);    /* toggle mute (restores the prior level)      */
 int hda_volume(void);          /* 0..HDA_VOL_MAX, or 0 while muted            */
+int hda_volume_level(void);    /* 0..HDA_VOL_MAX, ignoring mute               */
+int hda_is_muted(void);        /* 1 while muted                               */
 
 /* Streaming PCM sink, fed from /bin/play over the SYS_AUDIO_* calls.
  * The producer pushes a fixed canonical format — 48 kHz, 16-bit, stereo — which

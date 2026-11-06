@@ -15,11 +15,37 @@
 #include "net.h"
 #include "nic.h"
 #include "pci.h"
+#include "sb16.h"
 #include "smbios.h"
 #include <stdint.h>
 
 /* The single NIC's sysfs name (we keep one card; nic.c is driver-agnostic). */
 #define NET_IFACE "eth0"
+
+static bool sound_present(void) { return hda_present() || sb16_present(); }
+
+/* Master volume as 0..SB_VOL_MAX from whichever card owns the keys' output. */
+static int snd_level(void) { return hda_present() ? hda_volume_level() : sb16_volume_level(); }
+static bool snd_muted(void) { return hda_present() ? hda_is_muted() : sb16_is_muted(); }
+
+static void snd_set_level(int level)
+{
+  for (int d = level - snd_level(); d; d += d < 0 ? 1 : -1)
+    if (hda_present())
+      hda_volume_step(d < 0 ? -1 : 1);
+    else
+      sb16_volume_step(d < 0 ? -1 : 1);
+}
+
+static int parse_percent(const char *p)
+{
+  int v = 0;
+  if (*p < '0' || *p > '9')
+    return -1;
+  for (; *p >= '0' && *p <= '9'; p++)
+    v = v < 1000 ? v * 10 + (*p - '0') : v;
+  return v > 100 ? 100 : v;
+}
 
 /* text builder */
 /* Same bounded builder as procfs.c, local so the two stay independent. */
@@ -250,7 +276,7 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
   if (eq(seg[0], "class")) {
     if (n == 2)
       return (eq(seg[1], "input") || eq(seg[1], "net") || eq(seg[1], "block") || eq(seg[1], "graphics") ||
-              eq(seg[1], "dmi") || (eq(seg[1], "sound") && hda_present()))
+              eq(seg[1], "dmi") || (eq(seg[1], "sound") && sound_present()))
                  ? S_DIR
                  : S_NONE;
     if (eq(seg[1], "input")) {
@@ -287,7 +313,7 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
           return S_FILE_RO;
         if (eq(seg[3], "mode")) /* rw only where we can drive the mode */
           return fb_can_set_mode() ? S_FILE_RW : S_FILE_RO;
-        if (eq(seg[3], "rate")) /* compositor frame-pacing target (Hz) */
+        if (eq(seg[3], "rate") || eq(seg[3], "brightness")) /* rate: compositor frame-pacing target (Hz) */
           return S_FILE_RW;
       }
       return S_NONE;
@@ -300,15 +326,17 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
       return S_NONE;
     }
     if (eq(seg[1], "sound")) {
-      if (!hda_present())
+      if (!sound_present())
         return S_NONE;
       if (n == 3)
         return eq(seg[2], "card0") ? S_DIR : S_NONE;
       if (n == 4 && eq(seg[2], "card0")) {
         if (eq(seg[3], "output"))
           return S_FILE_RW;
-        if (eq(seg[3], "outputs"))
+        if (eq(seg[3], "outputs") || eq(seg[3], "muted"))
           return S_FILE_RO;
+        if (eq(seg[3], "volume"))
+          return S_FILE_RW;
       }
       return S_NONE;
     }
@@ -430,6 +458,11 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         pc(b, '\n');
         return;
       }
+      if (eq(seg[3], "brightness")) { /* 0..100 over FB_BRIGHT_MIN..FB_BRIGHT_MAX */
+        pu(b, (uint32_t)((fb_brightness() - FB_BRIGHT_MIN) * 100 / (FB_BRIGHT_MAX - FB_BRIGHT_MIN)));
+        pc(b, '\n');
+        return;
+      }
       if (eq(seg[3], "mode")) { /* the current mode, "WxH" */
         pu(b, fb_active() ? fb_width() : 0);
         pc(b, 'x');
@@ -472,6 +505,16 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
     }
     if (eq(seg[1], "sound")) {
       char nm[24];
+      if (eq(seg[3], "volume")) { /* 0..100 */
+        pu(b, (uint32_t)((snd_level() * 100 + SB_VOL_MAX / 2) / SB_VOL_MAX));
+        pc(b, '\n');
+        return;
+      }
+      if (eq(seg[3], "muted")) {
+        ps(b, snd_muted() ? "1" : "0");
+        pc(b, '\n');
+        return;
+      }
       if (eq(seg[3], "output")) { /* the active output's name */
         int a = hda_output_active();
         if (a >= 0 && hda_output_name(a, nm, (int)sizeof nm))
@@ -577,6 +620,20 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
     }
     return hda_output_select(idx) == 0 ? 0 : -1;
   }
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0") && eq(seg[3], "volume")) {
+    int v = parse_percent(arg);
+    if (v < 0)
+      return -1;
+    snd_set_level((v * SB_VOL_MAX + 50) / 100);
+    return 0;
+  }
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0") && eq(seg[3], "brightness")) {
+    int v = parse_percent(arg);
+    if (v < 0)
+      return -1;
+    fb_brightness_step(FB_BRIGHT_MIN + (v * (FB_BRIGHT_MAX - FB_BRIGHT_MIN) + 50) / 100 - fb_brightness());
+    return 0;
+  }
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0") && eq(seg[3], "mode")) {
     /* "WxH": reprogram the adapter (DISPI only, gated by fb_can_set_mode); the compositor rebinds on change. */
     int w = 0, h = 0;
@@ -640,7 +697,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     if (block_name(0, tmp))
       kids[k++] = "block";
     kids[k++] = "graphics";
-    if (hda_present())
+    if (sound_present())
       kids[k++] = "sound";
     kids[k++] = "dmi";
     hit = from_list(idx, name, max, kids, k);
@@ -710,7 +767,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     return 1;
   }
   if (n == 2 && eq(seg[0], "class") && eq(seg[1], "sound")) {
-    if (!hda_present() || idx != 0)
+    if (!sound_present() || idx != 0)
       return 0;
     cpy(name, "card0", max);
     if (is_dir)
@@ -777,8 +834,9 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     return hit;
   }
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0")) {
-    static const char *const k[] = {"width", "height", "refresh", "monitor", "internal", "mode", "modes", "rate"};
-    hit = from_list(idx, name, max, k, 8);
+    static const char *const k[] = {"width", "height", "refresh", "monitor",   "internal",
+                                    "mode",  "modes",  "rate",    "brightness"};
+    hit = from_list(idx, name, max, k, 9);
     if (hit && is_dir)
       *is_dir = 0;
     return hit;
@@ -791,8 +849,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     return hit;
   }
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0")) {
-    static const char *const k[] = {"output", "outputs"};
-    hit = from_list(idx, name, max, k, 2);
+    static const char *const k[] = {"output", "outputs", "volume", "muted"};
+    hit = from_list(idx, name, max, k, 4);
     if (hit && is_dir)
       *is_dir = 0;
     return hit;

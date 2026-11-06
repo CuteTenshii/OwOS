@@ -20,6 +20,8 @@ int sb16_present(void); /* 1 if a card was detected                     */
 void sb16_volume_step(int dir); /* +1 = louder, -1 = quieter (clamped)        */
 void sb16_volume_mute(void);    /* toggle mute (restores the prior level)      */
 int sb16_volume(void);          /* 0..SB_VOL_MAX, or 0 while muted             */
+int sb16_volume_level(void);    /* 0..SB_VOL_MAX, ignoring mute                */
+int sb16_is_muted(void);        /* 1 while muted                               */
 
 /* Streaming PCM sink, fed from /bin/play over the SYS_AUDIO_* calls
  * when no HD Audio codec is present. The producer pushes the canonical 48 kHz/

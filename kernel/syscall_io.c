@@ -46,7 +46,7 @@ void syscall_io_read(struct registers *r)
     char c;
     int got = 0;
     __asm__ volatile("sti");
-    while (!(got = keyboard_poll(&c, 0))) {
+    while (!(got = keyboard_poll_text(&c, 0))) {
       if (sched_intr_pending())
         break;
       __asm__ volatile("hlt");
@@ -58,7 +58,7 @@ void syscall_io_read(struct registers *r)
     }
     uint32_t n = 0;
     buf[n++] = c;
-    while (n < len && keyboard_poll(&c, 0))
+    while (n < len && keyboard_poll_text(&c, 0))
       buf[n++] = c;
     r->eax = n;
   } else if (f->type == FD_PIPE_RD || f->type == FD_CHANNEL) {

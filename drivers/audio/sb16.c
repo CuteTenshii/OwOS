@@ -95,6 +95,8 @@ void sb16_volume_mute(void)
 }
 
 int sb16_volume(void) { return muted ? 0 : volume; }
+int sb16_volume_level(void) { return volume; }
+int sb16_is_muted(void) { return muted; }
 
 static bool dsp_reset(void)
 {
