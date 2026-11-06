@@ -1,29 +1,18 @@
-/* js.c — wires the OwOS JavaScript engine (user/lib/js) into the browser.
- *
- * After the DOM is parsed, html.c calls js_run_document(): it spins up a fresh
- * engine context, installs a small `document`/`window` binding layer over the
- * browser's DOM (browser/dom.h), and runs every inline <script> in document
- * order sharing one global. Scripts run BEFORE layout, so any DOM they mutate
- * is reflected when html.c walks the tree to produce the styled page.
- *
- * A DOM element is exposed to JS as a wrapper object whose `host` slot (the
- * js_object embedder hook) points at the struct dom_node. Wrappers are created
- * fresh per access, so node *identity* across separate lookups is not preserved
- * yet — a known first-cut simplification. console output goes to stdout (fd 1);
- * timers (setTimeout/...) are accepted but do not fire (no event loop yet).
- */
+/* Browser bindings: document/window layer over the DOM for the OwOS JS engine (user/lib/js).
+ * Scripts run before layout. DOM nodes are wrapper objects whose `host` slot is the dom_node. */
 #include <stdbool.h>
 
-#include "cast.h" /* Google Cast sender: HTMLMediaElement.remote backend  */
+#include "cast.h" /* Google Cast sender: HTMLMediaElement.remote backend */
 #include "classlist.h"
-#include "clipboard.h" /* clip_put / clip_get for navigator.clipboard          */
+#include "clipboard.h" /* clip_put / clip_get for navigator.clipboard */
 #include "dom_query.h"
-#include "features/cors/cors.h"    /* cors_origin / cors_same_origin: SW scope + cache keys */
-#include "features/media/bmedia.h" /* HTMLMediaElement: <audio>/<video> + new Audio()      */
+#include "features/clienthints/clienthints.h" /* ch_ua: navigator.userAgentData */
+#include "features/cors/cors.h"               /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "features/media/bmedia.h"            /* HTMLMediaElement: <audio>/<video> + new Audio() */
 #include "features/notification/notification.h"
-#include "jsint.h"     /* internal shared surface (engine ctx + helpers + A())  */
-#include "notify.h"    /* notify_send: surface Notification() on the desktop    */
-#include "websocket.h" /* ws_open / ws_poll / ws_send / ws_close (RFC 6455)    */
+#include "jsint.h"     /* internal shared surface (engine ctx + helpers + A()) */
+#include "notify.h"    /* notify_send: surface Notification() on the desktop */
+#include "websocket.h" /* ws_open / ws_poll / ws_send / ws_close (RFC 6455) */
 
 js_ctx *g_ctx;
 static char *sdup(const char *s);
@@ -36,15 +25,9 @@ static js_object *g_sp_proto;
 static js_object *g_formdata_proto; /* FormData.prototype (shares URLSearchParams' @k/@v) */
 static js_object *g_event_proto;
 static js_object *g_html_proto; /* HTMLElement.prototype (chains to element) */
-js_object *g_media_proto;       /* HTMLMediaElement.prototype (audio/video)  */
+js_object *g_media_proto;       /* HTMLMediaElement.prototype (audio/video) */
 
-/* Standard HTMLxxxElement interfaces: the interface name, the space-separated
- * tag list it wraps, and (filled at setup) its prototype. Each is exposed as a
- * global constructor so scripts can reference/extend it (e.g. `class X extends
- * HTMLScriptElement`), and wrap_node gives a matching element its interface
- * prototype so `el instanceof HTMLScriptElement` holds. Every prototype chains
- * to HTMLElement.prototype; tags not listed here wrap as a plain HTMLElement.
- */
+/* Standard HTMLxxxElement interfaces: the interface name, the space-separated tag list it wraps */
 struct html_iface {
   const char *name;
   const char *tags;
@@ -52,10 +35,7 @@ struct html_iface {
   js_object *proto;
 };
 static struct html_iface g_html_ifaces[] = {
-    /* `media` = 1 chains to HTMLMediaElement.prototype instead of
-     * HTMLElement's, so <audio>/<video> inherit the media methods and
-     * instanceof reflects the HTMLMediaElement base. Everything else chains
-     * straight to HTMLElement. */
+    /* `media` = 1 chains to HTMLMediaElement.prototype instead of HTMLElement's */
     {"HTMLScriptElement", "script", false, 0},
     {"HTMLAnchorElement", "a", false, 0},
     {"HTMLImageElement", "img", false, 0},
@@ -98,58 +78,47 @@ static struct html_iface g_html_ifaces[] = {
     {"HTMLVideoElement", "video", true, 0},
     {"HTMLAudioElement", "audio", true, 0},
 };
-static js_object *g_custom_elements;       /* registry: tag name -> class constructor   */
+static js_object *g_custom_elements;       /* registry: tag name -> class constructor */
 static js_object *g_module_cache;          /* ES module registry: abs URL -> namespace */
 static js_object *g_module_src;            /* prefetched module sources: abs URL -> text */
-static js_object *g_document_proto;        /* shared by the live doc + DOMParser docs    */
-js_object *g_response_proto;               /* fetch() Response.prototype                  */
-static js_object *g_ws_proto;              /* WebSocket.prototype                          */
+static js_object *g_document_proto;        /* shared by the live doc + DOMParser docs */
+js_object *g_response_proto;               /* fetch() Response.prototype */
+static js_object *g_ws_proto;              /* WebSocket.prototype */
 static js_object *g_xhr_proto;             /* XMLHttpRequest.prototype */
 static js_object *g_blob_proto;            /* Blob.prototype */
 static js_object *g_clipitem_proto;        /* ClipboardItem.prototype */
-js_object *g_remote_proto;                 /* RemotePlayback.prototype (media.remote)      */
-js_object *g_remotes;                      /* rooted array of live RemotePlayback wrappers  */
+js_object *g_remote_proto;                 /* RemotePlayback.prototype (media.remote) */
+js_object *g_remotes;                      /* rooted array of live RemotePlayback wrappers */
 static js_object *g_websockets;            /* rooted array of live WebSocket wrappers */
 static js_object *g_bchannel_proto;        /* BroadcastChannel.prototype */
 static js_object *g_bchannels;             /* rooted array of open BroadcastChannel wrappers */
 static js_object *g_notification_proto;    /* Notification.prototype */
-static js_object *g_notifications;         /* rooted array of wrappers pending show/close   */
+static js_object *g_notifications;         /* rooted array of wrappers pending show/close */
 static js_object *g_abortsignal_proto;     /* AbortSignal.prototype */
 static js_object *g_abortcontroller_proto; /* AbortController.prototype */
 static js_object *g_rtc_proto;             /* RTCPeerConnection.prototype (inert stub) */
 static js_object *g_document;
 static struct dom_node *g_doc_root;
-static struct dom_node *g_parsed[64]; /* DOMParser trees, freed at page teardown    */
+static struct dom_node *g_parsed[64]; /* DOMParser trees, freed at page teardown */
 static int g_nparsed;
-static res_batch_fn g_fetch;  /* the batch fetch used to pull modules       */
-char g_page_url_buf[URL_MAX]; /* the page URL (module-resolution referrer)  */
+static res_batch_fn g_fetch;  /* the batch fetch used to pull modules */
+char g_page_url_buf[URL_MAX]; /* the page URL (module-resolution referrer) */
 
-/* The JS context now lives for the whole page (not just the initial script
- * run), so registered listeners + closures survive until the next navigation.
- * These hold that persistent state; html_page_teardown() reclaims it. */
+/* The JS context now lives for the whole page (not just the initial script run) */
 static js_object *g_live_wrappers; /* rooted array pinning every node wrapper */
-static bool g_has_listeners;       /* any addEventListener fired this page      */
-int g_page_live;                   /* a page context is currently alive         */
+static bool g_has_listeners;       /* any addEventListener fired this page */
+int g_page_live;                   /* a page context is currently alive */
 static js_arena **g_arenas;        /* per-script AST arenas (closures need them); grows */
 static int g_narenas, g_arenas_cap;
 
-/* Timer queue (setTimeout/setInterval/requestAnimationFrame). The engine has no
- * event loop, so timers are driven cooperatively: the worker calls
- * js_timers_pump each idle tick, which fires every timer whose deadline has
- * passed. Slot i holds a callback+extra-args bundle in the rooted array
- * g_timers (so closures stay GC- live); the parallel g_tmeta[] carries the
- * scheduling. A timer id is slot+1. The table grows on demand (a page may arm
- * any number of timers); cleared one-shots free their slot, so it settles at
- * the page's peak concurrent-timer count. */
+/* Timer queue (setTimeout/setInterval/requestAnimationFrame) */
 static js_object *g_timers; /* rooted: slot -> [callback, ...args] or null */
 static struct timer_meta {
   bool active, repeat, raf;
   long long due, period; /* ms; due is the next fire time (now_ms scale) */
-  char *async;           /* frames captured at the arming call site, so a
-                          * throw in the callback names who scheduled it
-                          * (js_async_capture; freed in timer_drop)       */
+  char *async;           /* frames captured at the arming call site */
 } *g_tmeta;
-static int g_tcap;    /* allocated slots in g_tmeta                  */
+static int g_tcap;    /* allocated slots in g_tmeta */
 static int g_ntimers; /* active count (fast empty-check for the pump) */
 
 /* ------------------------------------------------------- small buffer ----- */
@@ -212,11 +181,7 @@ struct dom_node *node_of(js_value v)
     return 0;
   return (struct dom_node *)v.u.obj->host;
 }
-/* A DOM node is exposed as a wrapper object whose `host` slot points at the
- * node. The wrapper is cached on the node (dom_node.wrapper) so repeated
- * lookups return the SAME object — node identity, which event listeners depend
- * on. Every wrapper is pinned in g_live_wrappers so its listener closures
- * survive GC for the page. */
+/* A DOM node is exposed as a wrapper object whose `host` slot points at the node */
 /* whole-word match of `tag` within the space-separated `list` */
 static bool tag_in_list(const char *list, const char *tag)
 {
@@ -253,7 +218,7 @@ js_value wrap_node(struct dom_node *n)
     return js_obj_value((js_object *)n->wrapper);
   proto = g_html_proto ? g_html_proto : g_element_proto;
   if (n->type == DOM_ELEMENT) {
-    js_object *ip = iface_proto_for_tag(n->tag); /* HTMLScriptElement etc.  */
+    js_object *ip = iface_proto_for_tag(n->tag); /* HTMLScriptElement etc. */
     if (ip)
       proto = ip;
   }
@@ -267,9 +232,7 @@ js_value wrap_node(struct dom_node *n)
   return js_obj_value(o);
 }
 
-/* dom.c calls this (via the dom_on_free_wrapper hook) when a node that owns a
- * wrapper is freed mid-page (innerHTML/removeChild), so the surviving wrapper
- * goes inert (node_of -> NULL) rather than dereferencing freed memory. */
+/* dom.c calls this (via the dom_on_free_wrapper hook) when a node that owns a wrapper is freed */
 static void wrapper_detach(void *wrapper)
 {
   if (wrapper)
@@ -427,10 +390,7 @@ static js_value el_set_id(js_ctx *ctx, js_value t, js_value *args, int argc)
     dom_set_attr(n, "id", arg_str(ctx, A(0)));
   return js_undef();
 }
-/* .nonce reflects the content attribute. Script loaders (Cloudflare's challenge
- * bootstrap among them) copy the CSP nonce onto an injected <script> via this
- * IDL property, not setAttribute; without reflection the content attribute
- * stays empty and the element's script-src nonce check fails. */
+/* .nonce reflects the content attribute */
 static js_value el_get_nonce(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -464,13 +424,8 @@ static js_value el_set_class(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* ------------------------------------------------------- classList ---------
- */
-/* DOMTokenList over the element's class="" attribute. A fresh wrapper (host =
- * node) is returned per `.classList` access, like `.style`; the mutating
- * methods read and rewrite the live class attr, so they never go stale.
- * Mutations re-serialize the normalized ordered set (whitespace collapsed,
- * duplicates dropped), matching the DOM's token-list update steps. */
+/* ------------------------------------------------------- classList --------- */
+/* DOMTokenList over the element's class="" attribute */
 
 /* the node's current class string, or "" (never NULL) */
 static const char *cl_class_of(js_value t)
@@ -480,8 +435,7 @@ static const char *cl_class_of(js_value t)
   return v ? v : "";
 }
 
-/* rebuild `n`'s class attr as the current tokens (deduped) with `tok` appended
- */
+/* rebuild `n`'s class attr as the current tokens (deduped) with `tok` appended */
 static void cl_write_add(struct dom_node *n, const char *tok, int tl)
 {
   char *classes = sdup(dom_get_attr(n, "class") ? dom_get_attr(n, "class") : "");
@@ -531,9 +485,7 @@ static js_value cl_remove(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* toggle(token[, force]): with `force` given, force==true adds / false removes
- * (idempotently) and returns force; otherwise flips and returns the new state.
- */
+/* toggle(token[, force]): with `force` given, force==true adds / false removes */
 static js_value cl_toggle(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -559,8 +511,7 @@ static js_value cl_toggle(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_bool(1);
 }
 
-/* replace(old, new): swap the first `old` for `new` (dropping duplicates of
- * either), returning whether `old` was present. */
+/* replace(old, new): swap the first `old` for `new` (dropping duplicates of either) */
 static js_value cl_replace(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -638,8 +589,7 @@ static js_value cl_foreach(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* values/keys/entries + Symbol.iterator: snapshot the tokens into a real array
- * and delegate to its iterator, so token order and pair shape match the DOM. */
+/* values/keys/entries + Symbol.iterator */
 static js_value cl_iter_kind(js_ctx *ctx, js_value t, const char *method)
 {
   js_object *arr;
@@ -685,9 +635,7 @@ static js_value el_get_classlist(js_ctx *ctx, js_value t, js_value *args, int ar
   gc_push_scope();
   o = (js_object *)gc_keep(js_new_object(ctx, g_classlist_proto));
   o->host = n;
-  /* Snapshot numeric index properties (classList[0]) — the engine has no
-   * index-getter hook, and the wrapper is fresh per access so this is current.
-   */
+  /* Snapshot numeric index properties (classList[0]), the engine has no index-getter hook */
   cur = n ? dom_get_attr(n, "class") : 0;
   if (!cur)
     cur = "";
@@ -712,9 +660,7 @@ static js_value el_get_classlist(js_ctx *ctx, js_value t, js_value *args, int ar
   gc_pop_scope();
   return js_obj_value(o);
 }
-/* .src / .href reflect the attribute resolved to an absolute URL (as the real
- * DOM does — e.g. `new URL(script.src)` needs an absolute value). Setters write
- * the raw attribute. */
+/* .src / .href reflect the attribute resolved to an absolute URL */
 static js_value el_get_url_attr(js_ctx *ctx, js_value t, const char *attr)
 {
   struct dom_node *n = node_of(t);
@@ -826,10 +772,7 @@ static js_value el_rm_attr(js_ctx *ctx, js_value t, js_value *args, int argc)
     dom_remove_attr(n, arg_str(ctx, A(0)));
   return js_undef();
 }
-/* A script inserted into the live document by these DOM bindings (the
- * analytics/ widget loader idiom: createElement('script') + appendChild) must
- * fetch+run, the way a browser does. Defined near the page runner;
- * forward-declared here. */
+/* A script inserted into the live document by these DOM bindings */
 static void run_inserted_script(struct dom_node *node);
 static bool node_connected(struct dom_node *n)
 {
@@ -928,11 +871,7 @@ static js_value el_children(js_ctx *ctx, js_value t, js_value *args, int argc)
   gc_pop_scope();
   return js_obj_value(arr);
 }
-/* ------------------------------------------------------- style (CSSOM-lite) -
- * el.style is a thin proxy whose host is the element node; its accessors and
- * methods read/write the element's style="" declaration string, which css.c's
- * css_apply_inline already folds in at layout time. So `el.style.color='red'`
- * (or setProperty) actually restyles the page on the next render. */
+/* ------------------------------------------------------- style (CSSOM-lite) - */
 
 static bool is_sp(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
 static bool span_ci_eq(const char *s, const char *e, const char *lit)
@@ -976,9 +915,7 @@ static js_value style_read(js_ctx *ctx, struct dom_node *node, const char *prop)
   return js_mk_cstring(ctx, "");
 }
 
-/* Rewrite the element's style="" with `setprop` set to `setval` (NULL/""
- * removes it). Every other declaration is preserved, the changed one moves to
- * the end. */
+/* Rewrite the element's style="" with `setprop` set to `setval` (NULL/"" removes it) */
 static void style_rebuild(struct dom_node *node, const char *setprop, const char *setval)
 {
   const char *style;
@@ -1100,11 +1037,7 @@ static js_value style_removeprop(js_ctx *ctx, js_value t, js_value *args, int ar
   return old;
 }
 
-/* <style>/<link> .sheet: a minimal CSSStyleSheet stub with an empty cssRules
- * list. We don't yet parse the element's text into a live CSSOM, but this keeps
- * feature-detectors that read `style.sheet.cssRules` from throwing (they just
- * report those rule-based features as unsupported). Non-stylesheet nodes: null.
- */
+/* <style>/<link> .sheet: a minimal CSSStyleSheet stub with an empty cssRules list */
 static js_value el_get_sheet(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -1130,9 +1063,7 @@ static js_value el_get_style(js_ctx *ctx, js_value t, js_value *args, int argc)
   o->host = node_of(t); /* proxy the element's style attr */
   return js_obj_value(o);
 }
-/* el.dataset: a snapshot object of the element's data-* attributes, keyed in
- * camelCase (data-astro-prefetch -> astroPrefetch). Reads only (fresh per
- * access). */
+/* el.dataset: a snapshot object of the element's data-* attributes, keyed in camelCase */
 static js_value el_get_dataset(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -1170,9 +1101,7 @@ static js_value win_getcomputedstyle(js_ctx *ctx, js_value t, js_value *args, in
   o->host = node_of(A(0)); /* inline styles only (no cascade) */
   return js_obj_value(o);
 }
-/* window geometry: the content viewport size and the page's scroll offset.
- * Paired with element getBoundingClientRect (same viewport frame), so
- * viewport-visibility math (lazy-load / scroll-spy) works. */
+/* window geometry: the content viewport size and the page's scroll offset */
 static js_value win_innerWidth(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   int w = 0, h = 0;
@@ -1210,9 +1139,7 @@ static js_value win_scrollY(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_number(browser_scroll_px());
 }
 
-/* window.screen — no separate display metric exists, so the resizable window's
- * client size stands in for the screen (sites use it for analytics/feature
- * sniffing, e.g. screen.width/height). Accessors so a resize is reflected. */
+/* window.screen, no separate display metric exists */
 static js_value screen_width(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)ctx;
@@ -1262,13 +1189,7 @@ static js_value el_empty_array(js_ctx *ctx, js_value t, js_value *args, int argc
   return js_obj_value(js_new_array(ctx, 0));
 }
 
-/* --- window.alert / confirm / prompt --------------------------------------
- * JS runs on the worker thread, but the modal dialog must run on the MAIN
- * thread: the gfx surface is main-thread-only, and the dialog is parented to
- * the browser window the main task owns. So we hand the request to main via
- * B->dlg_* and block this thread until it finishes — which is exactly
- * window.alert's blocking semantics. (main services B->dlg_req in its event
- * loop; see browser/main.c.) */
+/* --- window.alert / confirm / prompt -------------------------------------- */
 static void dlg_scopy(char *d, const char *s, int cap)
 {
   int i = 0;
@@ -1318,13 +1239,7 @@ static js_value win_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_null();
 }
 
-/* --- per-origin permissions (Notification / Geolocation / Camera / Microphone)
- * The requesting document's origin is g_page_url_buf (worker-thread local). A
- * powerful feature is gated in three stages: the site's own Permissions-Policy
- * (a blocked feature is denied silently), a remembered decision, else a modal
- * Refuse/Allow-once/Allow-always prompt driven on the main thread (dlg_req 4,
- * same handshake as alert/confirm). "Allow always" persists; the rest are
- * session-only. See permissions.c. */
+/* --- per-origin permissions (Notification / Geolocation / Camera / Microphone) */
 static int page_origin(char *origin, int ocap, char *host, int hcap)
 {
   struct purl pu;
@@ -1344,8 +1259,7 @@ static int page_origin(char *origin, int ocap, char *host, int hcap)
 
 const char *perm_state_str(int st) { return st == PERM_GRANTED ? "granted" : st == PERM_DENIED ? "denied" : "default"; }
 
-/* The remembered/policy state for a feature WITHOUT prompting (for
- * Notification.permission and navigator.permissions.query). */
+/* The remembered/policy state for a feature WITHOUT prompting */
 int perm_state_now(int feature)
 {
   char origin[URL_MAX], host[URL_HOST_MAX];
@@ -1356,8 +1270,7 @@ int perm_state_now(int feature)
   return perm_lookup(origin, feature);
 }
 
-/* Resolve a permission, prompting the user if there is no prior decision.
- * Returns PERM_GRANTED / PERM_DENIED and records the choice. */
+/* Resolve a permission, prompting the user if there is no prior decision */
 int worker_permission(int feature)
 {
   char origin[URL_MAX], host[URL_HOST_MAX];
@@ -1400,10 +1313,7 @@ int worker_permission(int feature)
   return state;
 }
 
-/* The Observer family (Mutation/Intersection/Resize/Performance): a constructor
- * returning an inert observer. We have no observation event loop, so observe()/
- * disconnect() are no-ops and the callback never fires — but constructing one
- * (a near-universal idiom on modern pages) no longer throws. */
+/* The Observer family (Mutation/Intersection/Resize/Performance) */
 static js_value observer_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   js_object *o;
@@ -1442,10 +1352,7 @@ static js_value win_queuemicrotask(js_ctx *ctx, js_value t, js_value *args, int 
   return js_undef();
 }
 
-/* --- Content-Security-Policy hooks ----------------------------------------- *
- * Script execution, fetch()/WebSocket connections and dynamic code generation
- * are gated against the page's policy (B->pg->csp). Violations log to the
- * devtools console (where CSP reports normally surface). */
+/* --- Content-Security-Policy hooks ----------------------------------------- */
 static void js_csp_log(const char *what, const char *url, const char *reason)
 {
   char m[URL_MAX + 160];
@@ -1463,8 +1370,7 @@ static void js_csp_log(const char *what, const char *url, const char *reason)
   devtools_console_append(DT_ERROR, m, n);
 }
 
-/* Stub installed over the eval/Function globals when 'unsafe-eval' is absent.
- */
+/* Stub installed over the eval/Function globals when 'unsafe-eval' is absent */
 static js_value dyncode_blocked(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   (void)t;
@@ -1473,11 +1379,7 @@ static js_value dyncode_blocked(js_ctx *ctx, js_value t, js_value *a, int n)
   return js_throw_type(ctx, "code generation from strings blocked by Content-Security-Policy");
 }
 
-/* ------------------------------------------------------- fetch ------------- *
- * fetch(url, opts) runs a synchronous HTTP request on the worker (fits the
- * settle-immediately Promise model) and resolves with a Response, or rejects
- * with a TypeError on a connection error. Response.text()/json() return
- * already-settled Promises of the body. */
+/* ------------------------------------------------------- fetch ------------- */
 static js_value resp_text(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)args;
@@ -1524,10 +1426,7 @@ js_value hdr_has(js_ctx *ctx, js_value t, js_value *args, int argc)
 }
 static const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap); /* defined with Blob */
 
-/* Build a Response on g_response_proto from raw bytes. Shared by fetch(), the
- * Cache API and the Response constructor. The returned object is live in the
- * caller's current gc scope only — a caller that allocates afterward must
- * gc_keep it first. `len` < 0 means an empty body. */
+/* Build a Response on g_response_proto from raw bytes */
 js_object *make_response(js_ctx *ctx, const char *url, int status, const char *statustext, const char *ctype,
                          const char *body, int len)
 {
@@ -1551,9 +1450,7 @@ js_object *make_response(js_ctx *ctx, const char *url, int status, const char *s
   return resp;
 }
 
-/* The controlling service worker (if any) answers a fetch() from the page: it
- * dispatches a FetchEvent and, if a handler called respondWith, sets *out to a
- * resolved Promise of the Response and returns 1. Defined in the SW section. */
+/* The controlling service worker (if any) answers a fetch() from the page */
 
 js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1597,15 +1494,12 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     if (m.type == JV_STR)
       strlcpy(method, m.u.str->data, sizeof method);
     (void)js_to_boolean(js_get(ctx, A(1), "keepalive")); /* sync fetch: inherently satisfied */
-    {                                                    /* credentials: "include" sends cookies cross-origin (default
-                                                            "same-origin" doesn't) */
+    {                                                    /* credentials: "include" sends cookies cross-origin */
       js_value cr = js_get(ctx, A(1), "credentials");
       if (cr.type == JV_STR && streq(cr.u.str->data, "include"))
         with_creds = true;
     }
-    /* Request headers: a plain { name: value } object (a Headers instance is a
-     * plain object here too). Content-Type folds into the body's ctype slot to
-     * avoid a duplicate header; the rest become a "Name: value\r\n" blob. */
+    /* Request headers: a plain { name: value } object (a Headers instance is a plain object here too) */
     if (h.type == JV_OBJ) {
       pmap *pm = &h.u.obj->props;
       int i;
@@ -1627,31 +1521,24 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
         sapp(extra_hdrs, &eh, sizeof extra_hdrs, "\r\n");
       }
     }
-    /* An already-aborted signal short-circuits before touching the network
-     * (the fetch runs synchronously, so this is the only cancellation point).
-     */
+    /* An already-aborted signal short-circuits before touching the network */
     if (sig.type == JV_OBJ && js_to_boolean(js_get(ctx, sig, "aborted"))) {
       js_value reason = js_get(ctx, sig, "reason");
       if (reason.type == JV_UNDEF)
         reason = js_make_error(ctx, ctx->error_proto, "AbortError", "The operation was aborted");
       return js_promise_rejected(ctx, reason);
     }
-    /* Body last, just before the request: body_bytes may hand back a pointer
-     * into a transient string (URLSearchParams), so no JS allocation must run
-     * between here and browser_cors_fetch. */
+    /* Body last, just before the request: body_bytes may hand back a pointer into a transient string */
     if (b.type != JV_UNDEF && b.type != JV_NULL)
       reqbody = body_bytes(ctx, b, &reqlen, req_ctype,
-                           sizeof req_ctype); /* string/Blob/ArrayBuffer/TypedArray/URLSearchParams
-                                               */
+                           sizeof req_ctype); /* string/Blob/ArrayBuffer/TypedArray/URLSearchParams */
   }
   if (!method[0] && A(0).type == JV_OBJ) { /* method carried on a Request */
     js_value m = js_get(ctx, A(0), "method");
     if (m.type == JV_STR)
       strlcpy(method, m.u.str->data, sizeof method);
   }
-  /* A controlling service worker gets first crack at the request. If it
-   * answered (respondWith), skip the network entirely. Reentrancy is guarded so
-   * the SW's own network fallback — fetch(event.request) — reaches the wire. */
+  /* A controlling service worker gets first crack at the request */
   if (sw_intercept_fetch(ctx, url, method[0] ? method : "GET", &rv))
     return rv;
   {
@@ -1679,12 +1566,7 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
   return rv;
 }
 
-/* History API, wired to the browser's per-tab back/forward history. The JS side
- * runs on the worker, so back/forward/go just post a request the main thread
- * acts on (it owns the history + nav buttons); length reads it back. pushState/
- * replaceState update the address bar + the live location.href without
- * navigating (an SPA's soft URL change), then a real Back re-fetches the
- * previous entry. */
+/* History API, wired to the browser's per-tab back/forward history */
 static js_value his_back(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)ctx;
@@ -1754,8 +1636,7 @@ static js_value his_replacestate(js_ctx *ctx, js_value t, js_value *args, int ar
   return js_undef();
 }
 
-/* location.assign/replace/reload: a real navigation, posted to the main thread.
- */
+/* location.assign/replace/reload: a real navigation, posted to the main thread */
 static js_value loc_assign(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
@@ -1842,13 +1723,7 @@ static js_value el_contains(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_bool(0);
 }
 
-/* ------------------------------------------------------- geometry natives - *
- * The browser is a line-flow renderer with no real box model, so element pixel
- * geometry is reconstructed from the wrapped-line table (browser_range_box, in
- * main.c). offsetWidth/offsetHeight/offsetTop/clientWidth etc. are document-
- * relative; getBoundingClientRect is viewport-relative (page scroll
- * subtracted), matching event.clientX/clientY. All values are approximate:
- * exact for a span on one text line, the content column otherwise. */
+/* ------------------------------------------------------- geometry natives - */
 static int node_box(js_value t, int *x, int *y, int *w, int *h)
 {
   struct dom_node *n = node_of(t);
@@ -1928,11 +1803,7 @@ static js_value el_get_bounding_rect(js_ctx *ctx, js_value t, js_value *args, in
 
 /* ------------------------------------------------------- iframe content --- */
 
-/* Wrap a DOM tree root as a Document object (host = root, root->wrapper = doc),
- * tracked in g_parsed so page teardown frees it. The document methods are
- * root-relative, so the returned object answers
- * createElement/getElementsByTagName/ head/body against `root`. Returns js_null
- * on OOM. */
+/* Wrap a DOM tree root as a Document object (host = root, root->wrapper = doc) */
 static js_value wrap_document(js_ctx *ctx, struct dom_node *root)
 {
   js_object *doc;
@@ -1953,12 +1824,7 @@ static js_value wrap_document(js_ctx *ctx, struct dom_node *root)
   return dv;
 }
 
-/* A script-created or src-less <iframe> exposes a live, initially-empty
- * document
- * (#document > html > head + body) so framework shims that inject into
- * a.contentDocument.head — e.g. the Cloudflare challenge bootstrap — work. The
- * sub-document is cached on the iframe wrapper (hidden "@cdoc" key) so each
- * access returns the SAME Document; we never load the frame's src here. */
+/* A script-created or src-less <iframe> exposes a live, initially-empty document */
 static js_value el_content_document(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t), *root, *html, *head, *body;
@@ -1996,10 +1862,7 @@ static js_value el_content_document(js_ctx *ctx, js_value t, js_value *args, int
   return dv;
 }
 
-/* contentWindow: a thin window over the same content document, with the usual
- * self-referential window/self/document so `a.contentWindow.document` resolves
- * to the same Document as `a.contentDocument`. Cached on the wrapper ("@cwin").
- */
+/* contentWindow: a thin window over the same content document */
 static js_value el_content_window(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -2029,9 +1892,7 @@ static js_value el_content_window(js_ctx *ctx, js_value t, js_value *args, int a
 
 /* ------------------------------------------------------- document natives - */
 
-/* The root the document method was called on: a DOMParser document wraps its
- * own tree (host = parsed root); the live document falls back to g_doc_root. So
- * every query below works on either the page or a parsed off-document tree. */
+/* The root the document method was called on: a DOMParser document wraps its own tree */
 static struct dom_node *doc_root_of(js_value t)
 {
   struct dom_node *r = node_of(t);
@@ -2084,9 +1945,7 @@ static js_value doc_create_text(js_ctx *ctx, js_value t, js_value *args, int arg
   (void)t;
   return wrap_node(dom_new_text(arg_str(ctx, A(0))));
 }
-/* createElementNS(ns, qualifiedName): the DOM tracks no namespace, so the
- * element is keyed by its qualified name (arg 1); custom-element upgrade is
- * HTML-only, so skip it for a namespaced create. */
+/* createElementNS(ns, qualifiedName): the DOM tracks no namespace */
 static js_value doc_create_el_ns(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
@@ -2144,9 +2003,7 @@ static js_value doc_set_title(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* DOMParser: parse a string into an off-document tree wrapped as a Document
- * (the doc methods above are root-relative, so querySelector/body/... operate
- * on it). The tree is tracked and freed at page teardown. */
+/* DOMParser: parse a string into an off-document tree wrapped as a Document */
 static js_value domparser_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   const char *html = arg_str(ctx, A(0));
@@ -2183,14 +2040,7 @@ static js_value domparser_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
   return js_obj_value(o);
 }
 
-/* ------------------------------------------------------- URL -------------- *
- * The WHATWG `URL` + `URLSearchParams` Web APIs, layered over the existing
- * curl/url.h parser (`parse_url`/`resolve_url`). Components are computed once
- * at construction and exposed as plain data properties; this is a snapshot
- * model — writing `url.pathname` does not re-serialize `url.href`, and
- * `url.searchParams` is a detached copy of the query (mutating it does not
- * update the URL). That covers the overwhelmingly common read path real pages
- * use. */
+/* ------------------------------------------------------- URL -------------- */
 
 static void span_copy(char *dst, int cap, const char *s, const char *e)
 {
@@ -2368,8 +2218,7 @@ static js_value sp_append(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
   return js_undef();
 }
-/* rebuild @k/@v keeping only entries not matching `name`; if `keepfirst`, the
- * first match survives with its value replaced by `repl` */
+/* rebuild @k/@v keeping only entries not matching `name`; if `keepfirst` */
 static void sp_rebuild(js_ctx *ctx, js_value t, const char *name, int keepfirst, js_value repl)
 {
   js_object *ka = sp_arr(ctx, t, "@k"), *va = sp_arr(ctx, t, "@v"), *nk, *nv;
@@ -2431,7 +2280,7 @@ static js_value sp_for_each(js_ctx *ctx, js_value t, js_value *args, int argc)
   n = js_array_len(ka);
   for (i = 0; i < n; i++) {
     cbargs[0] = js_get_index(ctx, js_obj_value(va), i); /* value */
-    cbargs[1] = js_get_index(ctx, js_obj_value(ka), i); /* key   */
+    cbargs[1] = js_get_index(ctx, js_obj_value(ka), i); /* key */
     cbargs[2] = t;
     js_call(ctx, cb, js_undef(), cbargs, 3);
     if (ctx->has_exc)
@@ -2476,11 +2325,7 @@ static js_value sp_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   return make_search_params(ctx, q);
 }
 
-/* --------------------------------------------------------------- FormData --
- * FormData is a name/value multimap — the same shape as URLSearchParams — so it
- * reuses the @k/@v arrays and the sp_* methods. `new FormData(formEl)` seeds it
- * from the form's successful controls. Serialized as urlencoded when used as a
- * fetch body: there is no file input here, so multipart carries no benefit. */
+/* --------------------------------------------------------------- FormData -- */
 static void fd_collect(js_ctx *ctx, struct dom_node *n, js_object *ka, js_object *va)
 {
   for (struct dom_node *c = n->first_child; c; c = c->next) {
@@ -2527,11 +2372,7 @@ static js_value fd_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   return js_obj_value(fd);
 }
 
-/* ------------------------------------------------------- HTMLFormElement ---
- * form.submit() navigates without firing 'submit'; requestSubmit() fires it
- * first (and honors an optional submitter's formaction/formmethod). Both defer
- * to the worker's browser_form_submit, which builds the GET query / POST body.
- */
+/* ------------------------------------------------------- HTMLFormElement --- */
 static js_value form_submit(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -2554,8 +2395,7 @@ static js_value form_request_submit(js_ctx *ctx, js_value t, js_value *args, int
     browser_form_submit(n, 1);
   return js_undef();
 }
-/* form.elements: a fresh array of the form's listed controls, also keyed by
- * each control's name/id for named access (form.elements.foo). */
+/* form.elements: a fresh array of the form's listed controls */
 static void fe_collect(js_ctx *ctx, struct dom_node *n, js_object *arr)
 {
   for (struct dom_node *c = n->first_child; c; c = c->next) {
@@ -2619,10 +2459,7 @@ static void url_parts(const char *abs, const char **path_s, const char **path_e,
   *frag = (*p == '#') ? p : 0;
 }
 
-/* Populate `o` with the WHATWG URL component properties of absolute URL `abs`
- * (href/protocol/host/hostname/port/pathname/search/hash/origin +
- * searchParams). Shared by the URL constructor and window.location. Bad URLs
- * yield blank parts. */
+/* Populate `o` with the WHATWG URL component properties of absolute URL `abs` */
 static void fill_url_props(js_ctx *ctx, js_object *o, const char *abs)
 {
   char protocol[16], host[URL_HOST_MAX + 8], port[12], origin[URL_HOST_MAX + 24];
@@ -2704,9 +2541,7 @@ static void fill_url_props(js_ctx *ctx, js_object *o, const char *abs)
   gc_pop_scope();
 }
 
-/* Anchor (and any href-bearing element) URL decomposition: .protocol/.host/
- * .hostname/.port/.pathname/.search/.hash/.origin, computed from the element's
- * href resolved against the page URL (read-only — the common DOM use). */
+/* Anchor (and any href-bearing element) URL decomposition */
 enum { AURL_PROTOCOL, AURL_HOSTNAME, AURL_PORT, AURL_HOST, AURL_ORIGIN, AURL_PATHNAME, AURL_SEARCH, AURL_HASH };
 static js_value anchor_url_part(js_ctx *ctx, js_value t, int part)
 {
@@ -2829,14 +2664,7 @@ static js_value url_tostring(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_get(ctx, t, "href");
 }
 
-/* ------------------------------------------------------- DOM events -------- *
- * Listeners are stored on the target object (a node wrapper, the document, or
- * window) under a hidden own "@ev" array of {type, fn, capture} records.
- * Dispatch walks the node's ancestor chain to build the propagation path, then
- * runs the capture phase (outermost -> target), the target, and the bubble
- * phase (target -> outermost), honouring stopPropagation/preventDefault. The
- * whole thing runs on the worker thread (the only thread that touches the
- * engine). */
+/* ------------------------------------------------------- DOM events -------- */
 
 static js_value report_exc_v(js_ctx *ctx); /* fwd: defined with the runner below */
 static void js_set_event_script(const char *type);
@@ -2861,9 +2689,7 @@ static js_object *listeners_of(js_object *target, int create)
 
 int ev_flag(js_value ev, const char *k) { return js_to_boolean(js_get(g_ctx, ev, k)); }
 
-/* Invoke the listeners on `obj` whose capture flag equals `want_capture` and
- * whose type matches the event's. currentTarget is set to `obj` for the
- * duration. */
+/* Invoke the listeners on `obj` whose capture flag equals `want_capture` and whose type matches the */
 void ev_fire_on(js_object *obj, js_value ev, int want_capture)
 {
   js_object *list = listeners_of(obj, 0);
@@ -2894,10 +2720,7 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
     if (g_ctx->has_exc)
       report_exc_v(g_ctx);
   }
-  /* on<type> property handler (onload/onclick/onchange/…): a plain callable
-   * property, fired in the non-capture phase alongside addEventListener
-   * listeners. Many pages wire their entry point via `onload = fn` (a
-   * property), not addEventListener — without this it never runs. */
+  /* on<type> property handler (onload/onclick/onchange/…): a plain callable property */
   if (!want_capture && evty.type == JV_STR && evty.u.str->len > 0 && evty.u.str->len < 40) {
     char onname[48];
     int k = 0;
@@ -2919,8 +2742,7 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
   gc_pop_scope();
 }
 
-/* Dispatch `ev` starting at wrapper `startobj` (its host node anchors the
- * path). Returns 1 if a listener called preventDefault. */
+/* Dispatch `ev` starting at wrapper `startobj` (its host node anchors the path) */
 static bool dispatch_from(js_object *startobj, js_value ev)
 {
   js_object *path[128];
@@ -2951,7 +2773,7 @@ static bool dispatch_from(js_object *startobj, js_value ev)
     ev_fire_on(path[0], ev, 0);
   } /* target */
   for (i = 1; i < np && !ev_flag(ev, "@sp"); i++)
-    ev_fire_on(path[i], ev, 0); /* bubble  */
+    ev_fire_on(path[i], ev, 0); /* bubble */
 
   gc_pop_scope();
   return ev_flag(ev, "@dp");
@@ -2976,9 +2798,7 @@ static js_value ev_stop(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* Build an Event object on g_event_proto. `init` (or undefined) supplies
- * bubbles/ cancelable/detail when present (CustomEvent / new Event(type,
- * init)). */
+/* Build an Event object on g_event_proto */
 js_value make_event(const char *type, int x, int y, js_value init)
 {
   js_object *e;
@@ -3098,9 +2918,7 @@ static js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc
   return make_event(arg_str(ctx, A(0)), 0, 0, A(1));
 }
 
-/* The init-dict fields carried by the Event subclasses (UIEvent/MouseEvent/
- * KeyboardEvent/WheelEvent/...). Each has the same name on the event object, so
- * event_sub_ctor overlays whichever the caller supplied onto the base Event. */
+/* The init-dict fields carried by the Event subclasses */
 static const char *const k_event_init_keys[] = {
     "view",      "detail",      "clientX",       "clientY",   "screenX", "screenY", "pageX",
     "pageY",     "movementX",   "movementY",     "button",    "buttons", "ctrlKey", "shiftKey",
@@ -3109,10 +2927,7 @@ static const char *const k_event_init_keys[] = {
     "pointerId", "pointerType", "pressure",      "isPrimary", "data",
 };
 
-/* Constructor shared by every Event subclass. It builds a base Event,
- * re-parents it to the subclass prototype (carried in fn->data) so instanceof
- * reflects the concrete interface, then overlays the interface-specific
- * init-dict fields. */
+/* Constructor shared by every Event subclass */
 static js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   js_value ev = make_event(arg_str(ctx, A(0)), 0, 0, A(1));
@@ -3137,9 +2952,7 @@ static js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
   return ev;
 }
 
-/* C entry: the worker resolved a content click to `target`; fire `type` on it.
- * Returns 1 if a listener called preventDefault (so navigation is suppressed).
- */
+/* C entry: the worker resolved a content click to `target`; fire `type` on it */
 int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int y)
 {
   js_value tgt, ev;
@@ -3163,14 +2976,7 @@ int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int 
 
 int js_has_listeners(void) { return g_page_live && g_has_listeners; }
 
-/* ------------------------------------------------------- web components ---- *
- * customElements.define(name, class) registers a tag; HTMLElement is the base a
- * custom class extends. Upgrading a node means pointing its wrapper's prototype
- * at the class's, running the constructor ON that wrapper (the engine inits
- * fields + runs super() on the given `this`), then firing connectedCallback
- * when it's in the tree. Existing matching nodes upgrade at define time;
- * createElement upgrades a defined tag; appendChild fires connectedCallback as
- * nodes connect. */
+/* ------------------------------------------------------- web components ---- */
 
 static js_value htmlelement_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
@@ -3217,8 +3023,7 @@ static void ce_call_cb(js_object *w, const char *cb, js_value *args, int n)
   gc_pop_scope();
 }
 
-/* Upgrade `n` to its custom class `cls`: retarget the wrapper's prototype and
- * run the constructor on it. Idempotent. Does not fire connectedCallback. */
+/* Upgrade `n` to its custom class `cls` */
 static void ce_upgrade_node(struct dom_node *n, js_value cls)
 {
   js_object *w;
@@ -3243,9 +3048,7 @@ static void ce_upgrade_node(struct dom_node *n, js_value cls)
   if (g_ctx->has_exc)
     report_exc_v(g_ctx);
   gc_pop_scope();
-  /* spec order: after the constructor, attributeChangedCallback for each
-   * observed attribute already present (ce_attr_changed filters to the observed
-   * set). */
+  /* spec order: after the constructor */
   {
     struct dom_attr *a;
     for (a = n->attrs; a; a = a->next)
@@ -3280,8 +3083,7 @@ static void ce_upgrade_tree(struct dom_node *root, const char *name, js_value cl
   }
 }
 
-/* setAttribute hook: fire attributeChangedCallback for an observed attribute.
- */
+/* setAttribute hook: fire attributeChangedCallback for an observed attribute */
 static void ce_attr_changed(struct dom_node *n, const char *name, const char *oldv, const char *newv)
 {
   js_object *w = n ? (js_object *)n->wrapper : 0;
@@ -3352,19 +3154,11 @@ static js_value ce_when_defined(js_ctx *ctx, js_value t, js_value *args, int arg
   return js_promise_resolved(ctx, js_undef());
 }
 
-/* ------------------------------------------------------- ES modules -------- *
- * The engine calls browser_load_module() for `import` (static + dynamic). It
- * resolves the specifier against the importing module (or the page), fetches
- * the source over the same batch path scripts/CSS use, parses + executes it
- * ONCE in a module scope, and caches the namespace by absolute URL. Synchronous
- * — which fits the engine's no-event-loop model; dynamic import() just wraps
- * the result in an already-settled Promise. Only URL-like specifiers resolve
- * (no import maps). */
+/* ------------------------------------------------------- ES modules -------- */
 
 static js_value report_exc_v(js_ctx *ctx); /* (defined with the runner below) */
 
-/* Keep a parsed script's arena alive for the page (closures reference its AST).
- * The list grows on demand — a page may load any number of scripts/modules. */
+/* Keep a parsed script's arena alive for the page (closures reference its AST) */
 int arenas_push(js_arena *ar)
 {
   if (g_narenas == g_arenas_cap) {
@@ -3379,8 +3173,7 @@ int arenas_push(js_arena *ar)
   return 1;
 }
 
-/* Append a ":line:col" (or ":line") source position to `sb`, for SyntaxError
- * reports. Nothing is written when the parser gave no line. */
+/* Append a ":line:col" (or ":line") source position to `sb`, for SyntaxError reports */
 static void sb_put_pos(sbuf *sb, int line, int col)
 {
   char n[16];
@@ -3435,8 +3228,7 @@ static js_node *module_compile(const char *code, const char *url)
   return prog;
 }
 
-/* True if the identifier word `w` (with a word boundary before it) ends at `q`,
- * skipping whitespace — used to spot `from '…'` / `import '…'` specifiers. */
+/* True if the identifier word `w` (with a word boundary before it) ends at `q` */
 static char *sdup(const char *s); /* defined below */
 static bool mod_word_before(const char *src, const char *q, const char *w)
 {
@@ -3457,13 +3249,7 @@ static bool mod_word_before(const char *src, const char *q, const char *w)
   return true;
 }
 
-/* Scan a module's source for its static import specifiers and batch-fetch the
- * uncached ones in ONE parallel g_fetch (multiplexed like stylesheets), caching
- * the sources in g_module_src. This turns a deep import graph from N serial
- * fetches into breadth-first parallel ones. Best-effort: a missed or spurious
- * hit just yields a serial fetch (or a wasted one) at import time — the
- * loader's own fetch fallback keeps it correct regardless of what the scan
- * finds. */
+/* Scan a module's source for its static import specifiers and batch-fetch the uncached ones in ONE */
 #define MODULE_PREFETCH_MAX 192
 static void module_prefetch_deps(const char *base, const char *src)
 {
@@ -3544,8 +3330,7 @@ static js_object *browser_load_module(js_ctx *ctx, const char *spec, void *ud)
   if (cached && cached->value.type == JV_OBJ)
     return cached->value.u.obj;
 
-  /* source: use the prefetched copy (batched with its siblings) if present,
-   * else fall back to a serial fetch. */
+  /* source: use the prefetched copy (batched with its siblings) if present */
   srcent = pmap_find_pub(g_module_src, abs);
   if (srcent && srcent->value.type == JV_STR) {
     int L = srcent->value.u.str->len;
@@ -3607,9 +3392,7 @@ void def_acc(js_object *proto, const char *name, js_native get, js_native set)
 
 /* ------------------------------------------------------- timers ----------- */
 
-/* Register a timer; returns its id (slot+1), or 0 if the table is full or the
- * callback isn't callable. `raf` requests requestAnimationFrame semantics (the
- * callback is invoked with a single timestamp argument). */
+/* Register a timer; returns its id (slot+1) */
 static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int delay, bool repeat, bool raf)
 {
   int i, k;
@@ -3633,7 +3416,7 @@ static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int 
   gc_push_scope();
   {
     js_object *bundle = (js_object *)gc_keep(js_new_array(ctx, 0));
-    js_array_push(ctx, bundle, cb); /* [0] = callback           */
+    js_array_push(ctx, bundle, cb); /* [0] = callback */
     for (k = 0; k < nextra; k++)
       js_array_push(ctx, bundle, extra[k]); /* [1..] args */
     js_set_index(ctx, js_obj_value(g_timers), (unsigned)i, js_obj_value(bundle));
@@ -3688,9 +3471,7 @@ static js_value win_clear_timer(js_ctx *ctx, js_value t, js_value *args, int arg
   return js_undef();
 }
 
-/* Fire every timer whose deadline has passed. Called by the worker each idle
- * tick (browser engine is worker-only). Returns the number of callbacks fired
- * so the caller can repaint/relayout if any of them mutated the DOM. */
+/* Fire every timer whose deadline has passed */
 int js_timers_pump(void)
 {
   int i, fired = 0;
@@ -3743,14 +3524,7 @@ int js_timers_pump(void)
   return fired;
 }
 
-/* ------------------------------------------------------- AbortController -- *
- * AbortController/AbortSignal (DOM standard). A signal is a plain EventTarget
- * on g_abortsignal_proto, so addEventListener/removeEventListener/dispatchEvent
- * come from the shared @ev listener API. abort() flips `aborted`, records
- * `reason`, and fires "abort" exactly once (onabort handler + listeners).
- * fetch() consults an already-aborted signal up front and rejects with the
- * reason — the request runs synchronously on the worker, so there is no
- * mid-flight cancellation point. */
+/* ------------------------------------------------------- AbortController -- */
 
 /* A fresh, not-yet-aborted AbortSignal. */
 static js_object *new_abort_signal(js_ctx *ctx)
@@ -3762,8 +3536,7 @@ static js_object *new_abort_signal(js_ctx *ctx)
   return s;
 }
 
-/* Abort `signal` with `reason` (an AbortError when none is given), once: set
- * the state then fire "abort" at the onabort handler and any listeners. */
+/* Abort `signal` with `reason` (an AbortError when none is given), once */
 static void signal_abort(js_ctx *ctx, js_object *signal, js_value reason)
 {
   js_value ev, h;
@@ -3804,8 +3577,7 @@ static js_value sig_throw_if_aborted(js_ctx *ctx, js_value t, js_value *args, in
   return js_undef();
 }
 
-/* AbortSignal is not directly constructable; use AbortSignal.abort()/.timeout()
- * or an AbortController's `.signal`. */
+/* AbortSignal is not directly constructable */
 static js_value abortsignal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   (void)thisv;
@@ -3856,15 +3628,8 @@ static js_value ctrl_abort(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* ------------------------------------------------- RTCPeerConnection -------
- */
-/* OwOS has no WebRTC/ICE stack. Sites `new` RTCPeerConnection to
- * feature-detect, probe for local IPs, or start a video call; a missing
- * constructor makes the
- * `||` vendor-prefix chain resolve to undefined and `new undefined()` aborts
- * the page with "value is not a constructor". This inert stub lets those
- * scripts run to completion — no ICE candidate is ever emitted, so nothing is
- * gathered. */
+/* ------------------------------------------------- RTCPeerConnection ------- */
+/* OwOS has no WebRTC/ICE stack. Sites `new` RTCPeerConnection to feature-detect */
 
 static js_value rtc_noop(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -3896,10 +3661,7 @@ static js_value rtc_create_data_channel(js_ctx *ctx, js_value t, js_value *args,
   return rv;
 }
 
-/* createOffer/createAnswer: the legacy (successCb, failureCb) form stays inert
- * — never invoking the callback means no description is applied and no
- * candidates gather. The modern promise form resolves with an empty session
- * description the page can hand to setLocalDescription. */
+/* createOffer/createAnswer: the legacy (successCb */
 static js_value rtc_offer_like(js_ctx *ctx, js_value *args, int argc, const char *type)
 {
   js_object *o;
@@ -3925,9 +3687,7 @@ static js_value rtc_create_answer(js_ctx *ctx, js_value t, js_value *args, int a
   return rtc_offer_like(ctx, args, argc, "answer");
 }
 
-/* setLocalDescription/setRemoteDescription/addIceCandidate: inert for the
- * legacy (desc, successCb, failureCb) form; a resolved promise for the modern
- * form. */
+/* setLocalDescription/setRemoteDescription/addIceCandidate: inert for the legacy */
 static js_value rtc_set_desc(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
@@ -3979,18 +3739,11 @@ static js_value rtc_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 }
 
 /* ------------------------------------------------------- WebSocket -------- */
-/* A WebSocket wrapper's `host` slot points at the ws_conn (NULL once closed or
- * if the connect failed). Every wrapper is pinned in g_websockets so it stays
- * GC-live and the pump can reach it. The library blocks only for the connect +
- * handshake (in the constructor, on the worker thread — same as fetch); after
- * that the socket is polled non-blocking by js_websockets_pump each idle tick,
- * which turns inbound frames into open/message/close/error events. */
+/* A WebSocket wrapper's `host` slot points at the ws_conn */
 
 static ws_conn *ws_of(js_value t) { return (t.type == JV_OBJ) ? (ws_conn *)t.u.obj->host : 0; }
 
-/* Fire a non-bubbling `type` event on a target object: its on<type> handler
- * property and any addEventListener listeners. For "message", `data` becomes
- * event.data. Shared by WebSocket, XMLHttpRequest, AbortSignal. */
+/* Fire a non-bubbling `type` event on a target object */
 void emit_event(js_object *w, const char *type, js_value data)
 {
   js_value ev;
@@ -4112,7 +3865,7 @@ static js_value ws_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   js_def(o, "onclose", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(o, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(o, "@open_sent", js_bool(0), P_WRITABLE);    /* "open" delivered (pump) */
-  js_def(o, "@dead", js_bool(c ? 0 : 1), P_WRITABLE); /* connect failed: emit error*/
+  js_def(o, "@dead", js_bool(c ? 0 : 1), P_WRITABLE); /* connect failed: emit error */
   if (g_websockets)
     js_array_push(ctx, g_websockets, js_obj_value(o));
   ov = js_obj_value(o);
@@ -4120,9 +3873,7 @@ static js_value ws_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   return ov;
 }
 
-/* Drive every live WebSocket: deliver the deferred "open", drain inbound
- * messages, and surface a close/error. Returns the number of events fired so
- * the worker can relayout/repaint when a handler mutated the DOM. */
+/* Drive every live WebSocket: deliver the deferred "open", drain inbound messages */
 int js_websockets_pump(void)
 {
   int fired = 0;
@@ -4186,18 +3937,9 @@ int js_websockets_pump(void)
   return fired;
 }
 
-/* ------------------------------------------------------- BroadcastChannel - *
- * Same-context BroadcastChannel: every open channel is pinned in g_bchannels;
- * postMessage delivers a MessageEvent to every OTHER open channel sharing the
- * name (never back to the sender, per spec). Cross-process delivery is out of
- * scope — one page's JS context is the whole "bus". Delivery is synchronous:
- * the engine has no event loop, matching how WebSocket/XHR events are fired.
- * A closed channel stays in the array (filtered by @closed at post time), the
- * same convention g_websockets uses for dead sockets. */
+/* ------------------------------------------------------- BroadcastChannel - */
 
-/* A MessageEvent over the shared Event.prototype (so
- * preventDefault/stopPropagation exist), carrying the standard message fields.
- * `origin` is the page's origin. */
+/* A MessageEvent over the shared Event.prototype (so preventDefault/stopPropagation exist) */
 js_value make_message_event(js_value data)
 {
   js_object *e;
@@ -4226,9 +3968,7 @@ js_value make_message_event(js_value data)
   return js_obj_value(e);
 }
 
-/* Deliver a fresh message event to one receiving channel. ev_fire_on runs both
- * its addEventListener("message") listeners and the onmessage property handler.
- */
+/* Deliver a fresh message event to one receiving channel */
 static void bc_deliver(js_object *w, js_value data)
 {
   js_value ev;
@@ -4246,10 +3986,7 @@ static void bc_deliver(js_object *w, js_value data)
   gc_pop_scope();
 }
 
-/* postMessage(msg): fan out to every other open same-named channel. The payload
- * is passed by reference — the engine has no structuredClone for cross-channel
- * cloning here, so receivers share the sender's object (adequate for feature
- * detection and single-page use). */
+/* postMessage(msg): fan out to every other open same-named channel */
 static js_value bc_post_m(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value data = A(0), namev;
@@ -4316,10 +4053,81 @@ static js_value bchannel_ctor(js_ctx *ctx, js_value thisv, js_value *args, int a
   return ov;
 }
 
-/* --- navigator.geolocation ------------------------------------------------
- * Gated by PERM_GEOLOCATION. OwOS has no GPS, so a granted request still fails
- * the fix with POSITION_UNAVAILABLE; a denied one reports PERMISSION_DENIED —
- * both spec-correct outcomes routed to the error callback. */
+/* --- navigator.userAgentData ---------------------------------------------- */
+static js_value uad_brands(js_ctx *ctx, const struct ch_brand *b)
+{
+  js_object *arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (int i = 0; i < CH_NBRANDS; i++) {
+    js_object *o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_def(o, "brand", js_mk_cstring(ctx, b[i].brand), P_ENUMERABLE);
+    js_def(o, "version", js_mk_cstring(ctx, b[i].version), P_ENUMERABLE);
+    js_array_push(ctx, arr, js_obj_value(o));
+  }
+  return js_obj_value(arr);
+}
+
+static void uad_low_entropy(js_ctx *ctx, js_object *o)
+{
+  js_def(o, "brands", uad_brands(ctx, ch_ua.brands), P_ENUMERABLE);
+  js_def(o, "mobile", js_bool(ch_ua.mobile), P_ENUMERABLE);
+  js_def(o, "platform", js_mk_cstring(ctx, ch_ua.platform), P_ENUMERABLE);
+}
+
+static js_value uad_tojson(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value rv;
+  (void)t;
+  (void)args;
+  (void)argc;
+  gc_push_scope();
+  js_object *o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  uad_low_entropy(ctx, o);
+  rv = js_obj_value(o);
+  gc_pop_scope();
+  return rv;
+}
+
+/* getHighEntropyValues(hints) -> Promise of the low-entropy values plus each requested hint */
+static js_value uad_high_entropy(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value hints = A(0), rv;
+  (void)t;
+  if (hints.type != JV_OBJ)
+    return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError",
+                                                  "getHighEntropyValues requires a sequence of hints"));
+  gc_push_scope();
+  gc_keep(hints.u.obj);
+  js_object *o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  uad_low_entropy(ctx, o);
+  unsigned n = (unsigned)js_to_number(ctx, js_get(ctx, hints, "length"));
+  for (unsigned i = 0; i < n; i++) {
+    const char *h = arg_str(ctx, js_get_index(ctx, hints, i));
+    if (streq(h, "architecture"))
+      js_def(o, h, js_mk_cstring(ctx, ch_ua.architecture), P_ENUMERABLE);
+    else if (streq(h, "bitness"))
+      js_def(o, h, js_mk_cstring(ctx, ch_ua.bitness), P_ENUMERABLE);
+    else if (streq(h, "model"))
+      js_def(o, h, js_mk_cstring(ctx, ch_ua.model), P_ENUMERABLE);
+    else if (streq(h, "platformVersion"))
+      js_def(o, h, js_mk_cstring(ctx, ch_ua.platform_version), P_ENUMERABLE);
+    else if (streq(h, "uaFullVersion"))
+      js_def(o, h, js_mk_cstring(ctx, ch_ua.full_version), P_ENUMERABLE);
+    else if (streq(h, "fullVersionList"))
+      js_def(o, h, uad_brands(ctx, ch_ua.full_brands), P_ENUMERABLE);
+    else if (streq(h, "wow64"))
+      js_def(o, h, js_bool(ch_ua.wow64), P_ENUMERABLE);
+    else if (streq(h, "formFactors")) {
+      js_object *ff = (js_object *)gc_keep(js_new_array(ctx, 0));
+      js_array_push(ctx, ff, js_mk_cstring(ctx, ch_ua.form_factor));
+      js_def(o, h, js_obj_value(ff), P_ENUMERABLE);
+    }
+  }
+  rv = js_promise_resolved(ctx, js_obj_value(o));
+  gc_pop_scope();
+  return rv;
+}
+
+/* --- navigator.geolocation ------------------------------------------------ */
 static js_value geo_error_obj(js_ctx *ctx, int code, const char *msg)
 {
   js_object *e = js_new_object(ctx, ctx->object_proto);
@@ -4352,12 +4160,10 @@ static js_value geo_get_current(js_ctx *ctx, js_value t, js_value *args, int arg
 static js_value geo_watch(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   geo_get_current(ctx, t, args, argc); /* one fix attempt, same as a single call */
-  return js_number(1);                 /* a watch id; clearWatch is a no-op       */
+  return js_number(1);                 /* a watch id; clearWatch is a no-op */
 }
 
-/* --- navigator.mediaDevices.getUserMedia ----------------------------------
- * Gated by PERM_CAMERA (video) + PERM_MICROPHONE (audio): a denied feature ->
- * NotAllowedError; all granted but no capture hardware -> NotFoundError. */
+/* --- navigator.mediaDevices.getUserMedia ---------------------------------- */
 static js_value md_get_user_media(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value c = A(0);
@@ -4391,9 +4197,7 @@ static js_value md_enumerate(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_promise_resolved(ctx, js_obj_value(js_new_array(ctx, 0))); /* no devices */
 }
 
-/* --- navigator.permissions.query ------------------------------------------
- * Reports the remembered state, never prompts (per spec). Unknown feature names
- * resolve "prompt" (clipboard is granted — the browser backs it). */
+/* --- navigator.permissions.query ------------------------------------------ */
 static js_value perm_query(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value d = A(0), rv;
@@ -4420,12 +4224,9 @@ static js_value perm_query(js_ctx *ctx, js_value t, js_value *args, int argc)
   return rv;
 }
 
-/* ------------------------------------------------------- crypto ----------- *
- * crypto.getRandomValues / crypto.randomUUID over the shared userspace CSPRNG
- * (rng_bytes in the libc: RDRAND directly, no kernel trap). */
+/* ------------------------------------------------------- crypto ----------- */
 
-/* Fill an integer TypedArray's backing bytes in place; returns the same array.
- */
+/* Fill an integer TypedArray's backing bytes in place; returns the same array */
 static js_value crypto_getrandomvalues(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value v = A(0);
@@ -4471,13 +4272,7 @@ static js_value crypto_randomuuid(js_ctx *ctx, js_value t, js_value *args, int a
   return js_mk_cstring(ctx, s);
 }
 
-/* ------------------------------------------------------- XMLHttpRequest ---- *
- * The classic XHR transport, over the same synchronous browser_cors_fetch path
- * as fetch() (the engine has no event loop). open() records the verb/URL; each
- * setRequestHeader() appends to a header blob; send() runs the request to
- * completion, then walks readyState 1->2->3->4 firing readystatechange + the
- * load/error/loadend events. So even "async" XHR settles within send(), which
- * suits a page's settle-immediately expectations here. */
+/* ------------------------------------------------------- XMLHttpRequest ---- */
 
 static js_value xhr_open(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -4682,8 +4477,7 @@ static js_value xhr_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 
 /* ------------------------------------------------------- Blob + sendBeacon */
 
-/* Append the raw bytes of one Blob "part" (string, ArrayBuffer, TypedArray,
- * Blob, else its String() form) to `sb`. */
+/* Append the raw bytes of one Blob "part" */
 static void blob_append_part(js_ctx *ctx, sbuf *sb, js_value v)
 {
   if (v.type == JV_STR) {
@@ -4815,10 +4609,7 @@ static js_value blob_slice(js_ctx *ctx, js_value t, js_value *args, int argc)
   return make_blob(ctx, b.u.str->data + s, e - s, type);
 }
 
-/* Extract the request bytes + a default content-type from a body value (string,
- * Blob, ArrayBuffer/TypedArray, URLSearchParams). `ctype` is left untouched
- * when the body implies none. Bytes point into a GC object the caller must
- * keep. */
+/* Extract the request bytes + a default content-type from a body value */
 static const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap)
 {
   if (v.type == JV_STR) {
@@ -4854,8 +4645,7 @@ static const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, in
       *len = s.type == JV_STR ? s.u.str->len : 0;
       return s.type == JV_STR ? s.u.str->data : "";
     }
-    /* FormData: no file input here, so serialize as urlencoded rather than
-     * multipart. */
+    /* FormData: no file input here, so serialize as urlencoded rather than multipart */
     if (o->proto == g_formdata_proto) {
       js_value s = sp_tostring(ctx, v, 0, 0);
       if (ctype && !ctype[0])
@@ -4868,8 +4658,7 @@ static const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, in
   return "";
 }
 
-/* navigator.sendBeacon(url, data) -> boolean. A fire-and-forget POST (the
- * response is discarded). Runs synchronously on the worker like fetch/XHR. */
+/* navigator.sendBeacon(url, data) -> boolean */
 static js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   char url[URL_MAX], ctype[160];
@@ -4921,9 +4710,7 @@ static bool clip_mime_is_text(const char *m)
   return m[0] == 't' && m[1] == 'e' && m[2] == 'x' && m[3] == 't' && m[4] == '/';
 }
 
-/* Resolve a ClipboardItem entry (a Blob, a string, or a settled Promise of
- * either) to its raw bytes. Returns the backing js_string (caller keeps it via
- * the GC scope) and copies the entry's MIME into `type` when it carries one. */
+/* Resolve a ClipboardItem entry (a Blob, a string, or a settled Promise of either) to its raw bytes */
 static js_string *clip_entry_bytes(js_ctx *ctx, js_value v, char *type, int tcap)
 {
   js_value settled;
@@ -4941,8 +4728,7 @@ static js_string *clip_entry_bytes(js_ctx *ctx, js_value v, char *type, int tcap
   }
 }
 
-/* new ClipboardItem({ "text/plain": blobOrString, ... }) — keeps the dictionary
- * verbatim (@data) so getType() can hand back each representation lazily. */
+/* new ClipboardItem({ "text/plain": blobOrString, ... }), keeps the dictionary verbatim */
 static js_value clipitem_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   js_object *o, *types, *dict;
@@ -4989,8 +4775,7 @@ static js_value clipitem_gettype(js_ctx *ctx, js_value t, js_value *args, int ar
   }
 }
 
-/* ClipboardItem.supports(type) — the formats the clipboard server round-trips.
- */
+/* ClipboardItem.supports(type), the formats the clipboard server round-trips */
 static js_value clipitem_supports(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   const char *m = arg_str(ctx, A(0));
@@ -5010,8 +4795,7 @@ static js_value clip_writetext(js_ctx *ctx, js_value t, js_value *args, int argc
   return js_promise_resolved(ctx, js_undef());
 }
 
-/* navigator.clipboard.readText() -> Promise<string> of the newest text clip
- * (empty string when the clipboard holds no text, mirroring real browsers). */
+/* navigator.clipboard.readTex */
 static js_value clip_readtext(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   char mime[64];
@@ -5029,10 +4813,7 @@ static js_value clip_readtext(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_promise_resolved(ctx, rv);
 }
 
-/* navigator.clipboard.write([ClipboardItem,...]) -> Promise<undefined>. The
- * kernel clipboard stores one blob per clip, so we write a single
- * representation per item — text/plain when offered (best cross-app paste),
- * else the item's first format. */
+/* navigator.clipboard.write([ClipboardItem,...]) -> Promise<undefined>. The kernel clipboard stores */
 static js_value clip_write(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value items = A(0), item, data, entry;
@@ -5110,9 +4891,7 @@ static js_value clip_read(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_promise_resolved(ctx, rv);
 }
 
-/* The DOM `Node` interface: not constructable, but exposed for the `Node.*`
- * nodeType constants and `x instanceof Node` (feature-detected by many libs).
- */
+/* The DOM `Node` interface: not constructable */
 static js_value node_ctor(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)ctx;
@@ -5137,11 +4916,7 @@ static void def_node_consts(js_object *o)
   js_def(o, "NOTATION_NODE", js_number(12), 0);
 }
 
-/* --- CSSStyleDeclaration: generic property access backed by the element's
- * style="" attribute. One getter/setter template, bound via fn->data to each
- * property's CSS name, so `prop in style`, `style[prop]`, `style[prop]=v` and
- * `style.length` behave like a real CSSStyleDeclaration for the standard set
- * (feature-detection libs like css3test's Supports rely on exactly this). */
+/* --- CSSStyleDeclaration: generic property access backed by the element's */
 static js_value style_gen_get(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value d = ctx->native_data;
@@ -5224,10 +4999,7 @@ static void def_style_prop(const char *jsName)
   }
   gc_pop_scope();
 }
-/* The standard CSS property set exposed on CSSStyleDeclaration (camelCase). Not
- * exhaustive, but broad enough that `prop in style` answers correctly for the
- * common properties; the ~16 with layout-specific accessors are refined below.
- */
+/* The standard CSS property set exposed on CSSStyleDeclaration (camelCase) */
 static const char *const k_css_props[] = {
     "alignContent",
     "alignItems",
@@ -5455,9 +5227,7 @@ static const char *const k_css_props[] = {
     "zIndex",
 };
 
-/* Web Storage (localStorage/sessionStorage): in-memory only — not persisted
- * across reloads, but enough for pages that stash a preference (items live in a
- * hidden "@items" backing object). getItem returns null for a missing key. */
+/* Web Storage (localStorage/sessionStorage): in-memory only, not persisted across reloads */
 static js_value storage_getitem(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value items = js_get(ctx, t, "@items"), v;
@@ -5504,10 +5274,7 @@ static js_value make_storage(js_ctx *ctx)
   return js_obj_value(s);
 }
 
-/* CSS.supports(): recognise a property by name (values aren't validated — we
- * report a known property as supported, matching the style-object behaviour).
- * `selector(...)` conditions report false (no selector-support detection yet).
- */
+/* CSS.supports(): recognise a property by name */
 static bool ci_has(const char *hay, const char *needle); /* defined below */
 static void css_norm(const char *s, char *out, int cap)
 {
@@ -5564,10 +5331,7 @@ static js_value css_supports(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
 }
 
-/* Expose a DOM interface constructor `name` on the global, wired to `proto`:
- * name.prototype === proto and proto.constructor === name. The body is the
- * no-op HTMLElement base ctor — only the prototype chain matters for
- * reference/instanceof. */
+/* Expose a DOM interface constructor `name` on the global, wired to `proto` */
 void define_iface(js_ctx *ctx, js_object *win, const char *name, js_object *proto)
 {
   js_object *ctor = js_new_native(ctx, htmlelement_ctor, name, 0);
@@ -5652,20 +5416,14 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   gc_add_root((void **)&g_timers);
   js_set_module_loader(ctx, browser_load_module, 0);
 
-  /* The document IS the root node's wrapper, so events bubbling to the top
-   * reach document.addEventListener handlers, and node.parentNode chains
-   * terminate at `document`. (window/global is appended past it during
-   * dispatch.) */
+  /* The document IS the root node's wrapper */
   g_document->host = g_doc_root;
   if (g_doc_root)
     g_doc_root->wrapper = g_document;
   dom_on_free_wrapper = wrapper_detach;
 
-  /* CSSStyleDeclaration-lite: accessors + methods over the style="" attribute
-   */
-  /* Full standard CSS property set (generic style-attr backed accessors) +
-   * length, so `prop in style` / `style[prop]` / `style.length` work. The
-   * layout-specific accessors below then refine the handful that matter. */
+  /* CSSStyleDeclaration-lite: accessors + methods over the style="" attribute */
+  /* Full standard CSS property set (generic style-attr backed accessors) + length */
   for (unsigned pi = 0; pi < sizeof k_css_props / sizeof k_css_props[0]; pi++)
     def_style_prop(k_css_props[pi]);
   def_acc(g_style_proto, "length", style_gen_length, 0);
@@ -5776,8 +5534,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   setup_media_proto(ctx);  /* HTMLMediaElement props/methods + the Audio ctor */
   setup_remote_proto(ctx); /* RemotePlayback (media.remote) methods + events */
 
-  /* document: methods on the shared proto so DOMParser documents inherit them
-   * (they're root-relative — they query whichever document is `this`). */
+  /* document: methods on the shared proto so DOMParser documents inherit them */
   def_method(g_document_proto, "getElementById", doc_get_by_id, 1);
   def_method(g_document_proto, "getElementsByTagName", doc_get_by_tag, 1);
   def_method(g_document_proto, "querySelector", doc_query, 1);
@@ -5897,6 +5654,14 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
       def_method(perm, "query", perm_query, 1);
       js_def(nav, "permissions", js_obj_value(perm), P_ENUMERABLE);
     }
+    if (ch_secure_url(page_url)) {
+      js_object *uad = js_new_object(ctx, ctx->object_proto); /* NavigatorUAData: secure contexts only */
+      gc_keep(uad);
+      uad_low_entropy(ctx, uad);
+      def_method(uad, "getHighEntropyValues", uad_high_entropy, 1);
+      def_method(uad, "toJSON", uad_tojson, 0);
+      js_def(nav, "userAgentData", js_obj_value(uad), P_ENUMERABLE);
+    }
     js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
@@ -5915,8 +5680,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "screen", js_obj_value(scr), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
-  /* ClipboardItem (window global) — pairs with navigator.clipboard.read/write
-   */
+  /* ClipboardItem (window global), pairs with navigator.clipboard.read/write */
   {
     js_object *cic;
     g_clipitem_proto = js_new_object(ctx, ctx->object_proto);
@@ -5930,8 +5694,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "ClipboardItem", js_obj_value(cic), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
-  /* crypto: getRandomValues (RDRAND-backed) + randomUUID. window.crypto and the
-   * bare `crypto` global resolve to the same object (window IS the global). */
+  /* crypto: getRandomValues (RDRAND-backed) + randomUUID. window.crypto and the bare `crypto` global */
   {
     js_object *cr = js_new_object(ctx, ctx->object_proto);
     gc_push_scope();
@@ -5968,8 +5731,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     gc_pop_scope();
   }
 
-  /* FormData — a name/value multimap over the same @k/@v arrays as
-   * URLSearchParams, so it shares the sp_* accessors. */
+  /* FormData, a name/value multimap over the same @k/@v arrays as URLSearchParams */
   def_method(g_formdata_proto, "get", sp_get, 1);
   def_method(g_formdata_proto, "getAll", sp_get_all, 1);
   def_method(g_formdata_proto, "has", sp_has, 1);
@@ -5997,8 +5759,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     }
   }
 
-  /* DOM events: Event prototype, the Event/CustomEvent constructors, and the
-   * window-level listener API (document + element protos got theirs above). */
+  /* DOM events: Event prototype, the Event/CustomEvent constructors */
   def_method(g_event_proto, "preventDefault", ev_prevent, 0);
   def_method(g_event_proto, "stopPropagation", ev_stop, 0);
   def_method(g_event_proto, "stopImmediatePropagation", ev_stop, 0);
@@ -6012,20 +5773,16 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "CustomEvent", js_obj_value(ec), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
-  /* Event subclasses. Each gets a prototype chaining to its parent interface's
-   * (so `mouseEvent instanceof UIEvent` holds up the whole DOM event hierarchy)
-   * and a constructor sharing event_sub_ctor, with its prototype in fn->data.
-   */
+  /* Event subclasses. Each gets a prototype chaining to its parent interface's */
   {
     static const struct {
       const char *name;
       int parent;
     } subs[] = {
-        {"UIEvent", -1},   /* -> Event.prototype       */
-        {"MouseEvent", 0}, /* -> UIEvent.prototype     */
+        {"UIEvent", -1},   /* -> Event.prototype */
+        {"MouseEvent", 0}, /* -> UIEvent.prototype */
         {"KeyboardEvent", 0},    {"FocusEvent", 0},   {"InputEvent", 0},
-        {"CompositionEvent", 0}, {"PointerEvent", 1}, /* -> MouseEvent.prototype
-                                                       */
+        {"CompositionEvent", 0}, {"PointerEvent", 1}, /* -> MouseEvent.prototype */
         {"WheelEvent", 1},       {"DragEvent", 1},
     };
     js_object *protos[sizeof subs / sizeof subs[0]];
@@ -6049,15 +5806,14 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(win, "removeEventListener", el_remove_listener, 3);
   def_method(win, "dispatchEvent", el_dispatch, 1);
 
-  /* Web components: HTMLElement (the base custom classes extend) +
-   * customElements */
+  /* Web components: HTMLElement (the base custom classes extend) + customElements */
   {
     js_object *nc = js_new_native(ctx, node_ctor, "Node", 0);
     gc_push_scope();
     gc_keep(nc);
     js_def(nc, "prototype", js_obj_value(g_node_proto), 0);
     js_def(g_node_proto, "constructor", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
-    def_node_consts(nc);           /* Node.ELEMENT_NODE etc. (on the interface)  */
+    def_node_consts(nc);           /* Node.ELEMENT_NODE etc. (on the interface) */
     def_node_consts(g_node_proto); /* and inherited by instances (node.TEXT_NODE) */
     js_def(win, "Node", js_obj_value(nc), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
@@ -6078,14 +5834,9 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     gc_pop_scope();
   }
 
-  /* Standard DOM interface constructors (Element/Document, HTMLMediaElement and
-   * the HTMLxxxElement family) so pages can reference and extend them;
-   * wrap_node hands each element its matching prototype so `el instanceof
-   * HTMLScriptElement` holds. Every HTMLxxxElement.prototype chains to
-   * HTMLElement.prototype. */
+  /* Standard DOM interface constructors */
   {
-    /* Element/Document/HTMLMediaElement are the shared bases the family chains
-     * to (they map to no single tag, so they stay out of the registry). */
+    /* Element/Document/HTMLMediaElement are the shared bases the family chains to */
     define_iface(ctx, win, "Element", g_element_proto);
     define_iface(ctx, win, "Document", g_document_proto);
     define_iface(ctx, win, "HTMLMediaElement", g_media_proto);
@@ -6101,9 +5852,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
       gc_add_root((void **)&g_html_ifaces[i].proto);
       gc_pop_scope();
     }
-    /* Image is a global alias constructing an <img>; its prototype is
-     * HTMLImageElement.prototype so `new Image() instanceof HTMLImageElement`
-     * (and instanceof Image) both hold. */
+    /* Image is a global alias constructing an <img> */
     for (i = 0; i < sizeof g_html_ifaces / sizeof g_html_ifaces[0]; i++) {
       if (!streq(g_html_ifaces[i].name, "HTMLImageElement"))
         continue;
@@ -6124,8 +5873,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_response_proto, "clone", resp_clone, 0);
   def_method(win, "fetch", win_fetch, 2);
 
-  /* WebSocket (RFC 6455 over user/lib/websocket): live, driven by the worker's
-   * js_websockets_pump each idle tick. */
+  /* WebSocket (RFC 6455 over user/lib/websocket): live */
   def_method(g_ws_proto, "send", ws_send_m, 1);
   def_method(g_ws_proto, "close", ws_close_m, 2);
   def_method(g_ws_proto, "addEventListener", el_add_listener, 3);
@@ -6149,8 +5897,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     gc_pop_scope();
   }
 
-  /* BroadcastChannel: same-context message bus (postMessage fans out to other
-   * open same-named channels via the shared EventTarget machinery). */
+  /* BroadcastChannel: same-context message bus */
   def_method(g_bchannel_proto, "postMessage", bc_post_m, 1);
   def_method(g_bchannel_proto, "close", bc_close_m, 0);
   def_method(g_bchannel_proto, "addEventListener", el_add_listener, 3);
@@ -6235,10 +5982,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     gc_pop_scope();
   }
 
-  /* RTCPeerConnection: inert (no WebRTC/ICE in OwOS). Present under all vendor
-   * prefixes so IP-leak probes and video-chat feature detection run past
-   * `new RTCPeerConnection(...)` instead of throwing "not a constructor"; it
-   * simply never gathers ICE candidates. */
+  /* RTCPeerConnection: inert (no WebRTC/ICE in OwOS) */
   def_method(g_rtc_proto, "createDataChannel", rtc_create_data_channel, 1);
   def_method(g_rtc_proto, "createOffer", rtc_create_offer, 0);
   def_method(g_rtc_proto, "createAnswer", rtc_create_answer, 0);
@@ -6268,8 +6012,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     gc_pop_scope();
   }
 
-  /* history (SPA routers lean on it): inert but present so pushState/back don't
-   * throw. The page doesn't re-route, but its scripts run past these calls. */
+  /* history (SPA routers lean on it): inert but present so pushState/back don't throw */
   {
     js_object *hist = js_new_object(ctx, ctx->object_proto);
     gc_push_scope();
@@ -6336,17 +6079,13 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   def_acc(win, "scrollY", win_scrollY, 0);
   def_acc(win, "pageYOffset", win_scrollY, 0);
 
-  /* navigator.serviceWorker + caches + Response/Request; re-instates a
-   * controlling worker registered on a previous page (must run last, after
-   * fetch/Promise/etc. are on the global). */
+  /* navigator.serviceWorker + caches + Response/Request */
   sw_install(ctx, win, page_url);
 }
 
 /* ------------------------------------------------------- runner ----------- */
 
-/* console.* output goes to the devtools Console — the canonical sink, as in a
- * real browser, not the process stdout/serial. The engine's log level maps to
- * the panel's colouring (warn yellow, error red). */
+/* console.* output goes to the devtools Console, the canonical sink, as in a real browser */
 static void js_print(js_ctx *ctx, int level, const char *s, int len)
 {
   (void)ctx;
@@ -6354,9 +6093,7 @@ static void js_print(js_ctx *ctx, int level, const char *s, int len)
   devtools_console_append(dl, s, len);
 }
 
-/* The script/context currently executing, for error attribution in the devtools
- * Console — a script URL, "<page> (inline script #N)", or an async label like
- * "<event listener>"/"<timer callback>". Set at each execution entry point. */
+/* The script/context currently executing */
 static char g_cur_script[URL_MAX];
 void js_set_cur_script(const char *label)
 {
@@ -6364,14 +6101,11 @@ void js_set_cur_script(const char *label)
   g_cur_script[0] = '\0';
   if (label)
     sapp(g_cur_script, &k, sizeof g_cur_script, label);
-  /* Point the engine at the same buffer so a captured stack's outermost frame
-   * names this script/async entry (the sites that build g_cur_script inline
-   * mutate the same storage, so this one binding tracks them all). */
+  /* Point the engine at the same buffer so a captured stack's outermost frame names this script/async */
   if (g_ctx)
     js_set_script(g_ctx, g_cur_script);
 }
-/* Attribute the current execution to a named event's listener, e.g. a thrown
- * error inside an onclick shows "in <click listener>". */
+/* Attribute the current execution to a named event's listener */
 static void js_set_event_script(const char *type)
 {
   char buf[64];
@@ -6412,10 +6146,7 @@ void report_exc(js_ctx *ctx)
     sb_puts(&sb, "exception");
   if (!have_stack)
     sb_putc(&sb, '\n');
-  /* A captured .stack already ends in its "    at <script>" origin line (and,
-   * for a deferred callback, the "scheduled from" chain back to the arming
-   * script), so only a bare throw (a string/number with no stack) needs the
-   * script footer. */
+  /* A captured .stack already ends in its " at <script>" origin line */
   if (!have_stack && g_cur_script[0]) {
     sb_puts(&sb, "    in ");
     sb_puts(&sb, g_cur_script);
@@ -6431,12 +6162,7 @@ static js_value report_exc_v(js_ctx *ctx)
   return js_undef();
 }
 
-/* Devtools console REPL: parse and run one expression/statement against the
- * live page context, echoing the input and the result (or exception) to the
- * console. Worker-thread only — g_ctx is worker-owned. The AST arena is
- * retained for the page's lifetime (a typed closure/timer may outlive this
- * call), matching how page scripts keep their arenas. A page with no script
- * context gets a note. */
+/* Devtools console REPL: parse and run one expression/statement against the live page context */
 void js_repl_run(const char *src)
 {
   js_arena *ar;
@@ -6461,7 +6187,7 @@ void js_repl_run(const char *src)
   }
 
   if (!g_page_live || !g_ctx) {
-    static const char note[] = "(no page script context — open a page that runs JS first)\n";
+    static const char note[] = "(no page script context: open a page that runs JS first)\n";
     devtools_console_append(DT_WARN, note, (int)sizeof note - 1);
     return;
   }
@@ -6541,7 +6267,7 @@ static bool script_is_js(struct dom_node *s)
   if (!type || !*type)
     return true;
   if (ci_has(type, "module"))
-    return false; /* handled as a module instead    */
+    return false; /* handled as a module instead */
   return ci_has(type, "javascript") || ci_has(type, "ecmascript");
 }
 
@@ -6595,12 +6321,7 @@ static char *script_text(struct dom_node *s)
   return sb.b;
 }
 
-/* Execute a <script> connected to the live document via the JS DOM API
- * (createElement + appendChild/insertBefore) — the loader idiom for analytics,
- * widgets and polyfills. Classic + module; an external `src` is fetched
- * synchronously like a module. Runs at most once per node (an "@scriptRan"
- * marker on the wrapper). Scripts produced by innerHTML go through the C tree
- * API, not these bindings, so they correctly never reach here. */
+/* Execute a <script> connected to the live document via the JS DOM API */
 static void run_inserted_script(struct dom_node *node)
 {
   js_value w;
@@ -6726,8 +6447,7 @@ static void run_inserted_script(struct dom_node *node)
   }
 }
 
-/* Fire DOMContentLoaded on the document and load on the window, advancing
- * document.readyState as a real page does. Called once, after scripts run. */
+/* Fire DOMContentLoaded on the document and load on the window */
 static void fire_lifecycle(void)
 {
   js_value ev;
@@ -6749,16 +6469,8 @@ static void fire_lifecycle(void)
     report_exc(g_ctx);
 }
 
-/* Run a page's scripts and LEAVE the engine context alive for the page's
- * lifetime (so listeners + closures survive). Reclaimed by js_page_end() on the
- * next navigation. A page with no scripts builds no context — the zero-overhead
- * path for static pages, which keeps today's navigation behaviour unchanged. */
-/* Script execution ordering (HTML spec, simplified for a fully-fetched batch):
- * pass 0 runs classic scripts (inline or external, no defer) and `async`
- * externals in document order; pass 1 runs deferred scripts — external `defer`
- * plus every module — after them, still in document order. `async` overrides
- * defer/module (runs in pass 0); defer/async are ignored on inline non-module
- * scripts. */
+/* Run a page's scripts and LEAVE the engine context alive for the page's lifetime */
+/* Script execution ordering (HTML spec, simplified for a fully-fetched batch) */
 static bool script_deferred(struct dom_node *s)
 {
   const char *src = dom_get_attr(s, "src");
@@ -6766,9 +6478,9 @@ static bool script_deferred(struct dom_node *s)
   if (external && dom_get_attr(s, "async"))
     return false; /* async: first pass, as-fetched */
   if (script_is_module(s))
-    return true; /* modules default to deferred    */
+    return true; /* modules default to deferred */
   if (external && dom_get_attr(s, "defer"))
-    return true; /* defer: external scripts only   */
+    return true; /* defer: external scripts only */
   return false;
 }
 
@@ -6802,8 +6514,7 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
   }
   collect_scripts(root, scripts, &ns, cap);
 
-  /* Resolve every <script src> to an absolute URL (document order) and batch-
-   * fetch them up front over the same path stylesheets use. */
+  /* Resolve every <script src> to an absolute URL */
   for (i = 0; i < ns; i++) {
     const char *src = dom_get_attr(scripts[i], "src");
     body_idx[i] = -1;
@@ -6858,16 +6569,14 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
   strlcpy(g_page_url_buf, page_url ? page_url : "", sizeof g_page_url_buf);
   g_page_live = 1;
 
-  /* CSP: without 'unsafe-eval', neutralise the dynamic-code globals so the
-   * page's own scripts can't generate code from strings. */
+  /* CSP: without 'unsafe-eval', neutralise the dynamic-code globals so the page's own scripts can't */
   if (B->pg->csp && !csp_allows_eval(B->pg->csp)) {
     js_def_native(g_ctx, g_ctx->global, "eval", dyncode_blocked, 1);
     js_def_native(g_ctx, g_ctx->global, "Function", dyncode_blocked, 1);
   }
 
   int inline_n = 0;
-  /* Two ordered passes: pass 0 = classic + async (document order), pass 1 =
-   * deferred scripts + modules (document order). See script_deferred(). */
+  /* Two ordered passes: pass 0 = classic + async (document order) */
   for (int pass = 0; pass < 2; pass++)
     for (i = 0; i < ns; i++) {
       char *code;
@@ -6878,8 +6587,7 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
         continue; /* CSP-blocked external (already logged) */
       if (script_deferred(scripts[i]) != pass)
         continue; /* run in its ordering pass */
-      /* Label this script for error attribution: its src URL, or the page URL
-       * plus an inline-script ordinal. */
+      /* Label this script for error attribution: its src URL */
       if (body_idx[i] >= 0 && urls[body_idx[i]]) {
         js_set_cur_script(urls[body_idx[i]]);
       } else {
@@ -6973,9 +6681,7 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
         gc_pop_scope();
       } else {
         js_value res;
-        /* document.currentScript points at the executing classic script (null
-         * for modules + outside execution), as scripts like analytics expect.
-         */
+        /* document.currentScript points at the executing classic script */
         js_set(g_ctx, js_obj_value(g_document), "currentScript", wrap_node(scripts[i]));
         if (js_run(g_ctx, prog, &res) != 0)
           report_exc(g_ctx);
@@ -6998,10 +6704,7 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
   fire_lifecycle();
 }
 
-/* Reclaim the page's JS context: drop roots, free the heap, free the script
- * ASTs. Idempotent — safe to call when no page context is live (static pages).
- * The caller frees the DOM AFTER this returns (wrappers reference nodes via
- * host). */
+/* Reclaim the page's JS context: drop roots, free the heap, free the script ASTs */
 void js_page_end(void)
 {
   int i;
@@ -7089,7 +6792,7 @@ void js_page_end(void)
   if (g_ctx) {
     js_ctx_free(g_ctx);
     g_ctx = 0;
-  } /* frees the whole JS heap         */
+  } /* frees the whole JS heap */
   for (i = 0; i < g_narenas; i++) {
     js_arena_free(g_arenas[i]);
     free(g_arenas[i]);

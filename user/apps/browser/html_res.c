@@ -1,12 +1,7 @@
+#include "features/clienthints/clienthints.h"
 #include "html_int.h"
 
-/* Stylesheets are collected as an ORDERED list of sources first, then external
- * ones are batch-fetched (same-origin multiplexed over h2), then all are added
- * in document order — so the cascade order is preserved AND the network
- * round-trips are batched rather than one blocking fetch per <link>. Both lists
- * grow on demand (a page may carry any number of <style>/<link> sources); the
- * allocated capacity persists across pages as a high-water mark (counts reset
- * to 0 each load). */
+/* Stylesheets are collected as an ORDERED list of sources first */
 struct css_src *g_src;
 int g_nsrc;
 static int g_src_cap;
@@ -68,17 +63,14 @@ void src_link(const char *absurl)
   g_css_url[g_n_css_url++] = u;
 }
 
-/* Record stylesheet sources in document order: inline <style> text, and
- * external <link rel=stylesheet> URLs (resolved against the page URL). */
+/* Record stylesheet sources in document order */
 void collect_styles(struct dom_node *node)
 {
   for (struct dom_node *c = node->first_child; c; c = c->next) {
     if (c->type != DOM_ELEMENT)
       continue;
     if (streq(c->tag, "style")) {
-      /* style-src for an inline <style>: gate on its nonce / a sha256 of the
-       * full rule text / 'unsafe-inline'. The sheet keeps the text node
-       * pointers, so only the hash uses a temporary concatenation. */
+      /* style-src for an inline <style> */
       int total = 0;
       for (struct dom_node *t = c->first_child; t; t = t->next)
         if (t->type == DOM_TEXT && t->text)
@@ -134,8 +126,8 @@ struct dom_node *find_tag(struct dom_node *node, const char *tag)
   return 0;
 }
 
-/* Fold any <meta http-equiv="Content-Security-Policy" content="..."> into the
- * page's policy set (meta CSP augments header CSP; both are enforced). */
+/* Fold <meta http-equiv="Content-Security-Policy"> into the page's policy set; <meta http-equiv="Accept-CH"> opts the
+ * origin in */
 void scan_meta_csp(struct dom_node *node)
 {
   for (struct dom_node *c = node->first_child; c; c = c->next) {
@@ -145,10 +137,7 @@ void scan_meta_csp(struct dom_node *node)
       const char *he = dom_get_attr(c, "http-equiv");
       const char *ct = dom_get_attr(c, "content");
       if (he && ct && ct[0] && streq_ci(he, "content-security-policy")) {
-        /* The DOM keeps attribute values raw, so a meta CSP's quote-
-         * keywords arrive entity-encoded ('none' as &#39;none&#39;). Decode
-         * on a copy before parsing, or every 'self'/'nonce-'/'unsafe-inline'
-         * fails the source grammar and the policy blocks its own inline. */
+        /* The DOM keeps attribute values raw, so a meta CSP's quote- keywords arrive entity-encoded */
         int cl = (int)strlen(ct);
         char *dec = malloc((unsigned)cl + 1);
         if (dec) {
@@ -160,6 +149,10 @@ void scan_meta_csp(struct dom_node *node)
           csp_add(B->pg->csp, dec);
           free(dec);
         }
+      } else if (he && ct && streq_ci(he, "accept-ch")) {
+        struct purl pu;
+        if (g_page_url && parse_url(g_page_url, &pu) && pu.tls)
+          ch_accept(pu.host, ct);
       }
     } else {
       scan_meta_csp(c);
@@ -167,8 +160,7 @@ void scan_meta_csp(struct dom_node *node)
   }
 }
 
-/* Generic font-family keywords that resolve to the default proportional UI font
- * (we have no serif/cursive face, so they all map to the system sans). */
+/* Generic font-family keywords that resolve to the default proportional UI font (we have no */
 static bool fam_generic_default(const char *n)
 {
   return streq(n, "sans-serif") || streq(n, "serif") || streq(n, "system-ui") || streq(n, "ui-sans-serif") ||
@@ -177,9 +169,7 @@ static bool fam_generic_default(const char *n)
 }
 static bool fam_monospace(const char *n) { return streq(n, "monospace") || streq(n, "ui-monospace"); }
 
-/* Load a TTF from a local file into `slot` (so it's freed with the other
- * faces). Used to back the `monospace` generic with the shipped Liberation
- * Mono. */
+/* Load a TTF from a local file into `slot` (so it's freed with the other faces) */
 static struct font *load_face_file(const char *path, struct loaded_face *slot)
 {
   struct statinfo st;
@@ -203,18 +193,8 @@ static struct font *load_face_file(const char *path, struct loaded_face *slot)
   return f;
 }
 
-/* Load the sheet's @font-face faces, then pick the one the <body> text uses by
- * walking its font-family stack (first available wins): an @font-face match,
- * then a generic (sans-serif/system-ui/... -> default UI font; monospace ->
- * Liberation Mono), else the next fallback. The faces' src URLs are resolved
- * against the page, batch-fetched (multiplexed like the stylesheets), and
- * parsed by user/lib/font; the kept face owns its file bytes (the parser points
- * into them), so unloaded bodies are freed. The result is swapped into B under
- * browser_buf_lock because render() reads B->pg->body_font and B->pg->faces on the main
- * thread while this runs on the fetch worker. */
-/* Is `family` one of the comma-separated names in the font-family `stack`? Uses
- * the same naive split as the picker below, so the faces we fetch are exactly
- * the ones the picker could select. */
+/* Load the sheet's @font-face faces */
+/* Is `family` one of the comma-separated names in the font-family `stack`? Uses the same naive */
 static bool family_in_stack(const char *stack, const char *family)
 {
   const char *p = stack;
@@ -234,9 +214,7 @@ static bool family_in_stack(const char *stack, const char *family)
   return false;
 }
 
-/* Ensure B->pg->faces holds `need` entries (grows on demand). render() reads
- * only B->pg->body_font, never the array, so the realloc is safe under
- * browser_buf_lock. */
+/* Ensure B->pg->faces holds `need` entries (grows on demand) */
 static bool faces_room(int need)
 {
   if (need <= B->pg->faces_cap)
@@ -254,11 +232,7 @@ static bool faces_room(int need)
 
 void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
 {
-  /* The page renders with a single body font, so the ONLY @font-face faces that
-   * can ever be used are those whose family is named in the <body> font-family
-   * stack. Fetch exactly those — any number of them, no fixed cap — and skip
-   * the rest, so an icon-font-heavy page doesn't download faces it never
-   * renders. */
+  /* The page renders with a single body font, so the ONLY @font-face faces that can ever be used */
   struct css_style cs;
   struct dom_node *body_el = find_tag(root, "body");
   const char *stack = "";
@@ -287,9 +261,7 @@ void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
     if (!family_in_stack(stack, family))
       continue; /* body can't use it */
 
-    /* A relative src resolves against the sheet that declared it (so an
-     * external sheet's "../media/x.woff2" lands next to the sheet, not at the
-     * page root). */
+    /* A relative src resolves against the sheet that declared it (so an external sheet's */
     char abs[URL_MAX], use[URL_MAX];
     resolve_url(base && base[0] ? base : page_url, url, abs, sizeof abs);
     if (!csp_url_ok(CSP_FONT, abs, "font", use, sizeof use))
@@ -308,9 +280,7 @@ void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
     urls[nu++] = u;
   }
 
-  /* Batch-fetch the font files (multiplexed over h2 same-origin), then parse.
-   * nf holds the loaded faces plus one slot for the monospace fallback below.
-   */
+  /* Batch-fetch the font files (multiplexed over h2 same-origin), then parse */
   struct loaded_face *nf = malloc((unsigned)(nu + 1) * sizeof *nf);
   int nn = 0;
   if (nf && nu > 0) {
@@ -419,13 +389,7 @@ void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
   }
 }
 
-/* ---------------------------------------------------- url() backgrounds ---- *
- * Each url() background is collected once, during the single layout walk
- * (bg_note_url, from the cascade the walk already ran — no second compute_style
- * pass over the DOM), then load_bg_images batch-fetches + PNG-decodes them into
- * the page's bgimgs table and points each box at its decoded entry
- * (bg_image_index); paint_boxes blits with background-size/-position/-repeat.
- */
+/* ---------------------------------------------------- url() backgrounds ---- * Each url() */
 struct bg_note {
   char *abs; /* table key: resolved abs URL */
   char *use; /* fetch URL (post-CSP, maybe upgraded) */
@@ -443,10 +407,7 @@ static char *dup_cstr(const char *s)
   return d;
 }
 
-/* Note one block box's url() background for the batched fetch: resolve against
- * the page base, apply img-src CSP, dedup. Called by the walk for top-document
- * boxes, reusing the box's already-cascaded bgi rather than re-running the
- * cascade. */
+/* Note one block box's url() background for the batched fetch */
 void bg_note_url(const char *raw_url)
 {
   if (!raw_url || !raw_url[0])
@@ -480,11 +441,7 @@ void bg_note_url(const char *raw_url)
   g_nbg++;
 }
 
-/* Fetch + decode the url() backgrounds collected during the layout walk
- * (g_bgabs/ g_bguse), then point each box at its decoded entry. Runs once per
- * navigation, AFTER the walk built the box tree — the walk's first pass
- * resolved img_idx against an empty table (-1), so the fix-up loop below
- * re-resolves once the table exists. */
+/* Fetch + decode the url() backgrounds collected during the layout walk (g_bgabs/ g_bguse) */
 void load_bg_images(const char *page_url, res_batch_fn fetch)
 {
   for (int i = 0; i < B->pg->n_bgimgs; i++)
@@ -538,8 +495,7 @@ void load_bg_images(const char *page_url, res_batch_fn fetch)
   B->pg->bgimgs = tab;
   B->pg->n_bgimgs = n;
   B->pg->bgimgs_cap = nu;
-  /* Re-resolve each box's decoded-image index now the table exists (the walk's
-   * first pass ran with an empty table). */
+  /* Re-resolve each box's decoded-image index now the table exists */
   int nboxes = 0;
   struct lbox *boxes = layout_pool(&nboxes);
   for (int i = 0; i < nboxes; i++)
@@ -548,10 +504,7 @@ void load_bg_images(const char *page_url, res_batch_fn fetch)
   browser_buf_unlock();
 }
 
-/* The decoded-background index for a box's url() (resolve + match the table
- * key). No CSP re-check here — the table only holds approved URLs — so the
- * layout walk doesn't re-log violations the collection pass already reported.
- */
+/* The decoded-background index for a box's url() (resolve + match the table key) */
 int bg_image_index(const char *raw_url, const char *page_url)
 {
   if (!raw_url || !raw_url[0] || B->pg->n_bgimgs == 0)
