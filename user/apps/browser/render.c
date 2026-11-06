@@ -11,9 +11,7 @@ void hover_rows(int *y0, int *y1)
   *y1 = by + sh < BH ? by + sh : BH;
 }
 
-/* Hovered-link status: a small flat box pinned to the content pane's bottom-
- * left, like Chrome/Firefox; drawn only while a link is under the cursor, on
- * top of the page but below the menu bar and its dropdowns. */
+/* Hovered-link status */
 static void draw_hover_status(void)
 {
   int by, y1;
@@ -30,10 +28,7 @@ static void draw_hover_status(void)
   gfx_ui_text(6, by + 3, shown, 0xe8eaee);
 }
 
-/* Paint the page (box backgrounds, text, images, media) for the content-pane
- * rows [ct,cb); the pane's top edge is at screen y `py`. Callers hold
- * browser_buf_lock. Everything is confined to the band, so a band is also the
- * unit of an incremental repaint. */
+/* Paint the page (box backgrounds, text, images, media) for the content-pane rows [ct,cb) */
 static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
 {
   const struct ltab *t = &g_fr->lt;
@@ -42,10 +37,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
   gfx_set_clip(0, ct, pw, cb - ct);
   gfx_fill_rect(0, ct, pw, cb - ct, bg);
 
-  /* The worker owns the line-table flow (see worker_fn). render() only paints
-   * the table it built; never reflows; so a heavy page can't stall the event
-   * loop here. If the worker hasn't caught up to the current width yet, we paint
-   * the existing table for this frame; the worker re-flows within a tick. */
+  /* The worker owns the line-table flow (see worker_fn) */
   if (!B->pg->text) {
     g_fr->lt.n = 0;
     B->layout_dirty = 1;
@@ -54,8 +46,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
   if (B->loading && t->n == 0) {
     gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
   } else if (t->n == 0 && !B->pg->cur_url[0]) {
-    /* No page loaded; a fresh tab: prompt for a URL. A page that
-     * loaded but produced no lines just stays its blank canvas. */
+    /* No page loaded */
     gfx_ui_text(8, py + 8, "Type a URL above and press Enter.", 0x707880);
     gfx_ui_text(8, py + 8 + UIFONT_H, "e.g. example.com  or  https://example.com", 0x9098a0);
   }
@@ -90,8 +81,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
     int itop = t->y[im->start_row], ibot = lt_bottom(t, r1 - 1);
     if (ibot <= vt || itop >= vb)
       continue; /* off-screen */
-    /* On-screen now: a deferred loading="lazy" image gets flagged so the
-     * worker fetches it (no-op once fetched). */
+    /* On-screen now */
     if (im->lazy && !im->fetched && show_images)
       im->want = 1;
     if (im->ok && show_images)
@@ -116,8 +106,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
   gfx_clip_none();
 }
 
-/* What the surface holds from the last paint, so a scroll or a small change can
- * reuse it instead of repainting everything. */
+/* What the surface holds from the last paint, so a scroll or a small change can reuse it instead */
 static struct {
   bool valid;
   const struct page *pg;
@@ -152,14 +141,10 @@ static unsigned render_sig(void)
 void render(void)
 {
   unsigned bg = B->pg->page_bg;
-  /* Hold off any buffer-relocating realloc on the worker thread, and any swap of
-   * the line table, while we read text/attr/line table/img_pool/imgs/raw below
-   * (see browser_buf_lock in browser.h). render() does only in-memory gfx work,
-   * no syscalls that block; so the worker is never stalled for long. */
+  /* Hold off any buffer-relocating realloc on the worker thread, and any swap of the line table */
   browser_buf_lock();
 
-  /* tab strip (between the menu bar and the address bar). Each tab passes its
-   * decoded favicon, or NULL so the widget draws the default globe. */
+  /* tab strip (between the menu bar and the address bar) */
   const char *labels[MAX_TABS];
   const unsigned *icons[MAX_TABS];
   for (int i = 0; i < n_tabs; i++) {
@@ -168,9 +153,7 @@ void render(void)
   }
   tabbar_draw(0, MENU_H, BW, labels, icons, n_tabs, active_tab);
 
-  /* address bar (below the tab strip): Back/Forward buttons + the text field.
-   * The buttons dim when their direction has no history (button_hit also
-   * refuses a disabled button, so a click on a dim arrow does nothing). */
+  /* address bar (below the tab strip) */
   gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
   struct rect rb, rf, rrl, rtf, rst;
   addr_layout(&rb, &rf, &rrl, &rtf, &rst);
@@ -183,7 +166,7 @@ void render(void)
   textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
   star_btn_draw(&rst);
 
-  /* content pane — shrinks to the left of the devtools dock when it is open */
+  /* content pane , shrinks to the left of the devtools dock when it is open */
   int right = devtools_visible() ? devtools_left() : BW;
   int py = MENU_H + TAB_H + ADDR_H, pw = right - SCROLL_W;
   int phh = BH - MENU_H - TAB_H - ADDR_H;
@@ -210,9 +193,7 @@ void render(void)
   if (hover_url[0])
     draw_hover_status();
 
-  /* Devtools element highlight: outline the selected node's box over the page
-   * (HTML pages only; an image page has no DOM to select). The box is document
-   * px from the worker, so translate by scroll and clip to the content pane. */
+  /* Devtools element highlight */
   if (devtools_visible() && B->pg->mode != MODE_IMAGE) {
     int hx, hy, hw, hh;
     const char *hlabel = 0;
@@ -220,18 +201,14 @@ void render(void)
       draw_dt_highlight(hx, py + hy - B->pg->scroll, hw, hh, py, py + phh, pw, hlabel);
   }
 
-  /* Developer tools (F12 / Ctrl+Shift+I): a right-side dock beside the page
-   * content (drawn after the page, before the menu dropdowns). No-op when
-   * closed. */
+  /* Developer tools (F12 / Ctrl+Shift+I) */
   devtools_render();
 
   /* Bookmarks panel over the content pane (below the menu dropdowns). */
   if (bm_panel_open)
     bookmarks_panel_render();
 
-  /* App menu bar over the top, then the dropdowns last so they overlay the
-   * page. "Stop" is only meaningful while a fetch is in flight, so disable it
-   * when idle — the widget dims it and ignores clicks/accelerators. */
+  /* App menu bar over the top, then the dropdowns last so they overlay the page */
   page_flags[2] = is_loading() ? 0 : MENU_DISABLED;
   edit_flags[0] = gfx_sel_has(&g_sel) ? 0 : MENU_DISABLED; /* Copy: only with a selection */
   bookmarks_menu_sync();
@@ -247,10 +224,7 @@ void render(void)
   browser_buf_unlock();
 }
 
-/* Pane rows dirtied by tracked UI actions (hover box, selection drag, media
- * ticks) since the last paint, and how many B->seq bumps those actions made. A
- * frame whose seq moved by exactly that many, with the pane otherwise unchanged
- * (render_sig), repaints only the dirty rows. Main thread only. */
+/* Pane rows dirtied by tracked UI actions (hover box, selection drag, media ticks) since the last */
 struct dmg_state g_dmg;
 
 void damage_rows(int y0, int y1)
@@ -320,9 +294,7 @@ void damage_media(void)
     damage_rows(y0, y1);
 }
 
-/* Paint only what the tracked damage covers, straight onto the surface from the
- * last paint. False when something else changed (or an overlay is up), so the
- * caller does a full render(). */
+/* Paint only what the tracked damage covers, straight onto the surface from the last paint */
 bool render_incremental(unsigned seq_delta, int id)
 {
   if (seq_delta != g_dmg.bumps || !g_painted.valid || g_painted.pg != B->pg || g_painted.bw != BW ||
@@ -375,9 +347,7 @@ bool render_incremental(unsigned seq_delta, int id)
   return true;
 }
 
-/* True while any menu dropdown is expanded. Such a dropdown overlaps the
- * address bar, so the chrome-only fast path must defer to a full render() then.
- */
+/* True while any menu dropdown is expanded */
 bool menu_any_open(void)
 {
   for (int i = 0; i < menubar.n; i++)
@@ -386,11 +356,7 @@ bool menu_any_open(void)
   return false;
 }
 
-/* Repaint only the address-bar strip (its background, the Back/Forward buttons,
- * and the URL field) and leave the page untouched. The page below and the menu
- * bar above don't intersect this row, so a present's frame diff blits just this
- * strip; no rewrap, no line/image redraw. It takes browser_buf_lock only to keep
- * the worker's measuring off the shared glyph caches while it draws text. */
+/* Repaint only the address-bar strip */
 void render_addr(void)
 {
   browser_buf_lock();

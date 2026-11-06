@@ -1,15 +1,10 @@
-/* aac.c — AAC (Advanced Audio Coding) command-line tool.
+/* aac.c: AAC command-line tool.
  *
  *   aac info   <file.aac|.m4a>          print the stream parameters
  *   aac decode <in.aac|.m4a> <out.wav>  decode AAC-LC to a 16-bit PCM WAV
  *
- * The decoder lives in user/lib/aac; this front end adds the two ways AAC is
- * carried — a raw ADTS elementary stream (.aac) and an MP4/.m4a container
- * (parsed by user/lib/mp4) — and a minimal WAV writer. The whole input is read
- * into memory (the MP4 demuxer needs random access) and the decoded PCM is
- * buffered so the WAV header can carry an exact length; this is a converter for
- * clips, not a streaming player (that path is user/lib/media).
- */
+ * Decoder in user/lib/aac; this front end reads raw ADTS (.aac) or MP4/.m4a (user/lib/mp4)
+ * and writes a WAV. Input and decoded PCM are fully buffered; not a streaming player. */
 #include "aac.h"
 #include "mp4.h"
 #include "owos.h"
@@ -84,8 +79,7 @@ static int pcm_append(struct pcmbuf *pb, const short *s, unsigned n)
 static bool is_adts(const unsigned char *b, unsigned len) { return len >= 2 && b[0] == 0xFF && (b[1] & 0xF6) == 0xF0; }
 static bool is_mp4(const unsigned char *b, unsigned len) { return len >= 8 && tag4(b + 4, "ftyp"); }
 
-/* Decode every access unit into `pb`; report sample rate + channels. 0 on
- * success. */
+/* Decode every access unit into `pb`; report sample rate + channels. 0 on success. */
 static int decode_all(const unsigned char *buf, unsigned len, struct pcmbuf *pb, unsigned *rate, unsigned *ch)
 {
   short frame[1024 * AAC_MAX_CHANNELS];

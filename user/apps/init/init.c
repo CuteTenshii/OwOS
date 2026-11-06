@@ -1,19 +1,11 @@
-/* init.c — PID-1 init / service manager, in user space.
- *
- * The kernel launches this one process at boot; it brings up everything else.
- * Reads /etc/inittab (one /bin program per line, optional args; '#' comments
- * and blank lines ignored), spawns each detached as root (init runs as root),
- * then stays alive as the supervisor: it blocks in waitpid reaping exited
- * children so daemons don't linger as zombies. It never exits. No respawn: an
- * inittab daemon that exits (dhcpcd is one-shot after it leases) stays down --
- * restart it by hand -- rather than being relaunched in a tight loop. */
+/* init.c, PID-1 init / service manager, in user space. The kernel launches this one process at
+ * boot; it brings up everything else */
 
 #include "owos.h"
 
 #define LINE_MAX 128
 
-/* Split "prog arg" in place: returns the program name and stores the single arg
- * (or NULL) in *arg. */
+/* Split "prog arg" in place: returns the program name and stores the single arg in *arg */
 static const char *split(char *line, const char **arg)
 {
   char *p = line;
@@ -30,7 +22,7 @@ static const char *split(char *line, const char **arg)
   return line;
 }
 
-/* Launch "prog [arg]" detached; a bare name resolves under /bin. */
+/* Launch "prog [arg]" detached; a bare name resolves under /bin */
 static void launch(char *line)
 {
   const char *arg;
@@ -59,7 +51,7 @@ int main(void)
     len = 0;
   buf[len] = '\0';
 
-  /* Spawn one entry per non-blank, non-comment line. */
+  /* Spawn one entry per non-blank, non-comment line */
   int start = 0;
   for (int i = 0; i <= len; i++) {
     if (buf[i] != '\n' && buf[i] != '\0')
@@ -74,9 +66,7 @@ int main(void)
     launch(line);
   }
 
-  /* Supervise: block in waitpid reaping any child that exits. Blocking (not
-   * spinning) is the point -- init is idle whenever the system is healthy, and
-   * must never exit (nothing else supervises). */
+  /* Supervise: block in waitpid reaping any child that exits */
   for (;;) {
     if (waitpid(-1) < 0)
       msleep(1000); /* no children (empty inittab / all failed): idle */

@@ -1,31 +1,11 @@
-/* player.c — a graphical media player for audio and H.264 video.
- *
- * `player <file>` opens a window with a seekable progress bar and Restart /
- * Play-Pause / Stop buttons. An audio file (.wav/.mp3/.caf) streams to the
- * sound device; a video file (.mp4/.mov/.264/.h264) decodes H.264 pictures and
- * blits them, paced against the monotonic clock, into a window sized to the
- * video with the transport strip below it. Launched bare from the Start menu it
- * opens empty (OwOS has no file-open dialog yet) — the load path is `player
- * <file>` from the terminal, like imgview/play.
- *
- * Decoding, resampling and seeking (audio) and H.264 + MP4 demux (video) all
- * live in user/lib/media (shared with the browser's <audio>/<video>): the file
- * is pulled off disk in small reads for audio, held resident for video (the
- * demuxer needs random access). A video MP4's AAC audio track plays too: it is
- * opened as a second media source on the software mixer (its own thread, so it
- * never blocks the frame loop) and becomes the master clock — video frames are
- * paced to the audio position, so picture and sound stay in sync. A raw
- * .264/.h264 has no audio track and plays silently. Software H.264 decode is
- * best-effort real-time: if a frame is already overdue when decoded it shows at
- * once, so slow decode degrades to a lower effective frame rate rather than
- * drifting off-clock.
- */
+/* player.c, a graphical media player for audio and H.264 video. `player <file>` opens a window
+ * with a seekable progress bar and Restart / Play-Pause / Stop buttons */
 #include "gfx.h"
 #include "media.h"
 #include "owos.h"
 #include <stdbool.h>
 
-/* ---- audio-window geometry ---------------------------------------------- */
+/* audio-window geometry */
 #define CW 440
 #define CH 180
 #define HDR_H 40
@@ -34,17 +14,17 @@
 #define TIME_Y (BAR_Y + GUI_PROGRESS_H + 6)
 #define BTN_Y 128
 
-/* ---- video display limits ----------------------------------------------- */
+/* video display limits */
 #define VID_MAXW 900
 #define VID_MAXH 560
-#define CTRL_H 96 /* transport strip below the video        */
+#define CTRL_H 96 /* transport strip below the video */
 #define VID_MINW 360
 
-/* ---- transport / playback state ----------------------------------------- */
+/* transport / playback state */
 enum { ST_EMPTY = 0, ST_STOPPED, ST_PLAYING, ST_PAUSED };
 static int g_state = ST_EMPTY;
 static int g_win;
-static int g_W = CW, g_H = CH; /* actual window client size              */
+static int g_W = CW, g_H = CH; /* actual window client size */
 static bool g_is_video;
 
 static int g_press = -1, g_press_ticks;
@@ -53,26 +33,24 @@ static const char *g_blabel[3];
 
 static char g_fn[256];
 
-/* ---- audio source ------------------------------------------------------- */
+/* audio source */
 static media_decoder *g_dec;
 static int audio_live;
 
-/* A video file's AAC audio track, played on the software mixer (its own thread)
- * and used as the A/V master clock. NULL for a video with no decodable audio.
- */
+/* A video file's AAC audio track, played on the software mixer and used as the A/V master clock */
 static media_source *g_asrc;
 
-/* ---- video source ------------------------------------------------------- */
+/* video source */
 static media_video *g_vid;
-static unsigned char *g_rgb;       /* native-size decoded frame (vw*vh*3)    */
-static int g_vw, g_vh;             /* native video dimensions                */
-static int g_dx, g_dy, g_dw, g_dh; /* on-screen video rectangle              */
-static bool g_frame_valid;         /* g_rgb holds a decoded, unshown frame   */
-static unsigned g_frame_pts;       /* its presentation time (ms)             */
-static long long g_shown_pts;      /* pts of the frame currently on screen   */
-static long long g_clock_origin;   /* msec() - playback position (ms)        */
+static unsigned char *g_rgb;       /* native-size decoded frame (vw*vh*3) */
+static int g_vw, g_vh;             /* native video dimensions */
+static int g_dx, g_dy, g_dw, g_dh; /* on-screen video rectangle */
+static bool g_frame_valid;         /* g_rgb holds a decoded, unshown frame */
+static unsigned g_frame_pts;       /* its presentation time (ms) */
+static long long g_shown_pts;      /* pts of the frame currently on screen */
+static long long g_clock_origin;   /* msec() - playback position (ms) */
 
-/* ---- basename + time formatting ----------------------------------------- */
+/* basename + time formatting */
 static const char *basename_of(const char *p)
 {
   const char *b = p;
@@ -109,9 +87,8 @@ static bool is_video_name(const char *p)
   return false;
 }
 
-/* ---- video frame blit --------------------------------------------------- */
-/* Nearest-neighbour scale the native g_rgb frame into the on-screen rectangle.
- */
+/* video frame blit */
+/* Nearest-neighbour scale the native g_rgb frame into the on-screen rectangle */
 static void blit_video(void)
 {
   unsigned *fb = win_fb();
@@ -127,7 +104,7 @@ static void blit_video(void)
   }
 }
 
-/* ---- loading ------------------------------------------------------------ */
+/* loading */
 static void copy_name(const char *fn)
 {
   int i;
@@ -136,7 +113,7 @@ static void copy_name(const char *fn)
   g_fn[i] = '\0';
 }
 
-/* Compute the on-screen video rectangle + window size from the native size. */
+/* Compute the on-screen video rectangle + window size from the native size */
 static void layout_video(void)
 {
   int sx = VID_MAXW * 256 / g_vw, sy = VID_MAXH * 256 / g_vh;
@@ -151,7 +128,7 @@ static void layout_video(void)
   g_dy = 0;
 }
 
-/* (Re)open the video decoder and decode its first frame. Returns 0/err. */
+/* (Re)open the video decoder and decode its first frame */
 static int video_reopen(void)
 {
   media_video *v;
@@ -203,8 +180,7 @@ static int load_video(const char *fn)
   layout_video();
   if (video_reopen() != 0)
     return -1;
-  /* Same container's audio track (AAC in an MP4), played via the mixer thread
-   * so it never blocks the frame loop. NULL for a raw .264 with no audio. */
+  /* Same container's audio track, played via the mixer thread so it never blocks the frame loop */
   {
     media_decoder *ad = media_open(fn);
     g_asrc = ad ? media_source_new(ad, 0, 0) : 0;
@@ -213,8 +189,7 @@ static int load_video(const char *fn)
   return 0;
 }
 
-/* The video playback clock in ms: the audio track's position when there is one
- * (so picture follows sound), else the monotonic wall clock. */
+/* The video playback clock in ms */
 static long long video_clock_ms(void)
 {
   if (g_asrc)
@@ -222,7 +197,7 @@ static long long video_clock_ms(void)
   return (long long)msec() - g_clock_origin;
 }
 
-/* ---- transport ---------------------------------------------------------- */
+/* transport */
 static void audio_seek_fraction(int num, int den)
 {
   unsigned dur = media_duration_ms(g_dec);
@@ -318,7 +293,7 @@ static void transport_toggle(void)
     transport_play();
 }
 
-/* ---- rendering ---------------------------------------------------------- */
+/* rendering */
 #define COL_BG 0x10141cu
 #define COL_HDR 0x1a2230u
 #define COL_TITLE 0xe6ebf2u
@@ -346,9 +321,7 @@ static void layout_buttons(void)
   }
 }
 
-/* Draw the progress bar + time + buttons of the transport strip starting at
- * client-y `top`, over a filled background `bg` spanning `top`..window bottom.
- */
+/* Draw the progress bar + time + buttons of the transport strip starting at client-y `top` */
 static void draw_controls(int top, unsigned bg, unsigned pos_ms, unsigned dur_ms)
 {
   int bar_y = top + 14, time_y = bar_y + GUI_PROGRESS_H + 6;
@@ -432,7 +405,7 @@ static void render_video_controls(void)
   draw_controls(g_dh, COL_HDR, pos, media_video_duration_ms(g_vid));
 }
 
-/* ---- input -------------------------------------------------------------- */
+/* input */
 static void on_click(int mx, int my)
 {
   if (g_state == ST_EMPTY)
@@ -459,9 +432,8 @@ static void on_click(int mx, int my)
   }
 }
 
-/* ---- video playback step ------------------------------------------------ */
-/* Advance the video: decode one frame ahead and show it once its time is due.
- * Returns 1 if a new frame was blitted this step. */
+/* video playback step */
+/* Advance the video: decode one frame ahead and show it once its time is due */
 static int video_step(void)
 {
   int blitted = 0;

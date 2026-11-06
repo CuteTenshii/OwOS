@@ -1,14 +1,4 @@
-/* stun.c - print this host's public (server-reflexive) address via STUN.
- *
- * A thin harness over user/lib/stun: send a Binding request to a STUN server
- * and report the XOR-MAPPED-ADDRESS the server saw - the IP:port a NAT maps our
- * UDP socket to. The same reflexive lookup ICE/WebRTC uses to gather
- * candidates.
- *
- *   stun                          query stun.l.google.com:19302
- *   stun stun.cloudflare.com      a different server, default port 3478
- *   stun 10.0.2.2 3478            explicit host + port
- */
+/* stun.c - print this host's public (server-reflexive) address via STUN */
 
 #include "stun.h"
 #include "opt.h"
@@ -17,7 +7,7 @@
 int main(int argc, char **argv)
 {
   const char *server = "stun.l.google.com";
-  int port = 19302; /* Google's public STUN     */
+  int port = 19302; /* Google's public STUN */
 
   static const struct opt opts[] = {{'h', "help", OPT_FLAG, 'h'}};
   struct optstate st;
@@ -35,7 +25,7 @@ int main(int argc, char **argv)
     }
     if (npos++ == 0) {
       server = st.arg;
-      port = 3478; /* the IANA default port    */
+      port = 3478; /* the IANA default port */
     } else if (npos == 2 && opt_uint(st.arg, &p) == 0 && p > 0 && p < 65536) {
       port = (int)p;
     }

@@ -1,13 +1,4 @@
-/* h264.c — a small H.264 / AVC command-line tool.
- *
- *   h264 info <file.264|.h264|.mp4|.mov>   decode the video, print dimensions
- * and a per-picture I/P frame summary
- *
- * A raw Annex-B elementary stream is decoded directly; an MP4/MOV file is taken
- * apart by the ISO-BMFF demuxer (user/lib/mp4) first — its H.264 track's avcC
- * seeds the decoder and each sample is fed as an access unit. The decoder
- * itself lives in user/lib/h264; this is only the front end.
- */
+/* h264.c, a small H.264 / AVC command-line tool */
 #include "h264.h"
 #include "mp4.h"
 #include "owos.h"

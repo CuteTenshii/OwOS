@@ -1,19 +1,4 @@
-/* net.c — a minimal IPv4 protocol stack on top of the RTL8139 driver.
- *
- * Just enough plumbing to ping a host through QEMU's user-mode (SLIRP)
- * network: Ethernet -> ARP -> IPv4 -> ICMP echo, plus a tiny UDP+DNS resolver
- * so a name like "google.com" can be looked up. The NIC itself lives in
- * rtl8139.c; this file only assembles frames (nic_send) and parses the ones
- * the driver hands up (net_rx_frame).
- *
- * SLIRP presents a fixed virtual network, so the IP configuration is hardcoded
- * rather than discovered over DHCP:
- *
- *     guest  10.0.2.15      gateway 10.0.2.2      DNS 10.0.2.3      /24
- *
- * Inbound frames are parsed in interrupt context (the RX path fills small
- * reply slots that the command-context senders below poll on).
- */
+/* net.c: minimal IPv4 stack (Ethernet, ARP, IPv4, ICMP, UDP, sockets) over the RTL8139 driver. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -32,16 +17,11 @@
 #include "tcp.h"
 #include "timer.h"
 
-/* ------------------------------------------------------------------ helpers */
-
 static inline uint16_t bswap16(uint16_t x) { return (uint16_t)((x << 8) | (x >> 8)); }
 #define htons(x) bswap16((uint16_t)(x))
 #define ntohs(x) bswap16((uint16_t)(x))
 
-/* Internet checksum (RFC 1071). Reads bytes as big-endian 16-bit words and
- * returns the host value of the checksum; store it into a header field with
- * htons() so the bytes land in network order. The csum field must be zero
- * while computing. Callers only ever pass even lengths here. */
+/* Internet checksum (RFC 1071), host value; the csum field must be zero while computing. Even lengths only. */
 static uint16_t inet_csum(const uint8_t *p, uint32_t len)
 {
   uint32_t sum = 0;
@@ -64,7 +44,7 @@ static uint16_t udp_checksum(const uint8_t src[4], const uint8_t dst[4], const u
   sum += ((uint32_t)src[2] << 8) | src[3];
   sum += ((uint32_t)dst[0] << 8) | dst[1];
   sum += ((uint32_t)dst[2] << 8) | dst[3];
-  sum += 17; /* UDP */
+  sum += 17;
   sum += len;
   for (uint32_t i = 0; i + 1 < len; i += 2)
     sum += ((uint32_t)seg[i] << 8) | seg[i + 1];
@@ -74,9 +54,6 @@ static uint16_t udp_checksum(const uint8_t src[4], const uint8_t dst[4], const u
     sum = (sum & 0xFFFF) + (sum >> 16);
   return (uint16_t)~sum;
 }
-
-/* --------------------------------------------------------------- on-the-wire
- */
 
 struct eth_hdr {
   uint8_t dst[6];
@@ -115,17 +92,10 @@ struct udp_hdr {
 #define IP_TCP 6
 #define IP_UDP 17
 
-/* ------------------------------------------------------------------- config */
-
-/* Unconfigured until DHCP leases an address: 0.0.0.0 means "no address held",
- * so the taskbar/sysfs don't claim an IP the machine doesn't yet own. DHCP now
- * runs in user space (/bin/dhcpcd) and applies the lease through
- * net_ifconfig(). Netmask stays /24 to keep same_subnet() well-defined before a
- * lease. */
+/* Unconfigured (0.0.0.0) until /bin/dhcpcd applies a lease via net_ifconfig(); /24 keeps same_subnet() defined. */
 static uint8_t my_ip[4] = {0, 0, 0, 0};
 static uint8_t gw_ip[4] = {0, 0, 0, 0};
-static uint8_t dns_ip[4] = {0, 0, 0, 0}; /* leased DNS server; set by ifconfig,
-                                          * no in-kernel reader (resolver is user space) */
+static uint8_t dns_ip[4] = {0, 0, 0, 0}; /* leased DNS server; no in-kernel reader */
 static uint8_t netmask[4] = {255, 255, 255, 0};
 
 #define ARP_CACHE 8
@@ -135,9 +105,7 @@ static struct arp_entry {
   bool valid;
 } arp_cache[ARP_CACHE];
 
-/* IPs we have an outstanding ARP request for. A reply is only trusted if it
- * answers a request we actually sent, so an unsolicited (gratuitous) reply
- * can't poison the cache for a host we're already talking to. */
+/* IPs with an outstanding ARP request; only solicited replies are cached. */
 #define ARP_PENDING 8
 static struct {
   uint8_t ip[4];
@@ -155,12 +123,11 @@ static void arp_pending_add(const uint8_t ip[4])
       arp_pending[i].valid = true;
       return;
     }
-  memcpy(arp_pending[0].ip, ip, 4); /* all in use: evict the oldest slot */
+  memcpy(arp_pending[0].ip, ip, 4);
   arp_pending[0].valid = true;
 }
 
-/* Consume a pending request for `ip`; returns 1 if one existed (a reply is then
- * solicited and may be cached). */
+/* Consume a pending request for `ip`; 1 if one existed. */
 static bool arp_pending_take(const uint8_t ip[4])
 {
   for (int i = 0; i < ARP_PENDING; i++)
@@ -171,8 +138,7 @@ static bool arp_pending_take(const uint8_t ip[4])
   return false;
 }
 
-/* Apply an IPv4 config (SYS_IFCONFIG, from /bin/dhcpcd). Any arg may be NULL.
- * Flushes the ARP cache since the subnet may have changed. */
+/* Apply an IPv4 config (SYS_IFCONFIG); NULL args are skipped. Flushes the ARP cache. */
 void net_ifconfig(const uint8_t ip[4], const uint8_t mask[4], const uint8_t gw[4], const uint8_t dns[4])
 {
   if (ip)
@@ -198,17 +164,10 @@ static volatile uint32_t icmp_rtt_us;  /* recv timestamp - send, set by IRQ  */
 
 static uint16_t ip_ident = 1;
 
-/* Nonzero while inside net_rx_frame (NIC RX / poll interrupt context). Used to
- * keep arp_resolve from blocking on hlt inside the IRQ, which would stall RX
- * and — since the wait re-enables interrupts — let the line re-enter unbounded.
- */
+/* Nonzero inside net_rx_frame; stops arp_resolve from blocking in the IRQ. */
 static volatile int net_rx_depth;
 
-/* ----------------------------------------------------------------- transmit */
-
-/* Assemble an Ethernet frame on the stack and hand it to the driver. The
- * stack-local buffer keeps the command-context senders and the IRQ-context
- * ARP reply from ever sharing one. */
+/* Assemble an Ethernet frame in a stack buffer (senders and the IRQ ARP reply never share one). */
 static void eth_send(const uint8_t dst[6], uint16_t type, const uint8_t *payload, uint32_t plen)
 {
   if (plen > 1500)
@@ -221,8 +180,6 @@ static void eth_send(const uint8_t dst[6], uint16_t type, const uint8_t *payload
   memcpy(frame + 14, payload, plen);
   nic_send(frame, 14 + plen);
 }
-
-/* ---------------------------------------------------------------------- ARP */
 
 static bool arp_lookup(const uint8_t ip[4], uint8_t out[6])
 {
@@ -273,7 +230,7 @@ static void arp_request(const uint8_t ip[4])
   static const uint8_t zero[6] = {0};
   uint8_t pkt[28];
   arp_build(pkt, 1, zero, ip);
-  arp_pending_add(ip); /* remember we asked, so the reply is trusted */
+  arp_pending_add(ip);
   eth_send(bcast, ETH_ARP, pkt, 28);
 }
 
@@ -302,27 +259,21 @@ static bool arp_resolve(const uint8_t ip[4], uint8_t out[6])
 {
   if (arp_lookup(ip, out))
     return true;
-  /* In RX-interrupt context (e.g. a passive-open SYN|ACK whose peer MAC isn't
-   * cached) we must not spin: blocking with hlt inside the NIC IRQ stalls RX
-   * and, because the wait re-enables interrupts, lets the same line re-enter
-   * without bound. Kick a request and fail; the solicited reply arrives in a
-   * later IRQ and the peer's TCP retransmit then resolves. */
+  /* In the RX IRQ never block: send a request and fail; the TCP retransmit resolves later. */
   if (net_rx_depth > 0) {
     arp_request(ip);
     return false;
   }
   for (int tries = 0; tries < 4; tries++) {
     arp_request(ip);
-    uint32_t deadline = timer_ticks() + TIMER_HZ / 4; /* ~250 ms        */
+    uint32_t deadline = timer_ticks() + TIMER_HZ / 4;
     while (timer_ticks() < deadline) {
       __asm__ volatile("" ::: "memory");
       if (arp_lookup(ip, out))
         return true;
       if (sched_intr_pending()) /* Ctrl+C: give up resolving */
         return false;
-      /* sti before hlt: this resolve can run in syscall context (a
-       * a program connecting through net_sock_*), where the int
-       * 0x80 gate left IF=0 — a bare hlt would halt the CPU forever. */
+      /* sti before hlt: syscall context has IF=0, a bare hlt would never wake. */
       __asm__ volatile("sti\n\thlt");
     }
   }
@@ -352,17 +303,13 @@ static int next_hop_mac(const uint8_t dst[4], uint8_t out[6])
   return arp_resolve(same_subnet(dst) ? dst : gw_ip, out);
 }
 
-/* ----------------------------------------------------------------------- IP */
-
 static void ip_send_ttl(const uint8_t dst[4], uint8_t proto, const uint8_t *payload, uint32_t plen, uint8_t ttl)
 {
   uint8_t nh[6];
   if (!next_hop_mac(dst, nh))
     return;
 
-  /* Stack-local, not static: this runs in both command context (UDP/ICMP/TCP
-   * write) and the RX IRQ (TCP ACKs), so a shared buffer would let the IRQ
-   * corrupt a datagram a thread is mid-assembly on. Mirrors eth_send. */
+  /* Stack-local: runs in both thread and RX IRQ context. */
   uint8_t buf[1500];
   if (20 + plen > sizeof(buf))
     return;
@@ -372,7 +319,7 @@ static void ip_send_ttl(const uint8_t dst[4], uint8_t proto, const uint8_t *payl
   ip->tos = 0;
   ip->len = htons(20 + plen);
   ip->id = htons(ip_ident++);
-  ip->frag = htons(0x4000); /* don't fragment                  */
+  ip->frag = htons(0x4000);
   ip->ttl = ttl;
   ip->proto = proto;
   ip->csum = 0;
@@ -397,13 +344,8 @@ void net_ip_send(const uint8_t dst[4], uint8_t proto, const uint8_t *payload, ui
 
 const uint8_t *net_my_ip(void) { return my_ip; }
 
-/* True once we hold a real IPv4 address (a DHCP lease landed, or a static
- * config was applied). 0.0.0.0 is never a valid host address, so a non-zero
- * my_ip is an exact "configured" test -- callers use it to distinguish "link
- * up" from "actually has an address" instead of conflating the two. */
+/* True once a real IPv4 address is held (non-zero my_ip). */
 bool net_have_ip(void) { return my_ip[0] || my_ip[1] || my_ip[2] || my_ip[3]; }
-
-/* --------------------------------------------------------------------- ICMP */
 
 /* Client-socket RX delivery (defined with the usock layer below). */
 static bool usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t dport, const uint8_t *data,
@@ -416,22 +358,18 @@ static void icmp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
   if (len < 8)
     return;
   const struct icmp_hdr *ic = (const struct icmp_hdr *)p;
-  if (ic->type == 0) {                       /* echo reply                      */
-    icmp_rtt_us = timer_us() - icmp_send_us; /* sample at arrival   */
+  if (ic->type == 0) {
+    icmp_rtt_us = timer_us() - icmp_send_us;
     icmp_id_rx = ntohs(ic->id);
     icmp_seq_rx = ntohs(ic->seq);
     for (int i = 0; i < 4; i++)
       icmp_from[i] = src[i];
     icmp_got = 1;
-    usock_icmp_deliver(p, len); /* hand the raw message to a raw socket */
+    usock_icmp_deliver(p, len);
   }
 }
 
-/* --------------------------------------------------------------------- UDP */
-
-/* Registered in-kernel UDP servers (net_udp_listen). None remain built in
- * (mDNS moved to /bin/mdnsd bound via net_bind); the table + dispatch stay as a
- * general primitive for any future kernel UDP daemon. */
+/* Registered in-kernel UDP servers (net_udp_listen). */
 #define UDP_LISTENERS 8
 static struct {
   uint16_t port;
@@ -448,7 +386,7 @@ static udp_handler_t udp_lookup(uint16_t port)
 
 int net_udp_listen(uint16_t port, udp_handler_t fn)
 {
-  for (int i = 0; i < UDP_LISTENERS; i++) /* re-bind an existing port */
+  for (int i = 0; i < UDP_LISTENERS; i++)
     if (udp_listeners[i].fn && udp_listeners[i].port == port) {
       udp_listeners[i].fn = fn;
       return 0;
@@ -472,9 +410,7 @@ void net_udp_unlisten(uint16_t port)
 void net_udp_send_ttl(const uint8_t dst[4], uint16_t dport, uint16_t sport, const uint8_t *data, uint32_t len,
                       uint8_t ttl)
 {
-  /* Cap at the IPv4 payload that ip_send's 1500-byte buffer allows (20 IP +
-   * 8 UDP headers). The old 512 limit predated any large-datagram user; QUIC's
-   * Initial datagram must be >=1200 bytes, so a full-MTU cap is required. */
+  /* Cap at what ip_send's 1500-byte buffer allows (20 IP + 8 UDP headers); QUIC needs >=1200. */
   if (len > 1472)
     len = 1472;
   uint8_t pkt[8 + 1472];
@@ -505,8 +441,7 @@ static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
     return;
   if (u->csum && udp_checksum(src, my_ip, p, ulen) != 0)
     return;
-  /* A client/server socket (dig/resolve, or /bin/mdnsd bound to 5353 via
-   * net_bind) gets the datagram; mDNS queries and responses both land here. */
+  /* A bound socket gets the datagram. */
   if (usock_udp_deliver(src, ntohs(u->sport), ntohs(u->dport), p + 8, ulen - 8))
     return;
   udp_handler_t fn = udp_lookup(ntohs(u->dport));
@@ -515,11 +450,7 @@ static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
   }
 }
 
-/* ----------------------------------------------------------- receive bottom */
-
-/* Is `dst` an address we should accept a packet for: our unicast, limited or
- * directed broadcast, or multicast? While unconfigured (no lease yet) accept
- * everything so the DHCP path still works. */
+/* Accept `dst` if our unicast, broadcast or multicast; everything while unconfigured (DHCP). */
 static bool ip_dst_ok(const uint8_t dst[4])
 {
   if (!net_have_ip())
@@ -527,10 +458,10 @@ static bool ip_dst_ok(const uint8_t dst[4])
   if (memcmp(dst, my_ip, 4) == 0)
     return true;
   if (dst[0] == 255 && dst[1] == 255 && dst[2] == 255 && dst[3] == 255)
-    return true; /* limited broadcast */
+    return true;
   if (dst[0] >= 224 && dst[0] <= 239)
-    return true;                    /* multicast */
-  int net_match = 1, host_ones = 1; /* directed subnet broadcast */
+    return true;
+  int net_match = 1, host_ones = 1;
   for (int i = 0; i < 4; i++) {
     if ((dst[i] & netmask[i]) != (my_ip[i] & netmask[i]))
       net_match = 0;
@@ -551,14 +482,13 @@ static void ip_recv(const uint8_t *p, uint32_t len)
   uint32_t total = ntohs(ip->len);
   if (ihl < 20 || ihl > len)
     return;
-  if (inet_csum(p, ihl) != 0) /* reject a corrupt header */
+  if (inet_csum(p, ihl) != 0)
     return;
-  /* We don't reassemble, so a fragment (offset != 0 or MF set) must never be
-   * parsed as though it carried a full transport header. */
+  /* No reassembly: drop fragments. */
   uint16_t frag = ntohs(ip->frag);
   if ((frag & 0x2000) || (frag & 0x1FFF))
     return;
-  if (!ip_dst_ok(ip->dst)) /* not addressed to us */
+  if (!ip_dst_ok(ip->dst))
     return;
   if (total < ihl || total > len)
     return;
@@ -579,8 +509,8 @@ void net_rx_frame(const uint8_t *f, uint32_t len)
   if (len < 14)
     return;
   net_rx_depth++;
-  entropy_stir(len);         /* packet-arrival timing feeds the CSPRNG */
-  usock_raw_deliver(f, len); /* additive tap: raw sockets see every frame */
+  entropy_stir(len);
+  usock_raw_deliver(f, len);
   const struct eth_hdr *e = (const struct eth_hdr *)f;
   uint16_t type = ntohs(e->type);
   if (type == ETH_ARP)
@@ -589,8 +519,6 @@ void net_rx_frame(const uint8_t *f, uint32_t len)
     ip_recv(f + 14, len - 14);
   net_rx_depth--;
 }
-
-/* ------------------------------------------------------------------ command */
 
 static int parse_ipv4(const char *s, uint8_t out[4])
 {
@@ -613,12 +541,7 @@ static int parse_ipv4(const char *s, uint8_t out[4])
   return *s == '\0';
 }
 
-/* ---- socket handles ------------------------------------------------
- * A thin, handle-based connection table so user programs (the curl in
- * user/curl.c) can drive the kernel transport without a built-in doing the
- * HTTP itself. Deliberately tiny: connect (to an IP; resolution is user space),
- * send, recv (blocking, EOF-terminated), close. TLS lives entirely in user
- * space (user/lib/tls). */
+/* Socket handles: a small connection table user programs drive via connect/send/recv/close. */
 #define NET_SOCK_MAX 8
 #define SOCK_DGRAM 1500 /* one datagram's worth of rx per UDP/ICMP socket */
 #define SOCK_DGRING 16  /* datagrams buffered per UDP/ICMP socket         */
@@ -634,26 +557,19 @@ static struct usock {
   uint8_t peer[4];       /* UDP/ICMP destination                        */
   uint16_t lport, rport; /* UDP local / remote ports                    */
   uint8_t ttl;           /* outgoing IP TTL (UDP); mDNS/SSDP need 255   */
-  /* Datagram receive ring (UDP/ICMP): the RX IRQ enqueues at dg_tail,
-   * net_sock_recv dequeues at dg_head (head==tail => empty). A ring, not a
-   * single slot, so a burst of datagrams — e.g. a QUIC handshake flight
-   * spanning several packets — isn't collapsed down to the latest one. */
+  /* Datagram ring (UDP/ICMP): RX IRQ enqueues at dg_tail, recv dequeues at dg_head (empty when equal). */
   volatile uint32_t dg_head, dg_tail;
   uint32_t dg_len[SOCK_DGRING];
   uint8_t dg_src_ip[SOCK_DGRING][4]; /* per-datagram sender, for recvfrom */
   uint16_t dg_src_port[SOCK_DGRING];
   uint8_t dg[SOCK_DGRING][SOCK_DGRAM];
-  /* Raw Ethernet receive ring (SK_RAWETH): the RX IRQ enqueues a copy of every
-   * inbound frame at rf_tail; net_sock_recv dequeues at rf_head (a separate
-   * ring from dg[] because a full L2 frame exceeds SOCK_DGRAM). */
+  /* Raw Ethernet ring (SK_RAWETH): separate from dg[] because a frame exceeds SOCK_DGRAM. */
   volatile uint32_t rf_head, rf_tail;
   uint32_t rf_len[RAW_RING];
   uint8_t rf[RAW_RING][RAW_FRAME];
 } usocks[NET_SOCK_MAX];
 
-/* Tap: enqueue a copy of an inbound Ethernet frame into every open raw socket's
- * ring. Called from the RX IRQ, additive to the normal ip_recv path; drops on a
- * full ring. Raw sockets are unfiltered (they see all frames). */
+/* Copy an inbound frame into every open raw socket's ring (RX IRQ); drops when full. */
 static void usock_raw_deliver(const uint8_t *frame, uint32_t len)
 {
   if (len > RAW_FRAME)
@@ -664,7 +580,7 @@ static void usock_raw_deliver(const uint8_t *frame, uint32_t len)
       continue;
     uint32_t next = (s->rf_tail + 1) % RAW_RING;
     if (next == s->rf_head)
-      continue; /* ring full: drop this frame */
+      continue;
     for (uint32_t k = 0; k < len; k++)
       s->rf[s->rf_tail][k] = frame[k];
     s->rf_len[s->rf_tail] = len;
@@ -672,9 +588,7 @@ static void usock_raw_deliver(const uint8_t *frame, uint32_t len)
   }
 }
 
-/* Deliver an inbound UDP datagram to a matching socket (by local port), storing
- * the sender's IP/port alongside the payload for recvfrom. Called from the RX
- * IRQ; returns 1 if a socket claimed it. */
+/* Deliver a UDP datagram to the socket on its local port (RX IRQ); 1 if claimed. */
 static bool usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t dport, const uint8_t *data,
                               uint32_t len)
 {
@@ -684,7 +598,7 @@ static bool usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t 
     if (s->used && s->proto == SK_UDP && s->lport == dport && peer_match) {
       uint32_t next = (s->dg_tail + 1) % SOCK_DGRING;
       if (next == s->dg_head)
-        return true; /* ring full: drop, but the port is ours */
+        return true;
       if (len > SOCK_DGRAM)
         len = SOCK_DGRAM;
       for (uint32_t k = 0; k < len; k++)
@@ -700,8 +614,7 @@ static bool usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t 
   return false;
 }
 
-/* Deliver an inbound ICMP message to a raw ICMP socket (the program matches the
- * id/seq itself). Called from the RX IRQ. */
+/* Deliver an ICMP message to a raw ICMP socket (RX IRQ). */
 static void usock_icmp_deliver(const uint8_t *msg, uint32_t len)
 {
   for (int i = 0; i < NET_SOCK_MAX; i++) {
@@ -709,7 +622,7 @@ static void usock_icmp_deliver(const uint8_t *msg, uint32_t len)
     if (s->used && s->proto == SK_ICMP) {
       uint32_t next = (s->dg_tail + 1) % SOCK_DGRING;
       if (next == s->dg_head)
-        return; /* ring full: drop the datagram */
+        return;
       if (len > SOCK_DGRAM)
         len = SOCK_DGRAM;
       for (uint32_t k = 0; k < len; k++)
@@ -721,8 +634,7 @@ static void usock_icmp_deliver(const uint8_t *msg, uint32_t len)
   }
 }
 
-/* Block ~2 s for a datagram on a UDP/ICMP socket, optionally reporting the
- * sender (out_ip[4]/out_port may be NULL). >0 bytes / 0 timeout / -4 intr. */
+/* Block ~2 s for a datagram; out_ip/out_port may be NULL. >0 bytes, 0 timeout, -4 intr. */
 static int sock_dgram_recvfrom(struct usock *s, void *buf, uint32_t max, uint8_t *out_ip, uint16_t *out_port)
 {
   uint32_t deadline = timer_ticks() + 2 * TIMER_HZ;
@@ -757,8 +669,7 @@ static int sock_dgram_recv(struct usock *s, void *buf, uint32_t max)
   return sock_dgram_recvfrom(s, buf, max, NULL, NULL);
 }
 
-/* Dequeue one raw Ethernet frame. Blocking waits ~2 s: >0 bytes / 0 timeout /
- * -4 intr. `block`==0 returns 0 immediately when the ring is empty. */
+/* Dequeue one raw frame, waiting ~2 s if `block`: >0 bytes, 0 timeout or empty, -4 intr. */
 static int sock_raw_recv(struct usock *s, void *buf, uint32_t max, int block)
 {
   uint32_t deadline = timer_ticks() + 2 * TIMER_HZ;
@@ -785,8 +696,7 @@ static int sock_raw_recv(struct usock *s, void *buf, uint32_t max, int block)
   }
 }
 
-/* Open a raw Ethernet socket (reached via net_sock_connect with SK_RAWETH;
- * root- gated in the syscall layer). Returns a handle or -1 (no NIC/slot). */
+/* Open a raw Ethernet socket (root-gated in the syscall layer). Handle or -1. */
 int net_raw_open(void)
 {
   if (!nic_present())
@@ -809,13 +719,10 @@ int net_raw_open(void)
   return h;
 }
 
-/* Open a socket: TCP connect, or a UDP/raw-ICMP datagram socket bound to
- * `peer`. `host` is a dotted-quad IP literal — the kernel no longer resolves
- * names (that's user space, user/lib/resolve). Returns a handle
- * 0..NET_SOCK_MAX-1, or -1 no slot/NIC, -2 not an IP, -3 connect, -4 Ctrl+C. */
+/* Open a TCP/UDP/raw-ICMP socket to IP literal `host`: handle, or -1 slot/NIC, -2 bad IP, -3 connect, -4 intr. */
 int net_sock_connect(const char *host, uint16_t port, int proto)
 {
-  if (proto == SK_RAWETH) /* raw L2 socket: no host/peer */
+  if (proto == SK_RAWETH)
     return net_raw_open();
   if (!nic_present())
     return -1;
@@ -830,9 +737,7 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
   if (h < 0)
     return -1;
 
-  /* Reserve the slot NOW, before the blocking TCP connect (which yields), so a
-   * concurrent connect on another thread can't claim the same slot. Every
-   * failure path below releases it. */
+  /* Reserve the slot before the blocking connect so another thread can't claim it. */
   struct usock *s = &usocks[h];
   s->used = 1;
   s->owner = sched_current_process_id();
@@ -844,8 +749,8 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
   s->ttl = 64;
 
   uint8_t ip[4];
-  if (!parse_ipv4(host, ip)) { /* the kernel connects to an IP only:  */
-    s->used = 0;               /* resolution is user space (getaddrinfo) */
+  if (!parse_ipv4(host, ip)) {
+    s->used = 0;
     return -2;
   }
   for (int i = 0; i < 4; i++)
@@ -861,7 +766,7 @@ int net_sock_connect(const char *host, uint16_t port, int proto)
     break;
   case SK_UDP:
     s->rport = port;
-    s->lport = (uint16_t)(0xC000 + h); /* unique per slot for rx demux  */
+    s->lport = (uint16_t)(0xC000 + h);
     break;
   case SK_ICMP:
     s->lport = s->rport = 0;
@@ -886,10 +791,10 @@ int net_sock_send(int h, const void *buf, uint32_t len)
       return -1;
     net_udp_send_ttl(s->peer, s->rport, s->lport, buf, len, s->ttl);
     return (int)len;
-  case SK_ICMP: /* program built the ICMP message */
+  case SK_ICMP:
     ip_send(s->peer, IP_ICMP, buf, len);
     return (int)len;
-  case SK_RAWETH: /* full L2 frame, sent verbatim    */
+  case SK_RAWETH:
     if (len < 14 || len > RAW_FRAME)
       return -1;
     nic_send((const uint8_t *)buf, len);
@@ -898,8 +803,7 @@ int net_sock_send(int h, const void *buf, uint32_t len)
   return -1;
 }
 
-/* Block for data. TCP: >0 bytes, 0 EOF, -1 error, -4 intr. UDP/ICMP: >0
- * datagram bytes, 0 timeout, -4 intr. */
+/* Block for data. TCP: >0, 0 EOF, -1 error, -4 intr. UDP/ICMP: >0, 0 timeout, -4 intr. */
 int net_sock_recv(int h, void *buf, uint32_t max)
 {
   if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
@@ -922,11 +826,7 @@ int net_sock_recv(int h, void *buf, uint32_t max)
   return r;
 }
 
-/* Non-blocking recv. TCP: >0 bytes, 0 would-block (no data yet, connection
- * still open), -1 error/EOF, -4 intr. UDP/ICMP: same as the blocking path
- * (it already returns 0 on timeout). Lets an interactive client (ssh) poll the
- * socket alongside stdin without the blocking path's 5 s idle auto-close
- * tearing down a session that's merely waiting for the user to type. */
+/* Non-blocking recv. TCP: >0, 0 would-block, -1 error/EOF, -4 intr. Skips the blocking path's idle auto-close. */
 int net_sock_recv_nb(int h, void *buf, uint32_t max)
 {
   if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used)
@@ -935,7 +835,7 @@ int net_sock_recv_nb(int h, void *buf, uint32_t max)
   if (s->proto == SK_UDP || s->proto == SK_ICMP)
     return sock_dgram_recv(s, buf, max);
   if (s->proto == SK_RAWETH)
-    return sock_raw_recv(s, buf, max, 0); /* non-blocking */
+    return sock_raw_recv(s, buf, max, 0);
   if (s->closed)
     return -1;
   if (sched_intr_pending())
@@ -979,11 +879,7 @@ int net_sock_set_ttl(int h, int ttl)
   return 0;
 }
 
-/* --------------------------------------------------------- server sockets */
-/* The server side of the same handle table: a TCP listener (net_sock_listen +
- * net_sock_accept, which returns a fresh connection handle usable with the
- * ordinary net_sock_send/recv/close) and a bound UDP socket (net_sock_bind +
- * recvfrom/sendto). Additive: existing client sockets are untouched. */
+/* Server side of the handle table: TCP listen/accept and bound UDP sockets. */
 
 static int usock_alloc(void)
 {
@@ -1000,8 +896,7 @@ static int usock_alloc(void)
   return -1;
 }
 
-/* Open a passive TCP listener on `port`. Returns a handle or -1 (no NIC/slot).
- */
+/* Open a passive TCP listener on `port`. Handle or -1 (no NIC/slot). */
 int net_sock_listen(int port)
 {
   if (!nic_present() || port < 1 || port > 65535)
@@ -1020,10 +915,7 @@ int net_sock_listen(int port)
   return h;
 }
 
-/* Block until a client connects to a listener, or Ctrl+C. Returns a NEW handle
- * for the established connection (SK_TCP), or -1 bad fd, -4 interrupted.
- * tcp_accept polls sched_intr_pending() each wake, so a signal posted to this
- * task breaks the block on the next timer tick (returns NULL -> -4). */
+/* Block until a client connects or Ctrl+C. New handle, or -1 bad fd, -4 interrupted. */
 int net_sock_accept(int h)
 {
   if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || !usocks[h].listening)
@@ -1031,10 +923,10 @@ int net_sock_accept(int h)
   uint16_t port = usocks[h].lport;
   tcp_conn_t *c = tcp_accept(port);
   if (!c)
-    return -4; /* interrupted by a signal */
+    return -4;
   int nh = usock_alloc();
   if (nh < 0) {
-    tcp_close(c); /* table full: refuse cleanly */
+    tcp_close(c);
     return -1;
   }
   usocks[nh].proto = SK_TCP;
@@ -1043,8 +935,7 @@ int net_sock_accept(int h)
   return nh;
 }
 
-/* Bind a UDP socket to `port` so datagrams to it are delivered to this handle's
- * ring. Returns a handle or -1 (no NIC/slot). */
+/* Bind a UDP socket to `port`. Handle or -1 (no NIC/slot). */
 int net_sock_bind(int port)
 {
   if (!nic_present() || port < 1 || port > 65535)
@@ -1057,9 +948,7 @@ int net_sock_bind(int port)
   return h;
 }
 
-/* Receive one datagram on a bound UDP socket, reporting the sender's IP/port
- * (either out pointer may be NULL). >0 bytes / 0 timeout / -1 bad fd / -4 intr.
- */
+/* Receive one datagram on a bound UDP socket; out pointers may be NULL. >0, 0 timeout, -1 bad fd, -4 intr. */
 int net_sock_recvfrom(int h, void *buf, uint32_t max, uint8_t out_ip[4], uint16_t *out_port)
 {
   if (h < 0 || h >= NET_SOCK_MAX || !usocks[h].used || usocks[h].proto != SK_UDP)
@@ -1093,10 +982,7 @@ void net_init(void)
   nic_init();
   if (!nic_present())
     return;
-  /* The NIC driver already logged its name/MAC/link. Don't announce an IP here:
-   * none is leased yet (/bin/dhcpcd runs after sti and applies the lease via
-   * SYS_IFCONFIG). The live IP shows in the taskbar network indicator and
-   * `ping`/procfs report it on demand. */
+  /* No IP is announced here: /bin/dhcpcd applies the lease after sti. */
   con_write("net: requesting address via DHCP\n");
 }
 
@@ -1114,10 +1000,7 @@ void net_start(void)
     sched_create_thread("netrx", net_poll_thread);
 }
 
-/* Launch /bin/dhcpcd as a detached root process to lease a link. The general
- * "run the DHCP client" primitive: used at boot and when a hot-plugged NIC (the
- * RNDIS tether) registers. Must run post-sti with IF=1 (dhcpcd waits on the RX
- * IRQ). No-op with no NIC or if the program isn't installed. */
+/* Launch /bin/dhcpcd detached as root (post-sti, IF=1). No-op without a NIC or the program. */
 void net_dhcp_spawn(void)
 {
   if (!nic_present())
@@ -1129,6 +1012,6 @@ void net_dhcp_spawn(void)
   int n = fs_read("/bin/dhcpcd", buf, (uint32_t)sz);
   char *argv[1] = {"dhcpcd"};
   if (n > 0)
-    exec_program(buf, (uint32_t)n, 1, argv); /* detached; the WM reaps it */
+    exec_program(buf, (uint32_t)n, 1, argv);
   kfree(buf);
 }

@@ -1,58 +1,42 @@
-/* imgview.c — a PNG image viewer with a File menu and a properties panel.
- *
- * Opens a window with a menu bar (File: Open / Reload / Quit, View:
- * Properties), an image canvas, and a status bar. The image is streamed off
- * disk through the user-space decoder (upng): nothing about it — file bytes,
- * decoded pixels — is ever held whole. File bytes are pulled in 4 KiB reads via
- * readfile_at, the decoder emits one row at a time, and each scanline is scaled
- * straight into a fixed backing canvas (so opening/closing the menu or the
- * properties panel never forces a re-decode). A malformed image can only crash
- * this process; the kernel never parses it.
- *
- * The Properties panel reads image metadata with upng_probe — IHDR geometry and
- * colour space, transparency, interlace, resolution (pHYs), gamma, timestamp,
- * the tEXt/iTXt text records, and any embedded eXIf EXIF block — and lists them
- * in a scrollable overlay.
- */
+/* imgview.c, a PNG image viewer with a File menu and a properties panel. Opens a window with a
+ * menu bar (File: Open / Reload / Quit, View: Properties), an image canvas, and a status bar */
 #include "gfx.h"
 #include "owos.h"
 #include "upng.h"
 #include "webp.h"
 #include <stdbool.h>
 
-/* ---- layout ---------------------------------------------------------------
- */
-#define MENU_H GUI_BAR_H   /* top menu bar                              */
-#define STATUS_H GUI_BAR_H /* bottom status / open-prompt bar           */
-#define CW_MIN 480         /* canvas size is clamped to this range so    */
-#define CH_MIN 320         /* there's room for chrome + the panel even   */
-#define CW_MAX 700         /* for tiny images, and the window stays      */
-#define CH_MAX 460         /* within the screen-sized window-buffer cap. */
+/* layout */
+#define MENU_H GUI_BAR_H   /* top menu bar */
+#define STATUS_H GUI_BAR_H /* bottom status / open-prompt bar */
+#define CW_MIN 480         /* canvas size is clamped to this range so */
+#define CH_MIN 320         /* there's room for chrome + the panel even */
+#define CW_MAX 700         /* for tiny images, and the window stays */
+#define CH_MAX 460         /* within the screen-sized window-buffer cap */
 
-static int W, H;                         /* window client size                        */
-static int cw, ch;                       /* image canvas size (= W, H-MENU_H-STATUS_H)*/
+static int W, H;                         /* window client size */
+static int cw, ch;                       /* image canvas size (= W, H-MENU_H-STATUS_H) */
 static unsigned canvas[CW_MAX * CH_MAX]; /* backing store for the image area */
 
-static int wid;           /* window id                                 */
-static char curpath[256]; /* path of the image currently shown         */
-static unsigned iw, ih;   /* its pixel dimensions                      */
-static int load_ok;       /* a valid image is loaded                   */
-static bool is_webp;      /* the loaded image is WebP, not PNG         */
+static int wid;           /* window id */
+static char curpath[256]; /* path of the image currently shown */
+static unsigned iw, ih;   /* its pixel dimensions */
+static int load_ok;       /* a valid image is loaded */
+static bool is_webp;      /* the loaded image is WebP, not PNG */
 
-static struct upng_meta meta; /* probed metadata for curpath               */
-static int meta_valid;        /* meta + the props list match curpath       */
+static struct upng_meta meta; /* probed metadata for curpath */
+static int meta_valid;        /* meta + the props list match curpath */
 
-static int props_open;  /* the properties overlay is showing         */
-static int prop_scroll; /* first visible properties row              */
+static int props_open;  /* the properties overlay is showing */
+static int prop_scroll; /* first visible properties row */
 
-static int prompt_on; /* the bottom "Open:" prompt is active        */
+static int prompt_on; /* the bottom "Open:" prompt is active */
 static char prompt_buf[256];
 static int prompt_len;
 
 static struct status_bar sbar;
 
-/* ---- tiny helpers ---------------------------------------------------------
- */
+/* tiny helpers */
 
 static void scopy(char *d, const char *s, int max)
 {
@@ -71,7 +55,7 @@ static const char *basename_of(const char *p)
   return b;
 }
 
-/* String builders into caller buffers (no libc printf here). */
+/* String builders into caller buffers (no libc printf here) */
 static char *as(char *p, const char *s)
 {
   while (*s)
@@ -104,13 +88,7 @@ static char *au2(char *p, unsigned v)
 
 static void set_status(const char *s) { status_set(&sbar, s); }
 
-/* ---- a buffered file reader over readfile_at (streams any-size files) ------
- * The data buffer is one shared static block: only a single decode/probe ever
- * runs at a time (this app is single-threaded and never nests them), so the
- * freaders take turns using it. A large buffer is the point — the screenshot
- * tool writes *uncompressed* (stored-block) PNGs, so the decode is dominated by
- * pulling bytes, and a 64 KiB buffer hits readfile_at once per 64 KiB instead
- * of every 4 KiB (≈16× fewer syscalls for a multi-MiB image). */
+/* a buffered file reader over readfile_at (streams any-size files) */
 #define FR_BUF 65536
 static unsigned char fr_buffer[FR_BUF];
 struct freader {
@@ -146,9 +124,7 @@ static int fr_get(void *c)
   return fr_buffer[f->pos++];
 }
 
-/* Read a whole file into a fresh malloc'd buffer (WebP is not a streaming
- * format, so the decoder needs it all at once). NULL on any error; *len set on
- * success. */
+/* Read a whole file into a fresh malloc'd buffer */
 static unsigned char *read_whole(const char *path, int *len)
 {
   struct statinfo st;
@@ -172,8 +148,7 @@ static unsigned char *read_whole(const char *path, int *len)
   return buf;
 }
 
-/* Probe dimensions + format from a file: a RIFF/WEBP header routes to the WebP
- * reader, anything else to the streaming PNG reader. Returns 0 on success. */
+/* Probe dimensions + format from a file: a RIFF/WEBP header routes to the WebP reader */
 static int probe_image(const char *path, unsigned *w, unsigned *h, bool *webp)
 {
   unsigned char hdr[64];
@@ -189,25 +164,20 @@ static int probe_image(const char *path, unsigned *w, unsigned *h, bool *webp)
   return (upng_dimensions(fr_get, &fr, w, h) == 0 && *w && *h) ? 0 : -1;
 }
 
-/* ---- scaled blit into the backing canvas ----------------------------------
- */
+/* scaled blit into the backing canvas */
 struct view {
-  unsigned cw, ch;         /* canvas size                                     */
-  unsigned iw, ih;         /* image size                                      */
-  unsigned dw, dh, ox, oy; /* drawn size + top-left offset (letterboxed)      */
-  unsigned next_r;         /* next destination row awaiting a source row      */
-  int id;                  /* window, so we can present rows as they decode   */
-  unsigned shown;          /* next_r at the last present (throttle presents)   */
+  unsigned cw, ch;         /* canvas size */
+  unsigned iw, ih;         /* image size */
+  unsigned dw, dh, ox, oy; /* drawn size + top-left offset (letterboxed) */
+  unsigned next_r;         /* next destination row awaiting a source row */
+  int id;                  /* window, so we can present rows as they decode */
+  unsigned shown;          /* next_r at the last present (throttle presents) */
 };
 
-/* Per-destination-column source byte offset, (x*iw/dw)*4, computed once per
- * decode so the per-pixel inner loop is a table lookup instead of a divide. */
+/* Per-destination-column source byte offset, (x*iw/dw)*4 */
 static unsigned xmap[CW_MAX];
 
-/* Copy canvas rows [y0,y1) into the window's image area (rows below the menu
- * bar). The window width equals the canvas width, so each band is one
- * contiguous run — used both for the full present and for the progressive
- * band-by-band paints, so a present never recopies the whole canvas. */
+/* Copy canvas rows [y0,y1) into the window's image area (rows below the menu bar) */
 static void blit_band(int y0, int y1)
 {
   if (y0 < 0)
@@ -222,9 +192,7 @@ static void blit_band(int y0, int y1)
 
 static void blit_canvas(void) { blit_band(0, ch); }
 
-/* Called per source scanline: fill every destination row whose nearest source
- * row is this one (nearest-neighbour vertical scale), each scaled horizontally,
- * into the backing canvas. */
+/* Called per source scanline */
 static int v_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 {
   (void)w;
@@ -247,10 +215,7 @@ static int v_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
     }
     v->next_r++;
   }
-  /* Decoding a megabyte PNG off PIO disk takes seconds; present the rows
-   * filled so far every so often so the image paints top-to-bottom instead of
-   * staying blank until the whole decode finishes. Only the newly-filled band
-   * is copied to the screen, not the whole canvas. */
+  /* Decoding a megabyte PNG off PIO disk takes seconds */
   if (v->next_r - v->shown >= 16) {
     blit_band((int)(v->oy + v->shown), (int)(v->oy + v->next_r));
     v->shown = v->next_r;
@@ -259,13 +224,11 @@ static int v_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
   return 0;
 }
 
-/* Decode curpath into the backing canvas, fit-to-canvas with aspect preserved
- * and letterbox padding around it. Leaves a plain background if nothing loads.
- */
+/* Decode curpath into the backing canvas */
 static void decode_to_canvas(void)
 {
   for (int i = 0; i < cw * ch; i++)
-    canvas[i] = 0x141a24; /* letterbox background           */
+    canvas[i] = 0x141a24; /* letterbox background */
   if (!load_ok)
     return;
 
@@ -277,15 +240,15 @@ static void decode_to_canvas(void)
   v.next_r = 0;
   v.id = wid;
   v.shown = 0;
-  if (iw <= (unsigned)cw && ih <= (unsigned)ch) { /* fits: show 1:1          */
+  if (iw <= (unsigned)cw && ih <= (unsigned)ch) { /* fits: show 1:1 */
     v.dw = iw;
     v.dh = ih;
   } else if ((unsigned long)iw * ch > (unsigned long)ih * cw) {
     v.dw = cw;
-    v.dh = ih * cw / iw; /* width-bound                    */
+    v.dh = ih * cw / iw; /* width-bound */
   } else {
     v.dh = ch;
-    v.dw = iw * ch / ih; /* height-bound                   */
+    v.dw = iw * ch / ih; /* height-bound */
   }
   if (v.dw == 0)
     v.dw = 1;
@@ -294,17 +257,15 @@ static void decode_to_canvas(void)
   v.ox = ((unsigned)cw - v.dw) / 2;
   v.oy = ((unsigned)ch - v.dh) / 2;
 
-  for (unsigned x = 0; x < v.dw; x++) /* precompute the horizontal map  */
+  for (unsigned x = 0; x < v.dw; x++) /* precompute the horizontal map */
     xmap[x] = (x * v.iw / v.dw) * 4;
 
-  /* Paint the letterbox background once up front (the progressive band blits
-   * only touch image rows), then stream the image in over it. */
+  /* Paint the letterbox background once up front, then stream the image in over it */
   blit_canvas();
   win_present(wid);
 
   if (is_webp) {
-    /* WebP needs the whole file in memory; decode it, then push each row
-     * through the same scaled-blit callback the PNG path uses. */
+    /* WebP needs the whole file in memory; decode it */
     int flen = 0;
     unsigned char *file = read_whole(curpath, &flen);
     if (file) {
@@ -324,8 +285,7 @@ static void decode_to_canvas(void)
   }
 }
 
-/* ---- properties list ------------------------------------------------------
- */
+/* properties list */
 #define PROP_MAX 80
 static char prop_key[PROP_MAX][20];
 static char prop_val[PROP_MAX][UPNG_VAL_MAX];
@@ -364,7 +324,7 @@ static const char *color_name(unsigned color)
   }
 }
 
-/* Format curpath's size, human-readable, into b. */
+/* Format curpath's size, human-readable, into b */
 static void fmt_size(char *b)
 {
   struct statinfo st;
@@ -388,7 +348,7 @@ static void fmt_size(char *b)
   }
 }
 
-/* Properties for a WebP image (probed from its container header). */
+/* Properties for a WebP image (probed from its container header) */
 static void build_props_webp(void)
 {
   char b[UPNG_VAL_MAX], *p;
@@ -421,8 +381,7 @@ static void build_props_webp(void)
   }
 }
 
-/* Rebuild the key/value list from `meta` (assumed valid) + a stat() of curpath.
- */
+/* Rebuild the key/value list from `meta` (assumed valid) + a stat() of curpath */
 static void build_props(void)
 {
   char b[UPNG_VAL_MAX], *p;
@@ -470,7 +429,7 @@ static void build_props(void)
   padd("Interlace", meta.interlaced ? "Adam7" : "None");
 
   if (meta.have_phys) {
-    if (meta.phys_metre) { /* pixels/metre -> DPI            */
+    if (meta.phys_metre) { /* pixels/metre -> DPI */
       unsigned dx = (meta.ppu_x * 254u + 5000u) / 10000u;
       unsigned dy = (meta.ppu_y * 254u + 5000u) / 10000u;
       p = au(b, dx);
@@ -486,11 +445,11 @@ static void build_props(void)
     padd("Resolution", b);
   }
 
-  if (meta.have_gamma) { /* gAMA is gamma * 100000         */
+  if (meta.have_gamma) { /* gAMA is gamma * 100000 */
     unsigned g = meta.gamma;
     p = au(b, g / 100000u);
     *p++ = '.';
-    unsigned f = g % 100000u; /* zero-pad the 5-digit fraction  */
+    unsigned f = g % 100000u; /* zero-pad the 5-digit fraction */
     for (unsigned d = 10000u; d >= 1u; d /= 10u) {
       *p++ = (char)('0' + (f / d) % 10u);
       if (d == 1u)
@@ -525,8 +484,7 @@ static void build_props(void)
     padd("EXIF", "(present, too large)");
 }
 
-/* Ensure meta + the props list are current for curpath (lazy: only on demand).
- */
+/* Ensure meta + the props list are current for curpath (lazy: only on demand) */
 static void ensure_meta(void)
 {
   if (meta_valid)
@@ -545,8 +503,7 @@ static void ensure_meta(void)
   meta_valid = 1;
 }
 
-/* ---- file actions ---------------------------------------------------------
- */
+/* file actions */
 
 static void load(const char *path)
 {
@@ -620,8 +577,8 @@ static void file_action(int item)
   switch (item) {
   case 0:
     start_prompt();
-    break; /* Open...             */
-  case 1:  /* Reload              */
+    break; /* Open */
+  case 1:  /* Reload */
     if (load_ok || curpath[0])
       load(curpath);
     else
@@ -629,12 +586,11 @@ static void file_action(int item)
     break;
   case 2:
     win_close(wid);
-    exit(0); /* Quit                */
+    exit(0); /* Quit */
   }
 }
 
-/* ---- menus ----------------------------------------------------------------
- */
+/* menus */
 
 static const char *const file_items[] = {"Open...", "Reload", "Quit"};
 static const char *const file_hints[] = {"Ctrl+O", "F5", ""};
@@ -658,8 +614,7 @@ static void menu_action(struct menu *leaf, int item)
     file_action(item);
 }
 
-/* ---- properties overlay drawing -------------------------------------------
- */
+/* properties overlay drawing */
 
 static int props_visible_rows(int ph)
 {
@@ -715,22 +670,21 @@ static void draw_props(void)
   }
 }
 
-/* ---- rendering ------------------------------------------------------------
- */
+/* rendering */
 
 static void render(void)
 {
-  blit_canvas(); /* image area               */
+  blit_canvas(); /* image area */
 
-  if (!load_ok) { /* friendly empty state     */
+  if (!load_ok) { /* friendly empty state */
     const char *m = curpath[0] ? "Cannot display this file" : "Open an image:  File > Open";
     int tw = gfx_ui_width(m);
     gfx_ui_text((W - tw) / 2, MENU_H + ch / 2 - UIFONT_H / 2, m, 0x9fb0c4);
   }
 
-  gfx_fill_rect(0, 0, W, MENU_H, 0x232a36); /* menu bar background      */
+  gfx_fill_rect(0, 0, W, MENU_H, 0x232a36); /* menu bar background */
 
-  /* Status / open-prompt bar. */
+  /* Status / open-prompt bar */
   int sy = H - STATUS_H;
   struct status_bar bar;
   char line[128], *p = line;
@@ -757,13 +711,12 @@ static void render(void)
   if (props_open)
     draw_props();
 
-  /* Menu bar drawn last so an open dropdown overlays the panel. */
+  /* Menu bar drawn last so an open dropdown overlays the panel */
   view_flags[0] = props_open ? MENU_CHECKED : 0;
   menubar_draw(&mbar);
 }
 
-/* ---- input ----------------------------------------------------------------
- */
+/* input */
 
 static void on_key(char c)
 {
@@ -837,7 +790,7 @@ static void on_scroll(int delta)
 
 int main(int argc, char **argv)
 {
-  /* Size the canvas to the first image (if given) within the clamp range. */
+  /* Size the canvas to the first image (if given) within the clamp range */
   const char *arg = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : 0;
   unsigned w0 = CW_MIN, h0 = CH_MIN;
   if (arg) {
@@ -845,7 +798,7 @@ int main(int argc, char **argv)
     bool webp = false;
     if (probe_image(arg, &w, &h, &webp) == 0 && w && h) {
       w0 = w;
-      h0 = h; /* a readable image: fit the window to it       */
+      h0 = h; /* a readable image: fit the window to it */
     }
   }
 
@@ -878,12 +831,12 @@ int main(int argc, char **argv)
     return 1;
   }
   gfx_init(win_fb(), W, H);
-  win_resizable(wid, 0); /* fixed size: the buffer matches W*H     */
+  win_resizable(wid, 0); /* fixed size: the buffer matches W*H */
 
   if (arg)
     load(arg); /* shows the image, or "not a readable PNG" */
   else {
-    decode_to_canvas(); /* paints the empty-state background       */
+    decode_to_canvas(); /* paints the empty-state background */
     set_status("no image");
   }
 

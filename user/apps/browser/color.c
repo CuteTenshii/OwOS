@@ -1,7 +1,4 @@
-/* color.c — shared CSS/SVG colour parser (see color.h). Consolidates the hex /
- * rgb() / hsl() / oklch() / named parsing that css.c and svg.c each used to
- * carry their own copy of. Pure arithmetic + libm (pow/cos/sin) for the
- * colour-space conversions; no allocation. */
+/* color.c: shared CSS/SVG colour parser (see color.h). */
 #include "color.h"
 #include "dom.h" /* lower / starts_ci / streq_ci */
 #include "math.h"
@@ -38,7 +35,7 @@ static int named_rgb(const char *v)
   return -1;
 }
 
-/* HSL(0..360, 0..100%, 0..100%) -> 0xRRGGBB. Pure arithmetic (no libm). */
+/* HSL(0..360, 0..100%, 0..100%) -> 0xRRGGBB. */
 static int hsl_to_rgb(int H, int S, int L)
 {
   double h = H, s = S / 100.0, l = L / 100.0, c, x, m, r, g, b, t;

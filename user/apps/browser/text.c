@@ -54,22 +54,9 @@ int lt_line_at(const struct ltab *t, int y)
 
 /* --------------------------------------------------------------- word wrap */
 
-/* The page body is drawn with the PROPORTIONAL sans-serif UI font (gfx_ui_*),
- * not the monospace cell grid: a glyph's pen advance is gfx_ui_cw(c), a line is
- * LINE_H tall, and wrapping/hit-testing measure in pixels. (The address bar,
- * tabs and menus already use this font.) */
+/* The page body is drawn with the PROPORTIONAL sans-serif UI font (gfx_ui_*), not the monospace */
 
-/* --- body font: the baked proportional UI font, OR a page @font-face --------
- * When the page loads a usable @font-face and applies it to the body
- * (B->pg->body_font != NULL), body text is drawn with that custom face via
- * user/lib/font; otherwise it falls back to the baked gfx_ui font. B->pg->text
- * holds UTF-8; the renderer decodes a codepoint at a time via the shared
- * utf8_decode/utf8_seqlen (user/lib).
- *
- * Two contexts keep the layout thread and the paint thread off each other's
- * caches: g_ui (main thread: paint + hit-testing) and g_wk (worker: layout).
- * Each holds the block state set by set_block, an advance cache keyed by
- * (codepoint, px), and, for g_ui, a glyph bitmap cache keyed the same way. */
+/* --- body font */
 #define GT_BITMAP_BUDGET (3ul << 20)
 #define GT_ADV_MAX 65536
 
@@ -121,9 +108,7 @@ static int adv_measure(unsigned cp, int px)
 
 /* Indent width in pixels for one nesting level. */
 
-/* Block context for the paragraph about to be measured/drawn, decoded from a
- * glyph's BP_* byte: a heading px (0 = default UI font), monospace (<pre>),
- * centring, and an indent level (blockquote/list nesting). */
+/* Block context for the paragraph about to be measured/drawn, decoded from a glyph's BP_* byte */
 void set_block(struct bctx *c, int off)
 {
   int inb = (off >= 0 && off < B->pg->text_len);
@@ -136,9 +121,7 @@ void set_block(struct bctx *c, int off)
   c->blh = inb ? B->pg->lh[off] : 0;
 }
 
-/* Per-glyph resolved font-size px (0 = default body); like set_block's bpx
- * but for one glyph, so a line with mixed inline sizes measures/draws each run
- * right. */
+/* Per-glyph resolved font-size px (0 = default body) */
 int glyph_px(int off)
 {
   if (off < 0 || off >= B->pg->text_len)
@@ -146,15 +129,10 @@ int glyph_px(int off)
   return ru_glyph_px(B->pg->fsz[off], B->pg->bp[off]);
 }
 
-/* Raw, non-HTML content (text/plain, source, etc.) renders in the fixed-width
- * monospace cell font, not the proportional UI font — only HTML gets the
- * latter. A <pre> block (bmono) is monospace too, even inside an HTML page.
- */
+/* Raw, non-HTML content (text/plain, source, etc.) renders in the fixed-width monospace cell */
 static bool body_mono(const struct bctx *c) { return B->pg->mode == MODE_TEXT || c->bmono; }
 
-/* Pen advance of one codepoint in the active body font (baked UI font when no
- * custom face: ASCII/Latin-1 by value, a '?'-width box for anything above it).
- */
+/* Pen advance of one codepoint in the active body font */
 int body_cp_adv(struct bctx *c, unsigned cp, int px)
 {
   if (body_mono(c))
@@ -176,10 +154,7 @@ int body_cp_adv(struct bctx *c, unsigned cp, int px)
   return adv;
 }
 
-/* Alpha-blend one cached glyph's coverage in colour fg, clipped to [ct,cb).
- * With `italic`, faux-slant: each row shifts horizontally by ~1/4 its height
- * above the baseline `y` (rows above the baseline lean right, below lean left).
- */
+/* Alpha-blend one cached glyph's coverage in colour fg, clipped to [ct,cb) */
 static void blit_glyph(int x, int y, const struct ru_gent *g, unsigned fg, int ct, int cb, int italic)
 {
   if (!g->bm)
@@ -213,19 +188,14 @@ static void blit_glyph(int x, int y, const struct ru_gent *g, unsigned fg, int c
   }
 }
 
-/* A "tofu" box for a codepoint the active font (or the ASCII baked font) can't
- * draw, so missing glyphs are visible rather than silently dropped. */
+/* A "tofu" box for a codepoint the active font (or the ASCII baked font) can't draw, so missing */
 static void draw_tofu(int x, int y, int w, unsigned fg)
 {
   if (w > 4)
     gfx_rect(x + 1, y + 3, w - 3, UIFONT_H - 6, fg);
 }
 
-/* Draw a UTF-8 run of font size `px` (0 = default body), its baseline
- * `baseline` px below line-top `y` so runs of different sizes on one line share
- * a baseline. Clipped to [ct,cb); returns the pen x after the run. With a custom
- * face, glyphs come from the (codepoint, px) cache; otherwise the baked UI font
- * draws ASCII/Latin-1 and a tofu box stands in for anything it lacks. */
+/* Draw a UTF-8 run of font size `px` (0 = default body), its baseline `baseline` px below */
 int body_draw_run(int x, int y, const char *s, int len, int width, unsigned fg, int ct, int cb, int px, int baseline,
                   int italic)
 {
@@ -250,17 +220,13 @@ int body_draw_run(int x, int y, const char *s, int len, int width, unsigned fg, 
     }
     return x;
   }
-  /* No @font-face: the gfx system-ui font (size-cached). gfx_ui_text_px puts
-   * the baseline at y+ascent(px), so offset y to land it on the line's shared
-   * baseline. */
+  /* No @font-face */
   int eff = px ? px : (int)BODY_PX;
   gfx_ui_text_px_clip(x, y + baseline - gfx_ui_ascent_px(eff), s, fg, eff, ct, cb);
   return x + gfx_ui_width_px(s, eff);
 }
 
-/* Ascent (line-top → baseline) for a run of `px` in the active body font; a
- * line's baseline is the max over its runs, so mixed sizes share one baseline.
- */
+/* Ascent (line-top → baseline) for a run of `px` in the active body font */
 int run_ascent(int px)
 {
   if (px <= 0)
@@ -273,8 +239,7 @@ int run_ascent(int px)
   return gfx_ui_ascent_px(px);
 }
 
-/* Display height of a text line from its largest font px and largest CSS
- * line-height: an explicit line-height wins, else it's ~1.25 of the font. */
+/* Display height of a text line from its largest font px and largest CSS line-height */
 int line_height(int maxpx, int lhmax)
 {
   if (lhmax > 0)
@@ -285,9 +250,7 @@ int line_height(int maxpx, int lhmax)
   return lh < LINE_H ? LINE_H : lh;
 }
 
-/* While a flex-row item is being flowed, every wrapped line is captured into
- * the overlay on the band instead of appended to the main table (set by
- * flow_flex_row). */
+/* While a flex-row item is being flowed, every wrapped line is captured into the overlay */
 bool g_ov_active; /* 1 = redirect add_line to the flex overlay */
 int g_ov_base;    /* absolute band row that the item's first line maps to */
 int g_ov_n;       /* lines emitted for the current item so far */
@@ -319,14 +282,7 @@ void add_line(int off, int len, int x, int w, int h, int maxpx)
 }
 
 /* How many display rows an inline image reserves at the current pane width. */
-/* Decide an inline image's drawn size (dw x dh px) within a pane `paw` px wide,
- * honouring the CSS/HTML width & height: both given pin the box (a single one
- * scales the other by the natural aspect ratio); with neither, the natural size
- * is used. The result is shrunk to fit the pane width, ratio preserved. dw/dh
- * are 0 when nothing can be sized yet (no explicit size and the image isn't
- * decoded), which the caller renders as a one-row alt box. Explicit sizes work
- * even before the image loads, so a lazy/slow image reserves its space and the
- * page doesn't reflow when it lands. */
+/* Decide an inline image's drawn size (dw x dh px) within a pane `paw` px wide, honouring */
 void img_disp_size(const struct inl_img *im, int paw, int *dw, int *dh)
 {
   int natural = im->ok && im->iw && im->ih;
@@ -370,8 +326,7 @@ int img_at_pos(int pos)
   return -1;
 }
 
-/* Highest valid scroll line: the last `rows` lines fill the pane exactly, so
- * the bottom stop can't scroll content up into blank space below it. */
+/* Highest valid scroll line */
 int scroll_max(void)
 {
   int py, phh, rows;

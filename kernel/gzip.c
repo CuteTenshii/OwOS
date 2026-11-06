@@ -1,23 +1,4 @@
-/* gzip.c — a freestanding gzip codec: DEFLATE (RFC 1951) under gzip framing
- * (RFC 1952), interoperable with the standard gzip/gunzip tools.
- *
- * Decoder (inflate): a complete DEFLATE reader handling all three block types
- *   — stored, fixed-Huffman, and dynamic-Huffman — so it decompresses anything
- *   real gzip or a web server emits. The canonical Huffman decode follows the
- *   approach in Mark Adler's puff.c.
- *
- * Encoder (deflate): an LZ77 pass over the input (3..258-byte matches in a
- *   32 KiB window, found with hash chains) feeds a single block emitted as the
- *   cheapest of dynamic-Huffman (per-data optimal, length-limited code lengths
- *   built with zlib's algorithm), fixed-Huffman, or stored. Two LZ77 passes
- *   (count frequencies, then emit) avoid buffering the token list. Output is
- *   standard gzip that any tool can inflate; the stored fallback caps expansion
- *   on incompressible data.
- *
- * The bit order is DEFLATE's: data bits are packed LSB-first within each byte,
- * while Huffman codes travel MSB-first (so the encoder reverses each code and
- * the decoder reassembles MSB-first).
- */
+/* gzip.c: freestanding gzip/zlib codec: DEFLATE decoder (after puff.c) and LZ77 + Huffman encoder. */
 
 #include "gzip.h"
 #include "crc32.h"
@@ -27,21 +8,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MAXBITS 15                    /* longest Huffman code                        */
-#define MAXLCODES 286                 /* max literal/length codes                    */
-#define MAXDCODES 30                  /* max distance codes                          */
-#define FIXLCODES 288                 /* fixed literal/length codes                  */
-#define HEAP_SIZE (2 * MAXLCODES + 1) /* Huffman build heap/tree storage */
+#define MAXBITS 15
+#define MAXLCODES 286
+#define MAXDCODES 30
+#define FIXLCODES 288
+#define HEAP_SIZE (2 * MAXLCODES + 1)
 
-#define WINDOW 32768 /* DEFLATE's 32 KiB back-reference window       */
+#define WINDOW 32768
 #define MIN_MATCH 3
 #define MAX_MATCH 258
 #define HASH_BITS 15
 #define HASH_SIZE (1u << HASH_BITS)
-#define MAX_CHAIN 256 /* bound the match search per position          */
+#define MAX_CHAIN 256
 
-/* Length symbol (257..285) base value and extra-bit count, indexed by sym-257.
- */
+/* Length symbol (257..285) base value and extra-bit count, indexed by sym-257. */
 static const uint16_t lbase[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
                                    31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
 static const uint8_t lext[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
@@ -60,11 +40,11 @@ static void put_u32(uint8_t *p, uint32_t v)
   p[3] = (uint8_t)(v >> 24);
 }
 
-/* ---- inflate (DEFLATE decoder) ----------------------------------------- */
+/* inflate (DEFLATE decoder) */
 
 struct inbits {
   const uint8_t *src;
-  uint32_t len; /* one past the last readable byte             */
+  uint32_t len;
   uint32_t pos;
   uint32_t bitbuf;
   int bitcnt;
@@ -97,9 +77,8 @@ static uint32_t get_bits(struct inbits *s, int n)
 }
 
 struct huff {
-  short count[MAXBITS + 1]; /* number of codes of each length              */
-  short symbol[FIXLCODES];  /* symbols sorted by (length, value); sized for
-                             * the 288-entry fixed table, not just MAXLCODES */
+  short count[MAXBITS + 1];
+  short symbol[FIXLCODES]; /* sorted by (length, value); sized for the fixed table */
 };
 
 /* Build a canonical Huffman decoding table from per-symbol code lengths. */
@@ -110,7 +89,7 @@ static int huff_build(struct huff *h, const short *length, int n)
     h->count[len] = 0;
   for (int sym = 0; sym < n; sym++)
     h->count[length[sym]]++;
-  if (h->count[0] == n) /* no codes at all                     */
+  if (h->count[0] == n)
     return 0;
   offs[1] = 0;
   for (int len = 1; len < MAXBITS; len++)
@@ -150,7 +129,7 @@ static int inflate_block(struct inbits *s, const struct huff *lit, const struct 
     if (sym < 0)
       return -1;
     if (sym == 256)
-      break; /* end of block                    */
+      break;
     if (sym < 256) {
       if (out >= dcap)
         return -1;
@@ -180,11 +159,11 @@ static int inflate_block(struct inbits *s, const struct huff *lit, const struct 
 
 static int inflate_stored(struct inbits *s, uint8_t *dst, uint32_t dcap, uint32_t *outp)
 {
-  s->bitcnt = 0; /* align to a byte boundary        */
+  s->bitcnt = 0;
   if (s->pos + 4 > s->len)
     return -1;
   uint32_t len = s->src[s->pos] | ((uint32_t)s->src[s->pos + 1] << 8);
-  s->pos += 4; /* skip LEN and its complement     */
+  s->pos += 4;
   if (s->pos + len > s->len || *outp + len > dcap)
     return -1;
   for (uint32_t i = 0; i < len; i++)
@@ -301,13 +280,13 @@ static int inflate(const uint8_t *src, uint32_t start, uint32_t end, uint8_t *ds
       if (ok < 0)
         return -1;
     } else {
-      return -1; /* reserved block type             */
+      return -1;
     }
   } while (!last && !s.err);
   return s.err ? -1 : (int)out;
 }
 
-/* ---- deflate (fixed-Huffman encoder) ----------------------------------- */
+/* deflate (fixed-Huffman encoder) */
 
 struct outbits {
   uint8_t *buf;
@@ -367,8 +346,7 @@ static void put_raw(struct outbits *o, uint8_t b)
     o->err = true;
 }
 
-/* Map a match length (3..258) to its length symbol (257..285) and extra bits.
- */
+/* Map a match length (3..258) to its length symbol (257..285) and extra bits. */
 static int len_code(int len, uint32_t *extra, int *ebits)
 {
   int i = 28;
@@ -424,15 +402,13 @@ static void ht_insert(int *head, int *prev, const uint8_t *src, uint32_t slen, u
   }
 }
 
-/* Per-symbol Huffman code table (literal/length uses all, distance uses 0..29).
- */
+/* Per-symbol Huffman code table (distance uses 0..29). */
 struct codes {
   uint16_t code[MAXLCODES];
   uint8_t len[MAXLCODES];
 };
 
-/* Heap ordering for Huffman tree building: lower frequency first, shallower
- * subtree as the tiebreaker (keeps codes short and the build deterministic). */
+/* Heap order: lower frequency first, then shallower subtree. */
 static int hsmaller(const uint32_t *fr, const uint8_t *depth, int n, int m)
 {
   return fr[n] < fr[m] || (fr[n] == fr[m] && depth[n] <= depth[m]);
@@ -454,11 +430,7 @@ static void pqdown(const uint32_t *fr, const uint8_t *depth, int *heap, int heap
   heap[k] = v;
 }
 
-/* Length-limited Huffman code lengths (zlib's build_tree + gen_bitlen overflow
- * redistribution): optimal-ish lengths for freq[0..elems-1], none longer than
- * maxlen, written to out_len[]. At least two codes are forced so the tree — and
- * the decoder reading it — is always well-formed. Single-threaded; the work
- * arrays are static to keep the kernel stack small. */
+/* Length-limited Huffman lengths (zlib build_tree + gen_bitlen); forces two codes. Static work arrays. */
 static void build_lengths(const uint32_t *freq, int elems, int maxlen, uint8_t *out_len)
 {
   static uint32_t fr[HEAP_SIZE];
@@ -481,7 +453,7 @@ static void build_lengths(const uint32_t *freq, int elems, int maxlen, uint8_t *
       heap[++heap_len] = n;
       max_code = n;
     }
-  while (heap_len < 2) { /* force two codes                 */
+  while (heap_len < 2) {
     int node = (max_code < 2) ? ++max_code : 0;
     fr[node] = 1;
     heap[++heap_len] = node;
@@ -490,13 +462,13 @@ static void build_lengths(const uint32_t *freq, int elems, int maxlen, uint8_t *
   for (int k = heap_len / 2; k >= 1; k--)
     pqdown(fr, depth, heap, heap_len, k);
 
-  int node = elems; /* next internal-node index        */
+  int node = elems;
   do {
     int n = heap[1];
     heap[1] = heap[heap_len--];
     pqdown(fr, depth, heap, heap_len, 1);
     int m = heap[1];
-    heap[--heap_max] = n; /* stash sorted, for gen_bitlen    */
+    heap[--heap_max] = n;
     heap[--heap_max] = m;
     fr[node] = fr[n] + fr[m];
     depth[node] = (uint8_t)((depth[n] >= depth[m] ? depth[n] : depth[m]) + 1);
@@ -504,7 +476,7 @@ static void build_lengths(const uint32_t *freq, int elems, int maxlen, uint8_t *
     heap[1] = node++;
     pqdown(fr, depth, heap, heap_len, 1);
   } while (heap_len >= 2);
-  heap[--heap_max] = heap[1]; /* the root                        */
+  heap[--heap_max] = heap[1];
 
   for (int b = 0; b <= MAXBITS; b++)
     bl_count[b] = 0;
@@ -518,11 +490,11 @@ static void build_lengths(const uint32_t *freq, int elems, int maxlen, uint8_t *
       overflow++;
     }
     ln[n] = bits;
-    if (n <= max_code) /* a leaf, not an internal node    */
+    if (n <= max_code)
       bl_count[bits]++;
   }
   if (overflow > 0) {
-    do { /* push leaves down to fit maxlen  */
+    do {
       int bits = maxlen - 1;
       while (bl_count[bits] == 0)
         bits--;
@@ -531,7 +503,7 @@ static void build_lengths(const uint32_t *freq, int elems, int maxlen, uint8_t *
       bl_count[maxlen]--;
       overflow -= 2;
     } while (overflow > 0);
-    int h = HEAP_SIZE; /* reassign by descending frequency */
+    int h = HEAP_SIZE;
     for (int bits = maxlen; bits != 0; bits--) {
       int n = bl_count[bits];
       while (n != 0) {
@@ -547,8 +519,7 @@ static void build_lengths(const uint32_t *freq, int elems, int maxlen, uint8_t *
     out_len[n] = (uint8_t)ln[n];
 }
 
-/* The DEFLATE fixed Huffman tables, derived as canonical codes from the fixed
- * length assignment (so they match the decoder's fixed tables exactly). */
+/* The DEFLATE fixed Huffman tables as canonical codes. */
 static void fixed_codes(struct codes *lit, struct codes *dist)
 {
   static uint8_t len288[FIXLCODES];
@@ -563,7 +534,7 @@ static void fixed_codes(struct codes *lit, struct codes *dist)
   for (; i < 288; i++)
     len288[i] = 8;
   build_canonical(len288, FIXLCODES, code288);
-  for (i = 0; i < MAXLCODES; i++) { /* 286/287 are never emitted       */
+  for (i = 0; i < MAXLCODES; i++) {
     lit->len[i] = len288[i];
     lit->code[i] = code288[i];
   }
@@ -572,9 +543,7 @@ static void fixed_codes(struct codes *lit, struct codes *dist)
   build_canonical(dist->len, MAXDCODES, dist->code);
 }
 
-/* One LZ77 pass. emit==0: accumulate symbol frequencies into lf/df. emit==1:
- * write the tokens with the literal/length table lt and distance table dt.
- * Tokenization is deterministic, so the counting and emitting passes agree. */
+/* One LZ77 pass: emit==0 counts frequencies into lf/df, emit==1 writes tokens with lt/dt. */
 static void lz77(const uint8_t *src, uint32_t slen, int *head, int *prev, int emit, struct outbits *o,
                  const struct codes *lt, const struct codes *dt, uint32_t *lf, uint32_t *df)
 {
@@ -644,9 +613,9 @@ static void emit_stored(const uint8_t *src, uint32_t slen, struct outbits *o)
     if (chunk > 65535)
       chunk = 65535;
     int last = (off + chunk >= slen);
-    put_bits(o, last ? 1 : 0, 1); /* BFINAL                          */
-    put_bits(o, 0, 2);            /* BTYPE = 00 (stored)             */
-    flush_bits(o);                /* align to a byte boundary        */
+    put_bits(o, last ? 1 : 0, 1);
+    put_bits(o, 0, 2);
+    flush_bits(o);
     put_raw(o, (uint8_t)(chunk & 0xFF));
     put_raw(o, (uint8_t)(chunk >> 8));
     put_raw(o, (uint8_t)(~chunk & 0xFF));
@@ -659,9 +628,7 @@ static void emit_stored(const uint8_t *src, uint32_t slen, struct outbits *o)
 
 static const uint8_t clorder[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
 
-/* DEFLATE one block, choosing the cheapest of dynamic-Huffman, fixed-Huffman,
- * and stored. Two LZ77 passes (count, then emit) avoid storing the token list.
- */
+/* DEFLATE one block as the cheapest of dynamic, fixed or stored. */
 static int deflate(const uint8_t *src, uint32_t slen, struct outbits *o)
 {
   int *head = kmalloc(HASH_SIZE * sizeof(int));
@@ -679,7 +646,7 @@ static int deflate(const uint8_t *src, uint32_t slen, struct outbits *o)
   for (int i = 0; i < MAXDCODES; i++)
     df[i] = 0;
   lz77(src, slen, head, prev, 0, NULL, NULL, NULL, lf, df);
-  lf[256]++; /* end-of-block, once             */
+  lf[256]++;
 
   /* Dynamic tables for this data. */
   static struct codes dlit, ddist;
@@ -767,16 +734,14 @@ static int deflate(const uint8_t *src, uint32_t slen, struct outbits *o)
     }
   }
 
-  static struct codes clc; /* code-length code (uses 0..18)   */
+  static struct codes clc;
   build_lengths(cl_freq, 19, 7, clc.len);
   build_canonical(clc.len, 19, clc.code);
   int hclen = 19;
   while (hclen > 4 && clc.len[clorder[hclen - 1]] == 0)
     hclen--;
 
-  /* Costs in bytes, to choose the block type. Length/distance extra bits are
-   * the same for dynamic and fixed, so they cancel — but include them so the
-   * comparison against stored is honest. */
+  /* Costs in bytes per block type (extra bits included for the stored comparison). */
   uint32_t extra = 0;
   for (int s = 257; s <= 285; s++)
     extra += lf[s] * lext[s - 257];
@@ -804,7 +769,7 @@ static int deflate(const uint8_t *src, uint32_t slen, struct outbits *o)
   uint32_t chunks = slen ? (slen + 65534) / 65535 : 1;
   uint32_t stored_bytes = 5 * chunks + slen;
 
-  int choice = 0; /* 0 dynamic, 1 fixed, 2 stored    */
+  int choice = 0;
   if (fixed_bytes < dyn_bytes)
     choice = 1;
   uint32_t best = (choice == 1) ? fixed_bytes : dyn_bytes;
@@ -816,13 +781,13 @@ static int deflate(const uint8_t *src, uint32_t slen, struct outbits *o)
   } else if (choice == 1) {
     static struct codes flit, fdist;
     fixed_codes(&flit, &fdist);
-    put_bits(o, 1, 1); /* BFINAL                          */
-    put_bits(o, 1, 2); /* BTYPE = 01 (fixed)              */
+    put_bits(o, 1, 1);
+    put_bits(o, 1, 2);
     lz77(src, slen, head, prev, 1, o, &flit, &fdist, NULL, NULL);
     put_code(o, flit.code[256], flit.len[256]);
   } else {
-    put_bits(o, 1, 1); /* BFINAL                          */
-    put_bits(o, 2, 2); /* BTYPE = 10 (dynamic)            */
+    put_bits(o, 1, 1);
+    put_bits(o, 2, 2);
     put_bits(o, (uint32_t)(hlit - 257), 5);
     put_bits(o, (uint32_t)(hdist - 1), 5);
     put_bits(o, (uint32_t)(hclen - 4), 4);
@@ -841,12 +806,11 @@ static int deflate(const uint8_t *src, uint32_t slen, struct outbits *o)
   return o->err ? -1 : 0;
 }
 
-/* ---- gzip framing ------------------------------------------------------ */
+/* gzip framing */
 
 uint32_t gzip_bound(uint32_t src_len)
 {
-  /* gzip header (10) + trailer (8) + a fixed-Huffman body, whose worst
-   * case is ~9 bits per byte, plus block/EOB/padding slack. */
+  /* Header (10) + trailer (8) + worst-case fixed-Huffman body (~9 bits/byte) + slack. */
   return 18 + src_len + src_len / 8 + 64;
 }
 
@@ -888,19 +852,19 @@ int gzip_decompress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dc
   uint8_t flg = src[3];
   uint32_t pos = 10;
 
-  if (flg & 0x04) { /* FEXTRA                          */
+  if (flg & 0x04) {
     if (pos + 2 > slen)
       return -1;
     uint32_t xlen = src[pos] | ((uint32_t)src[pos + 1] << 8);
     pos += 2 + xlen;
   }
-  if (flg & 0x08) /* FNAME (NUL-terminated)          */
+  if (flg & 0x08)
     while (pos < slen && src[pos++])
       ;
-  if (flg & 0x10) /* FCOMMENT                        */
+  if (flg & 0x10)
     while (pos < slen && src[pos++])
       ;
-  if (flg & 0x02) /* FHCRC                           */
+  if (flg & 0x02)
     pos += 2;
   if (pos >= slen)
     return -1;
@@ -917,27 +881,22 @@ int gzip_decompress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dc
   return n;
 }
 
-/* Raw zlib stream (RFC 1950): a 2-byte header, the DEFLATE body, a 4-byte
- * adler32. The header's low nibble of byte 0 is the compression method (8 =
- * DEFLATE); FDICT (byte 1 bit 5) means a preset dictionary follows, which PNG
- * never uses and we don't support. We reuse the very same inflate() as gzip —
- * only the envelope differs — and leave the adler32 trailer unverified. */
+/* Raw zlib stream (RFC 1950): 2-byte header, DEFLATE body, adler32 (unverified). No FDICT. */
 int zlib_inflate(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
 {
-  if (slen < 6) /* 2 header + >=0 body + 4 adler   */
+  if (slen < 6)
     return -1;
-  if ((src[0] & 0x0F) != 0x08) /* CM must be DEFLATE              */
+  if ((src[0] & 0x0F) != 0x08)
     return -1;
-  if (((uint32_t)src[0] << 8 | src[1]) % 31 != 0) /* FCHECK: header % 31    */
+  if (((uint32_t)src[0] << 8 | src[1]) % 31 != 0)
     return -1;
-  if (src[1] & 0x20) /* FDICT — unsupported             */
+  if (src[1] & 0x20)
     return -1;
 
   return inflate(src, 2, slen - 4, dst, dcap);
 }
 
-/* adler32 (RFC 1950): two rolling 16-bit sums mod 65521. Stored big-endian in
- * the zlib trailer (unlike gzip's little-endian CRC32). */
+/* adler32 (RFC 1950): two rolling 16-bit sums mod 65521, stored big-endian. */
 static uint32_t adler32(const uint8_t *data, uint32_t n)
 {
   uint32_t a = 1, b = 0;
@@ -952,8 +911,8 @@ int zlib_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap
 {
   if (dcap < 6)
     return -1;
-  dst[0] = 0x78; /* CM=8 (DEFLATE), CINFO=7 (32K window)    */
-  dst[1] = 0x01; /* FLEVEL=0, no FDICT; 0x7801 % 31 == 0    */
+  dst[0] = 0x78;
+  dst[1] = 0x01;
 
   struct outbits o = {dst, dcap, 2, 0, 0, 0};
   if (deflate(src, slen, &o) < 0)
@@ -962,7 +921,7 @@ int zlib_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap
   if (o.err || o.pos + 4 > dcap)
     return -1;
 
-  uint32_t ad = adler32(src, slen); /* big-endian trailer                */
+  uint32_t ad = adler32(src, slen);
   dst[o.pos + 0] = (uint8_t)(ad >> 24);
   dst[o.pos + 1] = (uint8_t)(ad >> 16);
   dst[o.pos + 2] = (uint8_t)(ad >> 8);
@@ -972,37 +931,33 @@ int zlib_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap
 
 int zlib_store(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
 {
-  /* Worst case: header(2) + one 5-byte block header per <=65535-byte chunk +
-   * the data + adler(4). */
+  /* Worst case: header(2) + 5 bytes per 65535-byte chunk + data + adler(4). */
   uint32_t nblocks = slen ? (slen + 65534) / 65535 : 1;
   if (dcap < 2 + nblocks * 5 + slen + 4)
     return -1;
 
   uint32_t pos = 0;
-  dst[pos++] = 0x78; /* CM=8, CINFO=7; 0x7801 % 31 == 0         */
+  dst[pos++] = 0x78;
   dst[pos++] = 0x01;
 
-  /* One or more stored blocks. A stored block's 3-bit header (BFINAL, BTYPE=00)
-   * sits in the low bits of a byte and is then padded to a byte boundary, so a
-   * whole header byte of 0x00 (or 0x01 for the final block) is exactly right.
-   */
+  /* Stored blocks: the header byte is 0x00, or 0x01 for the final block. */
   uint32_t off = 0;
   do {
     uint32_t chunk = slen - off;
     if (chunk > 65535)
       chunk = 65535;
     int final = (off + chunk >= slen);
-    dst[pos++] = final ? 0x01 : 0x00; /* BFINAL | BTYPE=00 (stored)  */
-    dst[pos++] = (uint8_t)chunk;      /* LEN  (little-endian)        */
+    dst[pos++] = final ? 0x01 : 0x00;
+    dst[pos++] = (uint8_t)chunk;
     dst[pos++] = (uint8_t)(chunk >> 8);
-    dst[pos++] = (uint8_t)~chunk; /* NLEN = ~LEN                 */
+    dst[pos++] = (uint8_t)~chunk;
     dst[pos++] = (uint8_t)(~chunk >> 8);
     for (uint32_t i = 0; i < chunk; i++)
       dst[pos++] = src[off + i];
     off += chunk;
   } while (off < slen);
 
-  uint32_t ad = adler32(src, slen); /* big-endian trailer          */
+  uint32_t ad = adler32(src, slen);
   dst[pos++] = (uint8_t)(ad >> 24);
   dst[pos++] = (uint8_t)(ad >> 16);
   dst[pos++] = (uint8_t)(ad >> 8);

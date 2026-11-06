@@ -1,4 +1,4 @@
-/* shell.c — line editing and a handful of built-in commands. */
+/* shell.c, line editing and a handful of built-in commands. */
 
 #include "shell.h"
 #include "ahci.h"
@@ -39,19 +39,17 @@
 #define HIST_MAX 16
 
 static char line[LINE_MAX];
-static size_t line_len;     /* characters currently in line             */
-static size_t cursor;       /* insertion point, 0..line_len             */
+static size_t line_len;     /* characters currently in line */
+static size_t cursor;       /* insertion point, 0..line_len */
 static uint16_t edit_start; /* VGA linear pos where the line text begins */
-static size_t render_len;   /* chars currently drawn for this line       */
+static size_t render_len;   /* chars currently drawn for this line */
 
-/* Command history: a small ring browsed with Up/Down. hist_pos == hist_count
- * means "the new line being typed" (nothing recalled yet). */
+/* Command history ring (Up/Down); hist_pos == hist_count means the line being typed. */
 static char history[HIST_MAX][LINE_MAX];
 static int hist_count;
 static int hist_pos;
 
-/* When a generic pipe "A | B" is active, this holds A's captured output as a
- * NUL-terminated string; input-consuming builtins (grep) read from it. */
+/* Captured output of A in `A | B` as a NUL-terminated string, read by input-consuming builtins (grep). */
 static char *g_pipe_in;
 
 static void str_copy(char *dst, const char *src)
@@ -62,19 +60,15 @@ static void str_copy(char *dst, const char *src)
   dst[i] = '\0';
 }
 
-/* ------------------------------------------------------- working directory */
+/* working directory */
 
 #define PATH_MAX 128
 
-/* The shell's current directory, kept as a clean absolute path (no trailing
- * slash except for the root). owofs itself has no cwd -- the shell turns every
- * file argument into an absolute path before calling into the filesystem. */
+/* Shell cwd as a clean absolute path; owofs has no cwd, so file args are made absolute first. */
 #define HOME_DIR "/home/root"
 static char cwd[PATH_MAX] = HOME_DIR;
 
-/* Resolve `arg` against the current directory into a normalized absolute path
- * in out[PATH_MAX] (".", "..", and duplicate slashes collapsed). An absolute
- * arg ignores cwd. Returns 0, or -1 if the result would overflow PATH_MAX. */
+/* Resolve `arg` against the cwd into a normalized absolute path in out[PATH_MAX]; 0, or -1 on overflow. */
 static int path_resolve(const char *arg, char *out)
 {
   char tmp[PATH_MAX * 2];
@@ -82,7 +76,7 @@ static int path_resolve(const char *arg, char *out)
 
   if (arg[0] == '/') { /* absolute: start from root */
     tmp[n++] = '/';
-  } else { /* relative: seed with cwd   */
+  } else { /* relative: seed with cwd */
     for (int i = 0; cwd[i]; i++) {
       if (n >= (int)sizeof(tmp) - 2)
         return -1;
@@ -91,7 +85,7 @@ static int path_resolve(const char *arg, char *out)
     if (n == 0 || tmp[n - 1] != '/')
       tmp[n++] = '/';
   }
-  for (int i = 0; arg[i]; i++) { /* append the argument       */
+  for (int i = 0; arg[i]; i++) { /* append the argument */
     if (n >= (int)sizeof(tmp) - 2)
       return -1;
     tmp[n++] = arg[i];
@@ -113,10 +107,10 @@ static int path_resolve(const char *arg, char *out)
     if (len == 0)
       continue;
     if (len == 1 && tmp[s] == '.')
-      continue; /* "." : stay                */
+      continue; /* "." : stay */
     if (len == 2 && tmp[s] == '.' && tmp[s + 1] == '.') {
       if (depth > 0)
-        depth--; /* ".." : pop                */
+        depth--; /* ".." : pop */
       continue;
     }
     if (depth < (int)(sizeof(starts) / sizeof(starts[0]))) {
@@ -128,7 +122,7 @@ static int path_resolve(const char *arg, char *out)
 
   int o = 0;
   if (depth == 0) {
-    out[o++] = '/'; /* the root                  */
+    out[o++] = '/'; /* the root */
   } else {
     for (int d = 0; d < depth; d++) {
       if (o >= PATH_MAX - 1)
@@ -145,10 +139,7 @@ static int path_resolve(const char *arg, char *out)
   return 0;
 }
 
-/* If drawing since the saved scroll count `before` scrolled the console, the
- * line's anchor moved up with everything else; slide edit_start to match (it
- * can't legitimately fall off the top -- a line is at most a couple of rows).
- */
+/* If drawing scrolled the console since `before`, slide edit_start up to match. */
 static void edit_fix_anchor(uint32_t before)
 {
   uint32_t rows = con_scroll_count() - before;
@@ -156,10 +147,7 @@ static void edit_fix_anchor(uint32_t before)
     edit_start = con_pos_scroll_up(edit_start, rows);
 }
 
-/* Redraw the current line in place: text from edit_start, spaces to wipe any
- * leftover tail from a previously longer line, then park the cursor at the
- * insertion point. Stays correct even if the line is long enough to scroll the
- * screen mid-redraw -- edit_start is re-anchored against any scrolling. */
+/* Redraw the current line in place, wiping any leftover tail, then park the cursor; survives mid-redraw scroll. */
 static void edit_redraw(void)
 {
   uint32_t s0 = con_scroll_count();
@@ -190,10 +178,10 @@ static void hist_add(const char *s)
   if (s[0] == '\0')
     return;
   if (hist_count > 0 && streq(history[hist_count - 1], s)) {
-    hist_pos = hist_count; /* skip consecutive duplicate          */
+    hist_pos = hist_count; /* skip consecutive duplicate */
     return;
   }
-  if (hist_count == HIST_MAX) { /* full: drop the oldest           */
+  if (hist_count == HIST_MAX) { /* full: drop the oldest */
     for (int i = 1; i < HIST_MAX; i++)
       str_copy(history[i - 1], history[i]);
     hist_count--;
@@ -202,7 +190,7 @@ static void hist_add(const char *s)
   hist_pos = hist_count;
 }
 
-static void hist_up(void) /* recall older entries               */
+static void hist_up(void) /* recall older entries */
 {
   if (hist_pos > 0) {
     hist_pos--;
@@ -210,7 +198,7 @@ static void hist_up(void) /* recall older entries               */
   }
 }
 
-static void hist_down(void) /* back toward the new line           */
+static void hist_down(void) /* back toward the new line */
 {
   if (hist_pos >= hist_count)
     return;
@@ -247,21 +235,18 @@ static void prompt(void)
   line_len = cursor = render_len = 0;
 }
 
-/* "help" — list every built-in. The text is data in the `builtins` table just
- * above run(), so this walks that table; the definition lives there too. */
+/* "help": list every built-in by walking the `builtins` table. */
 static void cmd_help(const char *a);
 
 static void print_kib(const char *label, uint32_t kib) { con_printf("%s%u KiB\n", label, kib); }
 
-/* List every storage device the kernel brought up, with its capacity, and do a
- * read-only sanity check (read LBA 0) on the DMA-based controllers. */
-/* Print a 512-byte-sector capacity as "N MiB", or "N.N GiB" once it reaches
- * 1 GiB so large disks read naturally. */
+/* List storage devices with capacity and a read-only LBA 0 check on DMA controllers. */
+/* Print a 512-byte-sector capacity as MiB, or GiB from 1 GiB up. */
 static void write_capacity(uint32_t sectors)
 {
   uint32_t mib = sectors / 2048;
   if (mib >= 1024) {
-    uint32_t tenths = (mib * 10) / 1024; /* MiB -> tenths of a GiB        */
+    uint32_t tenths = (mib * 10) / 1024; /* MiB -> tenths of a GiB */
     con_printf("%u.%u GiB", tenths / 10, tenths % 10);
   } else {
     con_printf("%u MiB", mib);
@@ -297,10 +282,7 @@ static void cmd_storage(void)
     con_printf("  USB        %s  ", xhci_msc_model());
     write_capacity(xhci_msc_sectors());
     con_write(" (xHCI BOT) -- read LBA0: ");
-    /* Safe even on a flaky adapter: every wait in the read is bounded
-     * (event_wait times out in 500 ms) and sti-safe (timer_sleep does
-     * sti;hlt), and a controller that goes silent drops the device
-     * (hc_responsive -> msc_ready=0). So this reports FAIL, never a freeze. */
+    /* Bounded waits and a device drop on silence make this report FAIL, never freeze. */
     con_write(xhci_msc_read(0, buf) == 0 ? "ok\n" : "FAIL\n");
     n++;
   }
@@ -317,12 +299,7 @@ static void cmd_meminfo(void)
   print_kib("heap free:  ", (uint32_t)(heap_free_bytes() / 1024));
 }
 
-/* Split "prog a b c" in place into argv; returns argc (argv[0] is the prog).
- * Honors single/double quotes so an argument may contain spaces, e.g.
- *   curl -H "X-Test: a b"   ->  argv = {"curl","-H","X-Test: a b"}
- * The quote characters are removed and each token is compacted in place (the
- * write head never passes the read head, so this stays a safe in-place edit).
- */
+/* Split "prog a b c" in place into argv; returns argc. Single/double quotes group, quote chars are removed. */
 static int tokenize(char *s, char **argv, int max)
 {
   int argc = 0;
@@ -332,11 +309,11 @@ static int tokenize(char *s, char **argv, int max)
     if (!*s)
       break;
     argv[argc++] = s;
-    char *w = s; /* compacted write head (<= s)      */
-    char q = 0;  /* open quote char, or 0            */
+    char *w = s; /* compacted write head (<= s) */
+    char q = 0;  /* open quote char, or 0 */
     while (*s) {
       char c = *s;
-      if (q) { /* inside quotes: copy until close  */
+      if (q) { /* inside quotes: copy until close */
         if (c == q)
           q = 0;
         else
@@ -344,25 +321,22 @@ static int tokenize(char *s, char **argv, int max)
         s++;
       } else if (c == '"' || c == '\'') {
         q = c;
-        s++; /* open a quote (dropped)           */
+        s++; /* open a quote (dropped) */
       } else if (c == ' ') {
-        break; /* unquoted space ends the token    */
+        break; /* unquoted space ends the token */
       } else {
         *w++ = c;
         s++;
       }
     }
     if (*s == ' ')
-      s++;     /* consume the delimiter            */
-    *w = '\0'; /* terminate the compacted token    */
+      s++;     /* consume the delimiter */
+    *w = '\0'; /* terminate the compacted token */
   }
   return argc;
 }
 
-/* Read argv[0] off disk and spawn it; returns pid (-1 on failure). The program
- * is looked up like a shell PATH: first relative to the current directory (or
- * as an absolute path), then in /bin. argv[0] passed to the program is left as
- * typed. */
+/* Read argv[0] off disk and spawn it; pid or -1. Looked up in the cwd (or absolute), then /bin. */
 static int spawn(int argc, char **argv)
 {
   if (argc == 0)
@@ -373,7 +347,7 @@ static int spawn(int argc, char **argv)
   int sz = -1;
   if (path_resolve(argv[0], path) == 0)
     sz = fs_size(path);
-  if (sz < 0 && argv[0][0] != '/') { /* fall back to /bin/<name>  */
+  if (sz < 0 && argv[0][0] != '/') { /* fall back to /bin/<name> */
     int j = 0;
     const char *pfx = "/bin/";
     for (int i = 0; pfx[i]; i++)
@@ -386,8 +360,7 @@ static int spawn(int argc, char **argv)
   if (sz < 0)
     return -1;
 
-  /* Size the load buffer to the file -- programs are 120+ KiB now, so a fixed
-   * small buffer would truncate the ELF and the load would fail. */
+  /* Size the load buffer to the file; a fixed small buffer would truncate large ELFs. */
   uint8_t *buf = kmalloc((uint32_t)sz);
   if (!buf)
     return -1;
@@ -403,10 +376,7 @@ static void wait_reap(int pid)
 {
   int status;
   while (!sched_try_reap(pid, &status)) {
-    /* While a foreground child runs, the recovery console's main loop is parked
-     * here; leave keystrokes in the ring for a console program's own
-     * read()/readline. (The desktop's keyboard is drained by the user-space
-     * compositor, not this path.) */
+    /* While a foreground child runs, leave keystrokes in the ring for its read(); the desktop drains keys elsewhere. */
     __asm__ volatile("sti; hlt");
   }
   con_printf("[pid %u exited, status %u]\n", (uint32_t)pid, (uint32_t)status);
@@ -439,9 +409,9 @@ static void cmd_run(char *args)
     int p1 = spawn(ac1, av1);
     int p2 = spawn(ac2, av2);
     if (p1 >= 0)
-      sched_set_pipe_fd(p1, 1, 1, id); /* a's stdout -> pipe write     */
+      sched_set_pipe_fd(p1, 1, 1, id); /* a's stdout -> pipe write */
     if (p2 >= 0)
-      sched_set_pipe_fd(p2, 0, 0, id); /* b's stdin  -> pipe read      */
+      sched_set_pipe_fd(p2, 0, 0, id); /* b's stdin -> pipe read */
     __asm__ volatile("sti");
 
     if (p1 < 0 || p2 < 0) {
@@ -467,8 +437,7 @@ static void cmd_run(char *args)
   wait_reap(pid);
 }
 
-/* Does haystack contain needle as a substring? Empty needle matches anything.
- */
+/* Does haystack contain needle? An empty needle matches. */
 static bool str_contains(const char *haystack, const char *needle)
 {
   if (!*needle)
@@ -485,8 +454,7 @@ static bool str_contains(const char *haystack, const char *needle)
   return false;
 }
 
-/* Print the lines of a writable, NUL-terminated buffer that contain pattern,
- * walking it in place (each line is NUL-terminated as we go). */
+/* Print lines of a writable NUL-terminated buffer that contain pattern, walking it in place. */
 static void grep_emit(const char *pattern, char *buf)
 {
   char *p = buf;
@@ -504,9 +472,7 @@ static void grep_emit(const char *pattern, char *buf)
   }
 }
 
-/* "grep <pattern> [file]" — print lines containing <pattern> (plain substring,
- * no regex). With a file it greps owofs; with no file it greps piped input,
- * so the one command serves both "grep p f" and "<cmd> | grep p". */
+/* "grep <pattern> [file]": plain substring match on a file, or on piped input when no file. */
 static void cmd_grep(const char *arg)
 {
   char pattern[LINE_MAX];
@@ -525,7 +491,7 @@ static void cmd_grep(const char *arg)
     return;
   }
 
-  if (name[0] != '\0') { /* file mode                      */
+  if (name[0] != '\0') { /* file mode */
     char *buf = kmalloc(4096);
     if (!buf)
       return;
@@ -537,7 +503,7 @@ static void cmd_grep(const char *arg)
       grep_emit(pattern, buf);
     }
     kfree(buf);
-  } else if (g_pipe_in) { /* piped mode                     */
+  } else if (g_pipe_in) { /* piped mode */
     grep_emit(pattern, g_pipe_in);
   } else {
     con_write("usage: grep <pattern> <file>  (or: <cmd> | grep <pattern>)\n");
@@ -566,41 +532,25 @@ static void cmd_cat(const char *name)
   kfree(buf);
 }
 
-/* Load a .torrent from owofs into a freshly kmalloc'd buffer and parse it.
- * Returns the buffer (caller frees) with *t filled, or NULL on any failure
- * (a message is printed). On success *t owns a node pool freed by
+/* Load and parse a .torrent into a kmalloc'd buffer (caller frees); NULL on failure. *t owns a pool freed by
  * torrent_free(). */
 
-/* Parse a dotted-quad "a.b.c.d" into ip[4]; returns the pointer past it (at
- * the next space or NUL), or NULL on a malformed address. */
+/* Parse a dotted-quad into ip[4]; returns the pointer past it, or NULL if malformed. */
 
-/* torrent get <file> — download a whole single-file torrent concurrently from
- * several peers at once, verifying each piece's SHA-1 into a pre-allocated
- * output file. */
+/* torrent get <file>: concurrent multi-peer download, verifying each piece's SHA-1. */
 
-/* torrent info <file>   — parse a .torrent and print its metainfo + infohash.
- * torrent peers <file>  — announce to its tracker and list the returned peers.
- * torrent peer <f> <ip> <port> — leech piece 0 from one peer, verify its SHA-1.
- * torrent get <file>    — download the whole torrent to disk (single-file).
- * torrent test          — parse an embedded known-good torrent (offline).
- * torrent peers test     — tracker reply parsing self-check (offline). */
+/* torrent subcommands: info, peers, peer, get, test, peers test. */
 
 /* System identity, the fields a POSIX uname reports. */
-#define UNAME_SYSNAME "OwOS"  /* -s kernel name              */
-#define UNAME_NODENAME "owos" /* -n network node name        */
-#define UNAME_RELEASE "0.1"   /* -r kernel release           */
-#define UNAME_MACHINE "i386"  /* -m hardware                 */
+#define UNAME_SYSNAME "OwOS"  /* -s kernel name */
+#define UNAME_NODENAME "owos" /* -n network node name */
+#define UNAME_RELEASE "0.1"   /* -r kernel release */
+#define UNAME_MACHINE "i386"  /* -m hardware */
 
-/* "uname [-asnrmo]" — print system identity. Bare/-s is the kernel name;
- * -a is everything in the conventional sysname/nodename/release/machine order.
- */
+/* "uname [-asnrmo]": print system identity; -s is the default. */
 
-/* A shell built-in is a row in the `builtins` table defined just above run():
- * a name, a handler (called with the argument string — "" when none), and a
- * one-line help string. fn == NULL marks a documentation-only pseudo-entry
- * (curl, the pipe/redirect notes) that `help` prints but dispatch skips. The
- * table is the single source of truth for dispatch, `which`, and `help`. It
- * lives below because it must follow every handler it points at. */
+/* A built-in is a `builtins` row: name, handler, help; fn == NULL rows are help-only. Single source for dispatch, which
+ * and help. */
 typedef void (*cmd_fn)(const char *arg);
 struct builtin {
   const char *name;
@@ -608,15 +558,12 @@ struct builtin {
   const char *help;
 };
 
-/* "which <name>..." — for each name, report whether it resolves to a shell
- * built-in or to a runnable file in owofs (checked in that order, as run()
- * would). Prints a line per name; unresolved names get a "no <name>" notice. */
+/* "which <name>...": report built-in or runnable file for each name, in run() order. */
 
 /* Forward decl: parse_two is defined just below, but cp/mv use it. */
 static void parse_two(const char *arg, char *a, char *b, int cap);
 
-/* If `path` is an existing directory, extend it with the last component of
- * `src` so "cp f /dir" lands at "/dir/f" -- the usual cp/mv convenience. */
+/* If `path` is a directory, append the basename of `src` ("cp f /dir" -> "/dir/f"). */
 static void into_dir(char *path, const char *src)
 {
   if (fs_isdir(path) != 1)
@@ -633,7 +580,7 @@ static void into_dir(char *path, const char *src)
   path[n] = '\0';
 }
 
-/* "cd [dir]" — change the working directory (no arg -> home). */
+/* "cd [dir]", change the working directory (no arg -> home). */
 static void cmd_cd(const char *arg)
 {
   while (*arg == ' ')
@@ -659,11 +606,10 @@ static void cmd_cd(const char *arg)
   cwd[i] = '\0';
 }
 
-/* "pwd" — print the working directory. */
+/* "pwd", print the working directory. */
 static void cmd_pwd(void) { con_printf("%s\n", cwd); }
 
-/* "cp <src> <dst>" — copy a file's contents into a new (or overwritten) file.
- * If <dst> is a directory, the copy lands inside it under <src>'s basename. */
+/* "cp <src> <dst>": copy a file; a directory dst receives it under src's basename. */
 static void cmd_cp(const char *arg)
 {
   char src[PATH_MAX], dst[PATH_MAX], rsrc[PATH_MAX], rdst[PATH_MAX];
@@ -702,8 +648,7 @@ static void cmd_cp(const char *arg)
   kfree(buf);
 }
 
-/* "mv <src> <dst>" — rename/move a file or directory (overwrites a file dst).
- * If <dst> is a directory, the source moves inside it under its basename. */
+/* "mv <src> <dst>": rename or move; a directory dst receives it under src's basename. */
 static void cmd_mv(const char *arg)
 {
   char src[PATH_MAX], dst[PATH_MAX], rsrc[PATH_MAX], rdst[PATH_MAX];
@@ -718,7 +663,7 @@ static void cmd_mv(const char *arg)
   }
   into_dir(rdst, rsrc);
   if (streq(rsrc, rdst))
-    return; /* a no-op, like real mv            */
+    return; /* a no-op, like real mv */
   if (fs_rename(rsrc, rdst) != 0) {
     con_write("mv: failed (no such source, or illegal move)\n");
     return;
@@ -726,7 +671,7 @@ static void cmd_mv(const char *arg)
   con_printf("%s -> %s\n", rsrc, rdst);
 }
 
-/* "rm <file> [file...]" — delete one or more files (sectors leak). */
+/* "rm <file> [file...]", delete one or more files (sectors leak). */
 static void cmd_rm(const char *arg)
 {
   char name[PATH_MAX], extra[PATH_MAX], rpath[PATH_MAX];
@@ -747,11 +692,11 @@ static void cmd_rm(const char *arg)
       con_printf("rm: no such file: %s\n", name);
     }
   }
-  if (extra[0]) /* a courtesy for "rm a b"  */
+  if (extra[0]) /* a courtesy for "rm a b" */
     cmd_rm(extra);
 }
 
-/* "mkdir <dir>" — create a directory. */
+/* "mkdir <dir>", create a directory. */
 static void cmd_mkdir(const char *arg)
 {
   char name[PATH_MAX], extra[PATH_MAX], rpath[PATH_MAX];
@@ -770,7 +715,7 @@ static void cmd_mkdir(const char *arg)
     cmd_mkdir(extra);
 }
 
-/* "rmdir <dir>" — remove an empty directory. */
+/* "rmdir <dir>", remove an empty directory. */
 static void cmd_rmdir(const char *arg)
 {
   char name[PATH_MAX], extra[PATH_MAX], rpath[PATH_MAX];
@@ -797,8 +742,7 @@ static void cmd_rmdir(const char *arg)
     cmd_rmdir(extra);
 }
 
-/* Copy up to two space-separated tokens out of arg into a and b (each `cap`
- * bytes, NUL-terminated). b ends up empty when only one token is present. */
+/* Copy up to two space-separated tokens of arg into a and b (`cap` bytes each); b is empty for one token. */
 static void parse_two(const char *arg, char *a, char *b, int cap)
 {
   int i = 0;
@@ -815,22 +759,15 @@ static void parse_two(const char *arg, char *a, char *b, int cap)
   b[i] = '\0';
 }
 
-/* "unzip <src> [dst]" — restore a zipped file. dst defaults to <src> minus a
- * trailing ".z"; without that suffix an explicit dst is required. */
+/* "unzip <src> [dst]": dst defaults to src minus ".z"; otherwise dst is required. */
 
-/* "gzip <src> [dst]" — compress a file to standard gzip. dst defaults to
- * "<src>.gz"; the output is readable by host gunzip. */
+/* "gzip <src> [dst]": dst defaults to "<src>.gz". */
 
-/* "gunzip <src> [dst]" — decompress a gzip file (from OwOS or host gzip). dst
- * defaults to <src> minus a trailing ".gz". */
+/* "gunzip <src> [dst]": dst defaults to src minus ".gz". */
 
 #define REDIR_MAX (16 * 1024) /* cap on captured output for "cmd > file" */
 
-/* ---- built-in command table ---------------------------------------------
- * Adapters give every handler the uniform cmd_fn shape (one const char *arg).
- * No-arg commands ignore it; a few carry the small bit of glue that used to
- * sit inline in run()'s dispatch ladder. Handlers already taking a single
- * const char * go into the table directly. */
+/* Built-in command table. Adapters give every handler the uniform cmd_fn shape. */
 static void bi_clear(const char *a)
 {
   (void)a;
@@ -874,14 +811,9 @@ static void bi_storage(const char *a)
   cmd_storage();
 }
 
-/* ---- mtp: browse a phone/camera attached in USB file-transfer (MTP) mode ----
- * MTP exposes objects (files + folders), not blocks, so it isn't mounted at
- * /media -- it's walked here, handle by handle, much like `lsusb`/`torrent`. */
+/* mtp: browse a phone/camera in MTP mode; objects, not blocks, so it is not mounted at /media. */
 
-/* Safely detach the removable volume mounted at /media so the medium can be
- * removed. Writes are write-through, so there is nothing buffered to flush --
- * this just drops the mount. `mount` re-probes a non-owofs disk and remounts.
- */
+/* Detach the volume at /media; writes are write-through so nothing needs flushing. */
 /* Build the default mount point "/media/<dev>" into out. */
 static void media_point(const char *dev, char *out)
 {
@@ -894,8 +826,7 @@ static void media_point(const char *dev, char *out)
   out[i] = '\0';
 }
 
-/* umount [point]: detach the volume at `point`, or the first mount if no arg.
- */
+/* umount [point]: detach the volume at `point`, or the first mount if no arg. */
 static void bi_umount(const char *a)
 {
   while (*a == ' ')
@@ -962,12 +893,9 @@ static void bi_mount(const char *a)
   }
   con_write("mount: no unmounted device (try `ls /dev`)\n");
 }
-/* `play` is now the program /bin/play (streaming WAV player); the kernel
- * no longer has a play builtin. is_capture_cli() routes it like neofetch/curl.
- */
+/* `play` is the program /bin/play; is_capture_cli() routes it like neofetch/curl. */
 static void bi_echo(const char *a) { con_printf("%s\n", a); }
-/* clip: with text, copy it to the clipboard (pushed to the host on VMware);
- * with no argument, print the current clipboard contents. */
+/* clip: copy text to the clipboard, or print the clipboard when no argument. */
 static void bi_poweroff(const char *a)
 {
   (void)a;
@@ -982,15 +910,8 @@ static void bi_restart(const char *a)
   power_reset();
 }
 
-/* The one and only command list. Add a built-in here — that wires it into
- * dispatch, `which`, and `help` at once. Order is the order `help` prints.
- * fn == NULL rows are help-only notes for things that aren't bare commands. */
-/* The recovery console is deliberately minimal: enough to inspect and repair
- * the system over COM1 when the desktop isn't up. Everything else (info
- * commands, codecs, clipboard, torrent, ...) lives in the terminal `/bin/term`.
- * A bare non-builtin name still spawns a /bin program, so `curl`, `play`,
- * `neofetch`, etc. remain runnable here -- they're just not listed. `mtp` stays
- * because it's kernel-only with nowhere else to live. */
+/* The one command list; order is `help` order, fn == NULL rows are help-only notes. */
+/* Minimal recovery console for COM1; everything else lives in /bin/term. Bare names still spawn /bin programs. */
 static const struct builtin builtins[] = {
     {"help", cmd_help, "help          show this list"},
     {"clear", bi_clear, "clear         clear the screen"},
@@ -1018,8 +939,7 @@ static const struct builtin builtins[] = {
     {NULL, NULL, NULL}, /* sentinel */
 };
 
-/* Resolve a command name to its row, skipping help-only (fn == NULL) entries.
- */
+/* Resolve a command name to its row, skipping help-only (fn == NULL) entries. */
 static const struct builtin *builtin_find(const char *name)
 {
   for (const struct builtin *b = builtins; b->name || b->help; b++)
@@ -1042,23 +962,22 @@ static void cmd_help(const char *a)
 static void run(char *cmd)
 {
   if (cmd[0] == '\0')
-    return; /* blank line                              */
+    return; /* blank line */
 
-  /* "<cmd> > <file>": capture cmd's text output and write it to file.
-   * Works for any built-in because all of them emit through con_putc. */
+  /* "<cmd> > <file>": capture cmd's output (all built-ins emit via con_putc) and write it to file. */
   char *gt = cmd;
   while (*gt && *gt != '>')
     gt++;
   if (*gt == '>') {
     *gt = '\0';
     char *fname = gt + 1;
-    while (*fname == ' ') /* skip blanks after '>'    */
+    while (*fname == ' ') /* skip blanks after '>' */
       fname++;
-    char *fend = fname; /* stop at first blank      */
+    char *fend = fname; /* stop at first blank */
     while (*fend && *fend != ' ')
       fend++;
     *fend = '\0';
-    char *cend = gt; /* trim blanks before '>'   */
+    char *cend = gt; /* trim blanks before '>' */
     while (cend > cmd && cend[-1] == ' ')
       *--cend = '\0';
 
@@ -1072,7 +991,7 @@ static void run(char *cmd)
       return;
     }
     con_capture_begin(cap, REDIR_MAX);
-    run(cmd); /* no '>' left: dispatches  */
+    run(cmd); /* no '>' left: dispatches */
     uint32_t n = con_capture_end();
     if (fs_create(fname, cap, n) == 0) {
       con_printf("wrote %u bytes to %s\n", n, fname);
@@ -1083,12 +1002,7 @@ static void run(char *cmd)
     return;
   }
 
-  /* Pipe "A | B". Two cases by what B is:
-   *  - B is a program  -> run A and B concurrently through a real kernel pipe
-   *    (cmd_run); A's stdout becomes B's stdin. This is how program pipelines
-   *    work now that there is no `run` keyword.
-   *  - B is a builtin (grep) -> capture A's console output and hand it to B as
-   *    piped input it reads from g_pipe_in. Chains: A | grep x | grep y. */
+  /* Pipe "A | B": if B is a program, run both through a kernel pipe; if a builtin, capture A into g_pipe_in. */
   {
     char *bar = cmd;
     while (*bar && *bar != '|')
@@ -1105,15 +1019,15 @@ static void run(char *cmd)
         rn++;
       }
       rname[rn] = '\0';
-      if (!builtin_find(rname)) { /* B is a program: real pipe   */
-        cmd_run(cmd);             /* splits on '|', spawns both    */
+      if (!builtin_find(rname)) { /* B is a program: real pipe */
+        cmd_run(cmd);             /* splits on '|', spawns both */
         return;
       }
       *bar = '\0';
       char *left = cmd, *right = bar + 1;
       while (*right == ' ')
         right++;
-      char *lend = bar; /* trim blanks before '|'   */
+      char *lend = bar; /* trim blanks before '|' */
       while (lend > left && lend[-1] == ' ')
         *--lend = '\0';
       if (left[0] == '\0' || right[0] == '\0') {
@@ -1139,10 +1053,7 @@ static void run(char *cmd)
     }
   }
 
-  /* Split off the first whitespace-delimited token (the command name); the
-   * rest, leading blanks trimmed, is its argument string ("" when none).
-   * `cmd` is left intact so the /bin fallback can re-tokenize the whole line.
-   */
+  /* Split off the command name; the rest (leading blanks trimmed) is the argument. `cmd` is left intact. */
   char name[64];
   int n = 0;
   while (cmd[n] && cmd[n] != ' ' && n < (int)sizeof(name) - 1) {
@@ -1160,10 +1071,7 @@ static void run(char *cmd)
     return;
   }
 
-  /* Not a builtin: treat it like a shell would — look for a program of that
-   * name (cwd, then /bin) and run it in user space with its arguments. This is
-   * how every user program (hello, args, curl, ...) launches by bare name;
-   * none of them is wired into the command table above. */
+  /* Not a builtin: look for a program of that name (cwd, then /bin) and run it in user space. */
   char *av[8] = {0};
   int ac = tokenize(cmd, av, 8);
   int pid = (ac > 0) ? spawn(ac, av) : -1;
@@ -1178,7 +1086,7 @@ void shell_feed(char c)
 {
   switch (c) {
   case '\n':
-    con_set_pos((uint16_t)(edit_start + line_len)); /* end of line     */
+    con_set_pos((uint16_t)(edit_start + line_len)); /* end of line */
     con_putc('\n');
     line[line_len] = '\0';
     hist_add(line);
@@ -1200,7 +1108,7 @@ void shell_feed(char c)
       }
     }
     return;
-  case KEY_DELETE: /* delete char under the cursor     */
+  case KEY_DELETE: /* delete char under the cursor */
     if (cursor < line_len) {
       for (size_t i = cursor; i + 1 < line_len; i++)
         line[i] = line[i + 1];
@@ -1230,11 +1138,11 @@ void shell_feed(char c)
   case KEY_DOWN:
     hist_down();
     return;
-  case KEY_KILL: /* Ctrl+U: erase the whole line     */
+  case KEY_KILL: /* Ctrl+U: erase the whole line */
     line_len = cursor = 0;
     edit_redraw();
     return;
-  case KEY_CLEAR: /* Ctrl+L: clear, keep the line     */
+  case KEY_CLEAR: /* Ctrl+L: clear, keep the line */
     con_clear();
     print_prompt();
     edit_start = con_get_pos();
@@ -1242,9 +1150,8 @@ void shell_feed(char c)
     edit_redraw();
     return;
   default:
-    /* Insert a printable byte at the cursor. CP437 high bytes (>= 0x80,
-     * negative as signed char) are accent characters from the FR layout;
-     * 0x15 is its CP437 '§'. Other control codes are ignored. */
+    /* Insert a printable byte at the cursor; high bytes are FR-layout CP437 accents (0x15 is '§'); other controls
+     * ignored. */
     if (((unsigned char)c >= 0x20 || (unsigned char)c == 0x15) && line_len < LINE_MAX - 1) {
       int at_end = (cursor == line_len);
       for (size_t i = line_len; i > cursor; i--)
@@ -1252,11 +1159,11 @@ void shell_feed(char c)
       line[cursor] = c;
       cursor++;
       line_len++;
-      if (at_end) { /* fast path: just echo the new char  */
+      if (at_end) { /* fast path: just echo the new char */
         uint32_t s0 = con_scroll_count();
         con_putc(c);
         render_len = line_len;
-        edit_fix_anchor(s0); /* the echo may have scrolled         */
+        edit_fix_anchor(s0); /* the echo may have scrolled */
       } else {
         edit_redraw();
       }
@@ -1265,9 +1172,7 @@ void shell_feed(char c)
   }
 }
 
-/* Ctrl+C at the prompt: abandon whatever is on the line and start fresh. (A
- * Ctrl+C that lands while a command is running is handled by the command
- * itself; by the time control is back here the line is already empty.) */
+/* Ctrl+C at the prompt: abandon the line (a running command handles its own Ctrl+C). */
 void shell_interrupt(void)
 {
   con_set_pos((uint16_t)(edit_start + line_len));
@@ -1277,10 +1182,7 @@ void shell_interrupt(void)
 
 void shell_init(void)
 {
-  /* The shell now owns the console: stop journaling so interactive traffic
-   * isn't logged, and clear the screen so the terminal opens clean -- whether
-   * the boot was quiet (nothing drawn) or verbose (boot log still on screen).
-   * The bring-up log is in the journal; `journal` replays it. */
+  /* The shell owns the console: stop journaling and clear the screen (`journal` replays the bring-up log). */
   journal_capture(0);
   con_clear();
   con_write("type 'help' for commands, 'journal' for the boot log.\n");

@@ -1,4 +1,4 @@
-/* alac.c — see alac.h. A faithful port of Apple's open-source ALAC reference
+/* alac.c, see alac.h. A faithful port of Apple's open-source ALAC reference
  * (Apache-2.0, (c) 2011 Apple Inc.), restructured into one freestanding file:
  *
  *   - BitBuffer          MSB-first bit reader/writer over a byte buffer
@@ -28,8 +28,7 @@
 #endif
 #define nil NULL
 
-/* target is always little-endian (x86); the reference bit writer works on
- * big-endian 32-bit words, so swap on load/store. */
+/* target is always little-endian (x86) */
 static inline uint32_t bswap32(uint32_t x)
 {
   return (x << 24) | ((x << 8) & 0x00ff0000) | ((x >> 8) & 0x0000ff00) | ((x >> 24) & 0xff);
@@ -39,7 +38,7 @@ static inline uint32_t bswap32(uint32_t x)
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
 
-/* ---- constants (aglib.h / dplib.h / ALACAudioTypes.h) -------------------- */
+/* constants (aglib.h / dplib.h / ALACAudioTypes.h) */
 #define QBSHIFT 9
 #define QB (1 << QBSHIFT)
 #define PB0 40
@@ -76,7 +75,7 @@ static inline uint32_t bswap32(uint32_t x)
 
 enum { ID_SCE = 0, ID_CPE = 1, ID_LFE = 3, ID_DSE = 4, ID_FIL = 6, ID_END = 7 };
 
-/* ============================ BitBuffer ================================== */
+/* BitBuffer */
 typedef struct {
   uint8_t *cur;
   uint8_t *end;
@@ -94,7 +93,7 @@ static void BitBufferInit(BitBuffer *bits, uint8_t *buffer, uint32_t byteSize)
   bits->error = 0;
 }
 
-/* Bits still readable from the current position to `end`; 0 once exhausted. */
+/* Bits still readable from the current position to `end`; 0 once exhausted */
 static uint32_t BitBufferRemaining(const BitBuffer *bits)
 {
   if (bits->cur >= bits->end)
@@ -203,8 +202,8 @@ static void BitBufferByteAlign(BitBuffer *bits, int addZeros)
     BitBufferAdvance(bits, 8 - bits->bitIndex);
 }
 
-/* ============================ matrix (mix/unmix) ========================= */
-/* 24-bit words are little-endian 3-byte in memory: byte0=LSB, byte2=MSB. */
+/* matrix (mix/unmix) */
+/* 24-bit words are little-endian 3-byte in memory: byte0=LSB, byte2=MSB */
 #define LBYTE 0
 #define MBYTE 1
 #define HBYTE 2
@@ -601,7 +600,7 @@ static void copyPredictorTo32Shift(int32_t *in, uint16_t *shift, int32_t *out, u
   }
 }
 
-/* ============================ dynamic predictor ========================== */
+/* dynamic predictor */
 static void init_coefs(int16_t *coefs, uint32_t denshift, int32_t numPairs)
 {
   int32_t k, den = 1 << denshift;
@@ -700,11 +699,7 @@ static void unpc_block(int32_t *pc1, int32_t *out, int32_t num, int16_t *coefs, 
     }
     return;
   }
-  /* Warmup writes out[1..numactive] unconditionally. In a valid stream num is
-   * always > numactive, but both num (numSamples) and numactive (numU/numV) are
-   * attacker-controlled and only bounded by frame_length; a hostile packet with
-   * numactive >= num would run this loop past the num-sized buffer. Clamp it.
-   */
+  /* Warmup writes out[1..numactive] unconditionally */
   {
     int32_t warm = (numactive < num) ? numactive : (num - 1);
     for (j = 1; j <= warm; j++) {
@@ -746,7 +741,7 @@ static void unpc_block(int32_t *pc1, int32_t *out, int32_t num, int16_t *coefs, 
   }
 }
 
-/* ============================ adaptive Golomb ============================ */
+/* adaptive Golomb */
 typedef struct {
   uint32_t mb, mb0, pb, kb, wb, qb, fw, sw, maxrun;
 } AGParamRec;
@@ -886,10 +881,7 @@ static int dyn_decomp(AGParamRec *params, BitBuffer *bitstream, int32_t *pc, int
   *outNumBits = 0;
   in = bitstream->cur;
   startPos = bitstream->bitIndex;
-  /* dyn_get* read via read32bit(in + bitPos/8) — relative to `in`, which has
-   * already advanced. Bound bitPos by the bits left from `in` to `end` (not
-   * from the buffer start) or the guard `bitPos >= maxPos` lets reads run past
-   * end. */
+  /* dyn_get* read via read32bit(in + bitPos/8), relative to `in`, which has already advanced */
   maxPos = (uint32_t)(bitstream->end - in) * 8;
   bitPos = startPos;
   mb = params->mb0;
@@ -1107,7 +1099,7 @@ Exit:
   return status;
 }
 
-/* ============================ magic cookie =============================== */
+/* magic cookie */
 static uint32_t rd_be32(const uint8_t *p)
 {
   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
@@ -1143,8 +1135,7 @@ int alac_parse_cookie(const uint8_t *cookie, uint32_t len, alac_config *out)
 {
   if (!cookie || !out)
     return ALAC_EPARAM;
-  /* tolerate a leading 'frma'/'alac' atom wrapper (see
-   * ALACMagicCookieDescription) */
+  /* tolerate a leading 'frma'/'alac' atom wrapper (see ALACMagicCookieDescription) */
   if (len >= 12 && cookie[4] == 'f' && cookie[5] == 'r' && cookie[6] == 'm' && cookie[7] == 'a') {
     cookie += 12;
     len -= 12;
@@ -1210,7 +1201,7 @@ uint32_t alac_max_packet_size(const alac_config *c)
   return c->frame_length * c->num_channels * ((10 + kMaxSampleSize) / 8) + 1;
 }
 
-/* ============================ decoder ==================================== */
+/* decoder */
 struct alac_decoder {
   alac_config cfg;
   int32_t *mixU, *mixV, *predictor;
@@ -1227,9 +1218,7 @@ alac_decoder *alac_decoder_open(const alac_config *c)
     return NULL;
   if (c->bit_depth != 16 && c->bit_depth != 20 && c->bit_depth != 24 && c->bit_depth != 32)
     return NULL;
-  /* Bound frame_length here too (not only in parse_cookie): a direct caller
-   * with a huge value overflows alac_max_packet_size (frame_length*channels*n)
-   * in 32-bit. */
+  /* Bound frame_length here too (not only in parse_cookie) */
   if (c->frame_length == 0 || c->frame_length > (1u << 20))
     return NULL;
   d = (alac_decoder *)malloc(sizeof *d);
@@ -1571,7 +1560,7 @@ Exit:
   return status;
 }
 
-/* ============================ encoder ==================================== */
+/* encoder */
 struct alac_encoder {
   alac_config cfg;
   uint32_t frameSize, bitDepth, numChannels, maxOutputBytes;

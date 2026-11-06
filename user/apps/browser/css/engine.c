@@ -1,19 +1,8 @@
-/* css.c — CSS parser + selector matcher + cascade. See css.h.
- *
- * Scope: selectors are tag / .class / #id / * / compound (div.a#b) / descendant
- * (space) / child (>) / grouping (a, b); structural/state pseudo-classes
- * (:first-child, :nth-child(), :not(), :checked, :root, ... — dynamic ones like
- * :hover never match in a static render) and @supports feature queries are
- * honoured. Cascade is
- * by specificity then source order, with !important winning. Properties acted
- * on: color, background[-color], font-weight, text-decoration, display, width,
- * height (others parse-and-ignore, like any browser). Inline <style> and
- * style="" only — external <link rel=stylesheet> is not fetched. Descendant
- * matching is greedy (no backtracking), enough for ordinary selectors. */
+/* CSS parser, selector matcher and cascade. See css.h.
+   Dynamic pseudo-classes never match in a static render; descendant matching is greedy. */
 #include "engine_int.h"
 
-/* CSS custom-property table (built per active sheet; see "custom properties").
- */
+/* custom-property table, built per active sheet */
 static struct css_var {
   char *name, *val;
 } *g_vars;
@@ -23,8 +12,7 @@ int g_vars_gen = -1;
 static unsigned g_vars_serial; /* bumped whenever the table is rebuilt or dropped */
 static void resolve_vars(const char *in, int inlen, char *out, int *on, int cap, int depth);
 
-/* Viewport the @media features test against; the browser refreshes it per
- * cascade. */
+/* Viewport the @media features test against. */
 int g_vw = 800, g_vh = 600;
 static unsigned g_viewport_gen;
 void css_set_viewport(int width, int height)
@@ -38,8 +26,7 @@ void css_set_viewport(int width, int height)
 }
 unsigned css_viewport_generation(void) { return g_viewport_gen; }
 
-/* ------------------------------------------------ cascade ------------------
- */
+/* cascade */
 static void fold(struct css_style *out, const struct css_style *d)
 {
   if (d->color >= 0)
@@ -242,9 +229,7 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->trans_delay = d->trans_delay;
   if (d->trans_timing >= 0)
     out->trans_timing = d->trans_timing;
-  /* background image layer: the image identity (kind + gradient/url) folds as a
-   * unit; repeat/size/position are independent longhands with their own
-   * sentinels. */
+  /* image identity folds as a unit; repeat/size/position are independent longhands */
   if (d->bgi.kind >= 0) {
     out->bgi.kind = d->bgi.kind;
     out->bgi.angle = d->bgi.angle;
@@ -282,12 +267,7 @@ static void fold(struct css_style *out, const struct css_style *d)
   }
 }
 
-/* ------------------------------------------------ custom properties -------- *
- * CSS variables. Authored `--name: value` declarations are collected sheet-wide
- * into a table (a pragmatic model: variables are nearly always defined on
- * :root, and we treat them as global, last-declaration-wins, honouring @media).
- * At fold time, a declaration that uses var(--name, fallback) is resolved
- * against this table (recursively) before it's interpreted. */
+/* Custom properties: global, last declaration wins, honours @media. */
 static bool var_name_is(const struct css_var *v, const char *name, int len)
 {
   return (int)strlen(v->name) == len && memcmp(v->name, name, (unsigned)len) == 0;
@@ -324,7 +304,7 @@ static void var_store(const char *name, int nlen, const char *val, int vlen)
   char *nv = dup_span(val, vlen);
   if (!nv)
     return;
-  for (int i = 0; i < g_nvars; i++) /* later wins: overwrite */
+  for (int i = 0; i < g_nvars; i++)
     if (var_name_is(&g_vars[i], name, nlen)) {
       free(g_vars[i].val);
       g_vars[i].val = nv;
@@ -395,9 +375,7 @@ bool str_uses_var(const char *s)
       return true;
   return false;
 }
-/* Copy `in`, substituting var(--name, fallback) from the table (recursive,
- * depth- bounded). Unknown var with no fallback expands to empty, as in real
- * CSS. */
+/* Substitute var(--name, fallback) from the table; unknown with no fallback is empty. */
 static void resolve_vars(const char *in, int inlen, char *out, int *on, int cap, int depth)
 {
   int i = 0;
@@ -494,11 +472,7 @@ static const struct css_style *rule_decl(struct css_rule *r)
   return dst;
 }
 
-/* ------------------------------------------------ rule index -------------- *
- * Bucket rules by their rightmost key so an element tests only the rules that
- * can possibly match it (its tag / each class / its id) plus the universal ones
- * — instead of every rule in the sheet. Rebuilt lazily when the sheet changes.
- */
+/* Rule index: rules bucketed by rightmost key (tag/class/id), rebuilt lazily. */
 static unsigned css_hash_n(const char *s, int n)
 {
   unsigned h = 5381;
@@ -507,15 +481,7 @@ static unsigned css_hash_n(const char *s, int n)
   return h % CSS_NBUCK;
 }
 static unsigned css_hash(const char *s) { return css_hash_n(s, (int)strlen(s)); }
-/* Append the index key(s) under which the rightmost compound `st` must be
- * filed, each pointing into the selector tree (stable for the rule's life).
- * Returns 1 with
- * >=1 keys appended, or 0 if the compound can match an element with no usable
- * key (explicit *, an [attr]-only or bare dynamic-pseudo subject) — the caller
- * then files the whole rule universally. A subject :is()/:where() with no key
- * of its own contributes one key per branch, so :is(a.x, b.y) is filed under
- * classes x and y; if any branch is itself universal the whole rule falls back
- * to universal. */
+/* Append index keys for compound `st`; returns 0 if it has no usable key (file universally). */
 struct idx_key {
   int kind;
   const char *str;
@@ -642,10 +608,7 @@ static bool rule_ptr_room(struct css_rule ***buf, int *cap, int need)
   return true;
 }
 
-/* Candidate rules for `el`: the universal bucket + its tag/id/class buckets. A
- * rule may be filed under several keys (an :is()/:where() subject), so a
- * per-rule visit stamp de-dups; selector_match still confirms each (the buckets
- * are a superset). */
+/* Candidate rules for `el`; a per-rule visit stamp de-dups multi-key rules. */
 static unsigned g_visit;
 static int collect_candidates(css_sheet *sh, const struct dom_node *el)
 {
@@ -697,8 +660,7 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el)
   return failed ? -1 : n;
 }
 
-/* Collect rules matching an element. `pseudo` selects ::before/::after when
- * nonzero. Results are ordered by cascade priority, lowest first. */
+/* Rules matching an element, lowest cascade priority first; `pseudo` selects ::before/::after. */
 static int collect_matches(css_sheet *sh, const struct dom_node *el, int pseudo)
 {
   int nc = collect_candidates(sh, el), nm = 0;
@@ -793,17 +755,9 @@ void css_apply_attrs(const struct dom_node *el, struct css_style *out)
   }
 }
 
-/* ------------------------------------------------ page background (alpha) -- *
- * A background-color may be translucent; per CSS it composites over what's
- * behind it (an element's box over its ancestors; the root's over the canvas).
- * css_bg_argb returns an element's cascade-winning background as 0xAARRGGBB via
- * *out, and the caller composites <html> then <body> over a white canvas — so a
- * Tailwind /var(--tw-bg-opacity) tint blends rather than being treated as
- * opaque. The colour + its alpha both come from color_parse_a (color.c). */
+/* css_bg_argb: cascade-winning background as 0xAARRGGBB; caller composites over the canvas. */
 
-/* Pull the (last) background[-color] value out of a declaration block,
- * resolving var() against the sheet table, into out[cap]. Returns 1 if one was
- * present. */
+/* Last background[-color] value in a block, var() resolved, into out[cap]; 1 if present. */
 static char *extract_bg(const char *decls)
 {
   const char *bv = 0, *bve = 0, *s = decls;
@@ -856,8 +810,7 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
     return 0;
   ensure_vars(sh);
 
-  /* highest priority first: inline style="", then sheet rules, then bgcolor=""
-   */
+  /* priority: inline style, sheet rules, then bgcolor */
   const char *inl = dom_get_attr(el, "style");
   if (inl && bg_decl_color(inl, out))
     return 1;
@@ -880,8 +833,7 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
   return 0;
 }
 
-/* ------------------------------------------------ devtools: matched rules ---
- */
+/* devtools: matched rules */
 /* Tiny bounded string appenders for reconstructing selector/media text. */
 static void cm_ap(char *o, int *k, int cap, const char *s)
 {
@@ -1040,8 +992,7 @@ int css_matches(css_sheet *sh, const struct dom_node *el, struct css_match *out,
       sh->match[nm++] = sh->cand[i];
     }
 
-  /* Most-specific / last-declared first (winner on top, like a real devtools).
-   */
+  /* Most specific / last declared first. */
   for (int i = 1; i < nm; i++) {
     struct css_rule *k = sh->match[i];
     int j = i - 1;

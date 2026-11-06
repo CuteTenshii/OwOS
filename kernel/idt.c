@@ -34,8 +34,7 @@ struct idt_entry {
 } __attribute__((packed));
 #endif
 
-/* Operand for lidt. base is uintptr_t so it is the right width per arch (64-bit
- * lidt reads an 8-byte base). */
+/* Operand for lidt; base is uintptr_t (8 bytes on 64-bit). */
 struct idt_ptr {
   uint16_t limit;
   uintptr_t base;
@@ -113,9 +112,7 @@ void idt_set_gate(uint8_t num, uintptr_t base, uint16_t sel, uint8_t flags)
 #endif
 }
 
-/* Tiny string builders for the panic screen, no libc, no heap (the heap may be
- * the very thing that's corrupt). Each returns the new end-of-string pointer.
- */
+/* Panic-screen string builders: no libc or heap (it may be corrupt); return the end pointer. */
 static char *p_str(char *p, const char *s)
 {
   while (*s)
@@ -132,8 +129,7 @@ static char *p_hex(char *p, uint32_t v)
   return p;
 }
 
-/* Is `a` a present page? Unlike paging_user_mapped, no USER bit is required, so the
- * panic handler can probe a supervisor stack word without double-faulting. */
+/* Is `a` a present page? No USER bit needed, so the panic handler can probe supervisor stacks. */
 #ifdef __x86_64__
 static bool addr_present(uint64_t a)
 {
@@ -162,17 +158,16 @@ static bool addr_present(uint32_t a)
 }
 #endif
 
-/* Full-screen crash report on the framebuffer (UEFI has no VGA text, so a fault would look like a hang).
- * Touches no heap or locks; no-op without a graphics mode. */
+/* Crash report on the framebuffer (UEFI has no VGA text); no heap or locks, no-op without graphics. */
 static void panic_screen(struct registers *r)
 {
   if (!fb_active())
     return;
 
   int W = (int)fb_width(), H = (int)fb_height();
-  uint32_t bg = fb_rgb(0x0a, 0x14, 0x6e); /* deep blue, the classic        */
+  uint32_t bg = fb_rgb(0x0a, 0x14, 0x6e);
   uint32_t fg = fb_rgb(0xe6, 0xe6, 0xe6);
-  uint32_t hi = fb_rgb(0xff, 0xd0, 0x40); /* yellow for the heading        */
+  uint32_t hi = fb_rgb(0xff, 0xd0, 0x40);
 
   fb_fill_rect(0, 0, W, H, bg);
 
@@ -208,7 +203,7 @@ static void panic_screen(struct registers *r)
   fb_text(x, y, line, fg, bg);
   y += lh;
 
-  if (r->int_no == 14) { /* page fault: CR2 holds the bad address    */
+  if (r->int_no == 14) { /* page fault: CR2 holds the address */
     uint32_t cr2 = (uint32_t)read_cr2();
     uint32_t cr3 = (uint32_t)read_cr3();
     p = line;
@@ -259,9 +254,7 @@ static void panic_screen(struct registers *r)
   fb_text(x, y, line, fg, bg);
   y += lh;
 
-  /* Breadcrumb: how far did boot get, and which task was current at the fault.
-   * A laptop has no serial capture and the panic clears the boot log, so carry
-   * it here. TEMP diagnostic for the wm-thread boot crash. */
+  /* TEMP: boot progress breadcrumb and current task for the wm-thread boot crash. */
   extern const char *g_boot_stage;
   p = line;
   p = p_str(p, "boot=");
@@ -292,18 +285,16 @@ static void panic_screen(struct registers *r)
   fb_present();
 }
 
-/* The signal a ring-3 CPU exception is reported as, mirroring POSIX: #DE ->
- * SIGFPE, #UD -> SIGILL, everything memory-ish (#PF/#GP/#SS/bounds) -> SIGSEGV.
- */
+/* Ring-3 exception to POSIX signal: #DE SIGFPE, #UD SIGILL, memory faults SIGSEGV. */
 static int fault_signal(uint32_t vec)
 {
   switch (vec) {
   case 0:
-    return SIGFPE; /* divide error                                  */
+    return SIGFPE;
   case 6:
-    return SIGILL; /* invalid opcode                                */
+    return SIGILL;
   default:
-    return SIGSEGV; /* #PF, #GP, #SS, and the rest                    */
+    return SIGSEGV;
   }
 }
 
@@ -313,9 +304,9 @@ void isr_handler(struct registers *r)
   int user_fault = (r->int_no == 0x80 || r->int_no < 32) && (r->cs & 3) == 3;
   if (user_fault)
     sched_kernel_enter();
-  if (r->int_no == 0x80) { /* system call, not an exception            */
+  if (r->int_no == 0x80) {
     syscall_dispatch(r);
-    sched_signal_deliver(r); /* run any pending signal on the way to ring 3 */
+    sched_signal_deliver(r);
     sched_kernel_leave();
     return;
   }
@@ -325,15 +316,14 @@ void isr_handler(struct registers *r)
     return;
   }
 
-  /* Ring-3 fault (CS RPL = 3): deliver the matching signal if handled, else record a
-   * crash window and kill just that process. */
+  /* Ring-3 fault: deliver the signal if handled, else record a crash and kill the process. */
   if (r->int_no < 32 && (r->cs & 3) == 3) {
     if (sched_fault_signal(r, fault_signal(r->int_no))) {
       sched_kernel_leave();
-      return; /* iret runs the user handler               */
+      return;
     }
     crash_record(sched_current_name(), r);
-    sched_exit(139); /* kill the faulting task; never returns    */
+    sched_exit(139);
   }
 
   con_set_color(CON_WHITE, CON_RED);
@@ -341,14 +331,14 @@ void isr_handler(struct registers *r)
 
   con_printf("  vector=0x%08X  err=0x%08X  eip=0x%08X", r->int_no, r->err_code, r->eip);
 
-  if (r->int_no == 14) { /* page fault: CR2 holds the bad address    */
+  if (r->int_no == 14) { /* page fault: CR2 holds the address */
     uint32_t cr2 = (uint32_t)read_cr2();
     con_printf("  cr2=0x%08X", cr2);
   }
 
   con_write("\n  system halted.\n");
 
-  panic_screen(r); /* and a readable version on the framebuffer */
+  panic_screen(r);
 
   for (;;)
     __asm__ volatile("cli; hlt");

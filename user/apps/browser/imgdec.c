@@ -1,6 +1,4 @@
-/* imgdec.c — shared image decoder (see imgdec.h). Dispatches by content to the
- * SVG rasterizer, the WebP decoder and the PNG decoder, always producing RGBA.
- */
+/* imgdec.c - shared image decoder (see imgdec.h) */
 #include "imgdec.h"
 #include "features/svg/svg.h"
 #include "owos.h"

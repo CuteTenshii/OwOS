@@ -1,16 +1,5 @@
-/* encode.c — MPEG-1 video (ISO/IEC 11172-2) encoder. See mpeg.h.
- *
- * The inverse of decode.c: RGB/YCbCr frames -> a conformant elementary stream.
- * Each frame is coded intra (I) or forward-predicted (P, integer-pel
- * full-search motion estimation); blocks go through a forward DCT, quantiser,
- * and the run/ level VLCs. Crucially the encoder *reconstructs* every frame
- * with the exact dequant + IDCT the decoder uses and predicts the next P frame
- * from that reconstruction, so encoder and decoder never drift out of sync.
- *
- * The output round-trips: ffmpeg's mpeg1video decoder — and this library's own
- * decoder — read it back. Rate control is a fixed quantiser (no VBV modelling);
- * B-picture encoding is not implemented (decode-only).
- */
+/* encode.c, MPEG-1 video (ISO/IEC 11172-2) encoder. See mpeg.h. The inverse of decode.c:
+ * RGB/YCbCr frames -> a conformant elementary stream */
 #include "bits.h"
 #include "mpeg.h"
 #include "mpeg_tables.h"
@@ -19,24 +8,22 @@
 struct mpeg_encoder {
   int w, h, mb_w, mb_h, yw, yh, cw, ch;
   int fps_code, qscale, gop;
-  int frame_count; /* pictures emitted so far                  */
+  int frame_count; /* pictures emitted so far */
   bitw bw;
 
   unsigned char intra_q[64], non_intra_q[64];
 
-  /* padded planes: `in` = current input, `rec` = its reconstruction (next
-   * frame's reference), `ref` = previous reconstruction. */
+  /* padded planes: `in` = current input, `rec` = its reconstruction (next frame's reference) */
   unsigned char *pool;
   unsigned char *in_y, *in_cb, *in_cr;
   unsigned char *ref_y, *ref_cb, *ref_cr;
   unsigned char *rec_y, *rec_cb, *rec_cr;
 
-  int pmv[2];     /* motion-vector predictor (integer pel)    */
-  int dc_pred[3]; /* intra DC predictors                      */
+  int pmv[2];     /* motion-vector predictor (integer pel) */
+  int dc_pred[3]; /* intra DC predictors */
 };
 
-/* ---- forward + inverse transforms (inverse mirrors decode.c exactly) ------
- */
+/* forward + inverse transforms (inverse mirrors decode.c exactly) */
 static void fdct(const int in[64], double out[64])
 {
   double g[64];
@@ -81,8 +68,7 @@ static int dequant(const struct mpeg_encoder *e, int level, int r, int intra)
   return val;
 }
 
-/* Inverse DCT of `blk` (raster) into an 8x8 region; add to prediction (P) or
- * overwrite with a clamped pixel (intra). Identical arithmetic to decode.c. */
+/* Inverse DCT of `blk` into an 8x8 region; add to prediction or overwrite with a clamped pixel */
 static void idct_out(const int blk[64], int add, unsigned char *out, int stride)
 {
   double tmp[64];
@@ -111,7 +97,7 @@ static void idct_out(const int blk[64], int add, unsigned char *out, int stride)
     }
 }
 
-/* ---- VLC encoders (reverse of the shared tables) ------------------------- */
+/* VLC encoders (reverse of the shared tables) */
 static void put_coeff(bitw *w, int run, int alevel, int sign)
 {
   int i;
@@ -141,10 +127,7 @@ static void put_coeff(bitw *w, int run, int alevel, int sign)
 }
 static void put_eob(bitw *w) { bw_put(w, mpeg_dct_vlc[MPEG_DCT_EOB][0], mpeg_dct_vlc[MPEG_DCT_EOB][1]); }
 
-/* Encode one intra block: DC differential (per the luma/chroma DC-size VLC)
- * then the AC run/levels. `levels` is quantised, raster order; comp picks the
- * DC table and predictor. Returns nothing; also fills `rec_levels` for
- * reconstruction. */
+/* Encode one intra block: DC differential then the AC run/levels */
 static void put_intra_block(struct mpeg_encoder *e, const int levels[64], int comp)
 {
   int cc = (comp < 4) ? 0 : (comp - 3);
@@ -153,7 +136,7 @@ static void put_intra_block(struct mpeg_encoder *e, const int levels[64], int co
   const unsigned short (*dctab)[2] = comp < 4 ? mpeg_dc_lum : mpeg_dc_chroma;
   e->dc_pred[cc] = dc;
   while ((1u << size) <= mag)
-    size++; /* bits to hold |diff|      */
+    size++; /* bits to hold |diff| */
   bw_put(&e->bw, dctab[size][0], dctab[size][1]);
   if (size > 0) {
     int v = diff >= 0 ? diff : diff + (1 << size) - 1;
@@ -193,7 +176,7 @@ static void put_inter_block(struct mpeg_encoder *e, const int levels[64])
   put_eob(&e->bw);
 }
 
-/* macroblock_type: emit the {code,len} for `flags` from a P/B or I table. */
+/* macroblock_type: emit the {code,len} for `flags` from a P/B or I table */
 static void put_mbtype(bitw *w, const unsigned char (*tab)[3], int n, int flags)
 {
   int i;
@@ -204,7 +187,7 @@ static void put_mbtype(bitw *w, const unsigned char (*tab)[3], int n, int flags)
     }
 }
 
-/* One motion-vector component: the value `d = mv - pred` (integer pel here). */
+/* One motion-vector component: the value `d = mv - pred` (integer pel here) */
 static void put_mv(bitw *w, int d, int f_code)
 {
   int r_size = f_code - 1, a, code, residual, sign;
@@ -222,8 +205,7 @@ static void put_mv(bitw *w, int d, int f_code)
     bw_put(w, residual, r_size);
 }
 
-/* ---- quantisation ---------------------------------------------------------
- */
+/* quantisation */
 static int q_intra_ac(const struct mpeg_encoder *e, double coef, int r)
 {
   double q = coef * 8.0 / (e->qscale * e->intra_q[r]);
@@ -245,9 +227,8 @@ static int q_inter(const struct mpeg_encoder *e, double coef, int r)
   return lv;
 }
 
-/* ---- block helpers --------------------------------------------------------
- */
-/* Gather an 8x8 block of a plane into `blk` (ints). */
+/* block helpers */
+/* Gather an 8x8 block of a plane into `blk` (ints) */
 static void gather(const unsigned char *p, int stride, int bx, int by, int blk[64])
 {
   int y, x;
@@ -256,7 +237,7 @@ static void gather(const unsigned char *p, int stride, int bx, int by, int blk[6
       blk[y * 8 + x] = p[(by + y) * stride + bx + x];
 }
 
-/* Intra-code one 8x8 block: fdct -> quant -> emit -> reconstruct into `rec`. */
+/* Intra-code one 8x8 block: fdct -> quant -> emit -> reconstruct into `rec` */
 static void encode_intra_block(struct mpeg_encoder *e, const unsigned char *src, int sstride, unsigned char *rec,
                                int rstride, int bx, int by, int comp)
 {
@@ -274,10 +255,7 @@ static void encode_intra_block(struct mpeg_encoder *e, const unsigned char *src,
   idct_out(deq, 0, rec + by * rstride + bx, rstride);
 }
 
-/* ---- motion estimation ----------------------------------------------------
- */
-/* SAD of the 16x16 luma block at (mbx,mby) against the reference shifted by
- * (dx,dy) integer pixels, with edge clamping. */
+/* motion estimation */
 static int sad16(const struct mpeg_encoder *e, int mbx, int mby, int dx, int dy)
 {
   const unsigned char *cur = e->in_y, *ref = e->ref_y;
@@ -302,10 +280,6 @@ static int sad16(const struct mpeg_encoder *e, int mbx, int mby, int dx, int dy)
 #define ME_RANGE 15
 static void motion_search(const struct mpeg_encoder *e, int mbx, int mby, int *bestx, int *besty, int *bestsad)
 {
-  /* Constrain the search so the 16x16 block never references pixels outside the
-   * reference frame: it keeps predictions unambiguous (no reliance on a
-   * decoder's edge-extension policy), so the output is portable to any
-   * conformant decoder. */
   int dx, dy, best = sad16(e, mbx, mby, 0, 0);
   int lox = -mbx * 16, hix = e->yw - 16 - mbx * 16;
   int loy = -mby * 16, hiy = e->yh - 16 - mby * 16;
@@ -329,9 +303,7 @@ static void motion_search(const struct mpeg_encoder *e, int mbx, int mby, int *b
   *bestsad = best;
 }
 
-/* Half-pel motion compensation, byte-for-byte identical to decode.c's mc_block,
- * so the encoder's reconstruction matches what a conformant decoder produces.
- * mv is in half-pel units. */
+/* Half-pel motion compensation, byte-for-byte identical to decode.c's mc_block */
 static void mc_pred(unsigned char *dst, int dstride, const unsigned char *src, int sw, int sh, int bx, int by, int mvx,
                     int mvy, int bw, int bh)
 {
@@ -367,10 +339,7 @@ static void mc_pred(unsigned char *dst, int dstride, const unsigned char *src, i
     }
 }
 
-/* Write the (half-pel) prediction for macroblock (mbx,mby) into the
- * reconstruction planes; coded residuals are then added on top. `hmvx`/`hmvy`
- * are the luma motion in half-pel units; chroma uses mv/2 exactly as the
- * decoder does. */
+/* Write the (half-pel) prediction for macroblock (mbx,mby) into the reconstruction planes */
 static void build_pred(struct mpeg_encoder *e, int mbx, int mby, int hmvx, int hmvy)
 {
   int cmvx = hmvx / 2, cmvy = hmvy / 2;
@@ -380,9 +349,7 @@ static void build_pred(struct mpeg_encoder *e, int mbx, int mby, int hmvx, int h
   mc_pred(e->rec_cr + (mby * 8) * e->cw + mbx * 8, e->cw, e->ref_cr, e->cw, e->ch, mbx * 8, mby * 8, cmvx, cmvy, 8, 8);
 }
 
-/* Quantise one 8x8 inter residual (src - pred, where pred is already in rec)
- * into `levels`. Returns 1 if any coefficient is nonzero. Does not modify rec.
- */
+/* Quantise one 8x8 inter residual (src - pred, where pred is already in rec) into `levels` */
 static int quant_inter_block(struct mpeg_encoder *e, const unsigned char *src, int sstride, const unsigned char *rec,
                              int rstride, int bx, int by, int levels[64])
 {
@@ -400,7 +367,7 @@ static int quant_inter_block(struct mpeg_encoder *e, const unsigned char *src, i
   return any;
 }
 
-/* Add a coded inter block's reconstructed residual on top of the prediction. */
+/* Add a coded inter block's reconstructed residual on top of the prediction */
 static void recon_inter_block(struct mpeg_encoder *e, const int levels[64], unsigned char *rec, int rstride, int bx,
                               int by)
 {
@@ -410,8 +377,7 @@ static void recon_inter_block(struct mpeg_encoder *e, const int levels[64], unsi
   idct_out(deq, 1, rec + by * rstride + bx, rstride);
 }
 
-/* ---- headers --------------------------------------------------------------
- */
+/* headers */
 static void start_code(bitw *w, int id)
 {
   bw_align(w);
@@ -442,42 +408,41 @@ static void write_seq_header(struct mpeg_encoder *e)
   start_code(&e->bw, 0xB3);
   bw_put(&e->bw, e->w, 12);
   bw_put(&e->bw, e->h, 12);
-  bw_put(&e->bw, 1, 4); /* aspect_ratio 1:1 pel                */
+  bw_put(&e->bw, 1, 4); /* aspect_ratio 1:1 pel */
   bw_put(&e->bw, e->fps_code, 4);
-  bw_put(&e->bw, 0x3FFFF, 18); /* bit_rate: unspecified/variable      */
-  bw_put(&e->bw, 1, 1);        /* marker                              */
-  bw_put(&e->bw, 112, 10);     /* vbv_buffer_size                     */
-  bw_put(&e->bw, 0, 1);        /* constrained_parameters              */
-  bw_put(&e->bw, 0, 1);        /* load_intra_quantiser (use default)  */
-  bw_put(&e->bw, 0, 1);        /* load_non_intra_quantiser            */
+  bw_put(&e->bw, 0x3FFFF, 18); /* bit_rate: unspecified/variable */
+  bw_put(&e->bw, 1, 1);        /* marker */
+  bw_put(&e->bw, 112, 10);     /* vbv_buffer_size */
+  bw_put(&e->bw, 0, 1);        /* constrained_parameters */
+  bw_put(&e->bw, 0, 1);        /* load_intra_quantiser (use default) */
+  bw_put(&e->bw, 0, 1);        /* load_non_intra_quantiser */
 }
 
-/* ---- per-frame encode -----------------------------------------------------
- */
+/* per-frame encode */
 static void encode_frame_internal(struct mpeg_encoder *e, int is_i)
 {
   static const int bx4[4] = {0, 8, 0, 8}, by4[4] = {0, 0, 8, 8};
-  int f_code = 3; /* half-pel MVs (full_pel off)          */
+  int f_code = 3; /* half-pel MVs (full_pel off) */
   int row, col, comp;
 
   if (is_i)
-    write_seq_header(e); /* a fresh seq header at each I frame   */
+    write_seq_header(e); /* a fresh seq header at each I frame */
 
-  start_code(&e->bw, 0x00);                   /* picture start                       */
-  bw_put(&e->bw, e->frame_count & 0x3FF, 10); /* temporal_reference          */
+  start_code(&e->bw, 0x00);                   /* picture start */
+  bw_put(&e->bw, e->frame_count & 0x3FF, 10); /* temporal_reference */
   bw_put(&e->bw, is_i ? MPEG_PIC_I : MPEG_PIC_P, 3);
-  bw_put(&e->bw, 0xFFFF, 16); /* vbv_delay                           */
+  bw_put(&e->bw, 0xFFFF, 16); /* vbv_delay */
   if (!is_i) {
     bw_put(&e->bw, 0, 1);
     bw_put(&e->bw, f_code, 3);
   } /* full_pel off + f_code */
-  bw_put(&e->bw, 0, 1); /* extra_bit_picture                   */
+  bw_put(&e->bw, 0, 1); /* extra_bit_picture */
 
   for (row = 0; row < e->mb_h; row++) {
     int prev_col = -1;
-    start_code(&e->bw, row + 1); /* slice, vertical position = row+1     */
+    start_code(&e->bw, row + 1); /* slice, vertical position = row+1 */
     bw_put(&e->bw, e->qscale, 5);
-    bw_put(&e->bw, 0, 1); /* extra_bit_slice                      */
+    bw_put(&e->bw, 0, 1); /* extra_bit_slice */
     e->pmv[0] = e->pmv[1] = 0;
     e->dc_pred[0] = e->dc_pred[1] = e->dc_pred[2] = 128;
 
@@ -504,7 +469,7 @@ static void encode_frame_internal(struct mpeg_encoder *e, int is_i)
         hmvy = mvy * 2; /* integer-pel ME -> even half-pel MV */
         first_last = (col == 0 || col == e->mb_w - 1);
 
-        /* Prediction into rec; residual-quantise each block for cbp. */
+        /* Prediction into rec; residual-quantise each block for cbp */
         build_pred(e, mbx, mby, hmvx, hmvy);
         for (comp = 0; comp < 4; comp++)
           if (quant_inter_block(e, e->in_y, e->yw, e->rec_y, e->yw, mbx * 16 + bx4[comp], mby * 16 + by4[comp],
@@ -537,7 +502,7 @@ static void encode_frame_internal(struct mpeg_encoder *e, int is_i)
         e->pmv[0] = hmvx;
         e->pmv[1] = hmvy;
 
-        /* Emit + reconstruct the coded blocks (rec already holds pred). */
+        /* Emit + reconstruct the coded blocks (rec already holds pred) */
         for (comp = 0; comp < 6; comp++) {
           if (!((cbp >> (5 - comp)) & 1))
             continue;
@@ -555,8 +520,7 @@ static void encode_frame_internal(struct mpeg_encoder *e, int is_i)
   }
 }
 
-/* ---- public API -----------------------------------------------------------
- */
+/* public API */
 static void copy_pad(unsigned char *dst, int dw, int dh, const unsigned char *src, int sw, int sh)
 {
   int y, x;
@@ -620,8 +584,7 @@ int mpeg_encode_frame_rgb(mpeg_encoder *e, const unsigned char *rgb)
       e->in_y[y * e->yw + x] = (unsigned char)Y;
     }
   }
-  /* chroma: average each 2x2 RGB block, then edge-replicate to the padded plane
-   */
+  /* chroma: average each 2x2 RGB block, then edge-replicate to the padded plane */
   for (cy = 0; cy < e->ch; cy++)
     for (cx = 0; cx < e->cw; cx++) {
       int scx = cx < cwi ? cx : cwi - 1, scy = cy < chi ? cy : chi - 1;
@@ -722,12 +685,12 @@ int mpeg_encoder_finish(mpeg_encoder *e, unsigned char **out, unsigned *outlen)
 {
   if (!e || !out || !outlen)
     return MPEG_EFORMAT;
-  start_code(&e->bw, 0xB7); /* sequence_end_code                   */
+  start_code(&e->bw, 0xB7); /* sequence_end_code */
   if (e->bw.oom)
     return MPEG_ENOMEM;
   *out = e->bw.buf;
   *outlen = e->bw.len;
-  e->bw.buf = 0; /* ownership transferred to caller     */
+  e->bw.buf = 0; /* ownership transferred to caller */
   return MPEG_OK;
 }
 

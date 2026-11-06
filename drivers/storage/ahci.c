@@ -1,24 +1,5 @@
-/* ahci.c — AHCI (SATA) host-bus-adapter driver, polled and single-port.
- *
- * Flow, mirroring how AHCI hardware actually works:
- *   1. Find the controller on PCI (class 0x01 / subclass 0x06) and read its
- *      MMIO register block (ABAR = BAR5). Identity-map it so the kernel can
- *      touch the registers directly (it lives above the 16 MiB identity map).
- *   2. Enable the controller (GHC.AE) and scan the implemented ports for one
- *      whose PHY is up and whose signature says "SATA disk".
- *   3. Give that port three DMA areas — a command list, a received-FIS area,
- *      and one command table — all page-aligned frames from the pool, which is
- *      identity-mapped so physical == virtual (the addresses the HBA needs).
- *   4. Per I/O: build a Register-Host-to-Device FIS carrying READ/WRITE DMA
- *      EXT, point a single PRDT entry at a bounce buffer, ring the doorbell
- *      (PxCI), and poll until the controller clears the bit.
- *
- * Polled, one sector at a time — same contract as ata.c, just over DMA. Every
- * wait is bounded so a wedged or absent drive returns -1 instead of hanging.
- *
- * Note: the MMIO mapping is cached (paging_identity_map has no uncached flag).
- * That is fine under QEMU; on real silicon AHCI registers want PCD set.
- */
+/* ahci.c: polled single-port AHCI (SATA) driver, one sector at a time over DMA.
+ * Per I/O: Reg H2D FIS (READ/WRITE DMA EXT), one PRDT entry to a bounce buffer, ring PxCI, poll. Waits are bounded. */
 
 #include <stdbool.h>
 
@@ -28,9 +9,6 @@
 #include "pci.h"
 #include "spinlock.h"
 
-/* ------------------------------------------------------- HBA / port registers
- */
-
 #define AHCI_CLASS 0x01
 #define AHCI_SUBCLASS 0x06
 
@@ -38,68 +16,59 @@
 #define HBA_CAP 0x00
 #define HBA_GHC 0x04
 #define HBA_IS 0x08
-#define HBA_PI 0x0C /* ports implemented, one bit per port            */
+#define HBA_PI 0x0C
 
-#define GHC_AE 0x80000000u /* AHCI enable */
+#define GHC_AE 0x80000000u
 
 /* Per-port register block: PORT_BASE(n) + register offset. */
 #define PORT_BASE(n) (0x100 + (n) * 0x80)
-#define PX_CLB 0x00 /* command-list base (1 KiB aligned)              */
+#define PX_CLB 0x00
 #define PX_CLBU 0x04
-#define PX_FB 0x08 /* received-FIS base (256 B aligned)              */
+#define PX_FB 0x08
 #define PX_FBU 0x0C
 #define PX_IS 0x10
 #define PX_IE 0x14
 #define PX_CMD 0x18
-#define PX_TFD 0x20  /* task-file data (ATA status/error)              */
-#define PX_SIG 0x24  /* device signature                               */
-#define PX_SSTS 0x28 /* SATA status (DET/IPM)                          */
+#define PX_TFD 0x20
+#define PX_SIG 0x24
+#define PX_SSTS 0x28
 #define PX_SERR 0x30
-#define PX_CI 0x38 /* command issue (the doorbell)                   */
+#define PX_CI 0x38
 
-#define CMD_ST 0x0001  /* start                                          */
-#define CMD_FRE 0x0010 /* FIS-receive enable                             */
-#define CMD_FR 0x4000  /* FIS-receive running                            */
-#define CMD_CR 0x8000  /* command-list running                           */
+#define CMD_ST 0x0001
+#define CMD_FRE 0x0010
+#define CMD_FR 0x4000
+#define CMD_CR 0x8000
 
 #define TFD_BSY 0x80
 #define TFD_DRQ 0x08
-#define IS_TFES 0x40000000u /* task-file error */
+#define IS_TFES 0x40000000u
 
-#define SIG_SATA 0x00000101u /* signature of a plain SATA disk                 */
+#define SIG_SATA 0x00000101u
 
 #define ATA_READ_DMA_EX 0x25
 #define ATA_WRITE_DMA_EX 0x35
 
 #define POLL_LIMIT 5000000u
 
-/* --------------------------------------------------------------------- state
- */
-
-static volatile uint32_t *abar; /* mapped MMIO register block                 */
+static volatile uint32_t *abar;
 static bool found;
-static int port; /* the port we drive                          */
+static int port;
 static uint32_t cap_sectors;
-static char model[41]; /* drive model from IDENTIFY                   */
+static char model[41];
 
 /* DMA areas, each a page-aligned identity-mapped frame (phys == virt). */
-static volatile uint32_t *clb; /* command list (32 headers x 32 B)           */
-static volatile uint8_t *fis;  /* received-FIS area                          */
-static volatile uint8_t *ctab; /* one command table (CFIS + PRDT)            */
-static volatile uint8_t *dbuf; /* one-page DMA bounce buffer                 */
+static volatile uint32_t *clb;
+static volatile uint8_t *fis;
+static volatile uint8_t *ctab;
+static volatile uint8_t *dbuf;
 static spinlock_t io_lock;
-
-/* ----------------------------------------------------------------- MMIO + I/O
- */
 
 static inline uint32_t hba_rd(uint32_t off) { return abar[off / 4]; }
 static inline void hba_wr(uint32_t off, uint32_t v) { abar[off / 4] = v; }
 
 static inline uint32_t port_rd(uint32_t reg) { return abar[(PORT_BASE(port) + reg) / 4]; }
 static inline void port_wr(uint32_t reg, uint32_t v) { abar[(PORT_BASE(port) + reg) / 4] = v; }
-
-/* ----------------------------------------------------------- port start/stop
- */
 
 static void port_stop(void)
 {
@@ -121,17 +90,13 @@ static void port_start(void)
   port_wr(PX_CMD, port_rd(PX_CMD) | CMD_ST);
 }
 
-/* ------------------------------------------------------------- command issue
- */
-
-/* Build a one-sector READ/WRITE DMA EXT command in slot 0 and ring PxCI.
- * Returns 0 on success, -1 on timeout or task-file error. */
+/* Build a one-sector READ/WRITE DMA EXT command in slot 0 and ring PxCI. */
 static int issue(uint32_t lba, uint32_t count, uint8_t ata_cmd, bool write)
 {
   if (count == 0 || count > 8)
     return -1;
-  port_wr(PX_SERR, 0xFFFFFFFFu); /* clear sticky errors            */
-  port_wr(PX_IS, 0xFFFFFFFFu);   /* clear port interrupt status    */
+  port_wr(PX_SERR, 0xFFFFFFFFu);
+  port_wr(PX_IS, 0xFFFFFFFFu);
 
   /* Wait for the drive to be idle before handing it a command. */
   uint32_t i;
@@ -143,8 +108,8 @@ static int issue(uint32_t lba, uint32_t count, uint8_t ata_cmd, bool write)
 
   /* Command header 0: 5-dword command FIS, one PRDT entry, W bit for writes. */
   clb[0] = 5 | (write ? (1u << 6) : 0) | (1u << 16);
-  clb[1] = 0;                         /* PRDBC (filled by HBA)          */
-  clb[2] = (uint32_t)(uintptr_t)ctab; /* command-table base (phys)      */
+  clb[1] = 0;
+  clb[2] = (uint32_t)(uintptr_t)ctab;
   clb[3] = 0;
 
   /* Command table: zero the CFIS + PRDT region we touch. */
@@ -159,23 +124,23 @@ static int issue(uint32_t lba, uint32_t count, uint8_t ata_cmd, bool write)
   ct[4] = lba & 0xFF;
   ct[5] = (lba >> 8) & 0xFF;
   ct[6] = (lba >> 16) & 0xFF;
-  ct[7] = 0x40; /* LBA mode                       */
+  ct[7] = 0x40;
   ct[8] = (lba >> 24) & 0xFF;
-  ct[12] = (uint8_t)count; /* sector count (low)                 */
+  ct[12] = (uint8_t)count;
 
   /* PRDT entry 0 (at offset 0x80): point at the bounce buffer, 512 bytes. */
   volatile uint32_t *prdt = (volatile uint32_t *)(ctab + 0x80);
-  prdt[0] = (uint32_t)(uintptr_t)dbuf; /* data base (phys)               */
+  prdt[0] = (uint32_t)(uintptr_t)dbuf;
   prdt[1] = 0;
   prdt[2] = 0;
-  prdt[3] = (count * 512 - 1) & 0x3FFFFF; /* byte count - 1, no IRQ */
+  prdt[3] = (count * 512 - 1) & 0x3FFFFF;
 
-  port_wr(PX_CI, 1); /* ring the doorbell for slot 0   */
+  port_wr(PX_CI, 1);
 
   for (i = 0; i < POLL_LIMIT; i++) {
     if (!(port_rd(PX_CI) & 1))
       break;
-    if (port_rd(PX_IS) & IS_TFES) /* task-file error                */
+    if (port_rd(PX_IS) & IS_TFES)
       return -1;
   }
   if (i == POLL_LIMIT)
@@ -222,12 +187,7 @@ int ahci_present(void) { return found; }
 uint32_t ahci_sectors(void) { return cap_sectors; }
 const char *ahci_model(void) { return model; }
 
-/* --------------------------------------------------------------------- probe
- */
-
-/* Send IDENTIFY DEVICE (0xEC), then pull the 48-bit sector count (words
- * 100..103) and the model string (words 27..46) out of the 512-byte identify
- * block left in the DMA buffer. Best-effort: 0/"" means unknown. */
+/* IDENTIFY DEVICE (0xEC): read the 48-bit sector count (words 100..103) and model (words 27..46); best-effort. */
 static uint32_t identify_drive(void)
 {
   model[0] = '\0';
@@ -294,13 +254,11 @@ void ahci_init(void)
     con_write("ahci: could not map MMIO\n");
     return;
   }
-  /* MMIO must be uncached, or on real hardware a command-list/doorbell write
-   * can linger in the write-back cache and the HBA never sees it. QEMU hides
-   * this. */
+  /* Mark MMIO uncached, or a doorbell write can linger in the write-back cache (QEMU hides this). */
   paging_mark_uc(bar5, 0x2000);
   abar = (volatile uint32_t *)(uintptr_t)bar5;
 
-  hba_wr(HBA_GHC, hba_rd(HBA_GHC) | GHC_AE); /* take the HBA out of legacy mode */
+  hba_wr(HBA_GHC, hba_rd(HBA_GHC) | GHC_AE);
 
   /* Find the first implemented port with a SATA disk whose PHY is up. */
   uint32_t pi = hba_rd(HBA_PI);
@@ -312,9 +270,9 @@ void ahci_init(void)
     uint32_t ssts = port_rd(PX_SSTS);
     uint8_t det = ssts & 0x0F;
     uint8_t ipm = (ssts >> 8) & 0x0F;
-    if (det != 3 || ipm != 1) /* not present / not active        */
+    if (det != 3 || ipm != 1)
       continue;
-    if (port_rd(PX_SIG) != SIG_SATA) /* skip ATAPI/other signatures     */
+    if (port_rd(PX_SIG) != SIG_SATA)
       continue;
     chosen = p;
     break;
@@ -325,8 +283,7 @@ void ahci_init(void)
   }
   port = chosen;
 
-  /* Carve the per-port DMA areas from the identity-mapped frame pool, so the
-   * physical addresses the HBA reads back are exactly these pointers. */
+  /* Carve the per-port DMA areas from the identity-mapped pool (phys == virt). */
   clb = palloc();
   fis = palloc();
   ctab = palloc();
@@ -343,7 +300,7 @@ void ahci_init(void)
   port_wr(PX_FBU, 0);
   port_wr(PX_SERR, 0xFFFFFFFFu);
   port_wr(PX_IS, 0xFFFFFFFFu);
-  port_wr(PX_IE, 0); /* polled: no interrupts          */
+  port_wr(PX_IE, 0);
   port_start();
 
   found = true;
@@ -354,7 +311,7 @@ void ahci_init(void)
     con_printf(" [%s]", model);
   }
   if (cap_sectors) {
-    con_printf(", %u MiB", cap_sectors / 2048); /* 512-B sectors -> MiB */
+    con_printf(", %u MiB", cap_sectors / 2048);
   }
   con_putc('\n');
 }

@@ -1,12 +1,4 @@
-/* notifysend.c - /bin/notify-send: raise a notification from the shell.
- *
- *   notify-send <title> [body]
- *   notify-send -i <image.png> <title> [body]
- *   notify-send -a <app> -b "Label:command" <title> [body]
- *
- * -i sets the thumbnail image, -a the sending app's name, and each -b adds an
- * action button "Label:command" (the command is spawned when the button is
- * clicked). The rest is the title and an optional body. */
+/* notifysend.c - /bin/notify-send: raise a notification from the shell */
 #include "notify.h"
 #include "opt.h"
 #include "owos.h"

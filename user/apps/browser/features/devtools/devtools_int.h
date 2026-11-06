@@ -12,9 +12,7 @@
 enum { TAB_ELEMENTS, TAB_STYLES, TAB_CONSOLE, TAB_NETWORK, TAB_APP, N_TABS };
 typedef char dt_panel_count_matches[N_TABS == DT_PANELS ? 1 : -1]; /* keep dt_view in sync */
 #define DT_HDR 22                                                  /* tab-strip height at the panel top           */
-/* A code view is monospace: rows use the fixed cell font via gfx_text_utf8,
- * which decodes UTF-8 (so accents render) while keeping one column per
- * character. */
+/* Code view rows use the fixed cell font via gfx_text_utf8 (UTF-8, one column per character). */
 #define ROW_H GLYPH_H /* monospace cell height (16)                    */
 struct textblk {
   char *buf;
@@ -29,9 +27,7 @@ struct dt_crumb {
   char label[40];
 };
 #define CON_MAX 400
-/* A `%c` style span: from byte `off` in the line's (marker-stripped) text,
- * apply these overrides until the next run. Parsed out of the JS_STYLE_ON/OFF
- * markers the engine embeds (see interp.h) when con_push stores the line. */
+/* A `%c` style span: from byte `off` in the marker-stripped text, apply overrides until the next run. */
 struct crun {
   int off;
   unsigned fg, bg;
@@ -55,9 +51,7 @@ struct netinfo {
   char *resp_hdr;
 };
 enum { NF_ALL, NF_DOC, NF_CSS, NF_JS, NF_IMG, NF_FONT, NF_OTHER, NF_N };
-/* A conline `level` used only by net rows for the dim NET_PENDING colour —
- * never a console level (those are DT_LOG/WARN/ERROR), so the console filter is
- * unaffected. */
+/* Conline `level` for net rows (dim NET_PENDING colour); never a console level, so filters ignore it. */
 #define DT_NET_PENDING_LVL 3
 
 extern mutex_t dt_lk;

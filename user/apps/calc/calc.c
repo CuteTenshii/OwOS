@@ -1,9 +1,4 @@
-/* calc.c — a four-function desktop calculator.
- *
- * Immediate-execution semantics (the pocket-calculator model, not an expression
- * parser): an entry buffer the user edits, a single pending operator, and a
- * running accumulator folded each time an operator or `=` is pressed. Driven by
- * both the on-screen keypad (mouse) and the physical keyboard. */
+/* calc.c: a four-function desktop calculator with immediate-execution semantics. */
 #include "fmt.h"
 #include "gfx.h"
 #include "owos.h"
@@ -28,9 +23,7 @@
 #define KEY_BD 0x12151cu  /* key border                 */
 #define KEY_HL 0xc9d4e6u  /* hover outline              */
 
-/* A keypad cell: a UTF-8 label and the single-byte action code the engine acts
- * on. Digits and '.' carry their literal char; operators carry '+ - * /'; the
- * rest use mnemonic codes below. Row-major, COLS*ROWS entries. */
+/* A keypad cell: a UTF-8 label and the single-byte action code the engine acts on. */
 enum { ACT_CLEAR = 'C', ACT_BACK = 'B', ACT_NEG = 'N', ACT_PCT = '%', ACT_EQ = '=' };
 
 static const struct {
@@ -50,9 +43,8 @@ static const struct {
     {".", '.', KEY_DIG},           {"=", ACT_EQ, KEY_EQ},
 };
 
-/* Engine state. `buf` is the editable entry shown on the display; `acc` is the
- * left operand of a pending op; `op` is that operator (0 = none); `fresh` means
- * the next digit starts a new entry (after an operator, `=`, or clear). */
+/* Engine state: `buf` entry, `acc` left operand, `op` pending operator (0 = none), `fresh` = next digit starts a new
+ * entry. */
 static char buf[40] = "0";
 static double acc = 0.0;
 static char op = 0;
@@ -86,9 +78,7 @@ static void clear_all(void)
   error = false;
 }
 
-/* Fold the current entry into `acc` under the pending operator (if any),
- * leaving the result in both `acc` and the display. Clears `op`. Flags
- * divide-by-zero. */
+/* Fold the current entry into `acc` under the pending operator; clears `op`, flags divide-by-zero. */
 static void fold(void)
 {
   double v = strtod(buf, 0);
@@ -238,8 +228,7 @@ static void act(unsigned char a)
   }
 }
 
-/* Map a physical-keyboard byte to an action code, or 0 if it isn't a calc key.
- */
+/* Map a physical-keyboard byte to an action code, or 0 if it isn't a calc key. */
 static unsigned char key_to_act(char c)
 {
   if (c >= '0' && c <= '9')

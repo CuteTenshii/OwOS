@@ -1,6 +1,4 @@
-/* csp.c — Content-Security-Policy engine (see csp.h). Parses one or more
- * policies and answers per-resource load/run decisions with the full source
- * grammar. */
+/* csp.c: Content-Security-Policy parsing and per-resource load/run decisions. */
 #include "features/csp/csp.h"
 #include "base64.h" /* shared base64 for the digest encoding */
 #include "crypto.h" /* sha256 for 'sha256-...' inline hashes */
@@ -9,9 +7,7 @@
 #include "url.h"
 #include <stdbool.h>
 
-/* One policy = a value string per directive (NULL = unset) + the two flag
- * directives. The whole CSP is the set of policies; a load must pass them all.
- */
+/* One policy: a value string per directive (NULL = unset) plus flag directives. */
 struct policy {
   char *dir[CSP_NTYPES]; /* raw value (space-separated sources), or NULL */
   char *form;            /* form-action value, or NULL                  */
@@ -58,8 +54,7 @@ void csp_free(csp *c)
   free(c);
 }
 
-/* Map a directive name to a CSP_* slot, or -1 (flag/unknown handled by caller).
- */
+/* Map a directive name to a CSP_* slot, or -1. */
 static int dir_index(const char *name, int len)
 {
   struct {
@@ -108,7 +103,6 @@ void csp_add(csp *c, const char *policy)
   pol->upgrade = false;
   pol->block_mixed = false;
 
-  /* Split on ';' into directives; each is "name value...". */
   const char *p = policy;
   while (*p) {
     while (*p == ' ' || *p == '\t' || *p == ';')
@@ -118,9 +112,9 @@ void csp_add(csp *c, const char *policy)
     const char *seg = p;
     while (*p && *p != ';')
       p++;
-    const char *segend = p; /* [seg,segend) is one directive */
+    const char *segend = p;
 
-    const char *ns = seg; /* directive name */
+    const char *ns = seg;
     while (ns < segend && (*ns == ' ' || *ns == '\t'))
       ns++;
     const char *ne = ns;
@@ -130,14 +124,13 @@ void csp_add(csp *c, const char *policy)
     if (nlen <= 0)
       continue;
 
-    const char *vs = ne; /* value (trimmed) */
+    const char *vs = ne;
     while (vs < segend && (*vs == ' ' || *vs == '\t'))
       vs++;
     const char *ve = segend;
     while (ve > vs && (ve[-1] == ' ' || ve[-1] == '\t'))
       ve--;
 
-    /* Flag directives carry no value. */
     int nl = nlen;
     if (nl == 25 && starts_ci(ns, "upgrade-insecure-requests")) {
       pol->upgrade = true;
@@ -155,7 +148,7 @@ void csp_add(csp *c, const char *policy)
 
     int di = dir_index(ns, nlen);
     if (di < 0)
-      continue; /* frame-ancestors/base-uri/report/etc: ignored here */
+      continue;
     free(pol->dir[di]);
     pol->dir[di] = dupn(vs, (int)(ve - vs));
   }
@@ -177,10 +170,7 @@ int csp_empty(const csp *c)
   return 1;
 }
 
-/* The source value that governs `type` under one policy, applying the fallback
- * chain. form-action has no fallback; fetch directives fall back to
- * default-src; frame falls back through child-src to default-src. NULL =
- * unrestricted. */
+/* Source value governing `type` under one policy after fallbacks; NULL = unrestricted. */
 static const char *effective(const struct policy *pol, int type)
 {
   if (type == CSP_FORM)
@@ -194,11 +184,9 @@ static const char *effective(const struct policy *pol, int type)
   }
   if (type == CSP_DEFAULT)
     return 0;
-  return pol->dir[CSP_DEFAULT]; /* script/style/img/font/connect/media/object */
+  return pol->dir[CSP_DEFAULT];
 }
 
-/* --- token helpers ---------------------------------------------------------
- */
 static const char *tok_next(const char *p, const char **ts, const char **te)
 {
   while (*p == ' ' || *p == '\t')
@@ -230,8 +218,6 @@ static bool tok_starts(const char *ts, const char *te, const char *pre)
   return true;
 }
 
-/* --- origin / host-source matching -----------------------------------------
- */
 static bool origin_eq(const char *a, const char *b)
 {
   struct purl ua, ub;
@@ -240,15 +226,13 @@ static bool origin_eq(const char *a, const char *b)
   return ua.tls == ub.tls && ua.port == ub.port && streq_ci(ua.host, ub.host);
 }
 
-/* Match a host-source token `s` (NUL-terminated, may carry scheme/port/path)
- * against absolute http(s) URL `url`. */
+/* Match a host-source token (scheme/port/path optional) against an absolute URL. */
 static bool host_source_match(const char *s, const char *url)
 {
   struct purl u;
   if (!parse_url(url, &u))
     return false;
 
-  /* Optional "scheme://" prefix. */
   int want_tls = -1; /* -1 = no scheme given */
   const char *h = s;
   const char *sep = 0;
@@ -268,13 +252,12 @@ static bool host_source_match(const char *s, const char *url)
     else if (slen == 2 && starts_ci(s, "ws"))
       want_tls = 0;
     else
-      return false; /* a scheme we never speak */
+      return false;
     h = sep + 3;
   }
   if (want_tls >= 0 && u.tls != want_tls)
     return false;
 
-  /* host (up to ':' or '/'), then optional :port, then optional /path. */
   char host[256];
   int hi = 0;
   while (*h && *h != ':' && *h != '/' && hi < (int)sizeof host - 1)
@@ -290,13 +273,12 @@ static bool host_source_match(const char *s, const char *url)
   }
   port[pi] = '\0';
 
-  const char *path = (*h == '/') ? h : 0; /* remaining = path */
+  const char *path = (*h == '/') ? h : 0;
 
-  /* host */
   if (host[0] == '*' && host[1] == '\0') {
     /* any host */
   } else if (host[0] == '*' && host[1] == '.') {
-    const char *suf = host + 1; /* ".rest" */
+    const char *suf = host + 1;
     int ul = (int)strlen(u.host), sl = (int)strlen(suf);
     if (ul <= sl || !streq_ci(u.host + (ul - sl), suf))
       return false;
@@ -304,7 +286,6 @@ static bool host_source_match(const char *s, const char *url)
     return false;
   }
 
-  /* port */
   if (port[0]) {
     if (!(port[0] == '*' && port[1] == '\0')) {
       int pn = 0;
@@ -315,10 +296,10 @@ static bool host_source_match(const char *s, const char *url)
     }
   } else {
     if (u.port != (u.tls ? 443 : 80))
-      return false; /* omitted port = default only */
+      return false;
   }
 
-  /* path (query stripped); trailing '/' = prefix, else exact-or-segment. */
+  /* trailing '/' = prefix, else exact or segment match */
   if (path && !(path[0] == '/' && path[1] == '\0')) {
     char pp[512];
     int k = 0;
@@ -347,12 +328,11 @@ static bool host_source_match(const char *s, const char *url)
   return true;
 }
 
-/* A scheme-source token like "https:" / "data:" — matches by URL scheme. */
 static bool scheme_source_match(const char *s, const char *url)
 {
   int n = (int)strlen(s);
   if (n < 2 || s[n - 1] != ':')
-    return false; /* must be "<scheme>:" */
+    return false;
   char sc[24];
   int k = 0;
   for (int i = 0; i < n - 1 && k < (int)sizeof sc - 1; i++)
@@ -366,7 +346,6 @@ static bool scheme_source_match(const char *s, const char *url)
     return starts_ci(url, "wss://");
   if (streq(sc, "ws"))
     return starts_ci(url, "ws://");
-  /* data:/blob:/filesystem:/mediastream: etc — literal scheme prefix. */
   char pre[26];
   int j = 0;
   for (int i = 0; sc[i] && j < (int)sizeof pre - 2; i++)
@@ -376,14 +355,13 @@ static bool scheme_source_match(const char *s, const char *url)
   return starts_ci(url, pre);
 }
 
-/* Does the source token [ts,te) admit URL `url` (with `page_url` for 'self')?
- */
+/* Does the source token admit `url` ('self' is relative to `page_url`)? */
 static bool url_source_admits(const char *ts, const char *te, const char *url, const char *page_url)
 {
   if (tok_is(ts, te, "'self'"))
     return origin_eq(url, page_url);
   if (ts[0] == '\'')
-    return false; /* unsafe-inline/eval/nonce/hash: not for URLs */
+    return false;
   if (te - ts == 1 && ts[0] == '*')
     return starts_ci(url, "http://") || starts_ci(url, "https://") || starts_ci(url, "ws://") ||
            starts_ci(url, "wss://");
@@ -395,8 +373,6 @@ static bool url_source_admits(const char *ts, const char *te, const char *url, c
     s[i] = ts[i];
   s[n] = '\0';
 
-  /* "<scheme>:" with no host is a scheme-source; anything with "://" or a bare
-   * host is a host-source. */
   bool has_sep = false;
   for (const char *q = s; q[0] && q[1] && q[2]; q++)
     if (q[0] == ':' && q[1] == '/' && q[2] == '/') {
@@ -408,7 +384,6 @@ static bool url_source_admits(const char *ts, const char *te, const char *url, c
   return host_source_match(s, url);
 }
 
-/* Match a URL against a directive value's source list (no inline keywords). */
 static bool sources_admit_url(const char *val, const char *url, const char *page_url)
 {
   const char *p = val, *ts, *te;
@@ -423,9 +398,7 @@ static bool sources_admit_url(const char *val, const char *url, const char *page
   return found;
 }
 
-/* Does the source list `val` carry a 'nonce-<nonce>' matching `nonce`? A nonce
- * on a <script src>/<link> element admits it regardless of the host-source
- * list. */
+/* Does `val` carry a 'nonce-<nonce>' matching `nonce`? */
 static bool sources_admit_nonce(const char *val, const char *nonce)
 {
   if (!nonce || !*nonce)
@@ -434,7 +407,7 @@ static bool sources_admit_nonce(const char *val, const char *nonce)
   const char *p = val, *ts, *te;
   while ((p = tok_next(p, &ts, &te)) != 0) {
     if (tok_starts(ts, te, "'nonce-")) {
-      const char *vs = ts + 7; /* after "'nonce-" */
+      const char *vs = ts + 7;
       const char *ve = te;
       if (ve > vs && ve[-1] == '\'')
         ve--;
@@ -454,10 +427,7 @@ static bool sources_admit_nonce(const char *val, const char *nonce)
   return false;
 }
 
-/* Does the source list `val` carry 'strict-dynamic'? When present, host-source
- * and scheme-source expressions (and 'self') are ignored for scripts: only
- * nonces, hashes, and scripts injected by an already-trusted script are
- * admitted. */
+/* 'strict-dynamic' ignores host/scheme sources: only nonces, hashes and injected scripts pass. */
 static bool sources_strict_dynamic(const char *val)
 {
   const char *p = val, *ts, *te;
@@ -469,16 +439,12 @@ static bool sources_strict_dynamic(const char *val)
   return false;
 }
 
-/* --- base64 (for sha256 hashes) --------------------------------------------
- */
-
-/* Canonical (padless, +/ alphabet) base64 of a digest, into dst — the form CSP
- * 'sha256-...' tokens are compared in after b64_canon_token normalizes them. */
+/* Padless base64 of a digest, the form b64_canon_token normalizes tokens to. */
 static void b64_canon_digest(const unsigned char *d, int n, char *dst)
 {
   int l = base64_encode(d, n, dst);
   while (l > 0 && dst[l - 1] == '=')
-    l--; /* CSP hashes carry no padding */
+    l--;
   dst[l] = '\0';
 }
 
@@ -499,7 +465,6 @@ static void b64_canon_token(const char *ts, const char *te, char *dst, int cap)
   dst[o] = '\0';
 }
 
-/* Decide inline allowance for one policy's directive value. */
 static bool inline_allowed_by(const char *val, const char *nonce, const unsigned char *body, int len)
 {
   const char *p = val, *ts, *te;
@@ -515,7 +480,7 @@ static bool inline_allowed_by(const char *val, const char *nonce, const unsigned
     else if (tok_starts(ts, te, "'nonce-")) {
       has_nh = 1;
       if (nonce && *nonce) {
-        const char *vs = ts + 7; /* after "'nonce-" */
+        const char *vs = ts + 7;
         const char *ve = te;
         if (ve > vs && ve[-1] == '\'')
           ve--;
@@ -540,7 +505,7 @@ static bool inline_allowed_by(const char *val, const char *nonce, const unsigned
           b64_canon_digest(dg, SHA256_DIGEST, myhash);
           have_hash = true;
         }
-        const char *vs = ts + 8; /* after "'sha256-" */
+        const char *vs = ts + 8;
         const char *ve = te;
         if (ve > vs && ve[-1] == '\'')
           ve--;
@@ -550,19 +515,17 @@ static bool inline_allowed_by(const char *val, const char *nonce, const unsigned
           ok = 1;
       }
     } else if (tok_starts(ts, te, "'sha384-") || tok_starts(ts, te, "'sha512-")) {
-      has_nh = 1; /* present but unverifiable here */
+      has_nh = 1;
     }
     p = te;
   }
   if (ok)
     return true;
   if (unsafe_inline && !has_nh)
-    return true; /* nonce/hash present => unsafe-inline ignored */
+    return true;
   return false;
 }
 
-/* --- public checks ---------------------------------------------------------
- */
 static const char *dir_name(int type)
 {
   switch (type) {
@@ -614,15 +577,12 @@ int csp_check_url(const csp *c, int type, const char *abs_url, const char *page_
   if (!c || csp_empty(c))
     return 1;
 
-  /* upgrade-insecure-requests: any policy can request the rewrite. */
   bool upgrade = false;
   for (int i = 0; i < c->n; i++)
     if (c->p[i].upgrade)
       upgrade = true;
   if (upgrade && starts_ci(out, "http://") && !is_local_host(out)) {
-    /* Insert the 's' in place ("http://" -> "https://"): one char longer, so
-     * only rewrite when it fits — never truncate a long URL into a broken one.
-     */
+    /* http:// -> https:// is one char longer; only rewrite when it fits */
     int len = 0;
     while (out[len])
       len++;
@@ -673,18 +633,13 @@ int csp_check_url(const csp *c, int type, const char *abs_url, const char *page_
 int csp_check_script_el(const csp *c, const char *abs_url, const char *page_url, const char *nonce, int parser_inserted,
                         char *out, int out_cap, char *reason, int rcap)
 {
-  /* csp_check_url fills `out` (upgrade rewrite applied) even when it blocks,
-   * and gives the host-source-only verdict. If that already admits, we're done.
-   */
+  /* csp_check_url fills `out` even when it blocks */
   if (csp_check_url(c, CSP_SCRIPT, abs_url, page_url, out, out_cap, reason, rcap))
     return 1;
   if (!c || csp_empty(c))
     return 1;
 
-  /* Host-source failed under some policy. Re-decide with the two things
-   * csp_check_url can't express for a <script> element: a matching nonce, and
-   * 'strict-dynamic' (which trusts scripts injected by an already-run script).
-   * The element must still satisfy EVERY policy. */
+  /* re-decide with the element's nonce and 'strict-dynamic'; every policy must still pass */
   struct purl pu;
   int page_https = parse_url(page_url, &pu) && pu.tls;
   int out_http = starts_ci(out, "http://");
@@ -705,13 +660,11 @@ int csp_check_script_el(const csp *c, const char *abs_url, const char *page_url,
     }
     const char *val = effective(pol, CSP_SCRIPT);
     if (!val)
-      continue; /* unrestricted by this policy */
+      continue;
 
     int admit = sources_admit_nonce(val, nonce);
     if (!admit && sources_strict_dynamic(val)) {
-      /* strict-dynamic ignores host/scheme sources: a parser-inserted script
-       * needs a nonce/hash (nonce already tried); a script-injected one is
-       * trusted by its injector. */
+      /* parser-inserted scripts need a nonce/hash (already tried); injected ones are trusted */
       if (!parser_inserted)
         admit = 1;
     } else if (!admit) {
@@ -768,7 +721,7 @@ int csp_allows_eval(const csp *c)
   for (int i = 0; i < c->n; i++) {
     const char *val = effective(&c->p[i], CSP_SCRIPT);
     if (!val)
-      continue; /* unrestricted by this policy */
+      continue;
     const char *p = val, *ts, *te;
     bool seen = false;
     while ((p = tok_next(p, &ts, &te)) != 0) {
@@ -777,7 +730,7 @@ int csp_allows_eval(const csp *c)
       p = te;
     }
     if (!seen)
-      return 0; /* this policy forbids it */
+      return 0;
   }
   return 1;
 }

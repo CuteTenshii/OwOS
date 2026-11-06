@@ -1,9 +1,6 @@
-/* dig.c - a DNS lookup tool over a UDP socket.
+/* dig.c - a DNS lookup tool over a UDP socket; builds the query and parses the response itself.
  *
- * The kernel only lends a UDP datagram transport; this program builds the DNS
- * query and parses the response (header, question, answer RRs with name
- * compression) itself. The resolver defaults to 8.8.8.8; override with @server.
- * Interruptible (net_recv -> NET_EINTR).
+ * Resolver defaults to 8.8.8.8; override with @server. Interruptible (net_recv -> NET_EINTR).
  *
  *   dig example.com            A record via 8.8.8.8
  *   dig example.com MX
@@ -52,8 +49,7 @@ static const char *type_name(int t)
   return "?";
 }
 
-/* In-stream length of a name at msg[pos]: labels until a 0 byte (+1) or a
- * compression pointer (+2). 0 on malformed. */
+/* In-stream length of a name at msg[pos]: labels until a 0 byte or a compression pointer. 0 on malformed. */
 static int name_len(const unsigned char *msg, int pos, int end)
 {
   int p = pos;

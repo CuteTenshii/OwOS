@@ -1,7 +1,6 @@
 #include "devtools_int.h"
 
-/* Right-side split (content | devtools), not an overlay: the panel docks on the
- * right for the full content height, and the page pane shrinks to its left. */
+/* Right-side split (content | devtools): the page pane shrinks to its left. */
 #define DT_MINW 240
 static int dt_user_w = 0; /* 0 = auto (default fraction); >0 = user-dragged */
 static int dt_width(void)
@@ -17,7 +16,7 @@ static int dt_width(void)
     w = 60;
   return w;
 }
-/* Drag-to-resize: the panel docks right, so its width is (BW - pointer x). */
+/* Drag-to-resize: width is (BW - pointer x). */
 void devtools_set_width(int w)
 {
   dt_user_w = w;
@@ -33,23 +32,18 @@ int devtools_on_splitter(int mx, int my)
   return mx >= x - 3 && mx <= x + 3 && my >= devtools_top() && my < BH;
 }
 
-/* X of the panel's left edge — equals BW when closed, so the page gets the full
- * width and callers can use [0, devtools_left()) as the page region. */
+/* X of the panel's left edge (BW when closed); [0, devtools_left()) is the page region. */
 int devtools_left(void) { return dt_open ? BW - dt_width() : BW; }
 
-/* Y of the panel's top edge: just below the toolbar (tab strip + address bar).
- */
+/* Y of the panel's top edge, just below the toolbar. */
 int devtools_top(void) { return MENU_H + TAB_H + ADDR_H; }
 
 static const char *const tab_names[N_TABS] = {"Elements", "Styles", "Console", "Network", "Application"};
 
-/* The header is a row of buttons (the shared gfx button widget): an
- * inspect-element toggle (↖) at the left, then one per view (the active one
- * drawn pressed), plus a trailing close button. Geometry is shared by render
- * and the click handler so the drawn and hit rects never drift. */
+/* Header buttons: inspect toggle, one per view (active drawn pressed), close; shared by render and click. */
 #define DT_CLOSE_W 24
 #define DT_PICK_W 26                 /* inspect-element toggle, left of the tab strip */
-#define DT_PICK_GLYPH "\xe2\x86\x96" /* ↖ — the universal "inspect" cursor icon */
+#define DT_PICK_GLYPH "\xe2\x86\x96" /* ↖ inspect cursor icon */
 static int tab_x(int i)
 {
   int x = DT_PICK_W;
@@ -59,8 +53,7 @@ static int tab_x(int i)
 }
 static int tab_w(int i) { return gfx_ui_width(tab_names[i]) + 18; }
 
-/* Elements breadcrumb strip, shown above the find bar when a node is selected.
- */
+/* Elements breadcrumb strip, shown above the find bar when a node is selected. */
 #define DT_CRUMB_H 20
 #define DT_CRUMB_SEP " \xe2\x80\xba " /* " › " between segments */
 static int crumb_h(void) { return (dt_tab == TAB_ELEMENTS && dt_ncrumbs > 0) ? DT_CRUMB_H : 0; }
@@ -69,10 +62,7 @@ static int crumb_h(void) { return (dt_tab == TAB_ELEMENTS && dt_ncrumbs > 0) ? D
 #define DT_NETBAR_H 20     /* Network summary + type-filter bar at the very bottom  */
 static int content_top(int top) { return top + DT_HDR; }
 static int net_detail_top(void) { return BH - DT_NETBAR_H - DT_NETDETAIL_H; }
-/* The Console tab reserves a bottom row for the REPL input; the Elements tab a
- * find bar (plus the breadcrumb when a node is selected); the Network tab
- * always reserves the summary bar, plus the detail band when a request is
- * expanded above it. */
+/* Console reserves a bottom row for the REPL; Elements a find bar (+ breadcrumb); Network a summary bar (+ detail). */
 static int content_bottom(void)
 {
   if (dt_tab == TAB_CONSOLE)
@@ -90,8 +80,7 @@ int dt_content_rows(int top)
 }
 static int content_w(void) { return (BW - devtools_left()) - SCROLL_W; } /* panel minus scrollbar */
 
-/* Total scrollable line count of the active tab (read under dt_lk by caller).
- */
+/* Total scrollable line count of the active tab (caller holds dt_lk). */
 static int active_lines(void)
 {
   if (dt_tab == TAB_ELEMENTS)
@@ -117,15 +106,14 @@ static int clamp_scroll(int s, int total, int rows)
   return s;
 }
 
-/* Syntax-highlight palette (dark theme, à la a real devtools markup view). */
+/* Syntax-highlight palette (dark theme). */
 #define DT_C_TEXT 0xcdd3de
 #define DT_C_PUNCT 0x9aa0a6 /* < > / = and whitespace             */
 #define DT_C_TAG 0x7cb7e8   /* element tag name                   */
 #define DT_C_ATTR 0xe0a060  /* attribute name                     */
 #define DT_C_VALUE 0x9bce8a /* attribute value (incl. its quotes) */
 
-/* Draw a run [run,run+rl) at x in colour col with the monospace UTF-8 font,
- * returning the advanced x (one cell per codepoint) so colour segments abut. */
+/* Draw run [run,run+rl) at x in colour col, returning the advanced x. */
 static int flush_run(int x, int y, char *run, int *rl, unsigned col)
 {
   if (*rl <= 0)
@@ -136,10 +124,7 @@ static int flush_run(int x, int y, char *run, int *rl, unsigned col)
   return x;
 }
 
-/* Render one DOM-markup line with token colours: brackets/`=` punct, tag names,
- * attribute names, quoted values, and text content. A tiny scanner — `in_tag`
- * tracks `<…>`, `in_quote` a value, `tag_name` the first identifier after `<`.
- */
+/* Render one DOM-markup line with token colours (in_tag tracks `<...>`, in_quote a value). */
 static void draw_dom_line(int x, int y, const char *s)
 {
   char run[260];
@@ -184,8 +169,7 @@ static void draw_dom_line(int x, int y, const char *s)
   flush_run(x, y, run, &rl, cur);
 }
 
-/* Render one Styles line: a `<tag#id.class>` header in tag colour; a
- * `name: value` declaration with the property dim and the value highlighted. */
+/* Render one Styles line: `<tag#id.class>` header, or `name: value` with the value highlighted. */
 static void draw_style_line(int x, int y, const char *s)
 {
   if (s[0] == '<') {
@@ -210,9 +194,7 @@ static void draw_style_line(int x, int y, const char *s)
   gfx_text_utf8(x, y, s + colon + 1, DT_C_VALUE, GFX_TRANSPARENT); /* " value" */
 }
 
-/* Render one Application-tab line: a section header (no indent) in tag colour;
- * an indented "name=value" entry with the name dim and the value highlighted.
- */
+/* Render one Application line: section header, or indented "name=value" with the value highlighted. */
 static void draw_app_line(int x, int y, const char *s)
 {
   if (s[0] != ' ') {
@@ -237,8 +219,7 @@ static void draw_app_line(int x, int y, const char *s)
   gfx_text_utf8(x, y, s + eq + 1, DT_C_VALUE, GFX_TRANSPARENT); /* value @ host */
 }
 
-/* Physical rows a console/network line occupies once wrapped at `max` columns.
- */
+/* Physical rows a console/network line occupies once wrapped at `max` columns. */
 static int wrap_rows_for(const char *s, int max)
 {
   int len = 0;
@@ -247,8 +228,7 @@ static int wrap_rows_for(const char *s, int max)
   int r = (len + max - 1) / max;
   return r < 1 ? 1 : r;
 }
-/* The topmost VISIBLE console line (level-filtered) keeping the newest passing
- * content in view — i.e. the scroll position that shows the tail. */
+/* Topmost visible (level-filtered) console line that keeps the tail in view. */
 static int con_ftail(int rows, int max)
 {
   int used = 0, seen = 0, vis = dt_con_visible_count();
@@ -269,8 +249,7 @@ static int con_ftail(int rows, int max)
     start = 0;
   return start;
 }
-/* con_tail_start over the type-filtered network log: the topmost VISIBLE
- * request index keeping the newest passing rows in view. */
+/* con_tail_start over the type-filtered network log. */
 static int net_ftail(int rows, int max)
 {
   int used = 0, seen = 0, vis = dt_net_visible_count();
@@ -325,9 +304,7 @@ void devtools_render(void)
     max = 1;
   char line[256];
   if (dt_tab == TAB_CONSOLE || dt_tab == TAB_NETWORK) {
-    /* Console/Network lines wrap: a long message spans as many rows as it needs
-     * (so a full error/URL is readable), and scrolling steps by logical line.
-     */
+    /* Console/Network lines wrap; scrolling steps by logical line. */
     bool isconsole = dt_tab == TAB_CONSOLE;
     struct conline *ring = isconsole ? dt_con : dt_net;
     int cap = isconsole ? CON_MAX : NET_MAX;
@@ -521,7 +498,7 @@ void devtools_render(void)
         gfx_text_utf8(lx, ly, b, 0x7cb7e8, GFX_TRANSPARENT);
         off += n;
       }
-      /* Response headers — a scrollable list filling the rest of the detail. */
+      /* Response headers: scrollable list filling the rest of the detail. */
       ly += 2;
       if (ly + GLYPH_H <= dbot) {
         gfx_text_utf8(lx, ly, "Response Headers", 0x9aa0a6, GFX_TRANSPARENT);
@@ -597,10 +574,7 @@ void devtools_render(void)
   mutex_unlock(&dt_lk);
 }
 
-/* The logical Network row at screen-y `my`, accounting for line wrapping (a
- * long URL spans several physical rows). -1 if the click is below the last row.
- * Mirrors the render walk so the hit rect matches what was drawn. Caller holds
- * dt_lk. */
+/* Logical Network row at screen-y `my` accounting for wrapping; -1 below the last row. Caller holds dt_lk. */
 static int net_row_at(int my)
 {
   int top = devtools_top(), ct = content_top(top);
@@ -628,9 +602,7 @@ static int net_row_at(int my)
   return -1;
 }
 
-/* Select (and scroll to) the next Elements line matching the find box, wrapping
- * past the current selection. Selecting also highlights the node on the page.
- */
+/* Select and scroll to the next Elements line matching the find box, wrapping. */
 static void dt_find_next(int fresh)
 {
   if (!dt_find[0])
@@ -818,9 +790,7 @@ int devtools_handle_click(int mx, int my)
     }
     mutex_unlock(&dt_lk);
     if (ok) {
-      /* dt_toggle_collapsed reallocs dt_collapsed, which the worker reads under
-       * dt_lk in dt_dom_emit->dt_is_collapsed — take the lock so we can't free it
-       * out from under a concurrent snapshot walk. */
+      /* dt_toggle_collapsed reallocs dt_collapsed, which the worker reads under dt_lk. */
       if (tri >= 0 && cell >= 0 && cell <= tri + 1) {
         mutex_lock(&dt_lk);
         dt_toggle_collapsed(node);
@@ -850,9 +820,7 @@ int devtools_handle_scroll(int delta)
 {
   if (!dt_open)
     return 0;
-  /* An expanded Network request takes the wheel for its response-header list
-   * (the detail owns the focus); collapse it to scroll the request list again.
-   */
+  /* An expanded Network request takes the wheel for its header list. */
   if (dt_tab == TAB_NETWORK && dt_net_sel >= 0) {
     int prev = dt_nd_scroll;
     dt_nd_scroll -= delta * 3;
@@ -865,9 +833,7 @@ int devtools_handle_scroll(int delta)
   int rows = dt_content_rows(devtools_top());
   int prev = dt_scroll[dt_tab], next;
   if (dt_tab == TAB_CONSOLE || dt_tab == TAB_NETWORK) {
-    /* Lines wrap here, so the max scroll is the wrap-aware tail (matching
-     * render), not total-minus-rows — otherwise a wheel step near the bottom
-     * moves the value only for render to clamp it straight back. */
+    /* Max scroll is the wrap-aware tail (as in render), else render clamps the wheel step back. */
     int cols = (content_w() - 8) / GLYPH_W;
     if (cols > 255)
       cols = 255;
@@ -896,11 +862,7 @@ int devtools_handle_scroll(int delta)
   return 1;
 }
 
-/* Feed a key to the Console REPL input. Returns 1 when consumed (the panel is
- * open, the Console tab is shown, and its input is focused), so the caller
- * stops routing the key to the address bar / page. Enter queues the command for
- * the worker (which owns the JS context); Esc blurs the input without closing
- * the panel; Up/Down recall history. Non-edit keys are left for the caller. */
+/* Feed a key to the Console REPL input; returns 1 when consumed (Enter queues for the worker, Esc blurs). */
 int devtools_handle_key(char c, int mods)
 {
   (void)mods;
@@ -951,11 +913,7 @@ int devtools_handle_key(char c, int mods)
     }
     return 1;
   }
-  /* These edit only the REPL input field in the dock, not the page: request a
-   * dock-only repaint (dt_paint_only), not a full-page render (B->seq++). A
-   * full render per keystroke re-lays-out/repaints the whole document — seconds
-   * of lag on a heavy page. (Enter keeps B->seq++: its eval may mutate the
-   * DOM.) */
+  /* Field edits repaint only the dock (dt_paint_only); a full render per key lags heavy pages. */
   if (uc == KEY_UP) {
     dt_hist_recall(-1);
     dt_paint_only = true;

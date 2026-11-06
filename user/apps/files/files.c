@@ -1,11 +1,4 @@
-/* files.c — a navigable file explorer for owofs.
- *
- * Ports the former kernel app_files.c: a top "Go" menu bar (mirroring the
- * editor's File menu), a left "Places" sidebar, plus a path header and
- * scrollable listing. Directory contents come from the readdir syscall; the
- * window's pixel buffer is drawn with the gfx lib. files_seq bumps on every
- * navigation/scroll/select/menu action to trigger a repaint.
- */
+/* files.c, a navigable file explorer for owofs */
 #include "dialog.h"
 #include "gfx.h"
 #include "owos.h"
@@ -16,14 +9,12 @@ static int W = 320, H = 380; /* client size; changes on resize */
 #define HEADER_H 18
 #define ROW_H 16
 #define FMAX 64
-#define SIDEBAR_W 96                 /* default sidebar width (a customizable property)   */
-#define SIDEBAR_MIN 64               /* narrowest the divider drag may make it            */
+#define SIDEBAR_W 96                 /* default sidebar width (a customizable property) */
+#define SIDEBAR_MIN 64               /* narrowest the divider drag may make it */
 #define SIDEBAR_MAX 220              /* widest */
 #define LIST_TOP (MENU_H + HEADER_H) /* y of the first places/list row */
 
-/* The left navigation pane is a gfx sidebar widget: it owns its width as a
- * resizable property (drag the divider, clamped to [MIN,MAX]); we draw our own
- * Places/Devices rows into it. */
+/* The left navigation pane is a gfx sidebar widget */
 static struct sidebar sb;
 
 struct fent {
@@ -40,9 +31,7 @@ static int fent_count;
 static char list_path[256]; /* path the cached listing reflects */
 static int force_relist;    /* set by F5/Refresh to re-read in place */
 
-/* The single drop-down menu ("Go"), mirroring the editor's File menu: a top
- * bar with mouse-driven items, two of them carrying keyboard accelerators
- * (F5 refresh, Ctrl+O open) wired through menu_shortcut. */
+/* The single drop-down menu ("Go"), mirroring the editor's File menu */
 static const char *const go_items[] = {"Up", "Home", "Refresh", "Open"};
 static const char *const go_hints[] = {"", "", "F5", "Ctrl+O"};
 static const unsigned char go_keys[] = {0, 0, KEY_F5, KEY_OPEN};
@@ -88,10 +77,7 @@ static void u32str(unsigned v, char *out)
   out[i] = 0;
 }
 
-/* Format a byte count as "N B", or "N.N KiB/MiB/GiB/TiB" scaled to the largest
- * unit that keeps the whole part under 1024. Integer-only (no 64-bit / float):
- * the fractional digit comes from the leftover low bits below the chosen unit.
- */
+/* Format a byte count as "N B" */
 static void size_str(unsigned v, char *out)
 {
   static const char *const unit[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -146,9 +132,7 @@ static int collect(void)
   return n;
 }
 
-/* Re-read the directory only when the path changed or an explicit refresh was
- * asked for — NOT on every repaint. A resize bumps `seq` each frame, and on a
- * removable device re-listing per frame is real block I/O (visible lag). */
+/* Re-read the directory only when the path changed or an explicit refresh was asked for */
 static void refresh(void)
 {
   if (!force_relist && feq(list_path, path))
@@ -198,8 +182,7 @@ static const struct {
 };
 #define NPLACES (int)(sizeof(places) / sizeof(places[0]))
 
-/* Removable volumes (USB sticks, etc.), refreshed from the kernel each paint so
- * the list reflects plug/eject in real time. */
+/* Removable volumes (USB sticks, etc.) */
 static struct volinfo vols[6];
 static int nvols;
 static void scan_vols(void)
@@ -209,8 +192,7 @@ static void scan_vols(void)
     nvols++;
 }
 
-/* 1 if `p` is `base` or sits inside it (so a device stays highlighted while you
- * browse into it). */
+/* 1 if `p` is `base` or sits inside it (so a device stays highlighted while you browse into it) */
 static int under_path(const char *p, const char *base)
 {
   int i = 0;
@@ -221,13 +203,12 @@ static int under_path(const char *p, const char *base)
   return p[i] == '\0' || p[i] == '/';
 }
 
-/* Sidebar geometry for the Devices section (below Places, after a small gap).
- */
+/* Sidebar geometry for the Devices section (below Places, after a small gap) */
 static int dev_header_y(void) { return LIST_TOP + NPLACES * ROW_H + 6; }
 static int dev_row_y(int i) { return dev_header_y() + ROW_H + i * ROW_H; }
 #define EJECT_W 14 /* right-edge hit zone (and icon) for the eject button */
 
-/* A tiny eject glyph: a triangle over a tray bar, drawn in a ~7x9 box. */
+/* A tiny eject glyph: a triangle over a tray bar, drawn in a ~7x9 box */
 static void draw_eject(int x, int y, unsigned c)
 {
   gfx_fill_rect(x + 3, y + 3, 1, 1, c);
@@ -236,9 +217,7 @@ static void draw_eject(int x, int y, unsigned c)
   gfx_fill_rect(x + 1, y + 7, 5, 1, c);
 }
 
-/* A "connect" glyph: a down-arrow into a tray bar (insert), the mirror of
- * eject. Marks a present-but-unmounted device; clicking it mounts the device.
- */
+/* A "connect" glyph: a down-arrow into a tray bar (insert), the mirror of eject */
 static void draw_connect(int x, int y, unsigned c)
 {
   gfx_fill_rect(x + 1, y + 3, 5, 1, c);
@@ -247,10 +226,7 @@ static void draw_connect(int x, int y, unsigned c)
   gfx_fill_rect(x + 1, y + 7, 5, 1, c);
 }
 
-/* The width actually rendered this frame: the widget's property width, capped
- * so the file list always keeps ~80px (a narrow window can't be all sidebar).
- * The property itself (sb.w) is unchanged — only the on-screen pane is clamped.
- */
+/* The width actually rendered this frame: the widget's property width */
 static int sidebar_w(void)
 {
   int sbw = sb.w;
@@ -295,8 +271,7 @@ static void render(void)
   refresh();
   int sbw = sidebar_w();
 
-  /* Sidebar: the widget paints the panel base, the right divider and the
-   * resize grip; we overdraw the header strip and the Places/Devices rows. */
+  /* Sidebar: the widget paints the panel base, the right divider and the resize grip */
   sidebar_draw(&sb, 0, 0, sbw, H, 0x0e1218, 0x05070a);
   gfx_fill_rect(0, MENU_H, sbw, HEADER_H, 0x161d28);
   gfx_ui_text(6, MENU_H + 1, "Places", 0x8aa0b8);
@@ -309,9 +284,7 @@ static void render(void)
     gfx_ui_text(6, ry, places[i].label, here ? 0xffffff : 0xc8d0dc);
   }
 
-  /* Devices: every present removable device. Mounted ones are navigable and
-   * carry an eject button; unmounted ones read dimmer and carry a connect
-   * (mount) button. */
+  /* Devices: every present removable device */
   scan_vols();
   if (nvols > 0) {
     gfx_ui_text(6, dev_header_y(), "Devices", 0x8aa0b8);
@@ -331,7 +304,7 @@ static void render(void)
     }
   }
 
-  /* File list. */
+  /* File list */
   int lx = sbw + 1, lw = W - sbw - 1;
   int vis = (H - LIST_TOP) / ROW_H;
   if (vis < 1)
@@ -380,15 +353,14 @@ static void render(void)
     }
   }
 
-  /* Top menu bar over the sidebar/list, then the dropdown drawn last so it
-   * overlays the listing. */
+  /* Top menu bar over the sidebar/list, then the dropdown drawn last so it overlays the listing */
   gfx_fill_rect(0, 0, W, MENU_H, 0x232a36);
   menu_draw(&gomenu, 2, 0);
 
   ctx_draw(); /* right-click popup overlays everything */
 }
 
-/* Build the absolute path of `name` under the current directory into out. */
+/* Build the absolute path of `name` under the current directory into out */
 static void full_path(const char *name, char *out, int max)
 {
   int i = 0;
@@ -404,9 +376,7 @@ static void full_path(const char *name, char *out, int max)
   out[i] = 0;
 }
 
-/* File-type associations: a filename extension picks the /bin program that
- * opens it; anything unlisted falls back to the editor. Add a row to extend it
- * (e.g. another image type -> "imgview"). */
+/* File-type associations: a filename extension picks the /bin program that opens it */
 static const struct {
   const char *ext;
   const char *prog;
@@ -414,7 +384,7 @@ static const struct {
     {"png", "imgview"}, {"webp", "imgview"}, {"wav", "player"}, {"mp3", "player"}, {"caf", "player"},
 };
 
-/* Case-insensitive compare of `a` against the lowercase literal `b`. */
+/* Case-insensitive compare of `a` against the lowercase literal `b` */
 static int ext_eq(const char *a, const char *b)
 {
   for (; *a && *b; a++, b++) {
@@ -425,7 +395,7 @@ static int ext_eq(const char *a, const char *b)
   return *a == '\0' && *b == '\0';
 }
 
-/* The program to open `name` with: by its extension, else the editor. */
+/* The program to open `name` with: by its extension, else the editor */
 static const char *app_for(const char *name)
 {
   const char *dot = 0;
@@ -439,11 +409,7 @@ static const char *app_for(const char *name)
   return "editor";
 }
 
-/* Open a file by launching its associated program on it. Fork so this explorer
- * survives; the child replaces its image with the program, passing the path as
- * argv[1]. waitpid keeps the child off the zombie list (the shell's outer wait
- * loop still pumps keystrokes to whichever window holds focus, so the opened
- * app stays interactive while we block). */
+/* Open a file by launching its associated program on it */
 static void open_with(const char *name, const char *prog)
 {
   char fp[256];
@@ -459,9 +425,7 @@ static void open_with(const char *name, const char *prog)
 
 static void open_file(const char *name) { open_with(name, app_for(name)); }
 
-/* Confirm and remove the entry `name` in the current directory — a file via
- * unlink, a folder via rmdir (which only succeeds when empty). The confirm and
- * any error report are modal dialogs parented on this window. */
+/* Confirm and remove the entry `name` in the current directory, a file via unlink */
 static void delete_entry(int id, const char *name, bool is_dir)
 {
   if (feq(name, ".."))
@@ -482,13 +446,7 @@ static void delete_entry(int id, const char *name, bool is_dir)
   seq++;
 }
 
-/* ----------------------------------------------------------- Properties window
- * A rich dialog's content is app-specific, so the app builds it itself (the
- * dialog lib only ships the modal message box). Properties is a MODELESS
- * transient child window we own: created with win_set_parent(..., 0) so it
- * doesn't block the explorer, drawn with gfx into its own buffer, and pumped
- * from our main loop (props_pump) alongside the file list — so you can keep
- * browsing with it open. */
+/* Properties window */
 #define PROP_ROWH 22
 #define PROP_PAD 14
 #define PROP_LABELW 118
@@ -522,7 +480,7 @@ static void prop_close_rect(int *bx, int *by, int *bw)
   *by = prop_h - PROP_PAD - PROP_BTN_H;
 }
 
-/* Open (or replace) the Properties window for `name`, built from its facts. */
+/* Open (or replace) the Properties window for `name`, built from its facts */
 static void show_properties(int mainid, const char *name, bool is_dir, unsigned size)
 {
   prop_nrows = 0;
@@ -558,8 +516,7 @@ static void show_properties(int mainid, const char *name, bool is_dir, unsigned 
   prop_last = 0;
 }
 
-/* Repaint the Properties window into its own buffer, then restore our main gfx
- * surface (the explorer's window) so the rest of the app draws as usual. */
+/* Repaint the Properties window into its own buffer */
 static void render_props(void)
 {
   gfx_init(prop_fb, prop_w, prop_h);
@@ -607,8 +564,7 @@ static void render_props(void)
   gfx_init(win_fb(), W, H); /* hand the surface back to the explorer window */
 }
 
-/* Service the Properties window each frame: drain its events, repaint on
- * change. */
+/* Service the Properties window each frame: drain its events, repaint on change */
 static void props_pump(void)
 {
   if (prop_id < 0)
@@ -652,15 +608,8 @@ static void props_pump(void)
 
 static int list_hit(int mx, int my); /* list row under (mx,my), or -1 */
 
-/* ----------------------------------------------------------- context menu */
-/*
- * A right-click popup whose items depend on what sits under the cursor: a file,
- * a directory, a Places shortcut, a removable device, or empty space. It's a
- * self-contained popup (not a `struct menu`, which is anchored to a bar title):
- * ctx_open() captures the target and clamps the popup inside the window,
- * ctx_draw() paints it last so it overlays the listing, and ctx_click() routes
- * a left-press to an item or dismisses the menu.
- */
+/* context menu */
+/* A right-click popup whose items depend on what sits under the cursor: a file, a directory */
 enum ctx_kind { CTX_BG, CTX_FILE, CTX_DIR, CTX_PLACE, CTX_DEVICE };
 enum ctx_act { A_OPEN, A_EDIT, A_DELETE, A_PROPS, A_EJECT, A_CONNECT, A_REFRESH, A_UP, A_HOME };
 
@@ -680,14 +629,14 @@ static struct {
   bool open;
   int x, y; /* popup top-left (clamped into the window) */
   enum ctx_kind kind;
-  int target;    /* place / device index                    */
+  int target;    /* place / device index */
   char name[64]; /* file / dir entry name (owofs FS_NAME_LEN) */
 } ctx;
 
 #define CTX_W 110
 #define CTX_ROW 16
 
-/* The item table + count for the menu's current kind. */
+/* The item table + count for the menu's current kind */
 static const struct ctx_item *ctx_items(int *n)
 {
   switch (ctx.kind) {
@@ -713,7 +662,7 @@ static const struct ctx_item *ctx_items(int *n)
   }
 }
 
-/* Open the popup at (mx,my) for the given target, clamped to stay on-screen. */
+/* Open the popup at (mx,my) for the given target, clamped to stay on-screen */
 static void ctx_open(enum ctx_kind kind, int target, const char *name, int mx, int my)
 {
   int n;
@@ -751,7 +700,7 @@ static void ctx_draw(void)
     gfx_ui_text(ctx.x + 6, ctx.y + 1 + i * CTX_ROW, it[i].label, 0xc8d0dc);
 }
 
-/* Run the chosen context-menu action against the captured target. */
+/* Run the chosen context-menu action against the captured target */
 static void ctx_run(int act, int id)
 {
   switch (act) {
@@ -818,8 +767,7 @@ static void ctx_run(int act, int id)
   }
 }
 
-/* Route a left-press while the popup is open: fire an item, or dismiss. Always
- * closes the menu and bumps seq so the popup repaints away. */
+/* Route a left-press while the popup is open: fire an item, or dismiss */
 static void ctx_click(int id, int mx, int my)
 {
   int n;
@@ -833,8 +781,7 @@ static void ctx_click(int id, int mx, int my)
   seq++;
 }
 
-/* A right-press at (mx,my): figure out what's under the cursor and pop up the
- * matching context menu. Mirrors click()'s hit regions. */
+/* A right-press at: figure out what's under the cursor and pop up the matching context menu */
 static void rclick(int id, int mx, int my)
 {
   int sbw = sidebar_w();
@@ -880,8 +827,7 @@ static void rclick(int id, int mx, int my)
   seq++;
 }
 
-/* Map a click in the list area to an entry index, or -1 (sidebar/header/empty).
- * Used by both the single- and double-click handlers. */
+/* Map a click in the list area to an entry index, or -1 (sidebar/header/empty) */
 static int list_hit(int mx, int my)
 {
   int sbw = sidebar_w();
@@ -891,8 +837,7 @@ static int list_hit(int mx, int my)
   return (e >= 0 && e < fent_count) ? e : -1;
 }
 
-/* Activate the current selection: descend into a directory or open a file with
- * its associated program. Shared by the Enter key and the menu's Open item. */
+/* Activate the current selection */
 static void activate(int id)
 {
   refresh();
@@ -913,7 +858,7 @@ static void activate(int id)
   seq++;
 }
 
-/* Run a "Go" menu item (also reached via the F5/Ctrl+O accelerators). */
+/* Run a "Go" menu item (also reached via the F5/Ctrl+O accelerators) */
 static void menu_action(int item, int id)
 {
   switch (item) {
@@ -923,19 +868,19 @@ static void menu_action(int item, int id)
     sel = -1;
     set_title(id);
     seq++;
-    break; /* Up      */
+    break; /* Up */
   case 1:
     goto_path("/");
     set_title(id);
     seq++;
-    break; /* Home    */
+    break; /* Home */
   case 2:
     force_relist = 1;
     seq++;
     break; /* Refresh */
   case 3:
     activate(id);
-    break; /* Open    */
+    break; /* Open */
   }
 }
 
@@ -955,8 +900,7 @@ static void click(int id, int mx, int my)
   int sbw = sidebar_w();
   refresh();
 
-  /* Divider grip: grab it to resize the sidebar. Consumes the press (and the
-   * following WEV_DRAG motion) so it isn't also taken as a row click. */
+  /* Divider grip: grab it to resize the sidebar */
   if (sidebar_press(&sb, 0, 0, sbw, H, mx, my)) {
     seq++;
     return;
@@ -972,8 +916,7 @@ static void click(int id, int mx, int my)
       seq++;
       return;
     }
-    /* Devices region: an unmounted device connects (mounts) on any click; a
-     * mounted one navigates, or ejects if its right-edge button was hit. */
+    /* Devices region: an unmounted device connects (mounts) on any click */
     for (int v = 0; v < nvols; v++) {
       int ry = dev_row_y(v);
       if (my < ry || my >= ry + ROW_H)
@@ -1019,9 +962,7 @@ static void click(int id, int mx, int my)
   seq++;
 }
 
-/* Double-click (delivered by the WM after the WEV_MOUSE that selected the row):
- * activate the entry — descend into a directory or open a file in its program.
- */
+/* Double-click: activate the entry, descend into a directory or open a file in its program */
 static void dblclick(int id, int mx, int my)
 {
   refresh();
@@ -1043,9 +984,7 @@ static void dblclick(int id, int mx, int my)
   seq++;
 }
 
-/* Left-button motion (WEV_DRAG): drive a live sidebar resize if the press
- * grabbed the divider grip. The widget clamps the width to [MIN,MAX]; we just
- * repaint when it moved. */
+/* Left-button motion: drive a live sidebar resize if the press grabbed the divider grip */
 static void drag(int id, int mx, int my)
 {
   (void)id;
@@ -1054,13 +993,10 @@ static void drag(int id, int mx, int my)
     seq++;
 }
 
-/* Keyboard navigation: arrow up/down move the highlighted entry (directories
- * included, unlike a single click which only selects files), keeping it in view
- * by scrolling. Enter activates the selection — descend into a directory or
- * open a file with its associated program, mirroring click/dblclick. */
+/* Keyboard navigation: arrow up/down move the highlighted entry, keeping it in view by scrolling */
 static void key(int id, int k)
 {
-  /* Menu accelerators (F5 refresh, Ctrl+O open): fire the item like a click. */
+  /* Menu accelerators (F5 refresh, Ctrl+O open): fire the item like a click */
   int sc = menu_shortcut(&gomenu, k);
   if (sc >= 0) {
     gomenu.open = 0;

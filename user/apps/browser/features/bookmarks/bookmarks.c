@@ -1,29 +1,10 @@
-/* bookmarks.c — the browser's persistent bookmarks tree.
- *
- * The in-memory model is a tree of `struct bm_node` (folders + bookmarks) under
- * a static implicit root. A bookmark node may carry a heap copy of the page's
- * 16x16 ARGB favicon. On disk the tree lives in one real SQLite3 database
- * (user/lib/ sqlite), the file BM_DB, as a single flat node table with an
- * id/parent linkage — the same engine and whole-file rewrite model as the
- * cookie jar (jar.c). It is a genuine SQLite file: `sqlite3 bookmarks.db` on
- * the host opens and queries it.
- *
- * Mutations (add/remove/delete/toggle) come from the UI thread; the deferred
- * save runs on the worker thread. Both take browser_buf_lock (buffers.c's realloc/render
- * interlock) around the tree so the worker never walks a half-linked node, and
- * a delete frees its subtree under the same lock. The save copies the tree into
- * the SQLite model under the lock, then releases it before the (blocking) disk
- * write, so a save never stalls the UI for the length of a writefile.
- */
+/* bookmarks.c: bookmarks tree persisted to a SQLite file (BM_DB); UI mutates, worker flushes. */
 #include "features/bookmarks/bookmarks.h"
 #include "browser.h"
 #include "sqlite.h"
 
-/* Mirrors the browser's /home/root convention (see jar.c's JAR_DB). */
 #define BM_DB "/home/root/bookmarks.db"
-/* nodes(id, parent, kind, title, url, icon, expanded): kind 0=bookmark
- * 1=folder; parent 0 = the root. icon is a FAVICON_W*FAVICON_H ARGB BLOB (NULL
- * if none). */
+/* kind 0=bookmark 1=folder; parent 0 = root; icon is an ARGB BLOB or NULL. */
 #define BM_SQL                                                                                                         \
   "CREATE TABLE nodes(id INTEGER, parent INTEGER, kind INTEGER, "                                                      \
   "title TEXT, url TEXT, icon BLOB, expanded INTEGER)"
@@ -32,9 +13,7 @@
 
 /* The implicit root: a folder whose `child` list is the top level. */
 static struct bm_node bm_root = {1, 0, 0, 0, 1, 0, 0, 0};
-/* Set on any change; bookmarks_flush() rewrites the db once, later, on the
- * worker thread — keeping the whole-file write off the click that made the
- * change. */
+/* Set on any change; bookmarks_flush() rewrites the db later on the worker thread. */
 static bool bm_dirty;
 
 static char *bm_dup(const char *s)
@@ -49,7 +28,6 @@ static char *bm_dup(const char *s)
   return d;
 }
 
-/* Heap copy of a favicon bitmap (NULL -> NULL). */
 static unsigned *icon_dup(const unsigned *ic)
 {
   if (!ic)
@@ -62,7 +40,7 @@ static unsigned *icon_dup(const unsigned *ic)
 
 struct bm_node *bookmarks_root(void) { return &bm_root; }
 
-/* Append `n` to `folder`'s child list (order = creation order). */
+/* Append `n` to `folder`'s children. */
 static void link_child(struct bm_node *folder, struct bm_node *n)
 {
   n->parent = folder;
@@ -77,7 +55,6 @@ static void link_child(struct bm_node *folder, struct bm_node *n)
   t->next = n;
 }
 
-/* Depth-first search for the bookmark whose url matches. */
 static struct bm_node *find_url(struct bm_node *folder, const char *url)
 {
   for (struct bm_node *n = folder->child; n; n = n->next) {
@@ -137,7 +114,7 @@ void bookmark_set_icon(const char *url, const unsigned *icon)
   if (!n)
     return;
   if (n->icon && !memcmp(n->icon, icon, (unsigned)ICON_BYTES))
-    return; /* unchanged */
+    return;
   unsigned *cp = icon_dup(icon);
   if (!cp)
     return;
@@ -226,8 +203,6 @@ void folder_toggle(struct bm_node *node)
   bm_dirty = true;
 }
 
-/* ------------------------------------------------------- SQLite persistence */
-
 /* Emit `n` and its subtree as rows; ids are DFS-assigned from *next. */
 static void emit_node(struct sql_table *t, struct bm_node *n, int parent_id, int *next)
 {
@@ -247,7 +222,7 @@ static void emit_node(struct sql_table *t, struct bm_node *n, int parent_id, int
     v[5] = sqlv_null();
   }
   v[6] = sqlv_int(n->is_folder ? (n->expanded ? 1 : 0) : 0);
-  sql_insert(t, v, BM_COLS); /* a long title/url spills onto SQLite overflow pages */
+  sql_insert(t, v, BM_COLS);
   for (struct bm_node *c = n->child; c; c = c->next)
     emit_node(t, c, id, next);
 }
@@ -258,12 +233,12 @@ void bookmarks_flush(void)
     return;
   struct sql_db *db = sql_new();
   if (!db)
-    return; /* stays dirty: retry next tick */
+    return;
   struct sql_table *t = sql_create_table(db, "nodes", BM_SQL, BM_COLS);
   if (!t) {
     sql_close(db);
     return;
-  } /* stays dirty */
+  }
 
   browser_buf_lock();
   int next = 1;
@@ -272,7 +247,7 @@ void bookmarks_flush(void)
   bm_dirty = false;
   browser_buf_unlock();
 
-  sql_save(db, BM_DB); /* writefile outside the lock */
+  sql_save(db, BM_DB); /* disk write outside the lock */
   sql_close(db);
 }
 
@@ -287,8 +262,7 @@ void bookmarks_load(void)
     return;
   }
 
-  /* Count rows to size the id->node map; ids were assigned 1..N in DFS order.
-   */
+  /* ids are 1..N in DFS order */
   int maxid = 0;
   for (struct sql_row *r = t->rows; r; r = r->next)
     if (r->ncol >= 1 && r->col[0].type == SQL_INT && (int)r->col[0].i > maxid)
@@ -305,7 +279,6 @@ void bookmarks_load(void)
   for (int i = 0; i <= maxid; i++)
     byid[i] = 0;
 
-  /* First pass: materialise each node keyed by its id. */
   for (struct sql_row *r = t->rows; r; r = r->next) {
     if (r->ncol < 7 || r->col[0].type != SQL_INT)
       continue;
@@ -328,8 +301,7 @@ void bookmarks_load(void)
     n->expanded = n->is_folder ? (r->col[6].type == SQL_INT ? r->col[6].i != 0 : 1) : 0;
     byid[id] = n;
   }
-  /* Second pass: link each node to its parent (0 = root). Rows are in DFS
-   * order, so appending in id order restores the original sibling order. */
+  /* DFS row order means appending by id restores sibling order */
   for (struct sql_row *r = t->rows; r; r = r->next) {
     if (r->ncol < 2 || r->col[0].type != SQL_INT)
       continue;

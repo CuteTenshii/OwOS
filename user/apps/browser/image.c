@@ -2,8 +2,7 @@
 
 /* ------------------------------------------------------------- image draw */
 
-/* PNG byte source: pulls straight out of the already-fetched body buffer, so
- * the decoder streams from B->pg->raw without a second copy. */
+/* PNG byte source: pulls straight out of the already-fetched body buffer, so the decoder streams */
 struct rawrd {
   int pos;
 };
@@ -15,8 +14,7 @@ static int rawrd_get(void *c)
   return (unsigned char)B->pg->raw[r->pos++];
 }
 
-/* Source-column table for scaling a row of iw pixels to dw, shared by every blit
- * (main thread only). NULL when it can't be allocated: callers then divide. */
+/* Source-column table for scaling a row of iw pixels to dw, shared by every blit (main thread */
 static unsigned *g_xm;
 static unsigned g_xm_cap, g_xm_dw, g_xm_iw;
 const unsigned *xmap_get(unsigned dw, unsigned iw)
@@ -50,8 +48,7 @@ static bool clip_cols(int x0, unsigned dw, unsigned *lo, unsigned *hi)
   return true;
 }
 
-/* Decode state: a fit-to-pane letterbox, blitting each PNG scanline directly
- * into the window buffer inside the content pane (mirrors imgview's v_row). */
+/* Decode state: a fit-to-pane letterbox, blitting each PNG scanline directly into the window */
 struct imgblit {
   int px, py;              /* pane top-left (window coords)            */
   unsigned iw, ih;         /* source image size                       */
@@ -76,8 +73,7 @@ static int img_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
   return 0;
 }
 
-/* Row-copy sink: write each decoded PNG scanline into a full RGBA buffer
- * (the full-page image cache below). */
+/* Row-copy sink: write each decoded PNG scanline into a full RGBA buffer (the full-page image */
 struct imgc_fill {
   unsigned char *buf;
   unsigned iw, ih;
@@ -92,12 +88,7 @@ static int imgc_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
   return 0;
 }
 
-/* Decoded full-page image cache (MODE_IMAGE): the image page would otherwise
- * re-inflate the whole PNG on every repaint (hover, resize, scrollbar). Decode
- * once into RGBA, keyed by the page + its raw buffer, then scale-blit
- * thereafter. Images past DIMG_MAX_PX aren't held — they stream each frame.
- * Cleared on a page change (imgc_clear) or when the raw buffer changes.
- * Main-thread-only. */
+/* Decoded full-page image cache (MODE_IMAGE) */
 #define DIMG_MAX_PX (16u * 1024 * 1024)
 static struct {
   struct page *pg;
@@ -107,8 +98,7 @@ static struct {
   unsigned char *rgba;
 } g_dimg;
 
-/* Streaming decode straight to the pane (no held copy): the cache's fallback
- * for an image too large to buffer, and the unreadable-image error path. */
+/* Streaming decode straight to the pane (no held copy) */
 static void draw_image_stream(int px, int py, int pw, int ph)
 {
   struct rawrd r = {0};
@@ -145,9 +135,7 @@ static void draw_image_stream(int px, int py, int pw, int ph)
   upng_decode(rawrd_get, &r2, img_row, &v, 0, 0);
 }
 
-/* Draw B->pg->raw as a PNG into the content pane (px,py,pw,ph), fit-to-pane
- * with aspect preserved. Decoded once into g_dimg and scale-blitted on later
- * repaints; only a new page / raw buffer forces a re-decode. */
+/* Draw B->pg->raw as a PNG into the content pane (px,py,pw,ph), fit-to-pane with aspect preserved */
 void draw_image(int px, int py, int pw, int ph, unsigned bg)
 {
   (void)bg;
@@ -222,8 +210,7 @@ static int poolrd_get(void *c)
   return r->pos < r->len ? B->img_pool[r->off + r->pos++] : -1;
 }
 
-/* Blit one inline image left-aligned at (x0,y0), width dw, height dh, clipped
- * vertically to the content pane [clip_top, clip_bot) so it scrolls cleanly. */
+/* Blit one inline image left-aligned at (x0,y0), width dw, height dh */
 struct inlblit {
   int x0, y0, dw, dh, clip_top, clip_bot;
   unsigned iw, ih, next_r;
@@ -245,13 +232,7 @@ static int inl_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
   return 0;
 }
 
-/* Decoded-PNG cache: an inline PNG would otherwise re-inflate on every scroll
- * frame (SVGs are raw RGBA and blit directly). Each PNG is decoded once into
- * 0xAARRGGBB words, keyed by its session-unique uid: at natural size when it is
- * small, else already scaled to the displayed size (so a huge photo is held as
- * a pane-sized bitmap). Least recently used entries go first once the byte
- * budget is spent. Cleared when the active page changes or a new page loads.
- * Main-thread-only (render owns it). */
+/* Decoded-PNG cache */
 #define IMGC_BUDGET (16ul << 20)
 #define IMGC_NATURAL_MAX_PX (1024u * 1024u) /* cache at natural size up to this */
 static struct ru_imgcache g_imgc = {.budget = IMGC_BUDGET};
@@ -276,8 +257,7 @@ void imgc_clear(void)
   g_dimg.iw = g_dimg.ih = 0;
 }
 
-/* Decoded pixels for inline PNG `im` shown dw x dh (decoding + caching on first
- * use), or NULL if it can't be decoded or held; the caller then streams it. */
+/* Decoded pixels for inline PNG `im` shown dw x dh (decoding + caching on first use) */
 static const struct ru_img *imgc_get(struct inl_img *im, unsigned dw, unsigned dh)
 {
   if (g_imgc_pg != B->pg) {
@@ -316,11 +296,7 @@ static const struct ru_img *imgc_get(struct inl_img *im, unsigned dw, unsigned d
 
 void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
 {
-  /* Draw with the exact geometry the row was reserved with (line_x/line_w),
-   * not the full pane: an image inside a narrower/indented box was reserved at
-   * its box width but, drawn at pane width, grew taller than its row and lapped
-   * the next line. The caller's `paw` is only a fallback for an unrecorded row.
-   */
+  /* Draw with the exact geometry the row was reserved with (line_x/line_w), not the full pane */
   const struct ltab *t = &g_fr->lt;
   int row = im->start_row;
   bool recorded = (row >= 0 && row < t->n);
@@ -341,8 +317,7 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
     return;
   unsigned *fb = browser_surface();
 
-  /* SVGs live raw in img_pool; PNGs come from the decode cache (decoded once,
-   * not per frame). */
+  /* SVGs live raw in img_pool */
   if (im->is_argb) {
     const unsigned char *src = B->img_pool + im->coff;
     const unsigned *xm = xmap_get((unsigned)dw, im->iw);

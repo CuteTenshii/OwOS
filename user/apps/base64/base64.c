@@ -3,16 +3,13 @@
  *   base64 [file]        encode <file> (or stdin) to base64, wrapped at 76 cols
  *   base64 -d [file]     decode base64 <file> (or stdin) to raw bytes
  *
- * Input is a file argument, or stdin when none is given or it is "-", so it
- * works in a pipe. The codec lives in user/lib/base64; this is just the front
- * end. */
+ * Reads stdin when no file is given or it is "-". Codec lives in user/lib/base64. */
 #include "base64.h"
 #include "opt.h"
 #include "owos.h"
 #include <stdbool.h>
 
-/* Read the whole of `path` into a malloc'd buffer. NULL on error, *out_len set.
- */
+/* Read the whole of `path` into a malloc'd buffer. NULL on error, *out_len set. */
 static char *read_file(const char *path, int *out_len)
 {
   struct statinfo st;

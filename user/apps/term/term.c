@@ -1,22 +1,5 @@
-/* term.c — a terminal: a resizable, scrollable window hosting a shell.
- *
- * A text grid drawn with the 8x16 font (gfx.c) over a scrollback ring buffer.
- * Keys arrive as WEV_KEY events; the shell line-edits in the grid. This is a
- * self-contained shell -- there is no kernel-shell bridge. Commands are
- * served three ways:
- *   - builtins run over syscalls: filesystem/string ops, plus system
- *     info/actions that read or write /proc (cpuinfo, journal, clip, poweroff,
- *     dhcp, services, ...);
- *   - CLI tools (neofetch, curl, lspci, ping, ...) are spawned with their
- * stdout captured through a pipe (spawn_cap) and rendered inline like a pty;
- *   - any other /bin program is launched detached (GUI apps open their window).
- * Ctrl+C arrives as a KEY_INTR event: it cancels the line at the prompt, or
- * kills the captured child mid-command.
- *
- * The window resizes (WEV_RESIZE recomputes the grid) and scrolls (mouse wheel
- * -> WEV_SCROLL moves a view offset over the scrollback, or a drag/click on the
- * gfx scrollbar widget down the right edge).
- */
+/* term.c, a terminal: a resizable, scrollable window hosting a shell. A text grid drawn with the
+ * 8x16 font (gfx.c) over a scrollback ring buffer */
 
 #include "clipboard.h" /* the clipd-backed multi-item clipboard */
 #include "crypto.h"    /* SHA-256 for passwd hashing (su/login/passwd) */
@@ -29,7 +12,7 @@
 #define FONT_W 8
 #define FONT_H 16
 #define MAXCOLS 200
-#define SBROWS 400 /* scrollback lines                   */
+#define SBROWS 400 /* scrollback lines */
 
 #define BG 0x0e1116u
 #define FG 0xc8d0dcu
@@ -37,33 +20,26 @@
 #define FG_DIR 0x6cb6ffu
 #define FG_ERR 0xe06c75u
 
-/* The shell's identity. `home`/`username` track the credentials of *this*
- * process (root at launch, changed by su/login/logout); the kernel hands out
- * the uid via getuid() and the lib resolves the name/home from /etc/passwd. The
- * prompt, ~ expansion and the default cwd all follow `home`. `hostnm` is the
- * system hostname (/etc/hostname) shown in the prompt as user@host. */
+/* The shell's identity */
 static char username[32] = "root";
 static char home[256] = "/home/root";
 static char hostnm[64] = "owos";
 
-/* Refresh `username`/`home` for the calling process (left unchanged when the
- * uid has no /etc/passwd entry). Called at startup and after su/login/logout.
- */
+/* Refresh `username`/`home` for the calling process */
 static void reload_identity(void) { user_ident(username, sizeof username, home, sizeof home); }
 
-/* ---- scrollback ring buffer -------------------------------------------------
- */
+/* scrollback ring buffer */
 
 static unsigned char gch[SBROWS][MAXCOLS];
 static unsigned gfg[SBROWS][MAXCOLS];
-static int top;             /* phys index of logical line 0       */
-static int nlines = 1;      /* logical lines in use               */
-static int cl, cc;          /* cursor: logical line, column       */
-static int view;            /* lines scrolled up from the bottom  */
-static int ls_line, ls_col; /* where the input line starts        */
+static int top;             /* phys index of logical line 0 */
+static int nlines = 1;      /* logical lines in use */
+static int cl, cc;          /* cursor: logical line, column */
+static int view;            /* lines scrolled up from the bottom */
+static int ls_line, ls_col; /* where the input line starts */
 static unsigned cur_fg = FG;
-static int cols = 90, rows = 27;   /* active grid (from window size)     */
-static int winw = 720, winh = 432; /* window client size in pixels       */
+static int cols = 90, rows = 27;   /* active grid (from window size) */
+static int winw = 720, winh = 432; /* window client size in pixels */
 static int win;
 static bool dirty = true;
 
@@ -88,8 +64,7 @@ static void grid_reset(void)
   dirty = true;
 }
 
-/* Advance to a fresh next line, scrolling the ring when the cursor falls off
- * the bottom of the scrollback. */
+/* Advance to a fresh next line */
 static void tnewline(void)
 {
   cc = 0;
@@ -98,7 +73,7 @@ static void tnewline(void)
     if (nlines < SBROWS) {
       nlines = cl + 1;
     } else {
-      top = (top + 1) % SBROWS; /* drop the oldest line               */
+      top = (top + 1) % SBROWS; /* drop the oldest line */
       cl--;
       if (ls_line > 0)
         ls_line--;
@@ -107,14 +82,12 @@ static void tnewline(void)
   }
 }
 
-/* 16-colour ANSI palette. The bridge sends kernel-builtin colours as SGR escape
- * sequences (see vga.c capture_emit_color); we parse them so neofetch et al.
- * keep their colours. Index 0-7 normal, 8-15 bright. */
+/* 16-colour ANSI palette */
 static const unsigned ansi_rgb[16] = {
     0x1b1f26, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xc8d0dc,
     0x5c6370, 0xff7b86, 0xb5e890, 0xffd68a, 0x7ec5ff, 0xe0a0ff, 0x70d8e4, 0xffffff,
 };
-static int esc; /* 0 normal, 1 saw ESC, 2 in CSI       */
+static int esc; /* 0 normal, 1 saw ESC, 2 in CSI */
 static int eparm[8], enp;
 
 static void sgr_apply(void)
@@ -122,7 +95,7 @@ static void sgr_apply(void)
   for (int i = 0; i <= enp; i++) {
     int p = eparm[i];
     if (p == 0)
-      cur_fg = FG; /* reset           */
+      cur_fg = FG; /* reset */
     else if (p >= 30 && p <= 37)
       cur_fg = ansi_rgb[p - 30];
     else if (p >= 90 && p <= 97)
@@ -131,12 +104,7 @@ static void sgr_apply(void)
   }
 }
 
-/* Headless stdio mode (term -stdio): no window/grid; output goes raw to stdout
- * and input comes from stdin, so the shell runs over a pipe instead of a
- * window. term knows nothing about who's on the other end — the kernel sshd
- * spawns it this way with an SSH channel as its stdio, but a plain pipe works
- * too. `headless` switches the I/O funnels; the command dispatch (run/the
- * builtins) is shared with the windowed terminal unchanged. */
+/* Headless stdio mode (term -stdio): no window/grid */
 static int headless;
 
 static void tputc(char c)
@@ -149,9 +117,7 @@ static void tputc(char c)
     }
     return;
   }
-  /* ANSI SGR (colour) escape parser: ESC [ params m. Other escapes are
-   * swallowed. Only the bridge's output carries escapes; typed input never
-   * does (on_key filters to printable bytes). */
+  /* ANSI SGR (colour) escape parser: ESC [ params m */
   if (esc == 1) {
     esc = (c == '[') ? 2 : 0;
     if (esc == 2) {
@@ -178,12 +144,12 @@ static void tputc(char c)
     return;
   }
 
-  view = 0; /* any output snaps to the bottom      */
+  view = 0; /* any output snaps to the bottom */
   if (c == '\n') {
     tnewline();
   } else if (c == '\r') {
     cc = 0;
-  } /* carriage return (e.g. ssh's CRLF)   */
+  } /* carriage return (e.g. ssh's CRLF) */
   else if (c == '\b') {
     if (cc > 0) {
       cc--;
@@ -236,7 +202,7 @@ static void redraw(void)
 {
   if (headless)
     return;                                           /* no window/grid in SSH stdio mode */
-  gfx_fill_rect(0, 0, winw - GUI_SCROLL_W, winh, BG); /* text area          */
+  gfx_fill_rect(0, 0, winw - GUI_SCROLL_W, winh, BG); /* text area */
   int bottom = nlines > rows ? nlines - rows : 0;
   int vt = bottom - view;
   if (vt < 0)
@@ -250,20 +216,17 @@ static void redraw(void)
       if (gch[p][x] != ' ')
         gfx_glyph(x * FONT_W, r * FONT_H, gch[p][x], gfg[p][x], BG);
   }
-  if (view == 0 && cl >= vt && cl < vt + rows) /* caret at bottom    */
+  if (view == 0 && cl >= vt && cl < vt + rows) /* caret at bottom */
     gfx_fill_rect(cc * FONT_W, (cl - vt) * FONT_H + FONT_H - 2, FONT_W, 2, FG);
 
-  /* Scrollbar down the right edge: `scroll` is the top visible line (vt), which
-   * runs 0..bottom as `view` runs bottom..0 (view counts lines scrolled back).
-   */
+  /* Scrollbar down the right edge: `scroll` is the top visible line (vt) */
   scrollbar_draw(winw - GUI_SCROLL_W, 0, GUI_SCROLL_W, winh, bottom - view, nlines, rows);
 
   win_present(win);
   dirty = false;
 }
 
-/* ---- tiny string helpers ----------------------------------------------------
- */
+/* tiny string helpers */
 
 static bool has_prefix(const char *s, const char *p)
 {
@@ -274,15 +237,11 @@ static bool has_prefix(const char *s, const char *p)
   return true;
 }
 
-/* ---- cwd + path resolution --------------------------------------------------
- */
+/* cwd + path resolution */
 
 static char cwd[256] = "/home/root";
 
-/* Resolve `name` against cwd into `out`: ~ expands to the user's home, then .
- * and .. are collapsed. Every syscall path goes through here (the process
- * kernel cwd is
- * "/", so the shell must hand syscalls absolute paths). */
+/* Resolve `name` against cwd into `out`: ~ expands to the user's home, then  */
 static void abspath(const char *name, char *out)
 {
   char in[512];
@@ -333,8 +292,7 @@ static void abspath(const char *name, char *out)
   }
 }
 
-/* ---- builtins ---------------------------------------------------------------
- */
+/* builtins */
 
 static char iobuf[64 * 1024];
 
@@ -352,7 +310,7 @@ static void prompt(void)
     tputs_c(cwd + hl, FG_PROMPT);
   } else
     tputs_c(cwd, FG_PROMPT);
-  /* '#' for root, '$' for everyone else — the classic privilege cue. */
+  /* '#' for root, '$' for everyone else, the classic privilege cue */
   tputs_c(strcmp(username, "root") == 0 ? "# " : "$ ", FG_PROMPT);
   ls_line = cl;
   ls_col = cc;
@@ -464,10 +422,9 @@ static void bi_stat(int argc, char **argv)
   }
 }
 
-/* ---- info builtins: read /proc and render (no kernel-shell bridge) ----------
- */
+/* info builtins: read /proc and render (no kernel-shell bridge) */
 
-/* Print /proc/<name> verbatim. 1 on success, 0 if the entry is missing. */
+/* Print /proc/<name> verbatim */
 static int cat_proc(const char *name)
 {
   char p[64];
@@ -541,8 +498,7 @@ static void bi_which(int argc, char **argv)
   err(argv[1], " not found");
 }
 
-/* ---- control builtins: act via /proc + /sys, no kernel-shell bridge ---------
- */
+/* control builtins: act via /proc + /sys, no kernel-shell bridge */
 
 static void bi_loadkeys(int argc, char **argv)
 {
@@ -561,7 +517,7 @@ static void bi_loadkeys(int argc, char **argv)
 
 static void bi_clip(int argc, char **argv)
 {
-  if (argc < 2) { /* no text: print the clipboard  */
+  if (argc < 2) { /* no text: print the clipboard */
     char mime[64];
     void *data;
     int len;
@@ -582,7 +538,7 @@ static void bi_clip(int argc, char **argv)
       tputc('\n');
     return;
   }
-  int len = 0; /* join argv[1..] with spaces    */
+  int len = 0; /* join argv[1..] with spaces */
   for (int k = 1; k < argc; k++) {
     for (const char *a = argv[k]; *a && len < (int)sizeof iobuf - 1; a++)
       iobuf[len++] = *a;
@@ -593,7 +549,7 @@ static void bi_clip(int argc, char **argv)
     err("clip: failed", 0);
 }
 
-/* Default mount point for a device: /media/<dev>. */
+/* Default mount point for a device: /media/<dev> */
 static void media_point(const char *dev, char *out)
 {
   strcpy(out, "/media/");
@@ -602,7 +558,7 @@ static void media_point(const char *dev, char *out)
 
 static void bi_mount(int argc, char **argv)
 {
-  if (argc > 1) { /* mount <dev> [point]           */
+  if (argc > 1) { /* mount <dev> [point] */
     char point[64];
     if (argc > 2)
       strcpy(point, argv[2]);
@@ -639,7 +595,7 @@ static void bi_mount(int argc, char **argv)
 
 static void bi_umount(int argc, char **argv)
 {
-  if (argc > 1) { /* umount <point>                */
+  if (argc > 1) { /* umount <point> */
     if (umount(argv[1]) == 0) {
       tputs("unmounted ");
       tputs(argv[1]);
@@ -668,7 +624,7 @@ static void bi_services(int argc, char **argv)
     cat_proc("services");
     return;
   }
-  char req[128]; /* "start X" / "stop X" / ...    */
+  char req[128]; /* "start X" / "stop X" /  */
   int len = 0;
   for (int k = 1; k < argc; k++) {
     for (const char *a = argv[k]; *a && len < (int)sizeof req - 1; a++)
@@ -681,13 +637,11 @@ static void bi_services(int argc, char **argv)
     err("services: failed", 0);
 }
 
-/* ---- file codecs: zip/unzip (LZSS) + gzip/gunzip (DEFLATE) ------------------
- */
+/* file codecs: zip/unzip (LZSS) + gzip/gunzip (DEFLATE) */
 
-static unsigned char cbuf[96 * 1024]; /* codec output (input is iobuf)   */
+static unsigned char cbuf[96 * 1024]; /* codec output (input is iobuf) */
 
-/* zip/gzip: read src, compress into cbuf, write dst (default = src + suffix).
- */
+/* zip/gzip: read src, compress into cbuf, write dst (default = src + suffix) */
 static void do_compress(int argc, char **argv, const char *suffix, const char *cmd,
                         int (*comp)(const uint8_t *, uint32_t, uint8_t *, uint32_t), uint32_t (*bound)(uint32_t))
 {
@@ -738,8 +692,7 @@ static void do_compress(int argc, char **argv, const char *suffix, const char *c
   tputs(" bytes)\n");
 }
 
-/* unzip/gunzip: read src, decompress into cbuf, write dst (default = src minus
- * suffix). `orig` sizes the output; the codec validates the container. */
+/* unzip/gunzip: read src, decompress into cbuf, write dst (default = src minus suffix) */
 static void do_decompress(int argc, char **argv, const char *suffix, const char *cmd,
                           int (*dec)(const uint8_t *, uint32_t, uint8_t *, uint32_t),
                           int (*orig)(const uint8_t *, uint32_t))
@@ -770,7 +723,7 @@ static void do_decompress(int argc, char **argv, const char *suffix, const char 
   char dp[256];
   if (argc > 2) {
     abspath(argv[2], dp);
-  } else { /* strip the suffix from src        */
+  } else { /* strip the suffix from src */
     int sl = strlen(argv[1]), xl = strlen(suffix);
     if (sl <= xl || strcmp(argv[1] + sl - xl, suffix) != 0) {
       tputs(cmd);
@@ -794,7 +747,7 @@ static void do_decompress(int argc, char **argv, const char *suffix, const char 
   tputs(" bytes)\n");
 }
 
-/* grep <pattern> <file>: print lines of the file that contain the pattern. */
+/* grep <pattern> <file>: print lines of the file that contain the pattern */
 static void bi_grep(int argc, char **argv)
 {
   if (argc < 3) {
@@ -814,9 +767,9 @@ static void bi_grep(int argc, char **argv)
     int ls = i;
     while (i < n && iobuf[i] != '\n')
       i++;
-    iobuf[i < n ? i : n - 1] = '\0'; /* terminate the line for strstr  */
+    iobuf[i < n ? i : n - 1] = '\0'; /* terminate the line for strstr */
     int hit = 0;
-    for (const char *s = &iobuf[ls]; *s; s++) { /* substring search        */
+    for (const char *s = &iobuf[ls]; *s; s++) { /* substring search */
       const char *a = s, *b = pat;
       while (*a && *b && *a == *b) {
         a++;
@@ -835,26 +788,11 @@ static void bi_grep(int argc, char **argv)
   }
 }
 
-/* /bin programs that drive an interactive session (read keystrokes, not just
- * emit output): their stdin is wired to a pipe and the window's keystrokes are
- * forwarded into it. ssh is the one such tool. */
+/* /bin programs that drive an interactive session (read keystrokes, not just emit output) */
 static bool is_interactive(const char *name) { return !strcmp(name, "ssh"); }
 
-/* Spawn a /bin CLI tool with its stdout wired to a pipe (spawn_cap) and render
- * the output as it streams in. The terminal stays responsive to window events;
- * closing the window kills the child. This replaces the kernel-shell bridge:
- * the command is an ordinary process whose output we read like a pty.
- *
- * `interactive` (ssh) also wires the child's stdin: every key the window
- * delivers is forwarded raw into the child's stdin pipe (no local echo -- the
- * remote side echoes), Ctrl+C included (the child turns it into a remote ^C)
- * rather than aborting the child. Closing the window still kills it. */
-/* Backgrounded windowed children. A child that opens its own window is handed
- * off here so the prompt returns immediately (our stdout-capture model would
- * otherwise block on a long-lived window). We keep draining its stray stdout so
- * a full pipe can't wedge it, and reap it once it exits. No app list is needed:
- * the kernel reports which children own a window (win_owned), the same way a
- * Unix terminal never classifies its children at all. */
+/* Spawn a /bin CLI tool with its stdout wired to a pipe and render the output as it streams in */
+/* Backgrounded windowed children */
 #define BG_MAX 16
 static struct {
   int pid, rfd;
@@ -870,8 +808,7 @@ static void bg_add(int pid, int rfd)
       bg_jobs[i].active = true;
       return;
     }
-  close(rfd); /* table full: drop the pipe; the child is reparented + reaped on
-                 our exit */
+  close(rfd); /* table full: drop the pipe */
 }
 
 static void bg_service(void)
@@ -898,9 +835,7 @@ static void bg_service(void)
 static void render_child(const char *path, char **argv, int argc, int interactive)
 {
   int rfd = -1, wfd = -1;
-  /* Headless (SSH): no window. Capture the child's stdout to our stdout (the
-   * channel); forward our stdin to the child if interactive; Ctrl+C (0x03 from
-   * the remote) aborts it. */
+  /* Headless (SSH): no window */
   if (headless) {
     int pid = interactive ? spawn_cap_io(path, argv, argc, &rfd, &wfd) : spawn_cap(path, argv, argc, &rfd);
     if (pid < 0) {
@@ -945,7 +880,7 @@ static void render_child(const char *path, char **argv, int argc, int interactiv
         closing = 1;
         kill(pid, SIGKILL);
       } else if (ev.type == WEV_KEY && interactive && !closing) {
-        char b = (char)ev.a; /* forward the keystroke raw   */
+        char b = (char)ev.a; /* forward the keystroke raw */
         if (wfd >= 0)
           write(wfd, &b, 1);
       } else if (ev.type == WEV_KEY && (unsigned char)ev.a == KEY_INTR && !intr && !closing) {
@@ -955,9 +890,7 @@ static void render_child(const char *path, char **argv, int argc, int interactiv
         redraw(); /* Ctrl+C: abort */
       }
     }
-    /* A windowed app (opened its own window): hand it off and return to the
-     * prompt. This is what replaces the hardcoded CLI/GUI list — any program,
-     * shipped or third-party, is classified by behavior, not by name. */
+    /* A windowed app (opened its own window): hand it off and return to the prompt */
     if (!interactive && !closing && !intr && win_owned(pid)) {
       bg_add(pid, rfd);
       return;
@@ -973,14 +906,14 @@ static void render_child(const char *path, char **argv, int argc, int interactiv
       break; /* child closed stdout / exited */
     } else {
       if (dirty && !closing)
-        redraw(); /* running; nothing yet     */
+        redraw(); /* running; nothing yet */
       msleep(interactive ? 4 : 8);
     }
   }
   if (wfd >= 0)
     close(wfd);
   close(rfd);
-  waitpid(pid); /* reap the zombie           */
+  waitpid(pid); /* reap the zombie */
   if (closing) {
     win_close(win);
     exit(0);
@@ -988,24 +921,12 @@ static void render_child(const char *path, char **argv, int argc, int interactiv
   /* intr: fall through -- run()'s caller prints a fresh prompt */
 }
 
-/* ---- multi-user: account & group management --------------------------------
- * *
- *
- * The account database is two ordinary owofs files edited here in user space:
- *   /etc/passwd  name:pwhash:uid:gid:home   (pwhash empty = no password)
- *   /etc/group   name:gid:member1,member2
- * The only privileged step is switching identity (su/login), which is done by
- * writing /proc/login and validated by the kernel (it hashes the plaintext and
- * checks it against /etc/passwd). Everything else is plain file editing, so the
- * "only root may manage accounts" rule is enforced here by checking the
- * caller's uid via getuid().
- */
+/* multi-user: account & group management */
 
 static char pbuf[8192]; /* working copy of /etc/passwd */
-static char gbuf[8192]; /* working copy of /etc/group  */
+static char gbuf[8192]; /* working copy of /etc/group */
 
-/* Load a line file into buf (NUL-terminated). Returns its length, or -1 (then
- * buf is the empty string, so callers can still append to a fresh file). */
+/* Load a line file into buf (NUL-terminated) */
 static int load_file(const char *path, char *buf, int max)
 {
   int n = readfile(path, buf, max - 1);
@@ -1019,7 +940,7 @@ static int load_file(const char *path, char *buf, int max)
 
 static int save_file(const char *path, const char *buf) { return writefile(path, buf, strlen(buf)); }
 
-/* Unsigned int -> decimal string. */
+/* Unsigned int -> decimal string */
 static void u2s(unsigned v, char *out)
 {
   char t[12];
@@ -1039,8 +960,7 @@ static void u2s(unsigned v, char *out)
   out[i] = '\0';
 }
 
-/* Copy the idx-th ':'-delimited field of the line at `line` into out[max].
- * Stops at ':' or the end of the line. Returns 1 if the field exists. */
+/* Copy the idx-th ':'-delimited field of the line at `line` into out[max] */
 static int line_field(const char *line, int idx, char *out, int max)
 {
   const char *p = line;
@@ -1060,7 +980,7 @@ static int line_field(const char *line, int idx, char *out, int max)
   return 1;
 }
 
-/* Pointer to the line in `buf` whose field 0 equals `name`, or NULL. */
+/* Pointer to the line in `buf` whose field 0 equals `name`, or NULL */
 static char *find_line(char *buf, const char *name)
 {
   for (char *line = buf; *line;) {
@@ -1076,7 +996,7 @@ static char *find_line(char *buf, const char *name)
   return 0;
 }
 
-/* Delete the line beginning at `p` from `buf` (shift the tail down over it). */
+/* Delete the line beginning at `p` from `buf` (shift the tail down over it) */
 static void remove_line(char *buf, char *p)
 {
   (void)buf;
@@ -1090,7 +1010,7 @@ static void remove_line(char *buf, char *p)
     p[i] = e[i];
 }
 
-/* Smallest id >= start in column `idx` that no line uses. */
+/* Smallest id >= start in column `idx` that no line uses */
 static unsigned next_free_id(const char *buf, int idx, unsigned start)
 {
   for (unsigned c = start;; c++) {
@@ -1112,7 +1032,7 @@ static unsigned next_free_id(const char *buf, int idx, unsigned start)
   }
 }
 
-/* Lowercase-hex SHA-256 of `pass` into out[65]. Matches the kernel's check. */
+/* Lowercase-hex SHA-256 of `pass` into out[65] */
 static void pw_hash(const char *pass, char out[65])
 {
   unsigned char dg[SHA256_DIGEST];
@@ -1133,8 +1053,7 @@ static int require_root(const char *cmd)
   return 0;
 }
 
-/* A legal account/group name: [A-Za-z_][A-Za-z0-9_-]*, <= 16 chars (so
- * "/home/<name>" fits owofs's 17-char component limit). */
+/* A legal account/group name: [A-Za-z_][A-Za-z0-9_-]*, <= 16 chars */
 static bool valid_name(const char *s)
 {
   if (!s || !s[0])
@@ -1175,7 +1094,7 @@ static int csv_has(const char *csv, const char *tok)
   return 0;
 }
 
-/* Group name whose gid field == gid, into out[max] ("" if none). */
+/* Group name whose gid field == gid, into out[max] ("" if none) */
 static void group_name_for_gid(char *groups, unsigned gid, char *out, int max)
 {
   out[0] = '\0';
@@ -1197,8 +1116,7 @@ static void group_name_for_gid(char *groups, unsigned gid, char *out, int max)
   }
 }
 
-/* ---- account commands (each is its own builtin) ----------------------------
- */
+/* account commands (each is its own builtin) */
 
 static void cmd_useradd(int argc, char **argv)
 {
@@ -1221,7 +1139,7 @@ static void cmd_useradd(int argc, char **argv)
   }
 
   unsigned uid = next_free_id(pbuf, 2, 1000);
-  unsigned gid = uid; /* user-private group (same id)        */
+  unsigned gid = uid; /* user-private group (same id) */
   char ub[12], gb[12];
   u2s(uid, ub);
   u2s(gid, gb);
@@ -1241,7 +1159,7 @@ static void cmd_useradd(int argc, char **argv)
     return;
   }
 
-  /* The matching primary group. */
+  /* The matching primary group */
   load_file("/etc/group", gbuf, sizeof gbuf);
   if (!find_line(gbuf, name)) {
     char gl[128];
@@ -1253,7 +1171,7 @@ static void cmd_useradd(int argc, char **argv)
     save_file("/etc/group", gbuf);
   }
 
-  /* The home directory. */
+  /* The home directory */
   char hp[64];
   strcpy(hp, "/home/");
   strcat(hp, name);
@@ -1298,12 +1216,12 @@ static void cmd_userdel(int argc, char **argv)
     return;
   }
 
-  /* Drop the user's primary group and strip it from every member list. */
+  /* Drop the user's primary group and strip it from every member list */
   load_file("/etc/group", gbuf, sizeof gbuf);
   char *gp = find_line(gbuf, name);
   if (gp)
     remove_line(gbuf, gp);
-  /* Rebuild each group line with `name` filtered out of its members. */
+  /* Rebuild each group line with `name` filtered out of its members */
   static char nb[8192];
   int o = 0;
   for (char *line = gbuf; *line;) {
@@ -1493,7 +1411,7 @@ static void cmd_groupdel(int argc, char **argv)
   tputc('\n');
 }
 
-/* usermod -aG <group> <user>: add an existing user to a supplementary group. */
+/* usermod -aG <group> <user>: add an existing user to a supplementary group */
 static void cmd_usermod(int argc, char **argv)
 {
   if (argc < 4 || strcmp(argv[1], "-aG") != 0) {
@@ -1554,7 +1472,7 @@ static void cmd_usermod(int argc, char **argv)
   tputc('\n');
 }
 
-/* users: list every account. */
+/* users: list every account */
 static void cmd_users(void)
 {
   if (load_file("/etc/passwd", pbuf, sizeof pbuf) < 0) {
@@ -1581,9 +1499,7 @@ static void cmd_users(void)
   }
 }
 
-/* The groups a user belongs to: its primary group plus any whose member list
- * names it. Shared by `groups` and `id`. Writes space-separated names to out.
- */
+/* The groups a user belongs to: its primary group plus any whose member list names it */
 static void user_groups(const char *user, char *out, int max)
 {
   out[0] = '\0';
@@ -1674,10 +1590,7 @@ static void cmd_id(int argc, char **argv)
   tputc('\n');
 }
 
-/* su / login / logout: switch this shell's identity. The kernel validates the
- * password (write to /proc/login), then we re-read our new identity and move to
- * the new home. Password is given on the line (`su alice secret`) since the
- * line editor has no hidden-input mode. */
+/* su / login / logout: switch this shell's identity */
 static void do_login(const char *name, const char *pass)
 {
   char req[200];
@@ -1719,8 +1632,7 @@ static void bi_whoami(void)
   tputc('\n');
 }
 
-/* hostname: print the system hostname, or (with an arg) set it via
- * /etc/hostname. */
+/* hostname: print the system hostname, or (with an arg) set it via /etc/hostname */
 static void bi_hostname(int argc, char **argv)
 {
   if (argc > 1) {
@@ -1735,8 +1647,7 @@ static void bi_hostname(int argc, char **argv)
   }
 }
 
-/* A non-builtin command: a captured CLI tool, a detached GUI app, or (until the
- * last kernel builtins are ported) the kernel-shell bridge. */
+/* A non-builtin command: a captured CLI tool, a detached GUI app, or the kernel-shell bridge */
 static void run_other(const char *orig, int argc, char **argv)
 {
   char path[256];
@@ -1754,16 +1665,12 @@ static void run_other(const char *orig, int argc, char **argv)
 
   struct statinfo st;
   if (stat(path, &st) == 0 && !st.is_dir) {
-    /* Run every program the same way: captured, streaming its output inline.
-     * If it opens a window, render_child hands it off (bg_service) and the
-     * prompt returns. No CLI/GUI allowlist — the window is the signal, so a
-     * new or third-party program behaves correctly with no term.c edit. */
+    /* Run every program the same way: captured, streaming its output inline */
     render_child(path, argv, argc, 0);
     return;
   }
 
-  /* The shell dispatches entirely in user space -- there is no kernel-shell
-   * bridge, and every command it offers is implemented here. */
+  /* The shell dispatches entirely in user space -- there is no kernel-shell bridge */
   err(argv[0], ": command not found");
 }
 
@@ -1773,9 +1680,7 @@ static void run(const char *orig)
   strcpy(buf, orig);
   char *argv[16];
   int argc = 0, i = 0;
-  /* Split on whitespace, with double-quoted runs kept whole and the quotes
-   * stripped (so `curl -H "X-Test: a b"` is one argument). Compacted in place.
-   */
+  /* Split on whitespace, with double-quoted runs kept whole and the quotes stripped */
   while (buf[i] && argc < 16) {
     while (buf[i] == ' ')
       i++;
@@ -1948,8 +1853,7 @@ static void run(const char *orig)
     run_other(orig, argc, argv);
 }
 
-/* ---- line editor ------------------------------------------------------------
- */
+/* line editor */
 
 static char line[256];
 static int llen, lpos, rlen;
@@ -2006,14 +1910,10 @@ static void line_submit(void)
   strcpy(tmp, line);
   llen = lpos = rlen = 0;
   hpos = -1;
-  redraw(); /* flush the echoed line + newline now: a
-                                          command that blocks in the kernel
-               (play, sleep, curl) stalls this event handler, and the present
-               only runs in the main loop after we return -- without this the
-               screen freezes on the pre-Enter line for the whole command. */
+  redraw(); /* flush the echoed line + newline now */
   run(tmp);
   cur_fg = FG;
-  esc = 0; /* don't let a command's colour bleed   */
+  esc = 0; /* don't let a command's colour bleed */
   prompt();
 }
 
@@ -2024,7 +1924,7 @@ static void on_key(char c)
   case '\r':
     line_submit();
     break;
-  case KEY_INTR: /* Ctrl+C: abandon the line     */
+  case KEY_INTR: /* Ctrl+C: abandon the line */
     cl = ls_line;
     cc = ls_col;
     for (int i = 0; i < llen; i++)
@@ -2102,7 +2002,7 @@ static void on_key(char c)
 static void on_scroll(int dz)
 {
   int maxoff = nlines > rows ? nlines - rows : 0;
-  view -= dz * 3; /* wheel up scrolls back to older lines  */
+  view -= dz * 3; /* wheel up scrolls back to older lines */
   if (view < 0)
     view = 0;
   if (view > maxoff)
@@ -2110,9 +2010,8 @@ static void on_scroll(int dz)
   dirty = true;
 }
 
-/* The scrollbar widget works in top-line units (`scroll`, 0..bottom); `view`
- * counts lines scrolled back (bottom..0), so the two are mirror images. */
-static int sb_drag; /* 1 while the thumb is held           */
+/* The scrollbar widget works in top-line units (`scroll`, 0..bottom) */
+static int sb_drag; /* 1 while the thumb is held */
 
 static void sb_set(int scroll)
 {
@@ -2125,14 +2024,13 @@ static void sb_set(int scroll)
   dirty = true;
 }
 
-/* Left-click on the bar: arrows step a line, a track grab jumps the thumb to
- * the cursor and starts a drag. A click anywhere else ends any pending drag. */
+/* Left-click on the bar: arrows step a line */
 static void on_click(int mx, int my)
 {
   sb_drag = 0;
   int maxoff = nlines > rows ? nlines - rows : 0;
   if (maxoff <= 0)
-    return; /* nothing to scroll  */
+    return; /* nothing to scroll */
   int sbx = winw - GUI_SCROLL_W;
   int part = scrollbar_hit(sbx, 0, GUI_SCROLL_W, winh, mx, my);
   int scroll = maxoff - view;
@@ -2146,8 +2044,7 @@ static void on_click(int mx, int my)
   }
 }
 
-/* Drag while the thumb is held: track the cursor's y. mx is pinned into the bar
- * so a little horizontal drift doesn't drop the grab. */
+/* Drag while the thumb is held: track the cursor's y */
 static void on_drag(int mx, int my)
 {
   if (!sb_drag)
@@ -2173,10 +2070,7 @@ static void on_resize(int w, int h)
   dirty = true;
 }
 
-/* Headless stdio REPL (term -stdio): the shell over stdin/stdout instead of a
- * window. Reuses run() + every builtin unchanged; only the I/O is a raw byte
- * stream (a simple echoing line editor — no grid, no history/arrows). Whoever
- * spawns us (the kernel sshd, a pipe) wires our stdio; we don't care which. */
+/* Headless stdio REPL (term -stdio): the shell over stdin/stdout instead of a window */
 static void stdio_repl(void)
 {
   headless = 1;
@@ -2237,7 +2131,7 @@ int main(int argc, char **argv)
   rows = 432 / FONT_H;
 
   reload_identity();                  /* pick up our launch user (root) + its home */
-  gethostname(hostnm, sizeof hostnm); /* system hostname for the prompt   */
+  gethostname(hostnm, sizeof hostnm); /* system hostname for the prompt */
   strcpy(cwd, home);
   grid_reset();
   tputs_c("OwOS terminal -- type 'help'.\n", FG);

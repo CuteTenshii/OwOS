@@ -1,16 +1,6 @@
-/* ext.c — read-only ext2/3/4 driver (see ext.h).
- *
- * Little-endian throughout. The Superblock (byte 1024) gives the block size,
- * inode size, inodes-per-group and feature flags; block-group descriptors (just
- * after it) locate each group's inode table. An inode's data blocks are mapped
- * logical->physical by an extent tree (ext4) or classic indirect blocks
- * (ext2/3). Directories are files of dir_entry_2 records; we scan them linearly
- * (htree indexes are transparent to a linear read). Root is inode 2.
- *
- * Multi-instance: all per-mount state -- including the sector/block scratch
- * buffers -- lives in a heap-allocated `struct ext_mount`, so concurrent mounts
- * don't clobber each other. Each op takes the instance through a void *inst.
- */
+/* ext.c: read-only ext2/3/4 driver (see ext.h).
+ * Little-endian; extent tree (ext4) or indirect blocks (ext2/3); linear directory scan; root is inode 2.
+ * All per-mount state, scratch buffers included, lives in a heap struct ext_mount (multi-instance). */
 
 #include <stddef.h>
 
@@ -20,7 +10,6 @@
 #include "heap.h"
 #include "kstring.h"
 
-/* ---------------------------------------------------------------- state */
 #define EXT_MAGIC 0xEF53u
 #define EXT_ROOT_INO 2u
 #define MAX_BLOCK 4096
@@ -31,9 +20,7 @@
 #define INODE_EXTENTS_FL 0x80000u
 #define EXT_EXTENT_MAGIC 0xF30Au
 
-/* Every per-mount mutable field. One heap-allocated instance per mounted ext
- * volume; ops cast their void *inst to this. The scratch buffers live here too
- * so two concurrent mounts never share them. */
+/* Per-mount mutable state (heap-allocated); ops cast their void *inst to this. */
 struct ext_mount {
   blk_read_fn read;
   uint32_t base; /* LBA of byte 0 of the volume */
@@ -45,15 +32,13 @@ struct ext_mount {
   const char *type;
   char label[20];
 
-  /* Scratch: one inode under inspection, one for the directory being walked,
-   * and two block buffers (one for block-mapping internals, one for data). */
+  /* Scratch: current inode, directory inode being walked, and two block buffers (mapping, data). */
   uint8_t cur_inode[256];
   uint8_t dir_inode[256];
   uint8_t blk_scratch[MAX_BLOCK];
   uint8_t data_blk[MAX_BLOCK];
 };
 
-/* ------------------------------------------------------------- device I/O */
 static int dev_read(struct ext_mount *m, uint64_t byteoff, uint8_t *buf, uint32_t len)
 {
   uint8_t s[512];
@@ -78,9 +63,7 @@ static int read_block(struct ext_mount *m, uint32_t block, uint8_t *buf)
   return dev_read(m, (uint64_t)block * m->block_size, buf, m->block_size);
 }
 
-/* Straddle-safe read of `len` bytes from an absolute device byte offset using a
- * raw callback (used while probing, before an ext_mount's read/base are set).
- */
+/* Straddle-safe read of len bytes at an absolute byte offset via a raw callback (used while probing). */
 static int raw_read(blk_read_fn read, uint64_t byteoff, uint8_t *buf, uint32_t len)
 {
   uint8_t s[512];
@@ -100,7 +83,6 @@ static int raw_read(blk_read_fn read, uint64_t byteoff, uint8_t *buf, uint32_t l
   return 0;
 }
 
-/* The inode-table start block of a given block group. */
 static uint64_t group_inode_table(struct ext_mount *m, uint32_t group)
 {
   uint8_t gd[64];
@@ -137,14 +119,8 @@ static uint64_t inode_size(const uint8_t *ibuf)
   return sz;
 }
 
-/* ------------------------------------------------- logical -> physical block
- */
-
-/* Walk an extent tree to map logical block `lblk` -> physical block (0 = hole).
- * `node` points at an ext4_extent_header (inline in the inode, or a tree node
- * read into blk_scratch); `node_bytes` is the usable size of that buffer, so an
- * untrusted eh_entries can't drive the entry scan past it. A guard counter caps
- * tree depth against a cyclic/self-referential tree. */
+/* Map logical block lblk to physical (0 = hole) via an extent tree at node (node_bytes usable);
+ * bounded by node_bytes and a depth guard against untrusted or cyclic trees. */
 static uint32_t extent_lookup(struct ext_mount *m, const uint8_t *node, uint32_t node_bytes, uint32_t lblk)
 {
   for (int guard = 0; guard < 32; guard++) {
@@ -152,11 +128,11 @@ static uint32_t extent_lookup(struct ext_mount *m, const uint8_t *node, uint32_t
       return 0;
     uint16_t entries = load_le16(node + 2);
     uint16_t depth = load_le16(node + 6);
-    uint32_t maxent = (node_bytes - 12) / 12; /* entries that fit */
+    uint32_t maxent = (node_bytes - 12) / 12;
     if (entries > maxent)
       entries = (uint16_t)maxent;
 
-    if (depth == 0) { /* leaf: ext4_extent */
+    if (depth == 0) {
       for (int i = 0; i < entries; i++) {
         const uint8_t *e = node + 12 + i * 12;
         uint32_t eb = load_le32(e);
@@ -164,7 +140,7 @@ static uint32_t extent_lookup(struct ext_mount *m, const uint8_t *node, uint32_t
         if (len > 32768)
           len -= 32768; /* uninitialized */
         if (lblk >= eb && lblk < eb + len) {
-          uint32_t phys = load_le32(e + 8); /* ee_start_lo */
+          uint32_t phys = load_le32(e + 8);
           return phys + (lblk - eb);
         }
       }
@@ -181,7 +157,7 @@ static uint32_t extent_lookup(struct ext_mount *m, const uint8_t *node, uint32_t
     }
     if (!chosen)
       return 0;
-    uint32_t leaf = load_le32(chosen + 4); /* ei_leaf_lo */
+    uint32_t leaf = load_le32(chosen + 4);
     if (read_block(m, leaf, m->blk_scratch) != 0)
       return 0;
     node = m->blk_scratch;
@@ -193,7 +169,7 @@ static uint32_t extent_lookup(struct ext_mount *m, const uint8_t *node, uint32_t
 /* Classic ext2/3 block map: 12 direct + single/double/triple indirect. */
 static uint32_t indirect_lookup(struct ext_mount *m, const uint8_t *ibuf, uint32_t lblk)
 {
-  const uint8_t *blk = ibuf + 40;   /* i_block[15] */
+  const uint8_t *blk = ibuf + 40;
   uint32_t ppb = m->block_size / 4; /* pointers per block */
 
   if (lblk < 12)
@@ -228,16 +204,12 @@ static uint32_t indirect_lookup(struct ext_mount *m, const uint8_t *ibuf, uint32
 static uint32_t map_block(struct ext_mount *m, const uint8_t *ibuf, uint32_t lblk)
 {
   if (load_le32(ibuf + 32) & INODE_EXTENTS_FL)
-    return extent_lookup(m, ibuf + 40, 60, lblk); /* i_block[15] = 60 bytes */
+    return extent_lookup(m, ibuf + 40, 60, lblk);
   return indirect_lookup(m, ibuf, lblk);
 }
 
-/* ----------------------------------------------------- directory + resolve */
-
-/* Find child `name` (exact, case-sensitive) in directory inode `dirbuf`. On a
- * hit returns the child inode number and sets *is_dir (best-effort from the
- * dir_entry file_type); 0 if not found. Uses data_blk (so the caller must not
- * hold a data_blk it needs). */
+/* Find child name (case-sensitive) in dirbuf; returns its inode, *is_dir best-effort, 0 if absent.
+ * Uses data_blk. */
 static uint32_t dir_find(struct ext_mount *m, const uint8_t *dirbuf, const char *name, int *is_dir)
 {
   uint64_t size = inode_size(dirbuf);
@@ -258,7 +230,7 @@ static uint32_t dir_find(struct ext_mount *m, const uint8_t *dirbuf, const char 
       if (rec < 8)
         break;
       if (off + 8 + nl > m->block_size)
-        break; /* name runs past the block */
+        break;
       if (ino && nl == nlen) {
         bool match = true;
         for (uint32_t i = 0; i < nlen; i++)
@@ -268,7 +240,7 @@ static uint32_t dir_find(struct ext_mount *m, const uint8_t *dirbuf, const char 
           }
         if (match) {
           if (is_dir)
-            *is_dir = (e[7] == 2); /* file_type dir */
+            *is_dir = (e[7] == 2);
           return ino;
         }
       }
@@ -322,8 +294,6 @@ static int resolve(struct ext_mount *m, const char *path, uint32_t *ino_out, int
   return 0;
 }
 
-/* ------------------------------------------------------------- mounting */
-
 static int parse_superblock(struct ext_mount *m, const uint8_t *sb)
 {
   if (load_le16(sb + 56) != EXT_MAGIC)
@@ -358,8 +328,7 @@ static int parse_superblock(struct ext_mount *m, const uint8_t *sb)
   return 0;
 }
 
-/* Try to mount the ext volume whose Superblock is at byte 1024 of `base_lba`.
- * 0 on success (m populated), -1 on failure. */
+/* Mount the ext volume whose Superblock is at byte 1024 of base_lba. 0, or -1. */
 static int try_mount(struct ext_mount *m, blk_read_fn read, uint32_t base_lba)
 {
   uint8_t sb[1024];
@@ -370,14 +339,12 @@ static int try_mount(struct ext_mount *m, blk_read_fn read, uint32_t base_lba)
     return -1;
   if (parse_superblock(m, sb) != 0)
     return -1;
-  /* Sanity: the root inode must read and be a directory. */
   if (read_inode(m, EXT_ROOT_INO, m->cur_inode) != 0 || !inode_is_dir(m->cur_inode))
     return -1;
   return 0;
 }
 
-/* Whole disk, then GPT, then MBR partitions (ext often lives in a partition).
- */
+/* Try the whole disk, then GPT, then MBR partitions. */
 static int probe_dev(struct ext_mount *m, blk_read_fn read)
 {
   if (try_mount(m, read, 0) == 0)
@@ -394,9 +361,7 @@ static int probe_dev(struct ext_mount *m, blk_read_fn read)
       ent_cnt = 128;
     uint8_t ent[128];
     for (uint32_t i = 0; i < ent_cnt; i++) {
-      /* ent_sz is untrusted (only floored to 128), so an entry can straddle
-       * a sector boundary and its tail runs past a single 512-byte read.
-       * Read exactly one 128-byte entry straddle-safe and index that. */
+      /* ent_sz is untrusted, so read exactly one 128-byte entry straddle-safe. */
       if (raw_read(read, ent_lba * 512 + (uint64_t)i * ent_sz, ent, 128) != 0)
         break;
       bool empty = true;
@@ -424,8 +389,6 @@ static int probe_dev(struct ext_mount *m, blk_read_fn read)
   return -1;
 }
 
-/* ------------------------------------------------------------------ ops */
-
 static const char *ext_label(struct ext_mount *m) { return m->label; }
 static const char *ext_type(struct ext_mount *m) { return m->type; }
 
@@ -450,7 +413,7 @@ static int dir_walk(struct ext_mount *m, const char *path, int want_idx, char *n
   uint64_t sz;
   if (resolve(m, path, NULL, &d, &sz) != 0 || !d)
     return want_idx < 0 ? -1 : 0;
-  memcpy(m->dir_inode, m->cur_inode, sizeof m->dir_inode); /* hold the dir inode */
+  memcpy(m->dir_inode, m->cur_inode, sizeof m->dir_inode);
 
   uint64_t dsize = inode_size(m->dir_inode);
   int seen = 0;
@@ -467,7 +430,7 @@ static int dir_walk(struct ext_mount *m, const char *path, int want_idx, char *n
       if (rec < 8)
         break;
       if (off + 8 + nl > m->block_size)
-        break; /* name runs past the block */
+        break;
       if (ino && nl) {
         char nm[256];
         int j = 0;
@@ -478,7 +441,7 @@ static int dir_walk(struct ext_mount *m, const char *path, int want_idx, char *n
         if (!skip) {
           int isd = (e[7] == 2);
           uint32_t fsz = 0;
-          if (want_idx < 0) { /* print mode */
+          if (want_idx < 0) {
             uint32_t s = 0;
             if (read_inode(m, ino, m->cur_inode) == 0) {
               isd = inode_is_dir(m->cur_inode);
@@ -491,7 +454,7 @@ static int dir_walk(struct ext_mount *m, const char *path, int want_idx, char *n
               con_write("  ");
             }
             con_printf("%s\n", nm);
-          } else if (seen == want_idx) { /* index mode */
+          } else if (seen == want_idx) {
             if (read_inode(m, ino, m->cur_inode) == 0) {
               isd = inode_is_dir(m->cur_inode);
               fsz = (uint32_t)inode_size(m->cur_inode);
@@ -529,8 +492,8 @@ static int ext_read_at(struct ext_mount *m, const char *path, uint32_t offset, v
   uint64_t sz;
   int d;
   if (resolve(m, path, NULL, &d, &sz) != 0 || d)
-    return -1;                                             /* absent / a dir */
-  memcpy(m->dir_inode, m->cur_inode, sizeof m->dir_inode); /* the file inode */
+    return -1;
+  memcpy(m->dir_inode, m->cur_inode, sizeof m->dir_inode);
 
   if (offset >= sz)
     return 0;
@@ -547,7 +510,7 @@ static int ext_read_at(struct ext_mount *m, const char *path, uint32_t offset, v
     uint32_t chunk = m->block_size - boff;
     if (chunk > len - got)
       chunk = len - got;
-    if (!phys) { /* sparse hole */
+    if (!phys) {
       memset(dst + got, 0, chunk);
     } else {
       if (read_block(m, phys, m->data_blk) != 0)
@@ -559,11 +522,9 @@ static int ext_read_at(struct ext_mount *m, const char *path, uint32_t offset, v
   return (int)got;
 }
 
-/* --------------------------------------------------------------- vtable */
-
 static void *ext_probe(blk_read_fn read, blk_write_fn write)
 {
-  (void)write; /* read-only */
+  (void)write;
   if (!read)
     return NULL;
   struct ext_mount *m = kmalloc(sizeof *m);

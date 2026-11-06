@@ -1,7 +1,6 @@
 #include "engine_int.h"
 
-/* ------------------------------------------------ @media -------------------
- */
+/* @media */
 static const char *skip_sp(const char *p, const char *e)
 {
   while (p < e && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f'))
@@ -9,8 +8,7 @@ static const char *skip_sp(const char *p, const char *e)
   return p;
 }
 
-/* Match lowercase keyword `lit` at *pp (token-bounded); advance past it on a
- * hit. */
+/* Match lowercase keyword `lit` at *pp (token-bounded); advance past it on a hit. */
 static bool kw(const char **pp, const char *e, const char *lit)
 {
   const char *q = *pp;
@@ -26,11 +24,7 @@ static bool kw(const char **pp, const char *e, const char *lit)
   return true;
 }
 
-/* Parse a media length operand in [s,e) -> px (rounded to int); -1 if no
- * number. Width/height media features carry an integer px, so font- and
- * physical-unit lengths (em/rem, cm/mm/in/pt — common in framework breakpoints)
- * resolve against the same bases the cascade uses, and decimals (37.5em)
- * survive. */
+/* Media length operand in [s,e) -> integer px (em/rem and physical units resolve like the cascade); -1 if none. */
 static int parse_len_px(const char *s, const char *e)
 {
   s = skip_sp(s, e);
@@ -61,7 +55,7 @@ static int parse_len_px(const char *s, const char *e)
   const char *u = skip_sp(s, e);
   double px;
   if (u >= e)
-    px = n; /* unitless -> px */
+    px = n;
   else if (starts_ci(u, "px"))
     px = n;
   else if (starts_ci(u, "rem"))
@@ -92,8 +86,7 @@ static bool span_eq_trim(const char *a, const char *e, const char *lit)
   return span_is(a, e, lit);
 }
 
-/* ------- modern range syntax: (width >= 600px), (400px <= width <= 900px) ---
- */
+/* range syntax: (width >= 600px), (400px <= width <= 900px) */
 enum { OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ };
 
 /* width/height keyword in [s,e) -> 'w' / 'h' (0 = neither). */
@@ -125,8 +118,7 @@ static int op_flip(int op)
   }
 }
 
-/* Read a comparison operator at *pp (`<` `<=` `>` `>=` `=` `==`); -1 if none.
- */
+/* Read a comparison operator at *pp (`<` `<=` `>` `>=` `=` `==`); -1 if none. */
 static int read_op(const char **pp, const char *e)
 {
   const char *p = *pp;
@@ -155,9 +147,7 @@ static int read_op(const char **pp, const char *e)
   return op;
 }
 
-/* Add one bound `<feature> op <len>` (op as written with the feature on the
- * LEFT) to *c as a min/max/exact feature. Strict </> nudge the integer px
- * boundary by 1 so a viewport exactly on the edge compares correctly. */
+/* Add bound `<feature> op <len>` (feature on the left) to *c; strict </> nudge the px edge by 1. */
 static bool cond_add_feat(struct media_cond *c, struct media_feature f)
 {
   struct media_feature *nf = realloc(c->feat, (unsigned)(c->nfeat + 1) * sizeof *nf);
@@ -196,8 +186,7 @@ static void range_bound(struct media_cond *c, int dim, int op, int len)
     cond_add_feat(c, f);
 }
 
-/* Parse range syntax inside the parens [s,e): one comparison (feature on either
- * side) or a two-sided interval, emitting one or two min/max/exact features. */
+/* Parse range syntax in parens [s,e): one comparison or a two-sided interval. */
 static void parse_range(const char *s, const char *e, struct media_cond *c)
 {
   const char *part_s[3], *part_e[3];
@@ -225,7 +214,7 @@ static void parse_range(const char *s, const char *e, struct media_cond *c)
     np++;
   }
 
-  if (np == 2 && no == 1) { /* A op B — feature on one side */
+  if (np == 2 && no == 1) { /* A op B */
     int d0 = range_dim(part_s[0], part_e[0]);
     if (d0)
       range_bound(c, d0, ops[0], parse_len_px(part_s[1], part_e[1]));
@@ -234,7 +223,7 @@ static void parse_range(const char *s, const char *e, struct media_cond *c)
       if (d1)
         range_bound(c, d1, op_flip(ops[0]), parse_len_px(part_s[0], part_e[0]));
     }
-  } else if (np == 3 && no == 2) { /* A op0 B op1 C — B the feature */
+  } else if (np == 3 && no == 2) { /* A op0 B op1 C */
     int d = range_dim(part_s[1], part_e[1]);
     if (d) {
       range_bound(c, d, op_flip(ops[0]), parse_len_px(part_s[0], part_e[0]));
@@ -243,11 +232,7 @@ static void parse_range(const char *s, const char *e, struct media_cond *c)
   }
 }
 
-/* Parse one parenthesised media feature starting at *pp (which points at '(');
- * always advances past the matching ')'. Handles classic `(feature: value)` and
- * modern range syntax. A feature we don't support stays MF_UNKNOWN, which
- * evaluates false — per CSS, an unrecognised feature makes its query false (so
- * a block gated only on one we can't test won't apply). */
+/* Parse one parenthesised media feature at *pp, advancing past ')'; unsupported ones are MF_UNKNOWN (false). */
 static void parse_feature(const char **pp, const char *e, struct media_cond *c)
 {
   const char *p = *pp;
@@ -264,7 +249,7 @@ static void parse_feature(const char **pp, const char *e, struct media_cond *c)
     p++;
   *pp = p;
 
-  /* Distinguish classic (a ':') from range (a comparison operator). */
+  /* classic (a ':') vs range (a comparison operator) */
   const char *q = is;
   while (q < ie && *q != ':' && *q != '<' && *q != '>' && *q != '=')
     q++;
@@ -316,8 +301,7 @@ static void parse_feature(const char **pp, const char *e, struct media_cond *c)
   cond_add_feat(c, f);
 }
 
-/* Parse one comma-free media query (`[not|only] type? (and feature)*`) into *c.
- */
+/* Parse one comma-free media query (`[not|only] type? (and feature)*`) into *c. */
 static void parse_cond(const char *s, const char *e, struct media_cond *c)
 {
   c->negate = false;
@@ -328,7 +312,7 @@ static void parse_cond(const char *s, const char *e, struct media_cond *c)
   if (kw(&p, e, "not"))
     c->negate = true;
   p = skip_sp(p, e);
-  kw(&p, e, "only"); /* `only` is a no-op for us */
+  kw(&p, e, "only");
   p = skip_sp(p, e);
   if (p < e && *p != '(') { /* an explicit media type */
     if (kw(&p, e, "screen"))
@@ -356,8 +340,7 @@ static void parse_cond(const char *s, const char *e, struct media_cond *c)
   }
 }
 
-/* Parse a full @media header [s,e) (comma-separated condition list) into *mq.
- */
+/* Parse a full @media header [s,e) (comma-separated conditions) into *mq. */
 static void parse_media_query(const char *s, const char *e, struct media_query *mq)
 {
   mq->n = 0;
@@ -431,8 +414,7 @@ bool media_matches(const struct media_query *mq)
   return false;
 }
 
-/* ------------------------------------------------ sheet build --------------
- */
+/* sheet build */
 css_sheet *css_new(void)
 {
   css_sheet *s = malloc(sizeof *s);
@@ -459,10 +441,7 @@ css_sheet *css_new(void)
   return s;
 }
 
-/* Pick the first url(...) in a src value naming a font we can decode: a raw
- * SFNT
- * (.ttf/.otf) or a WOFF/WOFF2 container (font_load decodes both via the woff.c
- * linked into the browser). Writes it to url[cap] (empty if none qualifies). */
+/* First url(...) in a src value naming a decodable font (SFNT or WOFF/WOFF2), into url[cap]. */
 static void parse_src(const char *v, char *url, int cap)
 {
   url[0] = '\0';
@@ -495,8 +474,7 @@ static void parse_src(const char *v, char *url, int cap)
   }
 }
 
-/* Parse an @font-face block [s,end): pull out font-family + a usable src url
- * and, if both are present, register the face on the sheet. */
+/* Parse an @font-face block [s,end); registers the face if family and a usable src exist. */
 static void parse_fontface(css_sheet *sh, const char *s, const char *end)
 {
   char family[CSS_FAM_MAX];
@@ -566,8 +544,7 @@ static void parse_fontface(css_sheet *sh, const char *s, const char *end)
 
 static const char *skip_ws_com(const char *p, const char *end); /* defined below */
 
-/* A @keyframes stop selector: `from` -> 0, `to` -> 1000, `N%` -> N*10 permille;
- * -1 if it isn't a valid keyframe offset. */
+/* @keyframes stop selector: `from` -> 0, `to` -> 1000, `N%` -> N*10; -1 if invalid. */
 static int keyframe_offset(const char *s, const char *e)
 {
   while (s < e && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r'))
@@ -604,9 +581,7 @@ static int keyframe_offset(const char *s, const char *e)
   return pm;
 }
 
-/* Insert one stop (offset + declaration delta) into *kf, keeping off[]/stop[]
- * ascending by offset; a duplicate offset is overwritten (last wins, like CSS).
- */
+/* Insert a stop into *kf keeping offsets ascending; a duplicate offset is overwritten. */
 static void keyframes_add_stop(struct css_keyframes *kf, int pm, const struct css_style *decl)
 {
   for (int i = 0; i < kf->nstops; i++) {
@@ -638,17 +613,14 @@ static void keyframes_add_stop(struct css_keyframes *kf, int pm, const struct cs
   kf->nstops++;
 }
 
-/* Parse a @keyframes block: `name` is [ns,ne); the brace body is [bs,be). Each
- * inner rule is a comma-separated list of offset selectors + a declaration
- * block, folded via the ordinary declaration parser. Registers the block on the
- * sheet if it yields at least one stop. */
+/* Parse a @keyframes block (name [ns,ne), body [bs,be)); registers it if it yields a stop. */
 static void parse_keyframes(css_sheet *sh, const char *ns, const char *ne, const char *bs, const char *be)
 {
   while (ns < ne && (*ns == ' ' || *ns == '\t' || *ns == '\n' || *ns == '\r'))
     ns++;
   while (ne > ns && (ne[-1] == ' ' || ne[-1] == '\t' || ne[-1] == '\n' || ne[-1] == '\r'))
     ne--;
-  /* an animation-name may be quoted ("spin"); dequote it */
+  /* dequote a quoted animation-name */
   if (ne - ns >= 2 && (*ns == '"' || *ns == '\'') && ne[-1] == ns[0]) {
     ns++;
     ne--;
@@ -720,7 +692,7 @@ static void parse_keyframes(css_sheet *sh, const char *ns, const char *ne, const
   sh->keyframes = kf;
 }
 
-/* ---- @keyframes public accessors (the animation engine, anim.c) ---- */
+/* ---- @keyframes accessors (anim.c) ---- */
 const struct css_keyframes *css_keyframes_find(css_sheet *sh, const char *name)
 {
   if (!sh || !name || !name[0])
@@ -837,11 +809,7 @@ static const char *skip_atrule(const char *p, const char *end)
   return p;
 }
 
-/* Parse the rules in [p,end) and push each under media query *mq. Recurses for
- * a nested @media block; nested queries don't intersect — the inner one
- * replaces an outer unconditional context, otherwise the outer (active) query
- * is kept, since
- * @media-inside-@media is vanishingly rare. */
+/* Parse rules in [p,end) under media query *mq; a nested @media replaces only an unconditional outer one. */
 static void add_rules(css_sheet *sh, const char *p, const char *end, const struct media_query *mq)
 {
   while (p < end) {
@@ -916,15 +884,7 @@ static void add_rules(css_sheet *sh, const char *p, const char *end, const struc
           continue;
         }
       }
-      /* @layer / @supports: flatten the inner rules into the current context.
-       * @layer's cascade-priority ordering is approximated by source order
-       * (good enough for Tailwind, which emits layers in priority order); a
-       * @supports condition is treated as satisfied (its rules are the modern
-       * branch, and any value we can't parse is ignored anyway). The bare
-       * `@layer a, b;` order-declaration form has no block and falls through to
-       * skip_atrule. Without this, Tailwind v4 — which wraps base resets, the
-       * :root variables and every utility in @layer — renders almost nothing.
-       */
+      /* @layer / @supports: flatten inner rules (layer order approximated by source; @supports assumed true). */
       if (starts_ci(p, "@layer") || starts_ci(p, "@supports")) {
         const char *b = p;
         while (b < end && *b != '{' && *b != ';')
@@ -970,8 +930,7 @@ static void add_rules(css_sheet *sh, const char *p, const char *end, const struc
     bool important = false;
     parse_decls(dec_s, dec_e, &decl, &important);
 
-    /* Split the selector list on top-level commas only (scan_top skips a comma
-     * inside an :is()/:not() list or an [attr] value). */
+    /* Split on top-level commas only (scan_top skips :is()/:not() lists and [attr] values). */
     for (const char *q = sel_s; q < sel_e;) {
       const char *comma = scan_top(q, sel_e, ",");
       struct selector sel;

@@ -1,17 +1,4 @@
-/* editor.c — a windowed plain-text editor, running entirely in user space.
- *
- * The user-space successor to the kernel-side app_edit.c: it owns a window via
- * the windowing syscalls, draws into the shared buffer with the gfx lib, reads
- * input through win_poll events, and loads/saves files with readfile/writefile.
- * A File menu (New / Open / Save / Save As) is driven by the mouse, with a
- * bottom minibuffer prompt for typing a filename on Open / Save As.
- *
- * An Edit menu (Select All / Cut / Copy / Paste / Delete) operates on a text
- * selection. The selection is an anchor + the moving caret; extend it with
- * Shift+arrows / Shift+Home/End, select everything with Ctrl+A, and Cut/Copy
- * exchange text with the system clipboard (the clipd server, via the clipboard
- * client lib — multi-item and any-type).
- */
+/* editor.c, a windowed plain-text editor, running entirely in user space */
 #include "clipboard.h"
 #include "dialog.h"
 #include "gfx.h"
@@ -44,25 +31,19 @@ static int prompt_len;
 static char io_buf[MAXLINES * (MAXCOLS + 1)];
 static char clip_buf[8192]; /* scratch for Cut/Copy (text staged for clip_put) */
 
-/* Selection: an anchor (sel_x,sel_y) plus the moving caret (curx,cury). The
- * selected span runs in document order between the two; sel_active gates it. */
+/* Selection: an anchor (sel_x,sel_y) plus the moving caret (curx,cury) */
 static int sel_active;
 static int sel_x, sel_y;
 
-/* GUI widgets (shared gfx lib): a File + Edit menu bar and the status message.
- */
+/* GUI widgets (shared gfx lib): a File + Edit menu bar and the status message */
 
-/* File menu. The hint labels and key bytes are parallel to file_items, giving
- * New/Open/Save the Ctrl+N/O/S accelerators (Save As is dropdown-only). */
+/* File menu */
 static const char *const file_items[] = {"New", "Open", "Save", "Save As"};
 static const char *const file_hints[] = {"Ctrl+N", "Ctrl+O", "Ctrl+S", ""};
 static const unsigned char file_keys[] = {KEY_NEW, KEY_OPEN, KEY_SAVE, 0};
 static struct menu filemenu = {"File", file_items, 4, 0, file_hints, file_keys};
 
-/* Edit menu. Cut/Copy/Delete are disabled (greyed, accelerator inert) when
- * nothing is selected; edit_flags is refreshed each frame in render(). Paste
- * uses Ctrl+V, which the kernel services by injecting the clipboard text as key
- * events, so it has no key byte here -- only the cosmetic hint. */
+/* Edit menu */
 static const char *const edit_items[] = {"Select All", "Cut", "Copy", "Paste", "Delete"};
 static const char *const edit_hints[] = {"Ctrl+A", "Ctrl+X", "Ctrl+C", "Ctrl+V", "Del"};
 static const unsigned char edit_keys[] = {KEY_SELALL, KEY_CUT, KEY_INTR, 0, 0};
@@ -73,7 +54,7 @@ static struct menu *const bar_menus[] = {&filemenu, &editmenu};
 static struct menubar mbar = {bar_menus, 2, 2, 0};
 static struct status_bar sbar;
 
-/* ------------------------------------------------------------- tiny helpers */
+/* tiny helpers */
 
 static void scopy(char *d, const char *s, int max)
 {
@@ -98,10 +79,9 @@ static void ed_clear(void)
   sel_active = 0;
 }
 
-/* ------------------------------------------------------------- selection */
+/* selection */
 
-/* Order the anchor and caret into top-left (*x0,*y0) .. bottom-right (*x1,*y1).
- */
+/* Order the anchor and caret into top-left (*x0,*y0)  */
 static void sel_bounds(int *x0, int *y0, int *x1, int *y1)
 {
   if (sel_y < cury || (sel_y == cury && sel_x <= curx)) {
@@ -117,8 +97,7 @@ static void sel_bounds(int *x0, int *y0, int *x1, int *y1)
   }
 }
 
-/* Begin a selection at the caret if none is active (called before a Shift+move
- * grows it); plain moves call sel_clear() so the next motion starts fresh. */
+/* Begin a selection at the caret if none is active (called before a Shift+move grows it) */
 static void sel_begin(void)
 {
   if (!sel_active) {
@@ -129,8 +108,7 @@ static void sel_begin(void)
 }
 static void sel_clear(void) { sel_active = 0; }
 
-/* Copy the selected text into out (with '\n' between lines); returns its
- * length. */
+/* Copy the selected text into out (with '\n' between lines); returns its length */
 static int sel_extract(char *out, int max)
 {
   int x0, y0, x1, y1, p = 0;
@@ -146,7 +124,7 @@ static int sel_extract(char *out, int max)
   return p;
 }
 
-/* Remove the selected span, leaving the caret where it began. */
+/* Remove the selected span, leaving the caret where it began */
 static void sel_delete(void)
 {
   int x0, y0, x1, y1;
@@ -154,7 +132,7 @@ static void sel_delete(void)
     return;
   sel_bounds(&x0, &y0, &x1, &y1);
 
-  /* Splice the kept tail of the last line onto the kept head of the first. */
+  /* Splice the kept tail of the last line onto the kept head of the first */
   int tail = linelen[y1] - x1;
   for (int j = 0; j < tail; j++)
     lines[y0][x0 + j] = lines[y1][x1 + j];
@@ -175,7 +153,7 @@ static void sel_delete(void)
   modified = true;
 }
 
-/* ------------------------------------------------------------- buffer edits */
+/* buffer edits */
 
 static void ed_insert(char c)
 {
@@ -272,7 +250,7 @@ static void clamp_curx(void)
     curx = 0;
 }
 
-/* -------------------------------------------------------------- file I/O */
+/* file I/O */
 
 static void ed_load(const char *name)
 {
@@ -326,7 +304,7 @@ static void ed_save(const char *name)
   }
 }
 
-/* --------------------------------------------------------------- menu */
+/* menu */
 
 static void start_prompt(int mode)
 {
@@ -337,8 +315,7 @@ static void start_prompt(int mode)
 
 static int g_win = -1; /* the editor's window id, for parenting modal dialogs */
 
-/* 1 if it's safe to throw away the current buffer (nothing unsaved, or the user
- * chose to discard). Guards New / Open, which replace the buffer wholesale. */
+/* 1 if it's safe to throw away the current buffer */
 static int confirm_discard(void)
 {
   if (!modified)
@@ -374,7 +351,7 @@ static void file_action(int item)
   }
 }
 
-/* --------------------------------------------------------------- clipboard */
+/* clipboard */
 
 static void select_all(void)
 {
@@ -486,10 +463,9 @@ static void confirm_prompt(void)
     ed_save(prompt_buf);
 }
 
-/* --------------------------------------------------------------- input */
+/* input */
 
-/* Caret moves, shared by the plain (selection-clearing) and Shift (selection-
- * extending) navigation keys. They only touch curx/cury. */
+/* Caret moves, shared by the plain and Shift navigation keys */
 static void move_left(void)
 {
   if (curx > 0)
@@ -523,12 +499,10 @@ static void move_down(void)
   }
 }
 
-/* Cut/Copy/Delete only apply with a selection -> grey them out otherwise, which
- * also makes their accelerators (Ctrl+X / Ctrl+C) inert when nothing's picked.
- */
+/* Cut/Copy/Delete only apply with a selection -> grey them out otherwise */
 static void sync_edit_flags(void)
 {
-  edit_flags[1] = sel_active ? 0 : MENU_DISABLED; /* Cut  */
+  edit_flags[1] = sel_active ? 0 : MENU_DISABLED; /* Cut */
   edit_flags[2] = sel_active ? 0 : MENU_DISABLED; /* Copy */
 }
 
@@ -548,9 +522,7 @@ static void key(int id, char c)
       prompt_buf[prompt_len++] = c;
     return;
   }
-  /* Menu accelerators (Ctrl+N/O/S/A/X, and Ctrl+C as Copy): fire the item
-   * directly, like a click. Sync the greyed-out state first so the Cut/Copy
-   * accelerators track the live selection, not last frame's. */
+  /* Menu accelerators (Ctrl+N/O/S/A/X, and Ctrl+C as Copy): fire the item directly, like a click */
   sync_edit_flags();
   struct menu *leaf;
   int sc = menubar_shortcut(&mbar, (unsigned char)c, &leaf);
@@ -576,7 +548,7 @@ static void key(int id, char c)
     ed_delete();
     break;
 
-  /* Plain navigation: drop any selection, then move. */
+    /* Plain navigation: drop any selection, then move */
   case KEY_LEFT:
     sel_clear();
     move_left();
@@ -602,7 +574,7 @@ static void key(int id, char c)
     curx = linelen[cury];
     break;
 
-  /* Shift+navigation: anchor a selection if needed, then move the caret. */
+    /* Shift+navigation: anchor a selection if needed, then move the caret */
   case KEY_SLEFT:
     sel_begin();
     move_left();
@@ -676,7 +648,7 @@ static void click(int mx, int my)
   }
 }
 
-/* --------------------------------------------------------------- rendering */
+/* rendering */
 
 static void apnd(char *buf, int *p, int cap, const char *s)
 {
@@ -704,16 +676,16 @@ static void render(void)
 {
   unsigned txt_bg = 0x0d1117;
 
-  /* Menu bar background (the File menu itself is drawn last, on top). */
+  /* Menu bar background (the File menu itself is drawn last, on top) */
   gfx_fill_rect(0, 0, W, MENU_H, 0x232a36);
 
-  /* Text area. */
+  /* Text area */
   int ty0 = MENU_H, th = H - MENU_H - STATUS_H;
   gfx_fill_rect(0, ty0, W, th, txt_bg);
   int visrows = th / ROW_H;
   int maxcol = (W - 4) / COL_W;
 
-  /* Selection bounds (in document order) for the highlight below. */
+  /* Selection bounds (in document order) for the highlight below */
   int sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;
   if (sel_active)
     sel_bounds(&sx0, &sy0, &sx1, &sy1);
@@ -726,7 +698,7 @@ static void render(void)
     int ry = ty0 + r * ROW_H;
     int cols = linelen[ln] < maxcol ? linelen[ln] : maxcol;
 
-    /* This line's selected column span [c0,c1); -1 = not selected. */
+    /* This line's selected column span [c0,c1); -1 = not selected */
     int c0 = -1, c1 = -1;
     if (sel_active && ln >= sy0 && ln <= sy1) {
       c0 = (ln == sy0) ? sx0 : 0;
@@ -740,20 +712,17 @@ static void render(void)
       unsigned bg = (c0 >= 0 && j >= c0 && j < c1) ? sel_bg : txt_bg;
       gfx_glyph(2 + j * COL_W, ry, (unsigned char)lines[ln][j], 0xc8d0dc, bg);
     }
-    /* A line whose newline is inside the selection (any but the last selected
-     * line) shows one trailing highlighted cell so the wrap reads as picked. */
     if (c0 >= 0 && ln < sy1)
       gfx_fill_rect(2 + cols * COL_W, ry, COL_W, ROW_H, sel_bg);
   }
 
-  /* Caret. */
+  /* Caret */
   if (cury >= top_line && cury < top_line + visrows) {
     int cc = curx < maxcol ? curx : maxcol;
     gfx_fill_rect(2 + cc * COL_W, ty0 + (cury - top_line) * ROW_H, 2, ROW_H, 0x66ddff);
   }
 
-  /* Status / prompt bar, rendered with the gfx status_bar widget (it owns the
-   * bar background + the left-aligned message). */
+  /* Status / prompt bar, rendered with the gfx status_bar widget */
   int sy = H - STATUS_H;
   struct status_bar bar;
   char line[64];
@@ -774,8 +743,7 @@ static void render(void)
     status_set(&bar, line);
     status_draw(&bar, 0, sy, W, 0x9fb0c4, 0x161d28);
 
-    /* Cursor position + encoding, right-aligned over the bar the widget
-     * just drew (status_draw is left-only). */
+    /* Cursor position + encoding, right-aligned over the bar the widget just drew */
     char rstat[40];
     int rp = 0;
     rstat[0] = 0;
@@ -791,8 +759,7 @@ static void render(void)
     gfx_ui_text(rx, sy + (GUI_BAR_H - UIFONT_H) / 2, rstat, 0x9fb0c4);
   }
 
-  /* The menu bar, drawn last so an open dropdown overlays the text. Refresh
-   * the Edit menu's greyed-out state to match the current selection first. */
+  /* The menu bar, drawn last so an open dropdown overlays the text */
   sync_edit_flags();
   menubar_draw(&mbar);
 }
@@ -810,8 +777,7 @@ int main(int argc, char **argv)
   gfx_init(win_fb(), W, H);
   win_cursor(id, WIN_CURSOR_TEXT); /* I-beam over the text area */
 
-  /* Launched with a path (e.g. double-clicked in the file explorer): open
-   * it straight away instead of starting on a blank buffer. */
+  /* Launched with a path: open it straight away instead of starting on a blank buffer */
   if (argc > 1 && argv[1] && argv[1][0])
     ed_load(argv[1]);
 

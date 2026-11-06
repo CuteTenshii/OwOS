@@ -1,11 +1,9 @@
-/* Host unit test for the browser's CSS list-* support (css.c).
- *
- * Exercises list-style-type / list-style-position parsing (longhands + the
- * `list-style` shorthand) through css_apply_inline, and the cascade merge of the
- * new list_pos field through css_apply_sheet against a real <li> DOM node.
+/* Host unit test for CSS list-style-type/-position parsing and cascade merge (css.c).
  *
  *   cc -std=c11 -Iscripts -Iuser/apps/browser \
- *      tests/css_list_test.c user/apps/browser/css/engine.c user/apps/browser/css/engine_values.c user/apps/browser/css/engine_props.c user/apps/browser/css/engine_decl.c user/apps/browser/css/engine_sel.c user/apps/browser/css/engine_sheet.c user/apps/browser/css/sibling.c \
+ *      tests/css_list_test.c user/apps/browser/css/engine.c user/apps/browser/css/engine_values.c
+ * user/apps/browser/css/engine_props.c user/apps/browser/css/engine_decl.c user/apps/browser/css/engine_sel.c
+ * user/apps/browser/css/engine_sheet.c user/apps/browser/css/sibling.c \
  *      user/apps/browser/color.c user/apps/browser/dom.c \
  *      -lm -o /tmp/css_list_test && /tmp/css_list_test
  */
@@ -51,8 +49,7 @@ int main(void)
   /* A bare url() names no type keyword: type stays default (ul/ol fallback). */
   chk_inline("list-style: url(bullet.png)", CSS_LST_DEFAULT, CSS_LSP_DEFAULT);
 
-  /* Cascade: two matching rules contribute type and position separately; both
-   * must survive the merge (regression guard for the new list_pos field). */
+  /* Cascade: two matching rules set type and position separately; both must survive the merge. */
   css_sheet *sheet = css_new();
   const char *src = "li { list-style-type: upper-roman }"
                     "li { list-style-position: inside }";

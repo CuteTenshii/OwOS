@@ -1,28 +1,16 @@
-/* js_webapi.c — Performance (High Resolution Time + User Timing) and the WHATWG
- * Encoding API (TextEncoder / TextDecoder) for the browser. Pure computation
- * over the engine's UTF-8 string bytes; installed onto `window` by
- * js_webapi_setup. Split out of js.c; shares the page engine context + helpers
- * via jsint.h. */
+/* Performance (High Resolution Time, User Timing) and Encoding API (TextEncoder/TextDecoder). */
 #include <stdbool.h>
 
 #include "jsint.h"
 
-/* ---- performance / TextEncoder / TextDecoder (Web platform APIs) --------- *
- *
- * performance.now() is a monotonic ms clock relative to the page's timeOrigin;
- * mark()/measure() record real User Timing entries queryable via getEntries*.
- * The Encoding API pairs a UTF-8 TextEncoder with a TextDecoder that also reads
- * UTF-16 (LE/BE) and the windows-1252 (latin1) single-byte set. The engine's
- * strings are UTF-8 byte arrays (charCodeAt indexes bytes), so encode()/utf-8
- * decode() are byte copies while the other decoders transcode to UTF-8. */
+/* Strings are UTF-8 bytes: utf-8 encode/decode are copies, other decoders transcode. */
 
 static unsigned g_perf_origin;    /* msec() captured at page setup: now() base */
 static double g_perf_time_origin; /* wall-clock ms at setup: performance.timeOrigin */
 static js_object *g_textencoder_proto;
 static js_object *g_textdecoder_proto;
 
-/* windows-1252 mapping for the 0x80..0x9F range (identity elsewhere). WHATWG
- * folds latin1/iso-8859-1/ascii/us-ascii onto this decoder. */
+/* windows-1252 mapping for 0x80..0x9F (identity elsewhere). */
 static const unsigned short k_cp1252_hi[32] = {
     0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
     0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
@@ -30,8 +18,7 @@ static const unsigned short k_cp1252_hi[32] = {
 };
 enum { DEC_UTF8, DEC_UTF16LE, DEC_UTF16BE, DEC_LATIN1 };
 
-/* Fresh Uint8Array holding data[0..len). Bytes go straight into the backing
- * ArrayBuffer so multibyte content survives verbatim. */
+/* Fresh Uint8Array holding data[0..len). */
 static js_value make_uint8array(js_ctx *ctx, const unsigned char *data, int len)
 {
   js_value u8ctor, lenarg, view;
@@ -54,9 +41,7 @@ static js_value make_uint8array(js_ctx *ctx, const unsigned char *data, int len)
   return view;
 }
 
-/* Raw bytes behind an ArrayBuffer, TypedArray, or DataView argument (NULL/0 for
- * anything else). The pointer is valid while the source object stays reachable.
- */
+/* Raw bytes of an ArrayBuffer/TypedArray/DataView (NULL/0 otherwise). */
 const unsigned char *view_bytes(js_value v, int *len)
 {
   *len = 0;
@@ -157,8 +142,7 @@ static int decoder_kind(const char *label)
     return DEC_UTF16BE;
   j = i;
   (void)j;
-  return DEC_LATIN1; /* latin1 / iso-8859-1 / ascii / windows-1252 / everything
-                        else */
+  return DEC_LATIN1; /* everything else */
 }
 static const char *decoder_name(int kind)
 {
@@ -218,8 +202,7 @@ static js_value textdec_decode(js_ctx *ctx, js_value t, js_value *args, int argc
       int k = utf8_decode((const char *)in + i, (const char *)in + len, &cp);
       if (k <= 0)
         k = 1;
-      /* utf8_decode returns k==1 with U+FFFD only for a malformed lead byte
-       * (a real U+FFFD is a 3-byte sequence); that's the fatal trigger. */
+      /* k==1 with U+FFFD means a malformed lead byte (a real U+FFFD is 3 bytes). */
       if (k == 1 && in[i] >= 0x80 && fatal) {
         if (sb.b)
           free(sb.b);
@@ -299,8 +282,7 @@ static js_value perf_noop(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)n;
   return js_undef();
 }
-/* A number stays itself; a string names a mark whose startTime is returned (0
- * if unknown). Used to resolve measure()'s start/end arguments. */
+/* Number stays itself; a string names a mark (its startTime, 0 if unknown). */
 static double perf_resolve(js_ctx *ctx, js_value entries, js_value v)
 {
   if (v.type == JV_NUM)
@@ -377,8 +359,7 @@ static js_value perf_measure(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
   return perf_add_entry(ctx, entries, name, "measure", st, en - st);
 }
-/* Shared filter for getEntries / getEntriesByType / getEntriesByName.
- * `type`/`name` NULL means "don't filter on it". */
+/* Shared getEntries* filter; NULL type/name means no filter. */
 static js_value perf_filter(js_ctx *ctx, js_value t, const char *type, const char *name)
 {
   js_value entries = js_get(ctx, t, "@entries");
@@ -422,8 +403,7 @@ static js_value perf_getbyname(js_ctx *ctx, js_value t, js_value *args, int argc
   }
   return perf_filter(ctx, t, 0, name);
 }
-/* Rebuild @entries dropping the entries of `type` (optionally only those named
- * `name`). Backs clearMarks/clearMeasures. */
+/* Drop entries of `type` (optionally named `name`) from @entries. */
 static void perf_clear(js_ctx *ctx, js_value t, const char *type, const char *name)
 {
   js_value entries = js_get(ctx, t, "@entries");
@@ -488,9 +468,7 @@ void js_webapi_setup(js_ctx *ctx, js_object *win)
   g_textdecoder_proto = js_new_object(ctx, ctx->object_proto);
   gc_add_root((void **)&g_textencoder_proto);
   gc_add_root((void **)&g_textdecoder_proto);
-  /* performance: High Resolution Time (now/timeOrigin) + User Timing
-   * (mark/measure + the getEntries/clear query surface) + the legacy
-   * PerformanceTiming/Navigation objects some sites still read. */
+  /* performance: now/timeOrigin, User Timing, legacy timing/navigation objects. */
   {
     js_object *perf = js_new_object(ctx, ctx->object_proto);
     js_object *entries;
@@ -584,9 +562,7 @@ void js_webapi_setup(js_ctx *ctx, js_object *win)
   }
 }
 
-/* Unroot the Encoding-API prototypes at navigation teardown. js_webapi_setup
- * re-roots them on the next page; without this the roots array grows by two
- * slots every navigation (gc_add_root does not dedup). */
+/* Unroot Encoding-API prototypes at teardown (gc_add_root does not dedup). */
 void js_webapi_teardown(void)
 {
   gc_remove_root((void **)&g_textencoder_proto);

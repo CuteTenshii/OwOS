@@ -1,4 +1,4 @@
-/* about.c — the "about" window. */
+/* about.c: the "about" window. */
 #include "gfx.h"
 #include "owos.h"
 

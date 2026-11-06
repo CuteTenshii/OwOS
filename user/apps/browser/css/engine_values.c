@@ -1,17 +1,10 @@
 #include "engine_int.h"
 
-/* ------------------------------------------------ value parsing ------------
- */
+/* value parsing */
 /* Colour parsing lives in color.c now (shared with svg.c). */
 int parse_color(const char *v) { return color_parse(v); }
 
-/* calc()/min()/max()/clamp() evaluation. CSS forbids multiplying two lengths,
- * so any sub-expression stays a linear length a*px + b*% (plus a
- * dimensionless-number case for the scalar side of * and /). Percentages can't
- * be resolved to px at parse time (no containing block is known), so a result
- * keeps px and % separate and the caller maps it onto its box; for
- * min/max/clamp comparisons a % is measured against the viewport width as a
- * heuristic. */
+/* calc()/min()/max()/clamp(): values are linear a*px + b*%, % kept separate (viewport-relative in min/max/clamp). */
 struct calcval {
   double px, pct, num;
   bool dimless;
@@ -28,8 +21,7 @@ static void calc_skip(struct calcctx *c)
     c->p++;
 }
 
-/* Parse a signed decimal at *pp into *out; 1 if at least one digit was
- * consumed. */
+/* Parse a signed decimal at *pp into *out; 1 if a digit was consumed. */
 bool calc_number(const char **pp, double *out)
 {
   const char *p = *pp;
@@ -61,8 +53,7 @@ bool calc_number(const char **pp, double *out)
   return true;
 }
 
-/* A number + unit -> a calcval. Unknown units degrade to a dimensionless
- * number. */
+/* A number + unit -> calcval; unknown units become a dimensionless number. */
 static void unit_value(double n, const char *u, struct calcval *o)
 {
   o->px = o->pct = o->num = 0;
@@ -106,9 +97,7 @@ static void unit_value(double n, const char *u, struct calcval *o)
   }
 }
 
-/* A length magnitude for comparing min()/max()/clamp() arguments: a % is
- * measured against the viewport width (a heuristic — the real containing block
- * is unknown). */
+/* Length magnitude for min()/max()/clamp() comparisons; % is measured against viewport width. */
 static double calc_mag(const struct calcval *v)
 {
   if (v->dimless)
@@ -119,8 +108,7 @@ static double calc_mag(const struct calcval *v)
 
 static struct calcval calc_expr(struct calcctx *c); /* additive, the entry point */
 
-/* Read comma-separated expression arguments up to (and past) the closing ')'.
- */
+/* Read comma-separated arguments up to and past the closing ')'. */
 static int calc_args(struct calcctx *c, struct calcval *out, int maxn)
 {
   int n = 0;
@@ -277,10 +265,7 @@ static struct calcval calc_expr(struct calcctx *c)
   return a;
 }
 
-/* Map a calcval onto parse_len2's representation: px>=0 via return, else a
- * percent via *pct. A mixed px+% result (e.g. calc(100% - 1rem)) keeps only the
- * percent — we can't store an offset — which is the dominant term in practice.
- */
+/* Map a calcval to parse_len2's form: px>=0 via return, else percent via *pct (mixed keeps only %). */
 static int calc_result(const struct calcval *r, bool ok, int *pct)
 {
   if (!ok)
@@ -299,10 +284,7 @@ static int calc_result(const struct calcval *r, bool ok, int *pct)
   return n >= 0 ? n : -1;
 }
 
-/* Parse a CSS length. Returns px>=0 (resolving px/rem/em/vw/vh/physical units
- * and calc()/min()/max()/clamp()); for "N%" or a percent-valued result, returns
- * -1 and sets *pct = N. For auto and anything unresolvable, returns -1 with
- * *pct = -1. */
+/* Parse a CSS length: px>=0 (units and calc() resolved), or -1 with *pct = N for %, else *pct = -1. */
 int parse_len2(const char *v, int *pct)
 {
   *pct = -1;
@@ -313,16 +295,14 @@ int parse_len2(const char *v, int *pct)
   return calc_result(&r, c.ok, pct);
 }
 
-/* Parse a CSS length: integer px (or unitless), else -1 (%, em, auto, calc...).
- */
+/* Parse a CSS length: integer px (or unitless), else -1 (%, em, auto, calc...). */
 int parse_len(const char *v)
 {
   int pct;
   return parse_len2(v, &pct);
 }
 
-/* One length for a single box side: px>=0, -2 for "auto" (margins only), else
- * -1. */
+/* One box-side length: px>=0, -2 for auto (margins only), else -1. */
 short one_len(const char *v, int allow_auto)
 {
   while (*v == ' ' || *v == '\t')
@@ -371,9 +351,7 @@ void parse_box4(const char *v, short out[4], int allow_auto)
   out[3] = l;
 }
 
-/* A `border` / `border-<side>` shorthand: pull a width (length or thin/medium/
- * thick; none/hidden = 0) and a colour out of the value; *w / *col stay -1 if
- * absent. Border style keywords (solid/dashed/...) are ignored. */
+/* `border` shorthand: width (length, thin/medium/thick, none/hidden = 0) and colour; -1 if absent. */
 void parse_border_val(const char *v, int *w, int *col)
 {
   *w = -1;
@@ -412,9 +390,7 @@ void parse_border_val(const char *v, int *w, int *col)
   }
 }
 
-/* SVG paint value: -2 none/transparent, -3 currentColor, 0xRRGGBB, or -1 if not
- * a recognised colour (e.g. url(#gradient) — left unset so it doesn't
- * override). */
+/* SVG paint: -2 none, -3 currentColor, 0xRRGGBB, or -1 if unrecognised (e.g. url(#gradient)). */
 int parse_paint_val(const char *v)
 {
   while (*v == ' ' || *v == '\t')
@@ -503,8 +479,7 @@ void parse_border_styles(const char *v, signed char out[4])
   }
 }
 
-/* substring (ci) — for text-decoration:"underline" inside a multi-value list.
- */
+/* case-insensitive substring, for text-decoration in a multi-value list */
 bool has_ci(const char *hay, const char *needle)
 {
   for (; *hay; hay++)
@@ -513,10 +488,7 @@ bool has_ci(const char *hay, const char *needle)
   return false;
 }
 
-/* Decode a `content` value into out[cap]: a quoted string (with \HHHH unicode
- * and
- * \" / \\ escapes) -> UTF-8; none/normal/empty or a non-string
- * (attr()/counter()/ unresolved var) -> "" (rendered as nothing). */
+/* Decode a `content` value into out[cap]: quoted string (\HHHH and \" \\ escapes) -> UTF-8, else "". */
 void parse_content(const char *v, char *out, int cap)
 {
   out[0] = '\0';
@@ -579,12 +551,11 @@ int parse_disp(const char *v)
   if (starts_ci(v, "none"))
     return CSS_DISP_NONE;
   if (starts_ci(v, "inline"))
-    return CSS_DISP_INLINE; /* incl inline-block */
-  return CSS_DISP_BLOCK;    /* block/flex/grid/table */
+    return CSS_DISP_INLINE;
+  return CSS_DISP_BLOCK; /* block/flex/grid/table */
 }
 
-/* ------------------------------------------------ backgrounds --------------
- */
+/* backgrounds */
 void css_bgi_reset(struct css_bg_image *b)
 {
   b->kind = -1;
@@ -658,8 +629,7 @@ void parse_bg_size(const char *v, signed char *kind, short *sw, short *sh)
   *sh = (nv >= 2) ? vals[1] : -1;
 }
 
-/* background-position: 1-2 keyword/percentage tokens -> percent on each axis. A
- * pixel/length token degrades to 0% (we lack the box size at parse time). */
+/* background-position: 1-2 keyword/percent tokens -> percent per axis; lengths degrade to 0%. */
 void parse_bg_position(const char *v, short *px, short *py)
 {
   *px = *py = -1;
@@ -721,8 +691,7 @@ void parse_bg_position(const char *v, short *px, short *py)
     *px = 50;
 }
 
-/* One position token -> percent along its axis (0 horizontal, 1 vertical), or
- * -1. */
+/* One position token -> percent along its axis (0 horizontal, 1 vertical), or -1. */
 int bg_pos_single(const char *t, int axis)
 {
   while (*t == ' ' || *t == '\t')
@@ -813,9 +782,7 @@ static bool parse_lin_dir(const char *a, short *angle)
   return true;
 }
 
-/* A radial-gradient leading token (shape/size/position), e.g. "circle at
- * center". We only honour the shape; size/position degrade to a centred fill.
- */
+/* A radial-gradient leading token; only the shape is honoured, the fill is centred. */
 static bool parse_rad_dir(const char *a, struct css_bg_image *b)
 {
   if (has_ci(a, "circle")) {
@@ -838,9 +805,7 @@ static void add_gradient_stop(const char *arg, struct css_bg_image *b)
     return;
   while (*arg == ' ' || *arg == '\t')
     arg++;
-  /* A trailing space-separated number/percentage (at paren depth 0) is the
-   * stop's position; everything before it is the colour (which may itself hold
-   * spaces). */
+  /* A trailing number/percentage at paren depth 0 is the stop position; the rest is the colour. */
   const char *lastsp = 0;
   int depth = 0;
   for (const char *q = arg; *q; q++) {
@@ -953,8 +918,7 @@ static bool parse_gradient(const char *v, struct css_bg_image *b)
   return b->nstops > 0;
 }
 
-/* background-image: none / url(...) / a gradient. Takes the FIRST comma layer.
- */
+/* background-image: none / url(...) / a gradient; takes the first comma layer. */
 void parse_bg_image(const char *v, struct css_bg_image *b)
 {
   while (*v == ' ' || *v == '\t')
@@ -1000,9 +964,7 @@ static const char *skip_bg_func(const char *p)
   return p;
 }
 
-/* Find the first colour token in a background value, skipping url()/gradient()
- * functions and non-colour keywords. Returns 0xRRGGBB (+ alpha via *alpha) or
- * -1. */
+/* First colour token in a background value (skipping url()/gradient()); 0xRRGGBB, alpha via *alpha, or -1. */
 int bg_value_color(const char *v, int *alpha)
 {
   const char *p = v;
@@ -1038,8 +1000,7 @@ int bg_value_color(const char *v, int *alpha)
   return -1;
 }
 
-/* Collect the position-relevant tokens (keywords + percentages, before any '/')
- * out of a background shorthand and resolve them into b->pos_x/pos_y. */
+/* Collect position tokens (before any '/') from a background shorthand into b->pos_x/pos_y. */
 static void bg_shorthand_position(const char *rest, struct css_bg_image *b)
 {
   char pos[48];

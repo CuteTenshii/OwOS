@@ -1,19 +1,4 @@
-/* layout.h — the CSS box tree the browser lays out and paints.
- *
- * The inline content of a block stays the existing glyph stream (browser.h
- * B->pg->text): a box owns a [t0,t1) slice of it, word-wrapped + painted by the
- * flow renderer (main.c) within the box's content rectangle. Only block/flex
- * OUTER geometry lives here —
- * margin/border/padding/background/size/flex/position.
- *
- * The tree is built by hooks the HTML walk calls (layout_box_open/close), so no
- * second CSS cascade is needed: the walk already computed each element's style.
- * Nodes live in one growable arena; links are ARRAY INDICES, not pointers, so a
- * realloc that moves the arena can't dangle them. Descendants are contiguous
- * (the walk is pre-order), so a box records `parent` and `end` (one past its
- * last descendant) and children are recovered by scanning [self+1, end). Worker
- * builds it under browser_buf_lock; the render thread reads it under browser_buf_lock; dropped
- * on page teardown — same discipline as the glyph stream and span table. */
+/* layout.h , the CSS box tree the browser lays out and paints. The inline content of a block */
 #ifndef OWOS_LAYOUT_H
 #define OWOS_LAYOUT_H
 
@@ -34,10 +19,7 @@ struct lbox {
   signed char justify;     /* enum css_justify (main axis), or -1   */
   signed char align_items; /* enum css_align (cross axis), or -1    */
   short gap_row, gap_col;  /* flex/grid gaps, px (0 if unset)  */
-  /* CSS grid (kind==LB_GRID container / any item). n_cols/n_rows are the
-   * explicit template counts (<=0 = none); grid_flow 0 row / 1 column;
-   * col_span/row_span
-   * >=1 (item's cell span); justify_items enum css_align (-1 unset). */
+  /* CSS grid (kind==LB_GRID container / any item) */
   signed char grid_flow;
   signed char n_cols, n_rows;
   signed char col_span, row_span;
@@ -49,12 +31,11 @@ struct lbox {
   struct ledge margin, border, padding;
   signed char border_style[4];
   unsigned border_side_color[4];
-  unsigned char ml_auto, mr_auto;         /* left/right margin was `auto` (centring) */
-  unsigned border_color;                  /* 0xRRGGBB, or BG_NONE = none */
-  unsigned bg;                            /* 0xRRGGBB, or BG_NONE = none */
-  struct css_bg_image bgi;                /* background image/gradient layer (kind<=0 = none) */
-  unsigned char border_box;               /* box-sizing: border-box (width/height span the
-                                           * border box, not the content box) */
+  unsigned char ml_auto, mr_auto; /* left/right margin was `auto` (centring) */
+  unsigned border_color;          /* 0xRRGGBB, or BG_NONE = none */
+  unsigned bg;                    /* 0xRRGGBB, or BG_NONE = none */
+  struct css_bg_image bgi;        /* background image/gradient layer (kind<=0 = none) */
+  unsigned char border_box;
   int radius;                             /* border-radius px (0 = square corners) */
   short sh_dx, sh_dy, sh_blur, sh_spread; /* box-shadow geometry, px */
   unsigned sh_color;                      /* box-shadow 0xAARRGGBB, BG_NONE = no shadow */
@@ -79,17 +60,14 @@ struct lbox {
 
   int parent, end; /* parent index (-1 = top), index past last descendant */
 
-  /* Resolved geometry (filled by the layout pass in later stages), document px.
-   */
+  /* Resolved geometry (filled by the layout pass in later stages), document px */
   int x, y, w, h;     /* margin box */
   int cx, cy, cw, ch; /* content box (inside border + padding) */
 };
 
 void layout_reset(void); /* start a fresh tree for a new walk */
 void layout_free(void);  /* drop the tree (page teardown) */
-/* HTML-walk hooks: open a block/flex box for `el` (style copied from `cs`), and
- * close the current one. `t0`/`t1` are the current glyph-stream offset (W_n).
- */
+/* HTML-walk hooks */
 void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0);
 void layout_box_close(int t1);
 
@@ -101,8 +79,7 @@ static inline unsigned layout_mix(unsigned h, unsigned v)
   return h * 16777619u;
 }
 
-/* Fold every field of `b` that decides line wrapping or box geometry into hash `h`
- * (colours, borders' paint, shadows and the like are deliberately left out). */
+/* Fold every field of `b` that decides line wrapping or box geometry into hash `h` */
 static inline unsigned layout_box_sig(const struct lbox *b, unsigned h)
 {
   h = layout_mix(h, (unsigned)b->kind | ((unsigned)b->flex_dir << 8) | ((unsigned)b->flex_wrap << 16) |

@@ -1,21 +1,10 @@
-/* webp.c — a small WebP command-line tool.
- *
- *   webp info   <file.webp>          print dimensions + format
- *   webp encode <in.png> <out.webp>  convert a PNG to lossless WebP
- *   webp verify <in.png>             encode -> decode and confirm it is
- * lossless
- *
- * The codec itself lives in user/lib/webp; this is just the front end. PNG
- * input is decoded with the streaming PNG library (upng), the same one imgview
- * uses.
- */
+/* webp.c, a small WebP command-line tool */
 #include "webp.h"
 #include "owos.h"
 #include "upng.h"
 #include <stdbool.h>
 
-/* ---- a buffered file reader over readfile_at (for the streaming PNG decoder)
- */
+/* a buffered file reader over readfile_at (for the streaming PNG decoder) */
 #define FR_BUF 65536
 static unsigned char fr_buffer[FR_BUF];
 struct freader {
@@ -51,8 +40,7 @@ static int fr_get(void *c)
   return fr_buffer[f->pos++];
 }
 
-/* ---- read a whole file into a malloc'd buffer -----------------------------
- */
+/* read a whole file into a malloc'd buffer */
 static unsigned char *read_whole(const char *path, int *out_len)
 {
   struct statinfo st;
@@ -76,8 +64,7 @@ static unsigned char *read_whole(const char *path, int *out_len)
   return buf;
 }
 
-/* ---- decode a PNG file into a fresh RGBA buffer ----------------------------
- */
+/* decode a PNG file into a fresh RGBA buffer */
 struct pngdst {
   unsigned char *buf;
   unsigned w, h;
@@ -206,11 +193,11 @@ static int cmd_verify(const char *in)
 
 int main(int argc, char **argv)
 {
-  if (argc >= 3 && argv[1][0] == 'i') /* info   <file>          */
+  if (argc >= 3 && argv[1][0] == 'i') /* info <file> */
     return cmd_info(argv[2]);
-  if (argc >= 4 && argv[1][0] == 'e') /* encode <in.png> <out>  */
+  if (argc >= 4 && argv[1][0] == 'e') /* encode <in.png> <out> */
     return cmd_encode(argv[2], argv[3]);
-  if (argc >= 3 && argv[1][0] == 'v') /* verify <in.png>        */
+  if (argc >= 3 && argv[1][0] == 'v') /* verify <in.png> */
     return cmd_verify(argv[2]);
 
   puts("usage:\n");

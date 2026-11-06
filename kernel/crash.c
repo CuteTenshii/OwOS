@@ -1,10 +1,6 @@
-/* crash.c — crash reporter (see crash.h).
- *
- * A user process fault never panics: the IDT handler calls crash_record() in
- * the faulting task's context (capturing registers + a backtrace and dumping to
- * COM1), and the process is killed. The user-space compositor drains the
- * pending reports via SYS_CRASH_POLL (crash_poll) and renders its own "<app>
- * has crashed" window. */
+/* crash.c: crash reporter (see crash.h).
+ * A user fault never panics: crash_record() captures registers and a backtrace, dumps to COM1 and the
+ * process is killed. The compositor drains reports via crash_poll (SYS_CRASH_POLL). */
 #include "crash.h"
 #include "creg.h"
 #include "idt.h"
@@ -50,9 +46,7 @@ static const char *vec_name(uint32_t v)
                    : "exception";
 }
 
-/* Plain-English page-fault cause from the error code + faulting address, so the
- * window says what happened instead of leaving the reader to decode err bits.
- */
+/* Plain-English page-fault cause from the error code and faulting address. */
 static const char *pf_cause(uint32_t vec, uint32_t err, uint32_t cr2, char *buf)
 {
   int i = 0;
@@ -65,7 +59,7 @@ static const char *pf_cause(uint32_t vec, uint32_t err, uint32_t cr2, char *buf)
   parts[2] = (err & 1) ? "a protected page" : "unmapped memory";
   parts[3] = cr2 < 0x1000 ? " (NULL dereference)"
              : (cr2 >= USER_BASE && cr2 < USER_REGION_END)
-                 ? " (bad heap/stack pointer — likely corruption or use-after-free)"
+                 ? " (bad heap/stack pointer - likely corruption or use-after-free)"
                  : "";
   for (int p = 0; p < 4; p++)
     for (const char *s = parts[p]; *s && i < 126; s++)
@@ -74,8 +68,7 @@ static const char *pf_cause(uint32_t vec, uint32_t err, uint32_t cr2, char *buf)
   return buf;
 }
 
-/* Combined per-app function-symbol table (built by user/apps/build.mk): text,
- * sections ">app\n" then "<hexaddr> name\n" lines sorted by address. */
+/* Per-app function symbol table (user/apps/build.mk): ">app" sections of "<hexaddr> name" lines sorted by address. */
 extern const char _binary_appsyms_start[], _binary_appsyms_end[];
 
 /* Resolve `addr` to "func+0xNN" within `app`'s symbol section (largest symbol
@@ -100,7 +93,7 @@ static bool crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
         i++;
       int match = (i == L && !app[i]);
       if (in && !match)
-        break; /* left our section */
+        break;
       in = match;
     } else if (in) { /* "<hexaddr> name" */
       uint32_t a = 0;
@@ -126,7 +119,7 @@ static bool crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
       }
     }
     while (p < end && *p != '\n')
-      p++; /* to end of line */
+      p++;
     if (p < end)
       p++;
   }
@@ -154,15 +147,13 @@ static bool crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
   return true;
 }
 
-/* Emit the full report to COM1 as text — capturable in logs and addr2line-able,
- * unlike squinting at the on-screen window. serial_* is heapless/lockless, so
- * it's safe from the faulting task's context. */
+/* Emit the full report to COM1 as text (serial_* is heapless and lockless, safe from the faulting task). */
 static void crash_dump_serial(const struct crash_info *c)
 {
   char hx[12], cb[128];
   serial_write("\n=== CRASH: ");
   serial_write(c->name[0] ? c->name : "?");
-  serial_write(" — ");
+  serial_write(" - ");
   serial_write(vec_name(c->vector));
   serial_write(" ===\n");
   if (c->vector == 14) {
@@ -223,7 +214,7 @@ void crash_record(const char *name, struct registers *r)
       break;
     }
   if (slot < 0)
-    return; /* report buffer full: drop it          */
+    return;
   struct crash_info *c = &reports[slot];
 
   int i = 0;
@@ -246,8 +237,7 @@ void crash_record(const char *name, struct registers *r)
   c->ebp = r->ebp;
   c->esp = r->esp;
 
-  /* Backtrace: the faulting EIP, then the saved return address up each frame.
-   * Probe every read so a corrupt frame pointer can't fault us. */
+  /* Backtrace via saved return addresses; every read is probed so a corrupt frame pointer can't fault. */
   c->ntrace = 0;
   c->trace[c->ntrace++] = r->eip;
   uint32_t bp = r->ebp;
@@ -261,11 +251,10 @@ void crash_record(const char *name, struct registers *r)
     bp = nbp;
   }
   c->state = 1;
-  crash_dump_serial(c); /* text report to COM1 for capture       */
+  crash_dump_serial(c);
 }
 
-/* SYS_CRASH_POLL: hand pending reports to the user-space compositor, which
- * renders its own crash windows. Consumes each report (state 1 -> free). */
+/* SYS_CRASH_POLL: hand pending reports to the compositor, consuming each (state 1 to free). */
 int crash_poll(struct crash_rec *out, int max)
 {
   int n = 0;
@@ -291,7 +280,7 @@ int crash_poll(struct crash_rec *out, int max)
     o->ntrace = c->ntrace;
     for (int k = 0; k < CRASH_TRACE_MAX; k++)
       o->trace[k] = c->trace[k];
-    reports[i].state = 0; /* consumed */
+    reports[i].state = 0;
   }
   return n;
 }

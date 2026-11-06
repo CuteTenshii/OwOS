@@ -1,18 +1,4 @@
-/* iso9660.c — read-only ISO 9660 / Joliet driver (see iso9660.h).
- *
- * Little-endian fields throughout (ISO stores numbers "both-endian": an LE copy
- * then a BE copy of the same value — we read the LE copy). 2048-byte logical
- * sectors. The Volume Descriptor chain starts at sector 16; the Primary VD
- * (type 1) gives the root directory record, and an optional Joliet
- * Supplementary VD (type 2) gives a nicer UCS-2 name tree we prefer when there.
- *
- * Multi-instance: every per-mount mutable global (the 2048-byte read fn, the
- * root extent, the Joliet flag, cached label/type, and the directory/file
- * scratch sectors) lives in a heap-allocated `struct iso_mount`. The driver is
- * exposed only through the `struct fs_ops` vtable; each op takes the instance.
- * Within one instance the scratch sectors aren't reentrant — consistent with
- * fat.c/hfs.c/ext.c, and the FS layer is single-threaded (the shell).
- */
+/* iso9660.c: read-only ISO 9660 / Joliet driver (see iso9660.h). Little-endian copy of both-endian fields. */
 
 #include <stddef.h>
 
@@ -22,62 +8,56 @@
 #include "iso9660.h"
 #include "kstring.h"
 
-/* ---------------------------------------------------------------- constants */
 #define ISO_SECTOR 2048u
-#define VD_START 16u /* first Volume Descriptor sector         */
-#define VD_LIMIT 64u /* stop scanning the chain past here       */
+#define VD_START 16u
+#define VD_LIMIT 64u
 #define VDT_PRIMARY 1
 #define VDT_SUPPLEM 2
 #define VDT_TERM 255
 
-#define FLAG_DIR 0x02 /* directory record file-flags bit         */
+#define FLAG_DIR 0x02
 
 struct dirrec {
   uint32_t lba, size;
   int is_dir;
 };
 
-/* ---------------------------------------------------------------- per-mount */
 struct iso_mount {
-  blk_read_fn rd; /* reads one 2048-byte logical sector      */
+  blk_read_fn rd;
   uint32_t root_lba, root_size;
-  bool joliet; /* names are UCS-2 in the active VD         */
+  bool joliet;
   char vol_label[33];
   char vol_type[20];
 
-  uint8_t dbuf[ISO_SECTOR]; /* directory walking                       */
-  uint8_t rbuf[ISO_SECTOR]; /* file reads / descriptor scan            */
+  uint8_t dbuf[ISO_SECTOR];
+  uint8_t rbuf[ISO_SECTOR];
 };
 
-/* ------------------------------------------------------------ name helpers */
-/* Decode an ISO/Joliet file identifier into a clean name: drop the ";version"
- * suffix and a bare trailing '.', and (Joliet) fold UCS-2BE down to its low
- * byte. `dst` must hold at least 256 bytes. */
+/* Decode an identifier: drop ";version" and a bare trailing '.', fold Joliet UCS-2BE to bytes. dst >= 256. */
 static void decode_name(struct iso_mount *m, char *dst, const uint8_t *id, int len)
 {
   int n = 0;
   if (m->joliet) {
     for (int i = 0; i + 1 < len && n < 254; i += 2)
-      dst[n++] = (char)id[i + 1]; /* low byte of the UCS-2 unit    */
+      dst[n++] = (char)id[i + 1];
   } else {
     for (int i = 0; i < len && n < 254; i++)
       dst[n++] = (char)id[i];
   }
   dst[n] = '\0';
-  for (int i = 0; i < n; i++) /* strip ";1" version            */
+  for (int i = 0; i < n; i++)
     if (dst[i] == ';') {
       dst[i] = '\0';
       n = i;
       break;
     }
-  if (n > 0 && dst[n - 1] == '.') /* "NAME." -> "NAME"             */
+  if (n > 0 && dst[n - 1] == '.')
     dst[--n] = '\0';
 }
 
-/* ------------------------------------------------------ directory iterator */
 struct rec_iter {
-  uint32_t base_lba, size, pos; /* extent + total bytes + cursor     */
-  uint32_t cur_sec;             /* sector currently in dbuf          */
+  uint32_t base_lba, size, pos;
+  uint32_t cur_sec;
   bool loaded;
 };
 
@@ -89,9 +69,7 @@ static void ri_init(struct rec_iter *it, uint32_t lba, uint32_t size)
   it->loaded = false;
 }
 
-/* Yield the next directory record. Fills out + decoded name (>=256 bytes) and
- * returns 1, or 0 at end. Records never straddle a sector: a zero length byte
- * means "skip to the next sector". */
+/* Next directory record into out/name (>=256 bytes): 1, or 0 at end. A zero length skips to the next sector. */
 static bool ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct dirrec *out)
 {
   while (it->pos < it->size) {
@@ -106,16 +84,15 @@ static bool ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct
     }
 
     uint8_t reclen = m->dbuf[off];
-    if (reclen == 0) { /* pad — jump to next sector      */
+    if (reclen == 0) {
       it->pos = (sec + 1) * ISO_SECTOR;
       continue;
     }
-    if (off + reclen > ISO_SECTOR) { /* malformed; bail this sector    */
+    if (off + reclen > ISO_SECTOR) {
       it->pos = (sec + 1) * ISO_SECTOR;
       continue;
     }
-    if (reclen < 34) { /* too short for the 33-byte header
-                        * + a 1-byte name; skip it        */
+    if (reclen < 34) {
       it->pos += reclen;
       continue;
     }
@@ -127,16 +104,14 @@ static bool ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct
     out->size = load_le32(p + 10);
     out->is_dir = (p[25] & FLAG_DIR) ? 1 : 0;
 
-    /* Clamp the untrusted identifier length to what the record actually holds
-     * (reclen >= 34 here, and off + reclen <= ISO_SECTOR), so decode_name
-     * can't read past dbuf into the adjacent buffer. */
+    /* Clamp the untrusted identifier length to the record. */
     uint32_t fil = p[32];
     if (33 + fil > reclen)
       fil = reclen - 33;
-    if (fil == 1 && p[33] == 0x00) { /* "." (self)                     */
+    if (fil == 1 && p[33] == 0x00) {
       name[0] = '.';
       name[1] = '\0';
-    } else if (fil == 1 && p[33] == 0x01) { /* ".." (parent)                  */
+    } else if (fil == 1 && p[33] == 0x01) {
       name[0] = '.';
       name[1] = '.';
       name[2] = '\0';
@@ -177,7 +152,7 @@ static int resolve(struct iso_mount *m, const char *path, struct dirrec *out)
 
   while (path && *path) {
     if (!cur.is_dir)
-      return -1; /* tried to descend into a file   */
+      return -1;
     char comp[256];
     int n = 0;
     while (*path && *path != '/' && n < 255)
@@ -196,7 +171,6 @@ static int resolve(struct iso_mount *m, const char *path, struct dirrec *out)
   return 0;
 }
 
-/* ------------------------------------------------------------------ mount */
 static void load_label(struct iso_mount *m, const uint8_t *vd)
 {
   /* Volume Identifier: 32 bytes at offset 40 (Joliet: UCS-2BE, 16 chars). */
@@ -213,16 +187,14 @@ static void load_label(struct iso_mount *m, const uint8_t *vd)
   m->vol_label[n] = '\0';
 }
 
-/* A Supplementary VD is Joliet when its escape sequences (32 bytes at offset
- * 88) begin with one of the UCS-2 level markers %/@ , %/C , %/E. */
+/* Joliet if the escape sequences (32 bytes at offset 88) start with %/@, %/C or %/E. */
 static bool is_joliet_svd(const uint8_t *vd)
 {
   const uint8_t *e = vd + 88;
   return e[0] == 0x25 && e[1] == 0x2F && (e[2] == 0x40 || e[2] == 0x43 || e[2] == 0x45);
 }
 
-/* Run the volume-descriptor probe into a fresh instance. 0 on success, -1 on
- * failure (no "CD001" magic, I/O error, no medium). */
+/* Probe the volume descriptors into a fresh instance: 0, or -1 (no "CD001", I/O error, no medium). */
 static int mount_probe(struct iso_mount *m, blk_read_fn read)
 {
   m->joliet = false;
@@ -238,7 +210,7 @@ static int mount_probe(struct iso_mount *m, blk_read_fn read)
     if (m->rd(s, m->rbuf) != 0)
       break;
     if (m->rbuf[1] != 'C' || m->rbuf[2] != 'D' || m->rbuf[3] != '0' || m->rbuf[4] != '0' || m->rbuf[5] != '1')
-      break; /* not ISO 9660 / chain ended     */
+      break;
 
     uint8_t type = m->rbuf[0];
     if (type == VDT_TERM)
@@ -284,7 +256,6 @@ static int mount_probe(struct iso_mount *m, blk_read_fn read)
   return 0;
 }
 
-/* ----------------------------------------------------------------- queries */
 static const char *iso_label(struct iso_mount *m) { return m->vol_label; }
 static const char *iso_type(struct iso_mount *m) { return m->vol_type; }
 
@@ -380,10 +351,9 @@ static int iso_enum_dir(struct iso_mount *m, const char *path, int idx, char *na
   return 0;
 }
 
-/* ---------------------------------------------------------------- vtable */
 static void *iso_probe(blk_read_fn read, blk_write_fn write)
 {
-  (void)write; /* ISO 9660 is read-only         */
+  (void)write;
   struct iso_mount *m = kmalloc(sizeof(*m));
   if (!m)
     return NULL;

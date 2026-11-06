@@ -1,13 +1,6 @@
 #include "main_int.h"
 
-/* --- approximate element geometry for the DOM geometry APIs (js.c) ----------
- * * The line-flow renderer has no per-element box model, so an element's pixel
- * box is reconstructed from the wrapped line table + inline-image rows. Returns
- * a document-relative box (x,y,w,h) for the rendered text range [start,end), 0
- * if the range produced no rows (unrendered/empty). Width is exact for a range
- * that lies on one text line; the content column otherwise. Runs on the worker
- * (JS) thread, so it holds browser_buf_lock to keep the front line table from
- * being swapped under it. */
+/* Approximate document-relative element box from the wrapped line table; worker thread, holds browser_buf_lock. */
 int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
 {
   *ox = *oy = *ow = *oh = 0;
@@ -33,8 +26,7 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
     if (rl > 0)
       text_rows++;
   }
-  /* Inline images anchored inside the span: the <img> element itself (whose
-   * span ends at its anchor) and any ancestor block enclosing it. */
+  /* Inline images anchored in the span, and ancestor blocks enclosing them. */
   for (int q = 0; q < B->pg->n_imgs; q++) {
     struct inl_img *im = &B->pg->imgs[q];
     if (im->start_row < 0 || im->text_pos < start || im->text_pos > end)
@@ -120,33 +112,24 @@ void browser_viewport_px(int *w, int *h)
     *h = phh;
 }
 
-/* The CSS box layer. Behind a flag so a regression is one flip back to the pure
- * flat text renderer. The box tree (layout.c) supplies each block's content
- * origin/width; inline text still flows through the shared wrap below, and
- * vertical spacing is quantised to text rows (Stage 6 moves to pixel
- * scrolling). */
+/* CSS box layer, behind a flag; inline text still flows through the shared wrap. */
 bool g_box_layout = true;
 
 static int rows_for(int px) { return px > 0 ? (px + LINE_H - 1) / LINE_H : 0; }
 static int max0(int v) { return v > 0 ? v : 0; }
-/* Reserve `n` LINE_H-tall blank lines (flex bands still address rows via
- * line_y). */
+/* Reserve `n` LINE_H-tall blank lines. */
 static void add_n_blanks(int n, int off, int x, int w)
 {
   while (n-- > 0)
     add_line(off, 0, x, w, LINE_H, (int)BODY_PX);
 }
-/* Reserve one blank line of exactly `h` px — exact margin/padding spacing, no
- * rounding to whole rows (the Stage 6 phase 2 improvement). No-op for h<=0. */
+/* Reserve one blank line of exactly `h` px; no-op for h<=0. */
 static void add_blank_px(int h, int off, int x, int w)
 {
   if (h > 0)
     add_line(off, 0, x, w, h, (int)BODY_PX);
 }
-/* Line height for the block set by set_block — LINE_H today (body text +
- * headings, which are capped at LINE_H); Stage 6 phase 3 derives a taller
- * height from a larger CSS font-size, which is what lets big headings exceed
- * one row. */
+/* Line height for the block set by set_block. */
 static int block_line_h(void)
 {
   if (g_wk.blh > 0)
@@ -157,16 +140,10 @@ static int block_line_h(void)
   return lh < LINE_H ? LINE_H : lh;
 }
 
-/* Wrap the glyph slice [t0,t1) at content origin `base_x` px / width `w` px,
- * appending display lines (and reserving inline-image rows). The per-glyph bp
- * byte still governs heading size / monospace / centring / list indent within
- * the line; the box tree supplies base_x/w. Shared by the flat renderer (the
- * whole stream) and the box layout (one slice per block). */
+/* Wrap glyph slice [t0,t1) at origin `base_x` / width `w` px into display lines. */
 static void flow_slice(int t0, int t1, int base_x, int w)
 {
-  /* Text/attr buffers are (re)built together by the layout walk; a relayout
-   * triggered mid-flight (e.g. by a script mutating the DOM) can reach here
-   * before they exist. Never scan a NULL buffer, and clamp to what's built. */
+  /* Buffers may not exist yet after a mid-flight relayout; never scan NULL. */
   if (!B->pg->text || !B->pg->attr)
     return;
   struct bctx *c = &g_wk;
@@ -214,10 +191,9 @@ static void flow_slice(int t0, int t1, int base_x, int w)
       while (ls < j) {
         int brk;
         if (pg->attr[ls] & ST_NOWRAP) {
-          brk = j; /* white-space:nowrap — one line, may overflow */
+          brk = j; /* white-space:nowrap - one line, may overflow */
         } else {
-          /* greedy fit by pixel width; break at the last space if a word
-           * would overflow, else hard-break (one char always fits). */
+          /* greedy fit by pixel width; hard-break if one word overflows */
           int wd = 0, e = ls, lastsp = -1;
           while (e < j) {
             unsigned cp;
@@ -244,9 +220,7 @@ static void flow_slice(int t0, int t1, int base_x, int w)
   }
 }
 
-/* Resolve a CSS length to px: an explicit px wins, else a percent of `basis`,
- * else -1 (auto/unset). Used for width/height and their min/max against the
- * container. */
+/* Resolve a CSS length to px: px, else percent of `basis`, else -1 (auto/unset). */
 static int resolve_len(int px, int pct, int basis)
 {
   if (px >= 0)
@@ -256,12 +230,7 @@ static int resolve_len(int px, int pct, int basis)
   return -1;
 }
 
-/* Resolve a box's border-box width within `avail_w` (the containing block's
- * content width). `frame` is the horizontal padding+border. With
- * box-sizing:content-box (the default) CSS width/min/max size the CONTENT box,
- * so `frame` is added back; with border-box they size the border box directly.
- * `auto` width fills what the margins leave. min-/max-width clamp, then the
- * result is kept within the containing block. */
+/* Resolve a box's border-box width within `avail_w`; `frame` is horizontal padding+border. */
 static int box_width(const struct lbox *b, int avail_w, int frame, int ml, int mr)
 {
   int extra = b->border_box ? 0 : frame; /* added to a content-box length */
@@ -284,13 +253,7 @@ static int box_width(const struct lbox *b, int avail_w, int frame, int ml, int m
   return box_w;
 }
 
-/* Minimum content-box height in px, or -1 if the box is purely content-sized.
- * CSS height is treated as a floor (short content is padded so the background
- * fills, but taller content overflows — we don't clip); min-height raises the
- * floor and max-height caps it. Percent heights need a definite container,
- * which this content- driven flow doesn't have, so they're ignored.
- * box-sizing:border-box values include the vertical frame, removed here to get
- * the content height. */
+/* Minimum content-box height in px (CSS height is a floor), or -1 if content-sized. */
 static int box_min_content_h(const struct lbox *b, int vframe)
 {
   int frame = b->border_box ? vframe : 0;
@@ -307,20 +270,9 @@ static int box_min_content_h(const struct lbox *b, int vframe)
   return target;
 }
 
-/* --- flex (flex-direction:row)
- * ------------------------------------------------ * Row flex items must sit
- * side by side on the same vertical band, which the one- slice-per-row line
- * table can't express. So a row flex container reserves a blank band in the
- * main table for height/scroll, and each item's wrapped text is stashed in the
- * overlay (struct fslice) at its own column x, drawn over the band. Item box
- * geometry is set here so paint_boxes still draws each item's
- * background/border. Item content is treated as inline text (its full glyph
- * slice); nested block boxes inside an item don't get their own side-by-side
- * geometry — a documented limit of the band overlay (the common
- * navbar/button-row/card-row case works). */
+/* --- flex (row): items share a band reserved in the main table, text drawn via the overlay --- */
 
-/* Natural (max-content) width of a glyph slice in px: the widest unwrapped
- * line. */
+/* Max-content width of a glyph slice in px. */
 static int slice_maxcontent(int t0, int t1)
 {
   int best = 0, i = t0;
@@ -347,9 +299,7 @@ static int slice_maxcontent(int t0, int t1)
   return best;
 }
 
-/* A flex item's flex-basis as a border-box main size: flex-basis, else width,
- * else its max-content text width. content-box lengths get the horizontal frame
- * added. */
+/* A flex item's flex-basis as a border-box main size. */
 static int flex_base_main(const struct lbox *it, int cont_w)
 {
   int frame = it->border.l + it->border.r + it->padding.l + it->padding.r;
@@ -363,8 +313,7 @@ static int flex_base_main(const struct lbox *it, int cont_w)
   return slice_maxcontent(it->t0, it->t1) + frame;
 }
 
-/* Clamp a resolved border-box main size to the item's min/max-width and a 1px
- * floor. */
+/* Clamp a border-box main size to min/max-width and a 1px floor. */
 static int flex_clamp_main(const struct lbox *it, int v, int cont_w)
 {
   int frame = it->border.l + it->border.r + it->padding.l + it->padding.r;
@@ -396,11 +345,7 @@ static int box_children(const struct lbox *bx, int idx, int *items)
   return n;
 }
 
-/* Lay out a flex-direction:row container's direct children side by side within
- * the container content box [content_x, content_x+content_w). Appends the band
- * to the main table and the items' text to the overlay; sets each item's box
- * geometry. False (nothing emitted) when memory runs out, so the caller can
- * flow the container as a plain block. */
+/* Lay out a row flex container's children side by side; false if out of memory. */
 static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w)
 {
   struct lbox *cont = &bx[idx];
@@ -486,11 +431,7 @@ static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
     break; /* flex-start */
   }
 
-  /* Phase 1: flow each item's text (top-aligned for now) to learn its cross
-   * size. An item's outer (border-box) height is its content rows clamped by
-   * height/ min-height plus its vertical frame; the band is the tallest item,
-   * raised to the container's own content-height floor so align-items has room
-   * to work. */
+  /* Phase 1: flow each item's text to learn its cross size; band is the tallest item. */
   int band_top = g_bk->lt.n;
   int band_top_y = lt_doc_px(&g_bk->lt); /* pixel top of the band (its rows are added below) */
   int x = content_x + start, band_h = 0;
@@ -528,9 +469,7 @@ static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
   if (band_h < 1)
     band_h = 1;
 
-  /* Phase 2: cross-axis place each item (align-items), inset its text by the
-   * item's top padding, and record geometry so paint_boxes draws its
-   * background/border. */
+  /* Phase 2: cross-axis place each item (align-items) and record geometry. */
   signed char ai = cont->align_items < 0 ? CSS_ALIGN_STRETCH : cont->align_items;
   for (int k = 0; k < nit; k++) {
     struct lbox *it = &bx[items[k]];
@@ -569,23 +508,8 @@ static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
   return true;
 }
 
-/* --- grid (display:grid)
- * ------------------------------------------------------ * Like flex-row, a
- * grid needs items placed at arbitrary columns within a band the row-quantised
- * line table can't express, so it reuses the same band overlay: the container
- * reserves a blank band (keeping scroll/height row-indexed) and each cell's
- * wrapped text is stashed in the overlay at the cell's column x, drawn over the
- * band. Column tracks are sized (px / % / fr / auto→max-content) within the
- * content box; items auto-flow row-by-row honouring grid-column/row spans; each
- * grid row's height is its tallest cell (row-quantised). Item box geometry is
- * set so paint_boxes draws each cell's background/border. Cells stretch to fill
- * their track span by default (align-items/justify-items:stretch). Limits:
- * dense packing of row-spanning items isn't tracked (a cell a rowspan reserves
- * may be reused by the next row); a cell's inline text is its own glyph slice —
- * nested block boxes inside a cell don't get their own side-by-side geometry
- * (same limit as flex). */
-/* False (nothing emitted) when memory runs out, so the caller can flow the
- * container as a plain block. */
+/* --- grid: like flex-row, cells are drawn via the band overlay; no dense packing of row spans --- */
+/* False when memory runs out, so the caller flows the container as a plain block. */
 static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
 {
   struct lbox *cont = &bx[idx];
@@ -608,10 +532,7 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
   int gcol = cont->gap_col > 0 ? cont->gap_col : 0;
   int grow_gap = cont->gap_row > 0 ? cont->gap_row : 0;
 
-  /* --- auto-placement: assign each item a (col,row) + span
-   * (grid-auto-flow:row). A span wider than the remaining columns wraps to the
-   * next row. Row spans are honoured for height/geometry but not tracked as
-   * occupied cells (v1 limit). */
+  /* auto-placement: assign each item a (col,row) and span (grid-auto-flow:row) */
   int cur_c = 0, cur_r = 0, nrows = 0;
   for (int k = 0; k < nit; k++) {
     struct lbox *it = &bx[items[k]];
@@ -644,10 +565,7 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
   }
   int *rowh = rmem, *row_off = rmem + nrows;
 
-  /* --- column track sizing: resolve fixed (px/%) tracks and auto tracks
-   * (max-content of their single-column items), then share the leftover across
-   * fr tracks (or grow auto tracks if there are none), and scale down on
-   * overflow. */
+  /* column track sizing: fixed, auto (max-content), fr, then overflow scale-down */
   int colw[CSS_GRID_MAX], is_fr[CSS_GRID_MAX], fr_w[CSS_GRID_MAX], is_auto[CSS_GRID_MAX];
   int total_gap = gcol * (ncols - 1);
   int avail = content_w - total_gap;
@@ -724,8 +642,7 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
   for (int c = 0; c < ncols; c++)
     track_x[c + 1] = track_x[c] + colw[c] + gcol;
 
-  /* --- flow each item into the overlay (top of band for now), measuring its
-   * content rows, its column x and its border-box main width. */
+  /* flow each item into the overlay, measuring rows, column x and border-box width */
   int band_top = g_bk->lt.n;
   int band_top_y = lt_doc_px(&g_bk->lt);
   for (int k = 0; k < nit; k++) {
@@ -759,9 +676,7 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
     toppad[k] = rows_for(it->border.t + it->padding.t);
   }
 
-  /* --- row-track heights (rows): a px grid-template-rows entry is a floor; a
-   * single-row item raises its row; a row-spanning item extends its last row.
-   */
+  /* row-track heights: px floor, single-row items raise it, spanning items extend the last row */
   for (int r = 0; r < nrows; r++) {
     rowh[r] = 0;
     if (cont->n_rows > 0 && r < cont->n_rows && cont->rows_t[r].kind == CSS_TRK_PX) {
@@ -802,9 +717,7 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
   if (band_h < 1)
     band_h = 1;
 
-  /* --- place: shift each cell's overlay text to its row (align-items on the
-   * block axis) + top padding, and record geometry so paint_boxes draws its
-   * bg/border. */
+  /* place: shift each cell's text to its row (align-items) and record geometry */
   signed char ai = cont->align_items < 0 ? CSS_ALIGN_STRETCH : cont->align_items;
   for (int k = 0; k < nit; k++) {
     struct lbox *it = &bx[items[k]];
@@ -853,16 +766,7 @@ static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
   return true;
 }
 
-/* Lay out one box: blank rows for top margin/border/padding, then its own
- * inline text interleaved with child boxes (each recursively laid out), then
- * bottom spacing. Geometry is stored in document px; vertical position is the
- * row cursor (g_bk->lt.n) * LINE_H. `x`/`avail_w` are the containing block's
- * content origin and width. The box honours CSS width with min-/max-width and
- * box-sizing, `height`/ min-height as a floor (short content is padded so the
- * background fills the box, capped by max-height), `margin:auto` (horizontal
- * centring) and `position` offsets. Because rows are sequential, a vertical
- * offset (`top`/`bottom`) moves only the painted box; horizontal offsets move
- * box+text. */
+/* Lay out one box and its children recursively; geometry in document px, `x`/`avail_w` from the parent. */
 static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
 {
   struct lbox *b = &bx[idx];
@@ -870,8 +774,7 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   int frame = b->border.l + b->border.r + b->padding.l + b->padding.r;
   int box_w = box_width(b, avail_w, frame, ml, mr);
 
-  /* Horizontal placement: auto margins absorb the slack (CSS block centring).
-   */
+  /* Horizontal placement: auto margins absorb the slack. */
   int slack = avail_w - box_w - ml - mr;
   int box_x;
   if (b->ml_auto && b->mr_auto)
@@ -881,9 +784,7 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   else
     box_x = x + ml;
 
-  /* position: relative shifts from the flow spot; absolute/fixed are placed
-   * from the containing block's edges. Horizontal offset moves the text with
-   * the box; vertical offset is applied to the painted rect only (dy). */
+  /* position: relative shifts from the flow spot; absolute/fixed use the containing block edges. */
   int dy = 0;
   if (b->pos == CSS_POS_REL || b->pos == CSS_POS_STICKY) {
     if (b->off_l >= 0)
@@ -921,9 +822,7 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   g->cx = content_x;
   g->cw = content_w;
 
-  /* grid: children placed into a 2-D track band via the overlay. Row flex:
-   * children laid side by side via the band overlay (column flex keeps the
-   * block-stacking path below; vertical stacking is already right). */
+  /* grid/row flex: children placed via the band overlay; column flex stacks as blocks */
   bool banded = false;
   if (b->kind == LB_GRID)
     banded = flow_grid(bx, idx, content_x, content_w);
@@ -944,9 +843,7 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
     flow_slice(pos, b->t1, content_x, content_w);
   }
 
-  /* Pad short content up to the box's minimum content height
-   * (height/min-height, capped by max-height) so the background fills; taller
-   * content overflows. */
+  /* Pad short content up to the box's minimum content height. */
   int vframe = b->border.t + b->border.b + b->padding.t + b->padding.b;
   int min_ch = box_min_content_h(b, vframe);
   if (min_ch > 0) {
@@ -966,9 +863,7 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   g->ch = content_bot_y - content_top_y;
 }
 
-/* Lay out the whole box tree (top-level boxes stacked, with any stray text
- * outside them flowed full width). Appends to the line table; sets every box's
- * geometry. */
+/* Lay out the whole box tree, flowing stray text full width. */
 static void layout_flow(int paw)
 {
   int n;
@@ -987,8 +882,7 @@ static void layout_flow(int paw)
   flow_slice(pos, B->pg->text_len, 4, paw);
 }
 
-/* Hash of every input that decides the line table and box geometry, so an
- * animation frame that only moved paint properties can keep the laid-out result. */
+/* Hash of every layout input, so paint-only animation frames can reuse the layout. */
 unsigned layout_sig(int paw)
 {
   const struct page *pg = B->pg;
@@ -1017,9 +911,7 @@ unsigned layout_sig(int paw)
   return h;
 }
 
-/* Publish a finished layout into the shared state the painter and the DOM
- * geometry APIs read: image rows, media placement, per-box geometry. Caller
- * holds browser_buf_lock. */
+/* Publish a finished layout to the painter and DOM geometry APIs; caller holds browser_buf_lock. */
 static void layout_apply(const struct layout_out *o)
 {
   struct page *pg = B->pg;
@@ -1049,8 +941,7 @@ static void layout_apply(const struct layout_out *o)
     }
 }
 
-/* The DOM was re-flattened but nothing that affects layout changed: re-attach
- * the current layout to the fresh box pool instead of re-wrapping. */
+/* DOM re-flattened without layout changes: re-attach the layout to the fresh box pool. */
 void layout_keep(void)
 {
   browser_buf_lock();
@@ -1079,8 +970,7 @@ void box_extent(const struct lbox *b, const struct lgeom *g, int *top, int *bot)
   }
 }
 
-/* Per-layout paint order (z bands + vertical cull index) and the furthest a
- * glyph can spill below its line box. */
+/* Per-layout paint order (z bands, vertical cull index) and max glyph spill below a line box. */
 static void layout_index(struct layout_out *o, const struct lbox *bx, int nb)
 {
   ru_bands_free(&o->bands);
@@ -1108,17 +998,12 @@ static void layout_index(struct layout_out *o, const struct lbox *bx, int nb)
   o->over = over;
 }
 
-/* Word-wrap B->pg->text into display lines that fit `paw` pixels wide
- * (proportional font), reserving rows for inline images. wrap_cols caches the
- * pane width. The result is built in g_bk without browser_buf_lock (only the
- * worker thread writes the text and box pool it reads) and swapped in under a
- * short lock, so painting and scrolling never wait on a long reflow. */
+/* Word-wrap the page text to `paw` px, building in g_bk and swapping in under a short lock. */
 void rewrap(int paw)
 {
   if (paw < 8)
     paw = 8;
-  /* Don't lay out over a NULL text buffer: drop to an empty page and force a
-   * re-wrap once it's ready. */
+  /* Without a text buffer, drop to an empty page and force a re-wrap. */
   if (!B->pg->text) {
     browser_buf_lock();
     g_fr->lt.n = 0;

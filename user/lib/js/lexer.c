@@ -1,9 +1,9 @@
-/* lexer.c — JavaScript tokenizer. See lexer.h for the design notes. */
+/* lexer.c, JavaScript tokenizer. See lexer.h for the design notes */
 #include "lexer.h"
 #include "fmt.h"  /* strtod (decimal forms only; hex/oct/bin done here) */
 #include "owos.h" /* mem*, str*, utf8_encode, malloc/free */
 
-/* ------------------------------------------------------- char classes ----- */
+/* char classes */
 
 static int is_digit(int c) { return c >= '0' && c <= '9'; }
 static int is_hex(int c) { return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
@@ -20,7 +20,7 @@ static int is_space(int c)
          c == (char)0xA0; /* NBSP low byte; good enough without full Unicode */
 }
 
-/* ------------------------------------------------------- cooked buffer ---- */
+/* cooked buffer */
 
 typedef struct {
   char *b;
@@ -64,7 +64,7 @@ static void cb_push_cp(cbuf *c, unsigned cp)
     cb_push(c, t[i]);
 }
 
-/* ------------------------------------------------------- keyword table ---- */
+/* keyword table */
 
 static int eqn(const char *s, const char *kw, int n)
 {
@@ -169,8 +169,7 @@ static int keyword_kind(const char *s, int n)
   return T_IDENT;
 }
 
-/* ----------------------------------------------------------- init ----------
- */
+/* init */
 
 void js_lexer_init(jlexer *lx, const char *src, js_arena *arena)
 {
@@ -196,10 +195,9 @@ static void fail(jlexer *lx, jtoken *out, const char *msg)
   out->kind = T_ERROR;
 }
 
-/* ------------------------------------------------------- trivia ----------- */
+/* trivia */
 
-/* Skip whitespace and comments; record whether a line terminator was crossed
- * (the parser needs this for automatic semicolon insertion). */
+/* Skip whitespace and comments; record whether a line terminator was crossed */
 static void skip_trivia(jlexer *lx)
 {
   for (;;) {
@@ -237,10 +235,7 @@ static void skip_trivia(jlexer *lx)
         lx->p += 2; /* consume the closing star-slash */
       continue;
     }
-    /* Annex B HTML-like comments (legacy inline-script wrappers): `<!--`
-     * opens a single-line comment anywhere; `-->` is one only at line start
-     * (saw_newline => only whitespace/comments precede it on this line, so a
-     * real `a-->b` post-decrement stays tokenized as `--` `>`). */
+    /* Annex B HTML-like comments (legacy inline-script wrappers) */
     if (c == '<' && lx->p[1] == '!' && lx->p[2] == '-' && lx->p[3] == '-') {
       lx->p += 4;
       while (*lx->p && *lx->p != '\n')
@@ -257,10 +252,9 @@ static void skip_trivia(jlexer *lx)
   }
 }
 
-/* ------------------------------------------------------- escapes ---------- */
+/* escapes */
 
-/* Decode one backslash escape at lx->p (which points at '\\') into `cook`.
- * Returns 0 on a malformed escape. */
+/* Decode one backslash escape at lx->p (which points at '\\') into `cook` */
 static int decode_escape(jlexer *lx, cbuf *cook)
 {
   char c;
@@ -352,7 +346,7 @@ static int decode_escape(jlexer *lx, cbuf *cook)
   }
 }
 
-/* ------------------------------------------------------- strings ---------- */
+/* strings */
 
 static void scan_string(jlexer *lx, jtoken *out, char quote)
 {
@@ -397,12 +391,9 @@ static void scan_string(jlexer *lx, jtoken *out, char quote)
   cb_free(&cook);
 }
 
-/* ------------------------------------------------------- templates -------- */
+/* templates */
 
-/* Scan a template segment from lx->p (just after a '`' or after a '}' that
- * closed a substitution). On '${' emits HEAD/MIDDLE and pushes a substitution
- * marker; on '`' emits TEMPLATE/TAIL. `after_sub` distinguishes the two cases.
- */
+/* Scan a template segment from lx->p */
 static void scan_template(jlexer *lx, jtoken *out, int after_sub)
 {
   cbuf cook;
@@ -468,7 +459,7 @@ static void scan_template(jlexer *lx, jtoken *out, int after_sub)
   cb_free(&cook);
 }
 
-/* ------------------------------------------------------- numbers ---------- */
+/* numbers */
 
 static void scan_number(jlexer *lx, jtoken *out)
 {
@@ -579,10 +570,9 @@ static void scan_number(jlexer *lx, jtoken *out)
   out->len = (int)(lx->p - s);
 }
 
-/* ------------------------------------------------------- regex ------------ */
+/* regex */
 
-/* True if a `/` in this position begins a regex literal rather than division,
- * decided from the previous significant token. */
+/* True if a `/` in this position begins a regex literal rather than division */
 static int regex_allowed(int prev)
 {
   switch (prev) {
@@ -609,14 +599,7 @@ static int regex_allowed(int prev)
   }
 }
 
-/* True if a `{` in this position opens an object literal rather than a block.
- * Decided from the previous significant token: a `{` is an object literal only
- * in expression-operand position (after an operator, `(`/`[`/`,`/`:`/`?`, or an
- * expression-introducing keyword like return/typeof/new). Everywhere else —
- * statement start, after `;`/`}`/`)`/`=>`/`else`, a function or control body —
- * it opens a block. This drives the regex-vs-divide choice after the matching
- * `}`: a `/` after a block-`}` is a regex; after an object-literal `}`, divide.
- */
+/* True if a `{` in this position opens an object literal rather than a block */
 static int lbrace_is_object(int prev)
 {
   switch (prev) {
@@ -746,11 +729,9 @@ static void scan_regex(jlexer *lx, jtoken *out)
   cb_free(&flags);
 }
 
-/* ------------------------------------------------------- identifiers ------ */
+/* identifiers */
 
-/* Decode a '\uXXXX' or '\u{...}' escape at lx->p (pointing at the '\\') — the
- * only escape legal inside an IdentifierName — appending its UTF-8 form to
- * cook. Returns 0 on a non-'\u' or malformed escape. */
+/* Decode a '\uXXXX' or '\u{...}' escape at lx->p (pointing at the '\\') */
 static int decode_ident_escape(jlexer *lx, cbuf *cook)
 {
   unsigned cp = 0;
@@ -781,11 +762,7 @@ static int decode_ident_escape(jlexer *lx, cbuf *cook)
   return 1;
 }
 
-/* Scan an identifier containing one or more '\uXXXX' escapes (the slow path;
- * plain names take the raw-slice fast path in js_lex_next). Re-scans from `s`,
- * decoding each escape into its UTF-8 bytes so the cooked name is the
- * identifier's StringValue. An escaped identifier is never a keyword (e.g. `if`
- * is the name "if", not the `if` keyword). */
+/* Scan an identifier containing one or more '\uXXXX' escapes */
 static void scan_ident_escaped(jlexer *lx, jtoken *out, const char *s)
 {
   cbuf cook;
@@ -824,7 +801,7 @@ static void scan_ident_escaped(jlexer *lx, jtoken *out, const char *s)
   cb_free(&cook);
 }
 
-/* ------------------------------------------------------- main scan -------- */
+/* main scan */
 
 void js_lex_next(jlexer *lx, jtoken *out)
 {
@@ -852,9 +829,6 @@ void js_lex_next(jlexer *lx, jtoken *out)
   out->start = lx->p;
 
   c = *lx->p;
-  /* Carry the "previous token was a control-flow header ')'" flag across the
-   * trivia between that ')' and this token, then clear it; re-set below only
-   * when this token is itself such a ')'. */
   rparen_ctrl = lx->prev_rparen_ctrl;
   lx->prev_rparen_ctrl = 0;
   rbrace_block = lx->prev_rbrace_block;
@@ -887,8 +861,7 @@ void js_lex_next(jlexer *lx, jtoken *out)
     return;
   }
 
-  /* An identifier that begins with a Unicode escape (e.g. `Ā` as an object
-   * key — real-world minifiers/transliteration maps emit these). */
+  /* An identifier that begins with a Unicode escape */
   if (c == '\\' && lx->p[1] == 'u') {
     scan_ident_escaped(lx, out, lx->p);
     if (out->kind != T_ERROR)
@@ -896,9 +869,7 @@ void js_lex_next(jlexer *lx, jtoken *out)
     return;
   }
 
-  /* A private class name (#field / #method): lexed as an ordinary identifier
-   * token whose text keeps the leading '#', so it flows through the normal
-   * property-key / member-access machinery as the key "#name". */
+  /* A private class name (#field / #method) */
   if (c == '#' && is_id_start((unsigned char)lx->p[1])) {
     const char *s = lx->p;
     lx->p++; /* '#' */
@@ -985,8 +956,6 @@ void js_lex_next(jlexer *lx, jtoken *out)
         lx->brace[lx->brace_sp++] = lbrace_is_object(lx->prev_kind) ? 0 : 2;
       ADV(1, T_LBRACE);
     case '(': {
-      /* Remember whether this '(' is an if/for/while/with header: a ')'
-       * closing it is followed by a statement, so a '/' there is a regex. */
       int ctrl =
           (lx->prev_kind == T_IF || lx->prev_kind == T_FOR || lx->prev_kind == T_WHILE || lx->prev_kind == T_WITH);
       if (lx->paren_sp < (int)sizeof(lx->paren))
@@ -1126,7 +1095,7 @@ void js_lex_next(jlexer *lx, jtoken *out)
   fail(lx, out, "unexpected character");
 }
 
-/* ------------------------------------------------------- spelling --------- */
+/* spelling */
 
 const char *js_tok_spell(int kind)
 {

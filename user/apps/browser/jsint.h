@@ -1,14 +1,4 @@
-/* jsint.h — internal shared surface for the browser's JavaScript bindings.
- *
- * js.c holds the core: the DOM/window/document bindings, the engine setup that
- * builds every prototype, the service-worker scope builder (which consumes the
- * whole API surface), and the document/REPL runners. Self-contained
- * web-platform subsystems (IndexedDB, ...) live in their own js_*.c files. They
- * all share the one per-page engine context and a handful of low-level helpers
- * declared here; the definitions live in js.c. Each subsystem exposes a setup
- * entry (installs its constructors onto `window`) plus, if it drives async
- * delivery, a pump in browser.h. This header is browser-internal — the public
- * js_* entry points the rest of the browser calls stay in browser.h. */
+/* jsint.h , internal shared surface for the browser's JavaScript bindings. js.c holds the core */
 #ifndef BROWSER_JSINT_H
 #define BROWSER_JSINT_H
 
@@ -17,9 +7,7 @@
 #include "interp.h"  /* js_ctx, js_run, js_call, js_ctx_new, js_def_native   */
 #include "parser.h"  /* js_parse, js_arena                                   */
 
-/* Nth call argument or undefined — the ubiquitous native-function arg accessor.
- * Expands `args`/`argc` from the enclosing js_native, so every module gets it.
- */
+/* Nth call argument or undefined */
 #define A(i) ((i) < argc ? args[i] : js_undef())
 
 /* ---- shared per-page state (defined in js.c) ---------------------------- */
@@ -27,17 +15,16 @@ extern js_ctx *g_ctx;               /* the engine context for the whole current 
 extern int g_page_live;             /* a page context is currently alive              */
 extern js_object *g_response_proto; /* fetch() Response.prototype (fetch + SW share) */
 extern char g_page_url_buf[];       /* the current page URL (module + SW referrer) */
-extern js_object *g_media_proto;    /* HTMLMediaElement.prototype (core wraps <audio>/<video>) */
-extern js_object *g_remote_proto;   /* RemotePlayback.prototype (media.remote) */
-extern js_object *g_remotes;        /* rooted array of live RemotePlayback wrappers */
+extern js_object *g_media_proto;
+extern js_object *g_remote_proto; /* RemotePlayback.prototype (media.remote) */
+extern js_object *g_remotes;      /* rooted array of live RemotePlayback wrappers */
 
 /* ---- shared low-level helpers (defined in js.c) ------------------------- */
 
 /* args[] -> a borrowed C string (coerces via ToString; "" for non-strings) */
 const char *arg_str(js_ctx *ctx, js_value v);
 
-/* the DOM node a wrapper object fronts (NULL if not a node wrapper), and the
- * cached wrapper object for a node (creating + pinning it on first access) */
+/* the DOM node a wrapper object fronts (NULL if not a node wrapper), and the cached wrapper */
 struct dom_node *node_of(js_value v);
 js_value wrap_node(struct dom_node *n);
 
@@ -45,9 +32,7 @@ js_value wrap_node(struct dom_node *n);
 void def_method(js_object *o, const char *name, js_native fn, int arity);
 void def_acc(js_object *proto, const char *name, js_native get, js_native set);
 
-/* EventTarget machinery: the three DOM-standard listener methods (installed as
- * natives on any EventTarget-like prototype), event-flag reads, capturing/
- * bubbling dispatch onto one object, and Event object construction. */
+/* EventTarget machinery */
 js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_dispatch(js_ctx *ctx, js_value t, js_value *args, int argc);
@@ -68,12 +53,10 @@ void sb_putn(sbuf *s, const char *t, int n);
 /* bytes backing an ArrayBuffer / typed-array / DataView view (NULL if none) */
 const unsigned char *view_bytes(js_value v, int *len);
 
-/* expose an interface prototype's constructor as a global on `win` (so scripts
- * can reference/extend it and `x instanceof Foo` holds) */
+/* expose an interface prototype's constructor as a global on `win` */
 void define_iface(js_ctx *ctx, js_object *win, const char *name, js_object *proto);
 
-/* ---- shared helpers used by the service-worker module (defined in js.c) ---
- */
+/* ---- shared helpers used by the service-worker module (defined in js.c) --- */
 int arenas_push(js_arena *ar);                                       /* keep a script's AST arena alive  */
 js_value el_noop(js_ctx *ctx, js_value t, js_value *args, int argc); /* no-op native */
 js_value hdr_get(js_ctx *ctx, js_value t, js_value *args, int argc); /* Headers.get   */
@@ -96,16 +79,13 @@ void js_idb_teardown(void);                        /* unroot the page's IDB stat
 void js_webapi_setup(js_ctx *ctx, js_object *win); /* performance + Encoding (js_webapi.c) */
 void js_webapi_teardown(void);                     /* unroot the Encoding-API prototypes  */
 
-/* HTMLMediaElement + Remote Playback + new Image()/Audio() (js_media.c). The
- * media/remote prototypes are allocated in setup_dom's batch (above); these
- * configure them and own the Cast session state + pump. */
+/* HTMLMediaElement + Remote Playback + new Image()/Audio() (js_media.c) */
 void setup_media_proto(js_ctx *ctx);
 void setup_remote_proto(js_ctx *ctx);
 js_value image_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 void js_cast_page_end(void); /* tear the page's Cast session down   */
 
-/* Service workers (js_serviceworker.c). The Cache API + registration store is
- * process-persistent C state; the JS surface is rebuilt per navigation. */
+/* Service workers (js_serviceworker.c) */
 void sw_install(js_ctx *ctx, js_object *win, const char *page_url);
 void sw_teardown(void); /* drop the per-page SW JS objects */
 int sw_intercept_fetch(js_ctx *ctx, const char *url, const char *method, js_value *out);

@@ -1,27 +1,4 @@
-/* hda.c — Intel High Definition Audio (HDA / "Azalia") PCM playback.
- *
- * An HDA *controller* (PCI class 0x04/0x03) is a PCI bus-master with a register
- * file in MMIO. It talks to one or more *codecs* over a serial link; the codec
- * is the thing with DACs, mixers and output pins. On real machines that codec
- * is almost always a Realtek ALC part, so this one driver is "Realtek audio".
- *
- * Bring-up (hda_init, runs before sti -> busy-waits, never sleeps):
- *   1. find the controller on PCI, map BAR0 uncached, enable bus-master DMA.
- *   2. reset the controller (GCTL.CRST) and wait for a codec on STATESTS.
- *   3. set up the CORB/RIRB command rings (how we send "verbs" to the codec).
- *   4. walk the codec's widget graph to find an output DAC -> pin path.
- *   5. configure that path (power, format, stream tag, unmute amps, EAPD).
- *
- * Playback (hda_stream_*, fed from user space with interrupts on):
- *   /bin/play parses the WAV and resamples it to 48 kHz 16-bit stereo,
- *   then pushes ready frames here; this driver streams them through one output
- *   stream descriptor over a cyclic 2-half DMA buffer, pacing the producer by
- *   *polling* the link position register (SDnLPIB) — no IRQ wiring, which keeps
- *   us off the PCI interrupt-sharing minefield on real hardware.
- *
- * Scope: enough of HDA for stereo PCM out. Long-form connection lists are
- * handled; multi-level mixer trees beyond one selector/mixer hop are not.
- */
+/* hda.c: Intel HDA controller and codec driver; polled cyclic-DMA stereo PCM out for /bin/play. */
 
 #include "hda.h"
 #include "console.h"
@@ -35,7 +12,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* ---- HDA controller MMIO register offsets ------------------------------ */
 #define R_GCAP 0x00     /* 16: capabilities (stream counts)             */
 #define R_GCTL 0x08     /* 32: bit0 CRST (controller reset)             */
 #define R_STATESTS 0x0E /* 16: one bit per codec link that responded    */
@@ -63,7 +39,6 @@
 #define SD_BDPL 0x18 /* 32: BDL base low                             */
 #define SD_BDPU 0x1C /* 32: BDL base high                            */
 
-/* ---- codec verbs / GET_PARAMETER ids ----------------------------------- */
 #define GET_PARAM 0xF0000u /* (0xF00 << 8)                    */
 #define P_SUBNODE 0x04     /* subordinate node count          */
 #define P_FGTYPE 0x05      /* function group type             */
@@ -92,7 +67,6 @@
 #define WT_SEL 3   /* selector                      */
 #define WT_PIN 4   /* pin complex                   */
 
-/* ---- driver state ------------------------------------------------------ */
 static volatile uint8_t *mmio;
 static bool present;
 static uint8_t codec;                       /* codec address on the link             */
@@ -103,8 +77,7 @@ static bool mix_is_sel;                     /* path_mix is a selector (not a mix
 static bool pin_is_hp;                      /* output pin is a headphone jack         */
 static uint32_t sd_off;                     /* output stream descriptor offset        */
 
-/* Master volume: applied to one output-amp widget in the path (pin preferred,
- * else DAC, else mixer) so attenuation isn't multiplied across stages. */
+/* Master volume goes to one output amp in the path (pin, else DAC, else mixer). */
 static uint16_t vol_nid;   /* widget carrying the volume amp (0 = none) */
 static uint32_t vol_steps; /* its loudest gain value                  */
 static int hda_vol = HDA_VOL_MAX;
@@ -113,11 +86,7 @@ static bool hda_muted;
 /* CORB/RIRB rings + the audio DMA buffer, all in one identity-mapped run. */
 #define CORB_N 256
 #define RIRB_N 256
-#define AUDIO_BYTES                                                                                                    \
-  0x30000u /* 192 KiB cyclic buffer (~1 s at 48k/S16/2ch):                                                             \
-            * deep enough that a transient producer stall                                                              \
-            * (a slow file read) can't let the play head                                                               \
-            * lap the writer and replay stale samples.   */
+#define AUDIO_BYTES 0x30000u /* 192 KiB cyclic buffer, ~1 s at 48k/S16 stereo */
 #define HALF (AUDIO_BYTES / 2)
 static volatile uint32_t *corb; /* CORB_N dwords                          */
 static volatile uint32_t *rirb; /* RIRB_N * 2 dwords (resp, resp_ex)      */
@@ -126,7 +95,6 @@ static uint8_t *audio;          /* the 192 KiB stereo S16 cyclic buffer    */
 static uint32_t corb_phys, rirb_phys, bdl_phys;
 static uint16_t corb_wp;
 
-/* ---- MMIO accessors ---------------------------------------------------- */
 static inline uint8_t rd8(uint32_t o) { return *(volatile uint8_t *)(mmio + o); }
 static inline uint16_t rd16(uint32_t o) { return *(volatile uint16_t *)(mmio + o); }
 static inline uint32_t rd32(uint32_t o) { return *(volatile uint32_t *)(mmio + o); }
@@ -140,17 +108,12 @@ static void spin(int n)
     __asm__ volatile("pause");
 }
 
-/* ---- codec command over CORB/RIRB -------------------------------------- */
-/* Push one command and poll the RIRB write pointer until the response lands.
- * One in flight at a time, so CORB index N <-> RIRB index N. Returns the 32-bit
- * response, or 0 on timeout. */
+/* Send one command and poll the RIRB until the response lands (0 on timeout); one in flight. */
 static uint32_t codec_cmd(uint16_t nid, uint32_t payload)
 {
   uint32_t cmd = ((uint32_t)codec << 28) | ((uint32_t)nid << 20) | (payload & 0xFFFFF);
 
-  /* Atomic against the keyboard IRQ, which can call in via hda_volume_*: the
-   * ring-pointer update + poll must not interleave with another command. Mask
-   * interrupts for the (microsecond) duration and restore the prior IF. */
+  /* Mask IRQs: the keyboard IRQ can call in via hda_volume_*, and the ring update must not interleave. */
   uintptr_t flags = irq_save();
 
   corb_wp = (uint16_t)((corb_wp + 1) & 0xFF);
@@ -173,12 +136,8 @@ static uint32_t codec_cmd(uint16_t nid, uint32_t payload)
 
 static uint32_t get_param(uint16_t nid, uint8_t p) { return codec_cmd(nid, GET_PARAM | p); }
 
-/* One connection-list entry. Robust to codecs that round the requested index
- * down to a group boundary: fetch the aligned group, then pick our slot. The
- * list is "long form" (16-bit nids) when CONNLEN bit7 is set. The entry's top
- * bit (bit7 short / bit15 long) is the *range* flag, not part of the node id:
- * it is stripped here and reported via *is_range so the caller can expand the
- * run. */
+/* One connection-list entry (fetches the aligned group); bit7 short / bit15 long is the range flag, returned via
+ * *is_range. */
 static uint16_t conn_entry(uint16_t nid, int longform, int i, int *is_range)
 {
   uint16_t e;
@@ -196,11 +155,7 @@ static uint16_t conn_entry(uint16_t nid, int longform, int i, int *is_range)
   return e & 0x7F;
 }
 
-/* Expand a widget's connection list into `out` (up to `max`) source node ids,
- * resolving HDA range entries — a set range bit means "the run from the
- * previous entry's nid + 1 up to this entry's nid" rather than a literal node.
- * The output position is the effective connection index (what input-amp routing
- * keys off). */
+/* Expand a connection list into `out`; a set range bit means previous nid + 1 up to this nid. */
 static int conn_list(uint16_t nid, uint16_t *out, int max)
 {
   uint32_t cl = get_param(nid, P_CONNLEN);
@@ -232,9 +187,7 @@ static int widget_type(uint16_t nid)
 /* Output-amp num-steps (loudest gain value) a widget supports; 0 = no amp. */
 static uint32_t out_steps(uint16_t nid) { return (get_param(nid, P_OUTAMPCAP) >> 8) & 0x7F; }
 
-/* Set a widget's output amp, both channels, to `gain` steps and mute state.
- * bit15 set-output, 13/12 left/right, bit7 mute, 6-0 gain. No-op on a widget
- * with no output amp (the SET is simply ignored). */
+/* Set a widget's output amp: bit15 set-output, 13/12 L/R, bit7 mute, 6-0 gain. */
 static void set_out_amp(uint16_t nid, uint32_t gain, bool mute)
 {
   codec_cmd(nid, V_SET_AMP | 0xB000 | (mute ? 0x80 : 0) | (gain & 0x7F));
@@ -242,8 +195,7 @@ static void set_out_amp(uint16_t nid, uint32_t gain, bool mute)
 
 static void amp_out_max(uint16_t nid) { set_out_amp(nid, out_steps(nid), false); }
 
-/* Unmute a widget's input amp at the given connection index (mixer/selector).
- */
+/* Unmute a widget's input amp at the given connection index. */
 static void amp_in_unmute(uint16_t nid, int idx)
 {
   uint32_t cap = get_param(nid, P_INAMPCAP);
@@ -251,9 +203,7 @@ static void amp_in_unmute(uint16_t nid, int idx)
   codec_cmd(nid, V_SET_AMP | 0x7000 | ((uint32_t)idx << 8) | gain);
 }
 
-/* ---- codec graph walk -------------------------------------------------- */
-/* Find an output DAC reachable from `pin`, either directly or through one
- * mixer/selector hop. Fills path_mix/mix_in_idx/pin_sel_idx/mix_is_sel. */
+/* Find an output DAC reachable from `pin`, directly or via one mixer/selector hop. */
 static bool find_dac_path(uint16_t pin)
 {
   uint16_t src[16];
@@ -290,13 +240,8 @@ static bool find_dac_path(uint16_t pin)
   return false;
 }
 
-/* Some real codecs (notably Realtek laptop parts) gate the internal speaker
- * amplifier and/or EAPD behind codec GPIO pins. QEMU's codec exposes none, so
- * this is invisible in emulation, and without a per-model quirk table there's
- * no telling which GPIO drives the amp — so assert every GPIO the codec
- * advertises as an output driven high, the common polarity for an amp/EAPD
- * enable. No-ops on a codec with no GPIOs, so it cannot regress the emulated
- * path. */
+/* Some Realtek laptop codecs gate the speaker amp/EAPD behind GPIOs; drive every advertised GPIO high (no-op in QEMU).
+ */
 static void enable_codec_gpios(uint16_t afg)
 {
   uint32_t ngpio = get_param(afg, P_GPIOCNT) & 0xFF; /* bidirectional pins */
@@ -308,11 +253,7 @@ static void enable_codec_gpios(uint16_t afg)
   codec_cmd(afg, V_SET_GPIODAT | mask); /* set them high        */
 }
 
-/* ---- output endpoint table --------------------------------------------- */
-/* The codec usually exposes several output pins (speaker, headphone, line-out).
- * Keep them all so the active one can be switched at runtime, instead of
- * collapsing to a single best pin at init. Each entry caches the full resolved
- * DAC path for its pin. */
+/* All output pins (speaker, headphone, line-out) are kept so the active one can switch at runtime. */
 #define MAX_OUTPUTS 6
 struct out_ep {
   uint16_t pin;    /* the output pin widget                          */
@@ -356,8 +297,7 @@ static const char *dev_name(int dev)
   }
 }
 
-/* Choose the single widget the volume keys/amp drive for the active path
- * (pin > DAC > mixer), so attenuation isn't multiplied across stages. */
+/* Pick the widget the volume keys drive for the active path (pin > DAC > mixer). */
 static void pick_vol_widget(void)
 {
   vol_nid = 0;
@@ -378,8 +318,7 @@ static void pick_vol_widget(void)
   }
 }
 
-/* Copy the active endpoint into the path globals and re-pick its volume widget,
- * so configure_path()/the volume keys act on the selected output. */
+/* Copy the active endpoint into the path globals and re-pick its volume widget. */
 static void apply_active_globals(void)
 {
   struct out_ep *e = &outs[cur_out];
@@ -393,10 +332,8 @@ static void apply_active_globals(void)
   pick_vol_widget();
 }
 
-/* Collect every output-capable pin that reaches a DAC into outs[], ranked
- * speaker > line-out > headphone > other. A strict pass first; only if it finds
- * nothing, a fallback pass also trusts pins whose config default mislabels a
- * wired output as "no physical connection". Returns the count. */
+/* Collect output pins that reach a DAC, ranked speaker > line-out > headphone; a fallback pass trusts mislabeled pins.
+ */
 static int collect_outputs(uint16_t w_start, int w_count)
 {
   n_outs = 0;
@@ -442,8 +379,7 @@ static int collect_outputs(uint16_t w_start, int w_count)
   return n_outs;
 }
 
-/* Walk the audio function group, collect output-capable pins, and pick the best
- * one (speaker > line-out > headphone > anything) that reaches a DAC. */
+/* Collect output pins and pick the best one that reaches a DAC. */
 static bool enumerate_codec(void)
 {
   uint32_t sub = get_param(0, P_SUBNODE); /* root's function groups   */
@@ -467,9 +403,7 @@ static bool enumerate_codec(void)
   uint16_t w_start = (uint16_t)((wsub >> 16) & 0xFF);
   int w_count = (int)(wsub & 0xFF);
 
-  /* Collect every switchable output pin (speaker/headphones/line-out/...),
-   * then make the best-ranked one active so the volume keys and the first play
-   * route correctly before anything is selected. */
+  /* Make the best-ranked pin active so volume keys and the first play route correctly. */
   if (!collect_outputs(w_start, w_count))
     return false;
   cur_out = 0;
@@ -477,7 +411,6 @@ static bool enumerate_codec(void)
   return true;
 }
 
-/* ---- bring-up ---------------------------------------------------------- */
 static bool find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
 {
   for (int b = 0; b < 256; b++)
@@ -501,11 +434,8 @@ static bool find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
 
 static bool ring_setup(void)
 {
-  /* Carve one contiguous run: CORB | RIRB | BDL | audio. pmm_alloc_contig
-   * only reserves frames (above the 16 MiB identity map), so map it into the
-   * kernel directory before touching it. Left write-back cached: x86 keeps
-   * bus-master DMA coherent with the cache, so the controller sees our writes
-   * and we get fast buffer fills. */
+  /* One contiguous run: CORB | RIRB | BDL | audio. Map it into the kernel directory first (pmm_alloc_contig is above
+   * the identity map). */
   uint32_t base = pmm_alloc_contig(0x40000);
   if (!base || paging_identity_map(base, 0x40000) != 0)
     return false;
@@ -622,12 +552,10 @@ void hda_init(void)
 
 int hda_present(void) { return present; }
 
-/* ---- path configuration + stream programming --------------------------- */
 #define FMT_48K_S16_STEREO 0x0011 /* base48k, x1, 16-bit, 2ch              */
 #define STREAM_TAG 1
 
-/* Push hda_vol/hda_muted onto the volume widget's output amp. Scales the 0..MAX
- * level onto 0..num-steps; mute drops the gain to 0 and sets the mute bit. */
+/* Push hda_vol/hda_muted onto the volume widget's amp (0..MAX scaled to num-steps; mute sets bit and gain 0). */
 static void hda_apply_volume(void)
 {
   if (!present || !vol_nid || !vol_steps)
@@ -674,9 +602,7 @@ static void configure_path(void)
     amp_out_max(path_mix);
   }
 
-  /* Disable every other output pin so playback is exclusive to the selected
-   * one — speaker and headphone often share a DAC, so leaving both pins enabled
-   * would drive both jacks at once. */
+  /* Disable other output pins: speaker and headphone often share a DAC, so both would sound. */
   for (int i = 0; i < n_outs; i++) {
     if (i == cur_out)
       continue;
@@ -684,32 +610,18 @@ static void configure_path(void)
     set_out_amp(outs[i].pin, 0, true);           /* mute its amp   */
   }
 
-  /* Active pin: power up, enable output (+ HP amp for a headphone), EAPD, amp.
-   */
+  /* Active pin: power, output enable (+ HP amp), EAPD, amp. */
   codec_cmd(pin_nid, V_SET_POWER | 0x00);
   codec_cmd(pin_nid, V_SET_PINCTL | (pin_is_hp ? 0xC0 : 0x40));
   codec_cmd(pin_nid, V_SET_EAPD | 0x02);
   amp_out_max(pin_nid);
 
-  /* Override the volume widget's amp with the current level (the keys may have
-   * moved it before this play). */
+  /* Override the volume widget's amp with the current level. */
   hda_apply_volume();
 }
 
-/* ---- streaming PCM sink (48 kHz / S16 / stereo, fed from user space) --------
- *
- * The WAV parse + resample now live in /bin/play: it streams the file
- * in small chunks, resamples to this canonical format, and pushes ready frames
- * here over the SYS_AUDIO_* syscalls. This driver is just the DMA back end —
- * a cyclic buffer the producer fills behind the play head. Pushing tiny bounded
- * chunks (rather than running the whole multi-minute playback inside one kernel
- * call) is what keeps the machine responsive while playing off slow/flaky
- * media.
- *
- * One stream at a time. The producer writes into the region the DMA has already
- * played, tracked by the link-position register (SDnLPIB); hda_stream_write
- * back-pressures (timer_sleep) until the DMA frees space, so it self-paces to
- * the 48 kHz output rate without an IRQ. */
+/* Streaming PCM sink (48 kHz/S16/stereo) fed from /bin/play; the producer fills behind the play head (SDnLPIB), paced
+ * by timer_sleep, one stream at a time. */
 #define STREAM_GUARD 256u /* bytes kept clear ahead of the play head  */
 
 static bool s_active;   /* a stream is open                         */
@@ -749,8 +661,7 @@ static void stream_program_sd(void)
   wr8(sd_off + SD_CTL + 2, (uint8_t)(STREAM_TAG << 4)); /* stream number */
 }
 
-/* Open the stream: configure the codec path and the stream descriptor, clear
- * the buffer to silence, and arm the producer. Returns 0, or -1 if no codec. */
+/* Configure the codec path and stream descriptor, silence the buffer; 0, or -1 if no codec. */
 int hda_stream_open(void)
 {
   if (!present)
@@ -766,9 +677,7 @@ int hda_stream_open(void)
   return 0;
 }
 
-/* Push `bytes` of 48 kHz/S16/stereo PCM, blocking until it is queued. Returns
- * the count consumed (== bytes), -1 if no stream is open, or -2 if Ctrl+C was
- * pressed (so /bin/play stops). Frame-aligned (4-byte) writes are assumed. */
+/* Push `bytes` of 48 kHz/S16/stereo PCM (frame-aligned), blocking; returns bytes, -1 if no stream, -2 on Ctrl+C. */
 int hda_stream_write(const void *pcm, uint32_t bytes)
 {
   if (!s_active)
@@ -782,9 +691,7 @@ int hda_stream_write(const void *pcm, uint32_t bytes)
       return -2;
 
     if (!s_started) {
-      /* Pre-roll: fill the buffer linearly; start RUN once it is full. A
-       * clip shorter than the buffer simply never starts here — close()
-       * pads it and plays it out. */
+      /* Pre-roll: fill linearly, start RUN once full; shorter clips start in close(). */
       uint32_t space = AUDIO_BYTES - s_wpos;
       uint32_t n = bytes - off;
       if (n > space)
@@ -804,10 +711,7 @@ int hda_stream_write(const void *pcm, uint32_t bytes)
 
     /* Steady state: write into the bytes the play head has already passed. */
     uint32_t rpos = rd32(sd_off + SD_LPIB);
-    /* Watchdog: a wedged/lazy controller can leave LPIB frozen (the driver
-     * doesn't program the DMA position buffer), which would spin us forever.
-     * Bail after ~4 s of no play-head progress rather than hang the producer.
-     */
+    /* Watchdog: LPIB can freeze on a wedged controller; bail after ~4 s without progress. */
     if (rpos != last_lpib) {
       last_lpib = rpos;
       stall = 0;
@@ -849,7 +753,7 @@ void hda_stream_close(void)
     return;
 
   if (!s_started) {
-    /* Clip shorter than the buffer: pad the tail with silence, play it once. */
+    /* Clip shorter than the buffer: pad with silence, play once. */
     uint32_t real = s_wpos;
     for (uint32_t i = s_wpos; i < AUDIO_BYTES; i++)
       audio[i] = 0;
@@ -857,9 +761,7 @@ void hda_stream_close(void)
     s_started = true;
     timer_sleep(real / 192 + 30); /* ~192 bytes/ms at 48 kHz/4B + tail   */
   } else {
-    /* Push a full buffer of silence behind the play head (back-pressured),
-     * which proves the DMA has consumed every real sample, then let the
-     * silence flush. */
+    /* Push a full buffer of silence to prove the DMA consumed every real sample. */
     uint32_t silence = AUDIO_BYTES;
     int guard = 0;
     while (silence > 0 && guard < 4000) {
@@ -899,10 +801,7 @@ void hda_stream_close(void)
   s_started = false;
 }
 
-/* ---- output endpoint switching (Sound settings + /sys/class/sound) ------ *
- * The codec's output pins are enumerated once at init; these expose them so the
- * Sound panel and /sys can list them and switch the active output at runtime.
- * All degrade to empty/-1/failure when no codec is present. */
+/* Output endpoint switching for the Sound panel and /sys; degrade to empty/-1 with no codec. */
 int hda_output_count(void) { return present ? n_outs : 0; }
 
 int hda_output_name(int i, char *out, int max)
@@ -924,8 +823,7 @@ int hda_output_select(int i)
   if (!present || i < 0 || i >= n_outs)
     return -1;
   cur_out = i;
-  /* Re-route a live stream immediately; otherwise just record the choice so the
-   * next play opens on the newly selected output. */
+  /* Re-route a live stream now; otherwise record the choice for the next play. */
   if (s_active)
     configure_path();
   else

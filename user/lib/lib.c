@@ -1,4 +1,4 @@
-/* lib.c: OwOS user library: syscall wrappers and small helpers. */
+/* lib.c: OwOS user library: syscall wrappers and small helpers */
 
 #include "mutex.h"
 #include "owos.h"
@@ -23,7 +23,7 @@ void exit(int code)
 {
   syscall(SYS_EXIT, code, 0, 0);
   for (;;)
-    ; /* not reached                             */
+    ; /* not reached */
 }
 
 int fork(void) { return syscall(SYS_FORK, 0, 0, 0); }
@@ -49,9 +49,7 @@ unsigned msec(void) { return (unsigned)syscall(SYS_MSEC, 0, 0, 0); }
 
 unsigned rtc_epoch(void) { return (unsigned)syscall(SYS_RTC_EPOCH, 0, 0, 0); }
 
-/* Wall-clock milliseconds since the Unix epoch, the basis for JS Date.now().
- * The RTC has 1-second resolution, so we anchor to it once and track sub-second
- * time with the monotonic ms counter (which also keeps now_ms() monotonic). */
+/* Wall-clock milliseconds since the Unix epoch, the basis for JS Date.now() */
 long long now_ms(void)
 {
   static unsigned base_epoch = 0, base_msec = 0;
@@ -80,8 +78,7 @@ int stream_end(void) { return syscall(SYS_STREAM_END, 0, 0, 0); }
 
 int net_connect(const char *host, int port, int tls) { return syscall(SYS_NET_CONNECT, (int)host, port, tls); }
 
-/* All net send/recv variants use two syscalls with a 6-word request {fd, buf, len, flags, ip|0, port};
- * non-NULL ip selects addressed form, MSG_DONTWAIT a non-blocking recv. */
+/* All net send/recv variants use two syscalls with a 6-word request {fd, buf, len, flags, ip|0 */
 int net_send(int h, const void *buf, int len)
 {
   unsigned a[6] = {(unsigned)h, (unsigned)buf, (unsigned)len, 0, 0, 0};
@@ -171,7 +168,7 @@ int win_resizable(int id, int on) { return syscall(SYS_WIN_RESIZABLE, id, on, 0)
 
 int win_cursor(int id, int shape) { return syscall(SYS_WIN_CURSOR, id, shape, 0); }
 
-/* ---- Phase 1 user-space compositor wrappers (root-only) ---- */
+/* Phase 1 user-space compositor wrappers (root-only) */
 int fb_info(struct fbinfo *out) { return syscall(SYS_FB_INFO, (int)out, 0, 0); }
 
 unsigned *fb_map(void)
@@ -204,8 +201,7 @@ int win_key_space(int id) { return syscall(SYS_WIN_KEY_SPACE, id, 0, 0); }
 
 int crash_poll(struct crash_rec *out, int max) { return syscall(SYS_CRASH_POLL, (int)out, max, 0); }
 
-/* Packed (hour<<16)|(min<<8)|sec, UTC, decoded in user space from the epoch
- * primitive rather than a dedicated syscall. */
+/* Packed (hour<<16)|(min<<8)|sec, UTC */
 unsigned now_hms(void)
 {
   unsigned s = rtc_epoch();
@@ -226,7 +222,7 @@ int statfs(const char *path, struct statfs_info *out) { return syscall(SYS_STATF
 
 int spawn(const char *path, const char *arg) { return syscall(SYS_SPAWN, (int)path, (int)arg, 0); }
 
-/* spawn_cap with a full argv; the kernel uses `path` for the image. */
+/* spawn_cap with a full argv; the kernel uses `path` for the image */
 int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
 {
   struct {
@@ -242,7 +238,7 @@ int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
   return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
 }
 
-/* Like spawn_cap, plus a stdin pipe whose write end is stored in *wfd. */
+/* Like spawn_cap, plus a stdin pipe whose write end is stored in *wfd */
 int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *wfd)
 {
   struct {
@@ -259,8 +255,7 @@ int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *
   return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
 }
 
-/* Like spawn_cap_io, plus uid/gid and cwd (uid/gid < 0 or cwd == 0 inherit).
- * Changing to another uid/gid is root-only. */
+/* Like spawn_cap_io, plus uid/gid and cwd (uid/gid < 0 or cwd == 0 inherit) */
 int spawn_cap_io_as(const char *path, char *const argv[], int argc, int uid, int gid, const char *cwd, int *rfd,
                     int *wfd)
 {
@@ -278,19 +273,19 @@ int spawn_cap_io_as(const char *path, char *const argv[], int argc, int uid, int
   return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
 }
 
-/* Non-blocking read: >0 bytes, 0 if it would block, -1 at EOF. */
+/* Non-blocking read: >0 bytes, 0 if it would block, -1 at EOF */
 int read_nb(int fd, void *buf, int len) { return syscall(SYS_READ_NB, fd, (int)buf, len); }
 
 int chdir(const char *path) { return syscall(SYS_CHDIR, (int)path, 0, 0); }
 
 int kill(int pid, int sig) { return syscall(SYS_KILL, pid, sig, 0); }
 
-/* action: 0 = shut down, 1 = reboot. Does not return on success. */
+/* action: 0 = shut down, 1 = reboot */
 int power(int action) { return syscall(SYS_POWER, action, 0, 0); }
 
 int getpid(void) { return syscall(SYS_GETPID, 0, 0, 0); }
 
-/* sigprocmask with set==NULL only queries the mask via *old. */
+/* sigprocmask with set==NULL only queries the mask via *old */
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old)
 {
   return syscall(SYS_SIGACTION, sig, (int)act, (int)old);
@@ -333,7 +328,7 @@ void msleep(unsigned ms) { syscall(SYS_SLEEP, (int)ms, 0, 0); }
 
 int thread_create(void (*fn)(void), void *stack_top) { return syscall(SYS_THREAD, (int)fn, (int)stack_top, 0); }
 
-/* Stack with an unmapped guard page below, so overflow faults. Returns the top, or 0 (caller falls back to malloc). */
+/* Stack with an unmapped guard page below, so overflow faults */
 void *thread_stack_alloc(int bytes)
 {
   int pages = (bytes + 4095) / 4096;
@@ -345,13 +340,11 @@ void thread_stack_free(void *top)
     syscall(SYS_STACK_FREE, (int)top, 0, 0);
 }
 
-/* ------------------------------------------------------- identity / hostname
- */
-/* Per-process credentials. The kernel only hands out the numeric ids; the login
- * name and home are resolved here from /etc/passwd, the Unix way. */
+/* identity / hostname */
+/* Per-process credentials */
 int getuid(void) { return syscall(SYS_GETUID, 0, 0, 0); }
 
-/* Copy the ':'-separated field #idx (0-based) of the line [s,end) into out. */
+/* Copy the ':'-separated field #idx (0-based) of the line [s,end) into out */
 static void passwd_field(const char *s, const char *end, int idx, char *out, int max)
 {
   int f = 0;
@@ -366,9 +359,7 @@ static void passwd_field(const char *s, const char *end, int idx, char *out, int
   out[i] = '\0';
 }
 
-/* Resolve the calling process's login from its uid via /etc/passwd
- * (name:pwhash:uid:gid:home). `name` and/or `home` may be NULL. Returns 1 if a
- * matching account was found, 0 otherwise. */
+/* Resolve the calling process's login from its uid via /etc/passwd (name:pwhash:uid:gid:home) */
 int user_ident(char *name, int nmax, char *home, int hmax)
 {
   static char pw[2048];
@@ -398,8 +389,7 @@ int user_ident(char *name, int nmax, char *home, int hmax)
   return 0;
 }
 
-/* The system hostname from /etc/hostname (default "owos" when unset). Returns
- * the length written. */
+/* The system hostname from /etc/hostname (default "owos" when unset) */
 int gethostname(char *buf, int max)
 {
   int n = readfile("/etc/hostname", buf, max - 1);
@@ -419,12 +409,10 @@ int gethostname(char *buf, int max)
   return n;
 }
 
-/* Persist a new system hostname to /etc/hostname. Returns 0/-1. */
+/* Persist a new system hostname to /etc/hostname */
 int sethostname(const char *name) { return writefile("/etc/hostname", name, (int)strlen(name)) < 0 ? -1 : 0; }
 
-/* POSIX uname(2). The kernel fills sysname/release/version/machine (machine is
- * its compile-time arch, the one fact a 32-bit user program can't know); we
- * add nodename from the hostname, keeping /etc/hostname the single source. */
+/* POSIX uname(2) */
 int uname(struct utsname *out)
 {
   if (syscall(SYS_UNAME, (int)out, 0, 0) != 0)
@@ -433,16 +421,14 @@ int uname(struct utsname *out)
   return 0;
 }
 
-/* ----------------------------------------------------------- IPC: local ports
- */
-/* Named local port: as_server=1 listens (then port_accept), 0 connects. */
+/* IPC: local ports */
+/* Named local port: as_server=1 listens (then port_accept), 0 connects */
 int port_open(const char *name, int as_server) { return syscall(SYS_PORT_OPEN, (int)name, as_server, 0); }
 
 int port_accept(int listen_fd) { return syscall(SYS_PORT_ACCEPT, listen_fd, 0, 0); }
 
-/* ----------------------------------------------------------- malloc / free */
-/* K&R first-fit allocator (§8.7) over SYS_SBRK, locked for threads. 8-byte block header;
- * the free list is address-ordered so free() coalesces. */
+/* malloc / free */
+/* K&R first-fit allocator (§8.7) over SYS_SBRK, locked for threads */
 
 void *sbrk(int inc) { return (void *)syscall(SYS_SBRK, inc, 0, 0); }
 
@@ -457,10 +443,9 @@ union header {
 typedef union header Header;
 
 static Header base;   /* degenerate block: starts the list */
-static Header *freep; /* roving free-list pointer          */
+static Header *freep; /* roving free-list pointer */
 
-/* Exact-size LIFO bins for small blocks (<= SBIN_MAX units): O(1) free/malloc. The
- * address-ordered coalescing list made free() O(n), which froze the browser on DOM-heavy pages. */
+/* Exact-size LIFO bins for small blocks (<= SBIN_MAX units): O(1) free/malloc */
 #define SBIN_MAX 1024u
 static Header *sbins[SBIN_MAX + 1];
 
@@ -468,13 +453,12 @@ static mutex_t heap_lock;
 #define hlock() mutex_lock(&heap_lock)
 #define hunlock() mutex_unlock(&heap_lock)
 
-/* Crash recovery only: drop the heap lock a longjmp'd-over frame may have held. */
+/* Crash recovery only: drop the heap lock a longjmp'd-over frame may have held */
 void heap_lock_reset(void) { mutex_reset(&heap_lock); }
 
 #define NALLOC 2048u /* min header-units to request at once */
 
-/* free() body without the lock (so morecore can reuse it under the held lock).
- */
+/* free() body without the lock (so morecore can reuse it under the held lock) */
 static void free_nolock(void *ap)
 {
   Header *bp = (Header *)ap - 1, *p;
@@ -485,7 +469,7 @@ static void free_nolock(void *ap)
   }
   for (p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr)
     if (p >= p->s.ptr && (bp > p || bp < p->s.ptr))
-      break;                         /* freed block at the list's edge   */
+      break;                         /* freed block at the list's edge */
   if (bp + bp->s.size == p->s.ptr) { /* coalesce with the upper neighbour */
     bp->s.size += p->s.ptr->s.size;
     bp->s.ptr = p->s.ptr->s.ptr;
@@ -501,8 +485,7 @@ static void free_nolock(void *ap)
   freep = p;
 }
 
-/* Grow the heap by at least `nu` header units via sbrk and fold it into the
- * free list. Returns the (updated) free pointer, or 0 if sbrk failed. */
+/* Grow the heap by at least `nu` header units via sbrk and fold it into the free list */
 static Header *morecore(unsigned nu)
 {
   if (nu < NALLOC)
@@ -531,16 +514,16 @@ void *malloc(unsigned nbytes)
     return (void *)(p + 1);
   }
   Header *prevp = freep;
-  if (prevp == 0) { /* first call: one empty block       */
+  if (prevp == 0) { /* first call: one empty block */
     base.s.ptr = freep = prevp = &base;
     base.s.size = 0;
   }
   for (Header *p = prevp->s.ptr;; prevp = p, p = p->s.ptr) {
-    if (p->s.size >= nunits) { /* big enough                        */
+    if (p->s.size >= nunits) { /* big enough */
       if (p->s.size == nunits) {
-        prevp->s.ptr = p->s.ptr; /* exact fit: unlink                 */
+        prevp->s.ptr = p->s.ptr; /* exact fit: unlink */
       } else {
-        p->s.size -= nunits; /* split: carve the tail             */
+        p->s.size -= nunits; /* split: carve the tail */
         p += p->s.size;
         p->s.size = nunits;
       }
@@ -548,7 +531,7 @@ void *malloc(unsigned nbytes)
       hunlock();
       return (void *)(p + 1);
     }
-    if (p == freep) { /* wrapped the list: grow the heap   */
+    if (p == freep) { /* wrapped the list: grow the heap */
       if ((p = morecore(nunits)) == 0) {
         hunlock();
         return 0;
@@ -569,7 +552,7 @@ void free(void *ptr)
 void *calloc(unsigned nmemb, unsigned size)
 {
   unsigned total = nmemb * size;
-  if (size && total / size != nmemb) /* overflow                          */
+  if (size && total / size != nmemb) /* overflow */
     return 0;
   void *p = malloc(total);
   if (p)
@@ -585,7 +568,7 @@ void *realloc(void *ptr, unsigned size)
     free(ptr);
     return 0;
   }
-  /* Old payload = (block units - 1) header-sized cells. */
+  /* Old payload = (block units - 1) header-sized cells */
   Header *h = (Header *)ptr - 1;
   unsigned oldbytes = (h->s.size - 1) * sizeof(Header);
   if (size <= oldbytes)
@@ -598,8 +581,7 @@ void *realloc(void *ptr, unsigned size)
   return np;
 }
 
-/* mem*: shared by every program (gcc lowers struct copies / array inits to
- * these at -O0) and by libs like minimp3 and the HTTP/2 HPACK tables. */
+/* mem*: shared by every program and by libs like minimp3 and the HTTP/2 HPACK tables */
 void *memcpy(void *d, const void *s, __SIZE_TYPE__ n)
 {
   int d0, d1, d2;
@@ -692,9 +674,7 @@ void strcat(char *d, const char *s)
     ;
 }
 
-/* ------------------------------------------------------------ UTF-8 codec ---
- * Decoding is tolerant: bad/truncated sequences yield U+FFFD and advance one
- * byte. Encode does not special-case surrogates or > U+10FFFF. */
+/* UTF-8 codec */
 
 int utf8_seqlen(unsigned char lead)
 {
@@ -775,11 +755,9 @@ void print_uint(unsigned v)
     write(1, &tmp[i], 1);
 }
 
-/* ----------------------------------------------------------- printf family */
+/* printf family */
 
-/* A minimal freestanding printf, shared by snprintf and printf, it writes one
- * byte at a time through `sink` so callers needn't size a buffer. Mirrors the
- * kernel's kvformat (kstring.c); see owos.h for the supported conversions. */
+/* A minimal freestanding printf, shared by snprintf and printf */
 static void emit_uint(void (*sink)(char, void *), void *ctx, unsigned v, unsigned base, int upper, int width, int zero,
                       int neg)
 {
@@ -796,7 +774,7 @@ static void emit_uint(void (*sink)(char, void *), void *ctx, unsigned v, unsigne
       sink('-', ctx);
     for (int pad = width - total; pad > 0; pad--)
       sink('0', ctx);
-  } else { /* "  -7": space padding, then sign */
+  } else { /* " -7": space padding, then sign */
     for (int pad = width - total; pad > 0; pad--)
       sink(' ', ctx);
     if (neg)
@@ -868,8 +846,7 @@ static void vfmt(void (*sink)(char, void *), void *ctx, const char *fmt, va_list
   }
 }
 
-/* snprintf sink: write into a buffer, but keep counting past the end so the
- * return value reports the would-be length (C99). */
+/* snprintf sink: write into a buffer */
 struct fmt_buf {
   char *p;
   unsigned len, cap;
@@ -900,9 +877,7 @@ int snprintf(char *buf, unsigned size, const char *fmt, ...)
   return n;
 }
 
-/* printf sink: accumulate into a buffer and write(1) in chunks, so an
- * arbitrary- length format costs a handful of syscalls instead of one per
- * character. */
+/* printf sink: accumulate into a buffer and write(1) in chunks */
 struct out_buf {
   char b[256];
   int n;
@@ -946,7 +921,7 @@ int readline(char *buf, int max)
       write(1, "\n", 1);
       break;
     }
-    if (c == '\b') { /* backspace                       */
+    if (c == '\b') { /* backspace */
       if (len > 0) {
         len--;
         write(1, "\b \b", 3);
@@ -955,16 +930,14 @@ int readline(char *buf, int max)
     }
     if (len < max - 1) {
       buf[len++] = c;
-      write(1, &c, 1); /* echo                            */
+      write(1, &c, 1); /* echo */
     }
   }
   buf[len] = '\0';
   return len;
 }
 
-/* ------------------------------------------------------- randomness ------- *
- * rng_bytes: RDRAND run directly in ring 3; without it, falls back to a
- * clock/TSC-seeded SplitMix64 (NOT cryptographic). */
+/* randomness */
 static int rng_have_rdrand(void)
 {
   static int cached = -1;
@@ -992,8 +965,7 @@ static unsigned long long rng_tsc(void)
   return ((unsigned long long)hi << 32) | lo;
 }
 
-/* getrandom(buf, len): CSPRNG bytes from the kernel entropy pool (interrupt
- * jitter, ratcheted through SHA-256). Returns bytes written, or -1. */
+/* getrandom: CSPRNG bytes from the kernel entropy pool */
 int getrandom(void *buf, int len) { return syscall(SYS_GETRANDOM, (int)buf, len, 0); }
 
 void rng_bytes(void *out, int n)
@@ -1016,9 +988,7 @@ void rng_bytes(void *out, int n)
     if (i >= n)
       return;
   }
-  /* No RDRAND, or it stalled mid-buffer: fill the rest from the kernel entropy
-   * pool. This is the CSPRNG path on hardware without RDRAND, the clock-seeded
-   * SplitMix below is not cryptographic and must never carry key material. */
+  /* No RDRAND, or it stalled mid-buffer: fill the rest from the kernel entropy pool */
   while (i < n) {
     int k = n - i < 256 ? n - i : 256;
     if (getrandom(p + i, k) != k)

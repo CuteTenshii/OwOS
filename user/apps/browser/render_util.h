@@ -1,5 +1,4 @@
-/* render_util.h - pure rendering helpers shared by main.c and the host tests.
- * The includer provides malloc/realloc/free/memcpy/memset. Integer only. */
+/* render_util.h - pure rendering helpers shared by main.c and the host tests */
 #ifndef OWOS_RENDER_UTIL_H
 #define OWOS_RENDER_UTIL_H
 
@@ -146,10 +145,7 @@ static inline long ru_floordiv(long a, long b)
   return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
 }
 
-/* One row of a linear gradient: t = 500 + trunc(dot * 1000 / lq) clamped to
- * 0..1000 with dot = (xx - bx - cx) * dx + rowdot. The division is stepped
- * incrementally, so a row costs one divide, not one per pixel (none when dx is
- * 0, since t then depends only on the row). */
+/* One row of a linear gradient */
 static inline void ru_grad_linear_row(unsigned *drow, int x0, int x1, int bx, int cx, int dx, long rowdot, long lq,
                                       const struct ru_glut *l)
 {
@@ -183,8 +179,7 @@ static inline void ru_grad_linear_row(unsigned *drow, int x0, int x1, int bx, in
   }
 }
 
-/* One row of a radial gradient. rx is measured from the centre; hw/hh are the
- * half extents, rad the circle radius (circle only). */
+/* One row of a radial gradient */
 static inline void ru_grad_radial_row(unsigned *drow, int x0, int x1, int bx, int cx, int ry, bool circle, int hw,
                                       int hh, unsigned rad, const struct ru_glut *l)
 {
@@ -240,8 +235,7 @@ static inline unsigned ru_src_x(const unsigned *xm, unsigned x, unsigned iw, uns
   return xm ? xm[x] : x * iw / dw;
 }
 
-/* Blend destination columns [lo,hi) of a dw-wide row from an RGBA byte row,
- * nearest-neighbour. xm may be NULL (columns are then divided out). */
+/* Blend destination columns [lo,hi) of a dw-wide row from an RGBA byte row, nearest-neighbour */
 static inline void ru_blit_row_rgba(unsigned *drow, const unsigned char *srow, const unsigned *xm, unsigned dw,
                                     unsigned iw, unsigned lo, unsigned hi)
 {
@@ -254,8 +248,7 @@ static inline void ru_blit_row_rgba(unsigned *drow, const unsigned char *srow, c
     drow[x] = ru_blend_rgba(srow + (unsigned long)ru_src_x(xm, x, iw, dw) * 4, drow[x]);
 }
 
-/* Same from a 0xAARRGGBB word row. `opaque` rows hold 0x00RRGGBB words that
- * replace the destination outright. */
+/* Same from a 0xAARRGGBB word row */
 static inline void ru_blit_row_words(unsigned *drow, const unsigned *srow, const unsigned *xm, unsigned dw, unsigned iw,
                                      bool opaque, unsigned lo, unsigned hi)
 {
@@ -277,8 +270,7 @@ static inline void ru_blit_row_words(unsigned *drow, const unsigned *srow, const
     drow[x] = ru_over_argb(srow[ru_src_x(xm, x, iw, dw)], drow[x]);
 }
 
-/* Nearest-neighbour resample of decoded PNG rows into a cw x ch word buffer, fed
- * one source row at a time (same mapping the direct blit used). */
+/* Nearest-neighbour resample of decoded PNG rows into a cw x ch word buffer, fed one source row */
 struct ru_scaler {
   unsigned *dst;
   const unsigned *xm;
@@ -300,8 +292,7 @@ static inline void ru_scaler_row(struct ru_scaler *s, unsigned y, const unsigned
   }
 }
 
-/* Drop the alpha byte of a finished fully-opaque buffer so rows can be copied
- * straight into the framebuffer. */
+/* Drop the alpha byte of a finished fully-opaque buffer so rows can be copied straight into */
 static inline void ru_words_strip_alpha(unsigned *px, unsigned long n)
 {
   for (unsigned long i = 0; i < n; i++)
@@ -313,7 +304,7 @@ static inline void ru_words_strip_alpha(unsigned *px, unsigned long n)
 struct ru_img {
   int uid;
   unsigned iw, ih; /* natural size */
-  unsigned cw, ch; /* size the words are stored at: natural, or the displayed size */
+  unsigned cw, ch;
   unsigned *px;
   unsigned long bytes;
   unsigned stamp;
@@ -350,8 +341,7 @@ static inline void ru_imgcache_drop(struct ru_imgcache *c, int i)
   c->e[i] = c->e[--c->n];
 }
 
-/* Take ownership of e->px on success. Evicts least recently used entries until it
- * fits; false (caller frees px) if it can never fit or memory is out. */
+/* Take ownership of e->px on success */
 static inline bool ru_imgcache_put(struct ru_imgcache *c, const struct ru_img *e)
 {
   if (e->bytes > c->budget)
@@ -395,7 +385,7 @@ static inline void ru_imgcache_clear(struct ru_imgcache *c)
 
 struct ru_gent {
   unsigned cp, px;
-  unsigned char *bm; /* coverage bitmap, NULL for an empty glyph or an advance-only entry */
+  unsigned char *bm;
   int w, h, ox, oy, adv;
   bool used;
 };
@@ -443,8 +433,7 @@ static inline void ru_gtab_slot(struct ru_gent *e, unsigned cap, const struct ru
   e[i] = *g;
 }
 
-/* Store a copy of *g (the table then owns g->bm). NULL on OOM, in which case the
- * caller still owns g->bm. The returned pointer is valid until the next put. */
+/* Store a copy of *g (the table then owns g->bm) */
 static inline struct ru_gent *ru_gtab_put(struct ru_gtab *t, const struct ru_gent *g)
 {
   unsigned long add = (unsigned long)(g->w > 0 && g->h > 0 ? g->w * g->h : 0);
@@ -488,8 +477,7 @@ static inline int ru_utf8_len(unsigned char c)
   return c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
 }
 
-/* Largest effective font px (floor body_px) and largest CSS line-height over the
- * glyphs of [off,end), in one pass. */
+/* Largest effective font px (floor body_px) and largest CSS line-height over the glyphs */
 static inline void ru_line_scan(const char *text, const unsigned char *fsz, const unsigned char *bp,
                                 const unsigned char *lh, int off, int end, int body_px, int *maxpx, int *lhmax)
 {
@@ -509,8 +497,7 @@ static inline void ru_line_scan(const char *text, const unsigned char *fsz, cons
 
 /* ---- inline image lookup by anchor offset ---- */
 
-/* Indices of imgs ordered by (text_pos, index); the first match for a position is
- * the lowest index, as a linear scan would find. */
+/* Indices of imgs ordered by (text_pos, index) */
 struct ru_imgidx {
   int *ord;
   const int *pos;
@@ -552,10 +539,7 @@ static inline int ru_imgidx_find(const struct ru_imgidx *ix, int text_pos)
 
 /* ---- paint order: z bands with vertical culling ---- */
 
-/* Boxes bucketed by z band (below flow, flow, above flow), each band in document
- * order. For a band, pmax_bot is the running max of box bottoms and smin_top the
- * running min of tops from the end, so the boxes touching a vertical range lie
- * between two binary searches. */
+/* Boxes bucketed by z band (below flow, flow, above flow), each band in document order */
 struct ru_bands {
   int *idx, *pmax_bot, *smin_top; /* all bands, concatenated */
   int start[4];
@@ -639,9 +623,7 @@ static inline void ru_bands_span(const struct ru_bands *b, int k, int vtop, int 
 
 /* ---- scroll blit plan ---- */
 
-/* Moving the pane from scroll `from` to `to` (phh rows tall): copy `rows` rows
- * from pane row `src` to `dst`, then repaint `rows_n` rows starting at pane row
- * `strip`. False when the move is too large to reuse anything. */
+/* Moving the pane from scroll `from` to `to` (phh rows tall) */
 struct ru_scroll_plan {
   int src, dst, rows, strip, strip_n;
 };
@@ -687,9 +669,7 @@ static inline bool ru_sel_edge(int la, int ca, int lb, int cb, int *lo, int *hi,
   return true;
 }
 
-/* Lines whose highlight can differ between two selections: the lines between the
- * old and new start, and between the old and new end (the lines themselves when
- * only a column moved). False when nothing changed. */
+/* Lines whose highlight can differ between two selections */
 static inline bool ru_sel_damage(const struct ru_selr *a, const struct ru_selr *b, int *lo, int *hi)
 {
   if (!a->has && !b->has)

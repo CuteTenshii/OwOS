@@ -1,23 +1,4 @@
-/* edit.c — a small line-oriented text editor for owofs.
- *
- * The console is line-buffered and cannot reposition its cursor (the keyboard
- * driver swallows the arrow keys, and there is no clear/move-cursor syscall),
- * so this is an `ed`-style editor: you operate on numbered lines through a
- * command prompt rather than moving a cursor around a full-screen canvas.
- *
- *   run edit <file>     open <file> (created on first write if absent)
- *
- * Commands at the `*` prompt:
- *   p          print the buffer with line numbers
- *   a          append: type lines, end with a single "." on its own line
- *   i N        insert before line N (same "." terminator)
- *   c N        change line N: the next line you type replaces it
- *   d N        delete line N
- *   w          write the buffer back to the file
- *   q          quit (refused if there are unsaved changes)
- *   q!         quit, discarding unsaved changes
- *   h          show this help
- */
+/* edit.c, a small line-oriented text editor for owofs */
 
 #include "owos.h"
 #include <stdbool.h>
@@ -44,7 +25,7 @@ static void copy_line(char *dst, const char *src)
   dst[i] = '\0';
 }
 
-/* Parse a 1-based line number out of a command argument; 0 if none/invalid. */
+/* Parse a 1-based line number out of a command argument; 0 if none/invalid */
 static int parse_line_no(const char *s)
 {
   int v = 0;
@@ -57,7 +38,7 @@ static int parse_line_no(const char *s)
   return v;
 }
 
-/* Split a freshly-read file into the line array, truncating to our limits. */
+/* Split a freshly-read file into the line array, truncating to our limits */
 static void load_lines(int n)
 {
   int col = 0;
@@ -80,7 +61,7 @@ static void load_lines(int n)
   }
 }
 
-/* Insert `text` so it becomes line `at` (0-based). Returns 0, or -1 if full. */
+/* Insert `text` so it becomes line `at` (0-based) */
 static int insert_at(int at, const char *text)
 {
   if (nlines >= MAX_LINES)
@@ -111,8 +92,7 @@ static void print_buffer(void)
     printf("%u  %s\n", (unsigned)(i + 1), lines[i]);
 }
 
-/* Read lines from the user, inserting each starting at `at`, until a lone
- * ".".*/
+/* Read lines from the user, inserting each starting at `at`, until a lone "." */
 static void input_mode(int at)
 {
   char buf[LINE_LEN];

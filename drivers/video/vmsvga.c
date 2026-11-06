@@ -1,12 +1,6 @@
-/* vmsvga.c — VMware SVGA II display adapter. See vmsvga.h.
- *
- * Three PCI BARs: BAR0 is an I/O register window (index/value port pair), BAR1
- * the linear framebuffer, BAR2 the command FIFO (a ring in device memory). We
- * negotiate the SVGA version, program a 32-bpp mode, then let fb.c own the
- * framebuffer exactly as if a bootloader had set it (fb_adopt). The one piece
- * SVGA needs beyond a dumb framebuffer is an explicit "this rectangle changed"
- * message per frame: fb_present calls our hook with the damage box and we push
- * an SVGA_CMD_UPDATE through the FIFO so the host re-reads those pixels. */
+/* vmsvga.c: VMware SVGA II display adapter (see vmsvga.h).
+ * BAR0 is the I/O register window, BAR1 the framebuffer, BAR2 the command FIFO. fb.c adopts the
+ * framebuffer; fb_present calls our hook, which pushes an SVGA_CMD_UPDATE for the damage box. */
 
 #include "vmsvga.h"
 #include "console.h"
@@ -21,7 +15,6 @@
 #define VMW_VENDOR 0x15AD
 #define VMW_DEV_SVGA2 0x0405
 
-/* BAR0 I/O port offsets. */
 #define SVGA_INDEX_PORT 0
 #define SVGA_VALUE_PORT 1
 
@@ -47,7 +40,7 @@ enum {
   SVGA_REG_BUSY = 22,
 };
 
-/* FIFO control words live in the first four dwords of the FIFO region. */
+/* FIFO control words occupy the first four dwords of the FIFO. */
 enum {
   SVGA_FIFO_MIN = 0,
   SVGA_FIFO_MAX = 1,
@@ -58,8 +51,7 @@ enum {
 #define SVGA_FIFO_NUM_REGS 4
 #define SVGA_CMD_UPDATE 1
 
-/* Version negotiation magic. Offer ID_2 first and step down until one reads
- * back, so we match whatever the device supports. */
+/* Version negotiation: offer ID_2 first and step down until one reads back. */
 #define SVGA_MAGIC 0x900000u
 #define SVGA_ID_2 ((SVGA_MAGIC << 8) | 2)
 #define SVGA_ID_1 ((SVGA_MAGIC << 8) | 1)
@@ -81,10 +73,7 @@ static uint32_t reg_read(uint32_t reg)
   return inl(io_base + SVGA_VALUE_PORT);
 }
 
-/* Append one dword to the FIFO ring, wrapping at MAX and stalling (via a forced
- * host sync) if it would overrun the host's read pointer. Our commands are tiny
- * and we kick the host after each, so the stall path is essentially never hit.
- */
+/* Append a dword to the FIFO ring, wrapping at MAX; stalls via a host sync if the ring is full. */
 static void fifo_write(uint32_t value)
 {
   uint32_t next = fifo[SVGA_FIFO_NEXT_CMD];
@@ -103,8 +92,7 @@ static void fifo_write(uint32_t value)
   fifo[SVGA_FIFO_NEXT_CMD] = after;
 }
 
-/* fb.c present hook: tell the host which rectangle of the framebuffer changed.
- */
+/* fb.c present hook: tell the host which framebuffer rectangle changed. */
 static void svga_present(int x, int y, int w, int h)
 {
   if (w <= 0 || h <= 0)
@@ -114,12 +102,11 @@ static void svga_present(int x, int y, int w, int h)
   fifo_write((uint32_t)y);
   fifo_write((uint32_t)w);
   fifo_write((uint32_t)h);
-  reg_write(SVGA_REG_SYNC, 1); /* nudge the host to drain the FIFO */
+  reg_write(SVGA_REG_SYNC, 1);
 }
 
 int vmsvga_init(uint32_t want_w, uint32_t want_h)
 {
-  /* Find the device and capture its three BARs. */
   uint32_t bar0 = 0, bar1 = 0, bar2 = 0;
   bool found = false;
   for (int bus = 0; bus < 256 && !found; bus++) {
@@ -130,7 +117,6 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
       bar0 = pci_read32(bus, slot, 0, 0x10);
       bar1 = pci_read32(bus, slot, 0, 0x14);
       bar2 = pci_read32(bus, slot, 0, 0x18);
-      /* Enable I/O + memory decode + bus mastering. */
       uint32_t cmd = pci_read32(bus, slot, 0, 0x04);
       pci_write32(bus, slot, 0, 0x04, cmd | 0x7);
       found = true;
@@ -138,7 +124,7 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
     }
   }
   if (!found)
-    return -1; /* not a VMware guest: stay quiet  */
+    return -1;
 
   con_write("vmsvga: SVGA II device found (15ad:0405).\n");
 
@@ -146,7 +132,6 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
   uint32_t fb_phys = bar1 & 0xFFFFFFF0u;    /* framebuffer (memory BAR)        */
   uint32_t fifo_phys = bar2 & 0xFFFFFFF0u;  /* command FIFO (memory BAR)       */
 
-  /* Negotiate the highest SVGA version the device echoes back. */
   reg_write(SVGA_REG_ID, SVGA_ID_2);
   if (reg_read(SVGA_REG_ID) != SVGA_ID_2) {
     reg_write(SVGA_REG_ID, SVGA_ID_1);
@@ -159,7 +144,6 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
     }
   }
 
-  /* Clamp the requested mode to what the adapter allows. */
   uint32_t maxw = reg_read(SVGA_REG_MAX_WIDTH);
   uint32_t maxh = reg_read(SVGA_REG_MAX_HEIGHT);
   if (maxw && want_w > maxw)
@@ -167,7 +151,6 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
   if (maxh && want_h > maxh)
     want_h = maxh;
 
-  /* Program and enable the mode, then read back the resulting pitch/offset. */
   reg_write(SVGA_REG_WIDTH, want_w);
   reg_write(SVGA_REG_HEIGHT, want_h);
   reg_write(SVGA_REG_BITS_PER_PIXEL, 32);
@@ -184,8 +167,7 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
 
   con_printf("vmsvga: mode %ux%ux32, pitch=%u fifo=%uKiB.\n", want_w, want_h, pitch, fifo_sz >> 10);
 
-  /* Map and initialise the FIFO ring. Device memory: map it uncached so our
-   * pointer writes reach the host without lingering in a cache line. */
+  /* Map the FIFO ring uncached so pointer writes reach the host. */
   if (paging_identity_map(fifo_phys, fifo_sz) < 0) {
     con_write("vmsvga: FIFO map failed.\n");
     reg_write(SVGA_REG_ENABLE, 0);
@@ -201,8 +183,7 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
   fifo[SVGA_FIFO_STOP] = SVGA_FIFO_NUM_REGS * 4;
   reg_write(SVGA_REG_CONFIG_DONE, 1);
 
-  /* Register the damage-flush hook before adopting, so fb_adopt's own initial
-   * clear-and-present is pushed to the host too. */
+  /* Register the hook before adopting so fb_adopt's initial present is pushed too. */
   fb_set_present_hook(svga_present);
 
   if (fb_adopt(fb_phys + fb_off, want_w, want_h, pitch, 32) != 0) {

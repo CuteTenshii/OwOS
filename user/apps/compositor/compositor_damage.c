@@ -31,7 +31,7 @@ void damage_add(int x, int y, int w, int h)
       break;
   }
   if (ndmg >= MAXDMG) {
-    /* Never drop damage: collapse the list to its bounding rectangle. */
+    /* Never drop damage: collapse the list to its bounding rectangle */
     int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
     for (int i = 0; i < ndmg; i++) {
       int r1 = dmg[i].x + dmg[i].w, r2 = dmg[i].y + dmg[i].h;

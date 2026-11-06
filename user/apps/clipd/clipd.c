@@ -1,25 +1,14 @@
-/* clipd.c — the clipboard server.
+/* clipd.c: the clipboard server, a windowless daemon owning the "clipboard" IPC port.
  *
- * A windowless resident daemon: it owns the "clipboard" IPC port and keeps an
- * in-RAM history of clips so the system has a real multi-item, any-type
- * clipboard instead of a single /proc text node. A clip is an opaque blob
- * tagged with a MIME type ("text/plain", "image/png", "application/pdf",
- * "video/mp4", ...), so anything — text, an image, a document, a video — can be
- * held and round-tripped byte-for-byte. Clients (editor/term/browser, and the
- * Super+V history viewer) link user/lib/clipboard.
- *
- * One request per connection (the IPC port is one-connection-at-a-time, which
- * is exactly right for short clipboard ops). Multi-byte fields are
- * little-endian; the MIME type is a length(1)-prefixed string; payloads larger
- * than the channel's ring stream in pieces, so a big blob isn't bounded by the
- * pipe size.
+ * Keeps an in-RAM history of opaque clips tagged with a MIME type. One request per connection;
+ * multi-byte fields are little-endian, MIME is a length(1)-prefixed string, large payloads
+ * stream in pieces. Clients link user/lib/clipboard.
  *
  *   'P' put    mime(1+) datalen(4) data(datalen)        -> 'K'
  *   'G' get    index(4, 0 = newest)  -> mime(1+) datalen(4) data
  *   'N' count                        -> count(4)
  *   'L' list   index(4)              -> mime(1+) datalen(4) plen(2) preview
- *   (an out-of-range get/list answers with a zero-length mime and datalen 0.)
- */
+ *   (an out-of-range get/list answers with a zero-length mime and datalen 0.) */
 #include "mime.h"
 #include "owos.h"
 #include <stdbool.h>
@@ -36,8 +25,7 @@ struct clip {
 static struct clip hist[MAX_CLIPS];
 static int nclips;
 
-/* ---- framed I/O over a channel fd (read/write may transfer partial) -------
- */
+/* ---- framed I/O over a channel fd (read/write may transfer partial) ---- */
 static bool read_full(int fd, void *buf, int n)
 {
   char *p = (char *)buf;
@@ -104,8 +92,7 @@ static bool wr_mime(int fd, const char *mime)
 }
 
 /* ---- history ------------------------------------------------------------- */
-/* Prepend a clip; evict (and free) the oldest once the ring is full. Takes
- * ownership of `data`. */
+/* Prepend a clip; evict (and free) the oldest once full. Takes ownership of `data`. */
 static void store(const char *mime, void *data, int len)
 {
   if (nclips == MAX_CLIPS) {

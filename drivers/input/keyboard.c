@@ -1,4 +1,4 @@
-/* keyboard.c — translate PS/2 scancodes (set 1, US QWERTY) and echo them. */
+/* keyboard.c: PS/2 scancode set 1 translation (US, AZERTY layouts) and key queueing. */
 
 #include "keyboard.h"
 #include "fb.h"
@@ -15,8 +15,7 @@
 #define KBD_STATUS_PORT 0x64
 #define KBD_BUF_SIZE 128 /* power of two not required; SPSC ring    */
 
-/* Scancodes we care about beyond plain keys. A key release is the make code
- * with bit 7 set. */
+/* Special scancodes; a release is the make code with bit 7 set. */
 #define SC_LSHIFT 0x2A
 #define SC_RSHIFT 0x36
 #define SC_CTRL 0x1D /* left Ctrl; right Ctrl is 0xE0 0x1D       */
@@ -35,25 +34,15 @@
 #define SC_E_DELETE 0x53
 #define SC_ALT 0x38 /* extended 0xE0 0x38 is AltGr (right Alt)  */
 
-/* Extended (0xE0-prefixed) media / "Fn" keys. Volume + mute use the standard
- * AT consumer-control make codes that multimedia keyboards (and QEMU's
- * `sendkey volumeup/volumedown/volumemute`) emit. Brightness has no universal
- * PS/2 scancode — laptops usually deliver it over ACPI/EC — so we adopt the
- * codes commonly seen on PS/2 brightness keys; they act on the framebuffer's
- * software dimmer. All are handled directly in the IRQ (like Print Screen),
- * not queued as characters. */
+/* Extended media keys: standard AT consumer codes for volume, common PS/2 codes for brightness; handled in the IRQ. */
 #define SC_E_MUTE 0x20
 #define SC_E_VOL_DOWN 0x2E
 #define SC_E_VOL_UP 0x30
 #define SC_E_BRIGHT_DN 0x6B
 #define SC_E_BRIGHT_UP 0x6C
 
-/* This laptop's keyboard delivers its volume/brightness keys as bare function-
- * key make codes (set 1), not the E0 consumer codes above -- the EC doesn't
- * translate them. So F5/F6/F8/F9 double as brightness/volume and act directly
- * in the IRQ, same handlers as the E0 cases. (No Fn distinction reaches us, so
- * these keys are media keys system-wide; F5 therefore no longer sends KEY_F5.)
- */
+/* This laptop sends volume/brightness as bare F5/F6/F8/F9 make codes, handled in the IRQ like the E0 cases (F5 sends no
+ * KEY_F5). */
 #define SC_F5 0x3F  /* brightness down                          */
 #define SC_F6 0x40  /* brightness up                            */
 #define SC_F8 0x42  /* volume down                              */
@@ -86,10 +75,7 @@ static const char keymap_shift[128] = {
     [0x33] = '<', [0x34] = '>', [0x35] = '?', [0x37] = '*',  [0x39] = ' ',
 };
 
-/* French AZERTY. Same physical scancodes, reinterpreted: the letter block is
- * permuted (a<->q, z<->w, m moved) and the number row types symbols unshifted,
- * digits when shifted. Accented keys use their CP437 byte (é=0x82, è=0x8A,
- * ç=0x87, à=0x85, ù=0x97, ²=0xFD), which the VGA text font renders directly. */
+/* French AZERTY: accents use CP437 bytes (é=0x82, è=0x8A, ç=0x87, à=0x85, ù=0x97, ²=0xFD). */
 static const char keymap_fr[128] = {
     [0x01] = 27,     [0x02] = '&', [0x03] = '\x82', [0x04] = '"',    [0x05] = '\'',   [0x06] = '(', [0x07] = '-',
     [0x08] = '\x8A', [0x09] = '_', [0x0A] = '\x87', [0x0B] = '\x85', [0x0C] = ')',    [0x0D] = '=', [0x0E] = '\b',
@@ -98,8 +84,7 @@ static const char keymap_fr[128] = {
     [0x1E] = 'q',    [0x1F] = 's', [0x20] = 'd',    [0x21] = 'f',    [0x22] = 'g',    [0x23] = 'h', [0x24] = 'j',
     [0x25] = 'k',    [0x26] = 'l', [0x27] = 'm',    [0x28] = '\x97', [0x29] = '\xFD', [0x2B] = '*', [0x2C] = 'w',
     [0x2D] = 'x',    [0x2E] = 'c', [0x2F] = 'v',    [0x30] = 'b',    [0x31] = 'n',    [0x32] = ',', [0x33] = ';',
-    [0x34] = ':',    [0x35] = '!', [0x37] = '*',    [0x39] = ' ',    [0x56] = '<', /* ISO 102nd key, left of W on AZERTY
-                                                                                    */
+    [0x34] = ':',    [0x35] = '!', [0x37] = '*',    [0x39] = ' ',    [0x56] = '<', /* ISO 102nd key */
 };
 
 /* French AZERTY with Shift held. */
@@ -114,16 +99,13 @@ static const char keymap_fr_shift[128] = {
     [0x34] = '/',  [0x35] = '\x15', [0x37] = '*', [0x39] = ' ', [0x56] = '>', /* ISO 102nd key with Shift */
 };
 
-/* French AZERTY third level (AltGr / right Alt): the number row carries the
- * programmer's punctuation. Unmapped entries are 0, so AltGr falls back to the
- * plain key. */
+/* French AZERTY third level (AltGr): programmer punctuation; unmapped entries fall back to the plain key. */
 static const char keymap_fr_altgr[128] = {
     [0x03] = '~',  [0x04] = '#', [0x05] = '{', [0x06] = '[', [0x07] = '|', [0x08] = '`',
     [0x09] = '\\', [0x0A] = '^', [0x0B] = '@', [0x0C] = ']', [0x0D] = '}',
 };
 
-/* Selectable layouts, keyed by the name `loadkeys` passes. altgr may be NULL
- * for layouts without a third level (e.g. plain US). */
+/* Selectable layouts keyed by the `loadkeys` name; altgr may be NULL. */
 struct kbd_layout {
   const char *name;
   const char *map;
@@ -136,8 +118,7 @@ static const struct kbd_layout layouts[] = {
     {"fr", keymap_fr, keymap_fr_shift, keymap_fr_altgr},
 };
 
-/* The keymaps in force; the handler indexes through these so a layout switch
- * is just a few pointer stores. Defaults to US. */
+/* Keymaps in force; a layout switch is a few pointer stores. Defaults to US. */
 static const char *active_map = keymap;
 static const char *active_shift = keymap_shift;
 static const char *active_altgr = NULL;
@@ -162,9 +143,7 @@ static bool expecting_extended;
 static bool num_lock = true; /* on by default, like most BIOSes        */
 static bool caps_lock;       /* off by default                         */
 
-/* Set the keyboard LEDs (bit2 = Caps Lock, bit1 = Num Lock). The two ACK bytes
- * (0xFA) the keyboard sends back have bit 7 set, so the IRQ handler harmlessly
- * ignores them as "releases". */
+/* Set the LEDs (bit2 Caps, bit1 Num); the two 0xFA ACKs have bit 7 set and are ignored as releases. */
 static void keyboard_set_leds(void)
 {
   uint8_t leds = (num_lock ? 0x02 : 0x00) | (caps_lock ? 0x04 : 0x00);
@@ -176,25 +155,19 @@ static void keyboard_set_leds(void)
   outb(KBD_DATA_PORT, leds);
 }
 
-/* Single-producer (IRQ) / single-consumer (main loop) ring buffer. head is
- * only written by the handler, tail only by keyboard_poll(), so byte-sized
- * indices need no locking on a single core. */
+/* Single-producer (IRQ) / single-consumer ring: head and tail have one writer each, so no locking. */
 static volatile char ring[KBD_BUF_SIZE];
 static volatile uint8_t ringmod[KBD_BUF_SIZE]; /* KMOD_* held when ring[i] was pressed */
 static volatile uint8_t ring_head;
 static volatile uint8_t ring_tail;
 
-/* Ctrl+C is a latch, not a queued key: it must interrupt a running command,
- * which is busy in a loop and never draining the ring. Consumers poll it. */
+/* Ctrl+C is a latch, not a queued key, since a busy command never drains the ring. */
 static volatile bool int_pending;
 
-/* Print Screen is a latch too: the IRQ can't capture the framebuffer, so it
- * just flags the request; SYS_INPUT_POLL drains it into a KEY_PRTSC event and
- * the compositor (which owns the framebuffer) takes the shot. */
+/* Print Screen latch: the IRQ only flags it; SYS_INPUT_POLL drains it into KEY_PRTSC for the compositor. */
 static volatile bool scrshot_pending;
 
-/* The modifier set currently held, as KMOD_* flags. Sampled when a key is
- * queued so the consumer learns which chord produced it. */
+/* Held modifiers as KMOD_* flags, sampled when a key is queued. */
 static uint8_t cur_mods(void)
 {
   uint8_t m = 0;
@@ -232,9 +205,7 @@ int keyboard_poll(char *out, unsigned char *mods)
   return 1;
 }
 
-/* Returns 1 (and clears the latch) if Ctrl+C has been pressed since the last
- * call. The idle shell loop polls this to cancel the line being typed; a
- * long-running command polls it to abort. */
+/* Returns 1 and clears the latch if Ctrl+C was pressed since the last call. */
 int keyboard_take_interrupt(void)
 {
   bool v = int_pending;
@@ -242,9 +213,7 @@ int keyboard_take_interrupt(void)
   return v;
 }
 
-/* Returns 1 (and clears the latch) if Print Screen has been pressed since the
- * last call. SYS_INPUT_POLL polls it and surfaces KEY_PRTSC to the compositor.
- */
+/* Returns 1 and clears the latch if Print Screen was pressed since the last call. */
 int keyboard_take_screenshot(void)
 {
   bool v = scrshot_pending;
@@ -252,9 +221,7 @@ int keyboard_take_screenshot(void)
   return v;
 }
 
-/* Raise the interrupt latch from outside the IRQ handler -- the serial console
- * uses this so a Ctrl+C typed in the host terminal stops a running command too.
- */
+/* Raise the interrupt latch from outside the IRQ (serial console Ctrl+C). */
 void keyboard_signal_interrupt(void) { int_pending = true; }
 
 /* The byte after a 0xE0 prefix; unmapped extended keys are swallowed. */
@@ -327,10 +294,7 @@ static void process_extended(uint8_t sc)
   case SC_E_BRIGHT_UP:
     fb_brightness_step(+1);
     break;
-  /* The navigation cluster emits the plain editing code; Shift and Alt ride
-   * along in the modifier set (cur_mods), so a consumer extends a selection
-   * on Shift+arrow or navigates on Alt+arrow itself. A bare Alt hold + arrow
-   * doesn't set alt_tabbed, so releasing Alt afterwards emits no KEY_ALT_UP. */
+  /* Navigation keys emit plain editing codes; Shift/Alt ride in cur_mods; a bare Alt+arrow sets no alt_tabbed. */
   case SC_E_UP:
     ring_push(KEY_UP);
     break;
@@ -355,8 +319,7 @@ static void process_extended(uint8_t sc)
   }
 }
 
-/* Shift/Ctrl/Alt holds, Num/Caps lock, and the Alt+Tab gesture. 1 if consumed.
- */
+/* Shift/Ctrl/Alt holds, Num/Caps lock and the Alt+Tab gesture. 1 if consumed. */
 static bool process_modifiers(uint8_t sc)
 {
   if (sc == SC_LSHIFT || sc == SC_RSHIFT) {
@@ -380,20 +343,14 @@ static bool process_modifiers(uint8_t sc)
     return true;
   }
   if (sc == (SC_ALT | SC_RELEASE)) { /* left Alt up                       */
-    /* Releasing Alt after an Alt+Tab gesture commits the WM's highlighted
-     * window; a bare Alt tap (no Tab) sends nothing. */
+    /* Releasing Alt after Alt+Tab commits the highlighted window; a bare Alt tap sends nothing. */
     if (alt_tabbed)
       ring_push(KEY_ALT_UP);
     alt_held = false;
     alt_tabbed = false;
     return true;
   }
-  /* Alt+Tab: emit a plain Tab carrying the Alt (and any Shift) modifier and let
-   * the WM decide it's a window switch — window-switching policy lives in the
-   * WM, not here. alt_tabbed records that this Alt hold drove the switcher, so
-   * its release commits the selection (KEY_ALT_UP). Tab is scancode 0x0F;
-   * matching only the make code lets the release fall through to the generic
-   * filter. */
+  /* Alt+Tab: emit Tab with the Alt modifier for the WM; alt_tabbed makes the Alt release send KEY_ALT_UP. */
   if (alt_held && sc == 0x0F) { /* Tab make                                */
     ring_push(KEY_TAB);
     alt_tabbed = true;
@@ -449,25 +406,18 @@ static bool process_keypad(uint8_t sc)
   return false;
 }
 
-/* Super+ and Ctrl+ chords: forward the base key carrying its modifier
- * (cur_mods) and let the consumer map the chord. The driver names no chord — it
- * doesn't know "cliphist" or "save"; it just delivers key + KMOD_*. 1 if
- * consumed. */
+/* Super+ and Ctrl+ chords: forward the key with its KMOD_* for the consumer to map. 1 if consumed. */
 static bool process_chords(uint8_t sc)
 {
   if (super_held && active_map[sc]) {
-    /* Any Super+<key>: forward the key with KMOD_SUPER; the compositor decides
-     * what it means (Super+V opens clipboard history, etc.). Mark super chorded
-     * so releasing Super doesn't also toggle the Start menu. */
+    /* Super+<key> forwards with KMOD_SUPER; super_chorded stops the release toggling the Start menu. */
     super_chorded = true;
     ring_push(active_map[sc]);
     return true;
   }
   if (ctrl_held) {
     char m = active_map[sc]; /* the unshifted key, layout-aware */
-    /* Ctrl+C stays a kernel concern — it's a latch (not a chord code) so it can
-     * interrupt a busy kernel loop that never drains the ring. Everything else
-     * is the letter + KMOD_CTRL for the consumer to interpret. */
+    /* Ctrl+C is a latch so it can interrupt a busy kernel loop; other Ctrl+key is forwarded. */
     if (m == 'c')
       int_pending = true;
     else if (m)
@@ -477,8 +427,7 @@ static bool process_chords(uint8_t sc)
   return false;
 }
 
-/* Make code -> char via the active layout; AltGr = third level, Caps Lock
- * inverts Shift for letters. */
+/* Make code -> char via the active layout; AltGr = third level, Caps Lock inverts Shift for letters. */
 static void emit_char(uint8_t sc)
 {
   char c = 0;
@@ -557,16 +506,8 @@ int keyboard_set_layout(const char *name)
 
 const char *keyboard_layout_name(void) { return active_layout; }
 
-/* --- i8042 controller bring-up -------------------------------------------- *
- * QEMU's SeaBIOS leaves the i8042 with the keyboard port enabled and the
- * keyboard-interrupt bit already set, so historically keyboard_init could get
- * away with just unmasking IRQ1. Real hardware (and UEFI firmware especially)
- * does NOT: the keyboard port and its IRQ are often left disabled, and any
- * scancode sitting unread in the output buffer blocks further IRQs. So we must
- * configure the controller ourselves here, independent of the mouse/WM path
- * (mouse_init used to be the only place this happened, but it only runs once
- * the framebuffer/window manager comes up — leaving the keyboard dead on any
- * machine where the framebuffer fails). */
+/* i8042 bring-up: real hardware and UEFI often leave the keyboard port and IRQ disabled, so configure the controller
+ * here. */
 
 #define KBD_STAT_OUTPUT_FULL 0x01 /* a byte is waiting in 0x60            */
 #define KBD_STAT_INPUT_FULL 0x02  /* controller busy; don't write 0x60/64 */
@@ -587,8 +528,7 @@ static void kbd_wait_read(void)
 
 static void keyboard_controller_init(void)
 {
-  /* Drain anything stale in the output buffer; a leftover byte (a scancode
-   * the firmware never read) latches the i8042 and stops it raising IRQ1. */
+  /* Drain stale output; a leftover byte latches the i8042 and stops IRQ1. */
   for (int i = 0; i < 16 && (inb(KBD_STATUS_PORT) & KBD_STAT_OUTPUT_FULL); i++)
     (void)inb(KBD_DATA_PORT);
 
@@ -596,10 +536,7 @@ static void keyboard_controller_init(void)
   kbd_wait_write();
   outb(KBD_STATUS_PORT, 0xAE);
 
-  /* Read the controller config byte, force the keyboard interrupt on (bit0)
-   * and the keyboard clock on (clear bit4), and preserve bit6 (scancode-set-1
-   * translation) so the keymaps above keep seeing set-1 codes. We OR/AND
-   * explicit bits rather than trusting the read wholesale. */
+  /* Force keyboard IRQ (bit0) and clock (clear bit4) on; keep bit6 so keymaps see set-1 codes. */
   kbd_wait_write();
   outb(KBD_STATUS_PORT, 0x20); /* "read config byte"                      */
   kbd_wait_read();
@@ -611,9 +548,7 @@ static void keyboard_controller_init(void)
   kbd_wait_write();
   outb(KBD_DATA_PORT, cfg);
 
-  /* Tell the keyboard device itself to (re-)enable scanning. The 0xFA ACK it
-   * sends back has bit7 set, so the IRQ handler treats it as a harmless
-   * "release" if it lands after we unmask. */
+  /* Re-enable scanning; the 0xFA ACK has bit7 set and is ignored as a release. */
   kbd_wait_write();
   outb(KBD_DATA_PORT, 0xF4); /* "enable scanning"                       */
   kbd_wait_read();

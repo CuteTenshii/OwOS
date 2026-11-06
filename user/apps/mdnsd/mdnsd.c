@@ -1,20 +1,5 @@
-/* mdnsd.c — the mDNS (RFC 6762) responder / DNS-SD (RFC 6763) advertiser, in
- * user space. Autostarted detached at boot.
- *
- * Ported verbatim from the former in-kernel kernel/services/svc_mdnsd.c: the
- * responder is a pure byte-stream server over UDP/5353 plus a couple of reads
- * from procfs/sysfs, so it needs no ring-0 privilege and lives here as a
- * windowless /bin daemon. It answers for our own "<hostname>.local" A record
- * and for the DNS-SD services listed in /etc/mdns.conf, one "type port
- * [txt...]" per line. A reply is multicast to 224.0.0.251:5353 by default, or
- * unicast when the querier asks for it (legacy source port != 5353, or the QU
- * "unicast response" bit). It also periodically announces its records so
- * passive browsers see us without asking, and sends goodbyes (TTL 0) on exit.
- *
- * This is a transport swap, not a protocol rewrite: the wire logic (query
- * parse, answer build, knowledge amplification) is the kernel responder's,
- * unchanged.
- */
+/* mdnsd.c, the mDNS (RFC 6762) responder / DNS-SD (RFC 6763) advertiser, in user space.
+ * Autostarted detached at boot */
 
 #include "owos.h"
 #include <stdbool.h>
@@ -22,36 +7,30 @@
 
 enum { MDNS_A = 1, MDNS_PTR = 12, MDNS_TXT = 16, MDNS_SRV = 33, MDNS_ANY = 255 };
 
-#define MDNS_NAME 96         /* longest owner/target name we store (dotted)     */
-#define MDNS_TXTMAX 192      /* longest TXT rdata (length-prefixed strings)     */
-#define MDNS_MAXREC 32       /* records in the published set                    */
-#define MDNS_TTL_UNIQUE 120  /* A/SRV/TXT: host-owned, short-lived              */
-#define MDNS_TTL_SHARED 4500 /* PTR: shared, long-lived (RFC 6762 §10)          */
+#define MDNS_NAME 96         /* longest owner/target name we store (dotted) */
+#define MDNS_TXTMAX 192      /* longest TXT rdata (length-prefixed strings) */
+#define MDNS_MAXREC 32       /* records in the published set */
+#define MDNS_TTL_UNIQUE 120  /* A/SRV/TXT: host-owned, short-lived */
+#define MDNS_TTL_SHARED 4500 /* PTR: shared, long-lived (RFC 6762 §10) */
 #define MDNS_PORT 5353
 
 static const unsigned char mdns_group[4] = {224, 0, 0, 251};
 
-/* One published resource record. `type` selects which rdata fields are live:
- *   A    -> rdata is the current host IP (passed to the builder)
- *   PTR  -> rdata is the name in `rname`
- *   SRV  -> rdata is prio/weight 0, `port`, target `rname`
- *   TXT  -> rdata is the `txt`/`txtlen` bytes verbatim */
+/* One published resource record */
 struct mdns_record {
-  char name[MDNS_NAME]; /* owner name (dotted, no trailing dot)        */
+  char name[MDNS_NAME]; /* owner name (dotted, no trailing dot) */
   uint16_t type;
-  uint16_t port;            /* SRV                                         */
-  char rname[MDNS_NAME];    /* PTR/SRV target (dotted)                     */
-  uint8_t txt[MDNS_TXTMAX]; /* TXT rdata                                   */
+  uint16_t port;            /* SRV */
+  char rname[MDNS_NAME];    /* PTR/SRV target (dotted) */
+  uint8_t txt[MDNS_TXTMAX]; /* TXT rdata */
   uint16_t txtlen;
 };
 
-/* ------------------------------------------------------------ pure wire logic
- */
+/* pure wire logic */
 
 static unsigned be16(const unsigned char *p) { return ((unsigned)p[0] << 8) | p[1]; }
 
-/* Case-insensitive name compare, tolerating one optional trailing dot on either
- * side (our stored names carry none; a query name may). */
+/* Case-insensitive name compare, tolerating one optional trailing dot on either side */
 static bool name_eq(const char *a, const char *b)
 {
   for (;;) {
@@ -65,8 +44,7 @@ static bool name_eq(const char *a, const char *b)
   }
 }
 
-/* In-stream length of a name at msg[pos]: labels until a 0 byte (+1) or a
- * compression pointer (+2, which ends the name in-stream). 0 on malformed. */
+/* In-stream length of a name at msg[pos]: labels until a 0 byte or a compression pointer */
 static int name_ilen(const unsigned char *msg, int pos, int end)
 {
   int p = pos;
@@ -81,8 +59,7 @@ static int name_ilen(const unsigned char *msg, int pos, int end)
   return 0;
 }
 
-/* Decode a (possibly compressed) name at msg[pos] into out (dotted, no trailing
- * dot). Follows compression pointers, bounded against loops. */
+/* Decode a (possibly compressed) name at msg[pos] into out (dotted, no trailing dot) */
 static void name_decode(const unsigned char *msg, int end, int pos, char *out, int outsz)
 {
   int oi = 0, jumps = 0, p = pos;
@@ -108,8 +85,7 @@ static void name_decode(const unsigned char *msg, int end, int pos, char *out, i
   out[oi] = '\0';
 }
 
-/* Encode dotted `name` as DNS labels into out[*o..cap]. Returns 0, or -1 if it
- * would overflow or a label exceeds 63 bytes. */
+/* Encode dotted `name` as DNS labels into out[*o..cap] */
 static int put_name(unsigned char *out, int *o, int cap, const char *name)
 {
   for (const char *s = name; *s;) {
@@ -142,9 +118,7 @@ static int put_u16(unsigned char *out, int *o, int cap, unsigned v)
 
 static bool ip_zero(const unsigned char ip[4]) { return !(ip[0] | ip[1] | ip[2] | ip[3]); }
 
-/* Encode one record (owner + type/class/ttl + rdata) at out[*o]. `ttl_override`
- * < 0 uses the per-type default; 0 (goodbye) or any value overrides it. Returns
- * 0, or -1 on overflow / an unrepresentable A record (no host IP). */
+/* Encode one record (owner + type/class/ttl + rdata) at out[*o] */
 static int put_record(unsigned char *out, int *o, int cap, const struct mdns_record *r, const unsigned char myip[4],
                       long ttl_override)
 {
@@ -154,8 +128,7 @@ static int put_record(unsigned char *out, int *o, int cap, const struct mdns_rec
     return -1;
   if (put_u16(out, o, cap, r->type) < 0)
     return -1;
-  /* Class IN; A/SRV/TXT are host-unique so set the cache-flush bit (0x8000).
-   * PTR is shared (many hosts publish the same service type) — plain IN. */
+  /* Class IN; A/SRV/TXT are host-unique so set the cache-flush bit (0x8000) */
   if (put_u16(out, o, cap, r->type == MDNS_PTR ? 0x0001 : 0x8001) < 0)
     return -1;
   unsigned ttl =
@@ -184,7 +157,7 @@ static int put_record(unsigned char *out, int *o, int cap, const struct mdns_rec
     if (put_u16(out, o, cap, 0) < 0)
       return -1; /* priority */
     if (put_u16(out, o, cap, 0) < 0)
-      return -1; /* weight   */
+      return -1; /* weight */
     if (put_u16(out, o, cap, r->port) < 0)
       return -1;
     if (put_name(out, o, cap, r->rname) < 0)
@@ -219,10 +192,7 @@ static bool idx_in(const int *arr, int n, int v)
   return false;
 }
 
-/* Build a response to the query datagram `q`/`qlen` against `recs`, using
- * `myip` for A records. Writes the response into out[..outcap] and returns its
- * length, or 0 if we own no matching record (nothing to send). Sets
- * *want_unicast when any question requested a unicast reply (QU bit). Pure. */
+/* Build a response to the query datagram `q`/`qlen` against `recs`, using `myip` for A records */
 static int mdns_build_response(const unsigned char *q, int qlen, const struct mdns_record *recs, int nrec,
                                const unsigned char myip[4], unsigned char *out, int outcap, int *want_unicast)
 {
@@ -233,8 +203,8 @@ static int mdns_build_response(const unsigned char *q, int qlen, const struct md
     return 0; /* QR=1: a response, not a query */
   int qd = (int)be16(q + 4);
 
-  int ans[MDNS_MAXREC * 2], nans = 0; /* answer-section record indices  */
-  int add[MDNS_MAXREC * 2], nadd = 0; /* additional-section indices     */
+  int ans[MDNS_MAXREC * 2], nans = 0; /* answer-section record indices */
+  int add[MDNS_MAXREC * 2], nadd = 0; /* additional-section indices */
 
   int pos = 12;
   for (int qi = 0; qi < qd && pos < qlen; qi++) {
@@ -263,9 +233,7 @@ static int mdns_build_response(const unsigned char *q, int qlen, const struct md
   if (nans == 0)
     return 0;
 
-  /* Knowledge amplification (RFC 6763 §12): a PTR answer drags in the target's
-   * SRV/TXT, and an SRV drags in the host A — so one browse round-trip
-   * suffices. */
+  /* Knowledge amplification (RFC 6763 §12): a PTR answer drags in the target's SRV/TXT */
   int base = nans;
   for (int k = 0; k < base; k++) {
     if (recs[ans[k]].type != MDNS_PTR)
@@ -293,16 +261,16 @@ static int mdns_build_response(const unsigned char *q, int qlen, const struct md
   if (outcap < 12)
     return 0;
   out[o++] = 0;
-  out[o++] = 0; /* id 0 (mDNS convention)      */
+  out[o++] = 0; /* id 0 (mDNS convention) */
   out[o++] = 0x84;
-  out[o++] = 0x00; /* flags: QR=1, AA=1           */
+  out[o++] = 0x00; /* flags: QR=1, AA=1 */
   out[o++] = 0;
-  out[o++] = 0; /* QDCOUNT 0 (responses omit)  */
+  out[o++] = 0; /* QDCOUNT 0 (responses omit) */
   int an_at = o;
   out[o++] = 0;
   out[o++] = 0;
   out[o++] = 0;
-  out[o++] = 0; /* NSCOUNT 0                   */
+  out[o++] = 0; /* NSCOUNT 0 */
   int ar_at = o;
   out[o++] = 0;
   out[o++] = 0;
@@ -325,17 +293,15 @@ static int mdns_build_response(const unsigned char *q, int qlen, const struct md
   return o;
 }
 
-/* --------------------------------------------------------------- record table
- */
+/* record table */
 
 static struct mdns_record g_rec[MDNS_MAXREC];
 static int g_nrec;
-static char g_host[MDNS_NAME]; /* "<hostname>.local"                  */
+static char g_host[MDNS_NAME]; /* "<hostname>.local" */
 
 static int rec_add(const struct mdns_record *r)
 {
-  /* Dedupe: identical type+name+target already published (e.g. the shared
-   * enumeration PTR when several services register). */
+  /* Dedupe: identical type+name+target already published */
   for (int i = 0; i < g_nrec; i++)
     if (g_rec[i].type == r->type && name_eq(g_rec[i].name, r->name) && name_eq(g_rec[i].rname, r->rname))
       return 0;
@@ -345,7 +311,7 @@ static int rec_add(const struct mdns_record *r)
   return 0;
 }
 
-/* dst = "<a>.<b>" into out (bounded). */
+/* dst = "<a>.<b>" into out (bounded) */
 static void name_join(char *out, int cap, const char *a, const char *b)
 {
   int o = 0;
@@ -367,10 +333,7 @@ static void str_copy(char *dst, int cap, const char *src)
   dst[i] = '\0';
 }
 
-/* Advertise a DNS-SD service (its PTR/SRV/TXT + the "_services._dns-sd._udp"
- * enumeration entry). `type` is the full service type incl. transport + domain,
- * e.g. "_ssh._tcp.local"; `instance` a single dotless label (e.g. our host);
- * `txt`/`ntxt` optional "key=value" strings. Ported from mdnsd_advertise. */
+/* Advertise a DNS-SD service (its PTR/SRV/TXT + the "_services._dns-sd._udp" enumeration entry) */
 static int advertise(const char *instance, const char *type, uint16_t port, const char *const *txt, int ntxt)
 {
   char fqdn[MDNS_NAME];
@@ -395,8 +358,7 @@ static int advertise(const char *instance, const char *type, uint16_t port, cons
       rtxt.txt[rtxt.txtlen++] = (uint8_t)txt[i][j];
   }
 
-  /* Service-type enumeration, so `dns-sd -B` / browsers find the type itself.
-   */
+  /* Service-type enumeration, so `dns-sd -B` / browsers find the type itself */
   struct mdns_record enu = {.type = MDNS_PTR};
   str_copy(enu.name, sizeof enu.name, "_services._dns-sd._udp.local");
   str_copy(enu.rname, sizeof enu.rname, type);
@@ -406,12 +368,9 @@ static int advertise(const char *instance, const char *type, uint16_t port, cons
   return 0;
 }
 
-/* ------------------------------------------------------------- config parsing
- */
+/* config parsing */
 
-/* Parse /etc/mdns.conf: one "service_type port [txt...]" per line, '#' comment.
- * e.g. "_ssh._tcp 22" -> advertise("<host>", "_ssh._tcp.local", 22, ...). Keeps
- * the format general so any daemon/user advertises by adding a line. */
+/* Parse /etc/mdns.conf: one "service_type port [txt...]" per line, '#' comment */
 static void load_conf(const char *hostlabel)
 {
   static char buf[2048];
@@ -431,7 +390,7 @@ static void load_conf(const char *hostlabel)
       i++;
     line[ll] = '\0';
 
-    /* split on whitespace; up to 6 fields (type, port, 4 txt). */
+    /* split on whitespace; up to 6 fields (type, port, 4 txt) */
     char *tok[6];
     int nt = 0;
     int j = 0;
@@ -453,8 +412,7 @@ static void load_conf(const char *hostlabel)
     if (port <= 0 || port > 65535)
       continue;
 
-    /* the conf carries the transport-qualified type without ".local"; the
-     * mDNS domain is implicit — append it. */
+    /* the conf carries the transport-qualified type without ".local" */
     char type[MDNS_NAME];
     name_join(type, sizeof type, tok[0], "local");
 
@@ -466,11 +424,9 @@ static void load_conf(const char *hostlabel)
   }
 }
 
-/* ------------------------------------------------------------- IP + send glue
- */
+/* IP + send glue */
 
-/* Read our current IPv4 from sysfs (reflects the dhcpcd lease). 0.0.0.0 until a
- * lease lands; re-read each loop so A records track it. */
+/* Read our current IPv4 from sysfs (reflects the dhcpcd lease) */
 static void read_ip(unsigned char ip[4])
 {
   char b[32];
@@ -495,8 +451,7 @@ static void read_ip(unsigned char ip[4])
   }
 }
 
-/* Send `recs`[list] as an unsolicited response to the mDNS group (announcement
- * when ttl_override<0, goodbye when 0). No question section. */
+/* Send `recs`[list] as an unsolicited response to the mDNS group */
 static void announce(int fd, const unsigned char myip[4], const int *list, int n, long ttl_override)
 {
   unsigned char out[1400];
@@ -534,13 +489,11 @@ static void announce_all(int fd, const unsigned char myip[4], long ttl_override)
   announce(fd, myip, list, n, ttl_override);
 }
 
-/* ----------------------------------------------------------------- main loop
- */
+/* main loop */
 
 int main(void)
 {
-  /* Publish our "<hostname>.local" A record up front, then load the DNS-SD
-   * services from /etc/mdns.conf (each SRV targets g_host). */
+  /* Publish our "<hostname>.local" A record up front */
   char host[64];
   int hn = readfile("/etc/hostname", host, (int)sizeof host - 1);
   if (hn <= 0) {
@@ -586,8 +539,7 @@ int main(void)
 
     read_ip(myip); /* track the dhcpcd lease */
 
-    /* Announce once shortly after an address is held, then re-announce
-     * ~every 60 s so browsers that missed the burst still learn us. */
+    /* Announce once shortly after an address is held */
     if (!ip_zero(myip)) {
       unsigned now = msec();
       if (!announced_once || now - last_announce >= 60000) {
@@ -606,9 +558,6 @@ int main(void)
     if (rn <= 0)
       continue;
 
-    /* Legacy unicast querier (source port != 5353) or an explicit QU request
-     * gets a unicast reply; everyone else a multicast one (RFC 6762 §5.4,
-     * §6.7). */
     if (sport != MDNS_PORT)
       net_sendto(fd, src, sport, out, rn);
     else if (qu)

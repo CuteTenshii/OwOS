@@ -1,12 +1,6 @@
-/* entropy.c — see entropy.h.
- *
- * The pool is stirred from interrupt context with the CPU timestamp counter,
- * whose low bits carry genuine jitter from interrupt-delivery latency. By the
- * time any user program opens a TLS connection, thousands of timer ticks and
- * every received packet have stirred it, so extraction yields unpredictable
- * bytes even on a CPU without RDRAND. Extraction hashes the whole pool with a
- * per-call counter and a fresh TSC, then folds the digest back in.
- */
+/* entropy.c: see entropy.h.
+ * The pool is stirred from interrupts with the TSC (low bits carry interrupt-latency jitter);
+ * extraction hashes the pool with a counter and fresh TSC, then folds the digest back in. */
 
 #include "entropy.h"
 #include "cpu.h"
@@ -21,15 +15,11 @@ static inline uint64_t rdtsc(void)
   return ((uint64_t)d << 32) | a;
 }
 
-/* 64 bytes of accumulated state, stirred in place. A torn read by a concurrent
- * extract only adds uncertainty, never corrupts, so the stir path takes no
- * lock. */
+/* 64 bytes of state stirred in place; a torn read only adds uncertainty, so no lock. */
 static volatile uint32_t pool[16];
 static volatile uint32_t widx;
 
-/* True if `feat` appears as a whole space-separated token in a cpu_features()
- * list — so RDRAND detection reuses cpu.c's CPUID decoding rather than redoing
- * it. */
+/* True if feat is a whole space-separated token in a cpu_features() list. */
 static bool feature_listed(const char *list, const char *feat)
 {
   uint32_t fl = strlen(feat);
@@ -50,8 +40,7 @@ static bool feature_listed(const char *list, const char *feat)
   return false;
 }
 
-/* RDRAND with a bounded retry (CF=0 means "not ready"); 0 if it never succeeds.
- */
+/* RDRAND with bounded retry (CF=0 means not ready); 0 if it never succeeds. */
 static bool rdrand32(uint32_t *out)
 {
   for (int i = 0; i < 16; i++) {
@@ -68,17 +57,12 @@ static bool rdrand32(uint32_t *out)
 
 void entropy_init(void)
 {
-  /* Reuse cpu.c's feature decoding: only touch RDRAND if CPUID reports it, or
-   * the opcode #UDs on older CPUs. (RDSEED isn't in cpu.c's decoded set, and we
-   * can't probe it here without duplicating CPUID, so the seed uses RDRAND
-   * only.) */
+  /* Only touch RDRAND if CPUID reports it (the opcode #UDs on older CPUs); RDSEED is not decoded. */
   char feats[256];
   cpu_features(feats, sizeof feats);
   int have_rdrand = feature_listed(feats, "rdrand");
 
-  /* Mix a batch of samples so the pool isn't all-zero before the first tick or
-   * packet has stirred it. RDRAND is the real seed when present; back-to-back
-   * TSC reads are the always-available (weaker) fallback. */
+  /* Mix samples so the pool is non-zero before the first tick: RDRAND if present, else TSC reads. */
   for (int i = 0; i < 64; i++) {
     uint32_t s = (uint32_t)rdtsc();
     if (have_rdrand) {
@@ -116,7 +100,7 @@ void entropy_get(void *out, uint32_t n)
     sha256_update(&s, &c, sizeof c);
     sha256_update(&s, &t, sizeof t);
     sha256_final(&s, d);
-    for (int i = 0; i < 8; i++) /* fold output back into the pool */
+    for (int i = 0; i < 8; i++)
       pool[i] ^= ((const uint32_t *)d)[i];
     irq_restore(f);
 

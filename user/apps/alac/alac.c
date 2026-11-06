@@ -1,16 +1,11 @@
-/* alac.c — Apple Lossless command-line tool.
+/* alac.c: Apple Lossless command-line tool.
  *
  *   alac info   <file.caf>            print stream parameters
  *   alac encode <in.wav>  <out.caf>   WAV (PCM) -> Apple Lossless in a CAF file
  *   alac decode <in.caf>  <out.wav>   Apple Lossless -> WAV (PCM)
  *   alac verify <in.wav>              encode -> decode and confirm bit-exact
  *
- * The codec lives in user/lib/alac; this front end adds the containers: a WAV
- * (RIFF/PCM) reader/writer and a minimal CAF (Core Audio Format) reader/writer,
- * the canonical raw-ALAC container. PCM is streamed a packet at a time through
- * readfile_at / stream_write so a long song never sits in memory whole; only
- * the (smaller) compressed stream and its packet-size table are buffered.
- */
+ * Codec in user/lib/alac; this adds WAV and CAF readers/writers. PCM streams a packet at a time. */
 #include "alac.h"
 #include "owos.h"
 #include <stdbool.h>
@@ -40,8 +35,7 @@ static unsigned long long get_be64(const uint8_t *p)
   return ((unsigned long long)get_be32(p) << 32) | get_be32(p + 4);
 }
 
-/* IEEE-754 double <-> big-endian 8 bytes (CAF stores mSampleRate as Float64).
- */
+/* IEEE-754 double <-> big-endian 8 bytes (CAF stores mSampleRate as Float64). */
 static void put_bef64(uint8_t *p, double d)
 {
   union {
@@ -68,8 +62,7 @@ static bool tag4(const uint8_t *p, const char *s)
 
 static uint8_t fmt_flag(int bits) { return bits == 16 ? 1 : bits == 20 ? 2 : bits == 24 ? 3 : 4; }
 
-/* CAF packet-table variable-length integer: base-128, big-endian, 0x80 = more.
- */
+/* CAF packet-table varint: base-128, big-endian, 0x80 = more. */
 static int caf_varint_put(uint8_t *out, unsigned v)
 {
   uint8_t tmp[5];
@@ -101,8 +94,7 @@ static unsigned caf_varint_get(const uint8_t *p, const uint8_t *end, int *used)
   return v;
 }
 
-/* ---- WAV (RIFF/PCM) -------------------------------------------------------
- */
+/* ---- WAV (RIFF/PCM) ---- */
 struct wav {
   unsigned channels, rate, bits, data_off, data_len;
 };
@@ -178,8 +170,7 @@ static void wav_header(uint8_t h[44], unsigned channels, unsigned rate, unsigned
   h[7] = riff >> 24;
 }
 
-/* ---- CAF parse ------------------------------------------------------------
- */
+/* ---- CAF parse ---- */
 struct caf {
   alac_config cfg;
   unsigned data_off; /* file offset of the first packet byte        */
@@ -188,8 +179,7 @@ struct caf {
   unsigned *pkt_size; /* per-packet byte sizes (malloc'd)             */
 };
 
-/* Read a whole file region into a fresh buffer (used for the small CAF chunks).
- */
+/* Read a whole file region into a fresh buffer (used for the small CAF chunks). */
 static uint8_t *read_range(const char *path, unsigned off, unsigned len)
 {
   uint8_t *b = malloc(len ? len : 1);
@@ -232,9 +222,7 @@ static int caf_parse(const char *path, struct caf *c)
       return -1;
     sz = get_be64(ch + 4);
     body = pos + 12;
-    /* Reject a 64-bit size that truncates to unsigned or runs past EOF; the
-       read_range/end math below is all 32-bit. -1 is the data-to-EOF sentinel.
-     */
+    /* Reject a 64-bit size that truncates to unsigned or runs past EOF; -1 is the data-to-EOF sentinel. */
     if (sz != (unsigned long long)-1 && (sz > 0xFFFFFFFFu || (unsigned long long)body + sz > st.size))
       return -1;
     if (tag4(ch, "desc")) {
@@ -268,8 +256,7 @@ static int caf_parse(const char *path, struct caf *c)
       } /* header: 2x be64 + 2x be32 */
       c->num_packets = (unsigned)get_be64(pk + 0);
       c->valid_frames = get_be64(pk + 8);
-      /* Cap the count: the table starts at pk+24 and each varint is >=1 byte,
-         so it can't exceed sz-24; also guard the malloc against 32-bit wrap. */
+      /* Cap the count (table starts at pk+24, varints >=1 byte) and guard the malloc against 32-bit wrap. */
       if (c->num_packets > 0xFFFFFFFFu / sizeof(unsigned) || c->num_packets > (unsigned)(sz - 24)) {
         free(pk);
         return -1;
@@ -314,8 +301,7 @@ static int caf_parse(const char *path, struct caf *c)
   return 0;
 }
 
-/* ---- info -----------------------------------------------------------------
- */
+/* ---- info ---- */
 static int cmd_info(const char *path)
 {
   struct caf c;
@@ -348,8 +334,7 @@ static int cmd_info(const char *path)
   return 0;
 }
 
-/* ---- encode: WAV -> CAF ---------------------------------------------------
- */
+/* ---- encode: WAV -> CAF ---- */
 /* A growing byte buffer for the compressed packet stream. */
 struct growbuf {
   uint8_t *buf;
@@ -506,8 +491,7 @@ done:
   return rc;
 }
 
-/* ---- decode: CAF -> WAV ---------------------------------------------------
- */
+/* ---- decode: CAF -> WAV ---- */
 static int cmd_decode(const char *in, const char *out)
 {
   struct caf c;
@@ -587,8 +571,7 @@ done:
   return rc;
 }
 
-/* ---- verify: encode -> decode, bit-exact, no files written ----------------
- */
+/* ---- verify: encode -> decode, bit-exact, no files written ---- */
 static int cmd_verify(const char *in)
 {
   struct wav w;

@@ -1,15 +1,12 @@
-/* css_test.c — host unit test for the browser CSS selector matcher (css.c).
+/* Host unit test for the browser CSS selector matcher (css.c): :is()/:where() and paren-aware
+ * selector splitting. An empty or unsupported :is() argument must match nothing.
  *
- * Builds tiny DOM trees by hand and asserts which sheet rules css_matches()
- * reports for an element. Focus: :is()/:where() support and the paren-aware
- * selector-list / compound splitting — i.e. that a selector wrapped in :is()
- * matches its real targets and, crucially, NOTHING (never the universal *)
- * when its argument is empty or unsupported.
- *
- * Build + run (see CLAUDE.md "pure-lib logic gets host unit tests"):
+ * Build + run:
  *   cc -std=c11 -Iscripts -Iuser/apps/browser -Iuser/lib/math \
- *      tests/css_test.c user/apps/browser/css/engine.c user/apps/browser/css/engine_values.c user/apps/browser/css/engine_props.c user/apps/browser/css/engine_decl.c user/apps/browser/css/engine_sel.c user/apps/browser/css/engine_sheet.c user/apps/browser/css/sibling.c
- * user/apps/browser/color.c \ -lm -o /tmp/css_test && /tmp/css_test
+ *      tests/css_test.c user/apps/browser/css/engine.c user/apps/browser/css/engine_values.c
+ * user/apps/browser/css/engine_props.c user/apps/browser/css/engine_decl.c user/apps/browser/css/engine_sel.c
+ * user/apps/browser/css/engine_sheet.c user/apps/browser/css/sibling.c user/apps/browser/color.c \ -lm -o /tmp/css_test
+ * && /tmp/css_test
  */
 #include <stdio.h>
 #define OWOS_SUITE_TEST
@@ -26,8 +23,7 @@ static char *dup_str(const char *s)
 }
 #define strdup dup_str
 
-/* Track every node/attr so the whole scratch DOM frees at exit — a leak that
- * survives free_dom() then belongs to css.c, not the harness. */
+/* Track every node/attr so the scratch DOM frees at exit. */
 static struct dom_node *g_nodes[256];
 static int g_nn;
 static struct dom_attr *g_attrs[256];
@@ -98,8 +94,7 @@ __attribute__((weak)) const char *dom_get_attr(const struct dom_node *n, const c
   return 0;
 }
 
-/* Every element lives under a synthetic #document root so :root and the ancestor
- * walk behave as in the real tree. */
+/* Every element lives under a synthetic #document root so :root works. */
 static struct dom_node *doc(struct dom_node *child)
 {
   struct dom_node *root = el("#document");
@@ -124,8 +119,7 @@ static css_sheet *sheet(const char *src)
 
 int main(void)
 {
-  /* 1. The reported bug: a rule whose whole selector is :is(<complex>) must not
-   *    collapse to the universal selector. A plain <div> matches nothing. */
+  /* 1. A rule whose whole selector is :is(<complex>) must not collapse to the universal selector. */
   test("complex :is selectors");
   {
     const char *rtl = ":is(:is(:lang(ar), :lang(he), :lang(fa)) svg.lucide-chevron-right,"
@@ -136,8 +130,7 @@ int main(void)
     doc(d);
     expect(!matches_any(sh, d));
 
-    /* An svg with the class but no RTL ancestor also matches nothing (:lang
-     * is unsupported -> the sub-selector can never match, so the rule can't). */
+    /* No RTL ancestor and :lang is unsupported, so no match. */
     struct dom_node *body = el("body"), *svg = cls(el("svg"), "lucide-chevron-right");
     append(body, svg);
     doc(body);
@@ -162,7 +155,7 @@ int main(void)
     css_free(sh);
   }
 
-  /* 3. A standalone :is(.x) matches only .x — never everything. */
+  /* 3. A standalone :is(.x) matches only .x, never everything. */
   test("standalone :is selector");
   {
     css_sheet *sh = sheet(":is(.x) { color: red }");
@@ -204,8 +197,7 @@ int main(void)
     css_free(sh);
   }
 
-  /* 6. :where() matches functionally but carries zero specificity, so a bare
-   *    class rule declared later still wins the cascade (reported winner-first). */
+  /* 6. :where() has zero specificity, so a later bare class rule wins the cascade. */
   test(":where specificity");
   {
     css_sheet *sh = sheet("p:where(.w) { color: red } .w { color: green }");
@@ -219,7 +211,7 @@ int main(void)
     css_free(sh);
   }
 
-  /* 7. An unsupported selector inside :is() yields no match — not everything. */
+  /* 7. An unsupported selector inside :is() yields no match, not everything. */
   test("unsupported selector handling");
   {
     css_sheet *sh = sheet(":is(:lang(ar) .x) { color: red }");
@@ -229,8 +221,7 @@ int main(void)
     css_free(sh);
   }
 
-  /* 8. Multi-key indexing de-dup: a rule filed under two class keys must be
-   *    reported exactly once for an element that carries both classes. */
+  /* 8. A rule filed under two class keys is reported once for an element with both. */
   test("multi-key selector deduplication");
   {
     css_sheet *sh = sheet(":is(.a, .b) { color: red }");
@@ -242,8 +233,7 @@ int main(void)
     css_free(sh);
   }
 
-  /* 9. A subject :is() constrained by an id/tag files under that single key and
-   *    still matches; a non-matching branch key doesn't leak the rule elsewhere. */
+  /* 9. A subject :is() with an id/tag files under that key; non-matching branch keys don't leak. */
   test("id and tag selector keys");
   {
     css_sheet *sh = sheet(":is(#hero, aside) .item { color: red }");

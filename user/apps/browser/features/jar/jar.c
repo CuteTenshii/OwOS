@@ -1,28 +1,10 @@
-/* jar.c — the browser's persistent cookie + HSTS store.
- *
- * Keeps the cookie/HSTS data model AND its on-disk persistence out of the HTTP
- * transport (fetch.c), which only ever calls cookie_store/cookie_header/
- * hsts_add/hsts_has. Both in-memory lists are uncapped heap linked lists
- * (B->cookies, B->hsts) — there is no fixed jar size and no fixed field width.
- *
- * On disk both live in ONE real SQLite3 database (user/lib/sqlite), the file
- * JAR_DB, as two tables: `cookies(host, name, value, expiry, secure, domain,
- * path)` and `hsts(host)`. Old 3-column cookie rows still load (the extra
- * attributes default). It is a genuine SQLite file — `sqlite3 cookies.db` on
- * the host opens and queries it.
- * The OwOS file API is whole-file, so every change rebuilds and rewrites the
- * whole db; the jar is small, so that is cheap. All persistence is best-effort:
- * a read/write/allocation failure just leaves the in-memory list as-is, so the
- * browser still runs without a writable home directory.
- */
+/* jar.c: persistent cookie and HSTS store (SQLite file JAR_DB), best-effort, whole-file rewrite. */
 #include "features/jar/jar.h"
 #include "browser.h"
 #include "httpcache.h" /* http_date_parse: Expires -> Unix epoch seconds */
 #include "sqlite.h"
 
-/* Mirrors the browser's existing /home/root convention (see DL_DIR for
- * downloads). The file name stays cookies.db even though it now also holds the
- * HSTS table — it is the browser's jar. */
+/* Browser home-dir convention; cookies.db also holds the HSTS table. */
 #define JAR_DB "/home/root/cookies.db"
 #define COOKIE_SQL                                                                                                     \
   "CREATE TABLE cookies(host TEXT, name TEXT, value TEXT, "                                                            \
@@ -30,7 +12,6 @@
 #define COOKIE_COLS 7
 #define HSTS_SQL "CREATE TABLE hsts(host TEXT)"
 
-/* Heap copy of a byte range as a NUL-terminated string (no length cap). */
 static char *dupn(const char *s, int n)
 {
   char *d = (char *)malloc((unsigned)(n + 1));
@@ -43,17 +24,10 @@ static char *dupn(const char *s, int n)
 }
 static char *dupz(const char *s) { return dupn(s, strlen(s)); }
 
-/* Set when the in-memory jar changes; jar_flush() writes the db once, later.
- * This keeps the expensive whole-file rewrite OUT of the per-header parse loop
- * — a response with several Set-Cookie lines now costs one write, not one each.
- */
+/* Set on change; jar_flush() writes the db once, not per Set-Cookie header. */
 static bool jar_dirty;
 
-/* Per-cookie attributes that struct cookie (browser.h: host/name/val only)
- * can't carry, kept in a side list keyed by the cookie node. jar.c owns every
- * cookie node's whole lifecycle, so the two lists stay in lockstep; a cookie
- * with no meta node is a plain session, host-only, non-Secure, any-path cookie
- * (the defaults), so meta is allocated only when an attribute needs it. */
+/* Per-cookie attributes beyond struct cookie, in a side list; absent meta = session/host-only/non-Secure/any-path. */
 struct cookie_meta {
   struct cookie *c; /* the B->cookies node this describes         */
   long expires;     /* Unix epoch secs; 0 = session (no expiry)   */
@@ -72,7 +46,6 @@ static struct cookie_meta *meta_find(struct cookie *c)
   return 0;
 }
 
-/* Drop c's meta node (freeing its owned domain/path). No-op if it has none. */
 static void meta_detach(struct cookie *c)
 {
   struct cookie_meta **pp = &cookie_metas;
@@ -89,9 +62,7 @@ static void meta_detach(struct cookie *c)
   }
 }
 
-/* Attach attributes to c, taking ownership of `domain`/`path`. Replaces any
- * previous meta. When everything is default it stores none (and frees the
- * passed-in strings). On OOM the cookie simply keeps the defaults. */
+/* Attach attributes to c, taking ownership of `domain`/`path`; all-default stores none. */
 static void meta_set(struct cookie *c, long expires, bool secure, char *domain, char *path)
 {
   meta_detach(c);
@@ -128,10 +99,7 @@ static void meta_clear(void)
   cookie_metas = 0;
 }
 
-/* --------------------------------------------------------------- cookie jar */
-
-/* Case-insensitive compare of the [s, s+n) slice against the NUL-terminated
- * literal `lit` (attribute names aren't NUL-terminated in the header). */
+/* Case-insensitive compare of the [s, s+n) slice against literal `lit`. */
 static bool attr_is(const char *s, int n, const char *lit)
 {
   int i = 0;
@@ -141,8 +109,7 @@ static bool attr_is(const char *s, int n, const char *lit)
   return i == n && lit[i] == '\0';
 }
 
-/* Parse a (possibly signed) decimal from the [s, s+n) slice; *ok=false if it
- * isn't a well-formed integer. */
+/* Parse a signed decimal from the slice; *ok=false if malformed. */
 static long parse_long(const char *s, int n, bool *ok)
 {
   int i = 0;
@@ -167,8 +134,7 @@ static long parse_long(const char *s, int n, bool *ok)
   return neg ? -r : r;
 }
 
-/* True if `host` equals `domain` or is a sub-domain of it (label-boundary
- * suffix match), case-insensitively — RFC 6265 domain-match. */
+/* RFC 6265 domain-match: `host` equals or is a sub-domain of `domain`. */
 static bool domain_match(const char *host, const char *domain)
 {
   int hl = (int)strlen(host), dl = (int)strlen(domain);
@@ -181,8 +147,7 @@ static bool domain_match(const char *host, const char *domain)
   return streq_ci(host + hl - dl, domain);
 }
 
-/* RFC 6265 path-match: `rpath` is at/under `cpath`. Query/fragment end the
- * request path. Case-sensitive (paths are). NULL/empty cpath matches all. */
+/* RFC 6265 path-match; query/fragment end `rpath`; NULL/empty cpath matches all. */
 static bool path_match(const char *cpath, const char *rpath)
 {
   if (!cpath || !*cpath)
@@ -197,8 +162,7 @@ static bool path_match(const char *cpath, const char *rpath)
   return cpath[i - 1] == '/';
 }
 
-/* Remove any stored (host, name) cookie (and its meta). Used to honour a
- * Set-Cookie that is already expired (a deletion request). */
+/* Remove any stored (host, name) cookie and its meta. */
 static void cookie_remove(const char *host, const char *name)
 {
   struct cookie **pp = &B->cookies;
@@ -241,8 +205,7 @@ void cookie_store(const char *host, const char *v)
     return;
   }
 
-  /* Attributes after the first ';' (Max-Age/Expires/Secure/Domain/Path; other
-   * attributes such as HttpOnly/SameSite are accepted and ignored). */
+  /* Max-Age/Expires/Secure/Domain/Path are honoured; other attributes are ignored */
   bool have_maxage = false;
   long maxage = 0;
   bool have_expires = false;
@@ -306,10 +269,7 @@ void cookie_store(const char *host, const char *v)
     }
   }
 
-  /* A Domain that isn't a suffix of the origin host is rejected (a site can't
-   * set cookies for an unrelated domain). The public-suffix list is not
-   * consulted, so Domain=<eTLD> isn't blocked — same approximation the CORS
-   * code documents. */
+  /* reject a Domain that isn't a suffix of the origin host (public-suffix list not consulted) */
   if (domain && !domain_match(host, domain)) {
     free(name);
     free(val);
@@ -332,7 +292,6 @@ void cookie_store(const char *host, const char *v)
       expired = true;
   }
 
-  /* An already-expired Set-Cookie is a deletion request: drop the match. */
   if (expired) {
     cookie_remove(host, name);
     free(name);
@@ -342,7 +301,6 @@ void cookie_store(const char *host, const char *v)
     return;
   }
 
-  /* Update in place if this (host, name) is already stored. */
   for (struct cookie *c = B->cookies; c; c = c->next) {
     if (streq_ci(c->host, host) && streq(c->name, name)) {
       free(c->val);
@@ -353,7 +311,6 @@ void cookie_store(const char *host, const char *v)
       return;
     }
   }
-  /* Otherwise prepend a fresh node. */
   struct cookie *c = (struct cookie *)malloc(sizeof *c);
   if (!c) {
     free(name);
@@ -379,10 +336,7 @@ void cookie_store(const char *host, const char *v)
   jar_dirty = true;
 }
 
-/* Build the Cookie: header value for a request. Skips cookies that have
- * expired, that a Domain/Path scope excludes, or (when !tls) that are Secure.
- * `path` may be NULL to skip Path filtering (callers without the request path).
- */
+/* Build the Cookie: header value; `path` NULL skips Path filtering. */
 int cookie_header_tls(const char *host, const char *path, int tls, char *out, int cap)
 {
   long now = (long)rtc_epoch();
@@ -411,11 +365,9 @@ int cookie_header_tls(const char *host, const char *path, int tls, char *out, in
   return n;
 }
 
-/* Legacy scheme/path-agnostic variant (browser.h API). Assumes the request is
- * secure so it stays a no-op change for existing callers (resource.c). */
+/* Legacy variant (browser.h API): assumes a secure request. */
 int cookie_header(const char *host, char *out, int cap) { return cookie_header_tls(host, 0, 1, out, cap); }
 
-/* Free the in-memory cookie jar (used before reloading it from disk). */
 static void cookie_clear(void)
 {
   struct cookie *c = B->cookies;
@@ -430,8 +382,6 @@ static void cookie_clear(void)
   B->cookies = 0;
   meta_clear();
 }
-
-/* ----------------------------------------------- HSTS (force-HTTPS hosts) */
 
 int hsts_has(const char *host)
 {
@@ -458,7 +408,6 @@ void hsts_add(const char *host)
   jar_dirty = true;
 }
 
-/* Free the in-memory HSTS list. */
 static void hsts_clear(void)
 {
   struct hsts_host *h = B->hsts;
@@ -471,10 +420,7 @@ static void hsts_clear(void)
   B->hsts = 0;
 }
 
-/* ----------------------------------------------------- SQLite persistence */
-
-/* Load the persistent jar (cookies + HSTS) from the SQLite db at startup. A
- * missing or corrupt db simply leaves both lists empty. No caps on either. */
+/* Load the persistent jar at startup; a missing or corrupt db leaves the lists empty. */
 void jar_load(void)
 {
   struct sql_db *db = sql_open(JAR_DB);
@@ -491,8 +437,7 @@ void jar_load(void)
         continue;
       if (r->col[0].type != SQL_TEXT || r->col[1].type != SQL_TEXT || r->col[2].type != SQL_TEXT)
         continue;
-      /* Columns 3-6 are absent in the old 3-column schema — read what a
-       * row carries and default the rest. */
+      /* columns 3-6 are absent in the old 3-column schema */
       long expiry = (r->ncol >= 4 && r->col[3].type == SQL_INT) ? (long)r->col[3].i : 0;
       if (expiry > 0 && expiry <= now)
         continue; /* drop expired on load */
@@ -543,7 +488,6 @@ void jar_load(void)
   sql_close(db);
 }
 
-/* Rewrite the jar db (cookies + HSTS tables) from the in-memory lists. */
 void jar_save(void)
 {
   struct sql_db *db = sql_new();
@@ -579,8 +523,7 @@ void jar_save(void)
   sql_close(db);
 }
 
-/* Persist the jar to disk only if it changed since the last flush. Call once
- * after handling a response, not once per cookie. */
+/* Persist the jar only if it changed since the last flush. */
 void jar_flush(void)
 {
   if (!jar_dirty)

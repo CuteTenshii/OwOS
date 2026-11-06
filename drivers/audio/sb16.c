@@ -1,13 +1,4 @@
-/* sb16.c — Sound Blaster 16 PCM playback.
- *
- * Bring-up follows the classic SB16 sequence: reset the DSP (expect 0xAA),
- * unmute the mixer, then for each audio block program the 8237 ISA DMA
- * controller (channel 1) to point at our buffer, set the output rate, and kick
- * off a single-cycle 8-bit transfer. The card raises IRQ 5 when the block
- * finishes; we wait for it, refill the buffer, and repeat. Single-cycle (vs
- * auto-init double-buffering) keeps the logic simple at the cost of a tiny gap
- * between ~0.4 s blocks.
- */
+/* sb16.c: Sound Blaster 16 PCM playback via 8237 ISA DMA (ch 1) and IRQ 5. */
 
 #include "sb16.h"
 #include "console.h"
@@ -40,13 +31,7 @@
 #define DMA1_COUNT 0x03   /* channel 1 count                       */
 #define DMA1_PAGE 0x83    /* channel 1 page (address bits 16-23)    */
 
-/* The DMA buffer must sit in the low 16 MiB (it does -- the kernel image is
- * identity-mapped there) and must not straddle a 64 KiB physical boundary. An
- * N-byte buffer aligned to N (with N dividing 64 KiB) never can. */
-/* One auto-init DMA buffer split into two halves: the card plays one half
- * while we refill the other, so the DAC never stops between blocks (gapless).
- * The whole buffer is aligned to its own size so it can't straddle a 64 KiB
- * DMA boundary. */
+/* Two-half auto-init DMA buffer in the low 16 MiB, size-aligned so it never crosses 64 KiB. */
 #define HALF 8192
 #define DMABUF (2 * HALF)
 static uint8_t dma_buf[DMABUF] __attribute__((aligned(DMABUF)));
@@ -54,19 +39,13 @@ static uint8_t dma_buf[DMABUF] __attribute__((aligned(DMABUF)));
 static bool present;
 static volatile int irq_count; /* bumped by the IRQ each time a half ends  */
 
-/* Master volume, 0..SB_VOL_MAX (max by default), plus a mute latch. Adjusted
- * live by the keyboard's volume keys; pushed to the mixer by set_mixer_volume.
- */
+/* Master volume 0..SB_VOL_MAX plus mute latch, driven by the keyboard volume keys. */
 static int volume = SB_VOL_MAX;
 static bool muted;
 
-/* ---- DSP / mixer primitives -------------------------------------------- */
-
 static void dsp_write(uint8_t v)
 {
-  /* Bound the busy-wait: a wedged/absent DSP never clears bit7, and an
-   * unbounded spin would hang the CPU (every software wait must be bounded).
-   * On expiry mark the card gone so callers stop poking it. */
+  /* Bounded wait: a wedged DSP never clears bit7; on expiry mark the card gone. */
   for (int tries = 0; tries < 100000; tries++) {
     if (!(inb(SB_WRITE) & 0x80)) { /* write buffer ready               */
       outb(SB_WRITE, v);
@@ -78,18 +57,14 @@ static void dsp_write(uint8_t v)
 
 static void mixer_write(uint8_t reg, uint8_t v)
 {
-  /* Index (0x224) then data (0x225) is a two-port latch; a keyboard IRQ that
-   * pokes the mixer (volume keys) between the writes would clobber the index.
-   * Mask interrupts across the pair and restore the caller's prior IF. */
+  /* Index/data is a two-port latch: mask IRQs so a volume-key write can't clobber the index. */
   uintptr_t flags = irq_save();
   outb(SB_MIX_ADDR, reg);
   outb(SB_MIX_DATA, v);
   irq_restore(flags);
 }
 
-/* Push the current volume/mute state to the SB16 mixer. The master (0x22) and
- * voice/DAC (0x04) registers each pack a 4-bit left and right level (bits 7-4 /
- * 3-0), so we map our 0..SB_VOL_MAX scale onto 0..15 and mirror it L+R. */
+/* Master (0x22) and voice (0x04) regs pack 4-bit L/R levels; map 0..SB_VOL_MAX onto 0..15. */
 static void set_mixer_volume(void)
 {
   int v = muted ? 0 : volume;
@@ -124,16 +99,11 @@ int sb16_volume(void) { return muted ? 0 : volume; }
 static bool dsp_reset(void)
 {
   outb(SB_RESET, 1);
-  /* Hold RESET high >= 3 us. sb16_init runs before the timer, so no PIT sleep:
-   * pace with ISA io_wait bounces (a 0x80 port write, ~1 us each on real HW)
-   * rather than a raw CPU-speed-dependent spin that could under-delay on a
-   * fast core and flake the probe. */
+  /* Hold RESET high >= 3 us; no PIT yet, so pace with io_wait (~1 us each). */
   for (int i = 0; i < 10; i++)
     io_wait();
   outb(SB_RESET, 0);
-  /* Read data bytes until the 0xAA ready-marker or the budget expires; a
-   * present DSP may present other bytes first, so don't judge only the first
-   * one. */
+  /* Read until the 0xAA ready marker or the budget expires; other bytes may come first. */
   for (int tries = 0; tries < 100000; tries++)
     if (inb(SB_RSTAT) & 0x80)
       if (inb(SB_READ) == 0xAA)
@@ -164,11 +134,7 @@ void sb16_init(void)
 
 int sb16_present(void) { return present; }
 
-/* ---- DMA + gapless playback -------------------------------------------- */
-
-/* Program the 8237 controller (channel 1) for an auto-init transfer over the
- * whole buffer: when it reaches the end it reloads and keeps going, so the
- * card streams continuously instead of stopping after each block. */
+/* Program 8237 ch 1 for auto-init over the whole buffer so the card streams continuously. */
 static void dma_setup_autoinit(uint32_t phys, uint32_t count)
 {
   uint16_t off = phys & 0xFFFF;
@@ -186,16 +152,7 @@ static void dma_setup_autoinit(uint32_t phys, uint32_t count)
   outb(DMA_MASK, SB_DMA); /* unmask -- transfer may begin     */
 }
 
-/* ---- streaming PCM sink (fed from user space) ------------------------------
- *
- * Like hda.c, the WAV parse + resample now run in /bin/play; it pushes
- * the canonical 48 kHz/16-bit/stereo stream here over the SYS_AUDIO_* syscalls.
- * This back end down-converts each frame to one 8-bit unsigned mono sample (all
- * the SB16's 8-bit DAC takes) and plays it at 48 kHz over the auto-init DMA
- * buffer. The card raises IRQ 5 at each half boundary; the producer paces
- * itself to those, filling the half the card has just left — so it
- * self-throttles to the output rate without buffering the whole file. One
- * stream at a time. */
+/* Streaming PCM sink fed from /bin/play: 48 kHz S16 stereo down-converted to 8-bit mono, paced by half IRQs. */
 static bool s_active;  /* a stream is open                                  */
 static bool s_started; /* both halves primed, DMA running                   */
 static int s_half;     /* half currently being filled by the producer (0/1) */
@@ -216,16 +173,14 @@ static void sb_start(void)
   dsp_write(((HALF - 1) >> 8) & 0xFF);
 }
 
-/* Block until the card is no longer playing half H (so we can refill it).
- * Returns -2 if Ctrl+C is pressed. The card plays half (irq_count & 1). */
+/* Block until half H is no longer playing (card plays half irq_count & 1); -2 on Ctrl+C. */
 static int sb_wait_half_free(int H)
 {
   int stall = 0;
   while ((irq_count & 1) == H) {
     if (keyboard_take_interrupt())
       return -2;
-    if (++stall > 2000) /* ~4 s: IRQ 5 lost or DSP wedged — give up
-                         * rather than block the thread forever    */
+    if (++stall > 2000) /* ~4 s: IRQ 5 lost or DSP wedged, give up */
       return -1;
     timer_sleep(2);
   }

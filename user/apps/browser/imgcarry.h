@@ -1,4 +1,4 @@
-/* imgcarry.h — inline images keep their landed state across layout walks. */
+/* imgcarry.h  -  inline images keep their landed state across layout walks. */
 #ifndef OWOS_BROWSER_IMGCARRY_H
 #define OWOS_BROWSER_IMGCARRY_H
 
@@ -61,8 +61,7 @@ static inline void img_clear(struct inl_img *im)
   im->want = 0;
 }
 
-/* Adopt the first unclaimed previous entry with href `key` (scanning from slot idx); with need_ok it must hold pixels,
- * or share one already built. */
+/* Adopt the first unclaimed previous entry with href `key` (scanning from slot idx) */
 static inline bool img_carry_take(struct img_carry *c, struct inl_img *im, const char *key, int idx, bool need_ok,
                                   const struct inl_img *built)
 {

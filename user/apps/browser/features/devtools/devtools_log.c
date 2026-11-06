@@ -1,25 +1,17 @@
 #include "devtools_int.h"
 
-/* The in-band `%c` style markers the JS engine embeds in console output. Kept
- * in sync with JS_STYLE_ON/OFF in user/lib/js/interp.h (that header pulls the
- * whole engine type graph, so it isn't included here). */
+/* In-band `%c` style markers; keep in sync with JS_STYLE_ON/OFF in user/lib/js/interp.h. */
 #define CON_STYLE_ON 0x01
 #define CON_STYLE_OFF 0x02
 
-/* --- console ring ---------------------------------------------------------- *
- * A fixed circular buffer of lines, each a heap string + a level. The worker
- * appends; the main thread reads under dt_lk. A pending accumulator collects
- * bytes between newlines (console.log sends a whole line, but write() chunks
- * are not guaranteed to land on a boundary). */
+/* Console ring: circular buffer of heap lines + level; worker appends, main reads under dt_lk. */
 struct conline dt_con[CON_MAX];
 int dt_con_start, dt_con_count;
 char *dt_con_pend;
 int dt_con_pend_len, dt_con_pend_cap;
 int dt_con_pend_level;
 bool dt_con_follow = true; /* keep the view pinned to the newest line      */
-/* Level filter: 0 = all, 1 = warnings+errors, 2 = errors only. A line shows
- * when its level (DT_LOG=0 < DT_WARN=1 < DT_ERROR=2) is >= the filter, so the
- * value is the threshold. */
+/* Level filter: 0 = all, 1 = warnings+errors, 2 = errors only (line shown if level >= filter). */
 int dt_con_filter;
 bool dt_con_pass(int level) { return level >= dt_con_filter; }
 int dt_con_visible_count(void)
@@ -50,11 +42,7 @@ void dt_con_clear(void)
   mutex_unlock(&dt_lk);
 }
 
-/* --- console REPL input (main thread) -------------------------------------- *
- * A one-line editor at the bottom of the Console panel. Typed expressions are
- * handed to the worker (which owns the JS context) via the dt_eval_* handoff;
- * the worker evaluates them against the live page context and appends the
- * result to the console ring. A small history ring backs Up/Down recall. */
+/* Console REPL input: expressions go to the worker via dt_eval_*; history ring backs Up/Down. */
 char dt_input[256];
 struct textfield dt_input_tf;
 static bool dt_input_init;
@@ -104,9 +92,7 @@ void dt_hist_recall(int dir)
   textfield_set(&dt_input_tf, p >= dt_hist_cnt ? "" : dt_hist[p]);
 }
 
-/* Parse one `%c` CSS block into the overrides of `r` (its off is preset). Only
- * the properties the console can actually render: color, background-color and a
- * bold/normal font-weight. An empty block leaves `r` a plain reset run. */
+/* Parse one `%c` CSS block into overrides of `r`: color, background-color, bold/normal weight. */
 static void con_style_parse(struct crun *r, const char *css, int n)
 {
   int i = 0;
@@ -178,8 +164,7 @@ void dt_con_free_runs(int slot)
   dt_con[slot].nruns = 0;
 }
 
-/* Store one console line: strip the in-band %c markers into plain display text,
- * recording each style directive as a run keyed by its offset in that text. */
+/* Store one console line: strip %c markers, recording each style directive as a run by offset. */
 static void con_push(int level, const char *s, int len)
 {
   char *dup = malloc((unsigned)len + 1);
@@ -229,11 +214,7 @@ static void con_push(int level, const char *s, int len)
   dt_con[slot].nruns = nruns;
 }
 
-/* Draw the wrapped row s[off,end) at (x,y) applying %c style runs: each run
- * overrides colour/background/weight from its offset onward; the default fg
- * (the level colour) fills gaps a run leaves unset. Bold is faked by a 1px
- * overstrike (the monospace face has no bold cut). Runs are in ascending-offset
- * order. */
+/* Draw wrapped row s[off,end) at (x,y) applying %c runs; bold is a 1px overstrike. */
 void dt_con_draw_runs(int x, int y, const char *s, int off, int end, unsigned deffg, const struct crun *runs, int nruns)
 {
   char buf[256];
@@ -267,10 +248,7 @@ void dt_con_draw_runs(int x, int y, const char *s, int off, int end, unsigned de
 
 void devtools_console_append(int level, const char *s, int len)
 {
-  /* Capture into the ring even while the panel is closed: errors thrown during
-   * page load (before the user opens devtools) would otherwise be lost, leaving
-   * an empty console. The ring is a bounded static, so this can't grow
-   * unbounded; only the repaint is gated on the panel being open. */
+  /* Capture even while the panel is closed so load-time errors are kept; only repaint is gated. */
   mutex_lock(&dt_lk);
   for (int i = 0; i < len; i++) {
     char c = s[i];
@@ -296,16 +274,10 @@ void devtools_console_append(int level, const char *s, int len)
     dt_paint_only = true; /* repaint only if visible */
 }
 
-/* --- network ring ---------------------------------------------------------- *
- * One preformatted line per HTTP response the page made (logged from the fetch
- * paths on the worker / image-fetch threads), reset on each top-level
- * navigation (devtools_net_reset). Same circular-buffer shape as the console.
- */
+/* Network ring: one preformatted line per HTTP response, reset on navigation (devtools_net_reset). */
 struct conline dt_net[NET_MAX];
 int dt_net_start, dt_net_count;
-/* Structured request fields, parallel to dt_net[] (same slot/start/count), backing
- * the click-to-expand detail view. The summary string in dt_net[] drives the list;
- * these drive the detail panel. url is heap (full, untruncated). */
+/* Structured request fields parallel to dt_net[], backing the detail view; url is heap. */
 struct netinfo dt_netinfo[NET_MAX];
 int dt_net_sel = -1;        /* logical index of the expanded request, -1 none */
 static int net_next_id = 1; /* monotonic id: the begin -> update handshake key */
@@ -433,10 +405,7 @@ static int net_level(const struct net_log *e)
   }
 }
 
-/* (Re)write ring slot `slot` — its list line + structured detail — from e,
- * freeing any prior heap strings. The slot's id is preserved (begin assigns it
- * once; update keeps it), so a pending row resolves in place. Caller holds
- * dt_lk. */
+/* (Re)write ring slot `slot` from e, freeing prior heap strings and keeping its id. Caller holds dt_lk. */
 static void net_fill(int slot, const struct net_log *e)
 {
   char buf[URL_MAX + 200];
@@ -475,8 +444,7 @@ static void net_fill(int slot, const struct net_log *e)
   ni->resp_hdr = dt_strdup(e->resp_hdr);
 }
 
-/* Reserve the next ring slot, evicting the oldest when full. Caller holds
- * dt_lk. */
+/* Reserve the next ring slot, evicting the oldest when full. Caller holds dt_lk. */
 static int net_alloc_slot(void)
 {
   int slot;
@@ -489,9 +457,7 @@ static int net_alloc_slot(void)
     dt_net[slot].text = 0;
     dt_netinfo_clear(&dt_netinfo[slot]);
     dt_net_start = (dt_net_start + 1) % NET_MAX;
-    /* dt_net_sel is a logical index off dt_net_start: shift it as the oldest drops
-     * so the expanded detail keeps pointing at the same request (or closes if
-     * evicted). */
+    /* dt_net_sel is a logical index off dt_net_start: shift it as the oldest drops. */
     if (dt_net_sel == 0)
       dt_net_sel = -1;
     else if (dt_net_sel > 0)
@@ -510,9 +476,7 @@ static int net_push_e(const struct net_log *e)
   return id;
 }
 
-/* Capture into the ring even while the panel is closed (bounded static), so the
- * requests a page issues during load are still there when devtools is opened
- * afterwards; only the repaint is gated on the panel being visible. */
+/* Capture even while the panel is closed; only the repaint is gated on visibility. */
 static void net_repaint(void)
 {
   if (dt_open && dt_tab == TAB_NETWORK)
@@ -537,9 +501,7 @@ int devtools_net_begin(const char *method, const char *url)
   return id;
 }
 
-/* Resolve the in-flight row `id` to its final state (e->state). If it was
- * already evicted from the bounded ring, the outcome is appended fresh so it is
- * never lost. */
+/* Resolve in-flight row `id` to its final state; appended fresh if already evicted. */
 void devtools_net_update(int id, const struct net_log *e)
 {
   mutex_lock(&dt_lk);
@@ -559,14 +521,12 @@ void devtools_net_update(int id, const struct net_log *e)
   net_repaint();
 }
 
-/* --- network type filter + response-header iteration -----------------------
- */
+/* Network type filter + response-header iteration */
 const char *const dt_net_filter_names[NF_N] = {"All", "Doc", "CSS", "JS", "Img", "Font", "Other"};
 int dt_net_filter; /* NF_* category shown; NF_ALL = everything    */
 int dt_nd_scroll;  /* response-header scroll in the request detail */
 
-/* Case-insensitive: does `url` end with `suf`, ignoring a trailing
- * ?query/#frag? */
+/* Case-insensitive: does `url` end with `suf`, ignoring a trailing ?query/#frag? */
 static bool url_ext_is(const char *url, const char *suf)
 {
   if (!url)
@@ -583,8 +543,7 @@ static bool url_ext_is(const char *url, const char *suf)
   return true;
 }
 
-/* Resource category for the type filter — Content-Type first, URL extension as
- * a fallback (image batches log an empty or wildcard image type). */
+/* Resource category for the type filter: Content-Type first, URL extension as fallback. */
 static int net_category(const struct netinfo *ni)
 {
   const char *ct = ni->ctype;
@@ -628,9 +587,7 @@ int dt_net_visible_count(void)
   return c;
 }
 
-/* Iterate the raw response-header block by line ('\n'-split, trailing '\r' and
- * the trailing blank terminator line dropped). Backs the Network detail headers
- * list. */
+/* Iterate raw response-header lines ('\n'-split, trailing '\r' and blank terminator dropped). */
 int dt_hdr_nlines(const char *h)
 {
   if (!h)

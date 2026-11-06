@@ -1,15 +1,4 @@
-/* svg.c — a small SVG renderer. dom_parse() gives the element tree (SVG is
- * XML); this walks it, accumulating affine transforms and paint, and rasterizes
- * the shapes into an ARGB bitmap with a scanline polygon filler.
- *
- * Supported: rect (incl. rx/ry rounded corners), circle, ellipse, line,
- * polyline, polygon, path (M/L/H/V/C/S/Q/T/A/Z, abs+rel); fill (nonzero +
- * evenodd via fill-rule) + stroke; fill/stroke/style colours (#hex, rgb(),
- * hsl(), oklch(), named, none, currentColor); transforms
- * (translate/scale/rotate/matrix); viewBox
- * + width/height with aspect preserved.
- * Not supported: gradients, patterns, filters, text, clipping. Edges are
- * antialiased by rendering at SS× and box-downsampling. */
+/* Small SVG renderer: walks the dom_parse() tree and fills shapes with a scanline rasterizer. */
 #include "features/svg/svg.h"
 #include "color.h"
 #include "dom.h"
@@ -20,8 +9,7 @@
 
 #define SS_MAX 3 /* supersample factor cap (AA quality vs memory) */
 
-/* ------------------------------------------------ affine matrix ------------
- */
+/* affine matrix */
 struct mat {
   float a, b, c, d, e, f;
 }; /* x' = a x + c y + e,  y' = b x + d y + f */
@@ -57,8 +45,7 @@ static float mat_scale(struct mat m)
   return (float)sqrt((double)((sx + sy) * 0.5f));
 }
 
-/* ------------------------------------------------ number / token parse -----
- */
+/* number / token parse */
 static bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == ','; }
 
 static bool parse_num(const char **pp, const char *end, float *out)
@@ -68,9 +55,7 @@ static bool parse_num(const char **pp, const char *end, float *out)
     p++;
   if (p >= end)
     return false;
-  /* Only commit to strtod on a numeric lead, so a stray letter in the path
-   * grammar can't be swallowed as Infinity/NaN. Attribute values are NUL-
-   * terminated, so strtod stops at `end` on its own. */
+  /* Numeric lead only, so path letters are not parsed as Infinity/NaN. */
   char c = *p;
   if (!(c == '+' || c == '-' || c == '.' || (c >= '0' && c <= '9')))
     return false;
@@ -83,8 +68,7 @@ static bool parse_num(const char **pp, const char *end, float *out)
   return true;
 }
 
-/* Length attribute -> user units (drop a trailing px/unit; % unsupported -> 0).
- */
+/* Length attribute to user units (trailing unit dropped; % gives 0). */
 static float attr_len(const struct dom_node *n, const char *name, float def)
 {
   const char *v = dom_get_attr(n, name);
@@ -101,13 +85,8 @@ static float attr_len(const struct dom_node *n, const char *name, float def)
   return out;
 }
 
-/* ------------------------------------------------ colour -------------------
- */
-/* Returns 0xRRGGBB, -1 for "none"/transparent, -2 for "not a colour / inherit".
- * Hex/rgb/hsl/named parsing is shared via color.c; only the SVG-specific
- * keywords (none/transparent/currentColor) are handled here. `cur_color`
- * (0xRRGGBB) is what `currentColor` resolves to for this render — threaded
- * through so concurrent per-image renders don't share it. */
+/* colour */
+/* Returns 0xRRGGBB, -1 for none/transparent, -2 for not a colour/inherit. */
 static int parse_paint(const char *v, int cur_color)
 {
   while (*v == ' ' || *v == '\t')
@@ -147,8 +126,7 @@ static bool style_prop(const char *style, const char *prop, char *out, int cap)
   return false;
 }
 
-/* ------------------------------------------------ paint state --------------
- */
+/* paint state */
 struct paint {
   int fill;
   int stroke;
@@ -205,8 +183,7 @@ static struct paint resolve_paint(const struct dom_node *n, struct paint in, int
   return p;
 }
 
-/* ------------------------------------------------ transform parse ----------
- */
+/* transform parse */
 static struct mat parse_transform(const char *s)
 {
   struct mat m = mat_id();
@@ -268,8 +245,7 @@ static struct mat parse_transform(const char *s)
   return m;
 }
 
-/* ------------------------------------------------ rasterizer ---------------
- */
+/* rasterizer */
 struct ras {
   unsigned *buf;
   int w, h; /* device buffer (SS resolution) */
@@ -424,8 +400,7 @@ static void fill_path(struct ras *r, int rgb, bool evenodd)
   }
 }
 
-/* Stroke the current subpaths: each segment becomes a filled quad of width w.
- */
+/* Stroke the current subpaths as filled quads of width w. */
 static void stroke_path(struct ras *r, int rgb, float w, bool closed)
 {
   if (rgb < 0 || r->ns == 0)
@@ -482,8 +457,7 @@ static void stroke_path(struct ras *r, int rgb, float w, bool closed)
   free(sb);
 }
 
-/* ------------------------------------------------ shape emitters -----------
- */
+/* shape emitters */
 static void emit_ellipse(struct ras *r, struct mat m, float cx, float cy, float rx, float ry)
 {
   ras_reset(r);
@@ -538,9 +512,7 @@ static void bez2(struct ras *r, struct mat m, float x0, float y0, float x1, floa
   }
 }
 
-/* Flatten an SVG elliptical arc (endpoint parameterization) from the current
- * point to (x,y) into line segments. rx/ry radii, phi x-axis rotation (deg),
- * large/sweep the arc flags. The standard endpoint->center conversion. */
+/* Flatten an SVG elliptical arc (endpoint parameterization) into line segments. */
 #define SVG_PI 3.14159265358979f
 static void arc_to(struct ras *r, struct mat m, float x0, float y0, float rx, float ry, float phi_deg, bool large,
                    bool sweep, float x, float y)
@@ -762,8 +734,7 @@ static void emit_path(struct ras *r, struct mat m, const char *d)
   }
 }
 
-/* ------------------------------------------------ tree walk ----------------
- */
+/* tree walk */
 static void render_node(struct dom_node *n, struct ras *r, struct mat ctm, struct paint pin)
 {
   for (struct dom_node *c = n->first_child; c; c = c->next) {
@@ -871,8 +842,7 @@ static void render_node(struct dom_node *n, struct ras *r, struct mat ctm, struc
   }
 }
 
-/* ------------------------------------------------ entry --------------------
- */
+/* entry */
 static struct dom_node *find_svg(struct dom_node *n)
 {
   for (struct dom_node *c = n->first_child; c; c = c->next) {
@@ -1003,9 +973,7 @@ int svg_render(const char *data, int len, int w, int h, unsigned *out, unsigned 
   ctm.e = ox - vbx * s;
   ctm.f = oy - vby * s;
 
-  /* Default paint is black fill / no stroke, but the root <svg>'s own
-   * fill/stroke (incl. the CSS values html.c bakes onto it) must inherit to its
-   * children. */
+  /* Root <svg> fill/stroke (incl. CSS baked on by html.c) inherits to children. */
   struct paint base = resolve_paint(svg, (struct paint){0x000000, -1, 1.0f, 0}, r.cur_color);
   render_node(svg, &r, ctm, base);
 

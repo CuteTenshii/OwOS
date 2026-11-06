@@ -1,6 +1,4 @@
-/* compositor.c: the user-space window manager and desktop.
- * Built on the root-only SYS_FB_*, SYS_INPUT_POLL and SYS_WIN_* primitives
- * (owos.h); composites into the shared back buffer, presenting damaged rects. */
+/* compositor.c: the user-space window manager and desktop */
 #include "clipboard.h"
 #include "compositor_damage.h"
 #include "gfx.h"
@@ -9,7 +7,7 @@
 
 #include <stdbool.h>
 
-/* ---- WM metrics (mirror kernel/wm.h) ---- */
+/* WM metrics (mirror kernel/wm.h) */
 #define WM_TITLE_H 22
 #define WM_BORDER 2
 #define WM_BAR_H 28
@@ -19,17 +17,17 @@
 #define WM_MIN_W 140
 #define WM_MIN_H 120
 
-/* Cursor shapes (mirror enum wm_cursor / WIN_CURSOR_*). */
+/* Cursor shapes (mirror enum wm_cursor / WIN_CURSOR_*) */
 enum { CUR_ARROW = 0, CUR_HAND, CUR_TEXT, CUR_BUSY, CUR_RESIZE_NWSE, CUR_RESIZE_NESW, CUR_RESIZE_NS, CUR_RESIZE_EW };
 
-/* Global keys the kernel routes through wm_feed_key (mirror keyboard.h). */
+/* Global keys the kernel routes through wm_feed_key (mirror keyboard.h) */
 #define KEY_TAB '\t'
 #define KEY_ALT_UP 0x1B /* internal: "Alt released" marker (kernel wm KEY_ALT_UP) */
 
 #define WM_LIST_MAX 64
 
-/* ---- screen + back buffer ---- */
-static unsigned *back;         /* mapped back buffer (COMPOSITOR_FB_ADDR)         */
+/* screen + back buffer */
+static unsigned *back;         /* mapped back buffer (COMPOSITOR_FB_ADDR) */
 static int screen_w, screen_h; /* visible dimensions */
 static int fb_pitch;           /* back-buffer stride in pixels (== gfx surface w) */
 
@@ -56,8 +54,7 @@ static void fit_frame_to_work_area(int *x, int *y, int *w, int *h)
   clamp_frame_position(x, y, *w, *h);
 }
 
-/* Mirror of the active gfx clip rect, so blit_client (which writes `back`
- * directly) intersects against the same region gfx_set_clip installed. */
+/* Mirror of the active gfx clip rect */
 static int clip_x0, clip_y0, clip_x1, clip_y1;
 static void set_clip(int x, int y, int w, int h)
 {
@@ -85,20 +82,19 @@ static void clip_full(void)
   gfx_clip_none();
 }
 
-/* ------------------------------------------------------------- window model */
-/* cur[] is enumerated in slot order, then zorder_apply() sorts it bottom first,
- * so the index is the z slot. Z and focus are compositor-owned. */
+/* window model */
+/* cur[] is enumerated in slot order, then zorder_apply() sorts it bottom first */
 static struct winrec cur[WM_LIST_MAX];
 static int nwin;
 
 static bool win_visible(const struct winrec *w) { return (w->flags & UWIN_F_VISIBLE) != 0; }
 static bool win_minimized(const struct winrec *w) { return (w->flags & UWIN_F_MINIMIZED) != 0; }
 
-/* Compositor-tracked maximize state (see the maxrec table below): -1 if not. */
+/* Compositor-tracked maximize state (see the maxrec table below): -1 if not */
 static int is_maxed(int id);
 static void maxed_forget_gone(void);
 
-/* wins index by z position i (bottom..top); cur[] is already in that order. */
+/* wins index by z position i (bottom..top); cur[] is already in that order */
 static int slot_of(int id)
 {
   for (int i = 0; i < nwin; i++)
@@ -107,9 +103,7 @@ static int slot_of(int id)
   return -1;
 }
 
-/* Compositor-owned stacking order: window ids, bottom -> top. The kernel no
- * longer tracks z or focus; each frame we reconcile this list with the
- * enumerated set and reorder cur[] to match, so topmost_visible() == focus. */
+/* Compositor-owned stacking order: window ids, bottom -> top */
 static int zstack[WM_LIST_MAX];
 static int nz;
 static bool taskbar_layout_dirty = true;
@@ -141,13 +135,9 @@ static void z_lower(int id)
   taskbar_layout_dirty = true;
 }
 
-/* ---- window families
- * A child (winrec.parent) stacks above its parent and raises/hides with it; it
- * is hidden from the taskbar/Alt+Tab, and UWIN_F_MODAL blocks the rest of the family. */
+/* window families */
 
-/* The valid transient parent id of window `id`, or -1. The link is by window
- * id; we require the parent to still be live AND owned by the same process, so
- * a slot reused by another app can't be mistaken for the parent. */
+/* The valid transient parent id of window `id`, or -1 */
 static int parent_id_of(int id)
 {
   int s = slot_of(id);
@@ -162,7 +152,7 @@ static int parent_id_of(int id)
   return p;
 }
 
-/* The top ancestor of `id` (itself if it has no valid parent). Bounded walk. */
+/* The top ancestor of `id` (itself if it has no valid parent) */
 static int root_id_of(int id)
 {
   for (int guard = 0; guard < WM_LIST_MAX; guard++) {
@@ -174,7 +164,7 @@ static int root_id_of(int id)
   return id;
 }
 
-/* 1 if `id` is `anc` or descends from it through the parent chain. */
+/* 1 if `id` is `anc` or descends from it through the parent chain */
 static bool is_descendant(int id, int anc)
 {
   for (int guard = 0; id >= 0 && guard < WM_LIST_MAX; guard++) {
@@ -185,8 +175,7 @@ static bool is_descendant(int id, int anc)
   return false;
 }
 
-/* Drop closed ids, append new ones on top, then order cur[] bottom to top: each
- * root by zstack followed by a DFS of its descendants. */
+/* Drop closed ids, append new ones on top, then order cur[] bottom to top */
 static char fam_emitted[WM_LIST_MAX];
 static void emit_family(int rootslot, struct winrec *ord, int *n)
 {
@@ -225,8 +214,7 @@ static void zorder_apply(void)
     if (parent_id_of(zstack[zi]) < 0)
       emit_family(s, ord, &n);
   }
-  /* Any window not reached above (e.g. a parent link forming a cycle) still
-   * gets emitted, in zstack order, so nothing vanishes. */
+  /* Any window not reached above still gets emitted, in zstack order, so nothing vanishes */
   for (int zi = 0; zi < nz; zi++) {
     int s = slot_of(zstack[zi]);
     if (s >= 0 && !fam_emitted[s]) {
@@ -239,15 +227,14 @@ static void zorder_apply(void)
   nwin = n;
 }
 
-/* ---- "Not Responding": no kernel signal yet, so every window counts as responsive. */
+/* "Not Responding": no kernel signal yet, so every window counts as responsive */
 static bool not_responding(const struct winrec *w)
 {
   (void)w;
   return false;
 }
 
-/* ------------------------------------------------------------- title helpers
- */
+/* title helpers */
 static void put2(char *p, int v)
 {
   p[0] = (char)('0' + v / 10);
@@ -269,8 +256,7 @@ static void disp_title(const struct winrec *w, char *buf)
   }
 }
 
-/* ------------------------------------------------------------- taskbar / menus
- */
+/* taskbar / menus */
 #define START_W 70
 #define SM_ITEM_H 20
 #define SM_W 150
@@ -292,8 +278,7 @@ static int tb_band_right;
 static unsigned frame_clock;
 static int tb_band_left(void) { return START_W + 6; }
 
-/* ------------------------------------------------------------- Start menu apps
- * Ported app_menu[] from kernel/apps.c: each row spawns a /bin program. */
+/* Start menu apps */
 static const struct {
   const char *name;
   const char *bin;
@@ -304,8 +289,7 @@ static const struct {
 };
 static int apps_menu_count(void) { return (int)(sizeof app_menu / sizeof app_menu[0]); }
 
-/* Power actions. We can't probe ACPI S3 from user space, so always offer the
- * two that the power() syscall supports (shut down / reboot); no "Sleep". */
+/* Power actions */
 enum { PA_RESTART, PA_SHUTDOWN };
 static int sm_power_n(void) { return 2; }
 static const char *sm_power_label(int row) { return row == 0 ? "Restart" : "Shut Down"; }
@@ -316,9 +300,7 @@ static int sm_top(void) { return screen_h - WM_BAR_H - sm_h(); }
 
 static bool force_full;
 
-/* ---- child reaping
- * Start-menu apps are spawned detached; track their pids in a small ring and
- * reap zombies non-blocking (waitpid on an arbitrary child would block). */
+/* child reaping */
 #define MAXKIDS 64
 static int kids[MAXKIDS];
 static int nkids;
@@ -329,9 +311,7 @@ static void kid_track(int pid)
     kids[nkids++] = pid;
 }
 
-/* Reap exited children non-blocking so zombies don't accumulate. wm.c reaped as
- * the kernel-side parent; we're the user-space parent, so we use waitpid_nb (a
- * blocking waitpid would freeze the UI). */
+/* Reap exited children non-blocking so zombies don't accumulate */
 static void reap_kids(void)
 {
   int st;
@@ -358,7 +338,7 @@ static void launch_app(int i)
   kid_track(spawn(path, 0));
 }
 
-/* ------------------------------------------------------------- cursors */
+/* cursors */
 static const char *const arrow_glyph[] = {
     "X           ", "XX          ", "X.X         ", "X..X        ", "X...X       ", "X....X      ", "X.....X     ",
     "X......X    ", "X.......X   ", "X........X  ", "X.....XXXXX ", "X..X..X     ", "X.X X..X    ", "XX  X..X    ",
@@ -386,10 +366,9 @@ static const struct cur_shape cur_shapes[] = {
 #define CUR_DMG_H 30
 static unsigned cursor_frame;
 
-/* ------------------------------------------------------------- z / hit-testing
- */
+/* z / hit-testing */
 
-/* Topmost visible window's cur[] slot (holds focus), or -1. */
+/* Topmost visible window's cur[] slot (holds focus), or -1 */
 static int topmost_visible(void)
 {
   for (int i = nwin - 1; i >= 0; i--)
@@ -398,7 +377,7 @@ static int topmost_visible(void)
   return -1;
 }
 
-/* Topmost visible window containing (px,py), or -1. */
+/* Topmost visible window containing (px,py), or -1 */
 static int window_at(int px, int py)
 {
   for (int i = nwin - 1; i >= 0; i--) {
@@ -411,8 +390,7 @@ static int window_at(int px, int py)
   return -1;
 }
 
-/* Raise a window's whole family to the front: the root comes forward, then the
- * clicked window is raised within its family so it sits atop its siblings. */
+/* Raise a window's whole family to the front: the root comes forward */
 static void raise_family_id(int id)
 {
   int root = root_id_of(id);
@@ -426,12 +404,9 @@ static void raise_window(int slot)
     raise_family_id(cur[slot].id);
 }
 
-/* ---- modality
- * A visible UWIN_F_MODAL child grabs its family: input to other family windows
- * is redirected to it and it flashes. */
+/* modality */
 
-/* Topmost visible modal window in `id`'s family, or -1. cur[] is bottom->top,
- * so the last match is the topmost (an inner dialog over an outer one). */
+/* Topmost visible modal window in `id`'s family, or -1 */
 static int family_active_modal(int id)
 {
   int root = root_id_of(id);
@@ -445,9 +420,7 @@ static int family_active_modal(int id)
   return mid;
 }
 
-/* If interacting with window slot `idx` is blocked by a modal dialog, the
- * modal's id; else -1. The modal itself and its own descendants are never
- * blocked. */
+/* If interacting with window slot `idx` is blocked by a modal dialog, the modal's id; else -1 */
 static int blocking_modal(int idx)
 {
   if (idx < 0)
@@ -458,7 +431,7 @@ static int blocking_modal(int idx)
   return mid;
 }
 
-/* A modal being flashed to signal it holds input; counts down in frames. */
+/* A modal being flashed to signal it holds input; counts down in frames */
 static int flash_id = -1, flash_frames;
 static void flash_modal(int id)
 {
@@ -467,8 +440,7 @@ static void flash_modal(int id)
   force_full = true;
 }
 
-/* ------------------------------------------------------------- Alt+Tab
- * switcher */
+/* Alt+Tab */
 static bool at_active;
 static int at_order[WM_LIST_MAX]; /* window ids, most-recent first */
 static int at_count;
@@ -487,14 +459,13 @@ static int alttab_build(void)
   return n;
 }
 
-/* ------------------------------------------------------------- title buttons
- */
+/* title buttons */
 static bool btn_present(const struct winrec *w, int kind)
 {
-  /* Dialogs (transient children) get only a close box and stay movable. */
+  /* Dialogs (transient children) get only a close box and stay movable */
   bool is_dialog = parent_id_of(w->id) >= 0;
   if (kind == 0)
-    return true; /* close: always       */
+    return true; /* close: always */
   if (kind == 1)
     return (w->flags & UWIN_F_RESIZABLE) != 0; /* maximize: resizable */
   return !is_dialog;                           /* minimize: not dialogs */
@@ -531,13 +502,11 @@ static int titlebtn_hit(const struct winrec *w, int mx, int my)
   return -1;
 }
 
-/* ------------------------------------------------------------- taskbar layout
- */
+/* taskbar layout */
 static int taskbar_layout(int left, int right, int *idxs, int *bxs, int *bws, int max)
 {
   int n = 0;
-  /* One button per top-level window; transient children (dialogs) belong to
-   * their parent's app and don't get their own entry. */
+  /* One button per top-level window */
   for (int i = 0; i < nwin && n < max; i++)
     if (parent_id_of(cur[i].id) < 0)
       idxs[n++] = i;
@@ -586,12 +555,11 @@ static int taskbar_hit(int mx, int my)
   return -1;
 }
 
-/* ------------------------------------------------------------- rendering */
+/* rendering */
 
 static void ui_text_clip(int x, int y, const char *s, unsigned col, int maxw);
 
-/* Vertical gradient (deep indigo -> slate), a function of y only: one colour
- * per screen row, rebuilt when the height changes. */
+/* Vertical gradient (deep indigo -> slate), a function of y only: one colour per screen row */
 static unsigned *bg_rows;
 static int bg_rows_h;
 
@@ -619,9 +587,7 @@ static void draw_background(void)
     gfx_fill_rect(0, y, screen_w, 1, bg_rows[y]);
 }
 
-/* Blit a window's client buffer into the back buffer at the client rect,
- * honouring the active gfx clip (intersected manually since this writes `back`
- * directly for an opaque XRGB source with a source stride). */
+/* Blit a window's client buffer into the back buffer at the client rect */
 static void blit_client(int dx, int dy, const unsigned *src, int sw, int sh, int sstride)
 {
   long long x1 = (long long)dx + sw, y1 = (long long)dy + sh;
@@ -645,8 +611,7 @@ static void blit_client(int dx, int dy, const unsigned *src, int sw, int sh, int
     memcpy(back + (long)y * fb_pitch + x0, src + (long)(y - dy) * sstride + src_x, (unsigned)(x2 - x0) * 4);
 }
 
-/* the per-window client buffer, pinned via win_map and kept mapped across
- * frames (the Phase-1 pin), refreshed each frame from the enumerated set. */
+/* the per-window client buffer */
 struct clientmap {
   int id;
   bool valid;
@@ -663,8 +628,7 @@ static const struct winmap *client_for(int id)
   return 0;
 }
 
-/* Remap every enumerated window (win_map is idempotent and picks up resized
- * buffers) and unmap ids that are gone so the kernel can reclaim frames. */
+/* Remap every enumerated window and unmap ids that are gone so the kernel can reclaim frames */
 static void refresh_maps(void)
 {
   /* drop maps for gone windows */
@@ -718,8 +682,6 @@ static void draw_window(const struct winrec *w, bool focused)
 {
   unsigned title_bg = focused ? 0x2f6fb0 : 0x55606e;
   unsigned frame = 0x10141a;
-  /* A modal being flashed (its family was clicked while it holds input) pulses
-   * its title bar so the eye is pulled to the dialog demanding attention. */
   if (w->id == flash_id && flash_frames > 0 && ((flash_frames >> 1) & 1))
     title_bg = 0xf0a020;
 
@@ -756,8 +718,7 @@ static void draw_window(const struct winrec *w, bool focused)
     draw_close_button(bx, by, 0xc04030);
   }
 
-  /* Client area: blit the app's pixel buffer, or fill the chrome bg if
-   * unmapped. */
+  /* Client area: blit the app's pixel buffer, or fill the chrome bg if unmapped */
   int cx, cy, cw, ch;
   client_rect(w, &cx, &cy, &cw, &ch);
   const struct winmap *cm = client_for(w->id);
@@ -776,7 +737,7 @@ static void draw_window(const struct winrec *w, bool focused)
   gfx_rect(w->x, w->y, w->w, w->h, 0x05070a);
 }
 
-/* ---- cursor drawing (ported from wm.c) ---- */
+/* cursor drawing (ported from wm.c) */
 static void draw_glyph(const struct cur_shape *s, int x, int y)
 {
   for (int row = 0; row < s->nrows; row++) {
@@ -897,9 +858,6 @@ static void draw_cursor(int kind, int mx, int my)
   }
 }
 
-/* ---- taskbar indicators (battery/volume/network are unavailable to a plain
- * user program; the compositor draws only the clock. Phase 3 can expose these
- * via /proc reads if wanted.) ---- */
 static void ui_text_clip(int x, int y, const char *s, unsigned col, int maxw)
 {
   char buf[WM_TITLE_MAX + 2];
@@ -999,7 +957,7 @@ static void draw_tb_menu(void)
   gfx_rect(x, y, TBM_W, tbm_h(), 0x05070a);
 }
 
-/* ---- Alt+Tab overlay ---- */
+/* Alt+Tab overlay */
 #define AT_ROW_H 24
 #define AT_PAD 12
 #define AT_PANEL_W 340
@@ -1037,9 +995,7 @@ static void draw_switcher(void)
   }
 }
 
-/* ---- crash windows: rendered directly (no kernel window). Pending reports are
- * drained once via crash_poll(); each becomes a persistent panel the user can
- * dismiss by clicking its close box. ---- */
+/* crash windows: rendered directly (no kernel window) */
 struct crashwin {
   bool used;
   int x, y, w, h;
@@ -1128,7 +1084,7 @@ static void draw_crashwin(struct crashwin *c)
   }
 }
 
-/* ------------------------------------------------------------- cursor pick */
+/* cursor pick */
 enum { RZ_L = 1, RZ_R = 2, RZ_T = 4, RZ_B = 8 };
 
 static bool hover_resizing;
@@ -1204,14 +1160,12 @@ static int pick_cursor(int mx, int my)
   return CUR_ARROW;
 }
 
-/* ------------------------------------------------------------- compose */
+/* compose */
 static bool clip_hits(int x, int y, int w, int h)
 {
   return x < clip_x1 && x + w > clip_x0 && y < clip_y1 && y + h > clip_y0;
 }
 
-/* Is window i's visible part of the clip hidden behind a single window above
- * it? Frames are opaque, so such a window needs no drawing. */
 static bool occluded(int i)
 {
   const struct winrec *w = &cur[i];
@@ -1247,7 +1201,7 @@ static void compose(int mx, int my)
   draw_cursor(pick_cursor(mx, my), mx, my);
 }
 
-/* ------------------------------------------------------------- input */
+/* input */
 static void deliver_client(int slot, unsigned type, int mx, int my)
 {
   struct winrec *w = &cur[slot];
@@ -1257,23 +1211,17 @@ static void deliver_client(int slot, unsigned type, int mx, int my)
   win_deliver(w->id, &ev);
 }
 
-/* Live-drag / resize state (tracked by stable window id, since cur[] slots move
- * as z-order changes between frames). */
+/* Live-drag / resize state */
 static int drag_id = -1, resize_id = -1;
 static int drag_dx, drag_dy, drag_mx0, drag_my0;
 static int rsz_edge;
 static int rsz_ox, rsz_oy, rsz_ow, rsz_oh, rsz_mx0, rsz_my0;
 static int app_drag_id = -1;
 
-/* Title-bar double-click: two presses on the same window within DBLCLICK_MS and
- * DBLCLICK_SLOP pixels of each other toggle maximize (like the maximize
- * button). */
 #define DBLCLICK_MS 400
 #define DBLCLICK_SLOP 6
 
-/* Maximize/restore tracked in the compositor (there is no cross-process
- * maximize primitive): a window id is "maximized" while it fills the work area;
- * the entry remembers its pre-maximize frame so a second click restores it. */
+/* Maximize/restore tracked in the compositor (there is no cross-process maximize primitive) */
 struct maxrec {
   int id;
   bool used;
@@ -1323,7 +1271,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
   bool down = buttons & 1;
   bool rdown = buttons & 2;
 
-  /* Wheel -> focused window under cursor (dropped if a modal blocks it). */
+  /* Wheel -> focused window under cursor (dropped if a modal blocks it) */
   if (dz) {
     int idx = window_at(mx, my);
     if (idx >= 0 && blocking_modal(idx) < 0) {
@@ -1332,7 +1280,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
     }
   }
 
-  /* Right-press. */
+  /* Right-press */
   if (rdown && !prev_rdown) {
     int bar_y = screen_h - WM_BAR_H;
     int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
@@ -1365,7 +1313,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
   prev_rdown = rdown;
 
   if (down && !prev_down) { /* left press */
-    /* crash windows sit above everything but the menus: close box / dismiss. */
+                            /* crash windows sit above everything but the menus: close box / dismiss */
     for (int i = MAXCRASHWIN - 1; i >= 0; i--) {
       struct crashwin *c = &crashwins[i];
       if (!c->used)
@@ -1410,8 +1358,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
     int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
     if (tbw >= 0) {
       start_open = false;
-      /* restore/minimize/raise via focus + geom (kernel owns min/max state,
-       * but a plain raise is all we can express cross-process here). */
+      /* restore/minimize/raise via focus + geom */
       raise_window(tbw);
       prev_down = down;
       return;
@@ -1440,9 +1387,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
     }
     int idx = window_at(mx, my);
     if (idx >= 0) {
-      /* A modal dialog holds its family: clicking the parent bounces focus to
-       * the dialog (raised + flashed) instead of interacting with the parent.
-       */
+      /* A modal dialog holds its family */
       int mb = blocking_modal(idx);
       if (mb >= 0) {
         raise_family_id(mb);
@@ -1460,9 +1405,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
         win_deliver(w->id, &ev);
       } else if (tb == 1) { /* maximize / restore */
         toggle_maximize(idx);
-      } else if (tb == 2) { /* minimize: no cross-process
-                             * minimize primitive yet, best effort is to lower
-                             * the window so another comes forward. */
+      } else if (tb == 2) { /* minimize: no cross-process minimize primitive yet */
         z_lower(w->id);
       } else if (resizable && is_maxed(w->id) < 0 && resize) {
         int e = resize;
@@ -1511,9 +1454,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
       struct winrec *w = &cur[s];
       int rw = w->w, rh = w->h;
       int m = is_maxed(w->id);
-      /* Drag off a maximized window: once the pointer actually leaves the
-       * press point (so a plain click-hold doesn't), restore the pre-maximize
-       * size and grab it under the cursor, proportionally along the title. */
+      /* Drag off a maximized window */
       if (m >= 0 && (mx - drag_mx0 > DBLCLICK_SLOP || drag_mx0 - mx > DBLCLICK_SLOP || my - drag_my0 > DBLCLICK_SLOP ||
                      drag_my0 - my > DBLCLICK_SLOP)) {
         rw = maxed[m].sw;
@@ -1570,7 +1511,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
     drag_id = resize_id = app_drag_id = -1;
   }
 
-  /* Hover: no button held -> WEV_MOVE to the window under the cursor. */
+  /* Hover: no button held -> WEV_MOVE to the window under the cursor */
   static int hover_id = -1, hover_px = -1, hover_py = -1;
   if (!down && !rdown && drag_id < 0 && resize_id < 0 && app_drag_id < 0 && (mx != hover_px || my != hover_py)) {
     hover_px = mx;
@@ -1599,12 +1540,9 @@ static void handle_input(int mx, int my, int buttons, int dz)
   prev_down = down;
 }
 
-/* ---- global key routing (Super -> Start menu; Alt+Tab -> switcher; else the
- * focused window). Input keys arrive as {c, mods}. ---- */
+/* global key routing (Super -> Start menu; Alt+Tab -> switcher; else the focused window) */
 
-/* Clipboard-history viewer (Super+V): launch /bin/cliphist, then on its exit-0
- * (a clip was picked & promoted to the front) paste it into whatever window now
- * holds focus, the same path Ctrl+V uses (paste_begin, below). */
+/* Clipboard-history viewer (Super+V): launch /bin/cliphist */
 static void paste_begin(void);
 static int cliphist_pid;
 static void open_cliphist(void)
@@ -1612,8 +1550,7 @@ static void open_cliphist(void)
   if (cliphist_pid > 0)
     return; /* one at a time */
   cliphist_pid = spawn("/bin/cliphist", 0);
-  /* Reaped exclusively by cliphist_reap (which needs its exit status), so it is
-   * deliberately NOT added to kids[]. */
+  /* Reaped exclusively by cliphist_reap, so it is deliberately NOT added to kids[] */
 }
 static void cliphist_reap(void)
 {
@@ -1628,9 +1565,6 @@ static void cliphist_reap(void)
   }
 }
 
-/* Paste back-pressure: keys that couldn't fit the focused window's event ring
- * this frame wait here and are re-offered next frame before fresh input is
- * pulled, so a large paste never overruns a slow app's evq (win_key_space). */
 #define PENDING_MAX 256
 static struct {
   int c, mods;
@@ -1647,13 +1581,11 @@ static void pend_push(int c, int mods)
   pend_head = next;
 }
 
-/* ---- Print Screen
- * The main thread copies the back buffer; a background thread PNG-encodes and
- * writes it. One shot at a time; extra presses are dropped. */
+/* Print Screen */
 static unsigned *shot_pixels; /* tightly-packed w*h capture (grown on demand) */
-static unsigned shot_cap;     /* capacity of shot_pixels, in pixels             */
-static int shot_tid;          /* encode worker, 0 = idle                        */
-static void *shot_stack;      /* worker stack (allocated once, reused)          */
+static unsigned shot_cap;     /* capacity of shot_pixels, in pixels */
+static int shot_tid;          /* encode worker, 0 = idle */
+static void *shot_stack;      /* worker stack (allocated once, reused) */
 static char shot_path[64];
 static unsigned shot_w, shot_h;
 
@@ -1665,29 +1597,29 @@ static void shot_worker(void)
 
 static void take_screenshot(void)
 {
-  if (shot_tid) { /* previous encode still running?     */
+  if (shot_tid) { /* previous encode still running? */
     int st;
     if (!waitpid_nb(shot_tid, &st))
-      return; /* busy: drop this shot         */
+      return; /* busy: drop this shot */
     shot_tid = 0;
   }
   unsigned w = screen_w, h = screen_h;
   if (!w || !h || !back)
     return;
 
-  if (shot_cap < w * h) { /* (re)size the capture buffer        */
+  if (shot_cap < w * h) { /* (re)size the capture buffer */
     free(shot_pixels);
     shot_pixels = malloc(w * h * 4);
     shot_cap = shot_pixels ? w * h : 0;
   }
   if (!shot_pixels)
     return;
-  for (unsigned y = 0; y < h; y++) /* fast capture: strip the fb stride  */
+  for (unsigned y = 0; y < h; y++) /* fast capture: strip the fb stride */
     memcpy(shot_pixels + y * w, back + y * fb_pitch, w * 4);
   shot_w = w;
   shot_h = h;
 
-  /* First free /home/root/screenshotN.png. */
+  /* First free /home/root/screenshotN.png */
   struct statinfo si;
   for (unsigned idx = 0; idx <= 9999; idx++) {
     int p = 0;
@@ -1708,7 +1640,7 @@ static void take_screenshot(void)
       shot_path[p++] = *s;
     shot_path[p] = '\0';
     if (stat(shot_path, &si) != 0)
-      break; /* name is free                */
+      break; /* name is free */
     if (idx == 9999)
       return;
   }
@@ -1733,7 +1665,7 @@ static void feed_key(int c, int mods)
   if (c == 'v' && (mods & KMOD_CTRL)) {
     paste_begin();
     return;
-  } /* Ctrl+V  */
+  } /* Ctrl+V */
   if (c == KEY_SUPER) {
     start_open = !start_open;
     return;
@@ -1754,9 +1686,7 @@ static void feed_key(int c, int mods)
       at_sel = (at_sel + 1) % at_count;
     return;
   }
-  /* We don't get an "Alt released" event from input_poll; commit the switch
-   * when a non-Tab key arrives while the overlay is up, or on any key without
-   * Alt. */
+  /* We don't get an "Alt released" event from input_poll */
   if (at_active && !(mods & KMOD_ALT)) {
     int s = slot_of(at_order[at_sel]);
     at_active = false;
@@ -1767,8 +1697,7 @@ static void feed_key(int c, int mods)
   int t = topmost_visible();
   if (t < 0)
     return;
-  /* Flow control: if the focused window's event ring is full, park the key and
-   * retry next frame rather than letting win_deliver silently drop it. */
+  /* Flow control: if the focused window's event ring is full */
   if (win_key_space(cur[t].id) <= 0) {
     pend_push(c, mods);
     return;
@@ -1777,9 +1706,7 @@ static void feed_key(int c, int mods)
   win_deliver(cur[t].id, &ev);
 }
 
-/* Drain parked keys before pulling fresh input; stop as soon as the target
- * fills again (a key that can't be delivered is re-parked at the queue front by
- * feed_key). */
+/* Drain parked keys before pulling fresh input; stop as soon as the target fills again */
 static void pending_flush(void)
 {
   while (!pend_empty()) {
@@ -1797,9 +1724,6 @@ static void pending_flush(void)
   }
 }
 
-/* Clipboard paste: inject the newest text clip from /bin/clipd into the focused
- * window as keys (CRLF/CR folded to LF, other control bytes dropped), drained a
- * few per frame via win_key_space so a slow app's ring can't overflow. */
 #define PASTE_MAX 8192
 static char paste_buf[PASTE_MAX];
 static int paste_len, paste_pos;
@@ -1833,8 +1757,7 @@ static void paste_begin(void)
   paste_len = out; /* publish last */
 }
 
-/* Drain the pending paste into the focused window; stop when its event ring
- * fills (resumes next frame) or focus is lost (discard the rest). */
+/* Drain the pending paste into the focused window */
 static void paste_flush(void)
 {
   while (paste_pos < paste_len) {
@@ -1849,14 +1772,11 @@ static void paste_flush(void)
     win_deliver(cur[t].id, &ev);
   }
 }
-/* Active-frame target rate (Hz). The desktop paces to this while there's
- * motion; Settings can retune it via set_target_hz(). Idle frames use a fixed
- * low-power cadence regardless. */
+/* Active-frame target rate (Hz) */
 static int target_hz = 60;
 static unsigned active_period(void) { return target_hz > 0 ? 1000u / (unsigned)target_hz : 16u; }
 
-/* Frame pacing: sleep only the slack to a running deadline. Re-anchor on the
- * first call, an overrun, or a cadence change. */
+/* Frame pacing: sleep only the slack to a running deadline */
 static unsigned frame_deadline;
 
 static void frame_pace(unsigned period)
@@ -1871,17 +1791,13 @@ static void frame_pace(unsigned period)
   msleep((unsigned)slack);
 }
 
-/* Persisted desktop tunables: seeded into kernel sysfs nodes at startup from
- * /etc config and rewritten when a live value changes. Refresh rate also sets
- * the pacing target. */
+/* Persisted desktop tunables */
 #define CONF_DISPLAY "/etc/display.conf"
 #define CONF_INPUT "/etc/input.conf"
 #define CONF_SOUND "/etc/sound.conf"
 #define DISPLAY_RATE "/sys/class/graphics/fb0/rate"
 
-/* One row per tunable: config file + key <-> sysfs attribute. `cur` is the last
- * seeded or persisted value (change baseline). Values are opaque strings; keys
- * are globally unique. */
+/* One row per tunable: config file + key <-> sysfs attribute */
 struct tunable {
   const char *file;
   const char *key;
@@ -1908,9 +1824,7 @@ static int scan_uint(const char *p)
   return v;
 }
 
-/* Read a sysfs attribute into `out`, trimming trailing whitespace. Returns the
- * length; 0 for an empty/blank node (a device that isn't present, e.g. no
- * codec). */
+/* Read a sysfs attribute into `out`, trimming trailing whitespace */
 static int node_read(const char *path, char *out, int max)
 {
   int n = readfile(path, out, max - 1);
@@ -1922,7 +1836,7 @@ static int node_read(const char *path, char *out, int max)
   return n;
 }
 
-/* Fill each tunable's `cur` from its /etc config ("key=value" lines). */
+/* Fill each tunable's `cur` from its /etc config ("key=value" lines) */
 static void conf_load(void)
 {
   for (int f = 0; f < NCONF; f++) {
@@ -1961,7 +1875,7 @@ static void conf_load(void)
   }
 }
 
-/* Rewrite `file` from the known tunables that belong to it. */
+/* Rewrite `file` from the known tunables that belong to it */
 static void conf_save_file(const char *file)
 {
   char buf[256], *o = buf, *end = buf + sizeof buf;
@@ -1982,15 +1896,14 @@ static void conf_save_file(const char *file)
     writefile(file, buf, (int)(o - buf));
 }
 
-/* Persist every domain whose tunable changed. */
+/* Persist every domain whose tunable changed */
 static void conf_save(void)
 {
   for (int f = 0; f < NCONF; f++)
     conf_save_file(conf_files[f]);
 }
 
-/* Push saved values into kernel nodes, then read back what the kernel accepted
- * (values may be clamped) as the change baseline. */
+/* Push saved values into kernel nodes */
 static void tun_restore(void)
 {
   for (int i = 0; i < NTUN; i++)
@@ -2005,8 +1918,7 @@ static void tun_restore(void)
   }
 }
 
-/* Poll the live nodes; update any that changed. Returns 1 if something moved.
- */
+/* Poll the live nodes; update any that changed */
 static bool tun_poll(void)
 {
   bool changed = false;
@@ -2023,7 +1935,7 @@ static bool tun_poll(void)
   return changed;
 }
 
-/* The live frame-pacing target (Hz) from the kernel. */
+/* The live frame-pacing target (Hz) from the kernel */
 static int rate_now(void)
 {
   char v[16];
@@ -2032,8 +1944,7 @@ static int rate_now(void)
   return scan_uint(v);
 }
 
-/* ------------------------------------------------------------- prev-frame
- * snapshot */
+/* prev-frame */
 struct pfsnap {
   int id, x, y, w, h;
   bool vis, min;
@@ -2042,8 +1953,7 @@ struct pfsnap {
 static struct pfsnap pf[WM_LIST_MAX];
 static int npf;
 
-/* Rebind to the framebuffer's current geometry: remap the back buffer, re-init
- * the gfx surface and cursor bounds, force a full repaint. */
+/* Rebind to the framebuffer's current geometry: remap the back buffer */
 static int bind_mode(void)
 {
   struct fbinfo fi;
@@ -2062,10 +1972,8 @@ static int bind_mode(void)
   return 0;
 }
 
-/* Detect a resolution change via fb_info each frame; rebind and pull windows
- * off the smaller screen back into view (maximized ones refill the work area). */
-/* Center each transient dialog over its parent once, so it stays draggable;
- * `centered` tracks placed ids. cur[i] is updated so it draws centered now. */
+/* Detect a resolution change via fb_info each frame */
+/* Center each transient dialog over its parent once, so it stays draggable */
 static int centered[WM_LIST_MAX], ncentered;
 static bool was_centered(int id)
 {
@@ -2136,7 +2044,7 @@ int main(void)
     return 1;
   }
 
-  /* Session autostart: clipboard server, notification daemon, terminal. */
+  /* Session autostart: clipboard server, notification daemon, terminal */
   kid_track(spawn("/bin/clipd", 0));
   kid_track(spawn("/bin/vmclipd", 0)); /* VMware host clipboard bridge; self-exits off VMware */
   kid_track(spawn("/bin/notifyd", 0));
@@ -2148,7 +2056,7 @@ int main(void)
   int prev_focus = -1, last_sec = -1;
   bool inited = false;
 
-  /* Restore saved tunables, then adopt the live refresh rate as the pacing target. */
+  /* Restore saved tunables, then adopt the live refresh rate as the pacing target */
   conf_load();
   tun_restore();
   target_hz = rate_now();
@@ -2168,7 +2076,7 @@ int main(void)
     reap_kids();
     crash_ingest();
 
-    /* Refresh the window set, then (re)pin client buffers to match it. */
+    /* Refresh the window set, then (re)pin client buffers to match it */
     nwin = win_enum(cur, WM_LIST_MAX);
     if (nwin < 0)
       nwin = 0;
@@ -2179,8 +2087,7 @@ int main(void)
 
     check_resolution(); /* Settings may have changed the fb mode */
 
-    /* Pick up a Settings change to any tunable ~1x/sec; persist on change and
-     * keep the pacing target in step with the live refresh rate. */
+    /* Pick up a Settings change to any tunable ~1x/sec */
     unsigned nowms = msec();
     if ((int)(nowms - conf_poll_at) >= 0) {
       conf_poll_at = nowms + 1000;
@@ -2197,11 +2104,11 @@ int main(void)
       force_full = true;
     } /* pulse a modal */
 
-    /* Drain any keys parked by paste back-pressure before pulling new input. */
+    /* Drain any keys parked by paste back-pressure before pulling new input */
     pending_flush();
     paste_flush(); /* inject any in-progress clipboard paste */
 
-    /* Keys first (may open menus / switch focus). */
+    /* Keys first (may open menus / switch focus) */
     for (int i = 0; i < in.nkeys; i++)
       feed_key(in.keys[i].c, in.keys[i].mods);
 
@@ -2216,15 +2123,13 @@ int main(void)
     bool full = !inited || force_full;
     force_full = false;
 
-    /* Focus / z-order / visibility / add / remove change -> full repaint. */
+    /* Focus / z-order / visibility / add / remove change -> full repaint */
     if (!full) {
       int focus = topmost_visible();
       int focus_id = focus >= 0 ? cur[focus].id : -1;
       int zvis = (focus_id != prev_focus);
       if (nwin != npf)
         zvis = 1; /* window added or removed */
-      /* nwin == npf here, so pf[i] is window i's previous-frame snapshot
-       * unless the z-order or the window set changed. */
       for (int i = 0; i < nwin && !zvis; i++)
         if (pf[i].id != cur[i].id || pf[i].vis != win_visible(&cur[i]) || pf[i].min != win_minimized(&cur[i]))
           zvis = 1;
@@ -2317,7 +2222,6 @@ int main(void)
 
     int idle =
         in.nkeys == 0 && in.buttons == 0 && dz == 0 && !full && ndmg == 0 && pend_empty() && paste_pos >= paste_len;
-    frame_pace(idle ? 40 : active_period()); /* target_hz while active; ~25 fps
-                                                when static */
+    frame_pace(idle ? 40 : active_period()); /* target_hz while active; ~25 fps when static */
   }
 }

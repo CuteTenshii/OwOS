@@ -1,5 +1,4 @@
-/* dom.h — HTML DOM tree for the browser. dom_parse() builds a node tree on the
- * heap; html.c walks it to render. */
+/* dom.h: HTML DOM tree built by dom_parse() and walked by html.c. */
 #ifndef OWOS_DOM_H
 #define OWOS_DOM_H
 
@@ -42,20 +41,15 @@ struct dom_node {
   void *anim_rec;        /* animation/transition record (features/anim), or NULL */
   unsigned anc_bloom[4]; /* hashes of the ancestors' tag/id/classes (css/engine.c) */
   unsigned anc_bloom_seq;
-  void *wrapper; /* cached JS wrapper object (browser/js/bindings.c),
-                  * NULL until first exposed to script — gives
-                  * a node stable identity so listeners stick. */
+  void *wrapper; /* cached JS wrapper (browser/js/bindings.c); NULL until exposed to script */
 };
 
-/* Parse `len` bytes into a tree under a synthetic "#document" root. Returns
- * NULL only on immediate OOM; a mid-parse OOM returns the partial tree. */
+/* Parse `len` bytes under a synthetic "#document" root. NULL only on immediate OOM. */
 struct dom_node *dom_parse(const char *html, int len);
 void dom_free(struct dom_node *root);
 const char *dom_get_attr(const struct dom_node *node, const char *name);
 
-/* Mutation API used by the JS DOM bindings (browser/js/bindings.c). Nodes are plain
- * malloc'd cells; appended nodes are owned by the tree and freed by dom_free.
- */
+/* Mutation API for the JS DOM bindings; appended nodes are owned by the tree. */
 struct dom_node *dom_new_element(const char *tag);
 struct dom_node *dom_new_text(const char *text);
 void dom_append_child(struct dom_node *parent, struct dom_node *child);
@@ -74,13 +68,11 @@ extern bool dom_structural_styles;
 /* Installed by features/anim: drops the record of a node that is being freed. */
 extern void (*dom_on_free_anim)(struct dom_node *n);
 
-/* Hook the JS layer installs so a freed node detaches its wrapper (see dom.c).
- */
+/* Hook the JS layer installs so a freed node detaches its wrapper. */
 extern void (*dom_on_free_wrapper)(void *wrapper);
 extern void (*dom_on_free_style_cache)(void *cache);
 
-/* Bumped on every tree mutation; the browser re-flattens only when it changes.
- */
+/* Bumped on every tree mutation. */
 extern unsigned dom_mutation_seq;
 
 #endif /* OWOS_DOM_H */

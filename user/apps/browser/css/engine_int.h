@@ -8,9 +8,7 @@
 #include "sibling.h"
 #include <stdbool.h>
 
-/* The argument of :not() — a single simple selector (tag / #id / .class, no
- * combinators or nested pseudos): enough for :not(.x), :not(div), :not(div.x).
- */
+/* :not() argument: one simple selector (tag, #id or .class). */
 struct simple_sel {
   char tag[16];
   char **cls; /* heap class names */
@@ -18,11 +16,7 @@ struct simple_sel {
   char *id; /* heap, NULL = none */
 };
 
-/* Pseudo-classes we model. The structural/state ones are matched against the
- * DOM; the dynamic group lands on PC_NEVER (no live interaction state in a
- * static render, so it never matches), as does any pseudo-class we don't
- * recognise (its rule then can't apply, which is what an invalid selector
- * should do). */
+/* Pseudo-classes; dynamic and unrecognised ones map to PC_NEVER (never match). */
 enum {
   PC_FIRST_CHILD,
   PC_LAST_CHILD,
@@ -47,10 +41,7 @@ enum {
   PC_NEVER,
 };
 
-/* :is()/:where() argument: a heap list of full sub-selectors (each may carry
- * its own combinators and nested :is()). Held by pointer so struct pseudo —
- * embedded in every rule's struct selector — stays fixed-size and can nest
- * arbitrarily. */
+/* :is()/:where() sub-selector list, held by pointer so struct pseudo stays fixed-size. */
 struct sel_list;
 
 struct pseudo {
@@ -67,7 +58,7 @@ struct sel_step {
   char *id; /* heap, NULL = none */
   struct pseudo *pc;
   int npc;
-  int pseudo_el; /* PE_* — a ::pseudo-element; never matches a normal box */
+  int pseudo_el; /* PE_* ::pseudo-element; never matches a normal box */
   bool child;    /* combinator to the step on the right is '>' */
 };
 enum { PE_NONE = 0, PE_BEFORE = CSS_PSEUDO_BEFORE, PE_AFTER = CSS_PSEUDO_AFTER, PE_OTHER = 3 };
@@ -85,10 +76,7 @@ struct sel_list {
   struct selector *sels;
 };
 
-/* A parsed @media query the rule lives under (n == 0 → no query, always
- * applies). A query is an OR of comma-separated conditions; each condition is a
- * media type plus ANDed features, optionally `not`-negated. See
- * media_matches(). */
+/* Parsed @media query: OR of comma-separated conditions; n == 0 means always applies. */
 enum { MT_ALL, MT_SCREEN, MT_PRINT, MT_OTHER };
 enum {
   MF_UNKNOWN,
@@ -120,16 +108,7 @@ struct media_query {
   struct media_query *next; /* the owning sheet's list */
 };
 
-/* Rule index key: a rule is bucketed by its rightmost compound's most specific
- * simple selector (id, else a class, else tag, else universal), so an element
- * only ever tests rules that can match it — without this, Tailwind's thousands
- * of utility rules made the cascade O(elements × all-rules) and pegged the CPU.
- *
- * A rule is filed under one or more keys (see rule_keys): a plain compound
- * gives a single id/class/tag key; a subject-position :is()/:where() with no
- * key of its own gives one key per branch (e.g. :is(a.x, b.y) -> classes x and
- * y), so it leaves the universal bucket and is tested only by elements those
- * branches can match. */
+/* Rule index key: id, else class, else tag, else universal; :is()/:where() may add several. */
 enum { KK_UNIV = 0, KK_ID, KK_CLS, KK_TAG };
 struct css_rule {
   struct selector sel;
@@ -145,18 +124,14 @@ struct css_rule {
   struct css_rule *next; /* document order (build + fallback iteration)  */
 };
 
-/* One index entry: a rule filed in a bucket under a specific key. `key` points
- * into the rule's own selector tree (stable for the rule's lifetime), so a rule
- * keyed under several selectors needs no string copies. */
+/* One index entry: a rule filed in a bucket; `key` points into the rule's selector tree. */
 struct css_idx {
   struct css_rule *rule;
   const char *key; /* the id/class/tag string, or 0 for universal */
   struct css_idx *next;
 };
 
-/* An @font-face: a declared family name, the raw TTF/OTF src url, and the base
- * URL of the stylesheet that declared it (a relative src resolves against this,
- * not the page — an external sheet's fonts live next to the sheet). */
+/* @font-face: family, raw src url, and the stylesheet base URL a relative src resolves against. */
 struct css_face {
   char family[CSS_FAM_MAX];
   char *url;
@@ -164,10 +139,7 @@ struct css_face {
   struct css_face *next;
 };
 
-/* A parsed @keyframes block: a name plus a set of stops, each an offset
- * (permille, 0..1000) and the declaration delta that applies at it, kept sorted
- * by offset. The animation engine (anim.c) finds the two stops bracketing a
- * progress and interpolates their animatable properties. */
+/* @keyframes: name plus stops sorted by offset (permille), each with its declaration delta. */
 struct css_keyframes {
   char name[CSS_ANIM_NAME];
   int nstops, cap;
@@ -186,9 +158,7 @@ struct css_sheet {
   struct media_query *medias;      /* every @media query parsed for this sheet */
   bool has_pseudo_el;              /* set once any ::before/::after rule is pushed */
   const char *cur_base;            /* base URL for faces added by the in-progress css_add */
-  /* Rule index (rebuilt lazily when `gen` changes; see ensure_index). Buckets
-   * hold css_idx entries so one rule can be filed under several keys; every
-   * entry lives in exactly one bucket chain, so teardown just walks them. */
+  /* Rule index, rebuilt lazily when `gen` changes; each entry lives in exactly one bucket. */
   struct css_idx *id_b[CSS_NBUCK], *cls_b[CSS_NBUCK], *tag_b[CSS_NBUCK], *uni;
   int idx_gen;
   bool idx_failed;
@@ -198,9 +168,7 @@ struct css_sheet {
   int match_cap;
 };
 
-/* Root font size: the px basis for font-relative units (rem; em too — we don't
- * track an element-local font-size, so em uses the same basis). Keep in sync
- * with the renderer's default text size. */
+/* Root font size: px basis for rem and em; keep in sync with the renderer's default text size. */
 #define CSS_ROOT_FONT_PX 16
 
 extern int g_vw, g_vh;

@@ -1,17 +1,10 @@
-/* torrent.c — a BitTorrent client, a thin CLI over libtorrent
- * (user/lib/net/{bencode,torrent,tracker,peer}.c + user/lib/crypto).
- *
- *   torrent info  <file>            parse a .torrent: name, infohash, layout
- *   torrent test                    offline self-check (parse + infohash)
- *   torrent peers <file>            announce to the tracker, list peers
- *   torrent peer  <file> <ip> <port>  fetch + verify piece 0 from one peer
- *   torrent get   <file>            download a single-file torrent to owofs
- */
+/* torrent.c, a BitTorrent client, a thin CLI over libtorrent
+ * (user/lib/net/{bencode,torrent,tracker,peer}.c + user/lib/crypto) */
 
 #include "torrent.h"
 #include "owos.h"
 
-/* Read a whole .torrent into a static buffer; returns length or -1. */
+/* Read a whole .torrent into a static buffer; returns length or -1 */
 static unsigned char tbuf[1u << 20]; /* 1 MiB: plenty for a metainfo file */
 
 static int load(const char *path, struct torrent *t)

@@ -1,16 +1,4 @@
-/* ipc.c — named local ports (see ipc.h).
- *
- * A connection is two pipe-pool rings: c2s (client->server) and s2c
- * (server->client). Each end is one FD_CHANNEL fd that reads its rx ring and
- * writes its tx ring, so the channel is symmetric and ordinary read()/write()
- * just work. The pipe pool already gives us blocking flow control and EOF on
- * the peer's close, so this layer is only a name registry plus a one-slot
- * connection handshake (serialized: one un-accepted connection per port at a
- * time, the rest wait — fine for a request/reply daemon like the clipboard).
- *
- * The port table is file-static and zero-initialized, so `used == 0` and
- * `pend == PEND_NONE` are the correct cold state with no init call.
- */
+/* ipc.c: named local ports (see ipc.h). Each connection is two pipe-pool rings (c2s, s2c). */
 
 #include "ipc.h"
 #include "kstring.h"
@@ -25,16 +13,13 @@ enum { PEND_NONE = 0, PEND_CLAIMED, PEND_READY }; /* zero = no pending conn */
 struct port {
   bool used;
   char name[IPC_NAME_MAX];
-  int pend;     /* PEND_* — guards the single connection slot          */
-  int c2s, s2c; /* the pending connection's pipe-pool ids (when READY)  */
+  int pend;     /* PEND_*: guards the connection slot */
+  int c2s, s2c; /* pending connection's pipe ids (READY) */
 };
 
 static struct port ports[IPC_MAX_PORTS];
 
-/* These run from the int 0x80 gate (IF=0) but yield via timer_sleep, which
- * re-enables interrupts; the explicit cli/sti below make each claim/publish
- * test-and-set atomic against a timer-driven context switch. */
-
+/* Runs under IF=0 but yields via timer_sleep; cli/sti make claim/publish atomic. */
 static struct port *find_port(const char *name)
 {
   for (int i = 0; i < IPC_MAX_PORTS; i++)
@@ -46,7 +31,7 @@ static struct port *find_port(const char *name)
 int ipc_port_create(const char *name)
 {
   if (find_port(name))
-    return -1; /* one server per name           */
+    return -1;
   for (int i = 0; i < IPC_MAX_PORTS; i++) {
     if (!ports[i].used) {
       ports[i].used = true;
@@ -66,12 +51,10 @@ void ipc_port_destroy(int id)
   if (id < 0 || id >= IPC_MAX_PORTS || !ports[id].used)
     return;
   struct port *p = &ports[id];
-  /* Release the server-side ends of a published-but-unaccepted connection
-   * (the server reads c2s and writes s2c); the client still holds its own
-   * ends and frees the rings when it closes. */
+  /* Release the server-side ends of an unaccepted connection. */
   if (p->pend == PEND_READY) {
-    pipe_close(p->c2s, 0); /* server is c2s's reader            */
-    pipe_close(p->s2c, 1); /* server is s2c's writer            */
+    pipe_close(p->c2s, 0);
+    pipe_close(p->s2c, 1);
   }
   p->used = false;
   p->pend = PEND_NONE;
@@ -81,10 +64,9 @@ int ipc_connect(const char *name, int *rx, int *tx)
 {
   struct port *p = find_port(name);
   if (!p)
-    return -1; /* no server registered          */
+    return -1;
 
-  /* Claim the single connection slot (atomically), waiting if a prior
-   * connection hasn't been accepted yet. */
+  /* Claim the single connection slot, waiting if one is pending. */
   for (;;) {
     __asm__ volatile("cli");
     if (p->used && p->pend == PEND_NONE) {
@@ -119,8 +101,8 @@ int ipc_connect(const char *name, int *rx, int *tx)
   p->pend = PEND_READY;
   __asm__ volatile("sti");
 
-  *rx = s2c; /* client reads server->client */
-  *tx = c2s; /* client writes client->server */
+  *rx = s2c;
+  *tx = c2s;
   return 0;
 }
 
@@ -130,18 +112,18 @@ int ipc_accept(int id, int *rx, int *tx)
     return -1;
   struct port *p = &ports[id];
 
-  while (p->pend != PEND_READY) { /* park until a client publishes  */
+  while (p->pend != PEND_READY) {
     if (!p->used)
       return -1;
-    timer_sleep(10); /* timer_sleep sti;hlt's: low CPU */
+    timer_sleep(10);
   }
 
   __asm__ volatile("cli");
   int c2s = p->c2s, s2c = p->s2c;
-  p->pend = PEND_NONE; /* free the slot for the next     */
+  p->pend = PEND_NONE;
   __asm__ volatile("sti");
 
-  *rx = c2s; /* server reads client->server */
-  *tx = s2c; /* server writes server->client */
+  *rx = c2s;
+  *tx = s2c;
   return 0;
 }

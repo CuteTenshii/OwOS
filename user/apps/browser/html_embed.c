@@ -1,10 +1,6 @@
 #include "html_int.h"
 
-/* Serialize a DOM subtree back into SVG/XML text: `<tag attr="v"
- * ...>kids</tag>`, or `<tag .../>` when childless. Values are emitted raw (the
- * DOM keeps them undecoded), which is what the SVG parser wants. Reuses the
- * existing svg.c rasterizer rather than teaching the layout engine SVG
- * geometry. */
+/* Serialize a DOM subtree back into SVG/XML text */
 struct sbuf {
   char *p;
   int n, cap;
@@ -30,10 +26,7 @@ static void svg_put(struct sbuf *b, const char *s)
   memcpy(b->p + b->n, s, (unsigned)len + 1);
   b->n += len;
 }
-/* Emit ` name="value"` for a baked SVG paint: -1 skip, -2 none, -3
- * currentColor, else #rrggbb. Prepended before the element's own attrs so a
- * CSS-resolved paint wins over a presentation attribute (svg.c reads the first
- * matching attr). */
+/* Emit ` name="value"` for a baked SVG paint */
 static void svg_put_paint(struct sbuf *b, const char *name, int v)
 {
   if (v == -1)
@@ -59,10 +52,7 @@ static void svg_put_paint(struct sbuf *b, const char *name, int v)
   }
   svg_put(b, "\"");
 }
-/* Bound the recursion like the DOM walk (WALK_DEPTH_MAX): each frame carries a
- * css_style plus a compute_style call, so an adversarially deep inline <svg>
- * would otherwise overflow the 64 KiB worker stack. Content nested past the cap
- * is dropped rather than crashing the worker. */
+/* Bound the recursion like the DOM walk (WALK_DEPTH_MAX) */
 #define SVG_MAX_DEPTH 256
 static void svg_serialize(struct dom_node *el, struct sbuf *b, int depth)
 {
@@ -75,9 +65,7 @@ static void svg_serialize(struct dom_node *el, struct sbuf *b, int depth)
   }
   svg_put(b, "<");
   svg_put(b, el->tag);
-  /* Bake the element's cascaded fill/stroke so CSS (e.g. Tailwind fill-*
-   * classes, `svg{fill:…}`) colours the icon — svg.c only reads
-   * attrs/inline-style. */
+  /* Bake the element's cascaded fill/stroke so CSS (e.g */
   {
     struct css_style ecs;
     compute_style(el, &ecs);
@@ -105,11 +93,7 @@ static void svg_serialize(struct dom_node *el, struct sbuf *b, int depth)
 
 struct img_carry g_carry;
 
-/* Inline <svg>…</svg>: serialize the subtree and hand it to the SVG rasterizer
- * as a self-contained document, emitted as an inline image (same machinery as
- * <img src=.svg>). The bytes are committed synchronously here on the parse/walk
- * thread — no network fetch — and the slot is exposed only once committed. An
- * unchanged svg (same markup and currentColor) reuses its rasterized pixels. */
+/* Inline <svg>…</svg> */
 void handle_svg(struct dom_node *el, const struct css_style *cs)
 {
   if (!browser_ensure_imgs(B->pg->n_imgs + 1))
@@ -160,10 +144,7 @@ void handle_svg(struct dom_node *el, const struct css_style *cs)
   im->start_row = -1;
   if (!carried) {
     img_clear(im);
-    /* currentColor resolves to the SVG's own CSS color if it sets one, else the
-     * inherited text colour (sty_cur.fg) — icons are usually
-     * `fill="currentColor"` coloured by `color` on an ancestor link/element,
-     * not on the <svg> itself. */
+    /* currentColor resolves to the SVG's own CSS color if it sets one, else the inherited text */
     resource_commit_inline(idx, (const unsigned char *)sb.p, sb.n, color);
   }
   im->want = 0;
@@ -174,8 +155,7 @@ void handle_svg(struct dom_node *el, const struct css_style *cs)
   free(sb.p);
 }
 
-/* Append an inline <img> to B->pg->imgs on its own line (box from the computed
- * CSS width/height). data: URIs are skipped. */
+/* Append an inline <img> to B->pg->imgs on its own line (box from the computed CSS width/height) */
 void handle_img(struct dom_node *el, const struct css_style *cs)
 {
   if (!browser_ensure_imgs(B->pg->n_imgs + 1))
@@ -192,10 +172,7 @@ void handle_img(struct dom_node *el, const struct css_style *cs)
   if (!srcbuf[0] || starts_ci(srcbuf, "data:"))
     return;
 
-  /* Resolve to an absolute URL (a frame's relative src needs the frame's base),
-   * then apply CSP img-src — a blocked image is dropped, not laid out. The
-   * fetchers resolve im->href against the page, so storing the absolute URL is
-   * equivalent and lets CSP's http->https upgrade stick. */
+  /* Resolve to an absolute URL (a frame's relative src needs the frame's base), then apply CSP */
   char imgabs[URL_MAX], imgurl[URL_MAX];
   if (url_absolute(srcbuf)) {
     int a = 0;
@@ -238,12 +215,7 @@ void handle_img(struct dom_node *el, const struct css_style *cs)
   W_run_nl = 1;
 }
 
-/* <audio>/<video>: register the media element and, when it has a visible widget
- * (any <video>, or an <audio controls>), anchor a blank reserved row at the
- * text cursor — exactly as handle_img does for an inline image. The element's
- * <source> children and fallback content are not walked: a supported media
- * element hides them, matching browsers. Anchor at -1 (no widget) for a bare
- * <audio>. */
+/* <audio>/<video>: register the media element and, when it has a visible widget (any <video> */
 void handle_media(struct dom_node *el)
 {
   bool is_video = streq(el->tag, "video");
@@ -262,8 +234,7 @@ void handle_media(struct dom_node *el)
   }
 }
 
-/* <link rel="icon">: standard icon outranks apple-touch; mask-icon (SVG)
- * skipped. */
+/* <link rel="icon"> */
 void handle_favicon(struct dom_node *el)
 {
   const char *rel = dom_get_attr(el, "rel");
@@ -288,8 +259,7 @@ void handle_favicon(struct dom_node *el)
   B->pg->favicon_pri = pri;
 }
 
-/* Emit a literal ASCII/UTF-8 run with attr `a`, no whitespace collapsing — used
- * for the chrome around form controls and list markers. */
+/* Emit a literal ASCII/UTF-8 run with attr `a`, no whitespace collapsing - used for the chrome */
 void emit_lit(const char *s, unsigned char a)
 {
   if (W_pend_sp) {
@@ -303,20 +273,10 @@ void emit_lit(const char *s, unsigned char a)
   }
 }
 
-/* --- iframes -------------------------------------------------------------- *
- * Each <iframe> the walk meets becomes a cache entry keyed by (absolute src,
- * embedder URL). The entry starts PENDING; the worker fetches the document
- * (resource.c), decides whether it may be embedded, and hands the result back
- * via html_iframe_resolve, which parses an allowed HTML body into a live
- * sub-document. The walk then flattens that sub-document inline, indented and
- * bordered, into the parent's text — the same line-flow the rest of the page
- * uses. The cache lives for the page's lifetime (freed by html_page_teardown)
- * so it survives the many relayouts a page does, rather than re-fetching each
- * time. */
+/* --- iframes --- */
 #define FRAME_MAX_DEPTH 4
 
-/* sandbox flags we act on (a present `sandbox` attribute always sets SBX_ON).
- */
+/* sandbox flags we act on (a present `sandbox` attribute always sets SBX_ON) */
 enum { SBX_ON = 1, SBX_SCRIPTS = 2, SBX_SAME_ORIGIN = 4, SBX_FORMS = 8, SBX_TOP_NAV = 16, SBX_POPUPS = 32 };
 
 struct frame_doc *g_frames;
@@ -367,9 +327,7 @@ void frames_free(void)
   g_frames = 0;
 }
 
-/* Collect a sub-document's inline <style> blocks into `sheet` (frames don't
- * pull external stylesheets — only the page's own walk does the batched <link>
- * fetch). */
+/* Collect a sub-document's inline <style> blocks into `sheet` (frames don't pull external */
 void collect_inline_styles(struct dom_node *node, css_sheet *sheet, const char *base)
 {
   for (struct dom_node *c = node->first_child; c; c = c->next) {
@@ -404,8 +362,7 @@ static int parse_sandbox(struct dom_node *el)
   return f;
 }
 
-/* Emit the frame's chrome line: a marker, the host, sandbox/allow badges, and
- * an optional status note (loading / blocked / error reason). */
+/* Emit the frame's chrome line */
 static void frame_chrome(const char *host, const char *note, int sbx, const char *allow)
 {
   block_break();
@@ -425,15 +382,12 @@ static void frame_chrome(const char *host, const char *note, int sbx, const char
   if (note && note[0]) {
     sapp(line, &n, sizeof line, " \xe2\x80\x94 ");
     sapp(line, &n, sizeof line, note);
-  } /* — */
+  } /*  -  */
   emit_lit(line, ST_BOLD | 6);
   block_break();
 }
 
-/* Flatten an allowed frame's sub-document into the parent flow: indented one
- * level, under the frame's own CSS sheet and base URL, with link navigation
- * gated by the sandbox. The block context is saved/restored around the
- * recursive walk. */
+/* Flatten an allowed frame's sub-document into the parent flow */
 static void frame_render(struct frame_doc *f, int sbx)
 {
   if (!f->doc) {
@@ -452,8 +406,7 @@ static void frame_render(struct frame_doc *f, int sbx)
     sapp(sv_base, &k, sizeof sv_base, g_base_url);
   }
 
-  /* A sandboxed frame may navigate only with allow-top-navigation/-popups; a
-   * nested frame can never widen what an outer sandbox already forbade. */
+  /* A sandboxed frame may navigate only with allow-top-navigation/-popups */
   bool nav = !(sbx & SBX_ON) || (sbx & (SBX_TOP_NAV | SBX_POPUPS));
   g_link_nav = sv_nav && nav;
   g_sheet = f->sheet ? f->sheet : sv_sheet;
@@ -522,9 +475,7 @@ void handle_iframe(struct dom_node *el)
     host[0] = '\0';
   }
 
-  /* CSP frame-src (top document only; falls back to child-src then
-   * default-src). upgrade-insecure-requests also rewrites the frame URL here.
-   */
+  /* CSP frame-src (top document only */
   if (g_frame_depth == 0 && B->pg->csp) {
     char fu[URL_MAX], reason[64];
     if (!csp_check_url(B->pg->csp, CSP_FRAME, abs, g_cur_page_url, fu, sizeof fu, reason, sizeof reason)) {

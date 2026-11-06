@@ -1,35 +1,18 @@
-/* notifyd.c — the notification daemon.
- *
- * Owns the "notify" IPC port, keeps the notification history, and draws the
- * popups + the Notification Center in its own window. The compositor just shows
- * that window like any other app's — nothing notification-specific lives in the
- * kernel (the freedesktop / KDE Plasma model).
- *
- * Two threads share the address space: a server thread blocks on port_accept
- * and decodes incoming notifications; the main thread runs the window UI. They
- * hand off through a single-producer/single-consumer inbox ring (no lock needed
- * — only the server writes `head`, only the UI writes `tail`). The UI thread
- * owns the history and the window outright.
- *
- * A new notification pops the window up (the "toast"); the window persists as
- * the scrollable history until the user closes it, and reopens on the next
- * arrival. Launching notifyd a second time just asks the running one to show
- * itself.
- */
+/* notifyd.c, the notification daemon. Owns the "notify" IPC port, keeps the notification
+ * history, and draws the popups + the Notification Center in its own window */
 #include "gfx.h"
 #include "notify.h"
 #include "owos.h"
 #include "upng.h"
 #include <stdbool.h>
 
-/* ---- layout + theme -------------------------------------------------------
- */
-#define NW 384 /* default window width                          */
-#define NH 492 /* default window height                         */
+/* layout + theme */
+#define NW 384 /* default window width */
+#define NH 492 /* default window height */
 #define PAD 12
 #define GAP 10
 #define HDR_H 36
-#define THUMB 56 /* max image thumbnail edge                      */
+#define THUMB 56 /* max image thumbnail edge */
 #define BODY_MAXLINES 4
 #define LINE_H 19
 #define BTN_GAP 8
@@ -54,12 +37,12 @@ struct note {
   char btn_label[NOTIFY_MAX_BUTTONS][NOTIFY_BLABEL_MAX];
   char btn_cmd[NOTIFY_MAX_BUTTONS][NOTIFY_BCMD_MAX];
   int nbtn;
-  unsigned *img; /* ARGB thumbnail, or NULL                     */
+  unsigned *img; /* ARGB thumbnail, or NULL */
   int iw, ih;
 };
 
 #define HIST_MAX 64
-static struct note *hist[HIST_MAX]; /* newest first; UI-thread owned        */
+static struct note *hist[HIST_MAX]; /* newest first; UI-thread owned */
 static int nhist;
 
 #define INBOX_N 32
@@ -77,8 +60,7 @@ static void free_note(struct note *n)
   free(n);
 }
 
-/* ---- framed I/O over a channel fd -----------------------------------------
- */
+/* framed I/O over a channel fd */
 static int read_full(int fd, void *buf, int n)
 {
   char *p = (char *)buf;
@@ -105,9 +87,7 @@ static int write_full(int fd, const void *buf, int n)
   return 1;
 }
 
-/* Read a length-prefixed string (lenbytes = 1 or 2, LE) into dst[cap], NUL-
- * terminating and discarding any bytes past the cap so the framing stays
- * aligned. */
+/* Read a length-prefixed string (lenbytes = 1 or 2, LE) into dst[cap] */
 static int rd_str(int fd, int lenbytes, char *dst, int cap)
 {
   unsigned char b[2] = {0, 0};
@@ -127,10 +107,9 @@ static int rd_str(int fd, int lenbytes, char *dst, int cap)
   return 1;
 }
 
-/* ---- image decode: PNG path -> a small ARGB thumbnail ---------------------
- */
+/* image decode: PNG path -> a small ARGB thumbnail */
 #define FR_BUF 8192
-static unsigned char fr_buffer[FR_BUF]; /* server thread only          */
+static unsigned char fr_buffer[FR_BUF]; /* server thread only */
 
 struct freader {
   const char *name;
@@ -165,9 +144,7 @@ static int fr_get(void *c)
   return fr_buffer[f->pos++];
 }
 
-/* Nearest-neighbour downscale, streamed one source row at a time: each source
- * row paints the target rows it covers, so the whole frame is never resident.
- */
+/* Nearest-neighbour downscale, streamed one source row at a time */
 struct dctx {
   unsigned *out;
   int tw, th;
@@ -225,8 +202,7 @@ static void load_image(struct note *n, const char *path)
   n->ih = th;
 }
 
-/* ---- inbox (server -> UI) -------------------------------------------------
- */
+/* inbox (server -> UI) */
 static void inbox_push(struct note *n)
 {
   int nh = (in_head + 1) % INBOX_N;
@@ -238,8 +214,7 @@ static void inbox_push(struct note *n)
   in_head = nh;
 }
 
-/* ---- the server thread ----------------------------------------------------
- */
+/* the server thread */
 static void serve(int ch)
 {
   char op;
@@ -280,16 +255,14 @@ static void serve(int ch)
   if (!n->app[0])
     strcpy(n->app, "App");
   n->id = g_next_id++;
-  /* Ack before decoding the image so the sender doesn't block on a slow PNG;
-   * the notification simply appears once the thumbnail is ready. */
+  /* Ack before decoding the image so the sender doesn't block on a slow PNG */
   write_full(ch, "K", 1);
   if (img[0])
     load_image(n, img);
   inbox_push(n);
 }
 
-/* ---- history --------------------------------------------------------------
- */
+/* history */
 static void hist_prepend(struct note *n)
 {
   if (nhist == HIST_MAX) {
@@ -319,7 +292,7 @@ static void hist_clear(void)
   nhist = 0;
 }
 
-/* Drain everything the server queued; returns how many arrived. */
+/* Drain everything the server queued; returns how many arrived */
 static int inbox_drain(void)
 {
   int got = 0;
@@ -332,8 +305,7 @@ static int inbox_drain(void)
   return got;
 }
 
-/* ---- word-wrap (measure or draw) ------------------------------------------
- */
+/* word-wrap (measure or draw) */
 static int wrap_text(const char *s, int maxw, int maxlines, int draw, int x, int y, unsigned col)
 {
   int lines = 0, i = 0;
@@ -395,7 +367,7 @@ static int wrap_text(const char *s, int maxw, int maxlines, int draw, int x, int
   return lines;
 }
 
-/* UI text truncated with ".." to fit `maxw`. */
+/* UI text truncated with ".." to fit `maxw` */
 static void ui_clip(int x, int y, const char *s, unsigned col, int maxw)
 {
   if (maxw <= 0)
@@ -421,8 +393,7 @@ static void ui_clip(int x, int y, const char *s, unsigned col, int maxw)
     gfx_ui_text(x, y, buf, col);
 }
 
-/* ---- card geometry (shared by draw + hit-test) ----------------------------
- */
+/* card geometry (shared by draw + hit-test) */
 struct cardgeom {
   int textx, textw, sub_y, body_y, btn_y, height, close_x, close_y;
 };
@@ -433,7 +404,7 @@ static void card_geom(const struct note *n, int x, int y, int w, struct cardgeom
   g->textx = tx;
   g->textw = (x + w - 12) - tx;
 
-  int after = y + 10 + 22; /* below the title row           */
+  int after = y + 10 + 22; /* below the title row */
   g->sub_y = n->subtitle[0] ? after : -1;
   if (n->subtitle[0])
     after += LINE_H;
@@ -456,7 +427,7 @@ static void card_geom(const struct note *n, int x, int y, int w, struct cardgeom
   g->close_y = y + 8;
 }
 
-/* Button rects within a card, laid out left to right from the text column. */
+/* Button rects within a card, laid out left to right from the text column */
 static int button_layout(const struct note *n, const struct cardgeom *g, int *bx, int *bw)
 {
   int x = g->textx;
@@ -484,8 +455,7 @@ static int content_height(int win_w)
   return total;
 }
 
-/* ---- rendering ------------------------------------------------------------
- */
+/* rendering */
 static void draw_x(int x, int y, unsigned col)
 {
   for (int d = 0; d < 9; d++) {
@@ -524,7 +494,7 @@ static void draw_card(const struct note *n, int x, int y, int w, int newest)
   draw_x(g.close_x, g.close_y, C_DIM);
 }
 
-static int g_scroll; /* list scroll, in pixels                         */
+static int g_scroll; /* list scroll, in pixels */
 
 static void clamp_scroll(int win_w, int win_h)
 {
@@ -541,8 +511,6 @@ static void render(int win_w, int win_h)
 {
   gfx_clear(C_BG);
 
-  /* Cards first; the header is painted over their top so a scrolled-up card
-   * slides cleanly under it. */
   int cw = cardw_for(win_w);
   int y = HDR_H - g_scroll;
   for (int i = 0; i < nhist; i++) {
@@ -569,15 +537,14 @@ static void render(int win_w, int win_h)
   scrollbar_draw(win_w - SBW, HDR_H, SBW, visible, g_scroll, total, visible);
 }
 
-/* ---- input ----------------------------------------------------------------
- */
-static int g_sb_drag; /* dragging the scrollbar thumb                   */
+/* input */
+static int g_sb_drag; /* dragging the scrollbar thumb */
 static void run_command(const char *cmd);
 
-/* Returns 1 if the click changed anything needing a repaint. */
+/* Returns 1 if the click changed anything needing a repaint */
 static int handle_click(int mx, int my, int win_w, int win_h)
 {
-  if (my < HDR_H) { /* header                  */
+  if (my < HDR_H) { /* header */
     if (nhist && button_hit(win_w - PAD - 84, (HDR_H - 22) / 2, 84, 22, mx, my)) {
       hist_clear();
       g_scroll = 0;
@@ -588,7 +555,7 @@ static int handle_click(int mx, int my, int win_w, int win_h)
 
   int visible = win_h - HDR_H;
   int total = content_height(win_w);
-  if (mx >= win_w - SBW) { /* scrollbar               */
+  if (mx >= win_w - SBW) { /* scrollbar */
     int reg = scrollbar_hit(win_w - SBW, HDR_H, SBW, visible, mx, my);
     if (reg == SCROLLBAR_UP)
       g_scroll -= 40;
@@ -634,7 +601,7 @@ static int handle_click(int mx, int my, int win_w, int win_h)
   return 0;
 }
 
-/* Spawn a button's action: "prog [arg]" — bare names resolve under /bin. */
+/* Spawn a button's action: "prog [arg]", bare names resolve under /bin */
 static void run_command(const char *cmd)
 {
   if (!cmd || !cmd[0])
@@ -663,8 +630,7 @@ static void run_command(const char *cmd)
   spawn(full, ai ? arg : 0);
 }
 
-/* ---- window lifecycle + main loop -----------------------------------------
- */
+/* window lifecycle + main loop */
 static int g_win = -1;
 static int g_w = NW, g_h = NH;
 
@@ -681,11 +647,7 @@ static void open_window(void)
   g_scroll = 0;
 }
 
-/* The server runs in its own thread, not main, for two reasons: a uwin window
- * can only be created/owned by the task that draws it (so the window stays in
- * main), and file descriptors are per-task — so this thread opens the listen fd
- * itself and blocks in port_accept. It shares only memory with main: the inbox
- * ring, the history, and show_req. */
+/* The server runs in its own thread, not main, for two reasons */
 static char server_stack[32768];
 static void server_fn(void)
 {
@@ -705,7 +667,7 @@ static void server_fn(void)
 
 int main(void)
 {
-  /* If a notifyd is already serving, a second launch just asks it to show. */
+  /* If a notifyd is already serving, a second launch just asks it to show */
   int probe = port_open(NOTIFY_PORT, 0);
   if (probe >= 0) {
     char op = NOTIFY_OP_SHOW, r = 0;

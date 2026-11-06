@@ -1,11 +1,5 @@
-/* blk.c — block-device selection for owofs (see blk.h).
- *
- * Picks the first present backend in the order IDE -> AHCI -> NVMe and forwards
- * every sector access to it. The order keeps the QEMU dev setup unchanged (its
- * -hda IDE disk wins, with SATA/NVMe scratch disks ignored) while letting owofs
- * fall through to AHCI/NVMe on machines that have no IDE controller at all
- * (modern laptops, a VMware VM with only an NVMe disk).
- */
+/* blk.c: block-device selection for owofs (see blk.h).
+ * Picks the first present backend in the order IDE, AHCI, NVMe and forwards sector access to it. */
 
 #include "blk.h"
 #include "ahci.h"
@@ -24,10 +18,8 @@
 enum backend { BK_NONE, BK_IDE, BK_AHCI, BK_NVME, BK_SD, BK_RAM };
 static enum backend backend;
 
-/* RAM disk (tmpfs). Sized to match owofs's 16 MiB sector space so its bump
- * allocator can never run off the end. Allocated above the identity map on
- * first fallback and identity-mapped so the kernel can address it directly. */
-#define RAMDISK_SECTORS 32768u /* 16 MiB / 512                       */
+/* RAM disk (tmpfs) sized to owofs's 16 MiB sector space, allocated above the identity map on first use. */
+#define RAMDISK_SECTORS 32768u
 static volatile uint8_t *ram_disk;
 static uint32_t ram_sectors;
 
@@ -133,7 +125,7 @@ int blk_use_ram(void)
       return -1;
     ram_disk = (volatile uint8_t *)(uintptr_t)phys;
     ram_sectors = RAMDISK_SECTORS;
-    for (uint32_t i = 0; i < bytes; i++) /* start clean (unformatted)      */
+    for (uint32_t i = 0; i < bytes; i++)
       ram_disk[i] = 0;
   }
   cache_clear();
@@ -141,20 +133,13 @@ int blk_use_ram(void)
   return 0;
 }
 
-/* ---- removable devices: the /dev layer -------------------------------------
- *
- * blk.c no longer mounts or knows filesystems -- fs.c owns the mount table and
- * probes a device through the fs_ops drivers. Here we just enumerate the
- * present removable devices (everything except the disk owofs booted from)
- * under stable /dev names, and hand out each one's sector read/write callbacks
- * so fs.c can mount it. A CD/DVD reads 2048-byte ATAPI sectors (the `iso`
- * flag); the rest read 512-byte sectors. `id` is the owofs backend a device
- * would be, so we skip whichever disk owofs itself booted from. */
+/* Removable devices (the /dev layer): enumerate present devices except the disk owofs booted from
+ * and hand out their sector callbacks for fs.c to mount. CDs read 2048-byte ATAPI sectors. */
 struct cand {
-  const char *dev;            /* /dev name: "cd0","usb0","ide0",...        */
-  const char *kind;           /* UI label:  "CD","USB","IDE",...           */
-  int (*present)(void);       /* hardware presence -- cheap, no sector I/O */
-  const char *(*model)(void); /* drive model string for the UI            */
+  const char *dev; /* /dev name: "cd0","usb0","ide0",...        */
+  const char *kind;
+  int (*present)(void);
+  const char *(*model)(void);
   enum backend id;
   int iso; /* reads 2048-byte ATAPI sectors             */
   blk_read_fn r;
@@ -174,8 +159,7 @@ static const struct cand cands[] = {
 /* Present, and not the disk owofs itself booted from. */
 static bool cand_listable(const struct cand *c) { return c->present() && c->id != backend; }
 
-/* Enumerate present removable devices (the /dev contents + the Files app list).
- */
+/* Enumerate present removable devices (the /dev contents and the Files app list). */
 int blk_dev_list(struct blk_devinfo *out, int max)
 {
   int n = 0;
@@ -191,9 +175,7 @@ int blk_dev_list(struct blk_devinfo *out, int max)
   return n;
 }
 
-/* Resolve a /dev name to its sector I/O callbacks (and 2048-byte CD flag), so
- * fs.c can probe + mount it. 0 on success, -1 if no present device has that
- * name. `w` is left NULL for a read-only medium (a CD). */
+/* Resolve a /dev name to its sector callbacks and CD flag. 0, or -1 if absent; *w is NULL if read-only. */
 int blk_dev_io(const char *dev, blk_read_fn *r, blk_write_fn *w, int *iso)
 {
   for (int i = 0; i < NCAND; i++) {

@@ -1,34 +1,10 @@
-/* smbd.c — a minimal read-only SMB2 server, in user space.
- *
- * Ported from the former in-kernel kernel/smb.c: the SMB2 wire protocol is a
- * pure byte-stream server over TCP/445 plus file reads, so it needs no ring-0
- * privilege and lives here as a windowless /bin daemon. main() opens a listener
- * and loops accept -> serve -> close; run it detached (e.g. `smbd &`).
- *
- * Scope and shape: one client per connection, dialect 2.0.2 only, guest
- * authentication (no password check), a single hard-coded read-only share
- * ("owofs") backed by owofs. It implements just the command set a stock client
- * walks through to browse and read files:
- *
- *   NEGOTIATE -> SESSION_SETUP (NTLMSSP, granted as guest) -> TREE_CONNECT
- *   -> CREATE -> QUERY_DIRECTORY / QUERY_INFO / READ -> CLOSE -> ...
- *
- * Everything is little-endian on the wire (SMB2), framed by the NetBIOS
- * session header (a 4-byte big-endian length) on direct TCP/445. The server is
- * synchronous: serve() reads one request, builds one response, writes it, and
- * repeats — blocking in net_recv is fine.
- *
- * The certificate-equivalent caveat: authentication is cosmetic. The server
- * completes the NTLMSSP handshake but accepts ANY credentials as guest and
- * never verifies them. Good for serving files to yourself over QEMU's NAT, not
- * a security boundary.
- */
+/* smbd.c, a minimal read-only SMB2 server, in user space */
 
 #include "owos.h"
 #include <stdbool.h>
 #include <stdint.h>
 
-/* ------------------------------------------------------------- LE accessors */
+/* LE accessors */
 
 static uint16_t load_le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t load_le32(const uint8_t *p)
@@ -55,7 +31,7 @@ static void put64(uint8_t *p, uint64_t v)
   put32(p + 4, (uint32_t)(v >> 32));
 }
 
-/* ------------------------------------------------------------- SMB2 on wire */
+/* SMB2 on wire */
 
 #define SMB2_MAGIC0 0xFE /* 0xFE 'S' 'M' 'B' */
 #define SMB2_HDR 64
@@ -75,7 +51,7 @@ enum {
 
 #define SMB2_FLAGS_RESPONSE 0x00000001
 
-/* NTSTATUS values we use. */
+/* NTSTATUS values we use */
 #define STATUS_SUCCESS 0x00000000u
 #define STATUS_MORE_PROCESSING                                                                                         \
   0xC0000016u /* STATUS_MORE_PROCESSING_REQUIRED                                                                       \
@@ -88,23 +64,19 @@ enum {
 
 #define SMB2_DIALECT_0202 0x0202
 
-/* SPNEGO NegTokenInit advertising NTLMSSP — the security blob the server emits
- * in NEGOTIATE so the client knows to drive NTLMSSP in SESSION_SETUP. */
+/* SPNEGO NegTokenInit advertising NTLMSSP */
 static const uint8_t spnego_neg_init[] = {
     0x60, 0x1c, 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02, 0xa0, 0x12, 0x30, 0x10, 0xa0,
     0x0e, 0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
 };
 
-/* --------------------------------------------------------------- buffers/IO */
+/* buffers/IO */
 
 #define SMB_MSG_MAX 70000u /* per-message cap (NBT length is 24 bits) */
-#define SMB_TREE_ID 1      /* the single share's tree id              */
+#define SMB_TREE_ID 1      /* the single share's tree id */
 #define SMB_MAX_HANDLES 16
 
-/* An open "file": a root-directory handle (for QUERY_DIRECTORY) or a regular
- * file (for READ). One client at a time, so a tiny fixed table suffices. The
- * SMB2 FileId's first 8 bytes carry the slot index; the rest is a fixed magic.
- */
+/* An open "file": a root-directory handle (for QUERY_DIRECTORY) or a regular file (for READ) */
 struct smb_handle {
   bool used;
   bool is_dir;
@@ -123,7 +95,7 @@ struct smb_conn {
   bool closed;
 };
 
-/* Read exactly n bytes into buf; returns 0 on success, -1 on EOF/error. */
+/* Read exactly n bytes into buf; returns 0 on success, -1 on EOF/error */
 static int read_full(struct smb_conn *s, uint8_t *buf, uint32_t n)
 {
   uint32_t got = 0;
@@ -136,15 +108,13 @@ static int read_full(struct smb_conn *s, uint8_t *buf, uint32_t n)
   return 0;
 }
 
-/* Read one NetBIOS-framed SMB2 message into s->rx; returns body length or -1.
- */
+/* Read one NetBIOS-framed SMB2 message into s->rx; returns body length or -1 */
 static int read_msg(struct smb_conn *s)
 {
   uint8_t hdr[4];
   if (read_full(s, hdr, 4) < 0)
     return -1;
-  /* hdr[0] is the NBT message type (0x00 = session message); length is the
-   * low 24 bits, big-endian. */
+  /* hdr[0] is the NBT message type; length is the low 24 bits, big-endian */
   uint32_t len = ((uint32_t)hdr[1] << 16) | ((uint32_t)hdr[2] << 8) | hdr[3];
   if (len < SMB2_HDR || len > SMB_MSG_MAX)
     return -1;
@@ -153,7 +123,7 @@ static int read_msg(struct smb_conn *s)
   return (int)len;
 }
 
-/* Write all of buf[0..n); returns 0 on success, -1 on error. */
+/* Write all of buf[0..n); returns 0 on success, -1 on error */
 static int write_full(struct smb_conn *s, const uint8_t *buf, uint32_t n)
 {
   uint32_t sent = 0;
@@ -166,7 +136,7 @@ static int write_full(struct smb_conn *s, const uint8_t *buf, uint32_t n)
   return 0;
 }
 
-/* Send body[0..len) wrapped in a NetBIOS session header. */
+/* Send body[0..len) wrapped in a NetBIOS session header */
 static int send_msg(struct smb_conn *s, const uint8_t *body, uint32_t len)
 {
   uint8_t nbt[4];
@@ -181,9 +151,7 @@ static int send_msg(struct smb_conn *s, const uint8_t *body, uint32_t len)
   return 0;
 }
 
-/* Fill the 64-byte SMB2 response header in s->tx, echoing the request's
- * command, MessageId, SessionId and TreeId, with the RESPONSE flag and given
- * status. */
+/* Fill the 64-byte SMB2 response header in s->tx, echoing the request's command, MessageId */
 static void build_header(struct smb_conn *s, const uint8_t *req, uint32_t status)
 {
   uint8_t *h = s->tx;
@@ -204,16 +172,13 @@ static void build_header(struct smb_conn *s, const uint8_t *req, uint32_t status
   put32(h + 32, 0);                   /* Reserved */
   put32(h + 36, load_le32(req + 36)); /* TreeId */
   put64(h + 40, s->session_id);       /* SessionId */
-                                      /* Signature (16) left zero. */
+                                      /* Signature (16) left zero */
 }
 
-/* Fallback Windows FILETIME (100ns ticks since 1601, ~2015) for entries with no
- * recorded time (owofs mtime == 0, e.g. never stamped or a generated pseudo-fs
- * node). Real entries use their converted owofs stamp (see owofs_filetime). */
+/* Fallback Windows FILETIME for entries with no recorded time */
 #define FAKE_FILETIME 0x01D0000000000000ull
 
-/* Convert an owofs packed mtime ([year-2000:6][month:4][day:5][hour:5][min:6]
- * [sec:6]) to a Windows FILETIME. Returns FAKE_FILETIME if unset (m == 0). */
+/* Convert an owofs packed mtime to a Windows FILETIME */
 static uint64_t owofs_filetime(uint32_t m)
 {
   if (m == 0)
@@ -240,7 +205,7 @@ static uint64_t owofs_filetime(uint32_t m)
   return (secs + 11644473600ull) * 10000000ull;
 }
 
-/* ------------------------------------------------------------- NEGOTIATE */
+/* NEGOTIATE */
 
 static int do_negotiate(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 {
@@ -273,22 +238,14 @@ static int do_negotiate(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
   return send_msg(s, s->tx, total);
 }
 
-/* ------------------------------------------------------- SESSION_SETUP / NTLM
- *
- * The client drives NTLMSSP inside SPNEGO: it sends a NEGOTIATE (type 1), we
- * reply with a CHALLENGE (type 2) and STATUS_MORE_PROCESSING_REQUIRED, it sends
- * an AUTHENTICATE (type 3), and we accept it as guest without checking
- * anything. We don't parse SPNEGO/ASN.1 on the way in — we just scan for the
- * "NTLMSSP\0" signature and read the message type. On the way out we hand-build
- * the small SPNEGO wrappers (DER) since their shapes are fixed.
- */
+/* SESSION_SETUP / NTLM */
 
 #define SMB2_SESSION_FLAG_IS_GUEST 0x0001
-#define OWOS_SESSION_ID 0x0000000000574F4Full /* "OW0" — any nonzero */
+#define OWOS_SESSION_ID 0x0000000000574F4Full /* "OW0", any nonzero */
 
 static const uint8_t ntlmssp_sig[8] = {'N', 'T', 'L', 'M', 'S', 'S', 'P', 0};
 
-/* Find the NTLMSSP message inside a request; returns its start or NULL. */
+/* Find the NTLMSSP message inside a request; returns its start or NULL */
 static const uint8_t *find_ntlmssp(const uint8_t *buf, uint32_t len)
 {
   if (len < 12)
@@ -306,7 +263,7 @@ static const uint8_t *find_ntlmssp(const uint8_t *buf, uint32_t len)
   return NULL;
 }
 
-/* DER length byte(s) for values < 256. Returns bytes written. */
+/* DER length byte(s) for values < 256 */
 static uint32_t put_der_len(uint8_t *p, uint32_t L)
 {
   if (L < 128) {
@@ -318,7 +275,7 @@ static uint32_t put_der_len(uint8_t *p, uint32_t L)
   return 2;
 }
 
-/* Append a UTF-16LE copy of an ASCII string; returns bytes written (2*len). */
+/* Append a UTF-16LE copy of an ASCII string; returns bytes written (2*len) */
 static uint32_t put_utf16(uint8_t *p, const char *s)
 {
   uint32_t n = 0;
@@ -329,10 +286,7 @@ static uint32_t put_utf16(uint8_t *p, const char *s)
   return n;
 }
 
-/* Build an NTLMSSP CHALLENGE (type 2) into out; returns its length. Fixed
- * server challenge, server-type target with a small target-info block — enough
- * for any client to form a (NTLMv1 or v2) AUTHENTICATE, which we then ignore.
- */
+/* Build an NTLMSSP CHALLENGE (type 2) into out; returns its length */
 static uint32_t build_ntlm_challenge(uint8_t *out)
 {
   for (int i = 0; i < 48; i++)
@@ -346,7 +300,7 @@ static uint32_t build_ntlm_challenge(uint8_t *out)
   uint32_t tnlen = put_utf16(out + pay, "OWOS");
   pay += tnlen;
   uint32_t tioff = pay;
-  /* TargetInfo AV pairs: NbComputerName, NbDomainName, EOL. */
+  /* TargetInfo AV pairs: NbComputerName, NbDomainName, EOL */
   uint8_t *ti = out + pay;
   uint32_t t = 0;
   put16(ti + t, 1);
@@ -382,8 +336,7 @@ static uint32_t build_ntlm_challenge(uint8_t *out)
   return pay;
 }
 
-/* Wrap an NTLMSSP message in an SPNEGO NegTokenResp
- * (negState=accept-incomplete, responseToken=<ntlm>). Returns total length. */
+/* Wrap an NTLMSSP message in an SPNEGO NegTokenResp */
 static uint32_t wrap_spnego_resp(uint8_t *out, const uint8_t *ntlm, uint32_t nlen)
 {
   uint8_t inner[600];
@@ -413,7 +366,7 @@ static uint32_t wrap_spnego_resp(uint8_t *out, const uint8_t *ntlm, uint32_t nle
   return o;
 }
 
-/* SPNEGO NegTokenResp negState=accept-completed (the final SUCCESS blob). */
+/* SPNEGO NegTokenResp negState=accept-completed (the final SUCCESS blob) */
 static const uint8_t spnego_accept_done[] = {
     0xA1, 0x07, 0x30, 0x05, 0xA0, 0x03, 0x0A, 0x01, 0x00,
 };
@@ -446,14 +399,12 @@ static int do_session_setup(struct smb_conn *s, const uint8_t *req, uint32_t req
     uint32_t blen = wrap_spnego_resp(blob, chal, clen);
     return session_setup_response(s, req, STATUS_MORE_PROCESSING, 0, blob, blen);
   }
-  /* type 3 AUTHENTICATE (or anything else): accept as guest. */
+  /* type 3 AUTHENTICATE (or anything else): accept as guest */
   s->session_id = OWOS_SESSION_ID;
   return session_setup_response(s, req, STATUS_SUCCESS, SMB2_SESSION_FLAG_IS_GUEST, spnego_accept_done,
                                 sizeof spnego_accept_done);
 }
 
-/* Minimal error response: just the header with an error status and a 9-byte
- * SMB2 ERROR response body (StructureSize=9, the standard shape). */
 static int do_error(struct smb_conn *s, const uint8_t *req, uint32_t status)
 {
   build_header(s, req, status);
@@ -466,7 +417,7 @@ static int do_error(struct smb_conn *s, const uint8_t *req, uint32_t status)
   return send_msg(s, s->tx, SMB2_HDR + 9);
 }
 
-/* --------------------------------------------------------- TREE_CONNECT */
+/* TREE_CONNECT */
 
 static int do_tree_connect(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 {
@@ -501,7 +452,7 @@ static int do_logoff(struct smb_conn *s, const uint8_t *req)
   return send_msg(s, s->tx, SMB2_HDR + 4);
 }
 
-/* --------------------------------------------------------- handles + names */
+/* handles + names */
 
 #define FID_MAGIC 0x4F574F5346494421ull /* "OWOSFID!" in the FileId tail */
 
@@ -534,9 +485,7 @@ static void put_fileid(uint8_t *p, uint64_t idx)
   put64(p + 8, FID_MAGIC);
 }
 
-/* Convert an SMB share-relative path (UTF-16LE, ASCII assumed, backslash or
- * forward-slash separators) to an absolute owofs path "/a/b/c". An empty input
- * yields "/" (the share root). Separators are normalized and collapsed. */
+/* Convert an SMB share-relative path to an absolute owofs path "/a/b/c" */
 static uint32_t smb_to_path(const uint8_t *src, uint32_t bytelen, char *dst, uint32_t cap)
 {
   uint32_t n = 0;
@@ -556,8 +505,7 @@ static uint32_t smb_to_path(const uint8_t *src, uint32_t bytelen, char *dst, uin
   return n;
 }
 
-/* The virtual k-th entry of directory `dirpath`: 0=".", 1="..", then each
- * owofs child (files and subdirectories). */
+/* The virtual k-th entry of directory `dirpath`: 0=".", 1="..", then each owofs child */
 static bool dir_entry_at(const char *dirpath, int idx, char *name, bool *is_dir, uint32_t *size, uint32_t *mtime)
 {
   *mtime = 0;
@@ -586,7 +534,7 @@ static bool dir_entry_at(const char *dirpath, int idx, char *name, bool *is_dir,
   name[i] = 0;
   *is_dir = de.is_dir;
   *size = de.size;
-  /* readdir carries no mtime; stat the child to recover its owofs stamp. */
+  /* readdir carries no mtime; stat the child to recover its owofs stamp */
   char child[192];
   uint32_t n = 0;
   for (const char *q = dirpath; *q && n + 1 < sizeof child; q++)
@@ -602,7 +550,7 @@ static bool dir_entry_at(const char *dirpath, int idx, char *name, bool *is_dir,
   return true;
 }
 
-/* ------------------------------------------------------------- CREATE */
+/* CREATE */
 
 static int do_create(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 {
@@ -654,11 +602,9 @@ static int do_create(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
   return send_msg(s, s->tx, SMB2_HDR + 88);
 }
 
-/* ----------------------------------------------------- QUERY_DIRECTORY */
+/* QUERY_DIRECTORY */
 
-/* Build one directory-info entry; supports FileBothDirectoryInformation (3) and
- * FileIdBothDirectoryInformation (37). Returns bytes written (8-byte padded).
- */
+/* Build one directory-info entry */
 static uint32_t build_dirent(uint8_t *p, int cls, const char *name, bool is_dir, uint32_t size, uint32_t mtime,
                              int is_last)
 {
@@ -727,7 +673,7 @@ static int do_query_directory(struct smb_conn *s, const uint8_t *req, uint32_t r
   return send_msg(s, s->tx, SMB2_HDR + 8 + total);
 }
 
-/* ------------------------------------------------------------- READ */
+/* READ */
 
 static int do_read(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 {
@@ -764,7 +710,7 @@ static int do_read(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
   return send_msg(s, s->tx, SMB2_HDR + 16 + n);
 }
 
-/* ------------------------------------------------------------- CLOSE */
+/* CLOSE */
 
 static int do_close(struct smb_conn *s, const uint8_t *req)
 {
@@ -793,7 +739,7 @@ static int do_close(struct smb_conn *s, const uint8_t *req)
   return send_msg(s, s->tx, SMB2_HDR + 60);
 }
 
-/* ------------------------------------------------------------- QUERY_INFO */
+/* QUERY_INFO */
 
 static uint32_t put_basic_info(uint8_t *p, bool is_dir, uint64_t ft)
 {
@@ -882,7 +828,7 @@ static int do_query_info(struct smb_conn *s, const uint8_t *req, uint32_t reqlen
       break;
     }
   } else if (itype == 0x02) { /* FILESYSTEM info */
-    /* Real owofs capacity/free, reported in 512-byte allocation units. */
+                              /* Real owofs capacity/free, reported in 512-byte allocation units */
     struct statfs_info fs;
     uint64_t total_u = 32768, avail_u = 32764; /* fallback if statfs fails */
     if (statfs("/", &fs) == 0) {
@@ -950,7 +896,7 @@ static int do_query_info(struct smb_conn *s, const uint8_t *req, uint32_t reqlen
   return send_msg(s, s->tx, SMB2_HDR + 8 + olen);
 }
 
-/* ------------------------------------------------------------- dispatch */
+/* dispatch */
 
 static struct smb_conn conn; /* one connection at a time */
 
@@ -969,7 +915,7 @@ static void serve(int fd)
       return;
     const uint8_t *req = s->rx;
     if (req[0] != SMB2_MAGIC0 || req[1] != 'S' || req[2] != 'M' || req[3] != 'B')
-      return; /* not SMB2 (SMB1 negotiate etc.) — drop */
+      return; /* not SMB2 (SMB1 negotiate etc.), drop */
 
     uint16_t cmd = load_le16(req + 12);
     int rc;

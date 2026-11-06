@@ -1,11 +1,4 @@
-/* cliphist.c — the Super+V clipboard-history viewer.
- *
- * A plain user-space window over the clipboard lib (clipd): it lists the clip
- * history newest-first, and clicking an item promotes it back to the front so
- * the next paste uses it. The clipboard needs no kernel access — this is pure
- * presentation; the WM (which already routes input) launches it on Super+V and
- * delivers the paste to whatever window had focus.
- */
+/* cliphist.c: the Super+V clipboard-history viewer, a window over the clipd history. */
 #include "clipboard.h"
 #include "gfx.h"
 #include "mime.h"
@@ -87,8 +80,7 @@ static void render(int id)
   win_present(id);
 }
 
-/* Re-add history item `idx` as the newest clip (get its bytes, put them back).
- */
+/* Re-add history item `idx` as the newest clip (get its bytes, put them back). */
 static void promote(int idx)
 {
   char mime[64];

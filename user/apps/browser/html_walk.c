@@ -2,12 +2,8 @@
 
 static void walk_element_inner(struct dom_node *el);
 
-/* Record this element's covered text range as a span (for click hit-testing),
- * then walk it. Wrapping the whole body means every early return still closes
- * the span, and nested elements naturally produce narrower (deeper) spans. */
-/* Emit a ::before / ::after pseudo-element's generated content as inline text,
- * styled by the pseudo rule's colour/weight/decoration. No-op when the element
- * has no such rule (or its content is empty/non-string). */
+/* Record this element's covered text range as a span (for click hit-testing) */
+/* Emit a ::before / ::after pseudo-element's generated content as inline text */
 static void emit_pseudo(struct dom_node *el, int which)
 {
   if (!css_sheet_has_pseudo(g_sheet))
@@ -34,12 +30,7 @@ static void emit_pseudo(struct dom_node *el, int which)
   sty_cur = sv;
 }
 
-/* The render walk recurses one stack frame per DOM level, each carrying a
- * ~552-byte `struct css_style` by value, so a pathologically deep document
- * would overflow the worker stack and corrupt the heap (a browser fault + a
- * worker free() crash). Bound the depth: content nested past this is dropped,
- * not rendered — far better than a crash, and well beyond any real page's
- * nesting. */
+/* The render walk recurses one stack frame per DOM level, each carrying a ~552-byte `struct */
 #define WALK_DEPTH_MAX 256
 int g_walk_depth;
 unsigned g_walk_now; /* msec() sampled once per layout_dom walk */
@@ -96,9 +87,7 @@ static int li_roman(int n, char *b, int upper)
   return j;
 }
 
-/* Build the <li> marker text for `ls` (resolved, not DEFAULT) and item number
- * `n`. Returns 1 with NUL-terminated `out` filled, or 0 for CSS_LST_NONE (no
- * marker). */
+/* Build the <li> marker text for `ls` (resolved, not DEFAULT) and item number `n` */
 static int li_marker(signed char ls, int n, char *out, int cap)
 {
   if (ls == CSS_LST_NONE || cap < 8)
@@ -146,10 +135,7 @@ static int li_marker(signed char ls, int n, char *out, int cap)
   return 1;
 }
 
-/* Map an HTML presentational marker attribute — `type` on ul/ol/li, e.g.
- * `<ol type="a">` or `<ul type="square">` — to a css_list. A single-letter
- * ol/li type (1/a/A/i/I) is the ordered form; disc/circle/square the unordered
- * form. Returns CSS_LST_DEFAULT for an unrecognized value. */
+/* Map an HTML presentational marker attribute - `type` on ul/ol/li, e.g */
 static signed char list_type_from_attr(const char *v)
 {
   if (!v || !v[0])
@@ -178,8 +164,7 @@ static signed char list_type_from_attr(const char *v)
   return CSS_LST_DEFAULT;
 }
 
-/* Parse a signed integer attribute (`<ol start>` / `<li value>`), returning
- * `dflt` when the attribute is absent or names no digits. */
+/* Parse a signed integer attribute (`<ol start>` / `<li value>`) */
 static int attr_int(struct dom_node *el, const char *name, int dflt)
 {
   const char *v = dom_get_attr(el, name);
@@ -201,8 +186,7 @@ static int attr_int(struct dom_node *el, const char *name, int dflt)
   return neg ? -n : n;
 }
 
-/* Count direct <li> element children of a list — the starting ordinal for
- * `<ol reversed>` with no explicit start. */
+/* Count direct <li> element children of a list */
 static int count_list_items(struct dom_node *list)
 {
   int n = 0;
@@ -369,8 +353,7 @@ static void walk_element_inner(struct dom_node *el)
   if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2])
     W_size = (unsigned char)(name[1] - '0');
 
-  /* font-size: an explicit CSS value wins; a percent scales the inherited size;
-   * else a heading's UA default; else inherit the parent's W_fontpx. */
+  /* font-size: an explicit CSS value wins; a percent scales the inherited size; else a heading's */
   if (cs.font_px >= 0)
     W_fontpx = clamp_fontpx(cs.font_px);
   else if (cs.font_pct >= 0)
@@ -397,18 +380,12 @@ static void walk_element_inner(struct dom_node *el)
     W_listtype = ordered ? 'o' : 'u';
     W_listdef = list_type_from_attr(dom_get_attr(el, "type")); /* presentational default */
     W_listrev = (ordered && dom_get_attr(el, "reversed")) ? -1 : 1;
-    /* Seed the running number so the first item (no `value`) lands on `start`
-     * (item count for a reversed list, 1 otherwise). W_olnum tracks the LAST
-     * assigned number; each ordered item steps by W_listrev before use. `start`
-     * is an <ol> attribute, but the counter resets for a <ul> too so a
-     * `list-style-type: decimal` unordered list numbers from 1. */
+    /* Seed the running number so the first item (no `value`) lands on `start` */
     int start = ordered ? attr_int(el, "start", W_listrev < 0 ? count_list_items(el) : 1) : 1;
     W_olnum = start - W_listrev;
   }
 
-  /* white-space: nowrap suppresses line breaks; pre/pre-wrap/pre-line preserve
-   * spaces+newlines (pre also doesn't wrap). nowrap inherits through sty_cur.
-   */
+  /* white-space: nowrap suppresses line breaks; pre/pre-wrap/pre-line preserve spaces+newlines */
   if (cs.white_space == CSS_WS_NOWRAP)
     sty_cur.nowrap = 1;
   else if (cs.white_space == CSS_WS_PRE) {
@@ -421,9 +398,7 @@ static void walk_element_inner(struct dom_node *el)
     sty_cur.nowrap = 0;
   }
 
-  /* line-height: a px value, else a percent/unitless multiple of the resolved
-   * font-size (which the block above just settled). 0 leaves the font-derived
-   * height. */
+  /* line-height: a px value, else a percent/unitless multiple of the resolved font-size */
   if (cs.line_height >= 0)
     W_lineheight = (unsigned char)(cs.line_height > 255 ? 255 : cs.line_height);
   else if (cs.lh_pct >= 0) {
@@ -441,9 +416,7 @@ static void walk_element_inner(struct dom_node *el)
     block_break();
   if (streq(name, "li")) { /* list marker  */
     unsigned char a = sty_byte();
-    /* Marker type precedence: author CSS list-style-type (inherited via
-     * W_liststyle) wins; else the item's own `type` attr; else the list's
-     * presentational `type`; else the ul/ol default. */
+    /* Marker type precedence */
     signed char ls = W_liststyle;
     if (ls == CSS_LST_DEFAULT)
       ls = list_type_from_attr(dom_get_attr(el, "type"));
@@ -462,8 +435,7 @@ static void walk_element_inner(struct dom_node *el)
       emit_lit(mark, a);
   }
   if (blk) {
-    if (cs.bgi.kind == CSS_BGK_URL) { /* note the url() for the batched fetch,
-                                         resolve its index */
+    if (cs.bgi.kind == CSS_BGK_URL) { /* note the url() for the batched fetch, resolve its index */
       if (g_frame_depth == 0)
         bg_note_url(cs.bgi.url); /* frames don't pull background images */
       cs.bgi.img_idx = bg_image_index(cs.bgi.url, g_base_url);
@@ -493,10 +465,7 @@ static void walk_element_inner(struct dom_node *el)
   W_listdef = sv_ldef;
   W_lineheight = sv_lh;
   W_liststyle = sv_ls;
-  /* The ordered-list counter is list-scoped, not element-scoped: only a list
-   * container rolls it back (so a nested list restores the outer running
-   * count), while sibling <li> increments must persist through their
-   * per-element scope. */
+  /* The ordered-list counter is list-scoped, not element-scoped */
   if (streq(name, "ul") || streq(name, "ol"))
     W_olnum = sv_ol;
 }

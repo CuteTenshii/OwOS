@@ -1,47 +1,23 @@
-/* devtools.c — the browser's in-window developer tools (F12 / Ctrl+Shift+I).
- *
- * A bottom-docked overlay with three views, switched by a tab strip:
- *   Elements  the live DOM tree, one node per line, click to select
- *   Styles    the computed CSS of the selected element (via the css.c engine)
- *   Console   the page's console.* output and uncaught JS errors
- *
- * Threading: the live DOM is owned by the worker thread (it parses, mutates and
- * frees it), so the DOM/Styles snapshots are built there in
- * devtools_worker_tick — never walked from the main thread. The console buffer
- * is appended from the worker (js.c routes console.* + errors here) and read by
- * the main thread's render. A single mutex (dt_lk) guards the snapshot text
- * and the console ring against the render thread; it is separate from
- * browser_buf_lock so console/DOM updates never
- * serialise against the page buffers. The main thread only reads the prepared
- * snapshots and draws them. */
+/* devtools.c: in-window developer tools (F12 / Ctrl+Shift+I) with Elements, Styles and Console views.
+ * The worker thread owns the live DOM and builds snapshots; the main thread only reads them under dt_lk. */
 #include "devtools_int.h"
 
-/* --- the snapshot/console interlock (worker writes, main reads) ------------
- */
+/* Snapshot/console interlock (worker writes, main reads) */
 mutex_t dt_lk;
 
-/* --- panel state -----------------------------------------------------------
- */
+/* Panel state */
 bool dt_open;
 int dt_tab;
 int dt_scroll[N_TABS];
 volatile bool dt_dirty; /* main asks the worker to rebuild snapshots  */
-/* A devtools-local change that repaints ONLY the dock, not the whole page: a
- * logged network request or console line. The dock is an opaque right-side
- * split, so redrawing just its region is a correct frame — a chatty page
- * logging hundreds of requests would otherwise re-lay-out and re-paint the
- * entire page per entry (via B->seq++), which is the lag. Set on the
- * worker/fetch threads, drained each frame by the main render loop
- * (devtools_take_paint). */
+/* Set from worker/fetch threads: repaint only the dock, drained by devtools_take_paint. */
 volatile bool dt_paint_only;
 static unsigned dt_seen_mut;          /* last dom_mutation_seq the snapshot was built for */
 static unsigned dt_seen_layout;       /* last B->layout_seq (reflow generation) */
 static unsigned dt_seen_app_sig;      /* last cookie/HSTS jar signature (app tab) */
 static struct dom_node *dt_seen_root; /* live root the snapshot was built for (see gate) */
 
-/* --- a growable text buffer with a per-line offset index ------------------- *
- * Each snapshot (DOM tree, styles) is one char buffer holding '\n'-separated
- * lines, plus an offsets[] array so the renderer indexes a line in O(1). */
+/* Growable text buffer with a per-line offset index (O(1) line lookup). */
 
 struct textblk dt_dom; /* Elements view text                          */
 int *dt_dom_node;      /* per-line: the pre-order index of its node   */
@@ -50,35 +26,19 @@ struct textblk dt_sty; /* Styles view text                            */
 struct textblk dt_app; /* Application view text (cookies + HSTS)       */
 int dt_sel = -1;       /* selected node's pre-order index (-1 = none)  */
 
-/* Selected-element highlight box for the page overlay, in DOCUMENT px (the main
- * thread translates by scroll and draws it). Computed by the worker OUTSIDE
- * dt_lk — browser_range_box takes browser_buf_lock, and render() already holds
- * browser_buf_lock when it calls devtools_render() (lock order browser_buf->dt), so computing
- * it under dt_lk too would deadlock. Plain ints: a torn read just mis-paints
- * one frame of an overlay. dt_hl_active is written last (and read first) so
- * coords settle. */
+/* Selected-element highlight in document px; computed outside dt_lk (lock order browser_buf->dt). */
 static volatile bool dt_hl_active;
 static int dt_hl_x, dt_hl_y, dt_hl_w, dt_hl_h;
 static char dt_hl_label[80];
 
-/* Inspect-element picker (Ctrl+Shift+C / the ↖ toolbar button): the page→tree
- * direction. The main thread feeds the pane text offset under the pointer; the
- * worker (it owns the DOM) resolves it to the enclosing element,
- * hover-highlights it via dt_hl_*, and on a click commits it to the selection
- * and reveals it in the Elements tree. Volatile handoff fields, no lock — torn
- * ints just mis-pick one frame, and the worker re-reads every 30 ms tick. */
+/* Inspect-element picker: main thread feeds the hovered/clicked pane offset, worker resolves it. */
 volatile bool dt_pick;                   /* picker armed                              */
 static volatile int dt_pick_hover = -1;  /* main->worker: pane offset hovered (-1 none) */
 static volatile int dt_pick_commit = -1; /* main->worker: pane offset clicked (-1 none) */
 static int dt_pick_last = -2;            /* worker: last hovered node idx (dedupe repaints) */
 static bool dt_pick_reveal;              /* worker: scroll Elements to the new selection */
 
-/* Collapsed subtrees, keyed by pre-order node index (stable while the tree is).
- * A collapsed node renders as "<tag…>…</tag>" on one line; the Elements walk
- * still advances the index through its hidden descendants so click->node
- * mapping holds. Per-tab: swapped with the tab's frozen capture in cap_swap
- * (pre-order indices are page-specific), and cleared whenever the page capture
- * resets. */
+/* Collapsed subtrees by pre-order index; per-tab, swapped in cap_swap. */
 int *dt_collapsed, dt_collapsed_n, dt_collapsed_cap;
 bool dt_is_collapsed(int idx)
 {
@@ -105,16 +65,12 @@ void dt_toggle_collapsed(int idx)
   dt_collapsed[dt_collapsed_n++] = idx;
 }
 
-/* Elements "find" box: a substring search over the rendered DOM lines that
- * selects (and scrolls to) the next match, so it highlights on the page too. */
+/* Elements find box: substring search over the rendered DOM lines. */
 char dt_find[128];
 struct textfield dt_find_tf;
 bool dt_find_init, dt_find_focused;
 
-/* Elements breadcrumb: the ancestor chain of the selected node (html › body ›
- * …), a clickable strip below the tree. The worker rebuilds it (DOM walk) under
- * dt_lk whenever the selection changes; the main thread draws it and maps a
- * click on a segment back to that ancestor's pre-order index. */
+/* Breadcrumb: ancestor chain of the selected node, rebuilt by the worker under dt_lk. */
 struct dt_crumb dt_crumbs[DT_CRUMB_MAX];
 int dt_ncrumbs;
 
@@ -147,9 +103,7 @@ void dt_tb_putc(struct textblk *t, char c)
     t->buf = p;
     t->cap = nc;
   }
-  /* Terminate the line AND consume the NUL's slot, so the next line starts past
-   * it — otherwise the next char overwrites the terminator and dt_tb_line() reads
-   * one run spanning every following line. */
+  /* Terminate the line and consume the NUL slot so the next line starts past it. */
   if (c == '\n') {
     t->buf[t->len++] = '\0';
     t->line_open = false;
@@ -165,8 +119,7 @@ void dt_tb_puts(struct textblk *t, const char *s)
 }
 void dt_tb_newline(struct textblk *t) { dt_tb_putc(t, '\n'); }
 
-/* Copy line `i` of `t` (truncated to `max` bytes) into `out`. Returns length.
- */
+/* Copy line `i` of `t` (truncated to `max` bytes) into `out`. Returns length. */
 int dt_tb_line(const struct textblk *t, int i, char *out, int max)
 {
   if (i < 0 || i >= t->nlines) {
@@ -185,8 +138,7 @@ int dt_tb_line(const struct textblk *t, int i, char *out, int max)
 
 /* --- per-tab view state (main thread, on tab switch) ---------------------- */
 
-/* Drop the current page's capture. Caller holds dt_lk (the rings + snapshots
- * are shared with the worker/render threads). */
+/* Drop the current page's capture. Caller holds dt_lk. */
 static void dt_reset_content(void)
 {
   for (int i = 0; i < dt_con_count; i++) {
@@ -213,11 +165,7 @@ static void dt_reset_content(void)
   dt_tb_reset(&dt_sty);
 }
 
-/* A tab's frozen devtools capture: the Elements/Styles snapshots plus the
- * console and network rings. When a tab is backgrounded its live capture is
- * swapped out into one of these (held by its dt_view), and swapped back in on
- * reveal — so the panel keeps its content across tab switches instead of
- * resetting. */
+/* A tab's frozen devtools capture, swapped with the live one on tab switch. */
 struct dt_cap {
   struct conline dt_con[CON_MAX];
   int dt_con_start, dt_con_count;
@@ -378,8 +326,7 @@ void devtools_view_load(const struct dt_view *v)
   B->seq++;
 }
 
-/* Release a closed tab's frozen capture (its rings' text + snapshot buffers).
- */
+/* Release a closed tab's frozen capture. */
 void devtools_view_free(struct dt_view *v)
 {
   struct dt_cap *c = v->cap;
@@ -405,9 +352,7 @@ void devtools_view_free(struct dt_view *v)
   v->cap = 0;
 }
 
-/* Free the LIVE capture (the statics). Used when the active tab closes: its
- * content lives in the statics, not its dt_view, so it must be dropped here
- * before the neighbour's capture is swapped in. */
+/* Free the LIVE capture; used when the active tab closes. */
 void devtools_reset_live(void)
 {
   mutex_lock(&dt_lk);
@@ -416,11 +361,7 @@ void devtools_reset_live(void)
   mutex_unlock(&dt_lk);
 }
 
-/* Fill the page-overlay highlight (dt_hl_*) for element `sn`: its document-px
- * box from the laid-out line table + a "tag#id.class  WxH" label. Clears the
- * highlight when the node has no rendered box. MUST run outside dt_lk —
- * browser_range_box takes browser_buf_lock and render() holds browser_buf_lock when it reads
- * dt_hl_* (lock order browser_buf->dt). Worker thread only. */
+/* Fill the page highlight (dt_hl_*) for element `sn`. Worker only; must run outside dt_lk. */
 static void dt_set_highlight(struct dom_node *sn)
 {
   dt_hl_active = false;
@@ -454,8 +395,7 @@ static void dt_set_highlight(struct dom_node *sn)
   dt_hl_active = true; /* set last: coords are ready */
 }
 
-/* "tag", "tag#id" or "tag.firstclass" — a brief element label for the
- * breadcrumb. */
+/* "tag", "tag#id" or "tag.firstclass" label for the breadcrumb. */
 static void crumb_label(struct dom_node *n, char *out, int cap)
 {
   int k = 0;
@@ -475,9 +415,7 @@ static void crumb_label(struct dom_node *n, char *out, int cap)
   }
 }
 
-/* Rebuild the breadcrumb from the selected node up to the root (emitted
- * root-first), each segment carrying its pre-order index for click-to-select.
- * Caller holds dt_lk. */
+/* Rebuild the breadcrumb root-first from the selected node. Caller holds dt_lk. */
 static void build_crumbs(struct dom_node *root, struct dom_node *sel)
 {
   dt_ncrumbs = 0;
@@ -496,9 +434,7 @@ static void build_crumbs(struct dom_node *root, struct dom_node *sel)
   }
 }
 
-/* The element under pane offset `off`; a text node resolves to its parent
- * element (the thing you mean to inspect). Worker thread — owns the span table.
- */
+/* Element under pane offset `off`; a text node resolves to its parent. Worker only. */
 static struct dom_node *pick_resolve(int off)
 {
   struct dom_node *n = html_node_at_offset(off);
@@ -507,12 +443,7 @@ static struct dom_node *pick_resolve(int off)
   return n;
 }
 
-/* Picker step, run before the snapshot early-out while the picker is armed. A
- * click (dt_pick_commit) selects the node, reveals it in the Elements tree and
- * ends pick mode; otherwise the hovered element is highlighted on the page.
- * Hover only bumps seq when the target element changes, so sweeping the pointer
- * costs one DOM walk per tick (not a snapshot rebuild every frame). Runs
- * outside dt_lk. */
+/* Picker step: a click selects and reveals the node, otherwise highlight the hovered element. */
 static void devtools_pick_tick(struct dom_node *root)
 {
   if (!root)
@@ -558,25 +489,11 @@ void devtools_worker_tick(void)
 
   struct dom_node *root = html_dom_root();
 
-  /* Inspect-element picker: cheap, before the snapshot early-out so it runs
-   * every tick while armed. A commit sets dt_sel + dt_dirty, falling into the
-   * rebuild. */
+  /* Picker runs before the snapshot early-out so it ticks while armed. */
   if (dt_pick || dt_pick_commit >= 0)
     devtools_pick_tick(root);
 
-  /* Rebuild the expensive Elements/Styles snapshot only when something relevant
-   * changed — NOT on every global B->seq bump (cursor blink, network log,
-   * scrolling the panel itself), which used to force a full DOM re-walk every
-   * tick. The DOM's own mutation_seq covers structure + attributes; layout_seq
-   * covers reflow (resize, late image, @font-face) so the box model and page
-   * highlight track geometry; and dt_dirty covers
-   * selection/tab/collapse/find/REPL. The cookie/HSTS jar has no counter, so a
-   * cheap content signature gates the Application snapshot separately. The root
-   * pointer catches a whole new document (navigation / first paint / a page
-   * going non-NULL): the parser builds the tree with node_append, which does
-   * NOT bump dom_mutation_seq, so without this a fresh page could leave the
-   * stale "(no document loaded)" placeholder or a previous page's tree in the
-   * panel. */
+  /* Rebuild snapshots only on DOM/layout change, dt_dirty or a new root (node_append bumps no seq). */
   unsigned mut = dom_mutation_seq, lay = B->layout_seq, asig = dt_app_sig();
   bool rebuild = dt_dirty || root != dt_seen_root || mut != dt_seen_mut || lay != dt_seen_layout;
   bool app_changed = asig != dt_seen_app_sig;
@@ -589,10 +506,7 @@ void devtools_worker_tick(void)
       dt_tb_reset(&dt_dom);
       int idx = 0;
       dt_dom_emit(&dt_dom, root, 0, &idx, 0);
-      /* idx is now the live pre-order node count; a selection at or past it no
-       * longer exists (the tree shrank). Compare against the node count, NOT
-       * the per-line array capacity — node indices count whitespace/collapsed
-       * nodes that get no line, so they routinely exceed dt_dom_node_cap. */
+      /* Compare with the node count, not the per-line capacity (hidden nodes get no line). */
       if (dt_sel >= idx)
         dt_sel = -1;
       dt_style_emit(root);
@@ -611,7 +525,7 @@ void devtools_worker_tick(void)
     } /* else: keep the frozen snapshot of a backgrounded tab */
   }
   if (app_changed)
-    dt_app_emit(); /* cookies/HSTS — global, no document needed */
+    dt_app_emit(); /* cookies/HSTS, no document needed */
   /* Reveal a freshly picked node: centre its row in the Elements view. */
   if (rebuild && dt_pick_reveal && root && dt_sel >= 0) {
     dt_pick_reveal = false;
@@ -628,9 +542,7 @@ void devtools_worker_tick(void)
   dt_dirty = false;
   mutex_unlock(&dt_lk);
 
-  /* Selected-element highlight box (outside dt_lk; browser_range_box locks
-   * blk). While picking, the hover highlight owns dt_hl_* — don't clobber it
-   * here. */
+  /* Highlight box, outside dt_lk; the hover highlight owns dt_hl_* while picking. */
   if (rebuild && !dt_pick) {
     dt_hl_active = false;
     if (root && dt_sel >= 0 && (dt_tab == TAB_ELEMENTS || dt_tab == TAB_STYLES)) {
@@ -647,8 +559,7 @@ void devtools_worker_tick(void)
   B->seq++; /* repaint with the refreshed snapshot */
 }
 
-/* The selected element's page-overlay box (document px) + its label, for the
- * main thread's render. Returns 0 when no highlight is active. */
+/* Selected element's page-overlay box (document px) and label; returns 0 when inactive. */
 int devtools_highlight(int *x, int *y, int *w, int *h, const char **label)
 {
   if (!dt_hl_active)
@@ -679,10 +590,7 @@ void devtools_toggle(void)
 
 int devtools_visible(void) { return dt_open; }
 
-/* Consume a pending dock-only repaint request (see dt_paint_only). The main
- * render loop calls this each frame: a non-zero return means redraw just the
- * devtools dock — a network/console log line changed, but nothing on the page
- * did. */
+/* Consume a pending dock-only repaint request (see dt_paint_only). */
 int devtools_take_paint(void)
 {
   int v = dt_paint_only;
@@ -690,9 +598,7 @@ int devtools_take_paint(void)
   return v;
 }
 
-/* Inspect-element picker (page→tree). Arming it opens the panel; the main
- * thread feeds hovered/clicked pane offsets, the worker resolves + selects (see
- * above). */
+/* Inspect-element picker: arming opens the panel. */
 void devtools_pick_toggle(void)
 {
   if (!dt_open)

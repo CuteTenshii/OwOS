@@ -1,25 +1,18 @@
 #include "html_int.h"
 
-/* Append one styled glyph at offset `n`, growing text/attr as needed, and
- * return the new length. If the heap is exhausted the glyph is silently dropped
- * (the page just stops growing) — the same graceful truncation the old fixed
- * buffer did when full, only now the ceiling is available memory, not a fixed
- * cap. */
-/* Current block context, saved/restored around each element like sty_cur
- * (BP_* layout in browser.h). */
+/* Append one styled glyph at offset `n`, growing text/attr as needed, and return the new length */
+/* Current block context, saved/restored around each element like sty_cur */
 unsigned char W_size, W_center, W_mono, W_indent, W_pre;
 unsigned char W_fontpx;                    /* current CSS font-size px (0 = default body) */
 unsigned W_bg = BG_NONE;                   /* current background 0xRRGGBB, BG_NONE = none */
-char W_listtype;                           /* 'u' / 'o' / 0 — the enclosing list kind  */
+char W_listtype;                           /* 'u' / 'o' / 0  -  the enclosing list kind  */
 int W_olnum;                               /* <ol> running item number (last assigned) */
 signed char W_listrev;                     /* <ol reversed>: -1 counts down, +1 up     */
 signed char W_listdef = CSS_LST_DEFAULT;   /* list's presentational default (type="") */
 unsigned char W_lineheight;                /* current CSS line-height px (0 = font-derived) */
 signed char W_liststyle = CSS_LST_DEFAULT; /* inherited list-style-type    */
 
-/* CSS base font (px) that percent/relative sizes resolve against, plus the
- * heading UA sizes (h1..h6) — now real, since pixel scroll lets a line exceed
- * LINE_H. */
+/* CSS base font (px) that percent/relative sizes resolve against, plus the heading UA sizes */
 const unsigned char ua_h_px[6] = {32, 24, 19, 16, 13, 11};
 
 static unsigned char block_byte(void)
@@ -43,17 +36,11 @@ int text_put(int n, char c, unsigned char a)
   return n + 1;
 }
 
-/* Walk state (single-threaded: only the worker calls in). W_n = rendered
- * length; pend_sp/run_nl drive whitespace collapsing; W_cur_link = open <a>, or
- * -1. */
+/* Walk state (single-threaded */
 int W_n, W_run_nl, W_cur_link;
 bool W_pend_sp;
 
-/* Element span table: every element records the [start,end) text range it
- * covers, so a content-pane click resolves to the deepest enclosing DOM node
- * (the click target for event dispatch). Built during the walk, read by
- * html_node_at_offset. Worker-thread-only — both writer (walk) and reader
- * (dispatch) run there. */
+/* Element span table */
 struct domspan {
   int start, end;
   struct dom_node *node;
@@ -100,10 +87,7 @@ struct dom_node *html_node_at_offset(int off)
   return best;
 }
 
-/* Inverse of html_node_at_offset: the [start,end) text range a node covers (its
- * one span from the last walk). 0 if the node was never laid out — detached, or
- * a head/script-only node that emits no text. Worker-thread-only (the walk's
- * owner). */
+/* Inverse of html_node_at_offset */
 int html_node_span(struct dom_node *node, int *start, int *end)
 {
   for (int i = 0; i < g_nspans; i++)
@@ -117,9 +101,7 @@ int html_node_span(struct dom_node *node, int *start, int *end)
   return 0;
 }
 
-/* Append a codepoint to the styled-text buffer as UTF-8 (each byte carries the
- * same attr, so the renderer's same-attr runs keep a glyph's bytes together).
- */
+/* Append a codepoint to the styled-text buffer as UTF-8 (each byte carries the same attr */
 int utf8_emit(int n, unsigned cp, unsigned char a)
 {
   char b[4];
@@ -129,9 +111,7 @@ int utf8_emit(int n, unsigned cp, unsigned char a)
   return n;
 }
 
-/* Codepoints that must never reach layout: C0/C1 controls, DEL, soft hyphen,
- * the zero-width set, and the BOM. (Real spaces/newlines are handled before
- * this.) */
+/* Codepoints that must never reach layout */
 bool cp_drop(unsigned cp)
 {
   if (cp < 0x20 || cp == 0x7f)
@@ -147,12 +127,7 @@ bool cp_drop(unsigned cp)
   return false;
 }
 
-/* Apply text-transform (and font-variant small-caps) to one codepoint. ASCII +
- * Latin-1 letters are cased; the `*word` flag (set after a non-letter) drives
- * capitalize's first-letter rule. small-caps is approximated as uppercase —
- * this line renderer can't draw reduced-size capitals mid-run — and applies
- * after the transform, so a lowercasing text-transform still ends up
- * capitalised. */
+/* Apply text-transform (and font-variant small-caps) to one codepoint */
 static unsigned ttx_apply(unsigned cp, unsigned char ttx, int smallcaps, bool *word)
 {
   bool alpha =
@@ -188,8 +163,7 @@ static unsigned ttx_apply(unsigned cp, unsigned char ttx, int smallcaps, bool *w
   return r;
 }
 
-/* Emit text-node data: decode entities AND raw UTF-8, collapse whitespace, drop
- * control/zero-width codepoints, and store the rest as UTF-8. */
+/* Emit text-node data */
 void emit_text(const char *s)
 {
   const char *p = s, *end = s + strlen(s);
@@ -248,8 +222,7 @@ void emit_text(const char *s)
   }
 }
 
-/* End the current line: at most one blank line, never leading, clears pending
- * sp. */
+/* End the current line */
 void block_break(void)
 {
   W_pend_sp = false;
@@ -299,8 +272,7 @@ void capture_title(struct dom_node *el)
   }
 }
 
-/* Start recording an <a>: returns 1 if the href is navigable (caller closes
- * it), 0 for empty / fragment / javascript: / mailto:. */
+/* Start recording an <a> */
 int open_link(struct dom_node *el)
 {
   if (!g_link_nav)
@@ -320,9 +292,7 @@ int open_link(struct dom_node *el)
     return 0;
   struct link *L = &B->pg->links[B->pg->nlinks];
   L->start = W_n;
-  /* Inside a frame, store the absolute href (resolved against the frame's own
-   * URL): the click handler resolves L->href against the top page, so a frame's
-   * relative link would otherwise resolve against the wrong base. */
+  /* Inside a frame, store the absolute href (resolved against the frame's own URL) */
   char abs[URL_MAX];
   const char *put = buf;
   if (g_frame_depth > 0 && !url_absolute(buf)) {
@@ -333,8 +303,7 @@ int open_link(struct dom_node *el)
   for (; put[j] && j < (int)sizeof L->href - 1; j++)
     L->href[j] = put[j];
   L->href[j] = '\0';
-  /* target="_blank"/"_new" → open in a new tab (the click handler honors this).
-   */
+  /* target="_blank"/"_new" → open in a new tab (the click handler honors this) */
   const char *tgt = dom_get_attr(el, "target");
   L->newtab = (tgt && (streq_ci(tgt, "_blank") || streq_ci(tgt, "_new"))) ? 1 : 0;
   W_cur_link = B->pg->nlinks++;

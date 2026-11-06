@@ -1,4 +1,4 @@
-/* loader.c — set up the user region, parse an ELF32 executable, and run it. */
+/* loader.c: set up the user region, parse an ELF32 executable, and run it. */
 
 #include "loader.h"
 #include "elf.h"
@@ -9,18 +9,9 @@
 #include "pmm.h"
 #include "sched.h"
 
-/* USER_STACK_PAGES lives in loader.h now (shared with the heap ceiling). */
+/* The scratch mapping is shared: each map/unmap interval runs with interrupts off (irq_save). */
 
-/* The scratch mapping (paging_scratch_*) is shared kernel state, so a map->
- * write->unmap interval must not be preempted by another exec/fork using the
- * same slot. irq_save/irq_restore (irqflags.h) bracket each interval with
- * interrupts off and restore the prior IF, so it is safe whether exec runs from
- * a kernel thread (IF=1) or an int 0x80 syscall (IF=0). */
-
-/* Map [vaddr, vaddr+memsz) into dir from fresh pmm frames, copying filesz bytes
- * of segment data and zeroing the rest (.bss). Each frame is written in full
- * (data then zero-fill), so no stale RAM from a previous process leaks through.
- * Returns 0 on success, -1 if physical memory is exhausted. */
+/* Map [vaddr, vaddr+memsz) from fresh frames: copy filesz bytes, zero the rest. 0 or -1 if out of memory. */
 static int load_segment(uint32_t *dir, uint32_t vaddr, const uint8_t *src, uint32_t filesz, uint32_t memsz)
 {
   uint32_t first = vaddr & ~0xFFFu;
@@ -31,11 +22,7 @@ static int load_segment(uint32_t *dir, uint32_t vaddr, const uint8_t *src, uint3
       return -1;
     uint32_t fl = irq_save();
     uint8_t *kv = paging_scratch_map(0, phys);
-    /* Split the page into [0,lo) pre-segment padding, [lo,hi) file data, and
-     * [hi,4096) .bss tail. A pure-.bss page (the common case for big zeroed
-     * buffers) is lo==hi==0, so it skips straight to the word-store zero-fill
-     * below — ~4x fewer stores than the old per-byte branch, which matters at
-     * -O0 where a 11 MiB .bss otherwise stalls the launcher for seconds. */
+    /* Page = [0,lo) padding, [lo,hi) file data, [hi,4096) .bss tail. */
     uint32_t seg_end = vaddr + filesz;
     uint32_t lo = (vaddr > page) ? (vaddr - page) : 0;
     uint32_t hi = (seg_end > page) ? (seg_end - page) : 0;
@@ -51,7 +38,7 @@ static int load_segment(uint32_t *dir, uint32_t vaddr, const uint8_t *src, uint3
       memset(kv + hi, 0, 4096 - hi);
     paging_scratch_unmap(0);
     irq_restore(fl);
-    if (paging_map_user_at(dir, page, phys, 1) < 0) { /* private tables   */
+    if (paging_map_user_at(dir, page, phys, 1) < 0) {
       pmm_free_frame(phys);
       return -1;
     }
@@ -78,15 +65,11 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
   if (eh->e_ident[EI_CLASS] != ELFCLASS32 || eh->e_machine != EM_386 || eh->e_type != ET_EXEC)
     return -1;
 
-  /* A fresh address space: kernel mappings shared, user window private. */
   uint32_t *dir = paging_new_process_dir();
   if (!dir)
     return -1;
 
-  /* The program-header table is unvalidated user input; reject one whose
-   * entries are undersized or that runs past the image before indexing it —
-   * otherwise the phdr loop is a ring-0 out-of-bounds read. 64-bit math so the
-   * offset+count product can't wrap. */
+  /* Validate the untrusted phdr table (64-bit math avoids wrap) before indexing it. */
   if (eh->e_phentsize < sizeof(Elf32_Phdr) || (uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > size) {
     paging_free_process_dir(dir);
     return -1;
@@ -111,7 +94,7 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
       paging_free_process_dir(dir);
       return -1;
     }
-    uint32_t fl = irq_save(); /* zero it: never leak prior data  */
+    uint32_t fl = irq_save();
     uint32_t *kv = paging_scratch_map(0, phys);
     memset(kv, 0, 4096);
     paging_scratch_unmap(0);
@@ -125,7 +108,7 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
 
   *out_dir = dir;
   *out_entry = eh->e_entry;
-  *out_brk = (image_end + 0xFFFu) & ~0xFFFu; /* heap starts past the image */
+  *out_brk = (image_end + 0xFFFu) & ~0xFFFu;
   return 0;
 }
 
@@ -134,16 +117,12 @@ int load_elf(const void *image, uint32_t size, uint32_t **out_dir, uint32_t *out
 
 uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
 {
-  /* The top stack page [ARG_TOP-4K, ARG_TOP) backs the argument block. Its
-   * frame is pmm-backed (above the identity map), so reach it through the
-   * supervisor scratch mapping; pointers are stored as the user virtual
-   * addresses the process will see. Interrupts off for the whole build, since
-   * we hold the scratch slot across it. */
+  /* The top stack page holds the args, written via the scratch map (IF off); pointers are user vaddrs. */
   uint32_t page = ARG_TOP - 4096;
   uint32_t pa = paging_user_phys(dir, page);
-  if (!pa) /* no stack page (unrecoverable) */
+  if (!pa)
     return USER_STACK_TOP;
-  if (argc > MAX_ARGS) /* clamp; never fault on excess */
+  if (argc > MAX_ARGS)
     argc = MAX_ARGS;
 
   uint32_t fl = irq_save();
@@ -151,17 +130,12 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
   uint32_t uargv[MAX_ARGS];
   uint32_t sp = ARG_TOP;
 
-  /* Reserve room at the bottom of the page for the argv pointer vector that the
-   * push phase writes below the strings: argc+1 pointers (NULL-terminated) plus
-   * the argc word, at most (MAX_ARGS+2) dwords. Keeping the strings above this
-   * floor guarantees the unguarded PUSHes below never underflow past `page`. */
+  /* Keep strings above room for argv[] (argc+1 pointers) and argc, so the PUSHes never underflow. */
   const uint32_t floor = page + (uint32_t)(MAX_ARGS + 2) * 4;
 
-  for (int i = 0; i < argc; i++) { /* copy the strings            */
+  for (int i = 0; i < argc; i++) {
     uint32_t len = (uint32_t)strlen(argv[i]) + 1;
-    /* Out of room in the arg page: keep the args that fit (argv[0..i)) and
-     * stop, rather than returning an unmapped esp the program would fault on.
-     */
+    /* Out of room: keep the args that fit. */
     if (sp - len < floor) {
       argc = i;
       break;
@@ -178,10 +152,10 @@ uint32_t setup_args(uint32_t *dir, int argc, char *const argv[])
     sp -= 4;                                                                                                           \
     *(uint32_t *)(fp + (sp - page)) = (val);                                                                           \
   } while (0)
-  PUSH(0); /* argv[argc] = NULL           */
+  PUSH(0);
   for (int i = argc - 1; i >= 0; i--)
-    PUSH(uargv[i]);     /* argv[i]                     */
-  PUSH((uint32_t)argc); /* argc, at the lowest addr    */
+    PUSH(uargv[i]);
+  PUSH((uint32_t)argc);
 #undef PUSH
   paging_scratch_unmap(0);
   irq_restore(fl);
@@ -196,8 +170,6 @@ int exec_program(const void *image, uint32_t size, int argc, char *const argv[])
     return -1;
 
   uint32_t user_esp = setup_args(dir, argc, argv);
-  /* Name the task after the program (argv[0]) so the crash reporter and
-   * `tasks` show e.g. "browser" instead of a generic "user". */
   const char *nm = (argc > 0 && argv[0]) ? argv[0] : "user";
   int pid = sched_create_process(nm, entry, dir, user_esp, brk);
   if (pid < 0)
@@ -205,14 +177,7 @@ int exec_program(const void *image, uint32_t size, int argc, char *const argv[])
   return pid;
 }
 
-/* ---- guarded thread stacks (SYS_STACK_ALLOC/FREE) ------------------------- *
- * A per-address-space (CR3) bitmap of the fixed slots in the [TSTACK_LOW,
- * TSTACK_TOP) region. Each slot maps its top `pages` frames and leaves the rest
- * (down to and including its lowest page) unmapped, so a thread stack overflow
- * faults. Freeing keeps the mapping and just clears the bit — the frames are
- * reused by the next alloc of that slot (bounded to 8 MiB/process) and
- * reclaimed with the address space on exit; a per-page unmap isn't available
- * (the range unmap is 2 MiB-granular and would clobber neighbouring slots). */
+/* Guarded thread stacks (SYS_STACK_ALLOC/FREE): per-CR3 slot bitmap; free keeps the frames. */
 #define TSTACK_OWNERS 8
 static struct {
   uint32_t *dir;
@@ -230,7 +195,7 @@ static uint32_t *tstack_mask_for(uint32_t *dir)
       tstack_tab[i].used = 0;
       return &tstack_tab[i].used;
     }
-  return 0; /* table full: caller falls back to a heap stack */
+  return 0; /* table full */
 }
 
 static void tstack_zero(uint32_t phys)
@@ -259,15 +224,15 @@ uint32_t user_stack_alloc(int pages)
       break;
     }
   if (slot < 0)
-    return 0; /* all slots in use */
+    return 0;
   uint32_t top = TSTACK_TOP - (uint32_t)slot * TSTACK_SLOT_PAGES * 4096u;
   for (int p = 0; p < pages; p++) {
     uint32_t va = top - (uint32_t)(p + 1) * 4096u;
-    uint32_t phys = paging_user_phys(dir, va); /* reuse a prior mapping of this slot */
+    uint32_t phys = paging_user_phys(dir, va);
     if (!phys) {
       phys = pmm_alloc_frame();
       if (!phys)
-        return 0; /* OOM: earlier pages of this slot leak until exit */
+        return 0;
       if (paging_map_user_at(dir, va, phys, 1) < 0) {
         pmm_free_frame(phys);
         return 0;
@@ -287,10 +252,10 @@ void user_stack_free(uint32_t top)
     return;
   off = TSTACK_TOP - top;
   if (off % (TSTACK_SLOT_PAGES * 4096u))
-    return; /* not a slot top */
+    return;
   slot = off / (TSTACK_SLOT_PAGES * 4096u);
   if (slot < TSTACK_SLOTS)
-    *mask &= ~(1u << slot); /* keep the mapping for reuse */
+    *mask &= ~(1u << slot);
 }
 
 void user_stack_reset_owner(uint32_t *dir)

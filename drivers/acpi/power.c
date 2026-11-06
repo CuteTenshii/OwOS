@@ -1,10 +1,4 @@
-/* power.c — shutdown and reboot.
- *
- * There is no firmware abstraction here, so both paths poke hardware directly.
- * Shutdown first tries real ACPI (the only method VMware and bare metal honour)
- * and falls back to the "magic" I/O ports the emulators watch for; reboot
- * pulses the CPU reset line through the legacy 8042 keyboard controller, and
- * triple-faults as a last resort. */
+/* power.c: ACPI, QEMU-port and 8042/triple-fault power off, reset and S3 sleep. */
 
 #include "power.h"
 #include "io.h"
@@ -14,12 +8,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* ---- ACPI shutdown ------------------------------------------------------ *
- * The low 16 MiB is identity-mapped, and firmware parks the ACPI tables well
- * below that, so we can treat their physical addresses as plain pointers.
- * We find the FADT, pull the _S5 sleep-type value out of the DSDT's AML, then
- * write SLP_TYPa|SLP_EN into the PM1 control register(s) — the standard
- * software-off sequence that works on VMware and real hardware alike. */
+/* ACPI shutdown: tables sit in the identity-mapped low 16 MiB; write SLP_TYPa|SLP_EN from _S5 to PM1 CNT. */
 
 struct rsdp {
   char signature[8]; /* "RSD PTR " */
@@ -27,8 +16,7 @@ struct rsdp {
   char oemid[6];
   uint8_t revision; /* 0 = ACPI 1.0 (RSDT only); >=2 adds XSDT */
   uint32_t rsdt_addr;
-  /* ACPI 2.0+ extension, present when revision >= 2. UEFI firmware often sets
-   * rsdt_addr to 0 and only fills in this 64-bit XSDT pointer. */
+  /* ACPI 2.0+ extension; UEFI often zeroes rsdt_addr and fills only this XSDT pointer. */
   uint32_t length;
   uint64_t xsdt_addr;
   uint8_t ext_checksum;
@@ -47,8 +35,7 @@ struct sdt_header {
   uint32_t creator_revision;
 } __attribute__((packed));
 
-/* FADT — only the prefix up to the PM1 control blocks; offsets per ACPI spec.
- */
+/* FADT prefix up to the PM1 control blocks; offsets per ACPI spec. */
 struct fadt {
   struct sdt_header header;     /* 0  */
   uint32_t firmware_ctrl;       /* 36 */
@@ -84,43 +71,37 @@ static struct rsdp *scan_rsdp(uint32_t start, uint32_t end)
   return 0;
 }
 
-/* A copy of the RSDP the bootloader handed us via the multiboot2 ACPI tag.
- * On a UEFI boot the firmware leaves no RSDP in the legacy BIOS area, so the
- * scan below finds nothing and this copy is the only way to reach ACPI. */
+/* RSDP copy from the multiboot2 ACPI tag; on UEFI the BIOS-area scan finds nothing. */
 static struct rsdp boot_rsdp;
 static bool boot_rsdp_valid;
 
 void acpi_set_rsdp(const void *rsdp_copy)
 {
   const struct rsdp *src = rsdp_copy;
-  /* "RSD PTR " is the anchor; ignore anything that isn't really an RSDP. */
+  /* Ignore anything that isn't really an RSDP. */
   if (!(src->signature[0] == 'R' && src->signature[1] == 'S' && src->signature[2] == 'D' && src->signature[3] == ' '))
     return;
-  /* GRUB may hand us both an ACPI-1.0 (type 14) and a 2.0 (type 15) tag.
-   * Never let the 1.0 one clobber a 2.0 RSDP already captured — only the 2.0
-   * RSDP carries the XSDT that UEFI firmware actually populates. */
+  /* Don't let a type-14 (1.0) tag clobber a captured 2.0 RSDP; only 2.0 carries the XSDT. */
   if (boot_rsdp_valid && boot_rsdp.revision >= 2 && src->revision < 2)
     return;
 
   const uint8_t *s = rsdp_copy;
   uint8_t *d = (uint8_t *)&boot_rsdp;
-  /* A 2.0 RSDP is 36 bytes (adds length + the 64-bit XSDT pointer); a 1.0 one
-   * is only 20, so don't read the extension fields out of a smaller tag. */
+  /* A 2.0 RSDP is 36 bytes, a 1.0 one only 20. */
   uint32_t len = src->revision >= 2 ? sizeof boot_rsdp : 20;
   for (uint32_t i = 0; i < len; i++)
     d[i] = s[i];
-  /* Reachable if it names a root table — the RSDT (1.0) or XSDT (2.0+). */
+  /* Reachable if it names a root table (RSDT or XSDT). */
   boot_rsdp_valid = boot_rsdp.rsdt_addr != 0 || (boot_rsdp.revision >= 2 && boot_rsdp.xsdt_addr != 0);
 }
 
 static struct rsdp *find_rsdp(void)
 {
-  /* Prefer the loader-provided copy: on UEFI it's the only one that exists,
-   * and on a legacy boot it's simply absent (boot_rsdp_valid == 0). */
+  /* Prefer the loader-provided copy; absent on legacy boot (boot_rsdp_valid == 0). */
   if (boot_rsdp_valid)
     return &boot_rsdp;
 
-  /* The EBDA segment pointer lives at physical 0x40E (real-mode word). */
+  /* The EBDA segment pointer is the real-mode word at 0x40E. */
   uintptr_t ebda_addr = 0x40E;
   uint16_t ebda_word;
   __asm__ volatile("movw (%[reg]), %[out]" : [out] "=r"(ebda_word) : [reg] "r"(ebda_addr) : "memory");
@@ -133,10 +114,7 @@ static struct rsdp *find_rsdp(void)
   return r;
 }
 
-/* Map and validate the root system description table: the XSDT (8-byte entry
- * pointers) on ACPI 2.0+ when the firmware populated it, otherwise the RSDT
- * (4-byte). Returns 0 on failure; on success *hdr is the mapped header, *count
- * the number of table pointers, and *xsdt is 1 for 8-byte entries. */
+/* Map the root table (XSDT if populated, else RSDT); *count = entries, *xsdt = 1 for 8-byte entries. */
 static bool find_root_sdt(struct sdt_header **hdr, uint32_t *count, bool *xsdt)
 {
   struct rsdp *rsdp = find_rsdp();
@@ -169,9 +147,7 @@ static bool find_root_sdt(struct sdt_header **hdr, uint32_t *count, bool *xsdt)
   return true;
 }
 
-/* Physical address of the i-th table the root SDT points at. RSDT entries are
- * 4 bytes, XSDT entries 8; either way ACPI tables live below 4 GiB, so the
- * truncation to 32 bits is safe (we only manage the low 4 GiB anyway). */
+/* Physical address of the i-th root entry; truncation to 32 bits is safe (tables are below 4 GiB). */
 static uint32_t root_entry(struct sdt_header *root, uint32_t i, bool xsdt)
 {
   uint8_t *base = (uint8_t *)root + sizeof(struct sdt_header);
@@ -180,9 +156,7 @@ static uint32_t root_entry(struct sdt_header *root, uint32_t i, bool xsdt)
   return *(uint32_t *)(base + (uint32_t)i * 4);
 }
 
-/* The DSDT's physical address from the FADT. Prefer the 64-bit X_DSDT (offset
- * 140, ACPI 2.0+): UEFI firmware routinely leaves the legacy 32-bit dsdt field
- * zero. Falls back to that field. The caller must have mapped the full FADT. */
+/* DSDT address from the FADT: prefer the 64-bit X_DSDT (offset 140), since UEFI often zeroes dsdt. */
 static uint32_t fadt_dsdt_phys(struct fadt *f)
 {
   if (f->header.length >= 148) {
@@ -193,9 +167,7 @@ static uint32_t fadt_dsdt_phys(struct fadt *f)
   return f->dsdt;
 }
 
-/* Dig SLP_TYPa/SLP_TYPb out of one of the DSDT's sleep-state packages, named by
- * `name` ("_S5_" for off, "_S3_" for suspend-to-RAM). Returns 0 on failure; on
- * success the values are written *already shifted* into PM1_CNT position. */
+/* Read SLP_TYPa/b from the DSDT package `name` ("_S5_", "_S3_"), stored already shifted into PM1_CNT position. */
 static bool parse_sleep(struct fadt *f, const char *name, uint16_t *slp_a, uint16_t *slp_b)
 {
   uint32_t dphys = fadt_dsdt_phys(f);
@@ -217,9 +189,7 @@ static bool parse_sleep(struct fadt *f, const char *name, uint16_t *slp_a, uint1
   if (p >= end - 4)
     return false;
 
-  /* Validate it's a real NameOp(name, Package): the name is preceded by an
-   * AML NameOp (0x08), optionally under the root scope ('\\' == 0x5C), and
-   * followed by a PackageOp (0x12). */
+  /* Require NameOp (0x08), optionally after root '\\' (0x5C), then the name, then PackageOp (0x12). */
   if (!((*(p - 1) == 0x08) || (*(p - 2) == 0x08 && *(p - 1) == 0x5C)) || *(p + 4) != 0x12)
     return false;
 
@@ -248,10 +218,7 @@ static bool parse_sleep(struct fadt *f, const char *name, uint16_t *slp_a, uint1
   return true;
 }
 
-/* Locate and identity-map a primary ACPI table by signature, mapping the
- * *whole* table (not just the prefix). Walks whichever root table the RSDP
- * names (XSDT or RSDT). Returns the mapped header, or 0 if ACPI is absent or no
- * such table. */
+/* Map a primary ACPI table by signature in full; 0 if ACPI or the table is absent. */
 void *acpi_find_table(const char *sig)
 {
   struct sdt_header *root;
@@ -274,16 +241,10 @@ void *acpi_find_table(const char *sig)
   return 0;
 }
 
-/* The FADT ("FACP"): the whole table is mapped so fadt_dsdt_phys() can read the
- * 64-bit X_DSDT at offset 140. Shared by the shutdown path and
- * acpi_aml_contains. */
+/* The FADT ("FACP"), fully mapped so fadt_dsdt_phys() can read X_DSDT at offset 140. */
 static struct fadt *find_fadt(void) { return (struct fadt *)acpi_find_table("FACP"); }
 
-/* Map one already-located SDT (whose signature is sig) and scan its AML body
- * for a byte sequence. Returns 1 if found. The header must be reachable; we map
- * the full table once its length is known. A garbage length can't run away:
- * it's a table's own self-reported size and we only ever read inside the mapped
- * span. */
+/* Map one located SDT and scan its AML body for a byte sequence; reads stay inside the mapped span. */
 static bool sdt_contains(struct sdt_header *h, const char *sig, const uint8_t *needle, uint32_t n)
 {
   if (!h || paging_identity_map((uint32_t)(uintptr_t)h, sizeof(*h)) != 0)
@@ -307,11 +268,7 @@ static bool sdt_contains(struct sdt_header *h, const char *sig, const uint8_t *n
   return false;
 }
 
-/* Scan the device AML for a byte sequence (e.g. an EISA _HID), looking in both
- * the DSDT and every SSDT. Returns 1 if found. Firmware may declare a device —
- * the battery especially — in an SSDT rather than the DSDT, so battery.c must
- * search both. Returns 0 when ACPI isn't reachable (e.g. RSDP not in the legacy
- * BIOS area, as on a pure-UEFI boot). */
+/* Scan the DSDT and every SSDT for a byte sequence; SSDTs matter since firmware may declare the battery there. */
 bool acpi_aml_contains(const uint8_t *needle, uint32_t n)
 {
   struct sdt_header *root;
@@ -320,13 +277,12 @@ bool acpi_aml_contains(const uint8_t *needle, uint32_t n)
   if (!find_root_sdt(&root, &count, &xsdt))
     return false;
 
-  /* The DSDT hangs off the FADT, not the root table, so reach it separately
-   * (and via the 64-bit X_DSDT when the firmware uses it). */
+  /* The DSDT hangs off the FADT, not the root table (via X_DSDT when present). */
   struct fadt *f = find_fadt();
   if (f && sdt_contains((struct sdt_header *)(uintptr_t)fadt_dsdt_phys(f), "DSDT", needle, n))
     return true;
 
-  /* Every other table is a direct root-table entry; scan the SSDTs. */
+  /* Every other table is a root-table entry; scan the SSDTs. */
   for (uint32_t i = 0; i < count; i++) {
     uint32_t phys = root_entry(root, i, xsdt);
     if (paging_identity_map(phys, sizeof(struct sdt_header)) != 0)
@@ -337,10 +293,7 @@ bool acpi_aml_contains(const uint8_t *needle, uint32_t n)
   return false;
 }
 
-/* Hand each AML definition block (DSDT, then every SSDT) to fn as a (body, len)
- * pair past the 36-byte table header. Maps each table fully first. The AML
- * interpreter uses this to build its namespace without duplicating the table
- * walk. Mirrors acpi_aml_contains' traversal. */
+/* Pass each AML block (DSDT, then SSDTs) to fn as (body, len) past the 36-byte header; mirrors acpi_aml_contains. */
 void acpi_for_each_aml(void (*fn)(const uint8_t *body, uint32_t len, void *ctx), void *ctx)
 {
   struct sdt_header *root;
@@ -372,8 +325,7 @@ void acpi_for_each_aml(void (*fn)(const uint8_t *body, uint32_t len, void *ctx),
   }
 }
 
-/* Switch the chipset into ACPI mode if it isn't already, so the PM1 control
- * register is live. (QEMU boots in ACPI mode; VMware/real HW may not.) */
+/* Enter ACPI mode if needed so PM1 CNT is live (QEMU already is). */
 static void acpi_ensure_enabled(struct fadt *f)
 {
   if (f->smi_cmd && f->acpi_enable && !(inw((uint16_t)f->pm1a_cnt_blk) & SCI_EN)) {
@@ -406,26 +358,16 @@ static void acpi_off(void)
 
 void power_off(void)
 {
-  /* Real ACPI first — the only path VMware and bare metal honour. */
+  /* Real ACPI first, the only path VMware and bare metal honour. */
   acpi_off();
 
-  /* Fallback: the value/port pairs emulators listen on for "power off".
-   * QEMU >= 2.0 uses 0x604; older QEMU and Bochs use 0xB004; VirtualBox
-   * uses 0x4004. Try each — the live one shuts us down and never returns. */
+  /* Emulator power-off ports: QEMU >= 2.0 0x604, old QEMU/Bochs 0xB004, VirtualBox 0x4004. */
   outw(0x604, 0x2000);  /* QEMU            */
   outw(0xB004, 0x2000); /* Bochs / old QEMU */
   outw(0x4004, 0x3400); /* VirtualBox      */
 }
 
-/* ---- ACPI reset register (FADT) ---------------------------------------- *
- * ACPI 2.0+ lets the firmware name the exact register and value that reboot
- * the platform: a Generic Address Structure (RESET_REG) at FADT offset 116
- * and a one-byte RESET_VALUE at offset 128, valid only when FADT flags bit 10
- * (RESET_REG_SUP) is set. This is the spec-blessed reboot and the method most
- * UEFI laptops actually honour — where the legacy 8042 pulse and a triple
- * fault below often do nothing (the firmware/SMM swallows the fault and the
- * box just hangs, which is exactly what "restart froze the OS" looks like).
- * Returns if it couldn't issue the write; the caller falls through. */
+/* ACPI reset register: FADT RESET_REG (GAS, offset 116) and RESET_VALUE (128), valid if flags bit 10 is set. */
 static void acpi_reset(void)
 {
   struct fadt *f = find_fadt();
@@ -436,8 +378,7 @@ static void acpi_reset(void)
   if (!(flags & (1u << 10))) /* RESET_REG_SUP */
     return;
 
-  /* GAS layout: [0]=address-space id, [1..3]=width/offset/access, [4..11]=addr.
-   */
+  /* GAS layout: [0]=address-space id, [1..3]=width/offset/access, [4..11]=addr. */
   uint8_t *gas = (uint8_t *)f + 116;
   uint8_t space = gas[0]; /* 0 = system memory, 1 = system I/O */
   uint64_t addr = *(uint64_t *)(gas + 4);
@@ -455,14 +396,10 @@ static void acpi_reset(void)
 
 void power_reset(void)
 {
-  /* Firmware-declared ACPI reset first — the most reliable path on real
-   * (especially UEFI) hardware. Returns only if it couldn't be issued. */
+  /* Firmware-declared ACPI reset first; the most reliable path on UEFI hardware. */
   acpi_reset();
 
-  /* The PCI reset-control register at port 0xCF9, present on essentially
-   * every ICH/PCH-based x86 machine. Bit 2 (RST_CPU) triggers the reset and
-   * bit 1 (SYS_RST) selects a full reset; assert them in the Linux-blessed
-   * two-write order. Harmless on a box that lacks it. */
+  /* PCI reset control at 0xCF9: bit 1 SYS_RST (full reset), bit 2 RST_CPU, written in two steps. */
   {
     uint8_t v = inb(0xCF9) & ~0x06u;
     outb(0xCF9, v | 0x02); /* arm: SYS_RST */
@@ -471,23 +408,12 @@ void power_reset(void)
     io_wait();
   }
 
-  /* Pulse the reset line via the 8042: wait until the controller's input
-   * buffer is empty (status bit 1 clear), then issue command 0xFE.
-   *
-   * The wait MUST be bounded. On real hardware with no 8042 (many laptops,
-   * pure-UEFI machines) port 0x64 reads back 0xFF on the open bus, so
-   * (status & 0x02) is permanently set and an unbounded loop hangs the
-   * machine forever — which looks exactly like "restart froze the OS".
-   * Spin a finite number of times, then issue 0xFE and fall through to the
-   * triple fault below regardless: if the controller is alive the pulse
-   * resets us, and if it isn't the triple fault does. QEMU's 8042 drains
-   * immediately so this still resets cleanly there. */
+  /* Bounded 8042 wait: with no 8042, 0x64 reads 0xFF so an unbounded loop hangs. Then pulse 0xFE regardless. */
   for (int i = 0; i < 100000 && (inb(0x64) & 0x02); i++)
     io_wait();
   outb(0x64, 0xFE);
 
-  /* If that did nothing, force a triple fault: a null IDT means the next
-   * interrupt has nowhere to go, and the CPU resets. */
+  /* Last resort: a null IDT makes the next interrupt reset the CPU. */
   struct {
     uint16_t limit;
     uint32_t base;
@@ -495,30 +421,15 @@ void power_reset(void)
   __asm__ volatile("lidt %0; int3" : : "m"(null_idt));
 }
 
-/* ---- ACPI S3 sleep (suspend-to-RAM) ------------------------------------- *
- * S3 cuts power to the CPU but keeps RAM refreshed. The OS saves CPU state,
- * tells the firmware where to re-enter on wake (the FACS firmware_waking_vector
- * — a real-mode address), then writes the S3 sleep type to PM1_CNT. On wake the
- * firmware bounces through our trampoline (s3_wake.S) back into the kernel.
- *
- * NOTE: this restores the *CPU*, not devices. Under QEMU, S3 is a pause so the
- * emulated devices keep their state and the desktop comes back intact. On real
- * hardware the chipset/devices lose power across S3 and would need re-init on
- * resume (NIC, USB, the panel's backlight/timing) — not done here yet. */
-
-/* The trampoline blob and its physical landing address (must agree with the
- * .set TRAMP in s3_wake.S). 0x8000 is free conventional RAM, below the EBDA,
- * and inside the identity-mapped low 16 MiB so we can write it directly. */
+/* ACPI S3: save CPU state, set the FACS wake vector to our trampoline (s3_wake.S), write S3 to PM1_CNT. */
+/* Restores the CPU only; real-hardware devices lose power across S3 and are not re-inited yet. */
+/* Trampoline physical landing address; must match .set TRAMP in s3_wake.S (free RAM, identity-mapped). */
 #define S3_TRAMPOLINE_PHYS 0x8000u
 extern uint8_t s3_trampoline_start[];
 extern uint8_t s3_trampoline_end[];
 extern void s3_enter(uint32_t pm1a_port, uint32_t pm1b_port, uint32_t slp_a_value, uint32_t slp_b_value);
 
-/* The FACS hangs off the FADT (32-bit FIRMWARE_CTRL at offset 36, or the 64-bit
- * X_FIRMWARE_CTRL at offset 132 on ACPI 2.0+). Map and validate it; returns the
- * mapped base or 0. This is the firmware's own FACS — the same one the BIOS
- * reads on wake — so writing firmware_waking_vector here is what gets us back.
- */
+/* Map and validate the FACS (FIRMWARE_CTRL at offset 36, or X_FIRMWARE_CTRL at 132); 0 on failure. */
 static uint8_t *find_facs(struct fadt *f)
 {
   uint32_t phys = f->firmware_ctrl;
@@ -535,11 +446,7 @@ static uint8_t *find_facs(struct fadt *f)
   return facs;
 }
 
-/* Is ACPI S3 (suspend-to-RAM) actually available? Read-only probe: the FADT
- * must exist, the DSDT must advertise an `_S3` package, and the FACS (where we
- * stash the wake vector) must be reachable. Used to gate the Start-menu "Sleep"
- * item — VMware, for one, doesn't expose S3 to the guest, so offering it would
- * just be a dead button. Safe to call any time after paging is up. */
+/* Read-only probe: FADT, a DSDT _S3 package and a reachable FACS gate the Sleep UI item. */
 bool power_can_sleep(void)
 {
   struct fadt *f = find_fadt();
@@ -551,7 +458,7 @@ bool power_can_sleep(void)
   return find_facs(f) != 0;
 }
 
-/* Enter ACPI S3. Returns (after resume, or immediately) if S3 can't be done. */
+/* Enter ACPI S3; returns after resume, or at once if S3 can't be done. */
 void power_sleep(void)
 {
   struct fadt *f = find_fadt();
@@ -568,10 +475,7 @@ void power_sleep(void)
 
   acpi_ensure_enabled(f);
 
-  /* Copy the wake trampoline into low memory and point the firmware at it.
-   * firmware_waking_vector is the 32-bit (real-mode) entry at FACS offset 12;
-   * clear the 64-bit x_firmware_waking_vector (offset 24) so the firmware
-   * uses the 32-bit one. */
+  /* Copy the trampoline to low memory; set the 32-bit waking vector (FACS offset 12), zero the 64-bit one (24). */
   uint32_t len = (uint32_t)(s3_trampoline_end - s3_trampoline_start);
   uint8_t *dst = (uint8_t *)S3_TRAMPOLINE_PHYS;
   for (uint32_t i = 0; i < len; i++)
@@ -581,22 +485,17 @@ void power_sleep(void)
   if (facs[32] >= 1) /* FACS version >= 1 has the 64-bit field */
     *(volatile uint64_t *)(facs + 24) = 0;
 
-  /* Make sure the trampoline + saved state are in RAM before power drops. */
+  /* Ensure the trampoline and saved state are in RAM before power drops. */
   __asm__ volatile("wbinvd");
 
-  /* Snapshot the PIC line masks: the firmware's wake POST resets the 8259, so
-   * we reinstate exactly what was unmasked before sleeping. */
+  /* Snapshot PIC masks: the wake POST resets the 8259. */
   uint8_t pic_mask1 = inb(0x21);
   uint8_t pic_mask2 = inb(0xA1);
 
-  /* Hand off to asm: it snapshots the CPU and writes SLP_TYP|SLP_EN. Control
-   * returns here once the firmware re-enters us through the trampoline. */
+  /* Asm snapshots the CPU and writes SLP_TYP|SLP_EN; control returns after the firmware re-enters. */
   s3_enter(f->pm1a_cnt_blk, f->pm1b_cnt_blk, (uint32_t)(slp_a | SLP_EN), (uint32_t)(slp_b | SLP_EN));
 
-  /* ---- resumed ---- The S3 wake reset left interrupts off and the chipset
-   * timers/PIC reprogrammed by firmware. Re-establish them with interrupts
-   * masked so a stray tick can't land on a BIOS vector mid-repair, then let
-   * the restored EFLAGS' IF take over. */
+  /* Resumed: re-establish chipset timers/PIC with interrupts masked, then let the restored IF take over. */
   __asm__ volatile("cli");
   irq_resume(pic_mask1, pic_mask2); /* re-map PIC, restore masks */
   timer_init();                     /* re-program the PIT tick   */

@@ -1,16 +1,4 @@
-/* vorbis.c — a from-scratch Vorbis I decoder (Xiph "Vorbis I specification").
- *
- * Pipeline per audio packet: mode select -> window shape -> floor 1 curve ->
- * residue (0/1/2) -> inverse channel coupling -> floor*residue dot product ->
- * inverse MDCT -> windowed overlap-add. Codebooks are canonical Huffman with
- * optional VQ value lookup. Floor 0 (LSP) is not implemented (no libvorbis
- * encoder has emitted it in ~20 years); such a stream returns OGG_EUNSUP.
- *
- * All arithmetic is float/double over x87. The bit reader is LSB-first (Vorbis
- * packs bits low-to-high within each byte); reads past end-of-packet return 0
- * and latch an EOP flag, which the decoder treats as "the rest is silence" per
- * the spec, so a truncated packet degrades rather than faulting.
- */
+/* vorbis.c, a from-scratch Vorbis I decoder (Xiph "Vorbis I specification") */
 #include "ogg.h"
 
 #ifdef OGG_HOST_TEST
@@ -29,31 +17,25 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* Overall scale folded onto the IMDCT output so the windowed overlap-add lands
- * in the int16 range, matching libvorbis's normalization (see the header note
- * in imdct_scale below). */
 #define MDCT_SCALE 1.0f
 static double g_pcm_scale = 32768.0;
 #ifdef OGG_HOST_TEST
 void vorbis_set_scale(double s) { g_pcm_scale = s; }
 #endif
 
-/* ---- floor1 inverse-dB lookup: index (0..255) -> linear multiplier. --------
- * A pure geometric table (10^(a + i*step)) whose endpoints are libvorbis's
- * 1.0649863e-07 .. 0.82788260; the true table is generated as pow(10, linear),
- * so the reconstruction is exact. */
+/* floor1 inverse-dB lookup: index (0..255) -> linear multiplier */
 static float inv_db[256];
 static int inv_db_ready;
 static void inv_db_init(void)
 {
   double a = -6.9727444391292492; /* log10(1.0649863e-07) */
-  double b = -0.0820797818846034; /* log10(0.82788260)    */
+  double b = -0.0820797818846034; /* log10(0.82788260) */
   for (int i = 0; i < 256; i++)
     inv_db[i] = (float)pow(10.0, a + (b - a) * (i / 255.0));
   inv_db_ready = 1;
 }
 
-/* ============================ bit reader ================================= */
+/* bit reader */
 typedef struct {
   const uint8_t *data;
   uint32_t len;
@@ -94,8 +76,7 @@ static uint32_t br_bits(bitr *b, int n)
   return v;
 }
 
-/* ilog(x): bits needed to represent x, i.e. floor(log2(x))+1 for x>0, else 0.
- */
+/* ilog(x): bits needed to represent x, i.e. floor(log2(x))+1 for x>0, else 0 */
 static int ilog(int x)
 {
   int n = 0;
@@ -143,14 +124,14 @@ static int lookup1_values(int entries, int dim)
   return r;
 }
 
-/* ============================= codebook ================================= */
+/* codebook */
 typedef struct {
   int dimensions;
   int entries;
-  /* Huffman decode tree (arrays; node 0 = root). */
+  /* Huffman decode tree (arrays; node 0 = root) */
   int *c0, *c1, *leaf;
   int nnodes;
-  /* VQ value vectors (lookup_type != 0), else NULL. */
+  /* VQ value vectors (lookup_type != 0), else NULL */
   float *value; /* entries*dimensions */
 } codebook;
 
@@ -177,9 +158,7 @@ static int tree_child(codebook *c, int node, int bit, int alloc)
   return m;
 }
 
-/* Build the canonical codeword tree from code lengths (0 = unused entry).
- * Codewords assigned per the spec's under-full-tree algorithm; the first bit
- * read walks from the MSB, matching the LSB-first stream reader. */
+/* Build the canonical codeword tree from code lengths (0 = unused entry) */
 static int cb_build_tree(codebook *c, const uint8_t *lengths)
 {
   int cap = c->entries * 2 + 2;
@@ -202,7 +181,7 @@ static int cb_build_tree(codebook *c, const uint8_t *lengths)
   if (k == c->entries)
     return OGG_OK; /* empty book (all unused) */
 
-/* insert helper: place `code` (top-aligned in 32 bits) of `len` bits. */
+/* insert helper: place `code` (top-aligned in 32 bits) of `len` bits */
 #define INSERT(code, len, entry)                                                                                       \
   do {                                                                                                                 \
     int node = 0;                                                                                                      \
@@ -351,7 +330,7 @@ static int cb_parse(codebook *c, bitr *b)
   return OGG_OK;
 }
 
-/* ============================== floor 1 ================================= */
+/* floor 1 */
 #define FLOOR1_MAX_X 65
 typedef struct {
   int partitions;
@@ -452,9 +431,7 @@ static void render_line(int x0, int y0, int x1, int y1, float *out, int n)
   }
 }
 
-/* Decode a floor1 packet for one channel into `out` (linear multipliers, length
- * n2 = blocksize/2). Returns 1 if the channel carries a floor, 0 if unused, or
- * a negative error. */
+/* Decode a floor1 packet for one channel into `out` */
 static int f1_decode(floor1 *f, codebook *books, int nbooks, bitr *b, float *out, int n2)
 {
   static const int RANGE[4] = {256, 128, 86, 64};
@@ -545,7 +522,7 @@ static int f1_decode(floor1 *f, codebook *books, int nbooks, bitr *b, float *out
   return 1;
 }
 
-/* ============================== residue ================================= */
+/* residue */
 typedef struct {
   int type;
   int begin, end;
@@ -576,9 +553,7 @@ static int res_parse(residue *r, bitr *b)
   return OGG_OK;
 }
 
-/* Decode `ch` residue vectors of `n` values each into `out[ch]`. `do_not`
- * marks channels to skip. Types 0/1 decode per channel; type 2 interleaves all
- * channels into one vector, decodes it, and de-interleaves. */
+/* Decode `ch` residue vectors of `n` values each into `out[ch]` */
 static int res_decode(residue *r, codebook *books, int nbooks, bitr *b, int type, float **out, int ch, int n,
                       const int *do_not, float *scratch /* type-2 aggregate, len ch*n */)
 {
@@ -685,7 +660,7 @@ static int res_decode(residue *r, codebook *books, int nbooks, bitr *b, int type
   return OGG_OK;
 }
 
-/* ============================== mapping ================================= */
+/* mapping */
 typedef struct {
   int submaps;
   int coupling_steps;
@@ -723,7 +698,7 @@ static int map_parse(mapping *m, bitr *b, int channels, int nfloors, int nresidu
   return OGG_OK;
 }
 
-/* =============================== decoder ================================ */
+/* decoder */
 typedef struct {
   int blockflag, mapping;
 } vmode;
@@ -761,8 +736,7 @@ struct vorbis_decoder {
   double *cos_long, *cos_short; /* unused in direct path */
 };
 
-/* --- direct inverse MDCT (O(n^2/4)); correct reference, tuned to libvorbis
- * amplitude. Input X[0..n/2-1], output x[0..n-1]. --- */
+/* direct inverse MDCT (O(n^2/4)); correct reference, tuned to libvorbis */
 #ifdef OGG_HOST_TEST
 double g_imdct_num = 2.0; /* tunable numerator; scale = g_imdct_num / n */
 void vorbis_set_imdct(double s) { g_imdct_num = s; }
@@ -830,7 +804,7 @@ static int alloc_buffers(vorbis_decoder *v)
   return OGG_OK;
 }
 
-/* ---- id + setup header parse ---- */
+/* id + setup header parse */
 static int check_head(const uint8_t *p, unsigned len, int type)
 {
   return len >= 7 && p[0] == type && p[1] == 'v' && p[2] == 'o' && p[3] == 'r' && p[4] == 'b' && p[5] == 'i' &&
@@ -1135,8 +1109,6 @@ int vorbis_decode(vorbis_decoder *v, const unsigned char *pkt, unsigned len, sho
     }
   }
 
-  /* windowed overlap-add: mix the previous block's right half (hold) with this
-   * block's left half; emit the centre-to-centre span. */
   int out_frames = 0;
   if (v->first_frame) {
     for (int c = 0; c < ch; c++)
@@ -1167,7 +1139,7 @@ int vorbis_decode(vorbis_decoder *v, const unsigned char *pkt, unsigned len, sho
   return out_frames;
 }
 
-/* ======================= one-shot memory decode ========================= */
+/* one-shot memory decode */
 int ogg_vorbis_decode_mem(const void *ogg, unsigned len, short **out, int *frames, int *channels, int *rate)
 {
   if (!ogg || !out)

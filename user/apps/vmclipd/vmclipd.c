@@ -1,17 +1,4 @@
-/* vmclipd.c — VMware host<->guest clipboard bridge, in user space.
- *
- * The kernel exposes the VMware host clipboard as a device channel at
- * /proc/hostclip (read = the host's newest selection, or 0 bytes when nothing
- * is new; write = push guest text up to the host). This daemon bridges that
- * channel to the system clipboard (/bin/clipd, via the clipboard lib): a host
- * copy becomes the newest clip, and a guest copy is offered to the host. Text
- * only — the VMware backdoor channel carries text.
- *
- * `last` remembers whatever text we last bridged in either direction so the two
- * sides don't ping-pong an echo forever. Real VMware only: off VMware the
- * /proc/hostclip read returns -1, so we bow out at once rather than spin. This
- * replaces the old in-kernel vmclip_thread — the kernel no longer talks to
- * clipd. */
+/* vmclipd.c, VMware host<->guest clipboard bridge, in user space */
 
 #include "clipboard.h"
 #include "owos.h"
@@ -37,8 +24,7 @@ int main(void)
     if (!first)
       msleep(1000); /* how often to check the host clipboard */
 
-    /* host -> clipd: the host offered a new selection. A -1 here means we are
-     * not on VMware (the node reports it), so there's nothing to bridge. */
+    /* host -> clipd: the host offered a new selection */
     int n = readfile("/proc/hostclip", scratch, sizeof scratch);
     if (n < 0)
       return 0;
@@ -50,7 +36,7 @@ int main(void)
       continue; /* don't echo it straight back to the host */
     }
 
-    /* clipd -> host: a guest copy changed the newest text clip. */
+    /* clipd -> host: a guest copy changed the newest text clip */
     char mime[32];
     void *data = 0;
     int len = 0;

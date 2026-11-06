@@ -1,24 +1,5 @@
-/* media.c — the browser's <audio>/<video> + HTMLMediaElement layer (bmedia.h).
- *
- * A media element is a registry entry tying a DOM node to a user/lib/media
- * mixer source. The flow:
- *   - html.c / the Audio constructor register an element and set its src.
- *   - a load is kicked (autoplay, .load(), or the first play()): the loader
- * thread fetches the file, writes it to a temp owofs path, opens it with
- * media_open, and hands it to the mixer as a source.
- *   - the mixer plays/seeks/loops it; the worker's media_pump turns the
- * source's state changes into DOM media events (the mixer never touches the JS
- * engine).
- *   - main.c lays out and draws the controls widget and routes clicks to
- * play/seek.
- *
- * Audio decodes WAV and MPEG (user/lib/media). <video> decodes H.264 through
- * the media_video path on a background thread and blits frames into the poster;
- * an MP4's AAC audio track is not decoded, so such video plays silently. A
- * frame is shown once its presentation time is due (audio clock if present,
- * else wall clock); before the first frame the poster is black with a play
- * glyph.
- */
+/* media.c: <audio>/<video> HTMLMediaElement layer (bmedia.h) over the user/lib/media mixer.
+ * Audio decodes WAV/MPEG; <video> decodes H.264 only (an MP4's AAC track is silent). */
 #include "media.h" /* user/lib/media: decoder + software mixer */
 #include "browser.h"
 #include "features/media/bmedia.h"
@@ -68,9 +49,7 @@ struct media_el {
   bool playing_state; /* last play/pause we told script about      */
   unsigned last_tu;   /* msec of the last timeupdate               */
 
-  /* --- <video> picture path (user/lib/media media_video). Decoded on the video
-   * thread into a double buffer so the main thread never stalls on a frame. ---
-   */
+  /* <video> picture path: decoded on the video thread into a double buffer */
   media_video *vid;       /* H.264 decoder over m->file, or NULL       */
   int vw, vh;             /* native frame size                         */
   unsigned char *vbuf[2]; /* two native RGB (vw*vh*3) frame buffers    */
@@ -93,7 +72,6 @@ static struct media_el g_media[MEDIA_MAX];
 static void video_ensure(void);
 static void video_dispose(struct media_el *m);
 
-/* ---- helpers ------------------------------------------------------------- */
 static void mstrcpy(char *d, const char *s, int cap)
 {
   int i = 0;
@@ -113,7 +91,6 @@ static void apply_audio_params(struct media_el *m)
   media_source_set_loop(m->ms, m->loop);
 }
 
-/* ---- the loader thread: fetch + open one source at a time ---------------- */
 static char g_loader_stack[131072];
 static volatile bool g_loader_started;
 
@@ -154,14 +131,10 @@ static void loader_run(struct media_el *job)
   kind = job->kind;
   browser_buf_unlock();
 
-  /* Fetch the clip with a Range request, streamed straight to `file` (bounded
-   * memory, any size). Returns the byte count on a 2xx, having already written
-   * and vetted the response — so a positive result means the file is ready. */
+  /* Range-fetch straight to `file`; a positive count means the file is written and vetted. */
   got = browser_fetch_media(src, "audio/*,video/*,*/*", file, &status);
   if (got > 0) {
-    /* A <video> opens the H.264 picture path; its audio track (AAC) is not
-     * decoded, so audio only plays for a container we can also read (WAV/MP3).
-     */
+    /* video opens the H.264 path; AAC audio is not decoded, so only WAV/MP3 containers play sound */
     if (kind == MK_VIDEO) {
       vv = media_video_open(file);
       if (vv) {
@@ -258,14 +231,7 @@ static void loader_ensure(void)
   browser_buf_unlock();
 }
 
-/* ---- the video thread: decode <video> frames ahead of their play time ------
- * * One background thread services every playing video: it decodes the next
- * frame into the element's back buffer, then — when the frame's presentation
- * time is due against the clock (the audio track if the container has decodable
- * audio, else a wall clock) — promotes it to the front buffer for the main
- * thread to blit. The decode happens off-lock so the browser never stalls; a
- * per-element `vbusy` flag lets disposal wait for an in-flight decode rather
- * than free the decoder under it. */
+/* Video thread: decodes the next frame into the back buffer and promotes it when due (off-lock). */
 static char g_vthread_stack[131072];
 static volatile bool g_vthread_started;
 static volatile int g_video_busy; /* the element currently decoding */
@@ -342,8 +308,7 @@ static void video_ensure(void)
   browser_buf_unlock();
 }
 
-/* Tear down an element's video decoder, waiting out any in-flight decode so the
- * video thread never touches a freed decoder. */
+/* Tear down a video decoder, waiting out any in-flight decode. */
 static void video_dispose(struct media_el *m)
 {
   if (!m->vid && !m->vbuf[0])
@@ -368,9 +333,7 @@ static void video_dispose(struct media_el *m)
   browser_buf_unlock();
 }
 
-/* Reopen the video decoder from the (still-resident) temp file — used to replay
- * a finished clip, since the decoder has no random-access seek. Off the big
- * lock during the file read so the browser stays responsive. */
+/* Reopen the decoder from the temp file to replay a clip (no random-access seek). */
 static void video_reopen(struct media_el *m)
 {
   char file[64];
@@ -420,7 +383,6 @@ static void media_kick_load(struct media_el *m)
   m->net = MNS_LOADING;
 }
 
-/* ---- registry ------------------------------------------------------------ */
 static struct media_el *slot_alloc(struct dom_node *node, int kind)
 {
   struct media_el *m = 0;
@@ -460,8 +422,7 @@ struct media_el *media_for_node(struct dom_node *node)
   for (i = 0; i < MEDIA_MAX; i++)
     if (g_media[i].in_use && g_media[i].node == node && g_media[i].owner == B->pg)
       return &g_media[i];
-  /* createElement('audio'/'video') reached a media property before registration
-   */
+  /* createElement('audio'/'video') touched a media property before registration */
   {
     int kind = streq(node->tag, "video") ? MK_VIDEO : MK_AUDIO;
     return slot_alloc(node, kind);
@@ -476,9 +437,7 @@ struct media_el *media_new_audio(struct dom_node *node)
   return m;
 }
 
-/* ---- source selection (<source> children + src attr) --------------------- */
-/* A type string's playability: WAV/MPEG audio is decodable, other audio/video
- * is a maybe (we still try — the container may carry a stream we can read). */
+/* WAV/MPEG audio is decodable; other audio/video is a maybe (the container may carry a readable stream). */
 int media_can_play_type(const char *type)
 {
   if (!type || !type[0])
@@ -498,8 +457,7 @@ static int url_ext_playable(const char *url)
   int n = strlen(url), i;
   char ext[8];
   int e = 0;
-  /* scan back for the extension dot, no further than a plausible extension
-   * length */
+  /* scan back for the extension dot, within a plausible length */
   for (i = n - 1; i >= 0 && url[i] != '/' && url[i] != '?' && n - i < 8; i--)
     if (url[i] == '.')
       break;
@@ -514,8 +472,7 @@ static int url_ext_playable(const char *url)
   return MEDIA_MAYBE;
 }
 
-/* Pick the best source for a media node: its own src, else the best <source>
- * child (a recognized type/extension wins). Resolves against page_url. */
+/* Best source for a media node: its src, else the best <source> child. */
 static bool pick_source(struct dom_node *node, const char *page_url, char *out, int cap)
 {
   const char *src = dom_get_attr(node, "src");
@@ -556,7 +513,6 @@ static bool pick_source(struct dom_node *node, const char *page_url, char *out, 
   return false;
 }
 
-/* ---- registration -------------------------------------------------------- */
 struct media_el *media_register_element(struct dom_node *node, int text_pos, const char *page_url)
 {
   struct media_el *m = media_for_node(node);
@@ -564,10 +520,7 @@ struct media_el *media_register_element(struct dom_node *node, int text_pos, con
   if (!m)
     return 0;
 
-  /* The render walk re-runs on every relayout. Visual attributes (which widget,
-   * where it anchors) refresh each time; playback state
-   * (autoplay/loop/muted/src) is read once so a later JS mutation (audio.loop =
-   * ...) isn't clobbered. */
+  /* the walk re-runs per relayout: refresh visuals, read playback state once so JS mutations survive */
   m->kind = streq(node->tag, "video") ? MK_VIDEO : MK_AUDIO;
   m->text_pos = text_pos;
   m->controls = dom_get_attr(node, "controls") != 0;
@@ -596,7 +549,6 @@ struct media_el *media_register_element(struct dom_node *node, int text_pos, con
   return m;
 }
 
-/* ---- JS-facing operations ------------------------------------------------ */
 void media_set_src(struct media_el *m, const char *abs_url)
 {
   if (!m || !abs_url)
@@ -794,7 +746,6 @@ int media_ready_state(struct media_el *m)
 
 int media_network_state(struct media_el *m) { return m ? m->net : MNS_EMPTY; }
 
-/* ---- worker pump: fire queued + derived events --------------------------- */
 int media_pump(void)
 {
   int i, fired = 0;
@@ -805,8 +756,7 @@ int media_pump(void)
     if (!m->in_use || m->owner != B->pg || !m->node)
       continue;
 
-    /* Loop a finished silent video by reopening from the top (the decoder has
-     * no seek). Done off the big lock since video_reopen reads the file. */
+    /* loop a finished silent video by reopening (off the big lock) */
     if (m->vid && m->loop && m->vended && !m->ms) {
       video_reopen(m);
       browser_buf_lock();
@@ -819,9 +769,7 @@ int media_pump(void)
     }
 
     browser_buf_lock();
-    /* Derive transitions from the live source, then drain the queue — all
-     * under browser_buf_lock so a non-atomic m->ev |= can't clobber a bit the loader
-     * thread just set under the same lock. */
+    /* derive transitions then drain, under browser_buf_lock so m->ev |= can't clobber loader bits */
     if (m->ms) {
       if (media_source_ended(m->ms) && !m->reported_ended) {
         m->reported_ended = true;
@@ -893,7 +841,6 @@ int media_pump(void)
   return fired;
 }
 
-/* ---- layout -------------------------------------------------------------- */
 #define MBAR_H 34 /* control-bar height, px */
 
 static int media_poster_h(int w)
@@ -943,7 +890,6 @@ void media_set_layout(struct media_el *m, int start_row, int rows)
   }
 }
 
-/* ---- widget geometry (shared by draw + hit) ------------------------------ */
 struct mrects {
   int x0, w, bar_y, poster_h, total_h;
   int play_x, play_y, play_w;
@@ -967,8 +913,7 @@ static void media_rects(struct media_el *m, int x0, int y0, int w, struct mrects
   r->vol_w = btn;
   r->vol_x = x0 + w - 8 - btn;
   r->vol_y = my;
-  /* seek track fills the gap between the play button and the time/volume block
-   */
+  /* seek track fills the gap between the play button and the time/volume block */
   r->seek_x = r->play_x + btn + 10;
   r->seek_w = (r->vol_x - 110) - r->seek_x; /* leave room for "M:SS / M:SS" */
   if (r->seek_w < 24)
@@ -977,7 +922,6 @@ static void media_rects(struct media_el *m, int x0, int y0, int w, struct mrects
   r->seek_y = bar_y + (MBAR_H - r->seek_h) / 2;
 }
 
-/* ---- drawing primitives (clipped to the content pane [ct,cb)) ------------ */
 static void mfill(int x, int y, int w, int h, unsigned c, int ct, int cb)
 {
   if (y < ct) {
@@ -1043,11 +987,7 @@ static void fmt_clock(unsigned ms, char *buf)
   buf[k] = '\0';
 }
 
-/* Blit the current decoded video frame into the poster rect, letterboxed to the
- * native aspect. The caller (paint) already holds browser_buf_lock, which the video
- * thread also takes to swap the front buffer — so vfront is stable here and the
- * front buffer can be read directly (the thread only decodes into the back
- * buffer). */
+/* Blit the front video frame into the poster rect, letterboxed; caller holds browser_buf_lock. */
 static void blit_video_frame(struct media_el *m, int x0, int y0, int w, int ph, int ct, int cb)
 {
   int vw = m->vw, vh = m->vh;
@@ -1161,8 +1101,7 @@ void media_el_draw(struct media_el *m, int x0, int y0, int paw, int ct, int cb)
     media_draw(m, x0, y0, paw, ct, cb);
 }
 
-/* Act on a click at (mx,my) within the widget drawn at (x0,y0). The caller has
- * already confirmed the point is inside the widget. */
+/* Act on a click within the widget drawn at (x0,y0); caller checked the hit. */
 void media_el_click(struct media_el *m, int mx, int my, int x0, int y0, int paw)
 {
   struct mrects r;
@@ -1202,7 +1141,6 @@ int media_active(void)
   return 0;
 }
 
-/* ---- teardown ------------------------------------------------------------ */
 void media_page_teardown(void)
 {
   int i;

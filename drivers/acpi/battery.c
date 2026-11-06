@@ -1,17 +1,4 @@
-/* battery.c — ACPI battery detection and charge reading for the neofetch
- * splash.
- *
- * Presence is decided cheaply: an ACPI Control Method Battery is a device whose
- * _HID is the EISA id "PNP0C0A", so acpi_aml_contains() byte-scans the DSDT and
- * every SSDT for that id (two encodings — the compressed 4-byte EisaId the ASL
- * compiler usually emits, and the plain ASCII form a few tables carry).
- * Scanning the SSDTs matters: many laptops declare the battery there, not in
- * the DSDT.
- *
- * The actual percentage comes from aml.c, which evaluates the battery's _BST
- * and _BIF methods (see aml.h). That drives the Embedded Controller and isn't
- * free, so both queries are cached here. QEMU emulates no battery, so both are
- * empty there and the row only shows up on real machines. */
+/* battery.c: ACPI battery detection (PNP0C0A _HID scan) and cached charge reads for neofetch. */
 
 #include "battery.h"
 #include "aml.h"
@@ -20,12 +7,10 @@
 
 int battery_present(void)
 {
-  /* Does a battery *device* exist in the tables? Fixed for the session and the
-   * lookup byte-scans every ACPI table, so cache it. */
+  /* Fixed for the session; the lookup scans every ACPI table, so cache it. */
   static int has_device = -1;
   if (has_device < 0) {
-    /* EisaId("PNP0C0A") compresses to these four AML bytes: the manufacturer
-     * letters P,N,P pack into 0x41,0xD0 and the product id "0C0A" follows. */
+    /* EisaId("PNP0C0A") compressed into its four AML bytes. */
     static const unsigned char eisa[4] = {0x41, 0xD0, 0x0C, 0x0A};
     /* Fallback: a few tables store the _HID as a literal ASCII string. */
     static const unsigned char str[7] = {'P', 'N', 'P', '0', 'C', '0', 'A'};
@@ -34,13 +19,7 @@ int battery_present(void)
   if (!has_device)
     return 0;
 
-  /* A device exists. A real, populated battery reports an actual charge via
-   * _BST/_BIF — trust that outright (it's how this worked on real laptops, and
-   * real _STA methods are quirky/EC-driven and not always evaluable by our
-   * best-effort interpreter, so we must not gate on _STA when we have a real
-   * reading). Only when the charge reads 0/unknown do we consult _STA to weed
-   * out a phantom: VMware advertises a PNP0C0A whose _BST reports a flat 0% and
-   * whose _STA says the battery is absent. */
+  /* Trust a real _BST/_BIF reading; consult _STA only on 0% to weed out phantoms (e.g. VMware). */
   if (battery_percent(0, 0, 0) > 0)
     return 1;
   return aml_battery_present();
@@ -48,9 +27,7 @@ int battery_present(void)
 
 int battery_percent(int *charging, int *discharging, int *minutes)
 {
-  /* Evaluating _BST/_BIF drives the Embedded Controller (milliseconds), so
-   * cache the result and refresh at most once every few seconds rather than on
-   * every neofetch render. */
+  /* _BST/_BIF drive the EC (milliseconds): cache and refresh every few seconds. */
   static bool valid = false;
   static int pct = -1, mins = -1;
   static bool chg = false, dis = false;
@@ -86,21 +63,13 @@ int battery_percent(int *charging, int *discharging, int *minutes)
 
 const char *battery_error(void) { return aml_last_error(); }
 
-/* battery_diag — a one-line account of where detection stands, for debugging on
- * a real laptop (QEMU has no battery, so this path can't be exercised locally).
- * Reports, in order: whether the PNP0C0A _HID byte-pattern exists in the ACPI
- * tables at all (hid=0/1); the namespace-walk stats (objects recorded n=, and
- * the opcode any term-list walk first bailed on b=, or b=- for none); and
- * either the read percentage (pct=) or the aml interpreter's failure note
- * (err=). Read it with `cat /proc/battery`. */
+/* One-line detection status for debugging real laptops; read via /proc/battery. */
 const char *battery_diag(void)
 {
   static char buf[320];
   int i = 0;
 
-  /* Stage 1: does a battery *device* exist in the tables? (Same two encodings
-   * battery_present() scans for.) hid=0 means the firmware exposes no PNP0C0A
-   * at all — nothing downstream can help. */
+  /* Stage 1: hid=0 means the firmware exposes no PNP0C0A at all. */
   static const unsigned char eisa[4] = {0x41, 0xD0, 0x0C, 0x0A};
   static const unsigned char str[7] = {'P', 'N', 'P', '0', 'C', '0', 'A'};
   int hid = acpi_aml_contains(eisa, 4) || acpi_aml_contains(str, 7);
@@ -140,8 +109,7 @@ const char *battery_diag(void)
   }
   buf[i++] = ' ';
 
-  /* Stage 3: actually read it, and report the percentage or the failure note.
-   */
+  /* Stage 3: report the percentage or the failure note. */
   struct aml_battery b;
   if (aml_read_battery(&b)) {
     const char *p = "pct=";
@@ -167,8 +135,7 @@ const char *battery_diag(void)
       buf[i++] = m[k];
   }
 
-  /* Verbose raw-package dump: distinguishes an "EC not available" sentinel
-   * (every _BST field 0xFFFFFFFF) from one field that won't read. */
+  /* Distinguishes an "EC not available" sentinel (all _BST fields 0xFFFFFFFF) from one bad field. */
   if (hid && i < (int)sizeof buf - 2) {
     buf[i++] = ' ';
     aml_battery_debug(buf + i, (int)sizeof buf - i);

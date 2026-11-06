@@ -1,11 +1,6 @@
-/* permissions.c — per-origin permission store + Permissions-Policy parser.
- * See permissions.h. The store is one in-memory list of (origin, feature ->
- * state) entries; those flagged `persist` are also written to a real SQLite db
- * (user/lib/sqlite) at PERM_DB, so "Allow always" survives a reboot while
- * "Allow once" / "Refuse" (session-only) do not. Whole-file rewrite on each
- * persistent change — the list is tiny, like the cookie jar (jar.c). */
+/* permissions.c: per-origin permission store (SQLite-backed for persist entries) and policy parser. */
 #include "features/permissions/permissions.h"
-#include "owos.h" /* malloc/free/strlen + streq_ci/starts_ci helpers */
+#include "owos.h"
 #include "sqlite.h"
 #include <stdbool.h>
 
@@ -24,8 +19,7 @@ struct perm_entry {
 };
 static struct perm_entry *g_perms;
 
-/* Per-feature metadata: the on-disk index is the array index, so only append.
- */
+/* Per-feature metadata; the array index is persisted, so only append. */
 static const struct {
   const char *label, *verb, *token;
 } k_feat[PERM_FEATURE_COUNT] = {
@@ -165,26 +159,20 @@ void perm_load(void)
   sql_close(db);
 }
 
-/* ---- Permissions-Policy (HTTP response header) -------------------------- */
+/* Permissions-Policy (HTTP response header) */
 
 static bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 
-/* Does an allowlist enable this document (whose host is `host`)? The forms are
- * `*` (all), a bare `self`, or a parenthesised list of `self`/`*`/quoted
- * origins.
- * `()` (empty) disables. We enable when the list carries `*`, `self`, or the
- * page's own host — the top-level document's origin. */
+/* Enabled if the allowlist carries `*`, `self` or the page's own host; `()` disables. */
 static bool allowlist_enables(const char *a, int alen, const char *host)
 {
   bool has = false;
-  /* scan tokens: '*', bare/quoted words; ignore parens/quotes/commas/spaces */
   for (int i = 0; i < alen; i++) {
     char c = a[i];
     if (c == '*')
       return true;
     if (is_ws(c) || c == '(' || c == ')' || c == '"' || c == '\'' || c == ',')
       continue;
-    /* word start: capture [a-zA-Z] run and URL-ish runs */
     int s = i;
     while (i < alen && a[i] != ' ' && a[i] != '"' && a[i] != '\'' && a[i] != '(' && a[i] != ')' && a[i] != ',')
       i++;
@@ -192,7 +180,6 @@ static bool allowlist_enables(const char *a, int alen, const char *host)
     if (wl == 4 && starts_ci(a + s, "self"))
       return true;
     if (host && host[0] && wl > 0) {
-      /* enabled if the page's own host appears in a listed origin */
       int hl = strlen(host);
       for (int k = s; k + hl <= s + wl; k++)
         if (starts_ci(a + k, host)) {
@@ -226,8 +213,7 @@ unsigned perm_policy_parse(const char *hv, const char *host)
       e--;
     if (s >= e)
       continue;
-    /* split token[=allowlist]; a bare token (Feature-Policy "geolocation
-     * 'self'") also works — the allowlist is whatever follows the token. */
+    /* token[=allowlist]; Feature-Policy uses a bare token followed by the allowlist */
     int eq = s;
     while (eq < e && hv[eq] != '=' && !is_ws(hv[eq]))
       eq++;

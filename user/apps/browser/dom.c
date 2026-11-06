@@ -1,14 +1,9 @@
-/* dom.c — HTML tokenizer + tree builder. One forward pass builds the DOM tree
- * (the two interleave: a <script> body is raw text only the builder gathers).
- * Handles comments, doctype/PI, attributes, void + raw-text elements,
- * self-close, and the common implied-end ("auto-close") rules. Not a full HTML5
- * state machine (no adoption agency / foster-parenting / implicit
- * html/head/body). */
+/* dom.c: HTML tokenizer + tree builder. Not a full HTML5 state machine (no adoption agency etc). */
 #include "dom.h"
 #include "owos.h"
 #include <stdbool.h>
 
-#define MAX_DEPTH 256 /* bounds tree depth -> recursive walk can't overflow */
+#define MAX_DEPTH 256 /* bounds tree depth */
 
 static bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 static bool is_name_char(char c) { return is_alpha(c) || (c >= '0' && c <= '9') || c == '-' || c == ':' || c == '_'; }
@@ -61,9 +56,7 @@ static bool is_rawtext(const char *name)
   return name_in(name, r);
 }
 
-/* CSS block-level elements — used only to close an open <p> when one starts.
- * (The renderer has its own, deliberately different, line-break set in html.c.)
- */
+/* CSS block-level elements; only used to close an open <p>. */
 static bool is_block(const char *name)
 {
   static const char *const b[] = {"address",  "article",    "aside",  "blockquote", "details", "div",    "dl",
@@ -472,17 +465,13 @@ struct dom_node *dom_parse(const char *html, int len)
   return ps.root;
 }
 
-/* Set by browser/js/bindings.c: invoked when a node that has a JS wrapper is freed, so
- * the wrapper can be detached (host cleared) instead of dangling. NULL when no
- * JS. */
+/* Set by browser/js/bindings.c: detaches the JS wrapper of a freed node. NULL when no JS. */
 void (*dom_on_free_wrapper)(void *wrapper);
 void (*dom_on_free_style_cache)(void *cache);
 void (*dom_on_free_anim)(struct dom_node *n);
 bool dom_structural_styles;
 
-/* Bumped by every tree-mutating API below. The browser samples it around a JS
- * event so it only re-flattens the page when a handler actually changed the
- * DOM. */
+/* Bumped by every tree-mutating API; the browser re-flattens only when it changes. */
 unsigned dom_mutation_seq;
 
 static void node_free_one(struct dom_node *n)
@@ -511,8 +500,7 @@ static void node_free_one(struct dom_node *n)
   free(n);
 }
 
-/* Iterative post-order teardown — never recurses, so tree depth costs no stack.
- */
+/* Iterative post-order teardown (no recursion). */
 void dom_free(struct dom_node *root)
 {
   struct dom_node *n = root;
@@ -566,8 +554,7 @@ const char *dom_get_attr(const struct dom_node *node, const char *name)
   return 0;
 }
 
-/* Attributes the CSS engine and presentational-attr mapping read; any other
- * attribute cannot change a computed style. */
+/* Attributes that can change a computed style. */
 static bool style_attr(const char *name)
 {
   static const char *const names[] = {"id",     "class",   "style",    "color",    "bgcolor",  "width",
@@ -596,8 +583,7 @@ static void style_stale_subtree(struct dom_node *root)
   }
 }
 
-/* --- mutation API (for the JS DOM bindings; see browser/js/bindings.c) ------
- */
+/* Mutation API for the JS DOM bindings (browser/js/bindings.c). */
 
 struct dom_node *dom_new_element(const char *tag)
 {
@@ -661,8 +647,7 @@ void dom_append_child(struct dom_node *parent, struct dom_node *child)
     style_stale_subtree(parent);
 }
 
-/* Insert `child` before `ref` among `parent`'s children. A NULL `ref` (or one
- * not actually a child of `parent`) appends, matching Node.insertBefore. */
+/* Insert `child` before `ref`; a NULL or foreign `ref` appends (Node.insertBefore). */
 void dom_insert_before(struct dom_node *parent, struct dom_node *child, struct dom_node *ref)
 {
   if (!parent || !child)
@@ -686,8 +671,6 @@ void dom_insert_before(struct dom_node *parent, struct dom_node *child, struct d
       prev->next = child;
     else
       parent->first_child = child;
-    /* ref is not last (it has child before it now), so last_child is unchanged.
-     */
   }
   style_stale_subtree(child);
   if (dom_structural_styles)
@@ -753,8 +736,7 @@ void dom_remove_attr(struct dom_node *el, const char *name)
   }
 }
 
-/* Detach and free every child subtree. Each child is unlinked before dom_free
- * so the post-order teardown stays within that one subtree. */
+/* Detach and free every child subtree, unlinking each first. */
 void dom_clear_children(struct dom_node *el)
 {
   if (!el)

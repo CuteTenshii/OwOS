@@ -1,17 +1,15 @@
-/* gfx.c: user-space drawing into a window's shared pixel buffer. See gfx.h. */
+/* gfx.c: user-space drawing into a window's shared pixel buffer. See gfx.h */
 #include "gfx.h"
 #include "font.h" /* scalable fonts, loaded at runtime (no baked atlas) */
 #include "owos.h" /* KEY_* editing codes delivered via WEV_KEY */
 
-/* Apps lay out the monospace grid on this fixed cell (terminals, the editor).
- */
+/* Apps lay out the monospace grid on this fixed cell (terminals, the editor) */
 #define GFX_FONT_W 8
 #define GFX_FONT_H 16
 
 static unsigned *g_fb;
 static int g_w, g_h;
 
-/* Optional clip rect [g_cx0,g_cx1) x [g_cy0,g_cy1) for all primitives; defaults to the whole buffer. */
 static int g_cx0, g_cy0, g_cx1, g_cy1;
 
 void gfx_init(unsigned *fb, int w, int h)
@@ -60,9 +58,7 @@ void gfx_set_clip(int x, int y, int w, int h)
   g_cy1 = y1 > y ? y1 : y;
 }
 
-/* 32-bpp run fill (`rep stosl`): solid rows are the inner loop of every rect
- * fill and the per-frame content-pane clear; a scalar store loop dominated
- * paint. */
+/* 32-bpp run fill (`rep stosl`) */
 static inline void fill32(unsigned *d, unsigned v, int n)
 {
   int d0, d1;
@@ -144,7 +140,7 @@ void gfx_rect(int x, int y, int w, int h, unsigned color)
   gfx_fill_rect(x + w - 1, y, 1, h, color);
 }
 
-/* Blend fg over bg by coverage a (0..255), per channel. */
+/* Blend fg over bg by coverage a (0..255), per channel */
 static unsigned gfx_blend(unsigned fg, unsigned bg, unsigned a)
 {
   if (a == 0)
@@ -158,8 +154,7 @@ static unsigned gfx_blend(unsigned fg, unsigned bg, unsigned a)
   return (((r + (r >> 8)) >> 8) << 16) | (((g + (g >> 8)) >> 8) << 8) | ((b + (b >> 8)) >> 8);
 }
 
-/* Blit a w*h ARGB (0xAARRGGBB) bitmap at (x,y), alpha-blending each pixel over
- * the framebuffer. Fully transparent pixels are skipped; clipped to bounds. */
+/* Blit a w*h ARGB (0xAARRGGBB) bitmap at (x,y), alpha-blending each pixel over the framebuffer */
 void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb)
 {
   struct gfx_rect r;
@@ -179,9 +174,7 @@ void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb)
   }
 }
 
-/* ---------------------------------------------------------------- fonts -----
- * Sans and mono fonts load at runtime from /etc/fonts and are rasterised by
- * user/lib/font. A `gfx_face` is a lazily-loaded font plus a glyph cache. */
+/* fonts */
 struct gcache_e {
   unsigned cp;
   unsigned char *bm;
@@ -189,9 +182,7 @@ struct gcache_e {
   int valid;
 };
 #define FACE_CACHE 512
-/* No member initialisers here: the two faces are zero-initialised statics so
- * the big glyph cache lives in .bss (free in the binary), not .data. The path +
- * size are passed to face_ready by the callers (compile-time constants). */
+/* No member initialisers here */
 struct gfx_face {
   struct font *font;
   int px, baseline, tried;
@@ -229,7 +220,7 @@ static int face_ready(struct gfx_face *f, const char *path, int px)
   return f->font != 0;
 }
 
-/* Direct-mapped glyph cache lookup; rasterizes and evicts on a miss. */
+/* Direct-mapped glyph cache lookup; rasterizes and evicts on a miss */
 static struct gcache_e *cache_glyph(struct font *font, int px, struct gcache_e *cache, int n, unsigned cp)
 {
   struct gcache_e *g = &cache[cp % n];
@@ -251,7 +242,7 @@ static struct gcache_e *face_glyph(struct gfx_face *f, unsigned cp)
   return cache_glyph(f->font, f->px, f->cache, FACE_CACHE, cp);
 }
 
-/* Per-size sans cache pool (e.g. headings), LRU-reclaimed; g_sans is pinned at SANS_PX. */
+/* Per-size sans cache pool (e.g. headings), LRU-reclaimed; g_sans is pinned at SANS_PX */
 #define SIZED_FACES 6
 #define SIZED_CACHE 256
 struct sized_face {
@@ -262,8 +253,7 @@ struct sized_face {
 static struct sized_face g_sized[SIZED_FACES];
 static unsigned g_lru_tick;
 
-/* Return the pool slot serving `px` (g_sans.font assumed loaded), retargeting
- * and flushing an LRU slot if this size isn't already resident. */
+/* Return the pool slot serving `px` (g_sans.font assumed loaded) */
 static struct sized_face *sized_slot(int px)
 {
   int empty = -1, lru = 0;
@@ -290,8 +280,7 @@ static struct sized_face *sized_slot(int px)
   return s;
 }
 
-/* A resolved sans face at some px: the shared font, its baseline, and the glyph
- * cache (slots + size) to use. SANS_PX resolves to the primary g_sans face. */
+/* A resolved sans face at some px: the shared font, its baseline, and the glyph cache to use */
 struct face_view {
   struct font *font;
   int px, baseline;
@@ -322,9 +311,8 @@ static int sans_view(int px, struct face_view *v)
   return 1;
 }
 
-/* Blit a cached glyph with its top-left at (x + ox, baseline + oy). */
-/* Blit one glyph at `baseline`, additionally clipping rows to [ct,cb). ct>=cb
- * means "no vertical clip" (only the framebuffer bounds apply). */
+/* Blit a cached glyph with its top-left at (x + ox, baseline + oy) */
+/* Blit one glyph at `baseline`, additionally clipping rows to [ct,cb) */
 static void face_blit_clip(int x, int baseline, const struct gcache_e *g, unsigned fg, int ct, int cb)
 {
   if (!g->bm)
@@ -358,8 +346,7 @@ static void face_blit(int x, int baseline, const struct gcache_e *g, unsigned fg
   face_blit_clip(x, baseline, g, fg, 0, 0);
 }
 
-/* One monospace cell: optional opaque background, then the glyph centred in the
- * fixed GFX_FONT_W x GFX_FONT_H cell so columns stay aligned. */
+/* One monospace cell: optional opaque background */
 void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg)
 {
   if (!(bg & GFX_TRANSPARENT))
@@ -385,9 +372,7 @@ void gfx_text(int x, int y, const char *s, unsigned fg, unsigned bg)
     gfx_glyph(x, y, (unsigned char)*s, fg, bulk_bg ? GFX_TRANSPARENT : bg);
 }
 
-/* Map a Unicode codepoint to the cell font's CP437 glyph (0 = no glyph). The
- * Latin-1 supplement (U+00A0..U+00FF) covers the common Western-European
- * accents; a few cp1252 punctuation marks fold to ASCII. */
+/* Map a Unicode codepoint to the cell font's CP437 glyph (0 = no glyph) */
 static unsigned char uni_to_cp437(unsigned cp)
 {
   if (cp < 0x80)
@@ -416,27 +401,24 @@ static unsigned char uni_to_cp437(unsigned cp)
     return '-';
   case 0x2026:
     return '.';
-  /* Geometric shapes that exist in the CP437 cell font (used for tree toggles).
-   */
+    /* Geometric shapes that exist in the CP437 cell font (used for tree toggles) */
   case 0x25B6:
   case 0x25BA:
     return 0x10; /* ► right-pointing triangle */
   case 0x25C0:
   case 0x25C4:
-    return 0x11; /* ◄ left-pointing triangle  */
+    return 0x11; /* ◄ left-pointing triangle */
   case 0x25B2:
   case 0x25B4:
-    return 0x1E; /* ▲ up-pointing triangle    */
+    return 0x1E; /* ▲ up-pointing triangle */
   case 0x25BC:
   case 0x25BE:
-    return 0x1F; /* ▼ down-pointing triangle  */
+    return 0x1F; /* ▼ down-pointing triangle */
   }
   return '?';
 }
 
-/* Monospace text that decodes UTF-8, each codepoint occupies one GFX_FONT_W
- * cell (so columns stay aligned), rendered via the CP437 cell font. Returns the
- * pen x after the string so callers can abut coloured runs. */
+/* Monospace text that decodes UTF-8 */
 int gfx_text_utf8(int x, int y, const char *s, unsigned fg, unsigned bg)
 {
   const char *end = s + strlen(s);
@@ -449,8 +431,7 @@ int gfx_text_utf8(int x, int y, const char *s, unsigned fg, unsigned bg)
   return x;
 }
 
-/* Proportional UI text (UTF-8). UIFONT_H stays the advertised line height apps
- * lay out against; the glyph sits on its baseline within that. */
+/* Proportional UI text (UTF-8) */
 int gfx_ui_cw_cp_px(unsigned cp, int px)
 {
   struct face_view v;
@@ -482,10 +463,8 @@ int gfx_ui_ascent_px(int px)
   return v.baseline;
 }
 
-/* Proportional UTF-8 text at any pixel size; falls back to the monospace cell without a sans font. */
-/* Sized UI text, rows clipped to [ct,cb); ct>=cb disables the vertical clip.
- * The mono fallback (no sans face) is not clipped, it only fires when no TTF
- * loaded. */
+/* Proportional UTF-8 text at any pixel size */
+/* Sized UI text, rows clipped to [ct,cb); ct>=cb disables the vertical clip */
 void gfx_ui_text_px_clip(int x, int y, const char *s, unsigned fg, int px, int ct, int cb)
 {
   const char *end = s + strlen(s);
@@ -511,8 +490,7 @@ void gfx_ui_text_px(int x, int y, const char *s, unsigned fg, int px) { gfx_ui_t
 
 void gfx_ui_text(int x, int y, const char *s, unsigned fg) { gfx_ui_text_px(x, y, s, fg, SANS_PX); }
 
-/* --------------------------------------------------------------- GUI widgets
- */
+/* GUI widgets */
 
 void status_set(struct status_bar *s, const char *msg)
 {
@@ -528,12 +506,11 @@ void status_draw(const struct status_bar *s, int x, int y, int w, unsigned fg, u
   gfx_ui_text(x + 6, y + (GUI_BAR_H - UIFONT_H) / 2, s->msg, fg);
 }
 
-#define MENU_BG 0x2a3342u  /* dropdown background                         */
-#define MENU_FG 0xe0e6eeu  /* enabled item text                          */
-#define MENU_DIM 0x636b78u /* disabled item text / dimmed hint           */
+#define MENU_BG 0x2a3342u  /* dropdown background */
+#define MENU_FG 0xe0e6eeu  /* enabled item text */
+#define MENU_DIM 0x636b78u /* disabled item text / dimmed hint */
 
-/* A small checkmark drawn in a row's left gutter (the cell is GUI_ROW_H tall).
- */
+/* A small checkmark drawn in a row's left gutter (the cell is GUI_ROW_H tall) */
 static void menu_check(int x, int y, unsigned c)
 {
   gfx_fill_rect(x + 0, y + 8, 2, 2, c);
@@ -545,12 +522,10 @@ static void menu_check(int x, int y, unsigned c)
   gfx_fill_rect(x + 6, y + 2, 2, 2, c);
 }
 
-/* Draw a popup list (no title bar) at (px,py): one row per item, with the check
- * gutter, disabled dimming, accelerator hints, and submenu arrows. Open child
- * submenus are then drawn on top, to the right of their parent row. */
+/* Draw a popup list (no title bar) at (px,py): one row per item, with the check gutter */
 static void menu_popup(const struct menu *m, int px, int py)
 {
-  int gutter = m->flags ? 10 : 0; /* reserve a check column         */
+  int gutter = m->flags ? 10 : 0; /* reserve a check column */
   gfx_fill_rect(px, py, GUI_MENU_W, m->n * GUI_ROW_H, MENU_BG);
   for (int i = 0; i < m->n; i++) {
     int ry = py + i * GUI_ROW_H;
@@ -560,7 +535,7 @@ static void menu_popup(const struct menu *m, int px, int py)
     if (fl & MENU_CHECKED)
       menu_check(px + 2, ry, dis ? MENU_DIM : 0x8fd98f);
     gfx_ui_text(px + 6 + gutter, ry, m->items[i], fg);
-    if (m->subs && m->subs[i]) /* submenu: a right arrow (►)  */
+    if (m->subs && m->subs[i]) /* submenu: a right arrow (►) */
       gfx_glyph(px + GUI_MENU_W - 12, ry, 0x10, fg, MENU_BG);
     else if (m->hints && m->hints[i] && m->hints[i][0]) {
       int hw = gfx_ui_width(m->hints[i]);
@@ -584,7 +559,7 @@ void menu_draw(const struct menu *m, int x, int y)
     menu_popup(m, x, y + GUI_BAR_H);
 }
 
-/* Recursively close a menu's submenus (used when the menu itself closes). */
+/* Recursively close a menu's submenus (used when the menu itself closes) */
 static void menu_subs_close(struct menu *m)
 {
   if (!m->subs)
@@ -596,8 +571,7 @@ static void menu_subs_close(struct menu *m)
     }
 }
 
-/* Route a click in m's popup, recursing into open submenus first. Returns 2 = leaf fired
- * (sets *fm, *fi), 1 = handled, 0 = missed. */
+/* Route a click in m's popup, recursing into open submenus first */
 static int menu_popup_hit(struct menu *m, int px, int py, int mx, int my, struct menu **fm, int *fi)
 {
   for (int i = 0; i < m->n; i++)
@@ -611,7 +585,7 @@ static int menu_popup_hit(struct menu *m, int px, int py, int mx, int my, struct
   int i = (my - py) / GUI_ROW_H;
   unsigned char fl = m->flags ? m->flags[i] : 0;
   if (fl & MENU_DISABLED)
-    return 1;                  /* inert: swallow, stay open   */
+    return 1;                  /* inert: swallow, stay open */
   if (m->subs && m->subs[i]) { /* parent: toggle its child */
     int wasopen = m->subs[i]->open;
     for (int k = 0; k < m->n; k++)
@@ -647,9 +621,9 @@ int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **le
         *leaf = fm;
       return fi;
     }
-    if (r == 1) /* opened submenu / disabled: stay  */
+    if (r == 1) /* opened submenu / disabled: stay */
       return -1;
-    m->open = 0; /* clicked outside -> dismiss       */
+    m->open = 0; /* clicked outside -> dismiss */
     menu_subs_close(m);
   }
   return -1;
@@ -662,8 +636,7 @@ int menu_click(struct menu *m, int mx, int my, int x, int y)
   return (leaf == m) ? it : -1; /* back-compat: only this menu's items */
 }
 
-/* Search m (and its submenus) for an enabled item whose accelerator is `key`.
- */
+/* Search m (and its submenus) for an enabled item whose accelerator is `key` */
 static int menu_shortcut_walk(const struct menu *m, int key, struct menu **leaf)
 {
   if (m->keys)
@@ -694,12 +667,11 @@ int menu_shortcut(const struct menu *m, int key)
   return (leaf == m) ? it : -1; /* back-compat: only this menu's items */
 }
 
-/* ------------------------------------------------------------- menu bar */
+/* menu bar */
 
 #define MENUBAR_GAP 4 /* px between adjacent titles on the bar */
 
-/* x of menu i's title: the bar origin plus the widths of the titles before it.
- */
+/* x of menu i's title: the bar origin plus the widths of the titles before it */
 static int menubar_title_x(const struct menubar *mb, int i)
 {
   int x = mb->x;
@@ -718,8 +690,7 @@ void menubar_close(struct menubar *mb)
 
 void menubar_draw(const struct menubar *mb)
 {
-  /* Closed titles first; the open one (if any) last so its dropdown overlays
-   * a neighbouring title. */
+  /* Closed titles first; the open one last so its dropdown overlays a neighbouring title */
   int openi = -1;
   for (int i = 0; i < mb->n; i++) {
     if (mb->menus[i]->open) {
@@ -737,8 +708,7 @@ int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *i
   *leaf = 0;
   *item = -1;
 
-  /* On the title row: toggle the clicked title and close the others, so only
-   * one dropdown is ever open. */
+  /* On the title row: toggle the clicked title and close the others */
   if (my >= mb->y && my < mb->y + GUI_BAR_H) {
     for (int i = 0; i < mb->n; i++) {
       int x = menubar_title_x(mb, i);
@@ -754,8 +724,7 @@ int menubar_click(struct menubar *mb, int mx, int my, struct menu **leaf, int *i
     return 1;
   }
 
-  /* Below the bar: hand the click to whichever menu is open (menu_click_ex
-   * closes it and reports the chosen leaf item, or -1 if the click missed). */
+  /* Below the bar: hand the click to whichever menu is open */
   for (int i = 0; i < mb->n; i++) {
     if (!mb->menus[i]->open)
       continue;
@@ -791,13 +760,13 @@ int menubar_shortcut(const struct menubar *mb, int key, struct menu **leaf)
   return -1;
 }
 
-/* ------------------------------------------------------------- text field */
+/* text field */
 
-#define TF_BG 0xffffffu     /* field background                 */
-#define TF_FG 0x101418u     /* text colour                      */
-#define TF_BORDER 0x3a3f48u /* idle border                      */
-#define TF_FOCUS 0x2f6bd8u  /* focused border accent + caret    */
-#define TF_PAD 4            /* inner horizontal padding (px)    */
+#define TF_BG 0xffffffu     /* field background */
+#define TF_FG 0x101418u     /* text colour */
+#define TF_BORDER 0x3a3f48u /* idle border */
+#define TF_FOCUS 0x2f6bd8u  /* focused border accent + caret */
+#define TF_PAD 4            /* inner horizontal padding (px) */
 
 void textfield_init(struct textfield *tf, char *buf, int cap)
 {
@@ -821,7 +790,7 @@ void textfield_set(struct textfield *tf, const char *s)
   tf->scroll = 0;
 }
 
-/* Pixel width of buf[a..b) in the proportional UI font. */
+/* Pixel width of buf[a..b) in the proportional UI font */
 static int tf_span(const struct textfield *tf, int a, int b)
 {
   int w = 0;
@@ -841,20 +810,17 @@ void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focuse
     avail = 1;
   int ty = y + (h - UIFONT_H) / 2;
 
-  /* Scroll so the caret stays visible: never left of `scroll`, and the run
-   * from `scroll` to the caret must fit `avail` (leave 2px for the caret). */
+  /* Scroll so the caret stays visible: never left of `scroll` */
   if (tf->scroll > tf->len)
     tf->scroll = tf->len;
   if (tf->caret < tf->scroll)
     tf->scroll = tf->caret;
   while (tf->scroll < tf->caret && tf_span(tf, tf->scroll, tf->caret) > avail - 2)
     tf->scroll++;
-  /* After a deletion, pull the view left while all the text fits. */
+  /* After a deletion, pull the view left while all the text fits */
   while (tf->scroll > 0 && tf_span(tf, tf->scroll - 1, tf->len) <= avail - 2)
     tf->scroll--;
 
-  /* Draw visible chars; record where the caret falls so it's drawn afterward
-   * (over the glyphs) and never lost to the loop's right-edge break. */
   int px = inner;
   int caret_px = -1;
   for (int i = tf->scroll; i <= tf->len; i++) {
@@ -946,10 +912,9 @@ int textfield_key(struct textfield *tf, char c)
   }
 }
 
-/* ------------------------------------------------------------- button */
+/* button */
 
-/* Per-state face: fill, a 1px top highlight, label colour. The border is the
- * same near-black as the menu/tab chrome so buttons sit on any background. */
+/* Per-state face: fill, a 1px top highlight, label colour */
 struct btn_face {
   unsigned bg, top, fg;
 };
@@ -970,7 +935,7 @@ void button_draw(int x, int y, int w, int h, const char *label, int state)
     gfx_fill_rect(x + 1, y + 1, w - 2, 1, f->top);
   gfx_rect(x, y, w, h, 0x05070a);
 
-  /* Centre the label; nudge it down a pixel while pressed so it "sinks". */
+  /* Centre the label; nudge it down a pixel while pressed so it "sinks" */
   int tw = gfx_ui_width(label);
   int tx = x + (w - tw) / 2;
   int ty = y + (h - UIFONT_H) / 2 + (state == BTN_PRESSED ? 1 : 0);
@@ -979,9 +944,9 @@ void button_draw(int x, int y, int w, int h, const char *label, int state)
 
 int button_hit(int x, int y, int w, int h, int mx, int my) { return mx >= x && mx < x + w && my >= y && my < y + h; }
 
-/* ------------------------------------------------------------- progress bar */
+/* progress bar */
 
-#define PROG_TROUGH 0x1c2330u /* sunken background        */
+#define PROG_TROUGH 0x1c2330u /* sunken background */
 #define PROG_FILL 0x2f6bd8u   /* accent-blue done portion */
 #define PROG_TOP 0x5a8fe0u    /* lit top edge of the fill */
 #define PROG_BORDER 0x05070au
@@ -998,7 +963,7 @@ void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
 
   gfx_fill_rect(x, y, w, h, PROG_TROUGH);
 
-  /* Fill the inner area (inside the 1px border) proportionally. */
+  /* Fill the inner area (inside the 1px border) proportionally */
   int inner = w - 2;
   int fw = max > 0 && inner > 0 ? (int)((long)inner * value / max) : 0;
   if (fw > 0) {
@@ -1025,23 +990,21 @@ void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
     int tw = gfx_ui_width(buf);
     int tx = x + (w - tw) / 2;
     int ty = y + (h - UIFONT_H) / 2;
-    /* White over the blue done-portion, light grey over the trough; pick by
-     * whether the label's centre sits on the filled side. */
+    /* White over the blue done-portion, light grey over the trough */
     unsigned fg = (w / 2 < 1 + fw) ? 0xffffffu : 0xc8d0dcu;
     gfx_ui_text(tx, ty, buf, fg);
   }
 }
 
-/* ------------------------------------------------------------- scrollbar */
+/* scrollbar */
 
-#define SCROLL_TRACK 0xc8ccd2u    /* light track groove        */
-#define SCROLL_THUMB 0x6b7686u    /* draggable slate thumb     */
-#define SCROLL_ARROW_BG 0xb4b9c2u /* arrow-button face         */
-#define SCROLL_ARROW_FG 0x4a5564u /* arrowhead                 */
-#define SCROLL_MIN_THUMB 12       /* keep the thumb grabbable  */
+#define SCROLL_TRACK 0xc8ccd2u    /* light track groove */
+#define SCROLL_THUMB 0x6b7686u    /* draggable slate thumb */
+#define SCROLL_ARROW_BG 0xb4b9c2u /* arrow-button face */
+#define SCROLL_ARROW_FG 0x4a5564u /* arrowhead */
+#define SCROLL_MIN_THUMB 12       /* keep the thumb grabbable */
 
-/* Square arrow-button height for a w-wide, h-tall bar, or 0 when the bar is too
- * short to hold both arrows and a grabbable thumb (then it's a plain track). */
+/* Square arrow-button height for a w-wide, h-tall bar */
 static int scrollbar_arrow_h(int w, int h)
 {
   int a = w;
@@ -1050,9 +1013,7 @@ static int scrollbar_arrow_h(int w, int h)
   return a;
 }
 
-/* Thumb height + top offset within a track of height `tr` for the current
- * counts, shared by scrollbar_draw and scrollbar_pos so the visual and the
- * hit-test agree. Assumes total > visible (the only case with a thumb). */
+/* Thumb height + top offset within a track of height `tr` for the current counts */
 static void scrollbar_thumb(int tr, int scroll, int total, int visible, int *th, int *ty)
 {
   int t = (int)((long)tr * visible / total);
@@ -1070,8 +1031,7 @@ static void scrollbar_thumb(int tr, int scroll, int total, int visible, int *th,
   *ty = (maxs > 0) ? (int)((long)span * scroll / maxs) : 0;
 }
 
-/* A filled triangle centred in the arrow box [bx,by,w,a], pointing up or down.
- */
+/* A filled triangle centred in the arrow box [bx,by,w,a], pointing up or down */
 static void scrollbar_tri(int bx, int by, int w, int a, int up, unsigned color)
 {
   int sz = (w - 2) / 2;
@@ -1096,7 +1056,7 @@ void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visib
 
   gfx_fill_rect(x, y, w, h, SCROLL_TRACK);
   if (a > 0) {
-    gfx_fill_rect(x, y, w, a, SCROLL_ARROW_BG);         /* up box   */
+    gfx_fill_rect(x, y, w, a, SCROLL_ARROW_BG);         /* up box */
     gfx_fill_rect(x, y + h - a, w, a, SCROLL_ARROW_BG); /* down box */
     scrollbar_tri(x, y, w, a, 1, SCROLL_ARROW_FG);
     scrollbar_tri(x, y + h - a, w, a, 0, SCROLL_ARROW_FG);
@@ -1130,7 +1090,7 @@ int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int to
   if (maxs <= 0)
     return 0;
   int a = scrollbar_arrow_h(w, h);
-  int tr = h - 2 * a; /* track region height       */
+  int tr = h - 2 * a; /* track region height */
   if (tr <= 0)
     return scroll;
   int th, ty;

@@ -1,8 +1,4 @@
-/* firmware.c — remember whether UEFI or legacy BIOS booted us.
- *
- * The detection itself lives in kernel.c's multiboot2 tag walk (an EFI
- * system-table tag means UEFI); this just holds the answer for later readers
- * such as the shutdown path and the neofetch splash. */
+/* firmware.c: records whether UEFI or legacy BIOS booted us (detected in kernel.c's multiboot2 walk). */
 
 #include "firmware.h"
 

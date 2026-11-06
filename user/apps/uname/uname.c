@@ -1,10 +1,5 @@
-/* uname.c - print system identity (POSIX uname).
- *
- *   uname [-asnrvmo]
- *
- * With no flag, prints the kernel name (-s). Fields come from uname(2); the
- * machine arch is kernel-authoritative (this program is 32-bit ELF and can't
- * read the kernel's arch from its own build). */
+/* uname.c - print system identity (POSIX uname). uname [-asnrvmo] With no flag, prints the
+ * kernel name (-s) */
 #include "opt.h"
 #include "owos.h"
 #include <stdbool.h>

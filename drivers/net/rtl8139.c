@@ -1,11 +1,5 @@
-/* rtl8139.c — RealTek RTL8139 NIC driver.
- *
- * Owns the hardware only: PCI probe, the 8 KiB receive ring, four transmit
- * descriptors, and the receive interrupt. Inbound frames go up to the stack
- * through net_rx_frame(); the stack sends complete Ethernet frames back down
- * through nic_send(). Transmit briefly clears IF so the card's own receive
- * interrupt can't grab the same TX descriptor mid-send.
- */
+/* rtl8139.c: RealTek RTL8139 driver: PCI probe, 8 KiB RX ring, four TX descriptors, RX interrupt.
+ * TX clears IF so the card's RX interrupt can't grab the same TX descriptor mid-send. */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,8 +12,6 @@
 #include "pci.h"
 #include "rtl8139.h"
 
-/* ------------------------------------------------------------------ helpers */
-
 /* irq_save / irq_restore: snapshot EFLAGS + cli, restore the prior IF. */
 #include "irqflags.h"
 
@@ -29,49 +21,42 @@ static void print_hex2(uint8_t v)
   con_printf("%c%c", h[v >> 4], h[v & 0xF]);
 }
 
-/* -------------------------------------------------------------- RTL8139 regs
- */
-
 #define RTL_VENDOR 0x10EC
 #define RTL_DEVICE 0x8139
 
-#define REG_IDR0 0x00    /* MAC address, 6 bytes                            */
-#define REG_TSD0 0x10    /* transmit status/command, 4 descriptors x 4B     */
-#define REG_TSAD0 0x20   /* transmit start address (phys), 4 x 4B           */
-#define REG_RBSTART 0x30 /* receive buffer start (phys)                     */
-#define REG_CR 0x37      /* command register                               */
-#define REG_CAPR 0x38    /* current address of packet read                 */
-#define REG_IMR 0x3C     /* interrupt mask                                  */
-#define REG_ISR 0x3E     /* interrupt status                               */
-#define REG_RCR 0x44     /* receive configuration                          */
+#define REG_IDR0 0x00
+#define REG_TSD0 0x10
+#define REG_TSAD0 0x20
+#define REG_RBSTART 0x30
+#define REG_CR 0x37
+#define REG_CAPR 0x38
+#define REG_IMR 0x3C
+#define REG_ISR 0x3E
+#define REG_RCR 0x44
 #define REG_CONFIG1 0x52
 
 #define CR_RST 0x10
 #define CR_RE 0x08
 #define CR_TE 0x04
-#define CR_BUFE 0x01 /* receive buffer empty (1 = nothing to read)      */
+#define CR_BUFE 0x01
 
 #define ISR_ROK 0x0001
 #define ISR_TOK 0x0004
-#define TSD_TOK 0x8000 /* transmit OK                                     */
+#define TSD_TOK 0x8000
 
-#define RX_BUF_SIZE 8192                       /* the wrap modulus (RBLEN = 8K)           */
-#define RX_BUF_ALLOC (RX_BUF_SIZE + 16 + 1536) /* + header pad + WRAP slack */
+#define RX_BUF_SIZE 8192
+#define RX_BUF_ALLOC (RX_BUF_SIZE + 16 + 1536)
 #define TX_BUFS 4
-
-/* ------------------------------------------------------------------- state */
 
 static bool nic_found;
 static uint16_t io_base;
 static uint8_t mac[6];
 
 static uint8_t *rx_buf;
-static uint32_t rx_cur; /* read offset into the 8K ring           */
+static uint32_t rx_cur;
 
 static uint8_t *tx_buf[TX_BUFS];
 static int tx_cur;
-
-/* ----------------------------------------------------------------- exported */
 
 static const uint8_t *rtl8139_mac(void) { return mac; }
 
@@ -85,11 +70,11 @@ static void rtl8139_send(const uint8_t *frame, uint32_t len)
   int i = tx_cur;
   uint8_t *b = tx_buf[i];
   memcpy(b, frame, len);
-  while (len < 60) /* pad runt frames to the 60-byte minimum  */
+  while (len < 60)
     b[len++] = 0;
 
   outl(io_base + REG_TSAD0 + i * 4, (uint32_t)(uintptr_t)b);
-  outl(io_base + REG_TSD0 + i * 4, len); /* OWN=0 starts transmission     */
+  outl(io_base + REG_TSD0 + i * 4, len);
 
   /* Wait for the card to report the frame out (bounded spin). */
   for (int spins = 0; spins < 2000000; spins++)
@@ -100,9 +85,6 @@ static void rtl8139_send(const uint8_t *frame, uint32_t len)
   irq_restore(fl);
 }
 
-/* -------------------------------------------------------------- receive path
- */
-
 /* Drain every complete frame sitting in the RX ring. Called from the IRQ. */
 static void rx_poll(void)
 {
@@ -111,13 +93,11 @@ static void rx_poll(void)
     uint16_t status = (uint16_t)(p[0] | (p[1] << 8));
     uint16_t len = (uint16_t)(p[2] | (p[3] << 8));
 
-    /* Bound to a real (VLAN-tagged) Ethernet frame. The old 2000 cap
-     * exceeded the ring's WRAP slack, so an oversized DMA'd length read
-     * past the buffer allocation. */
+    /* Bound to a real (VLAN-tagged) frame; a larger cap read past the buffer's WRAP slack. */
     if (len < 14 || len > 1522 || !(status & 0x01))
-      break; /* runt / oversize / error / DMA-in-progress */
+      break;
 
-    net_rx_frame(p + 4, (uint32_t)len - 4); /* drop the 4-byte FCS */
+    net_rx_frame(p + 4, (uint32_t)len - 4);
 
     rx_cur = (rx_cur + len + 4 + 3) & ~3u;
     rx_cur %= RX_BUF_SIZE;
@@ -133,8 +113,6 @@ static void rtl_poll(void)
   rx_poll();
   irq_restore(fl);
 }
-
-/* --------------------------------------------------------------------- init */
 
 static int rtl8139_probe(void)
 {
@@ -158,7 +136,7 @@ static int rtl8139_probe(void)
     }
   }
   if (!found)
-    return 0; /* silent: the dispatch layer reports "no NIC" */
+    return 0;
 
   uint32_t bar0 = pci_read32(bus, slot, func, 0x10);
   io_base = (uint16_t)(bar0 & 0xFFFC);
@@ -181,20 +159,19 @@ static int rtl8139_probe(void)
     }
   }
 
-  outb(io_base + REG_CONFIG1, 0x00); /* power on                        */
-  outb(io_base + REG_CR, CR_RST);    /* software reset                  */
+  outb(io_base + REG_CONFIG1, 0x00);
+  outb(io_base + REG_CR, CR_RST);
   for (int spins = 0; spins < 1000000; spins++)
     if (!(inb(io_base + REG_CR) & CR_RST))
       break;
 
   outl(io_base + REG_RBSTART, (uint32_t)(uintptr_t)rx_buf);
   rx_cur = 0;
-  outw(io_base + REG_CAPR, 0xFFF0); /* read pointer = -16              */
-  outw(io_base + REG_IMR, 0);       /* RX/TX are drained or polled by netrx */
-  /* RCR: accept broadcast/multicast/phys-match/all, WRAP, max DMA burst,
-   * no RX FIFO threshold (whole frame), 8K+16 ring. */
+  outw(io_base + REG_CAPR, 0xFFF0);
+  outw(io_base + REG_IMR, 0);
+  /* RCR: accept broadcast/multicast/phys-match/all, WRAP, max DMA burst, no FIFO threshold, 8K+16 ring. */
   outl(io_base + REG_RCR, 0x0000000F | (1 << 7) | (7 << 8) | (7 << 13));
-  outb(io_base + REG_CR, CR_RE | CR_TE); /* enable receive + transmit       */
+  outb(io_base + REG_CR, CR_RE | CR_TE);
 
   for (int i = 0; i < 6; i++)
     mac[i] = inb(io_base + REG_IDR0 + i);

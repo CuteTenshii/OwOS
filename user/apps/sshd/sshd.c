@@ -1,22 +1,11 @@
-/* sshd.c — the SSH-2 server, entirely in user space.
- *
- * The server analogue of user/apps/ssh/ssh.c: curve25519-sha256 KEX +
- * aes128-gcm@openssh.com over a raw TCP listener (net_listen/net_accept), the
- * exchange hash signed with an ssh-ed25519 host key. Password auth against
- * /etc/passwd (name:sha256(pw):uid:gid:home). On success it spawns /bin/term as
- * the authenticated user via spawn_cap_io_as (the root-only spawn-as-user
- * primitive) and relays the channel to the shell's stdio. One client at a time.
- *
- * The daemon is started as root at boot; each session drops to the logged-in
- * user's uid/gid — the Unix model, ported out of the old kernel/sshd.c.
- */
+/* sshd.c, the SSH-2 server, entirely in user space */
 
 #include "crypto.h"
 #include "ed25519.h"
 #include "owos.h"
 #include <stdbool.h>
 
-/* ---- SSH-2 message numbers ----------------------------------------------- */
+/* SSH-2 message numbers */
 #define MSG_DISCONNECT 1
 #define MSG_IGNORE 2
 #define MSG_UNIMPLEMENTED 3
@@ -51,7 +40,7 @@
 #define MAXPKT 35000
 #define HOSTKEY_PATH "/etc/ssh_host_ed25519"
 
-/* ---- per-connection state (single static instance) ----------------------- */
+/* per-connection state (single static instance) */
 
 struct ssh {
   int sock;
@@ -62,7 +51,7 @@ struct ssh {
 
   unsigned char payload[MAXPKT];
   unsigned char ptext[MAXPKT];   /* recv GCM plaintext / caller build scratch */
-  unsigned char sealbuf[MAXPKT]; /* send GCM plaintext (distinct from ptext)  */
+  unsigned char sealbuf[MAXPKT]; /* send GCM plaintext (distinct from ptext) */
   unsigned char tx[MAXPKT + 64];
 
   bool recv_enc;
@@ -78,7 +67,7 @@ struct ssh {
   unsigned char ic[8192];
   int ic_len; /* client KEXINIT (I_C) */
   unsigned char is[2048];
-  int is_len; /* our KEXINIT    (I_S) */
+  int is_len; /* our KEXINIT (I_S) */
 
   /* channel */
   unsigned peer_chan, peer_window, peer_maxpkt;
@@ -91,11 +80,11 @@ struct ssh {
 
 static struct ssh S;
 
-/* The persistent host key. */
+/* The persistent host key */
 static uint8_t host_seed[32], host_pub[32];
 static bool host_ready;
 
-/* ---- byte helpers -------------------------------------------------------- */
+/* byte helpers */
 
 static void wb(unsigned char *d, int *p, unsigned v) { d[(*p)++] = (unsigned char)v; }
 static void w32(unsigned char *d, int *p, unsigned v)
@@ -130,7 +119,7 @@ static void incr_iv(unsigned char *iv)
       break;
 }
 
-/* ---- transport ----------------------------------------------------------- */
+/* transport */
 
 static int sock_send(const unsigned char *b, int n)
 {
@@ -146,8 +135,7 @@ static int sock_send(const unsigned char *b, int n)
   return 0;
 }
 
-/* Pull whatever is available off the socket (non-blocking).
- * Returns bytes added, 0 would-block, -1 on EOF/error/EINTR. */
+/* Pull whatever is available off the socket (non-blocking) */
 static int rx_pump(void)
 {
   if (S.rxlen >= (int)sizeof S.rx)
@@ -209,8 +197,7 @@ static int send_packet(const unsigned char *pl, int plen)
   return sock_send(S.tx, pos);
 }
 
-/* 1 = decoded one packet into payload (+*plen), consumed; 0 = need more; -1 err
- */
+/* 1 = decoded one packet into payload (+*plen), consumed; 0 = need more; -1 err */
 static int parse_one(int *plen)
 {
   if (S.rxlen < 4)
@@ -270,8 +257,7 @@ static int read_packet(int *plen, int timeout_ms)
   }
 }
 
-/* Next non-transport message; auto-handle IGNORE/DEBUG/EXT_INFO/GLOBAL_REQUEST.
- */
+/* Next non-transport message; auto-handle IGNORE/DEBUG/EXT_INFO/GLOBAL_REQUEST */
 static int recv_msg(int *plen, int timeout_ms)
 {
   for (;;) {
@@ -296,7 +282,7 @@ static int recv_msg(int *plen, int timeout_ms)
   }
 }
 
-/* ---- host key ------------------------------------------------------------ */
+/* host key */
 
 static void host_key_init(void)
 {
@@ -311,7 +297,7 @@ static void host_key_init(void)
   host_ready = true;
 }
 
-/* ---- KEX ----------------------------------------------------------------- */
+/* KEX */
 
 static void build_kexinit(void)
 {
@@ -471,8 +457,7 @@ static int do_kex(void)
   }
   memcpy(S.session_id, S.H, 32);
 
-  /* sign H with the host key: sig blob = string("ssh-ed25519") || string(sig)
-   */
+  /* sign H with the host key: sig blob = string("ssh-ed25519") || string(sig) */
   unsigned char sig[64];
   ed25519_sign(sig, S.H, 32, host_seed, host_pub);
   unsigned char sb[128];
@@ -505,9 +490,9 @@ static int do_kex(void)
   return 0;
 }
 
-/* ---- auth ---------------------------------------------------------------- */
+/* auth */
 
-/* Extract an SSH string field at *p into out (NUL-terminated, capped). */
+/* Extract an SSH string field at *p into out (NUL-terminated, capped) */
 static void get_str(int *p, int plen, char *out, int outsz)
 {
   unsigned n = (*p + 4 <= plen) ? r32(S.payload, p) : 0;
@@ -518,7 +503,7 @@ static void get_str(int *p, int plen, char *out, int outsz)
   *p += (int)n - i; /* skip any remainder we truncated */
 }
 
-/* Field `idx` of a colon-delimited /etc/passwd line [s,end). */
+/* Field `idx` of a colon-delimited /etc/passwd line [s,end) */
 static void pw_field(const char *s, const char *end, int idx, char *out, int max)
 {
   int f = 0;
@@ -545,10 +530,7 @@ static void hex_sha256(const char *s, char out[65])
   out[64] = '\0';
 }
 
-/* Password auth against /etc/passwd (name:sha256hex(pw):uid:gid:home). An empty
- * password field accepts any password, matching the kernel's
- * users_authenticate. On success fills S.uid/gid/home. Returns 0 ok, -1 on no
- * match / bad password. */
+/* Password auth against /etc/passwd (name:sha256hex(pw):uid:gid:home) */
 static int passwd_check(const char *user, const char *pass)
 {
   static char pw[4096];
@@ -628,7 +610,7 @@ static int do_auth(void)
         return 0;
       }
     }
-    /* "none" or a failed password: report password as the only method. */
+    /* "none" or a failed password: report password as the only method */
     unsigned char f[1 + 4 + 8 + 1];
     int q = 0;
     wb(f, &q, MSG_USERAUTH_FAILURE);
@@ -640,7 +622,7 @@ static int do_auth(void)
   return -1;
 }
 
-/* ---- channel + session --------------------------------------------------- */
+/* channel + session */
 
 #define LOCAL_WINDOW 0x100000u
 #define LOCAL_MAXPKT 32768u
@@ -683,11 +665,6 @@ static int top_up_window(void)
   return 0;
 }
 
-/* Run the login shell: spawn /bin/term in headless "-stdio" mode AS the authed
- * user (spawn_cap_io_as: the root-only spawn-as-user primitive, cwd = home),
- * with its stdin/stdout wired to pipes we drive, then relay bytes both ways.
- * The shell doesn't know it's SSH — the Unix model. Returns when the client
- * closes the channel or the shell exits. */
 static void ssh_session(void)
 {
   const char *fail = "no shell available\r\n";
@@ -740,8 +717,7 @@ static void ssh_session(void)
         r32(S.payload, &p);
         S.peer_window += r32(S.payload, &p);
       } else if (t == MSG_CHANNEL_EOF) {
-        /* client won't send more stdin: close the shell's stdin so it sees
-         * EOF, but keep relaying its stdout until the shell itself exits. */
+        /* client won't send more stdin: close the shell's stdin so it sees EOF */
         if (!stdin_closed) {
           close(wfd);
           stdin_closed = true;
@@ -763,9 +739,9 @@ static void ssh_session(void)
 
   if (!stdin_closed)
     close(wfd);       /* drop our stdin writer -> shell sees EOF */
-  close(rfd);         /* drop our stdout reader                  */
-  kill(pid, SIGKILL); /* stop the shell if still running         */
-  waitpid(pid);       /* reap it                                 */
+  close(rfd);         /* drop our stdout reader */
+  kill(pid, SIGKILL); /* stop the shell if still running */
+  waitpid(pid);       /* reap it */
 }
 
 static int do_channel(void)
@@ -805,7 +781,7 @@ static int do_channel(void)
   if (send_packet(a, q) != 0)
     return -1;
 
-  /* Handle channel requests until shell/exec starts the session. */
+  /* Handle channel requests until shell/exec starts the session */
   for (;;) {
     int t = recv_msg(&plen, 60000);
     if (t < 0)
@@ -866,7 +842,7 @@ static void channel_close(void)
   send_packet(m, p);
 }
 
-/* ---- version exchange + top level ---------------------------------------- */
+/* version exchange + top level */
 
 static int read_ident(void)
 {
@@ -904,7 +880,7 @@ static int read_ident(void)
   }
 }
 
-/* Serve one SSH connection synchronously over the accepted socket `c`. */
+/* Serve one SSH connection synchronously over the accepted socket `c` */
 static void serve(int c)
 {
   memset(&S, 0, sizeof S);

@@ -1,26 +1,6 @@
-/* sysfs.c — a Linux-sysfs-style /sys hierarchy (see sysfs.h).
- *
- * A real nested tree of kernel objects and their attribute files, reached
- * through the ordinary file API. Unlike the flat /proc, every directory level
- * here is walkable (`ls /sys/class/input` -> kbd0 mouse0). Layout:
- *
- *   /sys/class/input/kbd0/layout        keyboard layout       (rw)
- *   /sys/class/input/mouse0/speed       pointer speed 1..5    (rw)
- *   /sys/class/net/eth0/{address,carrier,ipaddr}              (ro)
- *   /sys/class/block/<dev>/{model,size}                       (ro)
- *   /sys/class/graphics/fb0/{width,height,refresh,monitor,internal}  (ro)
- *   /sys/class/graphics/fb0/{mode,modes}       screen resolution   (rw/ro,
- * DISPI) /sys/class/sound/card0/{output,outputs}    audio output select (rw/ro)
- *   /sys/class/dmi/id/{product_name,sys_vendor}               (ro, SMBIOS)
- *   /sys/bus/pci/devices/<bdf>/{vendor,device,class}          (ro, one
- * dir/device) /sys/power/battery/{capacity,status}                      (ro,
- * real HW) /sys/firmware/type                  BIOS / UEFI           (ro)
- *
- * The tree is small, and the dynamic parts (which NIC/block devices exist, is a
- * battery present) depend on hardware, so it's resolved by an explicit
- * per-level path walk rather than a static node table. Classification,
- * enumeration, read and write all share the same level structure.
- */
+/* sysfs.c: Linux-style /sys tree (see sysfs.h) reached via the file API; dynamic parts (NICs, block devices, battery)
+ * are resolved by a per-level path walk. Paths: class/{input,net,block,graphics,sound,dmi}, bus/pci/devices,
+ * power/battery, firmware/type. */
 
 #include "sysfs.h"
 #include "battery.h"
@@ -41,7 +21,7 @@
 /* The single NIC's sysfs name (we keep one card; nic.c is driver-agnostic). */
 #define NET_IFACE "eth0"
 
-/* ------------------------------------------------------------- text builder */
+/* text builder */
 /* Same bounded builder as procfs.c, local so the two stay independent. */
 struct pb {
   char *p;
@@ -84,15 +64,11 @@ static void phex4(struct pb *b, uint16_t v)
   phex2(b, v & 0xFF);
 }
 
-/* ------------------------------------------------------------- path tokeniser
- */
-#define MAXSEG                                                                                                         \
-  6 /* deepest path is bus/pci/devices/<bdf>/<attr> = 5 segments                                                       \
-     */
+/* path tokeniser */
+#define MAXSEG 6 /* deepest path is bus/pci/devices/<bdf>/<attr> = 5 segments */
 #define SEGLEN 24
 
-/* Split `sub` ("/class/input/mouse0/speed") into segments; returns the count.
- */
+/* Split `sub` ("/class/input/mouse0/speed") into segments; returns the count. */
 static int split(const char *sub, char seg[MAXSEG][SEGLEN])
 {
   int n = 0;
@@ -122,10 +98,8 @@ static void cpy(char *d, const char *s, int max)
   d[i] = 0;
 }
 
-/* ------------------------------------------------------------- block helpers
- */
-/* The backing owofs device appears as "<backend>0" (ide0/ahci0/nvme0/tmpfs0);
- * removable devices keep their /dev names (usb0/cd0/...). */
+/* block helpers */
+/* The backing owofs device is "<backend>0"; removable devices keep their /dev names. */
 static int backend_name(char *out)
 {
   const char *b = blk_backend();
@@ -143,8 +117,7 @@ static int backend_name(char *out)
   return 1;
 }
 
-/* idx 0 = backing device (if any), then each removable device. 1 if it exists.
- */
+/* idx 0 = backing device (if any), then each removable device; 1 if it exists. */
 static int block_name(int idx, char *out)
 {
   char bk[SEGLEN];
@@ -197,9 +170,8 @@ static bool block_exists(const char *name)
   return false;
 }
 
-/* ------------------------------------------------------------- PCI helpers */
-/* Each PCI device is a directory named by its Linux-style BDF address
- * "domain:bus:slot.func" — domain is always 0000 here (no PCI segments). */
+/* PCI helpers */
+/* PCI devices are dirs named by BDF "domain:bus:slot.func"; domain is always 0000. */
 static void pci_bdf_str(const struct pci_dev_info *d, char *out)
 {
   const char *h = "0123456789abcdef";
@@ -244,8 +216,7 @@ static int pci_find(const char *name, struct pci_dev_info *out)
   return -1;
 }
 
-/* ------------------------------------------------------------- classification
- */
+/* classification */
 enum { S_NONE = 0, S_DIR, S_FILE_RO, S_FILE_RW };
 
 /* Resolve a tokenised path to a directory, an attribute file, or nothing. */
@@ -364,10 +335,8 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
   return S_NONE;
 }
 
-/* ------------------------------------------------------------- attribute read
- */
-/* classify() has already validated the path depth, so emit only needs the
- * segments — it reads whichever attribute the leaf names. */
+/* attribute read */
+/* classify() validated the depth; emit reads whichever attribute the leaf names. */
 static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
 {
   if (eq(seg[0], "firmware")) {
@@ -456,22 +425,20 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         pc(b, '\n');
         return;
       }
-      if (eq(seg[3], "rate")) { /* compositor frame-pacing target (Hz)  */
+      if (eq(seg[3], "rate")) { /* compositor frame-pacing target (Hz) */
         pu(b, (uint32_t)fb_target_hz());
         pc(b, '\n');
         return;
       }
-      if (eq(seg[3], "mode")) { /* the current mode, "WxH"             */
+      if (eq(seg[3], "mode")) { /* the current mode, "WxH" */
         pu(b, fb_active() ? fb_width() : 0);
         pc(b, 'x');
         pu(b, fb_active() ? fb_height() : 0);
         pc(b, '\n');
         return;
       }
-      if (eq(seg[3], "modes")) { /* one "WxH" per line; index = row     */
-        /* Only enumerate the switchable list where we can actually drive
-         * the mode (DISPI). On an adopted/GOP framebuffer the resolution is
-         * fixed, so just report the current one. */
+      if (eq(seg[3], "modes")) { /* one "WxH" per line; index = row */
+        /* Enumerate modes only where DISPI can drive them; otherwise report the current one. */
         if (fb_can_set_mode()) {
           uint32_t w, h;
           for (int i = 0; fb_mode_get(i, &w, &h); i++) {
@@ -505,7 +472,7 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
     }
     if (eq(seg[1], "sound")) {
       char nm[24];
-      if (eq(seg[3], "output")) { /* the active output's name      */
+      if (eq(seg[3], "output")) { /* the active output's name */
         int a = hda_output_active();
         if (a >= 0 && hda_output_name(a, nm, (int)sizeof nm))
           ps(b, nm);
@@ -539,7 +506,7 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         pc(b, '\n');
         return;
       }
-      if (eq(seg[4], "class")) { /* class:subclass:progif, Linux 6-hex   */
+      if (eq(seg[4], "class")) { /* class:subclass:progif, Linux 6-hex */
         ps(b, "0x");
         phex2(b, d.class_code);
         phex2(b, d.subclass);
@@ -565,13 +532,13 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
       pc(b, '\n');
       return;
     }
-    if (eq(seg[2], "minutes")) { /* runtime remaining, 0 if unknown      */
+    if (eq(seg[2], "minutes")) { /* runtime remaining, 0 if unknown */
       (void)battery_percent(&charging, &discharging, &minutes);
       pu(b, minutes < 0 ? 0 : (uint32_t)minutes);
       pc(b, '\n');
       return;
     }
-    if (eq(seg[2], "diag")) { /* AML detection note (real-HW debug)   */
+    if (eq(seg[2], "diag")) { /* AML detection note (real-HW debug) */
       ps(b, battery_diag());
       pc(b, '\n');
       return;
@@ -579,8 +546,7 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
   }
 }
 
-/* ------------------------------------------------------------- attribute write
- */
+/* attribute write */
 static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
 {
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "input")) {
@@ -612,10 +578,7 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
     return hda_output_select(idx) == 0 ? 0 : -1;
   }
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0") && eq(seg[3], "mode")) {
-    /* "WxH": reprogram the adapter directly (only DISPI is switchable, gated by
-     * fb_can_set_mode). The compositor re-queries fb_info each frame and
-     * rebinds its surface on a change, so a live resolution switch takes effect
-     * at once. */
+    /* "WxH": reprogram the adapter (DISPI only, gated by fb_can_set_mode); the compositor rebinds on change. */
     int w = 0, h = 0;
     const char *p = arg;
     while (*p >= '0' && *p <= '9')
@@ -642,7 +605,7 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
   return -1;
 }
 
-/* ------------------------------------------------------------- enumeration */
+/* enumeration */
 /* List a static name array, returning the idx-th into out (1 if in range). */
 static bool from_list(int idx, char *out, int max, const char *const *names, int n)
 {
@@ -667,8 +630,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
   }
 
   if (n == 1 && eq(seg[0], "class")) {
-    /* input + graphics always; net/block only when present (so an empty dir
-     * doesn't show). fb0 exists even in text mode, like /proc/display did. */
+    /* input + graphics always; net/block only when present; fb0 exists even in text mode. */
     const char *kids[6];
     int k = 0;
     kids[k++] = "input";
@@ -771,7 +733,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
   }
 
   if (n == 3 && eq(seg[0], "bus") && eq(seg[1], "pci") && eq(seg[2], "devices")) {
-    hit = pci_bdf(idx, name); /* one dir per PCI device (BDF)     */
+    hit = pci_bdf(idx, name); /* one dir per PCI device (BDF) */
     if (hit && is_dir)
       *is_dir = 1;
     return hit;
@@ -839,7 +801,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
   return 0;
 }
 
-/* ------------------------------------------------------------- public API */
+/* public API */
 const char *sysfs_subpath(const char *path)
 {
   if (!path)
@@ -852,10 +814,10 @@ const char *sysfs_subpath(const char *path)
     q++;
   }
   if (*q)
-    return 0; /* didn't match "sys"               */
+    return 0; /* didn't match "sys" */
   if (*path && *path != '/')
-    return 0;  /* "sysfoo" is not /sys             */
-  return path; /* "" or "/class/..."              */
+    return 0;  /* "sysfoo" is not /sys */
+  return path; /* "" or "/class/..." */
 }
 
 int sysfs_kind(const char *sub)

@@ -1,9 +1,4 @@
-/* layout.c — build + own the CSS box tree (see layout.h).
- *
- * Stage 1 builds the tree from the HTML walk and copies each element's box
- * style; the renderer derives each box's pixel rectangle from the wrapped line
- * table and paints backgrounds behind the text. Later stages make the box
- * geometry authoritative (it drives text wrapping, then scrolling). */
+/* layout.c , build + own the CSS box tree (see layout.h). Stage 1 builds the tree from the HTML */
 #include "layout.h"
 #include "browser.h" /* BG_NONE, browser_buf_lock/browser_buf_unlock */
 #include "owos.h"
@@ -34,10 +29,7 @@ struct lbox *layout_pool(int *n)
   return g_pool;
 }
 
-/* Grow the arena to hold one more box. The realloc may MOVE the arena, so guard
- * it against a concurrent render read with browser_buf_lock (links are indices, so a
- * move is otherwise harmless). Returns the new slot, or -1 on OOM (box
- * dropped). */
+/* Grow the arena to hold one more box */
 static int box_alloc(void)
 {
   if (g_n >= g_cap) {

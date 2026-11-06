@@ -1,37 +1,17 @@
-/* js_serviceworker.c — Service Workers + the Cache API for the browser.
- *
- * Registrations and the Cache store are PROCESS-persistent C state (plain
- * malloc, not the JS heap) so a worker registered on one page controls the next
- * and a cached response survives a reload; the JS-side prototypes are
- * per-navigation, rebuilt by sw_install and dropped by sw_teardown.
- * sw_intercept_fetch lets the core fetch() consult a controlling worker. Split
- * out of js.c; shares the page engine context and the DOM/fetch/notification
- * helpers via jsint.h. */
+/* Service Workers and the Cache API. Registrations and caches persist across navigations. */
 #include <stdbool.h>
 
 #include "features/cors/cors.h" /* cors_origin / cors_same_origin: SW scope + cache keys */
 #include "jsint.h"
 #include "notify.h" /* notify_send: a service worker's showNotification()    */
 
-/* ------------------------------------------------------- service workers --- *
- * Registrations and the Cache API store are PROCESS-persistent C state (plain
- * malloc, not the JS heap): they must outlive the per-navigation js_ctx so a SW
- * registered on one page still controls the next, and a cached response
- * survives a reload — the whole point of offline support. Each new page
- * (setup_dom) checks this store, re-instantiates the controlling worker into
- * the fresh context, and rebuilds the navigator.serviceWorker / caches surface
- * over it. The JS-side prototype objects below are per-context (rebuilt +
- * re-rooted every navigation, reclaimed by sw_teardown()). See the "SERVICE
- * WORKERS" section for the model. */
-
-/* One cached (request -> response). Bodies are raw bytes so any content
- * survives. */
+/* One cached request/response pair; body is raw bytes. */
 struct sw_c_entry {
   char *method, *url, *statustext, *ctype;
   unsigned char *body;
   int blen, status;
 };
-/* A named Cache, scoped to an origin (CacheStorage is per-origin per spec). */
+/* A named Cache, scoped to an origin. */
 struct sw_cache {
   int id; /* stable across the process (JS wrapper key) */
   char *origin, *name;
@@ -41,8 +21,7 @@ struct sw_cache {
 static struct sw_cache **g_swc; /* every open Cache, all origins             */
 static int g_swc_n, g_swc_cap, g_swc_nextid = 1;
 
-/* One service-worker registration: its scope, script URL and the script SOURCE
- * (kept so the worker can be re-run in each new context without a re-fetch). */
+/* A registration; src is kept so the worker can be re-run without a re-fetch. */
 struct sw_reg {
   char *origin, *scope, *script_url, *src;
   int slen;
@@ -51,8 +30,7 @@ struct sw_reg {
 static struct sw_reg **g_swr;
 static int g_swr_n, g_swr_cap;
 
-/* Per-context (per-navigation) JS objects — rebuilt + rooted in sw_install,
- * dropped in sw_teardown. */
+/* Per-navigation JS objects, rebuilt in sw_install and dropped in sw_teardown. */
 static js_object *g_swcontainer_proto;  /* navigator.serviceWorker (an EventTarget)   */
 static js_object *g_swreg_proto;        /* ServiceWorkerRegistration.prototype */
 static js_object *g_sw_proto;           /* ServiceWorker.prototype (page-side handle)  */
@@ -67,20 +45,7 @@ static js_object *g_sw_active_scope;    /* the controlling worker's global scope
 static js_object *g_sw_exec_holder;     /* transient: receives a Promise's resolvers   */
 static int g_sw_in_fetch;               /* dispatching a fetch event: don't re-enter   */
 
-/* ======================================================= SERVICE WORKERS === *
- * A working Service Worker implementation over the single-context engine.
- *
- * The engine keeps one live js_ctx (torn down per navigation) and settles
- * promises synchronously, so a worker cannot run in a separate realm or thread.
- * Instead the worker script runs in THIS context inside its own function scope
- * — a ServiceWorkerGlobalScope object bound as `self` — with caches/clients/
- * registration/skipWaiting/addEventListener/fetch shadowed to the scope, while
- * everything else (Promise/Response/JSON/…) resolves up the scope chain to the
- * window global. Registrations and the Cache store are persistent C state, so a
- * worker registered on one page controls the next and cached bodies survive a
- * reload — real offline support. fetch() interception, install/activate,
- * respondWith/waitUntil, client<->worker postMessage and the Cache API are all
- * real; every step settles synchronously, exactly as fetch/XHR/WebSocket do. */
+/* The worker script runs in the page context inside its own scope object bound as `self`. */
 
 static js_value sw_resolve(js_ctx *ctx, js_value v);
 static js_value sw_make_request(js_ctx *ctx, const char *url, const char *method);
@@ -110,9 +75,7 @@ static char *sw_strdup(const char *s)
   }
   return d;
 }
-/* A resolved Promise of `v`, keeping a freshly-built object alive across the
- * promise allocation (the common return shape for the async-looking SW
- * methods). */
+/* A resolved Promise of `v`, keeping v alive across the promise allocation. */
 static js_value sw_resolve(js_ctx *ctx, js_value v)
 {
   js_value rv;
@@ -284,8 +247,7 @@ static bool sw_reg_remove(const char *origin, const char *scope)
     }
   return false;
 }
-/* The registration (if any) that controls `page_url`: same origin and the
- * longest scope path that is a prefix of the page's path. */
+/* Registration controlling page_url: same origin, longest matching scope prefix. */
 static struct sw_reg *sw_reg_for_url(const char *page_url)
 {
   char org[URL_MAX];
@@ -311,7 +273,7 @@ static struct sw_reg *sw_reg_for_url(const char *page_url)
   }
   return best;
 }
-/* Default scope = the directory of the script URL (through its last '/'). */
+/* Default scope: the script URL up to its last '/'. */
 static void sw_default_scope(const char *script, char *out, int cap)
 {
   int i, last = -1, n;
@@ -963,8 +925,7 @@ static js_value sw_make_registration(js_ctx *ctx, struct sw_reg *reg, js_value w
 /* ---- lifecycle + FetchEvent ---- */
 static js_value ee_wait_until(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  /* Every promise settles synchronously here, so waitUntil has nothing to
-   * extend; it exists so handlers that call it don't throw. */
+  /* Promises settle synchronously; this exists so handlers calling it don't throw. */
   (void)ctx;
   (void)t;
   (void)args;
@@ -1218,8 +1179,7 @@ static js_value swg_skip_waiting(js_ctx *ctx, js_value t, js_value *args, int ar
   return sw_resolve(ctx, js_undef());
 }
 
-/* Settle a pending navigator.serviceWorker.ready and fire controllerchange when
- * the controlling worker changes. */
+/* Settles a pending .ready and fires controllerchange when the controller changes. */
 static void sw_set_controller(js_ctx *ctx, js_value worker)
 {
   js_value old;
@@ -1254,9 +1214,7 @@ static void sw_set_controller(js_ctx *ctx, js_value worker)
     }
   }
 }
-/* Build the ServiceWorkerGlobalScope, run the worker source in it, optionally
- * fire install/activate, and make it the page's controller. Returns the
- * page-side ServiceWorkerRegistration, or undefined if the script errored. */
+/* Runs the worker, optionally fires install/activate, sets it as controller. Undefined on error. */
 static js_value sw_instantiate(js_ctx *ctx, struct sw_reg *reg, bool do_install, bool do_activate)
 {
   js_object *scope;
@@ -1482,9 +1440,7 @@ static js_value swc_ready_get(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
 }
 
-/* Install the whole navigator.serviceWorker + caches surface into this context,
- * then, if a registration already controls this page, start its worker (without
- * re-firing install/activate — those already happened) so it can intercept. */
+/* Installs navigator.serviceWorker + caches; restarts the controlling worker without re-firing install. */
 void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
 {
   js_object *nav = 0;
@@ -1607,8 +1563,7 @@ void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
   }
 }
 
-/* Drop the per-context SW roots + objects. The persistent C store (g_swr/g_swc)
- * survives — that's what carries registrations + caches across navigations. */
+/* Drops per-context roots; the persistent store (g_swr/g_swc) survives. */
 void sw_teardown(void)
 {
   gc_remove_root((void **)&g_swcontainer_proto);

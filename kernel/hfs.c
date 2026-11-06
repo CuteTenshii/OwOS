@@ -1,18 +1,4 @@
-/* hfs.c — read-only HFS+ driver (see hfs.h).
- *
- * Everything is big-endian. The Volume Header (byte 1024) points at the Catalog
- * B-tree via the catalog file's fork extents. The catalog's leaf nodes hold the
- * folder tree as records keyed by (parentCNID, name); we walk the leaf chain
- * linearly (firstLeafNode -> fLink -> ...), which finds every record regardless
- * of tree depth and sidesteps HFS+'s gnarly Unicode key-ordering -- we only
- * ever compare keys for equality, case-insensitively over ASCII. File data is
- * read from the data fork's inline extents (allocation blocks -> device
- * sectors).
- *
- * Multi-instance: every per-mount mutable global lives in a heap-allocated
- * `struct hfs_mount`; each op takes one and threads it through. The driver is
- * reached only through hfs_ops().
- */
+/* hfs.c: read-only HFS+ driver (see hfs.h). Big-endian; scans catalog leaf nodes linearly. */
 
 #include <stddef.h>
 
@@ -22,7 +8,6 @@
 #include "hfs.h"
 #include "kstring.h"
 
-/* --------------------------------------------------------------- state */
 #define HFS_SIG 0x482Bu  /* 'H+' */
 #define HFSX_SIG 0x4858u /* 'HX' */
 #define ROOT_CNID 2u
@@ -53,10 +38,7 @@ struct obj {
   struct extent ext[8]; /* data fork inline extents (files) */
 };
 
-/* ------------------------------------------------------------- device I/O */
-
-/* Read `len` bytes from absolute device byte offset into buf
- * (sector-by-sector). */
+/* Read `len` bytes from an absolute device byte offset. */
 static int dev_read(struct hfs_mount *m, uint64_t byteoff, uint8_t *buf, uint32_t len)
 {
   uint8_t s[512];
@@ -76,8 +58,7 @@ static int dev_read(struct hfs_mount *m, uint64_t byteoff, uint8_t *buf, uint32_
   return 0;
 }
 
-/* Map a logical offset within the catalog file to an absolute device byte
- * offset, walking the catalog fork extents. Returns 0 on success. */
+/* Map a catalog-file offset to a device byte offset via the fork extents. 0 on success. */
 static int cat_dev_off(struct hfs_mount *m, uint64_t logoff, uint64_t *devoff)
 {
   uint64_t pos = 0;
@@ -101,10 +82,7 @@ static int read_node(struct hfs_mount *m, uint32_t idx)
   return dev_read(m, devoff, m->nodebuf, m->node_size);
 }
 
-/* ------------------------------------------------------- node/record access */
-
-/* Byte offset of record `i` within the current node (from the trailing offset
- * array: the last 2 bytes hold record 0's offset, etc.). */
+/* Byte offset of record `i` (from the node's trailing offset array). */
 static uint32_t rec_off(struct hfs_mount *m, int i) { return load_be16(m->nodebuf + m->node_size - 2 * (i + 1)); }
 
 /* Convert an HFSUniStr255 name (UTF-16BE) to ASCII into out[cap]. */
@@ -127,14 +105,10 @@ struct catrec {
   const uint8_t *data; /* record body (after the key) */
 };
 
-/* Parse record `i`, validating every offset against the untrusted node's size.
- * Returns 0 on success, -1 if any derived pointer would fall outside nodebuf.
- */
+/* Parse record `i`, bounds-checking against the node size. 0, or -1 if out of range. */
 static int parse_rec(struct hfs_mount *m, int i, struct catrec *c)
 {
   uint32_t ns = m->node_size;
-  /* the offset array grows down from the node end; entry i needs 2*(i+1) bytes
-   */
   if ((uint32_t)(2 * (i + 1)) > ns)
     return -1;
   uint32_t ro = rec_off(m, i);
@@ -151,17 +125,14 @@ static int parse_rec(struct hfs_mount *m, int i, struct catrec *c)
     return -1;
   c->data = m->nodebuf + body;
   c->type = load_be16(c->data);
-  /* rec_to_obj reads a folder body to +12 and a file body (fork data) to +168
-   */
+  /* rec_to_obj reads a folder body to +12 and a file body to +168. */
   uint32_t need = (c->type == 1) ? 12u : (c->type == 2) ? 168u : 0u;
   if (need && body + need > ns)
     return -1;
   return 0;
 }
 
-/* Hidden if the name is empty or begins with a control character -- this skips
- * the "HFS+ Private Data" / hardlink directories whose names start with NULs.
- */
+/* Hidden if the name is empty or starts with a control char (private/hardlink dirs). */
 static bool rec_hidden(const struct catrec *c)
 {
   if (c->namelen == 0)
@@ -188,12 +159,7 @@ static void rec_to_obj(const struct catrec *c, struct obj *o)
   }
 }
 
-/* ------------------------------------------------------- catalog scanning */
-
-/* Iterate every catalog leaf record, calling visit(); stop early if it returns
- * non-zero (that value is returned). 0 if the whole tree was scanned. Reuses
- * m->nodebuf, so visit() must consume what it needs before returning to
- * continue. */
+/* Call visit() on every leaf record; a non-zero return stops the scan and is returned. Reuses nodebuf. */
 static int for_each_leaf(struct hfs_mount *m, int (*visit)(struct hfs_mount *, const struct catrec *, void *),
                          void *ctx)
 {
@@ -222,7 +188,6 @@ static int for_each_leaf(struct hfs_mount *m, int (*visit)(struct hfs_mount *, c
   return 0;
 }
 
-/* find a child by (parent, name) ------------------------------------------- */
 struct find_ctx {
   uint32_t parent;
   const char *name;
@@ -307,8 +272,6 @@ static int resolve(struct hfs_mount *m, const char *path, struct obj *out)
   return 0;
 }
 
-/* ------------------------------------------------------------- mounting */
-
 static int parse_volume_header(struct hfs_mount *m, const uint8_t *vh)
 {
   uint16_t sig = load_be16(vh);
@@ -329,8 +292,7 @@ static int parse_volume_header(struct hfs_mount *m, const uint8_t *vh)
   return 0;
 }
 
-/* The volume label is the name of the root folder's own catalog record, which
- * is the one folder record whose parent CNID is 1. */
+/* The label is the folder record whose parent CNID is 1. */
 static int visit_label(struct hfs_mount *m, const struct catrec *c, void *vp)
 {
   (void)vp;
@@ -341,8 +303,7 @@ static int visit_label(struct hfs_mount *m, const struct catrec *c, void *vp)
   return 0;
 }
 
-/* Mount the HFS+ volume whose Volume Header sits at byte 1024 of `base_lba`,
- * reading through m->read. Returns 0 on success, -1 on failure. */
+/* Mount the volume whose header sits at byte 1024 of `base_lba`. 0, or -1. */
 static int hfs_mount(struct hfs_mount *m, uint32_t base_lba)
 {
   uint8_t vh[512];
@@ -353,8 +314,7 @@ static int hfs_mount(struct hfs_mount *m, uint32_t base_lba)
   if (parse_volume_header(m, vh) != 0)
     return -1;
 
-  /* Catalog B-tree header is node 0: read its first sector for the header
-   * record (treeDepth/rootNode/firstLeafNode/nodeSize at node+14). */
+  /* Catalog B-tree header record (treeDepth/rootNode/firstLeafNode/nodeSize at node+14). */
   uint64_t devoff;
   if (cat_dev_off(m, 0, &devoff) != 0)
     return -1;
@@ -379,8 +339,7 @@ static int hfs_mount(struct hfs_mount *m, uint32_t base_lba)
   return 0;
 }
 
-/* Read `len` bytes from absolute device byte offset using a raw read callback
- * (used during probing, before m->read/base are set). */
+/* Raw-callback variant of the above, used before m->read is set. */
 static int raw_read(blk_read_fn read, uint64_t byteoff, uint8_t *buf, uint32_t len)
 {
   uint8_t s[512];
@@ -453,8 +412,6 @@ static int probe(struct hfs_mount *m, blk_read_fn read)
   return -1;
 }
 
-/* ------------------------------------------------------------- public reads */
-
 static int hfs_stat(struct hfs_mount *m, const char *path, int *is_dir, uint32_t *size)
 {
   struct obj o;
@@ -467,7 +424,6 @@ static int hfs_stat(struct hfs_mount *m, const char *path, int *is_dir, uint32_t
   return 0;
 }
 
-/* Directory listing / enumeration ------------------------------------------ */
 struct list_ctx {
   uint32_t parent;
   int want_idx; /* -1 => print all; else fill *out for that index */
@@ -583,9 +539,6 @@ static int hfs_read_at(struct hfs_mount *m, const char *path, uint32_t offset, v
   }
   return (int)got;
 }
-
-/* ------------------------------------------------------------- fs_ops vtable
- */
 
 static void *hfs_op_probe(blk_read_fn read, blk_write_fn write)
 {

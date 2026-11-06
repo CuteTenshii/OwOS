@@ -1,13 +1,4 @@
-/* mpeg.c — a small MPEG-1 video command-line tool.
- *
- *   mpeg info <file.mpg>            decode the stream, print dimensions + a
- * frame summary (per-picture I/P/B type) mpeg gen  <out.mpg> [frames]    encode
- * a synthetic animated clip (a moving gradient) — exercises the encoder end to
- * end
- *
- * The codec itself lives in user/lib/mpeg; this is just the front end. An
- * encoded clip round-trips: `mpeg gen /tmp/x.mpg` then `mpeg info /tmp/x.mpg`.
- */
+/* mpeg.c, a small MPEG-1 video command-line tool */
 #include "mpeg.h"
 #include "owos.h"
 
@@ -68,9 +59,7 @@ static int cmd_info(const char *path)
   return 0;
 }
 
-/* One synthetic RGB frame: a diagonal colour gradient scrolled by `t` pixels,
- * so consecutive frames differ by translation (real work for the P-frame path).
- */
+/* One synthetic RGB frame: a diagonal colour gradient scrolled by `t` pixels */
 static void gen_frame(unsigned char *rgb, int w, int h, int t)
 {
   int x, y;

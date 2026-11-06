@@ -1,12 +1,4 @@
-/* lspci.c — a PCI device lister.
- *
- * Like its Linux namesake (which reads from sysfs, not by living in the
- * kernel), this is pure presentation: the kernel scanned the bus at boot and
- * exposes the list as the ordinary file /proc/pci. lspci just reads and prints
- * it — no bespoke syscall, and a bug here is a contained crash, not a panic.
- *
- *   lspci
- */
+/* lspci.c, a PCI device lister */
 
 #include "owos.h"
 

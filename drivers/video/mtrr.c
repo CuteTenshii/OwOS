@@ -1,22 +1,22 @@
-/* mtrr.c — force the linear framebuffer to write-combining via a variable MTRR.
+/* mtrr.c - force the linear framebuffer to write-combining via a variable MTRR.
  *
  * fb.c already requests WC for the framebuffer through PAT (enable_wc tags the
  * LFB's PTEs to select a WC PAT entry). But on x86 the *effective* memory type
  * of a page is the combination of its MTRR type and its PAT type, and the
  * more-uncached of the two wins (see Intel SDM Vol 3, Table 11-7). On real
  * UEFI hardware the firmware programs the MTRRs and commonly leaves the GOP
- * framebuffer's physical range uncached — either by the MTRR default type or an
- * explicit variable range — so PAT-WC is silently overridden and every store to
+ * framebuffer's physical range uncached - either by the MTRR default type or an
+ * explicit variable range - so PAT-WC is silently overridden and every store to
  * the framebuffer becomes its own slow bus transaction. That is what laggy
  * window-drag / cursor movement looks like.
  *
  * This programs a variable-range MTRR that marks the framebuffer span WC, so
  * the effective type is WC no matter what PAT or the firmware default said. The
  * kernel is single-core, so the multi-processor MTRR rendezvous does not apply
- * — we follow the single-processor update sequence from SDM 11.11.8.
+ * - we follow the single-processor update sequence from SDM 11.11.8.
  *
  * Everything here is a no-op (beyond the diagnostic dump) when the CPU has no
- * MTRRs or no WC type — e.g. plain QEMU, whose "VRAM" is host RAM and already
+ * MTRRs or no WC type - e.g. plain QEMU, whose "VRAM" is host RAM and already
  * fast.
  */
 
@@ -188,7 +188,7 @@ static bool var_covers(uint32_t i, uint32_t phys)
  * overlap precedence: any overlapping UC wins; else WT beats WB; else the first
  * match. Returns -1 when no variable range covers `phys` (the default type then
  * applies). `out_uc_slot` (if non-NULL) receives the index of an overlapping UC
- * range, or -1 — so the caller can tell "UC from default" apart from "UC from a
+ * range, or -1 - so the caller can tell "UC from default" apart from "UC from a
  * variable range" (only the former is fixable by adding a WC range). */
 static int mtrr_var_type(uint32_t phys, uint32_t vcnt, int *out_uc_slot)
 {
@@ -289,7 +289,7 @@ static int free_slot(uint32_t vcnt)
 int mtrr_set_wc(uint32_t phys, uint32_t len)
 {
   if (!have_mtrr()) {
-    serial_write("[mtrr] no MTRR support (CPUID) — PAT only\n");
+    serial_write("[mtrr] no MTRR support (CPUID) - PAT only\n");
     return -1;
   }
 
@@ -301,11 +301,11 @@ int mtrr_set_wc(uint32_t phys, uint32_t len)
   dump_state(phys, vcnt, def_type, "before");
 
   if (!(cap & MTRRCAP_WC)) {
-    serial_write("[mtrr] CPU lacks WC type — PAT only\n");
+    serial_write("[mtrr] CPU lacks WC type - PAT only\n");
     return -1;
   }
 
-  /* Express [phys, phys+len) as one power-of-two, naturally aligned range —
+  /* Express [phys, phys+len) as one power-of-two, naturally aligned range -
    * the only shape a single variable MTRR can describe. size = smallest power
    * of two >= len; then phys must be size-aligned. Real GPU framebuffer BARs
    * are aligned to far more than the rounded fb size, so this holds in
@@ -318,24 +318,24 @@ int mtrr_set_wc(uint32_t phys, uint32_t len)
   if (phys & (size - 1)) {
     serial_write("[mtrr] fb base not aligned to its size (");
     s_hex(size);
-    serial_write(") — PAT only\n");
+    serial_write(") - PAT only\n");
     return -1;
   }
 
   /* Already effectively write-combining? Two ways this happens without us:
    * an existing WC variable range, or a WB/default region (WB MTRR + PAT-WC
-   * combines to WC). Either way the framebuffer is already fast — nothing to
+   * combines to WC). Either way the framebuffer is already fast - nothing to
    * do, and adding a redundant MTRR would only burn a slot. */
   int uc_slot;
   if (fb_effective_wc(phys, vcnt, def_type, &uc_slot)) {
-    serial_write("[mtrr] fb already effectively WC — no change needed\n");
+    serial_write("[mtrr] fb already effectively WC - no change needed\n");
     return 0;
   }
 
   /* It's UC. We can only force WC by *adding* a WC range when the UC comes
    * from the default type. If a UC *variable* range overlaps the fb, the
    * overlap rule (SDM 11.11.4.1) makes UC win regardless of any WC range we
-   * add — the firmware's UC range would have to be retiled around the fb,
+   * add - the firmware's UC range would have to be retiled around the fb,
    * which we don't do (it also covers MMIO that must stay UC). Report and stop
    * rather than install a WC range that silently does nothing. */
   if (uc_slot >= 0) {
@@ -349,7 +349,7 @@ int mtrr_set_wc(uint32_t phys, uint32_t len)
 
   int slot = free_slot(vcnt);
   if (slot < 0) {
-    serial_write("[mtrr] no free variable MTRR slot — PAT only\n");
+    serial_write("[mtrr] no free variable MTRR slot - PAT only\n");
     return -1;
   }
 
@@ -405,13 +405,13 @@ int mtrr_set_wc(uint32_t phys, uint32_t len)
 
   dump_state(phys, vcnt, (uint32_t)rdmsr(IA32_MTRR_DEF_TYPE), "after");
 
-  /* Confirm we actually achieved WC; if not, the slot did nothing useful —
+  /* Confirm we actually achieved WC; if not, the slot did nothing useful -
    * roll it back so we don't leave a stray range behind. */
   if (fb_effective_wc(phys, vcnt, def_type, &uc_slot)) {
     serial_write("[mtrr] framebuffer is now WC\n");
     return 0;
   }
-  serial_write("[mtrr] WC not achieved after install — rolling back slot\n");
+  serial_write("[mtrr] WC not achieved after install - rolling back slot\n");
   wrmsr(IA32_MTRR_PHYSBASE0 + 2 * slot + 1, 0); /* clear valid bit          */
   return -1;
 }

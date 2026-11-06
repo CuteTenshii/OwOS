@@ -2,8 +2,7 @@
 
 /* --- DOM snapshot (worker thread) ----------------------------------------- */
 
-/* Append ` name="value"` for each attribute, values truncated so one element
- * line stays readable. */
+/* Append ` name="value"` per attribute, values truncated. */
 static void dom_emit_attrs(struct textblk *t, struct dom_node *el)
 {
   for (struct dom_attr *a = el->attrs; a; a = a->next) {
@@ -23,10 +22,7 @@ static void dom_emit_attrs(struct textblk *t, struct dom_node *el)
   }
 }
 
-/* Record the next-emitted line's owning node index in dt_dom_node (a
- * closing-tag line reuses the element's own index, so a click anywhere on the
- * element — open or close line — selects it). Call right before the line's
- * first character, when dt_dom.nlines still equals that line's number. */
+/* Record the next line's owning node index in dt_dom_node; call before the line's first character. */
 static void dom_record(int my)
 {
   if (dt_dom.nlines >= dt_dom_node_cap) {
@@ -47,7 +43,7 @@ static void dom_indent(struct textblk *t, int depth)
     dt_tb_puts(t, "  ");
 }
 
-/* Collapsed text content (newlines/tabs → single spaces, truncated). */
+/* Collapsed text content (newlines/tabs to single spaces, truncated). */
 static void dom_emit_text(struct textblk *t, const char *s, int maxc)
 {
   int cnt = 0;
@@ -76,8 +72,7 @@ static bool dom_is_void(const char *tag)
   return false;
 }
 
-/* True if `n`'s only child is a single (non-whitespace) text node — rendered
- * inline as `<tag>text</tag>` on one line, like a real devtools tree. */
+/* True if `n`'s only child is one non-whitespace text node (rendered inline). */
 static struct dom_node *dom_only_text(struct dom_node *n)
 {
   struct dom_node *c = n->first_child;
@@ -89,24 +84,12 @@ static struct dom_node *dom_only_text(struct dom_node *n)
   return (s && *s) ? c : 0;
 }
 
-/* Emit the DOM subtree rooted at `n`, indented by depth, with proper open/close
- * tags. Records each line's pre-order node index in dt_dom_node so a click maps
- * a row back to a node. Pure-whitespace text nodes are skipped, but `*idx`
- * still counts every node so the index space matches dt_dom_node_at()'s pre-order
- * walk. */
-/* Upper bounds on the snapshot walk: the tree builder caps depth at 256, but a
- * page that exhausts the 64 MiB window can leave a malformed tree, so cap here
- * too rather than recurse into garbage. The index keeps advancing past the cap
- * so click-to-node mapping stays aligned with dt_dom_node_at()'s pre-order walk.
- */
+/* Emit the DOM subtree at `n`, recording each line's pre-order index in dt_dom_node; `*idx` counts every node. */
+/* Walk caps: the builder caps depth at 256, but a malformed tree is possible; the index still advances. */
 #define DT_DOM_MAX_DEPTH 300
 #define DT_DOM_MAX_NODES 50000
 
-/* `suppress` walks a collapsed subtree to advance *idx WITHOUT emitting lines,
- * so the index space stays identical whether a node is expanded or collapsed
- * (the click->node and highlight mappings depend on that alignment). Every
- * output is guarded by !suppress; the control flow — and thus every (*idx)++ —
- * is the same. */
+/* `suppress` walks a collapsed subtree advancing *idx without emitting, keeping index space identical. */
 void dt_dom_emit(struct textblk *t, struct dom_node *n, int depth, int *idx, int suppress)
 {
   int my = (*idx)++;
@@ -130,9 +113,7 @@ void dt_dom_emit(struct textblk *t, struct dom_node *n, int depth, int *idx, int
 
   const char *tag = n->tag[0] ? n->tag : "?";
   bool isvoid = dom_is_void(tag);
-  /* ::before / ::after generated content shows as pseudo-element rows, like a
-   * real devtools tree (not real DOM nodes, so they take no pre-order index).
-   */
+  /* ::before / ::after show as pseudo-element rows (no pre-order index). */
   bool hb = !isvoid && html_has_pseudo(n, CSS_PSEUDO_BEFORE);
   bool ha = !isvoid && html_has_pseudo(n, CSS_PSEUDO_AFTER);
   struct dom_node *only = (!isvoid && !hb && !ha) ? dom_only_text(n) : 0;
@@ -151,7 +132,7 @@ void dt_dom_emit(struct textblk *t, struct dom_node *n, int depth, int *idx, int
     dt_tb_putc(t, '>');
   }
 
-  if (isvoid) { /* <br>, <img> — no close */
+  if (isvoid) { /* <br>, <img>: no close */
     if (!suppress)
       dt_tb_newline(t);
     for (struct dom_node *c = n->first_child; c; c = c->next) /* normally none */
@@ -217,8 +198,7 @@ void dt_dom_emit(struct textblk *t, struct dom_node *n, int depth, int *idx, int
   }
 }
 
-/* The node at pre-order index `target` under `n`; *idx is the running counter.
- */
+/* The node at pre-order index `target` under `n`; *idx is the running counter. */
 struct dom_node *dt_dom_node_at(struct dom_node *n, int target, int *idx)
 {
   if ((*idx)++ == target)
@@ -231,9 +211,7 @@ struct dom_node *dt_dom_node_at(struct dom_node *n, int target, int *idx)
   return 0;
 }
 
-/* Inverse of dt_dom_node_at: the pre-order index of `target` under `n`, or -1.
- * Shares dt_dom_node_at's index space exactly (count self, then children) so the
- * picker and breadcrumb map a node back to the row dt_dom_emit() drew for it. */
+/* Inverse of dt_dom_node_at: pre-order index of `target` under `n`, or -1 (same index space). */
 int dt_dom_index_of(struct dom_node *n, struct dom_node *target, int *idx)
 {
   int my = (*idx)++;
@@ -247,9 +225,7 @@ int dt_dom_index_of(struct dom_node *n, struct dom_node *target, int *idx)
   return -1;
 }
 
-/* The laid-out box for `node`, or NULL (inline/anon elements have none). The
- * box pool has one writer — the worker — and dt_style_emit runs on the worker, so
- * this lock-free read races only with the render thread's reads (no writer). */
+/* Laid-out box for `node`, or NULL. The worker is the only writer, so this read is lock-free. */
 static struct lbox *lbox_for(struct dom_node *node)
 {
   int n = 0;
@@ -279,8 +255,7 @@ static void sty_edge(struct textblk *t, const char *label, struct ledge e)
   dt_tb_newline(t);
 }
 
-/* Append "  label: #rrggbb\n", or nothing when the colour is unset (BG_NONE).
- */
+/* Append "  label: #rrggbb\n", or nothing when the colour is unset (BG_NONE). */
 static void sty_color(struct textblk *t, const char *label, unsigned c)
 {
   if (c == BG_NONE)
@@ -298,8 +273,7 @@ static void sty_color(struct textblk *t, const char *label, unsigned c)
   dt_tb_newline(t);
 }
 
-/* The computed box model + a few resolved values for `n`, from its laid-out
- * box. */
+/* Computed box model and a few resolved values for `n`, from its laid-out box. */
 static void style_emit_box(struct dom_node *n)
 {
   struct lbox *lb = lbox_for(n);
@@ -307,7 +281,7 @@ static void style_emit_box(struct dom_node *n)
   dt_tb_puts(&dt_sty, "Computed box");
   dt_tb_newline(&dt_sty);
   if (!lb) {
-    dt_tb_puts(&dt_sty, "  (inline/anon element — no box geometry)");
+    dt_tb_puts(&dt_sty, "  (inline/anon element - no box geometry)");
     dt_tb_newline(&dt_sty);
     return;
   }
@@ -328,8 +302,7 @@ static void style_emit_box(struct dom_node *n)
     sty_color(&dt_sty, "border-color", lb->border_color);
 }
 
-/* Append "  label: value\n" for a Computed-pane entry (px or free-text
- * variants). */
+/* Append "  label: value\n" for a Computed-pane entry (px or free-text). */
 static void sty_kv_px(struct textblk *t, const char *label, int v)
 {
   if (v < 0)
@@ -356,8 +329,7 @@ static void sty_kv_str(struct textblk *t, const char *label, const char *val)
   dt_tb_newline(t);
 }
 
-/* Append "  label: <track> <track> ...\n" reconstructing a grid track template.
- */
+/* Append "  label: <track> <track> ...\n" for a grid track template. */
 static void sty_tracks(struct textblk *t, const char *label, const struct css_track *tr, int n)
 {
   if (n <= 0)
@@ -386,10 +358,7 @@ static void sty_tracks(struct textblk *t, const char *label, const struct css_tr
   dt_tb_newline(t);
 }
 
-/* A flat "Computed" list of the resolved values css.c models for `n` (the
- * cascade result from html_compute_style), shown after the box model like a
- * real devtools Computed pane. Only set properties are listed — most fields use
- * -1 for unset. */
+/* Flat "Computed" list of the values css.c models for `n`; only set properties (most use -1 for unset). */
 static void style_emit_computed(struct dom_node *n)
 {
   struct css_style s;
@@ -440,14 +409,9 @@ static void style_emit_computed(struct dom_node *n)
     sty_kv_px(&dt_sty, "column-gap", s.gap_col);
 }
 
-/* --- Application tab snapshot (worker thread; it owns cookie/HSTS writes) ----
- * * Cookies + HSTS-pinned hosts straight from the live jars
- * (B->cookies/B->hsts). Rebuilt in the worker tick like the DOM/Styles
- * snapshots, read under dt_lk. */
+/* Application tab snapshot: cookies and HSTS hosts from B->cookies/B->hsts, built in the worker tick. */
 
-/* A cheap FNV-1a content signature of the live cookie/HSTS jars. The jars have
- * no mutation counter (unlike the DOM), so the worker uses this to rebuild the
- * Application snapshot only when it actually changes, not on every tick. */
+/* FNV-1a signature of the cookie/HSTS jars (no mutation counter), gating Application rebuilds. */
 static unsigned app_fnv(unsigned h, const char *s)
 {
   if (s)
@@ -524,12 +488,7 @@ void dt_app_emit(void)
   }
 }
 
-/* Build the Styles view for the selected node, like a real devtools pane: the
- * inline style="" block, then every matching rule (winner first) with its
- * source — the selector and, when the rule lives under an @media, that prelude
- * — so it's clear which class / media query contributed. css.c models a subset
- * of CSS, so a rule that set only unmodeled properties shows an explanatory
- * note. Ends with the computed box model from the laid-out box tree. */
+/* Build the Styles view: inline style, matching rules (winner first, with selector and @media), then box model. */
 void dt_style_emit(struct dom_node *root)
 {
   dt_tb_reset(&dt_sty);
@@ -551,7 +510,7 @@ void dt_style_emit(struct dom_node *root)
     return;
   }
   if (n->type == DOM_TEXT) {
-    dt_tb_puts(&dt_sty, "(text node — no styles)");
+    dt_tb_puts(&dt_sty, "(text node - no styles)");
     dt_tb_newline(&dt_sty);
     return;
   }
@@ -579,7 +538,7 @@ void dt_style_emit(struct dom_node *root)
   dt_tb_newline(&dt_sty);
   dt_tb_newline(&dt_sty);
 
-  /* element.style {} — the inline style="" attribute, verbatim. */
+  /* element.style {}: the inline style="" attribute, verbatim. */
   const char *inl = dom_get_attr(n, "style");
   if (inl && inl[0]) {
     dt_tb_puts(&dt_sty, "element.style {");
@@ -625,8 +584,7 @@ void dt_style_emit(struct dom_node *root)
     ind[k++] = ' ';
     ind[k++] = ' ';
     ind[k] = '\0';
-    /* The authored declarations, verbatim — including properties this engine
-     * doesn't model (shown like a real devtools, not silently dropped). */
+    /* Authored declarations verbatim, including properties css.c does not model. */
     if (m[i].raw && m[i].raw[0]) {
       const char *seg = m[i].raw;
       while (*seg) {

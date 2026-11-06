@@ -22,39 +22,36 @@
 #define WM_MIN_H 120
 
 /* uwins[] grows on the heap; a window id is its slot index (slots never compact). */
-#define EVQ 64 /* per-window event ring                          */
+#define EVQ 64
 
 /* Fill for not-yet-painted client pixels; matches the compositor's frame. */
 #define UWIN_BG 0x10141a
 
 struct uwin {
   int used;
-  uint32_t owner;      /* owning task id                            */
-  uint32_t *owner_dir; /* its page dir (to unmap the buffer on exit) */
-  uint32_t buf_phys;   /* contiguous client buffer (>16 MiB phys)    */
-  uint32_t buf_bytes;  /* its size, for free/kunmap                  */
-  uint32_t user_vaddr; /* where buf_phys is mapped in the owner (its slot) */
-  int parent;          /* transient parent window id, or -1          */
+  uint32_t owner;
+  uint32_t *owner_dir; /* page dir, to unmap the buffer on exit */
+  uint32_t buf_phys;   /* contiguous client buffer */
+  uint32_t buf_bytes;
+  uint32_t user_vaddr; /* buffer mapping in the owner */
+  int parent;          /* transient parent id, or -1 */
   int npages;
-  int w, h;           /* client size in pixels                     */
-  int fx, fy, fw, fh; /* on-screen FRAME geometry (compositor-set) */
-  uint32_t flags;     /* UWIN_F_* (visible/minimized/maximized/modal) */
-  int cursor;         /* app-requested client-area cursor (enum wm_cursor) */
+  int w, h;           /* client size in pixels */
+  int fx, fy, fw, fh; /* on-screen frame geometry */
+  uint32_t flags;     /* UWIN_F_* */
+  int cursor;         /* enum wm_cursor */
   char title[64];
-  uint32_t present_seq;    /* bumped by uwin_present                      */
-  bool dirty_full;         /* whole frame needs repainting                  */
-  int dx0, dy0, dx1, dy1;  /* client-area damage since the last uwin_enum   */
-  bool compositor_pinned;  /* the compositor SYS_WIN_MAP'd this buffer;
-                                  uwin_reap must not free buf_phys until it
-                             unmaps */
-  bool free_pending;       /* detached; buffer still owed (pinned or deferred) */
-  volatile int head, tail; /* event ring indices                        */
+  uint32_t present_seq;
+  bool dirty_full;
+  int dx0, dy0, dx1, dy1; /* client damage since last uwin_enum */
+  bool compositor_pinned; /* uwin_reap must not free buf_phys while set */
+  bool free_pending;      /* detached, buffer still owed */
+  volatile int head, tail;
   struct win_event ev[EVQ];
-  uint32_t last_poll; /* timer_ticks() of the owner's last poll,
-                                 its event-loop heartbeat (hang detection)  */
+  uint32_t last_poll; /* timer_ticks() of last poll (hang detection) */
 };
 
-static struct uwin **uwins; /* grown array of kmalloc'd uwins (stable addrs) */
+static struct uwin **uwins;
 static int uwins_cap;
 
 /* Pid of the compositor owning the display (set on first SYS_FB_MAP). */
@@ -68,9 +65,7 @@ void uwin_compositor_register(uint32_t pid)
 
 bool uwin_compositor_active(void) { return compositor_pid != 0; }
 
-/* Ensure uwins[] can index `need` slots, growing ~2x. New pointer slots are
- * NULL. Returns 0 on heap exhaustion. cli around the swap so an
- * interrupt-context reader never sees a half-swapped table. */
+/* Grow uwins[] to `need` slots (~2x); 0 on heap exhaustion. cli around the swap for IRQ readers. */
 static bool uwins_reserve(int need)
 {
   if (need <= uwins_cap)
@@ -113,9 +108,7 @@ static void evq_push(struct uwin *u, uint32_t type, int32_t a, int32_t b)
   u->head = next;
 }
 
-/* Free slots in this window's input event ring. Used for paste flow control: a
- * clipboard paste must not push faster than the app drains, or events past the
- * ring's depth are dropped. */
+/* Free slots in the event ring (paste flow control). */
 int uwin_key_space(int id)
 {
   if (id < 0 || id >= uwins_cap || !uwins[id])
@@ -124,11 +117,10 @@ int uwin_key_space(int id)
   if (!u->used)
     return 1 << 30;
   int used = (u->head - u->tail + EVQ) % EVQ;
-  return (EVQ - 1) - used; /* one slot is always left empty (full test) */
+  return (EVQ - 1) - used;
 }
 
-/* Largest client buffer a window may have: the whole framebuffer (a window can
- * never usefully exceed the screen). */
+/* Largest client buffer: the whole framebuffer. */
 static uint32_t win_cap_bytes(void)
 {
   uint32_t px = fb_width() * fb_height();
@@ -139,13 +131,10 @@ static uint32_t win_cap_bytes(void)
   return cap;
 }
 
-/* Per-owner client-buffer slots span [WIN_FB_VADDR, COMPOSITOR_FB_VADDR), one
- * WIN_MAP_SLOT_BYTES each, the ceiling on how many windows one process may
- * own. */
+/* Per-owner buffer slots span [WIN_FB_VADDR, COMPOSITOR_FB_VADDR), capping windows per process. */
 #define WIN_FB_SLOTS ((int)((COMPOSITOR_FB_VADDR - WIN_FB_VADDR) / WIN_MAP_SLOT_BYTES))
 
-/* Lowest free buffer slot in `dir`, or -1. Keyed by directory, not task, since
- * threads share it. WIN_FB_SLOTS <= 32 fits a u32. */
+/* Lowest free buffer slot in `dir` (shared by threads), or -1. */
 static int alloc_dir_slot(const uint32_t *dir)
 {
   uint32_t used = 0;
@@ -163,16 +152,12 @@ static int alloc_dir_slot(const uint32_t *dir)
   return -1;
 }
 
-/* ------------------------------------------------------------- teardown */
-
 /* Detach the user mapping; defer freeing to uwin_reap() while compositor_pinned. */
 static void uwin_free(struct uwin *u)
 {
   if (!u->used || u->free_pending)
     return;
-  /* Detach the buffer from the owner's window (frees its private page tables)
-   * before the dir is torn down, so paging_free_process_dir never touches it.
-   */
+  /* Detach before the dir is torn down so paging_free_process_dir skips it. */
   if (u->owner_dir)
     paging_unmap_user_at(u->owner_dir, u->user_vaddr, u->buf_bytes);
   u->owner_dir = 0;
@@ -187,9 +172,7 @@ static void uwin_free(struct uwin *u)
   }
 }
 
-/* Reclaim client buffers of windows detached while still compositor-pinned,
- * once the compositor has SYS_WIN_UNMAPped them (compositor_pinned cleared).
- * Called from uwin_unmap after a pin is dropped. */
+/* Reclaim buffers of detached windows once the compositor has unmapped them. */
 void uwin_reap(void)
 {
   for (int i = 0; i < uwins_cap; i++) {
@@ -206,8 +189,6 @@ void uwin_reap(void)
   }
 }
 
-/* -------------------------------------------------------------- syscalls */
-
 int uwin_create(int w, int h, const char *title)
 {
   if (w < 16 || h < 16 || w > 4096 || h > 4096)
@@ -222,12 +203,12 @@ int uwin_create(int w, int h, const char *title)
       slot = i;
       break;
     }
-  if (slot < 0) { /* table full: grow; new slot at old cap */
+  if (slot < 0) {
     slot = uwins_cap;
     if (!uwins_reserve(slot + 1))
       return -1;
   }
-  if (!uwins[slot]) { /* fresh slot: allocate + zero the uwin */
+  if (!uwins[slot]) {
     uwins[slot] = kmalloc(sizeof(struct uwin));
     if (!uwins[slot])
       return -1;
@@ -237,11 +218,7 @@ int uwin_create(int w, int h, const char *title)
   }
   struct uwin *u = uwins[slot];
 
-  /* The client buffer is a private, contiguous run of physical RAM (its own
-   * space, off the shared kernel heap), identity-mapped for the compositor. */
-  /* Reserve the next free client-buffer slot in this address space before
-   * allocating, so a process that already fills every slot fails cleanly. Keyed
-   * on the page directory (shared by a process's threads), not the task. */
+  /* Client buffer: private contiguous PMM run, identity-mapped for the compositor. Reserve a slot first. */
   uint32_t owner = sched_current_id();
   uint32_t *dir = sched_current_dir();
   int fbslot = alloc_dir_slot(dir);
@@ -259,9 +236,7 @@ int uwin_create(int w, int h, const char *title)
     return -1;
   }
 
-  /* Map the buffer into the calling process at its slot vaddr, then clear it
-   * through that user mapping (this runs in the owner's CR3, where the buffer's
-   * kernel identity mapping isn't visible). `dir` was resolved above. */
+  /* Map into the owner and clear via that mapping (the kernel identity map is not visible in its CR3). */
   if (paging_map_user_at(dir, user_vaddr, phys, npages) < 0) {
     paging_kunmap(phys, buf_bytes);
     pmm_free_contig(phys, buf_bytes);
@@ -271,8 +246,7 @@ int uwin_create(int w, int h, const char *title)
   for (uint32_t i = 0; i < (uint32_t)npages * 1024u; i++)
     ((uint32_t *)(uintptr_t)user_vaddr)[i] = UWIN_BG;
 
-  /* Cascade the initial frame diagonally within the screen so a window never
-   * opens off-screen; the compositor may move it later via SYS_WIN_SET_GEOM. */
+  /* Cascade the initial frame so it opens on-screen. */
   int win_w = w + 2 * WM_BORDER;
   int win_h = h + WM_TITLE_H + WM_BORDER;
   int sw = (int)fb_width(), sh = (int)fb_height();
@@ -304,8 +278,7 @@ int uwin_create(int w, int h, const char *title)
   u->fy = wy;
   u->fw = win_w;
   u->fh = win_h;
-  u->flags = UWIN_F_VISIBLE | UWIN_F_RESIZABLE; /* resizable by default; apps opt out
-                                                   via win_resizable(id,0) */
+  u->flags = UWIN_F_VISIBLE | UWIN_F_RESIZABLE;
   u->cursor = 0;
   u->compositor_pinned = false;
   u->free_pending = false;
@@ -317,7 +290,7 @@ int uwin_create(int w, int h, const char *title)
   u->dirty_full = true;
   u->dx0 = u->dy0 = u->dx1 = u->dy1 = 0;
   u->head = u->tail = 0;
-  u->last_poll = timer_ticks(); /* seed the heartbeat */
+  u->last_poll = timer_ticks();
   return slot;
 }
 
@@ -328,7 +301,7 @@ static struct uwin *owned(int id)
     return 0;
   struct uwin *u = uwins[id];
   if (!u->used || u->free_pending || u->owner != sched_current_id())
-    return 0; /* detached-but-not-yet-reaped: gone        */
+    return 0;
   return u;
 }
 
@@ -386,7 +359,7 @@ int uwin_poll(int id, struct win_event *out)
   struct uwin *u = owned(id);
   if (!u)
     return -1;
-  u->last_poll = timer_ticks(); /* heartbeat: the owner's loop is alive */
+  u->last_poll = timer_ticks();
   if (u->tail == u->head)
     return 0;
   *out = u->ev[u->tail];
@@ -412,7 +385,7 @@ int uwin_set_title(int id, const char *title)
   for (const char *s = title ? title : ""; *s && j < (int)sizeof u->title - 1; s++)
     u->title[j++] = *s;
   u->title[j] = '\0';
-  touch_full(u); /* force a repaint so the new title shows */
+  touch_full(u);
   return 0;
 }
 
@@ -433,7 +406,7 @@ int uwin_set_cursor(int id, int cursor)
   struct uwin *u = owned(id);
   if (!u)
     return -1;
-  u->cursor = cursor; /* reported to the compositor via enum (advisory) */
+  u->cursor = cursor;
   return 0;
 }
 
@@ -442,21 +415,19 @@ int uwin_set_parent(int id, int parent, int modal)
   struct uwin *u = owned(id);
   if (!u || parent == id)
     return -1;
-  if (parent < 0) { /* clear the transient link */
+  if (parent < 0) {
     u->parent = -1;
     u->flags &= ~UWIN_F_MODAL;
     touch_full(u);
     return 0;
   }
-  /* The parent must be a live window the caller also owns (a dialog belongs to
-   * the same app), so a stale slot id can't hijack another process's window. */
+  /* Parent must be a live window of the same owner. */
   if (parent >= uwins_cap || !uwins[parent])
     return -1;
   struct uwin *p = uwins[parent];
   if (!p->used || p->free_pending || p->owner != u->owner)
     return -1;
-  /* Reject a cycle: walking the proposed parent's ancestry must not reach `id`.
-   */
+  /* Reject cycles: the parent's ancestry must not reach `id`. */
   int a = parent;
   for (int guard = 0; a >= 0 && guard < WIN_FB_SLOTS * 4; guard++) {
     if (a == id)
@@ -484,7 +455,7 @@ uint32_t uwin_fb_vaddr(int id)
 void uwin_task_exiting(uint32_t owner_id)
 {
   if (owner_id == compositor_pid)
-    compositor_pid = 0; /* compositor died: kernel_main reverts to shell */
+    compositor_pid = 0;
   for (int i = 0; i < uwins_cap; i++)
     if (uwins[i] && uwins[i]->used && uwins[i]->owner == owner_id)
       uwin_free(uwins[i]);
@@ -499,10 +470,7 @@ bool uwin_pid_has_window(uint32_t pid)
   return false;
 }
 
-/* --------------------------------------------- compositor brokering backends
- */
-
-/* A window is enumerable if it's a live, mapped uwin (not detached-pending). */
+/* Enumerable: live, mapped, not detached-pending. */
 static bool enumerable(struct uwin *u) { return u && u->used && !u->free_pending && u->buf_phys; }
 
 int uwin_enum(struct winrec *out, int max)
@@ -545,8 +513,7 @@ int uwin_enum(struct winrec *out, int max)
   return n;
 }
 
-/* Resolve an id to a live uwin regardless of caller (the compositor isn't the
- * owner). NULL if the id is out of range, free, or detached-pending. */
+/* Resolve an id to a live uwin regardless of caller; NULL if invalid. */
 static struct uwin *broker_win(int id)
 {
   if (id < 0 || id >= uwins_cap || !uwins[id])
@@ -562,13 +529,11 @@ int uwin_map(int id, uint32_t at, int *bw, int *bh, int *stride)
   struct uwin *u = broker_win(id);
   if (!u || !u->buf_phys)
     return -1;
-  /* Defend the slot boundary: the buffer must fit one map slot, or this mapping
-   * would run into the next window's slot (win_cap_bytes enforces it too). */
+  /* The buffer must fit one map slot. */
   if ((uint32_t)u->npages > WIN_MAP_SLOT_BYTES / 4096u)
     return -1;
   uint32_t *dir = sched_current_dir();
-  /* Re-map in place (paging_map_user_at overwrites the PTEs), so re-mapping an
-   * already-pinned window just refreshes it. */
+  /* Re-map in place; re-pinning just refreshes. */
   if (paging_map_user_at(dir, at, u->buf_phys, u->npages) < 0)
     return -1;
   u->compositor_pinned = true;
@@ -578,7 +543,7 @@ int uwin_map(int id, uint32_t at, int *bw, int *bh, int *stride)
   if (bh)
     *bh = u->h;
   if (stride)
-    *stride = u->w; /* client buffer is tightly packed (pitch = w) */
+    *stride = u->w;
   return 0;
 }
 
@@ -589,15 +554,13 @@ int uwin_unmap(int id, uint32_t *dir, uint32_t at)
   struct uwin *u = uwins[id];
   if (dir)
     paging_unmap_user_at(dir, at, u->buf_bytes ? u->buf_bytes : WIN_MAP_SLOT_BYTES);
-  u->compositor_pinned = false; /* the buffer may now be reclaimed if pending */
+  u->compositor_pinned = false;
   tlb_flush();
-  uwin_reap(); /* release a closed-but-pinned buffer now      */
+  uwin_reap();
   return 0;
 }
 
-/* Clear a rectangular sub-region [x0,x1) x [y0,y1) of a client buffer (row
- * stride = `stride` px) to UWIN_BG, reaching the high phys frames through the
- * supervisor scratch slot (the compositor's CR3 doesn't map them). */
+/* Clear [x0,x1) x [y0,y1) of a client buffer to UWIN_BG via the supervisor scratch slot. */
 static void uwin_clear_region(uint32_t phys, int stride, int x0, int y0, int x1, int y1)
 {
   for (int y = y0; y < y1; y++) {
@@ -617,8 +580,7 @@ static void uwin_clear_region(uint32_t phys, int stride, int x0, int y0, int x1,
   }
 }
 
-/* Resize the client area; the allocation only grows (shrinking under a
- * mid-paint owner would race). Pushes WEV_RESIZE so the owner repaints. */
+/* Resize the client area; the allocation only grows. Pushes WEV_RESIZE. */
 static void uwin_resize_client(struct uwin *u, int id, int cw, int ch)
 {
   if (cw < 16)
@@ -642,8 +604,7 @@ static void uwin_resize_client(struct uwin *u, int id, int cw, int ch)
   if ((uint32_t)cw * (uint32_t)ch * 4u <= u->buf_bytes) {
     u->w = cw;
     u->h = ch;
-    /* The resize event makes the owner repaint. Clear the new logical buffer
-     * instead of moving the old image while holding the compositor syscall. */
+    /* Clear the new logical buffer rather than copy the old image. */
     uwin_clear_region(u->buf_phys, cw, 0, 0, cw, ch);
     touch_full(u);
     evq_push(u, WEV_RESIZE, cw, ch);
@@ -653,12 +614,12 @@ static void uwin_resize_client(struct uwin *u, int id, int cw, int ch)
   int npages = (int)(((uint32_t)cw * ch * 4u + 4095u) / 4096u);
   uint32_t nbytes = (uint32_t)npages * 4096u;
   uint32_t nphys = pmm_alloc_contig(nbytes);
-  if (!nphys || paging_kmap(nphys, nbytes) < 0) { /* keep the old buffer */
+  if (!nphys || paging_kmap(nphys, nbytes) < 0) {
     if (nphys)
       pmm_free_contig(nphys, nbytes);
     return;
   }
-  /* The compositor's CR3 lacks the high kmap PDEs; use scratch slots, IRQs off. */
+  /* The compositor's CR3 lacks the kmap PDEs; use scratch slots with IRQs off. */
   for (uint32_t pg = 0; pg < (uint32_t)npages; pg++) {
     uintptr_t fl = irq_save();
     uint32_t *v = paging_scratch_map(0, nphys + pg * 4096u);
@@ -667,15 +628,10 @@ static void uwin_resize_client(struct uwin *u, int id, int cw, int ch)
     paging_scratch_unmap(0);
     irq_restore(fl);
   }
-  /* The resize event makes the owner repaint. Do not copy the old image here:
-   * that turns maximizing into a synchronous pixel migration in the compositor
-   * syscall. */
-  /* Remap the owner's window slot to the new buffer IN PLACE (overwrite the
-   * PTEs) rather than unmap-then-map: an unmapped gap here would fault a
-   * concurrent paint (the owner draws on its own thread). */
+  /* No old-image copy. Remap in place (no unmapped gap that would fault a concurrent paint). */
   if (u->owner_dir)
     paging_map_user_at(u->owner_dir, u->user_vaddr, nphys, npages);
-  /* Remap the compositor's pin in place too, or it blits freed frames. */
+  /* Remap the compositor's pin too. */
   if (u->compositor_pinned) {
     uint32_t at = WIN_MAP_BASE + (uint32_t)id * WIN_MAP_SLOT_BYTES;
     paging_map_user_at(sched_current_dir(), at, nphys, npages);

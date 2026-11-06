@@ -1,33 +1,11 @@
-/* js_indexeddb.c — IndexedDB for the browser (IDBFactory / IDBDatabase /
- * IDBTransaction / IDBObjectStore / IDBIndex / IDBCursor / IDBKeyRange).
- *
- * In-memory, per-page storage driven cooperatively by js_idb_pump (mirroring
- * js_timers_pump), installed onto `window` by js_idb_setup. Split out of js.c;
- * shares the page engine context and the DOM/event helpers via jsint.h. */
+/* js_indexeddb.c: in-memory, per-page IndexedDB driven cooperatively by js_idb_pump. */
 #include <stdbool.h>
 
 #include "jsint.h"
 
-/* ---------------------------------------------------------- IndexedDB ------ *
- *
- * A working IndexedDB: IDBFactory
- * (indexedDB.open/deleteDatabase/databases/cmp), IDBDatabase, IDBTransaction,
- * IDBObjectStore, IDBIndex, IDBCursor(WithValue), IDBKeyRange and
- * IDBRequest/IDBOpenDBRequest, with the asynchronous request model driven
- * cooperatively by js_idb_pump (mirrors js_timers_pump). Storage is per-page
- * in-memory — like localStorage above, it does not persist across a navigation
- * (the JS heap is freed at teardown). Values are structured-cloned in on write
- * and out on read so a page mutating a returned object can't corrupt the store.
- * Indexes carry only metadata; index lookups scan and sort records live, so
- * they never fall out of sync with writes.
- *
- * Keys order per spec (number < date < string < binary < array). Records live
- * in a per-store array kept sorted by key; requests execute their store
- * mutation synchronously, then queue their success/error event for the next
- * pump tick. A transaction auto-commits (fires "complete") once the pump has
- * drained every request placed against it; an unhandled request error, or an
- * explicit abort(), rolls the transaction's writes back from a snapshot taken
- * when it opened. */
+/* Records live in a per-store array sorted by key (number < date < string < binary < array).
+ * Requests mutate synchronously and queue their event for the next pump tick; a transaction
+ * auto-commits once drained, and abort/unhandled error rolls back from an open-time snapshot. */
 
 enum {
   IDBP_DB,
@@ -56,8 +34,6 @@ static js_value idb_throw(js_ctx *ctx, const char *name, const char *msg)
 {
   return js_throw_error(ctx, ctx->error_proto, name, msg);
 }
-
-/* ---- keys: validity, type rank and comparison (spec key ordering) -------- */
 
 static bool idb_is_keyrange(js_value v) { return v.type == JV_OBJ && v.u.obj->proto == g_idb_proto[IDBP_KEYRANGE]; }
 static bool idb_is_date(js_value v)
@@ -143,9 +119,6 @@ static int idb_cmp(js_value a, js_value b)
   }
   }
 }
-
-/* ---- structured clone (deep copy so store <-> page share no references) ---
- */
 
 static js_value idb_clone_buffer(js_ctx *ctx, js_object *bufobj)
 {
@@ -245,8 +218,7 @@ static js_value idb_clone(js_ctx *ctx, js_value v, int depth)
       }
       out = js_obj_value(a);
     } else {
-      /* plain object: copy own enumerable data properties (engine internals
-       * are defined non-enumerable, so they're skipped automatically). */
+      /* own enumerable data properties only (engine internals are non-enumerable) */
       js_object *n = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
       int i;
       for (i = 0; i < o->props.n; i++) {
@@ -268,12 +240,7 @@ static js_value idb_clone(js_ctx *ctx, js_value v, int depth)
   }
 }
 
-/* ---- key paths: extract a key from a value; inject a generated key --------
- */
-
-/* Navigate a dotted path through `value`'s properties; JV_UNDEF if any hop is
- * missing. An empty path yields the value itself (an in-line key IS the value).
- */
+/* Navigate a dotted path; JV_UNDEF if a hop is missing, an empty path yields the value itself. */
 static js_value idb_eval_path(js_ctx *ctx, js_value value, const char *path)
 {
   char seg[128];
@@ -352,9 +319,6 @@ static void idb_inject_key(js_ctx *ctx, js_value value, const char *path, js_val
   }
 }
 
-/* ---- database / store record access (the persistent-for-the-page store) ---
- */
-
 static js_value idb_dbrec(const char *name)
 {
   return g_idb_dbs ? js_get(g_ctx, js_obj_value(g_idb_dbs), name) : js_undef();
@@ -369,8 +333,7 @@ static js_object *idb_records(js_value storerec)
   js_value r = js_get(g_ctx, storerec, "records");
   return r.type == JV_OBJ ? r.u.obj : 0;
 }
-/* Binary search the sorted record array for `key`; *found set, returns the slot
- * (the position of the match, or where it would be inserted). */
+/* Binary search for `key`; *found set, returns the match or insertion slot. */
 static int idb_find(js_object *recs, js_value key, int *found)
 {
   int lo = 0, hi = (int)js_array_len(recs) - 1;
@@ -463,8 +426,6 @@ static js_value idb_stringlist(js_object *namesMap)
   return js_obj_value(arr);
 }
 
-/* ---- small runtime helpers over the wrappers ----------------------------- */
-
 static void idb_str_field(js_value o, const char *k, char *buf, int cap)
 {
   js_value v = (o.type == JV_OBJ) ? js_get(g_ctx, o, k) : js_undef();
@@ -511,8 +472,7 @@ static void idb_enqueue(js_object *req)
     js_array_push(g_ctx, g_idb_pending, js_obj_value(req));
 }
 
-/* Build an IDBRequest (or IDBOpenDBRequest when `open`) — pending, no result.
- */
+/* Build an IDBRequest (or IDBOpenDBRequest when `open`), pending with no result. */
 static js_object *idb_make_request(js_value source, js_value txn, int open)
 {
   js_object *req;
@@ -540,8 +500,7 @@ static js_object *idb_make_request(js_value source, js_value txn, int open)
   gc_pop_scope();
   return req;
 }
-/* Queue a request that will deliver a success result (counts against its txn).
- */
+/* Queue a request that delivers a success result (counts against its txn). */
 static js_value idb_succeed(js_value source, js_value txn, js_value result)
 {
   js_object *req;
@@ -578,9 +537,7 @@ static js_value idb_fail(js_value source, js_value txn, js_value err)
   return js_obj_value(req);
 }
 
-/* An entry (key,value) in a store's sorted record array — always replaced whole
- * (never mutated in place), so a transaction snapshot can hold the old objects.
- */
+/* A store record entry; always replaced whole so snapshots can hold the old objects. */
 static js_value idb_new_entry(js_value key, js_value value)
 {
   js_object *e;
@@ -618,9 +575,7 @@ static void idb_bump_key(js_value sr, js_value k)
   }
 }
 
-/* Snapshot a database's stores (shallow record/index copies) so an aborted
- * transaction can roll writes back. Records/indexes are never mutated in place,
- * so shallow array/map copies are valid restore points. */
+/* Shallow snapshot of a database's stores for rolling back an aborted transaction. */
 static js_value idb_snapshot(const char *dbname)
 {
   js_value dbrec = idb_dbrec(dbname), stores = js_get(g_ctx, dbrec, "stores");
@@ -715,8 +670,7 @@ static void idb_restore(const char *dbname, js_value snap)
   gc_pop_scope();
 }
 
-/* Is `query` (a key or a key range) satisfied by `key`? An unbounded query
- * (undefined/null) matches every key. */
+/* Is `query` (key or range) satisfied by `key`? Undefined/null matches all. */
 static bool idb_query_match(js_value query, js_value key)
 {
   if (query.type == JV_UNDEF || query.type == JV_NULL)
@@ -740,8 +694,6 @@ static bool idb_query_match(js_value query, js_value key)
   return idb_cmp(key, query) == 0;
 }
 static bool idb_query_valid(js_value q) { return idb_is_keyrange(q) || idb_valid_key(q, 0); }
-
-/* ---- wrapper factories --------------------------------------------------- */
 
 static js_value idb_make_db(const char *name, double version)
 {
@@ -855,7 +807,7 @@ static js_value idb_make_keyrange(js_value lo, js_value hi, int loOpen, int hiOp
   return js_obj_value(r);
 }
 
-/* ---- cursor stepping: an ordered {ikey,pkey} list, values read live ------ */
+/* cursor stepping: an ordered {ikey,pkey} list, values read live */
 
 typedef struct {
   js_value txn, sr, ir;
@@ -929,8 +881,7 @@ static void idb_reverse(js_object *arr)
 static bool idb_dir_prev(const char *d) { return d && (streq(d, "prev") || streq(d, "prevunique")); }
 static bool idb_dir_unique(const char *d) { return d && (streq(d, "nextunique") || streq(d, "prevunique")); }
 
-/* Object-store cursor steps: matching records in key order (keys are unique).
- */
+/* Object-store cursor steps: matching records in key order. */
 static js_object *idb_store_steps(js_ctx *ctx, js_value sr, js_value query, bool prev)
 {
   js_object *recs = idb_records(sr), *steps;
@@ -948,8 +899,7 @@ static js_object *idb_store_steps(js_ctx *ctx, js_value sr, js_value query, bool
   gc_pop_scope();
   return steps;
 }
-/* Index cursor steps: (indexKey, primaryKey) pairs, multiEntry expanded,
- * sorted. */
+/* Index cursor steps: (indexKey, primaryKey) pairs, multiEntry expanded, sorted. */
 static js_object *idb_index_pairs(js_ctx *ctx, js_value sr, js_value irec, js_value query, bool unique, bool prev)
 {
   js_value ikp = js_get(ctx, irec, "keyPath");
@@ -984,10 +934,7 @@ static js_object *idb_index_pairs(js_ctx *ctx, js_value sr, js_value irec, js_va
   gc_pop_scope();
   return pairs;
 }
-/* Advance a cursor to the next live step (skipping records deleted since open).
- * With hasKey, stop at the first step whose index key reaches `key` in
- * direction; otherwise move `count` live steps. Sets key/primaryKey/value; 1 if
- * positioned. */
+/* Advance to the next live step; with hasKey stop at the first step reaching `key`, else move `count`. */
 static bool idb_cursor_next(js_value cursor, bool hasKey, js_value key, int count)
 {
   js_value steps = js_get(g_ctx, cursor, "@steps");
@@ -1074,10 +1021,7 @@ static js_value idb_open_cursor(js_ctx *ctx, js_value source, js_value txn, js_v
   return js_obj_value(req);
 }
 
-/* ---- object-store operations --------------------------------------------- */
-
-/* Resolve + validate a store operation; throws and returns undefined on
- * failure. */
+/* Resolve and validate a store operation; throws and returns undefined on failure. */
 static js_value idb_store_rec_checked(js_ctx *ctx, js_value t, bool write)
 {
   js_value txn = js_get(ctx, t, "@txn"), sr;
@@ -1093,8 +1037,7 @@ static js_value idb_store_rec_checked(js_ctx *ctx, js_value t, bool write)
     return idb_throw(ctx, "InvalidStateError", "object store has been deleted");
   return sr;
 }
-/* Any existing record (other than the one keyed `key`) collides on a unique
- * index. */
+/* Any other record collides with `key` on a unique index. */
 static bool idb_violates_unique(js_ctx *ctx, js_value sr, js_value newValue, js_value key)
 {
   js_value idxmap = js_get(ctx, sr, "indexes");
@@ -1462,8 +1405,6 @@ static js_value idb_store_indexnames(js_ctx *ctx, js_value t, js_value *args, in
   return idb_stringlist(ix.type == JV_OBJ ? ix.u.obj : 0);
 }
 
-/* ---- index operations ---------------------------------------------------- */
-
 static bool idb_index_open(js_ctx *ctx, js_value t, idbix *x)
 {
   x->txn = js_get(ctx, t, "@txn");
@@ -1595,8 +1536,6 @@ static js_value idb_index_openkeycursor(js_ctx *ctx, js_value t, js_value *a, in
   return idb_index_opencursor_impl(ctx, t, a, n, true);
 }
 
-/* ---- cursor operations --------------------------------------------------- */
-
 static void idb_cursor_requeue(js_ctx *ctx, js_value cursor, js_value txn, bool positioned)
 {
   js_value req = js_get(ctx, cursor, "@req");
@@ -1696,8 +1635,6 @@ static js_value idb_cursor_delete(js_ctx *ctx, js_value t, js_value *args, int a
   return idb_succeed(t, txn, js_undef());
 }
 
-/* ---- IDBKeyRange --------------------------------------------------------- */
-
 static js_value idb_kr_only(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
@@ -1737,8 +1674,6 @@ static js_value idb_kr_includes(js_ctx *ctx, js_value t, js_value *args, int arg
     return idb_throw(ctx, "DataError", "invalid key");
   return js_bool(idb_query_match(t, A(0)));
 }
-
-/* ---- IDBTransaction ------------------------------------------------------ */
 
 static void idb_abort_txn(js_value txn, js_value err)
 {
@@ -1836,8 +1771,6 @@ static js_value idb_txn_storenames(js_ctx *ctx, js_value t, js_value *args, int 
   gc_pop_scope();
   return r;
 }
-
-/* ---- IDBDatabase --------------------------------------------------------- */
 
 static js_value idb_db_createstore(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1977,8 +1910,6 @@ static js_value idb_db_storenames(js_ctx *ctx, js_value t, js_value *args, int a
   return idb_stringlist(stores.type == JV_OBJ ? stores.u.obj : 0);
 }
 
-/* ---- IDBFactory (window.indexedDB) --------------------------------------- */
-
 static js_value idb_illegal_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   (void)t;
@@ -2112,10 +2043,7 @@ static js_value idb_factory_cmp(js_ctx *ctx, js_value t, js_value *args, int arg
   return js_number(idb_cmp(A(0), A(1)));
 }
 
-/* ---- delivery pump: fire request events, auto-commit/abort transactions -- */
-
-/* Fire `ev` at `target`, then optionally bubble to b1 (transaction) and b2
- * (db). Returns 1 if a handler called preventDefault. */
+/* Fire `ev` at `target`, bubbling to b1 (txn) and b2 (db); 1 if preventDefault was called. */
 static bool idb_fire(js_object *target, js_object *b1, js_object *b2, js_value ev)
 {
   bool dp;
@@ -2266,8 +2194,7 @@ int js_idb_pump(void)
   return fired;
 }
 
-/* Build the IndexedDB prototypes + interface constructors and expose
- * window.indexedDB / window.IDBKeyRange. Roots the per-page store. */
+/* Build the IndexedDB prototypes and constructors, expose window.indexedDB/IDBKeyRange. */
 void js_idb_setup(js_ctx *ctx, js_object *win)
 {
   int i;
@@ -2364,8 +2291,7 @@ void js_idb_setup(js_ctx *ctx, js_object *win)
   define_iface(ctx, win, "IDBCursorWithValue", g_idb_proto[IDBP_CURSORVAL]);
 }
 
-/* Unroot the page's IndexedDB state at navigation teardown (called by
- * js_page_end in js.c, which owns the page-global unrooting order). */
+/* Unroot the page's IndexedDB state at navigation teardown. */
 void js_idb_teardown(void)
 {
   int i;

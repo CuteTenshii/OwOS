@@ -1,20 +1,4 @@
-/* neofetch.c — a system-info splash: the OwO logo beside the stats.
- *
- * The presentation (logo, layout, colours) lives here in user space; the kernel
- * only hands over the raw facts through one syscall (sysinfo), the few user
- * space can't read itself — SMBIOS, RAM, the ACPI battery, and the disks and
- * displays the kernel enumerated. CPU identity comes from cpuid, which the
- * kernel reads once and caches into the same struct. A bug in this program is a
- * contained process crash (a "neofetch has crashed" window), not a kernel
- * panic.
- *
- * Structure: build_info() lays the stat lines (label + value, colours baked in)
- * into a row buffer, one row per logical fact; render() then pairs row i with
- * logo line i. Keeping content separate from layout means a new field is just
- * one more field()/endrow() block — no row-index bookkeeping.
- *
- *   neofetch
- */
+/* neofetch.c, a system-info splash: the OwO logo beside the stats */
 
 #include "owos.h"
 #include <stdbool.h>
@@ -25,7 +9,7 @@ static const char *logo[] = {
 #define LOGO_LINES 6
 #define LOGO_W 16
 
-/* 16-colour ANSI SGR escapes — the terminal renders them (term.c). */
+/* 16-colour ANSI SGR escapes, the terminal renders them (term.c) */
 #define CYAN "\033[96m"
 #define GREEN "\033[92m"
 #define GREY "\033[37m"
@@ -34,14 +18,13 @@ static const char *logo[] = {
 static void p(const char *s) { puts(s); }
 static void pc(char c) { write(1, &c, 1); }
 
-/* ---------------------------------------------------- row buffer + builders */
-/* Each stat is built into one fixed row (colour escapes baked in), then printed
- * beside the logo. Rooms for every optional disk/GPU row plus the fixed set. */
+/* row buffer + builders */
+/* Each stat is built into one fixed row (colour escapes baked in), then printed beside the logo */
 #define MAX_ROWS 40
 #define ROW_CAP 128
 static char rows[MAX_ROWS][ROW_CAP];
 static int nrows;
-static char *wp, *wend; /* write cursor into the current row        */
+static char *wp, *wend; /* write cursor into the current row */
 
 static void endrow(void)
 {
@@ -61,9 +44,7 @@ static void as(const char *s)
     *wp++ = *s++;
 }
 
-/* Begin a row whose label is `lab` (green), leaving the cursor in grey ready
- * for the value. A blank label keeps continuation rows (disk/GPU #2+) aligned.
- */
+/* Begin a row whose label is `lab` (green), leaving the cursor in grey ready for the value */
 static void field(const char *lab)
 {
   wp = rows[nrows < MAX_ROWS ? nrows : 0];
@@ -94,7 +75,7 @@ static void a2(unsigned v)
   ac('0' + (char)(v % 10));
 }
 
-/* A size in MiB, switching to "N.N GiB" past a gibibyte. */
+/* A size in MiB, switching to "N.N GiB" past a gibibyte */
 static void amib(unsigned mib)
 {
   if (mib >= 1024) {
@@ -109,11 +90,6 @@ static void amib(unsigned mib)
   }
 }
 
-/* Append a string with runs of whitespace collapsed to a single space and
- * leading/trailing space trimmed. The cpuid brand string is space-padded inside
- * its 48-byte field (e.g. "...CPU      @ 2.40GHz"), and that padding shows up
- * verbatim on real silicon / VMware — collapse it so the CPU line reads clean.
- */
 static void asqueeze(const char *s)
 {
   bool pending = false;
@@ -133,7 +109,7 @@ static void asqueeze(const char *s)
   }
 }
 
-/* A clock in MHz rendered as "@ N.NN GHz", the shared CPU/GPU form. */
+/* A clock in MHz rendered as "@ N.NN GHz", the shared CPU/GPU form */
 static void a_ghz(unsigned mhz)
 {
   unsigned cghz = (mhz + 5) / 10; /* hundredths of a GHz */
@@ -152,13 +128,10 @@ static bool has_at(const char *s)
   return false;
 }
 
-/* ----------------------------------------------- reading the /proc facts */
-/* Each fact is its own /proc file (cpuinfo, meminfo, uptime, ...), read through
- * the ordinary file API — no bespoke syscall. Small files, so read each whole.
- */
+/* reading the /proc facts */
+/* Each fact is its own /proc file, read through the ordinary file API, no bespoke syscall */
 
-/* Read a whole /proc file into buf (NUL-terminated). Returns length, 0 if none.
- */
+/* Read a whole /proc file into buf (NUL-terminated) */
 static int readproc(const char *path, char *buf, int max)
 {
   int n = readfile(path, buf, max - 1);
@@ -175,7 +148,7 @@ static void rstrip(char *s)
     s[--n] = '\0';
 }
 
-/* Value of a "key <value>" line; copies value (to EOL) into out. 1 if found. */
+/* Value of a "key <value>" line; copies value (to EOL) into out */
 static bool kvget(const char *buf, const char *key, char *out, int max)
 {
   int kl = strlen(key);
@@ -224,8 +197,7 @@ static unsigned u_of(const char *s)
   return v;
 }
 
-/* 1 if `s` begins with `pre`, case-insensitively (so "HP EliteBook" is seen to
- * start with "HP" and the vendor isn't printed twice in the Host line). */
+/* 1 if `s` begins with `pre`, case-insensitively */
 static bool ci_prefix(const char *s, const char *pre)
 {
   for (; *pre; s++, pre++) {
@@ -240,13 +212,13 @@ static bool ci_prefix(const char *s, const char *pre)
   return true;
 }
 
-/* --------------------------------------------------------------- the stats */
+/* the stats */
 static void build_info(void)
 {
-  static char f[8192]; /* reused per /proc file            */
+  static char f[8192]; /* reused per /proc file */
   char v[80];
 
-  /* Title line: "user@host" (classic neofetch), cyan like the old "OwOS". */
+  /* Title line: "user@host" (classic neofetch), cyan like the old "OwOS" */
   {
     char title[160], un[32], hn[64];
     if (!user_ident(un, sizeof un, 0, 0))
@@ -266,8 +238,7 @@ static void build_info(void)
   as("OwOS " OWOS_VERSION);
   endrow();
   {
-    /* Kernel arch is authoritative via uname() — this program is 32-bit ELF
-     * and can't infer the kernel's arch from its own build. */
+    /* Kernel arch is authoritative via uname() */
     struct utsname u;
     field("Kernel:  ");
     if (uname(&u) == 0) {
@@ -336,8 +307,7 @@ static void build_info(void)
   as(" bytes");
   endrow();
 
-  /* /proc/pci: count the lines for the PCI total, and remember it for the GPU
-   * pass below (class 03xx = display controller). */
+  /* /proc/pci: count the lines for the PCI total, and remember it for the GPU pass below */
   int pci_lines = 0;
   readproc("/proc/pci", f, sizeof f);
   for (const char *p = f; *p;) {
@@ -364,9 +334,7 @@ static void build_info(void)
   as(f[0] ? f : "unknown");
   endrow();
 
-  /* Host = vendor + product (brand + model), from /sys/class/dmi/id. Skip the
-   * vendor when the product name already starts with it (no "HP HP EliteBook").
-   */
+  /* Host = vendor + product (brand + model), from /sys/class/dmi/id */
   readproc("/sys/class/dmi/id/product_name", f, sizeof f);
   rstrip(f);
   readproc("/sys/class/dmi/id/sys_vendor", v, sizeof v);
@@ -384,8 +352,7 @@ static void build_info(void)
     as("unknown");
   endrow();
 
-  /* Battery: present when the sysfs node exists (the dir is absent with no
-   * battery), pct from capacity, charge state from status. */
+  /* Battery: present when the sysfs node exists, pct from capacity, charge state from status */
   if (readproc("/sys/power/battery/capacity", f, sizeof f) > 0 && f[0]) {
     field("Battery: ");
     au(u_of(f));
@@ -410,7 +377,7 @@ static void build_info(void)
     endrow();
   }
 
-  /* /proc/storage: one "<type> <sectors> <model>" line per disk. */
+  /* /proc/storage: one "<type> <sectors> <model>" line per disk */
   readproc("/proc/storage", f, sizeof f);
   if (!f[0]) {
     field("Storage: ");
@@ -426,7 +393,7 @@ static void build_info(void)
       first = false;
       const char *q = p;
       while (q < eol && *q != ' ')
-        ac(*q++); /* type            */
+        ac(*q++); /* type */
       unsigned sectors = 0;
       if (q < eol) {
         q++;
@@ -450,14 +417,14 @@ static void build_info(void)
     }
   }
 
-  /* GPUs = /proc/pci lines whose class field (3rd token) starts "03". */
+  /* GPUs = /proc/pci lines whose class field (3rd token) starts "03" */
   readproc("/proc/pci", f, sizeof f);
   int gpus = 0;
   for (const char *p = f; *p;) {
     const char *eol = p;
     while (*eol && *eol != '\n')
       eol++;
-    /* tokens: bdf  vendor:device  class  name... */
+    /* tokens: bdf vendor:device class name */
     const char *t = p;
     int tok = 0;
     const char *cls = 0, *name = 0;
@@ -489,8 +456,7 @@ static void build_info(void)
     endrow();
   }
 
-  /* The monitor: EDID brand/model + active resolution/refresh (or text mode),
-   * one attribute per sysfs file under /sys/class/graphics/fb0. */
+  /* The monitor: EDID brand/model + active resolution/refresh (or text mode) */
   field("Display: ");
   readproc("/sys/class/graphics/fb0/monitor", f, sizeof f);
   rstrip(f);
@@ -525,7 +491,7 @@ static void build_info(void)
   endrow();
 }
 
-/* Pair each stat row with its logo line (cyan, padded to a fixed column). */
+/* Pair each stat row with its logo line (cyan, padded to a fixed column) */
 static void render(void)
 {
   int total = nrows > LOGO_LINES ? nrows : LOGO_LINES;

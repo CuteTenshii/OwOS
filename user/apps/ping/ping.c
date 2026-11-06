@@ -1,21 +1,11 @@
-/* ping.c - an ICMP echo client over a raw ICMP socket.
- *
- * The kernel only lends a raw ICMP transport (net_connect(ip, 0, SK_ICMP) +
- * net_send/net_recv): this program resolves the host in user space (net_dial),
- * builds the echo request (type 8, id, seq, checksum), sends it, and matches
- * the reply's id itself. Ctrl+C is cooperative (net_recv -> NET_EINTR).
- *
- *   ping 10.0.2.2        continuous until Ctrl+C
- *   ping -c 4 host       stop after 4
- */
+/* ping.c - an ICMP echo client over a raw ICMP socket */
 
 #include "opt.h"
 #include "owos.h"
 #include "resolve.h"
 #include <stdbool.h>
 
-/* Internet checksum (RFC 1071): ones-complement sum of 16-bit big-endian words.
- */
+/* Internet checksum (RFC 1071): ones-complement sum of 16-bit big-endian words */
 static unsigned short icmp_csum(const unsigned char *d, int n)
 {
   unsigned long s = 0;
@@ -28,10 +18,7 @@ static unsigned short icmp_csum(const unsigned char *d, int n)
   return (unsigned short)(~s & 0xFFFF);
 }
 
-/* Ctrl+C arrives as SIGINT (the terminal posts it to us). Catch it so we print
- * the summary and exit cleanly instead of being terminated by the default
- * action; a blocking net_recv also returns NET_EINTR when the signal is
- * pending. */
+/* Ctrl+C arrives as SIGINT (the terminal posts it to us) */
 static volatile bool g_interrupted;
 static void on_sigint(int s)
 {
@@ -41,7 +28,7 @@ static void on_sigint(int s)
 
 int main(int argc, char **argv)
 {
-  int count = 0; /* 0 = continuous                          */
+  int count = 0; /* 0 = continuous */
   const char *host = 0;
 
   signal(SIGINT, on_sigint);
@@ -85,7 +72,7 @@ int main(int argc, char **argv)
     pkt[0] = 8;
     pkt[1] = 0;
     pkt[2] = 0;
-    pkt[3] = 0; /* type/code/csum  */
+    pkt[3] = 0; /* type/code/csum */
     pkt[4] = (unsigned char)(id >> 8);
     pkt[5] = (unsigned char)id;
     pkt[6] = (unsigned char)(seq >> 8);
@@ -104,7 +91,7 @@ int main(int argc, char **argv)
     sent++;
 
     bool got = false;
-    for (;;) { /* wait for our reply      */
+    for (;;) { /* wait for our reply */
       unsigned char rb[1500];
       int n = net_recv(h, rb, (int)sizeof rb);
       if (n == NET_EINTR) {
@@ -112,7 +99,7 @@ int main(int argc, char **argv)
         break;
       }
       if (n <= 0)
-        break; /* timeout                 */
+        break; /* timeout */
       if (n >= 8 && rb[0] == 0 && (((int)rb[4] << 8) | rb[5]) == id) {
         got = true;
         break;

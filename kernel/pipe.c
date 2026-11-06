@@ -1,12 +1,9 @@
-/* pipe.c — fixed pool of pipe ring buffers. Blocking ends yield to the
- * scheduler so the other end can make progress. */
+/* pipe.c: fixed pool of pipe ring buffers; blocking ends yield to the scheduler. */
 
 #include "pipe.h"
 #include "sched.h"
 
-#define MAX_PIPES                                                                                                      \
-  16 /* spawn_cap uses 1 each; an IPC channel uses 2 (rx+tx)                                                           \
-      */
+#define MAX_PIPES 16 /* spawn_cap uses 1 each; an IPC channel uses 2 (rx+tx) */
 #define PIPE_SIZE 512
 
 struct pipe {
@@ -48,7 +45,7 @@ void pipe_close(int id, int writer)
   else
     p->readers--;
   if (p->readers <= 0 && p->writers <= 0)
-    p->used = false; /* both ends gone: free the pipe           */
+    p->used = false; /* both ends gone: free the pipe */
 }
 
 int pipe_read(int id, char *buf, int len)
@@ -56,8 +53,8 @@ int pipe_read(int id, char *buf, int len)
   struct pipe *p = &pipes[id];
   while (p->count == 0) {
     if (p->writers <= 0)
-      return 0;    /* EOF: drained and no writers left        */
-    sched_yield(); /* let a writer run                        */
+      return 0;    /* EOF: drained and no writers left */
+    sched_yield(); /* let a writer run */
   }
   int n = 0;
   while (n < len && p->count > 0) {
@@ -68,9 +65,7 @@ int pipe_read(int id, char *buf, int len)
   return n;
 }
 
-/* Non-blocking read: >0 bytes copied, 0 if empty but a writer is still attached
- * (would-block), -1 once drained with no writers left (EOF). Lets a GUI program
- * poll captured child output without parking on it. */
+/* Non-blocking read: >0 bytes, 0 if empty with a writer attached, -1 on EOF. */
 int pipe_read_nb(int id, char *buf, int len)
 {
   struct pipe *p = &pipes[id];
@@ -92,8 +87,8 @@ int pipe_write(int id, const char *buf, int len)
   while (n < len) {
     while (p->count == PIPE_SIZE) {
       if (p->readers <= 0)
-        return n;    /* nobody reading; stop                    */
-      sched_yield(); /* let the reader drain it                 */
+        return n;    /* nobody reading; stop */
+      sched_yield(); /* let the reader drain it */
     }
     p->buf[p->head] = buf[n++];
     p->head = (p->head + 1) % PIPE_SIZE;

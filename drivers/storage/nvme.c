@@ -1,23 +1,5 @@
-/* nvme.c — minimal polled NVMe block driver (admin + one I/O queue pair).
- *
- * Bring-up follows the NVMe spec's controller-init sequence:
- *   1. Find the controller on PCI (class 0x01 / subclass 0x08) and map its
- *      MMIO register block (BAR0) — it sits above the 16 MiB identity map.
- *   2. Disable the controller (CC.EN=0, wait CSTS.RDY=0), program the admin
- *      submission/completion queues (AQA/ASQ/ACQ), then enable it and wait for
- *      CSTS.RDY=1.
- *   3. Over the admin queue: create an I/O completion queue, an I/O submission
- *      queue, and IDENTIFY namespace 1 to learn its capacity.
- *   4. Per I/O: post a Read/Write command on the I/O queue with PRP1 pointing
- *      at a bounce buffer, ring the submission doorbell, and poll the
- *      completion queue's phase bit.
- *
- * All queues and buffers are page-aligned frames from the identity-mapped pool
- * (palloc), so physical == virtual — exactly the addresses the controller DMAs
- * to. Polled and synchronous: one command in flight at a time, which is all the
- * single-threaded shell/fs need. Every wait is bounded so a wedged controller
- * returns -1 instead of hanging.
- */
+/* nvme.c: minimal polled NVMe driver (admin queue + one I/O queue pair), one command in flight.
+ * Queues and buffers are identity-mapped palloc frames (phys == virt); waits are bounded. */
 
 #include <stdbool.h>
 
@@ -31,19 +13,19 @@
 #define NVME_SUBCLASS 0x08
 
 /* Controller registers (byte offsets into BAR0). */
-#define REG_CAP 0x00        /* capabilities (64-bit)                          */
-#define REG_CC 0x14         /* controller configuration                       */
-#define REG_CSTS 0x1C       /* controller status                              */
-#define REG_AQA 0x24        /* admin queue attributes                         */
-#define REG_ASQ 0x28        /* admin submission queue base (64-bit)           */
-#define REG_ACQ 0x30        /* admin completion queue base (64-bit)           */
-#define REG_DOORBELL 0x1000 /* SQ0 tail doorbell; the rest follow by stride */
+#define REG_CAP 0x00
+#define REG_CC 0x14
+#define REG_CSTS 0x1C
+#define REG_AQA 0x24
+#define REG_ASQ 0x28
+#define REG_ACQ 0x30
+#define REG_DOORBELL 0x1000
 
 #define CC_EN 0x1
 #define CSTS_RDY 0x1
-#define CSTS_CFS 0x2 /* controller fatal status                        */
+#define CSTS_CFS 0x2
 
-#define QDEPTH 8 /* entries per queue (fits in one 4 KiB frame)    */
+#define QDEPTH 8
 
 /* Admin opcodes. */
 #define ADM_CREATE_SQ 0x01
@@ -56,33 +38,27 @@
 
 #define POLL_LIMIT 5000000u
 
-/* --------------------------------------------------------------------- state
- */
-
-static volatile uint32_t *bar; /* mapped MMIO register block                */
+static volatile uint32_t *bar;
 static bool found;
-static uint32_t dstrd; /* doorbell stride exponent (CAP bits 35:32) */
+static uint32_t dstrd;
 static uint32_t cap_sectors;
 static uint16_t next_cid;
-static char model[41]; /* controller model from Identify            */
+static char model[41];
 
 struct queue {
-  volatile uint32_t *sq; /* submission entries, 16 dwords each            */
-  volatile uint32_t *cq; /* completion entries, 4 dwords each             */
+  volatile uint32_t *sq;
+  volatile uint32_t *cq;
   uint32_t sq_tail;
   uint32_t cq_head;
-  int phase;      /* expected phase-tag for the next completion    */
-  uint32_t sq_db; /* submission tail doorbell (byte offset)        */
-  uint32_t cq_db; /* completion head doorbell (byte offset)        */
+  int phase;
+  uint32_t sq_db;
+  uint32_t cq_db;
 };
 
 static struct queue admin_q, io_q;
 
-static volatile uint8_t *dbuf; /* 4 KiB page: DMA bounce + identify buffer  */
+static volatile uint8_t *dbuf;
 static spinlock_t io_lock;
-
-/* ----------------------------------------------------------------- MMIO + I/O
- */
 
 static inline uint32_t reg_rd(uint32_t off) { return bar[off / 4]; }
 static inline void reg_wr(uint32_t off, uint32_t v) { bar[off / 4] = v; }
@@ -91,8 +67,7 @@ static inline void reg_wr(uint32_t off, uint32_t v) { bar[off / 4] = v; }
 static uint32_t sq_doorbell(uint32_t y) { return REG_DOORBELL + (2 * y) * (4u << dstrd); }
 static uint32_t cq_doorbell(uint32_t y) { return REG_DOORBELL + (2 * y + 1) * (4u << dstrd); }
 
-/* Submit one 16-dword command and poll its completion. Returns the status-field
- * value (0 = success) or 0xFFFF on timeout. */
+/* Submit one 16-dword command and poll its completion. */
 static uint32_t submit(struct queue *q, const uint32_t cmd[16])
 {
   volatile uint32_t *slot = q->sq + q->sq_tail * 16;
@@ -100,7 +75,7 @@ static uint32_t submit(struct queue *q, const uint32_t cmd[16])
     slot[i] = cmd[i];
 
   q->sq_tail = (q->sq_tail + 1) % QDEPTH;
-  reg_wr(q->sq_db, q->sq_tail); /* ring submission doorbell        */
+  reg_wr(q->sq_db, q->sq_tail);
 
   volatile uint32_t *cqe = q->cq + q->cq_head * 4;
   uint32_t i;
@@ -110,12 +85,12 @@ static uint32_t submit(struct queue *q, const uint32_t cmd[16])
   if (i == POLL_LIMIT)
     return 0xFFFF;
 
-  uint32_t status = (cqe[3] >> 17) & 0x7FF; /* status field of the completion */
+  uint32_t status = (cqe[3] >> 17) & 0x7FF;
 
   q->cq_head = (q->cq_head + 1) % QDEPTH;
   if (q->cq_head == 0)
-    q->phase ^= 1;              /* phase flips each ring wrap      */
-  reg_wr(q->cq_db, q->cq_head); /* ring completion doorbell        */
+    q->phase ^= 1;
+  reg_wr(q->cq_db, q->cq_head);
   return status;
 }
 
@@ -123,13 +98,11 @@ static void build(uint32_t cmd[16], uint8_t opcode, uint32_t nsid, uint32_t prp1
 {
   for (int i = 0; i < 16; i++)
     cmd[i] = 0;
-  cmd[0] = opcode | ((uint32_t)(next_cid++) << 16); /* opcode + command id */
-  cmd[1] = nsid;                                    /* namespace id            */
-  cmd[6] = prp1;                                    /* PRP1 (data/list ptr)    */
-  cmd[7] = 0;                                       /* PRP1 high               */
+  cmd[0] = opcode | ((uint32_t)(next_cid++) << 16);
+  cmd[1] = nsid;
+  cmd[6] = prp1;
+  cmd[7] = 0;
 }
-
-/* ---------------------------------------------------------------- I/O path */
 
 static int rw(uint32_t lba, uint32_t count, bool write)
 {
@@ -137,9 +110,9 @@ static int rw(uint32_t lba, uint32_t count, bool write)
     return -1;
   uint32_t cmd[16];
   build(cmd, write ? IO_WRITE : IO_READ, 1, (uint32_t)(uintptr_t)dbuf);
-  cmd[10] = lba;       /* CDW10: starting LBA (low)       */
-  cmd[11] = 0;         /* CDW11: starting LBA (high)      */
-  cmd[12] = count - 1; /* CDW12: NLB = count - 1            */
+  cmd[10] = lba;
+  cmd[11] = 0;
+  cmd[12] = count - 1;
   return submit(&io_q, cmd) == 0 ? 0 : -1;
 }
 
@@ -180,9 +153,6 @@ int nvme_present(void) { return found; }
 uint32_t nvme_sectors(void) { return cap_sectors; }
 const char *nvme_model(void) { return model; }
 
-/* --------------------------------------------------------------------- probe
- */
-
 static int find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
 {
   for (int b = 0; b < 256; b++)
@@ -204,12 +174,12 @@ static int find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
   return 0;
 }
 
-static int wait_ready(uint32_t want) /* want = CSTS.RDY value to await  */
+static int wait_ready(uint32_t want)
 {
   for (uint32_t i = 0; i < POLL_LIMIT; i++) {
     uint32_t csts = reg_rd(REG_CSTS);
     if (csts & CSTS_CFS)
-      return -1; /* controller fatal                */
+      return -1;
     if ((csts & CSTS_RDY) == want)
       return 0;
   }
@@ -231,19 +201,17 @@ void nvme_init(void)
   }
 
   uint32_t cmd = pci_read32(bus, slot, func, 0x04);
-  pci_write32(bus, slot, func, 0x04, cmd | 0x06); /* memory space + bus master */
+  pci_write32(bus, slot, func, 0x04, cmd | 0x06);
 
   if (paging_identity_map(bar0, 0x2000) != 0) {
     con_write("nvme: could not map MMIO\n");
     return;
   }
-  /* Registers are MMIO: mark the BAR uncached or, on real silicon, a doorbell
-   * write can sit in the write-back cache and the controller never sees the
-   * submission (the polled completion then times out). QEMU hides this. */
+  /* Mark the BAR uncached, or a doorbell write can sit in the write-back cache (QEMU hides this). */
   paging_mark_uc(bar0, 0x2000);
   bar = (volatile uint32_t *)(uintptr_t)bar0;
 
-  dstrd = reg_rd(REG_CAP + 4) & 0xF; /* CAP bits 35:32 = doorbell stride */
+  dstrd = reg_rd(REG_CAP + 4) & 0xF;
 
   /* Disable the controller before reprogramming the admin queues. */
   reg_wr(REG_CC, reg_rd(REG_CC) & ~CC_EN);
@@ -263,7 +231,7 @@ void nvme_init(void)
     return;
   }
   admin_q.sq_tail = admin_q.cq_head = 0;
-  admin_q.phase = 1; /* first valid completion has P=1  */
+  admin_q.phase = 1;
   admin_q.sq_db = sq_doorbell(0);
   admin_q.cq_db = cq_doorbell(0);
 
@@ -305,11 +273,11 @@ void nvme_init(void)
 
   /* IDENTIFY controller (CNS=1): model number is ASCII at bytes 24..63. */
   build(c, ADM_IDENTIFY, 0, (uint32_t)(uintptr_t)dbuf);
-  c[10] = 1; /* CNS = 1: identify controller     */
+  c[10] = 1;
   model[0] = '\0';
   if (submit(&admin_q, c) == 0) {
     int n = 0;
-    for (int i = 0; i < 40; i++) /* not byte-swapped, space-padded   */
+    for (int i = 0; i < 40; i++)
       model[n++] = (char)dbuf[24 + i];
     while (n > 0 && model[n - 1] == ' ')
       n--;
@@ -318,20 +286,17 @@ void nvme_init(void)
 
   /* IDENTIFY namespace 1 (CNS=0): NSZE (bytes 0-7) is the block count. */
   build(c, ADM_IDENTIFY, 1, (uint32_t)(uintptr_t)dbuf);
-  c[10] = 0; /* CNS = 0: identify namespace      */
+  c[10] = 0;
   if (submit(&admin_q, c) == 0) {
     const volatile uint32_t *idns = (const volatile uint32_t *)dbuf;
-    cap_sectors = idns[0]; /* low 32 bits of NSZE is plenty    */
-    /* The block layer addresses this device in 512-byte sectors. Confirm the
-     * namespace is actually 512-byte formatted: FLBAS (byte 26) selects an LBA
-     * format whose LBADS (2^n byte size) is bits 16-23 of the entry at
-     * byte 128 + 4*index. A 4K-formatted drive would otherwise report 8x the
-     * capacity and every read would return a fraction of a block. */
+    cap_sectors = idns[0];
+    /* Require a 512-byte LBA format (FLBAS byte 26 picks the entry at 128+4*index, LBADS in bits 16-23); the block
+     * layer assumes 512. */
     uint32_t flbas = ((const volatile uint8_t *)dbuf)[26] & 0xF;
     uint32_t lbads = (idns[(128 / 4) + flbas] >> 16) & 0xFF;
     if (lbads != 9) {
       con_printf("nvme: unsupported LBA size %u bytes; ignoring device\n", 1u << lbads);
-      return; /* leave found=0 so blk won't use it */
+      return;
     }
   }
 
@@ -341,7 +306,7 @@ void nvme_init(void)
     con_printf(" [%s]", model);
   }
   if (cap_sectors) {
-    con_printf(", %u MiB", cap_sectors / 2048); /* 512-B blocks -> MiB */
+    con_printf(", %u MiB", cap_sectors / 2048);
   }
   con_putc('\n');
 }

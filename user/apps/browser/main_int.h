@@ -4,20 +4,19 @@
 
 // clang-format off
 #include <stdbool.h>
-// clang-format on
+// clang-format
 #include "browser.h"
-#include "clipboard.h"                    /* clip_put_text for Copy */
-#include "dialog.h"                       /* window.alert/confirm/prompt run on the main thread here */
-#include "features/anim/anim.h"           /* CSS @keyframes / transition engine (drives per-frame relayout) */
+#include "clipboard.h" /* clip_put_text for Copy */
+#include "dialog.h"
+#include "features/anim/anim.h"
 #include "features/bookmarks/bookmarks.h" /* persistent (url,title) bookmarks store */
 #include "features/cache/cache.h"         /* persistent HTTP response cache: load at startup */
 #include "features/media/bmedia.h"        /* <audio>/<video> controls widget + playback state */
 #include "font.h"                         /* custom @font-face faces (user/lib/font) */
 #include "layout.h"                       /* the CSS box tree (backgrounds/borders behind the text) */
-#include "render_util.h"                  /* gradient/image/glyph caches, scroll + paint-order helpers */
+#include "render_util.h"
 
-/* The word-wrap line table: per display line source offset/length, content
- * origin, width, document-pixel top, height and largest glyph size. */
+/* The word-wrap line table */
 struct ltab {
   int *off, *len, *x, *w, *y, *h, *px;
   int n, cap;
@@ -32,16 +31,14 @@ struct lmedia {
   int row, rows;
 };
 
-/* One complete layout result. The worker builds the next one in g_bk without
- * holding browser_buf_lock, then swaps it with g_fr under a short lock; render()
- * only ever reads g_fr. */
+/* One complete layout result */
 struct layout_out {
   struct ltab lt;
   struct fslice *fs; /* flex/grid item text over reserved bands */
   int n_fs, cap_fs;
   struct lgeom *geo; /* per-box geometry, indexed like the box pool */
   int n_geo, cap_geo;
-  int *img_pos, *img_row, *img_rows; /* per inline image: anchor, first row, rows (-1 = unchanged) */
+  int *img_pos, *img_row, *img_rows;
   int n_img, cap_img;
   struct lmedia *med;
   int n_med, cap_med;
@@ -49,43 +46,23 @@ struct layout_out {
   int doc_h;
   int over; /* furthest a glyph can spill below its line box, px */
 };
-/* --- tabs ------------------------------------------------------------------
- */
-/* Each tab keeps its URL, label and scroll offset, plus — when it isn't the
- * active tab — a *snapshot* of its rendered page so switching back is instant
- * and never re-hits the network. Only the active tab's page lives in B (the
- * growable working buffers); an inactive tab's page is serialized into a single
- * heap blob the tab owns (malloc'd on cache, freed on restore/close). The blob
- * packs every variable-sized part — text, attr, img_pool, raw, the link list,
- * and the image list — back to back; the small fixed metadata (lengths, urls,
- * favicon) lives in the tab struct. A snapshot that can't be allocated falls
- * back to the old behaviour: re-fetch on select. There is no shared arena and
- * no eviction — each tab's blob is independent and demand-paged, so the only
- * bound on a cached page is available memory. The strip is the gfx tabbar
- * widget; this owns the list. */
+/* --- tabs ------------------------------------------------------------------ */
+/* Each tab keeps its URL, label and scroll offset, plus */
 #define MAX_TABS 8
 #define HIST_MAX 32 /* per-tab back/forward history depth */
 struct tab {
   char url[URL_MAX]; /* address-bar / navigation target               */
   char label[40];    /* tab-strip label (page title or host)          */
-  struct page page;  /* this tab's whole page; B->pg points here when
-                      * active, so a switch is a pointer swap (no copy) */
+  struct page page;
 
-  /* Per-tab navigation history: URLs landed on, with hist_i the current entry.
-   * Back/Next move hist_i and re-navigate; a fresh navigation truncates any
-   * forward entries. Entries are malloc'd; the oldest is dropped when full. */
+  /* Per-tab navigation history */
   char *hist[HIST_MAX];
   int hist_n; /* number of entries in use                    */
   int hist_i; /* index of the current page (0..hist_n-1)     */
 
   struct dt_view dt; /* this tab's devtools view (panel/scroll/open) */
 
-  /* Set when this tab's page faulted (JS-runtime/GC OOM, a use-after-free, deep
-   * recursion overrun): the worker caught the CPU fault, tore the page down,
-   * and flagged it so render() shows the "tab crashed" page instead of the
-   * browser dying. Cleared when the tab is navigated/reloaded. crash_sig is the
-   * fault signal (SIGSEGV/SIGILL/SIGFPE …) that fired, used to label the page.
-   */
+  /* Set when this tab's page faulted (JS-runtime/GC OOM, a use-after-free, deep recursion overrun) */
   bool crashed;
   int crash_sig;
 };
@@ -101,8 +78,8 @@ struct bctx {
   struct ru_gtab at;
   struct ru_gtab gt;
   struct font *gf; /* the face the caches currently hold */
-  bool worker;     /* misses touch the shared gfx caches, so they take browser_buf_lock */
-  bool held;       /* the caller already holds browser_buf_lock */
+  bool worker;
+  bool held; /* the caller already holds browser_buf_lock */
 };
 #define INDENT_PX 24
 struct rect {

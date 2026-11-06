@@ -1,27 +1,4 @@
-/* ntfs.c — read-only NTFS driver (see ntfs.h).
- *
- * Little-endian throughout. The boot sector at LBA 0 gives bytes/sector,
- * sectors/cluster, the $MFT start cluster (LCN) and the MFT record size. The
- * $MFT is itself a file whose $DATA describes (via a runlist) where every MFT
- * record lives -- but record 0 ($MFT) is reachable straight from the boot
- * sector's MFT LCN, and we bootstrap the rest of the MFT through $MFT's own
- * $DATA runlist so high record numbers (root = 5, $Volume = 3) resolve even on
- * a fragmented MFT.
- *
- * Each MFT record begins with "FILE" magic and is protected by a fixup/update-
- * sequence array: the last 2 bytes of every 512-byte chunk are stolen for a USA
- * entry and must be restored before the record is trusted (likewise INDX index
- * blocks). After fixup, the record is a list of attributes; we walk the ones we
- * need: $FILE_NAME (0x30), $DATA (0x80), $INDEX_ROOT (0x90), $INDEX_ALLOCATION
- * (0xA0), $VOLUME_NAME (0x60).
- *
- * Scope: resident + simple non-resident $DATA, $INDEX_ROOT/$INDEX_ALLOCATION
- * directory reading. Compressed/encrypted/sparse runs, attribute lists spanning
- * multiple records, ADS and reparse points are out of scope; we fail closed
- * (return -1/0/NULL) on anything malformed and bound every loop.
- *
- * Multi-instance: all per-mount state -- including the scratch buffers -- lives
- * in a heap-allocated `struct ntfs_mount`; each op casts its void *inst to it.
+/* ntfs.c: read-only NTFS driver (see ntfs.h). Resident/simple non-resident $DATA and index directories; fails closed.
  */
 
 #include <stddef.h>
@@ -32,7 +9,6 @@
 #include "kstring.h"
 #include "ntfs.h"
 
-/* --------------------------------------------------------------- constants */
 #define NTFS_MAX_REC 4096u      /* largest MFT record we handle           */
 #define NTFS_MAX_CLUSTER 65536u /* largest cluster we buffer (64 KiB cap) */
 #define NTFS_MAX_NAME 255u      /* UTF-16 units in a name                 */
@@ -51,9 +27,7 @@
 #define INDEX_ENTRY_NODE 0x01u     /* index-entry flag: has a sub-node    */
 #define INDEX_ENTRY_END 0x02u      /* index-entry flag: end-of-list entry */
 
-/* Every per-mount mutable field. One heap-allocated instance per mounted NTFS
- * volume; ops cast their void *inst to this. Scratch buffers live here so two
- * concurrent mounts never share them. */
+/* Per-mount state, heap-allocated (scratch buffers included). */
 struct ntfs_mount {
   blk_read_fn read;
   uint32_t bytes_per_sector;
@@ -62,8 +36,7 @@ struct ntfs_mount {
   uint32_t mft_lcn;      /* $MFT start cluster (LCN)             */
   uint32_t mft_rec_size; /* bytes per MFT record                 */
 
-  /* $MFT's own $DATA runlist, so we can map any MFT record number -> bytes.
-   * Decoded once at probe time. Bounded list of (vcn_start, length, lcn). */
+  /* $MFT's $DATA runlist (vcn_start, length, lcn), decoded at probe time. */
   uint32_t mft_run_n;
   uint64_t mft_run_vcn[64]; /* first VCN of the run                 */
   uint64_t mft_run_len[64]; /* run length in clusters               */
@@ -75,10 +48,7 @@ struct ntfs_mount {
   char label[64];
 };
 
-/* ------------------------------------------------------------- device I/O */
-
-/* Read `len` bytes at absolute byte offset `byteoff` into buf, in 512-byte
- * sector reads. Returns 0 / -1. */
+/* Read `len` bytes at absolute byte offset `byteoff`. 0 / -1. */
 static int dev_read(struct ntfs_mount *m, uint64_t byteoff, uint8_t *buf, uint32_t len)
 {
   uint8_t s[512];
@@ -104,12 +74,7 @@ static int read_cluster(struct ntfs_mount *m, uint64_t lcn, uint8_t *buf)
   return dev_read(m, lcn * m->bytes_per_cluster, buf, m->bytes_per_cluster);
 }
 
-/* ----------------------------------------------------------- fixup (USA) */
-
-/* Apply the update-sequence array to a record/index block of `total` bytes that
- * has just been read from disk. usa_off/usa_cnt come from the header. The first
- * USA word is the sequence number; the remaining (usa_cnt-1) words replace the
- * last 2 bytes of each 512-byte stride. Returns 0 / -1 on malformed input. */
+/* Apply the update-sequence array: its words replace the last 2 bytes of each 512-byte stride. 0 / -1. */
 static int apply_fixup(uint8_t *buf, uint32_t total, uint16_t usa_off, uint16_t usa_cnt)
 {
   if (usa_cnt < 1)
@@ -131,12 +96,7 @@ static int apply_fixup(uint8_t *buf, uint32_t total, uint16_t usa_off, uint16_t 
   return 0;
 }
 
-/* --------------------------------------------------- runlist decode + read */
-
-/* Decode one mapping-pairs run header byte: low nibble = #bytes of length, high
- * nibble = #bytes of (signed) LCN delta. Returns the next pointer, or NULL on a
- * malformed/short buffer. Sets *len and *delta. A header of 0x00 ends the list
- * (caller checks *p == 0 before calling). */
+/* Decode one run header (low nibble length bytes, high nibble signed LCN delta bytes). Next pointer or NULL. */
 static const uint8_t *decode_run(const uint8_t *p, const uint8_t *end, uint64_t *len_out, int64_t *delta_out)
 {
   uint8_t hdr = *p++;
@@ -172,24 +132,19 @@ static const uint8_t *decode_run(const uint8_t *p, const uint8_t *end, uint64_t 
   return p;
 }
 
-/* Read `len` bytes starting at byte offset `off` from a non-resident attribute
- * whose mapping pairs are at [mp, mp_end). Bounds every run against the
- * cluster size and reads cluster-by-cluster through clbuf. Returns bytes read
- * (>=0) or -1. Holes read as zero. Uses m->clbuf. */
+/* Read from a non-resident attribute with mapping pairs [mp, mp_end), via clbuf. Bytes read or -1; holes are zero. */
 static int read_runlist(struct ntfs_mount *m, const uint8_t *mp, const uint8_t *mp_end, uint64_t off, uint8_t *dst,
                         uint32_t len)
 {
   uint32_t cl = m->bytes_per_cluster;
   uint32_t got = 0;
-  uint64_t vcn = 0; /* current run's first VCN             */
-  int64_t lcn = 0;  /* running absolute LCN                */
+  uint64_t vcn = 0;
+  int64_t lcn = 0;
   const uint8_t *p = mp;
   int guard = 0;
 
   while (got < len) {
-    /* (re)scan the runlist from the top to find the run holding the VCN we
-     * need next.  N is tiny for our images, so the rescan is cheap and keeps
-     * state simple. */
+    /* Rescan the runlist for the run holding the next VCN. */
     uint64_t want_vcn = (off + got) / cl;
     const uint8_t *q = mp;
     uint64_t cur_vcn = 0;
@@ -220,7 +175,7 @@ static int read_runlist(struct ntfs_mount *m, const uint8_t *mp, const uint8_t *
     (void)p;
     (void)vcn;
     if (!found)
-      break; /* past end of the mapped data */
+      break;
 
     uint32_t boff = (uint32_t)((off + got) % cl);
     uint32_t chunk = cl - boff;
@@ -242,10 +197,7 @@ static int read_runlist(struct ntfs_mount *m, const uint8_t *mp, const uint8_t *
   return (int)got;
 }
 
-/* -------------------------------------------------------- MFT record access */
-
-/* Read a record of size m->mft_rec_size at absolute byte offset `byteoff`,
- * verify "FILE" magic and apply its fixup. Returns 0 / -1. */
+/* Read an MFT record at `byteoff`, check "FILE" magic and apply fixup. 0 / -1. */
 static int read_mft_record_at(struct ntfs_mount *m, uint64_t byteoff, uint8_t *buf)
 {
   uint32_t rs = m->mft_rec_size;
@@ -262,8 +214,7 @@ static int read_mft_record_at(struct ntfs_mount *m, uint64_t byteoff, uint8_t *b
   return 0;
 }
 
-/* Map MFT record number `recno` to its absolute byte offset using $MFT's $DATA
- * runlist (decoded at probe time). Returns 0 / -1. */
+/* Map MFT record `recno` to its byte offset via $MFT's runlist. 0 / -1. */
 static int mft_record_offset(struct ntfs_mount *m, uint64_t recno, uint64_t *off_out)
 {
   uint64_t rec_byte = recno * m->mft_rec_size;
@@ -291,14 +242,11 @@ static int read_mft_record(struct ntfs_mount *m, uint64_t recno, uint8_t *buf)
   return read_mft_record_at(m, off, buf);
 }
 
-/* -------------------------------------------------------- attribute walking */
-
-/* Find the first attribute of `type` in MFT record `rec`. Returns a pointer
- * into `rec` or NULL. Bounds the walk against the record's logical size. */
+/* Find the first attribute of `type` in `rec`, or NULL. */
 static const uint8_t *find_attr(const uint8_t *rec, uint32_t rec_size, uint32_t type)
 {
   uint16_t aoff = load_le16(rec + 0x14);
-  uint32_t used = load_le32(rec + 0x18); /* bytes used in record   */
+  uint32_t used = load_le32(rec + 0x18);
   if (used > rec_size)
     used = rec_size;
   if (aoff < 0x18 || aoff + 8u > used)
@@ -323,11 +271,10 @@ static const uint8_t *find_attr(const uint8_t *rec, uint32_t rec_size, uint32_t 
   return NULL;
 }
 
-/* For a resident attribute, set *vp -> value bytes and *vlen -> length, bounded
- * within the attribute. Returns 0 / -1 (non-resident or malformed). */
+/* Resident attribute value pointer and length. 0 / -1 (non-resident or malformed). */
 static int resident_value(const uint8_t *a, uint32_t arec_room, const uint8_t **vp, uint32_t *vlen)
 {
-  if (a[8] != 0) /* non-resident flag      */
+  if (a[8] != 0)
     return -1;
   uint32_t alen = load_le32(a + 4);
   uint32_t vlength = load_le32(a + 0x10);
@@ -341,10 +288,7 @@ static int resident_value(const uint8_t *a, uint32_t arec_room, const uint8_t **
   return 0;
 }
 
-/* ----------------------------------------------------------- name decoding */
-
-/* UTF-16LE -> ASCII (low byte; non-ASCII -> '?'). `units` 16-bit code units at
- * `src`; writes at most cap-1 chars to dst + NUL. Returns chars written. */
+/* UTF-16LE to ASCII (non-ASCII becomes '?'); writes at most cap-1 chars + NUL, returns the count. */
 static int utf16_to_ascii(const uint8_t *src, uint32_t units, char *dst, uint32_t cap)
 {
   if (units > NTFS_MAX_NAME)
@@ -358,11 +302,7 @@ static int utf16_to_ascii(const uint8_t *src, uint32_t units, char *dst, uint32_
   return (int)n;
 }
 
-/* --------------------------------------------------------- $DATA accessors */
-
-/* Locate the unnamed $DATA attribute in `rec` and report its size. For a
- * resident $DATA *res_ptr/res_len point into rec; for non-resident the mapping
- * pairs span [*mp,*mp_end). Sets *resident. Returns 0 / -1. */
+/* Locate the unnamed $DATA of `rec`: resident ptr/len, or non-resident mapping pairs [*mp,*mp_end). 0 / -1. */
 static int find_data(struct ntfs_mount *m, const uint8_t *rec, int *resident, const uint8_t **res_ptr,
                      uint32_t *res_len, const uint8_t **mp, const uint8_t **mp_end, uint64_t *size)
 {
@@ -370,8 +310,7 @@ static int find_data(struct ntfs_mount *m, const uint8_t *rec, int *resident, co
   if (used > m->mft_rec_size)
     used = m->mft_rec_size;
 
-  /* walk attributes by hand so we can require an *unnamed* $DATA (name len 0)
-   */
+  /* Walk by hand to require an unnamed $DATA. */
   uint16_t aoff = load_le16(rec + 0x14);
   uint32_t off = aoff;
   int guard = 0;
@@ -385,9 +324,9 @@ static int find_data(struct ntfs_mount *m, const uint8_t *rec, int *resident, co
     uint32_t alen = load_le32(a + 4);
     if (alen < 8 || off + alen > used)
       return -1;
-    if (alen >= 0x10 && atype == ATTR_DATA && a[9] == 0) { /* unnamed $DATA */
-      if (a[8] == 0) {                                     /* resident */
-        if (alen < 0x18)                                   /* value header must fit */
+    if (alen >= 0x10 && atype == ATTR_DATA && a[9] == 0) {
+      if (a[8] == 0) {
+        if (alen < 0x18)
           return -1;
         uint32_t vlen = load_le32(a + 0x10);
         uint16_t voff = load_le16(a + 0x14);
@@ -398,11 +337,11 @@ static int find_data(struct ntfs_mount *m, const uint8_t *rec, int *resident, co
         *res_len = vlen;
         *size = vlen;
         return 0;
-      } else {           /* non-resident */
-        if (alen < 0x40) /* non-res header must fit */
+      } else {
+        if (alen < 0x40)
           return -1;
         uint16_t mp_off = load_le16(a + 0x20);
-        uint64_t real_sz = load_le64(a + 0x30); /* real size of data */
+        uint64_t real_sz = load_le64(a + 0x30);
         if (mp_off < 0x40 || mp_off >= alen)
           return -1;
         *resident = 0;
@@ -455,12 +394,7 @@ static int read_data(struct ntfs_mount *m, const uint8_t *rec, uint64_t off, uin
   return read_runlist(m, mp, mpe, off, dst, len);
 }
 
-/* --------------------------------------------------- directory index walking
- */
-
-/* An index entry, decoded. `child` is the referenced MFT record number; `name`
- * is the decoded $FILE_NAME (ASCII), `is_dir` from its flags, `size` the data
- * size; `nspace` is the filename namespace byte. */
+/* A decoded index entry; `nspace` is the filename namespace byte. */
 struct index_entry {
   uint64_t child;
   int is_dir;
@@ -469,14 +403,13 @@ struct index_entry {
   char name[NTFS_MAX_NAME + 1];
 };
 
-/* Parse the $FILE_NAME structure embedded at `fn` (length-bounded by `room`)
- * and fill out the name/flags/namespace of `e`. Returns 0 / -1. */
+/* Parse the $FILE_NAME at `fn` (bounded by `room`) into `e`. 0 / -1. */
 static int parse_filename(const uint8_t *fn, uint32_t room, struct index_entry *e)
 {
   if (room < 0x42)
     return -1;
   uint32_t flags = load_le32(fn + 0x38);
-  uint8_t nlen = fn[0x40]; /* name length, in chars      */
+  uint8_t nlen = fn[0x40];
   uint8_t nspace = fn[0x41];
   if (0x42u + (uint32_t)nlen * 2u > room)
     return -1;
@@ -486,10 +419,7 @@ static int parse_filename(const uint8_t *fn, uint32_t room, struct index_entry *
   return 0;
 }
 
-/* Walk an index node (a run of index entries starting at `entries`, bounded by
- * `end`). For each leaf entry, decode it and hand it to the callback. The
- * callback returns nonzero to stop the whole walk (and the stop value is
- * propagated up via *stop). Returns 0 / -1. */
+/* Walk index entries in [entries, end), calling cb on each leaf; nonzero stops the walk (set in *stop). 0 / -1. */
 typedef int (*entry_cb)(void *ctx, const struct index_entry *e);
 
 static int walk_index_entries(const uint8_t *entries, const uint8_t *end, entry_cb cb, void *ctx, int *stopped)
@@ -506,7 +436,7 @@ static int walk_index_entries(const uint8_t *entries, const uint8_t *end, entry_
       return -1;
 
     if (!(iflags & INDEX_ENTRY_END)) {
-      uint64_t ref = load_le64(p) & 0x0000FFFFFFFFFFFFull; /* 48-bit recno */
+      uint64_t ref = load_le64(p) & 0x0000FFFFFFFFFFFFull;
       /* the $FILE_NAME content sits right after the 16-byte header */
       if (0x10u + (uint32_t)fn_len <= entry_len) {
         struct index_entry e;
@@ -528,10 +458,8 @@ static int walk_index_entries(const uint8_t *entries, const uint8_t *end, entry_
   return 0;
 }
 
-/* Run `cb` over every directory entry of the directory record `rec`. Walks
- * $INDEX_ROOT (always present) and, if there is one, every INDX block named by
- * the $INDEX_ALLOCATION runlist. Uses m->clbuf for INDX blocks. Returns 0/-1;
- * sets *stopped if the callback asked to stop. */
+/* Run `cb` over every entry of directory `rec` ($INDEX_ROOT, then INDX blocks via clbuf). 0/-1; *stopped if cb stopped.
+ */
 static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb cb, void *ctx, int *stopped)
 {
   if (stopped)
@@ -539,17 +467,14 @@ static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb
   uint32_t used = load_le32(rec + 0x18);
   if (used > m->mft_rec_size)
     used = m->mft_rec_size;
-
-  /* ---- $INDEX_ROOT ---- */
   const uint8_t *ir = find_attr(rec, m->mft_rec_size, ATTR_INDEX_ROOT);
   if (!ir)
-    return -1; /* not a directory (no index root) */
+    return -1;
   const uint8_t *irval;
   uint32_t irlen;
   if (resident_value(ir, m->mft_rec_size, &irval, &irlen) != 0)
     return -1;
-  /* INDEX_ROOT: 0x10 header, then an INDEX_HEADER. entries_off is relative to
-   * the start of that INDEX_HEADER (at irval+0x10). */
+  /* INDEX_ROOT: 0x10 header, then an INDEX_HEADER; entries_off is relative to it (irval+0x10). */
   if (irlen < 0x20)
     return -1;
   uint32_t ih_off = 0x10;
@@ -563,15 +488,13 @@ static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb
     return -1;
   if (stopped && *stopped)
     return 0;
-
-  /* ---- $INDEX_ALLOCATION (optional) ---- */
   const uint8_t *ia = find_attr(rec, m->mft_rec_size, ATTR_INDEX_ALLOC);
   if (!ia)
-    return 0; /* small dir: no external index blocks */
+    return 0;
   uint32_t alen = load_le32(ia + 4);
   if (alen < 0x40) /* non-resident header must fit */
     return 0;
-  if (ia[8] == 0) /* must be non-resident */
+  if (ia[8] == 0)
     return 0;
   uint16_t mp_off = load_le16(ia + 0x20);
   uint64_t alloc_sz = load_le64(ia + 0x28); /* allocated size of the attr */
@@ -579,8 +502,7 @@ static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb
     return 0;
   const uint8_t *mp = ia + mp_off, *mp_end = ia + alen;
 
-  /* INDX blocks are usually 4096 bytes; read them one block at a time through
-   * the runlist reader into clbuf (cap at NTFS_MAX_CLUSTER). */
+  /* Read INDX blocks one at a time into clbuf (capped at NTFS_MAX_CLUSTER). */
   uint32_t blk = m->bytes_per_cluster;
   if (blk < 512)
     blk = 512;
@@ -598,7 +520,7 @@ static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb
     pos += blk;
 
     if (m->clbuf[0] != 'I' || m->clbuf[1] != 'N' || m->clbuf[2] != 'D' || m->clbuf[3] != 'X')
-      continue; /* unused block */
+      continue;
     uint16_t usa_off = load_le16(m->clbuf + 0x04);
     uint16_t usa_cnt = load_le16(m->clbuf + 0x06);
     if (apply_fixup(m->clbuf, blk, usa_off, usa_cnt) != 0)
@@ -620,8 +542,6 @@ static int for_each_dir_entry(struct ntfs_mount *m, const uint8_t *rec, entry_cb
   }
   return 0;
 }
-
-/* ---------------------------------------------------------- path resolution */
 
 /* Context for the lookup-by-name callback. */
 struct lookup_ctx {
@@ -653,8 +573,7 @@ static int lookup_cb(void *vctx, const struct index_entry *e)
   return is_dos ? 0 : 1;
 }
 
-/* Look up `name` (length nlen) in the directory record `rec`. On a hit fills
- * the child and is_dir and returns 1; 0 if absent; -1 on error. */
+/* Look up `name` in directory `rec`: 1 hit (child, is_dir set), 0 absent, -1 error. */
 static int dir_lookup(struct ntfs_mount *m, const uint8_t *rec, const char *name, uint32_t nlen, uint64_t *child,
                       int *is_dir)
 {
@@ -677,8 +596,7 @@ static int dir_lookup(struct ntfs_mount *m, const uint8_t *rec, const char *name
   return 1;
 }
 
-/* Resolve `path` to an MFT record, leaving the record in `out` (>=
- * NTFS_MAX_REC) and reporting is_dir and size. Returns 0 / -1. */
+/* Resolve `path` to an MFT record in `out` (>= NTFS_MAX_REC), with is_dir and size. 0 / -1. */
 static int resolve(struct ntfs_mount *m, const char *path, uint8_t *out, int *is_dir_out, uint64_t *size_out)
 {
   if (read_mft_record(m, MFT_REC_ROOT, out) != 0)
@@ -725,10 +643,7 @@ static int resolve(struct ntfs_mount *m, const char *path, uint8_t *out, int *is
   return 0;
 }
 
-/* --------------------------------------------------------------- mounting */
-
-/* Decode $MFT's own $DATA runlist into the instance so any record resolves.
- * `mft_rec` is MFT record 0, already read+fixed. Returns 0 / -1. */
+/* Decode $MFT's $DATA runlist from record 0 (`mft_rec`, already fixed up). 0 / -1. */
 static int load_mft_runlist(struct ntfs_mount *m, const uint8_t *mft_rec)
 {
   const uint8_t *a = find_attr(mft_rec, m->mft_rec_size, ATTR_DATA);
@@ -748,7 +663,7 @@ static int load_mft_runlist(struct ntfs_mount *m, const uint8_t *mft_rec)
     if (++guard > 4096)
       return -1;
     if (n >= 64)
-      break; /* cap the run table */
+      break;
     int is_hole = ((p[0] >> 4) & 0x0F) == 0;
     uint64_t rlen;
     int64_t delta;
@@ -793,7 +708,7 @@ static int parse_boot(struct ntfs_mount *m, const uint8_t *bs)
     return -1;
 
   uint32_t bps = load_le16(bs + 0x0B);
-  if (bps < 256 || bps > 4096 || (bps & (bps - 1))) /* power of two */
+  if (bps < 256 || bps > 4096 || (bps & (bps - 1)))
     return -1;
 
   uint32_t spc;
@@ -803,7 +718,7 @@ static int parse_boot(struct ntfs_mount *m, const uint8_t *bs)
   if (spc_raw <= 0x80) {
     spc = spc_raw;
     if (spc & (spc - 1))
-      return -1; /* power of two */
+      return -1;
   } else {
     uint32_t shift = 256u - spc_raw;
     if (shift > 24)
@@ -841,11 +756,9 @@ static int parse_boot(struct ntfs_mount *m, const uint8_t *bs)
   return 0;
 }
 
-/* ----------------------------------------------------------------- vtable */
-
 static void *ntfs_probe(blk_read_fn read, blk_write_fn write)
 {
-  (void)write; /* read-only */
+  (void)write;
   if (!read)
     return NULL;
 
@@ -863,8 +776,7 @@ static void *ntfs_probe(blk_read_fn read, blk_write_fn write)
     return NULL;
   }
 
-  /* Read $MFT record 0 directly from the boot-sector MFT LCN, then decode its
-   * $DATA runlist so every other record resolves through the MFT proper. */
+  /* Read $MFT record 0 from the boot-sector LCN, then decode its runlist for the rest. */
   uint64_t mft0_off = (uint64_t)m->mft_lcn * m->bytes_per_cluster;
   if (read_mft_record_at(m, mft0_off, m->rec) != 0) {
     kfree(m);
@@ -919,12 +831,11 @@ static int op_read_at(void *inst, const char *path, uint32_t off, void *buf, uin
   int d;
   uint64_t sz;
   if (resolve(m, path, m->dir_rec, &d, &sz) != 0 || d)
-    return -1; /* absent or a directory */
+    return -1;
   return read_data(m, m->dir_rec, off, buf, len);
 }
 
-/* enum_dir / list share one walk. Context records either a target index or
- * print mode, and skips "." plus $-prefixed system metafiles. */
+/* enum_dir and list share one walk (index or print mode); skips "." and $-prefixed metafiles. */
 struct list_ctx {
   int want_idx; /* >=0 = the index to return; -1 = print mode    */
   int seen;
@@ -954,7 +865,7 @@ static int list_cb(void *vctx, const struct index_entry *e)
       fsz = (uint32_t)data_size(c->m, c->m->rec);
   }
 
-  if (c->want_idx < 0) { /* print mode */
+  if (c->want_idx < 0) {
     con_write(isd ? "  <DIR>  " : "         ");
     if (!isd) {
       con_printf("%u  ", fsz);
@@ -964,7 +875,7 @@ static int list_cb(void *vctx, const struct index_entry *e)
     con_printf("%s\n", e->name);
     return 0;
   }
-  if (c->seen == c->want_idx) { /* index mode */
+  if (c->seen == c->want_idx) {
     int j = 0;
     for (; j < (int)NTFS_MAX_NAME && e->name[j]; j++)
       c->name[j] = e->name[j];

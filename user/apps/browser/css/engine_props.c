@@ -1,7 +1,6 @@
 #include "engine_int.h"
 
-/* ------------------------------------------------ declarations -------------
- */
+/* declarations */
 void css_style_reset(struct css_style *s)
 {
   s->color = s->bg = -1;
@@ -66,9 +65,7 @@ void css_style_reset(struct css_style *s)
   s->fam[0] = '\0';
 }
 
-/* Copy the FIRST font-family name from a value (up to a comma) into out[cap],
- * dequoted and lowercased. Used for an @font-face's own font-family (one name).
- */
+/* First font-family name of a value, dequoted and lowercased, into out[cap]. */
 void first_family(const char *v, char *out, int cap)
 {
   while (*v == ' ' || *v == '\t')
@@ -91,17 +88,13 @@ void first_family(const char *v, char *out, int cap)
   out[k] = '\0';
 }
 
-/* Copy a whole font-family VALUE — the comma-separated fallback stack — into
- * out[cap]: each name dequoted + lowercased + space-trimmed, names joined by a
- * single comma (e.g. `"Helvetica Neue",Arial,sans-serif` -> `helvetica neue,
- * arial,sans-serif`). The browser walks this list and uses the first available
- * face, resolving generic keywords (sans-serif/system-ui/monospace/...). */
+/* Whole font-family stack into out[cap]: names dequoted, lowercased, trimmed, comma-joined. */
 void copy_family_stack(const char *v, char *out, int cap)
 {
   int k = 0;
   while (*v && k < cap - 1) {
     while (*v == ' ' || *v == '\t' || *v == ',')
-      v++; /* skip separators */
+      v++;
     if (!*v || *v == ';')
       break;
     char q = 0;
@@ -120,14 +113,14 @@ void copy_family_stack(const char *v, char *out, int cap)
       v++;
     }
     while (k > start && (out[k - 1] == ' ' || out[k - 1] == '\t'))
-      k--; /* trim */
+      k--;
     while (*v == ' ' || *v == '\t')
       v++;
     if (*v == ',' && k > start && k < cap - 1)
-      out[k++] = ','; /* join */
+      out[k++] = ',';
   }
   if (k > 0 && out[k - 1] == ',')
-    k--; /* no trailing comma */
+    k--;
   out[k] = '\0';
 }
 
@@ -138,8 +131,7 @@ bool ends_ci(const char *s, const char *suf)
   return sl >= fl && streq_ci(s + sl - fl, suf);
 }
 
-/* Lowercased-compare a span [a,ae) against a NUL-terminated lowercase literal.
- */
+/* Lowercased-compare a span [a,ae) against a NUL-terminated lowercase literal. */
 bool span_is(const char *a, const char *ae, const char *lit)
 {
   while (a < ae && *lit && lower(*a) == *lit) {
@@ -149,8 +141,7 @@ bool span_is(const char *a, const char *ae, const char *lit)
   return a == ae && !*lit;
 }
 
-/* justify-content keyword -> enum css_justify (longest/most-specific first so
- * "flex-start" isn't mistaken for the "start" suffix of nothing, etc.). */
+/* justify-content keyword -> enum css_justify. */
 signed char parse_justify(const char *v)
 {
   if (has_ci(v, "space-between"))
@@ -166,8 +157,7 @@ signed char parse_justify(const char *v)
   return CSS_JUST_START; /* flex-start / start / left / normal */
 }
 
-/* align-items keyword -> enum css_align (baseline approximated as start/top).
- */
+/* align-items keyword -> enum css_align (baseline approximated as start/top). */
 signed char parse_align(const char *v)
 {
   if (has_ci(v, "center"))
@@ -179,8 +169,7 @@ signed char parse_align(const char *v)
   return CSS_ALIGN_STRETCH; /* stretch / normal */
 }
 
-/* `gap: <row> [<col>]` (also row-gap/column-gap longhands handled by the
- * caller). */
+/* `gap: <row> [<col>]`; row-gap/column-gap longhands are handled by the caller. */
 /* Copy a token span [a,b) into a bounded, NUL-terminated stack buffer. */
 static void tok_copy(const char *a, const char *b, char *buf, int cap)
 {
@@ -190,9 +179,7 @@ static void tok_copy(const char *a, const char *b, char *buf, int cap)
   buf[k] = '\0';
 }
 
-/* Classify one grid track token ("100px" / "1fr" / "20%" / "auto" / min-/max-
- * content) into *t. Unrecognised tokens fall back to an auto (content) track.
- */
+/* Classify one grid track token into *t; unrecognised tokens become an auto track. */
 static void parse_track_token(const char *a, const char *b, struct css_track *t)
 {
   char buf[32];
@@ -221,11 +208,9 @@ static void parse_track_token(const char *a, const char *b, struct css_track *t)
     t->kind = CSS_TRK_PX;
     t->v = (short)px;
   }
-  /* else: leave as auto */
 }
 
-/* Parse a grid track list ("100px 1fr auto repeat(3, 1fr) 20%") into out[max],
- * expanding repeat(<count>, <tracks>). Returns the number of tracks emitted. */
+/* Parse a grid track list into out[max], expanding repeat(); returns the track count. */
 int parse_tracks(const char *v, struct css_track *out, int max)
 {
   int n = 0;
@@ -284,8 +269,7 @@ int parse_tracks(const char *v, struct css_track *out, int max)
   return n;
 }
 
-/* grid-column / grid-row -> a span count (>=1). Handles `span <n>`, `<a> / <b>`
- * (span = b-a), `<a> / span <n>`, and bare/auto (span 1). */
+/* grid-column / grid-row -> span count (>=1): `span <n>`, `<a> / <b>`, `<a> / span <n>`, auto. */
 signed char parse_grid_span(const char *v)
 {
   while (*v == ' ')
@@ -349,8 +333,7 @@ void parse_gap(const char *v, struct css_style *o)
   }
 }
 
-/* `flex: none | auto | <grow> [<shrink>] [<basis>]`. A unitless token is grow
- * then shrink; a token carrying a unit/percent (or auto) is the basis. */
+/* `flex: none | auto | <grow> [<shrink>] [<basis>]`; a unit/percent/auto token is the basis. */
 void parse_flex_shorthand(const char *v, struct css_style *o)
 {
   const char *f = v;
@@ -417,10 +400,7 @@ void parse_flex_shorthand(const char *v, struct css_style *o)
     o->flex_shrink = 1;
 }
 
-/* box-shadow: parse the FIRST layer's "[inset] dx dy [blur] [spread] color"
- * into o. inset (inner) shadows aren't drawn — skipped. A missing colour
- * defaults to a soft black, the usual look. Lengths are signed px (units beyond
- * px are ignored). */
+/* box-shadow: first layer only; inset shadows skipped, missing colour is soft black, px only. */
 static bool sh_is_len(const char *t) { return (*t >= '0' && *t <= '9') || *t == '-' || *t == '+' || *t == '.'; }
 static int sh_len(const char *t)
 {
@@ -492,8 +472,7 @@ void parse_box_shadow(const char *v, struct css_style *o)
   }
 }
 
-/* list-style[-type]: the marker shape/number style. Returns CSS_LST_DEFAULT
- * when the value names no type keyword (e.g. a bare `list-style: inside`). */
+/* list-style[-type] marker style; CSS_LST_DEFAULT when the value names no type. */
 signed char parse_list_style(const char *v)
 {
   if (has_ci(v, "decimal-leading-zero"))
@@ -519,8 +498,7 @@ signed char parse_list_style(const char *v)
   return CSS_LST_DEFAULT;
 }
 
-/* list-style[-position]: inside/outside. Returns CSS_LSP_DEFAULT when the value
- * names no position keyword (e.g. a bare `list-style: square`). */
+/* list-style[-position]; CSS_LSP_DEFAULT when the value names no position. */
 signed char parse_list_position(const char *v)
 {
   if (has_ci(v, "inside"))
@@ -530,10 +508,7 @@ signed char parse_list_position(const char *v)
   return CSS_LSP_DEFAULT;
 }
 
-/* line-height: normal -> unset; a unitless multiplier -> lh_pct = N*100; a
- * length
- * -> px; a percent -> lh_pct. The unset case leaves the renderer's font-derived
- * height. */
+/* line-height: normal -> unset; unitless -> lh_pct = N*100; length -> px; percent -> lh_pct. */
 void parse_line_height(const char *v, struct css_style *o)
 {
   while (*v == ' ' || *v == '\t')
@@ -568,11 +543,7 @@ void parse_line_height(const char *v, struct css_style *o)
   }
 }
 
-/* font-size: the CSS absolute/relative keyword scale (most-specific first),
- * else a length/percent. em/rem resolve via parse_len2 (rem against the 16px
- * root; em approximated likewise, since no element-local size is tracked).
- * smaller/larger map to a percent of the inherited size. Leaves *o untouched if
- * unparseable. */
+/* font-size: keyword scale, else length/percent; em approximated as rem; *o untouched on failure. */
 void parse_font_size(const char *v, struct css_style *o)
 {
   if (has_ci(v, "xx-small"))
@@ -603,11 +574,7 @@ void parse_font_size(const char *v, struct css_style *o)
   }
 }
 
-/* Does the whitespace-delimited token at p read as the `font` shorthand's
- * font-size, as opposed to a preceding numeric font-weight like `400`? A
- * font-size carries a unit, a decimal point, a percent, or a `/line-height`; a
- * bare 100..900 integer is a weight. Size keywords are matched by the caller.
- */
+/* Does the token at p read as the `font` shorthand's size rather than a numeric weight like `400`? */
 static bool font_tok_is_size(const char *p)
 {
   int digits = 0;
@@ -629,11 +596,7 @@ static bool font_tok_is_size(const char *p)
   return false;  /* bare integer: a weight */
 }
 
-/* The `font` shorthand: `[ style || variant || weight || stretch ]? size[/lh]
- * family`, plus the system-font keywords (caption/menu/…). Per spec the
- * shorthand resets its longhands, so an omitted style/variant/weight becomes
- * normal (not inherited) — but only once a valid font-size + family have been
- * recognised; a value we can't parse leaves the style untouched. */
+/* The `font` shorthand; resets omitted longhands only once a valid size and family parse. */
 void parse_font_shorthand(const char *v, struct css_style *out)
 {
   while (*v == ' ' || *v == '\t')
@@ -721,8 +684,7 @@ void parse_font_shorthand(const char *v, struct css_style *out)
   out->bold = (bold >= 0) ? bold : 0;
 }
 
-/* opacity: a 0..1 number (or an N% form) -> 0..100 percent, -1 if unparseable.
- */
+/* opacity: 0..1 number or N% -> 0..100, -1 if unparseable. */
 signed char parse_opacity(const char *v)
 {
   while (*v == ' ' || *v == '\t')

@@ -16,9 +16,7 @@
 
 #define HTML_BASE_FONT 16
 
-/* Current text style. The walk saves/restores it around each element (via the C
- * call stack), so style nesting needs no explicit stack. fg is a full 0xRRGGBB.
- */
+/* Current text style */
 struct sty {
   unsigned fg;
   unsigned char bold, under, italic, strike, nowrap, ttx, smallcaps;

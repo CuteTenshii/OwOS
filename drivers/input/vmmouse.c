@@ -1,10 +1,5 @@
-/* vmmouse.c — VMware absolute pointer over the hypervisor backdoor. See header.
- *
- * The protocol rides three backdoor commands: COMMAND (enable / pick absolute
- * or relative mode), STATUS (how many dwords are queued), and DATA (pull
- * dwords). A pointer packet is four dwords: flags/buttons, absolute X, absolute
- * Y, and a signed wheel delta. Absolute X/Y arrive in [0,0xFFFF] regardless of
- * resolution and we scale them onto the screen. */
+/* vmmouse.c: VMware absolute pointer over the hypervisor backdoor. See header.
+ * A packet is four dwords: flags/buttons, absolute X, absolute Y (0..0xFFFF), signed wheel. */
 
 #include "vmmouse.h"
 #include "vmware.h"
@@ -16,17 +11,14 @@
 #define ABSPOINTER_STATUS 40
 #define ABSPOINTER_COMMAND 41
 
-/* Sub-commands passed in EBX to ABSPOINTER_COMMAND. READ_ID queues the protocol
- * version word (the handshake we verify); REQUEST_ABSOLUTE makes the device the
- * active pointer and switches it to absolute coordinates. */
+/* EBX sub-commands: READ_ID queues the version word, REQUEST_ABSOLUTE selects absolute mode. */
 #define CMD_READ_ID 0x45414552u
 #define CMD_REQUEST_ABSOLUTE 0x53424152u
 
-#define VERSION_ID 0x3442554au   /* what READ_ID then DATA(1) yields             */
-#define STATUS_ERROR 0xFFFF0000u /* STATUS reads this when the device wedged      */
+#define VERSION_ID 0x3442554au
+#define STATUS_ERROR 0xFFFF0000u
 
-/* Set in a packet's flags dword when EBX/ECX carry relative deltas, not an
- * absolute position — VMware emits these on focus/grab transitions. */
+/* Packet flag: EBX/ECX carry relative deltas (VMware sends these on focus/grab). */
 #define RELATIVE_PACKET 0x00010000u
 
 /* Button bits in a packet's flags dword. */
@@ -39,9 +31,7 @@ static int bound_x, bound_y;
 
 bool vmmouse_active(void) { return enabled; }
 
-/* Rescale absolute coordinates onto a new screen size (after a resolution
- * change). The device keeps reporting in [0,0xFFFF]; only the target box moves.
- */
+/* Rescale absolute coordinates after a resolution change. */
 void vmmouse_set_bounds(int max_x, int max_y)
 {
   bound_x = max_x;
@@ -58,8 +48,7 @@ int vmmouse_init(int max_x, int max_y)
 
   struct vmware_regs r = {0};
 
-  /* Kick off the version handshake: READ_ID queues the protocol version, then
-   * STATUS must report it queued and DATA(1) must yield the version word. */
+  /* Version handshake: READ_ID, STATUS must report queued, DATA(1) yields the version. */
   r.ebx = CMD_READ_ID;
   vmware_send(ABSPOINTER_COMMAND, &r);
 
@@ -73,7 +62,6 @@ int vmmouse_init(int max_x, int max_y)
   if (r.eax != VERSION_ID)
     return -1;
 
-  /* Ask for absolute coordinates (the default after enable is relative). */
   r.ebx = CMD_REQUEST_ABSOLUTE;
   vmware_send(ABSPOINTER_COMMAND, &r);
 
@@ -89,7 +77,7 @@ bool vmmouse_poll(int *x, int *y, int *btn, int *dz)
   struct vmware_regs r = {0};
   r.ebx = 0;
   vmware_send(ABSPOINTER_STATUS, &r);
-  if (r.eax == STATUS_ERROR) { /* device fell over: stop using it        */
+  if (r.eax == STATUS_ERROR) {
     enabled = false;
     return false;
   }
@@ -98,10 +86,7 @@ bool vmmouse_poll(int *x, int *y, int *btn, int *dz)
   if (words < 4)
     return false;
 
-  /* Drain whole 4-dword packets; the last one read wins for position/buttons,
-   * wheel deltas accumulate. x and y come in holding the current cursor
-   * position (mouse.c seeds them), which we update in place — so a relative
-   * packet adds to it rather than starting from zero. */
+  /* Drain 4-dword packets; x/y hold the current cursor and are updated in place. */
   int wheel = 0;
   bool updated = false;
   int px = *x, py = *y;
@@ -120,10 +105,7 @@ bool vmmouse_poll(int *x, int *y, int *btn, int *dz)
       b |= 4;
     *btn = b;
 
-    /* The device can emit a *relative* packet on a focus/grab transition even
-     * in absolute mode (VMware does this on click-to-enter). EBX/ECX are then
-     * signed deltas, not [0,0xFFFF] absolutes — scaling them as absolute would
-     * snap the cursor to the top-left ("teleport"). Honor the flag. */
+    /* Relative packet (focus/grab): EBX/ECX are signed deltas; scaling them as absolute teleports the cursor. */
     if (flags & RELATIVE_PACKET) {
       px += (int)(int32_t)r.ebx;
       py += (int)(int32_t)r.ecx;
@@ -144,9 +126,7 @@ bool vmmouse_poll(int *x, int *y, int *btn, int *dz)
   }
   *x = px;
   *y = py;
-  /* VMware reports +toward-the-user (like the raw PS/2 wheel byte); negate so
-   * the delta follows the kernel's +up/-down WEV_SCROLL convention, matching
-   * what mouse.c's PS/2 path does before it adds the delta. */
+  /* VMware wheel is +toward-user; negate to match the kernel's +up WEV_SCROLL. */
   *dz = -wheel;
   return updated;
 }

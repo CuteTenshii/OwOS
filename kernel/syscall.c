@@ -1,7 +1,4 @@
-/* syscall.c — dispatch system calls from user programs.
- *
- * ABI: eax = call number, ebx/ecx/edx = arguments, return value in eax.
- */
+/* syscall.c: dispatch user system calls. ABI: eax = number, ebx/ecx/edx = args, result in eax. */
 
 #include "syscall.h"
 #include "ahci.h"
@@ -61,21 +58,14 @@
 #include "uwin.h"
 #include <stdint.h>
 
-/* Build stamp for SYS_UNAME's release/version; the Makefile passes it, this is
- * the fallback so a stray build path still compiles. */
+/* Build stamp for SYS_UNAME; the Makefile passes it, this is the fallback. */
 #ifndef OWOS_VERSION
 #define OWOS_VERSION "dev"
 #endif
 
-/* Net transports are general sockets: SYS_NET_CONNECT's `proto` arg selects
- * TCP/TLS/UDP/raw-ICMP, so ping/dig/resolve are libs over sockets, not
- * bespoke syscalls. */
+/* Net transports are sockets: SYS_NET_CONNECT's `proto` selects TCP/TLS/UDP/raw-ICMP. */
 
-/* Turn a user-supplied name into an absolute owofs path: an absolute name
- * ("/foo/bar") passes through; a relative one is joined onto the calling
- * process's cwd, so `curl -o out.txt` (and any program's readfile/writefile)
- * lands in the directory the user is actually in. owofs resolves "." / ".." in
- * the result, so the join can be naive. */
+/* Make a user-supplied name an absolute owofs path; relative names join the caller's cwd. */
 void join_cwd(const char *name, char *out, int outsz)
 {
   int n = 0;
@@ -91,10 +81,7 @@ void join_cwd(const char *name, char *out, int outsz)
   out[n] = '\0';
 }
 
-/* Read a file by `name` (resolved against the cwd), falling back to /bin/<name>
- * when a relative name isn't found -- the same PATH-style lookup the shell
- * does, so a program can read or run another by bare name (fork+run "curl" ->
- * /bin/curl). */
+/* Read a file by `name` (cwd-relative), falling back to /bin/<name> like the shell's PATH lookup. */
 int read_with_path(const char *name, void *buf, uint32_t max)
 {
   char abs[SYS_PATH_MAX];
@@ -114,8 +101,7 @@ int read_with_path(const char *name, void *buf, uint32_t max)
   return n;
 }
 
-/* Resolve `name` (cwd-relative, then /bin) to an absolute owofs path that
- * exists; fills `out`, returns 0 / -1. */
+/* Resolve `name` (cwd-relative, then /bin) to an existing absolute owofs path in `out`; 0 / -1. */
 int resolve_path(const char *name, char *out, int outcap)
 {
   uint32_t sz;
@@ -134,9 +120,7 @@ int resolve_path(const char *name, char *out, int outcap)
   return fs_stat(out, 0, &sz, 0) == 0 ? 0 : -1;
 }
 
-/* pread: read up to `len` bytes at byte `off`. Clamps to the file size and
- * returns a short count (0 = EOF), so a program can stream a file far
- * larger than its 1.5 MiB window — e.g. an image viewer decoding a big PNG. */
+/* pread: read up to `len` bytes at `off`; short count clamped to file size, 0 = EOF. */
 int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t len)
 {
   char abs[SYS_PATH_MAX];
@@ -144,24 +128,19 @@ int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t len)
   if (resolve_path(name, abs, sizeof abs) != 0)
     return -1;
   if (fs_stat(abs, 0, &size, 0) != 0)
-    return -1; /* missing/unstattable: not EOF, an error
-                * (fs_stat leaves *size untouched on
-                * failure — reading it was a UB bug that
-                * hung on tmpfs where the garbage was big) */
+    return -1; /* missing/unstattable: not EOF, an error (fs_stat leaves *size untouched on failure, reading it was a UB
+                  bug that hung on tmpfs where the garbage was big) */
   if (off >= size)
-    return 0; /* EOF                                  */
+    return 0; /* EOF */
   if (len > size - off)
     len = size - off;
   return fs_read_at(abs, off, buf, len);
 }
 
-/* A user pointer must stay entirely within the user region, or we refuse
- * the call -- otherwise a program could make the kernel touch its memory. */
-extern void isr128(void); /* the int 0x80 stub (isr.S)               */
+/* A user pointer must lie entirely within the user region, else refuse the call. */
+extern void isr128(void); /* the int 0x80 stub (isr.S) */
 
-/* Unix seconds (UTC) -> civil date/time (Howard Hinnant's days-from-civil
- * inverse). Any time source can drive SYS_SETRTC; rtc_set wants broken-down
- * fields, so the conversion lives here rather than in each caller. */
+/* Unix seconds (UTC) to civil date/time (Hinnant's civil-from-days), for SYS_SETRTC. */
 void epoch_to_rtc(uint32_t secs, struct rtc_time *t)
 {
   uint32_t days = secs / 86400u, rem = secs % 86400u;
@@ -169,15 +148,15 @@ void epoch_to_rtc(uint32_t secs, struct rtc_time *t)
   t->min = (uint8_t)((rem % 3600u) / 60u);
   t->sec = (uint8_t)(rem % 60u);
 
-  uint32_t z = days + 719468u; /* shift epoch to 0000-03-01       */
+  uint32_t z = days + 719468u; /* shift epoch to 0000-03-01 */
   uint32_t era = z / 146097u;
-  uint32_t doe = z - era * 146097u; /* [0, 146096]     */
+  uint32_t doe = z - era * 146097u; /* [0, 146096] */
   uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
   uint32_t y = yoe + era * 400u;
-  uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u); /* [0, 365]    */
-  uint32_t mp = (5u * doy + 2u) / 153u;                      /* [0, 11]     */
-  uint32_t d = doy - (153u * mp + 2u) / 5u + 1u;             /* [1, 31]      */
-  uint32_t m = mp < 10u ? mp + 3u : mp - 9u;                 /* [1, 12]      */
+  uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u); /* [0, 365] */
+  uint32_t mp = (5u * doy + 2u) / 153u;                      /* [0, 11] */
+  uint32_t d = doy - (153u * mp + 2u) / 5u + 1u;             /* [1, 31] */
+  uint32_t m = mp < 10u ? mp + 3u : mp - 9u;                 /* [1, 12] */
 
   t->day = (uint8_t)d;
   t->month = (uint8_t)m;

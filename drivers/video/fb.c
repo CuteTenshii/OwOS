@@ -14,7 +14,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* DISPI index/data ports and register indices. */
 #define VBE_DISPI_INDEX 0x01CE
 #define VBE_DISPI_DATA 0x01CF
 #define VBE_DISPI_ID 0x0
@@ -40,8 +39,7 @@ static bool active;
 static bool single;   /* 1 when there is no back buffer (draw direct)   */
 static bool can_mode; /* 1 = DISPI path: the mode can be reprogrammed   */
 
-/* Modes for runtime switching (DISPI only). Buffers are sized for the largest at
- * init, so a switch is just a reprogram. Keep the largest entry last. */
+/* Runtime-switchable modes (DISPI only); buffers are sized for the largest, keep it last. */
 static const struct {
   uint16_t w, h;
 } fb_modes[] = {
@@ -52,18 +50,15 @@ static const struct {
 #define FB_MAX_W 1920u
 #define FB_MAX_H 1080u
 
-/* Display brightness, FB_BRIGHT_MIN..FB_BRIGHT_MAX (max = undimmed). Applied as
- * a per-channel scale when the back buffer is copied to the visible screen. */
+/* Display brightness FB_BRIGHT_MIN..FB_BRIGHT_MAX (max = undimmed), a per-channel scale on present. */
 static int brightness = FB_BRIGHT_MAX;
 
-/* Compositor frame-pacing target (Hz), not a hardware mode. Set via
- * /sys/class/graphics/fb0/rate and polled by /bin/compositor; the upper end isn't enforced. */
+/* Compositor frame-pacing target in Hz (not a hardware mode); set via /sys/class/graphics/fb0/rate. */
 #define FB_HZ_MIN 20
 #define FB_HZ_MAX 240
 static int target_hz = 60;
 
-/* Scale a back-buffer pixel by the current brightness (a >>3 since
- * FB_BRIGHT_MAX is 8). Red and blue share one multiply in 16-bit lanes. */
+/* Scale a pixel by brightness (>>3, MAX is 8); red and blue share one multiply in 16-bit lanes. */
 static inline uint32_t dim_px(uint32_t p)
 {
   uint32_t k = (uint32_t)brightness;
@@ -72,17 +67,14 @@ static inline uint32_t dim_px(uint32_t p)
   return rb | g;
 }
 
-/* 32-bpp run fill (`rep stosl`): a solid-colour row is the inner loop of every
- * rect fill, so a scalar per-pixel store at -O1 wasted most of a full-screen
- * clear. memset can't do this (it broadcasts a byte, not a 32-bit pixel). */
+/* 32-bpp run fill (rep stosl); memset cannot broadcast a 32-bit pixel. */
 static inline void fill32(uint32_t *d, uint32_t v, int n)
 {
   int d0, d1;
   __asm__ volatile("rep ; stosl" : "=&D"(d0), "=&c"(d1) : "a"(v), "0"(d), "1"(n) : "memory");
 }
 
-/* Bounding box of everything drawn since the last present; fb_present copies only
- * this to VRAM (slow on real hardware). Empty when dirty_x1 <= dirty_x0. */
+/* Damage box since the last present; empty when dirty_x1 <= dirty_x0. */
 static int dirty_x0, dirty_y0, dirty_x1, dirty_y1;
 
 /* Intersect (x,y,w,h) with the screen into out[], returns 0 if empty. */
@@ -108,7 +100,7 @@ static bool clip(int x, int y, int w, int h, int *ox, int *oy, int *ow, int *oh)
 /* Grow the damage box to include the (already clipped) rectangle. */
 static void mark(int x, int y, int w, int h)
 {
-  if (dirty_x1 <= dirty_x0) { /* was empty                        */
+  if (dirty_x1 <= dirty_x0) {
     dirty_x0 = x;
     dirty_y0 = y;
     dirty_x1 = x + w;
@@ -127,13 +119,12 @@ static void mark(int x, int y, int w, int h)
 
 static void alloc_backbuffer(void);
 
-/* Optional flush hook for paravirtual adapters (VMware SVGA II), called per rect copied to the framebuffer. */
+/* Optional per-rect flush hook for paravirtual adapters (VMware SVGA II). */
 static void (*present_hook)(int, int, int, int);
 
 void fb_set_present_hook(void (*cb)(int, int, int, int)) { present_hook = cb; }
 
-/* Make the framebuffer write-combining (PAT entry 1) so stores batch into bursts
- * instead of uncached bus transactions. Harmless under QEMU. */
+/* Make the framebuffer write-combining (PAT entry 1). Harmless under QEMU. */
 static void enable_wc(void)
 {
   uint32_t a, b, c, d;
@@ -141,20 +132,16 @@ static void enable_wc(void)
   if (!(d & (1u << 16))) /* CPUID.01H:EDX.PAT, no PAT, give up      */
     return;
 
-  /* Read IA32_PAT (MSR 0x277), set entry 1 (PA1) to WC (0x01), write it back.
-   * Editing only PA1 preserves whatever the firmware set for the rest. */
+  /* Set PAT entry 1 (MSR 0x277) to WC (0x01), leaving the firmware's other entries intact. */
   uint32_t lo, hi;
   __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x277));
   lo = (lo & ~0x0000FF00u) | (0x01u << 8);
   __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0x277));
 
-  /* Drop any cached lines for the framebuffer, then switch it to WC. */
   __asm__ volatile("wbinvd" ::: "memory");
   paging_mark_wc((uint32_t)(uintptr_t)front, fb_cap * 4);
 
-  /* PAT alone isn't enough on real UEFI hardware: a firmware MTRR can mark the
-   * framebuffer UC, which overrides PAT-WC and leaves every store slow. Pin the
-   * range WC with a variable MTRR too (no-op under QEMU / without MTRRs). */
+  /* A firmware MTRR marking the fb UC overrides PAT-WC; also pin the range WC (no-op on QEMU). */
   mtrr_set_wc((uint32_t)(uintptr_t)front, fb_cap * 4);
 }
 
@@ -170,9 +157,7 @@ static uint16_t dispi_read(uint16_t index)
   return inw(VBE_DISPI_DATA);
 }
 
-/* Find the linear framebuffer's physical base: the first PCI display
- * controller's BAR0 (a prefetchable memory BAR on stdvga). Returns 0 if none.
- */
+/* Physical base of the first PCI display controller's BAR0, or 0 if none. */
 static uint32_t find_lfb_phys(void)
 {
   for (int bus = 0; bus < 256; bus++) {
@@ -181,12 +166,11 @@ static uint32_t find_lfb_phys(void)
       if ((id & 0xFFFF) == 0xFFFF)
         continue;
       uint32_t cls = pci_read32(bus, slot, 0, 0x08);
-      if (((cls >> 24) & 0xFF) != 0x03) /* display controller   */
+      if (((cls >> 24) & 0xFF) != 0x03)
         continue;
       uint32_t bar0 = pci_read32(bus, slot, 0, 0x10);
-      if (bar0 & 0x1) /* must be a memory BAR  */
+      if (bar0 & 0x1)
         continue;
-      /* Make sure the card decodes memory space and can master. */
       uint32_t cmd = pci_read32(bus, slot, 0, 0x04);
       pci_write32(bus, slot, 0, 0x04, cmd | 0x6);
       return bar0 & 0xFFFFFFF0u;
@@ -195,21 +179,18 @@ static uint32_t find_lfb_phys(void)
   return 0;
 }
 
-/* Adopt a bootloader-provided (GRUB/UEFI GOP) framebuffer. `pitch` is in bytes.
- * Only 32-bpp direct-RGB is supported. Returns 0, or -1. */
+/* Adopt a bootloader (GRUB/UEFI GOP) framebuffer; pitch in bytes, 32-bpp RGB only. 0 or -1. */
 int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32_t bpp)
 {
   if (bpp != 32 || phys == 0 || w == 0 || h == 0)
     return -1;
-  if (pitch_bytes & 0x3) /* must be 4-byte aligned    */
+  if (pitch_bytes & 0x3)
     return -1;
 
   uint32_t pitch_px = pitch_bytes / 4;
   uint32_t pixels = pitch_px * h;
 
-  /* Map the whole visible region (full pitch, all rows) into the address
-   * space. The framebuffer may live high in the physical map on real
-   * hardware; paging_identity_map allocates page tables as needed. */
+  /* Map the whole visible region; paging_identity_map allocates page tables as needed. */
   if (paging_identity_map(phys, pixels * 4) < 0)
     return -1;
   front = (uint32_t *)(uintptr_t)phys;
@@ -218,11 +199,11 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
   fb_h = h;
   fb_pitch = pitch_px;
   fb_pixels = pixels;
-  fb_cap = pixels;  /* a bootloader framebuffer is fixed-size        */
-  can_mode = false; /* cannot reprogram a GOP/adopted framebuffer    */
+  fb_cap = pixels;
+  can_mode = false;
 
-  enable_wc();        /* write-combining on the framebuffer          */
-  alloc_backbuffer(); /* off-screen buffer in cached RAM              */
+  enable_wc();
+  alloc_backbuffer();
 
   active = true;
   fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
@@ -230,8 +211,7 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
   return 0;
 }
 
-/* Back buffer in cached RAM (VRAM reads are glacial): a contiguous PMM run above
- * the 16 MiB identity map. Falls back to single-buffered if none is available. */
+/* Cached-RAM back buffer (VRAM reads are slow); falls back to single-buffered. */
 static void alloc_backbuffer(void)
 {
   uint32_t bytes = fb_cap * 4;
@@ -240,7 +220,7 @@ static void alloc_backbuffer(void)
     fb = (uint32_t *)(uintptr_t)bb;
     single = false;
   } else {
-    fb = front; /* last resort: draw directly to VRAM           */
+    fb = front;
     single = true;
   }
 }
@@ -256,7 +236,6 @@ int fb_init(uint32_t want_w, uint32_t want_h)
   if (!lfb)
     return -1;
 
-  /* Program the mode: disable, set geometry, re-enable with the LFB. */
   dispi_write(VBE_DISPI_ENABLE, 0);
   dispi_write(VBE_DISPI_XRES, (uint16_t)want_w);
   dispi_write(VBE_DISPI_YRES, (uint16_t)want_h);
@@ -267,7 +246,6 @@ int fb_init(uint32_t want_w, uint32_t want_h)
   dispi_write(VBE_DISPI_YOFF, 0);
   dispi_write(VBE_DISPI_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED);
 
-  /* Confirm the adapter accepted the geometry we asked for. */
   if (dispi_read(VBE_DISPI_XRES) != (uint16_t)want_w || dispi_read(VBE_DISPI_YRES) != (uint16_t)want_h) {
     dispi_write(VBE_DISPI_ENABLE, 0);
     return -1;
@@ -283,7 +261,6 @@ int fb_init(uint32_t want_w, uint32_t want_h)
   if (fb_cap < fb_pixels)
     fb_cap = fb_pixels;
 
-  /* Map the visible framebuffer (one copy), then a RAM back buffer. */
   if (paging_identity_map(lfb, fb_cap * 4) < 0)
     return -1;
   front = (uint32_t *)(uintptr_t)lfb;
@@ -291,7 +268,7 @@ int fb_init(uint32_t want_w, uint32_t want_h)
   alloc_backbuffer();
 
   active = true;
-  can_mode = true; /* DISPI: the mode can be reprogrammed at runtime */
+  can_mode = true;
   fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
   fb_present();
   return 0;
@@ -309,8 +286,7 @@ int fb_mode_get(int i, uint32_t *w, uint32_t *h)
   return 1;
 }
 
-/* Reprogram DISPI to an offered mode (buffers are already max-sized), clear and
- * present. Must run on the compositor thread (mutates fb_w/fb_h/fb_pitch). */
+/* Reprogram DISPI to an offered mode, clear and present. Compositor thread only. */
 int fb_set_mode(uint32_t w, uint32_t h)
 {
   if (!active || !can_mode)
@@ -325,7 +301,7 @@ int fb_set_mode(uint32_t w, uint32_t h)
   if (!known || w * h > fb_cap)
     return -1;
   if (w == fb_w && h == fb_h)
-    return 0; /* already there                  */
+    return 0;
 
   dispi_write(VBE_DISPI_ENABLE, 0);
   dispi_write(VBE_DISPI_XRES, (uint16_t)w);
@@ -337,7 +313,7 @@ int fb_set_mode(uint32_t w, uint32_t h)
   dispi_write(VBE_DISPI_YOFF, 0);
   dispi_write(VBE_DISPI_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED);
   if (dispi_read(VBE_DISPI_XRES) != (uint16_t)w || dispi_read(VBE_DISPI_YRES) != (uint16_t)h)
-    return -1; /* adapter rejected the geometry  */
+    return -1;
 
   fb_w = w;
   fb_h = h;
@@ -348,8 +324,7 @@ int fb_set_mode(uint32_t w, uint32_t h)
   return 0;
 }
 
-/* Copy [x,y,w,h) of the back buffer to VRAM, dimmed below max brightness. Rect
- * must be pre-clipped. Nothing to copy when single-buffered. */
+/* Copy [x,y,w,h) of the back buffer to VRAM, dimmed; rect must be pre-clipped. */
 static void copy_region(int x, int y, int w, int h)
 {
   if (single)
@@ -367,8 +342,7 @@ static void copy_region(int x, int y, int w, int h)
   }
 }
 
-/* Drain the write-combining buffer; without SFENCE small presents stayed
- * invisible on real hardware. */
+/* Drain the WC buffer; without SFENCE small presents stayed invisible on real hardware. */
 static void drain_wc(void)
 {
   if (!single)
@@ -390,14 +364,13 @@ void fb_present(void)
     int rw = dirty_x1 - dirty_x0, rh = dirty_y1 - dirty_y0;
     copy_region(rx, ry, rw, rh);
     drain_wc();
-    if (present_hook) /* paravirtual adapter (VMware SVGA II): flush the rect */
+    if (present_hook)
       present_hook(rx, ry, rw, rh);
   }
   dirty_x1 = dirty_x0;
 }
 
-/* Flush every rectangle of the back buffer with a single WC drain. Each rect is
- * clipped to the screen; a compositor supplies its own damage list. */
+/* Flush every back-buffer rect clipped to the screen with a single WC drain. */
 void fb_present_rects(const struct fb_rect *r, int n)
 {
   if (!active)
@@ -417,8 +390,7 @@ void fb_present_rects(const struct fb_rect *r, int n)
   }
 }
 
-/* Step brightness and re-render the whole screen from the back buffer (the WM only
- * presents damage). No-op in text mode or single-buffered. IRQ-safe. */
+/* Step brightness and re-render the whole screen (the WM only presents damage). IRQ-safe. */
 void fb_brightness_step(int dir)
 {
   if (!active || single)
@@ -440,8 +412,7 @@ int fb_active(void) { return active; }
 uint32_t fb_width(void) { return fb_w; }
 uint32_t fb_height(void) { return fb_h; }
 
-/* Compositor primitives (SYS_FB_*). The back buffer is identity-mapped, so its
- * physical base equals the pointer; 0 in text mode or single-buffered. */
+/* Compositor primitives (SYS_FB_*); back buffer is identity-mapped, 0 if text or single-buffered. */
 uint32_t fb_backbuffer_phys(void) { return (active && !single) ? (uint32_t)(uintptr_t)fb : 0; }
 
 uint32_t fb_backbuffer_bytes(void) { return fb_cap * 4u; }
@@ -453,7 +424,7 @@ void fb_dims(int *w, int *h, int *pitch, int *bpp)
   if (h)
     *h = (int)fb_h;
   if (pitch)
-    *pitch = (int)fb_pitch; /* pixels per row (stride) */
+    *pitch = (int)fb_pitch;
   if (bpp)
     *bpp = 32;
 }
@@ -507,8 +478,7 @@ void fb_glyph(int x, int y, unsigned char ch, uint32_t fg, uint32_t bg)
     for (int col = 0; col < cw; col++) {
       int sx = cx + col;
       unsigned a = cov[sx - x];
-      /* Transparent bg: blend the coverage straight over the pixel
-       * already in the (cached) back buffer; opaque bg: fg over bg. */
+      /* Transparent bg: blend over the cached back buffer pixel; opaque bg: fg over bg. */
       d[sx] = transparent ? blend(fg, d[sx], a) : blend(fg, bg, a);
     }
   }
@@ -521,9 +491,7 @@ void fb_text(int x, int y, const char *s, uint32_t fg, uint32_t bg)
     fb_glyph(x, y, (unsigned char)*s, fg, bg);
 }
 
-/* --- framebuffer boot console ---
- * Scrolling text console drawn to the framebuffer for the verbose boot log,
- * fed a char at a time by vga.c until the WM takes the framebuffer. */
+/* Framebuffer boot console: scrolling text fed a char at a time by vga.c until the WM takes over. */
 
 #define CON_MARGIN 4
 static int con_x = CON_MARGIN, con_y = CON_MARGIN;
@@ -566,7 +534,7 @@ void fb_con_putc(char c)
   }
   if (con_x + FONT_W > (int)fb_w)
     fb_con_newline();
-  fb_glyph(con_x, con_y, (unsigned char)c, 0x33ff66, 0x000000); /* green on black */
-  fb_present();                                                 /* copies just the glyph's damage rect          */
+  fb_glyph(con_x, con_y, (unsigned char)c, 0x33ff66, 0x000000);
+  fb_present();
   con_x += FONT_W;
 }

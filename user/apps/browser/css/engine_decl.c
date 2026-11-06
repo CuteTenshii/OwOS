@@ -1,9 +1,7 @@
 #include "engine_int.h"
 
-/* ------------------------------------------------ animation/transition -----
- */
-/* A CSS <time> in ms (`1.5s`, `300ms`); -1 if `s` isn't a time (unitless etc.).
- */
+/* animation/transition */
+/* A CSS <time> in ms; -1 if not a time. */
 static int parse_time_ms(const char *s, const char *e)
 {
   while (s < e && (*s == ' ' || *s == '\t'))
@@ -31,7 +29,7 @@ static int parse_time_ms(const char *s, const char *e)
   }
   if (!any)
     return -1;
-  if (p + 1 < e && (p[0] == 'm' || p[0] == 'M') && (p[1] == 's' || p[1] == 'S')) { /* ms */
+  if (p + 1 < e && (p[0] == 'm' || p[0] == 'M') && (p[1] == 's' || p[1] == 'S')) {
   } else if (p < e && (*p == 's' || *p == 'S'))
     n *= 1000.0;
   else
@@ -41,10 +39,7 @@ static int parse_time_ms(const char *s, const char *e)
   return (int)(n + 0.5);
 }
 
-/* A CSS <easing-function> keyword span -> enum css_easing, or -1 if
- * unrecognised. cubic-bezier()/steps() degrade to the nearest preset (we don't
- * carry params on the style; anim.c re-derives bezier control points from the
- * preset). */
+/* <easing-function> keyword -> enum css_easing, -1 if unknown; functions map to nearest preset. */
 static int parse_easing(const char *s, const char *e)
 {
   while (s < e && (*s == ' ' || *s == '\t'))
@@ -71,9 +66,7 @@ static int parse_easing(const char *s, const char *e)
   return -1;
 }
 
-/* A transition-property name span -> a mask of (1<<ANP_*) bits (a shorthand
- * like `margin` expands to all four sides). `all` -> TRANS_ALL, `none`/unknown
- * -> 0. */
+/* transition-property name -> (1<<ANP_*) mask; `all` -> TRANS_ALL, none/unknown -> 0. */
 static unsigned trans_prop_bit(const char *s, const char *e)
 {
   while (s < e && (*s == ' ' || *s == '\t'))
@@ -169,8 +162,7 @@ static int parse_anim_fill(const char *s, const char *e)
   return -1;
 }
 
-/* Split a value on top-level whitespace (never inside parentheses, so
- * `cubic-bezier(0, 0, 1, 1)` stays one token), calling `tok` per token. */
+/* Split on top-level whitespace (not inside parens), calling `tok` per token. */
 static void for_each_token(const char *s, const char *e, void (*tok)(const char *, const char *, void *), void *ud)
 {
   while (s < e) {
@@ -226,7 +218,6 @@ static void anim_token(const char *s, const char *e, void *ud)
     a->out->anim_iter = -1;
     return;
   }
-  /* a bare number is the iteration count */
   {
     const char *p = s;
     bool any = false;
@@ -253,7 +244,6 @@ static void anim_token(const char *s, const char *e, void *ud)
     a->out->anim_name[0] = '\0';
     return;
   }
-  /* otherwise the animation-name */
   if (!span_is(s, e, "running") && !span_is(s, e, "paused")) {
     int n = 0;
     const char *p = s;
@@ -373,8 +363,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
       out->bgi.size_h = sh;
     }
   }
-  /* background-attachment / -origin / -clip parse-and-ignore (no box-model
-     effect here) */
+  /* background-attachment / -origin / -clip: parsed and ignored */
   else if (span_is(p, pe, "background-attachment") || span_is(p, pe, "background-origin") ||
            span_is(p, pe, "background-clip")) {
   } else if (span_is(p, pe, "font-weight"))
@@ -617,17 +606,14 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
   else if (span_is(p, pe, "font"))
     parse_font_shorthand(val, out);
   else if (span_is(p, pe, "font-variant") || span_is(p, pe, "font-variant-caps")) {
-    /* only the caps axis is renderable (as an uppercase approximation); the
-     * ligature/numeric/east-asian/etc. sub-values are inert here. */
+    /* only the caps axis renders (as uppercase); other sub-values are inert */
     if (has_ci(val, "small-caps") || has_ci(val, "all-small-caps") || has_ci(val, "petite-caps") ||
         has_ci(val, "all-petite-caps") || has_ci(val, "unicase") || has_ci(val, "titling-caps"))
       out->small_caps = 1;
     else if (has_ci(val, "normal") || has_ci(val, "none"))
       out->small_caps = 0;
   }
-  /* Font longhands with no effect in this line-based renderer:
-   * parsed-and-ignored so they neither error nor fall through to an unrelated
-   * branch. */
+  /* Font longhands with no effect here: parsed and ignored. */
   else if (span_is(p, pe, "font-stretch") || span_is(p, pe, "font-kerning") ||
            span_is(p, pe, "font-feature-settings") || span_is(p, pe, "font-variation-settings") ||
            span_is(p, pe, "font-optical-sizing") || span_is(p, pe, "font-size-adjust") ||
@@ -657,10 +643,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     else if (has_ci(val, "normal"))
       out->white_space = CSS_WS_NORMAL;
   } else if (span_is(p, pe, "list-style")) {
-    /* shorthand: a type keyword and/or a position keyword, any order. The
-     * image component (none/url()) is captured by the type parse — a bare
-     * url() leaves the type at DEFAULT so the ul/ol default marker shows as
-     * the fallback, which is all this line-based renderer can draw. */
+    /* shorthand: type and/or position keyword, any order; bare url() leaves type DEFAULT. */
     out->list_style = parse_list_style(val);
     out->list_pos = parse_list_position(val);
   } else if (span_is(p, pe, "list-style-type"))
@@ -769,8 +752,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     if (fm >= 0)
       out->anim_fill = (signed char)fm;
   }
-  /* animation-play-state / -timeline parse-and-ignore (no paused state
-     modelled) */
+  /* animation-play-state / -timeline: parsed and ignored */
   else if (span_is(p, pe, "animation-play-state") || span_is(p, pe, "animation-timeline") ||
            span_is(p, pe, "-webkit-animation-play-state")) {
   } else if (span_is(p, pe, "transition") || span_is(p, pe, "-webkit-transition")) {

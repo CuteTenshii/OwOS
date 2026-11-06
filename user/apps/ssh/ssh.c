@@ -1,38 +1,11 @@
-/* ssh.c — a from-scratch SSH-2 client, entirely in user space.
- *
- *   ssh user@host [port]
- *
- * Opens a raw TCP socket (net_connect SK_TCP) and speaks SSH-2 over it: the
- * curve25519-sha256 key exchange, the aes128-gcm@openssh.com AEAD transport
- * cipher, password authentication, then a "session" channel with a pty and an
- * interactive remote shell. It is the SSH analogue of curl: the protocol lives
- * here, over the same net_* / stdio primitives every other CLI tool uses.
- *
- * Pragmatic scope, in the spirit of the kernel's TLS stack:
- *   - One cipher suite only: curve25519-sha256 KEX + aes128-gcm@openssh.com.
- *     Both reuse the user crypto lib (X25519 + SHA-256 + AES-128-GCM) that
- *     already backs the QUIC/TLS client, so no new primitives are needed.
- *   - The server host key signature is NOT verified (same deliberate trade-off
- *     as tls.c: resists passive eavesdropping, not an active MITM). We still
- *     hash the host key into the exchange hash, we just don't check its
- *     signature -- verifying ed25519/RSA would need SHA-512/bignum we don't
- * have.
- *   - Password auth only (prompted, no echo). One connection, in-order
- * delivery.
- *
- * The terminal runs ssh like a pty: it captures our stdout (rendered inline)
- * and wires our stdin to a pipe it feeds with the window's keystrokes
- * (spawn_cap_io
- * + render_child interactive mode). So fd 0 is the keyboard and fd 1 is the
- * screen, exactly as an SSH client expects.
- */
+/* ssh.c, a from-scratch SSH-2 client, entirely in user space */
 
 #include "crypto.h"
 #include "owos.h"
 #include "resolve.h"
 #include <stdbool.h>
 
-/* ---- SSH-2 message numbers (RFC 4253 / 4252 / 4254) ---------------------- */
+/* SSH-2 message numbers (RFC 4253 / 4252 / 4254) */
 #define MSG_DISCONNECT 1
 #define MSG_IGNORE 2
 #define MSG_UNIMPLEMENTED 3
@@ -66,24 +39,20 @@
 #define CLIENT_IDENT "SSH-2.0-OwOS_1.0"
 
 #define MAXPKT 40000           /* largest SSH packet we'll accept/build */
-#define LOCAL_WINDOW 0x100000u /* flow-control window we advertise      */
-#define LOCAL_MAXPKT 32768u    /* max channel-data payload we accept    */
+#define LOCAL_WINDOW 0x100000u /* flow-control window we advertise */
+#define LOCAL_MAXPKT 32768u    /* max channel-data payload we accept */
 
-/* ---- session state ------------------------------------------------------- */
+/* session state */
 
 static int sock = -1;
 static bool sock_dead;
 
-static unsigned char rxbuf[49152]; /* raw bytes pulled off the socket       */
+static unsigned char rxbuf[49152]; /* raw bytes pulled off the socket */
 static int rxlen;
 
 static unsigned char payload[MAXPKT]; /* the decoded payload of one packet */
 static unsigned char ptext[MAXPKT];   /* recv GCM plaintext / caller build scratch */
-static unsigned char sealbuf[MAXPKT]; /* send GCM plaintext (MUST be distinct from
-                                       * ptext: callers build the payload in ptext
-                                       * and pass it as send_packet's `pl`, so reusing
-                                       * ptext as the seal scratch would memcpy-overlap
-                                       * and corrupt the message). */
+static unsigned char sealbuf[MAXPKT]; /* send GCM plaintext */
 static unsigned char txbuf[MAXPKT + 64];
 
 static bool recv_encrypted;
@@ -91,12 +60,12 @@ static bool send_encrypted;
 static unsigned char send_key[16], recv_key[16];
 static unsigned char send_iv[12], recv_iv[12];
 
-/* Key-exchange artefacts kept for the exchange hash + key derivation. */
+/* Key-exchange artefacts kept for the exchange hash + key derivation */
 static unsigned char H[32], session_id[32];
 static unsigned char kmp[40];
 static int kmp_len; /* mpint(shared secret) */
 
-/* ---- little helpers ------------------------------------------------------ */
+/* little helpers */
 
 static void wb(unsigned char *d, int *p, unsigned v) { d[(*p)++] = (unsigned char)v; }
 static void w32(unsigned char *d, int *p, unsigned v)
@@ -134,7 +103,7 @@ static void incr_iv(unsigned char *iv) /* the GCM invocation counter */
 
 static void say(const char *s) { write(1, s, strlen(s)); }
 
-/* ---- socket byte stream -------------------------------------------------- */
+/* socket byte stream */
 
 static int sock_send_all(const unsigned char *b, int n)
 {
@@ -150,8 +119,7 @@ static int sock_send_all(const unsigned char *b, int n)
   return 0;
 }
 
-/* Pull whatever is available off the socket into rxbuf (non-blocking).
- * Returns bytes added, 0 would-block, -1 on EOF/error. */
+/* Pull whatever is available off the socket into rxbuf (non-blocking) */
 static int rx_pump(void)
 {
   if (rxlen >= (int)sizeof rxbuf)
@@ -177,19 +145,12 @@ static void rx_consume(int n)
   rxlen -= n;
 }
 
-/* ---- packet framing ------------------------------------------------------ */
+/* packet framing */
 
-/* Send one SSH packet carrying `pl[0..plen)` as its payload. Adds padding to a
- * cipher-block multiple and, once keys are installed, GCM-seals it. */
+/* Send one SSH packet carrying `pl[0..plen)` as its payload */
 static int send_packet(const unsigned char *pl, int plen)
 {
-  /* Padding makes a length multiple. RFC 4253 (cleartext "none" cipher, block
-   * 8): the multiple covers packet_length(4) + padding_length(1) + payload +
-   * padding -- the 4-byte length field is included. RFC 5647 (aes128-gcm, block
-   * 16): the length field is sent in clear and NOT counted, so only
-   * padding_length + payload + padding must be a multiple of 16. Getting the
-   * cleartext +4 wrong makes (packlen+4)%8 != 0, which OpenSSH rejects (it RSTs
-   * the connection without a DISCONNECT). Padding is at least 4 bytes. */
+  /* Padding makes a length multiple */
   int blk = send_encrypted ? 16 : 8;
   int lenfield = send_encrypted ? 0 : 4;
   int padlen = blk - ((lenfield + 1 + plen) % blk);
@@ -207,9 +168,7 @@ static int send_packet(const unsigned char *pl, int plen)
     return sock_send_all(txbuf, pos);
   }
 
-  /* aes128-gcm@openssh.com: the length is sent in clear and authenticated as
-   * AAD; padding_length||payload||padding is encrypted; a 16-byte tag follows.
-   */
+  /* aes128-gcm@openssh.com: the length is sent in clear and authenticated as AAD */
   unsigned char aad[4];
   int ap = 0;
   w32(aad, &ap, pktlen);
@@ -229,9 +188,7 @@ static int send_packet(const unsigned char *pl, int plen)
   return sock_send_all(txbuf, pos);
 }
 
-/* Try to decode one packet from rxbuf without blocking.
- * 1 = decoded into payload (+*plen) and consumed; 0 = need more bytes; -1 err.
- */
+/* Try to decode one packet from rxbuf without blocking */
 static int parse_one(int *plen)
 {
   if (rxlen < 4)
@@ -270,7 +227,7 @@ static int parse_one(int *plen)
   return 1;
 }
 
-/* Block (up to timeout_ms; -1 = forever) for one packet. 0 = ok, -1 = fail. */
+/* Block (up to timeout_ms; -1 = forever) for one packet */
 static int read_packet(int *plen, int timeout_ms)
 {
   unsigned start = msec();
@@ -308,9 +265,7 @@ static void print_disconnect(int plen)
   }
 }
 
-/* Read the next "interesting" packet, transparently skipping transport noise
- * (IGNORE/DEBUG/UNIMPLEMENTED) and reporting DISCONNECT. Returns the message
- * type (>0), or a negative on error. */
+/* Read the next "interesting" packet */
 static int recv_msg(int *plen, int timeout_ms)
 {
   for (;;) {
@@ -323,7 +278,7 @@ static int recv_msg(int *plen, int timeout_ms)
       print_disconnect(*plen);
       return -1;
     }
-    if (t == MSG_GLOBAL_REQUEST) { /* e.g. OpenSSH hostkeys-00@... */
+    if (t == MSG_GLOBAL_REQUEST) { /* e.g. OpenSSH hostkeys-00@ */
       int p = 1;
       unsigned n = r32(payload, &p);
       int wr = (p + (int)n < *plen) ? payload[p + (int)n] : 0;
@@ -337,13 +292,13 @@ static int recv_msg(int *plen, int timeout_ms)
   }
 }
 
-/* ---- version + key exchange ---------------------------------------------- */
+/* version + key exchange */
 
-static char v_s[256]; /* server identification line        */
+static char v_s[256]; /* server identification line */
 static unsigned char ic[2048];
 static int ic_len; /* our KEXINIT payload (I_C) */
 static unsigned char is_buf[8192];
-static int is_len; /* server KEXINIT (I_S)    */
+static int is_len; /* server KEXINIT (I_S) */
 
 static int read_ident(void)
 {
@@ -382,8 +337,7 @@ static int read_ident(void)
   }
 }
 
-/* Substring search over a byte span (for sanity-checking the server's offers).
- */
+/* Substring search over a byte span (for sanity-checking the server's offers) */
 static bool span_has(const unsigned char *hay, int n, const char *needle)
 {
   int m = strlen(needle);
@@ -419,8 +373,7 @@ static void build_kexinit(void)
   ic_len = p;
 }
 
-/* HASH(K || H || letter || session_id), extended to `outlen` bytes (RFC 4253).
- */
+/* HASH(K || H || letter || session_id), extended to `outlen` bytes (RFC 4253) */
 static void derive(unsigned char letter, unsigned char *out, int outlen)
 {
   struct sha256 s;
@@ -446,10 +399,10 @@ static void derive(unsigned char letter, unsigned char *out, int outlen)
   }
 }
 
-/* Run the curve25519-sha256 exchange. 0 on success, -1 on failure. */
+/* Run the curve25519-sha256 exchange */
 static int do_kex(const char *cident)
 {
-  /* Both sides send KEXINIT; we can fire ours immediately. */
+  /* Both sides send KEXINIT; we can fire ours immediately */
   build_kexinit();
   if (send_packet(ic, ic_len) != 0)
     return -1;
@@ -475,7 +428,7 @@ static int do_kex(const char *cident)
     return -1;
   }
 
-  /* Our ephemeral X25519 key pair. */
+  /* Our ephemeral X25519 key pair */
   unsigned char priv[32], qc[32];
   rng_bytes(priv, 32);
   priv[0] &= 248;
@@ -494,7 +447,7 @@ static int do_kex(const char *cident)
     say("ssh: key exchange failed\n");
     return -1;
   }
-  /* KEX_ECDH_REPLY: string K_S, string Q_S, string signature. */
+  /* KEX_ECDH_REPLY: string K_S, string Q_S, string signature */
   p = 1;
   unsigned ks_len = r32(payload, &p);
   int ks_off = p;
@@ -510,7 +463,7 @@ static int do_kex(const char *cident)
   }
   const unsigned char *qs = payload + p;
 
-  /* Shared secret + its mpint encoding (reused in hash + key derivation). */
+  /* Shared secret + its mpint encoding (reused in hash + key derivation) */
   unsigned char shared[32];
   x25519(shared, priv, qs);
   {
@@ -528,9 +481,7 @@ static int do_kex(const char *cident)
     kmp_len = kp;
   }
 
-  /* Exchange hash H = SHA256(V_C || V_S || I_C || I_S || K_S || Q_C || Q_S ||
-   * K). The host-key signature is intentionally not verified (see file header).
-   */
+  /* Exchange hash H = SHA256(V_C || V_S || I_C || I_S || K_S || Q_C || Q_S || K) */
   {
     struct sha256 s;
     sha256_init(&s);
@@ -569,8 +520,7 @@ static int do_kex(const char *cident)
   }
   memcpy(session_id, H, 32); /* first KEX fixes the session id */
 
-  /* NEWKEYS: install the directional keys. After we send ours, our packets are
-   * encrypted; after we receive the server's, theirs are. */
+  /* NEWKEYS: install the directional keys */
   derive('A', send_iv, 12);
   derive('B', recv_iv, 12);
   derive('C', send_key, 16);
@@ -589,10 +539,9 @@ static int do_kex(const char *cident)
   return 0;
 }
 
-/* ---- authentication ------------------------------------------------------ */
+/* authentication */
 
-/* Read a password from stdin with no echo. Returns length, or -1 if aborted
- * (Ctrl+C) / EOF (window closed). */
+/* Read a password from stdin with no echo */
 static int read_password(char *out, int max)
 {
   int len = 0;
@@ -625,8 +574,7 @@ static int read_password(char *out, int max)
   return len;
 }
 
-/* Request the ssh-userauth service, then try password auth (up to 3 times).
- * 0 on success, -1 on failure. */
+/* Request the ssh-userauth service, then try password auth (up to 3 times) */
 static int do_auth(const char *user, const char *host)
 {
   int plen, p;
@@ -687,16 +635,16 @@ static int do_auth(const char *user, const char *host)
   return -1;
 }
 
-/* ---- channel + interactive session --------------------------------------- */
+/* channel + interactive session */
 
-static unsigned remote_chan;   /* the server's channel id            */
+static unsigned remote_chan;   /* the server's channel id */
 static unsigned remote_window; /* bytes the server will accept from us */
 static unsigned remote_maxpkt = 32768;
 static unsigned local_window = LOCAL_WINDOW;
 
 #define LOCAL_CHAN 0
 
-/* Open a session channel and request a pty + an interactive shell. 0/-1. */
+/* Open a session channel and request a pty + an interactive shell */
 static int open_session(void)
 {
   int plen, p;
@@ -727,17 +675,16 @@ static int open_session(void)
   if (remote_maxpkt == 0 || remote_maxpkt > MAXPKT)
     remote_maxpkt = 32768;
 
-  /* pty-req: a vt100-ish terminal, 80x24, empty modes. want_reply=0 keeps the
-   * round-trips down; a standard sshd always grants it. */
+  /* pty-req: a vt100-ish terminal, 80x24, empty modes */
   p = 0;
   wb(ptext, &p, MSG_CHANNEL_REQUEST);
   w32(ptext, &p, remote_chan);
   wcstr(ptext, &p, "pty-req");
   wb(ptext, &p, 0); /* want_reply */
   wcstr(ptext, &p, "xterm");
-  w32(ptext, &p, 80); /* cols  */
-  w32(ptext, &p, 24); /* rows  */
-  w32(ptext, &p, 0);  /* width px  */
+  w32(ptext, &p, 80); /* cols */
+  w32(ptext, &p, 24); /* rows */
+  w32(ptext, &p, 0);  /* width px */
   w32(ptext, &p, 0);  /* height px */
   {
     unsigned char modes[1] = {0};
@@ -746,7 +693,7 @@ static int open_session(void)
   if (send_packet(ptext, p) != 0)
     return -1;
 
-  /* shell. */
+  /* shell */
   p = 0;
   wb(ptext, &p, MSG_CHANNEL_REQUEST);
   w32(ptext, &p, remote_chan);
@@ -757,8 +704,7 @@ static int open_session(void)
   return 0;
 }
 
-/* Send `n` bytes of channel data, chunked to the server's window + max packet.
- */
+/* Send `n` bytes of channel data, chunked to the server's window + max packet */
 static int send_channel_data(const unsigned char *d, int n)
 {
   int off = 0;
@@ -768,8 +714,7 @@ static int send_channel_data(const unsigned char *d, int n)
       chunk = (int)remote_maxpkt;
     if ((unsigned)chunk > remote_window)
       chunk = (int)remote_window;
-    if (chunk <= 0) { /* window exhausted: let the loop
-                                                pick up a WINDOW_ADJUST first */
+    if (chunk <= 0) { /* window exhausted: let the loop pick up a WINDOW_ADJUST first */
       return off;
     }
     int p = 0;
@@ -784,7 +729,7 @@ static int send_channel_data(const unsigned char *d, int n)
   return off;
 }
 
-/* Replenish our advertised window if it's run low. */
+/* Replenish our advertised window if it's run low */
 static int top_up_window(void)
 {
   if (local_window >= LOCAL_WINDOW / 2)
@@ -800,9 +745,7 @@ static int top_up_window(void)
   return 0;
 }
 
-/* Translate one terminal keystroke (as the window delivers it, see owos.h
- * KEY_* and the printable range) into the bytes a remote pty expects, appending
- * to `out`. Returns the number of bytes appended. */
+/* Translate one terminal keystroke into the bytes a remote pty expects, appending to `out` */
 static int map_key(unsigned char b, unsigned char *out)
 {
   switch (b) {
@@ -865,9 +808,7 @@ static int map_key(unsigned char b, unsigned char *out)
   }
 }
 
-/* The interactive loop: stdin keystrokes -> CHANNEL_DATA, server CHANNEL_DATA
- * -> stdout, plus flow-control + channel teardown. Returns when the session
- * ends. */
+/* The interactive loop: stdin keystrokes -> CHANNEL_DATA, server CHANNEL_DATA -> stdout */
 static void interactive(const char *host)
 {
   unsigned char obuf[2048];
@@ -877,7 +818,7 @@ static void interactive(const char *host)
   for (;;) {
     bool did = false;
 
-    /* 1. stdin -> outgoing buffer (translated to pty byte sequences). */
+    /* 1 */
     char kb[256];
     int kn = read_nb(0, kb, sizeof kb);
     if (kn < 0) {
@@ -899,7 +840,7 @@ static void interactive(const char *host)
       }
     }
 
-    /* 2. socket -> process inbound packets. */
+    /* 2 */
     if (rx_pump() < 0)
       break;
     int plen;
@@ -938,8 +879,7 @@ static void interactive(const char *host)
         send_packet(cl, cp);
         closed = true;
       } else if (t == MSG_CHANNEL_REQUEST) {
-        /* e.g. "exit-status"/"exit-signal": informational; if want_reply
-         * is set we'd owe a reply, but standard sshd doesn't ask. */
+        /* e.g. "exit-status"/"exit-signal": informational */
       } else if (t == MSG_GLOBAL_REQUEST) {
         /* decline anything that wants a reply */
         int p = 1;
@@ -972,7 +912,7 @@ static void interactive(const char *host)
   say(" closed.\n");
 }
 
-/* ---- entry --------------------------------------------------------------- */
+/* entry */
 
 int main(int argc, char **argv)
 {
@@ -981,7 +921,7 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  /* Parse user@host (user defaults to root when omitted). */
+  /* Parse user@host (user defaults to root when omitted) */
   static char user[64], host[160];
   const char *spec = argv[1];
   const char *at = 0;
@@ -1046,7 +986,7 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  /* Version exchange. */
+  /* Version exchange */
   {
     char line[64];
     int p = 0;

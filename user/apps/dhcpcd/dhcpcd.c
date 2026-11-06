@@ -1,10 +1,7 @@
-/* dhcpcd.c — the DHCP client, in user space. Autostarted as root at boot.
+/* dhcpcd.c: the user-space DHCP client, autostarted as root at boot.
  *
- * A minimal DISCOVER -> OFFER -> REQUEST -> ACK exchange over a raw Ethernet
- * socket (net_raw_open, the AF_PACKET analog): the kernel has no IP yet, so we
- * build the full L2 frame ourselves (broadcast dst, our MAC as src, IPv4/UDP
- * 68->67, BOOTP+DHCP) rather than going through the IP stack. On ACK we apply
- * the lease with ifconfig() and write /etc/resolv.conf. One-shot at startup. */
+ * One-shot DISCOVER/OFFER/REQUEST/ACK over a raw Ethernet socket (net_raw_open), building the
+ * L2/IPv4/UDP frame itself. On ACK it applies the lease with ifconfig() and writes /etc/resolv.conf. */
 
 #include "owos.h"
 #include <stdbool.h>
@@ -74,9 +71,7 @@ static bool parse_mac(const char *s, unsigned char mac[6])
 static unsigned char our_mac[6];
 static unsigned char xid[4];
 
-/* Build a BOOTP/DHCP message (type 1=DISCOVER, 3=REQUEST) into out[DHCP_LEN].
- * `srv`/`req_ip` carry the REQUEST's chosen server/address. Returns its length.
- * Ported from the kernel's dhcp_build. */
+/* Build a BOOTP/DHCP message (1=DISCOVER, 3=REQUEST) into out[DHCP_LEN]; returns its length. */
 static int dhcp_build(unsigned char msgtype, const unsigned char *srv, const unsigned char *req_ip, unsigned char *out)
 {
   memset(out, 0, DHCP_LEN);
@@ -113,8 +108,7 @@ static int dhcp_build(unsigned char msgtype, const unsigned char *srv, const uns
   return o;
 }
 
-/* Wrap a DHCP payload in Ethernet/IPv4/UDP (src 0.0.0.0:68 ->
- * 255.255.255.255:67) into frame[], returns the frame length. */
+/* Wrap a DHCP payload in Ethernet/IPv4/UDP (0.0.0.0:68 -> 255.255.255.255:67); returns frame length. */
 static int build_frame(const unsigned char *dhcp, int dlen, unsigned char *frame)
 {
   static const unsigned char bmac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -148,8 +142,7 @@ static int build_frame(const unsigned char *dhcp, int dlen, unsigned char *frame
   return 14 + iplen;
 }
 
-/* Parse a received frame; on a matching DHCP OFFER/ACK, fill the lease fields.
- * Returns the DHCP message type (2=OFFER, 5=ACK) or 0 if it isn't for us. */
+/* Parse a frame; on a matching OFFER/ACK fill the lease. Returns DHCP type (2/5) or 0. */
 static unsigned char parse_reply(const unsigned char *f, int len, unsigned char yiaddr[4], unsigned char mask[4],
                                  unsigned char gw[4], unsigned char dns[4], unsigned char srv[4])
 {
@@ -201,8 +194,7 @@ static unsigned char parse_reply(const unsigned char *f, int len, unsigned char 
   return mtype;
 }
 
-/* Send `frame`, then poll the raw socket for a reply of the wanted DHCP type
- * (2 OFFER / 5 ACK), retrying the send a few times. Returns 1 on match. */
+/* Send `frame`, poll for a reply of the wanted DHCP type (2/5), retrying. Returns 1 on match. */
 static bool exchange(int fd, const unsigned char *frame, int flen, unsigned char want, unsigned char yiaddr[4],
                      unsigned char mask[4], unsigned char gw[4], unsigned char dns[4], unsigned char srv[4])
 {

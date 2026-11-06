@@ -2,15 +2,8 @@
 
 /* --------------------------------------------------------------- drawing */
 
-/* Draw one wrapped display line in the body font (the page @font-face when set,
- * else the baked gfx_ui font), clipped vertically to [ct,cb). The pane bg is
- * already filled, so the text blends over existing pixels. Bold is a 1px-offset
- * overstrike; underline is a rule under the run. */
-/* Draw one wrapped text run [off,off+len) at (x,y), clipped vertically to
- * [ct,cb), in the per-block style (heading size/mono/centre/indent, or a
- * horizontal rule). Returns the content origin x after indent/centring, for the
- * caller's selection highlight. Shared by the main line table and the flex-row
- * overlay. */
+/* Draw one wrapped display line in the body font */
+/* Draw one wrapped text run [off,off+len) at (x,y), clipped vertically to [ct,cb) */
 int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int line_h, int maxpx)
 {
   set_block(&g_ui, off);
@@ -63,8 +56,7 @@ int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int
     int rpx = glyph_px(off + i);
     char run[260];
     int rl = 0, rw = 0;
-    /* Accumulate codepoints sharing one (attr,fg,bg,size) so any change starts
-     * a new run; never split a UTF-8 sequence into garbage. */
+    /* Accumulate codepoints sharing one (attr,fg,bg,size) so any change starts a new run */
     while (i < len && B->pg->attr[off + i] == a && B->pg->fg[off + i] == fg && B->pg->bg[off + i] == bgc &&
            glyph_px(off + i) == rpx) {
       int nb = utf8_seqlen((unsigned char)B->pg->text[off + i]);
@@ -145,9 +137,7 @@ void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
   }
 }
 
-/* ---- CSS background gradients & url() images --------------------------------
- * Painted per-pixel over a box's (already-filled) background colour. Integer
- * fixed-point throughout (no float): angles via a 5°-step sine table in Q10. */
+/* ---- CSS background gradients & url() images -------------------------------- Painted per-pixel */
 
 static int isin90(int d) /* sin(d°), d in [0,90], scaled by 1024 */
 {
@@ -172,10 +162,7 @@ static int icos(int d) { return isin(d + 90); }
 /* One colour table per distinct stop set, shared by every gradient box. */
 static struct ru_glut g_glut;
 
-/* Paint a linear/radial gradient into the box rect, clipped to the visible band
- * [by,by+bh) and to x in [0,clipw). (bx,sy) is the FULL box top-left in screen
- * px; (bw,bh_full) its full size — so the gradient geometry is
- * band-independent. */
+/* Paint a linear/radial gradient into the box rect, clipped to the visible band [by,by+bh) */
 static void paint_gradient(const struct css_bg_image *bi, int bx, int sy, int bw, int bh_full, int by, int bh,
                            int clipw)
 {
@@ -212,9 +199,7 @@ static void paint_gradient(const struct css_bg_image *bi, int bx, int sy, int bw
   }
 }
 
-/* Paint a decoded url() background image into the box rect, honouring
- * background- size (cover/contain/length) / -position / -repeat, clipped as
- * paint_gradient. */
+/* Paint a decoded url() background image into the box rect, honouring background- size */
 static void paint_bg_image(const struct bg_img *im, const struct css_bg_image *bi, int bx, int sy, int bw, int bh_full,
                            int by, int bh, int clipw)
 {
@@ -295,10 +280,7 @@ static void paint_bg_image(const struct bg_img *im, const struct css_bg_image *b
   }
 }
 
-/* Paint visible block-box backgrounds and borders from the box tree's resolved
- * geometry. Called with browser_buf_lock held, after the pane is cleared and rewrap()
- * laid out the tree, before the text lines are drawn. Boxes are in pre-order,
- * so a child paints over its parent. Box `y` is document px (row*LINE_H). */
+/* Paint visible block-box backgrounds and borders from the box tree's resolved geometry */
 /* Integer sqrt for the rounded-corner geometry. */
 static int isqrt_i(int n)
 {
@@ -311,9 +293,7 @@ static int isqrt_i(int n)
   }
   return x;
 }
-/* Fill rounded rect [x,y,w,h] radius r with `rgb` at `alpha` (0..255), clipped
- * to the vertical band [ct,cb). Hard-edged corners; r is clamped to half the
- * smaller side. */
+/* Fill rounded rect [x,y,w,h] radius r with `rgb` at `alpha` (0..255), clipped to the vertical */
 static void fill_round_rect(int x, int y, int w, int h, int r, unsigned rgb, int alpha, int ct, int cb)
 {
   if (w <= 0 || h <= 0 || alpha <= 0)
@@ -356,8 +336,7 @@ static void fill_round_rect(int x, int y, int w, int h, int r, unsigned rgb, int
       }
   }
 }
-/* A box's drop shadow: an offset, spread, optionally blurred rounded rect. Blur
- * is faked with a few expanding, fading passes (outer faint -> inner solid). */
+/* A box's drop shadow */
 static void draw_box_shadow(const struct lbox *b, const struct lgeom *ge, int sy, int r, int ct, int cb)
 {
   unsigned argb = b->sh_color;
@@ -424,10 +403,7 @@ static void draw_border_v(int x, int y, int w, int h, int style, unsigned color,
     fill_clip(x, y + p, w, on < h - p ? on : h - p, color, ct, cb);
 }
 
-/* Paint one box's shadow, background (colour/gradient/image), border and
- * outline into the band [ct,cb), with `ge` its resolved geometry. `alpha`
- * (0..255) is the element's opacity applied to the solid background/border
- * (images/gradients/outline stay opaque; a pragmatic subset). */
+/* Paint one box's shadow, background (colour/gradient/image), border and outline into the band */
 static void paint_one_box(const struct lbox *b, const struct lgeom *ge, int py, int pw, int ct, int cb, int top_doc)
 {
   int bgk = b->bgi.kind; /* CSS_BGK_* image layer, <=0 = none */
@@ -504,11 +480,7 @@ static void paint_one_box(const struct lbox *b, const struct lgeom *ge, int py, 
   }
 }
 
-/* Paint every box that touches the band [ct,cb). Boxes paint in pre-order (a
- * child over its parent), but split into three z-index bands so positive z-index
- * lands above the normal flow and negative below; within a band, document order
- * is the tiebreak. The layout's per-band index narrows each pass to the boxes
- * whose vertical extent can reach the band. */
+/* Paint every box that touches the band [ct,cb) */
 void paint_boxes(int py, int pw, int ct, int cb)
 {
   const struct layout_out *o = g_fr;
@@ -532,11 +504,7 @@ void paint_boxes(int py, int pw, int ct, int cb)
   }
 }
 
-/* Outline a devtools-selected element's box over the page: a 2px accent border,
- * each edge drawn only when it actually falls inside the content pane (so a box
- * scrolled partly off-screen doesn't paint a fake edge at the clip line), plus
- * a "tag#id.class WxH" chip at the top-left. Screen coords; clipped to
- * [0,clip_right) x [clip_top,clip_bot). */
+/* Outline a devtools-selected element's box over the page */
 void draw_dt_highlight(int x, int y, int w, int h, int clip_top, int clip_bot, int clip_right, const char *label)
 {
   unsigned col = 0x4c8df6;
@@ -587,14 +555,10 @@ static const char *crash_reason(int sig)
   }
 }
 
-/* Reload button on the crash page, remembered so handle_click can hit-test it.
- */
+/* Reload button on the crash page, remembered so handle_click can hit-test */
 struct rect crash_reload_rect;
 
-/* Draw the "Aw, snap"-style crashed-tab page over the content pane
- * (py..py+phh), replacing the dead page. Centred: a sad face, a heading, the
- * cause, and a Reload button. Its rect is stashed in crash_reload_rect for the
- * click handler. */
+/* Draw the "Aw, snap"-style crashed-tab page over the content pane (py..py+phh), replacing */
 void draw_crash_page(int py, int pw, int phh)
 {
   gfx_fill_rect(0, py, pw, phh, 0xf2f3f5); /* neutral canvas, not the dead page's */

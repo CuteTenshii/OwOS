@@ -1,26 +1,17 @@
-/* js_media.c — HTMLMediaElement (<audio>/<video> + new Audio()), the W3C Remote
- * Playback API (media.remote, backed by a Google Cast sender), and new Image().
- * Owns the single process-wide Cast session + its pump (js_cast_pump). The
- * media and remote prototypes are allocated in setup_dom's batch and configured
- * here (setup_media_proto/setup_remote_proto). Split out of js.c; shares the
- * page engine context + helpers via jsint.h. */
+/* HTMLMediaElement, Remote Playback API (Cast) and Image()/Audio() constructors. */
 #include <stdbool.h>
 
 #include "cast.h"                  /* Google Cast sender: RemotePlayback backend             */
 #include "features/media/bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
 #include "jsint.h"
 
-/* The single active Cast session + its liveness state, private to this module
- * (only the media handlers, js_cast_pump and js_cast_page_end touch them). */
+/* Single process-wide Cast session state. */
 static cast_session *g_cast;     /* the single active Cast session, or NULL      */
 static js_object *g_cast_remote; /* the RemotePlayback owning g_cast, or NULL */
 static int g_cast_used;          /* a page touched a remote-playback entry point */
 static int g_cast_conn_seen;     /* last connection state delivered by the pump  */
 
-/* ------------------------------------------------- HTMLMediaElement -------
- * <audio>/<video> elements (and `new Audio()`) get g_media_proto, which chains
- * to the element prototype and adds the media properties/methods. The state and
- * playback live in media.c (bmedia.h); these are thin bindings over it. */
+/* ---- HTMLMediaElement ---- */
 static struct media_el *mel_of(js_value t)
 {
   struct dom_node *n = node_of(t);
@@ -208,8 +199,7 @@ static js_value mel_can_play_type(js_ctx *ctx, js_value t, js_value *args, int a
   return js_mk_cstring(ctx, v == MEDIA_PROBABLY ? "probably" : v == MEDIA_MAYBE ? "maybe" : "");
 }
 
-/* The Audio() constructor: a detached HTMLAudioElement, optionally with a src
- * (which is preloaded). new Audio(src) === document.createElement('audio'). */
+/* new Audio(src): a detached audio element, preloaded when src is given. */
 static js_value audio_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   struct dom_node *n;
@@ -232,10 +222,7 @@ static js_value audio_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc
   return w;
 }
 
-/* The Image() constructor: a detached HTMLImageElement. new Image(w, h) presets
- * the width/height content attributes (per the HTML spec); .src is set after
- * and flows through the element `src` accessor. Mirrors audio_ctor for <img>.
- */
+/* new Image(w, h): a detached img with width/height attributes preset. */
 js_value image_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   struct dom_node *n;
@@ -252,10 +239,8 @@ js_value image_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   return w;
 }
 
-/* Defined with the Remote Playback API below; referenced here. */
 static js_value mel_get_remote(js_ctx *ctx, js_value t, js_value *args, int argc);
 
-/* Define the HTMLMediaElement surface on g_media_proto (chains to element). */
 void setup_media_proto(js_ctx *ctx)
 {
   g_cast = 0;
@@ -296,9 +281,7 @@ void setup_media_proto(js_ctx *ctx)
   }
 }
 
-/* media.c (worker thread) asks us to fire a (non-bubbling) media event on an
- * element's wrapper — both its on<type> handler and addEventListener listeners.
- */
+/* Fire a non-bubbling media event on an element wrapper (worker thread). */
 void js_media_fire(struct dom_node *node, const char *type)
 {
   if (!g_page_live || !g_ctx || !node || !node->wrapper)
@@ -306,17 +289,9 @@ void js_media_fire(struct dom_node *node, const char *type)
   emit_event((js_object *)node->wrapper, type, js_undef());
 }
 
-/* --- Remote Playback API (W3C) : HTMLMediaElement.remote --------------------
- * A media element's `remote` is a RemotePlayback (an EventTarget) that casts
- * the element's media to a discovered receiver via user/lib/cast. The engine's
- * Promise model settles synchronously, and cast connect/load are blocking, so
- * prompt() runs the whole discover->connect->load inline (a user gesture) and
- * resolves; availability and connection-state changes reach script from the
- * worker's js_cast_pump. There is one active session process-wide (a receiver
- * plays one thing), tracked by g_cast / g_cast_remote. */
+/* ---- Remote Playback API ---- */
 
-/* Derive a coarse contentType from a media URL's extension (the receiver still
- * sniffs; an empty hint is fine but a correct one avoids a probe). */
+/* Coarse contentType from the URL extension. */
 static const char *cast_ctype_for(const char *url)
 {
   int n = url ? (int)strlen(url) : 0, i;
@@ -325,7 +300,6 @@ static const char *cast_ctype_for(const char *url)
   for (i = n - 1; i >= 0 && url[i] != '.' && url[i] != '/' && e < 7; i--)
     ext[e++] = lower(url[i]);
   ext[e] = '\0';
-  /* ext is reversed; compare against reversed suffixes */
   if (streq(ext, "4pm") || streq(ext, "vom") || streq(ext, "4m"))
     return "video/mp4";
   if (streq(ext, "mbew"))
@@ -361,9 +335,7 @@ static js_value rp_get_state(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_mk_cstring(ctx, st);
 }
 
-/* watchAvailability(cb): register a monitor and start background discovery. The
- * promise resolves with an integer id (for cancelWatchAvailability). The first
- * value is delivered by the pump (we reset @availseen so it re-reports). */
+/* watchAvailability(cb): register a monitor; the pump delivers the first value. */
 static js_value rp_watch_availability(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value cb = A(0), watch;
@@ -396,8 +368,7 @@ static js_value rp_cancel_watch(js_ctx *ctx, js_value t, js_value *args, int arg
   return js_promise_resolved(ctx, js_undef());
 }
 
-/* prompt(): the user gesture. Discover, connect to the first receiver, load the
- * element's current media and begin playback. Fires connecting/connect. */
+/* prompt(): discover, connect to the first receiver, load and play. */
 static js_value rp_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = remote_node(t);
@@ -452,8 +423,7 @@ static js_value rp_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_promise_resolved(ctx, js_undef());
 }
 
-/* disconnect(): non-standard convenience — stop casting and return to local
- * playback (the base spec has no script-side stop, and we render no UI). */
+/* disconnect(): non-standard; stop casting and return to local playback. */
 static js_value rp_disconnect(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)ctx;
@@ -470,9 +440,7 @@ static js_value rp_disconnect(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* The `remote` accessor: lazily build and cache one RemotePlayback per element
- * (identity is stable, so listeners persist), hosting the element's dom_node.
- */
+/* `remote` accessor: one cached RemotePlayback per element. */
 static js_value mel_get_remote(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -509,10 +477,7 @@ void setup_remote_proto(js_ctx *ctx)
   def_method(g_remote_proto, "dispatchEvent", el_dispatch, 1);
 }
 
-/* Worker-thread pump: deliver availability changes to watchers and fire
- * connecting/connect/disconnect as the active session's state moves. Returns
- * the number of callbacks/events fired (so the worker repaints when handlers
- * ran). */
+/* Worker pump: deliver availability and connection events; returns the number fired. */
 int js_cast_pump(void)
 {
   int fired = 0;

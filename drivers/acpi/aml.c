@@ -1,22 +1,4 @@
-/* aml.c — a minimal ACPI AML interpreter for reading the battery charge.
- *
- * Two passes (see aml.h for the philosophy and scope):
- *   1. A namespace pass walks the DSDT + every SSDT once, recording the
- *      OperationRegions, Fields, Methods and Names it finds, each with its
- *      absolute ACPI path. This is cheap and cached.
- *   2. To read the battery we locate the device whose _HID is PNP0C0A and then
- *      *evaluate* its _BST (current state) and _BIF/_BIX (last-full capacity),
- *      driving the Embedded Controller for the field reads those methods do.
- *
- * Everything is bounded and crash-free: unknown opcodes, parse desyncs, a dead
- * EC, or an over-deep method all abort the evaluation and return failure, and
- * the caller falls back to showing "present". The interpreter is deliberately
- * partial — it covers the opcode subset real _BST/_BIF methods use, not all
- * AML.
- *
- * (The core term evaluator is named aml_eval, not the obvious short name, only
- * to dodge a repo security hook that flags that 4-letter word before a paren.)
- */
+/* aml.c: minimal bounded ACPI AML interpreter (namespace pass + method evaluation) for _BST/_BIF; see aml.h. */
 
 #include "aml.h"
 #include "heap.h"
@@ -29,45 +11,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---- limits (all static, sized for a laptop DSDT) ----------------------- */
 #define MAX_NODES                                                                                                      \
-  12288 /* real laptop DSDTs have thousands of objects;                                                                \
-         * the table is heap-allocated, not static BSS */
+  12288 /* real DSDTs have thousands of objects;                                                                       \
+         * heap-allocated */
 #define MAX_DEPTH 16
 #define ARENA_SIZE (64 * 1024)
 #define MAX_WHILE 50000
 #define MAX_CALL                                                                                                       \
-  12 /* nested AML method calls: each pushes a ~580-byte                                                               \
-      * struct frame on the kernel thread's 16 KiB stack    */
+  12 /* nested AML calls,                                                                                              \
+      * ~580-byte frame each */
 #define MAX_RDEPTH                                                                                                     \
-  48 /* combined aml_eval/exec_list C-recursion depth — a                                                            \
-      * coarse backstop only; the real bound is the stack-byte                                                         \
-      * budget below (frame-count is a poor proxy because -O0                                                          \
-      * frames are fat). Real laptop _BIF/_BST methods nest                                                            \
-      * well past 16 (nested If + per-field EC helper calls).  */
+  48 /* aml_eval/exec_list recursion cap; a backstop,                                                                  \
+      * the real bound is AML_STACK_BUDGET */
 
-/* Hard stack-byte budget for one evaluation, measured as growth from the entry
- * frame. The interpreter runs on the 32 KiB kernel / user-syscall stack (see
- * KSTACK_SIZE/UKSTACK_SIZE in sched.c), shared with a possible nested timer IRQ
- * + NIC RX path, so cap our own growth well below the stack size rather than
- * trusting the fat -O0 frame count. Past this we bail gracefully (-> "present"
- * fallback) instead of overflowing into a neighbouring thread's stack. Sized to
- * leave headroom for a nested timer-IRQ + NIC-RX path on the same stack (the
- * reason KSTACK grew 16->32K). Per-level cost is ~0.9 KiB after the
- * aml_eval_inner case split, so this still allows ~18 nesting levels — well
- * past real _BST/_BIF. */
+/* Stack-byte budget per evaluation (growth from the entry frame); the 32 KiB kernel stack is shared with nested IRQ +
+ * NIC RX. Bail instead of overflowing. */
 #define AML_STACK_BUDGET (16 * 1024)
 
-/* Wall-clock budget for evaluating one method. Real _BST methods often spin a
- * `While (EC-not-ready)` poll, and EC reads are milliseconds each, so without a
- * hard time bound a slow or unready EC can hang the read for many seconds. We
- * cap each method evaluation and bail (-> "present" fallback) past this. A
- * stuck *single* EC read is bounded independently by ec_wait's own iteration
- * cap
- * (~ms), so this budget only backstops runaway While loops and cumulative
- * slowness. Real laptop _BIF does ~8 EC ops + builds a serial string (GBSS),
- * and on a slow EC that overran 150ms mid-method; 600ms covers it with margin.
- */
+/* Wall-clock budget per method: a slow EC or While poll could otherwise hang the read; real _BIF needs ~150ms+. */
 #define EVAL_BUDGET_US 600000u
 
 static uint32_t g_start_us;
@@ -75,7 +36,6 @@ static bool deadline_hit(void) { return (timer_us() - g_start_us) > EVAL_BUDGET_
 
 #define PNP0C0A 0x0A0CD041u /* EisaId("PNP0C0A") as a little-endian DWord */
 
-/* ---- object model ------------------------------------------------------- */
 enum { T_INT, T_STR, T_BUF, T_PKG, T_REF };
 enum { RT_SLOT, RT_FIELD }; /* what a T_REF points at                    */
 
@@ -90,10 +50,7 @@ struct obj {
   void *ref;       /* RT_SLOT: struct obj*  RT_FIELD: ns_node*  */
 };
 
-/* ---- namespace ---------------------------------------------------------- */
-/* NS_OTHER covers declarations we record only so references resolve (Mutex,
- * Event): evaluating one just yields 0, but it must not be an "unresolved
- * name". */
+/* NS_OTHER records declarations (Mutex, Event) only so references resolve; evaluating one yields 0. */
 enum { NS_REGION, NS_FIELD, NS_METHOD, NS_NAME, NS_DEVICE, NS_OTHER };
 
 struct ns_node {
@@ -125,9 +82,7 @@ struct ns_node {
 static struct ns_node *nodes; /* MAX_NODES entries, heap-allocated on first build */
 static int node_count;
 static bool ns_built;
-/* Diagnostics: the opcode at which a namespace term-list walk first gave up
- * (so we can see what construct stops us reaching a device like the EC). For an
- * ExtOp the value is 0x5B00|ext; otherwise the bare opcode. */
+/* Opcode at which a namespace walk first gave up (0x5B00|ext for an ExtOp). */
 static uint16_t ns_bail_op;
 static bool ns_bailed;
 
@@ -176,7 +131,6 @@ static void *arena_alloc(uint32_t n)
   return p;
 }
 
-/* ---- little-endian stream reads with bounds ----------------------------- */
 static uint64_t rd(const uint8_t *p, int n)
 {
   uint64_t v = 0;
@@ -185,8 +139,7 @@ static uint64_t rd(const uint8_t *p, int n)
   return v;
 }
 
-/* PkgLength: returns the length value (which counts itself) and advances *p
- * past the length bytes. */
+/* PkgLength: returns the length (which counts itself) and advances *p past the length bytes. */
 static uint32_t pkglength(const uint8_t **p, const uint8_t *end)
 {
   const uint8_t *q = *p;
@@ -209,11 +162,7 @@ static uint32_t pkglength(const uint8_t **p, const uint8_t *end)
   return len;
 }
 
-/* ---- NameString parsing ------------------------------------------------- */
-/* Parse a NameString at *p, advancing past it. Returns the absolute path in
- * out_seg/out_depth, resolved against `scope` (the enclosing scope path). For a
- * bare single NameSeg used as a *declaration* this is scope+seg; resolution for
- * *references* (with upward search) is handled separately. */
+/* Parse a NameString at *p into an absolute path against `scope`; references use a separate upward search. */
 static int parse_name(const uint8_t **p, const uint8_t *end, const uint32_t *scope, int sdepth, uint32_t *out_seg,
                       int *out_depth)
 {
@@ -280,11 +229,7 @@ static struct ns_node *ns_find(const uint32_t *seg, int depth)
   return 0;
 }
 
-/* Resolve a reference NameString to a node. Advances *p past the name. Applies
- * the ACPI search rule: a relative path (no '\' root, no '^' parent prefix) is
- * tried at the current scope and every enclosing scope up to the root — for the
- * WHOLE path, not just a single segment, so e.g. `PCI0.OEMR` referenced from a
- * deep battery scope still finds `\_SB.PCI0.OEMR`. Returns 0 if not found. */
+/* Resolve a reference NameString: a relative path is tried at every enclosing scope up to the root. 0 if not found. */
 static struct ns_node *resolve_ref(const uint8_t **p, const uint8_t *end, const uint32_t *scope, int sdepth)
 {
   const uint8_t *q = *p;
@@ -327,11 +272,7 @@ static struct ns_node *resolve_ref(const uint8_t **p, const uint8_t *end, const 
   if (root)
     return ns_find(segs, nseg);
 
-  /* A relative path (with or without '^' prefixes): try at the scope level the
-   * prefixes select, then keep walking up toward the root. ACPI treats '^' as
-   * an exact relative path, but firmwares vary in how they count carets vs the
-   * enclosing method's depth, and searching upward as a fallback only ever
-   * helps find an object that genuinely exists — which is all we need. */
+  /* Relative path: try the scope the '^' prefixes select, then walk up; firmwares vary in caret counting. */
   for (int up = base; up >= 0; up--) {
     uint32_t cand[MAX_DEPTH];
     int cd = 0;
@@ -346,7 +287,6 @@ static struct ns_node *resolve_ref(const uint8_t **p, const uint8_t *end, const 
   return 0;
 }
 
-/* ---- namespace build pass ----------------------------------------------- */
 static struct ns_node *new_node(uint8_t kind, const uint32_t *seg, int depth)
 {
   if (node_count >= MAX_NODES)
@@ -367,11 +307,7 @@ static const uint8_t *read_int_arg(const uint8_t *p, const uint8_t *end, uint64_
 static const uint8_t *skip_term(const uint8_t *p, const uint8_t *end);
 static const uint8_t *read_term_int(const uint8_t *p, const uint8_t *end, uint64_t *out);
 
-/* Parse a Field's unit list, recording each named unit in the *current scope*
- * (where ACPI creates field-unit names — not under the region, which may live
- * elsewhere). `region` is the node index of the parent OperationRegion, or -1
- * if it didn't resolve; we record the unit either way, so the name resolves and
- * a read of an unbacked field fails loudly rather than the field vanishing. */
+/* Parse a Field's units into the current scope; region is -1 if unresolved (the name still resolves). */
 static void parse_field_list(const uint8_t *p, const uint8_t *end, int region, const uint32_t *scope, int sdepth)
 {
   uint32_t bit = 0;
@@ -412,8 +348,7 @@ static void parse_field_list(const uint8_t *p, const uint8_t *end, int region, c
 
 static void ns_walk(const uint8_t *p, const uint8_t *end, const uint32_t *scope, int sdepth, int depth)
 {
-  /* Malformed nested Scope/Device blocks recurse here with no natural bound;
-   * cap the C recursion so a crafted table can't overflow the kernel stack. */
+  /* Cap recursion so a crafted table can't overflow the kernel stack. */
   if (depth > MAX_RDEPTH)
     return;
   while (p < end) {
@@ -466,9 +401,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end, const uint32_t *scope,
         int d;
         parse_name(&q, end, scope, sdepth, seg, &d);
         uint8_t space = *q++;
-        /* Offset and length are TermArgs — usually constants, but can be
-         * names or expressions. Skip them as full terms (read_term_int),
-         * not just constants, or the whole rest of the table desyncs. */
+        /* Offset and length are TermArgs; skip them as full terms or the table desyncs. */
         uint64_t off = 0, rl = 0;
         q = read_term_int(q, end, &off);
         q = read_term_int(q, end, &rl);
@@ -553,9 +486,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end, const uint32_t *scope,
       uint32_t len = pkglength(&q, end);
       p = pkgstart + len;
     } else if (op == 0x15) { /* External: Name type argcount     */
-      /* SSDTs almost always open with a run of these forward declarations;
-       * skipping them (rather than bailing) is what lets us reach the
-       * battery device declared further down. */
+      /* SSDTs open with forward declarations; skip them to reach the battery device. */
       const uint8_t *q = p + 1;
       uint32_t seg[MAX_DEPTH];
       int d;
@@ -569,9 +500,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end, const uint32_t *scope,
       parse_name(&q, end, scope, sdepth, seg, &d);
       p = q;
     } else if (op == 0x8A || op == 0x8B || op == 0x8C || op == 0x8D || op == 0x8F) {
-      /* CreateByte/Word/DWord/QWord/BitField: SourceBuf, Index, NameString.
-       * Record the created name (so references resolve) and, crucially, skip
-       * the two TermArgs correctly so we don't desync the rest of the list. */
+      /* CreateXField: record the name and skip the two TermArgs to avoid desync. */
       const uint8_t *q = skip_term(p + 1, end);
       q = skip_term(q, end);
       uint32_t seg[MAX_DEPTH];
@@ -647,8 +576,7 @@ static const uint8_t *read_int_arg(const uint8_t *p, const uint8_t *end, uint64_
   case 0xFF:
     *out = ~0ull;
     return p + 1;
-  /* Bound each width against `end`: a truncated initializer must not read past
-   * it. Stop safely (0, at end) rather than run off the buffer. */
+  /* Bound each width against `end`; a truncated initializer must not read past it. */
   case 0x0A:
     if (p + 2 > end) {
       *out = 0;
@@ -683,16 +611,8 @@ static const uint8_t *read_int_arg(const uint8_t *p, const uint8_t *end, uint64_
   }
 }
 
-/* Skip exactly one TermArg, advancing past its whole structure — including
- * NameStrings and nested expressions. The namespace pass needs this for an
- * OperationRegion's offset/length, which may be more than a literal; getting
- * the length wrong desyncs the entire rest of the table.
- *
- * `depth` bounds the C recursion: a crafted table of deeply nested single-byte
- * prefix operators would otherwise recurse as deep as the table is long and
- * overflow the kernel stack. At the cap we stop descending (advancing one byte
- * so a caller's loop can't stall) — a desync, but graceful, matching aml.c's
- * never-crash contract. */
+/* Skip exactly one TermArg including NameStrings and nested expressions; `depth` caps recursion on crafted tables
+ * (advance one byte at the cap). */
 static const uint8_t *skip_term_d(const uint8_t *p, const uint8_t *end, int depth)
 {
   if (p >= end)
@@ -812,8 +732,7 @@ static const uint8_t *skip_term_d(const uint8_t *p, const uint8_t *end, int dept
 
 static const uint8_t *skip_term(const uint8_t *p, const uint8_t *end) { return skip_term_d(p, end, 0); }
 
-/* Get a constant integer if the term is one; otherwise skip the whole term and
- * report 0 (we don't need the value of a computed region offset/length). */
+/* Get a constant integer if the term is one; otherwise skip the term and report 0. */
 static const uint8_t *read_term_int(const uint8_t *p, const uint8_t *end, uint64_t *out)
 {
   if (p >= end) {
@@ -827,13 +746,11 @@ static const uint8_t *read_term_int(const uint8_t *p, const uint8_t *end, uint64
   return skip_term(p, end);
 }
 
-/* ---- Embedded Controller (and other region) access ---------------------- */
 #define EC_DATA 0x62
 #define EC_CMD 0x66
 static bool ec_wait(uint8_t mask, uint8_t want)
 {
-  /* A healthy EC answers within microseconds; cap the wait low and also honor
-   * the overall evaluation deadline so a dead/slow EC can't stall the read. */
+  /* Cap the wait low and honor the overall deadline so a dead EC can't stall the read. */
   for (int i = 0; i < 5000; i++) {
     if ((inb(EC_CMD) & mask) == want)
       return true;
@@ -857,9 +774,7 @@ static bool ec_read(uint8_t addr, uint8_t *val)
   return true;
 }
 
-/* A PCI_Config OperationRegion is addressed by the bus/device/function of the
- * device that encloses it: the nearest ancestor _ADR gives device:function, the
- * nearest _BBN gives the bus (default 0). Returns 1 if an _ADR was found. */
+/* A PCI_Config region uses the enclosing device's _ADR (device:function) and _BBN (bus, default 0). 1 if _ADR found. */
 #define SEG_ADR 0x5244415Fu /* "_ADR" packed little-endian */
 #define SEG_BBN 0x4E42425Fu /* "_BBN" */
 static bool region_pci_bdf(struct ns_node *reg, uint8_t *bus, uint8_t *slot, uint8_t *func)
@@ -892,8 +807,7 @@ static bool region_pci_bdf(struct ns_node *reg, uint8_t *bus, uint8_t *slot, uin
   return got;
 }
 
-/* Read `width` bits starting at `bit_off` from a region. Returns 1 on success.
- */
+/* Read `width` bits at `bit_off` from a region. Returns 1 on success. */
 static bool region_read(struct ns_node *reg, uint32_t bit_off, uint32_t width, uint64_t *out)
 {
   if (width == 0 || width > 64)
@@ -924,9 +838,7 @@ static bool region_read(struct ns_node *reg, uint32_t bit_off, uint32_t width, u
     } else {
       return false;
     }
-    /* nbytes can be 9 for a 64-bit field at a non-byte-aligned offset; the
-     * 9th byte's shift would be << 64 (UB) and contributes nothing after the
-     * later >> shift, so skip any byte whose shift reaches 64. */
+    /* A 64-bit field at an unaligned offset spans 9 bytes; skip any byte whose shift reaches 64 (UB). */
     if (8 * i < 64)
       raw |= (uint64_t)b << (8 * i);
   }
@@ -937,7 +849,6 @@ static bool region_read(struct ns_node *reg, uint32_t bit_off, uint32_t width, u
   return true;
 }
 
-/* ---- evaluator ---------------------------------------------------------- */
 struct frame {
   struct obj local[8];
   struct obj arg[7];
@@ -954,11 +865,8 @@ static bool g_failed;
 static char *g_stack_base; /* entry-frame address; growth from here is bounded */
 static int g_stack_peak;   /* high-water mark of stack growth, for diagnostics */
 
-/* Stack grows down: bytes consumed since the evaluation's entry frame. Bail
- * past AML_STACK_BUDGET so a deeply nested real method can't overflow the
- * shared kernel stack. g_stack_base==0 (e.g. not yet captured) disables the
- * check. Also tracks the high-water mark so the diagnostic can report how close
- * a method came to the ceiling (this path is real-hardware-only). */
+/* Stack-byte growth since the entry frame; bail past AML_STACK_BUDGET (g_stack_base == 0 disables) and track the
+ * high-water mark. */
 static bool stack_exhausted(void)
 {
   char probe;
@@ -1005,8 +913,7 @@ static void fail_op(const char *why, uint8_t op)
   }
 }
 
-/* Append a namespace path to err_buf, NameSegs separated by '.' for readability
- * (a seg is 4 chars, '_'-padded — so PCI0.OEMR, _SB_.PCI0.OEMR, etc.). */
+/* Append a namespace path to err_buf, '.'-separating 4-char NameSegs. */
 static void err_append_path(int *pi, const uint32_t *seg, int depth)
 {
   int i = *pi;
@@ -1021,10 +928,8 @@ static void err_append_path(int *pi, const uint32_t *seg, int depth)
   *pi = i;
 }
 
-/* Fail on an unresolved name, and report *why*: print the name, then whether
- * its leaf NameSeg is recorded anywhere ("@<path>" — a resolution/scope
- * problem) or missing entirely ("absent" — the parser never recorded it). That
- * single bit is what tells us, on a real laptop, which way to fix it. */
+/* Fail on an unresolved name: "@<path>" if its leaf NameSeg is recorded elsewhere (scope issue), "absent" if never
+ * recorded. */
 static void fail_name(const uint8_t *at)
 {
   if (g_failed)
@@ -1068,12 +973,7 @@ static void fail_name(const uint8_t *at)
   }
   err_append_path(&i, segs, nseg);
 
-  /* ...then whether the leaf NameSeg is recorded anywhere: "@<path>" means it
-   * exists (a resolution/scope issue) and shows where; "absent" means the
-   * parser never recorded it (a parsing issue). The decisive bit. */
-  /* Report where the leaf, and the container segment (e.g. the EC device),
-   * are recorded — "@<path>" or absent. Together they show whether the walk
-   * even built the enclosing scope, and where the field unit really landed. */
+  /* Report where the leaf and its container segment (e.g. the EC device) are recorded, "@<path>" or absent. */
   for (int which = 1; which >= 0; which--) {
     if (nseg <= which)
       continue;
@@ -1095,9 +995,7 @@ static void fail_name(const uint8_t *at)
     }
   }
 
-  /* Namespace stats: total nodes recorded, and the opcode (if any) at which a
-   * term-list walk first bailed — a low count or a bail op explains a missing
-   * device far better than a guess. */
+  /* Namespace stats: node count and the opcode at which a walk first bailed. */
   static const char hx[] = "0123456789ABCDEF";
   if (i < (int)sizeof err_buf - 8) {
     err_buf[i++] = ' ';
@@ -1120,9 +1018,7 @@ static void fail_name(const uint8_t *at)
   err_buf[i] = 0;
 }
 
-/* Advance g_p past a SuperName operand without resolving it — for Acquire/
- * Release, where the sync object's identity is irrelevant to a battery read and
- * an unrecorded mutex must never abort the evaluation. */
+/* Advance g_p past a SuperName without resolving it (Acquire/Release); an unrecorded mutex must not abort. */
 static void skip_supername(void)
 {
   if (g_p >= g_end)
@@ -1151,9 +1047,8 @@ static struct obj read_through(struct obj o)
     struct ns_node *reg = &nodes[f->region_idx];
     uint64_t v = 0;
     if (!region_read(reg, f->bit_off, f->bit_width, &v)) {
-      /* Report region space + byte address: distinguishes a silent EC
-       * (space 3) from an unsupported space (2 PCI cfg, 4 SMBus, …) or a
-       * bad address. ACPI region spaces: 0 mem,1 io,2 pcicfg,3 EC,4 smbus. */
+      /* Report region space and address: tells a silent EC (3) from an unsupported space (0 mem, 1 io, 2 pcicfg, 4
+       * smbus). */
       if (!g_failed) {
         int i = 0;
         const char *s = "rd s";
@@ -1279,14 +1174,8 @@ static struct obj eval_package(struct frame *fr)
   return o;
 }
 
-/* Evaluate one TermArg starting at g_p. Returns an object (possibly a T_REF for
- * lvalue producers like Index / a bare Name / Local / Arg). */
-/* Depth-guarded entry point. aml_eval and exec_list are mutually recursive with
- * no natural bound; on a real DSDT a deeply nested expression or method chain
- * would otherwise overflow the shared kernel stack and silently corrupt an
- * adjacent thread's stack (observed as a GP fault returning to a garbage EIP in
- * a wholly unrelated thread). Bound by actual stack growth (the real limit)
- * plus a coarse frame-count backstop, failing gracefully on either. */
+/* Evaluate one TermArg at g_p (possibly a T_REF for lvalue producers). Depth-guarded by stack growth plus a frame-count
+ * backstop, since aml_eval and exec_list recurse without bound. */
 static struct obj aml_eval(struct frame *fr)
 {
   if (g_rdepth >= MAX_RDEPTH || stack_exhausted()) {
@@ -1299,10 +1188,7 @@ static struct obj aml_eval(struct frame *fr)
   return o;
 }
 
-/* Invoke a control method. Split out of aml_eval_inner so its ~650-byte frame
- * (the new callee's local/arg array) lands here, on the once-per-call path,
- * instead of bloating every aml_eval_inner frame at -O0 — which is what let the
- * recursion budget reach the depth real _BIF methods need. */
+/* Invoke a control method; split out so the callee's local/arg array frame stays off aml_eval_inner at -O0. */
 static struct obj invoke_method(struct ns_node *n, struct frame *caller)
 {
   if (g_depth >= MAX_CALL) {
@@ -1321,9 +1207,7 @@ static struct obj invoke_method(struct ns_node *n, struct frame *caller)
   const uint8_t *sp = g_p, *se = g_end;
   const uint32_t *ss = g_scope;
   int sd = g_sdepth;
-  /* Resolve names inside the callee relative to *its* location, not the
-   * caller's — a helper under \_SB.PCI0.LPCB.EC0 referencing a bare EC field
-   * must search from EC0, not from the battery device. */
+  /* Resolve names relative to the callee's own location, not the caller's. */
   g_scope = n->seg;
   g_sdepth = n->depth;
   g_depth++;
@@ -1345,13 +1229,7 @@ static struct obj mk_ref_slot(void *p)
   return o;
 }
 
-/* The opcode cases that own struct obj locals are each split into their own
- * function. At -O0 GCC reserves every case's locals in aml_eval_inner's frame
- * simultaneously (~1.3 KiB), so on a deep method chain each recursion level
- * paid for cases it never ran; moving them here means a level only carries the
- * one active case's frame, which is what keeps real laptop _BST/_BIF under the
- * stack-byte budget. Each uses the g_p/g_end stream globals like the inline
- * bodies did; logic is unchanged. */
+/* Cases that own struct obj locals live in separate functions so aml_eval_inner's -O0 frame stays small. */
 static struct obj eval_string(void)
 {
   const uint8_t *s = g_p;
@@ -1465,14 +1343,8 @@ static struct obj eval_binary(uint8_t op, struct frame *fr)
   return mk_int(r);
 }
 
-/* Concatenate(src1, src2, target) — opcode 0x73. The battery's _BIF builds its
- * serial/model strings with this (GBSS/ISTR), so without it evaluation hits
- * 0x73, falls through to the NameString case, and reads 0x73='s' + operand
- * bytes as a bogus lowercase name ("...absent") — a desync that aborts the
- * whole method. ACPI keys the result type off src1: String->String, else
- * Buffer. We support those forms (an Integer operand contributes its raw
- * little-endian bytes); the exact serial text doesn't affect the charge math,
- * only that the method runs to completion and returns the capacity package. */
+/* Concatenate(src1, src2, target), opcode 0x73, used by _BIF for serial/model strings; result type follows src1 (String
+ * or Buffer). */
 static struct obj eval_concat(struct frame *fr)
 {
   struct obj a = read_through(aml_eval(fr));
@@ -1615,8 +1487,7 @@ static struct obj eval_ext(struct frame *fr)
   return mk_int(0);
 }
 
-/* A NameString: method invocation or named-object reference. The opcode byte is
- * the name's first byte, so g_p was already advanced past it — back up. */
+/* A NameString: method call or named-object reference; g_p already passed the first byte, so back up. */
 static struct obj eval_name(struct frame *fr)
 {
   g_p--;
@@ -1655,8 +1526,7 @@ static struct obj aml_eval_inner(struct frame *fr)
     return mk_int(1);
   case 0xFF:
     return mk_int(~0ull);
-  /* Constant width bytes may run past g_end in a truncated method — the entry
-   * check only guarantees one byte — so bound each rd() before reading. */
+  /* Constant bytes may run past g_end in a truncated method; bound each rd(). */
   case 0x0A: {
     if (g_p + 1 > g_end) {
       fail("truncated");
@@ -1780,8 +1650,7 @@ static struct obj aml_eval_inner(struct frame *fr)
 
 static struct obj eval_named_value(struct ns_node *n, struct frame *fr)
 {
-  /* Materialize the Name's value from its initializer on first touch this
-   * session (materialized is reset per session in session_begin). */
+  /* Materialize the Name's initializer on first touch per session. */
   if (!n->materialized) {
     const uint8_t *sp = g_p, *se = g_end;
     g_p = n->init;
@@ -1791,12 +1660,8 @@ static struct obj eval_named_value(struct ns_node *n, struct frame *fr)
     g_end = se;
     n->materialized = 1;
   }
-  /* Return the Name as an lvalue (a slot REF), not a snapshot value, so a
-   * Store through it persists — e.g. an EC driver's _REG setting the
-   * "EC available" flag that the battery's _BST/_BIF later read. A bare value
-   * here would make every Store(x, NAME) a silent no-op (store_through only
-   * writes through a T_REF), which is why a real laptop's battery methods
-   * returned the all-0xFFFFFFFF "data unavailable" template. */
+  /* Return the Name as a slot REF so Store persists (e.g. _REG setting the "EC available" flag); a value would make
+   * Store a no-op. */
   struct obj o = mk_int(0);
   o.type = T_REF;
   o.reftype = RT_SLOT;
@@ -1804,8 +1669,7 @@ static struct obj eval_named_value(struct ns_node *n, struct frame *fr)
   return o;
 }
 
-/* Execute a term list as statements, honoring If/Else/While/Return. The method
- * scope is taken from g_scope/g_sdepth set by the caller. */
+/* Execute a term list as statements, honoring If/Else/While/Return; scope comes from g_scope/g_sdepth. */
 static void exec_list(struct frame *fr, const uint8_t *start, const uint8_t *end)
 {
   if (g_rdepth >= MAX_RDEPTH || stack_exhausted()) {
@@ -1892,7 +1756,6 @@ static void exec_list(struct frame *fr, const uint8_t *start, const uint8_t *end
   g_rdepth--;
 }
 
-/* ---- namespace build driver --------------------------------------------- */
 static void build_one(const uint8_t *body, uint32_t len, void *ctx)
 {
   (void)ctx;
@@ -1909,18 +1772,8 @@ static void ns_map_only(const uint8_t *b, uint32_t l, void *c)
 
 static bool build_namespace(void)
 {
-  /* (Re)map every ACPI table into the CURRENT address space before we touch
-   * the node pointers that point into them. The interpreter runs from whatever
-   * context calls it — including a syscall under a user process's CR3 (e.g.
-   * neofetch reading the battery from the terminal). That process's page
-   * directory is a one-time snapshot of the kernel directory taken when it was
-   * created, which on a laptop predates the lazy mapping of the tables (they
-   * sit at a high physical address the shared low identity map doesn't cover),
-   * so the table pages are absent from its CR3 and the AML interpreter #PFs
-   * dereferencing a node->init/body pointer. acpi_for_each_aml maps via
-   * paging_identity_map into the current CR3 and is idempotent, so this is a
-   * cheap no-op once the tables are already present. (QEMU/VMware keep the
-   * tables low and shared, so this only matters on real hardware.) */
+  /* Remap every ACPI table into the current CR3: a process's page directory snapshot may lack the tables on real
+   * hardware. Idempotent. */
   acpi_for_each_aml(ns_map_only, 0);
 
   if (ns_built)
@@ -1940,8 +1793,7 @@ static bool build_namespace(void)
   return node_count > 0;
 }
 
-/* Find a method named seg4 under the battery device (the device whose _HID/_CID
- * is PNP0C0A). */
+/* Find a method named seg4 under the battery device (_HID/_CID PNP0C0A). */
 static struct ns_node *batt_method(const char *seg4)
 {
   uint32_t want =
@@ -1987,17 +1839,8 @@ static struct ns_node *batt_method(const char *seg4)
   return 0;
 }
 
-/* Run every _REG(EmbeddedControl, 1) in the namespace. The ACPI spec requires
- * the OS to call an OperationRegion's _REG once it owns that address space;
- * well-written DSDTs gate their EC field access on the "EC available" flag _REG
- * sets, returning an all-0xFFFFFFFF "data unavailable" template from _BST/_BIF
- * until then. We never installed an EC handler, so we synthesize that step
- * here. Called inside session_begin so the flag _REG stores (a Name, made
- * persistent by eval_named_value's lvalue return) survives into the battery
- * method that follows in the same session. Only runs when an EmbeddedControl
- * region actually exists, so a hypervisor's phantom battery (no EC) is left
- * untouched. A _REG for a different space sees Arg0 != 3 and no-ops, so calling
- * them all is safe. */
+/* Run every _REG(EmbeddedControl, 1) once an EC region exists: DSDTs gate EC access on the flag _REG sets (else
+ * _BST/_BIF return 0xFFFFFFFF). Other spaces no-op. */
 static void prime_reg(void)
 {
   int have_ec = 0;
@@ -2033,18 +1876,15 @@ static void prime_reg(void)
     exec_list(&fr, m->body, m->body + m->body_len);
     g_scope = ss;
     g_sdepth = sd;
-    /* A _REG we can't run just leaves its flag unset — never abort the read. */
+    /* A failing _REG just leaves its flag unset; never abort the read. */
     g_failed = false;
     g_rdepth = 0;
     g_depth = 0;
   }
 }
 
-/* Begin one evaluation session: reset scratch state, then prime _REG so the EC
- * is marked available before the method runs. Materialized Names and arena
- * contents from prime_reg are deliberately KEPT (that's how the EC-available
- * flag reaches the battery method); only the failure/recursion state and time
- * budget are cleared for the method proper. */
+/* Begin a session: reset scratch state and prime _REG; Names and arena from prime_reg are KEPT so the EC-available flag
+ * reaches the method. */
 static void session_begin(void)
 {
   arena_used = 0;
@@ -2092,8 +1932,7 @@ static bool eval_method_pkg(struct ns_node *m, struct obj *out_pkg)
   return true;
 }
 
-/* Evaluate an integer-returning method (e.g. _STA). Returns 1 and writes *out
- * on success, 0 if the method failed or didn't return an integer. */
+/* Evaluate an integer-returning method (e.g. _STA); 1 on success. */
 static bool eval_method_int(struct ns_node *m, uint64_t *out)
 {
   char base;
@@ -2117,11 +1956,8 @@ static bool eval_method_int(struct ns_node *m, uint64_t *out)
   return true;
 }
 
-/* _STA bit 4 (0x10) is "battery present". Some hypervisors (VMware) declare a
- * phantom battery device whose _BST/_BIF still evaluate — to a flat 0% — even
- * though no battery exists; honour _STA so we report "no battery" instead of a
- * bogus 0%. _STA absent or unevaluable => assume present (don't suppress a real
- * battery we just can't query). */
+/* _STA bit 4 (0x10) means present: hypervisors (VMware) declare a phantom battery; absent or unevaluable _STA assumes
+ * present. */
 bool aml_battery_present(void)
 {
   if (!build_namespace())
@@ -2135,12 +1971,7 @@ bool aml_battery_present(void)
   return (st & 0x10) != 0;
 }
 
-/* Diagnostics for real-hardware battery debugging (this path can't be exercised
- * in QEMU). *out_nodes gets the number of namespace objects the two-pass walk
- * recorded; *out_bail gets the opcode at which a term-list walk first gave up
- * (0x5B00|ext for an ExtOp, else the bare opcode), or -1 if it never bailed. A
- * tiny node count or a non-negative bail op means the walk choked before
- * reaching the battery device / EC fields — i.e. an opcode we must handle. */
+/* Diagnostics: namespace object count and the opcode at which a walk first bailed (-1 if none). */
 void aml_ns_stats(int *out_nodes, int *out_bail)
 {
   build_namespace();
@@ -2150,7 +1981,6 @@ void aml_ns_stats(int *out_nodes, int *out_bail)
     *out_bail = ns_bailed ? (int)ns_bail_op : -1;
 }
 
-/* ---- verbose battery dump (real-hardware debugging) --------------------- */
 static char *dbg_str(char *p, char *e, const char *s)
 {
   while (*s && p < e)
@@ -2184,11 +2014,8 @@ static char *dbg_dec(char *p, char *e, int v)
   return p;
 }
 
-/* Dump the raw _BST and _BIF/_BIX field values plus a few structural counts, so
- * we can tell an "EC not available" sentinel package (every _BST field reads
- * 0xFFFFFFFF) apart from a single field that won't read, and see whether a _REG
- * method and an EmbeddedControl region/EC device even exist. Writes a bounded,
- * NUL-terminated one-liner into out. */
+/* Dump raw _BST and _BIF/_BIX fields plus structure counts to tell an "EC unavailable" sentinel from one unreadable
+ * field. */
 void aml_battery_debug(char *out, int max)
 {
   char *p = out, *e = out + (max > 0 ? max - 1 : 0);
@@ -2198,8 +2025,7 @@ void aml_battery_debug(char *out, int max)
     return;
   }
 
-  /* _BST: state, rate, remaining, voltage — all four, so a sentinel template
-   * (all 0xFFFFFFFF bar a 0 state) is unmistakable. */
+  /* _BST: all four fields, so a sentinel (0xFFFFFFFF bar a 0 state) is unmistakable. */
   p = dbg_str(p, e, "BST=");
   struct ns_node *bst = batt_method("_BST");
   if (!bst) {
@@ -2244,8 +2070,7 @@ void aml_battery_debug(char *out, int max)
   }
   int bifpk = g_stack_peak; /* stack the _BIF/_BIX eval actually used */
 
-  /* Peak stack bytes each eval reached vs the AML_STACK_BUDGET ceiling — tells
-   * us how much headroom is left, or by how much a method blew the budget. */
+  /* Peak stack bytes per eval vs the AML_STACK_BUDGET ceiling. */
   p = dbg_str(p, e, " pk=");
   p = dbg_dec(p, e, bstpk);
   p = dbg_str(p, e, "/");
@@ -2253,9 +2078,8 @@ void aml_battery_debug(char *out, int max)
   p = dbg_str(p, e, "/");
   p = dbg_dec(p, e, AML_STACK_BUDGET);
 
-  /* Structural counts: _REG methods, EmbeddedControl regions, EC devices
-   * (PNP0C09). reg=0 with ec>0 is the classic "_BST gated on _REG we never
-   * called" shape. */
+  /* Structural counts: _REG methods, EmbeddedControl regions, EC devices (PNP0C09); reg=0 with ec>0 means _BST gated on
+   * an uncalled _REG. */
   int regm = 0, ecr = 0, ecdev = 0;
   for (int i = 0; i < node_count; i++) {
     struct ns_node *n = &nodes[i];
@@ -2302,12 +2126,8 @@ bool aml_read_battery(struct aml_battery *out)
   struct ns_node *bif = batt_method("_BIF");
   struct ns_node *bix = batt_method("_BIX");
 
-  /* The EC's BSTA flips to 0x0F on transient battery states, which makes _BST
-   * and _BIF return a 0xFFFFFFFF "unknown" sentinel package, and a momentarily
-   * busy EC can yield garbage — so a single read is unreliable. Retry until we
-   * get a sane charge AND capacity. The sentinel path is a fast early-return so
-   * retries are cheap, and each eval is its own session (NGBF/ECRG re-primed),
-   * so a later attempt is independent of an earlier one. */
+  /* EC BSTA 0x0F or a busy EC yields a 0xFFFFFFFF sentinel or garbage, so retry until a sane charge and capacity; each
+   * eval is its own session. */
   uint64_t last_state = 0, last_remaining = 0xFFFFFFFFu;
   for (int tries = 0; tries < 4; tries++) {
     struct obj bstpkg;
@@ -2325,8 +2145,7 @@ bool aml_read_battery(struct aml_battery *out)
     if (remaining == 0xFFFFFFFFu)
       continue; /* sentinel: retry */
 
-    /* Capacity from _BIF (last-full @2, design @1) or _BIX (last-full @3,
-     * design @2). */
+    /* Capacity from _BIF (last-full @2, design @1) or _BIX (@3, @2). */
     uint64_t full = 0, design = 0;
     if (bif) {
       struct obj p;
@@ -2358,8 +2177,7 @@ bool aml_read_battery(struct aml_battery *out)
     out->percent = (int)pct;
     out->discharging = (state & 0x1) != 0;
     out->charging = (state & 0x2) != 0;
-    /* Time to empty = remaining / rate (same unit, so unitless ratio), only
-     * when discharging with a known non-zero rate. */
+    /* Time to empty = remaining / rate, only when discharging with a known non-zero rate. */
     out->minutes = -1;
     if (out->discharging && rate && rate != 0xFFFFFFFFu)
       out->minutes = (int)(remaining * 60 / rate);
@@ -2367,9 +2185,7 @@ bool aml_read_battery(struct aml_battery *out)
     return true;
   }
 
-  /* No sane reading after retries. Keep a method eval error if one is set;
-   * else summarise the last _BST sentinel (state + remaining) as a breadcrumb.
-   */
+  /* No sane reading: keep a method eval error if set, else summarise the last _BST sentinel. */
   if (!err_buf[0]) {
     int i = 0;
     const char *s = "LFC st";

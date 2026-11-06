@@ -1,13 +1,4 @@
-/* anim.c — CSS animation & transition engine. See anim.h.
- *
- * Model: a per-element record (keyed by dom_node*) tracks a running keyframe
- * animation and/or a running transition. Each layout walk, anim_apply() is
- * handed the element's freshly-cascaded style; it interpolates the animatable
- * properties and writes the results back over that style, so the rest of the
- * renderer draws the animated frame with no special-casing. A transition starts
- * when a watched property's cascaded value changes between walks (the usual
- * trigger: a script toggled a class or inline style). Animations take
- * precedence over transitions, per spec, so they overlay last. */
+/* anim.c: CSS animation and transition engine; per-element records overlay interpolated styles. */
 #include "features/anim/anim.h"
 #include "owos.h"
 #include <stdbool.h>
@@ -87,18 +78,14 @@ static struct anim_rec *rec_for(struct dom_node *node)
   return r;
 }
 
-/* ------------------------------------------------ easing -------------------
- */
-/* Cubic Bézier value on one axis for control points (0,a1)->(a2,1) at parameter
- * t (endpoints fixed at 0 and 1). */
+/* Cubic Bezier value on one axis at parameter t, endpoints fixed at 0 and 1. */
 static double bez_axis(double t, double a1, double a2)
 {
   double u = 1.0 - t;
   return 3.0 * u * u * t * a1 + 3.0 * u * t * t * a2 + t * t * t;
 }
 
-/* Map linear progress x in [0,1] through an easing function to an eased value.
- */
+/* Map linear progress x in [0,1] through an easing function. */
 static double ease_curve(int kind, double x)
 {
   if (x <= 0)
@@ -109,9 +96,9 @@ static double ease_curve(int kind, double x)
   case CSS_EASE_LINEAR:
     return x;
   case CSS_EASE_STEP_START:
-    return 1; /* jumps to end immediately */
+    return 1;
   case CSS_EASE_STEP_END:
-    return 0; /* holds start until the very end */
+    return 0;
   default:
     break;
   }
@@ -144,7 +131,7 @@ static double ease_curve(int kind, double x)
   default:
     return x;
   }
-  /* invert x = bez_axis(t) for t by bisection, then evaluate the y axis */
+  /* bisect x = bez_axis(t) for t */
   double lo = 0, hi = 1, t = x;
   for (int i = 0; i < 24; i++) {
     double xe = bez_axis(t, p1x, p2x);
@@ -157,15 +144,12 @@ static double ease_curve(int kind, double x)
   return bez_axis(t, p1y, p2y);
 }
 
-/* ------------------------------------------------ property access ----------
- */
 static bool ap_is_color(int p)
 {
   return p == ANP_COLOR || p == ANP_BG || p == ANP_BORDER_COLOR || p == ANP_OUTLINE_COLOR;
 }
 
-/* Read animatable property `p` from `s`; *set = 1 if the style specifies it
- * (not the unset sentinel). Colours come back as 0xRRGGBB. */
+/* Read animatable property `p`; *set = 1 if specified. Colours are 0xRRGGBB. */
 static long ap_get(const struct css_style *s, int p, int *set)
 {
   *set = 1;
@@ -360,14 +344,10 @@ static long lerp_prop(int p, long a, long b, double f)
   return (long)(v >= 0 ? v + 0.5 : v - 0.5);
 }
 
-/* True if transition property `p` is in mask (TRANS_ALL selects all). */
+/* TRANS_ALL selects every property. */
 static bool prop_in_mask(unsigned mask, int p) { return (mask & TRANS_ALL) ? true : (mask & (1u << p)) != 0; }
 
-/* ------------------------------------------------ keyframe sampling --------
- */
-/* Write the keyframe styles at eased progress `p` (0..1) over `cs`,
- * interpolating between the two stops bracketing p for each animatable property
- * that both define (snapping to whichever one defines it otherwise). */
+/* Write keyframe styles at eased progress `p` over `cs`, interpolating the bracketing stops. */
 static void sample_keyframes(const struct css_keyframes *kf, double p, struct css_style *cs)
 {
   int pm = (int)(p * 1000 + 0.5);
@@ -417,8 +397,7 @@ static void sample_keyframes(const struct css_keyframes *kf, double p, struct cs
   }
 }
 
-/* Overlay the running keyframe animation onto cs. Returns 1 when the animation
- * is finished (no more frames needed from it), 0 while it is still running. */
+/* Overlay the running animation onto cs; returns true once finished. */
 static bool apply_keyframes(css_sheet *sheet, struct anim_rec *r, struct css_style *cs, unsigned now)
 {
   const struct css_keyframes *kf = css_keyframes_find(sheet, r->kf_name);
@@ -428,20 +407,19 @@ static bool apply_keyframes(css_sheet *sheet, struct anim_rec *r, struct css_sty
   if (dur <= 0)
     return true;
   int delay = r->kf_delay > 0 ? r->kf_delay : 0;
-  /* unsigned subtraction first (small, fits): (long)now would overflow 32-bit
-   * long */
-  long el = (long)(now - r->kf_start) - delay; /* ms into the active phase */
+  /* subtract unsigned first: (long)now would overflow a 32-bit long */
+  long el = (long)(now - r->kf_start) - delay;
 
   bool finished = false;
-  double frac; /* 0..1 within the current iteration */
+  double frac;
   long iter_index;
 
   if (el < 0) {
     if (r->kf_fill == CSS_AFILL_BACKWARDS || r->kf_fill == CSS_AFILL_BOTH) {
       frac = 0;
-      iter_index = 0; /* hold the first frame during delay */
+      iter_index = 0;
     } else {
-      return false; /* waiting out the delay, no overlay */
+      return false;
     }
   } else {
     iter_index = el / dur;
@@ -451,7 +429,7 @@ static bool apply_keyframes(css_sheet *sheet, struct anim_rec *r, struct css_sty
       iter_index = r->kf_iter - 1;
       frac = 1.0;
       if (r->kf_fill != CSS_AFILL_FORWARDS && r->kf_fill != CSS_AFILL_BOTH)
-        return true; /* done, no fill: leave cs untouched */
+        return true;
     }
   }
 
@@ -474,15 +452,12 @@ static bool apply_keyframes(css_sheet *sheet, struct anim_rec *r, struct css_sty
   return finished;
 }
 
-/* ------------------------------------------------ transitions --------------
- */
-/* Overlay the running transition onto cs at time `now`. Returns 1 when
- * finished. */
+/* Overlay the running transition onto cs; returns true once finished. */
 static bool apply_transition(struct anim_rec *r, unsigned now, struct css_style *cs)
 {
   long el = (long)(now - r->tr_start) - r->tr_delay;
   if (el < 0)
-    el = 0; /* delay: hold the `from` value */
+    el = 0;
   bool done = false;
   double f;
   if (r->tr_dur <= 0 || el >= r->tr_dur) {
@@ -510,16 +485,12 @@ void anim_apply(css_sheet *sheet, struct dom_node *el, struct css_style *cs, uns
   int wants_anim = cs->anim_name[0] && cs->anim_dur > 0;
   int wants_trans = cs->trans_mask && cs->trans_dur > 0;
 
-  /* No animation, no transition, and nothing already running for this node:
-   * skip the bookkeeping entirely (the common case for most elements). */
   struct anim_rec *r = (wants_anim || wants_trans) ? rec_for(el) : el->anim_rec;
   if (!r)
     return;
 
-  /* The freshly-cascaded animatable values are the transition baseline. */
   struct css_style newbase = *cs;
 
-  /* ---- start a transition when a watched property changed ---- */
   if (wants_trans && r->has_base) {
     unsigned changed = 0;
     for (int p = 0; p < ANP_COUNT; p++) {
@@ -531,9 +502,7 @@ void anim_apply(css_sheet *sheet, struct dom_node *el, struct css_style *cs, uns
         changed |= (1u << p);
     }
     if (changed) {
-      /* from = what is currently displayed: the old steady value, or the
-       * in-flight sample if a transition was already running (avoids a jump
-       * when a transition is reversed mid-way). */
+      /* start from the in-flight sample so a mid-way reversal does not jump */
       struct css_style from = r->base;
       if (r->tr_running)
         apply_transition(r, now, &from);
@@ -550,7 +519,6 @@ void anim_apply(css_sheet *sheet, struct dom_node *el, struct css_style *cs, uns
   r->base = newbase;
   r->has_base = true;
 
-  /* ---- apply the running transition ---- */
   if (r->tr_running) {
     if (apply_transition(r, now, cs))
       r->tr_running = false;
@@ -558,7 +526,7 @@ void anim_apply(css_sheet *sheet, struct dom_node *el, struct css_style *cs, uns
       g_more = true;
   }
 
-  /* ---- keyframe animation (wins over transitions) ---- */
+  /* animations win over transitions */
   if (wants_anim) {
     if (!r->kf_running || strcmp(r->kf_name, cs->anim_name) != 0) {
       int n = 0;

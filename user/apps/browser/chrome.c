@@ -1,9 +1,6 @@
 #include "main_int.h"
 
-/* Address-bar row layout: three nav buttons (Back, Forward, Reload) at the
- * left, the URL text field filling the middle, and the bookmark (star) button
- * pinned to the right. One source of truth for render() and the click handler,
- * so the drawn rects and hit rects never drift. */
+/* Address-bar layout: nav buttons left, URL field middle, star button right. */
 #define NAV_BTN_W 28
 
 void addr_layout(struct rect *back, struct rect *fwd, struct rect *rel, struct rect *tf, struct rect *star)
@@ -34,14 +31,10 @@ void addr_layout(struct rect *back, struct rect *fwd, struct rect *rel, struct r
     tf->w = 32; /* keep the field usable on a narrow window */
 }
 
-/* A load is in flight when the worker is fetching or a navigation is queued for
- * it — the reload/stop button shows Stop, and Page>Stop is enabled, only then.
- */
+/* True while the worker is fetching or a navigation is queued. */
 bool is_loading(void) { return B->loading || B->req_pending; }
 
-/* The reload (circular arrow) and stop (×) glyphs are hand-rasterized:
- * LiberationSans has no dependable U+21BB, and drawing them keeps the button
- * crisp at any size. Both fill a d×d box at (x0,y0). */
+/* Hand-rasterized reload arrow (LiberationSans lacks U+21BB), filling a d x d box at (x0,y0). */
 static void icon_reload(int x0, int y0, int d, unsigned col)
 {
   int cx = x0 + d / 2, cy = y0 + d / 2, r = d / 2;
@@ -54,8 +47,7 @@ static void icon_reload(int x0, int y0, int d, unsigned col)
         continue; /* open the ring at the top */
       gfx_pixel(cx + px, cy + py, col);
     }
-  /* arrowhead at the gap's right end: a corner stroke that reads as clockwise
-   */
+  /* arrowhead at the gap's right end */
   for (int k = 0; k <= 3; k++) {
     gfx_pixel(cx + k, cy - r, col);     /* along the top    */
     gfx_pixel(cx + 3, cy - r + k, col); /* turning downward */
@@ -72,8 +64,7 @@ static void icon_stop(int x0, int y0, int d, unsigned col)
   }
 }
 
-/* Draw the combined reload/stop button: the reload arrow while idle, a red × to
- * stop while a load is in flight. */
+/* Reload arrow while idle, red stop cross while loading. */
 void reload_btn_draw(const struct rect *r)
 {
   int d = 12;
@@ -85,10 +76,7 @@ void reload_btn_draw(const struct rect *r)
     icon_reload(x0, y0, d, 0xe6ebf2);
 }
 
-/* A bookmark-ribbon glyph in a d×d box at (x0,y0): a flag with a V-notch tail,
- * either solid-filled (the page is bookmarked) or a hollow outline (it isn't).
- * Hand-rasterized like the reload/stop icons rather than relying on a font
- * glyph. */
+/* Bookmark ribbon (V-notch tail) in a d x d box at (x0,y0), filled or outline. */
 static void icon_bookmark(int x0, int y0, int d, unsigned col, int filled)
 {
   int half = d / 2, notch = d / 3;
@@ -106,9 +94,7 @@ static void icon_bookmark(int x0, int y0, int d, unsigned col, int filled)
     }
 }
 
-/* Draw the bookmark (star) button: a solid gold ribbon when the current page is
- * bookmarked, a hollow grey one otherwise. The button dims on a blank tab (no
- * URL to bookmark), matching the Bookmarks menu's disabled toggle. */
+/* Gold ribbon when bookmarked, hollow grey otherwise; disabled on a blank tab. */
 void star_btn_draw(const struct rect *r)
 {
   bool has_url = B->pg->cur_url[0] != '\0';
@@ -121,8 +107,7 @@ void star_btn_draw(const struct rect *r)
     icon_bookmark(x0, y0, d, 0x9098a0, 0); /* hollow grey  */
 }
 
-/* A display title for the current page: its <title>, else the host, else the
- * URL. */
+/* The page's <title>, else the host, else the URL. */
 static void current_page_title(char *out, int cap)
 {
   if (B->pg->doc_title[0]) {
@@ -136,11 +121,7 @@ static void current_page_title(char *out, int cap)
     strlcpy(out, B->pg->cur_url[0] ? B->pg->cur_url : "Untitled", cap);
 }
 
-/* --- bookmarks panel state --------------------------------------------------
- * * The favicon/folder tree is shown in a left-side panel drawn over the
- * content pane (bookmarks_panel_render below). These track its open state,
- * scroll, the selected node (highlight + the target folder for new
- * bookmarks/folders), and an inline text field used to name a new folder. */
+/* Bookmarks panel state: open, scroll, selection, and the new-folder name field. */
 #define BM_ROW_H 20
 bool bm_panel_open;
 int bm_panel_scroll;                /* first visible row index */
@@ -150,8 +131,7 @@ char bm_name_buf[64];
 int bm_naming;                  /* 1 = the name field is active */
 struct bm_node *bm_name_parent; /* folder the new folder joins */
 
-/* The folder new bookmarks/folders should join: the selected folder when the
- * panel is open and a folder is picked, else the root. */
+/* The selected folder when the panel is open, else the root. */
 static struct bm_node *bm_target_folder(void)
 {
   if (bm_panel_open && bm_selected && bm_selected->is_folder)
@@ -159,9 +139,7 @@ static struct bm_node *bm_target_folder(void)
   return bookmarks_root();
 }
 
-/* Add or remove the current page's bookmark (the star button and the Bookmarks
- * menu's item 0 both call this). No-op on a blank tab. A new bookmark captures
- * the page's favicon and joins the target folder. */
+/* Toggle the current page's bookmark; no-op on a blank tab. */
 void toggle_current_bookmark(void)
 {
   const char *url = B->pg->cur_url;
@@ -177,9 +155,7 @@ void toggle_current_bookmark(void)
   B->seq++; /* repaint: the star + panel reflect the change */
 }
 
-/* Start naming a new folder inside `parent` (root if NULL): open the panel,
- * focus an empty inline text field. Enter creates it (handle_key), Esc cancels.
- */
+/* Open the panel with an empty name field for a new folder in `parent` (root if NULL). */
 void begin_new_folder(struct bm_node *parent)
 {
   bm_panel_open = true;
@@ -189,8 +165,7 @@ void begin_new_folder(struct bm_node *parent)
   B->seq++;
 }
 
-/* Refresh the Bookmarks bar menu's dynamic labels + item-0 state. Runs on the
- * main thread right before the menu is drawn or clicked. */
+/* Refresh the Bookmarks menu labels and item-0 state before it is drawn or clicked. */
 void bookmarks_menu_sync(void)
 {
   bool marked = B->pg->cur_url[0] && bookmark_find(B->pg->cur_url) != 0;
@@ -204,27 +179,18 @@ void bookmarks_menu_sync(void)
   bm_flags[2] = 0;
 }
 
-/* The absolute URL of the link currently under the cursor, shown in a status
- * box pinned to the content pane's bottom-left (like Chrome/Firefox). Empty =
- * none. Main-thread-only UI state, so it lives here rather than in the shared
- * struct. */
+/* URL of the link under the cursor, shown in the status box; empty = none. Main thread only. */
 char hover_url[URL_MAX];
 
-/* Last pointer Y (from WEV_MOVE/clicks), so the wheel scrolls whichever surface
- * it's over: the devtools dock when the pointer is inside it, else the page. */
+/* Last pointer position, so the wheel scrolls the surface under it. */
 int last_my = -1;
 int last_mx = -1;
 int dt_resizing = 0; /* dragging the devtools panel's resize edge */
 
-/* Set when only the address-bar chrome changed (a URL-field keystroke): the
- * main loop then repaints just that strip instead of re-wrapping and
- * re-blitting the whole page. Distinct from B->seq, which forces a full render.
- */
+/* Set when only the address bar changed, so the main loop repaints just that strip. */
 bool addr_dirty;
 
-/* Copy `src` into `dst` (cap bytes) truncated to fit `maxpx` pixels in the UI
- * font, appending a "..." ellipsis when it had to shorten. Used for the
- * hovered- link status box, where a long URL must not overrun the box. */
+/* Copy `src` into `dst`, truncated with "..." to fit `maxpx` pixels in the UI font. */
 void fit_ui(char *dst, int cap, const char *src, int maxpx)
 {
   int n = 0;
@@ -252,16 +218,7 @@ void fit_ui(char *dst, int cap, const char *src, int maxpx)
   sapp(dst, &n, cap, "...");
 }
 
-/* --- bookmarks panel: a left-side tree of folders + favicon bookmarks --------
- * Drawn over the content pane when open (below the address bar), so it never
- * reflows the page. Folders expand/collapse; a bookmark shows its 16x16 favicon
- * and navigates on click. New folders (with an inline typed name), the
- * selected- node highlight, delete, and wheel scroll are handled here + in the
- * click/key paths. */
-
-/* Panel geometry: the panel rect, the two header buttons, the inline name
- * field, and the y where the tree rows begin. One source of truth for render +
- * click. */
+/* Bookmarks panel geometry: panel rect, header buttons, name field, and the first tree row y. */
 static void bm_layout(struct rect *nf, struct rect *del, struct rect *name, struct rect *panel, int *list_y)
 {
   int top = MENU_H + TAB_H + ADDR_H;
@@ -288,8 +245,7 @@ static void bm_layout(struct rect *nf, struct rect *del, struct rect *name, stru
   *list_y = ny + (bm_naming ? 26 : 0);
 }
 
-/* Flatten the visible tree (a folder contributes its children only when
- * expanded) into a row list shared by the renderer and hit-testing. */
+/* Visible tree rows (children only when expanded), shared by render and hit-testing. */
 struct bm_row {
   struct bm_node *node;
   int depth;
@@ -316,8 +272,7 @@ static void bm_flatten(void)
   bm_flatten_into(bookmarks_root(), 0);
 }
 
-/* A small disclosure triangle: right-pointing (collapsed) or down-pointing
- * (open), centred on row-centre `cy`. */
+/* Disclosure triangle, right (collapsed) or down (open), centred on `cy`. */
 static void bm_tri(int x, int cy, int open, unsigned col)
 {
   for (int i = 0; i <= 3; i++)
@@ -386,8 +341,7 @@ void bookmarks_panel_render(void)
   gfx_fill_rect(BM_PANEL_W - 1, top, 1, panel.h, 0x0f1319); /* right border */
 }
 
-/* Route a click inside the bookmarks panel. Returns 1 if it was inside the
- * panel (consumed), 0 to let it fall through to the page. */
+/* Handle a click in the panel; false lets it fall through to the page. */
 bool bm_panel_click(int mx, int my)
 {
   struct rect nf, del, name, panel;

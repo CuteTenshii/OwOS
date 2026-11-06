@@ -1,12 +1,10 @@
 #include "html_int.h"
 
-/* The focused form control (a text input or textarea), or NULL. The worker sets
- * it on click (html_set_focus); the renderer draws a caret in it. */
+/* The focused form control (a text input or textarea), or NULL */
 struct dom_node *g_focus;
 struct dom_node *html_focus(void) { return g_focus; }
 
-/* Set by the control emitters during the walk; lets the worker route content
- * clicks even on a script-less page so its form controls stay interactive. */
+/* Set by the control emitters during the walk */
 bool g_has_controls;
 int html_has_controls(void) { return g_has_controls; }
 
@@ -53,8 +51,7 @@ void html_set_focus(struct dom_node *n)
   B->focus_kind = (k == CTRL_TEXT) ? 1 : (k == CTRL_TEXTAREA) ? 2 : 0;
 }
 
-/* --- control default actions (worker-side; called from main.c) -------------
- */
+/* --- control default actions (worker-side */
 
 void html_toggle_checked(struct dom_node *c)
 {
@@ -134,8 +131,7 @@ void html_seed_textarea(struct dom_node *ta)
   dom_set_attr(ta, "value", buf);
 }
 
-/* Edit the focused text control's value: append a char, or backspace. Returns
- * the node so the caller can fire an 'input' event on it. */
+/* Edit the focused text control's value */
 struct dom_node *html_focus_edit(int ch)
 {
   char buf[2048];
@@ -161,9 +157,7 @@ struct dom_node *html_focus_edit(int ch)
   return g_focus;
 }
 
-/* application/x-www-form-urlencoded component encoding: a space becomes '+' and
- * every byte outside the unreserved set is percent-encoded, so a value holding
- * '&', '=', ' ' or UTF-8 can't corrupt the field separators. */
+/* application/x-www-form-urlencoded component encoding */
 static bool form_unreserved(unsigned char c)
 {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
@@ -189,9 +183,7 @@ static void enc_field(char *q, int *qn, int cap, const char *s)
   q[*qn] = '\0';
 }
 
-/* Append one "name=value" pair to the encoded field set. FE_PLAIN (enctype
- * text/plain) writes the raw bytes with no escaping and '\n' separators; the
- * default urlencoded form percent-encodes both sides and joins with '&'. */
+/* Append one "name=value" pair to the encoded field set */
 enum { FE_URLENC, FE_PLAIN };
 static void q_field(char *q, int *qn, int cap, const char *name, const char *val, int enc)
 {
@@ -211,11 +203,7 @@ static void q_field(char *q, int *qn, int cap, const char *name, const char *val
   }
 }
 
-/* Collect the successful controls of a form into an encoded field set.
- * `clicked` is the activated submit control, whose own name/value is a
- * successful field (other submit/button/reset controls are not).
- * Checkboxes/radios contribute only when checked; a select contributes its
- * value; hidden inputs contribute. */
+/* Collect the successful controls of a form into an encoded field set */
 static void form_fields(struct dom_node *n, char *q, int *qn, int cap, struct dom_node *clicked, int enc)
 {
   for (struct dom_node *c = n->first_child; c; c = c->next) {
@@ -261,9 +249,6 @@ int html_form_build(struct dom_node *control, struct form_submission *fs)
   fs->ctype[0] = '\0';
   strcpy(fs->method, "GET");
 
-  /* A submit control may override the form's action/method/enctype via its
-   * formaction/formmethod/formenctype attributes (HTML "attributes for form
-   * submission"). Fall back to the form's own attributes otherwise. */
   action = control ? dom_get_attr(control, "formaction") : 0;
   method = control ? dom_get_attr(control, "formmethod") : 0;
   enctype = control ? dom_get_attr(control, "formenctype") : 0;
@@ -280,9 +265,7 @@ int html_form_build(struct dom_node *control, struct form_submission *fs)
     sapp(fs->url, &on, sizeof fs->url, g_cur_page_url);
   }
 
-  /* CSP form-action: refuse a submission whose target the policy forbids.
-   * Logged unconditionally (this is a user action, not the spammy per-relayout
-   * walk). */
+  /* CSP form-action: refuse a submission whose target the policy forbids. Logged unconditionally */
   if (B->pg->csp) {
     char fa[URL_MAX], reason[64];
     if (!csp_check_url(B->pg->csp, CSP_FORM, fs->url, g_cur_page_url, fa, sizeof fa, reason, sizeof reason)) {
@@ -300,9 +283,7 @@ int html_form_build(struct dom_node *control, struct form_submission *fs)
   }
 
   is_post = method && streq_ci(method, "post");
-  /* multipart/form-data needs file uploads (no file picker here), so a POST
-   * that asks for it degrades to urlencoded; text/plain is honored for both
-   * methods. */
+  /* multipart/form-data needs file uploads (no file picker here) */
   enc = (enctype && streq_ci(enctype, "text/plain")) ? FE_PLAIN : FE_URLENC;
 
   q[0] = '\0';
@@ -324,8 +305,7 @@ int html_form_build(struct dom_node *control, struct form_submission *fs)
   return 1;
 }
 
-/* Render <input> as a boxed widget reflecting its live value/checked state; a
- * focused text field shows a caret so typing is visible. */
+/* Render <input> as a boxed widget reflecting its live value/checked state */
 void emit_input(struct dom_node *el)
 {
   const char *type = dom_get_attr(el, "type");
@@ -368,9 +348,7 @@ void emit_input(struct dom_node *el)
   }
 }
 
-/* <textarea>: edits land in a synthetic "value" attribute (seeded from the
- * initial text on first focus); show that when present, else the original
- * content. */
+/* <textarea>: edits land in a synthetic "value" attribute (seeded from the initial text on first */
 void emit_textarea(struct dom_node *el)
 {
   const char *val = dom_get_attr(el, "value");
@@ -407,9 +385,7 @@ void emit_select(struct dom_node *el)
   emit_lit(" \xe2\x96\xbe ]", ST_BOLD); /* small down triangle */
 }
 
-/* Parse a numeric attribute (value/min/max) into thousandths, so "0.6" -> 600
- * and "8" -> 8000; missing or non-numeric yields `def`. Keeps
- * <progress>/<meter> math in integers (no float attr parsing needed). */
+/* Parse a numeric attribute (value/min/max) into thousandths, so "0.6" -> 600 and "8" -> 8000 */
 static long attr_milli(struct dom_node *el, const char *name, long def)
 {
   const char *s = dom_get_attr(el, name);

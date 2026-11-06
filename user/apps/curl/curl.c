@@ -1,22 +1,13 @@
-/* curl.c - an HTTP/1.1 client, a thin CLI over libcurl (user/lib/http.c).
- *
- * The protocol lives in libcurl; this file just parses options, picks where the
- * body goes (console, or a buffer for -o), and reports the outcome. Ctrl+C is a
- * cooperative interrupt: a blocked transfer returns HTTP_EINTR and we print ^C.
- *
- *   run curl http://example.com
- *   run curl -i https://example.com
- *   run curl -o page.html http://example.com/index.html
- */
+/* curl.c - an HTTP/1.1 client, a thin CLI over libcurl (user/lib/http.c) */
 
 #include "http.h"
 #include "opt.h"
 #include "owos.h"
 #include <stdbool.h>
 
-/* ---- body sinks -------------------------------------------------------- */
+/* body sinks */
 
-/* Console mode: batch and write to fd 1. */
+/* Console mode: batch and write to fd 1 */
 static char con_buf[1024];
 static int con_len;
 
@@ -39,7 +30,7 @@ static int sink_console(void *ctx, const unsigned char *buf, int len)
   return 0;
 }
 
-/* -o mode: accumulate into a buffer, then writefile. */
+/* -o mode: accumulate into a buffer, then writefile */
 static char save_buf[256 * 1024];
 static bool save_overflow;
 static int save_len;
@@ -64,8 +55,8 @@ int main(int argc, char **argv)
   const char *method = "GET";
   const char *outname = 0;
   const char *url = 0;
-  const char *user_agent = 0; /* -A: overrides the default UA           */
-  bool ua_in_headers = false; /* set if a -H line already gives one      */
+  const char *user_agent = 0; /* -A: overrides the default UA */
+  bool ua_in_headers = false; /* set if a -H line already gives one */
   char xhdr[2048];
   int xhlen = 0; /* -H request headers ("name: value\r\n"…) */
 
@@ -112,9 +103,7 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  /* The User-Agent is the tool's to send, not libcurl's (as on a real system):
-   * add "-A" if given, else a default - unless a -H line already carries one.
-   */
+  /* The User-Agent is the tool's to send, not libcurl's (as on a real system) */
   if (!ua_in_headers) {
     const char *ua = user_agent ? user_agent : "owos-curl/1.0";
     for (const char *s = "User-Agent: "; *s && xhlen < (int)sizeof xhdr - 3; s++)

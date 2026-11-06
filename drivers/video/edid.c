@@ -1,20 +1,4 @@
-/* edid.c — read a monitor's EDID over Intel GMBUS, recover its refresh rate.
- *
- * Why GMBUS and nothing else: there is no portable, BIOS-free way to reach the
- * DDC/I2C lines that carry EDID — each GPU family exposes its own I2C engine.
- * Intel's "GMBUS" is a clean MMIO controller that has stayed largely stable
- * across generations, and Intel integrated graphics is what a hobby kernel will
- * actually meet on a laptop, so it is the one transport worth implementing. We
- * walk the candidate DDC pin pairs, do a single I2C read of 128 bytes from the
- * EDID EEPROM at slave address 0x50, validate the block, and derive the refresh
- * rate from the preferred detailed timing descriptor.
- *
- * This cannot be exercised under QEMU (its emulated VGA answers no EDID over
- * GMBUS), so it is real-hardware-only and best-effort throughout: every failure
- * path records edid_error() and returns 0/empty rather than faulting. Known
- * gaps, by design: non-Intel GPUs, and internal eDP panels (EDID over the DP
- * AUX channel, not I2C). See edid.h.
- */
+/* edid.c: read a monitor's EDID over Intel GMBUS and recover its refresh rate (real hardware only). */
 
 #include "edid.h"
 #include "paging.h"
@@ -23,7 +7,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* GMBUS register block, offsets from the block base. */
 #define GMBUS0 0x00 /* clock / pin-pair select                              */
 #define GMBUS1 0x04 /* command + status                                     */
 #define GMBUS2 0x08 /* status                                               */
@@ -43,16 +26,10 @@
 #define EDID_ADDR 0x50 /* DDC EEPROM I2C slave address                      */
 #define EDID_LEN 128   /* one EDID block                                    */
 
-/* The GMBUS block sits at different offsets within BAR0 across generations: the
- * PCH-split parts (Gen5+) at 0xC5100, older integrated parts at 0x5100. We try
- * both. (VLV/CHV's 0x180000 display offset is left out — niche, and untestable
- * here anyway.) */
+/* GMBUS block offset in BAR0: 0xC5100 on PCH-split parts (Gen5+), 0x5100 on older ones. Try both. */
 static const uint32_t gmbus_bases[] = {0xC5100, 0x5100};
 
-/* Candidate DDC pin pairs (GMBUS0[2:0]). The pin->port mapping shifts between
- * generations, so rather than decode it we just try the usual suspects —
- * analog/VGA and the digital ports — and take whichever answers with a valid
- * block. */
+/* Candidate DDC pin pairs (GMBUS0[2:0]); the pin to port mapping varies by generation. */
 static const uint8_t gmbus_pins[] = {2, 4, 5, 6, 3, 1};
 
 static volatile uint8_t *mmio; /* mapped GPU BAR0                         */
@@ -78,9 +55,7 @@ static void seterr(const char *s)
 static inline uint32_t rd(uint32_t off) { return *(volatile uint32_t *)(mmio + base + off); }
 static inline void wr(uint32_t off, uint32_t val) { *(volatile uint32_t *)(mmio + base + off) = val; }
 
-/* Locate the first Intel display controller (vendor 0x8086, PCI class 0x03) and
- * return its BAR0 physical base. Integrated graphics always lives on bus 0, so
- * a single-bus scan is enough. Returns 0 on success. */
+/* Find the first Intel display controller on bus 0; BAR0 base goes to bar_out. 0 on success. */
 static int find_intel_gpu(uint32_t *bar_out)
 {
   for (uint8_t slot = 0; slot < 32; slot++) {
@@ -91,7 +66,7 @@ static int find_intel_gpu(uint32_t *bar_out)
       if ((id & 0xFFFF) != 0x8086)
         continue;
       uint32_t cls = pci_read32(0, slot, func, 0x08);
-      if (((cls >> 24) & 0xFF) != 0x03) /* 0x03 = display          */
+      if (((cls >> 24) & 0xFF) != 0x03)
         continue;
 
       uint32_t bar0 = pci_read32(0, slot, func, 0x10);
@@ -109,12 +84,10 @@ static int find_intel_gpu(uint32_t *bar_out)
   return -1;
 }
 
-/* Single GMBUS I2C read: `len` bytes from `addr` on the selected `pin` into
- * buf. The DDC EEPROM's address pointer powers up at 0, so a bare read returns
- * the block from byte 0. Returns 0 on success, -1 on NAK, -2 on timeout. */
+/* One GMBUS I2C read of len bytes from addr on pin. 0 ok, -1 NAK, -2 timeout. */
 static int gmbus_read(uint8_t pin, uint8_t addr, uint8_t *buf, int len)
 {
-  wr(GMBUS1, GMBUS_SW_CLR_INT); /* clear any stale state    */
+  wr(GMBUS1, GMBUS_SW_CLR_INT);
   wr(GMBUS1, 0);
   wr(GMBUS0, pin | GMBUS_RATE_100KHZ);
 
@@ -126,13 +99,13 @@ static int gmbus_read(uint8_t pin, uint8_t addr, uint8_t *buf, int len)
     uint32_t start = timer_us();
     for (;;) {
       uint32_t st = rd(GMBUS2);
-      if (st & GMBUS_SATOER) { /* no monitor on this pin  */
+      if (st & GMBUS_SATOER) {
         wr(GMBUS0, 0);
         return -1;
       }
       if (st & GMBUS_HW_RDY)
         break;
-      if (timer_us() - start > 50000) { /* 50 ms guard             */
+      if (timer_us() - start > 50000) {
         wr(GMBUS0, 0);
         return -2;
       }
@@ -141,12 +114,11 @@ static int gmbus_read(uint8_t pin, uint8_t addr, uint8_t *buf, int len)
     for (int b = 0; b < 4 && got < len; b++)
       buf[got++] = (word >> (b * 8)) & 0xFF;
   }
-  wr(GMBUS0, 0); /* release the bus          */
+  wr(GMBUS0, 0);
   return 0;
 }
 
-/* EDID header is 00 FF FF FF FF FF FF 00, and the 128 bytes sum to 0 mod 256.
- */
+/* EDID header is 00 FF FF FF FF FF FF 00 and the 128 bytes sum to 0 mod 256. */
 static bool edid_valid(const uint8_t *e)
 {
   static const uint8_t hdr[8] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0};
@@ -159,13 +131,12 @@ static bool edid_valid(const uint8_t *e)
   return sum == 0;
 }
 
-/* Derive width/height/refresh from the first detailed timing descriptor (the
- * preferred mode), at offset 54. refresh = pixel_clock / (htotal * vtotal). */
+/* Width/height/refresh from the preferred detailed timing descriptor at offset 54. */
 static int parse_preferred(const uint8_t *e)
 {
   const uint8_t *d = e + 54;
   uint32_t pclk = d[0] | ((uint32_t)d[1] << 8); /* 10 kHz units           */
-  if (pclk == 0) {                              /* not a timing descriptor */
+  if (pclk == 0) {
     seterr("no preferred DTD");
     return -1;
   }
@@ -181,15 +152,13 @@ static int parse_preferred(const uint8_t *e)
     return -1;
   }
   uint32_t total = htotal * vtotal;
-  cached_hz = (int)((pclk * 10000u + total / 2) / total); /* rounded Hz   */
+  cached_hz = (int)((pclk * 10000u + total / 2) / total);
   cached_w = (int)hact;
   cached_h = (int)vact;
   return 0;
 }
 
-/* PNP vendor ids that belong to laptop-panel makers (as opposed to standalone
- * monitor brands). EDID alone has no "internal" bit, so the panel vendor is the
- * practical signal that the display is an integrated laptop screen. */
+/* PNP ids of laptop-panel makers; EDID has no "internal" bit, so the vendor is the signal. */
 static bool panel_vendor(const char *mfg)
 {
   static const char *panels[] = {
@@ -211,8 +180,7 @@ static bool panel_vendor(const char *mfg)
   return false;
 }
 
-/* Decode the manufacturer id (bytes 8-9, three 5-bit letters) and, if present,
- * the monitor-name descriptor (tag 0xFC) — the brand/model neofetch shows. */
+/* Decode the manufacturer id (bytes 8-9) and the monitor-name descriptor (tag 0xFC), if any. */
 static void parse_identity(const uint8_t *e)
 {
   uint16_t m = ((uint16_t)e[8] << 8) | e[9];
@@ -221,9 +189,7 @@ static void parse_identity(const uint8_t *e)
   cached_mfg[2] = (char)('@' + (m & 0x1F));
   cached_mfg[3] = '\0';
 
-  /* The four 18-byte descriptors start at offset 54; a monitor descriptor has
-   * the lead-in 00 00 00 <tag>, and tag 0xFC carries the ASCII name (≤13 bytes,
-   * 0x0A-terminated, space-padded). */
+  /* Descriptors start at offset 54; 00 00 00 FC leads the ASCII name (<=13 bytes, 0x0A-terminated). */
   for (int off = 54; off <= 108; off += 18) {
     const uint8_t *d = e + off;
     if (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0xFC) {
@@ -252,9 +218,7 @@ static void probe(void)
   if (find_intel_gpu(&bar) != 0)
     return;
 
-  /* The GMBUS block lives in the first ~1 MiB of BAR0 (0x5100 / 0xC5100);
-   * map that much uncached. The map is one-shot (not reclaimed), like the
-   * ACPI table maps. */
+  /* Map the first ~1 MiB of BAR0 uncached (one-shot, not reclaimed). */
   if (paging_identity_map(bar, 0x100000) != 0) {
     seterr("BAR map failed");
     return;
@@ -274,7 +238,7 @@ static void probe(void)
       }
       if (parse_preferred(edid) == 0) {
         parse_identity(edid);
-        return; /* success                 */
+        return;
       }
     }
   }
@@ -309,8 +273,7 @@ int edid_internal(void)
   return cached_internal;
 }
 
-/* Friendly brand for the common monitor/panel PNP ids; falls back to the raw
- * 3-letter code so an unknown display still shows something meaningful. */
+/* Friendly brand for common PNP ids, else the raw 3-letter code. */
 static const char *brand_name(const char *mfg)
 {
   static const struct {
@@ -328,8 +291,7 @@ static const char *brand_name(const char *mfg)
   return mfg;
 }
 
-/* Compose "<brand> <model>" (e.g. "Dell U2412M") into out; "" if no EDID. The
- * monitor-name descriptor is optional, so a panel may yield brand only. */
+/* Compose "<brand> <model>" into out; "" if no EDID. */
 void edid_model(char *out, int len)
 {
   ensure();

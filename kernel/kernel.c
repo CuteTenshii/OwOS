@@ -1,9 +1,4 @@
-/* kernel.c — OwOS entry point (called from boot.S).
- *
- * Brings up the core subsystems in order, sets up memory (physical frame
- * allocator, paging, kernel heap), enables interrupts, then drops into the
- * shell.
- */
+/* kernel.c: OwOS entry point (called from boot.S); brings up subsystems in order, then runs the shell. */
 
 #include <stdint.h>
 
@@ -52,10 +47,7 @@
 #include "vmtools.h"
 #include "xhci.h"
 
-/* Boot-stage breadcrumb shown on the panic screen. On a laptop there is no COM1
- * to capture the serial log and the panic clears the boot log off screen, so
- * the panic must carry "how far did boot get" itself (idt.c prints it as
- * boot=...). Updated by bootmark(). */
+/* Boot-stage breadcrumb printed by the panic screen (idt.c). */
 const char *g_boot_stage = "early";
 static void bootmark(const char *s) { g_boot_stage = s; }
 
@@ -77,10 +69,7 @@ static void shell_interrupt_locked(void)
   irq_restore(flags);
 }
 
-/* Install an embedded program/asset blob to owofs, (re)creating it when absent
- * OR when the on-disk size differs from the built-in blob. The size check makes
- * a rebuilt binary actually replace the persisted copy in disk.img — without it
- * an "install only if absent" boots the stale program after every rebuild. */
+/* Install an embedded blob to owofs when absent or when its size differs from the built-in one. */
 static void install_blob(const char *path, const unsigned char *start, const unsigned char *end)
 {
   uint32_t len = (uint32_t)(end - start);
@@ -90,11 +79,7 @@ static void install_blob(const char *path, const unsigned char *start, const uns
   fs_create(path, start, len);
 }
 
-/* Install any embedded blob to owofs from just its disk path + objcopy symbol
- * base: the start/end externs and the install call all derive from the base, so
- * adding a shipped file (program, font, asset) is one line and never a separate
- * extern pair. INSTALL_APP wraps the /bin program convention (build.mk renames
- * each program blob to _binary_app_<nm>_{start,end}). */
+/* Install an embedded blob given its disk path and objcopy symbol base; INSTALL_APP is the /bin form. */
 #define INSTALL_FILE(diskpath, symbase)                                                                                \
   do {                                                                                                                 \
     extern const unsigned char symbase##_start[];                                                                      \
@@ -103,17 +88,14 @@ static void install_blob(const char *path, const unsigned char *start, const uns
   } while (0)
 #define INSTALL_APP(nm) INSTALL_FILE("/bin/" #nm, _binary_app_##nm)
 
-/* Two CPU-bound kernel threads that never yield. If scheduling were
- * cooperative the first one would hang the machine; under preemption the
- * shell stays responsive and `tasks` shows their run counts climbing. */
+/* CPU-bound thread that never yields (preemption test). */
 static void spinner(void)
 {
   for (;;)
     __asm__ volatile("");
 }
 
-/* Load a /bin program and run it as a detached root process (the WM reaps it).
- * Used to launch PID 1 (/bin/init) at boot. */
+/* Load a /bin program and run it as a detached root process. */
 static void spawn_bin_detached(const char *path, char *arg0)
 {
   int sz = fs_size(path);
@@ -127,42 +109,22 @@ static void spawn_bin_detached(const char *path, char *arg0)
   kfree(buf);
 }
 
-/* Slow post-`sti` device bring-up, run as a background thread so the shell
- * input loop in kernel_main starts immediately. On real hardware DHCP
- * retransmits and xHCI port resets (both timer_sleep-based) take seconds; doing
- * them inline left keystrokes piling up in the keyboard ring — captured at
- * `sti`, but not drained until the loop ran — and flushing all at once when
- * boot finished. A kernel thread runs with IF=1, so the "must run after sti"
- * timer_sleep paths are happy. */
+/* Slow post-sti bring-up in a background thread so the shell loop starts at once. */
 static void boot_bringup(void)
 {
-  /* Launch PID 1: /bin/init, detached from this post-sti boot thread, as root
-   * (init inherits uid 0, so the daemons it spawns get the privileges dhcpcd's
-   * raw socket / sshd's spawn-as-user need). init reads /etc/inittab and brings
-   * up the user daemons (dhcpcd/mdnsd/sshd) -- the kernel no longer does init's
-   * job. Non-blocking here (init detaches its own children). */
+  /* PID 1 runs as root so the daemons it spawns inherit uid 0. */
   spawn_bin_detached("/bin/init", "init");
 
   bootmark("xhci");
-  xhci_boot(); /* USB host up + devices configured.            */
+  xhci_boot();
 
   bootmark("vmtools");
-  vmtools_init(); /* VMware guest agent: clock sync + guestinfo +   */
-  /* heartbeat + clipboard sync over the backdoor.  */
-  /* No-op off VMware.                              */
+  vmtools_init(); /* no-op off VMware */
 
-  sched_exit(0); /* one-shot: done, leave a zombie to reap        */
+  sched_exit(0);
 }
 
-/* GRUB boots us through multiboot2 (its only reliable UEFI handoff). Translate
- * that tag-chain into the multiboot1 `struct multiboot_info` the rest of the
- * kernel consumes, so pmm/fb stay format-agnostic. The synthesized mmap is
- * emitted in multiboot1 entry layout (a 4-byte size=20 field, then the 8/8/4
- * addr/len/type) into a static scratch buffer that pmm walks the usual way.
- * Returns the filled-in info struct. */
-/* True if the NUL-terminated command line `s` contains the whitespace-delimited
- * token `tok` (so "verbose" matches "ro verbose quiet" but not "verbosely").
- * Used to read boot flags like `verbose` off the kernel command line. */
+/* True if command line `s` has `tok` as a whitespace-delimited token. */
 static bool cmdline_has(const char *s, const char *tok)
 {
   if (!s)
@@ -179,18 +141,16 @@ static bool cmdline_has(const char *s, const char *tok)
     }
     if (*b == '\0' && (*a == '\0' || *a == ' ' || *a == '\t'))
       return true;
-    while (*s && *s != ' ' && *s != '\t') /* skip to the next token       */
+    while (*s && *s != ' ' && *s != '\t')
       s++;
   }
 }
 
 static struct multiboot_info synth_mbi;
-/* Real UEFI firmware hands GRUB a memory map with *hundreds* of descriptors
- * (ACPI, runtime services, MMIO holes, fragmented conventional RAM); QEMU has
- * only a handful. Cap generously — a too-small buffer silently drops the later
- * regions, and if the bulk RAM block lands past the cutoff, pmm sees ~0 MiB. */
-static uint8_t synth_mmap[1024 * 24]; /* up to 1024 regions, 24 bytes each    */
+/* UEFI maps can have hundreds of regions; too small a cap drops later ones. */
+static uint8_t synth_mmap[1024 * 24];
 
+/* Translate GRUB's multiboot2 tags into a multiboot1 info struct (mmap in mb1 entry layout). */
 static struct multiboot_info *multiboot2_to_info(uintptr_t info_addr)
 {
   struct multiboot_info *m = &synth_mbi;
@@ -238,30 +198,23 @@ static struct multiboot_info *multiboot2_to_info(uintptr_t info_addr)
       m->framebuffer_type = fbt->framebuffer_type;
       m->flags |= MULTIBOOT_FLAG_FB;
     } else if (tag->type == MB2_TAG_ACPI_OLD || tag->type == MB2_TAG_ACPI_NEW) {
-      /* The firmware's RSDP. On UEFI it's not in the legacy BIOS area,
-       * so hand it to power.c now (we're still pre-paging and the whole
-       * 4 GiB is flat) — it stashes a copy so shutdown can reach ACPI. */
+      /* UEFI RSDP is outside the legacy BIOS area; power.c keeps a copy for shutdown. */
       struct mb2_tag_acpi *a = (struct mb2_tag_acpi *)p;
       acpi_set_rsdp(a->rsdp);
     } else if (tag->type == MB2_TAG_EFI32) {
-      /* GRUB only hands us an EFI system-table tag on a UEFI boot;
-       * legacy BIOS / CSM carries none. Its configuration-table array
-       * is how we reach SMBIOS under UEFI (smbios.c). */
+      /* EFI system table (UEFI only): its config tables lead to SMBIOS. */
       uefi = true;
       smbios_set_efi(((struct mb2_tag_efi32 *)p)->pointer, 0);
     } else if (tag->type == MB2_TAG_EFI64) {
       uefi = true;
       smbios_set_efi(((struct mb2_tag_efi64 *)p)->pointer, 1);
     } else if (tag->type == MB2_TAG_SMBIOS) {
-      /* The SMBIOS entry point. On UEFI the "_SM_"/"_SM3_" anchor is
-       * not in the legacy f-segment, so this tag is the only route to
-       * DMI (machine vendor/product for the splash's Host line). The
-       * entry point starts at the tag's `tables` field. */
+      /* SMBIOS entry point (the only route to DMI on UEFI) starts at `tables`. */
       struct mb2_tag_smbios *sm = (struct mb2_tag_smbios *)p;
       smbios_set_entry((uint32_t)(uintptr_t)sm->tables);
     }
 
-    p += (tag->size + 7) & ~7u; /* tags are 8-byte aligned             */
+    p += (tag->size + 7) & ~7u;
   }
 
   firmware_set(uefi ? FIRMWARE_UEFI : FIRMWARE_BIOS);
@@ -276,14 +229,10 @@ static struct multiboot_info *multiboot2_to_info(uintptr_t info_addr)
 
 void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 {
-  serial_init(); /* first: the console mirrors here         */
+  serial_init();
   con_init();
 
-  /* Boot is quiet on screen by default; a `verbose` token on the kernel
-   * command line shows the bring-up log live. Either way the journal records
-   * it (and the serial port streams it). Read it before the first log line so
-   * the whole boot honours it. mb1 carries the cmdline in the info struct;
-   * mb2's is read in multiboot2_to_info() below. */
+  /* A `verbose` token on the cmdline shows the boot log live (mb2's is read in multiboot2_to_info). */
   if (magic == MULTIBOOT_BOOTLOADER_MAGIC && (mbi->flags & MULTIBOOT_FLAG_CMD) &&
       cmdline_has((const char *)(uintptr_t)mbi->cmdline, "verbose"))
     log_set_verbose(1);
@@ -294,7 +243,6 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   con_write("booted in 32-bit protected mode via multiboot.\n");
 
   if (magic == MULTIBOOT2_BOOTLOADER_MAGIC) {
-    /* GRUB/UEFI path: ebx points at a multiboot2 tag chain, not an mbi. */
     mbi = multiboot2_to_info((uintptr_t)mbi);
   } else if (magic != MULTIBOOT_BOOTLOADER_MAGIC) {
     con_set_color(CON_WHITE, CON_RED);
@@ -309,44 +257,34 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   con_printf("mmdbg: path=%s mmapflag=%u entries=%u firmware=%s\n",
              magic == MULTIBOOT2_BOOTLOADER_MAGIC ? "mb2" : "mb1", (mbi->flags & MULTIBOOT_FLAG_MMAP) ? 1 : 0,
-             mbi->mmap_length / 24, /* synth/E820 entries are 24 bytes  */
-             firmware_name());
+             mbi->mmap_length / 24, firmware_name());
 
-  pmm_init(mbi); /* read the memory map, track frames       */
+  pmm_init(mbi);
   con_printf("pmm: %u MiB RAM detected", pmm_installed_kib() / 1024);
   if (pmm_installed_kib() > pmm_total_kib()) {
-    /* 32-bit, no PAE: we can only manage the low 4 GiB of it. */
+    /* 32-bit, no PAE: only the low 4 GiB is usable. */
     con_printf(" (%u MiB usable)", pmm_total_kib() / 1024);
   }
   con_write(".\n");
 
-  paging_init(); /* identity-map low 16 MiB, enable paging  */
+  paging_init();
   con_write("paging: enabled (low 16 MiB identity-mapped).\n");
 
-  heap_init(); /* kmalloc/kfree over [4 MiB, 16 MiB)      */
+  heap_init();
   con_write("heap: ready.\n");
 
-  entropy_init(); /* seed the RNG pool before any consumer    */
+  entropy_init();
 
-  smbios_init(); /* read DMI vendor/product for the splash  */
+  smbios_init();
 
-  pci_init(); /* enumerate the PCI bus                   */
+  pci_init();
   con_printf("pci: %u devices found.\n", (uint32_t)pci_count());
 
-  smp_init(); /* discover CPUs via ACPI MADT (no AP bring-up yet) */
+  smp_init();
 
-  /* Bring up a linear framebuffer. Prefer one the bootloader handed us (GRUB
-   * via Multiboot, on real VMs/hardware where we can't drive the GPU to set a
-   * mode); otherwise program QEMU's DISPI adapter directly (the -kernel path,
-   * which provides no framebuffer). */
+  /* Framebuffer: VMware SVGA, else the bootloader's, else QEMU DISPI. */
   {
     int rc = -1, adopted = 0, svga = 0;
-    /* Prefer the VMware SVGA II adapter when its PCI device is present:
-     * driving it directly (mode control + a command FIFO) beats adopting the
-     * dumb VBE framebuffer GRUB hands us on a VMware guest, where the legacy
-     * framebuffer needn't keep auto-refreshing once SVGA mode is on. Returns
-     * -1 on any non-VMware machine, so the adopt and DISPI paths below still
-     * serve real GPUs (UEFI GOP) and QEMU's default VGA. */
     rc = vmsvga_init(1024, 768);
     svga = (rc == 0);
     if (rc != 0 && (mbi->flags & MULTIBOOT_FLAG_FB) && mbi->framebuffer_type == MULTIBOOT_FB_TYPE_RGB &&
@@ -356,12 +294,9 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
       adopted = (rc == 0);
     }
     if (rc != 0)
-      rc = fb_init(1024, 768); /* VBE DISPI fallback (QEMU -kernel) */
+      rc = fb_init(1024, 768);
 
-    /* On a verbose boot, catch the framebuffer console up with everything
-     * logged before graphics mode existed (banner, pmm, paging, ...), which
-     * until now only reached the 0xB8000 text the graphics mode hides. After
-     * this the status lines below stream onto it live. */
+    /* Replay the pre-graphics boot log onto the framebuffer. */
     if (rc == 0 && log_verbose())
       journal_to_fb();
 
@@ -376,40 +311,29 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
       con_write("fb: no framebuffer available; staying in text mode.\n");
   }
 
-  net_init(); /* bring up the RTL8139 NIC, if present     */
+  net_init();
 
-  ahci_init();  /* bring up a SATA disk via AHCI, if present */
-  nvme_init();  /* bring up an NVMe namespace, if present    */
-  sd_init();    /* bring up an SD/MMC card via SDHCI, if any */
-  atapi_init(); /* find a CD/DVD drive on the IDE bus, if any */
+  ahci_init();
+  nvme_init();
+  sd_init();
+  atapi_init();
 
-  blk_init(); /* pick owofs's backing disk: IDE>AHCI>NVMe */
-  fs_init();  /* mount it (auto-format only the IDE disk) */
-  /* No auto-mount of removable volumes at boot — they mount only when asked,
-   * via `mount <dev> <point>` or the Files app's Connect button (fs_mount,
-   * which probes the device and adds it to fs.c's mount table). Several can be
-   * mounted at once, each at its own /media/<name>. */
+  blk_init();
+  fs_init();
+  /* Removable volumes are not auto-mounted (mount command or Files app). */
 
-  syscall_init(); /* int 0x80 gate (DPL 3)                   */
+  syscall_init();
 
   /* Install the embedded programs onto the disk if absent. */
   {
     char probe;
-    /* A Unix-like layout: programs in /bin, a home for the user. mkdir is
-     * a no-op if the directory already exists from a previous boot. */
     fs_mkdir("/bin");
     fs_mkdir("/home");
     fs_mkdir("/home/root");
-    fs_mkdir("/home/root/Downloads"); /* the browser saves here */
+    fs_mkdir("/home/root/Downloads");
 
-    /* The account database. /etc/passwd seeds the root account with no
-     * password (name:pwhash:uid:gid:home); /etc/group seeds the root group.
-     * Both are plain owofs files managed thereafter by the shell's
-     * useradd/groupadd/passwd commands. Only created if absent, so a previous
-     * boot's accounts (and any passwords set) persist. */
+    /* Seed passwd (name:pwhash:uid:gid:home) and group if absent. */
     fs_mkdir("/etc");
-    /* The shared UI font: gfx loads it at runtime so no app bakes in a
-     * bitmap atlas. One on-disk copy, installed if a prior boot lacks it. */
     fs_mkdir("/etc/fonts");
     INSTALL_FILE("/etc/fonts/LiberationSans-Regular.ttf", _binary_fonts_LiberationSans_Regular_ttf);
     INSTALL_FILE("/etc/fonts/LiberationMono-Regular.ttf", _binary_fonts_LiberationMono_Regular_ttf);
@@ -417,15 +341,10 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
       fs_create("/etc/passwd", "root::0:0:/home/root\n", 21);
     if (fs_read("/etc/group", &probe, 0) < 0)
       fs_create("/etc/group", "root:0:\n", 8);
-    /* mDNS/DNS-SD advertisements for /bin/mdnsd: one "type port [txt...]" per
-     * line. Seeds ssh + smb so they're announced on the .local link again;
-     * install-if-absent so a user's edits persist. */
+    /* mdnsd advertisements, one "type port [txt...]" per line. */
     if (fs_read("/etc/mdns.conf", &probe, 0) < 0)
       fs_create("/etc/mdns.conf", "_ssh._tcp 22\n_smb._tcp 445\n", 26);
-    /* init's service table: one /bin daemon per line (blank/# ignored). PID 1
-     * (/bin/init) spawns each at boot -- the kernel no longer autostarts any
-     * daemon itself. The compositor is first so the desktop comes up before the
-     * network daemons. Install-if-absent so a user's edits persist. */
+    /* init's service table, one /bin daemon per line; compositor first. */
     if (fs_read("/etc/inittab", &probe, 0) < 0)
       fs_create("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\n", 29);
     users_init();
@@ -439,7 +358,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(browser);
     INSTALL_APP(imgview);
     INSTALL_APP(term);
-    INSTALL_APP(compositor); /* the user-space desktop; launched first by init */
+    INSTALL_APP(compositor);
     INSTALL_APP(neofetch);
     INSTALL_APP(lspci);
     INSTALL_APP(uname);
@@ -472,33 +391,26 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   }
   con_write("usermode: ready ('run curl <url>').\n");
 
-  timer_init();    /* IRQ0: keep time                         */
-  keyboard_init(); /* IRQ1: buffer keystrokes                 */
-  sb16_init();     /* IRQ5: PCM audio (no-op if absent)       */
-  hda_init();      /* HD Audio / Realtek codec (no-op if absent) */
+  timer_init();
+  keyboard_init();
+  sb16_init();
+  hda_init();
 
-  sched_init(); /* current context becomes task "main"     */
+  sched_init();
   net_start();
   sched_create_thread("spin-a", spinner);
   sched_create_thread("spin-b", spinner);
   con_write("scheduler: 2 worker threads spawned.\n");
 
-  /* PS/2 mouse: force the i8042 IRQ/clock bits so the pointer works before the
-   * user-space compositor comes up. The compositor sets the pointer bounds to
-   * the screen size via SYS_INPUT_SET_BOUNDS; seed them from the framebuffer.
-   */
+  /* PS/2 mouse: seed pointer bounds from the framebuffer until the compositor sets them. */
   if (fb_active())
     mouse_init((int)fb_width() - 1, (int)fb_height() - 1);
 
   bootmark("sti");
-  __asm__ volatile("sti"); /* interrupts on; preemption begins        */
+  __asm__ volatile("sti");
 
-  smp_start_aps(); /* wake the other cores and start their schedulers */
+  smp_start_aps();
 
-  /* DHCP + xHCI + /media mount are slow on real hardware (timer_sleep-based
-   * retries/resets). Run them in a background thread so the shell input loop
-   * below starts draining keystrokes immediately instead of letting them pile
-   * up in the keyboard ring for several seconds and flush all at once. */
   sched_create_thread("bootup", boot_bringup);
 
   bootmark("shell");
@@ -507,26 +419,15 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   for (;;) {
     char c;
     unsigned char mods;
-    /* Physical keyboard (the QEMU/HW window). While the user-space compositor
-     * is alive it owns the keyboard: it drains it via SYS_INPUT_POLL and routes
-     * keys to the focused window (Ctrl+C reaches the window the same way). The
-     * kernel must NOT also drain it here, or input would split/race. When no
-     * compositor is running (not started yet, or it died), the physical
-     * keyboard falls through to the recovery console — the failsafe that keeps
-     * the machine usable. The COM1 serial path below is independent of this and
-     * always drives the shell (it's the debug console + test harness). */
+    /* The kernel drains the keyboard only while no compositor owns it (recovery console). */
     if (!uwin_compositor_active()) {
-      if (keyboard_take_interrupt()) /* Ctrl+C -> cancel the shell line */
+      if (keyboard_take_interrupt())
         shell_interrupt_locked();
       while (keyboard_poll(&c, &mods))
         shell_feed_locked(c);
     }
-    /* else: the compositor owns the keyboard — it drains both the keys AND the
-     * Ctrl+C latch itself via SYS_INPUT_POLL (which surfaces the interrupt as a
-     * KEY_INTR event to the focused window). The kernel must not consume either
-     * here, or it would race the compositor for them. */
-    while (serial_poll(&c))  /* host terminal (-serial stdio)    */
-      shell_feed_locked(c);  /* the debug console always drives shell */
-    __asm__ volatile("hlt"); /* sleep until the next interrupt          */
+    while (serial_poll(&c))
+      shell_feed_locked(c);
+    __asm__ volatile("hlt");
   }
 }

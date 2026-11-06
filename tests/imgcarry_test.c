@@ -1,5 +1,4 @@
-/* imgcarry_test.c — host unit test for imgcarry.h: inline images keep their
- * landed state (uid, pool offsets, fetch progress) across layout walks.
+/* Host unit test for imgcarry.h: inline images keep their landed state across layout walks.
  *
  * Build + run: scripts/run-tests.sh (or `make test`). */
 #include <stdio.h>

@@ -1,7 +1,5 @@
-/* css_cache_test.c — host unit test for the CSS engine's memoised and
- * unbounded paths: var() rule cache, ancestor bloom filter against a naive
- * matcher, selector/media/keyframe/variable limits, DOM style invalidation,
- * the anim record store.
+/* Host unit test for the CSS engine's memoised and unbounded paths: var() cache, ancestor bloom,
+ * selector/media/keyframe limits, style invalidation, anim store.
  *
  * Build + run: scripts/run-tests.sh (or `make test`). */
 #include <stdarg.h>
@@ -312,14 +310,14 @@ int main(void)
                           "li:first-child:not(.x):not(.y):not(.z):not(.w){min-width:3px} "
                           ".abcdefghijklmnopqrstuvwxyz0123456789{min-height:4px}");
     struct dom_node *root = parse("<div id=e6 class='c1 c2 c3 c4 c5 c6'></div>"
-                                      "<div id=e7 class='c1 c2 c3 c4 c5 c6 c7'></div>"
-                                      "<div class=s1><div class=s2><div class=s3><div class=s4><div class=s5>"
-                                      "<div class=s6><div class=s7><div id=deep class=s8></div></div></div>"
-                                      "</div></div></div></div></div>"
-                                      "<div id=shallow class=s8></div>"
-                                      "<ul><li id=li1></li><li id=li2></li></ul><ul><li id=li3 class=y></li></ul>"
-                                      "<div id=long1 class=abcdefghijklmnopqrstuvwxyz0123456789></div>"
-                                      "<div id=long2 class=abcdefghijklmnopqrstuvw></div>");
+                                  "<div id=e7 class='c1 c2 c3 c4 c5 c6 c7'></div>"
+                                  "<div class=s1><div class=s2><div class=s3><div class=s4><div class=s5>"
+                                  "<div class=s6><div class=s7><div id=deep class=s8></div></div></div>"
+                                  "</div></div></div></div></div>"
+                                  "<div id=shallow class=s8></div>"
+                                  "<ul><li id=li1></li><li id=li2></li></ul><ul><li id=li3 class=y></li></ul>"
+                                  "<div id=long1 class=abcdefghijklmnopqrstuvwxyz0123456789></div>"
+                                  "<div id=long2 class=abcdefghijklmnopqrstuvw></div>");
     struct css_style cs;
     apply(sh, find(root, "e6"), &cs);
     expect(cs.width < 0);
@@ -400,7 +398,7 @@ int main(void)
     int n = collect(root, all, 8, 0);
 #define FRESH()                                                                                                        \
   for (int i = 0; i < n; i++)                                                                                          \
-    all[i]->computed_style_seq = 5, all[i]->pseudo_seq = 5
+  all[i]->computed_style_seq = 5, all[i]->pseudo_seq = 5
     dom_structural_styles = false;
     FRESH();
     dom_set_attr(ids[1], "data-x", "1");

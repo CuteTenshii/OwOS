@@ -1,22 +1,15 @@
-/* inflate.c — streaming DEFLATE (RFC 1951) + gzip/zlib framing, user space.
- *
- * Ported from the kernel's gzip.c inflate engine, with the two ends made
- * streaming: the bit reader pulls bytes through a reader callback instead of
- * indexing a fixed buffer, and output goes to a 32 KiB circular window (to
- * resolve back-references) while being flushed to a writer callback. Nothing
- * scales with the body size — only the window and a small flush buffer.
- */
+/* inflate.c, streaming DEFLATE (RFC 1951) + gzip/zlib framing, user space */
 #include "inflate.h"
-#include "owos.h" /* malloc/free — per-call state, so decodes are reentrant */
+#include "owos.h" /* malloc/free, per-call state, so decodes are reentrant */
 #include <stdint.h>
 
 #define MAXBITS 15
 #define MAXLCODES 286
 #define MAXDCODES 30
 #define FIXLCODES 288
-#define WINSZ 32768 /* DEFLATE max back-reference distance         */
+#define WINSZ 32768 /* DEFLATE max back-reference distance */
 #define WINMASK (WINSZ - 1)
-#define OUTBUF 4096 /* flush granularity to the writer             */
+#define OUTBUF 4096 /* flush granularity to the writer */
 
 static const uint16_t lbase[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
                                    31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
@@ -34,11 +27,11 @@ struct state {
   void *wctx;
   uint32_t bitbuf;
   int bitcnt;
-  int err;            /* malformed stream                              */
-  int stop;           /* writer asked to stop early                    */
-  uint32_t total;     /* total bytes produced (window write cursor)    */
-  uint8_t win[WINSZ]; /* sliding window for back-references             */
-  uint8_t ob[OUTBUF]; /* pending output, flushed to wr() in batches     */
+  int err;            /* malformed stream */
+  int stop;           /* writer asked to stop early */
+  uint32_t total;     /* total bytes produced (window write cursor) */
+  uint8_t win[WINSZ]; /* sliding window for back-references */
+  uint8_t ob[OUTBUF]; /* pending output, flushed to wr() in batches */
   uint32_t obn;
 };
 
@@ -47,7 +40,7 @@ struct huff {
   short symbol[FIXLCODES]; /* must hold the 288 fixed codes, not just 286 */
 };
 
-/* ---- input bit reader (pull model) ------------------------------------- */
+/* input bit reader (pull model) */
 
 static int get_bit(struct state *s)
 {
@@ -74,7 +67,7 @@ static uint32_t get_bits(struct state *s, int n)
   return v;
 }
 
-/* ---- output (window + flushing writer) --------------------------------- */
+/* output (window + flushing writer) */
 
 static void flush(struct state *s)
 {
@@ -94,7 +87,7 @@ static void emit(struct state *s, uint8_t b)
     flush(s);
 }
 
-/* ---- Huffman ----------------------------------------------------------- */
+/* Huffman */
 
 static void huff_build(struct huff *h, const short *length, int n)
 {
@@ -131,7 +124,7 @@ static int huff_decode(struct state *s, const struct huff *h)
   return -1;
 }
 
-/* ---- block decoders ---------------------------------------------------- */
+/* block decoders */
 
 static int block_huff(struct state *s, const struct huff *lit, const struct huff *dist)
 {
@@ -142,7 +135,7 @@ static int block_huff(struct state *s, const struct huff *lit, const struct huff
     if (sym < 0)
       return -1;
     if (sym == 256)
-      return 0; /* end of block                    */
+      return 0; /* end of block */
     if (sym < 256) {
       emit(s, (uint8_t)sym);
     } else {
@@ -154,7 +147,7 @@ static int block_huff(struct state *s, const struct huff *lit, const struct huff
       if (dsym < 0 || dsym >= 30)
         return -1;
       uint32_t d = dbase[dsym] + get_bits(s, dext[dsym]);
-      if (d > s->total) /* reference before stream start   */
+      if (d > s->total) /* reference before stream start */
         return -1;
       for (uint32_t i = 0; i < len; i++)
         emit(s, s->win[(s->total - d) & WINMASK]);
@@ -166,14 +159,14 @@ static int block_huff(struct state *s, const struct huff *lit, const struct huff
 
 static int block_stored(struct state *s)
 {
-  s->bitcnt = 0; /* align to a byte boundary        */
+  s->bitcnt = 0; /* align to a byte boundary */
   int l0 = s->rd(s->rctx), l1 = s->rd(s->rctx);
   int n0 = s->rd(s->rctx), n1 = s->rd(s->rctx);
   if (l0 < 0 || l1 < 0 || n0 < 0 || n1 < 0)
     return -1;
   uint32_t len = (uint32_t)l0 | ((uint32_t)l1 << 8);
   if ((uint16_t)~(l0 | (l1 << 8)) != (uint16_t)(n0 | (n1 << 8)))
-    return -1; /* LEN / ~LEN mismatch             */
+    return -1; /* LEN / ~LEN mismatch */
   for (uint32_t i = 0; i < len; i++) {
     int c = s->rd(s->rctx);
     if (c < 0)
@@ -254,7 +247,7 @@ static int dynamic_tables(struct state *s, struct huff *lit, struct huff *dist)
   return 0;
 }
 
-/* ---- top level --------------------------------------------------------- */
+/* top level */
 
 static int inflate_run(struct state *s)
 {
@@ -277,7 +270,7 @@ static int inflate_run(struct state *s)
       if (block_huff(s, &lit, &dist) < 0)
         return -1;
     } else {
-      return -1; /* reserved block type             */
+      return -1; /* reserved block type */
     }
   } while (!last && !s->err && !s->stop);
 
@@ -287,9 +280,7 @@ static int inflate_run(struct state *s)
 
 int inflate_stream(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
 {
-  /* Per-call state (~37 KiB: window + flush buffer) so concurrent decodes on
-   * separate threads — e.g. the browser's per-image workers — never share the
-   * window or the output cursor. */
+  /* Per-call state (~37 KiB: window + flush buffer) so concurrent decodes on separate threads */
   struct state *s = malloc(sizeof *s);
   if (!s)
     return -1;
@@ -309,7 +300,7 @@ int inflate_stream(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
   return rc;
 }
 
-/* Read exactly one byte or flag EOF. */
+/* Read exactly one byte or flag EOF */
 static int rd1(inf_reader rd, void *ctx, int *eof)
 {
   int c = rd(ctx);
@@ -320,9 +311,7 @@ static int rd1(inf_reader rd, void *ctx, int *eof)
   return c;
 }
 
-/* A reader that replays up to two peeked bytes, then delegates — used by the
- * raw-DEFLATE fallback to "un-consume" the bytes we read to sniff the wrapper.
- */
+/* A reader that replays up to two peeked bytes, then delegates */
 struct prefix_rd {
   inf_reader rd;
   void *ctx;
@@ -339,10 +328,7 @@ static int prefix_reader(void *c)
 
 int inflate_http(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
 {
-  /* Peek the first two bytes to recognise the wrapper. Because the reader is
-   * a one-way pull, we consume them and branch; a raw-DEFLATE stream is the
-   * fallback, which we must then decode starting from those two bytes. So for
-   * the raw case we splice them back in via a tiny prefix reader. */
+  /* Peek the first two bytes to recognise the wrapper */
   int eof = 0;
   int b0 = rd1(rd, rctx, &eof);
   if (eof)
@@ -352,14 +338,14 @@ int inflate_http(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
     return -1;
 
   if (b0 == 0x1F && b1 == 0x8B) {
-    /* gzip: CM, FLG, then MTIME(4) XFL OS = 10-byte fixed header. */
+    /* gzip: CM, FLG, then MTIME(4) XFL OS = 10-byte fixed header */
     int cm = rd1(rd, rctx, &eof);
     int flg = rd1(rd, rctx, &eof);
     for (int i = 0; i < 6; i++)
-      rd1(rd, rctx, &eof); /* MTIME/XFL/OS    */
+      rd1(rd, rctx, &eof); /* MTIME/XFL/OS */
     if (eof || cm != 8)
       return -1;
-    if (flg & 0x04) { /* FEXTRA          */
+    if (flg & 0x04) { /* FEXTRA */
       int x0 = rd1(rd, rctx, &eof), x1 = rd1(rd, rctx, &eof);
       int xlen = x0 | (x1 << 8);
       for (int i = 0; i < xlen; i++)
@@ -367,10 +353,10 @@ int inflate_http(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
     }
     if (flg & 0x08)
       while (!eof && rd1(rd, rctx, &eof))
-        ; /* FNAME      */
+        ; /* FNAME */
     if (flg & 0x10)
       while (!eof && rd1(rd, rctx, &eof))
-        ; /* FCOMMENT   */
+        ; /* FCOMMENT */
     if (flg & 0x02) {
       rd1(rd, rctx, &eof);
       rd1(rd, rctx, &eof);
@@ -381,13 +367,11 @@ int inflate_http(inf_reader rd, void *rctx, inf_writer wr, void *wctx)
   }
 
   if ((b0 & 0x0F) == 0x08 && ((b0 << 8 | b1) % 31) == 0) {
-    /* zlib: 2-byte header already consumed (no FDICT in HTTP). */
+    /* zlib: 2-byte header already consumed (no FDICT in HTTP) */
     return inflate_stream(rd, rctx, wr, wctx);
   }
 
-  /* Raw DEFLATE: replay the two peeked bytes, then the rest of the stream.
-   * Local (not static): prefix_reader only runs synchronously below, and a
-   * shared static would corrupt a concurrent decode. */
+  /* Raw DEFLATE: replay the two peeked bytes, then the rest of the stream */
   struct prefix_rd pr;
   pr.rd = rd;
   pr.ctx = rctx;

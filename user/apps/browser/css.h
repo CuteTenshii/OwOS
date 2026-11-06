@@ -1,7 +1,4 @@
-/* css.h — a small but real CSS engine: parse <style> blocks / style="" into
- * rules, match selectors against DOM nodes, cascade by specificity, and produce
- * a computed style. The renderer (html.c) maps the result onto its capabilities
- * (16-colour text, bold/underline, block/inline, image box size). */
+/* css.h: CSS engine (parse, selector match, cascade, computed style) used by the renderer. */
 #ifndef OWOS_CSS_H
 #define OWOS_CSS_H
 
@@ -9,8 +6,7 @@
 
 enum { CSS_DISP_UNSET = 0, CSS_DISP_INLINE, CSS_DISP_BLOCK, CSS_DISP_NONE };
 enum css_pos { CSS_POS_STATIC = 0, CSS_POS_REL, CSS_POS_ABS, CSS_POS_FIXED, CSS_POS_STICKY };
-/* flex main-axis distribution (justify-content) and cross-axis (align-items).
- */
+/* flex justify-content and align-items. */
 enum css_justify {
   CSS_JUST_START = 0,
   CSS_JUST_CENTER,
@@ -20,21 +16,16 @@ enum css_justify {
   CSS_JUST_EVENLY
 };
 enum css_align { CSS_ALIGN_STRETCH = 0, CSS_ALIGN_START, CSS_ALIGN_CENTER, CSS_ALIGN_END };
-/* A grid track's sizing function (grid-template-columns/rows). AUTO covers
- * auto/ min-content/max-content (all content-sized here); FR is a flexible
- * fraction. */
+/* Grid track sizing; AUTO covers auto/min-content/max-content, FR is a flexible fraction. */
 enum css_track_kind { CSS_TRK_AUTO = 0, CSS_TRK_PX, CSS_TRK_PCT, CSS_TRK_FR };
 #define CSS_GRID_MAX 12 /* max explicit tracks per axis */
 struct css_track {
   signed char kind;
   short v;
 }; /* v = px | percent | fr weight */
-/* text-transform. */
 enum css_ttx { CSS_TT_NONE = 0, CSS_TT_UPPER, CSS_TT_LOWER, CSS_TT_CAPITALIZE };
-/* white-space: how spaces/newlines collapse and whether lines wrap. */
 enum css_ws { CSS_WS_NORMAL = 0, CSS_WS_NOWRAP, CSS_WS_PRE, CSS_WS_PRE_WRAP, CSS_WS_PRE_LINE };
-/* list-style-type: the <li> marker shape/number style (CSS_LST_DEFAULT = use
- * the list's own ul/ol default). */
+/* list-style-type (DEFAULT = the list's own ul/ol default). */
 enum css_list {
   CSS_LST_DEFAULT = 0,
   CSS_LST_NONE,
@@ -48,14 +39,11 @@ enum css_list {
   CSS_LST_LOWER_ROMAN,
   CSS_LST_UPPER_ROMAN
 };
-/* list-style-position: whether the marker sits in the content box (inside) or
- * the margin gutter (outside, the CSS default). DEFAULT = unset/inherit. */
+/* list-style-position (DEFAULT = unset/inherit). */
 enum css_list_pos { CSS_LSP_DEFAULT = 0, CSS_LSP_OUTSIDE, CSS_LSP_INSIDE };
 enum css_border_style { CSS_BST_UNSET = -1, CSS_BST_NONE = 0, CSS_BST_SOLID, CSS_BST_DASHED, CSS_BST_DOTTED };
 
-/* CSS timing functions (animation/transition easing). The bezier presets are
- * solved numerically by the animation engine (anim.c); the step forms
- * approximate a single jump. */
+/* Animation/transition easing; bezier presets are solved in anim.c. */
 enum css_easing {
   CSS_EASE_LINEAR = 0,
   CSS_EASE,
@@ -65,14 +53,10 @@ enum css_easing {
   CSS_EASE_STEP_START,
   CSS_EASE_STEP_END
 };
-/* animation-direction / animation-fill-mode. */
 enum { CSS_ADIR_NORMAL = 0, CSS_ADIR_REVERSE, CSS_ADIR_ALTERNATE, CSS_ADIR_ALTERNATE_REVERSE };
 enum { CSS_AFILL_NONE = 0, CSS_AFILL_FORWARDS, CSS_AFILL_BACKWARDS, CSS_AFILL_BOTH };
 
-/* Animatable properties: a dense index used by keyframe/transition
- * interpolation (anim.c walks 0..ANP_COUNT). A transition's property set is a
- * bitmask of (1<<ANP_*); TRANS_ALL selects every one (`transition-property:
- * all`). */
+/* Animatable property index (anim.c walks 0..ANP_COUNT); transitions use a (1<<ANP_*) bitmask. */
 enum css_anim_prop {
   ANP_COLOR = 0,
   ANP_BG,
@@ -105,24 +89,12 @@ enum css_anim_prop {
 #define TRANS_ALL (1u << 31) /* transition-property: all */
 #define CSS_ANIM_NAME 32
 
-/* A computed-style delta. Each field is either set or "unset" so deltas layer:
- * colours are 0xRRGGBB or -1; bold/under are 0/1 or -1; width/height are px or
- * -1; disp is a CSS_DISP_* value (UNSET = 0); fam is the full font-family stack
- * (each name lowercased + dequoted, comma-joined), "" = unset. The box-model
- * fields (margin/padding/border/position/flex) back the layout engine
- * (layout.c): lengths are px>=0, -1 unset; margin sides may be -2 (auto); a
- * percent width/ height keeps the px field -1 and stores the numerator in
- * pct_*. */
-#define CSS_FAM_MAX                                                                                                    \
-  48                      /* one family name (e.g. an @font-face's font-family)                                        \
-                           */
+/* A computed-style delta; unset fields are -1 (disp UNSET = 0) so deltas layer.
+ * Lengths are px>=0, margin may be -2 (auto), a percent size keeps px -1 and sets pct_*. */
+#define CSS_FAM_MAX 48    /* one family name */
 #define CSS_FAM_STACK 160 /* a whole font-family stack: "A", "B", sans-serif    */
 
-/* background-image layer. The renderer paints ONE image layer (the topmost in a
- * comma list) over the background colour — a url() bitmap or a CSS gradient.
- * Sub-properties carry their own unset sentinel so longhands cascade
- * independently of the image identity (which `kind`, the gradient and url all
- * come together). */
+/* background-image layer: only the topmost image of a comma list is painted. */
 enum css_bg_kind { CSS_BGK_NONE = 0, CSS_BGK_URL, CSS_BGK_LINEAR, CSS_BGK_RADIAL };
 enum { CSS_BGR_REPEAT = 0, CSS_BGR_NO_REPEAT, CSS_BGR_REPEAT_X, CSS_BGR_REPEAT_Y };
 enum { CSS_BGS_AUTO = 0, CSS_BGS_COVER, CSS_BGS_CONTAIN, CSS_BGS_LEN };
@@ -184,11 +156,7 @@ struct css_style {
   signed char justify;                    /* enum css_justify, -1 unset */
   signed char align_items;                /* enum css_align, -1 unset */
   short gap_row, gap_col;                 /* row/column gap px>=0, -1 unset */
-  /* CSS grid (display:grid). The container carries the explicit track templates
-   * and auto-flow; a grid item carries its col/row span. Sentinels: grid 1/0/-1
-   * like flex; n_cols/n_rows -1 unset (else a count into the track arrays);
-   * col_span/row_span >=1 or -1 unset; grid_flow 0 row / 1 column / -1 unset.
-   */
+  /* CSS grid: container track templates + auto-flow, item spans; -1 = unset. */
   signed char grid;               /* 1 = display:grid/inline-grid, 0 not, -1 unset */
   signed char grid_flow;          /* grid-auto-flow: 0 row, 1 column, -1 unset */
   signed char n_cols, n_rows;     /* explicit template track counts, -1 unset */
@@ -205,20 +173,13 @@ struct css_style {
   signed char list_pos;    /* enum css_list_pos (DEFAULT=0 means unset/inherit) */
   signed char opacity;     /* 0..100 percent, -1 unset */
   short line_height;       /* line-height px, -1 unset */
-  short lh_pct;            /* line-height as a percent of font-size, -1 unset
-                            * (a unitless multiplier N is stored as N*100) */
+  short lh_pct;            /* line-height percent of font-size, -1 unset (unitless N stored as N*100) */
   short outline_w;         /* outline width px, -1 unset */
   int outline_color;       /* outline 0xRRGGBB, -1 unset */
   short z_index;           /* stacking order; CSS_Z_AUTO = unset/auto */
-  /* SVG paint (for inline <svg>): -1 unset, -2 none/transparent, -3
-   * currentColor, else 0xRRGGBB. The browser bakes these onto serialized SVG
-   * elements. */
+  /* SVG paint: -1 unset, -2 none, -3 currentColor, else 0xRRGGBB. */
   int fill, stroke;
-  /* CSS animation (@keyframes) + transition. anim_* describe a running keyframe
-   * animation; trans_* a property transition. Sentinels: ms fields -1 unset;
-   * anim_iter -2 unset / -1 infinite; the enum bytes -1 unset. The animation
-   * engine (anim.c) reads these to drive time-based interpolation — they are
-   * not themselves interpolated. */
+  /* Animation and transition parameters read by anim.c; -1 = unset (anim_iter -2 unset, -1 infinite). */
   char anim_name[CSS_ANIM_NAME]; /* animation-name (@keyframes), "" = none */
   int anim_dur;                  /* animation-duration ms, -1 unset */
   int anim_delay;                /* animation-delay ms, -1 unset */
@@ -244,70 +205,47 @@ void css_style_reset(struct css_style *s);
 void css_bgi_reset(struct css_bg_image *b); /* reset a background layer to unset */
 
 css_sheet *css_new(void);
-/* Add a sheet source. `base` is the URL the sheet was loaded from (an external
- * sheet's own URL, or the page URL for an inline <style>); a relative
- * @font-face src resolves against it. */
+/* Add a sheet source; `base` is its load URL, used to resolve relative @font-face src. */
 void css_add(css_sheet *sheet, const char *src, int len, const char *base);
 void css_free(css_sheet *sheet);
 
-/* The current viewport, what @media (min/max-width|height), orientation and
- * prefers-color-scheme test against. The browser sets it before each cascade
- * (and on resize, so media queries re-evaluate). Defaults to a sane size. */
+/* Viewport that @media queries test against; set before each cascade and on resize. */
 void css_set_viewport(int width, int height);
 unsigned css_viewport_generation(void);
 
-/* @font-face faces declared in the sheet: each a family name + a src URL (the
- * first raw TTF/OTF url; woff/woff2 entries are skipped — we can't decode
- * them). The browser fetches the url and loads the face, keyed by family. */
+/* @font-face faces: family + first raw TTF/OTF url (woff/woff2 are skipped, not decodable). */
 int css_fontface_count(const css_sheet *sheet);
-/* `base` (may be 0) receives the URL of the sheet that declared the face, for
- * resolving a relative src. */
+/* `base` (may be 0) receives the declaring sheet's URL. */
 void css_fontface_at(const css_sheet *sheet, int i, const char **family, const char **url, const char **base);
 
-/* Fold the sheet's matching rules for `el` into *out (specificity/order order).
- */
+/* Fold the sheet's matching rules for `el` into *out (specificity/order). */
 void css_apply_sheet(css_sheet *sheet, const struct dom_node *el, struct css_style *out);
 /* Fold a style="" declaration block into *out (highest priority). */
 void css_apply_inline(const char *decls, struct css_style *out);
-/* Fold HTML presentational attrs (color/bgcolor/width/height) into *out
- * (lowest). */
+/* Fold HTML presentational attrs into *out (lowest priority). */
 void css_apply_attrs(const struct dom_node *el, struct css_style *out);
 
-/* The cascade-winning background-color for `el`, written to *out as 0xAARRGGBB;
- * returns 1 if `el` sets one, 0 if not. The alpha lets the caller composite a
- * translucent background over what's behind it (per CSS), e.g. to build the
- * page canvas colour from <html> then <body>. (An out-param, not the return
- * value, so an opaque 0xFF****** isn't mistaken for a negative/"none".) */
+/* Cascade-winning background-color for `el` as 0xAARRGGBB in *out; returns 1 if set. */
 int css_bg_argb(css_sheet *sheet, const struct dom_node *el, unsigned *out);
 
-/* ::before / ::after generated content. Folds the matching pseudo-element rules
- * for `el` into *out (its `content` holds the decoded text, plus colour/weight/
- * decoration); returns 1 if there is non-empty content to render, else 0.
- * `which` is CSS_PSEUDO_BEFORE or CSS_PSEUDO_AFTER. */
+/* Fold ::before/::after rules for `el` into *out; returns 1 if there is content to render. */
 enum { CSS_PSEUDO_BEFORE = 1, CSS_PSEUDO_AFTER = 2 };
 int css_pseudo_content(css_sheet *sheet, const struct dom_node *el, int which, struct css_style *out);
 
-/* 1 if the sheet declares any ::before/::after rule. Lets the renderer skip the
- * per-element pseudo-element cascade entirely when none exist. */
+/* 1 if the sheet declares any ::before/::after rule. */
 int css_sheet_has_pseudo(const css_sheet *sheet);
 
 /* Bumped by every css_add; with css_viewport_generation() it keys cached styles. */
 unsigned css_sheet_generation(const css_sheet *sheet);
 
-/* @keyframes lookup for the animation engine (anim.c). A block is an opaque set
- * of stops, each an offset (permille 0..1000) + a declaration delta. */
+/* @keyframes lookup for anim.c; stops are an offset (permille) + a declaration delta. */
 struct css_keyframes;
 const struct css_keyframes *css_keyframes_find(css_sheet *sheet, const char *name);
 int css_keyframes_count(const struct css_keyframes *kf);
-/* The i-th stop: *permille receives its offset, *decl a borrowed pointer to its
- * declaration delta (valid until the sheet is freed). Returns 1, or 0 out of
- * range. */
+/* The i-th stop; *decl is borrowed until the sheet is freed. Returns 0 out of range. */
 int css_keyframes_stop(const struct css_keyframes *kf, int i, int *permille, const struct css_style **decl);
 
-/* Devtools Styles pane: the rules whose selector matches `el`, winner first.
- * Each carries the reconstructed selector text, the @media prelude ("" if none)
- * plus whether that media currently applies, and the rule's declarations (the
- * subset css.c models). Returns the number written (<= cap). */
+/* Devtools Styles pane: rules matching `el`, winner first. Returns the number written (<= cap). */
 struct css_match {
   char selector[160];
   char media[128];

@@ -1,20 +1,10 @@
-/* json.c - a JSON command-line tool: validate, pretty-print, or minify.
- *
- *   json [file]        pretty-print <file> (or stdin) with 2-space indent
- *   json -c [file]     compact (minify) instead
- *   json -i N [file]   pretty-print with N spaces of indent
- *   json -v [file]     validate only: print "valid" or the parse error
- *
- * The parsing/encoding lives in user/lib/json; this is just the front end.
- * Input is a file argument, or stdin when none is given (so it works in a
- * pipe). */
+/* json.c - a JSON command-line tool: validate, pretty-print, or minify */
 #include "json.h"
 #include "opt.h"
 #include "owos.h"
 #include <stdbool.h>
 
-/* Read the whole of `path` into a malloc'd buffer (NUL is not appended; the
- * parser is given an explicit length). NULL on error, with *out_len set. */
+/* Read the whole of `path` into a malloc'd buffer */
 static char *read_file(const char *path, int *out_len)
 {
   struct statinfo st;
@@ -39,7 +29,7 @@ static char *read_file(const char *path, int *out_len)
   return buf;
 }
 
-/* Drain stdin (fd 0) into a growable malloc'd buffer. NULL on OOM. */
+/* Drain stdin (fd 0) into a growable malloc'd buffer */
 static char *read_stdin(int *out_len)
 {
   int cap = 4096, n = 0;

@@ -1,37 +1,20 @@
-/* html.c — the renderer. Walks the DOM (parsed by dom.c) into styled text in
- * B->pg->text/B->pg->attr, collecting links, inline images, the favicon and
- * title. Element styling comes from the css.c engine (sheet + inline + attrs);
- * this file maps the computed style onto the text renderer and does the
- * HTML-entity work. */
+/* html.c - the renderer */
 #include "html_int.h"
 
 css_sheet *g_sheet; /* the page's collected <style> rules, per render */
 
-/* url() background loader/lookup — defined lower, used during the layout walk.
- */
+/* url() background loader/lookup - defined lower, used during the layout walk */
 
-/* The DOM + CSS sheet now persist for the whole page lifetime (the JS context
- * in js.c does too), so event listeners can fire and mutate the tree after
- * load. html_page_teardown() frees all three on the next navigation;
- * html_relayout() re-flattens the live tree into B's buffers after a handler
- * changes it. */
+/* The DOM + CSS sheet now persist for the whole page lifetime (the JS context in js.c does too) */
 struct dom_node *g_live_dom;
 char g_cur_page_url[URL_MAX];
 
-/* Base URL the walk resolves relative links/sources against. Normally the page
- * URL; swapped to a frame's own src while its sub-document is being flattened,
- * so a relative <a>/<img> inside an iframe resolves against the frame, not the
- * top page. g_frame_depth is the iframe nesting depth (0 = top document);
- * g_link_nav is 0 while inside a sandboxed frame that may not navigate, so its
- * links render as plain (non-clickable) text. */
+/* Base URL the walk resolves relative links/sources against */
 char g_base_url[URL_MAX];
 int g_frame_depth;
 bool g_link_nav = true;
 
-/* CSP enforcement runs against the top document (B->pg->csp); frame
- * sub-documents have their own policy we don't track, so checks are skipped
- * inside frames (g_frame_depth > 0). g_csp_report gates console logging to the
- * initial load so the per-relayout walk doesn't spam duplicate violations. */
+/* CSP enforcement runs against the top document (B->pg->csp) */
 static bool g_csp_report;
 
 void csp_report(const char *what, const char *url, const char *reason)
@@ -53,10 +36,7 @@ void csp_report(const char *what, const char *url, const char *reason)
   devtools_console_append(DT_ERROR, m, n);
 }
 
-/* CSP gate for a sub-resource URL load (img/style/font/frame). `abs` is already
- * absolute; on success `out` holds the URL to use (http->https upgraded when
- * the policy asks). Returns 1 = allowed. No-op (allow) inside frames or with no
- * CSP. */
+/* CSP gate for a sub-resource URL load (img/style/font/frame) */
 bool csp_url_ok(int type, const char *abs, const char *what, char *out, int outcap)
 {
   if (g_frame_depth > 0 || !B->pg->csp) {
@@ -84,8 +64,7 @@ static bool csp_style_attr_ok(void)
   return csp_check_inline(B->pg->csp, CSP_STYLE, 0, 0, 0, 0, 0);
 }
 
-/* Computed style for one element: presentational attrs (lowest), sheet rules,
- * then inline style="" (highest). */
+/* Computed style for one element */
 void compute_style(struct dom_node *el, struct css_style *cs)
 {
   unsigned seq = style_key();
@@ -109,55 +88,40 @@ void compute_style(struct dom_node *el, struct css_style *cs)
   }
 }
 
-/* devtools hooks: the live DOM root and a public wrapper over compute_style, so
- * the developer-tools panel can walk the tree and read computed styles without
- * reaching into html.c's statics. Worker-thread callers only (the DOM's owner).
- */
+/* devtools hooks: the live DOM root and a public wrapper over compute_style */
 struct dom_node *html_dom_root(void) { return g_live_dom; }
 void html_compute_style(struct dom_node *el, struct css_style *out) { compute_style(el, out); }
 int html_match_styles(struct dom_node *el, struct css_match *out, int cap)
 {
   return css_matches(g_sheet, el, out, cap);
 }
-/* 1 if `el` has a ::before/::after (CSS_PSEUDO_*) with content — for devtools.
- */
+/* 1 if `el` has a ::before/::after (CSS_PSEUDO_*) with content - for devtools */
 int html_has_pseudo(struct dom_node *el, int which)
 {
   struct css_style cs;
   return css_pseudo_content(g_sheet, el, which, &cs);
 }
 
-/* True when `s` already carries a URL scheme that resolve_url won't expand, so
- * it must be used verbatim rather than joined onto a base (resolve_url only
- * treats http(s):// as absolute, and would mangle e.g. a data:/file:
- * reference). */
+/* True when `s` already carries a URL scheme that resolve_url won't expand, so it must be used */
 bool url_absolute(const char *s)
 {
   return starts_ci(s, "http://") || starts_ci(s, "https://") || starts_ci(s, "data:") || starts_ci(s, "file:") ||
          starts_ci(s, "blob:") || starts_ci(s, "mailto:");
 }
 
-/* Source charset for the document being parsed. We render Unicode, so non-UTF-8
- * input is transcoded as it is read. Default UTF-8; the HTTP Content-Type
- * charset (set by fetch.c) wins, else a <meta charset> in the document, else
- * the default. A fair number of pages (some Google locales among them) still
- * declare ISO-8859- 1, which in practice is Windows-1252 — so the Latin-1 path
- * uses the cp1252 map for 0x80..0x9F and is the identity for 0xA0..0xFF (==
- * Unicode U+00A0..U+00FF). */
+/* Source charset for the document being parsed */
 enum { CS_UTF8, CS_LATIN1 };
 static int g_charset;
 static bool g_charset_from_header;
 
-/* True if `cs` (a charset name, possibly inside a longer string) is a Latin-1 /
- * Windows-1252 label; returns 0 for utf-8 / unknown (treated as UTF-8). */
+/* True if `cs` (a charset name, possibly inside a longer string) is a Latin-1 / Windows-1252 */
 static bool charset_is_latin1(const char *cs)
 {
   return contains_ci(cs, "8859-1") || contains_ci(cs, "latin-1") || contains_ci(cs, "latin1") ||
          contains_ci(cs, "1252") || contains_ci(cs, "8859_1");
 }
 
-/* fetch.c calls this with the raw Content-Type header value (may be NULL). A
- * charset there is authoritative (locks out the <meta> guess). */
+/* fetch.c calls this with the raw Content-Type header value (may be NULL) */
 void html_set_charset(const char *content_type)
 {
   g_charset = CS_UTF8;
@@ -175,9 +139,7 @@ void html_set_charset(const char *content_type)
     g_charset = CS_LATIN1;
 }
 
-/* Scan the document head for <meta charset=...> / <meta
- * http-equiv="Content-Type" content="...charset=...">. Only consulted when the
- * header did not specify one. */
+/* Scan the document head for <meta charset=...> / <meta http-equiv="Content-Type" */
 static void detect_meta_charset(void)
 {
   if (g_charset_from_header)
@@ -199,8 +161,7 @@ static void detect_meta_charset(void)
   }
 }
 
-/* Read one source character, transcoding per the active charset, advancing
- * `*pp`. Returns the Unicode codepoint. */
+/* Read one source character, transcoding per the active charset, advancing `*pp` */
 int cp1252_high(unsigned char b)
 {
   if (b >= 0xA0)
@@ -247,10 +208,7 @@ unsigned char sty_byte(void)
   return a;
 }
 
-/* User-agent default style for a tag (the lowest layer; author CSS overrides).
- * The colour substitutes (italic grey, link blue, code brown, mark red) stand
- * in for renderings the engine can't otherwise show; headings inherit their
- * colour (so they stay readable on a dark page) and carry weight via bold. */
+/* User-agent default style for a tag (the lowest layer */
 void apply_ua_style(const char *name)
 {
   if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) {
@@ -295,8 +253,7 @@ void apply_css(const struct css_style *cs)
     sty_cur.ttx = (unsigned char)cs->ttx;
 }
 
-/* The renderer's line-break set (distinct from dom.c's CSS-block set: this one
- * includes br/li/tr/dd/dt, which force a new line but aren't <p>-closers). */
+/* The renderer's line-break set (distinct from dom.c's CSS-block set */
 bool is_block_tag(const char *name)
 {
   static const char *const blk[] = {
@@ -310,9 +267,7 @@ bool is_block_tag(const char *name)
   return false;
 }
 
-/* Reset the render buffers and re-flatten the live DOM into them. Shared by the
- * initial html_to_text and by html_relayout (after an event mutates the tree).
- */
+/* Reset the render buffers and re-flatten the live DOM into them */
 /* Alpha-composite src (0xAARRGGBB) over the opaque dst (0xRRGGBB). */
 static unsigned composite_over(unsigned dst, unsigned src)
 {
@@ -328,12 +283,7 @@ static unsigned composite_over(unsigned dst, unsigned src)
   return (r << 16) | (g << 8) | b;
 }
 
-/* The canvas background and default text colour, from the <html>/<body>
- * cascade. The canvas starts white; each of <html> then <body>'s background
- * composites over it (so a translucent tint blends instead of overriding),
- * matching how a browser propagates the root/body background to the canvas.
- * Defaults: white page, near- black text. The main thread reads
- * B->pg->page_bg/fg. */
+/* The canvas background and default text colour, from the <html>/<body> cascade */
 static void compute_page_colors(struct dom_node *root)
 {
   unsigned canvas = 0xffffff;
@@ -382,8 +332,7 @@ static void layout_dom(void)
   g_nbg = 0;      /* url() backgrounds re-collected during this walk */
   layout_reset(); /* fresh box tree for this walk */
   g_has_controls = false;
-  /* Reset the frame walk context to the top document (the cache itself persists
-   * across relayouts; only the per-walk base/depth/nav reset here). */
+  /* Reset the frame walk context to the top document (the cache itself persists across relayouts */
   g_frame_depth = 0;
   g_link_nav = true;
   g_walk_depth = 0;
@@ -400,10 +349,7 @@ static void layout_dom(void)
   B->layout_dirty = 1; /* box tree + text rebuilt → main thread must re-wrap */
 }
 
-/* Free the current page's live DOM, CSS sheet and JS context. Called on every
- * navigation/page replacement before a new page is built (and is a no-op when
- * no live page is held). The JS context goes FIRST: its node wrappers reference
- * the DOM nodes, so the DOM must outlive the wrapper teardown. */
+/* Free the current page's live DOM, CSS sheet and JS context */
 void html_page_teardown(void)
 {
   js_page_end();
@@ -425,8 +371,7 @@ void html_page_teardown(void)
   B->focus_kind = 0;
 }
 
-/* --- iframe fetch handshake (worker thread; resource.c does the network) ----
- */
+/* --- iframe fetch handshake (worker thread */
 
 int html_iframes_pending(void)
 {
@@ -475,8 +420,7 @@ void html_iframe_resolve(const char *url, const char *parent, int verdict, const
   }
 
   if (verdict == FRAME_OK) {
-    /* Render an HTML body (or an empty/sloppy Content-Type, the common case);
-     * anything else is left as an empty frame with a note. */
+    /* Render an HTML body (or an empty/sloppy Content-Type, the common case) */
     int as_html = !ctype || !ctype[0] || contains_ci(ctype, "html");
     if (as_html && body && len > 0) {
       f->doc = dom_parse((const char *)body, len);
@@ -501,9 +445,7 @@ void html_iframe_resolve(const char *url, const char *parent, int verdict, const
   }
 }
 
-/* Re-flatten the live DOM into B's buffers after a script mutated it (run by
- * the worker right after event dispatch), forcing a re-wrap + repaint. Landed
- * inline images keep their pixels; the caller fetches any new ones. */
+/* Re-flatten the live DOM into B's buffers after a script mutated it (run by the worker right */
 void html_relayout(void)
 {
   if (!g_live_dom)
@@ -536,7 +478,7 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 
   struct dom_node *root = dom_parse(B->pg->raw, B->pg->raw_len);
   g_sheet = css_new();
-  g_live_dom = root; /* the live tree — kept until the next teardown  */
+  g_live_dom = root; /* the live tree  -  kept until the next teardown  */
   if (root) {
     scan_meta_csp(root); /* fold <meta http-equiv=CSP> into B->pg->csp before any load */
     /* Link:-header sheets come before the document's own (then tree order). */
@@ -567,40 +509,27 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
     free(bodies);
     free(lens);
 
-    /* @font-face: load declared faces and pick the body font (before walk so
-     * the renderer sees B->pg->body_font for this page's text). */
+    /* @font-face: load declared faces and pick the body font (before walk so the renderer sees */
     load_faces(root, g_page_url, fetch);
 
-    /* Lay out the parsed page now; the worker publishes + paints it before any
-     * script runs (see below), so a slow or long-running script never keeps the
-     * page blank — the HTML shows as soon as it is parsed, as Chrome does. */
+    /* Lay out the parsed page now */
     layout_dom();
 
-    /* url() backgrounds: fetch+decode the urls the walk just collected, then
-     * point each box at its decoded entry (no second cascade over the DOM). */
+    /* url() backgrounds */
     load_bg_images(g_page_url, fetch);
     B->seq++;
 
-    /* Defer the page's <script>s. Running them here would keep `loading` set
-     * and the line table unbuilt until every script finished, so the whole page
-     * would sit on "Loading ..." for the duration of the JS. Instead the worker
-     * paints this laid-out page first, then calls html_run_page_scripts() on
-     * its next pass (see worker_fn). */
+    /* Defer the page's <script>s */
     g_page_fetch = fetch;
     B->scripts_pending = 1;
   } else {
     B->pg->text_len = 0;
   }
   g_csp_report = false; /* later relayouts re-decide silently (no log spam) */
-  /* DOM + sheet + JS context are NOT freed here — they live until the next
-   * navigation (html_page_teardown), so events keep working after load. */
+  /* DOM + sheet + JS context are NOT freed here - they live until the next navigation */
 }
 
-/* Run the current page's <script>s (`fetch` pulls external <script src>). Split
- * out of html_to_text and invoked by the worker only AFTER the parsed page has
- * been laid out and painted, so JS never blocks the first paint. The JS context
- * stays alive past this call so listeners/timers fire later; a script that
- * mutates the DOM is re-laid-out by the caller (worker_fn). */
+/* Run the current page's <script>s (`fetch` pulls external <script src>) */
 void html_run_page_scripts(void)
 {
   if (!g_live_dom)
@@ -608,10 +537,7 @@ void html_run_page_scripts(void)
   js_run_document(g_live_dom, g_page_url, g_page_fetch);
 }
 
-/* Render a non-HTML text body verbatim into the styled-text buffer: newlines
- * are kept (the word-wrapper honours them), tabs expand to the next 8-column
- * stop, and other control bytes are dropped. This is what fixes plain `.txt`
- * pages, whose line breaks the HTML reducer would otherwise collapse. */
+/* Render a non-HTML text body verbatim into the styled-text buffer */
 void plain_to_text(void)
 {
   const char *p = B->pg->raw, *pend = B->pg->raw + B->pg->raw_len;
@@ -668,8 +594,7 @@ void plain_to_text(void)
   B->layout_dirty = 1;
 }
 
-/* Fill the styled-text buffer with a literal one-off message (e.g. "unsupported
- * content type"), so render() shows it through the normal text path. */
+/* Fill the styled-text buffer with a literal one-off message (e.g */
 void doc_message(const char *m)
 {
   int n = 0;

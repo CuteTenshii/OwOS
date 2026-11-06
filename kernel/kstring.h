@@ -1,9 +1,4 @@
-/* kstring.h — freestanding string/memory primitives shared across the kernel.
- *
- * Standard C library names on purpose: the compiler emits implicit calls to
- * memcpy for struct/array copies even under -ffreestanding, and these read like
- * normal C. size_t is uint32_t on -m32, so the uint32_t lengths/returns match
- * the builtins with no signature mismatch. */
+/* kstring.h: freestanding string/memory primitives (libc names; the compiler emits memcpy calls). */
 #ifndef OWOS_KSTRING_H
 #define OWOS_KSTRING_H
 
@@ -19,8 +14,7 @@ uint32_t strlen(const char *s);                              /* byte count befor
 int strcmp(const char *a, const char *b);                    /* <0 / 0 / >0, like libc */
 uint32_t strlcpy(char *dst, const char *src, uint32_t size); /* bounded copy (BSD), ret strlen(src) */
 
-/* The codebase's idiom for "are these two strings equal?" — built on strcmp so
- * call sites read `if (streq(a, b))` instead of `if (!strcmp(a, b))`. */
+/* Equality idiom: streq(a, b) instead of !strcmp(a, b). */
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 static inline char k_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 static inline int k_streq_ci(const char *a, const char *b)
@@ -41,20 +35,10 @@ static inline bool k_eq_ci_n(const char *a, const char *b, uint32_t n)
 
 /* --------------------------------------------------------------- formatting */
 
-/* A minimal freestanding printf, shared by ksnprintf and con_printf. It writes
- * one byte at a time through `sink` so callers needn't size a buffer. Supported
- * conversions: %s (NULL -> "(null)"), %c, %d/%i, %u, %x, %X, %p, %%; with an
- * optional '0' flag and a decimal field width (e.g. %08x, %2u). No floats, no
- * length modifiers — everything here is 32-bit. */
+/* Minimal printf over a byte sink: %s %c %d %i %u %x %X %p %%, optional 0 flag and width. 32-bit only. */
 void kvformat(void (*sink)(char c, void *ctx), void *ctx, const char *fmt, va_list ap);
 
-/* Format into a fixed buffer (always NUL-terminated when size > 0). Returns the
- * number of characters that would have been written had the buffer been large
- * enough (C99 snprintf semantics), so truncation is detectable.
- *
- * No __attribute__((format(printf))): %u/%x/%X here consume a uint32_t, which
- * this toolchain types as `unsigned long`, so the standard printf archetype
- * would flag every 32-bit arg as a (harmless) int-vs-long rank mismatch. */
+/* snprintf semantics (returns would-be length). No format attribute: uint32_t is unsigned long here. */
 int ksnprintf(char *buf, uint32_t size, const char *fmt, ...);
 int kvsnprintf(char *buf, uint32_t size, const char *fmt, va_list ap);
 

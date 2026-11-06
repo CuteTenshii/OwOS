@@ -1,7 +1,6 @@
 #include "engine_int.h"
 
-/* ------------------------------------------------ selectors ----------------
- */
+/* selectors */
 static struct sel_list *parse_sel_list(const char *s, const char *e);
 static void pseudo_free(struct pseudo *pc);
 static void selector_finish(struct selector *sel);
@@ -15,11 +14,7 @@ static bool chr_in(const char *set, char c)
   return false;
 }
 
-/* Advance from s to the first byte in `stop` that sits at bracket-nesting depth
- * 0. (…) and […] are skipped as a unit, so a comma / whitespace / '>' inside an
- * :is()/:not() argument list or an [attr="…"] value never splits a selector.
- * The one scanner shared by the selector-list, compound and :is()-list
- * splitters. */
+/* First byte of `stop` at bracket depth 0; (...) and [...] are skipped as a unit. */
 const char *scan_top(const char *s, const char *e, const char *stop)
 {
   int depth = 0;
@@ -41,12 +36,7 @@ bool is_sel_name(char c)
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
 }
 
-/* ------------------------------------------------ pseudo-classes ----------- *
- * Structural/state pseudo-classes are matched against the DOM; dynamic ones
- * (:hover/:focus/…) and anything we can't evaluate become PC_NEVER so their
- * rule can't apply to a static render; :is()/:where() parse their argument into
- * a list of sub-selectors matched recursively (PC_MATCHES), matching nothing —
- * never the universal fallback — when the argument is empty or unparsable. */
+/* Pseudo-classes: dynamic or unevaluable ones become PC_NEVER; empty :is()/:where() match nothing. */
 
 /* an+b microsyntax (odd|even|<int>|an+b|-n+b) for the :nth-* pseudo-classes. */
 static void parse_anb(const char *s, const char *e, int *a, int *b)
@@ -104,8 +94,7 @@ static void parse_anb(const char *s, const char *e, int *a, int *b)
   }
 }
 
-/* Parse a single simple selector (tag / #id / .class…, no combinators) for
- * :not(). */
+/* Parse a single simple selector (no combinators) for :not(). */
 static char *span_dup(const char *s, const char *e)
 {
   char *d = malloc((unsigned)(e - s) + 1);
@@ -178,8 +167,7 @@ static void parse_simple_sel(const char *s, const char *e, struct simple_sel *ss
   }
 }
 
-/* Classify a pseudo-class name span [ns,ne) (+ optional arg [as,ae)) into *pc.
- * Returns 1 to record *pc, 0 to ignore the pseudo entirely (:is()/:where()). */
+/* Classify a pseudo-class name span (+ optional arg) into *pc; 0 to ignore (:is()/:where()). */
 static bool classify_pseudo(const char *ns, const char *ne, const char *as, const char *ae, struct pseudo *pc)
 {
   pc->kind = PC_NEVER;
@@ -278,10 +266,7 @@ static bool classify_pseudo(const char *ns, const char *ne, const char *as, cons
     return true;
   }
   if (span_is(ns, ne, "is") || span_is(ns, ne, "where")) {
-    /* :is()/:where() match if any sub-selector matches the element as its
-     * subject. An empty or wholly-unparsable argument matches NOTHING (its rule
-     * simply can't apply) — never the universal fallback a pass-through gave.
-     */
+    /* :is()/:where() match if any sub-selector matches; an empty or unparsable argument matches nothing. */
     struct sel_list *l = (as && as < ae) ? parse_sel_list(as, ae) : 0;
     if (!l)
       return true; /* PC_NEVER (matches nothing) */
@@ -359,12 +344,7 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
         if (s < e)
           s++;
       }
-      /* A pseudo-ELEMENT styles generated content / a part, not the element's
-       * own box: ::before/::after render content (PE_BEFORE/PE_AFTER); the rest
-       * (::selection/::first-line/…) we don't render, so the rule must not
-       * match a real element. A single-colon pseudo-CLASS is matched against
-       * the DOM (structural/state) or flagged PC_NEVER (dynamic/unsupported).
-       */
+      /* ::before/::after render content; other pseudo-elements never match a real element. */
       if (span_is(ns, ne, "before"))
         st->pseudo_el = PE_BEFORE;
       else if (span_is(ns, ne, "after"))
@@ -385,8 +365,7 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
   }
 }
 
-/* Parse one full selector (no commas) into *sel; returns 0 if empty/too deep.
- */
+/* Parse one full selector (no commas) into *sel; 0 if empty or too deep. */
 bool parse_selector(const char *s, const char *e, struct selector *sel)
 {
   sel->n = 0;
@@ -402,9 +381,7 @@ bool parse_selector(const char *s, const char *e, struct selector *sel)
       s++;
       continue;
     }
-    /* A compound runs to the next top-level combinator (space/'>'); one inside
-     * (…)/[…] belongs to a pseudo argument or [attr] value — scan_top skips it,
-     * so :is(.a > .b) and [x="a b"] stay a single compound. */
+    /* A compound runs to the next top-level combinator; scan_top skips (...) and [...]. */
     const char *tok = s;
     s = scan_top(s, e, " \t\n\r>");
     struct sel_step *ns = realloc(sel->step, (unsigned)(sel->n + 1) * sizeof *ns);
@@ -461,11 +438,7 @@ static void free_sel_list(struct sel_list *l)
   free(l);
 }
 
-/* Split [s,e) on top-level commas (respecting ()/[]) and parse each piece as a
- * full selector, collecting the ones that parse into a heap list. Returns 0 if
- * none parse — so an :is()/:where() with no usable argument matches nothing,
- * not everything. A depth guard bounds nested :is(:is(:is(…))) against a
- * hostile sheet. */
+/* Split [s,e) on top-level commas into a heap list of parsed selectors; 0 if none parse (depth-guarded). */
 static int g_is_depth;
 static struct sel_list *parse_sel_list(const char *s, const char *e)
 {
@@ -527,8 +500,7 @@ int selector_spec(const struct selector *sel)
         if (pc->arg.tag[0])
           c++;
       } else if (pc->kind == PC_MATCHES) {
-        /* :is() takes the specificity of its most-specific argument; :where()
-         * (pc->a) contributes nothing at all. */
+        /* :is() takes its most specific argument; :where() contributes nothing. */
         if (!pc->a && pc->list) {
           int best = 0;
           for (int k = 0; k < pc->list->n; k++) {
@@ -548,8 +520,7 @@ int selector_spec(const struct selector *sel)
   return a * 10000 + b * 100 + c;
 }
 
-/* ------------------------------------------------ matching -----------------
- */
+/* matching */
 static bool node_has_class(const struct dom_node *n, const char *cls)
 {
   const char *list = dom_get_attr(n, "class");
@@ -574,8 +545,7 @@ static bool node_has_class(const struct dom_node *n, const char *cls)
   return false;
 }
 
-/* ------------------------------------------------ pseudo-class matching ----
- */
+/* pseudo-class matching */
 /* idx satisfies an+b for some integer k >= 0. */
 static bool anb_match(int a, int b, int idx)
 {
@@ -668,8 +638,7 @@ static bool pseudo_match(const struct pseudo *pc, const struct dom_node *n)
   }
 }
 
-/* Match a step's tag/id/class/pseudo-class against `n` (ignoring any
- * pseudo-element). */
+/* Match a step's tag/id/class/pseudo-class against `n`, ignoring any pseudo-element. */
 static bool step_box_match(const struct sel_step *st, const struct dom_node *n)
 {
   if (!n || n->type != DOM_ELEMENT)
@@ -784,10 +753,7 @@ static bool ancestors_possible(const struct selector *sel, const struct dom_node
   return true;
 }
 
-/* Match steps [0, top] of `sel` against the ancestors of `subject` (right to
- * left): a '>' step must match the immediate parent, a descendant step the
- * nearest matching ancestor. Greedy, no backtracking — enough for ordinary
- * selectors. Shared by the normal and ::before/::after matchers. */
+/* Match steps [0, top] of `sel` against `subject`'s ancestors, right to left; greedy, no backtracking. */
 static bool match_ancestors(const struct selector *sel, int top, const struct dom_node *subject)
 {
   const struct dom_node *cur = subject;
@@ -814,9 +780,7 @@ bool selector_match(const struct selector *sel, const struct dom_node *el)
   return ancestors_possible(sel, el) && match_ancestors(sel, i - 1, el);
 }
 
-/* Match a ::before / ::after rule against its originating element `el`: the
- * rightmost compound must carry that pseudo-element, its box part must match
- * el, and the ancestor chain matches as usual. */
+/* Match a ::before/::after rule against its originating element `el`. */
 bool selector_match_pseudo(const struct selector *sel, const struct dom_node *el, int which)
 {
   int i = sel->n - 1;

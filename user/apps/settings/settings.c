@@ -1,36 +1,16 @@
-/* settings.c — a desktop Settings app for OwOS.
- *
- * A master/detail window: a gfx `sidebar` widget down the left edge lists the
- * setting categories, the right pane shows the selected category's controls.
- * Each category maps to real kernel state reached through the ordinary file
- * interface (no bespoke syscalls): device tunables live in the sysfs tree,
- * system info in /proc — the Unix split.
- *
- *   Mouse / Touchpad  pointer speed  -> /sys/class/input/mouse0/speed  (1..5)
- *   Keyboard          layout         -> /sys/class/input/kbd0/layout
- * ("us"/"fr") Display           resolution     ->
- * /sys/class/graphics/fb0/{mode,modes} refresh rate   ->
- * /sys/class/graphics/fb0/{rate,refresh} About             system info    ->
- * /sys/class/dmi/id, /proc/cpuinfo, ...
- *
- * A category owns a list of `control`s (label + dropdown + apply callback),
- * laid out top to bottom, so a pane can carry several settings (Display has
- * two). The sidebar owns its width as a resizable property (drag the divider).
- * A `seq` counter bumps on every change so the loop repaints only when
- * something moved.
- */
+/* settings.c, a desktop Settings app for OwOS */
 #include "gfx.h"
 #include "owos.h"
 #include <stdbool.h>
 
 static int W = 480, H = 320; /* client size; changes on resize */
-#define HEADER_H 22          /* sidebar title strip                  */
-#define ROW_H 26             /* sidebar category row height          */
+#define HEADER_H 22          /* sidebar title strip */
+#define ROW_H 26             /* sidebar category row height */
 #define SIDEBAR_W 150
 #define SIDEBAR_MIN 120
 #define SIDEBAR_MAX 220
 
-/* Theme (matches the Files explorer). */
+/* Theme (matches the Files explorer) */
 #define BG_PANEL 0x12161eu
 #define BG_SIDE 0x0e1218u
 #define BG_HEADER 0x161d28u
@@ -51,18 +31,17 @@ static const char *const cat_name[NCATS] = {
 static int sel = CAT_MOUSE; /* selected category */
 static unsigned seq = 1;    /* bump to request a repaint */
 
-/* Live state mirrored from /proc, re-read when a category is entered. Each
- * category presents its choices through one select (dropdown) widget. */
+/* Live state mirrored from /proc, re-read when a category is entered */
 static int mouse_level = 3;       /* pointer-speed level 1..5 */
-static char kbd_layout[8] = "us"; /* "us" / "fr"              */
+static char kbd_layout[8] = "us"; /* "us" / "fr" */
 
-/* Pointer-speed levels 1..5, by their dropdown labels. */
+/* Pointer-speed levels 1..5, by their dropdown labels */
 static const char *const mouse_opts[5] = {
     "Slowest", "Slow", "Normal", "Fast", "Fastest",
 };
 static struct select_box mouse_sel;
 
-/* Keyboard layouts: sysfs name + the label shown in the dropdown. */
+/* Keyboard layouts: sysfs name + the label shown in the dropdown */
 static const struct {
   const char *name, *label;
 } kbd_opts[] = {
@@ -74,28 +53,26 @@ static const char *kbd_opt_lbl[NKBD]; /* select_box wants a char* array */
 static struct select_box kbd_sel;
 
 #define MAX_OUTS 6
-static char sound_name[MAX_OUTS][20];    /* audio output device names            */
+static char sound_name[MAX_OUTS][20];    /* audio output device names */
 static const char *sound_opts[MAX_OUTS]; /* select_box array (-> sound_name) */
-static int sound_n;                      /* how many outputs the codec exposes   */
-static int sound_cur;                    /* index of the active output           */
+static int sound_n;                      /* how many outputs the codec exposes */
+static int sound_cur;                    /* index of the active output */
 static struct select_box sound_sel;
 
 #define MAX_MODES 16
 static char disp_label[MAX_MODES][16];   /* "1280 x 720" per offered mode */
 static const char *disp_opts[MAX_MODES]; /* select_box option array (-> labels) */
 static int disp_w[MAX_MODES], disp_h[MAX_MODES];
-static int disp_n;      /* how many modes are offered           */
+static int disp_n;      /* how many modes are offered */
 static int disp_cur;    /* index of the active mode, -1 if none */
-static bool disp_fixed; /* true = resolution can't be changed      */
+static bool disp_fixed; /* true = resolution can't be changed */
 static struct select_box disp_sel;
 
-/* Refresh rate: a second Display control over /sys/class/graphics/fb0/rate (the
- * compositor's frame-pacing target). The list is capped at the panel's real
- * refresh (fb0/refresh, from EDID) — above it there's no vblank to sync to. */
+/* Refresh rate: a second Display control over /sys/class/graphics/fb0/rate */
 #define MAX_RATES 8
 static char rate_label[MAX_RATES][12]; /* "60 Hz" per offered rate */
 static const char *rate_opts[MAX_RATES];
-static int rate_val[MAX_RATES]; /* the numeric Hz behind each option    */
+static int rate_val[MAX_RATES]; /* the numeric Hz behind each option */
 static int rate_n;
 static int rate_cur; /* index of the active rate, -1 if none */
 static struct select_box rate_sel;
@@ -103,8 +80,7 @@ static struct select_box rate_sel;
 static char about_line[10][72]; /* About: one formatted line per row */
 static int about_n;
 
-/* ------------------------------------------------------------- small helpers
- */
+/* small helpers */
 
 static void uitoa(unsigned v, char *out)
 {
@@ -135,8 +111,7 @@ static int patoi(const char *s)
   return v;
 }
 
-/* Read a /proc file into `buf` (NUL-terminated, trailing newline trimmed).
- * Returns the length, or 0 if the read failed / file was empty. */
+/* Read a /proc file into `buf` (NUL-terminated, trailing newline trimmed) */
 static int read_proc(const char *name, char *buf, int max)
 {
   int n = readfile(name, buf, max - 1);
@@ -148,8 +123,7 @@ static int read_proc(const char *name, char *buf, int max)
   return n;
 }
 
-/* Copy the text after "<key> " on its line in `buf` into out (trimmed at EOL).
- * Returns 1 if the key was found at a line start, else 0. */
+/* Copy the text after "<key> " on its line in `buf` into out (trimmed at EOL) */
 static bool field(const char *buf, const char *key, char *out, int max)
 {
   for (const char *p = buf; *p;) {
@@ -174,8 +148,7 @@ static bool field(const char *buf, const char *key, char *out, int max)
   return false;
 }
 
-/* ------------------------------------------------------------- state loading
- */
+/* state loading */
 
 static void load_mouse(void)
 {
@@ -242,7 +215,7 @@ static void load_sound(void)
   select_init(&sound_sel, sound_opts, sound_n, sound_cur);
 }
 
-/* Build "WxH" (compact, for the sysfs write) and "W x H" (the menu label). */
+/* Build "WxH" (compact, for the sysfs write) and "W x H" (the menu label) */
 static void mode_str(int w, int h, char *out, int spaced)
 {
   char t[12];
@@ -262,7 +235,7 @@ static void mode_str(int w, int h, char *out, int spaced)
   out[i] = 0;
 }
 
-/* Parse a leading "WxH" out of `s` into *w,*h (0 if absent). */
+/* Parse a leading "WxH" out of `s` into *w,*h (0 if absent) */
 static void parse_wh(const char *s, int *w, int *h)
 {
   int a = 0, b = 0;
@@ -312,13 +285,12 @@ static void load_display(void)
       break;
     }
 
-  /* A single offered mode means the kernel can't reprogram it (an adopted
-   * GOP/bootloader framebuffer) — it just reports the current one. */
+  /* A single offered mode means the kernel can't reprogram it, it just reports the current one */
   disp_fixed = (disp_n <= 1);
   select_init(&disp_sel, disp_opts, disp_n, disp_cur < 0 ? 0 : disp_cur);
 }
 
-/* Append hz to the offered-rate list as "N Hz" if there's room and it's new. */
+/* Append hz to the offered-rate list as "N Hz" if there's room and it's new */
 static void add_rate(int hz)
 {
   if (hz <= 0 || rate_n >= MAX_RATES)
@@ -344,9 +316,7 @@ static void load_rate(void)
   rate_n = 0;
   rate_cur = -1;
 
-  /* Cap the list at the panel's real refresh (EDID); without EDID (QEMU) fall
-   * back to the safe 30/60 pair. Above the panel rate there's no vblank to sync
-   * to, so a higher pacing target would only tear. */
+  /* Cap the list at the panel's real refresh; without EDID fall back to the safe 30/60 pair */
   int cap = 0;
   if (read_proc("/sys/class/graphics/fb0/refresh", t, sizeof t) > 0)
     cap = patoi(t);
@@ -362,7 +332,7 @@ static void load_rate(void)
   int cur = 0;
   if (read_proc("/sys/class/graphics/fb0/rate", t, sizeof t) > 0)
     cur = patoi(t);
-  add_rate(cur); /* the live value may be outside the candidate set — show it */
+  add_rate(cur); /* the live value may be outside the candidate set, show it */
   for (int i = 0; i < rate_n; i++)
     if (rate_val[i] == cur) {
       rate_cur = i;
@@ -445,8 +415,7 @@ static void load_about(void)
   }
 }
 
-/* Re-read the state the given category displays so it reflects the live kernel
- * value (it may have changed via the terminal or hotkeys since last shown). */
+/* Re-read the state the given category displays so it reflects the live kernel value */
 static void build_controls(int cat);
 
 static void load_category(int cat)
@@ -465,8 +434,7 @@ static void load_category(int cat)
   build_controls(cat);
 }
 
-/* ------------------------------------------------------------- apply changes
- */
+/* apply changes */
 
 static void set_mouse_level(int level)
 {
@@ -502,9 +470,7 @@ static void set_display(int i)
   if (i < 0 || i >= disp_n)
     return;
   mode_str(disp_w[i], disp_h[i], t, 0);
-  /* The kernel queues the switch for the compositor thread; the write succeeds
-   * once it's accepted. Mirror the selection so the UI tracks it immediately.
-   */
+  /* The kernel queues the switch for the compositor thread */
   if (writefile("/sys/class/graphics/fb0/mode", t, strlen(t)) == 0)
     disp_cur = i;
 }
@@ -515,17 +481,14 @@ static void set_rate(int i)
   if (i < 0 || i >= rate_n)
     return;
   uitoa((unsigned)rate_val[i], t);
-  /* The kernel clamps and stores it; the compositor polls the node and
-   * re-paces, then persists the choice to /etc/display.conf. */
+  /* The kernel clamps and stores it; the compositor polls the node and re-paces */
   if (writefile("/sys/class/graphics/fb0/rate", t, strlen(t)) == 0)
     rate_cur = i;
 }
 
-/* ------------------------------------------------------------- layout / paint
- */
+/* layout / paint */
 
-/* Width actually rendered this frame: the widget property, capped so the detail
- * pane always keeps ~200px on a narrow window. */
+/* Width actually rendered this frame: the widget property */
 static int sidebar_w(void)
 {
   int sbw = sb.w;
@@ -546,10 +509,6 @@ static int ctrl_box_w(int cw)
   return w;
 }
 
-/* A detail-pane control: a labelled dropdown plus the callback that pushes its
- * value to the kernel. Each category owns a list of these, laid out top to
- * bottom — the generalisation (over one hardcoded select per category) is what
- * lets Display carry both Resolution and Refresh rate. */
 struct control {
   const char *label, *hint;
   struct select_box *sel;
@@ -558,15 +517,14 @@ struct control {
 static struct control ctrls[3];
 static int nctrl;
 
-/* Per-control vertical geometry: label, then the box, then a dim hint under it.
- */
+/* Per-control vertical geometry: label, then the box, then a dim hint under it */
 #define CONTROLS_Y0 44
 #define CONTROL_PITCH 84
 static int ctrl_label_y(int i) { return CONTROLS_Y0 + i * CONTROL_PITCH; }
 static int ctrl_box_y(int i) { return ctrl_label_y(i) + 24; }
 static int ctrl_hint_y(int i) { return ctrl_box_y(i) + GUI_SELECT_H + 8; }
 
-/* Bridge each control's (int idx) selection to its typed setter. */
+/* Bridge each control's (int idx) selection to its typed setter */
 static void ap_mouse(int i) { set_mouse_level(i + 1); }
 static void ap_kbd(int i) { set_kbd_layout(kbd_opts[i].name); }
 static void ap_sound(int i) { set_sound_output(i); }
@@ -584,7 +542,7 @@ static void addc(const char *label, const char *hint, struct select_box *sel, vo
   nctrl++;
 }
 
-/* Populate ctrls[] for the active category from its freshly loaded state. */
+/* Populate ctrls[] for the active category from its freshly loaded state */
 static void build_controls(int cat)
 {
   nctrl = 0;
@@ -609,8 +567,7 @@ static void build_controls(int cat)
   }
 }
 
-/* Draw the active category's controls: labels and hints first, then the boxes —
- * the open one last so its expanded list overlays the controls below it. */
+/* Draw the active category's controls: labels and hints first, then the boxes */
 static void draw_controls(int cx, int cw)
 {
   if (nctrl == 0) {
@@ -637,8 +594,6 @@ static void draw_controls(int cx, int cw)
     select_draw(ctrls[open].sel, cx + 16, ctrl_box_y(open), bw, GUI_SELECT_H);
 }
 
-/* Draw `s` at (x,y), truncated to fit `maxw` pixels so a long line (a verbose
- * CPU brand string) can't spill past the detail pane's right edge. */
 static void draw_fit(int x, int y, const char *s, int maxw, unsigned fg)
 {
   if (gfx_ui_width(s) <= maxw) {
@@ -671,8 +626,7 @@ static void render(void)
   int sbw = sidebar_w();
   gfx_clear(BG_PANEL);
 
-  /* Sidebar: the widget paints the panel base, divider and resize grip; we
-   * overdraw the title strip and the category rows. */
+  /* Sidebar: the widget paints the panel base, divider and resize grip */
   sidebar_draw(&sb, 0, 0, sbw, H, BG_SIDE, BG_DIVIDER);
   gfx_fill_rect(0, 0, sbw, HEADER_H, BG_HEADER);
   gfx_ui_text(8, 2, "Settings", FG_TITLE);
@@ -684,8 +638,7 @@ static void render(void)
     gfx_ui_text(8, ry + (ROW_H - UIFONT_H) / 2, cat_name[i], here ? FG_WHITE : FG_TEXT);
   }
 
-  /* Detail pane: About renders its own text block; every other category shows
-   * the category title over its generic control stack. */
+  /* Detail pane: About renders its own text block */
   int cx = sbw + 1, cw = W - sbw - 1;
   gfx_fill_rect(cx, 0, cw, H, BG_PANEL);
   if (sel == CAT_ABOUT) {
@@ -696,14 +649,14 @@ static void render(void)
   }
 }
 
-/* ------------------------------------------------------------- input */
+/* input */
 
 static void click(int id, int mx, int my)
 {
   (void)id;
   int sbw = sidebar_w();
 
-  /* Divider grip: grab it to resize the sidebar (consumes the press). */
+  /* Divider grip: grab it to resize the sidebar (consumes the press) */
   if (sidebar_press(&sb, 0, 0, sbw, H, mx, my)) {
     seq++;
     return;
@@ -721,8 +674,7 @@ static void click(int id, int mx, int my)
     return;
   }
 
-  /* Detail-pane controls: route to the open dropdown first (its list overlays
-   * the boxes below it), then the rest. Acting on one closes the others. */
+  /* Detail-pane controls: route to the open dropdown first, then the rest */
   int cx = sbw + 1, cw = W - sbw - 1;
   int bw = ctrl_box_w(cw), opened = -1;
   for (int i = 0; i < nctrl; i++)
@@ -757,8 +709,7 @@ static void drag(int mx)
     seq++;
 }
 
-/* Up/Down move the selected category; an open dropdown captures keys instead.
- */
+/* Up/Down move the selected category; an open dropdown captures keys instead */
 static void key(int k)
 {
   for (int i = 0; i < nctrl; i++) {
@@ -797,7 +748,7 @@ int main(void)
   sidebar_init(&sb, SIDEBAR_W, SIDEBAR_MIN, SIDEBAR_MAX);
   win_resizable(id, 1);
 
-  /* Prime every category's state once so switching is instant. */
+  /* Prime every category's state once so switching is instant */
   load_mouse();
   load_kbd();
   load_sound();
@@ -818,7 +769,7 @@ int main(void)
       else if (ev.type == WEV_DRAG)
         drag(ev.a);
       else if (ev.type == WEV_MOVE) {
-        /* Track hover for whichever dropdown is open. */
+        /* Track hover for whichever dropdown is open */
         int sbw = sidebar_w(), cx = sbw + 1, cw = W - sbw - 1, bw = ctrl_box_w(cw);
         for (int i = 0; i < nctrl; i++) {
           if (!ctrls[i].sel->open)

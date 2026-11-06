@@ -1,15 +1,10 @@
-/* cast — a terminal front end for the Cast library (user/lib/cast).
+/* cast: a terminal front end for the Cast library (user/lib/cast).
  *
  *   cast [discover]                 list Cast receivers on the LAN
- *   cast play <name> <url> [type]   cast a media URL to a receiver and monitor
- * it
+ *   cast play <name> <url> [type]   cast a media URL to a receiver and monitor it
  *
- * <name> matches a device by a case-insensitive substring of its friendly name
- * (or a 0-based index); [type] is an optional MIME hint (e.g. video/mp4). This
- * exercises the whole pipeline (mDNS -> TLS channel -> Default Media Receiver)
- * without the browser; there is no Cast device under QEMU/SLIRP, so `discover`
- * there simply reports none.
- */
+ * <name> is a case-insensitive substring of the friendly name or a 0-based index;
+ * [type] is an optional MIME hint. `discover` reports none under QEMU/SLIRP. */
 #include "cast.h"
 #include "owos.h"
 #include <stdbool.h>
@@ -127,8 +122,7 @@ static int cmd_play(const char *sel, const char *url, const char *type)
   }
   printf("Now casting. (kill this process to stop)\n");
 
-  /* Monitor: print a status line each second until the track ends or the
-   * receiver disconnects. */
+  /* Monitor: print a status line each second until the track ends or the receiver disconnects. */
   for (;;) {
     cast_get_status(s, &st);
     if (st.conn == CAST_DISCONNECTED) {

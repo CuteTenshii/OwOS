@@ -1,8 +1,6 @@
 #include "html_int.h"
 
-/* decode_entity returns a real Unicode codepoint now (the renderer is UTF-8),
- * or the sentinels -1 (non-breaking space -> collapsible space) and -2 (drop).
- */
+/* decode_entity returns a real Unicode codepoint now (the renderer is UTF-8), or the sentinels */
 int decode_entity(const char *p, const char *end, int *adv)
 {
   int n = 1;
@@ -52,13 +50,7 @@ int decode_entity(const char *p, const char *end, int *adv)
       return 0xFFFD; /* invalid -> U+FFFD */
     return (int)v;
   }
-  /* Named entities -> their real Unicode codepoints (the renderer is UTF-8). A
-   * practical subset of the HTML5 named character references: the markup
-   * essentials, the full Latin-1 block, General Punctuation, common math/arrow/
-   * Greek/letterlike symbols, card suits and currency. nbsp maps to the -1
-   * collapsible-space sentinel. (The rare two-codepoint references are omitted
-   * — every entry expands to one codepoint, which keeps the in-place rewrite in
-   * decode_entities safe.) */
+  /* Named entities -> their real Unicode codepoints (the renderer is UTF-8) */
   static const struct {
     const char *name;
     int ch;
@@ -466,9 +458,7 @@ int decode_entity(const char *p, const char *end, int *adv)
              {"Psi", 0x3A8},
              {"Omega", 0x3A9},
              {0, 0}};
-  /* Bucket the table by first letter on first use, so each &name; only scans
-   * the handful of entries sharing its initial rather than the whole ~300-row
-   * table. */
+  /* Bucket the table by first letter on first use, so each &name */
   static short ent_head[256];                        /* first char -> entry index + 1 (0 = empty) */
   static short ent_next[sizeof ent / sizeof ent[0]]; /* chain within a bucket */
   static int ent_built;
@@ -494,12 +484,7 @@ int decode_entity(const char *p, const char *end, int *adv)
   return '&';
 }
 
-/* Decode HTML entities in a string in place — mainly so href/src attribute
- * values (e.g. "a?x=1&amp;y=2") become real URLs ("a?x=1&y=2") before we
- * navigate or fetch them. A codepoint is written back as UTF-8; since an entity
- * is always at least as long as the bytes it decodes to (and raw bytes copy
- * 1:1), the output never overruns the input, so the in-place rewrite is safe.
- */
+/* Decode HTML entities in a string in place - mainly so href/src attribute values (e.g */
 void decode_entities(char *s)
 {
   char *o = s;
