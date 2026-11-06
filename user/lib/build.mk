@@ -26,7 +26,7 @@ endif
 # graphics weight. gfx loads its fonts at runtime from /etc/fonts (see kernel
 # install + user/lib/gfx), so no app bakes in a bitmap atlas.
 FONT    := user/lib/font/font.o   # TrueType/OpenType(glyf) parser + AA glyph rasterizer
-ULIB    := user/lib/start.o user/lib/lib.o user/lib/opt.o
+ULIB    := user/lib/start.o user/lib/lib.o user/lib/opt.o user/lib/mutex.o
 GUILIB  := user/lib/gfx/gfx.o user/lib/gfx/selection.o user/lib/gfx/sidebar.o user/lib/gfx/select.o user/lib/gfx/tabbar.o $(FONT)
 DIALOG  := user/lib/dialog/dialog.o   # reusable modal message-box + property-sheet dialogs (uses gfx)
 

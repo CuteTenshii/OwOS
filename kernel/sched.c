@@ -69,6 +69,7 @@ typedef struct task {
   bool self_reap;             /* detached kernel thread: no parent waitpid's it, so
                                * schedule() frees its zombie instead of leaking it */
   int wait_pid;               /* pid being waited on while WAITING            */
+  uint32_t futex_key;         /* user address a futex waiter sleeps on (0 = none) */
   uint32_t wake_tick;         /* if WAITING for a timed sleep: tick to wake at
                                * (0 = not a timed sleep, e.g. a waitpid waiter) */
   int exit_status;            /* set on exit, read by waitpid                 */
@@ -873,6 +874,56 @@ void sched_sleep_until(uint32_t wake)
   current->wake_tick = 0;
   if (flags & 0x200) /* restore the caller's interrupt flag */
     __asm__ volatile("sti");
+}
+
+/* Sleep until futex_wake(addr) unless *addr != expected on entry. A timeout of
+ * 0 ms waits forever. Returns 1 if the wait timed out or was interrupted. */
+bool sched_futex_wait(uint32_t addr, uint32_t expected, uint32_t ms)
+{
+  uint32_t wake = 0;
+  if (ms) {
+    wake = timer_ticks() + (uint32_t)(((uint64_t)ms * TIMER_HZ + 999) / 1000);
+    if (wake == 0)
+      wake = 1;
+  }
+  uintptr_t flags = irq_save();
+  sched_lock();
+  if (*(volatile uint32_t *)(uintptr_t)addr != expected) {
+    sched_unlock();
+    irq_restore(flags);
+    return false;
+  }
+  current->futex_key = addr;
+  current->wake_tick = wake;
+  current->state = TASK_WAITING;
+  sched_unlock();
+  schedule();
+  bool unwoken = current->futex_key != 0;
+  current->futex_key = 0;
+  current->wake_tick = 0;
+  irq_restore(flags);
+  return unwoken;
+}
+
+/* Wake up to n tasks of the caller's address space sleeping on addr. */
+int sched_futex_wake(uint32_t addr, int n)
+{
+  int woken = 0;
+  uintptr_t flags = irq_save();
+  sched_lock();
+  task_t *t = &main_task;
+  do {
+    if (woken < n && t->state == TASK_WAITING && t->futex_key == addr && t->as == current->as) {
+      t->futex_key = 0;
+      t->wake_tick = 0;
+      t->state = TASK_RUNNABLE;
+      woken++;
+    }
+    t = t->next;
+  } while (t != &main_task);
+  sched_unlock();
+  irq_restore(flags);
+  return woken;
 }
 
 /* Promote every timed sleeper whose deadline has arrived back to RUNNABLE.

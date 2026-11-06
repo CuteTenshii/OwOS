@@ -70,6 +70,8 @@ void sched_yield(void); /* voluntarily give up the CPU (stays runnable)      */
  */
 void sched_sleep_until(uint32_t wake);
 void sched_wake_due(uint32_t now);
+bool sched_futex_wait(uint32_t addr, uint32_t expected, uint32_t ms); /* true: timed out/interrupted */
+int sched_futex_wake(uint32_t addr, int n);
 struct fd *sched_fds(void);        /* the current task's file descriptor table     */
 uint32_t *sched_current_dir(void); /* current task's page dir (windowing layer) */
 uint32_t sched_current_id(void);   /* current task's pid                        */

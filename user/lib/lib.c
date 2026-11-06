@@ -1,5 +1,6 @@
 /* lib.c: OwOS user library: syscall wrappers and small helpers. */
 
+#include "mutex.h"
 #include "owos.h"
 #include "syscall_nr.h"
 
@@ -36,6 +37,13 @@ int waitpid(int pid) { return syscall(SYS_WAITPID, pid, 0, 0); }
 int waitpid_nb(int pid, int *status) { return syscall(SYS_WAITPID, pid, (int)status, WNOHANG); }
 
 unsigned uptime(void) { return msec() / 1000u; /* seconds since boot, derived from the ms counter */ }
+
+bool futex_wait(unsigned *addr, unsigned expected, unsigned ms)
+{
+  return syscall(SYS_FUTEX_WAIT, (int)addr, (int)expected, (int)ms) == 1;
+}
+
+int futex_wake(unsigned *addr, int n) { return syscall(SYS_FUTEX_WAKE, (int)addr, n, 0); }
 
 unsigned msec(void) { return (unsigned)syscall(SYS_MSEC, 0, 0, 0); }
 
@@ -456,33 +464,12 @@ static Header *freep; /* roving free-list pointer          */
 #define SBIN_MAX 1024u
 static Header *sbins[SBIN_MAX + 1];
 
-/* Spinlock guarding the free list. xchg is atomic; on contention we yield to
- * the lock holder (single CPU, the timer also preempts a spinner as a
- * backstop). */
-static volatile int heap_lock;
-static inline int xchg32(volatile int *p, int v)
-{
-  __asm__ volatile("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
-  return v;
-}
-static void hlock(void)
-{
-  while (xchg32(&heap_lock, 1))
-    msleep(0);
-}
-static void hunlock(void)
-{
-  __asm__ volatile("" ::: "memory");
-  heap_lock = 0;
-}
+static mutex_t heap_lock;
+#define hlock() mutex_lock(&heap_lock)
+#define hunlock() mutex_unlock(&heap_lock)
 
-/* Crash recovery only: drop the heap lock a longjmp'd-over frame may have held.
- */
-void heap_lock_reset(void)
-{
-  __asm__ volatile("" ::: "memory");
-  heap_lock = 0;
-}
+/* Crash recovery only: drop the heap lock a longjmp'd-over frame may have held. */
+void heap_lock_reset(void) { mutex_reset(&heap_lock); }
 
 #define NALLOC 2048u /* min header-units to request at once */
 

@@ -82,5 +82,7 @@
 #define SYS_WIN_SET_PARENT 79
 #define SYS_WIN_FB 80
 #define SYS_UNAME 81
+#define SYS_FUTEX_WAIT 82
+#define SYS_FUTEX_WAKE 83
 
 #endif
