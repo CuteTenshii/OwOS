@@ -1,0 +1,12 @@
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-narrowing-conversions,
+  -clang-analyzer-security.insecureAPI.*,
+  -clang-analyzer-optin.performance.Padding
+WarningsAsErrors: ''
+HeaderFilterRegex: '^(boot|common|drivers|kernel)/'
+FormatStyle: file

@@ -1,0 +1,16 @@
+pre-commit:
+  parallel: false
+  commands:
+    format:
+      glob: "*.{c,h}"
+      exclude: '(^|/)(font[^/]*\.h|minimp3\.h)$'
+      run: clang-format -i -- {staged_files}
+      stage_fixed: true
+    tidy:
+      glob: "{kernel,drivers}/**/*.c"
+      run: make tidy TIDY_FILES="{staged_files}"
+
+pre-push:
+  commands:
+    test:
+      run: make test
