@@ -347,7 +347,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
       fs_create("/etc/mdns.conf", "_ssh._tcp 22\n_smb._tcp 445\n", 26);
     /* init's service table, one /bin daemon per line; compositor first. */
     if (fs_read("/etc/inittab", &probe, 0) < 0)
-      fs_create("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\nntpd\n", 34);
+      fs_create("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\nntpd\nmediad\n", 41);
     users_init();
     INSTALL_APP(edit);
     INSTALL_APP(curl);
@@ -386,6 +386,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(dhcpcd);
     INSTALL_APP(ntpd);
     INSTALL_APP(mdnsd);
+    INSTALL_APP(mediad);
+    INSTALL_APP(mediactl);
     INSTALL_APP(cast);
     INSTALL_APP(init);
     INSTALL_FILE("/bin/notify-send", _binary_app_notifysend);
@@ -425,7 +427,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     if (!uwin_compositor_active()) {
       if (keyboard_take_interrupt())
         shell_interrupt_locked();
-      while (keyboard_poll(&c, &mods))
+      while (keyboard_poll_text(&c, &mods))
         shell_feed_locked(c);
     }
     while (serial_poll(&c))

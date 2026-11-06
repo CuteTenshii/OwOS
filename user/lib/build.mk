@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto tls netconn gfx zlib png webp mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz
+ULIBDIRS := curl torrent crypto tls netconn gfx zlib png webp mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -112,6 +112,8 @@ PROTOBUF := user/lib/protobuf/protobuf.o
 # $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE) (which bundles $(MDNS)).
 CAST    := user/lib/cast/cast.o
 NOTIFY  := user/lib/notify/notify.o   # notifyd client (desktop notifications)
+# mediactl: client for the mediad media session service; session.o is the shared codec + policy.
+MEDIACTL := user/lib/mediactl/mediactl.o user/lib/mediactl/session.o
 # mdns: mDNS (RFC 6762) + DNS-SD (RFC 6763) client over a UDP socket - .local
 # resolution + service discovery. Pure over net_* + libc; needs $(LIBGCC).
 MDNS    := user/lib/mdns/mdns.o
