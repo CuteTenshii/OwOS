@@ -4,6 +4,7 @@
 #define OWOS_DOM_H
 
 #include "owos.h" /* lower/starts_ci/streq_ci/contains_ci case-insensitive helpers */
+#include <stdbool.h>
 
 enum dom_type { DOM_ELEMENT, DOM_TEXT };
 
@@ -34,7 +35,13 @@ struct dom_node {
   int type_count;
   void *computed_style;
   void *computed_style_sheet;
-  unsigned computed_style_seq;
+  unsigned computed_style_seq; /* style-cache key, DOM_STYLE_STALE after a relevant mutation */
+  void *pseudo_style[2];       /* cached ::before/::after style (NULL = no content) */
+  void *pseudo_sheet;
+  unsigned pseudo_seq;
+  void *anim_rec;        /* animation/transition record (features/anim), or NULL */
+  unsigned anc_bloom[4]; /* hashes of the ancestors' tag/id/classes (css/engine.c) */
+  unsigned anc_bloom_seq;
   void *wrapper; /* cached JS wrapper object (browser/js/bindings.c),
                   * NULL until first exposed to script — gives
                   * a node stable identity so listeners stick. */
@@ -57,6 +64,15 @@ void dom_remove_child(struct dom_node *parent, struct dom_node *child);
 void dom_set_attr(struct dom_node *el, const char *name, const char *value);
 void dom_remove_attr(struct dom_node *el, const char *name);
 void dom_clear_children(struct dom_node *el);
+
+/* computed_style_seq / pseudo_seq value after a mutation made the cache unusable. */
+#define DOM_STYLE_STALE (~0u)
+
+/* Set once a loaded rule uses a structural pseudo-class (:nth-*, :empty, ...). */
+extern bool dom_structural_styles;
+
+/* Installed by features/anim: drops the record of a node that is being freed. */
+extern void (*dom_on_free_anim)(struct dom_node *n);
 
 /* Hook the JS layer installs so a freed node detaches its wrapper (see dom.c).
  */

@@ -24,6 +24,7 @@
 #include "browser.h"
 #include "headers.h"
 #include "httpcache.h"
+#include "mutex.h"
 
 #define CACHE_DIR "/home/root/.cache/browser"
 #define CACHE_MAX_BYTES (16 * 1024 * 1024)
@@ -72,25 +73,8 @@ static bool g_disk_ok; /* CACHE_DIR is writable      */
 static char g_unlink[PEND_UNLINK_MAX][24];
 static int g_nunlink;
 
-/* Spinlock (xchg + yield), matching resource.c's pool locks. Guards the list,
- * the bucket index, g_bytes and the pending-unlink array against the fetch
- * threads. */
-static volatile int g_lock;
-static int lk_xchg(volatile int *p, int v)
-{
-  __asm__ volatile("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
-  return v;
-}
-static void lk_lock(void)
-{
-  while (lk_xchg(&g_lock, 1))
-    msleep(0);
-}
-static void lk_unlock(void)
-{
-  __asm__ volatile("" ::: "memory");
-  g_lock = 0;
-}
+/* Guards the list, the bucket index, g_bytes and the pending-unlink array against the fetch threads. */
+static mutex_t g_lock;
 
 /* Heap copy of a NUL-terminated string (NULL-safe: NULL -> NULL). */
 static char *sdup(const char *s)
@@ -326,10 +310,10 @@ int cache_lookup(const char *method, const char *url, long now, unsigned char **
   if (!is_get(method))
     return CACHE_MISS;
 
-  lk_lock();
+  mutex_lock(&g_lock);
   struct cache_entry *e = find(url);
   if (!e) {
-    lk_unlock();
+    mutex_unlock(&g_lock);
     return CACHE_MISS;
   }
   lru_touch(e);
@@ -340,7 +324,7 @@ int cache_lookup(const char *method, const char *url, long now, unsigned char **
   if (fresh) {
     fill_out(e, body, len, ctype, ctype_cap, hdr, hdr_cap);
     int ok = *body != 0;
-    lk_unlock();
+    mutex_unlock(&g_lock);
     return ok ? CACHE_FRESH : CACHE_MISS;
   }
   if (has_validator) {
@@ -349,15 +333,15 @@ int cache_lookup(const char *method, const char *url, long now, unsigned char **
      * revalidation-capable caller may reuse it later). */
     if (cond && cond_cap) {
       build_cond(e, cond, cond_cap);
-      lk_unlock();
+      mutex_unlock(&g_lock);
       return CACHE_REVALIDATE;
     }
-    lk_unlock();
+    mutex_unlock(&g_lock);
     return CACHE_MISS;
   }
   /* Stale with no way to revalidate: drop it and fetch fresh. */
   unlink_free(e);
-  lk_unlock();
+  mutex_unlock(&g_lock);
   return CACHE_MISS;
 }
 
@@ -391,12 +375,12 @@ void cache_store(const char *method, const char *url, int status, long now, cons
     return;
   }
 
-  lk_lock();
+  mutex_lock(&g_lock);
   struct cache_entry *e = find(url);
   if (e) { /* replace the stored body */
     unsigned char *nb = malloc((unsigned)(len ? len : 1));
     if (!nb) {
-      lk_unlock();
+      mutex_unlock(&g_lock);
       http_headers_free(&H);
       return;
     }
@@ -418,7 +402,7 @@ void cache_store(const char *method, const char *url, int status, long now, cons
     set_freshness(e, &cc, now);
     e->dirty = true;
     g_bytes += len;
-    lk_unlock();
+    mutex_unlock(&g_lock);
     http_headers_free(&H);
     return;
   }
@@ -426,7 +410,7 @@ void cache_store(const char *method, const char *url, int status, long now, cons
   evict_for(len);
   e = malloc(sizeof *e);
   if (!e) {
-    lk_unlock();
+    mutex_unlock(&g_lock);
     http_headers_free(&H);
     return;
   }
@@ -437,7 +421,7 @@ void cache_store(const char *method, const char *url, int status, long now, cons
   e->body = malloc((unsigned)(len ? len : 1));
   if (!e->url || !e->body) {
     entry_free(e);
-    lk_unlock();
+    mutex_unlock(&g_lock);
     http_headers_free(&H);
     return;
   }
@@ -450,7 +434,7 @@ void cache_store(const char *method, const char *url, int status, long now, cons
   e->dirty = true;
   entry_link(e);
   g_bytes += len;
-  lk_unlock();
+  mutex_unlock(&g_lock);
   http_headers_free(&H);
 }
 
@@ -465,10 +449,10 @@ int cache_revalidated(const char *url, long now, const char *hdr_block, unsigned
   struct http_cc cc;
   http_cc_parse(&H, &cc);
 
-  lk_lock();
+  mutex_lock(&g_lock);
   struct cache_entry *e = find(url);
   if (!e) {
-    lk_unlock();
+    mutex_unlock(&g_lock);
     http_headers_free(&H);
     return 0;
   }
@@ -477,7 +461,7 @@ int cache_revalidated(const char *url, long now, const char *hdr_block, unsigned
   lru_touch(e);
   fill_out(e, body, len, ctype, ctype_cap, hdr, hdr_cap);
   int ok = *body != 0;
-  lk_unlock();
+  mutex_unlock(&g_lock);
   http_headers_free(&H);
   return ok;
 }
@@ -530,7 +514,7 @@ void cache_flush(void)
 {
   if (!g_disk_ok)
     return;
-  lk_lock();
+  mutex_lock(&g_lock);
   for (struct cache_entry *e = g_head; e; e = e->next)
     if (e->dirty && e->disk[0]) {
       if (write_entry(e) == 0)
@@ -542,7 +526,7 @@ void cache_flush(void)
     unlink(path);
   }
   g_nunlink = 0;
-  lk_unlock();
+  mutex_unlock(&g_lock);
 }
 
 /* Locate the four front-matter lines in `fm` (read from the file head) and

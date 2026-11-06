@@ -5,11 +5,11 @@ static void sibling_meta(const struct dom_node *node)
   if (!node || !node->parent || node->sibling_meta_seq == dom_mutation_seq)
     return;
 
-  struct {
+  struct type_count {
     char tag[16];
     int count;
-  } types[64];
-  int ntypes = 0, elements = 0;
+  } *types = 0;
+  int ntypes = 0, types_cap = 0, elements = 0;
   for (struct dom_node *c = node->parent->first_child; c; c = c->next) {
     c->sibling_meta_seq = dom_mutation_seq;
     c->elem_index = c->elem_count = c->type_index = c->type_count = 0;
@@ -22,7 +22,15 @@ static void sibling_meta(const struct dom_node *node)
         ti = i;
         break;
       }
-    if (ti < 0 && ntypes < (int)(sizeof types / sizeof types[0])) {
+    if (ti < 0 && ntypes == types_cap) {
+      int nc = types_cap ? types_cap * 2 : 16;
+      struct type_count *nt = realloc(types, (unsigned)nc * sizeof *nt);
+      if (nt) {
+        types = nt;
+        types_cap = nc;
+      }
+    }
+    if (ti < 0 && ntypes < types_cap) {
       ti = ntypes++;
       int i = 0;
       while (c->tag[i] && i < (int)sizeof types[ti].tag - 1) {
@@ -45,6 +53,7 @@ static void sibling_meta(const struct dom_node *node)
         break;
       }
   }
+  free(types);
 }
 
 int css_elem_index(const struct dom_node *node)

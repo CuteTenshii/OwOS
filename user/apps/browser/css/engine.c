@@ -16,19 +16,14 @@
 #include "sibling.h"
 #include <stdbool.h>
 
-#define MAX_CLS 6
-#define MAX_STEPS 6
-#define MAX_PC 3     /* pseudo-classes per compound (input:checked:focus) */
-#define MAX_NOTCLS 3 /* classes inside a :not() simple selector            */
-
 /* The argument of :not() — a single simple selector (tag / #id / .class, no
  * combinators or nested pseudos): enough for :not(.x), :not(div), :not(div.x).
  */
 struct simple_sel {
   char tag[16];
-  char cls[MAX_NOTCLS][24];
+  char **cls; /* heap class names */
   int ncls;
-  char id[24];
+  char *id; /* heap, NULL = none */
 };
 
 /* Pseudo-classes we model. The structural/state ones are matched against the
@@ -75,10 +70,10 @@ struct pseudo {
 
 struct sel_step {
   char tag[16];
-  char cls[MAX_CLS][24];
+  char **cls; /* heap class names */
   int ncls;
-  char id[24];
-  struct pseudo pc[MAX_PC];
+  char *id; /* heap, NULL = none */
+  struct pseudo *pc;
   int npc;
   int pseudo_el; /* PE_* — a ::pseudo-element; never matches a normal box */
   bool child;    /* combinator to the step on the right is '>' */
@@ -86,8 +81,10 @@ struct sel_step {
 enum { PE_NONE = 0, PE_BEFORE = CSS_PSEUDO_BEFORE, PE_AFTER = CSS_PSEUDO_AFTER, PE_OTHER = 3 };
 
 struct selector {
-  struct sel_step step[MAX_STEPS];
+  struct sel_step *step;
   int n;
+  unsigned anc_req[4]; /* ancestor-bloom bits the steps left of the subject need */
+  bool anc_never;      /* an ancestor step can never match (pseudo-element) */
 };
 
 /* The concrete :is()/:where() argument list (forward-declared above). */
@@ -100,8 +97,6 @@ struct sel_list {
  * applies). A query is an OR of comma-separated conditions; each condition is a
  * media type plus ANDed features, optionally `not`-negated. See
  * media_matches(). */
-#define MAX_FEAT 4
-#define MAX_COND 4
 enum { MT_ALL, MT_SCREEN, MT_PRINT, MT_OTHER };
 enum {
   MF_UNKNOWN,
@@ -124,15 +119,15 @@ struct media_feature {
 struct media_cond {
   bool negate; /* a leading `not` */
   int mtype;
-  struct media_feature feat[MAX_FEAT];
+  struct media_feature *feat;
   int nfeat;
 };
 struct media_query {
-  struct media_cond cond[MAX_COND];
+  struct media_cond *cond;
   int n;
+  struct media_query *next; /* the owning sheet's list */
 };
 
-#define CSS_RAW_MAX 256
 /* Rule index key: a rule is bucketed by its rightmost compound's most specific
  * simple selector (id, else a class, else tag, else universal), so an element
  * only ever tests rules that can match it — without this, Tailwind's thousands
@@ -147,11 +142,13 @@ enum { KK_UNIV = 0, KK_ID, KK_CLS, KK_TAG };
 struct css_rule {
   struct selector sel;
   struct css_style decl;
-  struct media_query media;
+  const struct media_query *media; /* NULL = unconditional; owned by the sheet */
   int spec, order;
   bool important;
   unsigned char has_var; /* a declaration uses var() -> resolve at fold */
-  char raw[CSS_RAW_MAX]; /* authored declaration text (for devtools) */
+  char *raw;             /* authored declaration text, whitespace-collapsed */
+  struct css_style *vc;  /* decl with var() resolved, valid while vc_serial == g_vars_serial */
+  unsigned vc_serial;
   unsigned visit;        /* collect_candidates de-dup stamp (multi-key) */
   struct css_rule *next; /* document order (build + fallback iteration)  */
 };
@@ -179,12 +176,11 @@ struct css_face {
  * (permille, 0..1000) and the declaration delta that applies at it, kept sorted
  * by offset. The animation engine (anim.c) finds the two stops bracketing a
  * progress and interpolates their animatable properties. */
-#define CSS_KF_STOPS 16
 struct css_keyframes {
   char name[CSS_ANIM_NAME];
-  int nstops;
-  short off[CSS_KF_STOPS]; /* permille 0..1000, ascending */
-  struct css_style stop[CSS_KF_STOPS];
+  int nstops, cap;
+  short *off; /* permille 0..1000, ascending */
+  struct css_style *stop;
   struct css_keyframes *next;
 };
 
@@ -195,6 +191,7 @@ struct css_sheet {
   int gen;
   struct css_face *faces;
   struct css_keyframes *keyframes; /* @keyframes blocks (name -> stops) */
+  struct media_query *medias;      /* every @media query parsed for this sheet */
   bool has_pseudo_el;              /* set once any ::before/::after rule is pushed */
   const char *cur_base;            /* base URL for faces added by the in-progress css_add */
   /* Rule index (rebuilt lazily when `gen` changes; see ensure_index). Buckets
@@ -211,17 +208,17 @@ struct css_sheet {
 
 /* CSS custom-property table (built per active sheet; see "custom properties").
  */
-#define CSS_VARS_MAX 256
-#define CSS_VARNAME 64
-#define CSS_VARVAL 220
-static struct {
-  char name[CSS_VARNAME], val[CSS_VARVAL];
-} g_vars[CSS_VARS_MAX];
-static int g_nvars;
+static struct css_var {
+  char *name, *val;
+} *g_vars;
+static int g_nvars, g_vars_cap;
 static css_sheet *g_vars_sheet;
 static int g_vars_gen = -1;
+static unsigned g_vars_serial; /* bumped whenever the table is rebuilt or dropped */
 static bool str_uses_var(const char *s);
 static void resolve_vars(const char *in, int inlen, char *out, int *on, int cap, int depth);
+static char *resolve_vars_dup(const char *in, int inlen);
+static void vars_clear(void);
 
 /* Viewport the @media features test against; the browser refreshes it per
  * cascade. */
@@ -2950,10 +2947,11 @@ void css_apply_inline(const char *decls, struct css_style *out)
 {
   bool imp = false;
   if (str_uses_var(decls)) { /* resolve var() against the sheet table */
-    char buf[512];
-    int bn = 0;
-    resolve_vars(decls, (int)strlen(decls), buf, &bn, (int)sizeof buf, 0);
-    parse_decls(buf, buf + bn, out, &imp);
+    char *buf = resolve_vars_dup(decls, (int)strlen(decls));
+    if (buf) {
+      parse_decls(buf, buf + strlen(buf), out, &imp);
+      free(buf);
+    }
     return;
   }
   parse_decls(decls, decls + strlen(decls), out, &imp);
@@ -2964,7 +2962,9 @@ void css_apply_inline(const char *decls, struct css_style *out)
 static bool parse_selector(const char *s, const char *e, struct selector *sel);
 static struct sel_list *parse_sel_list(const char *s, const char *e);
 static bool selector_match(const struct selector *sel, const struct dom_node *el);
-static void free_selector_lists(struct selector *sel);
+static void selector_free(struct selector *sel);
+static void pseudo_free(struct pseudo *pc);
+static void selector_finish(struct selector *sel);
 
 /* True if byte c is in the NUL-terminated set. */
 static bool chr_in(const char *set, char c)
@@ -3066,45 +3066,73 @@ static void parse_anb(const char *s, const char *e, int *a, int *b)
 
 /* Parse a single simple selector (tag / #id / .class…, no combinators) for
  * :not(). */
+static char *span_dup(const char *s, const char *e)
+{
+  char *d = malloc((unsigned)(e - s) + 1);
+  if (!d)
+    return 0;
+  memcpy(d, s, (unsigned)(e - s));
+  d[e - s] = '\0';
+  return d;
+}
+static void cls_push(char ***v, int *n, const char *s, const char *e)
+{
+  if (e <= s)
+    return;
+  char *d = span_dup(s, e);
+  if (!d)
+    return;
+  char **nv = realloc(*v, (unsigned)(*n + 1) * sizeof *nv);
+  if (!nv) {
+    free(d);
+    return;
+  }
+  nv[(*n)++] = d;
+  *v = nv;
+}
+static void cls_free(char **v, int n)
+{
+  for (int i = 0; i < n; i++)
+    free(v[i]);
+  free(v);
+}
+/* Copy a tag name span, lowercased and cut to the DOM's tag width. */
+static void tag_copy(char tag[16], const char *s, const char *e)
+{
+  int k = 0;
+  for (; s + k < e && k < 15; k++)
+    tag[k] = lower(s[k]);
+  tag[k] = '\0';
+}
+static const char *name_end(const char *s, const char *e)
+{
+  while (s < e && is_sel_name(*s))
+    s++;
+  return s;
+}
+
 static void parse_simple_sel(const char *s, const char *e, struct simple_sel *ss)
 {
   ss->tag[0] = '\0';
-  ss->id[0] = '\0';
+  ss->id = 0;
+  ss->cls = 0;
   ss->ncls = 0;
   while (s < e) {
     if (*s == '.') {
-      s++;
-      char *d = ss->ncls < MAX_NOTCLS ? ss->cls[ss->ncls] : 0;
-      int k = 0;
-      while (s < e && is_sel_name(*s)) {
-        if (d && k < 23)
-          d[k++] = *s;
-        s++;
-      }
-      if (d) {
-        d[k] = '\0';
-        if (k)
-          ss->ncls++;
-      }
+      const char *ne = name_end(++s, e);
+      cls_push(&ss->cls, &ss->ncls, s, ne);
+      s = ne;
     } else if (*s == '#') {
-      s++;
-      int k = 0;
-      while (s < e && is_sel_name(*s)) {
-        if (k < 23)
-          ss->id[k++] = *s;
-        s++;
-      }
-      ss->id[k] = '\0';
+      const char *ne = name_end(++s, e);
+      free(ss->id);
+      ss->id = span_dup(s, ne);
+      s = ne;
     } else if (*s == '*') {
       s++;
     } else if (is_sel_name(*s)) {
-      int k = 0;
-      while (s < e && is_sel_name(*s)) {
-        if (k < 15)
-          ss->tag[k++] = lower(*s);
-        s++;
-      }
-      ss->tag[k] = '\0';
+      const char *ne = name_end(s, e);
+      tag_copy(ss->tag, s, ne);
+      s = ne;
     } else
       s++;
   }
@@ -3118,7 +3146,9 @@ static bool classify_pseudo(const char *ns, const char *ne, const char *as, cons
   pc->a = 0;
   pc->b = 0;
   pc->list = 0;
-  pc->arg.tag[0] = pc->arg.id[0] = '\0';
+  pc->arg.tag[0] = '\0';
+  pc->arg.id = 0;
+  pc->arg.cls = 0;
   pc->arg.ncls = 0;
 
   if (span_is(ns, ne, "not")) {
@@ -3225,45 +3255,40 @@ static bool classify_pseudo(const char *ns, const char *ne, const char *as, cons
 
 static void add_pseudo_class(struct sel_step *st, const char *ns, const char *ne, const char *as, const char *ae)
 {
-  if (st->npc >= MAX_PC)
-    return;
   struct pseudo pc;
-  if (classify_pseudo(ns, ne, as, ae, &pc))
-    st->pc[st->npc++] = pc;
+  if (!classify_pseudo(ns, ne, as, ae, &pc))
+    return;
+  if (pc.kind >= PC_FIRST_CHILD && pc.kind <= PC_EMPTY)
+    dom_structural_styles = true;
+  struct pseudo *np = realloc(st->pc, (unsigned)(st->npc + 1) * sizeof *np);
+  if (!np) {
+    pseudo_free(&pc);
+    return;
+  }
+  st->pc = np;
+  st->pc[st->npc++] = pc;
 }
 
 /* Parse one compound selector token (between combinators) into *st. */
 static void parse_compound(const char *s, const char *e, struct sel_step *st)
 {
   st->tag[0] = '\0';
-  st->id[0] = '\0';
+  st->id = 0;
+  st->cls = 0;
   st->ncls = 0;
+  st->pc = 0;
   st->npc = 0;
   st->pseudo_el = 0;
   while (s < e) {
     if (*s == '.') {
-      s++;
-      char *d = (st->ncls < MAX_CLS) ? st->cls[st->ncls] : 0;
-      int k = 0;
-      while (s < e && is_sel_name(*s)) {
-        if (d && k < 23)
-          d[k++] = *s;
-        s++;
-      }
-      if (d) {
-        d[k] = '\0';
-        if (k)
-          st->ncls++;
-      }
+      const char *ne = name_end(++s, e);
+      cls_push(&st->cls, &st->ncls, s, ne);
+      s = ne;
     } else if (*s == '#') {
-      s++;
-      int k = 0;
-      while (s < e && is_sel_name(*s)) {
-        if (k < 23)
-          st->id[k++] = *s;
-        s++;
-      }
-      st->id[k] = '\0';
+      const char *ne = name_end(++s, e);
+      free(st->id);
+      st->id = span_dup(s, ne);
+      s = ne;
     } else if (*s == ':') {
       s++;
       bool dbl = false;
@@ -3311,13 +3336,9 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
     } else if (*s == '*') {
       s++; /* universal: no constraint */
     } else if (is_sel_name(*s)) {
-      int k = 0;
-      while (s < e && is_sel_name(*s)) {
-        if (k < 15)
-          st->tag[k++] = lower(*s);
-        s++;
-      }
-      st->tag[k] = '\0';
+      const char *ne = name_end(s, e);
+      tag_copy(st->tag, s, ne);
+      s = ne;
     } else {
       s++;
     }
@@ -3329,6 +3350,7 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
 static bool parse_selector(const char *s, const char *e, struct selector *sel)
 {
   sel->n = 0;
+  sel->step = 0;
   bool pending_child = false;
   while (s < e) {
     while (s < e && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r'))
@@ -3345,8 +3367,12 @@ static bool parse_selector(const char *s, const char *e, struct selector *sel)
      * so :is(.a > .b) and [x="a b"] stay a single compound. */
     const char *tok = s;
     s = scan_top(s, e, " \t\n\r>");
-    if (sel->n >= MAX_STEPS)
-      return sel->n > 0; /* cap depth, keep what we have (token dropped, unparsed) */
+    struct sel_step *ns = realloc(sel->step, (unsigned)(sel->n + 1) * sizeof *ns);
+    if (!ns) {
+      selector_free(sel);
+      return false;
+    }
+    sel->step = ns;
     struct sel_step *st = &sel->step[sel->n];
     parse_compound(tok, s, st);
     st->child = false;
@@ -3355,29 +3381,42 @@ static bool parse_selector(const char *s, const char *e, struct selector *sel)
     pending_child = false;
     sel->n++;
   }
+  selector_finish(sel);
   return sel->n > 0;
 }
 
-/* Recursively free the heap :is()/:where() sub-selector lists a selector owns.
- */
+/* Free everything a parsed selector owns. */
 static void free_sel_list(struct sel_list *l);
-static void free_selector_lists(struct selector *sel)
+static void simple_sel_free(struct simple_sel *ss)
+{
+  free(ss->id);
+  cls_free(ss->cls, ss->ncls);
+}
+static void pseudo_free(struct pseudo *pc)
+{
+  free_sel_list(pc->list);
+  simple_sel_free(&pc->arg);
+}
+static void selector_free(struct selector *sel)
 {
   for (int i = 0; i < sel->n; i++) {
     struct sel_step *st = &sel->step[i];
+    free(st->id);
+    cls_free(st->cls, st->ncls);
     for (int j = 0; j < st->npc; j++)
-      if (st->pc[j].kind == PC_MATCHES && st->pc[j].list) {
-        free_sel_list(st->pc[j].list);
-        st->pc[j].list = 0;
-      }
+      pseudo_free(&st->pc[j]);
+    free(st->pc);
   }
+  free(sel->step);
+  sel->step = 0;
+  sel->n = 0;
 }
 static void free_sel_list(struct sel_list *l)
 {
   if (!l)
     return;
   for (int i = 0; i < l->n; i++)
-    free_selector_lists(&l->sels[i]);
+    selector_free(&l->sels[i]);
   free(l->sels);
   free(l);
 }
@@ -3408,6 +3447,8 @@ static struct sel_list *parse_sel_list(const char *s, const char *e)
     const char *comma = scan_top(q, e, ",");
     if (parse_selector(q, comma, &sels[n]))
       n++;
+    else
+      selector_free(&sels[n]);
     q = (comma < e) ? comma + 1 : e;
   }
   g_is_depth--;
@@ -3418,7 +3459,7 @@ static struct sel_list *parse_sel_list(const char *s, const char *e)
   struct sel_list *l = malloc(sizeof *l);
   if (!l) {
     for (int i = 0; i < n; i++)
-      free_selector_lists(&sels[i]);
+      selector_free(&sels[i]);
     free(sels);
     return 0;
   }
@@ -3432,7 +3473,7 @@ static int selector_spec(const struct selector *sel)
   int a = 0, b = 0, c = 0;
   for (int i = 0; i < sel->n; i++) {
     const struct sel_step *st = &sel->step[i];
-    if (st->id[0])
+    if (st->id)
       a++;
     b += st->ncls;
     if (st->tag[0])
@@ -3440,7 +3481,7 @@ static int selector_spec(const struct selector *sel)
     for (int j = 0; j < st->npc; j++) { /* pseudo-classes add specificity */
       const struct pseudo *pc = &st->pc[j];
       if (pc->kind == PC_NOT) { /* :not() contributes its argument's */
-        if (pc->arg.id[0])
+        if (pc->arg.id)
           a++;
         b += pc->arg.ncls;
         if (pc->arg.tag[0])
@@ -3516,7 +3557,7 @@ static bool simple_match(const struct simple_sel *ss, const struct dom_node *n)
     return false;
   if (ss->tag[0] && !streq(ss->tag, n->tag))
     return false;
-  if (ss->id[0]) {
+  if (ss->id) {
     const char *id = dom_get_attr(n, "id");
     if (!id || !streq_ci(id, ss->id))
       return false;
@@ -3595,7 +3636,7 @@ static bool step_box_match(const struct sel_step *st, const struct dom_node *n)
     return false;
   if (st->tag[0] && !streq(st->tag, n->tag))
     return false;
-  if (st->id[0]) {
+  if (st->id) {
     const char *id = dom_get_attr(n, "id");
     if (!id || !streq_ci(id, st->id))
       return false;
@@ -3614,6 +3655,93 @@ static bool step_match(const struct sel_step *st, const struct dom_node *n)
   if (st->pseudo_el)
     return false; /* ::before/::selection/… don't style a box */
   return step_box_match(st, n);
+}
+
+/* ---- ancestor bloom: per-element 128-bit filter of ancestor tag/id/classes ---- */
+enum { BK_TAG = 1, BK_ID, BK_CLS };
+static unsigned bloom_hash(unsigned kind, const char *s, int n, bool fold)
+{
+  unsigned h = (2166136261u ^ kind) * 16777619u;
+  for (int i = 0; i < n; i++) {
+    h ^= (unsigned char)(fold ? lower(s[i]) : s[i]);
+    h *= 16777619u;
+  }
+  return h ^ (h >> 15);
+}
+static void bloom_set(unsigned b[4], unsigned h)
+{
+  unsigned x = h & 127, y = (h >> 7) & 127;
+  b[x >> 5] |= 1u << (x & 31);
+  b[y >> 5] |= 1u << (y & 31);
+}
+static void bloom_add_node(unsigned b[4], const struct dom_node *n)
+{
+  bloom_set(b, bloom_hash(BK_TAG, n->tag, (int)strlen(n->tag), false));
+  const char *id = dom_get_attr(n, "id");
+  if (id && id[0])
+    bloom_set(b, bloom_hash(BK_ID, id, (int)strlen(id), true));
+  const char *cl = dom_get_attr(n, "class");
+  for (const char *p = cl ? cl : ""; *p;) {
+    while (*p == ' ' || *p == '\t')
+      p++;
+    const char *q = p;
+    while (*q && *q != ' ' && *q != '\t')
+      q++;
+    if (q > p)
+      bloom_set(b, bloom_hash(BK_CLS, p, (int)(q - p), false));
+    p = q;
+  }
+}
+static void selector_finish(struct selector *sel)
+{
+  memset(sel->anc_req, 0, sizeof sel->anc_req);
+  sel->anc_never = false;
+  for (int i = 0; i < sel->n - 1; i++) {
+    const struct sel_step *st = &sel->step[i];
+    if (st->pseudo_el)
+      sel->anc_never = true;
+    if (st->tag[0])
+      bloom_set(sel->anc_req, bloom_hash(BK_TAG, st->tag, (int)strlen(st->tag), false));
+    if (st->id)
+      bloom_set(sel->anc_req, bloom_hash(BK_ID, st->id, (int)strlen(st->id), true));
+    for (int c = 0; c < st->ncls; c++)
+      bloom_set(sel->anc_req, bloom_hash(BK_CLS, st->cls[c], (int)strlen(st->cls[c]), false));
+  }
+}
+
+#define BLOOM_MAX_DEPTH 100
+static const unsigned *ancestor_bloom(const struct dom_node *n, int depth)
+{
+  static const unsigned all[4] = {~0u, ~0u, ~0u, ~0u};
+  struct dom_node *m = (struct dom_node *)n;
+  unsigned stamp = dom_mutation_seq + 1; /* 0 = never computed */
+  if (m->anc_bloom_seq == stamp)
+    return m->anc_bloom;
+  if (depth > BLOOM_MAX_DEPTH)
+    return all;
+  const struct dom_node *p = n->parent;
+  if (!p) {
+    memset(m->anc_bloom, 0, sizeof m->anc_bloom);
+  } else {
+    memcpy(m->anc_bloom, ancestor_bloom(p, depth + 1), sizeof m->anc_bloom);
+    if (p->type == DOM_ELEMENT)
+      bloom_add_node(m->anc_bloom, p);
+  }
+  m->anc_bloom_seq = stamp;
+  return m->anc_bloom;
+}
+
+static bool ancestors_possible(const struct selector *sel, const struct dom_node *subject)
+{
+  if (sel->n < 2)
+    return true;
+  if (sel->anc_never)
+    return false;
+  const unsigned *b = ancestor_bloom(subject, 0);
+  for (int w = 0; w < 4; w++)
+    if (sel->anc_req[w] & ~b[w])
+      return false;
+  return true;
 }
 
 /* Match steps [0, top] of `sel` against the ancestors of `subject` (right to
@@ -3643,7 +3771,7 @@ static bool selector_match(const struct selector *sel, const struct dom_node *el
   int i = sel->n - 1;
   if (!step_match(&sel->step[i], el))
     return false;
-  return match_ancestors(sel, i - 1, el);
+  return ancestors_possible(sel, el) && match_ancestors(sel, i - 1, el);
 }
 
 /* Match a ::before / ::after rule against its originating element `el`: the
@@ -3656,7 +3784,7 @@ static bool selector_match_pseudo(const struct selector *sel, const struct dom_n
     return false;
   if (!step_box_match(&sel->step[i], el))
     return false;
-  return match_ancestors(sel, i - 1, el);
+  return ancestors_possible(sel, el) && match_ancestors(sel, i - 1, el);
 }
 
 /* ------------------------------------------------ @media -------------------
@@ -3817,9 +3945,19 @@ static int read_op(const char **pp, const char *e)
 /* Add one bound `<feature> op <len>` (op as written with the feature on the
  * LEFT) to *c as a min/max/exact feature. Strict </> nudge the integer px
  * boundary by 1 so a viewport exactly on the edge compares correctly. */
+static bool cond_add_feat(struct media_cond *c, struct media_feature f)
+{
+  struct media_feature *nf = realloc(c->feat, (unsigned)(c->nfeat + 1) * sizeof *nf);
+  if (!nf)
+    return false;
+  c->feat = nf;
+  c->feat[c->nfeat++] = f;
+  return true;
+}
+
 static void range_bound(struct media_cond *c, int dim, int op, int len)
 {
-  if (len < 0 || c->nfeat >= MAX_FEAT)
+  if (len < 0)
     return;
   struct media_feature f = {MF_UNKNOWN, len};
   switch (op) {
@@ -3842,7 +3980,7 @@ static void range_bound(struct media_cond *c, int dim, int op, int len)
     break;
   }
   if (f.kind != MF_UNKNOWN)
-    c->feat[c->nfeat++] = f;
+    cond_add_feat(c, f);
 }
 
 /* Parse range syntax inside the parens [s,e): one comparison (feature on either
@@ -3922,8 +4060,6 @@ static void parse_feature(const char **pp, const char *e, struct media_cond *c)
     return;
   }
 
-  if (c->nfeat >= MAX_FEAT)
-    return;
   const char *ns = skip_sp(is, ie), *ne = (q < ie) ? q : ie;
   const char *nend = ne;
   while (nend > ns && (nend[-1] == ' ' || nend[-1] == '\t'))
@@ -3964,7 +4100,7 @@ static void parse_feature(const char **pp, const char *e, struct media_cond *c)
        f.kind == MF_H) &&
       f.val < 0)
     f.kind = MF_UNKNOWN; /* width/height feature with no usable number */
-  c->feat[c->nfeat++] = f;
+  cond_add_feat(c, f);
 }
 
 /* Parse one comma-free media query (`[not|only] type? (and feature)*`) into *c.
@@ -3973,6 +4109,7 @@ static void parse_cond(const char *s, const char *e, struct media_cond *c)
 {
   c->negate = false;
   c->mtype = MT_ALL;
+  c->feat = 0;
   c->nfeat = 0;
   const char *p = skip_sp(s, e);
   if (kw(&p, e, "not"))
@@ -4011,14 +4148,27 @@ static void parse_cond(const char *s, const char *e, struct media_cond *c)
 static void parse_media_query(const char *s, const char *e, struct media_query *mq)
 {
   mq->n = 0;
+  mq->cond = 0;
   const char *p = s;
-  while (p < e && mq->n < MAX_COND) {
+  while (p < e) {
     const char *comma = p;
     while (comma < e && *comma != ',')
       comma++;
+    struct media_cond *nc = realloc(mq->cond, (unsigned)(mq->n + 1) * sizeof *nc);
+    if (!nc)
+      break;
+    mq->cond = nc;
     parse_cond(p, comma, &mq->cond[mq->n++]);
     p = (comma < e) ? comma + 1 : e;
   }
+}
+
+static void media_free(struct media_query *mq)
+{
+  for (int i = 0; i < mq->n; i++)
+    free(mq->cond[i].feat);
+  free(mq->cond);
+  free(mq);
 }
 
 static bool feature_matches(const struct media_feature *f)
@@ -4060,7 +4210,7 @@ static bool cond_matches(const struct media_cond *c)
 
 static bool media_matches(const struct media_query *mq)
 {
-  if (mq->n == 0)
+  if (!mq || mq->n == 0)
     return true;
   for (int i = 0; i < mq->n; i++)
     if (cond_matches(&mq->cond[i]))
@@ -4080,6 +4230,7 @@ css_sheet *css_new(void)
   s->gen = 0;
   s->faces = 0;
   s->keyframes = 0;
+  s->medias = 0;
   s->has_pseudo_el = false;
   s->cur_base = 0;
   for (int i = 0; i < CSS_NBUCK; i++) {
@@ -4251,8 +4402,18 @@ static void keyframes_add_stop(struct css_keyframes *kf, int pm, const struct cs
       return;
     }
   }
-  if (kf->nstops >= CSS_KF_STOPS)
-    return;
+  if (kf->nstops >= kf->cap) {
+    int nc = kf->cap ? kf->cap * 2 : 4;
+    short *no = realloc(kf->off, (unsigned)nc * sizeof *no);
+    if (no)
+      kf->off = no;
+    struct css_style *ns = realloc(kf->stop, (unsigned)nc * sizeof *ns);
+    if (ns)
+      kf->stop = ns;
+    if (!no || !ns)
+      return;
+    kf->cap = nc;
+  }
   int i = kf->nstops;
   while (i > 0 && kf->off[i - 1] > pm) {
     kf->off[i] = kf->off[i - 1];
@@ -4289,7 +4450,9 @@ static void parse_keyframes(css_sheet *sh, const char *ns, const char *ne, const
   for (; ns + ni < ne; ni++)
     kf->name[ni] = ns[ni];
   kf->name[ni] = '\0';
-  kf->nstops = 0;
+  kf->nstops = kf->cap = 0;
+  kf->off = 0;
+  kf->stop = 0;
   kf->next = 0;
 
   const char *p = bs;
@@ -4335,6 +4498,8 @@ static void parse_keyframes(css_sheet *sh, const char *ns, const char *ne, const
   }
 
   if (kf->nstops == 0) {
+    free(kf->off);
+    free(kf->stop);
     free(kf);
     return;
   }
@@ -4364,47 +4529,53 @@ int css_keyframes_stop(const struct css_keyframes *kf, int i, int *permille, con
   return 1;
 }
 
-static void sheet_push(css_sheet *sh, const struct selector *sel, const struct css_style *decl, bool important,
+static char no_raw[1];
+
+/* Copy [s,e) with whitespace runs collapsed; a shared empty string on OOM. */
+static char *copy_collapsed(const char *s, const char *e)
+{
+  char *out = malloc((unsigned)(e - s) + 1);
+  if (!out)
+    return no_raw;
+  int k = 0;
+  bool sp = false;
+  for (; s < e; s++) {
+    char c = *s;
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+      sp = true;
+      continue;
+    }
+    if (sp && k > 0)
+      out[k++] = ' ';
+    sp = false;
+    out[k++] = c;
+  }
+  out[k] = '\0';
+  return out;
+}
+
+/* Takes ownership of *sel (freed here when the rule can't be stored). */
+static void sheet_push(css_sheet *sh, struct selector *sel, const struct css_style *decl, bool important,
                        const struct media_query *media, const char *dec_s, const char *dec_e)
 {
   struct css_rule *r = malloc(sizeof *r);
-  if (!r)
+  if (!r) {
+    selector_free(sel);
     return;
+  }
   r->sel = *sel;
   r->decl = *decl;
-  r->media = *media;
+  r->media = media;
   r->spec = selector_spec(sel);
   r->order = sh->order++;
   r->important = important;
   if (sel->step[sel->n - 1].pseudo_el == PE_BEFORE || sel->step[sel->n - 1].pseudo_el == PE_AFTER)
     sh->has_pseudo_el = true; /* a ::before/::after rule exists in this sheet */
   r->visit = 0;               /* the index (ensure_index) files it by key */
-  {                           /* copy the authored declarations, collapsing runs of whitespace */
-    int k = 0, sp = 0;
-    const char *q = dec_s;
-    while (q < dec_e && k < CSS_RAW_MAX - 1) {
-      char c = *q++;
-      if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
-        sp = 1;
-        continue;
-      }
-      if (sp && k > 0)
-        r->raw[k++] = ' ';
-      sp = 0;
-      if (k < CSS_RAW_MAX - 1)
-        r->raw[k++] = c;
-    }
-    r->raw[k] = '\0';
-    {
-      const char *q = r->raw;
-      r->has_var = 0;
-      for (; *q; q++)
-        if ((*q == 'v' || *q == 'V') && starts_ci(q, "var(")) {
-          r->has_var = 1;
-          break;
-        }
-    }
-  }
+  r->vc = 0;
+  r->vc_serial = 0;
+  r->raw = copy_collapsed(dec_s, dec_e);
+  r->has_var = r->raw[0] && str_uses_var(r->raw);
   r->next = 0;
   if (sh->tail)
     sh->tail->next = r;
@@ -4511,8 +4682,12 @@ static void add_rules(css_sheet *sh, const char *p, const char *end, const struc
         while (b < end && *b != '{' && *b != '}' && *b != ';')
           b++;
         if (b < end && *b == '{') {
-          struct media_query nested;
-          parse_media_query(hdr, b, &nested);
+          struct media_query *nested = calloc(1, sizeof *nested);
+          if (nested) {
+            parse_media_query(hdr, b, nested);
+            nested->next = sh->medias;
+            sh->medias = nested;
+          }
           const char *db = b + 1, *de = db;
           int depth = 1;
           while (de < end && depth) {
@@ -4523,7 +4698,7 @@ static void add_rules(css_sheet *sh, const char *p, const char *end, const struc
             if (depth)
               de++;
           }
-          add_rules(sh, db, de, mq->n ? mq : &nested);
+          add_rules(sh, db, de, (mq && mq->n) || !nested ? mq : nested);
           p = (de < end) ? de + 1 : end;
           continue;
         }
@@ -4590,7 +4765,7 @@ static void add_rules(css_sheet *sh, const char *p, const char *end, const struc
       if (parse_selector(q, comma, &sel))
         sheet_push(sh, &sel, &decl, important, mq, dec_s, dec_e);
       else
-        free_selector_lists(&sel); /* discard: reclaim any parsed :is() lists */
+        selector_free(&sel); /* discard: reclaim any parsed :is() lists */
       q = (comma < sel_e) ? comma + 1 : sel_e;
     }
   }
@@ -4601,8 +4776,7 @@ void css_add(css_sheet *sh, const char *src, int len, const char *base)
   if (!sh)
     return;
   sh->cur_base = base; /* @font-face src resolves against this */
-  struct media_query none = {.n = 0};
-  add_rules(sh, src, src + len, &none);
+  add_rules(sh, src, src + len, 0);
   sh->cur_base = 0;
   sh->gen++; /* custom-property table is now stale */
 }
@@ -4616,15 +4790,23 @@ void css_free(css_sheet *sh)
   if (sh == g_vars_sheet) {
     g_vars_sheet = 0;
     g_vars_gen = -1;
-    g_nvars = 0;
+    vars_clear();
   } /* drop stale var cache */
   free(sh->cand);
   free(sh->match);
+  while (sh->medias) {
+    struct media_query *n = sh->medias->next;
+    media_free(sh->medias);
+    sh->medias = n;
+  }
   index_clear(sh); /* free the css_idx entries before their rules */
   struct css_rule *r = sh->head;
   while (r) {
     struct css_rule *n = r->next;
-    free_selector_lists(&r->sel);
+    selector_free(&r->sel);
+    if (r->raw != no_raw)
+      free(r->raw);
+    free(r->vc);
     free(r);
     r = n;
   }
@@ -4639,6 +4821,8 @@ void css_free(css_sheet *sh)
   struct css_keyframes *kf = sh->keyframes;
   while (kf) {
     struct css_keyframes *n = kf->next;
+    free(kf->off);
+    free(kf->stop);
     free(kf);
     kf = n;
   }
@@ -4922,52 +5106,66 @@ static void fold(struct css_style *out, const struct css_style *d)
  * :root, and we treat them as global, last-declaration-wins, honouring @media).
  * At fold time, a declaration that uses var(--name, fallback) is resolved
  * against this table (recursively) before it's interpreted. */
+static bool var_name_is(const struct css_var *v, const char *name, int len)
+{
+  return (int)strlen(v->name) == len && memcmp(v->name, name, (unsigned)len) == 0;
+}
 static const char *var_lookup(const char *name, int len)
 {
-  for (int i = 0; i < g_nvars; i++) {
-    int k = 0;
-    const char *nm = g_vars[i].name;
-    while (k < len && nm[k] && nm[k] == name[k])
-      k++;
-    if (k == len && !nm[k])
+  for (int i = 0; i < g_nvars; i++)
+    if (var_name_is(&g_vars[i], name, len))
       return g_vars[i].val;
-  }
   return 0;
+}
+static char *dup_span(const char *s, int n)
+{
+  char *d = malloc((unsigned)n + 1);
+  if (!d)
+    return 0;
+  memcpy(d, s, (unsigned)n);
+  d[n] = '\0';
+  return d;
+}
+static void vars_clear(void)
+{
+  for (int i = 0; i < g_nvars; i++) {
+    free(g_vars[i].name);
+    free(g_vars[i].val);
+  }
+  g_nvars = 0;
+  g_vars_serial++;
 }
 static void var_store(const char *name, int nlen, const char *val, int vlen)
 {
-  int slot = -1;
-  if (nlen <= 0 || nlen >= CSS_VARNAME)
+  if (nlen <= 0)
     return;
-  for (int i = 0; i < g_nvars; i++) { /* later wins: overwrite */
-    int k = 0;
-    const char *nm = g_vars[i].name;
-    while (k < nlen && nm[k] == name[k])
-      k++;
-    if (k == nlen && !nm[k]) {
-      slot = i;
-      break;
-    }
-  }
-  if (slot < 0) {
-    if (g_nvars >= CSS_VARS_MAX)
+  char *nv = dup_span(val, vlen);
+  if (!nv)
+    return;
+  for (int i = 0; i < g_nvars; i++) /* later wins: overwrite */
+    if (var_name_is(&g_vars[i], name, nlen)) {
+      free(g_vars[i].val);
+      g_vars[i].val = nv;
       return;
-    slot = g_nvars++;
+    }
+  if (g_nvars >= g_vars_cap) {
+    int nc = g_vars_cap ? g_vars_cap * 2 : 64;
+    struct css_var *nvs = realloc(g_vars, (unsigned)nc * sizeof *nvs);
+    if (!nvs) {
+      free(nv);
+      return;
+    }
+    g_vars = nvs;
+    g_vars_cap = nc;
   }
-  {
-    int i = 0;
-    for (; i < nlen; i++)
-      g_vars[slot].name[i] = name[i];
-    g_vars[slot].name[i] = '\0';
+  char *nn = dup_span(name, nlen);
+  if (!nn) {
+    free(nv);
+    return;
   }
-  if (vlen >= CSS_VARVAL)
-    vlen = CSS_VARVAL - 1;
-  {
-    int i = 0;
-    for (; i < vlen; i++)
-      g_vars[slot].val[i] = val[i];
-    g_vars[slot].val[i] = '\0';
-  }
+  g_vars[g_nvars].name = nn;
+  g_vars[g_nvars].val = nv;
+  g_nvars++;
 }
 
 /* Pull every `--name: value` declaration out of `raw` into the table. */
@@ -5000,9 +5198,9 @@ static void ensure_vars(css_sheet *sh)
 {
   if (sh == g_vars_sheet && sh->gen == g_vars_gen)
     return;
-  g_nvars = 0;
+  vars_clear();
   for (struct css_rule *r = sh->head; r; r = r->next)
-    if (media_matches(&r->media))
+    if (media_matches(r->media))
       vars_from_raw(r->raw); /* active rules only */
   g_vars_sheet = sh;
   g_vars_gen = sh->gen;
@@ -5072,18 +5270,61 @@ static void resolve_vars(const char *in, int inlen, char *out, int *on, int cap,
   out[*on] = '\0';
 }
 
+/* resolve_vars into a fresh heap string sized to fit (NULL on OOM). */
+static char *resolve_vars_dup(const char *in, int inlen)
+{
+  int cap = inlen * 2 + 64;
+  for (;;) {
+    char *out = malloc((unsigned)cap);
+    if (!out)
+      return 0;
+    int on = 0;
+    resolve_vars(in, inlen, out, &on, cap, 0);
+    if (on < cap - 1)
+      return out;
+    free(out);
+    cap *= 2;
+  }
+}
+
+/* Declarations with var() resolved, memoised until the variable table is rebuilt. */
+static const struct css_style *rule_decl(struct css_rule *r)
+{
+  static struct css_style scratch;
+  if (!r->has_var)
+    return &r->decl;
+  if (r->vc && r->vc_serial == g_vars_serial)
+    return r->vc;
+  struct css_style *dst = r->vc ? r->vc : malloc(sizeof *dst);
+  if (!dst)
+    dst = &scratch;
+  css_style_reset(dst);
+  char *buf = resolve_vars_dup(r->raw, (int)strlen(r->raw));
+  if (buf) {
+    bool imp = false;
+    parse_decls(buf, buf + strlen(buf), dst, &imp);
+    free(buf);
+  }
+  if (dst != &scratch) {
+    r->vc = dst;
+    r->vc_serial = g_vars_serial;
+  }
+  return dst;
+}
+
 /* ------------------------------------------------ rule index -------------- *
  * Bucket rules by their rightmost key so an element tests only the rules that
  * can possibly match it (its tag / each class / its id) plus the universal ones
  * — instead of every rule in the sheet. Rebuilt lazily when the sheet changes.
  */
-static unsigned css_hash(const char *s)
+static unsigned css_hash_n(const char *s, int n)
 {
   unsigned h = 5381;
-  for (; *s; s++)
-    h = h * 33u + (unsigned char)*s;
+  for (int i = 0; i < n; i++)
+    h = h * 33u + (unsigned char)s[i];
   return h % CSS_NBUCK;
 }
+static unsigned css_hash(const char *s) { return css_hash_n(s, (int)strlen(s)); }
 /* Append the index key(s) under which the rightmost compound `st` must be
  * filed, each pointing into the selector tree (stable for the rule's life).
  * Returns 1 with
@@ -5097,32 +5338,33 @@ struct idx_key {
   int kind;
   const char *str;
 };
-static int compound_keys(const struct sel_step *st, struct idx_key *out, int max, int *n)
+struct idx_keys {
+  struct idx_key *v;
+  int n, cap;
+};
+static bool idx_keys_push(struct idx_keys *k, int kind, const char *str)
 {
-  if (st->id[0]) {
-    if (*n < max) {
-      out[*n].kind = KK_ID;
-      out[*n].str = st->id;
-      (*n)++;
-    }
-    return 1;
+  if (k->n == k->cap) {
+    int nc = k->cap ? k->cap * 2 : 8;
+    struct idx_key *nv = realloc(k->v, (unsigned)nc * sizeof *nv);
+    if (!nv)
+      return false;
+    k->v = nv;
+    k->cap = nc;
   }
-  if (st->ncls) {
-    if (*n < max) {
-      out[*n].kind = KK_CLS;
-      out[*n].str = st->cls[0];
-      (*n)++;
-    }
-    return 1;
-  }
-  if (st->tag[0]) {
-    if (*n < max) {
-      out[*n].kind = KK_TAG;
-      out[*n].str = st->tag;
-      (*n)++;
-    }
-    return 1;
-  }
+  k->v[k->n].kind = kind;
+  k->v[k->n].str = str;
+  k->n++;
+  return true;
+}
+static int compound_keys(const struct sel_step *st, struct idx_keys *out)
+{
+  if (st->id)
+    return idx_keys_push(out, KK_ID, st->id);
+  if (st->ncls)
+    return idx_keys_push(out, KK_CLS, st->cls[0]);
+  if (st->tag[0])
+    return idx_keys_push(out, KK_TAG, st->tag);
   const struct pseudo *pm = 0;
   for (int i = 0; i < st->npc; i++)
     if (st->pc[i].kind == PC_MATCHES && st->pc[i].list) {
@@ -5133,7 +5375,7 @@ static int compound_keys(const struct sel_step *st, struct idx_key *out, int max
     return 0; /* :hover-only / [attr] / * subject -> universal */
   for (int i = 0; i < pm->list->n; i++) {
     const struct selector *sub = &pm->list->sels[i];
-    if (!compound_keys(&sub->step[sub->n - 1], out, max, n))
+    if (!compound_keys(&sub->step[sub->n - 1], out))
       return 0; /* a branch matches anything */
   }
   return 1;
@@ -5177,19 +5419,19 @@ static void ensure_index(css_sheet *sh)
     return;
   index_clear(sh);
   sh->idx_failed = false;
+  struct idx_keys keys = {0};
   for (struct css_rule *r = sh->head; r; r = r->next) {
-    struct idx_key keys[32];
-    int nk = 0;
-    if (!compound_keys(&r->sel.step[r->sel.n - 1], keys, 32, &nk) || nk == 0) {
+    keys.n = 0;
+    if (!compound_keys(&r->sel.step[r->sel.n - 1], &keys) || keys.n == 0) {
       if (!index_put(&sh->uni, r, 0)) {
         sh->idx_failed = true;
         break;
       }
       continue;
     }
-    for (int i = 0; i < nk; i++) {
-      struct css_idx **tab = keys[i].kind == KK_ID ? sh->id_b : keys[i].kind == KK_CLS ? sh->cls_b : sh->tag_b;
-      if (!index_put(&tab[css_hash(keys[i].str)], r, keys[i].str)) {
+    for (int i = 0; i < keys.n; i++) {
+      struct css_idx **tab = keys.v[i].kind == KK_ID ? sh->id_b : keys.v[i].kind == KK_CLS ? sh->cls_b : sh->tag_b;
+      if (!index_put(&tab[css_hash(keys.v[i].str)], r, keys.v[i].str)) {
         sh->idx_failed = true;
         break;
       }
@@ -5197,20 +5439,10 @@ static void ensure_index(css_sheet *sh)
     if (sh->idx_failed)
       break;
   }
+  free(keys.v);
   if (sh->idx_failed)
     index_clear(sh);
   sh->idx_gen = sh->gen;
-}
-
-/* Copy `s` truncated to 23 chars (the max stored key width) into out[24] so
- * element keys hash to the same bucket as the rule keys, which are capped the
- * same at parse. */
-static void key23(const char *s, char *out)
-{
-  int k = 0;
-  for (; s[k] && k < 23; k++)
-    out[k] = s[k];
-  out[k] = '\0';
 }
 
 static bool rule_ptr_room(struct css_rule ***buf, int *cap, int need)
@@ -5260,30 +5492,24 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el)
       if (streq(e->key, el->tag))
         ADD(e->rule);
   const char *id = dom_get_attr(el, "id");
-  if (id && id[0]) {
-    char b[24];
-    key23(id, b);
-    for (struct css_idx *e = sh->id_b[css_hash(b)]; e; e = e->next)
-      if (streq_ci(e->key, b))
+  if (id && id[0])
+    for (struct css_idx *e = sh->id_b[css_hash(id)]; e; e = e->next)
+      if (streq_ci(e->key, id))
         ADD(e->rule);
-  }
   const char *cl = dom_get_attr(el, "class");
   if (cl)
     for (const char *p = cl; *p;) {
       while (*p == ' ' || *p == '\t')
         p++;
-      char b[24];
-      int k = 0;
-      while (*p && *p != ' ' && *p != '\t') {
-        if (k < 23)
-          b[k++] = *p;
-        p++;
-      }
-      b[k] = '\0';
+      const char *q = p;
+      while (*q && *q != ' ' && *q != '\t')
+        q++;
+      int k = (int)(q - p);
       if (k)
-        for (struct css_idx *e = sh->cls_b[css_hash(b)]; e; e = e->next)
-          if (streq(e->key, b))
+        for (struct css_idx *e = sh->cls_b[css_hash_n(p, k)]; e; e = e->next)
+          if ((int)strlen(e->key) == k && memcmp(e->key, p, (unsigned)k) == 0)
             ADD(e->rule);
+      p = q;
     }
 #undef ADD
   return failed ? -1 : n;
@@ -5298,8 +5524,8 @@ static int collect_matches(css_sheet *sh, const struct dom_node *el, int pseudo)
     return -1;
   for (int i = 0; i < nc; i++) {
     struct css_rule *r = sh->cand[i];
-    int matches = pseudo ? selector_match_pseudo(&r->sel, el, pseudo) : selector_match(&r->sel, el);
-    if (!media_matches(&r->media) || !matches)
+    if (!media_matches(r->media) ||
+        !(pseudo ? selector_match_pseudo(&r->sel, el, pseudo) : selector_match(&r->sel, el)))
       continue;
     if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
       return -1;
@@ -5333,20 +5559,8 @@ void css_apply_sheet(css_sheet *sh, const struct dom_node *el, struct css_style 
   int nm = collect_matches(sh, el, 0);
   if (nm < 0)
     return;
-  for (int i = 0; i < nm; i++) {
-    struct css_rule *r = sh->match[i];
-    if (r->has_var) { /* re-parse with var() substituted */
-      char buf[512];
-      int bn = 0;
-      struct css_style tmp;
-      bool imp = false;
-      resolve_vars(r->raw, (int)strlen(r->raw), buf, &bn, (int)sizeof buf, 0);
-      css_style_reset(&tmp);
-      parse_decls(buf, buf + bn, &tmp, &imp);
-      fold(out, &tmp);
-    } else
-      fold(out, &r->decl);
-  }
+  for (int i = 0; i < nm; i++)
+    fold(out, rule_decl(sh->match[i]));
 }
 
 int css_pseudo_content(css_sheet *sh, const struct dom_node *el, int which, struct css_style *out)
@@ -5358,24 +5572,14 @@ int css_pseudo_content(css_sheet *sh, const struct dom_node *el, int which, stru
   int nm = collect_matches(sh, el, which);
   if (nm < 0)
     return 0;
-  for (int i = 0; i < nm; i++) {
-    struct css_rule *r = sh->match[i];
-    if (r->has_var) {
-      char buf[512];
-      int bn = 0;
-      struct css_style tmp;
-      bool imp = false;
-      resolve_vars(r->raw, (int)strlen(r->raw), buf, &bn, (int)sizeof buf, 0);
-      css_style_reset(&tmp);
-      parse_decls(buf, buf + bn, &tmp, &imp);
-      fold(out, &tmp);
-    } else
-      fold(out, &r->decl);
-  }
+  for (int i = 0; i < nm; i++)
+    fold(out, rule_decl(sh->match[i]));
   return out->content[0] != '\0';
 }
 
 int css_sheet_has_pseudo(const css_sheet *sh) { return sh && sh->has_pseudo_el; }
+
+unsigned css_sheet_generation(const css_sheet *sh) { return sh ? (unsigned)sh->gen : 0; }
 
 void css_apply_attrs(const struct dom_node *el, struct css_style *out)
 {
@@ -5418,7 +5622,7 @@ void css_apply_attrs(const struct dom_node *el, struct css_style *out)
 /* Pull the (last) background[-color] value out of a declaration block,
  * resolving var() against the sheet table, into out[cap]. Returns 1 if one was
  * present. */
-static int extract_bg(const char *decls, char *out, int cap)
+static char *extract_bg(const char *decls)
 {
   const char *bv = 0, *bve = 0, *s = decls;
   while (*s) {
@@ -5447,9 +5651,21 @@ static int extract_bg(const char *decls, char *out, int cap)
     bv++;
   while (bve > bv && (bve[-1] == ' ' || bve[-1] == '\t'))
     bve--;
-  int on = 0;
-  resolve_vars(bv, (int)(bve - bv), out, &on, cap, 0); /* verbatim copy when no var() */
-  return 1;
+  return resolve_vars_dup(bv, (int)(bve - bv)); /* verbatim copy when no var() */
+}
+
+static bool bg_decl_color(const char *decls, unsigned *out)
+{
+  char *val = extract_bg(decls);
+  if (!val)
+    return false;
+  int a;
+  int c = bg_value_color(val, &a);
+  free(val);
+  if (c < 0)
+    return false;
+  *out = ((unsigned)a << 24) | (unsigned)c;
+  return true;
 }
 
 int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
@@ -5457,32 +5673,19 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
   if (!sh || !el || el->type != DOM_ELEMENT)
     return 0;
   ensure_vars(sh);
-  char val[160];
 
   /* highest priority first: inline style="", then sheet rules, then bgcolor=""
    */
   const char *inl = dom_get_attr(el, "style");
-  if (inl && extract_bg(inl, val, sizeof val)) {
-    int a;
-    int c = bg_value_color(val, &a);
-    if (c >= 0) {
-      *out = ((unsigned)a << 24) | (unsigned)c;
-      return 1;
-    }
-  }
+  if (inl && bg_decl_color(inl, out))
+    return 1;
 
   int nm = collect_matches(sh, el, 0);
   if (nm < 0)
     return 0;
   for (int i = nm - 1; i >= 0; i--)
-    if (extract_bg(sh->match[i]->raw, val, sizeof val)) {
-      int a;
-      int c = bg_value_color(val, &a);
-      if (c >= 0) {
-        *out = ((unsigned)a << 24) | (unsigned)c;
-        return 1;
-      }
-    }
+    if (bg_decl_color(sh->match[i]->raw, out))
+      return 1;
 
   const char *bgc = dom_get_attr(el, "bgcolor");
   if (bgc) {
@@ -5538,7 +5741,7 @@ static void sel_text(const struct selector *sel, char *o, int cap)
     int start = k;
     if (st->tag[0])
       cm_ap(o, &k, cap, st->tag);
-    if (st->id[0]) {
+    if (st->id) {
       cm_ap(o, &k, cap, "#");
       cm_ap(o, &k, cap, st->id);
     }
@@ -5569,7 +5772,7 @@ static void media_text(const struct media_query *mq, char *o, int cap)
   int k = 0;
   if (cap)
     o[0] = '\0';
-  if (mq->n == 0)
+  if (!mq || mq->n == 0)
     return;
   cm_ap(o, &k, cap, "@media ");
   for (int c = 0; c < mq->n; c++) {
@@ -5677,8 +5880,8 @@ int css_matches(css_sheet *sh, const struct dom_node *el, struct css_match *out,
   for (int i = 0; i < nm && n < cap; i++) {
     struct css_rule *r = sh->match[i];
     sel_text(&r->sel, out[n].selector, (int)sizeof out[n].selector);
-    media_text(&r->media, out[n].media, (int)sizeof out[n].media);
-    out[n].active = media_matches(&r->media);
+    media_text(r->media, out[n].media, (int)sizeof out[n].media);
+    out[n].active = media_matches(r->media);
     out[n].decl = r->decl;
     out[n].raw = r->raw;
     n++;

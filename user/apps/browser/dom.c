@@ -82,13 +82,8 @@ struct parser {
   bool oom;
 };
 
-static struct dom_node *node_new(struct parser *ps, enum dom_type type)
+static void node_init(struct dom_node *n, enum dom_type type)
 {
-  struct dom_node *n = malloc(sizeof *n);
-  if (!n) {
-    ps->oom = true;
-    return 0;
-  }
   n->type = type;
   n->tag[0] = '\0';
   n->text = 0;
@@ -100,12 +95,27 @@ static struct dom_node *node_new(struct parser *ps, enum dom_type type)
   n->attr_seq = 0;
   n->attr_cache_valid = 0;
   n->parent = n->first_child = n->last_child = n->next = 0;
-  n->sibling_meta_seq = 0;
+  n->sibling_meta_seq = ~0u;
   n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
   n->computed_style = 0;
   n->computed_style_sheet = 0;
   n->computed_style_seq = 0;
+  n->pseudo_style[0] = n->pseudo_style[1] = 0;
+  n->pseudo_sheet = 0;
+  n->pseudo_seq = DOM_STYLE_STALE;
+  n->anim_rec = 0;
+  n->anc_bloom_seq = 0;
   n->wrapper = 0;
+}
+
+static struct dom_node *node_new(struct parser *ps, enum dom_type type)
+{
+  struct dom_node *n = malloc(sizeof *n);
+  if (!n) {
+    ps->oom = true;
+    return 0;
+  }
+  node_init(n, type);
   return n;
 }
 
@@ -443,7 +453,7 @@ struct dom_node *dom_parse(const char *html, int len)
   ps.root = malloc(sizeof *ps.root);
   if (!ps.root)
     return 0;
-  ps.root->type = DOM_ELEMENT;
+  node_init(ps.root, DOM_ELEMENT);
   {
     const char *r = "#document";
     int i = 0;
@@ -451,22 +461,6 @@ struct dom_node *dom_parse(const char *html, int len)
       ps.root->tag[i] = r[i];
     ps.root->tag[i] = '\0';
   }
-  ps.root->text = 0;
-  ps.root->attrs = 0;
-  ps.root->last_attr = 0;
-  for (int i = 0; i < 8; i++)
-    ps.root->attr_cache[i] = 0;
-  ps.root->attr_cache_seq = ~0u;
-  ps.root->attr_seq = 0;
-  ps.root->attr_cache_valid = 0;
-  ps.root->parent = 0;
-  ps.root->first_child = ps.root->last_child = ps.root->next = 0;
-  ps.root->sibling_meta_seq = 0;
-  ps.root->elem_index = ps.root->elem_count = ps.root->type_index = ps.root->type_count = 0;
-  ps.root->computed_style = 0;
-  ps.root->computed_style_sheet = 0;
-  ps.root->computed_style_seq = 0;
-  ps.root->wrapper = 0;
   ps.cur = ps.root;
 
   while (ps.p < ps.end && !ps.oom) {
@@ -483,6 +477,8 @@ struct dom_node *dom_parse(const char *html, int len)
  * JS. */
 void (*dom_on_free_wrapper)(void *wrapper);
 void (*dom_on_free_style_cache)(void *cache);
+void (*dom_on_free_anim)(struct dom_node *n);
+bool dom_structural_styles;
 
 /* Bumped by every tree-mutating API below. The browser samples it around a JS
  * event so it only re-flattens the page when a handler actually changed the
@@ -493,8 +489,15 @@ static void node_free_one(struct dom_node *n)
 {
   if (n->wrapper && dom_on_free_wrapper)
     dom_on_free_wrapper(n->wrapper);
-  if (n->computed_style && dom_on_free_style_cache)
-    dom_on_free_style_cache(n->computed_style);
+  if (dom_on_free_style_cache) {
+    if (n->computed_style)
+      dom_on_free_style_cache(n->computed_style);
+    for (int i = 0; i < 2; i++)
+      if (n->pseudo_style[i])
+        dom_on_free_style_cache(n->pseudo_style[i]);
+  }
+  if (n->anim_rec && dom_on_free_anim)
+    dom_on_free_anim(n);
   struct dom_attr *a = n->attrs;
   while (a) {
     struct dom_attr *nx = a->next;
@@ -563,6 +566,36 @@ const char *dom_get_attr(const struct dom_node *node, const char *name)
   return 0;
 }
 
+/* Attributes the CSS engine and presentational-attr mapping read; any other
+ * attribute cannot change a computed style. */
+static bool style_attr(const char *name)
+{
+  static const char *const names[] = {"id",     "class",   "style",    "color",    "bgcolor",  "width",
+                                      "height", "checked", "selected", "disabled", "required", "href"};
+  for (int i = 0; i < (int)(sizeof names / sizeof names[0]); i++)
+    if (streq_ci(name, names[i]))
+      return true;
+  return false;
+}
+
+static void style_stale_subtree(struct dom_node *root)
+{
+  struct dom_node *n = root;
+  while (n) {
+    n->computed_style_seq = DOM_STYLE_STALE;
+    n->pseudo_seq = DOM_STYLE_STALE;
+    if (n->first_child) {
+      n = n->first_child;
+      continue;
+    }
+    while (n != root && !n->next)
+      n = n->parent;
+    if (n == root)
+      break;
+    n = n->next;
+  }
+}
+
 /* --- mutation API (for the JS DOM bindings; see browser/js/bindings.c) ------
  */
 
@@ -571,22 +604,7 @@ struct dom_node *dom_new_element(const char *tag)
   struct dom_node *n = malloc(sizeof *n);
   if (!n)
     return 0;
-  n->type = DOM_ELEMENT;
-  n->text = 0;
-  n->attrs = 0;
-  n->last_attr = 0;
-  for (int i = 0; i < 8; i++)
-    n->attr_cache[i] = 0;
-  n->attr_cache_seq = ~0u;
-  n->attr_seq = 0;
-  n->attr_cache_valid = 0;
-  n->parent = n->first_child = n->last_child = n->next = 0;
-  n->sibling_meta_seq = 0;
-  n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
-  n->computed_style = 0;
-  n->computed_style_sheet = 0;
-  n->computed_style_seq = 0;
-  n->wrapper = 0;
+  node_init(n, DOM_ELEMENT);
   {
     int i = 0;
     for (; tag && tag[i] && i < 15; i++)
@@ -601,22 +619,7 @@ struct dom_node *dom_new_text(const char *text)
   struct dom_node *n = malloc(sizeof *n);
   if (!n)
     return 0;
-  n->type = DOM_TEXT;
-  n->tag[0] = '\0';
-  n->attrs = 0;
-  n->last_attr = 0;
-  for (int i = 0; i < 8; i++)
-    n->attr_cache[i] = 0;
-  n->attr_cache_seq = ~0u;
-  n->attr_seq = 0;
-  n->attr_cache_valid = 0;
-  n->parent = n->first_child = n->last_child = n->next = 0;
-  n->sibling_meta_seq = 0;
-  n->elem_index = n->elem_count = n->type_index = n->type_count = 0;
-  n->computed_style = 0;
-  n->computed_style_sheet = 0;
-  n->computed_style_seq = 0;
-  n->wrapper = 0;
+  node_init(n, DOM_TEXT);
   n->text = dupn(text ? text : "", text ? (int)strlen(text) : 0);
   return n;
 }
@@ -641,6 +644,8 @@ void dom_remove_child(struct dom_node *parent, struct dom_node *child)
     parent->last_child = prev;
   c->next = 0;
   c->parent = 0;
+  if (dom_structural_styles)
+    style_stale_subtree(parent);
 }
 
 void dom_append_child(struct dom_node *parent, struct dom_node *child)
@@ -651,6 +656,9 @@ void dom_append_child(struct dom_node *parent, struct dom_node *child)
   if (child->parent)
     dom_remove_child(child->parent, child);
   node_append(parent, child);
+  style_stale_subtree(child);
+  if (dom_structural_styles)
+    style_stale_subtree(parent);
 }
 
 /* Insert `child` before `ref` among `parent`'s children. A NULL `ref` (or one
@@ -681,6 +689,9 @@ void dom_insert_before(struct dom_node *parent, struct dom_node *child, struct d
     /* ref is not last (it has child before it now), so last_child is unchanged.
      */
   }
+  style_stale_subtree(child);
+  if (dom_structural_styles)
+    style_stale_subtree(parent);
 }
 
 void dom_set_attr(struct dom_node *el, const char *name, const char *value)
@@ -688,6 +699,8 @@ void dom_set_attr(struct dom_node *el, const char *name, const char *value)
   if (!el || el->type != DOM_ELEMENT || !name)
     return;
   dom_mutation_seq++;
+  if (style_attr(name))
+    style_stale_subtree(el);
   for (struct dom_attr *a = el->attrs; a; a = a->next)
     if (streq_ci(a->name, name)) {
       char *nv = dupn(value ? value : "", value ? (int)strlen(value) : 0);
@@ -718,6 +731,8 @@ void dom_remove_attr(struct dom_node *el, const char *name)
   if (!el)
     return;
   dom_mutation_seq++;
+  if (style_attr(name))
+    style_stale_subtree(el);
   struct dom_attr *prev = 0, *a = el->attrs;
   while (a) {
     if (streq_ci(a->name, name)) {
@@ -745,6 +760,10 @@ void dom_clear_children(struct dom_node *el)
   if (!el)
     return;
   dom_mutation_seq++;
+  if (dom_structural_styles) {
+    el->computed_style_seq = DOM_STYLE_STALE;
+    el->pseudo_seq = DOM_STYLE_STALE;
+  }
   struct dom_node *c = el->first_child;
   el->first_child = el->last_child = 0;
   while (c) {

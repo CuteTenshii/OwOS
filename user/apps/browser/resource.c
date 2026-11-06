@@ -13,6 +13,7 @@
 #include "fetchint.h"
 #include "headers.h" /* HTTP response headers (iframe X-Frame-Options / CSP)  */
 #include "imgdec.h"  /* shared image decoder (SVG/WebP/PNG) for <img> */
+#include "mutex.h"
 
 /* The origin that owns the sub-resources currently being fetched (the page, set
  * by do_fetch). Cross-origin no-cors loads are checked against it for CORP. */
@@ -1160,36 +1161,20 @@ unsigned char *browser_cors_fetch(const char *page_url, int with_credentials, co
 
 struct par_job {
   volatile int next; /* next index to claim                       */
-  volatile int lock; /* guards `next`                             */
+  mutex_t lock;      /* guards `next` */
   int n;
   void (*fn)(void *ctx, int i);
   void *ctx;
 };
 static struct par_job *g_par;
 
-static int par_xchg(volatile int *p, int v)
-{
-  __asm__ volatile("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
-  return v;
-}
-static void par_spin_lock(volatile int *l)
-{
-  while (par_xchg(l, 1))
-    msleep(0);
-}
-static void par_spin_unlock(volatile int *l)
-{
-  __asm__ volatile("" ::: "memory");
-  *l = 0;
-}
-
 static int par_claim(struct par_job *j)
 {
   int got = -1;
-  par_spin_lock(&j->lock);
+  mutex_lock(&j->lock);
   if (j->next < j->n)
     got = j->next++;
-  par_spin_unlock(&j->lock);
+  mutex_unlock(&j->lock);
   return got;
 }
 
@@ -1210,7 +1195,7 @@ static void par_fetch(int n, void (*fn)(void *ctx, int i), void *ctx)
 {
   if (n <= 0)
     return;
-  struct par_job job = {0, 0, n, fn, ctx};
+  struct par_job job = {0, MUTEX_INIT, n, fn, ctx};
   g_par = &job;
 
   int want = n - 1;
@@ -1632,7 +1617,7 @@ struct subres_batch {
   unsigned char **bodies;
   int *lens;
   bool *handled;
-  volatile int lock;
+  mutex_t lock;
 };
 
 /* Fetch one origin-group, starting from the URL `i` a pool thread just claimed:
@@ -1648,14 +1633,14 @@ static void subres_job(void *vctx, int i)
   struct purl u;
   int grp[H2_FETCH_MAX], ng = 0;
 
-  par_spin_lock(&c->lock);
+  mutex_lock(&c->lock);
   if (c->handled[i]) {
-    par_spin_unlock(&c->lock);
+    mutex_unlock(&c->lock);
     return;
   } /* claimed by another group */
   if (!origin_of(c->urls[i], &u)) {
     c->handled[i] = true;
-    par_spin_unlock(&c->lock);
+    mutex_unlock(&c->lock);
     return;
   }
   if (!u.tls) {
@@ -1676,7 +1661,7 @@ static void subres_job(void *vctx, int i)
       grp[ng++] = j;
     }
   }
-  par_spin_unlock(&c->lock);
+  mutex_unlock(&c->lock);
 
   if (!u.tls) { /* plain http: single h1.1 */
     c->bodies[grp[0]] = subres_get(c->urls[grp[0]], c->accept, &c->lens[grp[0]]);
@@ -1824,7 +1809,7 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
     }
   }
 
-  struct subres_batch ctx = {urls, n, accept, bodies, lens, handled, 0};
+  struct subres_batch ctx = {urls, n, accept, bodies, lens, handled, MUTEX_INIT};
   par_fetch(n, subres_job, &ctx);
   free(handled);
 }
@@ -1845,37 +1830,21 @@ void css_batch(char *const *urls, int n, unsigned char **bodies, int *lens)
 
 static char g_img_page[URL_MAX]; /* page URL the fetchers resolve against */
 static volatile int g_img_next;  /* next image index to claim             */
-static volatile int g_img_lock;  /* guards g_img_next + the pool bump      */
-
-static int img_xchg(volatile int *p, int v)
-{
-  __asm__ volatile("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
-  return v;
-}
-static void img_lock(void)
-{
-  while (img_xchg(&g_img_lock, 1))
-    msleep(0);
-}
-static void img_unlock(void)
-{
-  __asm__ volatile("" ::: "memory");
-  g_img_lock = 0;
-}
+static mutex_t g_img_lock;       /* guards g_img_next + the pool bump */
 
 /* Claim the next eager (non-lazy) image index, or -1 when none remain. */
 static int img_claim_next(void)
 {
   int got = -1;
-  img_lock();
+  mutex_lock(&g_img_lock);
   while (g_img_next < B->pg->n_imgs) {
     int i = g_img_next++;
-    if (!B->pg->imgs[i].lazy && !B->pg->imgs[i].ok) {
+    if (!B->pg->imgs[i].lazy && !B->pg->imgs[i].ok && !B->pg->imgs[i].fetched) {
       got = i;
       break;
     } /* skip h2-done */
   }
-  img_unlock();
+  mutex_unlock(&g_img_lock);
   return got;
 }
 
@@ -1899,12 +1868,12 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
     if (rgba) {
       long long bytes = (long long)ww * hh * 4;
       int off = -1;
-      img_lock();
+      mutex_lock(&g_img_lock);
       if (ww && hh && ww <= 16384 && hh <= 16384 && bytes <= (long long)(IMG_POOL - B->img_pool_len)) {
         off = B->img_pool_len;
         B->img_pool_len += (int)bytes;
       }
-      img_unlock();
+      mutex_unlock(&g_img_lock);
       if (off >= 0) {
         memcpy(B->img_pool + off, rgba, (unsigned)bytes);
         im->coff = off;
@@ -1927,12 +1896,12 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
     bool okdim = (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih);
 
     int off = -1;
-    img_lock();
+    mutex_lock(&g_img_lock);
     if (B->img_pool_len + blen <= IMG_POOL) {
       off = B->img_pool_len;
       B->img_pool_len += blen;
     }
-    img_unlock();
+    mutex_unlock(&g_img_lock);
     if (off >= 0) {
       memcpy(B->img_pool + off, body, (unsigned)blen); /* disjoint: no lock */
       im->coff = off;
@@ -2034,7 +2003,7 @@ static void h2_prefetch(const char *page_url)
 
   for (int i = 0; i < B->pg->n_imgs && nb < H2_FETCH_MAX; i++) {
     struct inl_img *im = &B->pg->imgs[i];
-    if (im->lazy || im->ok)
+    if (im->lazy || im->ok || im->fetched)
       continue;
     char full[URL_MAX];
     resolve_url(page_url, im->href, full, sizeof full);
@@ -2175,7 +2144,11 @@ static void img_fetcher_thread(void)
  * loading="lazy" images wait for fetch_lazy_visible() when scrolled in. */
 void fetch_inline_images(const char *page_url)
 {
-  B->img_pool_len = 0;
+  int pending = 0;
+  for (int i = 0; i < B->pg->n_imgs; i++)
+    pending += !B->pg->imgs[i].lazy && !B->pg->imgs[i].ok && !B->pg->imgs[i].fetched;
+  if (!pending)
+    return;
   {
     int k = 0;
     g_img_page[0] = '\0';
@@ -2190,7 +2163,7 @@ void fetch_inline_images(const char *page_url)
     long now = (long)rtc_epoch();
     for (int i = 0; i < B->pg->n_imgs; i++) {
       struct inl_img *im = &B->pg->imgs[i];
-      if (im->lazy || im->ok)
+      if (im->lazy || im->ok || im->fetched)
         continue;
       char full[URL_MAX];
       resolve_url(page_url, im->href, full, sizeof full);

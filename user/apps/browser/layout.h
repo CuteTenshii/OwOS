@@ -95,4 +95,53 @@ void layout_box_close(int t1);
 
 struct lbox *layout_pool(int *n); /* the box array (pre-order) + count */
 
+static inline unsigned layout_mix(unsigned h, unsigned v)
+{
+  h ^= v + 0x9e3779b9u + (h << 6) + (h >> 2);
+  return h * 16777619u;
+}
+
+/* Fold every field of `b` that decides line wrapping or box geometry into hash `h`
+ * (colours, borders' paint, shadows and the like are deliberately left out). */
+static inline unsigned layout_box_sig(const struct lbox *b, unsigned h)
+{
+  h = layout_mix(h, (unsigned)b->kind | ((unsigned)b->flex_dir << 8) | ((unsigned)b->flex_wrap << 16) |
+                        ((unsigned)(unsigned char)b->grid_flow << 24));
+  h = layout_mix(h, (unsigned)(unsigned char)b->justify | ((unsigned)(unsigned char)b->align_items << 8) |
+                        ((unsigned)(unsigned char)b->pos << 16) | ((unsigned)(unsigned char)b->justify_items << 24));
+  h = layout_mix(h, (unsigned)(unsigned short)b->gap_row | ((unsigned)(unsigned short)b->gap_col << 16));
+  h = layout_mix(h, (unsigned)(unsigned char)b->n_cols | ((unsigned)(unsigned char)b->n_rows << 8) |
+                        ((unsigned)(unsigned char)b->col_span << 16) | ((unsigned)(unsigned char)b->row_span << 24));
+  for (int i = 0; i < CSS_GRID_MAX; i++) {
+    h = layout_mix(h, (unsigned)(unsigned char)b->cols_t[i].kind | ((unsigned)(unsigned short)b->cols_t[i].v << 8));
+    h = layout_mix(h, (unsigned)(unsigned char)b->rows_t[i].kind | ((unsigned)(unsigned short)b->rows_t[i].v << 8));
+  }
+  const struct ledge *e[3] = {&b->margin, &b->border, &b->padding};
+  for (int i = 0; i < 3; i++) {
+    h = layout_mix(h, (unsigned)(unsigned short)e[i]->t | ((unsigned)(unsigned short)e[i]->r << 16));
+    h = layout_mix(h, (unsigned)(unsigned short)e[i]->b | ((unsigned)(unsigned short)e[i]->l << 16));
+  }
+  h = layout_mix(h, (unsigned)b->ml_auto | ((unsigned)b->mr_auto << 8) | ((unsigned)b->border_box << 16));
+  h = layout_mix(h, (unsigned)b->spec_w);
+  h = layout_mix(h, (unsigned)b->spec_h);
+  h = layout_mix(h, (unsigned)(unsigned short)b->pct_w | ((unsigned)(unsigned short)b->pct_h << 16));
+  h = layout_mix(h, (unsigned)b->max_w);
+  h = layout_mix(h, (unsigned)b->max_h);
+  h = layout_mix(h, (unsigned)b->min_w);
+  h = layout_mix(h, (unsigned)b->min_h);
+  h = layout_mix(h, (unsigned)(unsigned short)b->pct_maxw | ((unsigned)(unsigned short)b->pct_maxh << 16));
+  h = layout_mix(h, (unsigned)(unsigned short)b->pct_minw | ((unsigned)(unsigned short)b->pct_minh << 16));
+  h = layout_mix(h, (unsigned)(unsigned short)b->flex_grow | ((unsigned)(unsigned short)b->flex_shrink << 16));
+  h = layout_mix(h, (unsigned)b->flex_basis);
+  h = layout_mix(h, (unsigned)(unsigned short)b->pct_basis);
+  h = layout_mix(h, (unsigned)b->off_t);
+  h = layout_mix(h, (unsigned)b->off_r);
+  h = layout_mix(h, (unsigned)b->off_b);
+  h = layout_mix(h, (unsigned)b->off_l);
+  h = layout_mix(h, (unsigned)b->t0);
+  h = layout_mix(h, (unsigned)b->t1);
+  h = layout_mix(h, (unsigned)b->parent);
+  return layout_mix(h, (unsigned)b->end);
+}
+
 #endif /* OWOS_LAYOUT_H */

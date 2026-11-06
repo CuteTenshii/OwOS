@@ -11,6 +11,7 @@
 #include "features/media/bmedia.h" /* <audio>/<video> element registration */
 #include "features/svg/svg.h"
 #include "font.h"
+#include "imgcarry.h"
 #include "imgdec.h" /* shared image decoder for url() background images */
 #include "layout.h"
 
@@ -97,11 +98,13 @@ static bool csp_style_attr_ok(void)
   return csp_check_inline(B->pg->csp, CSP_STYLE, 0, 0, 0, 0, 0);
 }
 
+static unsigned style_key(void) { return css_viewport_generation() + css_sheet_generation(g_sheet); }
+
 /* Computed style for one element: presentational attrs (lowest), sheet rules,
  * then inline style="" (highest). */
 static void compute_style(struct dom_node *el, struct css_style *cs)
 {
-  unsigned seq = dom_mutation_seq ^ css_viewport_generation();
+  unsigned seq = style_key();
   dom_on_free_style_cache = free_style_cache;
   if (el->computed_style && el->computed_style_sheet == g_sheet && el->computed_style_seq == seq) {
     *cs = *(struct css_style *)el->computed_style;
@@ -1204,33 +1207,51 @@ static void close_link(void)
   }
 }
 
-/* Append an inline <img> to B->pg->imgs on its own line (box from the computed
- * CSS width/height). data: URIs are skipped. */
 /* Serialize a DOM subtree back into SVG/XML text: `<tag attr="v"
- * ...>kids</tag>`, or `<tag .../>` when childless. Bounded append; values are
- * emitted raw (the DOM keeps them undecoded), which is what the SVG parser
- * wants. Reuses the existing svg.c rasterizer rather than teaching the layout
- * engine SVG geometry. */
-static void svg_put(char *b, int *n, int cap, const char *s)
+ * ...>kids</tag>`, or `<tag .../>` when childless. Values are emitted raw (the
+ * DOM keeps them undecoded), which is what the SVG parser wants. Reuses the
+ * existing svg.c rasterizer rather than teaching the layout engine SVG
+ * geometry. */
+struct sbuf {
+  char *p;
+  int n, cap;
+  bool oom;
+};
+static void svg_put(struct sbuf *b, const char *s)
 {
-  while (*s && *n < cap - 1)
-    b[(*n)++] = *s++;
+  int len = (int)strlen(s);
+  if (b->oom)
+    return;
+  if (b->n + len + 1 > b->cap) {
+    int nc = b->cap ? b->cap * 2 : 4096;
+    while (nc < b->n + len + 1)
+      nc *= 2;
+    char *np = realloc(b->p, (unsigned)nc);
+    if (!np) {
+      b->oom = true;
+      return;
+    }
+    b->p = np;
+    b->cap = nc;
+  }
+  memcpy(b->p + b->n, s, (unsigned)len + 1);
+  b->n += len;
 }
 /* Emit ` name="value"` for a baked SVG paint: -1 skip, -2 none, -3
  * currentColor, else #rrggbb. Prepended before the element's own attrs so a
  * CSS-resolved paint wins over a presentation attribute (svg.c reads the first
  * matching attr). */
-static void svg_put_paint(char *b, int *n, int cap, const char *name, int v)
+static void svg_put_paint(struct sbuf *b, const char *name, int v)
 {
   if (v == -1)
     return;
-  svg_put(b, n, cap, " ");
-  svg_put(b, n, cap, name);
-  svg_put(b, n, cap, "=\"");
+  svg_put(b, " ");
+  svg_put(b, name);
+  svg_put(b, "=\"");
   if (v == -2)
-    svg_put(b, n, cap, "none");
+    svg_put(b, "none");
   else if (v == -3)
-    svg_put(b, n, cap, "currentColor");
+    svg_put(b, "currentColor");
   else {
     char h[8] = "#";
     const char *d = "0123456789abcdef";
@@ -1241,106 +1262,127 @@ static void svg_put_paint(char *b, int *n, int cap, const char *name, int v)
     h[5] = d[(v >> 4) & 0xf];
     h[6] = d[v & 0xf];
     h[7] = '\0';
-    svg_put(b, n, cap, h);
+    svg_put(b, h);
   }
-  svg_put(b, n, cap, "\"");
+  svg_put(b, "\"");
 }
 /* Bound the recursion like the DOM walk (WALK_DEPTH_MAX): each frame carries a
  * css_style plus a compute_style call, so an adversarially deep inline <svg>
  * would otherwise overflow the 64 KiB worker stack. Content nested past the cap
  * is dropped rather than crashing the worker. */
 #define SVG_MAX_DEPTH 256
-static void svg_serialize(struct dom_node *el, char *b, int *n, int cap, int depth)
+static void svg_serialize(struct dom_node *el, struct sbuf *b, int depth)
 {
   if (depth >= SVG_MAX_DEPTH)
     return;
   if (el->type == DOM_TEXT) {
     if (el->text)
-      svg_put(b, n, cap, el->text);
+      svg_put(b, el->text);
     return;
   }
-  svg_put(b, n, cap, "<");
-  svg_put(b, n, cap, el->tag);
+  svg_put(b, "<");
+  svg_put(b, el->tag);
   /* Bake the element's cascaded fill/stroke so CSS (e.g. Tailwind fill-*
    * classes, `svg{fill:…}`) colours the icon — svg.c only reads
    * attrs/inline-style. */
   {
     struct css_style ecs;
     compute_style(el, &ecs);
-    svg_put_paint(b, n, cap, "fill", ecs.fill);
-    svg_put_paint(b, n, cap, "stroke", ecs.stroke);
+    svg_put_paint(b, "fill", ecs.fill);
+    svg_put_paint(b, "stroke", ecs.stroke);
   }
   for (struct dom_attr *a = el->attrs; a; a = a->next) {
-    svg_put(b, n, cap, " ");
-    svg_put(b, n, cap, a->name);
-    svg_put(b, n, cap, "=\"");
-    svg_put(b, n, cap, a->value ? a->value : "");
-    svg_put(b, n, cap, "\"");
+    svg_put(b, " ");
+    svg_put(b, a->name);
+    svg_put(b, "=\"");
+    svg_put(b, a->value ? a->value : "");
+    svg_put(b, "\"");
   }
   if (!el->first_child) {
-    svg_put(b, n, cap, "/>");
+    svg_put(b, "/>");
     return;
   }
-  svg_put(b, n, cap, ">");
+  svg_put(b, ">");
   for (struct dom_node *c = el->first_child; c; c = c->next)
-    svg_serialize(c, b, n, cap, depth + 1);
-  svg_put(b, n, cap, "</");
-  svg_put(b, n, cap, el->tag);
-  svg_put(b, n, cap, ">");
+    svg_serialize(c, b, depth + 1);
+  svg_put(b, "</");
+  svg_put(b, el->tag);
+  svg_put(b, ">");
 }
+
+static struct img_carry g_carry;
 
 /* Inline <svg>…</svg>: serialize the subtree and hand it to the SVG rasterizer
  * as a self-contained document, emitted as an inline image (same machinery as
  * <img src=.svg>). The bytes are committed synchronously here on the parse/walk
- * thread — no network fetch — and the slot is exposed only once committed. */
+ * thread — no network fetch — and the slot is exposed only once committed. An
+ * unchanged svg (same markup and currentColor) reuses its rasterized pixels. */
 static void handle_svg(struct dom_node *el, const struct css_style *cs)
 {
   if (!browser_ensure_imgs(B->pg->n_imgs + 1))
     return;
-  int cap = 32768;
-  char *buf = malloc((unsigned)cap);
-  if (!buf)
+  struct sbuf sb = {0};
+  svg_serialize(el, &sb, 0);
+  if (sb.oom || sb.n < 5) {
+    free(sb.p);
     return;
-  int len = 0;
-  svg_serialize(el, buf, &len, cap, 0);
-  buf[len] = '\0';
-  if (len < 5 || !svg_probe(buf, len)) {
-    free(buf);
+  }
+  unsigned color = cs->color >= 0 ? (unsigned)cs->color : sty_cur.fg;
+  unsigned h1 = 2166136261u, h2 = 5381u;
+  for (int i = 0; i < sb.n; i++) {
+    h1 = (h1 ^ (unsigned char)sb.p[i]) * 16777619u;
+    h2 = h2 * 33u + (unsigned char)sb.p[i];
+  }
+  char key[64];
+  {
+    int k = 0;
+    sapp(key, &k, sizeof key, "svg:");
+    uapp(key, &k, sizeof key, h1);
+    sapp(key, &k, sizeof key, ":");
+    uapp(key, &k, sizeof key, h2);
+    sapp(key, &k, sizeof key, ":");
+    uapp(key, &k, sizeof key, (unsigned)sb.n);
+    sapp(key, &k, sizeof key, ":");
+    uapp(key, &k, sizeof key, color);
+  }
+
+  int idx = B->pg->n_imgs;
+  struct inl_img *im = &B->pg->imgs[idx];
+  bool carried = img_carry_take(&g_carry, im, key, idx, true, B->pg->imgs);
+  if (!carried && !svg_probe(sb.p, sb.n)) {
+    free(sb.p);
     return;
   }
 
   if (W_run_nl < 1 && W_n > 0)
     W_n = text_put(W_n, '\n', 0);
 
-  int idx = B->pg->n_imgs;
-  struct inl_img *im = &B->pg->imgs[idx];
-  im->href[0] = '\0';
+  strlcpy(im->href, key, (int)sizeof im->href);
   im->alt[0] = '\0';
   im->lazy = 0;
-  im->want = 0;
-  im->fetched = 1; /* nothing to fetch */
   im->cw = (cs->width >= 0) ? cs->width : 0;
   im->ch = (cs->height >= 0) ? cs->height : 0;
   im->text_pos = W_n;
-  im->ok = 0;
   im->rows = 0;
   im->start_row = -1;
-  im->iw = im->ih = 0;
-  im->coff = im->clen = 0;
-  im->is_argb = 0;
-  im->uid = 0;
-
-  /* currentColor resolves to the SVG's own CSS color if it sets one, else the
-   * inherited text colour (sty_cur.fg) — icons are usually
-   * `fill="currentColor"` coloured by `color` on an ancestor link/element, not
-   * on the <svg> itself. */
-  resource_commit_inline(idx, (const unsigned char *)buf, len, cs->color >= 0 ? (unsigned)cs->color : sty_cur.fg);
+  if (!carried) {
+    img_clear(im);
+    /* currentColor resolves to the SVG's own CSS color if it sets one, else the
+     * inherited text colour (sty_cur.fg) — icons are usually
+     * `fill="currentColor"` coloured by `color` on an ancestor link/element,
+     * not on the <svg> itself. */
+    resource_commit_inline(idx, (const unsigned char *)sb.p, sb.n, color);
+  }
+  im->want = 0;
+  im->fetched = 1; /* nothing to fetch */
   B->pg->n_imgs++; /* expose once committed */
   W_n = text_put(W_n, '\n', 0);
   W_run_nl = 1;
-  free(buf);
+  free(sb.p);
 }
 
+/* Append an inline <img> to B->pg->imgs on its own line (box from the computed
+ * CSS width/height). data: URIs are skipped. */
 static void handle_img(struct dom_node *el, const struct css_style *cs)
 {
   if (!browser_ensure_imgs(B->pg->n_imgs + 1))
@@ -1374,11 +1416,11 @@ static void handle_img(struct dom_node *el, const struct css_style *cs)
   if (W_run_nl < 1 && W_n > 0)
     W_n = text_put(W_n, '\n', 0);
 
-  struct inl_img *im = &B->pg->imgs[B->pg->n_imgs];
-  int j = 0;
-  for (; imgurl[j] && j < (int)sizeof im->href - 1; j++)
-    im->href[j] = imgurl[j];
-  im->href[j] = '\0';
+  int idx = B->pg->n_imgs;
+  struct inl_img *im = &B->pg->imgs[idx];
+  strlcpy(im->href, imgurl, (int)sizeof im->href);
+  if (!img_carry_take(&g_carry, im, im->href, idx, false, B->pg->imgs))
+    img_clear(im);
 
   im->alt[0] = '\0';
   const char *alt = dom_get_attr(el, "alt");
@@ -1391,20 +1433,13 @@ static void handle_img(struct dom_node *el, const struct css_style *cs)
 
   const char *ld = dom_get_attr(el, "loading"); /* lazy -> fetch on scroll-in */
   im->lazy = (ld && starts_ci(ld, "lazy")) ? 1 : 0;
-  im->want = 0;
-  im->fetched = 0;
 
   im->cw = (cs->width >= 0) ? cs->width : 0;
   im->ch = (cs->height >= 0) ? cs->height : 0;
 
   im->text_pos = W_n;
-  im->ok = 0;
   im->rows = 0;
   im->start_row = -1;
-  im->iw = im->ih = 0;
-  im->coff = im->clen = 0;
-  im->is_argb = 0;
-  im->uid = 0;
   B->pg->n_imgs++;
   W_n = text_put(W_n, '\n', 0);
   W_run_nl = 1;
@@ -2260,12 +2295,25 @@ static void emit_pseudo(struct dom_node *el, int which)
 {
   if (!css_sheet_has_pseudo(g_sheet))
     return; /* no ::before/::after rules -> skip the extra cascade */
-  struct css_style pcs;
-  if (!css_pseudo_content(g_sheet, el, which, &pcs))
+  unsigned seq = style_key();
+  if (el->pseudo_seq != seq || el->pseudo_sheet != g_sheet) {
+    dom_on_free_style_cache = free_style_cache;
+    for (int w = 0; w < 2; w++) {
+      struct css_style tmp;
+      free(el->pseudo_style[w]);
+      el->pseudo_style[w] = 0;
+      if (css_pseudo_content(g_sheet, el, w + 1, &tmp) && (el->pseudo_style[w] = malloc(sizeof tmp)))
+        *(struct css_style *)el->pseudo_style[w] = tmp;
+    }
+    el->pseudo_sheet = g_sheet;
+    el->pseudo_seq = seq;
+  }
+  const struct css_style *pcs = el->pseudo_style[which - 1];
+  if (!pcs)
     return;
   struct sty sv = sty_cur;
-  apply_css(&pcs);
-  emit_text(pcs.content);
+  apply_css(pcs);
+  emit_text(pcs->content);
   sty_cur = sv;
 }
 
@@ -2277,6 +2325,7 @@ static void emit_pseudo(struct dom_node *el, int which)
  * nesting. */
 #define WALK_DEPTH_MAX 256
 static int g_walk_depth;
+static unsigned g_walk_now; /* msec() sampled once per layout_dom walk */
 
 /* Decimal/alpha/roman numeral writers for ordered <li> markers (1-based). */
 static int li_decimal(int n, char *b, int pad)
@@ -2478,8 +2527,8 @@ static void walk_element_inner(struct dom_node *el)
   struct css_style cs;
   compute_style(el, &cs);
   if (cs.disp == CSS_DISP_NONE)
-    return;                             /* display:none */
-  anim_apply(g_sheet, el, &cs, msec()); /* overlay @keyframes / transition */
+    return;                                 /* display:none */
+  anim_apply(g_sheet, el, &cs, g_walk_now); /* overlay @keyframes / transition */
   if (streq(name, "dialog") && !dom_get_attr(el, "open"))
     return; /* closed modal is hidden */
   if (streq(name, "colgroup") || streq(name, "col"))
@@ -3175,10 +3224,21 @@ static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn
  * the page's bgimgs table and points each box at its decoded entry
  * (bg_image_index); paint_boxes blits with background-size/-position/-repeat.
  */
-#define BGIMG_MAX 32
-static char g_bgabs[BGIMG_MAX][URL_MAX]; /* table key: resolved abs URL */
-static char g_bguse[BGIMG_MAX][URL_MAX]; /* fetch URL (post-CSP, maybe upgraded)  */
-static int g_nbg;                        /* urls collected by the walk this pass  */
+struct bg_note {
+  char *abs; /* table key: resolved abs URL */
+  char *use; /* fetch URL (post-CSP, maybe upgraded) */
+};
+static struct bg_note *g_bgn;
+static int g_nbg, g_bgn_cap; /* urls collected by the walk this pass */
+
+static char *dup_cstr(const char *s)
+{
+  int n = (int)strlen(s);
+  char *d = malloc((unsigned)n + 1);
+  if (d)
+    memcpy(d, s, (unsigned)n + 1);
+  return d;
+}
 
 /* Note one block box's url() background for the batched fetch: resolve against
  * the page base, apply img-src CSP, dedup. Called by the walk for top-document
@@ -3186,23 +3246,34 @@ static int g_nbg;                        /* urls collected by the walk this pass
  * cascade. */
 static void bg_note_url(const char *raw_url)
 {
-  if (!raw_url || !raw_url[0] || g_nbg >= BGIMG_MAX)
+  if (!raw_url || !raw_url[0])
     return;
   char abs[URL_MAX], use[URL_MAX];
   resolve_url(g_base_url, raw_url, abs, sizeof abs);
   if (!csp_url_ok(CSP_IMG, abs, "image", use, sizeof use))
     return;
   for (int i = 0; i < g_nbg; i++)
-    if (streq(g_bgabs[i], abs))
+    if (streq(g_bgn[i].abs, abs))
       return;
-  int k = 0;
-  for (; abs[k] && k < URL_MAX - 1; k++)
-    g_bgabs[g_nbg][k] = abs[k];
-  g_bgabs[g_nbg][k] = '\0';
-  k = 0;
-  for (; use[k] && k < URL_MAX - 1; k++)
-    g_bguse[g_nbg][k] = use[k];
-  g_bguse[g_nbg][k] = '\0';
+  if (g_nbg == g_bgn_cap) {
+    int nc = g_bgn_cap ? g_bgn_cap * 2 : 16;
+    struct bg_note *nn = realloc(g_bgn, (unsigned)nc * sizeof *nn);
+    if (!nn)
+      return;
+    memset(nn + g_bgn_cap, 0, (unsigned)(nc - g_bgn_cap) * sizeof *nn);
+    g_bgn = nn;
+    g_bgn_cap = nc;
+  }
+  char *na = dup_cstr(abs), *nu = dup_cstr(use);
+  if (!na || !nu) {
+    free(na);
+    free(nu);
+    return;
+  }
+  free(g_bgn[g_nbg].abs); /* left over from an earlier walk */
+  free(g_bgn[g_nbg].use);
+  g_bgn[g_nbg].abs = na;
+  g_bgn[g_nbg].use = nu;
   g_nbg++;
 }
 
@@ -3231,7 +3302,7 @@ static void load_bg_images(const char *page_url, res_batch_fn fetch)
     return;
   }
   for (int i = 0; i < nu; i++)
-    furls[i] = g_bguse[i];
+    furls[i] = g_bgn[i].use;
 
   unsigned char **bodies = calloc((unsigned)nu, sizeof *bodies);
   int *lens = calloc((unsigned)nu, sizeof *lens);
@@ -3240,10 +3311,7 @@ static void load_bg_images(const char *page_url, res_batch_fn fetch)
     if (fetch)
       fetch(furls, nu, bodies, lens);
     for (int i = 0; i < nu; i++) {
-      int k = 0;
-      for (; g_bgabs[i][k] && k < URL_MAX - 1; k++)
-        tab[n].url[k] = g_bgabs[i][k];
-      tab[n].url[k] = '\0';
+      strlcpy(tab[n].url, g_bgn[i].abs, (int)sizeof tab[n].url);
       tab[n].iw = tab[n].ih = 0;
       tab[n].rgba = 0;
       if (bodies[i] && lens[i] > 0) {
@@ -3340,10 +3408,12 @@ static void compute_page_colors(struct dom_node *root)
 static void layout_dom(void)
 {
   css_set_viewport(BW, BH); /* so @media re-evaluates at the current size */
-  anim_frame_begin(msec()); /* advance the animation clock for this walk */
+  g_walk_now = msec();
+  anim_frame_begin(g_walk_now); /* advance the animation clock for this walk */
   B->pg->nlinks = 0;
+  if (B->img_pool_len > IMG_POOL / 2 || !img_carry_begin(&g_carry, B->pg->imgs, B->pg->n_imgs))
+    B->img_pool_len = 0; /* nothing carried: the pool restarts empty */
   B->pg->n_imgs = 0;
-  B->img_pool_len = 0;
   compute_page_colors(g_live_dom);
   sty_cur.fg = B->pg->page_fg;
   sty_cur.bold = sty_cur.under = 0;
@@ -3375,6 +3445,8 @@ static void layout_dom(void)
   }
   if (g_live_dom)
     walk(g_live_dom);
+  img_carry_end(&g_carry);
+  B->img_pool_len = img_carry_pool_len(B->pg->imgs, B->pg->n_imgs, B->img_pool_len);
   B->pg->text_len = W_n;
   B->layout_dirty = 1; /* box tree + text rebuilt → main thread must re-wrap */
 }
@@ -3391,12 +3463,12 @@ void html_page_teardown(void)
     dom_free(g_live_dom);
     g_live_dom = 0;
   }
-  dom_on_free_style_cache = 0;
   if (g_sheet) {
     css_free(g_sheet);
     g_sheet = 0;
   }
   frames_free(); /* drop this page's iframe sub-documents */
+  dom_on_free_style_cache = 0;
   layout_free(); /* drop the box tree */
   anim_reset();  /* drop per-element animation/transition state */
   g_nspans = 0;
@@ -3481,8 +3553,8 @@ void html_iframe_resolve(const char *url, const char *parent, int verdict, const
 }
 
 /* Re-flatten the live DOM into B's buffers after a script mutated it (run by
- * the worker right after event dispatch), forcing a re-wrap + repaint. Inline
- * images are rebuilt fresh, so the caller re-fetches them if any remain. */
+ * the worker right after event dispatch), forcing a re-wrap + repaint. Landed
+ * inline images keep their pixels; the caller fetches any new ones. */
 void html_relayout(void)
 {
   if (!g_live_dom)

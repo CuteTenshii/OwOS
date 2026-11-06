@@ -9,9 +9,9 @@
  * frees it), so the DOM/Styles snapshots are built there in
  * devtools_worker_tick — never walked from the main thread. The console buffer
  * is appended from the worker (js.c routes console.* + errors here) and read by
- * the main thread's render. A single spinlock (dt_lk) guards the snapshot text
- * and the console ring against the render thread; it is the same xchg pattern
- * as main.c's browser_buf_lock, but a separate lock so console/DOM updates never
+ * the main thread's render. A single mutex (dt_lk) guards the snapshot text
+ * and the console ring against the render thread; it is separate from
+ * browser_buf_lock so console/DOM updates never
  * serialise against the page buffers. The main thread only reads the prepared
  * snapshots and draws them. */
 #include "browser.h"
@@ -25,25 +25,11 @@
 #define CON_STYLE_ON 0x01
 #define CON_STYLE_OFF 0x02
 #include "layout.h" /* struct lbox: computed box geometry for the Styles box model */
+#include "mutex.h"
 
 /* --- the snapshot/console interlock (worker writes, main reads) ------------
  */
-static volatile int dt_lk;
-static inline int dt_xchg(volatile int *p, int v)
-{
-  __asm__ volatile("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
-  return v;
-}
-static void dt_lock(void)
-{
-  while (dt_xchg(&dt_lk, 1))
-    msleep(0);
-}
-static void dt_unlock(void)
-{
-  __asm__ volatile("" ::: "memory");
-  dt_lk = 0;
-}
+static mutex_t dt_lk;
 
 /* --- panel state -----------------------------------------------------------
  */
@@ -92,9 +78,9 @@ static int dt_sel = -1;       /* selected node's pre-order index (-1 = none)  */
 
 /* Selected-element highlight box for the page overlay, in DOCUMENT px (the main
  * thread translates by scroll and draws it). Computed by the worker OUTSIDE
- * dt_lock — browser_range_box takes browser_buf_lock, and render() already holds
+ * dt_lk — browser_range_box takes browser_buf_lock, and render() already holds
  * browser_buf_lock when it calls devtools_render() (lock order browser_buf->dt), so computing
- * it under dt_lock too would deadlock. Plain ints: a torn read just mis-paints
+ * it under dt_lk too would deadlock. Plain ints: a torn read just mis-paints
  * one frame of an overlay. dt_hl_active is written last (and read first) so
  * coords settle. */
 static volatile bool dt_hl_active;
@@ -153,7 +139,7 @@ static bool dt_find_init, dt_find_focused;
 
 /* Elements breadcrumb: the ancestor chain of the selected node (html › body ›
  * …), a clickable strip below the tree. The worker rebuilds it (DOM walk) under
- * dt_lock whenever the selection changes; the main thread draws it and maps a
+ * dt_lk whenever the selection changes; the main thread draws it and maps a
  * click on a segment back to that ancestor's pre-order index. */
 #define DT_CRUMB_MAX 24
 struct dt_crumb {
@@ -230,7 +216,7 @@ static int tb_line(const struct textblk *t, int i, char *out, int max)
 
 /* --- console ring ---------------------------------------------------------- *
  * A fixed circular buffer of lines, each a heap string + a level. The worker
- * appends; the main thread reads under dt_lock. A pending accumulator collects
+ * appends; the main thread reads under dt_lk. A pending accumulator collects
  * bytes between newlines (console.log sends a whole line, but write() chunks
  * are not guaranteed to land on a boundary). */
 #define CON_MAX 400
@@ -270,10 +256,10 @@ static int con_visible_count(void)
       c++;
   return c;
 }
-/* Drop every captured console line (the Clear button). Takes dt_lock itself. */
+/* Drop every captured console line (the Clear button). Takes dt_lk itself. */
 static void con_clear(void)
 {
-  dt_lock();
+  mutex_lock(&dt_lk);
   for (int i = 0; i < con_count; i++) {
     int s = (con_start + i) % CON_MAX;
     free(con[s].text);
@@ -285,7 +271,7 @@ static void con_clear(void)
   con_pend = 0;
   con_pend_len = con_pend_cap = 0;
   con_follow = true;
-  dt_unlock();
+  mutex_unlock(&dt_lk);
 }
 
 /* --- console REPL input (main thread) -------------------------------------- *
@@ -512,7 +498,7 @@ void devtools_console_append(int level, const char *s, int len)
    * page load (before the user opens devtools) would otherwise be lost, leaving
    * an empty console. The ring is a bounded static, so this can't grow
    * unbounded; only the repaint is gated on the panel being open. */
-  dt_lock();
+  mutex_lock(&dt_lk);
   for (int i = 0; i < len; i++) {
     char c = s[i];
     if (c == '\n') {
@@ -532,7 +518,7 @@ void devtools_console_append(int level, const char *s, int len)
     }
   }
   con_follow = true; /* a new line: jump to the bottom    */
-  dt_unlock();
+  mutex_unlock(&dt_lk);
   if (dt_open && dt_tab == TAB_CONSOLE)
     dt_paint_only = true; /* repaint only if visible */
 }
@@ -588,7 +574,7 @@ static char *dt_strdup(const char *s)
 
 void devtools_net_reset(void)
 {
-  dt_lock();
+  mutex_lock(&dt_lk);
   for (int i = 0; i < net_count; i++) {
     int s = (net_start + i) % NET_MAX;
     free(net[s].text);
@@ -598,7 +584,7 @@ void devtools_net_reset(void)
   net_start = 0;
   net_count = 0;
   dt_net_sel = -1;
-  dt_unlock();
+  mutex_unlock(&dt_lk);
   if (dt_open)
     B->seq++;
 }
@@ -690,7 +676,7 @@ static int net_level(const struct net_log *e)
 /* (Re)write ring slot `slot` — its list line + structured detail — from e,
  * freeing any prior heap strings. The slot's id is preserved (begin assigns it
  * once; update keeps it), so a pending row resolves in place. Caller holds
- * dt_lock. */
+ * dt_lk. */
 static void net_fill(int slot, const struct net_log *e)
 {
   char buf[URL_MAX + 200];
@@ -730,7 +716,7 @@ static void net_fill(int slot, const struct net_log *e)
 }
 
 /* Reserve the next ring slot, evicting the oldest when full. Caller holds
- * dt_lock. */
+ * dt_lk. */
 static int net_alloc_slot(void)
 {
   int slot;
@@ -754,7 +740,7 @@ static int net_alloc_slot(void)
   return slot;
 }
 
-/* Append a fresh request row from e and return its id. Caller holds dt_lock. */
+/* Append a fresh request row from e and return its id. Caller holds dt_lk. */
 static int net_push_e(const struct net_log *e)
 {
   int slot = net_alloc_slot();
@@ -775,18 +761,18 @@ static void net_repaint(void)
 
 void devtools_net_add(const struct net_log *e)
 {
-  dt_lock();
+  mutex_lock(&dt_lk);
   net_push_e(e);
-  dt_unlock();
+  mutex_unlock(&dt_lk);
   net_repaint();
 }
 
 int devtools_net_begin(const char *method, const char *url)
 {
   struct net_log e = {method, url, 0, 0, 0, 0, 0, NET_PENDING, 0};
-  dt_lock();
+  mutex_lock(&dt_lk);
   int id = net_push_e(&e);
-  dt_unlock();
+  mutex_unlock(&dt_lk);
   net_repaint();
   return id;
 }
@@ -796,7 +782,7 @@ int devtools_net_begin(const char *method, const char *url)
  * never lost. */
 void devtools_net_update(int id, const struct net_log *e)
 {
-  dt_lock();
+  mutex_lock(&dt_lk);
   int slot = -1;
   for (int i = 0; i < net_count; i++) {
     int s = (net_start + i) % NET_MAX;
@@ -809,7 +795,7 @@ void devtools_net_update(int id, const struct net_log *e)
     net_fill(slot, e);
   else
     net_push_e(e);
-  dt_unlock();
+  mutex_unlock(&dt_lk);
   net_repaint();
 }
 
@@ -934,7 +920,7 @@ static int hdr_line(const char *h, int idx, char *out, int max)
 
 /* --- per-tab view state (main thread, on tab switch) ---------------------- */
 
-/* Drop the current page's capture. Caller holds dt_lock (the rings + snapshots
+/* Drop the current page's capture. Caller holds dt_lk (the rings + snapshots
  * are shared with the worker/render threads). */
 static void dt_reset_content(void)
 {
@@ -1101,9 +1087,9 @@ void devtools_view_save(struct dt_view *v)
     c->sel = -1;
     c->net_sel = -1;
   }
-  dt_lock();
+  mutex_lock(&dt_lk);
   cap_swap(c); /* freeze the live capture into this tab's handle */
-  dt_unlock();
+  mutex_unlock(&dt_lk);
 }
 
 void devtools_view_load(const struct dt_view *v)
@@ -1115,14 +1101,14 @@ void devtools_view_load(const struct dt_view *v)
   dt_pick_last = -2; /* don't carry a pick across tabs */
   for (int i = 0; i < N_TABS; i++)
     dt_scroll[i] = v->scroll[i];
-  dt_lock();
+  mutex_lock(&dt_lk);
   if (v->cap)
     cap_swap((struct dt_cap *)v->cap); /* restore this tab's frozen capture */
   else {
     dt_reset_content();
     dt_sel = -1;
   } /* never captured: empty devtools     */
-  dt_unlock();
+  mutex_unlock(&dt_lk);
   dt_dirty = true; /* re-resolve crumbs/highlight against the restored tab's live DOM */
   B->seq++;
 }
@@ -1159,10 +1145,10 @@ void devtools_view_free(struct dt_view *v)
  * before the neighbour's capture is swapped in. */
 void devtools_reset_live(void)
 {
-  dt_lock();
+  mutex_lock(&dt_lk);
   dt_reset_content();
   dt_sel = -1;
-  dt_unlock();
+  mutex_unlock(&dt_lk);
 }
 
 /* --- DOM snapshot (worker thread) ----------------------------------------- */
@@ -1608,7 +1594,7 @@ static void style_emit_computed(struct dom_node *n)
 /* --- Application tab snapshot (worker thread; it owns cookie/HSTS writes) ----
  * * Cookies + HSTS-pinned hosts straight from the live jars
  * (B->cookies/B->hsts). Rebuilt in the worker tick like the DOM/Styles
- * snapshots, read under dt_lock. */
+ * snapshots, read under dt_lk. */
 
 /* A cheap FNV-1a content signature of the live cookie/HSTS jars. The jars have
  * no mutation counter (unlike the DOM), so the worker uses this to rebuild the
@@ -1836,7 +1822,7 @@ static int content_rows(int top); /* defined in the layout section below */
 
 /* Fill the page-overlay highlight (dt_hl_*) for element `sn`: its document-px
  * box from the laid-out line table + a "tag#id.class  WxH" label. Clears the
- * highlight when the node has no rendered box. MUST run outside dt_lock —
+ * highlight when the node has no rendered box. MUST run outside dt_lk —
  * browser_range_box takes browser_buf_lock and render() holds browser_buf_lock when it reads
  * dt_hl_* (lock order browser_buf->dt). Worker thread only. */
 static void dt_set_highlight(struct dom_node *sn)
@@ -1895,7 +1881,7 @@ static void crumb_label(struct dom_node *n, char *out, int cap)
 
 /* Rebuild the breadcrumb from the selected node up to the root (emitted
  * root-first), each segment carrying its pre-order index for click-to-select.
- * Caller holds dt_lock. */
+ * Caller holds dt_lk. */
 static void build_crumbs(struct dom_node *root, struct dom_node *sel)
 {
   dt_ncrumbs = 0;
@@ -1930,7 +1916,7 @@ static struct dom_node *pick_resolve(int off)
  * ends pick mode; otherwise the hovered element is highlighted on the page.
  * Hover only bumps seq when the target element changes, so sweeping the pointer
  * costs one DOM walk per tick (not a snapshot rebuild every frame). Runs
- * outside dt_lock. */
+ * outside dt_lk. */
 static void devtools_pick_tick(struct dom_node *root)
 {
   if (!root)
@@ -2001,7 +1987,7 @@ void devtools_worker_tick(void)
   if (!rebuild && !app_changed)
     return;
 
-  dt_lock();
+  mutex_lock(&dt_lk);
   if (rebuild) {
     if (root) { /* live page: rebuild Elements + Styles */
       tb_reset(&dt_dom);
@@ -2044,9 +2030,9 @@ void devtools_worker_tick(void)
       }
   }
   dt_dirty = false;
-  dt_unlock();
+  mutex_unlock(&dt_lk);
 
-  /* Selected-element highlight box (outside dt_lock; browser_range_box locks
+  /* Selected-element highlight box (outside dt_lk; browser_range_box locks
    * blk). While picking, the hover highlight owns dt_hl_* — don't clobber it
    * here. */
   if (rebuild && !dt_pick) {
@@ -2223,7 +2209,7 @@ static int content_rows(int top)
 }
 static int content_w(void) { return (BW - devtools_left()) - SCROLL_W; } /* panel minus scrollbar */
 
-/* Total scrollable line count of the active tab (read under dt_lock by caller).
+/* Total scrollable line count of the active tab (read under dt_lk by caller).
  */
 static int active_lines(void)
 {
@@ -2432,7 +2418,7 @@ void devtools_render(void)
   int left = devtools_left(), top = devtools_top();
   int w = BW - left, h = BH - top;
 
-  dt_lock();
+  mutex_lock(&dt_lk);
 
   gfx_fill_rect(left, top, w, h, 0x1e1e1e);      /* panel body */
   gfx_fill_rect(left, top, w, DT_HDR, 0x14171c); /* header row */
@@ -2727,13 +2713,13 @@ void devtools_render(void)
                             : 0xcdd3de,
                   GFX_TRANSPARENT);
   }
-  dt_unlock();
+  mutex_unlock(&dt_lk);
 }
 
 /* The logical Network row at screen-y `my`, accounting for line wrapping (a
  * long URL spans several physical rows). -1 if the click is below the last row.
  * Mirrors the render walk so the hit rect matches what was drawn. Caller holds
- * dt_lock. */
+ * dt_lk. */
 static int net_row_at(int my)
 {
   int top = devtools_top(), ct = content_top(top);
@@ -2769,7 +2755,7 @@ static void dt_find_next(int fresh)
   if (!dt_find[0])
     return;
   int rows = content_rows(devtools_top());
-  dt_lock();
+  mutex_lock(&dt_lk);
   int nl = dt_dom.nlines, start = 0, found = -1;
   if (nl > 0) {
     if (!fresh) /* "next": resume past the current match */
@@ -2789,7 +2775,7 @@ static void dt_find_next(int fresh)
     }
   }
   int node = (found >= 0 && found < dt_dom_node_cap) ? dt_dom_node[found] : -1;
-  dt_unlock();
+  mutex_unlock(&dt_lk);
   if (found >= 0) {
     dt_sel = node;
     int sc = found - rows / 2;
@@ -2867,7 +2853,7 @@ int devtools_handle_click(int mx, int my)
 
   if (crumb_h() && my >= BH - DT_INPUT_H - DT_CRUMB_H && my < BH - DT_INPUT_H) { /* breadcrumb */
     int cx = left + 6, hit = -1;
-    dt_lock();
+    mutex_lock(&dt_lk);
     for (int i = 0; i < dt_ncrumbs; i++) {
       if (i)
         cx += gfx_ui_width(DT_CRUMB_SEP);
@@ -2878,7 +2864,7 @@ int devtools_handle_click(int mx, int my)
       }
       cx += seg;
     }
-    dt_unlock();
+    mutex_unlock(&dt_lk);
     if (hit >= 0) {
       dt_sel = hit;
       dt_dirty = true;
@@ -2893,10 +2879,10 @@ int devtools_handle_click(int mx, int my)
       dt_net_filter = (dt_net_filter + 1) % NF_N; /* cycle the resource-type filter */
       dt_scroll[TAB_NETWORK] = 0;
       if (dt_net_sel >= 0) { /* close the detail if it's now hidden */
-        dt_lock();
+        mutex_lock(&dt_lk);
         if (dt_net_sel >= net_count || !net_pass_slot((net_start + dt_net_sel) % NET_MAX))
           dt_net_sel = -1;
-        dt_unlock();
+        mutex_unlock(&dt_lk);
       }
       B->seq++;
     }
@@ -2912,9 +2898,9 @@ int devtools_handle_click(int mx, int my)
   }
 
   int ct = content_top(top), rows = content_rows(top);
-  dt_lock();
+  mutex_lock(&dt_lk);
   int total = active_lines();
-  dt_unlock();
+  mutex_unlock(&dt_lk);
 
   int part = scrollbar_hit(BW - SCROLL_W, ct, SCROLL_W, content_bottom() - ct, mx, my);
   if (part != SCROLLBAR_NONE) { /* scrollbar (reused widget) */
@@ -2935,7 +2921,7 @@ int devtools_handle_click(int mx, int my)
   if (mx < BW - SCROLL_W && dt_tab == TAB_ELEMENTS) { /* select a DOM node, or toggle its ▸/▾ */
     int row = dt_scroll[dt_tab] + (my - ct) / ROW_H;
     int cell = (mx - (left + 6)) / GLYPH_W; /* monospace column of the click */
-    dt_lock();
+    mutex_lock(&dt_lk);
     bool ok = row >= 0 && row < dt_dom.nlines && row < dt_dom_node_cap;
     int node = ok ? dt_dom_node[row] : -1;
     int tri = -1; /* cell of this row's ▸/▾, or -1 */
@@ -2949,15 +2935,15 @@ int devtools_handle_click(int mx, int my)
           ((unsigned char)lb[sp + 2] == 0xba || (unsigned char)lb[sp + 2] == 0xbc))
         tri = sp;
     }
-    dt_unlock();
+    mutex_unlock(&dt_lk);
     if (ok) {
       /* toggle_collapsed reallocs dt_collapsed, which the worker reads under
-       * dt_lock in dom_emit->is_collapsed — take the lock so we can't free it
+       * dt_lk in dom_emit->is_collapsed — take the lock so we can't free it
        * out from under a concurrent snapshot walk. */
       if (tri >= 0 && cell >= 0 && cell <= tri + 1) {
-        dt_lock();
+        mutex_lock(&dt_lk);
         toggle_collapsed(node);
-        dt_unlock();
+        mutex_unlock(&dt_lk);
       } /* hit the triangle */
       else
         dt_sel = node;
@@ -2967,9 +2953,9 @@ int devtools_handle_click(int mx, int my)
   }
 
   if (mx < BW - SCROLL_W && dt_tab == TAB_NETWORK) { /* expand / collapse a request row */
-    dt_lock();
+    mutex_lock(&dt_lk);
     int row = net_row_at(my);
-    dt_unlock();
+    mutex_unlock(&dt_lk);
     if (row >= 0) {
       dt_net_sel = (dt_net_sel == row) ? -1 : row;
       dt_nd_scroll = 0;
@@ -3006,9 +2992,9 @@ int devtools_handle_scroll(int delta)
       cols = 255;
     if (cols < 1)
       cols = 1;
-    dt_lock();
+    mutex_lock(&dt_lk);
     int maxstart = dt_tab == TAB_CONSOLE ? con_ftail(rows, cols) : net_ftail(rows, cols);
-    dt_unlock();
+    mutex_unlock(&dt_lk);
     next = prev - delta * 3;
     if (next > maxstart)
       next = maxstart;
@@ -3017,9 +3003,9 @@ int devtools_handle_scroll(int delta)
     if (dt_tab == TAB_CONSOLE)
       con_follow = (next >= maxstart);
   } else {
-    dt_lock();
+    mutex_lock(&dt_lk);
     int total = active_lines();
-    dt_unlock();
+    mutex_unlock(&dt_lk);
     next = clamp_scroll(prev - delta * 3, total, rows);
   }
   if (next != prev) {

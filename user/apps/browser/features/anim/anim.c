@@ -12,11 +12,9 @@
 #include "owos.h"
 #include <stdbool.h>
 
-#define ANIM_RECS 128
-
 struct anim_rec {
-  struct dom_node *node; /* key; 0 = free slot */
-  unsigned last_seen;    /* frame counter, for LRU reclamation */
+  struct dom_node *node; /* owner; node->anim_rec points back here */
+  int slot;              /* index in g_recs */
 
   /* running @keyframes animation */
   bool kf_running;
@@ -34,46 +32,58 @@ struct anim_rec {
   int tr_dur, tr_delay, tr_timing;
 };
 
-static struct anim_rec g_recs[ANIM_RECS];
-static unsigned g_frame; /* bumped each walk */
-static bool g_more;      /* a frame is still due */
+static struct anim_rec **g_recs;
+static int g_nrecs, g_recs_cap;
+static bool g_more; /* a frame is still due */
+
+static void rec_free(struct anim_rec *r)
+{
+  struct anim_rec *last = g_recs[--g_nrecs];
+  g_recs[r->slot] = last;
+  last->slot = r->slot;
+  r->node->anim_rec = 0;
+  free(r);
+}
+
+/* A node is going away: drop its record so a reused address starts blank. */
+static void rec_forget(struct dom_node *n) { rec_free(n->anim_rec); }
 
 void anim_reset(void)
 {
-  for (int i = 0; i < ANIM_RECS; i++)
-    g_recs[i].node = 0;
-  g_frame = 0;
+  while (g_nrecs)
+    rec_free(g_recs[g_nrecs - 1]);
   g_more = false;
 }
 
 void anim_frame_begin(unsigned now)
 {
   (void)now;
-  g_frame++;
   g_more = false;
 }
 
 int anim_active(void) { return g_more; }
 
-/* Find `node`'s record, or claim a slot for it (a free one, else the least
- * recently seen). A reclaimed slot starts blank so its stale timers don't
- * apply. */
+/* The node's record, created on first use; NULL on OOM (the node is not animated). */
 static struct anim_rec *rec_for(struct dom_node *node)
 {
-  struct anim_rec *free_slot = 0, *lru = &g_recs[0];
-  for (int i = 0; i < ANIM_RECS; i++) {
-    struct anim_rec *r = &g_recs[i];
-    if (r->node == node)
-      return r;
-    if (!r->node && !free_slot)
-      free_slot = r;
-    if (r->node && r->last_seen < lru->last_seen)
-      lru = r;
+  if (node->anim_rec)
+    return node->anim_rec;
+  if (g_nrecs == g_recs_cap) {
+    int nc = g_recs_cap ? g_recs_cap * 2 : 16;
+    struct anim_rec **nr = realloc(g_recs, (unsigned)nc * sizeof *nr);
+    if (!nr)
+      return 0;
+    g_recs = nr;
+    g_recs_cap = nc;
   }
-  struct anim_rec *r = free_slot ? free_slot : lru;
-  struct anim_rec blank = {0};
-  *r = blank;
+  struct anim_rec *r = calloc(1, sizeof *r);
+  if (!r)
+    return 0;
   r->node = node;
+  r->slot = g_nrecs;
+  g_recs[g_nrecs++] = r;
+  node->anim_rec = r;
+  dom_on_free_anim = rec_forget;
   return r;
 }
 
@@ -502,19 +512,9 @@ void anim_apply(css_sheet *sheet, struct dom_node *el, struct css_style *cs, uns
 
   /* No animation, no transition, and nothing already running for this node:
    * skip the bookkeeping entirely (the common case for most elements). */
-  struct anim_rec *r = 0;
-  if (wants_anim || wants_trans)
-    r = rec_for(el);
-  else {
-    for (int i = 0; i < ANIM_RECS; i++)
-      if (g_recs[i].node == el) {
-        r = &g_recs[i];
-        break;
-      }
-    if (!r)
-      return;
-  }
-  r->last_seen = g_frame;
+  struct anim_rec *r = (wants_anim || wants_trans) ? rec_for(el) : el->anim_rec;
+  if (!r)
+    return;
 
   /* The freshly-cascaded animatable values are the transition baseline. */
   struct css_style newbase = *cs;

@@ -305,27 +305,12 @@ struct browser {
   unsigned char img_pool[IMG_POOL];
   int img_pool_len;
 
-  /* Word-wrap line table — render scratch for the active page (rebuilt by
-   * rewrap() from B->pg->text at the live width on every active repaint). With
-   * box layout on, line_x/line_w are the per-line content origin + width the
-   * box tree placed the line at; in flat mode they are the fixed 4 / pane
-   * width. */
-  int *line_off;
-  int *line_len;
-  int *line_x;
-  int *line_w;
-  int *line_y;  /* per-line document-pixel top (running sum of heights) */
-  int *line_h;  /* per-line pixel height                                */
-  int *line_px; /* largest effective glyph size per line                */
-  int nlines, line_cap;
+  /* Layout state. The word-wrap line table and flex/grid item text live in
+   * main.c (struct layout_out): the worker builds the next layout off to the
+   * side and swaps it in under browser_buf_lock; render() reads the live one. */
   int wrap_cols;
   int layout_dirty; /* 1 = box tree/text changed, re-wrap needed (NOT bumped by
                        scroll) */
-
-  /* Flex-row item text (see struct fslice), rebuilt with the line table and
-   * drawn over the reserved band; never freed (grows like the line table). */
-  struct fslice *fslices;
-  int n_fslices, fslice_cap;
 
   int sb_drag;
   unsigned seq;
@@ -339,31 +324,33 @@ struct browser {
    * main thread fills these + sets evt_pending; the worker resolves the node,
    * runs listeners, relays out, and navigates if the default wasn't prevented.
    */
-  volatile int evt_pending;  /* 1 = an event is queued for the worker      */
-  int evt_off;               /* text offset the click resolved to          */
-  int evt_x, evt_y;          /* viewport-relative coords (event.clientX/Y)  */
-  char evt_type[16];         /* "click", "input", "change", ...            */
-  char evt_text[URL_MAX];    /* payload: the link href for click default,
-                              * or the new field value for input/change    */
-  volatile int drop_dom;     /* main asks the worker to free the live page  */
-  volatile int drop_dom_tab; /* the tab that owned the DOM being torn down, so
-                              * a teardown fault is blamed on it and not on
-                              * whatever tab B->pg was swapped to meanwhile   */
-  volatile int worker_pause; /* main -> worker: park at the top of the loop so
-                              * the page set (B->pg / active_tab / tabs[]) can
-                              * be mutated with the worker guaranteed idle */
-  volatile int worker_idle;  /* worker -> main: parked, safe to mutate the set */
-  volatile int recascade;    /* main asks the worker to re-run the cascade
-                              * (window resized → @media may change)        */
-  volatile int want_paw;     /* main -> worker: current content-pane pixel
-                              * width. The worker owns the line-table flow
-                              * (rewrap); the main thread only paints, so it
-                              * never blocks the event loop on a big reflow.  */
-  volatile int events_live;  /* worker -> main: page has listeners, so the
-                              * main thread should route clicks as events   */
-  volatile int focus_kind;   /* worker -> main: 0 none, 1 text input,
-                              * 2 textarea — so the main thread routes keys
-                              * to the focused control instead of the addr bar */
+  volatile int evt_pending;    /* 1 = an event is queued for the worker      */
+  int evt_off;                 /* text offset the click resolved to          */
+  int evt_x, evt_y;            /* viewport-relative coords (event.clientX/Y)  */
+  char evt_type[16];           /* "click", "input", "change", ...            */
+  char evt_text[URL_MAX];      /* payload: the link href for click default,
+                                * or the new field value for input/change    */
+  volatile int drop_dom;       /* main asks the worker to free the live page  */
+  volatile int drop_dom_tab;   /* the tab that owned the DOM being torn down, so
+                                * a teardown fault is blamed on it and not on
+                                * whatever tab B->pg was swapped to meanwhile   */
+  volatile int worker_pause;   /* main -> worker: park at the top of the loop so
+                                * the page set (B->pg / active_tab / tabs[]) can
+                                * be mutated with the worker guaranteed idle */
+  volatile int worker_idle;    /* worker -> main: parked, safe to mutate the set */
+  volatile int recascade;      /* main asks the worker to re-run the cascade
+                                * (window resized → @media may change)        */
+  volatile unsigned resize_ms; /* main: msec() of the latest resize event, so the
+                                * worker cascades once the size settles        */
+  volatile int want_paw;       /* main -> worker: current content-pane pixel
+                                * width. The worker owns the line-table flow
+                                * (rewrap); the main thread only paints, so it
+                                * never blocks the event loop on a big reflow.  */
+  volatile int events_live;    /* worker -> main: page has listeners, so the
+                                * main thread should route clicks as events   */
+  volatile int focus_kind;     /* worker -> main: 0 none, 1 text input,
+                                * 2 textarea; so the main thread routes keys
+                                * to the focused control instead of the addr bar */
 
   /* the History API, wired to the real per-tab back/forward history. JS runs on
    * the worker; these let it drive the main thread's history (which owns the
@@ -436,7 +423,7 @@ static inline void uapp(char *d, int *n, int cap, unsigned v)
 
 /* --- growable buffers + the realloc/render interlock (buffers.c) ----------- *
  * Each browser_ensure_*(need) grows the matching B buffer so it holds at least `need`
- * elements (bytes, or entries for lines/links/imgs), reallocating ~1.5x and
+ * elements (bytes, or entries for links/imgs), reallocating ~1.5x and
  * never shrinking. They return 1 on success, 0 if the heap is exhausted — a
  * caller that gets 0 stops appending, so an out-of-memory page is truncated
  * gracefully instead of overrunning. text/attr grow together to a shared cap.
@@ -447,15 +434,12 @@ static inline void uapp(char *d, int *n, int cap, unsigned v)
  * that MOVES a buffer is dangerous. So browser_ensure_raw/text/img_pool/links/imgs take
  * browser_buf_lock around the realloc, and render() (plus the click hit-test) hold
  * browser_buf_lock while they read — serialising the move against any in-flight read.
- * browser_ensure_lines is unlocked: the line table is written and read only by the main
- * thread. */
+ * The line table is not one of these buffers: it is double-buffered in main.c. */
 int browser_ensure_raw(int need);
 int browser_grow_cap(int cap, int init, int need);
 int browser_ensure_text(int need);
 int browser_ensure_links(int need);
 int browser_ensure_imgs(int need);
-int browser_ensure_lines(int need);
-void browser_ov_add(int row, int off, int len, int x, int w, int h, int maxpx);
 unsigned *browser_surface(void);
 int browser_surface_ready(void);
 void browser_present(int id);

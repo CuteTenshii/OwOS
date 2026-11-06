@@ -291,6 +291,9 @@ int css_pseudo_content(css_sheet *sheet, const struct dom_node *el, int which, s
  * per-element pseudo-element cascade entirely when none exist. */
 int css_sheet_has_pseudo(const css_sheet *sheet);
 
+/* Bumped by every css_add; with css_viewport_generation() it keys cached styles. */
+unsigned css_sheet_generation(const css_sheet *sheet);
+
 /* @keyframes lookup for the animation engine (anim.c). A block is an opaque set
  * of stops, each an offset (permille 0..1000) + a declaration delta. */
 struct css_keyframes;

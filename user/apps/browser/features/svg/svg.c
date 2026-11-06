@@ -276,11 +276,29 @@ struct ras {
   float *px, *py;
   int np, cap; /* current path's points */
   int *sub;
-  int ns, csub;   /* subpath start indices */
-  int cur_color;  /* what currentColor resolves to (0xRRGGBB)  */
-  float xs[1024]; /* per-render scanline x-crossings scratch    */
-  int wd[1024];   /* winding direction for each crossing        */
+  int ns, csub;  /* subpath start indices */
+  int cur_color; /* what currentColor resolves to (0xRRGGBB)  */
+  float *xs;     /* per-render scanline x-crossings scratch    */
+  int *wd;       /* winding direction for each crossing        */
+  int xcap;
 };
+
+static bool ras_room_for_crossing(struct ras *r, int n)
+{
+  if (n < r->xcap)
+    return true;
+  int nc = r->xcap ? r->xcap * 2 : 256;
+  float *nx = realloc(r->xs, (unsigned)nc * sizeof *nx);
+  if (nx)
+    r->xs = nx;
+  int *nw = realloc(r->wd, (unsigned)nc * sizeof *nw);
+  if (nw)
+    r->wd = nw;
+  if (!nx || !nw)
+    return false;
+  r->xcap = nc;
+  return true;
+}
 
 static bool ras_pt(struct ras *r, float x, float y)
 {
@@ -355,7 +373,7 @@ static void fill_path(struct ras *r, int rgb, bool evenodd)
   for (int y = y0; y < y1; y++) {
     float yc = y + 0.5f;
     int nx = 0;
-    for (int s = 0; s < r->ns && nx < 1024; s++) {
+    for (int s = 0; s < r->ns; s++) {
       int a = r->sub[s];
       int b = (s + 1 < r->ns) ? r->sub[s + 1] : r->np;
       int cnt = b - a;
@@ -366,11 +384,13 @@ static void fill_path(struct ras *r, int rgb, bool evenodd)
         float ya = r->py[i0], yb = r->py[i1];
         if ((ya <= yc && yb > yc) || (yb <= yc && ya > yc)) {
           float t = (yc - ya) / (yb - ya);
-          if (nx < 1024) {
-            xs[nx] = r->px[i0] + t * (r->px[i1] - r->px[i0]);
-            wd[nx] = (yb > ya) ? 1 : -1;
-            nx++;
-          }
+          if (!ras_room_for_crossing(r, nx))
+            continue;
+          xs = r->xs;
+          wd = r->wd;
+          xs[nx] = r->px[i0] + t * (r->px[i1] - r->px[i0]);
+          wd[nx] = (yb > ya) ? 1 : -1;
+          nx++;
         }
       }
     }
@@ -959,6 +979,9 @@ int svg_render(const char *data, int len, int w, int h, unsigned *out, unsigned 
   r.px = r.py = 0;
   r.np = r.cap = 0;
   r.sub = 0;
+  r.xs = 0;
+  r.wd = 0;
+  r.xcap = 0;
   r.ns = r.csub = 0;
   r.w = dw;
   r.h = dh;
@@ -1012,6 +1035,8 @@ int svg_render(const char *data, int len, int w, int h, unsigned *out, unsigned 
   free(r.px);
   free(r.py);
   free(r.sub);
+  free(r.xs);
+  free(r.wd);
   dom_free(root);
   return 1;
 }

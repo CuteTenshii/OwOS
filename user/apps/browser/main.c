@@ -18,9 +18,99 @@
 #include "features/media/bmedia.h"        /* <audio>/<video> controls widget + playback state */
 #include "font.h"                         /* custom @font-face faces (user/lib/font) */
 #include "layout.h"                       /* the CSS box tree (backgrounds/borders behind the text) */
+#include "render_util.h"                  /* gradient/image/glyph caches, scroll + paint-order helpers */
 
 static struct browser binst;
 struct browser *B = &binst;
+
+/* The word-wrap line table: per display line source offset/length, content
+ * origin, width, document-pixel top, height and largest glyph size. */
+struct ltab {
+  int *off, *len, *x, *w, *y, *h, *px;
+  int n, cap;
+};
+
+struct lgeom {
+  int x, y, w, h, cx, cy, cw, ch;
+};
+
+struct lmedia {
+  struct media_el *me;
+  int row, rows;
+};
+
+/* One complete layout result. The worker builds the next one in g_bk without
+ * holding browser_buf_lock, then swaps it with g_fr under a short lock; render()
+ * only ever reads g_fr. */
+struct layout_out {
+  struct ltab lt;
+  struct fslice *fs; /* flex/grid item text over reserved bands */
+  int n_fs, cap_fs;
+  struct lgeom *geo; /* per-box geometry, indexed like the box pool */
+  int n_geo, cap_geo;
+  int *img_pos, *img_row, *img_rows; /* per inline image: anchor, first row, rows (-1 = unchanged) */
+  int n_img, cap_img;
+  struct lmedia *med;
+  int n_med, cap_med;
+  struct ru_bands bands;
+  int doc_h;
+  int over; /* furthest a glyph can spill below its line box, px */
+};
+static struct layout_out g_lo[2];
+static struct layout_out *g_fr = &g_lo[0]; /* what render() paints */
+static struct layout_out *g_bk = &g_lo[1]; /* what rewrap() builds */
+
+/* realloc a typed array to hold `need` elements; NULL on failure (the old array stays valid). */
+static void *grow_arr(void *p, int *cap, int need, unsigned esz)
+{
+  if (need <= *cap)
+    return p;
+  int nc = browser_grow_cap(*cap, 64, need);
+  void *np = realloc(p, (unsigned long)nc * esz);
+  if (np)
+    *cap = nc;
+  return np;
+}
+
+static bool lt_ensure(struct ltab *t, int need)
+{
+  if (need <= t->cap)
+    return true;
+  int nc = browser_grow_cap(t->cap, LINES_INIT, need);
+  int **col[7] = {&t->off, &t->len, &t->x, &t->w, &t->y, &t->h, &t->px};
+  int *np[7];
+  bool ok = true;
+  for (int i = 0; i < 7; i++) {
+    np[i] = realloc(*col[i], (unsigned long)nc * sizeof(int));
+    ok = ok && np[i];
+  }
+  for (int i = 0; i < 7; i++)
+    if (np[i])
+      *col[i] = np[i];
+  if (ok)
+    t->cap = nc;
+  return ok;
+}
+
+static int lt_bottom(const struct ltab *t, int i) { return (i >= 0 && i < t->n) ? t->y[i] + t->h[i] : 0; }
+static int lt_doc_px(const struct ltab *t) { return t->n > 0 ? lt_bottom(t, t->n - 1) : 0; }
+
+/* The line whose band contains document-pixel `y` (clamped to a real line). */
+static int lt_line_at(const struct ltab *t, int y)
+{
+  int lo = 0, hi = t->n - 1, ans = 0;
+  if (hi < 0 || y <= 0)
+    return 0;
+  while (lo <= hi) { /* last line with y <= target */
+    int mid = (lo + hi) / 2;
+    if (t->y[mid] <= y) {
+      ans = mid;
+      lo = mid + 1;
+    } else
+      hi = mid - 1;
+  }
+  return ans;
+}
 
 /* Content-pane text selection (drag to select, Ctrl+C to copy). The gfx_sel
  * model works in (display-line, byte-in-line) coordinates; g_selecting is set
@@ -280,6 +370,13 @@ static void tab_leave(int i)
 
 /* --- worker thread: drains req_pending, fetches, bumps seq for the UI ----- */
 static void rewrap(int paw); /* line-table flow; owned by the worker (see below) */
+static unsigned layout_sig(int paw);
+static void layout_keep(void);
+static unsigned g_lay_sig; /* layout_sig of the layout currently on screen */
+
+#define RESIZE_SETTLE_MS 50 /* cascade once the window size has been stable this long */
+#define RESIZE_MAX_MS 100   /* ...or at least this often during a continuous drag */
+
 /* 256 KiB: http_txn holds hdr[4096] + req[2048] + a cookie buffer, and the
  * redirect follower stacks several URL_MAX (2 KiB) scratch URLs. But the deeper
  * consumer is the recursive DOM render walk (walk_element_inner): it carries a
@@ -547,7 +644,7 @@ static void worker_fn(void)
     B->evt_pending = 0;
     B->events_live = 0;
     B->pg->text_len = 0;
-    B->nlines = 0; /* the sad-tab page ignores these */
+    g_fr->lt.n = 0; /* the sad-tab page ignores these */
     B->seq++;
     if (!worker_in_recovery) {
       /* First fault for this page: reclaim its DOM/JS heap. Guarded — if the
@@ -561,6 +658,7 @@ static void worker_fn(void)
     }
   }
 
+  unsigned cascade_ms = 0;
   for (;;) {
     if (worker_quit)
       exit(0);
@@ -590,12 +688,16 @@ static void worker_fn(void)
       worker_tab = B->drop_dom_tab;
       html_page_teardown();
     }
-    if (B->recascade) { /* window resized: re-run the cascade  */
-      B->recascade = 0;
-      html_relayout(); /* re-evaluates @media at the new size */
-      if (B->pg->n_imgs > 0)
-        fetch_inline_images(B->pg->cur_url);
-      B->seq++;
+    if (B->recascade) { /* window resized: re-run the cascade once the size settles */
+      unsigned now = msec();
+      if (now - B->resize_ms >= RESIZE_SETTLE_MS || now - cascade_ms >= RESIZE_MAX_MS) {
+        B->recascade = 0;
+        cascade_ms = now;
+        html_relayout(); /* re-evaluates @media at the new size */
+        if (B->pg->n_imgs > 0)
+          fetch_inline_images(B->pg->cur_url);
+        B->seq++;
+      }
     }
     if (B->req_pending) {
       B->req_pending = 0;
@@ -669,7 +771,12 @@ static void worker_fn(void)
      * the next frame. The loop's msleep(30) below paces this to ~30fps; when
      * nothing is animating anim_active() is false and no work is done. */
     if (!B->loading && anim_active()) {
+      bool settled = !B->layout_dirty && B->want_paw > 0 && B->wrap_cols == B->want_paw;
       html_relayout();
+      if (B->pg->n_imgs > 0)
+        fetch_inline_images(B->pg->cur_url);
+      if (settled && layout_sig(B->want_paw) == g_lay_sig)
+        layout_keep(); /* only paint properties moved: reuse the line table */
       B->seq++;
     }
 
@@ -695,12 +802,10 @@ static void worker_fn(void)
      * it off the main thread means render() only paints the built table and the
      * event loop never stalls ("Not Responding"). Re-flow when the box
      * tree/text changed (layout_dirty) or the main thread published a new width
-     * (resize). Held under browser_buf_lock so render() never observes a half-built
-     * table. */
+     * (resize). The result is built off to the side and swapped in under a short
+     * browser_buf_lock, so render() never waits on the layout. */
     if (B->want_paw > 0 && (B->layout_dirty || B->wrap_cols != B->want_paw)) {
-      browser_buf_lock();
       rewrap(B->want_paw);
-      browser_buf_unlock();
       B->seq++;
     }
     bookmarks_flush(); /* persist a changed bookmarks tree (deferred) */
@@ -717,141 +822,142 @@ static void worker_fn(void)
 #define LINE_H UIFONT_H
 
 /* --- body font: the baked proportional UI font, OR a page @font-face --------
- * * When the page loads a usable @font-face and applies it to the body
- * (B->body_ font != NULL), body text is drawn with that custom face via
- * user/lib/font; otherwise it falls back to the baked gfx_ui font. Custom
- * glyphs are rasterized on demand and cached per ASCII codepoint (the body text
- * is folded to 7-bit), at a fixed pixel size, so a repaint only blits. The
- * cache is main-thread-only; B->pg->body_font is swapped by the worker under
- * browser_buf_lock (see html.c). */
-/* B->pg->text holds UTF-8; the renderer decodes a codepoint at a time via the
- * shared utf8_decode/utf8_seqlen (user/lib). Per-codepoint glyph cache for the
- * active direct-mapped table (evict on collision, so a CJK page with hundreds
- * of glyphs stays bounded and a repaint only blits). Main-thread-only;
- * B->pg->body_font is swapped by the worker under browser_buf_lock (see html.c). */
+ * When the page loads a usable @font-face and applies it to the body
+ * (B->pg->body_font != NULL), body text is drawn with that custom face via
+ * user/lib/font; otherwise it falls back to the baked gfx_ui font. B->pg->text
+ * holds UTF-8; the renderer decodes a codepoint at a time via the shared
+ * utf8_decode/utf8_seqlen (user/lib).
+ *
+ * Two contexts keep the layout thread and the paint thread off each other's
+ * caches: g_ui (main thread: paint + hit-testing) and g_wk (worker: layout).
+ * Each holds the block state set by set_block, an advance cache keyed by
+ * (codepoint, px), and, for g_ui, a glyph bitmap cache keyed the same way. */
 #define BODY_PX 15.0f
-#define GCACHE_N 1024
-struct gcache {
-  unsigned cp;
-  unsigned char *bm;
-  int w, h, ox, oy, adv;
-  bool valid;
+#define GT_BITMAP_BUDGET (3ul << 20)
+#define GT_ADV_MAX 65536
+
+struct bctx {
+  int bpx;     /* heading px, 0 = default body font   */
+  bool bmono;  /* <pre>: render in the monospace cell */
+  int bcenter; /* text-align:center / <center>        */
+  int bindent; /* indent level 0..7                   */
+  bool bhr;    /* this line is a horizontal rule      */
+  int blh;     /* CSS line-height px at the line start, 0 = auto */
+  struct ru_gtab at;
+  struct ru_gtab gt;
+  struct font *gf; /* the face the caches currently hold */
+  bool worker;     /* misses touch the shared gfx caches, so they take browser_buf_lock */
+  bool held;       /* the caller already holds browser_buf_lock */
 };
-static struct gcache g_glyph[GCACHE_N];
-static struct font *g_gf; /* the face the cache currently holds */
-static int g_baseline;    /* baseline offset (px) within a line */
+static struct bctx g_ui = {.gt = {.budget = GT_BITMAP_BUDGET}};
+static struct bctx g_wk = {.worker = true};
+static struct ru_gent g_gscratch; /* stand-in glyph when the cache can't grow */
 
-static void gcache_sync(void)
+static void gcache_sync(struct bctx *c)
 {
-  if (g_gf == B->pg->body_font)
+  if (c->gf == B->pg->body_font)
     return;
-  for (int i = 0; i < GCACHE_N; i++) {
-    free(g_glyph[i].bm);
-    g_glyph[i].bm = 0;
-    g_glyph[i].valid = 0;
-  }
-  g_gf = B->pg->body_font;
-  if (g_gf) {
-    int asc = 0;
-    font_vmetrics(g_gf, BODY_PX, &asc, 0, 0);
-    g_baseline = asc;
-  }
+  ru_gtab_clear(&c->at);
+  ru_gtab_clear(&c->gt);
+  c->gf = B->pg->body_font;
 }
 
-static struct gcache *gcache_get(unsigned cp)
+/* Bitmap + advance of one glyph at `px` in the page font (g_ui only). */
+static const struct ru_gent *gcache_get(struct bctx *c, unsigned cp, int px)
 {
-  struct gcache *g = &g_glyph[cp & (GCACHE_N - 1)];
-  if (g->valid && g->cp == cp)
+  struct ru_gent *g = ru_gtab_find(&c->gt, cp, (unsigned)px);
+  if (g)
     return g;
-  if (g->valid) {
-    free(g->bm);
-    g->bm = 0;
-  }
+  struct ru_gent n = {.cp = cp, .px = (unsigned)px};
   int gi = font_glyph_index(B->pg->body_font, (int)cp);
-  g->bm = font_render_glyph(B->pg->body_font, gi, BODY_PX, &g->w, &g->h, &g->ox, &g->oy, &g->adv);
-  g->cp = cp;
-  g->valid = 1;
-  return g;
+  n.bm = font_render_glyph(B->pg->body_font, gi, (float)px, &n.w, &n.h, &n.ox, &n.oy, &n.adv);
+  if ((g = ru_gtab_put(&c->gt, &n)))
+    return g;
+  free(n.bm);
+  n.bm = 0;
+  g_gscratch = n;
+  return &g_gscratch;
 }
 
-/* Heading pixel sizes (BP_SIZE 1..6 = h1..h6); 0 = ordinary body text, 7 = a
- * horizontal rule. Kept within LINE_H (18) so a taller heading still fits one
- * row — headings also come bold (stamped in html.c), which carries the weight.
- */
-static const int g_size_px[8] = {0, 18, 17, 16, 15, 14, 13, 0};
-
-/* Block context for the paragraph currently being measured/drawn, decoded from
- * a glyph's BP_* byte by set_block(): a heading px (0 = default UI font),
- * monospace
- * (<pre>), centring, and an indent level (blockquote/list nesting). */
-static int cur_bpx;     /* heading px, 0 = default body font   */
-static bool cur_bmono;  /* <pre>: render in the monospace cell */
-static int cur_bcenter; /* text-align:center / <center>        */
-static int cur_bindent; /* indent level 0..7                   */
-static bool cur_bhr;    /* this line is a horizontal rule      */
-static int cur_blh;     /* CSS line-height px at the line start, 0 = auto */
+/* Pen advance of one codepoint, uncached. px 0 = the default body size. */
+static int adv_measure(unsigned cp, int px)
+{
+  if (!B->pg->body_font) /* the gfx system-ui font */
+    return px ? gfx_ui_cw_cp_px(cp, px) : gfx_ui_cw_cp(cp);
+  int gi = font_glyph_index(B->pg->body_font, (int)cp);
+  int adv = 0;
+  if (px && px != (int)BODY_PX) { /* sized run: advance at px */
+    font_glyph_hmetrics(B->pg->body_font, gi, (float)px, &adv, 0);
+    return adv;
+  }
+  int w, h, ox, oy;
+  free(font_render_glyph(B->pg->body_font, gi, BODY_PX, &w, &h, &ox, &oy, &adv));
+  return adv;
+}
 
 /* Indent width in pixels for one nesting level. */
 #define INDENT_PX 24
 
-static void set_block(int off)
+/* Block context for the paragraph about to be measured/drawn, decoded from a
+ * glyph's BP_* byte: a heading px (0 = default UI font), monospace (<pre>),
+ * centring, and an indent level (blockquote/list nesting). */
+static void set_block(struct bctx *c, int off)
 {
   int inb = (off >= 0 && off < B->pg->text_len);
   unsigned char bp = inb ? B->pg->bp[off] : 0;
-  int fpx = inb ? B->pg->fsz[off] : 0; /* CSS font-size px (0 = unset) */
-  int size = bp & BP_SIZE;
-  cur_bhr = (size == 7);
-  cur_bpx = fpx ? fpx : ((size >= 1 && size <= 6) ? g_size_px[size] : 0);
-  cur_bmono = (bp & BP_MONO) != 0;
-  cur_bcenter = inb && B->pg->align ? B->pg->align[off] : ((bp & BP_CENTER) ? 1 : 0);
-  cur_bindent = (bp & BP_INDENT) >> BP_INDENT_SH;
-  cur_blh = inb ? B->pg->lh[off] : 0;
+  c->bhr = ((bp & BP_SIZE) == 7);
+  c->bpx = ru_glyph_px(inb ? B->pg->fsz[off] : 0, bp);
+  c->bmono = (bp & BP_MONO) != 0;
+  c->bcenter = inb && B->pg->align ? B->pg->align[off] : ((bp & BP_CENTER) ? 1 : 0);
+  c->bindent = (bp & BP_INDENT) >> BP_INDENT_SH;
+  c->blh = inb ? B->pg->lh[off] : 0;
 }
 
-/* Per-glyph resolved font-size px (0 = default body) — like set_block's cur_bpx
+/* Per-glyph resolved font-size px (0 = default body); like set_block's bpx
  * but for one glyph, so a line with mixed inline sizes measures/draws each run
  * right. */
 static int glyph_px(int off)
 {
   if (off < 0 || off >= B->pg->text_len)
     return 0;
-  int f = B->pg->fsz[off];
-  if (f)
-    return f;
-  int sz = B->pg->bp[off] & BP_SIZE;
-  return (sz >= 1 && sz <= 6) ? g_size_px[sz] : 0;
+  return ru_glyph_px(B->pg->fsz[off], B->pg->bp[off]);
 }
+
+/* Raw, non-HTML content (text/plain, source, etc.) renders in the fixed-width
+ * monospace cell font, not the proportional UI font — only HTML gets the
+ * latter. A <pre> block (bmono) is monospace too, even inside an HTML page.
+ */
+static bool body_mono(const struct bctx *c) { return B->pg->mode == MODE_TEXT || c->bmono; }
 
 /* Pen advance of one codepoint in the active body font (baked UI font when no
  * custom face: ASCII/Latin-1 by value, a '?'-width box for anything above it).
  */
-/* Raw, non-HTML content (text/plain, source, etc.) renders in the fixed-width
- * monospace cell font, not the proportional UI font — only HTML gets the
- * latter. A <pre> block (cur_bmono) is monospace too, even inside an HTML page.
- */
-static bool body_mono(void) { return B->pg->mode == MODE_TEXT || cur_bmono; }
-
-static int body_cp_adv(unsigned cp, int px)
+static int body_cp_adv(struct bctx *c, unsigned cp, int px)
 {
-  if (body_mono())
-    return GLYPH_W;      /* monospace cell             */
-  if (!B->pg->body_font) /* the gfx system-ui font     */
-    return px ? gfx_ui_cw_cp_px(cp, px) : gfx_ui_cw_cp(cp);
-  if (px && px != (int)BODY_PX) { /* sized run: advance at px   */
-    int gi = font_glyph_index(B->pg->body_font, (int)cp);
-    int adv = 0;
-    font_glyph_hmetrics(B->pg->body_font, gi, (float)px, &adv, 0);
-    return adv;
-  }
-  gcache_sync();
-  return gcache_get(cp)->adv;
+  if (body_mono(c))
+    return GLYPH_W; /* monospace cell */
+  gcache_sync(c);
+  struct ru_gent *a = ru_gtab_find(&c->at, cp, (unsigned)px);
+  if (a)
+    return a->adv;
+  bool lock = c->worker && !c->held;
+  if (lock)
+    browser_buf_lock();
+  int adv = adv_measure(cp, px);
+  if (lock)
+    browser_buf_unlock();
+  if (c->at.n >= GT_ADV_MAX)
+    ru_gtab_clear(&c->at);
+  struct ru_gent n = {.cp = cp, .px = (unsigned)px, .adv = adv};
+  ru_gtab_put(&c->at, &n);
+  return adv;
 }
 
 /* Alpha-blend one cached glyph's coverage in colour fg, clipped to [ct,cb).
  * With `italic`, faux-slant: each row shifts horizontally by ~1/4 its height
  * above the baseline `y` (rows above the baseline lean right, below lean left).
  */
-static void blit_glyph(int x, int y, const struct gcache *g, unsigned fg, int ct, int cb, int italic)
+static void blit_glyph(int x, int y, const struct ru_gent *g, unsigned fg, int ct, int cb, int italic)
 {
   if (!g->bm)
     return;
@@ -892,46 +998,27 @@ static void draw_tofu(int x, int y, int w, unsigned fg)
     gfx_rect(x + 1, y + 3, w - 3, UIFONT_H - 6, fg);
 }
 
-/* Draw a UTF-8 string at line-top (x,y) in colour fg, one codepoint at a time,
- * clipped to [ct,cb). Returns the pen x after the string. With a custom face,
- * glyphs come from font.c; otherwise the baked UI font draws ASCII/Latin-1 and
- * a tofu box stands in for anything it lacks. */
 /* Draw a UTF-8 run of font size `px` (0 = default body), its baseline
  * `baseline` px below line-top `y` so runs of different sizes on one line share
- * a baseline. Clipped to [ct,cb); returns the pen x after the run. */
+ * a baseline. Clipped to [ct,cb); returns the pen x after the run. With a custom
+ * face, glyphs come from the (codepoint, px) cache; otherwise the baked UI font
+ * draws ASCII/Latin-1 and a tofu box stands in for anything it lacks. */
 static int body_draw_run(int x, int y, const char *s, int len, int width, unsigned fg, int ct, int cb, int px,
                          int baseline, int italic)
 {
   const char *end = s + len;
   unsigned cp;
-  if (body_mono()) { /* raw content: monospace cells */
-    (void)ct;
-    (void)cb;
-    (void)baseline;
+  if (body_mono(&g_ui)) { /* raw content: monospace cells */
     gfx_text(x, y, s, fg, GFX_TRANSPARENT);
     return x + width;
   }
   if (B->pg->body_font) {
     int by = y + baseline; /* screen baseline shared by runs */
-    gcache_sync();
-    if (px && px != (int)BODY_PX) { /* sized run: render uncached at px */
-      while (s < end) {
-        s += utf8_decode(s, end, &cp);
-        int gi = font_glyph_index(B->pg->body_font, (int)cp);
-        struct gcache g;
-        g.bm = font_render_glyph(B->pg->body_font, gi, (float)px, &g.w, &g.h, &g.ox, &g.oy, &g.adv);
-        if (g.bm) {
-          blit_glyph(x, by, &g, fg, ct, cb, italic);
-          free(g.bm);
-        } else if (cp > 0x20)
-          draw_tofu(x, y, g.adv, fg);
-        x += g.adv;
-      }
-      return x;
-    }
-    while (s < end) { /* default BODY_PX: cached glyphs */
+    int eff = px ? px : (int)BODY_PX;
+    gcache_sync(&g_ui);
+    while (s < end) {
       s += utf8_decode(s, end, &cp);
-      struct gcache *g = gcache_get(cp);
+      const struct ru_gent *g = gcache_get(&g_ui, cp, eff);
       if (g->bm)
         blit_glyph(x, by, g, fg, ct, cb, italic);
       else if (cp > 0x20)
@@ -962,38 +1049,16 @@ static int run_ascent(int px)
   }
   return gfx_ui_ascent_px(px);
 }
-/* Largest effective font px among the glyphs of [off,end) (default = BODY_PX).
- */
-static int line_maxpx(int off, int end)
+
+/* Display height of a text line from its largest font px and largest CSS
+ * line-height: an explicit line-height wins, else it's ~1.25 of the font. */
+static int line_height(int maxpx, int lhmax)
 {
-  int mx = (int)BODY_PX;
-  for (int p = off; p < end;) {
-    int g = glyph_px(p);
-    int eff = g ? g : (int)BODY_PX;
-    if (eff > mx)
-      mx = eff;
-    p += utf8_seqlen((unsigned char)B->pg->text[p]);
-  }
-  return mx;
-}
-/* Display height of a text line. An explicit CSS line-height (max over the
- * line's glyphs) wins; otherwise it's derived from the largest font (≈1.25
- * line-height). */
-static int line_height_for(int off, int end)
-{
-  int lhmax = 0;
-  for (int p = off; p < end;) {
-    int v = B->pg->lh[p];
-    if (v > lhmax)
-      lhmax = v;
-    p += utf8_seqlen((unsigned char)B->pg->text[p]);
-  }
   if (lhmax > 0)
     return lhmax < 6 ? 6 : lhmax;
-  int mx = line_maxpx(off, end);
-  if (mx <= (int)BODY_PX)
+  if (maxpx <= (int)BODY_PX)
     return LINE_H;
-  int lh = mx + (mx + 2) / 4;
+  int lh = maxpx + (maxpx + 2) / 4;
   return lh < LINE_H ? LINE_H : lh;
 }
 
@@ -1004,48 +1069,30 @@ static bool g_ov_active; /* 1 = redirect add_line to the flex overlay */
 static int g_ov_base;    /* absolute band row that the item's first line maps to */
 static int g_ov_n;       /* lines emitted for the current item so far */
 
-static void add_line(int off, int len, int x, int w, int h)
+static void add_line(int off, int len, int x, int w, int h, int maxpx)
 {
+  struct layout_out *o = g_bk;
   if (g_ov_active) {
-    int lh = h > 0 ? h : LINE_H;
-    browser_ov_add(g_ov_base + g_ov_n, off, len, x, w, lh, line_maxpx(off, off + len));
+    struct fslice *p = grow_arr(o->fs, &o->cap_fs, o->n_fs + 1, sizeof *p);
+    if (p) {
+      o->fs = p;
+      p[o->n_fs++] = (struct fslice){g_ov_base + g_ov_n, off, len, x, w, h > 0 ? h : LINE_H, maxpx};
+    }
     g_ov_n++;
     return;
   }
-  if (!browser_ensure_lines(B->nlines + 1))
+  struct ltab *t = &o->lt;
+  if (!lt_ensure(t, t->n + 1))
     return; /* out of memory: stop adding lines */
-  int n = B->nlines;
-  B->line_off[n] = off;
-  B->line_len[n] = len;
-  B->line_x[n] = x;
-  B->line_w[n] = w;
-  B->line_h[n] = h > 0 ? h : LINE_H;
-  B->line_px[n] = line_maxpx(off, off + len);
-  B->line_y[n] = n > 0 ? B->line_y[n - 1] + B->line_h[n - 1] : 0;
-  B->nlines++;
-}
-
-/* ---- pixel geometry over the line table (Stage 6 pixel scroll) ---- *
- * Each display line carries its document-pixel top (line_y) and height
- * (line_h); `B->pg->scroll` is a document-pixel offset. These map between line
- * and pixel. */
-static int line_bottom(int i) { return (i >= 0 && i < B->nlines) ? B->line_y[i] + B->line_h[i] : 0; }
-static int doc_px(void) { return B->nlines > 0 ? line_bottom(B->nlines - 1) : 0; }
-/* The line whose band contains document-pixel `y` (clamped to a real line). */
-static int line_at_px(int y)
-{
-  int lo = 0, hi = B->nlines - 1, ans = 0;
-  if (hi < 0 || y <= 0)
-    return 0;
-  while (lo <= hi) { /* last line with line_y <= y */
-    int mid = (lo + hi) / 2;
-    if (B->line_y[mid] <= y) {
-      ans = mid;
-      lo = mid + 1;
-    } else
-      hi = mid - 1;
-  }
-  return ans;
+  int n = t->n;
+  t->off[n] = off;
+  t->len[n] = len;
+  t->x[n] = x;
+  t->w[n] = w;
+  t->h[n] = h > 0 ? h : LINE_H;
+  t->px[n] = maxpx;
+  t->y[n] = n > 0 ? t->y[n - 1] + t->h[n - 1] : 0;
+  t->n++;
 }
 
 /* How many display rows an inline image reserves at the current pane width. */
@@ -1086,8 +1133,22 @@ static void img_disp_size(const struct inl_img *im, int paw, int *dw, int *dh)
   *dh = h < 1 ? 1 : h;
 }
 
+/* Inline image anchored at text offset `pos` (lowest index), or -1. */
+static struct ru_imgidx g_imgix;
+static bool g_imgix_ok;
+static bool g_has_media; /* this page has <audio>/<video> to place */
+static int img_at_pos(int pos)
+{
+  if (g_imgix_ok)
+    return ru_imgidx_find(&g_imgix, pos);
+  for (int q = 0; q < B->pg->n_imgs; q++)
+    if (B->pg->imgs[q].text_pos == pos)
+      return q;
+  return -1;
+}
+
 static void pane_metrics(int *py, int *phh, int *rows);
-static void sel_hl_rect(int x, int y, int w, int h); /* selection highlight (defined below) */
+static void sel_hl_rect(int x, int y, int w, int h, int ct, int cb); /* selection highlight (defined below) */
 
 /* Highest valid scroll line: the last `rows` lines fill the pane exactly, so
  * the bottom stop can't scroll content up into blank space below it. */
@@ -1095,7 +1156,7 @@ static int scroll_max(void)
 {
   int py, phh, rows;
   pane_metrics(&py, &phh, &rows);
-  int max = doc_px() - phh;
+  int max = g_fr->doc_h - phh;
   return max < 0 ? 0 : max;
 }
 
@@ -1105,8 +1166,8 @@ static int scroll_max(void)
  * a document-relative box (x,y,w,h) for the rendered text range [start,end), 0
  * if the range produced no rows (unrendered/empty). Width is exact for a range
  * that lies on one text line; the content column otherwise. Runs on the worker
- * (JS) thread, so it holds browser_buf_lock — render() rebuilds the line table and uses
- * the glyph cache (set_block/body_cp_adv) under the same lock. */
+ * (JS) thread, so it holds browser_buf_lock to keep the front line table from
+ * being swapped under it. */
 int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
 {
   *ox = *oy = *ow = *oh = 0;
@@ -1116,10 +1177,12 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
   if (paw < 8)
     paw = 8;
 
+  struct bctx *c = &g_wk;
   browser_buf_lock();
+  c->held = true;
   int first = -1, last = -1, text_rows = 0, img_w = 0;
-  for (int r = 0; r < B->nlines; r++) {
-    int rs = B->line_off[r], rl = B->line_len[r];
+  for (int r = 0; r < g_fr->lt.n; r++) {
+    int rs = g_fr->lt.off[r], rl = g_fr->lt.len[r];
     int hit = rl > 0 ? (rs < end && rs + rl > start) /* text-line overlap */
                      : (rs >= start && rs < end);    /* blank/anchor row  */
     if (!hit)
@@ -1147,52 +1210,54 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
       img_w = dw;
   }
   if (first < 0) {
+    c->held = false;
     browser_buf_unlock();
     return 0;
   }
 
-  int x = B->line_x[first], w = B->line_w[first];
-  int y = B->line_y[first], h = line_bottom(last) - B->line_y[first];
+  int x = g_fr->lt.x[first], w = g_fr->lt.w[first];
+  int y = g_fr->lt.y[first], h = lt_bottom(&g_fr->lt, last) - g_fr->lt.y[first];
   if (first == last && text_rows == 1) { /* one text line: exact x + width */
-    int rs = B->line_off[first], re = rs + B->line_len[first];
+    int rs = g_fr->lt.off[first], re = rs + g_fr->lt.len[first];
     const char *t = B->pg->text;
     unsigned cp;
-    set_block(rs);
-    x += cur_bindent * INDENT_PX;
-    if (cur_bcenter == 1 || cur_bcenter == 2) {
+    set_block(c, rs);
+    x += c->bindent * INDENT_PX;
+    if (c->bcenter == 1 || c->bcenter == 2) {
       int lw = 0;
       for (int p = rs; p < re;) {
         int gp = p;
         p += utf8_decode(&t[p], &t[re], &cp);
-        lw += body_cp_adv(cp, glyph_px(gp));
+        lw += body_cp_adv(c, cp, glyph_px(gp));
       }
-      int room = (B->line_w[first] - cur_bindent * INDENT_PX) - lw;
+      int room = (g_fr->lt.w[first] - c->bindent * INDENT_PX) - lw;
       if (room > 0)
-        x += cur_bcenter == 1 ? room / 2 : room;
+        x += c->bcenter == 1 ? room / 2 : room;
     }
     int a = start > rs ? start : rs, b = end < re ? end : re;
     for (int p = rs; p < a;) {
       int gp = p;
       p += utf8_decode(&t[p], &t[re], &cp);
-      x += body_cp_adv(cp, glyph_px(gp));
+      x += body_cp_adv(c, cp, glyph_px(gp));
     }
     w = 0;
     for (int p = a; p < b;) {
       int gp = p;
       p += utf8_decode(&t[p], &t[re], &cp);
-      w += body_cp_adv(cp, glyph_px(gp));
+      w += body_cp_adv(c, cp, glyph_px(gp));
     }
     if (w < 1)
       w = 1;
   } else if (text_rows == 0 && img_w > 0) { /* image-only box */
     w = img_w;
   } else { /* block / multi-line: content col */
-    set_block(B->line_off[first]);
-    x = B->line_x[first] + cur_bindent * INDENT_PX;
-    w = B->line_w[first] - cur_bindent * INDENT_PX;
+    set_block(c, g_fr->lt.off[first]);
+    x = g_fr->lt.x[first] + c->bindent * INDENT_PX;
+    w = g_fr->lt.w[first] - c->bindent * INDENT_PX;
     if (w < 1)
       w = 1;
   }
+  c->held = false;
   browser_buf_unlock();
   *ox = x;
   *oy = y;
@@ -1229,14 +1294,14 @@ static int max0(int v) { return v > 0 ? v : 0; }
 static void add_n_blanks(int n, int off, int x, int w)
 {
   while (n-- > 0)
-    add_line(off, 0, x, w, LINE_H);
+    add_line(off, 0, x, w, LINE_H, (int)BODY_PX);
 }
 /* Reserve one blank line of exactly `h` px — exact margin/padding spacing, no
  * rounding to whole rows (the Stage 6 phase 2 improvement). No-op for h<=0. */
 static void add_blank_px(int h, int off, int x, int w)
 {
   if (h > 0)
-    add_line(off, 0, x, w, h);
+    add_line(off, 0, x, w, h, (int)BODY_PX);
 }
 /* Line height for the block set by set_block — LINE_H today (body text +
  * headings, which are capped at LINE_H); Stage 6 phase 3 derives a taller
@@ -1244,11 +1309,11 @@ static void add_blank_px(int h, int off, int x, int w)
  * one row. */
 static int block_line_h(void)
 {
-  if (cur_blh > 0)
-    return cur_blh < 6 ? 6 : cur_blh; /* explicit CSS line-height */
-  if (cur_bpx <= 0)
-    return LINE_H;                      /* default body font */
-  int lh = cur_bpx + (cur_bpx + 2) / 4; /* ~1.25 line-height */
+  if (g_wk.blh > 0)
+    return g_wk.blh < 6 ? 6 : g_wk.blh; /* explicit CSS line-height */
+  if (g_wk.bpx <= 0)
+    return LINE_H;                        /* default body font */
+  int lh = g_wk.bpx + (g_wk.bpx + 2) / 4; /* ~1.25 line-height */
   return lh < LINE_H ? LINE_H : lh;
 }
 
@@ -1264,47 +1329,51 @@ static void flow_slice(int t0, int t1, int base_x, int w)
    * before they exist. Never scan a NULL buffer, and clamp to what's built. */
   if (!B->pg->text || !B->pg->attr)
     return;
-  if (t1 > B->pg->text_len)
-    t1 = B->pg->text_len;
+  struct bctx *c = &g_wk;
+  struct layout_out *o = g_bk;
+  const struct page *pg = B->pg;
+  if (t1 > pg->text_len)
+    t1 = pg->text_len;
   if (w < 8)
     w = 8;
   int i = t0;
   while (i < t1) {
     int j = i;
-    while (j < t1 && B->pg->text[j] != '\n')
+    while (j < t1 && pg->text[j] != '\n')
       j++;
-    set_block(i);
-    int avail = w - cur_bindent * INDENT_PX;
+    set_block(c, i);
+    int avail = w - c->bindent * INDENT_PX;
     if (avail < 8)
       avail = 8;
     if (j == i) { /* blank line / replaced-element anchor */
-      int img = -1;
+      int img = img_at_pos(i);
       struct media_el *me;
-      for (int q = 0; q < B->pg->n_imgs; q++)
-        if (B->pg->imgs[q].text_pos == i) {
-          img = q;
-          break;
-        }
       if (img >= 0) {
-        struct inl_img *im = &B->pg->imgs[img];
+        struct inl_img *im = &pg->imgs[img];
         int dw = 0, dh = 0;
         img_disp_size(im, w, &dw, &dh);
-        im->rows = 1; /* one display line, exact px tall */
-        im->start_row = B->nlines;
-        add_line(i, 0, base_x, w, dh > 0 ? dh : LINE_H);
-      } else if ((me = media_at_text_pos(i)) != 0) {
+        if (img < o->n_img) {
+          o->img_rows[img] = 1; /* one display line, exact px tall */
+          o->img_row[img] = o->lt.n;
+        }
+        add_line(i, 0, base_x, w, dh > 0 ? dh : LINE_H, (int)BODY_PX);
+      } else if (g_has_media && (me = media_at_text_pos(i)) != 0) {
         int mr = media_widget_rows(me, w, LINE_H);
-        media_set_layout(me, B->nlines, mr);
+        struct lmedia *mp = grow_arr(o->med, &o->cap_med, o->n_med + 1, sizeof *mp);
+        if (mp) {
+          o->med = mp;
+          mp[o->n_med++] = (struct lmedia){me, o->lt.n, mr};
+        }
         for (int r = 0; r < mr; r++)
-          add_line(i, 0, base_x, w, LINE_H);
+          add_line(i, 0, base_x, w, LINE_H, (int)BODY_PX);
       } else {
-        add_line(i, 0, base_x, w, block_line_h());
+        add_line(i, 0, base_x, w, block_line_h(), (int)BODY_PX);
       }
     } else {
       int ls = i;
       while (ls < j) {
         int brk;
-        if (B->pg->attr[ls] & ST_NOWRAP) {
+        if (pg->attr[ls] & ST_NOWRAP) {
           brk = j; /* white-space:nowrap — one line, may overflow */
         } else {
           /* greedy fit by pixel width; break at the last space if a word
@@ -1312,8 +1381,8 @@ static void flow_slice(int t0, int t1, int base_x, int w)
           int wd = 0, e = ls, lastsp = -1;
           while (e < j) {
             unsigned cp;
-            int nb = utf8_decode(&B->pg->text[e], &B->pg->text[j], &cp);
-            int cw = body_cp_adv(cp, glyph_px(e));
+            int nb = utf8_decode(&pg->text[e], &pg->text[j], &cp);
+            int cw = body_cp_adv(c, cp, glyph_px(e));
             if (wd + cw > avail && e > ls)
               break;
             if (cp == ' ')
@@ -1323,9 +1392,11 @@ static void flow_slice(int t0, int t1, int base_x, int w)
           }
           brk = (e < j && lastsp > ls) ? lastsp : e;
         }
-        add_line(ls, brk - ls, base_x, w, line_height_for(ls, brk));
+        int maxpx, lhmax;
+        ru_line_scan(pg->text, pg->fsz, pg->bp, pg->lh, ls, brk, (int)BODY_PX, &maxpx, &lhmax);
+        add_line(ls, brk - ls, base_x, w, line_height(maxpx, lhmax), maxpx);
         ls = brk;
-        while (ls < j && B->pg->text[ls] == ' ')
+        while (ls < j && pg->text[ls] == ' ')
           ls++;
       }
     }
@@ -1418,13 +1489,13 @@ static int slice_maxcontent(int t0, int t1)
     while (j < t1 && B->pg->text[j] != '\n')
       j++;
     if (j > i) {
-      set_block(i);
-      int w = cur_bindent * INDENT_PX;
+      set_block(&g_wk, i);
+      int w = g_wk.bindent * INDENT_PX;
       unsigned cp;
       for (int p = i; p < j;) {
         int gp = p;
         p += utf8_decode(&B->pg->text[p], &B->pg->text[j], &cp);
-        w += body_cp_adv(cp, glyph_px(gp));
+        w += body_cp_adv(&g_wk, cp, glyph_px(gp));
       }
       if (w > best)
         best = w;
@@ -1469,30 +1540,44 @@ static int flex_clamp_main(const struct lbox *it, int v, int cont_w)
   return v;
 }
 
-#define FLEX_MAX_ITEMS 64
-
-/* Lay out a flex-direction:row container's direct children side by side within
- * the container content box [content_x, content_x+content_w). Appends the band
- * to the main table and the items' text to the overlay; sets each item's box
- * geometry. */
-static void flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w)
+/* Number of direct child boxes of box `idx`, and (when items != NULL) their indices. */
+static int box_children(const struct lbox *bx, int idx, int *items)
 {
-  struct lbox *cont = &bx[idx];
-  int items[FLEX_MAX_ITEMS], nit = 0;
-  for (int j = idx + 1; j < cont->end && nit < FLEX_MAX_ITEMS;) {
+  int n = 0;
+  for (int j = idx + 1; j < bx[idx].end;) {
     if (bx[j].parent == idx) {
-      items[nit++] = j;
+      if (items)
+        items[n] = j;
+      n++;
       j = bx[j].end;
     } else
       j++;
   }
+  return n;
+}
+
+/* Lay out a flex-direction:row container's direct children side by side within
+ * the container content box [content_x, content_x+content_w). Appends the band
+ * to the main table and the items' text to the overlay; sets each item's box
+ * geometry. False (nothing emitted) when memory runs out, so the caller can
+ * flow the container as a plain block. */
+static bool flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w)
+{
+  struct lbox *cont = &bx[idx];
+  struct lgeom *geo = g_bk->geo;
+  int nit = box_children(bx, idx, 0);
   if (nit == 0)
-    return;
+    return true;
+  int *mem = malloc((unsigned long)nit * 7 * sizeof *mem);
+  if (!mem)
+    return false;
+  int *items = mem, *base = mem + nit, *main_sz = mem + 2 * nit, *rows_of = mem + 3 * nit;
+  int *ov_start = mem + 4 * nit, *item_x = mem + 5 * nit, *toppad = mem + 6 * nit;
+  box_children(bx, idx, items);
 
   int gap = cont->gap_col;
   int total_gap = gap * (nit - 1);
 
-  int base[FLEX_MAX_ITEMS], main_sz[FLEX_MAX_ITEMS];
   long sumbase = 0, sumgrow = 0, sumshrinkw = 0;
   for (int k = 0; k < nit; k++) {
     base[k] = flex_base_main(&bx[items[k]], content_w);
@@ -1566,9 +1651,8 @@ static void flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
    * height/ min-height plus its vertical frame; the band is the tallest item,
    * raised to the container's own content-height floor so align-items has room
    * to work. */
-  int band_top = B->nlines;
-  int band_top_y = doc_px(); /* pixel top of the band (its rows are added below) */
-  int rows_of[FLEX_MAX_ITEMS], ov_start[FLEX_MAX_ITEMS], item_x[FLEX_MAX_ITEMS], toppad[FLEX_MAX_ITEMS];
+  int band_top = g_bk->lt.n;
+  int band_top_y = lt_doc_px(&g_bk->lt); /* pixel top of the band (its rows are added below) */
   int x = content_x + start, band_h = 0;
   for (int k = 0; k < nit; k++) {
     struct lbox *it = &bx[items[k]];
@@ -1577,7 +1661,7 @@ static void flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
     if (cw < 4)
       cw = 4;
     item_x[k] = x;
-    ov_start[k] = B->n_fslices;
+    ov_start[k] = g_bk->n_fs;
     g_ov_active = true;
     g_ov_base = band_top;
     g_ov_n = 0;
@@ -1618,28 +1702,31 @@ static void flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
       off_rows = band_h - h_rows;
     int shift = off_rows + toppad[k];
     if (shift) {
-      int end = (k + 1 < nit) ? ov_start[k + 1] : B->n_fslices;
+      int end = (k + 1 < nit) ? ov_start[k + 1] : g_bk->n_fs;
       for (int s = ov_start[k]; s < end; s++)
-        B->fslices[s].row += shift;
+        g_bk->fs[s].row += shift;
     }
     int fl = it->border.l + it->padding.l, fr = it->border.r + it->padding.r;
     int ft = it->border.t + it->padding.t;
     int vframe = ft + it->border.b + it->padding.b;
-    it->x = item_x[k];
-    it->w = main_sz[k];
-    it->y = band_top_y + off_rows * LINE_H;
-    it->h = h_rows * LINE_H;
-    it->cx = item_x[k] + fl;
-    it->cw = main_sz[k] - fl - fr;
-    if (it->cw < 4)
-      it->cw = 4;
-    it->cy = it->y + ft;
-    it->ch = it->h - vframe;
-    if (it->ch < 0)
-      it->ch = 0;
+    struct lgeom *g = &geo[items[k]];
+    g->x = item_x[k];
+    g->w = main_sz[k];
+    g->y = band_top_y + off_rows * LINE_H;
+    g->h = h_rows * LINE_H;
+    g->cx = item_x[k] + fl;
+    g->cw = main_sz[k] - fl - fr;
+    if (g->cw < 4)
+      g->cw = 4;
+    g->cy = g->y + ft;
+    g->ch = g->h - vframe;
+    if (g->ch < 0)
+      g->ch = 0;
   }
 
   add_n_blanks(band_h, cont->t0, content_x, content_w);
+  free(mem);
+  return true;
 }
 
 /* --- grid (display:grid)
@@ -1657,26 +1744,26 @@ static void flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
  * may be reused by the next row); a cell's inline text is its own glyph slice —
  * nested block boxes inside a cell don't get their own side-by-side geometry
  * (same limit as flex). */
-#define GRID_MAX_ITEMS 128
-#define GRID_MAX_ROWS 64
-
-static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
+/* False (nothing emitted) when memory runs out, so the caller can flow the
+ * container as a plain block. */
+static bool flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
 {
   struct lbox *cont = &bx[idx];
+  struct lgeom *geo = g_bk->geo;
   int ncols = cont->n_cols > 0 ? cont->n_cols : 1;
   if (ncols > CSS_GRID_MAX)
     ncols = CSS_GRID_MAX;
 
-  int items[GRID_MAX_ITEMS], nit = 0;
-  for (int j = idx + 1; j < cont->end && nit < GRID_MAX_ITEMS;) {
-    if (bx[j].parent == idx) {
-      items[nit++] = j;
-      j = bx[j].end;
-    } else
-      j++;
-  }
+  int nit = box_children(bx, idx, 0);
   if (nit == 0)
-    return;
+    return true;
+  int *mem = malloc((unsigned long)nit * 10 * sizeof *mem);
+  if (!mem)
+    return false;
+  int *items = mem, *it_col = mem + nit, *it_row = mem + 2 * nit, *it_cs = mem + 3 * nit, *it_rs = mem + 4 * nit;
+  int *rows_of = mem + 5 * nit, *ov_start = mem + 6 * nit, *toppad = mem + 7 * nit, *it_x = mem + 8 * nit,
+      *it_w = mem + 9 * nit;
+  box_children(bx, idx, items);
 
   int gcol = cont->gap_col > 0 ? cont->gap_col : 0;
   int grow_gap = cont->gap_row > 0 ? cont->gap_row : 0;
@@ -1685,7 +1772,6 @@ static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
    * (grid-auto-flow:row). A span wider than the remaining columns wraps to the
    * next row. Row spans are honoured for height/geometry but not tracked as
    * occupied cells (v1 limit). */
-  int it_col[GRID_MAX_ITEMS], it_row[GRID_MAX_ITEMS], it_cs[GRID_MAX_ITEMS], it_rs[GRID_MAX_ITEMS];
   int cur_c = 0, cur_r = 0, nrows = 0;
   for (int k = 0; k < nit; k++) {
     struct lbox *it = &bx[items[k]];
@@ -1711,8 +1797,12 @@ static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
   }
   if (nrows < 1)
     nrows = 1;
-  if (nrows > GRID_MAX_ROWS)
-    nrows = GRID_MAX_ROWS;
+  int *rmem = malloc(((unsigned long)nrows * 2 + 1) * sizeof *rmem);
+  if (!rmem) {
+    free(mem);
+    return false;
+  }
+  int *rowh = rmem, *row_off = rmem + nrows;
 
   /* --- column track sizing: resolve fixed (px/%) tracks and auto tracks
    * (max-content of their single-column items), then share the leftover across
@@ -1796,10 +1886,8 @@ static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
 
   /* --- flow each item into the overlay (top of band for now), measuring its
    * content rows, its column x and its border-box main width. */
-  int band_top = B->nlines;
-  int band_top_y = doc_px();
-  int rows_of[GRID_MAX_ITEMS], ov_start[GRID_MAX_ITEMS], toppad[GRID_MAX_ITEMS];
-  int it_x[GRID_MAX_ITEMS], it_w[GRID_MAX_ITEMS];
+  int band_top = g_bk->lt.n;
+  int band_top_y = lt_doc_px(&g_bk->lt);
   for (int k = 0; k < nit; k++) {
     struct lbox *it = &bx[items[k]];
     int cs = it_cs[k];
@@ -1813,7 +1901,7 @@ static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
     int cw = iw - fl - fr;
     if (cw < 4)
       cw = 4;
-    ov_start[k] = B->n_fslices;
+    ov_start[k] = g_bk->n_fs;
     g_ov_active = true;
     g_ov_base = band_top;
     g_ov_n = 0;
@@ -1834,7 +1922,6 @@ static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
   /* --- row-track heights (rows): a px grid-template-rows entry is a floor; a
    * single-row item raises its row; a row-spanning item extends its last row.
    */
-  int rowh[GRID_MAX_ROWS];
   for (int r = 0; r < nrows; r++) {
     rowh[r] = 0;
     if (cont->n_rows > 0 && r < cont->n_rows && cont->rows_t[r].kind == CSS_TRK_PX) {
@@ -1851,7 +1938,6 @@ static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
       rowh[r] = 1;
 
   int gap_rows = rows_for(grow_gap);
-  int row_off[GRID_MAX_ROWS + 1];
   row_off[0] = 0;
   for (int r = 0; r < nrows; r++)
     row_off[r + 1] = row_off[r] + rowh[r] + (r + 1 < nrows ? gap_rows : 0);
@@ -1899,34 +1985,38 @@ static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
     int base_row = row_off[r0] + off_rows;
     int shift = base_row + toppad[k];
     if (shift) {
-      int end = (k + 1 < nit) ? ov_start[k + 1] : B->n_fslices;
+      int end = (k + 1 < nit) ? ov_start[k + 1] : g_bk->n_fs;
       for (int s = ov_start[k]; s < end; s++)
-        B->fslices[s].row += shift;
+        g_bk->fs[s].row += shift;
     }
     int fl = it->border.l + it->padding.l, fr = it->border.r + it->padding.r;
     int ft = it->border.t + it->padding.t;
     int vframe = ft + it->border.b + it->padding.b;
-    it->x = it_x[k];
-    it->w = it_w[k];
-    it->y = band_top_y + base_row * LINE_H;
-    it->h = h_rows * LINE_H;
-    it->cx = it_x[k] + fl;
-    it->cw = it_w[k] - fl - fr;
-    if (it->cw < 4)
-      it->cw = 4;
-    it->cy = it->y + ft;
-    it->ch = it->h - vframe;
-    if (it->ch < 0)
-      it->ch = 0;
+    struct lgeom *g = &geo[items[k]];
+    g->x = it_x[k];
+    g->w = it_w[k];
+    g->y = band_top_y + base_row * LINE_H;
+    g->h = h_rows * LINE_H;
+    g->cx = it_x[k] + fl;
+    g->cw = it_w[k] - fl - fr;
+    if (g->cw < 4)
+      g->cw = 4;
+    g->cy = g->y + ft;
+    g->ch = g->h - vframe;
+    if (g->ch < 0)
+      g->ch = 0;
   }
 
   add_n_blanks(band_h, cont->t0, content_x, content_w);
+  free(rmem);
+  free(mem);
+  return true;
 }
 
 /* Lay out one box: blank rows for top margin/border/padding, then its own
  * inline text interleaved with child boxes (each recursively laid out), then
  * bottom spacing. Geometry is stored in document px; vertical position is the
- * row cursor (B->nlines) * LINE_H. `x`/`avail_w` are the containing block's
+ * row cursor (g_bk->lt.n) * LINE_H. `x`/`avail_w` are the containing block's
  * content origin and width. The box honours CSS width with min-/max-width and
  * box-sizing, `height`/ min-height as a floor (short content is padded so the
  * background fills the box, capped by max-height), `margin:auto` (horizontal
@@ -1981,24 +2071,25 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
     content_w = 8;
 
   add_blank_px(max0(b->margin.t), b->t0, box_x, box_w);
-  int box_top_y = doc_px();
+  int box_top_y = lt_doc_px(&g_bk->lt);
   add_blank_px(b->border.t + b->padding.t, b->t0, content_x, content_w);
-  int content_top_y = doc_px();
+  int content_top_y = lt_doc_px(&g_bk->lt);
 
-  b->x = box_x;
-  b->w = box_w;
-  b->cx = content_x;
-  b->cw = content_w;
+  struct lgeom *g = &g_bk->geo[idx];
+  g->x = box_x;
+  g->w = box_w;
+  g->cx = content_x;
+  g->cw = content_w;
 
-  if (b->kind == LB_GRID) {
-    /* grid: children placed into a 2-D track band via the overlay. */
-    flow_grid(bx, idx, content_x, content_w);
-  } else if (b->kind == LB_FLEX && b->flex_dir == 0) {
-    /* row flex: children laid side by side via the band overlay (column flex
-     * keeps the block-stacking path below — vertical stacking is already
-     * right). */
-    flow_flex_row(bx, idx, content_x, content_w);
-  } else {
+  /* grid: children placed into a 2-D track band via the overlay. Row flex:
+   * children laid side by side via the band overlay (column flex keeps the
+   * block-stacking path below; vertical stacking is already right). */
+  bool banded = false;
+  if (b->kind == LB_GRID)
+    banded = flow_grid(bx, idx, content_x, content_w);
+  else if (b->kind == LB_FLEX && b->flex_dir == 0)
+    banded = flow_flex_row(bx, idx, content_x, content_w);
+  if (!banded) {
     int pos = b->t0;
     for (int j = idx + 1; j < b->end;) {
       if (bx[j].parent != idx) {
@@ -2019,20 +2110,20 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   int vframe = b->border.t + b->border.b + b->padding.t + b->padding.b;
   int min_ch = box_min_content_h(b, vframe);
   if (min_ch > 0) {
-    int have = doc_px() - content_top_y;
+    int have = lt_doc_px(&g_bk->lt) - content_top_y;
     if (min_ch > have)
       add_blank_px(min_ch - have, b->t1, content_x, content_w);
   }
 
-  int content_bot_y = doc_px();
+  int content_bot_y = lt_doc_px(&g_bk->lt);
   add_blank_px(b->padding.b + b->border.b, b->t1, content_x, content_w);
-  int box_bot_y = doc_px();
+  int box_bot_y = lt_doc_px(&g_bk->lt);
   add_blank_px(max0(b->margin.b), b->t1, box_x, box_w);
 
-  b->y = box_top_y + dy;
-  b->h = box_bot_y - box_top_y;
-  b->cy = content_top_y + dy;
-  b->ch = content_bot_y - content_top_y;
+  g->y = box_top_y + dy;
+  g->h = box_bot_y - box_top_y;
+  g->cy = content_top_y + dy;
+  g->ch = content_bot_y - content_top_y;
 }
 
 /* Lay out the whole box tree (top-level boxes stacked, with any stray text
@@ -2056,39 +2147,200 @@ static void layout_flow(int paw)
   flow_slice(pos, B->pg->text_len, 4, paw);
 }
 
+/* Hash of every input that decides the line table and box geometry, so an
+ * animation frame that only moved paint properties can keep the laid-out result. */
+static unsigned layout_sig(int paw)
+{
+  const struct page *pg = B->pg;
+  unsigned h = layout_mix((unsigned)paw, (unsigned)(unsigned long)pg->body_font);
+  h = layout_mix(h, (unsigned)pg->mode);
+  if (pg->text)
+    h = layout_mix(h, ru_text_sig(pg->text, pg->fsz, pg->lh, pg->bp, pg->attr, pg->text_len, ST_NOWRAP));
+  int n;
+  const struct lbox *bx = layout_pool(&n);
+  h = layout_mix(h, (unsigned)n);
+  for (int i = 0; i < n; i++)
+    h = layout_box_sig(&bx[i], h);
+  h = layout_mix(h, (unsigned)pg->n_imgs);
+  for (int q = 0; q < pg->n_imgs; q++) {
+    const struct inl_img *im = &pg->imgs[q];
+    h = layout_mix(h, (unsigned)im->text_pos | ((unsigned)im->ok << 31));
+    h = layout_mix(h, im->iw);
+    h = layout_mix(h, im->ih);
+    h = layout_mix(h, (unsigned)im->cw);
+    h = layout_mix(h, (unsigned)im->ch);
+  }
+  for (struct media_el *me = media_doc_first(); me; me = media_doc_next(me)) {
+    h = layout_mix(h, (unsigned)(unsigned long)me);
+    h = layout_mix(h, (unsigned)media_widget_rows(me, paw, LINE_H));
+  }
+  return h;
+}
+
+/* Publish a finished layout into the shared state the painter and the DOM
+ * geometry APIs read: image rows, media placement, per-box geometry. Caller
+ * holds browser_buf_lock. */
+static void layout_apply(const struct layout_out *o)
+{
+  struct page *pg = B->pg;
+  int n = pg->n_imgs < o->n_img ? pg->n_imgs : o->n_img;
+  for (int q = 0; q < n; q++) {
+    pg->imgs[q].start_row = o->img_row[q];
+    if (o->img_rows[q] >= 0)
+      pg->imgs[q].rows = o->img_rows[q];
+  }
+  for (int q = n; q < pg->n_imgs; q++)
+    pg->imgs[q].start_row = -1;
+  media_reset_layout();
+  for (int m = 0; m < o->n_med; m++)
+    media_set_layout(o->med[m].me, o->med[m].row, o->med[m].rows);
+  int nb;
+  struct lbox *bx = layout_pool(&nb);
+  if (nb == o->n_geo)
+    for (int i = 0; i < nb; i++) {
+      bx[i].x = o->geo[i].x;
+      bx[i].y = o->geo[i].y;
+      bx[i].w = o->geo[i].w;
+      bx[i].h = o->geo[i].h;
+      bx[i].cx = o->geo[i].cx;
+      bx[i].cy = o->geo[i].cy;
+      bx[i].cw = o->geo[i].cw;
+      bx[i].ch = o->geo[i].ch;
+    }
+}
+
+/* The DOM was re-flattened but nothing that affects layout changed: re-attach
+ * the current layout to the fresh box pool instead of re-wrapping. */
+static void layout_keep(void)
+{
+  browser_buf_lock();
+  layout_apply(g_fr);
+  B->layout_dirty = 0;
+  browser_buf_unlock();
+}
+
+/* Vertical extent of box `i` including the outline and shadow that spill past it. */
+static void box_extent(const struct lbox *b, const struct lgeom *g, int *top, int *bot)
+{
+  *top = g->y;
+  *bot = g->y + g->h;
+  if (b->outline_w > 0) {
+    *top -= b->outline_w;
+    *bot += b->outline_w;
+  }
+  if (b->sh_color != BG_NONE) {
+    int bl = b->sh_blur < 0 ? 0 : b->sh_blur;
+    int ext = b->sh_spread + bl;
+    int st = g->y + b->sh_dy - ext, sb = g->y + g->h + b->sh_dy + ext;
+    if (st < *top)
+      *top = st;
+    if (sb > *bot)
+      *bot = sb;
+  }
+}
+
+/* Per-layout paint order (z bands + vertical cull index) and the furthest a
+ * glyph can spill below its line box. */
+static void layout_index(struct layout_out *o, const struct lbox *bx, int nb)
+{
+  ru_bands_free(&o->bands);
+  int *tmp = nb > 0 ? malloc((unsigned long)nb * 3 * sizeof *tmp) : 0;
+  if (tmp) {
+    int *z = tmp, *top = tmp + nb, *bot = tmp + 2 * nb;
+    for (int i = 0; i < nb; i++) {
+      z[i] = bx[i].z_index;
+      box_extent(&bx[i], &o->geo[i], &top[i], &bot[i]);
+    }
+    ru_bands_build(&o->bands, z, top, bot, nb, CSS_Z_AUTO);
+    free(tmp);
+  }
+  int over = 0;
+  for (int i = 0; i < o->lt.n; i++) {
+    int v = o->lt.px[i] + (o->lt.px[i] + 2) / 4 + 2 - o->lt.h[i];
+    if (v > over)
+      over = v;
+  }
+  for (int i = 0; i < o->n_fs; i++) {
+    int v = o->fs[i].maxpx + (o->fs[i].maxpx + 2) / 4 + 2 - o->fs[i].h;
+    if (v > over)
+      over = v;
+  }
+  o->over = over;
+}
+
 /* Word-wrap B->pg->text into display lines that fit `paw` pixels wide
  * (proportional font), reserving rows for inline images. wrap_cols caches the
- * pane width. */
+ * pane width. The result is built in g_bk without browser_buf_lock (only the
+ * worker thread writes the text and box pool it reads) and swapped in under a
+ * short lock, so painting and scrolling never wait on a long reflow. */
 static void rewrap(int paw)
 {
   if (paw < 8)
     paw = 8;
-  /* Single consistency guard for the whole layout+paint below: the worker
-   * rebuilds text/attr/box-tree during a (re)layout, and although render()
-   * holds browser_buf_lock (so nothing changes mid-frame), it can still observe the
-   * instant where the buffers aren't built yet. Don't lay out or paint over a
-   * NULL text buffer — drop to an empty page this frame and force a re-wrap
-   * once it's ready. This replaces per-reader NULL checks across every
-   * flow/measure fn. */
+  /* Don't lay out over a NULL text buffer: drop to an empty page and force a
+   * re-wrap once it's ready. */
   if (!B->pg->text) {
-    B->nlines = 0;
+    browser_buf_lock();
+    g_fr->lt.n = 0;
+    g_fr->doc_h = 0;
+    browser_buf_unlock();
     B->layout_dirty = 1;
     return;
   }
   if (!B->layout_dirty && B->wrap_cols == paw)
     return;
-  for (int q = 0; q < B->pg->n_imgs; q++)
-    B->pg->imgs[q].start_row = -1;
-  media_reset_layout();
-  B->nlines = 0;
-  B->n_fslices = 0;
-  int n;
-  layout_pool(&n);
-  if (g_box_layout && n > 0)
+  B->layout_dirty = 0;
+
+  struct layout_out *o = g_bk;
+  int nb;
+  struct lbox *bx = layout_pool(&nb);
+  o->lt.n = 0;
+  o->n_fs = 0;
+  o->n_med = 0;
+  o->n_geo = 0;
+  o->n_img = 0;
+  struct lgeom *geo = nb > 0 ? grow_arr(o->geo, &o->cap_geo, nb, sizeof *geo) : 0;
+  if (geo) {
+    o->geo = geo;
+    memset(geo, 0, (unsigned long)nb * sizeof *geo);
+    o->n_geo = nb;
+  }
+  int ni = B->pg->n_imgs;
+  if (ni > o->cap_img) {
+    int nc = browser_grow_cap(o->cap_img, 64, ni);
+    int *m = realloc(o->img_pos, (unsigned long)nc * 3 * sizeof *m);
+    if (m) {
+      o->img_pos = m;
+      o->cap_img = nc;
+    }
+  }
+  if (ni <= o->cap_img) {
+    o->img_row = o->img_pos + o->cap_img;
+    o->img_rows = o->img_pos + 2 * o->cap_img;
+    for (int q = 0; q < ni; q++) {
+      o->img_pos[q] = B->pg->imgs[q].text_pos;
+      o->img_row[q] = -1;
+      o->img_rows[q] = -1;
+    }
+    o->n_img = ni;
+  }
+  g_imgix_ok = o->n_img == ni && ru_imgidx_build(&g_imgix, o->img_pos, ni);
+  g_has_media = media_doc_first() != 0;
+
+  if (g_box_layout && nb > 0 && o->n_geo == nb)
     layout_flow(paw); /* box-driven layout */
   else
     flow_slice(0, B->pg->text_len, 4, paw); /* flat flow  */
-  B->layout_dirty = 0;
+  free(g_imgix.ord);
+  g_imgix.ord = 0;
+  o->doc_h = lt_doc_px(&o->lt);
+  layout_index(o, bx, o->n_geo);
+  g_lay_sig = layout_sig(paw);
+
+  browser_buf_lock();
+  layout_apply(o);
+  g_bk = g_fr;
+  g_fr = o;
   B->wrap_cols = paw;
   B->layout_seq++; /* geometry changed: devtools box model + highlight */
   int max = scroll_max();
@@ -2096,6 +2348,7 @@ static void rewrap(int paw)
     B->pg->scroll = max;
   if (B->pg->scroll < 0)
     B->pg->scroll = 0;
+  browser_buf_unlock();
 }
 
 /* ------------------------------------------------------------- image draw */
@@ -2113,6 +2366,41 @@ static int rawrd_get(void *c)
   return (unsigned char)B->pg->raw[r->pos++];
 }
 
+/* Source-column table for scaling a row of iw pixels to dw, shared by every blit
+ * (main thread only). NULL when it can't be allocated: callers then divide. */
+static unsigned *g_xm;
+static unsigned g_xm_cap, g_xm_dw, g_xm_iw;
+static const unsigned *xmap_get(unsigned dw, unsigned iw)
+{
+  if (!dw)
+    return 0;
+  if (dw > g_xm_cap) {
+    unsigned *p = realloc(g_xm, (unsigned long)dw * sizeof *p);
+    if (!p)
+      return 0;
+    g_xm = p;
+    g_xm_cap = dw;
+    g_xm_dw = 0;
+  }
+  if (g_xm_dw != dw || g_xm_iw != iw) {
+    ru_xmap_fill(g_xm, dw, iw);
+    g_xm_dw = dw;
+    g_xm_iw = iw;
+  }
+  return g_xm;
+}
+
+/* Destination columns [lo,hi) of a dw-wide image drawn at x0 that land inside the surface. */
+static bool clip_cols(int x0, unsigned dw, unsigned *lo, unsigned *hi)
+{
+  int a = x0 < 0 ? -x0 : 0, b = BW - x0 < (int)dw ? BW - x0 : (int)dw;
+  if (b <= a)
+    return false;
+  *lo = (unsigned)a;
+  *hi = (unsigned)b;
+  return true;
+}
+
 /* Decode state: a fit-to-pane letterbox, blitting each PNG scanline directly
  * into the window buffer inside the content pane (mirrors imgview's v_row). */
 struct imgblit {
@@ -2120,42 +2408,27 @@ struct imgblit {
   unsigned iw, ih;         /* source image size                       */
   unsigned dw, dh, ox, oy; /* drawn size + offset within the pane      */
   unsigned next_r;         /* next dest row awaiting its source row    */
+  const unsigned *xm;
 };
-
-/* Composite one RGBA source pixel over an existing framebuffer pixel. */
-static unsigned blend_px(const unsigned char *p, unsigned dst)
-{
-  unsigned a = p[3];
-  if (a == 255)
-    return ((unsigned)p[0] << 16) | ((unsigned)p[1] << 8) | p[2];
-  if (a == 0)
-    return dst;
-  unsigned ia = 255 - a;
-  unsigned r = (p[0] * a + ((dst >> 16) & 0xff) * ia) / 255;
-  unsigned g = (p[1] * a + ((dst >> 8) & 0xff) * ia) / 255;
-  unsigned b = (p[2] * a + (dst & 0xff) * ia) / 255;
-  return (r << 16) | (g << 8) | b;
-}
 
 static int img_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 {
   (void)w;
   struct imgblit *v = c;
   unsigned *fb = browser_surface();
+  unsigned lo, hi;
   while (v->next_r < v->dh && (v->next_r * v->ih / v->dh) == y) {
-    unsigned *drow = fb + (unsigned long)(v->py + v->oy + v->next_r) * BW + v->px + v->ox;
-    for (unsigned x = 0; x < v->dw; x++) {
-      const unsigned char *p = rgba + (x * v->iw / v->dw) * 4;
-      drow[x] = blend_px(p, drow[x]);
-    }
+    int dy = v->py + (int)v->oy + (int)v->next_r;
+    int dx = v->px + (int)v->ox;
+    if (dy >= 0 && dy < BH && clip_cols(dx, v->dw, &lo, &hi))
+      ru_blit_row_rgba(fb + (unsigned long)dy * BW + dx, rgba, v->xm, v->dw, v->iw, lo, hi);
     v->next_r++;
   }
   return 0;
 }
 
-/* Row-copy sink: write each decoded PNG scanline into a full RGBA buffer.
- * Shared by the inline-image cache (imgc_get) and the full-page image cache
- * below. */
+/* Row-copy sink: write each decoded PNG scanline into a full RGBA buffer
+ * (the full-page image cache below). */
 struct imgc_fill {
   unsigned char *buf;
   unsigned iw, ih;
@@ -2217,6 +2490,7 @@ static void draw_image_stream(int px, int py, int pw, int ph)
     v.dh = 1;
   v.ox = ((unsigned)pw - v.dw) / 2;
   v.oy = ((unsigned)ph - v.dh) / 2;
+  v.xm = xmap_get(v.dw, iw);
 
   struct rawrd r2 = {0};
   upng_decode(rawrd_get, &r2, img_row, &v, 0, 0);
@@ -2274,14 +2548,16 @@ static void draw_image(int px, int py, int pw, int ph, unsigned bg)
     dh = 1;
   unsigned ox = ((unsigned)pw - dw) / 2, oy = ((unsigned)ph - dh) / 2;
   unsigned *fb = browser_surface();
+  const unsigned *xm = xmap_get(dw, iw);
+  unsigned lo, hi;
+  if (!clip_cols(px + (int)ox, dw, &lo, &hi))
+    return;
   for (unsigned ry = 0; ry < dh; ry++) {
-    unsigned sy = ry * ih / dh;
-    const unsigned char *srow = g_dimg.rgba + (unsigned long)sy * iw * 4;
-    unsigned *drow = fb + (unsigned long)(py + oy + ry) * BW + px + ox;
-    for (unsigned x = 0; x < dw; x++) {
-      const unsigned char *p = srow + (unsigned long)(x * iw / dw) * 4;
-      drow[x] = blend_px(p, drow[x]);
-    }
+    int dy = py + (int)oy + (int)ry;
+    if (dy < 0 || dy >= BH)
+      continue;
+    const unsigned char *srow = g_dimg.rgba + (unsigned long)(ry * ih / dh) * iw * 4;
+    ru_blit_row_rgba(fb + (unsigned long)dy * BW + px + ox, srow, xm, dw, iw, lo, hi);
   }
 }
 
@@ -2302,6 +2578,8 @@ static int poolrd_get(void *c)
 struct inlblit {
   int x0, y0, dw, dh, clip_top, clip_bot;
   unsigned iw, ih, next_r;
+  const unsigned *xm;
+  unsigned lo, hi;
 };
 
 static int inl_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
@@ -2311,40 +2589,36 @@ static int inl_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
   unsigned *fb = browser_surface();
   while (v->next_r < (unsigned)v->dh && (v->next_r * v->ih / (unsigned)v->dh) == y) {
     int dy = v->y0 + (int)v->next_r;
-    if (dy >= v->clip_top && dy < v->clip_bot) {
-      unsigned *drow = fb + (unsigned long)dy * BW + v->x0;
-      for (int x = 0; x < v->dw; x++) {
-        const unsigned char *p = rgba + ((unsigned)x * v->iw / (unsigned)v->dw) * 4;
-        drow[x] = blend_px(p, drow[x]);
-      }
-    }
+    if (dy >= v->clip_top && dy < v->clip_bot)
+      ru_blit_row_rgba(fb + (unsigned long)dy * BW + v->x0, rgba, v->xm, (unsigned)v->dw, v->iw, v->lo, v->hi);
     v->next_r++;
   }
   return 0;
 }
 
 /* Decoded-PNG cache: an inline PNG would otherwise re-inflate on every scroll
- * frame (SVGs are raw RGBA and blit directly). Each PNG's full RGBA is decoded
- * once, keyed by its session-unique uid, then scaled-blitted thereafter.
- * Bounded by slot count + a per-image pixel cap; cleared when the active page
- * changes or a new page loads. Main-thread-only (render owns it). */
-#define IMGC_N 6
-#define IMGC_MAX_PX (1024u * 1024u) /* don't cache images bigger than this */
-struct imgc_ent {
-  int uid;
-  unsigned iw, ih;
-  unsigned char *rgba;
-};
-static struct imgc_ent g_imgc[IMGC_N];
+ * frame (SVGs are raw RGBA and blit directly). Each PNG is decoded once into
+ * 0xAARRGGBB words, keyed by its session-unique uid: at natural size when it is
+ * small, else already scaled to the displayed size (so a huge photo is held as
+ * a pane-sized bitmap). Least recently used entries go first once the byte
+ * budget is spent. Cleared when the active page changes or a new page loads.
+ * Main-thread-only (render owns it). */
+#define IMGC_BUDGET (16ul << 20)
+#define IMGC_NATURAL_MAX_PX (1024u * 1024u) /* cache at natural size up to this */
+static struct ru_imgcache g_imgc = {.budget = IMGC_BUDGET};
 static struct page *g_imgc_pg;
+
+static int imgc_scale_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
+{
+  struct ru_scaler *sc = c;
+  if (w >= sc->iw)
+    ru_scaler_row(sc, y, rgba);
+  return 0;
+}
 
 static void imgc_clear(void)
 {
-  for (int i = 0; i < IMGC_N; i++) {
-    free(g_imgc[i].rgba);
-    g_imgc[i].rgba = 0;
-    g_imgc[i].uid = 0;
-  }
+  ru_imgcache_clear(&g_imgc);
   free(g_dimg.rgba);
   g_dimg.rgba = 0;
   g_dimg.pg = 0;
@@ -2353,10 +2627,9 @@ static void imgc_clear(void)
   g_dimg.iw = g_dimg.ih = 0;
 }
 
-/* Full decoded RGBA for inline PNG `im` (decoding + caching on first use), or
- * NULL if it can't be decoded / is too large — the caller then streams it once.
- */
-static const unsigned char *imgc_get(struct inl_img *im)
+/* Decoded pixels for inline PNG `im` shown dw x dh (decoding + caching on first
+ * use), or NULL if it can't be decoded or held; the caller then streams it. */
+static const struct ru_img *imgc_get(struct inl_img *im, unsigned dw, unsigned dh)
 {
   if (g_imgc_pg != B->pg) {
     imgc_clear();
@@ -2364,89 +2637,92 @@ static const unsigned char *imgc_get(struct inl_img *im)
   }
   if (!im->uid || !im->iw || !im->ih)
     return 0;
-  for (int i = 0; i < IMGC_N; i++)
-    if (g_imgc[i].uid == im->uid && g_imgc[i].rgba)
-      return g_imgc[i].rgba;
-  if ((unsigned long)im->iw * im->ih > IMGC_MAX_PX)
+  const struct ru_img *hit = ru_imgcache_find(&g_imgc, im->uid, im->iw, im->ih, dw, dh);
+  if (hit)
+    return hit;
+  bool natural = (unsigned long)im->iw * im->ih <= IMGC_NATURAL_MAX_PX;
+  unsigned cw = natural ? im->iw : dw, ch = natural ? im->ih : dh;
+  if (!cw || !ch || cw > IMGC_BUDGET / 4 / ch)
     return 0;
-  unsigned char *buf = malloc((unsigned long)im->iw * im->ih * 4);
-  if (!buf)
+  unsigned long bytes = (unsigned long)cw * ch * 4;
+  unsigned *px = calloc(1, bytes);
+  if (!px)
     return 0;
-  memset(buf, 0, (unsigned long)im->iw * im->ih * 4);
+  struct ru_scaler sc = {px, xmap_get(cw, im->iw), im->iw, im->ih, cw, ch, 0, true};
   struct poolrd r = {0, im->coff, im->clen};
-  struct imgc_fill f = {buf, im->iw, im->ih};
-  if (upng_decode(poolrd_get, &r, imgc_row, &f, 0, 0) != 0) {
-    free(buf);
+  if (upng_decode(poolrd_get, &r, imgc_scale_row, &sc, 0, 0) != 0) {
+    free(px);
     return 0;
   }
-  int slot = -1;
-  for (int i = 0; i < IMGC_N; i++)
-    if (!g_imgc[i].rgba) {
-      slot = i;
-      break;
-    }
-  static int rr = 0;
-  if (slot < 0) {
-    slot = rr;
-    rr = (rr + 1) % IMGC_N;
-    free(g_imgc[slot].rgba);
+  bool opaque = sc.opaque && sc.next_r == ch;
+  if (opaque)
+    ru_words_strip_alpha(px, (unsigned long)cw * ch);
+  struct ru_img e = {im->uid, im->iw, im->ih, cw, ch, px, bytes, 0, opaque};
+  if (!ru_imgcache_put(&g_imgc, &e)) {
+    free(px);
+    return 0;
   }
-  g_imgc[slot].uid = im->uid;
-  g_imgc[slot].iw = im->iw;
-  g_imgc[slot].ih = im->ih;
-  g_imgc[slot].rgba = buf;
-  return buf;
+  return ru_imgcache_find(&g_imgc, im->uid, im->iw, im->ih, dw, dh);
 }
 
-static void draw_inline_image(struct inl_img *im, int py, int phh, int paw)
+static void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
 {
   /* Draw with the exact geometry the row was reserved with (line_x/line_w),
    * not the full pane: an image inside a narrower/indented box was reserved at
    * its box width but, drawn at pane width, grew taller than its row and lapped
    * the next line. The caller's `paw` is only a fallback for an unrecorded row.
    */
+  const struct ltab *t = &g_fr->lt;
   int row = im->start_row;
-  int recorded = (row >= 0 && row < B->nlines);
-  int x0 = recorded ? B->line_x[row] : 4;
-  int rw = recorded ? B->line_w[row] : (paw < 1 ? 1 : paw);
+  bool recorded = (row >= 0 && row < t->n);
+  int x0 = recorded ? t->x[row] : 4;
+  int rw = recorded ? t->w[row] : (paw < 1 ? 1 : paw);
   int dw = 0, dh = 0;
   img_disp_size(im, rw, &dw, &dh);
   if (dw < 1)
     dw = 1;
   if (dh < 1)
     dh = 1;
-  int y0 = py + B->line_y[im->start_row] - B->pg->scroll, ct = py, cb = py + phh;
+  if (!recorded)
+    return;
+  int y0 = py + t->y[row] - B->pg->scroll;
+  int ry0 = y0 < ct ? ct - y0 : 0, ry1 = y0 + dh > cb ? cb - y0 : dh;
+  unsigned lo, hi;
+  if (ry1 <= ry0 || !clip_cols(x0, (unsigned)dw, &lo, &hi))
+    return;
+  unsigned *fb = browser_surface();
 
-  /* One scaled blit from a full RGBA source: SVGs live raw in img_pool; PNGs
-   * come from the decode cache (decoded once, not per frame). */
-  const unsigned char *src = im->is_argb ? (B->img_pool + im->coff) : imgc_get(im);
-  if (src) {
-    unsigned *fb = browser_surface();
-    for (int ry = 0; ry < dh; ry++) {
-      int dy = y0 + ry;
-      if (dy < ct || dy >= cb)
-        continue;
-      unsigned sy = (unsigned)ry * im->ih / (unsigned)dh;
-      const unsigned char *srow = src + (unsigned long)sy * im->iw * 4;
-      unsigned *drow = fb + (unsigned long)dy * BW + x0;
-      for (int x = 0; x < dw; x++) {
-        const unsigned char *p = srow + ((unsigned)x * im->iw / (unsigned)dw) * 4;
-        drow[x] = blend_px(p, drow[x]);
-      }
+  /* SVGs live raw in img_pool; PNGs come from the decode cache (decoded once,
+   * not per frame). */
+  if (im->is_argb) {
+    const unsigned char *src = B->img_pool + im->coff;
+    const unsigned *xm = xmap_get((unsigned)dw, im->iw);
+    for (int ry = ry0; ry < ry1; ry++) {
+      const unsigned char *srow = src + (unsigned long)((unsigned)ry * im->ih / (unsigned)dh) * im->iw * 4;
+      ru_blit_row_rgba(fb + (unsigned long)(y0 + ry) * BW + x0, srow, xm, (unsigned)dw, im->iw, lo, hi);
     }
     return;
   }
-  /* Fallback (image too large to cache / decode failed): stream it once. */
-  struct inlblit v = {x0, y0, dw, dh, ct, cb, im->iw, im->ih, 0};
+  const struct ru_img *c = imgc_get(im, (unsigned)dw, (unsigned)dh);
+  if (c) {
+    const unsigned *xm = c->cw == (unsigned)dw ? 0 : xmap_get((unsigned)dw, c->cw);
+    for (int ry = ry0; ry < ry1; ry++) {
+      const unsigned *srow = c->px + (unsigned long)((unsigned)ry * c->ch / (unsigned)dh) * c->cw;
+      ru_blit_row_words(fb + (unsigned long)(y0 + ry) * BW + x0, srow, xm, (unsigned)dw, c->cw, c->opaque, lo, hi);
+    }
+    return;
+  }
+  /* Fallback (too large to hold / decode failed): stream it once. */
+  struct inlblit v = {x0, y0, dw, dh, ct, cb, im->iw, im->ih, 0, xmap_get((unsigned)dw, im->iw), lo, hi};
   struct poolrd r = {0, im->coff, im->clen};
   upng_decode(poolrd_get, &r, inl_row, &v, 0, 0);
 }
 
 /* A placeholder box for an image that couldn't be fetched/decoded. */
-static void draw_alt_box(struct inl_img *im, int py, int phh)
+static void draw_alt_box(struct inl_img *im, int py, int ct, int cb)
 {
-  int y0 = py + B->line_y[im->start_row] - B->pg->scroll;
-  if (y0 + LINE_H <= py || y0 >= py + phh)
+  int y0 = py + g_fr->lt.y[im->start_row] - B->pg->scroll;
+  if (y0 + LINE_H <= ct || y0 >= cb)
     return; /* keep it in-pane    */
   const char *t = im->alt[0] ? im->alt : "[image]";
   int w = gfx_ui_width(t) + 8;
@@ -2468,42 +2744,42 @@ static void draw_alt_box(struct inl_img *im, int py, int phh)
  * overlay. */
 static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int line_h, int maxpx)
 {
-  set_block(off);
+  set_block(&g_ui, off);
 
   /* A horizontal rule is a whole-line element: a centred grey bar, no text. */
-  if (cur_bhr) {
-    int m = cur_bindent * INDENT_PX;
+  if (g_ui.bhr) {
+    int m = g_ui.bindent * INDENT_PX;
     gfx_fill_rect(x + m, y + LINE_H / 2, paw - m, 1, 0xc4c8cf);
     return x + m;
   }
 
-  x += cur_bindent * INDENT_PX; /* blockquote / list indent  */
-  int base = run_ascent(maxpx); /* baseline shared by the line's runs */
-  if (cur_bcenter == 1 || cur_bcenter == 2) {
+  x += g_ui.bindent * INDENT_PX; /* blockquote / list indent  */
+  int base = run_ascent(maxpx);  /* baseline shared by the line's runs */
+  if (g_ui.bcenter == 1 || g_ui.bcenter == 2) {
     int lw = 0, p = off, end = off + len;
     unsigned cp;
     while (p < end) {
       int gp = p;
       p += utf8_decode(&B->pg->text[p], &B->pg->text[end], &cp);
-      lw += body_cp_adv(cp, glyph_px(gp));
+      lw += body_cp_adv(&g_ui, cp, glyph_px(gp));
     }
-    int room = (paw - cur_bindent * INDENT_PX) - lw;
+    int room = (paw - g_ui.bindent * INDENT_PX) - lw;
     if (room > 0)
-      x += cur_bcenter == 1 ? room / 2 : room;
+      x += g_ui.bcenter == 1 ? room / 2 : room;
   }
   int x0 = x; /* line content origin (for selection) */
   int justify_extra = 0, justify_rem = 0, justify_spaces = 0;
-  if (cur_bcenter == 3) {
+  if (g_ui.bcenter == 3) {
     int lw = 0, p = off, end = off + len;
     unsigned cp;
     while (p < end) {
       int gp = p;
       p += utf8_decode(&B->pg->text[p], &B->pg->text[end], &cp);
-      lw += body_cp_adv(cp, glyph_px(gp));
+      lw += body_cp_adv(&g_ui, cp, glyph_px(gp));
       if (cp == ' ')
         justify_spaces++;
     }
-    int room = paw - cur_bindent * INDENT_PX - lw;
+    int room = paw - g_ui.bindent * INDENT_PX - lw;
     if (justify_spaces > 0 && room > 0) {
       justify_extra = room / justify_spaces;
       justify_rem = room % justify_spaces;
@@ -2529,7 +2805,7 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
         break;
       unsigned cp;
       utf8_decode(&B->pg->text[off + i], &B->pg->text[off + len], &cp);
-      rw += body_cp_adv(cp, rpx);
+      rw += body_cp_adv(&g_ui, cp, rpx);
       for (int b = 0; b < nb; b++)
         run[rl++] = B->pg->text[off + i++];
     }
@@ -2545,7 +2821,7 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
     if (a & ST_STRIKE)
       gfx_fill_rect(x, y + base - rpx / 3, rw, 1, fg);
     x += rw;
-    if (cur_bcenter == 3 && justify_spaces > 0) {
+    if (g_ui.bcenter == 3 && justify_spaces > 0) {
       int spaces = 0;
       for (int p = 0; p < rl;) {
         unsigned cp;
@@ -2568,9 +2844,9 @@ static int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int 
 
 static void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
 {
-  int off = B->line_off[idx], len = B->line_len[idx];
-  int x0 = draw_slice_core(x, y, off, len, paw, ct, cb, B->line_h[idx], B->line_px[idx]);
-  if (cur_bhr)
+  int off = g_fr->lt.off[idx], len = g_fr->lt.len[idx];
+  int x0 = draw_slice_core(x, y, off, len, paw, ct, cb, g_fr->lt.h[idx], g_fr->lt.px[idx]);
+  if (g_ui.bhr)
     return; /* rule: nothing to select   */
 
   /* Text selection: tint the selected byte span [s,e) of this display line. */
@@ -2587,15 +2863,15 @@ static void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb)
       for (int p = off; p < off + s;) {
         int gp = p;
         p += utf8_decode(&B->pg->text[p], &B->pg->text[off + len], &cp);
-        xs += body_cp_adv(cp, glyph_px(gp));
+        xs += body_cp_adv(&g_ui, cp, glyph_px(gp));
       }
       xe = xs;
       for (int p = off + s; p < off + e;) {
         int gp = p;
         p += utf8_decode(&B->pg->text[p], &B->pg->text[off + len], &cp);
-        xe += body_cp_adv(cp, glyph_px(gp));
+        xe += body_cp_adv(&g_ui, cp, glyph_px(gp));
       }
-      sel_hl_rect(xs, y, xe - xs, B->line_h[idx]);
+      sel_hl_rect(xs, y, xe - xs, g_fr->lt.h[idx], ct, cb);
     }
   }
 }
@@ -2880,101 +3156,8 @@ static int isin(int d)
 }
 static int icos(int d) { return isin(d + 90); }
 
-static unsigned isqrtu(unsigned v)
-{
-  unsigned r = 0, b = 1u << 30;
-  while (b > v)
-    b >>= 2;
-  while (b) {
-    if (v >= r + b) {
-      v -= r + b;
-      r = (r >> 1) + b;
-    } else
-      r >>= 1;
-    b >>= 2;
-  }
-  return r;
-}
-
-/* Gradient stops with positions normalised to percent (autos filled in). */
-struct gstops {
-  int col[CSS_BG_STOPS];
-  int pos[CSS_BG_STOPS];
-  int n;
-};
-static void resolve_stops(const struct css_bg_image *bi, struct gstops *g)
-{
-  int n = bi->nstops;
-  if (n > CSS_BG_STOPS)
-    n = CSS_BG_STOPS;
-  g->n = n;
-  for (int i = 0; i < n; i++) {
-    g->col[i] = bi->stops[i].color;
-    g->pos[i] = bi->stops[i].pos;
-  }
-  if (n > 0) {
-    if (g->pos[0] < 0)
-      g->pos[0] = 0;
-    if (g->pos[n - 1] < 0)
-      g->pos[n - 1] = 100;
-  }
-  for (int i = 1; i < n - 1; i++)
-    if (g->pos[i] < 0) { /* spread autos toward the next set stop */
-      int k = i + 1;
-      while (k < n && g->pos[k] < 0)
-        k++;
-      int next = (k < n) ? g->pos[k] : 100, span = k - (i - 1);
-      g->pos[i] = g->pos[i - 1] + (next - g->pos[i - 1]) / (span > 0 ? span : 1);
-    }
-  for (int i = 1; i < n; i++)
-    if (g->pos[i] < g->pos[i - 1])
-      g->pos[i] = g->pos[i - 1]; /* monotone */
-}
-
-static unsigned lerp_argb(unsigned c0, unsigned c1, int t) /* t in 0..1000 */
-{
-  int a0 = (c0 >> 24) & 255, r0 = (c0 >> 16) & 255, g0 = (c0 >> 8) & 255, b0 = c0 & 255;
-  int a1 = (c1 >> 24) & 255, r1 = (c1 >> 16) & 255, g1 = (c1 >> 8) & 255, b1 = c1 & 255;
-  unsigned a = a0 + (a1 - a0) * t / 1000, r = r0 + (r1 - r0) * t / 1000, g = g0 + (g1 - g0) * t / 1000,
-           b = b0 + (b1 - b0) * t / 1000;
-  return (a << 24) | (r << 16) | (g << 8) | b;
-}
-static unsigned grad_at(const struct gstops *g, int t1000) /* argb at param t (0..1000) */
-{
-  if (g->n == 0)
-    return 0;
-  int t100 = t1000 / 10;
-  if (t100 <= g->pos[0])
-    return (unsigned)g->col[0];
-  if (t100 >= g->pos[g->n - 1])
-    return (unsigned)g->col[g->n - 1];
-  for (int i = 1; i < g->n; i++)
-    if (t100 <= g->pos[i]) {
-      int lo = g->pos[i - 1], hi = g->pos[i];
-      int seg = hi > lo ? (t1000 - lo * 10) * 1000 / ((hi - lo) * 10) : 0;
-      if (seg < 0)
-        seg = 0;
-      if (seg > 1000)
-        seg = 1000;
-      return lerp_argb((unsigned)g->col[i - 1], (unsigned)g->col[i], seg);
-    }
-  return (unsigned)g->col[g->n - 1];
-}
-
-/* Composite a straight-ARGB source colour over a framebuffer pixel. */
-static unsigned over_argb(unsigned src, unsigned dst)
-{
-  unsigned a = (src >> 24) & 255;
-  if (a == 255)
-    return src & 0xffffff;
-  if (a == 0)
-    return dst;
-  unsigned ia = 255 - a;
-  unsigned r = (((src >> 16) & 255) * a + ((dst >> 16) & 255) * ia) / 255;
-  unsigned g = (((src >> 8) & 255) * a + ((dst >> 8) & 255) * ia) / 255;
-  unsigned b = ((src & 255) * a + (dst & 255) * ia) / 255;
-  return (r << 16) | (g << 8) | b;
-}
+/* One colour table per distinct stop set, shared by every gradient box. */
+static struct ru_glut g_glut;
 
 /* Paint a linear/radial gradient into the box rect, clipped to the visible band
  * [by,by+bh) and to x in [0,clipw). (bx,sy) is the FULL box top-left in screen
@@ -2985,14 +3168,17 @@ static void paint_gradient(const struct css_bg_image *bi, int bx, int sy, int bw
 {
   if (bw <= 0 || bh_full <= 0)
     return;
-  struct gstops g;
-  resolve_stops(bi, &g);
+  struct ru_gstops g;
+  ru_resolve_stops(bi, &g);
   if (g.n == 0)
     return;
+  const struct ru_glut *lut = ru_glut_get(&g_glut, &g);
   unsigned *fb = browser_surface();
   int x0 = bx < 0 ? 0 : bx, x1 = bx + bw;
   if (x1 > clipw)
     x1 = clipw;
+  if (x1 > BW)
+    x1 = BW;
   int cx = bw / 2, cy = bh_full / 2;
 
   if (bi->kind == CSS_BGK_LINEAR) {
@@ -3003,40 +3189,13 @@ static void paint_gradient(const struct css_bg_image *bi, int bx, int sy, int bw
     for (int yy = by; yy < by + bh; yy++) {
       int ry = yy - sy;
       long rowdot = (long)(ry - cy) * dy;
-      unsigned *drow = fb + (long)yy * BW;
-      for (int xx = x0; xx < x1; xx++) {
-        long dot = (long)(xx - bx - cx) * dx + rowdot;
-        int t = 500 + (int)(dot * 1000 / Lq);
-        if (t < 0)
-          t = 0;
-        if (t > 1000)
-          t = 1000;
-        drow[xx] = over_argb(grad_at(&g, t), drow[xx]);
-      }
+      ru_grad_linear_row(fb + (long)yy * BW, x0, x1, bx, cx, dx, rowdot, Lq, lut);
     }
   } else { /* radial (centred) */
     int hw = bw / 2 ? bw / 2 : 1, hh = bh_full / 2 ? bh_full / 2 : 1;
-    unsigned rad = bi->rad_circle ? isqrtu((unsigned)(hw * hw + hh * hh)) : 0;
-    for (int yy = by; yy < by + bh; yy++) {
-      int ry = yy - sy - cy;
-      unsigned *drow = fb + (long)yy * BW;
-      for (int xx = x0; xx < x1; xx++) {
-        int rx = xx - bx - cx;
-        int t;
-        if (bi->rad_circle) {
-          unsigned d = isqrtu((unsigned)(rx * rx + ry * ry));
-          t = rad ? (int)((long)d * 1000 / rad) : 1000;
-        } else { /* ellipse: per-axis normalised, 1000 = edge */
-          long nx = (long)rx * 1000 / hw, ny = (long)ry * 1000 / hh;
-          t = (int)isqrtu((unsigned)(nx * nx + ny * ny));
-        }
-        if (t < 0)
-          t = 0;
-        if (t > 1000)
-          t = 1000;
-        drow[xx] = over_argb(grad_at(&g, t), drow[xx]);
-      }
-    }
+    unsigned rad = bi->rad_circle ? ru_isqrt((unsigned)(hw * hw + hh * hh)) : 0;
+    for (int yy = by; yy < by + bh; yy++)
+      ru_grad_radial_row(fb + (long)yy * BW, x0, x1, bx, cx, yy - sy - cy, bi->rad_circle, hw, hh, rad, lut);
   }
 }
 
@@ -3092,9 +3251,12 @@ static void paint_bg_image(const struct bg_img *im, const struct css_bg_image *b
   int tiley = (rep == CSS_BGR_REPEAT || rep == CSS_BGR_REPEAT_Y);
 
   unsigned *fb = browser_surface();
+  const unsigned *xm = xmap_get((unsigned)dw, (unsigned)iw);
   int x0 = bx < 0 ? 0 : bx, x1 = bx + bw;
   if (x1 > clipw)
     x1 = clipw;
+  if (x1 > BW)
+    x1 = BW;
   for (int yy = by; yy < by + bh; yy++) {
     int ry = yy - sy - offy;
     if (tiley) {
@@ -3114,8 +3276,8 @@ static void paint_bg_image(const struct bg_img *im, const struct css_bg_image *b
           rx += dw;
       } else if (rx < 0 || rx >= dw)
         continue;
-      const unsigned char *p = srow + (long)(rx * iw / dw) * 4;
-      drow[xx] = blend_px(p, drow[xx]);
+      const unsigned char *p = srow + (long)(xm ? xm[rx] : (unsigned)(rx * iw / dw)) * 4;
+      drow[xx] = ru_blend_rgba(p, drow[xx]);
     }
   }
 }
@@ -3183,7 +3345,7 @@ static void fill_round_rect(int x, int y, int w, int h, int r, unsigned rgb, int
 }
 /* A box's drop shadow: an offset, spread, optionally blurred rounded rect. Blur
  * is faked with a few expanding, fading passes (outer faint -> inner solid). */
-static void draw_box_shadow(const struct lbox *b, int sy, int r, int ct, int cb)
+static void draw_box_shadow(const struct lbox *b, const struct lgeom *ge, int sy, int r, int ct, int cb)
 {
   unsigned argb = b->sh_color;
   int alpha = (int)((argb >> 24) & 0xff);
@@ -3191,12 +3353,12 @@ static void draw_box_shadow(const struct lbox *b, int sy, int r, int ct, int cb)
     alpha = 64;
   unsigned rgb = argb & 0xffffff;
   int sp = b->sh_spread, bl = b->sh_blur < 0 ? 0 : b->sh_blur;
-  int bx = b->x + b->sh_dx, by = sy + b->sh_dy;
+  int bx = ge->x + b->sh_dx, by = sy + b->sh_dy;
   if (bl <= 0) {
     int g = sp, rr = r + g;
     if (rr < 0)
       rr = 0;
-    fill_round_rect(bx - g, by - g, b->w + 2 * g, b->h + 2 * g, rr, rgb, alpha, ct, cb);
+    fill_round_rect(bx - g, by - g, ge->w + 2 * g, ge->h + 2 * g, rr, rgb, alpha, ct, cb);
     return;
   }
   for (int pass = 0; pass < 3; pass++) { /* outer (faint) -> inner (solid) */
@@ -3205,7 +3367,7 @@ static void draw_box_shadow(const struct lbox *b, int sy, int r, int ct, int cb)
     int rr = r + g;
     if (rr < 0)
       rr = 0;
-    fill_round_rect(bx - g, by - g, b->w + 2 * g, b->h + 2 * g, rr, rgb, a, ct, cb);
+    fill_round_rect(bx - g, by - g, ge->w + 2 * g, ge->h + 2 * g, rr, rgb, a, ct, cb);
   }
 }
 
@@ -3250,37 +3412,36 @@ static void draw_border_v(int x, int y, int w, int h, int style, unsigned color,
 }
 
 /* Paint one box's shadow, background (colour/gradient/image), border and
- * outline. `alpha` (0..255) is the element's opacity applied to the solid
- * background/border (images/gradients/outline stay opaque — a pragmatic
- * subset). */
-static void paint_one_box(struct lbox *b, int py, int pw, int phh, int top_doc)
+ * outline into the band [ct,cb), with `ge` its resolved geometry. `alpha`
+ * (0..255) is the element's opacity applied to the solid background/border
+ * (images/gradients/outline stay opaque; a pragmatic subset). */
+static void paint_one_box(const struct lbox *b, const struct lgeom *ge, int py, int pw, int ct, int cb, int top_doc)
 {
   int bgk = b->bgi.kind; /* CSS_BGK_* image layer, <=0 = none */
-  int has_img = bgk == CSS_BGK_LINEAR || bgk == CSS_BGK_RADIAL ||
-                (bgk == CSS_BGK_URL && b->bgi.img_idx >= 0 && b->bgi.img_idx < B->pg->n_bgimgs &&
-                 B->pg->bgimgs[b->bgi.img_idx].rgba);
-  int has_bg = b->bg != BG_NONE;
-  int has_bd = b->border_color != BG_NONE && (b->border.t || b->border.r || b->border.b || b->border.l);
-  int has_ol = b->outline_w > 0 && b->outline_color != BG_NONE;
+  bool has_img = bgk == CSS_BGK_LINEAR || bgk == CSS_BGK_RADIAL ||
+                 (bgk == CSS_BGK_URL && b->bgi.img_idx >= 0 && b->bgi.img_idx < B->pg->n_bgimgs &&
+                  B->pg->bgimgs[b->bgi.img_idx].rgba);
+  bool has_bg = b->bg != BG_NONE;
+  bool has_bd = b->border_color != BG_NONE && (b->border.t || b->border.r || b->border.b || b->border.l);
+  bool has_ol = b->outline_w > 0 && b->outline_color != BG_NONE;
   if (!has_bg && !has_bd && !has_img && !has_ol && b->sh_color == BG_NONE)
     return;
   int alpha = b->opacity < 0 ? 255 : b->opacity * 255 / 100;
-  int sy = py + b->y - top_doc; /* box top, screen y */
+  int sy = py + ge->y - top_doc; /* box top, screen y */
   int r = b->radius;
-  int cb = py + phh;
   if (b->sh_color != BG_NONE) /* drop shadow (clips itself to the band) */
-    draw_box_shadow(b, sy, r, py, cb);
-  int by = sy, bh = b->h;
-  if (by < py) {
-    bh -= py - by;
-    by = py;
+    draw_box_shadow(b, ge, sy, r, ct, cb);
+  int by = sy, bh = ge->h;
+  if (by < ct) {
+    bh -= ct - by;
+    by = ct;
   }
   if (by + bh > cb)
     bh = cb - by;
   /* Rounded path only for solid backgrounds; gradients/images stay square. */
   if (bh > 0 && r > 0 && !has_img && has_bg) {
     if (has_bd) { /* border ring: outer colour, inner bg */
-      fill_round_rect(b->x, sy, b->w, b->h, r, b->border_color, alpha, py, cb);
+      fill_round_rect(ge->x, sy, ge->w, ge->h, r, b->border_color, alpha, ct, cb);
       int il = b->border.l, it = b->border.t, ir = b->border.r, ib = b->border.b;
       int bw = il > it ? il : it;
       if (ir > bw)
@@ -3290,86 +3451,72 @@ static void paint_one_box(struct lbox *b, int py, int pw, int phh, int top_doc)
       int inr = r - bw;
       if (inr < 0)
         inr = 0;
-      fill_round_rect(b->x + il, sy + it, b->w - il - ir, b->h - it - ib, inr, b->bg, alpha, py, cb);
+      fill_round_rect(ge->x + il, sy + it, ge->w - il - ir, ge->h - it - ib, inr, b->bg, alpha, ct, cb);
     } else {
-      fill_round_rect(b->x, sy, b->w, b->h, r, b->bg, alpha, py, cb);
+      fill_round_rect(ge->x, sy, ge->w, ge->h, r, b->bg, alpha, ct, cb);
     }
   } else if (bh > 0) {
     if (has_bg) {
       if (alpha < 255)
-        fill_round_rect(b->x, by, b->w, bh, 0, b->bg, alpha, py, cb);
+        fill_round_rect(ge->x, by, ge->w, bh, 0, b->bg, alpha, ct, cb);
       else
-        gfx_fill_rect(b->x, by, b->w, bh, b->bg);
+        fill_clip(ge->x, by, ge->w, bh, b->bg, ct, cb);
     }
     if (has_img) {
       if (bgk == CSS_BGK_URL)
-        paint_bg_image(&B->pg->bgimgs[b->bgi.img_idx], &b->bgi, b->x, sy, b->w, b->h, by, bh, pw);
+        paint_bg_image(&B->pg->bgimgs[b->bgi.img_idx], &b->bgi, ge->x, sy, ge->w, ge->h, by, bh, pw);
       else
-        paint_gradient(&b->bgi, b->x, sy, b->w, b->h, by, bh, pw);
+        paint_gradient(&b->bgi, ge->x, sy, ge->w, ge->h, by, bh, pw);
     }
     if (has_bd) { /* 4 edges, clipped to the visible band */
-      if (b->border.t && sy >= py && sy < cb)
-        draw_border_h(b->x, sy, b->w, b->border.t, b->border_style[0], b->border_side_color[0], py, cb);
-      int bot = sy + b->h - b->border.b;
-      if (b->border.b && bot >= py && bot < cb)
-        draw_border_h(b->x, bot, b->w, b->border.b, b->border_style[2], b->border_side_color[2], py, cb);
+      if (b->border.t && sy >= ct && sy < cb)
+        draw_border_h(ge->x, sy, ge->w, b->border.t, b->border_style[0], b->border_side_color[0], ct, cb);
+      int bot = sy + ge->h - b->border.b;
+      if (b->border.b && bot >= ct && bot < cb)
+        draw_border_h(ge->x, bot, ge->w, b->border.b, b->border_style[2], b->border_side_color[2], ct, cb);
       if (b->border.l)
-        draw_border_v(b->x, by, b->border.l, bh, b->border_style[3], b->border_side_color[3], py, cb);
+        draw_border_v(ge->x, by, b->border.l, bh, b->border_style[3], b->border_side_color[3], ct, cb);
       if (b->border.r)
-        draw_border_v(b->x + b->w - b->border.r, by, b->border.r, bh, b->border_style[1], b->border_side_color[1], py,
+        draw_border_v(ge->x + ge->w - b->border.r, by, b->border.r, bh, b->border_style[1], b->border_side_color[1], ct,
                       cb);
     }
   }
   if (has_ol) { /* outline: a ring just outside the border box */
     int ow = b->outline_w;
     unsigned oc = b->outline_color;
-    fill_clip(b->x - ow, sy - ow, b->w + 2 * ow, ow, oc, py, cb);   /* top    */
-    fill_clip(b->x - ow, sy + b->h, b->w + 2 * ow, ow, oc, py, cb); /* bottom */
-    fill_clip(b->x - ow, sy, ow, b->h, oc, py, cb);                 /* left   */
-    fill_clip(b->x + b->w, sy, ow, b->h, oc, py, cb);               /* right  */
+    fill_clip(ge->x - ow, sy - ow, ge->w + 2 * ow, ow, oc, ct, cb);    /* top    */
+    fill_clip(ge->x - ow, sy + ge->h, ge->w + 2 * ow, ow, oc, ct, cb); /* bottom */
+    fill_clip(ge->x - ow, sy, ow, ge->h, oc, ct, cb);                  /* left   */
+    fill_clip(ge->x + ge->w, sy, ow, ge->h, oc, ct, cb);               /* right  */
   }
 }
 
-/* Paint every box. Boxes paint in pre-order (a child over its parent), but
- * split into three z-index bands so positive z-index lands above the normal
- * flow and negative below — within a band, document order is the tiebreak. */
-static void paint_boxes(int py, int pw, int phh)
+/* Paint every box that touches the band [ct,cb). Boxes paint in pre-order (a
+ * child over its parent), but split into three z-index bands so positive z-index
+ * lands above the normal flow and negative below; within a band, document order
+ * is the tiebreak. The layout's per-band index narrows each pass to the boxes
+ * whose vertical extent can reach the band. */
+static void paint_boxes(int py, int pw, int ct, int cb)
 {
-  if (!g_box_layout || B->nlines == 0)
-    return;
+  const struct layout_out *o = g_fr;
   int n;
-  struct lbox *bx = layout_pool(&n);
+  const struct lbox *bx = layout_pool(&n);
+  if (!g_box_layout || o->lt.n == 0 || n != o->n_geo || !o->bands.idx)
+    return;
   int top_doc = B->pg->scroll; /* document px at the pane top */
-  for (int band = 0; band < 3; band++)
-    for (int i = 0; i < n; i++) {
-      int z = bx[i].z_index;
-      int ez = (z == CSS_Z_AUTO) ? 0 : z;
-      int g = ez < 0 ? 0 : (ez == 0 ? 1 : 2);
-      if (g != band)
+  int vtop = top_doc + (ct - py), vbot = top_doc + (cb - py);
+  for (int band = 0; band < 3; band++) {
+    int lo, hi;
+    ru_bands_span(&o->bands, band, vtop, vbot, &lo, &hi);
+    for (int p = lo; p < hi; p++) {
+      int i = o->bands.idx[p];
+      int top, bot;
+      box_extent(&bx[i], &o->geo[i], &top, &bot);
+      if (bot <= vtop || top >= vbot)
         continue;
-      /* Cheap vertical cull before the per-box geometry work: skip a box
-       * whose extent doesn't reach the visible band [top_doc, top_doc+phh).
-       * A shadow/outline spills past the border box, so widen the test by
-       * that much to keep an off-screen box's spill correct. */
-      struct lbox *b = &bx[i];
-      int top = b->y, bot = b->y + b->h;
-      if (b->outline_w > 0) {
-        top -= b->outline_w;
-        bot += b->outline_w;
-      }
-      if (b->sh_color != BG_NONE) {
-        int bl = b->sh_blur < 0 ? 0 : b->sh_blur;
-        int ext = b->sh_spread + bl;
-        int st = b->y + b->sh_dy - ext, sb = b->y + b->h + b->sh_dy + ext;
-        if (st < top)
-          top = st;
-        if (sb > bot)
-          bot = sb;
-      }
-      if (bot <= top_doc || top >= top_doc + phh)
-        continue;
-      paint_one_box(b, py, pw, phh, top_doc);
+      paint_one_box(&bx[i], &o->geo[i], py, pw, ct, cb, top_doc);
     }
+  }
 }
 
 /* Outline a devtools-selected element's box over the page: a 2px accent border,
@@ -3504,12 +3651,14 @@ struct bm_row {
   struct bm_node *node;
   int depth;
 };
-static struct bm_row bm_rows[1024];
-static int bm_nrows;
+static struct bm_row *bm_rows;
+static int bm_nrows, bm_rows_cap;
 static void bm_flatten_into(struct bm_node *folder, int depth)
 {
   for (struct bm_node *n = folder->child; n; n = n->next) {
-    if (bm_nrows < (int)(sizeof bm_rows / sizeof bm_rows[0])) {
+    struct bm_row *p = grow_arr(bm_rows, &bm_rows_cap, bm_nrows + 1, sizeof *p);
+    if (p) {
+      bm_rows = p;
       bm_rows[bm_nrows].node = n;
       bm_rows[bm_nrows].depth = depth;
       bm_nrows++;
@@ -3639,13 +3788,164 @@ static bool bm_panel_click(int mx, int my)
   return true;
 }
 
+/* The hovered-link status box rows (screen y), which sit at the pane's bottom-left. */
+static void hover_rows(int *y0, int *y1)
+{
+  int sh = UIFONT_H + 6;
+  int by = BH - sh;
+  if (by < MENU_H + TAB_H + ADDR_H)
+    by = MENU_H + TAB_H + ADDR_H;
+  *y0 = by;
+  *y1 = by + sh < BH ? by + sh : BH;
+}
+
+/* Hovered-link status: a small flat box pinned to the content pane's bottom-
+ * left, like Chrome/Firefox; drawn only while a link is under the cursor, on
+ * top of the page but below the menu bar and its dropdowns. */
+static void draw_hover_status(void)
+{
+  int by, y1;
+  hover_rows(&by, &y1);
+  int sh = UIFONT_H + 6;
+  int maxw = (devtools_visible() ? devtools_left() : BW) - 2;
+  char shown[URL_MAX];
+  fit_ui(shown, sizeof shown, hover_url, maxw - 12);
+  int sw = gfx_ui_width(shown) + 12;
+  if (sw > maxw)
+    sw = maxw;
+  gfx_fill_rect(0, by, sw, sh, 0x202830);
+  gfx_rect(0, by, sw, sh, 0x10141a);
+  gfx_ui_text(6, by + 3, shown, 0xe8eaee);
+}
+
+/* Paint the page (box backgrounds, text, images, media) for the content-pane
+ * rows [ct,cb); the pane's top edge is at screen y `py`. Callers hold
+ * browser_buf_lock. Everything is confined to the band, so a band is also the
+ * unit of an incremental repaint. */
+static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
+{
+  const struct ltab *t = &g_fr->lt;
+  int paw = pw - 8; /* content width, px */
+  int sc = B->pg->scroll, vt = sc + (ct - py), vb = sc + (cb - py), over = g_fr->over;
+  gfx_set_clip(0, ct, pw, cb - ct);
+  gfx_fill_rect(0, ct, pw, cb - ct, bg);
+
+  /* The worker owns the line-table flow (see worker_fn). render() only paints
+   * the table it built; never reflows; so a heavy page can't stall the event
+   * loop here. If the worker hasn't caught up to the current width yet, we paint
+   * the existing table for this frame; the worker re-flows within a tick. */
+  if (!B->pg->text) {
+    g_fr->lt.n = 0;
+    B->layout_dirty = 1;
+  }
+  paint_boxes(py, pw, ct, cb); /* block backgrounds behind the text */
+  if (B->loading && t->n == 0) {
+    gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
+  } else if (t->n == 0 && !B->pg->cur_url[0]) {
+    /* No page loaded; a fresh tab: prompt for a URL. A page that
+     * loaded but produced no lines just stays its blank canvas. */
+    gfx_ui_text(8, py + 8, "Type a URL above and press Enter.", 0x707880);
+    gfx_ui_text(8, py + 8 + UIFONT_H, "e.g. example.com  or  https://example.com", 0x9098a0);
+  }
+  for (int i = lt_line_at(t, vt - over); i < t->n; i++) {
+    int sy = py + t->y[i] - sc;
+    if (sy >= cb)
+      break; /* below the band: done */
+    if (sy + t->h[i] + over <= ct || t->off[i] + t->len[i] > B->pg->text_len)
+      continue;
+    draw_styled_line(t->x[i], sy, i, t->w[i], ct, cb);
+  }
+
+  /* flex-row item text, drawn over the reserved band at each item's column */
+  for (int q = 0; q < g_fr->n_fs; q++) {
+    const struct fslice *f = &g_fr->fs[q];
+    if (f->row < 0 || f->row >= t->n || f->off + f->len > B->pg->text_len)
+      continue;
+    int sy = py + t->y[f->row] - sc;
+    if (sy + t->h[f->row] + over <= ct || sy >= cb)
+      continue;
+    draw_slice_core(f->x, sy, f->off, f->len, f->w, ct, cb, f->h, f->maxpx);
+  }
+
+  /* inline images, over their reserved (blank) rows */
+  for (int q = 0; q < B->pg->n_imgs; q++) {
+    struct inl_img *im = &B->pg->imgs[q];
+    if (im->start_row < 0 || im->start_row >= t->n)
+      continue;
+    int r1 = im->start_row + (im->rows > 0 ? im->rows : 1);
+    if (r1 > t->n)
+      r1 = t->n;
+    int itop = t->y[im->start_row], ibot = lt_bottom(t, r1 - 1);
+    if (ibot <= vt || itop >= vb)
+      continue; /* off-screen */
+    /* On-screen now: a deferred loading="lazy" image gets flagged so the
+     * worker fetches it (no-op once fetched). */
+    if (im->lazy && !im->fetched && show_images)
+      im->want = 1;
+    if (im->ok && show_images)
+      draw_inline_image(im, py, ct, cb, paw);
+    else
+      draw_alt_box(im, py, ct, cb);
+  }
+
+  /* <audio>/<video> control widgets, over their reserved rows */
+  for (struct media_el *me = media_doc_first(); me; me = media_doc_next(me)) {
+    int sr = media_el_start_row(me);
+    if (sr < 0 || sr >= t->n)
+      continue;
+    int r1 = sr + media_el_rows(me);
+    if (r1 > t->n)
+      r1 = t->n;
+    int itop = t->y[sr], ibot = lt_bottom(t, r1 - 1);
+    if (ibot <= vt || itop >= vb)
+      continue; /* off-screen */
+    media_el_draw(me, 4, py + t->y[sr] - sc, paw, ct, cb);
+  }
+  gfx_clip_none();
+}
+
+/* What the surface holds from the last paint, so a scroll or a small change can
+ * reuse it instead of repainting everything. */
+static struct {
+  bool valid;
+  const struct page *pg;
+  int bw, bh, scroll;
+  unsigned sig;
+} g_painted;
+
+static bool menu_any_open(void);
+
+/* Hash of everything that can change the pane without a tracked UI action. */
+static unsigned render_sig(void)
+{
+  const struct page *pg = B->pg;
+  unsigned h = layout_mix((unsigned)(unsigned long)pg, (unsigned)BW | ((unsigned)BH << 16));
+  h = layout_mix(h, B->layout_seq);
+  h = layout_mix(h, (unsigned)g_fr->lt.n);
+  h = layout_mix(h, (unsigned)pg->text_len);
+  h = layout_mix(h, (unsigned)pg->mode | ((unsigned)B->loading << 8) | ((unsigned)B->req_pending << 9) |
+                        ((unsigned)tabs[active_tab].crashed << 10) | ((unsigned)show_images << 11) |
+                        ((unsigned)devtools_visible() << 12) | ((unsigned)bm_panel_open << 13) |
+                        ((unsigned)menu_any_open() << 14) | ((unsigned)media_active() << 15) |
+                        ((unsigned)active_tab << 16) | ((unsigned)n_tabs << 20));
+  h = layout_mix(h, pg->page_bg);
+  h = layout_mix(h, (unsigned)(unsigned long)pg->body_font);
+  h = layout_mix(h, (unsigned)pg->n_bgimgs);
+  for (int q = 0; q < pg->n_imgs; q++) {
+    const struct inl_img *im = &pg->imgs[q];
+    h = layout_mix(h, (unsigned)im->ok | ((unsigned)im->start_row << 1));
+    h = layout_mix(h, (unsigned)im->uid);
+  }
+  return h;
+}
+
 static void render(void)
 {
   unsigned bg = B->pg->page_bg;
-  /* Hold off any buffer-relocating realloc on the worker thread while we read
-   * text/attr/line_off/img_pool/imgs/raw below (see browser_buf_lock in browser.h).
-   * render() does only in-memory gfx work — no syscalls that block — so the
-   * worker is never stalled for long. */
+  /* Hold off any buffer-relocating realloc on the worker thread, and any swap of
+   * the line table, while we read text/attr/line table/img_pool/imgs/raw below
+   * (see browser_buf_lock in browser.h). render() does only in-memory gfx work,
+   * no syscalls that block; so the worker is never stalled for long. */
   browser_buf_lock();
 
   /* tab strip (between the menu bar and the address bar). Each tab passes its
@@ -3679,114 +3979,26 @@ static void render(void)
   int phh = BH - MENU_H - TAB_H - ADDR_H;
   if (phh < 0)
     phh = 0;
-  gfx_fill_rect(0, py, pw, phh, bg);
 
   if (tabs[active_tab].crashed) {
+    gfx_fill_rect(0, py, pw, phh, bg);
     draw_crash_page(py, pw, phh);
     scrollbar_draw(pw, py, SCROLL_W, phh, 0, 0, 0); /* inert scrollbar */
   } else if (B->pg->mode == MODE_IMAGE) {
+    gfx_fill_rect(0, py, pw, phh, bg);
     if (B->loading)
       gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
     else
       draw_image(0, py, pw, phh, bg);
     scrollbar_draw(pw, py, SCROLL_W, phh, 0, 0, 0); /* inert scrollbar */
   } else {
-    int paw = pw - 8; /* content width, px */
-    /* The worker owns the line-table flow (see worker_fn). render() only paints
-     * the table it built — never reflows — so a heavy page can't stall the
-     * event loop here. If the worker hasn't caught up to the current width yet,
-     * we paint the existing table for this frame; the worker re-flows within a
-     * tick. */
-    if (!B->pg->text) {
-      B->nlines = 0;
-      B->layout_dirty = 1;
-    }
-    paint_boxes(py, pw, phh); /* block backgrounds behind the text */
-    if (B->loading && B->nlines == 0) {
-      gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
-    } else if (B->nlines == 0 && !B->pg->cur_url[0]) {
-      /* No page loaded — a fresh tab: prompt for a URL. A page that
-       * loaded but produced no lines just stays its blank canvas. */
-      gfx_ui_text(8, py + 8, "Type a URL above and press Enter.", 0x707880);
-      gfx_ui_text(8, py + 8 + UIFONT_H, "e.g. example.com  or  https://example.com", 0x9098a0);
-    }
-    int sc = B->pg->scroll;
-    for (int i = line_at_px(sc); i < B->nlines; i++) {
-      int sy = py + B->line_y[i] - sc;
-      if (sy >= py + phh)
-        break; /* below the pane: done */
-      draw_styled_line(B->line_x[i], sy, i, B->line_w[i], py, py + phh);
-    }
-
-    /* flex-row item text, drawn over the reserved band at each item's column */
-    for (int q = 0; q < B->n_fslices; q++) {
-      struct fslice *f = &B->fslices[q];
-      if (f->row < 0 || f->row >= B->nlines)
-        continue;
-      int sy = py + B->line_y[f->row] - sc;
-      if (sy + B->line_h[f->row] <= py || sy >= py + phh)
-        continue;
-      draw_slice_core(f->x, sy, f->off, f->len, f->w, py, py + phh, f->h, f->maxpx);
-    }
-
-    /* inline images, over their reserved (blank) rows */
-    for (int q = 0; q < B->pg->n_imgs; q++) {
-      struct inl_img *im = &B->pg->imgs[q];
-      if (im->start_row < 0)
-        continue;
-      int r1 = im->start_row + (im->rows > 0 ? im->rows : 1);
-      if (r1 > B->nlines)
-        r1 = B->nlines;
-      int itop = B->line_y[im->start_row], ibot = line_bottom(r1 - 1);
-      if (ibot <= sc || itop >= sc + phh)
-        continue; /* off-screen */
-      /* On-screen now: a deferred loading="lazy" image gets flagged so the
-       * worker fetches it (no-op once fetched). */
-      if (im->lazy && !im->fetched && show_images)
-        im->want = 1;
-      if (im->ok && show_images)
-        draw_inline_image(im, py, phh, paw);
-      else
-        draw_alt_box(im, py, phh);
-    }
-
-    /* <audio>/<video> control widgets, over their reserved rows */
-    for (struct media_el *me = media_doc_first(); me; me = media_doc_next(me)) {
-      int sr = media_el_start_row(me);
-      if (sr < 0)
-        continue;
-      int r1 = sr + media_el_rows(me);
-      if (r1 > B->nlines)
-        r1 = B->nlines;
-      int itop = B->line_y[sr], ibot = line_bottom(r1 - 1);
-      if (ibot <= sc || itop >= sc + phh)
-        continue; /* off-screen */
-      media_el_draw(me, 4, py + B->line_y[sr] - sc, paw, py, py + phh);
-    }
-
+    paint_page_band(py, pw, py, py + phh, bg);
     /* scrollbar (units are document pixels) */
-    scrollbar_draw(pw, py, SCROLL_W, phh, sc, doc_px(), phh);
+    scrollbar_draw(pw, py, SCROLL_W, phh, B->pg->scroll, g_fr->doc_h, phh);
   }
 
-  /* Hovered-link status: a small flat box pinned to the content pane's bottom-
-   * left, like Chrome/Firefox — drawn only while a link is under the cursor, on
-   * top of the page but below the menu bar and its dropdowns. */
-  if (hover_url[0]) {
-    int sy0 = MENU_H + TAB_H + ADDR_H;
-    int sh = UIFONT_H + 6;
-    int by = BH - sh;
-    if (by < sy0)
-      by = sy0;
-    int maxw = (devtools_visible() ? devtools_left() : BW) - 2;
-    char shown[URL_MAX];
-    fit_ui(shown, sizeof shown, hover_url, maxw - 12);
-    int sw = gfx_ui_width(shown) + 12;
-    if (sw > maxw)
-      sw = maxw;
-    gfx_fill_rect(0, by, sw, sh, 0x202830);
-    gfx_rect(0, by, sw, sh, 0x10141a);
-    gfx_ui_text(6, by + 3, shown, 0xe8eaee);
-  }
+  if (hover_url[0])
+    draw_hover_status();
 
   /* Devtools element highlight: outline the selected node's box over the page
    * (HTML pages only; an image page has no DOM to select). The box is document
@@ -3816,7 +4028,145 @@ static void render(void)
   gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
   menubar_draw(&menubar);
 
+  g_painted.valid = true;
+  g_painted.pg = B->pg;
+  g_painted.bw = BW;
+  g_painted.bh = BH;
+  g_painted.scroll = B->pg->scroll;
+  g_painted.sig = render_sig();
   browser_buf_unlock();
+}
+
+/* Pane rows dirtied by tracked UI actions (hover box, selection drag, media
+ * ticks) since the last paint, and how many B->seq bumps those actions made. A
+ * frame whose seq moved by exactly that many, with the pane otherwise unchanged
+ * (render_sig), repaints only the dirty rows. Main thread only. */
+static struct {
+  unsigned bumps;
+  bool band;
+  int y0, y1;
+} g_dmg;
+
+static void damage_rows(int y0, int y1)
+{
+  if (!g_dmg.band) {
+    g_dmg.band = true;
+    g_dmg.y0 = y0;
+    g_dmg.y1 = y1;
+  } else {
+    if (y0 < g_dmg.y0)
+      g_dmg.y0 = y0;
+    if (y1 > g_dmg.y1)
+      g_dmg.y1 = y1;
+  }
+  g_dmg.bumps++;
+  B->seq++;
+}
+
+/* Mark the display lines [lo,hi] dirty, if any of them is on screen. */
+static void damage_lines(int lo, int hi)
+{
+  int py, phh, rows;
+  pane_metrics(&py, &phh, &rows);
+  browser_buf_lock();
+  const struct ltab *t = &g_fr->lt;
+  if (lo < 0)
+    lo = 0;
+  if (hi >= t->n)
+    hi = t->n - 1;
+  int y0 = 0, y1 = 0;
+  if (lo <= hi) {
+    y0 = py + t->y[lo] - B->pg->scroll;
+    y1 = py + lt_bottom(t, hi) - B->pg->scroll;
+  }
+  browser_buf_unlock();
+  y0 = y0 < py ? py : y0;
+  y1 = y1 > py + phh ? py + phh : y1;
+  if (y1 > y0)
+    damage_rows(y0, y1);
+}
+
+/* A playing <audio>/<video> widget ticks: dirty just the visible widget rows. */
+static void damage_media(void)
+{
+  int py, phh, rows;
+  pane_metrics(&py, &phh, &rows);
+  int y0 = py + phh, y1 = py;
+  browser_buf_lock();
+  const struct ltab *t = &g_fr->lt;
+  for (struct media_el *me = media_doc_first(); me; me = media_doc_next(me)) {
+    int sr = media_el_start_row(me);
+    if (sr < 0 || sr >= t->n)
+      continue;
+    int r1 = sr + media_el_rows(me);
+    if (r1 > t->n)
+      r1 = t->n;
+    int top = py + t->y[sr] - B->pg->scroll, bot = py + lt_bottom(t, r1 - 1) - B->pg->scroll;
+    if (top < y0)
+      y0 = top;
+    if (bot > y1)
+      y1 = bot;
+  }
+  browser_buf_unlock();
+  y0 = y0 < py ? py : y0;
+  y1 = y1 > py + phh ? py + phh : y1;
+  if (y1 > y0)
+    damage_rows(y0, y1);
+}
+
+/* Paint only what the tracked damage covers, straight onto the surface from the
+ * last paint. False when something else changed (or an overlay is up), so the
+ * caller does a full render(). */
+static bool render_incremental(unsigned seq_delta, int id)
+{
+  if (seq_delta != g_dmg.bumps || !g_painted.valid || g_painted.pg != B->pg || g_painted.bw != BW ||
+      g_painted.bh != BH || g_painted.sig != render_sig())
+    return false;
+  if (devtools_visible() || bm_panel_open || menu_any_open() || tabs[active_tab].crashed || B->pg->mode == MODE_IMAGE ||
+      is_loading() || !browser_surface_ready())
+    return false;
+  int py, phh, rows;
+  pane_metrics(&py, &phh, &rows);
+  int pw = BW - SCROLL_W;
+  bool scrolled = B->pg->scroll != g_painted.scroll;
+  struct ru_scroll_plan plan = {0};
+  if (scrolled &&
+      (g_dmg.band || hover_url[0] || media_active() || !ru_scroll_plan(g_painted.scroll, B->pg->scroll, phh, &plan)))
+    return false;
+
+  int ct = 0, cb = 0;
+  browser_buf_lock();
+  unsigned *fb = browser_surface();
+  if (scrolled) {
+    memmove(fb + (unsigned long)(py + plan.dst) * BW, fb + (unsigned long)(py + plan.src) * BW,
+            (unsigned long)plan.rows * BW * 4);
+    ct = py + plan.strip;
+    cb = ct + plan.strip_n;
+  } else if (g_dmg.band) {
+    ct = g_dmg.y0 < py ? py : g_dmg.y0;
+    cb = g_dmg.y1 > py + phh ? py + phh : g_dmg.y1;
+  }
+  if (cb > ct)
+    paint_page_band(py, pw, ct, cb, B->pg->page_bg);
+  if (scrolled || cb > ct) {
+    scrollbar_draw(pw, py, SCROLL_W, phh, B->pg->scroll, g_fr->doc_h, phh);
+    if (hover_url[0])
+      draw_hover_status();
+  }
+  g_painted.scroll = B->pg->scroll;
+  browser_buf_unlock();
+
+  if (scrolled)
+    browser_blit_rect(0, py, BW, phh);
+  else if (cb > ct) {
+    browser_blit_rect(0, ct, BW, cb - ct);
+    browser_blit_rect(pw, py, SCROLL_W, phh);
+  }
+  if (scrolled || cb > ct)
+    win_present(id);
+  g_dmg.bumps = 0;
+  g_dmg.band = false;
+  return true;
 }
 
 /* True while any menu dropdown is expanded. Such a dropdown overlaps the
@@ -3833,10 +4183,11 @@ static bool menu_any_open(void)
 /* Repaint only the address-bar strip (its background, the Back/Forward buttons,
  * and the URL field) and leave the page untouched. The page below and the menu
  * bar above don't intersect this row, so a present's frame diff blits just this
- * strip — no rewrap, no line/image redraw. Touches no shared content buffers,
- * so unlike render() it needs no browser_buf_lock. */
+ * strip; no rewrap, no line/image redraw. It takes browser_buf_lock only to keep
+ * the worker's measuring off the shared glyph caches while it draws text. */
 static void render_addr(void)
 {
+  browser_buf_lock();
   gfx_fill_rect(0, MENU_H + TAB_H, BW, ADDR_H, 0x222831);
   struct rect rb, rf, rrl, rtf, rst;
   addr_layout(&rb, &rf, &rrl, &rtf, &rst);
@@ -3846,6 +4197,7 @@ static void render_addr(void)
   reload_btn_draw(&rrl);
   textfield_draw(&B->addr_tf, rtf.x, rtf.y, rtf.w, rtf.h, 1);
   star_btn_draw(&rst);
+  browser_buf_unlock();
 }
 
 /* --------------------------------------------------------------- input */
@@ -3872,6 +4224,7 @@ static void scroll_set(int target)
     target = 0;
   if (target != B->pg->scroll) {
     B->pg->scroll = target;
+    g_dmg.bumps++;
     B->seq++;
   }
 }
@@ -3968,7 +4321,7 @@ static void show_blank(void)
   B->pg->doc_title[0] = '\0';
   B->pg->mode = MODE_HTML;
   B->pg->text_len = 0;
-  B->nlines = 0;
+  g_fr->lt.n = 0;
   B->pg->n_imgs = 0;
   B->pg->nlinks = 0;
   B->pg->page_bg = 0xffffff;
@@ -4172,20 +4525,20 @@ static int hov_row = -1, hov_link = -1, hov_lo, hov_hi;
  * selection mappers so neither can drift from the painted position. */
 static int line_content_x(int row)
 {
-  int len = B->line_len[row], base = B->line_off[row];
-  set_block(base);
-  int x = B->line_x[row] + cur_bindent * INDENT_PX;
-  if (cur_bcenter == 1 || cur_bcenter == 2) {
+  int len = g_fr->lt.len[row], base = g_fr->lt.off[row];
+  set_block(&g_ui, base);
+  int x = g_fr->lt.x[row] + g_ui.bindent * INDENT_PX;
+  if (g_ui.bcenter == 1 || g_ui.bcenter == 2) {
     int lw = 0;
     unsigned cp;
     for (int p = base; p < base + len;) {
       int gp = p;
       p += utf8_decode(&B->pg->text[p], &B->pg->text[base + len], &cp);
-      lw += body_cp_adv(cp, glyph_px(gp));
+      lw += body_cp_adv(&g_ui, cp, glyph_px(gp));
     }
-    int room = (B->line_w[row] - cur_bindent * INDENT_PX) - lw;
+    int room = (g_fr->lt.w[row] - g_ui.bindent * INDENT_PX) - lw;
     if (room > 0)
-      x += cur_bcenter == 1 ? room / 2 : room;
+      x += g_ui.bcenter == 1 ? room / 2 : room;
   }
   return x;
 }
@@ -4208,18 +4561,18 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
   int right = devtools_visible() ? devtools_left() : BW;
   if (my < py || my >= py + phh || mx < 0 || mx >= right - SCROLL_W)
     return; /* outside the content pane: skip the lock */
-  int row = line_at_px(B->pg->scroll + (my - py));
   browser_buf_lock();
-  if (row >= 0 && row < B->nlines) {
+  int row = lt_line_at(&g_fr->lt, B->pg->scroll + (my - py));
+  if (row >= 0 && row < g_fr->lt.n) {
     /* proportional: walk the line's glyphs from the painted origin (block
      * indent + centering, via line_content_x) to find which char the point
      * falls on. A point left of the glyphs is not on any char. */
-    int len = B->line_len[row], base = B->line_off[row], col = -1;
+    int len = g_fr->lt.len[row], base = g_fr->lt.off[row], col = -1;
     int x = line_content_x(row);
     for (int k = 0; mx >= x && k < len;) {
       unsigned cp;
       int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
-      int cw = body_cp_adv(cp, glyph_px(base + k));
+      int cw = body_cp_adv(&g_ui, cp, glyph_px(base + k));
       if (mx < x + cw) {
         col = k;
         break;
@@ -4302,20 +4655,20 @@ static void pane_linecol(int mx, int my, int *line, int *col)
    * a freed text buffer (utf8_decode would then deref a NULL/dangling pointer).
    */
   browser_buf_lock();
-  if (B->pg->text && B->nlines > 0) {
-    int row = line_at_px(B->pg->scroll + (my - py));
+  if (B->pg->text && g_fr->lt.n > 0) {
+    int row = lt_line_at(&g_fr->lt, B->pg->scroll + (my - py));
     if (row < 0)
       row = 0;
-    if (row >= B->nlines)
-      row = B->nlines - 1;
+    if (row >= g_fr->lt.n)
+      row = g_fr->lt.n - 1;
     *line = row;
-    int len = B->line_len[row], base = B->line_off[row];
+    int len = g_fr->lt.len[row], base = g_fr->lt.off[row];
     int x = line_content_x(row); /* match draw_styled_line */
     int c = len;                 /* default: end of line */
     for (int k = 0; k < len;) {
       unsigned cp;
       int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
-      int cw = body_cp_adv(cp, glyph_px(base + k));
+      int cw = body_cp_adv(&g_ui, cp, glyph_px(base + k));
       if (mx < x + cw / 2) {
         c = k;
         break;
@@ -4328,13 +4681,14 @@ static void pane_linecol(int mx, int my, int *line, int *col)
   browser_buf_unlock();
 }
 
-/* Alpha-blend a translucent selection highlight over the frame buffer rect. */
-static void sel_hl_rect(int x, int y, int w, int h)
+/* Alpha-blend a translucent selection highlight over the frame buffer rect,
+ * clipped to the rows [ct,cb). */
+static void sel_hl_rect(int x, int y, int w, int h, int ct, int cb)
 {
   unsigned *fb = browser_surface();
   const unsigned sr = 0x33, sg = 0x66, sb = 0xcc, a = 110, ia = 255 - a; /* ~43% blue */
   for (int yy = y; yy < y + h; yy++) {
-    if (yy < 0 || yy >= BH)
+    if (yy < ct || yy >= cb || yy < 0 || yy >= BH)
       continue;
     unsigned *row = fb + (unsigned long)yy * BW;
     for (int xx = x; xx < x + w; xx++) {
@@ -4418,7 +4772,7 @@ static void handle_click(int mx, int my)
     else if (sbpart == SCROLLBAR_DOWN)
       target = B->pg->scroll + 3 * LINE_H;
     else
-      target = scrollbar_pos(right - SCROLL_W, py, SCROLL_W, phh, mx, my, B->pg->scroll, doc_px(), phh);
+      target = scrollbar_pos(right - SCROLL_W, py, SCROLL_W, phh, mx, my, B->pg->scroll, g_fr->doc_h, phh);
     scroll_set(target);
     return;
   }
@@ -4450,7 +4804,7 @@ static void handle_click(int mx, int my)
         int sr = media_el_start_row(me);
         if (sr < 0)
           continue;
-        int y0 = py + B->line_y[sr] - sc, h = media_el_height(me, paw);
+        int y0 = py + g_fr->lt.y[sr] - sc, h = media_el_height(me, paw);
         if (mx >= 4 && mx < 4 + paw && my >= y0 && my < y0 + h) {
           media_el_click(me, mx, my, 4, y0, paw);
           return;
@@ -4581,7 +4935,9 @@ static void handle_move(int mx, int my)
     return;
   int k = 0;
   sapp(hover_url, &k, sizeof hover_url, url);
-  B->seq++;
+  int y0, y1;
+  hover_rows(&y0, &y1);
+  damage_rows(y0, y1);
 }
 
 /* Left-button drag in the content pane (WEV_DRAG): extend an in-progress text
@@ -4591,8 +4947,13 @@ static void handle_drag(int mx, int my)
   if (g_selecting) {
     int line, col;
     pane_linecol(mx, my, &line, &col);
+    struct ru_selr before = {0}, after = {0};
+    before.has = gfx_sel_range(&g_sel, &before.l0, &before.c0, &before.l1, &before.c1);
     gfx_sel_extend(&g_sel, line, col);
-    B->seq++;
+    after.has = gfx_sel_range(&g_sel, &after.l0, &after.c0, &after.l1, &after.c1);
+    int lo, hi;
+    if (ru_sel_damage(&before, &after, &lo, &hi))
+      damage_lines(lo, hi);
     return;
   }
   handle_move(mx, my);
@@ -4609,8 +4970,8 @@ static void copy_selection(void)
   browser_buf_lock();
   char *buf = 0;
   int n = 0;
-  if (l0 < B->nlines && l1 < B->nlines) {
-    int a = B->line_off[l0] + c0, b = B->line_off[l1] + c1;
+  if (l0 < g_fr->lt.n && l1 < g_fr->lt.n) {
+    int a = g_fr->lt.off[l0] + c0, b = g_fr->lt.off[l1] + c1;
     if (a < 0)
       a = 0;
     if (b > B->pg->text_len)
@@ -4631,10 +4992,13 @@ static void copy_selection(void)
 /* Select the whole rendered page (Edit > Select All). */
 static void select_all(void)
 {
-  if (B->nlines <= 0)
+  browser_buf_lock();
+  int last = g_fr->lt.n - 1, last_len = last >= 0 ? g_fr->lt.len[last] : 0;
+  browser_buf_unlock();
+  if (last < 0)
     return;
   gfx_sel_start(&g_sel, 0, 0);
-  gfx_sel_extend(&g_sel, B->nlines - 1, B->line_len[B->nlines - 1]);
+  gfx_sel_extend(&g_sel, last, last_len);
   g_selecting = false;
   B->seq++;
 }
@@ -4921,6 +5285,7 @@ int main(int argc, char **argv)
           BH = prev_h;
         }
         gfx_init(browser_surface(), BW, BH);
+        B->resize_ms = msec();
         B->recascade = 1; /* @media may change → worker re-cascades  */
         B->seq++;         /* re-wrap + repaint at the new width */
       }
@@ -5008,7 +5373,7 @@ int main(int argc, char **argv)
      * and time advance (the worker's media_pump only bumps B->seq on events).
      */
     if (media_active() && (frame - last_paint_frame) >= LOAD_REDRAW_FRAMES)
-      B->seq++;
+      damage_media();
 
     /* Publish the content-pane pixel width for the worker's line-table flow
      * (must match render()'s paw below: pane width minus the scrollbar and the
@@ -5023,10 +5388,15 @@ int main(int argc, char **argv)
 
     int due = !B->loading || (frame - last_paint_frame) >= LOAD_REDRAW_FRAMES;
     int dt_paint = devtools_take_paint(); /* devtools-local change (log line) */
-    if (B->seq != last && due) {
-      render();
-      browser_present(id);
-      last = B->seq;
+    unsigned seq = B->seq;
+    if (seq != last && due) {
+      if (!render_incremental(seq - last, id)) {
+        render();
+        browser_present(id);
+      }
+      g_dmg.bumps = 0;
+      g_dmg.band = false;
+      last = seq;
       last_paint_frame = frame;
       addr_dirty = false;
     } else if (addr_dirty || dt_paint) { /* partial repaints: addr bar / devtools dock */
@@ -5035,8 +5405,11 @@ int main(int argc, char **argv)
         render_addr();
         addr_dirty = false;
       }
-      if (dt_paint)
+      if (dt_paint) {
+        browser_buf_lock();
         devtools_render(); /* opaque right-side split: dock only */
+        browser_buf_unlock();
+      }
       if (addr_paint)
         browser_blit_rect(0, MENU_H + TAB_H, BW, ADDR_H);
       if (dt_paint) {
