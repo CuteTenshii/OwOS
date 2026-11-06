@@ -15,7 +15,7 @@
  * the SQLite model under the lock, then releases it before the (blocking) disk
  * write, so a save never stalls the UI for the length of a writefile.
  */
-#include "bookmarks.h"
+#include "features/bookmarks/bookmarks.h"
 #include "browser.h"
 #include "sqlite.h"
 

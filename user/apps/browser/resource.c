@@ -6,13 +6,13 @@
  * fetch.c. */
 #include "base64.h" /* shared base64 for data: URL decoding */
 #include "browser.h"
-#include "cache.h"       /* the HTTP response cache (RFC 7234, honours headers)   */
-#include "clienthints.h" /* Accept-CH: per-origin Client Hints opt-in        */
-#include "cors.h"        /* CORS request orchestration + CORP sub-resource guard  */
+#include "features/cache/cache.h"             /* the HTTP response cache (RFC 7234, honours headers)   */
+#include "features/clienthints/clienthints.h" /* Accept-CH: per-origin Client Hints opt-in        */
+#include "features/cors/cors.h"               /* CORS request orchestration + CORP sub-resource guard  */
+#include "features/svg/svg.h"                 /* SVG -> ARGB rasterizer (favicon path) */
 #include "fetchint.h"
 #include "headers.h" /* HTTP response headers (iframe X-Frame-Options / CSP)  */
 #include "imgdec.h"  /* shared image decoder (SVG/WebP/PNG) for <img> */
-#include "svg.h"     /* SVG -> ARGB rasterizer (favicon path) */
 
 /* The origin that owns the sub-resources currently being fetched (the page, set
  * by do_fetch). Cross-origin no-cors loads are checked against it for CORP. */

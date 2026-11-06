@@ -7,12 +7,12 @@
  * worker thread (main.c), so its blocking reads never stall the UI. */
 #include "brotli.h" /* RFC 7932 `br` content-coding (whole-buffer decode)   */
 #include "browser.h"
-#include "cache.h"       /* the HTTP response cache (RFC 7234, honours headers)  */
-#include "clienthints.h" /* Accept-CH: per-origin Client Hints opt-in           */
-#include "fetchint.h"    /* shared transport interface + BR_* request headers   */
-#include "h3.h"          /* HTTP/3 over QUIC (libcurl engine)                    */
-#include "headers.h"     /* libcurl: HTTP response header parsing               */
-#include "jar.h"         /* scheme/path-aware cookie header (Secure/Path)        */
+#include "features/cache/cache.h"             /* the HTTP response cache (RFC 7234, honours headers)  */
+#include "features/clienthints/clienthints.h" /* Accept-CH: per-origin Client Hints opt-in           */
+#include "features/jar/jar.h"                 /* scheme/path-aware cookie header (Secure/Path)        */
+#include "fetchint.h"                         /* shared transport interface + BR_* request headers   */
+#include "h3.h"                               /* HTTP/3 over QUIC (libcurl engine)                    */
+#include "headers.h"                          /* libcurl: HTTP response header parsing               */
 
 /* The machine token for the UA platform, from uname(2), normalized the way
  * browsers present it: i386/i686 collapse to "x86", x86_64/amd64 to "x86_64",

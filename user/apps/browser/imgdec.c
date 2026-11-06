@@ -2,8 +2,8 @@
  * SVG rasterizer, the WebP decoder and the PNG decoder, always producing RGBA.
  */
 #include "imgdec.h"
+#include "features/svg/svg.h"
 #include "owos.h"
-#include "svg.h"
 #include "upng.h"
 #include "webp.h"
 

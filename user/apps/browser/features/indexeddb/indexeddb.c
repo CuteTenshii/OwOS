@@ -6,7 +6,7 @@
  * shares the page engine context and the DOM/event helpers via jsint.h. */
 #include <stdbool.h>
 
-#include "../jsint.h"
+#include "jsint.h"
 
 /* ---------------------------------------------------------- IndexedDB ------ *
  *

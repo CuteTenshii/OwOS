@@ -5,14 +5,14 @@
  * HTML-entity work. */
 #include <stdbool.h>
 
-#include "anim.h"   /* CSS @keyframes / transition engine */
-#include "bmedia.h" /* <audio>/<video> element registration */
 #include "browser.h"
 #include "css.h"
+#include "features/anim/anim.h"    /* CSS @keyframes / transition engine */
+#include "features/media/bmedia.h" /* <audio>/<video> element registration */
+#include "features/svg/svg.h"
 #include "font.h"
 #include "imgdec.h" /* shared image decoder for url() background images */
 #include "layout.h"
-#include "svg.h"
 
 static css_sheet *g_sheet; /* the page's collected <style> rules, per render */
 

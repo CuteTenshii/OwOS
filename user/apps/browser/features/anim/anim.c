@@ -8,7 +8,7 @@
  * when a watched property's cascaded value changes between walks (the usual
  * trigger: a script toggled a class or inline style). Animations take
  * precedence over transitions, per spec, so they overlay last. */
-#include "anim.h"
+#include "features/anim/anim.h"
 #include "owos.h"
 #include <stdbool.h>
 

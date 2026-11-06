@@ -33,7 +33,7 @@ for source in "$ROOT"/tests/*_test.c; do
 done
 
 "$CC" -std=gnu11 "${INCLUDES[@]}" -DPERM_DB='"'"$BUILD/permissions.db"'"' \
-	-c "$ROOT/user/apps/browser/permissions.c" -o "$BUILD/permissions_impl.o" || exit 1
+	-c "$ROOT/user/apps/browser/features/permissions/permissions.c" -o "$BUILD/permissions_impl.o" || exit 1
 
 
 "$CC" -std=gnu11 "${INCLUDES[@]}" -c "$ROOT/tests/browser_js_host.c" \
@@ -44,10 +44,10 @@ done
 
 "$CC" "${INCLUDES[@]}" "$BUILD"/*.o \
 	"$ROOT/user/apps/browser/css/engine.c" "$ROOT/user/apps/browser/css/sibling.c" "$ROOT/user/apps/browser/color.c" \
-	"$ROOT/user/apps/browser/dom.c" "$ROOT/user/apps/browser/csp.c" \
+	"$ROOT/user/apps/browser/dom.c" "$ROOT/user/apps/browser/features/csp/csp.c" \
 	"$ROOT/user/apps/browser/js/classlist.c" \
 	"$ROOT/user/apps/browser/js/webapi.c" \
-	"$ROOT/user/apps/browser/js/notification.c" \
+	"$ROOT/user/apps/browser/features/notification/notification.c" \
 	"$ROOT/user/lib/curl/url.c" "$ROOT/user/lib/curl/httpcache.c" \
 	"$ROOT/user/lib/curl/headers.c" "$ROOT/user/lib/crypto/crypto.c" \
 	"$ROOT/user/lib/base64/base64.c" "$ROOT/user/lib/zlib/crc32.c" \

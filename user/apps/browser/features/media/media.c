@@ -20,8 +20,8 @@
  * glyph.
  */
 #include "media.h" /* user/lib/media: decoder + software mixer */
-#include "bmedia.h"
 #include "browser.h"
+#include "features/media/bmedia.h"
 
 #define MK_AUDIO 0
 #define MK_VIDEO 1

@@ -1,7 +1,7 @@
 /* csp.c — Content-Security-Policy engine (see csp.h). Parses one or more
  * policies and answers per-resource load/run decisions with the full source
  * grammar. */
-#include "csp.h"
+#include "features/csp/csp.h"
 #include "base64.h" /* shared base64 for the digest encoding */
 #include "crypto.h" /* sha256 for 'sha256-...' inline hashes */
 #include "dom.h"    /* lower / starts_ci / streq_ci */

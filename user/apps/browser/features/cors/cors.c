@@ -1,7 +1,7 @@
 /* cors.c — CORS + Cross-Origin-Resource-Policy policy logic (see cors.h). Pure
  * decisions over parsed headers and URLs; the transport and the fetch/XHR
  * orchestration live in resource.c. */
-#include "cors.h"
+#include "features/cors/cors.h"
 #include "browser.h" /* parse_url, sapp/uapp, streq_ci, starts_ci, lower */
 #include "headers.h"
 

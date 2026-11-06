@@ -7,6 +7,9 @@
 # wrapped into kernel/<name>_blob.o with the symbol normalised to
 # _binary_app_<name>_{start,end}.
 
+# The browser includes its own headers by path from its root.
+user/apps/browser/%.o: UCFLAGS += -Iuser/apps/browser
+
 GUI_APPS := about browser calc cliphist clock compositor editor files imgview notifyd player settings term
 CLI_APPS := aac alac base64 cast clipd curl dhcpcd dig edit h264 init json lspci mdnsd mpeg neofetch notifysend ntpd ping smbd ssh sshd stun torrent uname vmclipd webp
 APPS := $(GUI_APPS) $(CLI_APPS)
@@ -15,7 +18,7 @@ APPS := $(GUI_APPS) $(CLI_APPS)
 # compositor: clipboard paste, plus Print Screen capture (PNG encode + CRC-32).
 # browser: a multi-file program, linked flat.
 APP_OBJS_compositor := user/apps/compositor/compositor.o user/apps/compositor/compositor_damage.o
-APP_OBJS_browser := user/apps/browser/main.o user/apps/browser/sync.o user/apps/browser/buffers.o user/apps/browser/surface.o user/apps/browser/fetch.o user/apps/browser/resource.o user/apps/browser/html.o user/apps/browser/dom.o user/apps/browser/css/engine.o user/apps/browser/css/sibling.o user/apps/browser/color.o user/apps/browser/layout.o user/apps/browser/anim.o user/apps/browser/svg.o user/apps/browser/jar.o user/apps/browser/cache.o user/apps/browser/js/bindings.o user/apps/browser/js/dom_query.o user/apps/browser/js/indexeddb.o user/apps/browser/js/serviceworker.o user/apps/browser/js/webapi.o user/apps/browser/js/notification.o user/apps/browser/js/media.o user/apps/browser/js/classlist.o user/apps/browser/devtools.o user/apps/browser/csp.o user/apps/browser/cors.o user/apps/browser/imgdec.o user/apps/browser/media.o user/apps/browser/bookmarks.o user/apps/browser/clienthints.o user/apps/browser/permissions.o
+APP_OBJS_browser := user/apps/browser/main.o user/apps/browser/sync.o user/apps/browser/buffers.o user/apps/browser/surface.o user/apps/browser/fetch.o user/apps/browser/resource.o user/apps/browser/html.o user/apps/browser/dom.o user/apps/browser/css/engine.o user/apps/browser/css/sibling.o user/apps/browser/color.o user/apps/browser/layout.o user/apps/browser/features/anim/anim.o user/apps/browser/features/svg/svg.o user/apps/browser/features/jar/jar.o user/apps/browser/features/cache/cache.o user/apps/browser/js/bindings.o user/apps/browser/js/dom_query.o user/apps/browser/features/indexeddb/indexeddb.o user/apps/browser/features/serviceworker/serviceworker.o user/apps/browser/js/webapi.o user/apps/browser/features/notification/notification.o user/apps/browser/js/media.o user/apps/browser/js/classlist.o user/apps/browser/features/devtools/devtools.o user/apps/browser/features/csp/csp.o user/apps/browser/features/cors/cors.o user/apps/browser/imgdec.o user/apps/browser/features/media/media.o user/apps/browser/features/bookmarks/bookmarks.o user/apps/browser/features/clienthints/clienthints.o user/apps/browser/features/permissions/permissions.o
 APP_LIBS_aac := $(AAC) $(MP4) $(MATH)
 APP_LIBS_alac := $(ALAC)
 APP_LIBS_base64 := $(BASE64)

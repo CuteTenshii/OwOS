@@ -14,14 +14,14 @@
  */
 #include <stdbool.h>
 
-#include "../bmedia.h" /* HTMLMediaElement: <audio>/<video> + new Audio()      */
-#include "../cors.h"   /* cors_origin / cors_same_origin: SW scope + cache keys */
-#include "../jsint.h"  /* internal shared surface (engine ctx + helpers + A())  */
-#include "cast.h"      /* Google Cast sender: HTMLMediaElement.remote backend  */
+#include "cast.h" /* Google Cast sender: HTMLMediaElement.remote backend  */
 #include "classlist.h"
 #include "clipboard.h" /* clip_put / clip_get for navigator.clipboard          */
 #include "dom_query.h"
-#include "notification.h"
+#include "features/cors/cors.h"    /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "features/media/bmedia.h" /* HTMLMediaElement: <audio>/<video> + new Audio()      */
+#include "features/notification/notification.h"
+#include "jsint.h"     /* internal shared surface (engine ctx + helpers + A())  */
 #include "notify.h"    /* notify_send: surface Notification() on the desktop    */
 #include "websocket.h" /* ws_open / ws_poll / ws_send / ws_close (RFC 6455)    */
 

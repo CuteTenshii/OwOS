@@ -19,14 +19,14 @@
 
 #include <stdbool.h>
 
-#include "csp.h" /* Content-Security-Policy engine (per-page enforcement)   */
-#include "dom.h" /* DOM tree + the shared lower/starts_ci/streq_ci helpers  */
+#include "dom.h"                              /* DOM tree + the shared lower/starts_ci/streq_ci helpers  */
+#include "features/csp/csp.h"                 /* Content-Security-Policy engine (per-page enforcement)   */
+#include "features/permissions/permissions.h" /* per-origin permission store + Permissions-Policy    */
 #include "gfx.h"
 #include "h2.h" /* HTTP/2 engine: h2_run + struct h2_opts (TLS+ALPN path) */
 #include "inflate.h"
 #include "netconn.h" /* TCP-or-TLS transport wrapper (h2/h1.1 over user-space TLS) */
 #include "owos.h"
-#include "permissions.h" /* per-origin permission store + Permissions-Policy    */
 #include "upng.h"
 #include "url.h" /* struct purl, parse_url, resolve_url (shared with curl) */
 

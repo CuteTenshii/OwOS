@@ -4,7 +4,7 @@
  * (user/lib/sqlite) at PERM_DB, so "Allow always" survives a reboot while
  * "Allow once" / "Refuse" (session-only) do not. Whole-file rewrite on each
  * persistent change — the list is tiny, like the cookie jar (jar.c). */
-#include "permissions.h"
+#include "features/permissions/permissions.h"
 #include "owos.h" /* malloc/free/strlen + streq_ci/starts_ci helpers */
 #include "sqlite.h"
 #include <stdbool.h>

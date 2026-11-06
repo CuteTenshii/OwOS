@@ -5,7 +5,7 @@
  * via jsint.h. */
 #include <stdbool.h>
 
-#include "../jsint.h"
+#include "jsint.h"
 
 /* ---- performance / TextEncoder / TextDecoder (Web platform APIs) --------- *
  *

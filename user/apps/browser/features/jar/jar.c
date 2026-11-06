@@ -15,7 +15,7 @@
  * a read/write/allocation failure just leaves the in-memory list as-is, so the
  * browser still runs without a writable home directory.
  */
-#include "jar.h"
+#include "features/jar/jar.h"
 #include "browser.h"
 #include "httpcache.h" /* http_date_parse: Expires -> Unix epoch seconds */
 #include "sqlite.h"

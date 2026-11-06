@@ -9,15 +9,15 @@
 // clang-format off
 #include <stdbool.h>
 // clang-format on
-#include "anim.h"      /* CSS @keyframes / transition engine (drives per-frame relayout) */
-#include "bmedia.h"    /* <audio>/<video> controls widget + playback state */
-#include "bookmarks.h" /* persistent (url,title) bookmarks store */
 #include "browser.h"
-#include "cache.h"     /* persistent HTTP response cache: load at startup */
-#include "clipboard.h" /* clip_put_text for Copy */
-#include "dialog.h"    /* window.alert/confirm/prompt run on the main thread here */
-#include "font.h"      /* custom @font-face faces (user/lib/font) */
-#include "layout.h"    /* the CSS box tree (backgrounds/borders behind the text) */
+#include "clipboard.h"                    /* clip_put_text for Copy */
+#include "dialog.h"                       /* window.alert/confirm/prompt run on the main thread here */
+#include "features/anim/anim.h"           /* CSS @keyframes / transition engine (drives per-frame relayout) */
+#include "features/bookmarks/bookmarks.h" /* persistent (url,title) bookmarks store */
+#include "features/cache/cache.h"         /* persistent HTTP response cache: load at startup */
+#include "features/media/bmedia.h"        /* <audio>/<video> controls widget + playback state */
+#include "font.h"                         /* custom @font-face faces (user/lib/font) */
+#include "layout.h"                       /* the CSS box tree (backgrounds/borders behind the text) */
 
 static struct browser binst;
 struct browser *B = &binst;

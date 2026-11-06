@@ -1,7 +1,7 @@
 /* Host test for the production Notification API module. */
 #define OWOS_SUITE_TEST
 #include "jsint.h"
-#include "notification.h"
+#include "features/notification/notification.h"
 #include "notify.h"
 #include <stdio.h>
 #include <stdlib.h>

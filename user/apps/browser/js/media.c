@@ -6,9 +6,9 @@
  * page engine context + helpers via jsint.h. */
 #include <stdbool.h>
 
-#include "../bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
-#include "../jsint.h"
-#include "cast.h" /* Google Cast sender: RemotePlayback backend             */
+#include "cast.h"                  /* Google Cast sender: RemotePlayback backend             */
+#include "features/media/bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
+#include "jsint.h"
 
 /* The single active Cast session + its liveness state, private to this module
  * (only the media handlers, js_cast_pump and js_cast_page_end touch them). */

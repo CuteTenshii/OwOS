@@ -1,18 +1,18 @@
 /* permissions_test.c — host unit test for the browser's permission store +
- * Permissions-Policy parser (user/apps/browser/permissions.c). Pure logic
+ * Permissions-Policy parser (user/apps/browser/features/permissions/permissions.c). Pure logic
  * (no engine, no QEMU): the feature/token table, the policy allowlist parser,
  * the session vs persistent store, and a real SQLite round-trip through
  * user/lib/sqlite. PERM_DB is redirected to a temp file via -DPERM_DB.
  *
  *   cc -std=gnu11 -Iscripts -Iuser/lib/sqlite -Iuser/apps/browser \
  *      -DPERM_DB='"/tmp/owos_perms_test.db"' \
- *      tests/permissions_test.c user/apps/browser/permissions.c \
+ *      tests/permissions_test.c user/apps/browser/features/permissions/permissions.c \
  *      user/lib/sqlite/sqlite.c -o /tmp/permissions_test && /tmp/permissions_test
  */
 #include <stdio.h>
 #define OWOS_SUITE_TEST
 #include <string.h>
-#include "permissions.h"
+#include "features/permissions/permissions.h"
 
 /* A parsed policy blocks feature f? */
 static int blocks(const char *hdr, const char *host, int f)

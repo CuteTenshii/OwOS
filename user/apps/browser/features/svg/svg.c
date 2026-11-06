@@ -10,7 +10,7 @@
  * + width/height with aspect preserved.
  * Not supported: gradients, patterns, filters, text, clipping. Edges are
  * antialiased by rendering at SS× and box-downsampling. */
-#include "svg.h"
+#include "features/svg/svg.h"
 #include "color.h"
 #include "dom.h"
 #include "fmt.h"

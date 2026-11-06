@@ -10,8 +10,8 @@
  * height (others parse-and-ignore, like any browser). Inline <style> and
  * style="" only — external <link rel=stylesheet> is not fetched. Descendant
  * matching is greedy (no backtracking), enough for ordinary selectors. */
-#include "../color.h" /* shared colour parser */
-#include "../css.h"
+#include "color.h" /* shared colour parser */
+#include "css.h"
 #include "owos.h"
 #include "sibling.h"
 #include <stdbool.h>

@@ -9,8 +9,8 @@
  * helpers via jsint.h. */
 #include <stdbool.h>
 
-#include "../cors.h" /* cors_origin / cors_same_origin: SW scope + cache keys */
-#include "../jsint.h"
+#include "features/cors/cors.h" /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "jsint.h"
 #include "notify.h" /* notify_send: a service worker's showNotification()    */
 
 /* ------------------------------------------------------- service workers --- *

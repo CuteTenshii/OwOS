@@ -3,7 +3,7 @@
  * The values are fixed for this browser (one known UA on a known platform), so
  * the only per-origin state is which hints a host asked for. Viewport-Width is
  * the sole dynamic value, read from the live viewport at emit time. */
-#include "clienthints.h"
+#include "features/clienthints/clienthints.h"
 #include "browser.h"
 
 enum {

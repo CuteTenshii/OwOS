@@ -1,7 +1,7 @@
 #include <stdbool.h>
 
-#include "../jsint.h"
-#include "notification.h"
+#include "features/notification/notification.h"
+#include "jsint.h"
 #include "notify.h"
 
 static js_ctx *ctx;

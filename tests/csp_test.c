@@ -3,11 +3,11 @@
  * challenge-platform case). Build+run:
  *
  *   cc -std=c11 -Iscripts -Iuser/lib/curl -Iuser/apps/browser -Iuser/lib/crypto \
- *      -Iuser/lib/base64 tests/csp_test.c user/apps/browser/csp.c \
+ *      -Iuser/lib/base64 tests/csp_test.c user/apps/browser/features/csp/csp.c \
  *      user/lib/curl/url.c user/lib/crypto/crypto.c user/lib/base64/base64.c \
  *      -o /tmp/csp_test && /tmp/csp_test
  */
-#include "csp.h"
+#include "features/csp/csp.h"
 #define OWOS_SUITE_TEST
 #include "test.h"
 #include <stdio.h>

@@ -20,7 +20,7 @@
  *
  * The transport (fetch.c, resource.c) sees only cache_lookup / cache_store /
  * cache_revalidated / cache_load / cache_flush. */
-#include "cache.h"
+#include "features/cache/cache.h"
 #include "browser.h"
 #include "headers.h"
 #include "httpcache.h"
