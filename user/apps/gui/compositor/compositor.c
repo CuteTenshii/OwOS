@@ -1,24 +1,6 @@
-/* compositor.c — the user-space window manager.
- *
- * Runs the desktop on the root-only windowing primitives (owos.h): SYS_FB_* for
- * the shared cached-RAM back buffer, SYS_INPUT_POLL for the pointer + keyboard,
- * and SYS_WIN_* to enumerate / map / move / focus / feed the windows the kernel
- * brokers. It composites the desktop (background, framed windows with title
- * bars
- * + borders + close/max/min boxes, taskbar with clock/battery/volume/network,
- * Start menu, Alt+Tab overlay, "Not Responding" suffix, crash windows, and the
- * cursor) into the back buffer using damage-tracking, presenting only the
- * damaged rectangles.
- *
- * This is the live desktop: /etc/inittab launches it as the first init entry,
- * and the first SYS_FB_MAP marks it as the compositor so the kernel stops
- * draining the physical keyboard into the recovery console. The in-kernel WM
- * has been removed.
- *
- * The metrics/colours/layout mirror the old kernel wm.c; where that drew with
- * kernel fb_* into a clipped surface, we draw with gfx_* into the mapped back
- * buffer, using gfx_set_clip() as the per-rect clip.
- */
+/* compositor.c: the user-space window manager and desktop.
+ * Built on the root-only SYS_FB_*, SYS_INPUT_POLL and SYS_WIN_* primitives
+ * (owos.h); composites into the shared back buffer, presenting damaged rects. */
 #include "clipboard.h"
 #include "compositor_damage.h"
 #include "gfx.h"
@@ -102,10 +84,8 @@ static void clip_full(void)
 }
 
 /* ------------------------------------------------------------- window model */
-/* Each frame we SYS_WIN_ENUM into cur[] (arbitrary slot order), then
- * zorder_apply() reorders it into ascending z (bottom first), so the array
- * index doubles as the z-order slot. Z and focus are compositor-owned (zstack,
- * below); only geometry is driven through the kernel via win_set_geom. */
+/* cur[] is enumerated in slot order, then zorder_apply() sorts it bottom first,
+ * so the index is the z slot. Z and focus are compositor-owned. */
 static struct winrec cur[WM_LIST_MAX];
 static int nwin;
 
@@ -159,12 +139,9 @@ static void z_lower(int id)
   taskbar_layout_dirty = 1;
 }
 
-/* ------------------------------------------------------------- window families
- * A window may be a transient child (dialog) of another via winrec.parent. The
- * kernel reports the link; the compositor enforces the UI: a child stacks
- * directly above its parent, the whole family raises/hides together, transient
- * children are hidden from the taskbar/Alt+Tab, and a UWIN_F_MODAL child blocks
- * input to the rest of its family. */
+/* ---- window families
+ * A child (winrec.parent) stacks above its parent and raises/hides with it; it
+ * is hidden from the taskbar/Alt+Tab, and UWIN_F_MODAL blocks the rest of the family. */
 
 /* The valid transient parent id of window `id`, or -1. The link is by window
  * id; we require the parent to still be live AND owned by the same process, so
@@ -206,12 +183,8 @@ static int is_descendant(int id, int anc)
   return 0;
 }
 
-/* Drop closed ids, append newly-appeared ids on top (in enum order), then
- * reorder cur[] bottom->top: families are grouped so a child always sits
- * directly above its parent, families ordered by their root's z. Emit each root
- * (in ascending zstack order) followed by a DFS of its descendants (siblings in
- * zstack order), so the topmost window is the deepest child of the frontmost
- * family. */
+/* Drop closed ids, append new ones on top, then order cur[] bottom to top: each
+ * root by zstack followed by a DFS of its descendants. */
 static char fam_emitted[WM_LIST_MAX];
 static void emit_family(int rootslot, struct winrec *ord, int *n)
 {
@@ -264,11 +237,7 @@ static void zorder_apply(void)
   nwin = n;
 }
 
-/* ------------------------------------------------------------- "Not
- * Responding" The kernel exposes this only implicitly (the WM decided it). We
- * don't have that signal here yet, so treat every window as responsive for the
- * suffix logic; the hook stays so the draw/damage paths match wm.c. Phase 3 can
- * wire a real signal (e.g. a winrec flag). */
+/* ---- "Not Responding": no kernel signal yet, so every window counts as responsive. */
 static int not_responding(const struct winrec *w)
 {
   (void)w;
@@ -345,12 +314,9 @@ static int sm_top(void) { return screen_h - WM_BAR_H - sm_h(); }
 
 static int force_full;
 
-/* ------------------------------------------------------------- child reaping
- * We spawn Start-menu apps detached; reap their zombies non-blocking so they
- * don't accumulate (mirrors wm.c's sched_try_reap loop). spawn() returns a pid;
- * a subsequent waitpid on any of our children would block, so we track pids and
- * only reap those. The kernel has no non-blocking waitpid wrapper for arbitrary
- * children, so we keep a small pid ring and try each. */
+/* ---- child reaping
+ * Start-menu apps are spawned detached; track their pids in a small ring and
+ * reap zombies non-blocking (waitpid on an arbitrary child would block). */
 #define MAXKIDS 64
 static int kids[MAXKIDS];
 static int nkids;
@@ -458,11 +424,9 @@ static void raise_window(int slot)
     raise_family_id(cur[slot].id);
 }
 
-/* ------------------------------------------------------------- modality
- * A visible UWIN_F_MODAL child grabs its family: interaction with any window in
- * the family that isn't the modal (or below it) is redirected to the modal,
- * which flashes to draw the eye. Focus follows naturally — the modal, being a
- * child, already stacks topmost in its family after zorder_apply. */
+/* ---- modality
+ * A visible UWIN_F_MODAL child grabs its family: input to other family windows
+ * is redirected to it and it flashes. */
 
 /* Topmost visible modal window in `id`'s family, or -1. cur[] is bottom->top,
  * so the last match is the topmost (an inner dialog over an outer one). */
@@ -525,11 +489,7 @@ static int alttab_build(void)
  */
 static int btn_present(const struct winrec *w, int kind)
 {
-  /* Standard OS dialog chrome: a dialog (a transient child bound to a parent —
-   * a Properties sheet, a message box, the permission prompt) keeps a close box
-   * and stays movable, but has no minimize or maximize. Top-level app windows
-   * carry the full set, and windows are resizable/maximizable by default (apps
-   * opt out with win_resizable(id,0), which the dialog lib does). */
+  /* Dialogs (transient children) get only a close box and stay movable. */
   int is_dialog = parent_id_of(w->id) >= 0;
   if (kind == 0)
     return 1; /* close: always       */
@@ -627,19 +587,33 @@ static int taskbar_hit(int mx, int my)
 
 static void ui_text_clip(int x, int y, const char *s, unsigned col, int maxw);
 
-static void draw_background(void)
+/* Vertical gradient (deep indigo -> slate), a function of y only: one colour
+ * per screen row, rebuilt when the height changes. */
+static unsigned *bg_rows;
+static int bg_rows_h;
+
+static void bg_rows_build(void)
 {
-  /* Vertical gradient (deep indigo -> slate); a function of y only.
-   * gfx_fill_rect bounds each row to the active clip, so an unclipped
-   * full-scene redraw during a small damage rect only touches the damaged rows.
-   */
-  for (int y = clip_y0; y < clip_y1; y++) {
+  free(bg_rows);
+  bg_rows = malloc((unsigned)screen_h * sizeof *bg_rows);
+  bg_rows_h = bg_rows ? screen_h : 0;
+  for (int y = 0; y < bg_rows_h; y++) {
     int t = y * 255 / screen_h;
     unsigned r = (unsigned)(24 + t * 40 / 255);
     unsigned g = (unsigned)(26 + t * 56 / 255);
     unsigned b = (unsigned)(54 + t * 70 / 255);
-    gfx_fill_rect(0, y, screen_w, 1, (r << 16) | (g << 8) | b);
+    bg_rows[y] = (r << 16) | (g << 8) | b;
   }
+}
+
+static void draw_background(void)
+{
+  if (bg_rows_h != screen_h)
+    bg_rows_build();
+  if (!bg_rows_h)
+    return;
+  for (int y = clip_y0; y < clip_y1; y++)
+    gfx_fill_rect(0, y, screen_w, 1, bg_rows[y]);
 }
 
 /* Blit a window's client buffer into the back buffer at the client rect,
@@ -685,10 +659,8 @@ static const struct winmap *client_for(int id)
   return 0;
 }
 
-/* Refresh the pinned client maps to match the enumerated set: (re)map every
- * live window (win_map is idempotent and picks up a resized buffer's new size),
- * and unmap any id no longer enumerated so the kernel can reclaim its frames.
- */
+/* Remap every enumerated window (win_map is idempotent and picks up resized
+ * buffers) and unmap ids that are gone so the kernel can reclaim frames. */
 static void refresh_maps(void)
 {
   /* drop maps for gone windows */
@@ -1228,14 +1200,36 @@ static int pick_cursor(int mx, int my)
 }
 
 /* ------------------------------------------------------------- compose */
+static int clip_hits(int x, int y, int w, int h)
+{
+  return x < clip_x1 && x + w > clip_x0 && y < clip_y1 && y + h > clip_y0;
+}
+
+/* Is window i's visible part of the clip hidden behind a single window above
+ * it? Frames are opaque, so such a window needs no drawing. */
+static int occluded(int i)
+{
+  const struct winrec *w = &cur[i];
+  int x0 = w->x > clip_x0 ? w->x : clip_x0, y0 = w->y > clip_y0 ? w->y : clip_y0;
+  int x1 = w->x + w->w < clip_x1 ? w->x + w->w : clip_x1;
+  int y1 = w->y + w->h < clip_y1 ? w->y + w->h : clip_y1;
+  for (int j = i + 1; j < nwin; j++) {
+    const struct winrec *o = &cur[j];
+    if (win_visible(o) && o->x <= x0 && o->y <= y0 && o->x + o->w >= x1 && o->y + o->h >= y1)
+      return 1;
+  }
+  return 0;
+}
+
 static void compose(int mx, int my)
 {
   draw_background();
   int top = topmost_visible();
   for (int i = 0; i < nwin; i++)
-    if (win_visible(&cur[i]))
+    if (win_visible(&cur[i]) && clip_hits(cur[i].x, cur[i].y, cur[i].w, cur[i].h) && !occluded(i))
       draw_window(&cur[i], i == top);
-  draw_taskbar();
+  if (clip_hits(0, screen_h - WM_BAR_H, screen_w, WM_BAR_H))
+    draw_taskbar();
   if (start_open)
     draw_start_menu();
   if (tb_menu_open)
@@ -1460,7 +1454,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
       } else if (tb == 1) { /* maximize / restore */
         toggle_maximize(idx);
       } else if (tb == 2) { /* minimize: no cross-process
-                             * minimize primitive yet — best effort is to lower
+                             * minimize primitive yet, best effort is to lower
                              * the window so another comes forward. */
         z_lower(w->id);
       } else if (resizable && is_maxed(w->id) < 0 && resize) {
@@ -1603,7 +1597,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
 
 /* Clipboard-history viewer (Super+V): launch /bin/cliphist, then on its exit-0
  * (a clip was picked & promoted to the front) paste it into whatever window now
- * holds focus — the same path Ctrl+V uses (paste_begin, below). */
+ * holds focus, the same path Ctrl+V uses (paste_begin, below). */
 static void paste_begin(void);
 static int cliphist_pid;
 static void open_cliphist(void)
@@ -1646,13 +1640,9 @@ static void pend_push(int c, int mods)
   pend_head = next;
 }
 
-/* ------------------------------------------------------------- Print Screen
- * The compositor owns the framebuffer, so it takes the screenshot (this used to
- * be a kernel worker thread). The main thread does the fast capture — memcpy
- * the composited back buffer into a tight buffer — then a background thread
- * PNG- encodes and writes it, so a multi-megabyte encode never stalls the
- * desktop. One shot at a time; a Print Screen while a shot is still encoding is
- * dropped. */
+/* ---- Print Screen
+ * The main thread copies the back buffer; a background thread PNG-encodes and
+ * writes it. One shot at a time; extra presses are dropped. */
 static unsigned *shot_pixels; /* tightly-packed w*h capture (grown on demand) */
 static unsigned shot_cap;     /* capacity of shot_pixels, in pixels             */
 static int shot_tid;          /* encode worker, 0 = idle                        */
@@ -1800,13 +1790,9 @@ static void pending_flush(void)
   }
 }
 
-/* Clipboard paste (Ctrl+V, or a Super+V history pick). The clipboard lives in
- * /bin/clipd; we pull the newest clip and, if it's text, inject it into the
- * focused window as key events — CRLF/CR folded to LF (so a multi-line paste
- * submits each line), tabs and newlines kept, other control bytes dropped — so
- * an app sees exactly the bytes it would if typed. Held here and drained a few
- * keys per frame (win_key_space back-pressure, like pending[]) so a large paste
- * can't overrun a slow app's event ring. */
+/* Clipboard paste: inject the newest text clip from /bin/clipd into the focused
+ * window as keys (CRLF/CR folded to LF, other control bytes dropped), drained a
+ * few per frame via win_key_space so a slow app's ring can't overflow. */
 #define PASTE_MAX 8192
 static char paste_buf[PASTE_MAX];
 static int paste_len, paste_pos;
@@ -1856,36 +1842,14 @@ static void paste_flush(void)
     win_deliver(cur[t].id, &ev);
   }
 }
-static void present_rect(int x, int y, int w, int h)
-{
-  if (x < 0) {
-    w += x;
-    x = 0;
-  }
-  if (y < 0) {
-    h += y;
-    y = 0;
-  }
-  if (x + w > screen_w)
-    w = screen_w - x;
-  if (y + h > screen_h)
-    h = screen_h - y;
-  if (w > 0 && h > 0)
-    fb_present_rect(x, y, w, h);
-}
-
 /* Active-frame target rate (Hz). The desktop paces to this while there's
  * motion; Settings can retune it via set_target_hz(). Idle frames use a fixed
  * low-power cadence regardless. */
 static int target_hz = 60;
 static unsigned active_period(void) { return target_hz > 0 ? 1000u / (unsigned)target_hz : 16u; }
 
-/* Frame pacing: hold a running deadline and sleep only the slack left until it,
- * rather than `work + fixed sleep` — the latter stacks each frame's
- * compose/present time on top of the target period, so the desktop free-runs
- * below its target rate. On the first call, an overrun, or a cadence change
- * (idle<->active), re-anchor the phase to now instead of sleeping a stale
- * interval or firing catch-up frames. */
+/* Frame pacing: sleep only the slack to a running deadline. Re-anchor on the
+ * first call, an overrun, or a cadence change. */
 static unsigned frame_deadline;
 
 static void frame_pace(unsigned period)
@@ -1900,23 +1864,17 @@ static void frame_pace(unsigned period)
   msleep((unsigned)slack);
 }
 
-/* Persisted desktop tunables. The Settings app (and loadkeys, etc.) applies a
- * change live by writing a kernel sysfs node; the compositor owns persistence —
- * it seeds each node from its /etc config at startup and rewrites that file
- * when a live value changes, so the choices survive a reboot. Each tunable
- * names the file it belongs to, split by domain the Unix way (display / input /
- * sound). The refresh rate doubles as the frame-pacing target, read back after
- * seeding. */
+/* Persisted desktop tunables: seeded into kernel sysfs nodes at startup from
+ * /etc config and rewritten when a live value changes. Refresh rate also sets
+ * the pacing target. */
 #define CONF_DISPLAY "/etc/display.conf"
 #define CONF_INPUT "/etc/input.conf"
 #define CONF_SOUND "/etc/sound.conf"
 #define DISPLAY_RATE "/sys/class/graphics/fb0/rate"
 
-/* One row per tunable: its config file + key <-> sysfs attribute. `cur` is the
- * last value seeded or persisted — the baseline for change detection. Values
- * are opaque strings ("1280x720", "us", "60", an output name), so one mechanism
- * covers all. Keys are globally unique, so a load can match across files by key
- * alone. */
+/* One row per tunable: config file + key <-> sysfs attribute. `cur` is the last
+ * seeded or persisted value (change baseline). Values are opaque strings; keys
+ * are globally unique. */
 struct tunable {
   const char *file;
   const char *key;
@@ -2024,10 +1982,8 @@ static void conf_save(void)
     conf_save_file(conf_files[f]);
 }
 
-/* Push every saved value into its kernel node, then read each node back so
- * `cur` reflects what the kernel actually accepted (rate/speed are clamped; an
- * unsettable resolution keeps its real mode). This becomes the change baseline.
- */
+/* Push saved values into kernel nodes, then read back what the kernel accepted
+ * (values may be clamped) as the change baseline. */
 static void tun_restore(void)
 {
   for (int i = 0; i < NTUN; i++)
@@ -2078,19 +2034,8 @@ struct pfsnap {
 static struct pfsnap pf[WM_LIST_MAX];
 static int npf;
 
-static struct pfsnap *pf_find(int id)
-{
-  for (int i = 0; i < npf; i++)
-    if (pf[i].id == id)
-      return &pf[i];
-  return 0;
-}
-
-/* (Re)bind the compositor to the framebuffer's current geometry: remap the back
- * buffer (idempotent; same vaddr, picks up any realloc), re-init the gfx
- * surface with the new stride, update the cursor bounds, and force a full
- * repaint. The kernel's fb_set_mode keeps w*h <= the capacity the buffer was
- * allocated at, so the mapped region always covers the new mode. */
+/* Rebind to the framebuffer's current geometry: remap the back buffer, re-init
+ * the gfx surface and cursor bounds, force a full repaint. */
 static int bind_mode(void)
 {
   struct fbinfo fi;
@@ -2109,16 +2054,10 @@ static int bind_mode(void)
   return 0;
 }
 
-/* A Settings-app resolution change reprograms fb_set_mode in the kernel; detect
- * it by re-querying fb_info each frame. On change, rebind the surface and pull
- * any window that now hangs off the smaller screen back into view (a maximized
- * window is re-filled to the new work area). Cheap: one syscall/frame, geometry
- * work only on an actual change. */
-/* Center each transient dialog over its parent the first time we see the link
- * (the kernel opens it at a cascade position). Done once per dialog so the user
- * can still drag it afterward; `centered` tracks the ids already placed, pruned
- * as windows close. cur[i] is updated in place too, so it draws centered this
- * frame. */
+/* Detect a resolution change via fb_info each frame; rebind and pull windows
+ * off the smaller screen back into view (maximized ones refill the work area). */
+/* Center each transient dialog over its parent once, so it stays draggable;
+ * `centered` tracks placed ids. cur[i] is updated so it draws centered now. */
 static int centered[WM_LIST_MAX], ncentered;
 static int was_centered(int id)
 {
@@ -2189,10 +2128,7 @@ int main(void)
     return 1;
   }
 
-  /* Desktop session autostart (was the kernel WM's apps_start): the clipboard
-   * server (+ its VMware host bridge), the notification daemon, then the
-   * terminal — so a fresh desktop comes up with a terminal open and copy/paste
-   * + notifications working. */
+  /* Session autostart: clipboard server, notification daemon, terminal. */
   kid_track(spawn("/bin/clipd", 0));
   kid_track(spawn("/bin/vmclipd", 0)); /* VMware host clipboard bridge; self-exits off VMware */
   kid_track(spawn("/bin/notifyd", 0));
@@ -2202,10 +2138,7 @@ int main(void)
   int prev_start = 0, prev_tb_menu = 0, prev_at_active = 0, prev_at_sel = -1;
   int prev_focus = -1, last_sec = -1, inited = 0;
 
-  /* Restore persisted desktop tunables into the kernel (resolution, refresh
-   * rate, keyboard layout, pointer speed, audio output), then adopt the live
-   * refresh rate as our pacing target. A restored resolution change is picked
-   * up by check_resolution() on the first frame. */
+  /* Restore saved tunables, then adopt the live refresh rate as the pacing target. */
   conf_load();
   tun_restore();
   target_hz = rate_now();
@@ -2280,17 +2213,11 @@ int main(void)
       int zvis = (focus_id != prev_focus);
       if (nwin != npf)
         zvis = 1; /* window added or removed */
-      for (int i = 0; i < nwin && !zvis; i++) {
-        struct pfsnap *p = pf_find(cur[i].id);
-        if (!p) {
+      /* nwin == npf here, so pf[i] is window i's previous-frame snapshot
+       * unless the z-order or the window set changed. */
+      for (int i = 0; i < nwin && !zvis; i++)
+        if (pf[i].id != cur[i].id || pf[i].vis != win_visible(&cur[i]) || pf[i].min != win_minimized(&cur[i]))
           zvis = 1;
-          break;
-        } /* a new window            */
-        if (pf[i].id != cur[i].id)
-          zvis = 1; /* z-order reordered       */
-        if (p->vis != win_visible(&cur[i]) || p->min != win_minimized(&cur[i]))
-          zvis = 1; /* shown/hidden/minimized  */
-      }
       if (zvis)
         full = 1;
       prev_focus = focus_id;
@@ -2305,8 +2232,8 @@ int main(void)
 
       /* moved/resized windows: old ∪ new as one region */
       for (int i = 0; i < nwin; i++) {
-        struct pfsnap *p = pf_find(cur[i].id);
-        if (p && (p->x != cur[i].x || p->y != cur[i].y || p->w != cur[i].w || p->h != cur[i].h))
+        const struct pfsnap *p = &pf[i];
+        if ((p->x != cur[i].x || p->y != cur[i].y || p->w != cur[i].w || p->h != cur[i].h))
           damage_add_union(p->x, p->y, p->w, p->h, cur[i].x, cur[i].y, cur[i].w, cur[i].h);
       }
       /* cursor moved/changed/animating */
@@ -2316,11 +2243,18 @@ int main(void)
         damage_add(mx - CUR_DMG_PAD, my - CUR_DMG_PAD, CUR_DMG_W, CUR_DMG_H);
       }
       prev_cur = cur_kind;
-      /* content changed (present_seq) */
+      /* content changed: only the client rect the app reported, or the whole frame */
       for (int i = 0; i < nwin; i++) {
-        struct pfsnap *p = pf_find(cur[i].id);
-        if (win_visible(&cur[i]) && p && p->seq != cur[i].present_seq)
-          damage_add(cur[i].x, cur[i].y, cur[i].w, cur[i].h);
+        const struct winrec *w = &cur[i];
+        if (!win_visible(w) || pf[i].seq == w->present_seq)
+          continue;
+        if (w->dirty_w < 0) {
+          damage_add(w->x, w->y, w->w, w->h);
+        } else if (w->dirty_w > 0 && w->dirty_h > 0) {
+          int cx, cy;
+          client_rect(w, &cx, &cy, 0, 0);
+          damage_add(cx + w->dirty_x, cy + w->dirty_y, w->dirty_w, w->dirty_h);
+        }
       }
       /* clock tick */
       int sec = (int)(frame_clock & 0xFF);
@@ -2334,14 +2268,21 @@ int main(void)
     if (full) {
       clip_full();
       compose(mx, my);
-      present_rect(0, 0, screen_w, screen_h);
+      struct fbrect all = {0, 0, screen_w, screen_h};
+      fb_present_rects(&all, 1);
     } else if (ndmg > 0) {
+      struct fbrect rects[MAXDMG];
+      int n = 0;
       for (int k = 0; k < ndmg; k++) {
         set_clip(dmg[k].x, dmg[k].y, dmg[k].w, dmg[k].h);
+        if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0)
+          continue;
         compose(mx, my);
-        present_rect(dmg[k].x, dmg[k].y, dmg[k].w, dmg[k].h);
+        rects[n++] = (struct fbrect){clip_x0, clip_y0, clip_x1 - clip_x0, clip_y1 - clip_y0};
       }
       clip_full();
+      if (n)
+        fb_present_rects(rects, n);
     }
 
     /* snapshot for next frame */

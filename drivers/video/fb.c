@@ -1,16 +1,9 @@
-/* fb.c — linear framebuffer driver over the Bochs/QEMU VBE DISPI interface.
- *
- * QEMU's default "std" VGA (and Bochs/VirtualBox) expose a tiny register bank,
- * the "VBE DISPI" interface, that sets a linear-framebuffer graphics mode from
- * protected mode with no real-mode BIOS call. We pick a 32-bpp mode, find the
- * card's linear framebuffer through its PCI BAR0, map it, and draw straight
- * into it. If no DISPI adapter answers, fb_init returns -1 and the kernel keeps
- * its VGA text console.
- */
+/* fb.c: linear framebuffer driver over the Bochs/QEMU VBE DISPI interface.
+ * Sets a 32-bpp mode via PCI BAR0 with no BIOS call; fb_init returns -1 if no
+ * DISPI adapter answers (the kernel keeps its VGA text console). */
 
 #include "fb.h"
 #include "font_aa.h"
-#include "font_ui.h"
 #include "heap.h"
 #include "io.h"
 #include "kstring.h"
@@ -46,10 +39,8 @@ static int active;
 static int single;   /* 1 when there is no back buffer (draw direct)   */
 static int can_mode; /* 1 = DISPI path: the mode can be reprogrammed   */
 
-/* Resolutions offered for runtime switching (DISPI path only). The front buffer
- * and back buffer are mapped/allocated at the largest of these once at init, so
- * a mode change is just a DISPI reprogram — no remap, no realloc, no race with
- * the compositor. Keep the last entry the largest (it sizes the capacity). */
+/* Modes for runtime switching (DISPI only). Buffers are sized for the largest at
+ * init, so a switch is just a reprogram. Keep the largest entry last. */
 static const struct {
   uint16_t w, h;
 } fb_modes[] = {
@@ -64,25 +55,20 @@ static const struct {
  * a per-channel scale when the back buffer is copied to the visible screen. */
 static int brightness = FB_BRIGHT_MAX;
 
-/* Compositor frame-pacing target (Hz) — the desktop's software present cadence,
- * NOT a hardware mode. Settings writes it via /sys/class/graphics/fb0/rate and
- * /bin/compositor polls it to pace its loop. The panel's real refresh caps the
- * useful upper end but isn't enforced here (Settings offers the sensible list).
- */
+/* Compositor frame-pacing target (Hz), not a hardware mode. Set via
+ * /sys/class/graphics/fb0/rate and polled by /bin/compositor; the upper end isn't enforced. */
 #define FB_HZ_MIN 20
 #define FB_HZ_MAX 240
 static int target_hz = 60;
 
-/* Scale a back-buffer pixel by the current brightness. FB_BRIGHT_MAX is 8, so
- * the divide is a >>3 the compiler can fold; callers skip this entirely at full
- * brightness (the common case) to keep the per-frame copy a plain memory move.
- */
+/* Scale a back-buffer pixel by the current brightness (a >>3 since
+ * FB_BRIGHT_MAX is 8). Red and blue share one multiply in 16-bit lanes. */
 static inline uint32_t dim_px(uint32_t p)
 {
-  uint32_t r = (((p >> 16) & 0xFF) * (uint32_t)brightness) >> 3;
-  uint32_t g = (((p >> 8) & 0xFF) * (uint32_t)brightness) >> 3;
-  uint32_t b = ((p & 0xFF) * (uint32_t)brightness) >> 3;
-  return (r << 16) | (g << 8) | b;
+  uint32_t k = (uint32_t)brightness;
+  uint32_t rb = (((p & 0x00FF00FFu) * k) >> 3) & 0x00FF00FFu;
+  uint32_t g = (((p & 0x0000FF00u) * k) >> 3) & 0x0000FF00u;
+  return rb | g;
 }
 
 /* 32-bpp run fill (`rep stosl`): a solid-colour row is the inner loop of every
@@ -94,63 +80,21 @@ static inline void fill32(uint32_t *d, uint32_t v, int n)
   __asm__ volatile("rep ; stosl" : "=&D"(d0), "=&c"(d1) : "a"(v), "0"(d), "1"(n) : "memory");
 }
 
-/* Clip rectangle: drawing primitives only touch pixels inside it, so the
- * compositor can redraw just a damaged region by clipping to it. Half-open
- * [cl_x0,cl_x1) x [cl_y0,cl_y1). */
-static int cl_x0, cl_y0, cl_x1, cl_y1;
-
-/* Damage rectangle: the bounding box of everything drawn since the last
- * present. fb_present copies only this region from the back buffer to VRAM —
- * the key to staying fast on real hardware, where VRAM writes are slow. Empty
- * when dirty_x1 <= dirty_x0. */
+/* Bounding box of everything drawn since the last present; fb_present copies only
+ * this to VRAM (slow on real hardware). Empty when dirty_x1 <= dirty_x0. */
 static int dirty_x0, dirty_y0, dirty_x1, dirty_y1;
 
-void fb_clip_full(void)
-{
-  cl_x0 = 0;
-  cl_y0 = 0;
-  cl_x1 = (int)fb_w;
-  cl_y1 = (int)fb_h;
-}
-
-void fb_set_clip(int x, int y, int w, int h)
-{
-  cl_x0 = x < 0 ? 0 : x;
-  cl_y0 = y < 0 ? 0 : y;
-  cl_x1 = (x + w > (int)fb_w) ? (int)fb_w : x + w;
-  cl_y1 = (y + h > (int)fb_h) ? (int)fb_h : y + h;
-  if (cl_x1 < cl_x0)
-    cl_x1 = cl_x0;
-  if (cl_y1 < cl_y0)
-    cl_y1 = cl_y0;
-}
-
-/* Current (clamped) clip rectangle, so a caller that iterates the whole screen
- * to render — the desktop background — can confine its loop to the damaged band
- * instead of every row at the panel's full height. */
-void fb_get_clip(int *x, int *y, int *w, int *h)
-{
-  if (x)
-    *x = cl_x0;
-  if (y)
-    *y = cl_y0;
-  if (w)
-    *w = cl_x1 - cl_x0;
-  if (h)
-    *h = cl_y1 - cl_y0;
-}
-
-/* Intersect (x,y,w,h) with the clip rect into out[], returns 0 if empty. */
+/* Intersect (x,y,w,h) with the screen into out[], returns 0 if empty. */
 static int clip(int x, int y, int w, int h, int *ox, int *oy, int *ow, int *oh)
 {
-  int x0 = x < cl_x0 ? cl_x0 : x;
-  int y0 = y < cl_y0 ? cl_y0 : y;
+  int x0 = x < 0 ? 0 : x;
+  int y0 = y < 0 ? 0 : y;
   int x1 = x + w;
-  if (x1 > cl_x1)
-    x1 = cl_x1;
+  if (x1 > (int)fb_w)
+    x1 = (int)fb_w;
   int y1 = y + h;
-  if (y1 > cl_y1)
-    y1 = cl_y1;
+  if (y1 > (int)fb_h)
+    y1 = (int)fb_h;
   if (x0 >= x1 || y0 >= y1)
     return 0;
   *ox = x0;
@@ -182,24 +126,18 @@ static void mark(int x, int y, int w, int h)
 
 static void alloc_backbuffer(void);
 
-/* Optional flush hook for paravirtual adapters (VMware SVGA II). Set, it is
- * called with each rectangle copied to the visible framebuffer so the backend
- * can tell the host to re-read it; unset (plain LFB), presents are just the
- * copy. */
+/* Optional flush hook for paravirtual adapters (VMware SVGA II), called per rect copied to the framebuffer. */
 static void (*present_hook)(int, int, int, int);
 
 void fb_set_present_hook(void (*cb)(int, int, int, int)) { present_hook = cb; }
 
-/* Make the visible framebuffer write-combining. On real GPUs VRAM defaults to
- * uncached, so each store is its own slow bus transaction; write-combining lets
- * the CPU batch them into bursts — the single biggest win for the per-frame
- * copy. We program PAT entry 1 to WC and tag the framebuffer's PTEs to use it.
- * A no-op (harmless) under QEMU, whose "VRAM" is host RAM. */
+/* Make the framebuffer write-combining (PAT entry 1) so stores batch into bursts
+ * instead of uncached bus transactions. Harmless under QEMU. */
 static void enable_wc(void)
 {
   uint32_t a, b, c, d;
   __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
-  if (!(d & (1u << 16))) /* CPUID.01H:EDX.PAT — no PAT, give up      */
+  if (!(d & (1u << 16))) /* CPUID.01H:EDX.PAT, no PAT, give up      */
     return;
 
   /* Read IA32_PAT (MSR 0x277), set entry 1 (PA1) to WC (0x01), write it back.
@@ -256,11 +194,8 @@ static uint32_t find_lfb_phys(void)
   return 0;
 }
 
-/* Adopt a framebuffer a bootloader (GRUB via Multiboot, or UEFI GOP) already
- * set up for us, instead of programming a mode ourselves. `pitch` is in bytes
- * and may exceed width*4. We only handle 32-bpp direct-RGB framebuffers, which
- * is what our XRGB8888 primitives assume. Returns 0 on success, -1 otherwise.
- */
+/* Adopt a bootloader-provided (GRUB/UEFI GOP) framebuffer. `pitch` is in bytes.
+ * Only 32-bpp direct-RGB is supported. Returns 0, or -1. */
 int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32_t bpp)
 {
   if (bpp != 32 || phys == 0 || w == 0 || h == 0)
@@ -289,18 +224,13 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
   alloc_backbuffer(); /* off-screen buffer in cached RAM              */
 
   active = 1;
-  fb_clip_full();
   fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
   fb_present();
   return 0;
 }
 
-/* Allocate the off-screen back buffer in cached system RAM. VRAM is the wrong
- * place for it: on real GPUs VRAM is uncached/write-combining, so reading it
- * back (and even drawing into it) is glacially slow. We pull a contiguous run
- * from the PMM (above the 16 MiB identity map — there's plenty on real
- * machines) and identity-map it. Falls back to single-buffered (draw straight
- * to the framebuffer) only if no RAM is available. */
+/* Back buffer in cached RAM (VRAM reads are glacial): a contiguous PMM run above
+ * the 16 MiB identity map. Falls back to single-buffered if none is available. */
 static void alloc_backbuffer(void)
 {
   uint32_t bytes = fb_cap * 4;
@@ -347,10 +277,7 @@ int fb_init(uint32_t want_w, uint32_t want_h)
   fb_pitch = want_w;
   fb_pixels = want_w * want_h;
 
-  /* Map and back the LFB at the largest offered mode, not just the initial
-   * one, so a later fb_set_mode is a pure DISPI reprogram with no remap/realloc
-   * (and so no race with the compositor). QEMU's std-vga VRAM aperture (16 MiB)
-   * comfortably holds 1920x1080x4. */
+  /* Back the LFB at the largest mode so fb_set_mode needs no remap/realloc. */
   fb_cap = FB_MAX_W * FB_MAX_H;
   if (fb_cap < fb_pixels)
     fb_cap = fb_pixels;
@@ -364,7 +291,6 @@ int fb_init(uint32_t want_w, uint32_t want_h)
 
   active = 1;
   can_mode = 1; /* DISPI: the mode can be reprogrammed at runtime */
-  fb_clip_full();
   fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
   fb_present();
   return 0;
@@ -382,10 +308,8 @@ int fb_mode_get(int i, uint32_t *w, uint32_t *h)
   return 1;
 }
 
-/* Reprogram the DISPI adapter to one of the offered modes. The buffers are
- * already sized for the largest mode (fb_init), so this only reshapes the
- * geometry the primitives use, clears the screen, and presents. Must run on the
- * compositor thread (it mutates fb_w/fb_h/fb_pitch the WM draws against). */
+/* Reprogram DISPI to an offered mode (buffers are already max-sized), clear and
+ * present. Must run on the compositor thread (mutates fb_w/fb_h/fb_pitch). */
 int fb_set_mode(uint32_t w, uint32_t h)
 {
   if (!active || !can_mode)
@@ -418,61 +342,82 @@ int fb_set_mode(uint32_t w, uint32_t h)
   fb_h = h;
   fb_pitch = w;
   fb_pixels = w * h;
-  fb_clip_full();
   fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
   fb_present();
   return 0;
 }
 
-void fb_present(void)
+/* Copy [x,y,w,h) of the back buffer to VRAM, dimmed below max brightness. Rect
+ * must be pre-clipped. Nothing to copy when single-buffered. */
+static void copy_region(int x, int y, int w, int h)
 {
-  if (dirty_x1 <= dirty_x0 || dirty_y1 <= dirty_y0) {
-    dirty_x1 = dirty_x0; /* nothing changed                           */
+  if (single)
     return;
-  }
-
-  int rx = dirty_x0, ry = dirty_y0;
-  int rw = dirty_x1 - dirty_x0, rh = dirty_y1 - dirty_y0;
-
-  /* Copy only the damaged rectangle, row by row, from the cached RAM back
-   * buffer to VRAM. This is the only place we ever write the framebuffer.
-   * When dimmed, each pixel is scaled on the way out; at full brightness the
-   * copy stays a verbatim move. In single-buffered fallback drawing already
-   * went straight to the framebuffer, so there is nothing to copy. */
-  if (!single) {
-    int dim = brightness < FB_BRIGHT_MAX;
-    for (int y = dirty_y0; y < dirty_y1; y++) {
-      const uint32_t *s = fb + (uint32_t)y * fb_pitch + dirty_x0;
-      uint32_t *d = front + (uint32_t)y * fb_pitch + dirty_x0;
-      if (dim) {
-        for (int x = 0; x < rw; x++)
-          d[x] = dim_px(s[x]);
-      } else {
-        memcpy(d, s, (uint32_t)rw * 4);
-      }
+  int dim = brightness < FB_BRIGHT_MAX;
+  for (int row = y; row < y + h; row++) {
+    const uint32_t *s = fb + (uint32_t)row * fb_pitch + x;
+    uint32_t *d = front + (uint32_t)row * fb_pitch + x;
+    if (dim) {
+      for (int i = 0; i < w; i++)
+        d[i] = dim_px(s[i]);
+    } else {
+      memcpy(d, s, (uint32_t)w * 4);
     }
-    /* Drain the write-combining buffer to VRAM. The front buffer is WC
-     * (enable_wc), so these stores otherwise linger in the CPU's WC buffer
-     * and don't reach the panel until some later eviction — which is why a
-     * small present (clock tick, cursor move) stayed invisible on real
-     * hardware until a burst of input forced a flush. SFENCE makes the frame
-     * appear now. */
-    __asm__ volatile("sfence" ::: "memory");
   }
-
-  /* Paravirtual adapter (VMware SVGA II): flush just the damaged rect. */
-  if (present_hook)
-    present_hook(rx, ry, rw, rh);
-
-  dirty_x1 = dirty_x0; /* mark the damage box empty again           */
 }
 
-/* Step the display brightness and re-render the whole visible screen from the
- * (full-colour) back buffer so the change is immediately visible — the WM only
- * presents damaged rectangles, so without this a brightness change would not
- * appear until something else redrew. No-op in text mode or single-buffered
- * fallback (there is no separate back buffer to re-scale from). IRQ-safe: it
- * runs to completion before the compositor thread resumes. */
+/* Drain the write-combining buffer; without SFENCE small presents stayed
+ * invisible on real hardware. */
+static void drain_wc(void)
+{
+  if (!single)
+    __asm__ volatile("sfence" ::: "memory");
+}
+
+static void present_full(void)
+{
+  copy_region(0, 0, (int)fb_w, (int)fb_h);
+  drain_wc();
+  if (present_hook)
+    present_hook(0, 0, (int)fb_w, (int)fb_h);
+}
+
+void fb_present(void)
+{
+  if (dirty_x1 > dirty_x0 && dirty_y1 > dirty_y0) {
+    int rx = dirty_x0, ry = dirty_y0;
+    int rw = dirty_x1 - dirty_x0, rh = dirty_y1 - dirty_y0;
+    copy_region(rx, ry, rw, rh);
+    drain_wc();
+    if (present_hook) /* paravirtual adapter (VMware SVGA II): flush the rect */
+      present_hook(rx, ry, rw, rh);
+  }
+  dirty_x1 = dirty_x0;
+}
+
+/* Flush every rectangle of the back buffer with a single WC drain. Each rect is
+ * clipped to the screen; a compositor supplies its own damage list. */
+void fb_present_rects(const struct fb_rect *r, int n)
+{
+  if (!active)
+    return;
+  for (int i = 0; i < n; i++) {
+    int x, y, w, h;
+    if (clip(r[i].x, r[i].y, r[i].w, r[i].h, &x, &y, &w, &h))
+      copy_region(x, y, w, h);
+  }
+  drain_wc();
+  if (!present_hook)
+    return;
+  for (int i = 0; i < n; i++) {
+    int x, y, w, h;
+    if (clip(r[i].x, r[i].y, r[i].w, r[i].h, &x, &y, &w, &h))
+      present_hook(x, y, w, h);
+  }
+}
+
+/* Step brightness and re-render the whole screen from the back buffer (the WM only
+ * presents damage). No-op in text mode or single-buffered. IRQ-safe. */
 void fb_brightness_step(int dir)
 {
   if (!active || single)
@@ -485,17 +430,7 @@ void fb_brightness_step(int dir)
   if (nb == brightness)
     return;
   brightness = nb;
-
-  int dim = brightness < FB_BRIGHT_MAX;
-  for (uint32_t y = 0; y < fb_h; y++) {
-    const uint32_t *s = fb + y * fb_pitch;
-    uint32_t *d = front + y * fb_pitch;
-    for (uint32_t x = 0; x < fb_w; x++)
-      d[x] = dim ? dim_px(s[x]) : s[x];
-  }
-  __asm__ volatile("sfence" ::: "memory");
-  if (present_hook)
-    present_hook(0, 0, (int)fb_w, (int)fb_h);
+  present_full();
 }
 
 int fb_brightness(void) { return brightness; }
@@ -503,13 +438,9 @@ int fb_brightness(void) { return brightness; }
 int fb_active(void) { return active; }
 uint32_t fb_width(void) { return fb_w; }
 uint32_t fb_height(void) { return fb_h; }
-uint32_t *fb_ptr(void) { return fb; }
-uint32_t fb_pitch_pixels(void) { return fb_pitch; }
 
-/* Phase-1 compositor primitives (SYS_FB_*). The back buffer is a contiguous PMM
- * run identity-mapped into the kernel, so its physical base equals fb_ptr(); 0
- * in text mode or single-buffered fallback (nothing safe to hand a compositor).
- */
+/* Compositor primitives (SYS_FB_*). The back buffer is identity-mapped, so its
+ * physical base equals the pointer; 0 in text mode or single-buffered. */
 uint32_t fb_backbuffer_phys(void) { return (active && !single) ? (uint32_t)(uintptr_t)fb : 0; }
 
 uint32_t fb_backbuffer_bytes(void) { return fb_cap * 4u; }
@@ -536,36 +467,6 @@ void fb_set_target_hz(int hz)
   target_hz = hz;
 }
 
-/* Flush just [x,y,w,h) of the back buffer to VRAM, reusing fb_present's device
- * path (WC drain + SVGA hook). Clipped to the screen; a compositor supplies its
- * own damage rect. */
-void fb_present_rect(int x, int y, int w, int h)
-{
-  if (!active || w <= 0 || h <= 0)
-    return;
-  int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-  int x1 = x + w, y1 = y + h;
-  if (x1 > (int)fb_w)
-    x1 = (int)fb_w;
-  if (y1 > (int)fb_h)
-    y1 = (int)fb_h;
-  if (x1 <= x0 || y1 <= y0)
-    return;
-  dirty_x0 = x0;
-  dirty_y0 = y0;
-  dirty_x1 = x1;
-  dirty_y1 = y1;
-  fb_present();
-}
-
-void fb_pixel(int x, int y, uint32_t color)
-{
-  if (x < cl_x0 || x >= cl_x1 || y < cl_y0 || y >= cl_y1)
-    return;
-  fb[y * (int)fb_pitch + x] = color;
-  mark(x, y, 1, 1);
-}
-
 void fb_fill_rect(int x, int y, int w, int h, uint32_t color)
 {
   int cx, cy, cw, ch;
@@ -578,27 +479,6 @@ void fb_fill_rect(int x, int y, int w, int h, uint32_t color)
   mark(cx, cy, cw, ch);
 }
 
-void fb_rect(int x, int y, int w, int h, uint32_t color)
-{
-  fb_fill_rect(x, y, w, 1, color);
-  fb_fill_rect(x, y + h - 1, w, 1, color);
-  fb_fill_rect(x, y, 1, h, color);
-  fb_fill_rect(x + w - 1, y, 1, h, color);
-}
-
-void fb_blit(int x, int y, int w, int h, const uint32_t *src, int src_pitch)
-{
-  int cx, cy, cw, ch;
-  if (!clip(x, y, w, h, &cx, &cy, &cw, &ch))
-    return;
-  for (int row = 0; row < ch; row++) {
-    const uint32_t *s = src + (cy - y + row) * src_pitch + (cx - x);
-    uint32_t *d = fb + (cy + row) * (int)fb_pitch + cx;
-    memcpy(d, s, (uint32_t)cw * 4);
-  }
-  mark(cx, cy, cw, ch);
-}
-
 /* Blend src (0..255 per channel) over dst by coverage a (0..255). */
 static inline uint32_t blend(uint32_t fg, uint32_t bg, unsigned a)
 {
@@ -607,10 +487,10 @@ static inline uint32_t blend(uint32_t fg, uint32_t bg, unsigned a)
   if (a == 255)
     return fg;
   unsigned ia = 255 - a;
-  unsigned r = (((fg >> 16) & 0xff) * a + ((bg >> 16) & 0xff) * ia) / 255;
-  unsigned g = (((fg >> 8) & 0xff) * a + ((bg >> 8) & 0xff) * ia) / 255;
-  unsigned b = ((fg & 0xff) * a + (bg & 0xff) * ia) / 255;
-  return (r << 16) | (g << 8) | b;
+  unsigned r = ((fg >> 16) & 0xff) * a + ((bg >> 16) & 0xff) * ia + 128;
+  unsigned g = ((fg >> 8) & 0xff) * a + ((bg >> 8) & 0xff) * ia + 128;
+  unsigned b = (fg & 0xff) * a + (bg & 0xff) * ia + 128;
+  return (((r + (r >> 8)) >> 8) << 16) | (((g + (g >> 8)) >> 8) << 8) | ((b + (b >> 8)) >> 8);
 }
 
 void fb_glyph(int x, int y, unsigned char ch, uint32_t fg, uint32_t bg)
@@ -640,15 +520,9 @@ void fb_text(int x, int y, const char *s, uint32_t fg, uint32_t bg)
     fb_glyph(x, y, (unsigned char)*s, fg, bg);
 }
 
-/* --- framebuffer boot console
- * ------------------------------------------------- A scrolling text console
- * drawn straight to the framebuffer, used during boot (in graphics mode, before
- * the window manager exists) so the verbose bring-up log is visible on screen.
- * In graphics mode the 0xB8000 text the VGA driver writes isn't shown and the
- * compositor isn't up yet, so without this only code that drew the framebuffer
- * directly (the old e1000 fb_line) appeared. vga.c feeds this one char at a
- * time when verbose logging is on; it goes quiet once the WM takes the
- * framebuffer (vga.c stops calling it). */
+/* --- framebuffer boot console ---
+ * Scrolling text console drawn to the framebuffer for the verbose boot log,
+ * fed a char at a time by vga.c until the WM takes the framebuffer. */
 
 #define CON_MARGIN 4
 static int con_x = CON_MARGIN, con_y = CON_MARGIN;
@@ -661,28 +535,11 @@ static void fb_con_newline(void)
     return;
   /* Scroll the back buffer up one text row and clear the new bottom row. */
   uint32_t move = fb_h - FONT_H;
-  for (uint32_t y = 0; y < move; y++)
-    for (uint32_t x = 0; x < fb_w; x++)
-      fb[y * fb_pitch + x] = fb[(y + FONT_H) * fb_pitch + x];
-  for (uint32_t y = move; y < fb_h; y++)
-    for (uint32_t x = 0; x < fb_w; x++)
-      fb[y * fb_pitch + x] = 0x000000;
+  memmove(fb, fb + (uint32_t)FONT_H * fb_pitch, move * fb_pitch * 4);
+  fill32(fb + move * fb_pitch, 0x000000, (int)((fb_h - move) * fb_pitch));
   con_y -= FONT_H;
-  /* Push the whole back buffer to the visible framebuffer (the scroll touched
-   * every row, so a damage-rect present won't do). single mode draws straight
-   * to `front`, so the back-buffer scroll above is already on screen. */
-  if (!single) {
-    int dim = brightness < FB_BRIGHT_MAX;
-    for (uint32_t y = 0; y < fb_h; y++) {
-      const uint32_t *s = fb + y * fb_pitch;
-      uint32_t *d = front + y * fb_pitch;
-      for (uint32_t x = 0; x < fb_w; x++)
-        d[x] = dim ? dim_px(s[x]) : s[x];
-    }
-    __asm__ volatile("sfence" ::: "memory");
-  }
-  if (present_hook) /* SVGA: the scroll touched the whole screen */
-    present_hook(0, 0, (int)fb_w, (int)fb_h);
+  /* The scroll touched every row, so a damage-rect present won't do. */
+  present_full();
 }
 
 void fb_con_putc(char c)
@@ -708,47 +565,7 @@ void fb_con_putc(char c)
   }
   if (con_x + FONT_W > (int)fb_w)
     fb_con_newline();
-  fb_clip_full();
   fb_glyph(con_x, con_y, (unsigned char)c, 0x33ff66, 0x000000); /* green on black */
   fb_present();                                                 /* copies just the glyph's damage rect          */
   con_x += FONT_W;
-}
-
-/* --- Proportional UI font (sans-serif) for window chrome. Always blends fg
- * over whatever is already in the back buffer (callers fill the bar first), so
- * it has no bg parameter and overlapping advances compose cleanly. --- */
-
-static void fb_ui_glyph(int x, int y, unsigned char ch, uint32_t fg)
-{
-  int cx, cy, cw, chh;
-  if (!clip(x, y, UIFONT_W, UIFONT_H, &cx, &cy, &cw, &chh))
-    return;
-  for (int row = 0; row < chh; row++) {
-    int sy = cy + row;
-    const unsigned char *cov = font_ui[ch][sy - y];
-    uint32_t *d = fb + sy * (int)fb_pitch;
-    for (int col = 0; col < cw; col++) {
-      int sx = cx + col;
-      unsigned a = cov[sx - x];
-      if (a)
-        d[sx] = blend(fg, d[sx], a);
-    }
-  }
-  mark(cx, cy, cw, chh);
-}
-
-int fb_ui_width(const char *s)
-{
-  int w = 0;
-  for (; *s; s++)
-    w += font_ui_adv[(unsigned char)*s];
-  return w;
-}
-
-void fb_ui_text(int x, int y, const char *s, uint32_t fg)
-{
-  for (; *s; s++) {
-    fb_ui_glyph(x, y, (unsigned char)*s, fg);
-    x += font_ui_adv[(unsigned char)*s];
-  }
 }

@@ -18,7 +18,12 @@ void syscall_window_create(struct registers *r)
   r->eax = (uint32_t)uwin_create((int)r->ebx, (int)r->ecx, title);
 }
 
-void syscall_window_present(struct registers *r) { r->eax = (uint32_t)uwin_present((int)r->ebx); }
+/* ecx = x | y << 16, edx = w | h << 16; both zero presents the whole buffer. */
+void syscall_window_present(struct registers *r)
+{
+  r->eax = (uint32_t)uwin_present((int)r->ebx, (int)(r->ecx & 0xFFFF), (int)(r->ecx >> 16), (int)(r->edx & 0xFFFF),
+                                  (int)(r->edx >> 16));
+}
 
 void syscall_window_poll(struct registers *r)
 {

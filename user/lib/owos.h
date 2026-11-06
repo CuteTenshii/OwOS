@@ -1,4 +1,4 @@
-/* owos.h — the OwOS user-space library (minimal libc over int 0x80). */
+/* owos.h: the OwOS user-space library (minimal libc over int 0x80). */
 #ifndef OWOS_USER_H
 #define OWOS_USER_H
 
@@ -39,12 +39,8 @@ int writefile(const char *name, const void *buf, int len); /* 0, or -1    */
  * may be short at end of file) or -1. Lets a program stream a file bigger than
  * its address window. */
 int readfile_at(const char *name, unsigned off, void *buf, unsigned len);
-/* Streaming write, for content too large to hold in one buffer (e.g. a browser
- * download). stream_begin opens `name` (overwriting any existing file);
- * stream_write appends a chunk; stream_end commits and returns the total bytes
- * written, or -1. Only one stream may be open at a time. begin/write return
- * 0/-1. A failed write auto-closes the stream, so stream_end then returns -1
- * (nothing is committed and the reserved space is reused). */
+/* Streaming write; one stream at a time. stream_end returns total bytes or -1
+ * (also after a failed write, which auto-closes without committing). */
 int stream_begin(const char *name);
 int stream_write(const void *buf, int len);
 int stream_end(void);
@@ -53,22 +49,12 @@ int stream_end(void);
  * program returns this from main when a cooperative interrupt aborted it. */
 #define EXIT_SIGINT 130
 
-/* net_* error/status codes. Negative returns from
- * net_connect/net_recv/net_send; NET_EINTR means a cooperative Ctrl+C arrived
- * mid-call (the program should tear down and exit). Check it with `r ==
- * NET_EINTR`. */
+/* net_* return: a cooperative Ctrl+C arrived mid-call; tear down and exit. */
 #define NET_EINTR (-4)
 
-/* Networking: a small Berkeley-ish socket API. net_connect takes an IP literal
- * (`host` is a dotted-quad — name resolution is user/lib/resolve, the
- * getaddrinfo analog) and opens a transport selected by `proto` (SK_*): TCP, a
- * UDP datagram socket to host:port, or a raw ICMP socket (the program
- * builds/parses the ICMP message itself). Returns a handle >= 0, or a negative
- * error (-1 no NIC/slot, -2 not an IP, -3 connect failed, -4 interrupted).
- * net_send writes (a datagram, for UDP/ICMP). net_recv blocks: TCP -> >0 bytes
- * / 0 EOF; UDP/ICMP -> >0 datagram bytes / 0 timeout; both -1 error, -4
- * interrupted. TLS/ping/dig/ resolution are code over these sockets
- * (user/lib/{tls,resolve}, ping/dig). */
+/* net_connect: `host` is a dotted-quad (name resolution is user/lib/resolve), `proto` is SK_*.
+ * Returns a handle >= 0 or -1 no NIC/slot, -2 not an IP, -3 connect failed, -4 interrupted.
+ * net_recv blocks: TCP >0 bytes / 0 EOF; UDP/ICMP >0 bytes / 0 timeout; -1 error. */
 #define SK_TCP 0
 #define SK_UDP 2
 #define SK_ICMP 3
@@ -92,25 +78,15 @@ int net_close(int h);
 #define NET_OPT_TTL 1 /* net_set_ttl option id (the only socket option today)  */
 int net_set_ttl(int h, int ttl);
 
-/* Server sockets — the passive/bound counterpart to net_connect, over the same
- * handle space. TCP: net_listen opens a listener on `port`; net_accept blocks
- * for a client and returns a NEW handle for the connection, driven with the
- * ordinary net_send/net_recv/net_close (net_close on the listener stops it).
- * UDP: net_bind binds a datagram socket to `port`; net_recvfrom blocks for one
- * datagram and reports the sender's IP/port (src_ip/src_port may be NULL);
- * net_sendto replies to any ip:port. Returns >=0 handle/bytes/ok, or negative
- * (-1 no NIC/slot/bad fd, NET_EINTR on Ctrl+C). */
+/* Server sockets. net_accept returns a new connection handle; net_recvfrom's
+ * src_ip/src_port may be NULL. Returns >=0, or -1 / NET_EINTR. */
 int net_listen(int port);
 int net_accept(int listen_fd);
 int net_bind(int port);
 int net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[4], int *src_port);
 int net_sendto(int fd, const unsigned char ip[4], int port, const void *buf, int len);
 
-/* Raw Ethernet socket (the AF_PACKET analog) + interface config — both
- * root-only, for /bin/dhcpcd. net_raw_open returns a fd usable with net_send
- * (transmit a full L2 frame verbatim) / net_recv / net_recv_nb (dequeue one
- * inbound frame, unfiltered) / net_close. ifconfig sets the kernel IPv4 config.
- * -1 if not root. */
+/* Raw Ethernet socket (full L2 frames) + IPv4 config, for /bin/dhcpcd. Root-only, -1 otherwise. */
 int net_raw_open(void);
 int ifconfig(const unsigned char ip[4], const unsigned char mask[4], const unsigned char gw[4],
              const unsigned char dns[4]);
@@ -119,34 +95,22 @@ int ifconfig(const unsigned char ip[4], const unsigned char mask[4], const unsig
  * caller isn't uid 0. Any time source (e.g. /bin/ntpd) can drive it. */
 int setrtc(unsigned secs);
 
-/* Freestanding string helpers — shared so each program doesn't re-roll its own.
+/* Freestanding string helpers, shared so each program doesn't re-roll its own.
  * Standard libc names, matching the kernel's kstring.h convention. */
 int strlen(const char *s);
 int strcmp(const char *a, const char *b); /* <0 / 0 / >0                    */
 void strcpy(char *d, const char *s);      /* caller sizes d                 */
 void strcat(char *d, const char *s);      /* caller sizes d                 */
-/* Bounded copy (BSD strlcpy): src into dst, writing at most size-1 bytes and
- * always NUL-terminating (dst[0]='' when size<=0). Truncates rather than
- * overflowing — the safe default when the source length isn't provably bounded
- * (URLs, header/attribute values); prefer over strcpy in those cases. Returns
- * void here (unlike BSD's size_t), matching this header's strcpy/strcat. */
+/* BSD strlcpy: truncates, always NUL-terminates. Returns void, unlike BSD. */
 void strlcpy(char *dst, const char *src, int size);
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 
-/* UTF-8 codec — shared so the whole system handles multibyte / non-Latin text
- * the same way. utf8_seqlen: bytes a lead byte announces (1 for
- * bad/continuation). utf8_decode: read one codepoint from [s,end) into *cp,
- * returning bytes consumed (U+FFFD + 1 byte on a malformed/truncated sequence).
- * utf8_encode: write cp as 1..4 bytes into `out` (must hold >=4), returning the
- * count. */
+/* UTF-8 codec. Malformed/truncated input decodes as U+FFFD, 1 byte; `out` needs >=4 bytes. */
 int utf8_seqlen(unsigned char lead);
 int utf8_decode(const char *s, const char *end, unsigned *cp);
 int utf8_encode(unsigned cp, char *out);
 
-/* mem* — the freestanding libc primitives gcc also lowers struct copies and
- * array inits to at -O0. Provided once in the shared lib so every program (and
- * any lib needing them, e.g. minimp3, the HTTP/2 HPACK tables) shares one copy.
- * __SIZE_TYPE__ is gcc's builtin for size_t — no header needed. */
+/* mem*: gcc also lowers struct copies and array inits to these at -O0. */
 void *memcpy(void *d, const void *s, __SIZE_TYPE__ n);
 void *memset(void *d, int c, __SIZE_TYPE__ n);
 int memcmp(const void *a, const void *b, __SIZE_TYPE__ n);
@@ -157,22 +121,14 @@ void puts(const char *s);         /* write a NUL-terminated string */
 void print_uint(unsigned v);      /* write a decimal number        */
 int readline(char *buf, int max); /* echoed line input, returns len*/
 
-/* Formatted output. Conversions: %s (NULL -> "(null)"), %c, %d/%i, %u, %x, %X,
- * %p, %%; with an optional '0' flag and a decimal field width (e.g. %08x, %4u).
- * No floats, no length modifiers — everything is 32-bit. printf writes to fd 1;
- * snprintf always NUL-terminates when size > 0 and returns the length that
- * would have been written (C99), so truncation is detectable. */
+/* Supports %s %c %d %i %u %x %X %p %% with '0' flag and width; no floats or length
+ * modifiers. snprintf returns the untruncated length (C99). */
 int printf(const char *fmt, ...);
 int snprintf(char *buf, unsigned size, const char *fmt, ...);
 int vsnprintf(char *buf, unsigned size, const char *fmt, va_list ap);
 
 /* ----------------------------------------------------------- windowing API */
-/*
- * A program creates one window, gets a shared client pixel buffer mapped at
- * WIN_FB_ADDR (XRGB8888, row-major, pitch = the width passed to win_create),
- * draws into it, calls win_present() to show it, and reads input events.
- * win_wait() sleeps roughly one frame so the event loop doesn't busy-spin.
- */
+/* Client buffer is mapped at WIN_FB_ADDR (XRGB8888, pitch = width passed to win_create). */
 #define WIN_FB_ADDR 0xC0000000u
 
 #define WEV_KEY                                                                                                        \
@@ -187,7 +143,7 @@ int vsnprintf(char *buf, unsigned size, const char *fmt, va_list ap);
 #define WEV_DRAG                                                                                                       \
   8 /* a, b = client x, y while the left button is held and                                                            \
      * moving (motion after a WEV_MOUSE press; ends silently                                                           \
-     * on release — the next WEV_MOUSE starts a fresh drag)  */
+     * on release, the next WEV_MOUSE starts a fresh drag)  */
 #define WEV_MOVE                                                                                                       \
   9 /* a, b = client x, y as the pointer moves with NO button                                                          \
      * held; a = -1 when the pointer leaves the window. Fast                                                           \
@@ -198,13 +154,14 @@ struct win_event {
   int a, b;
 };
 
-int win_create(int w, int h, const char *title); /* -> window id, or -1      */
-int win_present(int id);                         /* flush the buffer to screen */
-int win_poll(int id, struct win_event *ev);      /* 1 = got event, 0 = none  */
-void win_wait(int id);                           /* sleep ~a frame for events */
+int win_create(int w, int h, const char *title);          /* -> window id, or -1      */
+int win_present(int id);                                  /* flush the buffer to screen */
+int win_present_rect(int id, int x, int y, int w, int h); /* flush only the client rect that changed */
+int win_poll(int id, struct win_event *ev);               /* 1 = got event, 0 = none  */
+void win_wait(int id);                                    /* sleep ~a frame for events */
 int win_close(int id);
 /* 1 if process `pid` owns at least one window, else 0. The terminal uses this
- * to detach a windowed child (return to the prompt) vs. stream a CLI's output —
+ * to detach a windowed child (return to the prompt) vs. stream a CLI's output,
  * so it needs no hardcoded list of which /bin programs are GUI apps. */
 int win_owned(int pid);
 
@@ -213,38 +170,25 @@ static inline unsigned *win_fb(void) { return (unsigned *)WIN_FB_ADDR; }
 int win_settitle(int id, const char *title); /* set the window's title bar */
 int win_resizable(int id, int on);           /* opt the window in/out of user resizing */
 
-/* Make window `id` a transient (dialog) child of `parent` — both owned by this
- * process. The compositor stacks `id` above `parent`, moves them together, and
- * hides `id` from the taskbar/Alt+Tab. `modal` non-zero also blocks pointer/key
- * input to the rest of the parent's window family until `id` closes. parent < 0
- * clears the link. Returns 0/-1. See user/lib/dialog for ready-made dialogs. */
+/* Make `id` a transient child of `parent` (stacked above, hidden from taskbar).
+ * `modal` blocks input to the parent family. parent < 0 clears. 0/-1. */
 int win_set_parent(int id, int parent, int modal);
 
-/* The client pixel buffer of a window this process owns, in its own address
- * space. A single-window app just uses win_fb() (WIN_FB_ADDR); a second window
- * (a dialog) lands in its own slot, whose address this returns (0 if `id` isn't
- * owned). */
+/* Buffer of an owned window; 0 if not owned. A second window gets its own slot. */
 unsigned *win_fb_of(int id);
 
-/* Cursor shape shown while the pointer is over this window's client area (the
- * WM still overrides it with the resize arrow over a grip / hand over the close
- * box). Mirrors enum wm_cursor. Set WIN_CURSOR_BUSY around a slow operation
- * (loading, decoding) and WIN_CURSOR_ARROW again when done. */
+/* Cursor over the client area; mirrors enum wm_cursor. */
 #define WIN_CURSOR_ARROW 0
-#define WIN_CURSOR_HAND 1        /* pointing hand — over clickable items */
-#define WIN_CURSOR_TEXT 2        /* I-beam — over editable text          */
-#define WIN_CURSOR_BUSY 3        /* spinner — a slow operation is running */
+#define WIN_CURSOR_HAND 1        /* pointing hand, over clickable items */
+#define WIN_CURSOR_TEXT 2        /* I-beam, over editable text          */
+#define WIN_CURSOR_BUSY 3        /* spinner, a slow operation is running */
 #define WIN_CURSOR_RESIZE_NWSE 4 /* ↖↘ diagonal resize (corner) */
 #define WIN_CURSOR_RESIZE_NESW 5 /* ↗↙ diagonal resize (corner)        */
 #define WIN_CURSOR_RESIZE_NS 6   /* ↕ vertical resize (top/bottom edge) */
 #define WIN_CURSOR_RESIZE_EW 7   /* ↔ horizontal resize (left/right)    */
 int win_cursor(int id, int shape);
 
-/* ---- User-space compositor API (Phase 1; all root-only, -1 if not uid 0) ----
- * A /bin/compositor maps the shared framebuffer back buffer, reads raw input,
- * and brokers the windows the kernel WM exposes. Fixed VAs (loader.h): the back
- * buffer maps at COMPOSITOR_FB_ADDR; a window id's buffer maps at
- * WIN_MAP_ADDR(id). Unconsumed by ordinary apps. */
+/* ---- Compositor API (root-only, -1 if not uid 0). Fixed VAs, see loader.h ---- */
 #define COMPOSITOR_FB_ADDR 0xD0000000u
 #define WIN_MAP_BASE_ADDR 0xE0000000u
 #define WIN_MAP_SLOT 0x00800000u /* 8 MiB per window slot */
@@ -253,12 +197,15 @@ static inline unsigned *win_map_ptr(int id) { return (unsigned *)(WIN_MAP_BASE_A
 struct fbinfo {
   int w, h, pitch, bpp;
 }; /* pitch = pixels per row */
-int fb_info(struct fbinfo *out);                 /* 0/-1 */
-unsigned *fb_map(void);                          /* the back buffer (COMPOSITOR_FB_ADDR), or 0 */
-int fb_present_rect(int x, int y, int w, int h); /* flush a rect to VRAM; 0/-1 */
+int fb_info(struct fbinfo *out); /* 0/-1 */
+unsigned *fb_map(void);          /* the back buffer (COMPOSITOR_FB_ADDR), or 0 */
+struct fbrect {
+  int x, y, w, h;
+};
+int fb_present_rects(const struct fbrect *r, int n); /* flush up to 32 rects to VRAM, one drain; 0/-1 */
 
 /* Raw input for the compositor: current pointer state + drained key events
- * (non-blocking — whatever is pending now). keys[i].mods is a KMOD_* set. */
+ * (non-blocking, whatever is pending now). keys[i].mods is a KMOD_* set. */
 #define INPUT_KEYS 32
 struct inputstate {
   int mx, my, buttons, wheel; /* buttons: bit0 L, bit1 R, bit2 M */
@@ -270,15 +217,13 @@ struct inputstate {
 int input_poll(struct inputstate *out); /* 0/-1 */
 int input_set_bounds(int w, int h);     /* clamp box after a mode change; 0/-1 */
 
-/* Window brokering. win_enum fills `out` (up to `max`) with the live windows in
- * ascending z (bottom first) and returns the count. win_map maps a window's
- * client buffer at WIN_MAP_ADDR(id) and fills *m; win_unmap drops it.
- * win_set_geom moves/resizes; win_deliver pushes a hit-tested, client-relative
- * event into the window's ring. */
+/* Window brokering. win_enum lists windows bottom-first; win_map maps a client
+ * buffer at WIN_MAP_ADDR(id). */
 struct winrec {
   int id, x, y, w, h;
   unsigned flags; /* UWIN_F_* */
   unsigned present_seq;
+  int dirty_x, dirty_y, dirty_w, dirty_h; /* client damage since last enum; w < 0 = whole frame */
   int owner_pid, z;
   int buf_w, buf_h; /* client buffer size (stride = buf_w) */
   char title[64];
@@ -309,10 +254,7 @@ int win_deliver(int id, const struct winevent *ev);   /* 0/-1 */
  * drains or events past the ring depth are dropped. */
 int win_key_space(int id);
 
-/* Pending user-process crash reports, for the compositor to render "<app> has
- * crashed" windows (the kernel captures them in the fault handler). crash_poll
- * drains up to `max` into `out`, consuming each, and returns the count (root).
- */
+/* Pending crash reports; crash_poll consumes up to `max` (root). */
 #define CRASH_TRACE_MAX 12
 struct crash_rec {
   char name[24];
@@ -329,21 +271,14 @@ unsigned now_hms(void);
 /* Sleep for `ms` milliseconds (yields the CPU to other tasks meanwhile). */
 void msleep(unsigned ms);
 
-/* Threads. thread_create spawns `fn` on a caller-provided stack, sharing this
- * process's address space; it returns a tid. The thread function must not
- * return (loop, then call exit()); join it with thread_join (== waitpid) before
- * the process exits, so the shared address space outlives every thread. */
+/* Threads share the address space. `fn` must not return (call exit()); join before the process exits. */
 int thread_create(void (*fn)(void), void *stack_top);
 void *thread_stack_alloc(int bytes); /* guarded thread stack (unmapped guard
                                         page below); 0 on fail */
 void thread_stack_free(void *top);
 static inline int thread_join(int tid) { return waitpid(tid); }
 
-/* User-space heap. sbrk() moves the process break by `inc` bytes (negative to
- * shrink) and returns the PREVIOUS break, or (void *)-1 on failure. malloc/
- * calloc/realloc/free are a K&R-style allocator over it, and are safe to call
- * concurrently from the threads of one process (a lock serialises the free
- * list; the heap itself is shared, since threads share the address space). */
+/* sbrk returns the PREVIOUS break, or (void *)-1. malloc is thread-safe (locked free list). */
 void *sbrk(int inc);
 void *malloc(unsigned size);
 void *calloc(unsigned nmemb, unsigned size);
@@ -396,11 +331,7 @@ int statfs(const char *path, struct statfs_info *out);
  * with an optional single argument. Returns the child pid, or -1. */
 int spawn(const char *path, const char *arg);
 
-/* Spawn a /bin child with its stdout captured into a pipe: returns the pid and
- * stores the read-end fd in *rfd. Drain *rfd with read_nb until EOF (-1) to
- * render the child's output inline -- this is how the terminal runs CLI tools
- * (neofetch, curl, ...) without a kernel-shell bridge. The child inherits the
- * caller's cwd. */
+/* Spawn a /bin child with stdout piped to *rfd (drain with read_nb until -1). Inherits cwd. */
 int spawn_cap(const char *path, char *const argv[], int argc, int *rfd);
 /* Like spawn_cap, but also gives the child a stdin pipe: *wfd is the write end
  * (write keystrokes into it; the child reads fd 0). For interactive children
@@ -436,19 +367,11 @@ struct utsname {
 };
 int uname(struct utsname *out); /* 0/-1                               */
 
-/* Named local IPC ports (the unix-socket analog). Server: port_open(name,1) ->
- * listen fd, then port_accept(listen) -> a connection fd per client. Client:
- * port_open(name,0) -> a connection fd. Connections are bidirectional: read(),
- * write() and close() work on the fd. */
+/* Named local IPC ports. Server: port_open(name,1) then port_accept per client; client: port_open(name,0). */
 int port_open(const char *name, int as_server);
 int port_accept(int listen_fd);
 
-/* Signals (the kernel's minimal POSIX model — see kernel/signal.h). A process
- * installs a disposition with signal()/sigaction(); an uncaught signal takes
- * its default action (terminate for most, ignore for SIGCHLD/SIGCONT). Delivery
- * interrupts a blocking syscall (it returns the interrupted/-error value) and
- * then runs the handler. Masks are uint32 bitsets (bit n = signal n); build
- * with sigmask(n). Numbers/flags mirror kernel/signal.h — keep them in sync. */
+/* Signals; numbers/flags mirror kernel/signal.h, keep in sync. Masks are bitsets (sigmask(n)). */
 #define SIGHUP 1
 #define SIGINT 2
 #define SIGQUIT 3
@@ -496,33 +419,21 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old); /* 0
 unsigned sigprocmask(int how, const unsigned *set, unsigned *old);          /* new blocked mask */
 int raise(int sig);                                                         /* send `sig` to ourselves */
 
-/* setjmp/longjmp — non-local jump (start.S). jmp_buf saves the callee-saved
- * regs + the resume point; longjmp unwinds the stack back to the setjmp call,
- * which then appears to return `val` (or 1 if val==0). Used for crash recovery.
- */
+/* setjmp/longjmp (start.S); longjmp makes setjmp return `val` (1 if 0). */
 typedef unsigned jmp_buf[6];
 int setjmp(jmp_buf env);
 void longjmp(jmp_buf env, int val);
 
-/* Force-release the malloc heap spinlock. Only for crash recovery: after a
- * fault is unwound with longjmp, the interrupted code may have held the lock,
- * so a recovering handler resets it before allocating again. Never call in
- * normal code. */
+/* Force-release the malloc lock after longjmp crash recovery. Never call otherwise. */
 void heap_lock_reset(void);
 
-/* Audio PCM sink (streaming): open a stream, push 48 kHz / 16-bit / signed /
- * stereo frames (4 bytes each), then close. audio_write blocks (back-pressure)
- * until the device has room, so it self-paces to real time without buffering
- * the whole file; it returns the bytes accepted, -1 on error, or -2 if Ctrl+C
- * was pressed. Only one stream exists system-wide. */
+/* PCM sink: 48 kHz 16-bit signed stereo. audio_write blocks until the device has
+ * room; returns bytes accepted, -1 error, -2 Ctrl+C. One stream system-wide. */
 int audio_open(void);
 int audio_write(const void *pcm, int len);
 int audio_close(void);
 
-/* Mounted removable volumes (USB sticks, etc.). Fill *out with the idx-th
- * volume: its label, mount path (e.g. "/media"), backing kind
- * ("USB"/"SATA"/...), and removable flag. Returns 1 if it exists, 0 past the
- * end, -1 on error. */
+/* Fill *out with the idx-th removable volume. 1 if exists, 0 past end, -1 error. */
 struct volinfo {
   char dev[16];
   char kind[8];
@@ -542,10 +453,8 @@ int mount(const char *dev, const char *point);
  * or NULL. Returns 0 on success, -1 if nothing was mounted. */
 int umount(const char *point);
 
-/* Key codes delivered via WEV_KEY. Two groups. First: bytes the kernel keyboard
- * driver actually emits — these mirror kernel/keyboard.h exactly (a mismatch
- * misroutes keys). Chords arrive as base key + KMOD_* (Super+V is
- * 'v'+KMOD_SUPER, Ctrl+S is 's'+KMOD_CTRL), never a per-chord code. */
+/* Key codes via WEV_KEY emitted by the keyboard driver; must mirror kernel/keyboard.h.
+ * Chords arrive as base key + KMOD_*. */
 #define KEY_INTR                                                                                                       \
   0x18 /* Ctrl+C: interrupt the running command / cancel line                                                          \
         */
@@ -564,11 +473,8 @@ int umount(const char *point);
                        fb); 0x80 because every control code < 0x20 is already                                          \
           taken */
 
-/* Second group: menu/editing accelerators an app synthesises from a chord (via
- * menu_shortcut); the driver never emits these — they exist so apps agree on
- * one code per action, and must not collide with the driver-emitted codes
- * above. (Super+V opens clipboard history, but the compositor reads it as
- * 'v'+KMOD_SUPER directly, so it needs no code here.) */
+/* Accelerators apps synthesise via menu_shortcut; never driver-emitted, must not
+ * collide with the codes above. */
 #define KEY_NEW 0x0F    /* Ctrl+N  \                                         */
 #define KEY_OPEN 0x10   /* Ctrl+O   > menu accelerators (see menu_shortcut)  */
 #define KEY_SAVE 0x13   /* Ctrl+S  /                                         */
@@ -584,10 +490,7 @@ int umount(const char *point);
 /* Ctrl+C reaches a focused app as KEY_INTR (0x18); the editor uses it as Copy.
  */
 
-/* Modifier flags reported with every key event in win_event.b (WEV_KEY). An app
- * reads these to act on chords itself — e.g. the browser treats Alt+Left as
- * "back" — instead of the keyboard minting a dedicated code per chord. Keep in
- * sync with the KMOD_* in drivers/input/keyboard.h. */
+/* Modifier flags in win_event.b (WEV_KEY). Keep in sync with drivers/input/keyboard.h. */
 #define KMOD_SHIFT 0x01
 #define KMOD_CTRL 0x02
 #define KMOD_ALT 0x04

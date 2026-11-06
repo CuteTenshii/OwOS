@@ -45,17 +45,16 @@ void syscall_graphics_fb_map(struct registers *r)
   r->eax = COMPOSITOR_FB_VADDR;
 }
 
+/* ebx = struct fb_rect array, ecx = count (0 means one). */
 void syscall_graphics_fb_present(struct registers *r)
 {
-  struct fbrect {
-    int x, y, w, h;
-  } *rect;
-  if (sched_uid() != 0 || !user_out_range(r->ebx, sizeof *rect)) {
+  enum { MAX_RECTS = 32 };
+  uint32_t n = r->ecx ? r->ecx : 1;
+  if (sched_uid() != 0 || n > MAX_RECTS || !user_out_range(r->ebx, n * sizeof(struct fb_rect))) {
     r->eax = (uint32_t)-1;
     return;
   }
-  rect = (struct fbrect *)r->ebx;
-  fb_present_rect(rect->x, rect->y, rect->w, rect->h);
+  fb_present_rects((const struct fb_rect *)r->ebx, (int)n);
   r->eax = 0;
 }
 

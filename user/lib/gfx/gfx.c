@@ -1,4 +1,4 @@
-/* gfx.c — user-space drawing into a window's shared pixel buffer. See gfx.h. */
+/* gfx.c: user-space drawing into a window's shared pixel buffer. See gfx.h. */
 #include "gfx.h"
 #include "font.h" /* scalable fonts, loaded at runtime (no baked atlas) */
 #include "owos.h" /* KEY_* editing codes delivered via WEV_KEY */
@@ -11,10 +11,7 @@
 static unsigned *g_fb;
 static int g_w, g_h;
 
-/* Optional rectangular clip: all primitives additionally confine writes to
- * [g_cx0,g_cx1) x [g_cy0,g_cy1). Defaults to the whole buffer; a compositor
- * that repaints one damage rect at a time sets it so an unclipped full-scene
- * redraw touches only the damaged pixels (like the kernel fb clip). */
+/* Optional clip rect [g_cx0,g_cx1) x [g_cy0,g_cy1) for all primitives; defaults to the whole buffer. */
 static int g_cx0, g_cy0, g_cx1, g_cy1;
 
 void gfx_init(unsigned *fb, int w, int h)
@@ -155,10 +152,10 @@ static unsigned gfx_blend(unsigned fg, unsigned bg, unsigned a)
   if (a == 255)
     return fg;
   unsigned ia = 255 - a;
-  unsigned r = (((fg >> 16) & 0xff) * a + ((bg >> 16) & 0xff) * ia) / 255;
-  unsigned g = (((fg >> 8) & 0xff) * a + ((bg >> 8) & 0xff) * ia) / 255;
-  unsigned b = ((fg & 0xff) * a + (bg & 0xff) * ia) / 255;
-  return (r << 16) | (g << 8) | b;
+  unsigned r = ((fg >> 16) & 0xff) * a + ((bg >> 16) & 0xff) * ia + 128;
+  unsigned g = ((fg >> 8) & 0xff) * a + ((bg >> 8) & 0xff) * ia + 128;
+  unsigned b = (fg & 0xff) * a + (bg & 0xff) * ia + 128;
+  return (((r + (r >> 8)) >> 8) << 16) | (((g + (g >> 8)) >> 8) << 8) | ((b + (b >> 8)) >> 8);
 }
 
 /* Blit a w*h ARGB (0xAARRGGBB) bitmap at (x,y), alpha-blending each pixel over
@@ -183,12 +180,8 @@ void gfx_blit_argb(int x, int y, int w, int h, const unsigned *argb)
 }
 
 /* ---------------------------------------------------------------- fonts -----
- * Both fonts gfx draws with — the proportional UI font and the fixed-width
- * monospace grid font — are loaded at RUNTIME from /etc/fonts (one shared copy
- * on disk each) and rasterised by user/lib/font. No app bakes in a bitmap
- * atlas, and text is full Unicode (UTF-8 in; accents/Greek/Cyrillic via the
- * font's cmap). A `gfx_face` is a lazily-loaded font plus a per-codepoint glyph
- * cache. */
+ * Sans and mono fonts load at runtime from /etc/fonts and are rasterised by
+ * user/lib/font. A `gfx_face` is a lazily-loaded font plus a glyph cache. */
 struct gcache_e {
   unsigned cp;
   unsigned char *bm;
@@ -236,10 +229,7 @@ static int face_ready(struct gfx_face *f, const char *path, int px)
   return f->font != 0;
 }
 
-/* Look up codepoint cp in a direct-mapped glyph cache of n slots over `font` at
- * `px`, rasterizing (and evicting the slot's previous occupant) on a miss. The
- * cache array, its size, the font and the px are all explicit so both the fixed
- * faces and the size-keyed sans pool below share one implementation. */
+/* Direct-mapped glyph cache lookup; rasterizes and evicts on a miss. */
 static struct gcache_e *cache_glyph(struct font *font, int px, struct gcache_e *cache, int n, unsigned cp)
 {
   struct gcache_e *g = &cache[cp % n];
@@ -261,11 +251,7 @@ static struct gcache_e *face_glyph(struct gfx_face *f, unsigned cp)
   return cache_glyph(f->font, f->px, f->cache, FACE_CACHE, cp);
 }
 
-/* Size-keyed sans cache pool. The primary g_sans face is pinned at SANS_PX (the
- * body-text fast path); other pixel sizes — e.g. the browser's h1..h6 headings
- * — each get a slot here, reusing the already-loaded g_sans.font so nothing is
- * re-read from disk. Slots are reclaimed least-recently-used when more distinct
- * sizes are seen than there are slots. */
+/* Per-size sans cache pool (e.g. headings), LRU-reclaimed; g_sans is pinned at SANS_PX. */
 #define SIZED_FACES 6
 #define SIZED_CACHE 256
 struct sized_face {
@@ -448,7 +434,7 @@ static unsigned char uni_to_cp437(unsigned cp)
   return '?';
 }
 
-/* Monospace text that decodes UTF-8 — each codepoint occupies one GFX_FONT_W
+/* Monospace text that decodes UTF-8, each codepoint occupies one GFX_FONT_W
  * cell (so columns stay aligned), rendered via the CP437 cell font. Returns the
  * pen x after the string so callers can abut coloured runs. */
 int gfx_text_utf8(int x, int y, const char *s, unsigned fg, unsigned bg)
@@ -496,13 +482,9 @@ int gfx_ui_ascent_px(int px)
   return v.baseline;
 }
 
-/* Proportional UI text (UTF-8, accents/Greek/Cyrillic via the font's cmap) at
- * an arbitrary pixel size. SANS_PX (the default) draws from the primary cached
- * face; other sizes are cached per the size-keyed pool above — so headings
- * repaint by blitting too, not re-rasterizing. With no sans font, falls back to
- * the fixed monospace cell. */
+/* Proportional UTF-8 text at any pixel size; falls back to the monospace cell without a sans font. */
 /* Sized UI text, rows clipped to [ct,cb); ct>=cb disables the vertical clip.
- * The mono fallback (no sans face) is not clipped — it only fires when no TTF
+ * The mono fallback (no sans face) is not clipped, it only fires when no TTF
  * loaded. */
 void gfx_ui_text_px_clip(int x, int y, const char *s, unsigned fg, int px, int ct, int cb)
 {
@@ -614,10 +596,8 @@ static void menu_subs_close(struct menu *m)
     }
 }
 
-/* Route a click in m's popup at (px,py), recursing through open submenus (drawn
- * on top, so tested first). Returns 2 = a leaf item fired (sets *fm and *fi),
- * 1 = handled but nothing fired (opened/closed a submenu, or a disabled item),
- * 0 = the click missed this subtree. */
+/* Route a click in m's popup, recursing into open submenus first. Returns 2 = leaf fired
+ * (sets *fm, *fi), 1 = handled, 0 = missed. */
 static int menu_popup_hit(struct menu *m, int px, int py, int mx, int my, struct menu **fm, int *fi)
 {
   for (int i = 0; i < m->n; i++)
@@ -869,10 +849,7 @@ void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focuse
     tf->scroll = tf->caret;
   while (tf->scroll < tf->caret && tf_span(tf, tf->scroll, tf->caret) > avail - 2)
     tf->scroll++;
-  /* Reclaim blank space on the right after a deletion shortened the tail: pull
-   * the view left while the whole remaining text would still fit, so leading
-   * characters never stay hidden behind an empty gap. The caret stays visible
-   * because caret <= len. */
+  /* After a deletion, pull the view left while all the text fits. */
   while (tf->scroll > 0 && tf_span(tf, tf->scroll - 1, tf->len) <= avail - 2)
     tf->scroll--;
 

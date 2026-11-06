@@ -1,31 +1,13 @@
-/* uwin.h — the kernel windowing broker (user-window server).
- *
- * Lets a user process own a desktop window: it creates one, gets a shared
- * client-area pixel buffer mapped into its address space (at WIN_FB_VADDR),
- * draws into it, presents frames, and reads input events. The kernel records
- * the window's frame geometry and event ring (no focus or z-order — the
- * compositor owns those); the user-space compositor (/bin/compositor) draws the
- * chrome, blits the buffer, and routes input back in through the brokering
- * backends below.
- *
- * Reached from user space through the SYS_WIN_* syscalls (see syscall.c); the
- * functions here run in the calling process's context, so user pointers are
- * caller-validated and dereferenced directly.
- */
+/* uwin.h: kernel windowing broker. A user process owns a window with a shared
+ * client buffer and event ring; the compositor owns chrome, focus and z-order.
+ * Backends run in the calling process's context (SYS_WIN_*). */
 #ifndef OWOS_UWIN_H
 #define OWOS_UWIN_H
 
 #include <stdint.h>
 
-/* Base user-virtual address for a window's client buffer. A process may own
- * more than one window (an app plus its dialogs), so each of its live windows
- * gets a distinct slot: window k of an owner maps at WIN_FB_VADDR +
- * slot*WIN_MAP_SLOT_BYTES. The first window an owner creates takes slot 0 (==
- * WIN_FB_VADDR), so a plain single-window app still finds its buffer at the
- * fixed address via win_fb(). The slot region sits well above the program
- * image, stack and the 16 MiB identity map, in the process's own page tables,
- * and ends below COMPOSITOR_FB_VADDR (loader.h). WIN_MAP_SLOT_BYTES holds a
- * full-screen buffer, so a slot never overlaps. */
+/* Base user address of a window's client buffer. Each live window of an owner
+ * takes a slot at WIN_FB_VADDR + slot*WIN_MAP_SLOT_BYTES; the first is slot 0. */
 #define WIN_FB_VADDR 0xC0000000u
 #define WIN_MAX_BYTES 0x000E0000u /* fallback cap if the screen size is 0 */
 
@@ -45,10 +27,7 @@ struct win_event {
   int32_t a, b;
 };
 
-/* ---- window brokering for the user-space compositor ----
- * A root compositor enumerates live windows, maps their client buffers to blit
- * them zero-copy, positions them, and routes hit-tested input back in.
- * struct winrec must match user/lib/owos.h. */
+/* ---- window brokering for the compositor; struct winrec must match user/lib/owos.h. */
 
 /* One live window, as reported by uwin_enum. */
 struct winrec {
@@ -56,6 +35,8 @@ struct winrec {
   int x, y, w, h;       /* frame geometry on screen (top-left + full size) */
   uint32_t flags;       /* UWIN_F_* below                                 */
   uint32_t present_seq; /* bumped on each present -> the compositor's dirty tag */
+  int dirty_x, dirty_y; /* client-relative damage since the previous enum; */
+  int dirty_w, dirty_h; /* dirty_w < 0: whole frame, w == 0: none          */
   int owner_pid;        /* owning task id                                 */
   int z;                /* reserved/unused: the compositor tracks z itself */
   int buf_w, buf_h;     /* client buffer size in pixels (stride = buf_w)   */
@@ -83,28 +64,20 @@ struct winevent {
 };
 
 /* Syscall backends (all run in the caller's process context). */
-int uwin_create(int w, int h, const char *title); /* -> window id or -1     */
-int uwin_present(int id);                         /* -> 0 / -1              */
-int uwin_poll(int id, struct win_event *out);     /* 1 event / 0 none / -1  */
-int uwin_close(int id);                           /* -> 0 / -1              */
-int uwin_set_title(int id, const char *title);    /* -> 0 / -1              */
-int uwin_set_resizable(int id, int on);           /* app opts into resizing */
-int uwin_set_cursor(int id, int cursor);          /* enum wm_cursor for the
-                                                                  window's client area */
+int uwin_create(int w, int h, const char *title);     /* -> window id or -1     */
+int uwin_present(int id, int x, int y, int w, int h); /* damage rect; w/h <= 0 = all */
+int uwin_poll(int id, struct win_event *out);         /* 1 event / 0 none / -1  */
+int uwin_close(int id);                               /* -> 0 / -1              */
+int uwin_set_title(int id, const char *title);        /* -> 0 / -1              */
+int uwin_set_resizable(int id, int on);               /* app opts into resizing */
+int uwin_set_cursor(int id, int cursor);              /* enum wm_cursor for the
+                                                                      window's client area */
 
-/* Link window `id` (owned by the caller) to a transient `parent` window, also
- * owned by the caller: the compositor stacks `id` above `parent`, keeps them
- * together in z-order, and hides `id` from the taskbar/Alt+Tab (it belongs to
- * the parent app). `modal` non-zero also blocks pointer/key input to the rest
- * of the parent's window family until `id` closes. parent < 0 clears the link.
- * Rejects a parent the caller doesn't own, a self-link, or one that would form
- * a cycle. Returns 0 / -1. */
+/* Link `id` to a transient `parent` (both caller-owned); modal blocks input to
+ * the parent's family. parent < 0 clears. Rejects self-links and cycles. 0 / -1. */
 int uwin_set_parent(int id, int parent, int modal);
 
-/* User-virtual address where window `id`'s client buffer is mapped in the
- * caller's address space (its per-owner slot). 0 if the caller doesn't own
- * `id`. Lets an app find a second window's buffer (the first is always at
- * WIN_FB_VADDR). */
+/* User address of window `id`'s buffer in the caller, or 0 if not owned. */
 uint32_t uwin_fb_vaddr(int id);
 
 /* Free slots in a window's input event ring (1<<30 for a bad/unknown id). Used
@@ -124,12 +97,9 @@ int uwin_pid_has_window(uint32_t pid);
  * windows that were closed while the compositor still held them mapped. */
 void uwin_reap(void);
 
-/* Compositor liveness. uwin_compositor_register(pid) marks `pid` as the running
- * compositor on its first SYS_FB_MAP; uwin_compositor_active() is 1 while a
- * compositor owns the display. kernel_main uses it to decide whether to drain
- * the physical keyboard into the recovery console (it must not while the
- * compositor is draining input via SYS_INPUT_POLL). Cleared by
- * uwin_task_exiting when the compositor task exits. */
+/* uwin_compositor_register(pid) marks the compositor on its first SYS_FB_MAP;
+ * uwin_compositor_active() is 1 while it runs, so kernel_main leaves keyboard
+ * input to it. Cleared by uwin_task_exiting. */
 void uwin_compositor_register(uint32_t pid);
 int uwin_compositor_active(void);
 
@@ -137,16 +107,14 @@ int uwin_compositor_active(void);
  * All run in the caller's (compositor) context; the caller root-gates and
  * bounds-checks. */
 
-/* Fill up to `max` winrecs for live windows in unspecified (slot) order — the
+/* Fill up to `max` winrecs for live windows in unspecified (slot) order, the
  * compositor owns z-ordering. Returns the count written (may be < the number of
  * live windows if the table has more than `max`). */
 int uwin_enum(struct winrec *out, int max);
 
-/* Map window `id`'s client buffer into the caller at vaddr `at` (npages of it),
- * pinning the frames so a concurrent close can't free them under the compositor
- * (see uwin_reap). Fills bw/bh/stride with the buffer geometry. Returns 0, or
- * -1 (bad id / gone / map failed). Idempotent: re-mapping a pinned window just
- * refreshes the mapping. */
+/* Map window `id`'s buffer into the caller at `at` (npages), pinning the frames
+ * against a concurrent close (see uwin_reap). Fills bw/bh/stride. Idempotent.
+ * Returns 0 / -1. */
 int uwin_map(int id, uint32_t at, int *bw, int *bh, int *stride);
 
 /* Drop the compositor's pin on window `id` and unmap it from `dir` at `at`.

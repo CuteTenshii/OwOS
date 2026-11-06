@@ -1,4 +1,4 @@
-/* lib.c — OwOS user library: syscall wrappers and small helpers. */
+/* lib.c: OwOS user library: syscall wrappers and small helpers. */
 
 #include "owos.h"
 #include "syscall_nr.h"
@@ -41,7 +41,7 @@ unsigned msec(void) { return (unsigned)syscall(SYS_MSEC, 0, 0, 0); }
 
 unsigned rtc_epoch(void) { return (unsigned)syscall(SYS_RTC_EPOCH, 0, 0, 0); }
 
-/* Wall-clock milliseconds since the Unix epoch — the basis for JS Date.now().
+/* Wall-clock milliseconds since the Unix epoch, the basis for JS Date.now().
  * The RTC has 1-second resolution, so we anchor to it once and track sub-second
  * time with the monotonic ms counter (which also keeps now_ms() monotonic). */
 long long now_ms(void)
@@ -72,10 +72,8 @@ int stream_end(void) { return syscall(SYS_STREAM_END, 0, 0, 0); }
 
 int net_connect(const char *host, int port, int tls) { return syscall(SYS_NET_CONNECT, (int)host, port, tls); }
 
-/* net_send/net_recv and their addressed (sendto/recvfrom) and non-blocking
- * variants all funnel through the two unified syscalls, packing a 6-word
- * request: {fd, buf, len, flags, ip|0, port}. ip non-NULL selects the datagram
- * addressed form; flags&MSG_DONTWAIT selects a non-blocking recv. */
+/* All net send/recv variants use two syscalls with a 6-word request {fd, buf, len, flags, ip|0, port};
+ * non-NULL ip selects addressed form, MSG_DONTWAIT a non-blocking recv. */
 int net_send(int h, const void *buf, int len)
 {
   unsigned a[6] = {(unsigned)h, (unsigned)buf, (unsigned)len, 0, 0, 0};
@@ -136,6 +134,13 @@ int win_create(int w, int h, const char *title) { return syscall(SYS_WIN_CREATE,
 
 int win_present(int id) { return syscall(SYS_WIN_PRESENT, id, 0, 0); }
 
+int win_present_rect(int id, int x, int y, int w, int h)
+{
+  if (x < 0 || y < 0 || w <= 0 || h <= 0 || w > 0xFFFF || h > 0xFFFF)
+    return win_present(id);
+  return syscall(SYS_WIN_PRESENT, id, x | y << 16, w | h << 16);
+}
+
 int win_poll(int id, struct win_event *ev) { return syscall(SYS_WIN_POLL, id, (int)ev, 0); }
 
 void win_wait(int id) { syscall(SYS_WIN_POLL, id, 0, 1); /* ev=NULL, block=1: sleep ~one frame */ }
@@ -167,11 +172,7 @@ unsigned *fb_map(void)
   return v == -1 ? (unsigned *)0 : (unsigned *)v;
 }
 
-int fb_present_rect(int x, int y, int w, int h)
-{
-  int a[4] = {x, y, w, h};
-  return syscall(SYS_FB_PRESENT, (int)a, 0, 0);
-}
+int fb_present_rects(const struct fbrect *r, int n) { return syscall(SYS_FB_PRESENT, (int)r, n, 0); }
 
 int input_poll(struct inputstate *out) { return syscall(SYS_INPUT_POLL, (int)out, 0, 0); }
 
@@ -195,7 +196,7 @@ int win_key_space(int id) { return syscall(SYS_WIN_KEY_SPACE, id, 0, 0); }
 
 int crash_poll(struct crash_rec *out, int max) { return syscall(SYS_CRASH_POLL, (int)out, max, 0); }
 
-/* Packed (hour<<16)|(min<<8)|sec, UTC — decoded in user space from the epoch
+/* Packed (hour<<16)|(min<<8)|sec, UTC, decoded in user space from the epoch
  * primitive rather than a dedicated syscall. */
 unsigned now_hms(void)
 {
@@ -217,10 +218,7 @@ int statfs(const char *path, struct statfs_info *out) { return syscall(SYS_STATF
 
 int spawn(const char *path, const char *arg) { return syscall(SYS_SPAWN, (int)path, (int)arg, 0); }
 
-/* Spawn a /bin child capturing its stdout into a pipe, passing a full argv
- * vector (argv[0] is conventionally the program name; the kernel uses `path`
- * for the image and argv[1..] as arguments). On success returns the pid and
- * stores the read-end fd in *rfd; drain it with read_nb until EOF. */
+/* spawn_cap with a full argv; the kernel uses `path` for the image. */
 int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
 {
   struct {
@@ -236,10 +234,7 @@ int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
   return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
 }
 
-/* Like spawn_cap, but also wires the child's stdin (fd 0) to a pipe whose write
- * end is stored in *wfd. Feed the child keystrokes by write()'ing into *wfd;
- * the child reads them with read()/read_nb on fd 0. For interactive children
- * (ssh) whose input the terminal forwards from its own keystrokes. */
+/* Like spawn_cap, plus a stdin pipe whose write end is stored in *wfd. */
 int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *wfd)
 {
   struct {
@@ -256,11 +251,8 @@ int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *
   return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
 }
 
-/* Like spawn_cap_io, but also sets the child's uid/gid and cwd. uid/gid < 0 or
- * cwd == 0 mean "inherit" (as spawn_cap_io). Changing uid/gid to something
- * other than the caller's own is root-only (the kernel rejects it otherwise):
- * the privileged spawn-as-user primitive /bin/sshd uses to drop to the
- * logged-in user for a session. */
+/* Like spawn_cap_io, plus uid/gid and cwd (uid/gid < 0 or cwd == 0 inherit).
+ * Changing to another uid/gid is root-only. */
 int spawn_cap_io_as(const char *path, char *const argv[], int argc, int uid, int gid, const char *cwd, int *rfd,
                     int *wfd)
 {
@@ -290,10 +282,7 @@ int power(int action) { return syscall(SYS_POWER, action, 0, 0); }
 
 int getpid(void) { return syscall(SYS_GETPID, 0, 0, 0); }
 
-/* Signals. sigaction installs a disposition (SIG_DFL/SIG_IGN or a handler);
- * signal is the simple form. sigprocmask changes the blocked set (set==NULL
- * just queries, reporting the current mask via *old). raise sends a signal to
- * ourselves. */
+/* sigprocmask with set==NULL only queries the mask via *old. */
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old)
 {
   return syscall(SYS_SIGACTION, sig, (int)act, (int)old);
@@ -336,10 +325,7 @@ void msleep(unsigned ms) { syscall(SYS_SLEEP, (int)ms, 0, 0); }
 
 int thread_create(void (*fn)(void), void *stack_top) { return syscall(SYS_THREAD, (int)fn, (int)stack_top, 0); }
 
-/* Guarded thread stack: the kernel maps `bytes` (rounded to pages) with an
- * unmapped guard page below, so an overflow faults cleanly instead of
- * scribbling the heap. Returns the stack top for thread_create(), or 0 (caller
- * falls back to a malloc'd stack). thread_stack_free releases it. */
+/* Stack with an unmapped guard page below, so overflow faults. Returns the top, or 0 (caller falls back to malloc). */
 void *thread_stack_alloc(int bytes)
 {
   int pages = (bytes + 4095) / 4096;
@@ -429,7 +415,7 @@ int gethostname(char *buf, int max)
 int sethostname(const char *name) { return writefile("/etc/hostname", name, (int)strlen(name)) < 0 ? -1 : 0; }
 
 /* POSIX uname(2). The kernel fills sysname/release/version/machine (machine is
- * its compile-time arch — the one fact a 32-bit user program can't know); we
+ * its compile-time arch, the one fact a 32-bit user program can't know); we
  * add nodename from the hostname, keeping /etc/hostname the single source. */
 int uname(struct utsname *out)
 {
@@ -441,20 +427,14 @@ int uname(struct utsname *out)
 
 /* ----------------------------------------------------------- IPC: local ports
  */
-/* A named local port (the unix-socket analog). A server opens its name with
- * as_server=1 then port_accept()s connections; a client opens the same name
- * with as_server=0 to connect. Both get a bidirectional fd that read()/write()
- * and close() drive like any other. */
+/* Named local port: as_server=1 listens (then port_accept), 0 connects. */
 int port_open(const char *name, int as_server) { return syscall(SYS_PORT_OPEN, (int)name, as_server, 0); }
 
 int port_accept(int listen_fd) { return syscall(SYS_PORT_ACCEPT, listen_fd, 0, 0); }
 
 /* ----------------------------------------------------------- malloc / free */
-/* A K&R-style first-fit allocator (The C Programming Language §8.7) over the
- * SYS_SBRK heap, with a small lock so the threads of one process (e.g. the
- * browser's UI + fetch worker) can allocate concurrently — they share the one
- * heap because they share the address space. Blocks carry an 8-byte header; the
- * free list is kept address-ordered so free() coalesces neighbours. */
+/* K&R first-fit allocator (§8.7) over SYS_SBRK, locked for threads. 8-byte block header;
+ * the free list is address-ordered so free() coalesces. */
 
 void *sbrk(int inc) { return (void *)syscall(SYS_SBRK, inc, 0, 0); }
 
@@ -471,22 +451,13 @@ typedef union header Header;
 static Header base;   /* degenerate block: starts the list */
 static Header *freep; /* roving free-list pointer          */
 
-/* Size-segregated free bins for small blocks. The K&R free list below is kept
- * address-ordered so it can coalesce, which makes free() O(free-list length) —
- * a killer under high churn (a GC sweep freeing tens of thousands of objects
- * becomes O(n^2), which froze the browser on DOM-heavy pages). So small blocks
- * (<= SBIN_MAX header units) are recycled through per-exact-size LIFO bins
- * instead: free() pushes (O(1), no walk, no coalesce) and malloc() pops an
- * exact-size match (O(1)). Blocks bigger than the cap, and fresh heap from
- * morecore, still use the coalescing list, so the address space can't fragment
- * into permanently-stranded large holes. Same- size churn (the common case: JS
- * objects, strings, pmap entries) reuses bins perfectly, so memory stays
- * bounded by the per-size peak. */
+/* Exact-size LIFO bins for small blocks (<= SBIN_MAX units): O(1) free/malloc. The
+ * address-ordered coalescing list made free() O(n), which froze the browser on DOM-heavy pages. */
 #define SBIN_MAX 1024u
 static Header *sbins[SBIN_MAX + 1];
 
 /* Spinlock guarding the free list. xchg is atomic; on contention we yield to
- * the lock holder (single CPU — the timer also preempts a spinner as a
+ * the lock holder (single CPU, the timer also preempts a spinner as a
  * backstop). */
 static volatile int heap_lock;
 static inline int xchg32(volatile int *p, int v)
@@ -640,7 +611,7 @@ void *realloc(void *ptr, unsigned size)
   return np;
 }
 
-/* mem* — shared by every program (gcc lowers struct copies / array inits to
+/* mem*: shared by every program (gcc lowers struct copies / array inits to
  * these at -O0) and by libs like minimp3 and the HTTP/2 HPACK tables. */
 void *memcpy(void *d, const void *s, __SIZE_TYPE__ n)
 {
@@ -735,12 +706,8 @@ void strcat(char *d, const char *s)
 }
 
 /* ------------------------------------------------------------ UTF-8 codec ---
- * System-wide so any program handles non-Latin / multibyte text uniformly: the
- * browser renders it, an editor counts/moves by codepoint, the shell echoes it.
- * Encoding is the canonical 1..4-byte form; decoding is tolerant (bad/truncated
- * sequences yield U+FFFD and advance one byte, so a malformed stream never
- * stalls). Codepoints above U+10FFFF or in the surrogate range are not special-
- * cased on encode — callers pass real scalar values. */
+ * Decoding is tolerant: bad/truncated sequences yield U+FFFD and advance one
+ * byte. Encode does not special-case surrogates or > U+10FFFF. */
 
 int utf8_seqlen(unsigned char lead)
 {
@@ -823,7 +790,7 @@ void print_uint(unsigned v)
 
 /* ----------------------------------------------------------- printf family */
 
-/* A minimal freestanding printf, shared by snprintf and printf — it writes one
+/* A minimal freestanding printf, shared by snprintf and printf, it writes one
  * byte at a time through `sink` so callers needn't size a buffer. Mirrors the
  * kernel's kvformat (kstring.c); see owos.h for the supported conversions. */
 static void emit_uint(void (*sink)(char, void *), void *ctx, unsigned v, unsigned base, int upper, int width, int zero,
@@ -905,7 +872,7 @@ static void vfmt(void (*sink)(char, void *), void *ctx, const char *fmt, va_list
       sink('%', ctx);
       break;
     case '\0':
-      return; /* trailing '%' — stop */
+      return; /* trailing '%', stop */
     default:
       sink('%', ctx);
       sink(*fmt, ctx);
@@ -1009,12 +976,8 @@ int readline(char *buf, int max)
 }
 
 /* ------------------------------------------------------- randomness ------- *
- * rng_bytes — the userspace CSPRNG. The real source is the CPU's on-die RNG
- * (RDRAND, the Intel DRNG), a ring-3 instruction we run directly: no kernel
- * trap, since the kernel guards no entropy a userspace RDRAND can't reach. Only
- * a CPU without RDRAND falls back to a clock/TSC-seeded SplitMix64 stream
- * (best-effort, NOT cryptographic). One source for crypto.getRandomValues,
- * QUIC/TLS, torrent IDs. */
+ * rng_bytes: RDRAND run directly in ring 3; without it, falls back to a
+ * clock/TSC-seeded SplitMix64 (NOT cryptographic). */
 static int rng_have_rdrand(void)
 {
   static int cached = -1;
@@ -1067,7 +1030,7 @@ void rng_bytes(void *out, int n)
       return;
   }
   /* No RDRAND, or it stalled mid-buffer: fill the rest from the kernel entropy
-   * pool. This is the CSPRNG path on hardware without RDRAND — the clock-seeded
+   * pool. This is the CSPRNG path on hardware without RDRAND, the clock-seeded
    * SplitMix below is not cryptographic and must never carry key material. */
   while (i < n) {
     int k = n - i < 256 ? n - i : 256;

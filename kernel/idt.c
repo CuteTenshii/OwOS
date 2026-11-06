@@ -1,4 +1,4 @@
-/* idt.c — build and install the IDT, and dispatch CPU exceptions. */
+/* idt.c: build and install the IDT, and dispatch CPU exceptions. */
 
 #include "idt.h"
 #include "console.h"
@@ -113,7 +113,7 @@ void idt_set_gate(uint8_t num, uintptr_t base, uint16_t sel, uint8_t flags)
 #endif
 }
 
-/* Tiny string builders for the panic screen — no libc, no heap (the heap may be
+/* Tiny string builders for the panic screen, no libc, no heap (the heap may be
  * the very thing that's corrupt). Each returns the new end-of-string pointer.
  */
 static char *p_str(char *p, const char *s)
@@ -132,10 +132,8 @@ static char *p_hex(char *p, uint32_t v)
   return p;
 }
 
-/* Is `a` a present page in the current address space? Unlike paging_user_mapped
- * this does NOT require the USER bit — the panic stack is a supervisor kernel
- * stack — so the panic handler can probe a word before dereferencing it and not
- * double-fault on a corrupt ESP. Walks the live page tables via CR3. */
+/* Is `a` a present page? Unlike paging_user_mapped, no USER bit is required, so the
+ * panic handler can probe a supervisor stack word without double-faulting. */
 #ifdef __x86_64__
 static int addr_present(uint64_t a)
 {
@@ -164,12 +162,8 @@ static int addr_present(uint32_t a)
 }
 #endif
 
-/* Render a full-screen crash report to the framebuffer. Under UEFI there is no
- * VGA text console, so without this a fault is an information-free frozen
- * screen (it just looks like a hang). Draws straight to the framebuffer with
- * the console font; safe to call from the fault handler since it touches no
- * heap and no locks. No-op if no graphics mode is up (the VGA path still
- * printed). */
+/* Full-screen crash report on the framebuffer (UEFI has no VGA text, so a fault would look like a hang).
+ * Touches no heap or locks; no-op without a graphics mode. */
 static void panic_screen(struct registers *r)
 {
   if (!fb_active())
@@ -180,7 +174,6 @@ static void panic_screen(struct registers *r)
   uint32_t fg = fb_rgb(0xe6, 0xe6, 0xe6);
   uint32_t hi = fb_rgb(0xff, 0xd0, 0x40); /* yellow for the heading        */
 
-  fb_clip_full();
   fb_fill_rect(0, 0, W, H, bg);
 
   int x = 24, y = 24, lh = 18;
@@ -279,10 +272,7 @@ static void panic_screen(struct registers *r)
   fb_text(x, y, line, fg, bg);
   y += lh;
 
-  /* Dump a few words around ESP: the smashed thread frame, to see the full
-   * corruption pattern (e.g. back-buffer pointers + small ints). Probe each
-   * word first — a fault that corrupted ESP would otherwise double-fault here.
-   * TEMP. */
+  /* Dump words around ESP, probing each first (a corrupt ESP would double-fault). TEMP. */
   p = line;
   p = p_str(p, "stk:");
   for (int i = -2; i <= 5; i++) {
@@ -335,12 +325,8 @@ void isr_handler(struct registers *r)
     return;
   }
 
-  /* A fault that came from ring 3 (CS RPL = 3) is a user-program bug, not a
-   * kernel one. If the task installed a handler for the matching signal,
-   * deliver it so the program can recover (e.g. a browser turning a JS-runtime
-   * OOM into a "tab crashed" page instead of losing the whole app); otherwise
-   * record it for a crash window and terminate just that process instead of
-   * panicking the system. */
+  /* Ring-3 fault (CS RPL = 3): deliver the matching signal if handled, else record a
+   * crash window and kill just that process. */
   if (r->int_no < 32 && (r->cs & 3) == 3) {
     if (sched_fault_signal(r, fault_signal(r->int_no))) {
       sched_kernel_leave();
@@ -380,5 +366,5 @@ void idt_init(void)
   __asm__ volatile("lidt %0" : : "m"(idt_ptr));
 }
 
-/* Load the (already-built, shared) IDT on the calling CPU — for an AP. */
+/* Load the (already-built, shared) IDT on the calling CPU, for an AP. */
 void idt_load(void) { __asm__ volatile("lidt %0" : : "m"(idt_ptr)); }
