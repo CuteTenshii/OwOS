@@ -1689,8 +1689,8 @@ static int encodeStereo(alac_encoder *e, BitBuffer *bitstream, void *inputBuffer
   int32_t mixBits, mixRes, maxRes, bestRes;
   uint8_t bytesShifted, partialFrame;
   int doEscape, status = ALAC_OK;
-  int16_t(*coefsU)[kALACMaxCoefs] = e->coefsU[channelIndex];
-  int16_t(*coefsV)[kALACMaxCoefs] = e->coefsV[channelIndex];
+  int16_t (*coefsU)[kALACMaxCoefs] = e->coefsU[channelIndex];
+  int16_t (*coefsV)[kALACMaxCoefs] = e->coefsV[channelIndex];
 
   if (e->bitDepth == 32)
     bytesShifted = 2;
@@ -1851,7 +1851,7 @@ static int encodeMono(alac_encoder *e, BitBuffer *bitstream, void *inputBuffer, 
   int16_t *in16;
   int32_t *in32;
   int doEscape, status;
-  int16_t(*coefsU)[kALACMaxCoefs] = e->coefsU[channelIndex];
+  int16_t (*coefsU)[kALACMaxCoefs] = e->coefsU[channelIndex];
 
   status = ALAC_OK;
   if (e->bitDepth == 32)

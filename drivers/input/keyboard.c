@@ -160,7 +160,7 @@ static bool super_held;    /* GUI/Win key held; folds into KMOD_SUPER on any cho
 static bool super_chorded; /* a Super+key fired during this Super hold */
 static bool expecting_extended;
 static bool num_lock = true; /* on by default, like most BIOSes        */
-static bool caps_lock;    /* off by default                         */
+static bool caps_lock;       /* off by default                         */
 
 /* Set the keyboard LEDs (bit2 = Caps Lock, bit1 = Num Lock). The two ACK bytes
  * (0xFA) the keyboard sends back have bit 7 set, so the IRQ handler harmlessly
@@ -276,7 +276,7 @@ static void process_extended(uint8_t sc)
     ctrl_held = false;
     return;
   }
-  if (sc == 0x37) {      /* Print Screen make (E0 2A E0 37)        */
+  if (sc == 0x37) {         /* Print Screen make (E0 2A E0 37)        */
     scrshot_pending = true; /* compositor drains it via SYS_INPUT_POLL */
     return;
   }
@@ -422,7 +422,7 @@ static bool process_media_fkey(uint8_t sc)
   case SC_F6:
     fb_brightness_step(+1);
     return true; /* brightness up            */
-  case SC_F8: /* volume down              */
+  case SC_F8:    /* volume down              */
     if (hda_present())
       hda_volume_step(-1);
     else

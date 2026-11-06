@@ -196,8 +196,8 @@ static void dma_setup_autoinit(uint32_t phys, uint32_t count)
  * itself to those, filling the half the card has just left — so it
  * self-throttles to the output rate without buffering the whole file. One
  * stream at a time. */
-static bool s_active;   /* a stream is open                                  */
-static bool s_started;  /* both halves primed, DMA running                   */
+static bool s_active;  /* a stream is open                                  */
+static bool s_started; /* both halves primed, DMA running                   */
 static int s_half;     /* half currently being filled by the producer (0/1) */
 static uint32_t s_pos; /* fill cursor within that half (mono bytes)         */
 

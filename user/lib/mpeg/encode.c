@@ -150,7 +150,7 @@ static void put_intra_block(struct mpeg_encoder *e, const int levels[64], int co
   int cc = (comp < 4) ? 0 : (comp - 3);
   int dc = levels[0], diff = dc - e->dc_pred[cc], size = 0, i, run;
   unsigned mag = diff < 0 ? -diff : diff;
-  const unsigned short(*dctab)[2] = comp < 4 ? mpeg_dc_lum : mpeg_dc_chroma;
+  const unsigned short (*dctab)[2] = comp < 4 ? mpeg_dc_lum : mpeg_dc_chroma;
   e->dc_pred[cc] = dc;
   while ((1u << size) <= mag)
     size++; /* bits to hold |diff|      */

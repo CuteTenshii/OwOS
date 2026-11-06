@@ -99,8 +99,8 @@ static uint8_t codec;                       /* codec address on the link        
 static uint16_t dac_nid, pin_nid, path_mix; /* path_mix 0 = direct pin->DAC */
 static int mix_in_idx;                      /* mixer/selector input index -> DAC      */
 static int pin_sel_idx;                     /* pin input index -> mixer/DAC           */
-static bool mix_is_sel;                      /* path_mix is a selector (not a mixer)   */
-static bool pin_is_hp;                       /* output pin is a headphone jack         */
+static bool mix_is_sel;                     /* path_mix is a selector (not a mixer)   */
+static bool pin_is_hp;                      /* output pin is a headphone jack         */
 static uint32_t sd_off;                     /* output stream descriptor offset        */
 
 /* Master volume: applied to one output-amp widget in the path (pin preferred,
@@ -681,7 +681,7 @@ static void configure_path(void)
     if (i == cur_out)
       continue;
     codec_cmd(outs[i].pin, V_SET_PINCTL | 0x00); /* output disable */
-    set_out_amp(outs[i].pin, 0, true);              /* mute its amp   */
+    set_out_amp(outs[i].pin, 0, true);           /* mute its amp   */
   }
 
   /* Active pin: power up, enable output (+ HP amp for a headphone), EAPD, amp.
@@ -712,8 +712,8 @@ static void configure_path(void)
  * the 48 kHz output rate without an IRQ. */
 #define STREAM_GUARD 256u /* bytes kept clear ahead of the play head  */
 
-static bool s_active;    /* a stream is open                         */
-static bool s_started;   /* RUN asserted (buffer pre-rolled)         */
+static bool s_active;   /* a stream is open                         */
+static bool s_started;  /* RUN asserted (buffer pre-rolled)         */
 static uint32_t s_wpos; /* next write offset into audio[] (bytes)   */
 
 /* Reset + program the output stream descriptor for the cyclic 2-half buffer. */

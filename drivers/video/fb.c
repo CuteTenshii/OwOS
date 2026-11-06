@@ -218,8 +218,8 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
   fb_h = h;
   fb_pitch = pitch_px;
   fb_pixels = pixels;
-  fb_cap = pixels; /* a bootloader framebuffer is fixed-size        */
-  can_mode = false;    /* cannot reprogram a GOP/adopted framebuffer    */
+  fb_cap = pixels;  /* a bootloader framebuffer is fixed-size        */
+  can_mode = false; /* cannot reprogram a GOP/adopted framebuffer    */
 
   enable_wc();        /* write-combining on the framebuffer          */
   alloc_backbuffer(); /* off-screen buffer in cached RAM              */

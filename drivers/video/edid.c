@@ -62,7 +62,7 @@ static bool probed; /* one-shot guard                         */
 static int cached_hz, cached_w, cached_h;
 static char cached_mfg[4];   /* 3-letter PNP manufacturer id           */
 static char cached_name[16]; /* monitor-name descriptor (0xFC), if any */
-static bool cached_internal;  /* PNP id is a known laptop-panel vendor  */
+static bool cached_internal; /* PNP id is a known laptop-panel vendor  */
 static char err[48];
 
 static void seterr(const char *s)

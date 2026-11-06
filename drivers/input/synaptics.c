@@ -94,7 +94,7 @@ static int scroll_accum;     /* leftover two-finger travel below one notch     *
 /* Tap / gesture state for the in-progress touch. */
 static uint32_t touch_start;  /* tick the touch began */
 static int touch_x, touch_y;  /* where it began (for the move-budget test) */
-static bool touch_moved;       /* set once travel exceeds TAP_MOVE_MAX           */
+static bool touch_moved;      /* set once travel exceeds TAP_MOVE_MAX           */
 static int touch_max_fingers; /* most fingers seen during this touch */
 
 /* The synthetic tap pulse, evaluated lazily by synaptics_buttons(). */

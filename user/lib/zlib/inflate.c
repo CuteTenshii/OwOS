@@ -172,7 +172,7 @@ static int block_stored(struct state *s)
   if (l0 < 0 || l1 < 0 || n0 < 0 || n1 < 0)
     return -1;
   uint32_t len = (uint32_t)l0 | ((uint32_t)l1 << 8);
-  if ((uint16_t) ~(l0 | (l1 << 8)) != (uint16_t)(n0 | (n1 << 8)))
+  if ((uint16_t)~(l0 | (l1 << 8)) != (uint16_t)(n0 | (n1 << 8)))
     return -1; /* LEN / ~LEN mismatch             */
   for (uint32_t i = 0; i < len; i++) {
     int c = s->rd(s->rctx);
