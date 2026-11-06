@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Media Player
+GenericName=Media Player
+Comment=Play audio and video files
+Exec=player %f
+Icon=multimedia-player
+Terminal=false
+Categories=AudioVideo;Player;
+X-OwOS-Order=50
+MimeType=audio/x-wav;audio/wav;video/mp4;video/quicktime;

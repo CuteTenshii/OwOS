@@ -279,24 +279,77 @@ static unsigned frame_clock;
 static int tb_band_left(void) { return START_W + 6; }
 
 /* Start menu apps */
+enum {
+  APP_TERM,
+  APP_FILES,
+  APP_EDITOR,
+  APP_BROWSER,
+  APP_PLAYER,
+  APP_CLOCK,
+  APP_CALC,
+  APP_NOTIFYD,
+  APP_SETTINGS,
+  APP_ABOUT
+};
 static const struct {
   const char *name;
   const char *bin;
 } app_menu[] = {
-    {"Terminal", "term"},       {"Files", "files"}, {"Editor", "editor"},   {"Browser", "browser"},
-    {"Media Player", "player"}, {"Clock", "clock"}, {"Calculator", "calc"}, {"Notifications", "notifyd"},
-    {"Settings", "settings"},   {"About", "about"},
+    [APP_TERM] = {"Terminal", "term"},         [APP_FILES] = {"Files", "files"},
+    [APP_EDITOR] = {"Editor", "editor"},       [APP_BROWSER] = {"Browser", "browser"},
+    [APP_PLAYER] = {"Media Player", "player"}, [APP_CLOCK] = {"Clock", "clock"},
+    [APP_CALC] = {"Calculator", "calc"},       [APP_NOTIFYD] = {"Notifications", "notifyd"},
+    [APP_SETTINGS] = {"Settings", "settings"}, [APP_ABOUT] = {"About", "about"},
 };
+static int app_pid[sizeof app_menu / sizeof app_menu[0]];
 static int apps_menu_count(void) { return (int)(sizeof app_menu / sizeof app_menu[0]); }
 
 /* Power actions */
-enum { PA_RESTART, PA_SHUTDOWN };
-static int sm_power_n(void) { return 2; }
-static const char *sm_power_label(int row) { return row == 0 ? "Restart" : "Shut Down"; }
+enum { PA_SLEEP, PA_RESTART, PA_SHUTDOWN };
+static const char *const power_label[] = {"Sleep", "Restart", "Shut Down"};
+static bool can_sleep, resumed;
+
+static void power_run(int action)
+{
+  if (action == PA_SLEEP) {
+    power(2);
+    resumed = true; /* main loop resyncs input and pacing */
+  } else {
+    power(action == PA_RESTART ? 1 : 0);
+  }
+}
+
+static int sm_power_n(void) { return can_sleep ? 3 : 2; }
+static int sm_power_action(int row) { return can_sleep ? row : row + 1; }
 
 static int sm_apps_h(void) { return apps_menu_count() * SM_ITEM_H; }
 static int sm_h(void) { return sm_apps_h() + SM_SEP_H + sm_power_n() * SM_ITEM_H; }
 static int sm_top(void) { return screen_h - WM_BAR_H - sm_h(); }
+
+/* Power overlay: Sleep, Restart, Shut Down, Cancel */
+#define PW_W 240
+#define PW_TITLE_H 40
+#define PW_ROW_H 32
+#define PW_PAD 8
+#define PW_ROWS 4
+#define PW_CANCEL 3
+static bool pw_open;
+static int pw_sel;
+static int pw_x(void) { return (screen_w - PW_W) / 2; }
+static int pw_h(void) { return PW_TITLE_H + PW_ROWS * PW_ROW_H + PW_PAD; }
+static int pw_y(void) { return (screen_h - pw_h()) / 2; }
+static bool pw_enabled(int row) { return row != PA_SLEEP || can_sleep; }
+static bool pw_inside(int mx, int my)
+{
+  return mx >= pw_x() && mx < pw_x() + PW_W && my >= pw_y() && my < pw_y() + pw_h();
+}
+static int pw_row_at(int mx, int my)
+{
+  int rel = my - pw_y() - PW_TITLE_H;
+  if (mx < pw_x() + PW_PAD || mx >= pw_x() + PW_W - PW_PAD || rel < 0 || rel >= PW_ROWS * PW_ROW_H)
+    return -1;
+  return rel / PW_ROW_H;
+}
 
 static bool force_full;
 
@@ -335,7 +388,9 @@ static void launch_app(int i)
   for (int k = 0; app_menu[i].bin[k] && j < (int)sizeof path - 1; k++)
     path[j++] = app_menu[i].bin[k];
   path[j] = '\0';
-  kid_track(spawn(path, 0));
+  int pid = spawn(path, 0);
+  app_pid[i] = pid;
+  kid_track(pid);
 }
 
 /* cursors */
@@ -939,7 +994,7 @@ static void draw_start_menu(void)
   int py = top + sm_apps_h() + SM_SEP_H;
   for (int i = 0; i < sm_power_n(); i++) {
     int iy = py + i * SM_ITEM_H;
-    gfx_ui_text(10, iy + (SM_ITEM_H - UIFONT_H) / 2, sm_power_label(i), 0xa8b4c4);
+    gfx_ui_text(10, iy + (SM_ITEM_H - UIFONT_H) / 2, power_label[sm_power_action(i)], 0xa8b4c4);
   }
   gfx_rect(0, top, SM_W, sm_h(), 0x05070a);
 }
@@ -1135,6 +1190,10 @@ static int edge_cursor(int e)
 }
 static int pick_cursor(int mx, int my)
 {
+  if (pw_open) {
+    int row = pw_row_at(mx, my);
+    return row >= 0 && pw_enabled(row) ? CUR_HAND : CUR_ARROW;
+  }
   if (hover_resizing)
     return edge_cursor(rsz_edge_hint ? rsz_edge_hint : (RZ_R | RZ_B));
 
@@ -1180,6 +1239,186 @@ static bool occluded(int i)
   return false;
 }
 
+/* volume / brightness on-screen display */
+#define OSD_W 220
+#define OSD_H 44
+#define OSD_MS 1500
+#define OSD_BG 0x141a24
+#define OSD_FG 0xe6ebf2
+#define OSD_DIM 0x3a4458
+#define OSD_ACCENT 0x5aa0ff
+enum { OSD_NONE, OSD_VOLUME, OSD_BRIGHTNESS };
+static int osd_kind, osd_level = -1; /* level 0..100, -1 = unreadable */
+static bool osd_muted, osd_dirty;
+static unsigned osd_until;
+
+static int osd_x(void) { return (screen_w - OSD_W) / 2; }
+static int osd_y(void) { return screen_h - WM_BAR_H - OSD_H - 24; }
+
+static int sysfs_int(const char *path)
+{
+  char b[16];
+  int n = readfile(path, b, sizeof b - 1);
+  if (n <= 0)
+    return -1;
+  int v = 0, digits = 0;
+  for (int i = 0; i < n && b[i] >= '0' && b[i] <= '9'; i++, digits++)
+    v = v * 10 + (b[i] - '0');
+  return digits ? v : -1;
+}
+
+static void osd_show(int kind)
+{
+  if (kind == OSD_VOLUME) {
+    osd_level = sysfs_int("/sys/class/sound/card0/volume");
+    osd_muted = sysfs_int("/sys/class/sound/card0/muted") > 0;
+  } else {
+    osd_level = sysfs_int("/sys/class/graphics/fb0/brightness");
+    osd_muted = false;
+  }
+  if (osd_level > 100)
+    osd_level = 100;
+  osd_kind = kind;
+  osd_until = msec() + OSD_MS;
+  osd_dirty = true;
+}
+
+/* True when the overlay appeared, changed or expired since the last call */
+static bool osd_tick(void)
+{
+  if (osd_kind != OSD_NONE && (int)(msec() - osd_until) >= 0) {
+    osd_kind = OSD_NONE;
+    osd_dirty = true;
+  }
+  bool d = osd_dirty;
+  osd_dirty = false;
+  return d;
+}
+
+static void fill_round(int x, int y, int w, int h, int r, unsigned c)
+{
+  for (int row = 0; row < h; row++) {
+    int dy = row < r ? r - row : (row >= h - r ? row - (h - r) + 1 : 0);
+    int inset = 0;
+    if (dy)
+      while ((r - inset) * (r - inset) + dy * dy > r * r + r)
+        inset++;
+    gfx_fill_rect(x + inset, y + row, w - 2 * inset, 1, c);
+  }
+}
+
+static void osd_speaker(int x, int y, unsigned c)
+{
+  gfx_fill_rect(x, y + 6, 5, 8, c);
+  for (int i = 0; i < 6; i++)
+    gfx_fill_rect(x + 5 + i, y + 6 - i, 1, 8 + 2 * i, c);
+}
+
+static void osd_sun(int cx, int cy, unsigned c)
+{
+  static const signed char dir[8][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {-1, -1}, {1, -1}, {-1, 1}};
+  for (int dy = -4; dy <= 4; dy++)
+    for (int dx = -4; dx <= 4; dx++)
+      if (dx * dx + dy * dy <= 17)
+        gfx_pixel(cx + dx, cy + dy, c);
+  for (int i = 0; i < 8; i++)
+    for (int k = 7; k <= 9; k++) {
+      int m = i < 4 ? k : k * 5 / 7;
+      gfx_pixel(cx + dir[i][0] * m, cy + dir[i][1] * m, c);
+    }
+}
+
+static void draw_osd(void)
+{
+  int x = osd_x(), y = osd_y();
+  fill_round(x, y, OSD_W, OSD_H, 10, OSD_BG);
+  int ix = x + 14, iy = y + (OSD_H - 20) / 2, cy = y + OSD_H / 2;
+  bool off = osd_kind == OSD_VOLUME && (osd_muted || osd_level == 0);
+  if (osd_kind == OSD_VOLUME) {
+    osd_speaker(ix, iy, OSD_FG);
+    if (off) {
+      for (int i = 0; i < 8; i++) {
+        gfx_pixel(ix + 14 + i, cy - 4 + i, 0xff6060);
+        gfx_pixel(ix + 14 + i, cy + 3 - i, 0xff6060);
+      }
+    }
+  } else {
+    osd_sun(ix + 8, cy, OSD_FG);
+  }
+  if (osd_level < 0)
+    return;
+  int bx = x + 54, bw = OSD_W - 54 - 52, by = cy - 3;
+  fill_round(bx, by, bw, 6, 3, OSD_DIM);
+  int fw = osd_muted ? 0 : bw * osd_level / 100;
+  if (fw >= 6)
+    fill_round(bx, by, fw, 6, 3, OSD_ACCENT);
+  else if (fw > 0)
+    gfx_fill_rect(bx, by + 1, fw, 4, OSD_ACCENT);
+  char t[5];
+  int n = 0;
+  if (osd_muted) {
+    gfx_ui_text(x + OSD_W - 46, cy - UIFONT_H / 2, "Mute", 0xff8080);
+    return;
+  }
+  if (osd_level >= 100)
+    t[n++] = '1';
+  if (osd_level >= 10)
+    t[n++] = (char)('0' + osd_level / 10 % 10);
+  t[n++] = (char)('0' + osd_level % 10);
+  t[n++] = '%';
+  t[n] = '\0';
+  gfx_ui_text(x + OSD_W - 14 - gfx_ui_width(t), cy - UIFONT_H / 2, t, OSD_FG);
+}
+
+#define PW_BG 0x141a24
+#define PW_FG 0xe6ebf2
+#define PW_OFF 0x5a6578
+#define PW_SEL 0x2f6fb0
+
+static void draw_power(void)
+{
+  int x = pw_x(), y = pw_y();
+  fill_round(x, y, PW_W, pw_h(), 10, PW_BG);
+  gfx_ui_text(x + PW_PAD + 6, y + (PW_TITLE_H - UIFONT_H) / 2, "Power", PW_FG);
+  for (int i = 0; i < PW_ROWS; i++) {
+    int ry = y + PW_TITLE_H + i * PW_ROW_H;
+    if (i == pw_sel)
+      fill_round(x + PW_PAD, ry, PW_W - 2 * PW_PAD, PW_ROW_H - 2, 6, PW_SEL);
+    const char *label = i == PW_CANCEL ? "Cancel" : power_label[i];
+    gfx_ui_text(x + PW_PAD + 12, ry + (PW_ROW_H - 2 - UIFONT_H) / 2, label, pw_enabled(i) ? PW_FG : PW_OFF);
+  }
+}
+
+static void pw_show(void)
+{
+  pw_open = true;
+  pw_sel = can_sleep ? PA_SLEEP : PA_RESTART;
+  start_open = false;
+  tb_menu_open = false;
+  at_active = false;
+}
+
+static void pw_activate(int row)
+{
+  pw_open = false;
+  if (row != PW_CANCEL)
+    power_run(row);
+}
+
+static void pw_key(int c)
+{
+  if (c == 27 || c == KEY_POWER) {
+    pw_open = false;
+  } else if (c == '\n' || c == '\r') {
+    pw_activate(pw_sel);
+  } else if (c == KEY_UP || c == KEY_DOWN) {
+    int step = c == KEY_UP ? PW_ROWS - 1 : 1;
+    do
+      pw_sel = (pw_sel + step) % PW_ROWS;
+    while (!pw_enabled(pw_sel));
+  }
+}
+
 static void compose(int mx, int my)
 {
   draw_background();
@@ -1198,6 +1437,10 @@ static void compose(int mx, int my)
       draw_crashwin(&crashwins[i]);
   if (at_active)
     draw_switcher();
+  if (pw_open && clip_hits(pw_x(), pw_y(), PW_W, pw_h()))
+    draw_power();
+  if (osd_kind != OSD_NONE && clip_hits(osd_x(), osd_y(), OSD_W, OSD_H))
+    draw_osd();
   draw_cursor(pick_cursor(mx, my), mx, my);
 }
 
@@ -1263,13 +1506,33 @@ static void toggle_maximize(int slot)
   }
 }
 
+static bool prev_down, prev_rdown;
+static int prev_wheel;
+
 static void handle_input(int mx, int my, int buttons, int dz)
 {
-  static bool prev_down, prev_rdown;
   static int dbl_id = -1, dbl_x, dbl_y; /* last title-bar press, for double-click */
   static unsigned dbl_ms;
   bool down = buttons & 1;
   bool rdown = buttons & 2;
+
+  if (pw_open) {
+    static int last_mx, last_my;
+    int row = pw_row_at(mx, my);
+    if (down && !prev_down) {
+      if (row >= 0 && pw_enabled(row))
+        pw_activate(row);
+      else if (!pw_inside(mx, my))
+        pw_open = false;
+    } else if ((mx != last_mx || my != last_my) && row >= 0 && pw_enabled(row)) {
+      pw_sel = row;
+    }
+    last_mx = mx;
+    last_my = my;
+    prev_down = down;
+    prev_rdown = rdown;
+    return;
+  }
 
   /* Wheel -> focused window under cursor (dropped if a modal blocks it) */
   if (dz) {
@@ -1374,10 +1637,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
           int prel = rel - sm_apps_h() - SM_SEP_H;
           if (prel >= 0 && prel / SM_ITEM_H < sm_power_n()) {
             start_open = false;
-            if (sm_power_label(prel / SM_ITEM_H)[0] == 'R')
-              power(1); /* Restart */
-            else
-              power(0); /* Shut Down */
+            power_run(sm_power_action(prel / SM_ITEM_H));
           }
         }
         prev_down = down;
@@ -1652,8 +1912,127 @@ static void take_screenshot(void)
   shot_tid = thread_create(shot_worker, shot_stack);
 }
 
+static void key_to_focus(int c, int mods)
+{
+  int t = topmost_visible();
+  if (t < 0)
+    return;
+  /* Flow control: if the focused window's event ring is full */
+  if (win_key_space(cur[t].id) <= 0) {
+    pend_push(c, mods);
+    return;
+  }
+  struct winevent ev = {WEV_KEY, c, mods};
+  win_deliver(cur[t].id, &ev);
+}
+
+static bool title_is(const char *a, const char *b)
+{
+  while (*a && *a == *b)
+    a++, b++;
+  return *a == *b;
+}
+
+/* cur[] slot of an app's window: spawned by us, or (player) known by title */
+static int app_window(int app)
+{
+  for (int i = nwin - 1; i >= 0; i--) {
+    if (app_pid[app] > 0 && cur[i].owner_pid == app_pid[app])
+      return i;
+    if (app == APP_PLAYER && (title_is(cur[i].title, "Media Player") || title_is(cur[i].title, "Video Player")))
+      return i;
+  }
+  return -1;
+}
+
+static void app_raise_or_launch(int app)
+{
+  int s = app_window(app);
+  if (s >= 0)
+    raise_window(s);
+  else
+    launch_app(app);
+}
+
+/* Media transport reaches the player even when it is not focused */
+static void media_key(int c)
+{
+  int s = app_window(APP_PLAYER);
+  if (s < 0) {
+    if (c == KEY_MEDIA_PLAY)
+      launch_app(APP_PLAYER);
+    return;
+  }
+  if (win_key_space(cur[s].id) <= 0)
+    return;
+  struct winevent ev = {WEV_KEY, c, 0};
+  win_deliver(cur[s].id, &ev);
+}
+
+/* Global special keys; true when consumed (apps never see them) */
+static bool special_key(int c)
+{
+  switch (c) {
+  case KEY_VOL_UP:
+  case KEY_VOL_DOWN:
+  case KEY_MUTE:
+    osd_show(OSD_VOLUME);
+    return true;
+  case KEY_BRIGHT_UP:
+  case KEY_BRIGHT_DOWN:
+    osd_show(OSD_BRIGHTNESS);
+    return true;
+  case KEY_MIC_MUTE:    /* no mic state is exposed: swallowed */
+  case KEY_LAUNCH_MAIL: /* no mail app */
+    return true;
+  case KEY_MEDIA_PLAY:
+  case KEY_MEDIA_STOP:
+  case KEY_MEDIA_NEXT:
+  case KEY_MEDIA_PREV:
+    media_key(c);
+    return true;
+  case KEY_LAUNCH_CALC:
+    app_raise_or_launch(APP_CALC);
+    return true;
+  case KEY_LAUNCH_BROWSER:
+    app_raise_or_launch(APP_BROWSER);
+    return true;
+  case KEY_LAUNCH_FILES:
+    app_raise_or_launch(APP_FILES);
+    return true;
+  case KEY_SEARCH:
+    start_open = true;
+    return true;
+  case KEY_POWER:
+    pw_show();
+    return true;
+  case KEY_SLEEP:
+    if (can_sleep)
+      power_run(PA_SLEEP);
+    else
+      pw_show();
+    return true;
+  case KEY_WWW_BACK:
+    key_to_focus(KEY_LEFT, KMOD_ALT);
+    return true;
+  case KEY_WWW_FORWARD:
+    key_to_focus(KEY_RIGHT, KMOD_ALT);
+    return true;
+  case KEY_WWW_REFRESH:
+    key_to_focus(KEY_F5, 0);
+    return true;
+  }
+  return false;
+}
+
 static void feed_key(int c, int mods)
 {
+  if (pw_open) {
+    pw_key(c);
+    return;
+  }
+  if (special_key(c))
+    return;
   if (c == KEY_PRTSC) {
     take_screenshot();
     return;
@@ -1694,16 +2073,7 @@ static void feed_key(int c, int mods)
       raise_window(s);
     return;
   }
-  int t = topmost_visible();
-  if (t < 0)
-    return;
-  /* Flow control: if the focused window's event ring is full */
-  if (win_key_space(cur[t].id) <= 0) {
-    pend_push(c, mods);
-    return;
-  }
-  struct winevent ev = {WEV_KEY, c, mods};
-  win_deliver(cur[t].id, &ev);
+  key_to_focus(c, mods);
 }
 
 /* Drain parked keys before pulling fresh input; stop as soon as the target fills again */
@@ -2051,7 +2421,8 @@ int main(void)
   kid_track(spawn("/bin/term", 0));
 
   int prev_mx = -9999, prev_my = -9999, prev_cur = -1;
-  bool prev_start = false, prev_tb_menu = false, prev_at_active = false;
+  bool prev_start = false, prev_tb_menu = false, prev_at_active = false, prev_pw_open = false;
+  int prev_pw_sel = -1;
   int prev_at_sel = -1;
   int prev_focus = -1, last_sec = -1;
   bool inited = false;
@@ -2063,12 +2434,23 @@ int main(void)
   if (target_hz <= 0)
     target_hz = 60;
   unsigned conf_poll_at = 0;
+  can_sleep = power(3) > 0;
 
   for (;;) {
     struct inputstate in;
     if (input_poll(&in) < 0) {
       msleep(16);
       continue;
+    }
+    if (resumed) {
+      resumed = false;
+      in.nkeys = 0;
+      prev_wheel = in.wheel;
+      prev_down = in.buttons & 1;
+      prev_rdown = in.buttons & 2;
+      osd_kind = OSD_NONE;
+      force_full = true;
+      frame_deadline = msec();
     }
     frame_clock = now_hms();
 
@@ -2109,10 +2491,9 @@ int main(void)
     paste_flush(); /* inject any in-progress clipboard paste */
 
     /* Keys first (may open menus / switch focus) */
-    for (int i = 0; i < in.nkeys; i++)
+    for (int i = 0; i < in.nkeys && !resumed; i++)
       feed_key(in.keys[i].c, in.keys[i].mods);
 
-    static int prev_wheel = 0;
     int dz = in.wheel - prev_wheel; /* wheel is a running total; delta = this frame */
     prev_wheel = in.wheel;
 
@@ -2120,6 +2501,7 @@ int main(void)
 
     int mx = in.mx, my = in.my;
     ndmg = 0;
+    bool osd = osd_tick();
     bool full = !inited || force_full;
     force_full = false;
 
@@ -2175,9 +2557,13 @@ int main(void)
       int sec = (int)(frame_clock & 0xFF);
       if (sec != last_sec)
         damage_add(0, screen_h - WM_BAR_H, screen_w, WM_BAR_H);
+      if (osd)
+        damage_add(osd_x(), osd_y(), OSD_W, OSD_H);
       /* Start menu toggle */
       if (start_open != prev_start)
         damage_add(0, sm_top(), SM_W, sm_h() + WM_BAR_H);
+      if (pw_open != prev_pw_open || (pw_open && pw_sel != prev_pw_sel))
+        damage_add(pw_x(), pw_y(), PW_W, pw_h());
     }
 
     if (full) {
@@ -2216,6 +2602,8 @@ int main(void)
     prev_mx = mx;
     prev_my = my;
     prev_start = start_open;
+    prev_pw_open = pw_open;
+    prev_pw_sel = pw_sel;
     last_sec = (int)(frame_clock & 0xFF);
     inited = true;
     cursor_frame++;

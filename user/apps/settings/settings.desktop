@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+GenericName=System Settings
+Comment=Configure the system
+Exec=settings
+Icon=preferences-system
+Terminal=false
+Categories=System;Settings;
+X-OwOS-Order=90

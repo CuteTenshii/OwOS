@@ -525,6 +525,59 @@ static int ctrl_box_y(int i) { return ctrl_label_y(i) + 24; }
 static int ctrl_hint_y(int i) { return ctrl_box_y(i) + GUI_SELECT_H + 8; }
 
 /* Bridge each control's (int idx) selection to its typed setter */
+/* Level slider (0..100) bound to a sysfs node; hidden when the node is unreadable */
+static const char *slider_label, *slider_path;
+static int slider_val;
+static bool slider_grab;
+
+static int slider_y(void) { return ctrl_label_y(nctrl ? nctrl : 1); }
+static int slider_track_y(void) { return slider_y() + 30; }
+
+static void slider_load(const char *label, const char *path)
+{
+  char t[8];
+  slider_grab = false;
+  slider_label = slider_path = 0;
+  if (read_proc(path, t, sizeof t) <= 0)
+    return;
+  slider_val = patoi(t);
+  slider_label = label;
+  slider_path = path;
+}
+
+static void slider_set(int val)
+{
+  char t[8];
+  if (val < 0)
+    val = 0;
+  if (val > 100)
+    val = 100;
+  uitoa((unsigned)val, t);
+  if (writefile(slider_path, t, strlen(t)) == 0)
+    slider_val = val;
+}
+
+static void slider_at(int mx, int cx, int cw)
+{
+  int bw = ctrl_box_w(cw);
+  slider_set((mx - (cx + 16)) * 100 / bw);
+}
+
+static void draw_slider(int cx, int cw)
+{
+  if (!slider_path)
+    return;
+  int bw = ctrl_box_w(cw), x = cx + 16, y = slider_track_y();
+  char t[8];
+  uitoa((unsigned)slider_val, t);
+  strcat(t, "%");
+  gfx_ui_text(x, slider_y(), slider_label, FG_TEXT);
+  gfx_ui_text(x + bw - gfx_ui_width(t), slider_y(), t, FG_DIM);
+  gfx_fill_rect(x, y, bw, 6, BG_SIDE);
+  gfx_fill_rect(x, y, bw * slider_val / 100, 6, BG_SEL);
+  gfx_fill_rect(x + bw * slider_val / 100 - 3, y - 4, 6, 14, FG_WHITE);
+}
+
 static void ap_mouse(int i) { set_mouse_level(i + 1); }
 static void ap_kbd(int i) { set_kbd_layout(kbd_opts[i].name); }
 static void ap_sound(int i) { set_sound_output(i); }
@@ -546,6 +599,7 @@ static void addc(const char *label, const char *hint, struct select_box *sel, vo
 static void build_controls(int cat)
 {
   nctrl = 0;
+  slider_path = 0;
   switch (cat) {
   case CAT_MOUSE:
     addc("Pointer speed", "Higher moves the pointer farther per motion.", &mouse_sel, ap_mouse);
@@ -565,6 +619,10 @@ static void build_controls(int cat)
     }
     break;
   }
+  if (cat == CAT_SOUND)
+    slider_load("Volume", "/sys/class/sound/card0/volume");
+  else if (cat == CAT_DISPLAY)
+    slider_load("Brightness", "/sys/class/graphics/fb0/brightness");
 }
 
 /* Draw the active category's controls: labels and hints first, then the boxes */
@@ -575,6 +633,7 @@ static void draw_controls(int cx, int cw)
                       : sel == CAT_DISPLAY ? "No framebuffer."
                                            : "No options available.";
     gfx_ui_text(cx + 16, CONTROLS_Y0, msg, FG_DIM);
+    draw_slider(cx, cw);
     return;
   }
   int bw = ctrl_box_w(cw), open = -1;
@@ -592,6 +651,8 @@ static void draw_controls(int cx, int cw)
   }
   if (open >= 0)
     select_draw(ctrls[open].sel, cx + 16, ctrl_box_y(open), bw, GUI_SELECT_H);
+  else
+    draw_slider(cx, cw);
 }
 
 static void draw_fit(int x, int y, const char *s, int maxw, unsigned fg)
@@ -681,6 +742,15 @@ static void click(int id, int mx, int my)
     if (ctrls[i].sel->open)
       opened = i;
 
+  slider_grab = false;
+  if (opened < 0 && slider_path && mx >= cx + 16 - 4 && mx < cx + 16 + bw + 4 && my >= slider_track_y() - 8 &&
+      my < slider_track_y() + 14) {
+    slider_grab = true;
+    slider_at(mx, cx, cw);
+    seq++;
+    return;
+  }
+
   int order[3], no = 0;
   if (opened >= 0)
     order[no++] = opened;
@@ -705,6 +775,12 @@ static void click(int id, int mx, int my)
 
 static void drag(int mx)
 {
+  if (slider_grab) {
+    int cx = sidebar_w() + 1;
+    slider_at(mx, cx, W - cx);
+    seq++;
+    return;
+  }
   if (sidebar_drag(&sb, 0, mx))
     seq++;
 }

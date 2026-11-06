@@ -512,8 +512,12 @@ int main(int argc, char **argv)
       }
       if (ev.type == WEV_MOUSE)
         on_click(ev.a, ev.b);
-      else if (ev.type == WEV_KEY && ev.a == ' ')
+      else if (ev.type == WEV_KEY && (ev.a == ' ' || ev.a == KEY_MEDIA_PLAY))
         transport_toggle();
+      else if (ev.type == WEV_KEY && (ev.a == KEY_MEDIA_STOP || ev.a == KEY_MEDIA_NEXT))
+        transport_stop(); /* no playlist: next ends the track */
+      else if (ev.type == WEV_KEY && ev.a == KEY_MEDIA_PREV)
+        transport_restart();
     }
 
     if (g_is_video) {
