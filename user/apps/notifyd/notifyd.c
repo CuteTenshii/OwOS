@@ -20,6 +20,7 @@
 #include "notify.h"
 #include "owos.h"
 #include "upng.h"
+#include <stdbool.h>
 
 /* ---- layout + theme -------------------------------------------------------
  */
@@ -64,7 +65,7 @@ static int nhist;
 #define INBOX_N 32
 static struct note *volatile inbox[INBOX_N];
 static volatile int in_head, in_tail; /* SPSC: server head / UI tail */
-static volatile int show_req;         /* set by server, cleared by UI */
+static volatile bool show_req;        /* set by server, cleared by UI */
 static int g_next_id = 1;
 
 static void free_note(struct note *n)
@@ -134,7 +135,7 @@ static unsigned char fr_buffer[FR_BUF]; /* server thread only          */
 struct freader {
   const char *name;
   unsigned off, len, pos;
-  int eof;
+  bool eof;
 };
 
 static void fr_init(struct freader *f, const char *name)
@@ -143,7 +144,7 @@ static void fr_init(struct freader *f, const char *name)
   f->off = 0;
   f->len = 0;
   f->pos = 0;
-  f->eof = 0;
+  f->eof = false;
 }
 
 static int fr_get(void *c)
@@ -154,7 +155,7 @@ static int fr_get(void *c)
       return -1;
     int n = readfile_at(f->name, f->off, fr_buffer, FR_BUF);
     if (n <= 0) {
-      f->eof = 1;
+      f->eof = true;
       return -1;
     }
     f->off += (unsigned)n;
@@ -245,7 +246,7 @@ static void serve(int ch)
   if (read(ch, &op, 1) != 1)
     return;
   if (op == NOTIFY_OP_SHOW) {
-    show_req = 1;
+    show_req = true;
     write_full(ch, "K", 1);
     return;
   }
@@ -715,17 +716,17 @@ int main(void)
   }
   thread_create(server_fn, &server_stack[sizeof server_stack]);
 
-  int dirty = 1;
+  bool dirty = true;
   for (;;) {
     if (inbox_drain()) {
       open_window();
       g_scroll = 0;
-      dirty = 1;
+      dirty = true;
     }
     if (show_req) {
-      show_req = 0;
+      show_req = false;
       open_window();
-      dirty = 1;
+      dirty = true;
     }
 
     if (g_win < 0) {
@@ -744,20 +745,20 @@ int main(void)
         g_h = ev.b;
         gfx_init(win_fb(), g_w, g_h);
         clamp_scroll(g_w, g_h);
-        dirty = 1;
+        dirty = true;
       } else if (ev.type == WEV_SCROLL) {
         g_scroll -= ev.a * 40;
         clamp_scroll(g_w, g_h);
-        dirty = 1;
+        dirty = true;
       } else if (ev.type == WEV_MOUSE) {
         if (handle_click(ev.a, ev.b, g_w, g_h))
-          dirty = 1;
+          dirty = true;
       } else if (ev.type == WEV_DRAG) {
         if (g_sb_drag) {
           int visible = g_h - HDR_H;
           g_scroll = scrollbar_pos(g_w - SBW, HDR_H, SBW, visible, ev.a, ev.b, g_scroll, content_height(g_w), visible);
           clamp_scroll(g_w, g_h);
-          dirty = 1;
+          dirty = true;
         }
       }
     }
@@ -767,7 +768,7 @@ int main(void)
     if (dirty) {
       render(g_w, g_h);
       win_present(g_win);
-      dirty = 0;
+      dirty = false;
     }
     win_wait(g_win);
   }

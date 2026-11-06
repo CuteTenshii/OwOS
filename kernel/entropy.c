@@ -30,7 +30,7 @@ static volatile uint32_t widx;
 /* True if `feat` appears as a whole space-separated token in a cpu_features()
  * list — so RDRAND detection reuses cpu.c's CPUID decoding rather than redoing
  * it. */
-static int feature_listed(const char *list, const char *feat)
+static bool feature_listed(const char *list, const char *feat)
 {
   uint32_t fl = strlen(feat);
   for (const char *p = list; *p;) {
@@ -42,17 +42,17 @@ static int feature_listed(const char *list, const char *feat)
       while (i < fl && tok[i] == feat[i])
         i++;
       if (i == fl)
-        return 1;
+        return true;
     }
     while (*p == ' ')
       p++;
   }
-  return 0;
+  return false;
 }
 
 /* RDRAND with a bounded retry (CF=0 means "not ready"); 0 if it never succeeds.
  */
-static int rdrand32(uint32_t *out)
+static bool rdrand32(uint32_t *out)
 {
   for (int i = 0; i < 16; i++) {
     uint8_t ok;
@@ -60,10 +60,10 @@ static int rdrand32(uint32_t *out)
     __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok));
     if (ok) {
       *out = v;
-      return 1;
+      return true;
     }
   }
-  return 0;
+  return false;
 }
 
 void entropy_init(void)

@@ -17,6 +17,7 @@
  */
 
 #include "owos.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 enum { MDNS_A = 1, MDNS_PTR = 12, MDNS_TXT = 16, MDNS_SRV = 33, MDNS_ANY = 255 };
@@ -51,14 +52,14 @@ static unsigned be16(const unsigned char *p) { return ((unsigned)p[0] << 8) | p[
 
 /* Case-insensitive name compare, tolerating one optional trailing dot on either
  * side (our stored names carry none; a query name may). */
-static int name_eq(const char *a, const char *b)
+static bool name_eq(const char *a, const char *b)
 {
   for (;;) {
     char ca = *a, cb = *b;
     if ((ca == '\0' || (ca == '.' && a[1] == '\0')) && (cb == '\0' || (cb == '.' && b[1] == '\0')))
-      return 1;
+      return true;
     if (lower(ca) != lower(cb))
-      return 0;
+      return false;
     a++;
     b++;
   }
@@ -139,7 +140,7 @@ static int put_u16(unsigned char *out, int *o, int cap, unsigned v)
   return 0;
 }
 
-static int ip_zero(const unsigned char ip[4]) { return !(ip[0] | ip[1] | ip[2] | ip[3]); }
+static bool ip_zero(const unsigned char ip[4]) { return !(ip[0] | ip[1] | ip[2] | ip[3]); }
 
 /* Encode one record (owner + type/class/ttl + rdata) at out[*o]. `ttl_override`
  * < 0 uses the per-type default; 0 (goodbye) or any value overrides it. Returns
@@ -210,12 +211,12 @@ static int put_record(unsigned char *out, int *o, int cap, const struct mdns_rec
   return 0;
 }
 
-static int idx_in(const int *arr, int n, int v)
+static bool idx_in(const int *arr, int n, int v)
 {
   for (int i = 0; i < n; i++)
     if (arr[i] == v)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* Build a response to the query datagram `q`/`qlen` against `recs`, using
@@ -569,7 +570,7 @@ int main(void)
 
   unsigned char myip[4] = {0, 0, 0, 0};
   unsigned last_announce = 0;
-  int announced_once = 0;
+  bool announced_once = false;
 
   for (;;) {
     unsigned char src[4];
@@ -592,7 +593,7 @@ int main(void)
       if (!announced_once || now - last_announce >= 60000) {
         announce_all(fd, myip, -1);
         last_announce = now;
-        announced_once = 1;
+        announced_once = true;
       }
     }
 

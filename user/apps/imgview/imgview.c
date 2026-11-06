@@ -18,6 +18,7 @@
 #include "owos.h"
 #include "upng.h"
 #include "webp.h"
+#include <stdbool.h>
 
 /* ---- layout ---------------------------------------------------------------
  */
@@ -36,7 +37,7 @@ static int wid;           /* window id                                 */
 static char curpath[256]; /* path of the image currently shown         */
 static unsigned iw, ih;   /* its pixel dimensions                      */
 static int load_ok;       /* a valid image is loaded                   */
-static int is_webp;       /* the loaded image is WebP, not PNG         */
+static bool is_webp;      /* the loaded image is WebP, not PNG         */
 
 static struct upng_meta meta; /* probed metadata for curpath               */
 static int meta_valid;        /* meta + the props list match curpath       */
@@ -115,7 +116,7 @@ static unsigned char fr_buffer[FR_BUF];
 struct freader {
   const char *name;
   unsigned off, len, pos;
-  int eof;
+  bool eof;
 };
 
 static void fr_init(struct freader *f, const char *name)
@@ -124,7 +125,7 @@ static void fr_init(struct freader *f, const char *name)
   f->off = 0;
   f->len = 0;
   f->pos = 0;
-  f->eof = 0;
+  f->eof = false;
 }
 
 static int fr_get(void *c)
@@ -135,7 +136,7 @@ static int fr_get(void *c)
       return -1;
     int n = readfile_at(f->name, f->off, fr_buffer, FR_BUF);
     if (n <= 0) {
-      f->eof = 1;
+      f->eof = true;
       return -1;
     }
     f->off += (unsigned)n;
@@ -173,16 +174,16 @@ static unsigned char *read_whole(const char *path, int *len)
 
 /* Probe dimensions + format from a file: a RIFF/WEBP header routes to the WebP
  * reader, anything else to the streaming PNG reader. Returns 0 on success. */
-static int probe_image(const char *path, unsigned *w, unsigned *h, int *webp)
+static int probe_image(const char *path, unsigned *w, unsigned *h, bool *webp)
 {
   unsigned char hdr[64];
   int n = readfile_at(path, 0, hdr, sizeof hdr);
   if (n >= 12 && hdr[0] == 'R' && hdr[1] == 'I' && hdr[2] == 'F' && hdr[3] == 'F' && hdr[8] == 'W' && hdr[9] == 'E' &&
       hdr[10] == 'B' && hdr[11] == 'P') {
-    *webp = 1;
+    *webp = true;
     return webp_dimensions(hdr, n, w, h) == WEBP_OK ? 0 : -1;
   }
-  *webp = 0;
+  *webp = false;
   struct freader fr;
   fr_init(&fr, path);
   return (upng_dimensions(fr_get, &fr, w, h) == 0 && *w && *h) ? 0 : -1;
@@ -550,10 +551,10 @@ static void ensure_meta(void)
 static void load(const char *path)
 {
   unsigned w = 0, h = 0;
-  int webp = 0;
+  bool webp = false;
   if (probe_image(path, &w, &h, &webp) != 0 || w == 0 || h == 0) {
     load_ok = 0;
-    is_webp = 0;
+    is_webp = false;
     meta_valid = 0;
     scopy(curpath, path, sizeof curpath); /* set, so the UI says which file */
     decode_to_canvas();
@@ -841,7 +842,7 @@ int main(int argc, char **argv)
   unsigned w0 = CW_MIN, h0 = CH_MIN;
   if (arg) {
     unsigned w = 0, h = 0;
-    int webp = 0;
+    bool webp = false;
     if (probe_image(arg, &w, &h, &webp) == 0 && w && h) {
       w0 = w;
       h0 = h; /* a readable image: fit the window to it       */
@@ -889,12 +890,12 @@ int main(int argc, char **argv)
   render();
   win_present(wid);
 
-  int need = 0;
+  bool need = false;
   for (;;) {
     struct win_event ev;
     win_wait(wid);
     while (win_poll(wid, &ev)) {
-      need = 1;
+      need = true;
       if (ev.type == WEV_CLOSE) {
         win_close(wid);
         return 0;
@@ -908,7 +909,7 @@ int main(int argc, char **argv)
     if (need) {
       render();
       win_present(wid);
-      need = 0;
+      need = false;
     }
   }
 }

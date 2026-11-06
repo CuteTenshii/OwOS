@@ -4,6 +4,8 @@
  * media and remote prototypes are allocated in setup_dom's batch and configured
  * here (setup_media_proto/setup_remote_proto). Split out of js.c; shares the
  * page engine context + helpers via jsint.h. */
+#include <stdbool.h>
+
 #include "../bmedia.h" /* HTMLMediaElement backend: media_* over the mixer        */
 #include "../jsint.h"
 #include "cast.h" /* Google Cast sender: RemotePlayback backend             */
@@ -111,7 +113,7 @@ static js_value mel_get_loop(js_ctx *ctx, js_value t, js_value *args, int argc)
 static js_value mel_set_loop(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  int on = js_to_boolean(A(0));
+  bool on = js_to_boolean(A(0));
   media_set_loop(media_for_node(n), on);
   if (n) {
     if (on)
@@ -131,7 +133,7 @@ static js_value mel_get_autoplay(js_ctx *ctx, js_value t, js_value *args, int ar
 static js_value mel_set_autoplay(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  int on = js_to_boolean(A(0));
+  bool on = js_to_boolean(A(0));
   media_set_autoplay(media_for_node(n), on);
   if (n) {
     if (on)
@@ -400,7 +402,7 @@ static js_value rp_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = remote_node(t);
   struct cast_device dev;
-  int have = 0;
+  bool have = false;
   (void)args;
   (void)argc;
   if (t.type != JV_OBJ)
@@ -409,13 +411,13 @@ static js_value rp_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
   cast_scan_start();
   g_cast_used = 1;
   if (cast_scan_count() > 0 && cast_scan_get(0, &dev))
-    have = 1;
+    have = true;
   if (!have) {
     struct cast_device list[8];
     int c = cast_discover(list, 8, 4000);
     if (c > 0) {
       dev = list[0];
-      have = 1;
+      have = true;
     }
   }
   if (!have)

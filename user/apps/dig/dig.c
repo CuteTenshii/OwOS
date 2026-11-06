@@ -13,8 +13,9 @@
 #include "opt.h"
 #include "owos.h"
 #include "resolve.h"
+#include <stdbool.h>
 
-static int eq_ci(const char *a, const char *b)
+static bool eq_ci(const char *a, const char *b)
 {
   while (*a && *b) {
     char ca = *a, cb = *b;
@@ -23,7 +24,7 @@ static int eq_ci(const char *a, const char *b)
     if (cb >= 'a' && cb <= 'z')
       cb -= 32;
     if (ca != cb)
-      return 0;
+      return false;
     a++;
     b++;
   }

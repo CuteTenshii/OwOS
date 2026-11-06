@@ -23,7 +23,7 @@
 enum { PEND_NONE = 0, PEND_CLAIMED, PEND_READY }; /* zero = no pending conn */
 
 struct port {
-  int used;
+  bool used;
   char name[IPC_NAME_MAX];
   int pend;     /* PEND_* — guards the single connection slot          */
   int c2s, s2c; /* the pending connection's pipe-pool ids (when READY)  */
@@ -49,7 +49,7 @@ int ipc_port_create(const char *name)
     return -1; /* one server per name           */
   for (int i = 0; i < IPC_MAX_PORTS; i++) {
     if (!ports[i].used) {
-      ports[i].used = 1;
+      ports[i].used = true;
       ports[i].pend = PEND_NONE;
       int j = 0;
       for (; name[j] && j < IPC_NAME_MAX - 1; j++)
@@ -73,7 +73,7 @@ void ipc_port_destroy(int id)
     pipe_close(p->c2s, 0); /* server is c2s's reader            */
     pipe_close(p->s2c, 1); /* server is s2c's writer            */
   }
-  p->used = 0;
+  p->used = false;
   p->pend = PEND_NONE;
 }
 

@@ -7,6 +7,8 @@
  * sw_intercept_fetch lets the core fetch() consult a controlling worker. Split
  * out of js.c; shares the page engine context and the DOM/fetch/notification
  * helpers via jsint.h. */
+#include <stdbool.h>
+
 #include "../cors.h" /* cors_origin / cors_same_origin: SW scope + cache keys */
 #include "../jsint.h"
 #include "notify.h" /* notify_send: a service worker's showNotification()    */
@@ -44,7 +46,7 @@ static int g_swc_n, g_swc_cap, g_swc_nextid = 1;
 struct sw_reg {
   char *origin, *scope, *script_url, *src;
   int slen;
-  int installed; /* install has fired once for this src        */
+  bool installed; /* install has fired once for this src        */
 };
 static struct sw_reg **g_swr;
 static int g_swr_n, g_swr_cap;
@@ -87,10 +89,10 @@ static js_value sw_make_clients(js_ctx *ctx);
 static js_value sw_make_client(js_ctx *ctx);
 static js_value sw_make_worker(js_ctx *ctx, const char *script, const char *state);
 static js_value sw_make_registration(js_ctx *ctx, struct sw_reg *reg, js_value worker);
-static js_value sw_instantiate(js_ctx *ctx, struct sw_reg *reg, int do_install, int do_activate);
+static js_value sw_instantiate(js_ctx *ctx, struct sw_reg *reg, bool do_install, bool do_activate);
 static void sw_set_controller(js_ctx *ctx, js_value worker);
 static void sw_fire_lifecycle(js_ctx *ctx, js_object *scope, const char *type);
-static int sw_run_scope(js_ctx *ctx, js_object *scope, const char *src, const char *label);
+static bool sw_run_scope(js_ctx *ctx, js_object *scope, const char *src, const char *label);
 static struct sw_reg *sw_reg_for_url(const char *page_url);
 static void sw_input_url(js_ctx *ctx, js_value v, char *out, int cap);
 static void sw_input_method(js_ctx *ctx, js_value v, char *out, int cap);
@@ -131,7 +133,7 @@ static void sw_entry_free(struct sw_c_entry *e)
   free(e->ctype);
   free(e->body);
 }
-static struct sw_cache *sw_cache_find(const char *origin, const char *name, int create)
+static struct sw_cache *sw_cache_find(const char *origin, const char *name, bool create)
 {
   int i;
   for (i = 0; i < g_swc_n; i++)
@@ -267,7 +269,7 @@ static struct sw_reg *sw_reg_add(const char *origin, const char *scope, const ch
   g_swr[g_swr_n++] = r;
   return r;
 }
-static int sw_reg_remove(const char *origin, const char *scope)
+static bool sw_reg_remove(const char *origin, const char *scope)
 {
   int i;
   for (i = 0; i < g_swr_n; i++)
@@ -278,9 +280,9 @@ static int sw_reg_remove(const char *origin, const char *scope)
       free(g_swr[i]->src);
       free(g_swr[i]);
       g_swr[i] = g_swr[--g_swr_n];
-      return 1;
+      return true;
     }
-  return 0;
+  return false;
 }
 /* The registration (if any) that controls `page_url`: same origin and the
  * longest scope path that is a prefix of the page's path. */
@@ -641,7 +643,7 @@ static js_value caches_open(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)t;
   (void)argc;
   cors_origin(g_page_url_buf, org, sizeof org);
-  c = sw_cache_find(org, arg_str(ctx, A(0)), 1);
+  c = sw_cache_find(org, arg_str(ctx, A(0)), true);
   if (!c)
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "Error", "caches.open failed"));
   return sw_resolve(ctx, sw_make_cache_wrapper(ctx, c->id));
@@ -674,7 +676,7 @@ static js_value caches_has(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)t;
   (void)argc;
   cors_origin(g_page_url_buf, org, sizeof org);
-  return sw_resolve(ctx, js_bool(sw_cache_find(org, arg_str(ctx, A(0)), 0) != 0));
+  return sw_resolve(ctx, js_bool(sw_cache_find(org, arg_str(ctx, A(0)), false) != 0));
 }
 static js_value caches_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -855,7 +857,7 @@ static js_value reg_unregister(js_ctx *ctx, js_value t, js_value *args, int argc
 {
   char org[URL_MAX];
   js_value sc = js_get(ctx, t, "@scope");
-  int removed;
+  bool removed;
   (void)args;
   (void)argc;
   cors_origin(g_page_url_buf, org, sizeof org);
@@ -887,14 +889,14 @@ static js_value reg_update(js_ctx *ctx, js_value t, js_value *args, int argc)
   rq.method = "GET";
   body = browser_cors_fetch(g_page_url_buf, 0, &rq, &rs);
   if (body) {
-    int changed = !(r->src && r->slen == rs.len && memcmp(r->src, body, (unsigned)rs.len) == 0);
+    bool changed = !(r->src && r->slen == rs.len && memcmp(r->src, body, (unsigned)rs.len) == 0);
     if (changed) {
       sw_reg_set_src(r, (char *)body, rs.len);
-      r->installed = 0;
+      r->installed = false;
     }
     free(body);
     if (changed) {
-      js_value nr = sw_instantiate(ctx, r, 1, 1);
+      js_value nr = sw_instantiate(ctx, r, true, true);
       if (nr.type == JV_OBJ)
         return sw_resolve(ctx, nr);
     }
@@ -1005,12 +1007,12 @@ static void sw_fire_lifecycle(js_ctx *ctx, js_object *scope, const char *type)
   }
   gc_pop_scope();
 }
-static int sw_has_listener(js_object *scope, const char *type)
+static bool sw_has_listener(js_object *scope, const char *type)
 {
   char onname[24];
   pentry *pe;
   if (!scope)
-    return 0;
+    return false;
   pe = pmap_find_pub(scope, "@ev");
   if (pe && pe->value.type == JV_OBJ) {
     js_object *list = pe->value.u.obj;
@@ -1022,7 +1024,7 @@ static int sw_has_listener(js_object *scope, const char *type)
         continue;
       ty = js_get(g_ctx, e, "type");
       if (ty.type == JV_STR && streq(ty.u.str->data, type))
-        return 1;
+        return true;
     }
   }
   onname[0] = 'o';
@@ -1033,7 +1035,7 @@ static int sw_has_listener(js_object *scope, const char *type)
 int sw_intercept_fetch(js_ctx *ctx, const char *url, const char *method, js_value *out)
 {
   js_value ev, r;
-  int handled = 0;
+  bool handled = false;
   if (!g_sw_active_scope || g_sw_in_fetch)
     return 0;
   if (!sw_has_listener(g_sw_active_scope, "fetch"))
@@ -1066,13 +1068,13 @@ int sw_intercept_fetch(js_ctx *ctx, const char *url, const char *method, js_valu
   if (js_to_boolean(js_get(ctx, ev, "@responded"))) {
     if (js_to_boolean(js_get(ctx, ev, "@responderr"))) {
       *out = js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Failed to fetch"));
-      handled = 1;
+      handled = true;
     } else {
       r = js_get(ctx, ev, "@resp");
       if (r.type == JV_OBJ) {
         gc_keep(r.u.obj);
         *out = js_promise_resolved(ctx, r);
-        handled = 1;
+        handled = true;
       }
     }
   }
@@ -1109,7 +1111,7 @@ static char *sw_wrap_src(const char *src)
   w[pl + sl + ql] = 0;
   return w;
 }
-static int sw_run_scope(js_ctx *ctx, js_object *scope, const char *src, const char *label)
+static bool sw_run_scope(js_ctx *ctx, js_object *scope, const char *src, const char *label)
 {
   char *w = sw_wrap_src(src);
   js_arena *ar;
@@ -1117,11 +1119,11 @@ static int sw_run_scope(js_ctx *ctx, js_object *scope, const char *src, const ch
   js_parse_error pe;
   js_value res, fn, a;
   if (!w)
-    return 0;
+    return false;
   ar = (js_arena *)malloc(sizeof *ar);
   if (!ar) {
     free(w);
-    return 0;
+    return false;
   }
   js_arena_init(ar);
   prog = js_parse(w, ar, &pe);
@@ -1129,24 +1131,24 @@ static int sw_run_scope(js_ctx *ctx, js_object *scope, const char *src, const ch
   if (!prog) {
     js_arena_free(ar);
     free(ar);
-    return 0;
+    return false;
   }
   if (!arenas_push(ar)) {
     js_arena_free(ar);
     free(ar);
-    return 0;
+    return false;
   }
   js_set_cur_script(label);
   gc_push_scope();
   if (js_run(ctx, prog, &res) != 0) {
     report_exc(ctx);
     gc_pop_scope();
-    return 0;
+    return false;
   }
   fn = res;
   if (!js_is_callable(fn)) {
     gc_pop_scope();
-    return 0;
+    return false;
   }
   gc_keep(fn.u.obj);
   a = js_obj_value(scope);
@@ -1154,10 +1156,10 @@ static int sw_run_scope(js_ctx *ctx, js_object *scope, const char *src, const ch
   if (ctx->has_exc) {
     report_exc(ctx);
     gc_pop_scope();
-    return 0;
+    return false;
   }
   gc_pop_scope();
-  return 1;
+  return true;
 }
 static js_value swg_import_scripts(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1255,7 +1257,7 @@ static void sw_set_controller(js_ctx *ctx, js_value worker)
 /* Build the ServiceWorkerGlobalScope, run the worker source in it, optionally
  * fire install/activate, and make it the page's controller. Returns the
  * page-side ServiceWorkerRegistration, or undefined if the script errored. */
-static js_value sw_instantiate(js_ctx *ctx, struct sw_reg *reg, int do_install, int do_activate)
+static js_value sw_instantiate(js_ctx *ctx, struct sw_reg *reg, bool do_install, bool do_activate)
 {
   js_object *scope;
   js_value worker, regobj, clients;
@@ -1309,7 +1311,7 @@ static js_value sw_instantiate(js_ctx *ctx, struct sw_reg *reg, int do_install, 
   }
   if (do_install) {
     sw_fire_lifecycle(ctx, scope, "install");
-    reg->installed = 1;
+    reg->installed = true;
   }
   if (do_activate)
     sw_fire_lifecycle(ctx, scope, "activate");
@@ -1327,7 +1329,7 @@ static js_value swc_register(js_ctx *ctx, js_value t, js_value *args, int argc)
   struct http_req rq = {0};
   struct http_resp rs = {0};
   unsigned char *body;
-  int changed;
+  bool changed;
   (void)t;
   resolve_url(g_page_url_buf, arg_str(ctx, A(0)), script, sizeof script);
   scope[0] = 0;
@@ -1359,10 +1361,10 @@ static js_value swc_register(js_ctx *ctx, js_value t, js_value *args, int argc)
   changed = !(r->src && r->slen == rs.len && memcmp(r->src, body, (unsigned)rs.len) == 0);
   if (changed) {
     sw_reg_set_src(r, (char *)body, rs.len);
-    r->installed = 0;
+    r->installed = false;
   }
   free(body);
-  regobj = sw_instantiate(ctx, r, !r->installed, 1);
+  regobj = sw_instantiate(ctx, r, !r->installed, true);
   if (regobj.type != JV_OBJ)
     return js_promise_rejected(ctx,
                                js_make_error(ctx, ctx->error_proto, "Error", "ServiceWorker script evaluation failed"));
@@ -1601,7 +1603,7 @@ void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
   {
     struct sw_reg *r = sw_reg_for_url(page_url);
     if (r && r->src)
-      sw_instantiate(ctx, r, 0, 0);
+      sw_instantiate(ctx, r, false, false);
   }
 }
 

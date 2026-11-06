@@ -12,6 +12,7 @@
 #include "webp.h"
 #include "owos.h"
 #include "upng.h"
+#include <stdbool.h>
 
 /* ---- a buffered file reader over readfile_at (for the streaming PNG decoder)
  */
@@ -20,7 +21,7 @@ static unsigned char fr_buffer[FR_BUF];
 struct freader {
   const char *name;
   unsigned off, len, pos;
-  int eof;
+  bool eof;
 };
 
 static void fr_init(struct freader *f, const char *name)
@@ -29,7 +30,7 @@ static void fr_init(struct freader *f, const char *name)
   f->off = 0;
   f->len = 0;
   f->pos = 0;
-  f->eof = 0;
+  f->eof = false;
 }
 
 static int fr_get(void *c)
@@ -40,7 +41,7 @@ static int fr_get(void *c)
       return -1;
     int n = readfile_at(f->name, f->off, fr_buffer, FR_BUF);
     if (n <= 0) {
-      f->eof = 1;
+      f->eof = true;
       return -1;
     }
     f->off += (unsigned)n;
@@ -191,10 +192,10 @@ static int cmd_verify(const char *in)
     return 1;
   }
 
-  int ok = (dw == w && dh == h);
+  bool ok = (dw == w && dh == h);
   for (unsigned i = 0; ok && i < w * h * 4u; i++)
     if (rgba[i] != back[i])
-      ok = 0;
+      ok = false;
   free(rgba);
   free(back);
 

@@ -10,6 +10,7 @@
 
 #include "file.h"
 #include "signal.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 struct registers;
@@ -53,9 +54,9 @@ uint32_t sched_sigprocmask(int how, uint32_t set, int have_set);
 void sched_signal_deliver(struct registers *r);
 int sched_fault_signal(struct registers *r, int sig); /* deliver a CPU fault as a signal */
 int sched_sigreturn(struct registers *r);
-int sched_intr_pending(void);             /* a signal wants delivery (blocking waits) */
-int sched_waitpid(int pid);               /* block for a child; returns its status  */
-int sched_try_reap(int pid, int *status); /* non-blocking reap (kernel side) */
+bool sched_intr_pending(void);             /* a signal wants delivery (blocking waits) */
+int sched_waitpid(int pid);                /* block for a child; returns its status  */
+bool sched_try_reap(int pid, int *status); /* non-blocking reap (kernel side) */
 int sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, uint32_t brk, struct registers *r);
 
 void schedule(void); /* invoked from the timer tick                       */

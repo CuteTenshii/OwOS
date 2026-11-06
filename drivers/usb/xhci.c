@@ -30,6 +30,7 @@
 #include "pci.h"
 #include "sched.h"
 #include "timer.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -146,7 +147,7 @@ static uint32_t event_idx;
  * in 500 ms) and set on any successful event. A wedged/yanked device that stops
  * completing transfers flips this to 0, so callers can drop it instead of
  * retrying forever. */
-static volatile int hc_responsive = 1;
+static volatile bool hc_responsive = true;
 
 /* One enumerated device, indexed by root-hub port. Cached so each device is
  * enumerated exactly once (re-enumerating a configured device fails and would
@@ -154,7 +155,7 @@ static volatile int hc_responsive = 1;
  * actually changes — which is how we catch a phone switching into RNDIS. */
 #define XHCI_MAX_PORTS 256
 struct usbdev {
-  int active;
+  bool active;
   int slot;
   int speed;
   uint16_t vid, pid;
@@ -163,22 +164,22 @@ struct usbdev {
   int cfg_len;
   /* If this looks like a USB-Ethernet (RNDIS) device: the comm interface that
    * takes encapsulated commands, the bulk data pair, and the MAC we learned. */
-  int is_net;
-  int is_msc; /* bulk-only-transport mass storage (class 08/06/50) */
-  int is_mtp; /* media transfer protocol / PTP (class 06/01/01)    */
+  bool is_net;
+  bool is_msc; /* bulk-only-transport mass storage (class 08/06/50) */
+  bool is_mtp; /* media transfer protocol / PTP (class 06/01/01)    */
   int ctrl_iface;
   uint8_t bulk_in, bulk_out, intr_in;
   uint16_t bulk_in_mps, bulk_out_mps, intr_in_mps;
   uint8_t intr_interval;
   uint8_t mac[6];
-  int mac_ok;
+  bool mac_ok;
 };
 static struct usbdev port_dev[XHCI_MAX_PORTS];
 
 /* The active RNDIS USB-Ethernet data path (there is one tethered NIC). Set up
  * once the device is enumerated + RNDIS-initialized; the USB thread then runs a
  * bulk TX/RX loop over these. */
-static int net_up; /* 1 once the bulk data path is live        */
+static bool net_up; /* true once the bulk data path is live        */
 static int net_slot;
 static int net_in_dci, net_out_dci;
 static uint32_t net_in_mps;
@@ -186,14 +187,14 @@ static struct ring net_in_ring, net_out_ring;
 static uint8_t *net_rx_buf; /* one outstanding bulk-IN lands here       */
 static uint8_t *net_tx_buf; /* one outstanding bulk-OUT is built here   */
 static uint8_t net_mac[6];
-static int net_in_pending, net_out_pending;
+static bool net_in_pending, net_out_pending;
 static uint8_t net_in_ep;     /* bulk-IN endpoint address (for CLEAR_HALT) */
 static int net_stall_retries; /* bound stall recovery so it can't spin    */
 static int net_intr_dci;      /* RNDIS status (interrupt-IN) endpoint      */
 static struct ring net_ep0;   /* the net device's OWN EP0 ring (control)   */
 static struct ring net_intr_ring;
 static uint8_t *net_intr_buf;
-static int net_intr_pending;
+static bool net_intr_pending;
 static int net_ctrl_iface;           /* interface that takes encapsulated cmds    */
 static int dbg_rx, dbg_tx, dbg_intr; /* one-shot diagnostics counters     */
 
@@ -939,7 +940,7 @@ static int bring_up_net(struct usbdev *d, int port)
   for (int i = 0; i < 6; i++)
     net_mac[i] = d->mac[i];
   txq_head = txq_tail = 0;
-  net_in_pending = net_out_pending = net_intr_pending = 0;
+  net_in_pending = net_out_pending = net_intr_pending = false;
 
   /* Save this device's EP0 ring NOW, while the global ep0_ring still points at
    * it. Later enumerations (other ports) overwrite the global ring, so the data
@@ -1000,7 +1001,7 @@ static void data_loop(void)
     }
     if (!net_intr_pending) /* keep the status-IN armed            */
       post_bulk_intr();
-    int resp_avail = 0;
+    bool resp_avail = 0;
     /* Drain completion events, routing by endpoint. */
     struct trb *e;
     while ((e = event_poll())) {
@@ -1084,7 +1085,7 @@ static void data_loop(void)
  * RNDIS tether and a mass-storage device are mutually exclusive after boot --
  * an acceptable limit (you don't usually tether and mount a stick at once). */
 
-static int msc_ready; /* device configured + capacity known       */
+static bool msc_ready; /* device configured + capacity known       */
 static int msc_slot;
 static int msc_in_dci, msc_out_dci;
 static uint8_t msc_in_ep, msc_out_ep;
@@ -1097,7 +1098,8 @@ static char msc_model[40];
 static uint8_t *msc_cbw, *msc_csw, *msc_data; /* DMA scratch (palloc'd once) */
 
 /* One-slot request mailbox serviced by the poll thread. */
-static volatile int msc_req, msc_done, msc_rw, msc_result, msc_busy;
+static volatile bool msc_req, msc_done, msc_rw, msc_busy;
+static volatile int msc_result;
 static volatile int msc_mb_count; /* sectors in this request            */
 static volatile uint32_t msc_mb_lba;
 static volatile uint8_t *msc_mb_buf;
@@ -1261,7 +1263,7 @@ static void msc_clear_stall(int dci, uint8_t ep_addr, struct ring *ring)
 /* Run one BOT command: CBW (with the SCSI CDB) -> optional data -> CSW. For a
  * read, the data lands in `data`; for a write, `data` is sent. Returns 0 iff
  * the CSW reports success. */
-static int bot_xfer(const uint8_t *cdb, int cdb_len, int dlen, int write, uint8_t *data)
+static int bot_xfer(const uint8_t *cdb, int cdb_len, int dlen, bool write, uint8_t *data)
 {
   /* --- Command Block Wrapper --- */
   for (int i = 0; i < 31; i++)
@@ -1321,29 +1323,29 @@ static int bot_xfer(const uint8_t *cdb, int cdb_len, int dlen, int write, uint8_
 static int scsi_tur(void)
 {
   uint8_t cdb[6] = {0}; /* TEST UNIT READY */
-  return bot_xfer(cdb, 6, 0, 0, 0);
+  return bot_xfer(cdb, 6, 0, false, 0);
 }
 static int scsi_request_sense(uint8_t *out18)
 {
   uint8_t cdb[6] = {0x03, 0, 0, 0, 18, 0};
-  return bot_xfer(cdb, 6, 18, 0, out18);
+  return bot_xfer(cdb, 6, 18, false, out18);
 }
 static int scsi_inquiry(uint8_t *out36)
 {
   uint8_t cdb[6] = {0x12, 0, 0, 0, 36, 0};
-  return bot_xfer(cdb, 6, 36, 0, out36);
+  return bot_xfer(cdb, 6, 36, false, out36);
 }
 static int scsi_read_capacity(uint32_t *last_lba, uint32_t *blk)
 {
   uint8_t cdb[10] = {0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   uint8_t r[8];
-  if (bot_xfer(cdb, 10, 8, 0, r) != 0)
+  if (bot_xfer(cdb, 10, 8, false, r) != 0)
     return -1;
   *last_lba = ((uint32_t)r[0] << 24) | (r[1] << 16) | (r[2] << 8) | r[3];
   *blk = ((uint32_t)r[4] << 24) | (r[5] << 16) | (r[6] << 8) | r[7];
   return 0;
 }
-static int scsi_rw10(uint32_t lba, uint8_t *buf, int count, int write)
+static int scsi_rw10(uint32_t lba, uint8_t *buf, int count, bool write)
 {
   uint8_t cdb[10] = {write ? (uint8_t)0x2A : (uint8_t)0x28,
                      0,
@@ -1452,7 +1454,7 @@ static void msc_unlock(void)
 }
 
 /* Hand one op to the poll thread and wait (caller already holds the lock). */
-static int msc_io(uint32_t lba, uint8_t *buf, int count, int write)
+static int msc_io(uint32_t lba, uint8_t *buf, int count, bool write)
 {
   msc_mb_lba = lba;
   msc_mb_buf = buf;
@@ -1493,7 +1495,7 @@ int xhci_msc_read(uint32_t lba, void *buf)
       uint32_t cnt = MSC_CHUNK;
       if (base + cnt > msc_capacity)
         cnt = msc_capacity - base;
-      if (msc_io(base, msc_cache + line * MSC_LINE_BYTES, (int)cnt, 0) != 0)
+      if (msc_io(base, msc_cache + line * MSC_LINE_BYTES, (int)cnt, false) != 0)
         rc = -1;
       else
         msc_ctag[line] = base;
@@ -1501,7 +1503,7 @@ int xhci_msc_read(uint32_t lba, void *buf)
     if (rc == 0)
       memcpy(buf, msc_cache + line * MSC_LINE_BYTES + (lba - base) * 512, 512);
   } else {
-    rc = msc_io(lba, buf, 1, 0); /* no cache (alloc failed) */
+    rc = msc_io(lba, buf, 1, false); /* no cache (alloc failed) */
   }
 
   msc_unlock();
@@ -1519,7 +1521,7 @@ int xhci_msc_write(uint32_t lba, const void *buf)
   if (!msc_ready || lba >= msc_capacity)
     return -1;
   msc_lock();
-  int rc = msc_io(lba, (uint8_t *)buf, 1, 1);
+  int rc = msc_io(lba, (uint8_t *)buf, 1, true);
   if (msc_cache) { /* keep the cache coherent */
     uint32_t base = lba & ~(uint32_t)(MSC_CHUNK - 1);
     for (int i = 0; i < MSC_LINES; i++)
@@ -1573,7 +1575,7 @@ int xhci_msc_write(uint32_t lba, const void *buf)
 
 #define MTP_CHUNK 4096 /* one palloc page == one DMA chunk     */
 
-static int mtp_ready; /* device configured + session open     */
+static bool mtp_ready; /* device configured + session open     */
 static int mtp_slot;
 static int mtp_in_dci, mtp_out_dci;
 static uint8_t mtp_in_ep, mtp_out_ep;
@@ -1587,7 +1589,7 @@ static uint8_t *mtp_buf;   /* DMA: one data-phase chunk             */
 /* One-slot request mailbox serviced by the poll thread. kind 0 = a generic
  * transaction whose data-IN payload is copied into mb_out; kind 1 = stream
  * object mb_handle into owofs file mb_dst. */
-static volatile int mtp_req, mtp_done, mtp_busy;
+static volatile bool mtp_req, mtp_done, mtp_busy;
 static volatile int mtp_kind, mtp_result;
 static volatile uint32_t mtp_resp_code;
 static volatile uint16_t mtp_mb_op;

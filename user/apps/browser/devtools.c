@@ -17,6 +17,7 @@
 #include "browser.h"
 #include "color.h" /* color_parse: %c styling maps CSS colours to console spans */
 #include "css.h"
+#include <stdbool.h>
 
 /* The in-band `%c` style markers the JS engine embeds in console output. Kept
  * in sync with JS_STYLE_ON/OFF in user/lib/js/interp.h (that header pulls the
@@ -48,10 +49,10 @@ static void dt_unlock(void)
  */
 enum { TAB_ELEMENTS, TAB_STYLES, TAB_CONSOLE, TAB_NETWORK, TAB_APP, N_TABS };
 typedef char dt_panel_count_matches[N_TABS == DT_PANELS ? 1 : -1]; /* keep dt_view in sync */
-static int dt_open;
+static bool dt_open;
 static int dt_tab;
 static int dt_scroll[N_TABS];
-static volatile int dt_dirty; /* main asks the worker to rebuild snapshots  */
+static volatile bool dt_dirty; /* main asks the worker to rebuild snapshots  */
 /* A devtools-local change that repaints ONLY the dock, not the whole page: a
  * logged network request or console line. The dock is an opaque right-side
  * split, so redrawing just its region is a correct frame — a chatty page
@@ -59,7 +60,7 @@ static volatile int dt_dirty; /* main asks the worker to rebuild snapshots  */
  * entire page per entry (via B->seq++), which is the lag. Set on the
  * worker/fetch threads, drained each frame by the main render loop
  * (devtools_take_paint). */
-static volatile int dt_paint_only;
+static volatile bool dt_paint_only;
 static unsigned dt_seen_mut;          /* last dom_mutation_seq the snapshot was built for */
 static unsigned dt_seen_layout;       /* last B->layout_seq (reflow generation) */
 static unsigned dt_seen_app_sig;      /* last cookie/HSTS jar signature (app tab) */
@@ -79,7 +80,7 @@ struct textblk {
   int len, cap;
   int *off;
   int nlines, off_cap; /* off[i] = start of line i in buf */
-  int line_open;       /* a line has been started since the last '\n' */
+  bool line_open;      /* a line has been started since the last '\n' */
 };
 
 static struct textblk dt_dom; /* Elements view text                          */
@@ -96,7 +97,7 @@ static int dt_sel = -1;       /* selected node's pre-order index (-1 = none)  */
  * it under dt_lock too would deadlock. Plain ints: a torn read just mis-paints
  * one frame of an overlay. dt_hl_active is written last (and read first) so
  * coords settle. */
-static volatile int dt_hl_active;
+static volatile bool dt_hl_active;
 static int dt_hl_x, dt_hl_y, dt_hl_w, dt_hl_h;
 static char dt_hl_label[80];
 
@@ -106,11 +107,11 @@ static char dt_hl_label[80];
  * hover-highlights it via dt_hl_*, and on a click commits it to the selection
  * and reveals it in the Elements tree. Volatile handoff fields, no lock — torn
  * ints just mis-pick one frame, and the worker re-reads every 30 ms tick. */
-static volatile int dt_pick;             /* picker armed                              */
+static volatile bool dt_pick;            /* picker armed                              */
 static volatile int dt_pick_hover = -1;  /* main->worker: pane offset hovered (-1 none) */
 static volatile int dt_pick_commit = -1; /* main->worker: pane offset clicked (-1 none) */
 static int dt_pick_last = -2;            /* worker: last hovered node idx (dedupe repaints) */
-static int dt_pick_reveal;               /* worker: scroll Elements to the new selection */
+static bool dt_pick_reveal;              /* worker: scroll Elements to the new selection */
 
 /* Collapsed subtrees, keyed by pre-order node index (stable while the tree is).
  * A collapsed node renders as "<tag…>…</tag>" on one line; the Elements walk
@@ -119,12 +120,12 @@ static int dt_pick_reveal;               /* worker: scroll Elements to the new s
  * (pre-order indices are page-specific), and cleared whenever the page capture
  * resets. */
 static int *dt_collapsed, dt_collapsed_n, dt_collapsed_cap;
-static int is_collapsed(int idx)
+static bool is_collapsed(int idx)
 {
   for (int i = 0; i < dt_collapsed_n; i++)
     if (dt_collapsed[i] == idx)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 static void toggle_collapsed(int idx)
 {
@@ -148,7 +149,7 @@ static void toggle_collapsed(int idx)
  * selects (and scrolls to) the next match, so it highlights on the page too. */
 static char dt_find[128];
 static struct textfield dt_find_tf;
-static int dt_find_init, dt_find_focused;
+static bool dt_find_init, dt_find_focused;
 
 /* Elements breadcrumb: the ancestor chain of the selected node (html › body ›
  * …), a clickable strip below the tree. The worker rebuilds it (DOM walk) under
@@ -166,7 +167,7 @@ static void tb_reset(struct textblk *t)
 {
   t->len = 0;
   t->nlines = 0;
-  t->line_open = 0;
+  t->line_open = false;
 }
 
 static void tb_putc(struct textblk *t, char c)
@@ -181,7 +182,7 @@ static void tb_putc(struct textblk *t, char c)
       t->off_cap = nc;
     }
     t->off[t->nlines++] = t->len;
-    t->line_open = 1;
+    t->line_open = true;
   }
   if (t->len + 1 >= t->cap) {
     int nc = t->cap ? t->cap * 2 : 1024;
@@ -196,7 +197,7 @@ static void tb_putc(struct textblk *t, char c)
    * one run spanning every following line. */
   if (c == '\n') {
     t->buf[t->len++] = '\0';
-    t->line_open = 0;
+    t->line_open = false;
     return;
   }
   t->buf[t->len++] = c;
@@ -253,12 +254,12 @@ static int con_start, con_count;
 static char *con_pend;
 static int con_pend_len, con_pend_cap;
 static int con_pend_level;
-static int con_follow = 1; /* keep the view pinned to the newest line      */
+static bool con_follow = true; /* keep the view pinned to the newest line      */
 /* Level filter: 0 = all, 1 = warnings+errors, 2 = errors only. A line shows
  * when its level (DT_LOG=0 < DT_WARN=1 < DT_ERROR=2) is >= the filter, so the
  * value is the threshold. */
 static int dt_con_filter;
-static int con_pass(int level) { return level >= dt_con_filter; }
+static bool con_pass(int level) { return level >= dt_con_filter; }
 static int con_visible_count(void)
 {
   if (dt_con_filter == 0)
@@ -283,7 +284,7 @@ static void con_clear(void)
   free(con_pend);
   con_pend = 0;
   con_pend_len = con_pend_cap = 0;
-  con_follow = 1;
+  con_follow = true;
   dt_unlock();
 }
 
@@ -296,22 +297,22 @@ static void con_clear(void)
 #define DT_FBTN_W 46 /* console filter / clear button width */
 static char dt_input[256];
 static struct textfield dt_input_tf;
-static int dt_input_init;
-static int dt_input_focused;
+static bool dt_input_init;
+static bool dt_input_focused;
 
 #define DT_HIST_MAX 32
 static char *dt_hist[DT_HIST_MAX];
 static int dt_hist_cnt; /* commands stored (<= DT_HIST_MAX)            */
 static int dt_hist_nav; /* recall cursor; == dt_hist_cnt is the new line */
 
-static volatile int dt_eval_pending; /* main -> worker: a REPL command is queued    */
-static char dt_eval_buf[256];        /* its source text                             */
+static volatile bool dt_eval_pending; /* main -> worker: a REPL command is queued    */
+static char dt_eval_buf[256];         /* its source text                             */
 
 static void dt_input_ensure(void)
 {
   if (!dt_input_init) {
     textfield_init(&dt_input_tf, dt_input, sizeof dt_input);
-    dt_input_init = 1;
+    dt_input_init = true;
   }
 }
 
@@ -530,10 +531,10 @@ void devtools_console_append(int level, const char *s, int len)
       con_pend_level = level; /* the level of the line being built */
     }
   }
-  con_follow = 1; /* a new line: jump to the bottom    */
+  con_follow = true; /* a new line: jump to the bottom    */
   dt_unlock();
   if (dt_open && dt_tab == TAB_CONSOLE)
-    dt_paint_only = 1; /* repaint only if visible */
+    dt_paint_only = true; /* repaint only if visible */
 }
 
 /* --- network ring ---------------------------------------------------------- *
@@ -769,7 +770,7 @@ static int net_push_e(const struct net_log *e)
 static void net_repaint(void)
 {
   if (dt_open && dt_tab == TAB_NETWORK)
-    dt_paint_only = 1;
+    dt_paint_only = true;
 }
 
 void devtools_net_add(const struct net_log *e)
@@ -821,20 +822,20 @@ static int dt_nd_scroll;  /* response-header scroll in the request detail */
 
 /* Case-insensitive: does `url` end with `suf`, ignoring a trailing
  * ?query/#frag? */
-static int url_ext_is(const char *url, const char *suf)
+static bool url_ext_is(const char *url, const char *suf)
 {
   if (!url)
-    return 0;
+    return false;
   int n = 0;
   while (url[n] && url[n] != '?' && url[n] != '#')
     n++;
   int m = strlen(suf);
   if (m > n)
-    return 0;
+    return false;
   for (int i = 0; i < m; i++)
     if (lower(url[n - m + i]) != lower(suf[i]))
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
 /* Resource category for the type filter — Content-Type first, URL extension as
@@ -870,7 +871,7 @@ static int net_category(const struct netinfo *ni)
   return NF_OTHER;
 }
 /* Does the raw ring slot pass the active type filter? */
-static int net_pass_slot(int slot) { return dt_net_filter == NF_ALL || net_category(&netinfo[slot]) == dt_net_filter; }
+static bool net_pass_slot(int slot) { return dt_net_filter == NF_ALL || net_category(&netinfo[slot]) == dt_net_filter; }
 static int net_visible_count(void)
 {
   if (dt_net_filter == NF_ALL)
@@ -1109,7 +1110,7 @@ void devtools_view_load(const struct dt_view *v)
 {
   dt_open = v->open;
   dt_tab = v->tab;
-  dt_pick = 0;
+  dt_pick = false;
   dt_pick_hover = -1;
   dt_pick_last = -2; /* don't carry a pick across tabs */
   for (int i = 0; i < N_TABS; i++)
@@ -1122,7 +1123,7 @@ void devtools_view_load(const struct dt_view *v)
     dt_sel = -1;
   } /* never captured: empty devtools     */
   dt_unlock();
-  dt_dirty = 1; /* re-resolve crumbs/highlight against the restored tab's live DOM */
+  dt_dirty = true; /* re-resolve crumbs/highlight against the restored tab's live DOM */
   B->seq++;
 }
 
@@ -1230,14 +1231,14 @@ static void dom_emit_text(struct textblk *t, const char *s, int maxc)
 }
 
 /* Void/self-closing elements that never get a closing tag in the tree. */
-static int dom_is_void(const char *tag)
+static bool dom_is_void(const char *tag)
 {
   static const char *const v[] = {"area", "base", "br",    "col",    "embed", "hr",  "img", "input",
                                   "link", "meta", "param", "source", "track", "wbr", 0};
   for (int i = 0; v[i]; i++)
     if (streq(tag, v[i]))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* True if `n`'s only child is a single (non-whitespace) text node — rendered
@@ -1293,16 +1294,16 @@ static void dom_emit(struct textblk *t, struct dom_node *n, int depth, int *idx,
   }
 
   const char *tag = n->tag[0] ? n->tag : "?";
-  int isvoid = dom_is_void(tag);
+  bool isvoid = dom_is_void(tag);
   /* ::before / ::after generated content shows as pseudo-element rows, like a
    * real devtools tree (not real DOM nodes, so they take no pre-order index).
    */
-  int hb = !isvoid && html_has_pseudo(n, CSS_PSEUDO_BEFORE);
-  int ha = !isvoid && html_has_pseudo(n, CSS_PSEUDO_AFTER);
+  bool hb = !isvoid && html_has_pseudo(n, CSS_PSEUDO_BEFORE);
+  bool ha = !isvoid && html_has_pseudo(n, CSS_PSEUDO_AFTER);
   struct dom_node *only = (!isvoid && !hb && !ha) ? dom_only_text(n) : 0;
-  int empty = !n->first_child && !hb && !ha;
-  int general = !isvoid && !empty && !only; /* multi-line => collapsible */
-  int collapsed = general && is_collapsed(my);
+  bool empty = !n->first_child && !hb && !ha;
+  bool general = !isvoid && !empty && !only; /* multi-line => collapsible */
+  bool collapsed = general && is_collapsed(my);
 
   if (!suppress) { /* opening tag (+ a ▸/▾ on collapsible nodes) */
     dom_record(my);
@@ -1840,7 +1841,7 @@ static int content_rows(int top); /* defined in the layout section below */
  * dt_hl_* (lock order browser_buf->dt). Worker thread only. */
 static void dt_set_highlight(struct dom_node *sn)
 {
-  dt_hl_active = 0;
+  dt_hl_active = false;
   if (!sn || sn->type == DOM_TEXT)
     return;
   int s0, e0, bx, by, bw, bh;
@@ -1868,7 +1869,7 @@ static void dt_set_highlight(struct dom_node *sn)
   uapp(dt_hl_label, &k, sizeof dt_hl_label, (unsigned)(bw < 0 ? 0 : bw));
   sapp(dt_hl_label, &k, sizeof dt_hl_label, "x");
   uapp(dt_hl_label, &k, sizeof dt_hl_label, (unsigned)(bh < 0 ? 0 : bh));
-  dt_hl_active = 1; /* set last: coords are ready */
+  dt_hl_active = true; /* set last: coords are ready */
 }
 
 /* "tag", "tag#id" or "tag.firstclass" — a brief element label for the
@@ -1943,11 +1944,11 @@ static void devtools_pick_tick(struct dom_node *root)
       if (found >= 0) {
         dt_sel = found;
         dt_tab = TAB_ELEMENTS;
-        dt_dirty = 1;
-        dt_pick_reveal = 1;
+        dt_dirty = true;
+        dt_pick_reveal = true;
       }
     }
-    dt_pick = 0;
+    dt_pick = false;
     dt_pick_hover = -1;
     dt_pick_last = -2;
     B->seq++;
@@ -1968,9 +1969,9 @@ void devtools_worker_tick(void)
   if (!dt_open)
     return;
   if (dt_eval_pending) { /* a REPL command: run it in the page ctx */
-    dt_eval_pending = 0;
+    dt_eval_pending = false;
     js_repl_run(dt_eval_buf); /* appends its echo + result to the console */
-    dt_dirty = 1;             /* the script may have mutated the DOM      */
+    dt_dirty = true;          /* the script may have mutated the DOM      */
   }
 
   struct dom_node *root = html_dom_root();
@@ -1995,8 +1996,8 @@ void devtools_worker_tick(void)
    * stale "(no document loaded)" placeholder or a previous page's tree in the
    * panel. */
   unsigned mut = dom_mutation_seq, lay = B->layout_seq, asig = app_sig();
-  int rebuild = dt_dirty || root != dt_seen_root || mut != dt_seen_mut || lay != dt_seen_layout;
-  int app_changed = asig != dt_seen_app_sig;
+  bool rebuild = dt_dirty || root != dt_seen_root || mut != dt_seen_mut || lay != dt_seen_layout;
+  bool app_changed = asig != dt_seen_app_sig;
   if (!rebuild && !app_changed)
     return;
 
@@ -2031,7 +2032,7 @@ void devtools_worker_tick(void)
     app_emit(); /* cookies/HSTS — global, no document needed */
   /* Reveal a freshly picked node: centre its row in the Elements view. */
   if (rebuild && dt_pick_reveal && root && dt_sel >= 0) {
-    dt_pick_reveal = 0;
+    dt_pick_reveal = false;
     int rows = content_rows(devtools_top());
     for (int i = 0; i < dt_dom.nlines && i < dt_dom_node_cap; i++)
       if (dt_dom_node[i] == dt_sel) {
@@ -2042,14 +2043,14 @@ void devtools_worker_tick(void)
         break;
       }
   }
-  dt_dirty = 0;
+  dt_dirty = false;
   dt_unlock();
 
   /* Selected-element highlight box (outside dt_lock; browser_range_box locks
    * blk). While picking, the hover highlight owns dt_hl_* — don't clobber it
    * here. */
   if (rebuild && !dt_pick) {
-    dt_hl_active = 0;
+    dt_hl_active = false;
     if (root && dt_sel >= 0 && (dt_tab == TAB_ELEMENTS || dt_tab == TAB_STYLES)) {
       int idx = 0;
       struct dom_node *sn = dom_node_at(root, dt_sel, &idx);
@@ -2089,8 +2090,8 @@ void devtools_toggle(void)
 {
   dt_open = !dt_open;
   if (!dt_open)
-    dt_pick = 0; /* closing the panel disarms the picker */
-  dt_dirty = 1;
+    dt_pick = false; /* closing the panel disarms the picker */
+  dt_dirty = true;
   B->seq++;
 }
 
@@ -2103,7 +2104,7 @@ int devtools_visible(void) { return dt_open; }
 int devtools_take_paint(void)
 {
   int v = dt_paint_only;
-  dt_paint_only = 0;
+  dt_paint_only = false;
   return v;
 }
 
@@ -2113,11 +2114,11 @@ int devtools_take_paint(void)
 void devtools_pick_toggle(void)
 {
   if (!dt_open)
-    dt_open = 1;
+    dt_open = true;
   dt_pick = !dt_pick;
   dt_pick_hover = -1;
   dt_pick_last = -2;
-  dt_dirty = 1; /* re-derive the highlight on disarm */
+  dt_dirty = true; /* re-derive the highlight on disarm */
   B->seq++;
 }
 int devtools_picking(void) { return dt_pick; }
@@ -2277,30 +2278,30 @@ static void draw_dom_line(int x, int y, const char *s)
   char run[260];
   int rl = 0;
   unsigned cur = DT_C_TEXT;
-  int in_tag = 0, in_quote = 0, tag_name = 0;
+  bool in_tag = false, in_quote = false, tag_name = false;
   for (int i = 0; s[i]; i++) {
     char c = s[i];
     unsigned col;
     if (in_quote) {
       col = DT_C_VALUE;
       if (c == '"')
-        in_quote = 0;
+        in_quote = false;
     } else if (c == '<') {
-      in_tag = 1;
-      tag_name = 1;
+      in_tag = true;
+      tag_name = true;
       col = DT_C_PUNCT;
     } else if (c == '>') {
-      in_tag = 0;
-      tag_name = 0;
+      in_tag = false;
+      tag_name = false;
       col = DT_C_PUNCT;
     } else if (in_tag) {
       if (c == '"') {
-        in_quote = 1;
+        in_quote = true;
         col = DT_C_VALUE;
       } else if (c == '/' || c == '=')
         col = DT_C_PUNCT;
       else if (c == ' ') {
-        tag_name = 0;
+        tag_name = false;
         col = DT_C_PUNCT;
       } else
         col = tag_name ? DT_C_TAG : DT_C_ATTR;
@@ -2460,7 +2461,7 @@ void devtools_render(void)
     /* Console/Network lines wrap: a long message spans as many rows as it needs
      * (so a full error/URL is readable), and scrolling steps by logical line.
      */
-    int isconsole = dt_tab == TAB_CONSOLE;
+    bool isconsole = dt_tab == TAB_CONSOLE;
     struct conline *ring = isconsole ? con : net;
     int cap = isconsole ? CON_MAX : NET_MAX;
     int base = isconsole ? con_start : net_start;
@@ -2490,14 +2491,14 @@ void devtools_render(void)
                     : ring[slot].level == DT_WARN            ? 0xe0c060
                     : ring[slot].level == DT_NET_PENDING_LVL ? 0x8a93a0
                                                              : 0xcdd3de;
-      int iserr = ring[slot].level == DT_ERROR;
+      bool iserr = ring[slot].level == DT_ERROR;
       const char *s = ring[slot].text;
       struct crun *runs = isconsole ? ring[slot].runs : 0;
       int nruns = isconsole ? ring[slot].nruns : 0;
       int len = 0, off = 0;
       while (s && s[len])
         len++;
-      int netsel = (!isconsole && i == dt_net_sel);
+      bool netsel = (!isconsole && i == dt_net_sel);
       do {
         int n = 0;
         while (off + n < len && n < max - 1) {
@@ -2523,7 +2524,7 @@ void devtools_render(void)
         break;
       int y = ct + r * ROW_H;
       if (dt_tab == TAB_ELEMENTS) {
-        int sel = (idx < dt_dom_node_cap && dt_dom_node[idx] == dt_sel);
+        bool sel = (idx < dt_dom_node_cap && dt_dom_node[idx] == dt_sel);
         if (sel)
           gfx_fill_rect(left, y, cw, ROW_H, 0x094771);
         tb_line(&dt_dom, idx, line, max);
@@ -2576,7 +2577,7 @@ void devtools_render(void)
     int iy = BH - DT_INPUT_H;
     if (!dt_find_init) {
       textfield_init(&dt_find_tf, dt_find, sizeof dt_find);
-      dt_find_init = 1;
+      dt_find_init = true;
     }
     gfx_fill_rect(left, iy, w, DT_INPUT_H, 0x14171c);
     gfx_fill_rect(left, iy, w, 1, 0x000000);
@@ -2795,7 +2796,7 @@ static void dt_find_next(int fresh)
     if (sc < 0)
       sc = 0;
     dt_scroll[TAB_ELEMENTS] = sc;
-    dt_dirty = 1;
+    dt_dirty = true;
     B->seq++;
   }
 }
@@ -2806,7 +2807,7 @@ int devtools_handle_click(int mx, int my)
     return 0;
   int left = devtools_left(), top = devtools_top();
   if (mx < left || my < top) {
-    dt_input_focused = dt_find_focused = 0;
+    dt_input_focused = dt_find_focused = false;
     return 0;
   } /* not ours: blur */
 
@@ -2823,8 +2824,8 @@ int devtools_handle_click(int mx, int my)
       if (button_hit(left + tab_x(i), top, tab_w(i), DT_HDR, mx, my)) {
         dt_tab = i;
         dt_input_focused = (i == TAB_CONSOLE); /* the Console tab focuses its REPL */
-        dt_find_focused = 0;
-        dt_dirty = 1; /* refresh Styles/Application on reveal */
+        dt_find_focused = false;
+        dt_dirty = true; /* refresh Styles/Application on reveal */
         B->seq++;
         return 1;
       }
@@ -2836,7 +2837,7 @@ int devtools_handle_click(int mx, int my)
     int ftx = BW - 2 * DT_FBTN_W, fbx = BW - DT_FBTN_W;
     if (button_hit(ftx, iy + 1, DT_FBTN_W - 2, DT_INPUT_H - 2, mx, my)) {
       dt_con_filter = (dt_con_filter + 1) % 3;
-      con_follow = 1;
+      con_follow = true;
       B->seq++;
       return 1;
     }
@@ -2847,7 +2848,7 @@ int devtools_handle_click(int mx, int my)
     }
     dt_input_ensure();
     textfield_click(&dt_input_tf, mx, my, left + 20, iy + 2, (ftx - 4) - (left + 20), DT_INPUT_H - 4);
-    dt_input_focused = 1;
+    dt_input_focused = true;
     B->seq++;
     return 1;
   }
@@ -2856,10 +2857,10 @@ int devtools_handle_click(int mx, int my)
     int iy = BH - DT_INPUT_H, w = BW - left;
     if (!dt_find_init) {
       textfield_init(&dt_find_tf, dt_find, sizeof dt_find);
-      dt_find_init = 1;
+      dt_find_init = true;
     }
     textfield_click(&dt_find_tf, mx, my, left + 20, iy + 2, w - 24, DT_INPUT_H - 4);
-    dt_find_focused = 1;
+    dt_find_focused = true;
     B->seq++;
     return 1;
   }
@@ -2880,7 +2881,7 @@ int devtools_handle_click(int mx, int my)
     dt_unlock();
     if (hit >= 0) {
       dt_sel = hit;
-      dt_dirty = 1;
+      dt_dirty = true;
       B->seq++;
     }
     return 1;
@@ -2935,7 +2936,7 @@ int devtools_handle_click(int mx, int my)
     int row = dt_scroll[dt_tab] + (my - ct) / ROW_H;
     int cell = (mx - (left + 6)) / GLYPH_W; /* monospace column of the click */
     dt_lock();
-    int ok = row >= 0 && row < dt_dom.nlines && row < dt_dom_node_cap;
+    bool ok = row >= 0 && row < dt_dom.nlines && row < dt_dom_node_cap;
     int node = ok ? dt_dom_node[row] : -1;
     int tri = -1; /* cell of this row's ▸/▾, or -1 */
     if (ok) {
@@ -2960,7 +2961,7 @@ int devtools_handle_click(int mx, int my)
       } /* hit the triangle */
       else
         dt_sel = node;
-      dt_dirty = 1;
+      dt_dirty = true;
       B->seq++;
     }
   }
@@ -3039,11 +3040,11 @@ int devtools_handle_key(char c, int mods)
   if (dt_open && dt_tab == TAB_ELEMENTS && dt_find_focused) { /* Elements find box */
     if (!dt_find_init) {
       textfield_init(&dt_find_tf, dt_find, sizeof dt_find);
-      dt_find_init = 1;
+      dt_find_init = true;
     }
     unsigned char uc = (unsigned char)c;
     if (uc == 27) {
-      dt_find_focused = 0;
+      dt_find_focused = false;
       B->seq++;
       return 1;
     } /* Esc: blur */
@@ -3063,7 +3064,7 @@ int devtools_handle_key(char c, int mods)
   dt_input_ensure();
   unsigned char uc = (unsigned char)c;
   if (uc == 27) {
-    dt_input_focused = 0;
+    dt_input_focused = false;
     B->seq++;
     return 1;
   } /* blur, keep the panel */
@@ -3076,9 +3077,9 @@ int devtools_handle_key(char c, int mods)
         n++;
       }
       dt_eval_buf[n] = '\0';
-      dt_eval_pending = 1;
+      dt_eval_pending = true;
       textfield_set(&dt_input_tf, "");
-      con_follow = 1;
+      con_follow = true;
       B->seq++;
     }
     return 1;
@@ -3090,16 +3091,16 @@ int devtools_handle_key(char c, int mods)
    * DOM.) */
   if (uc == KEY_UP) {
     dt_hist_recall(-1);
-    dt_paint_only = 1;
+    dt_paint_only = true;
     return 1;
   }
   if (uc == KEY_DOWN) {
     dt_hist_recall(+1);
-    dt_paint_only = 1;
+    dt_paint_only = true;
     return 1;
   }
   if (textfield_key(&dt_input_tf, c)) {
-    dt_paint_only = 1;
+    dt_paint_only = true;
     return 1;
   }
   return 0; /* not an edit key: fall through */

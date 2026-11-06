@@ -17,6 +17,7 @@
 #include "gfx.h"
 #include "mime.h"
 #include "owos.h"
+#include <stdbool.h>
 
 static int W = 560, H = 360; /* client size; grows/shrinks on resize */
 #define MAXLINES 200
@@ -34,7 +35,7 @@ static int linelen[MAXLINES];
 static int nlines = 1;
 static int curx, cury, top_line;
 static char fname[FNAME_MAX];
-static int has_name, modified;
+static bool has_name, modified;
 
 static int prompt_mode;
 static char prompt_buf[FNAME_MAX];
@@ -84,7 +85,7 @@ static void scopy(char *d, const char *s, int max)
 
 static void set_status(const char *s) { status_set(&sbar, s); }
 
-static int has_high; /* 1 if the buffer holds any byte >= 0x80 (-> UTF-8) */
+static bool has_high; /* true if the buffer holds any byte >= 0x80 (-> UTF-8) */
 
 static void ed_clear(void)
 {
@@ -92,8 +93,8 @@ static void ed_clear(void)
   linelen[0] = 0;
   lines[0][0] = 0;
   curx = cury = top_line = 0;
-  modified = 0;
-  has_high = 0;
+  modified = false;
+  has_high = false;
   sel_active = 0;
 }
 
@@ -171,7 +172,7 @@ static void sel_delete(void)
   curx = x0;
   cury = y0;
   sel_active = 0;
-  modified = 1;
+  modified = true;
 }
 
 /* ------------------------------------------------------------- buffer edits */
@@ -187,9 +188,9 @@ static void ed_insert(char c)
   lines[cury][curx] = c;
   linelen[cury]++;
   curx++;
-  modified = 1;
+  modified = true;
   if ((unsigned char)c >= 0x80)
-    has_high = 1;
+    has_high = true;
 }
 
 static void ed_newline(void)
@@ -211,7 +212,7 @@ static void ed_newline(void)
   nlines++;
   cury++;
   curx = 0;
-  modified = 1;
+  modified = true;
 }
 
 static void ed_backspace(void)
@@ -225,7 +226,7 @@ static void ed_backspace(void)
       lines[cury][j] = lines[cury][j + 1];
     linelen[cury]--;
     curx--;
-    modified = 1;
+    modified = true;
   } else if (cury > 0) {
     int prev = cury - 1, pl = linelen[prev], cl = linelen[cury];
     if (pl + cl >= MAXCOLS)
@@ -241,7 +242,7 @@ static void ed_backspace(void)
     nlines--;
     cury = prev;
     curx = pl;
-    modified = 1;
+    modified = true;
   }
 }
 
@@ -255,7 +256,7 @@ static void ed_delete(void)
     for (int j = curx; j < linelen[cury] - 1; j++)
       lines[cury][j] = lines[cury][j + 1];
     linelen[cury]--;
-    modified = 1;
+    modified = true;
   } else if (cury < nlines - 1) {
     cury++;
     curx = 0;
@@ -294,15 +295,15 @@ static void ed_load(const char *name)
     } else if (ch != '\r' && col < MAXCOLS - 1) {
       lines[li][col++] = ch;
       if ((unsigned char)ch >= 0x80)
-        has_high = 1;
+        has_high = true;
     }
   }
   linelen[li] = col;
   nlines = li + 1;
   curx = cury = top_line = 0;
   scopy(fname, name, sizeof fname);
-  has_name = 1;
-  modified = 0;
+  has_name = true;
+  modified = false;
   set_status("opened");
 }
 
@@ -317,8 +318,8 @@ static void ed_save(const char *name)
   }
   if (writefile(name, io_buf, p) == 0) {
     scopy(fname, name, sizeof fname);
-    has_name = 1;
-    modified = 0;
+    has_name = true;
+    modified = false;
     set_status("saved");
   } else {
     set_status("save failed");
@@ -352,7 +353,7 @@ static void file_action(int item)
     if (!confirm_discard())
       break;
     ed_clear();
-    has_name = 0;
+    has_name = false;
     fname[0] = 0;
     set_status("new file");
     break;

@@ -76,12 +76,12 @@ enum { ENC_NONE = 0, ENC_ZLIB = 1, ENC_BR = 2 };
 #define H3_HOSTS_MAX 32
 static char h3_hosts[H3_HOSTS_MAX][URL_HOST_MAX];
 static int h3_nhosts;
-static int h3_known(const char *host)
+static bool h3_known(const char *host)
 {
   for (int i = 0; i < h3_nhosts; i++)
     if (streq(h3_hosts[i], host))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 static void h3_remember(const char *host)
 {
@@ -111,7 +111,8 @@ static int memrd_fn(void *c)
 }
 struct memwr {
   unsigned char *buf;
-  int cap, len, oom;
+  int cap, len;
+  bool oom;
 };
 static int memwr_fn(void *c, const unsigned char *p, unsigned n)
 {
@@ -119,7 +120,7 @@ static int memwr_fn(void *c, const unsigned char *p, unsigned n)
   /* Bomb guard: refuse a write that pushes the output past the cap. Unsigned
    * math throughout so the size can't wrap negative near the ceiling. */
   if (n > (unsigned)DECOMP_MAX || (unsigned)w->len + n > (unsigned)DECOMP_MAX) {
-    w->oom = 1;
+    w->oom = true;
     return -1;
   }
   if (w->len + (int)n > w->cap) {
@@ -129,7 +130,7 @@ static int memwr_fn(void *c, const unsigned char *p, unsigned n)
       nc = (unsigned)DECOMP_MAX;
     unsigned char *nb = realloc(w->buf, nc);
     if (!nb) {
-      w->oom = 1;
+      w->oom = true;
       return -1;
     }
     w->buf = nb;
@@ -237,7 +238,7 @@ static const char *fetch_error_message(int status)
   }
 }
 
-static int mime_is(const char *ctype, const char *want)
+static bool mime_is(const char *ctype, const char *want)
 {
   int n = 0;
   while (ctype[n] && ctype[n] != ';' && ctype[n] != ' ' && ctype[n] != '\t')
@@ -246,14 +247,14 @@ static int mime_is(const char *ctype, const char *want)
   while (want[w])
     w++;
   if (n != w)
-    return 0;
+    return false;
   for (int i = 0; i < n; i++)
     if (lower(ctype[i]) != lower(want[i]))
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
-static int is_html_type(const char *ctype)
+static bool is_html_type(const char *ctype)
 {
   return mime_is(ctype, "text/html") || mime_is(ctype, "application/xhtml+xml");
 }
@@ -265,7 +266,7 @@ static int is_html_type(const char *ctype)
  * — so whatever consumes it (a plain copy, or the inflate decoder) sees only
  * the payload. Returns the byte (0..255) or -1 at end of body. */
 struct bodysrc {
-  int chunked, have_len, done, need_crlf;
+  bool chunked, have_len, done, need_crlf;
   unsigned remaining; /* bytes left in this chunk / the content-length   */
 };
 
@@ -281,13 +282,14 @@ static int body_src(void *ctx)
         if (c == '\r')
           rgetc(); /* the \n                          */
         else if (c < 0) {
-          b->done = 1;
+          b->done = true;
           return -1;
         }
-        b->need_crlf = 0;
+        b->need_crlf = false;
       }
       unsigned sz = 0;
-      int c, any = 0;
+      int c;
+      bool any = false;
       while ((c = rgetc()) >= 0 && c != '\r' && c != ';') {
         int d;
         if (c >= '0' && c <= '9')
@@ -299,20 +301,20 @@ static int body_src(void *ctx)
         else
           break;
         sz = sz * 16 + (unsigned)d;
-        any = 1;
+        any = true;
       }
       while (c >= 0 && c != '\n')
         c = rgetc();
       if (!any || sz == 0) {
-        b->done = 1;
+        b->done = true;
         return -1;
       }
       b->remaining = sz;
-      b->need_crlf = 1;
+      b->need_crlf = true;
     }
     int c = rgetc();
     if (c < 0) {
-      b->done = 1;
+      b->done = true;
       return -1;
     }
     b->remaining--;
@@ -320,12 +322,12 @@ static int body_src(void *ctx)
   }
   if (b->have_len) {
     if (b->remaining == 0) {
-      b->done = 1;
+      b->done = true;
       return -1;
     }
     int c = rgetc();
     if (c < 0) {
-      b->done = 1;
+      b->done = true;
       return -1;
     }
     b->remaining--;
@@ -333,7 +335,7 @@ static int body_src(void *ctx)
   }
   int c = rgetc();
   if (c < 0) {
-    b->done = 1;
+    b->done = true;
     return -1;
   }
   return c;
@@ -352,22 +354,22 @@ static int body_src(void *ctx)
  * Content-Type at all would otherwise dump raw bytes into the page. An empty
  * Content-Type with no telltale extension is treated as HTML, the common case.
  */
-static int url_is_download_ext(const char *url);
-static int is_download(const char *url)
+static bool url_is_download_ext(const char *url);
+static bool is_download(const char *url)
 {
   if (B->cdisp_attach)
-    return 1;
+    return true;
   if (url_is_download_ext(url))
-    return 1;
+    return true;
   if (B->pg->ctype[0] == '\0')
-    return 0;
+    return false;
   if (is_html_type(B->pg->ctype))
-    return 0;
+    return false;
   if (starts_ci(B->pg->ctype, "text/"))
-    return 0;
+    return false;
   if (starts_ci(B->pg->ctype, "image/"))
-    return 0;
-  return 1;
+    return false;
+  return true;
 }
 
 /* Copy the last path component of `in` into `out`, dropping any directory
@@ -390,11 +392,11 @@ static void basename_of(const char *in, char *out, int cap)
  * Content-Type — e.g. an .mp3 served as text/plain, which otherwise filled the
  * page with raw bytes. Image extensions are deliberately absent: PNGs are shown
  * inline, a decision left to the Content-Type. */
-static int url_is_download_ext(const char *url)
+static bool url_is_download_ext(const char *url)
 {
   struct purl u;
   if (!parse_url(url, &u))
-    return 0;
+    return false;
   char base[128];
   basename_of(u.path, base, sizeof base);
   const char *ext = 0;
@@ -402,7 +404,7 @@ static int url_is_download_ext(const char *url)
     if (*q == '.')
       ext = q + 1;
   if (!ext || !*ext)
-    return 0;
+    return false;
   static const char *const bin_ext[] = {
       "mp3", "wav", "flac", "ogg", "oga",  "opus", "m4a",  "aac", "wma",  "mid",   "mp4",  "mkv", "webm", "avi",
       "mov", "wmv", "flv",  "m4v", "mpg",  "mpeg", "zip",  "gz",  "tgz",  "bz2",   "xz",   "7z",  "rar",  "tar",
@@ -410,8 +412,8 @@ static int url_is_download_ext(const char *url)
       "dmg", "deb", "rpm",  "apk", "msi",  "so",   "ttf",  "otf", "woff", "woff2", 0};
   for (int i = 0; bin_ext[i]; i++)
     if (streq_ci(ext, bin_ext[i]))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* Choose a filename for the download: the Content-Disposition name if any, else
@@ -510,7 +512,7 @@ static void pick_dl_path(const char *url, char *path, int cap)
 
 /* Report a finished download: switch to a text pane on `url` and show the saved
  * path (and byte count) or a failure notice. Shared by the 1.1 and h2 paths. */
-static void download_finished(const char *url, const char *path, int wrote, int fail)
+static void download_finished(const char *url, const char *path, int wrote, bool fail)
 {
   B->pg->mode = MODE_TEXT;
   {
@@ -577,7 +579,7 @@ static void ext_css_add(const char *url)
 /* True if "stylesheet" appears as a whitespace-delimited token of the rel value
  * within [q,end) — so rel="not-a-stylesheet" or "stylesheet-alt" doesn't match.
  * A trailing '"' (from a quoted rel="stylesheet") is treated as a separator. */
-static int rel_has_stylesheet(const char *q, const char *end)
+static bool rel_has_stylesheet(const char *q, const char *end)
 {
   for (const char *s = q; s < end;) {
     while (s < end && (*s == ' ' || *s == '\t' || *s == '"'))
@@ -586,9 +588,9 @@ static int rel_has_stylesheet(const char *q, const char *end)
     while (s < end && *s != ' ' && *s != '\t' && *s != '"')
       s++;
     if (s - tok == 10 && starts_ci(tok, "stylesheet"))
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 /* Parse one Link: header value (RFC 8288): "<url>; rel=stylesheet, <url2>; …".
@@ -620,7 +622,7 @@ static void parse_link_header(const char *v, const char *base)
         p++;
     }
 
-    int is_sheet = 0; /* scan params (after the URL) */
+    bool is_sheet = false; /* scan params (after the URL) */
     for (const char *q = p; q < eend; q++) {
       if ((q == p || q[-1] == ';' || q[-1] == ' ') && starts_ci(q, "rel")) {
         const char *r = q + 3;
@@ -634,7 +636,7 @@ static void parse_link_header(const char *v, const char *base)
           while (rv < eend && *rv != ';')
             rv++;
           if (rel_has_stylesheet(r, rv))
-            is_sheet = 1;
+            is_sheet = true;
         }
       }
     }
@@ -657,10 +659,11 @@ static int hdr_status(const char *hdr)
     p++; /* skip the "HTTP/x.y" token */
   while (*p == ' ')
     p++;
-  int s = 0, any = 0;
+  int s = 0;
+  bool any = false;
   while (*p >= '0' && *p <= '9') {
     s = s * 10 + (*p++ - '0');
-    any = 1;
+    any = true;
   }
   return any ? s : 0;
 }
@@ -728,8 +731,8 @@ static unsigned g_doc_t0;
  * transport's request builder. Lowercased, so one string serves h1.1/h2/h3. */
 static char g_doc_cond[512];
 
-static int parse_response(const char *hdr, const char *host, const char *full_url, char *loc, int loc_cap, int *chunked,
-                          int *have_len, unsigned *content_len, int *enc_gz)
+static int parse_response(const char *hdr, const char *host, const char *full_url, char *loc, int loc_cap,
+                          bool *chunked, bool *have_len, unsigned *content_len, int *enc_gz)
 {
   {
     int k = 0;
@@ -737,8 +740,8 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
       g_doc_hdr[k] = hdr[k];
     g_doc_hdr[k] = '\0';
   }
-  *chunked = 0;
-  *have_len = 0;
+  *chunked = false;
+  *have_len = false;
   *enc_gz = 0;
   *content_len = 0;
   B->nosniff = false;
@@ -751,7 +754,7 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
 
   const char *te = http_headers_get(&H, "transfer-encoding");
   if (te && http_header_has_token(te, "chunked"))
-    *chunked = 1;
+    *chunked = true;
 
   const char *ce = http_headers_get(&H, "content-encoding");
   if (ce && http_header_has_token(ce, "br"))
@@ -765,7 +768,7 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
     unsigned x = http_parse_uint(cl, &ok);
     if (ok) {
       *content_len = x;
-      *have_len = 1;
+      *have_len = true;
     }
   }
 
@@ -799,7 +802,7 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
       f++;
       while (*f == ' ')
         f++;
-      int quoted = (*f == '"');
+      bool quoted = (*f == '"');
       if (quoted)
         f++;
       int k = 0;
@@ -887,10 +890,11 @@ static int route_body(const char *full_url, int status, int allow_dl)
   if (allow_dl && status >= 200 && status < 300 && is_download(full_url)) {
     char path[256];
     pick_dl_path(full_url, path, sizeof path);
-    int wrote = -1, fail = 0;
+    int wrote = -1;
+    bool fail = false;
     if (stream_begin(path) == 0) {
       if (B->pg->raw_len > 0 && stream_write((const unsigned char *)B->pg->raw, B->pg->raw_len) < 0)
-        fail = 1;
+        fail = true;
       wrote = stream_end();
     }
     download_finished(full_url, path, wrote, fail);
@@ -918,7 +922,7 @@ static int h2_headers_cb(void *ctx, const char *block, int len)
     early_collect(block);
     return 0;
   } /* 103 etc. */
-  int chunked, have_len;
+  bool chunked, have_len;
   unsigned clen;
   h->status = parse_response(block, h->host, h->full_url, h->loc, h->loc_cap, &chunked, &have_len, &clen, &h->enc);
   return 0;
@@ -1053,7 +1057,8 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc
   if (st <= 0)
     return st; /* QUIC failed -> caller falls back */
 
-  int chunked, have_len, enc;
+  bool chunked, have_len;
+  int enc;
   unsigned clen;
   int status = parse_response(hdrbuf, u->host, full_url, loc, loc_cap, &chunked, &have_len, &clen, &enc);
   raw_decode(enc);
@@ -1064,7 +1069,7 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc
  * revalidation that came back 304 reuses the stored body (rendered as 200); a
  * fresh, non-download 200 is stored (already content-decoded, in B->pg->raw).
  * Returns the status do_fetch should act on. */
-static int doc_cache_finish(const char *full_url, long now, int revalidating, int status)
+static int doc_cache_finish(const char *full_url, long now, bool revalidating, int status)
 {
   if (revalidating && status == 304) {
     unsigned char *rb = 0;
@@ -1088,7 +1093,7 @@ static int doc_cache_finish(const char *full_url, long now, int revalidating, in
 static int http_txn(const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl,
                     const char *method, const unsigned char *body, int blen, const char *bctype)
 {
-  int is_get = streq(method, "GET");
+  bool is_get = streq(method, "GET");
   g_doc_t0 = msec(); /* for the devtools Network duration of this response */
   loc[0] = '\0';
   B->pg->ctype[0] = '\0';
@@ -1104,7 +1109,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
    * hit needs no re-decode. Downloads (route_body empties raw) are never
    * cached. */
   long now = (long)rtc_epoch();
-  int revalidating = 0;
+  bool revalidating = false;
   g_doc_cond[0] = '\0';
   if (is_get) { /* only GET is cacheable / revalidatable */
     unsigned char *cbody = 0;
@@ -1248,12 +1253,13 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
     }
   }
 
-  int chunked, have_len, enc_gz;
+  bool chunked, have_len;
+  int enc_gz;
   unsigned content_len;
   int status = parse_response(hdr, u->host, full_url, loc, loc_cap, &chunked, &have_len, &content_len, &enc_gz);
   early_apply(full_url); /* merge any 103 Early-Hints stylesheets into ext_css */
 
-  struct bodysrc bs = {chunked, have_len, 0, 0, have_len ? content_len : 0};
+  struct bodysrc bs = {chunked, have_len, false, false, have_len ? content_len : 0};
 
   /* Read the whole (framed) body into B->pg->raw, then the common pipeline
    * decodes Content-Encoding and routes render-vs-download. */
@@ -1283,7 +1289,7 @@ static void render_raw(const char *url)
    * servers). But X-Content-Type-Options: nosniff forbids that guess: with it
    * set, render as HTML ONLY when the server explicitly declared an HTML type,
    * otherwise fall through to plain text. */
-  int as_html = is_html_type(B->pg->ctype) || (B->pg->ctype[0] == '\0' && !B->nosniff);
+  bool as_html = is_html_type(B->pg->ctype) || (B->pg->ctype[0] == '\0' && !B->nosniff);
   if (as_html) {
     B->pg->mode = MODE_HTML;
     html_to_text(url, css_batch);
@@ -1436,7 +1442,7 @@ void do_fetch(void)
    * and render through the same path as a fetched page (no sub-resource fetch).
    */
   if (starts_ci(url, "file:") || starts_ci(url, "data:")) {
-    int data = starts_ci(url, "data:");
+    bool data = starts_ci(url, "data:");
     B->pg->ctype[0] = '\0';
     B->dl_name[0] = '\0';
     B->cdisp_attach = 0;
@@ -1465,7 +1471,7 @@ void do_fetch(void)
    * to https like a modern browser. Remember it was implicit so a host that
    * can't do TLS (or a plain dev server on a custom port) falls back to http.
    */
-  int implicit_scheme = 0;
+  bool implicit_scheme = false;
   if (!starts_ci(url, "http://") && !starts_ci(url, "https://")) {
     char tmp[URL_MAX];
     int t = 0;
@@ -1473,7 +1479,7 @@ void do_fetch(void)
     sapp(tmp, &t, sizeof tmp, url);
     n = 0;
     sapp(url, &n, sizeof url, tmp);
-    implicit_scheme = 1;
+    implicit_scheme = true;
   }
 
   /* Log the document as in-flight up front, so a slow or failing navigation
@@ -1522,7 +1528,7 @@ void do_fetch(void)
         sapp(tmp, &t, sizeof tmp, url + 8); /* past "https://" */
         n = 0;
         sapp(url, &n, sizeof url, tmp);
-        implicit_scheme = 0;
+        implicit_scheme = false;
         continue;
       }
       const char *msg = fetch_error_message(st);

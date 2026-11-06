@@ -34,7 +34,7 @@ static uint32_t ram_sectors;
 #define BLK_CACHE_LINES 32
 struct cache_line {
   uint32_t lba;
-  uint8_t valid;
+  bool valid;
   uint8_t data[512];
 };
 static struct cache_line cache[BLK_CACHE_LINES];
@@ -43,24 +43,24 @@ static spinlock_t blk_lock;
 static void cache_clear(void)
 {
   for (int i = 0; i < BLK_CACHE_LINES; i++)
-    cache[i].valid = 0;
+    cache[i].valid = false;
 }
 
 static struct cache_line *cache_slot(uint32_t lba) { return &cache[lba % BLK_CACHE_LINES]; }
 
-static int blk_range_valid(uint32_t lba, uint32_t count)
+static bool blk_range_valid(uint32_t lba, uint32_t count)
 {
   uint32_t sectors = blk_sectors();
   return count != 0 && lba < sectors && count <= sectors - lba;
 }
 
-static int cache_read(uint32_t lba, void *buf)
+static bool cache_read(uint32_t lba, void *buf)
 {
   struct cache_line *c = cache_slot(lba);
   if (!c->valid || c->lba != lba)
-    return 0;
+    return false;
   memcpy(buf, c->data, sizeof c->data);
-  return 1;
+  return true;
 }
 
 static void cache_fill(uint32_t lba, const void *buf)
@@ -68,7 +68,7 @@ static void cache_fill(uint32_t lba, const void *buf)
   struct cache_line *c = cache_slot(lba);
   c->lba = lba;
   memcpy(c->data, buf, sizeof c->data);
-  c->valid = 1;
+  c->valid = true;
 }
 
 static void cache_invalidate(uint32_t lba, uint32_t count)
@@ -76,7 +76,7 @@ static void cache_invalidate(uint32_t lba, uint32_t count)
   for (int i = 0; i < BLK_CACHE_LINES; i++) {
     struct cache_line *c = &cache[i];
     if (c->valid && c->lba >= lba && c->lba - lba < count)
-      c->valid = 0;
+      c->valid = false;
   }
 }
 
@@ -102,7 +102,7 @@ void blk_init(void)
   con_putc('\n');
 }
 
-int blk_present(void) { return backend != BK_NONE; }
+bool blk_present(void) { return backend != BK_NONE; }
 
 const char *blk_backend(void)
 {
@@ -120,7 +120,7 @@ const char *blk_backend(void)
   }
 }
 
-int blk_is_ide(void) { return backend == BK_IDE; }
+bool blk_is_ide(void) { return backend == BK_IDE; }
 
 int blk_use_ram(void)
 {
@@ -172,7 +172,7 @@ static const struct cand cands[] = {
 #define NCAND (int)(sizeof(cands) / sizeof(cands[0]))
 
 /* Present, and not the disk owofs itself booted from. */
-static int cand_listable(const struct cand *c) { return c->present() && c->id != backend; }
+static bool cand_listable(const struct cand *c) { return c->present() && c->id != backend; }
 
 /* Enumerate present removable devices (the /dev contents + the Files app list).
  */

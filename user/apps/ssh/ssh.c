@@ -30,6 +30,7 @@
 #include "crypto.h"
 #include "owos.h"
 #include "resolve.h"
+#include <stdbool.h>
 
 /* ---- SSH-2 message numbers (RFC 4253 / 4252 / 4254) ---------------------- */
 #define MSG_DISCONNECT 1
@@ -71,7 +72,7 @@
 /* ---- session state ------------------------------------------------------- */
 
 static int sock = -1;
-static int sock_dead;
+static bool sock_dead;
 
 static unsigned char rxbuf[49152]; /* raw bytes pulled off the socket       */
 static int rxlen;
@@ -85,7 +86,8 @@ static unsigned char sealbuf[MAXPKT]; /* send GCM plaintext (MUST be distinct fr
                                        * and corrupt the message). */
 static unsigned char txbuf[MAXPKT + 64];
 
-static int send_encrypted, recv_encrypted;
+static bool recv_encrypted;
+static bool send_encrypted;
 static unsigned char send_key[16], recv_key[16];
 static unsigned char send_iv[12], recv_iv[12];
 
@@ -140,7 +142,7 @@ static int sock_send_all(const unsigned char *b, int n)
   while (off < n) {
     int w = net_send(sock, b + off, n - off);
     if (w <= 0) {
-      sock_dead = 1;
+      sock_dead = true;
       return -1;
     }
     off += w;
@@ -161,7 +163,7 @@ static int rx_pump(void)
   }
   if (n == 0)
     return 0;
-  sock_dead = 1;
+  sock_dead = true;
   return -1;
 }
 
@@ -382,7 +384,7 @@ static int read_ident(void)
 
 /* Substring search over a byte span (for sanity-checking the server's offers).
  */
-static int span_has(const unsigned char *hay, int n, const char *needle)
+static bool span_has(const unsigned char *hay, int n, const char *needle)
 {
   int m = strlen(needle);
   for (int i = 0; i + m <= n; i++) {
@@ -390,9 +392,9 @@ static int span_has(const unsigned char *hay, int n, const char *needle)
     while (k < m && hay[i + k] == (unsigned char)needle[k])
       k++;
     if (k == m)
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 static void build_kexinit(void)
@@ -577,13 +579,13 @@ static int do_kex(const char *cident)
   unsigned char nk = MSG_NEWKEYS;
   if (send_packet(&nk, 1) != 0)
     return -1;
-  send_encrypted = 1;
+  send_encrypted = true;
 
   if (recv_msg(&plen, 15000) != MSG_NEWKEYS) {
     say("ssh: expected NEWKEYS\n");
     return -1;
   }
-  recv_encrypted = 1;
+  recv_encrypted = true;
   return 0;
 }
 
@@ -870,21 +872,21 @@ static void interactive(const char *host)
 {
   unsigned char obuf[2048];
   int olen = 0; /* keystrokes pending to the server */
-  int closed = 0;
+  bool closed = false;
 
   for (;;) {
-    int did = 0;
+    bool did = false;
 
     /* 1. stdin -> outgoing buffer (translated to pty byte sequences). */
     char kb[256];
     int kn = read_nb(0, kb, sizeof kb);
     if (kn < 0) {
-      closed = 1;
+      closed = true;
     } /* terminal closed our stdin */
     else if (kn > 0) {
       for (int i = 0; i < kn && olen + 4 <= (int)sizeof obuf; i++)
         olen += map_key((unsigned char)kb[i], obuf + olen);
-      did = 1;
+      did = true;
     }
     if (olen > 0 && !closed) {
       int sent = send_channel_data(obuf, olen);
@@ -893,7 +895,7 @@ static void interactive(const char *host)
       if (sent > 0) {
         memmove(obuf, obuf + sent, (unsigned)(olen - sent));
         olen -= sent;
-        did = 1;
+        did = true;
       }
     }
 
@@ -903,7 +905,7 @@ static void interactive(const char *host)
     int plen;
     int r;
     while ((r = parse_one(&plen)) == 1) {
-      did = 1;
+      did = true;
       int t = payload[0];
       if (t == MSG_CHANNEL_DATA) {
         int p = 1;
@@ -934,7 +936,7 @@ static void interactive(const char *host)
         wb(cl, &cp, MSG_CHANNEL_CLOSE);
         w32(cl, &cp, remote_chan);
         send_packet(cl, cp);
-        closed = 1;
+        closed = true;
       } else if (t == MSG_CHANNEL_REQUEST) {
         /* e.g. "exit-status"/"exit-signal": informational; if want_reply
          * is set we'd owe a reply, but standard sshd doesn't ask. */
@@ -949,7 +951,7 @@ static void interactive(const char *host)
         }
       } else if (t == MSG_DISCONNECT) {
         print_disconnect(plen);
-        closed = 1;
+        closed = true;
       }
     }
     if (r < 0)

@@ -145,7 +145,8 @@ static bool attr_is(const char *s, int n, const char *lit)
  * isn't a well-formed integer. */
 static long parse_long(const char *s, int n, bool *ok)
 {
-  int i = 0, neg = 0;
+  int i = 0;
+  bool neg = false;
   long r = 0;
   if (i < n && (s[i] == '+' || s[i] == '-')) {
     neg = (s[i] == '-');

@@ -8,6 +8,7 @@
 
 #include "vmmouse.h"
 #include "vmware.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Backdoor command numbers (ECX). */
@@ -33,10 +34,10 @@
 #define BTN_RIGHT 0x10
 #define BTN_MIDDLE 0x08
 
-static int enabled;
+static bool enabled;
 static int bound_x, bound_y;
 
-int vmmouse_active(void) { return enabled; }
+bool vmmouse_active(void) { return enabled; }
 
 /* Rescale absolute coordinates onto a new screen size (after a resolution
  * change). The device keeps reporting in [0,0xFFFF]; only the target box moves.
@@ -76,32 +77,33 @@ int vmmouse_init(int max_x, int max_y)
   r.ebx = CMD_REQUEST_ABSOLUTE;
   vmware_send(ABSPOINTER_COMMAND, &r);
 
-  enabled = 1;
+  enabled = true;
   return 0;
 }
 
-int vmmouse_poll(int *x, int *y, int *btn, int *dz)
+bool vmmouse_poll(int *x, int *y, int *btn, int *dz)
 {
   if (!enabled)
-    return 0;
+    return false;
 
   struct vmware_regs r = {0};
   r.ebx = 0;
   vmware_send(ABSPOINTER_STATUS, &r);
   if (r.eax == STATUS_ERROR) { /* device fell over: stop using it        */
-    enabled = 0;
-    return 0;
+    enabled = false;
+    return false;
   }
 
   uint32_t words = r.eax & 0xFFFFu;
   if (words < 4)
-    return 0;
+    return false;
 
   /* Drain whole 4-dword packets; the last one read wins for position/buttons,
    * wheel deltas accumulate. x and y come in holding the current cursor
    * position (mouse.c seeds them), which we update in place — so a relative
    * packet adds to it rather than starting from zero. */
-  int wheel = 0, updated = 0;
+  int wheel = 0;
+  bool updated = false;
   int px = *x, py = *y;
   while (words >= 4) {
     r.ebx = 4;
@@ -137,7 +139,7 @@ int vmmouse_poll(int *x, int *y, int *btn, int *dz)
       py = 0;
     else if (py > bound_y)
       py = bound_y;
-    updated = 1;
+    updated = true;
     words -= 4;
   }
   *x = px;

@@ -11,6 +11,7 @@
 #include "paging.h"
 #include "pci.h"
 #include "pmm.h"
+#include <stdbool.h>
 #include <stddef.h>
 
 /* DISPI index/data ports and register indices. */
@@ -35,9 +36,9 @@ static uint32_t fb_w, fb_h;
 static uint32_t fb_pitch;  /* pixels per row                                */
 static uint32_t fb_pixels; /* visible pixels in the current mode (pitch*h)   */
 static uint32_t fb_cap;    /* pixels mapped/allocated (>= fb_pixels)         */
-static int active;
-static int single;   /* 1 when there is no back buffer (draw direct)   */
-static int can_mode; /* 1 = DISPI path: the mode can be reprogrammed   */
+static bool active;
+static bool single;   /* 1 when there is no back buffer (draw direct)   */
+static bool can_mode; /* 1 = DISPI path: the mode can be reprogrammed   */
 
 /* Modes for runtime switching (DISPI only). Buffers are sized for the largest at
  * init, so a switch is just a reprogram. Keep the largest entry last. */
@@ -85,7 +86,7 @@ static inline void fill32(uint32_t *d, uint32_t v, int n)
 static int dirty_x0, dirty_y0, dirty_x1, dirty_y1;
 
 /* Intersect (x,y,w,h) with the screen into out[], returns 0 if empty. */
-static int clip(int x, int y, int w, int h, int *ox, int *oy, int *ow, int *oh)
+static bool clip(int x, int y, int w, int h, int *ox, int *oy, int *ow, int *oh)
 {
   int x0 = x < 0 ? 0 : x;
   int y0 = y < 0 ? 0 : y;
@@ -96,12 +97,12 @@ static int clip(int x, int y, int w, int h, int *ox, int *oy, int *ow, int *oh)
   if (y1 > (int)fb_h)
     y1 = (int)fb_h;
   if (x0 >= x1 || y0 >= y1)
-    return 0;
+    return false;
   *ox = x0;
   *oy = y0;
   *ow = x1 - x0;
   *oh = y1 - y0;
-  return 1;
+  return true;
 }
 
 /* Grow the damage box to include the (already clipped) rectangle. */
@@ -218,12 +219,12 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
   fb_pitch = pitch_px;
   fb_pixels = pixels;
   fb_cap = pixels; /* a bootloader framebuffer is fixed-size        */
-  can_mode = 0;    /* cannot reprogram a GOP/adopted framebuffer    */
+  can_mode = false;    /* cannot reprogram a GOP/adopted framebuffer    */
 
   enable_wc();        /* write-combining on the framebuffer          */
   alloc_backbuffer(); /* off-screen buffer in cached RAM              */
 
-  active = 1;
+  active = true;
   fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
   fb_present();
   return 0;
@@ -237,10 +238,10 @@ static void alloc_backbuffer(void)
   uint32_t bb = pmm_alloc_contig(bytes);
   if (bb && paging_identity_map(bb, bytes) == 0) {
     fb = (uint32_t *)(uintptr_t)bb;
-    single = 0;
+    single = false;
   } else {
     fb = front; /* last resort: draw directly to VRAM           */
-    single = 1;
+    single = true;
   }
 }
 
@@ -289,8 +290,8 @@ int fb_init(uint32_t want_w, uint32_t want_h)
   enable_wc();
   alloc_backbuffer();
 
-  active = 1;
-  can_mode = 1; /* DISPI: the mode can be reprogrammed at runtime */
+  active = true;
+  can_mode = true; /* DISPI: the mode can be reprogrammed at runtime */
   fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
   fb_present();
   return 0;
@@ -315,10 +316,10 @@ int fb_set_mode(uint32_t w, uint32_t h)
   if (!active || !can_mode)
     return -1;
 
-  int known = 0;
+  bool known = false;
   for (int i = 0; i < FB_NMODES; i++)
     if (fb_modes[i].w == w && fb_modes[i].h == h) {
-      known = 1;
+      known = true;
       break;
     }
   if (!known || w * h > fb_cap)
@@ -353,7 +354,7 @@ static void copy_region(int x, int y, int w, int h)
 {
   if (single)
     return;
-  int dim = brightness < FB_BRIGHT_MAX;
+  bool dim = brightness < FB_BRIGHT_MAX;
   for (int row = y; row < y + h; row++) {
     const uint32_t *s = fb + (uint32_t)row * fb_pitch + x;
     uint32_t *d = front + (uint32_t)row * fb_pitch + x;
@@ -498,7 +499,7 @@ void fb_glyph(int x, int y, unsigned char ch, uint32_t fg, uint32_t bg)
   int cx, cy, cw, chh;
   if (!clip(x, y, FONT_W, FONT_H, &cx, &cy, &cw, &chh))
     return;
-  int transparent = (bg & FB_TRANSPARENT) != 0;
+  bool transparent = (bg & FB_TRANSPARENT) != 0;
   for (int row = 0; row < chh; row++) {
     int sy = cy + row;
     const unsigned char *cov = font_aa[ch][sy - y];

@@ -25,6 +25,7 @@
  */
 
 #include "owos.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 /* ------------------------------------------------------------- LE accessors */
@@ -105,8 +106,8 @@ static const uint8_t spnego_neg_init[] = {
  * SMB2 FileId's first 8 bytes carry the slot index; the rest is a fixed magic.
  */
 struct smb_handle {
-  int used;
-  int is_dir;
+  bool used;
+  bool is_dir;
   char path[128]; /* owofs path, e.g. "/bin/hello"; "/" = root */
   uint32_t size;
   uint32_t mtime; /* owofs packed mtime (0 = unknown) */
@@ -119,7 +120,7 @@ struct smb_conn {
   uint8_t tx[SMB_MSG_MAX];
   uint64_t session_id;
   struct smb_handle handles[SMB_MAX_HANDLES];
-  int closed;
+  bool closed;
 };
 
 /* Read exactly n bytes into buf; returns 0 on success, -1 on EOF/error. */
@@ -293,10 +294,10 @@ static const uint8_t *find_ntlmssp(const uint8_t *buf, uint32_t len)
   if (len < 12)
     return NULL;
   for (uint32_t i = 0; i + 12 <= len; i++) {
-    int hit = 1;
+    bool hit = true;
     for (int j = 0; j < 8; j++)
       if (buf[i + j] != ntlmssp_sig[j]) {
-        hit = 0;
+        hit = false;
         break;
       }
     if (hit)
@@ -509,8 +510,8 @@ static int handle_alloc(struct smb_conn *s)
   for (int i = 0; i < SMB_MAX_HANDLES; i++)
     if (!s->handles[i].used) {
       struct smb_handle *h = &s->handles[i];
-      h->used = 1;
-      h->is_dir = 0;
+      h->used = true;
+      h->is_dir = false;
       h->path[0] = 0;
       h->size = 0;
       h->enum_pos = 0;
@@ -557,28 +558,28 @@ static uint32_t smb_to_path(const uint8_t *src, uint32_t bytelen, char *dst, uin
 
 /* The virtual k-th entry of directory `dirpath`: 0=".", 1="..", then each
  * owofs child (files and subdirectories). */
-static int dir_entry_at(const char *dirpath, int idx, char *name, int *is_dir, uint32_t *size, uint32_t *mtime)
+static bool dir_entry_at(const char *dirpath, int idx, char *name, bool *is_dir, uint32_t *size, uint32_t *mtime)
 {
   *mtime = 0;
   if (idx == 0) {
     name[0] = '.';
     name[1] = 0;
-    *is_dir = 1;
+    *is_dir = true;
     *size = 0;
-    return 1;
+    return true;
   }
   if (idx == 1) {
     name[0] = '.';
     name[1] = '.';
     name[2] = 0;
-    *is_dir = 1;
+    *is_dir = true;
     *size = 0;
-    return 1;
+    return true;
   }
   struct dirent_u de;
   int r = readdir(dirpath, idx - 2, &de);
   if (r != 1)
-    return 0;
+    return false;
   int i = 0;
   for (; de.name[i] && i < 63; i++)
     name[i] = de.name[i];
@@ -598,7 +599,7 @@ static int dir_entry_at(const char *dirpath, int idx, char *name, int *is_dir, u
   struct statinfo cst;
   if (stat(child, &cst) == 0)
     *mtime = cst.mtime;
-  return 1;
+  return true;
 }
 
 /* ------------------------------------------------------------- CREATE */
@@ -619,7 +620,7 @@ static int do_create(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
   struct statinfo st;
   if (stat(path, &st) != 0)
     return do_error(s, req, STATUS_OBJECT_NAME_NOTFOUND);
-  int is_dir = st.is_dir;
+  bool is_dir = st.is_dir;
   uint32_t size = st.size;
 
   int idx = handle_alloc(s);
@@ -658,7 +659,7 @@ static int do_create(struct smb_conn *s, const uint8_t *req, uint32_t reqlen)
 /* Build one directory-info entry; supports FileBothDirectoryInformation (3) and
  * FileIdBothDirectoryInformation (37). Returns bytes written (8-byte padded).
  */
-static uint32_t build_dirent(uint8_t *p, int cls, const char *name, int is_dir, uint32_t size, uint32_t mtime,
+static uint32_t build_dirent(uint8_t *p, int cls, const char *name, bool is_dir, uint32_t size, uint32_t mtime,
                              int is_last)
 {
   uint64_t ft = owofs_filetime(mtime);
@@ -703,7 +704,7 @@ static int do_query_directory(struct smb_conn *s, const uint8_t *req, uint32_t r
   int produced = 0;
   for (;;) {
     char nm[64];
-    int is_dir;
+    bool is_dir;
     uint32_t sz, mt; /* >= owofs FS_NAME_LEN */
     if (!dir_entry_at(h->path, h->enum_pos, nm, &is_dir, &sz, &mt))
       break;
@@ -774,7 +775,7 @@ static int do_close(struct smb_conn *s, const uint8_t *req)
     size = h->is_dir ? 0 : h->size;
     attrs = h->is_dir ? 0x10 : 0x80;
     mtime = h->mtime;
-    h->used = 0;
+    h->used = false;
   }
   uint64_t ft = owofs_filetime(mtime);
   build_header(s, req, STATUS_SUCCESS);
@@ -794,7 +795,7 @@ static int do_close(struct smb_conn *s, const uint8_t *req)
 
 /* ------------------------------------------------------------- QUERY_INFO */
 
-static uint32_t put_basic_info(uint8_t *p, int is_dir, uint64_t ft)
+static uint32_t put_basic_info(uint8_t *p, bool is_dir, uint64_t ft)
 {
   put64(p + 0, ft);                    /* CreationTime */
   put64(p + 8, ft);                    /* LastAccessTime */
@@ -805,7 +806,7 @@ static uint32_t put_basic_info(uint8_t *p, int is_dir, uint64_t ft)
   return 40;
 }
 
-static uint32_t put_standard_info(uint8_t *p, int is_dir, uint32_t size)
+static uint32_t put_standard_info(uint8_t *p, bool is_dir, uint32_t size)
 {
   put64(p + 0, size);                /* AllocationSize */
   put64(p + 8, size);                /* EndOfFile */
@@ -828,7 +829,7 @@ static int do_query_info(struct smb_conn *s, const uint8_t *req, uint32_t reqlen
 
   if (itype == 0x01) { /* FILE info */
     struct smb_handle *h = handle_get(s, body + 24);
-    int is_dir = h ? h->is_dir : 1;
+    bool is_dir = h ? h->is_dir : true;
     uint32_t size = h ? h->size : 0;
     const char *nm = h ? h->path : "";
     uint64_t ft = owofs_filetime(h ? h->mtime : 0);
@@ -958,9 +959,9 @@ static void serve(int fd)
   struct smb_conn *s = &conn;
   s->fd = fd;
   s->session_id = 0;
-  s->closed = 0;
+  s->closed = false;
   for (int i = 0; i < SMB_MAX_HANDLES; i++)
-    s->handles[i].used = 0;
+    s->handles[i].used = false;
 
   for (;;) {
     int n = read_msg(s);

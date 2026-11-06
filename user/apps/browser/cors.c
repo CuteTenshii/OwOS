@@ -71,7 +71,7 @@ static void media_type(const char *ct, char *out, int cap)
 
 /* A CORS-safelisted *request* header name (always allowed without a preflight).
  */
-static int header_is_safelisted(const char *name, int len)
+static bool header_is_safelisted(const char *name, int len)
 {
   static const char *const safe[] = {"accept", "accept-language", "content-language", "content-type", 0};
   for (int i = 0; safe[i]; i++) {
@@ -79,9 +79,9 @@ static int header_is_safelisted(const char *name, int len)
     for (; j < len && safe[i][j] && lower(name[j]) == safe[i][j]; j++)
       ;
     if (j == len && !safe[i][j])
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 /* Call `fn(name, namelen, ctx)` for each "Name: value\r\n" line of an author
@@ -159,10 +159,10 @@ void cors_request_header_names(const char *author_hdrs, char *out, int cap)
 
 /* Is `tok` (case-insensitive) a member of the comma-separated list `list`?
  * `wildcard_ok` lets a literal "*" entry match anything. */
-static int list_has(const char *list, const char *tok, int wildcard_ok)
+static bool list_has(const char *list, const char *tok, bool wildcard_ok)
 {
   if (!list)
-    return 0;
+    return false;
   const char *p = list;
   while (*p) {
     while (*p == ' ' || *p == ',' || *p == '\t')
@@ -175,18 +175,18 @@ static int list_has(const char *list, const char *tok, int wildcard_ok)
       e--;
     int n = (int)(e - s);
     if (n == 1 && s[0] == '*' && wildcard_ok)
-      return 1;
+      return true;
     if (n > 0) {
       int j = 0;
       for (; j < n && tok[j] && lower(s[j]) == lower(tok[j]); j++)
         ;
       if (j == n && !tok[j])
-        return 1;
+        return true;
     }
     if (*p == ',')
       p++;
   }
-  return 0;
+  return false;
 }
 
 static void put_reason(char *reason, int rcap, const char *s)
@@ -230,7 +230,7 @@ int cors_check_response(const struct http_headers *H, const char *origin, int wi
 
 struct unmatched_hdr {
   const struct http_headers *H;
-  int with_creds;
+  bool with_creds;
   const char *bad;
   int badlen;
 };

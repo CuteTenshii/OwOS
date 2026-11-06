@@ -132,7 +132,7 @@ static uint8_t netmask[4] = {255, 255, 255, 0};
 static struct arp_entry {
   uint8_t ip[4];
   uint8_t mac[6];
-  int valid;
+  bool valid;
 } arp_cache[ARP_CACHE];
 
 /* IPs we have an outstanding ARP request for. A reply is only trusted if it
@@ -141,7 +141,7 @@ static struct arp_entry {
 #define ARP_PENDING 8
 static struct {
   uint8_t ip[4];
-  int valid;
+  bool valid;
 } arp_pending[ARP_PENDING];
 
 static void arp_pending_add(const uint8_t ip[4])
@@ -152,23 +152,23 @@ static void arp_pending_add(const uint8_t ip[4])
   for (int i = 0; i < ARP_PENDING; i++)
     if (!arp_pending[i].valid) {
       memcpy(arp_pending[i].ip, ip, 4);
-      arp_pending[i].valid = 1;
+      arp_pending[i].valid = true;
       return;
     }
   memcpy(arp_pending[0].ip, ip, 4); /* all in use: evict the oldest slot */
-  arp_pending[0].valid = 1;
+  arp_pending[0].valid = true;
 }
 
 /* Consume a pending request for `ip`; returns 1 if one existed (a reply is then
  * solicited and may be cached). */
-static int arp_pending_take(const uint8_t ip[4])
+static bool arp_pending_take(const uint8_t ip[4])
 {
   for (int i = 0; i < ARP_PENDING; i++)
     if (arp_pending[i].valid && memcmp(arp_pending[i].ip, ip, 4) == 0) {
-      arp_pending[i].valid = 0;
-      return 1;
+      arp_pending[i].valid = false;
+      return true;
     }
-  return 0;
+  return false;
 }
 
 /* Apply an IPv4 config (SYS_IFCONFIG, from /bin/dhcpcd). Any arg may be NULL.
@@ -184,9 +184,9 @@ void net_ifconfig(const uint8_t ip[4], const uint8_t mask[4], const uint8_t gw[4
   if (dns)
     memcpy(dns_ip, dns, 4);
   for (int i = 0; i < ARP_CACHE; i++)
-    arp_cache[i].valid = 0;
+    arp_cache[i].valid = false;
   for (int i = 0; i < ARP_PENDING; i++)
-    arp_pending[i].valid = 0;
+    arp_pending[i].valid = false;
 }
 
 /* Reply slots written by the RX interrupt, polled by the command context. */
@@ -224,15 +224,15 @@ static void eth_send(const uint8_t dst[6], uint16_t type, const uint8_t *payload
 
 /* ---------------------------------------------------------------------- ARP */
 
-static int arp_lookup(const uint8_t ip[4], uint8_t out[6])
+static bool arp_lookup(const uint8_t ip[4], uint8_t out[6])
 {
   for (int i = 0; i < ARP_CACHE; i++) {
     if (arp_cache[i].valid && memcmp(arp_cache[i].ip, ip, 4) == 0) {
       memcpy(out, arp_cache[i].mac, 6);
-      return 1;
+      return true;
     }
   }
-  return 0;
+  return false;
 }
 
 static void arp_cache_put(const uint8_t ip[4], const uint8_t m[6])
@@ -250,7 +250,7 @@ static void arp_cache_put(const uint8_t ip[4], const uint8_t m[6])
     slot = 0;
   memcpy(arp_cache[slot].ip, ip, 4);
   memcpy(arp_cache[slot].mac, m, 6);
-  arp_cache[slot].valid = 1;
+  arp_cache[slot].valid = true;
 }
 
 static void arp_build(uint8_t *pkt, uint16_t oper, const uint8_t tha[6], const uint8_t tpa[4])
@@ -298,10 +298,10 @@ static void arp_recv(const uint8_t *p, uint32_t len)
 }
 
 /* Resolve an IP to a MAC, sending requests and waiting on the RX interrupt. */
-static int arp_resolve(const uint8_t ip[4], uint8_t out[6])
+static bool arp_resolve(const uint8_t ip[4], uint8_t out[6])
 {
   if (arp_lookup(ip, out))
-    return 1;
+    return true;
   /* In RX-interrupt context (e.g. a passive-open SYN|ACK whose peer MAC isn't
    * cached) we must not spin: blocking with hlt inside the NIC IRQ stalls RX
    * and, because the wait re-enables interrupts, lets the same line re-enter
@@ -309,7 +309,7 @@ static int arp_resolve(const uint8_t ip[4], uint8_t out[6])
    * later IRQ and the peer's TCP retransmit then resolves. */
   if (net_rx_depth > 0) {
     arp_request(ip);
-    return 0;
+    return false;
   }
   for (int tries = 0; tries < 4; tries++) {
     arp_request(ip);
@@ -317,24 +317,24 @@ static int arp_resolve(const uint8_t ip[4], uint8_t out[6])
     while (timer_ticks() < deadline) {
       __asm__ volatile("" ::: "memory");
       if (arp_lookup(ip, out))
-        return 1;
+        return true;
       if (sched_intr_pending()) /* Ctrl+C: give up resolving */
-        return 0;
+        return false;
       /* sti before hlt: this resolve can run in syscall context (a
        * a program connecting through net_sock_*), where the int
        * 0x80 gate left IF=0 — a bare hlt would halt the CPU forever. */
       __asm__ volatile("sti\n\thlt");
     }
   }
-  return 0;
+  return false;
 }
 
-static int same_subnet(const uint8_t ip[4])
+static bool same_subnet(const uint8_t ip[4])
 {
   for (int i = 0; i < 4; i++)
     if ((ip[i] & netmask[i]) != (my_ip[i] & netmask[i]))
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
 /* Pick the next hop (host directly, or the gateway) and resolve its MAC. */
@@ -401,13 +401,13 @@ const uint8_t *net_my_ip(void) { return my_ip; }
  * config was applied). 0.0.0.0 is never a valid host address, so a non-zero
  * my_ip is an exact "configured" test -- callers use it to distinguish "link
  * up" from "actually has an address" instead of conflating the two. */
-int net_have_ip(void) { return my_ip[0] || my_ip[1] || my_ip[2] || my_ip[3]; }
+bool net_have_ip(void) { return my_ip[0] || my_ip[1] || my_ip[2] || my_ip[3]; }
 
 /* --------------------------------------------------------------------- ICMP */
 
 /* Client-socket RX delivery (defined with the usock layer below). */
-static int usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t dport, const uint8_t *data,
-                             uint32_t len);
+static bool usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t dport, const uint8_t *data,
+                              uint32_t len);
 static void usock_icmp_deliver(const uint8_t *msg, uint32_t len);
 static void usock_raw_deliver(const uint8_t *frame, uint32_t len);
 
@@ -520,16 +520,16 @@ static void udp_recv(const uint8_t src[4], const uint8_t *p, uint32_t len)
 /* Is `dst` an address we should accept a packet for: our unicast, limited or
  * directed broadcast, or multicast? While unconfigured (no lease yet) accept
  * everything so the DHCP path still works. */
-static int ip_dst_ok(const uint8_t dst[4])
+static bool ip_dst_ok(const uint8_t dst[4])
 {
   if (!net_have_ip())
-    return 1;
+    return true;
   if (memcmp(dst, my_ip, 4) == 0)
-    return 1;
+    return true;
   if (dst[0] == 255 && dst[1] == 255 && dst[2] == 255 && dst[3] == 255)
-    return 1; /* limited broadcast */
+    return true; /* limited broadcast */
   if (dst[0] >= 224 && dst[0] <= 239)
-    return 1;                       /* multicast */
+    return true;                    /* multicast */
   int net_match = 1, host_ones = 1; /* directed subnet broadcast */
   for (int i = 0; i < 4; i++) {
     if ((dst[i] & netmask[i]) != (my_ip[i] & netmask[i]))
@@ -675,7 +675,8 @@ static void usock_raw_deliver(const uint8_t *frame, uint32_t len)
 /* Deliver an inbound UDP datagram to a matching socket (by local port), storing
  * the sender's IP/port alongside the payload for recvfrom. Called from the RX
  * IRQ; returns 1 if a socket claimed it. */
-static int usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t dport, const uint8_t *data, uint32_t len)
+static bool usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t dport, const uint8_t *data,
+                              uint32_t len)
 {
   for (int i = 0; i < NET_SOCK_MAX; i++) {
     struct usock *s = &usocks[i];
@@ -683,7 +684,7 @@ static int usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t d
     if (s->used && s->proto == SK_UDP && s->lport == dport && peer_match) {
       uint32_t next = (s->dg_tail + 1) % SOCK_DGRING;
       if (next == s->dg_head)
-        return 1; /* ring full: drop, but the port is ours */
+        return true; /* ring full: drop, but the port is ours */
       if (len > SOCK_DGRAM)
         len = SOCK_DGRAM;
       for (uint32_t k = 0; k < len; k++)
@@ -693,10 +694,10 @@ static int usock_udp_deliver(const uint8_t src_ip[4], uint16_t sport, uint16_t d
         s->dg_src_ip[s->dg_tail][k] = src_ip[k];
       s->dg_src_port[s->dg_tail] = sport;
       s->dg_tail = next;
-      return 1;
+      return true;
     }
   }
-  return 0;
+  return false;
 }
 
 /* Deliver an inbound ICMP message to a raw ICMP socket (the program matches the

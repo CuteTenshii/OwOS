@@ -24,11 +24,13 @@
  * needed — bytes come through the controller's Buffer Data Port register.
  */
 
-#include "sd.h"
+#include <stdbool.h>
+
 #include "console.h"
 #include "kstring.h"
 #include "paging.h"
 #include "pci.h"
+#include "sd.h"
 
 /* ------------------------------------------------------- controller registers
  */
@@ -110,9 +112,9 @@
  */
 
 static volatile uint8_t *mmio; /* BAR0, mapped uncached                   */
-static int found;
-static int high_capacity; /* CCS: block-addressed (SDHC/SDXC)        */
-static uint16_t rca;      /* card's relative address                 */
+static bool found;
+static bool high_capacity; /* CCS: block-addressed (SDHC/SDXC)        */
+static uint16_t rca;       /* card's relative address                 */
 static uint32_t cap_sectors;
 static char model[24];
 
@@ -186,7 +188,7 @@ static int sd_wait(uint16_t want)
 /* Issue one SD command. `flags` is the response shape | data/CRC/index bits;
  * `data` adds the data-present bit (CMD17/CMD24). Returns 0 once Command
  * Complete is seen, -1 on inhibit/timeout/error. */
-static int sd_command(uint8_t idx, uint32_t arg, uint16_t flags, int data)
+static int sd_command(uint8_t idx, uint32_t arg, uint16_t flags, bool data)
 {
   /* Don't issue while the CMD line is busy; also wait on DAT for data
    * transfers and R1b (busy) responses. */
@@ -248,22 +250,22 @@ static int card_init(void)
 {
   uint32_t r[4];
 
-  if (sd_command(0, 0, CF_RESP_NONE, 0)) /* GO_IDLE_STATE            */
+  if (sd_command(0, 0, CF_RESP_NONE, false)) /* GO_IDLE_STATE            */
     return -1;
 
   /* CMD8: check-pattern 0xAA at 2.7-3.6 V. An R7 echo means an SD v2 card. */
   int v2 = 0;
-  if (sd_command(8, 0x1AA, RESP_R7, 0) == 0 && (rd32(R_RESPONSE) & 0xFF) == 0xAA)
+  if (sd_command(8, 0x1AA, RESP_R7, false) == 0 && (rd32(R_RESPONSE) & 0xFF) == 0xAA)
     v2 = 1;
 
   /* ACMD41: repeatedly ask the card to power up, until OCR bit 31 is set.
    * HCS (bit 30 of the arg) advertises host high-capacity support on v2. */
   uint32_t ocr = 0;
   for (int t = 0; t < 2000; t++) {
-    if (sd_command(55, 0, RESP_R1, 0)) /* APP_CMD, no RCA yet      */
+    if (sd_command(55, 0, RESP_R1, false)) /* APP_CMD, no RCA yet      */
       return -1;
     uint32_t arg = 0x00FF8000u | (v2 ? 0x40000000u : 0u);
-    if (sd_command(41, arg, RESP_R3, 0)) /* SD_SEND_OP_COND          */
+    if (sd_command(41, arg, RESP_R3, false)) /* SD_SEND_OP_COND          */
       return -1;
     ocr = rd32(R_RESPONSE);
     if (ocr & 0x80000000u) /* power-up complete        */
@@ -272,15 +274,15 @@ static int card_init(void)
   }
   if (!(ocr & 0x80000000u))
     return -1;
-  high_capacity = (ocr & 0x40000000u) ? 1 : 0; /* CCS                      */
+  high_capacity = (ocr & 0x40000000u) != 0; /* CCS */
 
-  if (sd_command(2, 0, RESP_R2, 0)) /* ALL_SEND_CID             */
+  if (sd_command(2, 0, RESP_R2, false)) /* ALL_SEND_CID             */
     return -1;
-  if (sd_command(3, 0, RESP_R6, 0)) /* SEND_RELATIVE_ADDR       */
+  if (sd_command(3, 0, RESP_R6, false)) /* SEND_RELATIVE_ADDR       */
     return -1;
   rca = (uint16_t)(rd32(R_RESPONSE) >> 16);
 
-  if (sd_command(9, (uint32_t)rca << 16, RESP_R2, 0)) /* SEND_CSD             */
+  if (sd_command(9, (uint32_t)rca << 16, RESP_R2, false)) /* SEND_CSD             */
     return -1;
   r[0] = rd32(R_RESPONSE);
   r[1] = rd32(R_RESPONSE + 4);
@@ -288,12 +290,12 @@ static int card_init(void)
   r[3] = rd32(R_RESPONSE + 12);
   parse_csd(r);
 
-  if (sd_command(7, (uint32_t)rca << 16, RESP_R1B, 0)) /* SELECT_CARD         */
+  if (sd_command(7, (uint32_t)rca << 16, RESP_R1B, false)) /* SELECT_CARD         */
     return -1;
 
   /* Fix the block length at 512 (a no-op for block-addressed SDHC, required
    * for byte-addressed SDSC). */
-  if (sd_command(16, 512, RESP_R1, 0)) /* SET_BLOCKLEN             */
+  if (sd_command(16, 512, RESP_R1, false)) /* SET_BLOCKLEN             */
     return -1;
   return 0;
 }
@@ -302,7 +304,7 @@ static int card_init(void)
 
 static int card_bring_up(void); /* defined below sd_init's helpers */
 
-static int do_transfer(uint32_t lba, void *buf, int write)
+static int do_transfer(uint32_t lba, void *buf, bool write)
 {
   /* Lazily bring up a card that was hot-inserted after boot (or re-inserted).
    * card_bring_up() is a no-op-fail if the slot is empty, so a yanked card just
@@ -322,7 +324,7 @@ static int do_transfer(uint32_t lba, void *buf, int write)
   wr16(R_XFER_MODE, write ? 0 : TM_READ); /* single block, PIO        */
 
   uint8_t cmd = write ? 24 : 17; /* WRITE/READ_SINGLE_BLOCK  */
-  if (sd_command(cmd, arg, RESP_R1, 1))
+  if (sd_command(cmd, arg, RESP_R1, true))
     return -1;
 
   /* Stream 512 bytes through the Buffer Data Port a dword at a time, going via
@@ -347,8 +349,8 @@ static int do_transfer(uint32_t lba, void *buf, int write)
   return sd_wait(IS_XFER_DONE);
 }
 
-int sd_read_sector(uint32_t lba, void *buf) { return do_transfer(lba, buf, 0); }
-int sd_write_sector(uint32_t lba, const void *buf) { return do_transfer(lba, (void *)buf, 1); }
+int sd_read_sector(uint32_t lba, void *buf) { return do_transfer(lba, buf, false); }
+int sd_write_sector(uint32_t lba, const void *buf) { return do_transfer(lba, (void *)buf, true); }
 
 /* Live presence: read the SDHCI card-detect bit each call (cheap MMIO read,
  * safe to poll per frame), so the file explorer's Devices list reflects a card
@@ -360,8 +362,8 @@ int sd_present(void)
   if (!mmio) /* no SDHCI controller at all            */
     return 0;
   if (rd32(R_PRESENT) & PS_CARD_PRESENT)
-    return 1; /* a card is physically in the slot      */
-  found = 0;  /* slot empty -> drop any cached card     */
+    return 1;    /* a card is physically in the slot      */
+  found = false; /* slot empty -> drop any cached card     */
   return 0;
 }
 uint32_t sd_sectors(void) { return cap_sectors; }
@@ -416,7 +418,7 @@ static int card_bring_up(void)
     return -1;
 
   sd_set_clock(25000); /* full-speed transfers     */
-  found = 1;
+  found = true;
   if (high_capacity)
     memcpy(model, "SDHC/SDXC card", sizeof("SDHC/SDXC card"));
   else

@@ -12,6 +12,7 @@
 #include "opt.h"
 #include "owos.h"
 #include "resolve.h"
+#include <stdbool.h>
 
 /* Internet checksum (RFC 1071): ones-complement sum of 16-bit big-endian words.
  */
@@ -31,11 +32,11 @@ static unsigned short icmp_csum(const unsigned char *d, int n)
  * the summary and exit cleanly instead of being terminated by the default
  * action; a blocking net_recv also returns NET_EINTR when the signal is
  * pending. */
-static volatile int g_interrupted;
+static volatile bool g_interrupted;
 static void on_sigint(int s)
 {
   (void)s;
-  g_interrupted = 1;
+  g_interrupted = true;
 }
 
 int main(int argc, char **argv)
@@ -76,7 +77,8 @@ int main(int argc, char **argv)
   printf("PING %s : 56 data bytes\n", host);
 
   int id = (int)(msec() & 0xFFFF);
-  int sent = 0, recv = 0, interrupted = 0;
+  bool interrupted = false;
+  int sent = 0, recv = 0;
 
   for (int seq = 1; count == 0 || seq <= count; seq++) {
     unsigned char pkt[8 + 56];
@@ -101,18 +103,18 @@ int main(int argc, char **argv)
     }
     sent++;
 
-    int got = 0;
+    bool got = false;
     for (;;) { /* wait for our reply      */
       unsigned char rb[1500];
       int n = net_recv(h, rb, (int)sizeof rb);
       if (n == NET_EINTR) {
-        interrupted = 1;
+        interrupted = true;
         break;
       }
       if (n <= 0)
         break; /* timeout                 */
       if (n >= 8 && rb[0] == 0 && (((int)rb[4] << 8) | rb[5]) == id) {
-        got = 1;
+        got = true;
         break;
       }
       /* not our reply; keep waiting */
@@ -128,7 +130,7 @@ int main(int argc, char **argv)
       printf("request timeout for icmp_seq=%u\n", (unsigned)seq);
     }
     if (g_interrupted) {
-      interrupted = 1;
+      interrupted = true;
       break;
     }
     if (count == 0 || seq < count)

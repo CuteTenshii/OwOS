@@ -13,6 +13,7 @@
 #include "irq.h"
 #include "synaptics.h"
 #include "vmmouse.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 #define PS2_DATA 0x60
@@ -41,8 +42,8 @@ static int bound_x, bound_y;
 
 static uint8_t packet[4];
 static uint8_t cycle;
-static int wheel_mode; /* 1 once IntelliMouse 4-byte mode is on  */
-static int syn_mode;   /* 1 once a Synaptics TouchPad took over   */
+static bool wheel_mode; /* 1 once IntelliMouse 4-byte mode is on  */
+static bool syn_mode;   /* 1 once a Synaptics TouchPad took over   */
 
 /* Pointer-speed scale applied to PS/2 relative deltas: a level 1..5 (3 = the
  * native 1x), each mapping to a num/den factor. A fractional residual carries

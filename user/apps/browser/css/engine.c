@@ -14,6 +14,7 @@
 #include "../css.h"
 #include "owos.h"
 #include "sibling.h"
+#include <stdbool.h>
 
 #define MAX_CLS 6
 #define MAX_STEPS 6
@@ -80,7 +81,7 @@ struct sel_step {
   struct pseudo pc[MAX_PC];
   int npc;
   int pseudo_el; /* PE_* — a ::pseudo-element; never matches a normal box */
-  int child;     /* combinator to the step on the right is '>' */
+  bool child;    /* combinator to the step on the right is '>' */
 };
 enum { PE_NONE = 0, PE_BEFORE = CSS_PSEUDO_BEFORE, PE_AFTER = CSS_PSEUDO_AFTER, PE_OTHER = 3 };
 
@@ -121,7 +122,7 @@ struct media_feature {
   int val;
 }; /* val = px (width/height only) */
 struct media_cond {
-  int negate; /* a leading `not` */
+  bool negate; /* a leading `not` */
   int mtype;
   struct media_feature feat[MAX_FEAT];
   int nfeat;
@@ -147,7 +148,8 @@ struct css_rule {
   struct selector sel;
   struct css_style decl;
   struct media_query media;
-  int spec, order, important;
+  int spec, order;
+  bool important;
   unsigned char has_var; /* a declaration uses var() -> resolve at fold */
   char raw[CSS_RAW_MAX]; /* authored declaration text (for devtools) */
   unsigned visit;        /* collect_candidates de-dup stamp (multi-key) */
@@ -193,14 +195,14 @@ struct css_sheet {
   int gen;
   struct css_face *faces;
   struct css_keyframes *keyframes; /* @keyframes blocks (name -> stops) */
-  int has_pseudo_el;               /* set once any ::before/::after rule is pushed */
+  bool has_pseudo_el;              /* set once any ::before/::after rule is pushed */
   const char *cur_base;            /* base URL for faces added by the in-progress css_add */
   /* Rule index (rebuilt lazily when `gen` changes; see ensure_index). Buckets
    * hold css_idx entries so one rule can be filed under several keys; every
    * entry lives in exactly one bucket chain, so teardown just walks them. */
   struct css_idx *id_b[CSS_NBUCK], *cls_b[CSS_NBUCK], *tag_b[CSS_NBUCK], *uni;
   int idx_gen;
-  int idx_failed;
+  bool idx_failed;
   struct css_rule **cand;
   int cand_cap;
   struct css_rule **match;
@@ -218,7 +220,7 @@ static struct {
 static int g_nvars;
 static css_sheet *g_vars_sheet;
 static int g_vars_gen = -1;
-static int str_uses_var(const char *s);
+static bool str_uses_var(const char *s);
 static void resolve_vars(const char *in, int inlen, char *out, int *on, int cap, int depth);
 
 /* Viewport the @media features test against; the browser refreshes it per
@@ -255,11 +257,12 @@ static int parse_color(const char *v) { return color_parse(v); }
  * heuristic. */
 struct calcval {
   double px, pct, num;
-  int dimless;
+  bool dimless;
 };
 struct calcctx {
   const char *p, *e;
-  int ok, depth;
+  bool ok;
+  int depth;
 };
 
 static void calc_skip(struct calcctx *c)
@@ -270,20 +273,20 @@ static void calc_skip(struct calcctx *c)
 
 /* Parse a signed decimal at *pp into *out; 1 if at least one digit was
  * consumed. */
-static int calc_number(const char **pp, double *out)
+static bool calc_number(const char **pp, double *out)
 {
   const char *p = *pp;
-  int neg = 0;
+  bool neg = false;
   if (*p == '-') {
-    neg = 1;
+    neg = true;
     p++;
   } else if (*p == '+')
     p++;
   double n = 0;
-  int any = 0;
+  bool any = false;
   while (*p >= '0' && *p <= '9') {
     n = n * 10 + (*p++ - '0');
-    any = 1;
+    any = true;
   }
   if (*p == '.') {
     p++;
@@ -291,14 +294,14 @@ static int calc_number(const char **pp, double *out)
     while (*p >= '0' && *p <= '9') {
       n += (*p++ - '0') * f;
       f *= 0.1;
-      any = 1;
+      any = true;
     }
   }
   if (!any)
-    return 0;
+    return false;
   *out = neg ? -n : n;
   *pp = p;
-  return 1;
+  return true;
 }
 
 /* A number + unit -> a calcval. Unknown units degrade to a dimensionless
@@ -306,11 +309,11 @@ static int calc_number(const char **pp, double *out)
 static void unit_value(double n, const char *u, struct calcval *o)
 {
   o->px = o->pct = o->num = 0;
-  o->dimless = 0;
+  o->dimless = false;
   if (u[0] == '%')
     o->pct = n;
   else if (!u[0]) {
-    o->dimless = 1;
+    o->dimless = true;
     o->num = n;
   } else if (starts_ci(u, "px"))
     o->px = n;
@@ -341,7 +344,7 @@ static void unit_value(double n, const char *u, struct calcval *o)
   else if (starts_ci(u, "pc"))
     o->px = n * 16.0;
   else {
-    o->dimless = 1;
+    o->dimless = true;
     o->num = n;
   }
 }
@@ -379,7 +382,7 @@ static int calc_args(struct calcctx *c, struct calcval *out, int maxn)
   if (c->p < c->e && *c->p == ')')
     c->p++;
   else
-    c->ok = 0;
+    c->ok = false;
   return n;
 }
 
@@ -388,7 +391,7 @@ static struct calcval calc_factor(struct calcctx *c)
   struct calcval v = {0, 0, 0, 0};
   calc_skip(c);
   if (c->p >= c->e || c->depth > 24) {
-    c->ok = 0;
+    c->ok = false;
     return v;
   }
   if (*c->p == '(') {
@@ -400,7 +403,7 @@ static struct calcval calc_factor(struct calcctx *c)
     if (c->p < c->e && *c->p == ')')
       c->p++;
     else
-      c->ok = 0;
+      c->ok = false;
     return v;
   }
   int fn = 0; /* 1 calc, 2 min, 3 max, 4 clamp */
@@ -442,7 +445,7 @@ static struct calcval calc_factor(struct calcctx *c)
   }
   double num;
   if (!calc_number(&c->p, &num)) {
-    c->ok = 0;
+    c->ok = false;
     return v;
   }
   const char *us = c->p;
@@ -479,7 +482,7 @@ static struct calcval calc_term(struct calcctx *c)
         a.pct *= k;
         a.num *= k;
       } else
-        c->ok = 0; /* length * length is invalid */
+        c->ok = false; /* length * length is invalid */
     } else {
       if (b.dimless && b.num != 0) {
         double k = 1.0 / b.num;
@@ -487,7 +490,7 @@ static struct calcval calc_term(struct calcctx *c)
         a.pct *= k;
         a.num *= k;
       } else
-        c->ok = 0;
+        c->ok = false;
     }
   }
   return a;
@@ -503,7 +506,7 @@ static struct calcval calc_expr(struct calcctx *c)
     char op = *c->p++;
     struct calcval b = calc_term(c);
     if (a.dimless != b.dimless)
-      c->ok = 0;
+      c->ok = false;
     if (op == '+') {
       a.px += b.px;
       a.pct += b.pct;
@@ -521,7 +524,7 @@ static struct calcval calc_expr(struct calcctx *c)
  * percent via *pct. A mixed px+% result (e.g. calc(100% - 1rem)) keeps only the
  * percent — we can't store an offset — which is the dominant term in practice.
  */
-static int calc_result(const struct calcval *r, int ok, int *pct)
+static int calc_result(const struct calcval *r, bool ok, int *pct)
 {
   if (!ok)
     return -1;
@@ -674,10 +677,11 @@ static int parse_weight(const char *v)
     return 1; /* bold, bolder */
   if (starts_ci(v, "normal") || starts_ci(v, "light"))
     return 0;
-  int n = 0, any = 0;
+  int n = 0;
+  bool any = false;
   while (*v >= '0' && *v <= '9') {
     n = n * 10 + (*v++ - '0');
-    any = 1;
+    any = true;
   }
   if (any)
     return n >= 600 ? 1 : 0;
@@ -744,12 +748,12 @@ static void parse_border_styles(const char *v, signed char out[4])
 
 /* substring (ci) — for text-decoration:"underline" inside a multi-value list.
  */
-static int has_ci(const char *hay, const char *needle)
+static bool has_ci(const char *hay, const char *needle)
 {
   for (; *hay; hay++)
     if (starts_ci(hay, needle))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* Decode a `content` value into out[cap]: a quoted string (with \HHHH unicode
@@ -839,7 +843,7 @@ void css_bgi_reset(struct css_bg_image *b)
 }
 
 /* True if `p` begins a CSS gradient function (any flavour we model). */
-static int is_grad_prefix(const char *p)
+static bool is_grad_prefix(const char *p)
 {
   return starts_ci(p, "linear-gradient(") || starts_ci(p, "radial-gradient(") ||
          starts_ci(p, "repeating-linear-gradient(") || starts_ci(p, "repeating-radial-gradient(");
@@ -915,21 +919,21 @@ static void parse_bg_position(const char *v, short *px, short *py)
     toks[nt][k] = '\0';
     nt++;
   }
-  int xset = 0, yset = 0;
+  bool xset = false, yset = false;
   for (int i = 0; i < nt; i++) {
     const char *t = toks[i];
     if (starts_ci(t, "left")) {
       *px = 0;
-      xset = 1;
+      xset = true;
     } else if (starts_ci(t, "right")) {
       *px = 100;
-      xset = 1;
+      xset = true;
     } else if (starts_ci(t, "top")) {
       *py = 0;
-      yset = 1;
+      yset = true;
     } else if (starts_ci(t, "bottom")) {
       *py = 100;
-      yset = 1;
+      yset = true;
     } else if (starts_ci(t, "center")) { /* assigned to a free axis below */
     } else {
       int pct;
@@ -937,10 +941,10 @@ static void parse_bg_position(const char *v, short *px, short *py)
       short p = (short)(pct >= 0 ? (pct > 100 ? 100 : pct) : 0);
       if (i == 0 && !xset) {
         *px = p;
-        xset = 1;
+        xset = true;
       } else if (!yset) {
         *py = p;
-        yset = 1;
+        yset = true;
       }
     }
   }
@@ -948,10 +952,10 @@ static void parse_bg_position(const char *v, short *px, short *py)
     if (starts_ci(toks[i], "center")) {
       if (!xset) {
         *px = 50;
-        xset = 1;
+        xset = true;
       } else if (!yset) {
         *py = 50;
-        yset = 1;
+        yset = true;
       }
     }
   if (xset && !yset)
@@ -986,7 +990,7 @@ static int bg_pos_single(const char *t, int axis)
 
 /* A linear-gradient direction token ("to bottom right", "45deg", "1turn") -> a
  * CSS angle in *angle (0 = to top, 90 = to right). Returns 1 if consumed. */
-static int parse_lin_dir(const char *a, short *angle)
+static bool parse_lin_dir(const char *a, short *angle)
 {
   while (*a == ' ')
     a++;
@@ -1011,19 +1015,19 @@ static int parse_lin_dir(const char *a, short *angle)
     else if (left)
       ang = 270;
     else
-      return 0;
+      return false;
     *angle = (short)ang;
-    return 1;
+    return true;
   }
   const char *p = a;
-  int neg = 0;
+  bool neg = false;
   if (*p == '-') {
-    neg = 1;
+    neg = true;
     p++;
   } else if (*p == '+')
     p++;
   if (!(*p >= '0' && *p <= '9'))
-    return 0;
+    return false;
   int n = 0;
   while (*p >= '0' && *p <= '9')
     n = n * 10 + (*p++ - '0');
@@ -1042,32 +1046,32 @@ static int parse_lin_dir(const char *a, short *angle)
   else if (starts_ci(p, "rad"))
     deg = n * 57; /* ~180/pi, integer-approx */
   else
-    return 0;
+    return false;
   if (neg)
     deg = -deg;
   deg %= 360;
   if (deg < 0)
     deg += 360;
   *angle = (short)deg;
-  return 1;
+  return true;
 }
 
 /* A radial-gradient leading token (shape/size/position), e.g. "circle at
  * center". We only honour the shape; size/position degrade to a centred fill.
  */
-static int parse_rad_dir(const char *a, struct css_bg_image *b)
+static bool parse_rad_dir(const char *a, struct css_bg_image *b)
 {
   if (has_ci(a, "circle")) {
     b->rad_circle = 1;
-    return 1;
+    return true;
   }
   if (has_ci(a, "ellipse")) {
     b->rad_circle = 0;
-    return 1;
+    return true;
   }
   if (has_ci(a, "at ") || has_ci(a, "closest") || has_ci(a, "farthest"))
-    return 1;
-  return 0;
+    return true;
+  return false;
 }
 
 /* Append one "color [position]" gradient stop to b. */
@@ -1124,22 +1128,22 @@ static void add_gradient_stop(const char *arg, struct css_bg_image *b)
 }
 
 /* Parse a linear-/radial-gradient() value into b. Returns 1 on success. */
-static int parse_gradient(const char *v, struct css_bg_image *b)
+static bool parse_gradient(const char *v, struct css_bg_image *b)
 {
   while (*v == ' ')
     v++;
   const char *p = v;
   if (starts_ci(p, "repeating-"))
     p += 10; /* treated as non-repeating */
-  int linear;
+  bool linear;
   if (starts_ci(p, "linear-gradient(")) {
-    linear = 1;
+    linear = true;
     p += 16;
   } else if (starts_ci(p, "radial-gradient(")) {
-    linear = 0;
+    linear = false;
     p += 16;
   } else
-    return 0;
+    return false;
   const char *e = p;
   int depth = 1;
   while (*e && depth) {
@@ -1158,7 +1162,7 @@ static int parse_gradient(const char *v, struct css_bg_image *b)
   b->rad_circle = 0;
   b->nstops = 0;
   const char *a = p;
-  int first = 1;
+  bool first = true;
   while (a < e) {
     const char *c = a;
     int d2 = 0; /* split on top-level commas */
@@ -1181,12 +1185,12 @@ static int parse_gradient(const char *v, struct css_bg_image *b)
     for (int i = 0; i < al; i++)
       arg[i] = as[i];
     arg[al] = '\0';
-    int consumed = 0;
+    bool consumed = false;
     if (first)
       consumed = linear ? parse_lin_dir(arg, &b->angle) : parse_rad_dir(arg, b);
     if (!consumed)
       add_gradient_stop(arg, b);
-    first = 0;
+    first = false;
     a = (c < e) ? c + 1 : e;
   }
   return b->nstops > 0;
@@ -1296,14 +1300,14 @@ static void bg_shorthand_position(const char *rest, struct css_bg_image *b)
       p++;
     }
     tok[k] = '\0';
-    int is_pos = starts_ci(tok, "left") || starts_ci(tok, "right") || starts_ci(tok, "top") ||
-                 starts_ci(tok, "bottom") || starts_ci(tok, "center");
+    bool is_pos = starts_ci(tok, "left") || starts_ci(tok, "right") || starts_ci(tok, "top") ||
+                  starts_ci(tok, "bottom") || starts_ci(tok, "center");
     if (!is_pos) {
       const char *q = tok;
       if (*q == '-' || *q == '+')
         q++;
       if (*q >= '0' && *q <= '9')
-        is_pos = 1;
+        is_pos = true;
     }
     if (is_pos && pl + k + 1 < (int)sizeof pos) {
       if (pl)
@@ -1508,7 +1512,7 @@ static void copy_family_stack(const char *v, char *out, int cap)
 }
 
 /* Case-insensitive suffix test. */
-static int ends_ci(const char *s, const char *suf)
+static bool ends_ci(const char *s, const char *suf)
 {
   int sl = strlen(s), fl = strlen(suf);
   return sl >= fl && streq_ci(s + sl - fl, suf);
@@ -1516,7 +1520,7 @@ static int ends_ci(const char *s, const char *suf)
 
 /* Lowercased-compare a span [a,ae) against a NUL-terminated lowercase literal.
  */
-static int span_is(const char *a, const char *ae, const char *lit)
+static bool span_is(const char *a, const char *ae, const char *lit)
 {
   while (a < ae && *lit && lower(*a) == *lit) {
     a++;
@@ -1675,10 +1679,11 @@ static signed char parse_grid_span(const char *v)
       n = n * 10 + (*v++ - '0');
     return (signed char)(n > 0 ? n : 1);
   }
-  int a = 0, hasA = 0;
+  int a = 0;
+  bool hasA = false;
   while (*v >= '0' && *v <= '9') {
     a = a * 10 + (*v++ - '0');
-    hasA = 1;
+    hasA = true;
   }
   while (*v == ' ')
     v++;
@@ -1695,10 +1700,11 @@ static signed char parse_grid_span(const char *v)
         n = n * 10 + (*v++ - '0');
       return (signed char)(n > 0 ? n : 1);
     }
-    int b = 0, hasB = 0;
+    int b = 0;
+    bool hasB = false;
     while (*v >= '0' && *v <= '9') {
       b = b * 10 + (*v++ - '0');
-      hasB = 1;
+      hasB = true;
     }
     if (hasA && hasB && b > a)
       return (signed char)(b - a);
@@ -1752,27 +1758,28 @@ static void parse_flex_shorthand(const char *v, struct css_style *o)
     return;
   }
 
-  int seen_grow = 0, seen_shrink = 0, pct;
+  bool seen_grow = false, seen_shrink = false;
+  int pct;
   while (*f) {
     while (*f == ' ' || *f == '\t')
       f++;
     if (!*f)
       break;
-    int has_unit = 0;
+    bool has_unit = false;
     for (const char *q = f; *q && *q != ' ' && *q != '\t'; q++)
       if (*q == '%' || *q == 'p' || *q == 'e' || *q == 'r' || *q == 'v' || *q == 'c') {
-        has_unit = 1;
+        has_unit = true;
         break;
       }
-    int isnum = (*f >= '0' && *f <= '9') || *f == '.';
+    bool isnum = (*f >= '0' && *f <= '9') || *f == '.';
     if (isnum && !has_unit) { /* unitless: grow, then shrink */
       int n = parse_len(f);
       if (!seen_grow) {
         o->flex_grow = (short)(n < 0 ? 0 : n);
-        seen_grow = 1;
+        seen_grow = true;
       } else {
         o->flex_shrink = (short)(n < 0 ? 0 : n);
-        seen_shrink = 1;
+        seen_shrink = true;
       }
     } else if (starts_ci(f, "auto") || starts_ci(f, "content")) {
       o->flex_basis = -1;
@@ -1794,12 +1801,12 @@ static void parse_flex_shorthand(const char *v, struct css_style *o)
  * into o. inset (inner) shadows aren't drawn — skipped. A missing colour
  * defaults to a soft black, the usual look. Lengths are signed px (units beyond
  * px are ignored). */
-static int sh_is_len(const char *t) { return (*t >= '0' && *t <= '9') || *t == '-' || *t == '+' || *t == '.'; }
+static bool sh_is_len(const char *t) { return (*t >= '0' && *t <= '9') || *t == '-' || *t == '+' || *t == '.'; }
 static int sh_len(const char *t)
 {
-  int neg = 0;
+  bool neg = false;
   if (*t == '-') {
-    neg = 1;
+    neg = true;
     t++;
   } else if (*t == '+')
     t++;
@@ -1916,10 +1923,10 @@ static void parse_line_height(const char *v, struct css_style *o)
     o->lh_pct = -1;
     return;
   }
-  int has_unit = 0;
+  bool has_unit = false;
   for (const char *q = v; *q && *q != ' ' && *q != '\t'; q++)
     if (*q == '%' || ((*q | 32) >= 'a' && (*q | 32) <= 'z')) {
-      has_unit = 1;
+      has_unit = true;
       break;
     }
   if (!has_unit && ((*v >= '0' && *v <= '9') || *v == '.')) { /* unitless multiplier */
@@ -1981,24 +1988,25 @@ static void parse_font_size(const char *v, struct css_style *o)
  * font-size carries a unit, a decimal point, a percent, or a `/line-height`; a
  * bare 100..900 integer is a weight. Size keywords are matched by the caller.
  */
-static int font_tok_is_size(const char *p)
+static bool font_tok_is_size(const char *p)
 {
-  int digits = 0, dot = 0;
+  int digits = 0;
+  bool dot = false;
   const char *q = p;
   while ((*q >= '0' && *q <= '9') || *q == '.') {
     if (*q == '.')
-      dot = 1;
+      dot = true;
     else
       digits++;
     q++;
   }
   if (!digits && !dot)
-    return 0; /* not numeric */
+    return false; /* not numeric */
   if (dot || *q == '/' || *q == '%')
-    return 1; /* decimal / lh / percent */
+    return true; /* decimal / lh / percent */
   if (((*q | 32) >= 'a' && (*q | 32) <= 'z'))
-    return 1; /* carries a unit */
-  return 0;   /* bare integer: a weight */
+    return true; /* carries a unit */
+  return false;  /* bare integer: a weight */
 }
 
 /* The `font` shorthand: `[ style || variant || weight || stretch ]? size[/lh]
@@ -2124,15 +2132,15 @@ static int parse_time_ms(const char *s, const char *e)
     s++;
   const char *p = s;
   double n = 0;
-  int any = 0, neg = 0;
+  bool any = false, neg = false;
   if (p < e && (*p == '-' || *p == '+')) {
     if (*p == '-')
-      neg = 1;
+      neg = true;
     p++;
   }
   while (p < e && *p >= '0' && *p <= '9') {
     n = n * 10 + (*p++ - '0');
-    any = 1;
+    any = true;
   }
   if (p < e && *p == '.') {
     p++;
@@ -2140,7 +2148,7 @@ static int parse_time_ms(const char *s, const char *e)
     while (p < e && *p >= '0' && *p <= '9') {
       n += (*p++ - '0') * f;
       f *= 0.1;
-      any = 1;
+      any = true;
     }
   }
   if (!any)
@@ -2343,11 +2351,11 @@ static void anim_token(const char *s, const char *e, void *ud)
   /* a bare number is the iteration count */
   {
     const char *p = s;
-    int any = 0;
+    bool any = false;
     double n = 0;
     while (p < e && *p >= '0' && *p <= '9') {
       n = n * 10 + (*p++ - '0');
-      any = 1;
+      any = true;
     }
     if (p < e && *p == '.') {
       p++;
@@ -2355,7 +2363,7 @@ static void anim_token(const char *s, const char *e, void *ud)
       while (p < e && *p >= '0' && *p <= '9') {
         n += (*p++ - '0') * f;
         f *= 0.1;
-        any = 1;
+        any = true;
       }
     }
     if (any && p >= e) {
@@ -2417,7 +2425,7 @@ static void parse_transition_segment(const char *s, const char *e, struct css_st
 }
 
 static void apply_decl(const char *p, const char *pe, const char *v, const char *ve, struct css_style *out,
-                       int *important)
+                       bool *important)
 {
   while (p < pe && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
     p++;
@@ -2442,7 +2450,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
   for (int i = 0; i + 9 < vl + 1; i++) {
     if (val[i] == '!' && starts_ci(val + i + 1, "important")) {
       if (important)
-        *important = 1;
+        *important = true;
       val[i] = '\0';
       while (i > 0 && (val[i - 1] == ' ' || val[i - 1] == '\t'))
         val[--i] = '\0';
@@ -2800,9 +2808,9 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     if (starts_ci(f, "auto"))
       out->z_index = CSS_Z_AUTO;
     else {
-      int neg = 0;
+      bool neg = false;
       if (*f == '-') {
-        neg = 1;
+        neg = true;
         f++;
       } else if (*f == '+')
         f++;
@@ -2856,11 +2864,11 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
     if (starts_ci(f, "infinite"))
       out->anim_iter = -1;
     else {
-      int any = 0;
+      bool any = false;
       double n = 0;
       while (*f >= '0' && *f <= '9') {
         n = n * 10 + (*f++ - '0');
-        any = 1;
+        any = true;
       }
       if (*f == '.') {
         f++;
@@ -2868,7 +2876,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
         while (*f >= '0' && *f <= '9') {
           n += (*f++ - '0') * fr;
           fr *= 0.1;
-          any = 1;
+          any = true;
         }
       }
       if (any)
@@ -2923,7 +2931,7 @@ static void apply_decl(const char *p, const char *pe, const char *v, const char 
 }
 
 /* Parse a `prop: value; ...` block [s,end) into *out. */
-static void parse_decls(const char *s, const char *end, struct css_style *out, int *important)
+static void parse_decls(const char *s, const char *end, struct css_style *out, bool *important)
 {
   while (s < end) {
     const char *semi = s;
@@ -2940,7 +2948,7 @@ static void parse_decls(const char *s, const char *end, struct css_style *out, i
 
 void css_apply_inline(const char *decls, struct css_style *out)
 {
-  int imp = 0;
+  bool imp = false;
   if (str_uses_var(decls)) { /* resolve var() against the sheet table */
     char buf[512];
     int bn = 0;
@@ -2953,18 +2961,18 @@ void css_apply_inline(const char *decls, struct css_style *out)
 
 /* ------------------------------------------------ selectors ----------------
  */
-static int parse_selector(const char *s, const char *e, struct selector *sel);
+static bool parse_selector(const char *s, const char *e, struct selector *sel);
 static struct sel_list *parse_sel_list(const char *s, const char *e);
-static int selector_match(const struct selector *sel, const struct dom_node *el);
+static bool selector_match(const struct selector *sel, const struct dom_node *el);
 static void free_selector_lists(struct selector *sel);
 
 /* True if byte c is in the NUL-terminated set. */
-static int chr_in(const char *set, char c)
+static bool chr_in(const char *set, char c)
 {
   for (; *set; set++)
     if (*set == c)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* Advance from s to the first byte in `stop` that sits at bracket-nesting depth
@@ -2988,7 +2996,7 @@ static const char *scan_top(const char *s, const char *e, const char *stop)
   return s;
 }
 
-static int is_sel_name(char c)
+static bool is_sel_name(char c)
 {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
 }
@@ -3019,7 +3027,9 @@ static void parse_anb(const char *s, const char *e, int *a, int *b)
     *b = 0;
     return;
   }
-  int sign = 1, has1 = 0, num1 = 0;
+  int sign = 1;
+  bool has1 = false;
+  int num1 = 0;
   if (s < e && (*s == '+' || *s == '-')) {
     if (*s == '-')
       sign = -1;
@@ -3027,14 +3037,16 @@ static void parse_anb(const char *s, const char *e, int *a, int *b)
   }
   while (s < e && *s >= '0' && *s <= '9') {
     num1 = num1 * 10 + (*s++ - '0');
-    has1 = 1;
+    has1 = true;
   }
   if (s < e && (*s == 'n' || *s == 'N')) {
     s++;
     *a = sign * (has1 ? num1 : 1);
     while (s < e && (*s == ' ' || *s == '\t'))
       s++;
-    int bsign = 1, has2 = 0, num2 = 0;
+    int bsign = 1;
+    bool has2 = false;
+    int num2 = 0;
     if (s < e && (*s == '+' || *s == '-')) {
       if (*s == '-')
         bsign = -1;
@@ -3044,7 +3056,7 @@ static void parse_anb(const char *s, const char *e, int *a, int *b)
       s++;
     while (s < e && *s >= '0' && *s <= '9') {
       num2 = num2 * 10 + (*s++ - '0');
-      has2 = 1;
+      has2 = true;
     }
     *b = has2 ? bsign * num2 : 0;
   } else {
@@ -3100,7 +3112,7 @@ static void parse_simple_sel(const char *s, const char *e, struct simple_sel *ss
 
 /* Classify a pseudo-class name span [ns,ne) (+ optional arg [as,ae)) into *pc.
  * Returns 1 to record *pc, 0 to ignore the pseudo entirely (:is()/:where()). */
-static int classify_pseudo(const char *ns, const char *ne, const char *as, const char *ae, struct pseudo *pc)
+static bool classify_pseudo(const char *ns, const char *ne, const char *as, const char *ae, struct pseudo *pc)
 {
   pc->kind = PC_NEVER;
   pc->a = 0;
@@ -3113,87 +3125,87 @@ static int classify_pseudo(const char *ns, const char *ne, const char *as, const
     pc->kind = PC_NOT;
     if (as)
       parse_simple_sel(as, ae, &pc->arg);
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "first-child")) {
     pc->kind = PC_FIRST_CHILD;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "last-child")) {
     pc->kind = PC_LAST_CHILD;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "only-child")) {
     pc->kind = PC_ONLY_CHILD;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "first-of-type")) {
     pc->kind = PC_FIRST_OF_TYPE;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "last-of-type")) {
     pc->kind = PC_LAST_OF_TYPE;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "only-of-type")) {
     pc->kind = PC_ONLY_OF_TYPE;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "nth-child")) {
     pc->kind = PC_NTH_CHILD;
     if (as)
       parse_anb(as, ae, &pc->a, &pc->b);
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "nth-last-child")) {
     pc->kind = PC_NTH_LAST_CHILD;
     if (as)
       parse_anb(as, ae, &pc->a, &pc->b);
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "nth-of-type")) {
     pc->kind = PC_NTH_OF_TYPE;
     if (as)
       parse_anb(as, ae, &pc->a, &pc->b);
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "nth-last-of-type")) {
     pc->kind = PC_NTH_LAST_OF_TYPE;
     if (as)
       parse_anb(as, ae, &pc->a, &pc->b);
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "root")) {
     pc->kind = PC_ROOT;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "empty")) {
     pc->kind = PC_EMPTY;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "checked")) {
     pc->kind = PC_CHECKED;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "disabled")) {
     pc->kind = PC_DISABLED;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "enabled")) {
     pc->kind = PC_ENABLED;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "required")) {
     pc->kind = PC_REQUIRED;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "optional")) {
     pc->kind = PC_OPTIONAL;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "link") || span_is(ns, ne, "any-link")) {
     pc->kind = PC_LINK;
-    return 1;
+    return true;
   }
   if (span_is(ns, ne, "is") || span_is(ns, ne, "where")) {
     /* :is()/:where() match if any sub-selector matches the element as its
@@ -3202,13 +3214,13 @@ static int classify_pseudo(const char *ns, const char *ne, const char *as, const
      */
     struct sel_list *l = (as && as < ae) ? parse_sel_list(as, ae) : 0;
     if (!l)
-      return 1; /* PC_NEVER (matches nothing) */
+      return true; /* PC_NEVER (matches nothing) */
     pc->kind = PC_MATCHES;
     pc->list = l;
     pc->a = span_is(ns, ne, "where"); /* :where() carries zero specificity */
-    return 1;
+    return true;
   }
-  return 1; /* dynamic state / :has() / unsupported -> PC_NEVER */
+  return true; /* dynamic state / :has() / unsupported -> PC_NEVER */
 }
 
 static void add_pseudo_class(struct sel_step *st, const char *ns, const char *ne, const char *as, const char *ae)
@@ -3254,10 +3266,10 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
       st->id[k] = '\0';
     } else if (*s == ':') {
       s++;
-      int dbl = 0;
+      bool dbl = false;
       if (s < e && *s == ':') {
         s++;
-        dbl = 1;
+        dbl = true;
       }
       const char *ns = s;
       while (s < e && is_sel_name(*s))
@@ -3314,17 +3326,17 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
 
 /* Parse one full selector (no commas) into *sel; returns 0 if empty/too deep.
  */
-static int parse_selector(const char *s, const char *e, struct selector *sel)
+static bool parse_selector(const char *s, const char *e, struct selector *sel)
 {
   sel->n = 0;
-  int pending_child = 0;
+  bool pending_child = false;
   while (s < e) {
     while (s < e && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r'))
       s++;
     if (s >= e)
       break;
     if (*s == '>') {
-      pending_child = 1;
+      pending_child = true;
       s++;
       continue;
     }
@@ -3337,10 +3349,10 @@ static int parse_selector(const char *s, const char *e, struct selector *sel)
       return sel->n > 0; /* cap depth, keep what we have (token dropped, unparsed) */
     struct sel_step *st = &sel->step[sel->n];
     parse_compound(tok, s, st);
-    st->child = 0;
+    st->child = false;
     if (sel->n > 0 && pending_child)
-      sel->step[sel->n - 1].child = 1;
-    pending_child = 0;
+      sel->step[sel->n - 1].child = true;
+    pending_child = false;
     sel->n++;
   }
   return sel->n > 0;
@@ -3457,11 +3469,11 @@ static int selector_spec(const struct selector *sel)
 
 /* ------------------------------------------------ matching -----------------
  */
-static int node_has_class(const struct dom_node *n, const char *cls)
+static bool node_has_class(const struct dom_node *n, const char *cls)
 {
   const char *list = dom_get_attr(n, "class");
   if (!list)
-    return 0;
+    return false;
   int cl = strlen(cls);
   for (const char *p = list; *p;) {
     while (*p == ' ' || *p == '\t')
@@ -3474,47 +3486,47 @@ static int node_has_class(const struct dom_node *n, const char *cls)
       while (i < cl && p[i] == cls[i])
         i++;
       if (i == cl)
-        return 1;
+        return true;
     }
     p = q;
   }
-  return 0;
+  return false;
 }
 
 /* ------------------------------------------------ pseudo-class matching ----
  */
 /* idx satisfies an+b for some integer k >= 0. */
-static int anb_match(int a, int b, int idx)
+static bool anb_match(int a, int b, int idx)
 {
   int d = idx - b;
   if (a == 0)
     return d == 0;
   if ((a > 0 && d < 0) || (a < 0 && d > 0))
-    return 0;
+    return false;
   return d % a == 0;
 }
-static int is_form_control(const char *tag)
+static bool is_form_control(const char *tag)
 {
   return streq(tag, "input") || streq(tag, "button") || streq(tag, "select") || streq(tag, "textarea") ||
          streq(tag, "option") || streq(tag, "optgroup") || streq(tag, "fieldset");
 }
-static int simple_match(const struct simple_sel *ss, const struct dom_node *n)
+static bool simple_match(const struct simple_sel *ss, const struct dom_node *n)
 {
   if (!n || n->type != DOM_ELEMENT)
-    return 0;
+    return false;
   if (ss->tag[0] && !streq(ss->tag, n->tag))
-    return 0;
+    return false;
   if (ss->id[0]) {
     const char *id = dom_get_attr(n, "id");
     if (!id || !streq_ci(id, ss->id))
-      return 0;
+      return false;
   }
   for (int i = 0; i < ss->ncls; i++)
     if (!node_has_class(n, ss->cls[i]))
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
-static int pseudo_match(const struct pseudo *pc, const struct dom_node *n)
+static bool pseudo_match(const struct pseudo *pc, const struct dom_node *n)
 {
   switch (pc->kind) {
   case PC_FIRST_CHILD:
@@ -3542,13 +3554,13 @@ static int pseudo_match(const struct pseudo *pc, const struct dom_node *n)
   case PC_EMPTY:
     for (const struct dom_node *c = n->first_child; c; c = c->next) {
       if (c->type == DOM_ELEMENT)
-        return 0;
+        return false;
       if (c->type == DOM_TEXT && c->text)
         for (const char *t = c->text; *t; t++)
           if (*t != ' ' && *t != '\t' && *t != '\n' && *t != '\r' && *t != '\f')
-            return 0;
+            return false;
     }
-    return 1;
+    return true;
   case PC_CHECKED:
     return dom_get_attr(n, "checked") != 0 || dom_get_attr(n, "selected") != 0;
   case PC_DISABLED:
@@ -3565,42 +3577,42 @@ static int pseudo_match(const struct pseudo *pc, const struct dom_node *n)
     return !simple_match(&pc->arg, n);
   case PC_MATCHES:
     if (!pc->list)
-      return 0;
+      return false;
     for (int i = 0; i < pc->list->n; i++)
       if (selector_match(&pc->list->sels[i], n))
-        return 1;
-    return 0;
+        return true;
+    return false;
   default:
-    return 0; /* PC_NEVER */
+    return false; /* PC_NEVER */
   }
 }
 
 /* Match a step's tag/id/class/pseudo-class against `n` (ignoring any
  * pseudo-element). */
-static int step_box_match(const struct sel_step *st, const struct dom_node *n)
+static bool step_box_match(const struct sel_step *st, const struct dom_node *n)
 {
   if (!n || n->type != DOM_ELEMENT)
-    return 0;
+    return false;
   if (st->tag[0] && !streq(st->tag, n->tag))
-    return 0;
+    return false;
   if (st->id[0]) {
     const char *id = dom_get_attr(n, "id");
     if (!id || !streq_ci(id, st->id))
-      return 0;
+      return false;
   }
   for (int i = 0; i < st->ncls; i++)
     if (!node_has_class(n, st->cls[i]))
-      return 0;
+      return false;
   for (int i = 0; i < st->npc; i++)
     if (!pseudo_match(&st->pc[i], n))
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
-static int step_match(const struct sel_step *st, const struct dom_node *n)
+static bool step_match(const struct sel_step *st, const struct dom_node *n)
 {
   if (st->pseudo_el)
-    return 0; /* ::before/::selection/… don't style a box */
+    return false; /* ::before/::selection/… don't style a box */
   return step_box_match(st, n);
 }
 
@@ -3608,42 +3620,42 @@ static int step_match(const struct sel_step *st, const struct dom_node *n)
  * left): a '>' step must match the immediate parent, a descendant step the
  * nearest matching ancestor. Greedy, no backtracking — enough for ordinary
  * selectors. Shared by the normal and ::before/::after matchers. */
-static int match_ancestors(const struct selector *sel, int top, const struct dom_node *subject)
+static bool match_ancestors(const struct selector *sel, int top, const struct dom_node *subject)
 {
   const struct dom_node *cur = subject;
   for (int i = top; i >= 0; i--) {
     cur = cur ? cur->parent : 0;
     if (sel->step[i].child) {
       if (!step_match(&sel->step[i], cur))
-        return 0;
+        return false;
     } else {
       while (cur && !step_match(&sel->step[i], cur))
         cur = cur->parent;
       if (!cur)
-        return 0;
+        return false;
     }
   }
-  return 1;
+  return true;
 }
 
-static int selector_match(const struct selector *sel, const struct dom_node *el)
+static bool selector_match(const struct selector *sel, const struct dom_node *el)
 {
   int i = sel->n - 1;
   if (!step_match(&sel->step[i], el))
-    return 0;
+    return false;
   return match_ancestors(sel, i - 1, el);
 }
 
 /* Match a ::before / ::after rule against its originating element `el`: the
  * rightmost compound must carry that pseudo-element, its box part must match
  * el, and the ancestor chain matches as usual. */
-static int selector_match_pseudo(const struct selector *sel, const struct dom_node *el, int which)
+static bool selector_match_pseudo(const struct selector *sel, const struct dom_node *el, int which)
 {
   int i = sel->n - 1;
   if (sel->step[i].pseudo_el != which)
-    return 0;
+    return false;
   if (!step_box_match(&sel->step[i], el))
-    return 0;
+    return false;
   return match_ancestors(sel, i - 1, el);
 }
 
@@ -3658,7 +3670,7 @@ static const char *skip_sp(const char *p, const char *e)
 
 /* Match lowercase keyword `lit` at *pp (token-bounded); advance past it on a
  * hit. */
-static int kw(const char **pp, const char *e, const char *lit)
+static bool kw(const char **pp, const char *e, const char *lit)
 {
   const char *q = *pp;
   while (q < e && *lit && lower(*q) == *lit) {
@@ -3666,11 +3678,11 @@ static int kw(const char **pp, const char *e, const char *lit)
     lit++;
   }
   if (*lit)
-    return 0;
+    return false;
   if (q < e && is_sel_name(*q))
-    return 0;
+    return false;
   *pp = q;
-  return 1;
+  return true;
 }
 
 /* Parse a media length operand in [s,e) -> px (rounded to int); -1 if no
@@ -3681,16 +3693,16 @@ static int kw(const char **pp, const char *e, const char *lit)
 static int parse_len_px(const char *s, const char *e)
 {
   s = skip_sp(s, e);
-  int neg = 0;
+  bool neg = false;
   if (s < e && (*s == '+' || *s == '-')) {
     neg = (*s == '-');
     s++;
   }
   double n = 0;
-  int any = 0;
+  bool any = false;
   while (s < e && *s >= '0' && *s <= '9') {
     n = n * 10 + (*s++ - '0');
-    any = 1;
+    any = true;
   }
   if (s < e && *s == '.') {
     s++;
@@ -3698,7 +3710,7 @@ static int parse_len_px(const char *s, const char *e)
     while (s < e && *s >= '0' && *s <= '9') {
       n += (*s++ - '0') * f;
       f *= 0.1;
-      any = 1;
+      any = true;
     }
   }
   if (!any)
@@ -3731,7 +3743,7 @@ static int parse_len_px(const char *s, const char *e)
 }
 
 /* True if [a,e) trimmed equals lowercase literal `lit`. */
-static int span_eq_trim(const char *a, const char *e, const char *lit)
+static bool span_eq_trim(const char *a, const char *e, const char *lit)
 {
   a = skip_sp(a, e);
   while (e > a && (e[-1] == ' ' || e[-1] == '\t'))
@@ -3959,12 +3971,12 @@ static void parse_feature(const char **pp, const char *e, struct media_cond *c)
  */
 static void parse_cond(const char *s, const char *e, struct media_cond *c)
 {
-  c->negate = 0;
+  c->negate = false;
   c->mtype = MT_ALL;
   c->nfeat = 0;
   const char *p = skip_sp(s, e);
   if (kw(&p, e, "not"))
-    c->negate = 1;
+    c->negate = true;
   p = skip_sp(p, e);
   kw(&p, e, "only"); /* `only` is a no-op for us */
   p = skip_sp(p, e);
@@ -4009,7 +4021,7 @@ static void parse_media_query(const char *s, const char *e, struct media_query *
   }
 }
 
-static int feature_matches(const struct media_feature *f)
+static bool feature_matches(const struct media_feature *f)
 {
   switch (f->kind) {
   case MF_MIN_W:
@@ -4029,31 +4041,31 @@ static int feature_matches(const struct media_feature *f)
   case MF_ORIENT_LANDSCAPE:
     return g_vw > g_vh;
   case MF_SCHEME_LIGHT:
-    return 1; /* the browser renders a light theme */
+    return true; /* the browser renders a light theme */
   case MF_SCHEME_DARK:
-    return 0;
+    return false;
   default:
-    return 0; /* MF_UNKNOWN / unsupported feature */
+    return false; /* MF_UNKNOWN / unsupported feature */
   }
 }
 
-static int cond_matches(const struct media_cond *c)
+static bool cond_matches(const struct media_cond *c)
 {
-  int ok = (c->mtype == MT_ALL || c->mtype == MT_SCREEN);
+  bool ok = (c->mtype == MT_ALL || c->mtype == MT_SCREEN);
   for (int i = 0; ok && i < c->nfeat; i++)
     if (!feature_matches(&c->feat[i]))
-      ok = 0;
+      ok = false;
   return c->negate ? !ok : ok;
 }
 
-static int media_matches(const struct media_query *mq)
+static bool media_matches(const struct media_query *mq)
 {
   if (mq->n == 0)
-    return 1;
+    return true;
   for (int i = 0; i < mq->n; i++)
     if (cond_matches(&mq->cond[i]))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* ------------------------------------------------ sheet build --------------
@@ -4068,14 +4080,14 @@ css_sheet *css_new(void)
   s->gen = 0;
   s->faces = 0;
   s->keyframes = 0;
-  s->has_pseudo_el = 0;
+  s->has_pseudo_el = false;
   s->cur_base = 0;
   for (int i = 0; i < CSS_NBUCK; i++) {
     s->id_b[i] = s->cls_b[i] = s->tag_b[i] = 0;
   }
   s->uni = 0;
   s->idx_gen = -1; /* index is stale until first ensure_index */
-  s->idx_failed = 0;
+  s->idx_failed = false;
   s->cand = 0;
   s->cand_cap = 0;
   s->match = 0;
@@ -4203,11 +4215,11 @@ static int keyframe_offset(const char *s, const char *e)
   if (span_is(s, e, "to"))
     return 1000;
   double n = 0;
-  int any = 0;
+  bool any = false;
   const char *p = s;
   while (p < e && *p >= '0' && *p <= '9') {
     n = n * 10 + (*p++ - '0');
-    any = 1;
+    any = true;
   }
   if (p < e && *p == '.') {
     p++;
@@ -4215,7 +4227,7 @@ static int keyframe_offset(const char *s, const char *e)
     while (p < e && *p >= '0' && *p <= '9') {
       n += (*p++ - '0') * f;
       f *= 0.1;
-      any = 1;
+      any = true;
     }
   }
   if (!any || p >= e || *p != '%')
@@ -4307,7 +4319,7 @@ static void parse_keyframes(css_sheet *sh, const char *ns, const char *ne, const
 
     struct css_style decl;
     css_style_reset(&decl);
-    int imp = 0;
+    bool imp = false;
     parse_decls(dec_s, dec_e, &decl, &imp);
 
     const char *q = sel_s;
@@ -4352,7 +4364,7 @@ int css_keyframes_stop(const struct css_keyframes *kf, int i, int *permille, con
   return 1;
 }
 
-static void sheet_push(css_sheet *sh, const struct selector *sel, const struct css_style *decl, int important,
+static void sheet_push(css_sheet *sh, const struct selector *sel, const struct css_style *decl, bool important,
                        const struct media_query *media, const char *dec_s, const char *dec_e)
 {
   struct css_rule *r = malloc(sizeof *r);
@@ -4365,9 +4377,9 @@ static void sheet_push(css_sheet *sh, const struct selector *sel, const struct c
   r->order = sh->order++;
   r->important = important;
   if (sel->step[sel->n - 1].pseudo_el == PE_BEFORE || sel->step[sel->n - 1].pseudo_el == PE_AFTER)
-    sh->has_pseudo_el = 1; /* a ::before/::after rule exists in this sheet */
-  r->visit = 0;            /* the index (ensure_index) files it by key */
-  {                        /* copy the authored declarations, collapsing runs of whitespace */
+    sh->has_pseudo_el = true; /* a ::before/::after rule exists in this sheet */
+  r->visit = 0;               /* the index (ensure_index) files it by key */
+  {                           /* copy the authored declarations, collapsing runs of whitespace */
     int k = 0, sp = 0;
     const char *q = dec_s;
     while (q < dec_e && k < CSS_RAW_MAX - 1) {
@@ -4567,7 +4579,7 @@ static void add_rules(css_sheet *sh, const char *p, const char *end, const struc
 
     struct css_style decl;
     css_style_reset(&decl);
-    int important = 0;
+    bool important = false;
     parse_decls(dec_s, dec_e, &decl, &important);
 
     /* Split the selector list on top-level commas only (scan_top skips a comma
@@ -4996,12 +5008,12 @@ static void ensure_vars(css_sheet *sh)
   g_vars_gen = sh->gen;
 }
 
-static int str_uses_var(const char *s)
+static bool str_uses_var(const char *s)
 {
   for (; *s; s++)
     if ((*s == 'v' || *s == 'V') && starts_ci(s, "var("))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 /* Copy `in`, substituting var(--name, fallback) from the table (recursive,
  * depth- bounded). Unknown var with no fallback expands to empty, as in real
@@ -5147,16 +5159,16 @@ static void index_clear(css_sheet *sh)
   sh->uni = 0;
 }
 
-static int index_put(struct css_idx **head, struct css_rule *r, const char *key)
+static bool index_put(struct css_idx **head, struct css_rule *r, const char *key)
 {
   struct css_idx *e = malloc(sizeof *e);
   if (!e)
-    return 0;
+    return false;
   e->rule = r;
   e->key = key;
   e->next = *head;
   *head = e;
-  return 1;
+  return true;
 }
 
 static void ensure_index(css_sheet *sh)
@@ -5164,13 +5176,13 @@ static void ensure_index(css_sheet *sh)
   if (sh->idx_gen == sh->gen)
     return;
   index_clear(sh);
-  sh->idx_failed = 0;
+  sh->idx_failed = false;
   for (struct css_rule *r = sh->head; r; r = r->next) {
     struct idx_key keys[32];
     int nk = 0;
     if (!compound_keys(&r->sel.step[r->sel.n - 1], keys, 32, &nk) || nk == 0) {
       if (!index_put(&sh->uni, r, 0)) {
-        sh->idx_failed = 1;
+        sh->idx_failed = true;
         break;
       }
       continue;
@@ -5178,7 +5190,7 @@ static void ensure_index(css_sheet *sh)
     for (int i = 0; i < nk; i++) {
       struct css_idx **tab = keys[i].kind == KK_ID ? sh->id_b : keys[i].kind == KK_CLS ? sh->cls_b : sh->tag_b;
       if (!index_put(&tab[css_hash(keys[i].str)], r, keys[i].str)) {
-        sh->idx_failed = 1;
+        sh->idx_failed = true;
         break;
       }
     }
@@ -5201,19 +5213,19 @@ static void key23(const char *s, char *out)
   out[k] = '\0';
 }
 
-static int rule_ptr_room(struct css_rule ***buf, int *cap, int need)
+static bool rule_ptr_room(struct css_rule ***buf, int *cap, int need)
 {
   if (need <= *cap)
-    return 1;
+    return true;
   int nc = *cap ? *cap * 2 : 64;
   while (nc < need)
     nc *= 2;
   struct css_rule **p = realloc(*buf, (unsigned)nc * sizeof *p);
   if (!p)
-    return 0;
+    return false;
   *buf = p;
   *cap = nc;
-  return 1;
+  return true;
 }
 
 /* Candidate rules for `el`: the universal bucket + its tag/id/class buckets. A
@@ -5225,7 +5237,8 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el)
 {
   ensure_index(sh);
   unsigned stamp = ++g_visit;
-  int n = 0, failed = 0;
+  int n = 0;
+  bool failed = false;
 #define ADD(rp)                                                                                                        \
   do {                                                                                                                 \
     struct css_rule *rr = (rp);                                                                                        \
@@ -5234,7 +5247,7 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el)
       if (rule_ptr_room(&sh->cand, &sh->cand_cap, n + 1))                                                              \
         sh->cand[n++] = rr;                                                                                            \
       else                                                                                                             \
-        failed = 1;                                                                                                    \
+        failed = true;                                                                                                 \
     }                                                                                                                  \
   } while (0)
   if (sh->idx_failed)
@@ -5326,7 +5339,7 @@ void css_apply_sheet(css_sheet *sh, const struct dom_node *el, struct css_style 
       char buf[512];
       int bn = 0;
       struct css_style tmp;
-      int imp = 0;
+      bool imp = false;
       resolve_vars(r->raw, (int)strlen(r->raw), buf, &bn, (int)sizeof buf, 0);
       css_style_reset(&tmp);
       parse_decls(buf, buf + bn, &tmp, &imp);
@@ -5351,7 +5364,7 @@ int css_pseudo_content(css_sheet *sh, const struct dom_node *el, int which, stru
       char buf[512];
       int bn = 0;
       struct css_style tmp;
-      int imp = 0;
+      bool imp = false;
       resolve_vars(r->raw, (int)strlen(r->raw), buf, &bn, (int)sizeof buf, 0);
       css_style_reset(&tmp);
       parse_decls(buf, buf + bn, &tmp, &imp);
@@ -5565,16 +5578,16 @@ static void media_text(const struct media_query *mq, char *o, int cap)
       cm_ap(o, &k, cap, ", ");
     if (cd->negate)
       cm_ap(o, &k, cap, "not ");
-    int need_and = 0;
+    bool need_and = false;
     const char *mt = cd->mtype == MT_SCREEN ? "screen" : cd->mtype == MT_PRINT ? "print" : 0;
     if (mt) {
       cm_ap(o, &k, cap, mt);
-      need_and = 1;
+      need_and = true;
     }
     for (int f = 0; f < cd->nfeat; f++) {
       if (need_and)
         cm_ap(o, &k, cap, " and ");
-      need_and = 1;
+      need_and = true;
       cm_ap(o, &k, cap, "(");
       const struct media_feature *ft = &cd->feat[f];
       switch (ft->kind) {

@@ -135,28 +135,28 @@ static char *p_hex(char *p, uint32_t v)
 /* Is `a` a present page? Unlike paging_user_mapped, no USER bit is required, so the
  * panic handler can probe a supervisor stack word without double-faulting. */
 #ifdef __x86_64__
-static int addr_present(uint64_t a)
+static bool addr_present(uint64_t a)
 {
   uint64_t *t = (uint64_t *)(uintptr_t)((uint64_t)read_cr3() & ~0xFFFull);
   for (int lvl = 39; lvl >= 12; lvl -= 9) {
     uint64_t e = t[(a >> lvl) & 0x1FF];
     if (!(e & 1))
-      return 0;
+      return false;
     if ((e & 0x80) && lvl > 12) /* 1 GiB / 2 MiB large page: present */
-      return 1;
+      return true;
     t = (uint64_t *)(uintptr_t)(e & 0x000FFFFFFFFFF000ull);
   }
-  return 1;
+  return true;
 }
 #else
-static int addr_present(uint32_t a)
+static bool addr_present(uint32_t a)
 {
   uint32_t *pd = (uint32_t *)((uint32_t)read_cr3() & ~0xFFFu);
   uint32_t pde = pd[a >> 22];
   if (!(pde & 1))
-    return 0;
+    return false;
   if (pde & 0x80) /* 4 MiB large page: present */
-    return 1;
+    return true;
   uint32_t *pt = (uint32_t *)(pde & ~0xFFFu);
   return pt[(a >> 12) & 0x3FF] & 1;
 }

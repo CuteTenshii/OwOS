@@ -51,9 +51,11 @@ int battery_percent(int *charging, int *discharging, int *minutes)
   /* Evaluating _BST/_BIF drives the Embedded Controller (milliseconds), so
    * cache the result and refresh at most once every few seconds rather than on
    * every neofetch render. */
-  static int valid = 0, pct = -1, chg = 0, dis = 0, mins = -1;
+  static bool valid = false;
+  static int pct = -1, mins = -1;
+  static bool chg = false, dis = false;
   static uint32_t last_t;
-  static int have = 0;
+  static bool have = false;
 
   uint32_t now = timer_seconds();
   if (!have || (now - last_t) >= 5) {
@@ -70,7 +72,7 @@ int battery_percent(int *charging, int *discharging, int *minutes)
       mins = -1;
     }
     last_t = now;
-    have = 1;
+    have = true;
   }
 
   if (charging)

@@ -260,10 +260,10 @@ static uint32_t dir_find(struct ext_mount *m, const uint8_t *dirbuf, const char 
       if (off + 8 + nl > m->block_size)
         break; /* name runs past the block */
       if (ino && nl == nlen) {
-        int match = 1;
+        bool match = true;
         for (uint32_t i = 0; i < nlen; i++)
           if (e[8 + i] != (uint8_t)name[i]) {
-            match = 0;
+            match = false;
             break;
           }
         if (match) {
@@ -399,10 +399,10 @@ static int probe_dev(struct ext_mount *m, blk_read_fn read)
        * Read exactly one 128-byte entry straddle-safe and index that. */
       if (raw_read(read, ent_lba * 512 + (uint64_t)i * ent_sz, ent, 128) != 0)
         break;
-      int empty = 1;
+      bool empty = true;
       for (int k = 0; k < 16; k++)
         if (ent[k]) {
-          empty = 0;
+          empty = false;
           break;
         }
       if (empty)

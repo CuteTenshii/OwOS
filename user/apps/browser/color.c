@@ -6,6 +6,7 @@
 #include "dom.h" /* lower / starts_ci / streq_ci */
 #include "math.h"
 #include "owos.h"
+#include <stdbool.h>
 
 static int hexnib(char c)
 {
@@ -140,10 +141,10 @@ static int alpha_tok(const char *p)
   while (*p == ' ')
     p++;
   double val = 0;
-  int got = 0;
+  bool got = false;
   while (*p >= '0' && *p <= '9') {
     val = val * 10 + (*p++ - '0');
-    got = 1;
+    got = true;
   }
   if (*p == '.') {
     p++;
@@ -152,7 +153,7 @@ static int alpha_tok(const char *p)
       val += (*p++ - '0') * f;
       f *= 0.1;
     }
-    got = 1;
+    got = true;
   }
   if (!got)
     return 255;
@@ -205,10 +206,11 @@ int color_parse_a(const char *v, int *alpha)
     for (int i = 0; i < 3; i++) {
       while (*p == ' ')
         p++;
-      int got = 0, val = 0;
+      bool got = false;
+      int val = 0;
       while (*p >= '0' && *p <= '9') {
         val = val * 10 + (*p++ - '0');
-        got = 1;
+        got = true;
       }
       if (*p == '.') {
         p++;
@@ -243,16 +245,18 @@ int color_parse_a(const char *v, int *alpha)
       p++;
     int comp[3] = {0, 0, 0};
     for (int i = 0; i < 3; i++) {
-      int got = 0, val = 0, neg = 0;
+      bool got = false;
+      int val = 0;
+      bool neg = false;
       while (*p == ' ')
         p++;
       if (*p == '-') {
-        neg = 1;
+        neg = true;
         p++;
       }
       while (*p >= '0' && *p <= '9') {
         val = val * 10 + (*p++ - '0');
-        got = 1;
+        got = true;
       }
       if (*p == '.') {
         p++;
@@ -282,16 +286,16 @@ int color_parse_a(const char *v, int *alpha)
     for (int i = 0; i < 3; i++) {
       while (*p == ' ')
         p++;
-      int got = 0;
+      bool got = false;
       double val = 0;
-      int neg = 0;
+      bool neg = false;
       if (*p == '-') {
-        neg = 1;
+        neg = true;
         p++;
       }
       while (*p >= '0' && *p <= '9') {
         val = val * 10 + (*p++ - '0');
-        got = 1;
+        got = true;
       }
       if (*p == '.') {
         p++;
@@ -300,7 +304,7 @@ int color_parse_a(const char *v, int *alpha)
           val += (*p++ - '0') * f;
           f *= 0.1;
         }
-        got = 1;
+        got = true;
       }
       if (!got)
         return -1;

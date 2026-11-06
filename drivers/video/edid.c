@@ -20,6 +20,7 @@
 #include "paging.h"
 #include "pci.h"
 #include "timer.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 /* GMBUS register block, offsets from the block base. */
@@ -57,11 +58,11 @@ static const uint8_t gmbus_pins[] = {2, 4, 5, 6, 3, 1};
 static volatile uint8_t *mmio; /* mapped GPU BAR0                         */
 static uint32_t base;          /* current GMBUS block offset             */
 
-static int probed; /* one-shot guard                         */
+static bool probed; /* one-shot guard                         */
 static int cached_hz, cached_w, cached_h;
 static char cached_mfg[4];   /* 3-letter PNP manufacturer id           */
 static char cached_name[16]; /* monitor-name descriptor (0xFC), if any */
-static int cached_internal;  /* PNP id is a known laptop-panel vendor  */
+static bool cached_internal;  /* PNP id is a known laptop-panel vendor  */
 static char err[48];
 
 static void seterr(const char *s)
@@ -146,12 +147,12 @@ static int gmbus_read(uint8_t pin, uint8_t addr, uint8_t *buf, int len)
 
 /* EDID header is 00 FF FF FF FF FF FF 00, and the 128 bytes sum to 0 mod 256.
  */
-static int edid_valid(const uint8_t *e)
+static bool edid_valid(const uint8_t *e)
 {
   static const uint8_t hdr[8] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0};
   for (int i = 0; i < 8; i++)
     if (e[i] != hdr[i])
-      return 0;
+      return false;
   uint8_t sum = 0;
   for (int i = 0; i < EDID_LEN; i++)
     sum += e[i];
@@ -189,7 +190,7 @@ static int parse_preferred(const uint8_t *e)
 /* PNP vendor ids that belong to laptop-panel makers (as opposed to standalone
  * monitor brands). EDID alone has no "internal" bit, so the panel vendor is the
  * practical signal that the display is an integrated laptop screen. */
-static int panel_vendor(const char *mfg)
+static bool panel_vendor(const char *mfg)
 {
   static const char *panels[] = {
       "AUO",
@@ -206,8 +207,8 @@ static int panel_vendor(const char *mfg)
   };
   for (uint32_t i = 0; i < sizeof(panels) / sizeof(panels[0]); i++)
     if (mfg[0] == panels[i][0] && mfg[1] == panels[i][1] && mfg[2] == panels[i][2])
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* Decode the manufacturer id (bytes 8-9, three 5-bit letters) and, if present,
@@ -244,7 +245,7 @@ static void parse_identity(const uint8_t *e)
 
 static void probe(void)
 {
-  probed = 1;
+  probed = true;
   err[0] = '\0';
 
   uint32_t bar;

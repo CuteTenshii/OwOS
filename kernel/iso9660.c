@@ -41,7 +41,7 @@ struct dirrec {
 struct iso_mount {
   blk_read_fn rd; /* reads one 2048-byte logical sector      */
   uint32_t root_lba, root_size;
-  int joliet; /* names are UCS-2 in the active VD         */
+  bool joliet; /* names are UCS-2 in the active VD         */
   char vol_label[33];
   char vol_type[20];
 
@@ -78,7 +78,7 @@ static void decode_name(struct iso_mount *m, char *dst, const uint8_t *id, int l
 struct rec_iter {
   uint32_t base_lba, size, pos; /* extent + total bytes + cursor     */
   uint32_t cur_sec;             /* sector currently in dbuf          */
-  int loaded;
+  bool loaded;
 };
 
 static void ri_init(struct rec_iter *it, uint32_t lba, uint32_t size)
@@ -86,13 +86,13 @@ static void ri_init(struct rec_iter *it, uint32_t lba, uint32_t size)
   it->base_lba = lba;
   it->size = size;
   it->pos = 0;
-  it->loaded = 0;
+  it->loaded = false;
 }
 
 /* Yield the next directory record. Fills out + decoded name (>=256 bytes) and
  * returns 1, or 0 at end. Records never straddle a sector: a zero length byte
  * means "skip to the next sector". */
-static int ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct dirrec *out)
+static bool ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct dirrec *out)
 {
   while (it->pos < it->size) {
     uint32_t sec = it->pos / ISO_SECTOR;
@@ -100,9 +100,9 @@ static int ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct 
 
     if (!it->loaded || it->cur_sec != sec) {
       if (m->rd(it->base_lba + sec, m->dbuf) != 0)
-        return 0;
+        return false;
       it->cur_sec = sec;
-      it->loaded = 1;
+      it->loaded = true;
     }
 
     uint8_t reclen = m->dbuf[off];
@@ -143,13 +143,13 @@ static int ri_next(struct iso_mount *m, struct rec_iter *it, char *name, struct 
     } else {
       decode_name(m, name, p + 33, (int)fil);
     }
-    return 1;
+    return true;
   }
-  return 0;
+  return false;
 }
 
 /* Find a named child in directory (lba,size). 1 + *out on hit, else 0. */
-static int dir_find(struct iso_mount *m, uint32_t lba, uint32_t size, const char *want, struct dirrec *out)
+static bool dir_find(struct iso_mount *m, uint32_t lba, uint32_t size, const char *want, struct dirrec *out)
 {
   struct rec_iter it;
   char name[256];
@@ -160,10 +160,10 @@ static int dir_find(struct iso_mount *m, uint32_t lba, uint32_t size, const char
       continue;
     if (k_streq_ci(name, want)) {
       *out = r;
-      return 1;
+      return true;
     }
   }
-  return 0;
+  return false;
 }
 
 /* Resolve a media subpath ("" or "/a/b/c") to a directory/file record. */
@@ -215,7 +215,7 @@ static void load_label(struct iso_mount *m, const uint8_t *vd)
 
 /* A Supplementary VD is Joliet when its escape sequences (32 bytes at offset
  * 88) begin with one of the UCS-2 level markers %/@ , %/C , %/E. */
-static int is_joliet_svd(const uint8_t *vd)
+static bool is_joliet_svd(const uint8_t *vd)
 {
   const uint8_t *e = vd + 88;
   return e[0] == 0x25 && e[1] == 0x2F && (e[2] == 0x40 || e[2] == 0x43 || e[2] == 0x45);
@@ -225,12 +225,12 @@ static int is_joliet_svd(const uint8_t *vd)
  * failure (no "CD001" magic, I/O error, no medium). */
 static int mount_probe(struct iso_mount *m, blk_read_fn read)
 {
-  m->joliet = 0;
+  m->joliet = false;
   m->rd = read;
   m->vol_label[0] = '\0';
   m->vol_type[0] = '\0';
 
-  int have_primary = 0;
+  bool have_primary = false;
   uint32_t pri_lba = 0, pri_size = 0;
   char pri_label[33] = {0};
 
@@ -248,16 +248,16 @@ static int mount_probe(struct iso_mount *m, blk_read_fn read)
       /* Root directory record sits at offset 156. */
       pri_lba = load_le32(m->rbuf + 156 + 2);
       pri_size = load_le32(m->rbuf + 156 + 10);
-      m->joliet = 0;
+      m->joliet = false;
       load_label(m, m->rbuf);
       for (int i = 0; (pri_label[i] = m->vol_label[i]); i++)
         ;
-      have_primary = 1;
+      have_primary = true;
     } else if (type == VDT_SUPPLEM && is_joliet_svd(m->rbuf)) {
       /* Prefer Joliet: long, mixed-case names. */
       m->root_lba = load_le32(m->rbuf + 156 + 2);
       m->root_size = load_le32(m->rbuf + 156 + 10);
-      m->joliet = 1;
+      m->joliet = true;
       load_label(m, m->rbuf);
       const char *t = "ISO9660+Joliet";
       int i = 0;
@@ -273,7 +273,7 @@ static int mount_probe(struct iso_mount *m, blk_read_fn read)
 
   m->root_lba = pri_lba;
   m->root_size = pri_size;
-  m->joliet = 0;
+  m->joliet = false;
   for (int i = 0; (m->vol_label[i] = pri_label[i]); i++)
     ;
   const char *t = "ISO9660";

@@ -14,13 +14,14 @@
 #define OWOS_BLK_H
 
 #include "fsmount.h" /* blk_read_fn / blk_write_fn */
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Choose the backing device. Call AFTER ahci_init()/nvme_init() (so their
  * _present() is valid) and BEFORE fs_init(). */
 void blk_init(void);
 
-int blk_present(void);         /* 1 if a backing device was selected     */
+bool blk_present(void);        /* 1 if a backing device was selected     */
 const char *blk_backend(void); /* "IDE" / "AHCI" / "NVMe" / "tmpfs"/"none"*/
 
 /* Switch the active backend to a volatile RAM disk (tmpfs). fs_init() calls
@@ -54,7 +55,7 @@ int blk_dev_io(const char *dev, blk_read_fn *r, blk_write_fn *w, int *iso);
 /* True only for the IDE disk. fs_init() auto-creates owofs on a blank IDE disk
  * (the dev/QEMU disk) but never on AHCI/NVMe, which on real hardware is the
  * user's OS drive — formatting that automatically would destroy their data. */
-int blk_is_ide(void);
+bool blk_is_ide(void);
 
 int blk_read_sector(uint32_t lba, void *buf);
 /* Read `count` contiguous sectors at once. */

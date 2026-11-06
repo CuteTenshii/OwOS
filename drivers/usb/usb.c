@@ -22,6 +22,7 @@
 #include "pci.h"
 #include "timer.h"
 #include "xhci.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 #define PCI_CLASS_SERIAL_BUS 0x0C
@@ -113,10 +114,10 @@ static const char *controller_type(uint8_t prog_if)
 
 /* Build a TD token dword: PID, device address, endpoint, data toggle, and the
  * max length encoded as (len-1), with 0x7FF meaning a zero-length packet. */
-static uint32_t td_token(uint8_t pid, uint8_t addr, uint8_t ep, int toggle, int len)
+static uint32_t td_token(uint8_t pid, uint8_t addr, uint8_t ep, bool toggle, int len)
 {
   uint32_t maxlen = (len == 0) ? 0x7FF : ((uint32_t)(len - 1) & 0x7FF);
-  return (uint32_t)pid | ((uint32_t)addr << 8) | ((uint32_t)ep << 15) | ((uint32_t)(toggle & 1) << 19) | (maxlen << 21);
+  return (uint32_t)pid | ((uint32_t)addr << 8) | ((uint32_t)ep << 15) | ((uint32_t)toggle << 19) | (maxlen << 21);
 }
 
 /* Put the controller in a known idle state: stopped, no interrupts (we poll),
@@ -129,14 +130,14 @@ static void uhci_prepare(uint16_t io)
 }
 
 /* Reset and enable a root-hub port so its device will answer on endpoint 0.
- * Returns 1 and sets *lowspeed if a device is enabled, 0 otherwise. The
+ * Returns true and sets *lowspeed if a device is enabled. The
  * change bits (CSC/PEDC) are write-1-to-clear, so writes that aren't meant to
  * clear them must write 0 there. */
-static int uhci_reset_port(uint16_t port, int *lowspeed)
+static bool uhci_reset_port(uint16_t port, bool *lowspeed)
 {
   uint16_t s = inw(port);
   if (!(s & UHCI_PORT_CONNECTED))
-    return 0;
+    return false;
 
   /* Drive reset for >= 50 ms, then release it. */
   outw(port, (s & ~(UHCI_PORT_CSC | UHCI_PORT_PEDC)) | UHCI_PORT_RESET);
@@ -151,7 +152,7 @@ static int uhci_reset_port(uint16_t port, int *lowspeed)
   for (int tries = 0; tries < 20; tries++) {
     s = inw(port);
     if (!(s & UHCI_PORT_CONNECTED))
-      return 0;
+      return false;
     if (s & UHCI_PORT_ENABLED)
       break;
     /* Set enable and clear any pending change bits. */
@@ -161,9 +162,9 @@ static int uhci_reset_port(uint16_t port, int *lowspeed)
 
   s = inw(port);
   if (!(s & UHCI_PORT_ENABLED))
-    return 0;
-  *lowspeed = (s & UHCI_PORT_LOWSPEED) ? 1 : 0;
-  return 1;
+    return false;
+  *lowspeed = s & UHCI_PORT_LOWSPEED;
+  return true;
 }
 
 /* Run one GET-style control transfer (data stage IN) on endpoint 0 of the
@@ -172,7 +173,7 @@ static int uhci_reset_port(uint16_t port, int *lowspeed)
  *
  * Chunks the data stage by `maxpacket`; the caller must pass the device's
  * real bMaxPacketSize0 (or 8, which is always safe for the first read). */
-static int uhci_control_in(uint16_t io, int lowspeed, uint8_t addr, uint8_t maxpacket, uint8_t reqtype, uint8_t req,
+static int uhci_control_in(uint16_t io, bool lowspeed, uint8_t addr, uint8_t maxpacket, uint8_t reqtype, uint8_t req,
                            uint16_t wValue, uint16_t wIndex, uint8_t *out, uint16_t length)
 {
   uint8_t *fl = palloc();   /* 1024-entry frame list, 4 KiB aligned */
@@ -205,18 +206,19 @@ static int uhci_control_in(uint16_t io, int lowspeed, uint8_t addr, uint8_t maxp
 
   /* SETUP stage: always DATA0, 8 bytes. */
   td[n].status = base;
-  td[n].token = td_token(PID_SETUP, addr, 0, 0, 8);
+  td[n].token = td_token(PID_SETUP, addr, 0, false, 8);
   td[n].buffer = (uint32_t)(uintptr_t)setup;
   n++;
 
   /* DATA IN stage: alternate the toggle, starting at DATA1. */
-  int toggle = 1, off = 0, remaining = length;
+  bool toggle = true;
+  int off = 0, remaining = length;
   while (remaining > 0 && n < MAX_TDS - 1) {
     int chunk = remaining < maxpacket ? remaining : maxpacket;
     td[n].status = base;
     td[n].token = td_token(PID_IN, addr, 0, toggle, chunk);
     td[n].buffer = (uint32_t)(uintptr_t)(data + off);
-    toggle ^= 1;
+    toggle = !toggle;
     off += chunk;
     remaining -= chunk;
     n++;
@@ -224,7 +226,7 @@ static int uhci_control_in(uint16_t io, int lowspeed, uint8_t addr, uint8_t maxp
 
   /* STATUS stage: zero-length OUT, always DATA1. */
   td[n].status = base;
-  td[n].token = td_token(PID_OUT, addr, 0, 1, 0);
+  td[n].token = td_token(PID_OUT, addr, 0, true, 0);
   td[n].buffer = 0;
   n++;
 
@@ -250,13 +252,13 @@ static int uhci_control_in(uint16_t io, int lowspeed, uint8_t addr, uint8_t maxp
   /* Poll until the queue drains or a TD reports a fatal error. */
   int result = -1;
   for (int t = 0; t < 200; t++) {
-    int active = 0, err = 0;
+    bool active = false, err = false;
     for (int i = 0; i < n; i++) {
       uint32_t st = td[i].status;
       if (st & TD_ACTIVE)
-        active = 1;
+        active = true;
       if (st & TD_ERRMASK)
-        err = 1;
+        err = true;
     }
     if (err)
       break;
@@ -288,7 +290,7 @@ static int uhci_control_in(uint16_t io, int lowspeed, uint8_t addr, uint8_t maxp
  * exact-length transfers: the 2-byte header gives bLength, then we read
  * exactly that many bytes. The payload is UTF-16LE; we show the ASCII subset.
  */
-static void uhci_print_string(uint16_t io, int lowspeed, uint8_t maxpacket, uint8_t index)
+static void uhci_print_string(uint16_t io, bool lowspeed, uint8_t maxpacket, uint8_t index)
 {
   if (!index)
     return;
@@ -316,7 +318,7 @@ static void uhci_print_string(uint16_t io, int lowspeed, uint8_t maxpacket, uint
  * has no device or the device never answers. */
 static void uhci_enumerate(uint16_t io, uint16_t portsc_off)
 {
-  int lowspeed;
+  bool lowspeed;
   if (!uhci_reset_port(io + portsc_off, &lowspeed))
     return;
 

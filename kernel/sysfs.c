@@ -188,13 +188,13 @@ static void block_attr(const char *name, struct pb *b, int want_size)
   pc(b, '\n');
 }
 
-static int block_exists(const char *name)
+static bool block_exists(const char *name)
 {
   char nm[SEGLEN];
   for (int i = 0; block_name(i, nm); i++)
     if (eq(nm, name))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* ------------------------------------------------------------- PCI helpers */
@@ -219,13 +219,13 @@ static void pci_bdf_str(const struct pci_dev_info *d, char *out)
 }
 
 /* idx-th PCI device's BDF into out; 1 if it exists. */
-static int pci_bdf(int idx, char *out)
+static bool pci_bdf(int idx, char *out)
 {
   struct pci_dev_info d;
   if (pci_dev_info(idx, &d) <= 0)
-    return 0;
+    return false;
   pci_bdf_str(&d, out);
-  return 1;
+  return true;
 }
 
 /* Resolve a BDF dir name to its device info; returns the index, or -1. */
@@ -644,12 +644,12 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
 
 /* ------------------------------------------------------------- enumeration */
 /* List a static name array, returning the idx-th into out (1 if in range). */
-static int from_list(int idx, char *out, int max, const char *const *names, int n)
+static bool from_list(int idx, char *out, int max, const char *const *names, int n)
 {
   if (idx < 0 || idx >= n)
-    return 0;
+    return false;
   cpy(out, names[idx], max);
-  return 1;
+  return true;
 }
 
 int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)

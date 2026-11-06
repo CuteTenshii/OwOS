@@ -45,7 +45,8 @@ static int memrd_get(void *c)
 struct ireader {
   netconn *conn;
   unsigned char buf[2048];
-  int pos, len, eof;
+  int pos, len;
+  bool eof;
 };
 static int ir_getc(struct ireader *r)
 {
@@ -54,7 +55,7 @@ static int ir_getc(struct ireader *r)
       return -1;
     int n = nc_read(r->conn, r->buf, (int)sizeof r->buf);
     if (n <= 0) {
-      r->eof = 1;
+      r->eof = true;
       return -1;
     }
     r->pos = 0;
@@ -123,7 +124,7 @@ static long ir_drain(struct ireader *r, unsigned char **body, int *cap, int *ble
         break;
       int n = nc_read(r->conn, r->buf, (int)sizeof r->buf);
       if (n <= 0) {
-        r->eof = 1;
+        r->eof = true;
         break;
       }
       r->pos = 0;
@@ -184,7 +185,7 @@ static long ir_pump_n(struct ireader *r, long want, http_body_fn sink, void *ctx
         break;
       int n = nc_read(r->conn, r->buf, (int)sizeof r->buf);
       if (n <= 0) {
-        r->eof = 1;
+        r->eof = true;
         break;
       }
       r->pos = 0;
@@ -207,7 +208,7 @@ static long ir_pump_n(struct ireader *r, long want, http_body_fn sink, void *ctx
  * `sink`, undoing the transfer framing. Returns the content byte count, or -1
  * if the sink aborts (a disk error). `clen < 0` with !chunked means read to
  * close. */
-static long ir_pump_body(struct ireader *r, int chunked, long clen, http_body_fn sink, void *ctx)
+static long ir_pump_body(struct ireader *r, bool chunked, long clen, http_body_fn sink, void *ctx)
 {
   long total = 0;
   if (chunked) {
@@ -262,12 +263,12 @@ struct resp_meta {
  * "HTTP/2 NNN\r\nname: value\r\n…"): status + Location + Content-Type into
  * `meta`, and the framing (chunked / Content-Length) for the body reader.
  * Shared by the h1.1 socket reader and the h2 path. */
-static void parse_resp_headers(const char *hdr, struct resp_meta *meta, int *chunked, long *clen)
+static void parse_resp_headers(const char *hdr, struct resp_meta *meta, bool *chunked, long *clen)
 {
   meta->status = 0;
   meta->location[0] = '\0';
   meta->ctype[0] = '\0';
-  *chunked = 0;
+  *chunked = false;
   *clen = -1;
 
   {
@@ -291,7 +292,7 @@ static void parse_resp_headers(const char *hdr, struct resp_meta *meta, int *chu
     } else if (starts_ci(line, "transfer-encoding:")) {
       for (const char *q = line; *q && *q != '\n'; q++)
         if (starts_ci(q, "chunked")) {
-          *chunked = 1;
+          *chunked = true;
           break;
         }
     } else if (starts_ci(line, "location:")) {
@@ -337,7 +338,7 @@ static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp
     hdr_out[k] = '\0';
   }
 
-  int chunked;
+  bool chunked;
   long clen;
   parse_resp_headers(hdr, meta, &chunked, &clen);
 
@@ -383,7 +384,7 @@ done:
   return body;
 }
 
-static int is_redirect(int s) { return s == 301 || s == 302 || s == 303 || s == 307 || s == 308; }
+static bool is_redirect(int s) { return s == 301 || s == 302 || s == 303 || s == 307 || s == 308; }
 
 /* Fetch an absolute URL as a sub-resource (GET, follow redirects): the 200 body
  * (caller frees) + *outlen, or NULL. A thin wrapper over browser_fetch (the one
@@ -415,7 +416,7 @@ static unsigned char *subres_get(const char *absurl, const char *accept, int *ou
   if (g_embedder[0] && !cors_same_origin(g_embedder, absurl)) {
     struct http_headers H;
     http_headers_parse(&H, hdr);
-    int blocked = !corp_allows(&H, g_embedder, absurl, 0, 0);
+    bool blocked = !corp_allows(&H, g_embedder, absurl, 0, 0);
     http_headers_free(&H);
     if (blocked) {
       free(body);
@@ -529,7 +530,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
 {
   const char *method = (rq->method && rq->method[0]) ? rq->method : "GET";
   const char *accept = (rq->accept && rq->accept[0]) ? rq->accept : "*/*";
-  int is_get = streq_ci(method, "GET") || streq_ci(method, "HEAD");
+  bool is_get = streq_ci(method, "GET") || streq_ci(method, "HEAD");
   char full[URL_MAX];
   {
     int k = 0;
@@ -549,9 +550,9 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
    * entirely; a stale one rides a conditional GET (the `cond` headers) and a
    * 304 reuses the stored body. Keyed on the requested URL (origurl), so a
    * repeat hits the cache before re-walking any redirect chain. */
-  int cacheable = streq_ci(method, "GET") && !(rq->body && rq->body_len > 0);
+  bool cacheable = streq_ci(method, "GET") && !(rq->body && rq->body_len > 0);
   long now = (long)rtc_epoch();
-  int revalidating = 0;
+  bool revalidating = false;
   char cond[512];
   cond[0] = '\0';
   char origurl[URL_MAX];
@@ -658,7 +659,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
           free(hb.body);
         return 0;
       }
-      int dchunk;
+      bool dchunk;
       long dclen;
       parse_resp_headers(rawhdr, &meta, &dchunk, &dclen);
       body = hb.body ? hb.body : malloc(1);
@@ -675,7 +676,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
         nc_close(conn);
         return 0;
       }
-      struct ireader r = {conn, {0}, 0, 0, 0};
+      struct ireader r = {conn, {0}, 0, 0, false};
       body = read_http_body(&r, &blen, &meta, rawhdr, sizeof rawhdr);
       nc_close(conn);
     }
@@ -762,7 +763,7 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
  * total and latching a disk error (which aborts the pump). */
 struct filesink {
   long written;
-  int err;
+  bool err;
 };
 static int filesink_cb(void *ctx, const unsigned char *p, int n)
 {
@@ -770,7 +771,7 @@ static int filesink_cb(void *ctx, const unsigned char *p, int n)
   if (n <= 0)
     return 0;
   if (stream_write(p, n) < 0) {
-    f->err = 1;
+    f->err = true;
     return 1;
   } /* abort the pump */
   f->written += n;
@@ -788,8 +789,8 @@ struct mstream {
   int loc_cap;
   struct filesink fs;
   int status;
-  int began;    /* stream_begin done (a 2xx is being written) */
-  int redirect; /* saw a 3xx with a Location                  */
+  bool began;    /* stream_begin done (a 2xx is being written) */
+  bool redirect; /* saw a 3xx with a Location                  */
   char ctype[160];
 };
 static int mstream_headers(void *ctx, const char *block, int len)
@@ -797,7 +798,7 @@ static int mstream_headers(void *ctx, const char *block, int len)
   (void)len;
   struct mstream *m = ctx;
   struct resp_meta meta;
-  int ch;
+  bool ch;
   long cl;
   parse_resp_headers(block, &meta, &ch, &cl);
   m->status = meta.status;
@@ -808,13 +809,13 @@ static int mstream_headers(void *ctx, const char *block, int len)
     m->ctype[k] = '\0';
   }
   if (is_redirect(meta.status) && meta.location[0]) {
-    m->redirect = 1;
+    m->redirect = true;
     resolve_url(m->full, meta.location, m->loc, m->loc_cap);
   } else if (meta.status >= 200 && meta.status < 300 && !m->began && !m->fs.err) {
     if (stream_begin(m->file) == 0)
-      m->began = 1;
+      m->began = true;
     else
-      m->fs.err = 1;
+      m->fs.err = true;
   }
   return 0;
 }
@@ -969,7 +970,7 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
       return -1;
     }
 
-    struct ireader r = {conn, {0}, 0, 0, 0};
+    struct ireader r = {conn, {0}, 0, 0, false};
     char rawhdr[RESP_HDR_MAX];
     if (ir_read_header_block(&r, rawhdr, sizeof rawhdr) < 0) {
       nc_close(conn);
@@ -977,7 +978,7 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
       return -1;
     }
     struct resp_meta meta;
-    int chunked;
+    bool chunked;
     long clen;
     parse_resp_headers(rawhdr, &meta, &chunked, &clen);
 
@@ -1008,7 +1009,7 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
       net_fail(nid, "GET", full);
       return -1;
     }
-    struct filesink fs = {0, 0};
+    struct filesink fs = {0, false};
     long got = ir_pump_body(&r, chunked, clen, filesink_cb, &fs);
     nc_close(conn);
     if (got < 0 || fs.err) {
@@ -1104,7 +1105,7 @@ unsigned char *browser_cors_fetch(const char *page_url, int with_credentials, co
     struct http_headers PH;
     http_headers_parse(&PH, phdr);
     char reason[64];
-    int ok = cors_check_preflight(&PH, origin, method, author, with_credentials, reason, sizeof reason);
+    bool ok = cors_check_preflight(&PH, origin, method, author, with_credentials, reason, sizeof reason);
     http_headers_free(&PH);
     if (!ok)
       return 0;
@@ -1128,7 +1129,7 @@ unsigned char *browser_cors_fetch(const char *page_url, int with_credentials, co
   struct http_headers H;
   http_headers_parse(&H, rawhdr);
   char reason[64];
-  int ok = cors_check_response(&H, origin, with_credentials, reason, sizeof reason);
+  bool ok = cors_check_response(&H, origin, with_credentials, reason, sizeof reason);
   http_headers_free(&H);
   if (!ok) {
     free(body);
@@ -1261,11 +1262,11 @@ static void par_fetch(int n, void (*fn)(void *ctx, int i), void *ctx)
  * embedder (the page, or an outer frame) is matched against it by origin. */
 
 /* Two URLs share an origin when scheme (tls), host and port all match. */
-static int origin_eq(const char *a, const char *b)
+static bool origin_eq(const char *a, const char *b)
 {
   struct purl ua, ub;
   if (!parse_url(a, &ua) || !parse_url(b, &ub))
-    return 0;
+    return false;
   return ua.tls == ub.tls && ua.port == ub.port && streq_ci(ua.host, ub.host);
 }
 
@@ -1295,13 +1296,13 @@ static const char *csp_directive(const char *csp, const char *name)
 /* Does one frame-ancestors source token [tok,tend) admit the embedder `parent`
  * (`framed` is the framed doc's own URL, used by 'self')? Handles 'self', '*',
  * a scheme://host[:port] origin, a "*.suffix" host, and a bare host. */
-static int csp_src_admits(const char *tok, const char *tend, const char *parent, const char *framed)
+static bool csp_src_admits(const char *tok, const char *tend, const char *parent, const char *framed)
 {
   int n = (int)(tend - tok);
   if (n == 6 && starts_ci(tok, "'self'"))
     return origin_eq(parent, framed);
   if (n == 1 && tok[0] == '*')
-    return 1;
+    return true;
 
   char s[256];
   int k = 0;
@@ -1310,7 +1311,7 @@ static int csp_src_admits(const char *tok, const char *tend, const char *parent,
   s[k] = '\0';
   struct purl pp;
   if (!parse_url(parent, &pp))
-    return 0;
+    return false;
   if (contains_ci(s, "://"))
     return origin_eq(parent, s);    /* full origin */
   if (s[0] == '*' && s[1] == '.') { /* host suffix */
@@ -1324,8 +1325,8 @@ static int csp_src_admits(const char *tok, const char *tend, const char *parent,
 /* Decide whether `framed` may be embedded by `parent` given its X-Frame-Options
  * and Content-Security-Policy. frame-ancestors, when present, supersedes XFO. A
  * short human reason is written to `reason` when embedding is refused. */
-static int frame_embedding_allowed(const char *parent, const char *framed, const char *xfo, const char *csp,
-                                   char *reason, int rcap)
+static bool frame_embedding_allowed(const char *parent, const char *framed, const char *xfo, const char *csp,
+                                    char *reason, int rcap)
 {
   if (reason && rcap)
     reason[0] = '\0';
@@ -1333,7 +1334,7 @@ static int frame_embedding_allowed(const char *parent, const char *framed, const
   const char *fa = csp_directive(csp, "frame-ancestors");
   if (fa) {
     const char *p = fa;
-    int any = 0, ok = 0;
+    bool any = false, ok = false;
     while (*p && *p != ';') {
       while (*p == ' ')
         p++;
@@ -1342,24 +1343,24 @@ static int frame_embedding_allowed(const char *parent, const char *framed, const
         p++;
       if (p == t)
         break;
-      any = 1;
+      any = true;
       if ((p - t) == 6 && starts_ci(t, "'none'")) {
         if (reason && rcap) {
           int k = 0;
           sapp(reason, &k, rcap, "CSP frame-ancestors 'none'");
         }
-        return 0;
+        return false;
       }
       if (csp_src_admits(t, p, parent, framed))
-        ok = 1;
+        ok = true;
     }
     if (!any || ok)
-      return 1;
+      return true;
     if (reason && rcap) {
       int k = 0;
       sapp(reason, &k, rcap, "CSP frame-ancestors");
     }
-    return 0;
+    return false;
   }
 
   if (xfo && xfo[0]) {
@@ -1371,16 +1372,16 @@ static int frame_embedding_allowed(const char *parent, const char *framed, const
         int k = 0;
         sapp(reason, &k, rcap, "X-Frame-Options: DENY");
       }
-      return 0;
+      return false;
     }
     if (starts_ci(v, "sameorigin")) {
       if (origin_eq(parent, framed))
-        return 1;
+        return true;
       if (reason && rcap) {
         int k = 0;
         sapp(reason, &k, rcap, "X-Frame-Options: SAMEORIGIN");
       }
-      return 0;
+      return false;
     }
     if (starts_ci(v, "allow-from")) {
       const char *u = v + 10;
@@ -1392,16 +1393,16 @@ static int frame_embedding_allowed(const char *parent, const char *framed, const
         uri[k] = u[k];
       uri[k] = '\0';
       if (uri[0] && origin_eq(parent, uri))
-        return 1;
+        return true;
       if (reason && rcap) {
         int kk = 0;
         sapp(reason, &kk, rcap, "X-Frame-Options: ALLOW-FROM");
       }
-      return 0;
+      return false;
     }
     /* Unknown / malformed value: browsers ignore it, so do we. */
   }
-  return 1;
+  return true;
 }
 
 /* Decode a data: URL into a fresh buffer (caller frees) + its media type, so a
@@ -1427,7 +1428,8 @@ unsigned char *decode_data_url(const char *url, int *outlen, char *ctype, int ca
     return 0;
 
   char mt[80];
-  int mi = 0, base64 = 0;
+  int mi = 0;
+  bool base64 = false;
   const char *h = p;
   while (h < comma && *h != ';') {
     if (mi < (int)sizeof mt - 1)
@@ -1441,7 +1443,7 @@ unsigned char *decode_data_url(const char *url, int *outlen, char *ctype, int ca
     while (h < comma && *h != ';')
       h++;
     if (h - tok == 6 && starts_ci(tok, "base64"))
-      base64 = 1;
+      base64 = true;
   }
   {
     int k = 0;
@@ -1563,7 +1565,7 @@ static void iframe_job(void *vctx, int i)
   const char *xfo = http_headers_get(&H, "x-frame-options");
   const char *csp = http_headers_get(&H, "content-security-policy");
   const char *framed = final[0] ? final : r->url;
-  int ok = frame_embedding_allowed(r->parent, framed, xfo, csp, r->reason, sizeof r->reason);
+  bool ok = frame_embedding_allowed(r->parent, framed, xfo, csp, r->reason, sizeof r->reason);
   if (ok && !cors_same_origin(r->parent, framed)) /* CORP also guards a framed resource */
     ok = corp_allows(&H, r->parent, framed, r->reason, sizeof r->reason);
   http_headers_free(&H);
@@ -1609,16 +1611,16 @@ void fetch_iframes(void)
 
 /* Normalise a URL's origin (HSTS-upgrades http->https) into *u; returns 0 on a
  * bad URL. */
-static int origin_of(const char *url, struct purl *u)
+static bool origin_of(const char *url, struct purl *u)
 {
   if (!parse_url(url, u))
-    return 0;
+    return false;
   if (!u->tls && hsts_has(u->host)) {
     u->tls = 1;
     if (u->port == 80)
       u->port = 443;
   }
-  return 1;
+  return true;
 }
 
 /* Shared state for a parallel subres batch: the URL list + its output arrays,
@@ -1629,7 +1631,7 @@ struct subres_batch {
   const char *accept;
   unsigned char **bodies;
   int *lens;
-  char *handled;
+  bool *handled;
   volatile int lock;
 };
 
@@ -1652,12 +1654,12 @@ static void subres_job(void *vctx, int i)
     return;
   } /* claimed by another group */
   if (!origin_of(c->urls[i], &u)) {
-    c->handled[i] = 1;
+    c->handled[i] = true;
     par_spin_unlock(&c->lock);
     return;
   }
   if (!u.tls) {
-    c->handled[i] = 1;
+    c->handled[i] = true;
     grp[ng++] = i; /* plain http: this one */
   } else {
     for (int j = i; j < c->n && ng < H2_FETCH_MAX; j++) { /* same-origin HTTPS group */
@@ -1665,12 +1667,12 @@ static void subres_job(void *vctx, int i)
         continue;
       struct purl v;
       if (!origin_of(c->urls[j], &v)) {
-        c->handled[j] = 1;
+        c->handled[j] = true;
         continue;
       }
       if (!v.tls || !streq_ci(v.host, u.host) || v.port != u.port)
         continue;
-      c->handled[j] = 1;
+      c->handled[j] = true;
       grp[ng++] = j;
     }
   }
@@ -1681,7 +1683,7 @@ static void subres_job(void *vctx, int i)
     return;
   }
 
-  char(*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
+  char (*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
   if (!paths) { /* OOM: fall back to h1.1 each */
     for (int g = 0; g < ng; g++)
       c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]);
@@ -1690,7 +1692,7 @@ static void subres_job(void *vctx, int i)
   /* Per-stream response-header buffers, so a fetched 200 can be cached (the h2
    * batch otherwise surfaces no headers). NULL on OOM = fetch without caching.
    */
-  char(*hdrs)[RESP_HDR_MAX] = malloc((unsigned)ng * RESP_HDR_MAX);
+  char (*hdrs)[RESP_HDR_MAX] = malloc((unsigned)ng * RESP_HDR_MAX);
   long now = (long)rtc_epoch();
   struct h2_fetch reqs[H2_FETCH_MAX];
   for (int g = 0; g < ng; g++) {
@@ -1787,7 +1789,7 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
    * fixed cap): a page may reference any number of sub-resources. Each h2 group
    * still gathers at most H2_FETCH_MAX same-origin streams per connection and
    * leaves the rest for another claimed group, so this stays unbounded. */
-  char *handled = calloc((unsigned)n, 1);
+  bool *handled = calloc((unsigned)n, sizeof *handled);
   if (!handled) { /* OOM: degrade to one fetch at a time */
     for (int i = 0; i < n; i++)
       bodies[i] = subres_get(urls[i], accept, &lens[i]);
@@ -1802,7 +1804,7 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
     if (starts_ci(urls[i], "data:")) {
       char ct[64];
       bodies[i] = decode_data_url(urls[i], &lens[i], ct, sizeof ct);
-      handled[i] = 1;
+      handled[i] = true;
     }
   }
 
@@ -1816,7 +1818,7 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
     if (cache_lookup("GET", urls[i], now, &cb, &cl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
       bodies[i] = cb;
       lens[i] = cl;
-      handled[i] = 1;
+      handled[i] = true;
       struct net_log e = {"GET", urls[i], 200, "", cl, 0, 0};
       devtools_net_add(&e);
     }
@@ -1922,7 +1924,7 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
       body[3] == 'G') { /* PNG stored verbatim (lazy decode) */
     struct memrd mr = {body, 0, blen};
     unsigned iw = 0, ih = 0;
-    int okdim = (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih);
+    bool okdim = (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih);
 
     int off = -1;
     img_lock();
@@ -1970,7 +1972,7 @@ static void fetch_image(int i, const char *page_url)
   free(body);
 }
 
-static int favicon_decode(const unsigned char *r, int n); /* defined below */
+static bool favicon_decode(const unsigned char *r, int n); /* defined below */
 
 /* on_done bridge for the h2 batch: map a batch request index back to its target
  * (idxs[]) and consume that resource as its stream lands. An index of FAV_IDX
@@ -2021,11 +2023,11 @@ static void h2_prefetch(const char *page_url)
   if (!parse_url(page_url, &pu) || !pu.tls)
     return;
 
-  char(*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
+  char (*paths)[URL_MAX] = malloc((unsigned)H2_FETCH_MAX * URL_MAX);
   if (!paths)
     return;
   /* Per-stream header buffers so a fetched 200 can be cached (h2img_commit). */
-  char(*hdrs)[RESP_HDR_MAX] = malloc((unsigned)H2_FETCH_MAX * RESP_HDR_MAX);
+  char (*hdrs)[RESP_HDR_MAX] = malloc((unsigned)H2_FETCH_MAX * RESP_HDR_MAX);
   long now = (long)rtc_epoch();
   struct h2_fetch reqs[H2_FETCH_MAX];
   int idxs[H2_FETCH_MAX], nb = 0;
@@ -2298,16 +2300,16 @@ static int fav_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
   return 0;
 }
 
-static int fav_decode_png(const unsigned char *buf, int len)
+static bool fav_decode_png(const unsigned char *buf, int len)
 {
   struct memrd mr = {buf, 0, len};
   unsigned iw = 0, ih = 0;
   if (upng_dimensions(memrd_get, &mr, &iw, &ih) != 0 || !iw || !ih)
-    return 0;
+    return false;
   struct favscale v = {iw, ih, 0, B->pg->favicon};
   struct memrd mr2 = {buf, 0, len};
   if (upng_decode(memrd_get, &mr2, fav_row, &v, 0, 0) != 0)
-    return 0;
+    return false;
   return v.next_r > 0;
 }
 
@@ -2323,26 +2325,27 @@ static unsigned le32(const unsigned char *p)
  * equal AND (1bpp transparency) mask, so the real height is half. Supports
  * 1/4/8/24/32 bpp, BI_RGB. Sampled directly at 16x16 to avoid a full-size
  * intermediate buffer. */
-static int fav_decode_dib(const unsigned char *p, int len)
+static bool fav_decode_dib(const unsigned char *p, int len)
 {
   if (len < 40)
-    return 0;
+    return false;
   unsigned hsz = le32(p);
   if (hsz < 40 || (int)hsz > len)
-    return 0;
+    return false;
   int W = (int)le32(p + 4);
   int Hf = (int)le32(p + 8);
   unsigned bpp = le16(p + 14);
   unsigned comp = le32(p + 16);
   if (comp != 0 && comp != 3)
-    return 0; /* BI_RGB / BI_BITFIELDS only */
+    return false; /* BI_RGB / BI_BITFIELDS only */
   if (W <= 0 || Hf <= 0)
-    return 0;
+    return false;
 
-  int H = Hf / 2, mask = 1; /* XOR colour rows = half     */
+  int H = Hf / 2;
+  bool mask = true; /* XOR colour rows = half     */
   if (H < 1) {
     H = Hf;
-    mask = 0;
+    mask = false;
   } /* no AND mask present         */
 
   unsigned clr = le32(p + 32);
@@ -2355,19 +2358,19 @@ static int fav_decode_dib(const unsigned char *p, int len)
   const unsigned char *xor_ = pal + pal_sz;
   long xor_sz = (long)xstride * H;
   if ((xor_ - p) + xor_sz > len)
-    return 0;
+    return false;
 
   int astride = ((W + 31) / 32) * 4;
   const unsigned char *and_ = xor_ + xor_sz;
-  int and_present = mask && ((and_ - p) + (long)astride * H <= len);
+  bool and_present = mask && ((and_ - p) + (long)astride * H <= len);
 
   /* Trust a 32bpp alpha channel only if at least one pixel is non-zero;
    * many icons leave it all-zero and rely on the AND mask instead. */
-  int has_alpha = 0;
+  bool has_alpha = false;
   if (bpp == 32)
     for (long i = 3; i < xor_sz && !has_alpha; i += 4)
       if (xor_[i])
-        has_alpha = 1;
+        has_alpha = true;
 
   for (int dy = 0; dy < FAVICON_H; dy++) {
     int sy = dy * H / FAVICON_H; /* dest row -> source row      */
@@ -2397,7 +2400,7 @@ static int fav_decode_dib(const unsigned char *p, int len)
         else if (bpp == 1)
           idx = (xrow[sx >> 3] >> (7 - (sx & 7))) & 1;
         else
-          return 0; /* unsupported depth           */
+          return false; /* unsupported depth           */
         if (idx >= clr)
           idx = 0;
         const unsigned char *c = pal + idx * 4;
@@ -2413,19 +2416,19 @@ static int fav_decode_dib(const unsigned char *p, int len)
       B->pg->favicon[dy * FAVICON_W + dx] = (a << 24) | (r << 16) | (g << 8) | b;
     }
   }
-  return 1;
+  return true;
 }
 
 /* Pick the best image in an .ico directory: the smallest entry that is still
  * >= 16px (an exact 16 wins), else the largest available. Fills poff/plen with
  * its byte range within the file. */
-static int ico_pick(const unsigned char *p, int len, int *poff, int *plen)
+static bool ico_pick(const unsigned char *p, int len, int *poff, int *plen)
 {
   if (len < 6 || le16(p) != 0 || le16(p + 2) != 1)
-    return 0; /* type 1 = icon */
+    return false; /* type 1 = icon */
   int count = le16(p + 4);
   if (count < 1 || 6 + count * 16 > len)
-    return 0;
+    return false;
   int best = -1, best_score = -1;
   for (int i = 0; i < count; i++) {
     const unsigned char *e = p + 6 + i * 16;
@@ -2446,16 +2449,16 @@ static int ico_pick(const unsigned char *p, int len, int *poff, int *plen)
 
 /* Decode `buf` (a fetched favicon) into B->pg->favicon; returns 1 on success.
  */
-static int favicon_decode(const unsigned char *r, int n)
+static bool favicon_decode(const unsigned char *r, int n)
 {
   if (n < 4)
-    return 0;
+    return false;
   if (r[0] == 0x89 && r[1] == 'P' && r[2] == 'N' && r[3] == 'G')
     return fav_decode_png(r, n);
   if (r[0] == 0 && r[1] == 0 && r[2] == 1 && r[3] == 0) { /* .ico        */
     int off = 0, l = 0;
     if (!ico_pick(r, n, &off, &l))
-      return 0;
+      return false;
     const unsigned char *img = r + off;
     if (l >= 8 && img[0] == 0x89 && img[1] == 'P' && img[2] == 'N' && img[3] == 'G') /* PNG in .ico */
       return fav_decode_png(img, l);
@@ -2463,7 +2466,7 @@ static int favicon_decode(const unsigned char *r, int n)
   }
   if (svg_probe((const char *)r, n)) /* SVG favicon */
     return svg_render((const char *)r, n, FAVICON_W, FAVICON_H, B->pg->favicon, 0x000000);
-  return 0; /* GIF/BMP favicons unsupported */
+  return false; /* GIF/BMP favicons unsupported */
 }
 
 /* Fetch and decode the page favicon into B->pg->favicon, from the <link

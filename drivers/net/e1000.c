@@ -24,6 +24,7 @@
  * CPU sees fresh status without an uncached mapping. Only the registers are UC.
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -258,8 +259,8 @@ static const uint16_t intel_nics[] = {
 
 static volatile uint8_t *mmio; /* BAR0, mapped uncached                   */
 static uint8_t mac[6];
-static int present;
-static int pch_part; /* 1 for I217/I218/I219 (needs PCH WAs)     */
+static bool present;
+static bool pch_part; /* 1 for I217/I218/I219 (needs PCH WAs)     */
 static uint16_t device_id;
 
 static struct rx_desc *rx_ring; /* RX_DESCS entries, page-aligned          */
@@ -468,7 +469,7 @@ static uint32_t phy_id;  /* full 32-bit PHY identity, once found    */
 
 /* Is the PHY answering MDIO? Reads PHYID1/2 at address 1 then 2 (caller holds
  * the flag). Records the address + id on success (e1000_phy_is_accessible). */
-static int phy_accessible_locked(void)
+static bool phy_accessible_locked(void)
 {
   for (uint8_t a = 1; a <= 2; a++) {
     int id1 = phy_read_locked(a, 2);
@@ -479,9 +480,9 @@ static int phy_accessible_locked(void)
       continue;
     phy_addr = a;
     phy_id = ((uint32_t)id1 << 16) | (uint16_t)id2;
-    return 1;
+    return true;
   }
-  return 0;
+  return false;
 }
 
 /* Bring the MAC-PHY interconnect out of SMBus into PCIe mode so MDIO reaches
@@ -502,7 +503,7 @@ static void pch_phy_workarounds(void)
     return;
   }
 
-  int ok = phy_accessible_locked();
+  bool ok = phy_accessible_locked();
   if (!ok) {
     dlog("  PHY: force SMBus\n");
     reg_write(E1000_CTRL_EXT, reg_read(E1000_CTRL_EXT) | CTRL_EXT_FORCE_SMBUS);
@@ -562,13 +563,13 @@ static void pch_phy_link_setup(void)
   phy_release();
   dlog("  PHY autoneg restarted; waiting for link\n");
 
-  int up = 0;
+  bool up = false;
   for (int i = 0; i < 400; i++) { /* up to ~4s                */
     if (phy_acquire() == 0) {
       int bmsr = phy_read_locked(phy_addr, 1);
       phy_release();
       if (bmsr > 0 && (bmsr & 0x0004)) {
-        up = 1;
+        up = true;
         break;
       } /* link up   */
     }
@@ -619,7 +620,7 @@ static void kmrn_write_locked(uint8_t off, uint16_t data)
 /* Configure the Kumeran K1 power state (e1000e e1000_configure_k1_ich8lan).
  * Disabling K1 takes the MAC<->PHY link out of its low-power idle — the
  * suspected reason the link passes RX but the transmit engine never starts. */
-static void pch_configure_k1(int k1_enable)
+static void pch_configure_k1(bool k1_enable)
 {
   if (phy_acquire() != 0)
     return;
@@ -729,7 +730,7 @@ static void pch_reset(void)
 
 /* True for the I219 (Sunrise-Point/Kaby-Lake-class) parts that need the TX
  * arbiter errata — i.e. every recognized PCH part except I217/I218. */
-static int is_pch_spt(uint16_t dev)
+static bool is_pch_spt(uint16_t dev)
 {
   switch (dev) {
   case 0x153A:
@@ -738,13 +739,13 @@ static int is_pch_spt(uint16_t dev)
   case 0x15A1:
   case 0x15A2:
   case 0x15A3: /* I218 (LPT)           */
-    return 0;
+    return false;
   case 0x100E:
   case 0x100F:
   case 0x10D3: /* QEMU/VMware discrete     */
-    return 0;
+    return false;
   default:
-    return 1; /* I219 (SPT and later)     */
+    return true; /* I219 (SPT and later)     */
   }
 }
 
@@ -1017,11 +1018,11 @@ static const char *model_name(uint16_t dev)
  * with no panic). So we recognize these parts but refuse to touch their MMIO.
  * The QEMU parts (82540EM/82574L) and the VMware 82545EM are real PCI(e)
  * devices whose CSRs are live immediately, so they're driven normally. */
-static int is_pch_lan(uint16_t dev) { return dev != 0x100E && dev != 0x100F && dev != 0x10D3; }
+static bool is_pch_lan(uint16_t dev) { return dev != 0x100E && dev != 0x100F && dev != 0x10D3; }
 
 static int e1000_probe(void)
 {
-  int found = 0;
+  bool found = false;
   uint8_t bus = 0, slot = 0, func = 0;
 
   for (int b = 0; b < 256 && !found; b++) {
@@ -1039,7 +1040,7 @@ static int e1000_probe(void)
             slot = (uint8_t)s;
             func = (uint8_t)f;
             device_id = dev;
-            found = 1;
+            found = true;
             break;
           }
         }
@@ -1049,7 +1050,7 @@ static int e1000_probe(void)
   if (!found)
     return 0; /* silent: another driver may own the NIC      */
 
-  int pch = is_pch_lan(device_id);
+  bool pch = is_pch_lan(device_id);
   pch_part = pch;
   diag_len = 0;
   diag[0] = 0;
@@ -1136,7 +1137,7 @@ static int e1000_probe(void)
     dlog("  took hw control (DRV_LOAD)\n");
 
     /* Take the MAC<->PHY internal (Kumeran) link out of K1 low-power idle. */
-    pch_configure_k1(0);
+    pch_configure_k1(false);
 
     /* Un-gate PHY config and let the MAC track the PHY's real link/speed (so
      * STATUS reflects a true link and the transmit engine gets a clock). */
@@ -1195,7 +1196,7 @@ static int e1000_probe(void)
   if (irq >= 8)
     irq_unmask(2); /* cascade line for the slave PIC              */
 
-  present = 1;
+  present = true;
 
   con_printf("net: Intel %s at mmio 0x%08X irq %u mac ", model_name(device_id), mmio_phys, irq);
   for (int i = 0; i < 6; i++) {

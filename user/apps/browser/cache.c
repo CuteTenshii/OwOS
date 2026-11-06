@@ -46,12 +46,12 @@ struct cache_entry {
   long stored_at; /* epoch seconds when received          */
   long freshness; /* lifetime seconds (from headers)      */
   long date, age; /* for current-age recomputation        */
-  int no_cache, must_revalidate;
+  bool no_cache, must_revalidate;
   char *etag;     /* validator, or NULL                   */
   char *last_mod; /* validator, or NULL                   */
 
   char disk[24];                   /* on-disk filename (hash of url), or "" */
-  int dirty;                       /* body/headers not yet written to disk */
+  bool dirty;                      /* body/headers not yet written to disk */
   unsigned long long hash;         /* url_hash(url): hash-index + bucket key */
   struct cache_entry *next, *prev; /* LRU list (head = most-recently-used)   */
   struct cache_entry *hnext;       /* next entry sharing this url's bucket   */
@@ -65,7 +65,7 @@ static struct cache_entry *g_head, *g_tail;
 #define CACHE_BUCKETS 256 /* power of two: url-hash index */
 static struct cache_entry *g_bucket[CACHE_BUCKETS];
 static long g_bytes;
-static int g_disk_ok; /* CACHE_DIR is writable      */
+static bool g_disk_ok; /* CACHE_DIR is writable      */
 
 /* Files whose entries were evicted; deleted by the next cache_flush (owofs
  * one-stream rule keeps unlink off the fetch threads too). */
@@ -104,7 +104,7 @@ static char *sdup(const char *s)
   return d;
 }
 
-static int is_get(const char *method) { return !method || !method[0] || streq_ci(method, "GET"); }
+static bool is_get(const char *method) { return !method || !method[0] || streq_ci(method, "GET"); }
 
 /* FNV-1a of the URL: keys both the on-disk filename and the in-memory bucket.
  */
@@ -335,7 +335,7 @@ int cache_lookup(const char *method, const char *url, long now, unsigned char **
   lru_touch(e);
 
   int has_validator = e->etag || e->last_mod;
-  int fresh = !e->no_cache && entry_current_age(e, now) < e->freshness;
+  bool fresh = !e->no_cache && entry_current_age(e, now) < e->freshness;
 
   if (fresh) {
     fill_out(e, body, len, ctype, ctype_cap, hdr, hdr_cap);
@@ -416,7 +416,7 @@ void cache_store(const char *method, const char *url, int status, long now, cons
     e->hdr = sdup(hdr_block);
     e->status = status;
     set_freshness(e, &cc, now);
-    e->dirty = 1;
+    e->dirty = true;
     g_bytes += len;
     lk_unlock();
     http_headers_free(&H);
@@ -447,7 +447,7 @@ void cache_store(const char *method, const char *url, int status, long now, cons
   e->status = status;
   set_freshness(e, &cc, now);
   disk_name(url, e->disk);
-  e->dirty = 1;
+  e->dirty = true;
   entry_link(e);
   g_bytes += len;
   lk_unlock();
@@ -473,7 +473,7 @@ int cache_revalidated(const char *url, long now, const char *hdr_block, unsigned
     return 0;
   }
   set_freshness(e, &cc, now); /* refresh freshness from the 304 */
-  e->dirty = 1;               /* freshness changed: rewrite front matter */
+  e->dirty = true;            /* freshness changed: rewrite front matter */
   lru_touch(e);
   fill_out(e, body, len, ctype, ctype_cap, hdr, hdr_cap);
   int ok = *body != 0;
@@ -534,7 +534,7 @@ void cache_flush(void)
   for (struct cache_entry *e = g_head; e; e = e->next)
     if (e->dirty && e->disk[0]) {
       if (write_entry(e) == 0)
-        e->dirty = 0;
+        e->dirty = false;
     }
   for (int i = 0; i < g_nunlink; i++) {
     char path[128];
@@ -691,7 +691,7 @@ void cache_load(void)
     if (stat(CACHE_DIR, &si) != 0)
       return; /* no dir and can't create: no disk */
   }
-  g_disk_ok = 1;
+  g_disk_ok = true;
 
   struct dirent_u de;
   for (int i = 0; readdir(CACHE_DIR, i, &de) == 1; i++) {

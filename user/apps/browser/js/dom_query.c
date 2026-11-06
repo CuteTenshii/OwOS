@@ -1,21 +1,23 @@
+#include <stdbool.h>
+
 #include "dom_query.h"
 
 enum query_kind { QUERY_TAG, QUERY_ID, QUERY_CLASS };
 
-static int match_id(struct dom_node *n, const char *v)
+static bool match_id(struct dom_node *n, const char *v)
 {
   const char *a = dom_get_attr(n, "id");
   return a && streq(a, v);
 }
 
-static int match_tag(struct dom_node *n, const char *v) { return streq(v, "*") || streq(n->tag, v); }
+static bool match_tag(struct dom_node *n, const char *v) { return streq(v, "*") || streq(n->tag, v); }
 
-static int match_class(struct dom_node *n, const char *v)
+static bool match_class(struct dom_node *n, const char *v)
 {
   const char *a = dom_get_attr(n, "class");
   int vl = strlen(v);
   if (!a)
-    return 0;
+    return false;
   while (*a) {
     const char *s;
     while (*a == ' ' || *a == '\t' || *a == '\n')
@@ -24,12 +26,12 @@ static int match_class(struct dom_node *n, const char *v)
     while (*a && *a != ' ' && *a != '\t' && *a != '\n')
       a++;
     if (a - s == vl && !memcmp(s, v, (unsigned)vl))
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
-typedef int (*match_fn)(struct dom_node *, const char *);
+typedef bool (*match_fn)(struct dom_node *, const char *);
 
 static struct dom_node *find_first(struct dom_node *n, match_fn match, const char *value)
 {

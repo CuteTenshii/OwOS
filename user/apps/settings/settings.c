@@ -21,6 +21,7 @@
  */
 #include "gfx.h"
 #include "owos.h"
+#include <stdbool.h>
 
 static int W = 480, H = 320; /* client size; changes on resize */
 #define HEADER_H 22          /* sidebar title strip                  */
@@ -83,9 +84,9 @@ static struct select_box sound_sel;
 static char disp_label[MAX_MODES][16];   /* "1280 x 720" per offered mode */
 static const char *disp_opts[MAX_MODES]; /* select_box option array (-> labels) */
 static int disp_w[MAX_MODES], disp_h[MAX_MODES];
-static int disp_n;     /* how many modes are offered           */
-static int disp_cur;   /* index of the active mode, -1 if none */
-static int disp_fixed; /* 1 = resolution can't be changed      */
+static int disp_n;      /* how many modes are offered           */
+static int disp_cur;    /* index of the active mode, -1 if none */
+static bool disp_fixed; /* true = resolution can't be changed      */
 static struct select_box disp_sel;
 
 /* Refresh rate: a second Display control over /sys/class/graphics/fb0/rate (the
@@ -149,7 +150,7 @@ static int read_proc(const char *name, char *buf, int max)
 
 /* Copy the text after "<key> " on its line in `buf` into out (trimmed at EOL).
  * Returns 1 if the key was found at a line start, else 0. */
-static int field(const char *buf, const char *key, char *out, int max)
+static bool field(const char *buf, const char *key, char *out, int max)
 {
   for (const char *p = buf; *p;) {
     int i = 0;
@@ -163,14 +164,14 @@ static int field(const char *buf, const char *key, char *out, int max)
         n++;
       }
       out[n] = 0;
-      return 1;
+      return true;
     }
     while (*p && *p != '\n')
       p++;
     if (*p == '\n')
       p++;
   }
-  return 0;
+  return false;
 }
 
 /* ------------------------------------------------------------- state loading

@@ -2,6 +2,7 @@
 #ifndef OWOS_NET_H
 #define OWOS_NET_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Socket protocol selector for net_sock_connect / the SYS_NET_CONNECT `proto`
@@ -64,7 +65,7 @@ void net_ip_send(const uint8_t dst[4], uint8_t proto, const uint8_t *payload, ui
 const uint8_t *net_my_ip(void);
 /* 1 once a real IPv4 address is held (DHCP lease / static config), else 0.
  * Distinguishes "link up" from "has an address" -- see net.c. */
-int net_have_ip(void);
+bool net_have_ip(void);
 
 /* UDP server support, used by headless network daemons (now user-space).
  * A handler is invoked from interrupt context for every datagram arriving on

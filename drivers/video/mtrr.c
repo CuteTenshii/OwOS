@@ -23,6 +23,7 @@
 #include "mtrr.h"
 #include "irqflags.h"
 #include "serial.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 /* MSR addresses (SDM Vol 4). */
@@ -164,7 +165,7 @@ static uint32_t phys_addr_bits(void)
 }
 
 /* Does CPUID report MTRR support (CPUID.01H:EDX bit 12)? */
-static int have_mtrr(void)
+static bool have_mtrr(void)
 {
   uint32_t a, b, c, d;
   __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0));
@@ -173,12 +174,12 @@ static int have_mtrr(void)
 
 /* True if a *valid* variable MTRR `i` covers `phys`: (phys & mask) == (base &
  * mask), comparing only the address bits (mask without its flag bits). */
-static int var_covers(uint32_t i, uint32_t phys)
+static bool var_covers(uint32_t i, uint32_t phys)
 {
   uint64_t base = rdmsr(IA32_MTRR_PHYSBASE0 + 2 * i);
   uint64_t mask = rdmsr(IA32_MTRR_PHYSBASE0 + 2 * i + 1);
   if (!(mask & PHYSMASK_V))
-    return 0;
+    return false;
   uint64_t m = mask & ~0xFFFULL;
   return ((uint64_t)phys & m) == (base & m);
 }
@@ -191,7 +192,8 @@ static int var_covers(uint32_t i, uint32_t phys)
  * variable range" (only the former is fixable by adding a WC range). */
 static int mtrr_var_type(uint32_t phys, uint32_t vcnt, int *out_uc_slot)
 {
-  int found = -1, saw_wt = 0, saw_wb = 0, uc_slot = -1;
+  int found = -1, uc_slot = -1;
+  bool saw_wt = false, saw_wb = false;
   for (uint32_t i = 0; i < vcnt; i++) {
     if (!var_covers(i, phys))
       continue;
@@ -199,9 +201,9 @@ static int mtrr_var_type(uint32_t phys, uint32_t vcnt, int *out_uc_slot)
     if (t == MTRR_TYPE_UC && uc_slot < 0)
       uc_slot = (int)i;
     if (t == MTRR_TYPE_WT)
-      saw_wt = 1;
+      saw_wt = true;
     if (t == MTRR_TYPE_WB)
-      saw_wb = 1;
+      saw_wb = true;
     if (found < 0)
       found = t;
   }

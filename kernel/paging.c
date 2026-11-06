@@ -295,26 +295,26 @@ void paging_free_process_dir(uint32_t *dir)
   pfree(pml4);
 }
 
-int paging_user_mapped(uint32_t vaddr)
+bool paging_user_mapped(uint32_t vaddr)
 {
   uint64_t *pte = get_pte(current_pml4(), vaddr);
   return pte && (*pte & PAGE_PRESENT) && (*pte & PAGE_USER);
 }
 
-int paging_user_range(uint32_t vaddr, uint32_t len, int write)
+bool paging_user_range(uint32_t vaddr, uint32_t len, bool write)
 {
   uint64_t end;
   if (vaddr < USER_BASE || (uint64_t)vaddr + len > USER_REGION_END)
-    return 0;
+    return false;
   if (!len)
-    return 1;
+    return true;
   end = (uint64_t)vaddr + len;
   for (uint64_t a = vaddr & ~0xFFFULL; a < end; a += 4096) {
     uint64_t *pte = get_pte(current_pml4(), a);
     if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER) || (write && !(*pte & PAGE_RW) && !(*pte & PAGE_COW)))
-      return 0;
+      return false;
   }
-  return 1;
+  return true;
 }
 
 uint32_t paging_user_phys(uint32_t *dir, uint32_t vaddr)
@@ -352,24 +352,24 @@ void paging_unmap_user_at(uint32_t *dir, uint32_t vaddr, uint32_t bytes)
   }
 }
 
-int paging_handle_page_fault(uint32_t vaddr, uint32_t error)
+bool paging_handle_page_fault(uint32_t vaddr, uint32_t error)
 {
   uint64_t *pte;
   uint32_t old, fresh;
   if (!(error & 2) || vaddr < USER_BASE || vaddr >= USER_REGION_END)
-    return 0;
+    return false;
   pte = get_pte(current_pml4(), vaddr);
   if (!pte || !(*pte & PAGE_PRESENT) || !(*pte & PAGE_USER) || !(*pte & PAGE_COW))
-    return 0;
+    return false;
   old = (uint32_t)(*pte & PG_ADDR);
   if (pmm_frame_refs(old) <= 1) {
     *pte = (*pte | PAGE_RW) & ~PAGE_COW;
     invlpg(vaddr);
-    return 1;
+    return true;
   }
   fresh = pmm_alloc_frame();
   if (!fresh)
-    return 0;
+    return false;
   {
     uint32_t fl = irq_save();
     uint32_t *src = paging_scratch_map(0, old);
@@ -382,7 +382,7 @@ int paging_handle_page_fault(uint32_t vaddr, uint32_t error)
   *pte = (fresh & PG_ADDR) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
   invlpg(vaddr);
   pmm_free_frame(old);
-  return 1;
+  return true;
 }
 
 uint32_t *paging_fork_dir(uint32_t *parent)
@@ -708,7 +708,7 @@ void paging_free_process_dir(uint32_t *dir)
 {
   /* Retire any guarded thread-stack slots this address space owned, so the
    * per-CR3 slot table can't later match a stale dir pointer (loader.c). */
-  extern void user_stack_reset_owner(uint32_t * dir);
+  extern void user_stack_reset_owner(uint32_t *dir);
   user_stack_reset_owner(dir);
   /* Free the user window: each present PDE in the window range is a private
    * page table; free its pmm-backed frames, then the table itself (pool). */
@@ -743,38 +743,38 @@ void paging_free_process_dir(uint32_t *dir)
  * Reads cr3 (so it works for threads, which carry dir=0) and walks the tables,
  * all identity-mapped. Lets the crash handler probe a frame pointer before
  * dereferencing it for a backtrace, so a corrupt one can't double-fault. */
-int paging_user_mapped(uint32_t vaddr)
+bool paging_user_mapped(uint32_t vaddr)
 {
   uint32_t cr3 = (uint32_t)read_cr3();
   uint32_t *pd = (uint32_t *)(cr3 & ~0xFFFu);
   uint32_t pde = pd[vaddr >> 22];
   if (!(pde & PAGE_PRESENT))
-    return 0;
+    return false;
   uint32_t *pt = (uint32_t *)(pde & ~0xFFFu);
   uint32_t pte = pt[(vaddr >> 12) & 0x3FF];
   return (pte & PAGE_PRESENT) && (pte & PAGE_USER);
 }
 
-int paging_user_range(uint32_t vaddr, uint32_t len, int write)
+bool paging_user_range(uint32_t vaddr, uint32_t len, bool write)
 {
   uint64_t end;
   if (vaddr < USER_BASE || (uint64_t)vaddr + len > USER_REGION_END)
-    return 0;
+    return false;
   if (!len)
-    return 1;
+    return true;
   end = (uint64_t)vaddr + len;
   for (uint32_t a = vaddr & ~0xFFFu; (uint64_t)a < end; a += 4096) {
     uint32_t pde = ((uint32_t *)read_cr3())[a >> 22];
     uint32_t *pt;
     uint32_t pte;
     if (!(pde & PAGE_PRESENT))
-      return 0;
+      return false;
     pt = (uint32_t *)(pde & ~0xFFFu);
     pte = pt[(a >> 12) & 0x3FF];
     if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER) || (write && !(pte & PAGE_RW) && !(pte & PAGE_COW)))
-      return 0;
+      return false;
   }
-  return 1;
+  return true;
 }
 
 uint32_t paging_user_phys(uint32_t *dir, uint32_t vaddr)
@@ -787,28 +787,28 @@ uint32_t paging_user_phys(uint32_t *dir, uint32_t vaddr)
   return (pte & PAGE_PRESENT) ? (pte & ~0xFFFu) : 0;
 }
 
-int paging_handle_page_fault(uint32_t vaddr, uint32_t error)
+bool paging_handle_page_fault(uint32_t vaddr, uint32_t error)
 {
   uint32_t *pd, pde, *pt, pte, old, fresh;
   if (!(error & 2) || vaddr < USER_BASE || vaddr >= USER_REGION_END)
-    return 0;
+    return false;
   pd = (uint32_t *)(uintptr_t)read_cr3();
   pde = pd[vaddr >> 22];
   if (!(pde & PAGE_PRESENT) || !(pde & PAGE_USER))
-    return 0;
+    return false;
   pt = (uint32_t *)(pde & ~0xFFFu);
   pte = pt[(vaddr >> 12) & 0x3FF];
   if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER) || !(pte & PAGE_COW))
-    return 0;
+    return false;
   old = pte & ~0xFFFu;
   if (pmm_frame_refs(old) <= 1) {
     pt[(vaddr >> 12) & 0x3FF] = (pte | PAGE_RW) & ~PAGE_COW;
     __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
-    return 1;
+    return true;
   }
   fresh = pmm_alloc_frame();
   if (!fresh)
-    return 0;
+    return false;
   {
     uint32_t fl = irq_save();
     uint32_t *src = paging_scratch_map(0, old);
@@ -821,7 +821,7 @@ int paging_handle_page_fault(uint32_t vaddr, uint32_t error)
   pt[(vaddr >> 12) & 0x3FF] = fresh | PAGE_PRESENT | PAGE_RW | PAGE_USER;
   __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
   pmm_free_frame(old);
-  return 1;
+  return true;
 }
 
 uint32_t *paging_fork_dir(uint32_t *parent)

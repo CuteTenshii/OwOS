@@ -162,10 +162,10 @@ static int parse_rec(struct hfs_mount *m, int i, struct catrec *c)
 /* Hidden if the name is empty or begins with a control character -- this skips
  * the "HFS+ Private Data" / hardlink directories whose names start with NULs.
  */
-static int rec_hidden(const struct catrec *c)
+static bool rec_hidden(const struct catrec *c)
 {
   if (c->namelen == 0)
-    return 1;
+    return true;
   return load_be16(c->name) < 0x20;
 }
 
@@ -226,17 +226,17 @@ static int for_each_leaf(struct hfs_mount *m, int (*visit)(struct hfs_mount *, c
 struct find_ctx {
   uint32_t parent;
   const char *name;
-  int found;
+  bool found;
   struct obj out;
 };
 
 /* Full case-insensitive ASCII compare of two NUL-terminated names. */
-static int names_match(const char *want, const char *have)
+static bool names_match(const char *want, const char *have)
 {
   int i = 0;
   for (; want[i] && have[i]; i++)
     if (k_lower(want[i]) != k_lower(have[i]))
-      return 0;
+      return false;
   return want[i] == '\0' && have[i] == '\0';
 }
 
@@ -250,7 +250,7 @@ static int visit_find2(struct hfs_mount *m, const struct catrec *c, void *vp)
   uni_ascii(c->name, c->namelen, nm, sizeof nm);
   if (names_match(f->name, nm)) {
     rec_to_obj(c, &f->out);
-    f->found = 1;
+    f->found = true;
     return 1; /* stop scanning */
   }
   return 0;
@@ -261,7 +261,7 @@ static int find_child(struct hfs_mount *m, uint32_t parent, const char *name, st
   struct find_ctx f;
   f.parent = parent;
   f.name = name;
-  f.found = 0;
+  f.found = false;
   for_each_leaf(m, visit_find2, &f);
   if (!f.found)
     return -1;
@@ -421,10 +421,10 @@ static int probe(struct hfs_mount *m, blk_read_fn read)
     for (uint32_t i = 0; i < ent_cnt; i++) {
       if (raw_read(read, ent_lba * 512 + (uint64_t)i * ent_sz, ent, 128) != 0)
         break;
-      int empty = 1; /* zero type GUID => unused slot */
+      bool empty = true; /* zero type GUID => unused slot */
       for (int b = 0; b < 16; b++)
         if (ent[b]) {
-          empty = 0;
+          empty = false;
           break;
         }
       if (empty)

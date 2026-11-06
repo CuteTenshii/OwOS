@@ -7,6 +7,8 @@
 #include "owos.h"
 #include "pngenc.h"
 
+#include <stdbool.h>
+
 /* ---- WM metrics (mirror kernel/wm.h) ---- */
 #define WM_TITLE_H 22
 #define WM_BORDER 2
@@ -89,8 +91,8 @@ static void clip_full(void)
 static struct winrec cur[WM_LIST_MAX];
 static int nwin;
 
-static int win_visible(const struct winrec *w) { return (w->flags & UWIN_F_VISIBLE) != 0; }
-static int win_minimized(const struct winrec *w) { return (w->flags & UWIN_F_MINIMIZED) != 0; }
+static bool win_visible(const struct winrec *w) { return (w->flags & UWIN_F_VISIBLE) != 0; }
+static bool win_minimized(const struct winrec *w) { return (w->flags & UWIN_F_MINIMIZED) != 0; }
 
 /* Compositor-tracked maximize state (see the maxrec table below): -1 if not. */
 static int is_maxed(int id);
@@ -110,7 +112,7 @@ static int slot_of(int id)
  * enumerated set and reorder cur[] to match, so topmost_visible() == focus. */
 static int zstack[WM_LIST_MAX];
 static int nz;
-static int taskbar_layout_dirty = 1;
+static bool taskbar_layout_dirty = true;
 static int z_index(int id)
 {
   for (int i = 0; i < nz; i++)
@@ -126,7 +128,7 @@ static void z_raise(int id)
   for (int i = p; i < nz - 1; i++)
     zstack[i] = zstack[i + 1];
   zstack[nz - 1] = id;
-  taskbar_layout_dirty = 1;
+  taskbar_layout_dirty = true;
 }
 static void z_lower(int id)
 {
@@ -136,7 +138,7 @@ static void z_lower(int id)
   for (int i = p; i > 0; i--)
     zstack[i] = zstack[i - 1];
   zstack[0] = id;
-  taskbar_layout_dirty = 1;
+  taskbar_layout_dirty = true;
 }
 
 /* ---- window families
@@ -173,14 +175,14 @@ static int root_id_of(int id)
 }
 
 /* 1 if `id` is `anc` or descends from it through the parent chain. */
-static int is_descendant(int id, int anc)
+static bool is_descendant(int id, int anc)
 {
   for (int guard = 0; id >= 0 && guard < WM_LIST_MAX; guard++) {
     if (id == anc)
-      return 1;
+      return true;
     id = parent_id_of(id);
   }
-  return 0;
+  return false;
 }
 
 /* Drop closed ids, append new ones on top, then order cur[] bottom to top: each
@@ -238,10 +240,10 @@ static void zorder_apply(void)
 }
 
 /* ---- "Not Responding": no kernel signal yet, so every window counts as responsive. */
-static int not_responding(const struct winrec *w)
+static bool not_responding(const struct winrec *w)
 {
   (void)w;
-  return 0;
+  return false;
 }
 
 /* ------------------------------------------------------------- title helpers
@@ -273,12 +275,12 @@ static void disp_title(const struct winrec *w, char *buf)
 #define SM_ITEM_H 20
 #define SM_W 150
 #define SM_SEP_H 9
-static int start_open;
+static bool start_open;
 
 #define TBM_W 120
 #define TBM_ITEM_H 22
 #define TBM_N 2
-static int tb_menu_open;
+static bool tb_menu_open;
 static int tb_menu_win = -1; /* targeted cur[] id */
 static int tb_menu_x, tb_menu_y;
 static int tbm_h(void) { return TBM_N * TBM_ITEM_H; }
@@ -312,7 +314,7 @@ static int sm_apps_h(void) { return apps_menu_count() * SM_ITEM_H; }
 static int sm_h(void) { return sm_apps_h() + SM_SEP_H + sm_power_n() * SM_ITEM_H; }
 static int sm_top(void) { return screen_h - WM_BAR_H - sm_h(); }
 
-static int force_full;
+static bool force_full;
 
 /* ---- child reaping
  * Start-menu apps are spawned detached; track their pids in a small ring and
@@ -462,12 +464,12 @@ static void flash_modal(int id)
 {
   flash_id = id;
   flash_frames = 8;
-  force_full = 1;
+  force_full = true;
 }
 
 /* ------------------------------------------------------------- Alt+Tab
  * switcher */
-static int at_active;
+static bool at_active;
 static int at_order[WM_LIST_MAX]; /* window ids, most-recent first */
 static int at_count;
 static int at_sel;
@@ -487,12 +489,12 @@ static int alttab_build(void)
 
 /* ------------------------------------------------------------- title buttons
  */
-static int btn_present(const struct winrec *w, int kind)
+static bool btn_present(const struct winrec *w, int kind)
 {
   /* Dialogs (transient children) get only a close box and stay movable. */
-  int is_dialog = parent_id_of(w->id) >= 0;
+  bool is_dialog = parent_id_of(w->id) >= 0;
   if (kind == 0)
-    return 1; /* close: always       */
+    return true; /* close: always       */
   if (kind == 1)
     return (w->flags & UWIN_F_RESIZABLE) != 0; /* maximize: resizable */
   return !is_dialog;                           /* minimize: not dialogs */
@@ -557,7 +559,8 @@ static int taskbar_layout(int left, int right, int *idxs, int *bxs, int *bws, in
 }
 
 struct taskbar_cache {
-  int valid, right, n;
+  bool valid;
+  int right, n;
   int idxs[WM_LIST_MAX], bxs[WM_LIST_MAX], bws[WM_LIST_MAX];
 };
 static struct taskbar_cache tb_cache;
@@ -568,8 +571,8 @@ static void taskbar_layout_cached(int right)
     return;
   tb_cache.right = right;
   tb_cache.n = taskbar_layout(tb_band_left(), right, tb_cache.idxs, tb_cache.bxs, tb_cache.bws, WM_LIST_MAX);
-  tb_cache.valid = 1;
-  taskbar_layout_dirty = 0;
+  tb_cache.valid = true;
+  taskbar_layout_dirty = false;
 }
 
 static int taskbar_hit(int mx, int my)
@@ -645,7 +648,8 @@ static void blit_client(int dx, int dy, const unsigned *src, int sw, int sh, int
 /* the per-window client buffer, pinned via win_map and kept mapped across
  * frames (the Phase-1 pin), refreshed each frame from the enumerated set. */
 struct clientmap {
-  int id, valid;
+  int id;
+  bool valid;
   struct winmap m;
 };
 static struct clientmap cmap[WM_LIST_MAX];
@@ -710,7 +714,7 @@ static void client_rect(const struct winrec *w, int *x, int *y, int *width, int 
     *height = w->h - WM_TITLE_H - WM_BORDER;
 }
 
-static void draw_window(const struct winrec *w, int focused)
+static void draw_window(const struct winrec *w, bool focused)
 {
   unsigned title_bg = focused ? 0x2f6fb0 : 0x55606e;
   unsigned frame = 0x10141a;
@@ -931,7 +935,7 @@ static void draw_taskbar_windows(int y, int uy, int right)
   int by = y + 3, bh = WM_BAR_H - 6;
   for (int k = 0; k < tb_cache.n; k++) {
     struct winrec *w = &cur[tb_cache.idxs[k]];
-    int active = (w->id == focus_root);
+    bool active = (w->id == focus_root);
     unsigned bg = active ? 0x2f6fb0 : win_minimized(w) ? 0x12161e : 0x1d2533;
     gfx_fill_rect(tb_cache.bxs[k], by, tb_cache.bws[k], bh, bg);
     gfx_fill_rect(tb_cache.bxs[k], by, tb_cache.bws[k], 1, active ? 0x4f8fd0 : 0x2a3550);
@@ -1037,7 +1041,8 @@ static void draw_switcher(void)
  * drained once via crash_poll(); each becomes a persistent panel the user can
  * dismiss by clicking its close box. ---- */
 struct crashwin {
-  int used, x, y, w, h;
+  bool used;
+  int x, y, w, h;
   struct crash_rec rec;
 };
 #define MAXCRASHWIN 4
@@ -1051,13 +1056,13 @@ static void crash_ingest(void)
     for (int s = 0; s < MAXCRASHWIN; s++) {
       if (crashwins[s].used)
         continue;
-      crashwins[s].used = 1;
+      crashwins[s].used = true;
       crashwins[s].x = 140 + s * 22;
       crashwins[s].y = 110 + s * 22;
       crashwins[s].w = 460;
       crashwins[s].h = 300;
       crashwins[s].rec = recs[i];
-      force_full = 1;
+      force_full = true;
       break;
     }
   }
@@ -1126,7 +1131,7 @@ static void draw_crashwin(struct crashwin *c)
 /* ------------------------------------------------------------- cursor pick */
 enum { RZ_L = 1, RZ_R = 2, RZ_T = 4, RZ_B = 8 };
 
-static int hover_resizing;
+static bool hover_resizing;
 static int rsz_edge_hint;
 
 static int resize_edge(const struct winrec *w, int mx, int my)
@@ -1200,14 +1205,14 @@ static int pick_cursor(int mx, int my)
 }
 
 /* ------------------------------------------------------------- compose */
-static int clip_hits(int x, int y, int w, int h)
+static bool clip_hits(int x, int y, int w, int h)
 {
   return x < clip_x1 && x + w > clip_x0 && y < clip_y1 && y + h > clip_y0;
 }
 
 /* Is window i's visible part of the clip hidden behind a single window above
  * it? Frames are opaque, so such a window needs no drawing. */
-static int occluded(int i)
+static bool occluded(int i)
 {
   const struct winrec *w = &cur[i];
   int x0 = w->x > clip_x0 ? w->x : clip_x0, y0 = w->y > clip_y0 ? w->y : clip_y0;
@@ -1216,9 +1221,9 @@ static int occluded(int i)
   for (int j = i + 1; j < nwin; j++) {
     const struct winrec *o = &cur[j];
     if (win_visible(o) && o->x <= x0 && o->y <= y0 && o->x + o->w >= x1 && o->y + o->h >= y1)
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 static void compose(int mx, int my)
@@ -1270,7 +1275,9 @@ static int app_drag_id = -1;
  * maximize primitive): a window id is "maximized" while it fills the work area;
  * the entry remembers its pre-maximize frame so a second click restores it. */
 struct maxrec {
-  int id, used, sx, sy, sw, sh;
+  int id;
+  bool used;
+  int sx, sy, sw, sh;
 };
 static struct maxrec maxed[WM_LIST_MAX];
 static int is_maxed(int id)
@@ -1284,7 +1291,7 @@ static void maxed_forget_gone(void)
 {
   for (int i = 0; i < WM_LIST_MAX; i++)
     if (maxed[i].used && slot_of(maxed[i].id) < 0)
-      maxed[i].used = 0;
+      maxed[i].used = false;
 }
 static void toggle_maximize(int slot)
 {
@@ -1292,11 +1299,11 @@ static void toggle_maximize(int slot)
   int m = is_maxed(w->id);
   if (m >= 0) { /* restore */
     win_set_geom(w->id, maxed[m].sx, maxed[m].sy, maxed[m].sw, maxed[m].sh);
-    maxed[m].used = 0;
+    maxed[m].used = false;
   } else { /* maximize: fill the work area */
     for (int i = 0; i < WM_LIST_MAX; i++)
       if (!maxed[i].used) {
-        maxed[i].used = 1;
+        maxed[i].used = true;
         maxed[i].id = w->id;
         maxed[i].sx = w->x;
         maxed[i].sy = w->y;
@@ -1310,11 +1317,11 @@ static void toggle_maximize(int slot)
 
 static void handle_input(int mx, int my, int buttons, int dz)
 {
-  static int prev_down, prev_rdown;
+  static bool prev_down, prev_rdown;
   static int dbl_id = -1, dbl_x, dbl_y; /* last title-bar press, for double-click */
   static unsigned dbl_ms;
-  int down = buttons & 1;
-  int rdown = buttons & 2;
+  bool down = buttons & 1;
+  bool rdown = buttons & 2;
 
   /* Wheel -> focused window under cursor (dropped if a modal blocks it). */
   if (dz) {
@@ -1330,9 +1337,9 @@ static void handle_input(int mx, int my, int buttons, int dz)
     int bar_y = screen_h - WM_BAR_H;
     int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
     if (tbw >= 0) {
-      tb_menu_open = 1;
+      tb_menu_open = true;
       tb_menu_win = cur[tbw].id;
-      start_open = 0;
+      start_open = false;
       tb_menu_x = mx;
       if (tb_menu_x + TBM_W > screen_w)
         tb_menu_x = screen_w - TBM_W;
@@ -1340,7 +1347,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
         tb_menu_x = 0;
       tb_menu_y = bar_y - tbm_h();
     } else {
-      tb_menu_open = 0;
+      tb_menu_open = false;
       int idx = window_at(mx, my);
       if (idx >= 0) {
         int mb = blocking_modal(idx);
@@ -1366,8 +1373,8 @@ static void handle_input(int mx, int my, int buttons, int dz)
       if (mx >= c->x && mx < c->x + c->w && my >= c->y && my < c->y + c->h) {
         int bx = c->x + c->w - 4 - TB_BTN_W, by = c->y + 4;
         if (mx >= bx && mx < bx + TB_BTN_W && my >= by && my < by + TB_BTN_W) {
-          c->used = 0;
-          force_full = 1;
+          c->used = false;
+          force_full = true;
         }
         prev_down = down;
         return; /* clicks over a crash panel stop here */
@@ -1378,7 +1385,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
       if (inside) {
         int item = (my - tb_menu_y) / TBM_ITEM_H;
         int id = tb_menu_win;
-        tb_menu_open = 0;
+        tb_menu_open = false;
         int s = slot_of(id);
         if (s >= 0) {
           if (item == 0) { /* Close: ask the app */
@@ -1392,7 +1399,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
         prev_down = down;
         return;
       }
-      tb_menu_open = 0;
+      tb_menu_open = false;
     }
     int bar_y = screen_h - WM_BAR_H;
     if (my >= bar_y && mx >= 0 && mx < START_W) { /* Start button */
@@ -1402,7 +1409,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
     }
     int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
     if (tbw >= 0) {
-      start_open = 0;
+      start_open = false;
       /* restore/minimize/raise via focus + geom (kernel owns min/max state,
        * but a plain raise is all we can express cross-process here). */
       raise_window(tbw);
@@ -1415,11 +1422,11 @@ static void handle_input(int mx, int my, int buttons, int dz)
         int rel = my - top;
         if (rel < sm_apps_h()) {
           launch_app(rel / SM_ITEM_H);
-          start_open = 0;
+          start_open = false;
         } else {
           int prel = rel - sm_apps_h() - SM_SEP_H;
           if (prel >= 0 && prel / SM_ITEM_H < sm_power_n()) {
-            start_open = 0;
+            start_open = false;
             if (sm_power_label(prel / SM_ITEM_H)[0] == 'R')
               power(1); /* Restart */
             else
@@ -1429,7 +1436,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
         prev_down = down;
         return;
       }
-      start_open = 0;
+      start_open = false;
     }
     int idx = window_at(mx, my);
     if (idx >= 0) {
@@ -1445,7 +1452,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
       }
       raise_window(idx);
       struct winrec *w = &cur[idx];
-      int resizable = (w->flags & UWIN_F_RESIZABLE) != 0; /* dialogs opt out */
+      bool resizable = (w->flags & UWIN_F_RESIZABLE) != 0; /* dialogs opt out */
       int tb = titlebtn_hit(w, mx, my);
       int resize = resize_hit(w, mx, my);
       if (tb == 0) { /* close */
@@ -1511,7 +1518,7 @@ static void handle_input(int mx, int my, int buttons, int dz)
                      drag_my0 - my > DBLCLICK_SLOP)) {
         rw = maxed[m].sw;
         rh = maxed[m].sh;
-        maxed[m].used = 0;
+        maxed[m].used = false;
         drag_dx = (screen_w > 0) ? mx * rw / screen_w : rw / 2;
       }
       int nx = mx - drag_dx, ny = my - drag_dy;
@@ -1573,9 +1580,9 @@ static void handle_input(int mx, int my, int buttons, int dz)
     int cx, cy, cw, ch;
     if (w)
       client_rect(w, &cx, &cy, &cw, &ch);
-    int in_client = w && mx >= cx && mx < cx + cw && my >= cy && my < cy + ch;
+    bool in_client = w && mx >= cx && mx < cx + cw && my >= cy && my < cy + ch;
     if (in_client && blocking_modal(idx) >= 0)
-      in_client = 0; /* modal blocks hover */
+      in_client = false; /* modal blocks hover */
     if (hover_id >= 0 && (idx < 0 || cur[idx].id != hover_id || !in_client)) {
       struct winevent ev = {WEV_MOVE, -1, -1};
       win_deliver(hover_id, &ev);
@@ -1629,7 +1636,7 @@ static struct {
   int c, mods;
 } pending[PENDING_MAX];
 static int pend_head, pend_tail;
-static int pend_empty(void) { return pend_head == pend_tail; }
+static bool pend_empty(void) { return pend_head == pend_tail; }
 static void pend_push(int c, int mods)
 {
   int next = (pend_head + 1) % PENDING_MAX;
@@ -1738,7 +1745,7 @@ static void feed_key(int c, int mods)
         at_count = 0;
         return;
       }
-      at_active = 1;
+      at_active = true;
       at_sel = 0;
     }
     if (mods & KMOD_SHIFT)
@@ -1752,7 +1759,7 @@ static void feed_key(int c, int mods)
    * Alt. */
   if (at_active && !(mods & KMOD_ALT)) {
     int s = slot_of(at_order[at_sel]);
-    at_active = 0;
+    at_active = false;
     if (s >= 0)
       raise_window(s);
     return;
@@ -1880,7 +1887,7 @@ struct tunable {
   const char *key;
   const char *node;
   char cur[32];
-  int known; /* cur holds a real value */
+  bool known; /* cur holds a real value */
 };
 static struct tunable tun[] = {
     {CONF_DISPLAY, "mode", "/sys/class/graphics/fb0/mode", "", 0},
@@ -1993,24 +2000,24 @@ static void tun_restore(void)
     char v[32];
     if (node_read(tun[i].node, v, sizeof v) > 0) {
       strcpy(tun[i].cur, v);
-      tun[i].known = 1;
+      tun[i].known = true;
     }
   }
 }
 
 /* Poll the live nodes; update any that changed. Returns 1 if something moved.
  */
-static int tun_poll(void)
+static bool tun_poll(void)
 {
-  int changed = 0;
+  bool changed = false;
   char v[32];
   for (int i = 0; i < NTUN; i++) {
     if (node_read(tun[i].node, v, sizeof v) <= 0)
       continue;
     if (!streq(v, tun[i].cur)) {
       strcpy(tun[i].cur, v);
-      tun[i].known = 1;
-      changed = 1;
+      tun[i].known = true;
+      changed = true;
     }
   }
   return changed;
@@ -2028,7 +2035,8 @@ static int rate_now(void)
 /* ------------------------------------------------------------- prev-frame
  * snapshot */
 struct pfsnap {
-  int id, x, y, w, h, vis, min;
+  int id, x, y, w, h;
+  bool vis, min;
   unsigned seq;
 };
 static struct pfsnap pf[WM_LIST_MAX];
@@ -2050,7 +2058,7 @@ static int bind_mode(void)
   gfx_init(back, fb_pitch, screen_h); /* surface stride = pitch */
   input_set_bounds(screen_w - 1, screen_h - 1);
   clip_full();
-  force_full = 1;
+  force_full = true;
   return 0;
 }
 
@@ -2059,12 +2067,12 @@ static int bind_mode(void)
 /* Center each transient dialog over its parent once, so it stays draggable;
  * `centered` tracks placed ids. cur[i] is updated so it draws centered now. */
 static int centered[WM_LIST_MAX], ncentered;
-static int was_centered(int id)
+static bool was_centered(int id)
 {
   for (int i = 0; i < ncentered; i++)
     if (centered[i] == id)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 static void center_new_dialogs(void)
 {
@@ -2135,8 +2143,10 @@ int main(void)
   kid_track(spawn("/bin/term", 0));
 
   int prev_mx = -9999, prev_my = -9999, prev_cur = -1;
-  int prev_start = 0, prev_tb_menu = 0, prev_at_active = 0, prev_at_sel = -1;
-  int prev_focus = -1, last_sec = -1, inited = 0;
+  bool prev_start = false, prev_tb_menu = false, prev_at_active = false;
+  int prev_at_sel = -1;
+  int prev_focus = -1, last_sec = -1;
+  bool inited = false;
 
   /* Restore saved tunables, then adopt the live refresh rate as the pacing target. */
   conf_load();
@@ -2164,7 +2174,7 @@ int main(void)
       nwin = 0;
     refresh_maps(); /* maps must be current before compose */
     zorder_apply(); /* reconcile z-stack; reorder cur[] bottom->top */
-    taskbar_layout_dirty = 1;
+    taskbar_layout_dirty = true;
     center_new_dialogs(); /* place a fresh dialog over its parent */
 
     check_resolution(); /* Settings may have changed the fb mode */
@@ -2184,7 +2194,7 @@ int main(void)
 
     if (flash_frames > 0) {
       flash_frames--;
-      force_full = 1;
+      force_full = true;
     } /* pulse a modal */
 
     /* Drain any keys parked by paste back-pressure before pulling new input. */
@@ -2203,8 +2213,8 @@ int main(void)
 
     int mx = in.mx, my = in.my;
     ndmg = 0;
-    int full = !inited || force_full;
-    force_full = 0;
+    bool full = !inited || force_full;
+    force_full = false;
 
     /* Focus / z-order / visibility / add / remove change -> full repaint. */
     if (!full) {
@@ -2219,15 +2229,15 @@ int main(void)
         if (pf[i].id != cur[i].id || pf[i].vis != win_visible(&cur[i]) || pf[i].min != win_minimized(&cur[i]))
           zvis = 1;
       if (zvis)
-        full = 1;
+        full = true;
       prev_focus = focus_id;
 
       if (at_active != prev_at_active || at_sel != prev_at_sel)
-        full = 1;
+        full = true;
       prev_at_active = at_active;
       prev_at_sel = at_sel;
       if (tb_menu_open != prev_tb_menu)
-        full = 1;
+        full = true;
       prev_tb_menu = tb_menu_open;
 
       /* moved/resized windows: old ∪ new as one region */
@@ -2302,7 +2312,7 @@ int main(void)
     prev_my = my;
     prev_start = start_open;
     last_sec = (int)(frame_clock & 0xFF);
-    inited = 1;
+    inited = true;
     cursor_frame++;
 
     int idle =

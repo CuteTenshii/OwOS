@@ -14,6 +14,7 @@
 #include "crypto.h"
 #include "ed25519.h"
 #include "owos.h"
+#include <stdbool.h>
 
 /* ---- SSH-2 message numbers ----------------------------------------------- */
 #define MSG_DISCONNECT 1
@@ -54,7 +55,7 @@
 
 struct ssh {
   int sock;
-  int dead;
+  bool dead;
 
   unsigned char rx[40960];
   int rxlen;
@@ -64,7 +65,8 @@ struct ssh {
   unsigned char sealbuf[MAXPKT]; /* send GCM plaintext (distinct from ptext)  */
   unsigned char tx[MAXPKT + 64];
 
-  int send_enc, recv_enc;
+  bool recv_enc;
+  bool send_enc;
   unsigned char send_key[16], recv_key[16];
   unsigned char send_iv[12], recv_iv[12];
 
@@ -91,7 +93,7 @@ static struct ssh S;
 
 /* The persistent host key. */
 static uint8_t host_seed[32], host_pub[32];
-static int host_ready;
+static bool host_ready;
 
 /* ---- byte helpers -------------------------------------------------------- */
 
@@ -136,7 +138,7 @@ static int sock_send(const unsigned char *b, int n)
   while (off < n) {
     int w = net_send(S.sock, b + off, n - off);
     if (w <= 0) {
-      S.dead = 1;
+      S.dead = true;
       return -1;
     }
     off += w;
@@ -157,7 +159,7 @@ static int rx_pump(void)
   }
   if (n == 0)
     return 0;
-  S.dead = 1;
+  S.dead = true;
   return -1; /* -1 EOF/closed, NET_EINTR on Ctrl+C */
 }
 
@@ -306,7 +308,7 @@ static void host_key_init(void)
     writefile(HOSTKEY_PATH, host_seed, 32); /* persist a fresh host key */
   }
   ed25519_pubkey(host_pub, host_seed);
-  host_ready = 1;
+  host_ready = true;
 }
 
 /* ---- KEX ----------------------------------------------------------------- */
@@ -358,7 +360,7 @@ static void derive(unsigned char letter, unsigned char *out, int outlen)
   }
 }
 
-static int span_has(const unsigned char *hay, int n, const char *needle)
+static bool span_has(const unsigned char *hay, int n, const char *needle)
 {
   int m = (int)strlen(needle);
   for (int i = 0; i + m <= n; i++) {
@@ -366,9 +368,9 @@ static int span_has(const unsigned char *hay, int n, const char *needle)
     while (k < m && hay[i + k] == (unsigned char)needle[k])
       k++;
     if (k == m)
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 static int do_kex(void)
@@ -496,10 +498,10 @@ static int do_kex(void)
   unsigned char nk = MSG_NEWKEYS;
   if (send_packet(&nk, 1) != 0)
     return -1;
-  S.send_enc = 1;
+  S.send_enc = true;
   if (recv_msg(&plen, 15000) != MSG_NEWKEYS)
     return -1;
-  S.recv_enc = 1;
+  S.recv_enc = true;
   return 0;
 }
 
@@ -706,15 +708,16 @@ static void ssh_session(void)
   }
 
   unsigned char buf[1024];
-  int done = 0, stdin_closed = 0;
+  bool done = false;
+  bool stdin_closed = false;
   while (!done) {
-    int progressed = 0;
+    bool progressed = false;
 
     int rn = read_nb(rfd, buf, (int)sizeof buf);
     if (rn > 0) {
       if (send_data(buf, rn) < 0)
         break;
-      progressed = 1;
+      progressed = true;
     } else if (rn < 0)
       break; /* shell exited: its stdout end closed */
 
@@ -722,7 +725,7 @@ static void ssh_session(void)
       break;
     int plen, r;
     while ((r = parse_one(&plen)) == 1) {
-      progressed = 1;
+      progressed = true;
       int t = S.payload[0];
       if (t == MSG_CHANNEL_DATA) {
         int p = 1;
@@ -741,10 +744,10 @@ static void ssh_session(void)
          * EOF, but keep relaying its stdout until the shell itself exits. */
         if (!stdin_closed) {
           close(wfd);
-          stdin_closed = 1;
+          stdin_closed = true;
         }
       } else if (t == MSG_CHANNEL_CLOSE || t == MSG_DISCONNECT) {
-        done = 1;
+        done = true;
         break;
       }
     }

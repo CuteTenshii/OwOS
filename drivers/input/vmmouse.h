@@ -9,6 +9,8 @@
 #ifndef OWOS_VMMOUSE_H
 #define OWOS_VMMOUSE_H
 
+#include <stdbool.h>
+
 /* Detect + enable absolute mode. Coordinates are reported scaled into
  * [0,max_x] x [0,max_y]. Returns 0 if the device came up (vmmouse_active() will
  * read 1), -1 if there's no VMware backdoor / vmmouse — leave PS/2 in charge.
@@ -16,7 +18,7 @@
 int vmmouse_init(int max_x, int max_y);
 
 /* 1 once vmmouse_init succeeded. */
-int vmmouse_active(void);
+bool vmmouse_active(void);
 
 /* Rescale the absolute range onto a new screen size after a resolution change.
  */
@@ -28,6 +30,6 @@ void vmmouse_set_bounds(int max_x, int max_y);
  * change). Call from the mouse IRQ handler. x, y  — latest absolute cursor
  * position btn   — button mask (bit0 left, bit1 right, bit2 middle) dz    —
  * summed wheel delta */
-int vmmouse_poll(int *x, int *y, int *btn, int *dz);
+bool vmmouse_poll(int *x, int *y, int *btn, int *dz);
 
 #endif /* OWOS_VMMOUSE_H */

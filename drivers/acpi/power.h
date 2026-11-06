@@ -2,6 +2,7 @@
 #ifndef OWOS_POWER_H
 #define OWOS_POWER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 void power_off(void);   /* ACPI/QEMU shutdown; returns only if it fails  */
@@ -17,13 +18,13 @@ void power_sleep(void);
 /* 1 if ACPI S3 is available (FADT + DSDT _S3 + FACS all present). Read-only;
  * use it to gate UI that offers Sleep so an unsupported host (e.g. VMware,
  * which doesn't expose S3 to the guest) doesn't show a dead button. */
-int power_can_sleep(void);
+bool power_can_sleep(void);
 
 /* Scan the ACPI device AML (DSDT + every SSDT) for a byte sequence such as an
  * EISA _HID. Returns 1 if found, 0 if absent or ACPI is unreachable. Used by
  * battery.c to detect an ACPI battery device wherever the firmware declared it.
  */
-int acpi_aml_contains(const uint8_t *needle, uint32_t n);
+bool acpi_aml_contains(const uint8_t *needle, uint32_t n);
 
 /* Invoke fn(body, len, ctx) for each ACPI AML definition block — the DSDT, then
  * every SSDT — where body/len is the table's AML byte stream (past the header).

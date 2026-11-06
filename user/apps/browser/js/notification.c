@@ -1,5 +1,7 @@
-#include "notification.h"
+#include <stdbool.h>
+
 #include "../jsint.h"
+#include "notification.h"
 #include "notify.h"
 
 static js_ctx *ctx;
@@ -19,7 +21,7 @@ static const char *option_string(js_value options, const char *name, const char 
   return arg_str(ctx, value);
 }
 
-static int option_bool(js_value options, const char *name)
+static bool option_bool(js_value options, const char *name)
 {
   return options.type == JV_OBJ && js_to_boolean(js_get(ctx, options, name));
 }

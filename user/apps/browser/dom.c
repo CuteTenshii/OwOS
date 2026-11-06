@@ -6,12 +6,13 @@
  * html/head/body). */
 #include "dom.h"
 #include "owos.h"
+#include <stdbool.h>
 
 #define MAX_DEPTH 256 /* bounds tree depth -> recursive walk can't overflow */
 
-static int is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
-static int is_name_char(char c) { return is_alpha(c) || (c >= '0' && c <= '9') || c == '-' || c == ':' || c == '_'; }
-static int is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
+static bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+static bool is_name_char(char c) { return is_alpha(c) || (c >= '0' && c <= '9') || c == '-' || c == ':' || c == '_'; }
+static bool is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
 
 static char *dupn(const char *s, int n)
 {
@@ -38,15 +39,15 @@ static char *dupn_lower(const char *s, int n)
   return d;
 }
 
-static int name_in(const char *n, const char *const *set)
+static bool name_in(const char *n, const char *const *set)
 {
   for (int i = 0; set[i]; i++)
     if (streq(n, set[i]))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
-static int is_void(const char *name)
+static bool is_void(const char *name)
 {
   static const char *const v[] = {"area", "base", "br",    "col",    "embed", "hr",  "img", "input",
                                   "link", "meta", "param", "source", "track", "wbr", 0};
@@ -54,7 +55,7 @@ static int is_void(const char *name)
 }
 
 /* Content is literal up to the matching close tag. */
-static int is_rawtext(const char *name)
+static bool is_rawtext(const char *name)
 {
   static const char *const r[] = {"script", "style", "title", "textarea", 0};
   return name_in(name, r);
@@ -63,7 +64,7 @@ static int is_rawtext(const char *name)
 /* CSS block-level elements — used only to close an open <p> when one starts.
  * (The renderer has its own, deliberately different, line-break set in html.c.)
  */
-static int is_block(const char *name)
+static bool is_block(const char *name)
 {
   static const char *const b[] = {"address",  "article",    "aside",  "blockquote", "details", "div",    "dl",
                                   "fieldset", "figcaption", "figure", "footer",     "form",    "h1",     "h2",
@@ -78,14 +79,14 @@ struct parser {
   struct dom_node *root;
   struct dom_node *cur; /* insertion point */
   int depth;
-  int oom;
+  bool oom;
 };
 
 static struct dom_node *node_new(struct parser *ps, enum dom_type type)
 {
   struct dom_node *n = malloc(sizeof *n);
   if (!n) {
-    ps->oom = 1;
+    ps->oom = true;
     return 0;
   }
   n->type = type;
@@ -119,13 +120,13 @@ static void node_append(struct dom_node *parent, struct dom_node *child)
   parent->last_child = child;
 }
 
-static int attr_append(struct dom_node *el, char *name, char *value)
+static bool attr_append(struct dom_node *el, char *name, char *value)
 {
   struct dom_attr *a = malloc(sizeof *a);
   if (!a) {
     free(name);
     free(value);
-    return 0;
+    return false;
   }
   a->name = name;
   a->value = value;
@@ -135,7 +136,7 @@ static int attr_append(struct dom_node *el, char *name, char *value)
   else
     el->attrs = a;
   el->last_attr = a;
-  return 1;
+  return true;
 }
 
 /* Close cur up to and including the nearest ancestor in `targets`, unless a
@@ -214,13 +215,13 @@ static void auto_close(struct parser *ps, const char *name)
 }
 
 /* s[0..n) == pre (case-insensitive) and followed by a tag-name terminator. */
-static int ci_close_match(const char *s, const char *end, const char *pre, int n)
+static bool ci_close_match(const char *s, const char *end, const char *pre, int n)
 {
   if (s + n > end)
-    return 0;
+    return false;
   for (int i = 0; i < n; i++)
     if (lower(s[i]) != lower(pre[i]))
-      return 0;
+      return false;
   char nx = (s + n < end) ? s[n] : '>';
   return nx == '>' || nx == '/' || is_space(nx);
 }
@@ -239,7 +240,7 @@ static void handle_text(struct parser *ps)
   t->text = dupn(start, len);
   if (!t->text) {
     free(t);
-    ps->oom = 1;
+    ps->oom = true;
     return;
   }
   node_append(ps->cur, t);
@@ -253,7 +254,7 @@ static void emit_literal(struct parser *ps, char c)
   t->text = dupn(&c, 1);
   if (!t->text) {
     free(t);
-    ps->oom = 1;
+    ps->oom = true;
     return;
   }
   node_append(ps->cur, t);
@@ -278,10 +279,10 @@ static void handle_tag(struct parser *ps)
     return;
   }
 
-  int closing = 0;
+  bool closing = false;
   const char *q = p + 1;
   if (q < end && *q == '/') {
-    closing = 1;
+    closing = true;
     q++;
   }
 
@@ -323,13 +324,13 @@ static void handle_tag(struct parser *ps)
     el->tag[i] = '\0';
   }
 
-  int self_close = 0;
+  bool self_close = false;
   while (q < end && *q != '>') {
     const char *guard = q;
     while (q < end && is_space(*q))
       q++;
     if (q < end && *q == '/') {
-      self_close = 1;
+      self_close = true;
       q++;
       continue;
     }
@@ -408,7 +409,7 @@ static void handle_tag(struct parser *ps)
           node_append(el, t);
         else {
           free(t);
-          ps->oom = 1;
+          ps->oom = true;
         }
       }
     }
@@ -437,7 +438,7 @@ struct dom_node *dom_parse(const char *html, int len)
   ps.p = html;
   ps.end = html + len;
   ps.depth = 0;
-  ps.oom = 0;
+  ps.oom = false;
 
   ps.root = malloc(sizeof *ps.root);
   if (!ps.root)

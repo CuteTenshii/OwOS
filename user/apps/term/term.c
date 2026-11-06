@@ -24,6 +24,7 @@
 #include "gfx.h"
 #include "lzss.h"
 #include "owos.h"
+#include <stdbool.h>
 
 #define FONT_W 8
 #define FONT_H 16
@@ -63,7 +64,8 @@ static int ls_line, ls_col; /* where the input line starts        */
 static unsigned cur_fg = FG;
 static int cols = 90, rows = 27;   /* active grid (from window size)     */
 static int winw = 720, winh = 432; /* window client size in pixels       */
-static int win, dirty = 1;
+static int win;
+static bool dirty = true;
 
 static int phys(int logical) { return (top + logical) % SBROWS; }
 
@@ -83,7 +85,7 @@ static void grid_reset(void)
   nlines = 1;
   cl = cc = 0;
   view = 0;
-  dirty = 1;
+  dirty = true;
 }
 
 /* Advance to a fresh next line, scrolling the ring when the cursor falls off
@@ -199,7 +201,7 @@ static void tputc(char c)
     gfg[p][cc] = cur_fg;
     cc++;
   }
-  dirty = 1;
+  dirty = true;
 }
 
 static void tputs(const char *s)
@@ -257,19 +259,19 @@ static void redraw(void)
   scrollbar_draw(winw - GUI_SCROLL_W, 0, GUI_SCROLL_W, winh, bottom - view, nlines, rows);
 
   win_present(win);
-  dirty = 0;
+  dirty = false;
 }
 
 /* ---- tiny string helpers ----------------------------------------------------
  */
 
-static int has_prefix(const char *s, const char *p)
+static bool has_prefix(const char *s, const char *p)
 {
   while (*p) {
     if (*s++ != *p++)
-      return 0;
+      return false;
   }
-  return 1;
+  return true;
 }
 
 /* ---- cwd + path resolution --------------------------------------------------
@@ -836,7 +838,7 @@ static void bi_grep(int argc, char **argv)
 /* /bin programs that drive an interactive session (read keystrokes, not just
  * emit output): their stdin is wired to a pipe and the window's keystrokes are
  * forwarded into it. ssh is the one such tool. */
-static int is_interactive(const char *name) { return !strcmp(name, "ssh"); }
+static bool is_interactive(const char *name) { return !strcmp(name, "ssh"); }
 
 /* Spawn a /bin CLI tool with its stdout wired to a pipe (spawn_cap) and render
  * the output as it streams in. The terminal stays responsive to window events;
@@ -855,7 +857,8 @@ static int is_interactive(const char *name) { return !strcmp(name, "ssh"); }
  * Unix terminal never classifies its children at all. */
 #define BG_MAX 16
 static struct {
-  int pid, rfd, active;
+  int pid, rfd;
+  bool active;
 } bg_jobs[BG_MAX];
 
 static void bg_add(int pid, int rfd)
@@ -864,7 +867,7 @@ static void bg_add(int pid, int rfd)
     if (!bg_jobs[i].active) {
       bg_jobs[i].pid = pid;
       bg_jobs[i].rfd = rfd;
-      bg_jobs[i].active = 1;
+      bg_jobs[i].active = true;
       return;
     }
   close(rfd); /* table full: drop the pipe; the child is reparented + reaped on
@@ -888,7 +891,7 @@ static void bg_service(void)
       } /* child closed stdout */
     }
     if (bg_jobs[i].rfd < 0 && waitpid_nb(bg_jobs[i].pid, 0))
-      bg_jobs[i].active = 0;
+      bg_jobs[i].active = false;
   }
 }
 
@@ -1132,17 +1135,17 @@ static int require_root(const char *cmd)
 
 /* A legal account/group name: [A-Za-z_][A-Za-z0-9_-]*, <= 16 chars (so
  * "/home/<name>" fits owofs's 17-char component limit). */
-static int valid_name(const char *s)
+static bool valid_name(const char *s)
 {
   if (!s || !s[0])
-    return 0;
+    return false;
   int n = 0;
   for (const char *p = s; *p; p++, n++) {
     char c = *p;
-    int alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
-    int rest = alpha || (c >= '0' && c <= '9') || c == '-';
+    bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    bool rest = alpha || (c >= '0' && c <= '9') || c == '-';
     if (n == 0 ? !alpha : !rest)
-      return 0;
+      return false;
   }
   return n <= 16;
 }
@@ -1316,7 +1319,7 @@ static void cmd_userdel(int argc, char **argv)
       nb[o++] = gf[i];
     nb[o++] = ':';
     /* filtered members */
-    int first = 1;
+    bool first = true;
     for (const char *q = mem; *q;) {
       const char *s = q;
       while (*q && *q != ',')
@@ -1332,7 +1335,7 @@ static void cmd_userdel(int argc, char **argv)
           nb[o++] = ',';
         for (int i = 0; i < tl; i++)
           nb[o++] = tok[i];
-        first = 0;
+        first = false;
       }
       if (*q == ',')
         q++;
@@ -1974,7 +1977,7 @@ static void line_redraw(void)
     tputc(' ');
   rlen = llen;
   caret_to(lpos);
-  dirty = 1;
+  dirty = true;
 }
 
 static void line_set(const char *s)
@@ -2104,7 +2107,7 @@ static void on_scroll(int dz)
     view = 0;
   if (view > maxoff)
     view = maxoff;
-  dirty = 1;
+  dirty = true;
 }
 
 /* The scrollbar widget works in top-line units (`scroll`, 0..bottom); `view`
@@ -2119,7 +2122,7 @@ static void sb_set(int scroll)
     view = 0;
   if (view > maxoff)
     view = maxoff;
-  dirty = 1;
+  dirty = true;
 }
 
 /* Left-click on the bar: arrows step a line, a track grab jumps the thumb to
@@ -2167,7 +2170,7 @@ static void on_resize(int w, int h)
   rows = h / FONT_H;
   if (rows < 1)
     rows = 1;
-  dirty = 1;
+  dirty = true;
 }
 
 /* Headless stdio REPL (term -stdio): the shell over stdin/stdout instead of a

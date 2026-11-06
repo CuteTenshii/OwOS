@@ -22,6 +22,7 @@
  */
 #include "mime.h"
 #include "owos.h"
+#include <stdbool.h>
 
 #define MAX_CLIPS 64   /* history depth; oldest is evicted past this   */
 #define MIME_MAX 64    /* longest MIME type we keep (NUL-terminated)    */
@@ -37,63 +38,63 @@ static int nclips;
 
 /* ---- framed I/O over a channel fd (read/write may transfer partial) -------
  */
-static int read_full(int fd, void *buf, int n)
+static bool read_full(int fd, void *buf, int n)
 {
   char *p = (char *)buf;
   int got = 0;
   while (got < n) {
     int r = read(fd, p + got, n - got);
     if (r <= 0)
-      return 0; /* peer closed / error */
+      return false; /* peer closed / error */
     got += r;
   }
-  return 1;
+  return true;
 }
 
-static int write_full(int fd, const void *buf, int n)
+static bool write_full(int fd, const void *buf, int n)
 {
   const char *p = (const char *)buf;
   int put = 0;
   while (put < n) {
     int w = write(fd, p + put, n - put);
     if (w <= 0)
-      return 0;
+      return false;
     put += w;
   }
-  return 1;
+  return true;
 }
 
-static int rd_u32(int fd, unsigned *v)
+static bool rd_u32(int fd, unsigned *v)
 {
   unsigned char b[4];
   if (!read_full(fd, b, 4))
-    return 0;
+    return false;
   *v = (unsigned)b[0] | ((unsigned)b[1] << 8) | ((unsigned)b[2] << 16) | ((unsigned)b[3] << 24);
-  return 1;
+  return true;
 }
 
-static int wr_u32(int fd, unsigned v)
+static bool wr_u32(int fd, unsigned v)
 {
   unsigned char b[4] = {(unsigned char)v, (unsigned char)(v >> 8), (unsigned char)(v >> 16), (unsigned char)(v >> 24)};
   return write_full(fd, b, 4);
 }
 
 /* Read a length(1)-prefixed MIME string into `out` (<= MIME_MAX, NUL-term). */
-static int rd_mime(int fd, char *out)
+static bool rd_mime(int fd, char *out)
 {
   unsigned char n;
   if (!read_full(fd, &n, 1))
-    return 0;
+    return false;
   if (n >= MIME_MAX)
     n = MIME_MAX - 1;
   if (n && !read_full(fd, out, n))
-    return 0;
+    return false;
   out[n] = '\0';
-  return 1;
+  return true;
 }
 
 /* Write a length(1)-prefixed MIME string. */
-static int wr_mime(int fd, const char *mime)
+static bool wr_mime(int fd, const char *mime)
 {
   int n = 0;
   while (mime[n] && n < MIME_MAX - 1)

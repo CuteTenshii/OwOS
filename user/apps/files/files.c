@@ -9,6 +9,7 @@
 #include "dialog.h"
 #include "gfx.h"
 #include "owos.h"
+#include <stdbool.h>
 
 static int W = 320, H = 380; /* client size; changes on resize */
 #define MENU_H 18            /* top menu bar (above the sidebar + list) */
@@ -27,7 +28,7 @@ static struct sidebar sb;
 
 struct fent {
   char name[64];
-  int is_dir;
+  bool is_dir;
   unsigned size;
 }; /* name: owofs FS_NAME_LEN */
 
@@ -124,21 +125,21 @@ static int collect(void)
   struct dirent_u d;
   if (!feq(path, "/")) {
     fcpy(fent_buf[n].name, "..");
-    fent_buf[n].is_dir = 1;
+    fent_buf[n].is_dir = true;
     fent_buf[n].size = 0;
     n++;
   }
   for (int i = 0; n < FMAX && readdir(path, i, &d) == 1; i++)
     if (d.is_dir) {
       fcpy(fent_buf[n].name, d.name);
-      fent_buf[n].is_dir = 1;
+      fent_buf[n].is_dir = true;
       fent_buf[n].size = 0;
       n++;
     }
   for (int i = 0; n < FMAX && readdir(path, i, &d) == 1; i++)
     if (!d.is_dir) {
       fcpy(fent_buf[n].name, d.name);
-      fent_buf[n].is_dir = 0;
+      fent_buf[n].is_dir = false;
       fent_buf[n].size = d.size;
       n++;
     }
@@ -461,7 +462,7 @@ static void open_file(const char *name) { open_with(name, app_for(name)); }
 /* Confirm and remove the entry `name` in the current directory — a file via
  * unlink, a folder via rmdir (which only succeeds when empty). The confirm and
  * any error report are modal dialogs parented on this window. */
-static void delete_entry(int id, const char *name, int is_dir)
+static void delete_entry(int id, const char *name, bool is_dir)
 {
   if (feq(name, ".."))
     return;
@@ -522,7 +523,7 @@ static void prop_close_rect(int *bx, int *by, int *bw)
 }
 
 /* Open (or replace) the Properties window for `name`, built from its facts. */
-static void show_properties(int mainid, const char *name, int is_dir, unsigned size)
+static void show_properties(int mainid, const char *name, bool is_dir, unsigned size)
 {
   prop_nrows = 0;
   prop_add("Name", name);
@@ -676,7 +677,7 @@ static const struct ctx_item ci_device_off[] = {{"Connect", A_CONNECT}};
 static const struct ctx_item ci_bg[] = {{"Refresh", A_REFRESH}, {"Go Up", A_UP}, {"Home", A_HOME}};
 
 static struct {
-  int open;
+  bool open;
   int x, y; /* popup top-left (clamped into the window) */
   enum ctx_kind kind;
   int target;    /* place / device index                    */
@@ -734,7 +735,7 @@ static void ctx_open(enum ctx_kind kind, int target, const char *name, int mx, i
     y = 0;
   ctx.x = x;
   ctx.y = y;
-  ctx.open = 1;
+  ctx.open = true;
 }
 
 static void ctx_draw(void)
@@ -828,7 +829,7 @@ static void ctx_click(int id, int mx, int my)
     if (i >= 0 && i < n)
       ctx_run(it[i].act, id);
   }
-  ctx.open = 0;
+  ctx.open = false;
   seq++;
 }
 
@@ -1068,7 +1069,7 @@ static void key(int id, int k)
   }
   if (k == 27) {
     gomenu.open = 0;
-    ctx.open = 0;
+    ctx.open = false;
     seq++;
     return;
   }

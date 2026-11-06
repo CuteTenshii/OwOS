@@ -10,7 +10,7 @@
 #define PIPE_SIZE 512
 
 struct pipe {
-  int used;
+  bool used;
   char buf[PIPE_SIZE];
   int head, tail, count;
   int readers, writers;
@@ -22,7 +22,7 @@ int pipe_alloc(void)
 {
   for (int i = 0; i < MAX_PIPES; i++) {
     if (!pipes[i].used) {
-      pipes[i].used = 1;
+      pipes[i].used = true;
       pipes[i].head = pipes[i].tail = pipes[i].count = 0;
       pipes[i].readers = 1;
       pipes[i].writers = 1;
@@ -48,7 +48,7 @@ void pipe_close(int id, int writer)
   else
     p->readers--;
   if (p->readers <= 0 && p->writers <= 0)
-    p->used = 0; /* both ends gone: free the pipe           */
+    p->used = false; /* both ends gone: free the pipe           */
 }
 
 int pipe_read(int id, char *buf, int len)

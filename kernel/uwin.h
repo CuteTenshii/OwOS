@@ -4,6 +4,7 @@
 #ifndef OWOS_UWIN_H
 #define OWOS_UWIN_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Base user address of a window's client buffer. Each live window of an owner
@@ -91,7 +92,7 @@ void uwin_task_exiting(uint32_t owner_id);
 
 /* 1 if task `pid` owns at least one live window, else 0 (SYS_WIN_OWNS backend:
  * lets the terminal detach windowed apps without a hardcoded program list). */
-int uwin_pid_has_window(uint32_t pid);
+bool uwin_pid_has_window(uint32_t pid);
 
 /* Called when a pin is dropped (uwin_unmap): reclaim the client buffers of
  * windows that were closed while the compositor still held them mapped. */
@@ -101,7 +102,7 @@ void uwin_reap(void);
  * uwin_compositor_active() is 1 while it runs, so kernel_main leaves keyboard
  * input to it. Cleared by uwin_task_exiting. */
 void uwin_compositor_register(uint32_t pid);
-int uwin_compositor_active(void);
+bool uwin_compositor_active(void);
 
 /* ---- compositor brokering backends (SYS_WIN_ENUM/MAP/UNMAP/SET_GEOM/DELIVER).
  * All run in the caller's (compositor) context; the caller root-gates and

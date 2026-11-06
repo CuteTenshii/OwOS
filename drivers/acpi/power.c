@@ -11,6 +11,7 @@
 #include "irq.h"
 #include "paging.h"
 #include "timer.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 /* ---- ACPI shutdown ------------------------------------------------------ *
@@ -69,7 +70,7 @@ struct fadt {
 #define SLP_EN (1 << 13) /* PM1_CNT sleep-enable bit */
 #define SCI_EN (1 << 0)  /* PM1a_CNT: ACPI mode is on */
 
-static int sig4(const char *a, const char *b) { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]; }
+static bool sig4(const char *a, const char *b) { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]; }
 
 /* Scan a physical range, 16-byte aligned, for the RSDP anchor string. */
 static struct rsdp *scan_rsdp(uint32_t start, uint32_t end)
@@ -87,7 +88,7 @@ static struct rsdp *scan_rsdp(uint32_t start, uint32_t end)
  * On a UEFI boot the firmware leaves no RSDP in the legacy BIOS area, so the
  * scan below finds nothing and this copy is the only way to reach ACPI. */
 static struct rsdp boot_rsdp;
-static int boot_rsdp_valid;
+static bool boot_rsdp_valid;
 
 void acpi_set_rsdp(const void *rsdp_copy)
 {
@@ -136,42 +137,42 @@ static struct rsdp *find_rsdp(void)
  * pointers) on ACPI 2.0+ when the firmware populated it, otherwise the RSDT
  * (4-byte). Returns 0 on failure; on success *hdr is the mapped header, *count
  * the number of table pointers, and *xsdt is 1 for 8-byte entries. */
-static int find_root_sdt(struct sdt_header **hdr, uint32_t *count, int *xsdt)
+static bool find_root_sdt(struct sdt_header **hdr, uint32_t *count, bool *xsdt)
 {
   struct rsdp *rsdp = find_rsdp();
   if (!rsdp)
-    return 0;
+    return false;
 
   uint32_t phys;
-  int is_xsdt;
+  bool is_xsdt;
   if (rsdp->revision >= 2 && rsdp->xsdt_addr && rsdp->xsdt_addr < 0x100000000ull) {
     phys = (uint32_t)rsdp->xsdt_addr;
-    is_xsdt = 1;
+    is_xsdt = true;
   } else {
     phys = rsdp->rsdt_addr;
-    is_xsdt = 0;
+    is_xsdt = false;
   }
   if (!phys)
-    return 0;
+    return false;
 
   struct sdt_header *h = (struct sdt_header *)(uintptr_t)phys;
   if (paging_identity_map(phys, sizeof(*h)) != 0)
-    return 0;
+    return false;
   if (!sig4(h->signature, is_xsdt ? "XSDT" : "RSDT"))
-    return 0;
+    return false;
   if (paging_identity_map(phys, h->length) != 0)
-    return 0;
+    return false;
 
   *hdr = h;
   *count = (h->length - sizeof(*h)) / (is_xsdt ? 8 : 4);
   *xsdt = is_xsdt;
-  return 1;
+  return true;
 }
 
 /* Physical address of the i-th table the root SDT points at. RSDT entries are
  * 4 bytes, XSDT entries 8; either way ACPI tables live below 4 GiB, so the
  * truncation to 32 bits is safe (we only manage the low 4 GiB anyway). */
-static uint32_t root_entry(struct sdt_header *root, uint32_t i, int xsdt)
+static uint32_t root_entry(struct sdt_header *root, uint32_t i, bool xsdt)
 {
   uint8_t *base = (uint8_t *)root + sizeof(struct sdt_header);
   if (xsdt)
@@ -195,17 +196,17 @@ static uint32_t fadt_dsdt_phys(struct fadt *f)
 /* Dig SLP_TYPa/SLP_TYPb out of one of the DSDT's sleep-state packages, named by
  * `name` ("_S5_" for off, "_S3_" for suspend-to-RAM). Returns 0 on failure; on
  * success the values are written *already shifted* into PM1_CNT position. */
-static int parse_sleep(struct fadt *f, const char *name, uint16_t *slp_a, uint16_t *slp_b)
+static bool parse_sleep(struct fadt *f, const char *name, uint16_t *slp_a, uint16_t *slp_b)
 {
   uint32_t dphys = fadt_dsdt_phys(f);
   struct sdt_header *dsdt = (struct sdt_header *)(uintptr_t)dphys;
   /* Map the header, then the whole table once its length is known. */
   if (paging_identity_map(dphys, sizeof(*dsdt)) != 0)
-    return 0;
+    return false;
   if (!dsdt || !sig4(dsdt->signature, "DSDT"))
-    return 0;
+    return false;
   if (paging_identity_map(dphys, dsdt->length) != 0)
-    return 0;
+    return false;
 
   uint8_t *p = (uint8_t *)dsdt + sizeof(*dsdt);
   uint8_t *end = (uint8_t *)dsdt + dsdt->length;
@@ -214,37 +215,37 @@ static int parse_sleep(struct fadt *f, const char *name, uint16_t *slp_a, uint16
       break;
   }
   if (p >= end - 4)
-    return 0;
+    return false;
 
   /* Validate it's a real NameOp(name, Package): the name is preceded by an
    * AML NameOp (0x08), optionally under the root scope ('\\' == 0x5C), and
    * followed by a PackageOp (0x12). */
   if (!((*(p - 1) == 0x08) || (*(p - 2) == 0x08 && *(p - 1) == 0x5C)) || *(p + 4) != 0x12)
-    return 0;
+    return false;
 
   p += 5; /* skip the name and the PackageOp byte */
   if (p >= end)
-    return 0;
+    return false;
   p += ((*p & 0xC0) >> 6) + 2; /* skip PkgLength + element count       */
   if (p >= end)
-    return 0;
+    return false;
 
   if (*p == 0x0A) { /* BytePrefix before SLP_TYPa           */
     p++;
     if (p >= end)
-      return 0;
+      return false;
   }
   *slp_a = (uint16_t)(*p++) << 10;
   if (p >= end)
-    return 0;
+    return false;
 
   if (*p == 0x0A) { /* BytePrefix before SLP_TYPb           */
     p++;
     if (p >= end)
-      return 0;
+      return false;
   }
   *slp_b = (uint16_t)(*p) << 10;
-  return 1;
+  return true;
 }
 
 /* Locate and identity-map a primary ACPI table by signature, mapping the
@@ -255,7 +256,7 @@ void *acpi_find_table(const char *sig)
 {
   struct sdt_header *root;
   uint32_t count;
-  int xsdt;
+  bool xsdt;
   if (!find_root_sdt(&root, &count, &xsdt))
     return 0;
 
@@ -283,27 +284,27 @@ static struct fadt *find_fadt(void) { return (struct fadt *)acpi_find_table("FAC
  * the full table once its length is known. A garbage length can't run away:
  * it's a table's own self-reported size and we only ever read inside the mapped
  * span. */
-static int sdt_contains(struct sdt_header *h, const char *sig, const uint8_t *needle, uint32_t n)
+static bool sdt_contains(struct sdt_header *h, const char *sig, const uint8_t *needle, uint32_t n)
 {
   if (!h || paging_identity_map((uint32_t)(uintptr_t)h, sizeof(*h)) != 0)
-    return 0;
+    return false;
   if (!sig4(h->signature, sig) || h->length <= sizeof(*h) || n == 0)
-    return 0;
+    return false;
   if (paging_identity_map((uint32_t)(uintptr_t)h, h->length) != 0)
-    return 0;
+    return false;
 
   const uint8_t *body = (const uint8_t *)h + sizeof(*h);
   uint32_t len = h->length - sizeof(*h);
   if (len < n)
-    return 0;
+    return false;
   for (uint32_t i = 0; i + n <= len; i++) {
     uint32_t j = 0;
     while (j < n && body[i + j] == needle[j])
       j++;
     if (j == n)
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 /* Scan the device AML for a byte sequence (e.g. an EISA _HID), looking in both
@@ -311,19 +312,19 @@ static int sdt_contains(struct sdt_header *h, const char *sig, const uint8_t *ne
  * the battery especially — in an SSDT rather than the DSDT, so battery.c must
  * search both. Returns 0 when ACPI isn't reachable (e.g. RSDP not in the legacy
  * BIOS area, as on a pure-UEFI boot). */
-int acpi_aml_contains(const uint8_t *needle, uint32_t n)
+bool acpi_aml_contains(const uint8_t *needle, uint32_t n)
 {
   struct sdt_header *root;
   uint32_t count;
-  int xsdt;
+  bool xsdt;
   if (!find_root_sdt(&root, &count, &xsdt))
-    return 0;
+    return false;
 
   /* The DSDT hangs off the FADT, not the root table, so reach it separately
    * (and via the 64-bit X_DSDT when the firmware uses it). */
   struct fadt *f = find_fadt();
   if (f && sdt_contains((struct sdt_header *)(uintptr_t)fadt_dsdt_phys(f), "DSDT", needle, n))
-    return 1;
+    return true;
 
   /* Every other table is a direct root-table entry; scan the SSDTs. */
   for (uint32_t i = 0; i < count; i++) {
@@ -331,9 +332,9 @@ int acpi_aml_contains(const uint8_t *needle, uint32_t n)
     if (paging_identity_map(phys, sizeof(struct sdt_header)) != 0)
       continue;
     if (sdt_contains((struct sdt_header *)(uintptr_t)phys, "SSDT", needle, n))
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 /* Hand each AML definition block (DSDT, then every SSDT) to fn as a (body, len)
@@ -344,7 +345,7 @@ void acpi_for_each_aml(void (*fn)(const uint8_t *body, uint32_t len, void *ctx),
 {
   struct sdt_header *root;
   uint32_t count;
-  int xsdt;
+  bool xsdt;
   if (!find_root_sdt(&root, &count, &xsdt))
     return;
 
@@ -539,14 +540,14 @@ static uint8_t *find_facs(struct fadt *f)
  * stash the wake vector) must be reachable. Used to gate the Start-menu "Sleep"
  * item — VMware, for one, doesn't expose S3 to the guest, so offering it would
  * just be a dead button. Safe to call any time after paging is up. */
-int power_can_sleep(void)
+bool power_can_sleep(void)
 {
   struct fadt *f = find_fadt();
   if (!f)
-    return 0;
+    return false;
   uint16_t a, b;
   if (!parse_sleep(f, "_S3_", &a, &b))
-    return 0;
+    return false;
   return find_facs(f) != 0;
 }
 

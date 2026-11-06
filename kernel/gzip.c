@@ -23,6 +23,7 @@
 #include "crc32.h"
 #include "endian.h"
 #include "heap.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -67,14 +68,14 @@ struct inbits {
   uint32_t pos;
   uint32_t bitbuf;
   int bitcnt;
-  int err;
+  bool err;
 };
 
 static int get_bit(struct inbits *s)
 {
   if (s->bitcnt == 0) {
     if (s->pos >= s->len) {
-      s->err = 1;
+      s->err = true;
       return 0;
     }
     s->bitbuf = s->src[s->pos++];
@@ -314,7 +315,7 @@ struct outbits {
   uint32_t pos;
   uint32_t acc;
   int nbits;
-  int err;
+  bool err;
 };
 
 /* Append n data bits, LSB-first. */
@@ -328,7 +329,7 @@ static void put_bits(struct outbits *o, uint32_t val, int n)
     if (o->pos < o->cap)
       o->buf[o->pos++] = (uint8_t)(o->acc & 0xFF);
     else
-      o->err = 1;
+      o->err = true;
     o->acc >>= 8;
     o->nbits -= 8;
   }
@@ -351,7 +352,7 @@ static void flush_bits(struct outbits *o)
     if (o->pos < o->cap)
       o->buf[o->pos++] = (uint8_t)(o->acc & 0xFF);
     else
-      o->err = 1;
+      o->err = true;
     o->acc = 0;
     o->nbits = 0;
   }
@@ -363,7 +364,7 @@ static void put_raw(struct outbits *o, uint8_t b)
   if (o->pos < o->cap)
     o->buf[o->pos++] = b;
   else
-    o->err = 1;
+    o->err = true;
 }
 
 /* Map a match length (3..258) to its length symbol (257..285) and extra bits.

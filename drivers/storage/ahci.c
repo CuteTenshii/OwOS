@@ -20,6 +20,8 @@
  * That is fine under QEMU; on real silicon AHCI registers want PCD set.
  */
 
+#include <stdbool.h>
+
 #include "ahci.h"
 #include "console.h"
 #include "paging.h"
@@ -75,7 +77,7 @@
  */
 
 static volatile uint32_t *abar; /* mapped MMIO register block                 */
-static int found;
+static bool found;
 static int port; /* the port we drive                          */
 static uint32_t cap_sectors;
 static char model[41]; /* drive model from IDENTIFY                   */
@@ -124,7 +126,7 @@ static void port_start(void)
 
 /* Build a one-sector READ/WRITE DMA EXT command in slot 0 and ring PxCI.
  * Returns 0 on success, -1 on timeout or task-file error. */
-static int issue(uint32_t lba, uint32_t count, uint8_t ata_cmd, int write)
+static int issue(uint32_t lba, uint32_t count, uint8_t ata_cmd, bool write)
 {
   if (count == 0 || count > 8)
     return -1;
@@ -192,7 +194,7 @@ int ahci_read(uint32_t lba, void *buf, uint32_t count)
   if (!found || count == 0 || count > 8)
     return -1;
   uintptr_t flags = spin_lock_irqsave(&io_lock);
-  if (issue(lba, count, ATA_READ_DMA_EX, 0)) {
+  if (issue(lba, count, ATA_READ_DMA_EX, false)) {
     spin_unlock_irqrestore(&io_lock, flags);
     return -1;
   }
@@ -211,7 +213,7 @@ int ahci_write(uint32_t lba, const void *buf, uint32_t count)
   const uint8_t *s = buf;
   for (uint32_t i = 0; i < count * 512; i++)
     dbuf[i] = s[i];
-  int rc = issue(lba, count, ATA_WRITE_DMA_EX, 1);
+  int rc = issue(lba, count, ATA_WRITE_DMA_EX, true);
   spin_unlock_irqrestore(&io_lock, flags);
   return rc;
 }
@@ -229,7 +231,7 @@ const char *ahci_model(void) { return model; }
 static uint32_t identify_drive(void)
 {
   model[0] = '\0';
-  if (issue(0, 1, 0xEC, 0))
+  if (issue(0, 1, 0xEC, false))
     return 0;
   const volatile uint16_t *id = (const volatile uint16_t *)dbuf;
 
@@ -344,7 +346,7 @@ void ahci_init(void)
   port_wr(PX_IE, 0); /* polled: no interrupts          */
   port_start();
 
-  found = 1;
+  found = true;
   cap_sectors = identify_drive();
 
   con_printf("ahci: SATA disk on port %u", (uint32_t)port);

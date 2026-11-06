@@ -4,6 +4,8 @@
  * In-memory, per-page storage driven cooperatively by js_idb_pump (mirroring
  * js_timers_pump), installed onto `window` by js_idb_setup. Split out of js.c;
  * shares the page engine context and the DOM/event helpers via jsint.h. */
+#include <stdbool.h>
+
 #include "../jsint.h"
 
 /* ---------------------------------------------------------- IndexedDB ------ *
@@ -57,35 +59,35 @@ static js_value idb_throw(js_ctx *ctx, const char *name, const char *msg)
 
 /* ---- keys: validity, type rank and comparison (spec key ordering) -------- */
 
-static int idb_is_keyrange(js_value v) { return v.type == JV_OBJ && v.u.obj->proto == g_idb_proto[IDBP_KEYRANGE]; }
-static int idb_is_date(js_value v)
+static bool idb_is_keyrange(js_value v) { return v.type == JV_OBJ && v.u.obj->proto == g_idb_proto[IDBP_KEYRANGE]; }
+static bool idb_is_date(js_value v)
 {
   return v.type == JV_OBJ && v.u.obj->kind == OBJ_PLAIN && v.u.obj->proto == g_ctx->date_proto;
 }
-static int idb_is_binary(js_value v)
+static bool idb_is_binary(js_value v)
 {
   return v.type == JV_OBJ && (v.u.obj->kind == OBJ_ARRAYBUFFER || v.u.obj->kind == OBJ_TYPEDARRAY);
 }
-static int idb_valid_key(js_value v, int depth)
+static bool idb_valid_key(js_value v, int depth)
 {
   if (depth > 64)
-    return 0;
+    return false;
   if (v.type == JV_NUM)
     return !IDB_ISNAN(v.u.num);
   if (idb_is_date(v))
     return !IDB_ISNAN(js_to_number(g_ctx, js_get(g_ctx, v, "@t")));
   if (v.type == JV_STR)
-    return 1;
+    return true;
   if (idb_is_binary(v))
-    return 1;
+    return true;
   if (v.type == JV_OBJ && v.u.obj->kind == OBJ_ARRAY) {
     unsigned i, n = js_array_len(v.u.obj);
     for (i = 0; i < n; i++)
       if (!idb_valid_key(js_get_index(g_ctx, v, i), depth + 1))
-        return 0;
-    return 1;
+        return false;
+    return true;
   }
-  return 0;
+  return false;
 }
 /* type rank: number 0, date 1, string 2, binary 3, array 4 */
 static int idb_key_rank(js_value v)
@@ -471,27 +473,27 @@ static void idb_str_field(js_value o, const char *k, char *buf, int cap)
   else
     buf[0] = 0;
 }
-static int idb_txn_active(js_value txn)
+static bool idb_txn_active(js_value txn)
 {
   js_value s;
   if (txn.type != JV_OBJ)
-    return 0;
+    return false;
   s = js_get(g_ctx, txn, "@state");
   return s.type == JV_STR && streq(s.u.str->data, "active");
 }
-static int idb_txn_write(js_value txn)
+static bool idb_txn_write(js_value txn)
 {
   js_value m;
   if (txn.type != JV_OBJ)
-    return 0;
+    return false;
   m = js_get(g_ctx, txn, "mode");
   return m.type == JV_STR && (streq(m.u.str->data, "readwrite") || streq(m.u.str->data, "versionchange"));
 }
-static int idb_txn_isversion(js_value txn)
+static bool idb_txn_isversion(js_value txn)
 {
   js_value m;
   if (txn.type != JV_OBJ)
-    return 0;
+    return false;
   m = js_get(g_ctx, txn, "mode");
   return m.type == JV_STR && streq(m.u.str->data, "versionchange");
 }
@@ -715,29 +717,29 @@ static void idb_restore(const char *dbname, js_value snap)
 
 /* Is `query` (a key or a key range) satisfied by `key`? An unbounded query
  * (undefined/null) matches every key. */
-static int idb_query_match(js_value query, js_value key)
+static bool idb_query_match(js_value query, js_value key)
 {
   if (query.type == JV_UNDEF || query.type == JV_NULL)
-    return 1;
+    return true;
   if (idb_is_keyrange(query)) {
     js_value lo = js_get(g_ctx, query, "@lower"), hi = js_get(g_ctx, query, "@upper");
-    int loO = js_to_boolean(js_get(g_ctx, query, "@lowerOpen"));
-    int hiO = js_to_boolean(js_get(g_ctx, query, "@upperOpen"));
+    bool loO = js_to_boolean(js_get(g_ctx, query, "@lowerOpen"));
+    bool hiO = js_to_boolean(js_get(g_ctx, query, "@upperOpen"));
     if (lo.type != JV_UNDEF) {
       int c = idb_cmp(key, lo);
       if (c < 0 || (c == 0 && loO))
-        return 0;
+        return false;
     }
     if (hi.type != JV_UNDEF) {
       int c = idb_cmp(key, hi);
       if (c > 0 || (c == 0 && hiO))
-        return 0;
+        return false;
     }
-    return 1;
+    return true;
   }
   return idb_cmp(key, query) == 0;
 }
-static int idb_query_valid(js_value q) { return idb_is_keyrange(q) || idb_valid_key(q, 0); }
+static bool idb_query_valid(js_value q) { return idb_is_keyrange(q) || idb_valid_key(q, 0); }
 
 /* ---- wrapper factories --------------------------------------------------- */
 
@@ -762,7 +764,7 @@ static js_value idb_make_txn(js_value db, js_object *scope, const char *mode, js
 {
   js_object *txn;
   char dbn[128];
-  int write = streq(mode, "readwrite") || streq(mode, "versionchange");
+  bool write = streq(mode, "readwrite") || streq(mode, "versionchange");
   idb_str_field(db, "@dbname", dbn, sizeof dbn);
   gc_push_scope();
   if (db.type == JV_OBJ)
@@ -924,12 +926,12 @@ static void idb_reverse(js_object *arr)
     js_set_index(g_ctx, js_obj_value(arr), (unsigned)(n - 1 - i), a);
   }
 }
-static int idb_dir_prev(const char *d) { return d && (streq(d, "prev") || streq(d, "prevunique")); }
-static int idb_dir_unique(const char *d) { return d && (streq(d, "nextunique") || streq(d, "prevunique")); }
+static bool idb_dir_prev(const char *d) { return d && (streq(d, "prev") || streq(d, "prevunique")); }
+static bool idb_dir_unique(const char *d) { return d && (streq(d, "nextunique") || streq(d, "prevunique")); }
 
 /* Object-store cursor steps: matching records in key order (keys are unique).
  */
-static js_object *idb_store_steps(js_ctx *ctx, js_value sr, js_value query, int prev)
+static js_object *idb_store_steps(js_ctx *ctx, js_value sr, js_value query, bool prev)
 {
   js_object *recs = idb_records(sr), *steps;
   unsigned i, n = recs ? js_array_len(recs) : 0;
@@ -948,10 +950,10 @@ static js_object *idb_store_steps(js_ctx *ctx, js_value sr, js_value query, int 
 }
 /* Index cursor steps: (indexKey, primaryKey) pairs, multiEntry expanded,
  * sorted. */
-static js_object *idb_index_pairs(js_ctx *ctx, js_value sr, js_value irec, js_value query, int unique, int prev)
+static js_object *idb_index_pairs(js_ctx *ctx, js_value sr, js_value irec, js_value query, bool unique, bool prev)
 {
   js_value ikp = js_get(ctx, irec, "keyPath");
-  int multi = js_to_boolean(js_get(ctx, irec, "multiEntry"));
+  bool multi = js_to_boolean(js_get(ctx, irec, "multiEntry"));
   js_object *recs = idb_records(sr), *pairs;
   unsigned r, rn = recs ? js_array_len(recs) : 0;
   gc_push_scope();
@@ -986,16 +988,17 @@ static js_object *idb_index_pairs(js_ctx *ctx, js_value sr, js_value irec, js_va
  * With hasKey, stop at the first step whose index key reaches `key` in
  * direction; otherwise move `count` live steps. Sets key/primaryKey/value; 1 if
  * positioned. */
-static int idb_cursor_next(js_value cursor, int hasKey, js_value key, int count)
+static bool idb_cursor_next(js_value cursor, bool hasKey, js_value key, int count)
 {
   js_value steps = js_get(g_ctx, cursor, "@steps");
   int n = steps.type == JV_OBJ ? (int)js_array_len(steps.u.obj) : 0;
   int pos = (int)js_to_number(g_ctx, js_get(g_ctx, cursor, "@pos"));
-  int keyonly = js_to_boolean(js_get(g_ctx, cursor, "@keyonly"));
+  bool keyonly = js_to_boolean(js_get(g_ctx, cursor, "@keyonly"));
   char db[128], sn[128], dir[16];
   js_value sr;
   js_object *recs;
-  int prev, moved = 0, p;
+  bool prev;
+  int moved = 0, p;
   idb_str_field(cursor, "@dbname", db, sizeof db);
   idb_str_field(cursor, "@storename", sn, sizeof sn);
   idb_str_field(cursor, "@dir", dir, sizeof dir);
@@ -1031,9 +1034,9 @@ static int idb_cursor_next(js_value cursor, int hasKey, js_value key, int count)
 }
 static js_value idb_open_cursor(js_ctx *ctx, js_value source, js_value txn, js_value sr, const char *dbname,
                                 const char *sname, js_value irec, const char *iname, js_value query, const char *dir,
-                                int keyonly)
+                                bool keyonly)
 {
-  int prev = idb_dir_prev(dir), uniq = idb_dir_unique(dir);
+  bool prev = idb_dir_prev(dir), uniq = idb_dir_unique(dir);
   js_object *steps =
       irec.type == JV_OBJ ? idb_index_pairs(ctx, sr, irec, query, uniq, prev) : idb_store_steps(ctx, sr, query, prev);
   js_object *cur, *req;
@@ -1062,7 +1065,7 @@ static js_value idb_open_cursor(js_ctx *ctx, js_value source, js_value txn, js_v
   js_def(cur, "@req", js_obj_value(req), P_WRITABLE);
   js_def(cur, "request", js_obj_value(req), P_WRITABLE | P_ENUMERABLE);
   {
-    int ok = idb_cursor_next(js_obj_value(cur), 0, js_undef(), 1);
+    bool ok = idb_cursor_next(js_obj_value(cur), false, js_undef(), 1);
     js_set(ctx, js_obj_value(req), "@result", ok ? js_obj_value(cur) : js_null());
   }
   idb_txn_pending(txn, 1);
@@ -1075,7 +1078,7 @@ static js_value idb_open_cursor(js_ctx *ctx, js_value source, js_value txn, js_v
 
 /* Resolve + validate a store operation; throws and returns undefined on
  * failure. */
-static js_value idb_store_rec_checked(js_ctx *ctx, js_value t, int write)
+static js_value idb_store_rec_checked(js_ctx *ctx, js_value t, bool write)
 {
   js_value txn = js_get(ctx, t, "@txn"), sr;
   char sname[128], db[128];
@@ -1092,20 +1095,20 @@ static js_value idb_store_rec_checked(js_ctx *ctx, js_value t, int write)
 }
 /* Any existing record (other than the one keyed `key`) collides on a unique
  * index. */
-static int idb_violates_unique(js_ctx *ctx, js_value sr, js_value newValue, js_value key)
+static bool idb_violates_unique(js_ctx *ctx, js_value sr, js_value newValue, js_value key)
 {
   js_value idxmap = js_get(ctx, sr, "indexes");
   js_object *im, *recs;
   int j;
   unsigned r, rn;
   if (idxmap.type != JV_OBJ)
-    return 0;
+    return false;
   im = idxmap.u.obj;
   recs = idb_records(sr);
   rn = recs ? js_array_len(recs) : 0;
   for (j = 0; j < im->props.n; j++) {
     js_value irec, ikp, ik;
-    int multi;
+    bool multi;
     if (!(im->props.e[j].flags & P_ENUMERABLE))
       continue;
     irec = im->props.e[j].value;
@@ -1132,22 +1135,23 @@ static int idb_violates_unique(js_ctx *ctx, js_value sr, js_value newValue, js_v
             unsigned b, bn = js_array_len(eik.u.obj);
             for (b = 0; b < bn; b++)
               if (idb_cmp(ne, js_get_index(ctx, eik, b)) == 0)
-                return 1;
+                return true;
           } else if (idb_cmp(ne, eik) == 0)
-            return 1;
+            return true;
         }
       } else if (idb_cmp(ik, eik) == 0)
-        return 1;
+        return true;
     }
   }
-  return 0;
+  return false;
 }
-static js_value idb_store_write(js_ctx *ctx, js_value t, js_value *args, int argc, int isAdd)
+static js_value idb_store_write(js_ctx *ctx, js_value t, js_value *args, int argc, bool isAdd)
 {
   js_value txn = js_get(ctx, t, "@txn");
-  js_value sr = idb_store_rec_checked(ctx, t, 1);
+  js_value sr = idb_store_rec_checked(ctx, t, true);
   js_value value, explicitKey, keyPath, key, cval, ckey;
-  int autoInc, inlineKeys, found, pos;
+  bool autoInc, inlineKeys;
+  int found, pos;
   js_object *recs;
   if (ctx->has_exc)
     return js_undef();
@@ -1215,16 +1219,16 @@ static js_value idb_store_write(js_ctx *ctx, js_value t, js_value *args, int arg
 }
 static js_value idb_store_add(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  return idb_store_write(ctx, t, args, argc, 1);
+  return idb_store_write(ctx, t, args, argc, true);
 }
 static js_value idb_store_put(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  return idb_store_write(ctx, t, args, argc, 0);
+  return idb_store_write(ctx, t, args, argc, false);
 }
 
 static js_value idb_store_get(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, 0), q = A(0);
+  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, false), q = A(0);
   js_object *recs;
   unsigned i, n;
   if (ctx->has_exc)
@@ -1242,7 +1246,7 @@ static js_value idb_store_get(js_ctx *ctx, js_value t, js_value *args, int argc)
 }
 static js_value idb_store_getkey(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, 0), q = A(0);
+  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, false), q = A(0);
   js_object *recs;
   unsigned i, n;
   if (ctx->has_exc)
@@ -1259,9 +1263,9 @@ static js_value idb_store_getkey(js_ctx *ctx, js_value t, js_value *args, int ar
   }
   return idb_succeed(t, txn, js_undef());
 }
-static js_value idb_store_getall_impl(js_ctx *ctx, js_value t, js_value *args, int argc, int keys)
+static js_value idb_store_getall_impl(js_ctx *ctx, js_value t, js_value *args, int argc, bool keys)
 {
-  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, 0), q = A(0), r;
+  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, false), q = A(0), r;
   int count, got = 0;
   js_object *recs, *out;
   unsigned i, n;
@@ -1290,15 +1294,15 @@ static js_value idb_store_getall_impl(js_ctx *ctx, js_value t, js_value *args, i
 }
 static js_value idb_store_getall(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  return idb_store_getall_impl(ctx, t, args, argc, 0);
+  return idb_store_getall_impl(ctx, t, args, argc, false);
 }
 static js_value idb_store_getallkeys(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  return idb_store_getall_impl(ctx, t, args, argc, 1);
+  return idb_store_getall_impl(ctx, t, args, argc, true);
 }
 static js_value idb_store_count(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, 0), q = A(0);
+  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, false), q = A(0);
   js_object *recs;
   unsigned i, n;
   int c = 0;
@@ -1317,7 +1321,7 @@ static js_value idb_store_count(js_ctx *ctx, js_value t, js_value *args, int arg
 }
 static js_value idb_store_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, 1), q = A(0);
+  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, true), q = A(0);
   js_object *recs;
   int i;
   if (ctx->has_exc)
@@ -1334,7 +1338,7 @@ static js_value idb_store_delete(js_ctx *ctx, js_value t, js_value *args, int ar
 }
 static js_value idb_store_clear(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, 1);
+  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, true);
   js_object *recs;
   (void)args;
   (void)argc;
@@ -1345,9 +1349,9 @@ static js_value idb_store_clear(js_ctx *ctx, js_value t, js_value *args, int arg
     js_array_set_len(ctx, recs, 0);
   return idb_succeed(t, txn, js_undef());
 }
-static js_value idb_store_opencursor_impl(js_ctx *ctx, js_value t, js_value *args, int argc, int keyonly)
+static js_value idb_store_opencursor_impl(js_ctx *ctx, js_value t, js_value *args, int argc, bool keyonly)
 {
-  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, 0), q = A(0);
+  js_value txn = js_get(ctx, t, "@txn"), sr = idb_store_rec_checked(ctx, t, false), q = A(0);
   char db[128], sn[128], dirbuf[16];
   const char *dir;
   if (ctx->has_exc)
@@ -1364,15 +1368,15 @@ static js_value idb_store_opencursor_impl(js_ctx *ctx, js_value t, js_value *arg
 }
 static js_value idb_store_opencursor(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  return idb_store_opencursor_impl(ctx, t, args, argc, 0);
+  return idb_store_opencursor_impl(ctx, t, args, argc, false);
 }
 static js_value idb_store_openkeycursor(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  return idb_store_opencursor_impl(ctx, t, args, argc, 1);
+  return idb_store_opencursor_impl(ctx, t, args, argc, true);
 }
 static js_value idb_store_index(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value sr = idb_store_rec_checked(ctx, t, 0), idxmap;
+  js_value sr = idb_store_rec_checked(ctx, t, false), idxmap;
   js_value txn = js_get(ctx, t, "@txn");
   char db[128], sn[128], name[128];
   (void)argc;
@@ -1390,10 +1394,10 @@ static js_value idb_store_createindex(js_ctx *ctx, js_value t, js_value *args, i
 {
   js_value txn = js_get(ctx, t, "@txn"), sr, keyPath, opts, idxmap;
   char db[128], sn[128], name[128];
-  int uniq = 0, multi = 0;
+  bool uniq = false, multi = false;
   if (!idb_txn_active(txn) || !idb_txn_isversion(txn))
     return idb_throw(ctx, "InvalidStateError", "createIndex requires a versionchange transaction");
-  sr = idb_store_rec_checked(ctx, t, 1);
+  sr = idb_store_rec_checked(ctx, t, true);
   if (ctx->has_exc)
     return js_undef();
   strlcpy(name, arg_str(ctx, A(0)), sizeof name);
@@ -1436,7 +1440,7 @@ static js_value idb_store_deleteindex(js_ctx *ctx, js_value t, js_value *args, i
   (void)argc;
   if (!idb_txn_active(txn) || !idb_txn_isversion(txn))
     return idb_throw(ctx, "InvalidStateError", "deleteIndex requires a versionchange transaction");
-  sr = idb_store_rec_checked(ctx, t, 1);
+  sr = idb_store_rec_checked(ctx, t, true);
   if (ctx->has_exc)
     return js_undef();
   strlcpy(name, arg_str(ctx, A(0)), sizeof name);
@@ -1460,7 +1464,7 @@ static js_value idb_store_indexnames(js_ctx *ctx, js_value t, js_value *args, in
 
 /* ---- index operations ---------------------------------------------------- */
 
-static int idb_index_open(js_ctx *ctx, js_value t, idbix *x)
+static bool idb_index_open(js_ctx *ctx, js_value t, idbix *x)
 {
   x->txn = js_get(ctx, t, "@txn");
   idb_str_field(t, "@dbname", x->db, sizeof x->db);
@@ -1468,19 +1472,19 @@ static int idb_index_open(js_ctx *ctx, js_value t, idbix *x)
   idb_str_field(t, "@iname", x->in, sizeof x->in);
   if (!idb_txn_active(x->txn)) {
     idb_throw(ctx, "TransactionInactiveError", "transaction is not active");
-    return 0;
+    return false;
   }
   x->sr = idb_storerec(idb_dbrec(x->db), x->sn);
   if (x->sr.type != JV_OBJ) {
     idb_throw(ctx, "InvalidStateError", "object store not found");
-    return 0;
+    return false;
   }
   x->ir = js_get(ctx, js_get(ctx, x->sr, "indexes"), x->in);
   if (x->ir.type != JV_OBJ) {
     idb_throw(ctx, "InvalidStateError", "index has been deleted");
-    return 0;
+    return false;
   }
-  return 1;
+  return true;
 }
 static js_value idb_value_by_pkey(js_value sr, js_value pkey)
 {
@@ -1508,7 +1512,7 @@ static js_value idb_index_getall_impl(js_ctx *ctx, js_value t, js_value *args, i
     return idb_throw(ctx, "DataError", "invalid key or range");
   if ((mode == 2 || mode == 3) && argc >= 2 && A(1).type == JV_NUM && !IDB_ISNAN(A(1).u.num))
     count = (int)A(1).u.num;
-  pairs = idb_index_pairs(ctx, x.sr, x.ir, q, 0, 0);
+  pairs = idb_index_pairs(ctx, x.sr, x.ir, q, false, false);
   n = js_array_len(pairs);
   gc_push_scope();
   gc_keep(pairs);
@@ -1566,7 +1570,7 @@ static js_value idb_index_count(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   return idb_index_getall_impl(ctx, t, a, n, 4);
 }
-static js_value idb_index_opencursor_impl(js_ctx *ctx, js_value t, js_value *args, int argc, int keyonly)
+static js_value idb_index_opencursor_impl(js_ctx *ctx, js_value t, js_value *args, int argc, bool keyonly)
 {
   idbix x;
   js_value q = A(0);
@@ -1584,16 +1588,16 @@ static js_value idb_index_opencursor_impl(js_ctx *ctx, js_value t, js_value *arg
 }
 static js_value idb_index_opencursor(js_ctx *ctx, js_value t, js_value *a, int n)
 {
-  return idb_index_opencursor_impl(ctx, t, a, n, 0);
+  return idb_index_opencursor_impl(ctx, t, a, n, false);
 }
 static js_value idb_index_openkeycursor(js_ctx *ctx, js_value t, js_value *a, int n)
 {
-  return idb_index_opencursor_impl(ctx, t, a, n, 1);
+  return idb_index_opencursor_impl(ctx, t, a, n, true);
 }
 
 /* ---- cursor operations --------------------------------------------------- */
 
-static void idb_cursor_requeue(js_ctx *ctx, js_value cursor, js_value txn, int positioned)
+static void idb_cursor_requeue(js_ctx *ctx, js_value cursor, js_value txn, bool positioned)
 {
   js_value req = js_get(ctx, cursor, "@req");
   if (req.type != JV_OBJ)
@@ -1607,7 +1611,7 @@ static void idb_cursor_requeue(js_ctx *ctx, js_value cursor, js_value txn, int p
 static js_value idb_cursor_continue(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value txn = js_get(ctx, t, "@txn");
-  int hasKey = argc >= 1 && A(0).type != JV_UNDEF && A(0).type != JV_NULL, ok;
+  bool hasKey = argc >= 1 && A(0).type != JV_UNDEF && A(0).type != JV_NULL, ok;
   if (!idb_txn_active(txn))
     return idb_throw(ctx, "TransactionInactiveError", "transaction is not active");
   if (hasKey && !idb_valid_key(A(0), 0))
@@ -1619,13 +1623,14 @@ static js_value idb_cursor_continue(js_ctx *ctx, js_value t, js_value *args, int
 static js_value idb_cursor_advance(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value txn = js_get(ctx, t, "@txn");
-  int count = (int)js_to_number(ctx, A(0)), ok;
+  int count = (int)js_to_number(ctx, A(0));
+  bool ok;
   (void)argc;
   if (count <= 0)
     return idb_throw(ctx, "TypeError", "advance count must be positive");
   if (!idb_txn_active(txn))
     return idb_throw(ctx, "TransactionInactiveError", "transaction is not active");
-  ok = idb_cursor_next(t, 0, js_undef(), count);
+  ok = idb_cursor_next(t, false, js_undef(), count);
   idb_cursor_requeue(ctx, t, txn, ok);
   return js_undef();
 }
@@ -1775,7 +1780,7 @@ static js_value idb_txn_objectstore(js_ctx *ctx, js_value t, js_value *args, int
   char name[128], dbn[128];
   js_value scope;
   unsigned i, n;
-  int in = 0;
+  bool in = false;
   (void)argc;
   strlcpy(name, arg_str(ctx, A(0)), sizeof name);
   idb_str_field(t, "@dbname", dbn, sizeof dbn);
@@ -1786,7 +1791,7 @@ static js_value idb_txn_objectstore(js_ctx *ctx, js_value t, js_value *args, int
   for (i = 0; i < n; i++) {
     js_value s = js_get_index(ctx, scope, i);
     if (s.type == JV_STR && streq(s.u.str->data, name)) {
-      in = 1;
+      in = true;
       break;
     }
   }
@@ -1838,7 +1843,7 @@ static js_value idb_db_createstore(js_ctx *ctx, js_value t, js_value *args, int 
 {
   js_value vtxn = js_get(ctx, t, "@vtxn"), opts, keyPath = js_null(), dbrec, stores;
   char dbn[128], name[128];
-  int autoInc = 0;
+  bool autoInc = false;
   (void)argc;
   if (vtxn.type != JV_OBJ || !idb_txn_active(vtxn))
     return idb_throw(ctx, "InvalidStateError", "createObjectStore requires a versionchange transaction");
@@ -1877,12 +1882,12 @@ static js_value idb_db_createstore(js_ctx *ctx, js_value t, js_value *args, int 
   {
     js_value scope = js_get(ctx, vtxn, "@scope");
     if (scope.type == JV_OBJ) {
-      int dup = 0;
+      bool dup = false;
       unsigned i, n = js_array_len(scope.u.obj);
       for (i = 0; i < n; i++) {
         js_value s = js_get_index(ctx, scope, i);
         if (s.type == JV_STR && streq(s.u.str->data, name)) {
-          dup = 1;
+          dup = true;
           break;
         }
       }
@@ -1985,7 +1990,7 @@ static js_value idb_illegal_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value idb_factory_open(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   char name[128];
-  int hasVer, isNew;
+  bool hasVer, isNew;
   double reqver, curver, newver;
   js_value existing;
   js_object *req;
@@ -2111,9 +2116,9 @@ static js_value idb_factory_cmp(js_ctx *ctx, js_value t, js_value *args, int arg
 
 /* Fire `ev` at `target`, then optionally bubble to b1 (transaction) and b2
  * (db). Returns 1 if a handler called preventDefault. */
-static int idb_fire(js_object *target, js_object *b1, js_object *b2, js_value ev)
+static bool idb_fire(js_object *target, js_object *b1, js_object *b2, js_value ev)
 {
-  int dp;
+  bool dp;
   gc_push_scope();
   gc_keep(target);
   if (ev.type == JV_OBJ)
@@ -2135,15 +2140,16 @@ static int idb_fire(js_object *target, js_object *b1, js_object *b2, js_value ev
 
 int js_idb_pump(void)
 {
-  int fired = 0, progress, guard = 0;
+  int fired = 0, guard = 0;
+  bool progress;
   if (!g_page_live || !g_ctx || !g_idb_pending)
     return 0;
   do {
-    progress = 0;
+    progress = false;
     while (js_array_len(g_idb_pending) > 0) { /* deliver requests, oldest first */
       js_value req = js_get_index(g_ctx, js_obj_value(g_idb_pending), 0);
       js_value txn, evt, err;
-      int isup;
+      bool isup;
       idb_arr_remove(g_idb_pending, 0);
       if (req.type != JV_OBJ)
         continue;
@@ -2161,7 +2167,7 @@ int js_idb_pump(void)
       if (err.type == JV_OBJ) {
         js_object *dbo = 0;
         js_value ev;
-        int prevented;
+        bool prevented;
         js_set(g_ctx, req, "error", err);
         if (txn.type == JV_OBJ) {
           js_value db = js_get(g_ctx, txn, "@db");
@@ -2188,7 +2194,7 @@ int js_idb_pump(void)
         idb_txn_pending(txn, -1);
       gc_pop_scope();
       fired++;
-      progress = 1;
+      progress = true;
     }
     { /* commit/abort transactions whose queue drained */
       int i, n = g_idb_txns ? (int)js_array_len(g_idb_txns) : 0;
@@ -2206,7 +2212,7 @@ int js_idb_pump(void)
             js_set(g_ctx, txn, "@state", js_mk_cstring(g_ctx, "finished"));
             idb_fire(txn.u.obj, db.type == JV_OBJ ? db.u.obj : 0, 0, ev);
             fired++;
-            progress = 1;
+            progress = true;
           }
           continue;
         }
@@ -2224,7 +2230,7 @@ int js_idb_pump(void)
           ev = make_event("complete", 0, 0, js_undef());
           idb_fire(txn.u.obj, 0, 0, ev);
           fired++;
-          progress = 1;
+          progress = true;
           if (openreq.type == JV_OBJ) { /* the upgrade finished: hand the open
                                            request its success */
             js_value sev;

@@ -224,10 +224,10 @@ static void print_prompt(void)
   con_write("owos:");
   /* Show the working directory, abbreviating the home directory to "~". */
   size_t hlen = strlen(HOME_DIR);
-  int in_home = 1;
+  bool in_home = true;
   for (size_t i = 0; i < hlen; i++)
     if (cwd[i] != HOME_DIR[i]) {
-      in_home = 0;
+      in_home = false;
       break;
     }
   if (in_home && (cwd[hlen] == '\0' || cwd[hlen] == '/')) {
@@ -469,10 +469,10 @@ static void cmd_run(char *args)
 
 /* Does haystack contain needle as a substring? Empty needle matches anything.
  */
-static int str_contains(const char *haystack, const char *needle)
+static bool str_contains(const char *haystack, const char *needle)
 {
   if (!*needle)
-    return 1;
+    return true;
   for (; *haystack; haystack++) {
     const char *h = haystack, *n = needle;
     while (*h && *n && *h == *n) {
@@ -480,9 +480,9 @@ static int str_contains(const char *haystack, const char *needle)
       n++;
     }
     if (!*n)
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 /* Print the lines of a writable, NUL-terminated buffer that contain pattern,
@@ -945,10 +945,10 @@ static void bi_mount(const char *a)
   int n = blk_dev_list(devs, 8);
   for (int k = 0; k < n; k++) {
     struct fs_mountinfo mi;
-    int mounted = 0;
+    bool mounted = false;
     for (int j = 0; fs_mount_enum(j, &mi); j++)
       if (streq(mi.dev, devs[k].dev)) {
-        mounted = 1;
+        mounted = true;
         break;
       }
     if (!mounted) {

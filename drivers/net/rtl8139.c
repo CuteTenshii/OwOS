@@ -7,6 +7,7 @@
  * interrupt can't grab the same TX descriptor mid-send.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "console.h"
@@ -60,7 +61,7 @@ static void print_hex2(uint8_t v)
 
 /* ------------------------------------------------------------------- state */
 
-static int nic_found;
+static bool nic_found;
 static uint16_t io_base;
 static uint8_t mac[6];
 
@@ -137,7 +138,7 @@ static void rtl_poll(void)
 
 static int rtl8139_probe(void)
 {
-  int found = 0;
+  bool found = false;
   uint8_t bus = 0, slot = 0, func = 0;
 
   for (int b = 0; b < 256 && !found; b++) {
@@ -151,7 +152,7 @@ static int rtl8139_probe(void)
         bus = (uint8_t)b;
         slot = (uint8_t)s;
         func = (uint8_t)f;
-        found = 1;
+        found = true;
         break;
       }
     }
@@ -198,7 +199,7 @@ static int rtl8139_probe(void)
   for (int i = 0; i < 6; i++)
     mac[i] = inb(io_base + REG_IDR0 + i);
 
-  nic_found = 1;
+  nic_found = true;
 
   con_printf("net: RTL8139 at io 0x%08X mac ", io_base);
   for (int i = 0; i < 6; i++) {

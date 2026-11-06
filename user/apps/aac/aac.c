@@ -13,6 +13,7 @@
 #include "aac.h"
 #include "mp4.h"
 #include "owos.h"
+#include <stdbool.h>
 
 static void put_le16(unsigned char *p, unsigned v)
 {
@@ -27,7 +28,7 @@ static void put_le32(unsigned char *p, unsigned v)
   p[3] = v >> 24;
 }
 
-static int tag4(const unsigned char *p, const char *s)
+static bool tag4(const unsigned char *p, const char *s)
 {
   return p[0] == s[0] && p[1] == s[1] && p[2] == s[2] && p[3] == s[3];
 }
@@ -80,8 +81,8 @@ static int pcm_append(struct pcmbuf *pb, const short *s, unsigned n)
   return 0;
 }
 
-static int is_adts(const unsigned char *b, unsigned len) { return len >= 2 && b[0] == 0xFF && (b[1] & 0xF6) == 0xF0; }
-static int is_mp4(const unsigned char *b, unsigned len) { return len >= 8 && tag4(b + 4, "ftyp"); }
+static bool is_adts(const unsigned char *b, unsigned len) { return len >= 2 && b[0] == 0xFF && (b[1] & 0xF6) == 0xF0; }
+static bool is_mp4(const unsigned char *b, unsigned len) { return len >= 8 && tag4(b + 4, "ftyp"); }
 
 /* Decode every access unit into `pb`; report sample rate + channels. 0 on
  * success. */
@@ -131,7 +132,7 @@ static int decode_all(const unsigned char *buf, unsigned len, struct pcmbuf *pb,
   if (is_adts(buf, len)) {
     aac_decoder *d = aac_open_adts();
     uint32_t off = 0;
-    int got = 0;
+    bool got = false;
     if (!d)
       return -1;
     while (off + 7 <= len) {
@@ -144,7 +145,7 @@ static int decode_all(const unsigned char *buf, unsigned len, struct pcmbuf *pb,
       if (!got) {
         aac_get_info(d, &info);
         *rate = info.sample_rate;
-        got = 1;
+        got = true;
       }
       *ch = nc;
       if (pcm_append(pb, frame, ns * nc)) {

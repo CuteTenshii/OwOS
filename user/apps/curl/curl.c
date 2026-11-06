@@ -12,6 +12,7 @@
 #include "http.h"
 #include "opt.h"
 #include "owos.h"
+#include <stdbool.h>
 
 /* ---- body sinks -------------------------------------------------------- */
 
@@ -40,7 +41,8 @@ static int sink_console(void *ctx, const unsigned char *buf, int len)
 
 /* -o mode: accumulate into a buffer, then writefile. */
 static char save_buf[256 * 1024];
-static int save_len, save_overflow;
+static bool save_overflow;
+static int save_len;
 
 static int sink_save(void *ctx, const unsigned char *buf, int len)
 {
@@ -49,21 +51,21 @@ static int sink_save(void *ctx, const unsigned char *buf, int len)
     if (save_len < (int)sizeof save_buf)
       save_buf[save_len++] = (char)buf[i];
     else
-      save_overflow = 1;
+      save_overflow = true;
   }
   return 0;
 }
 
 int main(int argc, char **argv)
 {
-  int show_headers = 0;
-  int http2 = 0;
-  int http3 = 0;
+  bool show_headers = false;
+  bool http2 = false;
+  bool http3 = false;
   const char *method = "GET";
   const char *outname = 0;
   const char *url = 0;
   const char *user_agent = 0; /* -A: overrides the default UA           */
-  int ua_in_headers = 0;      /* set if a -H line already gives one      */
+  bool ua_in_headers = false; /* set if a -H line already gives one      */
   char xhdr[2048];
   int xhlen = 0; /* -H request headers ("name: value\r\n"…) */
 
@@ -75,11 +77,11 @@ int main(int argc, char **argv)
   opt_init(&st, argc, argv);
   for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
     if (o == 'i') {
-      show_headers = 1;
+      show_headers = true;
     } else if (o == '2') {
-      http2 = 1;
+      http2 = true;
     } else if (o == '3') {
-      http3 = 1;
+      http3 = true;
     } else if (o == 'X') {
       method = st.arg;
     } else if (o == 'o') {
@@ -89,7 +91,7 @@ int main(int argc, char **argv)
     } else if (o == 'H') {
       const char *h = st.arg;
       if (starts_ci(h, "user-agent:"))
-        ua_in_headers = 1;
+        ua_in_headers = true;
       for (int k = 0; h[k] && xhlen < (int)sizeof xhdr - 3; k++)
         xhdr[xhlen++] = h[k];
       xhdr[xhlen++] = '\r';

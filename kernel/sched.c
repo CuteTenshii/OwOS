@@ -59,14 +59,14 @@ typedef struct address_space {
 typedef struct task {
   uintptr_t esp;        /* saved kernel stack pointer (the context)     */
   address_space_t *as;  /* shared by a process and its user threads      */
-  int as_owner;         /* this task owns the address-space object          */
+  bool as_owner;        /* this task owns the address-space object          */
   void *kstack;         /* kernel stack to free (0 for the main task)   */
   uintptr_t kstack_top; /* TSS stack top (0 = leave it alone)          */
   int state;
   uint32_t id;
   struct task *process;       /* process leader for user threads             */
   uint32_t parent;            /* pid of the task that created it              */
-  int self_reap;              /* detached kernel thread: no parent waitpid's it, so
+  bool self_reap;             /* detached kernel thread: no parent waitpid's it, so
                                * schedule() frees its zombie instead of leaking it */
   int wait_pid;               /* pid being waited on while WAITING            */
   uint32_t wake_tick;         /* if WAITING for a timed sleep: tick to wake at
@@ -157,12 +157,12 @@ static int detached_zombies; /* self_reap threads that have exited, awaiting fre
 
 #define current (current_tasks[smp_this_cpu()])
 
-static int task_running(const task_t *task)
+static bool task_running(const task_t *task)
 {
   for (int i = 0; i < SMP_MAX_CPUS; i++)
     if (current_tasks[i] == task || switching_tasks[i] == task)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 static void sched_lock(void)
@@ -289,7 +289,7 @@ void sched_init(void)
   t->runs = 1;
   t->esp = 0; /* filled in on the first switch away       */
   t->as = 0;
-  t->as_owner = 0;
+  t->as_owner = false;
   t->process = t;
   t->kstack = 0;
   t->kstack_top = 0; /* a kernel thread: never traps to ring 0   */
@@ -342,11 +342,11 @@ void sched_create_thread(const char *name, void (*entry)(void))
   t->name = name;
   t->runs = 0;
   t->as = 0;
-  t->as_owner = 0;
+  t->as_owner = false;
   t->process = t;
   t->kstack_top = 0;
   t->state = TASK_RUNNABLE;
-  t->self_reap = 1; /* main_task never waitpid's us: self-reap on exit */
+  t->self_reap = true; /* main_task never waitpid's us: self-reap on exit */
 
   uint8_t *stack = kmalloc(KSTACK_SIZE);
   if (!stack) { /* heap exhausted: don't enqueue a bogus stack */
@@ -404,7 +404,7 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
   }
   t->runs = 0;
   t->as = as;
-  t->as_owner = 1;
+  t->as_owner = true;
   t->process = t;
   t->parent = current->id;
   t->state = TASK_RUNNABLE;
@@ -515,7 +515,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
   t->name = "thread";
   t->runs = 0;
   t->as = current->as;
-  t->as_owner = 0;
+  t->as_owner = false;
   t->process = current->process;
   address_space_get(t->as);
   t->parent = current->id;
@@ -598,7 +598,7 @@ int sched_fork(struct registers *r)
   }
   t->as->dir = child_dir;
   t->as->refs = 1;
-  t->as_owner = 1;
+  t->as_owner = true;
   t->process = t;
   t->parent = current->id;
   t->kstack = kstack;
@@ -912,7 +912,7 @@ void sched_exit(int status)
     if (child != current && child->parent == current->id) {
       child->parent = main_task.id;
       if (child->self_reap == 0) {
-        child->self_reap = 1;
+        child->self_reap = true;
         if (child->state == TASK_ZOMBIE)
           detached_zombies++;
       }
@@ -954,7 +954,7 @@ void sched_exit(int status)
 /* Default action for a SIG_DFL disposition: 1 = ignore, 0 = terminate. The job-
  * control stops default to ignore until Phase B wires process groups + a tty.
  */
-static int sig_default_ignore(int sig)
+static bool sig_default_ignore(int sig)
 {
   switch (sig) {
   case SIGCHLD:
@@ -963,9 +963,9 @@ static int sig_default_ignore(int sig)
   case SIGTSTP:
   case SIGTTIN:
   case SIGTTOU:
-    return 1;
+    return true;
   default:
-    return 0;
+    return false;
   }
 }
 
@@ -973,10 +973,10 @@ static int sig_default_ignore(int sig)
  * SIG_IGN, or a default action that is ignore). SIGKILL/SIGSTOP are never
  * ignorable. POSIX: a signal generated while ignored is discarded, not left
  * pending. */
-static int sig_ignored(task_t *t, int sig)
+static bool sig_ignored(task_t *t, int sig)
 {
   if (sig == SIGKILL || sig == SIGSTOP)
-    return 0;
+    return false;
   uint32_t h = t->sig_handler[sig];
   return h == SIG_IGN || (h == SIG_DFL && sig_default_ignore(sig));
 }
@@ -1007,7 +1007,7 @@ static int sig_next(task_t *t)
  * polls this and bails with an EINTR sentinel when a signal wants delivery, so
  * control reaches a return-to-ring-3 boundary where sched_signal_deliver runs.
  */
-int sched_intr_pending(void) { return sig_next(current) != 0; }
+bool sched_intr_pending(void) { return sig_next(current) != 0; }
 
 /* Post signal `sig` to task `pid` (the kill(2) primitive). Permission: root,
  * the caller itself, or a child of the caller. sig 0 only probes
@@ -1103,7 +1103,7 @@ static int sigframe_setup(task_t *t, struct registers *r, int sig)
     return -1;
 
   struct sigframe *f = (struct sigframe *)(uintptr_t)base;
-  uint32_t tramp = base + (uint32_t) __builtin_offsetof(struct sigframe, tramp);
+  uint32_t tramp = base + (uint32_t)__builtin_offsetof(struct sigframe, tramp);
   f->pretcode = tramp;
   f->sig = (uint32_t)sig;
   f->saved_blocked = t->sig_blocked;
@@ -1227,15 +1227,15 @@ static task_t *zombie_child(int pid)
   return 0;
 }
 
-static int has_child(int pid)
+static bool has_child(int pid)
 {
   task_t *t = &main_task;
   do {
     if (t->parent == current->id && (pid < 0 || (int)t->id == pid))
-      return 1;
+      return true;
     t = t->next;
   } while (t != &main_task);
-  return 0;
+  return false;
 }
 
 /* Block until a child exits; reap it and return its status (-1 if none). */
@@ -1259,14 +1259,14 @@ int sched_waitpid(int pid)
 }
 
 /* Kernel-side, non-blocking reap (used by the shell's foreground wait). */
-int sched_try_reap(int pid, int *status)
+bool sched_try_reap(int pid, int *status)
 {
   task_t *z = zombie_child(pid);
   if (!z)
-    return 0;
+    return false;
   *status = z->exit_status;
   reap_task(z);
-  return 1;
+  return true;
 }
 
 /* Replace the current process's image: swap in a new address space and set up
@@ -1282,7 +1282,7 @@ int sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, uint32_t
   next->brk = next->brk_base = brk;
   paging_load(new_dir);
   current->as = next;
-  current->as_owner = 1;
+  current->as_owner = true;
   current->process = current;
   address_space_put(old);
 

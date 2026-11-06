@@ -7,6 +7,7 @@
 #include "permissions.h"
 #include "owos.h" /* malloc/free/strlen + streq_ci/starts_ci helpers */
 #include "sqlite.h"
+#include <stdbool.h>
 
 #ifndef PERM_DB /* overridable so the host test can redirect it */
 #define PERM_DB "/home/root/permissions.db"
@@ -17,8 +18,8 @@
 struct perm_entry {
   char *origin;
   int feature;
-  int state;   /* PERM_GRANTED / PERM_DENIED                */
-  int persist; /* 1 = also lives on disk (Allow always)     */
+  int state;    /* PERM_GRANTED / PERM_DENIED                */
+  bool persist; /* 1 = also lives on disk (Allow always)     */
   struct perm_entry *next;
 };
 static struct perm_entry *g_perms;
@@ -106,7 +107,7 @@ void perm_remember(const char *origin, int feature, int state, int persist)
   if (!origin || !origin[0] || feature < 0 || feature >= PERM_FEATURE_COUNT)
     return;
   struct perm_entry *e = perm_find(origin, feature);
-  int was_persist = e ? e->persist : 0;
+  bool was_persist = e ? e->persist : false;
   if (!e) {
     e = (struct perm_entry *)malloc(sizeof *e);
     if (!e)
@@ -121,7 +122,7 @@ void perm_remember(const char *origin, int feature, int state, int persist)
     g_perms = e;
   }
   e->state = state;
-  e->persist = persist ? 1 : 0;
+  e->persist = persist != 0;
   if (persist || was_persist)
     perm_save(); /* disk changed either way */
 }
@@ -156,7 +157,7 @@ void perm_load(void)
       }
       e->feature = feature;
       e->state = state;
-      e->persist = 1;
+      e->persist = true;
       e->next = g_perms;
       g_perms = e;
     }
@@ -166,21 +167,21 @@ void perm_load(void)
 
 /* ---- Permissions-Policy (HTTP response header) -------------------------- */
 
-static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+static bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 
 /* Does an allowlist enable this document (whose host is `host`)? The forms are
  * `*` (all), a bare `self`, or a parenthesised list of `self`/`*`/quoted
  * origins.
  * `()` (empty) disables. We enable when the list carries `*`, `self`, or the
  * page's own host — the top-level document's origin. */
-static int allowlist_enables(const char *a, int alen, const char *host)
+static bool allowlist_enables(const char *a, int alen, const char *host)
 {
-  int has = 0;
+  bool has = false;
   /* scan tokens: '*', bare/quoted words; ignore parens/quotes/commas/spaces */
   for (int i = 0; i < alen; i++) {
     char c = a[i];
     if (c == '*')
-      return 1;
+      return true;
     if (is_ws(c) || c == '(' || c == ')' || c == '"' || c == '\'' || c == ',')
       continue;
     /* word start: capture [a-zA-Z] run and URL-ish runs */
@@ -189,20 +190,20 @@ static int allowlist_enables(const char *a, int alen, const char *host)
       i++;
     int wl = i - s;
     if (wl == 4 && starts_ci(a + s, "self"))
-      return 1;
+      return true;
     if (host && host[0] && wl > 0) {
       /* enabled if the page's own host appears in a listed origin */
       int hl = strlen(host);
       for (int k = s; k + hl <= s + wl; k++)
         if (starts_ci(a + k, host)) {
-          has = 1;
+          has = true;
           break;
         }
       if (has)
-        return 1;
+        return true;
     }
   }
-  return 0;
+  return false;
 }
 
 unsigned perm_policy_parse(const char *hv, const char *host)

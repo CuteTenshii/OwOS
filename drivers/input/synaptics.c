@@ -35,6 +35,7 @@
 #include "console.h"
 #include "io.h"
 #include "timer.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 #define PS2_DATA 0x60
@@ -77,7 +78,7 @@
 #define BTN_RIGHT 0x02
 #define BTN_MIDDLE 0x04
 
-static int active;
+static bool active;
 static int bound_x, bound_y;
 
 /* Live cursor + reported state (what synaptics_feed hands back to mouse.c). */
@@ -93,7 +94,7 @@ static int scroll_accum;     /* leftover two-finger travel below one notch     *
 /* Tap / gesture state for the in-progress touch. */
 static uint32_t touch_start;  /* tick the touch began */
 static int touch_x, touch_y;  /* where it began (for the move-budget test) */
-static int touch_moved;       /* set once travel exceeds TAP_MOVE_MAX           */
+static bool touch_moved;       /* set once travel exceeds TAP_MOVE_MAX           */
 static int touch_max_fingers; /* most fingers seen during this touch */
 
 /* The synthetic tap pulse, evaluated lazily by synaptics_buttons(). */
@@ -211,7 +212,7 @@ int synaptics_init(int max_x, int max_y)
   bound_y = max_y;
   cur_x = max_x / 2;
   cur_y = max_y / 2;
-  active = 0;
+  active = false;
 
   /* Drain any stale output byte so the query results aren't misaligned. */
   for (int i = 0; i < 16 && (inb(PS2_STATUS) & STAT_OUTPUT_FULL); i++)
@@ -258,7 +259,7 @@ int synaptics_init(int max_x, int max_y)
   rep_wheel = 0;
   scroll_accum = 0;
   tap_start = 0;
-  active = 1;
+  active = true;
 
   char *p = status;
   p = put_str(p, "synaptics: TouchPad fw ");
@@ -274,7 +275,7 @@ int synaptics_init(int max_x, int max_y)
   return 0;
 }
 
-int synaptics_active(void) { return active; }
+bool synaptics_active(void) { return active; }
 
 /* Move the clamp box after a resolution change (relative motion is scaled into
  * this box). */
@@ -332,7 +333,7 @@ static void touch_release(void)
   }
 }
 
-int synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz)
+bool synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz)
 {
   static uint8_t buf[6];
   static int idx;
@@ -340,19 +341,19 @@ int synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz)
   /* Resync on the position-specific signature bits before storing. byte0 is
    * 1 0 .. 0 1 .. (mask 0xC8 == 0x80); byte3 is 1 1 .. 0 1 .. (== 0xC0). */
   if (idx == 0 && (byte & 0xC8) != 0x80)
-    return 0;
+    return false;
   if (idx == 3 && (byte & 0xC8) != 0xC0) {
     idx = 0; /* lost sync; maybe this byte starts a packet */
     if ((byte & 0xC8) == 0x80) {
       buf[0] = byte;
       idx = 1;
     }
-    return 0;
+    return false;
   }
 
   buf[idx++] = byte;
   if (idx < 6)
-    return 0;
+    return false;
   idx = 0;
 
   /* Decode the assembled packet. */
@@ -371,7 +372,7 @@ int synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz)
   int finger = (z >= Z_TOUCH) && (z < Z_PALM) && (w != 2);
   int fingers = !finger ? 0 : (w == 0 ? 2 : 1);
 
-  int moved = 0;
+  bool moved = false;
   int wheel_delta = 0;
 
   if (fingers == 0) {
@@ -384,7 +385,7 @@ int synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz)
       touch_start = timer_ticks();
       touch_x = fx;
       touch_y = fy;
-      touch_moved = 0;
+      touch_moved = false;
       touch_max_fingers = fingers;
       scroll_accum = 0;
     } else {
@@ -397,7 +398,7 @@ int synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz)
       if (ady < 0)
         ady = -ady;
       if (adx > TAP_MOVE_MAX || ady > TAP_MOVE_MAX)
-        touch_moved = 1;
+        touch_moved = true;
     }
 
     if (fingers == 1) {
@@ -411,7 +412,7 @@ int synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz)
           cur_x += dx;
           cur_y -= dy; /* pad +Y is up; screen Y grows down */
           clamp_cursor();
-          moved = 1;
+          moved = true;
         }
       }
     } else { /* two fingers: vertical scroll */
@@ -437,16 +438,16 @@ int synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz)
 
   int buttons = synaptics_buttons();
   static int last_buttons = 0;
-  int changed = moved || wheel_delta || (buttons != last_buttons);
+  bool changed = moved || wheel_delta || (buttons != last_buttons);
   last_buttons = buttons;
   if (!changed)
-    return 0;
+    return false;
 
   *x = cur_x;
   *y = cur_y;
   *btn = buttons;
   *dz = wheel_delta;
-  return 1;
+  return true;
 }
 
 int synaptics_buttons(void)

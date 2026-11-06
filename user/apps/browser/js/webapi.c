@@ -3,6 +3,8 @@
  * over the engine's UTF-8 string bytes; installed onto `window` by
  * js_webapi_setup. Split out of js.c; shares the page engine context + helpers
  * via jsint.h. */
+#include <stdbool.h>
+
 #include "../jsint.h"
 
 /* ---- performance / TextEncoder / TextDecoder (Web platform APIs) --------- *
@@ -174,7 +176,8 @@ static const char *decoder_name(int kind)
 static js_value textdec_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   js_object *o;
-  int kind = DEC_UTF8, fatal = 0, ignore = 0;
+  int kind = DEC_UTF8;
+  bool fatal = false, ignore = false;
   (void)thisv;
   if (argc > 0 && A(0).type != JV_UNDEF)
     kind = decoder_kind(arg_str(ctx, A(0)));
@@ -194,7 +197,8 @@ static js_value textdec_ctor(js_ctx *ctx, js_value thisv, js_value *args, int ar
 }
 static js_value textdec_decode(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  int len = 0, kind, ignore, fatal, i;
+  int len = 0, kind, i;
+  bool ignore, fatal;
   const unsigned char *in;
   sbuf sb = {0, 0, 0};
   js_value r;
@@ -229,14 +233,14 @@ static js_value textdec_decode(js_ctx *ctx, js_value t, js_value *args, int argc
       i += k;
     }
   } else if (kind == DEC_UTF16LE || kind == DEC_UTF16BE) {
-    int be = (kind == DEC_UTF16BE);
+    bool be = (kind == DEC_UTF16BE);
     i = 0;
     if (!ignore && len >= 2) {
       if (in[0] == 0xFF && in[1] == 0xFE) {
-        be = 0;
+        be = false;
         i = 2;
       } else if (in[0] == 0xFE && in[1] == 0xFF) {
-        be = 1;
+        be = true;
         i = 2;
       }
     }
@@ -435,8 +439,8 @@ static void perf_clear(js_ctx *ctx, js_value t, const char *type, const char *na
     js_value e = js_get_index(ctx, entries, i);
     js_value ty = js_get(ctx, e, "entryType");
     js_value nm = js_get(ctx, e, "name");
-    int match = ty.type == JV_STR && streq(ty.u.str->data, type) &&
-                (!name || (nm.type == JV_STR && streq(nm.u.str->data, name)));
+    bool match = ty.type == JV_STR && streq(ty.u.str->data, type) &&
+                 (!name || (nm.type == JV_STR && streq(nm.u.str->data, name)));
     if (!match)
       js_array_push(ctx, keep, e);
   }

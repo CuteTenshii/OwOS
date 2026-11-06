@@ -17,6 +17,7 @@
 #include "irqflags.h"
 #include "keyboard.h"
 #include "timer.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 /* DSP / mixer ports (offsets from the 0x220 base). */
@@ -50,14 +51,14 @@
 #define DMABUF (2 * HALF)
 static uint8_t dma_buf[DMABUF] __attribute__((aligned(DMABUF)));
 
-static int present;
+static bool present;
 static volatile int irq_count; /* bumped by the IRQ each time a half ends  */
 
 /* Master volume, 0..SB_VOL_MAX (max by default), plus a mute latch. Adjusted
  * live by the keyboard's volume keys; pushed to the mixer by set_mixer_volume.
  */
 static int volume = SB_VOL_MAX;
-static int muted;
+static bool muted;
 
 /* ---- DSP / mixer primitives -------------------------------------------- */
 
@@ -72,7 +73,7 @@ static void dsp_write(uint8_t v)
       return;
     }
   }
-  present = 0;
+  present = false;
 }
 
 static void mixer_write(uint8_t reg, uint8_t v)
@@ -106,7 +107,7 @@ void sb16_volume_step(int dir)
   if (nv > SB_VOL_MAX)
     nv = SB_VOL_MAX;
   volume = nv;
-  muted = 0; /* nudging the level always unmutes         */
+  muted = false; /* nudging the level always unmutes         */
   if (present)
     set_mixer_volume();
 }
@@ -120,7 +121,7 @@ void sb16_volume_mute(void)
 
 int sb16_volume(void) { return muted ? 0 : volume; }
 
-static int dsp_reset(void)
+static bool dsp_reset(void)
 {
   outb(SB_RESET, 1);
   /* Hold RESET high >= 3 us. sb16_init runs before the timer, so no PIT sleep:
@@ -136,8 +137,8 @@ static int dsp_reset(void)
   for (int tries = 0; tries < 100000; tries++)
     if (inb(SB_RSTAT) & 0x80)
       if (inb(SB_READ) == 0xAA)
-        return 1;
-  return 0;
+        return true;
+  return false;
 }
 
 static void sb16_irq(struct registers *r)
@@ -150,11 +151,11 @@ static void sb16_irq(struct registers *r)
 void sb16_init(void)
 {
   if (!dsp_reset()) {
-    present = 0;
+    present = false;
     con_write("sb16: no device (run QEMU with -device sb16)\n");
     return;
   }
-  present = 1;
+  present = true;
   irq_register(SB_IRQ, sb16_irq);
   irq_unmask(SB_IRQ);
   set_mixer_volume(); /* defaults to SB_VOL_MAX (== 0xFF L+R)     */
@@ -195,8 +196,8 @@ static void dma_setup_autoinit(uint32_t phys, uint32_t count)
  * itself to those, filling the half the card has just left — so it
  * self-throttles to the output rate without buffering the whole file. One
  * stream at a time. */
-static int s_active;   /* a stream is open                                  */
-static int s_started;  /* both halves primed, DMA running                   */
+static bool s_active;   /* a stream is open                                  */
+static bool s_started;  /* both halves primed, DMA running                   */
 static int s_half;     /* half currently being filled by the producer (0/1) */
 static uint32_t s_pos; /* fill cursor within that half (mono bytes)         */
 
@@ -236,8 +237,8 @@ int sb16_stream_open(void)
   if (!present)
     return -1;
   set_mixer_volume();
-  s_active = 1;
-  s_started = 0;
+  s_active = true;
+  s_started = false;
   s_half = 0;
   s_pos = 0;
   keyboard_take_interrupt(); /* drop any stale Ctrl+C            */
@@ -269,7 +270,7 @@ int sb16_stream_write(const void *pcm, uint32_t bytes)
           s_half = 1; /* prime the second half            */
         } else {
           sb_start(); /* both halves primed -> go         */
-          s_started = 1;
+          s_started = true;
           s_half = 0; /* refill half 0 once it's played   */
         }
       } else {
@@ -294,7 +295,7 @@ void sb16_stream_close(void)
       for (uint32_t i = 0; i < HALF; i++)
         dma_buf[HALF + i] = 128;
     sb_start();
-    s_started = 1;
+    s_started = true;
     timer_sleep(real / 48 + 40); /* 48 bytes/ms at 48 kHz mono + tail */
   } else {
     /* Follow the last real audio with two halves of silence, then drain. */
@@ -310,6 +311,6 @@ void sb16_stream_close(void)
 
   dsp_write(0xD0); /* halt the DMA                     */
   dsp_write(0xD3); /* speaker off                      */
-  s_active = 0;
-  s_started = 0;
+  s_active = false;
+  s_started = false;
 }

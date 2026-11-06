@@ -13,6 +13,7 @@
  */
 #include "alac.h"
 #include "owos.h"
+#include <stdbool.h>
 
 /* ---- big-endian scalar helpers (CAF is big-endian) ----------------------- */
 static void put_be16(uint8_t *p, unsigned v)
@@ -60,7 +61,7 @@ static double get_bef64(const uint8_t *p)
   return x.f;
 }
 
-static int tag4(const uint8_t *p, const char *s)
+static bool tag4(const uint8_t *p, const char *s)
 {
   return p[0] == s[0] && p[1] == s[1] && p[2] == s[2] && p[3] == s[3];
 }
@@ -213,7 +214,9 @@ static int caf_parse(const char *path, struct caf *c)
   struct statinfo st;
   uint8_t hdr[8];
   unsigned pos;
-  int have_desc = 0, have_kuki = 0, have_pakt = 0;
+  bool have_desc = false;
+  bool have_kuki = false;
+  bool have_pakt = false;
   if (stat(path, &st) != 0 || st.size < 8)
     return -1;
   if (readfile_at(path, 0, hdr, 8) < 8 || !tag4(hdr, "caff"))
@@ -243,7 +246,7 @@ static int caf_parse(const char *path, struct caf *c)
       c->cfg.sample_rate = (unsigned)get_bef64(d);
       c->cfg.frame_length = get_be32(d + 20);
       c->cfg.num_channels = get_be32(d + 24);
-      have_desc = 1;
+      have_desc = true;
     } else if (tag4(ch, "kuki")) {
       uint8_t *k = read_range(path, body, (unsigned)sz);
       int rc;
@@ -253,7 +256,7 @@ static int caf_parse(const char *path, struct caf *c)
       free(k);
       if (rc != ALAC_OK)
         return -1;
-      have_kuki = 1;
+      have_kuki = true;
     } else if (tag4(ch, "pakt")) {
       uint8_t *pk = read_range(path, body, (unsigned)sz), *p, *end;
       unsigned i;
@@ -290,7 +293,7 @@ static int caf_parse(const char *path, struct caf *c)
         p += used;
       }
       free(pk);
-      have_pakt = 1;
+      have_pakt = true;
     } else if (tag4(ch, "data")) {
       c->data_off = body + 4; /* skip 4-byte mEditCount */
     }
@@ -595,7 +598,8 @@ static int cmd_verify(const char *in)
   uint8_t *pin, *pout, *pkt;
   unsigned bpf, total_frames, done = 0;
   unsigned long long comp = 0;
-  int ok = 1, rc = 1;
+  bool ok = true;
+  int rc = 1;
 
   if (wav_parse(in, &w) != 0) {
     printf("alac: cannot read WAV %s\n", in);
@@ -637,10 +641,10 @@ static int cmd_verify(const char *in)
       goto done;
     }
     if (gf != nf)
-      ok = 0;
+      ok = false;
     for (unsigned k = 0; ok && k < nf * bpf; k++)
       if (pin[k] != pout[k])
-        ok = 0;
+        ok = false;
     done += nf;
   }
   {

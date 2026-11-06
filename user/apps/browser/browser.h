@@ -17,6 +17,8 @@
 #ifndef OWOS_BROWSER_H
 #define OWOS_BROWSER_H
 
+#include <stdbool.h>
+
 #include "csp.h" /* Content-Security-Policy engine (per-page enforcement)   */
 #include "dom.h" /* DOM tree + the shared lower/starts_ci/streq_ci helpers  */
 #include "gfx.h"

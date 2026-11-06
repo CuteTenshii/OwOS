@@ -11,6 +11,7 @@
 #include "h264.h"
 #include "mp4.h"
 #include "owos.h"
+#include <stdbool.h>
 
 static unsigned char *read_whole(const char *path, unsigned *out_len)
 {
@@ -36,7 +37,7 @@ static unsigned char *read_whole(const char *path, unsigned *out_len)
   return buf;
 }
 
-static int ends_with(const char *s, const char *suf)
+static bool ends_with(const char *s, const char *suf)
 {
   int ls = strlen(s), lf = strlen(suf);
   return ls >= lf && streq_ci(s + ls - lf, suf);

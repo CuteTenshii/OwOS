@@ -6,6 +6,9 @@
  * page loads. The worker only touches B's buffers + net; window syscalls
  * (title, present) are made by this, the owning, thread.
  */
+// clang-format off
+#include <stdbool.h>
+// clang-format on
 #include "anim.h"      /* CSS @keyframes / transition engine (drives per-frame relayout) */
 #include "bmedia.h"    /* <audio>/<video> controls widget + playback state */
 #include "bookmarks.h" /* persistent (url,title) bookmarks store */
@@ -23,7 +26,7 @@ struct browser *B = &binst;
  * model works in (display-line, byte-in-line) coordinates; g_selecting is set
  * between a press on plain text and the end of the drag. */
 static struct gfx_sel g_sel;
-static int g_selecting;
+static bool g_selecting;
 
 int BW = 600, BH = 368; /* client size; grows/shrinks on resize */
 
@@ -36,7 +39,7 @@ const unsigned palette[16] = {
  * helper (one open at a time). It also exercises the widget's per-item states:
  * "Stop" is DISABLED while idle, "Show Images" is a CHECKED toggle, and
  * "Scroll" is a submenu holding the scroll commands. */
-static int show_images = 1; /* "View > Show Images" checkbox state */
+static bool show_images = true; /* "View > Show Images" checkbox state */
 
 static const char *const page_items[] = {"Reload", "Home", "Stop"};
 static const char *const page_hints[] = {"F5", "", ""};
@@ -113,7 +116,7 @@ struct tab {
    * browser dying. Cleared when the tab is navigated/reloaded. crash_sig is the
    * fault signal (SIGSEGV/SIGILL/SIGFPE …) that fired, used to label the page.
    */
-  int crashed;
+  bool crashed;
   int crash_sig;
 };
 static struct tab tabs[MAX_TABS];
@@ -185,7 +188,7 @@ static void page_restore_images(struct page *p)
 /* Set while a fetch was started by Back/Next so its completion doesn't push a
  * new history entry (we're moving within the existing list, not extending it).
  */
-static int nav_from_history;
+static bool nav_from_history;
 
 /* Free a tab's whole history (on close). */
 static void hist_clear(struct tab *t)
@@ -230,8 +233,8 @@ static void hist_push(struct tab *t, const char *url)
   t->hist_i = t->hist_n - 1;
 }
 
-static int hist_can_back(const struct tab *t) { return t->hist_i > 0; }
-static int hist_can_fwd(const struct tab *t) { return t->hist_i < t->hist_n - 1; }
+static bool hist_can_back(const struct tab *t) { return t->hist_i > 0; }
+static bool hist_can_fwd(const struct tab *t) { return t->hist_i < t->hist_n - 1; }
 
 /* Stop any in-flight load and wait for the worker to go idle, so it's safe for
  * the main thread to repoint B->pg at another tab (the worker only ever writes
@@ -285,7 +288,7 @@ static void rewrap(int paw); /* line-table flow; owned by the worker (see below)
  * and corrupts it — surfacing as a browser page-fault AND a worker free() crash
  * at once. Bumped from 64 KiB; ~400 levels of nesting now fit. */
 static char worker_stack[262144];
-static volatile int worker_quit;
+static volatile bool worker_quit;
 
 /* Lowest native SP the JS engine may recurse to on the worker thread before it
  * must throw a RangeError. The interpreter tree-walks + runs native callbacks
@@ -307,8 +310,8 @@ void *browser_js_stack_floor(void) { return &worker_stack[JS_STACK_HEADROOM]; }
  * crashed tab is flagged and its page torn down. The main (UI) thread never
  * runs JS, so it stays responsive. */
 static jmp_buf worker_recovery;
-static volatile int worker_in_recovery; /* re-entrancy guard: a fault while tearing
-                                         * a crashed page down must not loop forever */
+static volatile bool worker_in_recovery; /* re-entrancy guard: a fault while tearing
+                                          * a crashed page down must not loop forever */
 
 /* The tab whose page the worker is operating on this loop iteration — derived
  * from B->pg (the page the work actually touches), NOT the UI thread's
@@ -428,39 +431,39 @@ static int worker_submit(struct dom_node *from) { return browser_form_submit(fro
 /* Perform a clicked control's default action: toggle/cycle/focus/submit, firing
  * the matching DOM events. Returns 1 if the page should re-flatten afterwards.
  */
-static int activate_control(struct dom_node *c, int kind)
+static bool activate_control(struct dom_node *c, int kind)
 {
   switch (kind) {
   case CTRL_CHECKBOX:
     html_toggle_checked(c);
     js_dispatch_dom_event(c, "change", 0, 0);
     html_set_focus(0);
-    return 1;
+    return true;
   case CTRL_RADIO:
     html_radio_select(c);
     js_dispatch_dom_event(c, "change", 0, 0);
     html_set_focus(0);
-    return 1;
+    return true;
   case CTRL_SELECT:
     html_select_cycle(c);
     js_dispatch_dom_event(c, "change", 0, 0);
     html_set_focus(0);
-    return 1;
+    return true;
   case CTRL_TEXT:
     html_set_focus(c);
-    return 1;
+    return true;
   case CTRL_TEXTAREA:
     if (!dom_get_attr(c, "value"))
       html_seed_textarea(c);
     html_set_focus(c);
-    return 1;
+    return true;
   case CTRL_SUBMIT:
     html_set_focus(0);
     worker_submit(c);
-    return 1;
+    return true;
   default:
     html_set_focus(0);
-    return 1;
+    return true;
   }
 }
 
@@ -473,7 +476,7 @@ static int activate_control(struct dom_node *c, int kind)
 static void worker_dispatch_event(void)
 {
   unsigned mseq = dom_mutation_seq;
-  int need_relayout = 0;
+  bool need_relayout = false;
   B->evt_pending = 0;
 
   if (streq(B->evt_type, "blur")) {
@@ -488,10 +491,10 @@ static void worker_dispatch_event(void)
     int ch = B->evt_x;
     if (f && (ch == '\n' || ch == '\r') && html_control_kind(f) == CTRL_TEXT) {
       worker_submit(f); /* Enter in a single-line field */
-      need_relayout = 1;
+      need_relayout = true;
     } else if ((f = html_focus_edit(ch)) != 0) {
       js_dispatch_dom_event(f, "input", 0, 0);
-      need_relayout = 1;
+      need_relayout = true;
     }
   } else { /* a click */
     struct dom_node *t = html_node_at_offset(B->evt_off), *ctrl;
@@ -506,7 +509,7 @@ static void worker_dispatch_event(void)
       else {
         if (html_focus()) {
           html_set_focus(0);
-          need_relayout = 1;
+          need_relayout = true;
         } /* blur */
         if (B->evt_text[0])
           worker_navigate(B->evt_text); /* link */
@@ -550,11 +553,11 @@ static void worker_fn(void)
       /* First fault for this page: reclaim its DOM/JS heap. Guarded — if the
        * teardown itself refaults on a corrupted heap we land back here with the
        * flag set and skip it, leaking the page rather than looping forever. */
-      worker_in_recovery = 1;
+      worker_in_recovery = true;
       html_page_teardown();
-      worker_in_recovery = 0;
+      worker_in_recovery = false;
     } else {
-      worker_in_recovery = 0; /* give up on teardown; stay alive */
+      worker_in_recovery = false; /* give up on teardown; stay alive */
     }
   }
 
@@ -732,7 +735,7 @@ struct gcache {
   unsigned cp;
   unsigned char *bm;
   int w, h, ox, oy, adv;
-  int valid;
+  bool valid;
 };
 static struct gcache g_glyph[GCACHE_N];
 static struct font *g_gf; /* the face the cache currently holds */
@@ -782,10 +785,10 @@ static const int g_size_px[8] = {0, 18, 17, 16, 15, 14, 13, 0};
  * monospace
  * (<pre>), centring, and an indent level (blockquote/list nesting). */
 static int cur_bpx;     /* heading px, 0 = default body font   */
-static int cur_bmono;   /* <pre>: render in the monospace cell */
+static bool cur_bmono;  /* <pre>: render in the monospace cell */
 static int cur_bcenter; /* text-align:center / <center>        */
 static int cur_bindent; /* indent level 0..7                   */
-static int cur_bhr;     /* this line is a horizontal rule      */
+static bool cur_bhr;    /* this line is a horizontal rule      */
 static int cur_blh;     /* CSS line-height px at the line start, 0 = auto */
 
 /* Indent width in pixels for one nesting level. */
@@ -799,7 +802,7 @@ static void set_block(int off)
   int size = bp & BP_SIZE;
   cur_bhr = (size == 7);
   cur_bpx = fpx ? fpx : ((size >= 1 && size <= 6) ? g_size_px[size] : 0);
-  cur_bmono = (bp & BP_MONO) ? 1 : 0;
+  cur_bmono = (bp & BP_MONO) != 0;
   cur_bcenter = inb && B->pg->align ? B->pg->align[off] : ((bp & BP_CENTER) ? 1 : 0);
   cur_bindent = (bp & BP_INDENT) >> BP_INDENT_SH;
   cur_blh = inb ? B->pg->lh[off] : 0;
@@ -826,7 +829,7 @@ static int glyph_px(int off)
  * monospace cell font, not the proportional UI font — only HTML gets the
  * latter. A <pre> block (cur_bmono) is monospace too, even inside an HTML page.
  */
-static int body_mono(void) { return B->pg->mode == MODE_TEXT || cur_bmono; }
+static bool body_mono(void) { return B->pg->mode == MODE_TEXT || cur_bmono; }
 
 static int body_cp_adv(unsigned cp, int px)
 {
@@ -997,9 +1000,9 @@ static int line_height_for(int off, int end)
 /* While a flex-row item is being flowed, every wrapped line is captured into
  * the overlay on the band instead of appended to the main table (set by
  * flow_flex_row). */
-static int g_ov_active; /* 1 = redirect add_line to the flex overlay */
-static int g_ov_base;   /* absolute band row that the item's first line maps to */
-static int g_ov_n;      /* lines emitted for the current item so far */
+static bool g_ov_active; /* 1 = redirect add_line to the flex overlay */
+static int g_ov_base;    /* absolute band row that the item's first line maps to */
+static int g_ov_n;       /* lines emitted for the current item so far */
 
 static void add_line(int off, int len, int x, int w, int h)
 {
@@ -1217,7 +1220,7 @@ void browser_viewport_px(int *w, int *h)
  * origin/width; inline text still flows through the shared wrap below, and
  * vertical spacing is quantised to text rows (Stage 6 moves to pixel
  * scrolling). */
-static int g_box_layout = 1;
+static bool g_box_layout = true;
 
 static int rows_for(int px) { return px > 0 ? (px + LINE_H - 1) / LINE_H : 0; }
 static int max0(int v) { return v > 0 ? v : 0; }
@@ -1575,11 +1578,11 @@ static void flow_flex_row(struct lbox *bx, int idx, int content_x, int content_w
       cw = 4;
     item_x[k] = x;
     ov_start[k] = B->n_fslices;
-    g_ov_active = 1;
+    g_ov_active = true;
     g_ov_base = band_top;
     g_ov_n = 0;
     flow_slice(it->t0, it->t1, x + fl, cw);
-    g_ov_active = 0;
+    g_ov_active = false;
     int vframe = it->border.t + it->border.b + it->padding.t + it->padding.b;
     int content_px = g_ov_n * LINE_H;
     int minch = box_min_content_h(it, vframe);
@@ -1811,11 +1814,11 @@ static void flow_grid(struct lbox *bx, int idx, int content_x, int content_w)
     if (cw < 4)
       cw = 4;
     ov_start[k] = B->n_fslices;
-    g_ov_active = 1;
+    g_ov_active = true;
     g_ov_base = band_top;
     g_ov_n = 0;
     flow_slice(it->t0, it->t1, it_x[k] + fl, cw);
-    g_ov_active = 0;
+    g_ov_active = false;
     int vframe = it->border.t + it->border.b + it->padding.t + it->padding.b;
     int content_px = g_ov_n * LINE_H;
     int minch = box_min_content_h(it, vframe);
@@ -2637,7 +2640,7 @@ static void addr_layout(struct rect *back, struct rect *fwd, struct rect *rel, s
 /* A load is in flight when the worker is fetching or a navigation is queued for
  * it — the reload/stop button shows Stop, and Page>Stop is enabled, only then.
  */
-static int is_loading(void) { return B->loading || B->req_pending; }
+static bool is_loading(void) { return B->loading || B->req_pending; }
 
 /* The reload (circular arrow) and stop (×) glyphs are hand-rasterized:
  * LiberationSans has no dependable U+21BB, and drawing them keeps the button
@@ -2711,8 +2714,8 @@ static void icon_bookmark(int x0, int y0, int d, unsigned col, int filled)
  * URL to bookmark), matching the Bookmarks menu's disabled toggle. */
 static void star_btn_draw(const struct rect *r)
 {
-  int has_url = B->pg->cur_url[0] != '\0';
-  int marked = has_url && bookmark_find(B->pg->cur_url) != 0;
+  bool has_url = B->pg->cur_url[0] != '\0';
+  bool marked = has_url && bookmark_find(B->pg->cur_url) != 0;
   int d = 13, x0 = r->x + (r->w - d) / 2, y0 = r->y + (r->h - d) / 2;
   button_draw(r->x, r->y, r->w, r->h, "", has_url ? BTN_NORMAL : BTN_DISABLED);
   if (marked)
@@ -2743,7 +2746,7 @@ static void current_page_title(char *out, int cap)
  * bookmarks/folders), and an inline text field used to name a new folder. */
 #define BM_PANEL_W 250
 #define BM_ROW_H 20
-static int bm_panel_open;
+static bool bm_panel_open;
 static int bm_panel_scroll;         /* first visible row index */
 static struct bm_node *bm_selected; /* highlighted node, or NULL */
 static struct textfield bm_name_tf; /* inline new-folder name entry */
@@ -2783,7 +2786,7 @@ static void toggle_current_bookmark(void)
  */
 static void begin_new_folder(struct bm_node *parent)
 {
-  bm_panel_open = 1;
+  bm_panel_open = true;
   bm_name_parent = parent ? parent : bookmarks_root();
   bm_naming = 1;
   textfield_set(&bm_name_tf, "");
@@ -2794,7 +2797,7 @@ static void begin_new_folder(struct bm_node *parent)
  * main thread right before the menu is drawn or clicked. */
 static void bookmarks_menu_sync(void)
 {
-  int marked = B->pg->cur_url[0] && bookmark_find(B->pg->cur_url) != 0;
+  bool marked = B->pg->cur_url[0] && bookmark_find(B->pg->cur_url) != 0;
   strlcpy(bm_toggle_label, marked ? "Remove Bookmark" : "Add Bookmark", sizeof bm_toggle_label);
   strlcpy(bm_show_label, bm_panel_open ? "Hide Bookmarks" : "Show Bookmarks", sizeof bm_show_label);
   bm_items[0] = bm_toggle_label;
@@ -2821,7 +2824,7 @@ static int dt_resizing = 0; /* dragging the devtools panel's resize edge */
  * main loop then repaints just that strip instead of re-wrapping and
  * re-blitting the whole page. Distinct from B->seq, which forces a full render.
  */
-static int addr_dirty;
+static bool addr_dirty;
 
 /* Copy `src` into `dst` (cap bytes) truncated to fit `maxpx` pixels in the UI
  * font, appending a "..." ellipsis when it had to shorten. Used for the
@@ -3593,24 +3596,24 @@ static void bookmarks_panel_render(void)
 
 /* Route a click inside the bookmarks panel. Returns 1 if it was inside the
  * panel (consumed), 0 to let it fall through to the page. */
-static int bm_panel_click(int mx, int my)
+static bool bm_panel_click(int mx, int my)
 {
   struct rect nf, del, name, panel;
   int list_y;
   bm_layout(&nf, &del, &name, &panel, &list_y);
   if (mx < panel.x || mx >= panel.x + panel.w || my < panel.y || my >= panel.y + panel.h)
-    return 0;
+    return false;
   if (bm_naming)
-    return 1; /* naming: keys, not clicks */
+    return true; /* naming: keys, not clicks */
   if (button_hit(nf.x, nf.y, nf.w, nf.h, mx, my)) {
     begin_new_folder(bm_target_folder());
-    return 1;
+    return true;
   }
   if (bm_selected && button_hit(del.x, del.y, del.w, del.h, mx, my)) {
     bm_delete(bm_selected);
     bm_selected = 0;
     B->seq++;
-    return 1;
+    return true;
   }
   if (my >= list_y) {
     bm_flatten();
@@ -3621,7 +3624,7 @@ static int bm_panel_click(int mx, int my)
       if (n->is_folder && mx >= rx && mx < rx + 10) {
         folder_toggle(n);
         B->seq++;
-        return 1;
+        return true;
       }
       bm_selected = n;
       if (!n->is_folder && n->url)
@@ -3633,7 +3636,7 @@ static int bm_panel_click(int mx, int my)
       B->seq++;
     }
   }
-  return 1;
+  return true;
 }
 
 static void render(void)
@@ -3819,12 +3822,12 @@ static void render(void)
 /* True while any menu dropdown is expanded. Such a dropdown overlaps the
  * address bar, so the chrome-only fast path must defer to a full render() then.
  */
-static int menu_any_open(void)
+static bool menu_any_open(void)
 {
   for (int i = 0; i < menubar.n; i++)
     if (menubar.menus[i] && menubar.menus[i]->open)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* Repaint only the address-bar strip (its background, the Back/Forward buttons,
@@ -3878,7 +3881,7 @@ static void navigate(const char *url)
   hover_url[0] = '\0'; /* drop any stale hovered-link status */
   if (gfx_sel_has(&g_sel))
     gfx_sel_clear(&g_sel);
-  g_selecting = 0;
+  g_selecting = false;
   textfield_set(&B->addr_tf, url); /* writes into B->addr (its buffer) */
   int i = 0;
   for (; url[i] && i < URL_MAX - 1; i++)
@@ -3941,7 +3944,7 @@ static void go_back(void)
   if (!hist_can_back(t))
     return;
   t->hist_i--;
-  nav_from_history = 1;
+  nav_from_history = true;
   navigate(t->hist[t->hist_i]);
 }
 
@@ -3951,7 +3954,7 @@ static void go_fwd(void)
   if (!hist_can_fwd(t))
     return;
   t->hist_i++;
-  nav_from_history = 1;
+  nav_from_history = true;
   navigate(t->hist[t->hist_i]);
 }
 
@@ -4243,7 +4246,7 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
     }
   }
   if (*off >= 0) {
-    int cache_ok = (hov_pg == B->pg && hov_seq == B->seq && row == hov_row);
+    bool cache_ok = (hov_pg == B->pg && hov_seq == B->seq && row == hov_row);
     if (cache_ok && *off >= hov_lo && *off < hov_hi) {
       /* Same row + same link/gap span as the last move: reuse it. */
       if (hov_link >= 0 && hov_link < B->pg->nlinks) {
@@ -4462,7 +4465,7 @@ static void handle_click(int mx, int my)
       gfx_sel_clear(&g_sel);
       B->seq++;
     }
-    g_selecting = 0;
+    g_selecting = false;
     /* If the page registered JS listeners, hand the click to the worker to
      * dispatch through the live DOM (it follows the link `res` afterwards
      * unless a handler calls preventDefault). Otherwise take the fast path and
@@ -4495,7 +4498,7 @@ static void handle_click(int mx, int my)
     int line, col;
     pane_linecol(mx, my, &line, &col);
     gfx_sel_start(&g_sel, line, col);
-    g_selecting = 1;
+    g_selecting = true;
   }
 }
 
@@ -4513,7 +4516,7 @@ static void set_cursor(int id, int shape)
   }
 }
 
-static int in_rect(int mx, int my, const struct rect *r)
+static bool in_rect(int mx, int my, const struct rect *r)
 {
   return mx >= r->x && mx < r->x + r->w && my >= r->y && my < r->y + r->h;
 }
@@ -4632,7 +4635,7 @@ static void select_all(void)
     return;
   gfx_sel_start(&g_sel, 0, 0);
   gfx_sel_extend(&g_sel, B->nlines - 1, B->line_len[B->nlines - 1]);
-  g_selecting = 0;
+  g_selecting = false;
   B->seq++;
 }
 
@@ -4780,7 +4783,7 @@ static void handle_key(char c, int mods)
     if (menu_any_open())
       B->seq++;
     else
-      addr_dirty = 1;
+      addr_dirty = true;
     return;
   }
 
@@ -4865,7 +4868,7 @@ int main(int argc, char **argv)
     struct win_event ev;
     while (win_poll(id, &ev)) {
       if (ev.type == WEV_CLOSE) {
-        worker_quit = 1;
+        worker_quit = true;
         B->dlg_done = 1; /* release the worker if it's blocked in a dialog */
         if (wtid >= 0)
           thread_join(wtid); /* let the worker exit first */
@@ -4995,7 +4998,7 @@ int main(int argc, char **argv)
        * Back/Next move (then we only walked the existing history). */
       if (!nav_from_history)
         hist_push(&tabs[active_tab], B->pg->cur_url);
-      nav_from_history = 0;
+      nav_from_history = false;
       if (B->pg->favicon_ok && B->pg->cur_url[0]) /* update a saved bookmark's icon */
         bookmark_set_icon(B->pg->cur_url, B->pg->favicon);
     }
@@ -5025,12 +5028,12 @@ int main(int argc, char **argv)
       browser_present(id);
       last = B->seq;
       last_paint_frame = frame;
-      addr_dirty = 0;
+      addr_dirty = false;
     } else if (addr_dirty || dt_paint) { /* partial repaints: addr bar / devtools dock */
       int addr_paint = addr_dirty;
       if (addr_dirty) {
         render_addr();
-        addr_dirty = 0;
+        addr_dirty = false;
       }
       if (dt_paint)
         devtools_render(); /* opaque right-side split: dock only */

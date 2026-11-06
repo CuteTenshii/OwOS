@@ -37,7 +37,7 @@
 
 struct mnt {
   int used;
-  int permanent;  /* a kernel pseudo-fs: never unmounts  */
+  bool permanent; /* a kernel pseudo-fs: never unmounts  */
   char point[48]; /* "/media/usb0", "/proc"              */
   char dev[16];   /* "usb0", "proc"                      */
   const struct fs_ops *ops;
@@ -89,7 +89,7 @@ static struct mnt *mount_for(const char *path, const char **sub)
 }
 
 /* A mount is writable iff its driver exposes create(). */
-static int rvol_readonly(struct mnt *m) { return m->ops->create == NULL; }
+static bool rvol_readonly(struct mnt *m) { return m->ops->create == NULL; }
 
 static int rvol_list(struct mnt *m, const char *p) { return m->ops->list(m->inst, p); }
 static int rvol_stat(struct mnt *m, const char *p, int *d, uint32_t *s) { return m->ops->stat(m->inst, p, d, s); }
@@ -114,17 +114,17 @@ static const char *mnt_leaf(const struct mnt *m)
 }
 
 /* True for "/media" or "/media/" -- the synthetic mount-root directory. */
-static int is_media_root(const char *path)
+static bool is_media_root(const char *path)
 {
   if (!path)
-    return 0;
+    return false;
   const char *m = "/media";
   while (*m && *path == *m) {
     path++;
     m++;
   }
   if (*m != '\0')
-    return 0;
+    return false;
   return *path == '\0' || (*path == '/' && path[1] == '\0');
 }
 
@@ -177,7 +177,7 @@ struct super {
 static struct super sb;
 static struct dirent *dir; /* heap-allocated mirror of the directory  */
 static uint32_t dir_cap;   /* entries the current extent/mirror hold  */
-static int mounted;
+static bool mounted;
 
 /* ---- data-sector allocation (in-RAM bitmap, rebuilt from the directory) -----
  *
@@ -200,9 +200,9 @@ static uint32_t fs_total_sectors;              /* full capacity of the disk     
 static uint32_t clus_sectors;                  /* sectors per cluster (>= 1)    */
 static uint32_t clus_count;                    /* whole clusters on this disk   */
 
-static int clus_test(uint32_t c) { return (clus_used[c >> 3] >> (c & 7)) & 1; }
+static bool clus_test(uint32_t c) { return (clus_used[c >> 3] >> (c & 7)) & 1; }
 static void clus_set(uint32_t c) { clus_used[c >> 3] |= (uint8_t)(1u << (c & 7)); }
-static void clus_clr(uint32_t c) { clus_used[c >> 3] &= (uint8_t) ~(1u << (c & 7)); }
+static void clus_clr(uint32_t c) { clus_used[c >> 3] &= (uint8_t)~(1u << (c & 7)); }
 
 /* Sectors a file of `size` bytes occupies (always >= 1, matching fs_create). */
 static uint32_t size_to_sectors(uint32_t size)
@@ -402,15 +402,15 @@ static int grow_dir(void)
   return 0;
 }
 
-static int name_eq(const char *a, const char *b)
+static bool name_eq(const char *a, const char *b)
 {
   for (int i = 0; i < FS_NAME_LEN; i++) {
     if (a[i] != b[i])
-      return 0;
+      return false;
     if (a[i] == '\0')
-      return 1;
+      return true;
   }
-  return 1;
+  return true;
 }
 
 static void name_copy(char *dst, const char *src)
@@ -434,12 +434,12 @@ static uint32_t pack_now(void)
 }
 
 /* Compare two NUL-terminated strings for equality (for "."/".." components). */
-static int s_eq(const char *a, const char *b)
+static bool s_eq(const char *a, const char *b)
 {
   int i = 0;
   for (; a[i] && b[i]; i++)
     if (a[i] != b[i])
-      return 0;
+      return false;
   return a[i] == b[i];
 }
 
@@ -571,7 +571,7 @@ static void write_pad(uint32_t v, int width);
 static void str_copy(char *dst, const char *src, int cap);
 
 /* "" or "/" -- the mount point itself, i.e. the pseudo-fs root directory. */
-static int sub_is_root(const char *p) { return !p[0] || (p[0] == '/' && !p[1]); }
+static bool sub_is_root(const char *p) { return !p[0] || (p[0] == '/' && !p[1]); }
 
 /* ---- /dev: the present block devices, each a regular (non-byte-readable) file
  */
@@ -904,7 +904,7 @@ static void mount_pseudo(const char *point, const char *dev, const struct fs_ops
     if (mtab[i].used)
       continue;
     mtab[i].used = 1;
-    mtab[i].permanent = 1;
+    mtab[i].permanent = true;
     str_copy(mtab[i].point, point, (int)sizeof mtab[i].point);
     str_copy(mtab[i].dev, dev, (int)sizeof mtab[i].dev);
     mtab[i].ops = ops;
@@ -931,7 +931,7 @@ void fs_format(void)
   uint32_t init_sectors = (DIR_INIT_ENTRIES * (uint32_t)sizeof(struct dirent) + SECTOR_SIZE - 1) / SECTOR_SIZE;
   uint32_t start = alloc_run(init_sectors);
   if (start == 0) { /* disk too small for a directory */
-    mounted = 0;
+    mounted = false;
     return;
   }
   sb.magic = FS_MAGIC;
@@ -945,7 +945,7 @@ void fs_format(void)
     kfree(dir);
   dir = kmalloc(bytes);
   if (!dir) {
-    mounted = 0;
+    mounted = false;
     return;
   }
   for (uint32_t i = 0; i < bytes; i++)
@@ -954,7 +954,7 @@ void fs_format(void)
 
   blk_write_sector(SUPER_LBA, &sb);
   dir_store();
-  mounted = 1;
+  mounted = true;
 }
 
 void fs_init(void)
@@ -967,11 +967,11 @@ void fs_init(void)
   if (have && sb.magic == FS_MAGIC) { /* a real owofs disk -- mount it  */
     set_capacity();
     if (dir_load() != 0) { /* out of heap -- can't mount      */
-      mounted = 0;
+      mounted = false;
       return;
     }
     rebuild_alloc_map(); /* reconstruct free space from the dir */
-    mounted = 1;
+    mounted = true;
     return;
   }
   if (have && blk_is_ide()) { /* blank IDE dev disk -- make owofs*/
@@ -991,7 +991,7 @@ void fs_init(void)
     return;
   }
   con_write("fs: no disk and RAM fs unavailable.\n");
-  mounted = 0;
+  mounted = false;
 }
 
 /* Print a zero-padded decimal of the given width (1..) */
@@ -1196,12 +1196,12 @@ int fs_create(const char *name, const void *data, uint32_t size)
     return -1; /* bad path / names a dir   */
 
   int slot = find_in(parent, leaf); /* overwrite if it exists   */
-  int overwrite = 0;
+  bool overwrite = false;
   uint32_t old_start = 0, old_size = 0;
   if (slot >= 0) {
     if (dir[slot].flags & FS_DIR_FLAG)
       return -1; /* can't clobber a directory*/
-    overwrite = 1;
+    overwrite = true;
     old_start = dir[slot].start;
     old_size = dir[slot].size;
   } else {
@@ -1407,12 +1407,12 @@ int fs_prealloc(const char *name, uint32_t size)
     return -1;
 
   int slot = find_in(parent, leaf);
-  int overwrite = 0;
+  bool overwrite = false;
   uint32_t old_start = 0, old_size = 0;
   if (slot >= 0) {
     if (dir[slot].flags & FS_DIR_FLAG)
       return -1; /* can't clobber a directory       */
-    overwrite = 1;
+    overwrite = true;
     old_start = dir[slot].start;
     old_size = dir[slot].size;
   } else {
@@ -1510,7 +1510,7 @@ int fs_write_at(const char *name, uint32_t offset, const void *data, uint32_t le
  * tail (and reclaims an overwritten file's old extent), so a download is
  * bounded only by the biggest free gap, and a stream that dies partway frees
  * its whole reservation -- nothing is leaked. */
-static int strm_active;
+static bool strm_active;
 static char strm_name[FS_NAME_LEN];       /* final path component (leaf)          */
 static int strm_parent;                   /* slot of the directory to create it in */
 static uint32_t strm_start;               /* first data sector (reserved at begin) */
@@ -1538,7 +1538,7 @@ int fs_stream_begin(const char *name)
   strm_sectors = 0;
   strm_size = 0;
   strm_fill = 0;
-  strm_active = 1;
+  strm_active = true;
   return 0;
 }
 
@@ -1559,7 +1559,7 @@ int fs_stream_write(const void *data, uint32_t size)
     if (strm_fill == sizeof strm_buf) {
       if (strm_reserved - strm_sectors < 8 || blk_write(strm_start + strm_sectors, strm_buf, 8) != 0) {
         run_mark(strm_start, strm_reserved, 0); /* release the gap */
-        strm_active = 0;                        /* overran the reservation / I/O error */
+        strm_active = false;                    /* overran the reservation / I/O error */
         return -1;
       }
       strm_sectors += 8;
@@ -1573,7 +1573,7 @@ int fs_stream_end(void)
 {
   if (!strm_active)
     return -1;
-  strm_active = 0;
+  strm_active = false;
 
   if (strm_fill > 0) { /* flush the partial final batch */
     uint32_t full = strm_fill / SECTOR_SIZE;
@@ -1602,14 +1602,14 @@ int fs_stream_end(void)
   }
 
   int slot = find_in(strm_parent, strm_name); /* overwrite if it exists   */
-  int overwrite = 0;
+  bool overwrite = false;
   uint32_t old_start = 0, old_size = 0;
   if (slot >= 0) {
     if (dir[slot].flags & FS_DIR_FLAG) {
       run_mark(strm_start, strm_reserved, 0); /* release; can't clobber dir */
       return -1;
     }
-    overwrite = 1;
+    overwrite = true;
     old_start = dir[slot].start;
     old_size = dir[slot].size;
   } else {
@@ -1702,11 +1702,11 @@ int fs_selftest(void)
   for (uint32_t i = 0; i < SZ && rb_ok; i++) {
     uint8_t want = 0;
     if (i < 4)
-      want = (uint8_t) "ABCD"[i];
+      want = (uint8_t)"ABCD"[i];
     else if (i >= 510 && i < 514)
-      want = (uint8_t) "WXYZ"[i - 510];
+      want = (uint8_t)"WXYZ"[i - 510];
     else if (i >= 996)
-      want = (uint8_t) "1234"[i - 996];
+      want = (uint8_t)"1234"[i - 996];
     if (buf[i] != want)
       rb_ok = 0;
   }
@@ -1977,7 +1977,7 @@ int fs_mount(const char *dev, const char *point)
   }
 
   mtab[slot].used = 1;
-  mtab[slot].permanent = 0;
+  mtab[slot].permanent = false;
   str_copy(mtab[slot].point, point, (int)sizeof mtab[slot].point);
   str_copy(mtab[slot].dev, dev, (int)sizeof mtab[slot].dev);
   mtab[slot].ops = ops;

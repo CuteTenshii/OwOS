@@ -7,6 +7,7 @@
  * the lease with ifconfig() and write /etc/resolv.conf. One-shot at startup. */
 
 #include "owos.h"
+#include <stdbool.h>
 
 /* --- byte helpers --------------------------------------------------------- */
 static void put16(unsigned char *p, unsigned v)
@@ -15,12 +16,12 @@ static void put16(unsigned char *p, unsigned v)
   p[1] = v & 0xff;
 }
 static unsigned get16(const unsigned char *p) { return (p[0] << 8) | p[1]; }
-static int eq4(const unsigned char *a, const unsigned char *b)
+static bool eq4(const unsigned char *a, const unsigned char *b)
 {
   for (int i = 0; i < 4; i++)
     if (a[i] != b[i])
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
 /* Ones-complement Internet checksum over `len` bytes. */
@@ -40,7 +41,7 @@ static unsigned short inet_csum(const unsigned char *p, int len)
 }
 
 /* Parse "aa:bb:cc:dd:ee:ff" (from /sys/class/net/eth0/address) into mac[6]. */
-static int parse_mac(const char *s, unsigned char mac[6])
+static bool parse_mac(const char *s, unsigned char mac[6])
 {
   for (int i = 0; i < 6; i++) {
     int hi = -1, lo = -1;
@@ -54,7 +55,7 @@ static int parse_mac(const char *s, unsigned char mac[6])
       else if (c >= 'A' && c <= 'F')
         d = c - 'A' + 10;
       else
-        return 0;
+        return false;
       if (k == 0)
         hi = d;
       else
@@ -62,9 +63,9 @@ static int parse_mac(const char *s, unsigned char mac[6])
     }
     mac[i] = (unsigned char)((hi << 4) | lo);
     if (i < 5 && *s++ != ':')
-      return 0;
+      return false;
   }
-  return 1;
+  return true;
 }
 
 /* --- DHCP ----------------------------------------------------------------- */
@@ -202,18 +203,18 @@ static unsigned char parse_reply(const unsigned char *f, int len, unsigned char 
 
 /* Send `frame`, then poll the raw socket for a reply of the wanted DHCP type
  * (2 OFFER / 5 ACK), retrying the send a few times. Returns 1 on match. */
-static int exchange(int fd, const unsigned char *frame, int flen, unsigned char want, unsigned char yiaddr[4],
-                    unsigned char mask[4], unsigned char gw[4], unsigned char dns[4], unsigned char srv[4])
+static bool exchange(int fd, const unsigned char *frame, int flen, unsigned char want, unsigned char yiaddr[4],
+                     unsigned char mask[4], unsigned char gw[4], unsigned char dns[4], unsigned char srv[4])
 {
   unsigned char rx[1514];
   for (int t = 0; t < 8; t++) {
     if (net_send(fd, frame, flen) < 0)
-      return 0;
+      return false;
     /* ~1.5 s of non-blocking polling per try. */
     for (int w = 0; w < 30; w++) {
       int n = net_recv_nb(fd, rx, sizeof rx);
       if (n == NET_EINTR)
-        return 0;
+        return false;
       if (n > 0) {
         unsigned char yi[4], mk[4], g[4], dn[4], sv[4];
         memcpy(yi, yiaddr, 4);
@@ -228,14 +229,14 @@ static int exchange(int fd, const unsigned char *frame, int flen, unsigned char 
           memcpy(gw, g, 4);
           memcpy(dns, dn, 4);
           memcpy(srv, sv, 4);
-          return 1;
+          return true;
         }
         continue; /* ARP / unrelated traffic: ignore, keep polling */
       }
       msleep(50);
     }
   }
-  return 0;
+  return false;
 }
 
 static void log_ip(const char *label, const unsigned char ip[4])

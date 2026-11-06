@@ -12,15 +12,16 @@
  */
 #include "cast.h"
 #include "owos.h"
+#include <stdbool.h>
 
-static int is_uint(const char *s)
+static bool is_uint(const char *s)
 {
   if (!*s)
-    return 0;
+    return false;
   for (; *s; s++)
     if (*s < '0' || *s > '9')
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
 static int atoi_simple(const char *s)
@@ -95,7 +96,8 @@ static int cmd_play(const char *sel, const char *url, const char *type)
   struct cast_device d[16];
   cast_session *s;
   struct cast_status st;
-  int n, idx, seen_playing = 0;
+  bool seen_playing = false;
+  int n, idx;
 
   printf("Scanning for Cast devices...\n");
   n = cast_discover(d, 16, 3000);
@@ -141,7 +143,7 @@ static int cmd_play(const char *sel, const char *url, const char *type)
     }
     printf("   ");
     if (st.state == CAST_PLAYING)
-      seen_playing = 1;
+      seen_playing = true;
     if (seen_playing && st.state == CAST_IDLE) {
       printf("\nPlayback ended.\n");
       break;

@@ -7,6 +7,7 @@
 #include "fmt.h"
 #include "gfx.h"
 #include "owos.h"
+#include <stdbool.h>
 
 #define W 248
 #define H 336
@@ -56,7 +57,7 @@ static char buf[40] = "0";
 static double acc = 0.0;
 static char op = 0;
 static int fresh = 1;
-static int error = 0;
+static bool error;
 
 static int buf_len(void)
 {
@@ -82,7 +83,7 @@ static void clear_all(void)
   acc = 0.0;
   op = 0;
   fresh = 1;
-  error = 0;
+  error = false;
 }
 
 /* Fold the current entry into `acc` under the pending operator (if any),
@@ -104,7 +105,7 @@ static void fold(void)
       break;
     case '/':
       if (v == 0.0) {
-        error = 1;
+        error = true;
         op = 0;
         return;
       }
@@ -334,7 +335,8 @@ int main(void)
   gfx_init(win_fb(), W, H);
   win_resizable(id, 0);
 
-  int hover = -1, dirty = 1;
+  int hover = -1;
+  bool dirty = true;
   for (;;) {
     struct win_event ev;
     while (win_poll(id, &ev)) {
@@ -346,7 +348,7 @@ int main(void)
         int i = cell_at(ev.a, ev.b);
         if (i >= 0) {
           act(keys[i].act);
-          dirty = 1;
+          dirty = true;
         }
         break;
       }
@@ -354,7 +356,7 @@ int main(void)
         int i = cell_at(ev.a, ev.b);
         if (i != hover) {
           hover = i;
-          dirty = 1;
+          dirty = true;
         }
         break;
       }
@@ -362,7 +364,7 @@ int main(void)
         unsigned char a = key_to_act((char)ev.a);
         if (a) {
           act(a);
-          dirty = 1;
+          dirty = true;
         }
         break;
       }
@@ -371,7 +373,7 @@ int main(void)
     if (dirty) {
       draw(hover);
       win_present(id);
-      dirty = 0;
+      dirty = false;
     }
     win_wait(id);
   }

@@ -1,3 +1,5 @@
+#include <stdbool.h>
+
 #include "classlist.h"
 #include "owos.h"
 
@@ -9,12 +11,12 @@ static char *dup_empty(void)
   return s;
 }
 
-static int is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
+static bool is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
 
 int classlist_has(const char *classes, const char *token, int length)
 {
   if (!classes || !token || length <= 0)
-    return 0;
+    return false;
   while (*classes) {
     const char *start;
     while (is_space(*classes))
@@ -23,9 +25,9 @@ int classlist_has(const char *classes, const char *token, int length)
     while (*classes && !is_space(*classes))
       classes++;
     if (classes - start == length && !memcmp(start, token, (unsigned)length))
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 int classlist_count(const char *classes)
@@ -67,11 +69,11 @@ const char *classlist_nth(const char *classes, int index, int *length)
   return 0;
 }
 
-static int append(char **out, int *length, int *capacity, const char *token, int token_length)
+static bool append(char **out, int *length, int *capacity, const char *token, int token_length)
 {
   int need;
   if (token_length <= 0)
-    return 1;
+    return true;
   need = *length + token_length + (*length ? 1 : 0) + 1;
   if (need > *capacity) {
     int next = *capacity ? *capacity * 2 : 32;
@@ -80,7 +82,7 @@ static int append(char **out, int *length, int *capacity, const char *token, int
     {
       char *grown = realloc(*out, (unsigned)next);
       if (!grown)
-        return 0;
+        return false;
       *out = grown;
     }
     *capacity = next;
@@ -90,7 +92,7 @@ static int append(char **out, int *length, int *capacity, const char *token, int
   memcpy(*out + *length, token, (unsigned)token_length);
   *length += token_length;
   (*out)[*length] = 0;
-  return 1;
+  return true;
 }
 
 static void rebuild(char **classes, const char *replace, int replace_length, const char *remove, int remove_length)

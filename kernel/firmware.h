@@ -8,6 +8,8 @@
 #ifndef OWOS_FIRMWARE_H
 #define OWOS_FIRMWARE_H
 
+#include <stdbool.h>
+
 enum firmware_kind { FIRMWARE_BIOS = 0, FIRMWARE_UEFI = 1 };
 
 /* Record the detected firmware mode; called once from kernel_main during boot.
@@ -15,7 +17,7 @@ enum firmware_kind { FIRMWARE_BIOS = 0, FIRMWARE_UEFI = 1 };
 void firmware_set(enum firmware_kind kind);
 
 /* 1 if we booted via UEFI, 0 for legacy BIOS / CSM. */
-int firmware_is_uefi(void);
+bool firmware_is_uefi(void);
 
 /* "UEFI" or "BIOS" — for banners and the neofetch splash. */
 const char *firmware_name(void);

@@ -17,6 +17,7 @@
  */
 
 #include "owos.h"
+#include <stdbool.h>
 
 static const char *logo[] = {
     "   /\\___/\\", "  /       \\", "  ( O w O )", "  (   v   )", "   \\     /", "    \\___/",
@@ -115,19 +116,20 @@ static void amib(unsigned mib)
  */
 static void asqueeze(const char *s)
 {
-  int started = 0, pending = 0;
+  bool pending = false;
+  bool started = false;
   for (; *s; s++) {
     if (*s == ' ' || *s == '\t') {
       if (started)
-        pending = 1;
+        pending = true;
       continue;
     }
     if (pending) {
       ac(' ');
-      pending = 0;
+      pending = false;
     }
     ac(*s);
-    started = 1;
+    started = true;
   }
 }
 
@@ -142,12 +144,12 @@ static void a_ghz(unsigned mhz)
   as(" GHz");
 }
 
-static int has_at(const char *s)
+static bool has_at(const char *s)
 {
   for (; *s; s++)
     if (*s == '@')
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* ----------------------------------------------- reading the /proc facts */
@@ -174,14 +176,14 @@ static void rstrip(char *s)
 }
 
 /* Value of a "key <value>" line; copies value (to EOL) into out. 1 if found. */
-static int kvget(const char *buf, const char *key, char *out, int max)
+static bool kvget(const char *buf, const char *key, char *out, int max)
 {
   int kl = strlen(key);
   for (const char *p = buf; *p;) {
-    int match = 1;
+    bool match = true;
     for (int i = 0; i < kl; i++)
       if (p[i] != key[i]) {
-        match = 0;
+        match = false;
         break;
       }
     if (match && p[kl] == ' ') {
@@ -192,7 +194,7 @@ static int kvget(const char *buf, const char *key, char *out, int max)
         i++;
       }
       out[i] = '\0';
-      return 1;
+      return true;
     }
     while (*p && *p != '\n')
       p++;
@@ -200,7 +202,7 @@ static int kvget(const char *buf, const char *key, char *out, int max)
       p++;
   }
   out[0] = '\0';
-  return 0;
+  return false;
 }
 static unsigned kvu(const char *buf, const char *key)
 {
@@ -224,7 +226,7 @@ static unsigned u_of(const char *s)
 
 /* 1 if `s` begins with `pre`, case-insensitively (so "HP EliteBook" is seen to
  * start with "HP" and the vendor isn't printed twice in the Host line). */
-static int ci_prefix(const char *s, const char *pre)
+static bool ci_prefix(const char *s, const char *pre)
 {
   for (; *pre; s++, pre++) {
     int a = *s, b = *pre;
@@ -233,9 +235,9 @@ static int ci_prefix(const char *s, const char *pre)
     if (b >= 'A' && b <= 'Z')
       b += 32;
     if (a != b)
-      return 0;
+      return false;
   }
-  return 1;
+  return true;
 }
 
 /* --------------------------------------------------------------- the stats */
@@ -415,13 +417,13 @@ static void build_info(void)
     as("none detected");
     endrow();
   } else {
-    int first = 1;
+    bool first = true;
     for (const char *p = f; *p;) {
       const char *eol = p;
       while (*eol && *eol != '\n')
         eol++;
       field(first ? "Storage: " : "         ");
-      first = 0;
+      first = false;
       const char *q = p;
       while (q < eol && *q != ' ')
         ac(*q++); /* type            */

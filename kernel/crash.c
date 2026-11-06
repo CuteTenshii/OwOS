@@ -80,7 +80,7 @@ extern const char _binary_appsyms_start[], _binary_appsyms_end[];
 
 /* Resolve `addr` to "func+0xNN" within `app`'s symbol section (largest symbol
  * address <= addr). Returns 1 and fills out on success, 0 if unknown. */
-static int crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
+static bool crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
 {
   const char *p = _binary_appsyms_start, *end = _binary_appsyms_end;
   int in = 0;
@@ -89,7 +89,7 @@ static int crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
   int bl = 0;
   out[0] = '\0';
   if (!app || !app[0])
-    return 0;
+    return false;
   while (p < end) {
     if (*p == '>') { /* section header ">app" */
       const char *s = ++p;
@@ -131,7 +131,7 @@ static int crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
       p++;
   }
   if (!bn)
-    return 0;
+    return false;
   int o = 0;
   for (int i = 0; i < bl && o < cap - 12; i++)
     out[o++] = bn[i];
@@ -141,17 +141,17 @@ static int crash_symbolize(const char *app, uint32_t addr, char *out, int cap)
   out[o++] = 'x';
   {
     static const char hd[] = "0123456789abcdef";
-    int st = 0;
+    bool st = false;
     for (int sh = 28; sh >= 0; sh -= 4) {
       int nb = (off >> sh) & 0xF;
       if (nb || st || sh == 0) {
         out[o++] = hd[nb];
-        st = 1;
+        st = true;
       }
     }
   }
   out[o] = '\0';
-  return 1;
+  return true;
 }
 
 /* Emit the full report to COM1 as text — capturable in logs and addr2line-able,

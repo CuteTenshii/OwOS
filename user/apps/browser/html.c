@@ -3,6 +3,8 @@
  * title. Element styling comes from the css.c engine (sheet + inline + attrs);
  * this file maps the computed style onto the text renderer and does the
  * HTML-entity work. */
+#include <stdbool.h>
+
 #include "anim.h"   /* CSS @keyframes / transition engine */
 #include "bmedia.h" /* <audio>/<video> element registration */
 #include "browser.h"
@@ -36,14 +38,14 @@ static char g_cur_page_url[URL_MAX];
  * links render as plain (non-clickable) text. */
 static char g_base_url[URL_MAX];
 static int g_frame_depth;
-static int g_link_nav = 1;
+static bool g_link_nav = true;
 static void free_style_cache(void *cache) { free(cache); }
 
 /* CSP enforcement runs against the top document (B->pg->csp); frame
  * sub-documents have their own policy we don't track, so checks are skipped
  * inside frames (g_frame_depth > 0). g_csp_report gates console logging to the
  * initial load so the per-relayout walk doesn't spam duplicate violations. */
-static int g_csp_report;
+static bool g_csp_report;
 
 static void csp_report(const char *what, const char *url, const char *reason)
 {
@@ -68,7 +70,7 @@ static void csp_report(const char *what, const char *url, const char *reason)
  * absolute; on success `out` holds the URL to use (http->https upgraded when
  * the policy asks). Returns 1 = allowed. No-op (allow) inside frames or with no
  * CSP. */
-static int csp_url_ok(int type, const char *abs, const char *what, char *out, int outcap)
+static bool csp_url_ok(int type, const char *abs, const char *what, char *out, int outcap)
 {
   if (g_frame_depth > 0 || !B->pg->csp) {
     int k = 0;
@@ -78,20 +80,20 @@ static int csp_url_ok(int type, const char *abs, const char *what, char *out, in
       k++;
     }
     out[k] = '\0';
-    return 1;
+    return true;
   }
   char reason[64];
   if (csp_check_url(B->pg->csp, type, abs, g_cur_page_url, out, outcap, reason, sizeof reason))
-    return 1;
+    return true;
   csp_report(what, abs, reason);
-  return 0;
+  return false;
 }
 
 /* style-src gate for an inline style="" attribute (no nonce/hash for attrs). */
-static int csp_style_attr_ok(void)
+static bool csp_style_attr_ok(void)
 {
   if (g_frame_depth > 0 || !B->pg->csp)
-    return 1;
+    return true;
   return csp_check_inline(B->pg->csp, CSP_STYLE, 0, 0, 0, 0, 0);
 }
 
@@ -142,7 +144,7 @@ int html_has_pseudo(struct dom_node *el, int which)
  * it must be used verbatim rather than joined onto a base (resolve_url only
  * treats http(s):// as absolute, and would mangle e.g. a data:/file:
  * reference). */
-static int url_absolute(const char *s)
+static bool url_absolute(const char *s)
 {
   return starts_ci(s, "http://") || starts_ci(s, "https://") || starts_ci(s, "data:") || starts_ci(s, "file:") ||
          starts_ci(s, "blob:") || starts_ci(s, "mailto:");
@@ -157,11 +159,11 @@ static int url_absolute(const char *s)
  * Unicode U+00A0..U+00FF). */
 enum { CS_UTF8, CS_LATIN1 };
 static int g_charset;
-static int g_charset_from_header;
+static bool g_charset_from_header;
 
 /* True if `cs` (a charset name, possibly inside a longer string) is a Latin-1 /
  * Windows-1252 label; returns 0 for utf-8 / unknown (treated as UTF-8). */
-static int charset_is_latin1(const char *cs)
+static bool charset_is_latin1(const char *cs)
 {
   return contains_ci(cs, "8859-1") || contains_ci(cs, "latin-1") || contains_ci(cs, "latin1") ||
          contains_ci(cs, "1252") || contains_ci(cs, "8859_1");
@@ -172,7 +174,7 @@ static int charset_is_latin1(const char *cs)
 void html_set_charset(const char *content_type)
 {
   g_charset = CS_UTF8;
-  g_charset_from_header = 0;
+  g_charset_from_header = false;
   if (!content_type)
     return;
   const char *cs = content_type;
@@ -181,7 +183,7 @@ void html_set_charset(const char *content_type)
       break;
   if (!*cs)
     return; /* header gave no charset */
-  g_charset_from_header = 1;
+  g_charset_from_header = true;
   if (charset_is_latin1(cs))
     g_charset = CS_LATIN1;
 }
@@ -315,7 +317,7 @@ static void apply_css(const struct css_style *cs)
 
 /* The renderer's line-break set (distinct from dom.c's CSS-block set: this one
  * includes br/li/tr/dd/dt, which force a new line but aren't <p>-closers). */
-static int is_block_tag(const char *name)
+static bool is_block_tag(const char *name)
 {
   static const char *const blk[] = {
       "p",          "br",      "div",    "li",       "tr",     "ul",      "ol",      "h1",     "h2",         "h3",
@@ -324,8 +326,8 @@ static int is_block_tag(const char *name)
       "aside",      "details", "dialog", "fieldset", "legend", "caption", "address", 0};
   for (int i = 0; blk[i]; i++)
     if (streq(name, blk[i]))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* decode_entity returns a real Unicode codepoint now (the renderer is UTF-8),
@@ -898,7 +900,8 @@ static int text_put(int n, char c, unsigned char a)
 /* Walk state (single-threaded: only the worker calls in). W_n = rendered
  * length; pend_sp/run_nl drive whitespace collapsing; W_cur_link = open <a>, or
  * -1. */
-static int W_n, W_pend_sp, W_run_nl, W_cur_link;
+static int W_n, W_run_nl, W_cur_link;
+static bool W_pend_sp;
 
 /* Element span table: every element records the [start,end) text range it
  * covers, so a content-pane click resolves to the deepest enclosing DOM node
@@ -984,19 +987,19 @@ static int utf8_emit(int n, unsigned cp, unsigned char a)
 /* Codepoints that must never reach layout: C0/C1 controls, DEL, soft hyphen,
  * the zero-width set, and the BOM. (Real spaces/newlines are handled before
  * this.) */
-static int cp_drop(unsigned cp)
+static bool cp_drop(unsigned cp)
 {
   if (cp < 0x20 || cp == 0x7f)
-    return 1;
+    return true;
   if (cp >= 0x80 && cp <= 0x9f)
-    return 1;
+    return true;
   if (cp == 0xAD)
-    return 1; /* soft hyphen     */
+    return true; /* soft hyphen     */
   if (cp >= 0x200B && cp <= 0x200F)
-    return 1; /* zero-width / dir */
+    return true; /* zero-width / dir */
   if (cp == 0xFEFF)
-    return 1; /* BOM / ZWNBSP    */
-  return 0;
+    return true; /* BOM / ZWNBSP    */
+  return false;
 }
 
 /* Apply text-transform (and font-variant small-caps) to one codepoint. ASCII +
@@ -1005,9 +1008,9 @@ static int cp_drop(unsigned cp)
  * this line renderer can't draw reduced-size capitals mid-run — and applies
  * after the transform, so a lowercasing text-transform still ends up
  * capitalised. */
-static unsigned ttx_apply(unsigned cp, unsigned char ttx, int smallcaps, int *word)
+static unsigned ttx_apply(unsigned cp, unsigned char ttx, int smallcaps, bool *word)
 {
-  int alpha =
+  bool alpha =
       (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') || (cp >= 0xC0 && cp <= 0xFF && cp != 0xD7 && cp != 0xF7);
   unsigned up = cp, lo = cp;
   if (cp >= 'a' && cp <= 'z')
@@ -1036,7 +1039,7 @@ static unsigned ttx_apply(unsigned cp, unsigned char ttx, int smallcaps, int *wo
     else if (r >= 0xE0 && r <= 0xFE && r != 0xF7)
       r -= 0x20;
   }
-  *word = alpha ? 0 : 1;
+  *word = !alpha;
   return r;
 }
 
@@ -1045,7 +1048,7 @@ static unsigned ttx_apply(unsigned cp, unsigned char ttx, int smallcaps, int *wo
 static void emit_text(const char *s)
 {
   const char *p = s, *end = s + strlen(s);
-  int ws = 1; /* at a word start (for capitalize) */
+  bool ws = true; /* at a word start (for capitalize) */
   while (p < end) {
     int c;
     if (*p == '&') {
@@ -1055,7 +1058,7 @@ static void emit_text(const char *s)
       if (c == -2)
         continue;
       if (c == -1) {
-        W_pend_sp = 1;
+        W_pend_sp = true;
         continue;
       } /* nbsp -> space   */
     } else {
@@ -1065,7 +1068,7 @@ static void emit_text(const char *s)
       if (c == '\n') {
         W_n = text_put(W_n, '\n', 0);
         W_run_nl = 1;
-        ws = 1;
+        ws = true;
         continue;
       }
       if (c == '\r')
@@ -1074,7 +1077,7 @@ static void emit_text(const char *s)
         for (int t = 0; t < 4; t++)
           W_n = text_put(W_n, ' ', sty_byte());
         W_run_nl = 0;
-        ws = 1;
+        ws = true;
         continue;
       }
       if (cp_drop((unsigned)c))
@@ -1084,8 +1087,8 @@ static void emit_text(const char *s)
       continue;
     }
     if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-      W_pend_sp = 1;
-      ws = 1;
+      W_pend_sp = true;
+      ws = true;
       continue;
     }
     if (cp_drop((unsigned)c))
@@ -1093,7 +1096,7 @@ static void emit_text(const char *s)
     if (W_pend_sp) {
       if (W_n > 0 && W_run_nl == 0)
         W_n = text_put(W_n, ' ', 0);
-      W_pend_sp = 0;
+      W_pend_sp = false;
     }
     W_n = utf8_emit(W_n, ttx_apply((unsigned)c, sty_cur.ttx, sty_cur.smallcaps, &ws), sty_byte());
     W_run_nl = 0;
@@ -1104,7 +1107,7 @@ static void emit_text(const char *s)
  * sp. */
 static void block_break(void)
 {
-  W_pend_sp = 0;
+  W_pend_sp = false;
   if (W_run_nl < 2 && W_n > 0) {
     W_n = text_put(W_n, '\n', 0);
     W_run_nl++;
@@ -1113,7 +1116,8 @@ static void block_break(void)
 
 static void capture_title(struct dom_node *el)
 {
-  int tl = 0, t_pend = 0;
+  int tl = 0;
+  bool t_pend = false;
   B->pg->doc_title[0] = '\0';
   for (struct dom_node *c = el->first_child; c; c = c->next) {
     if (c->type != DOM_TEXT || !c->text)
@@ -1128,21 +1132,21 @@ static void capture_title(struct dom_node *el)
         if (ch == -2)
           continue;
         if (ch == -1) {
-          t_pend = 1;
+          t_pend = true;
           continue;
         }
       } else {
         ch = (unsigned char)*p++;
       }
       if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
-        t_pend = 1;
+        t_pend = true;
         continue;
       }
       if (ch < 0x20 || ch >= 0x7f)
         continue;
       if (t_pend && tl > 0 && tl < (int)sizeof B->pg->doc_title - 1)
         B->pg->doc_title[tl++] = ' ';
-      t_pend = 0;
+      t_pend = false;
       if (tl < (int)sizeof B->pg->doc_title - 1)
         B->pg->doc_title[tl++] = (char)ch;
       B->pg->doc_title[tl] = '\0';
@@ -1414,9 +1418,9 @@ static void handle_img(struct dom_node *el, const struct css_style *cs)
  * <audio>. */
 static void handle_media(struct dom_node *el)
 {
-  int is_video = streq(el->tag, "video");
-  int controls = dom_get_attr(el, "controls") != 0;
-  int widget = is_video || controls;
+  bool is_video = streq(el->tag, "video");
+  bool controls = dom_get_attr(el, "controls") != 0;
+  bool widget = is_video || controls;
   int text_pos = -1;
   if (widget) {
     if (W_run_nl < 1 && W_n > 0)
@@ -1463,7 +1467,7 @@ static void emit_lit(const char *s, unsigned char a)
   if (W_pend_sp) {
     if (W_n > 0 && W_run_nl == 0)
       W_n = text_put(W_n, ' ', 0);
-    W_pend_sp = 0;
+    W_pend_sp = false;
   }
   for (const char *p = s; *p; p++) {
     W_n = text_put(W_n, *p, a);
@@ -1621,7 +1625,7 @@ static void frame_render(struct frame_doc *f, int sbx)
   struct sty sv_sty = sty_cur;
   unsigned char sv_indent = W_indent;
   css_sheet *sv_sheet = g_sheet;
-  int sv_nav = g_link_nav;
+  bool sv_nav = g_link_nav;
   char sv_base[URL_MAX];
   {
     int k = 0;
@@ -1631,7 +1635,7 @@ static void frame_render(struct frame_doc *f, int sbx)
 
   /* A sandboxed frame may navigate only with allow-top-navigation/-popups; a
    * nested frame can never widen what an outer sandbox already forbade. */
-  int nav = !(sbx & SBX_ON) || (sbx & (SBX_TOP_NAV | SBX_POPUPS));
+  bool nav = !(sbx & SBX_ON) || (sbx & (SBX_TOP_NAV | SBX_POPUPS));
   g_link_nav = sv_nav && nav;
   g_sheet = f->sheet ? f->sheet : sv_sheet;
   W_indent = (W_indent < 7) ? (unsigned char)(W_indent + 1) : 7;
@@ -1747,13 +1751,13 @@ struct dom_node *html_focus(void) { return g_focus; }
 
 /* Set by the control emitters during the walk; lets the worker route content
  * clicks even on a script-less page so its form controls stay interactive. */
-static int g_has_controls;
+static bool g_has_controls;
 int html_has_controls(void) { return g_has_controls; }
 
-static int input_is_text(const char *type)
+static bool input_is_text(const char *type)
 {
   if (!type || !type[0])
-    return 1;
+    return true;
   return streq(type, "text") || streq(type, "search") || streq(type, "email") || streq(type, "url") ||
          streq(type, "tel") || streq(type, "password") || streq(type, "number");
 }
@@ -1838,7 +1842,7 @@ void html_radio_select(struct dom_node *c)
 void html_select_cycle(struct dom_node *sel)
 {
   struct dom_node *first = 0, *cur = 0, *nextopt = 0;
-  int take = 0;
+  bool take = false;
   for (struct dom_node *o = sel->first_child; o; o = o->next) {
     if (o->type != DOM_ELEMENT || !streq(o->tag, "option"))
       continue;
@@ -1846,11 +1850,11 @@ void html_select_cycle(struct dom_node *sel)
       first = o;
     if (take) {
       nextopt = o;
-      take = 0;
+      take = false;
     }
     if (dom_get_attr(o, "selected")) {
       cur = o;
-      take = 1;
+      take = true;
     }
   }
   if (!cur) {
@@ -1904,7 +1908,7 @@ struct dom_node *html_focus_edit(int ch)
 /* application/x-www-form-urlencoded component encoding: a space becomes '+' and
  * every byte outside the unreserved set is percent-encoded, so a value holding
  * '&', '=', ' ' or UTF-8 can't corrupt the field separators. */
-static int form_unreserved(unsigned char c)
+static bool form_unreserved(unsigned char c)
 {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
          c == '.' || c == '*';
@@ -1965,9 +1969,9 @@ static void form_fields(struct dom_node *n, char *q, int *qn, int cap, struct do
     const char *type = dom_get_attr(c, "type");
     if (name && name[0] &&
         (streq(tag, "input") || streq(tag, "select") || streq(tag, "textarea") || streq(tag, "button"))) {
-      int is_btn = streq(tag, "button")
-                       ? !(type && (streq(type, "reset") || streq(type, "button"))) /* default type=submit */
-                       : (type && (streq(type, "submit") || streq(type, "button") || streq(type, "reset")));
+      bool is_btn = streq(tag, "button")
+                        ? !(type && (streq(type, "reset") || streq(type, "button"))) /* default type=submit */
+                        : (type && (streq(type, "submit") || streq(type, "button") || streq(type, "reset")));
       if (is_btn) {
         /* Only the activated submit control is a successful field. */
         if (c == clicked && !(type && (streq(type, "button") || streq(type, "reset"))))
@@ -1991,7 +1995,8 @@ int html_form_build(struct dom_node *control, struct form_submission *fs)
   const char *action, *method, *enctype;
   char q[POST_BODY_MAX];
   int qn = 0, on = 0;
-  int is_post, enc;
+  bool is_post;
+  int enc;
   if (!form)
     return 0;
   fs->url[0] = '\0';
@@ -2079,7 +2084,7 @@ static void emit_input(struct dom_node *el)
     return;
   }
   if (type && (streq(type, "checkbox") || streq(type, "radio"))) {
-    int on = dom_get_attr(el, "checked") != 0;
+    bool on = dom_get_attr(el, "checked") != 0;
     if (streq(type, "radio"))
       emit_lit(on ? "(o)" : "( )", ST_BOLD);
     else
@@ -2093,7 +2098,7 @@ static void emit_input(struct dom_node *el)
     return;
   }
   {
-    int focused = (el == g_focus);
+    bool focused = (el == g_focus);
     emit_lit("[ ", ST_BOLD);
     if (val && val[0])
       emit_lit(val, 0);
@@ -2113,7 +2118,7 @@ static void emit_input(struct dom_node *el)
 static void emit_textarea(struct dom_node *el)
 {
   const char *val = dom_get_attr(el, "value");
-  int focused = (el == g_focus);
+  bool focused = (el == g_focus);
   emit_lit("[ ", ST_BOLD);
   if (val)
     emit_lit(val, 0);
@@ -2516,19 +2521,19 @@ static void walk_element_inner(struct dom_node *el)
     return;
   }
   if (streq(name, "input")) {
-    g_has_controls = 1;
+    g_has_controls = true;
     emit_input(el);
     return;
   }
   if (streq(name, "select")) {
-    g_has_controls = 1;
+    g_has_controls = true;
     emit_select(el);
     return;
   }
   if (streq(name, "button")) {
     struct sty sv = sty_cur;
     sty_cur.bold = 1;
-    g_has_controls = 1;
+    g_has_controls = true;
     emit_lit("[ ", ST_BOLD);
     walk(el);
     emit_lit(" ]", ST_BOLD);
@@ -2536,17 +2541,17 @@ static void walk_element_inner(struct dom_node *el)
     return;
   }
   if (streq(name, "textarea")) {
-    g_has_controls = 1;
+    g_has_controls = true;
     emit_textarea(el);
     return;
   }
   if (streq(name, "progress")) {
-    g_has_controls = 1;
+    g_has_controls = true;
     emit_progress(el);
     return;
   }
   if (streq(name, "meter")) {
-    g_has_controls = 1;
+    g_has_controls = true;
     emit_meter(el);
     return;
   }
@@ -2760,29 +2765,29 @@ static int g_n_css_url, g_css_url_cap;
 static const char *g_page_url;
 static res_batch_fn g_page_fetch; /* batch fetcher stashed for the deferred script pass */
 
-static int css_src_room(void) /* ensure one free slot in g_src */
+static bool css_src_room(void) /* ensure one free slot in g_src */
 {
   if (g_nsrc < g_src_cap)
-    return 1;
+    return true;
   int nc = g_src_cap ? g_src_cap * 2 : 16;
   struct css_src *n = realloc(g_src, (unsigned)nc * sizeof *n);
   if (!n)
-    return 0;
+    return false;
   g_src = n;
   g_src_cap = nc;
-  return 1;
+  return true;
 }
-static int css_url_room(void) /* ensure one free slot in g_css_url */
+static bool css_url_room(void) /* ensure one free slot in g_css_url */
 {
   if (g_n_css_url < g_css_url_cap)
-    return 1;
+    return true;
   int nc = g_css_url_cap ? g_css_url_cap * 2 : 8;
   char **n = realloc(g_css_url, (unsigned)nc * sizeof *n);
   if (!n)
-    return 0;
+    return false;
   g_css_url = n;
   g_css_url_cap = nc;
-  return 1;
+  return true;
 }
 
 static void src_inline(const char *text, int len)
@@ -2913,13 +2918,13 @@ static void scan_meta_csp(struct dom_node *node)
 
 /* Generic font-family keywords that resolve to the default proportional UI font
  * (we have no serif/cursive face, so they all map to the system sans). */
-static int fam_generic_default(const char *n)
+static bool fam_generic_default(const char *n)
 {
   return streq(n, "sans-serif") || streq(n, "serif") || streq(n, "system-ui") || streq(n, "ui-sans-serif") ||
          streq(n, "ui-serif") || streq(n, "ui-rounded") || streq(n, "cursive") || streq(n, "fantasy") ||
          streq(n, "-apple-system") || streq(n, "blinkmacsystemfont");
 }
-static int fam_monospace(const char *n) { return streq(n, "monospace") || streq(n, "ui-monospace"); }
+static bool fam_monospace(const char *n) { return streq(n, "monospace") || streq(n, "ui-monospace"); }
 
 /* Load a TTF from a local file into `slot` (so it's freed with the other
  * faces). Used to back the `monospace` generic with the shipped Liberation
@@ -2928,18 +2933,18 @@ static struct font *load_face_file(const char *path, struct loaded_face *slot)
 {
   struct statinfo st;
   if (stat(path, &st) < 0 || st.is_dir || st.size == 0)
-    return 0;
+    return false;
   unsigned char *buf = malloc(st.size);
   if (!buf)
-    return 0;
+    return false;
   if (readfile_at(path, 0, buf, st.size) != (int)st.size) {
     free(buf);
-    return 0;
+    return false;
   }
   struct font *f = font_load(buf, (int)st.size);
   if (!f) {
     free(buf);
-    return 0;
+    return false;
   }
   slot->data = buf;
   slot->font = f;
@@ -2959,7 +2964,7 @@ static struct font *load_face_file(const char *path, struct loaded_face *slot)
 /* Is `family` one of the comma-separated names in the font-family `stack`? Uses
  * the same naive split as the picker below, so the faces we fetch are exactly
  * the ones the picker could select. */
-static int family_in_stack(const char *stack, const char *family)
+static bool family_in_stack(const char *stack, const char *family)
 {
   const char *p = stack;
   while (*p) {
@@ -2973,27 +2978,27 @@ static int family_in_stack(const char *stack, const char *family)
     if (*p == ',')
       p++;
     if (name[0] && streq(name, family))
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 /* Ensure B->pg->faces holds `need` entries (grows on demand). render() reads
  * only B->pg->body_font, never the array, so the realloc is safe under
  * browser_buf_lock. */
-static int faces_room(int need)
+static bool faces_room(int need)
 {
   if (need <= B->pg->faces_cap)
-    return 1;
+    return true;
   int nc = B->pg->faces_cap ? B->pg->faces_cap : 4;
   while (nc < need)
     nc *= 2;
   struct loaded_face *n = realloc(B->pg->faces, (unsigned)nc * sizeof *n);
   if (!n)
-    return 0;
+    return false;
   B->pg->faces = n;
   B->pg->faces_cap = nc;
-  return 1;
+  return true;
 }
 
 static void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
@@ -3351,17 +3356,17 @@ static void layout_dom(void)
   W_listrev = 1;
   W_listdef = CSS_LST_DEFAULT;
   W_n = 0;
-  W_pend_sp = 0;
+  W_pend_sp = false;
   W_run_nl = 1;
   W_cur_link = -1;
   g_nspans = 0;
   g_nbg = 0;      /* url() backgrounds re-collected during this walk */
   layout_reset(); /* fresh box tree for this walk */
-  g_has_controls = 0;
+  g_has_controls = false;
   /* Reset the frame walk context to the top document (the cache itself persists
    * across relayouts; only the per-walk base/depth/nav reset here). */
   g_frame_depth = 0;
-  g_link_nav = 1;
+  g_link_nav = true;
   g_walk_depth = 0;
   {
     int k = 0;
@@ -3506,7 +3511,7 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
   g_n_css_url = 0;
 
   detect_meta_charset(); /* header charset (if any) already set by fetch.c */
-  g_csp_report = 1;      /* log CSP violations for this initial load only */
+  g_csp_report = true;   /* log CSP violations for this initial load only */
 
   struct dom_node *root = dom_parse(B->pg->raw, B->pg->raw_len);
   g_sheet = css_new();
@@ -3565,7 +3570,7 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
   } else {
     B->pg->text_len = 0;
   }
-  g_csp_report = 0; /* later relayouts re-decide silently (no log spam) */
+  g_csp_report = false; /* later relayouts re-decide silently (no log spam) */
   /* DOM + sheet + JS context are NOT freed here — they live until the next
    * navigation (html_page_teardown), so events keep working after load. */
 }

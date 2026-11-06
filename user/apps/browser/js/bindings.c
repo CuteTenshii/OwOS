@@ -12,6 +12,8 @@
  * yet — a known first-cut simplification. console output goes to stdout (fd 1);
  * timers (setTimeout/...) are accepted but do not fire (no event loop yet).
  */
+#include <stdbool.h>
+
 #include "../bmedia.h" /* HTMLMediaElement: <audio>/<video> + new Audio()      */
 #include "../cors.h"   /* cors_origin / cors_same_origin: SW scope + cache keys */
 #include "../jsint.h"  /* internal shared surface (engine ctx + helpers + A())  */
@@ -46,7 +48,7 @@ js_object *g_media_proto;       /* HTMLMediaElement.prototype (audio/video)  */
 struct html_iface {
   const char *name;
   const char *tags;
-  int media;
+  bool media;
   js_object *proto;
 };
 static struct html_iface g_html_ifaces[] = {
@@ -54,47 +56,47 @@ static struct html_iface g_html_ifaces[] = {
      * HTMLElement's, so <audio>/<video> inherit the media methods and
      * instanceof reflects the HTMLMediaElement base. Everything else chains
      * straight to HTMLElement. */
-    {"HTMLScriptElement", "script", 0, 0},
-    {"HTMLAnchorElement", "a", 0, 0},
-    {"HTMLImageElement", "img", 0, 0},
-    {"HTMLInputElement", "input", 0, 0},
-    {"HTMLButtonElement", "button", 0, 0},
-    {"HTMLFormElement", "form", 0, 0},
-    {"HTMLDivElement", "div", 0, 0},
-    {"HTMLSpanElement", "span", 0, 0},
-    {"HTMLParagraphElement", "p", 0, 0},
-    {"HTMLHeadingElement", "h1 h2 h3 h4 h5 h6", 0, 0},
-    {"HTMLUListElement", "ul", 0, 0},
-    {"HTMLOListElement", "ol", 0, 0},
-    {"HTMLLIElement", "li", 0, 0},
-    {"HTMLLinkElement", "link", 0, 0},
-    {"HTMLStyleElement", "style", 0, 0},
-    {"HTMLMetaElement", "meta", 0, 0},
-    {"HTMLTitleElement", "title", 0, 0},
-    {"HTMLHeadElement", "head", 0, 0},
-    {"HTMLBodyElement", "body", 0, 0},
-    {"HTMLHtmlElement", "html", 0, 0},
-    {"HTMLIFrameElement", "iframe", 0, 0},
-    {"HTMLCanvasElement", "canvas", 0, 0},
-    {"HTMLSelectElement", "select", 0, 0},
-    {"HTMLOptionElement", "option", 0, 0},
-    {"HTMLTextAreaElement", "textarea", 0, 0},
-    {"HTMLLabelElement", "label", 0, 0},
-    {"HTMLTableElement", "table", 0, 0},
-    {"HTMLTableRowElement", "tr", 0, 0},
-    {"HTMLTableCellElement", "td th", 0, 0},
-    {"HTMLTableSectionElement", "thead tbody tfoot", 0, 0},
-    {"HTMLPreElement", "pre", 0, 0},
-    {"HTMLBRElement", "br", 0, 0},
-    {"HTMLHRElement", "hr", 0, 0},
-    {"HTMLSourceElement", "source", 0, 0},
-    {"HTMLTemplateElement", "template", 0, 0},
-    {"HTMLPictureElement", "picture", 0, 0},
-    {"HTMLDataListElement", "datalist", 0, 0},
-    {"HTMLProgressElement", "progress", 0, 0},
-    {"HTMLObjectElement", "object", 0, 0},
-    {"HTMLVideoElement", "video", 1, 0},
-    {"HTMLAudioElement", "audio", 1, 0},
+    {"HTMLScriptElement", "script", false, 0},
+    {"HTMLAnchorElement", "a", false, 0},
+    {"HTMLImageElement", "img", false, 0},
+    {"HTMLInputElement", "input", false, 0},
+    {"HTMLButtonElement", "button", false, 0},
+    {"HTMLFormElement", "form", false, 0},
+    {"HTMLDivElement", "div", false, 0},
+    {"HTMLSpanElement", "span", false, 0},
+    {"HTMLParagraphElement", "p", false, 0},
+    {"HTMLHeadingElement", "h1 h2 h3 h4 h5 h6", false, 0},
+    {"HTMLUListElement", "ul", false, 0},
+    {"HTMLOListElement", "ol", false, 0},
+    {"HTMLLIElement", "li", false, 0},
+    {"HTMLLinkElement", "link", false, 0},
+    {"HTMLStyleElement", "style", false, 0},
+    {"HTMLMetaElement", "meta", false, 0},
+    {"HTMLTitleElement", "title", false, 0},
+    {"HTMLHeadElement", "head", false, 0},
+    {"HTMLBodyElement", "body", false, 0},
+    {"HTMLHtmlElement", "html", false, 0},
+    {"HTMLIFrameElement", "iframe", false, 0},
+    {"HTMLCanvasElement", "canvas", false, 0},
+    {"HTMLSelectElement", "select", false, 0},
+    {"HTMLOptionElement", "option", false, 0},
+    {"HTMLTextAreaElement", "textarea", false, 0},
+    {"HTMLLabelElement", "label", false, 0},
+    {"HTMLTableElement", "table", false, 0},
+    {"HTMLTableRowElement", "tr", false, 0},
+    {"HTMLTableCellElement", "td th", false, 0},
+    {"HTMLTableSectionElement", "thead tbody tfoot", false, 0},
+    {"HTMLPreElement", "pre", false, 0},
+    {"HTMLBRElement", "br", false, 0},
+    {"HTMLHRElement", "hr", false, 0},
+    {"HTMLSourceElement", "source", false, 0},
+    {"HTMLTemplateElement", "template", false, 0},
+    {"HTMLPictureElement", "picture", false, 0},
+    {"HTMLDataListElement", "datalist", false, 0},
+    {"HTMLProgressElement", "progress", false, 0},
+    {"HTMLObjectElement", "object", false, 0},
+    {"HTMLVideoElement", "video", true, 0},
+    {"HTMLAudioElement", "audio", true, 0},
 };
 static js_object *g_custom_elements;       /* registry: tag name -> class constructor   */
 static js_object *g_module_cache;          /* ES module registry: abs URL -> namespace */
@@ -126,7 +128,7 @@ char g_page_url_buf[URL_MAX]; /* the page URL (module-resolution referrer)  */
  * run), so registered listeners + closures survive until the next navigation.
  * These hold that persistent state; html_page_teardown() reclaims it. */
 static js_object *g_live_wrappers; /* rooted array pinning every node wrapper */
-static int g_has_listeners;        /* any addEventListener fired this page      */
+static bool g_has_listeners;       /* any addEventListener fired this page      */
 int g_page_live;                   /* a page context is currently alive         */
 static js_arena **g_arenas;        /* per-script AST arenas (closures need them); grows */
 static int g_narenas, g_arenas_cap;
@@ -141,7 +143,7 @@ static int g_narenas, g_arenas_cap;
  * the page's peak concurrent-timer count. */
 static js_object *g_timers; /* rooted: slot -> [callback, ...args] or null */
 static struct timer_meta {
-  unsigned char active, repeat, raf;
+  bool active, repeat, raf;
   long long due, period; /* ms; due is the next fire time (now_ms scale) */
   char *async;           /* frames captured at the arming call site, so a
                           * throw in the callback names who scheduled it
@@ -152,7 +154,7 @@ static int g_ntimers; /* active count (fast empty-check for the pump) */
 
 /* ------------------------------------------------------- small buffer ----- */
 
-static int sb_need(sbuf *s, int extra)
+static bool sb_need(sbuf *s, int extra)
 {
   if (s->n + extra + 1 > s->cap) {
     int c = s->cap ? s->cap * 2 : 128;
@@ -161,12 +163,12 @@ static int sb_need(sbuf *s, int extra)
     char *b = (char *)realloc(s->b, (unsigned)c);
     if (!b) {
       s->failed = 1;
-      return 0;
+      return false;
     }
     s->b = b;
     s->cap = c;
   }
-  return 1;
+  return true;
 }
 void sb_putc(sbuf *s, char c)
 {
@@ -216,7 +218,7 @@ struct dom_node *node_of(js_value v)
  * on. Every wrapper is pinned in g_live_wrappers so its listener closures
  * survive GC for the page. */
 /* whole-word match of `tag` within the space-separated `list` */
-static int tag_in_list(const char *list, const char *tag)
+static bool tag_in_list(const char *list, const char *tag)
 {
   int tl = strlen(tag);
   const char *p = list;
@@ -225,11 +227,11 @@ static int tag_in_list(const char *list, const char *tag)
     while (*p && *p != ' ')
       p++;
     if (p - s == tl && memcmp_js(s, tag, tl) == 0)
-      return 1;
+      return true;
     while (*p == ' ')
       p++;
   }
-  return 0;
+  return false;
 }
 
 /* interface prototype for an element tag, or NULL for a plain HTMLElement */
@@ -542,7 +544,7 @@ static js_value cl_toggle(js_ctx *ctx, js_value t, js_value *args, int argc)
     return js_bool(0);
   present = classlist_has(cl_class_of(t), tok, tl);
   if (argc >= 2) {
-    int force = js_to_boolean(args[1]);
+    bool force = js_to_boolean(args[1]);
     if (force && !present)
       cl_write_add(n, tok, tl);
     else if (!force && present)
@@ -829,12 +831,12 @@ static js_value el_rm_attr(js_ctx *ctx, js_value t, js_value *args, int argc)
  * fetch+run, the way a browser does. Defined near the page runner;
  * forward-declared here. */
 static void run_inserted_script(struct dom_node *node);
-static int node_connected(struct dom_node *n)
+static bool node_connected(struct dom_node *n)
 {
   for (; n; n = n->parent)
     if (n == g_doc_root)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 static js_value el_append(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -914,7 +916,7 @@ static js_value el_children(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t), *c;
   js_object *arr;
-  int elems_only = 1;
+  bool elems_only = true;
   (void)args;
   (void)argc;
   gc_push_scope();
@@ -932,12 +934,12 @@ static js_value el_children(js_ctx *ctx, js_value t, js_value *args, int argc)
  * css_apply_inline already folds in at layout time. So `el.style.color='red'`
  * (or setProperty) actually restyles the page on the next render. */
 
-static int is_sp(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
-static int span_ci_eq(const char *s, const char *e, const char *lit)
+static bool is_sp(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
+static bool span_ci_eq(const char *s, const char *e, const char *lit)
 {
   while (s < e && *lit) {
     if (lower(*s) != lower(*lit))
-      return 0;
+      return false;
     s++;
     lit++;
   }
@@ -1558,7 +1560,8 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
   char url[URL_MAX], method[16], req_ctype[64], resp_ctype[160];
   char extra_hdrs[1024];
   const char *reqbody = 0;
-  int reqlen = 0, status = 0, outlen = 0, eh = 0, with_creds = 0;
+  int reqlen = 0, status = 0, outlen = 0, eh = 0;
+  bool with_creds = false;
   unsigned char *body;
   js_object *resp;
   js_value rv;
@@ -1598,7 +1601,7 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
                                                             "same-origin" doesn't) */
       js_value cr = js_get(ctx, A(1), "credentials");
       if (cr.type == JV_STR && streq(cr.u.str->data, "include"))
-        with_creds = 1;
+        with_creds = true;
     }
     /* Request headers: a plain { name: value } object (a Headers instance is a
      * plain object here too). Content-Type folds into the body's ctype slot to
@@ -1808,7 +1811,7 @@ static js_value el_query_all(js_ctx *ctx, js_value t, js_value *args, int argc)
   gc_pop_scope();
   return js_obj_value(arr);
 }
-static int node_matches_sel(struct dom_node *n, const char *sel) { return js_dom_matches(n, sel); }
+static bool node_matches_sel(struct dom_node *n, const char *sel) { return js_dom_matches(n, sel); }
 static js_value el_matches(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -2371,7 +2374,7 @@ static void sp_rebuild(js_ctx *ctx, js_value t, const char *name, int keepfirst,
 {
   js_object *ka = sp_arr(ctx, t, "@k"), *va = sp_arr(ctx, t, "@v"), *nk, *nv;
   unsigned i, n;
-  int seen = 0;
+  bool seen = false;
   if (!ka || !va)
     return;
   gc_push_scope();
@@ -2380,9 +2383,9 @@ static void sp_rebuild(js_ctx *ctx, js_value t, const char *name, int keepfirst,
   n = js_array_len(ka);
   for (i = 0; i < n; i++) {
     js_value k = js_get_index(ctx, js_obj_value(ka), i);
-    int match = k.type == JV_STR && streq(k.u.str->data, name);
+    bool match = k.type == JV_STR && streq(k.u.str->data, name);
     if (match && keepfirst && !seen) {
-      seen = 1;
+      seen = true;
       js_array_push(ctx, nk, k);
       js_array_push(ctx, nv, repl);
     } else if (!match) {
@@ -2485,8 +2488,8 @@ static void fd_collect(js_ctx *ctx, struct dom_node *n, js_object *ka, js_object
       const char *tag = c->tag, *name = dom_get_attr(c, "name");
       const char *type = dom_get_attr(c, "type");
       if (name && name[0] && (streq(tag, "input") || streq(tag, "select") || streq(tag, "textarea"))) {
-        int skip = type && (streq(type, "submit") || streq(type, "button") || streq(type, "reset") ||
-                            streq(type, "file") || streq(type, "image"));
+        bool skip = type && (streq(type, "submit") || streq(type, "button") || streq(type, "reset") ||
+                             streq(type, "file") || streq(type, "image"));
         if (!skip) {
           if (type && (streq(type, "checkbox") || streq(type, "radio"))) {
             if (dom_get_attr(c, "checked")) {
@@ -2918,7 +2921,7 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
 
 /* Dispatch `ev` starting at wrapper `startobj` (its host node anchors the
  * path). Returns 1 if a listener called preventDefault. */
-static int dispatch_from(js_object *startobj, js_value ev)
+static bool dispatch_from(js_object *startobj, js_value ev)
 {
   js_object *path[128];
   int np = 0, i;
@@ -2979,7 +2982,7 @@ static js_value ev_stop(js_ctx *ctx, js_value t, js_value *args, int argc)
 js_value make_event(const char *type, int x, int y, js_value init)
 {
   js_object *e;
-  int bubbles = 1, cancelable = 1;
+  bool bubbles = true, cancelable = true;
   js_value detail = js_undef();
   if (init.type == JV_OBJ) {
     js_value b = js_get(g_ctx, init, "bubbles");
@@ -3013,7 +3016,7 @@ js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   char type[64];
   js_value fn = A(1);
-  int capture = 0;
+  bool capture = false;
   if (t.type != JV_OBJ || !js_is_callable(fn))
     return js_undef();
   strlcpy(type, arg_str(ctx, A(0)), sizeof type);
@@ -3039,7 +3042,7 @@ js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
     js_array_push(ctx, list, js_obj_value(e));
   }
   gc_pop_scope();
-  g_has_listeners = 1;
+  g_has_listeners = true;
   return js_undef();
 }
 js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -3048,7 +3051,7 @@ js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_value fn = A(1);
   js_object *list, *nl;
   unsigned i, n;
-  int capture = 0;
+  bool capture = false;
   if (t.type != JV_OBJ)
     return js_undef();
   strlcpy(type, arg_str(ctx, A(0)), sizeof type);
@@ -3072,8 +3075,8 @@ js_value el_remove_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
   for (i = 0; i < n; i++) {
     js_value e = js_get_index(ctx, js_obj_value(list), i);
     js_value ty = js_get(ctx, e, "type"), ef = js_get(ctx, e, "fn");
-    int ec = js_to_boolean(js_get(ctx, e, "capture"));
-    int match = ty.type == JV_STR && streq(ty.u.str->data, type) && js_strict_eq(ef, fn) && ec == capture;
+    bool ec = js_to_boolean(js_get(ctx, e, "capture"));
+    bool match = ty.type == JV_STR && streq(ty.u.str->data, type) && js_strict_eq(ef, fn) && ec == capture;
     if (!match)
       js_array_push(ctx, nl, e);
   }
@@ -3140,7 +3143,7 @@ static js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
 int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int y)
 {
   js_value tgt, ev;
-  int prevented;
+  bool prevented;
   if (!g_page_live || !target)
     return 0;
   gc_push_scope();
@@ -3178,13 +3181,13 @@ static js_value htmlelement_ctor(js_ctx *ctx, js_value thisv, js_value *args, in
   return js_undef();
 }
 
-static int ce_is_upgraded(js_object *w) { return w && pmap_find_pub(w, "@ce") != 0; }
-static int ce_connected(struct dom_node *n)
+static bool ce_is_upgraded(js_object *w) { return w && pmap_find_pub(w, "@ce") != 0; }
+static bool ce_connected(struct dom_node *n)
 {
   for (; n; n = n->parent)
     if (n == g_doc_root)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 static js_value ce_lookup(const char *tag)
 {
@@ -3284,7 +3287,7 @@ static void ce_attr_changed(struct dom_node *n, const char *name, const char *ol
   js_object *w = n ? (js_object *)n->wrapper : 0;
   js_value ctor, obs;
   unsigned i, len;
-  int observed = 0;
+  bool observed = false;
   if (!w || !ce_is_upgraded(w))
     return;
   ctor = js_get(g_ctx, js_obj_value(w), "constructor");
@@ -3297,7 +3300,7 @@ static void ce_attr_changed(struct dom_node *n, const char *name, const char *ol
   for (i = 0; i < len; i++) {
     js_value e = js_get_index(g_ctx, obs, i);
     if (e.type == JV_STR && streq(e.u.str->data, name)) {
-      observed = 1;
+      observed = true;
       break;
     }
   }
@@ -3435,23 +3438,23 @@ static js_node *module_compile(const char *code, const char *url)
 /* True if the identifier word `w` (with a word boundary before it) ends at `q`,
  * skipping whitespace — used to spot `from '…'` / `import '…'` specifiers. */
 static char *sdup(const char *s); /* defined below */
-static int mod_word_before(const char *src, const char *q, const char *w)
+static bool mod_word_before(const char *src, const char *q, const char *w)
 {
   const char *e = q;
   while (e > src && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r'))
     e--;
   int wl = (int)strlen(w);
   if (e - src < wl)
-    return 0;
+    return false;
   for (int i = 0; i < wl; i++)
     if (e[-wl + i] != w[i])
-      return 0;
+      return false;
   if (e - src > wl) {
     char c = e[-wl - 1];
     if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9'))
-      return 0;
+      return false;
   }
-  return 1;
+  return true;
 }
 
 /* Scan a module's source for its static import specifiers and batch-fetch the
@@ -3487,10 +3490,10 @@ static void module_prefetch_deps(const char *base, const char *src)
       char abs[URL_MAX];
       resolve_url(base, spec, abs, sizeof abs);
       if (!pmap_find_pub(g_module_src, abs) && !pmap_find_pub(g_module_cache, abs)) {
-        int dup = 0;
+        bool dup = false;
         for (int i = 0; i < n; i++)
           if (streq(urls[i], abs)) {
-            dup = 1;
+            dup = true;
             break;
           }
         if (!dup)
@@ -3607,7 +3610,7 @@ void def_acc(js_object *proto, const char *name, js_native get, js_native set)
 /* Register a timer; returns its id (slot+1), or 0 if the table is full or the
  * callback isn't callable. `raf` requests requestAnimationFrame semantics (the
  * callback is invoked with a single timestamp argument). */
-static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int delay, int repeat, int raf)
+static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int delay, bool repeat, bool raf)
 {
   int i, k;
   if (!g_timers || !js_is_callable(cb))
@@ -3621,7 +3624,7 @@ static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int 
     if (!nt)
       return 0;
     for (k = g_tcap; k < nc; k++) {
-      nt[k].active = nt[k].repeat = nt[k].raf = 0;
+      nt[k].active = nt[k].repeat = nt[k].raf = false;
       nt[k].due = nt[k].period = 0;
     }
     g_tmeta = nt;
@@ -3636,9 +3639,9 @@ static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int 
     js_set_index(ctx, js_obj_value(g_timers), (unsigned)i, js_obj_value(bundle));
   }
   gc_pop_scope();
-  g_tmeta[i].active = 1;
-  g_tmeta[i].repeat = repeat ? 1 : 0;
-  g_tmeta[i].raf = raf ? 1 : 0;
+  g_tmeta[i].active = true;
+  g_tmeta[i].repeat = repeat;
+  g_tmeta[i].raf = raf;
   g_tmeta[i].period = delay < 0 ? 0 : delay;
   g_tmeta[i].due = now_ms() + g_tmeta[i].period;
   g_tmeta[i].async = js_async_capture(ctx); /* who armed this timer */
@@ -3649,7 +3652,7 @@ static void timer_drop(int i)
 {
   if (i < 0 || i >= g_tcap || !g_tmeta[i].active)
     return;
-  g_tmeta[i].active = 0;
+  g_tmeta[i].active = false;
   if (g_tmeta[i].async) {
     free(g_tmeta[i].async);
     g_tmeta[i].async = 0;
@@ -3663,18 +3666,18 @@ static js_value win_set_timeout(js_ctx *ctx, js_value t, js_value *args, int arg
 {
   int delay = argc > 1 ? (int)js_to_number(ctx, args[1]) : 0;
   (void)t;
-  return js_number(timer_add(ctx, A(0), args + (argc > 2 ? 2 : argc), argc > 2 ? argc - 2 : 0, delay, 0, 0));
+  return js_number(timer_add(ctx, A(0), args + (argc > 2 ? 2 : argc), argc > 2 ? argc - 2 : 0, delay, false, false));
 }
 static js_value win_set_interval(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   int delay = argc > 1 ? (int)js_to_number(ctx, args[1]) : 0;
   (void)t;
-  return js_number(timer_add(ctx, A(0), args + (argc > 2 ? 2 : argc), argc > 2 ? argc - 2 : 0, delay, 1, 0));
+  return js_number(timer_add(ctx, A(0), args + (argc > 2 ? 2 : argc), argc > 2 ? argc - 2 : 0, delay, true, false));
 }
 static js_value win_request_anim(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
-  return js_number(timer_add(ctx, A(0), 0, 0, 16, 0, 1)); /* ~one 60fps frame */
+  return js_number(timer_add(ctx, A(0), 0, 0, 16, false, true)); /* ~one 60fps frame */
 }
 static js_value win_clear_timer(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -3715,9 +3718,9 @@ int js_timers_pump(void)
       for (k = 1; k < bl && nargs < 8; k++)
         argv[nargs++] = js_get_index(g_ctx, bundle, k);
     }
-    int raf = g_tmeta[i].raf;
+    bool raf = g_tmeta[i].raf;
     char *async = g_tmeta[i].async; /* scheduling-site frames; realloc-safe local */
-    int oneshot = !g_tmeta[i].repeat;
+    bool oneshot = !g_tmeta[i].repeat;
     if (g_tmeta[i].repeat)
       g_tmeta[i].due = now + g_tmeta[i].period; /* reschedule from now (no drift pileup) */
     else {
@@ -4077,7 +4080,7 @@ static js_value ws_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 
   gc_push_scope();
   o = (js_object *)gc_keep(js_new_object(ctx, g_ws_proto));
-  int ws_blocked = 0;
+  bool ws_blocked = false;
   if (B->pg->csp) { /* CSP connect-src (ws->http for matching) */
     char norm[URL_MAX], use[URL_MAX], reason[64];
     int k = 0;
@@ -4093,7 +4096,7 @@ static js_value ws_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
     }
     if (!csp_check_url(B->pg->csp, CSP_CONNECT, norm, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
       js_csp_log("WebSocket to", url, reason);
-      ws_blocked = 1;
+      ws_blocked = true;
     }
   }
   c = ws_blocked ? 0 : ws_open(url, protos[0] ? protos : 0); /* blocks for connect + handshake */
@@ -4358,7 +4361,7 @@ static js_value geo_watch(js_ctx *ctx, js_value t, js_value *args, int argc)
 static js_value md_get_user_media(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value c = A(0);
-  int want_audio = 0, want_video = 0;
+  bool want_audio = false, want_video = false;
   (void)t;
   if (c.type == JV_OBJ) {
     want_audio = js_to_boolean(js_get(ctx, c, "audio"));
@@ -4561,7 +4564,7 @@ static js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc)
     hdrs = h.type == JV_STR ? h.u.str->data : 0;
   }
   {
-    int with_creds = js_to_boolean(js_get(ctx, t, "withCredentials"));
+    bool with_creds = js_to_boolean(js_get(ctx, t, "withCredentials"));
     struct http_req rq = {0};
     struct http_resp rs = {0};
     rq.url = url;
@@ -4913,7 +4916,7 @@ static js_value nav_sendbeacon(js_ctx *ctx, js_value t, js_value *args, int argc
 /* ------------------------------------------------- Async Clipboard API */
 
 /* clip_get tags every clip with a MIME type; readText() only surfaces text. */
-static int clip_mime_is_text(const char *m)
+static bool clip_mime_is_text(const char *m)
 {
   return m[0] == 't' && m[1] == 'e' && m[2] == 'x' && m[3] == 't' && m[4] == '/';
 }
@@ -5505,7 +5508,7 @@ static js_value make_storage(js_ctx *ctx)
  * report a known property as supported, matching the style-object behaviour).
  * `selector(...)` conditions report false (no selector-support detection yet).
  */
-static int ci_has(const char *hay, const char *needle); /* defined below */
+static bool ci_has(const char *hay, const char *needle); /* defined below */
 static void css_norm(const char *s, char *out, int cap)
 {
   int o = 0; /* lowercase, strip dashes */
@@ -5517,24 +5520,24 @@ static void css_norm(const char *s, char *out, int cap)
   }
   out[o] = 0;
 }
-static int css_prop_known(const char *prop)
+static bool css_prop_known(const char *prop)
 {
   /* The table is a compile-time constant, so normalize it once and reuse. */
   static char norm_props[sizeof k_css_props / sizeof k_css_props[0]][64];
-  static int norm_built;
+  static bool norm_built;
   char pn[64];
   css_norm(prop, pn, sizeof pn);
   if (!pn[0])
-    return 0;
+    return false;
   if (!norm_built) {
     for (unsigned i = 0; i < sizeof k_css_props / sizeof k_css_props[0]; i++)
       css_norm(k_css_props[i], norm_props[i], sizeof norm_props[i]);
-    norm_built = 1;
+    norm_built = true;
   }
   for (unsigned i = 0; i < sizeof k_css_props / sizeof k_css_props[0]; i++)
     if (streq(pn, norm_props[i]))
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 static js_value css_supports(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -6386,14 +6389,14 @@ void report_exc(js_ctx *ctx)
   sb.b = 0;
   sb.n = 0;
   sb.cap = 0;
-  int have_stack = 0;
+  bool have_stack = false;
   ctx->has_exc = 0;
   sb_puts(&sb, "[js] uncaught ");
   if (e.type == JV_OBJ) {
     js_value stk = js_get(ctx, e, "stack");
     if (stk.type == JV_STR && stk.u.str->len) { /* name: msg + frames */
       sb_puts(&sb, stk.u.str->data);            /* stack ends in '\n' */
-      have_stack = 1;
+      have_stack = true;
     } else {
       js_value nm = js_get(ctx, e, "name"), msg = js_get(ctx, e, "message");
       if (nm.type == JV_STR)
@@ -6515,7 +6518,7 @@ void js_repl_run(const char *src)
 }
 
 /* ci substring test, for the <script type=...> filter */
-static int ci_has(const char *hay, const char *needle)
+static bool ci_has(const char *hay, const char *needle)
 {
   int nl = strlen(needle);
   for (; *hay; hay++) {
@@ -6523,26 +6526,26 @@ static int ci_has(const char *hay, const char *needle)
     while (i < nl && lower(hay[i]) == lower(needle[i]))
       i++;
     if (i == nl)
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
-static int script_is_module(struct dom_node *s)
+static bool script_is_module(struct dom_node *s)
 {
   const char *type = dom_get_attr(s, "type");
   return type && ci_has(type, "module");
 }
-static int script_is_js(struct dom_node *s)
+static bool script_is_js(struct dom_node *s)
 {
   const char *type = dom_get_attr(s, "type");
   if (!type || !*type)
-    return 1;
+    return true;
   if (ci_has(type, "module"))
-    return 0; /* handled as a module instead    */
+    return false; /* handled as a module instead    */
   return ci_has(type, "javascript") || ci_has(type, "ecmascript");
 }
 
-static int script_node(struct dom_node *c)
+static bool script_node(struct dom_node *c)
 {
   return c->type == DOM_ELEMENT && streq(c->tag, "script") && (script_is_js(c) || script_is_module(c));
 }
@@ -6606,7 +6609,7 @@ static void run_inserted_script(struct dom_node *node)
   js_arena *ar;
   js_parse_error pe;
   js_node *prog;
-  int is_module;
+  bool is_module;
 
   if (!g_page_live || !g_ctx || !node || node->type != DOM_ELEMENT)
     return;
@@ -6756,17 +6759,17 @@ static void fire_lifecycle(void)
  * plus every module — after them, still in document order. `async` overrides
  * defer/module (runs in pass 0); defer/async are ignored on inline non-module
  * scripts. */
-static int script_deferred(struct dom_node *s)
+static bool script_deferred(struct dom_node *s)
 {
   const char *src = dom_get_attr(s, "src");
-  int external = src && *src;
+  bool external = src && *src;
   if (external && dom_get_attr(s, "async"))
-    return 0; /* async: first pass, as-fetched */
+    return false; /* async: first pass, as-fetched */
   if (script_is_module(s))
-    return 1; /* modules default to deferred    */
+    return true; /* modules default to deferred    */
   if (external && dom_get_attr(s, "defer"))
-    return 1; /* defer: external scripts only   */
-  return 0;
+    return true; /* defer: external scripts only   */
+  return false;
 }
 
 void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn fetch)
@@ -6849,7 +6852,7 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
   g_ctx->now_ms = now_ms;
   js_set_stack_limit(g_ctx, browser_js_stack_floor()); /* bound recursion to the worker stack */
   js_set_script(g_ctx, g_cur_script);                  /* origin frame for captured stacks */
-  g_has_listeners = 0;
+  g_has_listeners = false;
   setup_dom(g_ctx, page_url);
   g_fetch = fetch; /* the loader uses it for modules */
   strlcpy(g_page_url_buf, page_url ? page_url : "", sizeof g_page_url_buf);
@@ -7100,7 +7103,7 @@ void js_page_end(void)
   for (i = 0; i < g_nparsed; i++)
     dom_free(g_parsed[i]); /* DOMParser trees */
   g_nparsed = 0;
-  g_has_listeners = 0;
+  g_has_listeners = false;
   g_page_live = 0;
   g_doc_root = 0;
 }

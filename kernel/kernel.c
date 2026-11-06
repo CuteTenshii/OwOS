@@ -163,22 +163,22 @@ static void boot_bringup(void)
 /* True if the NUL-terminated command line `s` contains the whitespace-delimited
  * token `tok` (so "verbose" matches "ro verbose quiet" but not "verbosely").
  * Used to read boot flags like `verbose` off the kernel command line. */
-static int cmdline_has(const char *s, const char *tok)
+static bool cmdline_has(const char *s, const char *tok)
 {
   if (!s)
-    return 0;
+    return false;
   for (;;) {
     while (*s == ' ' || *s == '\t')
       s++;
     if (*s == '\0')
-      return 0;
+      return false;
     const char *a = s, *b = tok;
     while (*a && *a != ' ' && *a != '\t' && *a == *b) {
       a++;
       b++;
     }
     if (*b == '\0' && (*a == '\0' || *a == ' ' || *a == '\t'))
-      return 1;
+      return true;
     while (*s && *s != ' ' && *s != '\t') /* skip to the next token       */
       s++;
   }
@@ -199,7 +199,7 @@ static struct multiboot_info *multiboot2_to_info(uintptr_t info_addr)
     mz[i] = 0;
 
   int mmap_used = 0;
-  int uefi = 0;
+  bool uefi = false;
   /* The info block starts with total_size + reserved (8 bytes), then tags. */
   uint8_t *p = (uint8_t *)(uintptr_t)info_addr + 8;
   for (;;) {
@@ -247,10 +247,10 @@ static struct multiboot_info *multiboot2_to_info(uintptr_t info_addr)
       /* GRUB only hands us an EFI system-table tag on a UEFI boot;
        * legacy BIOS / CSM carries none. Its configuration-table array
        * is how we reach SMBIOS under UEFI (smbios.c). */
-      uefi = 1;
+      uefi = true;
       smbios_set_efi(((struct mb2_tag_efi32 *)p)->pointer, 0);
     } else if (tag->type == MB2_TAG_EFI64) {
-      uefi = 1;
+      uefi = true;
       smbios_set_efi(((struct mb2_tag_efi64 *)p)->pointer, 1);
     } else if (tag->type == MB2_TAG_SMBIOS) {
       /* The SMBIOS entry point. On UEFI the "_SM_"/"_SM3_" anchor is

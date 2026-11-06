@@ -2,6 +2,7 @@
 #ifndef OWOS_PAGING_H
 #define OWOS_PAGING_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 void paging_init(void);
@@ -25,18 +26,18 @@ uint32_t *paging_fork_dir(uint32_t *parent);
 
 /* Resolve a write fault on a copy-on-write user page. Returns 1 when the fault
  * was handled and the instruction may be retried. */
-int paging_handle_page_fault(uint32_t vaddr, uint32_t error);
+bool paging_handle_page_fault(uint32_t vaddr, uint32_t error);
 
 /* Physical frame backing a mapped user virtual address (0 if not mapped). */
 uint32_t paging_user_phys(uint32_t *dir, uint32_t vaddr);
 
 /* 1 if vaddr is a present user page in the current address space (safe probe).
  */
-int paging_user_mapped(uint32_t vaddr);
+bool paging_user_mapped(uint32_t vaddr);
 
 /* Validate every page in a current-process user range. `write` also requires
  * the page mappings to be writable. */
-int paging_user_range(uint32_t vaddr, uint32_t len, int write);
+bool paging_user_range(uint32_t vaddr, uint32_t len, bool write);
 
 /* Identity-map [phys, phys+len) into the current address space so the kernel
  * can read firmware tables (e.g. ACPI) that sit above the 16 MiB identity map.

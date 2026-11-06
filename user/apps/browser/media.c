@@ -39,7 +39,7 @@
 #define MEV_ERROR 0x80
 
 struct media_el {
-  int in_use;
+  bool in_use;
   void *owner;               /* the struct page that created it          */
   struct dom_node *node;     /* the <audio>/<video> element              */
   struct dom_node *detached; /* a node WE created (new Audio), to free    */
@@ -47,26 +47,26 @@ struct media_el {
 
   char src[URL_MAX]; /* resolved absolute current source ("" = none) */
   char poster[URL_MAX];
-  int controls, autoplay, loop, muted, preload_none;
+  bool controls, autoplay, loop, muted, preload_none;
   int volume; /* 0..1000 (milli-units of HTMLMediaElement) */
 
-  int registered;      /* first walk done: keep JS-mutated state     */
+  bool registered;     /* first walk done: keep JS-mutated state     */
   int text_pos;        /* widget anchor offset, or -1 = no widget   */
   int start_row, rows; /* widget placement (main.c rewrap)          */
 
   struct media_source *ms; /* mixer source once loaded                  */
   char file[64];           /* temp owofs path the media is fetched to   */
   volatile int net;        /* MNS_* network state                       */
-  volatile int fetching;   /* loader thread is on this slot             */
-  int want_play;           /* play requested before the source existed  */
+  volatile bool fetching;  /* loader thread is on this slot             */
+  bool want_play;          /* play requested before the source existed  */
   unsigned start_ms;       /* pending currentTime applied on load       */
   int load_gen;            /* bumped per src change (stale-load guard)   */
 
   volatile unsigned ev; /* queued MEV_* bits (worker drains)         */
-  int reported_meta;
-  int reported_ended;
-  int playing_state; /* last play/pause we told script about      */
-  unsigned last_tu;  /* msec of the last timeupdate               */
+  bool reported_meta;
+  bool reported_ended;
+  bool playing_state; /* last play/pause we told script about      */
+  unsigned last_tu;   /* msec of the last timeupdate               */
 
   /* --- <video> picture path (user/lib/media media_video). Decoded on the video
    * thread into a double buffer so the main thread never stalls on a frame. ---
@@ -75,13 +75,13 @@ struct media_el {
   int vw, vh;             /* native frame size                         */
   unsigned char *vbuf[2]; /* two native RGB (vw*vh*3) frame buffers    */
   volatile int vfront;    /* index of the displayable buffer           */
-  volatile int vshown;    /* vfront holds a real (not blank) frame     */
-  int vpending;           /* a decoded frame waits in vbuf[1-vfront]   */
+  volatile bool vshown;   /* vfront holds a real (not blank) frame     */
+  bool vpending;          /* a decoded frame waits in vbuf[1-vfront]   */
   unsigned vpending_pts;  /* its presentation time                     */
-  volatile int vplaying;
-  volatile int vended;
-  volatile int vbusy;      /* video thread is mid-decode on this slot   */
-  volatile int vgone;      /* disposal requested; thread must not touch */
+  volatile bool vplaying;
+  volatile bool vended;
+  volatile bool vbusy;     /* video thread is mid-decode on this slot   */
+  volatile bool vgone;     /* disposal requested; thread must not touch */
   long long vclock_origin; /* msec() - position, when self-clocking     */
   long long vpos_ms;       /* shown video position                      */
   unsigned vdur_ms;
@@ -115,7 +115,7 @@ static void apply_audio_params(struct media_el *m)
 
 /* ---- the loader thread: fetch + open one source at a time ---------------- */
 static char g_loader_stack[131072];
-static volatile int g_loader_started;
+static volatile bool g_loader_started;
 
 /* Claim the next slot waiting to load (MNS_LOADING, no source yet). */
 static struct media_el *loader_pick(void)
@@ -126,7 +126,7 @@ static struct media_el *loader_pick(void)
   for (i = 0; i < MEDIA_MAX; i++) {
     struct media_el *m = &g_media[i];
     if (m->in_use && m->net == MNS_LOADING && !m->fetching && !m->ms && !m->vid && m->src[0]) {
-      m->fetching = 1;
+      m->fetching = true;
       job = m;
       break;
     }
@@ -211,9 +211,9 @@ static void loader_run(struct media_el *job)
       job->vbuf[1] = vb1;
       job->vdur_ms = vdur;
       job->vfront = 0;
-      job->vshown = 0;
-      job->vpending = 0;
-      job->vended = 0;
+      job->vshown = false;
+      job->vpending = false;
+      job->vended = false;
     }
     job->net = MNS_IDLE;
     job->ev |= MEV_LOADEDMETA;
@@ -221,17 +221,17 @@ static void loader_run(struct media_el *job)
       if (s)
         media_source_play(s);
       if (vv) {
-        job->vplaying = 1;
+        job->vplaying = true;
         job->vclock_origin = (long long)msec() - job->vpos_ms;
       }
-      job->want_play = 0;
+      job->want_play = false;
       job->ev |= MEV_PLAY;
     }
   } else {
     job->net = MNS_NO_SOURCE;
     job->ev |= MEV_ERROR;
   }
-  job->fetching = 0;
+  job->fetching = false;
   browser_buf_unlock();
   B->seq++; /* request a repaint */
 }
@@ -252,7 +252,7 @@ static void loader_ensure(void)
 {
   browser_buf_lock();
   if (!g_loader_started) {
-    g_loader_started = 1;
+    g_loader_started = true;
     thread_create(loader_thread, &g_loader_stack[sizeof g_loader_stack]);
   }
   browser_buf_unlock();
@@ -267,19 +267,19 @@ static void loader_ensure(void)
  * per-element `vbusy` flag lets disposal wait for an in-flight decode rather
  * than free the decoder under it. */
 static char g_vthread_stack[131072];
-static volatile int g_vthread_started;
+static volatile bool g_vthread_started;
 static volatile int g_video_busy; /* the element currently decoding */
 
-static int video_service(struct media_el *m)
+static bool video_service(struct media_el *m)
 {
   long long clk;
   int back, r;
   browser_buf_lock();
   if (m->vgone || !m->vid || !m->vplaying) {
     browser_buf_unlock();
-    return 0;
+    return false;
   }
-  m->vbusy = 1;
+  m->vbusy = true;
   browser_buf_unlock();
 
   back = 1 - m->vfront;
@@ -287,36 +287,37 @@ static int video_service(struct media_el *m)
   if (!m->vpending) {
     r = media_video_next(m->vid, m->vbuf[back], &m->vpending_pts);
     if (r == 1)
-      m->vpending = 1;
+      m->vpending = true;
   }
   clk = m->ms ? (long long)media_source_position_ms(m->ms) : ((long long)msec() - m->vclock_origin);
 
   browser_buf_lock();
   if (r != 1) { /* end of stream / decode error */
-    m->vended = 1;
-    m->vplaying = 0;
-    m->vbusy = 0;
+    m->vended = true;
+    m->vplaying = false;
+    m->vbusy = false;
     browser_buf_unlock();
-    return 0;
+    return false;
   }
   if ((long long)m->vpending_pts <= clk) { /* frame is due: show it */
     m->vfront = back;
-    m->vshown = 1;
+    m->vshown = true;
     m->vpos_ms = m->vpending_pts;
-    m->vpending = 0;
-    m->vbusy = 0;
+    m->vpending = false;
+    m->vbusy = false;
     browser_buf_unlock();
-    return 1;
+    return true;
   }
-  m->vbusy = 0;
+  m->vbusy = false;
   browser_buf_unlock();
-  return 0;
+  return false;
 }
 
 static void video_thread(void)
 {
   for (;;) {
-    int did = 0, i;
+    bool did = false;
+    int i;
     for (i = 0; i < MEDIA_MAX; i++) {
       struct media_el *m = &g_media[i];
       if (m->in_use && m->kind == MK_VIDEO && m->vid && m->vplaying) {
@@ -335,7 +336,7 @@ static void video_ensure(void)
 {
   browser_buf_lock();
   if (!g_vthread_started) {
-    g_vthread_started = 1;
+    g_vthread_started = true;
     thread_create(video_thread, &g_vthread_stack[sizeof g_vthread_stack]);
   }
   browser_buf_unlock();
@@ -348,8 +349,8 @@ static void video_dispose(struct media_el *m)
   if (!m->vid && !m->vbuf[0])
     return;
   browser_buf_lock();
-  m->vgone = 1;
-  m->vplaying = 0;
+  m->vgone = true;
+  m->vplaying = false;
   browser_buf_unlock();
   while (m->vbusy)
     msleep(1);
@@ -360,10 +361,10 @@ static void video_dispose(struct media_el *m)
   free(m->vbuf[0]);
   free(m->vbuf[1]);
   m->vbuf[0] = m->vbuf[1] = 0;
-  m->vshown = m->vpending = m->vended = 0;
+  m->vshown = m->vpending = m->vended = false;
   m->vfront = 0;
   browser_buf_lock();
-  m->vgone = 0;
+  m->vgone = false;
   browser_buf_unlock();
 }
 
@@ -401,9 +402,9 @@ static void video_reopen(struct media_el *m)
   m->vbuf[1] = b1;
   m->vdur_ms = media_video_duration_ms(nv);
   m->vfront = 0;
-  m->vshown = 0;
-  m->vpending = 0;
-  m->vended = 0;
+  m->vshown = false;
+  m->vpending = false;
+  m->vended = false;
   m->vpos_ms = 0;
   browser_buf_unlock();
 }
@@ -445,7 +446,7 @@ static struct media_el *slot_alloc(struct dom_node *node, int kind)
       uapp(m->file, &k, sizeof m->file, (unsigned)(m - g_media));
     }
     __asm__ volatile("" ::: "memory");
-    m->in_use = 1;
+    m->in_use = true;
   }
   browser_buf_unlock();
   return m;
@@ -515,7 +516,7 @@ static int url_ext_playable(const char *url)
 
 /* Pick the best source for a media node: its own src, else the best <source>
  * child (a recognized type/extension wins). Resolves against page_url. */
-static int pick_source(struct dom_node *node, const char *page_url, char *out, int cap)
+static bool pick_source(struct dom_node *node, const char *page_url, char *out, int cap)
 {
   const char *src = dom_get_attr(node, "src");
   struct dom_node *c;
@@ -550,9 +551,9 @@ static int pick_source(struct dom_node *node, const char *page_url, char *out, i
   }
   if (best[0]) {
     mstrcpy(out, best, cap);
-    return 1;
+    return true;
   }
-  return 0;
+  return false;
 }
 
 /* ---- registration -------------------------------------------------------- */
@@ -573,7 +574,7 @@ struct media_el *media_register_element(struct dom_node *node, int text_pos, con
 
   if (!m->registered) {
     const char *poster, *pl;
-    m->registered = 1;
+    m->registered = true;
     m->autoplay = dom_get_attr(node, "autoplay") != 0;
     m->loop = dom_get_attr(node, "loop") != 0;
     m->muted = dom_get_attr(node, "muted") != 0;
@@ -586,7 +587,7 @@ struct media_el *media_register_element(struct dom_node *node, int text_pos, con
       media_set_src(m, abs);
     apply_audio_params(m);
     if (m->autoplay && m->src[0]) {
-      m->want_play = 1;
+      m->want_play = true;
       media_kick_load(m);
     }
   } else if (pick_source(node, page_url, abs, sizeof abs)) {
@@ -611,9 +612,9 @@ void media_set_src(struct media_el *m, const char *abs_url)
     m->ms = 0;
   }
   m->load_gen++;
-  m->reported_meta = 0;
-  m->reported_ended = 0;
-  m->want_play = 0;
+  m->reported_meta = false;
+  m->reported_ended = false;
+  m->want_play = false;
   m->start_ms = 0;
   m->net = m->src[0] ? MNS_IDLE : MNS_EMPTY;
   browser_buf_unlock();
@@ -636,22 +637,22 @@ void media_play(struct media_el *m)
   browser_buf_lock();
   if (m->ms || m->vid) {
     if (m->vid) {
-      m->vplaying = 1;
+      m->vplaying = true;
       m->vclock_origin = (long long)msec() - m->vpos_ms;
     }
     if (m->ms) {
       if (m->reported_ended) {
         media_source_seek_ms(m->ms, 0);
-        m->reported_ended = 0;
+        m->reported_ended = false;
       }
       media_source_play(m->ms);
     }
     if (!m->playing_state) {
       m->ev |= MEV_PLAY;
-      m->playing_state = 1;
+      m->playing_state = true;
     }
   } else {
-    m->want_play = 1;
+    m->want_play = true;
   }
   browser_buf_unlock();
   if (!m->ms && !m->vid)
@@ -663,14 +664,14 @@ void media_pause(struct media_el *m)
   if (!m)
     return;
   browser_buf_lock();
-  m->want_play = 0;
+  m->want_play = false;
   if (m->ms)
     media_source_pause(m->ms);
   if (m->vid)
-    m->vplaying = 0; /* vpos_ms holds the resume point */
+    m->vplaying = false; /* vpos_ms holds the resume point */
   if (m->playing_state) {
     m->ev |= MEV_PAUSE;
-    m->playing_state = 0;
+    m->playing_state = false;
   }
   browser_buf_unlock();
 }
@@ -710,7 +711,7 @@ void media_set_current_time(struct media_el *m, double sec)
   ms = (unsigned)(sec * 1000.0);
   if (m->ms) {
     media_source_seek_ms(m->ms, ms);
-    m->reported_ended = 0;
+    m->reported_ended = false;
     m->ev |= MEV_SEEKED | MEV_TIMEUPDATE;
   } else {
     m->start_ms = ms;
@@ -752,9 +753,9 @@ int media_muted(struct media_el *m) { return m ? m->muted : 0; }
 
 void media_set_muted(struct media_el *m, int on)
 {
-  if (!m || m->muted == (on ? 1 : 0))
+  if (!m || m->muted == (on != 0))
     return;
-  m->muted = on ? 1 : 0;
+  m->muted = on != 0;
   apply_audio_params(m);
   m->ev |= MEV_VOLCHANGE;
 }
@@ -763,7 +764,7 @@ int media_loop_get(struct media_el *m) { return m ? m->loop : 0; }
 void media_set_loop(struct media_el *m, int on)
 {
   if (m) {
-    m->loop = on ? 1 : 0;
+    m->loop = on != 0;
     apply_audio_params(m);
   }
 }
@@ -772,9 +773,9 @@ int media_autoplay_get(struct media_el *m) { return m ? m->autoplay : 0; }
 void media_set_autoplay(struct media_el *m, int on)
 {
   if (m) {
-    m->autoplay = on ? 1 : 0;
+    m->autoplay = on != 0;
     if (on && m->src[0] && !m->ms) {
-      m->want_play = 1;
+      m->want_play = true;
       media_kick_load(m);
     }
   }
@@ -809,8 +810,8 @@ int media_pump(void)
     if (m->vid && m->loop && m->vended && !m->ms) {
       video_reopen(m);
       browser_buf_lock();
-      m->vplaying = 1;
-      m->vended = 0;
+      m->vplaying = true;
+      m->vended = false;
       m->vpos_ms = 0;
       m->vclock_origin = (long long)msec();
       browser_buf_unlock();
@@ -823,8 +824,8 @@ int media_pump(void)
      * thread just set under the same lock. */
     if (m->ms) {
       if (media_source_ended(m->ms) && !m->reported_ended) {
-        m->reported_ended = 1;
-        m->playing_state = 0;
+        m->reported_ended = true;
+        m->playing_state = false;
         m->ev |= MEV_ENDED | MEV_TIMEUPDATE;
       } else if (media_source_playing(m->ms)) {
         if (now - m->last_tu >= 250) {
@@ -834,8 +835,8 @@ int media_pump(void)
       }
     } else if (m->vid) { /* silent video: drive from vid */
       if (m->vended && !m->reported_ended) {
-        m->reported_ended = 1;
-        m->playing_state = 0;
+        m->reported_ended = true;
+        m->playing_state = false;
         m->ev |= MEV_ENDED | MEV_TIMEUPDATE;
       } else if (m->vplaying) {
         if (now - m->last_tu >= 250) {
@@ -847,7 +848,7 @@ int media_pump(void)
     ev = m->ev;
     m->ev = 0;
     if (ev & MEV_LOADEDMETA)
-      m->reported_meta = 1;
+      m->reported_meta = true;
     browser_buf_unlock();
     if (!ev)
       continue;
@@ -1008,7 +1009,7 @@ static void draw_pause_glyph(int cx, int cy, int s, unsigned col, int ct, int cb
   mfill(cx - s / 2, cy - s, s / 3 + 1, 2 * s, col, ct, cb);
   mfill(cx + s / 6, cy - s, s / 3 + 1, 2 * s, col, ct, cb);
 }
-static void draw_speaker_glyph(int x, int y, int muted, unsigned col, int ct, int cb)
+static void draw_speaker_glyph(int x, int y, bool muted, unsigned col, int ct, int cb)
 {
   mfill(x, y + 4, 4, 6, col, ct, cb); /* speaker body  */
   for (int i = 0; i < 5; i++)         /* cone          */

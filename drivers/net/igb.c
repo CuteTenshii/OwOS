@@ -33,6 +33,7 @@
  * command) since a laptop shows no console at NIC-probe time.
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -220,7 +221,7 @@ static const uint16_t igb_nics[] = {
 
 static volatile uint8_t *mmio; /* BAR0, mapped uncached                   */
 static uint8_t mac[6];
-static int present;
+static bool present;
 static uint16_t device_id;
 
 static union igb_rx_desc *rx_ring;  /* RX_DESCS entries, page-aligned         */
@@ -469,7 +470,7 @@ static int igb_link_up(void) { return present && (reg_read(IGB_STATUS) & STATUS_
 
 static int igb_probe(void)
 {
-  int found = 0;
+  bool found = false;
   uint8_t bus = 0, slot = 0, func = 0;
 
   for (int b = 0; b < 256 && !found; b++) {
@@ -487,7 +488,7 @@ static int igb_probe(void)
             slot = (uint8_t)s;
             func = (uint8_t)f;
             device_id = dev;
-            found = 1;
+            found = true;
             break;
           }
         }
@@ -551,7 +552,7 @@ static int igb_probe(void)
     return 0;
   }
 
-  present = 1;
+  present = true;
 
   con_printf("net: Intel %s at mmio 0x%08X mac ", model_name(device_id), mmio_phys);
   for (int i = 0; i < 6; i++) {

@@ -18,6 +18,7 @@
 #include "console.h"
 #include "pmm.h"
 #include "spinlock.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Defined by linker.ld as the first byte past the kernel image (end of .bss).
@@ -36,7 +37,7 @@ extern char kernel_end[];
 typedef struct block {
   size_t size; /* payload bytes, not counting the header  */
   uint32_t magic;
-  int free;
+  bool free;
   struct block *prev;
   struct block *next;
 } block_t;
@@ -60,7 +61,7 @@ void heap_init(void)
   head = (block_t *)(uintptr_t)start;
   head->size = (KHEAP_END - start) - sizeof(block_t);
   head->magic = BLOCK_MAGIC;
-  head->free = 1;
+  head->free = true;
   head->prev = 0;
   head->next = 0;
   alloc_cursor = head;
@@ -86,7 +87,7 @@ void *kmalloc(size_t size)
         block_t *rest = (block_t *)((uint8_t *)b + sizeof(block_t) + size);
         rest->size = b->size - size - sizeof(block_t);
         rest->magic = BLOCK_MAGIC;
-        rest->free = 1;
+        rest->free = true;
         rest->prev = b;
         rest->next = b->next;
         if (rest->next)
@@ -94,7 +95,7 @@ void *kmalloc(size_t size)
         b->size = size;
         b->next = rest;
       }
-      b->free = 0;
+      b->free = false;
       alloc_cursor = b->next ? b->next : head;
       void *result = (uint8_t *)b + sizeof(block_t);
       spin_unlock_irqrestore(&heap_lock, flags);
@@ -127,7 +128,7 @@ void kfree(void *ptr)
     spin_unlock_irqrestore(&heap_lock, flags);
     return;
   }
-  b->free = 1;
+  b->free = true;
 
   /* Merge forward with adjacent free blocks. */
   while (b->next && b->next->free) {

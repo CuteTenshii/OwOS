@@ -11,6 +11,7 @@
 #include "json.h"
 #include "opt.h"
 #include "owos.h"
+#include <stdbool.h>
 
 /* Read the whole of `path` into a malloc'd buffer (NUL is not appended; the
  * parser is given an explicit length). NULL on error, with *out_len set. */
@@ -67,13 +68,14 @@ static char *read_stdin(int *out_len)
 
 static int parse_int(const char *s, int defval)
 {
-  int v = 0, any = 0;
+  bool any = false;
+  int v = 0;
   if (!s)
     return defval;
   while (*s >= '0' && *s <= '9') {
     v = v * 10 + (*s - '0');
     s++;
-    any = 1;
+    any = true;
   }
   return any ? v : defval;
 }
@@ -90,7 +92,8 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-  int indent = 2, validate = 0;
+  bool validate = false;
+  int indent = 2;
   const char *path = 0;
   char *input;
   int in_len = 0, out_len = 0;
@@ -110,7 +113,7 @@ int main(int argc, char **argv)
     if (o == 'c') {
       indent = 0;
     } else if (o == 'v') {
-      validate = 1;
+      validate = true;
     } else if (o == 'i') {
       indent = parse_int(st.arg, 2);
     } else if (o == 'h') {

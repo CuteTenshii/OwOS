@@ -19,8 +19,10 @@
  * returns -1 instead of hanging.
  */
 
-#include "nvme.h"
+#include <stdbool.h>
+
 #include "console.h"
+#include "nvme.h"
 #include "paging.h"
 #include "pci.h"
 #include "spinlock.h"
@@ -58,7 +60,7 @@
  */
 
 static volatile uint32_t *bar; /* mapped MMIO register block                */
-static int found;
+static bool found;
 static uint32_t dstrd; /* doorbell stride exponent (CAP bits 35:32) */
 static uint32_t cap_sectors;
 static uint16_t next_cid;
@@ -129,7 +131,7 @@ static void build(uint32_t cmd[16], uint8_t opcode, uint32_t nsid, uint32_t prp1
 
 /* ---------------------------------------------------------------- I/O path */
 
-static int rw(uint32_t lba, uint32_t count, int write)
+static int rw(uint32_t lba, uint32_t count, bool write)
 {
   if (count == 0 || count > 8)
     return -1;
@@ -150,7 +152,7 @@ int nvme_read(uint32_t lba, void *buf, uint32_t count)
   if (!found || count == 0 || count > 8)
     return -1;
   uintptr_t flags = spin_lock_irqsave(&io_lock);
-  if (rw(lba, count, 0)) {
+  if (rw(lba, count, false)) {
     spin_unlock_irqrestore(&io_lock, flags);
     return -1;
   }
@@ -169,7 +171,7 @@ int nvme_write(uint32_t lba, const void *buf, uint32_t count)
   const uint8_t *s = buf;
   for (uint32_t i = 0; i < count * 512; i++)
     dbuf[i] = s[i];
-  int rc = rw(lba, count, 1);
+  int rc = rw(lba, count, true);
   spin_unlock_irqrestore(&io_lock, flags);
   return rc;
 }
@@ -333,7 +335,7 @@ void nvme_init(void)
     }
   }
 
-  found = 1;
+  found = true;
   con_write("nvme: namespace 1 ready");
   if (model[0]) {
     con_printf(" [%s]", model);

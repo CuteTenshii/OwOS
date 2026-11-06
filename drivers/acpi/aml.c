@@ -25,6 +25,7 @@
 #include "pci.h"
 #include "power.h"
 #include "timer.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -70,7 +71,7 @@
 #define EVAL_BUDGET_US 600000u
 
 static uint32_t g_start_us;
-static int deadline_hit(void) { return (timer_us() - g_start_us) > EVAL_BUDGET_US; }
+static bool deadline_hit(void) { return (timer_us() - g_start_us) > EVAL_BUDGET_US; }
 
 #define PNP0C0A 0x0A0CD041u /* EisaId("PNP0C0A") as a little-endian DWord */
 
@@ -123,12 +124,12 @@ struct ns_node {
 
 static struct ns_node *nodes; /* MAX_NODES entries, heap-allocated on first build */
 static int node_count;
-static int ns_built;
+static bool ns_built;
 /* Diagnostics: the opcode at which a namespace term-list walk first gave up
  * (so we can see what construct stops us reaching a device like the EC). For an
  * ExtOp the value is 0x5B00|ext; otherwise the bare opcode. */
 static uint16_t ns_bail_op;
-static int ns_bailed;
+static bool ns_bailed;
 
 /* arena */
 static uint8_t arena[ARENA_SIZE];
@@ -261,14 +262,14 @@ static int parse_name(const uint8_t **p, const uint8_t *end, const uint32_t *sco
   return 1;
 }
 
-static int path_eq(const uint32_t *a, int ad, const uint32_t *b, int bd)
+static bool path_eq(const uint32_t *a, int ad, const uint32_t *b, int bd)
 {
   if (ad != bd)
-    return 0;
+    return false;
   for (int i = 0; i < ad; i++)
     if (a[i] != b[i])
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
 static struct ns_node *ns_find(const uint32_t *seg, int depth)
@@ -540,7 +541,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end, const uint32_t *scope,
         p = q;
       } else {
         if (!ns_bailed) {
-          ns_bailed = 1;
+          ns_bailed = true;
           ns_bail_op = 0x5B00 | ext;
         }
         return; /* unknown ext op: stop this list   */
@@ -580,7 +581,7 @@ static void ns_walk(const uint8_t *p, const uint8_t *end, const uint32_t *scope,
       p = q;
     } else {
       if (!ns_bailed) {
-        ns_bailed = 1;
+        ns_bailed = true;
         ns_bail_op = op;
       }
       return; /* executable/unknown: stop         */
@@ -829,31 +830,31 @@ static const uint8_t *read_term_int(const uint8_t *p, const uint8_t *end, uint64
 /* ---- Embedded Controller (and other region) access ---------------------- */
 #define EC_DATA 0x62
 #define EC_CMD 0x66
-static int ec_wait(uint8_t mask, uint8_t want)
+static bool ec_wait(uint8_t mask, uint8_t want)
 {
   /* A healthy EC answers within microseconds; cap the wait low and also honor
    * the overall evaluation deadline so a dead/slow EC can't stall the read. */
   for (int i = 0; i < 5000; i++) {
     if ((inb(EC_CMD) & mask) == want)
-      return 1;
+      return true;
     if ((i & 0xFF) == 0 && deadline_hit())
-      return 0;
+      return false;
     io_wait();
   }
-  return 0;
+  return false;
 }
-static int ec_read(uint8_t addr, uint8_t *val)
+static bool ec_read(uint8_t addr, uint8_t *val)
 {
   if (!ec_wait(0x02, 0))
-    return 0;         /* IBF clear */
+    return false;     /* IBF clear */
   outb(EC_CMD, 0x80); /* RD_EC */
   if (!ec_wait(0x02, 0))
-    return 0;
+    return false;
   outb(EC_DATA, addr);
   if (!ec_wait(0x01, 0x01))
-    return 0; /* OBF set */
+    return false; /* OBF set */
   *val = inb(EC_DATA);
-  return 1;
+  return true;
 }
 
 /* A PCI_Config OperationRegion is addressed by the bus/device/function of the
@@ -861,7 +862,7 @@ static int ec_read(uint8_t addr, uint8_t *val)
  * nearest _BBN gives the bus (default 0). Returns 1 if an _ADR was found. */
 #define SEG_ADR 0x5244415Fu /* "_ADR" packed little-endian */
 #define SEG_BBN 0x4E42425Fu /* "_BBN" */
-static int region_pci_bdf(struct ns_node *reg, uint8_t *bus, uint8_t *slot, uint8_t *func)
+static bool region_pci_bdf(struct ns_node *reg, uint8_t *bus, uint8_t *slot, uint8_t *func)
 {
   *bus = 0;
   *slot = 0;
@@ -893,13 +894,13 @@ static int region_pci_bdf(struct ns_node *reg, uint8_t *bus, uint8_t *slot, uint
 
 /* Read `width` bits starting at `bit_off` from a region. Returns 1 on success.
  */
-static int region_read(struct ns_node *reg, uint32_t bit_off, uint32_t width, uint64_t *out)
+static bool region_read(struct ns_node *reg, uint32_t bit_off, uint32_t width, uint64_t *out)
 {
   if (width == 0 || width > 64)
-    return 0;
+    return false;
   uint8_t pbus = 0, pslot = 0, pfunc = 0;
   if (reg->space == 2 && !region_pci_bdf(reg, &pbus, &pslot, &pfunc))
-    return 0; /* PCI region with no _ADR to address */
+    return false; /* PCI region with no _ADR to address */
   uint32_t first = bit_off / 8;
   uint32_t shift = bit_off % 8;
   uint32_t nbytes = (shift + width + 7) / 8;
@@ -909,19 +910,19 @@ static int region_read(struct ns_node *reg, uint32_t bit_off, uint32_t width, ui
     uint8_t b = 0;
     if (reg->space == 3) { /* EmbeddedControl */
       if (base > 0xFF || !ec_read((uint8_t)base, &b))
-        return 0;
+        return false;
     } else if (reg->space == 1) { /* SystemIO */
       b = inb((uint16_t)base);
     } else if (reg->space == 0) { /* SystemMemory */
       if (paging_identity_map((uint32_t)base, 1) != 0)
-        return 0;
+        return false;
       b = *(volatile uint8_t *)(uintptr_t)(uint32_t)base;
     } else if (reg->space == 2) { /* PCI_Config (mechanism #1) */
       uint32_t off = (uint32_t)base;
       uint32_t dw = pci_read32(pbus, pslot, pfunc, (uint8_t)(off & ~3u));
       b = (uint8_t)(dw >> ((off & 3) * 8));
     } else {
-      return 0;
+      return false;
     }
     /* nbytes can be 9 for a 64-bit field at a non-byte-aligned offset; the
      * 9th byte's shift would be << 64 (UB) and contributes nothing after the
@@ -933,7 +934,7 @@ static int region_read(struct ns_node *reg, uint32_t bit_off, uint32_t width, ui
   if (width < 64)
     raw &= ((uint64_t)1 << width) - 1;
   *out = raw;
-  return 1;
+  return true;
 }
 
 /* ---- evaluator ---------------------------------------------------------- */
@@ -949,7 +950,7 @@ static const uint32_t *g_scope;
 static int g_sdepth;
 static int g_depth;  /* method-call recursion depth */
 static int g_rdepth; /* combined aml_eval/exec_list C-recursion depth */
-static int g_failed;
+static bool g_failed;
 static char *g_stack_base; /* entry-frame address; growth from here is bounded */
 static int g_stack_peak;   /* high-water mark of stack growth, for diagnostics */
 
@@ -958,11 +959,11 @@ static int g_stack_peak;   /* high-water mark of stack growth, for diagnostics *
  * shared kernel stack. g_stack_base==0 (e.g. not yet captured) disables the
  * check. Also tracks the high-water mark so the diagnostic can report how close
  * a method came to the ceiling (this path is real-hardware-only). */
-static int stack_exhausted(void)
+static bool stack_exhausted(void)
 {
   char probe;
   if (!g_stack_base)
-    return 0;
+    return false;
   int used = (int)(g_stack_base - &probe);
   if (used > g_stack_peak)
     g_stack_peak = used;
@@ -993,14 +994,14 @@ static void fail(const char *why)
 {
   if (!g_failed) {
     set_err(why);
-    g_failed = 1;
+    g_failed = true;
   }
 }
 static void fail_op(const char *why, uint8_t op)
 {
   if (!g_failed) {
     set_err_op(why, op);
-    g_failed = 1;
+    g_failed = true;
   }
 }
 
@@ -1028,7 +1029,7 @@ static void fail_name(const uint8_t *at)
 {
   if (g_failed)
     return;
-  g_failed = 1;
+  g_failed = true;
 
   int i = 0;
   const char *pfx = "u ";
@@ -1172,7 +1173,7 @@ static struct obj read_through(struct obj o)
         err_buf[i++] = '0' + (char)((f->bit_width / 10) % 10);
         err_buf[i++] = '0' + (char)(f->bit_width % 10);
         err_buf[i] = 0;
-        g_failed = 1;
+        g_failed = true;
       }
       return mk_int(0);
     }
@@ -1906,7 +1907,7 @@ static void ns_map_only(const uint8_t *b, uint32_t l, void *c)
   (void)c; /* acpi_for_each_aml already mapped the table */
 }
 
-static int build_namespace(void)
+static bool build_namespace(void)
 {
   /* (Re)map every ACPI table into the CURRENT address space before we touch
    * the node pointers that point into them. The interpreter runs from whatever
@@ -1928,14 +1929,14 @@ static int build_namespace(void)
     nodes = kmalloc(sizeof(struct ns_node) * MAX_NODES);
     if (!nodes) {
       set_err("ns alloc failed");
-      return 0;
+      return false;
     }
   }
   node_count = 0;
-  ns_bailed = 0;
+  ns_bailed = false;
   ns_bail_op = 0;
   acpi_for_each_aml(build_one, 0);
-  ns_built = 1;
+  ns_built = true;
   return node_count > 0;
 }
 
@@ -2033,7 +2034,7 @@ static void prime_reg(void)
     g_scope = ss;
     g_sdepth = sd;
     /* A _REG we can't run just leaves its flag unset — never abort the read. */
-    g_failed = 0;
+    g_failed = false;
     g_rdepth = 0;
     g_depth = 0;
   }
@@ -2049,13 +2050,13 @@ static void session_begin(void)
   arena_used = 0;
   for (int i = 0; i < node_count; i++)
     nodes[i].materialized = 0;
-  g_failed = 0;
+  g_failed = false;
   g_depth = 0;
   g_rdepth = 0;
   err_buf[0] = 0;
   g_start_us = timer_us();
   prime_reg();
-  g_failed = 0;
+  g_failed = false;
   g_depth = 0;
   g_rdepth = 0;
   err_buf[0] = 0;
@@ -2063,7 +2064,7 @@ static void session_begin(void)
   g_start_us = timer_us(); /* fresh time budget for the method */
 }
 
-static int eval_method_pkg(struct ns_node *m, struct obj *out_pkg)
+static bool eval_method_pkg(struct ns_node *m, struct obj *out_pkg)
 {
   char base;
   g_stack_base = &base; /* bound recursion to actual stack growth */
@@ -2081,19 +2082,19 @@ static int eval_method_pkg(struct ns_node *m, struct obj *out_pkg)
   g_sdepth = m->depth;
   exec_list(&fr, m->body, m->body + m->body_len);
   if (g_failed)
-    return 0;
+    return false;
   struct obj r = read_through(fr.retval);
   if (r.type != T_PKG) {
     set_err("method returned non-package");
-    return 0;
+    return false;
   }
   *out_pkg = r;
-  return 1;
+  return true;
 }
 
 /* Evaluate an integer-returning method (e.g. _STA). Returns 1 and writes *out
  * on success, 0 if the method failed or didn't return an integer. */
-static int eval_method_int(struct ns_node *m, uint64_t *out)
+static bool eval_method_int(struct ns_node *m, uint64_t *out)
 {
   char base;
   g_stack_base = &base; /* bound recursion to actual stack growth */
@@ -2111,9 +2112,9 @@ static int eval_method_int(struct ns_node *m, uint64_t *out)
   g_sdepth = m->depth;
   exec_list(&fr, m->body, m->body + m->body_len);
   if (g_failed)
-    return 0;
+    return false;
   *out = to_int(read_through(fr.retval));
-  return 1;
+  return true;
 }
 
 /* _STA bit 4 (0x10) is "battery present". Some hypervisors (VMware) declare a
@@ -2121,17 +2122,17 @@ static int eval_method_int(struct ns_node *m, uint64_t *out)
  * though no battery exists; honour _STA so we report "no battery" instead of a
  * bogus 0%. _STA absent or unevaluable => assume present (don't suppress a real
  * battery we just can't query). */
-int aml_battery_present(void)
+bool aml_battery_present(void)
 {
   if (!build_namespace())
-    return 1;
+    return true;
   struct ns_node *sta = batt_method("_STA");
   if (!sta)
-    return 1;
+    return true;
   uint64_t st = 0;
   if (!eval_method_int(sta, &st))
-    return 1;
-  return (st & 0x10) ? 1 : 0;
+    return true;
+  return (st & 0x10) != 0;
 }
 
 /* Diagnostics for real-hardware battery debugging (this path can't be exercised
@@ -2284,18 +2285,18 @@ void aml_battery_debug(char *out, int max)
   *p = 0;
 }
 
-int aml_read_battery(struct aml_battery *out)
+bool aml_read_battery(struct aml_battery *out)
 {
   err_buf[0] = 0;
   if (!build_namespace()) {
     set_err("no ACPI namespace");
-    return 0;
+    return false;
   }
 
   struct ns_node *bst = batt_method("_BST");
   if (!bst) {
     set_err("_BST not found");
-    return 0;
+    return false;
   }
 
   struct ns_node *bif = batt_method("_BIF");
@@ -2314,7 +2315,7 @@ int aml_read_battery(struct aml_battery *out)
       continue; /* transient eval fail */
     if (bstpkg.nelems < 4) {
       set_err("_BST package too short");
-      return 0;
+      return false;
     }
     uint64_t state = to_int(bstpkg.elems[0]);
     uint64_t rate = to_int(bstpkg.elems[1]); /* (dis)charge rate */
@@ -2355,15 +2356,15 @@ int aml_read_battery(struct aml_battery *out)
     if (pct > 100)
       pct = 100;
     out->percent = (int)pct;
-    out->discharging = (state & 0x1) ? 1 : 0;
-    out->charging = (state & 0x2) ? 1 : 0;
+    out->discharging = (state & 0x1) != 0;
+    out->charging = (state & 0x2) != 0;
     /* Time to empty = remaining / rate (same unit, so unitless ratio), only
      * when discharging with a known non-zero rate. */
     out->minutes = -1;
     if (out->discharging && rate && rate != 0xFFFFFFFFu)
       out->minutes = (int)(remaining * 60 / rate);
     err_buf[0] = 0;
-    return 1;
+    return true;
   }
 
   /* No sane reading after retries. Keep a method eval error if one is set;
@@ -2380,5 +2381,5 @@ int aml_read_battery(struct aml_battery *out)
     i = put_hex(i, (uint32_t)last_remaining, 8);
     err_buf[i] = 0;
   }
-  return 0;
+  return false;
 }

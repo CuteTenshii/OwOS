@@ -1,5 +1,7 @@
 #include "compositor_damage.h"
 
+#include <stdbool.h>
+
 struct rect dmg[MAXDMG];
 int ndmg;
 
@@ -8,7 +10,7 @@ void damage_add(int x, int y, int w, int h)
   if (w <= 0 || h <= 0)
     return;
   for (;;) {
-    int merged = 0;
+    bool merged = false;
     for (int i = 0; i < ndmg; i++) {
       struct rect *r = &dmg[i];
       int x1 = x + w, y1 = y + h;
@@ -22,7 +24,7 @@ void damage_add(int x, int y, int w, int h)
       w = nx1 - nx;
       h = ny1 - ny;
       dmg[i] = dmg[--ndmg];
-      merged = 1;
+      merged = true;
       break;
     }
     if (!merged)

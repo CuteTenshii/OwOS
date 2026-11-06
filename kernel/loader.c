@@ -60,7 +60,7 @@ static int load_segment(uint32_t *dir, uint32_t vaddr, const uint8_t *src, uint3
 }
 
 /* A user address range is valid only if it sits entirely in the user window. */
-static int in_user_window(uint32_t addr, uint32_t len)
+static bool in_user_window(uint32_t addr, uint32_t len)
 {
   return addr >= USER_BASE && addr + len <= USER_REGION_END && addr + len >= addr;
 }

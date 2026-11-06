@@ -20,6 +20,7 @@
  */
 
 #include "owos.h"
+#include <stdbool.h>
 
 #define MAX_LINES 256
 #define LINE_LEN 128
@@ -27,7 +28,7 @@
 
 static char lines[MAX_LINES][LINE_LEN];
 static int nlines;
-static int dirty;
+static bool dirty;
 static char filename[64];
 
 static char loadbuf[LOAD_MAX];
@@ -88,7 +89,7 @@ static int insert_at(int at, const char *text)
     copy_line(lines[j], lines[j - 1]);
   copy_line(lines[at], text);
   nlines++;
-  dirty = 1;
+  dirty = true;
   return 0;
 }
 
@@ -97,7 +98,7 @@ static void delete_at(int at)
   for (int j = at; j < nlines - 1; j++)
     copy_line(lines[j], lines[j + 1]);
   nlines--;
-  dirty = 1;
+  dirty = true;
 }
 
 static void print_buffer(void)
@@ -138,7 +139,7 @@ static void save_file(void)
   }
   if (writefile(filename, savebuf, out) == 0) {
     printf("wrote %s (%u lines)\n", filename, (unsigned)nlines);
-    dirty = 0;
+    dirty = false;
   } else {
     puts("write failed\n");
   }
@@ -205,7 +206,7 @@ int main(int argc, char **argv)
       char buf[LINE_LEN];
       readline(buf, sizeof buf);
       copy_line(lines[ln - 1], buf);
-      dirty = 1;
+      dirty = true;
     } else if (c == 'd') {
       if (ln < 1 || ln > nlines) {
         puts("bad line number\n");

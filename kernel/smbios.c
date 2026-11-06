@@ -49,17 +49,17 @@ static void copy_str(char *dst, uint32_t cap, const char *src)
 
 static void set_err(const char *s) { copy_str(errbuf, sizeof errbuf, s); }
 
-static int streq4(const uint8_t *p, char a, char b, char c, char d)
+static bool streq4(const uint8_t *p, char a, char b, char c, char d)
 {
   return p[0] == a && p[1] == b && p[2] == c && p[3] == d;
 }
 
-static int bytes_eq(const uint8_t *a, const uint8_t *b, uint32_t n)
+static bool bytes_eq(const uint8_t *a, const uint8_t *b, uint32_t n)
 {
   for (uint32_t i = 0; i < n; i++)
     if (a[i] != b[i])
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
 /* The two SMBIOS configuration-table GUIDs, in EFI's mixed-endian byte layout
@@ -206,7 +206,7 @@ static int from_efi(void)
     const uint8_t *e = ct + (uint32_t)i * stride;
     if (!bytes_eq(e, SMBIOS_GUID, 16) && !bytes_eq(e, SMBIOS3_GUID, 16))
       continue;
-    uint64_t vt = g_efi_is64 ? *(const uint64_t *)(e + 16) : (uint64_t) * (const uint32_t *)(e + 16);
+    uint64_t vt = g_efi_is64 ? *(const uint64_t *)(e + 16) : (uint64_t)*(const uint32_t *)(e + 16);
     if (vt >> 32) {
       set_err("SMBIOS EP >4GB");
       continue;
@@ -222,7 +222,7 @@ static int from_efi(void)
 /* True when `product` already begins with `vendor` (case-insensitive, e.g.
  * vendor "HP" + product "HP EliteBook 840 G3") so the join shouldn't repeat it.
  */
-static int product_has_vendor_prefix(void)
+static bool product_has_vendor_prefix(void)
 {
   for (int i = 0; vendor[i]; i++) {
     char a = vendor[i], b = product[i];
@@ -231,9 +231,9 @@ static int product_has_vendor_prefix(void)
     if (b >= 'A' && b <= 'Z')
       b += 32;
     if (a != b)
-      return 0;
+      return false;
   }
-  return 1;
+  return true;
 }
 
 void smbios_init(void)

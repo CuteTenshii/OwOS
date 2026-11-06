@@ -92,16 +92,16 @@ struct tcp_conn {
 
   volatile uint32_t snd_nxt; /* command context writes this        */
   volatile uint32_t rcv_nxt; /* interrupt context writes this      */
-  volatile int finned;       /* peer sent FIN                      */
-  volatile int reset;        /* peer sent RST                      */
+  volatile bool finned;      /* peer sent FIN                      */
+  volatile bool reset;       /* peer sent RST                      */
 
   uint8_t *rxbuf;            /* lazily allocated, retained per slot */
   volatile uint32_t wlen;    /* bytes written by the IRQ           */
   volatile uint32_t rlen;    /* bytes consumed by the reader       */
   volatile uint32_t adv_wnd; /* last receive window we advertised  */
 
-  volatile int accepted; /* server: handed out by tcp_accept   */
-  uint32_t opened;       /* timer_ticks() at SYN_RCVD (reaping)*/
+  volatile bool accepted; /* server: handed out by tcp_accept   */
+  uint32_t opened;        /* timer_ticks() at SYN_RCVD (reaping)*/
 };
 
 static struct tcp_conn conns[TCP_MAX_CONNS];
@@ -109,7 +109,7 @@ static struct tcp_conn conns[TCP_MAX_CONNS];
 /* Open listening ports. A SYN whose dport matches a live entry is accepted. */
 static struct {
   uint16_t port;
-  volatile int active;
+  volatile bool active;
 } listeners[TCP_MAX_LISTEN];
 
 /* Rotating source of ephemeral local ports; combined with the slot index so
@@ -222,10 +222,10 @@ static struct tcp_conn *tcp_demux(const uint8_t src[4], uint16_t dport, uint16_t
       continue;
     if (c->lport != dport || c->rport != sport)
       continue;
-    int ip_ok = 1;
+    bool ip_ok = true;
     for (int j = 0; j < 4; j++)
       if (src[j] != c->peer_ip[j])
-        ip_ok = 0;
+        ip_ok = false;
     if (ip_ok)
       return c;
   }
@@ -233,12 +233,12 @@ static struct tcp_conn *tcp_demux(const uint8_t src[4], uint16_t dport, uint16_t
 }
 
 /* Is `port` an open listening port? (interrupt + command context) */
-static int tcp_is_listening(uint16_t port)
+static bool tcp_is_listening(uint16_t port)
 {
   for (int i = 0; i < TCP_MAX_LISTEN; i++)
     if (listeners[i].active && listeners[i].port == port)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* Passive open: a SYN landed on a listening port. Claim a buffered slot,
@@ -263,9 +263,9 @@ static void tcp_accept_syn(const uint8_t src[4], const struct tcp_hdr *t)
   c->wlen = 0;
   c->rlen = 0;
   c->adv_wnd = 0;
-  c->finned = 0;
-  c->reset = 0;
-  c->accepted = 0;
+  c->finned = false;
+  c->reset = false;
+  c->accepted = false;
   c->opened = timer_ticks();
   tcp_send_ctl(c, TCP_SYN | TCP_ACK, isn);
 }
@@ -273,7 +273,7 @@ static void tcp_accept_syn(const uint8_t src[4], const struct tcp_hdr *t)
 /* Is `seq` within our current receive window? Used to reject off-path segments
  * (notably a forged RST) whose sequence number we never advertised. Serial
  * arithmetic so it survives 32-bit sequence-space wraparound. */
-static int seq_in_rcv_window(const struct tcp_conn *c, uint32_t seq)
+static bool seq_in_rcv_window(const struct tcp_conn *c, uint32_t seq)
 {
   uint32_t wnd = TCP_RXBUF - (c->wlen - c->rlen);
   if (wnd == 0)
@@ -320,7 +320,7 @@ void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len)
   if (flags & TCP_RST) {
     int ok = (c->state == ST_SYN_SENT) ? ((flags & TCP_ACK) && ack == c->snd_nxt) : seq_in_rcv_window(c, seq);
     if (ok) {
-      c->reset = 1;
+      c->reset = true;
       c->state = ST_DONE;
     }
     return;
@@ -381,7 +381,7 @@ void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len)
   }
   if ((flags & TCP_FIN) && seq + dlen == c->rcv_nxt) {
     c->rcv_nxt += 1; /* FIN consumes one seq      */
-    c->finned = 1;
+    c->finned = true;
     c->state = ST_CLOSE_WAIT;
     tcp_send_ctl(c, TCP_ACK, c->snd_nxt);
   }
@@ -418,9 +418,9 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport)
   c->wlen = 0;
   c->rlen = 0;
   c->adv_wnd = 0;
-  c->finned = 0;
-  c->reset = 0;
-  c->accepted = 0;
+  c->finned = false;
+  c->reset = false;
+  c->accepted = false;
   c->state = ST_SYN_SENT;
 
   for (int tries = 0; tries < 6; tries++) {
@@ -573,7 +573,7 @@ int tcp_listen(uint16_t port)
     return -1; /* listener table full */
   }
   listeners[slot].port = port;
-  listeners[slot].active = 1;
+  listeners[slot].active = true;
   irq_restore(f);
   return 0;
 }
@@ -582,7 +582,7 @@ void tcp_unlisten(uint16_t port)
 {
   for (int i = 0; i < TCP_MAX_LISTEN; i++)
     if (listeners[i].active && listeners[i].port == port)
-      listeners[i].active = 0;
+      listeners[i].active = false;
 }
 
 /* Reap half-open connections (SYN_RCVD whose peer never sent the final ACK)
@@ -610,7 +610,7 @@ tcp_conn_t *tcp_accept(uint16_t port)
         continue;
       uint32_t f = irq_save();
       if (c->state == ST_ESTAB && !c->accepted) {
-        c->accepted = 1;
+        c->accepted = true;
         irq_restore(f);
         return c;
       }

@@ -8,6 +8,7 @@
 #define OWOS_KSTRING_H
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 void *memcpy(void *dst, const void *src, uint32_t n);
@@ -30,12 +31,12 @@ static inline int k_streq_ci(const char *a, const char *b)
   }
   return k_lower(*a) == k_lower(*b);
 }
-static inline int k_eq_ci_n(const char *a, const char *b, uint32_t n)
+static inline bool k_eq_ci_n(const char *a, const char *b, uint32_t n)
 {
   for (uint32_t i = 0; i < n; i++)
     if (k_lower(a[i]) != k_lower(b[i]))
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
 /* --------------------------------------------------------------- formatting */

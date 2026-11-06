@@ -3,9 +3,9 @@
 #include "kstring.h"
 #include "paging.h"
 
-int user_range(uint32_t addr, uint32_t len) { return paging_user_range(addr, len, 0); }
+int user_range(uint32_t addr, uint32_t len) { return paging_user_range(addr, len, false); }
 
-int user_out_range(uint32_t addr, uint32_t len) { return paging_user_range(addr, len, 1); }
+int user_out_range(uint32_t addr, uint32_t len) { return paging_user_range(addr, len, true); }
 
 int copyin(void *dst, uint32_t src, uint32_t len)
 {

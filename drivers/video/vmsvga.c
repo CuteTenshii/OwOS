@@ -14,6 +14,7 @@
 #include "io.h"
 #include "paging.h"
 #include "pci.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -120,7 +121,7 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
 {
   /* Find the device and capture its three BARs. */
   uint32_t bar0 = 0, bar1 = 0, bar2 = 0;
-  int found = 0;
+  bool found = false;
   for (int bus = 0; bus < 256 && !found; bus++) {
     for (int slot = 0; slot < 32; slot++) {
       uint32_t id = pci_read32(bus, slot, 0, 0x00);
@@ -132,7 +133,7 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
       /* Enable I/O + memory decode + bus mastering. */
       uint32_t cmd = pci_read32(bus, slot, 0, 0x04);
       pci_write32(bus, slot, 0, 0x04, cmd | 0x7);
-      found = 1;
+      found = true;
       break;
     }
   }

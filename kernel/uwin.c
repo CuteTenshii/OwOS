@@ -42,12 +42,12 @@ struct uwin {
   int cursor;         /* app-requested client-area cursor (enum wm_cursor) */
   char title[64];
   uint32_t present_seq;    /* bumped by uwin_present                      */
-  int dirty_full;          /* whole frame needs repainting                  */
+  bool dirty_full;         /* whole frame needs repainting                  */
   int dx0, dy0, dx1, dy1;  /* client-area damage since the last uwin_enum   */
-  int compositor_pinned;   /* the compositor SYS_WIN_MAP'd this buffer;
-                                   uwin_reap must not free buf_phys until it
-                              unmaps */
-  int free_pending;        /* detached; buffer still owed (pinned or deferred) */
+  bool compositor_pinned;  /* the compositor SYS_WIN_MAP'd this buffer;
+                                  uwin_reap must not free buf_phys until it
+                             unmaps */
+  bool free_pending;       /* detached; buffer still owed (pinned or deferred) */
   volatile int head, tail; /* event ring indices                        */
   struct win_event ev[EVQ];
   uint32_t last_poll; /* timer_ticks() of the owner's last poll,
@@ -66,21 +66,21 @@ void uwin_compositor_register(uint32_t pid)
     compositor_pid = pid;
 }
 
-int uwin_compositor_active(void) { return compositor_pid != 0; }
+bool uwin_compositor_active(void) { return compositor_pid != 0; }
 
 /* Ensure uwins[] can index `need` slots, growing ~2x. New pointer slots are
  * NULL. Returns 0 on heap exhaustion. cli around the swap so an
  * interrupt-context reader never sees a half-swapped table. */
-static int uwins_reserve(int need)
+static bool uwins_reserve(int need)
 {
   if (need <= uwins_cap)
-    return 1;
+    return true;
   int nc = uwins_cap ? uwins_cap * 2 : 16;
   while (nc < need)
     nc *= 2;
   struct uwin **nu = kmalloc((size_t)nc * sizeof *nu);
   if (!nu)
-    return 0;
+    return false;
   for (int i = 0; i < uwins_cap; i++)
     nu[i] = uwins[i];
   for (int i = uwins_cap; i < nc; i++)
@@ -93,7 +93,7 @@ static int uwins_reserve(int need)
     __asm__ volatile("sti");
   if (ou)
     kfree(ou);
-  return 1;
+  return true;
 }
 
 static inline void tlb_flush(void)
@@ -176,14 +176,14 @@ static void uwin_free(struct uwin *u)
   if (u->owner_dir)
     paging_unmap_user_at(u->owner_dir, u->user_vaddr, u->buf_bytes);
   u->owner_dir = 0;
-  u->free_pending = 1;
+  u->free_pending = true;
   /* If the compositor isn't holding this buffer, reclaim it now. */
   if (!u->compositor_pinned && u->buf_phys) {
     paging_kunmap(u->buf_phys, u->buf_bytes);
     pmm_free_contig(u->buf_phys, u->buf_bytes);
     u->used = 0;
     u->buf_phys = 0;
-    u->free_pending = 0;
+    u->free_pending = false;
   }
 }
 
@@ -202,7 +202,7 @@ void uwin_reap(void)
     }
     u->used = 0;
     u->buf_phys = 0;
-    u->free_pending = 0;
+    u->free_pending = false;
   }
 }
 
@@ -307,14 +307,14 @@ int uwin_create(int w, int h, const char *title)
   u->flags = UWIN_F_VISIBLE | UWIN_F_RESIZABLE; /* resizable by default; apps opt out
                                                    via win_resizable(id,0) */
   u->cursor = 0;
-  u->compositor_pinned = 0;
-  u->free_pending = 0;
+  u->compositor_pinned = false;
+  u->free_pending = false;
   int j = 0;
   for (const char *s = title ? title : "app"; *s && j < (int)sizeof u->title - 1; s++)
     u->title[j++] = *s;
   u->title[j] = '\0';
   u->present_seq = 1;
-  u->dirty_full = 1;
+  u->dirty_full = true;
   u->dx0 = u->dy0 = u->dx1 = u->dy1 = 0;
   u->head = u->tail = 0;
   u->last_poll = timer_ticks(); /* seed the heartbeat */
@@ -337,7 +337,7 @@ static void touch_full(struct uwin *u)
 {
   uintptr_t fl = irq_save();
   u->present_seq++;
-  u->dirty_full = 1;
+  u->dirty_full = true;
   irq_restore(fl);
 }
 
@@ -359,7 +359,7 @@ int uwin_present(int id, int x, int y, int w, int h)
   uintptr_t fl = irq_save();
   u->present_seq++;
   if (w <= 0 || h <= 0) {
-    u->dirty_full = 1;
+    u->dirty_full = true;
   } else if (x1 > x && y1 > y) {
     if (u->dx1 <= u->dx0 || u->dy1 <= u->dy0) {
       u->dx0 = x;
@@ -491,19 +491,19 @@ void uwin_task_exiting(uint32_t owner_id)
 }
 
 /* Does task `pid` own a live window? Tells windowed apps from CLIs. */
-int uwin_pid_has_window(uint32_t pid)
+bool uwin_pid_has_window(uint32_t pid)
 {
   for (int i = 0; i < uwins_cap; i++)
     if (uwins[i] && uwins[i]->used && uwins[i]->owner == pid)
-      return 1;
-  return 0;
+      return true;
+  return false;
 }
 
 /* --------------------------------------------- compositor brokering backends
  */
 
 /* A window is enumerable if it's a live, mapped uwin (not detached-pending). */
-static int enumerable(struct uwin *u) { return u && u->used && !u->free_pending && u->buf_phys; }
+static bool enumerable(struct uwin *u) { return u && u->used && !u->free_pending && u->buf_phys; }
 
 int uwin_enum(struct winrec *out, int max)
 {
@@ -527,7 +527,7 @@ int uwin_enum(struct winrec *out, int max)
     r->dirty_y = u->dy0;
     r->dirty_w = u->dirty_full ? -1 : u->dx1 - u->dx0;
     r->dirty_h = u->dirty_full ? -1 : u->dy1 - u->dy0;
-    u->dirty_full = 0;
+    u->dirty_full = false;
     u->dx1 = u->dx0;
     u->dy1 = u->dy0;
     irq_restore(fl);
@@ -571,7 +571,7 @@ int uwin_map(int id, uint32_t at, int *bw, int *bh, int *stride)
    * already-pinned window just refreshes it. */
   if (paging_map_user_at(dir, at, u->buf_phys, u->npages) < 0)
     return -1;
-  u->compositor_pinned = 1;
+  u->compositor_pinned = true;
   tlb_flush();
   if (bw)
     *bw = u->w;
@@ -589,7 +589,7 @@ int uwin_unmap(int id, uint32_t *dir, uint32_t at)
   struct uwin *u = uwins[id];
   if (dir)
     paging_unmap_user_at(dir, at, u->buf_bytes ? u->buf_bytes : WIN_MAP_SLOT_BYTES);
-  u->compositor_pinned = 0; /* the buffer may now be reclaimed if pending */
+  u->compositor_pinned = false; /* the buffer may now be reclaimed if pending */
   tlb_flush();
   uwin_reap(); /* release a closed-but-pinned buffer now      */
   return 0;

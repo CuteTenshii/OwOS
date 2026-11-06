@@ -9,6 +9,7 @@
 #include "base64.h"
 #include "opt.h"
 #include "owos.h"
+#include <stdbool.h>
 
 /* Read the whole of `path` into a malloc'd buffer. NULL on error, *out_len set.
  */
@@ -72,7 +73,7 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-  int decode = 0;
+  bool decode = false;
   const char *path = 0;
   char *input;
   int in_len = 0;
@@ -82,7 +83,7 @@ int main(int argc, char **argv)
   opt_init(&st, argc, argv);
   for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
     if (o == 'd') {
-      decode = 1;
+      decode = true;
     } else if (o == 'h') {
       usage();
       return 0;

@@ -7,6 +7,7 @@
 #include "irq.h"
 #include "sb16.h"
 #include "serial.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -150,16 +151,16 @@ static const char keypad[] = {
     '0', '.',           /* 0x52 0x53           */
 };
 
-static int shift_held;
-static int altgr_held;
-static int ctrl_held;
-static int alt_held;      /* left Alt, for Alt+Tab window switching   */
-static int alt_tabbed;    /* Tab was pressed during this Alt hold     */
-static int super_held;    /* GUI/Win key held; folds into KMOD_SUPER on any chord */
-static int super_chorded; /* a Super+key fired during this Super hold */
-static int expecting_extended;
-static int num_lock = 1; /* on by default, like most BIOSes        */
-static int caps_lock;    /* off by default                         */
+static bool shift_held;
+static bool altgr_held;
+static bool ctrl_held;
+static bool alt_held;      /* left Alt, for Alt+Tab window switching   */
+static bool alt_tabbed;    /* Tab was pressed during this Alt hold     */
+static bool super_held;    /* GUI/Win key held; folds into KMOD_SUPER on any chord */
+static bool super_chorded; /* a Super+key fired during this Super hold */
+static bool expecting_extended;
+static bool num_lock = true; /* on by default, like most BIOSes        */
+static bool caps_lock;    /* off by default                         */
 
 /* Set the keyboard LEDs (bit2 = Caps Lock, bit1 = Num Lock). The two ACK bytes
  * (0xFA) the keyboard sends back have bit 7 set, so the IRQ handler harmlessly
@@ -185,12 +186,12 @@ static volatile uint8_t ring_tail;
 
 /* Ctrl+C is a latch, not a queued key: it must interrupt a running command,
  * which is busy in a loop and never draining the ring. Consumers poll it. */
-static volatile int int_pending;
+static volatile bool int_pending;
 
 /* Print Screen is a latch too: the IRQ can't capture the framebuffer, so it
  * just flags the request; SYS_INPUT_POLL drains it into a KEY_PRTSC event and
  * the compositor (which owns the framebuffer) takes the shot. */
-static volatile int scrshot_pending;
+static volatile bool scrshot_pending;
 
 /* The modifier set currently held, as KMOD_* flags. Sampled when a key is
  * queued so the consumer learns which chord produced it. */
@@ -236,8 +237,8 @@ int keyboard_poll(char *out, unsigned char *mods)
  * long-running command polls it to abort. */
 int keyboard_take_interrupt(void)
 {
-  int v = int_pending;
-  int_pending = 0;
+  bool v = int_pending;
+  int_pending = false;
   return v;
 }
 
@@ -246,49 +247,49 @@ int keyboard_take_interrupt(void)
  */
 int keyboard_take_screenshot(void)
 {
-  int v = scrshot_pending;
-  scrshot_pending = 0;
+  bool v = scrshot_pending;
+  scrshot_pending = false;
   return v;
 }
 
 /* Raise the interrupt latch from outside the IRQ handler -- the serial console
  * uses this so a Ctrl+C typed in the host terminal stops a running command too.
  */
-void keyboard_signal_interrupt(void) { int_pending = 1; }
+void keyboard_signal_interrupt(void) { int_pending = true; }
 
 /* The byte after a 0xE0 prefix; unmapped extended keys are swallowed. */
 static void process_extended(uint8_t sc)
 {
   if (sc == SC_ALT) { /* AltGr down                             */
-    altgr_held = 1;
+    altgr_held = true;
     return;
   }
   if (sc == (SC_ALT | SC_RELEASE)) { /* AltGr up                     */
-    altgr_held = 0;
+    altgr_held = false;
     return;
   }
   if (sc == SC_CTRL) { /* right Ctrl down                        */
-    ctrl_held = 1;
+    ctrl_held = true;
     return;
   }
   if (sc == (SC_CTRL | SC_RELEASE)) { /* right Ctrl up                */
-    ctrl_held = 0;
+    ctrl_held = false;
     return;
   }
   if (sc == 0x37) {      /* Print Screen make (E0 2A E0 37)        */
-    scrshot_pending = 1; /* compositor drains it via SYS_INPUT_POLL */
+    scrshot_pending = true; /* compositor drains it via SYS_INPUT_POLL */
     return;
   }
   if (sc == 0x5B || sc == 0x5C) { /* GUI/Win key down            */
-    super_held = 1;
-    super_chorded = 0;
+    super_held = true;
+    super_chorded = false;
     return; /* the Start-menu toggle waits for release  */
   }
   if (sc == (0x5B | SC_RELEASE) || sc == (0x5C | SC_RELEASE)) { /* Win up */
     if (!super_chorded)                                         /* a bare tap -> toggle Start menu */
       ring_push(KEY_SUPER);
-    super_held = 0;
-    super_chorded = 0;
+    super_held = false;
+    super_chorded = false;
     return;
   }
   if (sc & SC_RELEASE) /* other extended release: ignore         */
@@ -356,36 +357,36 @@ static void process_extended(uint8_t sc)
 
 /* Shift/Ctrl/Alt holds, Num/Caps lock, and the Alt+Tab gesture. 1 if consumed.
  */
-static int process_modifiers(uint8_t sc)
+static bool process_modifiers(uint8_t sc)
 {
   if (sc == SC_LSHIFT || sc == SC_RSHIFT) {
-    shift_held = 1;
-    return 1;
+    shift_held = true;
+    return true;
   }
   if (sc == (SC_LSHIFT | SC_RELEASE) || sc == (SC_RSHIFT | SC_RELEASE)) {
-    shift_held = 0;
-    return 1;
+    shift_held = false;
+    return true;
   }
   if (sc == SC_CTRL) { /* left Ctrl down                          */
-    ctrl_held = 1;
-    return 1;
+    ctrl_held = true;
+    return true;
   }
   if (sc == (SC_CTRL | SC_RELEASE)) { /* left Ctrl up                      */
-    ctrl_held = 0;
-    return 1;
+    ctrl_held = false;
+    return true;
   }
   if (sc == SC_ALT) { /* left Alt down (Alt+Tab modifier)        */
-    alt_held = 1;
-    return 1;
+    alt_held = true;
+    return true;
   }
   if (sc == (SC_ALT | SC_RELEASE)) { /* left Alt up                       */
     /* Releasing Alt after an Alt+Tab gesture commits the WM's highlighted
      * window; a bare Alt tap (no Tab) sends nothing. */
     if (alt_tabbed)
       ring_push(KEY_ALT_UP);
-    alt_held = 0;
-    alt_tabbed = 0;
-    return 1;
+    alt_held = false;
+    alt_tabbed = false;
+    return true;
   }
   /* Alt+Tab: emit a plain Tab carrying the Alt (and any Shift) modifier and let
    * the WM decide it's a window switch — window-switching policy lives in the
@@ -395,72 +396,72 @@ static int process_modifiers(uint8_t sc)
    * filter. */
   if (alt_held && sc == 0x0F) { /* Tab make                                */
     ring_push(KEY_TAB);
-    alt_tabbed = 1;
-    return 1;
+    alt_tabbed = true;
+    return true;
   }
   if (sc == SC_NUMLOCK) { /* toggle Num Lock and update its LED      */
     num_lock = !num_lock;
     keyboard_set_leds();
-    return 1;
+    return true;
   }
   if (sc == SC_CAPSLOCK) { /* toggle Caps Lock and update its LED     */
     caps_lock = !caps_lock;
     keyboard_set_leds();
-    return 1;
+    return true;
   }
-  return 0;
+  return false;
 }
 
 /* Bare F-key media codes (see SC_F*); act on the device. 1 if consumed. */
-static int process_media_fkey(uint8_t sc)
+static bool process_media_fkey(uint8_t sc)
 {
   switch (sc) {
   case SC_F5:
     fb_brightness_step(-1);
-    return 1; /* brightness down          */
+    return true; /* brightness down          */
   case SC_F6:
     fb_brightness_step(+1);
-    return 1; /* brightness up            */
+    return true; /* brightness up            */
   case SC_F8: /* volume down              */
     if (hda_present())
       hda_volume_step(-1);
     else
       sb16_volume_step(-1);
-    return 1;
+    return true;
   case SC_F9: /* volume up                */
     if (hda_present())
       hda_volume_step(+1);
     else
       sb16_volume_step(+1);
-    return 1;
+    return true;
   }
-  return 0;
+  return false;
 }
 
 /* Keypad digits, when Num Lock is on. 1 if sc was a keypad key. */
-static int process_keypad(uint8_t sc)
+static bool process_keypad(uint8_t sc)
 {
   if (sc >= SC_KP_FIRST && sc <= SC_KP_LAST) {
     if (num_lock)
       ring_push(keypad[sc - SC_KP_FIRST]);
-    return 1;
+    return true;
   }
-  return 0;
+  return false;
 }
 
 /* Super+ and Ctrl+ chords: forward the base key carrying its modifier
  * (cur_mods) and let the consumer map the chord. The driver names no chord — it
  * doesn't know "cliphist" or "save"; it just delivers key + KMOD_*. 1 if
  * consumed. */
-static int process_chords(uint8_t sc)
+static bool process_chords(uint8_t sc)
 {
   if (super_held && active_map[sc]) {
     /* Any Super+<key>: forward the key with KMOD_SUPER; the compositor decides
      * what it means (Super+V opens clipboard history, etc.). Mark super chorded
      * so releasing Super doesn't also toggle the Start menu. */
-    super_chorded = 1;
+    super_chorded = true;
     ring_push(active_map[sc]);
-    return 1;
+    return true;
   }
   if (ctrl_held) {
     char m = active_map[sc]; /* the unshifted key, layout-aware */
@@ -468,12 +469,12 @@ static int process_chords(uint8_t sc)
      * interrupt a busy kernel loop that never drains the ring. Everything else
      * is the letter + KMOD_CTRL for the consumer to interpret. */
     if (m == 'c')
-      int_pending = 1;
+      int_pending = true;
     else if (m)
       ring_push(m);
-    return 1;
+    return true;
   }
-  return 0;
+  return false;
 }
 
 /* Make code -> char via the active layout; AltGr = third level, Caps Lock
@@ -484,7 +485,7 @@ static void emit_char(uint8_t sc)
   if (altgr_held && active_altgr) /* third level: AltGr punctuation  */
     c = active_altgr[sc];
   if (!c) {
-    int shift = shift_held;
+    bool shift = shift_held;
     char base = active_map[sc];
     if (caps_lock && base >= 'a' && base <= 'z')
       shift = !shift;
@@ -501,11 +502,11 @@ static void keyboard_handler(struct registers *r)
 
   /* Extended keys arrive as 0xE0 then a second byte. */
   if (sc == SC_EXTENDED) {
-    expecting_extended = 1;
+    expecting_extended = true;
     return;
   }
   if (expecting_extended) {
-    expecting_extended = 0;
+    expecting_extended = false;
     process_extended(sc);
     return;
   }
@@ -529,11 +530,11 @@ static void keyboard_handler(struct registers *r)
 }
 
 /* Compare an argument (terminated by NUL or a space) against a layout name. */
-static int name_eq(const char *arg, const char *name)
+static bool name_eq(const char *arg, const char *name)
 {
   while (*name) {
     if (*arg != *name)
-      return 0;
+      return false;
     arg++;
     name++;
   }

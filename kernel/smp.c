@@ -135,7 +135,7 @@ volatile uint32_t ap_arg;
 #endif
 volatile uint32_t ap_cr3; /* kernel page dir; AP enables paging */
 
-static volatile uint32_t ap_started;      /* AP -> BSP: "I'm in ap_main"     */
+static volatile bool ap_started;          /* AP -> BSP: "I'm in ap_main"     */
 static volatile uint32_t online_mask = 1; /* bit i set when CPU i is running  */
 
 /* Local APIC registers (offsets into the MMIO page). */
@@ -243,7 +243,7 @@ void ap_main(uint32_t idx)
   lapic_timer_start();
 
   __sync_fetch_and_or(&online_mask, 1u << idx);
-  ap_started = 1;
+  ap_started = true;
   __asm__ volatile("sti");
   sched_start_cpu((int)idx);
 }
@@ -287,7 +287,7 @@ void smp_start_aps(void)
       continue;
     ap_stack_top = (uintptr_t)stack + AP_STACK;
     ap_arg = (uintptr_t)i;
-    ap_started = 0;
+    ap_started = false;
 
     send_ipi(aid, 0x4500); /* INIT, level-assert               */
     udelay(10000);         /* 10 ms                            */

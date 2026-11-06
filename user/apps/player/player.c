@@ -23,6 +23,7 @@
 #include "gfx.h"
 #include "media.h"
 #include "owos.h"
+#include <stdbool.h>
 
 /* ---- audio-window geometry ---------------------------------------------- */
 #define CW 440
@@ -44,7 +45,7 @@ enum { ST_EMPTY = 0, ST_STOPPED, ST_PLAYING, ST_PAUSED };
 static int g_state = ST_EMPTY;
 static int g_win;
 static int g_W = CW, g_H = CH; /* actual window client size              */
-static int g_is_video;
+static bool g_is_video;
 
 static int g_press = -1, g_press_ticks;
 static int g_bx[3], g_bw[3];
@@ -66,7 +67,7 @@ static media_video *g_vid;
 static unsigned char *g_rgb;       /* native-size decoded frame (vw*vh*3)    */
 static int g_vw, g_vh;             /* native video dimensions                */
 static int g_dx, g_dy, g_dw, g_dh; /* on-screen video rectangle              */
-static int g_frame_valid;          /* g_rgb holds a decoded, unshown frame   */
+static bool g_frame_valid;         /* g_rgb holds a decoded, unshown frame   */
 static unsigned g_frame_pts;       /* its presentation time (ms)             */
 static long long g_shown_pts;      /* pts of the frame currently on screen   */
 static long long g_clock_origin;   /* msec() - playback position (ms)        */
@@ -96,16 +97,16 @@ static void fmt_time(unsigned sec, char *buf)
   buf[k] = '\0';
 }
 
-static int is_video_name(const char *p)
+static bool is_video_name(const char *p)
 {
   int n = strlen(p);
   const char *ext[] = {".mp4", ".mov", ".m4v", ".264", ".h264"};
   for (int i = 0; i < 5; i++) {
     int l = strlen(ext[i]);
     if (n >= l && streq_ci(p + n - l, ext[i]))
-      return 1;
+      return true;
   }
-  return 0;
+  return false;
 }
 
 /* ---- video frame blit --------------------------------------------------- */
@@ -162,10 +163,10 @@ static int video_reopen(void)
   if (!v)
     return -1;
   g_vid = v;
-  g_frame_valid = 0;
+  g_frame_valid = false;
   g_shown_pts = -1;
   if (media_video_next(g_vid, g_rgb, &g_frame_pts) == 1) {
-    g_frame_valid = 1; /* first frame, shown on entry */
+    g_frame_valid = true; /* first frame, shown on entry */
   }
   return 0;
 }
@@ -179,7 +180,7 @@ static int load_audio(const char *fn)
     media_close(g_dec);
   g_dec = d;
   copy_name(fn);
-  g_is_video = 0;
+  g_is_video = false;
   g_state = ST_STOPPED;
   return 0;
 }
@@ -198,7 +199,7 @@ static int load_video(const char *fn)
   if (!g_rgb)
     return -1;
   copy_name(fn);
-  g_is_video = 1;
+  g_is_video = true;
   layout_video();
   if (video_reopen() != 0)
     return -1;
@@ -468,7 +469,7 @@ static int video_step(void)
     if (!g_frame_valid) {
       int r = media_video_next(g_vid, g_rgb, &g_frame_pts);
       if (r == 1)
-        g_frame_valid = 1;
+        g_frame_valid = true;
       else {
         transport_pause();
       } /* EOS / error: hold on last frame */
@@ -478,7 +479,7 @@ static int video_step(void)
       if ((long long)g_frame_pts <= elapsed) {
         blit_video();
         g_shown_pts = g_frame_pts;
-        g_frame_valid = 0;
+        g_frame_valid = false;
         blitted = 1;
       }
     }
@@ -486,7 +487,7 @@ static int video_step(void)
     /* stopped/paused with a freshly decoded first frame: show it once */
     blit_video();
     g_shown_pts = g_frame_pts;
-    g_frame_valid = 0;
+    g_frame_valid = false;
     blitted = 1;
   }
   return blitted;

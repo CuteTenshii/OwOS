@@ -10,6 +10,7 @@
  * precedence over transitions, per spec, so they overlay last. */
 #include "anim.h"
 #include "owos.h"
+#include <stdbool.h>
 
 #define ANIM_RECS 128
 
@@ -18,15 +19,15 @@ struct anim_rec {
   unsigned last_seen;    /* frame counter, for LRU reclamation */
 
   /* running @keyframes animation */
-  int kf_running;
+  bool kf_running;
   char kf_name[CSS_ANIM_NAME];
   int kf_dur, kf_delay, kf_iter, kf_dir, kf_fill, kf_timing;
   unsigned kf_start;
 
   /* transition */
-  int has_base; /* base holds the previous steady cascade */
+  bool has_base; /* base holds the previous steady cascade */
   struct css_style base;
-  int tr_running;
+  bool tr_running;
   unsigned tr_mask; /* which ANP_* are transitioning */
   struct css_style tr_from, tr_to;
   unsigned tr_start;
@@ -35,21 +36,21 @@ struct anim_rec {
 
 static struct anim_rec g_recs[ANIM_RECS];
 static unsigned g_frame; /* bumped each walk */
-static int g_more;       /* a frame is still due */
+static bool g_more;      /* a frame is still due */
 
 void anim_reset(void)
 {
   for (int i = 0; i < ANIM_RECS; i++)
     g_recs[i].node = 0;
   g_frame = 0;
-  g_more = 0;
+  g_more = false;
 }
 
 void anim_frame_begin(unsigned now)
 {
   (void)now;
   g_frame++;
-  g_more = 0;
+  g_more = false;
 }
 
 int anim_active(void) { return g_more; }
@@ -148,7 +149,7 @@ static double ease_curve(int kind, double x)
 
 /* ------------------------------------------------ property access ----------
  */
-static int ap_is_color(int p)
+static bool ap_is_color(int p)
 {
   return p == ANP_COLOR || p == ANP_BG || p == ANP_BORDER_COLOR || p == ANP_OUTLINE_COLOR;
 }
@@ -350,7 +351,7 @@ static long lerp_prop(int p, long a, long b, double f)
 }
 
 /* True if transition property `p` is in mask (TRANS_ALL selects all). */
-static int prop_in_mask(unsigned mask, int p) { return (mask & TRANS_ALL) ? 1 : (mask & (1u << p)) != 0; }
+static bool prop_in_mask(unsigned mask, int p) { return (mask & TRANS_ALL) ? true : (mask & (1u << p)) != 0; }
 
 /* ------------------------------------------------ keyframe sampling --------
  */
@@ -408,20 +409,20 @@ static void sample_keyframes(const struct css_keyframes *kf, double p, struct cs
 
 /* Overlay the running keyframe animation onto cs. Returns 1 when the animation
  * is finished (no more frames needed from it), 0 while it is still running. */
-static int apply_keyframes(css_sheet *sheet, struct anim_rec *r, struct css_style *cs, unsigned now)
+static bool apply_keyframes(css_sheet *sheet, struct anim_rec *r, struct css_style *cs, unsigned now)
 {
   const struct css_keyframes *kf = css_keyframes_find(sheet, r->kf_name);
   if (!kf || css_keyframes_count(kf) == 0)
-    return 1;
+    return true;
   int dur = r->kf_dur;
   if (dur <= 0)
-    return 1;
+    return true;
   int delay = r->kf_delay > 0 ? r->kf_delay : 0;
   /* unsigned subtraction first (small, fits): (long)now would overflow 32-bit
    * long */
   long el = (long)(now - r->kf_start) - delay; /* ms into the active phase */
 
-  int finished = 0;
+  bool finished = false;
   double frac; /* 0..1 within the current iteration */
   long iter_index;
 
@@ -430,33 +431,33 @@ static int apply_keyframes(css_sheet *sheet, struct anim_rec *r, struct css_styl
       frac = 0;
       iter_index = 0; /* hold the first frame during delay */
     } else {
-      return 0; /* waiting out the delay, no overlay */
+      return false; /* waiting out the delay, no overlay */
     }
   } else {
     iter_index = el / dur;
     frac = (double)(el % dur) / (double)dur;
     if (r->kf_iter >= 0 && iter_index >= r->kf_iter) {
-      finished = 1;
+      finished = true;
       iter_index = r->kf_iter - 1;
       frac = 1.0;
       if (r->kf_fill != CSS_AFILL_FORWARDS && r->kf_fill != CSS_AFILL_BOTH)
-        return 1; /* done, no fill: leave cs untouched */
+        return true; /* done, no fill: leave cs untouched */
     }
   }
 
-  int rev;
+  bool rev;
   switch (r->kf_dir) {
   case CSS_ADIR_REVERSE:
-    rev = 1;
+    rev = true;
     break;
   case CSS_ADIR_ALTERNATE:
-    rev = (iter_index & 1);
+    rev = (iter_index & 1) != 0;
     break;
   case CSS_ADIR_ALTERNATE_REVERSE:
     rev = !(iter_index & 1);
     break;
   default:
-    rev = 0;
+    rev = false;
   }
   double prog = rev ? 1.0 - frac : frac;
   sample_keyframes(kf, ease_curve(r->kf_timing, prog), cs);
@@ -467,16 +468,16 @@ static int apply_keyframes(css_sheet *sheet, struct anim_rec *r, struct css_styl
  */
 /* Overlay the running transition onto cs at time `now`. Returns 1 when
  * finished. */
-static int apply_transition(struct anim_rec *r, unsigned now, struct css_style *cs)
+static bool apply_transition(struct anim_rec *r, unsigned now, struct css_style *cs)
 {
   long el = (long)(now - r->tr_start) - r->tr_delay;
   if (el < 0)
     el = 0; /* delay: hold the `from` value */
-  int done = 0;
+  bool done = false;
   double f;
   if (r->tr_dur <= 0 || el >= r->tr_dur) {
     f = 1.0;
-    done = 1;
+    done = true;
   } else
     f = (double)el / (double)r->tr_dur;
   double fe = ease_curve(r->tr_timing, f);
@@ -543,18 +544,18 @@ void anim_apply(css_sheet *sheet, struct dom_node *el, struct css_style *cs, uns
       r->tr_dur = cs->trans_dur;
       r->tr_delay = cs->trans_delay > 0 ? cs->trans_delay : 0;
       r->tr_timing = cs->trans_timing >= 0 ? cs->trans_timing : CSS_EASE;
-      r->tr_running = 1;
+      r->tr_running = true;
     }
   }
   r->base = newbase;
-  r->has_base = 1;
+  r->has_base = true;
 
   /* ---- apply the running transition ---- */
   if (r->tr_running) {
     if (apply_transition(r, now, cs))
-      r->tr_running = 0;
+      r->tr_running = false;
     else
-      g_more = 1;
+      g_more = true;
   }
 
   /* ---- keyframe animation (wins over transitions) ---- */
@@ -565,7 +566,7 @@ void anim_apply(css_sheet *sheet, struct dom_node *el, struct css_style *cs, uns
         r->kf_name[n] = cs->anim_name[n];
       r->kf_name[n] = '\0';
       r->kf_start = now;
-      r->kf_running = 1;
+      r->kf_running = true;
     }
     r->kf_dur = cs->anim_dur;
     r->kf_delay = cs->anim_delay > 0 ? cs->anim_delay : 0;
@@ -574,8 +575,8 @@ void anim_apply(css_sheet *sheet, struct dom_node *el, struct css_style *cs, uns
     r->kf_fill = cs->anim_fill >= 0 ? cs->anim_fill : CSS_AFILL_NONE;
     r->kf_timing = cs->anim_timing >= 0 ? cs->anim_timing : CSS_EASE;
     if (!apply_keyframes(sheet, r, cs, now))
-      g_more = 1;
+      g_more = true;
   } else if (r->kf_running) {
-    r->kf_running = 0;
+    r->kf_running = false;
   }
 }

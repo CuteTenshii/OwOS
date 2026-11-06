@@ -15,15 +15,16 @@
 
 #include "clipboard.h"
 #include "owos.h"
+#include <stdbool.h>
 
 #define CLIP_MAX 8192
 
-static int same(const char *a, const char *b, int n)
+static bool same(const char *a, const char *b, int n)
 {
   for (int i = 0; i < n; i++)
     if (a[i] != b[i])
-      return 0;
-  return 1;
+      return false;
+  return true;
 }
 
 int main(void)
@@ -32,7 +33,7 @@ int main(void)
   static char last[CLIP_MAX];
   int last_len = 0;
 
-  for (int first = 1;; first = 0) {
+  for (bool first = true;; first = false) {
     if (!first)
       msleep(1000); /* how often to check the host clipboard */
 

@@ -32,6 +32,7 @@
 #include "pci.h"
 #include "pmm.h"
 #include "timer.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 /* ---- HDA controller MMIO register offsets ------------------------------ */
@@ -93,13 +94,13 @@
 
 /* ---- driver state ------------------------------------------------------ */
 static volatile uint8_t *mmio;
-static int present;
+static bool present;
 static uint8_t codec;                       /* codec address on the link             */
 static uint16_t dac_nid, pin_nid, path_mix; /* path_mix 0 = direct pin->DAC */
 static int mix_in_idx;                      /* mixer/selector input index -> DAC      */
 static int pin_sel_idx;                     /* pin input index -> mixer/DAC           */
-static int mix_is_sel;                      /* path_mix is a selector (not a mixer)   */
-static int pin_is_hp;                       /* output pin is a headphone jack         */
+static bool mix_is_sel;                      /* path_mix is a selector (not a mixer)   */
+static bool pin_is_hp;                       /* output pin is a headphone jack         */
 static uint32_t sd_off;                     /* output stream descriptor offset        */
 
 /* Master volume: applied to one output-amp widget in the path (pin preferred,
@@ -107,7 +108,7 @@ static uint32_t sd_off;                     /* output stream descriptor offset  
 static uint16_t vol_nid;   /* widget carrying the volume amp (0 = none) */
 static uint32_t vol_steps; /* its loudest gain value                  */
 static int hda_vol = HDA_VOL_MAX;
-static int hda_muted;
+static bool hda_muted;
 
 /* CORB/RIRB rings + the audio DMA buffer, all in one identity-mapped run. */
 #define CORB_N 256
@@ -234,12 +235,12 @@ static uint32_t out_steps(uint16_t nid) { return (get_param(nid, P_OUTAMPCAP) >>
 /* Set a widget's output amp, both channels, to `gain` steps and mute state.
  * bit15 set-output, 13/12 left/right, bit7 mute, 6-0 gain. No-op on a widget
  * with no output amp (the SET is simply ignored). */
-static void set_out_amp(uint16_t nid, uint32_t gain, int mute)
+static void set_out_amp(uint16_t nid, uint32_t gain, bool mute)
 {
   codec_cmd(nid, V_SET_AMP | 0xB000 | (mute ? 0x80 : 0) | (gain & 0x7F));
 }
 
-static void amp_out_max(uint16_t nid) { set_out_amp(nid, out_steps(nid), 0); }
+static void amp_out_max(uint16_t nid) { set_out_amp(nid, out_steps(nid), false); }
 
 /* Unmute a widget's input amp at the given connection index (mixer/selector).
  */
@@ -253,7 +254,7 @@ static void amp_in_unmute(uint16_t nid, int idx)
 /* ---- codec graph walk -------------------------------------------------- */
 /* Find an output DAC reachable from `pin`, either directly or through one
  * mixer/selector hop. Fills path_mix/mix_in_idx/pin_sel_idx/mix_is_sel. */
-static int find_dac_path(uint16_t pin)
+static bool find_dac_path(uint16_t pin)
 {
   uint16_t src[16];
   int n = conn_list(pin, src, 16);
@@ -263,7 +264,7 @@ static int find_dac_path(uint16_t pin)
       dac_nid = src[i];
       path_mix = 0;
       pin_sel_idx = i;
-      return 1;
+      return true;
     }
   }
   for (int i = 0; i < n; i++) { /* pin -> mixer/sel -> DAC  */
@@ -282,11 +283,11 @@ static int find_dac_path(uint16_t pin)
         mix_in_idx = j;
         mix_is_sel = (wt == WT_SEL);
         pin_sel_idx = i;
-        return 1;
+        return true;
       }
     }
   }
-  return 0;
+  return false;
 }
 
 /* Some real codecs (notably Realtek laptop parts) gate the internal speaker
@@ -319,8 +320,8 @@ struct out_ep {
   uint16_t mix;    /* mixer/selector hop, 0 = direct                 */
   int mix_in_idx;  /* mixer/selector input index -> DAC              */
   int pin_sel_idx; /* pin input index -> mixer/DAC                   */
-  int mix_is_sel;  /* the hop is a selector (not a mixer)            */
-  int is_hp;       /* the pin is a headphone jack                    */
+  bool mix_is_sel; /* the hop is a selector (not a mixer)            */
+  bool is_hp;      /* the pin is a headphone jack                    */
   int dev;         /* config-default device code (names the output)  */
 };
 static struct out_ep outs[MAX_OUTPUTS];
@@ -443,7 +444,7 @@ static int collect_outputs(uint16_t w_start, int w_count)
 
 /* Walk the audio function group, collect output-capable pins, and pick the best
  * one (speaker > line-out > headphone > anything) that reaches a DAC. */
-static int enumerate_codec(void)
+static bool enumerate_codec(void)
 {
   uint32_t sub = get_param(0, P_SUBNODE); /* root's function groups   */
   uint16_t fg_start = (uint16_t)((sub >> 16) & 0xFF);
@@ -458,7 +459,7 @@ static int enumerate_codec(void)
     }
   }
   if (!afg)
-    return 0;
+    return false;
   codec_cmd(afg, V_SET_POWER | 0x00); /* power the AFG to D0      */
   enable_codec_gpios(afg);            /* unmute a GPIO-gated amp  */
 
@@ -470,14 +471,14 @@ static int enumerate_codec(void)
    * then make the best-ranked one active so the volume keys and the first play
    * route correctly before anything is selected. */
   if (!collect_outputs(w_start, w_count))
-    return 0;
+    return false;
   cur_out = 0;
   apply_active_globals();
-  return 1;
+  return true;
 }
 
 /* ---- bring-up ---------------------------------------------------------- */
-static int find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
+static bool find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
 {
   for (int b = 0; b < 256; b++)
     for (int s = 0; s < 32; s++) {
@@ -491,14 +492,14 @@ static int find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
           *bus = (uint8_t)b;
           *slot = (uint8_t)s;
           *func = (uint8_t)f;
-          return 1;
+          return true;
         }
       }
     }
-  return 0;
+  return false;
 }
 
-static int ring_setup(void)
+static bool ring_setup(void)
 {
   /* Carve one contiguous run: CORB | RIRB | BDL | audio. pmm_alloc_contig
    * only reserves frames (above the 16 MiB identity map), so map it into the
@@ -507,7 +508,7 @@ static int ring_setup(void)
    * and we get fast buffer fills. */
   uint32_t base = pmm_alloc_contig(0x40000);
   if (!base || paging_identity_map(base, 0x40000) != 0)
-    return 0;
+    return false;
   corb = (volatile uint32_t *)(uintptr_t)(base + 0x0000);
   corb_phys = base + 0x0000;
   rirb = (volatile uint32_t *)(uintptr_t)(base + 0x0400);
@@ -546,7 +547,7 @@ static int ring_setup(void)
 
   wr8(R_CORBCTL, 0x02); /* CORBRUN              */
   wr8(R_RIRBCTL, 0x02); /* RIRBDMAEN            */
-  return 1;
+  return true;
 }
 
 void hda_init(void)
@@ -615,7 +616,7 @@ void hda_init(void)
   int num_iss = (gcap >> 8) & 0x0F;
   sd_off = SD_BASE + (uint32_t)num_iss * SD_STRIDE;
 
-  present = 1;
+  present = true;
   con_printf("hda: HD Audio ready (codec %u, dac nid %u, pin nid %u)\n", codec, dac_nid, pin_nid);
 }
 
@@ -643,7 +644,7 @@ void hda_volume_step(int dir)
   if (nv > HDA_VOL_MAX)
     nv = HDA_VOL_MAX;
   hda_vol = nv;
-  hda_muted = 0; /* nudging the level always unmutes         */
+  hda_muted = false; /* nudging the level always unmutes         */
   hda_apply_volume();
 }
 
@@ -680,7 +681,7 @@ static void configure_path(void)
     if (i == cur_out)
       continue;
     codec_cmd(outs[i].pin, V_SET_PINCTL | 0x00); /* output disable */
-    set_out_amp(outs[i].pin, 0, 1);              /* mute its amp   */
+    set_out_amp(outs[i].pin, 0, true);              /* mute its amp   */
   }
 
   /* Active pin: power up, enable output (+ HP amp for a headphone), EAPD, amp.
@@ -711,8 +712,8 @@ static void configure_path(void)
  * the 48 kHz output rate without an IRQ. */
 #define STREAM_GUARD 256u /* bytes kept clear ahead of the play head  */
 
-static int s_active;    /* a stream is open                         */
-static int s_started;   /* RUN asserted (buffer pre-rolled)         */
+static bool s_active;    /* a stream is open                         */
+static bool s_started;   /* RUN asserted (buffer pre-rolled)         */
 static uint32_t s_wpos; /* next write offset into audio[] (bytes)   */
 
 /* Reset + program the output stream descriptor for the cyclic 2-half buffer. */
@@ -758,8 +759,8 @@ int hda_stream_open(void)
   stream_program_sd();
   for (uint32_t i = 0; i < AUDIO_BYTES; i++)
     audio[i] = 0;
-  s_active = 1;
-  s_started = 0;
+  s_active = true;
+  s_started = false;
   s_wpos = 0;
   keyboard_take_interrupt(); /* drop any stale Ctrl+C              */
   return 0;
@@ -795,7 +796,7 @@ int hda_stream_write(const void *pcm, uint32_t bytes)
       if (s_wpos >= AUDIO_BYTES) {
         __asm__ volatile("" ::: "memory"); /* buffer stores complete before RUN */
         wr8(sd_off + SD_CTL, (uint8_t)(rd8(sd_off + SD_CTL) | 0x02));
-        s_started = 1;
+        s_started = true;
         s_wpos = 0;
       }
       continue;
@@ -853,7 +854,7 @@ void hda_stream_close(void)
     for (uint32_t i = s_wpos; i < AUDIO_BYTES; i++)
       audio[i] = 0;
     wr8(sd_off + SD_CTL, (uint8_t)(rd8(sd_off + SD_CTL) | 0x02));
-    s_started = 1;
+    s_started = true;
     timer_sleep(real / 192 + 30); /* ~192 bytes/ms at 48 kHz/4B + tail   */
   } else {
     /* Push a full buffer of silence behind the play head (back-pressured),
@@ -894,8 +895,8 @@ void hda_stream_close(void)
   }
 
   wr8(sd_off + SD_CTL, 0); /* stop the stream                   */
-  s_active = 0;
-  s_started = 0;
+  s_active = false;
+  s_started = false;
 }
 
 /* ---- output endpoint switching (Sound settings + /sys/class/sound) ------ *

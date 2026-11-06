@@ -7,6 +7,8 @@
  * read and PIO-streams 2048-byte logical sectors back over the data port.
  */
 
+#include <stdbool.h>
+
 #include "atapi.h"
 #include "console.h"
 #include "io.h"
@@ -53,7 +55,7 @@ static const struct chan chans[2] = {{0x1F0, 0x3F6}, {0x170, 0x376}};
 /* The first CD/DVD drive atapi_init() latched onto, if any. One is plenty —
  * mirrors ata.c's single-disk model. */
 static struct {
-  int present;
+  bool present;
   uint16_t io, ctrl;
   uint8_t sel; /* 0xA0 = master, 0xB0 = slave                        */
   char model[41];
@@ -205,7 +207,7 @@ static int probe_one(uint16_t io, uint16_t ctrl, uint8_t sel)
     return 0;
 
   /* It's a packet device. Pull its model via IDENTIFY PACKET DEVICE. */
-  cd.present = 1;
+  cd.present = true;
   cd.io = io;
   cd.ctrl = ctrl;
   cd.sel = sel;
@@ -224,7 +226,7 @@ static int probe_one(uint16_t io, uint16_t ctrl, uint8_t sel)
 
 void atapi_init(void)
 {
-  cd.present = 0;
+  cd.present = false;
   for (int c = 0; c < 2 && !cd.present; c++)
     for (int d = 0; d < 2; d++) {
       uint8_t sel = d ? 0xB0 : 0xA0;

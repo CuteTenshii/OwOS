@@ -629,7 +629,7 @@ struct lookup_ctx {
   uint32_t nlen;
   uint64_t found; /* matched child recno                           */
   int is_dir;
-  int have;     /* set once a match (preferring Win32 namespace) */
+  bool have;    /* set once a match (preferring Win32 namespace) */
   int best_dos; /* the current match was a DOS-namespace name    */
 };
 
@@ -647,7 +647,7 @@ static int lookup_cb(void *vctx, const struct index_entry *e)
     return 0;
   c->found = e->child;
   c->is_dir = e->is_dir;
-  c->have = 1;
+  c->have = true;
   c->best_dos = is_dos;
   /* Keep scanning only if we matched on a DOS name (might find a Win32 one). */
   return is_dos ? 0 : 1;
@@ -663,7 +663,7 @@ static int dir_lookup(struct ntfs_mount *m, const uint8_t *rec, const char *name
   c.nlen = nlen;
   c.found = 0;
   c.is_dir = 0;
-  c.have = 0;
+  c.have = false;
   c.best_dos = 0;
   int stopped = 0;
   if (for_each_dir_entry(m, rec, lookup_cb, &c, &stopped) != 0)
@@ -931,7 +931,7 @@ struct list_ctx {
   char *name;
   int *is_dir_out;
   uint32_t *size_out;
-  int hit; /* set when want_idx matched                     */
+  bool hit; /* set when want_idx matched                     */
   struct ntfs_mount *m;
 };
 
@@ -973,7 +973,7 @@ static int list_cb(void *vctx, const struct index_entry *e)
       *c->is_dir_out = isd;
     if (c->size_out)
       *c->size_out = fsz;
-    c->hit = 1;
+    c->hit = true;
     return 1;
   }
   c->seen++;
@@ -993,7 +993,7 @@ static int op_list(void *inst, const char *path)
   c.name = NULL;
   c.is_dir_out = NULL;
   c.size_out = NULL;
-  c.hit = 0;
+  c.hit = false;
   c.m = m;
   int stopped = 0;
   if (for_each_dir_entry(m, m->dir_rec, list_cb, &c, &stopped) != 0)
@@ -1016,7 +1016,7 @@ static int op_enum_dir(void *inst, const char *path, int idx, char *name, int *i
   c.name = name;
   c.is_dir_out = is_dir;
   c.size_out = size;
-  c.hit = 0;
+  c.hit = false;
   c.m = m;
   int stopped = 0;
   if (for_each_dir_entry(m, m->dir_rec, list_cb, &c, &stopped) != 0)

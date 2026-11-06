@@ -14,6 +14,7 @@
 #ifndef OWOS_SYNAPTICS_H
 #define OWOS_SYNAPTICS_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Probe the aux device for a Synaptics TouchPad and, if found, switch it into
@@ -25,7 +26,7 @@
 int synaptics_init(int max_x, int max_y);
 
 /* 1 once synaptics_init succeeded. */
-int synaptics_active(void);
+bool synaptics_active(void);
 
 /* Move the clamp box onto a new screen size after a resolution change. */
 void synaptics_set_bounds(int max_x, int max_y);
@@ -37,7 +38,7 @@ void synaptics_set_bounds(int max_x, int max_y);
  * right, bit2 middle), and the wheel delta (two-finger scroll) into *dz.
  * Returns 0 mid-packet, on a dropped (out-of-sync) byte, or when nothing
  * changed. Call only from the mouse IRQ handler. */
-int synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz);
+bool synaptics_feed(uint8_t byte, int *x, int *y, int *btn, int *dz);
 
 /* Current button mask, including the time-limited tap-to-click pulse. mouse.c's
  * mouse_buttons() routes here when we're active so a tap registers a clean

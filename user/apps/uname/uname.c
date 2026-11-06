@@ -7,21 +7,22 @@
  * read the kernel's arch from its own build). */
 #include "opt.h"
 #include "owos.h"
+#include <stdbool.h>
 
 static void usage(void) { puts("usage: uname [-asnrvmo]\n"); }
 
-static void emit(const char *s, int *first)
+static void emit(const char *s, bool *first)
 {
   if (!*first)
     write(1, " ", 1);
   write(1, s, (int)strlen(s));
-  *first = 0;
+  *first = false;
 }
 
 int main(int argc, char **argv)
 {
   struct utsname u;
-  int s = 0, n = 0, r = 0, v = 0, m = 0, o = 0, any = 0, first = 1;
+  bool s = false, n = false, r = false, v = false, m = false, o = false, any = false, first = true;
 
   static const struct opt opts[] = {
       {'a', "all", OPT_FLAG, 'a'},
@@ -50,20 +51,20 @@ int main(int argc, char **argv)
       return 0;
     }
     if (c == 'a')
-      s = n = r = v = m = o = 1;
+      s = n = r = v = m = o = true;
     else if (c == 's')
-      s = 1;
+      s = true;
     else if (c == 'n')
-      n = 1;
+      n = true;
     else if (c == 'r')
-      r = 1;
+      r = true;
     else if (c == 'v')
-      v = 1;
+      v = true;
     else if (c == 'm')
-      m = 1;
+      m = true;
     else
-      o = 1;
-    any = 1;
+      o = true;
+    any = true;
   }
 
   if (uname(&u) != 0) {
@@ -71,7 +72,7 @@ int main(int argc, char **argv)
     return 1;
   }
   if (!any)
-    s = 1; /* default: kernel name */
+    s = true; /* default: kernel name */
 
   if (s)
     emit(u.sysname, &first);
