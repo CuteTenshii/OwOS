@@ -57,7 +57,7 @@ done
 	"$ROOT/user/lib/js/ast.c" "$ROOT/user/lib/js/value.c" \
 	"$ROOT/user/lib/js/interp.c" "$ROOT/user/lib/js/builtins.c" \
 	"$ROOT/user/lib/js/bigint.c" "$ROOT/user/lib/math/fmt.c" \
-	"$ROOT/user/lib/gc/gc.c" "$ROOT/scripts/host_math.c" \
+	"$ROOT/user/lib/gc/gc.c" "$ROOT/scripts/host_math.c" "$ROOT/user/lib/opt.c" \
 	-lm -o "$BUILD/owos-tests" || exit 1
 
 exec "$BUILD/owos-tests"

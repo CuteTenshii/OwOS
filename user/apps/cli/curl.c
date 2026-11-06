@@ -1,4 +1,4 @@
-/* curl.c — an HTTP/1.1 client, a thin CLI over libcurl (user/lib/http.c).
+/* curl.c - an HTTP/1.1 client, a thin CLI over libcurl (user/lib/http.c).
  *
  * The protocol lives in libcurl; this file just parses options, picks where the
  * body goes (console, or a buffer for -o), and reports the outcome. Ctrl+C is a
@@ -10,6 +10,7 @@
  */
 
 #include "http.h"
+#include "opt.h"
 #include "owos.h"
 
 /* ---- body sinks -------------------------------------------------------- */
@@ -66,22 +67,27 @@ int main(int argc, char **argv)
   char xhdr[2048];
   int xhlen = 0; /* -H request headers ("name: value\r\n"…) */
 
-  for (int i = 1; i < argc; i++) {
-    const char *a = argv[i];
-    if (streq(a, "-i"))
+  static const struct opt opts[] = {
+      {'i', 0, OPT_FLAG, 'i'}, {0, "http2", OPT_FLAG, '2'},       {'3', "http3", OPT_FLAG, '3'}, {'X', 0, OPT_ARG, 'X'},
+      {'o', 0, OPT_ARG, 'o'},  {'A', "user-agent", OPT_ARG, 'A'}, {'H', 0, OPT_ARG, 'H'},
+  };
+  struct optstate st;
+  opt_init(&st, argc, argv);
+  for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
+    if (o == 'i') {
       show_headers = 1;
-    else if (streq(a, "--http2"))
+    } else if (o == '2') {
       http2 = 1;
-    else if (streq(a, "--http3") || streq(a, "-3"))
+    } else if (o == '3') {
       http3 = 1;
-    else if (streq(a, "-X") && i + 1 < argc)
-      method = argv[++i];
-    else if (streq(a, "-o") && i + 1 < argc)
-      outname = argv[++i];
-    else if ((streq(a, "-A") || streq(a, "--user-agent")) && i + 1 < argc)
-      user_agent = argv[++i];
-    else if (streq(a, "-H") && i + 1 < argc) {
-      const char *h = argv[++i];
+    } else if (o == 'X') {
+      method = st.arg;
+    } else if (o == 'o') {
+      outname = st.arg;
+    } else if (o == 'A') {
+      user_agent = st.arg;
+    } else if (o == 'H') {
+      const char *h = st.arg;
       if (starts_ci(h, "user-agent:"))
         ua_in_headers = 1;
       for (int k = 0; h[k] && xhlen < (int)sizeof xhdr - 3; k++)
@@ -89,8 +95,13 @@ int main(int argc, char **argv)
       xhdr[xhlen++] = '\r';
       xhdr[xhlen++] = '\n';
       xhdr[xhlen] = '\0';
-    } else if (a[0] != '-')
-      url = a;
+    } else if (o == OPT_POS) {
+      url = st.arg;
+    } else {
+      printf("curl: bad option %s\n", st.bad);
+      url = 0;
+      break;
+    }
   }
 
   if (!url) {
@@ -100,7 +111,7 @@ int main(int argc, char **argv)
   }
 
   /* The User-Agent is the tool's to send, not libcurl's (as on a real system):
-   * add "-A" if given, else a default — unless a -H line already carries one.
+   * add "-A" if given, else a default - unless a -H line already carries one.
    */
   if (!ua_in_headers) {
     const char *ua = user_agent ? user_agent : "owos-curl/1.0";

@@ -1,4 +1,4 @@
-/* notifysend.c — /bin/notify-send: raise a notification from the shell.
+/* notifysend.c - /bin/notify-send: raise a notification from the shell.
  *
  *   notify-send <title> [body]
  *   notify-send -i <image.png> <title> [body]
@@ -8,6 +8,7 @@
  * action button "Label:command" (the command is spawned when the button is
  * clicked). The rest is the title and an optional body. */
 #include "notify.h"
+#include "opt.h"
 #include "owos.h"
 
 static void usage(void)
@@ -24,16 +25,24 @@ int main(int argc, char **argv)
   const char *pos[2] = {0, 0};
   int npos = 0;
 
-  for (int i = 1; i < argc; i++) {
-    if (streq(argv[i], "-a") && i + 1 < argc) {
-      n.app = argv[++i];
-    } else if (streq(argv[i], "-s") && i + 1 < argc) {
-      n.subtitle = argv[++i];
-    } else if (streq(argv[i], "-i") && i + 1 < argc) {
-      n.image = argv[++i];
-    } else if (streq(argv[i], "-b") && i + 1 < argc && n.nbuttons < NOTIFY_MAX_BUTTONS) {
-      /* "Label:command" — split on the first ':'. */
-      const char *s = argv[++i];
+  static const struct opt opts[] = {
+      {'a', "app", OPT_ARG, 'a'},
+      {'s', "subtitle", OPT_ARG, 's'},
+      {'i', "image", OPT_ARG, 'i'},
+      {'b', "button", OPT_ARG, 'b'},
+  };
+  struct optstate st;
+  opt_init(&st, argc, argv);
+  for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
+    if (o == 'a') {
+      n.app = st.arg;
+    } else if (o == 's') {
+      n.subtitle = st.arg;
+    } else if (o == 'i') {
+      n.image = st.arg;
+    } else if (o == 'b' && n.nbuttons < NOTIFY_MAX_BUTTONS) {
+      /* "Label:command", split on the first ':' */
+      const char *s = st.arg;
       int k = n.nbuttons, j = 0;
       while (s[j] && s[j] != ':' && j < NOTIFY_BLABEL_MAX - 1)
         blabel[k][j] = s[j], j++;
@@ -43,11 +52,12 @@ int main(int argc, char **argv)
       n.buttons[k].label = blabel[k];
       n.buttons[k].action = s[j] == ':' ? s + j + 1 : 0;
       n.nbuttons++;
-    } else if (argv[i][0] == '-' && argv[i][1]) {
+    } else if (o == OPT_POS) {
+      if (npos < 2)
+        pos[npos++] = st.arg;
+    } else {
       usage();
       return 2;
-    } else if (npos < 2) {
-      pos[npos++] = argv[i];
     }
   }
 

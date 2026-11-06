@@ -1,10 +1,10 @@
-# user/lib/build.mk — user/lib, the user-space libraries.
+# user/lib/build.mk - user/lib, the user-space libraries.
 #
-# -mno-sse/-mmx + x87 math: like the kernel, user code must avoid SSE — the
+# -mno-sse/-mmx + x87 math: like the kernel, user code must avoid SSE - the
 # context switch saves no FPU/SSE state, and the float->int conversions gcc would
 # otherwise emit as cvttss2si (#UD on a no-SSE CPU like QEMU's qemu32) must use
-# x87 instead. The user lib is one directory per actual library — curl/ torrent/
-# crypto/ gfx/ zlib/ png/ mp3/ font/ — each linked independently into the programs
+# x87 instead. The user lib is one directory per actual library - curl/ torrent/
+# crypto/ gfx/ zlib/ png/ mp3/ font/ - each linked independently into the programs
 # that use it, and each added to the include path so the flat `#include "http.h"`
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
@@ -21,12 +21,12 @@ UCFLAGS += -DJS_TRACE_THROW
 endif
 
 # Base every program links: crt + the syscall/libc lib. GUI (windowed) apps also
-# link $(GUILIB) — gfx + the scalable font rasterizer; CLI apps don't (they just
+# link $(GUILIB) - gfx + the scalable font rasterizer; CLI apps don't (they just
 # read/write stdio and the terminal renders their output), so they carry no
 # graphics weight. gfx loads its fonts at runtime from /etc/fonts (see kernel
 # install + user/lib/gfx), so no app bakes in a bitmap atlas.
 FONT    := user/lib/font/font.o   # TrueType/OpenType(glyf) parser + AA glyph rasterizer
-ULIB    := user/lib/start.o user/lib/lib.o
+ULIB    := user/lib/start.o user/lib/lib.o user/lib/opt.o
 GUILIB  := user/lib/gfx/gfx.o user/lib/gfx/selection.o user/lib/gfx/sidebar.o user/lib/gfx/select.o user/lib/gfx/tabbar.o $(FONT)
 DIALOG  := user/lib/dialog/dialog.o   # reusable modal message-box + property-sheet dialogs (uses gfx)
 
@@ -45,15 +45,15 @@ H2      := user/lib/curl/h2.o         # libcurl: HTTP/2 engine (HPACK + framing)
 QUIC    := user/lib/curl/quic.o       # libcurl: QUIC v1 transport (RFC 9000/9001)
 H3      := user/lib/curl/h3.o         # libcurl: HTTP/3 framing + QPACK (RFC 9114/9204)
 MP3     := user/lib/mp3/mp3.o         # streaming MPEG audio decoder (.mp3/.mp2/.mp1)
-# mp4: ISO base media file format (.mp4/.mov/.m4v/.m4a) demuxer — box tree ->
+# mp4: ISO base media file format (.mp4/.mov/.m4v/.m4a) demuxer - box tree ->
 # tracks + a flat sample table, codec-agnostic. The substrate a video decoder
 # consumes; pure computation, libc-only (needs $(LIBGCC) for 64-bit box sizes).
 MP4     := user/lib/mp4/mp4.o
-# mpeg: from-scratch MPEG-1 video (ISO 11172-2) decoder + encoder — I/P/B pictures,
+# mpeg: from-scratch MPEG-1 video (ISO 11172-2) decoder + encoder - I/P/B pictures,
 # motion compensation, DCT/IDCT, run/level VLCs. Both directions round-trip through
 # ffmpeg's mpeg1video. Pure computation (x87 doubles for the IDCT), libc-only.
 MPEG    := user/lib/mpeg/decode.o user/lib/mpeg/encode.o
-# h264: from-scratch H.264/AVC Constrained Baseline decoder (CAVLC) — NAL/RBSP,
+# h264: from-scratch H.264/AVC Constrained Baseline decoder (CAVLC) - NAL/RBSP,
 # SPS/PPS/slice parsing, I/P slices, intra + inter (quarter-pel) prediction, the
 # 4x4 integer transform, and the in-loop deblocking filter. Verified bit-exact
 # against ffmpeg/libx264 (scripts/h264_test.c). Consumes an Annex-B stream or an
@@ -66,7 +66,7 @@ H264    := user/lib/h264/nal.o user/lib/h264/cavlc.o user/lib/h264/transform.o \
 # Apple's reference. Pure integer computation, libc-only (needs $(LIBGCC) for the
 # 64-bit ops in the container/CLI). Used by the `alac` CLI and the media engine.
 ALAC    := user/lib/alac/alac.o
-# aac: from-scratch MPEG-2/4 AAC Low Complexity decoder — the audio of .m4a/.mp4
+# aac: from-scratch MPEG-2/4 AAC Low Complexity decoder - the audio of .m4a/.mp4
 # and ADTS .aac. Full LC tool set (M/S, intensity, PNS, TNS, long/short IMDCT),
 # verified bit-exact against ffmpeg (scripts/aac_test.c). Pure computation, needs
 # $(MATH) (pow/sqrt/trig for dequant + windows) + $(LIBGCC).
@@ -106,20 +106,20 @@ JSON    := user/lib/json/json.o
 # + growable writer). Pure computation, libc-only (needs $(LIBGCC) for 64-bit
 # varint shifts/divides). Consumers supply their own schema (Chromecast, Google).
 PROTOBUF := user/lib/protobuf/protobuf.o
-# cast: Google Cast (Chromecast) sender — mDNS discovery + a TLS channel speaking
+# cast: Google Cast (Chromecast) sender - mDNS discovery + a TLS channel speaking
 # length-prefixed CastMessage protobufs with JSON payloads (Default Media
 # Receiver control). Bare .o; a consumer also links $(PROTOBUF) $(JSON) $(MATH)
 # $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE) (which bundles $(MDNS)).
 CAST    := user/lib/cast/cast.o
 NOTIFY  := user/lib/notify/notify.o   # notifyd client (desktop notifications)
-# mdns: mDNS (RFC 6762) + DNS-SD (RFC 6763) client over a UDP socket — .local
+# mdns: mDNS (RFC 6762) + DNS-SD (RFC 6763) client over a UDP socket - .local
 # resolution + service discovery. Pure over net_* + libc; needs $(LIBGCC).
 MDNS    := user/lib/mdns/mdns.o
-# resolve: the getaddrinfo analog — hostname -> IPv4 (IP literal / .local via
+# resolve: the getaddrinfo analog - hostname -> IPv4 (IP literal / .local via
 # $(MDNS) / unicast DNS from /etc/resolv.conf). Now that the kernel connect path
 # takes an IP only, this is the user-space resolver; needs $(MDNS) + $(LIBGCC).
 RESOLVE := user/lib/resolve/resolve.o $(MDNS)
-# stun: STUN (RFC 5389/8489) message codec + server-reflexive query — the generic
+# stun: STUN (RFC 5389/8489) message codec + server-reflexive query - the generic
 # NAT-traversal substrate ICE/WebRTC gathers candidates over. Needs $(CRYPTO)
 # (hmac_sha1 for MESSAGE-INTEGRITY) and $(RESOLVE) (stun_query's name->IP).
 STUN    := user/lib/stun/stun.o
@@ -160,5 +160,5 @@ user/%.o: user/%.c $(ARCH_STAMP)
 
 # Header dependencies: -MMD -MP (above) emits a .d beside each .o listing the
 # headers it includes, so editing a header (e.g. browser.h's struct layout)
-# recompiles every .o that includes it — no stale object with a mismatched ABI.
+# recompiles every .o that includes it - no stale object with a mismatched ABI.
 -include $(shell find user -name '*.d' 2>/dev/null)

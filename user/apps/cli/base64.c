@@ -1,4 +1,4 @@
-/* base64.c — encode or decode base64 (RFC 4648).
+/* base64.c - encode or decode base64 (RFC 4648).
  *
  *   base64 [file]        encode <file> (or stdin) to base64, wrapped at 76 cols
  *   base64 -d [file]     decode base64 <file> (or stdin) to raw bytes
@@ -7,6 +7,7 @@
  * works in a pipe. The codec lives in user/lib/base64; this is just the front
  * end. */
 #include "base64.h"
+#include "opt.h"
 #include "owos.h"
 
 /* Read the whole of `path` into a malloc'd buffer. NULL on error, *out_len set.
@@ -71,25 +72,26 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-  int decode = 0, i;
+  int decode = 0;
   const char *path = 0;
   char *input;
   int in_len = 0;
 
-  for (i = 1; i < argc; i++) {
-    const char *a = argv[i];
-    if (a[0] == '-' && a[1] == 'd' && !a[2])
+  static const struct opt opts[] = {{'d', "decode", OPT_FLAG, 'd'}, {'h', "help", OPT_FLAG, 'h'}};
+  struct optstate st;
+  opt_init(&st, argc, argv);
+  for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
+    if (o == 'd') {
       decode = 1;
-    else if (a[0] == '-' && a[1] == 'h' && !a[2]) {
+    } else if (o == 'h') {
       usage();
       return 0;
-    } else if (a[0] == '-' && a[1] == '\0')
-      path = 0; /* "-" = stdin */
-    else if (a[0] == '-' && a[1]) {
-      printf("base64: unknown option %s\n", a);
+    } else if (o == OPT_POS) {
+      path = streq(st.arg, "-") ? 0 : st.arg; /* "-" = stdin */
+    } else {
+      printf("base64: unknown option %s\n", st.bad);
       return 1;
-    } else
-      path = a;
+    }
   }
 
   if (path) {

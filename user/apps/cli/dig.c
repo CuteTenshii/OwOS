@@ -1,4 +1,4 @@
-/* dig.c — a DNS lookup tool over a UDP socket.
+/* dig.c - a DNS lookup tool over a UDP socket.
  *
  * The kernel only lends a UDP datagram transport; this program builds the DNS
  * query and parses the response (header, question, answer RRs with name
@@ -10,6 +10,7 @@
  *   dig @10.0.2.3 example.com  use a specific resolver
  */
 
+#include "opt.h"
 #include "owos.h"
 #include "resolve.h"
 
@@ -161,15 +162,19 @@ static void put_rdata(const unsigned char *msg, int end, int type, int rd, int r
 int main(int argc, char **argv)
 {
   const char *server = "8.8.8.8", *host = 0, *typestr = 0;
-  for (int i = 1; i < argc; i++) {
-    if (argv[i][0] == '@')
-      server = argv[i] + 1;
-    else if (argv[i][0] == '-')
-      continue;
+  struct optstate st;
+  opt_init(&st, argc, argv);
+  for (int o; (o = opt_next(&st, 0, 0)) != OPT_DONE;) {
+    if (o != OPT_POS) {
+      host = 0;
+      break;
+    }
+    if (st.arg[0] == '@')
+      server = st.arg + 1;
     else if (!host)
-      host = argv[i];
+      host = st.arg;
     else if (!typestr)
-      typestr = argv[i];
+      typestr = st.arg;
   }
   if (!host) {
     puts("usage: dig [@server] <host> [type]   (A AAAA NS CNAME MX TXT PTR SOA "

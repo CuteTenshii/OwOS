@@ -1,7 +1,7 @@
-/* stun.c — print this host's public (server-reflexive) address via STUN.
+/* stun.c - print this host's public (server-reflexive) address via STUN.
  *
  * A thin harness over user/lib/stun: send a Binding request to a STUN server
- * and report the XOR-MAPPED-ADDRESS the server saw — the IP:port a NAT maps our
+ * and report the XOR-MAPPED-ADDRESS the server saw - the IP:port a NAT maps our
  * UDP socket to. The same reflexive lookup ICE/WebRTC uses to gather
  * candidates.
  *
@@ -11,6 +11,7 @@
  */
 
 #include "stun.h"
+#include "opt.h"
 #include "owos.h"
 
 int main(int argc, char **argv)
@@ -18,20 +19,26 @@ int main(int argc, char **argv)
   const char *server = "stun.l.google.com";
   int port = 19302; /* Google's public STUN     */
 
-  if (argc > 1) {
-    if (streq(argv[1], "-h") || streq(argv[1], "--help")) {
+  static const struct opt opts[] = {{'h', "help", OPT_FLAG, 'h'}};
+  struct optstate st;
+  int npos = 0;
+  opt_init(&st, argc, argv);
+  for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
+    unsigned p;
+    if (o == 'h') {
       puts("usage: stun [server] [port]   (default stun.l.google.com 19302)\n");
       return 0;
     }
-    server = argv[1];
-    port = 3478; /* the IANA default port    */
-  }
-  if (argc > 2) {
-    int p = 0;
-    for (const char *s = argv[2]; *s >= '0' && *s <= '9'; s++)
-      p = p * 10 + (*s - '0');
-    if (p > 0 && p < 65536)
-      port = p;
+    if (o != OPT_POS) {
+      printf("stun: unknown option %s\n", st.bad);
+      return 1;
+    }
+    if (npos++ == 0) {
+      server = st.arg;
+      port = 3478; /* the IANA default port    */
+    } else if (npos == 2 && opt_uint(st.arg, &p) == 0 && p > 0 && p < 65536) {
+      port = (int)p;
+    }
   }
 
   stun_addr a;

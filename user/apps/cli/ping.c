@@ -1,4 +1,4 @@
-/* ping.c — an ICMP echo client over a raw ICMP socket.
+/* ping.c - an ICMP echo client over a raw ICMP socket.
  *
  * The kernel only lends a raw ICMP transport (net_connect(ip, 0, SK_ICMP) +
  * net_send/net_recv): this program resolves the host in user space (net_dial),
@@ -9,6 +9,7 @@
  *   ping -c 4 host       stop after 4
  */
 
+#include "opt.h"
 #include "owos.h"
 #include "resolve.h"
 
@@ -44,13 +45,18 @@ int main(int argc, char **argv)
 
   signal(SIGINT, on_sigint);
 
-  for (int i = 1; i < argc; i++) {
-    if (streq(argv[i], "-c") && i + 1 < argc) {
-      count = 0;
-      for (const char *p = argv[++i]; *p >= '0' && *p <= '9'; p++)
-        count = count * 10 + (*p - '0');
-    } else if (argv[i][0] != '-') {
-      host = argv[i];
+  static const struct opt opts[] = {{'c', "count", OPT_ARG, 'c'}};
+  struct optstate st;
+  opt_init(&st, argc, argv);
+  for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
+    unsigned n;
+    if (o == 'c' && opt_uint(st.arg, &n) == 0) {
+      count = (int)n;
+    } else if (o == OPT_POS) {
+      host = st.arg;
+    } else {
+      host = 0;
+      break;
     }
   }
   if (!host) {

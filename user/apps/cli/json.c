@@ -1,4 +1,4 @@
-/* json.c — a JSON command-line tool: validate, pretty-print, or minify.
+/* json.c - a JSON command-line tool: validate, pretty-print, or minify.
  *
  *   json [file]        pretty-print <file> (or stdin) with 2-space indent
  *   json -c [file]     compact (minify) instead
@@ -9,6 +9,7 @@
  * Input is a file argument, or stdin when none is given (so it works in a
  * pipe). */
 #include "json.h"
+#include "opt.h"
 #include "owos.h"
 
 /* Read the whole of `path` into a malloc'd buffer (NUL is not appended; the
@@ -89,7 +90,7 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-  int indent = 2, validate = 0, i;
+  int indent = 2, validate = 0;
   const char *path = 0;
   char *input;
   int in_len = 0, out_len = 0;
@@ -97,24 +98,30 @@ int main(int argc, char **argv)
   json_value *root;
   char *out;
 
-  for (i = 1; i < argc; i++) {
-    const char *a = argv[i];
-    if (a[0] == '-' && a[1] && !path) {
-      if (a[1] == 'c')
-        indent = 0;
-      else if (a[1] == 'v')
-        validate = 1;
-      else if (a[1] == 'i')
-        indent = parse_int(argv[++i], 2);
-      else if (a[1] == 'h') {
-        usage();
-        return 0;
-      } else {
-        printf("json: unknown option %s\n", a);
-        return 1;
-      }
-    } else if (!path) {
-      path = a;
+  static const struct opt opts[] = {
+      {'c', "compact", OPT_FLAG, 'c'},
+      {'v', "validate", OPT_FLAG, 'v'},
+      {'i', "indent", OPT_ARG, 'i'},
+      {'h', "help", OPT_FLAG, 'h'},
+  };
+  struct optstate st;
+  opt_init(&st, argc, argv);
+  for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
+    if (o == 'c') {
+      indent = 0;
+    } else if (o == 'v') {
+      validate = 1;
+    } else if (o == 'i') {
+      indent = parse_int(st.arg, 2);
+    } else if (o == 'h') {
+      usage();
+      return 0;
+    } else if (o == OPT_POS) {
+      if (!path)
+        path = st.arg;
+    } else {
+      printf("json: unknown option %s\n", st.bad);
+      return 1;
     }
   }
 
