@@ -71,6 +71,15 @@ void syscall_process_kill(struct registers *r) { r->eax = (uint32_t)sched_signal
 
 void syscall_process_power(struct registers *r)
 {
+  if (r->ebx == 3) {
+    r->eax = power_can_sleep();
+    return;
+  }
+  if (r->ebx == 2) {
+    power_sleep();
+    r->eax = 0;
+    return;
+  }
   if (r->ebx == 1)
     power_reset();
   else

@@ -316,7 +316,7 @@ int read_nb(int fd, void *buf, int len); /* >0 bytes / 0 would-block / -1 EOF */
 int chdir(const char *path);             /* set this process's cwd; 0/-1 */
 int kill(int pid, int sig);              /* post a signal to a task; 0/-1 */
 int getpid(void);                        /* this process's pid */
-int power(int action);                   /* 0 = shut down, 1 = reboot */
+int power(int action); /* 0 = shut down, 1 = reboot, 2 = suspend (returns on resume), 3 = 1 if suspend works */
 
 /* Identity: numeric uid from the kernel; name/home resolved from /etc/passwd */
 int getuid(void);

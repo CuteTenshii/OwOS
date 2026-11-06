@@ -286,7 +286,7 @@ int chdir(const char *path) { return syscall(SYS_CHDIR, (int)path, 0, 0); }
 
 int kill(int pid, int sig) { return syscall(SYS_KILL, pid, sig, 0); }
 
-/* action: 0 = shut down, 1 = reboot */
+/* action: 0 = shut down, 1 = reboot, 2 = suspend (returns on resume), 3 = 1 if suspend is supported */
 int power(int action) { return syscall(SYS_POWER, action, 0, 0); }
 
 int getpid(void) { return syscall(SYS_GETPID, 0, 0, 0); }
