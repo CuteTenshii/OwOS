@@ -8,7 +8,7 @@
  *
  * Build + run (see CLAUDE.md "pure-lib logic gets host unit tests"):
  *   cc -std=c11 -Iscripts -Iuser/apps/browser -Iuser/lib/math \
- *      tests/css_test.c user/apps/browser/css/engine.c user/apps/browser/css/sibling.c
+ *      tests/css_test.c user/apps/browser/css/engine.c user/apps/browser/css/engine_values.c user/apps/browser/css/engine_props.c user/apps/browser/css/engine_decl.c user/apps/browser/css/engine_sel.c user/apps/browser/css/engine_sheet.c user/apps/browser/css/sibling.c
  * user/apps/browser/color.c \ -lm -o /tmp/css_test && /tmp/css_test
  */
 #include <stdio.h>

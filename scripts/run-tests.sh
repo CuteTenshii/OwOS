@@ -43,7 +43,7 @@ done
 	-o "$BUILD/test_runner.o" || exit 1
 
 "$CC" "${INCLUDES[@]}" "$BUILD"/*.o \
-	"$ROOT/user/apps/browser/css/engine.c" "$ROOT/user/apps/browser/css/sibling.c" "$ROOT/user/apps/browser/color.c" \
+	"$ROOT/user/apps/browser/css/engine.c" "$ROOT/user/apps/browser/css/engine_values.c" "$ROOT/user/apps/browser/css/engine_props.c" "$ROOT/user/apps/browser/css/engine_decl.c" "$ROOT/user/apps/browser/css/engine_sel.c" "$ROOT/user/apps/browser/css/engine_sheet.c" "$ROOT/user/apps/browser/css/sibling.c" "$ROOT/user/apps/browser/color.c" \
 	"$ROOT/user/apps/browser/dom.c" "$ROOT/user/apps/browser/features/csp/csp.c" \
 	"$ROOT/user/apps/browser/js/classlist.c" \
 	"$ROOT/user/apps/browser/js/webapi.c" \

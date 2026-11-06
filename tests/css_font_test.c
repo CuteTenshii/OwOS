@@ -5,7 +5,7 @@
  * font-variant-caps small-caps, all through css_apply_inline.
  *
  *   cc -std=c11 -Iscripts -Iuser/apps/browser \
- *      tests/css_font_test.c user/apps/browser/css/engine.c user/apps/browser/css/sibling.c \
+ *      tests/css_font_test.c user/apps/browser/css/engine.c user/apps/browser/css/engine_values.c user/apps/browser/css/engine_props.c user/apps/browser/css/engine_decl.c user/apps/browser/css/engine_sel.c user/apps/browser/css/engine_sheet.c user/apps/browser/css/sibling.c \
  *      user/apps/browser/color.c user/apps/browser/dom.c \
  *      -lm -o /tmp/css_font_test && /tmp/css_font_test
  */

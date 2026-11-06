@@ -1,0 +1,718 @@
+#include "main_int.h"
+
+/* Run item `item` of leaf menu `m` (a bar menu or one of its submenus — the
+ * menubar helper reports which one, so we dispatch by pointer). Reload is also
+ * reached via the F5 accelerator. */
+static void menu_action(struct menu *m, int item)
+{
+  int py, phh, rows;
+  pane_metrics(&py, &phh, &rows);
+  if (m == &pagemenu) {
+    switch (item) {
+    case 0:
+      do_reload();
+      break; /* Reload current page     */
+    case 1:
+      navigate("example.com");
+      break; /* Home                    */
+    case 2:
+      do_stop();
+      break; /* Stop the in-flight load */
+    }
+  } else if (m == &editmenu) {
+    if (item == 0)
+      copy_selection(); /* Copy                    */
+    else if (item == 1)
+      select_all(); /* Select All              */
+  } else if (m == &viewmenu) {
+    if (item == 0) { /* Show Images checkbox    */
+      view_flags[0] ^= MENU_CHECKED;
+      show_images = (view_flags[0] & MENU_CHECKED) != 0;
+      B->seq++;
+    } /* item 1 = Scroll submenu */
+  } else if (m == &scrollmenu) {
+    switch (item) {
+    case 0:
+      scroll_set(0);
+      break; /* Top      */
+    case 1:
+      scroll_set(scroll_max());
+      break; /* Bottom   */
+    case 2:
+      scroll_set(B->pg->scroll - phh);
+      break; /* Page Up  */
+    case 3:
+      scroll_set(B->pg->scroll + phh);
+      break; /* Page Down */
+    }
+  } else if (m == &bmarkmenu) {
+    switch (item) {
+    case 0:
+      toggle_current_bookmark();
+      break; /* Add/Remove Bookmark */
+    case 1:
+      bm_panel_open = !bm_panel_open;
+      B->seq++;
+      break; /* Show/Hide panel     */
+    case 2:
+      begin_new_folder(bookmarks_root());
+      break; /* New top-level folder */
+    }
+  }
+}
+
+/* Hover link-scan cache: the span [hov_lo,hov_hi) of the last resolved link (or
+ * of the last empty gap between links) on display row hov_row, valid while the
+ * page + its content version (B->pg / B->seq) are unchanged. A pointer move
+ * that lands in the same span reuses hov_link instead of rescanning all links —
+ * the common case over long link lists / large link-free text areas. */
+static struct page *hov_pg;
+static unsigned hov_seq;
+static int hov_row = -1, hov_link = -1, hov_lo, hov_hi;
+
+/* Line-relative x where display line `row`'s glyphs begin: its left edge plus
+ * the block indent and, for a centered block, the centering offset — the same
+ * origin draw_slice_core paints from. Calls set_block, so callers must hold
+ * browser_buf_lock and the line index must be in range. Shared by the hit-test and
+ * selection mappers so neither can drift from the painted position. */
+static int line_content_x(int row)
+{
+  int len = g_fr->lt.len[row], base = g_fr->lt.off[row];
+  set_block(&g_ui, base);
+  int x = g_fr->lt.x[row] + g_ui.bindent * INDENT_PX;
+  if (g_ui.bcenter == 1 || g_ui.bcenter == 2) {
+    int lw = 0;
+    unsigned cp;
+    for (int p = base; p < base + len;) {
+      int gp = p;
+      p += utf8_decode(&B->pg->text[p], &B->pg->text[base + len], &cp);
+      lw += body_cp_adv(&g_ui, cp, glyph_px(gp));
+    }
+    int room = (g_fr->lt.w[row] - g_ui.bindent * INDENT_PX) - lw;
+    if (room > 0)
+      x += g_ui.bcenter == 1 ? room / 2 : room;
+  }
+  return x;
+}
+
+/* Resolve a content-pane hit at client coords (mx,my): sets *off to the text
+ * offset under the cursor (-1 if outside the pane or past the line's glyphs)
+ * and copies the absolute href of any <a> covering it into `url` ("" if none).
+ * Holds browser_buf_lock across the walk + resolve, since the worker can move the
+ * text/line/ link tables with a realloc mid-load. Shared by the click and hover
+ * handlers. */
+static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
+{
+  *off = -1;
+  if (cap)
+    url[0] = '\0';
+  if (newtab)
+    *newtab = 0;
+  int py, phh, rows;
+  pane_metrics(&py, &phh, &rows);
+  int right = devtools_visible() ? devtools_left() : BW;
+  if (my < py || my >= py + phh || mx < 0 || mx >= right - SCROLL_W)
+    return; /* outside the content pane: skip the lock */
+  browser_buf_lock();
+  int row = lt_line_at(&g_fr->lt, B->pg->scroll + (my - py));
+  if (row >= 0 && row < g_fr->lt.n) {
+    /* proportional: walk the line's glyphs from the painted origin (block
+     * indent + centering, via line_content_x) to find which char the point
+     * falls on. A point left of the glyphs is not on any char. */
+    int len = g_fr->lt.len[row], base = g_fr->lt.off[row], col = -1;
+    int x = line_content_x(row);
+    for (int k = 0; mx >= x && k < len;) {
+      unsigned cp;
+      int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
+      int cw = body_cp_adv(&g_ui, cp, glyph_px(base + k));
+      if (mx < x + cw) {
+        col = k;
+        break;
+      }
+      x += cw;
+      k += nb;
+    }
+    if (col >= 0)
+      *off = base + col;
+  }
+  /* An inline image (incl. inline <svg>) occupies its own blank reserved row,
+   * so the glyph walk above finds no column there — map a click on the image to
+   * its anchor offset, so an <a> wrapping the image resolves to that link. */
+  if (*off < 0) {
+    for (int i = 0; i < B->pg->n_imgs; i++) {
+      struct inl_img *im = &B->pg->imgs[i];
+      if (im->start_row < 0)
+        continue;
+      int r1 = im->start_row + (im->rows > 0 ? im->rows : 1);
+      if (row >= im->start_row && row < r1) {
+        *off = im->text_pos;
+        break;
+      }
+    }
+  }
+  if (*off >= 0) {
+    bool cache_ok = (hov_pg == B->pg && hov_seq == B->seq && row == hov_row);
+    if (cache_ok && *off >= hov_lo && *off < hov_hi) {
+      /* Same row + same link/gap span as the last move: reuse it. */
+      if (hov_link >= 0 && hov_link < B->pg->nlinks) {
+        resolve_url(B->pg->cur_url, B->pg->links[hov_link].href, url, cap);
+        if (newtab)
+          *newtab = B->pg->links[hov_link].newtab;
+      }
+    } else {
+      /* Scan once, and cache both the covering link and, on a miss, the
+       * link-free gap around *off (bounded by the nearest link edges) so
+       * an idle move over plain text also short-circuits next time. */
+      int found = -1, lo = 0, hi = B->pg->text_len;
+      for (int i = 0; i < B->pg->nlinks; i++) {
+        int s = B->pg->links[i].start, e = B->pg->links[i].end;
+        if (*off >= s && *off < e) {
+          found = i;
+          lo = s;
+          hi = e;
+          break;
+        }
+        if (e <= *off && e > lo)
+          lo = e;
+        if (s > *off && s < hi)
+          hi = s;
+      }
+      if (found >= 0) {
+        resolve_url(B->pg->cur_url, B->pg->links[found].href, url, cap);
+        if (newtab)
+          *newtab = B->pg->links[found].newtab;
+      }
+      hov_pg = B->pg;
+      hov_seq = B->seq;
+      hov_row = row;
+      hov_link = found;
+      hov_lo = lo;
+      hov_hi = hi;
+    }
+  }
+  browser_buf_unlock();
+}
+
+/* Map a pane pixel to (display line, byte offset within that line), clamped so
+ * a drag past the text edge selects to the line/end. Used for text selection.
+ */
+static void pane_linecol(int mx, int my, int *line, int *col)
+{
+  int py, phh, rows;
+  pane_metrics(&py, &phh, &rows);
+  *line = 0;
+  *col = 0;
+  /* The worker rebuilds the line table and B->pg->text under browser_buf_lock; take it
+   * so a mid-navigation free/rewrap can't hand this drag a stale nlines>0 with
+   * a freed text buffer (utf8_decode would then deref a NULL/dangling pointer).
+   */
+  browser_buf_lock();
+  if (B->pg->text && g_fr->lt.n > 0) {
+    int row = lt_line_at(&g_fr->lt, B->pg->scroll + (my - py));
+    if (row < 0)
+      row = 0;
+    if (row >= g_fr->lt.n)
+      row = g_fr->lt.n - 1;
+    *line = row;
+    int len = g_fr->lt.len[row], base = g_fr->lt.off[row];
+    int x = line_content_x(row); /* match draw_styled_line */
+    int c = len;                 /* default: end of line */
+    for (int k = 0; k < len;) {
+      unsigned cp;
+      int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
+      int cw = body_cp_adv(&g_ui, cp, glyph_px(base + k));
+      if (mx < x + cw / 2) {
+        c = k;
+        break;
+      } /* nearest char edge */
+      x += cw;
+      k += nb;
+    }
+    *col = c;
+  }
+  browser_buf_unlock();
+}
+
+/* Alpha-blend a translucent selection highlight over the frame buffer rect,
+ * clipped to the rows [ct,cb). */
+void sel_hl_rect(int x, int y, int w, int h, int ct, int cb)
+{
+  unsigned *fb = browser_surface();
+  const unsigned sr = 0x33, sg = 0x66, sb = 0xcc, a = 110, ia = 255 - a; /* ~43% blue */
+  for (int yy = y; yy < y + h; yy++) {
+    if (yy < ct || yy >= cb || yy < 0 || yy >= BH)
+      continue;
+    unsigned *row = fb + (unsigned long)yy * BW;
+    for (int xx = x; xx < x + w; xx++) {
+      if (xx < 0 || xx >= BW)
+        continue;
+      unsigned d = row[xx];
+      unsigned r = (sr * a + ((d >> 16) & 0xff) * ia) / 255;
+      unsigned g = (sg * a + ((d >> 8) & 0xff) * ia) / 255;
+      unsigned b = (sb * a + (d & 0xff) * ia) / 255;
+      row[xx] = (r << 16) | (g << 8) | b;
+    }
+  }
+}
+
+void handle_click(int mx, int my)
+{
+  if (my < MENU_H || menu_any_open()) { /* menu bar / dropdown */
+    bookmarks_menu_sync();
+    struct menu *leaf;
+    int item;
+    if (menubar_click(&menubar, mx, my, &leaf, &item)) {
+      if (item >= 0)
+        menu_action(leaf, item);
+      B->seq++;
+      return;
+    }
+  }
+  /* Developer tools dock (bottom of the window): consumes clicks within it.
+   * Its rect sits below the address bar, so it never shadows the bars above. */
+  if (devtools_handle_click(mx, my))
+    return;
+  if (my >= MENU_H && my < MENU_H + TAB_H) { /* tab strip */
+    blur_content_control();
+    int idx = 0;
+    switch (tabbar_hit(0, MENU_H, BW, n_tabs, mx, my, &idx)) {
+    case TABBAR_SELECT:
+      select_tab(idx);
+      break;
+    case TABBAR_CLOSE:
+      close_tab(idx);
+      break;
+    case TABBAR_NEW:
+      new_tab();
+      break;
+    }
+    B->seq++;
+    return;
+  }
+  if (my >= MENU_H + TAB_H && my < MENU_H + TAB_H + ADDR_H) { /* address bar */
+    blur_content_control();
+    struct rect rb, rf, rrl, rtf, rst;
+    addr_layout(&rb, &rf, &rrl, &rtf, &rst);
+    struct tab *at = &tabs[active_tab];
+    if (hist_can_back(at) && button_hit(rb.x, rb.y, rb.w, rb.h, mx, my)) {
+      go_back();
+    } else if (hist_can_fwd(at) && button_hit(rf.x, rf.y, rf.w, rf.h, mx, my)) {
+      go_fwd();
+    } else if (button_hit(rrl.x, rrl.y, rrl.w, rrl.h, mx, my)) {
+      if (is_loading())
+        do_stop();
+      else
+        do_reload();
+    } else if (B->pg->cur_url[0] && button_hit(rst.x, rst.y, rst.w, rst.h, mx, my)) {
+      toggle_current_bookmark();
+    } else {
+      textfield_click(&B->addr_tf, mx, my, rtf.x, rtf.y, rtf.w, rtf.h);
+    }
+    B->seq++;
+    return;
+  }
+  if (bm_panel_open && bm_panel_click(mx, my))
+    return;
+  int py, phh, rows;
+  pane_metrics(&py, &phh, &rows);
+  int right = devtools_visible() ? devtools_left() : BW;
+  int sbpart = scrollbar_hit(right - SCROLL_W, py, SCROLL_W, phh, mx, my);
+  if (sbpart != SCROLLBAR_NONE) { /* scrollbar */
+    int target;
+    if (sbpart == SCROLLBAR_UP)
+      target = B->pg->scroll - 3 * LINE_H;
+    else if (sbpart == SCROLLBAR_DOWN)
+      target = B->pg->scroll + 3 * LINE_H;
+    else
+      target = scrollbar_pos(right - SCROLL_W, py, SCROLL_W, phh, mx, my, B->pg->scroll, g_fr->doc_h, phh);
+    scroll_set(target);
+    return;
+  }
+  if (my >= py && my < py + phh) { /* content pane click */
+    /* Crashed tab: the only thing in the pane is the Reload button. */
+    if (tabs[active_tab].crashed) {
+      if (button_hit(crash_reload_rect.x, crash_reload_rect.y, crash_reload_rect.w, crash_reload_rect.h, mx, my))
+        do_reload();
+      return;
+    }
+    /* Inspect-element picker armed: a click selects the element under the
+     * cursor in devtools instead of following links / starting a selection. */
+    if (devtools_picking()) {
+      char res[URL_MAX];
+      int off;
+      pane_hit(mx, my, &off, res, sizeof res, 0);
+      devtools_pick_commit(off);
+      return;
+    }
+    /* A click on an <audio>/<video> controls widget is consumed by it
+     * (play/pause, seek, mute) — never treated as a link or selection. */
+    {
+      int sc = B->pg->scroll;
+      int right = devtools_visible() ? devtools_left() : BW;
+      int paw = (right - SCROLL_W) - 8;
+      if (paw < 8)
+        paw = 8;
+      for (struct media_el *me = media_doc_first(); me; me = media_doc_next(me)) {
+        int sr = media_el_start_row(me);
+        if (sr < 0)
+          continue;
+        int y0 = py + g_fr->lt.y[sr] - sc, h = media_el_height(me, paw);
+        if (mx >= 4 && mx < 4 + paw && my >= y0 && my < y0 + h) {
+          media_el_click(me, mx, my, 4, y0, paw);
+          return;
+        }
+      }
+    }
+    char res[URL_MAX];
+    int off, nt = 0;
+    pane_hit(mx, my, &off, res, sizeof res, &nt);
+    /* A press clears any previous selection. */
+    if (gfx_sel_has(&g_sel)) {
+      gfx_sel_clear(&g_sel);
+      B->seq++;
+    }
+    g_selecting = false;
+    /* If the page registered JS listeners, hand the click to the worker to
+     * dispatch through the live DOM (it follows the link `res` afterwards
+     * unless a handler calls preventDefault). Otherwise take the fast path and
+     * navigate directly — pages with no scripts behave exactly as before. */
+    if (off >= 0 && B->events_live) {
+      /* clientX/clientY are viewport-relative (pane origin), matching
+       * getBoundingClientRect; the pane's left edge is window x 0. */
+      B->evt_off = off;
+      B->evt_x = mx;
+      B->evt_y = my - py;
+      {
+        int k = 0;
+        sapp(B->evt_type, &k, sizeof B->evt_type, "click");
+      }
+      {
+        int k = 0;
+        sapp(B->evt_text, &k, sizeof B->evt_text, res);
+      }
+      B->evt_pending = 1;
+      B->seq++;
+      return;
+    }
+    if (res[0]) {
+      if (nt)
+        new_tab(); /* target="_blank": open + switch to a new tab */
+      navigate(res);
+      return;
+    }
+    /* Plain text (no link): begin a selection; a following drag extends it. */
+    int line, col;
+    pane_linecol(mx, my, &line, &col);
+    gfx_sel_start(&g_sel, line, col);
+    g_selecting = true;
+  }
+}
+
+/* All cursor-shape changes funnel through here so the per-element hover shape
+ * and the loading spinner share one source of truth; a syscall fires only on a
+ * real change (the WM applies w->cursor across the whole client area, so the
+ * app must re-pick the shape per pointer position to get element-specific
+ * cursors). */
+static int cur_cursor = WIN_CURSOR_ARROW;
+void set_cursor(int id, int shape)
+{
+  if (shape != cur_cursor) {
+    win_cursor(id, shape);
+    cur_cursor = shape;
+  }
+}
+
+static bool in_rect(int mx, int my, const struct rect *r)
+{
+  return mx >= r->x && mx < r->x + r->w && my >= r->y && my < r->y + r->h;
+}
+
+/* Pick the cursor for the element under (mx,my): I-beam in the address field,
+ * hand over links and the clickable chrome (nav buttons, tab strip), else
+ * arrow. */
+static int cursor_for(int mx, int my, const char *link)
+{
+  if (mx < 0)
+    return WIN_CURSOR_ARROW;
+  if (my >= MENU_H && my < MENU_H + TAB_H)
+    return WIN_CURSOR_HAND;                                   /* tab strip */
+  if (my >= MENU_H + TAB_H && my < MENU_H + TAB_H + ADDR_H) { /* address bar */
+    struct rect rb, rf, rrl, rtf, rst;
+    addr_layout(&rb, &rf, &rrl, &rtf, &rst);
+    if (in_rect(mx, my, &rtf))
+      return WIN_CURSOR_TEXT;
+    if (in_rect(mx, my, &rb) || in_rect(mx, my, &rf) || in_rect(mx, my, &rrl) || in_rect(mx, my, &rst))
+      return WIN_CURSOR_HAND;
+    return WIN_CURSOR_ARROW;
+  }
+  if (bm_panel_open && mx < BM_PANEL_W && my >= MENU_H + TAB_H + ADDR_H)
+    return WIN_CURSOR_HAND;
+  /* Content pane: I-beam over selectable text, hand over a link, arrow on the
+   * scrollbar. */
+  if (mx >= (devtools_visible() ? devtools_left() : BW) - SCROLL_W)
+    return WIN_CURSOR_ARROW;
+  /* Crashed tab: hand over the Reload button, plain arrow elsewhere (nothing to
+   * select). */
+  if (tabs[active_tab].crashed)
+    return in_rect(mx, my, &crash_reload_rect) ? WIN_CURSOR_HAND : WIN_CURSOR_ARROW;
+  return link[0] ? WIN_CURSOR_HAND : WIN_CURSOR_TEXT;
+}
+
+/* Pointer moved over the content pane with no button held (WEV_MOVE; mx<0 when
+ * it left the window): show the hovered link's target in the bottom-left status
+ * box, or clear it. Only repaints when the shown URL actually changes. */
+void handle_move(int mx, int my)
+{
+  char url[URL_MAX];
+  int off;
+  last_my = mx < 0 ? -1 : my; /* track for wheel routing (devtools vs page) */
+  last_mx = mx;
+  if (mx < 0) {
+    url[0] = '\0';
+    off = -1;
+  } /* pointer left the window: clear */
+  else
+    pane_hit(mx, my, &off, url, sizeof url, 0);
+
+  /* Feed the inspect-element picker the page offset under the cursor (only over
+   * the page pane, never the devtools panel itself). */
+  if (devtools_picking())
+    devtools_pick_hover(mx >= 0 && mx < devtools_left() ? off : -1);
+
+  /* Per-element cursor; the loading spinner (event loop) outranks it. */
+  if (!B->loading)
+    set_cursor(B->win_id, cursor_for(mx, my, url));
+
+  if (streq(url, hover_url))
+    return;
+  int k = 0;
+  sapp(hover_url, &k, sizeof hover_url, url);
+  int y0, y1;
+  hover_rows(&y0, &y1);
+  damage_rows(y0, y1);
+}
+
+/* Left-button drag in the content pane (WEV_DRAG): extend an in-progress text
+ * selection; otherwise treated as a hover move. */
+void handle_drag(int mx, int my)
+{
+  if (g_selecting) {
+    int line, col;
+    pane_linecol(mx, my, &line, &col);
+    struct ru_selr before = {0}, after = {0};
+    before.has = gfx_sel_range(&g_sel, &before.l0, &before.c0, &before.l1, &before.c1);
+    gfx_sel_extend(&g_sel, line, col);
+    after.has = gfx_sel_range(&g_sel, &after.l0, &after.c0, &after.l1, &after.c1);
+    int lo, hi;
+    if (ru_sel_damage(&before, &after, &lo, &hi))
+      damage_lines(lo, hi);
+    return;
+  }
+  handle_move(mx, my);
+}
+
+/* Copy the current text selection to the clipboard. The display lines are
+ * contiguous in B->pg->text, so the selection is one byte span [a,b) — which
+ * preserves real newlines (wrap points are spaces, not '\n'). */
+void copy_selection(void)
+{
+  int l0, c0, l1, c1;
+  if (!gfx_sel_range(&g_sel, &l0, &c0, &l1, &c1))
+    return;
+  browser_buf_lock();
+  char *buf = 0;
+  int n = 0;
+  if (l0 < g_fr->lt.n && l1 < g_fr->lt.n) {
+    int a = g_fr->lt.off[l0] + c0, b = g_fr->lt.off[l1] + c1;
+    if (a < 0)
+      a = 0;
+    if (b > B->pg->text_len)
+      b = B->pg->text_len;
+    n = b - a;
+    if (n > 0 && (buf = malloc((unsigned)n + 1))) {
+      memcpy(buf, B->pg->text + a, (unsigned)n);
+      buf[n] = '\0';
+    }
+  }
+  browser_buf_unlock();
+  if (buf) {
+    clip_put_text(buf, n);
+    free(buf);
+  }
+}
+
+/* Select the whole rendered page (Edit > Select All). */
+void select_all(void)
+{
+  browser_buf_lock();
+  int last = g_fr->lt.n - 1, last_len = last >= 0 ? g_fr->lt.len[last] : 0;
+  browser_buf_unlock();
+  if (last < 0)
+    return;
+  gfx_sel_start(&g_sel, 0, 0);
+  gfx_sel_extend(&g_sel, last, last_len);
+  g_selecting = false;
+  B->seq++;
+}
+
+void handle_key(char c, int mods)
+{
+  /* Naming a new bookmark folder: the inline field captures every key; Enter
+   * commits it, Esc cancels. */
+  if (bm_naming) {
+    unsigned char uc = (unsigned char)c;
+    if (uc == '\n' || uc == '\r') {
+      folder_add(bm_name_parent, bm_name_buf);
+      bm_naming = 0;
+      B->seq++;
+    } else if (uc == 27) {
+      bm_naming = 0;
+      B->seq++;
+    } else {
+      textfield_key(&bm_name_tf, c);
+      B->seq++;
+    }
+    return;
+  }
+  /* Ctrl+B toggles the bookmarks panel. */
+  if ((mods & KMOD_CTRL) && (c == 'b' || c == 'B')) {
+    bm_panel_open = !bm_panel_open;
+    B->seq++;
+    return;
+  }
+  /* Developer tools: toggle on F12 or Ctrl+Shift+I; Esc closes an open panel.
+   * Ctrl+Shift+I arrives as a bare 'i' char with the CTRL|SHIFT modifier bits.
+   */
+  if ((unsigned char)c == KEY_F12 || ((mods & KMOD_CTRL) && (mods & KMOD_SHIFT) && (c == 'i' || c == 'I'))) {
+    devtools_toggle();
+    return;
+  }
+  /* Ctrl+Shift+C arms the inspect-element picker (like the ↖ toolbar button).
+   */
+  if ((mods & KMOD_CTRL) && (mods & KMOD_SHIFT) && (c == 'c' || c == 'C')) {
+    devtools_pick_toggle();
+    return;
+  }
+  /* The Console REPL input takes keys when it is focused (returns 1); otherwise
+   * this is a no-op and the key routes normally (address bar / page). */
+  if (devtools_handle_key(c, mods))
+    return;
+  /* Esc cancels an active pick before it would close the panel. */
+  if ((unsigned char)c == 27 && devtools_picking()) {
+    devtools_pick_toggle();
+    return;
+  }
+  if ((unsigned char)c == 27 && devtools_visible()) {
+    devtools_toggle();
+    return;
+  }
+
+  /* Alt+Left / Alt+Right are history navigation — checked before the address
+   * bar so the modifier turns the arrow into back/forward instead of a caret
+   * move. The keyboard reports the chord via mods (KMOD_*); the app decides. */
+  if (mods & KMOD_ALT) {
+    if ((unsigned char)c == KEY_LEFT) {
+      go_back();
+      return;
+    }
+    if ((unsigned char)c == KEY_RIGHT) {
+      go_fwd();
+      return;
+    }
+  }
+
+  /* Ctrl+R reloads (the keyboard delivers the unshifted letter + KMOD_CTRL).
+   * Checked before the address field so it isn't typed into the URL. */
+  if ((mods & KMOD_CTRL) && (c == 'r' || c == 'R')) {
+    do_reload();
+    return;
+  }
+  if ((mods & KMOD_CTRL) && (c == 't' || c == 'T')) {
+    new_tab();
+    return;
+  }
+  if ((mods & KMOD_CTRL) && (c == 'w' || c == 'W')) {
+    close_tab(active_tab);
+    return;
+  }
+  if ((mods & KMOD_CTRL) && c >= '1' && c <= '8') {
+    int tab = c - '1';
+    if (tab < n_tabs)
+      select_tab(tab);
+    return;
+  }
+
+  /* Ctrl+C (delivered as KEY_INTR) copies the text selection when there is one.
+   */
+  if ((unsigned char)c == KEY_INTR && gfx_sel_has(&g_sel)) {
+    copy_selection();
+    return;
+  }
+
+  /* Menu accelerator (F5 = Reload): fire the item like a click. */
+  struct menu *leaf;
+  int sc = menubar_shortcut(&menubar, (unsigned char)c, &leaf);
+  if (sc >= 0) {
+    menubar_close(&menubar);
+    menu_action(leaf, sc);
+    return;
+  }
+
+  /* A focused content text field captures editing keys: post them to the worker
+   * (which owns the DOM) as keyinput/blur events instead of editing the address
+   * bar. Esc blurs; other navigation keys fall through to the defaults below.
+   */
+  if (B->focus_kind != 0) {
+    unsigned char uc = (unsigned char)c;
+    if (uc == 27) {
+      {
+        int k = 0;
+        sapp(B->evt_type, &k, sizeof B->evt_type, "blur");
+      }
+      B->evt_pending = 1;
+      B->seq++;
+      return;
+    }
+    if (uc == '\n' || uc == '\r' || uc == 8 || uc == 127 || (uc >= 0x20 && uc < 0x7f)) {
+      B->evt_x = uc;
+      {
+        int k = 0;
+        sapp(B->evt_type, &k, sizeof B->evt_type, "keyinput");
+      }
+      B->evt_pending = 1;
+      B->seq++;
+      return;
+    }
+  }
+
+  if ((unsigned char)c == 27) {
+    menubar_close(&menubar);
+    B->seq++;
+    return;
+  }
+
+  /* The address-bar widget handles editing (printable/Backspace/Delete/caret).
+   * That only changes the URL field, so flag a chrome-only repaint rather than
+   * bumping B->seq (a full page render) — unless an open dropdown overlaps the
+   * strip, where only a full render restores it correctly. */
+  if (textfield_key(&B->addr_tf, c)) {
+    if (menu_any_open())
+      B->seq++;
+    else
+      addr_dirty = true;
+    return;
+  }
+
+  switch ((unsigned char)c) {
+  case '\n':
+  case '\r':
+    submit();
+    return;
+  case KEY_UP:
+    scroll_set(B->pg->scroll - 3 * LINE_H);
+    return;
+  case KEY_DOWN:
+    scroll_set(B->pg->scroll + 3 * LINE_H);
+    return;
+  }
+}
