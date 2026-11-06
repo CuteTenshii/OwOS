@@ -24,12 +24,14 @@
 #define US_PER_TICK (1000000u / TIMER_HZ)
 
 static volatile uint32_t ticks;
+static volatile uint32_t ticks_hi; /* ticks wraps (198 days at 250 Hz); this extends it to 64 bits */
 static timer_tick_fn tick_cb;
 
 static void timer_handler(struct registers *r)
 {
   (void)r;
-  ticks++;
+  if (++ticks == 0)
+    ticks_hi++;
   entropy_stir(ticks);   /* interrupt-latency jitter feeds the CSPRNG */
   sched_wake_due(ticks); /* promote timed sleepers that are now due  */
   if (tick_cb)
@@ -52,7 +54,7 @@ void timer_init(void)
 
 uint32_t timer_ticks(void) { return ticks; }
 
-/* Microseconds since boot, at PIT resolution (~0.8 us). Combines the tick
+/* 64-bit microseconds since boot, at PIT resolution (~0.8 us). Combines the tick
  * count with the live channel-0 down-counter. The tricky case is a counter
  * wrap whose IRQ0 hasn't been serviced yet (e.g. we're called from another
  * interrupt handler, or with IF clear): the latched count has already
@@ -60,7 +62,7 @@ uint32_t timer_ticks(void) { return ticks; }
  * pending IRQ via the PIC's IRR and, when the count sits in the first half of
  * the period (so the reload truly preceded our latch), credit the extra tick.
  * Safe to call from interrupt context. */
-uint32_t timer_us(void)
+uint64_t timer_us64(void)
 {
   uintptr_t fl = irq_save();
 
@@ -70,7 +72,7 @@ uint32_t timer_us(void)
 
   outb(PIC1_CMD, PIC_READ_IRR);
   uint8_t irr = inb(PIC1_CMD);
-  uint32_t t = ticks;
+  uint64_t t = ((uint64_t)ticks_hi << 32) | ticks;
 
   if (fl & 0x200)
     __asm__ volatile("sti" ::: "memory");
@@ -80,8 +82,10 @@ uint32_t timer_us(void)
 
   uint32_t frac = PIT_DIVISOR - count; /* input clocks into this tick     */
   uint64_t us = (uint64_t)t * US_PER_TICK + (uint64_t)frac * 1000000u / PIT_BASE_HZ;
-  return (uint32_t)us;
+  return us;
 }
+
+uint32_t timer_us(void) { return (uint32_t)timer_us64(); }
 
 uint32_t timer_seconds(void) { return ticks / TIMER_HZ; }
 

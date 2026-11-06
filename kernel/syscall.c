@@ -171,7 +171,7 @@ void syscall_init(void)
 
 typedef void (*syscall_handler_t)(struct registers *r);
 
-static const syscall_handler_t syscall_handlers[SYS_FUTEX_WAKE + 1] = {
+static const syscall_handler_t syscall_handlers[SYS_ADJTIME + 1] = {
     [SYS_WRITE] = syscall_io_write,
     [SYS_EXIT] = syscall_process_exit,
     [SYS_READ] = syscall_io_read,
@@ -255,12 +255,15 @@ static const syscall_handler_t syscall_handlers[SYS_FUTEX_WAKE + 1] = {
     [SYS_WIN_SET_PARENT] = syscall_window_set_parent,
     [SYS_WIN_FB] = syscall_window_fb,
     [SYS_UNAME] = syscall_fs_uname,
+    [SYS_GETTIME] = syscall_net_gettime,
+    [SYS_SETTIME] = syscall_net_settime,
+    [SYS_ADJTIME] = syscall_net_adjtime,
 };
 
 void syscall_dispatch(struct registers *r)
 {
   uint32_t number = r->eax;
-  if (number > SYS_FUTEX_WAKE || !syscall_handlers[number]) {
+  if (number > SYS_ADJTIME || !syscall_handlers[number]) {
     r->eax = (uint32_t)-1;
     return;
   }

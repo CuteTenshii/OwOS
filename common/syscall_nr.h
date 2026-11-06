@@ -84,5 +84,8 @@
 #define SYS_UNAME 81
 #define SYS_FUTEX_WAIT 82
 #define SYS_FUTEX_WAKE 83
+#define SYS_GETTIME 84
+#define SYS_SETTIME 85
+#define SYS_ADJTIME 86
 
 #endif

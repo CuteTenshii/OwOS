@@ -6,6 +6,8 @@
 #include "sched.h"
 #include "syscall_path.h"
 #include "uaccess.h"
+#include "wallclock.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 void syscall_net_connect(struct registers *r)
@@ -115,10 +117,41 @@ void syscall_net_setrtc(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  struct rtc_time t;
-  epoch_to_rtc((uint32_t)r->ebx, &t);
-  rtc_set(&t);
-  r->eax = 0;
+  struct timeval64 tv = {(uint32_t)r->ebx, 0};
+  r->eax = wallclock_set(&tv) ? 0 : (uint32_t)-1;
+}
+
+void syscall_net_gettime(struct registers *r)
+{
+  struct timeval64 tv;
+  wallclock_get(&tv);
+  r->eax = copyout(r->ebx, &tv, sizeof tv) == 0 ? 0 : (uint32_t)-1;
+}
+
+void syscall_net_settime(struct registers *r)
+{
+  struct timeval64 tv;
+  if (sched_uid() != 0 || copyin(&tv, r->ebx, sizeof tv) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  r->eax = wallclock_set(&tv) ? 0 : (uint32_t)-1;
+}
+
+void syscall_net_adjtime(struct registers *r)
+{
+  struct timeval64 delta, old;
+  bool has_delta = r->ebx != 0;
+  if (sched_uid() != 0 || (has_delta && copyin(&delta, r->ebx, sizeof delta) != 0) ||
+      (r->ecx && !user_out_range(r->ecx, sizeof old))) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  if (!wallclock_adjust(has_delta ? &delta : 0, &old)) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  r->eax = r->ecx && copyout(r->ecx, &old, sizeof old) != 0 ? (uint32_t)-1 : 0;
 }
 
 void syscall_net_listen(struct registers *r)

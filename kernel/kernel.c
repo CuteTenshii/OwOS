@@ -45,6 +45,7 @@
 #include "uwin.h"
 #include "vmsvga.h"
 #include "vmtools.h"
+#include "wallclock.h"
 #include "xhci.h"
 
 /* Boot-stage breadcrumb printed by the panic screen (idt.c). */
@@ -346,7 +347,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
       fs_create("/etc/mdns.conf", "_ssh._tcp 22\n_smb._tcp 445\n", 26);
     /* init's service table, one /bin daemon per line; compositor first. */
     if (fs_read("/etc/inittab", &probe, 0) < 0)
-      fs_create("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\n", 29);
+      fs_create("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\nntpd\n", 34);
     users_init();
     INSTALL_APP(edit);
     INSTALL_APP(curl);
@@ -392,6 +393,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
   con_write("usermode: ready ('run curl <url>').\n");
 
   timer_init();
+  wallclock_init();
   keyboard_init();
   sb16_init();
   hda_init();

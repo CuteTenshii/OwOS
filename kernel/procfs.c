@@ -32,10 +32,12 @@
 #include "rtc.h"
 #include "sched.h"
 #include "smp.h"
+#include "syscall_path.h"
 #include "timer.h"
 #include "usb.h"
 #include "users.h"
 #include "vmware.h"
+#include "wallclock.h"
 #include "xhci.h"
 #include <stdint.h>
 
@@ -117,8 +119,10 @@ static void gen_tasks(struct pb *b)
 
 static void gen_date(struct pb *b)
 {
+  struct timeval64 tv;
   struct rtc_time t;
-  rtc_now(&t);
+  wallclock_get(&tv);
+  epoch_to_rtc((uint32_t)tv.tv_sec, &t);
   pu(b, t.year);
   pc(b, '-');
   p2(b, t.month);

@@ -52,12 +52,9 @@ unsigned rtc_epoch(void) { return (unsigned)syscall(SYS_RTC_EPOCH, 0, 0, 0); }
 /* Wall-clock milliseconds since the Unix epoch, the basis for JS Date.now() */
 long long now_ms(void)
 {
-  static unsigned base_epoch = 0, base_msec = 0;
-  if (base_epoch == 0) {
-    base_epoch = rtc_epoch();
-    base_msec = msec();
-  }
-  return (long long)base_epoch * 1000 + (long long)(msec() - base_msec);
+  struct timeval64 tv;
+  gettime(&tv);
+  return tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
 int readfile(const char *name, char *buf, int max) { return syscall(SYS_READFILE, (int)name, (int)buf, max); }
@@ -116,6 +113,15 @@ int ifconfig(const unsigned char ip[4], const unsigned char mask[4], const unsig
 }
 
 int setrtc(unsigned secs) { return syscall(SYS_SETRTC, (int)secs, 0, 0); }
+
+int gettime(struct timeval64 *tv) { return syscall(SYS_GETTIME, (int)tv, 0, 0); }
+
+int settime(const struct timeval64 *tv) { return syscall(SYS_SETTIME, (int)tv, 0, 0); }
+
+int adjtime(const struct timeval64 *delta, struct timeval64 *old)
+{
+  return syscall(SYS_ADJTIME, (int)delta, (int)old, 0);
+}
 
 int net_listen(int port) { return syscall(SYS_NET_LISTEN, port, 0, 0); }
 

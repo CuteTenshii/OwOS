@@ -9,6 +9,7 @@
 #include "syscall_path.h"
 #include "sysfs.h"
 #include "uaccess.h"
+#include "wallclock.h"
 #include <stdint.h>
 
 #ifndef OWOS_VERSION
@@ -131,7 +132,12 @@ void syscall_fs_readfile_at(struct registers *r)
   r->eax = (uint32_t)read_at_with_path(name, args[1], (void *)(uintptr_t)args[2], args[3]);
 }
 
-void syscall_fs_rtc_epoch(struct registers *r) { r->eax = rtc_epoch(); }
+void syscall_fs_rtc_epoch(struct registers *r)
+{
+  struct timeval64 tv;
+  wallclock_get(&tv);
+  r->eax = (uint32_t)tv.tv_sec;
+}
 
 void syscall_fs_readdir(struct registers *r)
 {

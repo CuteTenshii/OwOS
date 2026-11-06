@@ -12,7 +12,7 @@ INCLUDES=(
 	-I"$ROOT/user/lib/crypto" -I"$ROOT/user/lib/resolve"
 	-I"$ROOT/user/lib/zlib" -I"$ROOT/user/lib/stun" -I"$ROOT/user/lib/mp4"
 	-I"$ROOT/user/lib/sqlite" -I"$ROOT/user/lib/gfx" -I"$ROOT/user/lib/png"
-	-I"$ROOT/user/lib/netconn" -I"$ROOT/user/lib/notify" -I"$ROOT/user/apps/browser"
+	-I"$ROOT/user/lib/tz" -I"$ROOT/user/lib/ntp" -I"$ROOT/user/lib/netconn" -I"$ROOT/user/lib/notify" -I"$ROOT/user/apps/browser"
 	-I"$ROOT/user/apps/browser/js"
 )
 
@@ -26,6 +26,9 @@ for source in "$ROOT"/tests/*_test.c; do
 	extra=()
 	if [ "$name" = permissions ]; then
 		extra=(-DPERM_DB='"'"$BUILD/permissions.db"'"')
+	fi
+	if [ "$name" = tz ]; then
+		extra=(-DTZ_CONFIG_PATH='"'"$BUILD/timezone"'"')
 	fi
 	if [ "$name" = vary ]; then
 		extra=(-DCACHE_DIR='"'"$BUILD/vary-cache"'"')
@@ -46,6 +49,9 @@ done
 "$CC" -std=gnu11 -I"$ROOT/tests" -DCACHE_DIR='"'"$BUILD/vary-cache"'"' \
 	-c "$ROOT/tests/vary_fs.c" -o "$BUILD/vary_fs.o" || exit 1
 
+"$CC" -std=gnu11 "${INCLUDES[@]}" -DTZ_CONFIG_PATH='"'"$BUILD/timezone"'"' \
+	-c "$ROOT/user/lib/tz/tz.c" -o "$BUILD/tz_impl.o" || exit 1
+
 "$CC" -std=gnu11 "${INCLUDES[@]}" -c "$ROOT/tests/browser_js_host.c" \
 	-o "$BUILD/browser_js_host.o" || exit 1
 
@@ -61,7 +67,7 @@ done
 	"$ROOT/user/lib/curl/url.c" "$ROOT/user/lib/curl/httpcache.c" \
 	"$ROOT/user/lib/curl/headers.c" "$ROOT/user/lib/crypto/crypto.c" \
 	"$ROOT/user/lib/base64/base64.c" "$ROOT/user/lib/zlib/crc32.c" \
-	"$ROOT/user/lib/stun/stun.c" "$ROOT/user/lib/mp4/mp4.c" \
+	"$ROOT/user/lib/stun/stun.c" "$ROOT/user/lib/ntp/ntp.c" "$ROOT/user/lib/mp4/mp4.c" \
 	"$ROOT/user/lib/sqlite/sqlite.c" \
 	"$ROOT/user/lib/js/lexer.c" "$ROOT/user/lib/js/parser.c" \
 	"$ROOT/user/lib/js/ast.c" "$ROOT/user/lib/js/value.c" \

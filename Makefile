@@ -21,7 +21,7 @@
 
 FORMAT_FILES := $(shell find boot drivers kernel user -type f \( -name '*.c' -o -name '*.h' \) \
 	! -path 'kernel/font*.h' ! -path 'user/lib/gfx/font*.h' \
-	! -path 'user/lib/mp3/minimp3.h')
+	! -path 'user/lib/mp3/minimp3.h' ! -path 'user/lib/tz/zones.h')
 CLANG_FORMAT ?= clang-format
 CLANG_TIDY ?= clang-tidy
 TIDY_TARGET = --target=$(if $(filter x86_64,$(ARCH)),x86_64,i386)-none-elf

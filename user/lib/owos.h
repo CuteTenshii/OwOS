@@ -3,6 +3,7 @@
 #define OWOS_USER_H
 
 #include "ascii.h"
+#include "timeval64.h"
 #include <stdarg.h>
 
 /* The null pointer constant */
@@ -80,6 +81,12 @@ int ifconfig(const unsigned char ip[4], const unsigned char mask[4], const unsig
 
 /* Set the wall clock from a Unix timestamp (UTC seconds) */
 int setrtc(unsigned secs);
+
+/* Microsecond wall clock (UTC). settime steps it (root); adjtime slews by delta at <= 500 ppm (root),
+ * returns the unapplied remainder in *old; either pointer may be NULL. 0 on success, -1 on error. */
+int gettime(struct timeval64 *tv);
+int settime(const struct timeval64 *tv);
+int adjtime(const struct timeval64 *delta, struct timeval64 *old);
 
 /* Freestanding string helpers, shared so each program doesn't re-roll its own */
 int strlen(const char *s);

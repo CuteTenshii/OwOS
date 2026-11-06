@@ -29,6 +29,15 @@ static inline int writefile(const char *name, const void *buf, int len)
   fclose(f);
   return (wrote == len) ? 0 : -1;
 }
+static inline int readfile(const char *name, char *buf, int max)
+{
+  FILE *f = fopen(name, "rb");
+  if (!f)
+    return -1;
+  int got = (int)fread(buf, 1, (size_t)max, f);
+  fclose(f);
+  return got;
+}
 static inline int readfile_at(const char *name, unsigned off, void *buf, unsigned len)
 {
   FILE *f = fopen(name, "rb");

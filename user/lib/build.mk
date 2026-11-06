@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto tls netconn gfx zlib png webp mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64
+ULIBDIRS := curl torrent crypto tls netconn gfx zlib png webp mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -123,6 +123,12 @@ RESOLVE := user/lib/resolve/resolve.o $(MDNS)
 # NAT-traversal substrate ICE/WebRTC gathers candidates over. Needs $(CRYPTO)
 # (hmac_sha1 for MESSAGE-INTEGRITY) and $(RESOLVE) (stun_query's name->IP).
 STUN    := user/lib/stun/stun.o
+# ntp: NTPv4 client arithmetic (timestamps, packet validation, offset/delay, sample
+# filter, poll schedule). Pure computation, libc-free; needs $(LIBGCC) for 64-bit divides.
+NTP     := user/lib/ntp/ntp.o
+# tz: built-in IANA zone table (POSIX rules), UTC<->local conversion, /etc/timezone. Pure computation.
+TZ      := user/lib/tz/tz.o
+
 # math: freestanding x87 libm + shortest-round-trip number<->string (Dragon4).
 # Pure computation, no syscalls; links with $(LIBGCC) for 64-bit integer divides.
 MATH    := user/lib/math/math.o user/lib/math/fmt.o

@@ -21,6 +21,7 @@ typedef void (*timer_tick_fn)(void);
 void timer_init(void);                /* program the PIT, claim IRQ0             */
 void timer_on_tick(timer_tick_fn cb); /* run cb on every tick (e.g. sched) */
 uint32_t timer_ticks(void);           /* raw ticks since boot                    */
+uint64_t timer_us64(void);            /* 64-bit microseconds since boot          */
 uint32_t timer_us(void);              /* microseconds since boot (PIT resolution)*/
 uint32_t timer_seconds(void);         /* uptime in seconds                       */
 void timer_sleep(uint32_t ms);        /* block (hlt) for at least ms millisecs   */
