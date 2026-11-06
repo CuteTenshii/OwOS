@@ -1,41 +1,21 @@
-/* cache.c — the browser's persistent HTTP response cache.
- *
- * A store of GET responses keyed by URL, honouring the response cache headers
- * via user/lib/curl/httpcache (the RFC 7234 freshness/age policy). It survives
- * across sessions: each entry's body lives in its own file under CACHE_DIR on
- * owofs, so a body is NOT bound by the SQLite jar's 4 KiB record limit (jar.c)
- * — the reason cookies use SQLite but response bodies can't. A small metadata
- * index (URL, freshness facts, validators, on-disk filename) is held in memory.
- *
- * The store is bounded: total body bytes are capped (LRU eviction), and one
- * oversized body is simply not cached. All of it is best-effort — a read/write
- * failure just means a miss or a not-cached response, never a fetch failure. A
- * read-only home directory transparently degrades to a memory-only cache.
- *
- * Concurrency: cache_lookup/cache_store run on the parallel sub-resource pool,
- * so the in-memory index is guarded by a spinlock. But owofs allows only one
- * open write stream at a time, so disk writes/deletes are NOT done inline —
- * they are deferred to cache_flush(), which the transport calls from the single
- * worker thread after a navigation, when no fetch is in flight.
- *
- * The transport (fetch.c, resource.c) sees only cache_lookup / cache_store /
- * cache_revalidated / cache_load / cache_flush. */
+/* cache.c: persistent HTTP response cache; one body file per entry on owofs, index in memory.
+ * Disk writes are deferred to cache_flush (owofs allows one open stream). */
 #include "features/cache/cache.h"
 #include "browser.h"
 #include "headers.h"
 #include "httpcache.h"
 #include "mutex.h"
 
+#ifndef CACHE_DIR
 #define CACHE_DIR "/home/root/.cache/browser"
+#endif
 #define CACHE_MAX_BYTES (16 * 1024 * 1024)
 #define CACHE_MAX_ONE (4 * 1024 * 1024)
-#define CACHE_MAGIC "OWCACHE1"
+#define CACHE_MAGIC "OWCACHE2"
 #define PEND_UNLINK_MAX 128 /* deferred deletes between flushes       */
 #define FM_MAX 3072         /* front-matter (magic+url+meta+ctype) cap */
 
-/* One stored response. body/hdr/ctype/etag/last_mod are owned heap copies. The
- * freshness facts are frozen at store time so a lookup needs no re-parse; only
- * a 304 revalidation recomputes them. */
+/* One stored response; freshness facts are frozen at store time and recomputed on 304. */
 struct cache_entry {
   char *url;
   int status;
@@ -51,32 +31,30 @@ struct cache_entry {
   char *etag;     /* validator, or NULL                   */
   char *last_mod; /* validator, or NULL                   */
 
-  char disk[24];                   /* on-disk filename (hash of url), or "" */
+  struct http_vary vary; /* response Vary names                  */
+  char *vkey;            /* secondary key of the request that fetched it ("" without Vary) */
+
+  char disk[24];                   /* on-disk filename (hash of url + vkey), or "" */
   bool dirty;                      /* body/headers not yet written to disk */
   unsigned long long hash;         /* url_hash(url): hash-index + bucket key */
   struct cache_entry *next, *prev; /* LRU list (head = most-recently-used)   */
   struct cache_entry *hnext;       /* next entry sharing this url's bucket   */
 };
 
-/* LRU list (head = most-recently-used, tail = eviction victim) for ordering,
- * plus a URL-hash bucket index over the same entries so lookup is O(1) average
- * instead of a full-list scan. Both are kept in sync on every
- * insert/access/evict. */
+/* LRU list plus a URL-hash bucket index over the same entries. */
 static struct cache_entry *g_head, *g_tail;
 #define CACHE_BUCKETS 256 /* power of two: url-hash index */
 static struct cache_entry *g_bucket[CACHE_BUCKETS];
 static long g_bytes;
 static bool g_disk_ok; /* CACHE_DIR is writable      */
 
-/* Files whose entries were evicted; deleted by the next cache_flush (owofs
- * one-stream rule keeps unlink off the fetch threads too). */
+/* Files of evicted entries, deleted by the next cache_flush. */
 static char g_unlink[PEND_UNLINK_MAX][24];
 static int g_nunlink;
 
-/* Guards the list, the bucket index, g_bytes and the pending-unlink array against the fetch threads. */
+/* Guards the list, bucket index, g_bytes and pending unlinks against fetch threads. */
 static mutex_t g_lock;
 
-/* Heap copy of a NUL-terminated string (NULL-safe: NULL -> NULL). */
 static char *sdup(const char *s)
 {
   if (!s)
@@ -90,8 +68,7 @@ static char *sdup(const char *s)
 
 static bool is_get(const char *method) { return !method || !method[0] || streq_ci(method, "GET"); }
 
-/* FNV-1a of the URL: keys both the on-disk filename and the in-memory bucket.
- */
+/* FNV-1a of the URL: keys the disk filename and the bucket. */
 static unsigned long long url_hash(const char *url)
 {
   unsigned long long h = 1469598103934665603ULL;
@@ -102,11 +79,14 @@ static unsigned long long url_hash(const char *url)
   return h;
 }
 
-/* The URL hash -> 16 hex chars: the entry's stable on-disk filename, so a
- * re-store overwrites the same file and a reload maps back to it. */
-static void disk_name(const char *url, char *out)
+/* Hash of url and variant key as 16 hex chars: the entry's stable on-disk filename. */
+static void disk_name(const char *url, const char *vkey, char *out)
 {
   unsigned long long h = url_hash(url);
+  for (const char *p = vkey; *p; p++) {
+    h ^= (unsigned char)*p;
+    h *= 1099511628211ULL;
+  }
   static const char hex[] = "0123456789abcdef";
   for (int i = 0; i < 16; i++)
     out[i] = hex[(h >> ((15 - i) * 4)) & 0xf];
@@ -115,8 +95,6 @@ static void disk_name(const char *url, char *out)
 
 static unsigned bucket_of(unsigned long long h) { return (unsigned)(h & (CACHE_BUCKETS - 1)); }
 
-/* Doubly-linked LRU list: push at the head, evict from the tail, move-to-front
- * on access — so the victim is always g_tail (O(1), no min-scan). */
 static void lru_push_front(struct cache_entry *e)
 {
   e->prev = 0;
@@ -147,7 +125,6 @@ static void lru_touch(struct cache_entry *e)
   lru_push_front(e);
 }
 
-/* Hash-bucket index (intrusive hnext chain per bucket). */
 static void idx_insert(struct cache_entry *e)
 {
   unsigned b = bucket_of(e->hash);
@@ -164,7 +141,6 @@ static void idx_remove(struct cache_entry *e)
   e->hnext = 0;
 }
 
-/* Link a fully-populated entry into both the LRU list (front) and the index. */
 static void entry_link(struct cache_entry *e)
 {
   e->hash = url_hash(e->url);
@@ -180,11 +156,33 @@ static void disk_path(const char *name, char *out, int cap)
   sapp(out, &n, cap, name);
 }
 
-static struct cache_entry *find(const char *url)
+/* Does the request's header block select this variant (RFC 9111 4.1)? */
+static bool variant_matches(const struct cache_entry *e, const char *req_hdrs)
+{
+  if (e->vary.star)
+    return false;
+  if (!e->vary.n)
+    return true;
+  char *k = http_vary_key(&e->vary, req_hdrs ? req_hdrs : "");
+  bool ok = http_vary_key_match(k, e->vkey);
+  free(k);
+  return ok;
+}
+
+static struct cache_entry *find_match(const char *url, const char *req_hdrs)
 {
   unsigned long long h = url_hash(url);
   for (struct cache_entry *e = g_bucket[bucket_of(h)]; e; e = e->hnext)
-    if (e->hash == h && streq(e->url, url))
+    if (e->hash == h && streq(e->url, url) && variant_matches(e, req_hdrs))
+      return e;
+  return 0;
+}
+
+static struct cache_entry *find_variant(const char *url, const char *vkey)
+{
+  unsigned long long h = url_hash(url);
+  for (struct cache_entry *e = g_bucket[bucket_of(h)]; e; e = e->hnext)
+    if (e->hash == h && streq(e->url, url) && streq(e->vkey, vkey))
       return e;
   return 0;
 }
@@ -197,25 +195,25 @@ static void entry_free(struct cache_entry *e)
   free(e->body);
   free(e->etag);
   free(e->last_mod);
+  free(e->vkey);
+  http_vary_free(&e->vary);
   free(e);
 }
 
-/* Queue an entry's disk file for deletion by the next flush (caller holds
- * lock). */
+/* Queue a file for deletion by the next flush; caller holds the lock. */
 static void queue_unlink(const char *name)
 {
   if (!name || !name[0] || !g_disk_ok)
     return;
   if (g_nunlink >= PEND_UNLINK_MAX)
-    return; /* overflow: leave the file */
+    return;
   int k = 0;
   g_unlink[g_nunlink][0] = '\0';
   sapp(g_unlink[g_nunlink], &k, (int)sizeof g_unlink[0], name);
   g_nunlink++;
 }
 
-/* Unlink `e` from the LRU list and the index, queue its file for deletion, free
- * it. Both the list and the index are O(1)-ish (no scan of the whole store). */
+/* Unlink `e` from the list and index, queue its file for deletion, free it. */
 static void unlink_free(struct cache_entry *e)
 {
   lru_remove(e);
@@ -225,16 +223,26 @@ static void unlink_free(struct cache_entry *e)
   entry_free(e);
 }
 
-/* Evict least-recently-used entries (the list tail) until `incoming` fits the
- * budget. O(1) per eviction now the victim is the tail, not a full min-scan. */
+/* The server changed which fields it varies on: older variants of `url` no longer apply. */
+static void drop_other_variants(const char *url, const struct http_vary *vary)
+{
+  unsigned long long h = url_hash(url);
+  struct cache_entry *next;
+  for (struct cache_entry *e = g_bucket[bucket_of(h)]; e; e = next) {
+    next = e->hnext;
+    if (e->hash == h && streq(e->url, url) && !http_vary_same(&e->vary, vary))
+      unlink_free(e);
+  }
+}
+
+/* Evict from the LRU tail until `incoming` fits the budget. */
 static void evict_for(int incoming)
 {
   while (g_tail && g_bytes + incoming > CACHE_MAX_BYTES)
     unlink_free(g_tail);
 }
 
-/* Current age of a stored entry now (RFC 7234 §4.2.3), from its frozen Age/Date
- * facts plus how long it has resided in the cache. */
+/* Current age per RFC 7234 section 4.2.3. */
 static long entry_current_age(const struct cache_entry *e, long now)
 {
   long apparent = e->stored_at - (e->date ? e->date : e->stored_at);
@@ -247,7 +255,6 @@ static long entry_current_age(const struct cache_entry *e, long now)
   return corrected + resident;
 }
 
-/* Freeze the freshness facts from a parsed response into `e`. */
 static void set_freshness(struct cache_entry *e, const struct http_cc *cc, long now)
 {
   e->stored_at = now;
@@ -262,9 +269,7 @@ static void set_freshness(struct cache_entry *e, const struct http_cc *cc, long 
   e->last_mod = sdup(cc->last_mod_str);
 }
 
-/* Build the conditional-request header lines for a stale entry with a
- * validator. Lowercased names, so the one string is valid for HTTP/1.1 and
- * HTTP/2 alike. */
+/* Conditional-request lines, lowercased so valid for HTTP/1.1 and HTTP/2. */
 static void build_cond(const struct cache_entry *e, char *cond, int cap)
 {
   int n = 0;
@@ -300,8 +305,8 @@ static void fill_out(const struct cache_entry *e, unsigned char **body, int *len
   }
 }
 
-int cache_lookup(const char *method, const char *url, long now, unsigned char **body, int *len, char *ctype,
-                 int ctype_cap, char *hdr, int hdr_cap, char *cond, int cond_cap)
+int cache_lookup(const char *method, const char *url, const char *req_hdrs, long now, unsigned char **body, int *len,
+                 char *ctype, int ctype_cap, char *hdr, int hdr_cap, char *cond, int cond_cap)
 {
   *body = 0;
   *len = 0;
@@ -311,7 +316,7 @@ int cache_lookup(const char *method, const char *url, long now, unsigned char **
     return CACHE_MISS;
 
   mutex_lock(&g_lock);
-  struct cache_entry *e = find(url);
+  struct cache_entry *e = find_match(url, req_hdrs);
   if (!e) {
     mutex_unlock(&g_lock);
     return CACHE_MISS;
@@ -328,9 +333,7 @@ int cache_lookup(const char *method, const char *url, long now, unsigned char **
     return ok ? CACHE_FRESH : CACHE_MISS;
   }
   if (has_validator) {
-    /* Stale but revalidatable. If the caller can carry conditional headers,
-     * ask it to revalidate; otherwise report a miss but KEEP the entry (a
-     * revalidation-capable caller may reuse it later). */
+    /* without a cond buffer, report a miss but keep the entry */
     if (cond && cond_cap) {
       build_cond(e, cond, cond_cap);
       mutex_unlock(&g_lock);
@@ -339,55 +342,27 @@ int cache_lookup(const char *method, const char *url, long now, unsigned char **
     mutex_unlock(&g_lock);
     return CACHE_MISS;
   }
-  /* Stale with no way to revalidate: drop it and fetch fresh. */
+  /* stale with no validator: drop */
   unlink_free(e);
   mutex_unlock(&g_lock);
   return CACHE_MISS;
 }
 
-void cache_store(const char *method, const char *url, int status, long now, const char *hdr_block, const char *ctype,
-                 const unsigned char *body, int len)
+/* Insert or replace the variant keyed by `vkey`; a new entry takes over *vary. Caller holds the lock. */
+static void store_locked(const char *url, const char *vkey, struct http_vary *vary, int status, long now,
+                         const char *hdr_block, const char *ctype, const unsigned char *body, int len,
+                         const struct http_cc *cc)
 {
-  if (!is_get(method) || !url || len < 0 || len > CACHE_MAX_ONE)
+  drop_other_variants(url, vary);
+  unsigned char *nb = malloc((unsigned)(len ? len : 1));
+  if (!nb)
     return;
+  if (len)
+    memcpy(nb, body, (unsigned)len);
 
-  struct http_headers H;
-  http_headers_parse(&H, hdr_block ? hdr_block : "");
-  struct http_cc cc;
-  http_cc_parse(&H, &cc);
-
-  if (!http_cc_storable(&cc, status)) {
-    http_headers_free(&H);
-    return;
-  }
-  /* Vary means the response depends on request headers this URL-keyed cache
-   * doesn't match on — refuse it rather than risk serving the wrong variant. */
-  const char *vary = http_headers_get(&H, "vary");
-  if (vary && vary[0]) {
-    http_headers_free(&H);
-    return;
-  }
-  /* Worth keeping only if it can be served without a round trip (has some
-   * freshness) or revalidated cheaply (has a validator). */
-  int worth = http_cc_freshness(&cc, now) > 0 || cc.etag || cc.last_mod_str;
-  if (!worth) {
-    http_headers_free(&H);
-    return;
-  }
-
-  mutex_lock(&g_lock);
-  struct cache_entry *e = find(url);
-  if (e) { /* replace the stored body */
-    unsigned char *nb = malloc((unsigned)(len ? len : 1));
-    if (!nb) {
-      mutex_unlock(&g_lock);
-      http_headers_free(&H);
-      return;
-    }
-    if (len)
-      memcpy(nb, body, (unsigned)len);
-    /* Drop the old body from the budget, mark e most-recent so it can't be
-     * its own victim, then evict others so a larger replacement still fits. */
+  struct cache_entry *e = find_variant(url, vkey);
+  if (e) {
+    /* touch e first so it cannot evict itself */
     g_bytes -= e->len;
     lru_touch(e);
     evict_for(len);
@@ -399,47 +374,68 @@ void cache_store(const char *method, const char *url, int status, long now, cons
     free(e->hdr);
     e->hdr = sdup(hdr_block);
     e->status = status;
-    set_freshness(e, &cc, now);
+    set_freshness(e, cc, now);
     e->dirty = true;
     g_bytes += len;
-    mutex_unlock(&g_lock);
-    http_headers_free(&H);
     return;
   }
 
   evict_for(len);
   e = malloc(sizeof *e);
   if (!e) {
-    mutex_unlock(&g_lock);
-    http_headers_free(&H);
+    free(nb);
     return;
   }
   memset(e, 0, sizeof *e);
   e->url = sdup(url);
+  e->vkey = sdup(vkey);
   e->ctype = sdup(ctype);
   e->hdr = sdup(hdr_block);
-  e->body = malloc((unsigned)(len ? len : 1));
-  if (!e->url || !e->body) {
+  e->body = nb;
+  if (!e->url || !e->vkey) {
     entry_free(e);
-    mutex_unlock(&g_lock);
-    http_headers_free(&H);
     return;
   }
-  if (len)
-    memcpy(e->body, body, (unsigned)len);
+  e->vary = *vary;
+  memset(vary, 0, sizeof *vary);
   e->len = len;
   e->status = status;
-  set_freshness(e, &cc, now);
-  disk_name(url, e->disk);
+  set_freshness(e, cc, now);
+  disk_name(url, vkey, e->disk);
   e->dirty = true;
   entry_link(e);
   g_bytes += len;
-  mutex_unlock(&g_lock);
+}
+
+void cache_store(const char *method, const char *url, const char *req_hdrs, int status, long now, const char *hdr_block,
+                 const char *ctype, const unsigned char *body, int len)
+{
+  if (!is_get(method) || !url || len < 0 || len > CACHE_MAX_ONE)
+    return;
+
+  struct http_headers H;
+  http_headers_parse(&H, hdr_block ? hdr_block : "");
+  struct http_cc cc;
+  http_cc_parse(&H, &cc);
+  struct http_vary vary;
+  char *vkey = 0;
+  if (http_vary_parse(&vary, &H) == 0 && !vary.star)
+    vkey = http_vary_key(&vary, req_hdrs ? req_hdrs : "");
+
+  /* worth keeping only with some freshness or a validator */
+  bool worth = http_cc_freshness(&cc, now) > 0 || cc.etag || cc.last_mod_str;
+  if (vkey && http_cc_storable(&cc, status) && worth) {
+    mutex_lock(&g_lock);
+    store_locked(url, vkey, &vary, status, now, hdr_block, ctype, body, len, &cc);
+    mutex_unlock(&g_lock);
+  }
+  free(vkey);
+  http_vary_free(&vary);
   http_headers_free(&H);
 }
 
-int cache_revalidated(const char *url, long now, const char *hdr_block, unsigned char **body, int *len, char *ctype,
-                      int ctype_cap, char *hdr, int hdr_cap)
+int cache_revalidated(const char *url, const char *req_hdrs, long now, const char *hdr_block, unsigned char **body,
+                      int *len, char *ctype, int ctype_cap, char *hdr, int hdr_cap)
 {
   *body = 0;
   *len = 0;
@@ -450,14 +446,14 @@ int cache_revalidated(const char *url, long now, const char *hdr_block, unsigned
   http_cc_parse(&H, &cc);
 
   mutex_lock(&g_lock);
-  struct cache_entry *e = find(url);
+  struct cache_entry *e = find_match(url, req_hdrs);
   if (!e) {
     mutex_unlock(&g_lock);
     http_headers_free(&H);
     return 0;
   }
-  set_freshness(e, &cc, now); /* refresh freshness from the 304 */
-  e->dirty = true;            /* freshness changed: rewrite front matter */
+  set_freshness(e, &cc, now);
+  e->dirty = true;
   lru_touch(e);
   fill_out(e, body, len, ctype, ctype_cap, hdr, hdr_cap);
   int ok = *body != 0;
@@ -466,11 +462,7 @@ int cache_revalidated(const char *url, long now, const char *hdr_block, unsigned
   return ok;
 }
 
-/* ------------------------------------------------------------- persistence */
-
-/* Write one entry to its file: front matter (magic / url / status stored_at
- * hdr_len body_len / ctype), then the raw header block, then the body. Worker
- * thread only (owofs single-stream). Returns 0, or -1 on any write failure. */
+/* Write front matter (magic, url, numbers, ctype), variant key, header block, then body. Worker thread only. */
 static int write_entry(const struct cache_entry *e)
 {
   char path[128];
@@ -479,6 +471,7 @@ static int write_entry(const struct cache_entry *e)
   char fm[FM_MAX];
   int n = 0;
   int hlen = e->hdr ? strlen(e->hdr) : 0;
+  int klen = strlen(e->vkey);
   sapp(fm, &n, sizeof fm, CACHE_MAGIC "\n");
   sapp(fm, &n, sizeof fm, e->url);
   sapp(fm, &n, sizeof fm, "\n");
@@ -489,6 +482,8 @@ static int write_entry(const struct cache_entry *e)
   uapp(fm, &n, sizeof fm, (unsigned)hlen);
   sapp(fm, &n, sizeof fm, " ");
   uapp(fm, &n, sizeof fm, (unsigned)e->len);
+  sapp(fm, &n, sizeof fm, " ");
+  uapp(fm, &n, sizeof fm, (unsigned)klen);
   sapp(fm, &n, sizeof fm, "\n");
   sapp(fm, &n, sizeof fm, e->ctype ? e->ctype : "");
   sapp(fm, &n, sizeof fm, "\n");
@@ -496,6 +491,10 @@ static int write_entry(const struct cache_entry *e)
   if (stream_begin(path) != 0)
     return -1;
   if (stream_write(fm, n) < 0) {
+    stream_end();
+    return -1;
+  }
+  if (klen && stream_write(e->vkey, klen) < 0) {
     stream_end();
     return -1;
   }
@@ -529,12 +528,9 @@ void cache_flush(void)
   mutex_unlock(&g_lock);
 }
 
-/* Locate the four front-matter lines in `fm` (read from the file head) and
- * parse them. Fills url and ctype (into caller spans), status, stored_at,
- * hdr_len, body_len, and text_len = byte offset where the header block begins.
- * Returns 0, or -1 if the magic or shape is wrong. */
+/* Parse the front-matter lines; text_len is where the header block begins. 0, or -1 if malformed. */
 static int parse_front(const char *fm, int fmlen, char *url, int url_cap, char *ctype, int ctype_cap, int *status,
-                       long *stored_at, int *hdr_len, int *body_len, int *text_len)
+                       long *stored_at, int *hdr_len, int *body_len, int *key_len, int *text_len)
 {
   if (fmlen < 9 || !starts_ci(fm, CACHE_MAGIC "\n"))
     return -1;
@@ -544,7 +540,7 @@ static int parse_front(const char *fm, int fmlen, char *url, int url_cap, char *
     if (fm[i] == '\n')
       nl[nn++] = fm + i;
   if (nn < 4)
-    return -1; /* need 4 lines of front matter */
+    return -1;
 
   const char *u = nl[0] + 1;
   int ul = (int)(nl[1] - u);
@@ -553,13 +549,12 @@ static int parse_front(const char *fm, int fmlen, char *url, int url_cap, char *
     url[k++] = u[i];
   url[k] = '\0';
 
-  /* Line 3: four space-separated decimals. skip_field steps past one. */
   const char *m = nl[1] + 1;
   bool ok;
   *status = (int)http_parse_uint(m, &ok);
   if (!ok)
     return -1;
-  for (int f = 0; f < 3; f++) {
+  for (int f = 0; f < 4; f++) {
     while (*m && *m != ' ')
       m++;
     while (*m == ' ')
@@ -569,8 +564,10 @@ static int parse_front(const char *fm, int fmlen, char *url, int url_cap, char *
       *stored_at = v;
     else if (f == 1)
       *hdr_len = (int)v;
-    else
+    else if (f == 2)
       *body_len = (int)v;
+    else
+      *key_len = (int)v;
   }
 
   const char *c = nl[2] + 1;
@@ -581,14 +578,13 @@ static int parse_front(const char *fm, int fmlen, char *url, int url_cap, char *
   ctype[k] = '\0';
 
   *text_len = (int)(nl[3] + 1 - fm);
-  if (*hdr_len < 0 || *hdr_len > RESP_HDR_MAX || *body_len < 0 || *body_len > CACHE_MAX_ONE)
+  if (*hdr_len < 0 || *hdr_len > RESP_HDR_MAX || *body_len < 0 || *body_len > CACHE_MAX_ONE || *key_len < 0 ||
+      *key_len > CACHE_MAX_ONE)
     return -1;
   return 0;
 }
 
-/* Load one cache file into an in-memory entry. Returns the entry (linked into
- * the LRU list + index, g_bytes updated) or NULL on any problem (the caller
- * then unlinks the bad/oversized file). Single-threaded startup, so no lock. */
+/* Load one cache file into a linked entry, or NULL (caller then deletes the file). Startup only. */
 static struct cache_entry *load_file(const char *name)
 {
   char path[128];
@@ -602,78 +598,76 @@ static struct cache_entry *load_file(const char *name)
 
   char url[URL_MAX];
   char ctype[80];
-  int status, hdr_len, body_len, text_len;
-  long stored_at;
-  if (parse_front(fm, got, url, sizeof url, ctype, sizeof ctype, &status, &stored_at, &hdr_len, &body_len, &text_len) !=
-      0)
+  int status, hdr_len, body_len = 0, key_len, text_len;
+  long stored_at = 0;
+  if (parse_front(fm, got, url, sizeof url, ctype, sizeof ctype, &status, &stored_at, &hdr_len, &body_len, &key_len,
+                  &text_len) != 0)
     return 0;
   if (g_bytes + body_len > CACHE_MAX_BYTES)
-    return 0; /* over budget: drop it */
+    return 0;
 
+  char *vkey = malloc((unsigned)key_len + 1);
   char *hdr = malloc((unsigned)hdr_len + 1);
   unsigned char *body = malloc((unsigned)(body_len ? body_len : 1));
-  if (!hdr || !body) {
-    free(hdr);
-    free(body);
-    return 0;
-  }
-  if (hdr_len && readfile_at(path, (unsigned)text_len, hdr, (unsigned)hdr_len) != hdr_len) {
-    free(hdr);
-    free(body);
-    return 0;
-  }
+  struct cache_entry *e = 0;
+  struct http_headers H = {0};
+  if (!vkey || !hdr || !body)
+    goto out;
+  if (key_len && readfile_at(path, (unsigned)text_len, vkey, (unsigned)key_len) != key_len)
+    goto out;
+  vkey[key_len] = '\0';
+  if (hdr_len && readfile_at(path, (unsigned)(text_len + key_len), hdr, (unsigned)hdr_len) != hdr_len)
+    goto out;
   hdr[hdr_len] = '\0';
-  if (body_len && readfile_at(path, (unsigned)(text_len + hdr_len), body, (unsigned)body_len) != body_len) {
-    free(hdr);
-    free(body);
-    return 0;
-  }
+  if (body_len && readfile_at(path, (unsigned)(text_len + key_len + hdr_len), body, (unsigned)body_len) != body_len)
+    goto out;
 
-  struct cache_entry *e = malloc(sizeof *e);
-  if (!e) {
-    free(hdr);
-    free(body);
-    return 0;
-  }
+  e = malloc(sizeof *e);
+  if (!e)
+    goto out;
   memset(e, 0, sizeof *e);
   e->url = sdup(url);
   e->ctype = sdup(ctype);
   e->hdr = hdr;
   e->body = body;
+  e->vkey = vkey;
+  hdr = 0;
+  body = 0;
+  vkey = 0;
   e->len = body_len;
   e->status = status;
-  if (!e->url) {
+
+  http_headers_parse(&H, e->hdr);
+  if (!e->url || http_vary_parse(&e->vary, &H) < 0 || e->vary.star || find_variant(e->url, e->vkey)) {
     entry_free(e);
-    return 0;
+    e = 0;
+    goto out;
   }
   {
     int k = 0;
     sapp(e->disk, &k, (int)sizeof e->disk, name);
   }
-
-  /* Recompute the freshness facts from the stored headers, exactly as the
-   * original store did (now == stored_at when it was received). */
-  struct http_headers H;
-  http_headers_parse(&H, hdr);
   struct http_cc cc;
   http_cc_parse(&H, &cc);
   set_freshness(e, &cc, stored_at);
-  http_headers_free(&H);
-
   entry_link(e);
   g_bytes += body_len;
+
+out:
+  http_headers_free(&H);
+  free(vkey);
+  free(hdr);
+  free(body);
   return e;
 }
 
 void cache_load(void)
 {
-  /* Create the cache dir (parents first); if it can't be made, stay
-   * memory-only. */
   mkdir("/home/root/.cache");
   if (mkdir(CACHE_DIR) != 0) {
     struct statinfo si;
     if (stat(CACHE_DIR, &si) != 0)
-      return; /* no dir and can't create: no disk */
+      return;
   }
   g_disk_ok = true;
 
@@ -681,7 +675,7 @@ void cache_load(void)
   for (int i = 0; readdir(CACHE_DIR, i, &de) == 1; i++) {
     if (de.is_dir || !de.name[0])
       continue;
-    if (!load_file(de.name)) { /* corrupt / oversized: remove it */
+    if (!load_file(de.name)) {
       char path[128];
       disk_path(de.name, path, sizeof path);
       unlink(path);

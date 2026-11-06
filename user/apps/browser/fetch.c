@@ -1,10 +1,5 @@
-/* fetch.c — the browser's main page transaction: the buffered reader, response-
- * header parsing, the HTTP/1.1 + HTTP/2 fetch, downloads (an attachment
- * response streamed to disk instead of B->pg->raw — kept here because it shares
- * this file's body reader), the redirect follower, the file:/data: schemes, and
- * do_fetch. Separately-fetched sub-resources (inline images, favicon, external
- * stylesheets) live in resource.c; the cookie/HSTS jar in jar.c. Runs on the
- * worker thread (main.c), so its blocking reads never stall the UI. */
+/* fetch.c: page transaction (HTTP/1.1, h2, h3), downloads, redirects, file:/data: schemes; runs on the worker thread.
+ */
 #include "brotli.h" /* RFC 7932 `br` content-coding (whole-buffer decode)   */
 #include "browser.h"
 #include "features/cache/cache.h"             /* the HTTP response cache (RFC 7234, honours headers)  */
@@ -14,10 +9,7 @@
 #include "h3.h"                               /* HTTP/3 over QUIC (libcurl engine)                    */
 #include "headers.h"                          /* libcurl: HTTP response header parsing               */
 
-/* The machine token for the UA platform, from uname(2), normalized the way
- * browsers present it: i386/i686 collapse to "x86", x86_64/amd64 to "x86_64",
- * 64-bit ARM to "aarch64", 32-bit ARM to "arm". Cached — arch can't change at
- * runtime, and uname() is authoritative so there's no hardcoded fallback. */
+/* UA platform token from uname(2): x86, x86_64, aarch64 or arm; cached. */
 static const char *ua_arch(void)
 {
   static char tok[12];
@@ -36,9 +28,7 @@ static const char *ua_arch(void)
   return tok;
 }
 
-/* navigator.appVersion — the UA minus "Mozilla/". Built once from ua_arch() +
- * OWOS_VERSION (the browser version), so neither arch nor version is hardcoded.
- */
+/* navigator.appVersion: the UA minus "Mozilla/". */
 const char *browser_ua_version(void)
 {
   static char buf[160];
@@ -50,8 +40,7 @@ const char *browser_ua_version(void)
   return buf;
 }
 
-/* The full User-Agent, "Mozilla/" + browser_ua_version(). Shared by the HTTP
- * transport and the JS navigator so wire and script never disagree. */
+/* The full User-Agent, shared by the HTTP transport and the JS navigator. */
 const char *browser_ua(void)
 {
   static char buf[168];
@@ -63,16 +52,10 @@ const char *browser_ua(void)
 /* Content-encoding of a response body. */
 enum { ENC_NONE = 0, ENC_ZLIB = 1, ENC_BR = 2 };
 
-/* Hard ceiling on a single decompressed body. A small gzip/deflate/br response
- * can expand enormously (a decompression bomb); without a cap the sink grows
- * until it exhausts memory, and the old (len+n)*2 size math overflowed to a
- * negative int near ~1 GiB. RAW_MAX (browser.h) bounds the *compressed* body we
- * read; this bounds the decompressed output at a generous multiple of it. */
+/* Ceiling on a decompressed body (decompression-bomb guard); RAW_MAX bounds the compressed body. */
 #define DECOMP_MAX (RAW_MAX * 2) /* 64 MiB */
 
-/* Origins observed to advertise HTTP/3 via Alt-Svc; the next request to one is
- * tried over h3 first (how browsers bootstrap h3 without an extra round trip).
- */
+/* Origins that advertised HTTP/3 via Alt-Svc; tried over h3 first. */
 #define H3_HOSTS_MAX 32
 static char h3_hosts[H3_HOSTS_MAX][URL_HOST_MAX];
 static int h3_nhosts;
@@ -94,12 +77,7 @@ static void h3_remember(const char *host)
   h3_nhosts++;
 }
 
-/* One body pipeline for every transport: each fills B->pg->raw with the raw
- * (maybe compressed) body, then raw_decode() decodes Content-Encoding in place
- * and route_body() decides render vs download. (No per-transport decode paths.)
- *
- * Decompress an in-memory body per its content-encoding (ENC_BR / ENC_ZLIB).
- * Returns a malloc'd buffer of *out_len bytes (caller frees), or NULL. */
+/* Decompress an in-memory body per ENC_BR / ENC_ZLIB; returns a malloc'd buffer (caller frees) or NULL. */
 struct memrd {
   const unsigned char *p;
   int len, pos;
@@ -117,8 +95,7 @@ struct memwr {
 static int memwr_fn(void *c, const unsigned char *p, unsigned n)
 {
   struct memwr *w = c;
-  /* Bomb guard: refuse a write that pushes the output past the cap. Unsigned
-   * math throughout so the size can't wrap negative near the ceiling. */
+  /* Bomb guard: refuse writes past the cap; unsigned math so sizes can't wrap. */
   if (n > (unsigned)DECOMP_MAX || (unsigned)w->len + n > (unsigned)DECOMP_MAX) {
     w->oom = true;
     return -1;
@@ -143,8 +120,7 @@ static int memwr_fn(void *c, const unsigned char *p, unsigned n)
 static unsigned char *body_decompress(const unsigned char *in, int in_len, int enc, int *out_len)
 {
   if (enc == ENC_BR) {
-    /* brotli decodes whole-buffer inside the lib; the most we can enforce
-     * here is to reject (and free) an over-cap result before it's adopted. */
+    /* brotli decodes whole-buffer in the lib; only an over-cap result can be rejected here. */
     unsigned char *o = brotli_decompress(in, in_len, out_len);
     if (o && *out_len > DECOMP_MAX) {
       free(o);
@@ -162,9 +138,7 @@ static unsigned char *body_decompress(const unsigned char *in, int in_len, int e
   return w.buf ? w.buf : malloc(1);
 }
 
-/* Decode the body already collected in B->pg->raw per its content-encoding, in
- * place. A failed decode empties B->pg->raw (never show the compressed bytes).
- */
+/* Decode B->pg->raw in place per its content-encoding; a failed decode empties it. */
 static void raw_decode(int enc)
 {
   if (!enc || B->pg->raw_len <= 0)
@@ -175,10 +149,7 @@ static void raw_decode(int enc)
     B->pg->raw_len = 0;
     return;
   } /* failed decode: never show the compressed bytes */
-  /* Adopt the decoded buffer directly rather than copying it back into raw:
-   * both come from the same malloc/realloc/free family (browser_ensure_raw and the
-   * memwr/brotli sinks). browser_buf_lock guards the swap against the main thread's
-   * concurrent reads of B->pg->raw, matching browser_ensure_raw's discipline. */
+  /* Adopt the decoded buffer directly (same allocator family); browser_buf_lock guards the swap. */
   browser_buf_lock();
   free(B->pg->raw);
   B->pg->raw = (char *)o;
@@ -207,10 +178,7 @@ static int rgetc(void)
   return B->rbuf[B->rpos++];
 }
 
-/* Show a one-line message as the page body. The browser has no status bar, so
- * errors (and other notices that used to live there) are rendered straight into
- * the content pane. Clears cur_url so the address bar keeps whatever the user
- * typed, ready to edit and retry. */
+/* Show a one-line message as the page body; clears cur_url so the address bar keeps the typed text. */
 void show_error(const char *m)
 {
   B->pg->mode = MODE_TEXT;
@@ -261,10 +229,7 @@ static bool is_html_type(const char *ctype)
 
 /* --------------------------------------------------- body byte source/sink */
 
-/* Yields the next *content* byte of the response body, transparently undoing
- * the transfer framing (chunked sizes, Content-Length limit, or read-to-close)
- * — so whatever consumes it (a plain copy, or the inflate decoder) sees only
- * the payload. Returns the byte (0..255) or -1 at end of body. */
+/* Next content byte of the body with transfer framing removed, or -1 at end of body. */
 struct bodysrc {
   bool chunked, have_len, done, need_crlf;
   unsigned remaining; /* bytes left in this chunk / the content-length   */
@@ -345,15 +310,7 @@ static int body_src(void *ctx)
 
 #define DL_DIR "/home/root/Downloads"
 
-/* A response is a download when the server flags it as an attachment, when the
- * URL points at a file type the browser never renders inline (audio/video/
- * archive/document/binary — matched by extension), or when the Content-Type is
- * something the pane can't show (anything that isn't HTML, plain text, or an
- * image — images get their own viewer/notice). The extension check catches a
- * download a sloppy server mislabels: an .mp3 served as text/plain or with no
- * Content-Type at all would otherwise dump raw bytes into the page. An empty
- * Content-Type with no telltale extension is treated as HTML, the common case.
- */
+/* A response is a download if flagged as an attachment, or by file extension, or by a non-renderable Content-Type. */
 static bool url_is_download_ext(const char *url);
 static bool is_download(const char *url)
 {
@@ -372,8 +329,7 @@ static bool is_download(const char *url)
   return true;
 }
 
-/* Copy the last path component of `in` into `out`, dropping any directory
- * prefix and a trailing "?query" — so "/files/a/b.zip?x=1" -> "b.zip". */
+/* Copy the last path component of `in` into `out`, dropping directory and "?query". */
 static void basename_of(const char *in, char *out, int cap)
 {
   const char *last = in;
@@ -386,12 +342,7 @@ static void basename_of(const char *in, char *out, int cap)
   out[k] = '\0';
 }
 
-/* True when the URL's last path segment ends in an extension the browser never
- * renders inline (audio, video, archives, documents, executables, fonts). Lets
- * is_download() save such a file even when the server omits or mislabels the
- * Content-Type — e.g. an .mp3 served as text/plain, which otherwise filled the
- * page with raw bytes. Image extensions are deliberately absent: PNGs are shown
- * inline, a decision left to the Content-Type. */
+/* True if the last path segment has an extension never rendered inline (images excluded). */
 static bool url_is_download_ext(const char *url)
 {
   struct purl u;
@@ -416,8 +367,7 @@ static bool url_is_download_ext(const char *url)
   return false;
 }
 
-/* Choose a filename for the download: the Content-Disposition name if any, else
- * the URL's last path segment, else a generic fallback. */
+/* Choose a download filename: Content-Disposition, else the URL's last segment, else a fallback. */
 static void derive_filename(const char *url, char *out, int cap)
 {
   if (B->dl_name[0]) {
@@ -435,20 +385,13 @@ static void derive_filename(const char *url, char *out, int cap)
   sapp(out, &k, cap, "download.bin");
 }
 
-/* owofs caps each path component at 63 chars (FS_NAME_LEN - 1); a longer leaf
- * makes fs_stream_begin reject the whole path, which surfaced as a bogus
- * "disk full" download failure for any file whose name exceeds that. */
+/* owofs caps path components at 63 chars; longer leaves make fs_stream_begin reject the path. */
 #define DL_LEAF_MAX 63
 
-/* Build DL_DIR/<base> for attempt 0, or DL_DIR/<stem>-<n><ext> for n>=1, so a
- * repeated download lands beside the original instead of clobbering it. The
- * leaf is clamped to owofs's component limit, truncating the stem (never the
- * extension or the collision suffix) so e.g. "annual-report-2026-final.pdf"
- * still lands as a valid "annual-rep.pdf". */
+/* Build DL_DIR/<base> (attempt 0) or DL_DIR/<stem>-<n><ext), truncating the stem to the component limit. */
 static void build_path(const char *base, int n, char *out, int cap)
 {
-  /* Split base into stem and ".ext" at the last dot (a leading dot doesn't
-   * count -- a dotfile has no extension to preserve). */
+  /* Split base into stem and ".ext" at the last dot (a leading dot is not an extension). */
   int dot = -1;
   for (int i = 0; base[i]; i++)
     if (base[i] == '.')
@@ -466,14 +409,13 @@ static void build_path(const char *base, int n, char *out, int cap)
   }
   sfx[sl] = '\0';
 
-  /* A pathologically long extension can't fit either; cap it, leaving room
-   * for the suffix and at least one stem char. */
+  /* Cap a pathologically long extension, leaving room for the suffix and one stem char. */
   if (ext_len > DL_LEAF_MAX - sl - 1) {
     ext_len = DL_LEAF_MAX - sl - 1;
     if (ext_len < 0)
       ext_len = 0;
   }
-  /* Truncate the stem so stem + suffix + ext fits the component limit. */
+  /* Truncate the stem so stem + suffix + ext fits. */
   int budget = DL_LEAF_MAX - sl - ext_len;
   if (budget < 1)
     budget = 1;
@@ -491,12 +433,7 @@ static void build_path(const char *base, int n, char *out, int cap)
   out[p] = '\0';
 }
 
-/* Pick a non-clobbering DL_DIR/<name> path for a download (the saved name comes
- * from Content-Disposition or the URL; a repeat gets a "-N" suffix). Ensures
- * DL_DIR exists first: the boot image creates it, but a disk.img persisted from
- * an older build may not have it, and a missing directory makes stream_begin
- * fail (which the h2 path used to mishandle by dumping the body into the page).
- */
+/* Pick a non-clobbering DL_DIR/<name> path; ensures DL_DIR exists (older disk images lack it). */
 static void pick_dl_path(const char *url, char *path, int cap)
 {
   mkdir(DL_DIR); /* no-op if it already exists */
@@ -510,8 +447,7 @@ static void pick_dl_path(const char *url, char *path, int cap)
   }
 }
 
-/* Report a finished download: switch to a text pane on `url` and show the saved
- * path (and byte count) or a failure notice. Shared by the 1.1 and h2 paths. */
+/* Report a finished download: show the saved path and size, or a failure notice. */
 static void download_finished(const char *url, const char *path, int wrote, bool fail)
 {
   B->pg->mode = MODE_TEXT;
@@ -539,13 +475,11 @@ static void download_finished(const char *url, const char *path, int wrote, bool
 
 /* ----------------------------------------------------------- transaction */
 
-/* External stylesheet URLs from the Link: response header (heap list in B->
- * ext_css). Reset each response, consumed by html_to_text before layout. */
+/* External stylesheet URLs from the Link: header (B->ext_css); reset per response. */
 static void ext_css_clear(void)
 {
   struct css_link *c = B->ext_css;
-  /* Defensive: the head is always NULL or a heap node (>= USER_BASE). A lower
-   * value is a stray write from elsewhere — drop the list rather than fault. */
+  /* The head must be NULL or a heap node; a lower value is a stray write, so drop the list. */
   if ((unsigned)c && (unsigned)c < 0x40000000u) {
     B->ext_css = 0;
     return;
@@ -576,9 +510,7 @@ static void ext_css_add(const char *url)
   B->ext_css = c;
 }
 
-/* True if "stylesheet" appears as a whitespace-delimited token of the rel value
- * within [q,end) — so rel="not-a-stylesheet" or "stylesheet-alt" doesn't match.
- * A trailing '"' (from a quoted rel="stylesheet") is treated as a separator. */
+/* True if "stylesheet" is a whitespace-delimited token of the rel value in [q,end). */
 static bool rel_has_stylesheet(const char *q, const char *end)
 {
   for (const char *s = q; s < end;) {
@@ -593,10 +525,7 @@ static bool rel_has_stylesheet(const char *q, const char *end)
   return false;
 }
 
-/* Parse one Link: header value (RFC 8288): "<url>; rel=stylesheet, <url2>; …".
- * For each entry whose rel includes "stylesheet", resolve its URL against
- * `base` and add it to B->ext_css. Each entry's params are scanned only up to
- * the next top-level comma, so one entry's rel can't leak into another's. */
+/* Parse a Link: header value (RFC 8288), adding rel=stylesheet URLs resolved against `base` to B->ext_css. */
 static void parse_link_header(const char *v, const char *base)
 {
   while (*v) {
@@ -650,8 +579,7 @@ static void parse_link_header(const char *v, const char *base)
   }
 }
 
-/* Status code of a raw header block: "HTTP/x.y NNN …" -> NNN (0 if
- * unparseable). */
+/* Status code of a raw header block ("HTTP/x.y NNN"), 0 if unparseable. */
 static int hdr_status(const char *hdr)
 {
   const char *p = hdr;
@@ -668,10 +596,8 @@ static int hdr_status(const char *hdr)
   return any ? s : 0;
 }
 
-/* 103 Early Hints: a 1xx interim response precedes the final one and may carry
- * Link: rel=stylesheet hints. Its Link values are stashed here (joined by '\n')
- * because the final response's parse_response clears ext_css; early_apply
- * merges them back afterwards. Reset per request in http_txn. */
+/* 103 Early Hints: Link values stashed here because the final parse_response clears ext_css; early_apply merges them.
+ */
 static char g_early[2048];
 static int g_early_len;
 
@@ -712,23 +638,31 @@ static void early_apply(const char *base)
   }
 }
 
-/* Parse a response header block (an HTTP/1.1 block, or the HTTP/2-synthesized
- * "HTTP/x NNN\r\nname: value\r\n…" equivalent) into the browser state: sets
- * B->pg->ctype / B->dl_name / B->cdisp_attach, stores cookies for `host`, notes
- * HSTS, collects Link: stylesheets, resolves any Location into `loc`, and
- * reports the body framing (chunked / content-length / gzip — moot over h2,
- * which sends none). Returns the status code. Shared by the HTTP/1.1 and HTTP/2
- * fetch paths.*/
-/* The most recent document response's raw header block + the tick http_txn
- * began, captured here / in http_txn so do_fetch can log them to the devtools
- * Network tab (the transport functions return only the status, not the header
- * block or timing). Document-only: sub-resources are logged from resource.c's
- * own transport. */
+/* All values of a repeated header joined with ", " into a heap string; NULL if absent or OOM. */
+static char *join_headers(const struct http_headers *H, const char *name)
+{
+  int cnt = http_headers_count(H, name), len = 0;
+  if (cnt == 0)
+    return 0;
+  for (int i = 0; i < cnt; i++)
+    len += (int)strlen(http_headers_at(H, name, i)) + 2;
+  char *s = malloc((unsigned)len + 1);
+  if (!s)
+    return 0;
+  int n = 0;
+  for (int i = 0; i < cnt; i++) {
+    if (i)
+      sapp(s, &n, len + 1, ", ");
+    sapp(s, &n, len + 1, http_headers_at(H, name, i));
+  }
+  return s;
+}
+
+/* Parse an HTTP/1.1 or h2-synthesized header block into browser state; returns the status code. */
+/* Last document response's raw headers and start tick, for the devtools Network log. */
 static char g_doc_hdr[RESP_HDR_MAX];
 static unsigned g_doc_t0;
-/* Conditional-request header lines ("if-none-match"/"if-modified-since") for a
- * stale cached document, filled by http_txn's cache_lookup and appended by each
- * transport's request builder. Lowercased, so one string serves h1.1/h2/h3. */
+/* Lowercased conditional-request header lines for a stale cached document, shared by h1.1/h2/h3. */
 static char g_doc_cond[512];
 
 static int parse_response(const char *hdr, const char *host, const char *full_url, char *loc, int loc_cap,
@@ -747,7 +681,7 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
   B->nosniff = false;
   ext_css_clear(); /* this response's Link: stylesheets replace the last */
 
-  /* Parse the raw block once into a k/v object, then just query it. */
+  /* Parse the raw block once into a k/v object, then query it. */
   struct http_headers H;
   http_headers_parse(&H, hdr);
   int status = H.status;
@@ -816,7 +750,7 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
     }
   }
 
-  /* Set-Cookie may appear several times — store every one. */
+  /* Set-Cookie may repeat; store every one. */
   int ncookie = http_headers_count(&H, "set-cookie");
   for (int i = 0; i < ncookie; i++)
     cookie_store(host, http_headers_at(&H, "set-cookie", i));
@@ -824,14 +758,12 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
   if (http_headers_get(&H, "strict-transport-security"))
     hsts_add(host);
 
-  /* Accept-CH (Client Hints opt-in): record which hints this origin wants so
-   * later requests to it carry them. Honoured on https only (spec: secure). */
+  /* Accept-CH: record the hints this origin wants (https only). */
   const char *ach = http_headers_get(&H, "accept-ch");
   if (ach && starts_ci(full_url, "https://"))
     ch_accept(host, ach);
 
-  /* Alt-Svc advertising HTTP/3 (h3=… or h3-NN=…) — remember the origin so the
-   * next request to it goes over QUIC. */
+  /* Alt-Svc advertising h3: remember the origin so the next request uses QUIC. */
   const char *as = http_headers_get(&H, "alt-svc");
   if (as)
     for (const char *p = as; *p; p++)
@@ -840,20 +772,17 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
         break;
       }
 
-  /* Link: <a.css>; rel=stylesheet — external sheets declared in the header. */
+  /* Link: <a.css>; rel=stylesheet - external sheets declared in the header. */
   int nlink = http_headers_count(&H, "link");
   for (int i = 0; i < nlink; i++)
     parse_link_header(http_headers_at(&H, "link", i), full_url);
 
-  /* nosniff: the server forbids MIME-sniffing — honour the declared
-   * Content-Type and never guess the body's type (see render_raw). */
+  /* nosniff: honour the declared Content-Type and never guess (see render_raw). */
   const char *xcto = http_headers_get(&H, "x-content-type-options");
   if (xcto && http_header_has_token(xcto, "nosniff"))
     B->nosniff = true;
 
-  /* Content-Security-Policy: build the page's enforced policy set — each header
-   * is one policy and a load must satisfy them all. Report-Only is deliberately
-   * not enforced, so it is left out. (The final hop after redirects wins.) */
+  /* Content-Security-Policy: one policy per header, all must pass; Report-Only is not enforced. */
   if (B->pg->csp) {
     csp_free(B->pg->csp);
     B->pg->csp = 0;
@@ -865,26 +794,21 @@ static int parse_response(const char *hdr, const char *host, const char *full_ur
       csp_add(B->pg->csp, http_headers_at(&H, "content-security-policy", i));
   }
 
-  /* Permissions-Policy (and the legacy Feature-Policy): a feature the site's
-   * own policy disallows for this document is blocked with no prompt. Multiple
-   * headers combine (OR the blocked bitmaps); the final hop after redirects
-   * defines the page, so overwrite rather than accumulate across responses. */
+  /* Permissions-Policy (and Feature-Policy): blocked bitmaps OR together; the final redirect hop wins. */
   B->pg->perm_policy = 0;
   for (int i = 0, np = http_headers_count(&H, "permissions-policy"); i < np; i++)
     B->pg->perm_policy |= perm_policy_parse(http_headers_at(&H, "permissions-policy", i), host);
   for (int i = 0, nf = http_headers_count(&H, "feature-policy"); i < nf; i++)
     B->pg->perm_policy |= perm_policy_parse(http_headers_at(&H, "feature-policy", i), host);
+  free(B->pg->perm_policy_hdr);
+  B->pg->perm_policy_hdr = join_headers(&H, "permissions-policy");
 
   http_headers_free(&H);
   jar_flush(); /* persist cookies/HSTS once, if this response changed them */
   return status;
 }
 
-/* Route the fully-received, already-content-decoded body in B->pg->raw: a
- * download (attachment / non-renderable type on a 2xx) is written to
- * ~/Downloads and B->pg->raw cleared; anything else stays in B->pg->raw for
- * rendering. The single place the download decision lives, shared by every
- * transport. Returns `status`. */
+/* Route the decoded body in B->pg->raw: downloads go to ~/Downloads (raw cleared), the rest stays for rendering. */
 static int route_body(const char *full_url, int status, int allow_dl)
 {
   if (allow_dl && status >= 200 && status < 300 && is_download(full_url)) {
@@ -912,8 +836,7 @@ struct h2tx {
   int status, enc;
 };
 
-/* Headers-ready hook (fired before any DATA): parse the response (status, enc,
- * redirect Location, cookies). */
+/* Headers-ready hook: parse the response before any DATA. */
 static int h2_headers_cb(void *ctx, const char *block, int len)
 {
   (void)len;
@@ -928,8 +851,7 @@ static int h2_headers_cb(void *ctx, const char *block, int len)
   return 0;
 }
 
-/* Body sink: append the raw DATA payload to B->pg->raw (decoded once, after).
- */
+/* Body sink: append the raw DATA payload to B->pg->raw. */
 static int h2_body_cb(void *ctx, const unsigned char *p, int n)
 {
   (void)ctx;
@@ -942,9 +864,24 @@ static int h2_body_cb(void *ctx, const unsigned char *p, int n)
   return 0;
 }
 
-/* Run the request over HTTP/2 (sock already open + ALPN-confirmed h2). Fills
- * B->pg->raw with the raw body; raw_decode + route_body finish it the common
- * way. */
+/* Append the lowercased headers a document GET sends beyond the UA: cookies, accept*, client hints. */
+static void doc_req_hdrs(char *xh, int *xn, int cap, const struct purl *u)
+{
+  char ck[1024];
+  if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
+    sapp(xh, xn, cap, "cookie: ");
+    sapp(xh, xn, cap, ck);
+    sapp(xh, xn, cap, "\r\n");
+  }
+  sapp(xh, xn, cap,
+       "accept: " BR_ACCEPT "\r\naccept-language: " BR_ACCLNG "\r\n"
+       "accept-encoding: gzip, deflate, br\r\n");
+  char ch[512];
+  if (ch_headers_for(u, false, ch, sizeof ch) > 0)
+    sapp(xh, xn, cap, ch);
+}
+
+/* Run the request over HTTP/2 (ALPN-confirmed); fills B->pg->raw with the raw body. */
 static int h2_txn(const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl, const char *method,
                   const unsigned char *body, int blen, const char *bctype)
 {
@@ -956,25 +893,10 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc, int loc
     uapp(auth, &an, sizeof auth, (unsigned)u->port);
   }
 
-  /* cookies + accept + accept-encoding. No Connection/Transfer-Encoding
-   * (forbidden in HTTP/2). The User-Agent rides in h2_opts. A POST body carries
-   * its own content-type header (h2 has no separate request line for it). */
+  /* cookies + accept + accept-encoding; no Connection/Transfer-Encoding in HTTP/2, UA rides in h2_opts. */
   char xh[1408];
   int xn = 0;
-  char ck[1024];
-  if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
-    sapp(xh, &xn, sizeof xh, "cookie: ");
-    sapp(xh, &xn, sizeof xh, ck);
-    sapp(xh, &xn, sizeof xh, "\r\n");
-  }
-  sapp(xh, &xn, sizeof xh,
-       "accept: " BR_ACCEPT "\r\naccept-language: " BR_ACCLNG "\r\n"
-       "accept-encoding: gzip, deflate, br\r\n");
-  {
-    char ch[512];
-    if (ch_request_headers(u->host, ch, sizeof ch) > 0)
-      sapp(xh, &xn, sizeof xh, ch);
-  }
+  doc_req_hdrs(xh, &xn, sizeof xh, u);
   if (body && blen > 0) {
     sapp(xh, &xn, sizeof xh, "content-type: ");
     sapp(xh, &xn, sizeof xh, bctype ? bctype : "application/x-www-form-urlencoded");
@@ -997,10 +919,9 @@ static int h2_txn(const struct purl *u, const char *full_url, char *loc, int loc
   return route_body(full_url, h.status > 0 ? h.status : -5, allow_dl);
 }
 
-/* ---- HTTP/3 transaction (QUIC; used for Alt-Svc-advertised origins) -------
- */
+/* ---- HTTP/3 transaction (QUIC; used for Alt-Svc-advertised origins) ---- */
 
-/* Body sink: append to B->pg->raw (decoded once, after — same as h2/h1.1). */
+/* Body sink: append to B->pg->raw. */
 static int h3_body_cb(void *ctx, const unsigned char *p, int n)
 {
   (void)ctx;
@@ -1013,8 +934,7 @@ static int h3_body_cb(void *ctx, const unsigned char *p, int n)
   return 0;
 }
 
-/* Run the request over HTTP/3. Mirrors http_txn's contract; returns the status,
- * or a negative HTTP_E* (the caller then falls back to TLS h2/h1.1). */
+/* Run the request over HTTP/3; returns the status or a negative HTTP_E* (caller falls back). */
 static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl)
 {
   loc[0] = '\0';
@@ -1035,19 +955,8 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc
   int xn = 0;
   sapp(xh, &xn, sizeof xh, "user-agent: ");
   sapp(xh, &xn, sizeof xh, browser_ua());
-  sapp(xh, &xn, sizeof xh,
-       "\r\naccept: " BR_ACCEPT "\r\naccept-language: " BR_ACCLNG "\r\naccept-encoding: gzip, deflate, br\r\n");
-  {
-    char ch[512];
-    if (ch_request_headers(u->host, ch, sizeof ch) > 0)
-      sapp(xh, &xn, sizeof xh, ch);
-  }
-  char ck[1024];
-  if (cookie_header_tls(u->host, u->path, u->tls, ck, sizeof ck) > 0) {
-    sapp(xh, &xn, sizeof xh, "cookie: ");
-    sapp(xh, &xn, sizeof xh, ck);
-    sapp(xh, &xn, sizeof xh, "\r\n");
-  }
+  sapp(xh, &xn, sizeof xh, "\r\n");
+  doc_req_hdrs(xh, &xn, sizeof xh, u);
   if (g_doc_cond[0])
     sapp(xh, &xn, sizeof xh, g_doc_cond); /* revalidation */
 
@@ -1065,16 +974,28 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc
   return route_body(full_url, status, allow_dl);
 }
 
-/* Apply the HTTP cache to a finished document response (any transport): a
- * revalidation that came back 304 reuses the stored body (rendered as 200); a
- * fresh, non-download 200 is stored (already content-decoded, in B->pg->raw).
- * Returns the status do_fetch should act on. */
-static int doc_cache_finish(const char *full_url, long now, bool revalidating, int status)
+#define DOC_VARY_HDRS_MAX 2560
+
+/* The request headers a document GET to `u` sends, as the cache's Vary input. */
+static void doc_vary_hdrs(const struct purl *u, char *out)
 {
+  int n = 0;
+  out[0] = '\0';
+  sapp(out, &n, DOC_VARY_HDRS_MAX, "user-agent: ");
+  sapp(out, &n, DOC_VARY_HDRS_MAX, browser_ua());
+  sapp(out, &n, DOC_VARY_HDRS_MAX, "\r\n");
+  doc_req_hdrs(out, &n, DOC_VARY_HDRS_MAX, u);
+}
+
+/* Apply the HTTP cache to a finished document: 304 reuses the stored body, a fresh non-download 200 is stored. */
+static int doc_cache_finish(const struct purl *u, const char *full_url, long now, bool revalidating, int status)
+{
+  char vh[DOC_VARY_HDRS_MAX];
+  doc_vary_hdrs(u, vh);
   if (revalidating && status == 304) {
     unsigned char *rb = 0;
     int rl = 0;
-    if (cache_revalidated(full_url, now, g_doc_hdr, &rb, &rl, B->pg->ctype, sizeof B->pg->ctype, 0, 0)) {
+    if (cache_revalidated(full_url, vh, now, g_doc_hdr, &rb, &rl, B->pg->ctype, sizeof B->pg->ctype, 0, 0)) {
       B->pg->raw_len = 0;
       if (browser_ensure_raw(rl)) {
         memcpy(B->pg->raw, rb, (unsigned)rl);
@@ -1086,7 +1007,8 @@ static int doc_cache_finish(const char *full_url, long now, bool revalidating, i
     return status; /* entry evicted mid-flight: render the (empty) 304 */
   }
   if (status == 200 && !B->dl_saved && B->pg->raw_len > 0)
-    cache_store("GET", full_url, 200, now, g_doc_hdr, B->pg->ctype, (const unsigned char *)B->pg->raw, B->pg->raw_len);
+    cache_store("GET", full_url, vh, 200, now, g_doc_hdr, B->pg->ctype, (const unsigned char *)B->pg->raw,
+                B->pg->raw_len);
   return status;
 }
 
@@ -1103,18 +1025,17 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
   B->pg->raw_len = 0;
   early_reset();
 
-  /* HTTP cache (RFC 7234): a fresh copy of this document skips the wire; a
-   * stale one with a validator revalidates via g_doc_cond and reuses the body
-   * on 304. The body pipeline stores already-decoded bytes + Content-Type, so a
-   * hit needs no re-decode. Downloads (route_body empties raw) are never
-   * cached. */
+  /* HTTP cache (RFC 7234): fresh hits skip the wire, stale ones revalidate via g_doc_cond; downloads are never cached.
+   */
   long now = (long)rtc_epoch();
   bool revalidating = false;
   g_doc_cond[0] = '\0';
   if (is_get) { /* only GET is cacheable / revalidatable */
     unsigned char *cbody = 0;
     int clen = 0;
-    int cv = cache_lookup("GET", full_url, now, &cbody, &clen, B->pg->ctype, sizeof B->pg->ctype, g_doc_hdr,
+    char vh[DOC_VARY_HDRS_MAX];
+    doc_vary_hdrs(u, vh);
+    int cv = cache_lookup("GET", full_url, vh, now, &cbody, &clen, B->pg->ctype, sizeof B->pg->ctype, g_doc_hdr,
                           sizeof g_doc_hdr, g_doc_cond, sizeof g_doc_cond);
     if (cv == CACHE_FRESH) {
       B->pg->raw_len = 0;
@@ -1128,13 +1049,11 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
     revalidating = (cv == CACHE_REVALIDATE);
   }
 
-  /* If this https origin previously advertised HTTP/3 (Alt-Svc), try QUIC
-   * first; on any failure fall through to the TLS h2/h1.1 path below. HTTP/3
-   * here has no request-body path, so a POST skips it straight to h2/h1.1. */
+  /* If this origin advertised HTTP/3, try QUIC first (GET only), else fall through to TLS h2/h1.1. */
   if (is_get && u->tls && u->port == 443 && h3_known(u->host)) {
     int st = h3_txn(u, full_url, loc, loc_cap, allow_dl);
     if (st > 0)
-      return doc_cache_finish(full_url, now, revalidating, st);
+      return doc_cache_finish(u, full_url, now, revalidating, st);
     loc[0] = '\0';
     B->pg->ctype[0] = '\0';
     B->dl_name[0] = '\0';
@@ -1142,9 +1061,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
     B->pg->raw_len = 0;
   }
 
-  /* Over TLS, offer ALPN "h2"; if the server selects it, run the request over
-   * HTTP/2 instead of the HTTP/1.1 code below. The netconn owns a user-space
-   * TLS connection (or a plain TCP socket). */
+  /* Over TLS, offer ALPN "h2"; if selected, run over HTTP/2 instead of HTTP/1.1. */
   B->sock = nc_open(u->host, u->port, u->tls, /*offer_h2=*/1);
   if (!B->sock) {
     if (nc_last_error() == NC_OPEN_RESOLVE)
@@ -1158,7 +1075,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
     int st = h2_txn(u, full_url, loc, loc_cap, allow_dl, method, body, blen, bctype);
     nc_close(B->sock);
     B->sock = 0;
-    return doc_cache_finish(full_url, now, revalidating, st);
+    return doc_cache_finish(u, full_url, now, revalidating, st);
   }
 
   char req[2048];
@@ -1187,7 +1104,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
        "Accept-Encoding: gzip, deflate, br\r\n");
   {
     char ch[512];
-    if (ch_request_headers(u->host, ch, sizeof ch) > 0)
+    if (ch_headers_for(u, false, ch, sizeof ch) > 0)
       sapp(req, &n, sizeof req, ch);
   }
   sapp(req, &n, sizeof req, "Connection: close\r\n");
@@ -1213,9 +1130,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
     return -4;
   }
 
-  /* Read the response header block, skipping any 1xx interim response. A 103
-   * Early Hints response carries Link: rel=stylesheet hints (stashed now,
-   * merged after the final response is parsed); other 1xx are just skipped. */
+  /* Read the header block, skipping 1xx interim responses; 103 Link hints are stashed for the final response. */
   char hdr[RESP_HDR_MAX];
   int hlen = 0;
   for (int interim = 0;;) {
@@ -1261,8 +1176,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
 
   struct bodysrc bs = {chunked, have_len, false, false, have_len ? content_len : 0};
 
-  /* Read the whole (framed) body into B->pg->raw, then the common pipeline
-   * decodes Content-Encoding and routes render-vs-download. */
+  /* Read the whole framed body into B->pg->raw; the common pipeline decodes and routes it. */
   int c;
   while ((c = body_src(&bs)) >= 0) {
     if (!browser_ensure_raw(B->pg->raw_len + 1))
@@ -1273,22 +1187,15 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
   B->sock = 0;
 
   raw_decode(enc_gz);
-  return doc_cache_finish(full_url, now, revalidating, route_body(full_url, status, allow_dl));
+  return doc_cache_finish(u, full_url, now, revalidating, route_body(full_url, status, allow_dl));
 }
 
 /* ----------------------------------------------- local & inline URL schemes */
 
-/* Render whatever is in B->pg->raw (with B->pg->ctype already set) as the page
- * body — HTML, plain text, or a PNG. Shared by the network, file:, and data:
- * paths so all three pick the display mode the same way. HTML pulls external
- * stylesheets (via css_batch) before layout; other sub-resources are fetched by
- * do_fetch. */
+/* Render B->pg->raw (ctype set) as HTML, text or PNG; shared by network, file: and data: paths. */
 static void render_raw(const char *url)
 {
-  /* HTML rendering normally also covers an empty/missing Content-Type (sloppy
-   * servers). But X-Content-Type-Options: nosniff forbids that guess: with it
-   * set, render as HTML ONLY when the server explicitly declared an HTML type,
-   * otherwise fall through to plain text. */
+  /* Empty Content-Type renders as HTML, except under nosniff which requires an explicit HTML type. */
   bool as_html = is_html_type(B->pg->ctype) || (B->pg->ctype[0] == '\0' && !B->nosniff);
   if (as_html) {
     B->pg->mode = MODE_HTML;
@@ -1312,9 +1219,7 @@ static void render_raw(const char *url)
   }
 }
 
-/* Pick a Content-Type for a local file from its extension — only the
- * distinctions render_raw cares about (HTML vs PNG vs everything-else-as-text);
- * an unknown or missing extension renders verbatim as text. */
+/* Content-Type for a local file from its extension (HTML, PNG, else text). */
 static void ctype_from_ext(const char *path)
 {
   const char *ext = 0;
@@ -1335,11 +1240,7 @@ static void ctype_from_ext(const char *path)
   sapp(B->pg->ctype, &k, sizeof B->pg->ctype, t);
 }
 
-/* file:// — read a file from the local FS (owofs or a /media mount) into
- * B->pg->raw, streamed and grown on demand so a file of any size loads (bounded
- * only by memory). Accepts file:/path, file://host/path (host ignored),
- * file:///path; a trailing ?query or #fragment is dropped. Returns 0, or -1 if
- * it can't open. */
+/* file://: read a local file into B->pg->raw, grown on demand; host ignored, ?query and #fragment dropped. */
 static int load_file_url(const char *url)
 {
   const char *p = url + 5;          /* past "file:" */
@@ -1374,11 +1275,7 @@ static int load_file_url(const char *url)
   return 0;
 }
 
-/* data:[<mediatype>][;base64],<data> — decode an inline document into
- * B->pg->raw. The media type sets B->pg->ctype so render_raw picks the display
- * mode. Uses the shared decode_data_url (resource.c) so the base64/percent
- * logic lives once, then copies the payload into the streaming raw buffer.
- * Returns 0, or -1 if malformed. */
+/* data:[<mediatype>][;base64],<data>: decode into B->pg->raw via decode_data_url; sets ctype. */
 static int load_data_url(const char *url)
 {
   int len = 0;
@@ -1400,35 +1297,29 @@ void do_fetch(void)
 {
   char url[URL_MAX];
   int n = 0;
-  /* Capture the page we're leaving as the referrer for the page we're about to
-   * load (cur_url still holds the old URL until render_raw overwrites it). */
+  /* Keep the page being left as the referrer (cur_url still holds the old URL). */
   {
     int k = 0;
     B->referrer[0] = '\0';
     sapp(B->referrer, &k, sizeof B->referrer, B->pg->cur_url);
   }
-  /* Free the previous page's live DOM/CSS/JS before building the new one. This
-   * covers every navigation (incl. plain-text/image/error paths that don't go
-   * through html_to_text); html_to_text repeats it harmlessly for HTML pages.
-   */
+  /* Free the previous page's DOM/CSS/JS on every navigation. */
   html_page_teardown();
   if (B->pg->csp) {
     csp_free(B->pg->csp);
     B->pg->csp = 0;
   } /* drop the old page's CSP; parse_response/meta rebuild it */
   B->pg->perm_policy = 0; /* drop the old Permissions-Policy; parse_response rebuilds it */
-  devtools_net_reset();   /* a new top-level navigation starts a fresh net log */
+  free(B->pg->perm_policy_hdr);
+  B->pg->perm_policy_hdr = 0;
+  devtools_net_reset(); /* a new top-level navigation starts a fresh net log */
   sapp(url, &n, sizeof url, B->req_url);
   B->dl_saved = 0;
   B->scripts_pending = 0; /* only an HTML render (html_to_text) re-arms it */
   B->pg->favicon_ok = 0;  /* cleared per navigation; refilled on success */
   ext_css_clear();        /* Link: stylesheets refilled by parse_response  */
 
-  /* Capture this navigation's HTTP method + body (a form POST fills them).
-   * Point at B->req_body rather than copying to a big stack buffer — the bytes
-   * stay put through the fetch, and render_raw's deep HTML parse runs on this
-   * same frame. Clear req_method so the NEXT navigation defaults back to GET.
-   */
+  /* Capture this navigation's method + body without copying; req_method is cleared so the next one is GET. */
   char method[8];
   strcpy(method, B->req_method[0] ? B->req_method : "GET");
   const unsigned char *body = (const unsigned char *)B->req_body;
@@ -1437,10 +1328,7 @@ void do_fetch(void)
   B->req_method[0] = '\0';
   B->req_body_len = 0;
 
-  /* Local / inline schemes never touch the network: file:// reads the local
-   * FS, data: decodes an embedded document. Both fill B->pg->raw + B->pg->ctype
-   * and render through the same path as a fetched page (no sub-resource fetch).
-   */
+  /* file: and data: never touch the network; they fill raw + ctype and render like a fetched page. */
   if (starts_ci(url, "file:") || starts_ci(url, "data:")) {
     bool data = starts_ci(url, "data:");
     B->pg->ctype[0] = '\0';
@@ -1467,10 +1355,7 @@ void do_fetch(void)
     return;
   }
 
-  /* Auto-add a scheme when the user typed a bare host ("miwa.lol/..."): default
-   * to https like a modern browser. Remember it was implicit so a host that
-   * can't do TLS (or a plain dev server on a custom port) falls back to http.
-   */
+  /* Add https:// to a bare host; remember it was implicit so a TLS failure falls back to http. */
   bool implicit_scheme = false;
   if (!starts_ci(url, "http://") && !starts_ci(url, "https://")) {
     char tmp[URL_MAX];
@@ -1482,12 +1367,10 @@ void do_fetch(void)
     implicit_scheme = true;
   }
 
-  /* Log the document as in-flight up front, so a slow or failing navigation
-   * shows in the Network panel while it loads — not only once (if) it
-   * completes. Seed the duration clock here too (http_txn re-stamps it per hop)
-   * so a bail before the first hop reports a sane elapsed time. */
+  /* Log the document as in-flight up front so slow loads show in the Network panel. */
   g_doc_t0 = msec();
   int docnid = devtools_net_begin(method, url);
+  bool ch_retried = false;
 
   for (int hop = 0; hop <= MAX_REDIR; hop++) {
     if (B->abort_load) { /* stopped before this hop: leave as-is */
@@ -1503,15 +1386,15 @@ void do_fetch(void)
       return;
     }
 
-    /* HSTS: a host that previously sent Strict-Transport-Security is only
-     * ever contacted over HTTPS, even if the URL says http://. */
+    /* HSTS: a host with Strict-Transport-Security is only contacted over HTTPS. */
     if (!u.tls && hsts_has(u.host)) {
       u.tls = 1;
       if (u.port == 80)
         u.port = 443;
     }
 
-    char loc[URL_MAX];
+    char loc[URL_MAX], ch_sent[512];
+    ch_headers_for(&u, false, ch_sent, sizeof ch_sent);
     int st = http_txn(&u, url, loc, sizeof loc, 1, method, body, blen, bctype);
     if (st < 0) {
       if (B->abort_load) { /* user stopped: no error page */
@@ -1519,8 +1402,7 @@ void do_fetch(void)
         devtools_net_update(docnid, &e);
         return;
       }
-      /* Secure connect failed for an auto-https URL (host has no TLS, or a
-       * plain dev server) — retry the same URL over http once. */
+      /* TLS connect failed for an auto-https URL: retry over http once. */
       if (implicit_scheme && st == -3 && starts_ci(url, "https://")) {
         char tmp[URL_MAX];
         int t = 0;
@@ -1539,6 +1421,20 @@ void do_fetch(void)
       }
       return;
     }
+    if (!ch_retried && streq(method, "GET") && !B->dl_saved) {
+      struct http_headers H;
+      http_headers_parse(&H, g_doc_hdr);
+      char *critical = join_headers(&H, "critical-ch");
+      http_headers_free(&H);
+      char ch_now[512];
+      ch_headers_for(&u, false, ch_now, sizeof ch_now);
+      ch_retried = critical && ch_critical_retry(critical, ch_sent, ch_now);
+      free(critical);
+      if (ch_retried) {
+        hop--;
+        continue;
+      }
+    }
     if ((st == 301 || st == 302 || st == 303 || st == 307 || st == 308) && loc[0]) {
       if (hop == MAX_REDIR) {
         show_error("Too many redirects");
@@ -1547,8 +1443,7 @@ void do_fetch(void)
         devtools_net_update(docnid, &e);
         return;
       }
-      /* A POST redirected by 301/302/303 becomes a bodyless GET (browser
-       * convention; 303 mandates it). 307/308 preserve the method + body. */
+      /* A POST redirected by 301/302/303 becomes a bodyless GET; 307/308 keep method and body. */
       if (!streq(method, "GET") && st != 307 && st != 308) {
         strcpy(method, "GET");
         body = 0;
@@ -1560,8 +1455,7 @@ void do_fetch(void)
       continue;
     }
 
-    /* Resolve the in-flight document row with the final response (after any
-     * redirects; a streamed download has raw_len 0). */
+    /* Resolve the in-flight document row with the final response. */
     {
       struct net_log e = {
           method,    url,      st, B->pg->ctype, B->dl_saved ? 0 : B->pg->raw_len, (int)(msec() - g_doc_t0),
@@ -1569,37 +1463,24 @@ void do_fetch(void)
       devtools_net_update(docnid, &e);
     }
 
-    /* A download was streamed straight to ~/Downloads inside http_txn (it
-     * never touched B->pg->raw), so there is nothing to render. */
+    /* A download was streamed to ~/Downloads inside http_txn, so there is nothing to render. */
     if (B->dl_saved)
       return;
 
-    /* Render according to the response type. An empty Content-Type is
-     * treated as HTML (the common case for sloppy servers); a plain text
-     * type is shown verbatim so line breaks survive; image/png is decoded. */
+    /* Render by response type: empty Content-Type is HTML, text is verbatim, image/png is decoded. */
     resource_set_page(url); /* attribute this page's sub-resources for CORP */
     render_raw(url);
-    /* The title bar is updated by the main thread (only the window's owner
-     * task may call win_settitle); it reads B->pg->doc_title / B->pg->cur_url.
-     */
+    /* The title bar is updated by the main thread (win_settitle is owner-only). */
 
-    /* HTML pages may carry inline <img>: the parallel fetchers (resource.c)
-     * pull each over its own socket into img_pool — B->pg->raw is untouched.
-     * Each landed image bumps B->seq so the UI re-lays-out as they arrive. */
+    /* Inline <img> are fetched by the parallel fetchers in resource.c; each landed image bumps B->seq. */
     if (B->pg->mode == MODE_HTML && B->pg->n_imgs > 0 && !B->abort_load)
       fetch_inline_images(url);
 
-    /* Pull the site favicon for the tab strip. Skipped for a directly-rendered
-     * image page, whose pixels are in B->pg->raw (the favicon fetch uses its
-     * own buffer, but the page is already the image, so there's nothing to
-     * fetch). */
+    /* Pull the site favicon for the tab strip, unless the page is itself an image. */
     if (B->pg->mode != MODE_IMAGE && !B->abort_load)
       fetch_favicon(url);
 
-    /* Persist everything this navigation cached (document + stylesheets +
-     * images + favicon). Deferred to here — the single worker thread, with the
-     * sub-resource pools already joined — because owofs allows one open write
-     * stream at a time. */
+    /* Persist cached documents, stylesheets, images and favicon here (owofs allows one write stream at a time). */
     cache_flush();
     return;
   }

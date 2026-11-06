@@ -1,9 +1,4 @@
-/* resource.c — sub-resource fetching for the browser: a self-contained HTTP/1.1
- * GET (own socket, follows redirects, sends cookies, HSTS-upgrade) shared by
- * the parallel inline-image fetcher, the favicon, and external stylesheets.
- * These run while the page renders, each on its own socket, so the multi-flow
- * kernel TLS lets several proceed at once. The main page transaction lives in
- * fetch.c. */
+/* resource.c: sub-resource fetching (images, favicon, CSS) on per-request sockets. */
 #include "base64.h" /* shared base64 for data: URL decoding */
 #include "browser.h"
 #include "features/cache/cache.h"             /* the HTTP response cache (RFC 7234, honours headers)   */
@@ -15,8 +10,7 @@
 #include "imgdec.h"  /* shared image decoder (SVG/WebP/PNG) for <img> */
 #include "mutex.h"
 
-/* The origin that owns the sub-resources currently being fetched (the page, set
- * by do_fetch). Cross-origin no-cors loads are checked against it for CORP. */
+/* Origin owning the sub-resources being fetched (set by do_fetch); used for CORP checks. */
 static char g_embedder[URL_MAX];
 void resource_set_page(const char *page_url)
 {
@@ -24,6 +18,19 @@ void resource_set_page(const char *page_url)
   g_embedder[0] = '\0';
   if (page_url)
     sapp(g_embedder, &k, sizeof g_embedder, page_url);
+}
+
+int ch_headers_for(const struct purl *u, bool subresource, char *out, int cap)
+{
+  char url[URL_HOST_MAX + 16];
+  int n = 0;
+  sapp(url, &n, sizeof url, u->tls ? "https://" : "http://");
+  sapp(url, &n, sizeof url, u->host);
+  sapp(url, &n, sizeof url, ":");
+  uapp(url, &n, sizeof url, (unsigned)u->port);
+  if (!subresource)
+    return ch_request_headers_for(0, 0, url, out, cap);
+  return ch_request_headers_for(g_embedder[0] ? g_embedder : 0, B->pg->perm_policy_hdr, url, out, cap);
 }
 
 /* --------------------------------------------------- inline image fetching */
@@ -39,10 +46,7 @@ static int memrd_get(void *c)
   return m->pos < m->len ? m->p[m->pos++] : -1;
 }
 
-/* Self-contained per-thread HTTP reader: several images fetch in parallel, each
- * over its OWN netconn/buffer, so they never touch B->sock/B->pg->raw (which
- * only the page fetch uses). The user-space TLS is per-connection, so the HTTPS
- * handshakes run concurrently. */
+/* Per-thread HTTP reader over its own netconn/buffer, so parallel fetches don't share B->sock. */
 struct ireader {
   netconn *conn;
   unsigned char buf[2048];
@@ -65,8 +69,7 @@ static int ir_getc(struct ireader *r)
   return r->buf[r->pos++];
 }
 
-/* Append one byte to a malloc'd, doubling body buffer (capped at RAW_MAX).
- * Returns 0, or -1 if full / out of memory (the caller stops). */
+/* Append one byte to a doubling body buffer (cap RAW_MAX); 0 ok, -1 if full or OOM. */
 static int body_put(unsigned char **body, int *cap, int *blen, int c)
 {
   if (*blen >= *cap) {
@@ -85,9 +88,7 @@ static int body_put(unsigned char **body, int *cap, int *blen, int c)
   return 0;
 }
 
-/* Grow *body (doubling, capped at RAW_MAX) so it holds at least `need` bytes.
- * Returns the resulting capacity, which is < need only when the cap or OOM
- * stops the growth. */
+/* Grow *body (doubling, capped at RAW_MAX) to hold `need`; returns capacity, < need if capped/OOM. */
 static int body_reserve(unsigned char **body, int *cap, int need)
 {
   if (need <= *cap)
@@ -112,10 +113,7 @@ static int body_reserve(unsigned char **body, int *cap, int need)
   return *cap;
 }
 
-/* Bulk-copy up to `want` body bytes from the reader into *body, taking whole
- * buffered runs (memcpy) instead of a call per byte. Refills from the socket as
- * needed. Returns the count copied; short of `want` means EOF or the RAW_MAX
- * cap. */
+/* Bulk-copy up to `want` body bytes from the reader; returns count (short = EOF or RAW_MAX cap). */
 static long ir_drain(struct ireader *r, unsigned char **body, int *cap, int *blen, long want)
 {
   long done = 0;
@@ -148,9 +146,7 @@ static long ir_drain(struct ireader *r, unsigned char **body, int *cap, int *ble
   return done;
 }
 
-/* Read a response header block (up to the blank line) into `hdr`,
- * NUL-terminated. Returns its length, or -1 if the connection closed before the
- * block completed. */
+/* Read a header block into `hdr` (NUL-terminated); returns length, -1 if closed early. */
 static int ir_read_header_block(struct ireader *r, char *hdr, int cap)
 {
   int hl = 0, m = 0;
@@ -173,10 +169,7 @@ static int ir_read_header_block(struct ireader *r, char *hdr, int cap)
   return hl;
 }
 
-/* Pump up to `want` body bytes from the reader to `sink` (whole buffered runs
- * at a time), refilling from the socket as needed. `want < 0` means read to
- * close. Returns the count pumped (short of `want` = EOF), or -1 if the sink
- * aborts. */
+/* Pump up to `want` body bytes (<0 = until close) to `sink`; returns count, -1 if sink aborts. */
 static long ir_pump_n(struct ireader *r, long want, http_body_fn sink, void *ctx)
 {
   long done = 0;
@@ -205,10 +198,7 @@ static long ir_pump_n(struct ireader *r, long want, http_body_fn sink, void *ctx
   return done;
 }
 
-/* Stream a response's framed body (chunked / content-length / read-to-close) to
- * `sink`, undoing the transfer framing. Returns the content byte count, or -1
- * if the sink aborts (a disk error). `clen < 0` with !chunked means read to
- * close. */
+/* Stream a framed body (chunked/content-length/to-close) to `sink`; returns bytes, -1 on sink abort. */
 static long ir_pump_body(struct ireader *r, bool chunked, long clen, http_body_fn sink, void *ctx)
 {
   long total = 0;
@@ -252,18 +242,14 @@ static long ir_pump_body(struct ireader *r, bool chunked, long clen, http_body_f
   return total;
 }
 
-/* Response line/header facts a sub-resource fetch needs: the status code and a
- * Location (for redirects). */
+/* Status code and Location of a sub-resource response. */
 struct resp_meta {
   int status;
   char location[URL_MAX];
   char ctype[160];
 };
 
-/* Parse a response header block (an HTTP/1.1 block, or the HTTP/2-synthesized
- * "HTTP/2 NNN\r\nname: value\r\n…"): status + Location + Content-Type into
- * `meta`, and the framing (chunked / Content-Length) for the body reader.
- * Shared by the h1.1 socket reader and the h2 path. */
+/* Parse an HTTP/1.1 or h2-synthesized header block into `meta` plus body framing. */
 static void parse_resp_headers(const char *hdr, struct resp_meta *meta, bool *chunked, long *clen)
 {
   meta->status = 0;
@@ -322,11 +308,7 @@ static void parse_resp_headers(const char *hdr, struct resp_meta *meta, bool *ch
   }
 }
 
-/* Read a response's body (chunked / content-length / read-to-close) off an open
- * sub-resource request into a freshly malloc'd buffer. Fills *meta (status +
- * Location) and returns the body (caller frees) with *outlen set, for ANY
- * status — the caller decides what to do with a redirect or an error. NULL only
- * on a connection error / OOM. Bounded by RAW_MAX. */
+/* Read a response body into a malloc'd buffer (caller frees) for any status; NULL on error/OOM. */
 static unsigned char *read_http_body(struct ireader *r, int *outlen, struct resp_meta *meta, char *hdr_out, int hdr_cap)
 {
   char hdr[RESP_HDR_MAX];
@@ -387,13 +369,7 @@ done:
 
 static bool is_redirect(int s) { return s == 301 || s == 302 || s == 303 || s == 307 || s == 308; }
 
-/* Fetch an absolute URL as a sub-resource (GET, follow redirects): the 200 body
- * (caller frees) + *outlen, or NULL. A thin wrapper over browser_fetch (the one
- * single-request transport: h2 when the server offers it, else h1.1), which
- * also gives sub-resources HTTP/2. Sends cookies, HSTS-upgrades, runs
- * concurrently (the kernel TLS is multi-flow), and drops a cross-origin
- * response the server's Cross-Origin-Resource-Policy forbids this page from
- * using. */
+/* GET a sub-resource via browser_fetch (cookies, HSTS, CORP); returns the 200 body or NULL. */
 static unsigned char *subres_get(const char *absurl, const char *accept, int *outlen)
 {
   char hdr[RESP_HDR_MAX];
@@ -412,8 +388,7 @@ static unsigned char *subres_get(const char *absurl, const char *accept, int *ou
     return 0;
   }
 
-  /* CORP: a cross-origin no-cors resource may forbid this document embedding
-   * it. */
+  /* CORP: a cross-origin no-cors resource may forbid embedding. */
   if (g_embedder[0] && !cors_same_origin(g_embedder, absurl)) {
     struct http_headers H;
     http_headers_parse(&H, hdr);
@@ -428,11 +403,8 @@ static unsigned char *subres_get(const char *absurl, const char *accept, int *ou
   return body;
 }
 
-/* Build an arbitrary-method request (for the JS fetch()): like build_get but
- * with the method, an optional Content-Type, and a Content-Length when a body
- * follows. */
-/* Append a caller's "Name: value\r\n" header blob to an HTTP/2 header buffer,
- * lowercasing each field name (HTTP/2 requires lowercase header names). */
+/* Build a request with an arbitrary method, optional Content-Type and Content-Length. */
+/* Append a "Name: value\r\n" blob to an h2 header buffer, lowercasing names. */
 static void h2_append_headers(char *xh, int *xn, int cap, const char *extra)
 {
   const char *p = extra;
@@ -453,6 +425,49 @@ static void h2_append_headers(char *xh, int *xn, int cap, const char *extra)
       xh[*xn] = '\0';
     p = *eol ? eol + 1 : eol;
   }
+}
+
+#define IMG_ACCEPT "image/png,image/webp,image/svg+xml,*/*"
+#define VARY_HDRS_MAX 2560
+
+/* Normalise a URL's origin (HSTS-upgrading http) into *u; 0 on a bad URL. */
+static bool origin_of(const char *url, struct purl *u)
+{
+  if (!parse_url(url, u))
+    return false;
+  if (!u->tls && hsts_has(u->host)) {
+    u->tls = 1;
+    if (u->port == 80)
+      u->port = 443;
+  }
+  return true;
+}
+
+/* The request headers a GET of `url` sends (cookies, UA, accept, client hints, caller extras), as the cache's Vary
+ * input. */
+static void vary_req_hdrs(const char *url, const char *accept, const char *extra, bool cookies, char *out)
+{
+  int n = 0;
+  out[0] = '\0';
+  struct purl u;
+  if (!origin_of(url, &u))
+    return;
+  char ck[1024];
+  if (cookies && cookie_header(u.host, ck, sizeof ck) > 0) {
+    sapp(out, &n, VARY_HDRS_MAX, "cookie: ");
+    sapp(out, &n, VARY_HDRS_MAX, ck);
+    sapp(out, &n, VARY_HDRS_MAX, "\r\n");
+  }
+  sapp(out, &n, VARY_HDRS_MAX, "user-agent: ");
+  sapp(out, &n, VARY_HDRS_MAX, browser_ua());
+  sapp(out, &n, VARY_HDRS_MAX, "\r\naccept: ");
+  sapp(out, &n, VARY_HDRS_MAX, accept);
+  sapp(out, &n, VARY_HDRS_MAX, "\r\n");
+  char ch[512];
+  if (ch_headers_for(&u, true, ch, sizeof ch) > 0)
+    sapp(out, &n, VARY_HDRS_MAX, ch);
+  if (extra && extra[0])
+    sapp(out, &n, VARY_HDRS_MAX, extra);
 }
 
 static void build_request(char *req, int *n, int cap, const struct purl *u, const char *method, const char *accept,
@@ -489,7 +504,7 @@ static void build_request(char *req, int *n, int cap, const struct purl *u, cons
   sapp(req, n, cap, "\r\nConnection: close\r\n");
   {
     char ch[512];
-    if (ch_request_headers(u->host, ch, sizeof ch) > 0)
+    if (ch_headers_for(u, true, ch, sizeof ch) > 0)
       sapp(req, n, cap, ch);
   }
   if (rq->extra_hdrs && rq->extra_hdrs[0])
@@ -497,8 +512,7 @@ static void build_request(char *req, int *n, int cap, const struct purl *u, cons
   sapp(req, n, cap, "\r\n");
 }
 
-/* h2 response body sink for browser_fetch: append DATA into a growable buffer.
- */
+/* h2 body sink for browser_fetch: append DATA to a growable buffer. */
 struct h2buf {
   unsigned char *body;
   int cap, blen;
@@ -512,14 +526,8 @@ static int h2buf_cb(void *ctx, const unsigned char *p, int n)
   return 0;
 }
 
-/* The single-request transport core: one GET/POST (h2 when offered, else h1.1),
- * following redirects, returning the body for ANY final status. The optional
- * out fields of `rs` (final URL after redirects, the raw header block) let a
- * caller that needs more than status+ctype (the iframe path reads
- * X-Frame-Options/CSP, the CORS path reads Access-Control-*) get them without a
- * second request. NULL on a connection/OOM error. Worker-thread only. */
-/* Log an unfinished request as cancelled (the user stopped the load) or failed
- * (a connectivity / transport error), resolving the in-flight row `id`. */
+/* Single-request transport (h2 or h1.1, follows redirects); NULL on error. Worker-thread only. */
+/* Log an unfinished request as cancelled or failed. */
 static void net_fail(int id, const char *method, const char *url)
 {
   struct net_log e = {
@@ -547,10 +555,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
   if (rs->hdr && rs->hdr_cap)
     rs->hdr[0] = '\0';
 
-  /* HTTP cache: only a bodyless GET is cacheable. A fresh copy skips the wire
-   * entirely; a stale one rides a conditional GET (the `cond` headers) and a
-   * 304 reuses the stored body. Keyed on the requested URL (origurl), so a
-   * repeat hits the cache before re-walking any redirect chain. */
+  /* Cache: only bodyless GETs; fresh hits skip the wire, stale ones revalidate (304 reuses body). */
   bool cacheable = streq_ci(method, "GET") && !(rq->body && rq->body_len > 0);
   long now = (long)rtc_epoch();
   bool revalidating = false;
@@ -564,11 +569,13 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
   }
   struct http_req rqc; /* request copy carrying the cond headers */
   char combined[1408];
+  char vary_hdrs[VARY_HDRS_MAX];
   if (cacheable) {
+    vary_req_hdrs(origurl, accept, rq->extra_hdrs, !rq->no_cookies, vary_hdrs);
     unsigned char *cbody = 0;
     int clen = 0;
-    int cv = cache_lookup(method, origurl, now, &cbody, &clen, rs->ctype, sizeof rs->ctype, rs->hdr, rs->hdr_cap, cond,
-                          sizeof cond);
+    int cv = cache_lookup(method, origurl, vary_hdrs, now, &cbody, &clen, rs->ctype, sizeof rs->ctype, rs->hdr,
+                          rs->hdr_cap, cond, sizeof cond);
     if (cv == CACHE_FRESH) {
       rs->status = 200;
       rs->len = clen;
@@ -610,8 +617,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
       return 0;
 
     if (u.tls && nc_alpn(conn) == ALPN_H2) {
-      /* HTTP/2. :authority + lowercased headers; no accept-encoding so the
-       * body comes back plain (no decompression needed here). */
+      /* HTTP/2: :authority + lowercased headers; no accept-encoding, so the body is plain. */
       char auth[URL_HOST_MAX + 8];
       int an = 0;
       sapp(auth, &an, sizeof auth, u.host);
@@ -632,7 +638,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
       sapp(xh, &xn, sizeof xh, "\r\n");
       {
         char ch[512];
-        if (ch_request_headers(u.host, ch, sizeof ch) > 0)
+        if (ch_headers_for(&u, true, ch, sizeof ch) > 0)
           sapp(xh, &xn, sizeof xh, ch);
       }
       if (rq->ctype && rq->ctype[0]) {
@@ -694,12 +700,12 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
       continue;
     }
 
-    /* A revalidation that came back 304: reuse the stored body (its freshness
-     * refreshed from the 304's headers). */
+    /* Revalidated 304: reuse the stored body with refreshed freshness. */
     if (revalidating && meta.status == 304) {
       unsigned char *rb = 0;
       int rl = 0;
-      if (cache_revalidated(origurl, now, rawhdr, &rb, &rl, rs->ctype, sizeof rs->ctype, rs->hdr, rs->hdr_cap)) {
+      if (cache_revalidated(origurl, vary_hdrs, now, rawhdr, &rb, &rl, rs->ctype, sizeof rs->ctype, rs->hdr,
+                            rs->hdr_cap)) {
         free(body);
         rs->status = 200;
         rs->len = rl;
@@ -709,13 +715,11 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
         }
         return rb;
       }
-      /* Entry vanished (evicted mid-flight): fall through and hand back the
-       * 304 as-is; the caller treats a non-200 as a miss and refetches. */
+      /* Entry evicted mid-flight: return the 304 as-is (callers treat non-200 as a miss). */
     }
-    /* Store a fresh 200 under the requested URL (cache_store vets the headers).
-     */
+    /* Store a fresh 200 under the requested URL. */
     if (cacheable && meta.status == 200)
-      cache_store(method, origurl, 200, now, rawhdr, meta.ctype, body, blen);
+      cache_store(method, origurl, vary_hdrs, 200, now, rawhdr, meta.ctype, body, blen);
 
     rs->status = meta.status;
     rs->len = blen;
@@ -739,11 +743,7 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
   return 0;
 }
 
-/* Public transport entry. browser_fetch_raw does the HTTP work; this frames
- * every request in the devtools Network panel: an in-flight (pending) row
- * logged the moment it starts, resolved to done / failed / cancelled when raw
- * returns — so a request shows while loading and however it ends, not only on
- * success. */
+/* Public entry: wraps browser_fetch_raw with a devtools Network row (pending, then resolved). */
 unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 {
   const char *method = (rq->method && rq->method[0]) ? rq->method : "GET";
@@ -760,8 +760,7 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
   return body;
 }
 
-/* A body sink over the open owofs write stream: append each run, tracking the
- * total and latching a disk error (which aborts the pump). */
+/* Body sink over an open owofs write stream; latches a disk error to abort the pump. */
 struct filesink {
   long written;
   bool err;
@@ -779,10 +778,7 @@ static int filesink_cb(void *ctx, const unsigned char *p, int n)
   return 0;
 }
 
-/* HTTP/2 media streaming: the h2 engine delivers the response headers (once,
- * before any DATA) to mstream_headers, then each DATA payload to mstream_body.
- * On a 2xx the header hook opens the disk stream so DATA writes straight to it;
- * a redirect is noted (its target resolved) and its body discarded. */
+/* h2 media streaming: headers go to mstream_headers, DATA to mstream_body; 2xx streams to disk. */
 struct mstream {
   const char *file; /* temp path to stream a 2xx body into        */
   const char *full; /* current request URL (for Location resolve) */
@@ -855,10 +851,7 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
         u.port = 443;
     }
 
-    /* Offer h2 like every other sub-resource load: whichever the server picks,
-     * the body streams straight to disk (h2 via the DATA callback, h1.1 via the
-     * framed body pump). h3 is document-only in this browser, so media matches
-     * the h2/h1.1 sub-resource path. */
+    /* Offer h2; the body streams to disk either way (h3 is document-only). */
     netconn *conn = nc_open(u.host, u.port, u.tls, /*offer_h2=*/1);
     if (!conn) {
       net_fail(nid, "GET", full);
@@ -866,9 +859,7 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
     }
 
     if (u.tls && nc_alpn(conn) == ALPN_H2) {
-      /* HTTP/2: :authority + lowercased headers, DATA streamed to disk by the
-       * mstream callbacks. No Connection/Transfer-Encoding (forbidden in h2).
-       */
+      /* HTTP/2: :authority + lowercased headers; no Connection/Transfer-Encoding (forbidden in h2). */
       char auth[URL_HOST_MAX + 8];
       int an = 0;
       sapp(auth, &an, sizeof auth, u.host);
@@ -889,7 +880,7 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
       sapp(xh, &xn, sizeof xh, "\r\n");
       {
         char ch[512];
-        if (ch_request_headers(u.host, ch, sizeof ch) > 0)
+        if (ch_headers_for(&u, true, ch, sizeof ch) > 0)
           sapp(xh, &xn, sizeof xh, ch);
       }
       sapp(xh, &xn, sizeof xh, "accept-encoding: identity\r\nrange: bytes=0-\r\n");
@@ -933,9 +924,7 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
       return committed;
     }
 
-    /* GET with an open-ended Range so a partial-content server answers 206;
-     * identity coding so the body writes to disk verbatim (media is already
-     * compressed and this path does not decode Content-Encoding). */
+    /* Open-ended Range so servers answer 206; identity coding so the body lands on disk verbatim. */
     char req[2048];
     int n = 0;
     sapp(req, &n, sizeof req, "GET ");
@@ -959,7 +948,7 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
     sapp(req, &n, sizeof req, accept);
     {
       char ch[512];
-      if (ch_request_headers(u.host, ch, sizeof ch) > 0)
+      if (ch_headers_for(&u, true, ch, sizeof ch) > 0)
         sapp(req, &n, sizeof req, ch);
     }
     sapp(req, &n, sizeof req,
@@ -996,15 +985,13 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
       *status = meta.status;
     if (meta.status < 200 || meta.status >= 300) {
       nc_close(conn);
-      /* A real HTTP response arrived (4xx/5xx): record it as completed with its
-       * status, not a connectivity failure. */
+      /* Real 4xx/5xx response: record as completed, not a connectivity failure. */
       struct net_log e = {"GET", full, meta.status, meta.ctype, 0, (int)(msec() - t0), rawhdr, NET_DONE, 0};
       devtools_net_update(nid, &e);
       return -1;
     }
 
-    /* 2xx (200 whole-body or 206 partial): stream the body straight to disk.
-     * stream_begin is deferred to here so a redirect chain reserves no disk. */
+    /* 2xx: stream the body to disk; stream_begin is deferred so redirects reserve no disk. */
     if (stream_begin(file) != 0) {
       nc_close(conn);
       net_fail(nid, "GET", full);
@@ -1035,18 +1022,8 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
   return -1;
 }
 
-/* The CORS transport for fetch()/XMLHttpRequest. A same-origin request behaves
- * like browser_fetch (cookies sent, no extra checks). A cross-origin request
- * carries an Origin header; a non-simple one is gated by a preflight OPTIONS,
- * and the response is only handed back if its Access-Control-Allow-* headers
- * admit `page_url`'s origin. Cookies ride only when `with_credentials` (fetch
- * credentials:"include" / XHR withCredentials), per the CORS credentials rules.
- *
- * Returns the body (caller frees) with `rs` filled; NULL on a transport error
- * OR a CORS denial — the JS layer surfaces both as a network error (TypeError /
- * xhr "error"), so they need not be distinguished. The page-set "Name:
- * value\r\n" headers in `rq->extra_hdrs` classify the request and seed the
- * preflight's Access-Control-Request-Headers. */
+/* CORS transport for fetch()/XHR: Origin header, preflight for non-simple requests, ACAO checks. */
+/* Returns the body (caller frees), or NULL on transport error or CORS denial. */
 unsigned char *browser_cors_fetch(const char *page_url, int with_credentials, const struct http_req *rq,
                                   struct http_resp *rs)
 {
@@ -1069,9 +1046,7 @@ unsigned char *browser_cors_fetch(const char *page_url, int with_credentials, co
   if (author && author[0])
     sapp(xh, &xn, sizeof xh, author);
 
-  /* Non-simple request: a preflight must clear it first. The preflight is never
-   * credentialed and carries no author headers of its own — just the intended
-   * method and the list of non-simple header names. */
+  /* Non-simple request: preflight first (uncredentialed, method + non-simple header names only). */
   if (cors_needs_preflight(method, rq->ctype, author)) {
     char ph[1280];
     int pn = 0;
@@ -1112,8 +1087,7 @@ unsigned char *browser_cors_fetch(const char *page_url, int with_credentials, co
       return 0;
   }
 
-  /* The actual cross-origin request: same base, but Origin'd headers and
-   * cookies gated on the credentials mode. */
+  /* Actual request: Origin'd headers, cookies gated on the credentials mode. */
   struct http_req areq = *rq;
   areq.method = method;
   areq.accept = "*/*";
@@ -1147,15 +1121,9 @@ unsigned char *browser_cors_fetch(const char *page_url, int with_credentials, co
   return body;
 }
 
-/* --- generic parallel sub-resource fetch pool -----------------------------
- * A small fan-out helper: run fn(ctx, i) for every i in [0,n) across a few
- * worker threads plus this one, joining before return. Each job must fetch over
- * its own socket(s) and write disjoint state (or lock its own) — the transport
- * engines (h1.1, and the now per-connection h2) are re-entrant, so the jobs run
- * truly concurrently. Worker-thread only and non-nested: the spawned threads
- * find the active job through g_par (thread_create takes no argument), and
- * par_fetch joins them before returning, so the pointer stays live throughout.
- */
+/* --- parallel sub-resource fetch pool --- */
+/* Run fn(ctx, i) for i in [0,n) across pool threads plus this one, then join. Worker-thread only. */
+/* Jobs use their own sockets and disjoint state; non-nested, threads find the job via g_par. */
 #define PAR_FETCHERS 4
 #define PAR_FETCH_STACK (128 * 1024)
 
@@ -1206,9 +1174,7 @@ static void par_fetch(int n, void (*fn)(void *ctx, int i), void *ctx)
   void *tops[PAR_FETCHERS - 1];
   int nthr = 0;
   for (int t = 0; t < want; t++) {
-    /* Prefer a kernel-guarded stack (unmapped guard page below, so an overflow
-     * in the user-space TLS/h2 path faults cleanly instead of scribbling the
-     * heap); fall back to a plain malloc'd stack if none are free. */
+    /* Prefer a guard-paged kernel stack so overflow faults cleanly; else plain malloc. */
     char *stk = 0;
     void *top = thread_stack_alloc(PAR_FETCH_STACK);
     if (!top) {
@@ -1241,10 +1207,8 @@ static void par_fetch(int n, void (*fn)(void *ctx, int i), void *ctx)
   g_par = 0;
 }
 
-/* --- iframe fetching + embedding policy ------------------------------------ *
- * Whether a framed document may be displayed is the framed document's own call,
- * expressed by X-Frame-Options or the CSP `frame-ancestors` directive; the
- * embedder (the page, or an outer frame) is matched against it by origin. */
+/* --- iframe fetching + embedding policy --- */
+/* The framed document decides via X-Frame-Options or CSP frame-ancestors, matched by origin. */
 
 /* Two URLs share an origin when scheme (tls), host and port all match. */
 static bool origin_eq(const char *a, const char *b)
@@ -1255,9 +1219,7 @@ static bool origin_eq(const char *a, const char *b)
   return ua.tls == ub.tls && ua.port == ub.port && streq_ci(ua.host, ub.host);
 }
 
-/* The value of CSP directive `name` (case-insensitive, at a ';'/start
- * boundary), or NULL. Returns a pointer into `csp` past the name + any spaces.
- */
+/* Value of CSP directive `name` (at a ';'/start boundary) as a pointer past the name, or NULL. */
 static const char *csp_directive(const char *csp, const char *name)
 {
   if (!csp)
@@ -1278,9 +1240,7 @@ static const char *csp_directive(const char *csp, const char *name)
   return 0;
 }
 
-/* Does one frame-ancestors source token [tok,tend) admit the embedder `parent`
- * (`framed` is the framed doc's own URL, used by 'self')? Handles 'self', '*',
- * a scheme://host[:port] origin, a "*.suffix" host, and a bare host. */
+/* Does frame-ancestors token [tok,tend) admit `parent` ('self' uses `framed`)? */
 static bool csp_src_admits(const char *tok, const char *tend, const char *parent, const char *framed)
 {
   int n = (int)(tend - tok);
@@ -1307,9 +1267,7 @@ static bool csp_src_admits(const char *tok, const char *tend, const char *parent
   return streq_ci(pp.host, s); /* bare host */
 }
 
-/* Decide whether `framed` may be embedded by `parent` given its X-Frame-Options
- * and Content-Security-Policy. frame-ancestors, when present, supersedes XFO. A
- * short human reason is written to `reason` when embedding is refused. */
+/* Whether `parent` may embed `framed` per XFO/CSP (frame-ancestors wins); sets `reason` if refused. */
 static bool frame_embedding_allowed(const char *parent, const char *framed, const char *xfo, const char *csp,
                                     char *reason, int rcap)
 {
@@ -1390,9 +1348,7 @@ static bool frame_embedding_allowed(const char *parent, const char *framed, cons
   return true;
 }
 
-/* Decode a data: URL into a fresh buffer (caller frees) + its media type, so a
- * `data:` iframe needs no network. base64 and percent-encoded bodies both work.
- */
+/* Decode a data: URL (base64 or percent-encoded) into a fresh buffer + media type. */
 static int rhex(int c)
 {
   if (c >= '0' && c <= '9')
@@ -1473,8 +1429,7 @@ unsigned char *decode_data_url(const char *url, int *outlen, char *ctype, int ca
 
 #define IFRAME_BATCH 16
 
-/* One pending iframe's fetched result, filled by a pool thread and consumed on
- * the worker thread (only it may mutate the DOM via html_iframe_resolve). */
+/* One iframe's result: filled by a pool thread, consumed on the worker thread (sole DOM mutator). */
 struct iframe_res {
   char url[URL_MAX];
   char parent[URL_MAX];
@@ -1485,10 +1440,7 @@ struct iframe_res {
   char ctype[160];
 };
 
-/* Fetch + run the embedding policy for one pending iframe (network + pure
- * header checks only, no DOM mutation), storing the verdict in res[i]. Safe to
- * run on several threads at once: each touches only its own res entry and own
- * sockets. */
+/* Fetch + policy-check one pending iframe into res[i]; thread-safe (own res entry and sockets). */
 static void iframe_job(void *vctx, int i)
 {
   struct iframe_res *r = &((struct iframe_res *)vctx)[i];
@@ -1564,11 +1516,8 @@ static void iframe_job(void *vctx, int i)
   }
 }
 
-/* Drain a batch of the page's pending iframes and fetch them in PARALLEL (data:
- * inline, else GET + X-Frame-Options / CSP frame-ancestors / CORP policy), then
- * hand each verdict back to the cache on this (worker) thread, which alone may
- * touch the DOM (html.c re-flattens to show the allowed ones). More than
- * IFRAME_BATCH pending, or nested frames, surface on the worker's next pass. */
+/* Fetch pending iframes in parallel (data: inline, else GET + XFO/CSP/CORP) and resolve on this thread. */
+/* Beyond IFRAME_BATCH or nested frames wait for the next pass. */
 void fetch_iframes(void)
 {
   struct iframe_res *res = malloc(sizeof *res * IFRAME_BATCH);
@@ -1594,22 +1543,7 @@ void fetch_iframes(void)
   free(res);
 }
 
-/* Normalise a URL's origin (HSTS-upgrades http->https) into *u; returns 0 on a
- * bad URL. */
-static bool origin_of(const char *url, struct purl *u)
-{
-  if (!parse_url(url, u))
-    return false;
-  if (!u->tls && hsts_has(u->host)) {
-    u->tls = 1;
-    if (u->port == 80)
-      u->port = 443;
-  }
-  return true;
-}
-
-/* Shared state for a parallel subres batch: the URL list + its output arrays,
- * the per-URL claim bitmap and the lock guarding the origin-group claim. */
+/* Shared state for a parallel subres batch: URLs, outputs, claim bitmap and its lock. */
 struct subres_batch {
   char *const *urls;
   int n;
@@ -1620,13 +1554,8 @@ struct subres_batch {
   mutex_t lock;
 };
 
-/* Fetch one origin-group, starting from the URL `i` a pool thread just claimed:
- * gather every still-unclaimed same-origin HTTPS URL (up to H2_FETCH_MAX) and
- * multiplex them over one h2 connection (h1.1 per failed stream / no-h2
- * origin); a plain-http URL is fetched alone over h1.1. Only the group claim is
- * locked; the network I/O and the disjoint bodies[]/lens[] writes need none.
- * Several groups run at once — each opens its own connection and the engines
- * are re-entrant — so distinct origins fetch concurrently. */
+/* Fetch the origin group of claimed URL `i`: HTTPS multiplexed over one h2 connection, http over h1.1. */
+/* Only the claim is locked; groups for distinct origins run concurrently. */
 static void subres_job(void *vctx, int i)
 {
   struct subres_batch *c = vctx;
@@ -1674,9 +1603,7 @@ static void subres_job(void *vctx, int i)
       c->bodies[grp[g]] = subres_get(c->urls[grp[g]], c->accept, &c->lens[grp[g]]);
     return;
   }
-  /* Per-stream response-header buffers, so a fetched 200 can be cached (the h2
-   * batch otherwise surfaces no headers). NULL on OOM = fetch without caching.
-   */
+  /* Per-stream header buffers so a fetched 200 can be cached; NULL on OOM = no caching. */
   char (*hdrs)[RESP_HDR_MAX] = malloc((unsigned)ng * RESP_HDR_MAX);
   long now = (long)rtc_epoch();
   struct h2_fetch reqs[H2_FETCH_MAX];
@@ -1719,21 +1646,22 @@ static void subres_job(void *vctx, int i)
     sapp(xh, &xn, sizeof xh, "\r\n");
     {
       char ch[512];
-      if (ch_request_headers(u.host, ch, sizeof ch) > 0)
+      if (ch_headers_for(&u, true, ch, sizeof ch) > 0)
         sapp(xh, &xn, sizeof xh, ch);
     }
     struct h2_opts o = {browser_ua(), xh, 0};
     h2_fetch_many(conn, 1, auth, &o, reqs, ng, 0, 0); /* accumulate */
     nc_close(conn);
     for (int g = 0; g < ng; g++) {
-      /* Only a 200 body is usable; a non-200 (redirect/error) is dropped
-       * and retried over h1.1, exactly as the single-request subres_get
-       * path treats it (subres_get returns NULL for any non-200). */
+      /* Only a 200 is usable; others are dropped and retried over h1.1 like subres_get. */
       if (!reqs[g].failed && reqs[g].status == 200 && reqs[g].body) {
         c->bodies[grp[g]] = reqs[g].body;
         c->lens[grp[g]] = reqs[g].blen;
-        if (reqs[g].hdr && reqs[g].hdrlen > 0) /* cache the fetched 200 */
-          cache_store("GET", c->urls[grp[g]], reqs[g].status, now, reqs[g].hdr, "", reqs[g].body, reqs[g].blen);
+        if (reqs[g].hdr && reqs[g].hdrlen > 0) { /* cache the fetched 200 */
+          char vh[VARY_HDRS_MAX];
+          vary_req_hdrs(c->urls[grp[g]], c->accept, 0, true, vh);
+          cache_store("GET", c->urls[grp[g]], vh, reqs[g].status, now, reqs[g].hdr, "", reqs[g].body, reqs[g].blen);
+        }
         {
           struct net_log e = {"GET", c->urls[grp[g]], reqs[g].status, "", reqs[g].blen, 0, 0};
           devtools_net_add(&e);
@@ -1754,13 +1682,7 @@ static void subres_job(void *vctx, int i)
   free(hdrs);
 }
 
-/* Fetch n absolute URLs into bodies[i] (malloc'd, caller frees, NULL on
- * failure)
- * + lens[i], in PARALLEL across a thread pool: same-origin HTTPS URLs are still
- * multiplexed over one h2 connection (h1.1 fallback per failed stream / no-h2
- * origin) and plain-http URLs go over h1.1, but distinct origin-groups now
- * fetch concurrently — each on its own connection, the engines being
- * re-entrant. */
+/* Fetch n URLs into bodies[i]/lens[i] (malloc'd, NULL on failure); origin groups run in parallel. */
 void subres_get_batch(char *const *urls, int n, const char *accept, unsigned char **bodies, int *lens)
 {
   if (n <= 0)
@@ -1770,10 +1692,7 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
     lens[i] = 0;
   }
 
-  /* `handled` tracks which URLs an origin-group already claimed. Sized to n (no
-   * fixed cap): a page may reference any number of sub-resources. Each h2 group
-   * still gathers at most H2_FETCH_MAX same-origin streams per connection and
-   * leaves the rest for another claimed group, so this stays unbounded. */
+  /* `handled` marks URLs already claimed by an origin group; sized to n, no fixed cap. */
   bool *handled = calloc((unsigned)n, sizeof *handled);
   if (!handled) { /* OOM: degrade to one fetch at a time */
     for (int i = 0; i < n; i++)
@@ -1781,10 +1700,7 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
     return;
   }
 
-  /* data: URLs decode inline (no network, no origin) — the fetch groups below
-   * key on origin_of, which rejects data:, so a data: sub-resource (e.g. a
-   * background image) would otherwise never produce a body. Mark handled even
-   * on failure. */
+  /* data: URLs decode inline (origin_of rejects them); mark handled even on failure. */
   for (int i = 0; i < n; i++) {
     if (starts_ci(urls[i], "data:")) {
       char ct[64];
@@ -1793,14 +1709,14 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
     }
   }
 
-  /* Serve fresh cache hits up front (single-threaded here, before the pool):
-   * marking a URL `handled` excludes it from every fetch group below. Runs on
-   * this worker thread, so no fetch thread is racing `handled` yet. */
+  /* Serve fresh cache hits first (single-threaded, before the pool) and mark them handled. */
   long now = (long)rtc_epoch();
   for (int i = 0; i < n; i++) {
     unsigned char *cb = 0;
     int cl = 0;
-    if (cache_lookup("GET", urls[i], now, &cb, &cl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
+    char vh[VARY_HDRS_MAX];
+    vary_req_hdrs(urls[i], accept, 0, true, vh);
+    if (cache_lookup("GET", urls[i], vh, now, &cb, &cl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
       bodies[i] = cb;
       lens[i] = cl;
       handled[i] = true;
@@ -1820,11 +1736,8 @@ void css_batch(char *const *urls, int n, unsigned char **bodies, int *lens)
   subres_get_batch(urls, n, "text/css,*/*", bodies, lens);
 }
 
-/* --- parallel inline-image fetching ---------------------------------------
- * A small pool of threads fetches the page's images concurrently. Each thread
- * reads an image into a malloc'd buffer, then commits it into the shared
- * img_pool: a short lock guards only the bump of img_pool_len; the byte copy
- * and the per-image metadata go to disjoint regions, so they need no lock. */
+/* --- parallel inline-image fetching --- */
+/* Pool threads commit into img_pool; a short lock guards img_pool_len, copies go to disjoint regions. */
 #define IMG_FETCHERS 4
 #define IMG_FETCH_STACK (128 * 1024)
 
@@ -1848,20 +1761,13 @@ static int img_claim_next(void)
   return got;
 }
 
-/* Commit a fetched image body into img_pool for image `idx`: an SVG is
- * rasterized to RGBA (its `currentColor` resolving to `current_color`), a PNG
- * stored verbatim. Sets im->ok last so the UI only draws a fully-committed
- * image. Does NOT free `body` (the caller owns it). Shared by the HTTP/1.1
- * fetcher and the h2 multiplexed prefetch. The short img_lock guards only the
- * img_pool_len bump; the copy is to a disjoint region. */
+/* Commit a fetched body into img_pool slot `idx`: SVG rasterized with `currentColor`, PNG stored verbatim. */
+/* Sets im->ok last; does not free `body`. Shared by the h1.1 fetcher and h2 prefetch. */
 static void commit_image(int idx, const unsigned char *body, int blen, unsigned current_color)
 {
   struct inl_img *im = &B->pg->imgs[idx];
 
-  /* SVG / WebP -> decode to RGBA in the shared pool. The shared decoder
-   * produces RGBA bytes; ww/hh are decoder-controlled, so size the copy in
-   * 64-bit and reject absurd dimensions before touching the pool (no 32-bit
-   * wrap past the bound). */
+  /* Decoder-controlled ww/hh: size the copy in 64-bit and reject absurd dimensions (no 32-bit wrap). */
   if (image_sniff(body, blen) != IMG_FMT_PNG) {
     unsigned ww = 0, hh = 0;
     unsigned char *rgba = image_decode_rgba(body, blen, current_color, 256, &ww, &hh);
@@ -1917,24 +1823,20 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
   }
 }
 
-/* Commit image bytes we already hold in memory (e.g. an inline <svg> element
- * serialized back to SVG text by html.c) into image slot `idx` — no network
- * fetch. Reuses the same committer as the HTTP path; `current_color` is what
- * the SVG's `currentColor` resolves to (the element's CSS color). */
+/* Commit in-memory image bytes (e.g. an inline <svg> serialized by html.c) into slot `idx`; no fetch. */
 void resource_commit_inline(int idx, const unsigned char *body, int len, unsigned current_color)
 {
   commit_image(idx, body, len, current_color);
 }
 
-/* Fetch inline image `i` over its own HTTP/1.1 socket and commit it. Safe to
- * run on several threads at once (the h1.1 pool path). */
+/* Fetch inline image `i` over its own HTTP/1.1 socket and commit it; thread-safe. */
 static void fetch_image(int i, const char *page_url)
 {
   B->pg->imgs[i].ok = 0;
   char full[URL_MAX];
   resolve_url(page_url, B->pg->imgs[i].href, full, sizeof full);
   int blen = 0;
-  unsigned char *body = subres_get(full, "image/png,image/webp,image/svg+xml,*/*", &blen);
+  unsigned char *body = subres_get(full, IMG_ACCEPT, &blen);
   if (!body)
     return;
   commit_image(i, body, blen, 0x000000);
@@ -1943,10 +1845,7 @@ static void fetch_image(int i, const char *page_url)
 
 static bool favicon_decode(const unsigned char *r, int n); /* defined below */
 
-/* on_done bridge for the h2 batch: map a batch request index back to its target
- * (idxs[]) and consume that resource as its stream lands. An index of FAV_IDX
- * is the page favicon (decoded into B->pg->favicon); anything else is an image
- * index. */
+/* h2 batch on_done: map request index to its target (FAV_IDX = favicon, else image index). */
 #define FAV_IDX (-1)
 struct h2img_ctx {
   const int *idxs;
@@ -1976,16 +1875,15 @@ static void h2img_commit(void *ctx, int b, const unsigned char *body, int blen)
     commit_image(c->idxs[b], body, blen, 0x000000);
   }
   /* Cache the fetched 200 (the batch surfaced its headers into reqs[b].hdr). */
-  if (c->reqs[b].hdr && c->reqs[b].hdrlen > 0)
-    cache_store("GET", full, 200, c->now, c->reqs[b].hdr, "", body, blen);
+  if (c->reqs[b].hdr && c->reqs[b].hdrlen > 0) {
+    char vh[VARY_HDRS_MAX];
+    vary_req_hdrs(full, IMG_ACCEPT, 0, true, vh);
+    cache_store("GET", full, vh, 200, c->now, c->reqs[b].hdr, "", body, blen);
+  }
 }
 
-/* Multiplex the page's same-origin HTTPS eager images over ONE h2 connection
- * (up to H2_FETCH_MAX). Committed images get ok=1, so the h1.1 pool below skips
- * them; cross-origin / http / h2-unavailable / overflow / per-stream-failed
- * images fall through to the pool. Single-threaded by necessity: the h2
- * engine's HPACK + frame state is process-global, so only one h2 connection may
- * be live. */
+/* Multiplex same-origin HTTPS eager images over ONE h2 connection; the rest fall through to the pool. */
+/* Single-threaded: h2 HPACK/frame state is process-global. */
 static void h2_prefetch(const char *page_url)
 {
   struct purl pu;
@@ -2033,17 +1931,16 @@ static void h2_prefetch(const char *page_url)
     nb++;
   }
 
-  /* Fold the favicon onto the same connection when it's same-origin HTTPS, so
-   * it rides the images' h2 stream batch instead of opening its own.
-   * Cross-origin / http favicons (and a failed stream) are left for
-   * fetch_favicon's h1.1 path, which runs only when favicon_ok is still 0. */
+  /* Fold a same-origin HTTPS favicon into this batch; others use fetch_favicon's h1.1 path. */
   if (nb < H2_FETCH_MAX && !B->pg->favicon_ok) {
     char fav[URL_MAX];
     resolve_url(page_url, B->pg->favicon_href[0] ? B->pg->favicon_href : "/favicon.ico", fav, sizeof fav);
     /* A fresh cached favicon skips the batch entirely. */
     unsigned char *fb = 0;
     int fl = 0;
-    if (cache_lookup("GET", fav, now, &fb, &fl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
+    char vh[VARY_HDRS_MAX];
+    vary_req_hdrs(fav, IMG_ACCEPT, 0, true, vh);
+    if (cache_lookup("GET", fav, vh, now, &fb, &fl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
       if (favicon_decode(fb, fl)) {
         B->pg->favicon_ok = 1;
         B->seq++;
@@ -2103,18 +2000,15 @@ static void h2_prefetch(const char *page_url)
     sapp(xh, &xn, sizeof xh, ck);
     sapp(xh, &xn, sizeof xh, "\r\n");
   }
-  sapp(xh, &xn, sizeof xh, "accept: image/png,image/webp,image/svg+xml,*/*\r\n");
+  sapp(xh, &xn, sizeof xh, "accept: " IMG_ACCEPT "\r\n");
   {
     char ch[512];
-    if (ch_request_headers(pu.host, ch, sizeof ch) > 0)
+    if (ch_headers_for(&pu, true, ch, sizeof ch) > 0)
       sapp(xh, &xn, sizeof xh, ch);
   }
   struct h2_opts opts = {browser_ua(), xh, 0};
 
-  /* Commit each image the moment its stream finishes (h2_fetch_many's on_done),
-   * so they pop in progressively rather than all at once after the batch. Each
-   * commit sets ok=1 + bumps B->seq, so the UI re-lays-out as they land; a
-   * failed/empty stream leaves ok=0 and the h1.1 pool retries it. */
+  /* Commit each image as its stream finishes; a failed stream leaves ok=0 for the h1.1 pool. */
   struct h2img_ctx hc = {idxs, reqs, now};
   h2_fetch_many(conn, 1, auth, &opts, reqs, nb, h2img_commit, &hc);
   nc_close(conn);
@@ -2122,8 +2016,7 @@ static void h2_prefetch(const char *page_url)
   free(hdrs);
 }
 
-/* The fetch loop each pool thread (and the worker itself) runs: claim images
- * until none remain. */
+/* Per-thread loop: claim and fetch images until none remain. */
 static void img_fetch_loop(void)
 {
   int i;
@@ -2137,11 +2030,8 @@ static void img_fetcher_thread(void)
   exit(0); /* a thread fn must not return */
 }
 
-/* Fetch the page's *eager* inline images (loading != "lazy"): first multiplex
- * the same-origin HTTPS ones over a single h2 connection (h2_prefetch), then
- * fetch whatever is left over the HTTP/1.1 thread pool — spawn a few helper
- * threads, fetch alongside them on this (worker) thread, then join.
- * loading="lazy" images wait for fetch_lazy_visible() when scrolled in. */
+/* Fetch eager images (loading != "lazy"): h2 prefetch for same-origin HTTPS, then an h1.1 thread pool. */
+/* Lazy images wait for fetch_lazy_visible(). */
 void fetch_inline_images(const char *page_url)
 {
   int pending = 0;
@@ -2156,9 +2046,7 @@ void fetch_inline_images(const char *page_url)
   }
   g_img_next = 0;
 
-  /* Serve fresh cached eager images up front (single-threaded, before the
-   * pool): commit_image sets im->ok, so both h2_prefetch and the h1.1 pool skip
-   * them. */
+  /* Serve fresh cached images first (single-threaded); commit_image sets ok so fetchers skip them. */
   {
     long now = (long)rtc_epoch();
     for (int i = 0; i < B->pg->n_imgs; i++) {
@@ -2169,7 +2057,9 @@ void fetch_inline_images(const char *page_url)
       resolve_url(page_url, im->href, full, sizeof full);
       unsigned char *cb = 0;
       int cl = 0;
-      if (cache_lookup("GET", full, now, &cb, &cl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
+      char vh[VARY_HDRS_MAX];
+      vary_req_hdrs(full, IMG_ACCEPT, 0, true, vh);
+      if (cache_lookup("GET", full, vh, now, &cb, &cl, 0, 0, 0, 0, 0, 0) == CACHE_FRESH) {
         commit_image(i, cb, cl, 0x000000);
         free(cb);
         struct net_log e = {"GET", full, 200, "image/*", cl, 0, 0};
@@ -2178,8 +2068,7 @@ void fetch_inline_images(const char *page_url)
     }
   }
 
-  /* First multiplex the same-origin HTTPS images over one h2 connection; the
-   * rest (cross-origin, http, or h2-unavailable) go through the h1.1 pool. */
+  /* h2 for same-origin HTTPS images; the rest go through the h1.1 pool. */
   h2_prefetch(page_url);
 
   int tids[IMG_FETCHERS - 1];
@@ -2220,11 +2109,7 @@ void fetch_inline_images(const char *page_url)
   }
 }
 
-/* Worker step (called when no page fetch is pending): load at most one lazy
- * <img> the UI has flagged as scrolled into view, against the current page URL.
- * Returns 1 if it fetched one (so the caller can loop), 0 if there was nothing
- * to do — which keeps the worker mostly idle until the user actually scrolls.
- */
+/* Worker step: load one lazy <img> flagged as scrolled into view; returns 1 if fetched, else 0. */
 int fetch_lazy_visible(void)
 {
   if (!B->pg->cur_url[0])
@@ -2243,17 +2128,10 @@ int fetch_lazy_visible(void)
   return 0;
 }
 
-/* ------------------------------------------------------------ favicon decode
- */
-/* A favicon is fetched into B->pg->raw and decoded down to a fixed 16x16 ARGB
- * bitmap (B->pg->favicon) for the tab strip. PNG favicons go through upng; .ico
- * files are parsed here (best directory entry -> embedded PNG or a raw DIB).
- * Anything we can't decode (GIF/BMP/SVG/empty) just leaves favicon_ok 0 and the
- * tab shows the default globe. */
+/* --- favicon decode --- */
+/* Favicon -> 16x16 ARGB (B->pg->favicon): PNG via upng, .ico parsed here; else the default globe. */
 
-/* Nearest-neighbour scale of a decoded RGBA image into the 16x16 favicon. The
- * row callback fills every destination row whose source maps to the row `y`
- * upng just produced, so it works whatever the source dimensions are. */
+/* Nearest-neighbour scale of a decoded RGBA image into the 16x16 favicon, per upng row callback. */
 struct favscale {
   unsigned iw, ih, next_r;
   unsigned *dst;
@@ -2293,11 +2171,8 @@ static unsigned le32(const unsigned char *p)
   return p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
 }
 
-/* Decode one ICO image stored as a Windows DIB (BITMAPINFOHEADER + pixels, no
- * BMP file header). Bottom-up rows; biHeight counts the XOR colour rows plus an
- * equal AND (1bpp transparency) mask, so the real height is half. Supports
- * 1/4/8/24/32 bpp, BI_RGB. Sampled directly at 16x16 to avoid a full-size
- * intermediate buffer. */
+/* Decode an ICO DIB image (no BMP file header): bottom-up, biHeight covers XOR rows plus AND mask. */
+/* Supports 1/4/8/24/32 bpp BI_RGB, sampled directly at 16x16. */
 static bool fav_decode_dib(const unsigned char *p, int len)
 {
   if (len < 40)
@@ -2337,8 +2212,7 @@ static bool fav_decode_dib(const unsigned char *p, int len)
   const unsigned char *and_ = xor_ + xor_sz;
   bool and_present = mask && ((and_ - p) + (long)astride * H <= len);
 
-  /* Trust a 32bpp alpha channel only if at least one pixel is non-zero;
-   * many icons leave it all-zero and rely on the AND mask instead. */
+  /* Trust 32bpp alpha only if some pixel is non-zero; else use the AND mask. */
   bool has_alpha = false;
   if (bpp == 32)
     for (long i = 3; i < xor_sz && !has_alpha; i += 4)
@@ -2392,9 +2266,7 @@ static bool fav_decode_dib(const unsigned char *p, int len)
   return true;
 }
 
-/* Pick the best image in an .ico directory: the smallest entry that is still
- * >= 16px (an exact 16 wins), else the largest available. Fills poff/plen with
- * its byte range within the file. */
+/* Pick the smallest ico entry >= 16px (exact 16 wins), else the largest; fills poff/plen. */
 static bool ico_pick(const unsigned char *p, int len, int *poff, int *plen)
 {
   if (len < 6 || le16(p) != 0 || le16(p + 2) != 1)
@@ -2420,8 +2292,7 @@ static bool ico_pick(const unsigned char *p, int len, int *poff, int *plen)
   return best >= 0;
 }
 
-/* Decode `buf` (a fetched favicon) into B->pg->favicon; returns 1 on success.
- */
+/* Decode a fetched favicon into B->pg->favicon; returns 1 on success. */
 static bool favicon_decode(const unsigned char *r, int n)
 {
   if (n < 4)
@@ -2442,11 +2313,7 @@ static bool favicon_decode(const unsigned char *r, int n)
   return false; /* GIF/BMP favicons unsupported */
 }
 
-/* Fetch and decode the page favicon into B->pg->favicon, from the <link
- * rel=icon> href the parser found, else /favicon.ico. subres_get follows CDN
- * redirects and uses its own socket/buffer, so this no longer clobbers
- * B->pg->raw. Leaves favicon_ok 0 on any failure (the tab falls back to the
- * globe). */
+/* Fetch and decode the favicon (<link rel=icon> href, else /favicon.ico); leaves favicon_ok 0 on failure. */
 void fetch_favicon(const char *page_url)
 {
   if (B->pg->favicon_ok)

@@ -1,11 +1,11 @@
-/* httpcache.h — libcurl: the HTTP caching *policy*, RFC 7234 (no storage, no
+/* httpcache.h - libcurl: the HTTP caching *policy*, RFC 7234 (no storage, no
  * I/O).
  *
  * This is the pure decision core an HTTP cache is built on: parse a response's
  * cache-relevant headers into a struct, decide whether the response may be
  * stored at all, and compute its freshness lifetime and current age so a cache
  * can tell fresh from stale. Where the bytes actually live, how they are keyed,
- * eviction — all of that is the caller's (see the browser's cache.c). Keeping
+ * eviction - all of that is the caller's (see the browser's cache.c). Keeping
  * the fiddly, spec-driven arithmetic here means it is tested once, host-side,
  * instead of re-derived in every cache.
  *
@@ -17,6 +17,7 @@
 #define OWOS_LIBHTTPCACHE_H
 
 #include "headers.h"
+#include <stdbool.h>
 
 /* Parse an HTTP-date to Unix epoch seconds (UTC), or 0 if unparseable. Accepts
  * "Sun, 06 Nov 1994 08:49:37 GMT", "Sunday, 06-Nov-94 08:49:37 GMT", and
@@ -27,10 +28,10 @@ long http_date_parse(const char *s);
  * string pointers (etag / last_mod_str) point into the parsed `struct
  * http_headers` and are valid only as long as it is. */
 struct http_cc {
-  int no_store;             /* Cache-Control: no-store — must not be stored      */
-  int no_cache;             /* no-cache — may store but revalidate before EVERY use */
-  int must_revalidate;      /* must-revalidate — once stale, never serve stale   */
-  int is_private;           /* private — a *shared* cache mustn't store; a single-
+  int no_store;             /* Cache-Control: no-store - must not be stored      */
+  int no_cache;             /* no-cache - may store but revalidate before EVERY use */
+  int must_revalidate;      /* must-revalidate - once stale, never serve stale   */
+  int is_private;           /* private - a *shared* cache mustn't store; a single-
                              * user cache (ours) still may                        */
   int has_max_age;          /* a max-age directive was present                   */
   long max_age;             /* its value in seconds                              */
@@ -47,7 +48,7 @@ struct http_cc {
 void http_cc_parse(const struct http_headers *H, struct http_cc *cc);
 
 /* May a `status` response with these directives be stored at all? True only for
- * a 200 that is not no-store. (Freshness/validator worth is a separate check —
+ * a 200 that is not no-store. (Freshness/validator worth is a separate check -
  * see http_cc_freshness; a caller declines to store a 200 that is neither fresh
  * nor validatable.) */
 int http_cc_storable(const struct http_cc *cc, int status);
@@ -62,5 +63,28 @@ long http_cc_freshness(const struct http_cc *cc, long now);
  * from the Age/Date headers plus how long it has resided in the cache.
  * `stored_at` is when the response was received (epoch seconds). */
 long http_cc_current_age(const struct http_cc *cc, long stored_at, long now);
+
+/* The response's Vary field names (RFC 9110 12.5.5), merged across all Vary lines. */
+struct http_vary {
+  char **names; /* lowercased, unique, sorted */
+  int n;
+  bool star; /* Vary: * (never matches a request) */
+};
+
+/* Fill *v from H; 0, or -1 on OOM (free *v and treat as unusable). */
+int http_vary_parse(struct http_vary *v, const struct http_headers *H);
+
+void http_vary_free(struct http_vary *v);
+
+/* Do both responses name the same fields? */
+bool http_vary_same(const struct http_vary *a, const struct http_vary *b);
+
+/* Secondary key (RFC 9111 4.1): the normalized values of v's fields in the request header block `req_hdrs`
+ * ("Name: value\r\n" lines, no status line). An absent field differs from an empty one. malloc'd, or NULL on OOM or
+ * Vary: *. A response without Vary yields "". */
+char *http_vary_key(const struct http_vary *v, const char *req_hdrs);
+
+/* Do two secondary keys select the same variant? NULL never matches. */
+bool http_vary_key_match(const char *a, const char *b);
 
 #endif /* OWOS_LIBHTTPCACHE_H */

@@ -27,6 +27,9 @@ for source in "$ROOT"/tests/*_test.c; do
 	if [ "$name" = permissions ]; then
 		extra=(-DPERM_DB='"'"$BUILD/permissions.db"'"')
 	fi
+	if [ "$name" = vary ]; then
+		extra=(-DCACHE_DIR='"'"$BUILD/vary-cache"'"')
+	fi
 	"$CC" -std=gnu11 "${INCLUDES[@]}" -Dmain=owos_main_${name} \
 		-DOWOS_TEST_NAME=${name} -include "$ROOT/tests/test.h" \
 		"${extra[@]}" -c "$source" -o "$BUILD/${name}.o" || exit 1
@@ -35,6 +38,13 @@ done
 "$CC" -std=gnu11 "${INCLUDES[@]}" -DPERM_DB='"'"$BUILD/permissions.db"'"' \
 	-c "$ROOT/user/apps/browser/features/permissions/permissions.c" -o "$BUILD/permissions_impl.o" || exit 1
 
+
+"$CC" -std=gnu11 "${INCLUDES[@]}" -DCACHE_DIR='"'"$BUILD/vary-cache"'"' \
+	-Dmkdir=vary_mkdir -Dunlink=vary_unlink -Dreaddir=vary_readdir -include "$ROOT/tests/vary_fs.h" \
+	-c "$ROOT/user/apps/browser/features/cache/cache.c" -o "$BUILD/cache_impl.o" || exit 1
+
+"$CC" -std=gnu11 -I"$ROOT/tests" -DCACHE_DIR='"'"$BUILD/vary-cache"'"' \
+	-c "$ROOT/tests/vary_fs.c" -o "$BUILD/vary_fs.o" || exit 1
 
 "$CC" -std=gnu11 "${INCLUDES[@]}" -c "$ROOT/tests/browser_js_host.c" \
 	-o "$BUILD/browser_js_host.o" || exit 1

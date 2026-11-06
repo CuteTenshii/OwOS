@@ -4,9 +4,7 @@ struct tab tabs[MAX_TABS];
 int n_tabs = 1;
 int active_tab = 0;
 
-/* Free every heap buffer a page owns and zero it (so a reused slot starts
- * clean). Each tab owns its page, so this runs when a tab closes or a slot is
- * recycled. */
+/* Free every heap buffer a page owns and zero it (so a reused slot starts clean) */
 static void page_free(struct page *p)
 {
   free(p->raw);
@@ -32,12 +30,11 @@ static void page_free(struct page *p)
   free(p->faces);
   if (p->csp)
     csp_free(p->csp);
+  free(p->perm_policy_hdr);
   memset(p, 0, sizeof *p);
 }
 
-/* The shared 16 MiB image scratch holds only the ACTIVE tab's images.
- * Save/restore a tab's bytes around a switch so a backgrounded tab keeps its
- * images (compactly, sized to what it used) without refetching. */
+/* The shared 16 MiB image scratch holds only the ACTIVE tab's images */
 static void page_save_images(struct page *p)
 {
   int n = B->img_pool_len;
@@ -63,9 +60,7 @@ static void page_restore_images(struct page *p)
   }
 }
 
-/* Set while a fetch was started by Back/Next so its completion doesn't push a
- * new history entry (we're moving within the existing list, not extending it).
- */
+/* Set while a fetch was started by Back/Next so its completion doesn't push a new history entry */
 bool nav_from_history;
 
 /* Free a tab's whole history (on close). */
@@ -79,9 +74,7 @@ static void hist_clear(struct tab *t)
   t->hist_i = 0;
 }
 
-/* Record `url` as the tab's current page. A reload of the same page is ignored;
- * any forward entries are dropped; the oldest is evicted when the list is full.
- */
+/* Record `url` as the tab's current page */
 void hist_push(struct tab *t, const char *url)
 {
   if (!url || !url[0])
@@ -114,10 +107,7 @@ void hist_push(struct tab *t, const char *url)
 bool hist_can_back(const struct tab *t) { return t->hist_i > 0; }
 bool hist_can_fwd(const struct tab *t) { return t->hist_i < t->hist_n - 1; }
 
-/* Stop any in-flight load and wait for the worker to go idle, so it's safe for
- * the main thread to repoint B->pg at another tab (the worker only ever writes
- * the active tab's page). Bounded: a load aborts as soon as its next read
- * bails. */
+/* Stop any in-flight load and wait for the worker to go idle, so it's safe for the main thread */
 static void load_quiesce(void)
 {
   B->req_pending = 0;
@@ -127,12 +117,7 @@ static void load_quiesce(void)
   B->abort_load = 0;
 }
 
-/* Park the worker at the top of its loop so the main thread can mutate the page
- * set (B->pg, active_tab, tabs[]) with the worker guaranteed not to be reading
- * it. Call after load_quiesce(): that stops any in-flight fetch/script pass, so
- * the worker reaches the park point promptly; this then also fences the
- * timer/event/ media pump, the live window load_quiesce leaves open. Pair with
- * worker_unpark(). */
+/* Park the worker at the top of its loop so the main thread can mutate the page set */
 static void worker_park(void)
 {
   B->worker_pause = 1;
@@ -141,11 +126,7 @@ static void worker_park(void)
 }
 static void worker_unpark(void) { B->worker_pause = 0; }
 
-/* Leaving the active tab: its page (buffers, colours, everything) stays put in
- * tabs[i].page — only the shared image scratch and the live DOM are tied to
- * "the active tab", so save the images and drop the DOM (the page becomes
- * static until revealed again). No buffer copy: the swap of B->pg in reveal_tab
- * does the rest. */
+/* Leaving the active tab */
 static void tab_leave(int i)
 {
   struct tab *t = &tabs[i];
@@ -167,10 +148,7 @@ void pane_metrics(int *py, int *phh, int *rows)
   *rows = (*phh > 0) ? *phh / LINE_H : 1;
 }
 
-/* Apply a target scroll line, clamped to the page, repainting only when it
- * actually moves — so wheeling or arrowing at an end is a no-op instead of a
- * full content redraw. Callers wanting a tighter bottom stop (e.g. Page Down)
- * pass an already-tighter target; this only re-clamps for safety. */
+/* Apply a target scroll line, clamped to the page, repainting only when it actually moves */
 void scroll_set(int target)
 {
   int max = scroll_max();
@@ -226,17 +204,14 @@ void submit(void)
   B->seq++;
 }
 
-/* Reload the current page (reload button, Page>Reload, F5, Ctrl+R). No-op on a
- * blank tab, matching Page>Reload. */
+/* Reload the current page (reload button, Page>Reload, F5, Ctrl+R) */
 void do_reload(void)
 {
   if (B->pg->cur_url[0])
     navigate(B->pg->cur_url);
 }
 
-/* Stop the in-flight load: drop the queued request and signal the worker to
- * bail out of the fetch it is running (polled by the body readers in fetch.c).
- */
+/* Stop the in-flight load */
 void do_stop(void)
 {
   B->req_pending = 0;
@@ -244,9 +219,7 @@ void do_stop(void)
   B->seq++;
 }
 
-/* Navigate to the active tab's previous/next history entry. The hist index
- * moves here; nav_from_history keeps the load's completion from pushing a new
- * entry. */
+/* Navigate to the active tab's previous/next history entry */
 void go_back(void)
 {
   struct tab *t = &tabs[active_tab];
@@ -288,9 +261,7 @@ static void show_blank(void)
   B->seq++;
 }
 
-/* Pull the freshly-loaded page's url + a label into the active tab (called when
- * a fetch finishes — only the active tab ever loads). The favicon already lives
- * in the page, so the tab strip reads it from tabs[i].page directly. */
+/* Pull the freshly-loaded page's url + a label into the active tab */
 void tab_sync_active(void)
 {
   struct tab *t = &tabs[active_tab];
@@ -306,13 +277,10 @@ void tab_sync_active(void)
   }
 }
 
-/* Reveal tab `i`: point B at its page (instant, no copy), bring its images back
- * into the shared scratch, and repaint. The page is static (its live DOM was
- * dropped when it was last left); a tab interrupted mid-load (no rendered text)
- * is re-fetched. */
+/* Reveal tab `i` */
 static void reveal_tab(int i)
 {
-  B->pg = &tabs[i].page;           /* the swap — buffers already live here */
+  B->pg = &tabs[i].page;           /* the swap , buffers already live here */
   devtools_view_load(&tabs[i].dt); /* this tab's devtools view; drops old capture */
   page_restore_images(&tabs[i].page);
   B->events_live = 0; /* revealed page has no live DOM        */
@@ -322,15 +290,12 @@ static void reveal_tab(int i)
   textfield_set(&B->addr_tf, tabs[i].url[0] ? tabs[i].url : tabs[i].page.cur_url);
   update_title(B->win_id);
   B->seq++;
-  /* A crashed tab keeps its sad page (its empty text isn't "interrupted
-   * mid-load"), so don't auto-refetch it — the user reloads it explicitly. */
+  /* A crashed tab keeps its sad page (its empty text isn't "interrupted mid-load"), so don't */
   if (!tabs[i].crashed && tabs[i].page.text_len == 0 && tabs[i].url[0])
     navigate(tabs[i].url);
 }
 
-/* Make tab `i` the active one. Switching is a pointer swap: the page we leave
- * stays put in its tab (DOM dropped, images saved); the one we enter is
- * revealed from its own buffers with no network. */
+/* Make tab `i` the active one */
 void select_tab(int i)
 {
   if (i < 0 || i >= n_tabs || i == active_tab)
@@ -379,10 +344,7 @@ void close_tab(int i)
   int was_active = (i == active_tab);
   if (was_active)
     load_quiesce(); /* only the active tab loads: stop its fetch first */
-  /* Fence the worker: the shift below moves every tab's page struct (and
-   * B->pg), which the worker reads each iteration — even a background close
-   * relocates the active page's slot. Park regardless of which tab is being
-   * closed. */
+  /* Fence the worker */
   worker_park();
   if (was_active)
     devtools_reset_live();             /* its live devtools capture isn't in .cap */
