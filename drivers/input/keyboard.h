@@ -30,6 +30,28 @@
         * latch-delivered because the IRQ can't capture the framebuffer.                                               \
         * 0x80, not a control code, because every value < 0x20 is taken. */
 
+/* Special keys (media, system, launcher): driver-emitted, WM-consumed unless the compositor forwards them. */
+#define KEY_MEDIA_PLAY 0x81 /* play/pause  */
+#define KEY_MEDIA_STOP 0x82
+#define KEY_MEDIA_NEXT 0x83
+#define KEY_MEDIA_PREV 0x84
+#define KEY_VOL_UP 0x85
+#define KEY_VOL_DOWN 0x86
+#define KEY_MUTE 0x87
+#define KEY_BRIGHT_UP 0x88
+#define KEY_BRIGHT_DOWN 0x89
+#define KEY_LAUNCH_CALC 0x8A
+#define KEY_LAUNCH_BROWSER 0x8B /* WWW home    */
+#define KEY_LAUNCH_FILES 0x8C   /* My Computer */
+#define KEY_LAUNCH_MAIL 0x8D
+#define KEY_SEARCH 0x8E
+#define KEY_POWER 0x8F
+#define KEY_SLEEP 0x90
+#define KEY_WWW_BACK 0x91
+#define KEY_WWW_FORWARD 0x92
+#define KEY_WWW_REFRESH 0x93
+#define KEY_MIC_MUTE 0x94
+
 /* This header defines only the bytes the driver actually emits. Chords are NOT
  * given per-chord codes: the driver delivers the base key + its KMOD_* set (see
  * cur_mods in keyboard.c), and the consumer decides what the chord means. So
