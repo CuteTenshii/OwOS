@@ -1,6 +1,6 @@
 /* sshd.c — the SSH-2 server, entirely in user space.
  *
- * The server analogue of user/apps/cli/ssh.c: curve25519-sha256 KEX +
+ * The server analogue of user/apps/ssh/ssh.c: curve25519-sha256 KEX +
  * aes128-gcm@openssh.com over a raw TCP listener (net_listen/net_accept), the
  * exchange hash signed with an ssh-ed25519 host key. Password auth against
  * /etc/passwd (name:sha256(pw):uid:gid:home). On success it spawns /bin/term as

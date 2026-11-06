@@ -4,9 +4,9 @@
  * optional /line-height, family stack, system-font keywords) plus font-variant /
  * font-variant-caps small-caps, all through css_apply_inline.
  *
- *   cc -std=c11 -Iscripts -Iuser/apps/gui/browser \
- *      tests/css_font_test.c user/apps/gui/browser/css/engine.c user/apps/gui/browser/css/sibling.c \
- *      user/apps/gui/browser/color.c user/apps/gui/browser/dom.c \
+ *   cc -std=c11 -Iscripts -Iuser/apps/browser \
+ *      tests/css_font_test.c user/apps/browser/css/engine.c user/apps/browser/css/sibling.c \
+ *      user/apps/browser/color.c user/apps/browser/dom.c \
  *      -lm -o /tmp/css_font_test && /tmp/css_font_test
  */
 #include <stdio.h>

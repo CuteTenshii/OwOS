@@ -9,7 +9,7 @@ boot and low-level CPU code.
 - `kernel/` contains kernel subsystems, including memory, processes, filesystems,
   networking, graphics, and system calls.
 - `drivers/` contains hardware drivers grouped by device area.
-- `user/lib/` contains user-space libraries, and `user/apps/` contains programs
+- `user/lib/` contains user-space libraries, and `user/apps/<name>/` contains one directory per program,
   embedded into the kernel image.
 - `scripts/` contains host-side unit tests and the scripted QEMU test harness.
 - `fonts/`, `hostinc/`, `tools/`, linker scripts, and `*.img` files provide assets.

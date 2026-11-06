@@ -10,7 +10,7 @@
  * (the app keeps running). An app builds those itself as a transient child
  * window — win_create() + win_set_parent(id, parent, 0) for a non-blocking
  * child, then win_fb_of(id) for its pixel buffer — and draws + pumps it from
- * its own loop. See user/apps/gui/files.c (the Properties window) for the
+ * its own loop. See user/apps/files/files.c (the Properties window) for the
  * pattern.
  */
 #ifndef OWOS_DIALOG_H

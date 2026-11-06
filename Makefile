@@ -12,7 +12,7 @@
 # Include order matters: later fragments use variables the earlier ones define.
 #   toolchain.mk            compiler/linker flags + generic kernel compile rules
 #   user/lib/build.mk       libc + the per-library objects (UCFLAGS)
-#   user/apps/build.mk      user/apps/{gui,cli} programs + their kernel blobs
+#   user/apps/build.mk      user/apps/<name>/ programs + their kernel blobs
 #   kernel/build.mk         the kernel object list + the owos.bin link
 #   run.mk                  disk images + the QEMU run/debug/iso/usb targets
 
@@ -60,8 +60,7 @@ install-hooks:
 clean:
 	rm -f $(OBJS) owos.bin owos-x86_64.bin $(ISO) .arch.*
 	rm -f user/lib/*.o user/lib/*/*.o
-	rm -f user/apps/cli/*.o user/apps/cli/*.elf
-	rm -f user/apps/gui/*.o user/apps/gui/*.elf user/apps/gui/browser/*.o user/apps/gui/compositor/*.o user/apps/gui/compositor/*.elf
+	find user/apps \( -name '*.o' -o -name '*.elf' \) -delete
 	find user -name '*.d' -delete
 	rm -rf $(ISODIR)
 

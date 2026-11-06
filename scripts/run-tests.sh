@@ -12,8 +12,8 @@ INCLUDES=(
 	-I"$ROOT/user/lib/crypto" -I"$ROOT/user/lib/resolve"
 	-I"$ROOT/user/lib/zlib" -I"$ROOT/user/lib/stun" -I"$ROOT/user/lib/mp4"
 	-I"$ROOT/user/lib/sqlite" -I"$ROOT/user/lib/gfx" -I"$ROOT/user/lib/png"
-	-I"$ROOT/user/lib/netconn" -I"$ROOT/user/lib/notify" -I"$ROOT/user/apps/gui/browser"
-	-I"$ROOT/user/apps/gui/browser/js"
+	-I"$ROOT/user/lib/netconn" -I"$ROOT/user/lib/notify" -I"$ROOT/user/apps/browser"
+	-I"$ROOT/user/apps/browser/js"
 )
 
 for source in "$ROOT"/tests/*_test.c; do
@@ -33,7 +33,7 @@ for source in "$ROOT"/tests/*_test.c; do
 done
 
 "$CC" -std=gnu11 "${INCLUDES[@]}" -DPERM_DB='"'"$BUILD/permissions.db"'"' \
-	-c "$ROOT/user/apps/gui/browser/permissions.c" -o "$BUILD/permissions_impl.o" || exit 1
+	-c "$ROOT/user/apps/browser/permissions.c" -o "$BUILD/permissions_impl.o" || exit 1
 
 
 "$CC" -std=gnu11 "${INCLUDES[@]}" -c "$ROOT/tests/browser_js_host.c" \
@@ -43,11 +43,11 @@ done
 	-o "$BUILD/test_runner.o" || exit 1
 
 "$CC" "${INCLUDES[@]}" "$BUILD"/*.o \
-	"$ROOT/user/apps/gui/browser/css/engine.c" "$ROOT/user/apps/gui/browser/css/sibling.c" "$ROOT/user/apps/gui/browser/color.c" \
-	"$ROOT/user/apps/gui/browser/dom.c" "$ROOT/user/apps/gui/browser/csp.c" \
-	"$ROOT/user/apps/gui/browser/js/classlist.c" \
-	"$ROOT/user/apps/gui/browser/js/webapi.c" \
-	"$ROOT/user/apps/gui/browser/js/notification.c" \
+	"$ROOT/user/apps/browser/css/engine.c" "$ROOT/user/apps/browser/css/sibling.c" "$ROOT/user/apps/browser/color.c" \
+	"$ROOT/user/apps/browser/dom.c" "$ROOT/user/apps/browser/csp.c" \
+	"$ROOT/user/apps/browser/js/classlist.c" \
+	"$ROOT/user/apps/browser/js/webapi.c" \
+	"$ROOT/user/apps/browser/js/notification.c" \
 	"$ROOT/user/lib/curl/url.c" "$ROOT/user/lib/curl/httpcache.c" \
 	"$ROOT/user/lib/curl/headers.c" "$ROOT/user/lib/crypto/crypto.c" \
 	"$ROOT/user/lib/base64/base64.c" "$ROOT/user/lib/zlib/crc32.c" \

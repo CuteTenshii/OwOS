@@ -197,7 +197,9 @@ static void crash_dump_serial(const struct crash_info *c)
   serial_write(" esp=");
   serial_write(hex8(c->esp, hx));
   serial_write("\n");
-  serial_write("trace (addr2line -e user/apps/gui/");
+  serial_write("trace (addr2line -e user/apps/");
+  serial_write(c->name[0] ? c->name : "app");
+  serial_write("/");
   serial_write(c->name[0] ? c->name : "app");
   serial_write(".elf):\n");
   for (int i = 0; i < c->ntrace; i++) {

@@ -1,171 +1,67 @@
-# user/apps/build.mk — the user programs under user/apps/{gui,cli}/, and embedding each as
-# a kernel blob.
+# user/apps/build.mk: the user programs, one directory each (user/apps/<name>/),
+# embedded into the kernel as blobs.
 #
-# GUI (windowed) apps link gfx + the font lib ($(GUILIB)); CLI apps link only the
-# base ULIB. Each program ELF is wrapped into an object whose symbol is normalised
-# to _binary_app_<name>_{start,end} so the kernel installer doesn't care which
-# apps/ subdir a program lives in.
+# Every app links the base ULIB; GUI (windowed) apps also link gfx + the font lib
+# ($(GUILIB)). Per-app extras go in APP_LIBS_<name>; an app with several sources
+# lists them in APP_OBJS_<name> (default: user/apps/<name>/<name>.o). Each ELF is
+# wrapped into kernel/<name>_blob.o with the symbol normalised to
+# _binary_app_<name>_{start,end}.
 
-# Generic links. CLI = base only; GUI = base + gfx + font.
-user/apps/cli/%.elf: user/apps/cli/%.o $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ $< $(ULIB) $(LIBGCC)
-user/apps/gui/%.elf: user/apps/gui/%.o $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ $< $(GUILIB) $(ULIB) $(LIBGCC)
+GUI_APPS := about browser calc cliphist clock compositor editor files imgview notifyd player settings term
+CLI_APPS := aac alac base64 cast clipd curl dhcpcd dig edit h264 init json lspci mdnsd mpeg neofetch notifysend ntpd ping smbd ssh sshd stun torrent uname vmclipd webp
+APPS := $(GUI_APPS) $(CLI_APPS)
 
-# --- GUI apps that pull in extra libs ---------------------------------------
-# the terminal is a self-contained shell: zip/gzip file codecs + crypto (su/login).
-user/apps/gui/term.elf: user/apps/gui/term.o $(TERMLIB) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/term.o $(TERMLIB) $(GUILIB) $(ULIB) $(LIBGCC)
+# --- per-app libraries ---------------------------------------------------
+# compositor: clipboard paste, plus Print Screen capture (PNG encode + CRC-32).
+# browser: a multi-file program, linked flat.
+APP_OBJS_compositor := user/apps/compositor/compositor.o user/apps/compositor/compositor_damage.o
+APP_OBJS_browser := user/apps/browser/main.o user/apps/browser/sync.o user/apps/browser/buffers.o user/apps/browser/surface.o user/apps/browser/fetch.o user/apps/browser/resource.o user/apps/browser/html.o user/apps/browser/dom.o user/apps/browser/css/engine.o user/apps/browser/css/sibling.o user/apps/browser/color.o user/apps/browser/layout.o user/apps/browser/anim.o user/apps/browser/svg.o user/apps/browser/jar.o user/apps/browser/cache.o user/apps/browser/js/bindings.o user/apps/browser/js/dom_query.o user/apps/browser/js/indexeddb.o user/apps/browser/js/serviceworker.o user/apps/browser/js/webapi.o user/apps/browser/js/notification.o user/apps/browser/js/media.o user/apps/browser/js/classlist.o user/apps/browser/devtools.o user/apps/browser/csp.o user/apps/browser/cors.o user/apps/browser/imgdec.o user/apps/browser/media.o user/apps/browser/bookmarks.o user/apps/browser/clienthints.o user/apps/browser/permissions.o
+APP_LIBS_aac := $(AAC) $(MP4) $(MATH)
+APP_LIBS_alac := $(ALAC)
+APP_LIBS_base64 := $(BASE64)
+APP_LIBS_browser := $(UPNG) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(HTTPCACHE) $(NETCONN) $(TLS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(VIDEO) $(CAST) $(PROTOBUF) $(JSON) $(BASE64) $(CLIPBOARD) $(RESOLVE) $(NOTIFY) $(DIALOG)
+APP_LIBS_calc := $(MATH)
+APP_LIBS_cast := $(CAST) $(PROTOBUF) $(JSON) $(MATH) $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE)
+APP_LIBS_clipd := $(CLIPBOARD) $(MIME)
+APP_LIBS_cliphist := $(CLIPBOARD) $(MIME)
+APP_LIBS_compositor := $(CLIPBOARD) $(PNGENC) $(CRC32)
+APP_LIBS_curl := $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(NETCONN) $(TLS) $(CRYPTO) $(BROTLI) $(RESOLVE)
+APP_LIBS_dig := $(RESOLVE)
+APP_LIBS_editor := $(CLIPBOARD) $(MIME) $(DIALOG)
+APP_LIBS_files := $(DIALOG)
+APP_LIBS_h264 := $(H264) $(MP4)
+APP_LIBS_imgview := $(UPNG) $(WEBP) $(INFLATE)
+APP_LIBS_json := $(JSON) $(MATH)
+APP_LIBS_mpeg := $(MPEG)
+APP_LIBS_notifyd := $(UPNG) $(INFLATE)
+APP_LIBS_notifysend := $(NOTIFY)
+APP_LIBS_ntpd := $(RESOLVE)
+APP_LIBS_ping := $(RESOLVE)
+APP_LIBS_player := $(MEDIA) $(VIDEO) $(MATH)
+APP_LIBS_ssh := $(CRYPTO) $(RESOLVE)
+APP_LIBS_sshd := $(CRYPTO)
+APP_LIBS_stun := $(STUN) $(CRC32) $(CRYPTO) $(RESOLVE)
+APP_LIBS_term := $(TERMLIB)
+APP_LIBS_torrent := $(TORLIB) $(CRYPTO)
+APP_LIBS_vmclipd := $(CLIPBOARD)
+APP_LIBS_webp := $(WEBP) $(UPNG) $(INFLATE)
 
-# the editor + cliphist use the clipboard (Cut/Copy/Paste) + the MIME text check;
-# the editor also uses the dialog lib (unsaved-changes confirm).
-user/apps/gui/editor.elf: user/apps/gui/editor.o $(CLIPBOARD) $(MIME) $(DIALOG) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/editor.o $(CLIPBOARD) $(MIME) $(DIALOG) $(GUILIB) $(ULIB) $(LIBGCC)
-user/apps/gui/cliphist.elf: user/apps/gui/cliphist.o $(CLIPBOARD) $(MIME) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/cliphist.o $(CLIPBOARD) $(MIME) $(GUILIB) $(ULIB) $(LIBGCC)
-
-# files uses the dialog lib for delete confirmation + a Properties sheet.
-user/apps/gui/files.elf: user/apps/gui/files.o $(DIALOG) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/files.o $(DIALOG) $(GUILIB) $(ULIB) $(LIBGCC)
-
-# the compositor pastes clipboard text into the focused window (Ctrl+V / Super+V),
-# so it links the clipboard client lib; it also owns the framebuffer, so Print
-# Screen capture (PNG encode) lives here — $(PNGENC) + the shared $(CRC32).
-user/apps/gui/compositor.elf: user/apps/gui/compositor/compositor.o user/apps/gui/compositor/compositor_damage.o $(CLIPBOARD) $(PNGENC) $(CRC32) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/compositor/compositor.o user/apps/gui/compositor/compositor_damage.o $(CLIPBOARD) $(PNGENC) $(CRC32) $(GUILIB) $(ULIB) $(LIBGCC)
-
-# The browser is a multi-file user program (user/apps/gui/browser/*.c), linked
-# flat: streaming inflate (gzip/deflate), the PNG decoder, HTTP/2, the SQLite jar.
-BROWSER_OBJS := user/apps/gui/browser/main.o user/apps/gui/browser/sync.o user/apps/gui/browser/buffers.o user/apps/gui/browser/surface.o user/apps/gui/browser/fetch.o user/apps/gui/browser/resource.o user/apps/gui/browser/html.o user/apps/gui/browser/dom.o user/apps/gui/browser/css/engine.o user/apps/gui/browser/css/sibling.o user/apps/gui/browser/color.o user/apps/gui/browser/layout.o user/apps/gui/browser/anim.o user/apps/gui/browser/svg.o user/apps/gui/browser/jar.o user/apps/gui/browser/cache.o user/apps/gui/browser/js/bindings.o user/apps/gui/browser/js/dom_query.o user/apps/gui/browser/js/indexeddb.o user/apps/gui/browser/js/serviceworker.o user/apps/gui/browser/js/webapi.o user/apps/gui/browser/js/notification.o user/apps/gui/browser/js/media.o user/apps/gui/browser/js/classlist.o user/apps/gui/browser/devtools.o user/apps/gui/browser/csp.o user/apps/gui/browser/cors.o user/apps/gui/browser/imgdec.o user/apps/gui/browser/media.o user/apps/gui/browser/bookmarks.o user/apps/gui/browser/clienthints.o user/apps/gui/browser/permissions.o
-user/apps/gui/browser.elf: $(BROWSER_OBJS) $(UPNG) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(HTTPCACHE) $(NETCONN) $(TLS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(VIDEO) $(CAST) $(PROTOBUF) $(JSON) $(BASE64) $(CLIPBOARD) $(RESOLVE) $(NOTIFY) $(DIALOG) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ $(BROWSER_OBJS) $(UPNG) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(HTTPCACHE) $(NETCONN) $(TLS) $(CRYPTO) $(WEBSOCKET) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(VIDEO) $(CAST) $(PROTOBUF) $(JSON) $(BASE64) $(CLIPBOARD) $(RESOLVE) $(NOTIFY) $(DIALOG) $(GUILIB) $(ULIB) $(LIBGCC)
-
-# notifyd (the notification daemon) decodes notification thumbnails with the
-# streaming PNG decoder; it serves the "notify" port and draws the Notification
-# Center in its own window.
-user/apps/gui/notifyd.elf: user/apps/gui/notifyd.o $(UPNG) $(INFLATE) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/notifyd.o $(UPNG) $(INFLATE) $(GUILIB) $(ULIB) $(LIBGCC)
-
-# the calculator links the math lib for dtoa/strtod (double <-> shortest-decimal).
-user/apps/gui/calc.elf: user/apps/gui/calc.o $(MATH) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/calc.o $(MATH) $(GUILIB) $(ULIB) $(LIBGCC)
-
-# the image viewer links the streaming PNG decoder + the WebP codec; player links
-# the media engine (decoder + mixer, which bundles the MPEG decoder).
-user/apps/gui/imgview.elf: user/apps/gui/imgview.o $(UPNG) $(WEBP) $(INFLATE) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/imgview.o $(UPNG) $(WEBP) $(INFLATE) $(GUILIB) $(ULIB) $(LIBGCC)
-# player links the media engine (audio decoder + mixer) plus $(VIDEO) — the H.264
-# picture path (which bundles the H.264 decoder + MP4 demuxer) — so it plays both
-# audio files and video. $(MATH) is for the AAC decoder's dequant/window trig
-# (the MP4 demuxer for .m4a audio comes from $(VIDEO)).
-user/apps/gui/player.elf: user/apps/gui/player.o $(MEDIA) $(VIDEO) $(MATH) $(ULIB) $(GUILIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/gui/player.o $(MEDIA) $(VIDEO) $(MATH) $(GUILIB) $(ULIB) $(LIBGCC)
-
-# --- CLI apps that pull in extra libs ---------------------------------------
-# ping / dig resolve their target in user space now (kernel connect takes an IP
-# only): link the resolver ($(RESOLVE) bundles the mDNS client for .local names).
-user/apps/cli/ping.elf: user/apps/cli/ping.o $(RESOLVE) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/ping.o $(RESOLVE) $(ULIB) $(LIBGCC)
-user/apps/cli/dig.elf: user/apps/cli/dig.o $(RESOLVE) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/dig.o $(RESOLVE) $(ULIB) $(LIBGCC)
-
-# stun prints the host's server-reflexive address (the WebRTC/ICE candidate-
-# gathering path); links the STUN codec, which pulls $(CRYPTO) + $(RESOLVE).
-user/apps/cli/stun.elf: user/apps/cli/stun.o $(STUN) $(CRC32) $(CRYPTO) $(RESOLVE) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/stun.o $(STUN) $(CRC32) $(CRYPTO) $(RESOLVE) $(ULIB) $(LIBGCC)
-
-# ntpd resolves its server host in user space (kernel connect takes an IP only).
-user/apps/cli/ntpd.elf: user/apps/cli/ntpd.o $(RESOLVE) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/ntpd.o $(RESOLVE) $(ULIB) $(LIBGCC)
-
-# clipd (clipboard server) links the clipboard client lib + the MIME helper.
-user/apps/cli/clipd.elf: user/apps/cli/clipd.o $(CLIPBOARD) $(MIME) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/clipd.o $(CLIPBOARD) $(MIME) $(ULIB) $(LIBGCC)
-
-# vmclipd bridges the VMware host clipboard (/proc/hostclip) to clipd; links the
-# clipboard client lib.
-user/apps/cli/vmclipd.elf: user/apps/cli/vmclipd.o $(CLIPBOARD) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/vmclipd.o $(CLIPBOARD) $(ULIB) $(LIBGCC)
-
-# notify-send: the client CLI links the notifyd client lib.
-user/apps/cli/notifysend.elf: user/apps/cli/notifysend.o $(NOTIFY) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/notifysend.o $(NOTIFY) $(ULIB) $(LIBGCC)
-
-# webp: the WebP codec CLI (info / encode a PNG to WebP / verify a lossless round
-# trip). Links the WebP codec + the streaming PNG decoder it converts from.
-user/apps/cli/webp.elf: user/apps/cli/webp.o $(WEBP) $(UPNG) $(INFLATE) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/webp.o $(WEBP) $(UPNG) $(INFLATE) $(ULIB) $(LIBGCC)
-
-# json: the JSON CLI (validate / pretty-print / minify). Links the JSON value-tree
-# lib + the math lib it needs for dtoa/strtod.
-user/apps/cli/json.elf: user/apps/cli/json.o $(JSON) $(MATH) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/json.o $(JSON) $(MATH) $(ULIB) $(LIBGCC)
-
-# base64: the base64 CLI (encode / -d decode). Links the base64 codec lib.
-user/apps/cli/base64.elf: user/apps/cli/base64.o $(BASE64) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/base64.o $(BASE64) $(ULIB) $(LIBGCC)
-
-# mpeg: the MPEG-1 video CLI (info / gen). Links the from-scratch MPEG-1 codec.
-user/apps/cli/mpeg.elf: user/apps/cli/mpeg.o $(MPEG) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/mpeg.o $(MPEG) $(ULIB) $(LIBGCC)
-
-# h264: the H.264/AVC video CLI (info). Links the from-scratch baseline decoder
-# and the MP4 demuxer (for .mp4/.mov input); $(LIBGCC) for the 64-bit box sizes.
-user/apps/cli/h264.elf: user/apps/cli/h264.o $(H264) $(MP4) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/h264.o $(H264) $(MP4) $(ULIB) $(LIBGCC)
-
-# cast: the Cast (Chromecast) sender CLI. Links the cast lib + its transport
-# (netconn/TLS/crypto), the CastMessage frame codec ($(PROTOBUF)), the JSON
-# payload tree ($(JSON)+$(MATH)) and the resolver ($(RESOLVE), which bundles the
-# mDNS client discovery uses).
-user/apps/cli/cast.elf: user/apps/cli/cast.o $(CAST) $(PROTOBUF) $(JSON) $(MATH) $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/cast.o $(CAST) $(PROTOBUF) $(JSON) $(MATH) $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE) $(ULIB) $(LIBGCC)
-
-# alac: the Apple Lossless codec CLI (info / encode WAV->CAF / decode CAF->WAV /
-# verify a bit-exact round trip). Links the ALAC codec; the WAV/CAF containers
-# live in the CLI itself.
-user/apps/cli/alac.elf: user/apps/cli/alac.o $(ALAC) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/alac.o $(ALAC) $(ULIB) $(LIBGCC)
-
-# aac: the AAC-LC codec CLI (info / decode to WAV). Links the from-scratch AAC
-# decoder + the MP4 demuxer (for .m4a input) + $(MATH) (dequant/window trig).
-user/apps/cli/aac.elf: user/apps/cli/aac.o $(AAC) $(MP4) $(MATH) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/aac.o $(AAC) $(MP4) $(MATH) $(ULIB) $(LIBGCC)
-
-# curl: libcurl (HTTP/1.1 + HTTP/2 + HTTP/3 over QUIC) + URL + crypto (AES-GCM/x25519).
-user/apps/cli/curl.elf: user/apps/cli/curl.o $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(NETCONN) $(TLS) $(CRYPTO) $(BROTLI) $(RESOLVE) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/curl.o $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(NETCONN) $(TLS) $(CRYPTO) $(BROTLI) $(RESOLVE) $(ULIB) $(LIBGCC)
-
-# torrent: libtorrent (bencode/torrent/tracker/peer) + libcurl + crypto (SHA-1).
-user/apps/cli/torrent.elf: user/apps/cli/torrent.o $(TORLIB) $(CRYPTO) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/torrent.o $(TORLIB) $(CRYPTO) $(ULIB) $(LIBGCC)
-
-# ssh: from-scratch SSH-2 over net_* sockets + crypto (x25519/SHA-256/AES-128-GCM).
-# Resolves its target host in user space ($(RESOLVE)).
-user/apps/cli/ssh.elf: user/apps/cli/ssh.o $(CRYPTO) $(RESOLVE) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/ssh.o $(CRYPTO) $(RESOLVE) $(ULIB) $(LIBGCC)
-
-# sshd: the SSH-2 server (ed25519 host-key sign + the x25519/GCM transport).
-user/apps/cli/sshd.elf: user/apps/cli/sshd.o $(CRYPTO) $(ULIB) user/user.ld
-	$(ULD) -m elf_i386 -T user/user.ld -o $@ user/apps/cli/sshd.o $(CRYPTO) $(ULIB) $(LIBGCC)
-
-# Embed each program ELF as an object. The path-derived symbol is renamed to the
-# stable _binary_app_<name>_{start,end} the kernel installer references. Two
-# patterns (gui + cli); make picks whichever source actually exists.
-kernel/%_blob.o: user/apps/gui/%.elf
-	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) \
-	  --redefine-sym _binary_user_apps_gui_$*_elf_start=_binary_app_$*_start \
-	  --redefine-sym _binary_user_apps_gui_$*_elf_end=_binary_app_$*_end $< $@
-kernel/%_blob.o: user/apps/cli/%.elf
-	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) \
-	  --redefine-sym _binary_user_apps_cli_$*_elf_start=_binary_app_$*_start \
-	  --redefine-sym _binary_user_apps_cli_$*_elf_end=_binary_app_$*_end $< $@
+# $(call app_rule,name): link rule + kernel blob rule for one app.
+define app_rule
+user/apps/$(1)/$(1).elf: $(or $(APP_OBJS_$(1)),user/apps/$(1)/$(1).o) $(APP_LIBS_$(1)) $(if $(filter $(1),$(GUI_APPS)),$$(GUILIB)) $$(ULIB) user/user.ld
+	$$(ULD) -m elf_i386 -T user/user.ld -o $$@ $$(filter %.o,$$^) $$(LIBGCC)
+kernel/$(1)_blob.o: user/apps/$(1)/$(1).elf
+	$$(OBJCOPY) -I binary -O $$(KELF) -B $$(KBFD) \
+	  --redefine-sym _binary_user_apps_$(1)_$(1)_elf_start=_binary_app_$(1)_start \
+	  --redefine-sym _binary_user_apps_$(1)_$(1)_elf_end=_binary_app_$(1)_end $$< $$@
+endef
+$(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
 
 # Combined function-symbol table (one text blob, sections keyed by app name) so
-# the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"…
+# the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"...
 # per app, sorted by address. Regenerated whenever any listed app's .elf changes.
 SYM_APPS := browser files editor term calc imgview player settings notifyd about clock cliphist
-kernel/appsyms.o: $(addprefix user/apps/gui/,$(addsuffix .elf,$(SYM_APPS))) $(ARCH_STAMP)
+kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf) $(ARCH_STAMP)
 	@: > kernel/appsyms.dat
 	@for e in $(filter %.elf,$^); do n=`basename $$e .elf`; printf '>%s\n' "$$n" >> kernel/appsyms.dat; \
 	  $(UCROSS)nm -n --defined-only $$e | awk '$$2 ~ /^[tT]$$/ {print $$1" "$$3}' >> kernel/appsyms.dat; done
