@@ -118,6 +118,12 @@ STORAGE := -hda $(DISK) \
 	-device sd-card,drive=sddisk \
 	-cdrom $(CDISK)
 
+# USB_HID=1 also attaches a USB keyboard, mouse and tablet to the xHCI bus, so the USB HID driver gets exercised
+# (`make run USB_HID=1`); off by default so the PS/2 input path stays the only one.
+ifeq ($(USB_HID),1)
+  STORAGE += -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0 -device usb-tablet,bus=xhci.0
+endif
+
 # How the kernel image is handed to QEMU. The built-in `-kernel` multiboot loader
 # only loads 32-bit ELF ("Cannot load x86-64 image, give a 32bit one"), so the
 # 64-bit kernel is booted through GRUB on the ISO instead (multiboot2 loads

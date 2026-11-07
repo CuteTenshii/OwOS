@@ -1,14 +1,28 @@
-/* usb.c: the `lsusb` command.
- * Lists USB host controllers on PCI by prog_if; for UHCI also reads root-hub ports and fetches device descriptors over
- * endpoint 0. Transfers use a minimal UHCI schedule (frame list, one queue head, TD chain) in palloc'd memory (phys ==
- * virt). */
+/* usb.c - the `lsusb` command.
+ *
+ * Like lspci, this finds USB host controllers on the PCI bus (class 0x0C,
+ * subclass 0x03) and names them by prog_if. For UHCI controllers - the kind
+ * QEMU's PIIX3 exposes - it goes further: it reads the two root-hub ports out
+ * of the controller's I/O space, and for any device it finds it drives a real
+ * control transfer over endpoint 0 to fetch the USB device descriptor. That
+ * gives the device's vendor:product id, class, and (via a string descriptor)
+ * its product name - so a `usb-tablet` actually shows up as one.
+ *
+ * The transfer machinery is a minimal UHCI schedule: a 4 KiB frame list whose
+ * entries all point at one queue head, and a chain of transfer descriptors
+ * (SETUP -> DATA IN... -> STATUS) the controller walks via DMA. All of it
+ * lives in palloc'd low memory, where physical == virtual, so the addresses we
+ * hand the controller are the same pointers we dereference.
+ */
 
 #include "usb.h"
 #include "console.h"
 #include "io.h"
+#include "kstring.h"
 #include "paging.h"
 #include "pci.h"
 #include "timer.h"
+#include "usbhost.h"
 #include "xhci.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -23,40 +37,40 @@
 #define USB_PROGIF_XHCI 0x30
 
 /* UHCI I/O register offsets from the controller's BAR4 base. */
-#define UHCI_USBCMD 0x00
-#define UHCI_USBSTS 0x02
-#define UHCI_USBINTR 0x04
-#define UHCI_FRNUM 0x06
-#define UHCI_FRBASEADD 0x08
-#define UHCI_SOFMOD 0x0C
+#define UHCI_USBCMD 0x00    /* command (word)                     */
+#define UHCI_USBSTS 0x02    /* status (word)                      */
+#define UHCI_USBINTR 0x04   /* interrupt enable (word)            */
+#define UHCI_FRNUM 0x06     /* current frame number (word)        */
+#define UHCI_FRBASEADD 0x08 /* frame-list base address (dword)    */
+#define UHCI_SOFMOD 0x0C    /* start-of-frame timing (byte)       */
 #define UHCI_PORTSC1 0x10
 #define UHCI_PORTSC2 0x12
 
 /* USBCMD bits. */
 #define CMD_RUN 0x0001
 #define CMD_HCRESET 0x0002
-#define CMD_CF 0x0040
-#define CMD_MAXP 0x0080
+#define CMD_CF 0x0040   /* configure flag (informational)     */
+#define CMD_MAXP 0x0080 /* 64-byte max packet for reclamation */
 
 /* UHCI PORTSC bits. */
-#define UHCI_PORT_CONNECTED 0x0001
-#define UHCI_PORT_CSC 0x0002
-#define UHCI_PORT_ENABLED 0x0004
-#define UHCI_PORT_PEDC 0x0008
-#define UHCI_PORT_LOWSPEED 0x0100
-#define UHCI_PORT_RESET 0x0200
+#define UHCI_PORT_CONNECTED 0x0001 /* a device is attached            */
+#define UHCI_PORT_CSC 0x0002       /* connect-status change (R/WC)    */
+#define UHCI_PORT_ENABLED 0x0004   /* port enabled                    */
+#define UHCI_PORT_PEDC 0x0008      /* enable change (R/WC)            */
+#define UHCI_PORT_LOWSPEED 0x0100  /* low-speed device attached       */
+#define UHCI_PORT_RESET 0x0200     /* drive bus reset                 */
 
 /* Transfer-descriptor control/status bits. */
 #define TD_ACTIVE (1u << 23)
 #define TD_LOWSPEED (1u << 26)
-#define TD_CERR3 (3u << 27)
-/* Fatal status bits (NAK is not fatal, the controller retries it). */
+#define TD_CERR3 (3u << 27) /* allow 3 error retries              */
+/* Fatal status bits (NAK is not fatal - the controller retries it). */
 #define TD_ERRMASK ((1u << 22) | (1u << 21) | (1u << 20) | (1u << 18) | (1u << 17))
 
 /* Link-pointer bits. */
 #define LINK_TERMINATE 0x1
-#define LINK_QH 0x2
-#define LINK_DEPTH 0x4
+#define LINK_QH 0x2    /* pointer is a queue head, not a TD       */
+#define LINK_DEPTH 0x4 /* depth-first (Vf): follow this TD next   */
 
 /* Control-transfer token PIDs. */
 #define PID_SETUP 0x2D
@@ -65,7 +79,9 @@
 
 #define MAX_TDS 20
 
-/* UHCI TD: 4 hardware dwords, padded to a 32-byte stride (hardware needs 16-byte alignment). */
+/* UHCI transfer descriptor: 4 hardware dwords; the rest is software space and
+ * keeps consecutive TDs 32-byte spaced (the hardware needs only 16-byte
+ * alignment, which a 32-byte stride from a page boundary satisfies). */
 struct uhci_td {
   volatile uint32_t link;
   volatile uint32_t status;
@@ -74,7 +90,8 @@ struct uhci_td {
   uint32_t sw[4];
 };
 
-/* UHCI queue head */
+/* UHCI queue head: a horizontal link to the next queue and a vertical element
+ * link to the first TD of this queue. */
 struct uhci_qh {
   volatile uint32_t head;
   volatile uint32_t element;
@@ -97,23 +114,27 @@ static const char *controller_type(uint8_t prog_if)
   }
 }
 
-/* Build a TD token: PID, address, endpoint, toggle, max length as len-1 (0x7FF = zero-length). */
+/* Build a TD token dword: PID, device address, endpoint, data toggle, and the
+ * max length encoded as (len-1), with 0x7FF meaning a zero-length packet. */
 static uint32_t td_token(uint8_t pid, uint8_t addr, uint8_t ep, bool toggle, int len)
 {
   uint32_t maxlen = (len == 0) ? 0x7FF : ((uint32_t)(len - 1) & 0x7FF);
   return (uint32_t)pid | ((uint32_t)addr << 8) | ((uint32_t)ep << 15) | ((uint32_t)toggle << 19) | (maxlen << 21);
 }
 
-/* Put the controller in a known idle state (stopped, no interrupts, status cleared); no HCRESET. */
+/* Put the controller in a known idle state: stopped, no interrupts (we poll),
+ * status cleared. Left without HCRESET so an attached device stays attached. */
 static void uhci_prepare(uint16_t io)
 {
   outw(io + UHCI_USBCMD, 0);
   outw(io + UHCI_USBINTR, 0);
-  outw(io + UHCI_USBSTS, 0x3F);
+  outw(io + UHCI_USBSTS, 0x3F); /* write 1s to clear all status bits */
 }
 
-/* Reset and enable a root-hub port; returns true and sets *lowspeed if a device is enabled. CSC/PEDC are
- * write-1-to-clear, so write 0 there. */
+/* Reset and enable a root-hub port so its device will answer on endpoint 0.
+ * Returns 1 and sets *lowspeed if a device is enabled, 0 otherwise. The
+ * change bits (CSC/PEDC) are write-1-to-clear, so writes that aren't meant to
+ * clear them must write 0 there. */
 static bool uhci_reset_port(uint16_t port, bool *lowspeed)
 {
   uint16_t s = inw(port);
@@ -148,13 +169,17 @@ static bool uhci_reset_port(uint16_t port, bool *lowspeed)
   return true;
 }
 
-/* GET-style control transfer (data IN) on endpoint 0 of `addr`; reads exactly `length` bytes in maxpacket chunks.
- * Returns bytes read or -1. */
+/* Run one GET-style control transfer (data stage IN) on endpoint 0 of the
+ * device at `addr`. Requests exactly `length` bytes so every TD is filled
+ * exactly and no short-packet handling is needed. Returns bytes read, or -1.
+ *
+ * Chunks the data stage by `maxpacket`; the caller must pass the device's
+ * real bMaxPacketSize0 (or 8, which is always safe for the first read). */
 static int uhci_control_in(uint16_t io, bool lowspeed, uint8_t addr, uint8_t maxpacket, uint8_t reqtype, uint8_t req,
                            uint16_t wValue, uint16_t wIndex, uint8_t *out, uint16_t length)
 {
-  uint8_t *fl = palloc();
-  uint8_t *page = palloc();
+  uint8_t *fl = palloc();   /* 1024-entry frame list, 4 KiB aligned */
+  uint8_t *page = palloc(); /* queue head + TDs + buffers           */
   if (!fl || !page) {
     if (fl)
       pfree(fl);
@@ -211,8 +236,8 @@ static int uhci_control_in(uint16_t io, bool lowspeed, uint8_t addr, uint8_t max
   for (int i = 0; i < n; i++)
     td[i].link = (i + 1 < n) ? ((uint32_t)(uintptr_t)&td[i + 1] | LINK_DEPTH) : LINK_TERMINATE;
 
-  qh->head = LINK_TERMINATE;
-  qh->element = (uint32_t)(uintptr_t)&td[0];
+  qh->head = LINK_TERMINATE;                 /* only one queue this frame   */
+  qh->element = (uint32_t)(uintptr_t)&td[0]; /* first TD (TD select)        */
 
   /* Point every frame at our queue head so it runs regardless of FRNUM. */
   uint32_t *frames = (uint32_t *)fl;
@@ -248,7 +273,7 @@ static int uhci_control_in(uint16_t io, bool lowspeed, uint8_t addr, uint8_t max
 
   if (result == 0) {
     int got = 0;
-    for (int i = 1; i < n - 1; i++)
+    for (int i = 1; i < n - 1; i++) /* the IN TDs */
       got += ((td[i].status & 0x7FF) + 1) & 0x7FF;
     if (got > length)
       got = length;
@@ -257,14 +282,16 @@ static int uhci_control_in(uint16_t io, bool lowspeed, uint8_t addr, uint8_t max
     result = got;
   }
 
-  outw(io + UHCI_USBCMD, 0);
+  outw(io + UHCI_USBCMD, 0); /* stop the controller */
   pfree(fl);
   pfree(page);
   return result;
 }
 
-/* Fetch string descriptor `index` (English) and print its ASCII subset: a 2-byte read gives bLength, then the full
- * read. */
+/* Fetch string descriptor `index` (English) and print it quoted. Done in two
+ * exact-length transfers: the 2-byte header gives bLength, then we read
+ * exactly that many bytes. The payload is UTF-16LE; we show the ASCII subset.
+ */
 static void uhci_print_string(uint16_t io, bool lowspeed, uint8_t maxpacket, uint8_t index)
 {
   if (!index)
@@ -288,7 +315,9 @@ static void uhci_print_string(uint16_t io, bool lowspeed, uint8_t maxpacket, uin
   con_putc('"');
 }
 
-/* Enumerate the device on a freshly reset port and print vendor:product, class and product name. */
+/* Enumerate the device on a freshly reset port: read its device descriptor and
+ * print vendor:product, class, and product name. Prints nothing if the port
+ * has no device or the device never answers. */
 static void uhci_enumerate(uint16_t io, uint16_t portsc_off)
 {
   bool lowspeed;
@@ -328,23 +357,111 @@ static void uhci_probe_port(uint16_t io_base, uint16_t offset, int port)
   uhci_enumerate(io_base, offset);
 }
 
-/* For UHCI, BAR4 holds the I/O base */
+/* For UHCI, BAR4 holds the I/O base; enable bus mastering, then probe both
+ * root-hub ports. */
 static void uhci_probe(uint8_t bus, uint8_t slot, uint8_t func)
 {
   uint32_t bar4 = pci_read32(bus, slot, func, 0x20);
-  if (!(bar4 & 0x1)) {
+  if (!(bar4 & 0x1)) { /* expect an I/O-space BAR (bit 0 set)  */
     con_write("    (no I/O BAR; cannot probe ports)\n");
     return;
   }
   uint16_t io_base = (uint16_t)(bar4 & 0xFFFC);
 
-  /* The controller DMAs the frame list and TDs, so enable I/O decoding (bit 0) and bus master (bit 2). */
+  /* The controller DMAs the frame list and TDs, so it needs I/O-space
+   * decoding (bit 0) and bus-master (bit 2) enabled in PCI command. */
   uint32_t cmd = pci_read32(bus, slot, func, 0x04);
   pci_write32(bus, slot, func, 0x04, cmd | 0x5);
 
   uhci_prepare(io_base);
   uhci_probe_port(io_base, UHCI_PORTSC1, 1);
   uhci_probe_port(io_base, UHCI_PORTSC2, 2);
+}
+
+/* Walk a configuration descriptor blob and print its interfaces + endpoints, so
+ * lsusb shows what each device actually exposes (class/subclass/protocol and
+ * the bulk/interrupt endpoints a driver would use). */
+static void print_config(const uint8_t *cfg, int total)
+{
+  for (int i = 0; i + 2 <= total;) {
+    uint8_t blen = cfg[i];
+    if (blen < 2)
+      break;
+    uint8_t btype = cfg[i + 1];
+    if (btype == 0x04 && i + 9 <= total) { /* interface         */
+      con_printf("         if %u class %02x/%02x/%02x\n", cfg[i + 2], cfg[i + 5], cfg[i + 6], cfg[i + 7]);
+    } else if (btype == 0x05 && i + 7 <= total) { /* endpoint          */
+      uint8_t addr = cfg[i + 2];
+      uint8_t attr = cfg[i + 3] & 0x3;
+      const char *t = attr == 2 ? "bulk" : attr == 3 ? "intr" : attr == 1 ? "isoc" : "ctrl";
+      con_printf("           ep %02x%s%s\n", addr, (addr & 0x80) ? " IN  " : " OUT ", t);
+    }
+    i += blen;
+  }
+}
+
+/* One device line (and its downstream devices, indented), with interface detail when its root port is selected. */
+static void print_device(int slot, const char *path, int depth, int detail_port)
+{
+  struct usbdev *d = usbh_dev(slot);
+  if (!d || !d->active)
+    return;
+  con_write("xhci: ");
+  for (int i = 0; i < depth; i++)
+    con_write("  ");
+  con_printf("port %s: %04x:%04x class %02x speed %u", path, d->vid, d->pid, d->cls, d->speed);
+  if (d->mac_ok && (d->bound & USBH_BOUND_NET))
+    con_write(" [net]");
+  if (d->bound & USBH_BOUND_MTP)
+    con_write(" [mtp]");
+  if (d->bound & USBH_BOUND_MSC)
+    con_write(" [msc]");
+  hub_print(slot);
+  hid_print(slot, false);
+  con_putc('\n');
+  if (detail_port == d->root_port) {
+    if (d->cfg_len)
+      print_config(d->cfg, d->cfg_len);
+    hid_print(slot, true);
+    if (d->is_net && d->mac_ok) {
+      con_write("         rndis mac ");
+      for (int i = 0; i < 6; i++) {
+        con_put_hex(d->mac[i], 2);
+        if (i < 5)
+          con_putc(':');
+      }
+      con_putc('\n');
+    } else if (d->is_net) {
+      con_write("         rndis: init failed\n");
+    }
+  }
+  for (int s = 1; s <= usbh_max_slot(); s++) {
+    struct usbdev *c = usbh_dev(s);
+    if (c && c->parent_slot == slot) {
+      char child[24];
+      ksnprintf(child, sizeof child, "%s.%u", path, c->parent_port);
+      print_device(s, child, depth + 1, detail_port);
+    }
+  }
+}
+
+/* The xHCI device table: root devices by port with their hub topology below them. */
+static void xhci_list(int detail_port)
+{
+  bool any = false;
+  for (int p = 1; p < 256; p++) {
+    for (int s = 1; s <= usbh_max_slot(); s++) {
+      struct usbdev *d = usbh_dev(s);
+      if (d && d->active && d->parent_slot == 0 && d->root_port == p) {
+        char path[8];
+        ksnprintf(path, sizeof path, "%u", p);
+        print_device(s, path, 0, detail_port);
+        any = true;
+      }
+    }
+  }
+  if (!any)
+    con_write("xhci: no usable device on any port\n");
 }
 
 void usb_list(int detail_port)
@@ -375,7 +492,8 @@ void usb_list(int detail_port)
         if (prog_if == USB_PROGIF_UHCI)
           uhci_probe(bus, slot, f);
         else if (prog_if == USB_PROGIF_XHCI)
-          xhci_init(detail_port);
+          if (xhci_present())
+            xhci_list(detail_port);
       }
     }
   }

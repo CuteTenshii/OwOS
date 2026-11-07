@@ -1,4 +1,4 @@
-/* keyboard.h — PS/2 keyboard driver (IRQ1).
+/* keyboard.h - PS/2 keyboard driver (IRQ1).
  *
  * keyboard_init() claims IRQ1 and unmasks it. The interrupt handler only
  * translates each keypress to ASCII and pushes it into an internal ring
@@ -53,12 +53,22 @@
 #define KEY_WWW_FORWARD 0x92
 #define KEY_WWW_REFRESH 0x93
 #define KEY_MIC_MUTE 0x94
+#define KEY_F1 0x95 /* F5 and F12 keep their older codes above; F5/F6/F8/F9 on a laptop keyboard are media keys */
+#define KEY_F2 0x96
+#define KEY_F3 0x97
+#define KEY_F4 0x98
+#define KEY_F6 0x99
+#define KEY_F7 0x9A
+#define KEY_F8 0x9B
+#define KEY_F9 0x9C
+#define KEY_F10 0x9D
+#define KEY_F11 0x9E
 
 /* This header defines only the bytes the driver actually emits. Chords are NOT
  * given per-chord codes: the driver delivers the base key + its KMOD_* set (see
  * cur_mods in keyboard.c), and the consumer decides what the chord means. So
  * Ctrl+S is 's' + KMOD_CTRL, Super+V is 'v' + KMOD_SUPER, Shift+arrow is the
- * arrow + KMOD_SHIFT — the driver never names "Save"/"cliphist"/"extend
+ * arrow + KMOD_SHIFT - the driver never names "Save"/"cliphist"/"extend
  * selection". Those application accelerators are synthesised app-side and live
  * in owos.h (menu_shortcut), not in this driver header.
  *
@@ -67,7 +77,7 @@
  * kernel line editor (shell.c). The PS/2 path still delivers letter +
  * KMOD_CTRL.
  *
- * Ctrl+C isn't queued at all — it's a latch (keyboard_take_interrupt) so it can
+ * Ctrl+C isn't queued at all - it's a latch (keyboard_take_interrupt) so it can
  * interrupt a running command, not just the line being typed. */
 #define KEY_TAB '\t' /* WM keys off KEY_TAB + KMOD_ALT for Alt+Tab      */
 
@@ -91,6 +101,15 @@ void keyboard_init(void);
 /* Act on a KEY_VOL_*, KEY_MUTE or KEY_BRIGHT_* code and queue any KEY_MEDIA_*..KEY_MIC_MUTE code for the compositor.
  * Shared by the PS/2 IRQ and USB HID keyboards. */
 void keyboard_special_key(uint8_t key);
+
+/* USB HID entry points. keyboard_inject_scancode feeds one PS/2 set-1 make or break code (0x100 added for a 0xE0
+ * prefix) through the same decoder as IRQ1, so layouts, chords and specials behave identically. keyboard_inject_key
+ * queues a KEY_* code directly. keyboard_leds is the Num/Caps state in HID LED report order (bit 0 Num Lock, bit 1
+ * Caps Lock); keyboard_led_seq changes whenever it may have. */
+void keyboard_inject_scancode(uint16_t code);
+void keyboard_inject_key(uint8_t key);
+uint8_t keyboard_leds(void);
+uint32_t keyboard_led_seq(void);
 
 /* Non-blocking: stores the next buffered character in *out and returns 1,
  * or returns 0 if no input is waiting. When `mods` is non-NULL it receives the

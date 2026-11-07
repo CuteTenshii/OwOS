@@ -1,9 +1,17 @@
-/* mouse.c: PS/2 mouse on the i8042 aux port (IRQ12), accumulating a clamped absolute cursor. */
+/* mouse.c - PS/2 mouse on the i8042 auxiliary port (IRQ12).
+ *
+ * The controller delivers a 3-byte movement packet on every motion or button
+ * change: a flags byte (button state + sign/overflow bits) and signed X/Y
+ * deltas. We accumulate an absolute cursor position, clamped to the screen, so
+ * the compositor can read mouse_x/mouse_y directly. Y is inverted (the mouse
+ * reports +Y as "up"), so screen Y decreases as the mouse moves up.
+ */
 
 #include "mouse.h"
 #include "console.h"
 #include "io.h"
 #include "irq.h"
+#include "spinlock.h"
 #include "synaptics.h"
 #include "vmmouse.h"
 #include <stdbool.h>
@@ -31,6 +39,9 @@ static volatile int cur_x, cur_y;
 static volatile int buttons;
 static volatile int wheel; /* cumulative wheel notches              */
 static volatile uint32_t seq;
+static volatile int hwheel;      /* cumulative horizontal wheel, positive to the right */
+static volatile int usb_buttons; /* buttons held on USB HID pointers, same bit layout */
+static spinlock_t mouse_lock;    /* serialises IRQ12 with USB injection */
 static int bound_x, bound_y;
 
 static uint8_t packet[4];
@@ -38,7 +49,12 @@ static uint8_t cycle;
 static bool wheel_mode; /* 1 once IntelliMouse 4-byte mode is on  */
 static bool syn_mode;   /* 1 once a Synaptics TouchPad took over   */
 
-/* Pointer-speed level 1..5 (3 = 1x) as a num/den factor; the fractional residual carries over. */
+/* Pointer-speed scale applied to PS/2 relative deltas: a level 1..5 (3 = the
+ * native 1x), each mapping to a num/den factor. A fractional residual carries
+ * the bit lost to integer division into the next packet, so a slow setting
+ * still moves smoothly instead of snapping in whole steps. Settable from user
+ * space via /sys/class/input/mouse0/speed (the Settings app's Mouse/Touchpad
+ * category). */
 static int speed = 3;
 static int res_x, res_y;
 static const int spd_num[5] = {1, 3, 1, 3, 2};
@@ -86,7 +102,8 @@ static void mouse_apply(void)
   if (flags & (PKT_X_OVF | PKT_Y_OVF)) /* discard overflowed deltas        */
     dx = dy = 0;
 
-  /* Scale deltas by the speed factor, carrying the truncated remainder. */
+  /* Scale the raw deltas by the pointer-speed factor, accumulating the
+   * truncated remainder so slow settings stay smooth. */
   int num = spd_num[speed - 1], den = spd_den[speed - 1];
   int sx = dx * num + res_x, sy = dy * num + res_y;
   int adx = sx / den;
@@ -110,7 +127,9 @@ static void mouse_apply(void)
   buttons = flags & (PKT_LEFT | PKT_RIGHT | PKT_MIDDLE);
 
   if (wheel_mode) {
-    /* Byte 3: signed wheel nibble; negate so wheel follows the +up WEV_SCROLL convention. */
+    /* Byte 3 carries the wheel delta in its low nibble, sign-extended. The
+     * PS/2 IntelliMouse reports +toward-the-user; negate so `wheel` follows
+     * the +up/-down WEV_SCROLL convention (as Linux psmouse does). */
     int dz = packet[3] & 0x0F;
     if (dz & 0x08)
       dz -= 16;
@@ -119,16 +138,11 @@ static void mouse_apply(void)
   seq++;
 }
 
-static void mouse_handler(struct registers *r)
+static void mouse_handle_byte(uint8_t data)
 {
-  (void)r;
-  uint8_t st = inb(PS2_STATUS);
-  if (!(st & STAT_OUTPUT_FULL) || !(st & STAT_AUX_DATA))
-    return;
-
-  uint8_t data = inb(PS2_DATA); /* always consume, to clear the controller */
-
-  /* VMware vmmouse raises IRQ12 but the data is in the backdoor queue; ignore the PS/2 byte. */
+  /* Under VMware, the vmmouse device raises IRQ12 through the i8042 but the
+   * real data lives in the backdoor queue: read absolute position from there
+   * and ignore the (filler) PS/2 byte we just drained. */
   if (vmmouse_active()) {
     int nx = cur_x, ny = cur_y, btn = buttons, dz = 0;
     if (vmmouse_poll(&nx, &ny, &btn, &dz)) {
@@ -141,7 +155,8 @@ static void mouse_handler(struct registers *r)
     return;
   }
 
-  /* A Synaptics TouchPad decodes its own absolute packets; feed it the raw byte. */
+  /* A Synaptics TouchPad reassembles its own 6-byte absolute packets and
+   * synthesizes relative motion / tap / scroll. Feed it the raw byte. */
   if (syn_mode) {
     int nx = cur_x, ny = cur_y, btn = buttons, dz = 0;
     if (synaptics_feed(data, &nx, &ny, &btn, &dz)) {
@@ -182,6 +197,19 @@ static void mouse_handler(struct registers *r)
   }
 }
 
+static void mouse_handler(struct registers *r)
+{
+  (void)r;
+  uint8_t st = inb(PS2_STATUS);
+  if (!(st & STAT_OUTPUT_FULL) || !(st & STAT_AUX_DATA))
+    return;
+
+  uint8_t data = inb(PS2_DATA); /* always consume, to clear the controller */
+  uintptr_t f = spin_lock_irqsave(&mouse_lock);
+  mouse_handle_byte(data);
+  spin_unlock_irqrestore(&mouse_lock, f);
+}
+
 void mouse_init(int max_x, int max_y)
 {
   bound_x = max_x;
@@ -189,7 +217,8 @@ void mouse_init(int max_x, int max_y)
   cur_x = max_x / 2;
   cur_y = max_y / 2;
 
-  /* Drain the output buffer so the config read doesn't see stale data. */
+  /* Drain any byte sitting in the output buffer so the config read below
+   * doesn't pick up stale data. */
   for (int i = 0; i < 16 && (inb(PS2_STATUS) & STAT_OUTPUT_FULL); i++)
     (void)inb(PS2_DATA);
 
@@ -197,7 +226,11 @@ void mouse_init(int max_x, int max_y)
   ps2_wait_write();
   outb(PS2_CMD, 0xA8);
 
-  /* Force both IRQs on (bit0/1) and both clocks on (clear bit4/5); keep bit6 so keyboard.c sees set-1 codes. */
+  /* Rewrite the controller config byte. Crucially we force BOTH interrupts on
+   * (bit0 keyboard, bit1 mouse) and BOTH clocks on (clear bit4/bit5) rather
+   * than trusting the read - a stale read here used to write the keyboard's
+   * own IRQ back as disabled, killing the keyboard. Bit 6 (scancode
+   * translation) is preserved so keyboard.c keeps seeing set-1 codes. */
   ps2_wait_write();
   outb(PS2_CMD, 0x20);
   ps2_wait_read();
@@ -215,13 +248,20 @@ void mouse_init(int max_x, int max_y)
 
   mouse_command(0xF6); /* load default settings                    */
 
-  /* Probe Synaptics before the IntelliMouse knock, which would disturb the pad; synaptics.c then owns decoding. */
+  /* A laptop Synaptics TouchPad rides this same aux port but speaks an
+   * extended absolute protocol. Detect and enable it here, before the
+   * IntelliMouse knock below - the knock's set-sample-rate sequence would
+   * disturb the pad's mode. When found, synaptics.c owns all decoding and we
+   * skip the relative-mouse wheel setup entirely. */
   syn_mode = (synaptics_init(bound_x, bound_y) == 0);
   con_write(synaptics_status());
   con_write("\n");
 
   if (!syn_mode) {
-    /* IntelliMouse knock: set-sample-rate 200, 100, 80; ID 3 means a wheel. */
+    /* Try to switch the mouse into IntelliMouse mode (adds a scroll-wheel
+     * byte to every packet). The "magic knock" is three set-sample-rate
+     * commands (200, 100, 80); afterwards the device reports ID 3 if it has
+     * a wheel. */
     mouse_command(0xF3);
     mouse_command(200);
     mouse_command(0xF3);
@@ -240,7 +280,13 @@ void mouse_init(int max_x, int max_y)
     mouse_command(0xF4); /* enable data reporting                */
   }
 
-  /* Under VMware (or QEMU vmmouse) switch to the absolute pointer; falls back to PS/2 without a backdoor. */
+  /* If we're under VMware (or QEMU's vmport + vmmouse), switch to the absolute
+   * pointer: the host and guest cursors then track exactly, with no PS/2 delta
+   * decoding. The PS/2 setup above stays - vmmouse still rides IRQ12 - and we
+   * keep the same bounds. Falls back silently to PS/2 if there's no backdoor.
+   */
+  /* Diagnostic plumbing for on-hardware (VMware) debugging: a journal line so a
+   * real-VMware boot shows whether the absolute pointer engaged. */
   vmmouse_init(bound_x, bound_y);
   con_write(vmmouse_active() ? "mouse: vmmouse absolute pointer active.\n"
                              : "mouse: PS/2 relative (no VMware backdoor).\n");
@@ -253,8 +299,9 @@ void mouse_init(int max_x, int max_y)
 int mouse_x(void) { return cur_x; }
 int mouse_y(void) { return cur_y; }
 /* Route to a driving Synaptics pad so the timed tap-to-click pulse shows without a new packet. */
-int mouse_buttons(void) { return syn_mode ? synaptics_buttons() : buttons; }
+int mouse_buttons(void) { return (syn_mode ? synaptics_buttons() : buttons) | usb_buttons; }
 int mouse_wheel(void) { return wheel; }
+int mouse_hwheel(void) { return hwheel; }
 uint32_t mouse_seq(void) { return seq; }
 
 void mouse_set_speed(int level)
@@ -269,7 +316,44 @@ void mouse_set_speed(int level)
 
 int mouse_speed(void) { return speed; }
 
-/* Update the clamp box after a resolution change and clamp the cursor into it. */
+static int clamp_int(int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); }
+
+void mouse_inject_rel(int dx, int dy, int dwheel, int dhwheel, int btn)
+{
+  uintptr_t f = spin_lock_irqsave(&mouse_lock);
+  /* Same speed scaling and residual carry as the PS/2 path; HID Y grows downward already. */
+  int num = spd_num[speed - 1], den = spd_den[speed - 1];
+  int sx = dx * num + res_x, sy = dy * num + res_y;
+  int adx = sx / den, ady = sy / den;
+  res_x = sx - adx * den;
+  res_y = sy - ady * den;
+  cur_x = clamp_int(cur_x + adx, bound_x);
+  cur_y = clamp_int(cur_y + ady, bound_y);
+  wheel += dwheel;
+  hwheel += dhwheel;
+  usb_buttons = btn;
+  seq++;
+  spin_unlock_irqrestore(&mouse_lock, f);
+}
+
+void mouse_inject_abs(int x, int y, int dwheel, int dhwheel, int btn)
+{
+  uintptr_t f = spin_lock_irqsave(&mouse_lock);
+  cur_x = clamp_int(x, bound_x);
+  cur_y = clamp_int(y, bound_y);
+  wheel += dwheel;
+  hwheel += dhwheel;
+  usb_buttons = btn;
+  seq++;
+  spin_unlock_irqrestore(&mouse_lock, f);
+}
+
+int mouse_bound_x(void) { return bound_x; }
+int mouse_bound_y(void) { return bound_y; }
+
+/* Update the cursor's clamp box after a resolution change (the hardware stays
+ * initialised; only the bounds move). Clamps the current position into the new
+ * box so the cursor can't be stranded off-screen. */
 void mouse_set_bounds(int max_x, int max_y)
 {
   bound_x = max_x;
@@ -278,7 +362,8 @@ void mouse_set_bounds(int max_x, int max_y)
     cur_x = bound_x;
   if (cur_y > bound_y)
     cur_y = bound_y;
-  /* Keep the absolute pointers' bounds in step with the new screen. */
+  /* The absolute pointers scale onto their own copy of the bounds - keep them
+   * in step, or the cursor can't reach the new screen's far edges. */
   vmmouse_set_bounds(max_x, max_y);
   synaptics_set_bounds(max_x, max_y);
 }
