@@ -389,6 +389,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(mediad);
     INSTALL_APP(mediactl);
     INSTALL_APP(cast);
+    INSTALL_APP(unrar);
     INSTALL_APP(init);
     INSTALL_FILE("/bin/notify-send", _binary_app_notifysend);
   }
