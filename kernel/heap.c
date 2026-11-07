@@ -21,7 +21,9 @@ typedef struct block {
   bool free;
   struct block *prev;
   struct block *next;
-} block_t;
+} __attribute__((aligned(8))) block_t;
+
+_Static_assert(sizeof(block_t) % 8 == 0, "payloads must stay 8-byte aligned, kfree rejects the rest");
 
 static block_t *head;
 static block_t *alloc_cursor;
