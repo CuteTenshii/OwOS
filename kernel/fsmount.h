@@ -42,6 +42,9 @@ struct fs_ops {
   int (*del)(void *inst, const char *path);
   int (*mkdir)(void *inst, const char *path);
   int (*rmdir)(void *inst, const char *path);
+
+  /* Optional: real mode/uid/gid of a path; NULL or nonzero return means mount default. */
+  int (*getattr)(void *inst, const char *path, uint32_t *mode, uint32_t *uid, uint32_t *gid);
   int (*rename)(void *inst, const char *from, const char *to);
   int (*write_at)(void *inst, const char *path, uint32_t off, const void *buf, uint32_t len);
 

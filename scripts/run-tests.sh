@@ -66,7 +66,7 @@ done
 	"$ROOT/user/apps/browser/features/notification/notification.c" \
 	"$ROOT/user/lib/curl/url.c" "$ROOT/user/lib/curl/httpcache.c" \
 	"$ROOT/user/lib/curl/headers.c" "$ROOT/user/lib/crypto/crypto.c" \
-	"$ROOT/user/lib/base64/base64.c" "$ROOT/user/lib/zlib/crc32.c" \
+	"$ROOT/user/lib/base64/base64.c" "$ROOT/user/lib/zlib/crc32.c" "$ROOT/kernel/crc32c.c" \
 	"$ROOT/user/lib/stun/stun.c" "$ROOT/user/lib/ntp/ntp.c" "$ROOT"/user/lib/rar/*.c "$ROOT/drivers/usb/hid_desc.c" "$ROOT/user/lib/mp4/mp4.c" \
 	"$ROOT/user/lib/sqlite/sqlite.c" \
 	"$ROOT/user/lib/js/lexer.c" "$ROOT/user/lib/js/parser.c" \
