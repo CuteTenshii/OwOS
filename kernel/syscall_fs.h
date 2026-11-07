@@ -22,5 +22,9 @@ void syscall_fs_umount(struct registers *r);
 void syscall_fs_stat(struct registers *r);
 void syscall_fs_statfs(struct registers *r);
 void syscall_fs_uname(struct registers *r);
+void syscall_fs_chmod(struct registers *r);
+void syscall_fs_chown(struct registers *r);
+void syscall_fs_umask(struct registers *r);
+void syscall_fs_access(struct registers *r);
 
 #endif

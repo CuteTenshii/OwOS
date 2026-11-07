@@ -3,6 +3,7 @@
 #include "fs.h"
 #include "idt.h"
 #include "kstring.h"
+#include "perm.h"
 #include "procfs.h"
 #include "rtc.h"
 #include "sched.h"
@@ -16,6 +17,16 @@
 #define OWOS_VERSION "dev"
 #endif
 
+/* Fail with -EACCES if the caller may not do `want` on abs; other failures fall through. */
+static bool access_denied(struct registers *r, const char *abs, int want)
+{
+  int rc = fs_access(abs, want);
+  if (rc != -PERM_EACCES)
+    return false;
+  r->eax = (uint32_t)rc;
+  return true;
+}
+
 void syscall_fs_stream_begin(struct registers *r)
 {
   char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
@@ -24,6 +35,8 @@ void syscall_fs_stream_begin(struct registers *r)
     return;
   }
   join_cwd(name, abs, sizeof abs);
+  if (access_denied(r, abs, FS_W | FS_ACC_CREATE))
+    return;
   r->eax = (uint32_t)fs_stream_begin(abs);
 }
 
@@ -47,6 +60,8 @@ static void simple_path_op(struct registers *r, int op)
     return;
   }
   join_cwd(name, abs, sizeof abs);
+  if (access_denied(r, abs, FS_ACC_ENTRY))
+    return;
   if (op == 0)
     r->eax = (uint32_t)fs_mkdir(abs);
   else if (op == 1)
@@ -71,6 +86,8 @@ void syscall_fs_rename(struct registers *r)
   }
   join_cwd(old_name, old_path, sizeof old_path);
   join_cwd(new_name, new_path, sizeof new_path);
+  if (access_denied(r, old_path, FS_ACC_ENTRY) || access_denied(r, new_path, FS_ACC_ENTRY))
+    return;
   r->eax = (uint32_t)fs_rename(old_path, new_path);
 }
 
@@ -83,6 +100,8 @@ void syscall_fs_chdir(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
+  if (access_denied(r, abs, FS_X))
+    return;
   sched_set_cwd_self(abs);
   r->eax = 0;
 }
@@ -107,6 +126,8 @@ void syscall_fs_writefile(struct registers *r)
     return;
   }
   join_cwd(name, abs, sizeof abs);
+  if (access_denied(r, abs, FS_W | FS_ACC_CREATE))
+    return;
   const char *proc = procfs_subpath(abs);
   if (proc && proc[0]) {
     r->eax = (uint32_t)procfs_write(proc, (const char *)(uintptr_t)buf, (int)len);
@@ -153,6 +174,8 @@ void syscall_fs_readdir(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
+  if (access_denied(r, path[0] ? path : "/", FS_R))
+    return;
   int got = fs_enum_dir(path[0] ? path : "/", (int)r->ecx, name, &is_dir, &size, 0);
   if (got) {
     out = (struct rd_out *)r->edx;
@@ -244,6 +267,9 @@ void syscall_fs_stat(struct registers *r)
     int is_dir;
     uint32_t size;
     uint32_t mtime;
+    uint32_t mode;
+    uint32_t uid;
+    uint32_t gid;
   } *out;
   char name[SYS_PATH_MAX], path[SYS_PATH_MAX];
   if (copyin_str(r->ebx, name, sizeof name) != 0 || !user_out_range(r->ecx, sizeof *out)) {
@@ -251,16 +277,84 @@ void syscall_fs_stat(struct registers *r)
     return;
   }
   join_cwd(name, path, sizeof path);
-  int is_dir = 0;
-  uint32_t size = 0, mtime = 0;
-  int rc = fs_stat(path, &is_dir, &size, &mtime);
+  if (access_denied(r, path, 0))
+    return;
+  struct fs_stat_info st;
+  int rc = fs_stat_ex(path, &st);
   if (rc == 0) {
     out = (struct st_out *)r->ecx;
-    out->is_dir = is_dir;
-    out->size = size;
-    out->mtime = mtime;
+    out->is_dir = st.is_dir;
+    out->size = st.size;
+    out->mtime = st.mtime;
+    out->mode = st.mode;
+    out->uid = st.uid;
+    out->gid = st.gid;
   }
   r->eax = (uint32_t)rc;
+}
+
+void syscall_fs_chmod(struct registers *r)
+{
+  char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
+  struct fs_stat_info st;
+  if (copyin_str(r->ebx, name, sizeof name) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  join_cwd(name, abs, sizeof abs);
+  if (access_denied(r, abs, 0))
+    return;
+  if (fs_stat_ex(abs, &st) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  if (!perm_may_chmod(st.uid, sched_uid())) {
+    r->eax = (uint32_t)-PERM_EACCES;
+    return;
+  }
+  r->eax = (uint32_t)fs_chmod(abs, r->ecx);
+}
+
+/* uid/gid of -1 leave that field unchanged. */
+void syscall_fs_chown(struct registers *r)
+{
+  char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
+  struct fs_stat_info st;
+  if (copyin_str(r->ebx, name, sizeof name) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  join_cwd(name, abs, sizeof abs);
+  if (access_denied(r, abs, 0))
+    return;
+  if (fs_stat_ex(abs, &st) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  uint32_t uid = r->ecx == (uint32_t)-1 ? st.uid : r->ecx;
+  uint32_t gid = r->edx == (uint32_t)-1 ? st.gid : r->edx;
+  if (!perm_may_chown(st.uid, sched_uid(), sched_gid(), uid, gid)) {
+    r->eax = (uint32_t)-PERM_EACCES;
+    return;
+  }
+  r->eax = (uint32_t)fs_chown(abs, uid, gid);
+}
+
+/* A mask of -1 only queries. Returns the previous mask. */
+void syscall_fs_umask(struct registers *r)
+{
+  r->eax = r->ebx == (uint32_t)-1 ? sched_umask() : sched_set_umask(r->ebx);
+}
+
+void syscall_fs_access(struct registers *r)
+{
+  char name[SYS_PATH_MAX], abs[SYS_PATH_MAX];
+  if (copyin_str(r->ebx, name, sizeof name) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  join_cwd(name, abs, sizeof abs);
+  r->eax = (uint32_t)fs_access(abs, (int)(r->ecx & 7u));
 }
 
 void syscall_fs_statfs(struct registers *r)

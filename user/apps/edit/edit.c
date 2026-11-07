@@ -117,11 +117,12 @@ static void save_file(void)
       savebuf[out++] = s[k];
     savebuf[out++] = '\n';
   }
-  if (writefile(filename, savebuf, out) == 0) {
+  int wr = writefile(filename, savebuf, out);
+  if (wr == 0) {
     printf("wrote %s (%u lines)\n", filename, (unsigned)nlines);
     dirty = false;
   } else {
-    puts("write failed\n");
+    puts(wr == -EACCES ? "write: permission denied\n" : "write failed\n");
   }
 }
 
@@ -149,6 +150,10 @@ int main(int argc, char **argv)
     filename[63] = '\0';
 
   int n = readfile(filename, loadbuf, LOAD_MAX);
+  if (n == -EACCES) {
+    puts("edit: permission denied\n");
+    return 1;
+  }
   if (n > 0) {
     load_lines(n);
     printf("editing %s (%u lines). type 'h' for help.\n", filename, (unsigned)nlines);

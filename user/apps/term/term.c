@@ -5,7 +5,9 @@
 #include "crypto.h"    /* SHA-256 for passwd hashing (su/login/passwd) */
 #include "deflate.h"
 #include "gfx.h"
+#include "idnames.h"
 #include "lzss.h"
+#include "modeutil.h"
 #include "owos.h"
 #include <stdbool.h>
 
@@ -324,10 +326,20 @@ static void err(const char *a, const char *b)
   tputc('\n');
 }
 
+/* "cmd: <msg>path", with "permission denied: " in place of msg when rc is -EACCES */
+static void errc(int rc, const char *cmd, const char *msg, const char *path)
+{
+  char b[96];
+  strcpy(b, cmd);
+  strcat(b, ": ");
+  strcat(b, rc == -EACCES ? "permission denied: " : msg);
+  err(b, path);
+}
+
 static void bi_help(void)
 {
   tputs_c("OwOS shell.  Ctrl+C cancels the line / aborts a command.\n", FG_DIR);
-  tputs("files    ls cat cp mv rm mkdir rmdir stat pwd cd grep\n");
+  tputs("files    ls cat cp mv rm mkdir rmdir stat chmod chown umask pwd cd grep\n");
   tputs("archive  zip unzip gzip gunzip\n");
   tputs("system   uptime hostname whoami id cpuinfo meminfo date ps journal "
         "which\n");
@@ -343,23 +355,131 @@ static void bi_help(void)
   tputs("window (editor files clock browser ...) the prompt returns.\n");
 }
 
+static void tpad_dec(unsigned v, int width)
+{
+  int digits = 1;
+  for (unsigned t = v; t >= 10; t /= 10)
+    digits++;
+  for (; digits < width; digits++)
+    tputc(' ');
+  tdec(v);
+}
+
+static void t2(unsigned v)
+{
+  tputc((char)('0' + v / 10 % 10));
+  tputc((char)('0' + v % 10));
+}
+
+/* Packed owofs mtime as "YYYY-MM-DD HH:MM", or dashes when unstamped */
+static void tmtime(unsigned m)
+{
+  if (!m) {
+    tputs("   -            ");
+    return;
+  }
+  tdec(2000 + (m >> 26));
+  tputc('-');
+  t2((m >> 22) & 0xF);
+  tputc('-');
+  t2((m >> 17) & 0x1F);
+  tputc(' ');
+  t2((m >> 12) & 0x1F);
+  tputc(':');
+  t2((m >> 6) & 0x3F);
+}
+
+/* One `ls -l` row for the entry at `path` */
+static void ls_long_row(const struct idnames *names, const char *path, const char *name, int is_dir, unsigned size)
+{
+  struct statinfo st;
+  char mode[11], who[32], grp[32];
+  if (stat(path, &st) != 0) {
+    st.mode = 0;
+    st.uid = st.gid = 0;
+    st.mtime = 0;
+    st.size = size;
+    st.is_dir = is_dir;
+    strcpy(mode, "??????????");
+  } else {
+    perm_mode_str(st.mode, st.is_dir, mode);
+  }
+  idn_user_name(names, st.uid, who, sizeof who);
+  idn_group_name(names, st.gid, grp, sizeof grp);
+  tputs(mode);
+  tputc(' ');
+  tputs(who);
+  tputc(' ');
+  tputs(grp);
+  tputc(' ');
+  tpad_dec(st.is_dir ? 0 : st.size, 8);
+  tputc(' ');
+  tmtime(st.mtime);
+  tputc(' ');
+  tputs_c(name, st.is_dir ? FG_DIR : FG);
+  if (st.is_dir)
+    tputc('/');
+  tputc('\n');
+}
+
 static void bi_ls(int argc, char **argv)
 {
   char p[256];
-  abspath(argc > 1 ? argv[1] : ".", p);
+  bool long_fmt = false;
+  const char *target = ".";
+  for (int k = 1; k < argc; k++) {
+    if (argv[k][0] == '-' && argv[k][1]) {
+      for (const char *f = argv[k] + 1; *f; f++)
+        if (*f == 'l')
+          long_fmt = true;
+    } else {
+      target = argv[k];
+    }
+  }
+  abspath(target, p);
   struct dirent_u de;
   int i = 0;
   struct statinfo st;
-  if (stat(p, &st) != 0) {
-    err("ls: no such path: ", p);
+  int rc = stat(p, &st);
+  if (rc != 0) {
+    errc(rc, "ls", "no such path: ", p);
+    return;
+  }
+  rc = path_access(p, R_OK);
+  if (rc != 0) {
+    errc(rc, "ls", "cannot read: ", p);
+    return;
+  }
+  struct idnames names = {0};
+  if (long_fmt)
+    idn_load(&names);
+  if (!st.is_dir) {
+    if (long_fmt) {
+      ls_long_row(&names, p, target, 0, st.size);
+    } else {
+      tputs(target);
+      tputc('\n');
+    }
+    idn_free(&names);
     return;
   }
   while (readdir(p, i++, &de) == 1) {
-    tputs_c(de.name, de.is_dir ? FG_DIR : FG);
-    if (de.is_dir)
-      tputc('/');
-    tputc('\n');
+    if (!long_fmt) {
+      tputs_c(de.name, de.is_dir ? FG_DIR : FG);
+      if (de.is_dir)
+        tputc('/');
+      tputc('\n');
+      continue;
+    }
+    char child[320];
+    strcpy(child, p);
+    if (strcmp(p, "/") != 0)
+      strcat(child, "/");
+    strcat(child, de.name);
+    ls_long_row(&names, child, de.name, de.is_dir, de.size);
   }
+  if (long_fmt)
+    idn_free(&names);
 }
 
 static void bi_cat(int argc, char **argv)
@@ -372,7 +492,7 @@ static void bi_cat(int argc, char **argv)
   abspath(argv[1], p);
   int n = readfile(p, iobuf, sizeof iobuf);
   if (n < 0) {
-    err("cat: cannot read: ", argv[1]);
+    errc(n, "cat", "cannot read: ", argv[1]);
     return;
   }
   for (int i = 0; i < n; i++)
@@ -392,11 +512,12 @@ static void bi_cp(int argc, char **argv)
   abspath(argv[2], b);
   int n = readfile(a, iobuf, sizeof iobuf);
   if (n < 0) {
-    err("cp: cannot read source", 0);
+    errc(n, "cp", "cannot read source: ", argv[1]);
     return;
   }
-  if (writefile(b, iobuf, n) < 0)
-    err("cp: cannot write dest", 0);
+  int wr = writefile(b, iobuf, n);
+  if (wr < 0)
+    errc(wr, "cp", "cannot write dest: ", argv[2]);
 }
 
 static void bi_stat(int argc, char **argv)
@@ -405,21 +526,58 @@ static void bi_stat(int argc, char **argv)
     tputs("usage: stat <path>\n");
     return;
   }
-  char p[256];
+  char p[256], mode[11], who[32], grp[32];
   abspath(argv[1], p);
   struct statinfo st;
-  if (stat(p, &st) != 0) {
-    err("stat: no such path", 0);
+  int rc = stat(p, &st);
+  if (rc != 0) {
+    errc(rc, "stat", "no such path: ", p);
     return;
   }
+  struct idnames names;
+  idn_load(&names);
+  idn_user_name(&names, st.uid, who, sizeof who);
+  idn_group_name(&names, st.gid, grp, sizeof grp);
+  idn_free(&names);
+  perm_mode_str(st.mode, st.is_dir, mode);
   tputs(p);
-  if (st.is_dir)
-    tputs("  <dir>\n");
-  else {
-    tputs("  ");
+  tputs(st.is_dir ? "  <dir>  " : "  ");
+  if (!st.is_dir) {
     tdec(st.size);
-    tputs(" bytes\n");
+    tputs(" bytes  ");
   }
+  tputs(mode);
+  tputs(" (0");
+  tdec((st.mode >> 9 & 7) * 1000 + (st.mode >> 6 & 7) * 100 + (st.mode >> 3 & 7) * 10 + (st.mode & 7));
+  tputs(") ");
+  tputs(who);
+  tputc(':');
+  tputs(grp);
+  tputs("  ");
+  tmtime(st.mtime);
+  tputc('\n');
+}
+
+static void bi_umask(int argc, char **argv)
+{
+  if (argc < 2) {
+    unsigned m = umask((unsigned)-1);
+    tputc('0');
+    tputc((char)('0' + (m >> 6 & 7)));
+    tputc((char)('0' + (m >> 3 & 7)));
+    tputc((char)('0' + (m & 7)));
+    tputc('\n');
+    return;
+  }
+  unsigned v = 0;
+  for (const char *c = argv[1]; *c; c++) {
+    if (*c < '0' || *c > '7' || v > 077) {
+      err("umask: invalid mask: ", argv[1]);
+      return;
+    }
+    v = v * 8 + (unsigned)(*c - '0');
+  }
+  umask(v);
 }
 
 /* info builtins: read /proc and render (no kernel-shell bridge) */
@@ -473,8 +631,8 @@ static void bi_which(int argc, char **argv)
   static const char *const ring3[] = {
       "help",    "clear",    "echo",     "pwd",     "cd",     "ls",     "cat",      "cp",      "mv",
       "stat",    "mkdir",    "rmdir",    "rm",      "exit",   "uptime", "hostname", "whoami",  "which",
-      "cpuinfo", "meminfo",  "date",     "storage", "sleep",  "id",     "useradd",  "userdel", "passwd",
-      "usermod", "groupadd", "groupdel", "users",   "groups", "su",     "login",    "logout",
+      "umask",  "cpuinfo", "meminfo",  "date",     "storage", "sleep",  "id",       "useradd", "userdel",
+      "passwd", "usermod", "groupadd", "groupdel", "users",   "groups", "su",       "login",   "logout",
   };
   if (argc < 2) {
     tputs("usage: which <name>\n");
@@ -506,7 +664,10 @@ static void bi_loadkeys(int argc, char **argv)
     tputs("usage: loadkeys <us|fr>\n");
     return;
   }
-  if (writefile("/sys/class/input/kbd0/layout", argv[1], strlen(argv[1])) < 0)
+  int rc = writefile("/sys/class/input/kbd0/layout", argv[1], strlen(argv[1]));
+  if (rc == -EACCES)
+    err("loadkeys: permission denied", 0);
+  else if (rc < 0)
     err("loadkeys: unknown layout (try us or fr)", 0);
   else {
     tputs("keyboard layout: ");
@@ -655,7 +816,7 @@ static void do_compress(int argc, char **argv, const char *suffix, const char *c
   abspath(argv[1], sp);
   int n = readfile(sp, iobuf, sizeof iobuf);
   if (n < 0) {
-    err(cmd, ": no such file");
+    err(cmd, n == -EACCES ? ": permission denied" : ": no such file");
     return;
   }
   if (bound((uint32_t)n) > sizeof cbuf) {
@@ -674,8 +835,9 @@ static void do_compress(int argc, char **argv, const char *suffix, const char *c
     abspath(argv[1], dp);
     strcat(dp, suffix);
   }
-  if (writefile(dp, cbuf, clen) < 0) {
-    err(cmd, ": write failed");
+  int wr = writefile(dp, cbuf, clen);
+  if (wr < 0) {
+    err(cmd, wr == -EACCES ? ": permission denied" : ": write failed");
     return;
   }
   tputs(argv[1]);
@@ -707,7 +869,7 @@ static void do_decompress(int argc, char **argv, const char *suffix, const char 
   abspath(argv[1], sp);
   int n = readfile(sp, iobuf, sizeof iobuf);
   if (n < 0) {
-    err(cmd, ": no such file");
+    err(cmd, n == -EACCES ? ": permission denied" : ": no such file");
     return;
   }
   int o = orig((const uint8_t *)iobuf, (uint32_t)n);
@@ -735,8 +897,9 @@ static void do_decompress(int argc, char **argv, const char *suffix, const char 
     base[sl - xl] = '\0';
     abspath(base, dp);
   }
-  if (writefile(dp, cbuf, dlen) < 0) {
-    err(cmd, ": write failed");
+  int wr = writefile(dp, cbuf, dlen);
+  if (wr < 0) {
+    err(cmd, wr == -EACCES ? ": permission denied" : ": write failed");
     return;
   }
   tputs(argv[1]);
@@ -758,7 +921,7 @@ static void bi_grep(int argc, char **argv)
   abspath(argv[2], p);
   int n = readfile(p, iobuf, sizeof iobuf);
   if (n < 0) {
-    err("grep: cannot read ", argv[2]);
+    errc(n, "grep", "cannot read ", argv[2]);
     return;
   }
   const char *pat = argv[1];
@@ -839,7 +1002,7 @@ static void render_child(const char *path, char **argv, int argc, int interactiv
   if (headless) {
     int pid = interactive ? spawn_cap_io(path, argv, argc, &rfd, &wfd) : spawn_cap(path, argv, argc, &rfd);
     if (pid < 0) {
-      err("failed to launch ", path);
+      err(pid == -EACCES ? "permission denied: " : "failed to launch ", path);
       return;
     }
     for (;;) {
@@ -869,7 +1032,7 @@ static void render_child(const char *path, char **argv, int argc, int interactiv
   }
   int pid = interactive ? spawn_cap_io(path, argv, argc, &rfd, &wfd) : spawn_cap(path, argv, argc, &rfd);
   if (pid < 0) {
-    err("failed to launch ", path);
+    err(pid == -EACCES ? "permission denied: " : "failed to launch ", path);
     return;
   }
   int closing = 0, intr = 0;
@@ -939,6 +1102,20 @@ static int load_file(const char *path, char *buf, int max)
 }
 
 static int save_file(const char *path, const char *buf) { return writefile(path, buf, strlen(buf)); }
+
+/* /etc/passwd into pbuf; if the caller may not read it, only their own line (from /proc/user) */
+static void load_passwd(void)
+{
+  if (load_file("/etc/passwd", pbuf, sizeof pbuf) >= 0)
+    return;
+  char name[32], hm[80];
+  int uid = getuid(), gid = getgid();
+  if (!user_ident(name, sizeof name, hm, sizeof hm) || gid < 0) {
+    pbuf[0] = '\0';
+    return;
+  }
+  snprintf(pbuf, sizeof pbuf, "%s::%d:%d:%s\n", name, uid, gid, hm);
+}
 
 /* Unsigned int -> decimal string */
 static void u2s(unsigned v, char *out)
@@ -1175,7 +1352,10 @@ static void cmd_useradd(int argc, char **argv)
   char hp[64];
   strcpy(hp, "/home/");
   strcat(hp, name);
-  mkdir(hp);
+  if (mkdir(hp) == 0) {
+    chown(hp, (int)uid, (int)gid);
+    chmod(hp, 0700);
+  }
 
   tputs("useradd: created ");
   tputs(name);
@@ -1293,8 +1473,8 @@ static void cmd_passwd(int argc, char **argv)
     return;
   }
 
-  if (strcmp(target, username) != 0 && getuid() != 0) {
-    err("passwd: only root can change another user's password", 0);
+  if (getuid() != 0) {
+    err("passwd: permission denied (/etc/passwd is root-only)", 0);
     return;
   }
 
@@ -1475,10 +1655,7 @@ static void cmd_usermod(int argc, char **argv)
 /* users: list every account */
 static void cmd_users(void)
 {
-  if (load_file("/etc/passwd", pbuf, sizeof pbuf) < 0) {
-    err("users: /etc/passwd unreadable", 0);
-    return;
-  }
+  load_passwd();
   for (char *line = pbuf; *line;) {
     char nm[32], uid[16], hm[80];
     line_field(line, 0, nm, sizeof nm);
@@ -1504,7 +1681,7 @@ static void user_groups(const char *user, char *out, int max)
 {
   out[0] = '\0';
   int o = 0;
-  load_file("/etc/passwd", pbuf, sizeof pbuf);
+  load_passwd();
   char *p = find_line(pbuf, user);
   unsigned pgid = 0;
   if (p) {
@@ -1543,7 +1720,7 @@ static void user_groups(const char *user, char *out, int max)
 static void cmd_groups(int argc, char **argv)
 {
   const char *u = argc >= 2 ? argv[1] : username;
-  load_file("/etc/passwd", pbuf, sizeof pbuf);
+  load_passwd();
   if (!find_line(pbuf, u)) {
     err("groups: no such user: ", u);
     return;
@@ -1559,7 +1736,7 @@ static void cmd_groups(int argc, char **argv)
 static void cmd_id(int argc, char **argv)
 {
   const char *u = argc >= 2 ? argv[1] : username;
-  load_file("/etc/passwd", pbuf, sizeof pbuf);
+  load_passwd();
   char *p = find_line(pbuf, u);
   if (!p) {
     err("id: no such user: ", u);
@@ -1728,10 +1905,11 @@ static void run(const char *orig)
       char p[256];
       abspath(argv[1], p);
       struct statinfo st;
-      if (stat(p, &st) == 0 && st.is_dir)
+      int rc = stat(p, &st);
+      if (rc == 0 && st.is_dir && (rc = path_access(p, X_OK)) == 0)
         strcpy(cwd, p);
       else
-        err("cd: not a directory: ", argv[1]);
+        errc(rc, "cd", "not a directory: ", argv[1]);
     }
   } else if (!strcmp(c, "ls"))
     bi_ls(argc, argv);
@@ -1741,26 +1919,31 @@ static void run(const char *orig)
     bi_cp(argc, argv);
   else if (!strcmp(c, "stat"))
     bi_stat(argc, argv);
+  else if (!strcmp(c, "umask"))
+    bi_umask(argc, argv);
   else if (!strcmp(c, "mkdir")) {
     for (int k = 1; k < argc; k++) {
       char p[256];
       abspath(argv[k], p);
-      if (mkdir(p) < 0)
-        err("mkdir: failed: ", argv[k]);
+      int rc = mkdir(p);
+      if (rc < 0)
+        errc(rc, "mkdir", "failed: ", argv[k]);
     }
   } else if (!strcmp(c, "rmdir")) {
     for (int k = 1; k < argc; k++) {
       char p[256];
       abspath(argv[k], p);
-      if (rmdir(p) < 0)
-        err("rmdir: failed: ", argv[k]);
+      int rc = rmdir(p);
+      if (rc < 0)
+        errc(rc, "rmdir", "failed: ", argv[k]);
     }
   } else if (!strcmp(c, "rm")) {
     for (int k = 1; k < argc; k++) {
       char p[256];
       abspath(argv[k], p);
-      if (unlink(p) < 0)
-        err("rm: failed: ", argv[k]);
+      int rc = unlink(p);
+      if (rc < 0)
+        errc(rc, "rm", "failed: ", argv[k]);
     }
   } else if (!strcmp(c, "mv")) {
     if (argc < 3)
@@ -1769,8 +1952,9 @@ static void run(const char *orig)
       char a[256], b[256];
       abspath(argv[1], a);
       abspath(argv[2], b);
-      if (rename(a, b) < 0)
-        err("mv: failed", 0);
+      int rc = rename(a, b);
+      if (rc < 0)
+        errc(rc, "mv", "failed: ", argv[1]);
     }
   } else if (!strcmp(c, "exit")) {
     win_close(win);

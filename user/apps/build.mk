@@ -11,7 +11,7 @@
 user/apps/browser/%.o: UCFLAGS += -Iuser/apps/browser
 
 GUI_APPS := about browser calc cliphist clock compositor editor files imgview notifyd player settings term
-CLI_APPS := aac alac base64 cast clipd curl dhcpcd dig edit h264 init json lspci mdnsd mediactl mediad mpeg neofetch notifysend ntpd ping smbd ssh sshd stun torrent uname unrar vmclipd webp
+CLI_APPS := aac alac base64 cast chmod chown clipd curl dhcpcd dig edit h264 init json lspci mdnsd mediactl mediad mpeg neofetch notifysend ntpd ping smbd ssh sshd stun torrent uname unrar vmclipd webp
 APPS := $(GUI_APPS) $(CLI_APPS)
 
 # --- per-app libraries ---------------------------------------------------

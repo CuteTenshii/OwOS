@@ -224,6 +224,14 @@ int rename(const char *old, const char *neu) { return syscall(SYS_RENAME, (int)o
 
 int stat(const char *path, struct statinfo *out) { return syscall(SYS_STAT, (int)path, (int)out, 0); }
 
+int chmod(const char *path, unsigned mode) { return syscall(SYS_CHMOD, (int)path, (int)mode, 0); }
+
+int chown(const char *path, int uid, int gid) { return syscall(SYS_CHOWN, (int)path, uid, gid); }
+
+unsigned umask(unsigned mask) { return (unsigned)syscall(SYS_UMASK, (int)mask, 0, 0); }
+
+int path_access(const char *path, int mode) { return syscall(SYS_ACCESS, (int)path, mode, 0); }
+
 int statfs(const char *path, struct statfs_info *out) { return syscall(SYS_STATFS, (int)path, (int)out, 0); }
 
 int spawn(const char *path, const char *arg) { return syscall(SYS_SPAWN, (int)path, (int)arg, 0); }
@@ -365,10 +373,57 @@ static void passwd_field(const char *s, const char *end, int idx, char *out, int
   out[i] = '\0';
 }
 
+/* "uid gid name home" of the caller from /proc/user (readable even without /etc/passwd) */
+static int proc_user(unsigned *uid, unsigned *gid, char *name, int nmax, char *home, int hmax)
+{
+  char b[256];
+  int n = readfile("/proc/user", b, (int)sizeof b - 1);
+  if (n <= 0)
+    return 0;
+  b[n] = '\0';
+  const char *p = b;
+  unsigned id[2] = {0, 0};
+  for (int k = 0; k < 2; k++) {
+    for (; *p >= '0' && *p <= '9'; p++)
+      id[k] = id[k] * 10 + (unsigned)(*p - '0');
+    while (*p == ' ')
+      p++;
+  }
+  int i = 0;
+  while (*p && *p != ' ' && *p != '\n' && i < nmax - 1)
+    name[i++] = *p++;
+  name[i] = '\0';
+  while (*p == ' ')
+    p++;
+  i = 0;
+  while (*p && *p != '\n' && i < hmax - 1)
+    home[i++] = *p++;
+  home[i] = '\0';
+  *uid = id[0];
+  *gid = id[1];
+  return 1;
+}
+
+int getgid(void)
+{
+  unsigned uid, gid;
+  char name[2], home[2];
+  return proc_user(&uid, &gid, name, sizeof name, home, sizeof home) ? (int)gid : -1;
+}
+
 /* Resolve the calling process's login from its uid via /etc/passwd (name:pwhash:uid:gid:home) */
 int user_ident(char *name, int nmax, char *home, int hmax)
 {
   static char pw[2048];
+  unsigned pu, pg;
+  char pname[64], phome[256];
+  if (proc_user(&pu, &pg, pname, sizeof pname, phome, sizeof phome)) {
+    if (name)
+      strlcpy(name, pname, nmax);
+    if (home)
+      strlcpy(home, phome, hmax);
+    return 1;
+  }
   int uid = getuid();
   int n = readfile("/etc/passwd", pw, (int)sizeof pw - 1);
   if (n <= 0)

@@ -109,6 +109,25 @@ int fs_enum(int idx, char *name, uint32_t *size, uint32_t *mtime);
  * layout. */
 int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime);
 
+/* stat plus owner and mode; pseudo-fs report fixed modes, other volumes a mount default. */
+struct fs_stat_info {
+  int is_dir;
+  uint32_t size, mtime, mode, uid, gid;
+};
+int fs_stat_ex(const char *path, struct fs_stat_info *st);
+
+/* Set mode/owner on an owofs entry, unchecked. 0, or -1 if absent, root or not owofs. */
+int fs_chmod(const char *path, uint32_t mode);
+int fs_chown(const char *path, uint32_t uid, uint32_t gid);
+
+/* Permission check for the calling task: 0, -13 (EACCES), or -1 if a component is absent. */
+#define FS_R 4
+#define FS_W 2
+#define FS_X 1
+#define FS_ACC_ENTRY 0x10
+#define FS_ACC_CREATE 0x20
+int fs_access(const char *path, int want);
+
 /* Enumerate the children of directory `path` (NULL/""/"/" = root). For the
  * idx-th child (0-based, slot order) fill name (short component, >= 18 bytes),
  * *is_dir, *size, *mtime and return 1; return 0 past the last child or if

@@ -442,7 +442,41 @@ static void delete_entry(int id, const char *name, bool is_dir)
     force_relist = 1;
   } else
     dialog_message(id, "Delete failed",
-                   is_dir ? "The folder could not be removed (is it empty?)." : "The file could not be removed.");
+                   ok == -EACCES ? "Permission denied."
+                   : is_dir      ? "The folder could not be removed (is it empty?)."
+                                 : "The file could not be removed.");
+  seq++;
+}
+
+static void rename_entry(int id, const char *name)
+{
+  char out[96], msg[128];
+  if (feq(name, ".."))
+    return;
+  if (dialog_prompt(id, "Rename", "New name:", name, out, sizeof out) != DLG_R_OK || !out[0] || feq(out, name))
+    return;
+  const char *err = NULL;
+  for (const char *p = out; *p; p++)
+    if (*p == '/')
+      err = "The name cannot contain '/'.";
+  char from[256], to[256];
+  struct statinfo st;
+  full_path(name, from, sizeof from);
+  full_path(out, to, sizeof to);
+  if (!err && stat(to, &st) != -1)
+    err = "An entry with that name already exists.";
+  if (!err) {
+    int rc = rename(from, to);
+    if (rc == 0) {
+      force_relist = 1;
+      sel = -1;
+    } else
+      err = rc == -EACCES ? "Permission denied." : "The entry could not be renamed.";
+  }
+  if (err) {
+    snprintf(msg, sizeof msg, "%s", err);
+    dialog_message(id, "Rename failed", msg);
+  }
   seq++;
 }
 
@@ -1034,6 +1068,9 @@ static void key(int id, int k)
     seq++;
   } else if (k == '\n') {
     activate(id);
+  } else if (k == KEY_F2) {
+    if (sel >= 0 && sel < fent_count)
+      rename_entry(id, fent_buf[sel].name);
   } else if (k == KEY_DELETE) {
     if (sel >= 0 && sel < fent_count) {
       struct fent *fe = &fent_buf[sel];

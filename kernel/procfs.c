@@ -137,6 +137,23 @@ static void gen_date(struct pb *b)
   pc(b, '\n');
 }
 
+/* /proc/user: "uid gid name home" of the calling task, readable without /etc/passwd */
+static void gen_user(struct pb *b)
+{
+  char name[USER_NAME_MAX], home[USER_HOME_MAX];
+  uint32_t uid = sched_uid();
+  users_name_of(uid, name, sizeof name);
+  users_home_of(uid, home, sizeof home);
+  pu(b, uid);
+  pc(b, ' ');
+  pu(b, sched_gid());
+  pc(b, ' ');
+  ps(b, name);
+  pc(b, ' ');
+  ps(b, home);
+  pc(b, '\n');
+}
+
 static void gen_owofs(struct pb *b)
 {
   ps(b, "files ");
@@ -222,7 +239,7 @@ static void gen_usb(struct pb *b)
 
 /* The entry names, in listing order. Single source of truth for read + list. */
 static const char *const entries[] = {
-    "cpuinfo", "meminfo", "uptime", "tasks", "date", "owofs", "storage", "pci", "journal", "usb",
+    "cpuinfo", "meminfo", "uptime", "tasks", "date", "owofs", "storage", "pci", "journal", "usb", "user",
 };
 #define NENTRIES ((int)(sizeof entries / sizeof entries[0]))
 
@@ -245,6 +262,9 @@ int procfs_list(int idx, char *name, int max)
 int procfs_size(const char *sub)
 {
   static char scratch[8192];
+  const char *leaf = sub[0] == '/' ? sub + 1 : sub;
+  if (streq(leaf, "hostclip") || streq(leaf, "login"))
+    return 0; /* control nodes: a read would consume host state */
   int n = procfs_read(sub, scratch, (int)sizeof scratch);
   return n < 0 ? 0 : n;
 }
@@ -257,7 +277,7 @@ int procfs_kind(const char *sub)
     sub++;
   if (!sub[0])
     return 1; /* /proc itself                      */
-  if (streq(sub, "hostclip"))
+  if (streq(sub, "hostclip") || streq(sub, "login"))
     return 0; /* hidden VMware-clipboard device node */
   for (int i = 0; i < NENTRIES; i++)
     if (streq(sub, entries[i]))
@@ -310,6 +330,8 @@ int procfs_read(const char *sub, char *buf, int max)
     gen_journal(&b);
   else if (streq(sub, "usb"))
     gen_usb(&b);
+  else if (streq(sub, "user"))
+    gen_user(&b);
   else
     return -1;
 

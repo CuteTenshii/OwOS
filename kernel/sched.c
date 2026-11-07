@@ -70,6 +70,7 @@ typedef struct task {
   char cwd[TASK_CWD_MAX]; /* working dir; relative path syscalls join here */
   uint32_t uid;           /* owning user id (credentials; inherited like cwd) */
   uint32_t gid;           /* owning primary group id */
+  uint32_t umask;
   struct task *next;
   int running_cpu;
   uint8_t kernel_lock_depth;
@@ -272,6 +273,7 @@ void sched_init(void)
   t->wake_tick = 0;
   sig_init(t);
   t->uid = t->gid = 0; /* the boot session runs as root */
+  t->umask = 022;
   cwd_set(t->cwd, "/");
   t->next = t;
   t->running_cpu = 0;
@@ -322,6 +324,7 @@ void sched_create_thread(const char *name, void (*entry)(void))
   t->kstack_top = 0;
   t->state = TASK_RUNNABLE;
   t->self_reap = true; /* main_task never waitpid's us: self-reap on exit */
+  t->umask = 022;
 
   uint8_t *stack = kmalloc(KSTACK_SIZE);
   if (!stack) { /* heap exhausted: don't enqueue a bogus stack */
@@ -386,6 +389,7 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
   cwd_set(t->cwd, current->cwd); /* inherit the spawner's cwd by default */
   t->uid = current->uid;         /* and its credentials (uid/gid) */
   t->gid = current->gid;
+  t->umask = current->umask;
 
   uint8_t *kstack = kmalloc(UKSTACK_SIZE);
   if (!kstack) { /* heap exhausted: fail rather than enqueue a task whose saved esp points into low memory */
@@ -486,6 +490,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
   cwd_set(t->cwd, current->cwd);
   t->uid = current->uid;
   t->gid = current->gid;
+  t->umask = current->umask;
 
   uint8_t *kstack = kmalloc(UKSTACK_SIZE);
   if (!kstack) {
@@ -581,6 +586,7 @@ int sched_fork(struct registers *r)
   cwd_set(t->cwd, current->cwd);
   t->uid = current->uid;
   t->gid = current->gid;
+  t->umask = current->umask;
 
   /* The child inherits the parent's open files (Unix semantics). */
   for (int i = 0; i < MAX_FD; i++) {
@@ -760,9 +766,15 @@ void sched_set_cwd_self(const char *path) { cwd_set(current->cwd, path); }
 /* The current task's working directory (an absolute path), for syscall.c. */
 const char *sched_cwd(void) { return current->cwd; }
 
-/* Per-process credentials: getters, and a setter for login/su. */
-uint32_t sched_uid(void) { return current->uid; }
-uint32_t sched_gid(void) { return current->gid; }
+uint32_t sched_uid(void) { return current ? current->uid : 0; }
+uint32_t sched_gid(void) { return current ? current->gid : 0; }
+uint32_t sched_umask(void) { return current ? current->umask : 022; }
+uint32_t sched_set_umask(uint32_t mask)
+{
+  uint32_t old = current->umask;
+  current->umask = mask & 0777;
+  return old;
+}
 void sched_set_creds_self(uint32_t uid, uint32_t gid)
 {
   current->uid = uid;

@@ -288,12 +288,26 @@ struct statinfo {
   int is_dir;
   unsigned size;
   unsigned mtime;
+  unsigned mode; /* rwx for owner/group/other plus sticky (01000) */
+  unsigned uid;
+  unsigned gid;
 };
 int mkdir(const char *path);
 int rmdir(const char *path);
 int unlink(const char *path); /* delete a file */
 int rename(const char *old, const char *neu);
 int stat(const char *path, struct statinfo *out); /* -1 if path absent */
+
+/* Denied path syscalls return -13 (EACCES); other failures stay -1. */
+#define EACCES 13
+#define F_OK 0
+#define R_OK 4
+#define W_OK 2
+#define X_OK 1
+int chmod(const char *path, unsigned mode);    /* owner or root; 0/-1/-13 */
+int chown(const char *path, int uid, int gid); /* root only (owner may chgrp to own gid); -1 keeps a field */
+unsigned umask(unsigned mask);                 /* set the creation mask, returns the old one (-1 queries) */
+int path_access(const char *path, int mode);   /* 0 if the caller may, -1 absent, -13 denied */
 
 /* Filesystem usage of the volume backing `path` (any path selects the one owofs volume today) */
 struct statfs_info {
@@ -320,6 +334,7 @@ int power(int action); /* 0 = shut down, 1 = reboot, 2 = suspend (returns on res
 
 /* Identity: numeric uid from the kernel; name/home resolved from /etc/passwd */
 int getuid(void);
+int getgid(void);                                           /* primary gid of this process, -1 if unknown */
 int user_ident(char *name, int nmax, char *home, int hmax); /* 1 if found */
 int gethostname(char *buf, int max);                        /* /etc/hostname (default "owos") */
 int sethostname(const char *name);                          /* persist /etc/hostname; 0/-1 */

@@ -71,23 +71,40 @@ static void shell_interrupt_locked(void)
 }
 
 /* Install an embedded blob to owofs when absent or when its size differs from the built-in one. */
-static void install_blob(const char *path, const unsigned char *start, const unsigned char *end)
+static void install_blob(const char *path, const unsigned char *start, const unsigned char *end, uint32_t mode)
 {
   uint32_t len = (uint32_t)(end - start);
   if (fs_size(path) == (int)len)
     return;        /* already up to date */
   fs_delete(path); /* no-op if absent; drop stale copy */
   fs_create(path, start, len);
+  fs_chmod(path, mode);
 }
 
 /* Install an embedded blob given its disk path and objcopy symbol base; INSTALL_APP is the /bin form. */
-#define INSTALL_FILE(diskpath, symbase)                                                                                \
+#define INSTALL_FILE(diskpath, symbase, mode)                                                                          \
   do {                                                                                                                 \
     extern const unsigned char symbase##_start[];                                                                      \
     extern const unsigned char symbase##_end[];                                                                        \
-    install_blob(diskpath, symbase##_start, symbase##_end);                                                            \
+    install_blob(diskpath, symbase##_start, symbase##_end, mode);                                                      \
   } while (0)
-#define INSTALL_APP(nm) INSTALL_FILE("/bin/" #nm, _binary_app_##nm)
+#define INSTALL_APP(nm) INSTALL_FILE("/bin/" #nm, _binary_app_##nm, 0755)
+
+/* Create a directory / file only if absent, with an explicit mode (the boot session runs as root). */
+static void mkdir_mode(const char *path, uint32_t mode)
+{
+  if (fs_mkdir(path) == 0)
+    fs_chmod(path, mode);
+}
+
+static void seed_file(const char *path, const char *data, uint32_t len, uint32_t mode)
+{
+  char probe;
+  if (fs_read(path, &probe, 0) >= 0)
+    return;
+  fs_create(path, data, len);
+  fs_chmod(path, mode);
+}
 
 /* CPU-bound thread that never yields (preemption test). */
 static void spinner(void)
@@ -258,7 +275,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   con_printf("mmdbg: path=%s mmapflag=%u entries=%u firmware=%s\n",
              magic == MULTIBOOT2_BOOTLOADER_MAGIC ? "mb2" : "mb1", (mbi->flags & MULTIBOOT_FLAG_MMAP) ? 1 : 0,
-             mbi->mmap_length / 24, firmware_name());
+             mbi->mmap_length / 24, /* synth/E820 entries are 24 bytes  */
+             firmware_name());
 
   pmm_init(mbi);
   con_printf("pmm: %u MiB RAM detected", pmm_installed_kib() / 1024);
@@ -327,27 +345,23 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   /* Install the embedded programs onto the disk if absent. */
   {
-    char probe;
-    fs_mkdir("/bin");
-    fs_mkdir("/home");
-    fs_mkdir("/home/root");
-    fs_mkdir("/home/root/Downloads");
+    mkdir_mode("/bin", 0755);
+    mkdir_mode("/tmp", 01777);
+    mkdir_mode("/home", 0755);
+    mkdir_mode("/home/root", 0700);
+    mkdir_mode("/home/root/Downloads", 0755);
 
     /* Seed passwd (name:pwhash:uid:gid:home) and group if absent. */
-    fs_mkdir("/etc");
-    fs_mkdir("/etc/fonts");
-    INSTALL_FILE("/etc/fonts/LiberationSans-Regular.ttf", _binary_fonts_LiberationSans_Regular_ttf);
-    INSTALL_FILE("/etc/fonts/LiberationMono-Regular.ttf", _binary_fonts_LiberationMono_Regular_ttf);
-    if (fs_read("/etc/passwd", &probe, 0) < 0)
-      fs_create("/etc/passwd", "root::0:0:/home/root\n", 21);
-    if (fs_read("/etc/group", &probe, 0) < 0)
-      fs_create("/etc/group", "root:0:\n", 8);
+    mkdir_mode("/etc", 0755);
+    mkdir_mode("/etc/fonts", 0755);
+    INSTALL_FILE("/etc/fonts/LiberationSans-Regular.ttf", _binary_fonts_LiberationSans_Regular_ttf, 0644);
+    INSTALL_FILE("/etc/fonts/LiberationMono-Regular.ttf", _binary_fonts_LiberationMono_Regular_ttf, 0644);
+    seed_file("/etc/passwd", "root::0:0:/home/root\n", 21, 0600);
+    seed_file("/etc/group", "root:0:\n", 8, 0644);
     /* mdnsd advertisements, one "type port [txt...]" per line. */
-    if (fs_read("/etc/mdns.conf", &probe, 0) < 0)
-      fs_create("/etc/mdns.conf", "_ssh._tcp 22\n_smb._tcp 445\n", 26);
+    seed_file("/etc/mdns.conf", "_ssh._tcp 22\n_smb._tcp 445\n", 26, 0644);
     /* init's service table, one /bin daemon per line; compositor first. */
-    if (fs_read("/etc/inittab", &probe, 0) < 0)
-      fs_create("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\nntpd\nmediad\n", 41);
+    seed_file("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\nntpd\nmediad\n", 41, 0644);
     users_init();
     INSTALL_APP(edit);
     INSTALL_APP(curl);
@@ -389,9 +403,11 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(mediad);
     INSTALL_APP(mediactl);
     INSTALL_APP(cast);
+    INSTALL_APP(chmod);
     INSTALL_APP(unrar);
+    INSTALL_APP(chown);
     INSTALL_APP(init);
-    INSTALL_FILE("/bin/notify-send", _binary_app_notifysend);
+    INSTALL_FILE("/bin/notify-send", _binary_app_notifysend, 0755);
   }
   con_write("usermode: ready ('run curl <url>').\n");
 

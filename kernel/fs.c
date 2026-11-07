@@ -5,11 +5,14 @@
 #include "blk.h"
 #include "console.h"
 #include "fs.h"
+#include "fsmigrate.h"
 #include "fsmount.h"
 #include "heap.h"
 #include "kstring.h"
+#include "perm.h"
 #include "procfs.h"
 #include "rtc.h"
+#include "sched.h"
 #include "sysfs.h"
 
 /* Mount table: removable volumes appear under "/media/<name>"; /dev, /proc and /sys are permanent
@@ -24,6 +27,8 @@ struct mnt {
   char dev[16];   /* "usb0", "proc"                      */
   const struct fs_ops *ops;
   void *inst;
+  uint16_t dir_mode; /* mount-wide mode for volumes without permissions */
+  uint16_t file_mode;
 };
 
 static struct mnt mtab[MAX_MOUNTS];
@@ -107,8 +112,8 @@ static bool is_media_root(const char *path)
 }
 
 #define SECTOR_SIZE 512
-#define FS_MAGIC 0x4F574F38u /* "OWO8" (growable directory; no fixed cap) */
-#define FS_NAME_LEN 64
+#define FS_MAGIC FSM_MAGIC_V9
+#define FS_NAME_LEN FSM_NAME_LEN
 #define SUPER_LBA 0
 #define RESERVED_SECTORS 1
 #define DIR_INIT_ENTRIES 256
@@ -117,21 +122,12 @@ static bool is_media_root(const char *path)
 #define FS_MAX_CLUSTERS                                                                                                \
   262144 /* fixed 32 KiB allocation bitmap; cluster size scales with disk capacity so any size fits */
 
-#define FS_DIR_FLAG 0x01u /* dirent.flags: entry is a directory    */
-#define FS_ROOT 0xFFFFu   /* dirent.parent value meaning "in root" */
+#define FS_DIR_FLAG FSM_DIR_FLAG /* dirent.flags: entry is a directory    */
+#define FS_ROOT FSM_ROOT         /* dirent.parent value meaning "in root" */
 #define FS_SLOT_ROOT (-2)
 
 /* Directory entries form a tree: each names one component and points at its parent slot (FS_ROOT at top;
  * the root has no dirent). */
-struct dirent {
-  char name[FS_NAME_LEN];
-  uint8_t flags;
-  uint8_t reserved;
-  uint16_t parent; /* containing dir slot, or FS_ROOT         */
-  uint32_t size;   /* 0 for directories                       */
-  uint32_t start;  /* first data sector (0 for directories)   */
-  uint32_t mtime;  /* packed wall-clock time (see pack_now)   */
-};
 
 /* The directory is a growable extent allocated like a file; free_slot() relocates it when full. */
 struct super {
@@ -142,7 +138,7 @@ struct super {
 };
 
 static struct super sb;
-static struct dirent *dir; /* heap-allocated mirror of the directory  */
+static struct owofs_dirent *dir; /* heap-allocated mirror of the directory  */
 static uint32_t dir_cap;   /* entries the current extent/mirror hold  */
 static bool mounted;
 
@@ -188,7 +184,7 @@ static void free_extent(uint32_t start, uint32_t size)
 }
 
 /* Directory entries that fit in the given sectors. */
-static uint32_t entries_for(uint32_t sectors) { return sectors * SECTOR_SIZE / (uint32_t)sizeof(struct dirent); }
+static uint32_t entries_for(uint32_t sectors) { return sectors * SECTOR_SIZE / (uint32_t)sizeof(struct owofs_dirent); }
 
 /* Pick the cluster size so the disk fits in FS_MAX_CLUSTERS bits; a partial final cluster is unused. */
 static void set_capacity(void)
@@ -307,14 +303,14 @@ static int grow_dir(void)
   if (new_start == 0)
     return -1;
   uint32_t new_bytes = new_sectors * SECTOR_SIZE;
-  struct dirent *nd = kmalloc(new_bytes);
+  struct owofs_dirent *nd = kmalloc(new_bytes);
   if (!nd) {
     run_mark(new_start, new_sectors, 0);
     return -1;
   }
 
   uint8_t *d = (uint8_t *)nd, *s = (uint8_t *)dir;
-  uint32_t old_bytes = dir_cap * (uint32_t)sizeof(struct dirent);
+  uint32_t old_bytes = dir_cap * (uint32_t)sizeof(struct owofs_dirent);
   memset(d, 0, new_bytes);
   memcpy(d, s, old_bytes);
 
@@ -803,6 +799,21 @@ static const struct fs_ops sysfs_ops = {
     .rmdir = NULL,
 };
 
+/* Mode and owner of `sub` inside mount m: fixed for the pseudo-fs, the real inode for ext, else the mount default. */
+static void mnt_attr(struct mnt *m, const char *sub, bool is_dir, uint32_t *mode, uint32_t *uid, uint32_t *gid)
+{
+  *uid = *gid = 0;
+  const char *leaf = (sub[0] == '/') ? sub + 1 : sub;
+  if (m->ops == &devfs_ops)
+    *mode = is_dir ? 0555 : 0644;
+  else if (m->ops == &procfs_ops)
+    *mode = is_dir ? 0555 : s_eq(leaf, "login") ? 0666 : s_eq(leaf, "hostclip") ? 0644 : 0444;
+  else if (m->ops == &sysfs_ops)
+    *mode = is_dir ? 0555 : sysfs_writable(sub) ? 0644 : 0444;
+  else if (!m->ops->getattr || m->ops->getattr(m->inst, sub, mode, uid, gid) != 0)
+    *mode = is_dir ? m->dir_mode : m->file_mode;
+}
+
 /* Graft a permanent pseudo-filesystem into the mount table at `point`. */
 static void mount_pseudo(const char *point, const char *dev, const struct fs_ops *ops)
 {
@@ -835,7 +846,7 @@ void fs_format(void)
   set_capacity();
   reset_alloc_map();
 
-  uint32_t init_sectors = (DIR_INIT_ENTRIES * (uint32_t)sizeof(struct dirent) + SECTOR_SIZE - 1) / SECTOR_SIZE;
+  uint32_t init_sectors = (DIR_INIT_ENTRIES * (uint32_t)sizeof(struct owofs_dirent) + SECTOR_SIZE - 1) / SECTOR_SIZE;
   uint32_t start = alloc_run(init_sectors);
   if (start == 0) {
     mounted = false;
@@ -864,11 +875,63 @@ void fs_format(void)
   mounted = true;
 }
 
+/* Convert a v8 disk: write a v9 directory to a fresh extent, then flip the superblock; the old extent is
+ * only released once the new superblock is on disk, so a failure leaves the v8 disk untouched. */
+static int migrate_v8(void)
+{
+  uint32_t old_start = sb.dir_start, old_sectors = sb.dir_sectors;
+  if (old_sectors == 0 || old_sectors > FS_MAX_DIR_SECTORS || old_start >= fs_total_sectors ||
+      old_sectors > fs_total_sectors - old_start)
+    return -1;
+  uint32_t new_sectors = fsm_v9_sectors(old_sectors);
+  if (new_sectors > FS_MAX_DIR_SECTORS)
+    return -1;
+  struct owofs_dirent_v8 *old = kmalloc(old_sectors * SECTOR_SIZE);
+  struct owofs_dirent *nd = kmalloc(new_sectors * SECTOR_SIZE);
+  int rc = -1;
+  if (old && nd && blk_read(old_start, old, old_sectors) == 0) {
+    uint32_t n_old = fsm_entries_v8(old_sectors);
+    reset_alloc_map();
+    run_mark(old_start, old_sectors, 1);
+    for (uint32_t i = 0; i < n_old; i++)
+      if (old[i].name[0] && !(old[i].flags & FS_DIR_FLAG) && old[i].start != 0)
+        run_mark(old[i].start, size_to_sectors(old[i].size), 1);
+    uint32_t new_start = alloc_run(new_sectors);
+    if (new_start) {
+      fsm_convert(old, n_old, nd, fsm_entries_v9(new_sectors));
+      struct super next = sb;
+      next.magic = FS_MAGIC;
+      next.dir_start = new_start;
+      next.dir_sectors = new_sectors;
+      if (blk_write(new_start, nd, new_sectors) == 0 && blk_write_sector(SUPER_LBA, &next) == 0) {
+        sb = next;
+        dir = nd;
+        nd = NULL;
+        dir_cap = entries_for(new_sectors);
+        rebuild_alloc_map();
+        rc = 0;
+      }
+    }
+  }
+  kfree(old);
+  kfree(nd);
+  return rc;
+}
+
 void fs_init(void)
 {
   fs_mount_pseudo();
 
   int have = (blk_read_sector(SUPER_LBA, &sb) == 0);
+
+  if (have && sb.magic == FSM_MAGIC_V8) {
+    con_write("fs: migrating owofs v8 to v9 (owner and mode).\n");
+    set_capacity();
+    mounted = (migrate_v8() == 0);
+    if (!mounted)
+      con_write("fs: migration failed; disk left untouched.\n");
+    return;
+  }
 
   if (have && sb.magic == FS_MAGIC) {
     set_capacity();
@@ -930,6 +993,10 @@ static void write_mtime(uint32_t m)
 /* Print one directory row: mtime, size (or "<DIR>"), and the name. */
 static void list_row(int i)
 {
+  char mode[11];
+  perm_mode_str(dir[i].mode, (dir[i].flags & FS_DIR_FLAG) != 0, mode);
+  con_write(mode);
+  con_write("  ");
   write_mtime(dir[i].mtime);
   con_write("  ");
   if (dir[i].flags & FS_DIR_FLAG)
@@ -1073,6 +1140,14 @@ int fs_read_at(const char *name, uint32_t offset, void *buf, uint32_t len)
   return (int)copied;
 }
 
+/* Stamp a newly created entry with the caller's identity and umask-reduced mode. */
+static void entry_set_owner(int slot, uint32_t base_mode)
+{
+  dir[slot].uid = (uint16_t)sched_uid();
+  dir[slot].gid = (uint16_t)sched_gid();
+  dir[slot].mode = (uint16_t)perm_apply_umask(base_mode, sched_umask());
+}
+
 int fs_create(const char *name, const void *data, uint32_t size)
 {
   if (!mounted)
@@ -1134,6 +1209,8 @@ int fs_create(const char *name, const void *data, uint32_t size)
   dir[slot].size = size;
   dir[slot].start = start;
   dir[slot].mtime = pack_now();
+  if (!overwrite)
+    entry_set_owner(slot, 0666);
 
   if (overwrite)
     free_extent(old_start, old_size);
@@ -1151,6 +1228,9 @@ static void slot_clear(int i)
   dir[i].size = 0;
   dir[i].start = 0;
   dir[i].mtime = 0;
+  dir[i].mode = 0;
+  dir[i].uid = 0;
+  dir[i].gid = 0;
 }
 
 int fs_delete(const char *name)
@@ -1241,6 +1321,7 @@ int fs_mkdir(const char *path)
   dir[slot].size = 0;
   dir[slot].start = 0;
   dir[slot].mtime = pack_now();
+  entry_set_owner(slot, 0777);
   return (dir_store() == 0) ? 0 : -1;
 }
 
@@ -1341,6 +1422,8 @@ int fs_prealloc(const char *name, uint32_t size)
   dir[slot].size = size;
   dir[slot].start = start;
   dir[slot].mtime = pack_now();
+  if (!overwrite)
+    entry_set_owner(slot, 0666);
 
   if (overwrite)
     free_extent(old_start, old_size);
@@ -1522,6 +1605,8 @@ int fs_stream_end(void)
   dir[slot].size = strm_size;
   dir[slot].start = (strm_sectors > 0) ? strm_start : 0;
   dir[slot].mtime = pack_now();
+  if (!overwrite)
+    entry_set_owner(slot, 0666);
 
   if (overwrite)
     free_extent(old_start, old_size);
@@ -1547,6 +1632,8 @@ uint32_t fs_used_bytes(void)
       total += dir[i].size;
   return total;
 }
+
+/* --------------------------------------------------------------- self-test */
 
 int fs_selftest(void)
 {
@@ -1617,7 +1704,7 @@ int fs_enum(int idx, char *name, uint32_t *size, uint32_t *mtime)
   return 1;
 }
 
-int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime)
+int fs_stat_ex(const char *path, struct fs_stat_info *st)
 {
   const char *sub;
   struct mnt *mv = mount_for(path, &sub);
@@ -1626,47 +1713,170 @@ int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime)
     uint32_t sz;
     if (rvol_stat(mv, sub, &d, &sz) != 0)
       return -1;
-    if (is_dir)
-      *is_dir = d;
-    if (size)
-      *size = sz;
-    if (mtime) {
-      *mtime = 0;
-      if (mv->ops->mtime)
-        mv->ops->mtime(mv->inst, sub, mtime);
-    }
+    st->is_dir = d;
+    st->size = sz;
+    st->mtime = 0;
+    if (mv->ops->mtime)
+      mv->ops->mtime(mv->inst, sub, &st->mtime);
+    mnt_attr(mv, sub, d, &st->mode, &st->uid, &st->gid);
     return 0;
   }
+  st->size = st->mtime = st->uid = st->gid = 0;
+  st->is_dir = 1;
+  st->mode = 0755;
   /* /media: the synthetic mount root is a directory even with no mounts. */
-  if (is_media_root(path)) {
-    if (is_dir)
-      *is_dir = 1;
-    if (size)
-      *size = 0;
-    if (mtime)
-      *mtime = 0;
+  if (is_media_root(path))
     return 0;
-  }
   if (!mounted)
     return -1;
   int slot = find_path((path && path[0]) ? path : "/");
-  if (slot == FS_SLOT_ROOT) {
-    if (is_dir)
-      *is_dir = 1;
-    if (size)
-      *size = 0;
-    if (mtime)
-      *mtime = 0;
+  if (slot == FS_SLOT_ROOT)
     return 0;
-  }
   if (slot < 0)
     return -1;
+  st->is_dir = (dir[slot].flags & FS_DIR_FLAG) ? 1 : 0;
+  st->size = dir[slot].size;
+  st->mtime = dir[slot].mtime;
+  st->mode = dir[slot].mode;
+  st->uid = dir[slot].uid;
+  st->gid = dir[slot].gid;
+  return 0;
+}
+
+int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime)
+{
+  struct fs_stat_info st;
+  if (fs_stat_ex(path, &st) != 0)
+    return -1;
   if (is_dir)
-    *is_dir = (dir[slot].flags & FS_DIR_FLAG) ? 1 : 0;
+    *is_dir = st.is_dir;
   if (size)
-    *size = dir[slot].size;
+    *size = st.size;
   if (mtime)
-    *mtime = dir[slot].mtime;
+    *mtime = st.mtime;
+  return 0;
+}
+
+/* The owofs entry for `path`, or -1 for the root, a mount, the synthetic /media, or an absent path. */
+static int owofs_slot(const char *path)
+{
+  const char *sub;
+  if (!mounted || mount_for(path, &sub) || is_media_root(path))
+    return -1;
+  int slot = find_path(path);
+  return slot >= 0 ? slot : -1;
+}
+
+int fs_chmod(const char *path, uint32_t mode)
+{
+  int slot = owofs_slot(path);
+  if (slot < 0)
+    return -1;
+  dir[slot].mode = (uint16_t)(mode & PERM_MODE_MASK);
+  return dir_store() == 0 ? 0 : -1;
+}
+
+int fs_chown(const char *path, uint32_t uid, uint32_t gid)
+{
+  int slot = owofs_slot(path);
+  if (slot < 0 || uid > 0xFFFFu || gid > 0xFFFFu)
+    return -1;
+  dir[slot].uid = (uint16_t)uid;
+  dir[slot].gid = (uint16_t)gid;
+  return dir_store() == 0 ? 0 : -1;
+}
+
+#define FS_ACC_PATH_MAX 512
+
+/* fs_stat_ex without the size of generated /proc and /sys files (producing it can have side effects). */
+static int access_stat(const char *path, struct fs_stat_info *st)
+{
+  const char *sub;
+  struct mnt *mv = mount_for(path, &sub);
+  if (!mv || (mv->ops != &procfs_ops && mv->ops != &sysfs_ops))
+    return fs_stat_ex(path, st);
+  int k = mv->ops == &procfs_ops ? procfs_kind(sub) : sysfs_kind(sub);
+  if (k < 0)
+    return -1;
+  st->is_dir = k == 1;
+  st->size = st->mtime = 0;
+  mnt_attr(mv, sub, st->is_dir, &st->mode, &st->uid, &st->gid);
+  return 0;
+}
+
+/* May the caller use directory `st` with `want`? */
+static bool dir_allows(const struct fs_stat_info *st, uint32_t want)
+{
+  return perm_allows(st->mode, st->uid, st->gid, sched_uid(), sched_gid(), want, true);
+}
+
+int fs_access(const char *path, int want)
+{
+  char norm[FS_ACC_PATH_MAX];
+  int len = 0, last_start = 0;
+  if (!path)
+    return -1;
+  norm[0] = '\0';
+  for (const char *p = path; *p;) {
+    while (*p == '/')
+      p++;
+    if (!*p)
+      break;
+    const char *e = p;
+    while (*e && *e != '/')
+      e++;
+    int n = (int)(e - p);
+    if (n == 1 && p[0] == '.') {
+    } else if (n == 2 && p[0] == '.' && p[1] == '.') {
+      len = last_start;
+      norm[len] = '\0';
+      last_start = 0;
+      for (int i = 0; i < len; i++)
+        if (norm[i] == '/')
+          last_start = i;
+    } else {
+      if (len + 1 + n >= FS_ACC_PATH_MAX)
+        return -1;
+      last_start = len;
+      norm[len++] = '/';
+      for (int i = 0; i < n; i++)
+        norm[len++] = p[i];
+      norm[len] = '\0';
+    }
+    p = e;
+  }
+
+  struct fs_stat_info st;
+  /* Every directory above the final component needs x; norm[last_start..] is the final component. */
+  uint32_t parent_len = (uint32_t)last_start;
+  struct fs_stat_info pst = {.is_dir = 1, .mode = 0755};
+  for (uint32_t i = 1; i <= parent_len; i++) {
+    if (norm[i] != '/')
+      continue;
+    char saved = norm[i];
+    norm[i] = '\0';
+    int rc = access_stat(norm, &pst);
+    norm[i] = saved;
+    if (rc != 0 || !pst.is_dir)
+      return -1;
+    if (!dir_allows(&pst, PERM_X))
+      return -PERM_EACCES;
+  }
+
+  if (len == 0) {
+    norm[0] = '/';
+    norm[1] = '\0';
+  }
+  bool exists = access_stat(norm, &st) == 0;
+  bool entry = (want & FS_ACC_ENTRY) != 0;
+  if (!exists && !entry && !(want & FS_ACC_CREATE))
+    return -1;
+  if (exists && entry && len > 0 && !perm_sticky_allows(pst.mode, pst.uid, st.uid, sched_uid()))
+    return -PERM_EACCES;
+  if ((entry || !exists) && len > 0 && !dir_allows(&pst, PERM_W | PERM_X))
+    return -PERM_EACCES;
+  if (exists && !perm_allows(st.mode, st.uid, st.gid, sched_uid(), sched_gid(), (uint32_t)want & 7u, st.is_dir))
+    return -PERM_EACCES;
   return 0;
 }
 
@@ -1861,6 +2071,8 @@ int fs_mount(const char *dev, const char *point)
   str_copy(mtab[slot].dev, dev, (int)sizeof mtab[slot].dev);
   mtab[slot].ops = ops;
   mtab[slot].inst = inst;
+  mtab[slot].dir_mode = ops->create ? 0777 : 0555;
+  mtab[slot].file_mode = ops->create ? 0777 : 0444;
   return 0;
 }
 

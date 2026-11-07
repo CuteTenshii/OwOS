@@ -5,6 +5,7 @@
 #include "idt.h"
 #include "loader.h"
 #include "paging.h"
+#include "perm.h"
 #include "pipe.h"
 #include "sched.h"
 #include "syscall_path.h"
@@ -23,6 +24,11 @@ void syscall_exec_replace(struct registers *r)
   have_arg = r->ecx != 0;
   if (resolve_path(name, abs, sizeof abs) != 0) {
     r->eax = (uint32_t)-1;
+    return;
+  }
+  int acc = fs_access(abs, FS_X);
+  if (acc != 0) {
+    r->eax = (uint32_t)acc;
     return;
   }
   int size = fs_size(abs);
@@ -56,6 +62,11 @@ void syscall_exec_spawn(struct registers *r)
   char path[SYS_PATH_MAX], arg[SYS_PATH_MAX];
   if (copyin_str(r->ebx, path, sizeof path) != 0) {
     r->eax = (uint32_t)-1;
+    return;
+  }
+  int acc = fs_access(path, FS_X);
+  if (acc != 0) {
+    r->eax = (uint32_t)acc;
     return;
   }
   int size = fs_size(path);
@@ -190,6 +201,11 @@ void syscall_exec_spawn_cap(struct registers *r)
     }
   }
 
+  int acc = fs_access(path, FS_X);
+  if (acc != 0) {
+    r->eax = (uint32_t)acc;
+    return;
+  }
   int fsz = fs_size(path);
   if (fsz < 0) {
     r->eax = (uint32_t)-1;

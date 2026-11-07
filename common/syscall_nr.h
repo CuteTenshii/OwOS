@@ -87,5 +87,9 @@
 #define SYS_GETTIME 84
 #define SYS_SETTIME 85
 #define SYS_ADJTIME 86
+#define SYS_CHMOD 87
+#define SYS_CHOWN 88
+#define SYS_UMASK 89
+#define SYS_ACCESS 90
 
 #endif

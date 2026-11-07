@@ -58,6 +58,9 @@ struct statinfo {
   int is_dir;
   unsigned size;
   unsigned mtime;
+  unsigned mode;
+  unsigned uid;
+  unsigned gid;
 };
 static inline int stat(const char *path, struct statinfo *out)
 {
@@ -68,6 +71,8 @@ static inline int stat(const char *path, struct statinfo *out)
   out->size = (unsigned)ftell(f);
   out->is_dir = 0;
   out->mtime = 0;
+  out->mode = 0644;
+  out->uid = out->gid = 0;
   fclose(f);
   return 0;
 }

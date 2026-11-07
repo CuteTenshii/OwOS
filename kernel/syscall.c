@@ -31,6 +31,7 @@
 #include "nvme.h"
 #include "paging.h"
 #include "pci.h"
+#include "perm.h"
 #include "pipe.h"
 #include "pmm.h"
 #include "power.h"
@@ -86,7 +87,10 @@ int read_with_path(const char *name, void *buf, uint32_t max)
 {
   char abs[SYS_PATH_MAX];
   join_cwd(name, abs, sizeof abs);
-  int n = fs_read(abs, buf, max);
+  int rc = fs_access(abs, FS_R);
+  if (rc == -PERM_EACCES)
+    return rc;
+  int n = rc == 0 ? fs_read(abs, buf, max) : -1;
   if (n < 0 && name[0] != '/') {
     char p[SYS_PATH_MAX];
     int j = 0;
@@ -96,7 +100,10 @@ int read_with_path(const char *name, void *buf, uint32_t max)
     for (int i = 0; name[i] && j < (int)sizeof(p) - 1; i++)
       p[j++] = name[i];
     p[j] = '\0';
-    n = fs_read(p, buf, max);
+    rc = fs_access(p, FS_R);
+    if (rc == -PERM_EACCES)
+      return rc;
+    n = rc == 0 ? fs_read(p, buf, max) : -1;
   }
   return n;
 }
@@ -127,6 +134,9 @@ int read_at_with_path(const char *name, uint32_t off, void *buf, uint32_t len)
   uint32_t size = 0;
   if (resolve_path(name, abs, sizeof abs) != 0)
     return -1;
+  int rc = fs_access(abs, FS_R);
+  if (rc != 0)
+    return rc;
   if (fs_stat(abs, 0, &size, 0) != 0)
     return -1; /* missing/unstattable: not EOF, an error (fs_stat leaves *size untouched on failure, reading it was a UB
                   bug that hung on tmpfs where the garbage was big) */
@@ -171,7 +181,7 @@ void syscall_init(void)
 
 typedef void (*syscall_handler_t)(struct registers *r);
 
-static const syscall_handler_t syscall_handlers[SYS_ADJTIME + 1] = {
+static const syscall_handler_t syscall_handlers[SYS_ACCESS + 1] = {
     [SYS_WRITE] = syscall_io_write,
     [SYS_EXIT] = syscall_process_exit,
     [SYS_READ] = syscall_io_read,
@@ -258,12 +268,16 @@ static const syscall_handler_t syscall_handlers[SYS_ADJTIME + 1] = {
     [SYS_GETTIME] = syscall_net_gettime,
     [SYS_SETTIME] = syscall_net_settime,
     [SYS_ADJTIME] = syscall_net_adjtime,
+    [SYS_CHMOD] = syscall_fs_chmod,
+    [SYS_CHOWN] = syscall_fs_chown,
+    [SYS_UMASK] = syscall_fs_umask,
+    [SYS_ACCESS] = syscall_fs_access,
 };
 
 void syscall_dispatch(struct registers *r)
 {
   uint32_t number = r->eax;
-  if (number > SYS_ADJTIME || !syscall_handlers[number]) {
+  if (number > SYS_ACCESS || !syscall_handlers[number]) {
     r->eax = (uint32_t)-1;
     return;
   }

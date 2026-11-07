@@ -153,8 +153,9 @@ int main(int argc, char **argv)
   if (outname) {
     if (save_overflow)
       puts("curl: response exceeds 256 KiB buffer, truncated\n");
-    if (writefile(outname, save_buf, save_len) != 0) {
-      printf("curl: failed to save %s\n", outname);
+    int wr = writefile(outname, save_buf, save_len);
+    if (wr != 0) {
+      printf("curl: failed to save %s%s\n", outname, wr == -EACCES ? " (permission denied)" : "");
       return 1;
     }
     printf("curl: saved %u bytes to %s\n", (unsigned)save_len, outname);

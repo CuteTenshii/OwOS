@@ -256,7 +256,7 @@ static void ed_load(const char *name)
 {
   int n = readfile(name, io_buf, (int)sizeof(io_buf));
   if (n < 0) {
-    set_status("open: not found");
+    set_status(n == -EACCES ? "open: permission denied" : "open: not found");
     return;
   }
   ed_clear();
@@ -294,13 +294,14 @@ static void ed_save(const char *name)
     if (i < nlines - 1 && p < (int)sizeof(io_buf))
       io_buf[p++] = '\n';
   }
-  if (writefile(name, io_buf, p) == 0) {
+  int wr = writefile(name, io_buf, p);
+  if (wr == 0) {
     scopy(fname, name, sizeof fname);
     has_name = true;
     modified = false;
     set_status("saved");
   } else {
-    set_status("save failed");
+    set_status(wr == -EACCES ? "save: permission denied" : "save failed");
   }
 }
 
