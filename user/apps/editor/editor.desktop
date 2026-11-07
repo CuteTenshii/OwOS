@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Editor
+GenericName=Text Editor
+Comment=Edit text files
+Exec=editor %f
+Icon=accessories-text-editor
+Terminal=false
+Categories=Utility;TextEditor;
+X-OwOS-Order=30
+MimeType=text/plain;

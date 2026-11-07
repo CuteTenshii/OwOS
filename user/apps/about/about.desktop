@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=About
+GenericName=About This System
+Comment=Show system information
+Exec=about
+Icon=help-about
+Terminal=false
+Categories=System;
+X-OwOS-Order=100

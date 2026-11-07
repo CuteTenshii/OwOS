@@ -12,7 +12,7 @@ INCLUDES=(
 	-I"$ROOT/user/lib/crypto" -I"$ROOT/user/lib/resolve"
 	-I"$ROOT/user/lib/zlib" -I"$ROOT/user/lib/stun" -I"$ROOT/user/lib/mp4"
 	-I"$ROOT/user/lib/sqlite" -I"$ROOT/user/lib/gfx" -I"$ROOT/user/lib/png"
-	-I"$ROOT/user/lib/tz" -I"$ROOT/user/lib/ntp" -I"$ROOT/user/lib/netconn" -I"$ROOT/user/lib/notify" -I"$ROOT/user/lib/mediactl" -I"$ROOT/user/apps/browser" -I"$ROOT/user/lib/rar"
+	-I"$ROOT/user/lib/tz" -I"$ROOT/user/lib/desktop" -I"$ROOT/user/lib/ntp" -I"$ROOT/user/lib/netconn" -I"$ROOT/user/lib/notify" -I"$ROOT/user/lib/mediactl" -I"$ROOT/user/apps/browser" -I"$ROOT/user/lib/rar"
 	-I"$ROOT/user/apps/browser/js"
 )
 
@@ -66,6 +66,9 @@ done
 
 "$CC" -std=gnu11 "${INCLUDES[@]}" -DTZ_CONFIG_PATH='"'"$BUILD/timezone"'"' \
 	-c "$ROOT/user/lib/tz/tz.c" -o "$BUILD/tz_impl.o" || exit 1
+
+"$CC" -std=gnu11 "${INCLUDES[@]}" -Dreaddir=desktop_test_readdir -include "$ROOT/tests/desktop_fs.h" \
+	-c "$ROOT/user/lib/desktop/desktop.c" -o "$BUILD/desktop_impl.o" || exit 1
 
 "$CC" -std=gnu11 "${INCLUDES[@]}" -c "$ROOT/tests/browser_js_host.c" \
 	-o "$BUILD/browser_js_host.o" || exit 1

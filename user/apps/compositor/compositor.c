@@ -1,6 +1,7 @@
 /* compositor.c: the user-space window manager and desktop */
 #include "clipboard.h"
 #include "compositor_damage.h"
+#include "desktop.h"
 #include "gfx.h"
 #include "mediactl.h"
 #include "owos.h"
@@ -279,31 +280,38 @@ static int tb_band_right;
 static unsigned frame_clock;
 static int tb_band_left(void) { return START_W + 6; }
 
-/* Start menu apps */
-enum {
-  APP_TERM,
-  APP_FILES,
-  APP_EDITOR,
-  APP_BROWSER,
-  APP_PLAYER,
-  APP_CLOCK,
-  APP_CALC,
-  APP_NOTIFYD,
-  APP_SETTINGS,
-  APP_ABOUT
-};
-static const struct {
-  const char *name;
-  const char *bin;
-} app_menu[] = {
-    [APP_TERM] = {"Terminal", "term"},         [APP_FILES] = {"Files", "files"},
-    [APP_EDITOR] = {"Editor", "editor"},       [APP_BROWSER] = {"Browser", "browser"},
-    [APP_PLAYER] = {"Media Player", "player"}, [APP_CLOCK] = {"Clock", "clock"},
-    [APP_CALC] = {"Calculator", "calc"},       [APP_NOTIFYD] = {"Notifications", "notifyd"},
-    [APP_SETTINGS] = {"Settings", "settings"}, [APP_ABOUT] = {"About", "about"},
-};
-static int app_pid[sizeof app_menu / sizeof app_menu[0]];
-static int apps_menu_count(void) { return (int)(sizeof app_menu / sizeof app_menu[0]); }
+/* Start menu apps: the .desktop entries under APPS_DIR */
+#define APPS_DIR "/usr/share/applications"
+static struct desktop_list apps;
+static int *app_pid;
+static int app_player = -1;
+static int apps_menu_count(void) { return apps.n; }
+
+static int app_find(const char *id)
+{
+  for (int i = 0; i < apps.n; i++)
+    if (streq(apps.v[i]->id, id))
+      return i;
+  return -1;
+}
+
+static void apps_load(void)
+{
+  struct desktop_list all = {0};
+  if (desktop_scan(APPS_DIR, &all) < 0)
+    return;
+  desktop_sort(&all);
+  for (int i = 0; i < all.n; i++) {
+    if (desktop_visible(all.v[i]))
+      all.v[apps.n++] = all.v[i];
+    else
+      desktop_free(all.v[i]);
+  }
+  all.n = apps.n;
+  apps = all;
+  app_pid = calloc((unsigned)apps.n + 1, sizeof *app_pid);
+  app_player = app_find("player");
+}
 
 /* Power actions */
 enum { PA_SLEEP, PA_RESTART, PA_SHUTDOWN };
@@ -381,17 +389,16 @@ static void launch_app(int i)
 {
   if (i < 0 || i >= apps_menu_count())
     return;
+  char **argv;
+  int argc;
+  if (desktop_exec_argv(apps.v[i], NULL, NULL, 0, &argv, &argc) != 0 || argc < 1)
+    return;
   char path[64];
-  int j = 0;
-  const char *pfx = "/bin/";
-  for (int k = 0; pfx[k]; k++)
-    path[j++] = pfx[k];
-  for (int k = 0; app_menu[i].bin[k] && j < (int)sizeof path - 1; k++)
-    path[j++] = app_menu[i].bin[k];
-  path[j] = '\0';
-  int pid = spawn(path, 0);
+  snprintf(path, sizeof path, argv[0][0] == '/' ? "%s" : "/bin/%s", argv[0]);
+  int pid = spawn(path, argc > 1 ? argv[1] : 0);
   app_pid[i] = pid;
   kid_track(pid);
+  desktop_argv_free(argv, argc);
 }
 
 /* cursors */
@@ -988,7 +995,7 @@ static void draw_start_menu(void)
   gfx_fill_rect(0, top, SM_W, sm_h(), 0x141a24);
   for (int i = 0; i < n; i++) {
     int iy = top + i * SM_ITEM_H;
-    gfx_ui_text(10, iy + (SM_ITEM_H - UIFONT_H) / 2, app_menu[i].name, 0xc8d0dc);
+    gfx_ui_text(10, iy + (SM_ITEM_H - UIFONT_H) / 2, apps.v[i]->name, 0xc8d0dc);
   }
   int sep_y = top + sm_apps_h() + SM_SEP_H / 2;
   gfx_fill_rect(8, sep_y, SM_W - 16, 1, 0x05070a);
@@ -1937,10 +1944,12 @@ static bool title_is(const char *a, const char *b)
 /* cur[] slot of an app's window: spawned by us, or (player) known by title */
 static int app_window(int app)
 {
+  if (app < 0)
+    return -1;
   for (int i = nwin - 1; i >= 0; i--) {
     if (app_pid[app] > 0 && cur[i].owner_pid == app_pid[app])
       return i;
-    if (app == APP_PLAYER && (title_is(cur[i].title, "Media Player") || title_is(cur[i].title, "Video Player")))
+    if (app == app_player && (title_is(cur[i].title, "Media Player") || title_is(cur[i].title, "Video Player")))
       return i;
   }
   return -1;
@@ -1964,10 +1973,10 @@ static void media_key(int c)
                                   : MEDIA_CMD_PREV;
   if (mediactl_send(cmd, 0) == 0)
     return;
-  int s = app_window(APP_PLAYER);
+  int s = app_window(app_player);
   if (s < 0) {
     if (c == KEY_MEDIA_PLAY)
-      launch_app(APP_PLAYER);
+      launch_app(app_player);
     return;
   }
   if (win_key_space(cur[s].id) <= 0)
@@ -1999,13 +2008,13 @@ static bool special_key(int c)
     media_key(c);
     return true;
   case KEY_LAUNCH_CALC:
-    app_raise_or_launch(APP_CALC);
+    app_raise_or_launch(app_find("calc"));
     return true;
   case KEY_LAUNCH_BROWSER:
-    app_raise_or_launch(APP_BROWSER);
+    app_raise_or_launch(app_find("browser"));
     return true;
   case KEY_LAUNCH_FILES:
-    app_raise_or_launch(APP_FILES);
+    app_raise_or_launch(app_find("files"));
     return true;
   case KEY_SEARCH:
     start_open = true;
@@ -2420,6 +2429,8 @@ int main(void)
     puts("compositor: no framebuffer\n");
     return 1;
   }
+
+  apps_load();
 
   /* Session autostart: clipboard server, notification daemon, terminal */
   kid_track(spawn("/bin/clipd", 0));

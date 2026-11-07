@@ -27,7 +27,7 @@ APP_LIBS_calc := $(MATH)
 APP_LIBS_cast := $(CAST) $(PROTOBUF) $(JSON) $(MATH) $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE)
 APP_LIBS_clipd := $(CLIPBOARD) $(MIME)
 APP_LIBS_cliphist := $(CLIPBOARD) $(MIME)
-APP_LIBS_compositor := $(CLIPBOARD) $(PNGENC) $(CRC32) $(MEDIACTL)
+APP_LIBS_compositor := $(CLIPBOARD) $(PNGENC) $(CRC32) $(MEDIACTL) $(DESKTOP)
 APP_LIBS_curl := $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(NETCONN) $(TLS) $(CRYPTO) $(BROTLI) $(RESOLVE)
 APP_LIBS_dig := $(RESOLVE)
 APP_LIBS_editor := $(CLIPBOARD) $(MIME) $(DIALOG)
@@ -62,6 +62,16 @@ kernel/$(1)_blob.o: user/apps/$(1)/$(1).elf
 	  --redefine-sym _binary_user_apps_$(1)_$(1)_elf_end=_binary_app_$(1)_end $$< $$@
 endef
 $(foreach a,$(APPS),$(eval $(call app_rule,$(a))))
+
+# Start menu entries, embedded in the kernel and installed to /usr/share/applications at boot.
+DESKTOP_APPS := term files editor browser player clock calc notifyd settings about
+define desktop_rule
+kernel/$(1)_desktop_blob.o: user/apps/$(1)/$(1).desktop
+	$$(OBJCOPY) -I binary -O $$(KELF) -B $$(KBFD) \
+	  --redefine-sym _binary_user_apps_$(1)_$(1)_desktop_start=_binary_desktop_$(1)_start \
+	  --redefine-sym _binary_user_apps_$(1)_$(1)_desktop_end=_binary_desktop_$(1)_end $$< $$@
+endef
+$(foreach a,$(DESKTOP_APPS),$(eval $(call desktop_rule,$(a))))
 
 # Combined function-symbol table (one text blob, sections keyed by app name) so
 # the crash reporter can name backtrace frames. Format: ">app\n<hexaddr> name\n"...

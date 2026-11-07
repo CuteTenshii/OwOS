@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Browser
+GenericName=Web Browser
+Comment=Browse the web
+Exec=browser %U
+Icon=web-browser
+Terminal=false
+Categories=Network;WebBrowser;
+X-OwOS-Order=40
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=browser

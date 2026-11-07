@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Notifications
+GenericName=Notification Daemon
+Comment=Show desktop notifications
+Exec=notifyd
+Icon=preferences-system-notifications
+Terminal=false
+Categories=System;
+X-OwOS-Order=80

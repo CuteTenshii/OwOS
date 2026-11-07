@@ -89,6 +89,7 @@ static void install_blob(const char *path, const unsigned char *start, const uns
     install_blob(diskpath, symbase##_start, symbase##_end, mode);                                                      \
   } while (0)
 #define INSTALL_APP(nm) INSTALL_FILE("/bin/" #nm, _binary_app_##nm, 0755)
+#define INSTALL_DESKTOP(nm) INSTALL_FILE("/usr/share/applications/" #nm ".desktop", _binary_desktop_##nm, 0644)
 
 /* Create a directory / file only if absent, with an explicit mode (the boot session runs as root). */
 static void mkdir_mode(const char *path, uint32_t mode)
@@ -356,6 +357,19 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     mkdir_mode("/etc/fonts", 0755);
     INSTALL_FILE("/etc/fonts/LiberationSans-Regular.ttf", _binary_fonts_LiberationSans_Regular_ttf, 0644);
     INSTALL_FILE("/etc/fonts/LiberationMono-Regular.ttf", _binary_fonts_LiberationMono_Regular_ttf, 0644);
+    mkdir_mode("/usr", 0755);
+    mkdir_mode("/usr/share", 0755);
+    mkdir_mode("/usr/share/applications", 0755);
+    INSTALL_DESKTOP(term);
+    INSTALL_DESKTOP(files);
+    INSTALL_DESKTOP(editor);
+    INSTALL_DESKTOP(browser);
+    INSTALL_DESKTOP(player);
+    INSTALL_DESKTOP(clock);
+    INSTALL_DESKTOP(calc);
+    INSTALL_DESKTOP(notifyd);
+    INSTALL_DESKTOP(settings);
+    INSTALL_DESKTOP(about);
     seed_file("/etc/passwd", "root::0:0:/home/root\n", 21, 0600);
     seed_file("/etc/group", "root:0:\n", 8, 0644);
     /* mdnsd advertisements, one "type port [txt...]" per line. */

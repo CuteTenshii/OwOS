@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+GenericName=Terminal Emulator
+Comment=Run commands in a shell
+Exec=term
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+X-OwOS-Order=10

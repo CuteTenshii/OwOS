@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+GenericName=File Manager
+Comment=Browse and manage files
+Exec=files
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileManager;
+X-OwOS-Order=20

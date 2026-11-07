@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Calculator
+GenericName=Calculator
+Comment=Perform calculations
+Exec=calc
+Icon=accessories-calculator
+Terminal=false
+Categories=Utility;Calculator;
+X-OwOS-Order=70
