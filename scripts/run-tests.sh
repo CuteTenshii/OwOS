@@ -16,6 +16,18 @@ INCLUDES=(
 	-I"$ROOT/user/apps/browser/js"
 )
 
+# Host compressors the btrfs test cross-checks against; each one is used only when pkg-config finds it.
+host_defs=()
+host_libs=()
+for entry in ZLIB:zlib ZSTD:libzstd LZO:lzo2; do
+	pkg-config --exists "${entry#*:}" 2>/dev/null || continue
+	host_defs+=("-DHAVE_HOST_${entry%%:*}")
+	host_libs+=($(pkg-config --libs "${entry#*:}"))
+done
+if pkg-config --exists lzo2 2>/dev/null; then
+	host_defs+=(-I"$(dirname "$(pkg-config --variable=includedir lzo2)")")
+fi
+
 for source in "$ROOT"/tests/*_test.c; do
 	[ -f "$source" ] || continue
 	if ! grep -q '^#define OWOS_SUITE_TEST$' "$source"; then
@@ -32,6 +44,9 @@ for source in "$ROOT"/tests/*_test.c; do
 	fi
 	if [ "$name" = vary ]; then
 		extra=(-DCACHE_DIR='"'"$BUILD/vary-cache"'"')
+	fi
+	if [ "$name" = btrfs ] && [ ${#host_defs[@]} -gt 0 ]; then
+		extra=("${host_defs[@]}")
 	fi
 	"$CC" -std=gnu11 "${INCLUDES[@]}" -Dmain=owos_main_${name} \
 		-DOWOS_TEST_NAME=${name} -include "$ROOT/tests/test.h" \
@@ -74,6 +89,6 @@ done
 	"$ROOT/user/lib/js/interp.c" "$ROOT/user/lib/js/builtins.c" \
 	"$ROOT/user/lib/js/bigint.c" "$ROOT/user/lib/math/fmt.c" \
 	"$ROOT/user/lib/gc/gc.c" "$ROOT/scripts/host_math.c" "$ROOT/user/lib/opt.c" "$ROOT/user/lib/mutex.c" \
-	-lm -lpthread -o "$BUILD/owos-tests" || exit 1
+	"${host_libs[@]}" -lm -lpthread -o "$BUILD/owos-tests" || exit 1
 
 exec "$BUILD/owos-tests"

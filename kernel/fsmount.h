@@ -55,6 +55,7 @@ struct fs_ops {
 const struct fs_ops *fat_ops(void);
 const struct fs_ops *hfs_ops(void);
 const struct fs_ops *ext_ops(void);
+const struct fs_ops *btrfs_ops(void);
 const struct fs_ops *iso_ops(void);
 const struct fs_ops *ntfs_ops(void);
 

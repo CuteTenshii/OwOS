@@ -1838,6 +1838,7 @@ int fs_mount(const char *dev, const char *point)
     const struct fs_ops *cand[] = {
         fat_ops(),
         ext_ops(),
+        btrfs_ops(),
         ntfs_ops(),
         hfs_ops(),
     };
