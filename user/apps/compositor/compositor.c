@@ -2,6 +2,7 @@
 #include "clipboard.h"
 #include "compositor_damage.h"
 #include "gfx.h"
+#include "mediactl.h"
 #include "owos.h"
 #include "pngenc.h"
 
@@ -1954,9 +1955,15 @@ static void app_raise_or_launch(int app)
     launch_app(app);
 }
 
-/* Media transport reaches the player even when it is not focused */
+/* Media transport goes to the active media session, else to the player even when it is not focused */
 static void media_key(int c)
 {
+  int cmd = c == KEY_MEDIA_PLAY   ? MEDIA_CMD_TOGGLE
+            : c == KEY_MEDIA_STOP ? MEDIA_CMD_STOP
+            : c == KEY_MEDIA_NEXT ? MEDIA_CMD_NEXT
+                                  : MEDIA_CMD_PREV;
+  if (mediactl_send(cmd, 0) == 0)
+    return;
   int s = app_window(APP_PLAYER);
   if (s < 0) {
     if (c == KEY_MEDIA_PLAY)

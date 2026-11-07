@@ -9,6 +9,7 @@
 #include "features/clienthints/clienthints.h" /* ch_ua: navigator.userAgentData */
 #include "features/cors/cors.h"               /* cors_origin / cors_same_origin: SW scope + cache keys */
 #include "features/media/bmedia.h"            /* HTMLMediaElement: <audio>/<video> + new Audio() */
+#include "features/mediasession/mediasession.h"
 #include "features/notification/notification.h"
 #include "jsint.h"     /* internal shared surface (engine ctx + helpers + A()) */
 #include "notify.h"    /* notify_send: surface Notification() on the desktop */
@@ -5662,6 +5663,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
       def_method(uad, "toJSON", uad_tojson, 0);
       js_def(nav, "userAgentData", js_obj_value(uad), P_ENUMERABLE);
     }
+    mediasession_install(ctx, nav, page_url);
     js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
@@ -6754,6 +6756,7 @@ void js_page_end(void)
   gc_remove_root((void **)&g_notification_proto);
   gc_remove_root((void **)&g_notifications);
   js_notification_teardown();
+  mediasession_teardown();
   gc_remove_root((void **)&g_timers);
   js_idb_teardown();
   js_webapi_teardown();

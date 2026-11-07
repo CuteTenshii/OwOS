@@ -67,6 +67,7 @@ struct media_el {
 };
 
 static struct media_el g_media[MEDIA_MAX];
+static struct media_el *g_last_played;
 
 /* video thread machinery (defined below loader_run, which starts it) */
 static void video_ensure(void);
@@ -584,6 +585,7 @@ void media_play(struct media_el *m)
 {
   if (!m)
     return;
+  g_last_played = m;
   if (m->vid && m->vended)
     video_reopen(m); /* replay a finished clip */
   browser_buf_lock();
@@ -1138,6 +1140,20 @@ int media_active(void)
     if ((m->ms && media_source_playing(m->ms)) || (m->vid && m->vplaying))
       return 1;
   }
+  return 0;
+}
+
+struct media_el *media_current(void)
+{
+  struct media_el *m = g_last_played;
+  int i;
+  for (i = 0; i < MEDIA_MAX; i++) {
+    struct media_el *e = &g_media[i];
+    if (e->in_use && e->owner == B->pg && ((e->ms && media_source_playing(e->ms)) || (e->vid && e->vplaying)))
+      return e;
+  }
+  if (m && m->in_use && m->owner == B->pg && (m->ms || m->vid))
+    return m;
   return 0;
 }
 

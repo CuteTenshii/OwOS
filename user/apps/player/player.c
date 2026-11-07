@@ -2,6 +2,7 @@
  * with a seekable progress bar and Restart / Play-Pause / Stop buttons */
 #include "gfx.h"
 #include "media.h"
+#include "mediactl.h"
 #include "owos.h"
 #include <stdbool.h>
 
@@ -293,6 +294,83 @@ static void transport_toggle(void)
     transport_play();
 }
 
+/* system media session */
+#define SESSION_SYNC_MS 250
+
+static int g_sid = -1;
+static long long g_sync_at;
+
+static unsigned session_pos_ms(void)
+{
+  if (!g_is_video)
+    return media_position_ms(g_dec);
+  return g_shown_pts < 0 ? 0 : (unsigned)g_shown_pts;
+}
+
+static void session_seek(unsigned ms)
+{
+  if (g_is_video)
+    return;
+  unsigned dur = media_duration_ms(g_dec);
+  media_seek_ms(g_dec, dur && ms > dur ? dur : ms);
+}
+
+static void session_sync(void)
+{
+  long long now = (long long)msec();
+  if (g_state == ST_EMPTY || now < g_sync_at)
+    return;
+  g_sync_at = now + SESSION_SYNC_MS;
+  if (g_sid < 0 && (g_sid = mediactl_open("Player")) < 0)
+    return;
+  struct media_info in = {0};
+  strlcpy(in.app, "Player", sizeof in.app);
+  strlcpy(in.title, basename_of(g_fn), sizeof in.title);
+  in.state = g_state == ST_PLAYING ? MEDIA_PLAYING : g_state == ST_PAUSED ? MEDIA_PAUSED : MEDIA_STOPPED;
+  in.pos_ms = session_pos_ms();
+  in.dur_ms = g_is_video ? media_video_duration_ms(g_vid) : media_duration_ms(g_dec);
+  in.caps = MEDIA_CAP(MEDIA_CMD_PLAY) | MEDIA_CAP(MEDIA_CMD_PAUSE) | MEDIA_CAP(MEDIA_CMD_TOGGLE) |
+            MEDIA_CAP(MEDIA_CMD_STOP) | MEDIA_CAP(MEDIA_CMD_PREV) | MEDIA_CAP(MEDIA_CMD_NEXT);
+  if (!g_is_video)
+    in.caps |= MEDIA_CAP(MEDIA_CMD_SEEK_FWD) | MEDIA_CAP(MEDIA_CMD_SEEK_BACK) | MEDIA_CAP(MEDIA_CMD_SEEK_TO);
+  if (mediactl_update(g_sid, &in) < 0) {
+    g_sid = -1;
+    return;
+  }
+  unsigned arg;
+  int cmd;
+  while ((cmd = mediactl_poll(g_sid, &arg)) > MEDIA_CMD_NONE) {
+    unsigned step = arg ? arg : 10000;
+    switch (cmd) {
+    case MEDIA_CMD_PLAY:
+      transport_play();
+      break;
+    case MEDIA_CMD_PAUSE:
+      transport_pause();
+      break;
+    case MEDIA_CMD_TOGGLE:
+      transport_toggle();
+      break;
+    case MEDIA_CMD_STOP:
+    case MEDIA_CMD_NEXT:
+      transport_stop(); /* no playlist: next ends the track */
+      break;
+    case MEDIA_CMD_PREV:
+      transport_restart();
+      break;
+    case MEDIA_CMD_SEEK_FWD:
+      session_seek(session_pos_ms() + step);
+      break;
+    case MEDIA_CMD_SEEK_BACK:
+      session_seek(session_pos_ms() > step ? session_pos_ms() - step : 0);
+      break;
+    case MEDIA_CMD_SEEK_TO:
+      session_seek(arg);
+      break;
+    }
+  }
+}
+
 /* rendering */
 #define COL_BG 0x10141cu
 #define COL_HDR 0x1a2230u
@@ -496,8 +574,11 @@ int main(int argc, char **argv)
   for (;;) {
     struct win_event ev;
     int new_frame = 0;
+    session_sync();
     while (win_poll(g_win, &ev)) {
       if (ev.type == WEV_CLOSE) {
+        if (g_sid >= 0)
+          mediactl_close(g_sid);
         if (audio_live)
           audio_close();
         if (g_asrc)

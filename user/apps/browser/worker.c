@@ -1,3 +1,4 @@
+#include "features/mediasession/mediasession.h"
 #include "main_int.h"
 
 /* --- worker thread: drains req_pending, fetches, bumps seq for the UI ----- */
@@ -317,6 +318,8 @@ void worker_fn(void)
         B->seq++;
       }
     }
+    mediasession_tick(B->pg->doc_title, B->pg->cur_url);
+
     /* Drive CSS animations/transitions */
     if (!B->loading && anim_active()) {
       bool settled = !B->layout_dirty && B->want_paw > 0 && B->wrap_cols == B->want_paw;
