@@ -42,6 +42,11 @@ struct fs_ops {
   int (*del)(void *inst, const char *path);
   int (*mkdir)(void *inst, const char *path);
   int (*rmdir)(void *inst, const char *path);
+  int (*rename)(void *inst, const char *from, const char *to);
+  int (*write_at)(void *inst, const char *path, uint32_t off, const void *buf, uint32_t len);
+
+  /* Optional: modification time as Unix seconds. */
+  int (*mtime)(void *inst, const char *path, uint32_t *mtime);
 };
 
 const struct fs_ops *fat_ops(void);

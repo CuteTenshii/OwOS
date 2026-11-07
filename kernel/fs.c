@@ -1178,6 +1178,10 @@ int fs_rename(const char *old, const char *neu)
 {
   if (!mounted)
     return -1;
+  const char *osub, *nsub;
+  struct mnt *om = mount_for(old, &osub), *nm = mount_for(neu, &nsub);
+  if (om || nm) /* a rename can't cross mounts */
+    return (om == nm && om->ops->rename && om->ops->rename(om->inst, osub, nsub) == 0) ? 0 : -1;
 
   int src = find_path(old);
   if (src < 0 || src == FS_SLOT_ROOT)
@@ -1349,10 +1353,11 @@ int fs_write_at(const char *name, uint32_t offset, const void *data, uint32_t le
 {
   if (!mounted)
     return -1;
-  {
-    const char *sub;
-    if (mount_for(name, &sub))
-      return -1;
+  const char *sub;
+  struct mnt *mv = mount_for(name, &sub);
+  if (mv) {
+    int r = mv->ops->write_at ? mv->ops->write_at(mv->inst, sub, offset, data, len) : -1;
+    return r < 0 ? -1 : r;
   }
   int i = find_file(name);
   if (i >= 0) {
@@ -1625,8 +1630,11 @@ int fs_stat(const char *path, int *is_dir, uint32_t *size, uint32_t *mtime)
       *is_dir = d;
     if (size)
       *size = sz;
-    if (mtime)
+    if (mtime) {
       *mtime = 0;
+      if (mv->ops->mtime)
+        mv->ops->mtime(mv->inst, sub, mtime);
+    }
     return 0;
   }
   /* /media: the synthetic mount root is a directory even with no mounts. */
