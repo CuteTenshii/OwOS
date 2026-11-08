@@ -20,6 +20,10 @@ struct font;
 struct font *font_load(const unsigned char *data, int len);
 void font_free(struct font *f);
 
+/* Copy the family name (typographic, else legacy) into `out` as ASCII ('?' for
+ * other characters). Returns its length, 0 if the font has none. */
+int font_family(const struct font *f, char *out, int n);
+
 /* Scaled vertical metrics at pixel size `px` (the em square maps to `px`
  * pixels). `descent` is negative (below the baseline); any of the out pointers
  * may be 0. */

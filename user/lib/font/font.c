@@ -32,6 +32,10 @@ struct font {
   unsigned head, maxp, hhea, hmtx, loca, glyf; /* table offsets (0 = absent) */
   unsigned cmap_sub;
   int cmap_fmt; /* chosen cmap subtable        */
+  unsigned cff; /* CFF table offset; 0 = TrueType outlines */
+  unsigned charstrings, gsubrs, lsubrs, fdselect;
+  unsigned *fd_subrs; /* per-Font-DICT local subrs of a CID-keyed CFF */
+  int n_fd;
 };
 
 /* WOFF/WOFF2 → SFNT decoder (user/lib/font/woff.c). Weak so a program that only
@@ -101,6 +105,8 @@ static void pick_cmap(struct font *f)
   f->cmap_fmt = (int)rd16(f->d + best_off);
 }
 
+static int cff_init(struct font *f);
+
 struct font *font_load(const unsigned char *data, int len)
 {
   if (!data || len < 12)
@@ -120,13 +126,10 @@ struct font *font_load(const unsigned char *data, int len)
   }
 
   unsigned ver = rd32(data);
-  /* 0x00010000 = TrueType, 'true'/'typ1' = TT, 'OTTO' = CFF (unsupported here),
-   * 'ttcf' = collection (unsupported). */
-  if (ver != 0x00010000 && ver != 0x74727565 /*true*/) {
-    if (ver != 0x74797031 /*typ1*/) {
-      free(owned);
-      return 0;
-    } /* incl. OTTO (CFF) */
+  /* 0x00010000 = TrueType, 'true'/'typ1' = TT, 'OTTO' = CFF, 'ttcf' = collection (unsupported). */
+  if (ver != 0x00010000 && ver != 0x74727565 /*true*/ && ver != 0x74797031 /*typ1*/ && ver != 0x4f54544f /*OTTO*/) {
+    free(owned);
+    return 0;
   }
 
   struct font *f = malloc(sizeof *f);
@@ -146,7 +149,8 @@ struct font *font_load(const unsigned char *data, int len)
   f->hmtx = find_table(data, len, "hmtx");
   f->loca = find_table(data, len, "loca");
   f->glyf = find_table(data, len, "glyf");
-  if (!f->head || !f->maxp || !f->hhea || !f->hmtx || !f->loca || !f->glyf) {
+  f->cff = ver == 0x4f54544f ? find_table(data, len, "CFF ") : 0;
+  if (!f->head || !f->maxp || !f->hhea || !f->hmtx || (f->cff ? 0 : (!f->loca || !f->glyf))) {
     free(f->owned);
     free(f);
     return 0;
@@ -171,6 +175,11 @@ struct font *font_load(const unsigned char *data, int len)
   f->lgap = rds16(data + f->hhea + 8);
   f->n_hmetrics = (int)rd16(data + f->hhea + 34);
 
+  if (ver == 0x4f54544f && (!f->cff || !cff_init(f))) {
+    font_free(f);
+    return 0;
+  }
+
   pick_cmap(f);
   return f;
 }
@@ -179,6 +188,7 @@ void font_free(struct font *f)
 {
   if (f) {
     free(f->owned);
+    free(f->fd_subrs);
     free(f);
   }
 }
@@ -588,10 +598,454 @@ static void load_composite(const struct font *f, const unsigned char *g, int gle
   }
 }
 
+/* ------------------------------------------------ CFF outlines -------------
+ * OpenType fonts with PostScript outlines ('OTTO'): a CFF table of Type 2 charstrings. Name-keyed and
+ * CID-keyed fonts are handled; CFF2 (variable) is not. */
+static unsigned rdn(const unsigned char *p, int n)
+{
+  unsigned v = 0;
+  while (n-- > 0)
+    v = (v << 8) | *p++;
+  return v;
+}
+
+/* INDEX at offset `o`: its element count, or -1 if it does not fit in the file */
+static int idx_count(const struct font *f, unsigned o) { return off_ok(o, 2, f->len) ? (int)rd16(f->d + o) : -1; }
+
+/* Offset just past the INDEX at `o`, 0 if malformed */
+static unsigned idx_end(const struct font *f, unsigned o)
+{
+  int cnt = idx_count(f, o);
+  if (cnt < 0)
+    return 0;
+  if (cnt == 0)
+    return o + 2;
+  if (!off_ok(o, 3, f->len))
+    return 0;
+  int osz = f->d[o + 2];
+  if (osz < 1 || osz > 4 || !off_ok(o + 3, (cnt + 1) * osz, f->len))
+    return 0;
+  unsigned data = o + 3 + (unsigned)(cnt + 1) * osz - 1;
+  unsigned last = rdn(f->d + o + 3 + (unsigned)cnt * osz, osz);
+  return last >= 1 && off_ok(data, (int)last, f->len) && last <= 0x7fffffff ? data + last : 0;
+}
+
+/* Element `i` of the INDEX at `o` */
+static int idx_get(const struct font *f, unsigned o, int i, const unsigned char **p, int *n)
+{
+  int cnt = idx_count(f, o);
+  if (!o || cnt <= 0 || i < 0 || i >= cnt || !off_ok(o, 3, f->len))
+    return 0;
+  int osz = f->d[o + 2];
+  if (osz < 1 || osz > 4 || !off_ok(o + 3, (cnt + 1) * osz, f->len))
+    return 0;
+  unsigned data = o + 3 + (unsigned)(cnt + 1) * osz - 1;
+  unsigned a = rdn(f->d + o + 3 + (unsigned)i * osz, osz), b = rdn(f->d + o + 3 + (unsigned)(i + 1) * osz, osz);
+  if (a < 1 || b < a || b > (unsigned)f->len || !off_ok(data, (int)b, f->len))
+    return 0;
+  *p = f->d + data + a;
+  *n = (int)(b - a);
+  return 1;
+}
+
+/* Operands of operator `op` (escapes as 0x0c00|b) in a DICT; their count, or -1 if absent/malformed */
+static int dict_find(const unsigned char *p, int n, int op, long *v, int maxv)
+{
+  long st[8];
+  int ns = 0;
+  for (int i = 0; i < n;) {
+    int b = p[i++];
+    if (b <= 21) {
+      int o = b;
+      if (b == 12) {
+        if (i >= n)
+          return -1;
+        o = 0x0c00 | p[i++];
+      }
+      if (o == op) {
+        for (int k = 0; k < ns && k < maxv; k++)
+          v[k] = st[k];
+        return ns;
+      }
+      ns = 0;
+    } else if (b == 28) {
+      if (i + 2 > n)
+        return -1;
+      if (ns < 8)
+        st[ns++] = (short)((p[i] << 8) | p[i + 1]);
+      i += 2;
+    } else if (b == 29) {
+      if (i + 4 > n)
+        return -1;
+      if (ns < 8)
+        st[ns++] = (int)rd32(p + i);
+      i += 4;
+    } else if (b == 30) {
+      while (i < n) {
+        int c = p[i++];
+        if ((c & 15) == 15 || (c >> 4) == 15)
+          break;
+      }
+      if (ns < 8)
+        st[ns++] = 0;
+    } else if (b >= 32 && b <= 246) {
+      if (ns < 8)
+        st[ns++] = b - 139;
+    } else if (b >= 247 && b <= 254) {
+      if (i >= n)
+        return -1;
+      int w = p[i++];
+      if (ns < 8)
+        st[ns++] = b <= 250 ? (b - 247) * 256 + w + 108 : -(b - 251) * 256 - w - 108;
+    } else
+      return -1;
+  }
+  return -1;
+}
+
+/* Offset of the local Subrs INDEX named by a Private DICT reference ("size offset"), 0 if none */
+static unsigned cff_private_subrs(const struct font *f, const unsigned char *dict, int dn)
+{
+  long pv[2], sv;
+  if (dict_find(dict, dn, 18, pv, 2) != 2 || pv[0] < 0 || pv[1] < 0 ||
+      !off_ok(f->cff + (unsigned)pv[1], (int)pv[0], f->len))
+    return 0;
+  const unsigned char *priv = f->d + f->cff + pv[1];
+  if (dict_find(priv, (int)pv[0], 19, &sv, 1) != 1 || sv <= 0)
+    return 0;
+  return f->cff + (unsigned)pv[1] + (unsigned)sv;
+}
+
+/* Read the CFF header + Top DICT. Returns 0 if the table is unusable. */
+static int cff_init(struct font *f)
+{
+  unsigned c = f->cff;
+  if (!off_ok(c, 4, f->len))
+    return 0;
+  unsigned o = idx_end(f, c + f->d[c + 2]); /* Name INDEX */
+  const unsigned char *top;
+  int tn;
+  if (!o || !idx_get(f, o, 0, &top, &tn))
+    return 0;
+  o = idx_end(f, o);         /* Top DICT INDEX */
+  o = o ? idx_end(f, o) : 0; /* String INDEX */
+  if (!o || !idx_end(f, o))
+    return 0;
+  f->gsubrs = o;
+
+  long v;
+  if (dict_find(top, tn, 0x0c06, &v, 1) == 1 && v != 2)
+    return 0; /* Type 1 charstrings */
+  if (dict_find(top, tn, 17, &v, 1) != 1 || v <= 0 || (unsigned long)v >= (unsigned)f->len)
+    return 0;
+  f->charstrings = c + (unsigned)v;
+  if (idx_count(f, f->charstrings) < 0)
+    return 0;
+
+  if (dict_find(top, tn, 0x0c24, &v, 1) == 1) { /* CID-keyed: a Private DICT per Font DICT */
+    unsigned fda = c + (unsigned)v;
+    long fs;
+    int n = v > 0 && v < f->len ? idx_count(f, fda) : -1;
+    if (dict_find(top, tn, 0x0c25, &fs, 1) != 1 || fs <= 0 || fs >= f->len || n <= 0 || n > 256)
+      return 0;
+    f->fdselect = c + (unsigned)fs;
+    f->fd_subrs = calloc((unsigned)n, sizeof *f->fd_subrs);
+    if (!f->fd_subrs)
+      return 0;
+    f->n_fd = n;
+    for (int i = 0; i < n; i++) {
+      const unsigned char *fd;
+      int fn;
+      if (idx_get(f, fda, i, &fd, &fn))
+        f->fd_subrs[i] = cff_private_subrs(f, fd, fn);
+    }
+  } else
+    f->lsubrs = cff_private_subrs(f, top, tn);
+  return 1;
+}
+
+/* Local subrs INDEX for glyph `gi` (through FDSelect for CID-keyed fonts) */
+static unsigned cff_local_subrs(const struct font *f, int gi)
+{
+  if (!f->fd_subrs)
+    return f->lsubrs;
+  const unsigned char *s = f->d + f->fdselect;
+  int fd = -1;
+  if (!off_ok(f->fdselect, 1, f->len))
+    return 0;
+  if (s[0] == 0) {
+    if (off_ok(f->fdselect, 1 + gi + 1, f->len))
+      fd = s[1 + gi];
+  } else if (s[0] == 3 && off_ok(f->fdselect, 3, f->len)) {
+    int nr = (int)rd16(s + 1);
+    if (off_ok(f->fdselect, 5 + nr * 3, f->len))
+      for (int i = 0; i < nr; i++)
+        if (gi >= (int)rd16(s + 3 + i * 3) && gi < (int)rd16(s + 3 + (i + 1) * 3)) {
+          fd = s[5 + i * 3];
+          break;
+        }
+  }
+  return fd >= 0 && fd < f->n_fd ? f->fd_subrs[fd] : 0;
+}
+
+/* Type 2 charstring interpreter state */
+struct cs {
+  const struct font *f;
+  struct ras *r;
+  float st[48];
+  int n, nstems, w_done, done, open, ops;
+  float x, y;
+  unsigned lsubrs;
+};
+
+#define CS_MAX_OPS 20000
+
+static void cs_move(struct cs *c, float dx, float dy)
+{
+  c->x += dx;
+  c->y += dy;
+  ras_begin(c->r);
+  ras_pt(c->r, c->x, c->y);
+  c->open = 1;
+}
+
+static void cs_line(struct cs *c, float dx, float dy)
+{
+  if (!c->open)
+    return;
+  c->x += dx;
+  c->y += dy;
+  ras_pt(c->r, c->x, c->y);
+}
+
+static void cs_curve(struct cs *c, float dx1, float dy1, float dx2, float dy2, float dx3, float dy3)
+{
+  if (!c->open)
+    return;
+  float x0 = c->x, y0 = c->y;
+  float x1 = x0 + dx1, y1 = y0 + dy1, x2 = x1 + dx2, y2 = y1 + dy2, x3 = x2 + dx3, y3 = y2 + dy3;
+  const int N = 8;
+  for (int i = 1; i <= N; i++) {
+    float t = (float)i / N, u = 1 - t;
+    float a = u * u * u, b = 3 * u * u * t, d = 3 * u * t * t, e = t * t * t;
+    ras_pt(c->r, a * x0 + b * x1 + d * x2 + e * x3, a * y0 + b * y1 + d * y2 + e * y3);
+  }
+  c->x = x3;
+  c->y = y3;
+}
+
+/* The first stack-clearing operator may carry the glyph width as an extra leading operand; drop it */
+static void cs_width(struct cs *c, int has)
+{
+  if (!c->w_done && has && c->n > 0) {
+    for (int i = 1; i < c->n; i++)
+      c->st[i - 1] = c->st[i];
+    c->n--;
+  }
+  c->w_done = 1;
+}
+
+static int cs_bias(const struct font *f, unsigned idx)
+{
+  int n = idx_count(f, idx);
+  return n < 1240 ? 107 : n < 33900 ? 1131 : 32768;
+}
+
+static void cs_run(struct cs *c, const unsigned char *p, int len, int depth)
+{
+  float *s = c->st;
+  for (int i = 0; i < len && !c->done;) {
+    if (++c->ops > CS_MAX_OPS) {
+      c->done = 1;
+      return;
+    }
+    int b = p[i++];
+    if (b >= 32 || b == 28) {
+      float v;
+      if (b == 28) {
+        if (i + 2 > len)
+          return;
+        v = (float)(short)((p[i] << 8) | p[i + 1]);
+        i += 2;
+      } else if (b <= 246)
+        v = (float)(b - 139);
+      else if (b <= 250) {
+        if (i >= len)
+          return;
+        v = (float)((b - 247) * 256 + p[i++] + 108);
+      } else if (b <= 254) {
+        if (i >= len)
+          return;
+        v = (float)(-(b - 251) * 256 - p[i++] - 108);
+      } else {
+        if (i + 4 > len)
+          return;
+        v = (float)(int)rd32(p + i) / 65536.0f;
+        i += 4;
+      }
+      if (c->n >= 48) {
+        c->done = 1;
+        return;
+      }
+      s[c->n++] = v;
+      continue;
+    }
+    int n = c->n;
+    switch (b) {
+    case 1:
+    case 3:
+    case 18:
+    case 23: /* h/vstem(hm) */
+      cs_width(c, n & 1);
+      c->nstems += c->n / 2;
+      break;
+    case 19:
+    case 20: /* hintmask, cntrmask: implicit vstem, then a mask byte per 8 stems */
+      cs_width(c, n & 1);
+      c->nstems += c->n / 2;
+      i += (c->nstems + 7) / 8;
+      break;
+    case 21:
+      cs_width(c, n > 2);
+      if (c->n >= 2)
+        cs_move(c, s[c->n - 2], s[c->n - 1]);
+      break;
+    case 22:
+      cs_width(c, n > 1);
+      if (c->n >= 1)
+        cs_move(c, s[c->n - 1], 0);
+      break;
+    case 4:
+      cs_width(c, n > 1);
+      if (c->n >= 1)
+        cs_move(c, 0, s[c->n - 1]);
+      break;
+    case 5:
+      for (int k = 0; k + 2 <= n; k += 2)
+        cs_line(c, s[k], s[k + 1]);
+      break;
+    case 6:
+    case 7: { /* h/vlineto: alternating axes */
+      int horiz = b == 6;
+      for (int k = 0; k < n; k++, horiz = !horiz)
+        horiz ? cs_line(c, s[k], 0) : cs_line(c, 0, s[k]);
+      break;
+    }
+    case 8:
+      for (int k = 0; k + 6 <= n; k += 6)
+        cs_curve(c, s[k], s[k + 1], s[k + 2], s[k + 3], s[k + 4], s[k + 5]);
+      break;
+    case 24: {
+      int k = 0;
+      for (; k + 6 <= n - 2; k += 6)
+        cs_curve(c, s[k], s[k + 1], s[k + 2], s[k + 3], s[k + 4], s[k + 5]);
+      if (k + 2 <= n)
+        cs_line(c, s[k], s[k + 1]);
+      break;
+    }
+    case 25: {
+      int k = 0;
+      for (; k + 2 <= n - 6; k += 2)
+        cs_line(c, s[k], s[k + 1]);
+      if (k + 6 <= n)
+        cs_curve(c, s[k], s[k + 1], s[k + 2], s[k + 3], s[k + 4], s[k + 5]);
+      break;
+    }
+    case 26: {
+      int k = 0;
+      float dx1 = (n & 1) ? s[k++] : 0;
+      for (; k + 4 <= n; k += 4, dx1 = 0)
+        cs_curve(c, dx1, s[k], s[k + 1], s[k + 2], 0, s[k + 3]);
+      break;
+    }
+    case 27: {
+      int k = 0;
+      float dy1 = (n & 1) ? s[k++] : 0;
+      for (; k + 4 <= n; k += 4, dy1 = 0)
+        cs_curve(c, s[k], dy1, s[k + 1], s[k + 2], s[k + 3], 0);
+      break;
+    }
+    case 30:
+    case 31: { /* vhcurveto / hvcurveto */
+      int horiz = b == 31;
+      for (int k = 0; k + 4 <= n; k += 4, horiz = !horiz) {
+        float last = n - k == 5 ? s[k + 4] : 0;
+        if (horiz)
+          cs_curve(c, s[k], 0, s[k + 1], s[k + 2], last, s[k + 3]);
+        else
+          cs_curve(c, 0, s[k], s[k + 1], s[k + 2], s[k + 3], last);
+      }
+      break;
+    }
+    case 10:
+    case 29: { /* callsubr / callgsubr */
+      if (n < 1 || depth >= 10)
+        return;
+      unsigned idx = b == 10 ? c->lsubrs : c->f->gsubrs;
+      int k = (int)s[--c->n] + cs_bias(c->f, idx);
+      const unsigned char *sp;
+      int sn;
+      if (idx_get(c->f, idx, k, &sp, &sn))
+        cs_run(c, sp, sn, depth + 1);
+      continue; /* the subr's operands stay on the stack */
+    }
+    case 11:
+      return;
+    case 14:
+      cs_width(c, n == 1 || n == 5);
+      c->done = 1;
+      return;
+    case 12: {
+      if (i >= len)
+        return;
+      int e = p[i++];
+      if (e == 35 && n >= 12) {
+        cs_curve(c, s[0], s[1], s[2], s[3], s[4], s[5]);
+        cs_curve(c, s[6], s[7], s[8], s[9], s[10], s[11]);
+      } else if (e == 34 && n >= 7) {
+        cs_curve(c, s[0], 0, s[1], s[2], s[3], 0);
+        cs_curve(c, s[4], 0, s[5], -s[2], s[6], 0);
+      } else if (e == 36 && n >= 9) {
+        cs_curve(c, s[0], s[1], s[2], s[3], s[4], 0);
+        cs_curve(c, s[5], 0, s[6], s[7], s[8], -(s[1] + s[3] + s[7]));
+      } else if (e == 37 && n >= 11) {
+        float dx = s[0] + s[2] + s[4] + s[6] + s[8], dy = s[1] + s[3] + s[5] + s[7] + s[9];
+        int xdom = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy);
+        cs_curve(c, s[0], s[1], s[2], s[3], s[4], s[5]);
+        cs_curve(c, s[6], s[7], s[8], s[9], xdom ? s[10] : -dx, xdom ? -dy : s[10]);
+      }
+      break;
+    }
+    default:
+      break;
+    }
+    c->n = 0;
+  }
+}
+
+static void cff_glyph(const struct font *f, int gi, struct ras *r)
+{
+  const unsigned char *p;
+  int n;
+  if (!idx_get(f, f->charstrings, gi, &p, &n))
+    return;
+  struct cs c;
+  for (unsigned i = 0; i < sizeof c; i++)
+    ((char *)&c)[i] = 0;
+  c.f = f;
+  c.r = r;
+  c.lsubrs = cff_local_subrs(f, gi);
+  cs_run(&c, p, n, 0);
+}
+
 static void load_glyph(const struct font *f, int gi, struct ras *r, struct xf m, int depth)
 {
   if (depth > 5 || gi < 0 || gi >= f->num_glyphs)
     return;
+  if (f->cff) {
+    cff_glyph(f, gi, r);
+    return;
+  }
   unsigned o0, o1;
   if (f->loc_long) {
     if (!off_ok(f->loca, gi * 4 + 8, f->len))
@@ -774,4 +1228,44 @@ unsigned char *font_render_glyph(const struct font *f, int gi, float px, int *w,
   *ox = x0;
   *oy = y0;
   return out;
+}
+
+/* ------------------------------------------------ family name -------------- */
+int font_family(const struct font *f, char *out, int n)
+{
+  unsigned nt = find_table(f->d, f->len, "name");
+  if (n < 1)
+    return 0;
+  out[0] = '\0';
+  if (!nt || !off_ok(nt, 6, f->len))
+    return 0;
+  int count = (int)rd16(f->d + nt + 2);
+  unsigned strs = nt + rd16(f->d + nt + 4);
+  int best = 0, bestscore = 0;
+  for (int i = 0; i < count; i++) {
+    unsigned r = nt + 6 + (unsigned)i * 12;
+    if (!off_ok(r, 12, f->len))
+      break;
+    unsigned plat = rd16(f->d + r), id = rd16(f->d + r + 6);
+    int score = (id == 16 ? 2 : id == 1 ? 1 : 0) * 2 + (plat == 3 ? 1 : 0);
+    if (id != 1 && id != 16)
+      continue;
+    if ((plat != 3 && plat != 1) || score <= bestscore ||
+        !off_ok(strs + rd16(f->d + r + 10), rd16(f->d + r + 8), f->len))
+      continue;
+    best = i + 1;
+    bestscore = score;
+  }
+  if (!best)
+    return 0;
+  unsigned r = nt + 6 + (unsigned)(best - 1) * 12;
+  const unsigned char *s = f->d + strs + rd16(f->d + r + 10);
+  unsigned len = rd16(f->d + r + 8), step = rd16(f->d + r) == 3 ? 2 : 1;
+  int o = 0;
+  for (unsigned i = 0; i + step <= len && o < n - 1; i += step) {
+    unsigned c = step == 2 ? rd16(s + i) : s[i];
+    out[o++] = c < 0x80 ? (char)c : '?';
+  }
+  out[o] = '\0';
+  return o;
 }
