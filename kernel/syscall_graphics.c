@@ -22,6 +22,7 @@ void syscall_graphics_fb_info(struct registers *r)
     return;
   }
   out = (struct fbinfo *)r->ebx;
+  fb_poll_resize();
   fb_dims(&out->w, &out->h, &out->pitch, &out->bpp);
   r->eax = 0;
 }

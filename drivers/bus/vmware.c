@@ -143,6 +143,92 @@ fail:
   return -1;
 }
 
+/* --- Host-to-guest TCLO channel ---------------------------------------------
+ * The host pushes requests ("reset", "ping", "Resolution_Set w h", ...) that the guest must poll for. A reply
+ * ("OK <text>" or "ERROR <text>") is shipped at the start of the next poll. */
+
+#define TCLO_PROTOCOL 0x4F4C4354u /* "TCLO" */
+#define TCLO_REPLY_MAX 64
+
+static struct vmware_regs tclo_regs;
+static uint32_t tclo_channel;
+static int tclo_open;
+static char tclo_reply[TCLO_REPLY_MAX];
+static int tclo_reply_len;
+
+void vmware_tclo_reply(const char *reply)
+{
+  int n = 0;
+  while (reply[n] && n < TCLO_REPLY_MAX - 1) {
+    tclo_reply[n] = reply[n];
+    n++;
+  }
+  tclo_reply_len = n;
+}
+
+static void tclo_close(void)
+{
+  msg_call(MSG_CLOSE, 0, tclo_channel, &tclo_regs);
+  tclo_open = 0;
+}
+
+int vmware_tclo_poll(char *req, int max)
+{
+  if (!vmware_present() || max < 2)
+    return -1;
+  struct vmware_regs *r = &tclo_regs;
+  uint32_t st;
+
+  if (!tclo_open) {
+    *r = (struct vmware_regs){0};
+    st = msg_call(MSG_OPEN, TCLO_PROTOCOL | GUESTMSG_FLAG_COOKIE, 0, r);
+    if (!(st & MSG_ST_SUCCESS))
+      return -1;
+    tclo_channel = r->edx >> 16;
+    tclo_open = 1;
+    tclo_reply_len = 0;
+  }
+
+  if (tclo_reply_len) {
+    int len = tclo_reply_len;
+    tclo_reply_len = 0;
+    st = msg_call(MSG_SENDSIZE, (uint32_t)len, tclo_channel, r);
+    for (int i = 0; (st & MSG_ST_SUCCESS) && i < len; i += 4) {
+      uint32_t word = 0;
+      for (int b = 0; b < 4 && i + b < len; b++)
+        word |= (uint32_t)(uint8_t)tclo_reply[i + b] << (b * 8);
+      st = msg_call(MSG_SENDPAYLOAD, word, tclo_channel, r);
+    }
+    if (!(st & MSG_ST_SUCCESS)) {
+      tclo_close();
+      return -1;
+    }
+  }
+
+  st = msg_call(MSG_RECVSIZE, 0, tclo_channel, r);
+  if (!(st & MSG_ST_SUCCESS)) {
+    tclo_close();
+    return -1;
+  }
+  if (!(st & MSG_ST_DORECV))
+    return 0;
+
+  int rlen = (int)r->ebx, out = 0;
+  for (int i = 0; i < rlen; i += 4) {
+    st = msg_call(MSG_RECVPAYLOAD, MSG_ST_SUCCESS, tclo_channel, r);
+    if (!(st & MSG_ST_SUCCESS)) {
+      tclo_close();
+      return -1;
+    }
+    for (int b = 0; b < 4 && i + b < rlen; b++)
+      if (out < max - 1)
+        req[out++] = (char)((r->ebx >> (b * 8)) & 0xFF);
+  }
+  req[out] = '\0';
+  msg_call(MSG_RECVSTATUS, MSG_ST_SUCCESS, tclo_channel, r);
+  return out;
+}
+
 /* --- Legacy copy/paste backdoor ----------------------------------------------
  * The original (pre-GuestRPC) clipboard channel: four single-instruction
  * backdoor commands carrying plain text, four bytes at a time. GET_SELLENGTH

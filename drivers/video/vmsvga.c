@@ -59,6 +59,7 @@ enum {
 
 #define SVGA_FIFO_NUM_REGS 4
 #define SVGA_CMD_UPDATE 1
+#define MAX_PIXELS (2560u * 1600u) /* back buffer ceiling for runtime resizes */
 
 /* Version negotiation: offer ID_2 first and step down until one reads back. */
 #define SVGA_MAGIC 0x900000u
@@ -170,6 +171,23 @@ static void vmsvga_cursor_move(int x, int y)
   reg_write(SVGA_REG_CURSOR_ON, 1);
 }
 
+static uint32_t max_w, max_h;
+
+/* fb.c mode hook: reprogram the display and report the new pitch. */
+static int vmsvga_set_mode(uint32_t w, uint32_t h, uint32_t *pitch_bytes)
+{
+  if ((max_w && w > max_w) || (max_h && h > max_h))
+    return -1;
+  reg_write(SVGA_REG_WIDTH, w);
+  reg_write(SVGA_REG_HEIGHT, h);
+  reg_write(SVGA_REG_BITS_PER_PIXEL, 32);
+  reg_write(SVGA_REG_ENABLE, 1);
+  if (reg_read(SVGA_REG_WIDTH) != w || reg_read(SVGA_REG_HEIGHT) != h)
+    return -1;
+  *pitch_bytes = reg_read(SVGA_REG_BYTES_PER_LINE);
+  return *pitch_bytes ? 0 : -1;
+}
+
 int vmsvga_init(uint32_t want_w, uint32_t want_h)
 {
   uint32_t bar0 = 0, bar1 = 0, bar2 = 0;
@@ -211,6 +229,8 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
 
   uint32_t maxw = reg_read(SVGA_REG_MAX_WIDTH);
   uint32_t maxh = reg_read(SVGA_REG_MAX_HEIGHT);
+  max_w = maxw;
+  max_h = maxh;
   if (maxw && want_w > maxw)
     want_w = maxw;
   if (maxh && want_h > maxh)
@@ -250,11 +270,16 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
   /* Register the hook before adopting so fb_adopt's initial present is pushed too. */
   fb_set_present_hook(svga_present, svga_flush);
   fb_set_cursor_hooks(vmsvga_cursor_set, vmsvga_cursor_move);
+  uint32_t vram = reg_read(SVGA_REG_VRAM_SIZE);
+  uint32_t cap = vram > fb_off ? (vram - fb_off) / 4 : 0;
+  fb_set_capacity(cap < MAX_PIXELS ? cap : MAX_PIXELS);
+  fb_set_mode_hooks(vmsvga_set_mode, NULL);
 
   if (fb_adopt(fb_phys + fb_off, want_w, want_h, pitch, 32) != 0) {
     con_write("vmsvga: fb_adopt failed.\n");
     fb_set_present_hook(NULL, NULL);
     fb_set_cursor_hooks(NULL, NULL);
+    fb_set_mode_hooks(NULL, NULL);
     reg_write(SVGA_REG_ENABLE, 0);
     return -1;
   }

@@ -47,6 +47,8 @@
 
 enum {
   CMD_CREATE_2D = 0x101,
+  CMD_GET_DISPLAY_INFO = 0x100,
+  CMD_UNREF = 0x102,
   CMD_SET_SCANOUT = 0x103,
   CMD_FLUSH = 0x104,
   CMD_TRANSFER_2D = 0x105,
@@ -54,10 +56,14 @@ enum {
   CMD_UPDATE_CURSOR = 0x300,
   CMD_MOVE_CURSOR = 0x301,
   RESP_OK_NODATA = 0x1100,
+  RESP_OK_DISPLAY_INFO = 0x1101,
 };
 #define FORMAT_B8G8R8A8 1
 #define FORMAT_B8G8R8X8 2
-#define RESOURCE_ID 1
+#define FB_RESOURCE_A 1
+#define FB_RESOURCE_B 3 /* modes alternate resources so the old scanout stays valid until the new one is set */
+#define MAX_PIXELS (2560u * 1600u)
+#define MAX_PMODES 16
 #define CURSOR_RESOURCE_ID 2
 #define CURSOR_DIM 64 /* the host only accepts 64x64 cursor resources */
 #define POLL_LIMIT 5000000
@@ -90,6 +96,9 @@ static uint8_t *cmd_buf;
 static uint8_t *resp_buf;
 static uint32_t cmd_phys, resp_phys;
 static uint32_t gw, gh, gpitch;
+static uint32_t fb_res = FB_RESOURCE_A;
+static uint32_t fb_backing, fb_backing_bytes;
+static uint32_t host_w, host_h; /* last size the host reported */
 
 static spinlock_t cursor_lock; /* the mouse IRQ moves the cursor */
 static uint8_t *cur_cmd;
@@ -136,7 +145,8 @@ static bool submit(uint32_t req_len, uint32_t resp_len)
   for (int i = 0; i < POLL_LIMIT; i++) {
     if (ctrl.used[1] != ctrl.last_used) {
       ctrl.last_used = ctrl.used[1];
-      return ((struct hdr *)resp_buf)->type == RESP_OK_NODATA;
+      uint32_t t = ((struct hdr *)resp_buf)->type;
+      return t == RESP_OK_NODATA || t == RESP_OK_DISPLAY_INFO;
     }
   }
   return false;
@@ -172,7 +182,7 @@ static bool cmd_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     uint32_t res, pad;
   } *f = (void *)begin(CMD_FLUSH, sizeof *f);
   f->r = (struct rect){x, y, w, h};
-  f->res = RESOURCE_ID;
+  f->res = fb_res;
   return submit(sizeof *f, sizeof(struct hdr));
 }
 
@@ -182,7 +192,7 @@ static void vgpu_present(int x, int y, int w, int h)
   if (w <= 0 || h <= 0)
     return;
   __asm__ volatile("sfence" ::: "memory"); /* drain write-combined framebuffer stores before the device reads them */
-  if (!cmd_transfer(RESOURCE_ID, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, gpitch))
+  if (!cmd_transfer(fb_res, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, gpitch))
     return;
   if (flush_x1 <= flush_x0) {
     flush_x0 = (uint32_t)x;
@@ -283,6 +293,28 @@ static bool setup_queue(struct vq *q, int index, uint32_t mem, volatile uint8_t 
   return true;
 }
 
+static bool cmd_set_scanout(uint32_t res, uint32_t w, uint32_t h)
+{
+  struct {
+    struct hdr h;
+    struct rect r;
+    uint32_t scanout, res;
+  } *s = (void *)begin(CMD_SET_SCANOUT, sizeof *s);
+  s->r = (struct rect){0, 0, w, h};
+  s->res = res;
+  return submit(sizeof *s, sizeof(struct hdr));
+}
+
+static void cmd_unref(uint32_t res)
+{
+  struct {
+    struct hdr h;
+    uint32_t res, pad;
+  } *u = (void *)begin(CMD_UNREF, sizeof *u);
+  u->res = res;
+  submit(sizeof *u, sizeof(struct hdr));
+}
+
 /* Back resource res with n bytes of guest RAM at phys. */
 static bool create_backed(uint32_t res, uint32_t format, uint32_t w, uint32_t h, uint32_t phys, uint32_t bytes)
 {
@@ -310,6 +342,59 @@ static bool create_backed(uint32_t res, uint32_t format, uint32_t w, uint32_t h,
   return submit(sizeof *a, sizeof(struct hdr));
 }
 
+/* fb.c mode hook: a fresh resource of the new size over the same backing, then swap the scanout. */
+static int vgpu_set_mode(uint32_t w, uint32_t h, uint32_t *pitch_bytes)
+{
+  uint32_t res = fb_res == FB_RESOURCE_A ? FB_RESOURCE_B : FB_RESOURCE_A;
+  uint32_t bytes = w * 4 * h;
+  if (bytes > fb_backing_bytes || !create_backed(res, FORMAT_B8G8R8X8, w, h, fb_backing, bytes))
+    return -1;
+  if (!cmd_set_scanout(res, w, h)) {
+    cmd_unref(res);
+    return -1;
+  }
+  cmd_unref(fb_res);
+  fb_res = res;
+  gw = w;
+  gh = h;
+  gpitch = w * 4;
+  flush_x1 = flush_x0;
+  *pitch_bytes = gpitch;
+  return 0;
+}
+
+static bool query_host_size(uint32_t *w, uint32_t *h)
+{
+  begin(CMD_GET_DISPLAY_INFO, sizeof(struct hdr));
+  if (!submit(sizeof(struct hdr), sizeof(struct hdr) + MAX_PMODES * 24))
+    return false;
+  struct pmode {
+    struct rect r;
+    uint32_t enabled, flags;
+  } *pm = (struct pmode *)(resp_buf + sizeof(struct hdr));
+  if (!pm[0].enabled || !pm[0].r.w || !pm[0].r.h)
+    return false;
+  *w = pm[0].r.w;
+  *h = pm[0].r.h;
+  return true;
+}
+
+/* fb.c poll hook: report when the host's preferred size for scanout 0 changes (window resized). */
+static int vgpu_poll_size(uint32_t *w, uint32_t *h)
+{
+  uint32_t nw, nh;
+  if (!query_host_size(&nw, &nh))
+    return 0;
+  bool changed = host_w && (nw != host_w || nh != host_h);
+  host_w = nw;
+  host_h = nh;
+  if (!changed)
+    return 0;
+  *w = nw;
+  *h = nh;
+  return 1;
+}
+
 int virtiogpu_init(uint32_t want_w, uint32_t want_h)
 {
   int bus = 0, slot = 0;
@@ -327,7 +412,7 @@ int virtiogpu_init(uint32_t want_w, uint32_t want_h)
   bus--;
 
   uint32_t cmd = cfg_read32(bus, slot, 0x04);
-  pci_write32(bus, slot, 0, 0x04, cmd | 0x6);
+  pci_write32(bus, slot, 0, 0x04, cmd | 0x6 | 0x400); /* polled driver: mask INTx */
 
   uint32_t notify_mult = 0;
   common = NULL;
@@ -400,12 +485,13 @@ int virtiogpu_init(uint32_t want_w, uint32_t want_h)
   gw = want_w;
   gh = want_h;
   gpitch = want_w * 4;
-  uint32_t fb_bytes = gpitch * gh;
-  uint32_t fb_phys = pmm_alloc_contig(fb_bytes);
-  if (!fb_phys)
+  fb_backing_bytes = MAX_PIXELS * 4;
+  fb_backing = pmm_alloc_contig(fb_backing_bytes);
+  if (!fb_backing)
     return -1;
+  uint32_t fb_phys = fb_backing;
 
-  if (!create_backed(RESOURCE_ID, FORMAT_B8G8R8X8, gw, gh, fb_phys, fb_bytes)) {
+  if (!create_backed(fb_res, FORMAT_B8G8R8X8, gw, gh, fb_phys, gpitch * gh)) {
     con_write("virtio-gpu: framebuffer resource setup failed.\n");
     return -1;
   }
@@ -413,26 +499,22 @@ int virtiogpu_init(uint32_t want_w, uint32_t want_h)
                                      CURSOR_DIM * CURSOR_DIM * 4))
     cursor_ready = false;
 
-  struct {
-    struct hdr h;
-    struct rect r;
-    uint32_t scanout, res;
-  } *s = (void *)begin(CMD_SET_SCANOUT, sizeof *s);
-  s->r = (struct rect){0, 0, gw, gh};
-  s->res = RESOURCE_ID;
-  if (!submit(sizeof *s, sizeof(struct hdr))) {
+  if (!cmd_set_scanout(fb_res, gw, gh)) {
     con_write("virtio-gpu: set scanout failed.\n");
     return -1;
   }
 
   con_printf("virtio-gpu: mode %ux%ux32.\n", gw, gh);
   fb_set_present_hook(vgpu_present, vgpu_flush);
+  fb_set_capacity(MAX_PIXELS);
+  fb_set_mode_hooks(vgpu_set_mode, vgpu_poll_size);
   if (cursor_ready)
     fb_set_cursor_hooks(vgpu_cursor_set, vgpu_cursor_move);
   if (fb_adopt(fb_phys, gw, gh, gpitch, 32) != 0) {
     con_write("virtio-gpu: fb_adopt failed.\n");
     fb_set_present_hook(NULL, NULL);
     fb_set_cursor_hooks(NULL, NULL);
+    fb_set_mode_hooks(NULL, NULL);
     return -1;
   }
   return 0;

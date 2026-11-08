@@ -33,11 +33,22 @@ int fb_ui_scale(void);
 void fb_set_ui_scale(int s); /* ignores values outside 0..4 */
 int fb_ui_scale_active(void);
 
-/* Runtime mode switching (DISPI only; not for adopted framebuffers). Returns 0, or -1. Compositor thread only. */
+/* Runtime mode switching: DISPI offers the fb_mode_get list; adapters registered with fb_set_mode_hooks accept any
+ * size up to their capacity. Returns 0, or -1. Compositor thread only. */
 int fb_can_set_mode(void);
 int fb_mode_count(void);
 int fb_mode_get(int i, uint32_t *w, uint32_t *h);
 int fb_set_mode(uint32_t w, uint32_t h);
+
+/* Adapter mode support. set reprograms the hardware to w x h and returns the new pitch in bytes (0 / -1);
+ * poll (optional) reports the size the host wants, returning 1 when it changed. fb_set_capacity(pixels) before
+ * fb_adopt reserves room for larger modes. fb_request_size queues a host-requested size (any thread);
+ * fb_poll_resize, run from SYS_FB_INFO, applies it. */
+void fb_set_mode_hooks(int (*set)(uint32_t w, uint32_t h, uint32_t *pitch_bytes),
+                       int (*poll)(uint32_t *w, uint32_t *h));
+void fb_set_capacity(uint32_t pixels);
+void fb_request_size(uint32_t w, uint32_t h);
+void fb_poll_resize(void);
 
 /* Copy the damaged region of the back buffer to the visible framebuffer. */
 void fb_present(void);

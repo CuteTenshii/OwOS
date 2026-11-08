@@ -11,10 +11,12 @@
 
 #include "vmtools.h"
 #include "console.h"
+#include "fb.h"
 #include "rtc.h"
 #include "sched.h"
 #include "timer.h"
 #include "vmware.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 #define BDOOR_CMD_GETTIME                                                                                              \
@@ -22,6 +24,7 @@
       */
 
 #define HEARTBEAT_MS 30000
+#define TCLO_POLL_MS 100
 
 /* Convert Unix seconds (UTC) to a CMOS clock value (Howard Hinnant's
  * civil-from- days). The host hands us UTC; we store UTC, same as the NTP
@@ -66,15 +69,61 @@ static int sync_time(void)
   return 0;
 }
 
-/* Periodic liveness: re-assert guestinfo and the tools version so the host
- * keeps seeing the guest as alive. Only started when the RPC channel actually
- * works. */
+static bool starts_with(const char *s, const char *prefix)
+{
+  while (*prefix)
+    if (*s++ != *prefix++)
+      return false;
+  return true;
+}
+
+static uint32_t parse_uint(const char **p)
+{
+  uint32_t v = 0;
+  while (**p == ' ')
+    (*p)++;
+  while (**p >= '0' && **p <= '9')
+    v = v * 10 + (uint32_t)(*(*p)++ - '0');
+  return v;
+}
+
+/* Answer one host request: the display follows the VM window via "Resolution_Set w h". */
+static void handle_request(const char *req)
+{
+  if (starts_with(req, "reset")) {
+    vmware_tclo_reply("OK ATTACH");
+  } else if (starts_with(req, "ping")) {
+    vmware_tclo_reply("OK ");
+  } else if (starts_with(req, "Capabilities_Register")) {
+    vmware_rpc("tools.capability.resolution_set 1", 0, 0);
+    vmware_tclo_reply("OK ");
+  } else if (starts_with(req, "Resolution_Set")) {
+    const char *p = req + 14;
+    uint32_t w = parse_uint(&p), h = parse_uint(&p);
+    if (w && h)
+      fb_request_size(w, h);
+    vmware_tclo_reply("OK ");
+  } else {
+    vmware_tclo_reply("ERROR Unknown command");
+  }
+}
+
+/* Poll host requests and keep the guest looking alive: re-assert guestinfo and the tools version every
+ * HEARTBEAT_MS. Only started when the RPC channel actually works. */
 static void vmtools_thread(void)
 {
+  char req[128];
+  uint32_t since_beat = 0;
   for (;;) {
-    timer_sleep(HEARTBEAT_MS);
-    vmware_rpc("tools.set.version 0", 0, 0);
-    vmware_rpc("info-set guestinfo.owos.alive 1", 0, 0);
+    timer_sleep(TCLO_POLL_MS);
+    if (vmware_tclo_poll(req, sizeof req) > 0)
+      handle_request(req);
+    since_beat += TCLO_POLL_MS;
+    if (since_beat >= HEARTBEAT_MS) {
+      since_beat = 0;
+      vmware_rpc("tools.set.version 0", 0, 0);
+      vmware_rpc("info-set guestinfo.owos.alive 1", 0, 0);
+    }
   }
 }
 

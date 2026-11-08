@@ -48,6 +48,13 @@ int vmware_present(void);
  * reply doesn't matter (e.g. an info-set). */
 int vmware_rpc(const char *req, char *resp, int resp_max);
 
+/* Host-to-guest request channel ("TCLO"), polled. Each call ships the reply set by the previous
+ * vmware_tclo_reply (if any), then fetches the next pending host request into req (NUL-terminated, at most max-1
+ * bytes). Returns the request length, 0 if none is pending, -1 on a channel error (it reopens on the next call).
+ * Real VMware only. */
+int vmware_tclo_poll(char *req, int max);
+void vmware_tclo_reply(const char *reply);
+
 /* Legacy VMware copy/paste — the simple text-only clipboard channel that
  * predates GuestRPC (backdoor commands 6-9, four bytes per call). It rides the
  * plain single-instruction backdoor, so unlike vmware_rpc it does NOT need the

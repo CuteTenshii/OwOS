@@ -12,6 +12,7 @@
 #include "paging.h"
 #include "pci.h"
 #include "pmm.h"
+#include "timer.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -39,6 +40,15 @@ static uint32_t fb_cap;    /* pixels mapped/allocated (>= fb_pixels)         */
 static bool active;
 static bool single;   /* 1 when there is no back buffer (draw direct)   */
 static bool can_mode; /* 1 = DISPI path: the mode can be reprogrammed   */
+
+/* Paravirtual adapters reprogram themselves through these (any size up to fb_cap); see fb_set_mode_hooks. */
+static int (*mode_hook)(uint32_t w, uint32_t h, uint32_t *pitch_bytes);
+static int (*size_poll_hook)(uint32_t *w, uint32_t *h);
+static uint32_t cap_hint;              /* pixels to map/allocate for the next fb_adopt */
+static volatile uint32_t req_w, req_h; /* pending host-requested size (0 = none)        */
+#define FB_MIN_W 640u
+#define FB_MIN_H 400u
+#define POLL_MS 250u
 
 /* Runtime-switchable modes (DISPI only); buffers are sized for the largest, keep it last. */
 static const struct {
@@ -222,9 +232,11 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
 
   uint32_t pitch_px = pitch_bytes / 4;
   uint32_t pixels = pitch_px * h;
+  uint32_t cap = cap_hint > pixels ? cap_hint : pixels;
+  cap_hint = 0;
 
-  /* Map the whole visible region; paging_identity_map allocates page tables as needed. */
-  if (paging_identity_map(phys, pixels * 4) < 0)
+  /* Map the whole capacity; paging_identity_map allocates page tables as needed. */
+  if (paging_identity_map(phys, cap * 4) < 0)
     return -1;
   front = (uint32_t *)(uintptr_t)phys;
 
@@ -232,7 +244,7 @@ int fb_adopt(uint32_t phys, uint32_t w, uint32_t h, uint32_t pitch_bytes, uint32
   fb_h = h;
   fb_pitch = pitch_px;
   fb_pixels = pixels;
-  fb_cap = pixels;
+  fb_cap = cap;
   can_mode = false;
 
   enable_wc();
@@ -307,7 +319,7 @@ int fb_init(uint32_t want_w, uint32_t want_h)
   return 0;
 }
 
-int fb_can_set_mode(void) { return active && can_mode; }
+int fb_can_set_mode(void) { return active && (can_mode || mode_hook); }
 int fb_mode_count(void) { return FB_NMODES; }
 
 int fb_mode_get(int i, uint32_t *w, uint32_t *h)
@@ -319,23 +331,22 @@ int fb_mode_get(int i, uint32_t *w, uint32_t *h)
   return 1;
 }
 
-/* Reprogram DISPI to an offered mode, clear and present. Compositor thread only. */
-int fb_set_mode(uint32_t w, uint32_t h)
+void fb_set_mode_hooks(int (*set)(uint32_t w, uint32_t h, uint32_t *pitch_bytes), int (*poll)(uint32_t *w, uint32_t *h))
 {
-  if (!active || !can_mode)
-    return -1;
+  mode_hook = set;
+  size_poll_hook = poll;
+}
 
-  bool known = false;
-  for (int i = 0; i < FB_NMODES; i++)
-    if (fb_modes[i].w == w && fb_modes[i].h == h) {
-      known = true;
-      break;
-    }
-  if (!known || w * h > fb_cap)
-    return -1;
-  if (w == fb_w && h == fb_h)
-    return 0;
+void fb_set_capacity(uint32_t pixels) { cap_hint = pixels; }
 
+void fb_request_size(uint32_t w, uint32_t h)
+{
+  req_h = h;
+  req_w = w;
+}
+
+static void dispi_program(uint32_t w, uint32_t h)
+{
   dispi_write(VBE_DISPI_ENABLE, 0);
   dispi_write(VBE_DISPI_XRES, (uint16_t)w);
   dispi_write(VBE_DISPI_YRES, (uint16_t)h);
@@ -345,16 +356,69 @@ int fb_set_mode(uint32_t w, uint32_t h)
   dispi_write(VBE_DISPI_XOFF, 0);
   dispi_write(VBE_DISPI_YOFF, 0);
   dispi_write(VBE_DISPI_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED);
-  if (dispi_read(VBE_DISPI_XRES) != (uint16_t)w || dispi_read(VBE_DISPI_YRES) != (uint16_t)h)
+}
+
+/* Switch to w x h: DISPI offers the fb_modes list, adapters with a mode hook take any size up to fb_cap. */
+int fb_set_mode(uint32_t w, uint32_t h)
+{
+  if (!active || !(can_mode || mode_hook))
     return -1;
+  if (w == fb_w && h == fb_h)
+    return 0;
+  if (w < FB_MIN_W || h < FB_MIN_H || w > 0xFFFFu || h > 0xFFFFu || w * h > fb_cap)
+    return -1;
+
+  uint32_t pitch = w;
+  if (can_mode) {
+    bool known = false;
+    for (int i = 0; i < FB_NMODES; i++)
+      if (fb_modes[i].w == w && fb_modes[i].h == h)
+        known = true;
+    if (!known)
+      return -1;
+    dispi_program(w, h);
+    if (dispi_read(VBE_DISPI_XRES) != (uint16_t)w || dispi_read(VBE_DISPI_YRES) != (uint16_t)h)
+      return -1;
+  } else {
+    uint32_t pitch_bytes = 0;
+    if (mode_hook(w, h, &pitch_bytes) < 0)
+      return -1;
+    pitch = pitch_bytes / 4;
+    if (pitch < w || pitch * h > fb_cap) {
+      uint32_t old_pitch;
+      mode_hook(fb_w, fb_h, &old_pitch);
+      return -1;
+    }
+  }
 
   fb_w = w;
   fb_h = h;
-  fb_pitch = w;
-  fb_pixels = w * h;
+  fb_pitch = pitch;
+  fb_pixels = pitch * h;
+  dirty_x1 = dirty_x0;
   fb_fill_rect(0, 0, (int)fb_w, (int)fb_h, 0x000000);
   fb_present();
   return 0;
+}
+
+/* Apply a size the host asked for (guest tools or the adapter's own poll). Called from SYS_FB_INFO. */
+void fb_poll_resize(void)
+{
+  static uint32_t next_poll;
+  if (!active || !mode_hook)
+    return;
+  uint32_t now = timer_ticks();
+  if (size_poll_hook && (int32_t)(now - next_poll) >= 0) {
+    next_poll = now + POLL_MS * TIMER_HZ / 1000u;
+    uint32_t w, h;
+    if (size_poll_hook(&w, &h))
+      fb_request_size(w, h);
+  }
+  uint32_t w = req_w, h = req_h;
+  if (!w || !h)
+    return;
+  req_w = req_h = 0;
+  fb_set_mode(w, h);
 }
 
 /* Copy [x,y,w,h) of the back buffer to VRAM, dimmed; rect must be pre-clipped. */
