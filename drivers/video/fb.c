@@ -2,6 +2,7 @@
  * Sets a 32-bpp mode via PCI BAR0 with no BIOS call; fb_init returns -1 if no
  * DISPI adapter answers (the kernel keeps its VGA text console). */
 
+#include "edid.h"
 #include "fb.h"
 #include "font_aa.h"
 #include "heap.h"
@@ -57,6 +58,12 @@ static int brightness = FB_BRIGHT_MAX;
 #define FB_HZ_MIN 20
 #define FB_HZ_MAX 240
 static int target_hz = 60;
+
+/* UI scale: 0 = auto from the monitor's DPI, else an integer factor; via fb0/scale. */
+#define FB_SCALE_MAX 4
+#define FB_LOGICAL_MIN_W 640
+#define FB_LOGICAL_MIN_H 400
+static int ui_scale;
 
 /* Scale a pixel by brightness (>>3, MAX is 8); red and blue share one multiply in 16-bit lanes. */
 static inline uint32_t dim_px(uint32_t p)
@@ -427,6 +434,21 @@ void fb_dims(int *w, int *h, int *pitch, int *bpp)
     *pitch = (int)fb_pitch;
   if (bpp)
     *bpp = 32;
+}
+
+int fb_ui_scale(void) { return ui_scale; }
+void fb_set_ui_scale(int s) { ui_scale = s < 0 || s > FB_SCALE_MAX ? ui_scale : s; }
+
+int fb_ui_scale_active(void)
+{
+  int s = ui_scale;
+  if (s == 0) {
+    int dpi = edid_dpi();
+    s = dpi < 144 ? 1 : dpi < 240 ? 2 : dpi < 336 ? 3 : 4;
+  }
+  while (s > 1 && (fb_w / (uint32_t)s < FB_LOGICAL_MIN_W || fb_h / (uint32_t)s < FB_LOGICAL_MIN_H))
+    s--;
+  return s;
 }
 
 int fb_target_hz(void) { return target_hz; }

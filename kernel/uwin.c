@@ -249,7 +249,8 @@ int uwin_create(int w, int h, const char *title)
   /* Cascade the initial frame so it opens on-screen. */
   int win_w = w + 2 * WM_BORDER;
   int win_h = h + WM_TITLE_H + WM_BORDER;
-  int sw = (int)fb_width(), sh = (int)fb_height();
+  int scale = fb_ui_scale_active();
+  int sw = (int)fb_width() / scale, sh = (int)fb_height() / scale;
   int step = 26, margin = 40;
   int rng_x = sw - win_w - margin;
   int rng_y = sh - WM_BAR_H - win_h - margin;

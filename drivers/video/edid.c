@@ -36,7 +36,7 @@ static volatile uint8_t *mmio; /* mapped GPU BAR0                         */
 static uint32_t base;          /* current GMBUS block offset             */
 
 static bool probed; /* one-shot guard                         */
-static int cached_hz, cached_w, cached_h;
+static int cached_hz, cached_w, cached_h, cached_dpi;
 static char cached_mfg[4];   /* 3-letter PNP manufacturer id           */
 static char cached_name[16]; /* monitor-name descriptor (0xFC), if any */
 static bool cached_internal; /* PNP id is a known laptop-panel vendor  */
@@ -155,6 +155,12 @@ static int parse_preferred(const uint8_t *e)
   cached_hz = (int)((pclk * 10000u + total / 2) / total);
   cached_w = (int)hact;
   cached_h = (int)vact;
+
+  uint32_t mm = d[12] | (((uint32_t)d[14] >> 4) << 8);
+  if (mm == 0)
+    mm = (uint32_t)e[21] * 10; /* base block: max image width in cm */
+  if (mm)
+    cached_dpi = (int)((hact * 254u + mm * 5u) / (mm * 10u));
   return 0;
 }
 
@@ -266,6 +272,11 @@ int edid_height(void)
 {
   ensure();
   return cached_h;
+}
+int edid_dpi(void)
+{
+  ensure();
+  return cached_dpi;
 }
 int edid_internal(void)
 {

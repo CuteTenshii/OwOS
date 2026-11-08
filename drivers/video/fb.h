@@ -26,6 +26,13 @@ void fb_present_rects(const struct fb_rect *r, int n); /* one WC drain for the b
 int fb_target_hz(void);
 void fb_set_target_hz(int hz);
 
+/* Desktop UI scale (integer pixel multiplier). The setting is 0 (auto, from the
+ * monitor's EDID DPI) or 1..4; the active value is what the compositor applies,
+ * reduced so the logical screen stays at least 640x400. */
+int fb_ui_scale(void);
+void fb_set_ui_scale(int s); /* ignores values outside 0..4 */
+int fb_ui_scale_active(void);
+
 /* Runtime mode switching (DISPI only; not for adopted framebuffers). Returns 0, or -1. Compositor thread only. */
 int fb_can_set_mode(void);
 int fb_mode_count(void);

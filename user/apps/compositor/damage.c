@@ -1,4 +1,5 @@
-#include "compositor_damage.h"
+/* damage.c: dirty-rect list for partial repaints */
+#include "comp.h"
 
 #include <stdbool.h>
 

@@ -9,6 +9,8 @@
  *   /sys/class/net/eth0/{address,carrier,ipaddr}              (ro)
  *   /sys/class/block/<dev>/{model,size}                       (ro)
  *   /sys/class/graphics/fb0/{width,height,refresh,monitor,internal}  (ro)
+ *   /sys/class/graphics/fb0/{dpi,scale_active}  EDID DPI, applied UI scale (ro)
+ *   /sys/class/graphics/fb0/scale              UI scale "auto"|1..4 (rw)
  *   /sys/class/graphics/fb0/{mode,modes}       screen resolution   (rw/ro,
  * DISPI) /sys/class/sound/card0/{output,outputs}    audio output select (rw/ro)
  *   /sys/class/dmi/id/{product_name,sys_vendor}               (ro, SMBIOS)
@@ -345,11 +347,12 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
         return eq(seg[2], "fb0") ? S_DIR : S_NONE;
       if (n == 4 && eq(seg[2], "fb0")) {
         if (eq(seg[3], "width") || eq(seg[3], "height") || eq(seg[3], "refresh") || eq(seg[3], "monitor") ||
-            eq(seg[3], "internal") || eq(seg[3], "modes"))
+            eq(seg[3], "internal") || eq(seg[3], "modes") || eq(seg[3], "dpi") ||
+            eq(seg[3], "scale_active"))
           return S_FILE_RO;
         if (eq(seg[3], "mode")) /* rw only where we can drive the mode */
           return fb_can_set_mode() ? S_FILE_RW : S_FILE_RO;
-        if (eq(seg[3], "rate") || eq(seg[3], "brightness")) /* rate: compositor frame-pacing target (Hz) */
+        if (eq(seg[3], "rate") || eq(seg[3], "brightness") || eq(seg[3], "scale")) /* rate: compositor frame-pacing target (Hz) */
           return S_FILE_RW;
       }
       return S_NONE;
@@ -494,6 +497,24 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
       }
       if (eq(seg[3], "internal")) {
         ps(b, edid_internal() ? "1" : "0");
+        pc(b, '\n');
+        return;
+      }
+      if (eq(seg[3], "dpi")) { /* EDID pixels per inch, 0 if unknown */
+        pu(b, (uint32_t)edid_dpi());
+        pc(b, '\n');
+        return;
+      }
+      if (eq(seg[3], "scale")) { /* the UI scale setting: "auto" or 1..4 */
+        if (fb_ui_scale())
+          pu(b, (uint32_t)fb_ui_scale());
+        else
+          ps(b, "auto");
+        pc(b, '\n');
+        return;
+      }
+      if (eq(seg[3], "scale_active")) { /* the factor the compositor applies */
+        pu(b, (uint32_t)fb_ui_scale_active());
         pc(b, '\n');
         return;
       }
@@ -699,6 +720,16 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
       return -1;
     return fb_set_mode((uint32_t)w, (uint32_t)h);
   }
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0") && eq(seg[3], "scale")) {
+    if (arg[0] == 'a') {
+      fb_set_ui_scale(0);
+      return 0;
+    }
+    if (arg[0] < '1' || arg[0] > '4')
+      return -1;
+    fb_set_ui_scale(arg[0] - '0');
+    return 0;
+  }
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0") && eq(seg[3], "rate")) {
     int hz = 0;
     const char *p = arg;
@@ -886,8 +917,9 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
   }
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0")) {
     static const char *const k[] = {"width", "height", "refresh", "monitor",   "internal",
-                                    "mode",  "modes",  "rate",    "brightness"};
-    hit = from_list(idx, name, max, k, 9);
+                                    "mode",  "modes",  "rate",    "brightness", "dpi",
+                                    "scale", "scale_active"};
+    hit = from_list(idx, name, max, k, 12);
     if (hit && is_dir)
       *is_dir = 0;
     return hit;

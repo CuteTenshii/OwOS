@@ -77,6 +77,11 @@ static int rate_n;
 static int rate_cur; /* index of the active rate, -1 if none */
 static struct select_box rate_sel;
 
+/* Interface scale: Auto (EDID DPI) or 1x..4x over /sys/class/graphics/fb0/scale */
+static const char *const scale_opts[] = {"Auto", "100%", "200%", "300%", "400%"};
+static int scale_cur;
+static struct select_box scale_sel;
+
 static char about_line[10][72]; /* About: one formatted line per row */
 static int about_n;
 
@@ -342,6 +347,15 @@ static void load_rate(void)
   select_init(&rate_sel, rate_opts, rate_n, rate_cur < 0 ? 0 : rate_cur);
 }
 
+static void load_scale(void)
+{
+  char t[12];
+  scale_cur = 0;
+  if (read_proc("/sys/class/graphics/fb0/scale", t, sizeof t) > 0 && t[0] >= '1' && t[0] <= '4')
+    scale_cur = t[0] - '0';
+  select_init(&scale_sel, scale_opts, 5, scale_cur);
+}
+
 static void aline(const char *s)
 {
   if (about_n >= 10)
@@ -429,6 +443,7 @@ static void load_category(int cat)
   else if (cat == CAT_DISPLAY) {
     load_display();
     load_rate();
+    load_scale();
   } else if (cat == CAT_ABOUT)
     load_about();
   build_controls(cat);
@@ -484,6 +499,17 @@ static void set_rate(int i)
   /* The kernel clamps and stores it; the compositor polls the node and re-paces */
   if (writefile("/sys/class/graphics/fb0/rate", t, strlen(t)) == 0)
     rate_cur = i;
+}
+
+static void set_scale(int i)
+{
+  char t[8] = "auto";
+  if (i > 0) {
+    t[0] = '0' + i;
+    t[1] = 0;
+  }
+  if (writefile("/sys/class/graphics/fb0/scale", t, strlen(t)) == 0)
+    scale_cur = i;
 }
 
 /* layout / paint */
@@ -583,6 +609,7 @@ static void ap_kbd(int i) { set_kbd_layout(kbd_opts[i].name); }
 static void ap_sound(int i) { set_sound_output(i); }
 static void ap_display(int i) { set_display(i); }
 static void ap_rate(int i) { set_rate(i); }
+static void ap_scale(int i) { set_scale(i); }
 
 static void addc(const char *label, const char *hint, struct select_box *sel, void (*apply)(int))
 {
@@ -616,6 +643,7 @@ static void build_controls(int cat)
       addc("Resolution", disp_fixed ? "Resolution is fixed by the bootloader." : "Resolution applies immediately.",
            &disp_sel, ap_display);
       addc("Refresh rate", "Frame rate the desktop renders at.", &rate_sel, ap_rate);
+      addc("Interface scale", "Auto follows the monitor's DPI. Applies immediately.", &scale_sel, ap_scale);
     }
     break;
   }

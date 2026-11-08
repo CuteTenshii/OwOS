@@ -24,6 +24,10 @@ int edid_refresh_hz(void);
 int edid_width(void);
 int edid_height(void);
 
+/* Horizontal pixels per inch from the preferred timing and the panel's physical
+ * width (0 if unknown). Shares the one-shot probe. */
+int edid_dpi(void);
+
 /* The attached monitor's brand+model decoded from EDID ("<brand> <model>", e.g.
  * "Dell U2412M"), written NUL-terminated into out; "" if no EDID was read. The
  * model half (the 0xFC monitor-name descriptor) is optional, so a bare panel
