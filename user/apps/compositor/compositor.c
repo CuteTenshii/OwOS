@@ -1934,6 +1934,16 @@ static void key_to_focus(int c, int mods)
   win_deliver(cur[t].id, &ev);
 }
 
+static void close_focused(void)
+{
+  int t = topmost_visible();
+  if (t < 0)
+    return;
+  int mb = blocking_modal(t);
+  struct winevent ev = {WEV_CLOSE, 0, 0};
+  win_deliver(mb >= 0 ? mb : cur[t].id, &ev);
+}
+
 static bool title_is(const char *a, const char *b)
 {
   while (*a && *a == *b)
@@ -2049,6 +2059,10 @@ static void feed_key(int c, int mods)
   }
   if (special_key(c))
     return;
+  if (c == KEY_F4 && (mods & KMOD_ALT)) {
+    close_focused();
+    return;
+  }
   if (c == KEY_PRTSC) {
     take_screenshot();
     return;
