@@ -376,6 +376,11 @@ static void walk_element_inner(struct dom_node *el)
     W_mono = 1;
     W_pre = 1;
   }
+  if (streq(name, "kbd")) {
+    W_mono = 1;
+    if (cs.bg < 0)
+      W_bg = 0xe8eaee; /* keycap tint */
+  }
   if (streq(name, "blockquote"))
     W_indent = (unsigned char)(W_indent < 7 ? W_indent + 1 : 7);
   if (streq(name, "ul") || streq(name, "ol")) {
