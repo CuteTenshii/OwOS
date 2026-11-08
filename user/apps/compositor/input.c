@@ -18,7 +18,6 @@ static int rsz_edge;
 static int rsz_ox, rsz_oy, rsz_ow, rsz_oh, rsz_mx0, rsz_my0;
 static int app_drag_id = -1;
 
-
 bool prev_down, prev_rdown;
 int prev_wheel;
 

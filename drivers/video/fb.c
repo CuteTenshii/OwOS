@@ -2,8 +2,8 @@
  * Sets a 32-bpp mode via PCI BAR0 with no BIOS call; fb_init returns -1 if no
  * DISPI adapter answers (the kernel keeps its VGA text console). */
 
-#include "edid.h"
 #include "fb.h"
+#include "edid.h"
 #include "font_aa.h"
 #include "heap.h"
 #include "io.h"

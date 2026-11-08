@@ -347,12 +347,12 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
         return eq(seg[2], "fb0") ? S_DIR : S_NONE;
       if (n == 4 && eq(seg[2], "fb0")) {
         if (eq(seg[3], "width") || eq(seg[3], "height") || eq(seg[3], "refresh") || eq(seg[3], "monitor") ||
-            eq(seg[3], "internal") || eq(seg[3], "modes") || eq(seg[3], "dpi") ||
-            eq(seg[3], "scale_active"))
+            eq(seg[3], "internal") || eq(seg[3], "modes") || eq(seg[3], "dpi") || eq(seg[3], "scale_active"))
           return S_FILE_RO;
         if (eq(seg[3], "mode")) /* rw only where we can drive the mode */
           return fb_can_set_mode() ? S_FILE_RW : S_FILE_RO;
-        if (eq(seg[3], "rate") || eq(seg[3], "brightness") || eq(seg[3], "scale")) /* rate: compositor frame-pacing target (Hz) */
+        if (eq(seg[3], "rate") || eq(seg[3], "brightness") ||
+            eq(seg[3], "scale")) /* rate: compositor frame-pacing target (Hz) */
           return S_FILE_RW;
       }
       return S_NONE;
@@ -916,9 +916,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     return hit;
   }
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "graphics") && eq(seg[2], "fb0")) {
-    static const char *const k[] = {"width", "height", "refresh", "monitor",   "internal",
-                                    "mode",  "modes",  "rate",    "brightness", "dpi",
-                                    "scale", "scale_active"};
+    static const char *const k[] = {"width", "height", "refresh",    "monitor", "internal", "mode",
+                                    "modes", "rate",   "brightness", "dpi",     "scale",    "scale_active"};
     hit = from_list(idx, name, max, k, 12);
     if (hit && is_dir)
       *is_dir = 0;

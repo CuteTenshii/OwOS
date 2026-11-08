@@ -1125,7 +1125,7 @@ int png_decode(png_reader rd, void *rctx, png_row row, void *row_ctx, unsigned *
       d->in_chunk = 1; /* first IDAT open    */
       break;
     } else if (is_type(ty, "IEND")) {
-      return PNG_ETRUNC;              /* no image data     */
+      return PNG_ETRUNC;               /* no image data     */
     } else if (skip(d, len + 4) < 0) { /* ancillary + CRC    */
       return PNG_ETRUNC;
     }
@@ -1156,7 +1156,7 @@ int png_decode(png_reader rd, void *rctx, png_row row, void *row_ctx, unsigned *
 
   if (d->interlaced) {
     if (d->pass < 7)
-      return PNG_EINFLATE;               /* didn't finish passes   */
+      return PNG_EINFLATE;                /* didn't finish passes   */
     for (unsigned y = 0; y < d->h; y++) { /* emit the assembled rows*/
       if (d->row(d->row_ctx, y, il_frame + (unsigned long)y * d->w * 4, d->w) < 0)
         return PNG_OK; /* caller stopped: fine   */

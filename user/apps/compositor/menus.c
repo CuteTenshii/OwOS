@@ -73,10 +73,7 @@ int pw_x(void) { return (screen_w - PW_W) / 2; }
 int pw_h(void) { return PW_TITLE_H + PW_ROWS * PW_ROW_H + PW_PAD; }
 int pw_y(void) { return (screen_h - pw_h()) / 2; }
 bool pw_enabled(int row) { return row != PA_SLEEP || can_sleep; }
-bool pw_inside(int mx, int my)
-{
-  return mx >= pw_x() && mx < pw_x() + PW_W && my >= pw_y() && my < pw_y() + pw_h();
-}
+bool pw_inside(int mx, int my) { return mx >= pw_x() && mx < pw_x() + PW_W && my >= pw_y() && my < pw_y() + pw_h(); }
 int pw_row_at(int mx, int my)
 {
   int rel = my - pw_y() - PW_TITLE_H;

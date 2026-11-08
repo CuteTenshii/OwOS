@@ -71,7 +71,8 @@ static void downscale(const unsigned *src, unsigned w, unsigned h, unsigned *out
           a += pa;
           n++;
         }
-      out[dy * ICON_PX + dx] = a ? (unsigned)(a / n) << 24 | (unsigned)(r / a) << 16 | (unsigned)(g / a) << 8 | (unsigned)(b / a) : 0;
+      out[dy * ICON_PX + dx] =
+          a ? (unsigned)(a / n) << 24 | (unsigned)(r / a) << 16 | (unsigned)(g / a) << 8 | (unsigned)(b / a) : 0;
     }
 }
 

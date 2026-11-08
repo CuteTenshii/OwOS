@@ -24,15 +24,13 @@ static const char *const grab_glyph[] = {
     "   X.........X  ", "   X........X   ", "    XXXXXXXX    ",
 };
 static const char *const grabbing_glyph[] = {
-    "                ", "                ", "    XX XX XX    ", "  XX..X..X..XX  ", " X..X.......X.X ",
-    " X...........X.X", " X............X ", " X............X ", "  X..........X  ", "  X.........X   ",
-    "   XXXXXXXXXX   ",
+    "                ", "                ", "    XX XX XX    ", "  XX..X..X..XX  ",
+    " X..X.......X.X ", " X...........X.X", " X............X ", " X............X ",
+    "  X..........X  ", "  X.........X   ", "   XXXXXXXXXX   ",
 };
 static const struct cur_shape cur_shapes[] = {
-    [CUR_ARROW] = {arrow_glyph, 19, 0, 0},
-    [CUR_HAND] = {hand_glyph, 14, 2, 0},
-    [CUR_TEXT] = {text_glyph, 14, 2, 7},
-    [CUR_GRAB] = {grab_glyph, 13, 8, 6},
+    [CUR_ARROW] = {arrow_glyph, 19, 0, 0},       [CUR_HAND] = {hand_glyph, 14, 2, 0},
+    [CUR_TEXT] = {text_glyph, 14, 2, 7},         [CUR_GRAB] = {grab_glyph, 13, 8, 6},
     [CUR_GRABBING] = {grabbing_glyph, 11, 8, 6},
 };
 unsigned cursor_frame;

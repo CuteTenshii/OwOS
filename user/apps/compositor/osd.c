@@ -124,7 +124,6 @@ void draw_osd(void)
   gfx_ui_text(x + OSD_W - 14 - gfx_ui_width(t), cy - UIFONT_H / 2, t, OSD_FG);
 }
 
-
 void draw_power(void)
 {
   int x = pw_x(), y = pw_y();

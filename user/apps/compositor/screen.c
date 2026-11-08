@@ -2,13 +2,13 @@
 #include "comp.h"
 
 /* screen + back buffer */
-unsigned *back;         /* surface the desktop is drawn into */
-static unsigned *logical;      /* heap surface used when ui_scale > 1 */
-int screen_w, screen_h; /* visible dimensions */
-int fb_pitch;           /* back-buffer stride in pixels (== gfx surface w) */
+unsigned *back;           /* surface the desktop is drawn into */
+static unsigned *logical; /* heap surface used when ui_scale > 1 */
+int screen_w, screen_h;   /* visible dimensions */
+int fb_pitch;             /* back-buffer stride in pixels (== gfx surface w) */
 
 /* HiDPI: the desktop is drawn at logical size (hw / ui_scale) and replicated up on present */
-static unsigned *hw;             /* mapped framebuffer shadow at hardware size */
+static unsigned *hw;      /* mapped framebuffer shadow at hardware size */
 int hw_w, hw_h, hw_pitch; /* hardware dimensions (pixels) */
 int ui_scale = 1;
 bool scale_stale; /* the kernel's active scale differs from ui_scale */

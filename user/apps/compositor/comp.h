@@ -19,8 +19,23 @@
 #define WM_EDGE 5
 #define WM_MIN_W 140
 #define WM_MIN_H 120
-enum { CUR_ARROW = 0, CUR_HAND, CUR_TEXT, CUR_BUSY, CUR_RESIZE_NWSE, CUR_RESIZE_NESW, CUR_RESIZE_NS, CUR_RESIZE_EW,
-       CUR_MOVE, CUR_NOT_ALLOWED, CUR_CROSSHAIR, CUR_HELP, CUR_GRAB, CUR_GRABBING, CUR_PROGRESS };
+enum {
+  CUR_ARROW = 0,
+  CUR_HAND,
+  CUR_TEXT,
+  CUR_BUSY,
+  CUR_RESIZE_NWSE,
+  CUR_RESIZE_NESW,
+  CUR_RESIZE_NS,
+  CUR_RESIZE_EW,
+  CUR_MOVE,
+  CUR_NOT_ALLOWED,
+  CUR_CROSSHAIR,
+  CUR_HELP,
+  CUR_GRAB,
+  CUR_GRABBING,
+  CUR_PROGRESS
+};
 #define KEY_TAB '\t'
 #define KEY_ALT_UP 0x1B /* internal: "Alt released" marker (kernel wm KEY_ALT_UP) */
 #define WM_LIST_MAX 64
@@ -115,7 +130,6 @@ struct pfsnap {
   bool vis, min;
   unsigned seq;
 };
-
 
 /* screen.c */
 extern unsigned *back;

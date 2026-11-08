@@ -25,7 +25,7 @@ static int load_ok;       /* a valid image is loaded */
 static bool is_webp;      /* the loaded image is WebP, not PNG */
 
 static struct png_meta meta; /* probed metadata for curpath */
-static int meta_valid;        /* meta + the props list match curpath */
+static int meta_valid;       /* meta + the props list match curpath */
 
 static int props_open;  /* the properties overlay is showing */
 static int prop_scroll; /* first visible properties row */
