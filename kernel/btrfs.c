@@ -776,6 +776,8 @@ static int bt_dir_read(struct bt_mount *m, const struct bt_ref *dir, uint32_t n,
       return -1;
     if (k.objectid != dir->ino || k.type != BT_K_DIR_INDEX)
       return 0;
+    if (k.offset < start) /* an unsorted leaf made the seek land before the cursor: the next index would repeat */
+      return -1;
     if (bt_dir_item(d, sz, out)) {
       if (skip == 0) {
         m->cur_valid = k.offset != ~0ull;
