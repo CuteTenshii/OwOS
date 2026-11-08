@@ -9,18 +9,20 @@ int main(int argc, char **argv)
   const char *server = "stun.l.google.com";
   int port = 19302; /* Google's public STUN */
 
-  static const struct opt opts[] = {{'h', "help", OPT_FLAG, 'h'}};
+  static const struct opt opts[] = {{'h', "help", OPT_FLAG, 'h', 0, "show this help"}};
   struct optstate st;
   int npos = 0;
   opt_init(&st, argc, argv);
   for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
     unsigned p;
     if (o == 'h') {
-      puts("usage: stun [server] [port]   (default stun.l.google.com 19302)\n");
+      opt_print_help("stun", "[SERVER [PORT]]",
+                     "Ask a STUN server for the public address (default stun.l.google.com 19302).", opts, OPT_N(opts));
       return 0;
     }
     if (o != OPT_POS) {
       printf("stun: unknown option %s\n", st.bad);
+      opt_print_usage("stun", "[SERVER [PORT]]", opts, OPT_N(opts));
       return 1;
     }
     if (npos++ == 0) {

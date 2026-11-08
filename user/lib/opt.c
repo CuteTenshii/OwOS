@@ -130,3 +130,148 @@ int opt_uint(const char *s, unsigned *out)
   *out = v;
   return 0;
 }
+
+struct out {
+  char *buf;
+  int cap, len;
+};
+
+static void put(struct out *o, const char *s)
+{
+  for (; *s; s++, o->len++)
+    if (o->len + 1 < o->cap)
+      o->buf[o->len] = *s;
+}
+
+static void putc_(struct out *o, char c)
+{
+  char s[2] = {c, 0};
+  put(o, s);
+}
+
+static int finish(struct out *o)
+{
+  if (o->cap > 0)
+    o->buf[o->len < o->cap ? o->len : o->cap - 1] = '\0';
+  return o->len;
+}
+
+static int slen(const char *s)
+{
+  int n = 0;
+  while (s[n])
+    n++;
+  return n;
+}
+
+static const char *meta_of(const struct opt *o) { return o->meta ? o->meta : "ARG"; }
+
+static void usage_line(struct out *o, const char *prog, const char *args, const struct opt *tbl, int n)
+{
+  int clustered = 0;
+  put(o, "usage: ");
+  put(o, prog);
+  for (int i = 0; i < n; i++)
+    if (tbl[i].sh && tbl[i].has_arg == OPT_FLAG) {
+      if (!clustered)
+        put(o, " [-");
+      putc_(o, tbl[i].sh);
+      clustered = 1;
+    }
+  if (clustered)
+    putc_(o, ']');
+  for (int i = 0; i < n; i++) {
+    const struct opt *t = &tbl[i];
+    if (t->has_arg == OPT_FLAG && t->sh)
+      continue;
+    if (!t->sh && !t->lng)
+      continue;
+    put(o, " [");
+    if (t->sh) {
+      putc_(o, '-');
+      putc_(o, t->sh);
+    } else {
+      put(o, "--");
+      put(o, t->lng);
+    }
+    if (t->has_arg == OPT_ARG) {
+      putc_(o, ' ');
+      put(o, meta_of(t));
+    }
+    putc_(o, ']');
+  }
+  if (args && *args) {
+    putc_(o, ' ');
+    put(o, args);
+  }
+  putc_(o, '\n');
+}
+
+int opt_usage(char *buf, int cap, const char *prog, const char *args, const struct opt *tbl, int n)
+{
+  struct out o = {buf, cap, 0};
+  usage_line(&o, prog, args, tbl, n);
+  return finish(&o);
+}
+
+/* Width of "-o, --out META" for one row */
+static int row_width(const struct opt *t)
+{
+  int w = 0;
+  if (t->sh)
+    w += 2;
+  if (t->sh && t->lng)
+    w += 2;
+  if (t->lng)
+    w += 2 + slen(t->lng);
+  else if (!t->sh)
+    return 0;
+  if (t->has_arg == OPT_ARG)
+    w += 1 + slen(meta_of(t));
+  return w;
+}
+
+int opt_help(char *buf, int cap, const char *prog, const char *args, const char *summary, const struct opt *tbl, int n)
+{
+  struct out o = {buf, cap, 0};
+  int width = 0;
+  usage_line(&o, prog, args, tbl, n);
+  if (summary && *summary) {
+    putc_(&o, '\n');
+    put(&o, summary);
+    putc_(&o, '\n');
+  }
+  for (int i = 0; i < n; i++)
+    if (row_width(&tbl[i]) > width)
+      width = row_width(&tbl[i]);
+  if (width)
+    put(&o, "\noptions:\n");
+  for (int i = 0; i < n; i++) {
+    const struct opt *t = &tbl[i];
+    int w = row_width(t);
+    if (!w)
+      continue;
+    put(&o, "  ");
+    if (t->sh) {
+      putc_(&o, '-');
+      putc_(&o, t->sh);
+    }
+    if (t->sh && t->lng)
+      put(&o, ", ");
+    if (t->lng) {
+      put(&o, "--");
+      put(&o, t->lng);
+    }
+    if (t->has_arg == OPT_ARG) {
+      putc_(&o, ' ');
+      put(&o, meta_of(t));
+    }
+    if (t->help && *t->help) {
+      for (; w < width + 2; w++)
+        putc_(&o, ' ');
+      put(&o, t->help);
+    }
+    putc_(&o, '\n');
+  }
+  return finish(&o);
+}

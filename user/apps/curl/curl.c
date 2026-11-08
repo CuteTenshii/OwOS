@@ -61,13 +61,22 @@ int main(int argc, char **argv)
   int xhlen = 0; /* -H request headers ("name: value\r\n"…) */
 
   static const struct opt opts[] = {
-      {'i', 0, OPT_FLAG, 'i'}, {0, "http2", OPT_FLAG, '2'},       {'3', "http3", OPT_FLAG, '3'}, {'X', 0, OPT_ARG, 'X'},
-      {'o', 0, OPT_ARG, 'o'},  {'A', "user-agent", OPT_ARG, 'A'}, {'H', 0, OPT_ARG, 'H'},
+      {'i', 0, OPT_FLAG, 'i', 0, "print the response headers"},
+      {0, "http2", OPT_FLAG, '2', 0, "use HTTP/2"},
+      {'3', "http3", OPT_FLAG, '3', 0, "use HTTP/3"},
+      {'X', 0, OPT_ARG, 'X', "METHOD", "request method (default GET)"},
+      {'o', 0, OPT_ARG, 'o', "FILE", "save the body to FILE"},
+      {'A', "user-agent", OPT_ARG, 'A', "UA", "User-Agent to send"},
+      {'H', 0, OPT_ARG, 'H', "\"NAME: VALUE\"", "add a request header (repeatable)"},
+      {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
   };
   struct optstate st;
   opt_init(&st, argc, argv);
   for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
-    if (o == 'i') {
+    if (o == 'h') {
+      opt_print_help("curl", "URL", "Fetch URL over HTTP or HTTPS.", opts, OPT_N(opts));
+      return 0;
+    } else if (o == 'i') {
       show_headers = true;
     } else if (o == '2') {
       http2 = true;
@@ -98,8 +107,7 @@ int main(int argc, char **argv)
   }
 
   if (!url) {
-    puts("usage: curl [-i] [--http2] [--http3|-3] [-X method] [-A ua] "
-         "[-H \"Name: value\"] [-o file] <url>\n");
+    opt_print_usage("curl", "URL", opts, OPT_N(opts));
     return 1;
   }
 

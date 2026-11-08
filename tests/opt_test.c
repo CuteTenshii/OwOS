@@ -7,9 +7,12 @@
 enum { O_VERB = 1, O_COUNT, O_OUT, O_LONGONLY };
 
 static const struct opt tbl[] = {
-    {'v', "verbose", OPT_FLAG, O_VERB}, {'x', 0, OPT_FLAG, 'x'},
-    {'c', "count", OPT_ARG, O_COUNT},   {'o', "output", OPT_ARG, O_OUT},
-    {0, "http3", OPT_FLAG, O_LONGONLY},
+    {'v', "verbose", OPT_FLAG, O_VERB, 0, "print more"},
+    {'x', 0, OPT_FLAG, 'x', 0, "exclude nothing"},
+    {'c', "count", OPT_ARG, O_COUNT, "N", "repeat N times"},
+    {'o', "output", OPT_ARG, O_OUT},
+    {0, "http3", OPT_FLAG, O_LONGONLY, 0, "use HTTP/3"},
+    {0, "proxy", OPT_ARG, 0, "URL", "send requests through URL"},
 };
 
 static int run(char **argv, int *ids, const char **vals, int max)
@@ -84,6 +87,39 @@ int main(void)
   char *a10[] = {"prog", "--cou", 0};
   n = run(a10, ids, vals, 16);
   expect(n == 1 && ids[0] == OPT_BAD);
+
+  test("usage lists clustered flags, valued options and the synopsis");
+  char out[512];
+  int len = opt_usage(out, sizeof out, "prog", "FILE...", tbl, OPT_N(tbl));
+  expect(!strcmp(out, "usage: prog [-vx] [-c N] [-o ARG] [--http3] [--proxy URL] FILE...\n"));
+  expect(len == (int)strlen(out));
+
+  test("help aligns descriptions and tolerates a missing one");
+  len = opt_help(out, sizeof out, "prog", "FILE...", "Fetch FILE.", tbl, OPT_N(tbl));
+  expect(!strcmp(out,
+                 "usage: prog [-vx] [-c N] [-o ARG] [--http3] [--proxy URL] FILE...\n"
+                 "\n"
+                 "Fetch FILE.\n"
+                 "\n"
+                 "options:\n"
+                 "  -v, --verbose     print more\n"
+                 "  -x                exclude nothing\n"
+                 "  -c, --count N     repeat N times\n"
+                 "  -o, --output ARG\n"
+                 "  --http3           use HTTP/3\n"
+                 "  --proxy URL       send requests through URL\n"));
+  expect(len == (int)strlen(out));
+
+  test("truncation keeps the buffer terminated and reports the full length");
+  char small[16];
+  len = opt_usage(small, sizeof small, "prog", "FILE...", tbl, OPT_N(tbl));
+  expect(len > (int)sizeof small && strlen(small) == sizeof small - 1 && !strncmp(small, "usage: prog [-v", 15));
+  expect(opt_usage(small, 0, "prog", 0, tbl, OPT_N(tbl)) == len - 8);
+  const struct opt none[] = {{'h', 0, OPT_FLAG, 'h'}};
+  opt_usage(out, sizeof out, "x", 0, none, 1);
+  expect(!strcmp(out, "usage: x [-h]\n"));
+  opt_help(out, sizeof out, "x", 0, 0, none, 0);
+  expect(!strcmp(out, "usage: x\n"));
 
   test("opt_uint is strict");
   unsigned v = 0;

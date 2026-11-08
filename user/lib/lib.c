@@ -1,6 +1,7 @@
 /* lib.c: OwOS user library: syscall wrappers and small helpers */
 
 #include "mutex.h"
+#include "opt.h"
 #include "owos.h"
 #include "syscall_nr.h"
 
@@ -1076,4 +1077,26 @@ void rng_bytes(void *out, int n)
     memcpy(p + i, &z, (unsigned)k);
     i += k;
   }
+}
+
+void opt_print_usage(const char *prog, const char *args, const struct opt *tbl, int n)
+{
+  int len = opt_usage(0, 0, prog, args, tbl, n);
+  char *buf = malloc((unsigned)len + 1);
+  if (!buf)
+    return;
+  opt_usage(buf, len + 1, prog, args, tbl, n);
+  puts(buf);
+  free(buf);
+}
+
+void opt_print_help(const char *prog, const char *args, const char *summary, const struct opt *tbl, int n)
+{
+  int len = opt_help(0, 0, prog, args, summary, tbl, n);
+  char *buf = malloc((unsigned)len + 1);
+  if (!buf)
+    return;
+  opt_help(buf, len + 1, prog, args, summary, tbl, n);
+  puts(buf);
+  free(buf);
 }

@@ -61,13 +61,6 @@ static char *read_stdin(int *out_len)
   return b;
 }
 
-static void usage(void)
-{
-  puts("usage:\n");
-  puts("  base64 [file]      encode file (or stdin) to base64\n");
-  puts("  base64 -d [file]   decode base64 file (or stdin)\n");
-}
-
 int main(int argc, char **argv)
 {
   bool decode = false;
@@ -75,19 +68,23 @@ int main(int argc, char **argv)
   char *input;
   int in_len = 0;
 
-  static const struct opt opts[] = {{'d', "decode", OPT_FLAG, 'd'}, {'h', "help", OPT_FLAG, 'h'}};
+  static const struct opt opts[] = {
+      {'d', "decode", OPT_FLAG, 'd', 0, "decode base64 instead of encoding"},
+      {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
+  };
   struct optstate st;
   opt_init(&st, argc, argv);
   for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
     if (o == 'd') {
       decode = true;
     } else if (o == 'h') {
-      usage();
+      opt_print_help("base64", "[FILE]", "Encode FILE (or stdin) to base64.", opts, OPT_N(opts));
       return 0;
     } else if (o == OPT_POS) {
       path = streq(st.arg, "-") ? 0 : st.arg; /* "-" = stdin */
     } else {
       printf("base64: unknown option %s\n", st.bad);
+      opt_print_usage("base64", "[FILE]", opts, OPT_N(opts));
       return 1;
     }
   }

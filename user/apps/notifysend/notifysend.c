@@ -3,12 +3,12 @@
 #include "opt.h"
 #include "owos.h"
 
-static void usage(void)
-{
-  puts("usage: notify-send [-a app] [-s subtitle] [-i image.png] [-b "
-       "label:cmd] <title> "
-       "[body]\n");
-}
+static const struct opt opts[] = {
+    {'a', "app", OPT_ARG, 'a', "NAME", "application name shown on the notification"},
+    {'s', "subtitle", OPT_ARG, 's', "TEXT", "second line under the title"},
+    {'i', "image", OPT_ARG, 'i', "FILE.png", "image to show"},
+    {'b', "button", OPT_ARG, 'b', "LABEL:CMD", "add a button that runs CMD (repeatable)"},
+};
 
 int main(int argc, char **argv)
 {
@@ -17,12 +17,6 @@ int main(int argc, char **argv)
   const char *pos[2] = {0, 0};
   int npos = 0;
 
-  static const struct opt opts[] = {
-      {'a', "app", OPT_ARG, 'a'},
-      {'s', "subtitle", OPT_ARG, 's'},
-      {'i', "image", OPT_ARG, 'i'},
-      {'b', "button", OPT_ARG, 'b'},
-  };
   struct optstate st;
   opt_init(&st, argc, argv);
   for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
@@ -48,13 +42,13 @@ int main(int argc, char **argv)
       if (npos < 2)
         pos[npos++] = st.arg;
     } else {
-      usage();
+      opt_print_usage("notify-send", "TITLE [BODY]", opts, OPT_N(opts));
       return 2;
     }
   }
 
   if (npos < 1) {
-    usage();
+    opt_print_usage("notify-send", "TITLE [BODY]", opts, OPT_N(opts));
     return 2;
   }
   n.title = pos[0];

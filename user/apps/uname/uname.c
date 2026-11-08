@@ -4,8 +4,6 @@
 #include "owos.h"
 #include <stdbool.h>
 
-static void usage(void) { puts("usage: uname [-asnrvmo]\n"); }
-
 static void emit(const char *s, bool *first)
 {
   if (!*first)
@@ -20,14 +18,14 @@ int main(int argc, char **argv)
   bool s = false, n = false, r = false, v = false, m = false, o = false, any = false, first = true;
 
   static const struct opt opts[] = {
-      {'a', "all", OPT_FLAG, 'a'},
-      {'s', "kernel-name", OPT_FLAG, 's'},
-      {'n', "nodename", OPT_FLAG, 'n'},
-      {'r', "kernel-release", OPT_FLAG, 'r'},
-      {'v', "kernel-version", OPT_FLAG, 'v'},
-      {'m', "machine", OPT_FLAG, 'm'},
-      {'o', "operating-system", OPT_FLAG, 'o'},
-      {'h', "help", OPT_FLAG, 'h'},
+      {'a', "all", OPT_FLAG, 'a', 0, "print everything"},
+      {'s', "kernel-name", OPT_FLAG, 's', 0, "print the kernel name"},
+      {'n', "nodename", OPT_FLAG, 'n', 0, "print the network node name"},
+      {'r', "kernel-release", OPT_FLAG, 'r', 0, "print the kernel release"},
+      {'v', "kernel-version", OPT_FLAG, 'v', 0, "print the kernel version"},
+      {'m', "machine", OPT_FLAG, 'm', 0, "print the machine hardware name"},
+      {'o', "operating-system", OPT_FLAG, 'o', 0, "print the operating system"},
+      {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
   };
   struct optstate st;
   opt_init(&st, argc, argv);
@@ -38,11 +36,11 @@ int main(int argc, char **argv)
     }
     if (c == OPT_BAD) {
       printf("uname: invalid option '%s'\n", st.bad);
-      usage();
+      opt_print_usage("uname", 0, opts, OPT_N(opts));
       return 1;
     }
     if (c == 'h') {
-      usage();
+      opt_print_help("uname", 0, "Print system information.", opts, OPT_N(opts));
       return 0;
     }
     if (c == 'a')

@@ -33,12 +33,18 @@ int main(int argc, char **argv)
 
   signal(SIGINT, on_sigint);
 
-  static const struct opt opts[] = {{'c', "count", OPT_ARG, 'c'}};
+  static const struct opt opts[] = {
+      {'c', "count", OPT_ARG, 'c', "N", "stop after N replies (default: until Ctrl+C)"},
+      {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
+  };
   struct optstate st;
   opt_init(&st, argc, argv);
   for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
     unsigned n;
-    if (o == 'c' && opt_uint(st.arg, &n) == 0) {
+    if (o == 'h') {
+      opt_print_help("ping", "HOST", "Send ICMP echo requests to HOST.", opts, OPT_N(opts));
+      return 0;
+    } else if (o == 'c' && opt_uint(st.arg, &n) == 0) {
       count = (int)n;
     } else if (o == OPT_POS) {
       host = st.arg;
@@ -48,7 +54,7 @@ int main(int argc, char **argv)
     }
   }
   if (!host) {
-    puts("usage: ping [-c count] <host>\n");
+    opt_print_usage("ping", "HOST", opts, OPT_N(opts));
     return 1;
   }
 

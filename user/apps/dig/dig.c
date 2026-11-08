@@ -159,9 +159,15 @@ static void put_rdata(const unsigned char *msg, int end, int type, int rd, int r
 int main(int argc, char **argv)
 {
   const char *server = "8.8.8.8", *host = 0, *typestr = 0;
+  static const struct opt opts[] = {{'h', "help", OPT_FLAG, 'h', 0, "show this help"}};
   struct optstate st;
   opt_init(&st, argc, argv);
-  for (int o; (o = opt_next(&st, 0, 0)) != OPT_DONE;) {
+  for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
+    if (o == 'h') {
+      opt_print_help("dig", "[@SERVER] HOST [TYPE]", "Query DNS. TYPE is one of A AAAA NS CNAME MX TXT PTR SOA SRV.",
+                     opts, OPT_N(opts));
+      return 0;
+    }
     if (o != OPT_POS) {
       host = 0;
       break;
@@ -174,8 +180,7 @@ int main(int argc, char **argv)
       typestr = st.arg;
   }
   if (!host) {
-    puts("usage: dig [@server] <host> [type]   (A AAAA NS CNAME MX TXT PTR SOA "
-         "SRV)\n");
+    opt_print_usage("dig", "[@SERVER] HOST [TYPE]", opts, OPT_N(opts));
     return 1;
   }
   int qtype = 1;

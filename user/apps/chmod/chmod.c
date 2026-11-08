@@ -55,8 +55,8 @@ static void apply(const char *path)
 int main(int argc, char **argv)
 {
   static const struct opt opts[] = {
-      {'R', "recursive", OPT_FLAG, 'R'},
-      {'h', "help", OPT_FLAG, 'h'},
+      {'R', "recursive", OPT_FLAG, 'R', 0, "change files and directories recursively"},
+      {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
   };
   struct optstate st;
   unsigned probe;
@@ -69,7 +69,8 @@ int main(int argc, char **argv)
     if (c == 'R') {
       recursive = true;
     } else if (c == 'h') {
-      puts("usage: chmod [-R] MODE FILE...\n");
+      opt_print_help("chmod", "MODE FILE...", "Set the permission bits of each FILE (octal or symbolic MODE).", opts,
+                     OPT_N(opts));
       return 0;
     } else if (c == OPT_POS && !spec) {
       spec = st.arg;
@@ -83,7 +84,7 @@ int main(int argc, char **argv)
     }
   }
   if (!spec || nfiles == 0) {
-    puts("usage: chmod [-R] MODE FILE...\n");
+    opt_print_usage("chmod", "MODE FILE...", opts, OPT_N(opts));
     return 1;
   }
   cur_umask = umask((unsigned)-1);

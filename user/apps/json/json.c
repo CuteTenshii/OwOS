@@ -70,16 +70,6 @@ static int parse_int(const char *s, int defval)
   return any ? v : defval;
 }
 
-static void usage(void)
-{
-  puts("usage:\n");
-  puts("  json [file]        pretty-print JSON (2-space indent)\n");
-  puts("  json -c [file]     compact / minify\n");
-  puts("  json -i N [file]   pretty-print with N spaces\n");
-  puts("  json -v [file]     validate only\n");
-  puts("input is <file>, or stdin when no file is given\n");
-}
-
 int main(int argc, char **argv)
 {
   bool validate = false;
@@ -92,10 +82,10 @@ int main(int argc, char **argv)
   char *out;
 
   static const struct opt opts[] = {
-      {'c', "compact", OPT_FLAG, 'c'},
-      {'v', "validate", OPT_FLAG, 'v'},
-      {'i', "indent", OPT_ARG, 'i'},
-      {'h', "help", OPT_FLAG, 'h'},
+      {'c', "compact", OPT_FLAG, 'c', 0, "print on one line"},
+      {'v', "validate", OPT_FLAG, 'v', 0, "only check that the input is valid"},
+      {'i', "indent", OPT_ARG, 'i', "N", "indent with N spaces (default 2)"},
+      {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
   };
   struct optstate st;
   opt_init(&st, argc, argv);
@@ -107,13 +97,15 @@ int main(int argc, char **argv)
     } else if (o == 'i') {
       indent = parse_int(st.arg, 2);
     } else if (o == 'h') {
-      usage();
+      opt_print_help("json", "[FILE]", "Pretty-print, minify or validate JSON from FILE (or stdin).", opts,
+                     OPT_N(opts));
       return 0;
     } else if (o == OPT_POS) {
       if (!path)
         path = st.arg;
     } else {
       printf("json: unknown option %s\n", st.bad);
+      opt_print_usage("json", "[FILE]", opts, OPT_N(opts));
       return 1;
     }
   }

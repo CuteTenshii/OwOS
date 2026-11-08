@@ -21,13 +21,14 @@ static const char *const default_servers[] = {
     "time.cloudflare.com", "time.google.com", "162.159.200.1",
 };
 
-enum { O_ONCE = 1, O_QUIET, O_SERVER, O_VERBOSE };
+enum { O_ONCE = 1, O_QUIET, O_SERVER, O_VERBOSE, O_HELP };
 
 static const struct opt opts[] = {
-    {'1', "once", OPT_FLAG, O_ONCE},
-    {'q', "quiet", OPT_FLAG, O_QUIET},
-    {'s', "server", OPT_ARG, O_SERVER},
-    {'v', "verbose", OPT_FLAG, O_VERBOSE},
+    {'1', "once", OPT_FLAG, O_ONCE, 0, "sync once and exit"},
+    {'q', "quiet", OPT_FLAG, O_QUIET, 0, "log nothing"},
+    {'s', "server", OPT_ARG, O_SERVER, "HOST", "query HOST instead of the configured servers"},
+    {'v', "verbose", OPT_FLAG, O_VERBOSE, 0, "log every exchange"},
+    {'h', "help", OPT_FLAG, O_HELP, 0, "show this help"},
 };
 
 static bool verbose, quiet;
@@ -237,8 +238,11 @@ int main(int argc, char **argv)
       verbose = true;
     else if (o == O_SERVER)
       forced = st.arg;
-    else {
-      puts("usage: ntpd [-1|--once] [-q] [-v] [-s server]\n");
+    else if (o == O_HELP) {
+      opt_print_help("ntpd", 0, "Keep the clock in sync over NTP.", opts, OPT_N(opts));
+      return 0;
+    } else {
+      opt_print_usage("ntpd", 0, opts, OPT_N(opts));
       return 2;
     }
   }

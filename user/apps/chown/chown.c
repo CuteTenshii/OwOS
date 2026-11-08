@@ -77,8 +77,8 @@ static bool parse_spec(char *s)
 int main(int argc, char **argv)
 {
   static const struct opt opts[] = {
-      {'R', "recursive", OPT_FLAG, 'R'},
-      {'h', "help", OPT_FLAG, 'h'},
+      {'R', "recursive", OPT_FLAG, 'R', 0, "change files and directories recursively"},
+      {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
   };
   struct optstate st;
   char *spec = NULL, **files = malloc((unsigned)(argc + 1) * sizeof *files);
@@ -90,7 +90,7 @@ int main(int argc, char **argv)
     if (c == 'R') {
       recursive = true;
     } else if (c == 'h') {
-      puts("usage: chown [-R] OWNER[:GROUP] FILE...\n");
+      opt_print_help("chown", "OWNER[:GROUP] FILE...", "Set the owner and group of each FILE.", opts, OPT_N(opts));
       return 0;
     } else if (c == OPT_POS && !spec) {
       spec = (char *)st.arg;
@@ -102,7 +102,7 @@ int main(int argc, char **argv)
     }
   }
   if (!spec || nfiles == 0) {
-    puts("usage: chown [-R] OWNER[:GROUP] FILE...\n");
+    opt_print_usage("chown", "OWNER[:GROUP] FILE...", opts, OPT_N(opts));
     return 1;
   }
   char *copy = malloc((unsigned)strlen(spec) + 1);

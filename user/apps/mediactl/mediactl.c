@@ -4,15 +4,22 @@
 #include "owos.h"
 #include <stdbool.h>
 
-static void usage(void)
-{
-  puts("usage: mediactl status\n"
-       "       mediactl play|pause|toggle|stop|next|prev\n"
-       "       mediactl seek [-b] <ms>      seek forward (or back with -b) by ms\n"
-       "       mediactl seekto <ms>         seek to an absolute position\n"
-       "       mediactl watch [-i ms]       print status changes (default every 500 ms)\n"
-       "       mediactl demo [-t seconds]   register a fake session and print its commands\n");
-}
+#define ARGS "COMMAND [ARG]"
+#define SUMMARY                                                                                                        \
+  "Commands:\n"                                                                                                        \
+  "  status          print the active session\n"                                                                       \
+  "  play|pause|toggle|stop|next|prev\n"                                                                               \
+  "  seek MS         seek forward (or back with -b) by MS milliseconds\n"                                              \
+  "  seekto MS       seek to an absolute position\n"                                                                   \
+  "  watch           print status changes\n"                                                                           \
+  "  demo            register a fake session and print its commands"
+
+static const struct opt opts[] = {
+    {'b', "back", OPT_FLAG, 'b', 0, "seek backwards"},
+    {'i', "interval", OPT_ARG, 'i', "MS", "watch: poll interval in milliseconds (default 500)"},
+    {'t', "time", OPT_ARG, 't', "SECONDS", "demo: how long to run (default 30)"},
+    {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
+};
 
 static const char *state_name(int s)
 {
@@ -109,11 +116,6 @@ static int cmd_demo(unsigned seconds)
 
 int main(int argc, char **argv)
 {
-  static const struct opt opts[] = {
-      {'b', "back", OPT_FLAG, 'b'},
-      {'i', "interval", OPT_ARG, 'i'},
-      {'t', "time", OPT_ARG, 't'},
-  };
   static const struct {
     const char *name;
     int cmd;
@@ -129,12 +131,15 @@ int main(int argc, char **argv)
   struct optstate st;
   opt_init(&st, argc, argv);
   for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
-    if (o == 'b') {
+    if (o == 'h') {
+      opt_print_help("mediactl", ARGS, SUMMARY, opts, OPT_N(opts));
+      return 0;
+    } else if (o == 'b') {
       back = true;
     } else if (o == 'i' || o == 't') {
       unsigned v;
       if (opt_uint(st.arg, &v) || (o == 'i' && !v)) {
-        usage();
+        opt_print_usage("mediactl", ARGS, opts, OPT_N(opts));
         return 1;
       }
       if (o == 'i')
@@ -144,12 +149,12 @@ int main(int argc, char **argv)
     } else if (o == OPT_POS && npos < 2) {
       pos[npos++] = st.arg;
     } else {
-      usage();
+      opt_print_usage("mediactl", ARGS, opts, OPT_N(opts));
       return 1;
     }
   }
   if (!npos) {
-    usage();
+    opt_print_usage("mediactl", ARGS, opts, OPT_N(opts));
     return 1;
   }
 
@@ -168,13 +173,13 @@ int main(int argc, char **argv)
       cmd = simple[i].cmd;
   if (streq(name, "seek") || streq(name, "seekto")) {
     if (!pos[1] || opt_uint(pos[1], &arg)) {
-      usage();
+      opt_print_usage("mediactl", ARGS, opts, OPT_N(opts));
       return 1;
     }
     cmd = streq(name, "seekto") ? MEDIA_CMD_SEEK_TO : back ? MEDIA_CMD_SEEK_BACK : MEDIA_CMD_SEEK_FWD;
   }
   if (cmd == MEDIA_CMD_NONE) {
-    usage();
+    opt_print_usage("mediactl", ARGS, opts, OPT_N(opts));
     return 1;
   }
   if (mediactl_send(cmd, arg) < 0) {
