@@ -440,9 +440,9 @@ int umount(const char *point);
 #define KEY_HOME 0x05
 #define KEY_END 0x06
 #define KEY_DELETE 0x07
-#define KEY_F5 0x0E    /* refresh/reload (the app decides what that means) */
-#define KEY_F12 0x1D   /* F12: the app decides (the browser opens devtools) */
-#define KEY_F1 0x95 /* F5 and F12 keep their older codes above; F5/F6/F8/F9 on a laptop keyboard are media keys */
+#define KEY_F5 0x0E  /* refresh/reload (the app decides what that means) */
+#define KEY_F12 0x1D /* F12: the app decides (the browser opens devtools) */
+#define KEY_F1 0x95  /* F5 and F12 keep their older codes above; F5/F6/F8/F9 on a laptop keyboard are media keys */
 #define KEY_F2 0x96
 #define KEY_F3 0x97
 #define KEY_F4 0x98

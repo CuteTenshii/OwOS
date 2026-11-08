@@ -139,7 +139,7 @@ struct super {
 
 static struct super sb;
 static struct owofs_dirent *dir; /* heap-allocated mirror of the directory  */
-static uint32_t dir_cap;   /* entries the current extent/mirror hold  */
+static uint32_t dir_cap;         /* entries the current extent/mirror hold  */
 static bool mounted;
 
 /* Data-sector allocation: in-RAM bitmap of clusters, rebuilt from the directory at mount, never stored.
@@ -2076,11 +2076,7 @@ int fs_mount(const char *dev, const char *point)
       return -1;
   } else {
     const struct fs_ops *cand[] = {
-        fat_ops(),
-        ext_ops(),
-        btrfs_ops(),
-        ntfs_ops(),
-        hfs_ops(),
+        fat_ops(), ext_ops(), btrfs_ops(), ntfs_ops(), hfs_ops(),
     };
     for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
       if (!cand[i])

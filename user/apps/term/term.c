@@ -629,8 +629,8 @@ static void bi_uptime(void)
 static void bi_which(int argc, char **argv)
 {
   static const char *const ring3[] = {
-      "help",    "clear",    "echo",     "pwd",     "cd",     "ls",     "cat",      "cp",      "mv",
-      "stat",    "mkdir",    "rmdir",    "rm",      "exit",   "uptime", "hostname", "whoami",  "which",
+      "help",   "clear",   "echo",     "pwd",      "cd",      "ls",     "cat",      "cp",      "mv",
+      "stat",   "mkdir",   "rmdir",    "rm",       "exit",    "uptime", "hostname", "whoami",  "which",
       "umask",  "cpuinfo", "meminfo",  "date",     "storage", "sleep",  "id",       "useradd", "userdel",
       "passwd", "usermod", "groupadd", "groupdel", "users",   "groups", "su",       "login",   "logout",
   };

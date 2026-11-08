@@ -8,7 +8,7 @@
 #include "dom_query.h"
 #include "features/clienthints/clienthints.h" /* ch_ua: navigator.userAgentData */
 #include "features/cors/cors.h"               /* cors_origin / cors_same_origin: SW scope + cache keys */
-#include "features/jar/jar.h"      /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "features/jar/jar.h"                 /* cors_origin / cors_same_origin: SW scope + cache keys */
 #include "features/media/bmedia.h"            /* HTMLMediaElement: <audio>/<video> + new Audio() */
 #include "features/mediasession/mediasession.h"
 #include "features/notification/notification.h"

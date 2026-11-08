@@ -59,7 +59,7 @@ int media_el_rows(struct media_el *m);
 int media_el_height(struct media_el *m, int paw); /* widget pixel height */
 void media_el_draw(struct media_el *m, int x0, int y0, int paw, int ct, int cb);
 void media_el_click(struct media_el *m, int mx, int my, int x0, int y0, int paw);
-int media_active(void); /* any owned media is playing */
+int media_active(void);               /* any owned media is playing */
 struct media_el *media_current(void); /* the page's playing element, else the last one played, or NULL */
 
 /* free every media element owned by the current page */
