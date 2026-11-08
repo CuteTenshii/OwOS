@@ -138,6 +138,38 @@ static void svga_flush(void)
   reg_write(SVGA_REG_SYNC, 1);
 }
 
+static int vmsvga_cursor_set(const uint32_t *argb, int w, int h, int hot_x, int hot_y, int scale)
+{
+  if (!io_base || !fifo)
+    return -1;
+  if (!argb) {
+    if (hw_cursor)
+      reg_write(SVGA_REG_CURSOR_ON, 0);
+    hw_cursor = false;
+    return 0;
+  }
+  uint32_t caps = reg_read(SVGA_REG_CAPABILITIES);
+  if (!(caps & SVGA_CAP_CURSOR_BYPASS) || !(caps & SVGA_CAP_ALPHA_CURSOR))
+    return -1;
+  if (w <= 0 || h <= 0 || (uint32_t)(w * h + 6) * 4 >= (fifo[SVGA_FIFO_MAX] - fifo[SVGA_FIFO_MIN]) / 2)
+    return -1;
+  uint32_t head[6] = {SVGA_CMD_DEFINE_ALPHA_CURSOR, 0, (uint32_t)hot_x, (uint32_t)hot_y, (uint32_t)w, (uint32_t)h};
+  fifo_put(head, 6, argb, (uint32_t)(w * h));
+  svga_flush();
+  cursor_scale = scale > 0 ? scale : 1;
+  hw_cursor = true;
+  return 0;
+}
+
+static void vmsvga_cursor_move(int x, int y)
+{
+  if (!hw_cursor)
+    return;
+  reg_write(SVGA_REG_CURSOR_X, (uint32_t)(x * cursor_scale));
+  reg_write(SVGA_REG_CURSOR_Y, (uint32_t)(y * cursor_scale));
+  reg_write(SVGA_REG_CURSOR_ON, 1);
+}
+
 int vmsvga_init(uint32_t want_w, uint32_t want_h)
 {
   uint32_t bar0 = 0, bar1 = 0, bar2 = 0;
@@ -217,44 +249,14 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
 
   /* Register the hook before adopting so fb_adopt's initial present is pushed too. */
   fb_set_present_hook(svga_present, svga_flush);
+  fb_set_cursor_hooks(vmsvga_cursor_set, vmsvga_cursor_move);
 
   if (fb_adopt(fb_phys + fb_off, want_w, want_h, pitch, 32) != 0) {
     con_write("vmsvga: fb_adopt failed.\n");
     fb_set_present_hook(NULL, NULL);
+    fb_set_cursor_hooks(NULL, NULL);
     reg_write(SVGA_REG_ENABLE, 0);
     return -1;
   }
   return 0;
-}
-
-int vmsvga_cursor_set(const uint32_t *argb, int w, int h, int hot_x, int hot_y, int scale)
-{
-  if (!io_base || !fifo)
-    return -1;
-  if (!argb) {
-    if (hw_cursor)
-      reg_write(SVGA_REG_CURSOR_ON, 0);
-    hw_cursor = false;
-    return 0;
-  }
-  uint32_t caps = reg_read(SVGA_REG_CAPABILITIES);
-  if (!(caps & SVGA_CAP_CURSOR_BYPASS) || !(caps & SVGA_CAP_ALPHA_CURSOR))
-    return -1;
-  if (w <= 0 || h <= 0 || (uint32_t)(w * h + 6) * 4 >= (fifo[SVGA_FIFO_MAX] - fifo[SVGA_FIFO_MIN]) / 2)
-    return -1;
-  uint32_t head[6] = {SVGA_CMD_DEFINE_ALPHA_CURSOR, 0, (uint32_t)hot_x, (uint32_t)hot_y, (uint32_t)w, (uint32_t)h};
-  fifo_put(head, 6, argb, (uint32_t)(w * h));
-  svga_flush();
-  cursor_scale = scale > 0 ? scale : 1;
-  hw_cursor = true;
-  return 0;
-}
-
-void vmsvga_cursor_move(int x, int y)
-{
-  if (!hw_cursor)
-    return;
-  reg_write(SVGA_REG_CURSOR_X, (uint32_t)(x * cursor_scale));
-  reg_write(SVGA_REG_CURSOR_Y, (uint32_t)(y * cursor_scale));
-  reg_write(SVGA_REG_CURSOR_ON, 1);
 }

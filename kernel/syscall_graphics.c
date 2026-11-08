@@ -9,7 +9,6 @@
 #include "sched.h"
 #include "uaccess.h"
 #include "uwin.h"
-#include "vmsvga.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -72,16 +71,16 @@ void syscall_graphics_fb_cursor(struct registers *r)
     return;
   }
   if (!r->ebx) {
-    r->eax = (uint32_t)vmsvga_cursor_set(NULL, 0, 0, 0, 0, 1);
+    r->eax = (uint32_t)fb_cursor_set(NULL, 0, 0, 0, 0, 1);
     return;
   }
   if (w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM || copyin(pix, r->ebx, (uint32_t)(w * h) * 4) != 0) {
     r->eax = (uint32_t)-1;
     return;
   }
-  int rc = vmsvga_cursor_set(pix, w, h, hx, hy, (int)r->edx);
+  int rc = fb_cursor_set(pix, w, h, hx, hy, (int)r->edx);
   if (rc == 0)
-    vmsvga_cursor_move(mouse_x(), mouse_y());
+    fb_cursor_move(mouse_x(), mouse_y());
   r->eax = (uint32_t)rc;
 }
 

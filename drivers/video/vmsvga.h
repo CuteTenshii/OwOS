@@ -17,9 +17,4 @@
  * II device is present — caller then falls through to fb_init. */
 int vmsvga_init(uint32_t want_w, uint32_t want_h);
 
-/* Hardware cursor: define from a w*h ARGB bitmap (NULL hides it and returns to software drawing).
- * Positions passed to vmsvga_cursor_move are multiplied by scale. Returns -1 if unsupported. */
-int vmsvga_cursor_set(const uint32_t *argb, int w, int h, int hot_x, int hot_y, int scale);
-void vmsvga_cursor_move(int x, int y);
-
 #endif /* OWOS_VMSVGA_H */

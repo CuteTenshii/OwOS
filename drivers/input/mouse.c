@@ -9,12 +9,12 @@
 
 #include "mouse.h"
 #include "console.h"
+#include "fb.h"
 #include "io.h"
 #include "irq.h"
 #include "spinlock.h"
 #include "synaptics.h"
 #include "vmmouse.h"
-#include "vmsvga.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -137,7 +137,7 @@ static void mouse_apply(void)
     wheel -= dz;
   }
   seq++;
-  vmsvga_cursor_move(cur_x, cur_y);
+  fb_cursor_move(cur_x, cur_y);
 }
 
 static void mouse_handle_byte(uint8_t data)
@@ -153,7 +153,7 @@ static void mouse_handle_byte(uint8_t data)
       buttons = btn;
       wheel += dz;
       seq++;
-      vmsvga_cursor_move(cur_x, cur_y);
+      fb_cursor_move(cur_x, cur_y);
     }
     return;
   }
@@ -168,7 +168,7 @@ static void mouse_handle_byte(uint8_t data)
       buttons = btn;
       wheel += dz;
       seq++;
-      vmsvga_cursor_move(cur_x, cur_y);
+      fb_cursor_move(cur_x, cur_y);
     }
     return;
   }
@@ -337,7 +337,7 @@ void mouse_inject_rel(int dx, int dy, int dwheel, int dhwheel, int btn)
   hwheel += dhwheel;
   usb_buttons = btn;
   seq++;
-  vmsvga_cursor_move(cur_x, cur_y);
+  fb_cursor_move(cur_x, cur_y);
   spin_unlock_irqrestore(&mouse_lock, f);
 }
 
@@ -350,7 +350,7 @@ void mouse_inject_abs(int x, int y, int dwheel, int dhwheel, int btn)
   hwheel += dhwheel;
   usb_buttons = btn;
   seq++;
-  vmsvga_cursor_move(cur_x, cur_y);
+  fb_cursor_move(cur_x, cur_y);
   spin_unlock_irqrestore(&mouse_lock, f);
 }
 

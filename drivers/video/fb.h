@@ -45,6 +45,14 @@ void fb_present(void);
 /* cb runs per rect copied to the framebuffer; flush (optional) once after each batch. NULL clears. */
 void fb_set_present_hook(void (*cb)(int x, int y, int w, int h), void (*flush)(void));
 
+/* Hardware cursor provided by the display adapter. fb_cursor_set defines it from a w*h ARGB bitmap (NULL hides it
+ * and returns to software drawing); fb_cursor_move positions it, scaled by the scale given to set. IRQ-safe.
+ * fb_cursor_set returns -1 when no adapter cursor exists. */
+void fb_set_cursor_hooks(int (*set)(const uint32_t *argb, int w, int h, int hot_x, int hot_y, int scale),
+                         void (*move)(int x, int y));
+int fb_cursor_set(const uint32_t *argb, int w, int h, int hot_x, int hot_y, int scale);
+void fb_cursor_move(int x, int y);
+
 /* Software brightness (fb_present dims pixels). fb_brightness_step re-renders the screen. IRQ-safe. */
 #define FB_BRIGHT_MAX 8
 #define FB_BRIGHT_MIN 2

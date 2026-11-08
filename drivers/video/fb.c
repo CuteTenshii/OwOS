@@ -136,6 +136,27 @@ void fb_set_present_hook(void (*cb)(int, int, int, int), void (*flush)(void))
   flush_hook = flush;
 }
 
+static int (*cursor_set_hook)(const uint32_t *, int, int, int, int, int);
+static void (*cursor_move_hook)(int, int);
+
+void fb_set_cursor_hooks(int (*set)(const uint32_t *argb, int w, int h, int hot_x, int hot_y, int scale),
+                         void (*move)(int x, int y))
+{
+  cursor_set_hook = set;
+  cursor_move_hook = move;
+}
+
+int fb_cursor_set(const uint32_t *argb, int w, int h, int hot_x, int hot_y, int scale)
+{
+  return cursor_set_hook ? cursor_set_hook(argb, w, h, hot_x, hot_y, scale) : -1;
+}
+
+void fb_cursor_move(int x, int y)
+{
+  if (cursor_move_hook)
+    cursor_move_hook(x, y);
+}
+
 /* Make the framebuffer write-combining (PAT entry 1). Harmless under QEMU. */
 static void enable_wc(void)
 {
