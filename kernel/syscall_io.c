@@ -26,6 +26,18 @@ void syscall_io_write(struct registers *r)
     r->eax = len;
   } else if (f->type == FD_PIPE_WR) {
     r->eax = (uint32_t)pipe_write(f->pipe, buf, (int)len);
+  } else if (f->type == FD_TTY) {
+    /* output processing of a terminal: newline becomes carriage return + newline */
+    uint32_t from = 0;
+    for (uint32_t i = 0; i <= len; i++) {
+      if (i < len && buf[i] != '\n')
+        continue;
+      pipe_write(f->tx, buf + from, (int)(i - from));
+      if (i < len)
+        pipe_write(f->tx, "\r\n", 2);
+      from = i + 1;
+    }
+    r->eax = len;
   } else if (fd_is_channel(f)) {
     r->eax = (uint32_t)pipe_write(f->tx, buf, (int)len);
   } else {
