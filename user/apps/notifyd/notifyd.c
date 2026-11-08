@@ -367,32 +367,6 @@ static int wrap_text(const char *s, int maxw, int maxlines, int draw, int x, int
   return lines;
 }
 
-/* UI text truncated with ".." to fit `maxw` */
-static void ui_clip(int x, int y, const char *s, unsigned col, int maxw)
-{
-  if (maxw <= 0)
-    return;
-  char buf[NOTIFY_TITLE_MAX + 4];
-  int n = 0;
-  for (; s[n] && n < (int)sizeof buf - 4; n++)
-    buf[n] = s[n];
-  buf[n] = '\0';
-  if (gfx_ui_width(buf) <= maxw) {
-    gfx_ui_text(x, y, buf, col);
-    return;
-  }
-  while (n > 0) {
-    buf[n] = '.';
-    buf[n + 1] = '.';
-    buf[n + 2] = '\0';
-    if (gfx_ui_width(buf) <= maxw)
-      break;
-    buf[n--] = '\0';
-  }
-  if (n > 0)
-    gfx_ui_text(x, y, buf, col);
-}
-
 /* card geometry (shared by draw + hit-test) */
 struct cardgeom {
   int textx, textw, sub_y, body_y, btn_y, height, close_x, close_y;
@@ -478,7 +452,7 @@ static void draw_card(const struct note *n, int x, int y, int w, int newest)
     gfx_blit_argb(x + 12, y + 12, n->iw, n->ih, n->img);
 
   int title_w = (g.close_x - 8) - g.textx;
-  ui_clip(g.textx, y + 10, n->title, C_BRIGHT, title_w);
+  gfx_ui_text_clip(g.textx, y + 10, n->title, C_BRIGHT, title_w);
   if (g.sub_y >= 0)
     gfx_ui_text(g.textx, g.sub_y, n->subtitle, C_DIM);
   if (g.body_y >= 0)
