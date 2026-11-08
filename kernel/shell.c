@@ -790,11 +790,19 @@ static void bi_ps(const char *a)
 }
 static void bi_ls(const char *a)
 {
-  while (a[0] == '-') { /* the listing is always long; accept and ignore flags such as -l */
-    while (*a && *a != ' ')
-      a++;
+  while (a[0] == '-' && a[1] && !(a[1] == '-' && (a[2] == '\0' || a[2] == ' '))) {
+    for (a++; *a && *a != ' '; a++) {
+      if (*a != 'l') { /* -l: long listing, which is the only format */
+        con_printf("ls: unknown option -%c\n", *a);
+        return;
+      }
+    }
     while (*a == ' ')
       a++;
+  }
+  if (a[0] == '-' && a[1] == '-') { /* "--" ends the options */
+    for (a += 2; *a == ' '; a++)
+      ;
   }
   if (a[0] == '\0') {
     fs_list(cwd);
@@ -924,7 +932,7 @@ static const struct builtin builtins[] = {
     {"journal", bi_journal, "journal       replay the verbose boot log"},
     {"meminfo", bi_meminfo, "meminfo       physical and heap memory usage"},
     {"ps", bi_ps, "ps            list scheduler threads and run counts"},
-    {"ls", bi_ls, "ls [path]     list a directory (default: current)"},
+    {"ls", bi_ls, "ls [-l] [path] list a directory (default: current)"},
     {"pwd", bi_pwd, "pwd           print the working directory"},
     {"cd", cmd_cd, "cd [dir]      change directory (no arg -> home)"},
     {"cat", cmd_cat, "cat <file>    print a file"},
