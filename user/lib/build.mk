@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto tls netconn gfx zlib png webp mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar
+ULIBDIRS := curl torrent crypto tls netconn gfx zlib png webp gif mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -37,6 +37,7 @@ CRC32   := user/lib/zlib/crc32.o      # zlib: the shared CRC-32 (deflate + stun 
 PNGDEC  := user/lib/png/png.o        # libpng: streaming PNG decode (uses zlib)
 PNGENC  := user/lib/png/pngenc.o      # PNG encode (uncompressed); screenshot path, uses $(CRC32)
 WEBP    := user/lib/webp/webp.o user/lib/webp/vp8.o  # WebP: lossless (VP8L) decode + encode, lossy (VP8) decode (no deps)
+GIF     := user/lib/gif/gif.o          # GIF87a/89a decode with frame compositing (no deps)
 URL     := user/lib/curl/url.o        # shared URL parse/resolve (curl + browser)
 HTTP    := user/lib/curl/http.o       # libcurl: HTTP/1.1 over net_* (curl + torrent tracker)
 HEADERS := user/lib/curl/headers.o    # libcurl: HTTP response header parser (curl + browser)
