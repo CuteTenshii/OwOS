@@ -437,22 +437,13 @@ static void cmd_run(char *args)
   wait_reap(pid);
 }
 
-/* Does haystack contain needle? An empty needle matches. */
-static bool str_contains(const char *haystack, const char *needle)
+/* Options given to the running built-in, one bit per letter (see flag()). */
+static uint64_t g_flags;
+static uint64_t flag_bit(char c)
 {
-  if (!*needle)
-    return true;
-  for (; *haystack; haystack++) {
-    const char *h = haystack, *n = needle;
-    while (*h && *n && *h == *n) {
-      h++;
-      n++;
-    }
-    if (!*n)
-      return true;
-  }
-  return false;
+  return c >= 'a' && c <= 'z' ? 1ull << (c - 'a') : c >= 'A' && c <= 'Z' ? 1ull << (26 + c - 'A') : 0;
 }
+static bool flag(char c) { return (g_flags & flag_bit(c)) != 0; }
 
 /* Print lines of a writable NUL-terminated buffer that contain pattern, walking it in place. */
 static void grep_emit(const char *pattern, char *buf)
@@ -464,7 +455,7 @@ static void grep_emit(const char *pattern, char *buf)
       p++;
     int had_newline = (*p == '\n');
     *p = '\0';
-    if (str_contains(line_start, pattern)) {
+    if ((flag('i') ? strcasestr : strstr)(line_start, pattern)) {
       con_printf("%s\n", line_start);
     }
     if (had_newline)
@@ -487,17 +478,16 @@ static void cmd_grep(const char *arg)
   const char *name = arg + i;
 
   if (pattern[0] == '\0') {
-    con_write("usage: grep <pattern> <file>  (or: <cmd> | grep <pattern>)\n");
+    con_write("usage: grep [-i] <pattern> <file>  (or: <cmd> | grep [-i] <pattern>)\n");
     return;
   }
 
   if (name[0] != '\0') { /* file mode */
-    char *buf = kmalloc(4096);
-    if (!buf)
-      return;
-    int n = fs_read(name, buf, 4095);
+    int size = fs_size(name);
+    char *buf = size < 0 ? 0 : kmalloc((uint32_t)size + 1);
+    int n = buf ? fs_read(name, buf, (uint32_t)size) : -1;
     if (n < 0) {
-      con_write("no such file\n");
+      con_write(size < 0 ? "no such file\n" : "grep: cannot read file\n");
     } else {
       buf[n] = '\0';
       grep_emit(pattern, buf);
@@ -506,7 +496,7 @@ static void cmd_grep(const char *arg)
   } else if (g_pipe_in) { /* piped mode */
     grep_emit(pattern, g_pipe_in);
   } else {
-    con_write("usage: grep <pattern> <file>  (or: <cmd> | grep <pattern>)\n");
+    con_write("usage: grep [-i] <pattern> <file>  (or: <cmd> | grep [-i] <pattern>)\n");
   }
 }
 
@@ -612,12 +602,114 @@ static void cmd_cd(const char *arg)
 static void cmd_pwd(void) { con_printf("%s\n", cwd); }
 
 /* "cp <src> <dst>": copy a file; a directory dst receives it under src's basename. */
+#define ENTRY_NAME_MAX 64 /* size of the name buffer fs_enum_dir fills */
+
+/* Append "/name" to a path, false when it does not fit. */
+static bool path_join(char *path, const char *name)
+{
+  int n = (int)strlen(path);
+  if (n + 1 + (int)strlen(name) >= PATH_MAX)
+    return false;
+  if (n == 0 || path[n - 1] != '/')
+    path[n++] = '/';
+  strlcpy(path + n, name, PATH_MAX - (uint32_t)n);
+  return true;
+}
+
+/* Drop the last component of a path in place. */
+static void path_parent(char *path)
+{
+  int n = (int)strlen(path);
+  while (n > 1 && path[n - 1] != '/')
+    n--;
+  path[n > 1 ? n - 1 : n] = '\0';
+}
+
+/* Copy one file; false after reporting the failure. */
+static bool copy_file(const char *src, const char *dst)
+{
+  int sz = fs_size(src);
+  if (sz < 0) {
+    con_printf("cp: no such file: %s\n", src);
+    return false;
+  }
+  uint8_t *buf = kmalloc(sz ? (uint32_t)sz : 1);
+  if (!buf) {
+    con_write("cp: out of memory\n");
+    return false;
+  }
+  int n = fs_read(src, buf, (uint32_t)sz);
+  bool ok = false;
+  if (n < 0)
+    con_write("cp: read failed\n");
+  else if (fs_create(dst, buf, (uint32_t)n) != 0)
+    con_write("cp: write failed (disk or directory full?)\n");
+  else
+    ok = true;
+  kfree(buf);
+  return ok;
+}
+
+/* Copy a directory tree. Walks with an explicit stack: this runs on the 16 KiB boot stack. */
+static void copy_tree(const char *src, const char *dst)
+{
+  uint32_t sl = strlen(src);
+  if (strlen(dst) >= sl && memcmp(dst, src, sl) == 0 && (dst[sl] == '\0' || dst[sl] == '/' || sl == 1)) {
+    con_write("cp: cannot copy a directory into itself\n");
+    return;
+  }
+  if (fs_isdir(dst) != 1 && fs_mkdir(dst) != 0) {
+    con_printf("cp: cannot create %s\n", dst);
+    return;
+  }
+  char sp[PATH_MAX], dp[PATH_MAX];
+  uint16_t next[PATH_MAX / 2 + 1]; /* next entry to look at, per level */
+  int depth = 0, files = 0, failed = 0;
+  strlcpy(sp, src, sizeof sp);
+  strlcpy(dp, dst, sizeof dp);
+  next[0] = 0;
+  for (;;) {
+    char name[ENTRY_NAME_MAX];
+    int is_dir;
+    if (!fs_enum_dir(sp, next[depth], name, &is_dir, 0, 0)) {
+      if (depth == 0)
+        break;
+      path_parent(sp);
+      path_parent(dp);
+      depth--;
+      continue;
+    }
+    next[depth]++;
+    char cs[PATH_MAX], cd[PATH_MAX];
+    strlcpy(cs, sp, sizeof cs);
+    strlcpy(cd, dp, sizeof cd);
+    if (!path_join(cs, name) || !path_join(cd, name)) {
+      con_printf("cp: path too long: %s\n", name);
+      failed++;
+    } else if (is_dir) {
+      if (depth >= PATH_MAX / 2 || (fs_isdir(cd) != 1 && fs_mkdir(cd) != 0)) {
+        con_printf("cp: cannot create %s\n", cd);
+        failed++;
+      } else {
+        strlcpy(sp, cs, sizeof sp);
+        strlcpy(dp, cd, sizeof dp);
+        next[++depth] = 0;
+      }
+    } else if (copy_file(cs, cd)) {
+      files++;
+    } else {
+      failed++;
+    }
+  }
+  con_printf("%s -> %s (%d files%s)\n", src, dst, files, failed ? ", some failed" : "");
+}
+
 static void cmd_cp(const char *arg)
 {
   char src[PATH_MAX], dst[PATH_MAX], rsrc[PATH_MAX], rdst[PATH_MAX];
   parse_two(arg, src, dst, (int)sizeof(src));
   if (src[0] == '\0' || dst[0] == '\0') {
-    con_write("usage: cp <src> <dst>\n");
+    con_write("usage: cp [-r] <src> <dst>\n");
     return;
   }
   if (path_resolve(src, rsrc) != 0 || path_resolve(dst, rdst) != 0) {
@@ -629,25 +721,15 @@ static void cmd_cp(const char *arg)
     con_write("cp: source and destination are the same\n");
     return;
   }
-  int sz = fs_size(rsrc);
-  if (sz < 0) {
-    con_printf("cp: no such file: %s\n", src);
+  if (fs_isdir(rsrc) == 1) {
+    if (flag('r') || flag('R'))
+      copy_tree(rsrc, rdst);
+    else
+      con_printf("cp: %s is a directory (use -r)\n", src);
     return;
   }
-  uint8_t *buf = kmalloc(sz ? (uint32_t)sz : 1);
-  if (!buf) {
-    con_write("cp: out of memory\n");
-    return;
-  }
-  int n = fs_read(rsrc, buf, (uint32_t)sz);
-  if (n < 0)
-    con_write("cp: read failed\n");
-  else if (fs_create(rdst, buf, (uint32_t)n) != 0)
-    con_write("cp: write failed (disk or directory full?)\n");
-  else {
+  if (copy_file(rsrc, rdst))
     con_printf("%s -> %s\n", rsrc, rdst);
-  }
-  kfree(buf);
 }
 
 /* "mv <src> <dst>": rename or move; a directory dst receives it under src's basename. */
@@ -674,42 +756,101 @@ static void cmd_mv(const char *arg)
 }
 
 /* "rm <file> [file...]", delete one or more files (sectors leak). */
+/* Delete a file, or a directory with everything below it. Walks with an explicit stack: this runs on the
+ * 16 KiB boot stack. Returns 0 when everything was removed. */
+static int rm_tree(const char *root)
+{
+  if (fs_isdir(root) != 1)
+    return fs_delete(root) == 0 ? 0 : -1;
+  char cur[PATH_MAX];
+  uint16_t skip[PATH_MAX / 2 + 1]; /* entries left in place at each level (undeletable) */
+  int depth = 0, failed = 0;
+  strlcpy(cur, root, sizeof cur);
+  skip[0] = 0;
+  for (;;) {
+    char name[ENTRY_NAME_MAX];
+    int is_dir;
+    if (!fs_enum_dir(cur, skip[depth], name, &is_dir, 0, 0)) {
+      bool removed = fs_rmdir(cur) == 0;
+      if (depth == 0)
+        return removed && !failed ? 0 : -1;
+      path_parent(cur);
+      depth--;
+      if (!removed) {
+        failed = 1;
+        skip[depth]++;
+      }
+      continue;
+    }
+    char child[PATH_MAX];
+    strlcpy(child, cur, sizeof child);
+    if (!path_join(child, name)) {
+      failed = 1;
+      skip[depth]++;
+    } else if (is_dir && depth < PATH_MAX / 2) {
+      strlcpy(cur, child, sizeof cur);
+      skip[++depth] = 0;
+    } else if (is_dir || fs_delete(child) != 0) {
+      failed = 1;
+      skip[depth]++;
+    }
+  }
+}
+
 static void cmd_rm(const char *arg)
 {
   char name[PATH_MAX], extra[PATH_MAX], rpath[PATH_MAX];
   parse_two(arg, name, extra, (int)sizeof(name));
   if (name[0] == '\0') {
-    con_write("usage: rm <file>\n");
+    con_write("usage: rm [-rf] <file>\n");
     return;
   }
+  bool recursive = flag('r') || flag('R');
   if (path_resolve(name, rpath) != 0) {
     con_write("rm: path too long\n");
+  } else if (recursive && streq(rpath, "/")) {
+    con_write("rm: refusing to remove /\n");
+  } else if (recursive && fs_isdir(rpath) == 1) {
+    if (rm_tree(rpath) == 0)
+      con_printf("removed %s\n", rpath);
+    else
+      con_printf("rm: could not remove everything under %s\n", name);
   } else {
     int r = fs_delete(rpath);
     if (r == 0) {
       con_printf("removed %s\n", rpath);
     } else if (r == -2) {
-      con_printf("rm: is a directory (use rmdir): %s\n", name);
-    } else {
+      con_printf("rm: is a directory (use -r or rmdir): %s\n", name);
+    } else if (!flag('f')) {
       con_printf("rm: no such file: %s\n", name);
     }
   }
   if (extra[0]) /* a courtesy for "rm a b" */
     cmd_rm(extra);
 }
-
-/* "mkdir <dir>", create a directory. */
 static void cmd_mkdir(const char *arg)
 {
   char name[PATH_MAX], extra[PATH_MAX], rpath[PATH_MAX];
   parse_two(arg, name, extra, (int)sizeof(name));
   if (name[0] == '\0') {
-    con_write("usage: mkdir <dir>\n");
+    con_write("usage: mkdir [-p] <dir>\n");
     return;
   }
   if (path_resolve(name, rpath) != 0)
     con_write("mkdir: path too long\n");
-  else if (fs_mkdir(rpath) == 0) {
+  else if (flag('p')) {
+    bool ok = true;
+    for (int k = 1; rpath[k] && ok; k++) {
+      if (rpath[k] != '/')
+        continue;
+      rpath[k] = '\0';
+      ok = fs_isdir(rpath) == 1 || fs_mkdir(rpath) == 0;
+      rpath[k] = '/';
+    }
+    ok = ok && (fs_isdir(rpath) == 1 || fs_mkdir(rpath) == 0);
+    if (!ok)
+      con_printf("mkdir: cannot create %s\n", name);
+  } else if (fs_mkdir(rpath) == 0) {
     con_printf("created %s\n", rpath);
   } else
     con_write("mkdir: cannot create (exists, bad path, or directory full)\n");
@@ -894,11 +1035,11 @@ static const struct builtin builtins[] = {
     {.name = "pwd", .help = "pwd           print the working directory", .fn0 = cmd_pwd},
     {.name = "cd", .fn = cmd_cd, .help = "cd [dir]      change directory (no arg -> home)"},
     {.name = "cat", .fn = cmd_cat, .help = "cat <file>    print a file"},
-    {.name = "grep", .fn = cmd_grep, .help = "grep <p> <f>  print lines of <f> that contain <p>"},
-    {.name = "cp", .fn = cmd_cp, .help = "cp <src> <dst> copy a file"},
+    {.name = "grep", .fn = cmd_grep, .flags = "i", .help = "grep <p> <f>  print lines of <f> that contain <p>"},
+    {.name = "cp", .fn = cmd_cp, .flags = "rR", .help = "cp <src> <dst> copy a file"},
     {.name = "mv", .fn = cmd_mv, .help = "mv <src> <dst> rename/move a file or directory"},
-    {.name = "rm", .fn = cmd_rm, .help = "rm <file>...  delete files"},
-    {.name = "mkdir", .fn = cmd_mkdir, .help = "mkdir <dir>...  create directories"},
+    {.name = "rm", .fn = cmd_rm, .flags = "rRf", .help = "rm <file>...  delete files"},
+    {.name = "mkdir", .fn = cmd_mkdir, .flags = "p", .help = "mkdir <dir>...  create directories"},
     {.name = "rmdir", .fn = cmd_rmdir, .help = "rmdir <dir>...  remove empty directories"},
     {.name = "storage", .help = "storage       list storage devices (IDE/SATA/NVMe)", .fn0 = cmd_storage},
     {.name = "mount",
@@ -913,7 +1054,7 @@ static const struct builtin builtins[] = {
 };
 
 /* Strip leading options ("--" ends them) from *arg; false after reporting one that `allowed` lacks. */
-static bool builtin_flags(const char *cmd, const char *allowed, const char **arg)
+static bool builtin_flags(const char *cmd, const char *allowed, const char **arg, uint64_t *seen)
 {
   const char *a = *arg;
   while (a[0] == '-' && a[1]) {
@@ -930,6 +1071,7 @@ static bool builtin_flags(const char *cmd, const char *allowed, const char **arg
         con_printf("%s: unknown option -%c\n", cmd, *a);
         return false;
       }
+      *seen |= flag_bit(*a);
     }
     while (*a == ' ')
       a++;
@@ -1066,7 +1208,8 @@ static void run(char *cmd)
 
   const struct builtin *b = builtin_find(name);
   if (b) {
-    if (!builtin_flags(b->name, b->flags, &carg))
+    g_flags = 0;
+    if (!builtin_flags(b->name, b->flags, &carg, &g_flags))
       return;
     if (b->fn0)
       b->fn0();
