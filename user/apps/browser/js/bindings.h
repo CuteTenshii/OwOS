@@ -94,7 +94,6 @@ js_value el_compare_position(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_contains(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_first_elem_child(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_attr(js_ctx *ctx, js_value t, js_value *args, int argc);
-js_value el_get_attr_ns(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_by_class(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_by_tag(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_popover(js_ctx *ctx, js_value t, js_value *args, int argc);
@@ -123,7 +122,6 @@ js_value el_replace_children(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_replace_with(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_root_node(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_set_attr(js_ctx *ctx, js_value t, js_value *args, int argc);
-js_value el_set_attr_ns(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_set_popover(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_show_popover(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_toggle_attr(js_ctx *ctx, js_value t, js_value *args, int argc);
@@ -234,6 +232,7 @@ const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap
 struct dom_node *doc_root_of(js_value t);
 js_value wrap_document(js_ctx *ctx, struct dom_node *root);
 void xpath_install(js_ctx *ctx, js_object *win);
+void namespace_install(void);
 
 js_value crypto_getrandomvalues(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value crypto_randomuuid(js_ctx *ctx, js_value t, js_value *args, int argc);

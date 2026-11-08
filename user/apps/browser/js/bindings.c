@@ -373,13 +373,14 @@ static js_value el_tagName(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
   char up[16];
-  int i = 0;
+  int i = 0, html;
   (void)args;
   (void)argc;
   if (!n)
     return js_undef();
+  html = n->tag[0] == '#' || !strcmp(dom_ns(n), DOM_NS_HTML);
   for (; n->tag[i] && i < 15; i++)
-    up[i] = (n->tag[i] >= 'a' && n->tag[i] <= 'z') ? (char)(n->tag[i] - 32) : n->tag[i];
+    up[i] = html && n->tag[i] >= 'a' && n->tag[i] <= 'z' ? (char)(n->tag[i] - 32) : n->tag[i];
   up[i] = '\0';
   return js_mk_cstring(ctx, up);
 }
@@ -1330,7 +1331,9 @@ static js_value doc_create_el(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_value wv = wrap_node(n);
   (void)t;
   if (n) {
-    js_value cls = ce_lookup(n->tag);
+    js_value cls;
+    dom_set_ns(n, DOM_NS_HTML);
+    cls = ce_lookup(n->tag);
     if (cls.type == JV_OBJ)
       ce_upgrade_node(n, cls);
   }
@@ -1341,12 +1344,6 @@ static js_value doc_create_text(js_ctx *ctx, js_value t, js_value *args, int arg
   (void)ctx;
   (void)t;
   return wrap_node(dom_new_text(arg_str(ctx, A(0))));
-}
-/* createElementNS(ns, qualifiedName): the DOM tracks no namespace */
-static js_value doc_create_el_ns(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  (void)t;
-  return wrap_node(dom_new_element(arg_str(ctx, A(1))));
 }
 static js_value doc_body(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1377,6 +1374,8 @@ static js_value doc_root_el(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)ctx;
   (void)args;
   (void)argc;
+  for (h = h ? h : root->first_child; h && h->type != DOM_ELEMENT; h = h->next)
+    ;
   return wrap_node(h ? h : root);
 }
 static js_value doc_get_title(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -1437,8 +1436,12 @@ static js_value doc_set_title(js_ctx *ctx, js_value t, js_value *args, int argc)
 static js_value domparser_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   const char *html = arg_str(ctx, A(0));
+  struct dom_node *root;
   (void)t;
-  return wrap_document(ctx, dom_parse(html, html ? (int)strlen(html) : 0));
+  root = dom_parse(html, html ? (int)strlen(html) : 0);
+  if (root && argc > 1 && !streq_ci(arg_str(ctx, A(1)), "text/html"))
+    dom_mark_xml_doc(root);
+  return wrap_document(ctx, root);
 }
 static js_value domparser_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
@@ -1453,6 +1456,111 @@ static js_value domparser_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
   return js_obj_value(o);
 }
 
+/* text and attribute values are stored undecoded: keep valid references, escape the rest */
+static void xml_escape(sbuf *sb, const char *s, bool attr)
+{
+  for (; *s; s++) {
+    if (*s == '&') {
+      const char *e = s + 1;
+      while ((*e >= '0' && *e <= '9') || (*e >= 'a' && *e <= 'z') || (*e >= 'A' && *e <= 'Z') || *e == '#')
+        e++;
+      sb_puts(sb, *e == ';' && e > s + 1 ? "&" : "&amp;");
+    } else if (*s == '<')
+      sb_puts(sb, "&lt;");
+    else if (*s == '>' && !attr)
+      sb_puts(sb, "&gt;");
+    else if (*s == '"' && attr)
+      sb_puts(sb, "&quot;");
+    else
+      sb_putc(sb, *s);
+  }
+}
+static void xml_decl(sbuf *sb, const char *prefix, int plen, const char *uri)
+{
+  sb_puts(sb, plen ? " xmlns:" : " xmlns");
+  sb_putn(sb, prefix, plen);
+  sb_puts(sb, "=\"");
+  xml_escape(sb, uri, true);
+  sb_putc(sb, '"');
+}
+static void xml_node(struct dom_node *e, sbuf *sb, int depth)
+{
+  struct dom_node *k;
+  struct dom_attr *a;
+  const char *ns, *declared[8];
+  int pl, nd = 0, html;
+  if (e->type == DOM_TEXT) {
+    if (e->text)
+      xml_escape(sb, e->text, false);
+    return;
+  }
+  if (node_is_comment(e)) {
+    const char *d = dom_get_attr(e, "data");
+    sb_puts(sb, "<!--");
+    sb_puts(sb, d ? d : "");
+    sb_puts(sb, "-->");
+    return;
+  }
+  if (e->tag[0] == '#') {
+    if (depth < SERIALIZE_DEPTH_MAX)
+      for (k = e->first_child; k; k = k->next)
+        xml_node(k, sb, depth + 1);
+    return;
+  }
+  ns = dom_ns(e);
+  pl = dom_prefix_len(e->tag);
+  html = !strcmp(ns, DOM_NS_HTML);
+  sb_putc(sb, '<');
+  sb_puts(sb, e->tag);
+  if (*ns && strcmp(dom_scope_ns(e->parent, e->tag, pl), ns)) {
+    bool own = false;
+    for (a = e->attrs; a; a = a->next)
+      own |= pl ? !memcmp(a->name, "xmlns:", 6) && (int)strlen(a->name + 6) == pl && !memcmp(a->name + 6, e->tag, pl)
+                : !strcmp(a->name, "xmlns");
+    if (!own)
+      xml_decl(sb, e->tag, pl, ns);
+  }
+  for (a = e->attrs; a; a = a->next) {
+    int apl = dom_prefix_len(a->name);
+    const char *ans = dom_attr_ns(a);
+    if (apl && *ans && strcmp(ans, DOM_NS_XMLNS) && strcmp(ans, DOM_NS_XML) && nd < 8 &&
+        strcmp(dom_scope_ns(e, a->name, apl), ans)) {
+      int seen = 0;
+      for (int i = 0; i < nd; i++)
+        seen |= !memcmp(declared[i], a->name, apl) && declared[i][apl] == ':';
+      if (!seen) {
+        declared[nd++] = a->name; /* compared up to the colon */
+        xml_decl(sb, a->name, apl, ans);
+      }
+    }
+  }
+  for (a = e->attrs; a; a = a->next) {
+    sb_putc(sb, ' ');
+    sb_puts(sb, a->name);
+    sb_puts(sb, "=\"");
+    xml_escape(sb, a->value ? a->value : "", true);
+    sb_putc(sb, '"');
+  }
+  if (!e->first_child) {
+    if (!html)
+      sb_puts(sb, "/>");
+    else if (tag_is_void(e->tag))
+      sb_puts(sb, " />");
+    else {
+      sb_puts(sb, "></");
+      sb_puts(sb, e->tag);
+      sb_putc(sb, '>');
+    }
+    return;
+  }
+  sb_putc(sb, '>');
+  if (depth < SERIALIZE_DEPTH_MAX)
+    for (k = e->first_child; k; k = k->next)
+      xml_node(k, sb, depth + 1);
+  sb_puts(sb, "</");
+  sb_puts(sb, e->tag);
+  sb_putc(sb, '>');
+}
 static js_value xmlser_serialize(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(A(0));
@@ -1461,10 +1569,7 @@ static js_value xmlser_serialize(js_ctx *ctx, js_value t, js_value *args, int ar
   (void)t;
   if (!n)
     return js_mk_cstring(ctx, "");
-  if (n->type == DOM_ELEMENT && n->tag[0] == '#' && !node_is_comment(n))
-    serialize(n, &sb); /* #document / #frag: children only */
-  else
-    serialize_node(n, &sb, 0);
+  xml_node(n, &sb, 0);
   r = js_mk_string(ctx, sb.b ? sb.b : "", sb.n);
   free(sb.b);
   return r;
@@ -1737,8 +1842,6 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_element_proto, "getAttributeNames", el_attr_names, 0);
   def_method(g_element_proto, "hasAttributes", el_has_attrs, 0);
   def_method(g_element_proto, "toggleAttribute", el_toggle_attr, 1);
-  def_method(g_element_proto, "getAttributeNS", el_get_attr_ns, 2);
-  def_method(g_element_proto, "setAttributeNS", el_set_attr_ns, 3);
   def_method(g_element_proto, "click", el_click, 0);
   def_method(g_element_proto, "focus", el_noop, 0);
   def_method(g_element_proto, "blur", el_noop, 0);
@@ -1771,7 +1874,6 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_document_proto, "querySelector", doc_query, 1);
   def_method(g_document_proto, "querySelectorAll", doc_query_all, 1);
   def_method(g_document_proto, "createElement", doc_create_el, 1);
-  def_method(g_document_proto, "createElementNS", doc_create_el_ns, 2);
   def_method(g_document_proto, "createTextNode", doc_create_text, 1);
   def_method(g_document_proto, "createDocumentFragment", doc_create_frag, 0);
   def_method(g_document_proto, "createComment", doc_create_comment, 1);
@@ -2191,6 +2293,9 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     }
   }
   js_def_native(ctx, win, "DOMParser", domparser_ctor, 0); /* new DOMParser().parseFromString */
+  js_def_native(ctx, win, "XMLSerializer", xmlser_ctor, 0);
+  xpath_install(ctx, win);
+  namespace_install();
 
   /* fetch() + Response.prototype */
   def_method(g_response_proto, "text", resp_text, 0);
@@ -2211,8 +2316,6 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_ws_proto, "send", ws_send_m, 1);
   def_method(g_ws_proto, "close", ws_close_m, 2);
   def_method(g_ws_proto, "addEventListener", el_add_listener, 3);
-  js_def_native(ctx, win, "XMLSerializer", xmlser_ctor, 0);
-  xpath_install(ctx, win);
   def_method(g_ws_proto, "removeEventListener", el_remove_listener, 3);
   def_method(g_ws_proto, "dispatchEvent", el_dispatch, 1);
   js_def(g_ws_proto, "CONNECTING", js_number(WS_CONNECTING), P_ENUMERABLE);

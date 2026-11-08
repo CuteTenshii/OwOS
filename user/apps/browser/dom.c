@@ -80,6 +80,7 @@ static void node_init(struct dom_node *n, enum dom_type type)
   n->type = type;
   n->tag[0] = '\0';
   n->text = 0;
+  n->ns = 0;
   n->attrs = 0;
   n->last_attr = 0;
   for (int i = 0; i < 8; i++)
@@ -133,6 +134,7 @@ static bool attr_append(struct dom_node *el, char *name, char *value)
   }
   a->name = name;
   a->value = value;
+  a->ns = 0;
   a->next = 0;
   if (el->last_attr)
     el->last_attr->next = a;
@@ -474,6 +476,30 @@ bool dom_structural_styles;
 /* Bumped by every tree-mutating API; the browser re-flattens only when it changes. */
 unsigned dom_mutation_seq;
 
+static const char *const known_ns[] = {DOM_NS_HTML,  DOM_NS_SVG, DOM_NS_MATHML, DOM_NS_XML, DOM_NS_XMLNS,
+                                       DOM_NS_XLINK, ""};
+static const char xml_doc_mark[] = "";
+
+/* known URIs are shared literals; anything else is a heap copy */
+static char *ns_dup(const char *ns)
+{
+  if (!ns)
+    return 0;
+  for (unsigned i = 0; i < sizeof known_ns / sizeof known_ns[0]; i++)
+    if (!strcmp(ns, known_ns[i]))
+      return (char *)known_ns[i];
+  return dupn(ns, (int)strlen(ns));
+}
+static void ns_free(char *ns)
+{
+  if (!ns || ns == xml_doc_mark)
+    return;
+  for (unsigned i = 0; i < sizeof known_ns / sizeof known_ns[0]; i++)
+    if (ns == known_ns[i])
+      return;
+  free(ns);
+}
+
 static void node_free_one(struct dom_node *n)
 {
   if (n->wrapper && dom_on_free_wrapper)
@@ -492,9 +518,11 @@ static void node_free_one(struct dom_node *n)
     struct dom_attr *nx = a->next;
     free(a->name);
     free(a->value);
+    ns_free(a->ns);
     free(a);
     a = nx;
   }
+  ns_free(n->ns);
   if (n->text)
     free(n->text);
   free(n);
@@ -650,6 +678,7 @@ static struct dom_node *clone_one(const struct dom_node *src)
     return 0;
   node_init(n, src->type);
   memcpy(n->tag, src->tag, sizeof n->tag);
+  n->ns = src->ns == xml_doc_mark ? 0 : ns_dup(src->ns);
   if (src->text && !(n->text = dupn(src->text, (int)strlen(src->text)))) {
     free(n);
     return 0;
@@ -667,6 +696,7 @@ static struct dom_node *clone_one(const struct dom_node *src)
       dom_free(n);
       return 0;
     }
+    n->last_attr->ns = ns_dup(a->ns);
     n->attr_seq++;
   }
   return n;
@@ -823,5 +853,145 @@ void dom_clear_children(struct dom_node *el)
     c->parent = 0;
     dom_free(c);
     c = nx;
+  }
+}
+
+/* ------------------------------------------------------- namespaces ------- */
+
+int dom_prefix_len(const char *q)
+{
+  const char *c = strchr(q, ':');
+  return c ? (int)(c - q) : 0;
+}
+const char *dom_local_name(const char *q)
+{
+  int n = dom_prefix_len(q);
+  return n ? q + n + 1 : q;
+}
+static int ncmp(const char *a, const char *b, int n)
+{
+  for (; n > 0; n--, a++, b++) {
+    if (*a != *b)
+      return (unsigned char)*a - (unsigned char)*b;
+    if (!*a)
+      return 0;
+  }
+  return 0;
+}
+static bool is_xml_doc(const struct dom_node *n)
+{
+  while (n->parent)
+    n = n->parent;
+  return n->ns == xml_doc_mark;
+}
+void dom_mark_xml_doc(struct dom_node *root)
+{
+  ns_free(root->ns);
+  root->ns = (char *)xml_doc_mark;
+}
+
+/* The namespace `prefix` (plen bytes, 0 = default) is bound to at `el`, from xmlns attributes */
+const char *dom_lookup_ns(const struct dom_node *el, const char *prefix, int plen)
+{
+  for (const struct dom_node *e = el; e && e->type == DOM_ELEMENT && e->tag[0] != '#'; e = e->parent)
+    for (const struct dom_attr *a = e->attrs; a; a = a->next) {
+      if (plen ? (!ncmp(a->name, "xmlns:", 6) && (int)strlen(a->name + 6) == plen && !ncmp(a->name + 6, prefix, plen))
+               : !strcmp(a->name, "xmlns"))
+        return a->value ? a->value : "";
+    }
+  return "";
+}
+
+const char *dom_ns(const struct dom_node *n)
+{
+  const struct dom_node *p = n;
+  int xml = is_xml_doc(n);
+  for (;;) {
+    int pl = dom_prefix_len(p->tag);
+    if (p->ns && p->ns != xml_doc_mark)
+      return p->ns;
+    if (pl) {
+      const char *u = dom_lookup_ns(p, p->tag, pl);
+      if (*u)
+        return u;
+    } else if (!strcmp(p->tag, "svg"))
+      return DOM_NS_SVG;
+    else if (!strcmp(p->tag, "math"))
+      return DOM_NS_MATHML;
+    else if (xml) {
+      const char *u = dom_lookup_ns(p, "", 0);
+      if (*u)
+        return u;
+    }
+    p = p->parent;
+    if (!p || p->tag[0] == '#' || !strcmp(p->tag, "foreignobject"))
+      return DOM_NS_HTML;
+  }
+}
+
+const char *dom_attr_ns(const struct dom_attr *a)
+{
+  int pl;
+  if (a->ns)
+    return a->ns;
+  if (!strcmp(a->name, "xmlns"))
+    return DOM_NS_XMLNS;
+  pl = dom_prefix_len(a->name);
+  if (pl == 5 && !ncmp(a->name, "xmlns", 5))
+    return DOM_NS_XMLNS;
+  if (pl == 3 && !ncmp(a->name, "xml", 3))
+    return DOM_NS_XML;
+  if (pl == 5 && !ncmp(a->name, "xlink", 5))
+    return DOM_NS_XLINK;
+  return "";
+}
+
+const char *dom_scope_ns(const struct dom_node *el, const char *prefix, int plen)
+{
+  for (const struct dom_node *e = el; e && e->type == DOM_ELEMENT && e->tag[0] != '#'; e = e->parent) {
+    if (dom_prefix_len(e->tag) == plen && !ncmp(e->tag, prefix, plen) && *dom_ns(e))
+      return dom_ns(e);
+    for (const struct dom_attr *a = e->attrs; a; a = a->next)
+      if (plen ? (!ncmp(a->name, "xmlns:", 6) && !ncmp(a->name + 6, prefix, plen) && !a->name[6 + plen])
+               : !strcmp(a->name, "xmlns"))
+        return a->value ? a->value : "";
+  }
+  return "";
+}
+
+void dom_set_ns(struct dom_node *el, const char *ns)
+{
+  char *c = ns_dup(ns);
+  if (ns && !c)
+    return;
+  ns_free(el->ns);
+  el->ns = c;
+}
+
+struct dom_attr *dom_find_attr_ns(const struct dom_node *el, const char *ns, const char *local)
+{
+  for (struct dom_attr *a = el->attrs; a; a = a->next)
+    if (!strcmp(dom_attr_ns(a), ns ? ns : "") && !strcmp(dom_local_name(a->name), local))
+      return a;
+  return 0;
+}
+
+void dom_set_attr_ns(struct dom_node *el, const char *ns, const char *qname, const char *value)
+{
+  struct dom_attr *a = dom_find_attr_ns(el, ns, dom_local_name(qname));
+  char *c;
+  if (!a) {
+    dom_set_attr(el, qname, value);
+    for (a = el->attrs; a && !streq_ci(a->name, qname); a = a->next)
+      ;
+  } else {
+    dom_set_attr(el, a->name, value);
+  }
+  if (!a)
+    return;
+  c = ns_dup(ns ? ns : "");
+  if (c) {
+    ns_free(a->ns);
+    a->ns = c;
   }
 }

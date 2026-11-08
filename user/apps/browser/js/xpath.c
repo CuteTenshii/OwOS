@@ -63,13 +63,22 @@ struct xe {
 };
 
 /* One evaluation at a time: every allocation lives in `blk` and is freed together. */
-static struct {
+enum { ERR_SYNTAX, ERR_NAMESPACE, ERR_THROWN };
+struct xstate {
   void **blk;
   int nb, cap;
   const char *err;
+  int err_kind;
   const char *p;
   int depth;
-} X;
+  js_value resolver;
+  struct {
+    char prefix[32];
+    const char *uri;
+  } pfx[16];
+  int npfx;
+};
+static struct xstate X;
 
 static void *palloc(unsigned n)
 {
@@ -873,13 +882,54 @@ static int compare(int op, xv a, xv b)
   return cmp_scalar(op, a, b);
 }
 
+/* The namespace URI a prefix in the expression stands for, via the caller's resolver */
+static const char *resolve_prefix(const char *prefix, int plen)
+{
+  js_value arg, res = js_undef(), fn;
+  const char *u = 0;
+  for (int i = 0; i < X.npfx; i++)
+    if ((int)strlen(X.pfx[i].prefix) == plen && !ncmp(X.pfx[i].prefix, prefix, plen))
+      return X.pfx[i].uri;
+  if (X.resolver.type == JV_OBJ && plen < 32) {
+    gc_push_scope();
+    arg = js_mk_string(g_ctx, prefix, plen);
+    if (arg.type == JV_STR)
+      gc_keep(arg.u.str);
+    fn = js_is_callable(X.resolver) ? X.resolver : js_get(g_ctx, X.resolver, "lookupNamespaceURI");
+    if (js_is_callable(fn))
+      res = js_call(g_ctx, fn, js_is_callable(X.resolver) ? js_undef() : X.resolver, &arg, 1);
+    if (g_ctx->has_exc) {
+      X.err_kind = ERR_THROWN;
+      fail("the namespace resolver threw");
+    } else if (res.type == JV_STR && *res.u.str->data)
+      u = pstr(res.u.str->data, (int)strlen(res.u.str->data));
+    gc_pop_scope();
+  }
+  if (!u) {
+    if (!X.err)
+      X.err_kind = ERR_NAMESPACE;
+    fail("the prefix cannot be resolved to a namespace");
+    return "";
+  }
+  if (X.npfx < 16) {
+    memcpy(X.pfx[X.npfx].prefix, prefix, (unsigned)plen);
+    X.pfx[X.npfx++].uri = u;
+  }
+  return u;
+}
+static int is_xmlns_attr(const struct dom_attr *a) { return !strcmp(a->name, "xmlns") || !ncmp(a->name, "xmlns:", 6); }
+
 static int name_matches(xn x, const struct xstep *st, int attr_axis)
 {
-  if (st->test == T_NODE)
-    return 1;
-  if (attr_axis != (x.a != 0))
+  const char *qname, *ns;
+  int pl, tl;
+  if (attr_axis != (x.a != 0) && st->test != T_NODE)
+    return 0;
+  if (x.a && is_xmlns_attr(x.a))
     return 0;
   switch (st->test) {
+  case T_NODE:
+    return 1;
   case T_TEXT:
     return !x.a && x.n->type == DOM_TEXT;
   case T_COMMENT:
@@ -889,13 +939,22 @@ static int name_matches(xn x, const struct xstep *st, int attr_axis)
   }
   if (!x.a && !is_element(x.n))
     return 0;
-  if (st->test == T_ANY) {
-    unsigned n = strlen(st->name);
-    if (!n)
-      return 1;
-    return !ncmp(x.a ? x.a->name : x.n->tag, st->name, n - 1);
+  qname = x.a ? x.a->name : x.n->tag;
+  ns = x.a ? dom_attr_ns(x.a) : dom_ns(x.n);
+  tl = (int)strlen(st->name);
+  pl = st->test == T_ANY ? (tl ? tl - 2 : 0) : dom_prefix_len(st->name);
+  if (st->test == T_ANY && !tl)
+    return 1;
+  if (pl > 0 || (st->test == T_ANY && tl)) {
+    const char *uri = resolve_prefix(st->name, pl);
+    if (strcmp(ns, uri))
+      return 0;
+    return st->test == T_ANY || !strcmp(dom_local_name(qname), dom_local_name(st->name));
   }
-  return !strcmp(x.a ? x.a->name : x.n->tag, st->name);
+  /* unprefixed: no namespace for attributes; HTML (or none) for elements */
+  if (x.a ? *ns : strcmp(ns, DOM_NS_HTML) && *ns)
+    return 0;
+  return !strcmp(qname, st->name);
 }
 
 static void push_subtree(struct dom_node *root, xl *out, int include_root)
@@ -970,7 +1029,8 @@ static void axis_nodes(xn c, int axis, xl *out)
     if (is_element(n))
       for (struct dom_attr *at = n->attrs; at; at = at->next) {
         xn x = {n, at};
-        xl_push(out, x);
+        if (!is_xmlns_attr(at))
+          xl_push(out, x);
       }
     break;
   case AX_FOLLOWING_SIBLING:
@@ -1078,12 +1138,8 @@ static double xround(double d)
     return d;
   return floor(d + 0.5);
 }
-static const char *node_name(xv v, xn c)
-{
-  xn x = v.ns.n ? v.ns.v[0] : c;
-  const char *s = x.a ? x.a->name : (is_element(x.n) ? x.n->tag : "");
-  return s;
-}
+static xn first_or(xv v, xn c) { return v.ns.n ? v.ns.v[0] : c; }
+static const char *node_name(xn x) { return x.a ? x.a->name : (is_element(x.n) ? x.n->tag : ""); }
 
 static xv call_function(struct xe *e, xn c, int pos, int size)
 {
@@ -1157,11 +1213,17 @@ static xv call_function(struct xe *e, xn c, int pos, int size)
       fail("name() needs a node-set");
       return vstr("");
     }
-    return vstr(node_name(a[0], c));
+    return vstr(IS("name") ? node_name(first_or(a[0], c)) : dom_local_name(node_name(first_or(a[0], c))));
   }
   if (IS("namespace-uri")) {
+    xn x;
     NEED(0, 1)
-    return vstr("");
+    if (n && a[0].t != V_NODES) {
+      fail("namespace-uri() needs a node-set");
+      return vstr("");
+    }
+    x = first_or(a[0], c);
+    return vstr(x.a ? dom_attr_ns(x.a) : (is_element(x.n) ? dom_ns(x.n) : ""));
   }
   if (IS("string")) {
     NEED(0, 1)
@@ -1470,8 +1532,19 @@ static js_value make_result(js_ctx *ctx, xv v, int type)
   return rv;
 }
 
-static js_value evaluate_on(js_ctx *ctx, const char *expr, struct dom_node *ctxnode, js_value type_arg)
+static js_value xpath_error(js_ctx *ctx, int kind, const char *msg)
 {
+  char buf[128];
+  if (kind == ERR_THROWN)
+    return js_undef();
+  snprintf(buf, sizeof buf, kind == ERR_NAMESPACE ? "%s" : "invalid XPath expression: %s", msg);
+  return js_throw_error(ctx, ctx->error_proto, kind == ERR_NAMESPACE ? "NamespaceError" : "SyntaxError", buf);
+}
+/* a resolver callback may evaluate again, so each evaluation keeps its own state */
+static js_value evaluate_on(js_ctx *ctx, const char *expr, struct dom_node *ctxnode, js_value resolver,
+                            js_value type_arg)
+{
+  struct xstate saved = X;
   struct xe *e;
   js_value out = js_undef();
   double ty = type_arg.type == JV_UNDEF ? 0 : js_to_number(ctx, type_arg);
@@ -1480,6 +1553,7 @@ static js_value evaluate_on(js_ctx *ctx, const char *expr, struct dom_node *ctxn
   if (!ctxnode)
     return js_throw_type(ctx, "XPath evaluate: missing context node");
   memset(&X, 0, sizeof X);
+  X.resolver = resolver;
   e = parse(expr);
   if (e) {
     xv v = eval(e, mk(ctxnode), 1, 1);
@@ -1487,12 +1561,15 @@ static js_value evaluate_on(js_ctx *ctx, const char *expr, struct dom_node *ctxn
       out = make_result(ctx, v, (int)ty);
   }
   if (X.err) {
+    int kind = X.err_kind;
     char msg[96];
-    snprintf(msg, sizeof msg, "invalid XPath expression: %s", X.err);
+    strlcpy(msg, X.err, sizeof msg);
     pool_reset();
-    return js_throw_error(ctx, ctx->error_proto, "SyntaxError", msg);
+    X = saved;
+    return xpath_error(ctx, kind, msg);
   }
   pool_reset();
+  X = saved;
   return out;
 }
 static struct dom_node *context_arg(js_value v, js_value fallback)
@@ -1502,16 +1579,18 @@ static struct dom_node *context_arg(js_value v, js_value fallback)
 
 js_value doc_evaluate(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  return evaluate_on(ctx, arg_str(ctx, A(0)), context_arg(A(1), t), A(3));
+  return evaluate_on(ctx, arg_str(ctx, A(0)), context_arg(A(1), t), A(2), A(3));
 }
 static js_value xpe_evaluate(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value src = js_get(ctx, t, "@src");
-  return evaluate_on(ctx, src.type == JV_STR ? src.u.str->data : "", context_arg(A(0), t), A(1));
+  return evaluate_on(ctx, src.type == JV_STR ? src.u.str->data : "", context_arg(A(0), t), js_get(ctx, t, "@resolver"),
+                     A(1));
 }
 js_value doc_create_expression(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   const char *expr = arg_str(ctx, A(0));
+  struct xstate saved = X;
   js_object *o;
   js_value ov;
   (void)t;
@@ -1519,15 +1598,18 @@ js_value doc_create_expression(js_ctx *ctx, js_value t, js_value *args, int argc
   parse(expr);
   if (X.err) {
     char msg[96];
-    snprintf(msg, sizeof msg, "invalid XPath expression: %s", X.err);
+    strlcpy(msg, X.err, sizeof msg);
     pool_reset();
-    return js_throw_error(ctx, ctx->error_proto, "SyntaxError", msg);
+    X = saved;
+    return xpath_error(ctx, ERR_SYNTAX, msg);
   }
   pool_reset();
+  X = saved;
   gc_push_scope();
   o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   ov = js_obj_value(o);
   js_set(ctx, ov, "@src", js_mk_cstring(ctx, expr));
+  js_set(ctx, ov, "@resolver", A(1));
   js_def_native(ctx, o, "evaluate", xpe_evaluate, 3);
   gc_pop_scope();
   return ov;

@@ -337,6 +337,85 @@ static void test_event_target(void)
              "AbortController().signal instanceof EventTarget, 'DOM objects inherit EventTarget');\n");
 }
 
+static void test_namespaces(void)
+{
+  run_script(
+      "var SVG='http://www.w3.org/2000/svg', XL='http://www.w3.org/1999/xlink', H='http://www.w3.org/1999/xhtml';\n"
+      "var d=document, div=d.createElement('div');\n"
+      "expect(div.namespaceURI===H && div.localName==='div' && div.prefix===null, 'createElement is HTML');\n"
+      "var s=d.createElementNS(SVG,'svg'); s.appendChild(d.createElementNS(SVG,'path'));\n"
+      "expect(s.namespaceURI===SVG && s.tagName==='svg' && s.firstChild.namespaceURI===SVG, 'createElementNS keeps "
+      "ns');\n"
+      "div.innerHTML='<svg><circle></circle></svg>';\n"
+      "expect(div.firstChild.namespaceURI===SVG && div.firstChild.firstChild.namespaceURI===SVG, 'parsed svg "
+      "subtree');\n"
+      "var p=d.createElementNS(SVG,'x:rect'); expect(p.prefix==='x' && p.localName==='rect' && p.tagName==='x:rect', "
+      "'prefix');\n"
+      "var bad=false; try{ d.createElementNS(null,'x:y') }catch(e){ bad=e.name==='NamespaceError' }\n"
+      "expect(bad, 'prefix without namespace throws');\n"
+      "s.setAttributeNS(XL,'xlink:href','#a'); s.setAttributeNS(null,'href','plain');\n"
+      "expect(s.getAttributeNS(XL,'href')==='#a' && s.getAttributeNS(null,'href')==='plain', 'attribute ns lookups');\n"
+      "expect(s.hasAttributeNS(XL,'href') && !s.hasAttributeNS(XL,'nope') && s.getAttribute('xlink:href')==='#a', "
+      "'hasAttributeNS');\n"
+      "s.setAttributeNS(XL,'xlink:href','#b'); expect(s.getAttributeNS(XL,'href')==='#b' && s.attributes.length===2, "
+      "'update');\n"
+      "var at=s.attributes[0]; expect(at.namespaceURI===XL && at.prefix==='xlink' && at.localName==='href', 'attr ns "
+      "fields');\n"
+      "s.removeAttributeNS(XL,'href'); expect(!s.hasAttributeNS(XL,'href') && s.getAttribute('href')==='plain', "
+      "'removeAttributeNS');\n"
+      "var c=s.cloneNode(true); expect(c.namespaceURI===SVG && c.firstChild.namespaceURI===SVG, 'clone keeps ns');\n"
+      "expect(d.getElementsByTagNameNS(SVG,'*').length===0, 'detached svg is not in the document');\n"
+      "d.body.appendChild(s);\n"
+      "expect(d.getElementsByTagNameNS(SVG,'path').length===1 && d.getElementsByTagNameNS('*','path').length===1 &&\n"
+      "       d.getElementsByTagNameNS(H,'path').length===0, 'getElementsByTagNameNS');\n"
+      "expect(s.lookupNamespaceURI(null)===SVG && div.lookupNamespaceURI(null)===H && s.isDefaultNamespace(SVG), "
+      "'lookups');\n"
+      "var x=new DOMParser().parseFromString('<r xmlns=\"urn:a\" xmlns:q=\"urn:b\"><q:k/><k/></r>','text/xml');\n"
+      "var r=x.documentElement;\n"
+      "expect(r.namespaceURI==='urn:a' && r.firstChild.namespaceURI==='urn:b' && r.lastChild.namespaceURI==='urn:a', "
+      "'xml doc ns');\n"
+      "expect(r.lookupNamespaceURI('q')==='urn:b' && r.lookupPrefix('urn:b')==='q', 'lookupPrefix/Namespace');\n"
+      "var ser=new XMLSerializer();\n"
+      "expect(ser.serializeToString(r)==='<r xmlns=\"urn:a\" xmlns:q=\"urn:b\"><q:k/><k/></r>', 'xml roundtrip: "
+      "'+ser.serializeToString(r));\n"
+      "var g=d.createElementNS(SVG,'g'); g.appendChild(d.createElementNS(SVG,'path')); "
+      "g.setAttributeNS(XL,'xlink:href','#z');\n"
+      "expect(ser.serializeToString(g)==='<g xmlns=\"'+SVG+'\" xmlns:xlink=\"'+XL+'\" xlink:href=\"#z\"><path/></g>', "
+      "'svg decls: '+ser.serializeToString(g));\n"
+      "expect(ser.serializeToString(d.createElement('br'))==='<br xmlns=\"'+H+'\" />', 'html void: "
+      "'+ser.serializeToString(d.createElement('br')));\n"
+      "var h=d.createElement('p'); h.textContent='a < b'; expect(ser.serializeToString(h).indexOf('a &lt; b')>0, 'text "
+      "escaped');\n"
+      "var doc=new DOMParser().parseFromString('<r xmlns=\"urn:a\" xmlns:q=\"urn:b\"><q:k/><k/><svg:g "
+      "xmlns:svg=\"'+SVG+'\"/></r>','text/xml');\n"
+      "var R=XPathResult, res=function(pfx){ return {a:'urn:a',b:'urn:b',s:SVG}[pfx]||null };\n"
+      "function n(e,ctx){ return doc.evaluate(e,ctx||doc,res,R.NUMBER_TYPE,null).numberValue }\n"
+      "expect(n('count(//b:k)')===1 && n('count(//a:k)')===1 && n('count(//s:g)')===1, 'prefixed name tests: "
+      "'+n('count(//b:k)'));\n"
+      "expect(n('count(//b:*)')===1 && n('count(//*)')===4, 'prefix wildcard');\n"
+      "expect(n('count(//k)')===0, 'unprefixed does not match foreign ns');\n"
+      "expect(doc.evaluate('namespace-uri(//b:k)',doc,res,R.STRING_TYPE,null).stringValue==='urn:b', "
+      "'namespace-uri()');\n"
+      "expect(doc.evaluate('local-name(//b:k)',doc,res,R.STRING_TYPE,null).stringValue==='k', 'local-name()');\n"
+      "expect(doc.evaluate('name(//b:k)',doc,res,R.STRING_TYPE,null).stringValue==='q:k', 'name()');\n"
+      "expect(doc.evaluate('count(//*[local-name()=\"k\"])',doc,res,R.NUMBER_TYPE,null).numberValue===2, 'local-name "
+      "predicate');\n"
+      "var "
+      "viaNode=doc.evaluate('count(//"
+      "q:k)',doc,doc.createNSResolver(doc.documentElement),R.NUMBER_TYPE,null).numberValue;\n"
+      "expect(viaNode===1, 'createNSResolver(node)');\n"
+      "var obj=doc.evaluate('count(//b:k)',doc,{lookupNamespaceURI:res},R.NUMBER_TYPE,null).numberValue; "
+      "expect(obj===1, 'resolver object');\n"
+      "var nse=false; try{ doc.evaluate('//zz:k',doc,null,0,null) }catch(e){ nse=e.name==='NamespaceError' }\n"
+      "expect(nse, 'unresolved prefix throws NamespaceError');\n"
+      "var thr=false; try{ doc.evaluate('//b:k',doc,function(){ throw new Error('boom') },0,null) }catch(e){ "
+      "thr=e.message==='boom' }\n"
+      "expect(thr, 'resolver exceptions propagate');\n"
+      "var re=doc.evaluate('count(//b:k)',doc,function(p){ return doc.evaluate('count(//a:k)',doc,function(){return "
+      "'urn:a'},R.NUMBER_TYPE,null).numberValue ? 'urn:b' : null },R.NUMBER_TYPE,null).numberValue;\n"
+      "expect(re===1, 'reentrant evaluation from a resolver');\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -358,6 +437,7 @@ int main(void)
   test("URL.createObjectURL stores Blob bytes until revoked", test_blob_object_urls);
   test("XPath: evaluate, XPathEvaluator and XPathResult", test_xpath);
   test("EventTarget: construction, subclassing, dispatch and isolation", test_event_target);
+  test("namespaces: DOM, XMLSerializer and XPath", test_namespaces);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 
   return 0;

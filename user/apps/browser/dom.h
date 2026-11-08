@@ -10,6 +10,7 @@ enum dom_type { DOM_ELEMENT, DOM_TEXT };
 struct dom_attr {
   char *name;  /* lowercased                           */
   char *value; /* raw (entities not decoded), "" if none */
+  char *ns;    /* explicit namespace URI ("" = none), NULL = derived from the prefix */
   struct dom_attr *next;
 };
 
@@ -17,6 +18,7 @@ struct dom_node {
   enum dom_type type;
   char tag[16]; /* lowercased tag name (element)        */
   char *text;   /* character data (text node)           */
+  char *ns;     /* explicit namespace URI ("" = none), NULL = derived; see dom_ns() */
   struct dom_attr *attrs;
   struct dom_attr *last_attr; /* tail of attrs, for O(1) append       */
   struct dom_attr *attr_cache[8];
@@ -48,6 +50,25 @@ struct dom_node {
 struct dom_node *dom_parse(const char *html, int len);
 void dom_free(struct dom_node *root);
 const char *dom_get_attr(const struct dom_node *node, const char *name);
+
+/* Namespaces. Parsed elements derive theirs (svg/math subtrees, prefixes via xmlns:p); script-made
+ * ones carry an explicit URI. "" means no namespace. */
+#define DOM_NS_HTML "http://www.w3.org/1999/xhtml"
+#define DOM_NS_SVG "http://www.w3.org/2000/svg"
+#define DOM_NS_MATHML "http://www.w3.org/1998/Math/MathML"
+#define DOM_NS_XML "http://www.w3.org/XML/1998/namespace"
+#define DOM_NS_XMLNS "http://www.w3.org/2000/xmlns/"
+#define DOM_NS_XLINK "http://www.w3.org/1999/xlink"
+const char *dom_ns(const struct dom_node *el);
+const char *dom_attr_ns(const struct dom_attr *a);
+const char *dom_local_name(const char *qname); /* part after the prefix */
+int dom_prefix_len(const char *qname);         /* length of the prefix, 0 if none */
+const char *dom_lookup_ns(const struct dom_node *el, const char *prefix, int plen); /* "" if undeclared */
+const char *dom_scope_ns(const struct dom_node *el, const char *prefix, int plen);  /* binding in scope, "" if none */
+void dom_set_ns(struct dom_node *el, const char *ns);
+void dom_mark_xml_doc(struct dom_node *root); /* unprefixed xmlns attributes apply under this root */
+struct dom_attr *dom_find_attr_ns(const struct dom_node *el, const char *ns, const char *local);
+void dom_set_attr_ns(struct dom_node *el, const char *ns, const char *qname, const char *value);
 
 /* Mutation API for the JS DOM bindings; appended nodes are owned by the tree. */
 struct dom_node *dom_new_element(const char *tag);

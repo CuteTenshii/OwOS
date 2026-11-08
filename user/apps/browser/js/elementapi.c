@@ -460,6 +460,10 @@ js_value el_attributes(js_ctx *ctx, js_value t, js_value *args, int argc)
     js_object *o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
     js_def(o, "name", js_mk_cstring(ctx, a->name), P_ENUMERABLE);
     js_def(o, "value", js_mk_cstring(ctx, a->value ? a->value : ""), P_ENUMERABLE | P_WRITABLE);
+    js_def(o, "namespaceURI", dom_attr_ns(a)[0] ? js_mk_cstring(ctx, dom_attr_ns(a)) : js_null(), P_ENUMERABLE);
+    js_def(o, "prefix", dom_prefix_len(a->name) ? js_mk_string(ctx, a->name, dom_prefix_len(a->name)) : js_null(),
+           P_ENUMERABLE);
+    js_def(o, "localName", js_mk_cstring(ctx, dom_local_name(a->name)), P_ENUMERABLE);
     js_array_push(ctx, arr, js_obj_value(o));
   }
   gc_pop_scope();
@@ -483,15 +487,6 @@ js_value el_toggle_attr(js_ctx *ctx, js_value t, js_value *args, int argc)
   else if (n && !want && has)
     dom_remove_attr(n, name);
   return js_bool(want);
-}
-/* attribute names without a namespace: the (ns, name) forms alias the plain ones */
-js_value el_get_attr_ns(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  return el_get_attr(ctx, t, args + (argc > 0 ? 1 : 0), argc > 0 ? argc - 1 : 0);
-}
-js_value el_set_attr_ns(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  return el_set_attr(ctx, t, args + (argc > 0 ? 1 : 0), argc > 0 ? argc - 1 : 0);
 }
 struct dom_node *tree_next(struct dom_node *n)
 {
