@@ -129,7 +129,10 @@ static void draw_window(const struct winrec *w, bool focused)
   gfx_fill_rect(w->x, w->y, w->w, w->h, frame);
   gfx_fill_rect(w->x, w->y, w->w, WM_TITLE_H, title_bg);
 
-  int title_x = w->x + 8;
+  const unsigned *icon = window_icon(w);
+  int title_x = w->x + 8 + (icon ? ICON_PX + 4 : 0);
+  if (icon)
+    gfx_blit_argb(w->x + 8, w->y + (WM_TITLE_H - ICON_PX) / 2, ICON_PX, ICON_PX, icon);
   int title_right = w->x + w->w - 4;
   for (int k = 0; k < 3; k++) {
     int bbx, bby;
@@ -220,7 +223,13 @@ static void draw_taskbar_windows(int y, int uy, int right)
     unsigned fg = win_minimized(w) ? 0x8b94a4 : 0xc8d0dc;
     char dt[WM_TITLE_DISP];
     disp_title(w, dt);
-    ui_text_clip(tb_cache.bxs[k] + 8, uy, dt, fg, tb_cache.bws[k] - 12);
+    const unsigned *icon = window_icon(w);
+    int tx = tb_cache.bxs[k] + 8;
+    if (icon) {
+      gfx_blit_argb(tx, by + (bh - ICON_PX) / 2, ICON_PX, ICON_PX, icon);
+      tx += ICON_PX + 4;
+    }
+    ui_text_clip(tx, uy, dt, fg, tb_cache.bxs[k] + tb_cache.bws[k] - 4 - tx);
   }
 }
 
@@ -252,7 +261,10 @@ static void draw_start_menu(void)
   gfx_fill_rect(0, top, SM_W, sm_h(), 0x141a24);
   for (int i = 0; i < n; i++) {
     int iy = top + i * SM_ITEM_H;
-    gfx_ui_text(10, iy + (SM_ITEM_H - UIFONT_H) / 2, apps.v[i]->name, 0xc8d0dc);
+    const unsigned *icon = app_icon(i);
+    if (icon)
+      gfx_blit_argb(8, iy + (SM_ITEM_H - ICON_PX) / 2, ICON_PX, ICON_PX, icon);
+    gfx_ui_text(icon ? 8 + ICON_PX + 6 : 10, iy + (SM_ITEM_H - UIFONT_H) / 2, apps.v[i]->name, 0xc8d0dc);
   }
   int sep_y = top + sm_apps_h() + SM_SEP_H / 2;
   gfx_fill_rect(8, sep_y, SM_W - 16, 1, 0x05070a);
@@ -308,7 +320,13 @@ static void draw_switcher(void)
       continue;
     struct winrec *w = &cur[s];
     unsigned fg = (i == at_sel) ? 0xffffff : 0xc8d0dc;
-    ui_text_clip(x + 14, ry + (AT_ROW_H - UIFONT_H) / 2, w->title, fg, pw - 28);
+    const unsigned *icon = window_icon(w);
+    int tx = x + 14;
+    if (icon) {
+      gfx_blit_argb(tx, ry + (AT_ROW_H - ICON_PX) / 2, ICON_PX, ICON_PX, icon);
+      tx += ICON_PX + 6;
+    }
+    ui_text_clip(tx, ry + (AT_ROW_H - UIFONT_H) / 2, w->title, fg, x + pw - 14 - tx);
   }
 }
 

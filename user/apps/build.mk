@@ -17,7 +17,7 @@ APPS := $(GUI_APPS) $(CLI_APPS)
 # --- per-app libraries ---------------------------------------------------
 # compositor: clipboard paste, plus Print Screen capture (PNG encode + CRC-32).
 # browser: a multi-file program, linked flat.
-APP_OBJS_compositor := $(addprefix user/apps/compositor/,compositor.o damage.o screen.o wm.o menus.o cursor.o draw.o osd.o input.o keys.o conf.o)
+APP_OBJS_compositor := $(addprefix user/apps/compositor/,compositor.o damage.o screen.o wm.o menus.o icon.o cursor.o draw.o osd.o input.o keys.o conf.o)
 APP_OBJS_browser := user/apps/browser/main.o user/apps/browser/tabs.o user/apps/browser/worker.o user/apps/browser/text.o user/apps/browser/flow.o user/apps/browser/image.o user/apps/browser/paint.o user/apps/browser/chrome.o user/apps/browser/render.o user/apps/browser/input.o user/apps/browser/sync.o user/apps/browser/buffers.o user/apps/browser/surface.o user/apps/browser/fetch.o user/apps/browser/resource.o user/apps/browser/html.o user/apps/browser/html_entities.o user/apps/browser/html_text.o user/apps/browser/html_embed.o user/apps/browser/html_forms.o user/apps/browser/html_walk.o user/apps/browser/html_res.o user/apps/browser/dom.o user/apps/browser/css/engine.o user/apps/browser/css/engine_values.o user/apps/browser/css/engine_props.o user/apps/browser/css/engine_decl.o user/apps/browser/css/engine_sel.o user/apps/browser/css/engine_sheet.o user/apps/browser/css/sibling.o user/apps/browser/color.o user/apps/browser/layout.o user/apps/browser/features/anim/anim.o user/apps/browser/features/svg/svg.o user/apps/browser/features/jar/jar.o user/apps/browser/features/cache/cache.o user/apps/browser/js/bindings.o user/apps/browser/js/dom_query.o user/apps/browser/features/indexeddb/indexeddb.o user/apps/browser/features/serviceworker/serviceworker.o user/apps/browser/js/webapi.o user/apps/browser/features/notification/notification.o user/apps/browser/js/media.o user/apps/browser/js/classlist.o user/apps/browser/features/devtools/devtools.o user/apps/browser/features/devtools/devtools_log.o user/apps/browser/features/devtools/devtools_snap.o user/apps/browser/features/devtools/devtools_render.o user/apps/browser/features/csp/csp.o user/apps/browser/features/cors/cors.o user/apps/browser/imgdec.o user/apps/browser/features/media/media.o user/apps/browser/features/bookmarks/bookmarks.o user/apps/browser/features/clienthints/clienthints.o user/apps/browser/features/permissions/permissions.o user/apps/browser/features/mediasession/mediasession.o
 APP_LIBS_aac := $(AAC) $(MP4) $(MATH)
 APP_LIBS_alac := $(ALAC)
@@ -27,7 +27,7 @@ APP_LIBS_calc := $(MATH)
 APP_LIBS_cast := $(CAST) $(PROTOBUF) $(JSON) $(MATH) $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE)
 APP_LIBS_clipd := $(CLIPBOARD) $(MIME)
 APP_LIBS_cliphist := $(CLIPBOARD) $(MIME)
-APP_LIBS_compositor := $(CLIPBOARD) $(PNGENC) $(CRC32) $(MEDIACTL) $(DESKTOP)
+APP_LIBS_compositor := $(CLIPBOARD) $(PNGENC) $(CRC32) $(MEDIACTL) $(DESKTOP) $(UPNG) $(INFLATE)
 APP_LIBS_curl := $(HTTP) $(HEADERS) $(H2) $(H3) $(QUIC) $(URL) $(NETCONN) $(TLS) $(CRYPTO) $(BROTLI) $(RESOLVE)
 APP_LIBS_dig := $(RESOLVE)
 APP_LIBS_editor := $(CLIPBOARD) $(MIME) $(DIALOG)
@@ -96,3 +96,14 @@ kernel/uifont_blob.o: fonts/LiberationSans-Regular.ttf $(ARCH_STAMP)
 	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) $< $@
 kernel/monofont_blob.o: fonts/LiberationMono-Regular.ttf $(ARCH_STAMP)
 	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) $< $@
+
+# App icons (icons/<Icon= name>.png, from tools/genicons.py), embedded in the kernel and installed to
+# /usr/share/icons at boot. The symbol base has dashes turned into underscores.
+ICON_NAMES := utilities-terminal system-file-manager accessories-text-editor web-browser multimedia-player \
+              preferences-system-time accessories-calculator preferences-system-notifications \
+              preferences-system help-about application-default
+define icon_rule
+kernel/icon_$(subst -,_,$(1))_blob.o: icons/$(1).png $(ARCH_STAMP)
+	$$(OBJCOPY) -I binary -O $$(KELF) -B $$(KBFD) $$< $$@
+endef
+$(foreach i,$(ICON_NAMES),$(eval $(call icon_rule,$(i))))

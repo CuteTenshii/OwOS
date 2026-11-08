@@ -91,6 +91,7 @@ static void install_blob(const char *path, const unsigned char *start, const uns
     install_blob(diskpath, symbase##_start, symbase##_end, mode);                                                      \
   } while (0)
 #define INSTALL_APP(nm) INSTALL_FILE("/bin/" #nm, _binary_app_##nm, 0755)
+#define INSTALL_ICON(name, sym) INSTALL_FILE("/usr/share/icons/" name ".png", _binary_icons_##sym##_png, 0644)
 #define INSTALL_DESKTOP(nm) INSTALL_FILE("/usr/share/applications/" #nm ".desktop", _binary_desktop_##nm, 0644)
 
 /* Create a directory / file only if absent, with an explicit mode (the boot session runs as root). */
@@ -389,6 +390,18 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     mkdir_mode("/usr", 0755);
     mkdir_mode("/usr/share", 0755);
     mkdir_mode("/usr/share/applications", 0755);
+    mkdir_mode("/usr/share/icons", 0755);
+    INSTALL_ICON("utilities-terminal", utilities_terminal);
+    INSTALL_ICON("system-file-manager", system_file_manager);
+    INSTALL_ICON("accessories-text-editor", accessories_text_editor);
+    INSTALL_ICON("web-browser", web_browser);
+    INSTALL_ICON("multimedia-player", multimedia_player);
+    INSTALL_ICON("preferences-system-time", preferences_system_time);
+    INSTALL_ICON("accessories-calculator", accessories_calculator);
+    INSTALL_ICON("preferences-system-notifications", preferences_system_notifications);
+    INSTALL_ICON("preferences-system", preferences_system);
+    INSTALL_ICON("help-about", help_about);
+    INSTALL_ICON("application-default", application_default);
     INSTALL_DESKTOP(term);
     INSTALL_DESKTOP(files);
     INSTALL_DESKTOP(editor);

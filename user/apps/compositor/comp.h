@@ -44,6 +44,7 @@ enum { PA_SLEEP, PA_RESTART, PA_SHUTDOWN };
 #define PW_ROWS 4
 #define PW_CANCEL 3
 #define MAXKIDS 64
+#define ICON_PX 16
 #define MAXDMG 16
 struct rect {
   int x, y, w, h;
@@ -260,5 +261,9 @@ extern struct rect dmg[MAXDMG];
 extern int ndmg;
 void damage_add(int x, int y, int w, int h);
 void damage_add_union(int x0, int y0, int w0, int h0, int x1, int y1, int w1, int h1);
+
+/* icon.c */
+const unsigned *app_icon(int app);
+const unsigned *window_icon(const struct winrec *w);
 
 #endif /* OWOS_COMP_H */
