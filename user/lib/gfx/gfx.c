@@ -1104,3 +1104,11 @@ int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int to
     s = maxs;
   return s;
 }
+
+void gfx_get_clip(int *x, int *y, int *w, int *h)
+{
+  *x = g_cx0;
+  *y = g_cy0;
+  *w = g_cx1 - g_cx0;
+  *h = g_cy1 - g_cy0;
+}

@@ -14,6 +14,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Key codes the widgets under test use; mirror user/lib/owos.h. */
+#define KEY_UP 0x01
+#define KEY_DOWN 0x02
+#define KEY_HOME 0x05
+#define KEY_END 0x06
+
 /* Byte-exact string compare, matching user/lib/owos.h's inline version. */
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 

@@ -22,6 +22,7 @@ void gfx_clear(unsigned color);
  * gfx_init resets it to the whole buffer. */
 void gfx_set_clip(int x, int y, int w, int h);
 void gfx_clip_none(void);
+void gfx_get_clip(int *x, int *y, int *w, int *h); /* the active clip rect */
 void gfx_pixel(int x, int y, unsigned color);
 void gfx_fill_rect(int x, int y, int w, int h, unsigned color);
 void gfx_rect(int x, int y, int w, int h, unsigned color); /* 1px outline */
@@ -279,6 +280,49 @@ int scrollbar_hit(int x, int y, int w, int h, int mx, int my);
  * `scroll` when (mx,my) is outside the track region, so it can be called
  * unconditionally. */
 int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible);
+
+/* --------------------------------------------------------------- scroll view */
+/*
+ * A vertically scrolling container: content taller than the viewport is clipped to it and moved with the
+ * mouse wheel, the keyboard, or an attached scrollbar. The widget owns the scroll position; the app owns
+ * the content and draws it each frame between scrollview_begin() and scrollview_end():
+ *
+ *   int top = scrollview_begin(&sv, x, y, w, h, content_h);
+ *   draw content at (scrollview_content_x(&sv) + ..., top + row_y), width scrollview_content_w(&sv)
+ *   scrollview_end(&sv);
+ *
+ * Content coordinates start at 0 at the top; a click at screen my is at content y = my - sv.y + sv.scroll.
+ * The scrollbar appears only when the content overflows, and the content width shrinks to make room.
+ * Route events: WEV_SCROLL -> scrollview_wheel, WEV_KEY -> scrollview_key, WEV_MOUSE -> scrollview_press
+ * (returns 1 when the bar consumed the click), WEV_DRAG -> scrollview_drag. Each returns 1 when the
+ * view changed or consumed the event, so the app repaints.
+ */
+#define SCROLLVIEW_STEP 24 /* default px per wheel notch / arrow / key */
+
+struct scrollview {
+  int x, y, w, h; /* viewport from the last scrollview_begin, scrollbar included */
+  int content_h;  /* content height in px */
+  int scroll;     /* px scrolled from the top, 0..content_h - h */
+  int step;       /* px per wheel notch / arrow / key */
+  int dragging;   /* a scrollbar thumb drag is in progress */
+  int saved_clip[4];
+};
+
+void scrollview_init(struct scrollview *sv, int step);
+/* Place the viewport, clamp the scroll to the new content height, and clip drawing to the content area.
+ * Returns the screen y of the content's top edge (y - scroll). */
+int scrollview_begin(struct scrollview *sv, int x, int y, int w, int h, int content_h);
+/* Restore the previous clip and draw the scrollbar when the content overflows. */
+void scrollview_end(struct scrollview *sv);
+int scrollview_content_x(const struct scrollview *sv); /* left edge of the content area */
+int scrollview_content_w(const struct scrollview *sv); /* content width, less the scrollbar when shown */
+int scrollview_wheel(struct scrollview *sv, int dz);   /* WEV_SCROLL delta: + up / - down */
+/* Up/Down step, Home/End jump; 1 if handled. */
+int scrollview_key(struct scrollview *sv, int key);
+int scrollview_press(struct scrollview *sv, int mx, int my);
+int scrollview_drag(struct scrollview *sv, int mx, int my);
+/* Scroll the least amount that brings [y, y+h) (content coordinates) into view; 1 if it moved. */
+int scrollview_reveal(struct scrollview *sv, int y, int h);
 
 /* --------------------------------------------------------------- sidebar */
 /*

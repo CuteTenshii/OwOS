@@ -33,7 +33,7 @@ COMMON_SRCS := $(BROWSER)/css/engine.c $(BROWSER)/css/engine_values.c $(BROWSER)
   $(LIB)/base64/base64.c $(LIB)/sqlite/sqlite.c $(LIB)/js/lexer.c $(LIB)/js/parser.c $(LIB)/js/ast.c \
   $(LIB)/js/value.c $(LIB)/js/interp.c $(LIB)/js/builtins.c $(LIB)/js/bigint.c $(LIB)/math/fmt.c \
   $(LIB)/gc/gc.c scripts/host_math.c $(LIB)/opt.c $(LIB)/mutex.c
-MAIN_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(LIB)/zlib/crc32.c kernel/crc32c.c $(LIB)/stun/stun.c $(LIB)/ntp/ntp.c \
+MAIN_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/zlib/crc32.c kernel/crc32c.c $(LIB)/stun/stun.c $(LIB)/ntp/ntp.c \
   $(LIB)/mediactl/session.c $(LIB)/mp4/mp4.c $(wildcard $(LIB)/rar/*.c) $(LIB)/brotli/decode.c \
   drivers/usb/hid_desc.c
 BIND_SRCS := $(COMMON_SRCS) $(BROWSER)/js/dom_query.c
