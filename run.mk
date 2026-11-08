@@ -120,9 +120,14 @@ STORAGE := -hda $(DISK) \
 
 # Host<->guest clipboard: QEMU's built-in vdagent chardev over virtio-serial (no spice needed). The
 # host UI must support clipboard sharing (GTK, Cocoa, VNC); the guest side is drivers/bus/vdagent.c.
+# The guest agent (drivers/bus/qemuga.c) listens on QGA_SOCK, e.g.
+#   echo '{"execute":"guest-ping"}' | nc -U /tmp/owos-qga.sock
+QGA_SOCK ?= /tmp/owos-qga.sock
 VDAGENT := -chardev qemu-vdagent,id=vdagent,clipboard=on \
 	-device virtio-serial-pci,disable-legacy=on \
-	-device virtserialport,chardev=vdagent,name=com.redhat.spice.0,nr=1
+	-device virtserialport,chardev=vdagent,name=com.redhat.spice.0,nr=1 \
+	-chardev socket,id=qga,path=$(QGA_SOCK),server=on,wait=off \
+	-device virtserialport,chardev=qga,name=org.qemu.guest_agent.0,nr=2
 
 # USB_HID=1 also attaches a USB keyboard, mouse and tablet to the xHCI bus, so the USB HID driver gets exercised
 # (`make run USB_HID=1`); off by default so the PS/2 input path stays the only one.

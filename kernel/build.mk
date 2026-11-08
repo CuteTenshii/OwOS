@@ -41,7 +41,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/cpu.o kernel/smp.o kernel/smp_ap.o kernel/rtc.o kernel/wallclock.o drivers/acpi/power.o drivers/acpi/s3_wake.o drivers/acpi/battery.o \
         kernel/firmware.o kernel/smbios.o drivers/acpi/aml.o drivers/video/edid.o \
         kernel/syscall.o kernel/syscall_env.o kernel/env.o kernel/syscall_process.o kernel/syscall_fs.o kernel/syscall_net.o kernel/syscall_window.o kernel/syscall_audio.o kernel/syscall_graphics.o kernel/syscall_io.o kernel/syscall_signal.o kernel/syscall_exec.o kernel/syscall_entropy.o kernel/loader.o kernel/pipe.o kernel/ipc.o \
-        drivers/bus/vmware.o drivers/bus/vmtools.o drivers/bus/vdagent.o drivers/input/vmmouse.o drivers/input/synaptics.o drivers/video/vmsvga.o drivers/video/virtiogpu.o \
+        drivers/bus/vmware.o drivers/bus/vmtools.o drivers/bus/virtioserial.o drivers/bus/vdagent.o drivers/bus/qemuga.o drivers/input/vmmouse.o drivers/input/synaptics.o drivers/video/vmsvga.o drivers/video/virtiogpu.o \
         drivers/video/fb.o drivers/video/mtrr.o drivers/input/mouse.o kernel/uwin.o kernel/crash.o \
         kernel/edit_blob.o kernel/curl_blob.o \
         kernel/editor_blob.o kernel/about_blob.o \
