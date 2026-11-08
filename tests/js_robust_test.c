@@ -147,7 +147,7 @@ static void check_deep_recursion(void)
   expect(run("var o=[]; for(var i=0;i<100000;i++) o=[o];\n"
              "var threw=false; try{ JSON.stringify(o) }catch(e){ threw=e instanceof RangeError } expect(threw, "
              "'JSON.stringify depth');\n"
-             "var s=''; for(var i=0;i<100000;i++) s+='['; threw=false;\n"
+             "var s='['; while(s.length<100000) s+=s; threw=false;\n"
              "try{ JSON.parse(s) }catch(e){ threw=e instanceof RangeError } expect(threw, 'JSON.parse depth');\n"
              "var src='x=a'; for(var i=0;i<5000;i++) src+='.b'; threw=false;\n"
              "try{ new Function(src)() }catch(e){ threw=true } expect(threw, 'long member chain');\n"

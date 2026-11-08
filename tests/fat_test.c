@@ -73,7 +73,9 @@ static void dev_new(uint32_t secs)
     munmap(g_img, g_img_bytes);
   g_secs = secs;
   g_img_bytes = (size_t)secs * 512;
-  g_img = mmap(NULL, g_img_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  g_img = mmap(NULL, g_img_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+  if (g_img == MAP_FAILED)
+    abort();
   g_fail_write = -1;
 }
 
