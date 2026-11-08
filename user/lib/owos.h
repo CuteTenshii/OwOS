@@ -201,6 +201,8 @@ struct fbrect {
   int x, y, w, h;
 };
 int fb_present_rects(const struct fbrect *r, int n); /* flush up to 32 rects to VRAM, one drain; 0/-1 */
+/* Hardware cursor (w,h,hot <= 64 / 255): argb NULL hides it. The kernel tracks the pointer; 0/-1 if unsupported. */
+int fb_cursor_set(const unsigned *argb, int w, int h, int hot_x, int hot_y, int scale);
 
 /* Raw input for the compositor: current pointer state + drained key events */
 #define INPUT_KEYS 32

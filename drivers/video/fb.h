@@ -42,8 +42,8 @@ int fb_set_mode(uint32_t w, uint32_t h);
 /* Copy the damaged region of the back buffer to the visible framebuffer. */
 void fb_present(void);
 
-/* Callback per rect copied to the framebuffer, for adapters needing an explicit flush. NULL clears. */
-void fb_set_present_hook(void (*cb)(int x, int y, int w, int h));
+/* cb runs per rect copied to the framebuffer; flush (optional) once after each batch. NULL clears. */
+void fb_set_present_hook(void (*cb)(int x, int y, int w, int h), void (*flush)(void));
 
 /* Software brightness (fb_present dims pixels). fb_brightness_step re-renders the screen. IRQ-safe. */
 #define FB_BRIGHT_MAX 8

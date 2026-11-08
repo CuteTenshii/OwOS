@@ -227,3 +227,44 @@ void draw_cursor(int kind, int mx, int my)
     return;
   }
 }
+
+/* Hardware cursor: the kernel moves it straight from the pointer IRQ, so the compositor only redefines it. */
+bool hw_cursor;
+
+#define HW_SZ 32
+#define HW_ORG 8
+#define HW_KEY 0xff00ff
+
+bool cursor_hw_update(int kind)
+{
+  static unsigned scratch[HW_SZ * HW_SZ], out[4 * HW_SZ * HW_SZ];
+  static int last_key = -1;
+  int phase = kind == CUR_BUSY       ? (int)((cursor_frame / 3) & 7)
+              : kind == CUR_PROGRESS ? (int)((cursor_frame / 4) & 3)
+                                     : 0;
+  int key = ui_scale * 1000 + kind * 8 + phase;
+  if (key == last_key)
+    return hw_cursor;
+  last_key = key;
+
+  unsigned *fb;
+  int w, h, cx, cy, cw, ch;
+  gfx_get(&fb, &w, &h);
+  gfx_get_clip(&cx, &cy, &cw, &ch);
+  gfx_init(scratch, HW_SZ, HW_SZ);
+  gfx_clear(HW_KEY);
+  draw_cursor(kind, HW_ORG, HW_ORG);
+  gfx_init(fb, w, h);
+  gfx_set_clip(cx, cy, cw, ch);
+
+  int s = ui_scale, n = HW_SZ * s;
+  for (int y = 0; y < n; y++)
+    for (int x = 0; x < n; x++) {
+      unsigned px = scratch[(y / s) * HW_SZ + x / s];
+      out[y * n + x] = px == HW_KEY ? 0 : 0xff000000u | px;
+    }
+  hw_cursor = n <= 64 && fb_cursor_set(out, n, n, HW_ORG * s, HW_ORG * s, s) == 0;
+  if (!hw_cursor)
+    fb_cursor_set(0, 0, 0, 0, 0, 1);
+  return hw_cursor;
+}

@@ -93,6 +93,7 @@
 #define SYS_ACCESS 90
 #define SYS_TTY 91
 #define SYS_ENV 92
+#define SYS_FB_CURSOR 93
 
 /* SYS_ENV commands (ebx points at a struct env_req: cmd, name, name_len, value, value_len, buf, buf_len, index) */
 #define ENV_GET 0   /* copy the value of name into buf (if buf_len > 0); returns its length, -1 if unset */
@@ -116,10 +117,10 @@ struct env_req {
 #define SPAWN_ENV 4   /* the child gets the NAME=VALUE block at env (env_len bytes) instead of a copy of ours */
 
 /* SYS_TTY commands (fd in ebx, command in ecx, argument in edx) */
-#define TTY_ISATTY 0   /* 1 if fd is a terminal */
-#define TTY_GETSIZE 1  /* cols << 16 | rows */
-#define TTY_SETSIZE 2  /* pty master only; arg = cols << 16 | rows */
-#define TTY_SETFG 3    /* record the foreground job pid (0 = the shell itself) */
-#define TTY_GETFG 4    /* the recorded foreground pid */
+#define TTY_ISATTY 0  /* 1 if fd is a terminal */
+#define TTY_GETSIZE 1 /* cols << 16 | rows */
+#define TTY_SETSIZE 2 /* pty master only; arg = cols << 16 | rows */
+#define TTY_SETFG 3   /* record the foreground job pid (0 = the shell itself) */
+#define TTY_GETFG 4   /* the recorded foreground pid */
 
 #endif

@@ -305,10 +305,10 @@ int virtiogpu_init(uint32_t want_w, uint32_t want_h)
   }
 
   con_printf("virtio-gpu: mode %ux%ux32.\n", gw, gh);
-  fb_set_present_hook(vgpu_present);
+  fb_set_present_hook(vgpu_present, NULL);
   if (fb_adopt(fb_phys, gw, gh, gpitch, 32) != 0) {
     con_write("virtio-gpu: fb_adopt failed.\n");
-    fb_set_present_hook(NULL);
+    fb_set_present_hook(NULL, NULL);
     return -1;
   }
   return 0;

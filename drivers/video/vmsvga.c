@@ -8,6 +8,7 @@
 #include "io.h"
 #include "paging.h"
 #include "pci.h"
+#include "spinlock.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -38,7 +39,15 @@ enum {
   SVGA_REG_CONFIG_DONE = 20,
   SVGA_REG_SYNC = 21,
   SVGA_REG_BUSY = 22,
+  SVGA_REG_CURSOR_ID = 24,
+  SVGA_REG_CURSOR_X = 25,
+  SVGA_REG_CURSOR_Y = 26,
+  SVGA_REG_CURSOR_ON = 27,
 };
+
+#define SVGA_CAP_CURSOR_BYPASS 0x40u
+#define SVGA_CAP_ALPHA_CURSOR 0x200u
+#define SVGA_CMD_DEFINE_ALPHA_CURSOR 22
 
 /* FIFO control words occupy the first four dwords of the FIFO. */
 enum {
@@ -59,49 +68,73 @@ enum {
 
 static uint16_t io_base;
 static volatile uint32_t *fifo;
-static uint32_t fifo_words; /* FIFO size in dwords                            */
+static bool queued; /* UPDATEs queued since the last SYNC */
+
+static spinlock_t reg_lock; /* index/value pair must not interleave (mouse IRQ moves the cursor) */
+static spinlock_t fifo_lock;
+static bool hw_cursor;
+static volatile int cursor_scale = 1;
 
 static void reg_write(uint32_t reg, uint32_t val)
 {
+  uintptr_t f = spin_lock_irqsave(&reg_lock);
   outl(io_base + SVGA_INDEX_PORT, reg);
   outl(io_base + SVGA_VALUE_PORT, val);
+  spin_unlock_irqrestore(&reg_lock, f);
 }
 
 static uint32_t reg_read(uint32_t reg)
 {
+  uintptr_t f = spin_lock_irqsave(&reg_lock);
   outl(io_base + SVGA_INDEX_PORT, reg);
-  return inl(io_base + SVGA_VALUE_PORT);
+  uint32_t v = inl(io_base + SVGA_VALUE_PORT);
+  spin_unlock_irqrestore(&reg_lock, f);
+  return v;
 }
 
-/* Append a dword to the FIFO ring, wrapping at MAX; stalls via a host sync if the ring is full. */
-static void fifo_write(uint32_t value)
+/* Free bytes in the ring; one slot stays unused so NEXT_CMD == STOP means empty. */
+static uint32_t fifo_free(uint32_t next)
 {
-  uint32_t next = fifo[SVGA_FIFO_NEXT_CMD];
-  uint32_t max = fifo[SVGA_FIFO_MAX];
-  uint32_t min = fifo[SVGA_FIFO_MIN];
+  uint32_t min = fifo[SVGA_FIFO_MIN], max = fifo[SVGA_FIFO_MAX], stop = fifo[SVGA_FIFO_STOP];
+  uint32_t used = next >= stop ? next - stop : (max - min) - (stop - next);
+  return (max - min) - used - 4;
+}
 
-  uint32_t after = next + 4;
-  if (after == max)
-    after = min;
-  while (after == fifo[SVGA_FIFO_STOP]) { /* full: let the host catch up    */
+/* Append n dwords as one unit (a split command would be consumed half-written). Needs n*4 < ring size. */
+static void fifo_put(const uint32_t *words, uint32_t n, const uint32_t *tail, uint32_t ntail)
+{
+  uintptr_t f = spin_lock_irqsave(&fifo_lock);
+  uint32_t next = fifo[SVGA_FIFO_NEXT_CMD];
+  while (fifo_free(next) < (n + ntail) * 4) {
     reg_write(SVGA_REG_SYNC, 1);
     (void)reg_read(SVGA_REG_BUSY);
   }
-
-  fifo[next / 4] = value;
-  fifo[SVGA_FIFO_NEXT_CMD] = after;
+  uint32_t min = fifo[SVGA_FIFO_MIN], max = fifo[SVGA_FIFO_MAX];
+  for (uint32_t i = 0; i < n + ntail; i++) {
+    fifo[next / 4] = i < n ? words[i] : tail[i - n];
+    next += 4;
+    if (next == max)
+      next = min;
+  }
+  fifo[SVGA_FIFO_NEXT_CMD] = next;
+  queued = true;
+  spin_unlock_irqrestore(&fifo_lock, f);
 }
 
-/* fb.c present hook: tell the host which framebuffer rectangle changed. */
+/* Queue SVGA_CMD_UPDATE for a box; the host is kicked once per batch by svga_flush. */
 static void svga_present(int x, int y, int w, int h)
 {
   if (w <= 0 || h <= 0)
     return;
-  fifo_write(SVGA_CMD_UPDATE);
-  fifo_write((uint32_t)x);
-  fifo_write((uint32_t)y);
-  fifo_write((uint32_t)w);
-  fifo_write((uint32_t)h);
+  uint32_t cmd[5] = {SVGA_CMD_UPDATE, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h};
+  fifo_put(cmd, 5, NULL, 0);
+}
+
+static void svga_flush(void)
+{
+  if (!queued)
+    return;
+  queued = false;
   reg_write(SVGA_REG_SYNC, 1);
 }
 
@@ -175,7 +208,6 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
   }
   paging_mark_uc(fifo_phys, fifo_sz);
   fifo = (volatile uint32_t *)(uintptr_t)fifo_phys;
-  fifo_words = fifo_sz / 4;
 
   fifo[SVGA_FIFO_MIN] = SVGA_FIFO_NUM_REGS * 4;
   fifo[SVGA_FIFO_MAX] = fifo_sz;
@@ -184,13 +216,45 @@ int vmsvga_init(uint32_t want_w, uint32_t want_h)
   reg_write(SVGA_REG_CONFIG_DONE, 1);
 
   /* Register the hook before adopting so fb_adopt's initial present is pushed too. */
-  fb_set_present_hook(svga_present);
+  fb_set_present_hook(svga_present, svga_flush);
 
   if (fb_adopt(fb_phys + fb_off, want_w, want_h, pitch, 32) != 0) {
     con_write("vmsvga: fb_adopt failed.\n");
-    fb_set_present_hook(NULL);
+    fb_set_present_hook(NULL, NULL);
     reg_write(SVGA_REG_ENABLE, 0);
     return -1;
   }
   return 0;
+}
+
+int vmsvga_cursor_set(const uint32_t *argb, int w, int h, int hot_x, int hot_y, int scale)
+{
+  if (!io_base || !fifo)
+    return -1;
+  if (!argb) {
+    if (hw_cursor)
+      reg_write(SVGA_REG_CURSOR_ON, 0);
+    hw_cursor = false;
+    return 0;
+  }
+  uint32_t caps = reg_read(SVGA_REG_CAPABILITIES);
+  if (!(caps & SVGA_CAP_CURSOR_BYPASS) || !(caps & SVGA_CAP_ALPHA_CURSOR))
+    return -1;
+  if (w <= 0 || h <= 0 || (uint32_t)(w * h + 6) * 4 >= (fifo[SVGA_FIFO_MAX] - fifo[SVGA_FIFO_MIN]) / 2)
+    return -1;
+  uint32_t head[6] = {SVGA_CMD_DEFINE_ALPHA_CURSOR, 0, (uint32_t)hot_x, (uint32_t)hot_y, (uint32_t)w, (uint32_t)h};
+  fifo_put(head, 6, argb, (uint32_t)(w * h));
+  svga_flush();
+  cursor_scale = scale > 0 ? scale : 1;
+  hw_cursor = true;
+  return 0;
+}
+
+void vmsvga_cursor_move(int x, int y)
+{
+  if (!hw_cursor)
+    return;
+  reg_write(SVGA_REG_CURSOR_X, (uint32_t)(x * cursor_scale));
+  reg_write(SVGA_REG_CURSOR_Y, (uint32_t)(y * cursor_scale));
+  reg_write(SVGA_REG_CURSOR_ON, 1);
 }

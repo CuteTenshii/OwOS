@@ -427,5 +427,6 @@ void compose(int mx, int my)
     draw_power();
   if (osd_kind != OSD_NONE && clip_hits(osd_x(), osd_y(), OSD_W, OSD_H))
     draw_osd();
-  draw_cursor(pick_cursor(mx, my), mx, my);
+  if (!hw_cursor)
+    draw_cursor(pick_cursor(mx, my), mx, my);
 }

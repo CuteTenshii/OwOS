@@ -9,6 +9,8 @@
 #include "sched.h"
 #include "uaccess.h"
 #include "uwin.h"
+#include "vmsvga.h"
+#include <stddef.h>
 #include <stdint.h>
 
 void syscall_graphics_fb_info(struct registers *r)
@@ -56,6 +58,31 @@ void syscall_graphics_fb_present(struct registers *r)
   }
   fb_present_rects((const struct fb_rect *)r->ebx, (int)n);
   r->eax = 0;
+}
+
+/* ebx = ARGB bitmap or 0 to hide, ecx = w | h << 8 | hot_x << 16 | hot_y << 24, edx = ui scale. */
+void syscall_graphics_fb_cursor(struct registers *r)
+{
+  enum { MAX_DIM = 64 };
+  static uint32_t pix[MAX_DIM * MAX_DIM];
+  int w = r->ecx & 0xff, h = (r->ecx >> 8) & 0xff;
+  int hx = (r->ecx >> 16) & 0xff, hy = (r->ecx >> 24) & 0xff;
+  if (sched_uid() != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  if (!r->ebx) {
+    r->eax = (uint32_t)vmsvga_cursor_set(NULL, 0, 0, 0, 0, 1);
+    return;
+  }
+  if (w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM || copyin(pix, r->ebx, (uint32_t)(w * h) * 4) != 0) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  int rc = vmsvga_cursor_set(pix, w, h, hx, hy, (int)r->edx);
+  if (rc == 0)
+    vmsvga_cursor_move(mouse_x(), mouse_y());
+  r->eax = (uint32_t)rc;
 }
 
 void syscall_graphics_input_poll(struct registers *r)

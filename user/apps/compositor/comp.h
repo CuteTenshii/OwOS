@@ -228,6 +228,8 @@ void launch_app(int i);
 /* cursor.c */
 extern unsigned cursor_frame;
 void draw_cursor(int kind, int mx, int my);
+extern bool hw_cursor;
+bool cursor_hw_update(int kind); /* redefine the hardware cursor if kind/animation/scale changed */
 
 /* draw.c */
 void refresh_maps(void);

@@ -128,8 +128,13 @@ static void alloc_backbuffer(void);
 
 /* Optional per-rect flush hook for paravirtual adapters (VMware SVGA II). */
 static void (*present_hook)(int, int, int, int);
+static void (*flush_hook)(void);
 
-void fb_set_present_hook(void (*cb)(int, int, int, int)) { present_hook = cb; }
+void fb_set_present_hook(void (*cb)(int, int, int, int), void (*flush)(void))
+{
+  present_hook = cb;
+  flush_hook = flush;
+}
 
 /* Make the framebuffer write-combining (PAT entry 1). Harmless under QEMU. */
 static void enable_wc(void)
@@ -362,6 +367,8 @@ static void present_full(void)
   drain_wc();
   if (present_hook)
     present_hook(0, 0, (int)fb_w, (int)fb_h);
+  if (flush_hook)
+    flush_hook();
 }
 
 void fb_present(void)
@@ -373,6 +380,8 @@ void fb_present(void)
     drain_wc();
     if (present_hook)
       present_hook(rx, ry, rw, rh);
+    if (flush_hook)
+      flush_hook();
   }
   dirty_x1 = dirty_x0;
 }
@@ -395,6 +404,8 @@ void fb_present_rects(const struct fb_rect *r, int n)
     if (clip(r[i].x, r[i].y, r[i].w, r[i].h, &x, &y, &w, &h))
       present_hook(x, y, w, h);
   }
+  if (flush_hook)
+    flush_hook();
 }
 
 /* Step brightness and re-render the whole screen (the WM only presents damage). IRQ-safe. */

@@ -189,6 +189,9 @@ int main(void)
     bool osd = osd_tick();
     bool full = !inited || force_full;
     force_full = false;
+    bool was_hw = hw_cursor;
+    if (cursor_hw_update(pick_cursor(mx, my)) != was_hw)
+      full = true;
 
     /* Focus / z-order / visibility / add / remove change -> full repaint */
     if (!full) {
@@ -220,7 +223,7 @@ int main(void)
       }
       /* cursor moved/changed/animating */
       int cur_kind = pick_cursor(mx, my);
-      if (mx != prev_mx || my != prev_my || cur_kind != prev_cur || cur_kind == CUR_BUSY) {
+      if (!hw_cursor && (mx != prev_mx || my != prev_my || cur_kind != prev_cur || cur_kind == CUR_BUSY)) {
         damage_add(prev_mx - CUR_DMG_PAD, prev_my - CUR_DMG_PAD, CUR_DMG_W, CUR_DMG_H);
         damage_add(mx - CUR_DMG_PAD, my - CUR_DMG_PAD, CUR_DMG_W, CUR_DMG_H);
       }

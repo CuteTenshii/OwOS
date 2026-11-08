@@ -186,6 +186,11 @@ unsigned *fb_map(void)
 
 int fb_present_rects(const struct fbrect *r, int n) { return syscall(SYS_FB_PRESENT, (int)r, n, 0); }
 
+int fb_cursor_set(const unsigned *argb, int w, int h, int hot_x, int hot_y, int scale)
+{
+  return syscall(SYS_FB_CURSOR, (int)argb, w | h << 8 | hot_x << 16 | hot_y << 24, scale);
+}
+
 int input_poll(struct inputstate *out) { return syscall(SYS_INPUT_POLL, (int)out, 0, 0); }
 
 int input_set_bounds(int w, int h) { return syscall(SYS_INPUT_SET_BOUNDS, w, h, 0); }
