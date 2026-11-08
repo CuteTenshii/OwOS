@@ -455,6 +455,35 @@ int gfx_ui_width_px(const char *s, int px)
 }
 int gfx_ui_width(const char *s) { return gfx_ui_width_px(s, SANS_PX); }
 
+#define CLIP_MAX 255 /* longest prefix kept before the ".." */
+
+void gfx_ui_text_clip(int x, int y, const char *s, unsigned fg, int maxw)
+{
+  if (maxw <= 0)
+    return;
+  if (gfx_ui_width(s) <= maxw) {
+    gfx_ui_text(x, y, s, fg);
+    return;
+  }
+  char buf[CLIP_MAX + 3];
+  const char *end = s + strlen(s);
+  int n = 0, w = 0, dots = 2 * gfx_ui_cw('.');
+  unsigned cp;
+  for (;;) {
+    int len = utf8_decode(s + n, end, &cp);
+    int cw = gfx_ui_cw_cp(cp);
+    if (n + len > CLIP_MAX || w + cw + dots > maxw)
+      break;
+    memcpy(buf + n, s + n, (unsigned)len);
+    n += len;
+    w += cw;
+  }
+  buf[n] = '.';
+  buf[n + 1] = '.';
+  buf[n + 2] = '\0';
+  gfx_ui_text(x, y, buf, fg);
+}
+
 int gfx_ui_ascent_px(int px)
 {
   struct face_view v;
@@ -994,6 +1023,39 @@ void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct)
     unsigned fg = (w / 2 < 1 + fw) ? 0xffffffu : 0xc8d0dcu;
     gfx_ui_text(tx, ty, buf, fg);
   }
+}
+
+/* slider */
+
+#define SLIDER_THUMB_W 6
+#define SLIDER_TRACK_H 6
+#define SLIDER_GRAB 4 /* extra hit margin around the box */
+
+static int slider_travel(int w) { return w - SLIDER_THUMB_W > 1 ? w - SLIDER_THUMB_W : 1; }
+
+void slider_draw(int x, int y, int w, int value, int max)
+{
+  if (value < 0)
+    value = 0;
+  if (value > max)
+    value = max;
+  int tx = x + (max > 0 ? (int)((long)slider_travel(w) * value / max) : 0);
+  int ty = y + (GUI_SLIDER_H - SLIDER_TRACK_H) / 2;
+  gfx_fill_rect(x, ty, w, SLIDER_TRACK_H, PROG_TROUGH);
+  gfx_fill_rect(x, ty, tx - x + SLIDER_THUMB_W / 2, SLIDER_TRACK_H, PROG_FILL);
+  gfx_rect(x, ty, w, SLIDER_TRACK_H, PROG_BORDER);
+  gfx_fill_rect(tx, y, SLIDER_THUMB_W, GUI_SLIDER_H, 0xffffffu);
+}
+
+int slider_hit(int x, int y, int w, int mx, int my)
+{
+  return button_hit(x - SLIDER_GRAB, y - SLIDER_GRAB, w + 2 * SLIDER_GRAB, GUI_SLIDER_H + 2 * SLIDER_GRAB, mx, my);
+}
+
+int slider_value(int x, int w, int mx, int max)
+{
+  long v = ((long)(mx - x - SLIDER_THUMB_W / 2) * max + slider_travel(w) / 2) / slider_travel(w);
+  return v < 0 ? 0 : v > max ? max : (int)v;
 }
 
 /* scrollbar */

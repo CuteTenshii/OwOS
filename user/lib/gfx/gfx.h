@@ -46,6 +46,9 @@ void gfx_ui_text(int x, int y, const char *s, unsigned fg); /* UTF-8 */
 int gfx_ui_width(const char *s);                            /* UTF-8 string pixel width */
 int gfx_ui_cw(unsigned char c);                             /* one byte/ASCII glyph's pen advance */
 int gfx_ui_cw_cp(unsigned cp);                              /* one Unicode codepoint's pen advance         */
+/* Like gfx_ui_text, but a string wider than maxw pixels is cut and ends in "..";
+ * nothing is drawn for maxw <= 0. */
+void gfx_ui_text_clip(int x, int y, const char *s, unsigned fg, int maxw);
 
 /* Sized UI text — the sans face at an arbitrary px, uncached (for headings). y
  * is the line top; the baseline is derived from the px ascent. */
@@ -241,6 +244,22 @@ int button_hit(int x, int y, int w, int h, int mx, int my);
 #define GUI_PROGRESS_H 16 /* a comfortable bar height */
 
 void progress_draw(int x, int y, int w, int h, int value, int max, int show_pct);
+
+/* --------------------------------------------------------------- slider */
+/*
+ * A horizontal value slider: a sunken track filled up to a white thumb, for a
+ * volume or brightness level. Stateless like the progress bar: the app keeps
+ * `value` (0..max) and a "grabbed" flag. On a press inside slider_hit(), set the
+ * flag; while it is set, feed each mouse x through slider_value() to get the new
+ * value. The box is [x,y,w,GUI_SLIDER_H]; the thumb stays inside it.
+ */
+#define GUI_SLIDER_H 14 /* thumb height, and the box height */
+
+void slider_draw(int x, int y, int w, int value, int max);
+/* 1 if (mx,my) is on the box or within a few pixels of it (a forgiving grab). */
+int slider_hit(int x, int y, int w, int mx, int my);
+/* The value 0..max for a pointer at mx, clamped. */
+int slider_value(int x, int w, int mx, int max);
 
 /* --------------------------------------------------------------- scrollbar */
 /*
