@@ -17,6 +17,10 @@
 
 void sha512(const void *data, uint32_t len, uint8_t out[SHA512_DIGEST]);
 
+#define SHA384_DIGEST 48
+
+void sha384(const void *data, uint32_t len, uint8_t out[SHA384_DIGEST]);
+
 /* -------------------------------------------------------------------- SHA-1 */
 
 #define SHA1_BLOCK 64

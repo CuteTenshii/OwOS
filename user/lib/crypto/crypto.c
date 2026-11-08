@@ -174,11 +174,8 @@ static void sha512_blocks(uint64_t st[8], const uint8_t *m, uint32_t blocks)
   }
 }
 
-void sha512(const void *data, uint32_t len, uint8_t out[SHA512_DIGEST])
+static void sha512_hash(const void *data, uint32_t len, const uint64_t iv[8], uint8_t *out, int words)
 {
-  static const uint64_t iv[8] = {0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL,
-                                 0xa54ff53a5f1d36f1ULL, 0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
-                                 0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
   uint64_t st[8];
   for (int i = 0; i < 8; i++)
     st[i] = iv[i];
@@ -200,8 +197,24 @@ void sha512(const void *data, uint32_t len, uint8_t out[SHA512_DIGEST])
   sha512_ts(tail + pad - 8, (uint64_t)len << 3);
   sha512_blocks(st, tail, pad / 128);
 
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < words; i++)
     sha512_ts(out + 8 * i, st[i]);
+}
+
+void sha512(const void *data, uint32_t len, uint8_t out[SHA512_DIGEST])
+{
+  static const uint64_t iv[8] = {0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL,
+                                 0xa54ff53a5f1d36f1ULL, 0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+                                 0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
+  sha512_hash(data, len, iv, out, 8);
+}
+
+void sha384(const void *data, uint32_t len, uint8_t out[SHA384_DIGEST])
+{
+  static const uint64_t iv[8] = {0xcbbb9d5dc1059ed8ULL, 0x629a292a367cd507ULL, 0x9159015a3070dd17ULL,
+                                 0x152fecd8f70e5939ULL, 0x67332667ffc00b31ULL, 0x8eb44a8768581511ULL,
+                                 0xdb0c2e0d64f98fa7ULL, 0x47b5481dbefa4fa4ULL};
+  sha512_hash(data, len, iv, out, 6);
 }
 
 /* ================================================================= SHA-256 */
