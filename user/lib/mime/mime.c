@@ -18,54 +18,242 @@ static const char *ext_of(const char *path)
   return dot ? dot : "";
 }
 
+/* Primary extension first for each type: mime_to_ext returns the first match. */
 static const struct {
   const char *ext, *mime;
 } ext_table[] = {
     {"txt", "text/plain"},
     {"text", "text/plain"},
+    {"log", "text/plain"},
+    {"conf", "text/plain"},
+    {"ini", "text/plain"},
+    {"cfg", "text/plain"},
     {"md", "text/markdown"},
+    {"markdown", "text/markdown"},
     {"csv", "text/csv"},
+    {"tsv", "text/tab-separated-values"},
     {"html", "text/html"},
     {"htm", "text/html"},
     {"css", "text/css"},
     {"js", "text/javascript"},
-    {"json", "application/json"},
-    {"xml", "application/xml"},
+    {"mjs", "text/javascript"},
+    {"cjs", "text/javascript"},
+    {"ics", "text/calendar"},
+    {"vcf", "text/vcard"},
+    {"rtf", "text/rtf"},
     {"c", "text/x-c"},
     {"h", "text/x-c"},
+    {"cpp", "text/x-c++"},
+    {"cc", "text/x-c++"},
+    {"cxx", "text/x-c++"},
+    {"hpp", "text/x-c++"},
+    {"hh", "text/x-c++"},
+    {"hxx", "text/x-c++"},
+    {"s", "text/x-asm"},
+    {"asm", "text/x-asm"},
+    {"java", "text/x-java"},
+    {"py", "text/x-python"},
+    {"rb", "text/x-ruby"},
+    {"pl", "text/x-perl"},
+    {"pm", "text/x-perl"},
+    {"lua", "text/x-lua"},
+    {"go", "text/x-go"},
+    {"rs", "text/x-rust"},
+    {"php", "text/x-php"},
+    {"swift", "text/x-swift"},
+    {"diff", "text/x-diff"},
+    {"patch", "text/x-diff"},
+    {"mk", "text/x-makefile"},
     {"sh", "text/x-shellscript"},
+    {"bash", "text/x-shellscript"},
+    {"zsh", "text/x-shellscript"},
+    {"sql", "text/x-sql"},
+    {"tex", "text/x-tex"},
+    {"yaml", "text/x-yaml"},
+    {"yml", "text/x-yaml"},
+    {"toml", "text/x-toml"},
+    {"json", "application/json"},
+    {"jsonld", "application/ld+json"},
+    {"xml", "application/xml"},
+    {"xsl", "application/xml"},
+    {"xsd", "application/xml"},
+    {"xhtml", "application/xhtml+xml"},
+    {"xht", "application/xhtml+xml"},
+    {"rss", "application/rss+xml"},
+    {"atom", "application/atom+xml"},
+    {"wasm", "application/wasm"},
+    {"jsx", "application/javascript"},
+    {"csh", "application/x-sh"},
     {"png", "image/png"},
     {"jpg", "image/jpeg"},
     {"jpeg", "image/jpeg"},
+    {"jpe", "image/jpeg"},
+    {"jfif", "image/jpeg"},
     {"gif", "image/gif"},
     {"bmp", "image/bmp"},
     {"webp", "image/webp"},
     {"svg", "image/svg+xml"},
+    {"svgz", "image/svg+xml"},
     {"ico", "image/x-icon"},
-    {"pdf", "application/pdf"},
-    {"zip", "application/zip"},
-    {"gz", "application/gzip"},
-    {"tar", "application/x-tar"},
+    {"cur", "image/x-icon"},
+    {"tif", "image/tiff"},
+    {"tiff", "image/tiff"},
+    {"avif", "image/avif"},
+    {"heic", "image/heic"},
+    {"heif", "image/heic"},
+    {"apng", "image/apng"},
+    {"psd", "image/vnd.adobe.photoshop"},
+    {"ppm", "image/x-portable-pixmap"},
+    {"pgm", "image/x-portable-graymap"},
+    {"pbm", "image/x-portable-bitmap"},
+    {"pnm", "image/x-portable-anymap"},
+    {"xbm", "image/x-xbitmap"},
+    {"xpm", "image/x-xpixmap"},
     {"mp3", "audio/mpeg"},
+    {"mp2", "audio/mpeg"},
+    {"mpga", "audio/mpeg"},
     {"wav", "audio/wav"},
+    {"wave", "audio/wav"},
     {"ogg", "audio/ogg"},
+    {"oga", "audio/ogg"},
+    {"spx", "audio/ogg"},
+    {"opus", "audio/opus"},
     {"flac", "audio/flac"},
+    {"aac", "audio/aac"},
+    {"m4a", "audio/mp4"},
+    {"aif", "audio/x-aiff"},
+    {"aiff", "audio/x-aiff"},
+    {"aifc", "audio/x-aiff"},
+    {"mid", "audio/midi"},
+    {"midi", "audio/midi"},
+    {"weba", "audio/webm"},
+    {"mka", "audio/x-matroska"},
+    {"wma", "audio/x-ms-wma"},
+    {"m3u", "audio/x-mpegurl"},
+    {"m3u8", "audio/x-mpegurl"},
+    {"alac", "audio/x-alac"},
     {"mp4", "video/mp4"},
+    {"m4v", "video/mp4"},
     {"webm", "video/webm"},
     {"mkv", "video/x-matroska"},
     {"avi", "video/x-msvideo"},
+    {"mpg", "video/mpeg"},
+    {"mpeg", "video/mpeg"},
+    {"mpe", "video/mpeg"},
+    {"ogv", "video/ogg"},
+    {"mov", "video/quicktime"},
+    {"qt", "video/quicktime"},
+    {"flv", "video/x-flv"},
+    {"wmv", "video/x-ms-wmv"},
+    {"3gp", "video/3gpp"},
+    {"ts", "video/mp2t"},
+    {"m2ts", "video/mp2t"},
+    {"ttf", "font/ttf"},
+    {"otf", "font/otf"},
+    {"woff", "font/woff"},
+    {"woff2", "font/woff2"},
+    {"ttc", "font/collection"},
+    {"eot", "application/vnd.ms-fontobject"},
+    {"pdf", "application/pdf"},
+    {"ps", "application/postscript"},
+    {"eps", "application/postscript"},
+    {"ai", "application/postscript"},
+    {"epub", "application/epub+zip"},
+    {"doc", "application/msword"},
+    {"docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+    {"xls", "application/vnd.ms-excel"},
+    {"xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+    {"ppt", "application/vnd.ms-powerpoint"},
+    {"pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+    {"odt", "application/vnd.oasis.opendocument.text"},
+    {"ods", "application/vnd.oasis.opendocument.spreadsheet"},
+    {"odp", "application/vnd.oasis.opendocument.presentation"},
+    {"zip", "application/zip"},
+    {"gz", "application/gzip"},
+    {"tar", "application/x-tar"},
+    {"bz2", "application/x-bzip2"},
+    {"xz", "application/x-xz"},
+    {"zst", "application/zstd"},
+    {"lzma", "application/x-lzma"},
+    {"7z", "application/x-7z-compressed"},
+    {"rar", "application/vnd.rar"},
+    {"z", "application/x-compress"},
+    {"cpio", "application/x-cpio"},
+    {"iso", "application/x-iso9660-image"},
+    {"dmg", "application/x-apple-diskimage"},
+    {"deb", "application/vnd.debian.binary-package"},
+    {"rpm", "application/x-rpm"},
+    {"jar", "application/java-archive"},
+    {"apk", "application/vnd.android.package-archive"},
+    {"exe", "application/x-msdownload"},
+    {"dll", "application/x-msdownload"},
+    {"msi", "application/x-msi"},
+    {"so", "application/x-sharedlib"},
+    {"elf", "application/x-executable"},
+    {"o", "application/x-object"},
     {"torrent", "application/x-bittorrent"},
     {"sqlite", "application/vnd.sqlite3"},
+    {"sqlite3", "application/vnd.sqlite3"},
+    {"db", "application/vnd.sqlite3"},
+    {"pem", "application/x-pem-file"},
+    {"crt", "application/pkix-cert"},
+    {"cer", "application/pkix-cert"},
+    {"der", "application/pkix-cert"},
+    {"sig", "application/pgp-signature"},
+    {"asc", "application/pgp-signature"},
+    {"p12", "application/x-pkcs12"},
+    {"pfx", "application/x-pkcs12"},
+    {"ca", "application/x-x509-ca-cert"},
+    {"swf", "application/x-shockwave-flash"},
+    {"bin", "application/x-bin"},
+    {"kml", "application/vnd.google-earth.kml+xml"},
+    {"gpx", "application/gpx+xml"},
+    {"lnk", "application/x-ms-shortcut"},
+    {"desktop", "application/x-desktop"},
+    {"ipynb", "application/x-ipynb+json"},
+    {"srt", "application/x-subrip"},
+    {"vtt", "text/vtt"},
+    {"pub", "application/x-ssh-key"},
 };
+#define EXT_COUNT ((int)(sizeof ext_table / sizeof ext_table[0]))
 
 const char *mime_from_ext(const char *path)
 {
   const char *e = ext_of(path);
   if (e[0])
-    for (unsigned i = 0; i < sizeof ext_table / sizeof ext_table[0]; i++)
+    for (int i = 0; i < EXT_COUNT; i++)
       if (streq_ci(e, ext_table[i].ext))
         return ext_table[i].mime;
   return "application/octet-stream";
+}
+
+/* `a` up to any ";params" and trailing blanks, case-insensitively equal to `b` */
+static int mime_eq(const char *a, const char *b)
+{
+  while (*a && *a != ';' && *a != ' ') {
+    char x = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a;
+    if (x != *b++)
+      return 0;
+    a++;
+  }
+  return *b == 0;
+}
+
+const char *mime_to_ext(const char *mime)
+{
+  for (int i = 0; i < EXT_COUNT; i++)
+    if (mime_eq(mime, ext_table[i].mime))
+      return ext_table[i].ext;
+  return 0;
+}
+
+int mime_entry(int i, const char **ext, const char **mime)
+{
+  if (i < 0 || i >= EXT_COUNT)
+    return 0;
+  *ext = ext_table[i].ext;
+  *mime = ext_table[i].mime;
+  return 1;
 }
 
 const char *mime_from_magic(const void *data, int len)
@@ -123,6 +311,11 @@ int mime_is_text(const char *mime)
     }
   if (pre)
     return 1;
-  return streq_ci(mime, "application/json") || streq_ci(mime, "application/javascript") ||
-         streq_ci(mime, "application/xml") || streq_ci(mime, "image/svg+xml");
+  if (streq_ci(mime, "application/json") || streq_ci(mime, "application/javascript") ||
+      streq_ci(mime, "application/xml") || streq_ci(mime, "image/svg+xml") || streq_ci(mime, "application/x-sh"))
+    return 1;
+  int n = 0;
+  while (mime[n])
+    n++;
+  return (n > 4 && streq_ci(mime + n - 4, "+xml")) || (n > 5 && streq_ci(mime + n - 5, "+json"));
 }
