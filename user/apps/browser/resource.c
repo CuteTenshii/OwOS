@@ -1,5 +1,6 @@
 /* resource.c: sub-resource fetching (images, favicon, CSS) on per-request sockets. */
-#include "base64.h" /* shared base64 for data: URL decoding */
+#include "animimg.h" /* frame playback for animated GIF/WebP */
+#include "base64.h"  /* shared base64 for data: URL decoding */
 #include "browser.h"
 #include "features/cache/cache.h"             /* the HTTP response cache (RFC 7234, honours headers)   */
 #include "features/clienthints/clienthints.h" /* Accept-CH: per-origin Client Hints opt-in        */
@@ -7,7 +8,7 @@
 #include "features/svg/svg.h"                 /* SVG -> ARGB rasterizer (favicon path) */
 #include "fetchint.h"
 #include "headers.h" /* HTTP response headers (iframe X-Frame-Options / CSP)  */
-#include "imgdec.h"  /* shared image decoder (SVG/WebP/PNG) for <img> */
+#include "imgdec.h"  /* shared image decoder (SVG/WebP/GIF/PNG) for <img> */
 #include "mutex.h"
 
 /* Origin owning the sub-resources being fetched (set by do_fetch); used for CORP checks. */
@@ -427,7 +428,7 @@ static void h2_append_headers(char *xh, int *xn, int cap, const char *extra)
   }
 }
 
-#define IMG_ACCEPT "image/png,image/webp,image/svg+xml,*/*"
+#define IMG_ACCEPT "image/png,image/webp,image/gif,image/svg+xml,*/*"
 #define VARY_HDRS_MAX 2560
 
 /* Normalise a URL's origin (HSTS-upgrading http) into *u; 0 on a bad URL. */
@@ -555,13 +556,13 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
   if (rs->hdr && rs->hdr_cap)
     rs->hdr[0] = '\0';
 
-  /* Cache: only bodyless GETs; fresh hits skip the wire, stale ones revalidate (304 reuses body). */
   if (starts_ci(full, "blob:")) {
     unsigned char *b = is_get ? blobstore_get(full, &rs->len, rs->ctype, sizeof rs->ctype) : 0;
     rs->status = b ? 200 : 0;
     return b;
   }
 
+  /* Cache: only bodyless GETs; fresh hits skip the wire, stale ones revalidate (304 reuses body). */
   bool cacheable = streq_ci(method, "GET") && !(rq->body && rq->body_len > 0);
   long now = (long)rtc_epoch();
   bool revalidating = false;
@@ -842,7 +843,6 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
     accept = "*/*";
   if (status)
     *status = 0;
-  unsigned t0 = msec();
   if (starts_ci(full, "blob:")) {
     int blen = 0;
     unsigned char *b = blobstore_get(full, &blen, 0, 0);
@@ -859,6 +859,7 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
     long committed = stream_end();
     return wrote < 0 ? -1 : committed;
   }
+  unsigned t0 = msec();
   int nid = devtools_net_begin("GET", full); /* in-flight until the download resolves */
 
   for (int hop = 0; hop <= MAX_REDIR; hop++) {
@@ -1793,15 +1794,21 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
 
   /* Decoder-controlled ww/hh: size the copy in 64-bit and reject absurd dimensions (no 32-bit wrap). */
   if (image_sniff(body, blen) != IMG_FMT_PNG) {
-    unsigned ww = 0, hh = 0;
-    unsigned char *rgba = image_decode_rgba(body, blen, current_color, 256, &ww, &hh);
+    unsigned ww = 0, hh = 0, delay = 0;
+    struct imganim *anim = 0;
+    unsigned char *keep = 0;
+    unsigned char *rgba = imganim_sniff(body, blen) != IMGANIM_NONE
+                              ? image_decode_first_frame(body, blen, &anim, &keep, &ww, &hh, &delay)
+                              : image_decode_rgba(body, blen, current_color, 256, &ww, &hh);
     if (rgba) {
       long long bytes = (long long)ww * hh * 4;
-      int off = -1;
+      int off = -1, uid = 0;
       mutex_lock(&g_img_lock);
       if (ww && hh && ww <= 16384 && hh <= 16384 && bytes <= (long long)(IMG_POOL - B->img_pool_len)) {
         off = B->img_pool_len;
         B->img_pool_len += (int)bytes;
+        if (anim)
+          uid = ++B->pg->img_uid_next;
       }
       mutex_unlock(&g_img_lock);
       if (off >= 0) {
@@ -1811,10 +1818,17 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
         im->iw = ww;
         im->ih = hh;
         im->is_argb = 1; /* raw RGBA */
-        im->ok = 1;      /* set last: the UI draws once ok is seen */
+        im->uid = uid;
+        if (anim && animimg_add(uid, anim, keep, delay))
+          anim = 0;
+        im->ok = 1; /* set last: the UI draws once ok is seen */
         B->seq++;
       }
       free(rgba);
+    }
+    if (anim) {
+      imganim_close(anim);
+      free(keep);
     }
     return;
   }

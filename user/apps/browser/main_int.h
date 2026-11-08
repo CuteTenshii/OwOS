@@ -5,6 +5,7 @@
 // clang-format off
 #include <stdbool.h>
 // clang-format
+#include "animimg.h" /* GIF / animated WebP frame playback */
 #include "browser.h"
 #include "clipboard.h" /* clip_put_text for Copy */
 #include "dialog.h"
@@ -173,6 +174,7 @@ void rewrap(int paw);
 const unsigned *xmap_get(unsigned dw, unsigned iw);
 void draw_image(int px, int py, int pw, int ph, unsigned bg);
 void imgc_clear(void);
+void image_anim_tick(void); /* advance a playing full-page GIF / animated WebP */
 void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw);
 void draw_alt_box(struct inl_img *im, int py, int ct, int cb);
 

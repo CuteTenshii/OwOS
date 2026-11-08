@@ -1192,7 +1192,7 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
 
 /* ----------------------------------------------- local & inline URL schemes */
 
-/* Render B->pg->raw (ctype set) as HTML, text or PNG; shared by network, file: and data: paths. */
+/* Render B->pg->raw (ctype set) as HTML, text or an image; shared by network, file: and data: paths. */
 static void render_raw(const char *url)
 {
   /* Empty Content-Type renders as HTML, except under nosniff which requires an explicit HTML type. */
@@ -1200,14 +1200,15 @@ static void render_raw(const char *url)
   if (as_html) {
     B->pg->mode = MODE_HTML;
     html_to_text(url, css_batch);
-  } else if (starts_ci(B->pg->ctype, "image/png")) {
+  } else if (starts_ci(B->pg->ctype, "image/png") || starts_ci(B->pg->ctype, "image/gif") ||
+             starts_ci(B->pg->ctype, "image/webp")) {
     B->pg->mode = MODE_IMAGE;
     B->pg->text_len = 0;
     B->pg->nlinks = 0;
     B->pg->doc_title[0] = '\0';
   } else if (starts_ci(B->pg->ctype, "image/")) {
     B->pg->mode = MODE_TEXT;
-    doc_message("[unsupported image type - only PNG can be shown]");
+    doc_message("[unsupported image type - only PNG, GIF and WebP can be shown]");
   } else {
     B->pg->mode = MODE_TEXT;
     plain_to_text();

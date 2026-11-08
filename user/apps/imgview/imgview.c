@@ -1,6 +1,7 @@
 /* imgview.c, a PNG image viewer with a File menu and a properties panel. Opens a window with a
  * menu bar (File: Open / Reload / Quit, View: Properties), an image canvas, and a status bar */
 #include "gfx.h"
+#include "imganim.h"
 #include "owos.h"
 #include "png.h"
 #include "webp.h"
@@ -22,7 +23,12 @@ static int wid;           /* window id */
 static char curpath[256]; /* path of the image currently shown */
 static unsigned iw, ih;   /* its pixel dimensions */
 static int load_ok;       /* a valid image is loaded */
-static bool is_webp;      /* the loaded image is WebP, not PNG */
+enum { FMT_PNG, FMT_WEBP, FMT_GIF };
+static int fmt; /* container of the loaded image */
+
+static struct imganim *anim; /* playing GIF / animated WebP, else NULL */
+static unsigned char *anim_file;
+static unsigned anim_next_ms;
 
 static struct png_meta meta; /* probed metadata for curpath */
 static int meta_valid;       /* meta + the props list match curpath */
@@ -148,17 +154,23 @@ static unsigned char *read_whole(const char *path, int *len)
   return buf;
 }
 
-/* Probe dimensions + format from a file: a RIFF/WEBP header routes to the WebP reader */
-static int probe_image(const char *path, unsigned *w, unsigned *h, bool *webp)
+/* Probe dimensions + format from a file: a RIFF/WEBP header routes to the WebP reader, GIF89a/87a to the GIF one */
+static int probe_image(const char *path, unsigned *w, unsigned *h, int *format)
 {
   unsigned char hdr[64];
   int n = readfile_at(path, 0, hdr, sizeof hdr);
   if (n >= 12 && hdr[0] == 'R' && hdr[1] == 'I' && hdr[2] == 'F' && hdr[3] == 'F' && hdr[8] == 'W' && hdr[9] == 'E' &&
       hdr[10] == 'B' && hdr[11] == 'P') {
-    *webp = true;
+    *format = FMT_WEBP;
     return webp_dimensions(hdr, n, w, h) == WEBP_OK ? 0 : -1;
   }
-  *webp = false;
+  if (n >= 10 && imganim_sniff(hdr, n) == IMGANIM_GIF) {
+    *format = FMT_GIF;
+    *w = hdr[6] | (hdr[7] << 8);
+    *h = hdr[8] | (hdr[9] << 8);
+    return 0;
+  }
+  *format = FMT_PNG;
   struct freader fr;
   fr_init(&fr, path);
   return (png_dimensions(fr_get, &fr, w, h) == 0 && *w && *h) ? 0 : -1;
@@ -216,7 +228,7 @@ static int v_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
     v->next_r++;
   }
   /* Decoding a megabyte PNG off PIO disk takes seconds */
-  if (v->next_r - v->shown >= 16) {
+  if (v->id >= 0 && v->next_r - v->shown >= 16) {
     blit_band((int)(v->oy + v->shown), (int)(v->oy + v->next_r));
     v->shown = v->next_r;
     win_present(v->id);
@@ -224,60 +236,97 @@ static int v_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
   return 0;
 }
 
+/* Fit iw x ih into the canvas (1:1 when it fits, else letterboxed) and build the column map */
+static void view_setup(struct view *v)
+{
+  v->cw = cw;
+  v->ch = ch;
+  v->iw = iw;
+  v->ih = ih;
+  v->next_r = 0;
+  v->id = wid;
+  v->shown = 0;
+  if (iw <= (unsigned)cw && ih <= (unsigned)ch) { /* fits: show 1:1 */
+    v->dw = iw;
+    v->dh = ih;
+  } else if ((unsigned long)iw * ch > (unsigned long)ih * cw) {
+    v->dw = cw;
+    v->dh = ih * cw / iw; /* width-bound */
+  } else {
+    v->dh = ch;
+    v->dw = iw * ch / ih; /* height-bound */
+  }
+  if (v->dw == 0)
+    v->dw = 1;
+  if (v->dh == 0)
+    v->dh = 1;
+  v->ox = ((unsigned)cw - v->dw) / 2;
+  v->oy = ((unsigned)ch - v->dh) / 2;
+
+  for (unsigned x = 0; x < v->dw; x++) /* precompute the horizontal map */
+    xmap[x] = (x * v->iw / v->dw) * 4;
+}
+
+static void stop_anim(void)
+{
+  imganim_close(anim);
+  free(anim_file);
+  anim = 0;
+  anim_file = 0;
+}
+
+/* Paint the player's current frame over a fresh letterbox background; no presenting, the main loop does that */
+static void draw_anim_frame(void)
+{
+  struct view v;
+  view_setup(&v);
+  v.id = -1;
+  for (unsigned y = 0; y < v.dh; y++)
+    for (unsigned x = 0; x < v.dw; x++)
+      canvas[(unsigned long)(v.oy + y) * cw + v.ox + x] = 0x141a24;
+  for (unsigned y = 0; y < anim->h; y++)
+    v_row(&v, y, anim->rgba + (unsigned long)y * anim->w * 4u, anim->w);
+}
+
 /* Decode curpath into the backing canvas */
 static void decode_to_canvas(void)
 {
+  stop_anim();
   for (int i = 0; i < cw * ch; i++)
     canvas[i] = 0x141a24; /* letterbox background */
   if (!load_ok)
     return;
 
   struct view v;
-  v.cw = cw;
-  v.ch = ch;
-  v.iw = iw;
-  v.ih = ih;
-  v.next_r = 0;
-  v.id = wid;
-  v.shown = 0;
-  if (iw <= (unsigned)cw && ih <= (unsigned)ch) { /* fits: show 1:1 */
-    v.dw = iw;
-    v.dh = ih;
-  } else if ((unsigned long)iw * ch > (unsigned long)ih * cw) {
-    v.dw = cw;
-    v.dh = ih * cw / iw; /* width-bound */
-  } else {
-    v.dh = ch;
-    v.dw = iw * ch / ih; /* height-bound */
-  }
-  if (v.dw == 0)
-    v.dw = 1;
-  if (v.dh == 0)
-    v.dh = 1;
-  v.ox = ((unsigned)cw - v.dw) / 2;
-  v.oy = ((unsigned)ch - v.dh) / 2;
-
-  for (unsigned x = 0; x < v.dw; x++) /* precompute the horizontal map */
-    xmap[x] = (x * v.iw / v.dw) * 4;
+  view_setup(&v);
 
   /* Paint the letterbox background once up front, then stream the image in over it */
   blit_canvas();
   win_present(wid);
 
-  if (is_webp) {
-    /* WebP needs the whole file in memory; decode it */
+  if (fmt != FMT_PNG) {
+    /* WebP and GIF need the whole file in memory; decode it */
     int flen = 0;
     unsigned char *file = read_whole(curpath, &flen);
-    if (file) {
-      unsigned char *rgba;
-      unsigned dw = 0, dh = 0;
-      if (webp_decode(file, flen, &rgba, &dw, &dh) == WEBP_OK) {
-        for (unsigned y = 0; y < dh; y++)
-          v_row(&v, y, rgba + (unsigned long)y * dw * 4u, dw);
-        free(rgba);
-      }
-      free(file);
+    if (!file)
+      return;
+    anim = imganim_open(file, flen);
+    unsigned delay;
+    if (anim && anim->w == iw && anim->h == ih && imganim_step(anim, &delay)) {
+      anim_file = file; /* the player reads from it until stop_anim */
+      anim_next_ms = msec() + delay;
+      draw_anim_frame();
+      return;
     }
+    stop_anim();
+    unsigned char *rgba;
+    unsigned dw = 0, dh = 0;
+    if (fmt == FMT_WEBP && webp_decode(file, flen, &rgba, &dw, &dh) == WEBP_OK) {
+      for (unsigned y = 0; y < dh; y++)
+        v_row(&v, y, rgba + (unsigned long)y * dw * 4u, dw);
+      free(rgba);
+    }
+    free(file);
   } else {
     struct freader fr;
     fr_init(&fr, curpath);
@@ -348,8 +397,8 @@ static void fmt_size(char *b)
   }
 }
 
-/* Properties for a WebP image (probed from its container header) */
-static void build_props_webp(void)
+/* Properties for a WebP or GIF image (probed from its header) */
+static void build_props_container(void)
 {
   char b[PNG_VAL_MAX], *p;
   n_props = 0;
@@ -370,7 +419,12 @@ static void build_props_webp(void)
   unsigned char hdr[64];
   int n = readfile_at(curpath, 0, hdr, sizeof hdr);
   struct webp_info info;
-  if (n > 0 && webp_probe(hdr, n, &info) == WEBP_OK) {
+  if (fmt == FMT_GIF) {
+    char ver[7] = {0};
+    for (int i = 0; i < 6 && i < n; i++)
+      ver[i] = (char)hdr[i];
+    padd("Format", ver);
+  } else if (n > 0 && webp_probe(hdr, n, &info) == WEBP_OK) {
     padd("Format", info.lossless ? "WebP lossless (VP8L)" : "WebP lossy (VP8)");
     padd("Transparency", info.has_alpha ? "Yes (alpha channel)" : "No");
     padd("Container", info.extended ? "Extended (VP8X)" : "Simple");
@@ -489,8 +543,8 @@ static void ensure_meta(void)
 {
   if (meta_valid)
     return;
-  if (is_webp) {
-    build_props_webp();
+  if (fmt != FMT_PNG) {
+    build_props_container();
     meta_valid = 1;
     return;
   }
@@ -508,10 +562,10 @@ static void ensure_meta(void)
 static void load(const char *path)
 {
   unsigned w = 0, h = 0;
-  bool webp = false;
-  if (probe_image(path, &w, &h, &webp) != 0 || w == 0 || h == 0) {
+  int format = FMT_PNG;
+  if (probe_image(path, &w, &h, &format) != 0 || w == 0 || h == 0) {
     load_ok = 0;
-    is_webp = false;
+    fmt = FMT_PNG;
     meta_valid = 0;
     scopy(curpath, path, sizeof curpath); /* set, so the UI says which file */
     decode_to_canvas();
@@ -520,7 +574,7 @@ static void load(const char *path)
     return;
   }
   scopy(curpath, path, sizeof curpath);
-  is_webp = webp;
+  fmt = format;
   iw = w;
   ih = h;
   load_ok = 1;
@@ -702,7 +756,7 @@ static void render(void)
       p = as(p, "x");
       p = au(p, ih);
       p = as(p, "  ");
-      p = as(p, is_webp ? "WebP" : color_name(meta_valid ? meta.color : 2));
+      p = as(p, fmt == FMT_WEBP ? "WebP" : fmt == FMT_GIF ? "GIF" : color_name(meta_valid ? meta.color : 2));
     }
     status_set(&bar, line);
     status_draw(&bar, 0, sy, W, 0x9fb0c4, 0x161d28);
@@ -795,8 +849,8 @@ int main(int argc, char **argv)
   unsigned w0 = CW_MIN, h0 = CH_MIN;
   if (arg) {
     unsigned w = 0, h = 0;
-    bool webp = false;
-    if (probe_image(arg, &w, &h, &webp) == 0 && w && h) {
+    int format;
+    if (probe_image(arg, &w, &h, &format) == 0 && w && h) {
       w0 = w;
       h0 = h; /* a readable image: fit the window to it */
     }
@@ -858,6 +912,16 @@ int main(int argc, char **argv)
         on_click(ev.a, ev.b);
       else if (ev.type == WEV_SCROLL)
         on_scroll(ev.a);
+    }
+    if (anim && (int)(msec() - anim_next_ms) >= 0) {
+      unsigned delay;
+      if (imganim_step(anim, &delay)) {
+        draw_anim_frame();
+        anim_next_ms = msec() + delay;
+        need = true;
+      } else {
+        stop_anim();
+      }
     }
     if (need) {
       render();

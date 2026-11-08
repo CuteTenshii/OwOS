@@ -1,6 +1,7 @@
 /* imgdec.c - shared image decoder (see imgdec.h) */
 #include "imgdec.h"
 #include "features/svg/svg.h"
+#include "imganim.h"
 #include "owos.h"
 #include "png.h"
 #include "webp.h"
@@ -18,6 +19,8 @@ int image_sniff(const unsigned char *data, int len)
     return IMG_FMT_WEBP;
   if (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G')
     return IMG_FMT_PNG;
+  if (imganim_sniff(data, len) == IMGANIM_GIF)
+    return IMG_FMT_GIF;
   return IMG_FMT_NONE;
 }
 
@@ -113,6 +116,33 @@ static unsigned char *decode_png(const unsigned char *data, int len, unsigned *o
   return buf;
 }
 
+unsigned char *image_decode_first_frame(const unsigned char *data, int len, struct imganim **anim, unsigned char **keep,
+                                        unsigned *w, unsigned *h, unsigned *delay_ms)
+{
+  unsigned char *copy = malloc((unsigned)len);
+  if (!copy)
+    return 0;
+  memcpy(copy, data, (unsigned)len);
+  struct imganim *a = imganim_open(copy, len);
+  if (!a || (unsigned long)a->w * a->h > IMG_AREA_CAP || !imganim_step(a, delay_ms)) {
+    imganim_close(a);
+    free(copy);
+    return 0;
+  }
+  unsigned char *rgba = malloc((unsigned long)a->w * a->h * 4);
+  if (!rgba) {
+    imganim_close(a);
+    free(copy);
+    return 0;
+  }
+  memcpy(rgba, a->rgba, (unsigned long)a->w * a->h * 4);
+  *w = a->w;
+  *h = a->h;
+  *anim = a;
+  *keep = copy;
+  return rgba;
+}
+
 unsigned char *image_decode_rgba(const unsigned char *data, int len, unsigned current_color, int max_edge, unsigned *w,
                                  unsigned *h)
 {
@@ -130,6 +160,17 @@ unsigned char *image_decode_rgba(const unsigned char *data, int len, unsigned cu
     }
     free(rgba);
     return 0;
+  }
+  case IMG_FMT_GIF: {
+    struct imganim *a;
+    unsigned char *keep, *rgba;
+    unsigned delay;
+    rgba = image_decode_first_frame(data, len, &a, &keep, w, h, &delay);
+    if (rgba) {
+      imganim_close(a);
+      free(keep);
+    }
+    return rgba;
   }
   case IMG_FMT_PNG:
     return decode_png(data, len, w, h);

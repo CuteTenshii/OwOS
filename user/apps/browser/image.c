@@ -1,4 +1,6 @@
+#include "imgdec.h"
 #include "main_int.h"
+#include "webp.h"
 
 /* ------------------------------------------------------------- image draw */
 
@@ -96,7 +98,65 @@ static struct {
   int src_len;
   unsigned iw, ih;
   unsigned char *rgba;
+  struct imganim *anim; /* playing GIF / animated WebP reading from src, else NULL */
+  unsigned next_ms;
 } g_dimg;
+
+static void dimg_reset(void)
+{
+  imganim_close(g_dimg.anim);
+  g_dimg.anim = 0;
+  free(g_dimg.rgba);
+  g_dimg.rgba = 0;
+  g_dimg.iw = g_dimg.ih = 0;
+}
+
+/* Decode a non-PNG page body into g_dimg.rgba (GIF and animated WebP keep their player for image_anim_tick) */
+static void dimg_decode_other(void)
+{
+  unsigned iw = 0, ih = 0, delay = 0;
+  const unsigned char *raw = (const unsigned char *)B->pg->raw;
+  struct imganim *a = imganim_open(raw, B->pg->raw_len);
+  if (a && (unsigned long)a->w * a->h <= DIMG_MAX_PX && imganim_step(a, &delay)) {
+    g_dimg.rgba = malloc((unsigned long)a->w * a->h * 4);
+    if (g_dimg.rgba) {
+      memcpy(g_dimg.rgba, a->rgba, (unsigned long)a->w * a->h * 4);
+      g_dimg.iw = a->w;
+      g_dimg.ih = a->h;
+      g_dimg.anim = a;
+      g_dimg.next_ms = msec() + delay;
+      return;
+    }
+  }
+  imganim_close(a);
+  unsigned char *rgba;
+  if (webp_decode(raw, B->pg->raw_len, &rgba, &iw, &ih) == WEBP_OK) {
+    if ((unsigned long)iw * ih <= DIMG_MAX_PX) {
+      g_dimg.rgba = rgba;
+      g_dimg.iw = iw;
+      g_dimg.ih = ih;
+    } else {
+      free(rgba);
+    }
+  }
+}
+
+/* Advance a playing full-page GIF / animated WebP; repaints the page when the frame changes. */
+void image_anim_tick(void)
+{
+  if (!g_dimg.anim || g_dimg.pg != B->pg || g_dimg.src != B->pg->raw || g_dimg.src_len != B->pg->raw_len ||
+      (int)(msec() - g_dimg.next_ms) < 0)
+    return;
+  unsigned delay;
+  if (!imganim_step(g_dimg.anim, &delay)) {
+    imganim_close(g_dimg.anim);
+    g_dimg.anim = 0;
+    return;
+  }
+  memcpy(g_dimg.rgba, g_dimg.anim->rgba, (unsigned long)g_dimg.iw * g_dimg.ih * 4);
+  g_dimg.next_ms = msec() + delay;
+  B->seq++;
+}
 
 /* Streaming decode straight to the pane (no held copy) */
 static void draw_image_stream(int px, int py, int pw, int ph)
@@ -140,15 +200,15 @@ void draw_image(int px, int py, int pw, int ph, unsigned bg)
 {
   (void)bg;
   if (g_dimg.pg != B->pg || g_dimg.src != B->pg->raw || g_dimg.src_len != B->pg->raw_len) {
-    free(g_dimg.rgba);
-    g_dimg.rgba = 0;
-    g_dimg.iw = g_dimg.ih = 0;
+    dimg_reset();
     g_dimg.pg = B->pg;
     g_dimg.src = B->pg->raw;
     g_dimg.src_len = B->pg->raw_len;
     struct rawrd r = {0};
     unsigned iw = 0, ih = 0;
-    if (png_dimensions(rawrd_get, &r, &iw, &ih) == 0 && iw && ih && (unsigned long)iw * ih <= DIMG_MAX_PX) {
+    if (image_sniff((const unsigned char *)B->pg->raw, B->pg->raw_len) != IMG_FMT_PNG) {
+      dimg_decode_other();
+    } else if (png_dimensions(rawrd_get, &r, &iw, &ih) == 0 && iw && ih && (unsigned long)iw * ih <= DIMG_MAX_PX) {
       unsigned char *buf = malloc((unsigned long)iw * ih * 4);
       if (buf) {
         memset(buf, 0, (unsigned long)iw * ih * 4);
@@ -164,7 +224,10 @@ void draw_image(int px, int py, int pw, int ph, unsigned bg)
     }
   }
   if (!g_dimg.rgba) {
-    draw_image_stream(px, py, pw, ph);
+    if (image_sniff((const unsigned char *)B->pg->raw, B->pg->raw_len) == IMG_FMT_PNG)
+      draw_image_stream(px, py, pw, ph);
+    else
+      gfx_ui_text(px + 8, py + 8, "Cannot decode image.", 0xb04040);
     return;
   } /* too big / unreadable */
 
@@ -249,12 +312,10 @@ static int imgc_scale_row(void *c, unsigned y, const unsigned char *rgba, unsign
 void imgc_clear(void)
 {
   ru_imgcache_clear(&g_imgc);
-  free(g_dimg.rgba);
-  g_dimg.rgba = 0;
+  dimg_reset();
   g_dimg.pg = 0;
   g_dimg.src = 0;
   g_dimg.src_len = 0;
-  g_dimg.iw = g_dimg.ih = 0;
 }
 
 /* Decoded pixels for inline PNG `im` shown dw x dh (decoding + caching on first use) */
@@ -317,8 +378,10 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
     return;
   unsigned *fb = browser_surface();
 
-  /* SVGs live raw in img_pool */
+  /* SVGs and animated frames live raw in img_pool */
   if (im->is_argb) {
+    if (im->uid)
+      animimg_seen(im->uid);
     const unsigned char *src = B->img_pool + im->coff;
     const unsigned *xm = xmap_get((unsigned)dw, im->iw);
     for (int ry = ry0; ry < ry1; ry++) {

@@ -250,6 +250,9 @@ int main(int argc, char **argv)
       B->want_paw = wpaw;
     }
 
+    animimg_tick();
+    image_anim_tick();
+
     int due = !B->loading || (frame - last_paint_frame) >= LOAD_REDRAW_FRAMES;
     int dt_paint = devtools_take_paint(); /* devtools-local change (log line) */
     unsigned seq = B->seq;

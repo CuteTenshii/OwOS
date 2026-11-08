@@ -18,11 +18,11 @@ APPS := $(GUI_APPS) $(CLI_APPS)
 # compositor: clipboard paste, plus Print Screen capture (PNG encode + CRC-32).
 # browser: a multi-file program, linked flat.
 APP_OBJS_compositor := $(addprefix user/apps/compositor/,compositor.o damage.o screen.o wm.o menus.o icon.o cursor.o draw.o osd.o input.o keys.o conf.o)
-APP_OBJS_browser := user/apps/browser/main.o user/apps/browser/tabs.o user/apps/browser/worker.o user/apps/browser/text.o user/apps/browser/flow.o user/apps/browser/image.o user/apps/browser/paint.o user/apps/browser/chrome.o user/apps/browser/render.o user/apps/browser/input.o user/apps/browser/sync.o user/apps/browser/buffers.o user/apps/browser/surface.o user/apps/browser/fetch.o user/apps/browser/resource.o user/apps/browser/blobstore.o user/apps/browser/html.o user/apps/browser/html_entities.o user/apps/browser/html_text.o user/apps/browser/html_embed.o user/apps/browser/html_forms.o user/apps/browser/html_walk.o user/apps/browser/html_res.o user/apps/browser/dom.o user/apps/browser/css/engine.o user/apps/browser/css/engine_values.o user/apps/browser/css/engine_props.o user/apps/browser/css/engine_decl.o user/apps/browser/css/engine_sel.o user/apps/browser/css/engine_sheet.o user/apps/browser/css/sibling.o user/apps/browser/color.o user/apps/browser/layout.o user/apps/browser/features/anim/anim.o user/apps/browser/features/svg/svg.o user/apps/browser/features/jar/jar.o user/apps/browser/features/cache/cache.o user/apps/browser/js/bindings.o user/apps/browser/js/events.o user/apps/browser/js/navigator.o user/apps/browser/js/cssom.o user/apps/browser/js/runner.o user/apps/browser/js/clipboard.o user/apps/browser/js/blob.o user/apps/browser/js/xhr.o user/apps/browser/js/realtime.o user/apps/browser/js/timers.o user/apps/browser/js/webcomponents.o user/apps/browser/js/dialog.o user/apps/browser/js/forms.o user/apps/browser/js/url.o user/apps/browser/js/fetchapi.o user/apps/browser/js/navigation.o user/apps/browser/js/elementapi.o user/apps/browser/js/documentapi.o user/apps/browser/js/dom_query.o user/apps/browser/features/indexeddb/indexeddb.o user/apps/browser/features/serviceworker/serviceworker.o user/apps/browser/js/webapi.o user/apps/browser/features/notification/notification.o user/apps/browser/js/media.o user/apps/browser/js/classlist.o user/apps/browser/features/devtools/devtools.o user/apps/browser/features/devtools/devtools_log.o user/apps/browser/features/devtools/devtools_snap.o user/apps/browser/features/devtools/devtools_render.o user/apps/browser/features/csp/csp.o user/apps/browser/features/cors/cors.o user/apps/browser/imgdec.o user/apps/browser/features/media/media.o user/apps/browser/features/bookmarks/bookmarks.o user/apps/browser/features/clienthints/clienthints.o user/apps/browser/features/permissions/permissions.o user/apps/browser/features/mediasession/mediasession.o
+APP_OBJS_browser := user/apps/browser/main.o user/apps/browser/tabs.o user/apps/browser/worker.o user/apps/browser/text.o user/apps/browser/flow.o user/apps/browser/image.o user/apps/browser/paint.o user/apps/browser/chrome.o user/apps/browser/render.o user/apps/browser/input.o user/apps/browser/sync.o user/apps/browser/buffers.o user/apps/browser/surface.o user/apps/browser/fetch.o user/apps/browser/resource.o user/apps/browser/blobstore.o user/apps/browser/html.o user/apps/browser/html_entities.o user/apps/browser/html_text.o user/apps/browser/html_embed.o user/apps/browser/html_forms.o user/apps/browser/html_walk.o user/apps/browser/html_res.o user/apps/browser/dom.o user/apps/browser/css/engine.o user/apps/browser/css/engine_values.o user/apps/browser/css/engine_props.o user/apps/browser/css/engine_decl.o user/apps/browser/css/engine_sel.o user/apps/browser/css/engine_sheet.o user/apps/browser/css/sibling.o user/apps/browser/color.o user/apps/browser/layout.o user/apps/browser/features/anim/anim.o user/apps/browser/features/svg/svg.o user/apps/browser/features/jar/jar.o user/apps/browser/features/cache/cache.o user/apps/browser/js/bindings.o user/apps/browser/js/events.o user/apps/browser/js/navigator.o user/apps/browser/js/cssom.o user/apps/browser/js/runner.o user/apps/browser/js/clipboard.o user/apps/browser/js/blob.o user/apps/browser/js/xhr.o user/apps/browser/js/realtime.o user/apps/browser/js/timers.o user/apps/browser/js/webcomponents.o user/apps/browser/js/dialog.o user/apps/browser/js/forms.o user/apps/browser/js/url.o user/apps/browser/js/fetchapi.o user/apps/browser/js/navigation.o user/apps/browser/js/elementapi.o user/apps/browser/js/documentapi.o user/apps/browser/js/dom_query.o user/apps/browser/features/indexeddb/indexeddb.o user/apps/browser/features/serviceworker/serviceworker.o user/apps/browser/js/webapi.o user/apps/browser/features/notification/notification.o user/apps/browser/js/media.o user/apps/browser/js/classlist.o user/apps/browser/features/devtools/devtools.o user/apps/browser/features/devtools/devtools_log.o user/apps/browser/features/devtools/devtools_snap.o user/apps/browser/features/devtools/devtools_render.o user/apps/browser/features/csp/csp.o user/apps/browser/features/cors/cors.o user/apps/browser/imgdec.o user/apps/browser/animimg.o user/apps/browser/features/media/media.o user/apps/browser/features/bookmarks/bookmarks.o user/apps/browser/features/clienthints/clienthints.o user/apps/browser/features/permissions/permissions.o user/apps/browser/features/mediasession/mediasession.o
 APP_LIBS_aac := $(AAC) $(MP4) $(MATH)
 APP_LIBS_alac := $(ALAC)
 APP_LIBS_base64 := $(BASE64)
-APP_LIBS_browser := $(PNGDEC) $(WEBP) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(HTTPCACHE) $(NETCONN) $(TLS) $(CRYPTO) $(WEBSOCKET) $(MIME) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(VIDEO) $(CAST) $(PROTOBUF) $(JSON) $(BASE64) $(CLIPBOARD) $(RESOLVE) $(NOTIFY) $(DIALOG) $(MEDIACTL)
+APP_LIBS_browser := $(PNGDEC) $(WEBP) $(GIF) $(IMGANIM) $(INFLATE) $(WOFF) $(BROTLI) $(URL) $(H2) $(H3) $(QUIC) $(HEADERS) $(HTTPCACHE) $(NETCONN) $(TLS) $(CRYPTO) $(WEBSOCKET) $(MIME) $(SQLITE) $(JS) $(GC) $(MATH) $(MEDIA) $(VIDEO) $(CAST) $(PROTOBUF) $(JSON) $(BASE64) $(CLIPBOARD) $(RESOLVE) $(NOTIFY) $(DIALOG) $(MEDIACTL)
 APP_LIBS_calc := $(MATH)
 APP_LIBS_cast := $(CAST) $(PROTOBUF) $(JSON) $(MATH) $(NETCONN) $(TLS) $(CRYPTO) $(RESOLVE)
 APP_LIBS_clipd := $(CLIPBOARD) $(MIME)
@@ -33,7 +33,7 @@ APP_LIBS_dig := $(RESOLVE)
 APP_LIBS_editor := $(CLIPBOARD) $(MIME) $(DIALOG)
 APP_LIBS_files := $(DIALOG)
 APP_LIBS_h264 := $(H264) $(MP4)
-APP_LIBS_imgview := $(PNGDEC) $(WEBP) $(INFLATE)
+APP_LIBS_imgview := $(PNGDEC) $(WEBP) $(GIF) $(IMGANIM) $(INFLATE)
 APP_LIBS_json := $(JSON) $(MATH)
 APP_LIBS_mediactl := $(MEDIACTL)
 APP_LIBS_mediad := user/lib/mediactl/session.o
@@ -89,13 +89,20 @@ kernel/appsyms.o: $(foreach a,$(SYM_APPS),user/apps/$(a)/$(a).elf) $(ARCH_STAMP)
 	  kernel/appsyms.dat $@
 	@rm -f kernel/appsyms.dat
 
-# The shared UI fonts shipped on disk (installed to /etc/fonts at boot); gfx loads
-# them at runtime instead of every app baking in a bitmap atlas. Give
-# _binary_fonts_Liberation{Sans,Mono}_Regular_ttf_{start,end}.
-kernel/uifont_blob.o: fonts/LiberationSans-Regular.ttf $(ARCH_STAMP)
-	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) $< $@
-kernel/monofont_blob.o: fonts/LiberationMono-Regular.ttf $(ARCH_STAMP)
-	$(OBJCOPY) -I binary -O $(KELF) -B $(KBFD) $< $@
+# Every fonts/*.ttf is installed to /etc/fonts at boot; gfx loads them at runtime
+# instead of every app baking in a bitmap atlas. Drop a .ttf in fonts/ to ship it.
+FONT_FILES := $(sort $(wildcard fonts/*.ttf))
+kernel/fontstore.c: $(FONT_FILES) user/apps/build.mk
+	@{ echo '/* generated by user/apps/build.mk */'; \
+	  echo 'struct font_blob { const char *name; const unsigned char *start, *end; };'; \
+	  n=0; for f in $(FONT_FILES); do \
+	    echo "__asm__(\".section .rodata\\n.balign 4\\nfont$${n}_start:\\n.incbin \\\"$$f\\\"\\nfont$${n}_end:\\n\");"; \
+	    echo "extern const unsigned char font$${n}_start[], font$${n}_end[];"; n=$$((n+1)); done; \
+	  echo 'const struct font_blob fontstore[] = {'; \
+	  n=0; for f in $(FONT_FILES); do \
+	    echo "  {\"$${f\#fonts/}\", font$${n}_start, font$${n}_end},"; n=$$((n+1)); done; \
+	  echo '};'; \
+	  echo 'const unsigned fontstore_count = sizeof fontstore / sizeof fontstore[0];'; } > $@
 
 # App icons (icons/<Icon= name>.png, from tools/genicons.py), embedded in the kernel and installed to
 # /usr/share/icons at boot. The symbol base has dashes turned into underscores.
