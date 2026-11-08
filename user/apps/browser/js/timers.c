@@ -187,7 +187,7 @@ static void signal_abort(js_ctx *ctx, js_object *signal, js_value reason)
   h = js_get(ctx, js_obj_value(signal), "onabort");
   if (js_is_callable(h)) {
     js_value a = ev;
-    js_set_event_script("abort");
+    js_set_event_script("abort", 0);
     js_call(ctx, h, js_obj_value(signal), &a, 1);
     if (ctx->has_exc)
       report_exc(ctx);

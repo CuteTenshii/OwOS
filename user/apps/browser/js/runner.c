@@ -28,14 +28,19 @@ void js_set_cur_script(const char *label)
   if (g_ctx)
     js_set_script(g_ctx, g_cur_script);
 }
-/* Attribute the current execution to a named event's listener */
-void js_set_event_script(const char *type)
+const char *js_cur_script(void) { return g_cur_script; }
+/* Attribute the current execution to a named event's listener, plus the script that registered it */
+void js_set_event_script(const char *type, const char *src)
 {
-  char buf[64];
+  char buf[320];
   int k = 0;
   sapp(buf, &k, sizeof buf, "<");
   sapp(buf, &k, sizeof buf, (type && type[0]) ? type : "event");
   sapp(buf, &k, sizeof buf, " listener>");
+  if (src && src[0]) {
+    sapp(buf, &k, sizeof buf, " ");
+    sapp(buf, &k, sizeof buf, src);
+  }
   js_set_cur_script(buf);
 }
 
