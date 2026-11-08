@@ -42,6 +42,8 @@ typedef struct address_space {
   uint32_t brk_base;
 } address_space_t;
 
+#define FPU_IMAGE_BYTES 108 /* fnsave image */
+
 typedef struct task {
   uintptr_t esp;        /* saved kernel stack pointer (the context) */
   address_space_t *as;  /* shared by a process and its user threads */
@@ -71,6 +73,8 @@ typedef struct task {
   uint32_t uid;           /* owning user id (credentials; inherited like cwd) */
   uint32_t gid;           /* owning primary group id */
   uint32_t umask;
+  bool fpu_valid;                /* fpu[] holds a saved x87 image (else the task still has the init state) */
+  uint8_t fpu[FPU_IMAGE_BYTES]; /* x87 state saved while the task is switched out */
   struct task *next;
   int running_cpu;
   uint8_t kernel_lock_depth;
@@ -1225,6 +1229,23 @@ int sched_replace(uint32_t *new_dir, uint32_t entry, uint32_t user_esp, uint32_t
   return 0;
 }
 
+/* The x87 file is per task: user code rasterizes and decodes in floating point, and a preemption mid-computation
+ * would otherwise leak one task's registers into another's. */
+static uint8_t fpu_init_image[FPU_IMAGE_BYTES];
+static bool fpu_init_ready;
+
+static void fpu_switch(task_t *prev, task_t *next)
+{
+  __asm__ volatile("fnsave %0" : "=m"(prev->fpu)); /* leaves the FPU in its init state */
+  prev->fpu_valid = true;
+  if (!fpu_init_ready) {
+    __asm__ volatile("fnsave %0" : "=m"(fpu_init_image));
+    fpu_init_ready = true;
+  }
+  const uint8_t *src = next->fpu_valid ? next->fpu : fpu_init_image;
+  __asm__ volatile("frstor (%0)" : : "r"(src) : "memory");
+}
+
 void schedule(void)
 {
   /* Pick-next plus context_switch must be atomic against the timer IRQ; the caller's IF is restored on resume. */
@@ -1255,6 +1276,7 @@ void schedule(void)
       tss_set_kernel_stack(current->kstack_top);
     if (task_cr3(current) != task_cr3(prev))
       paging_load((uint32_t *)(uintptr_t)task_cr3(current));
+    fpu_switch(prev, current);
     sched_unlock();
     context_switch(&prev->esp, current->esp);
     sched_kernel_switch_in();
