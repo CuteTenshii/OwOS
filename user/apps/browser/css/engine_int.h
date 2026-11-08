@@ -40,6 +40,10 @@ enum {
   PC_MATCHES, /* :is()/:where(): matches if any sub-selector does  */
   PC_POPOVER_OPEN,
   PC_MODAL,
+  PC_ATTR,         /* [name], [name=value], ~= |= ^= $= *= with an optional i flag */
+  PC_NOT_LIST,     /* :not() with a complex or comma-separated argument */
+  PC_HOST,         /* :host / :host(sel): the shadow host the sheet belongs to */
+  PC_HOST_CONTEXT, /* :host-context(sel): the host or one of its ancestors matches sel */
   PC_NEVER,
 };
 
@@ -51,6 +55,9 @@ struct pseudo {
   int a, b;              /* an+b for the nth-* kinds; a=1 marks :where (spec 0) */
   struct simple_sel arg; /* :not() argument (kind == PC_NOT) */
   struct sel_list *list; /* :is()/:where() sub-selectors (kind == PC_MATCHES), else 0 */
+  char *an, *av;         /* attribute selector name and value (kind == PC_ATTR) */
+  char aop;              /* 0 exists, '=', '~', '|', '^', '$', '*' */
+  bool aci;              /* the i flag: compare case-insensitively */
 };
 
 struct sel_step {
@@ -60,10 +67,19 @@ struct sel_step {
   char *id; /* heap, NULL = none */
   struct pseudo *pc;
   int npc;
-  int pseudo_el; /* PE_* ::pseudo-element; never matches a normal box */
-  bool child;    /* combinator to the step on the right is '>' */
+  int pseudo_el;            /* PE_* ::pseudo-element; never matches a normal box */
+  struct sel_list *pe_list; /* ::slotted(sel) argument */
+  char *pe_names;           /* ::part(a b) space-separated names */
+  bool child;               /* combinator to the step on the right is '>' */
 };
-enum { PE_NONE = 0, PE_BEFORE = CSS_PSEUDO_BEFORE, PE_AFTER = CSS_PSEUDO_AFTER, PE_OTHER = 3 };
+enum {
+  PE_NONE = 0,
+  PE_BEFORE = CSS_PSEUDO_BEFORE,
+  PE_AFTER = CSS_PSEUDO_AFTER,
+  PE_OTHER = 3,
+  PE_SLOTTED = 4,
+  PE_PART = 5
+};
 
 struct selector {
   struct sel_step *step;
@@ -150,6 +166,14 @@ struct css_keyframes {
   struct css_keyframes *next;
 };
 
+struct css_var {
+  char *name, *val;
+};
+struct var_table {
+  struct css_var *v;
+  int n, cap;
+};
+
 #define CSS_NBUCK 256
 struct css_sheet {
   struct css_rule *head, *tail;
@@ -168,6 +192,8 @@ struct css_sheet {
   int cand_cap;
   struct css_rule **match;
   int match_cap;
+  struct var_table lvars; /* this sheet's own custom properties, used when it is not the primary sheet */
+  int lvars_gen;
 };
 
 /* Root font size: px basis for rem and em; keep in sync with the renderer's default text size. */
@@ -223,6 +249,14 @@ char *resolve_vars_dup(const char *in, int inlen);
 const char *scan_top(const char *s, const char *e, const char *stop);
 void selector_free(struct selector *sel);
 bool selector_match(const struct selector *sel, const struct dom_node *el);
+bool selector_subject_is_host(const struct selector *sel);
+bool selector_match_slotted(const struct selector *sel, const struct dom_node *el);
+bool selector_match_part(const struct selector *sel, const struct dom_node *el);
+extern int g_css_mode;
+extern const struct dom_node *g_css_scope_host; /* the shadow host :host refers to while a shadow sheet applies */
+
+void vars_forget_sheet(css_sheet *sh);
+void sheet_vars_free(css_sheet *sh);
 bool selector_match_pseudo(const struct selector *sel, const struct dom_node *el, int which);
 int selector_spec(const struct selector *sel);
 bool span_is(const char *a, const char *ae, const char *lit);

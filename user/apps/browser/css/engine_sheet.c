@@ -423,6 +423,9 @@ css_sheet *css_new(void)
   s->head = s->tail = 0;
   s->order = 0;
   s->gen = 0;
+  s->lvars.v = 0;
+  s->lvars.n = s->lvars.cap = 0;
+  s->lvars_gen = -1;
   s->faces = 0;
   s->keyframes = 0;
   s->medias = 0;
@@ -953,10 +956,47 @@ void css_add(css_sheet *sh, const char *src, int len, const char *base)
   sh->gen++; /* custom-property table is now stale */
 }
 
+static void rule_chain_free(struct css_rule *r)
+{
+  while (r) {
+    struct css_rule *n = r->next;
+    selector_free(&r->sel);
+    if (r->raw != no_raw)
+      free(r->raw);
+    free(r->vc);
+    free(r);
+    r = n;
+  }
+}
+
+int css_mark(const css_sheet *sh) { return sh ? sh->order : 0; }
+
+void css_truncate(css_sheet *sh, int mark)
+{
+  struct css_rule *r = sh->head, *prev = 0;
+  while (r && r->order < mark) {
+    prev = r;
+    r = r->next;
+  }
+  if (!r)
+    return;
+  index_clear(sh); /* the index points at the rules about to go */
+  sh->idx_gen = -1;
+  if (prev)
+    prev->next = 0;
+  else
+    sh->head = 0;
+  sh->tail = prev;
+  rule_chain_free(r);
+  sh->order = mark;
+  sh->gen++;
+}
+
 void css_free(css_sheet *sh)
 {
   if (!sh)
     return;
+  vars_forget_sheet(sh);
   if (sh == g_vars_sheet) {
     g_vars_sheet = 0;
     g_vars_gen = -1;
@@ -970,16 +1010,7 @@ void css_free(css_sheet *sh)
     sh->medias = n;
   }
   index_clear(sh); /* free the css_idx entries before their rules */
-  struct css_rule *r = sh->head;
-  while (r) {
-    struct css_rule *n = r->next;
-    selector_free(&r->sel);
-    if (r->raw != no_raw)
-      free(r->raw);
-    free(r->vc);
-    free(r);
-    r = n;
-  }
+  rule_chain_free(sh->head);
   struct css_face *fc = sh->faces;
   while (fc) {
     struct css_face *n = fc->next;

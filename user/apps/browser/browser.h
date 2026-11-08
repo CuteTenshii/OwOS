@@ -305,6 +305,9 @@ void *browser_js_stack_floor(void);
 
 /* Render B->raw as HTML into the styled-text buffers; `fetch` (may be NULL) batch-pulls stylesheets. */
 void html_to_text(const char *page_url, res_batch_fn fetch);
+char *document_adopted_css(void); /* same, for document.adoptedStyleSheets */
+char *
+shadow_adopted_css(const struct dom_node *root); /* malloc'd text of a shadow root's adoptedStyleSheets, or NULL */
 void html_run_page_scripts(void);                /* deferred <script> pass; run after first paint */
 void html_set_charset(const char *content_type); /* charset from HTTP CT */
 

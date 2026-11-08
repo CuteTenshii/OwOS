@@ -45,7 +45,12 @@ struct dom_node {
   void *anim_rec;        /* animation/transition record (features/anim), or NULL */
   unsigned anc_bloom[4]; /* hashes of the ancestors' tag/id/classes (css/engine.c) */
   unsigned anc_bloom_seq;
-  void *wrapper; /* cached JS wrapper (browser/js/bindings.c); NULL until exposed to script */
+  void *wrapper;           /* cached JS wrapper (browser/js/bindings.c); NULL until exposed to script */
+  struct dom_node *shadow; /* element: its attached shadow root (detached tree, tag "#shadow-root") */
+  struct dom_node *host;   /* shadow root: the element it is attached to */
+  void *shadow_sheet;      /* shadow root: the rules of its <style> elements (css_sheet *) */
+  unsigned shadow_sheet_key;
+  bool shadow_open; /* shadow root: mode "open" */
 };
 
 /* Parse `len` bytes under a synthetic "#document" root. NULL only on immediate OOM. */
@@ -94,6 +99,19 @@ extern bool dom_structural_styles;
 
 /* Installed by features/anim: drops the record of a node that is being freed. */
 extern void (*dom_on_free_anim)(struct dom_node *n);
+
+/* Parent in the shadow-including tree: a shadow root's parent is its host. */
+const struct dom_node *dom_flat_parent(const struct dom_node *n);
+struct dom_node *dom_new_shadow_root(struct dom_node *host, bool open); /* NULL if `host` already has one */
+extern void (*dom_on_free_sheet)(void *sheet);
+
+/* Named slot assignment. A slot lives in a shadow tree; its assigned nodes are children of that tree's host. */
+const struct dom_node *dom_slot_host(const struct dom_node *slot); /* host of the shadow tree holding `slot` */
+bool dom_slot_accepts(const struct dom_node *slot,
+                      const struct dom_node *c);              /* c (a host child) is slotted in `slot` */
+struct dom_node *dom_assigned_slot(const struct dom_node *c); /* slot `c` is assigned to, or NULL */
+/* Turn every <template shadowrootmode="open|closed"> under `root` into a shadow root on its parent. */
+void dom_attach_declarative_shadows(struct dom_node *root);
 
 /* Hook the JS layer installs so a freed node detaches its wrapper. */
 extern void (*dom_on_free_wrapper)(void *wrapper);

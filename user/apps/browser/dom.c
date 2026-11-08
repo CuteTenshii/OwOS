@@ -103,6 +103,25 @@ static void node_init(struct dom_node *n, enum dom_type type)
   n->anim_rec = 0;
   n->anc_bloom_seq = 0;
   n->wrapper = 0;
+  n->shadow = n->host = 0;
+  n->shadow_sheet = 0;
+  n->shadow_sheet_key = 0;
+  n->shadow_open = false;
+}
+
+/* lowercased tag; the original spelling is kept only when it differs */
+static bool set_tag(struct dom_node *n, const char *name, int len)
+{
+  char *t = dupn_lower(name, len), *q = 0;
+  if (!t)
+    return false;
+  if (memcmp(t, name, (unsigned)len) && !(q = dupn(name, len))) {
+    free(t);
+    return false;
+  }
+  n->tag = t;
+  n->qname = q;
+  return true;
 }
 
 static struct dom_node *node_new(struct parser *ps, enum dom_type type)
@@ -503,8 +522,109 @@ static void ns_free(char *ns)
   free(ns);
 }
 
+void (*dom_on_free_sheet)(void *sheet);
+
+const struct dom_node *dom_flat_parent(const struct dom_node *n) { return n->parent ? n->parent : n->host; }
+
+struct dom_node *dom_new_shadow_root(struct dom_node *host, bool open)
+{
+  if (host->shadow)
+    return 0;
+  struct dom_node *root = dom_new_element("#shadow-root");
+  if (!root)
+    return 0;
+  root->host = host;
+  root->shadow_open = open;
+  host->shadow = root;
+  dom_mutation_seq++;
+  return root;
+}
+
+static const char *attr_or_empty(const struct dom_node *n, const char *name)
+{
+  const char *v = n->type == DOM_ELEMENT ? dom_get_attr(n, name) : 0;
+  return v ? v : "";
+}
+
+const struct dom_node *dom_slot_host(const struct dom_node *slot)
+{
+  const struct dom_node *r = slot;
+  while (r->parent)
+    r = r->parent;
+  return r->host;
+}
+
+/* First <slot name=`name`> in the shadow tree of `host`, in tree order. */
+static struct dom_node *first_slot_named(const struct dom_node *host, const char *name)
+{
+  struct dom_node *n = host->shadow->first_child;
+  while (n) {
+    if (n->type == DOM_ELEMENT && streq(n->tag, "slot") && streq(attr_or_empty(n, "name"), name))
+      return n;
+    if (n->first_child) {
+      n = n->first_child;
+      continue;
+    }
+    while (n && !n->next)
+      n = n->parent == host->shadow ? 0 : n->parent;
+    if (n)
+      n = n->next;
+  }
+  return 0;
+}
+
+bool dom_slot_accepts(const struct dom_node *slot, const struct dom_node *c)
+{
+  const struct dom_node *host = dom_slot_host(slot);
+  if (!host || !host->shadow || c->parent != host)
+    return false;
+  const char *want = attr_or_empty(slot, "name");
+  return streq(c->type == DOM_TEXT ? "" : attr_or_empty(c, "slot"), want) && first_slot_named(host, want) == slot;
+}
+
+struct dom_node *dom_assigned_slot(const struct dom_node *c)
+{
+  const struct dom_node *host = c->parent;
+  if (!host || !host->shadow)
+    return 0;
+  return first_slot_named(host, c->type == DOM_TEXT ? "" : attr_or_empty(c, "slot"));
+}
+
+static void declarative_walk(struct dom_node *host, int depth)
+{
+  struct dom_node *next;
+  for (struct dom_node *c = host->first_child; c; c = next) {
+    const char *mode = c->type == DOM_ELEMENT && streq(c->tag, "template") ? dom_get_attr(c, "shadowrootmode") : 0;
+    next = c->next;
+    if (mode && (streq_ci(mode, "open") || streq_ci(mode, "closed")) && host->tag[0] != '#' && !host->shadow) {
+      struct dom_node *sr = dom_new_shadow_root(host, streq_ci(mode, "open"));
+      if (sr) {
+        while (c->first_child) {
+          struct dom_node *k = c->first_child;
+          dom_remove_child(c, k);
+          dom_append_child(sr, k);
+        }
+        dom_remove_child(host, c);
+        dom_free(c);
+        declarative_walk(sr, depth + 1);
+        continue;
+      }
+    }
+    if (c->type == DOM_ELEMENT && depth < 512)
+      declarative_walk(c, depth + 1);
+  }
+}
+
+void dom_attach_declarative_shadows(struct dom_node *root) { declarative_walk(root, 0); }
+
 static void node_free_one(struct dom_node *n)
 {
+  if (n->shadow) {
+    n->shadow->host = 0;
+    dom_free(n->shadow);
+  }
+  if (n->shadow_sheet && dom_on_free_sheet)
+    dom_on_free_sheet(n->shadow_sheet);
   if (n->wrapper && dom_on_free_wrapper)
     dom_on_free_wrapper(n->wrapper);
   if (dom_on_free_style_cache) {

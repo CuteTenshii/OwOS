@@ -21,7 +21,7 @@ static bool ce_is_connected(js_object *w)
 }
 static bool ce_connected(struct dom_node *n)
 {
-  for (; n; n = n->parent)
+  for (; n; n = (struct dom_node *)dom_flat_parent(n))
     if (n == g_doc_root)
       return true;
   return false;
@@ -110,6 +110,8 @@ void ce_disconnect_tree(struct dom_node *n)
   }
   for (struct dom_node *c = n->first_child; c; c = c->next)
     ce_disconnect_tree(c);
+  if (n->shadow)
+    ce_disconnect_tree(n->shadow);
 }
 static void ce_upgrade_connect(struct dom_node *n, js_value cls)
 {
@@ -126,6 +128,8 @@ static void ce_upgrade_tree(struct dom_node *root, const char *name, js_value cl
       ce_upgrade_tree(c, name, cls);
     }
   }
+  if (root->shadow)
+    ce_upgrade_tree(root->shadow, name, cls);
 }
 
 /* setAttribute hook: fire attributeChangedCallback for an observed attribute */
@@ -280,6 +284,8 @@ void ce_upgrade_children(struct dom_node *n)
 {
   for (struct dom_node *c = n->first_child; c; c = c->next)
     ce_upgrade_subtree(c);
+  if (n->shadow)
+    ce_upgrade_children(n->shadow);
 }
 js_value ce_upgrade(js_ctx *ctx, js_value t, js_value *args, int argc)
 {

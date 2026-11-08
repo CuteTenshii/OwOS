@@ -174,12 +174,23 @@ static bool classify_pseudo(const char *ns, const char *ne, const char *as, cons
   pc->a = 0;
   pc->b = 0;
   pc->list = 0;
+  pc->an = pc->av = 0;
+  pc->aop = 0;
+  pc->aci = false;
   pc->arg.tag[0] = '\0';
   pc->arg.id = 0;
   pc->arg.cls = 0;
   pc->arg.ncls = 0;
 
   if (span_is(ns, ne, "not")) {
+    bool complex = false;
+    for (const char *p = as; as && p < ae; p++)
+      complex |= *p == '[' || *p == ',' || *p == ':' || *p == ' ' || *p == '>';
+    if (complex) {
+      pc->list = parse_sel_list(as, ae);
+      pc->kind = pc->list ? PC_NOT_LIST : PC_NEVER;
+      return true;
+    }
     pc->kind = PC_NOT;
     if (as)
       parse_simple_sel(as, ae, &pc->arg);
@@ -273,6 +284,13 @@ static bool classify_pseudo(const char *ns, const char *ne, const char *as, cons
     pc->kind = PC_MODAL;
     return true;
   }
+  if (span_is(ns, ne, "host") || span_is(ns, ne, "host-context")) {
+    pc->kind = span_is(ns, ne, "host") ? PC_HOST : PC_HOST_CONTEXT;
+    pc->list = (as && as < ae) ? parse_sel_list(as, ae) : 0;
+    if (pc->kind == PC_HOST_CONTEXT && !pc->list)
+      pc->kind = PC_NEVER;
+    return true;
+  }
   if (span_is(ns, ne, "is") || span_is(ns, ne, "where")) {
     /* :is()/:where() match if any sub-selector matches; an empty or unparsable argument matches nothing. */
     struct sel_list *l = (as && as < ae) ? parse_sel_list(as, ae) : 0;
@@ -302,6 +320,75 @@ static void add_pseudo_class(struct sel_step *st, const char *ns, const char *ne
   st->pc[st->npc++] = pc;
 }
 
+/* Parse the inside of [...] starting after the '['; returns the position after the ']'. */
+static const char *parse_attr_sel(const char *s, const char *e, struct sel_step *st)
+{
+  struct pseudo pc;
+  const char *close = s, *p;
+  char q = 0;
+  while (close < e && (q || *close != ']')) {
+    if (q && *close == q)
+      q = 0;
+    else if (!q && (*close == '"' || *close == '\''))
+      q = *close;
+    close++;
+  }
+  const char *next = close < e ? close + 1 : close;
+  memset(&pc, 0, sizeof pc);
+  pc.kind = PC_ATTR;
+  while (s < close && (*s == ' ' || *s == '\t'))
+    s++;
+  p = s;
+  while (p < close && !chr_in("~|^$*= \t", *p))
+    p++;
+  if (p == s)
+    return next;
+  pc.an = span_dup(s, p);
+  if (!pc.an)
+    return next;
+  for (char *c = pc.an; *c; c++)
+    *c = lower(*c);
+  while (p < close && (*p == ' ' || *p == '\t'))
+    p++;
+  if (p < close && *p != '=' && p + 1 < close && p[1] == '=') {
+    pc.aop = *p;
+    p += 2;
+  } else if (p < close && *p == '=') {
+    pc.aop = '=';
+    p++;
+  }
+  if (pc.aop) {
+    while (p < close && (*p == ' ' || *p == '\t'))
+      p++;
+    const char *vs = p, *ve;
+    if (p < close && (*p == '"' || *p == '\'')) {
+      char qc = *p++;
+      vs = p;
+      while (p < close && *p != qc)
+        p++;
+      ve = p;
+      if (p < close)
+        p++;
+    } else {
+      while (p < close && *p != ' ' && *p != '\t')
+        p++;
+      ve = p;
+    }
+    pc.av = span_dup(vs, ve);
+    while (p < close && (*p == ' ' || *p == '\t'))
+      p++;
+    pc.aci = p < close && (*p == 'i' || *p == 'I');
+  }
+  struct pseudo *np = realloc(st->pc, (unsigned)(st->npc + 1) * sizeof *np);
+  if (!np) {
+    pseudo_free(&pc);
+    return next;
+  }
+  st->pc = np;
+  st->pc[st->npc++] = pc;
+  return next;
+}
+
 /* Parse one compound selector token (between combinators) into *st. */
 static void parse_compound(const char *s, const char *e, struct sel_step *st)
 {
@@ -312,6 +399,8 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
   st->pc = 0;
   st->npc = 0;
   st->pseudo_el = 0;
+  st->pe_list = 0;
+  st->pe_names = 0;
   while (s < e) {
     if (*s == '.') {
       const char *ne = name_end(++s, e);
@@ -357,10 +446,21 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
         st->pseudo_el = PE_BEFORE;
       else if (span_is(ns, ne, "after"))
         st->pseudo_el = PE_AFTER;
-      else if (dbl || span_is(ns, ne, "first-line") || span_is(ns, ne, "first-letter"))
+      else if (dbl && span_is(ns, ne, "slotted") && as) {
+        st->pseudo_el = PE_SLOTTED;
+        st->pe_list = parse_sel_list(as, ae);
+        if (!st->pe_list)
+          st->pseudo_el = PE_OTHER;
+      } else if (dbl && span_is(ns, ne, "part") && as) {
+        st->pseudo_el = PE_PART;
+        free(st->pe_names);
+        st->pe_names = span_dup(as, ae);
+      } else if (dbl || span_is(ns, ne, "first-line") || span_is(ns, ne, "first-letter"))
         st->pseudo_el = PE_OTHER;
       else
         add_pseudo_class(st, ns, ne, as, ae);
+    } else if (*s == '[') {
+      s = parse_attr_sel(s + 1, e, st);
     } else if (*s == '*') {
       s++; /* universal: no constraint */
     } else if (is_sel_name(*s)) {
@@ -421,6 +521,8 @@ static void pseudo_free(struct pseudo *pc)
 {
   free_sel_list(pc->list);
   simple_sel_free(&pc->arg);
+  free(pc->an);
+  free(pc->av);
 }
 void selector_free(struct selector *sel)
 {
@@ -431,6 +533,8 @@ void selector_free(struct selector *sel)
     for (int j = 0; j < st->npc; j++)
       pseudo_free(&st->pc[j]);
     free(st->pc);
+    free_sel_list(st->pe_list);
+    free(st->pe_names);
   }
   free(sel->step);
   sel->step = 0;
@@ -595,6 +699,47 @@ static bool simple_match(const struct simple_sel *ss, const struct dom_node *n)
       return false;
   return true;
 }
+static bool attr_eq(const char *a, const char *b, int len, bool ci)
+{
+  for (int i = 0; i < len; i++)
+    if (ci ? lower(a[i]) != lower(b[i]) : a[i] != b[i])
+      return false;
+  return true;
+}
+static bool attr_value_match(const struct pseudo *pc, const char *v)
+{
+  const char *w = pc->av ? pc->av : "";
+  int vl = (int)strlen(v), wl = (int)strlen(w);
+  switch (pc->aop) {
+  case '=':
+    return vl == wl && attr_eq(v, w, wl, pc->aci);
+  case '^':
+    return wl && vl >= wl && attr_eq(v, w, wl, pc->aci);
+  case '$':
+    return wl && vl >= wl && attr_eq(v + vl - wl, w, wl, pc->aci);
+  case '*':
+    for (int i = 0; wl && i + wl <= vl; i++)
+      if (attr_eq(v + i, w, wl, pc->aci))
+        return true;
+    return false;
+  case '|':
+    return vl >= wl && attr_eq(v, w, wl, pc->aci) && (vl == wl || v[wl] == '-');
+  case '~':
+    for (const char *p = v; wl && *p;) {
+      while (*p == ' ' || *p == '\t' || *p == '\n')
+        p++;
+      const char *q = p;
+      while (*q && *q != ' ' && *q != '\t' && *q != '\n')
+        q++;
+      if ((int)(q - p) == wl && attr_eq(p, w, wl, pc->aci))
+        return true;
+      p = q;
+    }
+    return false;
+  }
+  return false;
+}
+
 static bool pseudo_match(const struct pseudo *pc, const struct dom_node *n)
 {
   switch (pc->kind) {
@@ -654,6 +799,36 @@ static bool pseudo_match(const struct pseudo *pc, const struct dom_node *n)
     for (int i = 0; i < pc->list->n; i++)
       if (selector_match(&pc->list->sels[i], n))
         return true;
+    return false;
+  case PC_ATTR: {
+    const char *v = dom_get_attr(n, pc->an);
+    if (!v)
+      return false;
+    if (!pc->aop)
+      return true;
+    return attr_value_match(pc, v);
+  }
+  case PC_NOT_LIST:
+    for (int i = 0; i < pc->list->n; i++)
+      if (selector_match(&pc->list->sels[i], n))
+        return false;
+    return true;
+  case PC_HOST:
+    if (n != g_css_scope_host)
+      return false;
+    if (!pc->list)
+      return true;
+    for (int i = 0; i < pc->list->n; i++)
+      if (selector_match(&pc->list->sels[i], n))
+        return true;
+    return false;
+  case PC_HOST_CONTEXT:
+    if (n != g_css_scope_host)
+      return false;
+    for (const struct dom_node *m = n; m; m = dom_flat_parent(m))
+      for (int i = 0; i < pc->list->n; i++)
+        if (selector_match(&pc->list->sels[i], m))
+          return true;
     return false;
   default:
     return false; /* PC_NEVER */
@@ -775,18 +950,92 @@ static bool ancestors_possible(const struct selector *sel, const struct dom_node
   return true;
 }
 
+const struct dom_node *g_css_scope_host;
+int g_css_mode;
+
+static bool step_has_host(const struct sel_step *st)
+{
+  for (int i = 0; i < st->npc; i++)
+    if (st->pc[i].kind == PC_HOST || st->pc[i].kind == PC_HOST_CONTEXT)
+      return true;
+  return false;
+}
+
+/* Parent of `n` for matching `st`: a shadow root continues to its host only for a :host step */
+static const struct dom_node *anc_up(const struct dom_node *n, const struct sel_step *st)
+{
+  return n->parent ? n->parent : (n->host && step_has_host(st) ? n->host : 0);
+}
+
+bool selector_subject_is_host(const struct selector *sel) { return step_has_host(&sel->step[sel->n - 1]); }
+
+static bool match_ancestors(const struct selector *sel, int top, const struct dom_node *subject);
+
+/* A ::slotted(sel) rule against a light child `el`: sel matches el, the rest matches the slot it is assigned to */
+bool selector_match_slotted(const struct selector *sel, const struct dom_node *el)
+{
+  int i = sel->n - 1;
+  const struct sel_step *st = &sel->step[i];
+  const struct dom_node *slot = st->pseudo_el == PE_SLOTTED ? dom_assigned_slot(el) : 0;
+  bool arg_ok = false;
+  if (!slot)
+    return false;
+  for (int k = 0; k < st->pe_list->n && !arg_ok; k++)
+    arg_ok = selector_match(&st->pe_list->sels[k], el);
+  return arg_ok && step_box_match(st, slot) && ancestors_possible(sel, slot) && match_ancestors(sel, i - 1, slot);
+}
+
+/* A ::part(name) rule against `el` inside a shadow tree: the rest of the selector matches the tree's host */
+bool selector_match_part(const struct selector *sel, const struct dom_node *el)
+{
+  int i = sel->n - 1;
+  const struct sel_step *st = &sel->step[i];
+  const char *have = dom_get_attr(el, "part");
+  const struct dom_node *host = el;
+  if (st->pseudo_el != PE_PART || !have || !st->pe_names)
+    return false;
+  while (host->parent)
+    host = host->parent;
+  host = host->host;
+  if (!host)
+    return false;
+  for (const char *p = st->pe_names; *p;) { /* every requested name must be on the element */
+    while (*p == ' ')
+      p++;
+    const char *q = p;
+    while (*q && *q != ' ')
+      q++;
+    if (q > p) {
+      bool found = false;
+      for (const char *h = have; *h && !found;) {
+        while (*h == ' ')
+          h++;
+        const char *he = h;
+        while (*he && *he != ' ')
+          he++;
+        found = he - h == q - p && memcmp(h, p, (unsigned)(q - p)) == 0;
+        h = he;
+      }
+      if (!found)
+        return false;
+    }
+    p = q;
+  }
+  return step_box_match(st, host) && ancestors_possible(sel, host) && match_ancestors(sel, i - 1, host);
+}
+
 /* Match steps [0, top] of `sel` against `subject`'s ancestors, right to left; greedy, no backtracking. */
 static bool match_ancestors(const struct selector *sel, int top, const struct dom_node *subject)
 {
   const struct dom_node *cur = subject;
   for (int i = top; i >= 0; i--) {
-    cur = cur ? cur->parent : 0;
+    cur = cur ? anc_up(cur, &sel->step[i]) : 0;
     if (sel->step[i].child) {
       if (!step_match(&sel->step[i], cur))
         return false;
     } else {
       while (cur && !step_match(&sel->step[i], cur))
-        cur = cur->parent;
+        cur = anc_up(cur, &sel->step[i]);
       if (!cur)
         return false;
     }

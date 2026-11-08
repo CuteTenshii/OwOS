@@ -443,6 +443,131 @@ static void test_names_keep_case_and_length(void)
       "expect(out.indexOf('a&#160;b &amp; c &#169; d &amp;bogus; e')>0, 'entities become numeric refs: '+out);\n");
 }
 
+static void test_shadow_dom(void)
+{
+  run_script(
+      "var h=document.createElement('div'); document.body.appendChild(h);\n"
+      "var r=h.attachShadow({mode:'open'});\n"
+      "expect(r instanceof ShadowRoot && r.nodeType===11 && r.host===h && r.mode==='open', 'attachShadow returns a "
+      "ShadowRoot');\n"
+      "expect(h.shadowRoot===r, 'open root is reachable');\n"
+      "var e=''; try{ h.attachShadow({mode:'open'}) }catch(x){ e=x.name }\n"
+      "expect(e==='NotSupportedError', 'second attach throws: '+e);\n"
+      "e=''; try{ document.createElement('a').attachShadow({mode:'open'}) }catch(x){ e=x.name }\n"
+      "expect(e==='NotSupportedError', 'non-host element throws: '+e);\n"
+      "var c=document.createElement('x-closed').attachShadow({mode:'closed'});\n"
+      "expect(c.host.shadowRoot===null && c.mode==='closed', 'closed root hidden');\n"
+      "r.innerHTML='<b id=in>hi</b><slot name=a id=sa></slot><slot id=sd></slot>';\n"
+      "expect(r.getElementById('in').textContent==='hi' && r.querySelector('b'), 'queries inside the root');\n"
+      "expect(document.getElementById('in')===null && document.querySelector('b')===null, 'document does not "
+      "pierce');\n"
+      "expect(h.childNodes.length===0, 'shadow children are not light children');\n"
+      "h.innerHTML='<span slot=a>A</span>text<p>P</p>';\n"
+      "var sa=r.getElementById('sa'), sd=r.getElementById('sd');\n"
+      "expect(sa.assignedNodes().length===1 && sa.assignedElements()[0].tagName==='SPAN', 'named slot takes slotted "
+      "child');\n"
+      "expect(sd.assignedNodes().length===2 && sd.assignedElements().length===1, 'default slot takes the rest');\n"
+      "expect(h.firstChild.assignedSlot===sa && h.lastChild.assignedSlot===sd, 'assignedSlot');\n"
+      "var ev=[]; h.addEventListener('ping',function(x){ ev.push('h:'+(x.target===h)) });\n"
+      "r.querySelector('b').addEventListener('ping',function(x){ ev.push('b:'+(x.target===this)) });\n"
+      "r.querySelector('b').dispatchEvent(new Event('ping',{bubbles:true,composed:true}));\n"
+      "expect(ev.join()==='b:true,h:true', 'composed event retargets to the host: '+ev);\n"
+      "ev.length=0; r.querySelector('b').dispatchEvent(new Event('ping',{bubbles:true}));\n"
+      "expect(ev.join()==='b:true', 'non-composed event stops at the root: '+ev);\n"
+      "var path; h.addEventListener('pp',function(x){ path=x.composedPath() });\n"
+      "r.querySelector('b').dispatchEvent(new Event('pp',{bubbles:true,composed:true}));\n"
+      "expect(path[0]===r.querySelector('b') && path.indexOf(r)>0 && path.indexOf(h)>path.indexOf(r) && "
+      "path[path.length-1]===window, 'composedPath');\n"
+      "var log=[]; class XIn extends HTMLElement { connectedCallback(){ log.push('c') } }\n"
+      "customElements.define('x-in',XIn);\n"
+      "r.appendChild(document.createElement('x-in'));\n"
+      "expect(log.join()==='c', 'custom elements connect inside a connected shadow root: '+log);\n"
+      "var late=document.createElement('div'), lr=late.attachShadow({mode:'open'}); lr.innerHTML='<x-in></x-in>';\n"
+      "expect(log.length===1, 'not connected while the host is detached'); document.body.appendChild(late);\n"
+      "expect(log.length===2, 'connects when the host does: '+log);\n"
+      "class XI extends HTMLElement { constructor(){ super(); this.i=this.attachInternals(); } }\n"
+      "customElements.define('x-i',XI); var xi=document.createElement('x-i');\n"
+      "expect(xi.i.states.add('on')===xi.i.states && xi.i.states.has('on') && xi.i.checkValidity(), "
+      "'ElementInternals');\n"
+      "e=''; try{ xi.attachInternals() }catch(x){ e=x.name } expect(e==='NotSupportedError', 'attachInternals once');\n"
+      "var sh=new CSSStyleSheet(); sh.replaceSync('p{color:red} .a{margin:0}');\n"
+      "expect(sh.cssRules.length===2, 'cssRules: '+sh.cssRules.length);\n"
+      "r.adoptedStyleSheets=[sh]; expect(r.adoptedStyleSheets[0]===sh, 'adoptedStyleSheets round-trips'); "
+      "window.sroot=r;\n");
+  {
+    js_value rv = js_get(g_ctx, js_obj_value(g_ctx->global), "sroot");
+    char *css = rv.type == JV_OBJ ? shadow_adopted_css((struct dom_node *)rv.u.obj->host) : 0;
+    expect(css && strstr(css, "p{color:red}"));
+    free(css);
+  }
+}
+
+static void test_template_content_and_declarative_shadow(void)
+{
+  const char html[] =
+      "<div id=h><template shadowrootmode=open><b>x</b><template shadowrootmode=closed></template></template>"
+      "<i>light</i><p><template shadowrootmode=closed><u>deep</u></template></p></div>";
+  struct dom_node *tree = dom_parse(html, (int)strlen(html)), *h = tree->first_child;
+  run_script("var t=document.createElement('template'); t.innerHTML='<i>a</i><b>b</b>';\n"
+             "var f=t.content; expect(f.nodeType===11 && f.childNodes.length===2 && t.childNodes.length===0, 'content "
+             "takes the children');\n"
+             "expect(t.content===f, 'content is stable');\n"
+             "var host=document.createElement('x-t'); "
+             "host.attachShadow({mode:'open'}).appendChild(t.content.cloneNode(true));\n"
+             "expect(host.shadowRoot.querySelector('b') && f.childNodes.length===2, 'stamping a clone leaves the "
+             "template intact');\n");
+  dom_attach_declarative_shadows(tree);
+  expect(h && h->shadow && h->shadow->shadow_open && h->shadow->host == h);
+  expect(h->shadow->first_child && streq(h->shadow->first_child->tag, "b"));
+  expect(h->first_child && streq(h->first_child->tag, "i")); /* the template itself is gone */
+  struct dom_node *p = h->first_child->next;
+  expect(p && p->shadow && !p->shadow->shadow_open && streq(p->shadow->first_child->tag, "u"));
+  expect(p->first_child == 0);
+  expect(streq(h->shadow->first_child->next->tag, "template")); /* a shadow root is not a valid host */
+  dom_free(tree);
+}
+
+static void test_slotchange(void)
+{
+  run_script("window.sc=[]; var h=document.createElement('div'); document.body.appendChild(h);\n"
+             "var r=h.attachShadow({mode:'open'}); r.innerHTML='<slot id=s></slot><slot name=n id=n></slot>';\n"
+             "r.getElementById('s').addEventListener('slotchange',function(e){ sc.push('s:'+e.bubbles+e.composed) });\n"
+             "r.getElementById('n').addEventListener('slotchange',function(e){ sc.push('n') });\n"
+             "var i=document.createElement('i'); h.appendChild(i); h.appendChild(document.createElement('b'));\n"
+             "expect(sc.length===0, 'slotchange is not synchronous');\n"
+             "window.h=h; window.i=i;\n");
+  js_timers_pump();
+  run_script("expect(sc.join()==='s:truefalse', 'one slotchange for the default slot: '+sc);\n"
+             "sc.length=0; h.removeChild(i);\n");
+  js_timers_pump();
+  run_script("expect(sc.join()==='s:truefalse', 'removal fires too: '+sc);\n"
+             "sc.length=0; var u=document.createElement('u'); u.slot='n'; h.appendChild(u);\n");
+  js_timers_pump();
+  run_script("expect(sc.join()==='n', 'named slot: '+sc);\n"
+             "sc.length=0; u.slot='';\n");
+  js_timers_pump();
+  run_script("expect(sc.join()==='n,s:truefalse' || sc.join()==='s:truefalse,n', 'reassigning notifies both: '+sc);\n");
+}
+
+static void test_attribute_selectors_in_script(void)
+{
+  run_script("var d=document.createElement('div'); d.innerHTML='<a id=l href=\"https://x.test/a.html\" rel=\"nofollow "
+             "ext\" lang=en-GB data-m=Dark>x</a><i id=n>y</i>';\n"
+             "document.body.appendChild(d); var a=d.querySelector('a');\n"
+             "expect(d.querySelector('[href]')===a && d.querySelector('a[href^=https]')===a && "
+             "d.querySelector('[href$=\".html\"]')===a, 'exists, ^=, $=');\n"
+             "expect(d.querySelector('[href*=\"x.test\"]')===a, '*= quoted');\n"
+             "expect(d.querySelector('[href*=test]')===a, '*= bare');\n"
+             "expect(d.querySelector('[href*=nope]')===null, '*= miss');\n"
+             "expect(d.querySelector('[rel~=ext]')===a && d.querySelector('[rel~=no]')===null, '~=');\n"
+             "expect(d.querySelector('[lang|=en]')===a && d.querySelector('[data-m=dark]')===null && "
+             "d.querySelector('[data-m=dark i]')===a, '|= and i');\n"
+             "expect(a.matches('a[href][rel~=nofollow]') && !a.matches('[href=nope]') && a.closest('[href]')===a, "
+             "'matches/closest');\n"
+             "expect(d.querySelectorAll(':not([href])').length===1 && d.querySelector(':not([href])').id==='n', "
+             "':not([attr])');\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -466,6 +591,10 @@ int main(void)
   test("EventTarget: construction, subclassing, dispatch and isolation", test_event_target);
   test("namespaces: DOM, XMLSerializer and XPath", test_namespaces);
   test("names: case and length are preserved, entities serialize as XML", test_names_keep_case_and_length);
+  test("Shadow DOM: roots, slots, event retargeting, lifecycle and adopted sheets", test_shadow_dom);
+  test("attribute selectors in querySelector, matches and closest", test_attribute_selectors_in_script);
+  test("slotchange fires asynchronously for the affected slots", test_slotchange);
+  test("template.content and declarative shadow roots", test_template_content_and_declarative_shadow);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 
   return 0;

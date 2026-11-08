@@ -64,18 +64,241 @@ static bool csp_style_attr_ok(void)
   return csp_check_inline(B->pg->csp, CSP_STYLE, 0, 0, 0, 0, 0);
 }
 
+static unsigned g_doc_adopted_key;
+static int g_adopted_mark;
+unsigned g_shadow_style_gen; /* bumped whenever a shadow tree's sheet is rebuilt */
+
+static void free_sheet_cb(void *sheet) { css_free(sheet); }
+
+/* The shadow root `el` lives in, or NULL for the page's own tree */
+static const struct dom_node *tree_root_shadow(const struct dom_node *el)
+{
+  while (el->parent)
+    el = el->parent;
+  return el->host ? el : 0;
+}
+
+/* The sheet whose rules apply to `el`: a shadow tree sees only its own <style>s, never the page's */
+css_sheet *sheet_for(const struct dom_node *el)
+{
+  const struct dom_node *root = tree_root_shadow(el);
+  return root ? root->shadow_sheet : g_sheet;
+}
+
+static unsigned hash_bytes(unsigned h, const char *s, int n)
+{
+  for (int i = 0; i < n; i++)
+    h = (h ^ (unsigned char)s[i]) * 16777619u;
+  return h;
+}
+
+struct txt {
+  char *b;
+  int n, cap;
+};
+static void txt_add(struct txt *t, const char *s, int len)
+{
+  if (t->n + len + 1 > t->cap) {
+    int nc = (t->n + len + 1) * 2;
+    char *nb = realloc(t->b, (unsigned)nc);
+    if (!nb)
+      return;
+    t->b = nb;
+    t->cap = nc;
+  }
+  memcpy(t->b + t->n, s, (unsigned)len);
+  t->n += len;
+  t->b[t->n] = '\0';
+}
+
+/* One stylesheet source of a shadow tree: inline <style> text, a fetched <link>, or adopted CSS */
+#define SHADOW_PIECES_MAX 48
+struct piece {
+  char *text;
+  int len;
+  const char *base; /* what relative url()s resolve against */
+  bool own;         /* text is heap memory this piece must free */
+};
+
+/* Fetched shadow-tree <link rel=stylesheet> bodies, kept for the page's life so a relayout never refetches */
+#define LINK_CACHE_MAX 64
+static struct {
+  char *url, *body;
+  int len;
+} g_link_cache[LINK_CACHE_MAX];
+static int g_n_link_cache;
+
+static void link_cache_reset(void)
+{
+  for (int i = 0; i < g_n_link_cache; i++) {
+    free(g_link_cache[i].url);
+    free(g_link_cache[i].body);
+  }
+  g_n_link_cache = 0;
+}
+
+static int link_cache_find(const char *url)
+{
+  for (int i = 0; i < g_n_link_cache; i++)
+    if (streq(g_link_cache[i].url, url))
+      return i;
+  return -1;
+}
+
+/* The absolute URL of a stylesheet <link> in a shadow tree, or false when it is not one (or CSP refuses it) */
+static bool shadow_link_url(const struct dom_node *c, char *out, int cap)
+{
+  const char *rel = dom_get_attr(c, "rel"), *href = dom_get_attr(c, "href");
+  char abs[URL_MAX];
+  if (!rel || !href || !href[0] || !contains_ci(rel, "stylesheet") || contains_ci(rel, "alternate"))
+    return false;
+  resolve_url(g_page_url, href, abs, sizeof abs);
+  return csp_url_ok(CSP_STYLE, abs, "stylesheet", out, cap);
+}
+
+/* Fetch the not-yet-cached <link> sheets under `n` in one batch */
+static void fetch_shadow_links(const struct dom_node *n)
+{
+  char *urls[8];
+  int nu = 0;
+  for (const struct dom_node *c = n->first_child; c; c = c->next) {
+    char use[URL_MAX];
+    if (c->type != DOM_ELEMENT)
+      continue;
+    if (streq(c->tag, "link") && shadow_link_url(c, use, sizeof use) && link_cache_find(use) < 0 && nu < 8 &&
+        g_n_link_cache + nu < LINK_CACHE_MAX)
+      urls[nu++] = strdup(use);
+    else if (!streq(c->tag, "style"))
+      fetch_shadow_links(c);
+  }
+  if (!nu)
+    return;
+  unsigned char *bodies[8] = {0};
+  int lens[8] = {0};
+  if (g_page_fetch)
+    g_page_fetch(urls, nu, bodies, lens);
+  for (int i = 0; i < nu; i++) { /* a failed fetch is cached empty so it is not retried every layout */
+    g_link_cache[g_n_link_cache].url = urls[i];
+    g_link_cache[g_n_link_cache].body = bodies[i] && lens[i] > 0 ? (char *)bodies[i] : 0;
+    g_link_cache[g_n_link_cache].len = bodies[i] && lens[i] > 0 ? lens[i] : 0;
+    if (!g_link_cache[g_n_link_cache].body)
+      free(bodies[i]);
+    g_n_link_cache++;
+  }
+}
+
+/* Collect the sources under `n` that belong to the same tree (a nested shadow root is its own tree), in order */
+static void gather_pieces(const struct dom_node *n, struct piece *pc, int *np)
+{
+  for (const struct dom_node *c = n->first_child; c && *np < SHADOW_PIECES_MAX; c = c->next) {
+    if (c->type != DOM_ELEMENT)
+      continue;
+    if (streq(c->tag, "style")) {
+      struct txt one = {0, 0, 0};
+      for (const struct dom_node *t = c->first_child; t; t = t->next)
+        if (t->type == DOM_TEXT && t->text)
+          txt_add(&one, t->text, (int)strlen(t->text));
+      char reason[64];
+      if (one.b && (!B->pg->csp || csp_check_inline(B->pg->csp, CSP_STYLE, dom_get_attr(c, "nonce"),
+                                                    (const unsigned char *)one.b, one.n, reason, sizeof reason))) {
+        pc[*np].text = one.b;
+        pc[*np].len = one.n;
+        pc[*np].own = true;
+        pc[(*np)++].base = g_page_url;
+      } else {
+        free(one.b);
+      }
+    } else if (streq(c->tag, "link")) {
+      char use[URL_MAX];
+      int ci;
+      if (shadow_link_url(c, use, sizeof use) && (ci = link_cache_find(use)) >= 0 && g_link_cache[ci].body) {
+        pc[*np].text = g_link_cache[ci].body;
+        pc[*np].len = g_link_cache[ci].len;
+        pc[*np].own = false;
+        pc[(*np)++].base = g_link_cache[ci].url;
+      }
+    } else {
+      gather_pieces(c, pc, np);
+    }
+  }
+}
+
+/* Rebuild the sheet of every shadow root whose sources (<style>, <link>, adopted sheets) changed */
+static void refresh_shadow_sheets(struct dom_node *n)
+{
+  for (struct dom_node *c = n->first_child; c; c = c->next)
+    if (c->type == DOM_ELEMENT)
+      refresh_shadow_sheets(c);
+  struct dom_node *root = n->shadow;
+  if (!root)
+    return;
+  refresh_shadow_sheets(root);
+  struct piece pc[SHADOW_PIECES_MAX + 1];
+  int np = 0;
+  fetch_shadow_links(root);
+  gather_pieces(root, pc, &np);
+  char *adopted = shadow_adopted_css(root);
+  if (adopted && np <= SHADOW_PIECES_MAX) {
+    pc[np].text = adopted;
+    pc[np].len = (int)strlen(adopted);
+    pc[np].own = false;
+    pc[np++].base = g_page_url;
+  }
+  unsigned key = 2166136261u;
+  for (int i = 0; i < np; i++) {
+    key = hash_bytes(key, pc[i].text, pc[i].len);
+    key = hash_bytes(key, pc[i].base, (int)strlen(pc[i].base));
+  }
+  key = np ? key | 1u : 0; /* 0 means no sheet */
+  if (key != root->shadow_sheet_key) {
+    dom_on_free_sheet = free_sheet_cb;
+    if (root->shadow_sheet)
+      css_free(root->shadow_sheet);
+    root->shadow_sheet = key ? css_new() : 0;
+    for (int i = 0; root->shadow_sheet && i < np; i++)
+      css_add(root->shadow_sheet, pc[i].text, pc[i].len, pc[i].base);
+    root->shadow_sheet_key = key;
+    g_shadow_style_gen++;
+  }
+  for (int i = 0; i < np; i++)
+    if (pc[i].own)
+      free(pc[i].text);
+  free(adopted);
+}
+
 /* Computed style for one element */
 void compute_style(struct dom_node *el, struct css_style *cs)
 {
   unsigned seq = style_key();
+  css_sheet *sheet = sheet_for(el);
   dom_on_free_style_cache = free_style_cache;
-  if (el->computed_style && el->computed_style_sheet == g_sheet && el->computed_style_seq == seq) {
+  if (el->computed_style && el->computed_style_sheet == sheet && el->computed_style_seq == seq) {
     *cs = *(struct css_style *)el->computed_style;
     return;
   }
   css_style_reset(cs);
   css_apply_attrs(el, cs);
-  css_apply_sheet(g_sheet, el, cs);
+  css_set_primary(g_sheet);
+  /* Shadow-tree rules that reach `el` from inside lose to the tree it lives in: :host and ::slotted come first */
+  if (el->shadow && el->shadow->shadow_sheet) {
+    css_set_scope(el, CSS_SCOPE_HOST_ONLY);
+    css_apply_sheet(el->shadow->shadow_sheet, el, cs);
+  }
+  if (el->parent && el->parent->shadow && el->parent->shadow->shadow_sheet) {
+    css_set_scope(el->parent, CSS_SCOPE_SLOTTED);
+    css_apply_sheet(el->parent->shadow->shadow_sheet, el, cs);
+  }
+  const struct dom_node *sroot = tree_root_shadow(el);
+  css_set_scope(sroot ? sroot->host : 0, CSS_SCOPE_NORMAL);
+  css_apply_sheet(sheet, el, cs);
+  if (sroot && sroot->host) { /* ::part() rules of the tree around the host win over the component's own */
+    css_sheet *outer = sheet_for(sroot->host);
+    if (outer) {
+      css_set_scope(sroot->host, CSS_SCOPE_PART);
+      css_apply_sheet(outer, el, cs);
+    }
+  }
+  css_set_scope(0, CSS_SCOPE_NORMAL);
   const char *inl = dom_get_attr(el, "style");
   if (inl && csp_style_attr_ok())
     css_apply_inline(inl, cs);
@@ -83,7 +306,7 @@ void compute_style(struct dom_node *el, struct css_style *cs)
     el->computed_style = malloc(sizeof *cs);
   if (el->computed_style) {
     *(struct css_style *)el->computed_style = *cs;
-    el->computed_style_sheet = g_sheet;
+    el->computed_style_sheet = sheet;
     el->computed_style_seq = seq;
   }
 }
@@ -93,13 +316,13 @@ struct dom_node *html_dom_root(void) { return g_live_dom; }
 void html_compute_style(struct dom_node *el, struct css_style *out) { compute_style(el, out); }
 int html_match_styles(struct dom_node *el, struct css_match *out, int cap)
 {
-  return css_matches(g_sheet, el, out, cap);
+  return css_matches(sheet_for(el), el, out, cap);
 }
 /* 1 if `el` has a ::before/::after (CSS_PSEUDO_*) with content - for devtools */
 int html_has_pseudo(struct dom_node *el, int which)
 {
   struct css_style cs;
-  return css_pseudo_content(g_sheet, el, which, &cs);
+  return css_pseudo_content(sheet_for(el), el, which, &cs);
 }
 
 /* True when `s` already carries a URL scheme that resolve_url won't expand, so it must be used */
@@ -287,7 +510,7 @@ static void compute_page_colors(struct dom_node *root)
     if (cs.color >= 0)
       B->pg->page_fg = (unsigned)cs.color;
     unsigned argb;
-    if (css_bg_argb(g_sheet, el, &argb))
+    if (css_bg_argb(sheet_for(el), el, &argb))
       canvas = composite_over(canvas, argb);
   }
   B->pg->page_bg = canvas;
@@ -302,6 +525,18 @@ static void layout_dom(void)
   if (B->img_pool_len > IMG_POOL / 2 || !img_carry_begin(&g_carry, B->pg->imgs, B->pg->n_imgs))
     B->img_pool_len = 0; /* nothing carried: the pool restarts empty */
   B->pg->n_imgs = 0;
+  char *doc_adopted = document_adopted_css();
+  unsigned adopted_key = doc_adopted ? hash_bytes(2166136261u, doc_adopted, (int)strlen(doc_adopted)) : 0;
+  if (adopted_key != g_doc_adopted_key && g_sheet) { /* adopted rules sit after the page's own, so replace them */
+    if (g_doc_adopted_key)
+      css_truncate(g_sheet, g_adopted_mark);
+    g_adopted_mark = css_mark(g_sheet);
+    if (doc_adopted)
+      css_add(g_sheet, doc_adopted, (int)strlen(doc_adopted), g_page_url);
+    g_doc_adopted_key = adopted_key;
+  }
+  free(doc_adopted);
+  refresh_shadow_sheets(g_live_dom);
   compute_page_colors(g_live_dom);
   sty_cur.fg = B->pg->page_fg;
   sty_cur.bold = sty_cur.under = 0;
@@ -352,6 +587,7 @@ void html_page_teardown(void)
     css_free(g_sheet);
     g_sheet = 0;
   }
+  link_cache_reset();
   frames_free(); /* drop this page's iframe sub-documents */
   dom_on_free_style_cache = 0;
   layout_free(); /* drop the box tree */
@@ -468,8 +704,11 @@ void html_to_text(const char *page_url, res_batch_fn fetch)
 
   struct dom_node *root = dom_parse(B->pg->raw, B->pg->raw_len);
   g_sheet = css_new();
+  g_doc_adopted_key = 0;
+  link_cache_reset();
   g_live_dom = root; /* the live tree  -  kept until the next teardown  */
   if (root) {
+    dom_attach_declarative_shadows(root);
     scan_meta_csp(root); /* fold <meta http-equiv=CSP> into B->pg->csp before any load */
     /* Link:-header sheets come before the document's own (then tree order). */
     for (struct css_link *L = B->ext_css; L; L = L->next)

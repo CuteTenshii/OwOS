@@ -78,7 +78,12 @@ extern const char *g_page_url;
 extern res_batch_fn g_page_fetch;
 
 static inline void free_style_cache(void *cache) { free(cache); }
-static inline unsigned style_key(void) { return css_viewport_generation() + css_sheet_generation(g_sheet); }
+extern unsigned g_shadow_style_gen;
+css_sheet *sheet_for(const struct dom_node *el);
+static inline unsigned style_key(void)
+{
+  return css_viewport_generation() + css_sheet_generation(g_sheet) + g_shadow_style_gen;
+}
 static inline unsigned char clamp_fontpx(int px) { return (unsigned char)(px < 8 ? 8 : (px > 120 ? 120 : px)); }
 
 void csp_report(const char *what, const char *url, const char *reason);

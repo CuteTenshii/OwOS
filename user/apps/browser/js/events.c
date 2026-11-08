@@ -77,12 +77,43 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
   gc_pop_scope();
 }
 
+/* The node `target` appears as to a listener on `cur` (NULL = window): shadow trees `cur` is outside of are hidden */
+static js_object *retarget(struct dom_node *target, struct dom_node *cur, js_object *startobj)
+{
+  struct dom_node *a = target;
+  for (;;) {
+    struct dom_node *r = a;
+    bool inside = false;
+    while (r->parent)
+      r = r->parent;
+    if (!r->host)
+      break;
+    for (const struct dom_node *m = cur; m && !inside; m = dom_flat_parent(m))
+      inside = m == r;
+    if (inside)
+      break;
+    a = r->host;
+  }
+  return a == target ? startobj : wrap_node(a).u.obj;
+}
+
+static void fire_at(js_object *obj, struct dom_node *cur, struct dom_node *target, js_object *startobj, js_value ev,
+                    int capture)
+{
+  if (target)
+    js_set(g_ctx, ev, "target", js_obj_value(retarget(target, cur, startobj)));
+  ev_fire_on(obj, ev, capture);
+}
+
 /* Dispatch `ev` starting at wrapper `startobj` (its host node anchors the path) */
 bool dispatch_from(js_object *startobj, js_value ev)
 {
   js_object *path[128];
+  struct dom_node *pnode[128];
   int np = 0, i;
   struct dom_node *target = (struct dom_node *)startobj->host;
+  bool composed = ev_flag(ev, "composed");
+  js_object *parr;
   gc_push_scope();
   gc_keep(startobj);
   /* hold ev across the calls below */
@@ -91,27 +122,55 @@ bool dispatch_from(js_object *startobj, js_value ev)
   js_set(g_ctx, ev, "target", js_obj_value(startobj));
 
   if (target) {
-    for (struct dom_node *n = target; n && np < 126; n = n->parent)
-      if (n->wrapper)
+    for (struct dom_node *n = target; n && np < 126; n = n->parent ? n->parent : (composed ? n->host : 0))
+      if (n->wrapper) {
+        pnode[np] = n;
         path[np++] = (js_object *)n->wrapper;
+      }
   } else {
+    pnode[np] = 0;
     path[np++] = startobj; /* window/detached: just itself */
   }
   /* window (global) is the outermost target, after the document */
-  if (target && g_ctx->global && np < 127 && path[np ? np - 1 : 0] != g_ctx->global)
+  if (target && g_ctx->global && np < 127 && path[np ? np - 1 : 0] != g_ctx->global) {
+    pnode[np] = 0;
     path[np++] = g_ctx->global;
+  }
+
+  parr = (js_object *)gc_keep(js_new_array(g_ctx, 0));
+  for (i = 0; i < np; i++)
+    js_array_push(g_ctx, parr, js_obj_value(path[i]));
+  js_def(ev.u.obj, "@path", js_obj_value(parr), P_WRITABLE);
 
   for (i = np - 1; i >= 1 && !ev_flag(ev, "@sp"); i--)
-    ev_fire_on(path[i], ev, 1); /* capture */
+    fire_at(path[i], pnode[i], target, startobj, ev, 1); /* capture */
   if (!ev_flag(ev, "@sp")) {
-    ev_fire_on(path[0], ev, 1);
-    ev_fire_on(path[0], ev, 0);
+    fire_at(path[0], pnode[0], target, startobj, ev, 1);
+    fire_at(path[0], pnode[0], target, startobj, ev, 0);
   } /* target */
   for (i = 1; i < np && !ev_flag(ev, "@sp"); i++)
-    ev_fire_on(path[i], ev, 0); /* bubble */
+    fire_at(path[i], pnode[i], target, startobj, ev, 0); /* bubble */
 
+  if (target)
+    js_set(g_ctx, ev, "target", js_obj_value(retarget(target, 0, startobj)));
+  js_def(ev.u.obj, "@path", js_obj_value(js_new_array(g_ctx, 0)), P_WRITABLE);
   gc_pop_scope();
   return ev_flag(ev, "@dp");
+}
+
+js_value ev_composed_path(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value p = t.type == JV_OBJ ? js_get(ctx, t, "@path") : js_undef();
+  js_object *copy;
+  (void)args;
+  (void)argc;
+  gc_push_scope();
+  copy = (js_object *)gc_keep(js_new_array(ctx, 0));
+  if (js_is_array(p))
+    for (unsigned i = 0; i < js_array_len(p.u.obj); i++)
+      js_array_push(ctx, copy, js_get_index(ctx, p, i));
+  gc_pop_scope();
+  return js_obj_value(copy);
 }
 
 js_value ev_prevent(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -156,6 +215,7 @@ js_value make_event(const char *type, int x, int y, js_value init)
   js_def(e, "bubbles", js_bool(bubbles), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "cancelable", js_bool(cancelable), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "defaultPrevented", js_bool(0), P_WRITABLE | P_ENUMERABLE);
+  js_def(e, "composed", js_bool(1), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "target", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "currentTarget", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "clientX", js_number(x), P_WRITABLE | P_ENUMERABLE);
@@ -249,8 +309,11 @@ js_value el_dispatch(js_ctx *ctx, js_value t, js_value *args, int argc)
 }
 js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
+  js_value ev;
   (void)thisv;
-  return make_event(arg_str(ctx, A(0)), 0, 0, A(1));
+  ev = make_event(arg_str(ctx, A(0)), 0, 0, A(1));
+  js_set(ctx, ev, "composed", js_bool(A(1).type == JV_OBJ && js_to_boolean(js_get(ctx, A(1), "composed"))));
+  return ev;
 }
 
 /* EventTarget(): `new` builds a bare target; `super()` from a subclass keeps its own `this` */
@@ -281,6 +344,7 @@ js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   (void)thisv;
   if (ev.type != JV_OBJ)
     return ev;
+  js_set(ctx, ev, "composed", js_bool(A(1).type == JV_OBJ && js_to_boolean(js_get(ctx, A(1), "composed"))));
   if (proto.type == JV_OBJ)
     ev.u.obj->proto = proto.u.obj;
   if (argc >= 2 && A(1).type == JV_OBJ) {

@@ -226,6 +226,15 @@ void css_sel_free(struct sel_list *l);
 
 /* Fold the sheet's matching rules for `el` into *out (specificity/order). */
 void css_apply_sheet(css_sheet *sheet, const struct dom_node *el, struct css_style *out);
+/* Shadow scoping for the next css_apply_sheet calls. `host` is what :host matches. mode picks the rules used:
+ * NORMAL all but ::slotted/::part, HOST_ONLY just those whose subject is :host (styling the host itself),
+ * SLOTTED the ::slotted() rules (styling a light child), PART the ::part() rules (styling a shadow element).
+ * css_set_primary names the page sheet whose custom properties every sheet sees. */
+enum { CSS_SCOPE_NORMAL, CSS_SCOPE_HOST_ONLY, CSS_SCOPE_SLOTTED, CSS_SCOPE_PART };
+void css_set_scope(const struct dom_node *host, int mode);
+void css_set_primary(css_sheet *sheet);
+int css_mark(const css_sheet *sheet);          /* position after the rules added so far */
+void css_truncate(css_sheet *sheet, int mark); /* drop every rule added after css_mark() returned `mark` */
 /* Fold a style="" declaration block into *out (highest priority). */
 void css_apply_inline(const char *decls, struct css_style *out);
 /* Fold HTML presentational attrs into *out (lowest priority). */

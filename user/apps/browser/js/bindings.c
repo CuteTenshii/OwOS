@@ -61,6 +61,7 @@ struct html_iface g_html_ifaces[] = {
     {"HTMLHRElement", "hr", false, 0},
     {"HTMLSourceElement", "source", false, 0},
     {"HTMLTemplateElement", "template", false, 0},
+    {"HTMLSlotElement", "slot", false, 0},
     {"HTMLDialogElement", "dialog", false, 0},
     {"HTMLDetailsElement", "details", false, 0},
     {"HTMLPictureElement", "picture", false, 0},
@@ -210,7 +211,9 @@ js_value wrap_node(struct dom_node *n)
   if (n->wrapper)
     return js_obj_value((js_object *)n->wrapper);
   proto = g_html_proto ? g_html_proto : g_element_proto;
-  if (n->type == DOM_ELEMENT) {
+  if (n->host && g_shadowroot_proto)
+    proto = g_shadowroot_proto;
+  else if (n->type == DOM_ELEMENT) {
     js_object *ip = iface_proto_for_tag(n->tag); /* HTMLScriptElement etc. */
     if (ip)
       proto = ip;
@@ -397,7 +400,7 @@ static js_value el_nodeName(js_ctx *ctx, js_value t, js_value *args, int argc)
   struct dom_node *n = node_of(t);
   if (n && n->type == DOM_TEXT)
     return js_mk_cstring(ctx, "#text");
-  if (n && node_is_frag(n))
+  if (n && (node_is_frag(n) || n->host))
     return js_mk_cstring(ctx, "#document-fragment");
   if (n && node_is_comment(n))
     return js_mk_cstring(ctx, "#comment");
@@ -411,7 +414,7 @@ static js_value el_nodeType(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)argc;
   if (!n || n->type == DOM_TEXT)
     return js_number(n ? 3 : 1);
-  return js_number(node_is_frag(n) ? 11 : node_is_comment(n) ? 8 : 1);
+  return js_number(node_is_frag(n) || n->host ? 11 : node_is_comment(n) ? 8 : 1);
 }
 static js_value el_get_id(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -820,7 +823,7 @@ static js_value el_rm_attr(js_ctx *ctx, js_value t, js_value *args, int argc)
 /* A script inserted into the live document by these DOM bindings */
 bool node_connected(struct dom_node *n)
 {
-  for (; n; n = n->parent)
+  for (; n; n = (struct dom_node *)dom_flat_parent(n))
     if (n == g_doc_root)
       return true;
   return false;
@@ -841,6 +844,7 @@ static void connect_inserted(struct dom_node *c)
 /* Detach `c` from `parent` and fire disconnectedCallback across its subtree */
 void remove_node(struct dom_node *parent, struct dom_node *c)
 {
+  shadow_node_removing(c);
   dom_remove_child(parent, c);
   ce_disconnect_tree(c);
 }
@@ -856,11 +860,13 @@ bool insert_node(js_ctx *ctx, struct dom_node *parent, struct dom_node *c, struc
     while ((k = c->first_child)) {
       dom_insert_before(parent, k, ref);
       connect_inserted(k);
+      shadow_node_inserted(k);
     }
     return true;
   }
   dom_insert_before(parent, c, ref);
   connect_inserted(c);
+  shadow_node_inserted(c);
   return true;
 }
 static js_value el_append(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -2173,6 +2179,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_event_proto, "initEvent", ev_init_event, 3);
   def_method(g_event_proto, "initCustomEvent", ev_init_event, 4);
   def_method(g_event_proto, "preventDefault", ev_prevent, 0);
+  def_method(g_event_proto, "composedPath", ev_composed_path, 0);
   def_method(g_event_proto, "stopPropagation", ev_stop, 0);
   def_method(g_event_proto, "stopImmediatePropagation", ev_stop, 0);
   {
@@ -2312,6 +2319,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   js_def_native(ctx, win, "DOMParser", domparser_ctor, 0); /* new DOMParser().parseFromString */
   js_def_native(ctx, win, "XMLSerializer", xmlser_ctor, 0);
   xpath_install(ctx, win);
+  shadow_install(ctx, win);
   namespace_install();
 
   /* fetch() + Response.prototype */

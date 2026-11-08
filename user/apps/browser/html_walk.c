@@ -6,19 +6,20 @@ static void walk_element_inner(struct dom_node *el);
 /* Emit a ::before / ::after pseudo-element's generated content as inline text */
 static void emit_pseudo(struct dom_node *el, int which)
 {
-  if (!css_sheet_has_pseudo(g_sheet))
+  css_sheet *sheet = sheet_for(el);
+  if (!css_sheet_has_pseudo(sheet))
     return; /* no ::before/::after rules -> skip the extra cascade */
   unsigned seq = style_key();
-  if (el->pseudo_seq != seq || el->pseudo_sheet != g_sheet) {
+  if (el->pseudo_seq != seq || el->pseudo_sheet != sheet) {
     dom_on_free_style_cache = free_style_cache;
     for (int w = 0; w < 2; w++) {
       struct css_style tmp;
       free(el->pseudo_style[w]);
       el->pseudo_style[w] = 0;
-      if (css_pseudo_content(g_sheet, el, w + 1, &tmp) && (el->pseudo_style[w] = malloc(sizeof tmp)))
+      if (css_pseudo_content(sheet, el, w + 1, &tmp) && (el->pseudo_style[w] = malloc(sizeof tmp)))
         *(struct css_style *)el->pseudo_style[w] = tmp;
     }
-    el->pseudo_sheet = g_sheet;
+    el->pseudo_sheet = sheet;
     el->pseudo_seq = seq;
   }
   const struct css_style *pcs = el->pseudo_style[which - 1];
@@ -213,8 +214,8 @@ static void walk_element_inner(struct dom_node *el)
 
   if (streq(name, "script") || streq(name, "style"))
     return; /* not rendered */
-  if (streq(name, "noscript"))
-    return;                   /* scripting is on, so its fallback is hidden */
+  if (streq(name, "noscript") || streq(name, "template"))
+    return;                   /* scripting is on, so its fallback is hidden; a template is inert */
   if (streq(name, "title")) { /* the document title... */
     struct dom_node *a;
     for (a = el->parent; a; a = a->parent)
@@ -228,8 +229,8 @@ static void walk_element_inner(struct dom_node *el)
   struct css_style cs;
   compute_style(el, &cs);
   if (cs.disp == CSS_DISP_NONE)
-    return;                                 /* display:none */
-  anim_apply(g_sheet, el, &cs, g_walk_now); /* overlay @keyframes / transition */
+    return;                                       /* display:none */
+  anim_apply(sheet_for(el), el, &cs, g_walk_now); /* overlay @keyframes / transition */
   if (streq(name, "dialog") || dom_get_attr(el, "popover"))
     g_has_controls = true; /* route clicks and Escape to the page */
   if (streq(name, "dialog") && !dom_get_attr(el, "open"))
@@ -487,8 +488,35 @@ static void walk_element_inner(struct dom_node *el)
     W_olnum = sv_ol;
 }
 
+static void walk_child(struct dom_node *c)
+{
+  if (c->type == DOM_TEXT) {
+    if (c->text)
+      emit_text(c->text);
+  } else
+    walk_element(c);
+}
+
+/* Flat tree: a shadow host renders its shadow root's children, and a <slot> renders what is assigned to it */
 void walk(struct dom_node *node)
 {
+  if (node->shadow) {
+    for (struct dom_node *c = node->shadow->first_child; c; c = c->next)
+      walk_child(c);
+    return;
+  }
+  if (node->type == DOM_ELEMENT && streq(node->tag, "slot")) {
+    const struct dom_node *host = dom_slot_host(node);
+    bool any = false;
+    if (host)
+      for (struct dom_node *c = host->first_child; c; c = c->next)
+        if (dom_slot_accepts(node, c)) {
+          any = true;
+          walk_child(c);
+        }
+    if (any)
+      return;
+  }
   bool closed = streq(node->tag, "details") && !dom_get_attr(node, "open"), summary_done = false;
   for (struct dom_node *c = node->first_child; c; c = c->next) {
     if (closed) { /* a closed <details> shows only its first <summary> */
@@ -496,10 +524,6 @@ void walk(struct dom_node *node)
         continue;
       summary_done = true;
     }
-    if (c->type == DOM_TEXT) {
-      if (c->text)
-        emit_text(c->text);
-    } else
-      walk_element(c);
+    walk_child(c);
   }
 }

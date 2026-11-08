@@ -285,6 +285,177 @@ static void test_dialog_and_popover_ua(void)
   expect(st.bg == -1 && st.border_w[0] == -1);
 }
 
+/* :host styles the shadow host only from its own shadow sheet; inside the tree it works as an ancestor */
+static void test_host_selectors(void)
+{
+  css_sheet *sh =
+      sheet(":host { color: red } :host(.on) { color: blue } div { color: green } :host .a { color: pink }");
+  struct dom_node *host = el("x-host"), *root = el("#shadow-root"), *inner = cls(el("div"), "a"), *plain = el("div");
+  struct css_style st;
+  root->host = host;
+  host->shadow = root;
+  append(root, inner);
+  append(root, plain);
+  doc(host);
+
+  css_set_scope(host, true);
+  css_style_reset(&st);
+  css_apply_sheet(sh, host, &st);
+  expect(st.color == 0xff0000);
+  css_set_scope(0, false);
+
+  css_style_reset(&st);
+  css_apply_sheet(sh, host, &st);
+  expect(st.color == -1); /* the page's own pass never sees :host */
+
+  struct dom_node *host2 = cls(el("x-host"), "on");
+  doc(host2);
+  css_set_scope(host2, true);
+  css_style_reset(&st);
+  css_apply_sheet(sh, host2, &st);
+  expect(st.color == 0x0000ff); /* :host(.on) comes later and matches */
+  css_set_scope(host, true);
+  css_style_reset(&st);
+  css_apply_sheet(sh, plain, &st);
+  expect(st.color == -1); /* host-only mode skips every other rule */
+
+  css_set_scope(host, false);
+  css_style_reset(&st);
+  css_apply_sheet(sh, plain, &st);
+  expect(st.color == 0x008000);
+  css_style_reset(&st);
+  css_apply_sheet(sh, inner, &st);
+  expect(st.color == 0xffc0cb); /* :host .a reaches the host through the shadow root */
+  css_set_scope(0, false);
+  css_free(sh);
+}
+
+/* Attribute selectors and :not() with attribute or list arguments */
+static void test_attribute_selectors(void)
+{
+  struct dom_node *a = el("a"), *b = el("div"), *c = el("span");
+  set_attr(a, "href", "https://x.test/docs/page.html");
+  set_attr(a, "rel", "nofollow external");
+  set_attr(a, "lang", "en-GB");
+  set_attr(b, "data-mode", "Dark");
+  doc(a);
+  doc(b);
+  doc(c);
+  const struct {
+    const char *sel;
+    int on_a, on_b, on_c;
+  } cases[] = {
+      {"a[href]", 1, 0, 0},
+      {"[href]", 1, 0, 0},
+      {"[href=\"https://x.test/docs/page.html\"]", 1, 0, 0},
+      {"[href='nope']", 0, 0, 0},
+      {"[href^=https]", 1, 0, 0},
+      {"[href$='.html']", 1, 0, 0},
+      {"[href*=docs]", 1, 0, 0},
+      {"[rel~=external]", 1, 0, 0},
+      {"[rel~=extern]", 0, 0, 0},
+      {"[lang|=en]", 1, 0, 0},
+      {"[data-mode=dark]", 0, 0, 0},
+      {"[data-mode=dark i]", 0, 1, 0},
+      {"[data-mode='Dark']", 0, 1, 0},
+      {"[ href ]", 1, 0, 0},
+      {"[href^='']", 0, 0, 0},
+      {"div:not([data-mode])", 0, 0, 0},
+      {":not([href])", 0, 1, 1},
+      {":not(a, div)", 0, 0, 1},
+      {"span:not([href]):not(.x)", 0, 0, 1},
+  };
+  for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    char rule[128];
+    snprintf(rule, sizeof rule, "%s { color: red }", cases[i].sel);
+    css_sheet *sh = sheet(rule);
+    expect(matches_any(sh, a) == cases[i].on_a);
+    expect(matches_any(sh, b) == cases[i].on_b);
+    expect(matches_any(sh, c) == cases[i].on_c);
+    css_free(sh);
+  }
+}
+
+/* A shadow sheet's own custom properties win inside it and never reach the page or another shadow sheet */
+static void test_scoped_custom_properties(void)
+{
+  css_sheet *page = sheet(":root { --c: red; --d: green } p { color: var(--c) } b { color: var(--d) }");
+  css_sheet *one = sheet(":host { --c: blue } p { color: var(--c) } b { color: var(--d) }");
+  css_sheet *two = sheet("p { color: var(--c, black) }");
+  struct dom_node *p = el("p");
+  struct dom_node *b = el("b");
+  struct css_style st;
+  doc(p);
+  doc(b);
+  css_set_primary(page);
+  css_style_reset(&st);
+  css_apply_sheet(page, p, &st);
+  expect(st.color == 0xff0000);
+  css_style_reset(&st);
+  css_apply_sheet(one, p, &st);
+  expect(st.color == 0x0000ff);
+  css_style_reset(&st);
+  css_apply_sheet(one, b, &st);
+  expect(st.color == 0x008000); /* not declared locally: the page's value */
+  css_style_reset(&st);
+  css_apply_sheet(two, p, &st);
+  expect(st.color == 0xff0000); /* the other shadow sheet's --c did not leak; the page's is seen */
+  css_style_reset(&st);
+  css_apply_sheet(page, p, &st);
+  expect(st.color == 0xff0000);
+  css_set_primary(0);
+  css_free(page);
+  css_free(one);
+  css_free(two);
+}
+
+/* ::slotted() styles assigned light children from the shadow sheet; ::part() styles shadow elements from outside */
+static void test_slotted_and_part(void)
+{
+  struct dom_node *host = el("x-h"), *root = el("#shadow-root"), *wrap = cls(el("div"), "w"), *slot = el("slot");
+  struct dom_node *e1 = cls(el("span"), "k"), *e2 = el("span"), *btn = el("button"), *plain = el("button");
+  struct css_style st;
+  set_attr(slot, "name", "a");
+  set_attr(e1, "slot", "a");
+  set_attr(btn, "part", "btn big");
+  root->host = host;
+  host->shadow = root;
+  append(root, wrap);
+  append(wrap, slot);
+  append(wrap, btn);
+  append(wrap, plain);
+  append(host, e1);
+  append(host, e2);
+  doc(host);
+
+  css_sheet *inner =
+      sheet("::slotted(span) { color: red } .w ::slotted(.k) { color: blue } slot::slotted(b) { color: lime }");
+  css_set_scope(host, CSS_SCOPE_SLOTTED);
+  css_style_reset(&st);
+  css_apply_sheet(inner, e1, &st);
+  expect(st.color == 0x0000ff); /* the more specific rule, whose ancestor matches the slot's */
+  css_style_reset(&st);
+  css_apply_sheet(inner, e2, &st);
+  expect(st.color == -1); /* no slot takes an unnamed child here */
+  css_set_scope(host, CSS_SCOPE_NORMAL);
+  css_style_reset(&st);
+  css_apply_sheet(inner, e1, &st);
+  expect(st.color == -1); /* normal pass ignores ::slotted rules */
+
+  css_sheet *outer =
+      sheet("x-h::part(btn) { color: pink } x-h::part(btn big) { background: black } x-h::part(nope) { color: lime }");
+  css_set_scope(host, CSS_SCOPE_PART);
+  css_style_reset(&st);
+  css_apply_sheet(outer, btn, &st);
+  expect(st.color == 0xffc0cb && st.bg == 0);
+  css_style_reset(&st);
+  css_apply_sheet(outer, plain, &st);
+  expect(st.color == -1 && st.bg == -1);
+  css_set_scope(0, CSS_SCOPE_NORMAL);
+  css_free(inner);
+  css_free(outer);
+}
+
 int main(void)
 {
   test("complex :is selectors", test_complex_is_selectors);
@@ -298,6 +469,10 @@ int main(void)
   test("id and tag selector keys", test_id_and_tag_selector);
   test("popover and dialog state selectors", test_popover_and_dialog_state);
   test("dialog and popover UA box", test_dialog_and_popover_ua);
+  test(":host selectors", test_host_selectors);
+  test("attribute selectors", test_attribute_selectors);
+  test("scoped custom properties", test_scoped_custom_properties);
+  test("::slotted and ::part", test_slotted_and_part);
 
   free_dom();
   return 0;

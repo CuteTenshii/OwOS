@@ -2,14 +2,11 @@
    Dynamic pseudo-classes never match in a static render; descendant matching is greedy. */
 #include "engine_int.h"
 
-/* custom-property table, built per active sheet */
-static struct css_var {
-  char *name, *val;
-} *g_vars;
-static int g_nvars, g_vars_cap;
+/* custom-property tables: the primary (page) sheet's, plus the applying shadow sheet's own */
+static struct var_table g_tab, *g_local;
 css_sheet *g_vars_sheet;
 int g_vars_gen = -1;
-static unsigned g_vars_serial; /* bumped whenever the table is rebuilt or dropped */
+static unsigned g_vars_serial; /* bumped whenever a table is rebuilt or dropped */
 static void resolve_vars(const char *in, int inlen, char *out, int *on, int cap, int depth);
 
 /* Viewport the @media features test against. */
@@ -272,12 +269,17 @@ static bool var_name_is(const struct css_var *v, const char *name, int len)
 {
   return (int)strlen(v->name) == len && memcmp(v->name, name, (unsigned)len) == 0;
 }
+static const char *table_lookup(const struct var_table *t, const char *name, int len)
+{
+  for (int i = 0; i < t->n; i++)
+    if (var_name_is(&t->v[i], name, len))
+      return t->v[i].val;
+  return 0;
+}
 static const char *var_lookup(const char *name, int len)
 {
-  for (int i = 0; i < g_nvars; i++)
-    if (var_name_is(&g_vars[i], name, len))
-      return g_vars[i].val;
-  return 0;
+  const char *v = g_local ? table_lookup(g_local, name, len) : 0;
+  return v ? v : table_lookup(&g_tab, name, len);
 }
 static char *dup_span(const char *s, int n)
 {
@@ -288,50 +290,63 @@ static char *dup_span(const char *s, int n)
   d[n] = '\0';
   return d;
 }
+static void table_clear(struct var_table *t)
+{
+  for (int i = 0; i < t->n; i++) {
+    free(t->v[i].name);
+    free(t->v[i].val);
+  }
+  t->n = 0;
+}
 void vars_clear(void)
 {
-  for (int i = 0; i < g_nvars; i++) {
-    free(g_vars[i].name);
-    free(g_vars[i].val);
-  }
-  g_nvars = 0;
+  table_clear(&g_tab);
   g_vars_serial++;
 }
-static void var_store(const char *name, int nlen, const char *val, int vlen)
+void sheet_vars_free(css_sheet *sh)
+{
+  table_clear(&sh->lvars);
+  free(sh->lvars.v);
+  sh->lvars.v = 0;
+  sh->lvars.cap = 0;
+  if (g_local == &sh->lvars)
+    g_local = 0;
+}
+static void var_store(struct var_table *t, const char *name, int nlen, const char *val, int vlen)
 {
   if (nlen <= 0)
     return;
   char *nv = dup_span(val, vlen);
   if (!nv)
     return;
-  for (int i = 0; i < g_nvars; i++)
-    if (var_name_is(&g_vars[i], name, nlen)) {
-      free(g_vars[i].val);
-      g_vars[i].val = nv;
+  for (int i = 0; i < t->n; i++)
+    if (var_name_is(&t->v[i], name, nlen)) {
+      free(t->v[i].val);
+      t->v[i].val = nv;
       return;
     }
-  if (g_nvars >= g_vars_cap) {
-    int nc = g_vars_cap ? g_vars_cap * 2 : 64;
-    struct css_var *nvs = realloc(g_vars, (unsigned)nc * sizeof *nvs);
+  if (t->n >= t->cap) {
+    int nc = t->cap ? t->cap * 2 : 64;
+    struct css_var *nvs = realloc(t->v, (unsigned)nc * sizeof *nvs);
     if (!nvs) {
       free(nv);
       return;
     }
-    g_vars = nvs;
-    g_vars_cap = nc;
+    t->v = nvs;
+    t->cap = nc;
   }
   char *nn = dup_span(name, nlen);
   if (!nn) {
     free(nv);
     return;
   }
-  g_vars[g_nvars].name = nn;
-  g_vars[g_nvars].val = nv;
-  g_nvars++;
+  t->v[t->n].name = nn;
+  t->v[t->n].val = nv;
+  t->n++;
 }
 
 /* Pull every `--name: value` declaration out of `raw` into the table. */
-static void vars_from_raw(const char *raw)
+static void vars_from_raw(struct var_table *t, const char *raw)
 {
   const char *p = raw;
   while (*p) {
@@ -350,22 +365,50 @@ static void vars_from_raw(const char *raw)
         vs++;
       while (ve > vs && ve[-1] == ' ')
         ve--;
-      var_store(seg, (int)(colon - seg), vs, (int)(ve - vs));
+      var_store(t, seg, (int)(colon - seg), vs, (int)(ve - vs));
     }
     if (*p == ';')
       p++;
   }
 }
-static void ensure_vars(css_sheet *sh)
+static css_sheet *g_vars_primary;
+
+void css_set_primary(css_sheet *sh) { g_vars_primary = sh; }
+void vars_forget_sheet(css_sheet *sh)
 {
-  if (sh == g_vars_sheet && sh->gen == g_vars_gen)
-    return;
-  vars_clear();
+  if (sh == g_vars_primary)
+    g_vars_primary = 0;
+  sheet_vars_free(sh);
+}
+
+static void vars_load(struct var_table *t, css_sheet *sh)
+{
   for (struct css_rule *r = sh->head; r; r = r->next)
     if (media_matches(r->media))
-      vars_from_raw(r->raw); /* active rules only */
-  g_vars_sheet = sh;
-  g_vars_gen = sh->gen;
+      vars_from_raw(t, r->raw); /* active rules only */
+}
+
+/* The global table holds the primary sheet's variables; any other sheet resolves against its own first */
+static void ensure_vars(css_sheet *sh)
+{
+  css_sheet *prim = g_vars_primary ? g_vars_primary : sh;
+  if (!(prim == g_vars_sheet && prim->gen == g_vars_gen)) {
+    vars_clear();
+    vars_load(&g_tab, prim);
+    g_vars_sheet = prim;
+    g_vars_gen = prim->gen;
+  }
+  if (sh == prim) {
+    g_local = 0;
+    return;
+  }
+  if (sh->lvars_gen != sh->gen) {
+    table_clear(&sh->lvars);
+    vars_load(&sh->lvars, sh);
+    sh->lvars_gen = sh->gen;
+    g_vars_serial++;
+  }
+  g_local = &sh->lvars;
 }
 
 bool str_uses_var(const char *s)
@@ -660,16 +703,43 @@ static int collect_candidates(css_sheet *sh, const struct dom_node *el)
   return failed ? -1 : n;
 }
 
+void css_set_scope(const struct dom_node *host, int mode)
+{
+  g_css_scope_host = host;
+  g_css_mode = mode;
+}
+
 /* Rules matching an element, lowest cascade priority first; `pseudo` selects ::before/::after. */
 static int collect_matches(css_sheet *sh, const struct dom_node *el, int pseudo)
 {
-  int nc = collect_candidates(sh, el), nm = 0;
+  int nc, nm = 0;
+  if (g_css_mode >= CSS_SCOPE_SLOTTED) { /* ::slotted / ::part rules aren't keyed by `el`: scan them all */
+    nc = 0;
+    for (struct css_rule *r = sh->head; r; r = r->next)
+      if (r->sel.step[r->sel.n - 1].pseudo_el == (g_css_mode == CSS_SCOPE_SLOTTED ? PE_SLOTTED : PE_PART)) {
+        if (!rule_ptr_room(&sh->cand, &sh->cand_cap, nc + 1))
+          return -1;
+        sh->cand[nc++] = r;
+      }
+  } else {
+    nc = collect_candidates(sh, el);
+  }
   if (nc < 0)
     return -1;
   for (int i = 0; i < nc; i++) {
     struct css_rule *r = sh->cand[i];
-    if (!media_matches(r->media) ||
-        !(pseudo ? selector_match_pseudo(&r->sel, el, pseudo) : selector_match(&r->sel, el)))
+    bool ok;
+    if (!media_matches(r->media))
+      continue;
+    if (g_css_mode == CSS_SCOPE_SLOTTED)
+      ok = selector_match_slotted(&r->sel, el);
+    else if (g_css_mode == CSS_SCOPE_PART)
+      ok = selector_match_part(&r->sel, el);
+    else if (g_css_mode == CSS_SCOPE_HOST_ONLY)
+      ok = selector_subject_is_host(&r->sel) && selector_match(&r->sel, el);
+    else
+      ok = pseudo ? selector_match_pseudo(&r->sel, el, pseudo) : selector_match(&r->sel, el);
+    if (!ok)
       continue;
     if (!rule_ptr_room(&sh->match, &sh->match_cap, nm + 1))
       return -1;

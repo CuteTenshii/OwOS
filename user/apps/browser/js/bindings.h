@@ -232,6 +232,12 @@ const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap
 struct dom_node *doc_root_of(js_value t);
 js_value wrap_document(js_ctx *ctx, struct dom_node *root);
 void xpath_install(js_ctx *ctx, js_object *win);
+void shadow_install(js_ctx *ctx, js_object *win);
+void shadow_node_inserted(struct dom_node *c);
+void shadow_node_removing(struct dom_node *c);
+char *document_adopted_css(void);
+extern js_object *g_shadowroot_proto;
+struct dom_node *js_dom_find_id(struct dom_node *root, const char *id);
 void namespace_install(void);
 int decode_entity(const char *p, const char *end, int *adv); /* html_entities.c */
 
@@ -247,6 +253,7 @@ js_value el_get_sheet(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_style(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value ev_prevent(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value ev_stop(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value ev_composed_path(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 js_value eventtarget_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
