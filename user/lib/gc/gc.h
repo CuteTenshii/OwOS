@@ -79,6 +79,22 @@ void gc_push_scope(void);
 void gc_pop_scope(void);
 void *gc_keep(void *obj);
 
+/* Coroutine support: a suspended coroutine's handle scopes must leave the shared
+ * LIFO stack while another context runs. gc_scope_pos() reads the current
+ * handle/scope depths; gc_scope_take() moves everything pushed above that mark
+ * into `st`; gc_scope_put() pushes it back on top of whatever is there now. The
+ * owner traces a parked `st` with gc_scope_trace() from its own tracer. */
+typedef struct {
+  void **h;
+  int *s;
+  int nh, ns;
+} gc_stash;
+void gc_scope_pos(int *nh, int *ns);
+void gc_scope_take(int nh, int ns, gc_stash *st);
+void gc_scope_put(gc_stash *st);
+void gc_scope_trace(const gc_stash *st);
+void gc_scope_drop(gc_stash *st);
+
 /* Force a full collection now; returns the number of payload bytes reclaimed.
  */
 unsigned gc_collect(void);

@@ -289,6 +289,12 @@ static void trace(void *obj, int kind)
     }
     if (o->kind == OBJ_TYPEDARRAY && o->host)
       gc_mark(((js_typedarray *)o->host)->buffer);
+    if (o->kind == OBJ_GENERATOR && o->host) {
+      js_generator *g = (js_generator *)o->host;
+      gc_mark(g->env);
+      mark_value(g->xfer);
+      gc_scope_trace(&g->parked);
+    }
   }
 }
 
@@ -326,6 +332,12 @@ static void finalize(void *obj, int kind)
     }
     if (o->kind == OBJ_TYPEDARRAY && o->host)
       free(o->host); /* the view; its buffer is GC'd separately */
+    if (o->kind == OBJ_GENERATOR && o->host) {
+      js_generator *g = (js_generator *)o->host;
+      gc_scope_drop(&g->parked);
+      free(g->stack);
+      free(g);
+    }
     if (o->kind == OBJ_HOST && o->host && js_host_finalizer)
       js_host_finalizer(o);
   }
@@ -448,7 +460,9 @@ js_object *js_new_function(js_ctx *ctx, js_node *node, js_env *closure)
   f->name = node && node->u.func.name ? node->u.func.name : "";
   o->fn = f;
   /* non-arrow functions get a fresh .prototype object with a back-ref */
-  if (!f->is_arrow) {
+  if (node && node->u.func.is_generator) {
+    js_def(o, "prototype", js_obj_value(js_new_object(ctx, ctx->generator_proto)), P_WRITABLE);
+  } else if (!f->is_arrow) {
     js_object *proto = js_new_object(ctx, ctx->object_proto);
     js_def(proto, "constructor", js_obj_value(o), P_WRITABLE | P_CONFIGURABLE);
     js_def(o, "prototype", js_obj_value(proto), P_WRITABLE);

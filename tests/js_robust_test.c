@@ -246,6 +246,80 @@ static void check_promise_gc(void)
   gc_set_threshold(1 << 20);
 }
 
+static void check_generators(void)
+{
+  expect(run(
+      "function* g(a){ var x = yield a; var y = yield x + 1; return x + y }\n"
+      "var it = g(1), r = it.next();\n"
+      "expect(r.value===1 && r.done===false, 'first yield');\n"
+      "r = it.next(10); expect(r.value===11 && !r.done, 'sent value comes back from yield');\n"
+      "r = it.next(5); expect(r.value===15 && r.done===true, 'return value ends it');\n"
+      "r = it.next(); expect(r.value===undefined && r.done===true, 'finished generator stays done');\n"
+      "function* nat(){ var i = 0; while (true) yield i++ }\n"
+      "var n = nat(), s = 0; for (var v of n) { if (v > 4) break; s += v }\n"
+      "expect(s===10, 'infinite generator under for-of break');\n"
+      "expect([...(function*(){ yield 1; yield* [2,3]; yield* (function*(){ yield 4; return 5 })() "
+      "})()].join()==='1,2,3,4',"
+      " 'spread and yield*');\n"
+      "var d = (function*(){ var r = yield* (function*(){ yield 1; return 'in' })(); yield r })();\n"
+      "d.next(); expect(d.next().value==='in', 'yield* evaluates to the delegate return value');\n"
+      "var o = { *[Symbol.iterator](){ yield 'a'; yield 'b' } };\n"
+      "expect(Array.from(o).join('')==='ab', 'generator method as Symbol.iterator');\n"
+      "class K { *items(){ yield this.v } constructor(){ this.v = 7 } }\n"
+      "expect(new K().items().next().value===7, 'this inside a generator method');\n"
+      "var gt = nat(); expect(gt[Symbol.iterator]()===gt && Object.prototype.toString.call(gt)==='[object Generator]',"
+      " 'iterator protocol surface');\n",
+      0));
+  expect(run("var log = [];\n"
+             "function* g(){ try { yield 1; yield 2 } catch (e) { log.push('c' + e); yield 'recovered' } finally { "
+             "log.push('f') } }\n"
+             "var it = g(); it.next();\n"
+             "expect(it.throw('x').value==='recovered', 'throw() is caught by the body');\n"
+             "it.next(); expect(log.join()==='cx,f', 'finally ran');\n"
+             "var r = g(); r.next();\n"
+             "var out = r.return(9); expect(out.value===9 && out.done===true, 'return() ends the generator');\n"
+             "expect(log.join()==='cx,f,f', 'return() runs finally but not catch');\n"
+             "var u = g(); var res = u.return(3); expect(res.value===3 && res.done, 'return() before start');\n"
+             "var t = g(); var threw = false; try { t.throw('boom') } catch (e) { threw = e==='boom' }\n"
+             "expect(threw && t.next().done, 'throw() before start rejects and finishes');\n"
+             "function* bad(){ yield 1; throw new Error('in body') }\n"
+             "var b = bad(); b.next(); var msg = ''; try { b.next() } catch (e) { msg = e.message }\n"
+             "expect(msg==='in body' && b.next().done, 'a throw out of the body propagates');\n"
+             "function* self(){ yield it2.next() } var it2 = self(); var re = '';\n"
+             "try { it2.next() } catch (e) { re = e.name }\n"
+             "expect(re==='TypeError', 'resuming a running generator throws');\n"
+             "log = []; function* inner(){ try { yield 1; yield 2 } finally { log.push('inner') } }\n"
+             "for (var x of inner()) break; expect(log.join()==='inner', 'for-of break closes the iterator');\n"
+             "function* outer(){ try { yield* inner() } finally { log.push('outer') } }\n"
+             "log = []; var o = outer(); o.next(); o.return(); expect(log.join()==='inner,outer', 'return() through "
+             "yield*');\n",
+             0));
+}
+
+static void check_generator_gc(void)
+{
+  gc_set_threshold(1);
+  expect(
+      run("function* g(n){ var keep = {n: n}; for (var i = 0; i < 20; i++) { var o = {i: i, s: 'v' + i}; yield o; }\n"
+          "  return keep }\n"
+          "var gens = [], total = 0;\n"
+          "for (var k = 0; k < 20; k++) gens.push(g(k));\n"
+          "for (var round = 0; round < 20; round++) for (var k = 0; k < 20; k++) { var r = gens[k].next();\n"
+          "  total += r.value.i + r.value.s.length }\n"
+          "var last = gens[3].next(); expect(last.done && last.value.n===3, 'parked locals survive collection');\n"
+          "expect(total===20*240, 'every parked yield delivered its value intact');\n"
+          "for (var j = 0; j < 200; j++) { var abandoned = g(j); abandoned.next() }\n",
+          0));
+  gc_set_threshold(1 << 20);
+}
+
+static void check_generator_stack_guard(void)
+{
+  expect(run("function* r(){ function f(){ return f() + 1 } try { f() } catch (e) { yield e instanceof RangeError } }\n"
+             "expect(r().next().value===true, 'runaway recursion inside a generator throws RangeError');\n",
+             0));
+}
+
 int main(void)
 {
   test("regexp matches whole code points, not bytes", check_regexp_code_points);
@@ -259,5 +333,8 @@ int main(void)
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);
   test("parser honours the stack floor", check_parser_stack_floor);
+  test("generators", check_generators);
+  test("generator state survives collection", check_generator_gc);
+  test("generator bodies are stack-guarded", check_generator_stack_guard);
   return 0;
 }

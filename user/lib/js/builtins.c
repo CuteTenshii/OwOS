@@ -9402,5 +9402,6 @@ void js_setup_builtins(js_ctx *ctx)
   js_def(ctx->global, "globalThis", js_obj_value(ctx->global), P_WRITABLE | P_CONFIGURABLE);
 
   setup_intl(ctx);
+  js_setup_generators(ctx);
   gc_pop_scope();
 }

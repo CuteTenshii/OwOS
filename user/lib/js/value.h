@@ -17,6 +17,7 @@
 #endif
 
 #include "bigint.h" /* the bignum behind the JV_BIGINT primitive    */
+#include "gc.h"     /* gc_stash, for a suspended generator's pinned locals */
 
 struct js_node;               /* ast.h — function bodies are AST nodes        */
 typedef struct js_ctx js_ctx; /* interp.h — the engine context                */
@@ -48,7 +49,8 @@ enum {
   OBJ_TYPEDARRAY,
   OBJ_BIGINT,
   OBJ_PROXY,
-  OBJ_HOST /* embedder object: `host` is freed through js_host_finalizer */
+  OBJ_HOST,     /* embedder object: `host` is freed through js_host_finalizer */
+  OBJ_GENERATOR /* host: js_generator, a coroutine running a generator body */
 };
 
 /* typed-array element kinds (index into ta_elem_size). DataView uses type -1.
@@ -67,6 +69,23 @@ typedef struct {
   js_object *buffer;
   int type, offset, length;
 } js_typedarray;
+
+/* OBJ_GENERATOR host: the body runs on its own native stack and is switched in
+ * and out by next/throw/return (interp.c). */
+enum { GEN_START, GEN_SUSPENDED, GEN_RUNNING, GEN_DONE };
+enum { GEN_NEXT, GEN_THROW, GEN_RETURN };
+typedef struct js_generator {
+  js_ctx *ctx;
+  js_object *self;
+  struct js_node *node; /* the JS_FUNC being run                             */
+  js_env *env;          /* function scope at start, current scope while parked */
+  js_value xfer;        /* value crossing a switch: sent in, or yielded/returned out */
+  void *sp, *caller_sp; /* saved stack pointers of the body and of its resumer */
+  char *stack;
+  gc_stash parked; /* handle scopes of the body while it is suspended    */
+  int stash_nh, stash_ns;
+  unsigned char state, mode;
+} js_generator;
 
 /* Called when an OBJ_HOST object is collected; release o->host here. */
 extern void (*js_host_finalizer)(js_object *o);

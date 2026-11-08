@@ -677,12 +677,13 @@ static int is_assign_op(int k) { return k == T_EQ || (k >= T_PLUS_EQ && k <= T_Q
 static js_node *finish_arrow(js_parser *p, js_node **params, int nparams, int line, int col)
 {
   js_node *fn = js_node_new(p->arena, JS_FUNC, line, col);
-  int saved = p->in_async;
+  int saved = p->in_async, saved_gen = p->in_generator;
   fn->u.func.is_arrow = 1;
   fn->u.func.is_async = p->pending_async;
   fn->u.func.params = params;
   fn->u.func.nparams = nparams;
   p->in_async = p->pending_async; /* await is a keyword in an async arrow */
+  p->in_generator = 0;            /* an arrow can't yield for its enclosing generator */
   p->pending_async = 0;
   if (at(p, T_LBRACE)) {
     fn->u.func.body = parse_block(p);
@@ -692,6 +693,7 @@ static js_node *finish_arrow(js_parser *p, js_node **params, int nparams, int li
     fn->u.func.is_expr_body = 1;
   }
   p->in_async = saved;
+  p->in_generator = saved_gen;
   return p->failed ? NULL : fn;
 }
 

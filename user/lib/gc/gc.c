@@ -537,6 +537,56 @@ void *gc_keep(void *obj)
   return obj;
 }
 
+void gc_scope_pos(int *nh, int *ns)
+{
+  *nh = nhandles;
+  *ns = nscopes;
+}
+
+void gc_scope_take(int nh, int ns, gc_stash *st)
+{
+  st->nh = nhandles - nh;
+  st->ns = nscopes - ns;
+  st->h = st->nh ? malloc((unsigned)st->nh * sizeof *st->h) : NULL;
+  st->s = st->ns ? malloc((unsigned)st->ns * sizeof *st->s) : NULL;
+  if ((st->nh && !st->h) || (st->ns && !st->s))
+    gc_oom();
+  for (int i = 0; i < st->nh; i++)
+    st->h[i] = handles[nh + i];
+  for (int i = 0; i < st->ns; i++)
+    st->s[i] = scopes[ns + i] - nh;
+  nhandles = nh;
+  nscopes = ns;
+}
+
+void gc_scope_put(gc_stash *st)
+{
+  int base = nhandles;
+  if (!grow((void ***)&handles, &caphandles, nhandles + st->nh) ||
+      !grow((void ***)&scopes, &capscopes, nscopes + st->ns))
+    gc_oom();
+  for (int i = 0; i < st->nh; i++)
+    handles[nhandles++] = st->h[i];
+  for (int i = 0; i < st->ns; i++)
+    scopes[nscopes++] = st->s[i] + base;
+  gc_scope_drop(st);
+}
+
+void gc_scope_trace(const gc_stash *st)
+{
+  for (int i = 0; i < st->nh; i++)
+    gc_mark(st->h[i]);
+}
+
+void gc_scope_drop(gc_stash *st)
+{
+  free(st->h);
+  free(st->s);
+  st->h = NULL;
+  st->s = NULL;
+  st->nh = st->ns = 0;
+}
+
 /* --------------------------------------------------------------------- misc */
 unsigned gc_bytes(void) { return young_bytes + old_bytes; }
 void gc_get_stats(gc_stats_t *out)

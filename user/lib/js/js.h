@@ -25,7 +25,7 @@
  * parser rejects, rather than silently misbehaving):
  *   - RegExp matching: a /re/ literal evaluates to a placeholder object with
  *     .source/.flags but no .test/.exec engine yet.
- *   - generators / yield, async / await / Promise   (need coroutines).
+ *   - async / await / Promise                         (need coroutines).
  *   - ES modules: import / export                    (separate loader).
  *   - Date, Map/Set, Symbol, Proxy/Reflect, typed arrays.
  *

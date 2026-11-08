@@ -83,6 +83,7 @@ static void bind_pattern(js_ctx *ctx, js_node *pat, js_value val, int declare, u
 static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_value *args, int argc);
 static js_object *super_home_proto(js_ctx *ctx);
 static int get_iterator(js_ctx *ctx, js_value v, js_value *iter);
+static js_value eval_yield(js_ctx *ctx, js_node *n);
 static int iterator_step(js_ctx *ctx, js_value iter, js_value *value);
 
 /* a small public shim so builtins.c can read own props without the static map
@@ -1975,7 +1976,7 @@ static js_value evaluate(js_ctx *ctx, js_node *n)
     return js_undef(); /* pending (no event loop) -> undefined */
   }
   case JS_YIELD:
-    return js_throw_type(ctx, "yield needs generator runtime (not yet implemented)");
+    return eval_yield(ctx, n);
   case JS_CLASS:
     return eval_class(ctx, n);
   case JS_SUPER: {
@@ -2430,6 +2431,28 @@ static int iterator_step(js_ctx *ctx, js_value iter, js_value *value)
   return !ctx->has_exc;
 }
 
+/* Call iter.return() when a loop leaves early; a throw already in flight wins over one from return(). */
+static void iterator_close(js_ctx *ctx, js_value iter)
+{
+  int had = ctx->has_exc, unwind = ctx->gen_unwind;
+  js_value ex = ctx->exc, rf;
+  void *root = ctx->exc_root;
+  gc_push_scope();
+  KEEP(ex);
+  ctx->has_exc = 0;
+  ctx->gen_unwind = 0;
+  rf = js_get(ctx, iter, "return");
+  if (!ctx->has_exc && js_is_callable(rf))
+    js_call(ctx, rf, iter, NULL, 0);
+  if (had) {
+    ctx->has_exc = 1;
+    ctx->exc = ex;
+    ctx->exc_root = root;
+    ctx->gen_unwind = unwind;
+  }
+  gc_pop_scope();
+}
+
 static completion exec_for_in(js_ctx *ctx, js_node *n, const char *label)
 {
   js_value rhs = evaluate(ctx, n->u.forin.right);
@@ -2465,6 +2488,7 @@ static completion exec_for_in(js_ctx *ctx, js_node *n, const char *label)
           js_throw_type(ctx, "value is not iterable");
         return cnorm();
       }
+      int early = 0;
       gc_push_scope();
       KEEP(iter);
       while (!ctx->has_exc && iterator_step(ctx, iter, &item)) {
@@ -2478,9 +2502,13 @@ static completion exec_for_in(js_ctx *ctx, js_node *n, const char *label)
         result = ctx->has_exc ? cnorm() : exec_loop_body(ctx, n->u.forin.body, label, &brk);
         ctx->cur_env = saved;
         gc_pop_scope();
-        if (ctx->has_exc || result.kind != C_NORMAL || brk)
+        if (ctx->has_exc || result.kind != C_NORMAL || brk) {
+          early = 1;
           break;
+        }
       }
+      if (early)
+        iterator_close(ctx, iter);
       gc_pop_scope();
     }
   } else if (rhs.type == JV_OBJ) { /* for...in */
@@ -2605,7 +2633,7 @@ static completion exec_try(js_ctx *ctx, js_node *n)
 {
   completion c;
   c = exec_stmt(ctx, n->u.tc.block, NULL);
-  if (ctx->has_exc && n->u.tc.handler) {
+  if (ctx->has_exc && n->u.tc.handler && !ctx->gen_unwind) {
     js_value ex = ctx->exc;
     js_env *saved = ctx->cur_env;
     ctx->has_exc = 0;
@@ -2624,8 +2652,10 @@ static completion exec_try(js_ctx *ctx, js_node *n)
     int had = ctx->has_exc;
     js_value saved_exc = ctx->exc;
     void *saved_root = ctx->exc_root;
+    int unwind = ctx->gen_unwind;
     completion fc;
     ctx->has_exc = 0;
+    ctx->gen_unwind = 0;
     ctx->exc_root = NULL;
     fc = exec_stmt(ctx, n->u.tc.finalizer, NULL);
     if (ctx->has_exc)
@@ -2636,6 +2666,7 @@ static completion exec_try(js_ctx *ctx, js_node *n)
       ctx->has_exc = 1;
       ctx->exc = saved_exc;
       ctx->exc_root = saved_root;
+      ctx->gen_unwind = unwind;
     }
   }
   return c;
@@ -2899,6 +2930,357 @@ static completion exec_stmt(js_ctx *ctx, js_node *n, const char *label)
   }
 }
 
+/* ------------------------------------------------------- generators ------ */
+
+/* A generator body runs on its own malloc'd native stack, switched in and out by
+ * next/throw/return, so `yield` can sit anywhere in an expression or statement
+ * without a resumable evaluator. */
+#define GEN_STACK_BYTES (sizeof(void *) > 4 ? 512 * 1024 : 128 * 1024)
+#define GEN_STACK_HEADROOM 32768 /* kept clear below the JS stack limit for natives and the throw path */
+
+__attribute__((naked, noinline)) static void coro_switch(void **save, void *to)
+{
+#if defined(__x86_64__)
+  __asm__("pushq %rbp\n\tpushq %rbx\n\tpushq %r12\n\tpushq %r13\n\tpushq %r14\n\tpushq %r15\n\t"
+          "movq %rsp, (%rdi)\n\tmovq %rsi, %rsp\n\t"
+          "popq %r15\n\tpopq %r14\n\tpopq %r13\n\tpopq %r12\n\tpopq %rbx\n\tpopq %rbp\n\tret");
+#elif defined(__i386__)
+  __asm__("movl 4(%esp), %eax\n\tmovl 8(%esp), %ecx\n\t"
+          "pushl %ebp\n\tpushl %ebx\n\tpushl %esi\n\tpushl %edi\n\t"
+          "movl %esp, (%eax)\n\tmovl %ecx, %esp\n\t"
+          "popl %edi\n\tpopl %esi\n\tpopl %ebx\n\tpopl %ebp\n\tret");
+#elif defined(__aarch64__)
+  __asm__(
+      "sub sp, sp, #160\n\t"
+      "stp x19, x20, [sp, #0]\n\tstp x21, x22, [sp, #16]\n\tstp x23, x24, [sp, #32]\n\t"
+      "stp x25, x26, [sp, #48]\n\tstp x27, x28, [sp, #64]\n\tstp x29, x30, [sp, #80]\n\t"
+      "stp d8, d9, [sp, #96]\n\tstp d10, d11, [sp, #112]\n\tstp d12, d13, [sp, #128]\n\tstp d14, d15, [sp, #144]\n\t"
+      "mov x9, sp\n\tstr x9, [x0]\n\tmov sp, x1\n\t"
+      "ldp x19, x20, [sp, #0]\n\tldp x21, x22, [sp, #16]\n\tldp x23, x24, [sp, #32]\n\t"
+      "ldp x25, x26, [sp, #48]\n\tldp x27, x28, [sp, #64]\n\tldp x29, x30, [sp, #80]\n\t"
+      "ldp d8, d9, [sp, #96]\n\tldp d10, d11, [sp, #112]\n\tldp d12, d13, [sp, #128]\n\tldp d14, d15, [sp, #144]\n\t"
+      "add sp, sp, #160\n\tret");
+#else
+#error "generators need a coro_switch for this architecture"
+#endif
+}
+
+/* Lay out a fresh stack so the first coro_switch into it "returns" into entry. */
+static void *coro_prepare(char *stack, void (*entry)(void))
+{
+  unsigned long top = ((unsigned long)stack + GEN_STACK_BYTES) & ~(unsigned long)15;
+  void **sp;
+#if defined(__x86_64__)
+  sp = (void **)(top - 64); /* r15 r14 r13 r12 rbx rbp entry pad; pad lands at 8 mod 16 */
+  memset(sp, 0, 64);
+  sp[6] = (void *)entry;
+#elif defined(__i386__)
+  sp = (void **)(top - 24); /* edi esi ebx ebp entry pad; pad lands at 12 mod 16 */
+  memset(sp, 0, 24);
+  sp[4] = (void *)entry;
+#else
+  sp = (void **)(top - 160);
+  memset(sp, 0, 160);
+  sp[11] = (void *)entry; /* x30 */
+#endif
+  return sp;
+}
+
+static js_generator *gen_boot;
+
+/* The first switch into a generator lands here; it never returns. */
+static void gen_entry(void)
+{
+  js_generator *g = gen_boot;
+  js_ctx *ctx = g->ctx;
+  js_node *body = g->node->u.func.body;
+  js_value result = js_undef();
+  completion c;
+  int unwinding;
+
+  hoist_vars(ctx, ctx->cur_env, body);
+  hoist_block_funcs(ctx, ctx->cur_env, body);
+  hoist_functions(ctx, body->u.list.items, body->u.list.count);
+  c = exec_list(ctx, body->u.list.items, body->u.list.count);
+  unwinding = ctx->gen_unwind;
+  ctx->gen_unwind = 0;
+  if (!ctx->has_exc) {
+    if (c.kind == C_RETURN)
+      result = c.value;
+  } else if (unwinding) { /* return() reached the end of the unwind */
+    ctx->has_exc = 0;
+    ctx->exc_root = NULL;
+    result = g->xfer;
+  }
+  g->xfer = result;
+  g->state = GEN_DONE;
+  coro_switch(&g->sp, g->caller_sp);
+  for (;;) {
+  }
+}
+
+static js_value iter_result(js_ctx *ctx, js_value v, int done)
+{
+  js_object *r;
+  gc_push_scope();
+  KEEP(v);
+  r = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(r, "value", v, P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+  js_def(r, "done", js_bool(done), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+  gc_pop_scope();
+  return js_obj_value(r);
+}
+
+/* Run the body until its next yield or its end. *done is set when it ended;
+ * a throw out of the body is left pending in ctx. */
+static js_value gen_resume(js_ctx *ctx, js_generator *g, int mode, js_value v, int *done)
+{
+  js_env *saved = ctx->cur_env;
+  js_generator *prev = ctx->cur_gen;
+  char *saved_limit = ctx->stack_limit;
+  int pushed = 0;
+  js_value out;
+
+  gc_push_scope();
+  gc_keep(saved);
+  gc_keep(g->self);
+  KEEP(v);
+  if (!g->stack) {
+    g->stack = (char *)malloc(GEN_STACK_BYTES);
+    if (!g->stack) {
+      gc_pop_scope();
+      return js_throw_range(ctx, "generator: out of memory");
+    }
+    g->sp = coro_prepare(g->stack, gen_entry);
+  }
+  g->mode = (unsigned char)mode;
+  g->xfer = v;
+  gc_write_barrier(g->self);
+  gc_scope_pos(&g->stash_nh, &g->stash_ns);
+  gc_scope_put(&g->parked);
+  if (ctx->nframes < 64) {
+    const char *name = g->node->u.func.name;
+    ctx->frames[ctx->nframes++] = (name && name[0]) ? name : "<anonymous>";
+    pushed = 1;
+  }
+  ctx->cur_env = g->env;
+  ctx->cur_gen = g;
+  js_set_stack_limit(ctx, g->stack + GEN_STACK_HEADROOM);
+  g->state = GEN_RUNNING;
+  gen_boot = g;
+  coro_switch(&g->caller_sp, g->sp);
+  js_set_stack_limit(ctx, saved_limit);
+  ctx->cur_gen = prev;
+  ctx->cur_env = saved;
+  if (pushed)
+    ctx->nframes--;
+  gc_scope_take(g->stash_nh, g->stash_ns, &g->parked);
+  *done = g->state == GEN_DONE;
+  out = g->xfer;
+  if (*done) {
+    free(g->stack);
+    g->stack = NULL;
+    g->env = NULL;
+    g->xfer = js_undef();
+  }
+  gc_write_barrier(g->self);
+  gc_pop_scope();
+  return out;
+}
+
+/* Park the running body and hand `v` to its resumer. Returns the value passed
+ * to the next resume, with *mode saying how it was resumed. */
+static js_value gen_park(js_ctx *ctx, js_value v, int *mode)
+{
+  js_generator *g = ctx->cur_gen;
+  g->env = ctx->cur_env;
+  g->xfer = v;
+  g->state = GEN_SUSPENDED;
+  coro_switch(&g->sp, g->caller_sp);
+  *mode = g->mode;
+  return g->xfer;
+}
+
+/* Begin unwinding the body for a generator.return(v): finally blocks run, catch
+ * clauses do not, and gen_entry reads v back as the return value. */
+static js_value gen_unwind_return(js_ctx *ctx, js_value v)
+{
+  ctx->cur_gen->xfer = v;
+  js_throw(ctx, v);
+  ctx->gen_unwind = 1;
+  return js_undef();
+}
+
+static js_value gen_resumed(js_ctx *ctx, js_value sent, int mode)
+{
+  if (mode == GEN_THROW) {
+    js_throw(ctx, sent);
+    return js_undef();
+  }
+  if (mode == GEN_RETURN)
+    return gen_unwind_return(ctx, sent);
+  return sent;
+}
+
+static js_value eval_yield(js_ctx *ctx, js_node *n)
+{
+  js_value v = js_undef(), sent, iter, res;
+  js_node *arg = n->u.one.arg;
+  int mode = GEN_NEXT;
+
+  if (arg) {
+    v = evaluate(ctx, arg);
+    if (ctx->has_exc)
+      return js_undef();
+  }
+  if (!n->op) {
+    sent = gen_park(ctx, v, &mode);
+    return gen_resumed(ctx, sent, mode);
+  }
+
+  gc_push_scope();
+  KEEP(v);
+  if (!get_iterator(ctx, v, &iter)) {
+    gc_pop_scope();
+    if (!ctx->has_exc)
+      js_throw_type(ctx, "yield* operand is not iterable");
+    return js_undef();
+  }
+  KEEP(iter);
+  sent = js_undef();
+  for (;;) {
+    const char *method = mode == GEN_THROW ? "throw" : mode == GEN_RETURN ? "return" : "next";
+    js_value fn = js_get(ctx, iter, method);
+    if (ctx->has_exc)
+      break;
+    if (!js_is_callable(fn)) {
+      if (mode == GEN_RETURN) {
+        gen_unwind_return(ctx, sent);
+      } else {
+        if (mode == GEN_THROW) {
+          js_value rf = js_get(ctx, iter, "return");
+          if (js_is_callable(rf))
+            js_call(ctx, rf, iter, NULL, 0);
+        }
+        if (!ctx->has_exc)
+          js_throw_type(ctx, mode == GEN_THROW ? "iterator does not have a throw method"
+                                               : "iterator.next is not a function");
+      }
+      break;
+    }
+    KEEP(sent);
+    res = js_call(ctx, fn, iter, &sent, 1);
+    if (ctx->has_exc)
+      break;
+    KEEP(res);
+    if (res.type != JV_OBJ) {
+      js_throw_type(ctx, "iterator result is not an object");
+      break;
+    }
+    {
+      int done = js_to_boolean(js_get(ctx, res, "done"));
+      js_value val = js_get(ctx, res, "value");
+      if (ctx->has_exc)
+        break;
+      KEEP(val);
+      if (done) {
+        if (mode == GEN_RETURN)
+          gen_unwind_return(ctx, val);
+        else
+          sent = val;
+        break;
+      }
+      sent = gen_park(ctx, val, &mode);
+    }
+  }
+  gc_pop_scope();
+  return ctx->has_exc ? js_undef() : sent;
+}
+
+static js_generator *gen_of(js_value t)
+{
+  return (t.type == JV_OBJ && t.u.obj->kind == OBJ_GENERATOR) ? (js_generator *)t.u.obj->host : NULL;
+}
+
+static js_value gen_step(js_ctx *ctx, js_value t, js_value *a, int n, int mode)
+{
+  js_generator *g = gen_of(t);
+  js_value v = n > 0 ? a[0] : js_undef(), out;
+  int done = 0;
+
+  if (!g)
+    return js_throw_type(ctx, "generator method called on an incompatible receiver");
+  if (g->state == GEN_RUNNING)
+    return js_throw_type(ctx, "generator is already running");
+  if (g->state == GEN_START && mode != GEN_NEXT) {
+    g->state = GEN_DONE;
+    g->env = NULL;
+  }
+  if (g->state == GEN_DONE) {
+    if (mode == GEN_THROW) {
+      js_throw(ctx, v);
+      return js_undef();
+    }
+    return iter_result(ctx, mode == GEN_RETURN ? v : js_undef(), 1);
+  }
+  gc_push_scope();
+  KEEP(t);
+  out = gen_resume(ctx, g, mode, v, &done);
+  if (!ctx->has_exc)
+    out = iter_result(ctx, out, done);
+  gc_pop_scope();
+  return ctx->has_exc ? js_undef() : out;
+}
+
+static js_value gen_next(js_ctx *ctx, js_value t, js_value *a, int n) { return gen_step(ctx, t, a, n, GEN_NEXT); }
+static js_value gen_return(js_ctx *ctx, js_value t, js_value *a, int n) { return gen_step(ctx, t, a, n, GEN_RETURN); }
+static js_value gen_throw(js_ctx *ctx, js_value t, js_value *a, int n) { return gen_step(ctx, t, a, n, GEN_THROW); }
+static js_value gen_self(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  (void)ctx;
+  (void)a;
+  (void)n;
+  return t;
+}
+
+void js_setup_generators(js_ctx *ctx)
+{
+  js_object *p = ctx->generator_proto;
+  js_def_native(ctx, p, "next", gen_next, 1);
+  js_def_native(ctx, p, "return", gen_return, 1);
+  js_def_native(ctx, p, "throw", gen_throw, 1);
+  gc_push_scope();
+  {
+    js_object *f = (js_object *)gc_keep(js_new_native(ctx, gen_self, "[Symbol.iterator]", 0));
+    js_def(p, js_symbol_key(ctx->sym_iterator), js_obj_value(f), P_WRITABLE | P_CONFIGURABLE);
+  }
+  js_def(p, js_symbol_key(ctx->sym_tostringtag), js_mk_cstring(ctx, "Generator"), P_CONFIGURABLE);
+  gc_pop_scope();
+}
+
+/* Calling a generator function binds its arguments but runs none of the body:
+ * it returns a generator object that owns the function scope. */
+static js_value gen_create(js_ctx *ctx, js_object *fn, js_env *env)
+{
+  js_generator *g = (js_generator *)calloc(1, sizeof *g);
+  js_object *obj;
+  js_value proto;
+  if (!g)
+    gc_oom();
+  gc_push_scope();
+  proto = js_get(ctx, js_obj_value(fn), "prototype");
+  obj = (js_object *)gc_keep(js_new_object(ctx, proto.type == JV_OBJ ? proto.u.obj : ctx->generator_proto));
+  g->ctx = ctx;
+  g->self = obj;
+  g->node = fn->fn->node;
+  g->env = env;
+  g->xfer = js_undef();
+  obj->kind = OBJ_GENERATOR;
+  obj->host = g;
+  gc_pop_scope();
+  return js_obj_value(obj);
+}
+
 /* ------------------------------------------------------- calls ------------ */
 
 static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_value *args, int argc)
@@ -3017,7 +3399,10 @@ static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_va
 
   if (!ctx->has_exc) {
     if (node && node->u.func.is_generator) {
-      js_throw_type(ctx, "generator functions need coroutine runtime (not yet implemented)");
+      if (node->u.func.is_async)
+        js_throw_type(ctx, "async generator functions are not supported");
+      else
+        result = gen_create(ctx, o, env);
     } else if (node) {
       if (node->u.func.is_expr_body)
         result = evaluate(ctx, node->u.func.body);
@@ -3385,6 +3770,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
   gc_add_root((void **)&ctx->weakset_proto);
   gc_add_root((void **)&ctx->date_proto);
   gc_add_root((void **)&ctx->regexp_proto);
+  gc_add_root((void **)&ctx->generator_proto);
   gc_add_root((void **)&ctx->typedarray_proto);
   gc_add_root((void **)&ctx->arraybuffer_proto);
   gc_add_root((void **)&ctx->dataview_proto);
@@ -3420,6 +3806,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
   ctx->weakset_proto = js_new_object(ctx, ctx->object_proto);
   ctx->date_proto = js_new_object(ctx, ctx->object_proto);
   ctx->regexp_proto = js_new_object(ctx, ctx->object_proto);
+  ctx->generator_proto = js_new_object(ctx, ctx->object_proto);
   ctx->typedarray_proto = js_new_object(ctx, ctx->object_proto);
   ctx->arraybuffer_proto = js_new_object(ctx, ctx->object_proto);
   ctx->dataview_proto = js_new_object(ctx, ctx->object_proto);
@@ -3472,6 +3859,7 @@ void js_ctx_free(js_ctx *ctx)
   gc_remove_root((void **)&ctx->weakset_proto);
   gc_remove_root((void **)&ctx->date_proto);
   gc_remove_root((void **)&ctx->regexp_proto);
+  gc_remove_root((void **)&ctx->generator_proto);
   gc_remove_root((void **)&ctx->typedarray_proto);
   gc_remove_root((void **)&ctx->arraybuffer_proto);
   gc_remove_root((void **)&ctx->dataview_proto);

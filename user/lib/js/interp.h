@@ -46,7 +46,7 @@ struct js_ctx {
 
   js_object *object_proto, *function_proto, *array_proto, *string_proto, *number_proto, *boolean_proto, *error_proto,
       *promise_proto, *symbol_proto, *bigint_proto, *map_proto, *set_proto, *weakmap_proto, *weakset_proto, *date_proto,
-      *regexp_proto;
+      *regexp_proto, *generator_proto;
   js_value sym_iterator;    /* the well-known Symbol.iterator                 */
   js_value sym_tostringtag; /* the well-known Symbol.toStringTag              */
   js_object *sym_registry;  /* array of every Symbol created, so
@@ -65,7 +65,10 @@ struct js_ctx {
   js_object *type_error_proto, *range_error_proto, *syntax_error_proto, *ref_error_proto, *eval_error_proto,
       *uri_error_proto, *aggregate_error_proto;
 
-  int has_exc; /* a throw is propagating                        */
+  int has_exc;           /* a throw is propagating                        */
+  int gen_unwind;        /* has_exc is a generator.return() unwinding: finally blocks
+                          * run but catch clauses do not                              */
+  js_generator *cur_gen; /* the generator body now running, or NULL    */
   js_value exc;
   void *exc_root; /* GC-rooted: the exc's object/string, or NULL    */
 
@@ -196,6 +199,9 @@ js_value js_promise_rejected(js_ctx *ctx, js_value v); /* a rejected promise of 
 /* -1 = not a promise; 0 pending, 1 fulfilled, 2 rejected. *out = settled value.
  */
 int js_promise_inspect(js_ctx *ctx, js_value v, js_value *out);
+
+/* Create %GeneratorPrototype% (next/return/throw), run once from js_setup_builtins. */
+void js_setup_generators(js_ctx *ctx);
 
 /* builtins.c — populate the global object and the prototype objects. */
 void js_setup_builtins(js_ctx *ctx);
