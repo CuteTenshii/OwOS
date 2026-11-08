@@ -231,3 +231,23 @@ int ksnprintf(char *buf, uint32_t size, const char *fmt, ...)
   va_end(ap);
   return n;
 }
+
+static char *find(const char *haystack, const char *needle, bool icase)
+{
+  if (!*needle)
+    return (char *)haystack;
+  for (; *haystack; haystack++) {
+    const char *h = haystack, *n = needle;
+    while (*h && *n && (icase ? k_lower(*h) == k_lower(*n) : *h == *n)) {
+      h++;
+      n++;
+    }
+    if (!*n)
+      return (char *)haystack;
+  }
+  return 0;
+}
+
+char *strstr(const char *haystack, const char *needle) { return find(haystack, needle, false); }
+
+char *strcasestr(const char *haystack, const char *needle) { return find(haystack, needle, true); }

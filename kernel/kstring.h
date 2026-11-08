@@ -13,6 +13,8 @@ int memcmp(const void *a, const void *b, uint32_t n);
 uint32_t strlen(const char *s);                              /* byte count before the terminating NUL */
 int strcmp(const char *a, const char *b);                    /* <0 / 0 / >0, like libc */
 uint32_t strlcpy(char *dst, const char *src, uint32_t size); /* bounded copy (BSD), ret strlen(src) */
+char *strstr(const char *haystack, const char *needle);      /* first match, or NULL; an empty needle matches */
+char *strcasestr(const char *haystack, const char *needle);  /* same, ignoring ASCII case */
 
 /* Equality idiom: streq(a, b) instead of !strcmp(a, b). */
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
