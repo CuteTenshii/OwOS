@@ -554,8 +554,10 @@ static void cmd_cat(const char *name)
 typedef void (*cmd_fn)(const char *arg);
 struct builtin {
   const char *name;
-  cmd_fn fn;
+  cmd_fn fn; /* takes the argument string */
   const char *help;
+  void (*fn0)(void); /* alternative for commands without arguments */
+  const char *flags; /* option letters the command accepts (none when NULL) */
 };
 
 /* "which <name>...": report built-in or runnable file for each name, in run() order. */
@@ -767,43 +769,9 @@ static void parse_two(const char *arg, char *a, char *b, int cap)
 
 #define REDIR_MAX (16 * 1024) /* cap on captured output for "cmd > file" */
 
-/* Built-in command table. Adapters give every handler the uniform cmd_fn shape. */
-static void bi_clear(const char *a)
-{
-  (void)a;
-  con_clear();
-}
-static void bi_journal(const char *a)
-{
-  (void)a;
-  journal_dump();
-}
-static void bi_meminfo(const char *a)
-{
-  (void)a;
-  cmd_meminfo();
-}
-static void bi_ps(const char *a)
-{
-  (void)a;
-  sched_dump();
-}
+/* Built-in command handlers. fn takes the argument string; argument-less commands set fn0 instead. */
 static void bi_ls(const char *a)
 {
-  while (a[0] == '-' && a[1] && !(a[1] == '-' && (a[2] == '\0' || a[2] == ' '))) {
-    for (a++; *a && *a != ' '; a++) {
-      if (*a != 'l') { /* -l: long listing, which is the only format */
-        con_printf("ls: unknown option -%c\n", *a);
-        return;
-      }
-    }
-    while (*a == ' ')
-      a++;
-  }
-  if (a[0] == '-' && a[1] == '-') { /* "--" ends the options */
-    for (a += 2; *a == ' '; a++)
-      ;
-  }
   if (a[0] == '\0') {
     fs_list(cwd);
     return;
@@ -813,16 +781,6 @@ static void bi_ls(const char *a)
     con_write("ls: path too long\n");
   else
     fs_list(rpath);
-}
-static void bi_pwd(const char *a)
-{
-  (void)a;
-  cmd_pwd();
-}
-static void bi_storage(const char *a)
-{
-  (void)a;
-  cmd_storage();
 }
 
 /* mtp: browse a phone/camera in MTP mode; objects, not blocks, so it is not mounted at /media. */
@@ -927,37 +885,64 @@ static void bi_restart(const char *a)
 /* The one command list; order is `help` order, fn == NULL rows are help-only notes. */
 /* Minimal recovery console for COM1; everything else lives in /bin/term. Bare names still spawn /bin programs. */
 static const struct builtin builtins[] = {
-    {"help", cmd_help, "help          show this list"},
-    {"clear", bi_clear, "clear         clear the screen"},
-    {"journal", bi_journal, "journal       replay the verbose boot log"},
-    {"meminfo", bi_meminfo, "meminfo       physical and heap memory usage"},
-    {"ps", bi_ps, "ps            list scheduler threads and run counts"},
-    {"ls", bi_ls, "ls [-l] [path] list a directory (default: current)"},
-    {"pwd", bi_pwd, "pwd           print the working directory"},
-    {"cd", cmd_cd, "cd [dir]      change directory (no arg -> home)"},
-    {"cat", cmd_cat, "cat <file>    print a file"},
-    {"grep", cmd_grep, "grep <p> <f>  print lines of <f> that contain <p>"},
-    {"cp", cmd_cp, "cp <src> <dst> copy a file"},
-    {"mv", cmd_mv, "mv <src> <dst> rename/move a file or directory"},
-    {"rm", cmd_rm, "rm <file>...  delete files"},
-    {"mkdir", cmd_mkdir, "mkdir <dir>...  create directories"},
-    {"rmdir", cmd_rmdir, "rmdir <dir>...  remove empty directories"},
-    {"storage", bi_storage, "storage       list storage devices (IDE/SATA/NVMe)"},
-    {"mount", bi_mount,
-     "mount [dev [pt]]  mount a removable device (see ls /dev) at "
-     "/media/<name>"},
-    {"umount", bi_umount, "umount [point]    detach a mounted volume"},
-    {"echo", bi_echo, "echo <text>   print text back"},
-    {"poweroff", bi_poweroff, "poweroff      shut the machine down"},
-    {"restart", bi_restart, "restart       reboot the machine"},
-    {NULL, NULL, NULL}, /* sentinel */
+    {.name = "help", .fn = cmd_help, .help = "help          show this list"},
+    {.name = "clear", .help = "clear         clear the screen", .fn0 = con_clear},
+    {.name = "journal", .help = "journal       replay the verbose boot log", .fn0 = journal_dump},
+    {.name = "meminfo", .help = "meminfo       physical and heap memory usage", .fn0 = cmd_meminfo},
+    {.name = "ps", .help = "ps            list scheduler threads and run counts", .fn0 = sched_dump},
+    {.name = "ls", .fn = bi_ls, .flags = "l", .help = "ls [-l] [path] list a directory (default: current)"},
+    {.name = "pwd", .help = "pwd           print the working directory", .fn0 = cmd_pwd},
+    {.name = "cd", .fn = cmd_cd, .help = "cd [dir]      change directory (no arg -> home)"},
+    {.name = "cat", .fn = cmd_cat, .help = "cat <file>    print a file"},
+    {.name = "grep", .fn = cmd_grep, .help = "grep <p> <f>  print lines of <f> that contain <p>"},
+    {.name = "cp", .fn = cmd_cp, .help = "cp <src> <dst> copy a file"},
+    {.name = "mv", .fn = cmd_mv, .help = "mv <src> <dst> rename/move a file or directory"},
+    {.name = "rm", .fn = cmd_rm, .help = "rm <file>...  delete files"},
+    {.name = "mkdir", .fn = cmd_mkdir, .help = "mkdir <dir>...  create directories"},
+    {.name = "rmdir", .fn = cmd_rmdir, .help = "rmdir <dir>...  remove empty directories"},
+    {.name = "storage", .help = "storage       list storage devices (IDE/SATA/NVMe)", .fn0 = cmd_storage},
+    {.name = "mount",
+     .fn = bi_mount,
+     .help = "mount [dev [pt]]  mount a removable device (see ls /dev) at "
+             "/media/<name>"},
+    {.name = "umount", .fn = bi_umount, .help = "umount [point]    detach a mounted volume"},
+    {.name = "echo", .fn = bi_echo, .help = "echo <text>   print text back"},
+    {.name = "poweroff", .fn = bi_poweroff, .help = "poweroff      shut the machine down"},
+    {.name = "restart", .fn = bi_restart, .help = "restart       reboot the machine"},
+    {NULL}, /* sentinel */
 };
+
+/* Strip leading options ("--" ends them) from *arg; false after reporting one that `allowed` lacks. */
+static bool builtin_flags(const char *cmd, const char *allowed, const char **arg)
+{
+  const char *a = *arg;
+  while (a[0] == '-' && a[1]) {
+    if (a[1] == '-' && (a[2] == '\0' || a[2] == ' ')) {
+      for (a += 2; *a == ' '; a++)
+        ;
+      break;
+    }
+    for (a++; *a && *a != ' '; a++) {
+      const char *f = allowed;
+      while (f && *f && *f != *a)
+        f++;
+      if (!f || !*f) {
+        con_printf("%s: unknown option -%c\n", cmd, *a);
+        return false;
+      }
+    }
+    while (*a == ' ')
+      a++;
+  }
+  *arg = a;
+  return true;
+}
 
 /* Resolve a command name to its row, skipping help-only (fn == NULL) entries. */
 static const struct builtin *builtin_find(const char *name)
 {
   for (const struct builtin *b = builtins; b->name || b->help; b++)
-    if (b->fn && streq(b->name, name))
+    if ((b->fn || b->fn0) && streq(b->name, name))
       return b;
   return NULL;
 }
@@ -1081,7 +1066,12 @@ static void run(char *cmd)
 
   const struct builtin *b = builtin_find(name);
   if (b) {
-    b->fn(carg);
+    if (!builtin_flags(b->name, b->flags, &carg))
+      return;
+    if (b->fn0)
+      b->fn0();
+    else
+      b->fn(carg);
     return;
   }
 
