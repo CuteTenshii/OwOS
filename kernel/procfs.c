@@ -263,7 +263,7 @@ int procfs_size(const char *sub)
 {
   static char scratch[8192];
   const char *leaf = sub[0] == '/' ? sub + 1 : sub;
-  if (streq(leaf, "hostclip") || streq(leaf, "login"))
+  if (streq(leaf, "hostclip") || streq(leaf, "login") || streq(leaf, "sudo"))
     return 0; /* control nodes: a read would consume host state */
   int n = procfs_read(sub, scratch, (int)sizeof scratch);
   return n < 0 ? 0 : n;
@@ -277,7 +277,7 @@ int procfs_kind(const char *sub)
     sub++;
   if (!sub[0])
     return 1; /* /proc itself                      */
-  if (streq(sub, "hostclip") || streq(sub, "login"))
+  if (streq(sub, "hostclip") || streq(sub, "login") || streq(sub, "sudo"))
     return 0; /* hidden VMware-clipboard device node */
   for (int i = 0; i < NENTRIES; i++)
     if (streq(sub, entries[i]))
@@ -380,6 +380,23 @@ int procfs_write(const char *sub, const char *buf, int len)
     else
       pass = (char *)""; /* no password supplied           */
     return users_login(arg, pass) == 0 ? len : -1;
+  }
+
+  /* sudo, for the calling uid. First byte: 'q' may this user sudo; '?' is a grant running; 'k' end it; 'p' + the
+   * user's own password starts one. Returns len on yes/success, -1 on no. */
+  if (streq(sub, "sudo") && n > 0) {
+    uint32_t uid = sched_uid();
+    switch (arg[0]) {
+    case 'q':
+      return users_sudo_allowed(uid) ? len : -1;
+    case '?':
+      return users_sudo_valid(uid) ? len : -1;
+    case 'k':
+      users_sudo_revoke(uid);
+      return len;
+    case 'p':
+      return users_sudo_grant(uid, arg + 1) == 0 ? len : -1;
+    }
   }
   return -1;
 }

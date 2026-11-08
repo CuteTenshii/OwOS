@@ -4,8 +4,10 @@
 
 #include "crypto.h"
 #include "fs.h"
+#include "heap.h"
 #include "kstring.h"
 #include "sched.h"
+#include "timer.h"
 #include "users.h"
 
 /* ---- tiny local string helpers (kstring.h is intentionally minimal) --------
@@ -196,4 +198,101 @@ int users_authenticate(const char *name, const char *pass, uint32_t *uid, uint32
   if (home)
     cpy(home, e.home[0] ? e.home : (e.uid == 0 ? "/home/root" : "/home/user"), homesz);
   return 0;
+}
+
+/* ---- sudo ---------------------------------------------------------------- */
+
+/* Is `name` (or the account's primary group `gid`) in the group `group` of /etc/group? Lines are name:gid:members. */
+static bool in_group(const char *group, const char *name, uint32_t gid)
+{
+  static char buf[4096];
+  int n = fs_read("/etc/group", buf, sizeof buf - 1);
+  if (n < 0)
+    return false;
+  buf[n] = '\0';
+  uint32_t nlen = (uint32_t)strlen(name);
+  for (const char *line = buf; *line; line = next_line(line)) {
+    char gname[USER_NAME_MAX];
+    const char *p = line;
+    take_field(&p, gname, sizeof gname);
+    if (!streq(gname, group) || *p != ':')
+      continue;
+    uint32_t ggid;
+    p = parse_u32(p + 1, &ggid);
+    if (ggid == gid)
+      return true;
+    if (*p != ':')
+      return false;
+    for (p++; *p && *p != '\n' && *p != '\r';) { /* comma separated members */
+      const char *end = p;
+      while (*end && *end != ',' && *end != '\n' && *end != '\r')
+        end++;
+      if ((uint32_t)(end - p) == nlen && memcmp(p, name, nlen) == 0)
+        return true;
+      p = *end == ',' ? end + 1 : end;
+    }
+    return false;
+  }
+  return false;
+}
+
+int users_sudo_allowed(uint32_t uid)
+{
+  struct pwent e;
+  if (uid == 0)
+    return 1;
+  if (!passwd_lookup(NULL, uid, &e))
+    return 0;
+  return in_group("wheel", e.name, e.gid) || in_group("sudo", e.name, e.gid);
+}
+
+struct sudo_grant {
+  uint32_t uid, expires; /* expires in timer ticks */
+};
+static struct sudo_grant *grants;
+static uint32_t ngrants;
+
+static struct sudo_grant *grant_of(uint32_t uid)
+{
+  for (uint32_t i = 0; i < ngrants; i++)
+    if (grants[i].uid == uid)
+      return &grants[i];
+  return 0;
+}
+
+int users_sudo_grant(uint32_t uid, const char *pass)
+{
+  struct pwent e;
+  if (!users_sudo_allowed(uid) || !passwd_lookup(NULL, uid, &e))
+    return -1;
+  if (users_authenticate(e.name, pass, 0, 0, 0, 0) != 0)
+    return -2;
+  struct sudo_grant *g = grant_of(uid);
+  if (!g) {
+    struct sudo_grant *grown = kmalloc((ngrants + 1) * sizeof *grown);
+    if (!grown)
+      return -1;
+    memcpy(grown, grants, ngrants * sizeof *grown);
+    kfree(grants);
+    grants = grown;
+    g = &grants[ngrants++];
+    g->uid = uid;
+  }
+  g->expires = timer_ticks() + USERS_SUDO_SECONDS * TIMER_HZ;
+  return 0;
+}
+
+int users_sudo_valid(uint32_t uid)
+{
+  if (uid == 0)
+    return 1;
+  struct sudo_grant *g = grant_of(uid);
+  return g && (int32_t)(g->expires - timer_ticks()) > 0;
+}
+
+void users_sudo_revoke(uint32_t uid)
+{
+  struct sudo_grant *g = grant_of(uid);
+  if (g)
+    g->expires = timer_ticks();
 }

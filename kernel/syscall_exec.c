@@ -11,6 +11,7 @@
 #include "syscall_nr.h"
 #include "syscall_path.h"
 #include "uaccess.h"
+#include "users.h"
 #include <stdint.h>
 
 void syscall_exec_replace(struct registers *r)
@@ -162,9 +163,10 @@ void syscall_exec_spawn_cap(struct registers *r)
    * front so we never spawn a child we would then have to tear down. */
   uint32_t caller_uid = sched_uid();
   int set_uid = req.uid >= 0, set_gid = req.gid >= 0;
-  if (caller_uid != 0 &&
+  bool to_root = (!set_uid || req.uid == 0) && (!set_gid || req.gid == 0);
+  if (caller_uid != 0 && !(to_root && users_sudo_valid(caller_uid)) &&
       ((set_uid && (uint32_t)req.uid != caller_uid) || (set_gid && (uint32_t)req.gid != sched_gid()))) {
-    r->eax = (uint32_t)-1; /* non-root may not change creds */
+    r->eax = (uint32_t)-1; /* non-root may not change creds, except to root under a sudo grant */
     return;
   }
   char cwdbuf[SYS_PATH_MAX];

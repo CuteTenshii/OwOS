@@ -833,7 +833,7 @@ static void mnt_attr(struct mnt *m, const char *sub, bool is_dir, uint32_t *mode
   if (m->ops == &devfs_ops)
     *mode = is_dir ? 0555 : 0644;
   else if (m->ops == &procfs_ops)
-    *mode = is_dir ? 0555 : s_eq(leaf, "login") ? 0666 : s_eq(leaf, "hostclip") ? 0644 : 0444;
+    *mode = is_dir ? 0555 : s_eq(leaf, "login") || s_eq(leaf, "sudo") ? 0666 : s_eq(leaf, "hostclip") ? 0644 : 0444;
   else if (m->ops == &sysfs_ops)
     *mode = is_dir ? 0555 : sysfs_writable(sub) ? 0644 : 0444;
   else if (!m->ops->getattr || m->ops->getattr(m->inst, sub, mode, uid, gid) != 0)

@@ -14,6 +14,7 @@
  *   /proc/user    (read)   -> "uid gid name home" for the calling task
  *   /proc/login   (write)  -> "name" or "name password": switch the *caller's*
  *                             credentials, validated against /etc/passwd
+ *   /proc/sudo    (write)  -> "q" may I sudo, "?" is my grant running, "k" end it, "p<password>" start one
  *
  * The account *database* lives in ordinary owofs files — /etc/passwd and
  * /etc/group — created and managed entirely in user space (the shell's
@@ -54,5 +55,17 @@ int users_login(const char *name, const char *pass);
  * the user's shell with these creds. 0 ok, -1 unknown user, -2 wrong password.
  */
 int users_authenticate(const char *name, const char *pass, uint32_t *uid, uint32_t *gid, char *home, int homesz);
+
+/* sudo: a user in group "wheel" or "sudo" (or root) who proves their own password may spawn processes as root for
+ * USERS_SUDO_SECONDS afterwards. The grant belongs to the uid, like a sudo timestamp, and is only ever consulted by the
+ * spawn privilege check; nothing changes the caller's own credentials.
+ *   users_sudo_allowed: 1 if the uid may use sudo at all
+ *   users_sudo_grant:   verify the password of the uid's account and start the grant; 0, -1 not allowed, -2 wrong
+ * password users_sudo_valid:   1 while a grant is running (always for root) users_sudo_revoke:  end the grant now */
+#define USERS_SUDO_SECONDS 900
+int users_sudo_allowed(uint32_t uid);
+int users_sudo_grant(uint32_t uid, const char *pass);
+int users_sudo_valid(uint32_t uid);
+void users_sudo_revoke(uint32_t uid);
 
 #endif /* OWOS_USERS_H */

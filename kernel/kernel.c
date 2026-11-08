@@ -446,6 +446,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(chown);
     INSTALL_APP(init);
     INSTALL_APP(sh);
+    INSTALL_APP(sudo);
     INSTALL_FILE("/bin/notify-send", _binary_app_notifysend, 0755);
   }
   con_write("usermode: ready ('run curl <url>').\n");
