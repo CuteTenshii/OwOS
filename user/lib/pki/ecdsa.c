@@ -1,8 +1,8 @@
 /* ecdsa.c — ECDSA signature verification over NIST P-256 and P-384 (FIPS 186-4). */
 
 #include "bn.h"
+#include "owos.h" /* memcpy/memset (user libc) */
 #include "pk.h"
-#include <string.h>
 
 #define EC_LIMBS 12 /* P-384 */
 

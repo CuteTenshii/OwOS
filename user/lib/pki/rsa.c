@@ -1,8 +1,8 @@
 /* rsa.c — RSA signature verification (PKCS#1 v1.5 and PSS, RFC 8017). */
 
 #include "bn.h"
+#include "owos.h" /* memcpy/memset (user libc) */
 #include "pk.h"
-#include <string.h>
 
 /* m = sig^e mod n as big-endian bytes in em[0..nbytes). */
 static int rsa_public(const uint8_t *n, uint32_t nlen, const uint8_t *e, uint32_t elen, const uint8_t *sig,

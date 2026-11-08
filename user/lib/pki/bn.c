@@ -1,7 +1,7 @@
 /* bn.c — see bn.h. */
 
 #include "bn.h"
-#include <string.h>
+#include "owos.h" /* memcpy/memset (user libc) */
 
 static uint32_t add_n(uint32_t *r, const uint32_t *a, const uint32_t *b, uint32_t len)
 {
