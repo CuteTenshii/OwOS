@@ -102,6 +102,8 @@ int browser_form_submit(struct dom_node *node, int fire_event)
     return 0;
   if (fire_event && js_dispatch_dom_event(form, "submit", 0, 0))
     return 1; /* preventDefault */
+  if (js_dialog_form_submit(form, node))
+    return 1;
   if (html_form_build(node, &fs) && fs.url[0]) {
     if (streq(fs.method, "POST"))
       worker_navigate_post(fs.url, fs.body, fs.body_len, fs.ctype);

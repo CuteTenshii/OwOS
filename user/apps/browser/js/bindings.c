@@ -73,6 +73,7 @@ static struct html_iface g_html_ifaces[] = {
     {"HTMLHRElement", "hr", false, 0},
     {"HTMLSourceElement", "source", false, 0},
     {"HTMLTemplateElement", "template", false, 0},
+    {"HTMLDialogElement", "dialog", false, 0},
     {"HTMLPictureElement", "picture", false, 0},
     {"HTMLDataListElement", "datalist", false, 0},
     {"HTMLProgressElement", "progress", false, 0},
@@ -255,6 +256,7 @@ static js_value ce_lookup(const char *tag);
 static void ce_upgrade_node(struct dom_node *n, js_value cls);
 static void ce_connect(struct dom_node *n);
 static void ce_attr_changed(struct dom_node *n, const char *name, const char *oldv, const char *newv);
+static void ce_disconnect_tree(struct dom_node *n);
 
 /* lowercase copy into a fixed buffer */
 static void lower_into(char *dst, int cap, const char *src)
@@ -352,6 +354,8 @@ static js_value text_content_value(js_ctx *ctx, struct dom_node *n)
 }
 static void set_text_content(struct dom_node *n, const char *text)
 {
+  for (struct dom_node *k = n->first_child; k; k = k->next)
+    ce_disconnect_tree(k);
   dom_clear_children(n);
   if (text && *text) {
     struct dom_node *t = dom_new_text(text);
@@ -362,6 +366,8 @@ static void set_text_content(struct dom_node *n, const char *text)
 static void set_inner_html(struct dom_node *el, const char *html)
 {
   struct dom_node *frag, *c;
+  for (c = el->first_child; c; c = c->next)
+    ce_disconnect_tree(c);
   dom_clear_children(el);
   frag = dom_parse(html, html ? (int)strlen(html) : 0);
   if (!frag)
@@ -841,6 +847,12 @@ static void connect_inserted(struct dom_node *c)
   if (node_connected(c))
     run_inserted_script(c);
 }
+/* Detach `c` from `parent` and fire disconnectedCallback across its subtree */
+static void remove_node(struct dom_node *parent, struct dom_node *c)
+{
+  dom_remove_child(parent, c);
+  ce_disconnect_tree(c);
+}
 /* Insert `c` (or a fragment's children) into `parent` before `ref`; false on a cycle. */
 static bool insert_node(js_ctx *ctx, struct dom_node *parent, struct dom_node *c, struct dom_node *ref)
 {
@@ -872,7 +884,7 @@ static js_value el_remove_child(js_ctx *ctx, js_value t, js_value *args, int arg
   struct dom_node *n = node_of(t), *c = node_of(A(0));
   (void)ctx;
   if (n && c)
-    dom_remove_child(n, c);
+    remove_node(n, c);
   return A(0);
 }
 static js_value el_insert_before(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -1968,7 +1980,7 @@ static js_value el_remove(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)args;
   (void)argc;
   if (n && n->parent)
-    dom_remove_child(n->parent, n);
+    remove_node(n->parent, n);
   return js_undef();
 }
 /* Insert every argument before `ref` in `parent` (ref NULL appends) */
@@ -2010,7 +2022,7 @@ static js_value el_replace_with(js_ctx *ctx, js_value t, js_value *args, int arg
 {
   struct dom_node *n = node_of(t), *parent = n ? n->parent : 0, *next = n ? n->next : 0;
   if (parent) {
-    dom_remove_child(parent, n);
+    remove_node(parent, n);
     insert_args(ctx, parent, next && next->parent == parent ? next : 0, args, argc);
   }
   return js_undef();
@@ -2020,7 +2032,7 @@ static js_value el_replace_child(js_ctx *ctx, js_value t, js_value *args, int ar
   struct dom_node *n = node_of(t), *nc = node_of(A(0)), *old = node_of(A(1));
   if (n && nc && old && old->parent == n && nc != old) {
     struct dom_node *next = old->next;
-    dom_remove_child(n, old);
+    remove_node(n, old);
     insert_node(ctx, n, nc, next);
   }
   return A(1);
@@ -2259,7 +2271,7 @@ static js_value doc_adopt_node(js_ctx *ctx, js_value t, js_value *args, int argc
   (void)ctx;
   (void)t;
   if (n && n->parent)
-    dom_remove_child(n->parent, n);
+    remove_node(n->parent, n);
   return A(0);
 }
 static struct dom_node *doc_root_of(js_value t);
@@ -3677,6 +3689,256 @@ static js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
   return ev;
 }
 
+/* ------------------------------------------------------- dialog + popover - */
+
+/* State lives in attributes: open, dialog-modal, dialog-rv (returnValue), popover-open. */
+
+static bool fire_state_event(struct dom_node *n, const char *type, const char *old_state, const char *new_state)
+{
+  js_value tgt = wrap_node(n), ev;
+  bool prevented = false;
+  if (!g_page_live || tgt.type != JV_OBJ)
+    return false;
+  gc_push_scope();
+  gc_keep(tgt.u.obj);
+  ev = make_event(type, 0, 0, js_undef());
+  if (ev.type == JV_OBJ) {
+    gc_keep(ev.u.obj);
+    if (new_state) {
+      js_def(ev.u.obj, "oldState", js_mk_cstring(g_ctx, old_state), P_WRITABLE | P_ENUMERABLE);
+      js_def(ev.u.obj, "newState", js_mk_cstring(g_ctx, new_state), P_WRITABLE | P_ENUMERABLE);
+    }
+    prevented = dispatch_from(tgt.u.obj, ev);
+  }
+  gc_pop_scope();
+  return prevented;
+}
+
+static bool popover_is_auto(const struct dom_node *p)
+{
+  const char *v = dom_get_attr(p, "popover");
+  return v && !streq_ci(v, "manual") && !streq_ci(v, "hint");
+}
+
+/* "auto" popovers that stay open only while the click lands inside them or `b` invoked them */
+static bool pop_outside(const struct dom_node *p, const struct dom_node *a, const struct dom_node *b)
+{
+  return popover_is_auto(p) && p != b && !dom_is_ancestor(p, a);
+}
+static bool pop_inside(const struct dom_node *p, const struct dom_node *a, const struct dom_node *b)
+{
+  (void)b;
+  return p != a && dom_is_ancestor(a, p);
+}
+
+static void popover_set(struct dom_node *n, bool open);
+
+/* Hide every open popover for which `pick(p, a, b)` holds */
+static void popover_sweep(bool (*pick)(const struct dom_node *, const struct dom_node *, const struct dom_node *),
+                          const struct dom_node *a, const struct dom_node *b)
+{
+  struct dom_node *hit[32], *p;
+  int nhit = 0;
+  for (p = g_doc_root; p && nhit < 32; p = tree_next(p))
+    if (p->type == DOM_ELEMENT && dom_get_attr(p, "popover-open") && pick(p, a, b))
+      hit[nhit++] = p;
+  for (int i = 0; i < nhit; i++)
+    popover_set(hit[i], false);
+}
+
+static void popover_set(struct dom_node *n, bool open)
+{
+  if (!dom_get_attr(n, "popover") || (dom_get_attr(n, "popover-open") != 0) == open)
+    return;
+  if (fire_state_event(n, "beforetoggle", open ? "closed" : "open", open ? "open" : "closed") && open)
+    return;
+  if (open) {
+    popover_sweep(pop_outside, n, n);
+    dom_set_attr(n, "popover-open", "");
+  } else {
+    popover_sweep(pop_inside, n, 0);
+    dom_remove_attr(n, "popover-open");
+  }
+  fire_state_event(n, "toggle", open ? "closed" : "open", open ? "open" : "closed");
+}
+
+static js_value el_show_popover(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  if (n)
+    popover_set(n, true);
+  return js_undef();
+}
+static js_value el_hide_popover(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  if (n)
+    popover_set(n, false);
+  return js_undef();
+}
+static js_value el_toggle_popover(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  bool want;
+  if (!n || !dom_get_attr(n, "popover"))
+    return js_bool(0);
+  want = argc > 0 && A(0).type != JV_UNDEF ? js_to_boolean(A(0)) : !dom_get_attr(n, "popover-open");
+  popover_set(n, want);
+  return js_bool(dom_get_attr(n, "popover-open") != 0);
+}
+static js_value el_get_popover(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  const char *v = n ? dom_get_attr(n, "popover") : 0;
+  (void)args;
+  (void)argc;
+  if (!v)
+    return js_null();
+  return js_mk_cstring(ctx, streq_ci(v, "manual") ? "manual" : streq_ci(v, "hint") ? "hint" : "auto");
+}
+static js_value el_set_popover(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  if (!n)
+    return js_undef();
+  if (A(0).type == JV_NULL)
+    dom_remove_attr(n, "popover");
+  else
+    dom_set_attr(n, "popover", arg_str(ctx, A(0)));
+  return js_undef();
+}
+
+/* A click's default action: light-dismiss auto popovers, then run a popovertarget invoker */
+static void popover_click(struct dom_node *t)
+{
+  struct dom_node *inv, *pop = 0;
+  for (inv = t; inv; inv = inv->parent)
+    if (inv->type == DOM_ELEMENT && (streq(inv->tag, "button") || streq(inv->tag, "input")) &&
+        dom_get_attr(inv, "popovertarget"))
+      break;
+  if (inv && !dom_get_attr(inv, "disabled")) {
+    pop = js_dom_find_id(g_doc_root, dom_get_attr(inv, "popovertarget"));
+    if (pop && !dom_get_attr(pop, "popover"))
+      pop = 0;
+  }
+  popover_sweep(pop_outside, t, pop);
+  if (pop) {
+    const char *act = dom_get_attr(inv, "popovertargetaction");
+    bool is_open = dom_get_attr(pop, "popover-open") != 0;
+    if (act && streq_ci(act, "show"))
+      popover_set(pop, true);
+    else if (act && streq_ci(act, "hide"))
+      popover_set(pop, false);
+    else
+      popover_set(pop, !is_open);
+  }
+}
+
+static bool is_dialog(const struct dom_node *n) { return n && streq(n->tag, "dialog"); }
+
+static void dialog_close(struct dom_node *d, const char *ret)
+{
+  if (!dom_get_attr(d, "open"))
+    return;
+  dom_remove_attr(d, "open");
+  dom_remove_attr(d, "dialog-modal");
+  if (ret)
+    dom_set_attr(d, "dialog-rv", ret);
+  fire_state_event(d, "close", 0, 0);
+}
+
+/* <form method=dialog> submission closes the enclosing dialog; false if `form` isn't one */
+bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter)
+{
+  const char *m = dom_get_attr(form, "method");
+  struct dom_node *d = form;
+  if (!m || !streq_ci(m, "dialog"))
+    return false;
+  while (d && !is_dialog(d))
+    d = d->parent;
+  if (d)
+    dialog_close(d, submitter && submitter != form ? dom_get_attr(submitter, "value") : 0);
+  return true;
+}
+
+static js_value dialog_show(js_value t, bool modal)
+{
+  struct dom_node *d = node_of(t);
+  if (is_dialog(d) && !dom_get_attr(d, "open")) {
+    dom_set_attr(d, "open", "");
+    if (modal)
+      dom_set_attr(d, "dialog-modal", "");
+  }
+  return js_undef();
+}
+static js_value dlg_show(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return dialog_show(t, false);
+}
+static js_value dlg_show_modal(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return dialog_show(t, true);
+}
+static js_value dlg_close(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *d = node_of(t);
+  if (is_dialog(d))
+    dialog_close(d, argc > 0 && A(0).type != JV_UNDEF ? arg_str(ctx, A(0)) : 0);
+  return js_undef();
+}
+static js_value dlg_request_close(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *d = node_of(t);
+  if (is_dialog(d) && dom_get_attr(d, "open") && !fire_state_event(d, "cancel", 0, 0))
+    dialog_close(d, argc > 0 && A(0).type != JV_UNDEF ? arg_str(ctx, A(0)) : 0);
+  return js_undef();
+}
+static js_value dlg_get_open(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *d = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return js_bool(d && dom_get_attr(d, "open") != 0);
+}
+static js_value dlg_set_open(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *d = node_of(t);
+  (void)ctx;
+  if (d && js_to_boolean(A(0)))
+    dom_set_attr(d, "open", "");
+  else if (d)
+    dom_remove_attr(d, "open");
+  return js_undef();
+}
+static js_value dlg_get_rv(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *d = node_of(t);
+  const char *v = d ? dom_get_attr(d, "dialog-rv") : 0;
+  (void)args;
+  (void)argc;
+  return js_mk_cstring(ctx, v ? v : "");
+}
+static js_value dlg_set_rv(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *d = node_of(t);
+  if (d)
+    dom_set_attr(d, "dialog-rv", arg_str(ctx, A(0)));
+  return js_undef();
+}
+
 /* C entry: the worker resolved a content click to `target`; fire `type` on it */
 int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int y)
 {
@@ -3695,6 +3957,8 @@ int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int 
   if (ev.type == JV_OBJ)
     gc_keep(ev.u.obj);
   prevented = dispatch_from(tgt.u.obj, ev);
+  if (!prevented && streq(type, "click"))
+    popover_click(target);
   gc_pop_scope();
   return prevented;
 }
@@ -3713,6 +3977,11 @@ static js_value htmlelement_ctor(js_ctx *ctx, js_value thisv, js_value *args, in
 }
 
 static bool ce_is_upgraded(js_object *w) { return w && pmap_find_pub(w, "@ce") != 0; }
+static bool ce_is_connected(js_object *w)
+{
+  pentry *pe = pmap_find_pub(w, "@conn");
+  return pe && js_to_boolean(pe->value);
+}
 static bool ce_connected(struct dom_node *n)
 {
   for (; n; n = n->parent)
@@ -3784,12 +4053,26 @@ static void ce_upgrade_node(struct dom_node *n, js_value cls)
 static void ce_connect(struct dom_node *n)
 {
   js_object *w = n ? (js_object *)n->wrapper : 0;
-  if (!w || !ce_is_upgraded(w) || pmap_find_pub(w, "@conn"))
+  if (!w || !ce_is_upgraded(w) || ce_is_connected(w))
     return;
   if (!ce_connected(n))
     return;
-  js_def(w, "@conn", js_bool(1), 0);
+  js_def(w, "@conn", js_bool(1), P_WRITABLE);
   ce_call_cb(w, "connectedCallback", 0, 0);
+}
+/* Fire disconnectedCallback on `n` and its descendants that were connected. */
+static void ce_disconnect_tree(struct dom_node *n)
+{
+  js_object *w;
+  if (!n || n->type != DOM_ELEMENT)
+    return;
+  w = (js_object *)n->wrapper;
+  if (w && ce_is_upgraded(w) && ce_is_connected(w)) {
+    js_def(w, "@conn", js_bool(0), P_WRITABLE);
+    ce_call_cb(w, "disconnectedCallback", 0, 0);
+  }
+  for (struct dom_node *c = n->first_child; c; c = c->next)
+    ce_disconnect_tree(c);
 }
 static void ce_upgrade_connect(struct dom_node *n, js_value cls)
 {
@@ -3849,14 +4132,37 @@ static void ce_attr_changed(struct dom_node *n, const char *name, const char *ol
   gc_pop_scope();
 }
 
+/* A valid custom element name: lowercase start, contains '-', no uppercase, not reserved */
+static bool ce_valid_name(const char *s)
+{
+  static const char *const reserved[] = {"annotation-xml", "color-profile",    "font-face",      "font-face-src",
+                                         "font-face-uri",  "font-face-format", "font-face-name", "missing-glyph"};
+  bool dash = false;
+  if (!(s[0] >= 'a' && s[0] <= 'z'))
+    return false;
+  for (const char *p = s; *p; p++) {
+    if (*p >= 'A' && *p <= 'Z')
+      return false;
+    if (*p == '-')
+      dash = true;
+  }
+  for (unsigned i = 0; i < sizeof reserved / sizeof reserved[0]; i++)
+    if (streq(s, reserved[i]))
+      return false;
+  return dash;
+}
 static js_value ce_define(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   char name[64];
   js_value cls = A(1);
   (void)t;
   strlcpy(name, arg_str(ctx, A(0)), sizeof name);
-  if (!name[0] || !js_is_callable(cls))
-    return js_undef();
+  if (!js_is_callable(cls))
+    return js_throw_type(ctx, "customElements.define: the constructor is not a function");
+  if (!ce_valid_name(name))
+    return js_throw_error(ctx, ctx->error_proto, "SyntaxError", "customElements.define: invalid custom element name");
+  if (pmap_find_pub(g_custom_elements, name))
+    return js_throw_error(ctx, ctx->error_proto, "NotSupportedError", "customElements.define: name already defined");
   js_def(g_custom_elements, name, cls, 0);
   if (g_doc_root)
     ce_upgrade_tree(g_doc_root, name, cls);
@@ -6574,6 +6880,12 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     }
   }
 
+  /* Popover API on every HTMLElement */
+  def_method(g_html_proto, "showPopover", el_show_popover, 0);
+  def_method(g_html_proto, "hidePopover", el_hide_popover, 0);
+  def_method(g_html_proto, "togglePopover", el_toggle_popover, 1);
+  def_acc(g_html_proto, "popover", el_get_popover, el_set_popover);
+
   /* DOM events: Event prototype, the Event/CustomEvent constructors */
   def_method(g_event_proto, "initEvent", ev_init_event, 3);
   def_method(g_event_proto, "initCustomEvent", ev_init_event, 4);
@@ -6680,6 +6992,15 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
       js_def(win, "Image", js_obj_value(ic), P_WRITABLE | P_CONFIGURABLE);
       gc_pop_scope();
       break;
+    }
+    {
+      js_object *dp = iface_proto_for_tag("dialog");
+      def_method(dp, "show", dlg_show, 0);
+      def_method(dp, "showModal", dlg_show_modal, 0);
+      def_method(dp, "close", dlg_close, 1);
+      def_method(dp, "requestClose", dlg_request_close, 1);
+      def_acc(dp, "open", dlg_get_open, dlg_set_open);
+      def_acc(dp, "returnValue", dlg_get_rv, dlg_set_rv);
     }
   }
   js_def_native(ctx, win, "DOMParser", domparser_ctor, 0); /* new DOMParser().parseFromString */

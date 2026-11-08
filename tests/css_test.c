@@ -253,6 +253,42 @@ int main(void)
     css_free(sh);
   }
 
+  /* 10. :popover-open / :modal follow the state attributes; closed elements don't match. */
+  test("popover and dialog state selectors");
+  {
+    css_sheet *sh = sheet(":popover-open { color: red } dialog:modal { color: blue }");
+    struct dom_node *closed = el("div"), *opened = el("div"), *plain = el("dialog"), *modal = el("dialog");
+    set_attr(opened, "popover-open", "");
+    set_attr(modal, "open", "");
+    set_attr(modal, "dialog-modal", "");
+    doc(closed);
+    doc(opened);
+    doc(plain);
+    doc(modal);
+    expect(!matches_any(sh, closed));
+    expect(matches_any(sh, opened));
+    expect(!matches_any(sh, plain));
+    expect(matches_any(sh, modal));
+    css_free(sh);
+  }
+
+  /* 11. dialogs and popovers get a UA box that author styles can override. */
+  test("dialog and popover UA box");
+  {
+    struct css_style st;
+    struct dom_node *dlg = el("dialog"), *pop = el("div"), *div = el("div");
+    set_attr(pop, "popover", "");
+    css_style_reset(&st);
+    css_apply_attrs(dlg, &st);
+    expect(st.bg == 0xffffff && st.border_w[0] == 2 && st.border_style[0] == CSS_BST_SOLID && st.margin[1] == -2);
+    css_style_reset(&st);
+    css_apply_attrs(pop, &st);
+    expect(st.bg == 0xffffff && st.border_w[0] == 1);
+    css_style_reset(&st);
+    css_apply_attrs(div, &st);
+    expect(st.bg == -1 && st.border_w[0] == -1);
+  }
+
   free_dom();
   return 0;
 }

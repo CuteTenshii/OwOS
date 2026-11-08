@@ -38,6 +38,8 @@ enum {
   PC_OPTIONAL,
   PC_LINK,
   PC_MATCHES, /* :is()/:where(): matches if any sub-selector does  */
+  PC_POPOVER_OPEN,
+  PC_MODAL,
   PC_NEVER,
 };
 

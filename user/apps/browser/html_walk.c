@@ -232,6 +232,8 @@ static void walk_element_inner(struct dom_node *el)
   anim_apply(g_sheet, el, &cs, g_walk_now); /* overlay @keyframes / transition */
   if (streq(name, "dialog") && !dom_get_attr(el, "open"))
     return; /* closed modal is hidden */
+  if (dom_get_attr(el, "popover") && !dom_get_attr(el, "popover-open"))
+    return; /* closed popover is hidden */
   if (streq(name, "colgroup") || streq(name, "col"))
     return; /* table column metadata, no box */
 

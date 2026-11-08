@@ -729,6 +729,18 @@ void css_apply_attrs(const struct dom_node *el, struct css_style *out)
 {
   if (!el || el->type != DOM_ELEMENT)
     return;
+  bool dialog = streq(el->tag, "dialog");
+  if (dialog || dom_get_attr(el, "popover")) { /* UA box for a dialog / popover */
+    out->bg = 0xffffff;
+    out->color = 0;
+    out->margin[1] = out->margin[3] = -2;
+    for (int i = 0; i < 4; i++) {
+      out->padding[i] = dialog ? 16 : 4;
+      out->border_w[i] = dialog ? 2 : 1;
+      out->border_style[i] = CSS_BST_SOLID;
+    }
+    out->border_color = 0;
+  }
   const char *c = dom_get_attr(el, "color");
   if (c) {
     int rgb = parse_color(c);

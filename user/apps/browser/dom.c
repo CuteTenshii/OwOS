@@ -557,8 +557,9 @@ const char *dom_get_attr(const struct dom_node *node, const char *name)
 /* Attributes that can change a computed style. */
 static bool style_attr(const char *name)
 {
-  static const char *const names[] = {"id",     "class",   "style",    "color",    "bgcolor",  "width",
-                                      "height", "checked", "selected", "disabled", "required", "href"};
+  static const char *const names[] = {"id",       "class",  "style",   "color",        "bgcolor",
+                                      "width",    "height", "checked", "selected",     "disabled",
+                                      "required", "href",   "open",    "popover-open", "dialog-modal"};
   for (int i = 0; i < (int)(sizeof names / sizeof names[0]); i++)
     if (streq_ci(name, names[i]))
       return true;

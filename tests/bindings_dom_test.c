@@ -129,6 +129,68 @@ int main(void)
              "expect(q.firstChild===r && r.nextSibling===null, 'insertBefore(x, x) is a no-op');\n"
              "expect(p.outerHTML.length>0, 'tree still serializes');\n");
 
+  test("dialog open state, returnValue and events");
+  run_script(
+      "var d=document, dlg=d.createElement('dialog'), log=[];\n"
+      "d.body.appendChild(dlg);\n"
+      "dlg.addEventListener('close', function(){ log.push('close') });\n"
+      "dlg.addEventListener('cancel', function(){ log.push('cancel') });\n"
+      "expect(dlg.open===false && dlg.returnValue==='', 'closed by default');\n"
+      "dlg.showModal();\n"
+      "expect(dlg.open===true && dlg.hasAttribute('dialog-modal'), 'showModal opens modally');\n"
+      "dlg.close('ok');\n"
+      "expect(dlg.open===false && dlg.returnValue==='ok' && log.join()==='close', 'close sets returnValue and fires "
+      "close');\n"
+      "dlg.close('again'); expect(dlg.returnValue==='ok' && log.length===1, 'closing a closed dialog is a no-op');\n"
+      "dlg.show(); expect(dlg.open && !dlg.hasAttribute('dialog-modal'), 'show is non-modal');\n"
+      "var veto=true; dlg.addEventListener('cancel', function(e){ if(veto) e.preventDefault() });\n"
+      "dlg.requestClose(); expect(dlg.open===true && log.join()==='close,cancel', 'cancel can be prevented');\n"
+      "veto=false; dlg.requestClose(); expect(dlg.open===false, 'requestClose closes');\n");
+
+  test("popover API: show, hide, toggle, events and light dismiss");
+  run_script(
+      "var d=document, a=d.createElement('div'), b=d.createElement('div'), log=[];\n"
+      "a.id='pa'; b.id='pb'; a.popover=''; b.setAttribute('popover','auto'); d.body.appendChild(a); "
+      "d.body.appendChild(b);\n"
+      "expect(a.popover==='auto' && d.createElement('p').popover===null, 'popover reflects the attribute');\n"
+      "a.addEventListener('beforetoggle', function(e){ log.push('before:'+e.newState) });\n"
+      "a.addEventListener('toggle', function(e){ log.push('toggle:'+e.newState) });\n"
+      "a.showPopover();\n"
+      "expect(a.hasAttribute('popover-open') && log.join()==='before:open,toggle:open', 'showPopover opens: '+log);\n"
+      "b.showPopover();\n"
+      "expect(b.hasAttribute('popover-open') && !a.hasAttribute('popover-open'), 'opening an auto popover closes the "
+      "others');\n"
+      "expect(b.togglePopover()===false && !b.hasAttribute('popover-open'), 'togglePopover closes');\n"
+      "expect(b.togglePopover(true)===true, 'togglePopover(force)');\n"
+      "var btn=d.createElement('button'); btn.setAttribute('popovertarget','pa'); d.body.appendChild(btn);\n"
+      "btn.click();\n"
+      "expect(a.hasAttribute('popover-open') && !b.hasAttribute('popover-open'), 'popovertarget invoker toggles its "
+      "target and dismisses others');\n"
+      "d.body.click();\n"
+      "expect(!a.hasAttribute('popover-open'), 'clicking outside light-dismisses');\n"
+      "var m=d.createElement('div'); m.setAttribute('popover','manual'); d.body.appendChild(m);\n"
+      "m.showPopover(); d.body.click(); expect(m.hasAttribute('popover-open'), 'manual popovers ignore light "
+      "dismiss');\n"
+      "var plain=d.createElement('div'); plain.showPopover(); expect(!plain.hasAttribute('popover-open'), 'no popover "
+      "attribute: no-op');\n");
+
+  test("custom elements: lifecycle and registry validation");
+  run_script("var log=[];\n"
+             "class XFoo extends HTMLElement {\n"
+             "  connectedCallback(){ log.push('c') } disconnectedCallback(){ log.push('d') }\n"
+             "}\n"
+             "customElements.define('x-foo', XFoo);\n"
+             "var e=document.createElement('x-foo'); document.body.appendChild(e);\n"
+             "expect(log.join()==='c', 'connected on insert');\n"
+             "var wrap=document.createElement('div'); wrap.appendChild(document.createElement('x-foo'));\n"
+             "e.remove(); expect(log.join()==='c,d', 'disconnected on remove');\n"
+             "document.body.appendChild(e); document.body.innerHTML=''; expect(log.join()==='c,d,c,d', 'disconnected "
+             "on innerHTML clear: '+log);\n"
+             "var err=''; try{ customElements.define('nodash', class extends HTMLElement{}) }catch(x){ err=x.name }\n"
+             "expect(err==='SyntaxError', 'name needs a hyphen: '+err);\n"
+             "err=''; try{ customElements.define('x-foo', class extends HTMLElement{}) }catch(x){ err=x.name }\n"
+             "expect(err==='NotSupportedError', 'redefinition throws: '+err);\n");
+
   test("timers: unused slots hold no stale pointers at teardown");
   run_script("var n=0; setTimeout(function(){ n++ }, 10); setInterval(function(){ n++ }, 1000);\n");
   fake_now_ms += 20;

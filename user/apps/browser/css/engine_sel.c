@@ -265,6 +265,14 @@ static bool classify_pseudo(const char *ns, const char *ne, const char *as, cons
     pc->kind = PC_LINK;
     return true;
   }
+  if (span_is(ns, ne, "popover-open")) {
+    pc->kind = PC_POPOVER_OPEN;
+    return true;
+  }
+  if (span_is(ns, ne, "modal")) {
+    pc->kind = PC_MODAL;
+    return true;
+  }
   if (span_is(ns, ne, "is") || span_is(ns, ne, "where")) {
     /* :is()/:where() match if any sub-selector matches; an empty or unparsable argument matches nothing. */
     struct sel_list *l = (as && as < ae) ? parse_sel_list(as, ae) : 0;
@@ -624,6 +632,10 @@ static bool pseudo_match(const struct pseudo *pc, const struct dom_node *n)
     return dom_get_attr(n, "required") == 0 && is_form_control(n->tag);
   case PC_LINK:
     return (streq(n->tag, "a") || streq(n->tag, "area") || streq(n->tag, "link")) && dom_get_attr(n, "href") != 0;
+  case PC_POPOVER_OPEN:
+    return dom_get_attr(n, "popover-open") != 0;
+  case PC_MODAL:
+    return dom_get_attr(n, "dialog-modal") != 0 && dom_get_attr(n, "open") != 0;
   case PC_NOT:
     return !simple_match(&pc->arg, n);
   case PC_MATCHES:
