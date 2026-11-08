@@ -1491,12 +1491,16 @@ static js_value array_iter_next(js_ctx *ctx, js_value t, js_value *a, int n)
   int i = js_to_int_sat(ctx, js_get(ctx, t, "@i"));
   int kind = js_to_int_sat(ctx, js_get(ctx, t, "@i2"));
   js_object *arr = (tgt.type == JV_OBJ && tgt.u.obj->kind == OBJ_ARRAY) ? tgt.u.obj : NULL;
+  js_typedarray *ta =
+      (tgt.type == JV_OBJ && tgt.u.obj->kind == OBJ_TYPEDARRAY) ? (js_typedarray *)tgt.u.obj->host : NULL;
   js_object *res;
   (void)a;
   (void)n;
   gc_push_scope();
   res = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  if (!arr || i >= (int)arr->elen) {
+  if (ta && ta->type < 0)
+    ta = NULL;
+  if ((!arr && !ta) || i >= (arr ? (int)arr->elen : ta->length)) {
     js_def(res, "value", js_undef(), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
     js_def(res, "done", js_bool(1), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
@@ -1511,10 +1515,10 @@ static js_value array_iter_next(js_ctx *ctx, js_value t, js_value *a, int n)
       js_object *pair = js_new_array(ctx, 0);
       gc_keep(pair);
       js_array_push(ctx, pair, js_number(i));
-      js_array_push(ctx, pair, arr->elems[i]);
+      js_array_push(ctx, pair, arr ? arr->elems[i] : ta_get(ctx, tgt.u.obj, (unsigned)i));
       val = js_obj_value(pair);
     } else
-      val = arr->elems[i];
+      val = arr ? arr->elems[i] : ta_get(ctx, tgt.u.obj, (unsigned)i);
     js_def(res, "value", val, P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
     js_def(res, "done", js_bool(0), P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
   }
@@ -1955,6 +1959,107 @@ static js_value op_valueof(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)n;
   return t;
 }
+static js_value op_tolocale(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  (void)a;
+  (void)n;
+  return js_call(ctx, js_get(ctx, t, "toString"), t, NULL, 0);
+}
+static js_value op_proto_get(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  (void)ctx;
+  (void)a;
+  (void)n;
+  return t.type == JV_OBJ && t.u.obj->proto ? js_obj_value(t.u.obj->proto) : js_null();
+}
+static js_value op_proto_set(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value p = ARG(0);
+  if (t.type == JV_OBJ && (p.type == JV_OBJ || p.type == JV_NULL)) {
+    t.u.obj->proto = p.type == JV_OBJ ? p.u.obj : NULL;
+    gc_write_barrier(t.u.obj);
+  }
+  return js_undef();
+}
+static js_value op_defgetter(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value keyv = ARG(0), fn = ARG(1), ks;
+  const char *key;
+  pentry *pe;
+  if (t.type != JV_OBJ)
+    return js_undef();
+  if (!js_is_callable(fn))
+    return js_throw_type(ctx, "getter is not a function");
+  gc_push_scope();
+  KEEP(t);
+  KEEP(fn);
+  key = to_key(ctx, keyv, &ks);
+  if (ks.type == JV_STR)
+    KEEP(ks);
+  if (key) {
+    pe = pmap_find_pub(t.u.obj, key);
+    js_def_accessor(t.u.obj, key, fn.u.obj, pe && (pe->flags & P_ACCESSOR) ? pe->setter : NULL,
+                    P_CONFIGURABLE | P_ENUMERABLE);
+  }
+  gc_pop_scope();
+  return js_undef();
+}
+static js_value op_defsetter(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value keyv = ARG(0), fn = ARG(1), ks;
+  const char *key;
+  pentry *pe;
+  if (t.type != JV_OBJ)
+    return js_undef();
+  if (!js_is_callable(fn))
+    return js_throw_type(ctx, "setter is not a function");
+  gc_push_scope();
+  KEEP(t);
+  KEEP(fn);
+  key = to_key(ctx, keyv, &ks);
+  if (ks.type == JV_STR)
+    KEEP(ks);
+  if (key) {
+    pe = pmap_find_pub(t.u.obj, key);
+    js_def_accessor(t.u.obj, key, pe && (pe->flags & P_ACCESSOR) ? pe->getter : NULL, fn.u.obj,
+                    P_CONFIGURABLE | P_ENUMERABLE);
+  }
+  gc_pop_scope();
+  return js_undef();
+}
+static js_value lookup_accessor(js_ctx *ctx, js_value t, js_value keyv, int want_set)
+{
+  js_value ks, r = js_undef();
+  const char *key;
+  js_object *o;
+  if (t.type != JV_OBJ)
+    return r;
+  gc_push_scope();
+  KEEP(t);
+  KEEP(keyv);
+  key = to_key(ctx, keyv, &ks);
+  if (ks.type == JV_STR)
+    KEEP(ks);
+  for (o = t.u.obj; key && o; o = o->proto) {
+    pentry *pe = pmap_find_pub(o, key);
+    if (pe) {
+      js_object *f = (pe->flags & P_ACCESSOR) ? (want_set ? pe->setter : pe->getter) : NULL;
+      if (f)
+        r = js_obj_value(f);
+      break;
+    }
+  }
+  gc_pop_scope();
+  return r;
+}
+static js_value op_lookupgetter(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  return lookup_accessor(ctx, t, ARG(0), 0);
+}
+static js_value op_lookupsetter(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  return lookup_accessor(ctx, t, ARG(0), 1);
+}
 static js_value op_isproto(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value x = ARG(0);
@@ -2188,7 +2293,7 @@ static js_value array_splice(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!arr)
     return js_undef();
   start = n > 0 ? clamp_index(js_to_number(ctx, a[0]), (int)arr->elen) : 0;
-  del = n > 1 ? js_to_int_sat(ctx, a[1]) : (int)arr->elen - start;
+  del = n > 1 ? js_to_int_sat(ctx, a[1]) : n == 1 ? (int)arr->elen - start : 0;
   if (del < 0)
     del = 0;
   if (start + del > (int)arr->elen)
@@ -2473,25 +2578,27 @@ static js_value array_fill(js_ctx *ctx, js_value t, js_value *a, int n)
     arr->elems[i] = v;
   return t;
 }
+static void flat_into(js_ctx *ctx, js_object *out, js_object *src, double depth)
+{
+  unsigned i;
+  for (i = 0; i < src->elen && !ctx->has_exc; i++) {
+    js_value e = src->elems[i];
+    if (depth >= 1 && e.type == JV_OBJ && e.u.obj->kind == OBJ_ARRAY)
+      flat_into(ctx, out, e.u.obj, depth - 1);
+    else
+      js_array_push(ctx, out, e);
+  }
+}
 static js_value array_flat(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_object *arr = as_array(ctx, t), *out;
-  unsigned i;
-  int depth = n > 0 ? js_to_int_sat(ctx, a[0]) : 1;
+  double depth = n > 0 && a[0].type != JV_UNDEF ? js_to_number(ctx, a[0]) : 1;
   if (!arr)
     return js_undef();
   gc_push_scope();
   KEEP(t);
   out = (js_object *)gc_keep(js_new_array(ctx, 0));
-  for (i = 0; i < arr->elen; i++) {
-    js_value e = arr->elems[i];
-    if (depth > 0 && e.type == JV_OBJ && e.u.obj->kind == OBJ_ARRAY) {
-      unsigned j;
-      for (j = 0; j < e.u.obj->elen; j++)
-        js_array_push(ctx, out, e.u.obj->elems[j]);
-    } else
-      js_array_push(ctx, out, e);
-  }
+  flat_into(ctx, out, arr, depth);
   gc_pop_scope();
   return js_obj_value(out);
 }
@@ -2538,6 +2645,47 @@ static js_value array_sort(js_ctx *ctx, js_value t, js_value *a, int n)
   }
   gc_pop_scope();
   return t;
+}
+static js_value array_tosorted(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value cmp = ARG(0), c;
+  if (cmp.type != JV_UNDEF && !js_is_callable(cmp))
+    return js_throw_type(ctx, "toSorted comparator is not a function");
+  c = array_slice(ctx, t, NULL, 0);
+  if (c.type != JV_OBJ)
+    return c;
+  return array_sort(ctx, c, a, n);
+}
+static js_value array_toreversed(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value c = array_slice(ctx, t, NULL, 0);
+  if (c.type != JV_OBJ)
+    return c;
+  return array_reverse(ctx, c, a, n);
+}
+static js_value array_tospliced(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value c = array_slice(ctx, t, NULL, 0);
+  if (c.type != JV_OBJ)
+    return c;
+  if (n == 0)
+    return c;
+  array_splice(ctx, c, a, n);
+  return c;
+}
+static js_value array_with(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_value c = array_slice(ctx, t, NULL, 0);
+  int i = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
+  if (c.type != JV_OBJ)
+    return c;
+  if (i < 0)
+    i += (int)c.u.obj->elen;
+  if (i < 0 || i >= (int)c.u.obj->elen)
+    return js_throw_range(ctx, "Invalid index");
+  c.u.obj->elems[i] = ARG(1);
+  gc_write_barrier(c.u.obj);
+  return c;
 }
 
 /* ------------------------------------------------------- String ----------- */
@@ -7622,6 +7770,329 @@ static js_value tap_reduce(js_ctx *ctx, js_value t, js_value *a, int n)
   }
   return acc;
 }
+/* callback scans: every/some/find/findIndex/findLast/findLastIndex */
+enum { TS_EVERY, TS_SOME, TS_FIND, TS_FINDIDX, TS_FINDLAST, TS_FINDLASTIDX };
+static js_value tap_scan(js_ctx *ctx, js_value t, js_value *a, int n, int mode)
+{
+  js_typedarray *ta = as_ta(t);
+  js_value cb = ARG(0), self = ARG(1);
+  int rev = mode >= TS_FINDLAST, i;
+  if (!ta)
+    return js_undef();
+  if (!js_is_callable(cb))
+    return js_throw_type(ctx, "callback is not a function");
+  for (i = rev ? ta->length - 1 : 0; rev ? i >= 0 : i < ta->length; i += rev ? -1 : 1) {
+    js_value ar[3], r;
+    ar[0] = ta_get(ctx, t.u.obj, (unsigned)i);
+    ar[1] = js_number(i);
+    ar[2] = t;
+    r = js_call(ctx, cb, self, ar, 3);
+    if (ctx->has_exc)
+      return js_undef();
+    if (mode == TS_EVERY ? !js_to_boolean(r) : js_to_boolean(r)) {
+      if (mode == TS_EVERY)
+        return js_bool(0);
+      if (mode == TS_SOME)
+        return js_bool(1);
+      return (mode == TS_FIND || mode == TS_FINDLAST) ? ar[0] : js_number(i);
+    }
+  }
+  if (mode == TS_EVERY)
+    return js_bool(1);
+  if (mode == TS_SOME)
+    return js_bool(0);
+  return (mode == TS_FIND || mode == TS_FINDLAST) ? js_undef() : js_number(-1);
+}
+#define TAP_SCAN(fn, mode)                                                                                             \
+  static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n) { return tap_scan(ctx, t, a, n, mode); }
+TAP_SCAN(tap_every, TS_EVERY)
+TAP_SCAN(tap_some, TS_SOME)
+TAP_SCAN(tap_find, TS_FIND)
+TAP_SCAN(tap_findindex, TS_FINDIDX)
+TAP_SCAN(tap_findlast, TS_FINDLAST)
+TAP_SCAN(tap_findlastindex, TS_FINDLASTIDX)
+#undef TAP_SCAN
+/* a new view of the same type holding the elements of `src` (a kept array of values) */
+static js_value ta_from_values(js_ctx *ctx, js_typedarray *like, js_object *src)
+{
+  js_value view;
+  unsigned i;
+  gc_push_scope();
+  {
+    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat((int)src->elen, ta_elem_size(like->type))));
+    view = new_view(ctx, like->type, buf, 0, (int)src->elen);
+    if (view.type == JV_OBJ) {
+      gc_keep(view.u.obj);
+      for (i = 0; i < src->elen && !ctx->has_exc; i++)
+        ta_set(ctx, view.u.obj, i, src->elems[i]);
+    }
+  }
+  gc_pop_scope();
+  return view;
+}
+static js_object *ta_to_array(js_ctx *ctx, js_value t)
+{
+  js_typedarray *ta = as_ta(t);
+  js_object *out = (js_object *)gc_keep(js_new_array(ctx, 0));
+  int i;
+  for (i = 0; ta && i < ta->length; i++)
+    js_array_push(ctx, out, ta_get(ctx, t.u.obj, (unsigned)i));
+  return out;
+}
+static js_value tap_filter(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  js_value cb = ARG(0), self = ARG(1), view = js_undef();
+  js_object *kept;
+  int i;
+  if (!ta)
+    return js_undef();
+  if (!js_is_callable(cb))
+    return js_throw_type(ctx, "callback is not a function");
+  gc_push_scope();
+  kept = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; i < ta->length; i++) {
+    js_value ar[3], r;
+    ar[0] = ta_get(ctx, t.u.obj, (unsigned)i);
+    ar[1] = js_number(i);
+    ar[2] = t;
+    r = js_call(ctx, cb, self, ar, 3);
+    if (ctx->has_exc)
+      break;
+    if (js_to_boolean(r))
+      js_array_push(ctx, kept, ar[0]);
+  }
+  if (!ctx->has_exc)
+    view = ta_from_values(ctx, ta, kept);
+  gc_pop_scope();
+  return view;
+}
+static js_value tap_lastindexof(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  js_value v = ARG(0);
+  int i;
+  if (!ta)
+    return js_number(-1);
+  i = n > 1 ? js_to_int_sat(ctx, a[1]) : ta->length - 1;
+  if (i < 0)
+    i += ta->length;
+  if (i >= ta->length)
+    i = ta->length - 1;
+  for (; i >= 0; i--)
+    if (js_strict_eq(ta_get(ctx, t.u.obj, (unsigned)i), v))
+      return js_number(i);
+  return js_number(-1);
+}
+static js_value tap_at(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  int i = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
+  if (!ta)
+    return js_undef();
+  if (i < 0)
+    i += ta->length;
+  if (i < 0 || i >= ta->length)
+    return js_undef();
+  return ta_get(ctx, t.u.obj, (unsigned)i);
+}
+static js_value tap_reverse(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  int i;
+  (void)a;
+  (void)n;
+  for (i = 0; ta && i < ta->length / 2; i++) {
+    js_value x = ta_get(ctx, t.u.obj, (unsigned)i), y = ta_get(ctx, t.u.obj, (unsigned)(ta->length - 1 - i));
+    gc_push_scope();
+    KEEP(x);
+    KEEP(y);
+    ta_set(ctx, t.u.obj, (unsigned)i, y);
+    ta_set(ctx, t.u.obj, (unsigned)(ta->length - 1 - i), x);
+    gc_pop_scope();
+  }
+  return t;
+}
+static int ta_less(js_ctx *ctx, js_value cmp, js_value x, js_value y)
+{
+  if (js_is_callable(cmp)) {
+    js_value ar[2];
+    ar[0] = x;
+    ar[1] = y;
+    return js_to_number(ctx, js_call(ctx, cmp, js_undef(), ar, 2)) < 0;
+  }
+  if (x.type == JV_NUM && y.type == JV_NUM) {
+    if (x.u.num != x.u.num)
+      return 0;
+    return y.u.num != y.u.num || x.u.num < y.u.num;
+  }
+  return js_to_number(ctx, x) < js_to_number(ctx, y);
+}
+/* stable insertion sort of the elements of `arr` (a kept js array) */
+static void sort_values(js_ctx *ctx, js_object *arr, js_value cmp)
+{
+  unsigned i, j;
+  for (i = 1; i < arr->elen && !ctx->has_exc; i++) {
+    js_value key = arr->elems[i];
+    for (j = i; j > 0 && ta_less(ctx, cmp, key, arr->elems[j - 1]) && !ctx->has_exc; j--)
+      arr->elems[j] = arr->elems[j - 1];
+    arr->elems[j] = key;
+  }
+}
+static js_value tap_sort(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  js_value cmp = ARG(0);
+  js_object *tmp;
+  int i;
+  if (!ta)
+    return t;
+  if (cmp.type != JV_UNDEF && !js_is_callable(cmp))
+    return js_throw_type(ctx, "comparator is not a function");
+  gc_push_scope();
+  KEEP(t);
+  KEEP(cmp);
+  tmp = ta_to_array(ctx, t);
+  sort_values(ctx, tmp, cmp);
+  for (i = 0; i < ta->length && !ctx->has_exc; i++)
+    ta_set(ctx, t.u.obj, (unsigned)i, tmp->elems[i]);
+  gc_pop_scope();
+  return t;
+}
+static js_value tap_tosorted(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  js_value cmp = ARG(0), view = js_undef();
+  js_object *tmp;
+  if (!ta)
+    return js_undef();
+  if (cmp.type != JV_UNDEF && !js_is_callable(cmp))
+    return js_throw_type(ctx, "comparator is not a function");
+  gc_push_scope();
+  KEEP(t);
+  KEEP(cmp);
+  tmp = ta_to_array(ctx, t);
+  sort_values(ctx, tmp, cmp);
+  if (!ctx->has_exc)
+    view = ta_from_values(ctx, ta, tmp);
+  gc_pop_scope();
+  return view;
+}
+static js_value tap_toreversed(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  js_value view = js_undef();
+  js_object *tmp;
+  unsigned i;
+  (void)a;
+  (void)n;
+  if (!ta)
+    return js_undef();
+  gc_push_scope();
+  KEEP(t);
+  tmp = ta_to_array(ctx, t);
+  for (i = 0; i < tmp->elen / 2; i++) {
+    js_value x = tmp->elems[i];
+    tmp->elems[i] = tmp->elems[tmp->elen - 1 - i];
+    tmp->elems[tmp->elen - 1 - i] = x;
+  }
+  view = ta_from_values(ctx, ta, tmp);
+  gc_pop_scope();
+  return view;
+}
+static js_value tap_with(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  js_value view = js_undef();
+  js_object *tmp;
+  int i = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
+  if (!ta)
+    return js_undef();
+  if (i < 0)
+    i += ta->length;
+  if (i < 0 || i >= ta->length)
+    return js_throw_range(ctx, "Invalid typed array index");
+  gc_push_scope();
+  KEEP(t);
+  KEEP(ARG(1));
+  tmp = ta_to_array(ctx, t);
+  tmp->elems[i] = ARG(1);
+  view = ta_from_values(ctx, ta, tmp);
+  gc_pop_scope();
+  return view;
+}
+static js_value tap_reduceright(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  js_value cb = ARG(0), acc;
+  int i;
+  if (!ta)
+    return js_undef();
+  if (!js_is_callable(cb))
+    return js_throw_type(ctx, "callback is not a function");
+  i = ta->length - 1;
+  if (n > 1)
+    acc = a[1];
+  else {
+    if (ta->length == 0)
+      return js_throw_type(ctx, "Reduce of empty array with no initial value");
+    acc = ta_get(ctx, t.u.obj, (unsigned)i--);
+  }
+  for (; i >= 0; i--) {
+    js_value ar[4];
+    gc_push_scope();
+    KEEP(acc);
+    ar[0] = acc;
+    ar[1] = ta_get(ctx, t.u.obj, (unsigned)i);
+    ar[2] = js_number(i);
+    ar[3] = t;
+    acc = js_call(ctx, cb, js_undef(), ar, 4);
+    gc_pop_scope();
+    if (ctx->has_exc)
+      break;
+  }
+  return acc;
+}
+static js_value tap_copywithin(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_typedarray *ta = as_ta(t);
+  int len, to, from, end, cnt, i;
+  js_object *tmp;
+  if (!ta)
+    return t;
+  len = ta->length;
+  to = clamp_idx(n > 0 ? js_to_int_sat(ctx, a[0]) : 0, len);
+  from = clamp_idx(n > 1 ? js_to_int_sat(ctx, a[1]) : 0, len);
+  end = (n > 2 && a[2].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[2]), len) : len;
+  cnt = end - from < len - to ? end - from : len - to;
+  if (cnt <= 0)
+    return t;
+  gc_push_scope();
+  KEEP(t);
+  tmp = ta_to_array(ctx, t);
+  for (i = 0; i < cnt; i++)
+    ta_set(ctx, t.u.obj, (unsigned)(to + i), tmp->elems[from + i]);
+  gc_pop_scope();
+  return t;
+}
+static js_value tap_values(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  (void)a;
+  (void)n;
+  return make_array_iter(ctx, t, 0);
+}
+static js_value tap_keys(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  (void)a;
+  (void)n;
+  return make_array_iter(ctx, t, 1);
+}
+static js_value tap_entries(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  (void)a;
+  (void)n;
+  return make_array_iter(ctx, t, 2);
+}
 /* TypedArray.of / .from read their element kind from the native's bound data */
 static js_value ta_of(js_ctx *ctx, js_value t, js_value *a, int n)
 {
@@ -7964,6 +8435,25 @@ static void setup_typed_arrays(js_ctx *ctx)
   js_def_native(ctx, ctx->typedarray_proto, "forEach", tap_foreach, 1);
   js_def_native(ctx, ctx->typedarray_proto, "map", tap_map, 1);
   js_def_native(ctx, ctx->typedarray_proto, "reduce", tap_reduce, 2);
+  js_def_native(ctx, ctx->typedarray_proto, "every", tap_every, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "some", tap_some, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "find", tap_find, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "findIndex", tap_findindex, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "findLast", tap_findlast, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "findLastIndex", tap_findlastindex, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "filter", tap_filter, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "lastIndexOf", tap_lastindexof, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "at", tap_at, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "reverse", tap_reverse, 0);
+  js_def_native(ctx, ctx->typedarray_proto, "sort", tap_sort, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "toSorted", tap_tosorted, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "toReversed", tap_toreversed, 0);
+  js_def_native(ctx, ctx->typedarray_proto, "with", tap_with, 2);
+  js_def_native(ctx, ctx->typedarray_proto, "reduceRight", tap_reduceright, 1);
+  js_def_native(ctx, ctx->typedarray_proto, "copyWithin", tap_copywithin, 2);
+  js_def_native(ctx, ctx->typedarray_proto, "keys", tap_keys, 0);
+  js_def_native(ctx, ctx->typedarray_proto, "entries", tap_entries, 0);
+  js_def_native(ctx, ctx->typedarray_proto, "toLocaleString", tap_tostring, 0);
 
   /* the twelve views: a constructor + a per-view prototype chained to the shared
    * one */
@@ -8958,6 +9448,16 @@ void js_setup_builtins(js_ctx *ctx)
   js_def_native(ctx, ctx->object_proto, "toString", op_tostring, 0);
   js_def_native(ctx, ctx->object_proto, "valueOf", op_valueof, 0);
   js_def_native(ctx, ctx->object_proto, "isPrototypeOf", op_isproto, 1);
+  js_def_native(ctx, ctx->object_proto, "toLocaleString", op_tolocale, 0);
+  js_def_native(ctx, ctx->object_proto, "__defineGetter__", op_defgetter, 2);
+  js_def_native(ctx, ctx->object_proto, "__defineSetter__", op_defsetter, 2);
+  js_def_native(ctx, ctx->object_proto, "__lookupGetter__", op_lookupgetter, 1);
+  js_def_native(ctx, ctx->object_proto, "__lookupSetter__", op_lookupsetter, 1);
+  {
+    js_object *g = (js_object *)gc_keep(js_new_native(ctx, op_proto_get, "__proto__", 0));
+    js_object *s = (js_object *)gc_keep(js_new_native(ctx, op_proto_set, "__proto__", 1));
+    js_def_accessor(ctx->object_proto, "__proto__", g, s, P_CONFIGURABLE);
+  }
   {
     js_object *octor = make_ctor(ctx, "Object", native_object, ctx->object_proto);
     js_def_native(ctx, octor, "keys", object_keys, 1);
@@ -9049,6 +9549,11 @@ void js_setup_builtins(js_ctx *ctx)
   js_def_native(ctx, ctx->array_proto, "findLastIndex", array_findlastindex, 1);
   js_def_native(ctx, ctx->array_proto, "reduceRight", array_reduceright, 1);
   js_def_native(ctx, ctx->array_proto, "copyWithin", array_copywithin, 2);
+  js_def_native(ctx, ctx->array_proto, "toSorted", array_tosorted, 1);
+  js_def_native(ctx, ctx->array_proto, "toReversed", array_toreversed, 0);
+  js_def_native(ctx, ctx->array_proto, "toSpliced", array_tospliced, 2);
+  js_def_native(ctx, ctx->array_proto, "with", array_with, 2);
+  js_def_native(ctx, ctx->array_proto, "toLocaleString", array_tostring, 0);
   js_def_native(ctx, ctx->array_proto, "values", array_values_m, 0);
   js_def_native(ctx, ctx->array_proto, "keys", array_keys_m, 0);
   js_def_native(ctx, ctx->array_proto, "entries", array_entries_m, 0);
@@ -9243,6 +9748,11 @@ void js_setup_builtins(js_ctx *ctx)
   {
     js_object *f = js_new_native(ctx, set_values, "[Symbol.iterator]", 0);
     js_def(ctx->array_proto, js_symbol_key(ctx->sym_iterator), js_obj_value(f), 0);
+  }
+  {
+    js_object *f = js_new_native(ctx, tap_values, "values", 0);
+    js_def(ctx->typedarray_proto, "values", js_obj_value(f), P_WRITABLE | P_CONFIGURABLE);
+    js_def(ctx->typedarray_proto, js_symbol_key(ctx->sym_iterator), js_obj_value(f), P_WRITABLE | P_CONFIGURABLE);
   }
   {
     js_object *f = js_new_native(ctx, string_values_m, "[Symbol.iterator]", 0);
