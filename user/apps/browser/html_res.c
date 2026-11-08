@@ -1,4 +1,5 @@
 #include "features/clienthints/clienthints.h"
+#include "fontstore.h"
 #include "html_int.h"
 
 /* Stylesheets are collected as an ORDERED list of sources first */
@@ -348,8 +349,11 @@ void load_faces(struct dom_node *root, const char *page_url, res_batch_fn fetch)
         chosen = 0;
         break;
       } /* default UI sans */
-      if (fam_monospace(name)) {
-        struct font *m = load_face_file("/etc/fonts/LiberationMono-Regular.ttf", &nf[nn]);
+      char fpath[96];
+      if (fam_monospace(name))
+        fontstore_path(FONT_MONO, fpath, sizeof fpath);
+      if (fam_monospace(name) || fontstore_find(name, fpath, sizeof fpath)) {
+        struct font *m = load_face_file(fpath, &nf[nn]);
         if (m) {
           chosen = m;
           nn++;

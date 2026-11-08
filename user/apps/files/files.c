@@ -1,5 +1,6 @@
 /* files.c, a navigable file explorer for owofs */
 #include "dialog.h"
+#include "fontstore.h"
 #include "gfx.h"
 #include "owos.h"
 #include <stdbool.h>
@@ -423,7 +424,39 @@ static void open_with(const char *name, const char *prog)
     waitpid(pid);
 }
 
-static void open_file(const char *name) { open_with(name, app_for(name)); }
+static bool is_font_file(const char *name)
+{
+  const char *dot = 0;
+  for (const char *p = name; *p; p++)
+    if (*p == '.')
+      dot = p;
+  return dot &&
+         (ext_eq(dot + 1, "ttf") || ext_eq(dot + 1, "otf") || ext_eq(dot + 1, "woff") || ext_eq(dot + 1, "woff2"));
+}
+
+static void install_font(int id, const char *name)
+{
+  char fp[256], msg[128], installed[64];
+  full_path(name, fp, sizeof fp);
+  snprintf(msg, sizeof msg, "Install font '%s' for all apps?", name);
+  if (dialog_msg(id, "Install font", msg, DLG_ICON_QUESTION | DLG_YESNO) != DLG_R_YES)
+    return;
+  if (fontstore_install(fp, installed) == 0) {
+    snprintf(msg, sizeof msg, "Installed %s. Choose it in Settings > Fonts.", installed);
+    dialog_msg(id, "Install font", msg, DLG_ICON_INFO);
+  } else
+    dialog_msg(id, "Install font",
+               "Not a usable font (TrueType or OpenType with CFF, WOFF/WOFF2), or /etc/fonts is not writable.",
+               DLG_ICON_ERROR);
+}
+
+static void open_file(int id, const char *name)
+{
+  if (is_font_file(name))
+    install_font(id, name);
+  else
+    open_with(name, app_for(name));
+}
 
 /* Confirm and remove the entry `name` in the current directory, a file via unlink */
 static void delete_entry(int id, const char *name, bool is_dir)
@@ -740,7 +773,7 @@ static void ctx_run(int act, int id)
   switch (act) {
   case A_OPEN:
     if (ctx.kind == CTX_FILE) {
-      open_file(ctx.name);
+      open_file(id, ctx.name);
     } else if (ctx.kind == CTX_DIR) {
       if (feq(ctx.name, ".."))
         go_up();
@@ -887,7 +920,7 @@ static void activate(int id)
     sel = -1;
     set_title(id);
   } else {
-    open_file(fe->name);
+    open_file(id, fe->name);
   }
   seq++;
 }
@@ -1013,7 +1046,7 @@ static void dblclick(int id, int mx, int my)
     sel = -1;
     set_title(id);
   } else {
-    open_file(fe->name);
+    open_file(id, fe->name);
   }
   seq++;
 }

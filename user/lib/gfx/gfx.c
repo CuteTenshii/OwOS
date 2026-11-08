@@ -1,6 +1,7 @@
 /* gfx.c: user-space drawing into a window's shared pixel buffer. See gfx.h */
 #include "gfx.h"
 #include "font.h" /* scalable fonts, loaded at runtime (no baked atlas) */
+#include "fontstore.h"
 #include "owos.h" /* KEY_* editing codes delivered via WEV_KEY */
 
 /* Apps lay out the monospace grid on this fixed cell (terminals, the editor) */
@@ -190,16 +191,16 @@ struct gfx_face {
 };
 static struct gfx_face g_sans, g_mono;
 
-#define SANS_PATH "/etc/fonts/LiberationSans-Regular.ttf"
 #define SANS_PX 15
-#define MONO_PATH "/etc/fonts/LiberationMono-Regular.ttf"
 #define MONO_PX 13
 
-static int face_ready(struct gfx_face *f, const char *path, int px)
+static int face_ready(struct gfx_face *f, int role, int px)
 {
   if (!f->tried) {
+    char path[96];
     f->tried = 1;
     f->px = px;
+    fontstore_path(role, path, sizeof path);
     struct statinfo st;
     if (stat(path, &st) < 0 || st.is_dir || st.size == 0)
       return 0;
@@ -292,7 +293,7 @@ static int sans_view(int px, struct face_view *v)
 {
   if (px <= 0)
     px = SANS_PX;
-  if (!face_ready(&g_sans, SANS_PATH, SANS_PX))
+  if (!face_ready(&g_sans, FONT_SANS, SANS_PX))
     return 0;
   if (px == SANS_PX) {
     v->font = g_sans.font;
@@ -351,7 +352,7 @@ void gfx_glyph(int x, int y, unsigned char ch, unsigned fg, unsigned bg)
 {
   if (!(bg & GFX_TRANSPARENT))
     gfx_fill_rect(x, y, GFX_FONT_W, GFX_FONT_H, bg);
-  if (!face_ready(&g_mono, MONO_PATH, MONO_PX))
+  if (!face_ready(&g_mono, FONT_MONO, MONO_PX))
     return;
   face_blit(x, y + g_mono.baseline, face_glyph(&g_mono, ch), fg);
 }
