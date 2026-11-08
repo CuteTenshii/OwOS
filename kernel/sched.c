@@ -955,6 +955,8 @@ void sched_exit(int status)
     child = child->next;
   } while (child != &main_task);
 
+  __sync_synchronize(); /* the zombie state must be visible before we look at whether the parent is waiting */
+
   /* Notify the parent: SIGCHLD only if it has a real handler; wake a waitpid or handler waiter. */
   task_t *parent = find_task(current->parent);
   if (parent && parent->state != TASK_FREE && parent->state != TASK_ZOMBIE) {
@@ -1192,16 +1194,21 @@ int sched_sigreturn(struct registers *r)
 }
 
 /* Find an exited child of `current` matching pid (-1 = any). */
-static task_t *zombie_child(int pid)
+/* A child that has exited. Until its CPU has switched away (`settled`) it cannot be reaped yet, and nothing wakes a
+ * parent that went to sleep waiting for it, so callers poll such a child instead of sleeping. */
+static task_t *zombie_child_state(int pid, bool settled)
 {
   task_t *t = &main_task;
   do {
-    if (t->state == TASK_ZOMBIE && !task_running(t) && t->parent == current->id && (pid < 0 || (int)t->id == pid))
+    if (t->state == TASK_ZOMBIE && (!settled || !task_running(t)) && t->parent == current->id &&
+        (pid < 0 || (int)t->id == pid))
       return t;
     t = t->next;
   } while (t != &main_task);
   return 0;
 }
+
+static task_t *zombie_child(int pid) { return zombie_child_state(pid, true); }
 
 static bool has_child(int pid)
 {
@@ -1226,8 +1233,19 @@ int sched_waitpid(int pid)
     }
     if (!has_child(pid))
       return -1;
-    current->state = TASK_WAITING;
+    if (zombie_child_state(pid, false)) { /* exiting on another CPU: let it finish, then reap it */
+      schedule();
+      continue;
+    }
     current->wait_pid = pid;
+    current->state = TASK_WAITING;
+    /* A child on another CPU may have exited between the check above and this store, before it could see us
+     * waiting. Look again now that it will: either it finds us WAITING and wakes us, or we find it a zombie. */
+    __sync_synchronize();
+    if (zombie_child_state(pid, false)) {
+      current->state = TASK_RUNNABLE;
+      continue;
+    }
     schedule();               /* yield; woken when a child exits */
     if (sched_intr_pending()) /* a signal wants delivery: bail (EINTR) */
       return -1;
