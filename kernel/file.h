@@ -13,6 +13,8 @@ enum {
   FD_PIPE_WR, /* write end of a pipe                                    */
   FD_PORT,    /* an IPC listen handle (server side); `pipe` = port id   */
   FD_CHANNEL, /* a bidirectional IPC connection: read `pipe`, write `tx`*/
+  FD_TTY,     /* slave side of a pty: a channel that isatty() reports   */
+  FD_PTY,     /* master side of a pty: a channel; `pipe` also holds the pty's state */
 };
 
 struct fd {
@@ -20,5 +22,11 @@ struct fd {
   uint8_t pipe; /* a pipe-pool index (pipe end / channel rx), or a port id */
   uint8_t tx;   /* channel tx pipe-pool index, when type is FD_CHANNEL     */
 };
+
+/* Channels, ttys and pty masters all read `pipe` and write `tx`. */
+static inline int fd_is_channel(const struct fd *f)
+{
+  return f->type == FD_CHANNEL || f->type == FD_TTY || f->type == FD_PTY;
+}
 
 #endif /* OWOS_FILE_H */

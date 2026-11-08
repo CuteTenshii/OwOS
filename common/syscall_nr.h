@@ -91,5 +91,17 @@
 #define SYS_CHOWN 88
 #define SYS_UMASK 89
 #define SYS_ACCESS 90
+#define SYS_TTY 91
+
+/* SYS_SPAWN_CAP request flags */
+#define SPAWN_PTY 1   /* give the child a pty as fds 0-2 and return the master fd in *rfd */
+#define SPAWN_STDIO 2 /* child fds 0-2 are copies of the caller's fds named in stdio[] (-1: left as the default) */
+
+/* SYS_TTY commands (fd in ebx, command in ecx, argument in edx) */
+#define TTY_ISATTY 0   /* 1 if fd is a terminal */
+#define TTY_GETSIZE 1  /* cols << 16 | rows */
+#define TTY_SETSIZE 2  /* pty master only; arg = cols << 16 | rows */
+#define TTY_SETFG 3    /* record the foreground job pid (0 = the shell itself) */
+#define TTY_GETFG 4    /* the recorded foreground pid */
 
 #endif

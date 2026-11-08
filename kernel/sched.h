@@ -57,9 +57,11 @@ uint32_t sched_current_id(void);   /* current task's pid */
 uint32_t sched_current_process_id(void);
 const char *sched_current_name(void); /* current task's name (crash reporter) */
 void sched_set_pipe_fd(int pid, int fd, int writer, int pipe_id);
-void sched_set_cwd(int pid, const char *path); /* set a child's working dir */
-void sched_set_cwd_self(const char *path);     /* set the caller's own cwd */
-const char *sched_cwd(void);                   /* the current task's working dir (absolute) */
+void sched_set_fd(int pid, int fd, const struct fd *f); /* install a copy of an open file in a new child */
+void fd_ref(const struct fd *f);                        /* take a reference for a new copy of an open file */
+void sched_set_cwd(int pid, const char *path);          /* set a child's working dir */
+void sched_set_cwd_self(const char *path);              /* set the caller's own cwd */
+const char *sched_cwd(void);                            /* the current task's working dir (absolute) */
 
 /* Per-process credentials, inherited across spawn/fork; sched_set_creds_self is for login/su. */
 uint32_t sched_uid(void);

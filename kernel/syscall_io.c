@@ -6,6 +6,7 @@
 #include "keyboard.h"
 #include "pipe.h"
 #include "sched.h"
+#include "syscall_nr.h"
 #include "uaccess.h"
 #include <stdint.h>
 
@@ -25,7 +26,7 @@ void syscall_io_write(struct registers *r)
     r->eax = len;
   } else if (f->type == FD_PIPE_WR) {
     r->eax = (uint32_t)pipe_write(f->pipe, buf, (int)len);
-  } else if (f->type == FD_CHANNEL) {
+  } else if (fd_is_channel(f)) {
     r->eax = (uint32_t)pipe_write(f->tx, buf, (int)len);
   } else {
     r->eax = (uint32_t)-1;
@@ -61,7 +62,7 @@ void syscall_io_read(struct registers *r)
     while (n < len && keyboard_poll_text(&c, 0))
       buf[n++] = c;
     r->eax = n;
-  } else if (f->type == FD_PIPE_RD || f->type == FD_CHANNEL) {
+  } else if (f->type == FD_PIPE_RD || fd_is_channel(f)) {
     r->eax = (uint32_t)pipe_read(f->pipe, buf, (int)len);
   } else {
     r->eax = (uint32_t)-1;
@@ -125,7 +126,7 @@ void syscall_io_close(struct registers *r)
     pipe_close(f->pipe, 0);
   else if (f->type == FD_PIPE_WR)
     pipe_close(f->pipe, 1);
-  else if (f->type == FD_CHANNEL) {
+  else if (fd_is_channel(f)) {
     pipe_close(f->pipe, 0);
     pipe_close(f->tx, 1);
   } else if (f->type == FD_PORT) {
@@ -144,7 +145,8 @@ void syscall_io_read_nb(struct registers *r)
     return;
   }
   struct fd *f = &sched_fds()[fd];
-  r->eax = f->type == FD_PIPE_RD ? (uint32_t)pipe_read_nb(f->pipe, (void *)r->ecx, (int)len) : (uint32_t)-1;
+  r->eax = f->type == FD_PIPE_RD || fd_is_channel(f) ? (uint32_t)pipe_read_nb(f->pipe, (void *)r->ecx, (int)len)
+                                                     : (uint32_t)-1;
 }
 
 void syscall_io_port_open(struct registers *r)
@@ -216,4 +218,41 @@ void syscall_io_port_accept(struct registers *r)
   fds[nfd].pipe = (uint8_t)rx;
   fds[nfd].tx = (uint8_t)tx;
   r->eax = (uint32_t)nfd;
+}
+
+/* SYS_TTY: terminal queries and the pty state (size, foreground job) kept on the slave-to-master pipe. */
+void syscall_io_tty(struct registers *r)
+{
+  int fd = (int)r->ebx;
+  struct fd *fds = sched_fds();
+  r->eax = (uint32_t)-1;
+  if (fd < 0 || fd >= MAX_FD || fds[fd].type == FD_NONE)
+    return;
+  struct fd *f = &fds[fd];
+  if (r->ecx == TTY_ISATTY) {
+    r->eax = f->type == FD_CONSOLE || f->type == FD_TTY || f->type == FD_PTY;
+    return;
+  }
+  if (f->type != FD_TTY && f->type != FD_PTY)
+    return;
+  struct pipe_tty *t = pipe_tty(f->type == FD_PTY ? f->pipe : f->tx);
+  switch (r->ecx) {
+  case TTY_GETSIZE:
+    r->eax = (uint32_t)t->cols << 16 | t->rows;
+    break;
+  case TTY_SETSIZE:
+    if (f->type == FD_PTY && (r->edx >> 16) && (r->edx & 0xFFFF)) {
+      t->cols = (uint16_t)(r->edx >> 16);
+      t->rows = (uint16_t)r->edx;
+      r->eax = 0;
+    }
+    break;
+  case TTY_SETFG:
+    t->fg_pid = (int)r->edx;
+    r->eax = 0;
+    break;
+  case TTY_GETFG:
+    r->eax = (uint32_t)t->fg_pid;
+    break;
+  }
 }

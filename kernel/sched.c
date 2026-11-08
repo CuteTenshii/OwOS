@@ -111,6 +111,19 @@ static void sig_init(task_t *t)
   }
 }
 
+/* Take one reference for a new copy of an open file. */
+void fd_ref(const struct fd *f)
+{
+  if (f->type == FD_PIPE_RD)
+    pipe_ref(f->pipe, 0);
+  else if (f->type == FD_PIPE_WR)
+    pipe_ref(f->pipe, 1);
+  else if (fd_is_channel(f)) {
+    pipe_ref(f->pipe, 0); /* rx reader */
+    pipe_ref(f->tx, 1);   /* tx writer */
+  }
+}
+
 /* Drop references this task held on any pipe ends. */
 static void fds_close_all(task_t *t)
 {
@@ -119,7 +132,7 @@ static void fds_close_all(task_t *t)
       pipe_close(t->fds[i].pipe, 0);
     else if (t->fds[i].type == FD_PIPE_WR)
       pipe_close(t->fds[i].pipe, 1);
-    else if (t->fds[i].type == FD_CHANNEL) {
+    else if (fd_is_channel(&t->fds[i])) {
       pipe_close(t->fds[i].pipe, 0); /* rx reader */
       pipe_close(t->fds[i].tx, 1);   /* tx writer */
     } else if (t->fds[i].type == FD_PORT)
@@ -595,14 +608,8 @@ int sched_fork(struct registers *r)
   /* The child inherits the parent's open files (Unix semantics). */
   for (int i = 0; i < MAX_FD; i++) {
     t->fds[i] = current->fds[i];
-    if (t->fds[i].type == FD_PIPE_RD)
-      pipe_ref(t->fds[i].pipe, 0);
-    else if (t->fds[i].type == FD_PIPE_WR)
-      pipe_ref(t->fds[i].pipe, 1);
-    else if (t->fds[i].type == FD_CHANNEL) {
-      pipe_ref(t->fds[i].pipe, 0); /* rx reader */
-      pipe_ref(t->fds[i].tx, 1);   /* tx writer */
-    } else if (t->fds[i].type == FD_PORT)
+    fd_ref(&t->fds[i]);
+    if (t->fds[i].type == FD_PORT)
       t->fds[i].type = FD_NONE; /* a listen port stays single-owner */
   }
 
@@ -754,6 +761,16 @@ void sched_set_pipe_fd(int pid, int fd, int writer, int pipe_id)
     return;
   t->fds[fd].type = writer ? FD_PIPE_WR : FD_PIPE_RD;
   t->fds[fd].pipe = (uint8_t)pipe_id;
+}
+
+/* Give a not-yet-running process a copy of an open file as `fd` (taking a reference). */
+void sched_set_fd(int pid, int fd, const struct fd *f)
+{
+  task_t *t = find_task((uint32_t)pid);
+  if (!t || fd < 0 || fd >= MAX_FD)
+    return;
+  t->fds[fd] = *f;
+  fd_ref(f);
 }
 
 /* Set a not-yet-running process's working directory. */

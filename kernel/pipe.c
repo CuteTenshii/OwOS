@@ -3,7 +3,7 @@
 #include "pipe.h"
 #include "sched.h"
 
-#define MAX_PIPES 16 /* spawn_cap uses 1 each; an IPC channel uses 2 (rx+tx) */
+#define MAX_PIPES 64 /* spawn_cap uses 1 each; an IPC channel or pty uses 2 (rx+tx) */
 #define PIPE_SIZE 512
 
 struct pipe {
@@ -11,6 +11,7 @@ struct pipe {
   char buf[PIPE_SIZE];
   int head, tail, count;
   int readers, writers;
+  struct pipe_tty tty;
 };
 
 static struct pipe pipes[MAX_PIPES];
@@ -23,6 +24,7 @@ int pipe_alloc(void)
       pipes[i].head = pipes[i].tail = pipes[i].count = 0;
       pipes[i].readers = 1;
       pipes[i].writers = 1;
+      pipes[i].tty = (struct pipe_tty){80, 24, 0};
       return i;
     }
   }
@@ -96,3 +98,5 @@ int pipe_write(int id, const char *buf, int len)
   }
   return n;
 }
+
+struct pipe_tty *pipe_tty(int id) { return &pipes[id].tty; }

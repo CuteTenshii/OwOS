@@ -237,56 +237,75 @@ int statfs(const char *path, struct statfs_info *out) { return syscall(SYS_STATF
 
 int spawn(const char *path, const char *arg) { return syscall(SYS_SPAWN, (int)path, (int)arg, 0); }
 
+/* SYS_SPAWN_CAP request; see syscall_exec_spawn_cap in the kernel */
+struct spawn_req {
+  const char *path;
+  char *const *argv;
+  int argc;
+  int *rfd;
+  int *wfd;
+  int uid;
+  int gid;
+  const char *cwd;
+  unsigned flags;
+  int stdio[3];
+};
+
+static int spawn_req(const struct spawn_req *req) { return syscall(SYS_SPAWN_CAP, (int)req, 0, 0); }
+
 /* spawn_cap with a full argv; the kernel uses `path` for the image */
 int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
 {
-  struct {
-    const char *path;
-    char *const *argv;
-    int argc;
-    int *rfd;
-    int *wfd;
-    int uid;
-    int gid;
-    const char *cwd;
-  } req = {path, argv, argc, rfd, 0, -1, -1, 0};
-  return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
+  struct spawn_req req = {path, argv, argc, rfd, 0, -1, -1, 0, 0, {-1, -1, -1}};
+  return spawn_req(&req);
 }
 
 /* Like spawn_cap, plus a stdin pipe whose write end is stored in *wfd */
 int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *wfd)
 {
-  struct {
-    const char *path;
-    char *const *argv;
-    int argc;
-    int *rfd;
-    int *wfd;
-    int uid;
-    int gid;
-    const char *cwd;
-  } req = {path, argv, argc, rfd, wfd, -1, -1, 0};
-  *wfd = -1;
-  return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
+  return spawn_cap_io_as(path, argv, argc, -1, -1, 0, rfd, wfd);
 }
 
 /* Like spawn_cap_io, plus uid/gid and cwd (uid/gid < 0 or cwd == 0 inherit) */
 int spawn_cap_io_as(const char *path, char *const argv[], int argc, int uid, int gid, const char *cwd, int *rfd,
                     int *wfd)
 {
-  struct {
-    const char *path;
-    char *const *argv;
-    int argc;
-    int *rfd;
-    int *wfd;
-    int uid;
-    int gid;
-    const char *cwd;
-  } req = {path, argv, argc, rfd, wfd, uid, gid, cwd};
+  struct spawn_req req = {path, argv, argc, rfd, wfd, uid, gid, cwd, 0, {-1, -1, -1}};
   *wfd = -1;
-  return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
+  return spawn_req(&req);
 }
+
+/* Child fds 0-2 are copies of the caller's fds in/out/err (-1: the default) */
+int spawn_stdio(const char *path, char *const argv[], int argc, int in, int out, int err)
+{
+  struct spawn_req req = {path, argv, argc, 0, 0, -1, -1, 0, SPAWN_STDIO, {in, out, err}};
+  return spawn_req(&req);
+}
+
+/* Child fds 0-2 are a new pty's slave side; *master is our end */
+int spawn_pty(const char *path, char *const argv[], int argc, int *master)
+{
+  struct spawn_req req = {path, argv, argc, master, 0, -1, -1, 0, SPAWN_PTY, {-1, -1, -1}};
+  return spawn_req(&req);
+}
+
+int isatty(int fd) { return syscall(SYS_TTY, fd, TTY_ISATTY, 0) == 1; }
+
+int tty_size(int fd, int *cols, int *rows)
+{
+  int v = syscall(SYS_TTY, fd, TTY_GETSIZE, 0);
+  if (v < 0)
+    return -1;
+  *cols = (int)((unsigned)v >> 16);
+  *rows = v & 0xFFFF;
+  return 0;
+}
+
+int tty_set_size(int master, int cols, int rows) { return syscall(SYS_TTY, master, TTY_SETSIZE, cols << 16 | rows); }
+
+int tty_set_fg(int fd, int pid) { return syscall(SYS_TTY, fd, TTY_SETFG, pid); }
+
+int tty_fg(int fd) { return syscall(SYS_TTY, fd, TTY_GETFG, 0); }
 
 /* Non-blocking read: >0 bytes, 0 if it would block, -1 at EOF */
 int read_nb(int fd, void *buf, int len) { return syscall(SYS_READ_NB, fd, (int)buf, len); }

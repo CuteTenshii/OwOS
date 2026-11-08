@@ -326,6 +326,15 @@ int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *
 /* Like spawn_cap_io, but also sets the child's uid/gid and cwd */
 int spawn_cap_io_as(const char *path, char *const argv[], int argc, int uid, int gid, const char *cwd, int *rfd,
                     int *wfd);
+/* Child fds 0-2 are copies of the caller's fds in/out/err (-1: left as the default console) */
+int spawn_stdio(const char *path, char *const argv[], int argc, int in, int out, int err);
+/* Child fds 0-2 are a new pty's slave side; *master is our end (read its output, write its input) */
+int spawn_pty(const char *path, char *const argv[], int argc, int *master);
+int isatty(int fd);                         /* 1 for the console or a pty slave/master */
+int tty_size(int fd, int *cols, int *rows); /* window size of a pty (80x24 until the master sets it) */
+int tty_set_size(int master, int cols, int rows);
+int tty_set_fg(int fd, int pid); /* the shell records which job owns the terminal; 0 = the shell */
+int tty_fg(int fd);
 int read_nb(int fd, void *buf, int len); /* >0 bytes / 0 would-block / -1 EOF */
 int chdir(const char *path);             /* set this process's cwd; 0/-1 */
 int kill(int pid, int sig);              /* post a signal to a task; 0/-1 */
