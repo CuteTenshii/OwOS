@@ -91,7 +91,7 @@ LIBGCC  := $(shell $(UCC) -m32 -print-libgcc-file-name)  # 64-bit div helpers et
 CRYPTO  := user/lib/crypto/crypto.o user/lib/crypto/ed25519.o   # SHA-1/256/512/HMAC/PRF/HKDF/AES-GCM/X25519 + Ed25519 (torrent, ssh, curl)
 # tls: user-space TLS 1.3 client with a TLS 1.2 fallback, over an owned SK_TCP
 # socket. Ported from kernel/tls.c; cert not verified. Needs $(CRYPTO).
-TLS     := user/lib/tls/tls.o
+TLS     := user/lib/tls/tls.o user/lib/tls/ech.o
 # netconn: a TCP-or-TLS byte-stream transport wrapper (SK_TCP socket or $(TLS)
 # conn behind one handle). Used by libcurl HTTP/1.1 + the WebSocket client; needs
 # $(TLS) (+ $(CRYPTO), which TLS needs).

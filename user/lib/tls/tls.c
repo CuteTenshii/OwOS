@@ -29,6 +29,7 @@
 #include <stdint.h>
 
 #include "crypto.h"
+#include "ech.h"
 #include "owos.h"
 #include "resolve.h"
 #include "tls.h"
@@ -99,6 +100,8 @@ static void put64be(uint8_t *p, uint64_t v)
 #define CIPHER_ECDHE_RSA_AES128_GCM 0xC02F /* TLS 1.2 */
 #define CIPHER_AES128_GCM_SHA256 0x1301    /* TLS 1.3 */
 
+#define ECH_RETRY_MAX 1024u
+
 #define TLS_RECMAX 18432u
 #define TLS_HSMAX 20480u
 
@@ -119,6 +122,14 @@ struct tls_conn {
   uint8_t client_iv[12], server_iv[12]; /* 1.2 uses first 4; 1.3 all 12 */
 
   struct sha256 transcript; /* running hash of handshake messages      */
+
+  /* ECH: 0 not offered, 1 offered but not (yet) accepted, 2 accepted. On a
+   * rejection the server's retry_configs land in retry[]. */
+  int ech;
+  struct sha256 inner_transcript; /* ClientHelloInner, until acceptance is known */
+  uint8_t inner_random[32];
+  uint8_t retry[ECH_RETRY_MAX];
+  uint32_t retrylen;
 
   /* ALPN: the application protocol the server selected ("h2"/"http/1.1"), or
    * empty if it offered none. Read by tls_alpn(). */
@@ -451,9 +462,12 @@ static void install_keys(struct tls_conn *c, const uint8_t c_secret[32], const u
 /* --------------------------------------------------------- ClientHello */
 
 /* One ClientHello offering both TLS 1.3 (key_share + supported_versions) and
- * TLS 1.2 (ECDHE-RSA). The server's chosen version decides which path runs. */
-static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32], const uint8_t our_pub[32],
-                                   const char *sni, int offer_h2)
+ * TLS 1.2 (ECDHE-RSA). The server's chosen version decides which path runs.
+ * `inner` builds a ClientHelloInner instead: TLS 1.3 only (RFC 9849 §6.1).
+ * `tail` is a pre-encoded extension appended last (the ECH extension). */
+static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32], const uint8_t session_id[32],
+                                   const uint8_t our_pub[32], const char *sni, int offer_h2, int inner,
+                                   const uint8_t *tail, uint32_t taillen)
 {
   uint32_t namelen = 0;
   if (sni)
@@ -472,18 +486,20 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
   memcpy(p, client_random, 32);
   p += 32;
   *p++ = 32; /* legacy_session_id (compat) */
-  rng_bytes(p, 32);
+  memcpy(p, session_id, 32);
   p += 32;
 
   /* cipher_suites: TLS 1.3 AEAD, TLS 1.2 ECDHE-RSA, empty-reneg SCSV */
-  put16(p, 6);
+  put16(p, inner ? 2 : 6);
   p += 2;
   put16(p, CIPHER_AES128_GCM_SHA256);
   p += 2;
-  put16(p, CIPHER_ECDHE_RSA_AES128_GCM);
-  p += 2;
-  put16(p, 0x00FF);
-  p += 2;
+  if (!inner) {
+    put16(p, CIPHER_ECDHE_RSA_AES128_GCM);
+    p += 2;
+    put16(p, 0x00FF);
+    p += 2;
+  }
 
   *p++ = 1;
   *p++ = 0; /* compression_methods: null */
@@ -516,12 +532,14 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
   put16(p, 0x001D);
   p += 2;
   /* ec_point_formats: uncompressed (for the TLS 1.2 path) */
-  put16(p, 0x000B);
-  p += 2;
-  put16(p, 2);
-  p += 2;
-  *p++ = 1;
-  *p++ = 0;
+  if (!inner) {
+    put16(p, 0x000B);
+    p += 2;
+    put16(p, 2);
+    p += 2;
+    *p++ = 1;
+    *p++ = 0;
+  }
   /* signature_algorithms: rsa_pss (1.3) + rsa_pkcs1 + ecdsa */
   put16(p, 0x000D);
   p += 2;
@@ -537,13 +555,15 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
   /* supported_versions: TLS 1.3 then 1.2 */
   put16(p, 0x002B);
   p += 2;
-  put16(p, 5);
+  put16(p, inner ? 3 : 5);
   p += 2;
-  *p++ = 4;
+  *p++ = inner ? 2 : 4;
   put16(p, 0x0304);
   p += 2;
-  put16(p, 0x0303);
-  p += 2;
+  if (!inner) {
+    put16(p, 0x0303);
+    p += 2;
+  }
   /* key_share: one x25519 share */
   put16(p, 0x0033);
   p += 2;
@@ -574,6 +594,10 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
     *p++ = 8;
     memcpy(p, "http/1.1", 8);
     p += 8;
+  }
+  if (taillen) {
+    memcpy(p, tail, taillen);
+    p += taillen;
   }
 
   put16(extlen, (uint16_t)(p - exts));
@@ -702,10 +726,15 @@ static int tls13_handshake(struct tls_conn *c, const uint8_t our_priv[32], const
           uint8_t nl = body[o + 2];
           if (o + 3u + nl <= e)
             set_alpn(c, body + o + 3, nl);
+        } else if (et == ECH_EXT_TYPE && c->ech == 1 && xl <= sizeof c->retry) {
+          memcpy(c->retry, body + o, xl);
+          c->retrylen = xl;
         }
         o += xl;
       }
     }
+    if (mt == HS_ENC_EXT && c->ech == 1)
+      return 0; /* ECH rejected: abort, the caller retries */
     /* EncryptedExtensions / Certificate / CertificateVerify: not verified. */
   }
 
@@ -750,6 +779,61 @@ static int tls13_handshake(struct tls_conn *c, const uint8_t our_priv[32], const
   return 1;
 }
 
+/* ClientHelloOuter carrying the encrypted ClientHelloInner (RFC 9849 §6.1). Starts the inner
+ * transcript for the acceptance check. Returns the outer length, or 0 on failure. */
+static uint32_t build_ech_hello(struct tls_conn *c, const struct ech_cfg *cfg, const char *host,
+                                const uint8_t client_random[32], const uint8_t session_id[32],
+                                const uint8_t our_pub[32], int offer_h2, uint8_t *out)
+{
+  static const uint8_t inner_ext[5] = {0xfe, 0x0d, 0, 1, 1}; /* ECHClientHello type inner */
+  uint8_t inner[768], encoded[1024], info[8 + 512], skE[32], enc[HPKE_ENC_LEN], ext[1100], sealed[1100];
+  if (cfg->rawlen > 512)
+    return 0;
+
+  rng_bytes(c->inner_random, 32);
+  uint32_t ilen = build_client_hello(inner, c->inner_random, session_id, our_pub, host, offer_h2, 1, inner_ext, 5);
+  uint32_t elen = ech_encode_inner(inner, ilen, (uint32_t)strlen(host), cfg, encoded, sizeof encoded);
+  if (!elen)
+    return 0;
+
+  memcpy(info, "tls ech", 8); /* includes the NUL */
+  memcpy(info + 8, cfg->raw, cfg->rawlen);
+  struct hpke_ctx hc;
+  rng_bytes(skE, 32);
+  int rc = hpke_setup_base_s(&hc, enc, cfg->pub, info, 8 + cfg->rawlen, skE);
+  secure_wipe(skE, sizeof skE);
+  if (rc)
+    return 0;
+
+  uint32_t payload = elen + HPKE_TAG_LEN;
+  uint32_t xlen = ech_outer_ext(ext, cfg, enc, payload);
+  uint32_t olen = build_client_hello(out, client_random, session_id, our_pub, cfg->public_name, offer_h2, 0, ext, xlen);
+  /* The AAD is the outer hello body with the payload still zeroed. */
+  hpke_seal(&hc, out + 4, olen - 4, encoded, elen, sealed);
+  memcpy(out + olen - payload, sealed, payload);
+
+  sha256_init(&c->inner_transcript);
+  sha256_update(&c->inner_transcript, inner, ilen);
+  c->ech = 1;
+  return olen;
+}
+
+/* RFC 9849 §7.2: the server signals acceptance in the last 8 bytes of ServerHello.random. `sh` is
+ * the ServerHello body, preceded in memory by its 4-byte handshake header. */
+static int ech_accepted(const struct tls_conn *c, const uint8_t *sh, uint32_t bl)
+{
+  static const uint8_t zeros[8] = {0};
+  struct sha256 ts = c->inner_transcript;
+  sha256_update(&ts, sh - 4, 4 + 2 + 24);
+  sha256_update(&ts, zeros, 8);
+  sha256_update(&ts, sh + 34, bl - 34);
+  uint8_t th[32], prk[32], conf[8];
+  sha256_final(&ts, th);
+  hkdf_extract(zeros, 8, c->inner_random, 32, prk);
+  hkdf_expand_label(prk, "ech accept confirmation", th, 32, conf, 8);
+  return ct_equal(conf, sh + 26, 8);
+}
+
 /* --------------------------------------------------------------- connect */
 
 static const uint8_t x25519_base[32] = {9};
@@ -757,7 +841,15 @@ static int g_tls_error;
 
 int tls_last_error(void) { return g_tls_error; }
 
-tls_conn *tls_client(const char *host, int port, int offer_h2)
+/* ECH attempt state shared between tls_client and tls_open. */
+struct ech_try {
+  const struct ech_cfg *cfg; /* in: config to offer */
+  int rejected;              /* out: the server did not accept ECH */
+  uint8_t retry[ECH_RETRY_MAX];
+  uint32_t retrylen;
+};
+
+static tls_conn *tls_open(const char *host, int port, int offer_h2, struct ech_try *ech)
 {
   g_tls_error = TLS_OPEN_HANDSHAKE;
   /* Allocate this session's state (~92 KiB) with malloc; freed by tls_close.
@@ -813,8 +905,15 @@ tls_conn *tls_client(const char *host, int port, int offer_h2)
   x25519(our_pub, our_priv, x25519_base);
 
   /* --- ClientHello --- */
-  uint8_t ch[768];
-  uint32_t chlen = build_client_hello(ch, client_random, our_pub, host, offer_h2);
+  uint8_t session_id[32], ch[1536];
+  rng_bytes(session_id, 32);
+  uint32_t chlen = 0;
+  if (ech && ech->cfg)
+    chlen = build_ech_hello(c, ech->cfg, host, client_random, session_id, our_pub, offer_h2, ch);
+  if (!chlen) {
+    c->ech = 0;
+    chlen = build_client_hello(ch, client_random, session_id, our_pub, host, offer_h2, 0, 0, 0);
+  }
   sha256_update(&c->transcript, ch, chlen);
   if (send_record(c, REC_HS, ch, chlen) < 0) {
     net_close(c->tcp);
@@ -839,8 +938,28 @@ tls_conn *tls_client(const char *host, int port, int offer_h2)
       free(c);
       return NULL;
     }
+    if (c->ech) {
+      static const uint8_t hrr_random[32] = {0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C,
+                                             0x02, 0x1E, 0x65, 0xB8, 0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB,
+                                             0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C};
+      if (!ct_equal(server_random, hrr_random, 32) && sel13 && ech_accepted(c, body, bl)) {
+        c->ech = 2;
+        c->transcript = c->inner_transcript;
+        sha256_update(&c->transcript, body - 4, 4 + bl);
+      } else if (!sel13 || ct_equal(server_random, hrr_random, 32)) {
+        ech->rejected = 1; /* no retry_configs without a TLS 1.3 handshake */
+        net_close(c->tcp);
+        free(c);
+        return NULL;
+      }
+    }
     if (sel13) {
       if (suite != CIPHER_AES128_GCM_SHA256 || !have_ks || !tls13_handshake(c, our_priv, server_pub)) {
+        if (c->ech == 1) {
+          ech->rejected = 1;
+          ech->retrylen = c->retrylen;
+          memcpy(ech->retry, c->retry, c->retrylen);
+        }
         net_close(c->tcp);
         free(c);
         return NULL;
@@ -1026,6 +1145,29 @@ int tls_write(tls_conn *c, const void *data, int len)
     sent += chunk;
   }
   return len;
+}
+
+/* Offer ECH when the host publishes a usable config. A rejection retries once with the server's
+ * retry_configs, then falls back to a plain handshake. */
+tls_conn *tls_client(const char *host, int port, int offer_h2)
+{
+  uint8_t list[ECH_RETRY_MAX];
+  struct ech_cfg cfg;
+  struct ech_try ech;
+  int n = resolve_ech(host, port, list, sizeof list);
+  if (n && ech_pick_config(list, (uint32_t)n, &cfg)) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+      memset(&ech, 0, sizeof ech);
+      ech.cfg = &cfg;
+      tls_conn *c = tls_open(host, port, offer_h2, &ech);
+      if (c || !ech.rejected)
+        return c;
+      memcpy(list, ech.retry, ech.retrylen); /* cfg points into list */
+      if (!ech_pick_config(list, ech.retrylen, &cfg))
+        break;
+    }
+  }
+  return tls_open(host, port, offer_h2, NULL);
 }
 
 int tls_read(tls_conn *c, void *buf, int max)
