@@ -120,6 +120,12 @@ int menu_click_ex(struct menu *m, int mx, int my, int x, int y, struct menu **le
 /* Map a pressed key to a menu item via the `keys` tables (searches submenus
  * too, skips disabled items): returns the item index, or -1 if none. */
 int menu_shortcut(const struct menu *m, int key);
+/* A free-standing popup list (right-click menu) whose top-left is (x,y); m->title
+ * is unused and submenus are not supported. menu_popup_click returns the enabled
+ * item under (mx,my), or -1 for a miss or a disabled item. The app owns when it is
+ * open and closes it after any click. */
+void menu_popup_draw(const struct menu *m, int x, int y);
+int menu_popup_click(const struct menu *m, int mx, int my, int x, int y);
 
 /* A row of dropdown menus sharing one bar (File / Edit / View ...). Holds an
  * array of `struct menu` pointers laid out left-to-right from (x,y); the
@@ -162,16 +168,27 @@ void menubar_close(struct menubar *mb);
  */
 #define TEXTFIELD_H 26 /* a comfortable single-line field height */
 
+#define TEXTFIELD_UNDO 32 /* undo steps kept per field */
+
+struct tf_snap {
+  char *text; /* heap copy of the buffer */
+  int caret;
+};
+
 struct textfield {
   char *buf;  /* app-owned buffer, NUL-terminated         */
   int cap;    /* buffer capacity in bytes (incl. the NUL) */
   int len;    /* current text length                      */
   int caret;  /* insertion point, 0..len                  */
+  int anchor; /* other end of the selection; == caret when empty */
   int scroll; /* leftmost visible char index (maintained by textfield_draw) */
+  struct tf_snap undo[TEXTFIELD_UNDO], redo[TEXTFIELD_UNDO];
+  int nundo, nredo;
+  int last_edit; /* kind of the previous edit, to merge a run of typing into one undo step */
 };
 
 void textfield_init(struct textfield *tf, char *buf, int cap);
-void textfield_set(struct textfield *tf, const char *s); /* replace text; caret to end */
+void textfield_set(struct textfield *tf, const char *s); /* replace text; caret to end; clears undo */
 /* Draw the field box filling [x,y,w,h]; `focused` shows a caret and a bright
  * border. Updates tf->scroll to keep the caret visible. */
 void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focused);
@@ -180,11 +197,20 @@ void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focuse
  * Uses the scroll left by the last textfield_draw, so call draw first each
  * frame. */
 int textfield_click(struct textfield *tf, int mx, int my, int x, int y, int w, int h);
-/* Feed a WEV_KEY char. Handles printable insert, Backspace, Delete, and
- * Left/Right/Home/End caret motion. Returns 1 if it consumed the key (repaint),
- * 0 if not — e.g. Enter/Esc/arrows the field doesn't use, which the app
- * handles. */
-int textfield_key(struct textfield *tf, char c);
+/* Extend the selection while the button is held after a textfield_click; the
+ * caret follows mx and the view scrolls past the field's edges. */
+void textfield_drag(struct textfield *tf, int mx, int x, int w);
+/* Selected range [*start,*end); returns 1 if non-empty. */
+int textfield_selection(const struct textfield *tf, int *start, int *end);
+void textfield_select_all(struct textfield *tf);
+/* Insert s[0..n) at the caret over the selection (paste): printable ASCII only,
+ * newlines and tabs become spaces. One undo step. */
+void textfield_insert(struct textfield *tf, const char *s, int n);
+/* Feed a WEV_KEY char with its KMOD_* flags. Handles printable insert (replacing
+ * the selection), Backspace, Delete, Left/Right/Home/End (Shift extends the
+ * selection), Ctrl+A, Ctrl+Z (undo) and Ctrl+Y or Ctrl+Shift+Z (redo). Returns 1 if it consumed the key (repaint), 0 if
+ * not, e.g. Enter/Esc/arrows the field doesn't use, which the app handles. */
+int textfield_key(struct textfield *tf, char c, int mods);
 
 /* --------------------------------------------------------------- tab strip */
 /*

@@ -640,6 +640,37 @@ static void dt_find_next(int fresh)
   }
 }
 
+int devtools_field_at(int mx, int my, struct textfield **tf, int *x, int *w)
+{
+  if (!dt_open || mx < devtools_left() || my < BH - DT_INPUT_H)
+    return 0;
+  int left = devtools_left(), iy = BH - DT_INPUT_H;
+  if (dt_tab == TAB_CONSOLE) {
+    dt_input_ensure();
+    *tf = &dt_input_tf;
+    *x = left + 20;
+    *w = (BW - 2 * DT_FBTN_W - 4) - (left + 20);
+    if (mx < *x || mx >= *x + *w || my < iy + 2)
+      return 0;
+    dt_input_focused = true;
+    return 1;
+  }
+  if (dt_tab == TAB_ELEMENTS) {
+    if (!dt_find_init) {
+      textfield_init(&dt_find_tf, dt_find, sizeof dt_find);
+      dt_find_init = true;
+    }
+    *tf = &dt_find_tf;
+    *x = left + 20;
+    *w = BW - left - 24;
+    if (mx < *x || mx >= *x + *w || my < iy + 2)
+      return 0;
+    dt_find_focused = true;
+    return 1;
+  }
+  return 0;
+}
+
 int devtools_handle_click(int mx, int my)
 {
   if (!dt_open)
@@ -686,7 +717,7 @@ int devtools_handle_click(int mx, int my)
       return 1;
     }
     dt_input_ensure();
-    textfield_click(&dt_input_tf, mx, my, left + 20, iy + 2, (ftx - 4) - (left + 20), DT_INPUT_H - 4);
+    drag_field(&dt_input_tf, mx, my, left + 20, iy + 2, (ftx - 4) - (left + 20), DT_INPUT_H - 4);
     dt_input_focused = true;
     B->seq++;
     return 1;
@@ -698,7 +729,7 @@ int devtools_handle_click(int mx, int my)
       textfield_init(&dt_find_tf, dt_find, sizeof dt_find);
       dt_find_init = true;
     }
-    textfield_click(&dt_find_tf, mx, my, left + 20, iy + 2, w - 24, DT_INPUT_H - 4);
+    drag_field(&dt_find_tf, mx, my, left + 20, iy + 2, w - 24, DT_INPUT_H - 4);
     dt_find_focused = true;
     B->seq++;
     return 1;
@@ -881,7 +912,7 @@ int devtools_handle_key(char c, int mods)
       dt_find_next(0);
       return 1;
     } /* Enter: next match */
-    if (textfield_key(&dt_find_tf, c)) {
+    if (field_key(&dt_find_tf, c, mods)) {
       dt_find_next(1);
       B->seq++;
       return 1;
@@ -924,7 +955,7 @@ int devtools_handle_key(char c, int mods)
     dt_paint_only = true;
     return 1;
   }
-  if (textfield_key(&dt_input_tf, c)) {
+  if (field_key(&dt_input_tf, c, mods)) {
     dt_paint_only = true;
     return 1;
   }

@@ -283,8 +283,143 @@ void sel_hl_rect(int x, int y, int w, int h, int ct, int cb)
   }
 }
 
+static bool in_rect(int mx, int my, const struct rect *r)
+{
+  return mx >= r->x && mx < r->x + r->w && my >= r->y && my < r->y + r->h;
+}
+
+static struct textfield *drag_tf;
+static int drag_x, drag_w;
+
+static const char *const field_ctx_items[] = {"Cut", "Copy", "Paste", "Select All"};
+static const char *const field_ctx_hints[] = {"Ctrl+X", "Ctrl+C", "Ctrl+V", "Ctrl+A"};
+static unsigned char field_ctx_flags[4];
+struct menu field_ctx = {"", field_ctx_items, 4, 0, field_ctx_hints, 0, field_ctx_flags, 0};
+static struct textfield *ctx_tf;
+static int ctx_x, ctx_y;
+
+static void field_copy(struct textfield *tf)
+{
+  int a, b;
+  if (textfield_selection(tf, &a, &b))
+    clip_put_text(tf->buf + a, b - a);
+}
+
+static void field_paste(struct textfield *tf)
+{
+  char mime[64];
+  void *data;
+  int len;
+  if (clip_get(0, mime, sizeof mime, &data, &len) != 0)
+    return;
+  if (!memcmp(mime, "text/", 5))
+    textfield_insert(tf, data, len);
+  free(data);
+}
+
+int field_key(struct textfield *tf, char c, int mods)
+{
+  if ((unsigned char)c == KEY_INTR) {
+    field_copy(tf);
+    return 1;
+  }
+  if (mods & KMOD_CTRL) {
+    int a, b;
+    if (c == 'x' || c == 'X') {
+      if (!textfield_selection(tf, &a, &b))
+        return 1;
+      field_copy(tf);
+      return textfield_key(tf, '\b', 0);
+    }
+    if (c == 'v' || c == 'V') {
+      field_paste(tf);
+      return 1;
+    }
+  }
+  return textfield_key(tf, c, mods);
+}
+
+void field_menu_draw(void)
+{
+  if (field_ctx.open)
+    menu_popup_draw(&field_ctx, ctx_x, ctx_y);
+}
+
+static bool field_menu_click(int mx, int my)
+{
+  int item = menu_popup_click(&field_ctx, mx, my, ctx_x, ctx_y);
+  field_ctx.open = 0;
+  B->seq++;
+  switch (item) {
+  case 0:
+    field_key(ctx_tf, 'x', KMOD_CTRL);
+    break;
+  case 1:
+    field_copy(ctx_tf);
+    break;
+  case 2:
+    field_paste(ctx_tf);
+    break;
+  case 3:
+    textfield_select_all(ctx_tf);
+    break;
+  default:
+    return mx >= ctx_x && mx < ctx_x + GUI_MENU_W && my >= ctx_y && my < ctx_y + field_ctx.n * GUI_ROW_H;
+  }
+  addr_dirty = true;
+  return true;
+}
+
+void handle_rclick(int mx, int my)
+{
+  drag_tf = 0;
+  field_ctx.open = 0;
+  menubar_close(&menubar);
+  B->seq++;
+  struct textfield *tf = 0;
+  int fx = 0, fw = 0, fy = 0, fh = 0;
+  struct rect rb, rf, rrl, rtf, rst;
+  addr_layout(&rb, &rf, &rrl, &rtf, &rst);
+  if (in_rect(mx, my, &rtf)) {
+    tf = &B->addr_tf;
+    fx = rtf.x, fw = rtf.w, fy = rtf.y, fh = rtf.h;
+  } else if (devtools_field_at(mx, my, &tf, &fx, &fw)) {
+    fy = my;
+    fh = 1;
+  }
+  if (!tf)
+    return;
+  int a, b;
+  if (!textfield_selection(tf, &a, &b))
+    textfield_click(tf, mx, my, fx, fy, fw, fh);
+  char mime[8];
+  void *data;
+  int len, has_sel = textfield_selection(tf, &a, &b);
+  int can_paste = clip_get(0, mime, sizeof mime, &data, &len) == 0;
+  if (can_paste)
+    free(data);
+  field_ctx_flags[0] = field_ctx_flags[1] = has_sel ? 0 : MENU_DISABLED;
+  field_ctx_flags[2] = can_paste ? 0 : MENU_DISABLED;
+  ctx_tf = tf;
+  ctx_x = mx + GUI_MENU_W > BW ? BW - GUI_MENU_W : mx;
+  ctx_y = my + field_ctx.n * GUI_ROW_H > BH ? BH - field_ctx.n * GUI_ROW_H : my;
+  field_ctx.open = 1;
+}
+
+void drag_field(struct textfield *tf, int mx, int my, int x, int y, int w, int h)
+{
+  if (textfield_click(tf, mx, my, x, y, w, h)) {
+    drag_tf = tf;
+    drag_x = x;
+    drag_w = w;
+  }
+}
+
 void handle_click(int mx, int my)
 {
+  drag_tf = 0;
+  if (field_ctx.open && field_menu_click(mx, my))
+    return;
   if (my < MENU_H || menu_any_open()) { /* menu bar / dropdown */
     bookmarks_menu_sync();
     struct menu *leaf;
@@ -333,7 +468,8 @@ void handle_click(int mx, int my)
     } else if (B->pg->cur_url[0] && button_hit(rst.x, rst.y, rst.w, rst.h, mx, my)) {
       toggle_current_bookmark();
     } else {
-      textfield_click(&B->addr_tf, mx, my, rtf.x, rtf.y, rtf.w, rtf.h);
+      drag_field(&B->addr_tf, mx, my, rtf.x, rtf.y, rtf.w, rtf.h);
+      gfx_sel_clear(&g_sel);
     }
     B->seq++;
     return;
@@ -429,11 +565,6 @@ void handle_click(int mx, int my)
   }
 }
 
-static bool in_rect(int mx, int my, const struct rect *r)
-{
-  return mx >= r->x && mx < r->x + r->w && my >= r->y && my < r->y + r->h;
-}
-
 /* Pick the cursor for the element under (mx,my) */
 static int cursor_for(int mx, int my, const char *link)
 {
@@ -495,6 +626,11 @@ void handle_move(int mx, int my)
 /* Left-button drag in the content pane (WEV_DRAG) */
 void handle_drag(int mx, int my)
 {
+  if (drag_tf) {
+    textfield_drag(drag_tf, mx, drag_x, drag_w);
+    B->seq++;
+    return;
+  }
   if (g_selecting) {
     int line, col;
     pane_linecol(mx, my, &line, &col);
@@ -554,6 +690,12 @@ void select_all(void)
 
 void handle_key(char c, int mods)
 {
+  if (field_ctx.open) {
+    field_ctx.open = 0;
+    B->seq++;
+    if ((unsigned char)c == 27)
+      return;
+  }
   /* Naming a new bookmark folder */
   if (bm_naming) {
     unsigned char uc = (unsigned char)c;
@@ -565,7 +707,7 @@ void handle_key(char c, int mods)
       bm_naming = 0;
       B->seq++;
     } else {
-      textfield_key(&bm_name_tf, c);
+      field_key(&bm_name_tf, c, mods);
       B->seq++;
     }
     return;
@@ -658,8 +800,10 @@ void handle_key(char c, int mods)
       B->seq++;
       return;
     }
-    if (uc == '\n' || uc == '\r' || uc == 8 || uc == 127 || (uc >= 0x20 && uc < 0x7f)) {
-      B->evt_x = uc;
+    int ctrl_a = (mods & KMOD_CTRL) && (uc == 'a' || uc == 'A');
+    if (ctrl_a || uc == KEY_INTR || uc == KEY_DELETE || uc == '\n' || uc == '\r' || uc == 8 || uc == 127 ||
+        ((uc >= 0x20 && uc < 0x7f) && !(mods & KMOD_CTRL))) {
+      B->evt_x = ctrl_a ? EDIT_SELECT_ALL : uc;
       {
         int k = 0;
         sapp(B->evt_type, &k, sizeof B->evt_type, "keyinput");
@@ -685,7 +829,7 @@ void handle_key(char c, int mods)
   }
 
   /* The address-bar widget handles editing (printable/Backspace/Delete/caret) */
-  if (textfield_key(&B->addr_tf, c)) {
+  if (field_key(&B->addr_tf, c, mods)) {
     if (menu_any_open())
       B->seq++;
     else

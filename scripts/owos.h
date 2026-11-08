@@ -19,6 +19,11 @@
 #define KEY_DOWN 0x02
 #define KEY_HOME 0x05
 #define KEY_END 0x06
+#define KEY_LEFT 0x03
+#define KEY_RIGHT 0x04
+#define KEY_DELETE 0x07
+#define KMOD_SHIFT 0x01
+#define KMOD_CTRL 0x02
 
 /* The guest strdup returns 0 for NULL; the host one would crash. */
 static inline char *owos_strdup(const char *s) { return s ? strdup(s) : 0; }

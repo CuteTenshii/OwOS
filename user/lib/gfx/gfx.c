@@ -589,6 +589,16 @@ void menu_draw(const struct menu *m, int x, int y)
     menu_popup(m, x, y + GUI_BAR_H);
 }
 
+void menu_popup_draw(const struct menu *m, int x, int y) { menu_popup(m, x, y); }
+
+int menu_popup_click(const struct menu *m, int mx, int my, int x, int y)
+{
+  if (mx < x || mx >= x + GUI_MENU_W || my < y || my >= y + m->n * GUI_ROW_H)
+    return -1;
+  int i = (my - y) / GUI_ROW_H;
+  return m->flags && (m->flags[i] & MENU_DISABLED) ? -1 : i;
+}
+
 /* Recursively close a menu's submenus (used when the menu itself closes) */
 static void menu_subs_close(struct menu *m)
 {
@@ -788,158 +798,6 @@ int menubar_shortcut(const struct menubar *mb, int key, struct menu **leaf)
   if (leaf)
     *leaf = 0;
   return -1;
-}
-
-/* text field */
-
-#define TF_BG 0xffffffu     /* field background */
-#define TF_FG 0x101418u     /* text colour */
-#define TF_BORDER 0x3a3f48u /* idle border */
-#define TF_FOCUS 0x2f6bd8u  /* focused border accent + caret */
-#define TF_PAD 4            /* inner horizontal padding (px) */
-
-void textfield_init(struct textfield *tf, char *buf, int cap)
-{
-  tf->buf = buf;
-  tf->cap = cap;
-  tf->len = 0;
-  tf->caret = 0;
-  tf->scroll = 0;
-  if (cap > 0)
-    buf[0] = '\0';
-}
-
-void textfield_set(struct textfield *tf, const char *s)
-{
-  int i = 0;
-  for (; s[i] && i < tf->cap - 1; i++)
-    tf->buf[i] = s[i];
-  tf->buf[i] = '\0';
-  tf->len = i;
-  tf->caret = i;
-  tf->scroll = 0;
-}
-
-/* Pixel width of buf[a..b) in the proportional UI font */
-static int tf_span(const struct textfield *tf, int a, int b)
-{
-  int w = 0;
-  for (int i = a; i < b; i++)
-    w += gfx_ui_cw((unsigned char)tf->buf[i]);
-  return w;
-}
-
-void textfield_draw(struct textfield *tf, int x, int y, int w, int h, int focused)
-{
-  gfx_fill_rect(x, y, w, h, TF_BG);
-  gfx_rect(x, y, w, h, focused ? TF_FOCUS : TF_BORDER);
-
-  int inner = x + TF_PAD;
-  int avail = w - 2 * TF_PAD;
-  if (avail < 1)
-    avail = 1;
-  int ty = y + (h - UIFONT_H) / 2;
-
-  /* Scroll so the caret stays visible: never left of `scroll` */
-  if (tf->scroll > tf->len)
-    tf->scroll = tf->len;
-  if (tf->caret < tf->scroll)
-    tf->scroll = tf->caret;
-  while (tf->scroll < tf->caret && tf_span(tf, tf->scroll, tf->caret) > avail - 2)
-    tf->scroll++;
-  /* After a deletion, pull the view left while all the text fits */
-  while (tf->scroll > 0 && tf_span(tf, tf->scroll - 1, tf->len) <= avail - 2)
-    tf->scroll--;
-
-  int px = inner;
-  int caret_px = -1;
-  for (int i = tf->scroll; i <= tf->len; i++) {
-    if (i == tf->caret)
-      caret_px = px;
-    if (i == tf->len)
-      break;
-    int cw = gfx_ui_cw((unsigned char)tf->buf[i]);
-    if (px - inner + cw > avail)
-      break;
-    char one[2] = {tf->buf[i], '\0'};
-    gfx_ui_text(px, ty, one, TF_FG);
-    px += cw;
-  }
-  if (focused && caret_px >= 0) {
-    if (caret_px > inner + avail - 1)
-      caret_px = inner + avail - 1;
-    gfx_fill_rect(caret_px, ty, 1, UIFONT_H, TF_FOCUS);
-  }
-}
-
-int textfield_click(struct textfield *tf, int mx, int my, int x, int y, int w, int h)
-{
-  if (mx < x || mx >= x + w || my < y || my >= y + h)
-    return 0;
-  int inner = x + TF_PAD;
-  int avail = w - 2 * TF_PAD;
-  int px = inner;
-  tf->caret = tf->len; /* default: past the text */
-  for (int i = tf->scroll; i < tf->len; i++) {
-    int cw = gfx_ui_cw((unsigned char)tf->buf[i]);
-    if (px - inner + cw > avail) {
-      tf->caret = i;
-      break;
-    }
-    if (mx < px + cw / 2) {
-      tf->caret = i;
-      break;
-    }
-    px += cw;
-  }
-  return 1;
-}
-
-int textfield_key(struct textfield *tf, char c)
-{
-  unsigned char u = (unsigned char)c;
-  switch (u) {
-  case KEY_LEFT:
-    if (tf->caret > 0)
-      tf->caret--;
-    return 1;
-  case KEY_RIGHT:
-    if (tf->caret < tf->len)
-      tf->caret++;
-    return 1;
-  case KEY_HOME:
-    tf->caret = 0;
-    return 1;
-  case KEY_END:
-    tf->caret = tf->len;
-    return 1;
-  case '\b': /* delete left of caret */
-    if (tf->caret > 0) {
-      for (int i = tf->caret - 1; i < tf->len; i++)
-        tf->buf[i] = tf->buf[i + 1];
-      tf->caret--;
-      tf->len--;
-    }
-    return 1;
-  case KEY_DELETE: /* delete right of caret */
-    if (tf->caret < tf->len) {
-      for (int i = tf->caret; i < tf->len; i++)
-        tf->buf[i] = tf->buf[i + 1];
-      tf->len--;
-    }
-    return 1;
-  default:
-    if (u >= 0x20 && u < 0x7f && tf->len < tf->cap - 1) {
-      for (int i = tf->len; i > tf->caret; i--) /* open a gap */
-        tf->buf[i] = tf->buf[i - 1];
-      tf->buf[tf->caret] = c;
-      tf->caret++;
-      tf->len++;
-      tf->buf[tf->len] = '\0';
-      return 1;
-    }
-    return 0; /* Enter/Esc/arrows: app handles */
-  }
 }
 
 /* button */

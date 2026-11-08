@@ -175,6 +175,8 @@ static void worker_dispatch_event(void)
     if (f && (ch == '\n' || ch == '\r') && html_control_kind(f) == CTRL_TEXT) {
       worker_submit(f); /* Enter in a single-line field */
       need_relayout = true;
+    } else if (ch == EDIT_SELECT_ALL || ch == KEY_INTR) {
+      need_relayout = html_focus_command(ch);
     } else if ((f = html_focus_edit(ch)) != 0) {
       js_dispatch_dom_event(f, "input", 0, 0);
       need_relayout = true;

@@ -355,6 +355,8 @@ void html_radio_select(struct dom_node *c);
 void html_select_cycle(struct dom_node *sel);
 void html_seed_textarea(struct dom_node *ta);
 struct dom_node *html_focus_edit(int ch); /* edit focused field; returns it */
+#define EDIT_SELECT_ALL 0x100             /* html_focus_command: select the whole value */
+int html_focus_command(int cmd);          /* EDIT_SELECT_ALL or KEY_INTR (copy); 1 = relayout */
 
 /* A resolved form submission; a GET folds the fields into url's query and leaves body empty. */
 struct form_submission {
@@ -395,8 +397,12 @@ int devtools_left(void);                   /* panel's left x; BW if hidden (righ
 void devtools_render(void);                /* main thread: draw the panel                */
 int devtools_take_paint(void);             /* main: 1 = repaint only the dock (log line)  */
 int devtools_handle_click(int mx, int my); /* 1 = consumed                    */
-int devtools_handle_scroll(int delta);     /* 1 = consumed                    */
-int devtools_handle_key(char c, int mods); /* Console REPL input; 1 = consumed */
+/* textfield_click that also arms drag-selection in that field for the held button */
+void drag_field(struct textfield *tf, int mx, int my, int x, int y, int w, int h);
+int devtools_handle_scroll(int delta);                                        /* 1 = consumed                    */
+int field_key(struct textfield *tf, char c, int mods);                        /* textfield_key plus Ctrl+X/C/V */
+int devtools_field_at(int mx, int my, struct textfield **tf, int *x, int *w); /* focuses it; 1 = over a field */
+int devtools_handle_key(char c, int mods);                                    /* Console REPL input; 1 = consumed */
 /* Selected element's overlay box (DOCUMENT px) + label, 0 if none. */
 int devtools_highlight(int *x, int *y, int *w, int *h, const char **label);
 int devtools_on_splitter(int mx, int my);                        /* 1 = pointer is on the resize edge */

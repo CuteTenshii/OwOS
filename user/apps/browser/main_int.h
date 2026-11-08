@@ -227,6 +227,9 @@ void sel_hl_rect(int x, int y, int w, int h, int ct, int cb);
 void handle_click(int mx, int my);
 void handle_move(int mx, int my);
 void handle_drag(int mx, int my);
+void handle_rclick(int mx, int my);
+void field_menu_draw(void);                            /* right-click menu for text fields, drawn last */
+extern struct menu field_ctx;
 void copy_selection(void);
 void select_all(void);
 void handle_key(char c, int mods);

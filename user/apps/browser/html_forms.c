@@ -1,7 +1,9 @@
+#include "clipboard.h"
 #include "html_int.h"
 
 /* The focused form control (a text input or textarea), or NULL */
 struct dom_node *g_focus;
+static bool g_sel_all; /* the focused field's whole value is selected (Ctrl+A) */
 struct dom_node *html_focus(void) { return g_focus; }
 
 /* Set by the control emitters during the walk */
@@ -48,6 +50,7 @@ void html_set_focus(struct dom_node *n)
 {
   int k = html_control_kind(n);
   g_focus = (k == CTRL_TEXT || k == CTRL_TEXTAREA) ? n : 0;
+  g_sel_all = false;
   B->focus_kind = (k == CTRL_TEXT) ? 1 : (k == CTRL_TEXTAREA) ? 2 : 0;
 }
 
@@ -137,10 +140,10 @@ struct dom_node *html_focus_edit(int ch)
   char buf[2048];
   int n = 0;
   const char *v;
-  if (!g_focus)
+  if (!g_focus || (ch == KEY_DELETE && !g_sel_all))
     return 0;
   v = dom_get_attr(g_focus, "value");
-  if (v)
+  if (v && !g_sel_all)
     for (const char *p = v; *p && n < (int)sizeof buf - 1; p++)
       buf[n++] = *p;
   if (ch == '\b' || ch == 127) {
@@ -153,8 +156,23 @@ struct dom_node *html_focus_edit(int ch)
   else if (ch >= 0x20 && n < (int)sizeof buf - 1)
     buf[n++] = (char)ch;
   buf[n] = '\0';
+  g_sel_all = false;
   dom_set_attr(g_focus, "value", buf);
   return g_focus;
+}
+
+int html_focus_command(int cmd)
+{
+  if (!g_focus)
+    return 0;
+  if (cmd == EDIT_SELECT_ALL) {
+    g_sel_all = true;
+    return 1;
+  }
+  const char *v = dom_get_attr(g_focus, "value");
+  if (cmd == KEY_INTR && g_sel_all && v)
+    clip_put_text(v, (int)strlen(v));
+  return 0;
 }
 
 /* application/x-www-form-urlencoded component encoding */
@@ -337,7 +355,7 @@ void emit_input(struct dom_node *el)
     bool focused = (el == g_focus);
     emit_lit("[ ", ST_BOLD);
     if (val && val[0])
-      emit_lit(val, 0);
+      emit_lit(val, focused && g_sel_all ? ST_UNDER : 0);
     else if (!focused && ph)
       emit_lit(ph, 0);
     else if (!focused)
@@ -355,7 +373,7 @@ void emit_textarea(struct dom_node *el)
   bool focused = (el == g_focus);
   emit_lit("[ ", ST_BOLD);
   if (val)
-    emit_lit(val, 0);
+    emit_lit(val, focused && g_sel_all ? ST_UNDER : 0);
   else
     walk(el);
   if (focused)

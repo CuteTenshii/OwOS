@@ -182,8 +182,8 @@ static unsigned render_sig(void)
   h = layout_mix(h, (unsigned)pg->mode | ((unsigned)B->loading << 8) | ((unsigned)B->req_pending << 9) |
                         ((unsigned)tabs[active_tab].crashed << 10) | ((unsigned)show_images << 11) |
                         ((unsigned)devtools_visible() << 12) | ((unsigned)bm_panel_open << 13) |
-                        ((unsigned)menu_any_open() << 14) | ((unsigned)media_active() << 15) |
-                        ((unsigned)active_tab << 16) | ((unsigned)n_tabs << 20));
+                        ((unsigned)menu_any_open() << 14) | ((unsigned)field_ctx.open << 24) |
+                        ((unsigned)media_active() << 15) | ((unsigned)active_tab << 16) | ((unsigned)n_tabs << 20));
   h = layout_mix(h, pg->page_bg);
   h = layout_mix(h, (unsigned)(unsigned long)pg->body_font);
   h = layout_mix(h, (unsigned)pg->n_bgimgs);
@@ -271,6 +271,7 @@ void render(void)
   bookmarks_menu_sync();
   gfx_fill_rect(0, 0, BW, MENU_H, 0x232a36);
   menubar_draw(&menubar);
+  field_menu_draw();
 
   g_painted.valid = true;
   g_painted.pg = B->pg;

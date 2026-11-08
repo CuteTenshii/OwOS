@@ -132,6 +132,8 @@ int main(int argc, char **argv)
           dt_resizing = 0;
           handle_click(ev.a, ev.b);
         }
+      } else if (ev.type == WEV_RCLICK) {
+        handle_rclick(ev.a, ev.b);
       } else if (ev.type == WEV_DRAG) {
         if (dt_resizing)
           devtools_set_width(BW - ev.a); /* docked right: width = BW - x */
