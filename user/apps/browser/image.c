@@ -103,7 +103,7 @@ static void draw_image_stream(int px, int py, int pw, int ph)
 {
   struct rawrd r = {0};
   unsigned iw = 0, ih = 0;
-  if (upng_dimensions(rawrd_get, &r, &iw, &ih) != 0 || !iw || !ih) {
+  if (png_dimensions(rawrd_get, &r, &iw, &ih) != 0 || !iw || !ih) {
     gfx_ui_text(px + 8, py + 8, "Cannot decode image (unreadable or oversized interlaced PNG).", 0xb04040);
     return;
   }
@@ -132,7 +132,7 @@ static void draw_image_stream(int px, int py, int pw, int ph)
   v.xm = xmap_get(v.dw, iw);
 
   struct rawrd r2 = {0};
-  upng_decode(rawrd_get, &r2, img_row, &v, 0, 0);
+  png_decode(rawrd_get, &r2, img_row, &v, 0, 0);
 }
 
 /* Draw B->pg->raw as a PNG into the content pane (px,py,pw,ph), fit-to-pane with aspect preserved */
@@ -148,13 +148,13 @@ void draw_image(int px, int py, int pw, int ph, unsigned bg)
     g_dimg.src_len = B->pg->raw_len;
     struct rawrd r = {0};
     unsigned iw = 0, ih = 0;
-    if (upng_dimensions(rawrd_get, &r, &iw, &ih) == 0 && iw && ih && (unsigned long)iw * ih <= DIMG_MAX_PX) {
+    if (png_dimensions(rawrd_get, &r, &iw, &ih) == 0 && iw && ih && (unsigned long)iw * ih <= DIMG_MAX_PX) {
       unsigned char *buf = malloc((unsigned long)iw * ih * 4);
       if (buf) {
         memset(buf, 0, (unsigned long)iw * ih * 4);
         struct rawrd r2 = {0};
         struct imgc_fill f = {buf, iw, ih};
-        if (upng_decode(rawrd_get, &r2, imgc_row, &f, 0, 0) == 0) {
+        if (png_decode(rawrd_get, &r2, imgc_row, &f, 0, 0) == 0) {
           g_dimg.rgba = buf;
           g_dimg.iw = iw;
           g_dimg.ih = ih;
@@ -279,7 +279,7 @@ static const struct ru_img *imgc_get(struct inl_img *im, unsigned dw, unsigned d
     return 0;
   struct ru_scaler sc = {px, xmap_get(cw, im->iw), im->iw, im->ih, cw, ch, 0, true};
   struct poolrd r = {0, im->coff, im->clen};
-  if (upng_decode(poolrd_get, &r, imgc_scale_row, &sc, 0, 0) != 0) {
+  if (png_decode(poolrd_get, &r, imgc_scale_row, &sc, 0, 0) != 0) {
     free(px);
     return 0;
   }
@@ -339,7 +339,7 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
   /* Fallback (too large to hold / decode failed): stream it once. */
   struct inlblit v = {x0, y0, dw, dh, ct, cb, im->iw, im->ih, 0, xmap_get((unsigned)dw, im->iw), lo, hi};
   struct poolrd r = {0, im->coff, im->clen};
-  upng_decode(poolrd_get, &r, inl_row, &v, 0, 0);
+  png_decode(poolrd_get, &r, inl_row, &v, 0, 0);
 }
 
 /* A placeholder box for an image that couldn't be fetched/decoded. */

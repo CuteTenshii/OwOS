@@ -3,7 +3,7 @@
 #include "gfx.h"
 #include "notify.h"
 #include "owos.h"
-#include "upng.h"
+#include "png.h"
 #include <stdbool.h>
 
 /* layout + theme */
@@ -174,7 +174,7 @@ static void load_image(struct note *n, const char *path)
   struct freader fr;
   unsigned sw, sh;
   fr_init(&fr, path);
-  if (upng_dimensions(fr_get, &fr, &sw, &sh) != 0 || !sw || !sh)
+  if (png_dimensions(fr_get, &fr, &sw, &sh) != 0 || !sw || !sh)
     return;
   int tw, th;
   if (sw >= sh) {
@@ -193,7 +193,7 @@ static void load_image(struct note *n, const char *path)
     return;
   struct dctx d = {out, tw, th, sw, sh};
   fr_init(&fr, path);
-  if (upng_decode(fr_get, &fr, dec_row, &d, 0, 0) != UPNG_OK) {
+  if (png_decode(fr_get, &fr, dec_row, &d, 0, 0) != PNG_OK) {
     free(out);
     return;
   }

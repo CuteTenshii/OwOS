@@ -1,4 +1,4 @@
-/* upng_test.c — host test for the streaming PNG decoder (user/lib/png/upng.c).
+/* png_test.c — host test for the streaming PNG decoder (user/lib/png/png.c).
  * Fixtures are built here with an independent encoder (all five filters, Adam7,
  * stored-block zlib, split IDATs), and every decoded pixel is checked against
  * the source samples. */
@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "crc32.h"
-#include "upng.h"
+#include "png.h"
 
 #define IL_CAP_W 512
 #define IL_CAP_H 384
@@ -236,7 +236,7 @@ static int decode_buf(size_t n, uint8_t *dst, struct sink *k, unsigned *w, unsig
 	struct mem m = {png, n, 0};
 	memset(k, 0, sizeof *k);
 	k->buf = dst;
-	return upng_decode(mem_rd, &m, row_cb, k, w, h);
+	return png_decode(mem_rd, &m, row_cb, k, w, h);
 }
 
 static int decode(const struct spec *sp, uint8_t *dst)
@@ -279,10 +279,10 @@ static void check_pair(unsigned color, unsigned depth, unsigned w, unsigned h, i
 {
 	struct spec sp;
 	init(&sp, color, depth, w, h, 0, filter, trns);
-	expect_eq(decode(&sp, out), UPNG_OK);
+	expect_eq(decode(&sp, out), PNG_OK);
 	expect_eq(mismatches(&sp, out), 0);
 	sp.interlace = 1;
-	expect_eq(decode(&sp, out_il), UPNG_OK);
+	expect_eq(decode(&sp, out_il), PNG_OK);
 	expect_eq(mismatches(&sp, out_il), 0);
 	expect(!memcmp(out, out_il, (size_t)w * h * 4));
 }
@@ -321,7 +321,7 @@ int main(void)
 		static const uint8_t want16[8] = {0x12, 0x56, 0x9A, 0xDE, 0xFF, 0, 0, 0x80};
 		init(&sp, 6, 16, 2, 1, 0, 0, 0);
 		sp.s = rgba16;
-		expect_eq(decode(&sp, out), UPNG_OK);
+		expect_eq(decode(&sp, out), PNG_OK);
 		expect(!memcmp(out, want16, 8));
 
 		static const uint16_t bits[8] = {1, 0, 1, 1, 0, 0, 0, 1};
@@ -329,13 +329,13 @@ int main(void)
 		                                  0,0,0,255, 0,0,0,255, 0,0,0,255, 255,255,255,255};
 		init(&sp, 0, 1, 8, 1, 1, 5, 0);
 		sp.s = bits;
-		expect_eq(decode(&sp, out), UPNG_OK);
+		expect_eq(decode(&sp, out), PNG_OK);
 		expect(!memcmp(out, wantg, 32));
 
 		static const uint16_t idx[3] = {0, 1, 2};
 		init(&sp, 3, 8, 3, 1, 0, 1, 1);
 		sp.s = idx;
-		expect_eq(decode(&sp, out), UPNG_OK);
+		expect_eq(decode(&sp, out), PNG_OK);
 		expect_eq(out[3], 10);
 		expect_eq(out[7], 200);
 		expect_eq(out[11], 0);
@@ -345,7 +345,7 @@ int main(void)
 		init(&sp, 0, 8, 3, 1, 1, 0, 0);
 		sp.s = gray;
 		sp.ckey = 1; sp.ck[0] = 0x40;
-		expect_eq(decode(&sp, out), UPNG_OK);
+		expect_eq(decode(&sp, out), PNG_OK);
 		expect_eq(out[3], 0);
 		expect_eq(out[7], 255);
 		expect_eq(out[11], 0);
@@ -356,7 +356,7 @@ int main(void)
 	{
 		struct spec sp;
 		init(&sp, 6, 8, 13, 11, 1, 5, 0);
-		expect_eq(decode(&sp, out), UPNG_OK);
+		expect_eq(decode(&sp, out), PNG_OK);
 		unsigned translucent = 0;
 		for (unsigned i = 0; i < 13 * 11; i++)
 			translucent += out[i * 4 + 3] != 255;
@@ -369,16 +369,16 @@ int main(void)
 		struct spec sp;
 		struct sink k;
 		init(&sp, 0, 8, IL_CAP_W, IL_CAP_H, 1, 5, 0);
-		expect_eq(decode(&sp, out), UPNG_OK);
+		expect_eq(decode(&sp, out), PNG_OK);
 		expect_eq(mismatches(&sp, out), 0);
 
 		init(&sp, 0, 8, IL_CAP_W, IL_CAP_H + 1, 1, 5, 0);
 		encode(&sp);
-		expect_eq(decode_buf(pn, out, &k, 0, 0), UPNG_EUNSUP);
+		expect_eq(decode_buf(pn, out, &k, 0, 0), PNG_EUNSUP);
 		expect_eq(k.rows, 0);
 
 		sp.interlace = 0;
-		expect_eq(decode(&sp, out), UPNG_OK);
+		expect_eq(decode(&sp, out), PNG_OK);
 		expect_eq(mismatches(&sp, out), 0);
 	}
 
@@ -391,27 +391,27 @@ int main(void)
 		size_t full = pn;
 
 		png[0] ^= 1;
-		expect_eq(decode_buf(full, out, &k, 0, 0), UPNG_EBADSIG);
+		expect_eq(decode_buf(full, out, &k, 0, 0), PNG_EBADSIG);
 		png[0] ^= 1;
 
-		expect_eq(decode_buf(full / 2, out, &k, 0, 0), UPNG_EINFLATE);
+		expect_eq(decode_buf(full / 2, out, &k, 0, 0), PNG_EINFLATE);
 		expect(k.rows < 11);
-		expect_eq(decode_buf(30, out, &k, 0, 0), UPNG_ETRUNC);
-		expect_eq(decode_buf(4, out, &k, 0, 0), UPNG_EBADSIG);
+		expect_eq(decode_buf(30, out, &k, 0, 0), PNG_ETRUNC);
+		expect_eq(decode_buf(4, out, &k, 0, 0), PNG_EBADSIG);
 
 		init(&sp, 2, 4, 3, 3, 0, 0, 0);
 		encode(&sp);
-		expect_eq(decode_buf(pn, out, &k, 0, 0), UPNG_EUNSUP);
+		expect_eq(decode_buf(pn, out, &k, 0, 0), PNG_EUNSUP);
 
 		init(&sp, 6, 8, 3, 3, 0, 0, 0);
 		encode(&sp);
 		put32(png + 16, 0);
-		expect_eq(decode_buf(pn, out, &k, 0, 0), UPNG_EBADHDR);
+		expect_eq(decode_buf(pn, out, &k, 0, 0), PNG_EBADHDR);
 
 		init(&sp, 0, 8, 4, 2, 0, 0, 0);
 		encode(&sp);
 		png[48] = 9; /* first scanline's filter byte, after the zlib and stored-block headers */
-		expect_eq(decode_buf(pn, out, &k, 0, 0), UPNG_EINFLATE);
+		expect_eq(decode_buf(pn, out, &k, 0, 0), PNG_EINFLATE);
 	}
 
 	test("caller can stop early");
@@ -424,7 +424,7 @@ int main(void)
 		memset(&k, 0, sizeof k);
 		k.buf = out;
 		k.stop_at = 4;
-		expect_eq(upng_decode(mem_rd, &m, row_cb, &k, 0, 0), UPNG_OK);
+		expect_eq(png_decode(mem_rd, &m, row_cb, &k, 0, 0), PNG_OK);
 		expect_eq(k.rows, 4);
 	}
 
@@ -435,7 +435,7 @@ int main(void)
 		init(&sp, 6, 8, 13, 11, 1, 0, 0);
 		encode(&sp);
 		struct mem m = {png, pn, 0};
-		expect_eq(upng_dimensions(mem_rd, &m, &w, &h), UPNG_OK);
+		expect_eq(png_dimensions(mem_rd, &m, &w, &h), PNG_OK);
 		expect_eq(w, 13);
 		expect_eq(h, 11);
 	}

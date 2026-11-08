@@ -2,7 +2,7 @@
  *
  * Untrusted-input parsing belongs in user space: a malformed or hostile WebP
  * can only corrupt this process (which then faults and is reaped), never the
- * kernel. Unlike the streaming PNG decoder (upng), VP8L is not a streaming
+ * kernel. Unlike the streaming PNG decoder (png), VP8L is not a streaming
  * format — backward references and the spatial transforms need the whole image
  * in memory — so the API works on a complete in-memory buffer and produces a
  * whole RGBA image.

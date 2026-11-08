@@ -35,7 +35,7 @@ int ch_headers_for(const struct purl *u, bool subresource, char *out, int cap)
 
 /* --------------------------------------------------- inline image fetching */
 
-/* A byte reader over a slice of img_pool, for upng_dimensions. */
+/* A byte reader over a slice of img_pool, for png_dimensions. */
 struct memrd {
   const unsigned char *p;
   int pos, len;
@@ -1799,7 +1799,7 @@ static void commit_image(int idx, const unsigned char *body, int blen, unsigned 
       body[3] == 'G') { /* PNG stored verbatim (lazy decode) */
     struct memrd mr = {body, 0, blen};
     unsigned iw = 0, ih = 0;
-    bool okdim = (upng_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih);
+    bool okdim = (png_dimensions(memrd_get, &mr, &iw, &ih) == 0 && iw && ih);
 
     int off = -1;
     mutex_lock(&g_img_lock);
@@ -2129,9 +2129,9 @@ int fetch_lazy_visible(void)
 }
 
 /* --- favicon decode --- */
-/* Favicon -> 16x16 ARGB (B->pg->favicon): PNG via upng, .ico parsed here; else the default globe. */
+/* Favicon -> 16x16 ARGB (B->pg->favicon): PNG via png, .ico parsed here; else the default globe. */
 
-/* Nearest-neighbour scale of a decoded RGBA image into the 16x16 favicon, per upng row callback. */
+/* Nearest-neighbour scale of a decoded RGBA image into the 16x16 favicon, per png row callback. */
 struct favscale {
   unsigned iw, ih, next_r;
   unsigned *dst;
@@ -2155,11 +2155,11 @@ static bool fav_decode_png(const unsigned char *buf, int len)
 {
   struct memrd mr = {buf, 0, len};
   unsigned iw = 0, ih = 0;
-  if (upng_dimensions(memrd_get, &mr, &iw, &ih) != 0 || !iw || !ih)
+  if (png_dimensions(memrd_get, &mr, &iw, &ih) != 0 || !iw || !ih)
     return false;
   struct favscale v = {iw, ih, 0, B->pg->favicon};
   struct memrd mr2 = {buf, 0, len};
-  if (upng_decode(memrd_get, &mr2, fav_row, &v, 0, 0) != 0)
+  if (png_decode(memrd_get, &mr2, fav_row, &v, 0, 0) != 0)
     return false;
   return v.next_r > 0;
 }

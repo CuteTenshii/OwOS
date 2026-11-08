@@ -1,7 +1,7 @@
 /* webp.c, a small WebP command-line tool */
 #include "webp.h"
 #include "owos.h"
-#include "upng.h"
+#include "png.h"
 #include <stdbool.h>
 
 /* a buffered file reader over readfile_at (for the streaming PNG decoder) */
@@ -69,7 +69,7 @@ struct pngdst {
   unsigned char *buf;
   unsigned w, h;
 };
-static int png_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
+static int webp_png_row(void *c, unsigned y, const unsigned char *rgba, unsigned w)
 {
   struct pngdst *d = c;
   if (y < d->h) {
@@ -84,7 +84,7 @@ static unsigned char *decode_png(const char *path, unsigned *w, unsigned *h)
   struct freader fr;
   fr_init(&fr, path);
   unsigned pw = 0, ph = 0;
-  if (upng_dimensions(fr_get, &fr, &pw, &ph) != 0 || !pw || !ph)
+  if (png_dimensions(fr_get, &fr, &pw, &ph) != 0 || !pw || !ph)
     return 0;
   unsigned char *buf = malloc(pw * ph * 4u);
   if (!buf)
@@ -92,7 +92,7 @@ static unsigned char *decode_png(const char *path, unsigned *w, unsigned *h)
   memset(buf, 0, pw * ph * 4u);
   fr_init(&fr, path);
   struct pngdst d = {buf, pw, ph};
-  if (upng_decode(fr_get, &fr, png_row, &d, 0, 0) != UPNG_OK) {
+  if (png_decode(fr_get, &fr, webp_png_row, &d, 0, 0) != PNG_OK) {
     free(buf);
     return 0;
   }

@@ -34,7 +34,7 @@ DIALOG  := user/lib/dialog/dialog.o   # reusable modal message-box + property-sh
 # doesn't carry the 32 KiB inflate window or the decoder buffers).
 INFLATE := user/lib/zlib/inflate.o    # zlib: streaming DEFLATE (gzip/png)
 CRC32   := user/lib/zlib/crc32.o      # zlib: the shared CRC-32 (deflate + stun FINGERPRINT)
-UPNG    := user/lib/png/upng.o        # libpng: streaming PNG decode (uses zlib)
+PNGDEC  := user/lib/png/png.o        # libpng: streaming PNG decode (uses zlib)
 PNGENC  := user/lib/png/pngenc.o      # PNG encode (uncompressed); screenshot path, uses $(CRC32)
 WEBP    := user/lib/webp/webp.o        # WebP lossless (VP8L) decode + encode (no deps)
 URL     := user/lib/curl/url.o        # shared URL parse/resolve (curl + browser)

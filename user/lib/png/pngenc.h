@@ -4,7 +4,7 @@
  * compression), so encoding is a single fast pass and the only dependency is
  * the shared CRC-32 (crc32.h) — no deflate engine. This is the screenshot path;
  * the compositor owns the framebuffer, so the capture lives there, not in the
- * kernel. Decoding is the separate upng.h. */
+ * kernel. Decoding is the separate png.h. */
 #ifndef PNGENC_H
 #define PNGENC_H
 

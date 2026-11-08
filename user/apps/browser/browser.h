@@ -12,7 +12,7 @@
 #include "inflate.h"
 #include "netconn.h"
 #include "owos.h"
-#include "upng.h"
+#include "png.h"
 #include "url.h"
 
 /* Canonical User-Agent shared by the HTTP transport and the JS navigator; resolved once. */

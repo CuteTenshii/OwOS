@@ -1,4 +1,4 @@
-/* upng.c — streaming PNG decoder (see upng.h). Built on inflate.c.
+/* png.c — streaming PNG decoder (see png.h). Built on inflate.c.
  *
  * Flow: verify signature -> read IHDR (+ PLTE) -> stream the concatenated IDAT
  * data (spanning chunks, skipping their length/CRC framing) through the
@@ -12,9 +12,9 @@
  * CRCs are not verified. Non-interlaced images stream with a working set of ~2
  * scanlines whatever the height; interlaced images need a full RGBA frame
  * buffer (Adam7 passes deposit pixels across the whole image), so they are
- * capped at IL_MAXPX pixels and otherwise return UPNG_EUNSUP.
+ * capped at IL_MAXPX pixels and otherwise return PNG_EUNSUP.
  */
-#include "upng.h"
+#include "png.h"
 #include "inflate.h"
 #include <stdint.h>
 
@@ -23,9 +23,9 @@
 #define IL_MAXPX (512u * 384u) /* interlaced frame budget (RGBA): 768 KiB      */
 
 struct dec {
-  upng_reader rd;
+  png_reader rd;
   void *rctx;
-  upng_row row;
+  png_row row;
   void *row_ctx;
   unsigned w, h;
   unsigned depth, color, samples; /* IHDR depth, colour type, samples/pixel  */
@@ -373,7 +373,7 @@ static int scan_sink(void *ctx, const unsigned char *buf, unsigned n)
   return d->interlaced ? sink_interlaced(d, buf, n) : sink_plain(d, buf, n);
 }
 
-int upng_dimensions(upng_reader rd, void *rctx, unsigned *w, unsigned *h)
+int png_dimensions(png_reader rd, void *rctx, unsigned *w, unsigned *h)
 {
   /* Read inline (no struct dec on the stack — it is large and would blow a
    * small user stack). Signature, then the IHDR chunk's length+type, then
@@ -381,28 +381,28 @@ int upng_dimensions(upng_reader rd, void *rctx, unsigned *w, unsigned *h)
   static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
   for (int i = 0; i < 8; i++)
     if (rd(rctx) != sig[i])
-      return UPNG_EBADSIG;
+      return PNG_EBADSIG;
   unsigned char b[8];
   for (int i = 0; i < 8; i++) { /* chunk length(4) + type(4)        */
     int c = rd(rctx);
     if (c < 0)
-      return UPNG_ETRUNC;
+      return PNG_ETRUNC;
     b[i] = (unsigned char)c;
   }
   if (!(b[4] == 'I' && b[5] == 'H' && b[6] == 'D' && b[7] == 'R'))
-    return UPNG_EBADHDR;
+    return PNG_EBADHDR;
   unsigned char d[8];
   for (int i = 0; i < 8; i++) { /* IHDR: width(4), height(4)        */
     int c = rd(rctx);
     if (c < 0)
-      return UPNG_ETRUNC;
+      return PNG_ETRUNC;
     d[i] = (unsigned char)c;
   }
   if (w)
     *w = ((unsigned)d[0] << 24) | ((unsigned)d[1] << 16) | ((unsigned)d[2] << 8) | d[3];
   if (h)
     *h = ((unsigned)d[4] << 24) | ((unsigned)d[5] << 16) | ((unsigned)d[6] << 8) | d[7];
-  return UPNG_OK;
+  return PNG_OK;
 }
 
 /* ----------------------------------------------------------- metadata probe */
@@ -414,7 +414,7 @@ int upng_dimensions(upng_reader rd, void *rctx, unsigned *w, unsigned *h)
  */
 
 struct rdr {
-  upng_reader rd;
+  png_reader rd;
   void *rctx;
 };
 static int prb(struct rdr *r) { return r->rd(r->rctx); }
@@ -478,24 +478,24 @@ static void m_textcopy(char *dst, unsigned cap, const unsigned char *src, unsign
 }
 
 /* Record one keyword/value text pair (tEXt/iTXt/zTXt) into the meta table. */
-static void m_addtext(struct upng_meta *m, const unsigned char *p, unsigned n)
+static void m_addtext(struct png_meta *m, const unsigned char *p, unsigned n)
 {
-  if (m->n_text >= UPNG_TEXT_MAX)
+  if (m->n_text >= PNG_TEXT_MAX)
     return;
   unsigned k = 0;
   while (k < n && p[k] != 0)
     k++; /* keyword runs to the first NUL  */
-  struct upng_text *t = &m->text[m->n_text];
-  m_textcopy(t->key, UPNG_KEY_MAX, p, k);
+  struct png_text *t = &m->text[m->n_text];
+  m_textcopy(t->key, PNG_KEY_MAX, p, k);
   if (t->key[0] == 0)
     return; /* a keyword is mandatory          */
   const unsigned char *v = p + (k < n ? k + 1 : n);
   unsigned vn = (k + 1 <= n) ? n - (k + 1) : 0;
-  m_textcopy(t->val, UPNG_VAL_MAX, v, vn);
+  m_textcopy(t->val, PNG_VAL_MAX, v, vn);
   m->n_text++;
 }
 
-int upng_probe(upng_reader rd, void *rctx, struct upng_meta *m)
+int png_probe(png_reader rd, void *rctx, struct png_meta *m)
 {
   m_zero(m, sizeof *m);
   struct rdr R = {rd, rctx}, *r = &R;
@@ -503,7 +503,7 @@ int upng_probe(upng_reader rd, void *rctx, struct upng_meta *m)
   static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
   for (int i = 0; i < 8; i++)
     if (prb(r) != sig[i])
-      return UPNG_EBADSIG;
+      return PNG_EBADSIG;
 
   int have_ihdr = 0;
   for (;;) {
@@ -522,7 +522,7 @@ int upng_probe(upng_reader rd, void *rctx, struct upng_meta *m)
       unsigned char hb[13];
       uint32_t got;
       if (pread(r, hb, len, 13, &got) < 0 || got < 13)
-        return UPNG_EBADHDR;
+        return PNG_EBADHDR;
       m->w = ((unsigned)hb[0] << 24) | (hb[1] << 16) | (hb[2] << 8) | hb[3];
       m->h = ((unsigned)hb[4] << 24) | (hb[5] << 16) | (hb[6] << 8) | hb[7];
       m->depth = hb[8];
@@ -629,14 +629,14 @@ int upng_probe(upng_reader rd, void *rctx, struct upng_meta *m)
           p++; /* skip translated keyword */
         if (p < got)
           p++;
-        if (m->n_text < UPNG_TEXT_MAX) {
-          struct upng_text *t = &m->text[m->n_text];
-          m_textcopy(t->key, UPNG_KEY_MAX, b, k);
+        if (m->n_text < PNG_TEXT_MAX) {
+          struct png_text *t = &m->text[m->n_text];
+          m_textcopy(t->key, PNG_KEY_MAX, b, k);
           if (t->key[0]) {
             if (compressed)
-              m_textcopy(t->val, UPNG_VAL_MAX, (const unsigned char *)"(compressed)", 12);
+              m_textcopy(t->val, PNG_VAL_MAX, (const unsigned char *)"(compressed)", 12);
             else
-              m_textcopy(t->val, UPNG_VAL_MAX, b + p, p < got ? got - p : 0);
+              m_textcopy(t->val, PNG_VAL_MAX, b + p, p < got ? got - p : 0);
             m->n_text++;
           }
         }
@@ -651,24 +651,24 @@ int upng_probe(upng_reader rd, void *rctx, struct upng_meta *m)
       unsigned k = 0;
       while (k < got && b[k])
         k++;
-      if (m->n_text < UPNG_TEXT_MAX && k > 0) {
-        struct upng_text *t = &m->text[m->n_text];
-        m_textcopy(t->key, UPNG_KEY_MAX, b, k);
+      if (m->n_text < PNG_TEXT_MAX && k > 0) {
+        struct png_text *t = &m->text[m->n_text];
+        m_textcopy(t->key, PNG_KEY_MAX, b, k);
         if (t->key[0]) {
-          m_textcopy(t->val, UPNG_VAL_MAX, (const unsigned char *)"(compressed)", 12);
+          m_textcopy(t->val, PNG_VAL_MAX, (const unsigned char *)"(compressed)", 12);
           m->n_text++;
         }
       }
       if (pskip(r, (len > got ? len - got : 0) + 4) < 0)
         goto done;
     } else if (is_type(ty, "eXIf")) {
-      if (len > UPNG_EXIF_MAX) {
+      if (len > PNG_EXIF_MAX) {
         m->exif_len = -1; /* present but over our cap */
         if (pskip(r, len + 4) < 0)
           goto done;
       } else {
         uint32_t got;
-        if (pread(r, m->exif, len, UPNG_EXIF_MAX, &got) < 0)
+        if (pread(r, m->exif, len, PNG_EXIF_MAX, &got) < 0)
           goto done;
         m->exif_len = (int)got;
         if (pskip(r, 4) < 0)
@@ -686,7 +686,7 @@ int upng_probe(upng_reader rd, void *rctx, struct upng_meta *m)
     }
   }
 done:
-  return have_ihdr ? UPNG_OK : UPNG_EBADHDR;
+  return have_ihdr ? PNG_OK : PNG_EBADHDR;
 }
 
 /* ------------------------------------------------------------- EXIF decoding
@@ -731,7 +731,7 @@ static unsigned ex_typesize(unsigned t)
   }
 }
 
-/* Small freestanding string helpers (upng.c is standalone — no libc here). */
+/* Small freestanding string helpers (png.c is standalone — no libc here). */
 static char *e_str(char *p, const char *s)
 {
   while (*s)
@@ -811,7 +811,7 @@ static const char *ex_format(unsigned tag, unsigned type, unsigned cnt, const un
       return 0;
     }
     unsigned o = 0, n = cnt;
-    for (unsigned i = 0; i < n && o < UPNG_VAL_MAX - 1; i++) {
+    for (unsigned i = 0; i < n && o < PNG_VAL_MAX - 1; i++) {
       if (dptr + (int)i >= len)
         break;
       unsigned char c = e[dptr + i];
@@ -920,7 +920,7 @@ static const char *ex_format(unsigned tag, unsigned type, unsigned cnt, const un
 /* Walk one IFD at byte offset `off`. Emits recognised tags; if !is_sub, stores
  * the Exif sub-IFD pointer (tag 0x8769) into *sub for a single follow-up walk.
  */
-static void ex_walk(const unsigned char *e, int len, int off, int le, int is_sub, int *sub, upng_kv emit, void *ctx)
+static void ex_walk(const unsigned char *e, int len, int off, int le, int is_sub, int *sub, png_kv emit, void *ctx)
 {
   if (off < 0 || off + 2 > len)
     return;
@@ -946,14 +946,14 @@ static void ex_walk(const unsigned char *e, int len, int off, int le, int is_sub
     int dptr = (total <= 4) ? ep + 8 : (int)ex32(e, len, ep + 8, le);
     if (dptr < 0 || dptr >= len)
       continue;
-    char val[UPNG_VAL_MAX];
+    char val[PNG_VAL_MAX];
     const char *label = ex_format(tag, type, cnt, e, len, dptr, le, val);
     if (label && val[0])
       emit(ctx, label, val);
   }
 }
 
-void upng_exif_emit(const unsigned char *exif, int len, upng_kv emit, void *ctx)
+void png_exif_emit(const unsigned char *exif, int len, png_kv emit, void *ctx)
 {
   if (len < 8)
     return;
@@ -1014,7 +1014,7 @@ static int set_format(struct dec *d)
   return 0;
 }
 
-int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx, unsigned *out_w, unsigned *out_h)
+int png_decode(png_reader rd, void *rctx, png_row row, void *row_ctx, unsigned *out_w, unsigned *out_h)
 {
   struct dec *d = &D;
   d->rd = rd;
@@ -1037,7 +1037,7 @@ int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx, unsigne
   static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
   for (int i = 0; i < 8; i++)
     if (rb(d) != sig[i])
-      return UPNG_EBADSIG;
+      return PNG_EBADSIG;
 
   unsigned interlace = 0;
   int have_ihdr = 0;
@@ -1045,68 +1045,68 @@ int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx, unsigne
     uint32_t len;
     uint8_t ty[4];
     if (chunk_hdr(d, &len, ty) < 0)
-      return UPNG_ETRUNC;
+      return PNG_ETRUNC;
     if (is_type(ty, "IHDR")) {
       if (len < 13)
-        return UPNG_EBADHDR;
+        return PNG_EBADHDR;
       uint8_t hb[13];
       for (int i = 0; i < 13; i++) {
         int c = rb(d);
         if (c < 0)
-          return UPNG_ETRUNC;
+          return PNG_ETRUNC;
         hb[i] = (uint8_t)c;
       }
       if (len > 13 && skip(d, len - 13) < 0)
-        return UPNG_ETRUNC;
+        return PNG_ETRUNC;
       d->w = ((unsigned)hb[0] << 24) | (hb[1] << 16) | (hb[2] << 8) | hb[3];
       d->h = ((unsigned)hb[4] << 24) | (hb[5] << 16) | (hb[6] << 8) | hb[7];
       d->depth = hb[8];
       d->color = hb[9];
       interlace = hb[12];
       if (skip(d, 4) < 0)
-        return UPNG_ETRUNC; /* CRC               */
+        return PNG_ETRUNC; /* CRC               */
       have_ihdr = 1;
     } else if (is_type(ty, "PLTE")) {
       if (!have_ihdr)
-        return UPNG_EBADHDR;
+        return PNG_EBADHDR;
       unsigned n = len / 3;
       if (n > 256)
         n = 256;
       for (unsigned i = 0; i < n * 3; i++) {
         int c = rb(d);
         if (c < 0)
-          return UPNG_ETRUNC;
+          return PNG_ETRUNC;
         d->plte[i] = (uint8_t)c;
       }
       if (skip(d, len - n * 3 + 4) < 0)
-        return UPNG_ETRUNC; /* rest+CRC */
+        return PNG_ETRUNC; /* rest+CRC */
       d->plte_n = n;
     } else if (is_type(ty, "tRNS")) {
       if (!have_ihdr)
-        return UPNG_EBADHDR;
+        return PNG_EBADHDR;
       if (d->color == 3) { /* per-index alpha    */
         unsigned n = len > 256 ? 256 : len;
         for (unsigned i = 0; i < n; i++) {
           int c = rb(d);
           if (c < 0)
-            return UPNG_ETRUNC;
+            return PNG_ETRUNC;
           d->trns[i] = (uint8_t)c;
         }
         if (skip(d, len - n + 4) < 0)
-          return UPNG_ETRUNC;
+          return PNG_ETRUNC;
         d->trns_n = n;
       } else if (d->color == 0 && len >= 2) { /* gray colour-key    */
         uint8_t b0 = (uint8_t)rb(d), b1 = (uint8_t)rb(d);
         d->ck_r = d->ck_g = d->ck_b = (d->depth == 16) ? b0 : d->depth == 8 ? b1 : b1 * 255u / ((1u << d->depth) - 1);
         d->has_ckey = 1;
         if (skip(d, len - 2 + 4) < 0)
-          return UPNG_ETRUNC;
+          return PNG_ETRUNC;
       } else if (d->color == 2 && len >= 6) { /* RGB colour-key     */
         uint8_t v[6];
         for (int i = 0; i < 6; i++) {
           int c = rb(d);
           if (c < 0)
-            return UPNG_ETRUNC;
+            return PNG_ETRUNC;
           v[i] = (uint8_t)c;
         }
         d->ck_r = (d->depth == 16) ? v[0] : v[1];
@@ -1114,34 +1114,34 @@ int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx, unsigne
         d->ck_b = (d->depth == 16) ? v[4] : v[5];
         d->has_ckey = 1;
         if (skip(d, len - 6 + 4) < 0)
-          return UPNG_ETRUNC;
+          return PNG_ETRUNC;
       } else if (skip(d, len + 4) < 0) {
-        return UPNG_ETRUNC;
+        return PNG_ETRUNC;
       }
     } else if (is_type(ty, "IDAT")) {
       if (!have_ihdr)
-        return UPNG_EBADHDR;
+        return PNG_EBADHDR;
       d->chunk_left = len;
       d->in_chunk = 1; /* first IDAT open    */
       break;
     } else if (is_type(ty, "IEND")) {
-      return UPNG_ETRUNC;              /* no image data     */
+      return PNG_ETRUNC;              /* no image data     */
     } else if (skip(d, len + 4) < 0) { /* ancillary + CRC    */
-      return UPNG_ETRUNC;
+      return PNG_ETRUNC;
     }
   }
   if (!have_ihdr || d->w == 0 || d->h == 0)
-    return UPNG_EBADHDR;
+    return PNG_EBADHDR;
   if (interlace > 1 || d->w > MAXW)
-    return UPNG_EUNSUP;
+    return PNG_EUNSUP;
   if (set_format(d) < 0)
-    return UPNG_EUNSUP;
+    return PNG_EUNSUP;
   if (d->color == 3 && d->plte_n == 0)
-    return UPNG_EBADHDR; /* palette needs PLTE */
+    return PNG_EBADHDR; /* palette needs PLTE */
   d->interlaced = (interlace == 1);
   if (d->interlaced) {
     if ((unsigned long)d->w * d->h > IL_MAXPX)
-      return UPNG_EUNSUP;
+      return PNG_EUNSUP;
     il_next_pass(d); /* prime the first pass   */
   }
 
@@ -1156,19 +1156,19 @@ int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx, unsigne
 
   if (d->interlaced) {
     if (d->pass < 7)
-      return UPNG_EINFLATE;               /* didn't finish passes   */
+      return PNG_EINFLATE;               /* didn't finish passes   */
     for (unsigned y = 0; y < d->h; y++) { /* emit the assembled rows*/
       if (d->row(d->row_ctx, y, il_frame + (unsigned long)y * d->w * 4, d->w) < 0)
-        return UPNG_OK; /* caller stopped: fine   */
+        return PNG_OK; /* caller stopped: fine   */
     }
-    return UPNG_OK;
+    return PNG_OK;
   }
 
   if (d->badfilt)
-    return UPNG_EINFLATE;
+    return PNG_EINFLATE;
   if (d->rowstop)
-    return UPNG_OK; /* caller stopped: fine      */
+    return PNG_OK; /* caller stopped: fine      */
   if (d->cur_y < d->h)
-    return UPNG_EINFLATE; /* didn't get every row      */
-  return UPNG_OK;
+    return PNG_EINFLATE; /* didn't get every row      */
+  return PNG_OK;
 }

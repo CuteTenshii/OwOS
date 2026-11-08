@@ -2,7 +2,7 @@
 #include "imgdec.h"
 #include "features/svg/svg.h"
 #include "owos.h"
-#include "upng.h"
+#include "png.h"
 #include "webp.h"
 
 #define IMG_AREA_CAP (4096u * 4096u) /* reject absurd dimensions before allocating */
@@ -21,7 +21,7 @@ int image_sniff(const unsigned char *data, int len)
   return IMG_FMT_NONE;
 }
 
-/* streaming source over an in-memory buffer, for upng's pull API */
+/* streaming source over an in-memory buffer, for png's pull API */
 struct imgrd {
   const unsigned char *d;
   int len, pos;
@@ -94,7 +94,7 @@ static unsigned char *decode_png(const unsigned char *data, int len, unsigned *o
 {
   struct imgrd r = {data, len, 0};
   unsigned w = 0, h = 0;
-  if (upng_dimensions(imgrd_get, &r, &w, &h) != UPNG_OK || !w || !h)
+  if (png_dimensions(imgrd_get, &r, &w, &h) != PNG_OK || !w || !h)
     return 0;
   if ((unsigned long)w * h > IMG_AREA_CAP)
     return 0;
@@ -104,7 +104,7 @@ static unsigned char *decode_png(const unsigned char *data, int len, unsigned *o
   memset(buf, 0, (unsigned long)w * h * 4);
   r.pos = 0;
   struct imgfill f = {buf, w, h};
-  if (upng_decode(imgrd_get, &r, imgfill_row, &f, 0, 0) != UPNG_OK) {
+  if (png_decode(imgrd_get, &r, imgfill_row, &f, 0, 0) != PNG_OK) {
     free(buf);
     return 0;
   }

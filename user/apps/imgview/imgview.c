@@ -2,7 +2,7 @@
  * menu bar (File: Open / Reload / Quit, View: Properties), an image canvas, and a status bar */
 #include "gfx.h"
 #include "owos.h"
-#include "upng.h"
+#include "png.h"
 #include "webp.h"
 #include <stdbool.h>
 
@@ -24,7 +24,7 @@ static unsigned iw, ih;   /* its pixel dimensions */
 static int load_ok;       /* a valid image is loaded */
 static bool is_webp;      /* the loaded image is WebP, not PNG */
 
-static struct upng_meta meta; /* probed metadata for curpath */
+static struct png_meta meta; /* probed metadata for curpath */
 static int meta_valid;        /* meta + the props list match curpath */
 
 static int props_open;  /* the properties overlay is showing */
@@ -161,7 +161,7 @@ static int probe_image(const char *path, unsigned *w, unsigned *h, bool *webp)
   *webp = false;
   struct freader fr;
   fr_init(&fr, path);
-  return (upng_dimensions(fr_get, &fr, w, h) == 0 && *w && *h) ? 0 : -1;
+  return (png_dimensions(fr_get, &fr, w, h) == 0 && *w && *h) ? 0 : -1;
 }
 
 /* scaled blit into the backing canvas */
@@ -281,14 +281,14 @@ static void decode_to_canvas(void)
   } else {
     struct freader fr;
     fr_init(&fr, curpath);
-    upng_decode(fr_get, &fr, v_row, &v, 0, 0);
+    png_decode(fr_get, &fr, v_row, &v, 0, 0);
   }
 }
 
 /* properties list */
 #define PROP_MAX 80
 static char prop_key[PROP_MAX][20];
-static char prop_val[PROP_MAX][UPNG_VAL_MAX];
+static char prop_val[PROP_MAX][PNG_VAL_MAX];
 static int n_props;
 
 static void padd(const char *k, const char *v)
@@ -351,7 +351,7 @@ static void fmt_size(char *b)
 /* Properties for a WebP image (probed from its container header) */
 static void build_props_webp(void)
 {
-  char b[UPNG_VAL_MAX], *p;
+  char b[PNG_VAL_MAX], *p;
   n_props = 0;
   padd("File", basename_of(curpath));
   if (!load_ok) {
@@ -384,7 +384,7 @@ static void build_props_webp(void)
 /* Rebuild the key/value list from `meta` (assumed valid) + a stat() of curpath */
 static void build_props(void)
 {
-  char b[UPNG_VAL_MAX], *p;
+  char b[PNG_VAL_MAX], *p;
   n_props = 0;
 
   padd("File", basename_of(curpath));
@@ -479,7 +479,7 @@ static void build_props(void)
     padd(meta.text[i].key, meta.text[i].val);
 
   if (meta.exif_len > 0)
-    upng_exif_emit(meta.exif, meta.exif_len, exif_cb, 0);
+    png_exif_emit(meta.exif, meta.exif_len, exif_cb, 0);
   else if (meta.exif_len < 0)
     padd("EXIF", "(present, too large)");
 }
@@ -497,7 +497,7 @@ static void ensure_meta(void)
   if (load_ok) {
     struct freader fr;
     fr_init(&fr, curpath);
-    upng_probe(fr_get, &fr, &meta);
+    png_probe(fr_get, &fr, &meta);
   }
   build_props();
   meta_valid = 1;

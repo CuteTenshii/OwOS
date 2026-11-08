@@ -1,6 +1,6 @@
 /* icon.c: app icons for the start menu, taskbar, title bars and Alt+Tab */
 #include "comp.h"
-#include "upng.h"
+#include "png.h"
 
 #define ICONS_DIR "/usr/share/icons/"
 #define ICON_DEFAULT "application-default"
@@ -80,14 +80,14 @@ static bool load_png(const char *path, unsigned *out)
 {
   struct reader rd = {.path = path};
   unsigned w, h;
-  if (upng_dimensions(rd_get, &rd, &w, &h) != 0 || w < ICON_PX || h < ICON_PX || w > ICON_SRC_MAX || h > ICON_SRC_MAX)
+  if (png_dimensions(rd_get, &rd, &w, &h) != 0 || w < ICON_PX || h < ICON_PX || w > ICON_SRC_MAX || h > ICON_SRC_MAX)
     return false;
   unsigned *src = malloc(w * h * 4);
   if (!src)
     return false;
   struct scale s = {src, w};
   rd = (struct reader){.path = path};
-  bool ok = upng_decode(rd_get, &rd, store_row, &s, 0, 0) == UPNG_OK;
+  bool ok = png_decode(rd_get, &rd, store_row, &s, 0, 0) == PNG_OK;
   if (ok)
     downscale(src, w, h, out);
   free(src);
