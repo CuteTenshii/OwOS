@@ -5,7 +5,7 @@
 #include "features/cors/cors.h"
 #include "fetchint.h"
 
-enum { WQ_TO_WORKER, WQ_TO_PAGE, WQ_ERROR };
+enum { WQ_TO_WORKER, WQ_TO_PAGE, WQ_ERROR, WQ_TO_PORT };
 
 static js_object *g_worker_proto; /* Worker.prototype */
 static js_object *g_wscope_proto; /* DedicatedWorkerGlobalScope.prototype (`self`) */
@@ -84,7 +84,7 @@ static void wq_deliver(js_value w, int kind, js_value data)
 {
   js_value target, ev;
   if (w.type != JV_OBJ || js_to_boolean(js_get(g_ctx, w, "@dead")) ||
-      (kind == WQ_TO_WORKER && js_to_boolean(js_get(g_ctx, w, "@closed"))))
+      ((kind == WQ_TO_WORKER || kind == WQ_TO_PORT) && js_to_boolean(js_get(g_ctx, w, "@closed"))))
     return;
   gc_push_scope();
   gc_keep(w.u.obj);
@@ -99,7 +99,12 @@ static void wq_deliver(js_value w, int kind, js_value data)
       ev = make_event("error", 0, 0, js_undef());
       if (ev.type == JV_OBJ) {
         gc_keep(ev.u.obj);
-        js_set(g_ctx, ev, "message", data);
+        event_adopt_iface(ev, "ErrorEvent");
+        js_def(ev.u.obj, "message", data, P_WRITABLE | P_ENUMERABLE);
+        js_def(ev.u.obj, "filename", js_get(g_ctx, w, "@url"), P_WRITABLE | P_ENUMERABLE);
+        js_def(ev.u.obj, "lineno", js_number(0), P_WRITABLE | P_ENUMERABLE);
+        js_def(ev.u.obj, "colno", js_number(0), P_WRITABLE | P_ENUMERABLE);
+        js_def(ev.u.obj, "error", js_null(), P_WRITABLE | P_ENUMERABLE);
       }
     } else
       ev = make_message_event(data);
@@ -133,6 +138,8 @@ int js_workers_pump(void)
   gc_pop_scope();
   return (int)(n / 3);
 }
+
+void js_port_enqueue(js_value port, js_value data) { wq_push(port, WQ_TO_PORT, data); }
 
 static js_value worker_post(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -412,6 +419,7 @@ static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int arg
   js_def(w, "onmessageerror", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(w, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(w, "@dead", js_bool(0), P_WRITABLE);
+  js_def(w, "@url", js_mk_cstring(ctx, url), 0);
   js_def(w, "@id", js_number(++g_next_wid), 0);
   scope = (js_object *)gc_keep(js_new_object(ctx, g_wscope_proto));
   nm = opts.type == JV_OBJ ? js_get(ctx, opts, "name") : js_undef();
@@ -451,6 +459,7 @@ void js_worker_setup(js_ctx *ctx, js_object *win)
   gc_add_root((void **)&g_wq);
   g_nwenvs = 0;
   gc_add_root_range((void **)g_wenvs, &g_nwenvs);
+  js_msgchannel_setup(ctx, win);
   def_method(g_worker_proto, "postMessage", worker_post, 1);
   def_method(g_worker_proto, "terminate", worker_terminate, 0);
   def_method(g_worker_proto, "addEventListener", el_add_listener, 3);
@@ -473,6 +482,7 @@ void js_worker_setup(js_ctx *ctx, js_object *win)
 
 void js_worker_teardown(void)
 {
+  js_msgchannel_teardown();
   gc_remove_root((void **)&g_worker_proto);
   gc_remove_root((void **)&g_wscope_proto);
   gc_remove_root((void **)&g_wq);

@@ -38,7 +38,7 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
   n = list ? js_array_len(list) : 0;
   for (i = 0; i < n; i++) {
     js_value e = js_get_index(g_ctx, js_obj_value(list), i);
-    js_value ty, fn, a;
+    js_value ty, fn, a, src;
     if (e.type != JV_OBJ)
       continue;
     if (js_to_boolean(js_get(g_ctx, e, "capture")) != want_capture)
@@ -50,7 +50,8 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
     if (!js_is_callable(fn))
       continue;
     a = ev;
-    js_set_event_script(evty.type == JV_STR ? evty.u.str->data : 0);
+    src = js_get(g_ctx, e, "src");
+    js_set_event_script(evty.type == JV_STR ? evty.u.str->data : 0, src.type == JV_STR ? src.u.str->data : 0);
     js_call(g_ctx, fn, js_obj_value(obj), &a, 1);
     if (g_ctx->has_exc)
       report_exc_v(g_ctx);
@@ -68,7 +69,7 @@ void ev_fire_on(js_object *obj, js_value ev, int want_capture)
     js_value h = js_get(g_ctx, js_obj_value(obj), onname);
     if (js_is_callable(h)) {
       js_value a = ev;
-      js_set_event_script(evty.u.str->data);
+      js_set_event_script(evty.u.str->data, 0);
       js_call(g_ctx, h, js_obj_value(obj), &a, 1);
       if (g_ctx->has_exc)
         report_exc_v(g_ctx);
@@ -254,6 +255,7 @@ js_value el_add_listener(js_ctx *ctx, js_value t, js_value *args, int argc)
     js_def(e, "type", js_mk_cstring(ctx, type), 0);
     js_def(e, "fn", fn, 0);
     js_def(e, "capture", js_bool(capture), 0);
+    js_def(e, "src", js_mk_cstring(ctx, js_cur_script()), 0);
     js_array_push(ctx, list, js_obj_value(e));
   }
   gc_pop_scope();
@@ -316,6 +318,17 @@ js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   return ev;
 }
 
+/* Re-parent an event onto a window interface's prototype (ErrorEvent, MessageEvent) if the page has it */
+void event_adopt_iface(js_value ev, const char *iface)
+{
+  js_value ctor = js_get(g_ctx, js_obj_value(g_ctx->global), iface), proto;
+  if (ev.type != JV_OBJ || ctor.type != JV_OBJ)
+    return;
+  proto = js_get(g_ctx, ctor, "prototype");
+  if (proto.type == JV_OBJ)
+    ev.u.obj->proto = proto.u.obj;
+}
+
 /* EventTarget(): `new` builds a bare target; `super()` from a subclass keeps its own `this` */
 js_value eventtarget_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
@@ -329,11 +342,12 @@ js_value eventtarget_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 
 /* The init-dict fields carried by the Event subclasses */
 static const char *const k_event_init_keys[] = {
-    "view",      "detail",      "clientX",       "clientY",   "screenX", "screenY", "pageX",
-    "pageY",     "movementX",   "movementY",     "button",    "buttons", "ctrlKey", "shiftKey",
-    "altKey",    "metaKey",     "relatedTarget", "key",       "code",    "keyCode", "which",
-    "charCode",  "repeat",      "location",      "deltaX",    "deltaY",  "deltaZ",  "deltaMode",
-    "pointerId", "pointerType", "pressure",      "isPrimary", "data",
+    "view",      "detail",      "clientX",       "clientY",   "screenX",     "screenY", "pageX",
+    "pageY",     "movementX",   "movementY",     "button",    "buttons",     "ctrlKey", "shiftKey",
+    "altKey",    "metaKey",     "relatedTarget", "key",       "code",        "keyCode", "which",
+    "charCode",  "repeat",      "location",      "deltaX",    "deltaY",      "deltaZ",  "deltaMode",
+    "pointerId", "pointerType", "pressure",      "isPrimary", "data",        "message", "filename",
+    "lineno",    "colno",       "error",         "origin",    "lastEventId", "source",  "ports",
 };
 
 /* Constructor shared by every Event subclass */

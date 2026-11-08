@@ -132,6 +132,40 @@ static void test_worker_timers(void)
   run_script("expect(ticks===1, 'terminate cancels the worker timers: '+ticks);\n");
 }
 
+static void test_message_channel(void)
+{
+  run_script("var mc=new MessageChannel(), seen=[], back=[];\n"
+             "expect(mc instanceof MessageChannel && mc.port1 instanceof MessagePort, 'instanceof');\n"
+             "mc.port2.onmessage=function(e){ seen.push(e.data); expect(e instanceof MessageEvent, 'MessageEvent'); "
+             "mc.port2.postMessage('pong'); };\n"
+             "mc.port1.addEventListener('message',function(e){ back.push(e.data); });\n"
+             "var obj={n:1}; mc.port1.postMessage(obj); mc.port1.postMessage(2); obj.n=9;\n"
+             "expect(seen.length===0, 'asynchronous');\n");
+  drain();
+  run_script("expect(seen.length===2 && seen[0].n===1 && seen[1]===2, 'ordered, cloned: '+JSON.stringify(seen));\n"
+             "expect(back.length===2 && back[0]==='pong', 'reply');\n"
+             "mc.port1.close(); mc.port2.postMessage('x'); mc.port1.postMessage('y');\n");
+  drain();
+  run_script("expect(seen.length===2 && back.length===2, 'closed ports drop traffic');\n"
+             "var threw=false; try{ new MessagePort(); }catch(e){ threw=true; } expect(threw, 'MessagePort is not "
+             "constructible');\n");
+}
+
+static void test_event_interfaces(void)
+{
+  run_script(
+      "var ee=new ErrorEvent('error',{message:'m',filename:'f.js',lineno:3,colno:4,error:7});\n"
+      "expect(ee instanceof Event && ee.type==='error' && ee.message==='m' && ee.filename==='f.js', 'ErrorEvent');\n"
+      "expect(ee.lineno===3 && ee.colno===4 && ee.error===7, 'ErrorEvent position and error');\n"
+      "var me=new MessageEvent('message',{data:{a:1},origin:'o',lastEventId:'i'});\n"
+      "expect(me instanceof Event && me.data.a===1 && me.origin==='o' && me.lastEventId==='i', 'MessageEvent');\n"
+      "var got=null, bw=new Worker('data:text/javascript,throw 1;');\n"
+      "bw.onerror=function(e){ got=e; };\n");
+  drain();
+  run_script("expect(got instanceof ErrorEvent && typeof got.message==='string' && got.filename.indexOf('data:')===0, "
+             "'worker error is an ErrorEvent');\n");
+}
+
 static void test_errors(void)
 {
   run_script("var errs=0, bad=new Worker('data:text/javascript,throw new Error(\"boom\");');\n"
@@ -160,6 +194,8 @@ int main(void)
   test("importScripts, location and name", test_import_scripts_and_location);
   test("module workers", test_module_worker);
   test("worker timers die with terminate", test_worker_timers);
+  test("MessageChannel and MessagePort", test_message_channel);
+  test("ErrorEvent and MessageEvent", test_event_interfaces);
   test("script and construction errors", test_errors);
 
   js_page_end();

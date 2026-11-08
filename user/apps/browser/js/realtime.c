@@ -140,7 +140,7 @@ void emit_event(js_object *w, const char *type, js_value data)
     js_value h = js_get(g_ctx, js_obj_value(w), on);
     if (js_is_callable(h)) {
       js_value a = ev;
-      js_set_event_script(type);
+      js_set_event_script(type, 0);
       js_call(g_ctx, h, js_obj_value(w), &a, 1);
       if (g_ctx->has_exc)
         report_exc(g_ctx);
@@ -340,6 +340,7 @@ js_value make_message_event(js_value data)
   js_def(e, "@dp", js_bool(0), P_WRITABLE);
   js_def(e, "@sp", js_bool(0), P_WRITABLE);
   gc_pop_scope();
+  event_adopt_iface(js_obj_value(e), "MessageEvent");
   return js_obj_value(e);
 }
 

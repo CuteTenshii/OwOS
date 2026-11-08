@@ -2222,9 +2222,9 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     } subs[] = {
         {"UIEvent", -1},   /* -> Event.prototype */
         {"MouseEvent", 0}, /* -> UIEvent.prototype */
-        {"KeyboardEvent", 0},    {"FocusEvent", 0},   {"InputEvent", 0},
-        {"CompositionEvent", 0}, {"PointerEvent", 1}, /* -> MouseEvent.prototype */
-        {"WheelEvent", 1},       {"DragEvent", 1},
+        {"KeyboardEvent", 0}, {"FocusEvent", 0}, {"InputEvent", 0},  {"CompositionEvent", 0},
+        {"PointerEvent", 1}, /* -> MouseEvent.prototype */
+        {"WheelEvent", 1},    {"DragEvent", 1},  {"ErrorEvent", -1}, {"MessageEvent", -1},
     };
     js_object *protos[sizeof subs / sizeof subs[0]];
     unsigned i;

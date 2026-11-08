@@ -39,6 +39,7 @@ js_value el_dispatch(js_ctx *ctx, js_value t, js_value *args, int argc);
 int ev_flag(js_value ev, const char *k);
 void ev_fire_on(js_object *obj, js_value ev, int want_capture);
 js_value make_event(const char *type, int x, int y, js_value init);
+void event_adopt_iface(js_value ev, const char *iface); /* give ev the ErrorEvent/MessageEvent prototype */
 
 /* a growable byte buffer (NUL-terminated); realloc-backed, caller frees s->b */
 typedef struct {
@@ -101,5 +102,8 @@ int sw_intercept_fetch(js_ctx *ctx, const char *url, const char *method, js_valu
 /* Dedicated workers (js/webworker.c) */
 void js_worker_setup(js_ctx *ctx, js_object *win);
 void js_worker_teardown(void);
+void js_port_enqueue(js_value port, js_value data); /* async message delivery to a MessagePort */
+void js_msgchannel_setup(js_ctx *ctx, js_object *win);
+void js_msgchannel_teardown(void);
 
 #endif /* BROWSER_JSINT_H */
