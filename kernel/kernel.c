@@ -44,6 +44,7 @@
 #include "timer.h"
 #include "users.h"
 #include "uwin.h"
+#include "virtiogpu.h"
 #include "vmsvga.h"
 #include "vmtools.h"
 #include "wallclock.h"
@@ -324,11 +325,15 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   smp_init();
 
-  /* Framebuffer: VMware SVGA, else the bootloader's, else QEMU DISPI. */
+  /* Framebuffer: VMware SVGA, virtio-gpu, else the bootloader's, else QEMU DISPI. */
   {
-    int rc = -1, adopted = 0, svga = 0;
+    int rc = -1, adopted = 0, svga = 0, vgpu = 0;
     rc = vmsvga_init(1024, 768);
     svga = (rc == 0);
+    if (rc != 0) {
+      rc = virtiogpu_init(1024, 768);
+      vgpu = (rc == 0);
+    }
     if (rc != 0 && (mbi->flags & MULTIBOOT_FLAG_FB) && mbi->framebuffer_type == MULTIBOOT_FB_TYPE_RGB &&
         mbi->framebuffer_bpp == 32) {
       rc = fb_adopt((uint32_t)mbi->framebuffer_addr, mbi->framebuffer_width, mbi->framebuffer_height,
@@ -347,6 +352,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     }
     if (svga)
       con_write("fb: VMware SVGA II adopted.\n");
+    if (vgpu)
+      con_write("fb: virtio-gpu adopted.\n");
     if (rc == 0)
       con_write("fb: graphics mode up.\n");
     else
