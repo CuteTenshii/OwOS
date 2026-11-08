@@ -374,16 +374,6 @@ void handle_click(int mx, int my)
   }
 }
 
-/* All cursor-shape changes funnel through here so the per-element hover shape and the loading */
-static int cur_cursor = WIN_CURSOR_ARROW;
-void set_cursor(int id, int shape)
-{
-  if (shape != cur_cursor) {
-    win_cursor(id, shape);
-    cur_cursor = shape;
-  }
-}
-
 static bool in_rect(int mx, int my, const struct rect *r)
 {
   return mx >= r->x && mx < r->x + r->w && my >= r->y && my < r->y + r->h;
@@ -436,7 +426,7 @@ void handle_move(int mx, int my)
 
   /* Per-element cursor; the loading spinner (event loop) outranks it. */
   if (!B->loading)
-    set_cursor(B->win_id, cursor_for(mx, my, url));
+    gfx_cursor(B->win_id, cursor_for(mx, my, url));
 
   if (streq(url, hover_url))
     return;

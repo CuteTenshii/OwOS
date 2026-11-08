@@ -204,7 +204,6 @@ void render_addr(void);
 /* input.c */
 void sel_hl_rect(int x, int y, int w, int h, int ct, int cb);
 void handle_click(int mx, int my);
-void set_cursor(int id, int shape);
 void handle_move(int mx, int my);
 void handle_drag(int mx, int my);
 void copy_selection(void);

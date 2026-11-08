@@ -220,9 +220,9 @@ int main(int argc, char **argv)
     B->hist_len = tabs[active_tab].hist_n;
 
     if (B->loading && !prev_loading)   /* fetch started */
-      set_cursor(id, WIN_CURSOR_BUSY); /* spinner while loading */
+      gfx_cursor(id, WIN_CURSOR_BUSY); /* spinner while loading */
     if (prev_loading && !B->loading) { /* fetch finished */
-      set_cursor(id, WIN_CURSOR_ARROW);
+      gfx_cursor(id, WIN_CURSOR_ARROW);
       imgc_clear();      /* drop the old page's decoded images */
       tab_sync_active(); /* refresh the tab label */
       update_title(id);

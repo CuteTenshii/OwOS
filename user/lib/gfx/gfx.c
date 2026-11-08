@@ -1112,3 +1112,14 @@ void gfx_get_clip(int *x, int *y, int *w, int *h)
   *w = g_cx1 - g_cx0;
   *h = g_cy1 - g_cy0;
 }
+
+void gfx_cursor(int win, int shape)
+{
+  static int last_win = -1, last_shape = -1;
+  if (win == last_win && shape == last_shape)
+    return;
+  if (win_cursor(win, shape) == 0) {
+    last_win = win;
+    last_shape = shape;
+  }
+}

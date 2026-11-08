@@ -281,6 +281,12 @@ int scrollbar_hit(int x, int y, int w, int h, int mx, int my);
  * unconditionally. */
 int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible);
 
+/* --------------------------------------------------------------- cursor */
+/* Set window `win`'s client-area cursor to a WIN_CURSOR_* shape (owos.h): arrow, hand, text, busy, the four
+ * resize arrows, move, not-allowed, crosshair, help, grab, grabbing, progress. The shape is only sent to
+ * the system when it differs from the last one set, so calling it on every mouse move is cheap. */
+void gfx_cursor(int win, int shape);
+
 /* --------------------------------------------------------------- scroll view */
 /*
  * A vertically scrolling container: content taller than the viewport is clipped to it and moved with the
