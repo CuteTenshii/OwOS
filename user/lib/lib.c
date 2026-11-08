@@ -823,6 +823,17 @@ void strlcpy(char *dst, const char *src, int size)
   dst[i] = '\0';
 }
 
+char *strdup(const char *s)
+{
+  if (!s)
+    return 0;
+  int n = strlen(s);
+  char *d = malloc((unsigned)n + 1);
+  if (d)
+    memcpy(d, s, (unsigned)n + 1);
+  return d;
+}
+
 void strcat(char *d, const char *s)
 {
   while (*d)

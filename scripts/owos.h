@@ -20,6 +20,10 @@
 #define KEY_HOME 0x05
 #define KEY_END 0x06
 
+/* The guest strdup returns 0 for NULL; the host one would crash. */
+static inline char *owos_strdup(const char *s) { return s ? strdup(s) : 0; }
+#define strdup owos_strdup
+
 /* Byte-exact string compare, matching user/lib/owos.h's inline version. */
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 

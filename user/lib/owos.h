@@ -95,6 +95,7 @@ int strcmp(const char *a, const char *b); /* <0 / 0 / >0 */
 void strcpy(char *d, const char *s);      /* caller sizes d */
 char *strchr(const char *s, int c);       /* first c in s (c == 0 finds the terminator), or 0 */
 void strcat(char *d, const char *s);      /* caller sizes d */
+char *strdup(const char *s);              /* malloc'd copy of s; 0 for a NULL s or out of memory */
 /* BSD strlcpy: truncates, always NUL-terminates */
 void strlcpy(char *dst, const char *src, int size);
 static inline int streq(const char *a, const char *b) { return strcmp(a, b) == 0; }

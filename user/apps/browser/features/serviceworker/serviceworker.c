@@ -64,17 +64,6 @@ static void sw_input_method(js_ctx *ctx, js_value v, char *out, int cap);
 static js_value sw_new_pending(js_ctx *ctx, js_value *resolve_out);
 
 /* ---- small utilities ---- */
-static char *sw_strdup(const char *s)
-{
-  int n = s ? (int)strlen(s) : 0;
-  char *d = (char *)malloc((unsigned)n + 1);
-  if (d) {
-    if (s && n)
-      memcpy(d, s, (unsigned)n);
-    d[n] = 0;
-  }
-  return d;
-}
 /* A resolved Promise of `v`, keeping v alive across the promise allocation. */
 static js_value sw_resolve(js_ctx *ctx, js_value v)
 {
@@ -117,8 +106,8 @@ static struct sw_cache *sw_cache_find(const char *origin, const char *name, bool
     if (!c)
       return 0;
     c->id = g_swc_nextid++;
-    c->origin = sw_strdup(origin);
-    c->name = sw_strdup(name);
+    c->origin = strdup(origin);
+    c->name = strdup(name);
     if (!c->origin || !c->name) {
       free(c->origin);
       free(c->name);
@@ -165,11 +154,11 @@ static void sw_cache_store(struct sw_cache *c, const char *method, const char *u
     e = &c->e[c->n++];
   }
   memset(e, 0, sizeof *e);
-  e->method = sw_strdup(method && method[0] ? method : "GET");
-  e->url = sw_strdup(url);
+  e->method = strdup(method && method[0] ? method : "GET");
+  e->url = strdup(url);
   e->status = status ? status : 200;
-  e->statustext = sw_strdup(st ? st : "");
-  e->ctype = sw_strdup(ct ? ct : "");
+  e->statustext = strdup(st ? st : "");
+  e->ctype = strdup(ct ? ct : "");
   e->blen = blen > 0 ? blen : 0;
   e->body = (unsigned char *)malloc((unsigned)(e->blen ? e->blen : 1));
   if (e->body && e->blen)
@@ -201,7 +190,7 @@ static struct sw_reg *sw_reg_add(const char *origin, const char *scope, const ch
 {
   struct sw_reg *r = sw_reg_find_scope(origin, scope);
   if (r) {
-    char *url = sw_strdup(script_url);
+    char *url = strdup(script_url);
     if (!url)
       return 0;
     free(r->script_url);
@@ -219,9 +208,9 @@ static struct sw_reg *sw_reg_add(const char *origin, const char *scope, const ch
   r = (struct sw_reg *)calloc(1, sizeof *r);
   if (!r)
     return 0;
-  r->origin = sw_strdup(origin);
-  r->scope = sw_strdup(scope);
-  r->script_url = sw_strdup(script_url);
+  r->origin = strdup(origin);
+  r->scope = strdup(scope);
+  r->script_url = strdup(script_url);
   if (!r->origin || !r->scope || !r->script_url) {
     free(r->origin);
     free(r->scope);

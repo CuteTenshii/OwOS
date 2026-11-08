@@ -55,17 +55,6 @@ static int g_nunlink;
 /* Guards the list, bucket index, g_bytes and pending unlinks against fetch threads. */
 static mutex_t g_lock;
 
-static char *sdup(const char *s)
-{
-  if (!s)
-    return 0;
-  int n = strlen(s);
-  char *d = malloc((unsigned)n + 1);
-  if (d)
-    memcpy(d, s, (unsigned)n + 1);
-  return d;
-}
-
 static bool is_get(const char *method) { return !method || !method[0] || streq_ci(method, "GET"); }
 
 /* FNV-1a of the URL: keys the disk filename and the bucket. */
@@ -264,9 +253,9 @@ static void set_freshness(struct cache_entry *e, const struct http_cc *cc, long 
   e->no_cache = cc->no_cache;
   e->must_revalidate = cc->must_revalidate;
   free(e->etag);
-  e->etag = sdup(cc->etag);
+  e->etag = strdup(cc->etag);
   free(e->last_mod);
-  e->last_mod = sdup(cc->last_mod_str);
+  e->last_mod = strdup(cc->last_mod_str);
 }
 
 /* Conditional-request lines, lowercased so valid for HTTP/1.1 and HTTP/2. */
@@ -370,9 +359,9 @@ static void store_locked(const char *url, const char *vkey, struct http_vary *va
     e->body = nb;
     e->len = len;
     free(e->ctype);
-    e->ctype = sdup(ctype);
+    e->ctype = strdup(ctype);
     free(e->hdr);
-    e->hdr = sdup(hdr_block);
+    e->hdr = strdup(hdr_block);
     e->status = status;
     set_freshness(e, cc, now);
     e->dirty = true;
@@ -387,10 +376,10 @@ static void store_locked(const char *url, const char *vkey, struct http_vary *va
     return;
   }
   memset(e, 0, sizeof *e);
-  e->url = sdup(url);
-  e->vkey = sdup(vkey);
-  e->ctype = sdup(ctype);
-  e->hdr = sdup(hdr_block);
+  e->url = strdup(url);
+  e->vkey = strdup(vkey);
+  e->ctype = strdup(ctype);
+  e->hdr = strdup(hdr_block);
   e->body = nb;
   if (!e->url || !e->vkey) {
     entry_free(e);
@@ -626,8 +615,8 @@ static struct cache_entry *load_file(const char *name)
   if (!e)
     goto out;
   memset(e, 0, sizeof *e);
-  e->url = sdup(url);
-  e->ctype = sdup(ctype);
+  e->url = strdup(url);
+  e->ctype = strdup(ctype);
   e->hdr = hdr;
   e->body = body;
   e->vkey = vkey;

@@ -292,18 +292,6 @@ void dt_netinfo_clear(struct netinfo *ni)
   ni->method[0] = ni->ctype[0] = ni->err[0] = '\0';
 }
 
-/* Heap-dup a possibly-NULL string (the borrowed net_log fields), or NULL. */
-static char *dt_strdup(const char *s)
-{
-  if (!s)
-    return 0;
-  int n = strlen(s);
-  char *d = malloc((unsigned)n + 1);
-  if (d)
-    memcpy(d, s, (unsigned)n + 1);
-  return d;
-}
-
 void devtools_net_reset(void)
 {
   mutex_lock(&dt_lk);
@@ -440,8 +428,8 @@ static void net_fill(int slot, const struct net_log *e)
     int k = 0;
     sapp(ni->err, &k, sizeof ni->err, e->reason);
   }
-  ni->url = dt_strdup(e->url);
-  ni->resp_hdr = dt_strdup(e->resp_hdr);
+  ni->url = strdup(e->url);
+  ni->resp_hdr = strdup(e->resp_hdr);
 }
 
 /* Reserve the next ring slot, evicting the oldest when full. Caller holds dt_lk. */

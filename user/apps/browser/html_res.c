@@ -398,15 +398,6 @@ static struct bg_note *g_bgn;
 int g_nbg;
 static int g_bgn_cap; /* urls collected by the walk this pass */
 
-static char *dup_cstr(const char *s)
-{
-  int n = (int)strlen(s);
-  char *d = malloc((unsigned)n + 1);
-  if (d)
-    memcpy(d, s, (unsigned)n + 1);
-  return d;
-}
-
 /* Note one block box's url() background for the batched fetch */
 void bg_note_url(const char *raw_url)
 {
@@ -428,7 +419,7 @@ void bg_note_url(const char *raw_url)
     g_bgn = nn;
     g_bgn_cap = nc;
   }
-  char *na = dup_cstr(abs), *nu = dup_cstr(use);
+  char *na = strdup(abs), *nu = strdup(use);
   if (!na || !nu) {
     free(na);
     free(nu);
