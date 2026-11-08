@@ -159,7 +159,7 @@ $(BROTLIDICT): user/lib/brotli/dictionary.bin
 # user/lib/font and is wired into font_load via a weak ref, so font_load decodes
 # web fonts transparently; only programs that link $(WOFF) drag in brotli/inflate.
 WOFF    := user/lib/font/woff.o
-TERMLIB := user/lib/zlib/lzss.o user/lib/zlib/deflate.o $(CRC32) $(CRYPTO) $(CLIPBOARD)  # the shell's codecs + crypto
+SHLIB := user/lib/zlib/lzss.o user/lib/zlib/deflate.o $(CRC32) $(CRYPTO) $(CLIPBOARD)  # the shell's codecs + crypto
 
 user/lib/start.o: user/lib/start.S $(ARCH_STAMP)
 	$(UCC) $(UCFLAGS) -c $< -o $@
