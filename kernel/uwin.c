@@ -39,7 +39,7 @@ struct uwin {
   int w, h;           /* client size in pixels */
   int fx, fy, fw, fh; /* on-screen frame geometry */
   uint32_t flags;     /* UWIN_F_* */
-  int cursor;         /* enum wm_cursor */
+  int cursor;         /* WIN_CURSOR_* */
   char title[64];
   uint32_t present_seq;
   bool dirty_full;
@@ -405,7 +405,7 @@ int uwin_set_resizable(int id, int on)
 int uwin_set_cursor(int id, int cursor)
 {
   struct uwin *u = owned(id);
-  if (!u)
+  if (!u || cursor < 0 || cursor > UWIN_CURSOR_LAST)
     return -1;
   u->cursor = cursor;
   return 0;
@@ -503,6 +503,7 @@ int uwin_enum(struct winrec *out, int max)
     r->owner_pid = (int)u->owner;
     r->z = 0;
     r->parent = u->parent;
+    r->cursor = u->cursor;
     r->buf_w = u->w;
     r->buf_h = u->h;
     int k = 0;

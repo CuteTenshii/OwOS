@@ -19,7 +19,8 @@
 #define WM_EDGE 5
 #define WM_MIN_W 140
 #define WM_MIN_H 120
-enum { CUR_ARROW = 0, CUR_HAND, CUR_TEXT, CUR_BUSY, CUR_RESIZE_NWSE, CUR_RESIZE_NESW, CUR_RESIZE_NS, CUR_RESIZE_EW };
+enum { CUR_ARROW = 0, CUR_HAND, CUR_TEXT, CUR_BUSY, CUR_RESIZE_NWSE, CUR_RESIZE_NESW, CUR_RESIZE_NS, CUR_RESIZE_EW,
+       CUR_MOVE, CUR_NOT_ALLOWED, CUR_CROSSHAIR, CUR_HELP, CUR_GRAB, CUR_GRABBING, CUR_PROGRESS };
 #define KEY_TAB '\t'
 #define KEY_ALT_UP 0x1B /* internal: "Alt released" marker (kernel wm KEY_ALT_UP) */
 #define WM_LIST_MAX 64
@@ -52,8 +53,8 @@ struct cur_shape {
   int nrows, hotx, hoty;
 };
 #define CUR_DMG_PAD 9
-#define CUR_DMG_W 24
-#define CUR_DMG_H 30
+#define CUR_DMG_W 32
+#define CUR_DMG_H 34
 struct taskbar_cache {
   bool valid;
   int right, n;

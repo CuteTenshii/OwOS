@@ -167,7 +167,7 @@ int win_set_parent(int id, int parent, int modal);
 /* Buffer of an owned window; 0 if not owned */
 unsigned *win_fb_of(int id);
 
-/* Cursor over the client area; mirrors enum wm_cursor */
+/* Cursor over the client area; mirrors UWIN_CURSOR_* in kernel/uwin.h */
 #define WIN_CURSOR_ARROW 0
 #define WIN_CURSOR_HAND 1        /* pointing hand, over clickable items */
 #define WIN_CURSOR_TEXT 2        /* I-beam, over editable text */
@@ -176,6 +176,13 @@ unsigned *win_fb_of(int id);
 #define WIN_CURSOR_RESIZE_NESW 5 /* ↗↙ diagonal resize (corner) */
 #define WIN_CURSOR_RESIZE_NS 6   /* ↕ vertical resize (top/bottom edge) */
 #define WIN_CURSOR_RESIZE_EW 7   /* ↔ horizontal resize (left/right) */
+#define WIN_CURSOR_MOVE 8        /* four-way arrows, over something draggable in place */
+#define WIN_CURSOR_NOT_ALLOWED 9 /* circle with a slash, a drop or action is refused */
+#define WIN_CURSOR_CROSSHAIR 10  /* precise picking, e.g. a screenshot region */
+#define WIN_CURSOR_HELP 11       /* arrow with a question mark */
+#define WIN_CURSOR_GRAB 12       /* open hand, over something that can be dragged */
+#define WIN_CURSOR_GRABBING 13   /* closed hand, while dragging it */
+#define WIN_CURSOR_PROGRESS 14   /* arrow with a spinner, busy but still usable */
 int win_cursor(int id, int shape);
 
 /* Compositor API (root-only, -1 if not uid 0) */
@@ -216,6 +223,7 @@ struct winrec {
   int buf_w, buf_h; /* client buffer size (stride = buf_w) */
   char title[64];
   int parent; /* transient parent window id, or -1 */
+  int cursor; /* client-area cursor shape, WIN_CURSOR_* */
 };
 #define UWIN_F_VISIBLE 0x01
 #define UWIN_F_FOCUSED 0x02

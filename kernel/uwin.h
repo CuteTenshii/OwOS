@@ -40,7 +40,11 @@ struct winrec {
   int buf_w, buf_h; /* client buffer size (stride = buf_w) */
   char title[64];
   int parent; /* transient parent id, or -1 */
+  int cursor; /* client-area cursor shape, WIN_CURSOR_* */
 };
+
+/* Highest client cursor shape; mirrors WIN_CURSOR_* in user/lib/owos.h */
+#define UWIN_CURSOR_LAST 14
 
 #define UWIN_F_VISIBLE 0x01
 #define UWIN_F_FOCUSED 0x02
@@ -64,7 +68,7 @@ int uwin_poll(int id, struct win_event *out);         /* 1 event / 0 none / -1 *
 int uwin_close(int id);
 int uwin_set_title(int id, const char *title);
 int uwin_set_resizable(int id, int on);
-int uwin_set_cursor(int id, int cursor); /* enum wm_cursor */
+int uwin_set_cursor(int id, int cursor); /* WIN_CURSOR_*, 0..UWIN_CURSOR_LAST */
 
 /* Link `id` to a transient `parent` (modal blocks the family); parent < 0 clears. 0 / -1. */
 int uwin_set_parent(int id, int parent, int modal);

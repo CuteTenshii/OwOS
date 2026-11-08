@@ -431,6 +431,10 @@ int pick_cursor(int mx, int my)
     int e = resize_hit(w, mx, my);
     if (e)
       return edge_cursor(e);
+    int cx, cy, cw, ch;
+    client_rect(w, &cx, &cy, &cw, &ch);
+    if (mx >= cx && mx < cx + cw && my >= cy && my < cy + ch && w->cursor >= 0 && w->cursor <= CUR_PROGRESS)
+      return w->cursor;
   }
   return CUR_ARROW;
 }
