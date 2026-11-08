@@ -1,6 +1,7 @@
 /* sd.c: SD/MMC driver over a PCI SDHCI controller, polled PIO, one 512-byte block at a time.
- * Identification: CMD0, CMD8, ACMD41, CMD2, CMD3, CMD9, CMD7. SDSC is byte-addressed, SDHC/SDXC block-addressed.
- * Waits are bounded; data moves through the Buffer Data Port, no DMA. */
+ * Identification: CMD0, CMD8, ACMD41, CMD2, CMD3, CMD9, CMD7 (eMMC: CMD1, host-assigned RCA, EXT_CSD capacity). SDSC is
+ * byte-addressed, SDHC/SDXC/eMMC block-addressed. Waits are bounded; data moves through the Buffer Data Port, no DMA.
+ */
 
 #include <stdbool.h>
 
@@ -86,6 +87,7 @@
 static volatile uint8_t *mmio;
 static bool found;
 static bool high_capacity;
+static bool is_mmc;
 static uint16_t rca;
 static uint32_t cap_sectors;
 static char model[24];
@@ -178,12 +180,12 @@ static uint32_t csd_bits(const uint32_t *r, int hi, int lo)
 static void parse_csd(const uint32_t *r)
 {
   cap_sectors = 0;
-  if (csd_bits(r, 127, 126) == 1) {
+  if (!is_mmc && csd_bits(r, 127, 126) == 1) {
     /* CSD v2 (SDHC/SDXC): capacity = (C_SIZE+1) * 512 KiB. */
     uint32_t c_size = csd_bits(r, 69, 48);
     cap_sectors = (c_size + 1) * 1024u;
   } else {
-    /* CSD v1 (SDSC): (C_SIZE+1) * 2^(C_SIZE_MULT+2) blocks of READ_BL_LEN. */
+    /* CSD v1 (SDSC, and MMC below 2 GiB): (C_SIZE+1) * 2^(C_SIZE_MULT+2) blocks of READ_BL_LEN. */
     uint32_t c_size = csd_bits(r, 73, 62);
     uint32_t c_size_mult = csd_bits(r, 49, 47);
     uint32_t read_bl_len = csd_bits(r, 83, 80);
@@ -193,10 +195,64 @@ static void parse_csd(const uint32_t *r)
   }
 }
 
+static int xfer_block(uint8_t cmd, uint32_t arg, void *buf, bool write);
+
+/* eMMC: CMD1 replaces ACMD41, the host picks the RCA, and capacity above 2 GiB lives in EXT_CSD. */
+static int mmc_init(void)
+{
+  uint32_t r[4];
+
+  wr8(R_SW_RESET, SR_CMD | SR_DAT);
+  for (uint32_t i = 0; i < POLL_LIMIT && (rd8(R_SW_RESET) & (SR_CMD | SR_DAT)); i++)
+    ;
+  if (sd_command(0, 0, CF_RESP_NONE, false))
+    return -1;
+
+  uint32_t ocr = 0;
+  for (int t = 0; t < 2000; t++) {
+    if (sd_command(1, 0x40FF8000u, RESP_R3, false))
+      return -1;
+    ocr = rd32(R_RESPONSE);
+    if (ocr & 0x80000000u)
+      break;
+    sd_spin(20000);
+  }
+  if (!(ocr & 0x80000000u))
+    return -1;
+  high_capacity = (ocr & 0x60000000u) == 0x40000000u;
+
+  if (sd_command(2, 0, RESP_R2, false))
+    return -1;
+  rca = 1;
+  if (sd_command(3, (uint32_t)rca << 16, RESP_R1, false))
+    return -1;
+
+  if (sd_command(9, (uint32_t)rca << 16, RESP_R2, false))
+    return -1;
+  for (int i = 0; i < 4; i++)
+    r[i] = rd32(R_RESPONSE + i * 4);
+  parse_csd(r);
+
+  if (sd_command(7, (uint32_t)rca << 16, RESP_R1B, false))
+    return -1;
+
+  if (high_capacity) {
+    uint8_t ext[512];
+    if (xfer_block(8, 0, ext, false))
+      return -1;
+    cap_sectors = (uint32_t)ext[212] | (uint32_t)ext[213] << 8 | (uint32_t)ext[214] << 16 | (uint32_t)ext[215] << 24;
+  }
+
+  if (sd_command(16, 512, RESP_R1, false))
+    return -1;
+  return 0;
+}
+
 static int card_init(void)
 {
   uint32_t r[4];
 
+  is_mmc = false;
   if (sd_command(0, 0, CF_RESP_NONE, false))
     return -1;
 
@@ -208,8 +264,12 @@ static int card_init(void)
   /* ACMD41: poll until OCR bit 31; HCS (arg bit 30) advertises high-capacity support. */
   uint32_t ocr = 0;
   for (int t = 0; t < 2000; t++) {
-    if (sd_command(55, 0, RESP_R1, false))
-      return -1;
+    if (sd_command(55, 0, RESP_R1, false)) {
+      if (t)
+        return -1;
+      is_mmc = true;
+      return mmc_init();
+    }
     uint32_t arg = 0x00FF8000u | (v2 ? 0x40000000u : 0u);
     if (sd_command(41, arg, RESP_R3, false))
       return -1;
@@ -247,22 +307,13 @@ static int card_init(void)
 
 static int card_bring_up(void);
 
-static int do_transfer(uint32_t lba, void *buf, bool write)
+/* One 512-byte data block: cmd 17/24 for sectors, 8 for the eMMC EXT_CSD. */
+static int xfer_block(uint8_t cmd, uint32_t arg, void *buf, bool write)
 {
-  /* Lazily bring up a hot-inserted card; card_bring_up() fails harmlessly on an empty slot. */
-  if (!found && card_bring_up() != 0)
-    return -1;
-
-  /* SDSC is byte-addressed; a large lba would wrap the 32-bit argument, so fail out of range. */
-  if (!high_capacity && lba > 0xFFFFFFFFu / 512u)
-    return -1;
-  uint32_t arg = high_capacity ? lba : lba * 512u;
-
   wr16(R_BLOCK_SIZE, 512);
   wr16(R_BLOCK_COUNT, 1);
   wr16(R_XFER_MODE, write ? 0 : TM_READ);
 
-  uint8_t cmd = write ? 24 : 17;
   if (sd_command(cmd, arg, RESP_R1, true))
     return -1;
 
@@ -285,6 +336,18 @@ static int do_transfer(uint32_t lba, void *buf, bool write)
     }
   }
   return sd_wait(IS_XFER_DONE);
+}
+
+static int do_transfer(uint32_t lba, void *buf, bool write)
+{
+  /* Lazily bring up a hot-inserted card; card_bring_up() fails harmlessly on an empty slot. */
+  if (!found && card_bring_up() != 0)
+    return -1;
+
+  /* SDSC is byte-addressed; a large lba would wrap the 32-bit argument, so fail out of range. */
+  if (!high_capacity && lba > 0xFFFFFFFFu / 512u)
+    return -1;
+  return xfer_block(write ? 24 : 17, high_capacity ? lba : lba * 512u, buf, write);
 }
 
 int sd_read_sector(uint32_t lba, void *buf) { return do_transfer(lba, buf, false); }
@@ -348,7 +411,9 @@ static int card_bring_up(void)
 
   sd_set_clock(25000);
   found = true;
-  if (high_capacity)
+  if (is_mmc)
+    memcpy(model, "eMMC", sizeof("eMMC"));
+  else if (high_capacity)
     memcpy(model, "SDHC/SDXC card", sizeof("SDHC/SDXC card"));
   else
     memcpy(model, "SD card", sizeof("SD card"));
