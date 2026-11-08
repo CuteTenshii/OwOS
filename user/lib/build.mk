@@ -128,7 +128,7 @@ MDNS    := user/lib/mdns/mdns.o
 # resolve: the getaddrinfo analog - hostname -> IPv4 (IP literal / .local via
 # $(MDNS) / unicast DNS from /etc/resolv.conf). Now that the kernel connect path
 # takes an IP only, this is the user-space resolver; needs $(MDNS) + $(LIBGCC).
-RESOLVE := user/lib/resolve/resolve.o $(MDNS)
+RESOLVE := user/lib/resolve/resolve.o user/lib/resolve/svcb.o $(MDNS)
 # stun: STUN (RFC 5389/8489) message codec + server-reflexive query - the generic
 # NAT-traversal substrate ICE/WebRTC gathers candidates over. Needs $(CRYPTO)
 # (hmac_sha1 for MESSAGE-INTEGRITY) and $(RESOLVE) (stun_query's name->IP).

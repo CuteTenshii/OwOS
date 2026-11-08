@@ -3,6 +3,7 @@
 #include "resolve.h"
 #include "mdns.h"
 #include "owos.h"
+#include "svcb.h"
 
 /* Fallback nameserver when /etc/resolv.conf is absent/unreadable (SLIRP's DNS).
  */
@@ -89,25 +90,9 @@ static void read_nameserver(unsigned char ns[4])
 
 static unsigned be16(const unsigned char *p) { return ((unsigned)p[0] << 8) | p[1]; }
 
-/* In-stream length of a name at msg[pos]: labels until a 0 byte (+1) or a
- * compression pointer (+2). 0 on malformed. */
-static int name_len(const unsigned char *msg, int pos, int end)
-{
-  int p = pos;
-  while (p < end) {
-    unsigned b = msg[p];
-    if (b == 0)
-      return p + 1 - pos;
-    if ((b & 0xC0) == 0xC0)
-      return p + 2 - pos;
-    p += 1 + (int)b;
-  }
-  return 0;
-}
-
-/* Send an A-record query for `host` to `ns`:53 and return the first A address
- * in ip. 1 = resolved, 0 = miss/timeout, NET_EINTR on Ctrl+C. */
-static int dns_lookup(const char *host, const unsigned char ns[4], unsigned char ip[4])
+/* Send a `qtype` query for `host` to `ns`:53. Returns the reply length in r (>= 12), 0 on
+ * miss/timeout, or NET_EINTR on Ctrl+C. */
+static int dns_exchange(const char *host, int qtype, const unsigned char ns[4], unsigned char *r, int rmax)
 {
   char server[16];
   int si = 0;
@@ -158,8 +143,8 @@ static int dns_lookup(const char *host, const unsigned char ns[4], unsigned char
       s++;
   }
   q[n++] = 0;
-  q[n++] = 0;
-  q[n++] = 1; /* QTYPE=A                             */
+  q[n++] = (unsigned char)(qtype >> 8);
+  q[n++] = (unsigned char)qtype;
   q[n++] = 0;
   q[n++] = 1; /* QCLASS=IN                           */
 
@@ -172,46 +157,54 @@ static int dns_lookup(const char *host, const unsigned char ns[4], unsigned char
       continue;
     }
 
-    unsigned char r[1500];
-    int rn = net_recv(h, r, (int)sizeof r); /* ~2 s socket timeout, then 0 */
+    int rn = net_recv(h, r, rmax); /* ~2 s socket timeout, then 0 */
     net_close(h);
     if (rn == NET_EINTR)
       return NET_EINTR;
-    if (rn < 12)
-      continue; /* no reply: retry             */
-
-    unsigned qd = be16(r + 4), an = be16(r + 6);
-    int pos = 12;
-    for (unsigned i = 0; i < qd; i++) { /* skip question(s)           */
-      int l = name_len(r, pos, rn);
-      if (!l) {
-        an = 0;
-        break;
-      }
-      pos += l + 4;
-    }
-    for (unsigned i = 0; i < an && pos + 10 <= rn; i++) {
-      int l = name_len(r, pos, rn);
-      if (!l)
-        break;
-      pos += l;
-      if (pos + 10 > rn)
-        break; /* RR header follows the name */
-      int type = (int)be16(r + pos);
-      int rdlen = (int)be16(r + pos + 8);
-      pos += 10;
-      if (pos + rdlen > rn)
-        break;
-      if (type == 1 && rdlen == 4) { /* first A record             */
-        for (int k = 0; k < 4; k++)
-          ip[k] = r[pos + k];
-        return 1;
-      }
-      pos += rdlen; /* CNAME etc.: keep scanning  */
-    }
-    return 0; /* answered, but no A          */
+    if (rn >= 12)
+      return rn;
   }
   return 0;
+}
+
+/* First A address of `host` via `ns`. 1 = resolved, 0 = miss/timeout, NET_EINTR on Ctrl+C. */
+static int dns_lookup(const char *host, const unsigned char ns[4], unsigned char ip[4])
+{
+  unsigned char r[1500];
+  int rn = dns_exchange(host, 1, ns, r, (int)sizeof r);
+  if (rn <= 0)
+    return rn;
+
+  unsigned qd = be16(r + 4), an = be16(r + 6);
+  int pos = 12;
+  for (unsigned i = 0; i < qd; i++) { /* skip question(s)           */
+    int l = dns_name_len(r, pos, rn);
+    if (!l) {
+      an = 0;
+      break;
+    }
+    pos += l + 4;
+  }
+  for (unsigned i = 0; i < an && pos + 10 <= rn; i++) {
+    int l = dns_name_len(r, pos, rn);
+    if (!l)
+      break;
+    pos += l;
+    if (pos + 10 > rn)
+      break; /* RR header follows the name */
+    int type = (int)be16(r + pos);
+    int rdlen = (int)be16(r + pos + 8);
+    pos += 10;
+    if (pos + rdlen > rn)
+      break;
+    if (type == 1 && rdlen == 4) { /* first A record             */
+      for (int k = 0; k < 4; k++)
+        ip[k] = r[pos + k];
+      return 1;
+    }
+    pos += rdlen; /* CNAME etc.: keep scanning  */
+  }
+  return 0; /* answered, but no A          */
 }
 
 int resolve(const char *host, unsigned char ip[4])
@@ -256,4 +249,34 @@ int net_dial(const char *host, int port, int proto)
   }
   dotted[di] = '\0';
   return net_connect(dotted, port, proto);
+}
+
+int resolve_ech(const char *host, int port, unsigned char *out, int max)
+{
+  char name[260];
+  int n = 0;
+  if (!host || !*host || is_local(host))
+    return 0;
+  if (port != 443) { /* RFC 9460 §9.1: _<port>._https.<host> */
+    name[n++] = '_';
+    char digits[6];
+    int dn = 0;
+    for (unsigned v = (unsigned)port; v; v /= 10)
+      digits[dn++] = (char)('0' + v % 10);
+    while (dn)
+      name[n++] = digits[--dn];
+    memcpy(name + n, "._https.", 8);
+    n += 8;
+  }
+  int hl = 0;
+  while (host[hl])
+    hl++;
+  if (n + hl >= (int)sizeof name)
+    return 0;
+  memcpy(name + n, host, hl + 1);
+
+  unsigned char ns[4], r[1500];
+  read_nameserver(ns);
+  int rn = dns_exchange(name, DNS_TYPE_HTTPS, ns, r, (int)sizeof r);
+  return rn > 0 ? svcb_find_ech(r, rn, out, max) : 0;
 }

@@ -16,6 +16,11 @@
  * failure/timeout, or NET_EINTR (-4) if a cooperative Ctrl+C arrived. */
 int resolve(const char *host, unsigned char ip[4]);
 
+/* Look up the HTTPS RR (RFC 9460) for host:port and copy its ECHConfigList (the `ech` SvcParam) into
+ * out. Returns the list length, or 0 if there is none, it does not fit in `max`, or the query failed.
+ * ServiceMode only; AliasMode targets are not followed. */
+int resolve_ech(const char *host, int port, unsigned char *out, int max);
+
 /* Convenience for the raw socket callers (ping's target, dig's @server):
  * resolve `host` then net_connect the resulting IP with (port, proto). Returns
  * the socket handle (>=0), or a negative net_connect-style error (-2 resolve,
