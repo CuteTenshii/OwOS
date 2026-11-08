@@ -98,7 +98,7 @@ bool dispatch_from(js_object *startobj, js_value ev)
     path[np++] = startobj; /* window/detached: just itself */
   }
   /* window (global) is the outermost target, after the document */
-  if (g_ctx->global && np < 127 && path[np ? np - 1 : 0] != g_ctx->global)
+  if (target && g_ctx->global && np < 127 && path[np ? np - 1 : 0] != g_ctx->global)
     path[np++] = g_ctx->global;
 
   for (i = np - 1; i >= 1 && !ev_flag(ev, "@sp"); i--)
@@ -251,6 +251,17 @@ js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
   (void)thisv;
   return make_event(arg_str(ctx, A(0)), 0, 0, A(1));
+}
+
+/* EventTarget(): `new` builds a bare target; `super()` from a subclass keeps its own `this` */
+js_value eventtarget_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  js_value proto = ctx->native_data;
+  (void)args;
+  (void)argc;
+  if (thisv.type == JV_OBJ)
+    return thisv;
+  return js_obj_value(js_new_object(ctx, proto.type == JV_OBJ ? proto.u.obj : ctx->object_proto));
 }
 
 /* The init-dict fields carried by the Event subclasses */

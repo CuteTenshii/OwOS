@@ -248,6 +248,7 @@ js_value el_get_style(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value ev_prevent(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value ev_stop(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value event_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
+js_value eventtarget_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 js_value event_sub_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 extern js_object *g_classlist_proto;
 extern js_object *g_document_proto;

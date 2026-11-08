@@ -2066,6 +2066,26 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "CustomEvent", js_obj_value(ec), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
+  /* EventTarget: root of everything that takes listeners */
+  {
+    js_object *tp = js_new_object(ctx, ctx->object_proto);
+    js_object *tc;
+    js_object *const heirs[] = {g_node_proto, g_abortsignal_proto, g_ws_proto, g_xhr_proto, g_bchannel_proto, win};
+    gc_push_scope();
+    gc_keep(tp);
+    def_method(tp, "addEventListener", el_add_listener, 3);
+    def_method(tp, "removeEventListener", el_remove_listener, 3);
+    def_method(tp, "dispatchEvent", el_dispatch, 1);
+    tc = (js_object *)gc_keep(js_new_native(ctx, eventtarget_ctor, "EventTarget", 0));
+    tc->fn->data = js_obj_value(tp);
+    js_def(tc, "prototype", js_obj_value(tp), 0);
+    js_def(tp, "constructor", js_obj_value(tc), P_WRITABLE | P_CONFIGURABLE);
+    js_def(win, "EventTarget", js_obj_value(tc), P_WRITABLE | P_CONFIGURABLE);
+    for (unsigned i = 0; i < sizeof heirs / sizeof heirs[0]; i++)
+      if (heirs[i]->proto == ctx->object_proto)
+        heirs[i]->proto = tp;
+    gc_pop_scope();
+  }
   /* Event subclasses. Each gets a prototype chaining to its parent interface's */
   {
     static const struct {
