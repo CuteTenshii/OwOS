@@ -8,8 +8,8 @@
 #define JAR_DB "/home/root/cookies.db"
 #define COOKIE_SQL                                                                                                     \
   "CREATE TABLE cookies(host TEXT, name TEXT, value TEXT, "                                                            \
-  "expiry INTEGER, secure INTEGER, domain TEXT, path TEXT)"
-#define COOKIE_COLS 7
+  "expiry INTEGER, secure INTEGER, domain TEXT, path TEXT, httponly INTEGER)"
+#define COOKIE_COLS 8
 #define HSTS_SQL "CREATE TABLE hsts(host TEXT)"
 
 static char *dupn(const char *s, int n)
@@ -32,6 +32,7 @@ struct cookie_meta {
   struct cookie *c; /* the B->cookies node this describes         */
   long expires;     /* Unix epoch secs; 0 = session (no expiry)   */
   bool secure;      /* send only over TLS                         */
+  bool httponly;    /* hidden from document.cookie                */
   char *domain;     /* NULL = host-only; else host suffix-match   */
   char *path;       /* NULL = any path; else request-path prefix  */
   struct cookie_meta *next;
@@ -63,10 +64,10 @@ static void meta_detach(struct cookie *c)
 }
 
 /* Attach attributes to c, taking ownership of `domain`/`path`; all-default stores none. */
-static void meta_set(struct cookie *c, long expires, bool secure, char *domain, char *path)
+static void meta_set(struct cookie *c, long expires, bool secure, bool httponly, char *domain, char *path)
 {
   meta_detach(c);
-  if (!expires && !secure && !domain && !path) {
+  if (!expires && !secure && !httponly && !domain && !path) {
     free(domain);
     free(path);
     return;
@@ -80,6 +81,7 @@ static void meta_set(struct cookie *c, long expires, bool secure, char *domain, 
   m->c = c;
   m->expires = expires;
   m->secure = secure;
+  m->httponly = httponly;
   m->domain = domain;
   m->path = path;
   m->next = cookie_metas;
@@ -182,7 +184,8 @@ static void cookie_remove(const char *host, const char *name)
   }
 }
 
-void cookie_store(const char *host, const char *v)
+/* from_script: a document.cookie write, which may not set or replace HttpOnly cookies. */
+static void cookie_store_from(const char *host, const char *v, bool from_script)
 {
   while (*v == ' ')
     v++;
@@ -210,7 +213,7 @@ void cookie_store(const char *host, const char *v)
   long maxage = 0;
   bool have_expires = false;
   long expires_at = 0;
-  bool secure = false;
+  bool secure = false, httponly = false;
   char *domain = 0, *path = 0;
 
   for (const char *a = v; *a == ';';) {
@@ -256,6 +259,8 @@ void cookie_store(const char *host, const char *v)
       }
     } else if (attr_is(an, anlen, "secure")) {
       secure = true;
+    } else if (attr_is(an, anlen, "httponly")) {
+      httponly = true;
     } else if (attr_is(an, anlen, "domain") && av && avlen > 0) {
       if (*av == '.') {
         av++;
@@ -269,8 +274,8 @@ void cookie_store(const char *host, const char *v)
     }
   }
 
-  /* reject a Domain that isn't a suffix of the origin host (public-suffix list not consulted) */
-  if (domain && !domain_match(host, domain)) {
+  /* reject a Domain that isn't a suffix of the origin host (no public-suffix list) */
+  if ((domain && !domain_match(host, domain)) || (from_script && httponly)) {
     free(name);
     free(val);
     free(domain);
@@ -303,10 +308,18 @@ void cookie_store(const char *host, const char *v)
 
   for (struct cookie *c = B->cookies; c; c = c->next) {
     if (streq_ci(c->host, host) && streq(c->name, name)) {
+      struct cookie_meta *old = meta_find(c);
+      if (from_script && old && old->httponly) {
+        free(name);
+        free(val);
+        free(domain);
+        free(path);
+        return;
+      }
       free(c->val);
       c->val = val;
       free(name);
-      meta_set(c, expiry, secure, domain, path);
+      meta_set(c, expiry, secure, httponly, domain, path);
       jar_dirty = true;
       return;
     }
@@ -332,12 +345,15 @@ void cookie_store(const char *host, const char *v)
   }
   c->next = B->cookies;
   B->cookies = c;
-  meta_set(c, expiry, secure, domain, path);
+  meta_set(c, expiry, secure, httponly, domain, path);
   jar_dirty = true;
 }
 
-/* Build the Cookie: header value; `path` NULL skips Path filtering. */
-int cookie_header_tls(const char *host, const char *path, int tls, char *out, int cap)
+void cookie_store(const char *host, const char *v) { cookie_store_from(host, v, false); }
+void cookie_store_script(const char *host, const char *v) { cookie_store_from(host, v, true); }
+
+/* Build a cookie list; `script` hides HttpOnly cookies (document.cookie). */
+static int cookie_list(const char *host, const char *path, int tls, bool script, char *out, int cap)
 {
   long now = (long)rtc_epoch();
   int n = 0;
@@ -354,6 +370,8 @@ int cookie_header_tls(const char *host, const char *path, int tls, char *out, in
     }
     if (m && m->secure && !tls)
       continue; /* Secure     */
+    if (script && m && m->httponly)
+      continue; /* Secure     */
     if (m && m->path && path && !path_match(m->path, path))
       continue; /* Path scope */
     if (n)
@@ -363,6 +381,17 @@ int cookie_header_tls(const char *host, const char *path, int tls, char *out, in
     sapp(out, &n, cap, c->val);
   }
   return n;
+}
+
+/* Build the Cookie: header value for a request; `path` may be NULL to skip Path filtering. */
+int cookie_header_tls(const char *host, const char *path, int tls, char *out, int cap)
+{
+  return cookie_list(host, path, tls, false, out, cap);
+}
+
+int cookie_script_list(const char *host, const char *path, int tls, char *out, int cap)
+{
+  return cookie_list(host, path, tls, true, out, cap);
 }
 
 /* Legacy variant (browser.h API): assumes a secure request. */
@@ -382,6 +411,8 @@ static void cookie_clear(void)
   B->cookies = 0;
   meta_clear();
 }
+
+/* ----------------------------------------------- HSTS (force-HTTPS hosts) */
 
 int hsts_has(const char *host)
 {
@@ -464,7 +495,8 @@ void jar_load(void)
       }
       c->next = B->cookies;
       B->cookies = c;
-      meta_set(c, expiry, secure, domain, path);
+      bool httponly = (r->ncol >= 8 && r->col[7].type == SQL_INT && r->col[7].i != 0);
+      meta_set(c, expiry, secure, httponly, domain, path);
     }
   }
 
@@ -508,6 +540,7 @@ void jar_save(void)
       v[4] = sqlv_int(m && m->secure ? 1 : 0);
       v[5] = (m && m->domain) ? sqlv_text(m->domain) : sqlv_null();
       v[6] = (m && m->path) ? sqlv_text(m->path) : sqlv_null();
+      v[7] = sqlv_int(m && m->httponly ? 1 : 0);
       sql_insert(t, v, COOKIE_COLS);
     }
   }

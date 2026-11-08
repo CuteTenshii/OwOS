@@ -48,6 +48,10 @@ typedef struct {
 } sbuf;
 static int sb_need(sbuf *s, int extra)
 {
+  if (extra < 0 || s->n > 0x3fffffff - extra - 1) {
+    s->failed = 1;
+    return 0;
+  }
   if (s->n + extra + 1 > s->cap) {
     int c = s->cap ? s->cap * 2 : 64;
     while (c < s->n + extra + 1)
@@ -792,6 +796,16 @@ static int desc_has(js_object *o, const char *key)
       return 1;
   return 0;
 }
+static int is_index_key(const char *key)
+{
+  unsigned i;
+  if (!*key || (key[0] == '0' && key[1]))
+    return 0;
+  for (i = 0; key[i]; i++)
+    if (key[i] < '0' || key[i] > '9')
+      return 0;
+  return i < 10;
+}
 /* Core of Object.defineProperty: apply descriptor `desc` to own property `key`
  * of `target`, preserving any attribute the descriptor omits. Returns -1 with a
  * pending exception on a bad descriptor, else 0. The caller must root `desc`
@@ -819,6 +833,15 @@ static int define_one(js_ctx *ctx, js_object *target, const char *key, js_value 
     gc_pop_scope();
     js_throw_type(ctx, "property descriptor cannot be both accessor and data");
     return -1;
+  }
+
+  if (target->kind == OBJ_ARRAY && !has_get && !has_set && (is_index_key(key) || strcmp(key, "length") == 0)) {
+    if (has_value)
+      js_set(ctx, js_obj_value(target), key, js_get(ctx, desc, "value"));
+    else if (strcmp(key, "length") != 0 && !js_has_own(target, key))
+      js_set(ctx, js_obj_value(target), key, js_undef());
+    gc_pop_scope();
+    return 0;
   }
 
   cur = pmap_find_pub(target, key); /* existing own property, or NULL */
@@ -1336,6 +1359,10 @@ static js_value *spread_args(js_ctx *ctx, js_value list, int *argc)
   unsigned i;
   *argc = arr ? (int)arr->elen : 0;
   argv = (js_value *)malloc((unsigned)(*argc > 0 ? *argc : 1) * sizeof(js_value));
+  if (!argv) {
+    js_throw_range(ctx, "out of memory");
+    return NULL;
+  }
   for (i = 0; arr && i < arr->elen; i++)
     argv[i] = arr->elems[i];
   return argv;
@@ -1353,6 +1380,10 @@ static js_value reflect_apply(js_ctx *ctx, js_value t, js_value *a, int n)
   KEEP(thisv);
   KEEP(list);
   argv = spread_args(ctx, list, &argc);
+  if (!argv) {
+    gc_pop_scope();
+    return js_undef();
+  }
   {
     int i;
     for (i = 0; i < argc; i++)
@@ -1375,6 +1406,10 @@ static js_value reflect_construct(js_ctx *ctx, js_value t, js_value *a, int n)
   KEEP(fn);
   KEEP(list);
   argv = spread_args(ctx, list, &argc);
+  if (!argv) {
+    gc_pop_scope();
+    return js_undef();
+  }
   {
     int i;
     for (i = 0; i < argc; i++)
@@ -1453,8 +1488,8 @@ static js_value proxy_revocable(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value array_iter_next(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value tgt = js_get(ctx, t, "@t");
-  int i = (int)js_to_number(ctx, js_get(ctx, t, "@i"));
-  int kind = (int)js_to_number(ctx, js_get(ctx, t, "@i2"));
+  int i = js_to_int_sat(ctx, js_get(ctx, t, "@i"));
+  int kind = js_to_int_sat(ctx, js_get(ctx, t, "@i2"));
   js_object *arr = (tgt.type == JV_OBJ && tgt.u.obj->kind == OBJ_ARRAY) ? tgt.u.obj : NULL;
   js_object *res;
   (void)a;
@@ -1528,7 +1563,7 @@ static js_value array_entries_m(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value string_iter_next(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value tgt = js_get(ctx, t, "@t");
-  int i = (int)js_to_number(ctx, js_get(ctx, t, "@i"));
+  int i = js_to_int_sat(ctx, js_get(ctx, t, "@i"));
   js_object *res;
   (void)a;
   (void)n;
@@ -1571,7 +1606,7 @@ static js_value array_at(js_ctx *ctx, js_value t, js_value *a, int n)
   int i;
   if (!arr)
     return js_undef();
-  i = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+  i = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   if (i < 0)
     i += (int)arr->elen;
   if (i < 0 || i >= (int)arr->elen)
@@ -1710,9 +1745,9 @@ static js_value array_copywithin(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!arr)
     return t;
   len = (int)arr->elen;
-  target = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
-  start = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
-  end = n > 2 && a[2].type != JV_UNDEF ? (int)js_to_number(ctx, a[2]) : len;
+  target = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
+  start = n > 1 ? js_to_int_sat(ctx, a[1]) : 0;
+  end = n > 2 && a[2].type != JV_UNDEF ? js_to_int_sat(ctx, a[2]) : len;
   if (target < 0)
     target += len;
   if (target < 0)
@@ -1737,6 +1772,8 @@ static js_value array_copywithin(js_ctx *ctx, js_value t, js_value *a, int n)
   if (count <= 0)
     return t;
   tmp = (js_value *)malloc((unsigned)count * sizeof(js_value));
+  if (!tmp)
+    return js_throw_range(ctx, "out of memory");
   for (i = 0; i < count; i++)
     tmp[i] = arr->elems[start + i];
   for (i = 0; i < count; i++)
@@ -2151,7 +2188,7 @@ static js_value array_splice(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!arr)
     return js_undef();
   start = n > 0 ? clamp_index(js_to_number(ctx, a[0]), (int)arr->elen) : 0;
-  del = n > 1 ? (int)js_to_number(ctx, a[1]) : (int)arr->elen - start;
+  del = n > 1 ? js_to_int_sat(ctx, a[1]) : (int)arr->elen - start;
   if (del < 0)
     del = 0;
   if (start + del > (int)arr->elen)
@@ -2254,7 +2291,7 @@ static js_value array_indexof(js_ctx *ctx, js_value t, js_value *a, int n)
   js_object *arr = as_array(ctx, t);
   unsigned i;
   js_value x = ARG(0);
-  int from = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
+  int from = n > 1 ? js_to_int_sat(ctx, a[1]) : 0;
   if (!arr)
     return js_undef();
   if (from < 0)
@@ -2440,7 +2477,7 @@ static js_value array_flat(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_object *arr = as_array(ctx, t), *out;
   unsigned i;
-  int depth = n > 0 ? (int)js_to_number(ctx, a[0]) : 1;
+  int depth = n > 0 ? js_to_int_sat(ctx, a[0]) : 1;
   if (!arr)
     return js_undef();
   gc_push_scope();
@@ -2507,6 +2544,13 @@ static js_value array_sort(js_ctx *ctx, js_value t, js_value *a, int n)
 
 static js_value this_str(js_ctx *ctx, js_value t) { return js_to_string(ctx, t); }
 
+/* No Unicode tables: normalize() keeps the text as is */
+static js_value str_normalize(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  (void)a;
+  (void)n;
+  return this_str(ctx, t);
+}
 static js_value string_fromcharcode(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   sbuf sb;
@@ -2518,7 +2562,15 @@ static js_value string_fromcharcode(js_ctx *ctx, js_value t, js_value *a, int n)
   for (i = 0; i < n; i++) {
     char tmp[4];
     unsigned cp = js_to_uint32(ctx, a[i]) & 0xFFFF;
-    int k = utf8_encode(cp, tmp);
+    int k;
+    if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < n) { /* join a surrogate pair */
+      unsigned lo = js_to_uint32(ctx, a[i + 1]) & 0xFFFF;
+      if (lo >= 0xDC00 && lo < 0xE000) {
+        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        i++;
+      }
+    }
+    k = utf8_encode(cp, tmp);
     sb_put(&sb, tmp, k);
   }
   {
@@ -2527,6 +2579,28 @@ static js_value string_fromcharcode(js_ctx *ctx, js_value t, js_value *a, int n)
       free(sb.b);
     return r;
   }
+}
+static js_value string_fromcodepoint(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  sbuf sb;
+  int i;
+  js_value r;
+  (void)t;
+  sb.b = NULL;
+  sb.n = 0;
+  sb.cap = 0;
+  for (i = 0; i < n; i++) {
+    char tmp[4];
+    double d = js_to_number(ctx, a[i]);
+    if (!(d >= 0 && d <= 0x10FFFF) || d != (double)(unsigned)d) {
+      free(sb.b);
+      return js_throw_range(ctx, "Invalid code point");
+    }
+    sb_put(&sb, tmp, utf8_encode((unsigned)d, tmp));
+  }
+  r = str_of(ctx, sb.b ? sb.b : "", sb.n);
+  free(sb.b);
+  return r;
 }
 /* String.raw`...` — concatenate the template's raw cooked-less segments
  * (strings.raw) interleaved with the substitutions. Used by tagged-template
@@ -2567,7 +2641,7 @@ static js_value string_raw(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value str_charat(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value s = this_str(ctx, t);
-  int i = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+  int i = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   if (i < 0 || i >= s.u.str->len)
     return js_mk_cstring(ctx, "");
   return str_of(ctx, s.u.str->data + i, 1);
@@ -2575,7 +2649,7 @@ static js_value str_charat(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value str_at(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value s = this_str(ctx, t);
-  int i = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+  int i = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   if (i < 0)
     i += s.u.str->len;
   if (i < 0 || i >= s.u.str->len)
@@ -2585,7 +2659,7 @@ static js_value str_at(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value str_charcode(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value s = this_str(ctx, t);
-  int i = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+  int i = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   if (i < 0 || i >= s.u.str->len)
     return js_number(0.0 / 0.0);
   return js_number((unsigned char)s.u.str->data[i]);
@@ -2605,7 +2679,7 @@ static js_value str_localecompare(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value str_indexof(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value s = this_str(ctx, t), needle = js_to_string(ctx, ARG(0));
-  int from = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
+  int from = n > 1 ? js_to_int_sat(ctx, a[1]) : 0;
   if (from < 0)
     from = 0;
   return js_number(find_sub(s.u.str->data, s.u.str->len, needle.u.str->data, needle.u.str->len, from));
@@ -2628,7 +2702,7 @@ static js_value str_includes(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value str_startswith(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value s = this_str(ctx, t), p = js_to_string(ctx, ARG(0));
-  int from = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
+  int from = n > 1 ? js_to_int_sat(ctx, a[1]) : 0;
   if (from < 0)
     from = 0;
   if (from + p.u.str->len > s.u.str->len)
@@ -2638,7 +2712,7 @@ static js_value str_startswith(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value str_endswith(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value s = this_str(ctx, t), p = js_to_string(ctx, ARG(0));
-  int end = n > 1 ? (int)js_to_number(ctx, a[1]) : s.u.str->len;
+  int end = n > 1 ? js_to_int_sat(ctx, a[1]) : s.u.str->len;
   if (end > s.u.str->len)
     end = s.u.str->len;
   if (p.u.str->len > end)
@@ -2672,8 +2746,8 @@ static js_value str_substr(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value s = this_str(ctx, t);
   int len = s.u.str->len;
-  int start = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
-  int cnt = n > 1 ? (int)js_to_number(ctx, a[1]) : len;
+  int start = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
+  int cnt = n > 1 ? js_to_int_sat(ctx, a[1]) : len;
   if (start < 0) {
     start += len;
     if (start < 0)
@@ -2692,6 +2766,8 @@ static js_value str_case(js_ctx *ctx, js_value t, int upper)
   js_value s = this_str(ctx, t);
   char *buf = (char *)malloc((unsigned)s.u.str->len + 1);
   int i;
+  if (!buf)
+    return js_throw_range(ctx, "out of memory");
   for (i = 0; i < s.u.str->len; i++) {
     char c = s.u.str->data[i];
     if (upper && c >= 'a' && c <= 'z')
@@ -2752,7 +2828,7 @@ static js_value strm_trimend(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value str_repeat(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value s = this_str(ctx, t);
-  int count = n > 0 ? (int)js_to_number(ctx, a[0]) : 0, i;
+  int count = n > 0 ? js_to_int_sat(ctx, a[0]) : 0, i;
   sbuf sb;
   sb.b = NULL;
   sb.n = 0;
@@ -2774,7 +2850,7 @@ static js_value str_repeat(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value str_pad(js_ctx *ctx, js_value t, js_value *a, int n, int start)
 {
   js_value s = this_str(ctx, t);
-  int target = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+  int target = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   js_value pad = n > 1 && a[1].type != JV_UNDEF ? js_to_string(ctx, a[1]) : js_mk_cstring(ctx, " ");
   sbuf sb;
   int need;
@@ -2860,13 +2936,17 @@ typedef struct {
   unsigned char op, neg;
   char ch;
   int x, y;
-  unsigned char set[32];
+  int roff, nrng;        /* I_CLASS: code point ranges >= 128 in reprog.pool, as lo/hi pairs */
+  unsigned char set[16]; /* I_CLASS: code points below 128 */
 } reinst;
 typedef struct {
   reinst *ins;
   int n, cap;
   int ngroups;
   char *names[32];
+  unsigned *pool; /* class ranges for every I_CLASS */
+  int npool, cappool;
+  int refs; /* the compile cache holds one reference */
 } reprog;
 
 enum {
@@ -2893,7 +2973,9 @@ typedef struct rnode {
   char ch;
   unsigned char neg, greedy;
   int gidx;
-  unsigned char set[32];
+  unsigned char set[16]; /* N_CLASS: code points below 128 */
+  unsigned *rng;         /* N_CLASS: ranges >= 128 as lo/hi pairs */
+  int nrng, caprng;
   const char *name;
   int namelen; /* N_BACKREF: pending \k<name> to resolve */
   struct rnode *a, *b;
@@ -2912,20 +2994,14 @@ typedef struct {
 #define RE_DEPTH_MAX 6000
 #define RE_STEPS_MAX 2000000
 
-static void re_setbit(unsigned char *set, unsigned char c) { set[c >> 3] |= (unsigned char)(1u << (c & 7)); }
-static int re_getbit(const unsigned char *set, unsigned char c) { return (set[c >> 3] >> (c & 7)) & 1; }
+static void re_setbit(unsigned char *set, unsigned c) { set[c >> 3] |= (unsigned char)(1u << (c & 7)); }
+static int re_getbit(const unsigned char *set, unsigned c) { return (set[c >> 3] >> (c & 7)) & 1; }
 static int re_flag(const char *flags, char f)
 {
   for (; flags && *flags; flags++)
     if (*flags == f)
       return 1;
   return 0;
-}
-static void re_setrange(unsigned char *set, unsigned lo, unsigned hi)
-{
-  unsigned i;
-  for (i = lo; i <= hi && i < 256; i++)
-    re_setbit(set, (unsigned char)i);
 }
 static char re_lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 static char re_swapcase(char c)
@@ -2941,38 +3017,85 @@ static int re_word(int c)
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
 }
 
-/* The \d \w \s class escapes (and uppercase complements) into a bitmap. Returns
- * 1 if `e` was such an escape (bits added), 0 if it is an ordinary escaped
- * char. */
-static int re_class_escape(unsigned char *set, char e)
+/* Lowest native SP the regex compiler/matcher may recurse to; set per call from the context. */
+static const char *re_floor;
+static int re_deep(void)
 {
-  unsigned char tmp[32];
-  int i, neg = 0;
+  char probe;
+  return re_floor && &probe < re_floor;
+}
+
+/* Add the code points lo..hi to a class: below 128 as bits, the rest as a range */
+static void re_add_range(recomp *c, rnode *nd, unsigned lo, unsigned hi)
+{
+  unsigned i;
+  for (i = lo; i <= hi && i < 128; i++)
+    re_setbit(nd->set, i);
+  if (hi < 128)
+    return;
+  if (lo < 128)
+    lo = 128;
+  if (nd->nrng + 2 > nd->caprng) {
+    int nc = nd->caprng ? nd->caprng * 2 : 8;
+    unsigned *nr = (unsigned *)realloc(nd->rng, (unsigned)nc * sizeof *nr);
+    if (!nr) {
+      c->err = 1;
+      return;
+    }
+    nd->rng = nr;
+    nd->caprng = nc;
+  }
+  nd->rng[nd->nrng++] = lo;
+  nd->rng[nd->nrng++] = hi;
+}
+
+/* Unicode White_Space beyond ASCII, as lo/hi pairs (JS \s) */
+static const unsigned re_space_rng[] = {0xA0,   0xA0,   0x1680, 0x1680, 0x2000, 0x200A, 0x2028, 0x2029,
+                                        0x202F, 0x202F, 0x205F, 0x205F, 0x3000, 0x3000, 0xFEFF, 0xFEFF};
+
+/* Add the \d \w \s escapes (and complements) to a class; 1 if `e` was one, else 0. */
+static int re_class_escape(recomp *c, rnode *nd, char e)
+{
+  unsigned char tmp[16] = {0};
+  unsigned i, next = 128;
+  int neg = e >= 'A' && e <= 'Z';
   char l = re_lc(e);
-  for (i = 0; i < 32; i++)
-    tmp[i] = 0;
-  if (l == 'd')
-    re_setrange(tmp, '0', '9');
-  else if (l == 'w') {
-    re_setrange(tmp, '0', '9');
-    re_setrange(tmp, 'A', 'Z');
-    re_setrange(tmp, 'a', 'z');
+  if (l == 'd') {
+    for (i = '0'; i <= '9'; i++)
+      re_setbit(tmp, i);
+  } else if (l == 'w') {
+    for (i = '0'; i <= '9'; i++)
+      re_setbit(tmp, i);
+    for (i = 'A'; i <= 'Z'; i++)
+      re_setbit(tmp, i);
+    for (i = 'a'; i <= 'z'; i++)
+      re_setbit(tmp, i);
     re_setbit(tmp, '_');
   } else if (l == 's') {
     re_setbit(tmp, ' ');
-    re_setbit(tmp, '\t');
-    re_setbit(tmp, '\n');
-    re_setbit(tmp, '\r');
-    re_setbit(tmp, '\f');
-    re_setbit(tmp, '\v');
+    for (i = 9; i <= 13; i++)
+      re_setbit(tmp, i);
   } else
     return 0;
-  neg = (e >= 'A' && e <= 'Z');
-  for (i = 0; i < 256; i++) {
-    int in = re_getbit(tmp, (unsigned char)i);
-    if (in != neg)
-      re_setbit(set, (unsigned char)i);
+  for (i = 0; i < 128; i++)
+    if (re_getbit(tmp, i) != neg)
+      re_setbit(nd->set, i);
+  if (l != 's') {
+    if (neg)
+      re_add_range(c, nd, 128, 0x10FFFF);
+    return 1;
   }
+  for (i = 0; i < sizeof re_space_rng / sizeof re_space_rng[0]; i += 2) {
+    if (!neg) {
+      re_add_range(c, nd, re_space_rng[i], re_space_rng[i + 1]);
+      continue;
+    }
+    if (re_space_rng[i] > next)
+      re_add_range(c, nd, next, re_space_rng[i] - 1);
+    next = re_space_rng[i + 1] + 1;
+  }
+  if (neg)
+    re_add_range(c, nd, next, 0x10FFFF);
   return 1;
 }
 
@@ -3026,22 +3149,32 @@ static int re_hex(char ch)
     return ch - 'A' + 10;
   return -1;
 }
-static char re_read_hex(recomp *c, int ndig)
+/* up to ndig hex digits at c->p (stops at the first non-digit) */
+static unsigned re_read_hex(recomp *c, int ndig)
 {
-  int v = 0, i, h;
+  unsigned v = 0;
+  int i, h;
   for (i = 0; i < ndig && c->p < c->end; i++) {
     h = re_hex(*c->p);
     if (h < 0)
       break;
-    v = v * 16 + h;
+    v = v * 16 + (unsigned)h;
     c->p++;
   }
-  return (char)(v & 0xFF);
+  return v;
 }
-/* a backslash escape used as a single character (after the '\' is consumed) */
-static char re_escape_char(recomp *c)
+/* One pattern code point at c->p: raw UTF-8 or an escape (after the '\' when `esc`); advances. */
+static unsigned re_cp(recomp *c, int esc)
 {
+  unsigned cp;
   char e;
+  if (!esc) {
+    int n = utf8_decode(c->p, c->end, &cp);
+    if ((unsigned char)*c->p >= 0x80 && cp == 0xFFFD)
+      cp = (unsigned char)*c->p;
+    c->p += n;
+    return cp;
+  }
   if (c->p >= c->end) {
     c->err = 1;
     return '\\';
@@ -3059,20 +3192,60 @@ static char re_escape_char(recomp *c)
   case 'v':
     return '\v';
   case '0':
-    return '\0';
+    return 0;
   case 'x':
     return re_read_hex(c, 2);
+  case 'c':
+    if (c->p < c->end && re_lc(*c->p) >= 'a' && re_lc(*c->p) <= 'z') {
+      char ch = *c->p++;
+      return (unsigned)(re_lc(ch) - 'a' + 1);
+    }
+    return 'c';
   case 'u':
-    return re_read_hex(c, 4);
+    if (c->p < c->end && *c->p == '{') {
+      c->p++;
+      cp = re_read_hex(c, 8);
+      if (c->p < c->end && *c->p == '}')
+        c->p++;
+      else
+        c->err = 1;
+      return cp > 0x10FFFF ? 0xFFFD : cp;
+    }
+    cp = re_read_hex(c, 4);
+    if (cp >= 0xD800 && cp < 0xDC00 && c->p + 1 < c->end && c->p[0] == '\\' && c->p[1] == 'u') {
+      const char *save = c->p;
+      unsigned lo;
+      c->p += 2;
+      lo = re_read_hex(c, 4);
+      if (lo >= 0xDC00 && lo < 0xE000)
+        return 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+      c->p = save;
+    }
+    return cp;
   default:
-    return e; /* \. \\ \/ \( … and \1 (no backrefs) */
+    c->p--; /* an escaped literal, possibly multi-byte */
+    return re_cp(c, 0);
   }
+}
+/* A literal code point as a node: one byte, or the byte sequence of its UTF-8 form */
+static rnode *re_char_node(recomp *c, unsigned cp)
+{
+  char enc[4];
+  int k = utf8_encode(cp, enc), i;
+  rnode *head = 0;
+  for (i = 0; i < k; i++) {
+    rnode *nn = rn_new(c, N_CHAR);
+    if (!nn)
+      return head;
+    nn->ch = enc[i];
+    head = rn_cat(c, head, nn);
+  }
+  return head;
 }
 
 static rnode *re_parse_class(recomp *c)
 {
   rnode *nd = rn_new(c, N_CLASS);
-  int first = 1;
   if (!nd)
     return 0;
   c->p++; /* '[' */
@@ -3080,31 +3253,37 @@ static rnode *re_parse_class(recomp *c)
     nd->neg = 1;
     c->p++;
   }
-  while (c->p < c->end && (*c->p != ']' || first)) {
-    unsigned char lo;
-    first = 0;
+  while (c->p < c->end && *c->p != ']') {
+    unsigned lo, hi;
     if (*c->p == '\\') {
       char peek = (c->p + 1 < c->end) ? c->p[1] : 0;
       if (re_lc(peek) == 'd' || re_lc(peek) == 'w' || re_lc(peek) == 's') {
-        c->p++;
-        re_class_escape(nd->set, *c->p++);
+        c->p += 2;
+        re_class_escape(c, nd, peek);
         continue;
       }
       c->p++;
-      lo = (unsigned char)re_escape_char(c);
+      if (c->p < c->end && *c->p == 'b') {
+        c->p++;
+        lo = 8; /* \b inside a class is a backspace */
+      } else
+        lo = re_cp(c, 1);
     } else
-      lo = (unsigned char)*c->p++;
-    if (c->p < c->end && *c->p == '-' && c->p + 1 < c->end && c->p[1] != ']') {
-      unsigned char hi;
+      lo = re_cp(c, 0);
+    if (c->p + 1 < c->end && *c->p == '-' && c->p[1] != ']') {
       c->p++;
       if (*c->p == '\\') {
         c->p++;
-        hi = (unsigned char)re_escape_char(c);
+        hi = re_cp(c, 1);
       } else
-        hi = (unsigned char)*c->p++;
-      re_setrange(nd->set, lo, hi);
+        hi = re_cp(c, 0);
+      if (hi < lo) {
+        c->err = 1;
+        break;
+      }
+      re_add_range(c, nd, lo, hi);
     } else
-      re_setbit(nd->set, lo);
+      re_add_range(c, nd, lo, lo);
   }
   if (c->p < c->end && *c->p == ']')
     c->p++;
@@ -3205,7 +3384,7 @@ static rnode *re_parse_atom(recomp *c)
       rnode *nd = rn_new(c, N_CLASS);
       c->p++;
       if (nd)
-        re_class_escape(nd->set, *c->p);
+        re_class_escape(c, nd, *c->p);
       c->p++;
       return nd;
     }
@@ -3249,22 +3428,10 @@ static rnode *re_parse_atom(recomp *c)
         c->err = 1;
       return bn;
     }
-    {
-      rnode *nn;
-      c->p++;
-      nn = rn_new(c, N_CHAR);
-      if (nn)
-        nn->ch = re_escape_char(c);
-      return nn;
-    }
-  }
-  {
-    rnode *nn = rn_new(c, N_CHAR);
     c->p++;
-    if (nn)
-      nn->ch = ch;
-    return nn;
+    return re_char_node(c, re_cp(c, 1));
   }
+  return re_char_node(c, re_cp(c, 0));
 }
 
 static rnode *re_parse_quant(recomp *c)
@@ -3353,7 +3520,12 @@ static rnode *re_parse_cat(recomp *c)
 }
 static rnode *re_parse_alt(recomp *c)
 {
-  rnode *a = re_parse_cat(c);
+  rnode *a;
+  if (re_deep()) {
+    c->err = 1;
+    return 0;
+  }
+  a = re_parse_cat(c);
   while (!c->err && c->p < c->end && *c->p == '|') {
     rnode *alt, *b;
     c->p++;
@@ -3388,6 +3560,8 @@ static int re_emit(reprog *p, rnode *nd)
   memset(&in, 0, sizeof in);
   if (!nd)
     return 0;
+  if (re_deep())
+    return -1;
   switch (nd->type) {
   case N_EMPTY:
     return 0;
@@ -3401,7 +3575,24 @@ static int re_emit(reprog *p, rnode *nd)
   case N_CLASS:
     in.op = I_CLASS;
     in.neg = nd->neg;
-    memcpy(in.set, nd->set, 32);
+    memcpy(in.set, nd->set, sizeof in.set);
+    if (nd->nrng) {
+      if (p->npool + nd->nrng > p->cappool) {
+        int nc = p->cappool ? p->cappool * 2 : 32;
+        unsigned *np;
+        while (nc < p->npool + nd->nrng)
+          nc *= 2;
+        np = (unsigned *)realloc(p->pool, (unsigned)nc * sizeof *np);
+        if (!np)
+          return -1;
+        p->pool = np;
+        p->cappool = nc;
+      }
+      memcpy(p->pool + p->npool, nd->rng, (unsigned)nd->nrng * sizeof *nd->rng);
+      in.roff = p->npool;
+      in.nrng = nd->nrng;
+      p->npool += nd->nrng;
+    }
     return re_emit_at(p, in) < 0 ? -1 : 0;
   case N_BOL:
     in.op = I_BOL;
@@ -3535,13 +3726,13 @@ static int re_emit(reprog *p, rnode *nd)
 
 static void re_free(reprog *p)
 {
-  if (p) {
+  if (p && --p->refs <= 0) {
     int g;
     for (g = 1; g <= RE_GROUPS_MAX; g++)
       if (p->names[g])
         free(p->names[g]);
-    if (p->ins)
-      free(p->ins);
+    free(p->ins);
+    free(p->pool);
     free(p);
   }
 }
@@ -3581,6 +3772,8 @@ static reprog *re_compile(const char *src, int srclen)
   }
   ok = !c.err;
   p = (reprog *)calloc(1, sizeof *p);
+  if (p)
+    p->refs = 1;
   if (p && ok) {
     p->ngroups = c.ngroups;
     memset(&in, 0, sizeof in);
@@ -3611,8 +3804,10 @@ static reprog *re_compile(const char *src, int srclen)
       }
     }
   }
-  for (i = 0; i < c.nall; i++)
+  for (i = 0; i < c.nall; i++) {
+    free(c.all[i]->rng);
     free(c.all[i]);
+  }
   if (c.all)
     free(c.all);
   if (!ok) {
@@ -3627,19 +3822,37 @@ typedef struct {
   int slen, icase, multiline, dotall, depth, steps, look_end;
 } restate;
 
-static int re_class_hit(const reinst *in, char c, int icase)
+static int re_class_hit(const reprog *p, const reinst *in, unsigned cp, int icase)
 {
-  int hit = re_getbit(in->set, (unsigned char)c);
-  if (!hit && icase) {
-    char alt = re_swapcase(c);
-    if (alt != c)
-      hit = re_getbit(in->set, (unsigned char)alt);
-  }
+  int hit = 0, i;
+  if (cp < 128) {
+    hit = re_getbit(in->set, cp);
+    if (!hit && icase) {
+      char alt = re_swapcase((char)cp);
+      if (alt != (char)cp)
+        hit = re_getbit(in->set, (unsigned char)alt);
+    }
+  } else
+    for (i = 0; i < in->nrng && !hit; i += 2)
+      hit = cp >= p->pool[in->roff + i] && cp <= p->pool[in->roff + i + 1];
   return in->neg ? !hit : hit;
+}
+/* the code point at s[sp] and its byte length (a stray byte decodes as itself) */
+static int re_decode(const restate *st, int sp, unsigned *cp)
+{
+  int n;
+  if ((unsigned char)st->s[sp] < 0x80) {
+    *cp = (unsigned char)st->s[sp];
+    return 1;
+  }
+  n = utf8_decode(st->s + sp, st->s + st->slen, cp);
+  if (*cp == 0xFFFD && n == 1)
+    *cp = (unsigned char)st->s[sp];
+  return n;
 }
 static int re_run(reprog *p, int pc, int sp, int *caps, restate *st)
 {
-  if (++st->depth > RE_DEPTH_MAX) {
+  if (++st->depth > RE_DEPTH_MAX || re_deep()) {
     st->depth--;
     return -2;
   }
@@ -3660,18 +3873,26 @@ static int re_run(reprog *p, int pc, int sp, int *caps, restate *st)
       st->depth--;
       return -1;
     case I_ANY:
-      if (sp < st->slen && (st->dotall || st->s[sp] != '\n')) {
-        pc++;
-        sp++;
-        break;
+      if (sp < st->slen) {
+        unsigned cp;
+        int n = re_decode(st, sp, &cp);
+        if (st->dotall || !(cp == '\n' || cp == '\r' || cp == 0x2028 || cp == 0x2029)) {
+          pc++;
+          sp += n;
+          break;
+        }
       }
       st->depth--;
       return -1;
     case I_CLASS:
-      if (sp < st->slen && re_class_hit(in, st->s[sp], st->icase)) {
-        pc++;
-        sp++;
-        break;
+      if (sp < st->slen) {
+        unsigned cp;
+        int n = re_decode(st, sp, &cp);
+        if (re_class_hit(p, in, cp, st->icase)) {
+          pc++;
+          sp += n;
+          break;
+        }
       }
       st->depth--;
       return -1;
@@ -3830,6 +4051,8 @@ static int re_search(reprog *p, const char *s, int slen, int from, int icase, in
   st.dotall = dotall;
   st.look_end = -1;
   for (start = from; start <= slen; start++) {
+    if (start > 0 && start < slen && ((unsigned char)s[start] & 0xC0) == 0x80)
+      continue; /* inside a multi-byte character */
     for (i = 0; i < ncap; i++)
       caps[i] = -1;
     st.depth = 0;
@@ -3842,15 +4065,42 @@ static int re_search(reprog *p, const char *s, int slen, int from, int icase, in
 
 static int re_is_regexp(js_ctx *ctx, js_value v) { return v.type == JV_OBJ && v.u.obj->proto == ctx->regexp_proto; }
 
+/* Compile the source+flags of a RegExp object; *caps_n = 2*(groups+1). */
+#define RE_CACHE_N 16
+static struct {
+  char *src;
+  int len;
+  reprog *prog;
+} re_cache[RE_CACHE_N];
+static int re_cache_next;
+
 /* Compile the source+flags carried by a RegExp object; *caps_n = 2*(groups+1).
  */
 static reprog *re_compile_obj(js_ctx *ctx, js_value rx, int *caps_n)
 {
   js_value src = js_get(ctx, rx, "source");
-  reprog *p;
+  reprog *p = NULL;
   const char *s = src.type == JV_STR ? src.u.str->data : "";
-  int len = src.type == JV_STR ? src.u.str->len : 0;
-  p = re_compile(s, len);
+  int len = src.type == JV_STR ? src.u.str->len : 0, i;
+  re_floor = ctx->stack_limit;
+  for (i = 0; i < RE_CACHE_N && !p; i++)
+    if (re_cache[i].prog && re_cache[i].len == len && memcmp_(re_cache[i].src, s, len) == 0) {
+      p = re_cache[i].prog;
+      p->refs++;
+    }
+  if (!p && (p = re_compile(s, len))) {
+    char *key = (char *)malloc((unsigned)len + 1);
+    if (key) {
+      i = re_cache_next++ % RE_CACHE_N;
+      re_free(re_cache[i].prog);
+      free(re_cache[i].src);
+      memcpy(key, s, (unsigned)len);
+      re_cache[i].src = key;
+      re_cache[i].len = len;
+      re_cache[i].prog = p;
+      p->refs++;
+    }
+  }
   if (p && caps_n)
     *caps_n = 2 * (p->ngroups + 1);
   return p;
@@ -3909,7 +4159,7 @@ static js_value re_exec(js_ctx *ctx, js_value rx, js_value t, js_value *a, int n
     return js_null();
   global = re_obj_flag(ctx, rx, "global") || re_obj_flag(ctx, rx, "sticky");
   if (global)
-    start = (int)js_to_number(ctx, js_get(ctx, rx, "lastIndex"));
+    start = js_to_int_sat(ctx, js_get(ctx, rx, "lastIndex"));
   if (start < 0 || start > input.u.str->len) {
     if (global)
       js_set(ctx, rx, "lastIndex", js_number(0));
@@ -4484,7 +4734,7 @@ static double parse_int(const char *s, int len, int radix)
 static js_value g_parseint(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value s = js_to_string(ctx, ARG(0));
-  int radix = n > 1 ? (int)js_to_number(ctx, a[1]) : 0;
+  int radix = n > 1 ? js_to_int_sat(ctx, a[1]) : 0;
   (void)t;
   return js_number(parse_int(s.u.str->data, s.u.str->len, radix));
 }
@@ -4830,7 +5080,7 @@ static js_value bigint_tostring(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!b)
     return js_throw_type(ctx, "BigInt.prototype.toString requires a BigInt");
   if (n > 0 && a[0].type != JV_UNDEF) {
-    radix = (int)js_to_number(ctx, a[0]);
+    radix = js_to_int_sat(ctx, a[0]);
     if (radix < 2 || radix > 36)
       return js_throw_range(ctx, "toString() radix must be between 2 and 36");
   }
@@ -4858,7 +5108,7 @@ static js_value bigint_asuintn(js_ctx *ctx, js_value t, js_value *a, int n)
   bigint *b;
   (void)t;
   (void)n;
-  bits = (int)js_to_number(ctx, ARG(0));
+  bits = js_to_int_sat(ctx, ARG(0));
   b = js_bigint_of(ARG(1));
   if (!b)
     return js_throw_type(ctx, "BigInt.asUintN requires a BigInt");
@@ -4872,7 +5122,7 @@ static js_value bigint_asintn(js_ctx *ctx, js_value t, js_value *a, int n)
   bigint *b;
   (void)t;
   (void)n;
-  bits = (int)js_to_number(ctx, ARG(0));
+  bits = js_to_int_sat(ctx, ARG(0));
   b = js_bigint_of(ARG(1));
   if (!b)
     return js_throw_type(ctx, "BigInt.asIntN requires a BigInt");
@@ -4884,7 +5134,7 @@ static js_value bigint_asintn(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value num_tofixed(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   double x = js_to_number(ctx, t);
-  int digits = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+  int digits = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   char buf[80], ds[40];
   int p = 0, i, dl, neg = 0;
   double scale = 1, scaled;
@@ -4937,7 +5187,7 @@ static js_value num_tofixed(js_ctx *ctx, js_value t, js_value *a, int n)
 static js_value num_tostring(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   double x = js_to_number(ctx, t);
-  int radix = n > 0 && a[0].type != JV_UNDEF ? (int)js_to_number(ctx, a[0]) : 10;
+  int radix = n > 0 && a[0].type != JV_UNDEF ? js_to_int_sat(ctx, a[0]) : 10;
   char buf[DTOA_RADIX_MAX];
   if (radix == 10) {
     dtoa(x, buf);
@@ -5044,7 +5294,7 @@ static js_value num_toexp(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   double x = js_to_number(ctx, t);
   int has = n > 0 && a[0].type != JV_UNDEF;
-  int f = has ? (int)js_to_number(ctx, a[0]) : 0;
+  int f = has ? js_to_int_sat(ctx, a[0]) : 0;
   char buf[160], ds[128] = {0};
   int p = 0, neg = 0, expo = 0, sig, i;
   if (x != x)
@@ -5094,7 +5344,7 @@ static js_value num_toprecision(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_mk_cstring(ctx, "Infinity");
   if (x == -1.0 / 0.0)
     return js_mk_cstring(ctx, "-Infinity");
-  prec = (int)js_to_number(ctx, a[0]);
+  prec = js_to_int_sat(ctx, a[0]);
   if (prec < 1 || prec > 100)
     return js_throw_range(ctx, "toPrecision() argument must be between 1 and 100");
   if (x < 0) {
@@ -5273,159 +5523,242 @@ static void json_quote(sbuf *sb, const char *s, int len)
   }
   sb_putc(sb, '"');
 }
-static int json_stringify_val(js_ctx *ctx, sbuf *sb, js_value v, const char *indent, int depth);
-static void json_indent(sbuf *sb, const char *indent, int depth)
+typedef struct {
+  js_ctx *ctx;
+  sbuf sb;
+  char gap[11];
+  js_value fn;       /* replacer function, or undefined */
+  js_object *allow;  /* replacer array: the property whitelist */
+  js_object **stack; /* objects being serialized, for cycle detection */
+  int nstack, capstack;
+} jstr;
+
+static char *json_dup(const char *s)
+{
+  unsigned n = strlen(s) + 1;
+  char *d = (char *)malloc(n);
+  if (d)
+    memcpy(d, s, n);
+  return d; /* NULL on OOM: the caller skips that key */
+}
+static void json_indent(jstr *j, int depth)
 {
   int i;
-  if (!indent || !indent[0])
+  if (!j->gap[0])
     return;
-  sb_putc(sb, '\n');
+  sb_putc(&j->sb, '\n');
   for (i = 0; i < depth; i++)
-    sb_puts(sb, indent);
+    sb_puts(&j->sb, j->gap);
 }
-static int json_stringify_val(js_ctx *ctx, sbuf *sb, js_value v, const char *indent, int depth)
+static int jstr_enter(jstr *j, js_object *o)
 {
-  char tmp[DTOA_MAX];
+  int i;
+  for (i = 0; i < j->nstack; i++)
+    if (j->stack[i] == o) {
+      js_throw_type(j->ctx, "Converting circular structure to JSON");
+      return 0;
+    }
+  if (j->nstack == j->capstack) {
+    int nc = j->capstack ? j->capstack * 2 : 16;
+    js_object **ns = (js_object **)realloc(j->stack, (unsigned)nc * sizeof *ns);
+    if (!ns) {
+      js_throw_range(j->ctx, "out of memory");
+      return 0;
+    }
+    j->stack = ns;
+    j->capstack = nc;
+  }
+  j->stack[j->nstack++] = o;
+  return 1;
+}
+
+/* Serialize holder[key] (read into v); 1 if emitted, 0 if omitted or on error */
+static int jstr_val(jstr *j, js_value holder, const char *key, js_value v, int depth)
+{
+  js_ctx *ctx = j->ctx;
+  char tmp[DTOA_MAX], probe;
+  js_value kv = js_undef();
+  int emitted = 0;
+  if (ctx->stack_limit && &probe < ctx->stack_limit) {
+    js_throw_range(ctx, "maximum call stack size exceeded");
+    return 0;
+  }
+  gc_push_scope();
+  KEEP(holder);
+  KEEP(v);
+  kv = js_mk_cstring(ctx, key);
+  KEEP(kv);
   /* toJSON hook */
   if (v.type == JV_OBJ) {
     js_value tj = js_get(ctx, v, "toJSON");
     if (js_is_callable(tj)) {
-      v = js_call(ctx, tj, v, NULL, 0);
-      if (ctx->has_exc)
-        return 0;
+      KEEP(tj);
+      v = js_call(ctx, tj, v, &kv, 1);
+      KEEP(v);
     }
   }
+  if (!ctx->has_exc && js_is_callable(j->fn)) {
+    js_value args[2];
+    args[0] = kv;
+    args[1] = v;
+    v = js_call(ctx, j->fn, holder, args, 2);
+    KEEP(v);
+  }
+  if (ctx->has_exc) {
+    gc_pop_scope();
+    return 0;
+  }
   switch (v.type) {
-  case JV_UNDEF:
-    return 0; /* omit */
   case JV_NULL:
-    sb_puts(sb, "null");
-    return 1;
+    sb_puts(&j->sb, "null");
+    emitted = 1;
+    break;
   case JV_BOOL:
-    sb_puts(sb, v.u.boolean ? "true" : "false");
-    return 1;
+    sb_puts(&j->sb, v.u.boolean ? "true" : "false");
+    emitted = 1;
+    break;
   case JV_NUM:
     if (v.u.num != v.u.num || v.u.num == 1.0 / 0.0 || v.u.num == -1.0 / 0.0)
-      sb_puts(sb, "null");
+      sb_puts(&j->sb, "null");
     else {
       dtoa(v.u.num, tmp);
-      sb_puts(sb, tmp);
+      sb_puts(&j->sb, tmp);
     }
-    return 1;
+    emitted = 1;
+    break;
   case JV_STR:
-    json_quote(sb, v.u.str->data, v.u.str->len);
-    return 1;
+    json_quote(&j->sb, v.u.str->data, v.u.str->len);
+    emitted = 1;
+    break;
+  case JV_BIGINT:
+    js_throw_type(ctx, "Do not know how to serialize a BigInt");
+    break;
+  case JV_OBJ:
+    if (js_is_callable(v))
+      break;
+    if (!jstr_enter(j, v.u.obj))
+      break;
+    emitted = 1;
+    if (v.u.obj->kind == OBJ_ARRAY) {
+      js_object *arr = v.u.obj;
+      unsigned i;
+      sb_putc(&j->sb, '[');
+      for (i = 0; i < arr->elen && !ctx->has_exc; i++) {
+        char idx[16];
+        js_value ev = arr->elems[i];
+        u64toa(i, idx, 10);
+        if (i)
+          sb_putc(&j->sb, ',');
+        json_indent(j, depth + 1);
+        if (!jstr_val(j, v, idx, ev, depth + 1) && !ctx->has_exc)
+          sb_puts(&j->sb, "null");
+      }
+      if (arr->elen)
+        json_indent(j, depth);
+      sb_putc(&j->sb, ']');
+    } else {
+      js_object *o = v.u.obj;
+      char **keys = NULL;
+      int nk = 0, i, first = 1;
+      if (j->allow) {
+        int na = (int)js_array_len(j->allow);
+        keys = (char **)calloc((unsigned)na + 1, sizeof *keys);
+        for (i = 0; keys && i < na; i++) {
+          js_value kk = js_to_string(ctx, js_get_index(ctx, js_obj_value(j->allow), (unsigned)i));
+          if (kk.type == JV_STR)
+            keys[nk++] = json_dup(kk.u.str->data);
+        }
+      } else {
+        keys = (char **)calloc((unsigned)o->props.n + 1, sizeof *keys);
+        for (i = 0; keys && i < o->props.n; i++) {
+          pentry *pe = &o->props.e[i];
+          if ((pe->flags & P_ENUMERABLE) && (unsigned char)pe->key[0] >= 0x20)
+            keys[nk++] = json_dup(pe->key);
+        }
+      }
+      sb_putc(&j->sb, '{');
+      for (i = 0; keys && i < nk && !ctx->has_exc; i++) {
+        js_value pv;
+        int mark;
+        if (!keys[i])
+          continue;
+        pv = js_get(ctx, v, keys[i]);
+        if (ctx->has_exc)
+          break;
+        KEEP(pv);
+        mark = j->sb.n;
+        if (!first)
+          sb_putc(&j->sb, ',');
+        json_indent(j, depth + 1);
+        json_quote(&j->sb, keys[i], (int)strlen(keys[i]));
+        sb_putc(&j->sb, ':');
+        if (j->gap[0])
+          sb_putc(&j->sb, ' ');
+        if (jstr_val(j, v, keys[i], pv, depth + 1))
+          first = 0;
+        else
+          j->sb.n = mark;
+      }
+      if (!first)
+        json_indent(j, depth);
+      sb_putc(&j->sb, '}');
+      for (i = 0; keys && i < nk; i++)
+        free(keys[i]);
+      free(keys);
+    }
+    j->nstack--;
+    break;
   default:
     break;
   }
-  if (v.u.obj->kind == OBJ_FUNCTION)
-    return 0; /* omit */
-  if (v.u.obj->kind == OBJ_ARRAY) {
-    unsigned i;
-    js_object *arr = v.u.obj;
-    if (arr->elen == 0) {
-      sb_puts(sb, "[]");
-      return 1;
-    }
-    sb_putc(sb, '[');
-    for (i = 0; i < arr->elen; i++) {
-      if (i)
-        sb_putc(sb, ',');
-      json_indent(sb, indent, depth + 1);
-      if (!json_stringify_val(ctx, sb, arr->elems[i], indent, depth + 1))
-        sb_puts(sb, "null");
-      if (ctx->has_exc)
-        return 0;
-    }
-    json_indent(sb, indent, depth);
-    sb_putc(sb, ']');
-    return 1;
-  }
-  {
-    js_object *o = v.u.obj;
-    int i, first = 1;
-    sb_putc(sb, '{');
-    for (i = 0; i < o->props.n; i++) {
-      pentry *pe = &o->props.e[i];
-      js_value pv;
-      if (!(pe->flags & P_ENUMERABLE))
-        continue;
-      pv = js_get(ctx, v, pe->key);
-      if (ctx->has_exc)
-        return 0;
-      if (pv.type == JV_UNDEF || (pv.type == JV_OBJ && pv.u.obj->kind == OBJ_FUNCTION))
-        continue;
-      if (!first)
-        sb_putc(sb, ',');
-      first = 0;
-      json_indent(sb, indent, depth + 1);
-      json_quote(sb, pe->key, strlen(pe->key));
-      sb_putc(sb, ':');
-      if (indent && indent[0])
-        sb_putc(sb, ' ');
-      json_stringify_val(ctx, sb, pv, indent, depth + 1);
-      if (ctx->has_exc)
-        return 0;
-    }
-    if (!first)
-      json_indent(sb, indent, depth);
-    sb_putc(sb, '}');
-    return 1;
-  }
+  gc_pop_scope();
+  return emitted;
 }
 static js_value json_stringify(js_ctx *ctx, js_value t, js_value *a, int n)
 {
-  js_value v = ARG(0), space = ARG(2);
-  char indent[12];
-  sbuf sb;
+  js_value v = ARG(0), repl = ARG(1), space = ARG(2), holder = js_undef(), r = js_undef();
+  jstr j;
   int ok;
   (void)t;
-  indent[0] = 0;
+  memset(&j, 0, sizeof j);
+  j.ctx = ctx;
+  j.fn = js_undef();
   if (space.type == JV_NUM) {
-    int k = (int)space.u.num, i;
+    int k = js_to_int_sat(ctx, space), i;
     if (k > 10)
       k = 10;
-    if (k < 0)
-      k = 0;
     for (i = 0; i < k; i++)
-      indent[i] = ' ';
-    indent[k] = 0;
+      j.gap[i] = ' ';
   } else if (space.type == JV_STR) {
     int k = space.u.str->len;
     if (k > 10)
       k = 10;
-    memcpy(indent, space.u.str->data, (unsigned)k);
-    indent[k] = 0;
+    memcpy(j.gap, space.u.str->data, (unsigned)k);
   }
-  sb.b = NULL;
-  sb.n = 0;
-  sb.cap = 0;
   gc_push_scope();
   KEEP(v);
-  ok = json_stringify_val(ctx, &sb, v, indent, 0);
+  KEEP(repl);
+  if (js_is_callable(repl)) {
+    j.fn = repl;
+    holder = js_obj_value((js_object *)gc_keep(js_new_object(ctx, ctx->object_proto)));
+    js_set(ctx, holder, "", v);
+  } else if (repl.type == JV_OBJ && repl.u.obj->kind == OBJ_ARRAY)
+    j.allow = repl.u.obj;
+  ok = jstr_val(&j, holder, "", v, 0);
   gc_pop_scope();
-  if (ctx->has_exc) {
-    if (sb.b)
-      free(sb.b);
-    return js_undef();
-  }
-  if (!ok) {
-    if (sb.b)
-      free(sb.b);
-    return js_undef();
-  }
-  {
-    js_value r = str_of(ctx, sb.b ? sb.b : "", sb.n);
-    if (sb.b)
-      free(sb.b);
-    return r;
-  }
+  free(j.stack);
+  if (j.sb.failed && !ctx->has_exc)
+    js_throw_range(ctx, "out of memory");
+  else if (!ctx->has_exc && ok)
+    r = str_of(ctx, j.sb.b ? j.sb.b : "", j.sb.n);
+  free(j.sb.b);
+  return r;
 }
 
 typedef struct {
   js_ctx *ctx;
   const char *s;
-  int len, pos;
+  int len, pos, depth;
 } jparse;
 static void jp_ws(jparse *p)
 {
@@ -5490,6 +5823,25 @@ static js_value jp_string(jparse *p)
           else if (h >= 'A' && h <= 'F')
             cp |= h - 'A' + 10;
         }
+        if (cp >= 0xD800 && cp < 0xDC00 && p->pos + 6 <= p->len && p->s[p->pos] == '\\' && p->s[p->pos + 1] == 'u') {
+          unsigned lo = 0; /* join a \uD83D\uDE00 pair */
+          for (i = 0; i < 4; i++) {
+            char h = p->s[p->pos + 2 + i];
+            lo <<= 4;
+            if (h >= '0' && h <= '9')
+              lo |= (unsigned)(h - '0');
+            else if (h >= 'a' && h <= 'f')
+              lo |= (unsigned)(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F')
+              lo |= (unsigned)(h - 'A' + 10);
+            else
+              lo = 0;
+          }
+          if (lo >= 0xDC00 && lo < 0xE000) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+            p->pos += 6;
+          }
+        }
         k = utf8_encode(cp, enc);
         sb_put(&sb, enc, k);
         break;
@@ -5506,7 +5858,21 @@ static js_value jp_string(jparse *p)
     free(sb.b);
   return r;
 }
+static js_value jp_value1(jparse *p);
 static js_value jp_value(jparse *p)
+{
+  char probe;
+  js_value r;
+  if (p->ctx->stack_limit && &probe < p->ctx->stack_limit) {
+    js_throw_range(p->ctx, "maximum call stack size exceeded");
+    return js_undef();
+  }
+  p->depth++;
+  r = jp_value1(p);
+  p->depth--;
+  return r;
+}
+static js_value jp_value1(jparse *p)
 {
   jp_ws(p);
   if (p->pos >= p->len)
@@ -5534,6 +5900,10 @@ static js_value jp_value(jparse *p)
           return jp_fail(p);
         }
         k = jp_string(p);
+        if (k.type != JV_STR) {
+          gc_pop_scope();
+          return jp_fail(p);
+        }
         gc_keep(refp(k));
         jp_ws(p);
         if (p->pos >= p->len || p->s[p->pos] != ':') {
@@ -5620,22 +5990,99 @@ static js_value jp_value(jparse *p)
   }
   return jp_fail(p);
 }
+/* JSON.parse reviver: walk bottom-up, replacing or dropping each member */
+static js_value jp_revive(js_ctx *ctx, js_value holder, const char *key, js_value reviver)
+{
+  char probe;
+  js_value val, kv, args[2];
+  if (ctx->stack_limit && &probe < ctx->stack_limit)
+    return js_throw_range(ctx, "maximum call stack size exceeded");
+  gc_push_scope();
+  KEEP(holder);
+  KEEP(reviver);
+  val = js_get(ctx, holder, key);
+  KEEP(val);
+  if (val.type == JV_OBJ && !ctx->has_exc) {
+    js_object *o = val.u.obj;
+    if (o->kind == OBJ_ARRAY) {
+      unsigned i;
+      for (i = 0; i < o->elen && !ctx->has_exc; i++) {
+        char idx[16];
+        js_value nv;
+        u64toa(i, idx, 10);
+        nv = jp_revive(ctx, val, idx, reviver);
+        if (ctx->has_exc)
+          break;
+        KEEP(nv);
+        js_set(ctx, val, idx, nv);
+      }
+    } else {
+      int i, nk = 0;
+      char **keys = (char **)calloc((unsigned)o->props.n + 1, sizeof *keys);
+      for (i = 0; keys && i < o->props.n; i++) {
+        pentry *pe = &o->props.e[i];
+        unsigned kl = strlen(pe->key) + 1;
+        if (!(pe->flags & P_ENUMERABLE) || !(keys[nk] = (char *)malloc(kl)))
+          continue;
+        memcpy(keys[nk++], pe->key, kl);
+      }
+      for (i = 0; i < nk && !ctx->has_exc; i++) {
+        js_value nv = jp_revive(ctx, val, keys[i], reviver);
+        if (ctx->has_exc)
+          break;
+        KEEP(nv);
+        if (nv.type == JV_UNDEF)
+          js_delete(o, keys[i]);
+        else
+          js_set(ctx, val, keys[i], nv);
+      }
+      for (i = 0; i < nk; i++)
+        free(keys[i]);
+      free(keys);
+    }
+  }
+  if (ctx->has_exc) {
+    gc_pop_scope();
+    return js_undef();
+  }
+  kv = js_mk_cstring(ctx, key);
+  KEEP(kv);
+  args[0] = kv;
+  args[1] = val;
+  val = js_call(ctx, reviver, holder, args, 2);
+  gc_pop_scope();
+  return val;
+}
 static js_value json_parse(js_ctx *ctx, js_value t, js_value *a, int n)
 {
-  js_value s = js_to_string(ctx, ARG(0));
+  js_value s = js_to_string(ctx, ARG(0)), reviver = ARG(1);
   jparse p;
   js_value r;
   (void)t;
-  (void)n;
+  if (ctx->has_exc || s.type != JV_STR)
+    return js_undef();
   p.ctx = ctx;
   p.s = s.u.str->data;
   p.len = s.u.str->len;
   p.pos = 0;
+  p.depth = 0;
   gc_push_scope();
   KEEP(s);
+  KEEP(reviver);
   r = jp_value(&p);
+  if (!ctx->has_exc) {
+    jp_ws(&p);
+    if (p.pos < p.len)
+      jp_fail(&p);
+  }
+  if (!ctx->has_exc && js_is_callable(reviver)) {
+    js_value holder = js_obj_value((js_object *)gc_keep(js_new_object(ctx, ctx->object_proto)));
+    KEEP(r);
+    js_set(ctx, holder, "", r);
+    r = jp_revive(ctx, holder, "", reviver);
+  }
   gc_pop_scope();
-  return r;
+  return ctx->has_exc ? js_undef() : r;
 }
 
 /* ------------------------------------------------------- Promise ---------- *
@@ -6133,8 +6580,8 @@ static js_object *coll_vals(js_ctx *ctx, js_value t)
 static js_value coll_iter_next(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_value tgt = js_get(ctx, t, "@t");
-  int i = (int)js_to_number(ctx, js_get(ctx, t, "@i"));
-  int kind = (int)js_to_number(ctx, js_get(ctx, t, "@i2"));
+  int i = js_to_int_sat(ctx, js_get(ctx, t, "@i"));
+  int kind = js_to_int_sat(ctx, js_get(ctx, t, "@i2"));
   js_object *keys =
       (tgt.type == JV_OBJ && tgt.u.obj->kind == OBJ_ARRAY) ? tgt.u.obj : (tgt.type == JV_OBJ ? coll_keys(ctx, tgt) : 0);
   js_object *res;
@@ -6457,8 +6904,12 @@ static double date_t(js_ctx *ctx, js_value t)
 }
 static void date_civil(double ms, int *Y, int *Mo, int *D, int *h, int *mi, int *s, int *mil, int *dow)
 {
-  long long t = (long long)ms;
-  long long secs = t / 1000;
+  long long t;
+  long long secs;
+  if (!(ms > -8.64e15 && ms < 8.64e15))
+    ms = 0;
+  t = (long long)ms;
+  secs = t / 1000;
   int millis = (int)(t - secs * 1000);
   if (millis < 0) {
     millis += 1000;
@@ -6532,13 +6983,13 @@ static js_value date_ctor(js_ctx *ctx, js_value thisv, js_value *a, int n)
   else if (n == 1)
     ms = js_to_number(ctx, a[0]); /* new Date(ms) */
   else {                          /* new Date(y, mo, d, ...) — UTC */
-    int y = (int)js_to_number(ctx, a[0]);
-    int mo = (int)js_to_number(ctx, a[1]);
-    int d = n > 2 ? (int)js_to_number(ctx, a[2]) : 1;
-    int h = n > 3 ? (int)js_to_number(ctx, a[3]) : 0;
-    int mi = n > 4 ? (int)js_to_number(ctx, a[4]) : 0;
-    int s = n > 5 ? (int)js_to_number(ctx, a[5]) : 0;
-    int milc = n > 6 ? (int)js_to_number(ctx, a[6]) : 0;
+    int y = js_to_int_sat(ctx, a[0]);
+    int mo = js_to_int_sat(ctx, a[1]);
+    int d = n > 2 ? js_to_int_sat(ctx, a[2]) : 1;
+    int h = n > 3 ? js_to_int_sat(ctx, a[3]) : 0;
+    int mi = n > 4 ? js_to_int_sat(ctx, a[4]) : 0;
+    int s = n > 5 ? js_to_int_sat(ctx, a[5]) : 0;
+    int milc = n > 6 ? js_to_int_sat(ctx, a[6]) : 0;
     ms = date_from_civil(y, mo, d, h, mi, s, milc);
   }
   gc_push_scope();
@@ -6769,6 +7220,13 @@ static js_value fn_bind(js_ctx *ctx, js_value t, js_value *a, int n)
  * keeps its ArrayBuffer alive via the tracer. */
 static js_object *make_ctor(js_ctx *ctx, const char *name, js_native fn, js_object *proto); /* fwd */
 
+/* a * b clamped to INT_MAX; the allocation then fails instead of overflowing */
+static int mul_sat(int a, int b)
+{
+  if (a < 0 || b < 0)
+    return 0;
+  return b && a > 2147483647 / b ? 2147483647 : a * b;
+}
 static js_object *new_arraybuffer(js_ctx *ctx, int n)
 {
   js_object *o;
@@ -6779,9 +7237,13 @@ static js_object *new_arraybuffer(js_ctx *ctx, int n)
   o = (js_object *)gc_keep(js_new_object(ctx, ctx->arraybuffer_proto));
   o->kind = OBJ_ARRAYBUFFER;
   ab = (js_arraybuffer *)malloc(sizeof *ab);
-  if (ab) {
-    ab->data = (unsigned char *)calloc((unsigned)(n > 0 ? n : 1), 1);
-    ab->byteLength = n;
+  if (!ab)
+    gc_oom();
+  ab->data = (unsigned char *)calloc((unsigned)(n > 0 ? n : 1), 1);
+  ab->byteLength = n;
+  if (!ab->data) { /* too big for the heap: an empty buffer and a RangeError */
+    ab->byteLength = 0;
+    js_throw_range(ctx, "Array buffer allocation failed");
   }
   o->host = ab;
   gc_pop_scope();
@@ -6797,12 +7259,20 @@ static js_value new_view(js_ctx *ctx, int type, js_object *buf, int offset, int 
   o = (js_object *)gc_keep(js_new_object(ctx, proto));
   o->kind = OBJ_TYPEDARRAY;
   ta = (js_typedarray *)malloc(sizeof *ta);
-  if (ta) {
-    ta->buffer = buf;
-    ta->type = type;
-    ta->offset = offset;
-    ta->length = length;
+  if (!ta)
+    gc_oom();
+  {
+    js_arraybuffer *ab = (js_arraybuffer *)buf->host;
+    int es = type >= 0 ? ta_elem_size(type) : 1, bl = ab ? ab->byteLength : 0;
+    if (offset < 0 || offset > bl)
+      offset = bl;
+    if (length < 0 || length > (bl - offset) / es)
+      length = (bl - offset) / es;
   }
+  ta->buffer = buf;
+  ta->type = type;
+  ta->offset = offset;
+  ta->length = length;
   o->host = ta;
   v = js_obj_value(o);
   gc_pop_scope();
@@ -6845,12 +7315,12 @@ static js_value ta_make(js_ctx *ctx, int type, js_value *a, int n)
   js_value arg = n > 0 ? a[0] : js_undef();
   if (arg.type == JV_OBJ && arg.u.obj->kind == OBJ_ARRAYBUFFER) {
     js_arraybuffer *ab = (js_arraybuffer *)arg.u.obj->host;
-    int off = (n > 1 && a[1].type != JV_UNDEF) ? (int)js_to_number(ctx, a[1]) : 0;
+    int off = (n > 1 && a[1].type != JV_UNDEF) ? js_to_int_sat(ctx, a[1]) : 0;
     int len;
     if (off < 0 || off > ab->byteLength || (off % es))
       return js_throw_range(ctx, "invalid typed array byte offset");
     if (n > 2 && a[2].type != JV_UNDEF) {
-      len = (int)js_to_number(ctx, a[2]);
+      len = js_to_int_sat(ctx, a[2]);
       if (len < 0 || off + len * es > ab->byteLength)
         return js_throw_range(ctx, "invalid typed array length");
     } else {
@@ -6865,7 +7335,7 @@ static js_value ta_make(js_ctx *ctx, int type, js_value *a, int n)
     js_value view;
     gc_push_scope();
     {
-      js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, len * es));
+      js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(len, es)));
       view = new_view(ctx, type, buf, 0, len);
       if (view.type == JV_OBJ) {
         gc_keep(view.u.obj);
@@ -6877,10 +7347,10 @@ static js_value ta_make(js_ctx *ctx, int type, js_value *a, int n)
     return view;
   }
   {
-    int len = arg.type == JV_UNDEF ? 0 : (int)js_to_number(ctx, arg);
+    int len = arg.type == JV_UNDEF ? 0 : js_to_int_sat(ctx, arg);
     if (len < 0)
       return js_throw_range(ctx, "invalid typed array length");
-    return new_view(ctx, type, new_arraybuffer(ctx, len * es), 0, len);
+    return new_view(ctx, type, new_arraybuffer(ctx, mul_sat(len, es)), 0, len);
   }
 }
 #define TA_CTOR(fn, TYPE)                                                                                              \
@@ -6938,7 +7408,7 @@ static js_value tap_set(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   js_typedarray *ta = as_ta(t);
   js_value src = n > 0 ? a[0] : js_undef();
-  int off = n > 1 ? (int)js_to_number(ctx, a[1]) : 0, len, i;
+  int off = n > 1 ? js_to_int_sat(ctx, a[1]) : 0, len, i;
   if (!ta)
     return js_undef();
   len = ta_src_len(ctx, src);
@@ -6955,8 +7425,8 @@ static js_value tap_subarray(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!ta)
     return js_undef();
   len = ta->length;
-  b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[0]), len) : 0;
-  e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[1]), len) : len;
+  b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[0]), len) : 0;
+  e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[1]), len) : len;
   if (e < b)
     e = b;
   return new_view(ctx, ta->type, ta->buffer, ta->offset + b * ta_elem_size(ta->type), e - b);
@@ -6970,14 +7440,14 @@ static js_value tap_slice(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_undef();
   len = ta->length;
   es = ta_elem_size(ta->type);
-  b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[0]), len) : 0;
-  e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[1]), len) : len;
+  b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[0]), len) : 0;
+  e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[1]), len) : len;
   m = e - b;
   if (m < 0)
     m = 0;
   gc_push_scope();
   {
-    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, m * es));
+    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(m, es)));
     view = new_view(ctx, ta->type, buf, 0, m);
     if (view.type == JV_OBJ) {
       gc_keep(view.u.obj);
@@ -6996,8 +7466,8 @@ static js_value tap_fill(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!ta)
     return t;
   len = ta->length;
-  s = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[1]), len) : 0;
-  e = (n > 2 && a[2].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[2]), len) : len;
+  s = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[1]), len) : 0;
+  e = (n > 2 && a[2].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[2]), len) : len;
   for (; s < e; s++)
     ta_set(ctx, t.u.obj, (unsigned)s, v);
   return t;
@@ -7009,7 +7479,7 @@ static js_value tap_indexof(js_ctx *ctx, js_value t, js_value *a, int n)
   int i, from;
   if (!ta)
     return js_number(-1);
-  from = n > 1 ? clamp_idx((int)js_to_number(ctx, a[1]), ta->length) : 0;
+  from = n > 1 ? clamp_idx(js_to_int_sat(ctx, a[1]), ta->length) : 0;
   for (i = from; i < ta->length; i++)
     if (js_strict_eq(ta_get(t.u.obj, (unsigned)i), v))
       return js_number(i);
@@ -7088,7 +7558,7 @@ static js_value tap_map(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_undef();
   gc_push_scope();
   {
-    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, ta->length * ta_elem_size(ta->type)));
+    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(ta->length, ta_elem_size(ta->type))));
     view = new_view(ctx, ta->type, buf, 0, ta->length);
     if (view.type == JV_OBJ) {
       gc_keep(view.u.obj);
@@ -7142,7 +7612,7 @@ static js_value ta_of(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)t;
   gc_push_scope();
   {
-    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, n * ta_elem_size(type)));
+    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(n, ta_elem_size(type))));
     view = new_view(ctx, type, buf, 0, n);
     if (view.type == JV_OBJ) {
       gc_keep(view.u.obj);
@@ -7161,7 +7631,7 @@ static js_value ta_from(js_ctx *ctx, js_value t, js_value *a, int n)
   len = ta_src_len(ctx, src);
   gc_push_scope();
   {
-    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, len * ta_elem_size(type)));
+    js_object *buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(len, ta_elem_size(type))));
     view = new_view(ctx, type, buf, 0, len);
     if (view.type == JV_OBJ) {
       gc_keep(view.u.obj);
@@ -7209,8 +7679,8 @@ static js_value ab_slice(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_undef();
   ab = (js_arraybuffer *)t.u.obj->host;
   len = ab->byteLength;
-  b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[0]), len) : 0;
-  e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx((int)js_to_number(ctx, a[1]), len) : len;
+  b = (n > 0 && a[0].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[0]), len) : 0;
+  e = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[1]), len) : len;
   m = e - b;
   if (m < 0)
     m = 0;
@@ -7221,7 +7691,7 @@ static js_value ab_slice(js_ctx *ctx, js_value t, js_value *a, int n)
 }
 static js_value arraybuffer_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
 {
-  int len = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+  int len = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   (void)t;
   if (len < 0)
     return js_throw_range(ctx, "Invalid array buffer length");
@@ -7303,7 +7773,7 @@ static js_value dv_get(js_ctx *ctx, js_value t, js_value *a, int n, int type)
   unsigned char tmp[8];
   if (!ta || ta->type != TA_DATAVIEW)
     return js_undef();
-  off = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+  off = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   le = (es > 1) && (n > 1) && js_to_boolean(a[1]);
   if (off < 0 || off + es > ta->length)
     return js_throw_range(ctx, "Offset is outside the bounds of the DataView");
@@ -7321,7 +7791,7 @@ static js_value dv_set(js_ctx *ctx, js_value t, js_value *a, int n, int type)
   unsigned char tmp[8];
   if (!ta || ta->type != TA_DATAVIEW)
     return js_undef();
-  off = n > 0 ? (int)js_to_number(ctx, a[0]) : 0;
+  off = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   le = (es > 1) && (n > 2) && js_to_boolean(a[2]);
   if (off < 0 || off + es > ta->length)
     return js_throw_range(ctx, "Offset is outside the bounds of the DataView");
@@ -7370,11 +7840,11 @@ static js_value dataview_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!(n > 0 && a[0].type == JV_OBJ && a[0].u.obj->kind == OBJ_ARRAYBUFFER))
     return js_throw_type(ctx, "First argument to DataView constructor must be an ArrayBuffer");
   ab = (js_arraybuffer *)a[0].u.obj->host;
-  off = (n > 1 && a[1].type != JV_UNDEF) ? (int)js_to_number(ctx, a[1]) : 0;
+  off = (n > 1 && a[1].type != JV_UNDEF) ? js_to_int_sat(ctx, a[1]) : 0;
   if (off < 0 || off > ab->byteLength)
     return js_throw_range(ctx, "Invalid DataView offset");
   if (n > 2 && a[2].type != JV_UNDEF) {
-    len = (int)js_to_number(ctx, a[2]);
+    len = js_to_int_sat(ctx, a[2]);
     if (len < 0 || off + len > ab->byteLength)
       return js_throw_range(ctx, "Invalid DataView length");
   } else
@@ -8539,6 +9009,9 @@ void js_setup_builtins(js_ctx *ctx)
   js_def_native(ctx, ctx->string_proto, "substr", str_substr, 2);
   js_def_native(ctx, ctx->string_proto, "toUpperCase", str_upper, 0);
   js_def_native(ctx, ctx->string_proto, "toLowerCase", str_lower, 0);
+  js_def_native(ctx, ctx->string_proto, "toLocaleUpperCase", str_upper, 0);
+  js_def_native(ctx, ctx->string_proto, "toLocaleLowerCase", str_lower, 0);
+  js_def_native(ctx, ctx->string_proto, "normalize", str_normalize, 0);
   js_def_native(ctx, ctx->string_proto, "trim", strm_trim, 0);
   js_def_native(ctx, ctx->string_proto, "trimStart", strm_trimstart, 0);
   js_def_native(ctx, ctx->string_proto, "trimEnd", strm_trimend, 0);
@@ -8557,6 +9030,7 @@ void js_setup_builtins(js_ctx *ctx)
   {
     js_object *sctor = make_ctor(ctx, "String", native_string, ctx->string_proto);
     js_def_native(ctx, sctor, "fromCharCode", string_fromcharcode, 1);
+    js_def_native(ctx, sctor, "fromCodePoint", string_fromcodepoint, 1);
     js_def_native(ctx, sctor, "raw", string_raw, 1);
   }
 

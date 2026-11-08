@@ -324,6 +324,15 @@ static int decode_escape(jlexer *lx, cbuf *cook)
         cp = cp * 16 + (unsigned)hexval(*lx->p);
         lx->p++;
       }
+      if (cp >= 0xD800 && cp < 0xDC00 && lx->p[0] == '\\' && lx->p[1] == 'u') { /* join a \uD83D\uDE00 pair */
+        unsigned lo = 0;
+        for (i = 0; i < 4 && is_hex(lx->p[2 + i]); i++)
+          lo = lo * 16 + (unsigned)hexval(lx->p[2 + i]);
+        if (i == 4 && lo >= 0xDC00 && lo < 0xE000) {
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          lx->p += 6;
+        }
+      }
     }
     cb_push_cp(cook, cp);
     return 1;

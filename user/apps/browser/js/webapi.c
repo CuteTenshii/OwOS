@@ -188,7 +188,7 @@ static js_value textdec_decode(js_ctx *ctx, js_value t, js_value *args, int argc
   js_value r;
   (void)argc;
   in = view_bytes(A(0), &len);
-  kind = (int)js_to_number(ctx, js_get(ctx, t, "@kind"));
+  kind = js_to_int_sat(ctx, js_get(ctx, t, "@kind"));
   ignore = js_to_boolean(js_get(ctx, t, "ignoreBOM"));
   fatal = js_to_boolean(js_get(ctx, t, "fatal"));
   if (!in)

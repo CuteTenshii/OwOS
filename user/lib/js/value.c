@@ -42,6 +42,9 @@ unsigned js_str_hash(const char *s, int len)
   return h;
 }
 
+/* Canonical array index (no leading zero): returns 1 and sets *out. */
+#define JS_ARRAY_MAX_LEN (1u << 26)
+
 /* a canonical array index ("0","1",...,no leading zero) -> 1 and *out */
 static int as_index(const char *key, unsigned *out)
 {
@@ -432,6 +435,8 @@ js_object *js_new_function(js_ctx *ctx, js_node *node, js_env *closure)
   o->extensible = 1;
   o->proto = ctx->function_proto;
   f = (js_func *)malloc(sizeof(js_func));
+  if (!f)
+    gc_oom();
   memset(f, 0, sizeof(js_func));
   f->node = node;
   f->closure = closure;
@@ -470,6 +475,8 @@ js_object *js_new_native(js_ctx *ctx, js_native fn, const char *name, int arity)
   o->extensible = 1;
   o->proto = ctx->function_proto;
   f = (js_func *)malloc(sizeof(js_func));
+  if (!f)
+    gc_oom();
   memset(f, 0, sizeof(js_func));
   f->native = fn;
   f->name = name ? name : "";
@@ -568,7 +575,7 @@ int js_has_own(js_object *o, const char *key)
     if (strcmp(key, "length") == 0)
       return 1;
     if (as_index(key, &idx))
-      return idx < o->elen && o->elems[idx].type != JV_UNDEF;
+      return idx < o->elen;
   }
   return pmap_find(&o->props, key) != NULL;
 }
@@ -617,6 +624,8 @@ void js_array_set_len(js_ctx *ctx, js_object *arr, unsigned len)
     arr->elen = len;
     return;
   }
+  if (len > JS_ARRAY_MAX_LEN)
+    return;
   if (len > arr->ecap) {
     unsigned nc = arr->ecap ? arr->ecap * 2 : 8;
     while (nc < len)
@@ -955,13 +964,9 @@ js_object *js_proxy_ownkeys_target(js_object *p)
 int js_proxy_callable(js_object *o)
 {
   js_value t = proxy_target(o);
-  if (t.type != JV_OBJ)
-    return 0;
-  if (t.u.obj->kind == OBJ_FUNCTION)
-    return 1;
-  if (t.u.obj->kind == OBJ_PROXY)
-    return js_proxy_callable(t.u.obj);
-  return 0;
+  while (t.type == JV_OBJ && t.u.obj->kind == OBJ_PROXY)
+    t = proxy_target(t.u.obj);
+  return t.type == JV_OBJ && t.u.obj->kind == OBJ_FUNCTION;
 }
 /* the named trap function from the handler, or undefined (missing/revoked) */
 static js_value proxy_trap(js_ctx *ctx, js_object *p, const char *name)
@@ -974,6 +979,11 @@ static js_value proxy_trap(js_ctx *ctx, js_object *p, const char *name)
 static int proxy_live(js_ctx *ctx, js_object *p, js_value *target)
 {
   js_value t = proxy_target(p);
+  char probe;
+  if (ctx->stack_limit && &probe < ctx->stack_limit) {
+    js_throw_range(ctx, "maximum call stack size exceeded");
+    return 0;
+  }
   if (t.type != JV_OBJ) {
     js_throw_type(ctx, "Cannot perform operation on a proxy that has been revoked");
     return 0;
@@ -1162,6 +1172,8 @@ js_string *js_str_concat(js_ctx *ctx, js_string *a, js_string *b)
   gc_keep(b);
   s = (js_string *)gc_alloc(sizeof(js_string), GCK_STRING);
   s->data = (char *)malloc((unsigned)n + 1);
+  if (!s->data)
+    gc_oom();
   memcpy(s->data, a->data, (unsigned)a->len);
   memcpy(s->data + a->len, b->data, (unsigned)b->len);
   s->data[n] = 0;
@@ -1340,6 +1352,18 @@ js_value js_to_primitive(js_ctx *ctx, js_value v, int number_hint)
   return js_undef();
 }
 
+int js_to_int_sat(js_ctx *ctx, js_value v)
+{
+  double d = js_to_number(ctx, v);
+  if (d != d)
+    return 0;
+  if (d >= 2147483647.0)
+    return 2147483647;
+  if (d <= -2147483648.0)
+    return -2147483647 - 1;
+  return (int)d;
+}
+
 int js_to_int32(js_ctx *ctx, js_value v)
 {
   double n = js_to_number(ctx, v);
@@ -1424,6 +1448,8 @@ js_value js_mk_symbol(js_ctx *ctx, const char *desc)
   /* unique key string: '\x01' 's' + base36 id (the control byte makes ordinary
    * enumeration skip symbol-keyed properties). */
   ks = (char *)malloc(48);
+  if (!ks)
+    gc_oom();
   ks[0] = 1;
   ks[1] = 's';
   n = u64toa((unsigned long long)counter++, ks + 2, 36);

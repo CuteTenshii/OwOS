@@ -8,6 +8,7 @@
 #include "dom_query.h"
 #include "features/clienthints/clienthints.h" /* ch_ua: navigator.userAgentData */
 #include "features/cors/cors.h"               /* cors_origin / cors_same_origin: SW scope + cache keys */
+#include "features/jar/jar.h"      /* cors_origin / cors_same_origin: SW scope + cache keys */
 #include "features/media/bmedia.h"            /* HTMLMediaElement: <audio>/<video> + new Audio() */
 #include "features/mediasession/mediasession.h"
 #include "features/notification/notification.h"
@@ -100,8 +101,8 @@ static js_object *g_abortcontroller_proto; /* AbortController.prototype */
 static js_object *g_rtc_proto;             /* RTCPeerConnection.prototype (inert stub) */
 static js_object *g_document;
 static struct dom_node *g_doc_root;
-static struct dom_node *g_parsed[64]; /* DOMParser trees, freed at page teardown */
-static int g_nparsed;
+static struct dom_node **g_parsed; /* DOMParser trees, freed at page teardown */
+static int g_nparsed, g_parsed_cap;
 static res_batch_fn g_fetch;  /* the batch fetch used to pull modules */
 char g_page_url_buf[URL_MAX]; /* the page URL (module-resolution referrer) */
 
@@ -175,6 +176,9 @@ static int memcmp_js(const char *a, const char *b, int n)
       return a[i] < b[i] ? -1 : 1;
   return 0;
 }
+
+static bool node_is_frag(const struct dom_node *n) { return n->type == DOM_ELEMENT && streq(n->tag, "#frag"); }
+static bool node_is_comment(const struct dom_node *n) { return n->type == DOM_ELEMENT && streq(n->tag, "#comment"); }
 
 struct dom_node *node_of(js_value v)
 {
@@ -263,7 +267,8 @@ static void lower_into(char *dst, int cap, const char *src)
 
 /* ------------------------------------------------------- text content ----- */
 
-static void collect_text(struct dom_node *n, sbuf *sb)
+#define SERIALIZE_DEPTH_MAX 256
+static void collect_text(struct dom_node *n, sbuf *sb, int depth)
 {
   struct dom_node *c;
   if (n->type == DOM_TEXT) {
@@ -271,36 +276,65 @@ static void collect_text(struct dom_node *n, sbuf *sb)
       sb_puts(sb, n->text);
     return;
   }
+  if (depth >= SERIALIZE_DEPTH_MAX || node_is_comment(n))
+    return;
   for (c = n->first_child; c; c = c->next)
-    collect_text(c, sb);
+    collect_text(c, sb, depth + 1);
 }
-static void serialize(struct dom_node *n, sbuf *sb)
+static bool tag_is_void(const char *tag)
 {
-  struct dom_node *c;
-  for (c = n->first_child; c; c = c->next) {
-    if (c->type == DOM_TEXT) {
-      if (c->text)
-        sb_puts(sb, c->text);
-      continue;
-    }
+  static const char *const v[] = {"area", "base", "br",    "col",    "embed", "hr",  "img", "input",
+                                  "link", "meta", "param", "source", "track", "wbr", 0};
+  for (int i = 0; v[i]; i++)
+    if (streq(tag, v[i]))
+      return true;
+  return false;
+}
+static void serialize_node(struct dom_node *c, sbuf *sb, int depth)
+{
+  struct dom_node *k;
+  bool frag = node_is_frag(c);
+  if (c->type == DOM_TEXT) {
+    if (c->text)
+      sb_puts(sb, c->text);
+    return;
+  }
+  if (node_is_comment(c)) {
+    const char *d = dom_get_attr(c, "data");
+    sb_puts(sb, "<!--");
+    sb_puts(sb, d ? d : "");
+    sb_puts(sb, "-->");
+    return;
+  }
+  if (!frag) {
+    struct dom_attr *a;
     sb_putc(sb, '<');
     sb_puts(sb, c->tag);
-    {
-      struct dom_attr *a;
-      for (a = c->attrs; a; a = a->next) {
-        sb_putc(sb, ' ');
-        sb_puts(sb, a->name);
-        sb_puts(sb, "=\"");
-        sb_puts(sb, a->value ? a->value : "");
-        sb_putc(sb, '"');
-      }
+    for (a = c->attrs; a; a = a->next) {
+      sb_putc(sb, ' ');
+      sb_puts(sb, a->name);
+      sb_puts(sb, "=\"");
+      sb_puts(sb, a->value ? a->value : "");
+      sb_putc(sb, '"');
     }
     sb_putc(sb, '>');
-    serialize(c, sb);
+    if (tag_is_void(c->tag))
+      return;
+  }
+  if (depth < SERIALIZE_DEPTH_MAX)
+    for (k = c->first_child; k; k = k->next)
+      serialize_node(k, sb, depth + 1);
+  if (!frag) {
     sb_puts(sb, "</");
     sb_puts(sb, c->tag);
     sb_putc(sb, '>');
   }
+}
+static void serialize(struct dom_node *n, sbuf *sb)
+{
+  struct dom_node *c;
+  for (c = n->first_child; c; c = c->next)
+    serialize_node(c, sb, 0);
 }
 
 static js_value text_content_value(js_ctx *ctx, struct dom_node *n)
@@ -310,7 +344,7 @@ static js_value text_content_value(js_ctx *ctx, struct dom_node *n)
   sb.b = 0;
   sb.n = 0;
   sb.cap = 0;
-  collect_text(n, &sb);
+  collect_text(n, &sb, 0);
   r = js_mk_string(ctx, sb.b ? sb.b : "", sb.n);
   if (sb.b)
     free(sb.b);
@@ -365,6 +399,10 @@ static js_value el_nodeName(js_ctx *ctx, js_value t, js_value *args, int argc)
   struct dom_node *n = node_of(t);
   if (n && n->type == DOM_TEXT)
     return js_mk_cstring(ctx, "#text");
+  if (n && node_is_frag(n))
+    return js_mk_cstring(ctx, "#document-fragment");
+  if (n && node_is_comment(n))
+    return js_mk_cstring(ctx, "#comment");
   return el_tagName(ctx, t, args, argc);
 }
 static js_value el_nodeType(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -373,7 +411,9 @@ static js_value el_nodeType(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)ctx;
   (void)args;
   (void)argc;
-  return js_number(n && n->type == DOM_TEXT ? 3 : 1);
+  if (!n || n->type == DOM_TEXT)
+    return js_number(n ? 3 : 1);
+  return js_number(node_is_frag(n) ? 11 : node_is_comment(n) ? 8 : 1);
 }
 static js_value el_get_id(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -543,7 +583,7 @@ static js_value cl_contains(js_ctx *ctx, js_value t, js_value *args, int argc)
 
 static js_value cl_item(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  int idx = (int)js_to_number(ctx, A(0)), len;
+  int idx = js_to_int_sat(ctx, A(0)), len;
   const char *b;
   (void)args;
   (void)argc;
@@ -708,10 +748,13 @@ static js_value el_get_text(js_ctx *ctx, js_value t, js_value *args, int argc)
     return js_mk_cstring(ctx, "");
   return text_content_value(ctx, n);
 }
+static js_value el_set_node_value(js_ctx *ctx, js_value t, js_value *args, int argc);
 static js_value el_set_text(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  if (n)
+  if (n && (n->type == DOM_TEXT || node_is_comment(n)))
+    el_set_node_value(ctx, t, args, argc);
+  else if (n)
     set_text_content(n, arg_str(ctx, A(0)));
   return js_undef();
 }
@@ -750,14 +793,18 @@ static js_value el_set_attr(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
   if (n) {
-    char name[64], oldv[256], val[1024];
-    const char *ov;
-    strlcpy(name, arg_str(ctx, A(0)), sizeof name);
-    ov = dom_get_attr(n, name);
-    strlcpy(oldv, ov ? ov : "", sizeof oldv);
-    strlcpy(val, arg_str(ctx, A(1)), sizeof val);
-    dom_set_attr(n, name, val);
-    ce_attr_changed(n, name, ov ? oldv : 0, val); /* observedAttributes hook */
+    char *name = sdup(arg_str(ctx, A(0))), *oldv = 0, *val = 0;
+    const char *ov = name ? dom_get_attr(n, name) : 0;
+    if (name && (!ov || (oldv = sdup(ov)))) {
+      val = sdup(arg_str(ctx, A(1)));
+      if (val) {
+        dom_set_attr(n, name, val);
+        ce_attr_changed(n, name, oldv, val); /* observedAttributes hook */
+      }
+    }
+    free(name);
+    free(oldv);
+    free(val);
   }
   return js_undef();
 }
@@ -782,21 +829,42 @@ static bool node_connected(struct dom_node *n)
       return true;
   return false;
 }
+static void connect_inserted(struct dom_node *c)
+{
+  js_value cls;
+  if (c->type != DOM_ELEMENT)
+    return;
+  cls = ce_lookup(c->tag);
+  if (cls.type == JV_OBJ)
+    ce_upgrade_node(c, cls);
+  ce_connect(c);
+  if (node_connected(c))
+    run_inserted_script(c);
+}
+/* Insert `c` (or a fragment's children) into `parent` before `ref`; false on a cycle. */
+static bool insert_node(js_ctx *ctx, struct dom_node *parent, struct dom_node *c, struct dom_node *ref)
+{
+  if (dom_is_ancestor(c, parent) || parent->type == DOM_TEXT) {
+    js_throw_error(ctx, ctx->error_proto, "HierarchyRequestError", "the new child contains the parent");
+    return false;
+  }
+  if (node_is_frag(c)) {
+    struct dom_node *k;
+    while ((k = c->first_child)) {
+      dom_insert_before(parent, k, ref);
+      connect_inserted(k);
+    }
+    return true;
+  }
+  dom_insert_before(parent, c, ref);
+  connect_inserted(c);
+  return true;
+}
 static js_value el_append(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t), *c = node_of(A(0));
-  (void)ctx;
-  if (n && c) {
-    dom_append_child(n, c);
-    if (c->type == DOM_ELEMENT) { /* upgrade + connect a custom el */
-      js_value cls = ce_lookup(c->tag);
-      if (cls.type == JV_OBJ)
-        ce_upgrade_node(c, cls);
-      ce_connect(c);
-      if (node_connected(c))
-        run_inserted_script(c);
-    }
-  }
+  if (n && c)
+    insert_node(ctx, n, c, 0);
   return A(0);
 }
 static js_value el_remove_child(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -810,18 +878,8 @@ static js_value el_remove_child(js_ctx *ctx, js_value t, js_value *args, int arg
 static js_value el_insert_before(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t), *c = node_of(A(0)), *ref = node_of(A(1));
-  (void)ctx;
-  if (n && c) {
-    dom_insert_before(n, c, ref); /* null/absent ref => append */
-    if (c->type == DOM_ELEMENT) { /* upgrade + connect a custom el */
-      js_value cls = ce_lookup(c->tag);
-      if (cls.type == JV_OBJ)
-        ce_upgrade_node(c, cls);
-      ce_connect(c);
-      if (node_connected(c))
-        run_inserted_script(c);
-    }
-  }
+  if (n && c)
+    insert_node(ctx, n, c, ref); /* null/absent ref => append */
   return A(0);
 }
 static js_value el_parent(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -1590,7 +1648,7 @@ static js_value his_forward(js_ctx *ctx, js_value t, js_value *args, int argc)
 }
 static js_value his_go(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  int d = argc >= 1 ? (int)js_to_number(ctx, args[0]) : 0;
+  int d = argc >= 1 ? js_to_int_sat(ctx, args[0]) : 0;
   (void)t;
   B->hist_go = d < 0 ? -1 : (d > 0 ? 1 : 0);
   if (B->hist_go)
@@ -1724,6 +1782,650 @@ static js_value el_contains(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_bool(0);
 }
 
+static struct dom_node *prev_sibling(struct dom_node *n)
+{
+  struct dom_node *c;
+  if (!n || !n->parent)
+    return 0;
+  for (c = n->parent->first_child; c && c->next != n; c = c->next)
+    ;
+  return c;
+}
+static struct dom_node *first_elem(struct dom_node *c)
+{
+  while (c && c->type != DOM_ELEMENT)
+    c = c->next;
+  return c;
+}
+static js_value el_child_nodes(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t), *c;
+  js_object *arr;
+  (void)args;
+  (void)argc;
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  if (n)
+    for (c = n->first_child; c; c = c->next)
+      js_array_push(ctx, arr, wrap_node(c));
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+static js_value el_first_elem_child(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return n ? wrap_node(first_elem(n->first_child)) : js_null();
+}
+static js_value el_last_elem_child(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t), *c, *last = 0;
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  for (c = n ? n->first_child : 0; c; c = c->next)
+    if (c->type == DOM_ELEMENT)
+      last = c;
+  return wrap_node(last);
+}
+static js_value el_child_count(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t), *c;
+  int k = 0;
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  for (c = n ? n->first_child : 0; c; c = c->next)
+    k += c->type == DOM_ELEMENT;
+  return js_number(k);
+}
+static js_value el_next_elem(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return n ? wrap_node(first_elem(n->next)) : js_null();
+}
+static js_value el_prev(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return wrap_node(prev_sibling(node_of(t)));
+}
+static js_value el_prev_elem(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t), *p;
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  for (p = prev_sibling(n); p && p->type != DOM_ELEMENT; p = prev_sibling(p))
+    ;
+  return wrap_node(p);
+}
+static js_value el_has_children(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return js_bool(n && n->first_child);
+}
+static js_value el_is_connected(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return js_bool(n && node_connected(n));
+}
+static js_value el_owner_document(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  return js_obj_value(g_document);
+}
+static js_value el_root_node(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  while (n && n->parent)
+    n = n->parent;
+  return n == g_doc_root ? js_obj_value(g_document) : wrap_node(n);
+}
+static js_value el_node_value(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  const char *v;
+  (void)args;
+  (void)argc;
+  if (!n)
+    return js_null();
+  if (n->type == DOM_TEXT)
+    return js_mk_cstring(ctx, n->text ? n->text : "");
+  v = node_is_comment(n) ? dom_get_attr(n, "data") : 0;
+  return v ? js_mk_cstring(ctx, v) : js_null();
+}
+static js_value el_set_node_value(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  if (n && n->type == DOM_TEXT) {
+    char *nt = sdup(arg_str(ctx, A(0)));
+    if (nt) {
+      free(n->text);
+      n->text = nt;
+      dom_mutation_seq++;
+    }
+  } else if (n && node_is_comment(n))
+    dom_set_attr(n, "data", arg_str(ctx, A(0)));
+  return js_undef();
+}
+static js_value el_outer_html(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  sbuf sb = {0, 0, 0, 0};
+  js_value r;
+  (void)args;
+  (void)argc;
+  if (!n)
+    return js_mk_cstring(ctx, "");
+  serialize_node(n, &sb, 0);
+  r = js_mk_string(ctx, sb.b ? sb.b : "", sb.n);
+  free(sb.b);
+  return r;
+}
+static js_value el_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t), *c;
+  (void)ctx;
+  if (!n)
+    return js_null();
+  c = dom_clone(n, js_to_boolean(A(0)));
+  if (c && c->type == DOM_ELEMENT) {
+    js_value cls = ce_lookup(c->tag);
+    if (cls.type == JV_OBJ)
+      ce_upgrade_node(c, cls);
+  }
+  return wrap_node(c);
+}
+/* An argument of before/after/append/...: a node, or a string turned into a text node */
+static struct dom_node *arg_node(js_ctx *ctx, js_value v)
+{
+  struct dom_node *n = node_of(v);
+  return n ? n : dom_new_text(arg_str(ctx, v));
+}
+static js_value el_remove(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  if (n && n->parent)
+    dom_remove_child(n->parent, n);
+  return js_undef();
+}
+/* Insert every argument before `ref` in `parent` (ref NULL appends) */
+static void insert_args(js_ctx *ctx, struct dom_node *parent, struct dom_node *ref, js_value *args, int argc)
+{
+  int i;
+  for (i = 0; i < argc && parent && !ctx->has_exc; i++) {
+    struct dom_node *c = arg_node(ctx, args[i]);
+    if (c)
+      insert_node(ctx, parent, c, ref);
+  }
+}
+static js_value el_append_multi(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  insert_args(ctx, node_of(t), 0, args, argc);
+  return js_undef();
+}
+static js_value el_prepend(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  insert_args(ctx, n, n ? n->first_child : 0, args, argc);
+  return js_undef();
+}
+static js_value el_before(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  if (n && n->parent)
+    insert_args(ctx, n->parent, n, args, argc);
+  return js_undef();
+}
+static js_value el_after(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  if (n && n->parent)
+    insert_args(ctx, n->parent, n->next, args, argc);
+  return js_undef();
+}
+static js_value el_replace_with(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t), *parent = n ? n->parent : 0, *next = n ? n->next : 0;
+  if (parent) {
+    dom_remove_child(parent, n);
+    insert_args(ctx, parent, next && next->parent == parent ? next : 0, args, argc);
+  }
+  return js_undef();
+}
+static js_value el_replace_child(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t), *nc = node_of(A(0)), *old = node_of(A(1));
+  if (n && nc && old && old->parent == n && nc != old) {
+    struct dom_node *next = old->next;
+    dom_remove_child(n, old);
+    insert_node(ctx, n, nc, next);
+  }
+  return A(1);
+}
+static js_value el_insert_adjacent_html(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t), *tree, *c, *ref, *parent;
+  char pos[16];
+  lower_into(pos, sizeof pos, arg_str(ctx, A(0)));
+  if (!n)
+    return js_undef();
+  tree = dom_parse(arg_str(ctx, A(1)), (int)strlen(arg_str(ctx, A(1))));
+  if (!tree)
+    return js_undef();
+  if (streq(pos, "beforebegin") || streq(pos, "afterend")) {
+    parent = n->parent;
+    ref = streq(pos, "beforebegin") ? n : n->next;
+  } else {
+    parent = n;
+    ref = streq(pos, "afterbegin") ? n->first_child : 0;
+  }
+  c = tree->first_child;
+  tree->first_child = tree->last_child = 0;
+  while (c) {
+    struct dom_node *nx = c->next;
+    c->next = 0;
+    c->parent = 0;
+    if (parent &&
+        (streq(pos, "beforebegin") || streq(pos, "afterbegin") || streq(pos, "beforeend") || streq(pos, "afterend")))
+      insert_node(ctx, parent, c, ref);
+    else
+      dom_free(c);
+    c = nx;
+  }
+  dom_free(tree);
+  return js_undef();
+}
+static js_value el_insert_adjacent_el(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t), *c = node_of(A(1));
+  char pos[16];
+  lower_into(pos, sizeof pos, arg_str(ctx, A(0)));
+  if (!n || !c)
+    return js_null();
+  if (streq(pos, "beforebegin") && n->parent)
+    insert_node(ctx, n->parent, c, n);
+  else if (streq(pos, "afterend") && n->parent)
+    insert_node(ctx, n->parent, c, n->next);
+  else if (streq(pos, "afterbegin"))
+    insert_node(ctx, n, c, n->first_child);
+  else if (streq(pos, "beforeend"))
+    insert_node(ctx, n, c, 0);
+  else
+    return js_null();
+  return A(1);
+}
+static js_value el_insert_adjacent_text(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value a2[2];
+  struct dom_node *tx = dom_new_text(arg_str(ctx, A(1)));
+  a2[0] = A(0);
+  a2[1] = wrap_node(tx);
+  if (tx)
+    el_insert_adjacent_el(ctx, t, a2, 2);
+  return js_undef();
+}
+static void collect_class(struct dom_node *root, const char *classes, js_object *out)
+{
+  struct dom_node *n = root;
+  while (n) {
+    if (n != root && n->type == DOM_ELEMENT) {
+      const char *cl = dom_get_attr(n, "class");
+      bool all = *classes != 0;
+      const char *p = classes;
+      while (all && *p) {
+        char one[64];
+        int k = 0;
+        while (*p == ' ')
+          p++;
+        while (*p && *p != ' ' && k < 63)
+          one[k++] = *p++;
+        one[k] = 0;
+        while (*p && *p != ' ')
+          p++;
+        if (k && !(cl && tag_in_list(cl, one)))
+          all = false;
+      }
+      if (all)
+        js_array_push(g_ctx, out, wrap_node(n));
+    }
+    if (n->first_child) {
+      n = n->first_child;
+      continue;
+    }
+    while (n != root && !n->next)
+      n = n->parent;
+    if (n == root)
+      break;
+    n = n->next;
+  }
+}
+static js_value el_get_by_class(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *arr;
+  struct dom_node *n = node_of(t);
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  if (n)
+    collect_class(n, arg_str(ctx, A(0)), arr);
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+static js_value el_click(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  if (n)
+    js_dispatch_dom_event(n, "click", 0, 0);
+  return js_undef();
+}
+static js_value el_attr_names(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  struct dom_attr *a;
+  js_object *arr;
+  (void)args;
+  (void)argc;
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (a = n ? n->attrs : 0; a; a = a->next)
+    js_array_push(ctx, arr, js_mk_cstring(ctx, a->name));
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+static js_value el_attributes(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  struct dom_attr *a;
+  js_object *arr;
+  (void)args;
+  (void)argc;
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (a = n ? n->attrs : 0; a; a = a->next) {
+    js_object *o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_def(o, "name", js_mk_cstring(ctx, a->name), P_ENUMERABLE);
+    js_def(o, "value", js_mk_cstring(ctx, a->value ? a->value : ""), P_ENUMERABLE | P_WRITABLE);
+    js_array_push(ctx, arr, js_obj_value(o));
+  }
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+static js_value el_has_attrs(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  (void)ctx;
+  (void)args;
+  (void)argc;
+  return js_bool(n && n->attrs);
+}
+static js_value el_toggle_attr(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  const char *name = arg_str(ctx, A(0));
+  bool has = n && dom_get_attr(n, name), want = argc > 1 ? js_to_boolean(A(1)) : !has;
+  if (n && want && !has)
+    dom_set_attr(n, name, "");
+  else if (n && !want && has)
+    dom_remove_attr(n, name);
+  return js_bool(want);
+}
+/* attribute names without a namespace: the (ns, name) forms alias the plain ones */
+static js_value el_get_attr_ns(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  return el_get_attr(ctx, t, args + (argc > 0 ? 1 : 0), argc > 0 ? argc - 1 : 0);
+}
+static js_value el_set_attr_ns(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  return el_set_attr(ctx, t, args + (argc > 0 ? 1 : 0), argc > 0 ? argc - 1 : 0);
+}
+static struct dom_node *tree_next(struct dom_node *n)
+{
+  if (n->first_child)
+    return n->first_child;
+  while (n && !n->next)
+    n = n->parent;
+  return n ? n->next : 0;
+}
+static js_value el_compare_position(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *a = node_of(t), *b = node_of(A(0)), *r, *n;
+  (void)ctx;
+  if (!a || !b || a == b)
+    return js_number(0);
+  if (dom_is_ancestor(a, b))
+    return js_number(16 | 4); /* contained_by | following */
+  if (dom_is_ancestor(b, a))
+    return js_number(8 | 2); /* contains | preceding */
+  for (r = a; r->parent; r = r->parent)
+    ;
+  if (!dom_is_ancestor(r, b))
+    return js_number(1 | 32 | 4); /* disconnected | implementation_specific | following */
+  for (n = r; n; n = tree_next(n)) {
+    if (n == a)
+      return js_number(4);
+    if (n == b)
+      return js_number(2);
+  }
+  return js_number(1);
+}
+static js_value doc_create_frag(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  return wrap_node(dom_new_element("#frag"));
+}
+static js_value doc_create_comment(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = dom_new_element("#comment");
+  (void)t;
+  if (n)
+    dom_set_attr(n, "data", arg_str(ctx, A(0)));
+  return wrap_node(n);
+}
+static js_value doc_import_node(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  return el_clone(ctx, A(0), args + 1, argc > 1 ? argc - 1 : 0);
+}
+static js_value doc_adopt_node(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(A(0));
+  (void)ctx;
+  (void)t;
+  if (n && n->parent)
+    dom_remove_child(n->parent, n);
+  return A(0);
+}
+static struct dom_node *doc_root_of(js_value t);
+static js_value wrap_document(js_ctx *ctx, struct dom_node *root);
+static js_value doc_get_by_class(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *arr;
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  if (doc_root_of(t))
+    collect_class(doc_root_of(t), arg_str(ctx, A(0)), arr);
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+static js_value doc_contains(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(A(0));
+  (void)ctx;
+  return js_bool(n && dom_is_ancestor(doc_root_of(t), n));
+}
+static js_value ev_init_event(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_set(ctx, t, "type", js_mk_cstring(ctx, arg_str(ctx, A(0))));
+  js_set(ctx, t, "bubbles", js_bool(js_to_boolean(A(1))));
+  js_set(ctx, t, "cancelable", js_bool(js_to_boolean(A(2))));
+  if (argc > 3)
+    js_set(ctx, t, "detail", A(3));
+  return js_undef();
+}
+static js_value doc_collect_tag(js_ctx *ctx, js_value t, const char *tag)
+{
+  js_object *arr;
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  if (doc_root_of(t))
+    js_dom_find_all_tag(doc_root_of(t), tag, arr);
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+static js_value doc_scripts(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return doc_collect_tag(ctx, t, "script");
+}
+static js_value doc_forms(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return doc_collect_tag(ctx, t, "form");
+}
+static js_value doc_images(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return doc_collect_tag(ctx, t, "img");
+}
+static js_value doc_links(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *arr;
+  (void)args;
+  (void)argc;
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  if (doc_root_of(t))
+    js_dom_query_all(doc_root_of(t), "a[href], area[href]", arr);
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+static js_value doc_domain(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct purl u;
+  (void)t;
+  (void)args;
+  (void)argc;
+  return js_mk_cstring(ctx, parse_url(g_page_url_buf, &u) ? u.host : "");
+}
+static js_value doc_null(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  return js_null();
+}
+static js_value doc_false(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  return js_bool(0);
+}
+static bool has_dquote(const char *s)
+{
+  for (; *s; s++)
+    if (*s == '"')
+      return true;
+  return false;
+}
+
+static js_value doc_get_by_name(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *arr;
+  char sel[128];
+  int k = 0;
+  sapp(sel, &k, sizeof sel, "[name=\"");
+  sapp(sel, &k, sizeof sel, arg_str(ctx, A(0)));
+  sapp(sel, &k, sizeof sel, "\"]");
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  if (doc_root_of(t) && !has_dquote(arg_str(ctx, A(0))))
+    js_dom_query_all(doc_root_of(t), sel, arr);
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+/* a detached document with the html/head/body skeleton (document.implementation) */
+static js_value impl_create_html_document(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *root = dom_parse("<!doctype html><html><head></head><body></body></html>", 53), *ti;
+  js_value dv = wrap_document(ctx, root);
+  (void)t;
+  if (root && argc > 0 && (ti = dom_new_element("title"))) {
+    struct dom_node *head = js_dom_find_tag(root, "head");
+    set_text_content(ti, arg_str(ctx, A(0)));
+    dom_append_child(head ? head : root, ti);
+  }
+  return dv;
+}
+static js_value impl_create_document(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *root = dom_new_element("#document");
+  (void)t;
+  (void)args;
+  (void)argc;
+  return wrap_document(ctx, root);
+}
+static js_value doc_implementation(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value cached;
+  js_object *impl;
+  (void)args;
+  (void)argc;
+  if (t.type != JV_OBJ)
+    return js_null();
+  if (js_has_own(t.u.obj, "@impl"))
+    return js_get(ctx, t, "@impl");
+  gc_push_scope();
+  impl = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  def_method(impl, "createHTMLDocument", impl_create_html_document, 1);
+  def_method(impl, "createDocument", impl_create_document, 3);
+  def_method(impl, "hasFeature", el_true, 0);
+  cached = js_obj_value(impl);
+  js_def(t.u.obj, "@impl", cached, P_WRITABLE | P_CONFIGURABLE);
+  gc_pop_scope();
+  return cached;
+}
+static js_value doc_create_event(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  return make_event("", 0, 0, js_undef());
+}
+
 /* ------------------------------------------------------- geometry natives - */
 static int node_box(js_value t, int *x, int *y, int *w, int *h)
 {
@@ -1811,9 +2513,15 @@ static js_value wrap_document(js_ctx *ctx, struct dom_node *root)
   js_value dv;
   if (!root)
     return js_null();
-  if (g_nparsed >= 64) {
-    dom_free(root);
-    return js_null();
+  if (g_nparsed == g_parsed_cap) {
+    int nc = g_parsed_cap ? g_parsed_cap * 2 : 16;
+    struct dom_node **np = (struct dom_node **)realloc(g_parsed, (unsigned)nc * sizeof *np);
+    if (!np) {
+      dom_free(root);
+      return js_null();
+    }
+    g_parsed = np;
+    g_parsed_cap = nc;
   }
   g_parsed[g_nparsed++] = root;
   gc_push_scope();
@@ -1990,6 +2698,39 @@ static js_value doc_get_title(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)argc;
   return ti ? text_content_value(ctx, ti) : js_mk_cstring(ctx, "");
 }
+static js_value doc_get_cookie(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct purl u;
+  char *buf;
+  int cap = 4096, n;
+  js_value r;
+  (void)t;
+  (void)args;
+  (void)argc;
+  if (!parse_url(g_page_url_buf, &u))
+    return js_mk_cstring(ctx, "");
+  for (;; cap *= 2) {
+    buf = (char *)malloc((unsigned)cap);
+    if (!buf)
+      return js_mk_cstring(ctx, "");
+    buf[0] = '\0';
+    n = cookie_script_list(u.host, u.path, u.tls, buf, cap);
+    if (n < cap - 1 || cap >= (1 << 24))
+      break;
+    free(buf);
+  }
+  r = js_mk_cstring(ctx, buf);
+  free(buf);
+  return r;
+}
+static js_value doc_set_cookie(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct purl u;
+  (void)t;
+  if (parse_url(g_page_url_buf, &u))
+    cookie_store_script(u.host, arg_str(ctx, A(0)));
+  return js_undef();
+}
 static js_value doc_set_title(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *root = doc_root_of(t), *ti = js_dom_find_tag(root, "title");
@@ -2008,25 +2749,8 @@ static js_value doc_set_title(js_ctx *ctx, js_value t, js_value *args, int argc)
 static js_value domparser_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   const char *html = arg_str(ctx, A(0));
-  struct dom_node *root;
-  js_object *doc;
-  js_value dv;
   (void)t;
-  root = dom_parse(html, html ? (int)strlen(html) : 0);
-  if (!root)
-    return js_null();
-  if (g_nparsed >= 64) {
-    dom_free(root);
-    return js_null();
-  } /* table full: don't leak */
-  g_parsed[g_nparsed++] = root; /* freed in js_page_end */
-  gc_push_scope();
-  doc = (js_object *)gc_keep(js_new_object(ctx, g_document_proto));
-  doc->host = root;
-  root->wrapper = doc; /* wrap_node(root) == doc */
-  dv = js_obj_value(doc);
-  gc_pop_scope();
-  return dv;
+  return wrap_document(ctx, dom_parse(html, html ? (int)strlen(html) : 0));
 }
 static js_value domparser_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
@@ -3410,6 +4134,7 @@ static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int 
     for (k = g_tcap; k < nc; k++) {
       nt[k].active = nt[k].repeat = nt[k].raf = false;
       nt[k].due = nt[k].period = 0;
+      nt[k].async = 0;
     }
     g_tmeta = nt;
     g_tcap = nc;
@@ -3448,13 +4173,13 @@ static void timer_drop(int i)
 }
 static js_value win_set_timeout(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  int delay = argc > 1 ? (int)js_to_number(ctx, args[1]) : 0;
+  int delay = argc > 1 ? js_to_int_sat(ctx, args[1]) : 0;
   (void)t;
   return js_number(timer_add(ctx, A(0), args + (argc > 2 ? 2 : argc), argc > 2 ? argc - 2 : 0, delay, false, false));
 }
 static js_value win_set_interval(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  int delay = argc > 1 ? (int)js_to_number(ctx, args[1]) : 0;
+  int delay = argc > 1 ? js_to_int_sat(ctx, args[1]) : 0;
   (void)t;
   return js_number(timer_add(ctx, A(0), args + (argc > 2 ? 2 : argc), argc > 2 ? argc - 2 : 0, delay, true, false));
 }
@@ -4587,8 +5312,8 @@ static js_value blob_slice(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value b = js_get(ctx, t, "@bytes");
   int len = b.type == JV_STR ? b.u.str->len : 0;
-  int s = argc > 0 && A(0).type != JV_UNDEF ? (int)js_to_number(ctx, A(0)) : 0;
-  int e = argc > 1 && A(1).type != JV_UNDEF ? (int)js_to_number(ctx, A(1)) : len;
+  int s = argc > 0 && A(0).type != JV_UNDEF ? js_to_int_sat(ctx, A(0)) : 0;
+  int e = argc > 1 && A(1).type != JV_UNDEF ? js_to_int_sat(ctx, A(1)) : len;
   char type[128];
   type[0] = '\0';
   if (s < 0)
@@ -5481,12 +6206,22 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   def_acc(g_element_proto, "parentNode", el_parent, 0);
   def_acc(g_element_proto, "parentElement", el_parent, 0);
   def_acc(g_element_proto, "firstChild", el_first_child, 0);
-  def_acc(g_element_proto, "firstElementChild", el_first_child, 0);
+  def_acc(g_element_proto, "firstElementChild", el_first_elem_child, 0);
+  def_acc(g_element_proto, "lastElementChild", el_last_elem_child, 0);
+  def_acc(g_element_proto, "childElementCount", el_child_count, 0);
+  def_acc(g_element_proto, "previousSibling", el_prev, 0);
+  def_acc(g_element_proto, "previousElementSibling", el_prev_elem, 0);
+  def_acc(g_element_proto, "isConnected", el_is_connected, 0);
+  def_acc(g_element_proto, "ownerDocument", el_owner_document, 0);
+  def_acc(g_element_proto, "outerHTML", el_outer_html, 0);
+  def_acc(g_element_proto, "nodeValue", el_node_value, el_set_node_value);
+  def_acc(g_element_proto, "data", el_node_value, el_set_node_value);
+  def_acc(g_element_proto, "attributes", el_attributes, 0);
   def_acc(g_element_proto, "lastChild", el_last_child, 0);
   def_acc(g_element_proto, "nextSibling", el_next, 0);
-  def_acc(g_element_proto, "nextElementSibling", el_next, 0);
+  def_acc(g_element_proto, "nextElementSibling", el_next_elem, 0);
   def_acc(g_element_proto, "children", el_children, 0);
-  def_acc(g_element_proto, "childNodes", el_children, 0);
+  def_acc(g_element_proto, "childNodes", el_child_nodes, 0);
   def_acc(g_element_proto, "src", el_get_src, el_set_src);
   def_acc(g_element_proto, "href", el_get_href, el_set_href);
   /* HTMLAnchorElement/HTMLAreaElement URL decomposition (read-only) */
@@ -5517,7 +6252,35 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_element_proto, "hasAttribute", el_has_attr, 1);
   def_method(g_element_proto, "removeAttribute", el_rm_attr, 1);
   def_method(g_element_proto, "appendChild", el_append, 1);
-  def_method(g_element_proto, "append", el_append, 1);
+  def_method(g_element_proto, "append", el_append_multi, 1);
+  def_method(g_element_proto, "prepend", el_prepend, 1);
+  def_method(g_element_proto, "before", el_before, 1);
+  def_method(g_element_proto, "after", el_after, 1);
+  def_method(g_element_proto, "replaceWith", el_replace_with, 1);
+  def_method(g_element_proto, "replaceChild", el_replace_child, 2);
+  def_method(g_element_proto, "remove", el_remove, 0);
+  def_method(g_element_proto, "cloneNode", el_clone, 1);
+  def_method(g_element_proto, "hasChildNodes", el_has_children, 0);
+  def_method(g_element_proto, "getRootNode", el_root_node, 0);
+  def_method(g_element_proto, "compareDocumentPosition", el_compare_position, 1);
+  def_method(g_element_proto, "insertAdjacentHTML", el_insert_adjacent_html, 2);
+  def_method(g_element_proto, "insertAdjacentElement", el_insert_adjacent_el, 2);
+  def_method(g_element_proto, "insertAdjacentText", el_insert_adjacent_text, 2);
+  def_method(g_element_proto, "getElementsByClassName", el_get_by_class, 1);
+  def_method(g_element_proto, "getAttributeNames", el_attr_names, 0);
+  def_method(g_element_proto, "hasAttributes", el_has_attrs, 0);
+  def_method(g_element_proto, "toggleAttribute", el_toggle_attr, 1);
+  def_method(g_element_proto, "getAttributeNS", el_get_attr_ns, 2);
+  def_method(g_element_proto, "setAttributeNS", el_set_attr_ns, 3);
+  def_method(g_element_proto, "click", el_click, 0);
+  def_method(g_element_proto, "focus", el_noop, 0);
+  def_method(g_element_proto, "blur", el_noop, 0);
+  def_method(g_element_proto, "scrollIntoView", el_noop, 0);
+  def_method(g_element_proto, "scrollTo", el_noop, 2);
+  def_method(g_element_proto, "scroll", el_noop, 2);
+  def_method(g_element_proto, "normalize", el_noop, 0);
+  def_method(g_element_proto, "webkitMatchesSelector", el_matches, 1);
+  def_method(g_element_proto, "msMatchesSelector", el_matches, 1);
   def_method(g_element_proto, "removeChild", el_remove_child, 1);
   def_method(g_element_proto, "insertBefore", el_insert_before, 2);
   def_method(g_element_proto, "getElementsByTagName", el_get_by_tag, 1);
@@ -5543,6 +6306,51 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_document_proto, "createElement", doc_create_el, 1);
   def_method(g_document_proto, "createElementNS", doc_create_el_ns, 2);
   def_method(g_document_proto, "createTextNode", doc_create_text, 1);
+  def_method(g_document_proto, "createDocumentFragment", doc_create_frag, 0);
+  def_method(g_document_proto, "createComment", doc_create_comment, 1);
+  def_method(g_document_proto, "createEvent", doc_create_event, 1);
+  def_method(g_document_proto, "importNode", doc_import_node, 2);
+  def_method(g_document_proto, "adoptNode", doc_adopt_node, 1);
+  def_method(g_document_proto, "getElementsByClassName", doc_get_by_class, 1);
+  def_method(g_document_proto, "contains", doc_contains, 1);
+  def_method(g_document_proto, "getRootNode", el_owner_document, 0);
+  def_method(g_document_proto, "getElementsByName", doc_get_by_name, 1);
+  def_method(g_document_proto, "execCommand", doc_false, 1);
+  def_method(g_document_proto, "elementFromPoint", doc_null, 2);
+  def_method(g_document_proto, "open", el_noop, 0);
+  def_method(g_document_proto, "close", el_noop, 0);
+  def_method(g_document_proto, "writeln", el_noop, 1);
+  def_acc(g_document_proto, "childNodes", el_child_nodes, 0);
+  def_acc(g_document_proto, "children", el_children, 0);
+  def_acc(g_document_proto, "firstChild", el_first_child, 0);
+  def_acc(g_document_proto, "lastChild", el_last_child, 0);
+  def_acc(g_document_proto, "firstElementChild", el_first_elem_child, 0);
+  def_acc(g_document_proto, "lastElementChild", el_last_elem_child, 0);
+  def_acc(g_document_proto, "childElementCount", el_child_count, 0);
+  def_acc(g_document_proto, "parentNode", doc_null, 0);
+  def_acc(g_document_proto, "parentElement", doc_null, 0);
+  def_acc(g_document_proto, "ownerDocument", doc_null, 0);
+  def_acc(g_document_proto, "textContent", doc_null, 0);
+  def_acc(g_document_proto, "doctype", doc_null, 0);
+  def_acc(g_document_proto, "fullscreenElement", doc_null, 0);
+  def_acc(g_document_proto, "scrollingElement", doc_root_el, 0);
+  def_acc(g_document_proto, "scripts", doc_scripts, 0);
+  def_acc(g_document_proto, "forms", doc_forms, 0);
+  def_acc(g_document_proto, "images", doc_images, 0);
+  def_acc(g_document_proto, "links", doc_links, 0);
+  def_acc(g_document_proto, "anchors", el_empty_array, 0);
+  def_acc(g_document_proto, "embeds", el_empty_array, 0);
+  def_acc(g_document_proto, "plugins", el_empty_array, 0);
+  def_acc(g_document_proto, "domain", doc_domain, 0);
+  def_acc(g_document_proto, "implementation", doc_implementation, 0);
+  js_def(g_document_proto, "characterSet", js_mk_cstring(ctx, "UTF-8"), P_ENUMERABLE);
+  js_def(g_document_proto, "charset", js_mk_cstring(ctx, "UTF-8"), P_ENUMERABLE);
+  js_def(g_document_proto, "inputEncoding", js_mk_cstring(ctx, "UTF-8"), P_ENUMERABLE);
+  js_def(g_document_proto, "contentType", js_mk_cstring(ctx, "text/html"), P_ENUMERABLE);
+  js_def(g_document_proto, "compatMode", js_mk_cstring(ctx, "CSS1Compat"), P_ENUMERABLE);
+  js_def(g_document_proto, "lastModified", js_mk_cstring(ctx, ""), P_ENUMERABLE);
+  js_def(g_document_proto, "designMode", js_mk_cstring(ctx, "off"), P_ENUMERABLE | P_WRITABLE);
+  js_def(g_document_proto, "dir", js_mk_cstring(ctx, ""), P_ENUMERABLE | P_WRITABLE);
   def_method(g_document_proto, "addEventListener", el_add_listener, 3);
   def_method(g_document_proto, "removeEventListener", el_remove_listener, 3);
   def_method(g_document_proto, "dispatchEvent", el_dispatch, 1);
@@ -5552,12 +6360,16 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   def_acc(g_document_proto, "head", doc_head, 0);
   def_acc(g_document_proto, "documentElement", doc_root_el, 0);
   def_acc(g_document_proto, "title", doc_get_title, doc_set_title);
+  def_acc(g_document_proto, "cookie", doc_get_cookie, doc_set_cookie);
+  js_def(g_document_proto, "nodeType", js_number(9), P_ENUMERABLE);
+  js_def(g_document_proto, "nodeName", js_mk_cstring(ctx, "#document"), P_ENUMERABLE);
   js_def(g_document, "readyState", js_mk_cstring(ctx, "loading"), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
   js_def(g_document, "visibilityState", js_mk_cstring(ctx, "visible"), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
   js_def(g_document, "hidden", js_bool(0), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
   js_def(g_document, "currentScript", js_null(), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
   js_def(g_document, "referrer", js_mk_cstring(ctx, B->referrer), P_WRITABLE | P_CONFIGURABLE | P_ENUMERABLE);
   def_method(g_document, "hasFocus", el_true, 0);
+  js_def(g_document, "defaultView", js_obj_value(win), P_CONFIGURABLE | P_ENUMERABLE);
 
   /* window / globals */
   js_def(win, "document", js_obj_value(g_document), P_WRITABLE | P_CONFIGURABLE);
@@ -5574,6 +6386,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     def_method(loc, "toString", loc_tostring, 0);
     js_def(g_document, "location", js_obj_value(loc), P_WRITABLE | P_CONFIGURABLE);
     js_def(g_document, "URL", js_mk_cstring(ctx, page_url ? page_url : ""), P_WRITABLE | P_CONFIGURABLE);
+    js_def(g_document, "documentURI", js_mk_cstring(ctx, page_url ? page_url : ""), P_WRITABLE | P_CONFIGURABLE);
     js_def(win, "location", js_obj_value(loc), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
@@ -5762,6 +6575,8 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   }
 
   /* DOM events: Event prototype, the Event/CustomEvent constructors */
+  def_method(g_event_proto, "initEvent", ev_init_event, 3);
+  def_method(g_event_proto, "initCustomEvent", ev_init_event, 4);
   def_method(g_event_proto, "preventDefault", ev_prevent, 0);
   def_method(g_event_proto, "stopPropagation", ev_stop, 0);
   def_method(g_event_proto, "stopImmediatePropagation", ev_stop, 0);
@@ -6080,6 +6895,24 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   def_acc(win, "pageXOffset", win_scrollX, 0);
   def_acc(win, "scrollY", win_scrollY, 0);
   def_acc(win, "pageYOffset", win_scrollY, 0);
+  def_acc(win, "outerWidth", win_innerWidth, 0);
+  def_acc(win, "outerHeight", win_innerHeight, 0);
+  js_def(win, "top", js_obj_value(win), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "parent", js_obj_value(win), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "frames", js_obj_value(win), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "opener", js_null(), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "length", js_number(0), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "name", js_mk_cstring(ctx, ""), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "devicePixelRatio", js_number(1), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "isSecureContext", js_bool(page_url && starts_ci(page_url, "https:")), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "origin", js_get(ctx, js_get(ctx, js_obj_value(win), "location"), "origin"), P_WRITABLE | P_CONFIGURABLE);
+  def_method(win, "scrollTo", el_noop, 2);
+  def_method(win, "scrollBy", el_noop, 2);
+  def_method(win, "scroll", el_noop, 2);
+  def_method(win, "open", doc_null, 0);
+  def_method(win, "close", el_noop, 0);
+  def_method(win, "focus", el_noop, 0);
+  def_method(win, "blur", el_noop, 0);
 
   /* navigator.serviceWorker + caches + Response/Request */
   sw_install(ctx, win, page_url);
@@ -6808,7 +7641,9 @@ void js_page_end(void)
   g_arenas_cap = 0;
   for (i = 0; i < g_nparsed; i++)
     dom_free(g_parsed[i]); /* DOMParser trees */
-  g_nparsed = 0;
+  free(g_parsed);
+  g_parsed = 0;
+  g_nparsed = g_parsed_cap = 0;
   g_has_listeners = false;
   g_page_live = 0;
   g_doc_root = 0;

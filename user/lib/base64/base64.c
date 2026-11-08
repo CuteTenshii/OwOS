@@ -51,7 +51,8 @@ int base64_decoded_cap(int len) { return len <= 0 ? 0 : (len / 4 + 1) * 3; }
 
 int base64_decode(const char *src, int len, unsigned char *dst)
 {
-  int o = 0, acc = 0, nb = 0;
+  int o = 0, nb = 0;
+  unsigned acc = 0;
   for (int i = 0; i < len; i++) {
     int c = (unsigned char)src[i];
     if (c == '=')
@@ -61,7 +62,7 @@ int base64_decode(const char *src, int len, unsigned char *dst)
     int v = dval(c);
     if (v < 0)
       return -1;
-    acc = (acc << 6) | v;
+    acc = (acc << 6) | (unsigned)v;
     nb += 6;
     if (nb >= 8) {
       nb -= 8;

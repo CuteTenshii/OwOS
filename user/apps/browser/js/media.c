@@ -361,7 +361,7 @@ static js_value rp_watch_availability(js_ctx *ctx, js_value t, js_value *args, i
 static js_value rp_cancel_watch(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value watch = t.type == JV_OBJ ? js_get(ctx, t, "@watch") : js_undef();
-  int id = (int)js_to_number(ctx, A(0));
+  int id = js_to_int_sat(ctx, A(0));
   (void)argc;
   if (js_is_array(watch) && id >= 1 && id <= (int)js_array_len(watch.u.obj))
     js_set_index(ctx, watch, (unsigned)(id - 1), js_null()); /* skipped by the pump */
@@ -496,7 +496,7 @@ int js_cast_pump(void)
       watch = js_get(g_ctx, rv, "@watch");
       if (!js_is_array(watch) || js_array_len(watch.u.obj) == 0)
         continue;
-      if ((int)js_to_number(g_ctx, js_get(g_ctx, rv, "@availseen")) == avail)
+      if (js_to_int_sat(g_ctx, js_get(g_ctx, rv, "@availseen")) == avail)
         continue;
       js_def(rv.u.obj, "@availseen", js_number(avail), P_WRITABLE);
       m = js_array_len(watch.u.obj);

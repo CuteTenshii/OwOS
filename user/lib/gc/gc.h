@@ -41,6 +41,9 @@ void gc_init(gc_tracer trace, gc_finalizer finalize);
  * the very next allocation collects. */
 void *gc_alloc(unsigned size, int kind);
 
+/* Unrecoverable allocation failure: raises SIGABRT so the embedder can drop the page. */
+void gc_oom(void);
+
 /* Called from a tracer to mark a referenced object reachable. NULL is ignored.
  * Must be passed a pointer returned by gc_alloc (a precise collector trusts its
  * tracer; do not pass interior or non-GC pointers). */

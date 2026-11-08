@@ -29,6 +29,7 @@ typedef struct {
   int pending_async;     /* the function/arrow about to be parsed is async */
   int pending_generator; /* the method about to be parsed is a generator   */
   int depth;             /* live recursion depth, bounded to spare the stack */
+  int sdepth;            /* depth of the unary/binary/new operand chains */
 } js_parser;
 
 /* The recursive-descent core costs one frame-ladder per source nesting level
@@ -38,6 +39,9 @@ typedef struct {
  * kernel/loader.h). */
 #define JS_MAX_DEPTH 700
 
+/* Lowest native SP the parser may recurse to (js_set_stack_limit); NULL = depth cap only. */
+static const char *g_parse_floor;
+void js_parser_set_stack_floor(const void *low) { g_parse_floor = (const char *)low; }
 /* ------------------------------------------------------- token stream ----- */
 
 static void advance(js_parser *p)
@@ -505,7 +509,20 @@ static js_node *parse_tail(js_parser *p, js_node *e, int allow_call)
   }
 }
 
+static js_node *parse_new_inner(js_parser *p);
 static js_node *parse_new(js_parser *p)
+{
+  js_node *r;
+  char probe;
+  if (++p->sdepth > 4 * JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
+    --p->sdepth;
+    return perr(p, "expression nesting too deep");
+  }
+  r = parse_new_inner(p);
+  --p->sdepth;
+  return r;
+}
+static js_node *parse_new_inner(js_parser *p)
 {
   js_node *node, *callee;
   int line = p->cur.line, col = p->cur.col;
@@ -542,7 +559,20 @@ static js_node *parse_lhs(js_parser *p)
   return parse_tail(p, e, 1);
 }
 
+static js_node *parse_unary_inner(js_parser *p);
 static js_node *parse_unary(js_parser *p)
+{
+  js_node *r;
+  char probe;
+  if (++p->sdepth > 4 * JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
+    --p->sdepth;
+    return perr(p, "expression nesting too deep");
+  }
+  r = parse_unary_inner(p);
+  --p->sdepth;
+  return r;
+}
+static js_node *parse_unary_inner(js_parser *p)
 {
   int k = p->cur.kind;
   if (p->in_async && at(p, T_IDENT) && word_is(&p->cur, "await", 5)) {
@@ -583,7 +613,20 @@ static js_node *parse_unary(js_parser *p)
   }
 }
 
+static js_node *parse_binary_inner(js_parser *p, int min_prec, int no_in);
 static js_node *parse_binary(js_parser *p, int min_prec, int no_in)
+{
+  js_node *r;
+  char probe;
+  if (++p->sdepth > 4 * JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
+    --p->sdepth;
+    return perr(p, "expression nesting too deep");
+  }
+  r = parse_binary_inner(p, min_prec, no_in);
+  --p->sdepth;
+  return r;
+}
+static js_node *parse_binary_inner(js_parser *p, int min_prec, int no_in)
 {
   js_node *left = parse_unary(p);
   if (p->failed)
@@ -656,7 +699,8 @@ static js_node *parse_assignment_inner(js_parser *p, int no_in);
 static js_node *parse_assignment(js_parser *p, int no_in)
 {
   js_node *r;
-  if (++p->depth > JS_MAX_DEPTH) {
+  char probe;
+  if (++p->depth > JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
     --p->depth;
     return perr(p, "expression nesting too deep");
   }
@@ -1807,7 +1851,8 @@ static js_node *parse_statement_inner(js_parser *p);
 static js_node *parse_statement(js_parser *p)
 {
   js_node *r;
-  if (++p->depth > JS_MAX_DEPTH) {
+  char probe;
+  if (++p->depth > JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
     --p->depth;
     return perr(p, "statement nesting too deep");
   }
@@ -1947,6 +1992,7 @@ js_node *js_parse(const char *src, js_arena *arena, js_parse_error *err)
   p.errcol = 0;
   p.in_async = p.in_generator = p.pending_async = p.pending_generator = 0;
   p.depth = 0;
+  p.sdepth = 0;
   js_lexer_init(&p.lx, src, arena);
   advance(&p);
 

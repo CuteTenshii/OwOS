@@ -238,6 +238,7 @@ double js_to_number(js_ctx *ctx, js_value v);
 js_value js_to_string(js_ctx *ctx, js_value v); /* -> JV_STR                  */
 js_value js_to_primitive(js_ctx *ctx, js_value v, int number_hint);
 int js_to_int32(js_ctx *ctx, js_value v);
+int js_to_int_sat(js_ctx *ctx, js_value v); /* ToNumber then saturate to int; NaN -> 0 */
 unsigned js_to_uint32(js_ctx *ctx, js_value v);
 const char *js_typeof(js_value v);
 

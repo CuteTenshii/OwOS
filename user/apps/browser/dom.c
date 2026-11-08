@@ -634,9 +634,77 @@ void dom_remove_child(struct dom_node *parent, struct dom_node *child)
     style_stale_subtree(parent);
 }
 
+bool dom_is_ancestor(const struct dom_node *anc, const struct dom_node *n)
+{
+  for (; n; n = n->parent)
+    if (n == anc)
+      return true;
+  return false;
+}
+
+static struct dom_node *clone_one(const struct dom_node *src)
+{
+  struct dom_node *n = malloc(sizeof *n);
+  if (!n)
+    return 0;
+  node_init(n, src->type);
+  memcpy(n->tag, src->tag, sizeof n->tag);
+  if (src->text && !(n->text = dupn(src->text, (int)strlen(src->text)))) {
+    free(n);
+    return 0;
+  }
+  for (const struct dom_attr *a = src->attrs; a; a = a->next) {
+    char *nn = dupn(a->name, (int)strlen(a->name)),
+         *nv = dupn(a->value ? a->value : "", a->value ? (int)strlen(a->value) : 0);
+    if (!nn || !nv) {
+      free(nn);
+      free(nv);
+      dom_free(n);
+      return 0;
+    }
+    if (!attr_append(n, nn, nv)) {
+      dom_free(n);
+      return 0;
+    }
+    n->attr_seq++;
+  }
+  return n;
+}
+
+struct dom_node *dom_clone(const struct dom_node *src, bool deep)
+{
+  struct dom_node *root = clone_one(src), *dst = root, *c;
+  const struct dom_node *s = src;
+  if (!root || !deep)
+    return root;
+  for (;;) {
+    if (s->first_child) {
+      if (!(c = clone_one(s->first_child)))
+        break;
+      node_append(dst, c);
+      s = s->first_child;
+      dst = c;
+      continue;
+    }
+    while (s != src && !s->next) {
+      s = s->parent;
+      dst = dst->parent;
+    }
+    if (s == src)
+      return root;
+    if (!(c = clone_one(s->next)))
+      break;
+    node_append(dst->parent, c);
+    s = s->next;
+    dst = c;
+  }
+  dom_free(root);
+  return 0;
+}
+
 void dom_append_child(struct dom_node *parent, struct dom_node *child)
 {
-  if (!parent || !child)
+  if (!parent || !child || dom_is_ancestor(child, parent))
     return;
   dom_mutation_seq++;
   if (child->parent)
@@ -650,7 +718,7 @@ void dom_append_child(struct dom_node *parent, struct dom_node *child)
 /* Insert `child` before `ref`; a NULL or foreign `ref` appends (Node.insertBefore). */
 void dom_insert_before(struct dom_node *parent, struct dom_node *child, struct dom_node *ref)
 {
-  if (!parent || !child)
+  if (!parent || !child || ref == child || dom_is_ancestor(child, parent))
     return;
   if (!ref || ref->parent != parent) {
     dom_append_child(parent, child);

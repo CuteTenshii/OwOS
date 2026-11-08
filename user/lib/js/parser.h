@@ -20,5 +20,6 @@ typedef struct {
  * `arena`. Returns the program, or NULL on a syntax error (then *err, if
  * non-NULL, describes it). */
 js_node *js_parse(const char *src, js_arena *arena, js_parse_error *err);
+void js_parser_set_stack_floor(const void *low); /* bound recursion to a thread stack */
 
 #endif /* OWOS_JS_PARSER_H */

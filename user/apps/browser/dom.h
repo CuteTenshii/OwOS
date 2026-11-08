@@ -58,6 +58,8 @@ void dom_remove_child(struct dom_node *parent, struct dom_node *child);
 void dom_set_attr(struct dom_node *el, const char *name, const char *value);
 void dom_remove_attr(struct dom_node *el, const char *name);
 void dom_clear_children(struct dom_node *el);
+struct dom_node *dom_clone(const struct dom_node *src, bool deep);          /* detached copy, NULL on OOM */
+bool dom_is_ancestor(const struct dom_node *anc, const struct dom_node *n); /* anc == n counts */
 
 /* computed_style_seq / pseudo_seq value after a mutation made the cache unusable. */
 #define DOM_STYLE_STALE (~0u)

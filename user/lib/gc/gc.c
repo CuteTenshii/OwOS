@@ -78,6 +78,7 @@ static void **handles;
 static int nhandles, caphandles;
 static int *scopes;
 static int nscopes, capscopes;
+static int lost_scopes; /* pushes that hit OOM: their pops must not close an outer scope */
 /* grey worklist. */
 static void **grey;
 static int grey_sp, grey_cap, grey_overflow;
@@ -107,6 +108,10 @@ static int grow(void ***a, int *cap, int need)
   return 1;
 }
 
+int raise(int sig);
+
+void gc_oom(void) { raise(6); /* SIGABRT: crash handler drops the page */ }
+
 void gc_init(gc_tracer trace, gc_finalizer finalize)
 {
   tracer = trace;
@@ -117,7 +122,7 @@ void gc_init(gc_tracer trace, gc_finalizer finalize)
   major_threshold = MIN_MAJOR;
   force_major = 0;
   collecting_minor = 0;
-  nroots = nranges = nhandles = nscopes = 0;
+  nroots = nranges = nhandles = nscopes = lost_scopes = 0;
   grey_sp = 0;
   remset_n = rescan_n = 0;
 }
@@ -447,8 +452,10 @@ void *gc_alloc(unsigned size, int kind)
   if (!o) {
     gc_major();
     o = malloc(sizeof(gc_obj) + size);
-    if (!o)
+    if (!o) {
+      gc_oom();
       return 0;
+    }
   }
 
   memset(o, 0, sizeof(gc_obj) + size); /* zero header + payload (NULL kids) */
@@ -508,14 +515,18 @@ void gc_remove_root_range(void **base)
 /* ------------------------------------------------------------ handle scopes */
 void gc_push_scope(void)
 {
-  if (!grow((void ***)&scopes, &capscopes, nscopes + 1))
+  if (!grow((void ***)&scopes, &capscopes, nscopes + 1)) {
+    lost_scopes++;
     return;
+  }
   scopes[nscopes++] = nhandles;
 }
 
 void gc_pop_scope(void)
 {
-  if (nscopes > 0)
+  if (lost_scopes > 0)
+    lost_scopes--;
+  else if (nscopes > 0)
     nhandles = scopes[--nscopes];
 }
 

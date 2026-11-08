@@ -35,6 +35,8 @@ static js_value idb_throw(js_ctx *ctx, const char *name, const char *msg)
   return js_throw_error(ctx, ctx->error_proto, name, msg);
 }
 
+/* ---- keys: validity, type rank and comparison (spec key ordering) -------- */
+
 static bool idb_is_keyrange(js_value v) { return v.type == JV_OBJ && v.u.obj->proto == g_idb_proto[IDBP_KEYRANGE]; }
 static bool idb_is_date(js_value v)
 {
@@ -119,6 +121,9 @@ static int idb_cmp(js_value a, js_value b)
   }
   }
 }
+
+/* ---- structured clone (deep copy so store <-> page share no references) ---
+ */
 
 static js_value idb_clone_buffer(js_ctx *ctx, js_object *bufobj)
 {
@@ -319,6 +324,9 @@ static void idb_inject_key(js_ctx *ctx, js_value value, const char *path, js_val
   }
 }
 
+/* ---- database / store record access (the persistent-for-the-page store) ---
+ */
+
 static js_value idb_dbrec(const char *name)
 {
   return g_idb_dbs ? js_get(g_ctx, js_obj_value(g_idb_dbs), name) : js_undef();
@@ -410,7 +418,7 @@ static js_value idb_stringlist_contains(js_ctx *ctx, js_value t, js_value *args,
 }
 static js_value idb_stringlist_item(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  int i = (int)js_to_number(ctx, A(0));
+  int i = js_to_int_sat(ctx, A(0));
   if (t.type != JV_OBJ || i < 0 || i >= (int)js_array_len(t.u.obj))
     return js_null();
   return js_get_index(ctx, t, (unsigned)i);
@@ -425,6 +433,8 @@ static js_value idb_stringlist(js_object *namesMap)
   gc_pop_scope();
   return js_obj_value(arr);
 }
+
+/* ---- small runtime helpers over the wrappers ----------------------------- */
 
 static void idb_str_field(js_value o, const char *k, char *buf, int cap)
 {
@@ -695,6 +705,8 @@ static bool idb_query_match(js_value query, js_value key)
 }
 static bool idb_query_valid(js_value q) { return idb_is_keyrange(q) || idb_valid_key(q, 0); }
 
+/* ---- wrapper factories --------------------------------------------------- */
+
 static js_value idb_make_db(const char *name, double version)
 {
   js_object *db;
@@ -939,7 +951,7 @@ static bool idb_cursor_next(js_value cursor, bool hasKey, js_value key, int coun
 {
   js_value steps = js_get(g_ctx, cursor, "@steps");
   int n = steps.type == JV_OBJ ? (int)js_array_len(steps.u.obj) : 0;
-  int pos = (int)js_to_number(g_ctx, js_get(g_ctx, cursor, "@pos"));
+  int pos = js_to_int_sat(g_ctx, js_get(g_ctx, cursor, "@pos"));
   bool keyonly = js_to_boolean(js_get(g_ctx, cursor, "@keyonly"));
   char db[128], sn[128], dir[16];
   js_value sr;
@@ -1405,6 +1417,8 @@ static js_value idb_store_indexnames(js_ctx *ctx, js_value t, js_value *args, in
   return idb_stringlist(ix.type == JV_OBJ ? ix.u.obj : 0);
 }
 
+/* ---- index operations ---------------------------------------------------- */
+
 static bool idb_index_open(js_ctx *ctx, js_value t, idbix *x)
 {
   x->txn = js_get(ctx, t, "@txn");
@@ -1536,6 +1550,8 @@ static js_value idb_index_openkeycursor(js_ctx *ctx, js_value t, js_value *a, in
   return idb_index_opencursor_impl(ctx, t, a, n, true);
 }
 
+/* ---- cursor operations --------------------------------------------------- */
+
 static void idb_cursor_requeue(js_ctx *ctx, js_value cursor, js_value txn, bool positioned)
 {
   js_value req = js_get(ctx, cursor, "@req");
@@ -1562,7 +1578,7 @@ static js_value idb_cursor_continue(js_ctx *ctx, js_value t, js_value *args, int
 static js_value idb_cursor_advance(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value txn = js_get(ctx, t, "@txn");
-  int count = (int)js_to_number(ctx, A(0));
+  int count = js_to_int_sat(ctx, A(0));
   bool ok;
   (void)argc;
   if (count <= 0)
@@ -1635,6 +1651,8 @@ static js_value idb_cursor_delete(js_ctx *ctx, js_value t, js_value *args, int a
   return idb_succeed(t, txn, js_undef());
 }
 
+/* ---- IDBKeyRange --------------------------------------------------------- */
+
 static js_value idb_kr_only(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
@@ -1674,6 +1692,8 @@ static js_value idb_kr_includes(js_ctx *ctx, js_value t, js_value *args, int arg
     return idb_throw(ctx, "DataError", "invalid key");
   return js_bool(idb_query_match(t, A(0)));
 }
+
+/* ---- IDBTransaction ------------------------------------------------------ */
 
 static void idb_abort_txn(js_value txn, js_value err)
 {
@@ -1771,6 +1791,8 @@ static js_value idb_txn_storenames(js_ctx *ctx, js_value t, js_value *args, int 
   gc_pop_scope();
   return r;
 }
+
+/* ---- IDBDatabase --------------------------------------------------------- */
 
 static js_value idb_db_createstore(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1909,6 +1931,8 @@ static js_value idb_db_storenames(js_ctx *ctx, js_value t, js_value *args, int a
   stores = js_get(ctx, idb_dbrec(dbn), "stores");
   return idb_stringlist(stores.type == JV_OBJ ? stores.u.obj : 0);
 }
+
+/* ---- IDBFactory (window.indexedDB) --------------------------------------- */
 
 static js_value idb_illegal_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
 {

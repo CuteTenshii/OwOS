@@ -297,7 +297,11 @@ static js_value throw_ref(js_ctx *ctx, const char *msg)
   return js_throw_error(ctx, ctx->ref_error_proto, "ReferenceError", msg);
 }
 
-void js_set_stack_limit(js_ctx *ctx, void *low_limit) { ctx->stack_limit = (char *)low_limit; }
+void js_set_stack_limit(js_ctx *ctx, void *low_limit)
+{
+  ctx->stack_limit = (char *)low_limit;
+  js_parser_set_stack_floor(low_limit);
+}
 
 /* Native-stack overflow guard. The evaluator and native callbacks recurse on
  * the C stack, so deep recursion (or a deeply nested AST) would smash past a
@@ -722,7 +726,7 @@ static js_value apply_binop(js_ctx *ctx, int op, js_value l, js_value r)
   case T_CARET:
     return js_number(js_to_int32(ctx, l) ^ js_to_int32(ctx, r));
   case T_LTLT:
-    return js_number(js_to_int32(ctx, l) << (js_to_uint32(ctx, r) & 31));
+    return js_number((int)((unsigned)js_to_int32(ctx, l) << (js_to_uint32(ctx, r) & 31)));
   case T_GTGT:
     return js_number(js_to_int32(ctx, l) >> (js_to_uint32(ctx, r) & 31));
   case T_GTGTGT:
@@ -818,6 +822,10 @@ static js_value *eval_args(js_ctx *ctx, js_node **anodes, int an, int *out_argc)
   int cap = an > 0 ? an : 1, i;
   int argc = 0;
   argv = (js_value *)malloc((unsigned)cap * sizeof(js_value));
+  if (!argv) {
+    js_throw_range(ctx, "out of memory");
+    return NULL;
+  }
   for (i = 0; i < an; i++) {
     js_node *a = anodes[i];
     if (a->type == JS_SPREAD) {
@@ -951,6 +959,9 @@ static void callee_desc(js_node *callee, char *buf, int cap)
 
 static js_value eval_chain(js_ctx *ctx, js_node *n, int *shorted)
 {
+  char probe;
+  if (stack_overflow(ctx, &probe))
+    return js_throw_range(ctx, "maximum call stack size exceeded");
   if (n->type == JS_MEMBER) {
     js_value obj = eval_chain_obj(ctx, n->u.member.obj, shorted);
     if (ctx->has_exc || *shorted)
@@ -1569,6 +1580,10 @@ static js_value build_tagged(js_ctx *ctx, js_node *n)
                   js_mk_string(ctx, tmpl->u.tmpl.quasis[i]->u.str.s, tmpl->u.tmpl.quasis[i]->u.str.len));
   js_set(ctx, strings, "raw", strings); /* approximate: raw == cooked     */
   argv = (js_value *)malloc((unsigned)nargs * sizeof(js_value));
+  if (!argv) {
+    gc_pop_scope();
+    return js_throw_range(ctx, "out of memory");
+  }
   argv[0] = strings;
   for (i = 0; i < tmpl->u.tmpl.nexprs; i++) {
     argv[i + 1] = evaluate(ctx, tmpl->u.tmpl.exprs[i]);
@@ -1978,8 +1993,13 @@ static js_value evaluate(js_ctx *ctx, js_node *n)
 
 static void bind_pattern(js_ctx *ctx, js_node *pat, js_value val, int declare, unsigned char flags)
 {
+  char probe;
   if (ctx->has_exc)
     return;
+  if (stack_overflow(ctx, &probe)) {
+    js_throw_range(ctx, "maximum call stack size exceeded");
+    return;
+  }
   switch (pat->type) {
   case JS_IDENT:
     if (declare)
@@ -2130,7 +2150,8 @@ static void declare_pattern_vars(js_env *fnenv, js_node *pat)
 
 static void hoist_vars(js_ctx *ctx, js_env *fnenv, js_node *n)
 {
-  if (!n)
+  char probe;
+  if (!n || stack_overflow(ctx, &probe))
     return;
   switch (n->type) {
   case JS_VAR_DECL:
@@ -2208,7 +2229,8 @@ static void hoist_functions(js_ctx *ctx, js_node **items, int count)
  * engine has no strict mode, so the rule is applied uniformly. */
 static void hoist_block_funcs(js_ctx *ctx, js_env *fnenv, js_node *n)
 {
-  if (!n)
+  char probe;
+  if (!n || stack_overflow(ctx, &probe))
     return;
   switch (n->type) {
   case JS_FUNC:
@@ -2662,8 +2684,13 @@ static void export_decl_names(js_ctx *ctx, js_node *decl, js_object *exports)
 
 static completion exec_stmt(js_ctx *ctx, js_node *n, const char *label)
 {
+  char probe;
   if (ctx->has_exc)
     return cnorm();
+  if (stack_overflow(ctx, &probe)) {
+    js_throw_range(ctx, "maximum call stack size exceeded");
+    return cnorm();
+  }
   switch (n->type) {
   case JS_EXPR_STMT: {
     completion c = cnorm();
@@ -3331,6 +3358,8 @@ int js_run_module(js_ctx *ctx, js_node *program, js_object *exports, const char 
 js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len))
 {
   js_ctx *ctx = (js_ctx *)malloc(sizeof(js_ctx));
+  if (!ctx)
+    return NULL;
   memset(ctx, 0, sizeof(js_ctx));
   ctx->print = print;
   ctx->rng = 0x9e3779b9u;
