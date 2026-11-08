@@ -82,9 +82,9 @@ static completion exec_list(js_ctx *ctx, js_node **items, int count);
 static void bind_pattern(js_ctx *ctx, js_node *pat, js_value val, int declare, unsigned char flags);
 static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_value *args, int argc);
 static js_object *super_home_proto(js_ctx *ctx);
-static int get_iterator(js_ctx *ctx, js_value v, js_value *iter);
+static int get_iterator(js_ctx *ctx, js_value v, js_value *iter, int async);
 static js_value eval_yield(js_ctx *ctx, js_node *n);
-static int iterator_step(js_ctx *ctx, js_value iter, js_value *value);
+static int iterator_step(js_ctx *ctx, js_value iter, js_value *value, int async);
 
 /* a small public shim so builtins.c can read own props without the static map
  */
@@ -817,6 +817,43 @@ static js_value eval_chain_obj(js_ctx *ctx, js_node *n, int *shorted)
   return evaluate(ctx, n);
 }
 
+/* await under the synchronous model: a settled promise unwraps inline, a pending one reads as undefined. */
+static js_value await_value(js_ctx *ctx, js_value v)
+{
+  js_value settled;
+  int st = js_promise_inspect(ctx, v, &settled);
+  if (st == -1)
+    return v;
+  if (st == 1)
+    return settled;
+  if (st == 2)
+    js_throw(ctx, settled);
+  return js_undef();
+}
+
+/* A generator parked mid-expression owns the malloc'd block behind *slot; its
+ * finalizer frees it if the generator is collected instead of resumed. */
+static void gen_hold(js_ctx *ctx, void **slot)
+{
+  js_generator *g = ctx->cur_gen;
+  if (!g)
+    return;
+  if (g->nheld == g->capheld) {
+    void ***nh = (void ***)realloc(g->held, (unsigned)(g->capheld ? g->capheld * 2 : 4) * sizeof *nh);
+    if (!nh)
+      gc_oom();
+    g->held = nh;
+    g->capheld = g->capheld ? g->capheld * 2 : 4;
+  }
+  g->held[g->nheld++] = slot;
+}
+
+static void gen_release(js_ctx *ctx)
+{
+  if (ctx->cur_gen)
+    ctx->cur_gen->nheld--;
+}
+
 static js_value *eval_args(js_ctx *ctx, js_node **anodes, int an, int *out_argc)
 {
   js_value *argv;
@@ -830,7 +867,10 @@ static js_value *eval_args(js_ctx *ctx, js_node **anodes, int an, int *out_argc)
   for (i = 0; i < an; i++) {
     js_node *a = anodes[i];
     if (a->type == JS_SPREAD) {
-      js_value sv = evaluate(ctx, a->u.one.arg);
+      js_value sv;
+      gen_hold(ctx, (void **)&argv);
+      sv = evaluate(ctx, a->u.one.arg);
+      gen_release(ctx);
       if (ctx->has_exc) {
         free(argv);
         return NULL;
@@ -850,14 +890,14 @@ static js_value *eval_args(js_ctx *ctx, js_node **anodes, int an, int *out_argc)
         }
       } else {
         js_value iter, e;
-        if (!get_iterator(ctx, sv, &iter)) {
+        if (!get_iterator(ctx, sv, &iter, 0)) {
           free(argv);
           if (!ctx->has_exc)
             js_throw_type(ctx, "spread value is not iterable");
           return NULL;
         }
         KEEP(iter);
-        while (iterator_step(ctx, iter, &e)) {
+        while (iterator_step(ctx, iter, &e, 0)) {
           if (!grow_values(&argv, &cap, argc + 1)) {
             free(argv);
             js_throw_range(ctx, "out of memory");
@@ -874,7 +914,10 @@ static js_value *eval_args(js_ctx *ctx, js_node **anodes, int an, int *out_argc)
         }
       }
     } else {
-      js_value v = evaluate(ctx, a);
+      js_value v;
+      gen_hold(ctx, (void **)&argv);
+      v = evaluate(ctx, a);
+      gen_release(ctx);
       if (ctx->has_exc) {
         free(argv);
         return NULL;
@@ -1395,14 +1438,14 @@ static js_value build_array(js_ctx *ctx, js_node *n)
           js_array_push(ctx, arr, js_get_index(ctx, sv, j));
       } else {
         js_value iter, e;
-        if (!get_iterator(ctx, sv, &iter)) {
+        if (!get_iterator(ctx, sv, &iter, 0)) {
           gc_pop_scope();
           if (!ctx->has_exc)
             js_throw_type(ctx, "spread value is not iterable");
           return js_undef();
         }
         KEEP(iter);
-        while (iterator_step(ctx, iter, &e)) {
+        while (iterator_step(ctx, iter, &e, 0)) {
           js_array_push(ctx, arr, e);
           if (ctx->has_exc)
             break;
@@ -1587,7 +1630,9 @@ static js_value build_tagged(js_ctx *ctx, js_node *n)
   }
   argv[0] = strings;
   for (i = 0; i < tmpl->u.tmpl.nexprs; i++) {
+    gen_hold(ctx, (void **)&argv);
     argv[i + 1] = evaluate(ctx, tmpl->u.tmpl.exprs[i]);
+    gen_release(ctx);
     if (ctx->has_exc) {
       free(argv);
       gc_pop_scope();
@@ -1960,20 +2005,8 @@ static js_value evaluate(js_ctx *ctx, js_node *n)
   case JS_REGEX:
     return js_make_regexp(ctx, n->u.regex.pattern, n->u.regex.flags);
   case JS_AWAIT: {
-    js_value v = evaluate(ctx, n->u.one.arg), settled;
-    int st;
-    if (ctx->has_exc)
-      return js_undef();
-    st = js_promise_inspect(ctx, v, &settled);
-    if (st == -1)
-      return v; /* await of a non-promise -> the value */
-    if (st == 1)
-      return settled; /* fulfilled -> its value              */
-    if (st == 2) {
-      js_throw(ctx, settled);
-      return js_undef();
-    } /* rejected -> throw */
-    return js_undef(); /* pending (no event loop) -> undefined */
+    js_value v = evaluate(ctx, n->u.one.arg);
+    return ctx->has_exc ? js_undef() : await_value(ctx, v);
   }
   case JS_YIELD:
     return eval_yield(ctx, n);
@@ -2396,18 +2429,31 @@ static void bind_for_target(js_ctx *ctx, js_node *left, js_value item)
 }
 
 /* the iteration protocol: obj[Symbol.iterator]() then repeated .next() */
-static int get_iterator(js_ctx *ctx, js_value v, js_value *iter)
+/* Returns 0 on failure, 1 on success, and 2 when `async` was asked for but the
+ * value only has a sync iterator (its results then need awaiting by the caller). */
+static int get_iterator(js_ctx *ctx, js_value v, js_value *iter, int async)
 {
-  js_value itfn;
-  if (v.type != JV_OBJ)
+  js_value itfn = js_undef();
+  int fallback = 0;
+  if (v.type != JV_OBJ && v.type != JV_STR)
     return 0;
-  itfn = js_get(ctx, v, js_symbol_key(ctx->sym_iterator));
+  if (async) {
+    itfn = js_get(ctx, v, js_symbol_key(ctx->sym_async_iterator));
+    if (ctx->has_exc)
+      return 0;
+  }
+  if (!js_is_callable(itfn)) {
+    fallback = async;
+    itfn = js_get(ctx, v, js_symbol_key(ctx->sym_iterator));
+  }
   if (ctx->has_exc || !js_is_callable(itfn))
     return 0;
   *iter = js_call(ctx, itfn, v, NULL, 0);
-  return !ctx->has_exc && iter->type == JV_OBJ;
+  if (ctx->has_exc || iter->type != JV_OBJ)
+    return 0;
+  return fallback ? 2 : 1;
 }
-static int iterator_step(js_ctx *ctx, js_value iter, js_value *value)
+static int iterator_step(js_ctx *ctx, js_value iter, js_value *value, int async)
 {
   js_value res, nextfn = js_get(ctx, iter, "next");
   if (!js_is_callable(nextfn)) {
@@ -2417,6 +2463,8 @@ static int iterator_step(js_ctx *ctx, js_value iter, js_value *value)
   gc_push_scope();
   KEEP(iter);
   res = js_call(ctx, nextfn, iter, NULL, 0);
+  if (!ctx->has_exc && async)
+    res = await_value(ctx, res);
   if (ctx->has_exc) {
     gc_pop_scope();
     return 0;
@@ -2469,6 +2517,10 @@ static completion exec_for_in(js_ctx *ctx, js_node *n, const char *label)
         js_value item = js_get_index(ctx, rhs, i);
         int brk;
         js_env *saved = ctx->cur_env;
+        if (n->u.forin.of == 2)
+          item = await_value(ctx, item);
+        if (ctx->has_exc)
+          break;
         gc_push_scope();
         gc_keep(saved);
         KEEP(item);
@@ -2482,7 +2534,8 @@ static completion exec_for_in(js_ctx *ctx, js_node *n, const char *label)
       }
     } else { /* general iterables (Map/Set/...) */
       js_value iter, item;
-      if (!get_iterator(ctx, rhs, &iter)) {
+      int is_await = n->u.forin.of == 2, kind = get_iterator(ctx, rhs, &iter, is_await);
+      if (!kind) {
         gc_pop_scope();
         if (!ctx->has_exc)
           js_throw_type(ctx, "value is not iterable");
@@ -2491,9 +2544,13 @@ static completion exec_for_in(js_ctx *ctx, js_node *n, const char *label)
       int early = 0;
       gc_push_scope();
       KEEP(iter);
-      while (!ctx->has_exc && iterator_step(ctx, iter, &item)) {
+      while (!ctx->has_exc && iterator_step(ctx, iter, &item, kind == 1)) {
         int brk;
         js_env *saved = ctx->cur_env;
+        if (kind == 2) /* sync iterator under for await: its values are awaited */
+          item = await_value(ctx, item);
+        if (ctx->has_exc)
+          break;
         gc_push_scope();
         gc_keep(saved);
         KEEP(item);
@@ -3126,10 +3183,12 @@ static js_value eval_yield(js_ctx *ctx, js_node *n)
 {
   js_value v = js_undef(), sent, iter, res;
   js_node *arg = n->u.one.arg;
-  int mode = GEN_NEXT;
+  int mode = GEN_NEXT, kind, async = ctx->cur_gen->node->u.func.is_async;
 
   if (arg) {
     v = evaluate(ctx, arg);
+    if (!ctx->has_exc && async && !n->op)
+      v = await_value(ctx, v);
     if (ctx->has_exc)
       return js_undef();
   }
@@ -3140,7 +3199,8 @@ static js_value eval_yield(js_ctx *ctx, js_node *n)
 
   gc_push_scope();
   KEEP(v);
-  if (!get_iterator(ctx, v, &iter)) {
+  kind = get_iterator(ctx, v, &iter, async);
+  if (!kind) {
     gc_pop_scope();
     if (!ctx->has_exc)
       js_throw_type(ctx, "yield* operand is not iterable");
@@ -3170,6 +3230,8 @@ static js_value eval_yield(js_ctx *ctx, js_node *n)
     }
     KEEP(sent);
     res = js_call(ctx, fn, iter, &sent, 1);
+    if (!ctx->has_exc && async)
+      res = await_value(ctx, res);
     if (ctx->has_exc)
       break;
     KEEP(res);
@@ -3180,6 +3242,8 @@ static js_value eval_yield(js_ctx *ctx, js_node *n)
     {
       int done = js_to_boolean(js_get(ctx, res, "done"));
       js_value val = js_get(ctx, res, "value");
+      if (!ctx->has_exc && kind == 2)
+        val = await_value(ctx, val);
       if (ctx->has_exc)
         break;
       KEEP(val);
@@ -3235,6 +3299,28 @@ static js_value gen_step(js_ctx *ctx, js_value t, js_value *a, int n, int mode)
 static js_value gen_next(js_ctx *ctx, js_value t, js_value *a, int n) { return gen_step(ctx, t, a, n, GEN_NEXT); }
 static js_value gen_return(js_ctx *ctx, js_value t, js_value *a, int n) { return gen_step(ctx, t, a, n, GEN_RETURN); }
 static js_value gen_throw(js_ctx *ctx, js_value t, js_value *a, int n) { return gen_step(ctx, t, a, n, GEN_THROW); }
+
+/* An async generator steps like a sync one (await runs inline) but hands back a promise of the result. */
+static js_value agen_step(js_ctx *ctx, js_value t, js_value *a, int n, int mode)
+{
+  js_value r = gen_step(ctx, t, a, n, mode);
+  gc_push_scope();
+  if (ctx->has_exc) {
+    js_value e = ctx->exc;
+    ctx->has_exc = 0;
+    ctx->exc_root = NULL;
+    KEEP(e);
+    r = js_promise_rejected(ctx, e);
+  } else {
+    KEEP(r);
+    r = js_promise_resolved(ctx, r);
+  }
+  gc_pop_scope();
+  return r;
+}
+static js_value agen_next(js_ctx *ctx, js_value t, js_value *a, int n) { return agen_step(ctx, t, a, n, GEN_NEXT); }
+static js_value agen_return(js_ctx *ctx, js_value t, js_value *a, int n) { return agen_step(ctx, t, a, n, GEN_RETURN); }
+static js_value agen_throw(js_ctx *ctx, js_value t, js_value *a, int n) { return agen_step(ctx, t, a, n, GEN_THROW); }
 static js_value gen_self(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   (void)ctx;
@@ -3255,6 +3341,16 @@ void js_setup_generators(js_ctx *ctx)
     js_def(p, js_symbol_key(ctx->sym_iterator), js_obj_value(f), P_WRITABLE | P_CONFIGURABLE);
   }
   js_def(p, js_symbol_key(ctx->sym_tostringtag), js_mk_cstring(ctx, "Generator"), P_CONFIGURABLE);
+
+  p = ctx->async_generator_proto;
+  js_def_native(ctx, p, "next", agen_next, 1);
+  js_def_native(ctx, p, "return", agen_return, 1);
+  js_def_native(ctx, p, "throw", agen_throw, 1);
+  {
+    js_object *f = (js_object *)gc_keep(js_new_native(ctx, gen_self, "[Symbol.asyncIterator]", 0));
+    js_def(p, js_symbol_key(ctx->sym_async_iterator), js_obj_value(f), P_WRITABLE | P_CONFIGURABLE);
+  }
+  js_def(p, js_symbol_key(ctx->sym_tostringtag), js_mk_cstring(ctx, "AsyncGenerator"), P_CONFIGURABLE);
   gc_pop_scope();
 }
 
@@ -3269,7 +3365,9 @@ static js_value gen_create(js_ctx *ctx, js_object *fn, js_env *env)
     gc_oom();
   gc_push_scope();
   proto = js_get(ctx, js_obj_value(fn), "prototype");
-  obj = (js_object *)gc_keep(js_new_object(ctx, proto.type == JV_OBJ ? proto.u.obj : ctx->generator_proto));
+  if (proto.type != JV_OBJ)
+    proto = js_obj_value(fn->fn->node->u.func.is_async ? ctx->async_generator_proto : ctx->generator_proto);
+  obj = (js_object *)gc_keep(js_new_object(ctx, proto.u.obj));
   g->ctx = ctx;
   g->self = obj;
   g->node = fn->fn->node;
@@ -3399,10 +3497,7 @@ static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_va
 
   if (!ctx->has_exc) {
     if (node && node->u.func.is_generator) {
-      if (node->u.func.is_async)
-        js_throw_type(ctx, "async generator functions are not supported");
-      else
-        result = gen_create(ctx, o, env);
+      result = gen_create(ctx, o, env);
     } else if (node) {
       if (node->u.func.is_expr_body)
         result = evaluate(ctx, node->u.func.body);
@@ -3426,7 +3521,7 @@ static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_va
 
   /* an async function settles a promise with its return value or thrown error
    * (synchronous model: await unwraps already-settled promises inline). */
-  if (node && node->u.func.is_async) {
+  if (node && node->u.func.is_async && !node->u.func.is_generator) {
     if (ctx->has_exc) {
       js_value e = ctx->exc;
       ctx->has_exc = 0;
@@ -3771,6 +3866,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
   gc_add_root((void **)&ctx->date_proto);
   gc_add_root((void **)&ctx->regexp_proto);
   gc_add_root((void **)&ctx->generator_proto);
+  gc_add_root((void **)&ctx->async_generator_proto);
   gc_add_root((void **)&ctx->typedarray_proto);
   gc_add_root((void **)&ctx->arraybuffer_proto);
   gc_add_root((void **)&ctx->dataview_proto);
@@ -3807,6 +3903,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
   ctx->date_proto = js_new_object(ctx, ctx->object_proto);
   ctx->regexp_proto = js_new_object(ctx, ctx->object_proto);
   ctx->generator_proto = js_new_object(ctx, ctx->object_proto);
+  ctx->async_generator_proto = js_new_object(ctx, ctx->object_proto);
   ctx->typedarray_proto = js_new_object(ctx, ctx->object_proto);
   ctx->arraybuffer_proto = js_new_object(ctx, ctx->object_proto);
   ctx->dataview_proto = js_new_object(ctx, ctx->object_proto);
@@ -3860,6 +3957,7 @@ void js_ctx_free(js_ctx *ctx)
   gc_remove_root((void **)&ctx->date_proto);
   gc_remove_root((void **)&ctx->regexp_proto);
   gc_remove_root((void **)&ctx->generator_proto);
+  gc_remove_root((void **)&ctx->async_generator_proto);
   gc_remove_root((void **)&ctx->typedarray_proto);
   gc_remove_root((void **)&ctx->arraybuffer_proto);
   gc_remove_root((void **)&ctx->dataview_proto);

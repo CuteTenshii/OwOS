@@ -9232,7 +9232,8 @@ void js_setup_builtins(js_ctx *ctx)
     js_def_native(ctx, sctor, "keyFor", symbol_keyfor, 1);
     ctx->sym_iterator = js_mk_symbol(ctx, "Symbol.iterator");
     js_def(sctor, "iterator", ctx->sym_iterator, 0);
-    js_def(sctor, "asyncIterator", js_mk_symbol(ctx, "Symbol.asyncIterator"), 0);
+    ctx->sym_async_iterator = js_mk_symbol(ctx, "Symbol.asyncIterator");
+    js_def(sctor, "asyncIterator", ctx->sym_async_iterator, 0);
     js_def(sctor, "hasInstance", js_mk_symbol(ctx, "Symbol.hasInstance"), 0);
     js_def(sctor, "toPrimitive", js_mk_symbol(ctx, "Symbol.toPrimitive"), 0);
     ctx->sym_tostringtag = js_mk_symbol(ctx, "Symbol.toStringTag");

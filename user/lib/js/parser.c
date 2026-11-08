@@ -1509,9 +1509,12 @@ static js_node *parse_for(js_parser *p)
   js_node *node;
   int line = p->cur.line, col = p->cur.col;
   js_node *init = NULL;
+  int is_await = 0;
   advance(p); /* 'for' */
-  if (at(p, T_IDENT) && word_is(&p->cur, "await", 5))
-    advance(p); /* `for await` (async iteration) — parsed like for-of */
+  if (at(p, T_IDENT) && word_is(&p->cur, "await", 5)) {
+    advance(p); /* `for await` */
+    is_await = 1;
+  }
   expect(p, T_LPAREN, "expected '(' after 'for'");
 
   if (at(p, T_SEMI)) {
@@ -1525,7 +1528,7 @@ static js_node *parse_for(js_parser *p)
       int of = is_of(p);
       advance(p);
       node = js_node_new(p->arena, JS_FOR_IN, line, col);
-      node->u.forin.of = of;
+      node->u.forin.of = of ? 1 + is_await : 0; /* 2 = for await */
       node->u.forin.left = init;
       node->u.forin.right = of ? parse_assignment(p, 0) : parse_expression(p, 0);
       expect(p, T_RPAREN, "expected ')' after for-header");
@@ -1543,7 +1546,7 @@ static js_node *parse_for(js_parser *p)
         return NULL;
       advance(p);
       node = js_node_new(p->arena, JS_FOR_IN, line, col);
-      node->u.forin.of = of;
+      node->u.forin.of = of ? 1 + is_await : 0; /* 2 = for await */
       node->u.forin.left = left;
       node->u.forin.right = of ? parse_assignment(p, 0) : parse_expression(p, 0);
       expect(p, T_RPAREN, "expected ')' after for-header");

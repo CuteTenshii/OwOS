@@ -335,6 +335,9 @@ static void finalize(void *obj, int kind)
     if (o->kind == OBJ_GENERATOR && o->host) {
       js_generator *g = (js_generator *)o->host;
       gc_scope_drop(&g->parked);
+      for (int i = 0; i < g->nheld; i++)
+        free(*g->held[i]);
+      free(g->held);
       free(g->stack);
       free(g);
     }
@@ -461,7 +464,8 @@ js_object *js_new_function(js_ctx *ctx, js_node *node, js_env *closure)
   o->fn = f;
   /* non-arrow functions get a fresh .prototype object with a back-ref */
   if (node && node->u.func.is_generator) {
-    js_def(o, "prototype", js_obj_value(js_new_object(ctx, ctx->generator_proto)), P_WRITABLE);
+    js_object *base = node->u.func.is_async ? ctx->async_generator_proto : ctx->generator_proto;
+    js_def(o, "prototype", js_obj_value(js_new_object(ctx, base)), P_WRITABLE);
   } else if (!f->is_arrow) {
     js_object *proto = js_new_object(ctx, ctx->object_proto);
     js_def(proto, "constructor", js_obj_value(o), P_WRITABLE | P_CONFIGURABLE);

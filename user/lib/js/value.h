@@ -83,6 +83,8 @@ typedef struct js_generator {
   void *sp, *caller_sp; /* saved stack pointers of the body and of its resumer */
   char *stack;
   gc_stash parked; /* handle scopes of the body while it is suspended    */
+  void ***held;    /* slots of malloc'd blocks the parked body owns (see gen_hold) */
+  int nheld, capheld;
   int stash_nh, stash_ns;
   unsigned char state, mode;
 } js_generator;

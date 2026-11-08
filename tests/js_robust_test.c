@@ -267,6 +267,10 @@ static void check_generators(void)
       "expect(Array.from(o).join('')==='ab', 'generator method as Symbol.iterator');\n"
       "class K { *items(){ yield this.v } constructor(){ this.v = 7 } }\n"
       "expect(new K().items().next().value===7, 'this inside a generator method');\n"
+      "expect([...(function*(){ yield* 'ab' })()].join('')==='ab', 'yield* over a string');\n"
+      "function* sum(a, b){ return a + b }\n"
+      "function* args(){ return sum(yield 1, yield 2) }\n"
+      "var ai = args(); ai.next(); ai.next(5); ai = args(); ai.next(); ai.next(5);\n"
       "var gt = nat(); expect(gt[Symbol.iterator]()===gt && Object.prototype.toString.call(gt)==='[object Generator]',"
       " 'iterator protocol surface');\n",
       0));
@@ -294,6 +298,32 @@ static void check_generators(void)
              "log = []; var o = outer(); o.next(); o.return(); expect(log.join()==='inner,outer', 'return() through "
              "yield*');\n",
              0));
+}
+
+static void check_async_generators(void)
+{
+  expect(run(
+      "var log = [];\n"
+      "async function* ag(){ var x = yield 1; log.push('got ' + x); yield Promise.resolve(2); await null; return 3 }\n"
+      "var it = ag(), p = it.next();\n"
+      "expect(p instanceof Promise && it[Symbol.asyncIterator]()===it, 'next() returns a promise');\n"
+      "p.then(function(r){ log.push(r.value + ':' + r.done) });\n"
+      "it.next('a').then(function(r){ log.push(r.value + ':' + r.done) });\n"
+      "it.next().then(function(r){ log.push(r.value + ':' + r.done) });\n"
+      "it.next().then(function(r){ log.push(r.value + ':' + r.done) });\n"
+      "async function run(){ var seen = [];\n"
+      "  for await (var v of ag()) seen.push(v);\n"
+      "  for await (var w of [Promise.resolve('p'), 'q']) seen.push(w);\n"
+      "  async function* outer(){ yield* ag(); yield* [7, 8] }\n"
+      "  for await (var z of outer()) seen.push(z);\n"
+      "  log.push('seen ' + seen.join()) }\n"
+      "run();\n"
+      "async function* bad(){ yield 1; throw new Error('boom') }\n"
+      "var b = bad(); b.next(); b.next().catch(function(e){ log.push('rej ' + e.message) });\n"
+      "var out = log.join('|');\n"
+      "expect(out==='1:false|got a|2:false|3:true|undefined:true|got undefined|got undefined|seen 1,2,p,q,1,2,7,8|rej "
+      "boom', 'async generator results: ' + out);\n",
+      0));
 }
 
 static void check_generator_gc(void)
@@ -334,6 +364,7 @@ int main(void)
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);
   test("parser honours the stack floor", check_parser_stack_floor);
   test("generators", check_generators);
+  test("async generators and for await", check_async_generators);
   test("generator state survives collection", check_generator_gc);
   test("generator bodies are stack-guarded", check_generator_stack_guard);
   return 0;

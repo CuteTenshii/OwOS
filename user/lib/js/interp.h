@@ -46,16 +46,17 @@ struct js_ctx {
 
   js_object *object_proto, *function_proto, *array_proto, *string_proto, *number_proto, *boolean_proto, *error_proto,
       *promise_proto, *symbol_proto, *bigint_proto, *map_proto, *set_proto, *weakmap_proto, *weakset_proto, *date_proto,
-      *regexp_proto, *generator_proto;
-  js_value sym_iterator;    /* the well-known Symbol.iterator                 */
-  js_value sym_tostringtag; /* the well-known Symbol.toStringTag              */
-  js_object *sym_registry;  /* array of every Symbol created, so
-                             * Object.getOwnPropertySymbols can recover the
-                             * symbol object behind a property's internal key */
-  js_object *sym_for_reg;   /* the GlobalSymbolRegistry (Symbol.for/keyFor):
-                             * a string-key -> Symbol map, shared and not
-                             * bound to `this` (the methods are often called
-                             * detached, e.g. `var f = Symbol.for; f(x)`)     */
+      *regexp_proto, *generator_proto, *async_generator_proto;
+  js_value sym_iterator;       /* the well-known Symbol.iterator                 */
+  js_value sym_tostringtag;    /* the well-known Symbol.toStringTag              */
+  js_value sym_async_iterator; /* the well-known Symbol.asyncIterator          */
+  js_object *sym_registry;     /* array of every Symbol created, so
+                                * Object.getOwnPropertySymbols can recover the
+                                * symbol object behind a property's internal key */
+  js_object *sym_for_reg;      /* the GlobalSymbolRegistry (Symbol.for/keyFor):
+                                * a string-key -> Symbol map, shared and not
+                                * bound to `this` (the methods are often called
+                                * detached, e.g. `var f = Symbol.for; f(x)`)     */
   /* typed arrays: the shared %TypedArray%.prototype, the per-view prototypes
    * (indexed by TA_*), plus ArrayBuffer/DataView prototypes. */
   js_object *typedarray_proto, *arraybuffer_proto, *dataview_proto;
