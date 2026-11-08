@@ -329,12 +329,17 @@ static int flex_clamp_main(const struct lbox *it, int v, int cont_w)
   return v;
 }
 
+/* position:fixed boxes leave the flow and are laid out into the overlay table */
+static bool out_of_flow(const struct lbox *b) { return b->pos == CSS_POS_FIXED; }
+
 /* Number of direct child boxes of box `idx`, and (when items != NULL) their indices. */
 static int box_children(const struct lbox *bx, int idx, int *items)
 {
   int n = 0;
   for (int j = idx + 1; j < bx[idx].end;) {
-    if (bx[j].parent == idx) {
+    if (bx[j].parent == idx && out_of_flow(&bx[j])) {
+      j = bx[j].end;
+    } else if (bx[j].parent == idx) {
       if (items)
         items[n] = j;
       n++;
@@ -836,7 +841,8 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
         continue;
       } /* not a direct child */
       flow_slice(pos, bx[j].t0, content_x, content_w); /* inline text before it */
-      flow_box(bx, j, content_x, content_w);
+      if (!out_of_flow(&bx[j]))
+        flow_box(bx, j, content_x, content_w);
       pos = bx[j].t1;
       j = bx[j].end; /* skip its descendants */
     }
@@ -863,6 +869,67 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   g->ch = content_bot_y - content_top_y;
 }
 
+/* Lay out every position:fixed box into the overlay table, stacked; the page flow never sees them. */
+static void layout_overlays(int paw)
+{
+  struct layout_out *o = g_bk;
+  int n;
+  struct lbox *bx = layout_pool(&n);
+  bool any = false;
+  o->n_ov = 0;
+  o->ovlt.n = 0;
+  o->n_ovfs = 0;
+  for (int i = 0; i < n && !any; i++)
+    any = out_of_flow(&bx[i]);
+  if (!any || o->n_geo != n)
+    return;
+
+  struct ltab page_lt = o->lt;
+  struct fslice *page_fs = o->fs;
+  int page_n_fs = o->n_fs, page_cap_fs = o->cap_fs, page_n_med = o->n_med;
+  o->lt = o->ovlt;
+  o->fs = o->ovfs;
+  o->n_fs = 0;
+  o->cap_fs = o->cap_ovfs;
+
+  for (int i = 0; i < n && o->n_ov < OVL_MAX; i++) {
+    struct lbox *b = &bx[i];
+    if (!out_of_flow(b))
+      continue;
+    struct lovl rec = {i, o->lt.n, 0, lt_doc_px(&o->lt), 0, false};
+    int saved_w = b->spec_w, saved_t = b->off_t, saved_b = b->off_b;
+    int frame = b->border.l + b->border.r + b->padding.l + b->padding.r;
+    if (b->kind == LB_BLOCK && b->spec_w < 0 && b->pct_w < 0 && !(b->off_l >= 0 && b->off_r >= 0))
+      b->spec_w = slice_maxcontent(b->t0, b->t1) + (b->border_box ? frame : 0); /* shrink to fit */
+    b->off_t = b->off_b = -1;                                                   /* placed vertically at paint time */
+    flow_box(bx, i, 4, paw);
+    b->spec_w = saved_w;
+    b->off_t = saved_t;
+    b->off_b = saved_b;
+    rec.row1 = o->lt.n;
+    rec.h = o->geo[i].h;
+    rec.modal = b->node && dom_get_attr(b->node, "dialog-modal");
+    for (int q = 0; q < o->n_img; q++) /* overlay images are not painted */
+      if (o->img_pos[q] >= b->t0 && o->img_pos[q] < b->t1)
+        o->img_row[q] = -1;
+    struct lovl *np = grow_arr(o->ov, &o->cap_ov, o->n_ov + 1, sizeof *np);
+    if (!np)
+      break;
+    o->ov = np;
+    o->ov[o->n_ov++] = rec;
+  }
+
+  o->n_med = page_n_med;
+  o->ovlt = o->lt;
+  o->ovfs = o->fs;
+  o->n_ovfs = o->n_fs;
+  o->cap_ovfs = o->cap_fs;
+  o->lt = page_lt;
+  o->fs = page_fs;
+  o->n_fs = page_n_fs;
+  o->cap_fs = page_cap_fs;
+}
+
 /* Lay out the whole box tree, flowing stray text full width. */
 static void layout_flow(int paw)
 {
@@ -875,11 +942,13 @@ static void layout_flow(int paw)
       continue;
     }
     flow_slice(pos, bx[j].t0, 4, paw);
-    flow_box(bx, j, 4, paw);
+    if (!out_of_flow(&bx[j]))
+      flow_box(bx, j, 4, paw);
     pos = bx[j].t1;
     j = bx[j].end;
   }
   flow_slice(pos, B->pg->text_len, 4, paw);
+  layout_overlays(paw);
 }
 
 /* Hash of every layout input, so paint-only animation frames can reuse the layout. */
@@ -1021,6 +1090,7 @@ void rewrap(int paw)
   struct lbox *bx = layout_pool(&nb);
   o->lt.n = 0;
   o->n_fs = 0;
+  o->n_ov = 0;
   o->n_med = 0;
   o->n_geo = 0;
   o->n_img = 0;

@@ -415,6 +415,8 @@ static void walk_element_inner(struct dom_node *el)
     W_liststyle = cs.list_style;
 
   int blk = (cs.disp == CSS_DISP_BLOCK) ? 1 : (cs.disp == CSS_DISP_INLINE) ? 0 : is_block_tag(name);
+  if (cs.pos == CSS_POS_FIXED)
+    blk = 1; /* a fixed box is blockified so it gets a layout box */
 
   if (blk)
     block_break();

@@ -31,9 +31,25 @@ struct lmedia {
   int row, rows;
 };
 
+/* A position:fixed / top-layer box laid out out of flow: its lines live in layout_out.ovlt */
+struct lovl {
+  int box;       /* index into the box pool */
+  int row0, row1; /* its line range in ovlt */
+  int y0;        /* ovlt pixel top of the range */
+  int h;         /* border-box height */
+  bool modal;    /* a modal dialog: dims and blocks the page */
+};
+
+#define OVL_MAX 32
+
 /* One complete layout result */
 struct layout_out {
   struct ltab lt;
+  struct ltab ovlt;    /* the lines of every overlay, stacked */
+  struct fslice *ovfs; /* flex/grid item text of the overlays */
+  int n_ovfs, cap_ovfs;
+  struct lovl *ov;
+  int n_ov, cap_ov;
   struct fslice *fs; /* flex/grid item text over reserved bands */
   int n_fs, cap_fs;
   struct lgeom *geo; /* per-box geometry, indexed like the box pool */
@@ -164,6 +180,9 @@ void draw_alt_box(struct inl_img *im, int py, int ct, int cb);
 int draw_slice_core(int x, int y, int off, int len, int paw, int ct, int cb, int line_h, int maxpx);
 void draw_styled_line(int x, int y, int idx, int paw, int ct, int cb);
 void paint_boxes(int py, int pw, int ct, int cb);
+int overlay_order(const struct layout_out *o, int *order); /* overlay indices, bottom to top */
+int overlay_place(const struct lovl *ov, int phh, int *h); /* pane-relative border-box top and drawn height */
+void paint_overlay_boxes(const struct lovl *ov, int py, int pw, int ct, int cb, int top, int h);
 void draw_dt_highlight(int x, int y, int w, int h, int clip_top, int clip_bot, int clip_right, const char *label);
 extern struct rect crash_reload_rect;
 void draw_crash_page(int py, int pw, int phh);

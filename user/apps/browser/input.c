@@ -65,11 +65,11 @@ static unsigned hov_seq;
 static int hov_row = -1, hov_link = -1, hov_lo, hov_hi;
 
 /* Line-relative x where display line `row`'s glyphs begin */
-static int line_content_x(int row)
+static int line_content_x(const struct ltab *t, int row)
 {
-  int len = g_fr->lt.len[row], base = g_fr->lt.off[row];
+  int len = t->len[row], base = t->off[row];
   set_block(&g_ui, base);
-  int x = g_fr->lt.x[row] + g_ui.bindent * INDENT_PX;
+  int x = t->x[row] + g_ui.bindent * INDENT_PX;
   if (g_ui.bcenter == 1 || g_ui.bcenter == 2) {
     int lw = 0;
     unsigned cp;
@@ -78,11 +78,77 @@ static int line_content_x(int row)
       p += utf8_decode(&B->pg->text[p], &B->pg->text[base + len], &cp);
       lw += body_cp_adv(&g_ui, cp, glyph_px(gp));
     }
-    int room = (g_fr->lt.w[row] - g_ui.bindent * INDENT_PX) - lw;
+    int room = (t->w[row] - g_ui.bindent * INDENT_PX) - lw;
     if (room > 0)
       x += g_ui.bcenter == 1 ? room / 2 : room;
   }
   return x;
+}
+
+/* Byte column of the glyph under `mx` in the run [base,base+len) starting at pixel `x`, or -1 */
+static int glyph_col(int x, int base, int len, int mx)
+{
+  for (int k = 0; mx >= x && k < len;) {
+    unsigned cp;
+    int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
+    int cw = body_cp_adv(&g_ui, cp, glyph_px(base + k));
+    if (mx < x + cw)
+      return k;
+    x += cw;
+    k += nb;
+  }
+  return -1;
+}
+
+/* A hit on a position:fixed / top-layer box: sets *off to the glyph under (mx,my) or -1, true if
+ * the overlay takes the click (text, a painted box, or a modal's backdrop). */
+static bool overlay_hit(int mx, int my, int py, int phh, int *off)
+{
+  const struct layout_out *o = g_fr;
+  int n, order[OVL_MAX];
+  const struct lbox *bx = layout_pool(&n);
+  bool modal = false;
+  if (!o->n_ov || n != o->n_geo)
+    return false;
+  overlay_order(o, order);
+  for (int q = o->n_ov - 1; q >= 0; q--) {
+    const struct lovl *ov = &o->ov[order[q]];
+    const struct lbox *b = &bx[ov->box];
+    const struct lgeom *g = &o->geo[ov->box];
+    int h, top = overlay_place(ov, phh, &h);
+    int shift = py + top - g->y;
+    const struct ltab *t = &o->ovlt;
+    for (int i = ov->row0; i < ov->row1; i++) {
+      int sy = shift + t->y[i];
+      if (t->len[i] == 0 || my < sy || my >= sy + t->h[i])
+        continue;
+      int col = glyph_col(line_content_x(t, i), t->off[i], t->len[i], mx);
+      if (col >= 0) {
+        *off = t->off[i] + col;
+        return true;
+      }
+    }
+    for (int s = 0; s < o->n_ovfs; s++) {
+      const struct fslice *f = &o->ovfs[s];
+      if (f->row < ov->row0 || f->row >= ov->row1 || my < shift + t->y[f->row] || my >= shift + t->y[f->row] + f->h)
+        continue;
+      set_block(&g_ui, f->off);
+      int col = glyph_col(f->x + g_ui.bindent * INDENT_PX, f->off, f->len, mx);
+      if (col >= 0) {
+        *off = f->off + col;
+        return true;
+      }
+    }
+    bool painted = b->bg != BG_NONE || (b->border_color != BG_NONE && b->border.t);
+    if (painted && mx >= g->x && mx < g->x + g->w && my >= py + top && my < py + top + h) {
+      *off = -1;
+      return true;
+    }
+    modal |= ov->modal;
+  }
+  if (modal)
+    *off = -1;
+  return modal;
 }
 
 /* Resolve a content-pane hit at client coords (mx,my) */
@@ -99,27 +165,16 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
   if (my < py || my >= py + phh || mx < 0 || mx >= right - SCROLL_W)
     return; /* outside the content pane: skip the lock */
   browser_buf_lock();
+  bool ov_hit = overlay_hit(mx, my, py, phh, off);
   int row = lt_line_at(&g_fr->lt, B->pg->scroll + (my - py));
-  if (row >= 0 && row < g_fr->lt.n) {
+  if (!ov_hit && row >= 0 && row < g_fr->lt.n) {
     /* proportional */
-    int len = g_fr->lt.len[row], base = g_fr->lt.off[row], col = -1;
-    int x = line_content_x(row);
-    for (int k = 0; mx >= x && k < len;) {
-      unsigned cp;
-      int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);
-      int cw = body_cp_adv(&g_ui, cp, glyph_px(base + k));
-      if (mx < x + cw) {
-        col = k;
-        break;
-      }
-      x += cw;
-      k += nb;
-    }
+    int col = glyph_col(line_content_x(&g_fr->lt, row), g_fr->lt.off[row], g_fr->lt.len[row], mx);
     if (col >= 0)
-      *off = base + col;
+      *off = g_fr->lt.off[row] + col;
   }
   /* An inline image */
-  if (*off < 0) {
+  if (*off < 0 && !ov_hit) {
     for (int i = 0; i < B->pg->n_imgs; i++) {
       struct inl_img *im = &B->pg->imgs[i];
       if (im->start_row < 0)
@@ -189,8 +244,8 @@ static void pane_linecol(int mx, int my, int *line, int *col)
       row = g_fr->lt.n - 1;
     *line = row;
     int len = g_fr->lt.len[row], base = g_fr->lt.off[row];
-    int x = line_content_x(row); /* match draw_styled_line */
-    int c = len;                 /* default: end of line */
+    int x = line_content_x(&g_fr->lt, row); /* match draw_styled_line */
+    int c = len;                            /* default: end of line */
     for (int k = 0; k < len;) {
       unsigned cp;
       int nb = utf8_decode(&B->pg->text[base + k], &B->pg->text[base + len], &cp);

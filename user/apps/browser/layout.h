@@ -32,9 +32,10 @@ struct lbox {
   signed char border_style[4];
   unsigned border_side_color[4];
   unsigned char ml_auto, mr_auto; /* left/right margin was `auto` (centring) */
-  unsigned border_color;          /* 0xRRGGBB, or BG_NONE = none */
-  unsigned bg;                    /* 0xRRGGBB, or BG_NONE = none */
-  struct css_bg_image bgi;        /* background image/gradient layer (kind<=0 = none) */
+  unsigned char vcenter;   /* position:fixed with auto top/bottom margins and no top/bottom: centred vertically */
+  unsigned border_color;   /* 0xRRGGBB, or BG_NONE = none */
+  unsigned bg;             /* 0xRRGGBB, or BG_NONE = none */
+  struct css_bg_image bgi; /* background image/gradient layer (kind<=0 = none) */
   unsigned char border_box;
   int radius;                             /* border-radius px (0 = square corners) */
   short sh_dx, sh_dy, sh_blur, sh_spread; /* box-shadow geometry, px */

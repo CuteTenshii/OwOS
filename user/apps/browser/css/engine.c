@@ -740,6 +740,10 @@ void css_apply_attrs(const struct dom_node *el, struct css_style *out)
       out->border_style[i] = CSS_BST_SOLID;
     }
     out->border_color = 0;
+    if ((dialog && dom_get_attr(el, "open") && dom_get_attr(el, "dialog-modal")) || dom_get_attr(el, "popover-open")) {
+      out->pos = CSS_POS_FIXED; /* top layer: centred in the viewport */
+      out->margin[0] = out->margin[2] = -2;
+    }
   }
   const char *c = dom_get_attr(el, "color");
   if (c) {

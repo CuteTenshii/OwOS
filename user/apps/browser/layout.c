@@ -88,6 +88,8 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
   b->margin = edge4(cs->margin);                     /* auto (-2) folds to 0; the auto flags drive centring */
   b->ml_auto = (unsigned char)(cs->margin[3] == -2); /* margin[] is T,R,B,L */
   b->mr_auto = (unsigned char)(cs->margin[1] == -2);
+  b->vcenter = (unsigned char)(cs->pos == CSS_POS_FIXED && cs->top < 0 && cs->bottom < 0 && cs->margin[0] == -2 &&
+                               cs->margin[2] == -2);
   short border_w[4];
   for (int i = 0; i < 4; i++) {
     b->border_style[i] = cs->border_style[i];

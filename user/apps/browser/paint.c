@@ -480,6 +480,71 @@ static void paint_one_box(const struct lbox *b, const struct lgeom *ge, int py, 
   }
 }
 
+/* True if box `i` belongs to an out-of-flow overlay (painted separately) */
+static bool in_overlay(const struct layout_out *o, const struct lbox *bx, int i)
+{
+  for (int k = 0; k < o->n_ov; k++)
+    if (i >= o->ov[k].box && i < bx[o->ov[k].box].end)
+      return true;
+  return false;
+}
+
+/* Overlay indices sorted bottom to top by z-index, then document order */
+int overlay_order(const struct layout_out *o, int *order)
+{
+  int n;
+  const struct lbox *bx = layout_pool(&n);
+  for (int k = 0; k < o->n_ov; k++) {
+    int z = bx[o->ov[k].box].z_index == CSS_Z_AUTO ? 0 : bx[o->ov[k].box].z_index, j = k;
+    while (j > 0 && (bx[o->ov[order[j - 1]].box].z_index == CSS_Z_AUTO ? 0 : bx[o->ov[order[j - 1]].box].z_index) > z) {
+      order[j] = order[j - 1];
+      j--;
+    }
+    order[j] = k;
+  }
+  return o->n_ov;
+}
+
+/* Pane-relative top of an overlay's border box in a pane `phh` tall, and the height to draw */
+int overlay_place(const struct lovl *ov, int phh, int *h)
+{
+  int n;
+  const struct lbox *b = &layout_pool(&n)[ov->box];
+  int hh = ov->h, top = 0;
+  if (b->off_t >= 0 && b->off_b >= 0 && b->spec_h < 0 && b->pct_h < 0) { /* top+bottom: stretch */
+    if (phh - b->off_t - b->off_b > hh)
+      hh = phh - b->off_t - b->off_b;
+    top = b->off_t;
+  } else if (b->off_t >= 0) {
+    top = b->off_t;
+  } else if (b->off_b >= 0) {
+    top = phh - b->off_b - hh;
+  } else if (b->vcenter) {
+    top = (phh - hh) / 2;
+  }
+  if (top < 0 && b->vcenter)
+    top = 0;
+  *h = hh;
+  return top;
+}
+
+/* Paint one overlay's box backgrounds and borders, its border box at pane-relative `top`, `h` tall */
+void paint_overlay_boxes(const struct lovl *ov, int py, int pw, int ct, int cb, int top, int h)
+{
+  const struct layout_out *o = g_fr;
+  int n;
+  const struct lbox *bx = layout_pool(&n);
+  if (n != o->n_geo)
+    return;
+  int shift = py + top - o->geo[ov->box].y; /* overlay-table y -> screen y */
+  for (int i = ov->box; i < bx[ov->box].end; i++) {
+    struct lgeom g = o->geo[i];
+    if (i == ov->box)
+      g.h = h;
+    paint_one_box(&bx[i], &g, shift, pw, ct, cb, 0);
+  }
+}
+
 /* Paint every box that touches the band [ct,cb) */
 void paint_boxes(int py, int pw, int ct, int cb)
 {
@@ -495,6 +560,8 @@ void paint_boxes(int py, int pw, int ct, int cb)
     ru_bands_span(&o->bands, band, vtop, vbot, &lo, &hi);
     for (int p = lo; p < hi; p++) {
       int i = o->bands.idx[p];
+      if (o->n_ov && in_overlay(o, bx, i))
+        continue;
       int top, bot;
       box_extent(&bx[i], &o->geo[i], &top, &bot);
       if (bot <= vtop || top >= vbot)

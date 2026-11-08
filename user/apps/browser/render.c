@@ -28,6 +28,62 @@ static void draw_hover_status(void)
   gfx_ui_text(6, by + 3, shown, 0xe8eaee);
 }
 
+/* Darken the pane rect behind a modal dialog */
+static void dim_rect(int x, int y, int w, int h, int ct, int cb)
+{
+  unsigned *fb = browser_surface();
+  if (y < ct) {
+    h -= ct - y;
+    y = ct;
+  }
+  if (y + h > cb)
+    h = cb - y;
+  for (int yy = y; yy < y + h; yy++)
+    for (int xx = x; xx < x + w; xx++) {
+      unsigned p = fb[(unsigned long)yy * BW + xx];
+      fb[(unsigned long)yy * BW + xx] =
+          ((((p & 0xff00ff) * 102) >> 8) & 0xff00ff) | ((((p & 0xff00) * 102) >> 8) & 0xff00);
+    }
+}
+
+/* Paint the position:fixed / top-layer boxes over the page, bottom to top */
+static void paint_overlays(int py, int pw, int ct, int cb)
+{
+  const struct layout_out *o = g_fr;
+  int n, order[OVL_MAX], pane_y, phh, rows;
+  if (!o->n_ov)
+    return;
+  layout_pool(&n);
+  if (n != o->n_geo)
+    return;
+  pane_metrics(&pane_y, &phh, &rows);
+  overlay_order(o, order);
+  for (int q = 0; q < o->n_ov; q++) {
+    const struct lovl *ov = &o->ov[order[q]];
+    int h, top = overlay_place(ov, phh, &h);
+    if (ov->modal)
+      dim_rect(0, py, pw, phh, ct, cb);
+    paint_overlay_boxes(ov, py, pw, ct, cb, top, h);
+    int shift = py + top - o->geo[ov->box].y;
+    const struct ltab *t = &o->ovlt;
+    for (int i = ov->row0; i < ov->row1; i++) {
+      int sy = shift + t->y[i];
+      if (sy + t->h[i] + o->over <= ct || sy >= cb || t->off[i] + t->len[i] > B->pg->text_len)
+        continue;
+      draw_slice_core(t->x[i], sy, t->off[i], t->len[i], t->w[i], ct, cb, t->h[i], t->px[i]);
+    }
+    for (int s = 0; s < o->n_ovfs; s++) {
+      const struct fslice *f = &o->ovfs[s];
+      if (f->row < ov->row0 || f->row >= ov->row1 || f->off + f->len > B->pg->text_len)
+        continue;
+      int sy = shift + t->y[f->row];
+      if (sy + t->h[f->row] + o->over <= ct || sy >= cb)
+        continue;
+      draw_slice_core(f->x, sy, f->off, f->len, f->w, ct, cb, f->h, f->maxpx);
+    }
+  }
+}
+
 /* Paint the page (box backgrounds, text, images, media) for the content-pane rows [ct,cb) */
 static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
 {
@@ -103,6 +159,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
       continue; /* off-screen */
     media_el_draw(me, 4, py + t->y[sr] - sc, paw, ct, cb);
   }
+  paint_overlays(py, pw, ct, cb);
   gfx_clip_none();
 }
 
