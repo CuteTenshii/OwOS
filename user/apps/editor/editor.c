@@ -769,7 +769,7 @@ int main(int argc, char **argv)
 {
   ed_clear();
   set_status("new file");
-  int id = win_create(W, H, "edit");
+  int id = win_create(W, H, "Editor");
   if (id < 0) {
     puts("editor: win_create failed\n");
     return 1;

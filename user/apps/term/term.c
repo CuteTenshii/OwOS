@@ -421,7 +421,7 @@ static void on_resize(int w, int h)
 
 int main(void)
 {
-  win = win_create(720, 432, "terminal");
+  win = win_create(720, 432, "Terminal");
   if (win < 0) {
     puts("term: no window\n");
     return 1;

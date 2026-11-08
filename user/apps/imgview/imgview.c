@@ -570,7 +570,7 @@ static void load(const char *path)
     scopy(curpath, path, sizeof curpath); /* set, so the UI says which file */
     decode_to_canvas();
     set_status("not a readable image");
-    win_settitle(wid, "imgview");
+    win_settitle(wid, "Image Viewer");
     return;
   }
   scopy(curpath, path, sizeof curpath);
@@ -879,7 +879,7 @@ int main(int argc, char **argv)
   W = cw;
   H = MENU_H + ch + STATUS_H;
 
-  wid = win_create(W, H, "imgview");
+  wid = win_create(W, H, "Image Viewer");
   if (wid < 0) {
     puts("imgview: could not open a window\n");
     return 1;

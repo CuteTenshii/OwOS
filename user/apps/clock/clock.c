@@ -14,7 +14,7 @@ static void put2(char *p, int v)
 
 int main(void)
 {
-  int id = win_create(W, H, "clock");
+  int id = win_create(W, H, "Clock");
   if (id < 0) {
     puts("clock: no window\n");
     return 1;

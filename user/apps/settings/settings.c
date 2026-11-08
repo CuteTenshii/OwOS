@@ -121,7 +121,7 @@ static void key(int k)
 
 int main(void)
 {
-  int id = win_create(W, H, "settings");
+  int id = win_create(W, H, "Settings");
   if (id < 0) {
     puts("settings: no window\n");
     return 1;

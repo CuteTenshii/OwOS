@@ -1114,7 +1114,7 @@ static void key(int id, int k)
 
 int main(void)
 {
-  int id = win_create(W, H, "files");
+  int id = win_create(W, H, "Files");
   if (id < 0) {
     puts("files: no window\n");
     return 1;

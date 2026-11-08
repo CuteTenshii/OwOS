@@ -8,7 +8,7 @@
 
 int main(void)
 {
-  int id = win_create(W, H, "about");
+  int id = win_create(W, H, "About");
   if (id < 0) {
     puts("about: no window\n");
     return 1;

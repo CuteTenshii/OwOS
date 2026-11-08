@@ -76,7 +76,7 @@ int main(int argc, char **argv)
 {
   const char *start = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : 0;
   B->pg = &tabs[active_tab].page; /* point at the first tab's page */
-  int id = win_create(BW, BH, "browser");
+  int id = win_create(BW, BH, "Browser");
   if (id < 0) {
     puts("browser: no window\n");
     return 1;

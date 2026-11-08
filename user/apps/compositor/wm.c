@@ -309,13 +309,30 @@ int titlebtn_hit(const struct winrec *w, int mx, int my)
 }
 
 /* taskbar layout */
+static int tbstack[WM_LIST_MAX];
+static int ntb;
 static int taskbar_layout(int left, int right, int *idxs, int *bxs, int *bws, int max)
 {
   int n = 0;
-  /* One button per top-level window */
-  for (int i = 0; i < nwin && n < max; i++)
-    if (parent_id_of(cur[i].id) < 0)
-      idxs[n++] = i;
+  for (int i = 0; i < ntb;) {
+    if (slot_of(tbstack[i]) < 0) {
+      memmove(&tbstack[i], &tbstack[i + 1], (unsigned)(ntb - i - 1) * sizeof tbstack[0]);
+      ntb--;
+    } else
+      i++;
+  }
+  for (int i = 0; i < nwin && ntb < WM_LIST_MAX; i++) {
+    int id = cur[i].id;
+    bool known = false;
+    for (int k = 0; k < ntb && !known; k++)
+      known = tbstack[k] == id;
+    if (!known)
+      tbstack[ntb++] = id;
+  }
+  /* One button per top-level window, in creation order so focus changes don't reshuffle them */
+  for (int k = 0; k < ntb && n < max; k++)
+    if (parent_id_of(tbstack[k]) < 0)
+      idxs[n++] = slot_of(tbstack[k]);
   if (n == 0)
     return 0;
   int avail = right - left;

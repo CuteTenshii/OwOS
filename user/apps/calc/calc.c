@@ -316,7 +316,7 @@ static void draw(int hover)
 
 int main(void)
 {
-  int id = win_create(W, H, "calc");
+  int id = win_create(W, H, "Calculator");
   if (id < 0) {
     puts("calc: no window\n");
     return 1;
