@@ -235,11 +235,23 @@ static void check_wide_typed_arrays(void)
       0));
 }
 
+static void check_promise_gc(void)
+{
+  gc_set_threshold(1);
+  expect(run("var n=0, p=Promise.resolve(0);\n"
+             "for(var i=0;i<300;i++){ p=p.then(function(v){ return v+1 }); new Promise(function(res){ res(p) "
+             "}).then(function(){ n++ }) }\n"
+             "expect(n===300, 'reactions survive a collection on every allocation');\n",
+             0));
+  gc_set_threshold(1 << 20);
+}
+
 int main(void)
 {
   test("regexp matches whole code points, not bytes", check_regexp_code_points);
   test("regexp compile and match are bounded by the stack", check_regexp_bounded);
   test("Object.defineProperty on array elements", check_define_property);
+  test("promise reaction objects survive collection", check_promise_gc);
   test("JSON.stringify", check_json_stringify);
   test("DataView BigInt64 and Float16", check_dataview);
   test("BigInt64Array, BigUint64Array and Float16Array", check_wide_typed_arrays);

@@ -6202,9 +6202,11 @@ static void prom_resolve(js_ctx *ctx, js_object *p, js_value v)
       prom_settle(ctx, p, 2, prom_value(vp));
     else {
       js_value a[2];
-      a[0] = js_obj_value(resolver(ctx, prom_res_fn, p));
-      a[1] = js_obj_value(resolver(ctx, prom_rej_fn, p));
+      gc_push_scope();
+      a[0] = js_obj_value(gc_keep(resolver(ctx, prom_res_fn, p)));
+      a[1] = js_obj_value(gc_keep(resolver(ctx, prom_rej_fn, p)));
       promise_then(ctx, v, a, 2);
+      gc_pop_scope();
     }
     return;
   }
@@ -6215,8 +6217,8 @@ static void prom_resolve(js_ctx *ctx, js_object *p, js_value v)
       gc_push_scope();
       gc_keep(p);
       KEEP(v);
-      a[0] = js_obj_value(resolver(ctx, prom_res_fn, p));
-      a[1] = js_obj_value(resolver(ctx, prom_rej_fn, p));
+      a[0] = js_obj_value(gc_keep(resolver(ctx, prom_res_fn, p)));
+      a[1] = js_obj_value(gc_keep(resolver(ctx, prom_rej_fn, p)));
       js_call(ctx, then, v, a, 2);
       if (ctx->has_exc) {
         js_value e = ctx->exc;
@@ -6241,8 +6243,8 @@ static js_value promise_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
   p = (js_object *)gc_keep(new_promise(ctx));
   {
     js_value ea[2];
-    ea[0] = js_obj_value(resolver(ctx, prom_res_fn, p));
-    ea[1] = js_obj_value(resolver(ctx, prom_rej_fn, p));
+    ea[0] = js_obj_value(gc_keep(resolver(ctx, prom_res_fn, p)));
+    ea[1] = js_obj_value(gc_keep(resolver(ctx, prom_rej_fn, p)));
     js_call(ctx, exec, js_undef(), ea, 2);
     if (ctx->has_exc) {
       js_value e = ctx->exc;
@@ -6267,9 +6269,9 @@ static js_value promise_then(js_ctx *ctx, js_value thisv, js_value *a, int n)
   KEEP(onR);
   child = (js_object *)gc_keep(new_promise(ctx));
   {
-    js_object *cres = resolver(ctx, prom_res_fn, child), *crej = resolver(ctx, prom_rej_fn, child);
-    js_object *reaction = js_new_array(ctx, 0);
-    gc_keep(reaction);
+    js_object *cres = (js_object *)gc_keep(resolver(ctx, prom_res_fn, child));
+    js_object *crej = (js_object *)gc_keep(resolver(ctx, prom_rej_fn, child));
+    js_object *reaction = (js_object *)gc_keep(js_new_array(ctx, 0));
     js_array_push(ctx, reaction, onF);
     js_array_push(ctx, reaction, onR);
     js_array_push(ctx, reaction, js_obj_value(cres));
