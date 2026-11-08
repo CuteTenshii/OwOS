@@ -27,6 +27,7 @@
 #include "sysfs.h"
 #include "battery.h"
 #include "blk.h"
+#include "bt.h"
 #include "edid.h"
 #include "fb.h"
 #include "firmware.h"
@@ -311,7 +312,8 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
   if (eq(seg[0], "class")) {
     if (n == 2)
       return (eq(seg[1], "input") || eq(seg[1], "net") || eq(seg[1], "block") || eq(seg[1], "graphics") ||
-              eq(seg[1], "dmi") || (eq(seg[1], "sound") && sound_present()))
+              eq(seg[1], "dmi") || (eq(seg[1], "sound") && sound_present()) ||
+              (eq(seg[1], "bluetooth") && bt_present()))
                  ? S_DIR
                  : S_NONE;
     if (eq(seg[1], "input")) {
@@ -362,6 +364,19 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
         return eq(seg[2], "id") ? S_DIR : S_NONE;
       if (n == 4 && eq(seg[2], "id") && (eq(seg[3], "product_name") || eq(seg[3], "sys_vendor")))
         return S_FILE_RO;
+      return S_NONE;
+    }
+    if (eq(seg[1], "bluetooth")) {
+      if (!bt_present())
+        return S_NONE;
+      if (n == 3)
+        return eq(seg[2], "hci0") ? S_DIR : S_NONE;
+      if (n == 4 && eq(seg[2], "hci0")) {
+        if (eq(seg[3], "control"))
+          return S_FILE_RW;
+        if (eq(seg[3], "status") || eq(seg[3], "devices") || eq(seg[3], "gatt"))
+          return S_FILE_RO;
+      }
       return S_NONE;
     }
     if (eq(seg[1], "sound")) {
@@ -570,6 +585,16 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         return;
       }
     }
+    if (eq(seg[1], "bluetooth")) {
+      int room = (int)(b->end - b->p);
+      if (eq(seg[3], "status"))
+        b->p += bt_status_text(b->p, room);
+      else if (eq(seg[3], "devices"))
+        b->p += bt_devices_text(b->p, room);
+      else if (eq(seg[3], "gatt"))
+        b->p += bt_gatt_text(b->p, room);
+      return;
+    }
     if (eq(seg[1], "sound")) {
       char nm[24];
       if (eq(seg[3], "volume")) { /* 0..100 */
@@ -671,6 +696,8 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
       return 0;
     }
   }
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "bluetooth") && eq(seg[2], "hci0") && eq(seg[3], "control"))
+    return bt_command(arg) == 0 ? 0 : -1;
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0") && eq(seg[3], "output")) {
     /* Accept an index ("1") or a name ("Headphones"). */
     int idx = -1;
@@ -770,7 +797,7 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
   if (n == 1 && eq(seg[0], "class")) {
     /* input + graphics always; net/block only when present (so an empty dir
      * doesn't show). fb0 exists even in text mode, like /proc/display did. */
-    const char *kids[6];
+    const char *kids[7];
     int k = 0;
     kids[k++] = "input";
     if (nic_present())
@@ -781,6 +808,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     kids[k++] = "graphics";
     if (sound_present())
       kids[k++] = "sound";
+    if (bt_present())
+      kids[k++] = "bluetooth";
     kids[k++] = "dmi";
     hit = from_list(idx, name, max, kids, k);
     if (hit && is_dir)
@@ -847,6 +876,21 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     if (is_dir)
       *is_dir = 1;
     return 1;
+  }
+  if (n == 2 && eq(seg[0], "class") && eq(seg[1], "bluetooth")) {
+    if (!bt_present() || idx != 0)
+      return 0;
+    cpy(name, "hci0", max);
+    if (is_dir)
+      *is_dir = 1;
+    return 1;
+  }
+  if (n == 3 && eq(seg[0], "class") && eq(seg[1], "bluetooth") && eq(seg[2], "hci0")) {
+    static const char *const k[] = {"status", "devices", "gatt", "control"};
+    hit = from_list(idx, name, max, k, 4);
+    if (hit && is_dir)
+      *is_dir = 0;
+    return hit;
   }
   if (n == 2 && eq(seg[0], "class") && eq(seg[1], "sound")) {
     if (!sound_present() || idx != 0)

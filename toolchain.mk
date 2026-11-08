@@ -93,7 +93,7 @@ endif
 #                                       byte mem* into self-calls and the compositor's
 #                                       dword copies into a slow byte memcpy.
 # DRVDIRS: each driver subdir on -I so the flat #include "foo.h" convention resolves.
-DRVDIRS := storage net audio usb input video acpi bus
+DRVDIRS := storage net audio usb input video acpi bus bt
 CFLAGS  := $(ARCHFLAGS) -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
            -O$(OPT_LEVEL) -fno-strict-aliasing -fno-tree-loop-distribute-patterns \
            -mno-sse -mno-mmx -Wall -Wextra $(VERSION_DEF) -Icommon -Ikernel $(addprefix -Idrivers/,$(DRVDIRS))

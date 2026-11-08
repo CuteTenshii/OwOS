@@ -165,7 +165,7 @@ struct usbh_pipe {
   struct ring ring;
   uint8_t *buf;
   uint8_t head, tail, queued, errors;
-  bool halted, dead;
+  bool halted, dead, out;
   usbh_pipe_cb cb;
   void *ctx;
 };
@@ -2182,7 +2182,7 @@ static struct usbh_pipe *pipe_find(int slot, int dci)
 static bool pipe_event(struct trb *e)
 {
   struct usbh_pipe *p = pipe_find((e->control >> 24) & 0xFF, (e->control >> 16) & 0x1F);
-  if (!p)
+  if (!p || p->out)
     return false;
   int cc = (e->status >> 24) & 0xFF;
   uint32_t resid = e->status & 0xFFFFFF;
@@ -2232,10 +2232,16 @@ static void pipes_recover(void)
   }
 }
 
-struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval, usbh_pipe_cb cb, void *ctx)
+#define EP_TYPE_BULK_OUT 2
+#define EP_TYPE_BULK_IN 6
+#define EP_TYPE_INTR_IN 7
+
+static struct usbh_pipe *open_pipe(int slot, uint8_t ep_addr, uint16_t mps, int ep_type, uint8_t interval,
+                                   usbh_pipe_cb cb, void *ctx)
 {
-  struct xdev *x = devs[slot];
-  if (!x || mps == 0 || mps > 1024 || !(ep_addr & 0x80))
+  struct xdev *x = slot > 0 && slot < XHCI_MAX_SLOTS ? devs[slot] : NULL;
+  bool out = !(ep_addr & 0x80);
+  if (!x || mps == 0 || mps > 1024 || out != (ep_type == EP_TYPE_BULK_OUT))
     return NULL;
   struct usbh_pipe *p = kmalloc(sizeof *p);
   if (!p)
@@ -2255,14 +2261,19 @@ struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_
   p->dci = ep_dci(ep_addr);
   p->ep_addr = ep_addr;
   p->mps = mps;
+  p->out = out;
   p->cb = cb;
   p->ctx = ctx;
 
   uint32_t ep[5] = {0};
-  ep[0] = usbh_intr_exponent(x->pub.speed, interval) << 16;
-  ep[1] = (3u << 1) | (7u << 3) | ((uint32_t)mps << 16);
+  if (ep_type == EP_TYPE_INTR_IN) {
+    ep[0] = usbh_intr_exponent(x->pub.speed, interval) << 16;
+    ep[4] = mps | ((uint32_t)mps << 16);
+  } else {
+    ep[4] = mps;
+  }
+  ep[1] = (3u << 1) | ((uint32_t)ep_type << 3) | ((uint32_t)mps << 16);
   ep[2] = (uint32_t)(uintptr_t)p->ring.base | 1;
-  ep[4] = mps | ((uint32_t)mps << 16);
   if (config_endpoint(slot, p->dci, ep) != 0) {
     pfree(p->ring.base);
     pfree(p->buf);
@@ -2271,8 +2282,38 @@ struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_
   }
   p->next = x->pipes;
   x->pipes = p;
-  pipe_post(p);
+  if (!out)
+    pipe_post(p);
   return p;
+}
+
+struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval, usbh_pipe_cb cb, void *ctx)
+{
+  return open_pipe(slot, ep_addr, mps, EP_TYPE_INTR_IN, interval, cb, ctx);
+}
+
+struct usbh_pipe *usbh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usbh_pipe_cb cb, void *ctx)
+{
+  return open_pipe(slot, ep_addr, mps, EP_TYPE_BULK_IN, 0, cb, ctx);
+}
+
+struct usbh_pipe *usbh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps)
+{
+  return open_pipe(slot, ep_addr, mps, EP_TYPE_BULK_OUT, 0, NULL, NULL);
+}
+
+int usbh_pipe_send(struct usbh_pipe *p, const uint8_t *data, int len)
+{
+  if (!p || !p->out || p->dead || len <= 0 || len > 4096)
+    return -1;
+  memcpy(p->buf, data, (uint32_t)len);
+  int cc;
+  int got = bulk_xfer(p->slot, &p->ring, p->dci, p->buf, len, &cc);
+  if (got < 0 && cc == CC_STALL) {
+    ep_reset(p->slot, p->dci, &p->ring);
+    usbh_control_nodata(p->slot, 0x02, 0x01, 0, p->ep_addr);
+  }
+  return got < 0 ? -1 : 0;
 }
 
 int usbh_config_hub(int slot, int nports, int think_time)
@@ -2317,6 +2358,7 @@ static void remove_device(int slot)
   con_printf("usb: slot %d detached\n", slot);
   hub_unbind(slot);
   hid_unbind(slot);
+  btusb_unbind(slot);
   if (x->pub.is_msc && slot == msc_slot)
     msc_ready = 0;
   if (x->pub.is_mtp && slot == mtp_slot)
@@ -2451,6 +2493,7 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
   if (d->cfg_len) {
     hub_bind(d);
     hid_bind(d);
+    btusb_bind(d);
   }
   return slot_id;
 
@@ -2596,6 +2639,7 @@ static void usb_service(void)
   pipes_recover();
   hid_tick();
   hub_service();
+  btusb_tick();
   uint32_t now = timer_ticks();
   if (port_event || now - last_scan >= TIMER_HZ) {
     port_event = false;

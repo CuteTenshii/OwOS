@@ -18,6 +18,7 @@
 #define USBH_BOUND_MTP 0x04
 #define USBH_BOUND_HID 0x08
 #define USBH_BOUND_HUB 0x10
+#define USBH_BOUND_BT 0x20
 
 struct usbdev {
   bool active;
@@ -61,6 +62,12 @@ struct usbh_pipe;
 typedef void (*usbh_pipe_cb)(void *ctx, const uint8_t *data, int len);
 struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval, usbh_pipe_cb cb, void *ctx);
 
+/* Bulk endpoints on a configured slot. IN: cb runs per completed transfer (at most mps bytes, a short one ends a
+ * packet). OUT: usbh_pipe_send blocks until the controller completes it; poll thread only. */
+struct usbh_pipe *usbh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usbh_pipe_cb cb, void *ctx);
+struct usbh_pipe *usbh_open_bulk_out(int slot, uint8_t ep_addr, uint16_t mps);
+int usbh_pipe_send(struct usbh_pipe *p, const uint8_t *data, int len);
+
 /* Configure a hub slot (Hub flag, port count, TT think time) and its status-change endpoint. */
 int usbh_config_hub(int slot, int nports, int think_time);
 
@@ -98,6 +105,10 @@ void hid_bind(struct usbdev *d);
 void hid_unbind(int slot);
 void hid_tick(void);
 void hid_print(int slot, bool detail);
+void btusb_bind(struct usbdev *d);
+void btusb_unbind(int slot);
+void btusb_tick(void);
+void btusb_print(int slot);
 void hub_bind(struct usbdev *d);
 void hub_unbind(int slot);
 void hub_service(void);

@@ -1,4 +1,5 @@
 #include "syscall_audio.h"
+#include "bt.h"
 #include "hda.h"
 #include "idt.h"
 #include "sb16.h"
@@ -17,6 +18,8 @@ void audio_task_exiting(uint32_t id)
     hda_stream_close();
   else if (audio_backend == 2)
     sb16_stream_close();
+  else if (audio_backend == 3)
+    bt_a2dp_close();
   audio_backend = 0;
   audio_owner = 0;
 }
@@ -28,7 +31,10 @@ void syscall_audio_open(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  if (hda_present())
+  if (bt_a2dp_ready()) {
+    __asm__ volatile("sti");
+    audio_backend = bt_a2dp_open() == 0 ? 3 : 0;
+  } else if (hda_present())
     audio_backend = hda_stream_open() == 0 ? 1 : 0;
   else if (sb16_present())
     audio_backend = sb16_stream_open() == 0 ? 2 : 0;
@@ -50,6 +56,8 @@ void syscall_audio_write(struct registers *r)
     r->eax = (uint32_t)hda_stream_write((const void *)(uintptr_t)buf, len);
   else if (audio_backend == 2)
     r->eax = (uint32_t)sb16_stream_write((const void *)(uintptr_t)buf, len);
+  else if (audio_backend == 3)
+    r->eax = (uint32_t)bt_a2dp_write((const void *)(uintptr_t)buf, len);
   else
     r->eax = (uint32_t)-1;
 }
@@ -65,6 +73,8 @@ void syscall_audio_close(struct registers *r)
     hda_stream_close();
   else if (audio_backend == 2)
     sb16_stream_close();
+  else if (audio_backend == 3)
+    bt_a2dp_close();
   audio_backend = 0;
   audio_owner = 0;
   r->eax = 0;

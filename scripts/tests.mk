@@ -35,7 +35,7 @@ COMMON_SRCS := $(BROWSER)/css/engine.c $(BROWSER)/css/engine_values.c $(BROWSER)
   $(LIB)/gc/gc.c scripts/host_math.c $(LIB)/opt.c $(LIB)/mutex.c
 MAIN_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/gfx/textfield.c $(LIB)/zlib/crc32.c kernel/crc32c.c $(LIB)/stun/stun.c $(LIB)/ntp/ntp.c \
   $(LIB)/font/font.c $(LIB)/font/woff.c $(LIB)/mediactl/session.c $(LIB)/mp4/mp4.c $(wildcard $(LIB)/rar/*.c) $(LIB)/brotli/decode.c \
-  drivers/usb/hid_desc.c $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
+  drivers/usb/hid_desc.c $(wildcard drivers/bt/*.c) $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c
 BIND_SRCS := $(COMMON_SRCS) $(BROWSER)/html_entities.c $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/features/cors/cors.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c $(LIB)/zlib/crc32.c $(LIB)/zlib/inflate.c $(LIB)/zlib/deflate.c
