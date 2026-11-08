@@ -218,6 +218,12 @@ int css_fontface_count(const css_sheet *sheet);
 /* `base` (may be 0) receives the declaring sheet's URL. */
 void css_fontface_at(const css_sheet *sheet, int i, const char **family, const char **url, const char **base);
 
+/* A parsed selector list for querySelector/matches; css_sel_parse returns NULL if nothing parses. */
+struct sel_list;
+struct sel_list *css_sel_parse(const char *s);
+bool css_sel_match(const struct sel_list *l, const struct dom_node *el);
+void css_sel_free(struct sel_list *l);
+
 /* Fold the sheet's matching rules for `el` into *out (specificity/order). */
 void css_apply_sheet(css_sheet *sheet, const struct dom_node *el, struct css_style *out);
 /* Fold a style="" declaration block into *out (highest priority). */

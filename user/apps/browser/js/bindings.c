@@ -3867,6 +3867,26 @@ bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter)
   return true;
 }
 
+/* Escape: close the topmost open modal dialog (after a cancelable `cancel`) or auto popover */
+bool js_escape_key(void)
+{
+  struct dom_node *top = 0;
+  for (struct dom_node *p = g_doc_root; p; p = tree_next(p)) {
+    if (p->type != DOM_ELEMENT)
+      continue;
+    if ((is_dialog(p) && dom_get_attr(p, "open") && dom_get_attr(p, "dialog-modal")) ||
+        (dom_get_attr(p, "popover-open") && popover_is_auto(p)))
+      top = p;
+  }
+  if (!top)
+    return false;
+  if (!is_dialog(top))
+    popover_set(top, false);
+  else if (!fire_state_event(top, "cancel", 0, 0))
+    dialog_close(top, 0);
+  return true;
+}
+
 static js_value dialog_show(js_value t, bool modal)
 {
   struct dom_node *d = node_of(t);
@@ -4166,6 +4186,22 @@ static js_value ce_define(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_def(g_custom_elements, name, cls, 0);
   if (g_doc_root)
     ce_upgrade_tree(g_doc_root, name, cls);
+  {
+    char key[80];
+    pentry *pe;
+    snprintf(key, sizeof key, "@wait:%s", name);
+    pe = pmap_find_pub(g_custom_elements, key);
+    if (pe && js_is_array(pe->value)) {
+      js_value waiters = pe->value;
+      gc_push_scope();
+      gc_keep(waiters.u.obj);
+      gc_keep(cls.u.obj);
+      js_def(g_custom_elements, key, js_undef(), P_WRITABLE);
+      for (unsigned i = 0; i < js_array_len(waiters.u.obj); i++)
+        js_call(ctx, js_get_index(ctx, waiters, i), js_undef(), &cls, 1);
+      gc_pop_scope();
+    }
+  }
   return js_undef();
 }
 static js_value ce_get(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -4177,12 +4213,60 @@ static js_value ce_get(js_ctx *ctx, js_value t, js_value *args, int argc)
   pe = pmap_find_pub(g_custom_elements, name);
   return pe ? pe->value : js_undef();
 }
-static js_value ce_when_defined(js_ctx *ctx, js_value t, js_value *args, int argc)
+static js_object *g_ce_waiters; /* the array the Promise executor appends its resolve function to */
+static js_value ce_executor(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
-  (void)args;
-  (void)argc; /* define is synchronous: already settled */
-  return js_promise_resolved(ctx, js_undef());
+  if (g_ce_waiters)
+    js_array_push(ctx, g_ce_waiters, A(0));
+  return js_undef();
+}
+static js_value ce_when_defined(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  char name[64], key[80];
+  pentry *pe;
+  js_value cls, promise, exec;
+  (void)t;
+  strlcpy(name, arg_str(ctx, A(0)), sizeof name);
+  pe = pmap_find_pub(g_custom_elements, name);
+  if (pe)
+    return js_promise_resolved(ctx, pe->value);
+  if (!ce_valid_name(name))
+    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "SyntaxError", "invalid custom element name"));
+  snprintf(key, sizeof key, "@wait:%s", name);
+  pe = pmap_find_pub(g_custom_elements, key);
+  gc_push_scope();
+  if (!pe || !js_is_array(pe->value)) {
+    js_def(g_custom_elements, key, js_obj_value((js_object *)gc_keep(js_new_array(ctx, 0))), P_WRITABLE);
+    pe = pmap_find_pub(g_custom_elements, key);
+  }
+  g_ce_waiters = pe->value.u.obj;
+  exec = js_obj_value((js_object *)gc_keep(js_new_native(ctx, ce_executor, "executor", 2)));
+  cls = js_get(ctx, js_obj_value(ctx->global), "Promise");
+  promise = js_construct(ctx, cls, &exec, 1);
+  g_ce_waiters = 0;
+  gc_pop_scope();
+  return promise;
+}
+static void ce_upgrade_subtree(struct dom_node *n)
+{
+  js_value cls;
+  if (n->type != DOM_ELEMENT)
+    return;
+  cls = ce_lookup(n->tag);
+  if (cls.type == JV_OBJ)
+    ce_upgrade_connect(n, cls);
+  for (struct dom_node *c = n->first_child; c; c = c->next)
+    ce_upgrade_subtree(c);
+}
+static js_value ce_upgrade(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(A(0));
+  (void)ctx;
+  (void)t;
+  if (n)
+    ce_upgrade_subtree(n);
+  return js_undef();
 }
 
 /* ------------------------------------------------------- ES modules -------- */
@@ -6959,6 +7043,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
     def_method(ce, "define", ce_define, 2);
     def_method(ce, "get", ce_get, 1);
     def_method(ce, "whenDefined", ce_when_defined, 1);
+    def_method(ce, "upgrade", ce_upgrade, 1);
     js_def(win, "customElements", js_obj_value(ce), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }

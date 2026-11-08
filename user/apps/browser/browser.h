@@ -312,7 +312,8 @@ void html_set_charset(const char *content_type); /* charset from HTTP CT */
 void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn fetch);
 void js_page_end(void); /* reclaim the page ctx  */
 int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int y);
-int js_has_listeners(void);                                                    /* any listener registered */
+int js_has_listeners(void); /* any listener registered */
+bool js_escape_key(void);   /* Escape: close the topmost modal dialog or auto popover */
 bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter); /* method=dialog: close its dialog */
 int js_timers_pump(void);        /* fire due setTimeout/Interval/rAF; -> # callbacks fired */
 int js_websockets_pump(void);    /* drain live WebSockets -> open/message/close/error events */

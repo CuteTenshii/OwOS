@@ -166,7 +166,9 @@ static void worker_dispatch_event(void)
     }
     return;
   }
-  if (streq(B->evt_type, "keyinput")) {
+  if (streq(B->evt_type, "escape")) {
+    need_relayout = js_escape_key();
+  } else if (streq(B->evt_type, "keyinput")) {
     struct dom_node *f = html_focus(); /* evt_x carries the char */
     int ch = B->evt_x;
     if (f && (ch == '\n' || ch == '\r') && html_control_kind(f) == CTRL_TEXT) {

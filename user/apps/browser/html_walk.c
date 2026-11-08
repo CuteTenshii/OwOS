@@ -230,6 +230,8 @@ static void walk_element_inner(struct dom_node *el)
   if (cs.disp == CSS_DISP_NONE)
     return;                                 /* display:none */
   anim_apply(g_sheet, el, &cs, g_walk_now); /* overlay @keyframes / transition */
+  if (streq(name, "dialog") || dom_get_attr(el, "popover"))
+    g_has_controls = true; /* route clicks and Escape to the page */
   if (streq(name, "dialog") && !dom_get_attr(el, "open"))
     return; /* closed modal is hidden */
   if (dom_get_attr(el, "popover") && !dom_get_attr(el, "popover-open"))

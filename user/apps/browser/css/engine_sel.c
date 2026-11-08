@@ -489,6 +489,16 @@ static struct sel_list *parse_sel_list(const char *s, const char *e)
   return l;
 }
 
+struct sel_list *css_sel_parse(const char *s) { return parse_sel_list(s, s + strlen(s)); }
+void css_sel_free(struct sel_list *l) { free_sel_list(l); }
+bool css_sel_match(const struct sel_list *l, const struct dom_node *el)
+{
+  for (int i = 0; l && i < l->n; i++)
+    if (selector_match(&l->sels[i], el))
+      return true;
+  return false;
+}
+
 int selector_spec(const struct selector *sel)
 {
   int a = 0, b = 0, c = 0;

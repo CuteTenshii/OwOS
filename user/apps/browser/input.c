@@ -615,6 +615,14 @@ void handle_key(char c, int mods)
     }
   }
 
+  if ((unsigned char)c == 27 && B->events_live && !menu_any_open()) {
+    int k = 0;
+    sapp(B->evt_type, &k, sizeof B->evt_type, "escape");
+    B->evt_pending = 1;
+    B->seq++;
+    return;
+  }
+
   if ((unsigned char)c == 27) {
     menubar_close(&menubar);
     B->seq++;
