@@ -84,6 +84,8 @@ void run_line(const char *text)
   current_line = text;
   for (int i = 0; text[i] && ok;) {
     char c = text[i++];
+    if (c == '#' && !quote && !in_word) /* a comment runs to the end of the line */
+      break;
     if (c == '&' && !quote) { /* a trailing & runs the command in the background */
       int k = i;
       while (text[k] == ' ' || text[k] == '\t')
@@ -152,4 +154,34 @@ void run_line(const char *text)
   for (int i = 0; i < argc; i++)
     free(argv[i]);
   free(argv);
+}
+
+/* Run the commands in a file, one per line; false when it cannot be read */
+bool run_file(const char *path)
+{
+  struct statinfo st;
+  if (stat(path, &st) != 0 || st.is_dir)
+    return false;
+  char *text = malloc(st.size + 1);
+  if (!text)
+    return false;
+  int n = readfile(path, text, (int)st.size);
+  if (n < 0) {
+    free(text);
+    return false;
+  }
+  text[n] = '\0';
+  for (char *line = text; *line;) {
+    char *end = line;
+    while (*end && *end != '\n')
+      end++;
+    char next = *end;
+    *end = '\0';
+    if (end > line && end[-1] == '\r')
+      end[-1] = '\0';
+    run_line(line);
+    line = next ? end + 1 : end;
+  }
+  free(text);
+  return true;
 }

@@ -16,7 +16,9 @@ static void bi_help(void)
   tputs("device   storage lsusb mount umount loadkeys clip\n");
   tputs("net      services (dhcp/ntp run as services: `services start ntp`)\n");
   tputs("power    poweroff restart\n");
-  tputs("shell    help clear echo sleep exit\n");
+  tputs("shell    help clear echo sleep source exit    (~/.shrc runs at startup)\n");
+  tputs("jobs     cmd &  jobs fg wait kill      export unset env printenv\n");
+  tputs("root     sudo <command>    (group wheel or sudo)\n");
   tputs("remote   ssh user@host (interactive SSH-2 session)\n");
   tputs("Any /bin program runs here: its output streams inline; if it opens a\n");
   tputs("window (editor files clock browser ...) the prompt returns.\n");
@@ -57,11 +59,11 @@ static void bi_env(int argc, char **argv)
 }
 
 static const char *const builtin_names[] = {
-    "help",   "clear",   "echo",     "pwd",      "cd",      "ls",     "cat",      "cp",      "mv",
-    "stat",   "mkdir",   "rmdir",    "rm",       "exit",    "uptime", "hostname", "whoami",  "which",
-    "umask",  "cpuinfo", "meminfo",  "date",     "storage", "sleep",  "id",       "useradd", "userdel",
-    "passwd", "usermod", "groupadd", "groupdel", "users",   "groups", "su",       "login",   "logout",
-    "export", "unset",   "env",      "printenv", "jobs",    "fg",     "wait",     "kill",
+    "help",     "clear", "echo",    "pwd",   "cd",     "ls",       "cat",     "cp",     "mv",      "stat",
+    "mkdir",    "rmdir", "rm",      "exit",  "uptime", "hostname", "whoami",  "which",  "umask",   "cpuinfo",
+    "meminfo",  "date",  "storage", "sleep", "id",     "useradd",  "userdel", "passwd", "usermod", "groupadd",
+    "groupdel", "users", "groups",  "su",    "login",  "logout",   "export",  "unset",  "env",     "printenv",
+    "jobs",     "fg",    "wait",    "kill",  "source", ".",
 };
 
 bool is_builtin(const char *name)
@@ -191,7 +193,16 @@ void run_argv(int argc, char **argv)
     bi_unset(argc, argv);
   else if (!strcmp(c, "env") || !strcmp(c, "printenv"))
     bi_env(argc, argv);
-  else if (!strcmp(c, "jobs"))
+  else if (!strcmp(c, "source") || !strcmp(c, ".")) {
+    char file[256];
+    if (argc < 2) {
+      tputs("usage: source <file>\n");
+    } else {
+      abspath(argv[1], file);
+      if (!run_file(file))
+        err("source: cannot read ", argv[1]);
+    }
+  } else if (!strcmp(c, "jobs"))
     bi_jobs();
   else if (!strcmp(c, "fg"))
     bi_fg(argc, argv);
@@ -249,7 +260,12 @@ int main(int argc, char **argv)
 {
   reload_identity();
   gethostname(hostnm, sizeof hostnm);
-  strcpy(cwd, home);
+  struct statinfo st;
+  const char *pwd = getenv("PWD"); /* a shell started from another keeps its directory */
+  if (pwd && pwd[0] == '/' && stat(pwd, &st) == 0 && st.is_dir)
+    strlcpy(cwd, pwd, sizeof cwd);
+  else
+    strcpy(cwd, home);
   chdir(cwd);
   sync_env();
 
@@ -257,6 +273,13 @@ int main(int argc, char **argv)
     run_line(argv[2]);
     oflush();
     return 0;
+  }
+
+  if (isatty(0)) { /* the startup files of an interactive shell */
+    char rc[300];
+    run_file("/etc/shrc");
+    snprintf(rc, sizeof rc, "%s/.shrc", home);
+    run_file(rc);
   }
 
   if (isatty(0))

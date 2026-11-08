@@ -90,6 +90,7 @@ void bi_hostname(int argc, char **argv);
 
 /* parse.c */
 void run_line(const char *text);
+bool run_file(const char *path);
 
 /* edit.c */
 void prompt(void);
