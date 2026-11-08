@@ -299,6 +299,9 @@ static void host_at(long long t, int *off, int *dst, char *abbr)
   snprintf(abbr, 16, "%s", h.tm_zone);
 }
 
+/* Europe/Dublin: the main tzdata format models winter as negative DST, the POSIX string models summer as DST */
+static bool g_negative_dst_host;
+
 static bool same_as_host(const struct tz *z, long long t)
 {
   int hoff, hdst, dst;
@@ -306,7 +309,7 @@ static bool same_as_host(const struct tz *z, long long t)
   const char *abbr;
   host_at(t, &hoff, &hdst, habbr);
   int off = tz_offset_at(z, t, &dst, &abbr);
-  return off == hoff && dst == hdst && strcmp(abbr, habbr) == 0;
+  return off == hoff && (g_negative_dst_host || dst == hdst) && strcmp(abbr, habbr) == 0;
 }
 
 /* Compare every 6 hours, and each host transition at -1s, 0s and +1s. Returns the transitions seen. */
@@ -318,6 +321,7 @@ static int compare_zone(int idx, long long from, long long to, bool *ok)
   setenv("TZ", tz_name_at(idx), 1);
   tzset();
   tz_load(&z, idx);
+  g_negative_dst_host = strcmp(tz_name_at(idx), "Europe/Dublin") == 0;
   host_at(from, &prev_off, &prev_dst, abbr);
   for (long long t = from, prev_t = from; t <= to; prev_t = t, t += 6 * HOUR) {
     host_at(t, &off, &dst, abbr);
@@ -342,6 +346,25 @@ static int compare_zone(int idx, long long from, long long to, bool *ok)
   return transitions;
 }
 
+/* Debian and Ubuntu ship the deprecated alias names in a separate package that may not be installed */
+static bool host_has_zone(const char *name)
+{
+  static const char *const dirs[] = {"/usr/share/zoneinfo", "/var/db/timezone/zoneinfo", "/usr/lib/zoneinfo"};
+  char path[256];
+  const char *env = getenv("TZDIR");
+  if (env) {
+    snprintf(path, sizeof path, "%s/%s", env, name);
+    if (access(path, R_OK) == 0)
+      return true;
+  }
+  for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+    snprintf(path, sizeof path, "%s/%s", dirs[i], name);
+    if (access(path, R_OK) == 0)
+      return true;
+  }
+  return false;
+}
+
 static void check_host(void)
 {
   int transitions = 0;
@@ -349,7 +372,7 @@ static void check_host(void)
   for (int i = 0; i < tz_count(); i++) {
     const char *name = tz_name_at(i);
     bool ok = true;
-    if (strcmp(name, "Africa/Casablanca") == 0)
+    if (strcmp(name, "Africa/Casablanca") == 0 || !host_has_zone(name))
       continue;
     transitions +=
         compare_zone(i, epoch(is_stable(name) ? 2012 : 2028, 1, 1, 0, 0, 0), epoch(2037, 12, 31, 0, 0, 0), &ok);
