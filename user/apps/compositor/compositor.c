@@ -98,11 +98,10 @@ int main(void)
 
   apps_load();
 
-  /* Session autostart: clipboard server, notification daemon, terminal */
+  /* Session autostart: clipboard server, notification daemon */
   kid_track(spawn("/bin/clipd", 0));
   kid_track(spawn("/bin/vmclipd", 0)); /* VMware host clipboard bridge; self-exits off VMware */
   kid_track(spawn("/bin/notifyd", 0));
-  kid_track(spawn("/bin/term", 0));
 
   int prev_mx = -9999, prev_my = -9999, prev_cur = -1;
   bool prev_start = false, prev_tb_menu = false, prev_at_active = false, prev_pw_open = false;
