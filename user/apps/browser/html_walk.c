@@ -330,7 +330,9 @@ static void walk_element_inner(struct dom_node *el)
     block_break();
     struct sty sv = sty_cur;
     sty_cur.bold = 1;
-    emit_lit("\xe2\x96\xbe ", ST_BOLD); /* ▾ marker */
+    g_has_controls = true; /* route the click that toggles it */
+    bool open = el->parent && dom_get_attr(el->parent, "open");
+    emit_lit(open ? "\xe2\x96\xbe " : "\xe2\x96\xb8 ", ST_BOLD); /* ▾ open, ▸ closed */
     walk(el);
     sty_cur = sv;
     block_break();
@@ -483,7 +485,13 @@ static void walk_element_inner(struct dom_node *el)
 
 void walk(struct dom_node *node)
 {
+  bool closed = streq(node->tag, "details") && !dom_get_attr(node, "open"), summary_done = false;
   for (struct dom_node *c = node->first_child; c; c = c->next) {
+    if (closed) { /* a closed <details> shows only its first <summary> */
+      if (summary_done || c->type != DOM_ELEMENT || !streq(c->tag, "summary"))
+        continue;
+      summary_done = true;
+    }
     if (c->type == DOM_TEXT) {
       if (c->text)
         emit_text(c->text);

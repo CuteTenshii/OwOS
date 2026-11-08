@@ -74,6 +74,7 @@ static struct html_iface g_html_ifaces[] = {
     {"HTMLSourceElement", "source", false, 0},
     {"HTMLTemplateElement", "template", false, 0},
     {"HTMLDialogElement", "dialog", false, 0},
+    {"HTMLDetailsElement", "details", false, 0},
     {"HTMLPictureElement", "picture", false, 0},
     {"HTMLDataListElement", "datalist", false, 0},
     {"HTMLProgressElement", "progress", false, 0},
@@ -3848,6 +3849,27 @@ static void popover_click(struct dom_node *t)
   }
 }
 
+/* A click on a <details>'s first <summary> toggles it */
+static void details_click(struct dom_node *t)
+{
+  struct dom_node *sum = t, *det, *c;
+  while (sum && !(sum->type == DOM_ELEMENT && streq(sum->tag, "summary")))
+    sum = sum->parent;
+  det = sum ? sum->parent : 0;
+  if (!det || !streq(det->tag, "details"))
+    return;
+  for (c = det->first_child; c; c = c->next)
+    if (c->type == DOM_ELEMENT && streq(c->tag, "summary"))
+      break;
+  if (c != sum)
+    return;
+  if (dom_get_attr(det, "open"))
+    dom_remove_attr(det, "open");
+  else
+    dom_set_attr(det, "open", "");
+  fire_state_event(det, "toggle", 0, 0);
+}
+
 static bool is_dialog(const struct dom_node *n) { return n && streq(n->tag, "dialog"); }
 
 static void dialog_close(struct dom_node *d, const char *ret)
@@ -3985,8 +4007,10 @@ int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int 
   if (ev.type == JV_OBJ)
     gc_keep(ev.u.obj);
   prevented = dispatch_from(tgt.u.obj, ev);
-  if (!prevented && streq(type, "click"))
+  if (!prevented && streq(type, "click")) {
     popover_click(target);
+    details_click(target);
+  }
   gc_pop_scope();
   return prevented;
 }
@@ -7095,6 +7119,8 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
       def_method(dp, "requestClose", dlg_request_close, 1);
       def_acc(dp, "open", dlg_get_open, dlg_set_open);
       def_acc(dp, "returnValue", dlg_get_rv, dlg_set_rv);
+      dp = iface_proto_for_tag("details");
+      def_acc(dp, "open", dlg_get_open, dlg_set_open);
     }
   }
   js_def_native(ctx, win, "DOMParser", domparser_ctor, 0); /* new DOMParser().parseFromString */

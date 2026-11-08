@@ -141,6 +141,18 @@ static void test_replace_children(void)
              "h.replaceChildren(); expect(h.childNodes.length===0, 'no arguments empties');\n");
 }
 
+static void test_details_summary_toggle(void)
+{
+  run_script("var d=document, det=d.createElement('details'), sum=d.createElement('summary'), log=[];\n"
+             "det.appendChild(sum); det.appendChild(d.createElement('p')); d.body.appendChild(det);\n"
+             "det.addEventListener('toggle', function(){ log.push(det.open) });\n"
+             "expect(det.open===false, 'closed by default');\n"
+             "sum.click(); expect(det.open===true && log.join()==='true', 'summary click opens');\n"
+             "sum.click(); expect(det.open===false && log.join()==='true,false', 'and closes');\n"
+             "det.open=true; expect(det.hasAttribute('open'), 'open reflects the attribute');\n"
+             "d.createElement('p').click();\n");
+}
+
 static void test_dialog_open_state_returnvalue(void)
 {
   run_script(
@@ -234,6 +246,7 @@ int main(void)
   test("fragments, cloning and tree editing", test_fragments_cloning_and_tree);
   test("cyclic insertion is rejected", test_cyclic_insertion_is_rejected);
   test("replaceChildren keeps nodes passed back in", test_replace_children);
+  test("details toggles from its summary", test_details_summary_toggle);
   test("dialog open state, returnValue and events", test_dialog_open_state_returnvalue);
   test("popover API: show, hide, toggle, events and light dismiss", test_popover_api_show_hide);
   test("custom elements: lifecycle and registry validation", test_custom_elements_lifecycle_and);
