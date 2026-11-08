@@ -7718,9 +7718,83 @@ static void rev_bytes(unsigned char *b, int n)
     b[n - 1 - i] = x;
   }
 }
-static js_value dv_decode(int type, unsigned char *p)
+/* DataView-only element kinds beyond the TA_* set */
+enum { DV_I64 = 100, DV_U64, DV_F16 };
+static int dv_size(int type)
+{
+  if (type == DV_F16)
+    return 2;
+  return type >= DV_I64 ? 8 : ta_elem_size(type);
+}
+static double f16_decode(unsigned h)
+{
+  int e = (h >> 10) & 31;
+  double m = (double)(h & 1023), v;
+  if (e == 0)
+    v = ldexp(m, -24);
+  else if (e == 31)
+    v = m ? NAN : INFINITY;
+  else
+    v = ldexp(1024.0 + m, e - 25);
+  return (h & 0x8000) ? -v : v;
+}
+/* round to nearest, ties to even */
+static unsigned f16_encode(double d)
+{
+  unsigned sign = signbit(d) ? 0x8000 : 0, q;
+  double a = d < 0 ? -d : d, x, frac;
+  int e = 0;
+  if (isnan(d))
+    return 0x7e00;
+  if (a >= 65520.0)
+    return sign | 0x7c00;
+  if (a < ldexp(1.0, -14)) {
+    x = ldexp(a, 24);
+  } else {
+    while (a >= 2.0) {
+      a /= 2.0;
+      e++;
+    }
+    while (a < 1.0) {
+      a *= 2.0;
+      e--;
+    }
+    x = (a - 1.0) * 1024.0;
+    e += 15;
+  }
+  q = (unsigned)x;
+  frac = x - (double)q;
+  if (frac > 0.5 || (frac == 0.5 && (q & 1)))
+    q++;
+  return sign | (e > 0 ? ((unsigned)e << 10) + q : q);
+}
+static js_value dv_decode(js_ctx *ctx, int type, unsigned char *p)
 { /* p is little-endian */
   switch (type) {
+  case DV_F16:
+    return js_number(f16_decode((unsigned)p[0] | (unsigned)p[1] << 8));
+  case DV_I64:
+  case DV_U64: {
+    unsigned lo, hi;
+    bigint *v, *t;
+    memcpy(&lo, p, 4);
+    memcpy(&hi, p + 4, 4);
+    if (type == DV_I64)
+      return js_mk_bigint(ctx, bi_from_i64((long long)((unsigned long long)hi << 32 | lo)));
+    v = bi_from_i64(hi);
+    t = v ? bi_shl(v, 32) : 0;
+    bi_free(v);
+    v = bi_from_i64(lo);
+    if (t && v) {
+      bigint *r = bi_add(t, v);
+      bi_free(t);
+      bi_free(v);
+      return js_mk_bigint(ctx, r);
+    }
+    bi_free(t);
+    bi_free(v);
+    return js_mk_bigint(ctx, 0);
+  }
   case TA_I8:
     return js_number((double)*(signed char *)p);
   case TA_U8:
@@ -7758,27 +7832,53 @@ static js_value dv_decode(int type, unsigned char *p)
   }
   return js_number(0);
 }
-static void dv_encode(js_ctx *ctx, int type, js_value v, unsigned char *p)
+static int dv_encode(js_ctx *ctx, int type, js_value v, unsigned char *p)
 {
+  if (type == DV_F16) {
+    unsigned h = f16_encode(js_to_number(ctx, v));
+    p[0] = (unsigned char)h;
+    p[1] = (unsigned char)(h >> 8);
+    return 1;
+  }
+  if (type == DV_I64 || type == DV_U64) {
+    bigint *b = js_bigint_of(v), *u;
+    unsigned lo, hi;
+    if (!b) {
+      js_throw_type(ctx, "Cannot convert value to a BigInt");
+      return 0;
+    }
+    u = bi_as_uintn(64, b);
+    if (!u) {
+      js_throw_range(ctx, "Maximum BigInt size exceeded");
+      return 0;
+    }
+    lo = u->len > 0 ? u->limb[0] : 0;
+    hi = u->len > 1 ? u->limb[1] : 0;
+    bi_free(u);
+    memcpy(p, &lo, 4);
+    memcpy(p + 4, &hi, 4);
+    return 1;
+  }
   if (type == TA_F32) {
     float f = (float)js_to_number(ctx, v);
     memcpy(p, &f, 4);
-    return;
+    return 1;
   }
   if (type == TA_F64) {
     double d = js_to_number(ctx, v);
     memcpy(p, &d, 8);
-    return;
+    return 1;
   }
   {
     unsigned u = js_to_uint32(ctx, v);
     memcpy(p, &u, (unsigned)ta_elem_size(type));
   }
+  return 1;
 }
 static js_value dv_get(js_ctx *ctx, js_value t, js_value *a, int n, int type)
 {
   js_typedarray *ta = as_ta(t);
-  int es = ta_elem_size(type), off, le;
+  int es = dv_size(type), off, le;
   js_arraybuffer *ab;
   unsigned char tmp[8];
   if (!ta || ta->type != TA_DATAVIEW)
@@ -7791,12 +7891,12 @@ static js_value dv_get(js_ctx *ctx, js_value t, js_value *a, int n, int type)
   memcpy(tmp, ab->data + ta->offset + off, (unsigned)es);
   if (!le)
     rev_bytes(tmp, es); /* DataView defaults to big-endian */
-  return dv_decode(type, tmp);
+  return dv_decode(ctx, type, tmp);
 }
 static js_value dv_set(js_ctx *ctx, js_value t, js_value *a, int n, int type)
 {
   js_typedarray *ta = as_ta(t);
-  int es = ta_elem_size(type), off, le;
+  int es = dv_size(type), off, le;
   js_arraybuffer *ab;
   unsigned char tmp[8];
   if (!ta || ta->type != TA_DATAVIEW)
@@ -7806,7 +7906,8 @@ static js_value dv_set(js_ctx *ctx, js_value t, js_value *a, int n, int type)
   if (off < 0 || off + es > ta->length)
     return js_throw_range(ctx, "Offset is outside the bounds of the DataView");
   ab = (js_arraybuffer *)ta->buffer->host;
-  dv_encode(ctx, type, n > 1 ? a[1] : js_undef(), tmp);
+  if (!dv_encode(ctx, type, n > 1 ? a[1] : js_undef(), tmp))
+    return js_undef();
   if (!le)
     rev_bytes(tmp, es);
   memcpy(ab->data + ta->offset + off, tmp, (unsigned)es);
@@ -7832,6 +7933,12 @@ DV_GET(dv_get_f32, TA_F32)
 DV_SET(dv_set_f32, TA_F32)
 DV_GET(dv_get_f64, TA_F64)
 DV_SET(dv_set_f64, TA_F64)
+DV_GET(dv_get_f16, DV_F16)
+DV_SET(dv_set_f16, DV_F16)
+DV_GET(dv_get_i64, DV_I64)
+DV_SET(dv_set_i64, DV_I64)
+DV_GET(dv_get_u64, DV_U64)
+DV_SET(dv_set_u64, DV_U64)
 #undef DV_GET
 #undef DV_SET
 static js_value dv_bytelength(js_ctx *ctx, js_value t, js_value *a, int n)
@@ -7956,6 +8063,12 @@ static void setup_typed_arrays(js_ctx *ctx)
   js_def_native(ctx, ctx->dataview_proto, "setFloat32", dv_set_f32, 2);
   js_def_native(ctx, ctx->dataview_proto, "getFloat64", dv_get_f64, 1);
   js_def_native(ctx, ctx->dataview_proto, "setFloat64", dv_set_f64, 2);
+  js_def_native(ctx, ctx->dataview_proto, "getFloat16", dv_get_f16, 1);
+  js_def_native(ctx, ctx->dataview_proto, "setFloat16", dv_set_f16, 2);
+  js_def_native(ctx, ctx->dataview_proto, "getBigInt64", dv_get_i64, 1);
+  js_def_native(ctx, ctx->dataview_proto, "setBigInt64", dv_set_i64, 2);
+  js_def_native(ctx, ctx->dataview_proto, "getBigUint64", dv_get_u64, 1);
+  js_def_native(ctx, ctx->dataview_proto, "setBigUint64", dv_set_u64, 2);
   make_ctor(ctx, "DataView", dataview_ctor, ctx->dataview_proto);
 }
 

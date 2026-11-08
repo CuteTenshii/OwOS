@@ -180,12 +180,37 @@ static void check_parser_stack_floor(void)
   js_arena_free(&arena);
 }
 
+static void check_dataview(void)
+{
+  expect(run(
+      "var b=new ArrayBuffer(16), v=new DataView(b);\n"
+      "v.setUint16(0,0x1234); expect(v.getUint8(0)===0x12 && v.getUint16(0,true)===0x3412, 'endianness');\n"
+      "v.setBigInt64(0,-2n); expect(v.getBigInt64(0)===-2n && v.getBigUint64(0)===2n**64n-2n, 'int64 round trip');\n"
+      "v.setBigUint64(8,0x0102030405060708n,true); expect(v.getUint8(8)===8 && v.getUint8(15)===1, 'uint64 "
+      "little-endian');\n"
+      "v.setBigInt64(0,2n**64n+5n); expect(v.getBigUint64(0)===5n, 'int64 wraps modulo 2^64');\n"
+      "var threw=false; try{ v.setBigInt64(0,1) }catch(e){ threw=e instanceof TypeError } expect(threw, 'Number is not "
+      "a BigInt');\n"
+      "threw=false; try{ v.getBigInt64(9) }catch(e){ threw=e instanceof RangeError } expect(threw, 'bounds');\n"
+      "var cases=[[0,0],[1,0x3c00],[-2,0xc000],[65504,0x7bff],[65520,0x7c00],[Infinity,0x7c00],[-Infinity,0xfc00],\n"
+      "  "
+      "[5.960464477539063e-8,1],[6.103515625e-5,0x400],[0.333251953125,0x3555],[2049,0x6800],[2051,0x6802],[1e-9,0]];\n"
+      "for(var i=0;i<cases.length;i++){ v.setFloat16(0,cases[i][0]); expect(v.getUint16(0)===cases[i][1], 'f16 encode "
+      "'+cases[i][0]); }\n"
+      "v.setUint16(0,0x3c00); expect(v.getFloat16(0)===1, 'f16 decode 1');\n"
+      "v.setUint16(0,0x0001); expect(v.getFloat16(0)===Math.pow(2,-24), 'f16 smallest subnormal');\n"
+      "v.setUint16(0,0x7e00); expect(v.getFloat16(0)!==v.getFloat16(0), 'f16 NaN');\n"
+      "v.setFloat16(0,NaN); expect(v.getUint16(0)===0x7e00, 'f16 NaN encode');\n",
+      0));
+}
+
 int main(void)
 {
   test("regexp matches whole code points, not bytes", check_regexp_code_points);
   test("regexp compile and match are bounded by the stack", check_regexp_bounded);
   test("Object.defineProperty on array elements", check_define_property);
   test("JSON.stringify", check_json_stringify);
+  test("DataView BigInt64 and Float16", check_dataview);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);
