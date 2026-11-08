@@ -29,4 +29,11 @@ int rsa_verify_pkcs1(const uint8_t *n, uint32_t nlen, const uint8_t *e, uint32_t
 int rsa_verify_pss(const uint8_t *n, uint32_t nlen, const uint8_t *e, uint32_t elen, int alg, const uint8_t *digest,
                    const uint8_t *sig, uint32_t siglen);
 
+enum pk_curve { PK_P256, PK_P384 };
+
+/* ECDSA over a NIST curve. pub is the uncompressed point 04||X||Y; sig is the DER SEQUENCE of r and s.
+ * The digest is truncated to the curve size. 0 = valid, -1 = invalid. */
+int ecdsa_verify_der(int curve, const uint8_t *pub, uint32_t publen, const uint8_t *digest, uint32_t dlen,
+                     const uint8_t *sig, uint32_t siglen);
+
 #endif /* OWOS_PKI_PK_H */
