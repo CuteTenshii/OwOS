@@ -77,11 +77,11 @@ static void mgf1(int alg, const uint8_t *seed, uint32_t seedlen, uint8_t *out, u
 }
 
 int rsa_verify_pss(const uint8_t *n, uint32_t nlen, const uint8_t *e, uint32_t elen, int alg, const uint8_t *digest,
-                   const uint8_t *sig, uint32_t siglen)
+                   uint32_t saltlen, const uint8_t *sig, uint32_t siglen)
 {
   uint8_t em[BN_MAX_LIMBS * 4];
   uint32_t emlen;
-  if (rsa_public(n, nlen, e, elen, sig, siglen, em, &emlen))
+  if (saltlen > 64 || rsa_public(n, nlen, e, elen, sig, siglen, em, &emlen))
     return -1;
 
   /* modBits - 1 bits of encoded message; with a modulus of 8k bits that drops the top byte. */
@@ -103,7 +103,7 @@ int rsa_verify_pss(const uint8_t *n, uint32_t nlen, const uint8_t *e, uint32_t e
   uint8_t topmask = topbits == 1 ? 0xff : (uint8_t)(0xff >> (8 - (topbits - 1)));
 
   uint32_t hl = pk_hash_len(alg);
-  if (len < hl + hl + 2 || p[len - 1] != 0xbc || (p[0] & ~topmask))
+  if (len < hl + saltlen + 2 || p[len - 1] != 0xbc || (p[0] & ~topmask))
     return -1;
   uint32_t dblen = len - hl - 1;
   const uint8_t *h = p + dblen;
@@ -113,7 +113,7 @@ int rsa_verify_pss(const uint8_t *n, uint32_t nlen, const uint8_t *e, uint32_t e
     db[i] ^= p[i];
   db[0] &= topmask;
 
-  uint32_t zeros = dblen - hl - 1;
+  uint32_t zeros = dblen - saltlen - 1;
   for (uint32_t i = 0; i < zeros; i++)
     if (db[i])
       return -1;
@@ -121,9 +121,9 @@ int rsa_verify_pss(const uint8_t *n, uint32_t nlen, const uint8_t *e, uint32_t e
     return -1;
   const uint8_t *salt = db + zeros + 1;
 
-  uint8_t mp[8 + PK_HASH_MAX * 2] = {0}, hh[PK_HASH_MAX];
+  uint8_t mp[8 + PK_HASH_MAX + 64] = {0}, hh[PK_HASH_MAX];
   memcpy(mp + 8, digest, hl);
-  memcpy(mp + 8 + hl, salt, hl);
-  pk_hash(alg, mp, 8 + 2 * hl, hh);
+  memcpy(mp + 8 + hl, salt, saltlen);
+  pk_hash(alg, mp, 8 + hl + saltlen, hh);
   return memcmp(hh, h, hl) ? -1 : 0;
 }

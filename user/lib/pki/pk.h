@@ -25,9 +25,9 @@ static inline void pk_hash(int alg, const void *data, uint32_t len, uint8_t out[
 /* RSA public-key signature checks over a digest. n and e are big-endian. 0 = valid, -1 = invalid. */
 int rsa_verify_pkcs1(const uint8_t *n, uint32_t nlen, const uint8_t *e, uint32_t elen, int alg, const uint8_t *digest,
                      const uint8_t *sig, uint32_t siglen);
-/* RSASSA-PSS with MGF1 over the same hash and salt length equal to the digest (the TLS 1.3 form). */
+/* RSASSA-PSS with MGF1 over the same hash; saltlen is 0..64 bytes (TLS 1.3 uses the digest length). */
 int rsa_verify_pss(const uint8_t *n, uint32_t nlen, const uint8_t *e, uint32_t elen, int alg, const uint8_t *digest,
-                   const uint8_t *sig, uint32_t siglen);
+                   uint32_t saltlen, const uint8_t *sig, uint32_t siglen);
 
 enum pk_curve { PK_P256, PK_P384 };
 

@@ -39,7 +39,7 @@ static int verify(const struct rsa_vec *v, const uint8_t *digest, const uint8_t 
   uint32_t nlen = unhex(v->n, n);
   int alg = hash_of(v->hash);
   return strcmp(scheme, "pss") ? rsa_verify_pkcs1(n, nlen, e, 3, alg, digest, sig, siglen)
-                               : rsa_verify_pss(n, nlen, e, 3, alg, digest, sig, siglen);
+                               : rsa_verify_pss(n, nlen, e, 3, alg, digest, pk_hash_len(alg), sig, siglen);
 }
 
 static void verifies_openssl_signatures(void)
@@ -316,6 +316,80 @@ static void verifies_tls_signatures(void)
   expect(x509_verify_tls_sig(&C_LEAFA3.x, 0x0001, msg, sizeof msg - 1, sig, n) == X509_E_UNSUPPORTED);
 }
 
+static void verifies_rsa_pss_certificates(void)
+{
+  static struct cert root, l384, l20;
+  load_cert(&root, CERT_ROOTPSS);
+  load_cert(&l384, CERT_LEAFPSS384);
+  load_cert(&l20, CERT_LEAFPSS20);
+  expect(root.x.sig_alg == X509_SIG_RSA_PSS && root.x.pss_hash == PK_SHA256 && root.x.pss_saltlen == 32);
+  expect(l384.x.sig_alg == X509_SIG_RSA_PSS && l384.x.pss_hash == PK_SHA384 && l384.x.pss_saltlen == 48);
+  expect(l20.x.pss_saltlen == 20);
+  expect(x509_check_signature(&root.x, &root.x) == X509_OK);
+  expect(x509_check_signature(&l384.x, &root.x) == X509_OK);
+  expect(x509_check_signature(&l20.x, &root.x) == X509_OK);
+  expect(x509_check_signature(&l20.x, &l384.x) != X509_OK);
+
+  struct cert bad = l384;
+  bad.der[bad.x.derlen - 10] ^= 1;
+  expect(x509_parse(&bad.x, bad.der, bad.x.derlen) == X509_OK);
+  expect(x509_check_signature(&bad.x, &root.x) == X509_E_SIG);
+
+  struct cert *roots[] = {&root};
+  struct x509_store st;
+  store_of(&st, roots, 1);
+  expect(chain(&st, "pss.test", 0, 1, &l384) == X509_OK);
+  expect(chain(&st, "pss20.test", 0, 1, &l20) == X509_OK);
+  free(st.certs);
+}
+
+static struct cert N_ROOT, N_OK, N_BAD, N_BADSUB, N_OTHER, N_IP, N_WILD, N2_ROOT, N2_SUB, N2_APEX, N2_WILD, N3_ROOT,
+    N3_INT, N3_OK, N3_BAD;
+
+static void enforces_name_constraints(void)
+{
+  load_cert(&N_ROOT, CERT_ROOTNC);
+  load_cert(&N_OK, CERT_NCOK);
+  load_cert(&N_BAD, CERT_NCBAD);
+  load_cert(&N_BADSUB, CERT_NCBADSUB);
+  load_cert(&N_OTHER, CERT_NCOTHER);
+  load_cert(&N_IP, CERT_NCIP);
+  load_cert(&N_WILD, CERT_NCWILD);
+  load_cert(&N2_ROOT, CERT_ROOTNC2);
+  load_cert(&N2_SUB, CERT_NC2SUB);
+  load_cert(&N2_APEX, CERT_NC2APEX);
+  load_cert(&N2_WILD, CERT_NC2WILD);
+  load_cert(&N3_ROOT, CERT_ROOTN3);
+  load_cert(&N3_INT, CERT_INTNC);
+  load_cert(&N3_OK, CERT_INTOK);
+  load_cert(&N3_BAD, CERT_INTBAD);
+  expect(N_ROOT.x.nc && !N_ROOT.x.unsupported_critical);
+
+  struct cert *r1[] = {&N_ROOT}, *r2[] = {&N2_ROOT}, *r3[] = {&N3_ROOT};
+  struct x509_store s1, s2, s3;
+  store_of(&s1, r1, 1);
+  store_of(&s2, r2, 1);
+  store_of(&s3, r3, 1);
+
+  expect(chain(&s1, "ok.permitted.test", 0, 1, &N_OK) == X509_OK);
+  expect(chain(&s1, "10.1.2.3", 0, 1, &N_OK) == X509_OK);
+  expect(chain(&s1, "bad.permitted.test", 0, 1, &N_BAD) == X509_E_NAME_CONSTRAINT);
+  expect(chain(&s1, "sub.bad.permitted.test", 0, 1, &N_BADSUB) == X509_E_NAME_CONSTRAINT);
+  expect(chain(&s1, "other.test", 0, 1, &N_OTHER) == X509_E_NAME_CONSTRAINT);
+  expect(chain(&s1, "ok.permitted.test", 0, 1, &N_IP) == X509_E_NAME_CONSTRAINT);
+  expect(chain(&s1, "x.permitted.test", 0, 1, &N_WILD) == X509_E_NAME_CONSTRAINT); /* could cover the excluded name */
+
+  expect(chain(&s2, "a.example.org", 0, 1, &N2_SUB) == X509_OK); /* an IP name is unconstrained here */
+  expect(chain(&s2, "example.org", 0, 1, &N2_APEX) == X509_E_NAME_CONSTRAINT);
+  expect(chain(&s2, "x.example.org", 0, 1, &N2_WILD) == X509_OK);
+
+  expect(chain(&s3, "a.int.test", 0, 2, &N3_OK, &N3_INT) == X509_OK);
+  expect(chain(&s3, "x.test", 0, 2, &N3_BAD, &N3_INT) == X509_E_NAME_CONSTRAINT);
+  free(s1.certs);
+  free(s2.certs);
+  free(s3.certs);
+}
+
 int main(void)
 {
   test("verifies OpenSSL RSA signatures", verifies_openssl_signatures);
@@ -327,5 +401,7 @@ int main(void)
   test("verifies certificate chains", verifies_chains);
   test("checks real root signatures", checks_real_roots);
   test("verifies TLS handshake signatures", verifies_tls_signatures);
+  test("verifies RSASSA-PSS certificates", verifies_rsa_pss_certificates);
+  test("enforces name constraints", enforces_name_constraints);
   return 0;
 }

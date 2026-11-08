@@ -53,6 +53,12 @@ static const uint8_t OID_RSA[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01
 static const uint8_t OID_RSA_SHA256[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B};
 static const uint8_t OID_RSA_SHA384[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C};
 static const uint8_t OID_RSA_SHA512[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D};
+static const uint8_t OID_RSA_PSS[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A};
+static const uint8_t OID_MGF1[] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x08};
+static const uint8_t OID_SHA256[] = {0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01};
+static const uint8_t OID_SHA384[] = {0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02};
+static const uint8_t OID_SHA512[] = {0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03};
+static const uint8_t OID_NAME_CONSTRAINTS[] = {0x55, 0x1D, 0x1E};
 static const uint8_t OID_EC[] = {0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01};
 static const uint8_t OID_P256[] = {0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07};
 static const uint8_t OID_P384[] = {0x2B, 0x81, 0x04, 0x00, 0x22};
@@ -84,7 +90,8 @@ const char *x509_strerror(int err)
                                       "issuer is not a CA",
                                       "hostname mismatch",
                                       "certificate not valid for servers",
-                                      "no trusted root certificates installed"};
+                                      "no trusted root certificates installed",
+                                      "name constraint violated"};
   return err >= 0 && err < (int)(sizeof names / sizeof *names) ? names[err] : "unknown error";
 }
 
@@ -129,11 +136,63 @@ static int parse_time(const struct tlv *t, int64_t *out)
 
 /* ---------------------------------------------------------------- parse */
 
-static int sig_alg_of(const struct tlv *alg)
+/* A hash AlgorithmIdentifier (SHA-2 only) to pk_hash, or -1. */
+static int hash_of_alg(const struct tlv *alg)
 {
   const uint8_t *p = alg->val;
   struct tlv oid;
   if (tlv_expect(&p, alg->val + alg->vlen, 0x06, &oid))
+    return -1;
+  return OID_EQ(oid, OID_SHA256)   ? PK_SHA256
+         : OID_EQ(oid, OID_SHA384) ? PK_SHA384
+         : OID_EQ(oid, OID_SHA512) ? PK_SHA512
+                                   : -1;
+}
+
+/* RSASSA-PSS-params (RFC 4055): hash, MGF1 over the same hash, salt length. SHA-1 defaults are refused. */
+static int parse_pss_params(struct x509 *c, const uint8_t *p, const uint8_t *end)
+{
+  struct tlv params, f, inner;
+  if (tlv_expect(&p, end, 0x30, &params))
+    return -1;
+  p = params.val;
+  end = p + params.vlen;
+  int hash = -1, mgf_hash = -1;
+  uint32_t salt = 20;
+  while (p < end) {
+    if (tlv_read(&p, end, &f))
+      return -1;
+    const uint8_t *q = f.val, *qend = q + f.vlen;
+    if (f.tag == 0xA0) {
+      if (tlv_expect(&q, qend, 0x30, &inner))
+        return -1;
+      hash = hash_of_alg(&inner);
+    } else if (f.tag == 0xA1) {
+      struct tlv oid, h;
+      if (tlv_expect(&q, qend, 0x30, &inner))
+        return -1;
+      const uint8_t *m = inner.val, *mend = m + inner.vlen;
+      if (tlv_expect(&m, mend, 0x06, &oid) || !OID_EQ(oid, OID_MGF1) || tlv_expect(&m, mend, 0x30, &h))
+        return -1;
+      mgf_hash = hash_of_alg(&h);
+    } else if (f.tag == 0xA2) {
+      if (tlv_expect(&q, qend, 0x02, &inner) || inner.vlen != 1 || inner.val[0] > 64)
+        return -1;
+      salt = inner.val[0];
+    }
+  }
+  if (hash < 0 || hash != mgf_hash)
+    return -1;
+  c->pss_hash = hash;
+  c->pss_saltlen = salt;
+  return 0;
+}
+
+static int sig_alg_of(struct x509 *c, const struct tlv *alg)
+{
+  const uint8_t *p = alg->val, *end = p + alg->vlen;
+  struct tlv oid;
+  if (tlv_expect(&p, end, 0x06, &oid))
     return X509_SIG_NONE;
   if (OID_EQ(oid, OID_RSA_SHA256))
     return X509_SIG_RSA_SHA256;
@@ -149,6 +208,8 @@ static int sig_alg_of(const struct tlv *alg)
     return X509_SIG_ECDSA_SHA512;
   if (OID_EQ(oid, OID_ED25519))
     return X509_SIG_ED25519;
+  if (OID_EQ(oid, OID_RSA_PSS))
+    return parse_pss_params(c, p, end) ? X509_SIG_NONE : X509_SIG_RSA_PSS;
   return X509_SIG_NONE;
 }
 
@@ -250,6 +311,11 @@ static int parse_extension(struct x509 *c, const struct tlv *ext)
       return -1;
     c->san = t.val;
     c->sanlen = t.vlen;
+  } else if (OID_EQ(oid, OID_NAME_CONSTRAINTS)) {
+    if (tlv_expect(&v, vend, 0x30, &t))
+      return -1;
+    c->nc = t.val;
+    c->nclen = t.vlen;
   } else if (OID_EQ(oid, OID_EKU)) {
     if (tlv_expect(&v, vend, 0x30, &t))
       return -1;
@@ -300,7 +366,7 @@ int x509_parse(struct x509 *c, const uint8_t *der, uint32_t len)
   if (t.tag != 0x02 || tlv_expect(&p, end, 0x30, &inner_alg) || inner_alg.vlen != outer_alg.vlen ||
       memcmp(inner_alg.val, outer_alg.val, inner_alg.vlen))
     return X509_E_PARSE;
-  c->sig_alg = sig_alg_of(&inner_alg);
+  c->sig_alg = sig_alg_of(c, &inner_alg);
 
   if (tlv_expect(&p, end, 0x30, &issuer) || tlv_expect(&p, end, 0x30, &validity) ||
       tlv_expect(&p, end, 0x30, &subject) || tlv_expect(&p, end, 0x30, &spki))
@@ -488,6 +554,17 @@ int x509_check_signature(const struct x509 *c, const struct x509 *issuer)
   uint8_t digest[PK_HASH_MAX];
   if (c->sig_alg == X509_SIG_NONE)
     return X509_E_UNSUPPORTED;
+  if (c->sig_alg == X509_SIG_RSA_PSS) {
+    if (issuer->key_type != X509_KEY_RSA)
+      return X509_E_SIG;
+    if (issuer->keylen < 256)
+      return X509_E_WEAK;
+    pk_hash(c->pss_hash, c->tbs, c->tbslen, digest);
+    return rsa_verify_pss(issuer->key, issuer->keylen, issuer->rsa_e, issuer->rsa_elen, c->pss_hash, digest,
+                          c->pss_saltlen, c->sig, c->siglen)
+               ? X509_E_SIG
+               : X509_OK;
+  }
   if (c->sig_alg == X509_SIG_ED25519) {
     return issuer->key_type == X509_KEY_ED25519 && c->siglen == 64 &&
                    !ed25519_verify(c->sig, c->tbs, c->tbslen, issuer->key)
@@ -557,9 +634,92 @@ int x509_verify_tls_sig(const struct x509 *leaf, uint16_t scheme, const uint8_t 
   if (leaf->key_type != X509_KEY_RSA || leaf->keylen < 256)
     return X509_E_SIG;
   int bad = (scheme >> 8) == 0x08
-                ? rsa_verify_pss(leaf->key, leaf->keylen, leaf->rsa_e, leaf->rsa_elen, alg, digest, sig, siglen)
+                ? rsa_verify_pss(leaf->key, leaf->keylen, leaf->rsa_e, leaf->rsa_elen, alg, digest, dl, sig, siglen)
                 : rsa_verify_pkcs1(leaf->key, leaf->keylen, leaf->rsa_e, leaf->rsa_elen, alg, digest, sig, siglen);
   return bad ? X509_E_SIG : X509_OK;
+}
+
+/* ------------------------------------------------------- name constraints */
+
+/* Is dNSName `name` inside the constraint `cons` (the name itself or any subdomain)? A wildcard name
+ * stands for any single label under its base; an excluded subtree also catches a wildcard whose
+ * base contains it. */
+static int dns_in_subtree(const uint8_t *cons, uint32_t cl, const uint8_t *name, uint32_t nl, int excluded)
+{
+  int wild = nl > 2 && name[0] == '*' && name[1] == '.';
+  int leading = cl && cons[0] == '.';
+  if (leading) {
+    cons++;
+    cl--;
+  }
+  if (!cl)
+    return 1;
+  const uint8_t *n = wild ? name + 1 : name; /* ".example.com" stands in for "a.example.com" */
+  uint32_t len = wild ? nl - 1 : nl;
+  if (len >= cl && equal_nocase(n + len - cl, (const char *)cons, cl) &&
+      (len == cl ? !leading : n[len - cl - 1] == '.'))
+    return 1;
+  /* constraint at or below the wildcard's base: e.g. excluded bad.example.com vs *.example.com */
+  return excluded && wild && cl >= nl - 2 && equal_nocase(cons + cl - (nl - 2), (const char *)name + 2, nl - 2) &&
+         (cl == nl - 2 || cons[cl - (nl - 2) - 1] == '.');
+}
+
+static int ip_in_subtree(const uint8_t *cons, uint32_t cl, const uint8_t *ip, uint32_t il)
+{
+  if (cl != 2 * il)
+    return 0;
+  for (uint32_t i = 0; i < il; i++)
+    if ((ip[i] ^ cons[i]) & cons[il + i])
+      return 0;
+  return 1;
+}
+
+static int nc_check_name(const struct x509 *ca, uint8_t tag, const uint8_t *name, uint32_t nl)
+{
+  int has_permitted = 0, permitted = 0;
+  const uint8_t *p = ca->nc, *end = p + ca->nclen;
+  struct tlv group, sub, base;
+  while (p < end) {
+    if (tlv_read(&p, end, &group) || (group.tag != 0xA0 && group.tag != 0xA1))
+      return X509_E_PARSE;
+    const uint8_t *g = group.val, *gend = g + group.vlen;
+    while (g < gend) {
+      if (tlv_expect(&g, gend, 0x30, &sub))
+        return X509_E_PARSE;
+      const uint8_t *s = sub.val;
+      if (tlv_read(&s, sub.val + sub.vlen, &base))
+        return X509_E_PARSE;
+      if (base.tag != tag)
+        continue;
+      int excluded = group.tag == 0xA1;
+      int in = tag == 0x82 ? dns_in_subtree(base.val, base.vlen, name, nl, excluded)
+                           : ip_in_subtree(base.val, base.vlen, name, nl);
+      if (excluded && in)
+        return X509_E_NAME_CONSTRAINT;
+      if (!excluded) {
+        has_permitted = 1;
+        permitted |= in;
+      }
+    }
+  }
+  return has_permitted && !permitted ? X509_E_NAME_CONSTRAINT : X509_OK;
+}
+
+/* The leaf's DNS and IP names must satisfy the constraints `ca` imposes on everything below it. */
+static int names_ok(const struct x509 *ca, const struct x509 *leaf)
+{
+  if (!ca->nc)
+    return X509_OK;
+  const uint8_t *p = leaf->san, *end = p + leaf->sanlen;
+  struct tlv name;
+  while (p < end && !tlv_read(&p, end, &name)) {
+    if (name.tag != 0x82 && name.tag != 0x87)
+      continue;
+    int rc = nc_check_name(ca, name.tag, name.val, name.vlen);
+    if (rc)
+      return rc;
+  }
+  return X509_OK;
 }
 
 /* ---------------------------------------------------------------- chain */
@@ -620,6 +780,8 @@ int x509_verify_chain(const struct x509_store *store, const struct x509 *certs, 
       if (!rc2)
         rc2 = x509_check_signature(cur, a);
       if (!rc2)
+        rc2 = names_ok(a, leaf);
+      if (!rc2)
         rc2 = check_dates(a, now);
       if (!rc2)
         return host_match(leaf, host) ? X509_OK : X509_E_HOSTNAME;
@@ -634,6 +796,8 @@ int x509_verify_chain(const struct x509_store *store, const struct x509 *certs, 
       int rc2 = ca_allows(cand, 0, depth);
       if (!rc2)
         rc2 = x509_check_signature(cur, cand);
+      if (!rc2)
+        rc2 = names_ok(cand, leaf);
       if (rc2) {
         err = rc2;
         continue;

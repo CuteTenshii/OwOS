@@ -1,8 +1,9 @@
 /* x509.h — X.509 certificate parsing and chain verification (RFC 5280) for the TLS client.
  *
  * Parsed certificates point into the caller's DER buffer. Supported: RSA (PKCS#1 v1.5), ECDSA P-256/P-384
- * and Ed25519 signatures; subjectAltName host matching with single-label wildcards. Not supported: name
- * constraints, CRL/OCSP revocation, SHA-1 or RSASSA-PSS certificate signatures. */
+ * and Ed25519 signatures, plus RSASSA-PSS with SHA-2; subjectAltName host matching with single-label
+ * wildcards; DNS and IP name constraints (applied to the leaf's subjectAltName). Not supported: CRL/OCSP
+ * revocation and SHA-1 signatures. */
 #ifndef OWOS_PKI_X509_H
 #define OWOS_PKI_X509_H
 
@@ -17,10 +18,11 @@ enum {
   X509_E_SIG,         /* a signature in the chain does not verify */
   X509_E_EXPIRED,
   X509_E_NOT_YET,
-  X509_E_NOT_CA,   /* an issuer is not allowed to sign certificates */
-  X509_E_HOSTNAME, /* leaf does not cover the requested name */
-  X509_E_PURPOSE,  /* leaf is not valid for TLS server authentication */
-  X509_E_NO_STORE, /* no trusted root certificates are installed */
+  X509_E_NOT_CA,          /* an issuer is not allowed to sign certificates */
+  X509_E_HOSTNAME,        /* leaf does not cover the requested name */
+  X509_E_PURPOSE,         /* leaf is not valid for TLS server authentication */
+  X509_E_NO_STORE,        /* no trusted root certificates are installed */
+  X509_E_NAME_CONSTRAINT, /* the leaf's names fall outside an issuer's name constraints */
 };
 
 const char *x509_strerror(int err);
@@ -36,6 +38,7 @@ enum {
   X509_SIG_ECDSA_SHA384,
   X509_SIG_ECDSA_SHA512,
   X509_SIG_ED25519,
+  X509_SIG_RSA_PSS, /* hash and salt length in pss_hash / pss_saltlen */
 };
 
 struct x509 {
@@ -46,6 +49,8 @@ struct x509 {
   const uint8_t *sig; /* signature bits, unused-bits byte stripped */
   uint32_t siglen;
   int sig_alg;
+  int pss_hash; /* pk_hash value, for X509_SIG_RSA_PSS */
+  uint32_t pss_saltlen;
   const uint8_t *issuer; /* whole Name TLVs, compared bytewise */
   uint32_t issuerlen;
   const uint8_t *subject;
@@ -64,6 +69,8 @@ struct x509 {
   int eku_server_auth; /* serverAuth or anyExtendedKeyUsage */
   const uint8_t *san;  /* GeneralNames contents */
   uint32_t sanlen;
+  const uint8_t *nc; /* NameConstraints contents */
+  uint32_t nclen;
   int unsupported_critical; /* a critical extension we do not understand */
 };
 
