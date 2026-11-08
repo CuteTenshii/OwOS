@@ -677,8 +677,9 @@ static int parse_residuals(struct dec *d, int mbx, const struct mbinfo *mb, stru
  *  Reconstruction                                                         *
  * ====================================================================== */
 
-#define MUL1(a) ((((a) * 20091) >> 16) + (a))
-#define MUL2(a) (((a) * 35468) >> 16)
+/* Unsigned multiply: hostile coefficients may overflow, which must wrap rather than be UB. */
+#define MUL1(a) (((int)((unsigned)(a) * 20091u) >> 16) + (a))
+#define MUL2(a) ((int)((unsigned)(a) * 35468u) >> 16)
 
 static void transform_add(const int16_t *in, uint8_t *dst)
 {

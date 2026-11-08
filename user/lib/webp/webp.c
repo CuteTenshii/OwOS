@@ -965,37 +965,32 @@ static void apply_alpha(const unsigned char *alph, int size, unsigned char *rgba
   free(plane);
 }
 
-static int decode_lossy(const unsigned char *buf, const struct scan *s, unsigned char **out, unsigned *w, unsigned *h)
+static int decode_lossy(const unsigned char *vp8, int vp8_size, const unsigned char *alph, int alph_size,
+                        unsigned char **out, unsigned *w, unsigned *h)
 {
-  int rc = vp8_decode(buf + s->vp8_off, s->vp8_size, out, w, h);
+  int rc = vp8_decode(vp8, vp8_size, out, w, h);
   if (rc != VP8_OK)
     return rc == VP8_ENOMEM ? WEBP_ENOMEM : WEBP_EFORMAT;
-  if (s->has_alph)
-    apply_alpha(buf + s->alph_off, s->alph_size, *out, (int)*w, (int)*h);
+  if (alph)
+    apply_alpha(alph, alph_size, *out, (int)*w, (int)*h);
   return WEBP_OK;
 }
 
-int webp_decode(const unsigned char *buf, int len, unsigned char **out, unsigned *w, unsigned *h)
+/* Decode a bare VP8L chunk payload; *alpha_hint gets the header's alpha_is_used bit. */
+static int decode_lossless(const unsigned char *p, int size, unsigned char **out, unsigned *w, unsigned *h,
+                           int *alpha_hint)
 {
-  *out = 0;
-  struct scan s;
-  int rc = scan_container(buf, len, &s);
-  if (rc != WEBP_OK)
-    return rc;
-  if (s.has_anim)
-    return WEBP_EUNSUP;
-  if (!s.has_vp8l)
-    return s.has_vp8 ? decode_lossy(buf, &s, out, w, h) : WEBP_EFORMAT;
-
   struct br b;
-  br_init(&b, buf + s.vp8l_off, s.vp8l_size);
+  br_init(&b, p, size);
   if (br_read(&b, 8) != 0x2f)
     return WEBP_EFORMAT;
   int width = (int)br_read(&b, 14) + 1;
   int height = (int)br_read(&b, 14) + 1;
-  (void)br_read(&b, 1); /* alpha hint          */
+  int hint = (int)br_read(&b, 1);
   if (br_read(&b, 3) != 0)
     return WEBP_EUNSUP; /* version             */
+  if (alpha_hint)
+    *alpha_hint = hint;
 
   int err = 0;
   unsigned *argb = decode_stream(&b, width, height, 1, &err);
@@ -1020,11 +1015,294 @@ int webp_decode(const unsigned char *buf, int len, unsigned char **out, unsigned
   }
   free(argb);
   *out = rgba;
-  if (w)
-    *w = width;
-  if (h)
-    *h = height;
+  *w = width;
+  *h = height;
   return WEBP_OK;
+}
+
+/* ====================================================================== *
+ *  Animation                                                              *
+ * ====================================================================== */
+
+#define ANIM_MAX_EDGE 16384
+#define ANMF_HDR 16 /* X, Y, W-1, H-1, duration (3 bytes each) + flags */
+
+struct webp_anim {
+  const unsigned char *buf;
+  unsigned len;
+  unsigned cw, ch;
+  int loops;
+  unsigned pos;            /* next top-level chunk to examine         */
+  unsigned frame_num;      /* frames composed since open / rewind     */
+  int prev_dispose_bg;     /* previous frame's dispose-to-background  */
+  unsigned px, py, pw, ph; /* previous frame rect                     */
+  int prev_key;            /* previous frame was a key frame          */
+};
+
+/* libwebp's BlendPixelNonPremult: composite `src` over `dst` (both straight RGBA), result into dst. */
+static void blend_pixel(const unsigned char *src, unsigned char *dst)
+{
+  unsigned src_a = src[3];
+  if (src_a == 0)
+    return;
+  if (src_a == 0xff) {
+    memcpy(dst, src, 4);
+    return;
+  }
+  unsigned dst_a = (dst[3] * (256 - src_a)) >> 8;
+  unsigned blend_a = (src_a + dst_a) & 0xff;
+  unsigned scale = (1u << 24) / blend_a;
+  for (int c = 0; c < 3; c++)
+    dst[c] = (unsigned char)(((src[c] * src_a + dst[c] * dst_a) * scale) >> 24);
+  dst[3] = (unsigned char)blend_a;
+}
+
+int webp_anim_open(struct webp_anim **out, const unsigned char *data, int len, unsigned *w, unsigned *h)
+{
+  *out = 0;
+  struct scan s;
+  int rc = scan_container(data, len, &s);
+  if (rc != WEBP_OK)
+    return rc;
+  int flag = s.has_vp8x && s.vp8x_off + 10 <= len && (data[s.vp8x_off] & 0x02);
+  if (!s.has_anim && !flag)
+    return WEBP_EUNSUP;
+  if (!s.has_vp8x || s.vp8x_off + 10 > len)
+    return WEBP_EFORMAT;
+  const unsigned char *v = data + s.vp8x_off;
+  unsigned cw = 1 + (v[4] | (v[5] << 8) | (v[6] << 16));
+  unsigned ch = 1 + (v[7] | (v[8] << 8) | (v[9] << 16));
+  if (cw > ANIM_MAX_EDGE || ch > ANIM_MAX_EDGE)
+    return WEBP_EFORMAT;
+
+  int loops = 0, frames = 0;
+  unsigned pos = 12;
+  while (pos + 8 <= (unsigned)len) {
+    const unsigned char *c = data + pos;
+    unsigned size = le32(c + 4);
+    unsigned payload = pos + 8;
+    unsigned avail = (unsigned)len - payload;
+    unsigned psize = size < avail ? size : avail;
+    if (tag_is(c, "ANIM") && psize >= 6)
+      loops = c[8 + 4] | (c[8 + 5] << 8);
+    else if (tag_is(c, "ANMF")) {
+      if (psize < ANMF_HDR)
+        return WEBP_EFORMAT;
+      const unsigned char *f = c + 8;
+      unsigned x = 2 * (f[0] | (f[1] << 8) | (f[2] << 16));
+      unsigned y = 2 * (f[3] | (f[4] << 8) | (f[5] << 16));
+      unsigned fw = 1 + (f[6] | (f[7] << 8) | (f[8] << 16));
+      unsigned fh = 1 + (f[9] | (f[10] << 8) | (f[11] << 16));
+      if (x + fw > cw || y + fh > ch)
+        return WEBP_EFORMAT;
+      frames++;
+    }
+    unsigned next = payload + size + (size & 1);
+    if (next <= pos)
+      break;
+    pos = next;
+  }
+  if (!frames)
+    return WEBP_EFORMAT;
+
+  struct webp_anim *a = calloc(1, sizeof *a);
+  if (!a)
+    return WEBP_ENOMEM;
+  a->buf = data;
+  a->len = (unsigned)len;
+  a->cw = cw;
+  a->ch = ch;
+  a->loops = loops;
+  a->pos = 12;
+  *out = a;
+  *w = cw;
+  *h = ch;
+  return WEBP_OK;
+}
+
+/* Decode one ANMF payload's image into a fresh RGBA buffer; *has_alpha as libwebp's demuxer reports it. */
+static int anim_decode_frame(const unsigned char *p, unsigned size, unsigned char **rgba, unsigned *w, unsigned *h,
+                             int *has_alpha)
+{
+  const unsigned char *alph = 0;
+  int alph_size = 0;
+  *has_alpha = 0;
+  unsigned pos = 0;
+  while (pos + 8 <= size) {
+    const unsigned char *c = p + pos;
+    unsigned csize = le32(c + 4);
+    unsigned avail = size - (pos + 8);
+    unsigned psize = csize < avail ? csize : avail;
+    if (tag_is(c, "ALPH") && !alph) {
+      alph = c + 8;
+      alph_size = (int)psize;
+      *has_alpha = 1;
+    } else if (tag_is(c, "VP8 ")) {
+      return decode_lossy(c + 8, (int)psize, alph, alph_size, rgba, w, h);
+    } else if (tag_is(c, "VP8L")) {
+      int hint = 0;
+      int rc = decode_lossless(c + 8, (int)psize, rgba, w, h, &hint);
+      if (rc == WEBP_OK && hint)
+        *has_alpha = 1;
+      return rc;
+    }
+    unsigned next = pos + 8 + csize + (csize & 1);
+    if (next <= pos)
+      break;
+    pos = next;
+  }
+  return WEBP_EFORMAT;
+}
+
+int webp_anim_next(struct webp_anim *a, unsigned char *canvas, int *delay_ms)
+{
+  while (a->pos + 8 <= a->len) {
+    const unsigned char *c = a->buf + a->pos;
+    unsigned size = le32(c + 4);
+    unsigned payload = a->pos + 8;
+    unsigned avail = a->len - payload;
+    unsigned psize = size < avail ? size : avail;
+    unsigned next = payload + size + (size & 1);
+    unsigned here = a->pos;
+    a->pos = next > here ? next : a->len;
+    if (!tag_is(c, "ANMF"))
+      continue;
+    if (psize < ANMF_HDR)
+      return WEBP_EFORMAT;
+
+    const unsigned char *f = c + 8;
+    unsigned x = 2 * (f[0] | (f[1] << 8) | (f[2] << 16));
+    unsigned y = 2 * (f[3] | (f[4] << 8) | (f[5] << 16));
+    unsigned fw = 1 + (f[6] | (f[7] << 8) | (f[8] << 16));
+    unsigned fh = 1 + (f[9] | (f[10] << 8) | (f[11] << 16));
+    int duration = f[12] | (f[13] << 8) | (f[14] << 16);
+    int dispose_bg = f[15] & 1, no_blend = (f[15] >> 1) & 1;
+    if (x + fw > a->cw || y + fh > a->ch)
+      return WEBP_EFORMAT;
+
+    unsigned char *rgba;
+    unsigned dw, dh;
+    int has_alpha;
+    int rc = anim_decode_frame(f + ANMF_HDR, psize - ANMF_HDR, &rgba, &dw, &dh, &has_alpha);
+    if (rc != WEBP_OK)
+      return rc;
+    if (dw != fw || dh != fh) {
+      free(rgba);
+      return WEBP_EFORMAT;
+    }
+
+    /* Key frame: the canvas is (or may as well be) fully transparent before this frame, so no blending. */
+    int full = fw == a->cw && fh == a->ch;
+    int key;
+    if (a->frame_num == 0)
+      key = 1;
+    else if ((!has_alpha || no_blend) && full)
+      key = 1;
+    else
+      key = a->prev_dispose_bg && ((a->pw == a->cw && a->ph == a->ch) || a->prev_key);
+
+    if (a->frame_num > 0 && a->prev_dispose_bg)
+      for (unsigned r = 0; r < a->ph; r++)
+        memset(canvas + ((unsigned)(a->py + r) * a->cw + a->px) * 4, 0, (unsigned)a->pw * 4);
+    if (key)
+      memset(canvas, 0, a->cw * a->ch * 4);
+
+    /* Pixels over the area the previous frame just disposed are written, not blended (as libwebp does). */
+    int disposed = a->frame_num > 0 && a->prev_dispose_bg;
+    for (unsigned r = 0; r < fh; r++) {
+      const unsigned char *src = rgba + r * fw * 4;
+      unsigned char *dst = canvas + ((y + r) * a->cw + x) * 4;
+      int row_in = disposed && y + r >= a->py && y + r < a->py + a->ph;
+      for (unsigned i = 0; i < fw; i++) {
+        int in = row_in && x + i >= a->px && x + i < a->px + a->pw;
+        if (key || no_blend || in)
+          memcpy(dst + i * 4, src + i * 4, 4);
+        else
+          blend_pixel(src + i * 4, dst + i * 4);
+      }
+    }
+    free(rgba);
+
+    a->frame_num++;
+    a->prev_dispose_bg = dispose_bg;
+    a->px = x;
+    a->py = y;
+    a->pw = fw;
+    a->ph = fh;
+    a->prev_key = key;
+    *delay_ms = duration;
+    return 1;
+  }
+  return 0;
+}
+
+void webp_anim_rewind(struct webp_anim *a, unsigned char *canvas)
+{
+  a->pos = 12;
+  a->frame_num = 0;
+  a->prev_dispose_bg = 0;
+  a->prev_key = 0;
+  memset(canvas, 0, a->cw * a->ch * 4);
+}
+
+int webp_anim_loops(const struct webp_anim *a) { return a->loops; }
+
+void webp_anim_close(struct webp_anim *a) { free(a); }
+
+int webp_decode(const unsigned char *buf, int len, unsigned char **out, unsigned *w, unsigned *h)
+{
+  *out = 0;
+  struct scan s;
+  int rc = scan_container(buf, len, &s);
+  if (rc != WEBP_OK)
+    return rc;
+  if (s.has_anim) {
+    struct webp_anim *a;
+    unsigned cw, ch;
+    int delay;
+    rc = webp_anim_open(&a, buf, len, &cw, &ch);
+    if (rc != WEBP_OK)
+      return rc;
+    unsigned char *canvas = calloc((unsigned)cw * ch, 4);
+    if (!canvas) {
+      webp_anim_close(a);
+      return WEBP_ENOMEM;
+    }
+    rc = webp_anim_next(a, canvas, &delay);
+    webp_anim_close(a);
+    if (rc != 1) {
+      free(canvas);
+      return rc < 0 ? rc : WEBP_EFORMAT;
+    }
+    *out = canvas;
+    if (w)
+      *w = cw;
+    if (h)
+      *h = ch;
+    return WEBP_OK;
+  }
+  if (s.has_vp8l) {
+    unsigned lw, lh;
+    rc = decode_lossless(buf + s.vp8l_off, s.vp8l_size, out, &lw, &lh, 0);
+    if (rc == WEBP_OK) {
+      if (w)
+        *w = lw;
+      if (h)
+        *h = lh;
+    }
+    return rc;
+  }
+  if (!s.has_vp8)
+    return WEBP_EFORMAT;
+  unsigned lw, lh;
+  rc = decode_lossy(buf + s.vp8_off, s.vp8_size, s.has_alph ? buf + s.alph_off : 0, s.alph_size, out, &lw, &lh);
+  if (rc == WEBP_OK) {
+    if (w)
+      *w = lw;
+    if (h)
+      *h = lh;
+  }
+  return rc;
 }
 
 /* ====================================================================== *
