@@ -11,12 +11,20 @@ void owos_test_register(struct owos_test_case *test);
 void owos_test_section(const char *name);
 void owos_expect(int condition, const char *file, int line, const char *expr);
 void owos_expect_string(const char *got, const char *want, const char *file, int line, const char *expr);
+/* Run fn(id, workers, ctx) in `workers` forked processes (<= 0: one per CPU) and wait for all. A worker that
+ * fails an expectation or crashes fails the calling suite. Results must come back through the exit status or
+ * shared memory (mmap MAP_SHARED), since each worker has its own copy of every global. */
+void owos_parallel(int workers, void (*fn)(int id, int workers, void *ctx), void *ctx);
+void owos_expect_int(long long got, long long want, const char *file, int line, const char *expr);
 
 #define expect(condition) \
 	owos_expect((condition), __FILE__, __LINE__, #condition)
 #define test(name) owos_test_section(name)
 #define expect_string(got, want) \
 	owos_expect_string((got), (want), __FILE__, __LINE__, #got " == " #want)
+/* Integer equality that reports both values on failure. */
+#define expect_eq(got, want) \
+	owos_expect_int((long long)(got), (long long)(want), __FILE__, __LINE__, #got " == " #want)
 
 #ifdef OWOS_TEST_NAME
 #define OWOS_JOIN_(a, b) a##b

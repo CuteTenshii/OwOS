@@ -36,7 +36,7 @@ include run.mk
 all: $(KERNEL)
 
 test:
-	./scripts/run-tests.sh
+	./scripts/run-tests.sh $(T)
 
 format:
 	@command -v $(CLANG_FORMAT) >/dev/null 2>&1 || { echo "error: $(CLANG_FORMAT) not found" >&2; exit 1; }
@@ -66,4 +66,5 @@ clean:
 
 # Also remove the disk images (wipes stored files).
 distclean: clean
+	rm -rf build
 	rm -f $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)

@@ -13,6 +13,7 @@
 #define OWOS_HEAP_H
 #define OWOS_KSTRING_H
 
+#include <execinfo.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -21,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -1095,6 +1097,8 @@ static void on_alarm(int sig)
   int n = snprintf(msg, sizeof msg, "btrfs_test: hang detected (fuzz iteration %d)\n", g_iter);
   if (write(2, msg, (size_t)n) < 0)
     _exit(3);
+  void *bt[40];
+  backtrace_symbols_fd(bt, backtrace(bt, 40), 2);
   _exit(3);
 }
 
@@ -1537,41 +1541,61 @@ static void t_cache_and_perf(void)
 
 /* ---------------------------------------------------------------- allocation failures */
 
+struct oom_ctx {
+	const struct bb *b;
+	int mode;
+	long *points; /* shared: allocation points reached, per worker */
+};
+
+static void oom_worker(int id, int workers, void *arg)
+{
+	struct oom_ctx *c = arg;
+	for (long k = id;; k += workers) {
+		g_allocs = 0;
+		g_fail_at = c->mode == 0 ? k : -1;
+		g_fail_from = c->mode == 1 ? k : -1;
+		void *m = mount_bb(c->b);
+		if (m) {
+			walk_all(m);
+			btrfs_ops()->close(m);
+		}
+		bool hit = g_allocs > k;
+		g_fail_at = g_fail_from = -1;
+		if (g_live != 0) {
+			printf("  leak after failing allocation %ld (mode %d): %ld live\n", k, c->mode, g_live);
+			expect(false);
+			return;
+		}
+		if (!hit) {
+			c->points[id] = k;
+			return;
+		}
+	}
+}
+
 static void t_oom(void)
 {
-  struct bb b;
-  test("btrfs: allocation failures leave nothing behind");
-  g_many = 24;
-  build_main(&b, &kPlain);
-  g_many = 700;
-  unsigned saved_budget = g_walk_budget;
-  g_walk_budget = 80;
-  for (int mode = 0; mode < 2; mode++) {
-    for (long k = 0; k < 6000; k++) {
-      g_allocs = 0;
-      g_fail_at = mode == 0 ? k : -1;
-      g_fail_from = mode == 1 ? k : -1;
-      void *m = mount_bb(&b);
-      if (m) {
-        walk_all(m);
-        btrfs_ops()->close(m);
-      }
-      bool hit = g_allocs > k;
-      g_fail_at = g_fail_from = -1;
-      if (g_live != 0) {
-        printf("  leak after failing allocation %ld (mode %d): %ld live\n", k, mode, g_live);
-        expect(false);
-        g_live = 0;
-        break;
-      }
-      if (!hit) {
-        printf("  mode %d: %ld allocation points exercised\n", mode, k);
-        break;
-      }
-    }
-  }
-  g_walk_budget = saved_budget;
-  bb_free(&b);
+	struct bb b;
+	test("btrfs: allocation failures leave nothing behind");
+	g_many = 24;
+	build_main(&b, &kPlain);
+	g_many = 700;
+	unsigned saved_budget = g_walk_budget;
+	g_walk_budget = 80;
+	int workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
+	long *points = mmap(0, sizeof *points * (size_t)workers, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+	for (int mode = 0; mode < 2; mode++) {
+		struct oom_ctx c = {&b, mode, points};
+		owos_parallel(workers, oom_worker, &c);
+		long reached = 0;
+		for (int i = 0; i < workers; i++)
+			if (points[i] > reached)
+				reached = points[i];
+		printf("  mode %d: %ld allocation points exercised\n", mode, reached);
+	}
+	munmap(points, sizeof *points * (size_t)workers);
+	g_walk_budget = saved_budget;
+	bb_free(&b);
 }
 
 /* ---------------------------------------------------------------- decoders */
@@ -1785,60 +1809,52 @@ struct undo {
   uint8_t old;
 };
 
-static void t_fuzz(void)
-{
-  struct bb b;
-  test("btrfs: seeded corruption fuzz of mount, listing and reads");
-  struct cfg c = {.nodesize = 4096, .sectorsize = 4096, .leaf_max = 12, .ptr_max = 5};
-  g_many = 40;
-  build_main(&b, &c);
-  g_many = 700;
+struct fuzz_ctx {
+  struct bb *b;
   struct {
     size_t base, len;
     unsigned weight;
-  } reg_[] = {
-      {0x10000, 4096, 12},
-      {b.ch[0].st[0].off, (size_t)(b.sys_next - b.ch[0].logical), 12},
-      {b.ch[1].st[0].off, (size_t)(b.meta_next - b.ch[1].logical), 60},
-      {b.ch[2].st[0].off, (size_t)(b.data_next - b.ch[2].logical), 16},
-  };
-  unsigned total_w = 0;
-  for (size_t i = 0; i < 4; i++)
-    total_w += reg_[i].weight;
+  } reg[4];
+  unsigned total_w;
+  int iters, only;
+  unsigned *mounted; /* shared, one slot per worker */
+};
 
-  const char *env = getenv("BTRFS_FUZZ_ITERS");
-  int iters = env ? atoi(env) : 3000;
-  const char *only_env = getenv("BTRFS_FUZZ_ONLY");
-  int only = only_env ? atoi(only_env) : -1;
+/* Worker `id` runs iterations id, id + workers, ... on its own copy of the image, each from a seed of its own. */
+static void fuzz_worker(int id, int workers, void *arg)
+{
+  struct fuzz_ctx *c = arg;
+  struct bb *b = c->b;
   unsigned mounted = 0;
-  g_rng = 0xB7F5u;
+  g_rng = 0xB7F5u + (unsigned)id * 0x9E3779B1u;
   unsigned saved_budget = g_walk_budget;
   g_walk_budget = 400;
   struct undo log[16];
-  for (int it = 0; it < iters; it++) {
+  for (int it = id; it < c->iters; it += workers) {
     g_iter = it;
     guard(30);
     int nm = 1 + rnd() % 6, nlog = 0;
     for (int k = 0; k < nm; k++) {
-      unsigned w = rnd() % total_w, r = 0;
-      while (w >= reg_[r].weight)
-        w -= reg_[r++].weight;
-      size_t pos = reg_[r].base + rnd() % reg_[r].len;
+      unsigned w = rnd() % c->total_w, r = 0;
+      while (w >= c->reg[r].weight)
+        w -= c->reg[r++].weight;
+      size_t pos = c->reg[r].base + rnd() % c->reg[r].len;
       log[nlog].pos = pos;
-      log[nlog++].old = b.img[pos];
+      log[nlog++].old = b->img[pos];
       static const uint8_t special[] = {0x00, 0xFF, 0x7F, 0x80, 0x01};
       uint32_t how = rnd() % 4;
-      b.img[pos] = how == 0 ? special[rnd() % 5] : how == 1 ? (uint8_t)(b.img[pos] ^ (1u << (rnd() % 8))) : (uint8_t)rnd();
+      b->img[pos] =
+          how == 0 ? special[rnd() % 5] : how == 1 ? (uint8_t)(b->img[pos] ^ (1u << (rnd() % 8))) : (uint8_t)rnd();
     }
     uint8_t keep[4];
     bool resealed = rnd() % 2 == 0;
-    memcpy(keep, b.img + 0x10000, 4);
+    memcpy(keep, b->img + 0x10000, 4);
     if (resealed)
-      fix_sb(b.img + 0x10000);
-    size_t size = b.size;
+      fix_sb(b->img + 0x10000);
+    size_t size = b->size;
     if (rnd() % 20 == 0)
-      size = 0x10000 + rnd() % (reg_[3].base + reg_[3].len);
-    void *m = only >= 0 && it != only ? NULL : mount_dev(b.img, size);
+      size = 0x10000 + rnd() % (c->reg[3].base + c->reg[3].len);
+    void *m = c->only >= 0 && it != c->only ? NULL : mount_dev(b->img, size);
     if (m) {
       mounted++;
       walk_all(m);
@@ -1847,14 +1863,43 @@ static void t_fuzz(void)
       expect(g_live == 0);
     }
     if (resealed)
-      memcpy(b.img + 0x10000, keep, 4);
+      memcpy(b->img + 0x10000, keep, 4);
     while (nlog--)
-      b.img[log[nlog].pos] = log[nlog].old;
+      b->img[log[nlog].pos] = log[nlog].old;
   }
   guard(0);
   g_walk_budget = saved_budget;
-  printf("  %d iterations, %u mounted\n", iters, mounted);
-  expect(mounted > (unsigned)iters / 4);
+  c->mounted[id] = mounted;
+}
+
+static void t_fuzz(void)
+{
+  struct bb b;
+  test("btrfs: seeded corruption fuzz of mount, listing and reads");
+  struct cfg c = {.nodesize = 4096, .sectorsize = 4096, .leaf_max = 12, .ptr_max = 5};
+  g_many = 40;
+  build_main(&b, &c);
+  g_many = 700;
+  struct fuzz_ctx fc = {.b = &b,
+                        .reg = {{0x10000, 4096, 12},
+                                {b.ch[0].st[0].off, (size_t)(b.sys_next - b.ch[0].logical), 12},
+                                {b.ch[1].st[0].off, (size_t)(b.meta_next - b.ch[1].logical), 60},
+                                {b.ch[2].st[0].off, (size_t)(b.data_next - b.ch[2].logical), 16}}};
+  for (size_t i = 0; i < 4; i++)
+    fc.total_w += fc.reg[i].weight;
+  const char *env = getenv("BTRFS_FUZZ_ITERS");
+  fc.iters = env ? atoi(env) : 3000;
+  const char *only_env = getenv("BTRFS_FUZZ_ONLY");
+  fc.only = only_env ? atoi(only_env) : -1;
+  int workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
+  fc.mounted = mmap(0, sizeof *fc.mounted * (size_t)workers, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+  owos_parallel(workers, fuzz_worker, &fc);
+  unsigned mounted = 0;
+  for (int i = 0; i < workers; i++)
+    mounted += fc.mounted[i];
+  printf("  %d iterations, %u mounted\n", fc.iters, mounted);
+  expect(mounted > (unsigned)fc.iters / 4);
+  munmap(fc.mounted, sizeof *fc.mounted * (size_t)workers);
   void *m = mount_bb(&b);
   expect(m != NULL);
   if (m)
