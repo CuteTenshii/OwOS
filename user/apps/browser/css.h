@@ -4,7 +4,7 @@
 
 #include "dom.h"
 
-enum { CSS_DISP_UNSET = 0, CSS_DISP_INLINE, CSS_DISP_BLOCK, CSS_DISP_NONE };
+enum { CSS_DISP_UNSET = 0, CSS_DISP_INLINE, CSS_DISP_BLOCK, CSS_DISP_NONE, CSS_DISP_CONTENTS };
 enum css_pos { CSS_POS_STATIC = 0, CSS_POS_REL, CSS_POS_ABS, CSS_POS_FIXED, CSS_POS_STICKY };
 /* flex justify-content and align-items. */
 enum css_justify {

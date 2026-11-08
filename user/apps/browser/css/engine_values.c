@@ -546,10 +546,12 @@ void parse_content(const char *v, char *out, int cap)
 
 int parse_disp(const char *v)
 {
-  while (*v == ' ')
+  while (*v == ' ' || *v == '\t')
     v++;
   if (starts_ci(v, "none"))
     return CSS_DISP_NONE;
+  if (starts_ci(v, "contents"))
+    return CSS_DISP_CONTENTS;
   if (starts_ci(v, "inline"))
     return CSS_DISP_INLINE;
   return CSS_DISP_BLOCK; /* block/flex/grid/table */

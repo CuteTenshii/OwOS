@@ -394,6 +394,8 @@ static void style_emit_computed(struct dom_node *n)
     sty_kv_str(&dt_sty, "display", "inline");
   else if (s.disp == CSS_DISP_NONE)
     sty_kv_str(&dt_sty, "display", "none");
+  else if (s.disp == CSS_DISP_CONTENTS)
+    sty_kv_str(&dt_sty, "display", "contents");
   sty_kv_px(&dt_sty, "width", s.width);
   sty_kv_px(&dt_sty, "height", s.height);
   if (s.box_sizing >= 0)

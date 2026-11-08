@@ -228,8 +228,8 @@ static void walk_element_inner(struct dom_node *el)
 
   struct css_style cs;
   compute_style(el, &cs);
-  if (cs.disp == CSS_DISP_NONE)
-    return;                                       /* display:none */
+  if (cs.disp == CSS_DISP_NONE || (cs.disp == CSS_DISP_UNSET && dom_get_attr(el, "hidden")))
+    return;                                       /* display:none, or [hidden] with no author display */
   anim_apply(sheet_for(el), el, &cs, g_walk_now); /* overlay @keyframes / transition */
   if (streq(name, "dialog") || dom_get_attr(el, "popover"))
     g_has_controls = true; /* route clicks and Escape to the page */
@@ -426,7 +426,9 @@ static void walk_element_inner(struct dom_node *el)
   if (cs.list_style != CSS_LST_DEFAULT)
     W_liststyle = cs.list_style;
 
-  int blk = (cs.disp == CSS_DISP_BLOCK) ? 1 : (cs.disp == CSS_DISP_INLINE) ? 0 : is_block_tag(name);
+  int blk = (cs.disp == CSS_DISP_BLOCK) ? 1 : (cs.disp == CSS_DISP_UNSET) ? is_block_tag(name) : 0;
+  if (cs.disp == CSS_DISP_CONTENTS)
+    cs.bg = -1; /* no box of its own, so no background */
   if (cs.pos == CSS_POS_FIXED)
     blk = 1; /* a fixed box is blockified so it gets a layout box */
 
