@@ -1275,12 +1275,13 @@ static int load_file_url(const char *url)
   return 0;
 }
 
-/* data:[<mediatype>][;base64],<data>: decode into B->pg->raw via decode_data_url; sets ctype. */
+/* data:[<mediatype>][;base64],<data> or blob: URL: load into B->pg->raw; sets ctype. */
 static int load_data_url(const char *url)
 {
   int len = 0;
   B->pg->ctype[0] = '\0';
-  unsigned char *buf = decode_data_url(url, &len, B->pg->ctype, sizeof B->pg->ctype);
+  unsigned char *buf = starts_ci(url, "blob:") ? blobstore_get(url, &len, B->pg->ctype, sizeof B->pg->ctype)
+                                               : decode_data_url(url, &len, B->pg->ctype, sizeof B->pg->ctype);
   if (!buf)
     return -1;
   B->pg->raw_len = 0;
@@ -1329,8 +1330,8 @@ void do_fetch(void)
   B->req_body_len = 0;
 
   /* file: and data: never touch the network; they fill raw + ctype and render like a fetched page. */
-  if (starts_ci(url, "file:") || starts_ci(url, "data:")) {
-    bool data = starts_ci(url, "data:");
+  if (starts_ci(url, "file:") || starts_ci(url, "data:") || starts_ci(url, "blob:")) {
+    bool data = !starts_ci(url, "file:");
     B->pg->ctype[0] = '\0';
     B->dl_name[0] = '\0';
     B->cdisp_attach = 0;
@@ -1338,7 +1339,7 @@ void do_fetch(void)
     B->pg->n_imgs = 0;
     int rc = data ? load_data_url(url) : load_file_url(url);
     if (rc < 0) {
-      const char *msg = data ? "Malformed data: URL" : "Cannot open file (not found or not absolute)";
+      const char *msg = data ? "Malformed data: or blob: URL" : "Cannot open file (not found or not absolute)";
       show_error(msg);
       {
         struct net_log e = {"GET", url, 0, 0, 0, 0, 0, NET_FAILED, msg};

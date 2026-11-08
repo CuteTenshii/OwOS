@@ -556,6 +556,12 @@ static unsigned char *browser_fetch_raw(const struct http_req *rq, struct http_r
     rs->hdr[0] = '\0';
 
   /* Cache: only bodyless GETs; fresh hits skip the wire, stale ones revalidate (304 reuses body). */
+  if (starts_ci(full, "blob:")) {
+    unsigned char *b = is_get ? blobstore_get(full, &rs->len, rs->ctype, sizeof rs->ctype) : 0;
+    rs->status = b ? 200 : 0;
+    return b;
+  }
+
   bool cacheable = streq_ci(method, "GET") && !(rq->body && rq->body_len > 0);
   long now = (long)rtc_epoch();
   bool revalidating = false;
@@ -837,6 +843,22 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
   if (status)
     *status = 0;
   unsigned t0 = msec();
+  if (starts_ci(full, "blob:")) {
+    int blen = 0;
+    unsigned char *b = blobstore_get(full, &blen, 0, 0);
+    if (!b)
+      return -1;
+    if (status)
+      *status = 200;
+    if (stream_begin(file) != 0) {
+      free(b);
+      return -1;
+    }
+    int wrote = stream_write(b, blen);
+    free(b);
+    long committed = stream_end();
+    return wrote < 0 ? -1 : committed;
+  }
   int nid = devtools_net_begin("GET", full); /* in-flight until the download resolves */
 
   for (int hop = 0; hop <= MAX_REDIR; hop++) {
@@ -1449,9 +1471,10 @@ static void iframe_job(void *vctx, int i)
   r->ctype[0] = '\0';
   r->reason[0] = '\0';
 
-  if (starts_ci(r->url, "data:")) {
+  if (starts_ci(r->url, "data:") || starts_ci(r->url, "blob:")) {
     int len = 0;
-    unsigned char *body = decode_data_url(r->url, &len, r->ctype, sizeof r->ctype);
+    unsigned char *body = starts_ci(r->url, "blob:") ? blobstore_get(r->url, &len, r->ctype, sizeof r->ctype)
+                                                     : decode_data_url(r->url, &len, r->ctype, sizeof r->ctype);
     if (body) {
       r->kind = FRAME_OK;
       r->body = body;
@@ -1459,7 +1482,7 @@ static void iframe_job(void *vctx, int i)
     } else {
       r->kind = FRAME_ERROR;
       int k = 0;
-      sapp(r->reason, &k, sizeof r->reason, "bad data: URL");
+      sapp(r->reason, &k, sizeof r->reason, "bad data: or blob: URL");
     }
     return;
   }
@@ -1700,11 +1723,12 @@ void subres_get_batch(char *const *urls, int n, const char *accept, unsigned cha
     return;
   }
 
-  /* data: URLs decode inline (origin_of rejects them); mark handled even on failure. */
+  /* data: and blob: URLs resolve inline (origin_of rejects them); mark handled even on failure. */
   for (int i = 0; i < n; i++) {
-    if (starts_ci(urls[i], "data:")) {
+    if (starts_ci(urls[i], "data:") || starts_ci(urls[i], "blob:")) {
       char ct[64];
-      bodies[i] = decode_data_url(urls[i], &lens[i], ct, sizeof ct);
+      bodies[i] = starts_ci(urls[i], "blob:") ? blobstore_get(urls[i], &lens[i], ct, sizeof ct)
+                                              : decode_data_url(urls[i], &lens[i], ct, sizeof ct);
       handled[i] = true;
     }
   }

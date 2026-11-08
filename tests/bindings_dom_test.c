@@ -221,6 +221,29 @@ static void test_custom_elements_lifecycle_and(void)
              "expect(err==='NotSupportedError', 'redefinition throws: '+err);\n");
 }
 
+static void test_blob_object_urls(void)
+{
+  unsigned char *body;
+  char type[64];
+  int len = 0;
+  js_value url;
+  run_script("var u=window.u=URL.createObjectURL(new Blob(['hello',' ','world'],{type:'text/plain'}));\n"
+             "expect(u.indexOf('blob:https://example.com/')===0, 'blob: url on the page origin: '+u);\n"
+             "expect(URL.createObjectURL(new Blob(['x']))!==u, 'urls are unique');\n"
+             "var threw=false; try{ URL.createObjectURL('nope') }catch(e){ threw=true }\n"
+             "expect(threw, 'non-Blob argument throws');\n");
+  url = js_get(g_ctx, js_obj_value(g_ctx->global), "u");
+  expect(url.type == JV_STR);
+  if (url.type != JV_STR)
+    return;
+  body = blobstore_get(url.u.str->data, &len, type, sizeof type);
+  expect(body != 0 && len == 11 && memcmp(body, "hello world", 11) == 0);
+  expect(strcmp(type, "text/plain") == 0);
+  free(body);
+  run_script("URL.revokeObjectURL(u);\n");
+  expect(blobstore_get(url.u.str->data, &len, type, sizeof type) == 0);
+}
+
 static void test_timers_unused_slots_hold(void)
 {
   run_script("var n=0; setTimeout(function(){ n++ }, 10); setInterval(function(){ n++ }, 1000);\n");
@@ -250,6 +273,7 @@ int main(void)
   test("dialog open state, returnValue and events", test_dialog_open_state_returnvalue);
   test("popover API: show, hide, toggle, events and light dismiss", test_popover_api_show_hide);
   test("custom elements: lifecycle and registry validation", test_custom_elements_lifecycle_and);
+  test("URL.createObjectURL stores Blob bytes until revoked", test_blob_object_urls);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 
   return 0;

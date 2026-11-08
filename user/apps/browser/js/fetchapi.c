@@ -94,7 +94,10 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     } else {
       s = arg_str(ctx, in);
     }
-    resolve_url(g_page_url_buf, s, url, sizeof url);
+    if (starts_ci(s, "blob:"))
+      strlcpy(url, s, sizeof url);
+    else
+      resolve_url(g_page_url_buf, s, url, sizeof url);
   }
   if (B->pg->csp) { /* CSP connect-src */
     char use[URL_MAX], reason[64];
@@ -172,7 +175,7 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     rq.body_len = reqlen;
     rq.ctype = req_ctype[0] ? req_ctype : 0;
     rq.extra_hdrs = extra_hdrs[0] ? extra_hdrs : 0;
-    body = browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
+    body = starts_ci(url, "blob:") ? browser_fetch(&rq, &rs) : browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
     status = rs.status;
     outlen = rs.len;
     strlcpy(resp_ctype, rs.ctype, sizeof resp_ctype);

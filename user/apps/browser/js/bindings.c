@@ -1973,6 +1973,8 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(g_url_proto, "constructor", js_obj_value(uc), P_WRITABLE | P_CONFIGURABLE);
     js_def(sc, "prototype", js_obj_value(g_sp_proto), 0);
     js_def(g_sp_proto, "constructor", js_obj_value(sc), P_WRITABLE | P_CONFIGURABLE);
+    js_def_native(ctx, uc, "createObjectURL", url_create_object_url, 1);
+    js_def_native(ctx, uc, "revokeObjectURL", url_revoke_object_url, 1);
     js_def(win, "URL", js_obj_value(uc), P_WRITABLE | P_CONFIGURABLE);
     js_def(win, "URLSearchParams", js_obj_value(sc), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();

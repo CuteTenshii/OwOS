@@ -1,4 +1,4 @@
-/* Blob and navigator.sendBeacon. */
+/* Blob, blob: object URLs and navigator.sendBeacon. */
 
 #include "bindings.h"
 
@@ -134,6 +134,51 @@ js_value blob_slice(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (argc > 2 && A(2).type == JV_STR)
     strlcpy(type, A(2).u.str->data, sizeof type);
   return make_blob(ctx, b.u.str->data + s, e - s, type);
+}
+
+/* ------------------------------------------------------- blob: URLs */
+
+js_value url_create_object_url(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  static const char hx[] = "0123456789abcdef";
+  js_value loc, org, bytes, type;
+  char url[URL_MAX], id[37];
+  unsigned char b[16];
+  int i, p = 0, n = 0;
+  (void)t;
+  if (argc < 1 || A(0).type != JV_OBJ || A(0).u.obj->proto != g_blob_proto)
+    return js_throw_type(ctx, "URL.createObjectURL: argument must be a Blob");
+  rng_bytes(b, 16);
+  b[6] = (unsigned char)((b[6] & 0x0f) | 0x40);
+  b[8] = (unsigned char)((b[8] & 0x3f) | 0x80);
+  for (i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10)
+      id[p++] = '-';
+    id[p++] = hx[b[i] >> 4];
+    id[p++] = hx[b[i] & 15];
+  }
+  id[p] = '\0';
+  loc = js_get(ctx, js_obj_value(ctx->global), "location");
+  org = loc.type == JV_OBJ ? js_get(ctx, loc, "origin") : js_undef();
+  sapp(url, &n, sizeof url, "blob:");
+  if (org.type == JV_STR && !streq(org.u.str->data, "null"))
+    sapp(url, &n, sizeof url, org.u.str->data);
+  sapp(url, &n, sizeof url, "/");
+  sapp(url, &n, sizeof url, id);
+  bytes = js_get(ctx, A(0), "@bytes");
+  type = js_get(ctx, A(0), "type");
+  if (bytes.type != JV_STR || !blobstore_put(url, (const unsigned char *)bytes.u.str->data, bytes.u.str->len,
+                                             type.type == JV_STR ? type.u.str->data : ""))
+    return js_throw_type(ctx, "URL.createObjectURL: out of memory");
+  return js_mk_cstring(ctx, url);
+}
+
+js_value url_revoke_object_url(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)t;
+  if (argc >= 1)
+    blobstore_del(arg_str(ctx, A(0)));
+  return js_undef();
 }
 
 /* Extract the request bytes + a default content-type from a body value */

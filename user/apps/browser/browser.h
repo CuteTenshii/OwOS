@@ -480,6 +480,12 @@ long browser_fetch_media(const char *url, const char *accept, const char *file, 
 unsigned char *browser_cors_fetch(const char *page_url, int with_credentials, const struct http_req *rq,
                                   struct http_resp *rs);
 
+/* blob: object URLs (blobstore.c): thread-safe byte copies; get returns a malloc'd body or NULL. */
+bool blobstore_put(const char *url, const unsigned char *data, int len, const char *type);
+void blobstore_del(const char *url);
+void blobstore_clear(void);
+unsigned char *blobstore_get(const char *url, int *len, char *ctype, int cap);
+
 /* Attribute subsequent sub-resource loads to `page_url`'s origin for CORP. */
 void resource_set_page(const char *page_url);
 /* Client Hints headers for a request to *u: a sub-resource of the current page, or a top-level navigation. */

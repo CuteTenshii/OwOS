@@ -10,7 +10,10 @@ js_value xhr_open(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (t.type != JV_OBJ)
     return js_undef();
   strlcpy(method, arg_str(ctx, A(0)), sizeof method);
-  resolve_url(g_page_url_buf, arg_str(ctx, A(1)), url, sizeof url);
+  if (starts_ci(arg_str(ctx, A(1)), "blob:"))
+    strlcpy(url, arg_str(ctx, A(1)), sizeof url);
+  else
+    resolve_url(g_page_url_buf, arg_str(ctx, A(1)), url, sizeof url);
   js_def(t.u.obj, "@method", js_mk_cstring(ctx, method[0] ? method : "GET"), 0);
   js_def(t.u.obj, "@url", js_mk_cstring(ctx, url), 0);
   js_def(t.u.obj, "@hdrs", js_mk_cstring(ctx, ""), 0);
@@ -98,7 +101,7 @@ js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc)
     rq.body_len = reqlen;
     rq.ctype = req_ctype[0] ? req_ctype : 0;
     rq.extra_hdrs = hdrs && hdrs[0] ? hdrs : 0;
-    body = browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
+    body = starts_ci(url, "blob:") ? browser_fetch(&rq, &rs) : browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
     status = rs.status;
     outlen = rs.len;
     strlcpy(resp_ctype, rs.ctype, sizeof resp_ctype);

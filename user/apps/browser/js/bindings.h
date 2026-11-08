@@ -34,6 +34,8 @@ js_value bchannel_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 js_value blob_arraybuffer(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value blob_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 js_value blob_slice(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value url_create_object_url(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value url_revoke_object_url(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value blob_text(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_object *browser_load_module(js_ctx *ctx, const char *spec, void *ud);
 void ce_attr_changed(struct dom_node *n, const char *name, const char *oldv, const char *newv);
