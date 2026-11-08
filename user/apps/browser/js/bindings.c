@@ -2567,4 +2567,5 @@ void setup_dom(js_ctx *ctx, const char *page_url)
 
   /* navigator.serviceWorker + caches + Response/Request */
   sw_install(ctx, win, page_url);
+  js_worker_setup(ctx, win);
 }

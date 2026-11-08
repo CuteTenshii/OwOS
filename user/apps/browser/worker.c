@@ -315,8 +315,8 @@ void worker_fn(void)
     {
       unsigned mseq = dom_mutation_seq;
       /* media_pump fires HTMLMediaElement events (play/timeupdate/ended/...) from the worker, the only */
-      if (js_timers_pump() + js_websockets_pump() + js_notifications_pump() + media_pump() + js_cast_pump() +
-          js_idb_pump()) {
+      if (js_timers_pump() + js_workers_pump() + js_websockets_pump() + js_notifications_pump() + media_pump() +
+          js_cast_pump() + js_idb_pump()) {
         if (dom_mutation_seq != mseq) {
           html_relayout();
           if (B->pg->n_imgs > 0)

@@ -98,4 +98,8 @@ void sw_install(js_ctx *ctx, js_object *win, const char *page_url);
 void sw_teardown(void); /* drop the per-page SW JS objects */
 int sw_intercept_fetch(js_ctx *ctx, const char *url, const char *method, js_value *out);
 
+/* Dedicated workers (js/webworker.c) */
+void js_worker_setup(js_ctx *ctx, js_object *win);
+void js_worker_teardown(void);
+
 #endif /* BROWSER_JSINT_H */

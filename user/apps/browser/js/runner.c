@@ -724,6 +724,7 @@ void js_page_end(void)
   g_blob_proto = 0;
   g_abortsignal_proto = g_abortcontroller_proto = 0;
   g_rtc_proto = 0;
+  js_worker_teardown();
   sw_teardown(); /* SW roots/objects (C store persists) */
   g_fetch = 0;
   if (g_ctx) {

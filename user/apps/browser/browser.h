@@ -319,6 +319,7 @@ int js_has_listeners(void); /* any listener registered */
 bool js_escape_key(void);   /* Escape: close the topmost modal dialog or auto popover */
 bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter); /* method=dialog: close its dialog */
 int js_timers_pump(void);        /* fire due setTimeout/Interval/rAF; -> # callbacks fired */
+int js_workers_pump(void);       /* deliver queued Worker postMessage traffic */
 int js_websockets_pump(void);    /* drain live WebSockets -> open/message/close/error events */
 int js_notifications_pump(void); /* deliver deferred Notification show/close events */
 int js_cast_pump(void);          /* deliver Remote Playback availability + connect/disconnect */
