@@ -188,7 +188,7 @@ js_value crypto_getrandomvalues(js_ctx *ctx, js_value t, js_value *args, int arg
     return js_throw_type(ctx, "Failed to execute 'getRandomValues': argument is not an "
                               "integer-typed TypedArray");
   ta = (js_typedarray *)v.u.obj->host;
-  if (!ta || ta->type < 0 || ta->type == TA_F32 || ta->type == TA_F64)
+  if (!ta || ta->type < 0 || ta->type == TA_F32 || ta->type == TA_F64 || ta->type == TA_F16)
     return js_make_error(ctx, ctx->type_error_proto, "TypeMismatchError",
                          "getRandomValues requires an integer-typed TypedArray");
   nbytes = ta->length * ta_elem_size(ta->type);

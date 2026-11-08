@@ -7213,7 +7213,7 @@ static js_value fn_bind(js_ctx *ctx, js_value t, js_value *a, int n)
 }
 
 /* ------------------------------------------------------- typed arrays ----- *
- * ArrayBuffer + the nine TypedArray views + DataView. A view object (kind
+ * ArrayBuffer + the twelve TypedArray views + DataView. A view object (kind
  * OBJ_TYPEDARRAY) carries a js_typedarray host {buffer, type, offset, length};
  * element get/set goes through ta_get/ta_set (value.c) so `view[i]` hits the
  * backing bytes. The buffer's bytes are freed by the GC finalizer; the view
@@ -7331,7 +7331,7 @@ static js_value ta_make(js_ctx *ctx, int type, js_value *a, int n)
       return js_throw_range(ctx, "invalid typed array byte offset");
     if (n > 2 && a[2].type != JV_UNDEF) {
       len = js_to_int_sat(ctx, a[2]);
-      if (len < 0 || off + len * es > ab->byteLength)
+      if (len < 0 || len > (ab->byteLength - off) / es)
         return js_throw_range(ctx, "invalid typed array length");
     } else {
       if ((ab->byteLength - off) % es)
@@ -7378,6 +7378,9 @@ TA_CTOR(int32a_ctor, TA_I32)
 TA_CTOR(uint32a_ctor, TA_U32)
 TA_CTOR(float32a_ctor, TA_F32)
 TA_CTOR(float64a_ctor, TA_F64)
+TA_CTOR(bigint64a_ctor, TA_I64)
+TA_CTOR(biguint64a_ctor, TA_U64)
+TA_CTOR(float16a_ctor, TA_F16)
 #undef TA_CTOR
 
 /* %TypedArray%.prototype accessors + methods (this = a view) */
@@ -7424,8 +7427,8 @@ static js_value tap_set(js_ctx *ctx, js_value t, js_value *a, int n)
   len = ta_src_len(ctx, src);
   if (off < 0)
     off = 0;
-  for (i = 0; i < len; i++)
-    ta_set(ctx, t.u.obj, (unsigned)(off + i), js_get_index(ctx, src, (unsigned)i));
+  for (i = 0; i < len && !ctx->has_exc; i++)
+    ta_set(ctx, t.u.obj, (unsigned)off + (unsigned)i, js_get_index(ctx, src, (unsigned)i));
   return js_undef();
 }
 static js_value tap_subarray(js_ctx *ctx, js_value t, js_value *a, int n)
@@ -7462,7 +7465,7 @@ static js_value tap_slice(js_ctx *ctx, js_value t, js_value *a, int n)
     if (view.type == JV_OBJ) {
       gc_keep(view.u.obj);
       for (i = 0; i < m; i++)
-        ta_set(ctx, view.u.obj, (unsigned)i, ta_get(t.u.obj, (unsigned)(b + i)));
+        ta_set(ctx, view.u.obj, (unsigned)i, ta_get(ctx, t.u.obj, (unsigned)(b + i)));
     }
   }
   gc_pop_scope();
@@ -7478,7 +7481,7 @@ static js_value tap_fill(js_ctx *ctx, js_value t, js_value *a, int n)
   len = ta->length;
   s = (n > 1 && a[1].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[1]), len) : 0;
   e = (n > 2 && a[2].type != JV_UNDEF) ? clamp_idx(js_to_int_sat(ctx, a[2]), len) : len;
-  for (; s < e; s++)
+  for (; s < e && !ctx->has_exc; s++)
     ta_set(ctx, t.u.obj, (unsigned)s, v);
   return t;
 }
@@ -7491,7 +7494,7 @@ static js_value tap_indexof(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_number(-1);
   from = n > 1 ? clamp_idx(js_to_int_sat(ctx, a[1]), ta->length) : 0;
   for (i = from; i < ta->length; i++)
-    if (js_strict_eq(ta_get(t.u.obj, (unsigned)i), v))
+    if (js_strict_eq(ta_get(ctx, t.u.obj, (unsigned)i), v))
       return js_number(i);
   return js_number(-1);
 }
@@ -7525,7 +7528,7 @@ static js_value tap_join(js_ctx *ctx, js_value t, js_value *a, int n)
       js_value e;
       if (i)
         sb_put(&sb, sep, seplen);
-      e = js_to_string(ctx, ta_get(t.u.obj, (unsigned)i));
+      e = js_to_string(ctx, ta_get(ctx, t.u.obj, (unsigned)i));
       if (e.type == JV_STR)
         sb_put(&sb, e.u.str->data, e.u.str->len);
     }
@@ -7550,7 +7553,7 @@ static js_value tap_foreach(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_undef();
   for (i = 0; i < ta->length; i++) {
     js_value ar[3];
-    ar[0] = ta_get(t.u.obj, (unsigned)i);
+    ar[0] = ta_get(ctx, t.u.obj, (unsigned)i);
     ar[1] = js_number(i);
     ar[2] = t;
     js_call(ctx, cb, js_undef(), ar, 3);
@@ -7574,7 +7577,7 @@ static js_value tap_map(js_ctx *ctx, js_value t, js_value *a, int n)
       gc_keep(view.u.obj);
       for (i = 0; i < ta->length; i++) {
         js_value ar[3], r;
-        ar[0] = ta_get(t.u.obj, (unsigned)i);
+        ar[0] = ta_get(ctx, t.u.obj, (unsigned)i);
         ar[1] = js_number(i);
         ar[2] = t;
         r = js_is_callable(cb) ? js_call(ctx, cb, js_undef(), ar, 3) : ar[0];
@@ -7599,16 +7602,19 @@ static js_value tap_reduce(js_ctx *ctx, js_value t, js_value *a, int n)
   else {
     if (ta->length == 0)
       return js_throw_type(ctx, "Reduce of empty array with no initial value");
-    acc = ta_get(t.u.obj, 0);
+    acc = ta_get(ctx, t.u.obj, 0);
     i = 1;
   }
   for (; i < ta->length; i++) {
     js_value ar[4];
+    gc_push_scope();
+    KEEP(acc);
     ar[0] = acc;
-    ar[1] = ta_get(t.u.obj, (unsigned)i);
+    ar[1] = ta_get(ctx, t.u.obj, (unsigned)i);
     ar[2] = js_number(i);
     ar[3] = t;
     acc = js_call(ctx, cb, js_undef(), ar, 4);
+    gc_pop_scope();
     if (ctx->has_exc)
       break;
   }
@@ -7726,74 +7732,17 @@ static int dv_size(int type)
     return 2;
   return type >= DV_I64 ? 8 : ta_elem_size(type);
 }
-static double f16_decode(unsigned h)
-{
-  int e = (h >> 10) & 31;
-  double m = (double)(h & 1023), v;
-  if (e == 0)
-    v = ldexp(m, -24);
-  else if (e == 31)
-    v = m ? NAN : INFINITY;
-  else
-    v = ldexp(1024.0 + m, e - 25);
-  return (h & 0x8000) ? -v : v;
-}
-/* round to nearest, ties to even */
-static unsigned f16_encode(double d)
-{
-  unsigned sign = signbit(d) ? 0x8000 : 0, q;
-  double a = d < 0 ? -d : d, x, frac;
-  int e = 0;
-  if (isnan(d))
-    return 0x7e00;
-  if (a >= 65520.0)
-    return sign | 0x7c00;
-  if (a < ldexp(1.0, -14)) {
-    x = ldexp(a, 24);
-  } else {
-    while (a >= 2.0) {
-      a /= 2.0;
-      e++;
-    }
-    while (a < 1.0) {
-      a *= 2.0;
-      e--;
-    }
-    x = (a - 1.0) * 1024.0;
-    e += 15;
-  }
-  q = (unsigned)x;
-  frac = x - (double)q;
-  if (frac > 0.5 || (frac == 0.5 && (q & 1)))
-    q++;
-  return sign | (e > 0 ? ((unsigned)e << 10) + q : q);
-}
 static js_value dv_decode(js_ctx *ctx, int type, unsigned char *p)
 { /* p is little-endian */
   switch (type) {
   case DV_F16:
-    return js_number(f16_decode((unsigned)p[0] | (unsigned)p[1] << 8));
+    return js_number(js_f16_decode((unsigned)p[0] | (unsigned)p[1] << 8));
   case DV_I64:
   case DV_U64: {
     unsigned lo, hi;
-    bigint *v, *t;
     memcpy(&lo, p, 4);
     memcpy(&hi, p + 4, 4);
-    if (type == DV_I64)
-      return js_mk_bigint(ctx, bi_from_i64((long long)((unsigned long long)hi << 32 | lo)));
-    v = bi_from_i64(hi);
-    t = v ? bi_shl(v, 32) : 0;
-    bi_free(v);
-    v = bi_from_i64(lo);
-    if (t && v) {
-      bigint *r = bi_add(t, v);
-      bi_free(t);
-      bi_free(v);
-      return js_mk_bigint(ctx, r);
-    }
-    bi_free(t);
-    bi_free(v);
-    return js_mk_bigint(ctx, 0);
+    return js_bigint_from_u64(ctx, lo, hi, type == DV_I64);
   }
   case TA_I8:
     return js_number((double)*(signed char *)p);
@@ -7835,26 +7784,15 @@ static js_value dv_decode(js_ctx *ctx, int type, unsigned char *p)
 static int dv_encode(js_ctx *ctx, int type, js_value v, unsigned char *p)
 {
   if (type == DV_F16) {
-    unsigned h = f16_encode(js_to_number(ctx, v));
+    unsigned h = js_f16_encode(js_to_number(ctx, v));
     p[0] = (unsigned char)h;
     p[1] = (unsigned char)(h >> 8);
     return 1;
   }
   if (type == DV_I64 || type == DV_U64) {
-    bigint *b = js_bigint_of(v), *u;
     unsigned lo, hi;
-    if (!b) {
-      js_throw_type(ctx, "Cannot convert value to a BigInt");
+    if (!js_bigint_to_u64(ctx, v, &lo, &hi))
       return 0;
-    }
-    u = bi_as_uintn(64, b);
-    if (!u) {
-      js_throw_range(ctx, "Maximum BigInt size exceeded");
-      return 0;
-    }
-    lo = u->len > 0 ? u->limb[0] : 0;
-    hi = u->len > 1 ? u->limb[1] : 0;
-    bi_free(u);
     memcpy(p, &lo, 4);
     memcpy(p + 4, &hi, 4);
     return 1;
@@ -7885,7 +7823,7 @@ static js_value dv_get(js_ctx *ctx, js_value t, js_value *a, int n, int type)
     return js_undef();
   off = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   le = (es > 1) && (n > 1) && js_to_boolean(a[1]);
-  if (off < 0 || off + es > ta->length)
+  if (off < 0 || off > ta->length - es)
     return js_throw_range(ctx, "Offset is outside the bounds of the DataView");
   ab = (js_arraybuffer *)ta->buffer->host;
   memcpy(tmp, ab->data + ta->offset + off, (unsigned)es);
@@ -7903,7 +7841,7 @@ static js_value dv_set(js_ctx *ctx, js_value t, js_value *a, int n, int type)
     return js_undef();
   off = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
   le = (es > 1) && (n > 2) && js_to_boolean(a[2]);
-  if (off < 0 || off + es > ta->length)
+  if (off < 0 || off > ta->length - es)
     return js_throw_range(ctx, "Offset is outside the bounds of the DataView");
   ab = (js_arraybuffer *)ta->buffer->host;
   if (!dv_encode(ctx, type, n > 1 ? a[1] : js_undef(), tmp))
@@ -7962,7 +7900,7 @@ static js_value dataview_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
     return js_throw_range(ctx, "Invalid DataView offset");
   if (n > 2 && a[2].type != JV_UNDEF) {
     len = js_to_int_sat(ctx, a[2]);
-    if (len < 0 || off + len > ab->byteLength)
+    if (len < 0 || len > ab->byteLength - off)
       return js_throw_range(ctx, "Invalid DataView length");
   } else
     len = ab->byteLength - off;
@@ -7986,15 +7924,18 @@ static void setup_typed_arrays(js_ctx *ctx)
     const char *name;
     js_native ctor;
     int type;
-  } views[9] = {{"Int8Array", int8a_ctor, TA_I8},
-                {"Uint8Array", uint8a_ctor, TA_U8},
-                {"Uint8ClampedArray", uint8ca_ctor, TA_U8C},
-                {"Int16Array", int16a_ctor, TA_I16},
-                {"Uint16Array", uint16a_ctor, TA_U16},
-                {"Int32Array", int32a_ctor, TA_I32},
-                {"Uint32Array", uint32a_ctor, TA_U32},
-                {"Float32Array", float32a_ctor, TA_F32},
-                {"Float64Array", float64a_ctor, TA_F64}};
+  } views[TA_NKINDS] = {{"Int8Array", int8a_ctor, TA_I8},
+                        {"Uint8Array", uint8a_ctor, TA_U8},
+                        {"Uint8ClampedArray", uint8ca_ctor, TA_U8C},
+                        {"Int16Array", int16a_ctor, TA_I16},
+                        {"Uint16Array", uint16a_ctor, TA_U16},
+                        {"Int32Array", int32a_ctor, TA_I32},
+                        {"Uint32Array", uint32a_ctor, TA_U32},
+                        {"Float32Array", float32a_ctor, TA_F32},
+                        {"Float64Array", float64a_ctor, TA_F64},
+                        {"BigInt64Array", bigint64a_ctor, TA_I64},
+                        {"BigUint64Array", biguint64a_ctor, TA_U64},
+                        {"Float16Array", float16a_ctor, TA_F16}};
   int i;
 
   /* ArrayBuffer */
@@ -8022,9 +7963,9 @@ static void setup_typed_arrays(js_ctx *ctx)
   js_def_native(ctx, ctx->typedarray_proto, "map", tap_map, 1);
   js_def_native(ctx, ctx->typedarray_proto, "reduce", tap_reduce, 2);
 
-  /* the nine views: a constructor + a per-view prototype chained to the shared
+  /* the twelve views: a constructor + a per-view prototype chained to the shared
    * one */
-  for (i = 0; i < 9; i++) {
+  for (i = 0; i < TA_NKINDS; i++) {
     js_object *proto = ctx->typed_protos[i];
     js_object *c, *of_fn, *from_fn;
     gc_push_scope();

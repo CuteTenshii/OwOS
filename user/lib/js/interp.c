@@ -3390,7 +3390,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
   gc_add_root((void **)&ctx->dataview_proto);
   {
     int i;
-    for (i = 0; i < 9; i++)
+    for (i = 0; i < TA_NKINDS; i++)
       gc_add_root((void **)&ctx->typed_protos[i]);
   }
   gc_add_root((void **)&ctx->type_error_proto);
@@ -3425,7 +3425,7 @@ js_ctx *js_ctx_new(void (*print)(js_ctx *ctx, int level, const char *s, int len)
   ctx->dataview_proto = js_new_object(ctx, ctx->object_proto);
   {
     int i;
-    for (i = 0; i < 9; i++)
+    for (i = 0; i < TA_NKINDS; i++)
       ctx->typed_protos[i] = js_new_object(ctx, ctx->typedarray_proto);
   }
   ctx->type_error_proto = js_new_object(ctx, ctx->error_proto);
@@ -3477,7 +3477,7 @@ void js_ctx_free(js_ctx *ctx)
   gc_remove_root((void **)&ctx->dataview_proto);
   {
     int i;
-    for (i = 0; i < 9; i++)
+    for (i = 0; i < TA_NKINDS; i++)
       gc_remove_root((void **)&ctx->typed_protos[i]);
   }
   gc_remove_root((void **)&ctx->type_error_proto);

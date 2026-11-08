@@ -59,7 +59,7 @@ struct js_ctx {
   /* typed arrays: the shared %TypedArray%.prototype, the per-view prototypes
    * (indexed by TA_*), plus ArrayBuffer/DataView prototypes. */
   js_object *typedarray_proto, *arraybuffer_proto, *dataview_proto;
-  js_object *typed_protos[9];
+  js_object *typed_protos[TA_NKINDS];
   /* error subclass prototypes (TypeError, RangeError, ...) chain to error_proto
    */
   js_object *type_error_proto, *range_error_proto, *syntax_error_proto, *ref_error_proto, *eval_error_proto,

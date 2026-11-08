@@ -675,15 +675,95 @@ int ta_elem_size(int type)
     return 1;
   case TA_I16:
   case TA_U16:
+  case TA_F16:
     return 2;
   case TA_F64:
+  case TA_I64:
+  case TA_U64:
     return 8;
   default:
     return 4; /* I32/U32/F32 */
   }
 }
 
-js_value ta_get(js_object *view, unsigned idx)
+js_value js_bigint_from_u64(js_ctx *ctx, unsigned lo, unsigned hi, int is_signed)
+{
+  bigint *r;
+  if (is_signed || !(hi >> 31))
+    return js_mk_bigint(ctx, bi_from_i64((long long)((unsigned long long)hi << 32 | lo)));
+  {
+    bigint *h = bi_from_i64(hi), *t = h ? bi_shl(h, 32) : 0, *l = bi_from_i64(lo);
+    r = t && l ? bi_add(t, l) : 0;
+    bi_free(h);
+    bi_free(t);
+    bi_free(l);
+  }
+  return js_mk_bigint(ctx, r);
+}
+
+int js_bigint_to_u64(js_ctx *ctx, js_value v, unsigned *lo, unsigned *hi)
+{
+  bigint *b = js_bigint_of(v), *u;
+  if (!b) {
+    js_throw_type(ctx, "Cannot convert value to a BigInt");
+    return 0;
+  }
+  u = bi_as_uintn(64, b);
+  if (!u) {
+    js_throw_range(ctx, "Maximum BigInt size exceeded");
+    return 0;
+  }
+  *lo = u->len > 0 ? u->limb[0] : 0;
+  *hi = u->len > 1 ? u->limb[1] : 0;
+  bi_free(u);
+  return 1;
+}
+
+double js_f16_decode(unsigned h)
+{
+  int e = (h >> 10) & 31;
+  double m = (double)(h & 1023), v;
+  if (e == 0)
+    v = ldexp(m, -24);
+  else if (e == 31)
+    v = m ? NAN : INFINITY;
+  else
+    v = ldexp(1024.0 + m, e - 25);
+  return (h & 0x8000) ? -v : v;
+}
+
+/* round to nearest, ties to even */
+unsigned js_f16_encode(double d)
+{
+  unsigned sign = signbit(d) ? 0x8000 : 0, q;
+  double a = d < 0 ? -d : d, x, frac;
+  int e = 0;
+  if (isnan(d))
+    return 0x7e00;
+  if (a >= 65520.0)
+    return sign | 0x7c00;
+  if (a < ldexp(1.0, -14)) {
+    x = ldexp(a, 24);
+  } else {
+    while (a >= 2.0) {
+      a /= 2.0;
+      e++;
+    }
+    while (a < 1.0) {
+      a *= 2.0;
+      e--;
+    }
+    x = (a - 1.0) * 1024.0;
+    e += 15;
+  }
+  q = (unsigned)x;
+  frac = x - (double)q;
+  if (frac > 0.5 || (frac == 0.5 && (q & 1)))
+    q++;
+  return sign | (e > 0 ? ((unsigned)e << 10) + q : q);
+}
+
+js_value ta_get(js_ctx *ctx, js_object *view, unsigned idx)
 {
   js_typedarray *ta = (js_typedarray *)view->host;
   js_arraybuffer *ab;
@@ -728,6 +808,17 @@ js_value ta_get(js_object *view, unsigned idx)
     memcpy(&x, p, 8);
     return js_number(x);
   }
+  case TA_F16: {
+    unsigned short x;
+    memcpy(&x, p, 2);
+    return js_number(js_f16_decode(x));
+  }
+  case TA_I64:
+  case TA_U64: {
+    unsigned w[2];
+    memcpy(w, p, 8);
+    return js_bigint_from_u64(ctx, w[0], w[1], ta->type == TA_I64);
+  }
   }
   return js_undef();
 }
@@ -749,6 +840,17 @@ void ta_set(js_ctx *ctx, js_object *view, unsigned idx, js_value v)
   if (ta->type == TA_F64) {
     double d = js_to_number(ctx, v);
     memcpy(p, &d, 8);
+    return;
+  }
+  if (ta->type == TA_F16) {
+    unsigned short h = (unsigned short)js_f16_encode(js_to_number(ctx, v));
+    memcpy(p, &h, 2);
+    return;
+  }
+  if (ta->type == TA_I64 || ta->type == TA_U64) {
+    unsigned w[2];
+    if (js_bigint_to_u64(ctx, v, &w[0], &w[1]))
+      memcpy(p, w, 8);
     return;
   }
   if (ta->type == TA_U8C) { /* ToUint8Clamp */
@@ -803,7 +905,7 @@ js_value js_get_index(js_ctx *ctx, js_value obj, unsigned i)
     return js_undef();
   }
   if (obj.type == JV_OBJ && obj.u.obj->kind == OBJ_TYPEDARRAY)
-    return ta_get(obj.u.obj, i);
+    return ta_get(ctx, obj.u.obj, i);
   if (obj.type == JV_STR) {
     if ((int)i < obj.u.str->len)
       return js_mk_string(ctx, obj.u.str->data + i, 1);
@@ -855,7 +957,7 @@ js_value js_get(js_ctx *ctx, js_value obj, const char *key)
         return js_get_index(ctx, obj, idx);
     }
     if (o->kind == OBJ_TYPEDARRAY && as_index(key, &idx))
-      return ta_get(o, idx);
+      return ta_get(ctx, o, idx);
   } else {
     char msg[160];
     int i = 0;

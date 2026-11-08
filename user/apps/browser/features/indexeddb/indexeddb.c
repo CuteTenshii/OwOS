@@ -159,6 +159,12 @@ static const char *idb_ta_name(int type)
     return "Float32Array";
   case TA_F64:
     return "Float64Array";
+  case TA_I64:
+    return "BigInt64Array";
+  case TA_U64:
+    return "BigUint64Array";
+  case TA_F16:
+    return "Float16Array";
   default:
     return "DataView";
   }

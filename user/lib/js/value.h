@@ -53,7 +53,7 @@ enum {
 
 /* typed-array element kinds (index into ta_elem_size). DataView uses type -1.
  */
-enum { TA_I8, TA_U8, TA_U8C, TA_I16, TA_U16, TA_I32, TA_U32, TA_F32, TA_F64 };
+enum { TA_I8, TA_U8, TA_U8C, TA_I16, TA_U16, TA_I32, TA_U32, TA_F32, TA_F64, TA_I64, TA_U64, TA_F16, TA_NKINDS };
 #define TA_DATAVIEW (-1)
 
 /* OBJ_ARRAYBUFFER host: the raw backing bytes. OBJ_TYPEDARRAY host: a view onto
@@ -232,8 +232,14 @@ void js_array_set_len(js_ctx *ctx, js_object *arr, unsigned len);
 
 /* typed-array element access (the backing-byte read/write behind ta[i]) */
 int ta_elem_size(int type);
-js_value ta_get(js_object *view, unsigned idx); /* number, or undefined */
+js_value ta_get(js_ctx *ctx, js_object *view, unsigned idx); /* number, BigInt, or undefined */
 void ta_set(js_ctx *ctx, js_object *view, unsigned idx, js_value v);
+
+/* 64-bit integer <-> BigInt (lo/hi 32-bit halves) and IEEE binary16 <-> double */
+js_value js_bigint_from_u64(js_ctx *ctx, unsigned lo, unsigned hi, int is_signed);
+int js_bigint_to_u64(js_ctx *ctx, js_value v, unsigned *lo, unsigned *hi); /* 0 + throws if not a BigInt */
+unsigned js_f16_encode(double d);
+double js_f16_decode(unsigned h);
 
 /* ---- coercions (ECMAScript abstract operations) ------------------------- */
 

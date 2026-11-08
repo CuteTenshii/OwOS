@@ -204,6 +204,37 @@ static void check_dataview(void)
       0));
 }
 
+static void check_wide_typed_arrays(void)
+{
+  expect(run(
+      "var b=new BigInt64Array(2), u=new BigUint64Array(b.buffer);\n"
+      "expect(b.length===2 && b.byteLength===16 && BigInt64Array.BYTES_PER_ELEMENT===8, 'sizes');\n"
+      "b[0]=-1n; expect(b[0]===-1n && u[0]===2n**64n-1n, 'signed and unsigned views');\n"
+      "b[1]=2n**63n; expect(b[1]===-(2n**63n), 'wraps modulo 2^64');\n"
+      "var threw=false; try{ b[0]=1 }catch(e){ threw=e instanceof TypeError } expect(threw, 'Number is not a "
+      "BigInt');\n"
+      "expect(b[2]===undefined, 'out of range read'); b[2]=1n; expect(b.length===2, 'out of range write ignored');\n"
+      "var f=BigUint64Array.from([1n,2n,3n]); expect(f.join()==='1,2,3' && f.indexOf(2n)===1, 'from, join, indexOf');\n"
+      "expect(f.reduce(function(a,x){ return a+x }, 0n)===6n, 'reduce');\n"
+      "expect(f.map(function(x){ return x*2n }).join()==='2,4,6', 'map');\n"
+      "expect(f.slice(1).join()==='2,3' && f.subarray(1,2)[0]===2n, 'slice and subarray');\n"
+      "f.fill(7n); expect(f.join()==='7,7,7', 'fill');\n"
+      "threw=false; try{ new BigInt64Array(new ArrayBuffer(16),8,2) }catch(e){ threw=e instanceof RangeError } "
+      "expect(threw, 'view past the buffer');\n"
+      "threw=false; try{ new BigInt64Array(new ArrayBuffer(16),0,2147483647) }catch(e){ threw=e instanceof RangeError "
+      "} expect(threw, 'huge length');\n"
+      "var h=new Float16Array([1,-2,65504,65520,0.1]);\n"
+      "expect(h.byteLength===10 && h[0]===1 && h[1]===-2 && h[2]===65504 && h[3]===Infinity, 'float16 values');\n"
+      "expect(Math.abs(h[4]-0.1)<1e-4 && h[4]!==0.1, 'float16 rounds');\n"
+      "expect(new Uint16Array(new Float16Array([1]).buffer)[0]===0x3c00, 'float16 bits');\n"
+      "var d=new DataView(new ArrayBuffer(8)); threw=false;\n"
+      "try{ d.getUint8(2147483647) }catch(e){ threw=e instanceof RangeError } expect(threw, 'DataView offset near "
+      "INT_MAX');\n"
+      "threw=false; try{ d.getBigInt64(1) }catch(e){ threw=e instanceof RangeError } expect(threw, 'DataView int64 "
+      "bounds');\n",
+      0));
+}
+
 int main(void)
 {
   test("regexp matches whole code points, not bytes", check_regexp_code_points);
@@ -211,6 +242,7 @@ int main(void)
   test("Object.defineProperty on array elements", check_define_property);
   test("JSON.stringify", check_json_stringify);
   test("DataView BigInt64 and Float16", check_dataview);
+  test("BigInt64Array, BigUint64Array and Float16Array", check_wide_typed_arrays);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);
