@@ -37,6 +37,10 @@ int nc_write(netconn *c, const void *buf, int len);
 /* The negotiated ALPN protocol (owos.h ALPN_*). */
 int nc_alpn(netconn *c);
 
+/* Why the server certificate of a TLS conn was not accepted (e.g. "untrusted issuer"), or NULL when it
+ * verified or the conn is plain TCP. The connection is usable either way; see tls_verify(). */
+const char *nc_verify_message(netconn *c);
+
 void nc_close(netconn *c);
 
 #endif /* OWOS_USER_NETCONN_H */

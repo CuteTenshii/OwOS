@@ -7,9 +7,8 @@
  * The crypto primitives come from user/lib/crypto (crypto.h); transport is a
  * plain SK_TCP socket this library owns.
  *
- * SECURITY: the server certificate and its signature are NOT verified — this
- * protects against passive eavesdropping but not an active man-in-the-middle.
- * Documented, deliberate; the natural next step is X.509 + RSA/ECDSA verify.
+ * SECURITY: the server certificate is verified (user/lib/pki) but a failure does
+ * not abort the handshake; see tls_verify().
  */
 #ifndef OWOS_USER_TLS_H
 #define OWOS_USER_TLS_H
@@ -38,6 +37,13 @@ int tls_write(tls_conn *c, const void *buf, int len);
 /* The ALPN protocol the server negotiated: ALPN_H2 / ALPN_HTTP11 / ALPN_NONE
  * (owos.h constants). Valid after a successful tls_client(). */
 int tls_alpn(tls_conn *c);
+
+/* Server certificate verdict for a connected handle: 0 when the chain leads to a root in
+ * /etc/ssl/certs.pem, covers `host`, is in date, and the handshake signature matches the leaf's key;
+ * otherwise an X509_E_* code (x509.h). A failure does not stop the connection (warn and allow), so the
+ * caller decides what to do with it. tls_verify_message is NULL when the verdict is good. */
+int tls_verify(tls_conn *c);
+const char *tls_verify_message(tls_conn *c);
 
 void tls_close(tls_conn *c);
 

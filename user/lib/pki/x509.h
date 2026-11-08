@@ -20,6 +20,7 @@ enum {
   X509_E_NOT_CA,   /* an issuer is not allowed to sign certificates */
   X509_E_HOSTNAME, /* leaf does not cover the requested name */
   X509_E_PURPOSE,  /* leaf is not valid for TLS server authentication */
+  X509_E_NO_STORE, /* no trusted root certificates are installed */
 };
 
 const char *x509_strerror(int err);

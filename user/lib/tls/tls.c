@@ -17,8 +17,8 @@
  * Both sides' Finished messages carry a PRF/HMAC over the full handshake
  * transcript, so a verified server Finished proves the whole key schedule.
  *
- * SECURITY: the server certificate is NOT verified (deliberate — see tls.h):
- * resists passive eavesdropping, not an active man-in-the-middle.
+ * Certificates are checked against /etc/ssl/certs.pem, but a failure does not
+ * abort the handshake: the verdict is exposed through tls_verify().
  *
  * NET_EINTR: net_recv/net_send return -4 when a cooperative Ctrl+C arrives
  * mid-call. It's latched in c->intr and propagated: the handshake aborts (NULL
@@ -30,9 +30,11 @@
 
 #include "crypto.h"
 #include "ech.h"
+#include "mutex.h"
 #include "owos.h"
 #include "resolve.h"
 #include "tls.h"
+#include "x509.h"
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -102,6 +104,11 @@ static void put64be(uint8_t *p, uint64_t v)
 
 #define ECH_RETRY_MAX 1024u
 
+#define TLS_CHAIN_MAX 8
+#define TLS_CERTBUF_MAX 24576u
+#define TLS_ROOTS_PATH "/etc/ssl/certs.pem"
+#define TLS_ROOTS_MAX (768 * 1024)
+
 #define TLS_RECMAX 18432u
 #define TLS_HSMAX 20480u
 
@@ -122,6 +129,14 @@ struct tls_conn {
   uint8_t client_iv[12], server_iv[12]; /* 1.2 uses first 4; 1.3 all 12 */
 
   struct sha256 transcript; /* running hash of handshake messages      */
+
+  /* Server certificate verification. The handshake carries on after a failure
+   * (warn and allow); callers read the verdict with tls_verify(). */
+  int verify;              /* X509_* code, X509_OK = chain and signature good */
+  const char *verify_host; /* name to match; only valid during tls_open       */
+  uint32_t nchain;
+  struct x509 chain[TLS_CHAIN_MAX];
+  uint8_t certbuf[TLS_CERTBUF_MAX];
 
   /* ECH: 0 not offered, 1 offered but not (yet) accepted, 2 accepted. On a
    * rejection the server's retry_configs land in retry[]. */
@@ -420,6 +435,100 @@ static int hs_next(struct tls_conn *c, uint8_t *mtype, uint8_t **body, uint32_t 
   return 0;
 }
 
+/* --------------------------------------------------- certificate verification */
+
+static mutex_t g_roots_lock = MUTEX_INIT;
+static struct x509_store g_roots;
+static int g_roots_loaded; /* 0 not tried, 1 loaded, -1 unavailable */
+
+static void load_roots(void)
+{
+  mutex_lock(&g_roots_lock);
+  if (!g_roots_loaded) {
+    g_roots_loaded = -1;
+    uint8_t *pem = malloc(TLS_ROOTS_MAX);
+    if (pem) {
+      int n = readfile(TLS_ROOTS_PATH, (char *)pem, TLS_ROOTS_MAX);
+      if (n > 0 && x509_store_load_pem(&g_roots, pem, (uint32_t)n))
+        g_roots_loaded = 1;
+      else
+        x509_store_free(&g_roots);
+      free(pem);
+    }
+  }
+  mutex_unlock(&g_roots_lock);
+}
+
+/* Unix seconds, or 0 while the clock is unset (the date checks are skipped then). */
+static int64_t wall_now(void)
+{
+  struct timeval64 tv;
+  return gettime(&tv) == 0 && tv.tv_sec >= 1704067200 ? tv.tv_sec : 0;
+}
+
+static void verify_fail(struct tls_conn *c, int err)
+{
+  if (c->verify == X509_OK)
+    c->verify = err;
+}
+
+/* Take the server's certificate_list (TLS 1.3 adds a request context and per-entry extensions), then
+ * verify the chain against the roots and c->verify_host. */
+static void take_chain(struct tls_conn *c, const uint8_t *body, uint32_t bl, int tls13)
+{
+  c->nchain = 0;
+  c->verify = X509_E_PARSE;
+  uint32_t o = tls13 ? 1u + (bl ? body[0] : 0) : 0;
+  if (o + 3 > bl)
+    return;
+  uint32_t end = o + 3 + (((uint32_t)body[o] << 16) | ((uint32_t)body[o + 1] << 8) | body[o + 2]);
+  o += 3;
+  if (end > bl)
+    return;
+  uint32_t used = 0;
+  while (o + 3 <= end) {
+    uint32_t cl = ((uint32_t)body[o] << 16) | ((uint32_t)body[o + 1] << 8) | body[o + 2];
+    o += 3;
+    if (o + cl > end)
+      return;
+    if (c->nchain == TLS_CHAIN_MAX || used + cl > sizeof c->certbuf) {
+      c->verify = X509_E_UNSUPPORTED;
+      return;
+    }
+    memcpy(c->certbuf + used, body + o, cl);
+    int rc = x509_parse(&c->chain[c->nchain], c->certbuf + used, cl);
+    if (rc) {
+      c->verify = rc;
+      return;
+    }
+    c->nchain++;
+    used += cl;
+    o += cl;
+    if (tls13) {
+      if (o + 2 > end)
+        return;
+      o += 2 + (((uint32_t)body[o] << 8) | body[o + 1]);
+    }
+  }
+  if (!c->nchain)
+    return;
+  load_roots();
+  c->verify = g_roots_loaded > 0 ? x509_verify_chain(&g_roots, c->chain, c->nchain, c->verify_host, wall_now())
+                                 : X509_E_NO_STORE;
+}
+
+/* Check the handshake signature against the leaf's key. */
+static void check_handshake_sig(struct tls_conn *c, uint16_t scheme, const uint8_t *msg, uint32_t msglen,
+                                const uint8_t *sig, uint32_t siglen)
+{
+  if (!c->nchain || x509_verify_tls_sig(&c->chain[0], scheme, msg, msglen, sig, siglen))
+    verify_fail(c, X509_E_SIG);
+}
+
+int tls_verify(tls_conn *c) { return c ? c->verify : X509_E_UNTRUSTED; }
+
+const char *tls_verify_message(tls_conn *c) { return c && c->verify == X509_OK ? NULL : x509_strerror(tls_verify(c)); }
+
 /* ----------------------------------------------- TLS 1.3 key schedule */
 
 /* HKDF-Expand-Label (RFC 8446 §7.1): wraps the secret expansion with the
@@ -540,12 +649,12 @@ static uint32_t build_client_hello(uint8_t *out, const uint8_t client_random[32]
     *p++ = 1;
     *p++ = 0;
   }
-  /* signature_algorithms: rsa_pss (1.3) + rsa_pkcs1 + ecdsa */
+  /* signature_algorithms: the schemes x509_verify_tls_sig implements */
   put16(p, 0x000D);
   p += 2;
-  static const uint8_t sigalgs[] = {0x08, 0x04, 0x08, 0x05, 0x08, 0x06,  /* rsa_pss_rsae_sha256/384/512 */
-                                    0x04, 0x01, 0x05, 0x01, 0x06, 0x01,  /* rsa_pkcs1_sha256/384/512    */
-                                    0x04, 0x03, 0x05, 0x03, 0x06, 0x03}; /* ecdsa_secp256r1/384/521     */
+  static const uint8_t sigalgs[] = {0x08, 0x04, 0x08, 0x05, 0x08, 0x06, /* rsa_pss_rsae_sha256/384/512 */
+                                    0x04, 0x01, 0x05, 0x01, 0x06, 0x01, /* rsa_pkcs1_sha256/384/512    */
+                                    0x04, 0x03, 0x05, 0x03};            /* ecdsa_secp256r1/384         */
   put16(p, (uint16_t)(sizeof sigalgs + 2));
   p += 2;
   put16(p, (uint16_t)sizeof sigalgs);
@@ -701,6 +810,22 @@ static int tls13_handshake(struct tls_conn *c, const uint8_t our_priv[32], const
       return 0; /* alert or read failure */
     if (mt == HS_CERT_REQ)
       return 0; /* 1.3 client cert (unsupported) */
+    if (mt == HS_CERT)
+      take_chain(c, body, bl, 1);
+    if (mt == HS_CERT_VERIFY) {
+      static const char ctx[] = "TLS 1.3, server CertificateVerify";
+      uint8_t signed_content[64 + sizeof ctx + 32];
+      struct sha256 through_cert = before;
+      memset(signed_content, ' ', 64);
+      memcpy(signed_content + 64, ctx, sizeof ctx); /* includes the NUL separator */
+      sha256_final(&through_cert, signed_content + 64 + sizeof ctx);
+      uint32_t sl = bl >= 4 ? ((uint32_t)body[2] << 8) | body[3] : 0;
+      if (bl < 4 || 4 + sl != bl)
+        verify_fail(c, X509_E_SIG);
+      else
+        check_handshake_sig(c, (uint16_t)(((uint16_t)body[0] << 8) | body[1]), signed_content, sizeof signed_content,
+                            body + 4, sl);
+    }
     if (mt == HS_FINISHED) {
       if (bl != 32)
         return 0;
@@ -859,6 +984,8 @@ static tls_conn *tls_open(const char *host, int port, int offer_h2, struct ech_t
   if (!c)
     return NULL;
   memset(c, 0, sizeof *c);
+  c->verify = X509_E_UNTRUSTED; /* until a certificate chain checks out */
+  c->verify_host = host;
 
   /* Resolve in user space (the kernel connect path takes an IP only), but keep
    * SNI = the original hostname (passed to build_client_hello below). */
@@ -965,6 +1092,7 @@ static tls_conn *tls_open(const char *host, int port, int offer_h2, struct ech_t
         return NULL;
       }
       secure_wipe(our_priv, sizeof our_priv); /* ephemeral key done */
+      c->verify_host = NULL;
       return c;
     }
     /* RFC 8446 §4.1.3 downgrade protection: this client always offers TLS 1.3,
@@ -999,7 +1127,9 @@ static tls_conn *tls_open(const char *host, int port, int offer_h2, struct ech_t
       free(c);
       return NULL;
     }
-    if (mt == HS_SKE) {
+    if (mt == HS_CERT) {
+      take_chain(c, body, bl, 0);
+    } else if (mt == HS_SKE) {
       /* curve_type(1) named_curve(2) pubkeylen(1) pubkey ... */
       if (bl < 4 || body[0] != 3 || (((uint16_t)body[1] << 8) | body[2]) != 0x001D || body[3] != 32 || bl < 4u + 32) {
         net_close(c->tcp);
@@ -1008,6 +1138,18 @@ static tls_conn *tls_open(const char *host, int port, int offer_h2, struct ech_t
       }
       memcpy(server_pub, body + 4, 32);
       have_ske = 1;
+      /* signature(scheme, len, bytes) over client_random || server_random || the params above */
+      uint32_t sl = bl >= 40 ? ((uint32_t)body[38] << 8) | body[39] : 0;
+      if (bl < 40 || 40 + sl != bl) {
+        verify_fail(c, X509_E_SIG);
+      } else {
+        uint8_t signed_content[64 + 36];
+        memcpy(signed_content, client_random, 32);
+        memcpy(signed_content + 32, server_random, 32);
+        memcpy(signed_content + 64, body, 36);
+        check_handshake_sig(c, (uint16_t)(((uint16_t)body[36] << 8) | body[37]), signed_content, sizeof signed_content,
+                            body + 40, sl);
+      }
     } else if (mt == HS_CERT_REQ) {
       net_close(c->tcp); /* client cert (unsupported) */
       free(c);
@@ -1015,7 +1157,6 @@ static tls_conn *tls_open(const char *host, int port, int offer_h2, struct ech_t
     } else if (mt == HS_DONE) {
       break;
     }
-    /* HS_CERT and anything else: ignored (no verification). */
   }
   if (!have_ske) {
     net_close(c->tcp);

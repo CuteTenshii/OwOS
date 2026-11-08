@@ -81,6 +81,8 @@ int nc_alpn(netconn *c)
   return c->tls ? tls_alpn(c->tls) : ALPN_NONE; /* a plain TCP conn has no ALPN */
 }
 
+const char *nc_verify_message(netconn *c) { return c && c->tls ? tls_verify_message(c->tls) : NULL; }
+
 void nc_close(netconn *c)
 {
   if (!c)

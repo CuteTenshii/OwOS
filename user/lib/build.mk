@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto tls netconn gfx zlib png webp gif imganim canvas2d mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar
+ULIBDIRS := curl torrent crypto pki tls netconn gfx zlib png webp gif imganim canvas2d mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -90,8 +90,10 @@ VIDEO   := user/lib/media/video.o $(H264) $(MP4)
 LIBGCC  := $(shell $(UCC) -m32 -print-libgcc-file-name)  # 64-bit div helpers etc.
 CRYPTO  := user/lib/crypto/crypto.o user/lib/crypto/ed25519.o   # SHA-1/256/512/HMAC/PRF/HKDF/AES-GCM/X25519 + Ed25519 (torrent, ssh, curl)
 # tls: user-space TLS 1.3 client with a TLS 1.2 fallback, over an owned SK_TCP
-# socket. Ported from kernel/tls.c; cert not verified. Needs $(CRYPTO).
-TLS     := user/lib/tls/tls.o user/lib/tls/ech.o
+# socket. Ported from kernel/tls.c; certificates verified with $(PKI) (warn and
+# allow, see tls_verify). Needs $(CRYPTO).
+PKI     := user/lib/pki/bn.o user/lib/pki/rsa.o user/lib/pki/ecdsa.o user/lib/pki/x509.o   # X.509 + RSA/ECDSA verify
+TLS     := user/lib/tls/tls.o user/lib/tls/ech.o $(PKI)
 # netconn: a TCP-or-TLS byte-stream transport wrapper (SK_TCP socket or $(TLS)
 # conn behind one handle). Used by libcurl HTTP/1.1 + the WebSocket client; needs
 # $(TLS) (+ $(CRYPTO), which TLS needs).

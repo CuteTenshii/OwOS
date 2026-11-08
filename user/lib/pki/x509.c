@@ -83,7 +83,8 @@ const char *x509_strerror(int err)
                                       "certificate not yet valid",
                                       "issuer is not a CA",
                                       "hostname mismatch",
-                                      "certificate not valid for servers"};
+                                      "certificate not valid for servers",
+                                      "no trusted root certificates installed"};
   return err >= 0 && err < (int)(sizeof names / sizeof *names) ? names[err] : "unknown error";
 }
 
