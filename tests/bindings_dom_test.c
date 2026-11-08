@@ -276,6 +276,67 @@ static void test_timers_unused_slots_hold(void)
   free(B);
 }
 
+static void test_xpath(void)
+{
+  run_script(
+      "var d=new DOMParser().parseFromString(\"<html><head><title>t</title></head><body><div id=a class='x y'>hi"
+      "<span>s</span></div><script>var ready=1</script></body></html>\",'text/html'), R=XPathResult;\n"
+      "function snap(x,c){ var r=d.evaluate(x,c||d,null,R.ORDERED_NODE_SNAPSHOT_TYPE,null); var o=[];\n"
+      "  for(var i=0;i<r.snapshotLength;i++) o.push(r.snapshotItem(i)); return o }\n"
+      "expect(snap('//span').length===1 && snap('//span')[0].tagName==='SPAN', 'descendant name test');\n"
+      "expect(snap('/html/body/div')[0]===d.getElementById('a'), 'absolute child path');\n"
+      "expect(snap(\"//div[@id='a']/span\").length===1, 'attribute predicate');\n"
+      "expect(snap('//div[contains(@class,\"y\")]').length===1, 'contains() on attribute');\n"
+      "expect(snap('//*[self::title or self::span]').length===2, 'or + self axis');\n"
+      "expect(snap('//title | //span').length===2 && snap('//title | //span')[0].tagName==='TITLE', 'union order');\n"
+      "expect(snap('//body/*').length===2 && snap('//body/*[last()]')[0].tagName==='SCRIPT', 'last()');\n"
+      "expect(snap('//span/ancestor::*').length===3 && snap('//span/ancestor::*')[0].tagName==='HTML', 'ancestor');\n"
+      "expect(snap('//span/preceding-sibling::text()')[0].nodeValue==='hi', 'preceding-sibling text()');\n"
+      "expect(snap('//head/following::div').length===1, 'following axis');\n"
+      "expect(snap('//div/..')[0].tagName==='BODY', 'parent step');\n"
+      "var n=d.evaluate('count(//div/node())',d,null,R.NUMBER_TYPE,null).numberValue; expect(n===2, 'count(): '+n);\n"
+      "expect(d.evaluate('string(//span)',d,null,R.STRING_TYPE,null).stringValue==='s', 'string()');\n"
+      "expect(d.evaluate('//div/@id',d,null,R.STRING_TYPE,null).stringValue==='a', 'attribute string value');\n"
+      "expect(d.evaluate('1 + 2 * 3 - 4 div 2 mod 3',d,null,R.NUMBER_TYPE,null).numberValue===5, 'arithmetic');\n"
+      "expect(d.evaluate('//span',d,null,R.BOOLEAN_TYPE,null).booleanValue===true, 'boolean');\n"
+      "expect(d.evaluate('//div',d,null,R.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue.id==='a', 'first node');\n"
+      "var it=d.evaluate('//body/*',d,null,R.ORDERED_NODE_ITERATOR_TYPE,null), c=0; while(it.iterateNext()) c++;\n"
+      "expect(c===2, 'iterator');\n"
+      "var a=d.getElementById('a');\n"
+      "expect(snap('span',a).length===1 && snap('./span',a).length===1, 'relative to context');\n"
+      "expect(d.evaluate('//x',d,null,R.ANY_TYPE,null).resultType===R.UNORDERED_NODE_ITERATOR_TYPE, 'ANY node-set');\n"
+      "expect(d.evaluate('2*3',d,null,R.ANY_TYPE,null).resultType===R.NUMBER_TYPE, 'ANY number');\n"
+      "var e=new XPathEvaluator(), x=e.createExpression('//span');\n"
+      "expect(x.evaluate(d,R.ORDERED_NODE_SNAPSHOT_TYPE).snapshotLength===1, 'XPathExpression');\n"
+      "expect(e.evaluate('//span',d,null,R.ORDERED_NODE_SNAPSHOT_TYPE,null).snapshotLength===1, 'XPathEvaluator');\n"
+      "var threw=false; try{ d.evaluate('//[',d,null,0,null) }catch(err){ threw=err.name==='SyntaxError' }\n"
+      "expect(threw, 'bad expression throws SyntaxError');\n"
+      "var q=new DOMParser().parseFromString('<p><b>x</b><b>y</b></p>','text/html');\n"
+      "expect(q.evaluate('//b[2]',q,null,R.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue.textContent==='y', '[n]');\n");
+}
+
+static void test_event_target(void)
+{
+  run_script("var log=[]; var t=new EventTarget();\n"
+             "var h=function(e){ log.push(e.type+':'+(e.target===t)+':'+(this===t)); };\n"
+             "t.addEventListener('ping',h); t.addEventListener('ping',h);\n"
+             "expect(t.dispatchEvent(new Event('ping')), 'dispatch returns true');\n"
+             "expect(log.join()==='ping:true:true,ping:true:true', 'listeners fire with target and this');\n"
+             "t.removeEventListener('ping',h); log.length=0; t.dispatchEvent(new Event('ping'));\n"
+             "expect(log.length===0, 'removed listener stays silent');\n"
+             "var wlog=0; window.addEventListener('ping',function(){ wlog++ });\n"
+             "t.addEventListener('ping',function(){}); t.dispatchEvent(new Event('ping',{bubbles:true}));\n"
+             "expect(wlog===0, 'plain targets do not bubble to window');\n"
+             "var once=0; t.addEventListener('c',function(e){ once++; e.preventDefault(); });\n"
+             "expect(t.dispatchEvent(new Event('c',{cancelable:true}))===false, 'preventDefault makes dispatch return "
+             "false');\n"
+             "class Bus extends EventTarget { constructor(){ super(); this.n=0; } }\n"
+             "var b=new Bus(); b.addEventListener('x',function(){ b.n++ }); b.dispatchEvent(new Event('x'));\n"
+             "expect(b.n===1 && b instanceof EventTarget && b instanceof Bus, 'subclass dispatches');\n"
+             "expect(document.body instanceof EventTarget && window instanceof EventTarget && new "
+             "AbortController().signal instanceof EventTarget, 'DOM objects inherit EventTarget');\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -295,6 +356,8 @@ int main(void)
   test("custom elements: lifecycle and registry validation", test_custom_elements_lifecycle_and);
   test("custom elements: nested elements upgrade on insert, clone and innerHTML", test_custom_elements_nested_upgrade);
   test("URL.createObjectURL stores Blob bytes until revoked", test_blob_object_urls);
+  test("XPath: evaluate, XPathEvaluator and XPathResult", test_xpath);
+  test("EventTarget: construction, subclassing, dispatch and isolation", test_event_target);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 
   return 0;

@@ -1453,6 +1453,35 @@ static js_value domparser_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
   return js_obj_value(o);
 }
 
+static js_value xmlser_serialize(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(A(0));
+  sbuf sb = {0, 0, 0, 0};
+  js_value r;
+  (void)t;
+  if (!n)
+    return js_mk_cstring(ctx, "");
+  if (n->type == DOM_ELEMENT && n->tag[0] == '#' && !node_is_comment(n))
+    serialize(n, &sb); /* #document / #frag: children only */
+  else
+    serialize_node(n, &sb, 0);
+  r = js_mk_string(ctx, sb.b ? sb.b : "", sb.n);
+  free(sb.b);
+  return r;
+}
+static js_value xmlser_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  js_object *o;
+  (void)thisv;
+  (void)args;
+  (void)argc;
+  gc_push_scope();
+  o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def_native(ctx, o, "serializeToString", xmlser_serialize, 1);
+  gc_pop_scope();
+  return js_obj_value(o);
+}
+
 /* ------------------------------------------------------- setup ------------ */
 
 void def_method(js_object *o, const char *name, js_native fn, int arity) { js_def_native(g_ctx, o, name, fn, arity); }
@@ -2162,6 +2191,8 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_ws_proto, "send", ws_send_m, 1);
   def_method(g_ws_proto, "close", ws_close_m, 2);
   def_method(g_ws_proto, "addEventListener", el_add_listener, 3);
+  js_def_native(ctx, win, "XMLSerializer", xmlser_ctor, 0);
+  xpath_install(ctx, win);
   def_method(g_ws_proto, "removeEventListener", el_remove_listener, 3);
   def_method(g_ws_proto, "dispatchEvent", el_dispatch, 1);
   js_def(g_ws_proto, "CONNECTING", js_number(WS_CONNECTING), P_ENUMERABLE);

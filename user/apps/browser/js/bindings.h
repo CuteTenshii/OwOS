@@ -233,6 +233,7 @@ js_value el_set_node_value(js_ctx *ctx, js_value t, js_value *args, int argc);
 const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap);
 struct dom_node *doc_root_of(js_value t);
 js_value wrap_document(js_ctx *ctx, struct dom_node *root);
+void xpath_install(js_ctx *ctx, js_object *win);
 
 js_value crypto_getrandomvalues(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value crypto_randomuuid(js_ctx *ctx, js_value t, js_value *args, int argc);
