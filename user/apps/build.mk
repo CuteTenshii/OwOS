@@ -48,6 +48,7 @@ APP_LIBS_sshd := $(CRYPTO)
 APP_LIBS_stun := $(STUN) $(CRC32) $(CRYPTO) $(RESOLVE)
 APP_LIBS_unrar := $(RAR) $(CRYPTO) $(CRC32)
 APP_LIBS_term :=
+APP_OBJS_sh := $(addprefix user/apps/sh/,sh.o out.o vars.o jobs.o files.o accounts.o parse.o edit.o)
 APP_LIBS_sh := $(SHLIB)
 APP_LIBS_torrent := $(TORLIB) $(CRYPTO)
 APP_LIBS_vmclipd := $(CLIPBOARD)
