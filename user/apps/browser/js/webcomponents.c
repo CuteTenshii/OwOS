@@ -276,6 +276,11 @@ static void ce_upgrade_subtree(struct dom_node *n)
   for (struct dom_node *c = n->first_child; c; c = c->next)
     ce_upgrade_subtree(c);
 }
+void ce_upgrade_children(struct dom_node *n)
+{
+  for (struct dom_node *c = n->first_child; c; c = c->next)
+    ce_upgrade_subtree(c);
+}
 js_value ce_upgrade(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(A(0));

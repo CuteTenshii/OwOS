@@ -44,6 +44,7 @@ js_value ce_get(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value ce_lookup(const char *tag);
 js_value ce_upgrade(js_ctx *ctx, js_value t, js_value *args, int argc);
 void ce_upgrade_node(struct dom_node *n, js_value cls);
+void ce_upgrade_children(struct dom_node *n);
 js_value ce_when_defined(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value clip_read(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value clip_readtext(js_ctx *ctx, js_value t, js_value *args, int argc);

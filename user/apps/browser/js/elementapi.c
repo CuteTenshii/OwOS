@@ -233,6 +233,7 @@ js_value el_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
     js_value cls = ce_lookup(c->tag);
     if (cls.type == JV_OBJ)
       ce_upgrade_node(c, cls);
+    ce_upgrade_children(c);
   }
   return wrap_node(c);
 }

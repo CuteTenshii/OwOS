@@ -221,6 +221,26 @@ static void test_custom_elements_lifecycle_and(void)
              "expect(err==='NotSupportedError', 'redefinition throws: '+err);\n");
 }
 
+static void test_custom_elements_nested_upgrade(void)
+{
+  run_script("var log=[];\n"
+             "class XNest extends HTMLElement {\n"
+             "  kid = document.createElement('i');\n"
+             "  connectedCallback(){ log.push('c'); this.append(this.kid) }\n"
+             "}\n"
+             "customElements.define('x-nest', XNest);\n"
+             "var h=document.createElement('div'); h.innerHTML='<p><x-nest></x-nest></p>';\n"
+             "expect(log.length===0 && h.firstChild.firstChild.kid, 'innerHTML upgrades detached descendants: '+log);\n"
+             "document.body.appendChild(h);\n"
+             "expect(log.join()==='c' && h.firstChild.firstChild.childNodes.length===1, 'insert connects descendants: "
+             "'+log);\n"
+             "var cl=h.cloneNode(true); expect(cl.firstChild.firstChild.kid, 'clone upgrades descendants');\n"
+             "document.body.appendChild(cl);\n"
+             "expect(log.join()==='c,c', 'cloned subtree connects: '+log);\n"
+             "document.body.innerHTML='<section><x-nest></x-nest></section>';\n"
+             "expect(log.join()==='c,c,c', 'innerHTML on a connected parent connects: '+log);\n");
+}
+
 static void test_blob_object_urls(void)
 {
   unsigned char *body;
@@ -273,6 +293,7 @@ int main(void)
   test("dialog open state, returnValue and events", test_dialog_open_state_returnvalue);
   test("popover API: show, hide, toggle, events and light dismiss", test_popover_api_show_hide);
   test("custom elements: lifecycle and registry validation", test_custom_elements_lifecycle_and);
+  test("custom elements: nested elements upgrade on insert, clone and innerHTML", test_custom_elements_nested_upgrade);
   test("URL.createObjectURL stores Blob bytes until revoked", test_blob_object_urls);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 

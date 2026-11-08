@@ -363,6 +363,7 @@ static void set_inner_html(struct dom_node *el, const char *html)
     c = nx;
   }
   dom_free(frag);
+  ce_upgrade_children(el);
 }
 
 /* ------------------------------------------------------- element natives -- */
@@ -823,6 +824,7 @@ static void connect_inserted(struct dom_node *c)
   if (cls.type == JV_OBJ)
     ce_upgrade_node(c, cls);
   ce_connect(c);
+  ce_upgrade_children(c);
   if (node_connected(c))
     run_inserted_script(c);
 }
@@ -1953,9 +1955,9 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     gc_pop_scope();
   }
   js_webapi_setup(ctx, win);
+  js_streams_setup(ctx, win);
   /* URL + URLSearchParams (WHATWG Web APIs over curl/url.h) */
   def_method(g_url_proto, "toString", url_tostring, 0);
-  js_streams_setup(ctx, win);
   def_method(g_url_proto, "toJSON", url_tostring, 0);
   def_method(g_sp_proto, "get", sp_get, 1);
   def_method(g_sp_proto, "getAll", sp_get_all, 1);
