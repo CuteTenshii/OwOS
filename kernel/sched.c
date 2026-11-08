@@ -73,7 +73,7 @@ typedef struct task {
   uint32_t uid;           /* owning user id (credentials; inherited like cwd) */
   uint32_t gid;           /* owning primary group id */
   uint32_t umask;
-  bool fpu_valid;                /* fpu[] holds a saved x87 image (else the task still has the init state) */
+  bool fpu_valid;               /* fpu[] holds a saved x87 image (else the task still has the init state) */
   uint8_t fpu[FPU_IMAGE_BYTES]; /* x87 state saved while the task is switched out */
   struct task *next;
   int running_cpu;
