@@ -74,10 +74,11 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc); /* window
 void emit_event(js_object *w, const char *type, js_value data);        /* fire a plain Event on w */
 
 /* ---- subsystem setup entry points --------------------------------------- */
-void js_idb_setup(js_ctx *ctx, js_object *win);    /* IndexedDB (js_indexeddb.c) */
-void js_idb_teardown(void);                        /* unroot the page's IDB state  */
-void js_webapi_setup(js_ctx *ctx, js_object *win); /* performance + Encoding (js_webapi.c) */
-void js_webapi_teardown(void);                     /* unroot the Encoding-API prototypes  */
+void js_idb_setup(js_ctx *ctx, js_object *win);     /* IndexedDB (js_indexeddb.c) */
+void js_idb_teardown(void);                         /* unroot the page's IDB state  */
+void js_webapi_setup(js_ctx *ctx, js_object *win);  /* performance + Encoding (js_webapi.c) */
+void js_streams_setup(js_ctx *ctx, js_object *win); /* Streams API, lazily compiled (js/streams.c) */
+void js_webapi_teardown(void);                      /* unroot the Encoding-API prototypes  */
 
 /* HTMLMediaElement + Remote Playback + new Image()/Audio() (js_media.c) */
 void setup_media_proto(js_ctx *ctx);

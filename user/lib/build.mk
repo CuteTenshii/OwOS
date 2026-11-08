@@ -33,6 +33,7 @@ DIALOG  := user/lib/dialog/dialog.o   # reusable modal message-box + property-sh
 # Optional libs, linked only into the programs that use them (so a tiny program
 # doesn't carry the 32 KiB inflate window or the decoder buffers).
 INFLATE := user/lib/zlib/inflate.o    # zlib: streaming DEFLATE (gzip/png)
+DEFLATE := user/lib/zlib/deflate.o     # zlib: gzip/zlib/raw DEFLATE encoder (uses $(CRC32))
 CRC32   := user/lib/zlib/crc32.o      # zlib: the shared CRC-32 (deflate + stun FINGERPRINT)
 PNGDEC  := user/lib/png/png.o        # libpng: streaming PNG decode (uses zlib)
 PNGENC  := user/lib/png/pngenc.o      # PNG encode (uncompressed); screenshot path, uses $(CRC32)

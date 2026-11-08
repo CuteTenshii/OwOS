@@ -1955,6 +1955,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   js_webapi_setup(ctx, win);
   /* URL + URLSearchParams (WHATWG Web APIs over curl/url.h) */
   def_method(g_url_proto, "toString", url_tostring, 0);
+  js_streams_setup(ctx, win);
   def_method(g_url_proto, "toJSON", url_tostring, 0);
   def_method(g_sp_proto, "get", sp_get, 1);
   def_method(g_sp_proto, "getAll", sp_get_all, 1);

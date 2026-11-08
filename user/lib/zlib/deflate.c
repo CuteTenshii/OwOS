@@ -875,6 +875,49 @@ int gzip_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap
   return (int)(o.pos + 8);
 }
 
+uint32_t zlib_adler32(const uint8_t *p, uint32_t n)
+{
+  uint32_t a = 1, b = 0;
+  while (n) {
+    uint32_t k = n < 5552 ? n : 5552; /* largest run before b can overflow 32 bits */
+    n -= k;
+    while (k--) {
+      a += *p++;
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return b << 16 | a;
+}
+
+int deflate_compress(int fmt, const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap)
+{
+  uint32_t head = fmt == DEFLATE_ZLIB ? 2 : 0, tail = fmt == DEFLATE_ZLIB ? 4 : 0;
+  if (fmt == DEFLATE_GZIP)
+    return gzip_compress(src, slen, dst, dcap);
+  if (dcap < head + tail)
+    return -1;
+  if (head) {
+    dst[0] = 0x78; /* CM = deflate, 32 KiB window */
+    dst[1] = 0x9C; /* default level, no preset dictionary, FCHECK */
+  }
+  struct outbits o = {dst, dcap, head, 0, 0, 0};
+  if (deflate(src, slen, &o) < 0)
+    return -1;
+  flush_bits(&o);
+  if (o.err || o.pos + tail > dcap)
+    return -1;
+  if (tail) {
+    uint32_t ad = zlib_adler32(src, slen);
+    dst[o.pos] = (uint8_t)(ad >> 24);
+    dst[o.pos + 1] = (uint8_t)(ad >> 16);
+    dst[o.pos + 2] = (uint8_t)(ad >> 8);
+    dst[o.pos + 3] = (uint8_t)ad;
+  }
+  return (int)(o.pos + tail);
+}
+
 int gzip_orig_size(const uint8_t *src, uint32_t slen)
 {
   if (slen < 18 || src[0] != 0x1F || src[1] != 0x8B || src[2] != 0x08)

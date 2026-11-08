@@ -24,6 +24,15 @@ int gzip_compress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap
  * small, or the CRC32/length check fails. */
 int gzip_decompress(const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap);
 
+/* Containers for deflate_compress. dst needs gzip_bound(slen) bytes for any of them. */
+enum { DEFLATE_GZIP, DEFLATE_ZLIB, DEFLATE_RAW };
+/* Compress into a gzip member, a zlib stream (RFC 1950) or a bare DEFLATE body.
+ * Returns the compressed length, or -1 if dst is too small. */
+int deflate_compress(int fmt, const uint8_t *src, uint32_t slen, uint8_t *dst, uint32_t dcap);
+
+/* The Adler-32 checksum that ends a zlib stream. */
+uint32_t zlib_adler32(const uint8_t *p, uint32_t n);
+
 /* The original size recorded in a gzip trailer (ISIZE, the decompressed length
  * mod 2^32), or -1 if src is not a gzip member. Lets a caller size its output
  * buffer before decompressing. */
