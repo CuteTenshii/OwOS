@@ -2144,6 +2144,15 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_response_proto, "text", resp_text, 0);
   def_method(g_response_proto, "json", resp_json, 0);
   def_method(g_response_proto, "clone", resp_clone, 0);
+  {
+    js_object *rc;
+    gc_push_scope();
+    rc = (js_object *)gc_keep(js_new_native(ctx, response_ctor, "Response", 2));
+    js_def(rc, "prototype", js_obj_value(g_response_proto), 0);
+    js_def(g_response_proto, "constructor", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
+    js_def(win, "Response", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
+    gc_pop_scope();
+  }
   def_method(win, "fetch", win_fetch, 2);
 
   /* WebSocket (RFC 6455 over user/lib/websocket): live */

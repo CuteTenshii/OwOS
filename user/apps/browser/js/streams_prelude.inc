@@ -884,8 +884,37 @@ JS(
     });
   }
 
+  function readAll(stream) {
+    var d = deferred(), reader, chunks = [], total = 0;
+    try { reader = stream.getReader(); } catch (e) { d.reject(e); return d.promise; }
+    function step() {
+      after(reader.read(), function (r) {
+        try {
+          if (r.done) { d.resolve(concat(chunks, total)); return; }
+          var u8 = toBytes(r.value);
+          total += u8.length;
+          if (total > MAX_BUFFERED) throw new RangeError("Body is too large");
+          chunks.push(u8);
+        } catch (e) { reader.cancel(e).then(undefined, noop); d.reject(e); return; }
+        step();
+      }, d.reject);
+    }
+    step();
+    return d.promise;
+  }
+
+  function consume(stream, kind, type) {
+    return readAll(stream).then(function (u8) {
+      if (kind === 0) return u8.buffer;
+      if (kind === 2) return new Blob([u8], { type: type });
+      var text = new TextDecoder().decode(u8);
+      return kind === 3 ? JSON.parse(text) : text;
+    });
+  }
+
   return {
     bytesStream: bytesStream,
+    consume: consume,
     ReadableStream: ReadableStream,
     ReadableStreamDefaultReader: ReadableStreamDefaultReader,
     ReadableStreamDefaultController: ReadableStreamDefaultController,

@@ -31,6 +31,15 @@ static const char *const k_globals[] = {"ReadableStream",
                                         "TextEncoderStream",
                                         "TextDecoderStream"};
 
+static const char *const k_helpers[] = {"bytesStream", "consume"};
+
+static js_value helper(js_ctx *ctx, const char *name)
+{
+  char key[24] = "@";
+  strlcpy(key + 1, name, sizeof key - 1);
+  return js_get(ctx, js_obj_value(ctx->global), key);
+}
+
 enum { LOAD_NONE, LOAD_RUNNING, LOAD_OK, LOAD_FAILED };
 static int g_load_state;
 
@@ -248,7 +257,11 @@ static int streams_load(js_ctx *ctx)
     gc_keep(exports.u.obj);
   for (i = 0; i < sizeof k_globals / sizeof k_globals[0]; i++)
     js_def(ctx->global, k_globals[i], js_get(ctx, exports, k_globals[i]), P_WRITABLE | P_CONFIGURABLE);
-  js_def(ctx->global, "@bytesStream", js_get(ctx, exports, "bytesStream"), 0);
+  for (i = 0; i < sizeof k_helpers / sizeof k_helpers[0]; i++) {
+    char key[24] = "@";
+    strlcpy(key + 1, k_helpers[i], sizeof key - 1);
+    js_def(ctx->global, key, js_get(ctx, exports, k_helpers[i]), 0);
+  }
   gc_pop_scope();
   g_load_state = LOAD_OK;
   return 1;
@@ -282,16 +295,16 @@ static js_value lazy_set(js_ctx *ctx, js_value t, js_value *args, int argc)
 /* A ReadableStream over the raw bytes held in a JS string */
 static js_value bytes_stream(js_ctx *ctx, js_value bytes)
 {
-  js_value helper, u8, r;
+  js_value fn, u8, r;
   if (!streams_load(ctx))
     return js_throw_type(ctx, "Streams are unavailable");
-  helper = js_get(ctx, js_obj_value(ctx->global), "@bytesStream");
+  fn = helper(ctx, "bytesStream");
   gc_push_scope();
   u8 = bytes.type == JV_STR ? bytes_to_u8(ctx, (const unsigned char *)bytes.u.str->data, (unsigned)bytes.u.str->len)
                             : bytes_to_u8(ctx, 0, 0);
   if (u8.type == JV_OBJ)
     gc_keep(u8.u.obj);
-  r = js_call(ctx, helper, js_undef(), &u8, 1);
+  r = js_call(ctx, fn, js_undef(), &u8, 1);
   gc_pop_scope();
   return r;
 }
@@ -305,15 +318,96 @@ static js_value blob_stream(js_ctx *ctx, js_value t, js_value *args, int argc)
 
 static js_value response_body(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value s = js_get(ctx, t, "@stream");
+  js_value s = js_get(ctx, t, "@source");
   (void)args;
   (void)argc;
   if (s.type == JV_OBJ || t.type != JV_OBJ)
+    return s;
+  s = js_get(ctx, t, "@stream");
+  if (s.type == JV_OBJ)
     return s;
   s = bytes_stream(ctx, js_get(ctx, t, "@body"));
   if (s.type == JV_OBJ)
     js_def(t.u.obj, "@stream", s, 0);
   return s;
+}
+
+js_value response_init_body(js_ctx *ctx, js_value body, js_value *stream, char *ctype, int ctcap)
+{
+  if (body.type == JV_UNDEF || body.type == JV_NULL)
+    return js_mk_cstring(ctx, "");
+  if (body.type == JV_OBJ) {
+    js_object *o = body.u.obj;
+    if (o->proto == g_blob_proto) {
+      js_value type = js_get(ctx, body, "type");
+      strlcpy(ctype, type.type == JV_STR ? type.u.str->data : "", (unsigned)ctcap);
+      return js_get(ctx, body, "@bytes");
+    }
+    if ((o->kind == OBJ_ARRAYBUFFER || o->kind == OBJ_TYPEDARRAY) && o->host) {
+      int n;
+      const unsigned char *p = view_bytes(body, &n);
+      ctype[0] = '\0';
+      return js_mk_string(ctx, p ? (const char *)p : "", p ? n : 0);
+    }
+    if (js_is_callable(js_get(ctx, body, "getReader")) && js_is_callable(js_get(ctx, body, "pipeTo"))) {
+      ctype[0] = '\0';
+      *stream = body;
+      return js_mk_cstring(ctx, "");
+    }
+  }
+  return body.type == JV_STR ? body : js_to_string(ctx, body);
+}
+
+js_value response_consume(js_ctx *ctx, js_value resp, int kind)
+{
+  js_value src = js_get(ctx, resp, "@source"), args[3], hdrs, type, r;
+  if (src.type != JV_OBJ || !streams_load(ctx))
+    return js_promise_rejected(ctx, js_mk_cstring(ctx, "Response has no stream body"));
+  hdrs = js_get(ctx, resp, "headers");
+  type = hdrs.type == JV_OBJ ? js_get(ctx, hdrs, "@ctype") : js_undef();
+  gc_push_scope();
+  args[0] = src;
+  args[1] = js_number(kind);
+  args[2] = type.type == JV_STR ? type : js_mk_cstring(ctx, "");
+  if (args[2].type == JV_STR)
+    gc_keep(args[2].u.str);
+  js_def(resp.u.obj, "bodyUsed", js_bool(1), P_WRITABLE | P_ENUMERABLE);
+  r = js_call(ctx, helper(ctx, "consume"), js_undef(), args, 3);
+  gc_pop_scope();
+  return r;
+}
+
+static js_value response_arraybuffer(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value body, u8;
+  (void)args;
+  (void)argc;
+  if (js_get(ctx, t, "@source").type == JV_OBJ)
+    return response_consume(ctx, t, CONSUME_BUFFER);
+  body = js_get(ctx, t, "@body");
+  gc_push_scope();
+  u8 = body.type == JV_STR ? bytes_to_u8(ctx, (const unsigned char *)body.u.str->data, (unsigned)body.u.str->len)
+                           : bytes_to_u8(ctx, 0, 0);
+  if (u8.type == JV_OBJ)
+    gc_keep(u8.u.obj);
+  u8 = js_get(ctx, u8, "buffer");
+  gc_pop_scope();
+  return js_promise_resolved(ctx, u8);
+}
+
+static js_value response_blob(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value body, hdrs, type;
+  (void)args;
+  (void)argc;
+  if (js_get(ctx, t, "@source").type == JV_OBJ)
+    return response_consume(ctx, t, CONSUME_BLOB);
+  body = js_get(ctx, t, "@body");
+  hdrs = js_get(ctx, t, "headers");
+  type = hdrs.type == JV_OBJ ? js_get(ctx, hdrs, "@ctype") : js_undef();
+  return js_promise_resolved(ctx, make_blob(ctx, body.type == JV_STR ? body.u.str->data : "",
+                                            body.type == JV_STR ? body.u.str->len : 0,
+                                            type.type == JV_STR ? type.u.str->data : ""));
 }
 
 void js_streams_setup(js_ctx *ctx, js_object *win)
@@ -334,4 +428,6 @@ void js_streams_setup(js_ctx *ctx, js_object *win)
   }
   def_method(g_blob_proto, "stream", blob_stream, 0);
   def_acc(g_response_proto, "body", response_body, 0);
+  def_method(g_response_proto, "arrayBuffer", response_arraybuffer, 0);
+  def_method(g_response_proto, "blob", response_blob, 0);
 }

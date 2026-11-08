@@ -78,7 +78,14 @@ void js_idb_setup(js_ctx *ctx, js_object *win);     /* IndexedDB (js_indexeddb.c
 void js_idb_teardown(void);                         /* unroot the page's IDB state  */
 void js_webapi_setup(js_ctx *ctx, js_object *win);  /* performance + Encoding (js_webapi.c) */
 void js_streams_setup(js_ctx *ctx, js_object *win); /* Streams API, lazily compiled (js/streams.c) */
-void js_webapi_teardown(void);                      /* unroot the Encoding-API prototypes  */
+enum { CONSUME_BUFFER, CONSUME_TEXT, CONSUME_BLOB, CONSUME_JSON };
+/* A Response body init as raw bytes in a string. A ReadableStream is returned through *stream instead; ctype is
+ * overwritten for Blob, BufferSource and stream bodies. */
+js_value response_init_body(js_ctx *ctx, js_value body, js_value *stream, char *ctype, int ctcap);
+/* Read a Response body to the end: a promise of an ArrayBuffer, string, Blob or parsed JSON value */
+js_value response_consume(js_ctx *ctx, js_value resp, int kind);
+js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc); /* new Response(body, init) */
+void js_webapi_teardown(void);                                                 /* unroot the Encoding-API prototypes  */
 
 /* HTMLMediaElement + Remote Playback + new Image()/Audio() (js_media.c) */
 void setup_media_proto(js_ctx *ctx);

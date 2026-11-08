@@ -220,6 +220,43 @@ static void test_blob_and_text_streams(void)
                               "desc.value===ReadableStream, 'globals become data properties once used');\n");
 }
 
+static void test_response_bodies(void)
+{
+  run_script(
+      HELPERS FIXTURES
+      "var got={};\n"
+      "function take(k,p){ p.then(function(v){ got[k]=v; },function(e){ got[k+'Err']=e; }); }\n"
+      "var src=function(){ return one(GZ).pipeThrough(new DecompressionStream('gzip')); };\n"
+      "var r=new Response(src()); expect(r.body instanceof ReadableStream && r.bodyUsed===false, 'stream body is "
+      "exposed');\n"
+      "take('buf',r.arrayBuffer()); expect(got.buf instanceof ArrayBuffer && same(new Uint8Array(got.buf),TEXT), "
+      "'arrayBuffer drains the stream');\n"
+      "expect(r.bodyUsed===true, 'bodyUsed after reading');\n"
+      "take('again',r.arrayBuffer()); expect(got.againErr instanceof TypeError, 'a second read fails');\n"
+      "take('txt',new Response(src()).text()); expect(got.txt==='hello hello hello hello streams\\nhello hello hello "
+      "hello streams\\nhello hello hello hello streams\\n', 'text decodes UTF-8');\n"
+      "take('js',new Response(new ReadableStream({start:function(c){ c.enqueue(new TextEncoder().encode('{\"a\":')); "
+      "c.enqueue(new TextEncoder().encode('[1,2]}')); c.close(); }})).json());\n"
+      "expect(got.js && got.js.a.join()==='1,2', 'json across chunks');\n"
+      "take('blob',new Response(one(RAW),{headers:{'content-type':'application/octet-stream'}}).blob());\n"
+      "expect(got.blob instanceof Blob && got.blob.size===RAW.length && got.blob.type==='application/octet-stream', "
+      "'blob keeps size and type');\n"
+      "take('bytes',new Response(new Uint8Array([1,2,3,255])).arrayBuffer());\n"
+      "expect(got.bytes.byteLength===4 && new Uint8Array(got.bytes)[3]===255, 'typed array body keeps raw bytes');\n"
+      "take('ab',new Response(GZ.buffer).arrayBuffer()); expect(same(new Uint8Array(got.ab),GZ), 'ArrayBuffer body');\n"
+      "take('fromblob',new Response(new Blob([TEXT],{type:'text/x'})).blob()); expect(got.fromblob.type==='text/x' && "
+      "got.fromblob.size===TEXT.length, 'Blob body keeps its type');\n"
+      "take('str',new Response('plain').text()); expect(got.str==='plain', 'string body');\n"
+      "var piped=new Response(new Blob([GZ]).stream().pipeThrough(new DecompressionStream('gzip')));\n"
+      "take('piped',piped.text()); expect(got.piped.length===TEXT.length, 'Blob.stream into DecompressionStream into "
+      "Response');\n"
+      "var rb=new Response('abc').body; expect(rb instanceof ReadableStream, 'string body streams');\n"
+      "expect(cat(drain(new Response('abc').body).chunks).length===3, 'string body bytes');\n"
+      "var bad=new Response(new ReadableStream({start:function(c){ c.enqueue('not bytes'); c.close(); }})); "
+      "take('badc',bad.arrayBuffer());\n"
+      "expect(got.badcErr instanceof TypeError, 'non-byte chunks reject');\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -232,6 +269,7 @@ int main(void)
   test("DecompressionStream", test_decompression);
   test("CompressionStream round trips", test_compression_round_trip);
   test("Blob.stream, TextEncoderStream and TextDecoderStream", test_blob_and_text_streams);
+  test("Response bodies from streams and buffers", test_response_bodies);
 
   return 0;
 }

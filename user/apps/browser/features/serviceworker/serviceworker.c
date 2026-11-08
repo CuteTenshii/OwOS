@@ -357,47 +357,6 @@ static js_value request_ctor(js_ctx *ctx, js_value thisv, js_value *args, int ar
   }
   return sw_make_request(ctx, url, method);
 }
-static js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  int status = 200;
-  char st[64], ct[160];
-  js_value body = A(0), rv;
-  (void)thisv;
-  strlcpy(st, "", sizeof st);
-  strlcpy(ct, "text/plain;charset=UTF-8", sizeof ct);
-  if (argc >= 2 && A(1).type == JV_OBJ) {
-    js_value s = js_get(ctx, A(1), "status");
-    js_value stt = js_get(ctx, A(1), "statusText");
-    js_value h = js_get(ctx, A(1), "headers");
-    if (s.type == JV_NUM)
-      status = (int)s.u.num;
-    if (stt.type == JV_STR)
-      strlcpy(st, stt.u.str->data, sizeof st);
-    if (h.type == JV_OBJ) {
-      js_value c = js_get(ctx, h, "content-type");
-      js_value cc = js_get(ctx, h, "@ctype");
-      if (c.type == JV_STR)
-        strlcpy(ct, c.u.str->data, sizeof ct);
-      if (cc.type == JV_STR && cc.u.str->len)
-        strlcpy(ct, cc.u.str->data, sizeof ct);
-    }
-  }
-  gc_push_scope();
-  {
-    js_value bstr = (body.type == JV_STR)                             ? body
-                    : (body.type == JV_UNDEF || body.type == JV_NULL) ? js_mk_cstring(ctx, "")
-                                                                      : js_to_string(ctx, body);
-    js_object *resp;
-    if (bstr.type == JV_STR)
-      gc_keep(bstr.u.str);
-    resp = (js_object *)gc_keep(make_response(ctx, "", status, st, ct, bstr.type == JV_STR ? bstr.u.str->data : "",
-                                              bstr.type == JV_STR ? bstr.u.str->len : 0));
-    rv = js_obj_value(resp);
-  }
-  gc_pop_scope();
-  return rv;
-}
-
 /* ---- Cache ---- */
 static struct sw_cache *cache_of(js_ctx *ctx, js_value t)
 {
@@ -1504,12 +1463,8 @@ void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
   js_def(win, "caches", sw_make_cachestorage(ctx), P_WRITABLE | P_CONFIGURABLE);
 
   {
-    js_object *rc, *qc;
+    js_object *qc;
     gc_push_scope();
-    rc = (js_object *)gc_keep(js_new_native(ctx, response_ctor, "Response", 2));
-    js_def(rc, "prototype", js_obj_value(g_response_proto), 0);
-    js_def(g_response_proto, "constructor", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
-    js_def(win, "Response", js_obj_value(rc), P_WRITABLE | P_CONFIGURABLE);
     qc = (js_object *)gc_keep(js_new_native(ctx, request_ctor, "Request", 2));
     js_def(qc, "prototype", js_obj_value(g_request_proto), 0);
     js_def(g_request_proto, "constructor", js_obj_value(qc), P_WRITABLE | P_CONFIGURABLE);

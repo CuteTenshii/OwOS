@@ -7,6 +7,8 @@ js_value resp_text(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)args;
   (void)argc;
+  if (js_get(ctx, t, "@source").type == JV_OBJ)
+    return response_consume(ctx, t, CONSUME_TEXT);
   return js_promise_resolved(ctx, js_get(ctx, t, "@body"));
 }
 js_value resp_json(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -14,6 +16,8 @@ js_value resp_json(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_value body = js_get(ctx, t, "@body"), parsed, jsonobj, parsefn;
   (void)args;
   (void)argc;
+  if (js_get(ctx, t, "@source").type == JV_OBJ)
+    return response_consume(ctx, t, CONSUME_JSON);
   jsonobj = js_get(ctx, js_obj_value(ctx->global), "JSON");
   parsefn = js_get(ctx, jsonobj, "parse");
   if (!js_is_callable(parsefn))
@@ -70,6 +74,47 @@ js_object *make_response(js_ctx *ctx, const char *url, int status, const char *s
   js_def(resp, "headers", js_obj_value(hdrs), P_ENUMERABLE);
   gc_pop_scope();
   return resp;
+}
+
+js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  int status = 200;
+  char st[64], ct[160];
+  js_value stream = js_undef(), bstr, rv;
+  js_object *resp;
+  (void)thisv;
+  strlcpy(st, "", sizeof st);
+  strlcpy(ct, "text/plain;charset=UTF-8", sizeof ct);
+  gc_push_scope();
+  bstr = response_init_body(ctx, A(0), &stream, ct, sizeof ct);
+  if (stream.type == JV_OBJ)
+    gc_keep(stream.u.obj);
+  if (bstr.type == JV_STR)
+    gc_keep(bstr.u.str);
+  if (argc >= 2 && A(1).type == JV_OBJ) {
+    js_value s = js_get(ctx, A(1), "status");
+    js_value stt = js_get(ctx, A(1), "statusText");
+    js_value h = js_get(ctx, A(1), "headers");
+    if (s.type == JV_NUM)
+      status = (int)s.u.num;
+    if (stt.type == JV_STR)
+      strlcpy(st, stt.u.str->data, sizeof st);
+    if (h.type == JV_OBJ) {
+      js_value c = js_get(ctx, h, "content-type");
+      js_value cc = js_get(ctx, h, "@ctype");
+      if (c.type == JV_STR)
+        strlcpy(ct, c.u.str->data, sizeof ct);
+      if (cc.type == JV_STR && cc.u.str->len)
+        strlcpy(ct, cc.u.str->data, sizeof ct);
+    }
+  }
+  resp = (js_object *)gc_keep(make_response(ctx, "", status, st, ct, bstr.type == JV_STR ? bstr.u.str->data : "",
+                                            bstr.type == JV_STR ? bstr.u.str->len : 0));
+  if (stream.type == JV_OBJ)
+    js_def(resp, "@source", stream, 0);
+  rv = js_obj_value(resp);
+  gc_pop_scope();
+  return rv;
 }
 
 /* The controlling service worker (if any) answers a fetch() from the page */
