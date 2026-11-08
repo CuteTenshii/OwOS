@@ -1872,63 +1872,66 @@ static void test_hash_failures(void)
   free(t);
 }
 
+static void test_paths_and_volume_names(void)
+{
+  test_paths_and_names();
+  test_volume_names();
+}
+
+static void test_distances_and_hashes(void)
+{
+  test_distance_boundaries();
+  test_hash_failures();
+}
+
+static void test_rar5_volumes_lz(void) { test_rar5_volumes(3); }
+
+static void test_rar5_volumes_stored(void) { test_rar5_volumes(0); }
+
+static void test_ppmd_streams(void)
+{
+  test_ppmd_vs_7z(200000, 0);
+  test_ppmd_vs_7z(1500000, 1);
+  test_ppmd_vs_7z(900000, 2);
+}
+
+static void test_rar4_volume_sets(void)
+{
+  test_rar4_volumes(true, 3);
+  test_rar4_volumes(false, 3);
+  test_rar4_volumes(true, 0);
+}
+
 int main(void)
 {
   have_unar = have_tool("unar");
   have_bsdtar = have_tool("bsdtar");
   alarm(280);
-  test("primitives: crc, aes, kdf, blake2sp, filters");
-  test_primitives();
-  test("path safety and volume names");
-  test_paths_and_names();
-  test_volume_names();
-  test("errors, limits, skipping, old methods");
-  test_errors_and_limits();
-  test("distance boundaries and hash failures");
-  test_distance_boundaries();
-  test_hash_failures();
-  test("rar5 stored and lz round trip, oracles");
-  test_rar5_basic();
-  test("rar5 solid, blocks, universal tables");
-  test_rar5_blocks_solid();
-  test("rar5 filters");
-  test_rar5_filters();
-  test("rar5 far distances");
-  test_rar5_distances();
-  test("rar5 names and links");
-  test_rar5_names_links();
-  test("rar5 volumes");
-  test_rar5_volumes(3);
-  test("rar5 volumes stored");
-  test_rar5_volumes(0);
+  test("primitives: crc, aes, kdf, blake2sp, filters", test_primitives);
+  test("path safety and volume names", test_paths_and_volume_names);
+  test("errors, limits, skipping, old methods", test_errors_and_limits);
+  test("distance boundaries and hash failures", test_distances_and_hashes);
+  test("rar5 stored and lz round trip, oracles", test_rar5_basic);
+  test("rar5 solid, blocks, universal tables", test_rar5_blocks_solid);
+  test("rar5 filters", test_rar5_filters);
+  test("rar5 far distances", test_rar5_distances);
+  test("rar5 names and links", test_rar5_names_links);
+  test("rar5 volumes", test_rar5_volumes_lz);
+  test("rar5 volumes stored", test_rar5_volumes_stored);
 #ifdef RAR_ENC_CRYPTO
-  test("rar5 encryption");
-  test_rar5_crypto();
+  test("rar5 encryption", test_rar5_crypto);
 #endif
-  test("ppmd model against libarchive 7z streams");
-  test_ppmd_vs_7z(200000, 0);
-  test_ppmd_vs_7z(1500000, 1);
-  test_ppmd_vs_7z(900000, 2);
-  test("rar4 basic");
-  test_rar4_basic();
-  test("rar4 solid");
-  test_rar4_solid();
-  test("rar4 far distances");
-  test_rar4_distances();
+  test("ppmd model against libarchive 7z streams", test_ppmd_streams);
+  test("rar4 basic", test_rar4_basic);
+  test("rar4 solid", test_rar4_solid);
+  test("rar4 far distances", test_rar4_distances);
 #ifdef RAR_ENC_CRYPTO
-  test("rar4 encryption");
-  test_rar4_crypto();
+  test("rar4 encryption", test_rar4_crypto);
 #endif
-  test("rar4 ppmd blocks (self-consistent encoder, model verified against 7z)");
-  test_rar4_ppmd();
-  test("rar4 filters through the VM record parser");
-  test_rar4_filters();
-  test("fuzz: mutated and truncated archives");
-  test_fuzz();
-  test("rar4 volumes");
-  test_rar4_volumes(true, 3);
-  test_rar4_volumes(false, 3);
-  test_rar4_volumes(true, 0);
+  test("rar4 ppmd blocks (self-consistent encoder, model verified against 7z)", test_rar4_ppmd);
+  test("rar4 filters through the VM record parser", test_rar4_filters);
+  test("fuzz: mutated and truncated archives", test_fuzz);
+  test("rar4 volumes", test_rar4_volume_sets);
   return 0;
 }
 

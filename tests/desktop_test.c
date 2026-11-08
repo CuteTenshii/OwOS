@@ -41,7 +41,6 @@ static struct desktop_entry *parse_ok(const char *s)
 
 static void check_basic(void)
 {
-  test("parse: fields");
   static const char full[] =
       "# comment\n\n[Desktop Entry]\r\nType=Application\r\nName = Foo App \nGenericName=Gen\nComment=C\nExec=foo %f\n"
       "TryExec=foo\nPath=/home\nIcon=foo-icon\nTerminal=true\nNoDisplay=true\nStartupWMClass=FooWM\n"
@@ -81,7 +80,6 @@ static void check_basic(void)
 
 static void check_escapes(void)
 {
-  test("parse: escapes and lists");
   struct desktop_entry *e = parse_ok(ENTRY("Name=a\\sb\\tc\\nd\\re\\\\f\nExec=x\nComment=semi\\;colon\n"
                                            "Keywords=one\\;two;three;;\\;\n"));
   if (!e)
@@ -100,7 +98,6 @@ static void check_escapes(void)
 
 static void check_localized(void)
 {
-  test("parse: localized keys ignored");
   struct desktop_entry *e =
       parse_ok(ENTRY("Name[fr]=Francais\nName=Plain\nName[de_DE@euro]=Deutsch\nComment[fr]=Seulement\nExec=x\n"));
   if (!e)
@@ -114,7 +111,6 @@ static void check_localized(void)
 
 static void check_groups(void)
 {
-  test("parse: groups and actions");
   struct desktop_entry *e = parse_ok(ENTRY("Name=N\nExec=x\nActions=new;ghost;nameless;\n"
                                            "[Desktop Action new]\nName=New Window\nExec=x --new %u\nIcon=i\n"
                                            "[Desktop Action unlisted]\nName=U\nExec=u\n"
@@ -147,7 +143,6 @@ static void check_groups(void)
 
 static void check_malformed(void)
 {
-  test("parse: malformed input");
   struct desktop_entry *e = PARSE("[Desktop Entry\nType=Application\nName=N\nExec=x\n");
   expect(e == NULL);
   e = parse_ok(ENTRY("garbage line\n=novalue\nbad key=1\nNam e=2\nName=N\nExec=x\n[broken\nName=Evil\n"));
@@ -182,7 +177,6 @@ static void check_malformed(void)
 
 static void check_validity(void)
 {
-  test("parse: rejection");
   expect(PARSE("[Desktop Entry]\nType=Application\nExec=x\n") == NULL);
   expect(PARSE("[Desktop Entry]\nType=Application\nName=N\n") == NULL);
   expect(PARSE("[Desktop Entry]\nName=N\nExec=x\n") == NULL);
@@ -226,10 +220,10 @@ static const char *run_exec(const char *exec, const char *const *files, int nfil
   return res;
 }
 
-static void check_exec(void)
+static const char *two[] = {"/a b", "/c"};
+
+static void exec_splitting(void)
 {
-  const char *two[] = {"/a b", "/c"};
-  test("exec: splitting");
   expect_string(run_exec("prog", NULL, 0), "[prog]");
   expect_string(run_exec("prog  a\tb   c", NULL, 0), "[prog] [a] [b] [c]");
   expect_string(run_exec("prog \"a b\" c", NULL, 0), "[prog] [a b] [c]");
@@ -242,8 +236,10 @@ static void check_exec(void)
   expect_string(run_exec("prog \"unterminated", NULL, 0), "ERR");
   expect_string(run_exec("", NULL, 0), "PARSE");
   expect_string(run_exec("%f", NULL, 0), "ERR");
+}
 
-  test("exec: field codes");
+static void exec_field_codes(void)
+{
   expect_string(run_exec("p %f", two, 2), "[p] [/a b]");
   expect_string(run_exec("p %u", two, 2), "[p] [/a b]");
   expect_string(run_exec("p %F", two, 2), "[p] [/a b] [/c]");
@@ -259,8 +255,10 @@ static void check_exec(void)
   expect_string(run_exec("p \"%c\"", NULL, 0), "[p] [My App]");
   expect_string(run_exec("p %k", NULL, 0), "[p] [/loc/id.desktop]");
   expect_string(run_exec("p %d %D %n %N %v %m x", NULL, 0), "[p] [x]");
+}
 
-  test("exec: invalid codes");
+static void exec_invalid_codes(void)
+{
   expect_string(run_exec("p %z", NULL, 0), "ERR");
   expect_string(run_exec("p %", NULL, 0), "ERR");
   expect_string(run_exec("p x%F", two, 2), "ERR");
@@ -268,8 +266,10 @@ static void check_exec(void)
   expect_string(run_exec("p %Fx", two, 2), "ERR");
   expect_string(run_exec("p x%i", NULL, 0), "ERR");
   expect_string(run_exec("p %1", NULL, 0), "ERR");
+}
 
-  test("exec: actions");
+static void exec_actions(void)
+{
   struct desktop_entry *e =
       parse_ok(ENTRY("Name=N\nExec=main\nActions=a;\n[Desktop Action a]\nName=A\nExec=act --x %u\n"));
   if (!e)
@@ -298,7 +298,6 @@ static bool visible(const char *body)
 
 static void check_visible(void)
 {
-  test("visible");
   expect(visible(ENTRY("Name=N\nExec=x\n")));
   expect(!visible(ENTRY("Name=N\nExec=x\nNoDisplay=true\n")));
   expect(visible(ENTRY("Name=N\nExec=x\nOnlyShowIn=GNOME;OwOS;\n")));
@@ -316,7 +315,6 @@ static void check_visible(void)
 
 static void check_sort(void)
 {
-  test("sort");
   const char *specs[] = {ENTRY("Name=zeta\nExec=x\nX-OwOS-Order=1\n"),
                          ENTRY("Name=beta\nExec=x\n"),
                          ENTRY("Name=Alpha\nExec=x\n"),
@@ -350,7 +348,6 @@ static void write_file(const char *dir, const char *name, const char *body)
 
 static void check_scan(void)
 {
-  test("scan and override");
   char a[256], b[256];
   const char *tmp = getenv("TMPDIR");
   snprintf(a, sizeof a, "%s/owos-desktop-XXXXXX", tmp ? tmp : "/tmp");
@@ -414,7 +411,6 @@ static void check_scan(void)
 
 static void check_shipped(void)
 {
-  test("shipped .desktop files");
   char root[512];
   snprintf(root, sizeof root, "%s", __FILE__);
   char *slash = strrchr(root, '/');
@@ -472,16 +468,19 @@ static void check_shipped(void)
 
 int main(void)
 {
-  check_basic();
-  check_escapes();
-  check_localized();
-  check_groups();
-  check_malformed();
-  check_validity();
-  check_exec();
-  check_visible();
-  check_sort();
-  check_scan();
-  check_shipped();
+  test("parse: fields", check_basic);
+  test("parse: escapes and lists", check_escapes);
+  test("parse: localized keys ignored", check_localized);
+  test("parse: groups and actions", check_groups);
+  test("parse: malformed input", check_malformed);
+  test("parse: rejection", check_validity);
+  test("exec: splitting", exec_splitting);
+  test("exec: field codes", exec_field_codes);
+  test("exec: invalid codes", exec_invalid_codes);
+  test("exec: actions", exec_actions);
+  test("visible", check_visible);
+  test("sort", check_sort);
+  test("scan and override", check_scan);
+  test("shipped .desktop files", check_shipped);
   return 0;
 }

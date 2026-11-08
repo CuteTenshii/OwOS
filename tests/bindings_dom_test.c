@@ -61,16 +61,10 @@ static void fetch_none(char *const *urls, int n, unsigned char **bodies, int *le
 static const char page[] = "<html><head><title>t</title></head><body><div id=a class='x "
                            "y'>hi<span>s</span></div><script>var ready=1</script></body></html>";
 
-int main(void)
-{
-  struct dom_node *root;
-  B = calloc(1, sizeof *B);
-  B->pg = calloc(1, 1 << 16);
-  root = dom_parse(page, (int)strlen(page));
-  js_run_document(root, "https://example.com/dir/p.html", fetch_none);
-  js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
+static struct dom_node *root;
 
-  test("document.cookie reads, writes and hides HttpOnly");
+static void test_document_cookie_reads_writes(void)
+{
   cookie_store("example.com", "sid=secret; HttpOnly");
   run_script("expect(document.cookie==='', 'httponly hidden from reads');\n"
              "document.cookie='a=1';\n"
@@ -88,16 +82,20 @@ int main(void)
     expect(strstr(header, "sid=secret") != 0);
     expect(strstr(header, "c=3") == 0);
   }
+}
 
-  test("document node properties");
+static void test_document_node_properties(void)
+{
   run_script("expect(document.nodeType===9, 'nodeType');\n"
              "expect(document.nodeName==='#document', 'nodeName');\n"
              "expect(document.defaultView===window, 'defaultView');\n"
              "expect(window.top===window && window.parent===window, 'top/parent');\n"
              "expect(typeof document.implementation.createHTMLDocument('x').body==='object', 'createHTMLDocument');\n"
              "expect(document.documentURI==='https://example.com/dir/p.html', 'documentURI');\n");
+}
 
-  test("fragments, cloning and tree editing");
+static void test_fragments_cloning_and_tree(void)
+{
   run_script(
       "var d=document, a=d.getElementById('a');\n"
       "var f=d.createDocumentFragment(); f.appendChild(d.createElement('i')); f.appendChild(d.createElement('b'));\n"
@@ -117,8 +115,10 @@ int main(void)
       "a.querySelector('em').remove(); expect(a.querySelector('em')===null, 'remove');\n"
       "expect(d.createComment('c').nodeType===8 && d.createComment('c').nodeValue==='c', 'comment');\n"
       "var t=d.createTextNode('abc'); t.textContent='xyz'; expect(t.nodeValue==='xyz', 'text node textContent');\n");
+}
 
-  test("cyclic insertion is rejected");
+static void test_cyclic_insertion_is_rejected(void)
+{
   run_script("var d=document, p=d.createElement('div'), q=d.createElement('div'), r=d.createElement('div');\n"
              "p.appendChild(q); q.appendChild(r);\n"
              "var threw=false; try{ r.appendChild(p) }catch(e){ threw=true }\n"
@@ -128,8 +128,10 @@ int main(void)
              "q.insertBefore(r, r);\n"
              "expect(q.firstChild===r && r.nextSibling===null, 'insertBefore(x, x) is a no-op');\n"
              "expect(p.outerHTML.length>0, 'tree still serializes');\n");
+}
 
-  test("dialog open state, returnValue and events");
+static void test_dialog_open_state_returnvalue(void)
+{
   run_script(
       "var d=document, dlg=d.createElement('dialog'), log=[];\n"
       "d.body.appendChild(dlg);\n"
@@ -146,8 +148,10 @@ int main(void)
       "var veto=true; dlg.addEventListener('cancel', function(e){ if(veto) e.preventDefault() });\n"
       "dlg.requestClose(); expect(dlg.open===true && log.join()==='close,cancel', 'cancel can be prevented');\n"
       "veto=false; dlg.requestClose(); expect(dlg.open===false, 'requestClose closes');\n");
+}
 
-  test("popover API: show, hide, toggle, events and light dismiss");
+static void test_popover_api_show_hide(void)
+{
   run_script(
       "var d=document, a=d.createElement('div'), b=d.createElement('div'), log=[];\n"
       "a.id='pa'; b.id='pb'; a.popover=''; b.setAttribute('popover','auto'); d.body.appendChild(a); "
@@ -173,8 +177,10 @@ int main(void)
       "dismiss');\n"
       "var plain=d.createElement('div'); plain.showPopover(); expect(!plain.matches(':popover-open'), 'no popover "
       "attribute: no-op');\n");
+}
 
-  test("custom elements: lifecycle and registry validation");
+static void test_custom_elements_lifecycle_and(void)
+{
   run_script("var log=[];\n"
              "class XFoo extends HTMLElement {\n"
              "  connectedCallback(){ log.push('c') } disconnectedCallback(){ log.push('d') }\n"
@@ -190,8 +196,10 @@ int main(void)
              "expect(err==='SyntaxError', 'name needs a hyphen: '+err);\n"
              "err=''; try{ customElements.define('x-foo', class extends HTMLElement{}) }catch(x){ err=x.name }\n"
              "expect(err==='NotSupportedError', 'redefinition throws: '+err);\n");
+}
 
-  test("timers: unused slots hold no stale pointers at teardown");
+static void test_timers_unused_slots_hold(void)
+{
   run_script("var n=0; setTimeout(function(){ n++ }, 10); setInterval(function(){ n++ }, 1000);\n");
   fake_now_ms += 20;
   expect(js_timers_pump() == 1);
@@ -200,5 +208,24 @@ int main(void)
   dom_free(root);
   free(B->pg);
   free(B);
+}
+
+int main(void)
+{
+  B = calloc(1, sizeof *B);
+  B->pg = calloc(1, 1 << 16);
+  root = dom_parse(page, (int)strlen(page));
+  js_run_document(root, "https://example.com/dir/p.html", fetch_none);
+  js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
+
+  test("document.cookie reads, writes and hides HttpOnly", test_document_cookie_reads_writes);
+  test("document node properties", test_document_node_properties);
+  test("fragments, cloning and tree editing", test_fragments_cloning_and_tree);
+  test("cyclic insertion is rejected", test_cyclic_insertion_is_rejected);
+  test("dialog open state, returnValue and events", test_dialog_open_state_returnvalue);
+  test("popover API: show, hide, toggle, events and light dismiss", test_popover_api_show_hide);
+  test("custom elements: lifecycle and registry validation", test_custom_elements_lifecycle_and);
+  test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
+
   return 0;
 }

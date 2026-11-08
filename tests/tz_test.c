@@ -38,7 +38,6 @@ static long long epoch(long long y, int mo, int d, int h, int mi, int s)
 static void check_calendar(void)
 {
   struct tz_tm t;
-  test("calendar");
   tz_utc_to_tm(0, &t);
   expect(t.year == 1970 && t.month == 1 && t.day == 1 && t.wday == 4 && t.yday == 0);
   tz_utc_to_tm(-1, &t);
@@ -80,7 +79,6 @@ static void check_calendar(void)
 static void check_parse(void)
 {
   struct tz z;
-  test("parse");
   expect(tz_parse(&z, "CET-1CEST,M3.5.0,M10.5.0/3") == 0);
   expect(z.has_dst && z.std_off == 3600 && z.dst_off == 7200 && strcmp(z.std, "CET") == 0 &&
          strcmp(z.dst, "CEST") == 0);
@@ -109,7 +107,6 @@ static void check_rules(void)
   struct tz ny = load("America/New_York"), syd = load("Australia/Sydney");
   int dst;
   const char *abbr;
-  test("transitions");
   expect(tz_offset_at(&ny, 1710053999, &dst, &abbr) == -18000 && !dst && strcmp(abbr, "EST") == 0);
   expect(tz_offset_at(&ny, 1710054000, &dst, &abbr) == -14400 && dst && strcmp(abbr, "EDT") == 0);
   expect(off_at(&ny, 1730613599) == -14400 && off_at(&ny, 1730613600) == -18000);
@@ -128,7 +125,6 @@ static void check_rules(void)
 static void check_calendar_rules(void)
 {
   struct tz z;
-  test("day-of-year and leap rules");
   expect(tz_parse(&z, "AAA0BBB,J60,J300") == 0);
   expect(off_at(&z, epoch(2000, 3, 1, 1, 59, 59)) == 0 && off_at(&z, epoch(2000, 3, 1, 2, 0, 0)) == 3600);
   expect(off_at(&z, epoch(2001, 3, 1, 1, 59, 59)) == 0 && off_at(&z, epoch(2001, 3, 1, 2, 0, 0)) == 3600);
@@ -146,11 +142,9 @@ static void check_calendar_rules(void)
   expect(off_at(&z, epoch(2025, 10, 26, 2, 0, 0)) == 3600 && off_at(&z, epoch(2025, 10, 25, 2, 0, 0)) == 0);
 }
 
-static void check_offsets(void)
+static void fixed_offsets(void)
 {
   struct tz z;
-  char buf[32];
-  test("fixed offsets");
   z = load("Asia/Tokyo");
   expect(off_at(&z, 1700000000) == 32400 && strcmp(abbr_at(&z, 0), "JST") == 0);
   z = load("Asia/Kolkata");
@@ -173,8 +167,11 @@ static void check_offsets(void)
   expect(off_at(&z, epoch(2024, 1, 1, 0, 0, 0)) == 0 && off_at(&z, epoch(2024, 7, 1, 0, 0, 0)) == 3600);
   z = load("UTC");
   expect(off_at(&z, 1700000000) == 0 && strcmp(abbr_at(&z, 0), "UTC") == 0);
+}
 
-  test("format");
+static void format(void)
+{
+  char buf[32];
   tz_format_offset(buf, sizeof(buf), 19800);
   expect_string(buf, "UTC+05:30");
   tz_format_offset(buf, sizeof(buf), -12600);
@@ -198,7 +195,6 @@ static void check_offsets(void)
 static void check_local(void)
 {
   struct tz ny = load("America/New_York"), syd = load("Australia/Sydney"), tok = load("Asia/Tokyo");
-  test("local to utc");
   expect(tz_local_to_utc(&ny, epoch(2024, 3, 10, 1, 59, 59)) == epoch(2024, 3, 10, 6, 59, 59));
   expect(tz_local_to_utc(&ny, epoch(2024, 3, 10, 2, 30, 0)) == epoch(2024, 3, 10, 7, 30, 0));
   expect(tz_local_to_utc(&ny, epoch(2024, 3, 10, 3, 0, 0)) == 1710054000);
@@ -223,7 +219,6 @@ static void check_local(void)
 static void check_table(void)
 {
   struct tz z;
-  test("table");
   expect(tz_count() >= 120);
   for (int i = 0; i < tz_count(); i++) {
     expect(tz_load(&z, i) == 0);
@@ -243,7 +238,6 @@ static void check_config(void)
 {
   struct tz z;
   char name[48];
-  test("config");
   unlink(TZ_CONFIG_PATH);
   expect(tz_load_config(&z, name, sizeof(name)) == -1);
   expect_string(name, "UTC");
@@ -368,7 +362,6 @@ static bool host_has_zone(const char *name)
 static void check_host(void)
 {
   int transitions = 0;
-  test("host zoneinfo");
   for (int i = 0; i < tz_count(); i++) {
     const char *name = tz_name_at(i);
     bool ok = true;
@@ -387,14 +380,15 @@ static void check_host(void)
 
 int main(void)
 {
-  check_calendar();
-  check_parse();
-  check_rules();
-  check_calendar_rules();
-  check_offsets();
-  check_local();
-  check_table();
-  check_config();
-  check_host();
+  test("calendar", check_calendar);
+  test("parse", check_parse);
+  test("transitions", check_rules);
+  test("day-of-year and leap rules", check_calendar_rules);
+  test("fixed offsets", fixed_offsets);
+  test("format", format);
+  test("local to utc", check_local);
+  test("table", check_table);
+  test("config", check_config);
+  test("host zoneinfo", check_host);
   return 0;
 }

@@ -1,7 +1,7 @@
 /* Host test for the production Notification API module. */
 #define OWOS_SUITE_TEST
-#include "jsint.h"
 #include "features/notification/notification.h"
+#include "jsint.h"
 #include "notify.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +113,19 @@ static void run(const char *source)
   js_arena_free(&arena);
 }
 
+static void check_lifecycle(void)
+{
+  run("expect(Notification.permission==='granted');\n"
+      "const n=new Notification('Hello',{body:'World'});\n"
+      "expect(n.title==='Hello' && n.body==='World');\n"
+      "let shows=0, closes=0; n.onshow=function(){shows++;}; n.onclose=function(){closes++;};\n"
+      "expect(shows===0);\n"
+      "__pump();\n"
+      "expect(shows===1);\n"
+      "n.close(); __pump(); expect(closes===1);\n");
+  expect(sent == 1 && !strcmp(last_title, "Hello"));
+}
+
 int main(void)
 {
   js_object *proto, *queue;
@@ -123,16 +136,7 @@ int main(void)
   js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
   js_def_native(g_ctx, g_ctx->global, "__pump", pump, 0);
   js_notification_setup(g_ctx, g_ctx->global, proto, queue);
-  test("production Notification lifecycle");
-  run("expect(Notification.permission==='granted');\n"
-      "const n=new Notification('Hello',{body:'World'});\n"
-      "expect(n.title==='Hello' && n.body==='World');\n"
-      "let shows=0, closes=0; n.onshow=function(){shows++;}; n.onclose=function(){closes++;};\n"
-      "expect(shows===0);\n"
-      "__pump();\n"
-      "expect(shows===1);\n"
-      "n.close(); __pump(); expect(closes===1);\n");
-  expect(sent == 1 && !strcmp(last_title, "Hello"));
+  test("production Notification lifecycle", check_lifecycle);
   js_notification_teardown();
   js_ctx_free(g_ctx);
   return 0;

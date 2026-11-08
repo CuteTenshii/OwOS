@@ -5,7 +5,9 @@
  * font-variant-caps small-caps, all through css_apply_inline.
  *
  *   cc -std=c11 -Iscripts -Iuser/apps/browser \
- *      tests/css_font_test.c user/apps/browser/css/engine.c user/apps/browser/css/engine_values.c user/apps/browser/css/engine_props.c user/apps/browser/css/engine_decl.c user/apps/browser/css/engine_sel.c user/apps/browser/css/engine_sheet.c user/apps/browser/css/sibling.c \
+ *      tests/css_font_test.c user/apps/browser/css/engine.c user/apps/browser/css/engine_values.c
+ * user/apps/browser/css/engine_props.c user/apps/browser/css/engine_decl.c user/apps/browser/css/engine_sel.c
+ * user/apps/browser/css/engine_sheet.c user/apps/browser/css/sibling.c \
  *      user/apps/browser/color.c user/apps/browser/dom.c \
  *      -lm -o /tmp/css_font_test && /tmp/css_font_test
  */
@@ -16,29 +18,45 @@
 
 /* Assert the fields the font-* work touches. Pass -1 for "don't care" on the
  * scalar sentinels; fam is compared only when non-NULL. */
+static const char *c_decls, *c_fam;
+static int c_px, c_pct, c_bold, c_italic, c_scaps;
+static short c_lhpct;
+
+static void chk_body(void)
+{
+  struct css_style s;
+  css_style_reset(&s);
+  css_apply_inline(c_decls, &s);
+  int ok = 1;
+  if (c_px != -2 && s.font_px != c_px)
+    ok = 0;
+  if (c_pct != -2 && s.font_pct != c_pct)
+    ok = 0;
+  if (c_bold != -2 && s.bold != c_bold)
+    ok = 0;
+  if (c_italic != -2 && s.italic != c_italic)
+    ok = 0;
+  if (c_scaps != -2 && s.small_caps != c_scaps)
+    ok = 0;
+  if (c_lhpct != -2 && s.lh_pct != c_lhpct)
+    ok = 0;
+  if (c_fam && strcmp(s.fam, c_fam) != 0)
+    ok = 0;
+  expect(ok);
+}
+
 static void chk(const char *decls, int want_px, int want_pct, int want_bold, int want_italic, int want_scaps,
                 short want_lhpct, const char *want_fam)
 {
-  struct css_style s;
-  test(decls);
-  css_style_reset(&s);
-  css_apply_inline(decls, &s);
-  int ok = 1;
-  if (want_px != -2 && s.font_px != want_px)
-    ok = 0;
-  if (want_pct != -2 && s.font_pct != want_pct)
-    ok = 0;
-  if (want_bold != -2 && s.bold != want_bold)
-    ok = 0;
-  if (want_italic != -2 && s.italic != want_italic)
-    ok = 0;
-  if (want_scaps != -2 && s.small_caps != want_scaps)
-    ok = 0;
-  if (want_lhpct != -2 && s.lh_pct != want_lhpct)
-    ok = 0;
-  if (want_fam && strcmp(s.fam, want_fam) != 0)
-    ok = 0;
-  expect(ok);
+  c_decls = decls;
+  c_px = want_px;
+  c_pct = want_pct;
+  c_bold = want_bold;
+  c_italic = want_italic;
+  c_scaps = want_scaps;
+  c_lhpct = want_lhpct;
+  c_fam = want_fam;
+  test(decls, chk_body);
 }
 
 int main(void)

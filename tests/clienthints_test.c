@@ -44,9 +44,8 @@ static void hints_for(const char *page, const char *policy, const char *url)
   ch_request_headers_for(page, policy, url, hdrs, sizeof hdrs);
 }
 
-int main(void)
+static void test_low_entropy_hints_without(void)
 {
-  test("low-entropy hints without opt-in");
   hints_for(0, 0, "https://fresh1.example/");
   expect(has("Sec-CH-UA: \"OwOS-Browser\";v=\"1\", \"Not.A/Brand\";v=\"99\""));
   expect(has("Sec-CH-UA-Mobile: ?0"));
@@ -54,8 +53,10 @@ int main(void)
   expect(!has_name("Sec-CH-UA-Arch"));
   expect(!has_name("Sec-CH-Viewport-Width"));
   expect(!has_name("DPR"));
+}
 
-  test("secure contexts only");
+static void test_secure_contexts_only(void)
+{
   hints_for(0, 0, "http://fresh1.example/");
   expect(hdrs[0] == '\0');
   hints_for(0, 0, "http://localhost:8080/");
@@ -64,8 +65,10 @@ int main(void)
   expect(has_name("Sec-CH-UA-Mobile"));
   expect(ch_secure_url("https://a.example/") && ch_secure_url("http://foo.localhost/"));
   expect(!ch_secure_url("http://a.example/") && !ch_secure_url(0));
+}
 
-  test("high-entropy hints after Accept-CH");
+static void test_high_entropy_hints_after(void)
+{
   ch_accept("opt.example", "Sec-CH-UA-Arch, sec-ch-ua-bitness;x=1, SEC-CH-UA-Model, bogus-token");
   hints_for(0, 0, "https://opt.example/x");
   expect(has("Sec-CH-UA-Arch: \"x86\""));
@@ -81,8 +84,10 @@ int main(void)
   ch_accept("allbogus.example", "nope, nada");
   hints_for(0, 0, "https://allbogus.example/");
   expect(!has_name("Sec-CH-UA-Arch"));
+}
 
-  test("full hint set and value formats");
+static void test_full_hint_set_and(void)
+{
   ch_accept("full.example",
             "Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List, Sec-CH-UA-WoW64, Sec-CH-UA-Form-Factors, "
             "Sec-CH-Prefers-Color-Scheme, Sec-CH-Prefers-Reduced-Motion, Sec-CH-Prefers-Reduced-Transparency, "
@@ -108,19 +113,25 @@ int main(void)
   g_vh = 480;
   hints_for(0, 0, "https://full.example/");
   expect(has("Sec-CH-Viewport-Width: 800") && has("Sec-CH-Viewport-Height: 480"));
+}
 
-  test("legacy ch_request_headers keeps host keying");
+static void test_legacy_ch_request_headers(void)
+{
   ch_request_headers("full.example", hdrs, sizeof hdrs);
   expect(has("Sec-CH-Viewport-Width: 800") && has_name("Sec-CH-UA"));
   ch_request_headers("never.example", hdrs, sizeof hdrs);
   expect(has_name("Sec-CH-UA-Mobile") && !has_name("Sec-CH-DPR"));
   expect(ch_request_headers("full.example", hdrs, 3) == 0);
+}
 
-  test("truncation never splits a line");
+static void test_truncation_never_splits_a(void)
+{
   int n = ch_request_headers("full.example", hdrs, 80);
   expect(n > 0 && n < 80 && !strcmp(hdrs + n - 2, "\r\n") && (int)strlen(hdrs) == n);
+}
 
-  test("Permissions-Policy delegation");
+static void test_permissions_policy_delegation(void)
+{
   ch_accept("page.example", "Sec-CH-UA-Arch, Sec-CH-DPR, Sec-CH-Device-Memory");
   hints_for(PAGE, 0, "https://page.example/img.png");
   expect(has_name("Sec-CH-UA-Arch") && has_name("Sec-CH-DPR"));
@@ -145,14 +156,18 @@ int main(void)
   expect(has_name("Sec-CH-DPR"));
   hints_for(PAGE, "ch-dpr=*", "http://cdn.example/");
   expect(hdrs[0] == '\0');
+}
 
-  test("Accept-CH is keyed on the page origin, not the sub-resource host");
+static void test_accept_ch_is_keyed(void)
+{
   hints_for("https://page.example", "ch-ua-arch=*", "https://nooptin.example/");
   expect(has_name("Sec-CH-UA-Arch"));
   hints_for("https://nooptin.example", "ch-ua-arch=*", "https://page.example/");
   expect(!has_name("Sec-CH-UA-Arch"));
+}
 
-  test("Critical-CH retry");
+static void test_critical_ch_retry(void)
+{
   char sent[1024], now[1024];
   ch_request_headers_for(0, 0, "https://crit.example/", sent, sizeof sent);
   ch_accept("crit.example", "Sec-CH-UA-Arch, Sec-CH-Viewport-Width, Sec-CH-Width");
@@ -166,8 +181,10 @@ int main(void)
   expect(!ch_critical_retry("Sec-CH-UA-Arch", now, now));
   expect(!ch_critical_retry(0, sent, now) && !ch_critical_retry("", sent, now));
   expect(ch_critical_retry("Sec-CH-UA-Arch", 0, now));
+}
 
-  test("headers and userAgentData share one source");
+static void test_headers_and_useragentdata_share(void)
+{
   ch_accept("src.example", "Sec-CH-UA-Platform-Version, Sec-CH-UA-Model");
   hints_for(0, 0, "https://src.example/");
   char want[256];
@@ -178,5 +195,20 @@ int main(void)
   snprintf(want, sizeof want, "Sec-CH-UA: \"%s\";v=\"%s\", \"%s\";v=\"%s\"", ch_ua.brands[0].brand,
            ch_ua.brands[0].version, ch_ua.brands[1].brand, ch_ua.brands[1].version);
   expect(has(want));
+}
+
+int main(void)
+{
+  test("low-entropy hints without opt-in", test_low_entropy_hints_without);
+  test("secure contexts only", test_secure_contexts_only);
+  test("high-entropy hints after Accept-CH", test_high_entropy_hints_after);
+  test("full hint set and value formats", test_full_hint_set_and);
+  test("legacy ch_request_headers keeps host keying", test_legacy_ch_request_headers);
+  test("truncation never splits a line", test_truncation_never_splits_a);
+  test("Permissions-Policy delegation", test_permissions_policy_delegation);
+  test("Accept-CH is keyed on the page origin, not the sub-resource host", test_accept_ch_is_keyed);
+  test("Critical-CH retry", test_critical_ch_retry);
+  test("headers and userAgentData share one source", test_headers_and_useragentdata_share);
+
   return 0;
 }

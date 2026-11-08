@@ -12,6 +12,7 @@
 #define OWOS_HEAP_H
 #define OWOS_KSTRING_H
 
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -19,7 +20,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <unistd.h>
 
 static char g_log[16384];
@@ -188,7 +188,10 @@ static bool is_zero(const uint8_t *p, size_t n)
   return true;
 }
 
-static int rd(void *m, const char *path, uint64_t off, void *buf, uint32_t len) { return ext_read64(m, path, off, buf, len); }
+static int rd(void *m, const char *path, uint64_t off, void *buf, uint32_t len)
+{
+  return ext_read64(m, path, off, buf, len);
+}
 
 static bool exists(void *m, const char *path)
 {
@@ -271,17 +274,30 @@ static bool check_sparse(void *m, const char *path, uint32_t bs, const uint64_t 
 
 /* ---------------------------------------------------------------- ext2 / ext3 indirect */
 
-static void run_indirect(uint32_t bs, int kind)
+static uint32_t indirect_bs;
+static int indirect_kind;
+
+static void indirect_case(void)
 {
-  test(tname("ext%d indirect blocks, %u-byte blocks", kind, bs));
+  uint32_t bs = indirect_bs;
+  int kind = indirect_kind;
   struct eb e;
   tcfg(&e, bs, kind, 4);
   if (kind == 3)
     e.compat |= EB_COMPAT_JOURNAL;
   eb_init(&e);
   uint64_t ppb = bs / 4;
-  uint64_t lb[] = {0, 1, 11, 12, 12 + ppb - 1, 12 + ppb, 12 + ppb + 3, 12 + 2 * ppb + 2,
-                   12 + ppb + ppb * ppb - 1, 12 + ppb + ppb * ppb, 12 + ppb + ppb * ppb + ppb + 7,
+  uint64_t lb[] = {0,
+                   1,
+                   11,
+                   12,
+                   12 + ppb - 1,
+                   12 + ppb,
+                   12 + ppb + 3,
+                   12 + 2 * ppb + 2,
+                   12 + ppb + ppb * ppb - 1,
+                   12 + ppb + ppb * ppb,
+                   12 + ppb + ppb * ppb + ppb + 7,
                    12 + ppb + ppb * ppb + ppb * ppb + 5};
   uint32_t n = sizeof lb / sizeof lb[0];
   uint32_t sp = sparse_file(&e, lb, n, 0, 0, 0, (lb[n - 1] + 1) * bs);
@@ -297,10 +313,10 @@ static void run_indirect(uint32_t bs, int kind)
   eb_dir(&e, d1, 2, inner, 1, 0);
   uint32_t l_fast = eb_symlink(&e, "small.txt", false);
   uint32_t l_slow = eb_symlink(&e, "dir/file", true);
-  struct eb_de ents[] = {DE("sparse", sp, EB_FT_REG),     DE("seq", i_seq, EB_FT_REG),
-                         DE("small.txt", i_small, EB_FT_REG), DE("empty", i_empty, EB_FT_REG),
-                         DE("dir", d1, EB_FT_DIR),        DE("lnk", l_fast, EB_FT_LNK),
-                         DE("lnk2", l_slow, EB_FT_LNK)};
+  struct eb_de ents[] = {
+      DE("sparse", sp, EB_FT_REG),     DE("seq", i_seq, EB_FT_REG), DE("small.txt", i_small, EB_FT_REG),
+      DE("empty", i_empty, EB_FT_REG), DE("dir", d1, EB_FT_DIR),    DE("lnk", l_fast, EB_FT_LNK),
+      DE("lnk2", l_slow, EB_FT_LNK)};
   mkroot(&e, ents, 7);
   size_t len;
   uint8_t *img = eb_finish(&e, &len);
@@ -333,6 +349,13 @@ static void run_indirect(uint32_t bs, int kind)
   free(e.img);
 }
 
+static void run_indirect(uint32_t bs, int kind)
+{
+  indirect_bs = bs;
+  indirect_kind = kind;
+  test(tname("ext%d indirect blocks, %u-byte blocks", kind, bs), indirect_case);
+}
+
 /* ---------------------------------------------------------------- journal replay */
 
 static void fillb(uint8_t *b, uint32_t bs, char c) { memset(b, c, bs); }
@@ -342,16 +365,14 @@ enum { JV_NONE, JV_NO_FLAG, JV_EXTERNAL, JV_BAD_SB };
 static void run_journal_img(uint32_t bs, uint32_t mode, bool b64, uint32_t torn, int variant, uint8_t **seed,
                             size_t *seedlen)
 {
-  static const char *mn[] = {"plain", "v1sb", "crc1", "v2", "v3"};
-  if (!seed)
-    test(tname("jbd2 %s%s bs=%u torn=%u variant=%d", mn[mode], b64 ? "+64bit" : "", bs, torn, variant));
   struct eb e;
   tcfg(&e, bs, 3, 2);
   eb_init(&e);
   uint8_t *b = malloc(bs), *nd = malloc(bs), *tb = malloc(bs), *t0 = malloc(bs);
   uint64_t pa, pb, pc, pd, pe, pm;
-  uint32_t ia = eb_mkino(&e, 0, EB_REG | 0644), ib = eb_mkino(&e, 0, EB_REG | 0644), ic = eb_mkino(&e, 0, EB_REG | 0644),
-           id = eb_mkino(&e, 0, EB_REG | 0644), ie = eb_mkino(&e, 0, EB_REG | 0644), im = eb_mkino(&e, 0, EB_REG | 0644);
+  uint32_t ia = eb_mkino(&e, 0, EB_REG | 0644), ib = eb_mkino(&e, 0, EB_REG | 0644),
+           ic = eb_mkino(&e, 0, EB_REG | 0644), id = eb_mkino(&e, 0, EB_REG | 0644),
+           ie = eb_mkino(&e, 0, EB_REG | 0644), im = eb_mkino(&e, 0, EB_REG | 0644);
   fillb(b, bs, 'a');
   pa = eb_data_at(&e, ia, 0, b, bs);
   fillb(b, bs, 'b');
@@ -371,7 +392,7 @@ static void run_journal_img(uint32_t bs, uint32_t mode, bool b64, uint32_t torn,
   eb_set_size(&e, ie, bs);
   eb_set_size(&e, im, bs);
   uint32_t iadd = eb_file(&e, 0, EB_REG | 0644, "added by journal", 16);
-  struct eb_de full[] = {DE("a.txt", ia, 1), DE("b.dat", ib, 1), DE("c.dat", ic, 1), DE("d.dat", id, 1),
+  struct eb_de full[] = {DE("a.txt", ia, 1), DE("b.dat", ib, 1), DE("c.dat", ic, 1),      DE("d.dat", id, 1),
                          DE("e.dat", ie, 1), DE("m.dat", im, 1), DE("added.txt", iadd, 1)};
   memcpy(nd, eb_blk(&e, mkroot(&e, full, 7)), bs);
   uint64_t root_blk = mkroot(&e, full, 6);
@@ -491,12 +512,21 @@ static void run_journal_img(uint32_t bs, uint32_t mode, bool b64, uint32_t torn,
   jb_begin(&j);
 }
 
-
 /* ---------------------------------------------------------------- ext4 extents */
 
-static void run_extents(uint32_t bs, uint32_t depth, uint32_t leaf_max, uint32_t idx_max, bool csum)
+static uint32_t extents_bs;
+static uint32_t extents_depth;
+static uint32_t extents_leaf_max;
+static uint32_t extents_idx_max;
+static bool extents_csum;
+
+static void extents_case(void)
 {
-  test(tname("ext4 extents depth %u bs=%u csum=%d", depth, bs, csum));
+  uint32_t bs = extents_bs;
+  uint32_t depth = extents_depth;
+  uint32_t leaf_max = extents_leaf_max;
+  uint32_t idx_max = extents_idx_max;
+  bool csum = extents_csum;
   struct eb e;
   tcfg(&e, bs, 4, 4);
   if (csum)
@@ -538,9 +568,18 @@ static void run_extents(uint32_t bs, uint32_t depth, uint32_t leaf_max, uint32_t
   free(e.img);
 }
 
+static void run_extents(uint32_t bs, uint32_t depth, uint32_t leaf_max, uint32_t idx_max, bool csum)
+{
+  extents_bs = bs;
+  extents_depth = depth;
+  extents_leaf_max = leaf_max;
+  extents_idx_max = idx_max;
+  extents_csum = csum;
+  test(tname("ext4 extents depth %u bs=%u csum=%d", depth, bs, csum), extents_case);
+}
+
 static void run_extent_limits(void)
 {
-  test("ext4 extent of 32768 blocks and uninitialized tail");
   struct eb e;
   tcfg(&e, 1024, 4, 136);
   eb_init(&e);
@@ -573,11 +612,25 @@ static void run_extent_limits(void)
 
 /* ---------------------------------------------------------------- layout: descriptors, meta_bg, uninit groups */
 
-static void run_layout(uint32_t bs, uint32_t dsize, bool bit64, uint32_t meta_bg, uint32_t first_meta, bool sparse2,
-                       uint32_t groups, uint32_t csum_kind)
+static uint32_t layout_bs;
+static uint32_t layout_dsize;
+static bool layout_bit64;
+static uint32_t layout_meta_bg;
+static uint32_t layout_first_meta;
+static bool layout_sparse2;
+static uint32_t layout_groups;
+static uint32_t layout_csum_kind;
+
+static void layout_case(void)
 {
-  test(tname("layout bs=%u desc=%u 64bit=%d meta_bg=%d first=%u sparse2=%d groups=%u csum=%u", bs, dsize, bit64, meta_bg,
-             first_meta, sparse2, groups, csum_kind));
+  uint32_t bs = layout_bs;
+  uint32_t dsize = layout_dsize;
+  bool bit64 = layout_bit64;
+  uint32_t meta_bg = layout_meta_bg;
+  uint32_t first_meta = layout_first_meta;
+  bool sparse2 = layout_sparse2;
+  uint32_t groups = layout_groups;
+  uint32_t csum_kind = layout_csum_kind;
   struct eb e;
   tcfg(&e, bs, 4, groups);
   e.dsize = dsize;
@@ -631,9 +684,27 @@ static void run_layout(uint32_t bs, uint32_t dsize, bool bit64, uint32_t meta_bg
   free(e.img);
 }
 
-static void run_uninit(uint32_t csum_kind)
+static void run_layout(uint32_t bs, uint32_t dsize, bool bit64, uint32_t meta_bg, uint32_t first_meta, bool sparse2,
+                       uint32_t groups, uint32_t csum_kind)
 {
-  test(tname("uninit_bg group flags csum=%u", csum_kind));
+  layout_bs = bs;
+  layout_dsize = dsize;
+  layout_bit64 = bit64;
+  layout_meta_bg = meta_bg;
+  layout_first_meta = first_meta;
+  layout_sparse2 = sparse2;
+  layout_groups = groups;
+  layout_csum_kind = csum_kind;
+  test(tname("layout bs=%u desc=%u 64bit=%d meta_bg=%d first=%u sparse2=%d groups=%u csum=%u", bs, dsize, bit64,
+             meta_bg, first_meta, sparse2, groups, csum_kind),
+       layout_case);
+}
+
+static uint32_t uninit_csum_kind;
+
+static void uninit_case(void)
+{
+  uint32_t csum_kind = uninit_csum_kind;
   struct eb e;
   tcfg(&e, 1024, 4, 4);
   if (csum_kind == 1)
@@ -668,11 +739,16 @@ static void run_uninit(uint32_t csum_kind)
   free(e.img);
 }
 
+static void run_uninit(uint32_t csum_kind)
+{
+  uninit_csum_kind = csum_kind;
+  test(tname("uninit_bg group flags csum=%u", csum_kind), uninit_case);
+}
+
 /* ---------------------------------------------------------------- inline data, htree, big and odd directories */
 
 static void run_inline(void)
 {
-  test("ext4 inline_data files and directories");
   struct eb e;
   tcfg(&e, 4096, 4, 2);
   e.incompat |= EB_INC_INLINE;
@@ -681,13 +757,13 @@ static void run_inline(void)
   for (int i = 0; i < 100; i++)
     d100[i] = (uint8_t)('a' + i % 26);
   memcpy(d68, d100, 68);
-  uint32_t f11 = eb_inline_file(&e, "tiny inline", 11), f60 = eb_inline_file(&e, d100, 60), f100 = eb_inline_file(&e, d100, 68),
-           f0 = eb_inline_file(&e, "", 0);
+  uint32_t f11 = eb_inline_file(&e, "tiny inline", 11), f60 = eb_inline_file(&e, d100, 60),
+           f100 = eb_inline_file(&e, d100, 68), f0 = eb_inline_file(&e, "", 0);
   uint32_t sub = eb_mkino(&e, 0, EB_DIR | 0755), id = eb_mkino(&e, 0, EB_DIR | 0755);
   struct eb_de se[] = {DE("leaf", f11, 1)};
   eb_inline_dir(&e, sub, id, se, 1);
-  struct eb_de ie[] = {DE("name0001", f11, 1), DE("name0002", f60, 1), DE("name0003", f100, 1), DE("name0004", f0, 1),
-                       DE("name0005", f11, 1), DE("sub", sub, 2)};
+  struct eb_de ie[] = {DE("name0001", f11, 1), DE("name0002", f60, 1), DE("name0003", f100, 1),
+                       DE("name0004", f0, 1),  DE("name0005", f11, 1), DE("sub", sub, 2)};
   eb_inline_dir(&e, id, 2, ie, 6);
   struct eb_de ents[] = {DE("f11", f11, 1), DE("f60", f60, 1), DE("f68", f100, 1), DE("f0", f0, 1), DE("idir", id, 2)};
   mkroot(&e, ents, 5);
@@ -718,9 +794,15 @@ static void run_inline(void)
   free(e.img);
 }
 
-static void run_htree(uint32_t bs, uint32_t levels, bool csum)
+static uint32_t htree_bs;
+static uint32_t htree_levels;
+static bool htree_csum;
+
+static void htree_case(void)
 {
-  test(tname("htree dir bs=%u levels=%u csum=%d", bs, levels, csum));
+  uint32_t bs = htree_bs;
+  uint32_t levels = htree_levels;
+  bool csum = htree_csum;
   struct eb e;
   tcfg(&e, bs, 4, 4);
   if (csum)
@@ -765,9 +847,16 @@ static void run_htree(uint32_t bs, uint32_t levels, bool csum)
   free(e.img);
 }
 
+static void run_htree(uint32_t bs, uint32_t levels, bool csum)
+{
+  htree_bs = bs;
+  htree_levels = levels;
+  htree_csum = csum;
+  test(tname("htree dir bs=%u levels=%u csum=%d", bs, levels, csum), htree_case);
+}
+
 static void run_bigdir(void)
 {
-  test("directory with 70000 entries streamed, cache bounded");
   struct eb e;
   tcfg(&e, 1024, 4, 8);
   eb_init(&e);
@@ -815,9 +904,11 @@ static void run_bigdir(void)
 
 static void dirent_set_rec(uint8_t *blk, uint32_t off, uint32_t rec) { w16(blk + off + 4, rec); }
 
-static void run_dirent_edges(uint32_t bs)
+static uint32_t dirent_bs;
+
+static void dirent_case(void)
 {
-  test(tname("directory entry edge cases bs=%u", bs));
+  uint32_t bs = dirent_bs;
   struct eb e;
   tcfg(&e, bs, 4, 4);
   eb_init(&e);
@@ -826,15 +917,9 @@ static void run_dirent_edges(uint32_t bs)
   uint8_t longname[255];
   memset(longname, 'L', sizeof longname);
   uint8_t slashy[] = {'a', '/', 'b'}, nully[] = {'a', 0, 'b'};
-  struct eb_de ents[] = {DE("alpha", f, 1),
-                         DE("deleted", 0, 1),
-                         DE("toobig", 9999999, 1),
-                         DE("reserved", 5, 1),
-                         {odd, sizeof odd, f, 1},
-                         {longname, 255, f, 1},
-                         {slashy, 3, f, 1},
-                         {nully, 3, f, 1},
-                         DE("omega", f, 1)};
+  struct eb_de ents[] = {DE("alpha", f, 1),    DE("deleted", 0, 1),     DE("toobig", 9999999, 1),
+                         DE("reserved", 5, 1), {odd, sizeof odd, f, 1}, {longname, 255, f, 1},
+                         {slashy, 3, f, 1},    {nully, 3, f, 1},        DE("omega", f, 1)};
   uint32_t d = eb_mkino(&e, 0, EB_DIR | 0755);
   eb_dir(&e, d, 2, ents, 9, 0);
   struct eb_de t3[] = {DE("one", f, 1), DE("two", f, 1), DE("three", f, 1)};
@@ -888,9 +973,17 @@ static void run_dirent_edges(uint32_t bs)
   free(e.img);
 }
 
-static void run_reclen64k(bool zero)
+static void run_dirent_edges(uint32_t bs)
 {
-  test(tname("64 KiB blocks, rec_len %s", zero ? "0" : "65535"));
+  dirent_bs = bs;
+  test(tname("directory entry edge cases bs=%u", bs), dirent_case);
+}
+
+static bool reclen_zero;
+
+static void reclen_case(void)
+{
+  bool zero = reclen_zero;
   struct eb e;
   tcfg(&e, 65536, 4, 3);
   e.reclen_zero = zero;
@@ -913,9 +1006,14 @@ static void run_reclen64k(bool zero)
   free(e.img);
 }
 
+static void run_reclen64k(bool zero)
+{
+  reclen_zero = zero;
+  test(tname("64 KiB blocks, rec_len %s", zero ? "0" : "65535"), reclen_case);
+}
+
 static void run_nofiletype(void)
 {
-  test("no filetype feature, case-folded directory");
   struct eb e;
   tcfg(&e, 1024, 4, 2);
   e.incompat &= ~EB_INC_FILETYPE;
@@ -923,7 +1021,9 @@ static void run_nofiletype(void)
   eb_init(&e);
   uint32_t f = eb_file(&e, 0, EB_REG | 0644, "cf", 2);
   uint32_t sub = eb_mkino(&e, 0, EB_DIR | 0755);
-  struct eb_de se[] = {DE("Hello.TXT", f, 1), DE("\xc3\x89" "cole", f, 1)};
+  struct eb_de se[] = {DE("Hello.TXT", f, 1), DE("\xc3\x89"
+                                                 "cole",
+                                                 f, 1)};
   eb_dir(&e, sub, 2, se, 2, 0);
   w32(eb_inode(&e, sub) + 32, r32(eb_inode(&e, sub) + 32) | EB_IF_CASEFOLD);
   uint32_t plain = eb_mkino(&e, 0, EB_DIR | 0755);
@@ -949,8 +1049,12 @@ static void run_nofiletype(void)
     expect(same(m, "/cf/Hello.TXT", "cf", 2));
     expect(same(m, "/cf/hello.txt", "cf", 2));
     expect(same(m, "/cf/HELLO.txt", "cf", 2));
-    expect(same(m, "/cf/\xc3\x89" "cole", "cf", 2));
-    expect(!exists(m, "/cf/\xc3\xa9" "cole"));
+    expect(same(m,
+                "/cf/\xc3\x89"
+                "cole",
+                "cf", 2));
+    expect(!exists(m, "/cf/\xc3\xa9"
+                      "cole"));
     expect(same(m, "/plain/Hello.TXT", "cf", 2));
     expect(!exists(m, "/plain/hello.txt"));
     ext_close(m);
@@ -963,7 +1067,6 @@ static void run_nofiletype(void)
 
 static void run_sizes(void)
 {
-  test("sizes above 4 GiB, i_size_high rules, fs_ops clamping");
   struct eb e;
   tcfg(&e, 4096, 4, 3);
   eb_init(&e);
@@ -1006,20 +1109,24 @@ static void run_sizes(void)
   }
   expect(g_live == 0);
   free(e.img);
+}
 
-  test("large_dir uses i_size_high for directories");
+static void run_large_dir(void)
+{
+  struct eb e;
   tcfg(&e, 4096, 4, 3);
   e.incompat |= EB_INC_LARGEDIR;
   eb_init(&e);
   uint32_t f = eb_file(&e, 0, EB_REG | 0644, "x", 1);
-  d = eb_mkino(&e, 0, EB_DIR | 0755);
+  uint32_t d = eb_mkino(&e, 0, EB_DIR | 0755);
   struct eb_de de2[] = {DE("in", f, 1)};
   eb_dir(&e, d, 2, de2, 1, 0);
   w32(eb_inode(&e, d) + 108, 7);
   struct eb_de ents2[] = {DE("dir", d, 2)};
   mkroot(&e, ents2, 1);
-  img = eb_finish(&e, &len);
-  m = mnt(img, len);
+  size_t len;
+  uint8_t *img = eb_finish(&e, &len);
+  void *m = mnt(img, len);
   expect(m != NULL);
   if (m) {
     struct ext_attr a;
@@ -1040,7 +1147,6 @@ static void set_extra_time(uint8_t *r, uint32_t lo_off, uint32_t extra_off, int3
 
 static void run_metadata(void)
 {
-  test("inode metadata: mode, uid/gid high, times, epoch bits, huge_file");
   struct eb e;
   tcfg(&e, 4096, 4, 2);
   e.ro_compat |= 0x2000 | 0x100;
@@ -1082,8 +1188,8 @@ static void run_metadata(void)
     expect(a.crtime == 1600000000 && a.crtime_ns == 999999999);
     expect(a.blocks512 == (((1ull << 32) + 5) * 8));
     uint32_t mode, uid, gid;
-    expect(ext_ops()->getattr(m, "/m", &mode, &uid, &gid) == 0 && mode == (01777u & (EB_REG | 04755)) && uid == 0x12345 &&
-           gid == 0xABCDEF);
+    expect(ext_ops()->getattr(m, "/m", &mode, &uid, &gid) == 0 && mode == (01777u & (EB_REG | 04755)) &&
+           uid == 0x12345 && gid == 0xABCDEF);
     expect(ext_getinfo(m, "/old", &a) == 0 && a.ctime == 1700000001 && a.ctime_ns == 0 && a.crtime == 0);
     expect(a.blocks512 == (1ull << 32) + 5);
     ext_close(m);
@@ -1094,13 +1200,12 @@ static void run_metadata(void)
 
 static void run_special(void)
 {
-  test("device nodes, FIFOs, sockets, encryption");
   struct eb e;
   tcfg(&e, 4096, 4, 2);
   e.incompat |= EB_INC_ENCRYPT;
   eb_init(&e);
-  uint32_t ch = eb_mkino(&e, 0, EB_CHR | 0600), bl = eb_mkino(&e, 0, EB_BLK | 0600), fi = eb_mkino(&e, 0, EB_FIFO | 0600),
-           so = eb_mkino(&e, 0, EB_SOCK | 0600);
+  uint32_t ch = eb_mkino(&e, 0, EB_CHR | 0600), bl = eb_mkino(&e, 0, EB_BLK | 0600),
+           fi = eb_mkino(&e, 0, EB_FIFO | 0600), so = eb_mkino(&e, 0, EB_SOCK | 0600);
   uint32_t ok = eb_file(&e, 0, EB_REG | 0644, "plain", 5);
   uint32_t enc = eb_file(&e, 0, EB_REG | 0644, "ciphertext", 10);
   w32(eb_inode(&e, enc) + 32, r32(eb_inode(&e, enc) + 32) | EB_IF_ENCRYPT);
@@ -1111,8 +1216,8 @@ static void run_special(void)
   uint32_t encdir = eb_mkino(&e, 0, EB_DIR | 0700);
   eb_dir(&e, encdir, 2, ed, 2, 0);
   w32(eb_inode(&e, encdir) + 32, r32(eb_inode(&e, encdir) + 32) | EB_IF_ENCRYPT);
-  struct eb_de ents[] = {DE("chr", ch, 3), DE("blk", bl, 4), DE("fifo", fi, 5), DE("sock", so, 6), DE("ok", ok, 1),
-                         DE("secret", encdir, 2), DE("encfile", enc, 1)};
+  struct eb_de ents[] = {DE("chr", ch, 3), DE("blk", bl, 4),        DE("fifo", fi, 5),    DE("sock", so, 6),
+                         DE("ok", ok, 1),  DE("secret", encdir, 2), DE("encfile", enc, 1)};
   mkroot(&e, ents, 7);
   size_t len;
   uint8_t *img = eb_finish(&e, &len);
@@ -1134,8 +1239,13 @@ static void run_special(void)
     expect(log_count("encrypted file") == 1);
     expect(ext_getinfo(m, "/encfile", &a) == 0 && a.size == 10 && (a.flags & EB_IF_ENCRYPT));
     expect(has_name(m, "/secret", "_____Q") == false);
-    expect(has_name(m, "/secret", "\x9a__\x1f" "Q"));
-    expect(rd(m, "/secret/\x9a__\x1f" "Q", 0, buf, 8) == -EXT_ERR_ENCRYPTED);
+    expect(has_name(m, "/secret",
+                    "\x9a__\x1f"
+                    "Q"));
+    expect(rd(m,
+              "/secret/\x9a__\x1f"
+              "Q",
+              0, buf, 8) == -EXT_ERR_ENCRYPTED);
     expect(ext_getinfo(m, "/secret/lnk", &a) == 0 || true);
     g_log[0] = '\0';
     ext_ops()->list(m, "/");
@@ -1149,9 +1259,13 @@ static void run_special(void)
 
 /* ---------------------------------------------------------------- symlinks */
 
-static void run_symlinks(uint32_t bs, int kind)
+static uint32_t symlink_bs;
+static int symlink_kind;
+
+static void symlink_case(void)
 {
-  test(tname("symlink resolution ext%d bs=%u", kind, bs));
+  uint32_t bs = symlink_bs;
+  int kind = symlink_kind;
   struct eb e;
   tcfg(&e, bs, kind, 3);
   eb_init(&e);
@@ -1233,6 +1347,13 @@ static void run_symlinks(uint32_t bs, int kind)
   free(e.img);
 }
 
+static void run_symlinks(uint32_t bs, int kind)
+{
+  symlink_bs = bs;
+  symlink_kind = kind;
+  test(tname("symlink resolution ext%d bs=%u", kind, bs), symlink_case);
+}
+
 /* ---------------------------------------------------------------- checksums */
 
 static uint32_t gd_off(struct eb *e, uint32_t g)
@@ -1278,9 +1399,15 @@ static bool csum_reads(void *m)
          !is_zero(b, 4096) && rd(m, "/d/deep", 0, b, 16) == 16;
 }
 
-static void run_csum(uint32_t ro, uint32_t inc, const char *what)
+static uint32_t csum_ro;
+static uint32_t csum_inc;
+static const char *csum_what;
+
+static void csum_case(void)
 {
-  test(tname("integrity: %s", what));
+  uint32_t ro = csum_ro;
+  uint32_t inc = csum_inc;
+  const char *what = csum_what;
   struct csum_img c;
   csum_build(&c, ro, inc);
   void *m = mnt(c.img, c.len);
@@ -1358,11 +1485,18 @@ static void run_csum(uint32_t ro, uint32_t inc, const char *what)
   free(e->img);
 }
 
+static void run_csum(uint32_t ro, uint32_t inc, const char *what)
+{
+  csum_ro = ro;
+  csum_inc = inc;
+  csum_what = what;
+  test(tname("integrity: %s", what), csum_case);
+}
+
 /* ---------------------------------------------------------------- cache, partitions, fs_ops */
 
 static void run_cache(void)
 {
-  test("block cache: repeated metadata access reads nothing, sequential reads stay correct");
   struct eb e;
   tcfg(&e, 4096, 4, 3);
   eb_init(&e);
@@ -1403,7 +1537,6 @@ static void run_cache(void)
 
 static void run_partitions(void)
 {
-  test("MBR and GPT partition probing");
   struct eb e;
   tcfg(&e, 1024, 4, 2);
   eb_init(&e);
@@ -1450,7 +1583,6 @@ static void run_partitions(void)
 
 static void run_fsops(void)
 {
-  test("fs_ops surface: list, stat, enum_dir, getattr, labels");
   struct eb e;
   tcfg(&e, 1024, 2, 2);
   eb_init(&e);
@@ -1499,14 +1631,28 @@ static void run_fsops(void)
   free(e.img);
 }
 
+static uint32_t journal_bs, journal_mode, journal_torn;
+static bool journal_b64;
+static int journal_variant;
+
+static void journal_case(void)
+{
+  run_journal_img(journal_bs, journal_mode, journal_b64, journal_torn, journal_variant, NULL, NULL);
+}
+
 static void run_journal(uint32_t bs, uint32_t mode, bool b64, uint32_t torn, int variant)
 {
-  run_journal_img(bs, mode, b64, torn, variant, NULL, NULL);
+  static const char *mn[] = {"plain", "v1sb", "crc1", "v2", "v3"};
+  journal_bs = bs;
+  journal_mode = mode;
+  journal_b64 = b64;
+  journal_torn = torn;
+  journal_variant = variant;
+  test(tname("jbd2 %s%s bs=%u torn=%u variant=%d", mn[mode], b64 ? "+64bit" : "", bs, torn, variant), journal_case);
 }
 
 static void run_journal_shapes(void)
 {
-  test("jbd2 multiple descriptors, wrapped log, sequence wraparound");
   for (int variant = 0; variant < 3; variant++) {
     uint32_t mode = variant == 0 ? JB_PLAIN : variant == 1 ? JB_V3 : JB_V2;
     bool b64 = variant != 0;
@@ -1573,7 +1719,6 @@ static void run_journal_shapes(void)
 
 static void run_state(void)
 {
-  test("unclean state, orphans, resize inode, lost+found");
   struct eb e;
   tcfg(&e, 1024, 2, 2);
   e.compat |= 0x10;
@@ -1684,7 +1829,7 @@ static uint8_t *seed_ext4(size_t *len, uint32_t bs, uint32_t dsize)
   eb_dir(e, cf, 2, ce, 1, 0);
   w32(eb_inode(e, cf) + 32, r32(eb_inode(e, cf) + 32) | EB_IF_CASEFOLD);
   struct eb_de ents[] = {DE("deep", deep, 1), DE("hello", f, 1), DE("inl", inl, 1), DE("l1", l1, 7), DE("l2", l2, 7),
-                         DE("chr", ch, 3),    DE("enc", enc, 1),  DE("ht", ht, 2),   DE("id", id, 2),  DE("cf", cf, 2)};
+                         DE("chr", ch, 3),    DE("enc", enc, 1), DE("ht", ht, 2),   DE("id", id, 2), DE("cf", cf, 2)};
   mkroot(e, ents, 10);
   return eb_finish(e, len);
 }
@@ -1778,7 +1923,6 @@ static void on_alarm(int sig)
 
 static void run_fuzz(void)
 {
-  test("fuzz: mutated and truncated images neither crash, hang nor leak");
   signal(SIGALRM, on_alarm);
   const char *env = getenv("EXT_FUZZ_ITERS");
   int iters = env ? atoi(env) : 4000;
@@ -1831,7 +1975,6 @@ static void run_fuzz(void)
 
 static void run_oom(void)
 {
-  test("allocation failure at every point is handled without leaks");
   size_t lens[3];
   uint8_t *seeds[3];
   seeds[0] = seed_ext4(&lens[0], 1024, 64);
@@ -1885,7 +2028,7 @@ int main(void)
   run_extents(1024, 3, 2, 2, false);
   run_extents(4096, 2, 3, 3, true);
   run_extents(1024, 3, 2, 2, true);
-  run_extent_limits();
+  test("ext4 extent of 32768 blocks and uninitialized tail", run_extent_limits);
   run_layout(1024, 32, false, 0, 0, false, 6, 0);
   run_layout(1024, 64, true, 0, 0, false, 20, 0);
   run_layout(1024, 64, true, 1, 0, false, 40, 0);
@@ -1900,31 +2043,32 @@ int main(void)
   run_uninit(0);
   run_uninit(1);
   run_uninit(2);
-  run_inline();
+  test("ext4 inline_data files and directories", run_inline);
   run_htree(1024, 1, false);
   run_htree(1024, 2, false);
   run_htree(4096, 1, true);
   run_htree(1024, 2, true);
-  run_bigdir();
+  test("directory with 70000 entries streamed, cache bounded", run_bigdir);
   run_dirent_edges(1024);
   run_dirent_edges(4096);
   run_reclen64k(false);
   run_reclen64k(true);
-  run_nofiletype();
-  run_sizes();
-  run_metadata();
-  run_special();
+  test("no filetype feature, case-folded directory", run_nofiletype);
+  test("sizes above 4 GiB, i_size_high rules, fs_ops clamping", run_sizes);
+  test("large_dir uses i_size_high for directories", run_large_dir);
+  test("inode metadata: mode, uid/gid high, times, epoch bits, huge_file", run_metadata);
+  test("device nodes, FIFOs, sockets, encryption", run_special);
   run_symlinks(4096, 4);
   run_symlinks(1024, 2);
   run_csum(EB_RO_MCSUM, 0, "metadata_csum");
   run_csum(EB_RO_MCSUM, EB_INC_CSUM_SEED, "metadata_csum with csum_seed");
   run_csum(EB_RO_GDT_CSUM, 0, "gdt_csum crc16");
-  run_journal_shapes();
-  run_state();
-  run_cache();
-  run_partitions();
-  run_fsops();
-  run_oom();
-  run_fuzz();
+  test("jbd2 multiple descriptors, wrapped log, sequence wraparound", run_journal_shapes);
+  test("unclean state, orphans, resize inode, lost+found", run_state);
+  test("block cache: repeated metadata access reads nothing, sequential reads stay correct", run_cache);
+  test("MBR and GPT partition probing", run_partitions);
+  test("fs_ops surface: list, stat, enum_dir, getattr, labels", run_fsops);
+  test("allocation failure at every point is handled without leaks", run_oom);
+  test("fuzz: mutated and truncated images neither crash, hang nor leak", run_fuzz);
   return 0;
 }

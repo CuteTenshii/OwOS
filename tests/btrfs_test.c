@@ -66,10 +66,10 @@ static void con_write(const char *s)
   snprintf(g_out + l, sizeof g_out - l, "%s", s);
 }
 
+#include "../kernel/btrfs.c"
 #include "../kernel/gzip.c"
 #include "../kernel/lzo.c"
 #include "../kernel/zstd.c"
-#include "../kernel/btrfs.c"
 
 /* ---------------------------------------------------------------- device */
 
@@ -128,8 +128,8 @@ static void fill_random(uint8_t *p, size_t n, uint32_t seed)
 
 static void fill_text(uint8_t *p, size_t n, uint32_t seed)
 {
-  static const char *words[] = {"btrfs ", "extent ", "chunk ", "leaf ", "node ", "subvolume ", "snapshot ", "the ",
-                                "of ", "and ", "inode ", "data\n", "0123456789 ", "zzzzzzzzzzzzzzzz "};
+  static const char *words[] = {"btrfs ", "extent ", "chunk ", "leaf ",  "node ",  "subvolume ",  "snapshot ",
+                                "the ",   "of ",     "and ",   "inode ", "data\n", "0123456789 ", "zzzzzzzzzzzzzzzz "};
   uint32_t s = seed * 2654435761u + 7;
   size_t o = 0;
   while (o < n) {
@@ -442,7 +442,10 @@ static void build_main(struct bb *b, const struct cfg *c)
       for (int kind = 0; kind < 3; kind++) {
         char name[64];
         const uint8_t *src = kind == 0 ? text : kind == 1 ? rnd8 : mix;
-        snprintf(name, sizeof name, "%s_v%d_%s.dat", cname[comp], variant, kind == 0 ? "text" : kind == 1 ? "rand" : "mix");
+        snprintf(name, sizeof name, "%s_v%d_%s.dat", cname[comp], variant,
+                 kind == 0   ? "text"
+                 : kind == 1 ? "rand"
+                             : "mix");
         add_comp(b, t, comp_dir, name, comp, variant, src, csz, "comp");
       }
       char name[64];
@@ -685,7 +688,8 @@ static void verify_all(void *m)
       verify_dir(m, e);
     } else if (e->kind == EX_DIRLINK) {
       char nm[300];
-      chk(ops()->stat(m, e->path, &is_dir, &size) == 0 && is_dir == 1 && ops()->enum_dir(m, e->path, 0, nm, NULL, NULL) == 1,
+      chk(ops()->stat(m, e->path, &is_dir, &size) == 0 && is_dir == 1 &&
+              ops()->enum_dir(m, e->path, 0, nm, NULL, NULL) == 1,
           "directory symlink", e->path);
     } else if (e->kind == EX_BROKEN) {
       chk(ops()->stat(m, e->path, &is_dir, &size) != 0, "broken stat fails", e->path);
@@ -702,12 +706,21 @@ static void verify_negative(void *m)
 {
   int is_dir;
   uint32_t size;
-  static const char *const bad[] = {"nope",           "hello.txt/x",   "hello.txt/..", "docs/nope/x", "docs/readme/.",
-                                    "dangling/x",     "loop1/x",       "sub/nope",     "snap/docs"};
+  static const char *const bad[] = {"nope",       "hello.txt/x", "hello.txt/..", "docs/nope/x", "docs/readme/.",
+                                    "dangling/x", "loop1/x",     "sub/nope",     "snap/docs"};
   for (size_t i = 0; i < sizeof bad / sizeof *bad; i++)
     chk(ops()->stat(m, bad[i], &is_dir, &size) != 0, "negative stat", bad[i]);
-  static const char *const good[] = {"/", "//", ".", "docs/..", "docs/./nested/../..", "sub/..", "sub/d/../..", "..",
-                                     "../..", "/docs/nested/../readme", "snap/../hello.txt"};
+  static const char *const good[] = {"/",
+                                     "//",
+                                     ".",
+                                     "docs/..",
+                                     "docs/./nested/../..",
+                                     "sub/..",
+                                     "sub/d/../..",
+                                     "..",
+                                     "../..",
+                                     "/docs/nested/../readme",
+                                     "snap/../hello.txt"};
   for (size_t i = 0; i < sizeof good / sizeof *good; i++)
     chk(ops()->stat(m, good[i], &is_dir, &size) == 0, "dot paths", good[i]);
   chk(ops()->stat(m, "docs/readme", &is_dir, &size) == 0 && ops()->stat(m, "//docs//readme//", &is_dir, &size) == 0,
@@ -737,18 +750,19 @@ static void verify_negative(void *m)
 
 /* ---------------------------------------------------------------- variants */
 
-static struct bb_prof prof(uint64_t profile, int ns, int sub, uint64_t stripe_len, uint64_t d0, uint64_t d1, uint64_t d2,
-                           uint64_t d3)
+static struct bb_prof prof(uint64_t profile, int ns, int sub, uint64_t stripe_len, uint64_t d0, uint64_t d1,
+                           uint64_t d2, uint64_t d3)
 {
   struct bb_prof p = {profile, ns, sub, stripe_len, {d0, d1, d2, d3}};
   return p;
 }
 
-static void run_variant(const char *tag, const struct cfg *c)
+static struct cfg vc;
+
+static void run_variant(void)
 {
   struct bb b;
-  test(tag);
-  build_main(&b, c);
+  build_main(&b, &vc);
   void *m = mount_bb(&b);
   expect(m != NULL);
   if (m) {
@@ -763,57 +777,61 @@ static void run_variant(const char *tag, const struct cfg *c)
 
 static void t_variants(void)
 {
-  struct cfg c = {.nodesize = 4096, .sectorsize = 4096};
-  run_variant("btrfs: 4K nodes, natural packing", &c);
+  vc = (struct cfg){.nodesize = 4096, .sectorsize = 4096};
+  test("btrfs: 4K nodes, natural packing", run_variant);
 
-  c = (struct cfg){.nodesize = 4096, .sectorsize = 4096, .leaf_max = 8, .ptr_max = 4};
-  run_variant("btrfs: 4K nodes, forced height 3+", &c);
+  vc = (struct cfg){.nodesize = 4096, .sectorsize = 4096, .leaf_max = 8, .ptr_max = 4};
+  test("btrfs: 4K nodes, forced height 3+", run_variant);
 
-  c = (struct cfg){.nodesize = 16384, .sectorsize = 4096, .leaf_max = 24, .ptr_max = 5};
-  run_variant("btrfs: 16K nodes, forced height", &c);
+  vc = (struct cfg){.nodesize = 16384, .sectorsize = 4096, .leaf_max = 24, .ptr_max = 5};
+  test("btrfs: 16K nodes, forced height", run_variant);
 
-  c = (struct cfg){.nodesize = 65536, .sectorsize = 4096};
-  run_variant("btrfs: 64K nodes", &c);
+  vc = (struct cfg){.nodesize = 65536, .sectorsize = 4096};
+  test("btrfs: 64K nodes", run_variant);
 
-  c = (struct cfg){.nodesize = 65536, .sectorsize = 65536, .leaf_max = 40, .ptr_max = 7};
-  run_variant("btrfs: 64K sectors, 64K nodes", &c);
+  vc = (struct cfg){.nodesize = 65536, .sectorsize = 65536, .leaf_max = 40, .ptr_max = 7};
+  test("btrfs: 64K sectors, 64K nodes", run_variant);
 
-  c = (struct cfg){.nodesize = 4096, .sectorsize = 512, .leaf_max = 12, .ptr_max = 5};
-  run_variant("btrfs: 512 byte sectors", &c);
+  vc = (struct cfg){.nodesize = 4096, .sectorsize = 512, .leaf_max = 12, .ptr_max = 5};
+  test("btrfs: 512 byte sectors", run_variant);
 
-  c = (struct cfg){.nodesize = 16384, .sectorsize = 4096, .leaf_max = 16, .ptr_max = 6, .incompat = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800};
-  run_variant("btrfs: every accepted incompat bit incl. METADATA_UUID", &c);
+  vc = (struct cfg){.nodesize = 16384,
+                    .sectorsize = 4096,
+                    .leaf_max = 16,
+                    .ptr_max = 6,
+                    .incompat = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800};
+  test("btrfs: every accepted incompat bit incl. METADATA_UUID", run_variant);
 
-  c = (struct cfg){.nodesize = 4096, .sectorsize = 4096, .leaf_max = 10, .ptr_max = 4};
-  c.meta = prof(BB_DUP, 2, 0, 0, 1, 1, 0, 0);
-  c.data = prof(0, 1, 0, 0, 1, 0, 0, 0);
-  c.has_meta = c.has_data = true;
-  run_variant("btrfs: DUP metadata", &c);
+  vc = (struct cfg){.nodesize = 4096, .sectorsize = 4096, .leaf_max = 10, .ptr_max = 4};
+  vc.meta = prof(BB_DUP, 2, 0, 0, 1, 1, 0, 0);
+  vc.data = prof(0, 1, 0, 0, 1, 0, 0, 0);
+  vc.has_meta = vc.has_data = true;
+  test("btrfs: DUP metadata", run_variant);
 
-  c.meta = prof(BB_RAID1, 2, 0, 0, 2, 1, 0, 0);
-  c.data = prof(BB_RAID1, 2, 0, 0, 1, 2, 0, 0);
-  run_variant("btrfs: RAID1 with the other mirror on a missing device", &c);
+  vc.meta = prof(BB_RAID1, 2, 0, 0, 2, 1, 0, 0);
+  vc.data = prof(BB_RAID1, 2, 0, 0, 1, 2, 0, 0);
+  test("btrfs: RAID1 with the other mirror on a missing device", run_variant);
 
-  c.meta = prof(BB_RAID1C3, 3, 0, 0, 2, 3, 1, 0);
-  c.data = prof(BB_RAID1C4, 4, 0, 0, 2, 3, 4, 1);
-  run_variant("btrfs: RAID1C3 and RAID1C4", &c);
+  vc.meta = prof(BB_RAID1C3, 3, 0, 0, 2, 3, 1, 0);
+  vc.data = prof(BB_RAID1C4, 4, 0, 0, 2, 3, 4, 1);
+  test("btrfs: RAID1C3 and RAID1C4", run_variant);
 
-  c.meta = prof(BB_RAID0, 2, 0, 65536, 1, 1, 0, 0);
-  c.data = prof(BB_RAID0, 3, 0, 65536, 1, 1, 1, 0);
-  c.leaf_max = 0;
-  c.ptr_max = 0;
-  c.nodesize = 16384;
-  run_variant("btrfs: RAID0 striping on one device", &c);
+  vc.meta = prof(BB_RAID0, 2, 0, 65536, 1, 1, 0, 0);
+  vc.data = prof(BB_RAID0, 3, 0, 65536, 1, 1, 1, 0);
+  vc.leaf_max = 0;
+  vc.ptr_max = 0;
+  vc.nodesize = 16384;
+  test("btrfs: RAID0 striping on one device", run_variant);
 
-  c.nodesize = 4096;
-  c.meta = prof(BB_RAID10, 4, 2, 65536, 2, 1, 1, 2);
-  c.data = prof(BB_RAID10, 4, 2, 65536, 1, 2, 2, 1);
-  run_variant("btrfs: RAID10 with one device per mirror pair", &c);
+  vc.nodesize = 4096;
+  vc.meta = prof(BB_RAID10, 4, 2, 65536, 2, 1, 1, 2);
+  vc.data = prof(BB_RAID10, 4, 2, 65536, 1, 2, 2, 1);
+  test("btrfs: RAID10 with one device per mirror pair", run_variant);
 
-  c.meta = prof(BB_RAID10, 4, 2, 4096, 1, 1, 1, 1);
-  c.data = prof(BB_RAID10, 6, 2, 8192, 1, 1, 1, 1);
-  c.data.devids[4] = c.data.devids[5] = 1;
-  run_variant("btrfs: RAID10 striping with small stripes", &c);
+  vc.meta = prof(BB_RAID10, 4, 2, 4096, 1, 1, 1, 1);
+  vc.data = prof(BB_RAID10, 6, 2, 8192, 1, 1, 1, 1);
+  vc.data.devids[4] = vc.data.devids[5] = 1;
+  test("btrfs: RAID10 striping with small stripes", run_variant);
 }
 
 /* ---------------------------------------------------------------- superblock, features, corruption */
@@ -843,10 +861,9 @@ static int dev_read_hi(uint32_t lba, void *buf)
   return dev_read(lba, buf);
 }
 
-static void t_superblock(void)
+static void superblock_selection(void)
 {
   struct bb b;
-  test("btrfs: superblock selection and mirrors");
   build_main(&b, &kPlain);
   uint8_t *sb = b.img + 0x10000;
   void *m = mount_bb(&b);
@@ -912,8 +929,12 @@ static void t_superblock(void)
   memset(b.img + 0x10000 + 64, 'x', 8);
   expect(mount_bb(&b) == NULL);
   bb_free(&b);
+}
 
-  test("btrfs: other checksum types are accepted unverified");
+static void other_checksum_types(void)
+{
+  struct bb b;
+  void *m;
   struct cfg c = kPlain;
   build_main(&b, &c);
   b.img[0x10000 + 196] = 1;
@@ -927,10 +948,9 @@ static void t_superblock(void)
   bb_free(&b);
 }
 
-static void t_features(void)
+static void incompat_features(void)
 {
   struct bb b;
-  test("btrfs: incompat features and geometry");
   build_main(&b, &kPlain);
   uint8_t *sb = b.img + 0x10000;
   static const uint64_t refuse[] = {0x1000, 0x2000, 0x4000, 0x10000, 1ull << 40, 0x1000 | 0x1};
@@ -961,7 +981,8 @@ static void t_features(void)
   static const struct {
     int off;
     uint32_t val;
-  } bad[] = {{148, 3000}, {148, 2048}, {148, 131072}, {152, 8192}, {144, 100}, {144, 0}, {144, 131072}, {144, 8192 * 2}};
+  } bad[] = {{148, 3000}, {148, 2048}, {148, 131072}, {152, 8192},
+             {144, 100},  {144, 0},    {144, 131072}, {144, 8192 * 2}};
   for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
     uint32_t keep = (uint32_t)bb_g64(sb + bad[i].off) & 0xFFFFFFFFu;
     bb_p32(sb + bad[i].off, bad[i].val);
@@ -978,16 +999,24 @@ static void t_features(void)
   if (m)
     unmount(m);
 
-  test("btrfs: RAID5/6 chunks are refused");
   bb_free(&b);
+}
+
+static void raid56_refused(void)
+{
+  struct bb b;
   struct cfg c = kPlain;
   c.has_data = true;
   c.data = prof(BB_RAID5, 3, 0, 65536, 1, 1, 1, 0);
   build_main(&b, &c);
   expect(mount_bb(&b) == NULL && strstr(g_log, "RAID5/6"));
   bb_free(&b);
+}
 
-  test("btrfs: overlapping and conflicting chunks are refused");
+static void overlapping_chunks(void)
+{
+  struct bb b;
+  void *m;
   build_main(&b, &kPlain);
   uint8_t *leaf = b.img + bb_phys_of(&b, b.chunk_tree_logical, 0);
   bb_p64(leaf + 101 + 25 * 3 + 9, b.ch[1].logical + 4096);
@@ -1010,10 +1039,9 @@ static uint8_t *node_phys(struct bb *b, uint64_t logical) { return b->img + bb_p
 
 static void reseal(struct bb *b, uint8_t *n) { bb_p32(n, ~bb_crc32c(0xFFFFFFFFu, n + 32, b->nodesize - 32)); }
 
-static void t_checksums(void)
+static void checksum_mismatch(void)
 {
   struct bb b;
-  test("btrfs: metadata checksum mismatch warns once and continues");
   build_main(&b, &kPlain);
   for (uint64_t at = b.ch[1].logical; at < b.meta_next; at += b.nodesize)
     node_phys(&b, at)[0] ^= 0x5A;
@@ -1025,8 +1053,12 @@ static void t_checksums(void)
     unmount(m);
   }
   bb_free(&b);
+}
 
-  test("btrfs: a bad DUP copy is replaced by the good one without a warning");
+static void dup_copy_replaced(void)
+{
+  struct bb b;
+  void *m;
   struct cfg c = kPlain;
   c.has_meta = true;
   c.has_data = true;
@@ -1043,8 +1075,16 @@ static void t_checksums(void)
     unmount(m);
   }
   bb_free(&b);
+}
 
-  test("btrfs: RAID1 falls back to the second mirror");
+static void raid1_fallback(void)
+{
+  struct bb b;
+  void *m;
+  struct cfg c = kPlain;
+  c.has_meta = true;
+  c.has_data = true;
+  c.data = prof(0, 1, 0, 0, 1, 0, 0, 0);
   c.meta = prof(BB_RAID1, 2, 0, 0, 1, 1, 0, 0);
   build_main(&b, &c);
   for (uint64_t at = b.ch[1].logical; at < b.meta_next; at += b.nodesize)
@@ -1057,8 +1097,11 @@ static void t_checksums(void)
     unmount(m);
   }
   bb_free(&b);
+}
 
-  test("btrfs: fsid and bytenr mismatches reject the node");
+static void fsid_bytenr_mismatch(void)
+{
+  struct bb b;
   build_main(&b, &kPlain);
   uint8_t *root = node_phys(&b, b.root_tree_logical);
   root[40] ^= 1;
@@ -1112,7 +1155,6 @@ static void guard(unsigned secs)
 static void t_cycles(void)
 {
   struct bb b;
-  test("btrfs: cyclic and repeated tree pointers cannot hang or loop");
   struct cfg c = {.nodesize = 4096, .sectorsize = 4096, .leaf_max = 8, .ptr_max = 4};
   build_main(&b, &c);
   uint8_t *root = node_phys(&b, b.fs_root[0]);
@@ -1203,11 +1245,10 @@ static void walk_all(void *m)
 static void t_truncated(void)
 {
   struct bb b;
-  test("btrfs: truncated devices never crash");
   build_main(&b, &kPlain);
   size_t used = bb_phys_of(&b, b.meta_next - 1, 0) + 4096;
-  size_t sizes[] = {0, 1, 511, 512, 0x10000, 0x10040, 0x10048, 0x10fff, 0x11000, 0x20000, 0x100000, 0x180000,
-                    used - 4096, used, b.size - 512, b.size};
+  size_t sizes[] = {0,       1,       511,      512,      0x10000,     0x10040, 0x10048,      0x10fff,
+                    0x11000, 0x20000, 0x100000, 0x180000, used - 4096, used,    b.size - 512, b.size};
   for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
     void *m = mount_dev(b.img, sizes[i]);
     if (m) {
@@ -1227,7 +1268,6 @@ static void t_truncated(void)
 
 static void t_nonbtrfs(void)
 {
-  test("btrfs: other media are not mistaken for btrfs");
   size_t n = 4u << 20;
   uint8_t *img = calloc(1, n);
   expect(mount_dev(img, n) == NULL);
@@ -1247,7 +1287,6 @@ static void t_nonbtrfs(void)
 static void t_partitions(void)
 {
   struct bb b;
-  test("btrfs: found inside MBR and GPT partitions");
   build_main(&b, &kPlain);
   size_t img_bytes = bb_phys_of(&b, b.data_next - 1, 0) + 4096;
   size_t total = (4u << 20) + img_bytes;
@@ -1288,7 +1327,6 @@ static void t_partitions(void)
 static void t_default_subvol(void)
 {
   struct bb b;
-  test("btrfs: the default subvolume is mounted");
   struct cfg c = kPlain;
   c.default_id = 257;
   build_main(&b, &c);
@@ -1336,10 +1374,9 @@ static void t_default_subvol(void)
 
 /* ---------------------------------------------------------------- devices that are missing, huge files */
 
-static void t_missing_devices(void)
+static void missing_device_reads(void)
 {
   struct bb b;
-  test("btrfs: reads that need a missing device fail, nothing is invented");
   struct cfg c = kPlain;
   c.has_meta = c.has_data = true;
   c.meta = prof(0, 1, 0, 0, 1, 0, 0, 0);
@@ -1367,8 +1404,13 @@ static void t_missing_devices(void)
     unmount(m);
   }
   bb_free(&b);
+}
 
-  test("btrfs: metadata with no stripe on our device does not mount");
+static void no_stripe_on_device(void)
+{
+  struct bb b;
+  struct cfg c = kPlain;
+  c.has_meta = c.has_data = true;
   c.meta = prof(0, 1, 0, 0, 2, 0, 0, 0);
   c.data = prof(0, 1, 0, 0, 1, 0, 0, 0);
   build_main(&b, &c);
@@ -1378,8 +1420,14 @@ static void t_missing_devices(void)
   build_main(&b, &c);
   expect(mount_bb(&b) == NULL);
   bb_free(&b);
+}
 
-  test("btrfs: RAID10 with both copies of a pair missing fails only those reads");
+static void raid10_pair_missing(void)
+{
+  struct bb b;
+  void *m;
+  struct cfg c = kPlain;
+  c.has_meta = c.has_data = true;
   c.meta = prof(0, 1, 0, 0, 1, 0, 0, 0);
   c.data = prof(BB_RAID10, 4, 2, 65536, 1, 2, 3, 3);
   build_main(&b, &c);
@@ -1410,7 +1458,6 @@ static void t_missing_devices(void)
 static void t_huge_files(void)
 {
   struct bb b;
-  test("btrfs: files up to 2^63 and the 64-bit read call");
   bb_init(&b, 4096, 4096, NULL, NULL, 12u << 20, 24u << 20);
   struct bb_tree *t = new_tree(5);
   bb_root_dir(t);
@@ -1458,10 +1505,9 @@ static void t_huge_files(void)
 
 /* ---------------------------------------------------------------- cache and performance */
 
-static void t_cache_and_perf(void)
+static void node_cache_budget(void)
 {
   struct bb b;
-  test("btrfs: node cache stays within its budget on a large directory");
   bb_init(&b, 4096, 4096, NULL, NULL, 12u << 20, 24u << 20);
   struct bb_tree *t = new_tree(5);
   bb_root_dir(t);
@@ -1510,8 +1556,12 @@ static void t_cache_and_perf(void)
     unmount(m);
   }
   bb_free(&b);
+}
 
-  test("btrfs: sequential file reads touch each sector about once");
+static void sequential_file_reads(void)
+{
+  struct bb b;
+  void *m;
   build_main(&b, &kPlain);
   m = mount_bb(&b);
   expect(m != NULL);
@@ -1542,67 +1592,67 @@ static void t_cache_and_perf(void)
 /* ---------------------------------------------------------------- allocation failures */
 
 struct oom_ctx {
-	const struct bb *b;
-	int mode;
-	long *points; /* shared: allocation points reached, per worker */
+  const struct bb *b;
+  int mode;
+  long *points; /* shared: allocation points reached, per worker */
 };
 
 static void oom_worker(int id, int workers, void *arg)
 {
-	struct oom_ctx *c = arg;
-	for (long k = id;; k += workers) {
-		g_allocs = 0;
-		g_fail_at = c->mode == 0 ? k : -1;
-		g_fail_from = c->mode == 1 ? k : -1;
-		void *m = mount_bb(c->b);
-		if (m) {
-			walk_all(m);
-			btrfs_ops()->close(m);
-		}
-		bool hit = g_allocs > k;
-		g_fail_at = g_fail_from = -1;
-		if (g_live != 0) {
-			printf("  leak after failing allocation %ld (mode %d): %ld live\n", k, c->mode, g_live);
-			expect(false);
-			return;
-		}
-		if (!hit) {
-			c->points[id] = k;
-			return;
-		}
-	}
+  struct oom_ctx *c = arg;
+  for (long k = id;; k += workers) {
+    g_allocs = 0;
+    g_fail_at = c->mode == 0 ? k : -1;
+    g_fail_from = c->mode == 1 ? k : -1;
+    void *m = mount_bb(c->b);
+    if (m) {
+      walk_all(m);
+      btrfs_ops()->close(m);
+    }
+    bool hit = g_allocs > k;
+    g_fail_at = g_fail_from = -1;
+    if (g_live != 0) {
+      printf("  leak after failing allocation %ld (mode %d): %ld live\n", k, c->mode, g_live);
+      expect(false);
+      return;
+    }
+    if (!hit) {
+      c->points[id] = k;
+      return;
+    }
+  }
 }
 
 static void t_oom(void)
 {
-	struct bb b;
-	test("btrfs: allocation failures leave nothing behind");
-	g_many = 24;
-	build_main(&b, &kPlain);
-	g_many = 700;
-	unsigned saved_budget = g_walk_budget;
-	g_walk_budget = 80;
-	int workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
-	long *points = mmap(0, sizeof *points * (size_t)workers, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-	for (int mode = 0; mode < 2; mode++) {
-		struct oom_ctx c = {&b, mode, points};
-		owos_parallel(workers, oom_worker, &c);
-		long reached = 0;
-		for (int i = 0; i < workers; i++)
-			if (points[i] > reached)
-				reached = points[i];
-		printf("  mode %d: %ld allocation points exercised\n", mode, reached);
-	}
-	munmap(points, sizeof *points * (size_t)workers);
-	g_walk_budget = saved_budget;
-	bb_free(&b);
+  struct bb b;
+  g_many = 24;
+  build_main(&b, &kPlain);
+  g_many = 700;
+  unsigned saved_budget = g_walk_budget;
+  g_walk_budget = 80;
+  int workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
+  long *points = mmap(0, sizeof *points * (size_t)workers, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+  for (int mode = 0; mode < 2; mode++) {
+    struct oom_ctx c = {&b, mode, points};
+    owos_parallel(workers, oom_worker, &c);
+    long reached = 0;
+    for (int i = 0; i < workers; i++)
+      if (points[i] > reached)
+        reached = points[i];
+    printf("  mode %d: %ld allocation points exercised\n", mode, reached);
+  }
+  munmap(points, sizeof *points * (size_t)workers);
+  g_walk_budget = saved_budget;
+  bb_free(&b);
 }
 
 /* ---------------------------------------------------------------- decoders */
 
-static void t_lzo(void)
+static uint8_t *src, *enc, *dec;
+
+static void lzo_hand_built(void)
 {
-  test("lzo: hand-built streams and malformed input");
   uint8_t out[64];
   uint32_t n;
   static const uint8_t lit4[] = {0x15, 'a', 'b', 'c', 'd', 0x11, 0, 0};
@@ -1625,10 +1675,16 @@ static void t_lzo(void)
   expect(lzo1x_unpack(noeos, sizeof noeos, out, sizeof out, &n) != 0);
   static const uint8_t runaway[] = {0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   expect(lzo1x_unpack(runaway, sizeof runaway, out, sizeof out, &n) != 0);
+}
 
-  test("lzo: round trips through the builder and the host library");
-  uint8_t *src = malloc(1 << 17), *enc = malloc((1 << 17) + (1 << 14) + 256), *dec = malloc(1 << 17);
-  static const size_t sizes[] = {1, 2, 3, 4, 17, 18, 19, 238, 239, 255, 256, 1000, 4096, 5000, 20000, 65536, 100000, 131072};
+static void lzo_round_trips(void)
+{
+  uint32_t n;
+  src = malloc(1 << 17);
+  enc = malloc((1 << 17) + (1 << 14) + 256);
+  dec = malloc(1 << 17);
+  static const size_t sizes[] = {1,   2,   3,    4,    17,   18,    19,    238,    239,
+                                 255, 256, 1000, 4096, 5000, 20000, 65536, 100000, 131072};
   for (int kind = 0; kind < 4; kind++) {
     for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
       size_t len = sizes[i];
@@ -1656,8 +1712,11 @@ static void t_lzo(void)
 #endif
     }
   }
+}
 
-  test("lzo: mutated and random streams are rejected or decoded within bounds");
+static void lzo_mutated_streams(void)
+{
+  uint32_t n;
   fill_text(src, 20000, 9);
   size_t el = bb_lzo_compress(src, 20000, enc);
   for (int it = 0; it < 20000; it++) {
@@ -1684,11 +1743,13 @@ static void t_lzo(void)
   free(dec);
 }
 
-static void t_zstd(void)
+static const size_t zstd_cap = 300000;
+
+static void zstd_hand_built(void)
 {
-  test("zstd: hand-built raw and RLE frames");
-  size_t cap = 300000;
-  uint8_t *src = malloc(cap), *enc = malloc(cap + 4096), *dec = malloc(cap);
+  src = malloc(zstd_cap);
+  enc = malloc(zstd_cap + 4096);
+  dec = malloc(zstd_cap);
   static const size_t sizes[] = {0, 1, 100, 4096, 5000, 70000, 131072, 131073, 262144, 300000};
   for (int kind = 0; kind < 3; kind++) {
     for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
@@ -1705,11 +1766,13 @@ static void t_zstd(void)
       if (len)
         expect(zstd_decompress(enc, (uint32_t)el, dec, (uint32_t)len - 1) < 0);
       for (size_t cut = 0; cut < el && cut < 40; cut++)
-        expect(zstd_decompress(enc, (uint32_t)cut, dec, (uint32_t)cap) < 0);
+        expect(zstd_decompress(enc, (uint32_t)cut, dec, (uint32_t)zstd_cap) < 0);
     }
   }
+}
 
-  test("zstd: frame header rules");
+static void zstd_frame_header(void)
+{
   fill_random(src, 100, 1);
   size_t el = bb_zstd_hand(src, 100, enc);
   uint8_t *two = malloc(el + 16);
@@ -1741,9 +1804,11 @@ static void t_zstd(void)
   expect(zstd_decompress(big, sizeof big, dec, 100) < 0);
   free(two);
   free(bad);
+}
 
 #ifdef BB_HAVE_ZSTD
-  test("zstd: host libzstd frames at several levels decode exactly");
+static void zstd_host_levels(void)
+{
   static const size_t hs[] = {1, 10, 100, 1000, 4096, 5000, 30000, 98304, 131072, 200000, 300000};
   for (int kind = 0; kind < 4; kind++) {
     for (size_t i = 0; i < sizeof hs / sizeof *hs; i++) {
@@ -1760,7 +1825,7 @@ static void t_zstd(void)
           src[k] = (rnd() % 10 < 8) ? 'e' : (uint8_t)rnd();
       static const int levels[] = {-3, 1, 3, 9, 19};
       for (size_t l = 0; l < sizeof levels / sizeof *levels; l++) {
-        size_t zl = ZSTD_compress(enc, cap + 4096, src, len, levels[l]);
+        size_t zl = ZSTD_compress(enc, zstd_cap + 4096, src, len, levels[l]);
         expect(!ZSTD_isError(zl));
         expect(zstd_decompress(enc, (uint32_t)zl, dec, (uint32_t)len) == (int)len && memcmp(dec, src, len) == 0);
         if (len > 1)
@@ -1768,12 +1833,14 @@ static void t_zstd(void)
       }
     }
   }
+}
 
-  test("zstd: truncated and mutated host frames never overrun");
+static void zstd_host_mutated(void)
+{
   fill_text(src, 60000, 77);
   for (size_t i = 0; i < 60000; i += 5)
     src[i] = (uint8_t)rnd();
-  size_t zl = ZSTD_compress(enc, cap + 4096, src, 60000, 3);
+  size_t zl = ZSTD_compress(enc, zstd_cap + 4096, src, 60000, 3);
   for (size_t cut = 0; cut < zl; cut += 1 + zl / 400)
     expect(zstd_decompress(enc, (uint32_t)cut, dec, 60000) < 0);
   for (int it = 0; it < 30000; it++) {
@@ -1786,8 +1853,11 @@ static void t_zstd(void)
     expect(r < 0 || (uint32_t)r <= dcap);
     free(cp);
   }
+}
 #endif
-  test("zstd: random bytes behind a valid header");
+
+static void zstd_random_behind_header(void)
+{
   for (int it = 0; it < 20000; it++) {
     uint8_t rbuf[300];
     memcpy(rbuf, "\x28\xB5\x2F\xFD\xA0\x00\x04\x00\x00", 9);
@@ -1843,8 +1913,9 @@ static void fuzz_worker(int id, int workers, void *arg)
       log[nlog++].old = b->img[pos];
       static const uint8_t special[] = {0x00, 0xFF, 0x7F, 0x80, 0x01};
       uint32_t how = rnd() % 4;
-      b->img[pos] =
-          how == 0 ? special[rnd() % 5] : how == 1 ? (uint8_t)(b->img[pos] ^ (1u << (rnd() % 8))) : (uint8_t)rnd();
+      b->img[pos] = how == 0   ? special[rnd() % 5]
+                    : how == 1 ? (uint8_t)(b->img[pos] ^ (1u << (rnd() % 8)))
+                               : (uint8_t)rnd();
     }
     uint8_t keep[4];
     bool resealed = rnd() % 2 == 0;
@@ -1875,7 +1946,6 @@ static void fuzz_worker(int id, int workers, void *arg)
 static void t_fuzz(void)
 {
   struct bb b;
-  test("btrfs: seeded corruption fuzz of mount, listing and reads");
   struct cfg c = {.nodesize = 4096, .sectorsize = 4096, .leaf_max = 12, .ptr_max = 5};
   g_many = 40;
   build_main(&b, &c);
@@ -1914,21 +1984,38 @@ int main(void)
   return 0;
 #endif
   t_variants();
-  t_superblock();
-  t_features();
-  t_checksums();
-  t_cycles();
-  t_truncated();
-  t_nonbtrfs();
-  t_partitions();
-  t_default_subvol();
-  t_missing_devices();
-  t_huge_files();
-  t_cache_and_perf();
-  t_oom();
-  t_lzo();
-  t_zstd();
-  t_fuzz();
+  test("btrfs: superblock selection and mirrors", superblock_selection);
+  test("btrfs: other checksum types are accepted unverified", other_checksum_types);
+  test("btrfs: incompat features and geometry", incompat_features);
+  test("btrfs: RAID5/6 chunks are refused", raid56_refused);
+  test("btrfs: overlapping and conflicting chunks are refused", overlapping_chunks);
+  test("btrfs: metadata checksum mismatch warns once and continues", checksum_mismatch);
+  test("btrfs: a bad DUP copy is replaced by the good one without a warning", dup_copy_replaced);
+  test("btrfs: RAID1 falls back to the second mirror", raid1_fallback);
+  test("btrfs: fsid and bytenr mismatches reject the node", fsid_bytenr_mismatch);
+  test("btrfs: cyclic and repeated tree pointers cannot hang or loop", t_cycles);
+  test("btrfs: truncated devices never crash", t_truncated);
+  test("btrfs: other media are not mistaken for btrfs", t_nonbtrfs);
+  test("btrfs: found inside MBR and GPT partitions", t_partitions);
+  test("btrfs: the default subvolume is mounted", t_default_subvol);
+  test("btrfs: reads that need a missing device fail, nothing is invented", missing_device_reads);
+  test("btrfs: metadata with no stripe on our device does not mount", no_stripe_on_device);
+  test("btrfs: RAID10 with both copies of a pair missing fails only those reads", raid10_pair_missing);
+  test("btrfs: files up to 2^63 and the 64-bit read call", t_huge_files);
+  test("btrfs: node cache stays within its budget on a large directory", node_cache_budget);
+  test("btrfs: sequential file reads touch each sector about once", sequential_file_reads);
+  test("btrfs: allocation failures leave nothing behind", t_oom);
+  test("lzo: hand-built streams and malformed input", lzo_hand_built);
+  test("lzo: round trips through the builder and the host library", lzo_round_trips);
+  test("lzo: mutated and random streams are rejected or decoded within bounds", lzo_mutated_streams);
+  test("zstd: hand-built raw and RLE frames", zstd_hand_built);
+  test("zstd: frame header rules", zstd_frame_header);
+#ifdef BB_HAVE_ZSTD
+  test("zstd: host libzstd frames at several levels decode exactly", zstd_host_levels);
+  test("zstd: truncated and mutated host frames never overrun", zstd_host_mutated);
+#endif
+  test("zstd: random bytes behind a valid header", zstd_random_behind_header);
+  test("btrfs: seeded corruption fuzz of mount, listing and reads", t_fuzz);
   clear_ex();
   free(g_ex);
   return 0;

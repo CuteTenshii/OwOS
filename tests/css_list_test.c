@@ -23,13 +23,23 @@ static const char *pos_name(int v)
   return (v >= 0 && v <= CSS_LSP_INSIDE) ? n[v] : "?";
 }
 
-static void chk_inline(const char *decls, int want_type, int want_pos)
+static const char *c_decls;
+static int c_type, c_pos;
+
+static void chk_inline_body(void)
 {
   struct css_style s;
-  test(decls);
   css_style_reset(&s);
-  css_apply_inline(decls, &s);
-  expect(s.list_style == want_type && s.list_pos == want_pos);
+  css_apply_inline(c_decls, &s);
+  expect(s.list_style == c_type && s.list_pos == c_pos);
+}
+
+static void chk_inline(const char *decls, int want_type, int want_pos)
+{
+  c_decls = decls;
+  c_type = want_type;
+  c_pos = want_pos;
+  test(decls, chk_inline_body);
 }
 
 int main(void)

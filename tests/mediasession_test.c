@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static js_object *navigator;
 static int opens, updates, closes;
 static struct media_info published;
 static int queue[16][2], queued, dequeued;
@@ -138,18 +139,8 @@ static void tick_n(int n)
     mediasession_tick("Doc Title", "https://example.com/page/index.html");
 }
 
-int main(void)
+static void test_mediametadata_attributes_and_artwork(void)
 {
-  js_object *navigator;
-  g_ctx = js_ctx_new(con_print);
-  navigator = js_new_object(g_ctx, g_ctx->object_proto);
-  js_def(g_ctx->global, "navigator", js_obj_value(navigator), P_WRITABLE);
-  js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
-  js_def_native(g_ctx, g_ctx->global, "__tick", native_tick, 0);
-  js_def_native(g_ctx, g_ctx->global, "__queue", native_queue, 2);
-  mediasession_install(g_ctx, navigator, "https://example.com/page/index.html");
-
-  test("MediaMetadata attributes and artwork normalization");
   run("const m=new MediaMetadata({title:'T',artist:'A',album:'B',"
       "artwork:[{src:'cover.png',sizes:'96x96',type:'image/png'},{src:'/x.jpg'}]});\n"
       "expect(m.title==='T' && m.artist==='A' && m.album==='B');\n"
@@ -165,8 +156,10 @@ int main(void)
       "expect(t1==='TypeError');\n"
       "let t2=''; try{ m.artwork=[5]; }catch(x){ t2=x.name; }\n"
       "expect(t2==='TypeError' && m.artwork.length===1);\n");
+}
 
-  test("mediaSession validation");
+static void test_mediasession_validation(void)
+{
   run("const s=navigator.mediaSession;\n"
       "expect(s.metadata===null && s.playbackState==='none');\n"
       "let n=''; try{ s.metadata={title:'x'}; }catch(x){ n=x.name; }\n"
@@ -188,12 +181,16 @@ int main(void)
       "expect(bad({duration:10,position:5,playbackRate:2})==='');\n"
       "expect(bad()==='' && bad({})==='');\n"
       "expect(s.setCameraActive(true) instanceof Promise && s.setMicrophoneActive(false) instanceof Promise);\n");
+}
 
-  test("no session without metadata, state or media");
+static void test_no_session_without_metadata(void)
+{
   tick_n(5);
   expect(opens == 0 && updates == 0);
+}
 
-  test("metadata publishes once, handlers set caps, commands reach handlers");
+static void test_metadata_publishes_once_handlers(void)
+{
   run("const s=navigator.mediaSession;\n"
       "globalThis.calls=[];\n"
       "s.metadata=new MediaMetadata({title:'Song',artist:'Band',album:'LP',artwork:[{src:'file:///art/c.png'}]});\n"
@@ -235,8 +232,10 @@ int main(void)
       "expect(calls[2].action==='nexttrack');\n"
       "expect(calls[3].action==='pause');\n");
   expect(plays == 0 && pauses == 0);
+}
 
-  test("commands fall back to the media element when no handler");
+static void test_commands_fall_back_to(void)
+{
   run("navigator.mediaSession.setActionHandler('play',null);navigator.mediaSession.setActionHandler('pause',null);");
   el_present = el_playing = 1;
   queue[queued][0] = MEDIA_CMD_PAUSE;
@@ -257,15 +256,19 @@ int main(void)
   tick_n(40);
   expect(plays == 1);
   el_present = el_playing = 0;
+}
 
-  test("teardown closes the session");
+static void test_teardown_closes_the_session(void)
+{
   closes = 0;
   mediasession_teardown();
   expect(closes == 1);
   mediasession_teardown();
   expect(closes == 1);
+}
 
-  test("default session from a playing element, cleared when it ends");
+static void test_default_session_from_a(void)
+{
   opens = updates = closes = 0;
   mediasession_install(g_ctx, navigator, "https://example.com/page/index.html");
   el_present = el_playing = 1;
@@ -282,8 +285,10 @@ int main(void)
   tick_n(2);
   expect(closes == 1);
   el_present = el_ended = 0;
+}
 
-  test("service down is retried without spamming");
+static void test_service_down_is_retried(void)
+{
   mediasession_teardown();
   mediasession_install(g_ctx, navigator, "https://example.com/");
   service_up = false;
@@ -294,6 +299,26 @@ int main(void)
   service_up = true;
   tick_n(1000);
   expect(opens == 1);
+}
+
+int main(void)
+{
+  g_ctx = js_ctx_new(con_print);
+  navigator = js_new_object(g_ctx, g_ctx->object_proto);
+  js_def(g_ctx->global, "navigator", js_obj_value(navigator), P_WRITABLE);
+  js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
+  js_def_native(g_ctx, g_ctx->global, "__tick", native_tick, 0);
+  js_def_native(g_ctx, g_ctx->global, "__queue", native_queue, 2);
+  mediasession_install(g_ctx, navigator, "https://example.com/page/index.html");
+
+  test("MediaMetadata attributes and artwork normalization", test_mediametadata_attributes_and_artwork);
+  test("mediaSession validation", test_mediasession_validation);
+  test("no session without metadata, state or media", test_no_session_without_metadata);
+  test("metadata publishes once, handlers set caps, commands reach handlers", test_metadata_publishes_once_handlers);
+  test("commands fall back to the media element when no handler", test_commands_fall_back_to);
+  test("teardown closes the session", test_teardown_closes_the_session);
+  test("default session from a playing element, cleared when it ends", test_default_session_from_a);
+  test("service down is retried without spamming", test_service_down_is_retried);
 
   mediasession_teardown();
   js_ctx_free(g_ctx);

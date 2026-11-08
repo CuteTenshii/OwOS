@@ -18,6 +18,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+static struct http_headers H;
+static struct http_cc cc;
+static long now = 1000000; /* arbitrary "now" in epoch seconds */
+
 /* Parse a header block and return its cc facts. */
 static void parse_cc(const char *block, struct http_cc *cc, struct http_headers *H)
 {
@@ -25,10 +29,9 @@ static void parse_cc(const char *block, struct http_cc *cc, struct http_headers 
   http_cc_parse(H, cc);
 }
 
-int main(void)
+/* --- http_date_parse: the three grammars all map to the same instant. */
+static void test_http_date_parsing(void)
 {
-  /* --- http_date_parse: the three grammars all map to the same instant. */
-  test("HTTP date parsing");
   long imf = http_date_parse("Sun, 06 Nov 1994 08:49:37 GMT");
   long rfc850 = http_date_parse("Sunday, 06-Nov-94 08:49:37 GMT");
   long asctime = http_date_parse("Sun Nov  6 08:49:37 1994");
@@ -40,13 +43,11 @@ int main(void)
   expect((http_date_parse(NULL)) == (0L));
   /* epoch of a round 2021 date, cross-checkable with `date -u -d`. */
   expect(http_date_parse("Fri, 01 Jan 2021 00:00:00 GMT") == 1609459200L);
+}
 
-  struct http_headers H;
-  struct http_cc cc;
-  long now = 1000000; /* arbitrary "now" in epoch seconds */
-
-  /* --- max-age wins; no-store / no-cache / must-revalidate flagged. */
-  test("Cache-Control directives");
+/* --- max-age wins; no-store / no-cache / must-revalidate flagged. */
+static void test_cache_control_directives(void)
+{
   parse_cc("HTTP/1.1 200 OK\r\nCache-Control: max-age=600, must-revalidate\r\n\r\n", &cc, &H);
   expect(cc.has_max_age);
   expect((cc.max_age) == (600L));
@@ -75,9 +76,11 @@ int main(void)
   parse_cc("HTTP/1.1 404 Not Found\r\nCache-Control: max-age=60\r\n\r\n", &cc, &H);
   expect(!http_cc_storable(&cc, 404));
   http_headers_free(&H);
+}
 
-  /* --- Expires - Date freshness (max-age absent). */
-  test("Expires freshness");
+/* --- Expires - Date freshness (max-age absent). */
+static void test_expires_freshness(void)
+{
   parse_cc("HTTP/1.1 200 OK\r\n"
            "Date: Fri, 01 Jan 2021 00:00:00 GMT\r\n"
            "Expires: Fri, 01 Jan 2021 01:00:00 GMT\r\n\r\n",
@@ -99,9 +102,11 @@ int main(void)
   expect(cc.has_expires);
   expect(http_cc_freshness(&cc, now) == 0L);
   http_headers_free(&H);
+}
 
-  /* --- Last-Modified heuristic: 10% of the resource's age, capped at a day. */
-  test("Last-Modified heuristic");
+/* --- Last-Modified heuristic: 10% of the resource's age, capped at a day. */
+static void test_last_modified_heuristic(void)
+{
   parse_cc("HTTP/1.1 200 OK\r\n"
            "Date: Fri, 01 Jan 2021 00:00:00 GMT\r\n"
            "Last-Modified: Thu, 01 Jan 2021 00:00:00 GMT\r\n\r\n",
@@ -123,9 +128,11 @@ int main(void)
            &cc, &H);
   expect(http_cc_freshness(&cc, now) == 86400L); /* capped at one day */
   http_headers_free(&H);
+}
 
-  /* --- current age (RFC 7234 §4.2.3): Age header + residence time. */
-  test("current age calculation");
+/* --- current age (RFC 7234 §4.2.3): Age header + residence time. */
+static void test_current_age_calculation(void)
+{
   parse_cc("HTTP/1.1 200 OK\r\nAge: 100\r\n\r\n", &cc, &H);
   /* stored 50s ago, was already 100s old on arrival -> 150s now. */
   expect(http_cc_current_age(&cc, 1000, 1050) == 150L);
@@ -140,9 +147,11 @@ int main(void)
     expect(http_cc_current_age(&cc, stored, stored + 30) == 230L);
   }
   http_headers_free(&H);
+}
 
-  /* --- a fresh-vs-stale end to end: max-age=300, stored now. */
-  test("fresh and stale responses");
+/* --- a fresh-vs-stale end to end: max-age=300, stored now. */
+static void test_fresh_and_stale_responses(void)
+{
   parse_cc("HTTP/1.1 200 OK\r\nCache-Control: max-age=300\r\n\r\n", &cc, &H);
   {
     long lifetime = http_cc_freshness(&cc, now);
@@ -150,33 +159,47 @@ int main(void)
     expect(http_cc_current_age(&cc, now, now + 400) >= lifetime); /* stale  */
   }
   http_headers_free(&H);
+}
 
-  /* --- validators surface for conditional requests. */
-  test("cache validators");
+/* --- validators surface for conditional requests. */
+static void test_cache_validators(void)
+{
   parse_cc("HTTP/1.1 200 OK\r\nETag: \"abc123\"\r\n"
            "Last-Modified: Fri, 01 Jan 2021 00:00:00 GMT\r\n\r\n",
            &cc, &H);
   expect(cc.etag && strcmp(cc.etag, "\"abc123\"") == 0);
   expect(cc.last_mod_str && strcmp(cc.last_mod_str, "Fri, 01 Jan 2021 00:00:00 GMT") == 0);
   http_headers_free(&H);
+}
 
-  /* --- Vary names and secondary keys. */
-  test("Vary key from a response and request");
-  {
-    struct http_vary v;
-    http_headers_parse(&H, "HTTP/1.1 200 OK\r\nVary: Accept-Encoding, User-Agent\r\n\r\n");
-    expect(http_vary_parse(&v, &H) == 0);
-    char *a = http_vary_key(&v, "User-Agent: x  y\r\nAccept-Encoding: GZIP\r\n");
-    char *b = http_vary_key(&v, "accept-encoding: GZIP\r\nuser-agent:  x y \r\n");
-    char *c = http_vary_key(&v, "accept-encoding: GZIP\r\n");
-    expect(http_vary_key_match(a, b));
-    expect(!http_vary_key_match(a, c));
-    free(a);
-    free(b);
-    free(c);
-    http_vary_free(&v);
-    http_headers_free(&H);
-  }
+/* --- Vary names and secondary keys. */
+static void test_vary_key_from_a(void)
+{
+  struct http_vary v;
+  http_headers_parse(&H, "HTTP/1.1 200 OK\r\nVary: Accept-Encoding, User-Agent\r\n\r\n");
+  expect(http_vary_parse(&v, &H) == 0);
+  char *a = http_vary_key(&v, "User-Agent: x  y\r\nAccept-Encoding: GZIP\r\n");
+  char *b = http_vary_key(&v, "accept-encoding: GZIP\r\nuser-agent:  x y \r\n");
+  char *c = http_vary_key(&v, "accept-encoding: GZIP\r\n");
+  expect(http_vary_key_match(a, b));
+  expect(!http_vary_key_match(a, c));
+  free(a);
+  free(b);
+  free(c);
+  http_vary_free(&v);
+  http_headers_free(&H);
+}
+
+int main(void)
+{
+  test("HTTP date parsing", test_http_date_parsing);
+  test("Cache-Control directives", test_cache_control_directives);
+  test("Expires freshness", test_expires_freshness);
+  test("Last-Modified heuristic", test_last_modified_heuristic);
+  test("current age calculation", test_current_age_calculation);
+  test("fresh and stale responses", test_fresh_and_stale_responses);
+  test("cache validators", test_cache_validators);
+  test("Vary key from a response and request", test_vary_key_from_a);
 
   return 0;
 }

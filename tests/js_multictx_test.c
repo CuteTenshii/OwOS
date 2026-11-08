@@ -12,89 +12,117 @@
  */
 #include <stdio.h>
 #define OWOS_SUITE_TEST
-#include <stdlib.h>
 #include "ast.h"
-#include "parser.h"
-#include "interp.h"
-#include "value.h"
 #include "gc.h"
+#include "interp.h"
+#include "parser.h"
+#include "value.h"
+#include <stdlib.h>
 
-static void con_print(js_ctx *ctx, int level, const char *s, int len) {
-    (void)ctx; (void)level;
-    fprintf(stderr, "[console] %.*s\n", len, s);
+static void con_print(js_ctx *ctx, int level, const char *s, int len)
+{
+  (void)ctx;
+  (void)level;
+  fprintf(stderr, "[console] %.*s\n", len, s);
 }
 
 /* Run one script in ctx; abort the test on parse/runtime error. */
-static void run_in(js_ctx *ctx, const char *src) {
-    js_arena a;
-    js_parse_error err = {0, 0};
-    js_node *prog;
-    js_value result;
-    js_arena_init(&a);
-    prog = js_parse(src, &a, &err);
-    if (!prog) { fprintf(stderr, "PARSE ERROR: %s\n", err.msg ? err.msg : "?"); expect(0); js_arena_free(&a); return; }
-    if (js_run(ctx, prog, &result) != 0) {
-        js_value msg = js_get(ctx, ctx->exc, "message");
-        fprintf(stderr, "UNCAUGHT: %s\n", msg.type == JV_STR ? msg.u.str->data : "(?)");
-        expect(0);
-        ctx->has_exc = 0;
-    }
+static void run_in(js_ctx *ctx, const char *src)
+{
+  js_arena a;
+  js_parse_error err = {0, 0};
+  js_node *prog;
+  js_value result;
+  js_arena_init(&a);
+  prog = js_parse(src, &a, &err);
+  if (!prog) {
+    fprintf(stderr, "PARSE ERROR: %s\n", err.msg ? err.msg : "?");
+    expect(0);
     js_arena_free(&a);
-    /* NOTE: the arena backing `prog` is freed here, mirroring the browser (each
-     * script parsed into a scratch arena freed after the run). The objects the
-     * script created live in the GC heap and must survive. */
+    return;
+  }
+  if (js_run(ctx, prog, &result) != 0) {
+    js_value msg = js_get(ctx, ctx->exc, "message");
+    fprintf(stderr, "UNCAUGHT: %s\n", msg.type == JV_STR ? msg.u.str->data : "(?)");
+    expect(0);
+    ctx->has_exc = 0;
+  }
+  js_arena_free(&a);
+  /* NOTE: the arena backing `prog` is freed here, mirroring the browser (each
+   * script parsed into a scratch arena freed after the run). The objects the
+   * script created live in the GC heap and must survive. */
 }
 
 /* Read globalThis.<obj>.v as a double; -1 on any miss. */
-static double read_v(js_ctx *ctx, const char *obj) {
-    js_value g = js_obj_value(ctx->global);
-    js_value o = js_get(ctx, g, obj);
-    if (o.type != JV_OBJ) return -1;
-    js_value v = js_get(ctx, o, "v");
-    return v.type == JV_NUM ? v.u.num : -1;
+static double read_v(js_ctx *ctx, const char *obj)
+{
+  js_value g = js_obj_value(ctx->global);
+  js_value o = js_get(ctx, g, obj);
+  if (o.type != JV_OBJ)
+    return -1;
+  js_value v = js_get(ctx, o, "v");
+  return v.type == JV_NUM ? v.u.num : -1;
 }
 
-int main(void) {
-    /* Two contexts live at once. Historically the second js_ctx_new reset the
-     * shared heap and destroyed the first; that is the regression under test. */
-	test("independent context globals");
-    js_ctx *A = js_ctx_new(con_print);
-    run_in(A, "globalThis.a = { v: 111, tag: 'A' };");
+static js_ctx *A, *B, *C;
 
-    js_ctx *B = js_ctx_new(con_print);         /* must not disturb A */
-    run_in(B, "globalThis.b = { v: 222, tag: 'B' };");
+/* Two contexts live at once. Historically the second js_ctx_new reset the
+ * shared heap and destroyed the first; that is the regression under test. */
+static void check_independent_globals(void)
+{
+  A = js_ctx_new(con_print);
+  run_in(A, "globalThis.a = { v: 111, tag: 'A' };");
 
-    /* Churn allocation in B and force collections; A's world must persist. */
-	test("cross-context garbage collection");
-    run_in(B, "for (let i = 0; i < 50000; i++) { let junk = { x: i, s: 'z' + i }; }");
-    gc_collect();
-    gc_collect();
+  B = js_ctx_new(con_print); /* must not disturb A */
+  run_in(B, "globalThis.b = { v: 222, tag: 'B' };");
+}
 
-    expect(read_v(A, "a") == 111);
-    expect(read_v(B, "b") == 222);
+/* Churn allocation in B and force collections; A's world must persist. */
+static void check_cross_context_gc(void)
+{
+  run_in(B, "for (let i = 0; i < 50000; i++) { let junk = { x: i, s: 'z' + i }; }");
+  gc_collect();
+  gc_collect();
 
-    /* A keeps running after B allocated heavily. */
-	test("context mutation after churn");
-    run_in(A, "globalThis.a.v = globalThis.a.v + 1;");
-    expect(read_v(A, "a") == 112);
+  expect(read_v(A, "a") == 111);
+  expect(read_v(B, "b") == 222);
+}
 
-    /* Freeing B must reclaim only B's world and leave A intact (no dangling
-     * roots into the freed context — the js_ctx_free root-removal fix). */
-	test("freeing one context");
-    js_ctx_free(B);
-    gc_collect();
-    expect(read_v(A, "a") == 112);
+/* A keeps running after B allocated heavily. */
+static void check_mutation_after_churn(void)
+{
+  run_in(A, "globalThis.a.v = globalThis.a.v + 1;");
+  expect(read_v(A, "a") == 112);
+}
 
-    /* A third context after a free still coexists. */
-	test("creating a context after free");
-    js_ctx *C = js_ctx_new(con_print);
-    run_in(C, "globalThis.c = { v: 333 };");
-    gc_collect();
-    expect(read_v(A, "a") == 112);
-    expect(read_v(C, "c") == 333);
+/* Freeing B must reclaim only B's world and leave A intact (no dangling
+ * roots into the freed context — the js_ctx_free root-removal fix). */
+static void check_free_one(void)
+{
+  js_ctx_free(B);
+  gc_collect();
+  expect(read_v(A, "a") == 112);
+}
 
-    js_ctx_free(A);
-    js_ctx_free(C);
+/* A third context after a free still coexists. */
+static void check_create_after_free(void)
+{
+  C = js_ctx_new(con_print);
+  run_in(C, "globalThis.c = { v: 333 };");
+  gc_collect();
+  expect(read_v(A, "a") == 112);
+  expect(read_v(C, "c") == 333);
 
-    return 0;
+  js_ctx_free(A);
+  js_ctx_free(C);
+}
+
+int main(void)
+{
+  test("independent context globals", check_independent_globals);
+  test("cross-context garbage collection", check_cross_context_gc);
+  test("context mutation after churn", check_mutation_after_churn);
+  test("freeing one context", check_free_one);
+  test("creating a context after free", check_create_after_free);
+  return 0;
 }

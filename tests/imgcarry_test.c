@@ -17,12 +17,11 @@ static void land(struct inl_img *im, const char *href, int uid, int off, int len
   im->uid = uid;
 }
 
-int main(void)
-{
-  struct inl_img old[4], fresh[4];
-  struct img_carry c;
+static struct inl_img old[4], fresh[4];
+static struct img_carry c;
 
-  test("unchanged list keeps uid and pool offsets in order");
+static void check_unchanged(void)
+{
   land(&old[0], "http://t/a.png", 7, 0, 100);
   land(&old[1], "http://t/b.png", 8, 100, 50);
   expect(img_carry_begin(&c, old, 2));
@@ -34,16 +33,20 @@ int main(void)
   expect(fresh[0].uid == 7 && fresh[0].coff == 0 && fresh[0].clen == 100 && fresh[0].ok);
   expect(fresh[1].uid == 8 && fresh[1].coff == 100 && fresh[1].clen == 50 && fresh[1].iw == 10);
   img_carry_end(&c);
+}
 
-  test("reordered images match by href");
+static void check_reordered(void)
+{
   expect(img_carry_begin(&c, old, 2));
   memset(fresh, 0, sizeof fresh);
   strcpy(fresh[0].href, "http://t/b.png");
   expect(img_carry_take(&c, &fresh[0], fresh[0].href, 0, false, fresh));
   expect(fresh[0].uid == 8);
   img_carry_end(&c);
+}
 
-  test("a new href gets nothing and a claimed entry is not reused");
+static void check_new_href(void)
+{
   expect(img_carry_begin(&c, old, 2));
   memset(fresh, 0, sizeof fresh);
   strcpy(fresh[0].href, "http://t/new.png");
@@ -54,8 +57,10 @@ int main(void)
   expect(img_carry_take(&c, &fresh[1], fresh[1].href, 1, false, fresh));
   expect(!img_carry_take(&c, &fresh[2], fresh[2].href, 2, false, fresh));
   img_carry_end(&c);
+}
 
-  test("need_ok skips entries without pixels and shares built duplicates");
+static void check_need_ok(void)
+{
   land(&old[0], "svg:1", 0, 0, 40);
   old[0].ok = 0;
   expect(img_carry_begin(&c, old, 1));
@@ -69,8 +74,10 @@ int main(void)
   expect(img_carry_take(&c, &fresh[1], fresh[1].href, 1, true, fresh));
   expect(fresh[1].coff == 64 && fresh[1].clen == 16);
   img_carry_end(&c);
+}
 
-  test("lazy fetch progress survives");
+static void check_lazy_fetch(void)
+{
   land(&old[0], "http://t/lazy.png", 0, 0, 0);
   old[0].ok = 0;
   old[0].fetched = 1;
@@ -81,19 +88,34 @@ int main(void)
   expect(img_carry_take(&c, &fresh[0], fresh[0].href, 0, false, fresh));
   expect(fresh[0].fetched == 1 && fresh[0].want == 1 && !fresh[0].ok);
   img_carry_end(&c);
+}
 
-  test("pool is kept only while an entry points into it");
+static void check_pool_len(void)
+{
   land(&old[0], "a", 1, 0, 30);
   expect(img_carry_pool_len(old, 1, 500) == 500);
   img_clear(&old[0]);
   expect(img_carry_pool_len(old, 1, 500) == 0);
   expect(img_carry_pool_len(old, 0, 500) == 0);
+}
 
-  test("img_clear resets landed state");
+static void check_clear(void)
+{
   land(&old[0], "a", 3, 8, 9);
   old[0].fetched = 1;
   old[0].want = 1;
   img_clear(&old[0]);
   expect(!old[0].ok && !old[0].uid && !old[0].clen && !old[0].fetched && !old[0].want && !old[0].iw);
+}
+
+int main(void)
+{
+  test("unchanged list keeps uid and pool offsets in order", check_unchanged);
+  test("reordered images match by href", check_reordered);
+  test("a new href gets nothing and a claimed entry is not reused", check_new_href);
+  test("need_ok skips entries without pixels and shares built duplicates", check_need_ok);
+  test("lazy fetch progress survives", check_lazy_fetch);
+  test("pool is kept only while an entry points into it", check_pool_len);
+  test("img_clear resets landed state", check_clear);
   return 0;
 }

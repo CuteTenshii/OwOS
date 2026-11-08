@@ -9,8 +9,8 @@
  */
 #include <stdio.h>
 #define OWOS_SUITE_TEST
-#include <string.h>
 #include "features/permissions/permissions.h"
+#include <string.h>
 
 /* A parsed policy blocks feature f? */
 static int blocks(const char *hdr, const char *host, int f)
@@ -18,10 +18,9 @@ static int blocks(const char *hdr, const char *host, int f)
   return perm_policy_blocks(perm_policy_parse(hdr, host), f);
 }
 
-int main(void)
+/* ---- feature <-> token table ---- */
+static void check_feature_tokens(void)
 {
-  /* ---- feature <-> token table ---- */
-  test("feature token table");
   expect(perm_feature_from_token("geolocation") == PERM_GEOLOCATION);
   expect(perm_feature_from_token("camera") == PERM_CAMERA);
   expect(perm_feature_from_token("microphone") == PERM_MICROPHONE);
@@ -29,9 +28,11 @@ int main(void)
   expect(perm_feature_from_token("GEOLOCATION") == PERM_GEOLOCATION);
   expect(perm_feature_from_token("gyroscope") == -1);
   expect(!strcmp(perm_feature_label(PERM_GEOLOCATION), "Location"));
+}
 
-  /* ---- Permissions-Policy parsing ---- */
-  test("Permissions-Policy parsing");
+/* ---- Permissions-Policy parsing ---- */
+static void check_policy_parsing(void)
+{
   expect(!blocks("geolocation=*", "a.com", PERM_GEOLOCATION));
   expect(!blocks("geolocation=(self)", "a.com", PERM_GEOLOCATION));
   expect(!blocks("geolocation=self", "a.com", PERM_GEOLOCATION));
@@ -53,9 +54,11 @@ int main(void)
   expect(!blocks("geolocation 'none'; microphone 'self'", "a.com", PERM_MICROPHONE));
   expect(perm_policy_parse(0, "a.com") == 0);
   expect(perm_policy_parse("", "a.com") == 0);
+}
 
-  /* ---- session store (persist = 0) ---- */
-  test("session permission store");
+/* ---- session store (persist = 0) ---- */
+static void check_session_store(void)
+{
   expect(perm_lookup("https://x.com", PERM_GEOLOCATION) == PERM_ASK);
   perm_remember("https://x.com", PERM_GEOLOCATION, PERM_DENIED, 0);
   expect(perm_lookup("https://x.com", PERM_GEOLOCATION) == PERM_DENIED);
@@ -64,9 +67,11 @@ int main(void)
   perm_remember("https://x.com", PERM_GEOLOCATION, PERM_GRANTED, 0); /* overwrite */
   expect(perm_lookup("https://x.com", PERM_GEOLOCATION) == PERM_GRANTED);
   expect(perm_lookup("HTTPS://X.COM", PERM_GEOLOCATION) == PERM_GRANTED);
+}
 
-  /* ---- persistent store round-trip (persist = 1) ---- */
-  test("persistent permission store");
+/* ---- persistent store round-trip (persist = 1) ---- */
+static void check_persistent_store(void)
+{
   remove(PERM_DB);
   perm_remember("https://persist.com", PERM_NOTIFICATIONS, PERM_GRANTED, 1); /* "Allow always" */
   perm_remember("https://persist.com", PERM_CAMERA, PERM_DENIED, 0);         /* session only */
@@ -95,6 +100,13 @@ int main(void)
     }
   }
   remove(PERM_DB);
+}
 
+int main(void)
+{
+  test("feature token table", check_feature_tokens);
+  test("Permissions-Policy parsing", check_policy_parsing);
+  test("session permission store", check_session_store);
+  test("persistent permission store", check_persistent_store);
   return 0;
 }

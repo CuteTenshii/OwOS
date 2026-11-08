@@ -67,9 +67,8 @@ static void *worker(void *arg)
   return 0;
 }
 
-int main(void)
+static void check_exclusion(void)
 {
-  test("lock and unlock exclude each other");
   pthread_t th[THREADS];
   for (int i = 0; i < THREADS; i++)
     pthread_create(&th[i], 0, worker, 0);
@@ -77,15 +76,19 @@ int main(void)
     pthread_join(th[i], 0);
   expect(counter == (long)THREADS * ITERS);
   expect(m.state == 0);
+}
 
-  test("trylock fails while held and succeeds when free");
+static void check_trylock(void)
+{
   expect(mutex_trylock(&m));
   expect(!mutex_trylock(&m));
   mutex_unlock(&m);
   expect(mutex_trylock(&m));
   mutex_unlock(&m);
+}
 
-  test("timedlock times out on a held mutex and succeeds on a free one");
+static void check_timedlock(void)
+{
   expect(mutex_timedlock(&m, 10));
   unsigned t0 = now_ms();
   expect(!mutex_timedlock(&m, 30));
@@ -93,11 +96,21 @@ int main(void)
   mutex_unlock(&m);
   expect(mutex_timedlock(&m, 10));
   mutex_unlock(&m);
+}
 
-  test("reset releases a stuck mutex");
+static void check_reset(void)
+{
   mutex_lock(&m);
   mutex_reset(&m);
   expect(mutex_trylock(&m));
   mutex_unlock(&m);
+}
+
+int main(void)
+{
+  test("lock and unlock exclude each other", check_exclusion);
+  test("trylock fails while held and succeeds when free", check_trylock);
+  test("timedlock times out on a held mutex and succeeds on a free one", check_timedlock);
+  test("reset releases a stuck mutex", check_reset);
   return 0;
 }

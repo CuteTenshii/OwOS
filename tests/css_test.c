@@ -117,177 +117,189 @@ static css_sheet *sheet(const char *src)
   return sh;
 }
 
+/* 1. A rule whose whole selector is :is(<complex>) must not collapse to the universal selector. */
+static void test_complex_is_selectors(void)
+{
+  const char *rtl = ":is(:is(:lang(ar), :lang(he), :lang(fa)) svg.lucide-chevron-right,"
+                    " :is(:lang(ar), :lang(he), :lang(fa)) svg.lucide-chevron-left)"
+                    " { transform: rotateY(180deg) }";
+  css_sheet *sh = sheet(rtl);
+  struct dom_node *d = el("div");
+  doc(d);
+  expect(!matches_any(sh, d));
+
+  /* No RTL ancestor and :lang is unsupported, so no match. */
+  struct dom_node *body = el("body"), *svg = cls(el("svg"), "lucide-chevron-right");
+  append(body, svg);
+  doc(body);
+  expect(!matches_any(sh, svg));
+  css_free(sh);
+}
+
+/* 2. :is() with a class list, constrained by a tag. */
+static void test_tag_constrained_is_selectors(void)
+{
+  css_sheet *sh = sheet("div:is(.x, .y) { color: red }");
+  struct dom_node *dx = cls(el("div"), "x"), *dy = cls(el("div"), "y"), *dz = cls(el("div"), "z"),
+                  *sx = cls(el("span"), "x");
+  doc(dx);
+  doc(dy);
+  doc(dz);
+  doc(sx);
+  expect(matches_any(sh, dx));
+  expect(matches_any(sh, dy));
+  expect(!matches_any(sh, dz));
+  expect(!matches_any(sh, sx));
+  css_free(sh);
+}
+
+/* 3. A standalone :is(.x) matches only .x, never everything. */
+static void test_standalone_is_selector(void)
+{
+  css_sheet *sh = sheet(":is(.x) { color: red }");
+  struct dom_node *px = cls(el("p"), "x"), *pz = cls(el("p"), "z");
+  doc(px);
+  doc(pz);
+  expect(matches_any(sh, px));
+  expect(!matches_any(sh, pz));
+  css_free(sh);
+}
+
+/* 4. A top-level comma still groups; a comma INSIDE :is() must not. */
+static void test_selector_grouping(void)
+{
+  css_sheet *sh = sheet(".keep, :is(.a, .b) { color: red }");
+  struct dom_node *k = cls(el("p"), "keep"), *a = cls(el("p"), "a"), *b = cls(el("p"), "b"), *c = cls(el("p"), "c");
+  doc(k);
+  doc(a);
+  doc(b);
+  doc(c);
+  expect(matches_any(sh, k));
+  expect(matches_any(sh, a));
+  expect(matches_any(sh, b));
+  expect(!matches_any(sh, c));
+  css_free(sh);
+}
+
+/* 5. :is() may hold a full descendant selector (space inside the parens). */
+static void test_descendant_selector_inside_is(void)
+{
+  css_sheet *sh = sheet(":is(section p) { color: red }");
+  struct dom_node *sec = el("section"), *pin = el("p");
+  append(sec, pin);
+  doc(sec);
+  struct dom_node *loose = el("p");
+  doc(loose);
+  expect(matches_any(sh, pin));
+  expect(!matches_any(sh, loose));
+  css_free(sh);
+}
+
+/* 6. :where() has zero specificity, so a later bare class rule wins the cascade. */
+static void test_where_specificity(void)
+{
+  css_sheet *sh = sheet("p:where(.w) { color: red } .w { color: green }");
+  struct dom_node *pw = cls(el("p"), "w");
+  doc(pw);
+  struct css_match m[8];
+  int n = css_matches(sh, pw, m, 8);
+  expect(n == 2);
+  /* winner (index 0) is the higher-specificity .w, not the :where rule */
+  expect(n >= 1 && strstr(m[0].selector, "where") == 0);
+  css_free(sh);
+}
+
+/* 7. An unsupported selector inside :is() yields no match, not everything. */
+static void test_unsupported_selector_handling(void)
+{
+  css_sheet *sh = sheet(":is(:lang(ar) .x) { color: red }");
+  struct dom_node *d = cls(el("div"), "x");
+  doc(d);
+  expect(!matches_any(sh, d));
+  css_free(sh);
+}
+
+/* 8. A rule filed under two class keys is reported once for an element with both. */
+static void test_multi_key_selector_deduplication(void)
+{
+  css_sheet *sh = sheet(":is(.a, .b) { color: red }");
+  struct dom_node *ab = cls(el("div"), "a b");
+  doc(ab);
+  struct css_match m[8];
+  int n = css_matches(sh, ab, m, 8);
+  expect(n == 1);
+  css_free(sh);
+}
+
+/* 9. A subject :is() with an id/tag files under that key; non-matching branch keys don't leak. */
+static void test_id_and_tag_selector(void)
+{
+  css_sheet *sh = sheet(":is(#hero, aside) .item { color: red }");
+  struct dom_node *hero = el("div"), *item = cls(el("span"), "item");
+  set_attr(hero, "id", "hero");
+  append(hero, item);
+  doc(hero);
+  struct dom_node *aside = el("aside"), *item2 = cls(el("span"), "item");
+  append(aside, item2);
+  doc(aside);
+  struct dom_node *plain = el("div"), *item3 = cls(el("span"), "item");
+  append(plain, item3);
+  doc(plain);
+  expect(matches_any(sh, item));
+  expect(matches_any(sh, item2));
+  expect(!matches_any(sh, item3));
+  css_free(sh);
+}
+
+/* 10. :popover-open / :modal follow the state attributes; closed elements don't match. */
+static void test_popover_and_dialog_state(void)
+{
+  css_sheet *sh = sheet(":popover-open { color: red } dialog:modal { color: blue }");
+  struct dom_node *closed = el("div"), *opened = el("div"), *plain = el("dialog"), *modal = el("dialog");
+  set_attr(opened, "popover-open", "");
+  set_attr(modal, "open", "");
+  set_attr(modal, "dialog-modal", "");
+  doc(closed);
+  doc(opened);
+  doc(plain);
+  doc(modal);
+  expect(!matches_any(sh, closed));
+  expect(matches_any(sh, opened));
+  expect(!matches_any(sh, plain));
+  expect(matches_any(sh, modal));
+  css_free(sh);
+}
+
+/* 11. dialogs and popovers get a UA box that author styles can override. */
+static void test_dialog_and_popover_ua(void)
+{
+  struct css_style st;
+  struct dom_node *dlg = el("dialog"), *pop = el("div"), *div = el("div");
+  set_attr(pop, "popover", "");
+  css_style_reset(&st);
+  css_apply_attrs(dlg, &st);
+  expect(st.bg == 0xffffff && st.border_w[0] == 2 && st.border_style[0] == CSS_BST_SOLID && st.margin[1] == -2);
+  css_style_reset(&st);
+  css_apply_attrs(pop, &st);
+  expect(st.bg == 0xffffff && st.border_w[0] == 1);
+  css_style_reset(&st);
+  css_apply_attrs(div, &st);
+  expect(st.bg == -1 && st.border_w[0] == -1);
+}
+
 int main(void)
 {
-  /* 1. A rule whose whole selector is :is(<complex>) must not collapse to the universal selector. */
-  test("complex :is selectors");
-  {
-    const char *rtl = ":is(:is(:lang(ar), :lang(he), :lang(fa)) svg.lucide-chevron-right,"
-                      " :is(:lang(ar), :lang(he), :lang(fa)) svg.lucide-chevron-left)"
-                      " { transform: rotateY(180deg) }";
-    css_sheet *sh = sheet(rtl);
-    struct dom_node *d = el("div");
-    doc(d);
-    expect(!matches_any(sh, d));
-
-    /* No RTL ancestor and :lang is unsupported, so no match. */
-    struct dom_node *body = el("body"), *svg = cls(el("svg"), "lucide-chevron-right");
-    append(body, svg);
-    doc(body);
-    expect(!matches_any(sh, svg));
-    css_free(sh);
-  }
-
-  /* 2. :is() with a class list, constrained by a tag. */
-  test("tag-constrained :is selectors");
-  {
-    css_sheet *sh = sheet("div:is(.x, .y) { color: red }");
-    struct dom_node *dx = cls(el("div"), "x"), *dy = cls(el("div"), "y"), *dz = cls(el("div"), "z"),
-                    *sx = cls(el("span"), "x");
-    doc(dx);
-    doc(dy);
-    doc(dz);
-    doc(sx);
-    expect(matches_any(sh, dx));
-    expect(matches_any(sh, dy));
-    expect(!matches_any(sh, dz));
-    expect(!matches_any(sh, sx));
-    css_free(sh);
-  }
-
-  /* 3. A standalone :is(.x) matches only .x, never everything. */
-  test("standalone :is selector");
-  {
-    css_sheet *sh = sheet(":is(.x) { color: red }");
-    struct dom_node *px = cls(el("p"), "x"), *pz = cls(el("p"), "z");
-    doc(px);
-    doc(pz);
-    expect(matches_any(sh, px));
-    expect(!matches_any(sh, pz));
-    css_free(sh);
-  }
-
-  /* 4. A top-level comma still groups; a comma INSIDE :is() must not. */
-  test("selector grouping");
-  {
-    css_sheet *sh = sheet(".keep, :is(.a, .b) { color: red }");
-    struct dom_node *k = cls(el("p"), "keep"), *a = cls(el("p"), "a"), *b = cls(el("p"), "b"), *c = cls(el("p"), "c");
-    doc(k);
-    doc(a);
-    doc(b);
-    doc(c);
-    expect(matches_any(sh, k));
-    expect(matches_any(sh, a));
-    expect(matches_any(sh, b));
-    expect(!matches_any(sh, c));
-    css_free(sh);
-  }
-
-  /* 5. :is() may hold a full descendant selector (space inside the parens). */
-  test("descendant selector inside :is");
-  {
-    css_sheet *sh = sheet(":is(section p) { color: red }");
-    struct dom_node *sec = el("section"), *pin = el("p");
-    append(sec, pin);
-    doc(sec);
-    struct dom_node *loose = el("p");
-    doc(loose);
-    expect(matches_any(sh, pin));
-    expect(!matches_any(sh, loose));
-    css_free(sh);
-  }
-
-  /* 6. :where() has zero specificity, so a later bare class rule wins the cascade. */
-  test(":where specificity");
-  {
-    css_sheet *sh = sheet("p:where(.w) { color: red } .w { color: green }");
-    struct dom_node *pw = cls(el("p"), "w");
-    doc(pw);
-    struct css_match m[8];
-    int n = css_matches(sh, pw, m, 8);
-    expect(n == 2);
-    /* winner (index 0) is the higher-specificity .w, not the :where rule */
-    expect(n >= 1 && strstr(m[0].selector, "where") == 0);
-    css_free(sh);
-  }
-
-  /* 7. An unsupported selector inside :is() yields no match, not everything. */
-  test("unsupported selector handling");
-  {
-    css_sheet *sh = sheet(":is(:lang(ar) .x) { color: red }");
-    struct dom_node *d = cls(el("div"), "x");
-    doc(d);
-    expect(!matches_any(sh, d));
-    css_free(sh);
-  }
-
-  /* 8. A rule filed under two class keys is reported once for an element with both. */
-  test("multi-key selector deduplication");
-  {
-    css_sheet *sh = sheet(":is(.a, .b) { color: red }");
-    struct dom_node *ab = cls(el("div"), "a b");
-    doc(ab);
-    struct css_match m[8];
-    int n = css_matches(sh, ab, m, 8);
-    expect(n == 1);
-    css_free(sh);
-  }
-
-  /* 9. A subject :is() with an id/tag files under that key; non-matching branch keys don't leak. */
-  test("id and tag selector keys");
-  {
-    css_sheet *sh = sheet(":is(#hero, aside) .item { color: red }");
-    struct dom_node *hero = el("div"), *item = cls(el("span"), "item");
-    set_attr(hero, "id", "hero");
-    append(hero, item);
-    doc(hero);
-    struct dom_node *aside = el("aside"), *item2 = cls(el("span"), "item");
-    append(aside, item2);
-    doc(aside);
-    struct dom_node *plain = el("div"), *item3 = cls(el("span"), "item");
-    append(plain, item3);
-    doc(plain);
-    expect(matches_any(sh, item));
-    expect(matches_any(sh, item2));
-    expect(!matches_any(sh, item3));
-    css_free(sh);
-  }
-
-  /* 10. :popover-open / :modal follow the state attributes; closed elements don't match. */
-  test("popover and dialog state selectors");
-  {
-    css_sheet *sh = sheet(":popover-open { color: red } dialog:modal { color: blue }");
-    struct dom_node *closed = el("div"), *opened = el("div"), *plain = el("dialog"), *modal = el("dialog");
-    set_attr(opened, "popover-open", "");
-    set_attr(modal, "open", "");
-    set_attr(modal, "dialog-modal", "");
-    doc(closed);
-    doc(opened);
-    doc(plain);
-    doc(modal);
-    expect(!matches_any(sh, closed));
-    expect(matches_any(sh, opened));
-    expect(!matches_any(sh, plain));
-    expect(matches_any(sh, modal));
-    css_free(sh);
-  }
-
-  /* 11. dialogs and popovers get a UA box that author styles can override. */
-  test("dialog and popover UA box");
-  {
-    struct css_style st;
-    struct dom_node *dlg = el("dialog"), *pop = el("div"), *div = el("div");
-    set_attr(pop, "popover", "");
-    css_style_reset(&st);
-    css_apply_attrs(dlg, &st);
-    expect(st.bg == 0xffffff && st.border_w[0] == 2 && st.border_style[0] == CSS_BST_SOLID && st.margin[1] == -2);
-    css_style_reset(&st);
-    css_apply_attrs(pop, &st);
-    expect(st.bg == 0xffffff && st.border_w[0] == 1);
-    css_style_reset(&st);
-    css_apply_attrs(div, &st);
-    expect(st.bg == -1 && st.border_w[0] == -1);
-  }
+  test("complex :is selectors", test_complex_is_selectors);
+  test("tag-constrained :is selectors", test_tag_constrained_is_selectors);
+  test("standalone :is selector", test_standalone_is_selector);
+  test("selector grouping", test_selector_grouping);
+  test("descendant selector inside :is", test_descendant_selector_inside_is);
+  test(":where specificity", test_where_specificity);
+  test("unsupported selector handling", test_unsupported_selector_handling);
+  test("multi-key selector deduplication", test_multi_key_selector_deduplication);
+  test("id and tag selector keys", test_id_and_tag_selector);
+  test("popover and dialog state selectors", test_popover_and_dialog_state);
+  test("dialog and popover UA box", test_dialog_and_popover_ua);
 
   free_dom();
   return 0;

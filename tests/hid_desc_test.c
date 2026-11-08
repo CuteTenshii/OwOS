@@ -105,18 +105,20 @@ static const struct hid_field *find(const struct hid_desc *d, uint32_t usage, ui
   return NULL;
 }
 
-int main(void)
-{
-  struct hid_desc d;
-  struct hid_decoded dec;
+static struct hid_desc d;
+static struct hid_decoded dec;
+static const struct hid_field *f;
+static uint8_t led[4];
+static uint8_t id;
 
-  test("boot keyboard descriptor");
+static void boot_kbd_desc(void)
+{
   expect(hid_parse(hid_boot_kbd_desc, sizeof hid_boot_kbd_desc, &d) == 0);
   expect(d.nfields == 8 + 5 + 1);
   expect(!d.has_ids);
   expect(hid_report_bytes(&d, HID_INPUT, 0) == 8);
   expect(hid_report_bytes(&d, HID_OUTPUT, 0) == 1);
-  const struct hid_field *f = find(&d, HID_USAGE(7, 0xE1), HID_INPUT);
+  f = find(&d, HID_USAGE(7, 0xE1), HID_INPUT);
   expect(f && f->bit_off == 1 && f->size == 1 && f->count == 1 && f->lmax == 1);
   f = find(&d, HID_USAGE(7, 0), HID_INPUT);
   expect(f && f->bit_off == 16 && f->size == 8 && f->count == 6 && f->usage_max == HID_USAGE(7, 0x65));
@@ -125,15 +127,19 @@ int main(void)
   expect(f && f->bit_off == 1 && f->size == 1);
   expect(hid_roles(&d) == HID_ROLE_KEYBOARD);
   hid_desc_free(&d);
+}
 
-  test("QEMU usb-kbd descriptor");
+static void qemu_kbd_desc(void)
+{
   expect(hid_parse(qemu_kbd, sizeof qemu_kbd, &d) == 0);
   f = find(&d, HID_USAGE(7, 0), HID_INPUT);
   expect(f && f->lmax == 255 && f->usage_max == HID_USAGE(7, 0xFF));
   expect(hid_roles(&d) == HID_ROLE_KEYBOARD);
   hid_desc_free(&d);
+}
 
-  test("keyboard report decoding");
+static void kbd_report_decoding(void)
+{
   expect(hid_parse(hid_boot_kbd_desc, sizeof hid_boot_kbd_desc, &d) == 0);
   expect(hid_decoded_init(&dec, &d) == 0);
   uint8_t rep[8] = {0x02, 0, 0x04, 0x05, 0, 0, 0, 0};
@@ -143,8 +149,10 @@ int main(void)
   uint8_t rep2[8] = {0x81, 0, 0x1E, 0, 0, 0, 0, 0};
   hid_decode(&d, rep2, sizeof rep2, &dec);
   expect(dec.mods == 0x81 && dec.nkeys == 1 && dec.keys[0] == 0x1E);
+}
 
-  test("rollover error is phantom and carries no keys");
+static void rollover_phantom(void)
+{
   uint8_t rollover[8] = {0, 0, 1, 1, 1, 1, 1, 1};
   hid_decode(&d, rollover, sizeof rollover, &dec);
   expect(dec.phantom && dec.nkeys == 0);
@@ -156,8 +164,10 @@ int main(void)
   expect(dec.mods == 1 && dec.nkeys == 1 && dec.keys[0] == 4);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("boot mouse and wheel mouse");
+static void boot_and_wheel_mouse(void)
+{
   expect(hid_parse(hid_boot_mouse_desc, sizeof hid_boot_mouse_desc, &d) == 0);
   expect(hid_decoded_init(&dec, &d) == 0);
   uint8_t m3[3] = {0x05, 0xFE, 0x03};
@@ -173,8 +183,10 @@ int main(void)
   expect(dec.buttons == 0x1F && dec.dx == 127 && dec.dy == -128 && dec.wheel == -1 && !dec.has_abs);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("tablet absolute axes");
+static void tablet_abs_axes(void)
+{
   expect(hid_parse(qemu_tablet, sizeof qemu_tablet, &d) == 0);
   expect(hid_decoded_init(&dec, &d) == 0);
   uint8_t t6[6] = {0x01, 0x00, 0x40, 0x00, 0x20, 0x01};
@@ -184,8 +196,10 @@ int main(void)
   expect(hid_roles(&d) == HID_ROLE_TABLET);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("absolute axis scaling");
+static void abs_axis_scaling(void)
+{
   expect(hid_scale_abs(0x4000, 0, 0x7FFF, 1023) == 511);
   expect(hid_scale_abs(0, 0, 0x7FFF, 1023) == 0);
   expect(hid_scale_abs(0x7FFF, 0, 0x7FFF, 1023) == 1023);
@@ -197,8 +211,10 @@ int main(void)
   expect(hid_scale_i16(255, 0, 255) == 32767);
   expect(hid_scale_i16(-128, -128, 127) == -32768);
   expect(hid_scale_i16(0, -128, 127) == 128);
+}
 
-  test("consumer and system controls with report IDs");
+static void consumer_report_ids(void)
+{
   expect(hid_parse(kbd_consumer, sizeof kbd_consumer, &d) == 0);
   expect(d.has_ids);
   expect(hid_report_bytes(&d, HID_INPUT, 2) == 2 && hid_report_bytes(&d, HID_INPUT, 3) == 1);
@@ -221,8 +237,10 @@ int main(void)
   expect(!dec.valid && dec.ncons == 0);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("consumer keys as individual bits");
+static void consumer_bits_keys(void)
+{
   expect(hid_parse(consumer_bits, sizeof consumer_bits, &d) == 0);
   expect(hid_decoded_init(&dec, &d) == 0);
   uint8_t bits[2] = {4, 0x0A};
@@ -230,8 +248,10 @@ int main(void)
   expect(dec.ncons == 2 && dec.cons[0] == HID_USAGE(0x0C, 0xEA) && dec.cons[1] == HID_USAGE(0x0C, 0xCD));
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("horizontal wheel as AC Pan");
+static void horizontal_wheel_pan(void)
+{
   expect(hid_parse(pan_mouse, sizeof pan_mouse, &d) == 0);
   expect(hid_roles(&d) == HID_ROLE_MOUSE);
   expect(hid_decoded_init(&dec, &d) == 0);
@@ -240,8 +260,10 @@ int main(void)
   expect(dec.buttons == 2 && dec.wheel == 2 && dec.pan == -1 && dec.ncons == 0 && !dec.has_cons);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("array with a logical minimum above zero");
+static void array_logical_min(void)
+{
   expect(hid_parse(sysctl_array, sizeof sysctl_array, &d) == 0);
   expect(hid_decoded_init(&dec, &d) == 0);
   uint8_t sc[2] = {5, 2};
@@ -255,8 +277,10 @@ int main(void)
   expect(dec.ncons == 0);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("array values beyond the usage range are ignored");
+static void array_beyond_usage(void)
+{
   expect(hid_parse(wide_array, sizeof wide_array, &d) == 0);
   expect(hid_decoded_init(&dec, &d) == 0);
   uint8_t wa[1] = {3};
@@ -267,8 +291,10 @@ int main(void)
   expect(dec.valid && dec.ncons == 0);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("four-way hat");
+static void four_way_hat(void)
+{
   expect(hid_parse(hat4, sizeof hat4, &d) == 0);
   expect(hid_decoded_init(&dec, &d) == 0);
   uint8_t h1[1] = {0x01};
@@ -282,8 +308,10 @@ int main(void)
   expect(dec.hat == 0);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("bitmap keyboard with LED report ID");
+static void bitmap_kbd_led_id(void)
+{
   expect(hid_parse(nkro_kbd, sizeof nkro_kbd, &d) == 0);
   expect(hid_report_bytes(&d, HID_INPUT, 1) == 14);
   expect(hid_decoded_init(&dec, &d) == 0);
@@ -292,8 +320,6 @@ int main(void)
   /* payload byte 1 = 0x05 sets bitmap bits 0 and 2 (usages 4 and 6); byte 3 bit 7 is bitmap bit 23 (usage 27) */
   expect(dec.mods == 1 && dec.nkeys == 3);
   expect(dec.keys[0] == 4 && dec.keys[1] == 6 && dec.keys[2] == 4 + 23);
-  uint8_t led[4] = {0};
-  uint8_t id = 0;
   expect(hid_pack_leds(&d, 0x03, led, hid_report_bytes(&d, HID_OUTPUT, 2), &id) == 2);
   expect(id == 2 && led[0] == 0x03);
   expect(hid_pack_leds(&d, 0x04, led, 1, &id) == 2 && led[0] == 0x04);
@@ -302,15 +328,19 @@ int main(void)
   expect(hid_parse(qemu_mouse, sizeof qemu_mouse, &d) == 0);
   expect(hid_pack_leds(&d, 3, led, 1, &id) == -1);
   hid_desc_free(&d);
+}
 
-  test("boot keyboard LED output packing");
+static void boot_kbd_led_packing(void)
+{
   expect(hid_parse(hid_boot_kbd_desc, sizeof hid_boot_kbd_desc, &d) == 0);
   memset(led, 0xFF, sizeof led);
   expect(hid_pack_leds(&d, 0x02, led, 1, &id) == 0 && id == 0);
   expect(led[0] == 0x02);
   hid_desc_free(&d);
+}
 
-  test("gamepad axes, hat and buttons across byte boundaries");
+static void gamepad_axes(void)
+{
   expect(hid_parse(gamepad, sizeof gamepad, &d) == 0);
   expect(hid_report_bytes(&d, HID_INPUT, 0) == 6);
   expect(hid_roles(&d) == HID_ROLE_GAMEPAD);
@@ -331,8 +361,10 @@ int main(void)
   expect(dec.hat == 1);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("touchscreen reports only its first finger");
+static void touchscreen_first_finger(void)
+{
   expect(hid_parse(touch2, sizeof touch2, &d) == 0);
   expect(hid_roles(&d) == HID_ROLE_TABLET);
   expect(hid_decoded_init(&dec, &d) == 0);
@@ -344,8 +376,10 @@ int main(void)
   expect(!dec.tip && dec.ax == 0x234);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
+}
 
-  test("bit extraction across byte boundaries");
+static void bit_extraction(void)
+{
   uint8_t raw[4] = {0xF0, 0x0F, 0xAA, 0x55};
   expect(hid_get_bits(raw, 4, 4, 8, false) == 0xFF);
   expect(hid_get_bits(raw, 4, 4, 8, true) == -1);
@@ -365,8 +399,10 @@ int main(void)
   expect(out[0] == 0 && out[1] == 0 && out[2] == 0);
   hid_set_bits(out, 3, 20, 8, 0xFF);
   expect(out[2] == 0xF0);
+}
 
-  test("descriptor edge cases");
+static void descriptor_edge_cases(void)
+{
   expect(hid_parse((const uint8_t *)"", 0, &d) == -1);
   static const uint8_t trunc[] = {0x05, 0x01, 0x09, 0x06, 0xa1};
   expect(hid_parse(trunc, sizeof trunc, &d) == -1);
@@ -403,16 +439,20 @@ int main(void)
                                     0x95, 0x01, 0x81, 0x02, 0xfe, 0x09, 0x10, 0xaa};
   expect(hid_parse(longcut, sizeof longcut, &d) == -1);
   expect(d.nfields == 0 && d.fields == NULL);
+}
 
-  test("report ID bit offsets are per report");
+static void report_id_bit_offsets(void)
+{
   static const uint8_t two_ids[] = {0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x75, 0x08, 0x95, 0x01,
                                     0x15, 0x00, 0x25, 0x7f, 0x81, 0x02, 0x85, 0x02, 0x09, 0x31, 0x81, 0x02, 0xc0};
   expect(hid_parse(two_ids, sizeof two_ids, &d) == 0);
   f = find(&d, HID_USAGE(1, 0x31), HID_INPUT);
   expect(f && f->report_id == 2 && f->bit_off == 0);
   hid_desc_free(&d);
+}
 
-  test("usage to PS/2 set-1 translation");
+static void usage_to_set1(void)
+{
   static const char rows[3][11] = {"qwertyuiop", "asdfghjkl", "zxcvbnm"};
   static const uint8_t row_base[3] = {0x10, 0x1E, 0x2C};
   for (int r = 0; r < 3; r++)
@@ -435,15 +475,19 @@ int main(void)
   expect(hid_usage_set1(0x46) == 0x137 && hid_usage_set1(0x47) == 0x46);
   expect(hid_usage_set1(0x00) == 0 && hid_usage_set1(0x01) == 0 && hid_usage_set1(0x70) == 0 &&
          hid_usage_set1(0xFF) == 0);
+}
 
-  test("laptop media F-keys are not synthesized from USB F5/F6/F8/F9");
+static void laptop_media_fkeys(void)
+{
   expect(hid_usage_set1(0x3E) == 0 && hid_usage_set1(0x3F) == 0 && hid_usage_set1(0x41) == 0 &&
          hid_usage_set1(0x42) == 0);
   expect(hid_usage_set1(0x3D) == 0x3E && hid_usage_set1(0x40) == 0x41);
   expect(hid_fkey_key(0x3E) == KEY_F5 && hid_fkey_key(0x3F) == KEY_F6 && hid_fkey_key(0x41) == KEY_F8 &&
          hid_fkey_key(0x42) == KEY_F9 && hid_fkey_key(0x40) == 0);
+}
 
-  test("special key mapping by page");
+static void special_key_mapping(void)
+{
   expect(hid_special_key(HID_USAGE(0x0C, 0xE9)) == KEY_VOL_UP);
   expect(hid_special_key(HID_USAGE(0x0C, 0xCD)) == KEY_MEDIA_PLAY);
   expect(hid_special_key(HID_USAGE(0x01, 0x81)) == KEY_POWER);
@@ -453,8 +497,10 @@ int main(void)
   expect(hid_special_key(HID_USAGE(0x0B, 0x2E)) == 0);
   expect(hid_special_key(HID_USAGE(0x07, 0xE9)) == 0);
   expect(hid_special_key(HID_USAGE(0x0C, 0x70)) == KEY_BRIGHT_DOWN);
+}
 
-  test("typematic eligibility");
+static void typematic_eligibility(void)
+{
   expect(hid_key_repeats(0x04) && hid_key_repeats(0x2C) && hid_key_repeats(0x4F) && hid_key_repeats(0x58));
   expect(!hid_key_repeats(0xE0) && !hid_key_repeats(0xE7));
   expect(!hid_key_repeats(0x39) && !hid_key_repeats(0x47) && !hid_key_repeats(0x53) && !hid_key_repeats(0x66));
@@ -462,8 +508,10 @@ int main(void)
   expect(hid_key_repeats(0x100 | KEY_BRIGHT_UP) && hid_key_repeats(0x100 | KEY_BRIGHT_DOWN));
   expect(!hid_key_repeats(0x100 | KEY_MUTE) && !hid_key_repeats(0x100 | KEY_POWER) &&
          !hid_key_repeats(0x100 | KEY_MEDIA_PLAY));
+}
 
-  test("key diff ordering");
+static void key_diff_ordering(void)
+{
   struct events ev = {0};
   uint16_t none_keys[1] = {0};
   uint16_t cur[2] = {0x04, 0x05};
@@ -481,8 +529,10 @@ int main(void)
   memset(&ev, 0, sizeof ev);
   hid_kbd_diff(0x03, 0x03, now, 2, now, 2, record, &ev);
   expect(ev.n == 0);
+}
 
-  test("typematic state machine");
+static void typematic_state_machine(void)
+{
   struct hid_typematic tm = {0};
   uint16_t key = 0;
   expect(!hid_tm_due(&tm, 1000, &key));
@@ -513,8 +563,10 @@ int main(void)
   expect(!hid_tm_due(&tm, 0xFFFFFFF0u, &key));
   expect(!hid_tm_due(&tm, 0x00000050u, &key));
   expect(hid_tm_due(&tm, 0x000000F4u, &key) && key == 7);
+}
 
-  test("interrupt endpoint interval encoding");
+static void intr_interval_encoding(void)
+{
   expect(usbh_intr_exponent(USB_SPEED_HIGH, 1) == 0);
   expect(usbh_intr_exponent(USB_SPEED_HIGH, 4) == 3);
   expect(usbh_intr_exponent(USB_SPEED_HIGH, 16) == 15);
@@ -528,5 +580,36 @@ int main(void)
   expect(usbh_intr_exponent(USB_SPEED_LOW, 4) == 5);
   expect(usbh_intr_exponent(USB_SPEED_FULL, 255) == 10);
   expect(usbh_intr_exponent(USB_SPEED_FULL, 0) == 3);
+}
+
+int main(void)
+{
+  test("boot keyboard descriptor", boot_kbd_desc);
+  test("QEMU usb-kbd descriptor", qemu_kbd_desc);
+  test("keyboard report decoding", kbd_report_decoding);
+  test("rollover error is phantom and carries no keys", rollover_phantom);
+  test("boot mouse and wheel mouse", boot_and_wheel_mouse);
+  test("tablet absolute axes", tablet_abs_axes);
+  test("absolute axis scaling", abs_axis_scaling);
+  test("consumer and system controls with report IDs", consumer_report_ids);
+  test("consumer keys as individual bits", consumer_bits_keys);
+  test("horizontal wheel as AC Pan", horizontal_wheel_pan);
+  test("array with a logical minimum above zero", array_logical_min);
+  test("array values beyond the usage range are ignored", array_beyond_usage);
+  test("four-way hat", four_way_hat);
+  test("bitmap keyboard with LED report ID", bitmap_kbd_led_id);
+  test("boot keyboard LED output packing", boot_kbd_led_packing);
+  test("gamepad axes, hat and buttons across byte boundaries", gamepad_axes);
+  test("touchscreen reports only its first finger", touchscreen_first_finger);
+  test("bit extraction across byte boundaries", bit_extraction);
+  test("descriptor edge cases", descriptor_edge_cases);
+  test("report ID bit offsets are per report", report_id_bit_offsets);
+  test("usage to PS/2 set-1 translation", usage_to_set1);
+  test("laptop media F-keys are not synthesized from USB F5/F6/F8/F9", laptop_media_fkeys);
+  test("special key mapping by page", special_key_mapping);
+  test("typematic eligibility", typematic_eligibility);
+  test("key diff ordering", key_diff_ordering);
+  test("typematic state machine", typematic_state_machine);
+  test("interrupt endpoint interval encoding", intr_interval_encoding);
   return 0;
 }
