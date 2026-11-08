@@ -15,8 +15,11 @@ struct timer_meta {
   bool active, repeat, raf;
   long long due, period; /* ms; due is the next fire time (now_ms scale) */
   char *async;           /* frames captured at the arming call site */
+  int owner;             /* worker id that armed it, 0 for the page */
 };
 extern struct timer_meta *g_tmeta;
+extern int g_timer_owner;          /* worker id whose code is running, 0 for the page */
+void timers_drop_owner(int owner); /* cancel every timer a worker armed */
 js_value el_get_protocol(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_hostname(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value el_get_port(js_ctx *ctx, js_value t, js_value *args, int argc);

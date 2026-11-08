@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern long long fake_now_ms;
+int js_timers_pump(void);
 int js_workers_pump(void);
 
 static js_value test_expect(js_ctx *ctx, js_value thisv, js_value *args, int argc)
@@ -97,12 +99,37 @@ static void test_terminate_and_close(void)
 static void test_import_scripts_and_location(void)
 {
   run_script("var r=null, w3=new Worker('data:text/javascript,"
-             "importScripts(\"data:text/javascript,var shared=42;\");"
-             "postMessage([shared, typeof location.href, self.name]);', {name:'nm'});\n"
+             "importScripts(\"data:text/javascript,var shared=42; self.fromLib=7;\");"
+             "postMessage([shared, typeof location.href, self.name, self.fromLib]);', {name:'nm'});\n"
              "w3.onmessage=function(e){ r=e.data; };\n");
   drain();
   run_script("expect(r && r[0]===42, 'importScripts shares globals');\n"
-             "expect(r && r[1]==='string' && r[2]==='nm', 'location and name');\n");
+             "expect(r && r[1]==='string' && r[2]==='nm', 'location and name');\n"
+             "expect(r && r[3]===7 && typeof fromLib==='undefined', 'imported code sees the worker as self');\n"
+             "expect(self===window, 'window.self restored');\n");
+}
+
+static void test_module_worker(void)
+{
+  run_script("var mr=[], mw=new Worker('data:text/javascript,const base=5; onmessage=e=>postMessage(base+e.data);"
+             "self.postMessage(\"up\");', {type:'module'});\n"
+             "mw.onmessage=function(e){ mr.push(e.data); };\n"
+             "mw.postMessage(1);\n");
+  drain();
+  run_script("expect(mr.length===2 && mr[0]==='up' && mr[1]===6, 'module worker replies: '+mr.join());\n"
+             "expect(typeof base==='undefined', 'module top level stays out of window');\n");
+}
+
+static void test_worker_timers(void)
+{
+  run_script(
+      "var tw=new Worker('data:text/javascript,setInterval(function(){window.ticks=(window.ticks||0)+1},1);');\n");
+  fake_now_ms += 10;
+  js_timers_pump();
+  run_script("expect(ticks===1, 'worker interval fires: '+ticks); tw.terminate();\n");
+  fake_now_ms += 10;
+  js_timers_pump();
+  run_script("expect(ticks===1, 'terminate cancels the worker timers: '+ticks);\n");
 }
 
 static void test_errors(void)
@@ -131,6 +158,8 @@ int main(void)
   test("self.addEventListener and structured clone", test_self_listeners_and_clone);
   test("terminate and close", test_terminate_and_close);
   test("importScripts, location and name", test_import_scripts_and_location);
+  test("module workers", test_module_worker);
+  test("worker timers die with terminate", test_worker_timers);
   test("script and construction errors", test_errors);
 
   js_page_end();

@@ -4,6 +4,8 @@
 
 /* ------------------------------------------------------- timers ----------- */
 
+int g_timer_owner;
+
 /* Register a timer; returns its id (slot+1) */
 static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int delay, bool repeat, bool raf)
 {
@@ -22,6 +24,7 @@ static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int 
       nt[k].active = nt[k].repeat = nt[k].raf = false;
       nt[k].due = nt[k].period = 0;
       nt[k].async = 0;
+      nt[k].owner = 0;
     }
     g_tmeta = nt;
     g_tcap = nc;
@@ -41,6 +44,7 @@ static int timer_add(js_ctx *ctx, js_value cb, js_value *extra, int nextra, int 
   g_tmeta[i].period = delay < 0 ? 0 : delay;
   g_tmeta[i].due = now_ms() + g_tmeta[i].period;
   g_tmeta[i].async = js_async_capture(ctx); /* who armed this timer */
+  g_tmeta[i].owner = g_timer_owner;
   g_ntimers++;
   return i + 1;
 }
@@ -84,6 +88,14 @@ js_value win_clear_timer(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
+void timers_drop_owner(int owner)
+{
+  int i;
+  for (i = 0; i < g_tcap; i++)
+    if (g_tmeta[i].active && g_tmeta[i].owner == owner)
+      timer_drop(i);
+}
+
 /* Fire every timer whose deadline has passed */
 int js_timers_pump(void)
 {
@@ -115,6 +127,7 @@ int js_timers_pump(void)
     bool raf = g_tmeta[i].raf;
     char *async = g_tmeta[i].async; /* scheduling-site frames; realloc-safe local */
     bool oneshot = !g_tmeta[i].repeat;
+    int owner = g_tmeta[i].owner;
     if (g_tmeta[i].repeat)
       g_tmeta[i].due = now + g_tmeta[i].period; /* reschedule from now (no drift pileup) */
     else {
@@ -124,7 +137,9 @@ int js_timers_pump(void)
     if (js_is_callable(cb)) {
       char *prev = js_async_enter(g_ctx, async); /* callback throws → stack names the arm site */
       js_set_cur_script(raf ? "<requestAnimationFrame callback>" : "<timer callback>");
+      g_timer_owner = owner;
       js_call(g_ctx, cb, js_obj_value(g_ctx->global), argv, nargs);
+      g_timer_owner = 0;
       js_async_leave(g_ctx, prev);
       if (g_ctx->has_exc)
         report_exc(g_ctx);

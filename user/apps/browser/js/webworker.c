@@ -1,15 +1,21 @@
 /* Dedicated Workers. The worker script runs in the page's single JS context inside its own scope object bound
  * as `self`; postMessage in both directions goes through a queue drained by js_workers_pump. */
 
+#include "bindings.h"
 #include "features/cors/cors.h"
 #include "fetchint.h"
-#include "jsint.h"
 
 enum { WQ_TO_WORKER, WQ_TO_PAGE, WQ_ERROR };
 
 static js_object *g_worker_proto; /* Worker.prototype */
 static js_object *g_wscope_proto; /* DedicatedWorkerGlobalScope.prototype (`self`) */
 static js_object *g_wq;           /* flat queue of (worker, kind, data) triples */
+static int g_next_wid;
+
+/* Module workers run against a scope env holding their globals; kept rooted for the page's lifetime */
+#define WENV_MAX 32
+static js_env *g_wenvs[WENV_MAX];
+static int g_nwenvs;
 
 static js_value throw_err(js_ctx *ctx, const char *name, const char *msg)
 {
@@ -50,18 +56,28 @@ static void wq_push(js_value w, int kind, js_value data)
 /* `onmessage = fn` inside the worker script assigns a wrapper local; mirror it onto the scope */
 static void sync_onmessage(js_ctx *ctx, js_value scope)
 {
-  js_value get = js_get(ctx, scope, "__getom"), cur;
-  if (!js_is_callable(get))
-    return;
-  cur = js_call(ctx, get, js_undef(), 0, 0);
-  if (ctx->has_exc) {
-    report_exc(ctx);
-    return;
+  js_value get = js_get(ctx, scope, "__getom"), envi = js_get(ctx, scope, "@envi"), cur = js_undef();
+  if (envi.type == JV_NUM) {
+    pentry *pe = js_env_lookup(g_wenvs[(int)envi.u.num], "onmessage");
+    if (pe)
+      cur = pe->value;
+  } else if (js_is_callable(get)) {
+    cur = js_call(ctx, get, js_undef(), 0, 0);
+    if (ctx->has_exc) {
+      report_exc(ctx);
+      return;
+    }
   }
   if (js_is_callable(cur) && !js_strict_eq(cur, js_get(ctx, scope, "@lom"))) {
     js_set(ctx, scope, "onmessage", cur);
     js_set(ctx, scope, "@lom", cur);
   }
+}
+
+static int worker_id(js_ctx *ctx, js_value w)
+{
+  js_value id = w.type == JV_OBJ ? js_get(ctx, w, "@id") : js_undef();
+  return id.type == JV_NUM ? (int)id.u.num : 0;
 }
 
 static void wq_deliver(js_value w, int kind, js_value data)
@@ -90,7 +106,9 @@ static void wq_deliver(js_value w, int kind, js_value data)
     if (ev.type == JV_OBJ) {
       gc_keep(ev.u.obj);
       js_set(g_ctx, ev, "target", target);
+      g_timer_owner = kind == WQ_TO_WORKER ? worker_id(g_ctx, w) : 0;
       ev_fire_on(target.u.obj, ev, 0);
+      g_timer_owner = 0;
     }
   }
   gc_pop_scope();
@@ -128,8 +146,10 @@ static js_value worker_terminate(js_ctx *ctx, js_value t, js_value *args, int ar
 {
   (void)args;
   (void)argc;
-  if (t.type == JV_OBJ)
+  if (t.type == JV_OBJ) {
     js_set(ctx, t, "@dead", js_bool(1));
+    timers_drop_owner(worker_id(ctx, t));
+  }
   return js_undef();
 }
 
@@ -149,8 +169,10 @@ static js_value scope_close(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)args;
   (void)argc;
   w = t.type == JV_OBJ ? js_get(ctx, t, "@worker") : js_undef();
-  if (w.type == JV_OBJ)
+  if (w.type == JV_OBJ) {
     js_set(ctx, w, "@closed", js_bool(1));
+    timers_drop_owner(worker_id(ctx, w));
+  }
   return js_undef();
 }
 
@@ -190,8 +212,10 @@ static js_value scope_import_scripts(js_ctx *ctx, js_value t, js_value *args, in
 {
   js_value loc = t.type == JV_OBJ ? js_get(ctx, t, "location") : js_undef();
   js_value href = loc.type == JV_OBJ ? js_get(ctx, loc, "href") : js_undef();
+  js_value gself = js_get(ctx, js_obj_value(ctx->global), "self"), ret = js_undef();
   int i;
-  for (i = 0; i < argc; i++) {
+  js_set(ctx, js_obj_value(ctx->global), "self", t); /* imported code sees the worker as `self` */
+  for (i = 0; i < argc && !ctx->has_exc; i++) {
     char url[URL_MAX];
     char *code;
     js_arena *ar;
@@ -199,15 +223,19 @@ static js_value scope_import_scripts(js_ctx *ctx, js_value t, js_value *args, in
     js_parse_error pe;
     js_value r;
     script_url(href.type == JV_STR ? href.u.str->data : g_page_url_buf, arg_str(ctx, args[i]), url, sizeof url);
-    if (!starts_ci(url, "blob:") && !starts_ci(url, "data:") && !cors_same_origin(g_page_url_buf, url))
-      return throw_err(ctx, "SecurityError", "importScripts: cross-origin");
+    if (!starts_ci(url, "blob:") && !starts_ci(url, "data:") && !cors_same_origin(g_page_url_buf, url)) {
+      ret = throw_err(ctx, "SecurityError", "importScripts: cross-origin");
+      break;
+    }
     code = fetch_source(url);
-    if (!code)
-      return js_throw_type(ctx, "importScripts failed");
+    if (!code) {
+      ret = js_throw_type(ctx, "importScripts failed");
+      break;
+    }
     ar = (js_arena *)malloc(sizeof *ar);
     if (!ar) {
       free(code);
-      return js_undef();
+      break;
     }
     js_arena_init(ar);
     prog = js_parse(code, ar, &pe);
@@ -215,13 +243,14 @@ static js_value scope_import_scripts(js_ctx *ctx, js_value t, js_value *args, in
     if (!prog || !arenas_push(ar)) {
       js_arena_free(ar);
       free(ar);
-      return throw_err(ctx, "SyntaxError", "importScripts: parse error");
+      ret = throw_err(ctx, "SyntaxError", "importScripts: parse error");
+      break;
     }
     js_set_cur_script(url);
-    if (js_run(ctx, prog, &r) != 0)
-      return js_undef(); /* the pending exception propagates to the caller */
+    js_run(ctx, prog, &r); /* a pending exception propagates to the caller */
   }
-  return js_undef();
+  js_set(ctx, js_obj_value(ctx->global), "self", gself);
+  return ret;
 }
 
 static char *wrap_source(const char *src)
@@ -286,6 +315,62 @@ static bool run_in_scope(js_ctx *ctx, js_object *scope, const char *src, const c
   return ok;
 }
 
+static js_value bound(js_ctx *ctx, js_value scope, const char *name)
+{
+  js_value fn = js_get(ctx, scope, name), bind = js_get(ctx, fn, "bind");
+  return js_call(ctx, bind, fn, &scope, 1);
+}
+
+/* Run a module worker: its globals live in an env spliced under the module scope, so bare
+ * `postMessage` and `onmessage = f` reach this worker instead of the window. */
+static bool run_module_in_scope(js_ctx *ctx, js_object *scope, const char *src, const char *url)
+{
+  static const char *const fns[] = {"postMessage",         "close",        "importScripts", "addEventListener",
+                                    "removeEventListener", "dispatchEvent"};
+  js_arena *ar;
+  js_node *prog;
+  js_parse_error pe;
+  js_object *exports;
+  js_env *env, *saved;
+  js_value sv = js_obj_value(scope);
+  unsigned i;
+  bool ok;
+  if (g_nwenvs == WENV_MAX)
+    return false;
+  ar = (js_arena *)malloc(sizeof *ar);
+  if (!ar)
+    return false;
+  js_arena_init(ar);
+  prog = js_parse(src, ar, &pe);
+  if (!prog || !arenas_push(ar)) {
+    js_arena_free(ar);
+    free(ar);
+    return false;
+  }
+  gc_push_scope();
+  env = (js_env *)gc_keep(js_new_env(ctx, ctx->global_env, 1));
+  g_wenvs[g_nwenvs] = env;
+  js_set(ctx, sv, "@envi", js_number(g_nwenvs++));
+  js_env_define(env, "self", sv, P_WRITABLE);
+  js_env_define(env, "name", js_get(ctx, sv, "name"), P_WRITABLE);
+  js_env_define(env, "location", js_get(ctx, sv, "location"), P_WRITABLE);
+  js_env_define(env, "onmessage", js_null(), P_WRITABLE);
+  js_env_define(env, "onerror", js_null(), P_WRITABLE);
+  js_env_define(env, "onmessageerror", js_null(), P_WRITABLE);
+  for (i = 0; i < sizeof fns / sizeof *fns; i++)
+    js_env_define(env, fns[i], bound(ctx, sv, fns[i]), P_WRITABLE);
+  exports = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  saved = ctx->global_env;
+  ctx->global_env = env;
+  js_set_cur_script(url);
+  ok = js_run_module(ctx, prog, exports, url) == 0;
+  ctx->global_env = saved;
+  if (!ok)
+    report_exc(ctx);
+  gc_pop_scope();
+  return ok;
+}
+
 static void def_location(js_ctx *ctx, js_object *scope, const char *url)
 {
   js_object *loc = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
@@ -313,7 +398,9 @@ static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int arg
   char url[URL_MAX];
   char *src;
   js_object *w, *scope;
-  js_value opts = A(1), nm, wv;
+  js_value opts = A(1), nm, ty, wv;
+  bool module, ok;
+  int prev_owner;
   (void)thisv;
   script_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
   if (!starts_ci(url, "blob:") && !starts_ci(url, "data:") && !cors_same_origin(g_page_url_buf, url))
@@ -325,8 +412,11 @@ static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int arg
   js_def(w, "onmessageerror", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(w, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(w, "@dead", js_bool(0), P_WRITABLE);
+  js_def(w, "@id", js_number(++g_next_wid), 0);
   scope = (js_object *)gc_keep(js_new_object(ctx, g_wscope_proto));
   nm = opts.type == JV_OBJ ? js_get(ctx, opts, "name") : js_undef();
+  ty = opts.type == JV_OBJ ? js_get(ctx, opts, "type") : js_undef();
+  module = ty.type == JV_STR && streq(ty.u.str->data, "module");
   js_def(scope, "self", js_obj_value(scope), P_WRITABLE | P_ENUMERABLE);
   js_def(scope, "name", nm.type == JV_STR ? nm : js_mk_cstring(ctx, ""), P_ENUMERABLE);
   js_def(scope, "onmessage", js_null(), P_WRITABLE | P_ENUMERABLE);
@@ -338,7 +428,11 @@ static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int arg
   if (!src) {
     wq_push(wv, WQ_ERROR, js_mk_cstring(ctx, "Failed to load worker script"));
   } else {
-    if (!run_in_scope(ctx, scope, src, url))
+    prev_owner = g_timer_owner;
+    g_timer_owner = g_next_wid;
+    ok = module ? run_module_in_scope(ctx, scope, src, url) : run_in_scope(ctx, scope, src, url);
+    g_timer_owner = prev_owner;
+    if (!ok)
       wq_push(wv, WQ_ERROR, js_mk_cstring(ctx, "Uncaught error in worker script"));
     free(src);
   }
@@ -355,6 +449,8 @@ void js_worker_setup(js_ctx *ctx, js_object *win)
   gc_add_root((void **)&g_worker_proto);
   gc_add_root((void **)&g_wscope_proto);
   gc_add_root((void **)&g_wq);
+  g_nwenvs = 0;
+  gc_add_root_range((void **)g_wenvs, &g_nwenvs);
   def_method(g_worker_proto, "postMessage", worker_post, 1);
   def_method(g_worker_proto, "terminate", worker_terminate, 0);
   def_method(g_worker_proto, "addEventListener", el_add_listener, 3);
@@ -380,5 +476,7 @@ void js_worker_teardown(void)
   gc_remove_root((void **)&g_worker_proto);
   gc_remove_root((void **)&g_wscope_proto);
   gc_remove_root((void **)&g_wq);
+  gc_remove_root_range((void **)g_wenvs);
+  g_nwenvs = 0;
   g_worker_proto = g_wscope_proto = g_wq = 0;
 }
