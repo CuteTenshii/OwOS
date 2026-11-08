@@ -5,6 +5,7 @@
 #include "desktop_fs.h"
 #include "test.h"
 #include <dirent.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -305,7 +306,7 @@ static void check_visible(void)
   expect(!visible(ENTRY("Name=N\nExec=x\nNotShowIn=OwOS;\n")));
   expect(visible(ENTRY("Name=N\nExec=x\nNotShowIn=GNOME;\n")));
   expect(!visible(ENTRY("Name=N\nExec=x\nOnlyShowIn=owos;\n")));
-  char self[1024], body[1200];
+  char self[PATH_MAX], body[PATH_MAX + 128];
   expect(realpath(__FILE__, self) != NULL);
   snprintf(body, sizeof body, ENTRY("Name=N\nExec=x\nTryExec=%s\n"), self);
   expect(visible(body));

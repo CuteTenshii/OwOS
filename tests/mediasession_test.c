@@ -116,18 +116,20 @@ static js_value native_queue(js_ctx *c, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
+static js_arena arenas[32];
+static int narenas;
+
 static void run(const char *source)
 {
-  js_arena arena;
+  js_arena *arena = &arenas[narenas++];
   js_parse_error error = {0, 0};
   js_node *program;
   js_value result;
-  js_arena_init(&arena);
-  program = js_parse(source, &arena, &error);
+  js_arena_init(arena);
+  program = js_parse(source, arena, &error);
   expect(program != 0);
   if (program)
     expect(js_run(g_ctx, program, &result) == 0);
-  js_arena_free(&arena);
 }
 
 static void tick_n(int n)
