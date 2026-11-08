@@ -36,6 +36,7 @@
 #include "timer.h"
 #include "usb.h"
 #include "users.h"
+#include "vdagent.h"
 #include "vmware.h"
 #include "wallclock.h"
 #include "xhci.h"
@@ -295,13 +296,15 @@ int procfs_read(const char *sub, char *buf, int max)
   if (sub[0] == '/')
     sub++;
 
-  /* /proc/hostclip — the VMware host clipboard as a device channel (not a
+  /* /proc/hostclip — the VMware or QEMU host clipboard as a device channel (not a
    * listed file). A read returns the newest host selection text, 0 bytes when
-   * nothing is new, or -1 off VMware so /bin/vmclipd knows to bow out. The
+   * nothing is new, or -1 off VMware/QEMU so /bin/vmclipd knows to bow out. The
    * backdoor GET is stateful (a success consumes the host's "new selection"
    * flag), so it is meant to be polled by vmclipd alone — hence unlisted, to
    * keep `ls /proc` off it. */
   if (streq(sub, "hostclip")) {
+    if (vdagent_present())
+      return vdagent_clip_recv(buf, max);
     if (!vmware_present())
       return -1;
     int n = vmware_clip_recv(buf, max);
@@ -353,7 +356,7 @@ int procfs_write(const char *sub, const char *buf, int len)
    * the raw payload (a clip is arbitrary text, may exceed the trimmed arg[]).
    */
   if (streq(sub, "hostclip"))
-    return vmware_clip_send(buf, len) < 0 ? -1 : len;
+    return (vdagent_present() ? vdagent_clip_send(buf, len) : vmware_clip_send(buf, len)) < 0 ? -1 : len;
 
   /* Trim a trailing newline and bound the payload into a NUL-terminated copy.
    */

@@ -118,6 +118,12 @@ STORAGE := -hda $(DISK) \
 	-device sd-card,drive=sddisk \
 	-cdrom $(CDISK)
 
+# Host<->guest clipboard: QEMU's built-in vdagent chardev over virtio-serial (no spice needed). The
+# host UI must support clipboard sharing (GTK, Cocoa, VNC); the guest side is drivers/bus/vdagent.c.
+VDAGENT := -chardev qemu-vdagent,id=vdagent,clipboard=on \
+	-device virtio-serial-pci,disable-legacy=on \
+	-device virtserialport,chardev=vdagent,name=com.redhat.spice.0,nr=1
+
 # USB_HID=1 also attaches a USB keyboard, mouse and tablet to the xHCI bus, so the USB HID driver gets exercised
 # (`make run USB_HID=1`); off by default so the PS/2 input path stays the only one.
 ifeq ($(USB_HID),1)
@@ -142,14 +148,16 @@ run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 		-audiodev $(QEMU_AUDIODEV),id=snd0 -machine pcspk-audiodev=snd0,accel=$(ACCEL) \
 		-device sb16,audiodev=snd0 \
 		-device intel-hda -device hda-output,audiodev=snd0 \
-		-usb -device usb-tablet
+		-usb -device usb-tablet \
+		$(VDAGENT)
 
 # Headless: no window, console comes out on the terminal via COM1.
 debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 -display none $(STORAGE) -serial stdio \
 		-machine accel=$(ACCEL) \
 		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22 -device $(NIC),netdev=net0 \
-		-usb -device usb-tablet
+		-usb -device usb-tablet \
+		$(VDAGENT)
 
 # --- bootable ISO ----------------------------------------------------------
 # QEMU's -kernel is its own Multiboot loader; real VMs (VMware, VirtualBox,

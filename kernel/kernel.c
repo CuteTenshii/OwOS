@@ -44,6 +44,7 @@
 #include "timer.h"
 #include "users.h"
 #include "uwin.h"
+#include "vdagent.h"
 #include "virtiogpu.h"
 #include "vmsvga.h"
 #include "vmtools.h"
@@ -330,6 +331,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
 
   pci_init();
   con_printf("pci: %u devices found.\n", (uint32_t)pci_count());
+
+  vdagent_init(); /* no-op without virtio-serial */
 
   smp_init();
 
