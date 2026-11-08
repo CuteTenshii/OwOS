@@ -361,6 +361,32 @@ static uint32_t pack_now(void)
          (((uint32_t)t.hour & 0x1F) << 12) | (((uint32_t)t.min & 0x3F) << 6) | ((uint32_t)t.sec & 0x3F);
 }
 
+/* Unix seconds (proleptic Gregorian, UTC) to the packed form above. */
+static uint32_t pack_unix(uint32_t t)
+{
+  uint32_t secs = t % 86400u;
+  uint32_t z = t / 86400u + 719468u;
+  uint32_t era = z / 146097u, doe = z - era * 146097u;
+  uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+  uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+  uint32_t mp = (5u * doy + 2u) / 153u;
+  uint32_t day = doy - (153u * mp + 2u) / 5u + 1u;
+  uint32_t mon = mp < 10u ? mp + 3u : mp - 9u;
+  uint32_t year = yoe + era * 400u + (mon <= 2u ? 1u : 0u);
+  uint32_t y = year >= 2000u ? year - 2000u : 0u;
+  return ((y & 0x3F) << 26) | ((mon & 0xF) << 22) | ((day & 0x1F) << 17) | (((secs / 3600u) & 0x1F) << 12) |
+         (((secs / 60u % 60u) & 0x3F) << 6) | ((secs % 60u) & 0x3F);
+}
+
+/* Packed mtime of a path on a mounted volume, 0 when the driver has none. */
+static uint32_t mnt_mtime(struct mnt *m, const char *path)
+{
+  uint32_t t = 0;
+  if (!m->ops->mtime || m->ops->mtime(m->inst, path, &t) != 0 || t == 0)
+    return 0;
+  return pack_unix(t);
+}
+
 static bool s_eq(const char *a, const char *b)
 {
   int i = 0;
@@ -1715,9 +1741,7 @@ int fs_stat_ex(const char *path, struct fs_stat_info *st)
       return -1;
     st->is_dir = d;
     st->size = sz;
-    st->mtime = 0;
-    if (mv->ops->mtime)
-      mv->ops->mtime(mv->inst, sub, &st->mtime);
+    st->mtime = mnt_mtime(mv, sub);
     mnt_attr(mv, sub, d, &st->mode, &st->uid, &st->gid);
     return 0;
   }
@@ -1893,8 +1917,14 @@ int fs_enum_dir(const char *path, int idx, char *name, int *is_dir, uint32_t *si
       *is_dir = d;
     if (size)
       *size = sz;
-    if (mtime)
-      *mtime = 0;
+    if (mtime) {
+      char child[256];
+      uint32_t n = strlcpy(child, sub, sizeof child);
+      if (n > 0 && child[n - 1] != '/' && n < sizeof child - 1)
+        child[n++] = '/';
+      strlcpy(child + n, name, sizeof child - n);
+      *mtime = mnt_mtime(mv, child);
+    }
     return 1;
   }
   if (idx < 0)
