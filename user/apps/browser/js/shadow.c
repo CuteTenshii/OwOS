@@ -3,6 +3,7 @@
 #include "bindings.h"
 
 js_object *g_shadowroot_proto;
+js_object *g_fragment_proto;
 
 static struct dom_node *element_of(js_value t)
 {
@@ -507,6 +508,14 @@ static js_value sr_illegal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int
   return js_throw_type(ctx, "Illegal constructor");
 }
 
+static js_value frag_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  (void)thisv;
+  (void)args;
+  (void)argc;
+  return wrap_node(dom_new_element("#frag"));
+}
+
 static js_object *shadow_slot_proto(void)
 {
   for (unsigned i = 0; i < g_nhtml_ifaces; i++)
@@ -525,7 +534,17 @@ void shadow_install(js_ctx *ctx, js_object *win)
   def_acc(g_element_proto, "slot", el_get_slot_attr, el_set_slot_attr);
   def_acc(g_element_proto, "assignedSlot", el_assigned_slot, 0);
 
-  g_shadowroot_proto = js_new_object(ctx, g_html_proto);
+  g_fragment_proto = js_new_object(ctx, g_html_proto);
+  gc_add_root((void **)&g_fragment_proto);
+  sc = js_new_native(ctx, frag_ctor, "DocumentFragment", 0);
+  gc_push_scope();
+  gc_keep(sc);
+  js_def(sc, "prototype", js_obj_value(g_fragment_proto), 0);
+  js_def(g_fragment_proto, "constructor", js_obj_value(sc), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "DocumentFragment", js_obj_value(sc), P_WRITABLE | P_CONFIGURABLE);
+  gc_pop_scope();
+
+  g_shadowroot_proto = js_new_object(ctx, g_fragment_proto);
   gc_add_root((void **)&g_shadowroot_proto);
   def_acc(g_shadowroot_proto, "host", sr_host, 0);
   def_acc(g_shadowroot_proto, "mode", sr_mode, 0);

@@ -213,6 +213,8 @@ js_value wrap_node(struct dom_node *n)
   proto = g_html_proto ? g_html_proto : g_element_proto;
   if (n->host && g_shadowroot_proto)
     proto = g_shadowroot_proto;
+  else if (node_is_frag(n) && g_fragment_proto)
+    proto = g_fragment_proto;
   else if (n->type == DOM_ELEMENT) {
     js_object *ip = iface_proto_for_tag(n->tag); /* HTMLScriptElement etc. */
     if (ip)

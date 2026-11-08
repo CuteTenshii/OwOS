@@ -237,6 +237,7 @@ void shadow_node_inserted(struct dom_node *c);
 void shadow_node_removing(struct dom_node *c);
 char *document_adopted_css(void);
 extern js_object *g_shadowroot_proto;
+extern js_object *g_fragment_proto;
 struct dom_node *js_dom_find_id(struct dom_node *root, const char *id);
 void namespace_install(void);
 int decode_entity(const char *p, const char *end, int *adv); /* html_entities.c */

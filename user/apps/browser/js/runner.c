@@ -667,6 +667,7 @@ void js_page_end(void)
   gc_remove_root((void **)&g_module_src);
   gc_remove_root((void **)&g_importmap);
   gc_remove_root((void **)&g_shadowroot_proto);
+  gc_remove_root((void **)&g_fragment_proto);
   gc_remove_root((void **)&g_document_proto);
   gc_remove_root((void **)&g_response_proto);
   gc_remove_root((void **)&g_ws_proto);
@@ -716,7 +717,7 @@ void js_page_end(void)
   g_module_cache = g_document_proto = g_response_proto = 0;
   g_module_src = 0;
   g_importmap = 0;
-  g_shadowroot_proto = 0;
+  g_shadowroot_proto = g_fragment_proto = 0;
   g_ws_proto = g_websockets = 0;
   g_bchannel_proto = g_bchannels = 0;
   g_xhr_proto = 0;
