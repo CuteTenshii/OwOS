@@ -36,7 +36,7 @@ COMMON_SRCS := $(BROWSER)/css/engine.c $(BROWSER)/css/engine_values.c $(BROWSER)
 MAIN_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/zlib/crc32.c kernel/crc32c.c $(LIB)/stun/stun.c $(LIB)/ntp/ntp.c \
   $(LIB)/mediactl/session.c $(LIB)/mp4/mp4.c $(wildcard $(LIB)/rar/*.c) $(LIB)/brotli/decode.c \
   drivers/usb/hid_desc.c $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c
-BIND_SRCS := $(COMMON_SRCS) $(BROWSER)/js/dom_query.c
+BIND_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c
 
 MAIN_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^\#define OWOS_SUITE_TEST$$' tests/*_test.c)))
 BIND_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^\#define OWOS_SUITE_BINDINGS$$' tests/*_test.c)))
@@ -50,7 +50,8 @@ EXTRA_btrfs       := $(HOST_DEFS)
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
 IMPLS := $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o
-BIND_IMPLS := $(B)/bind/impl/bindings.o $(B)/bind/impl/jar.o $(B)/bind/impl/clienthints.o \
+BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob xhr realtime timers webcomponents dialog forms url fetchapi navigation elementapi documentapi
+BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/clienthints.o \
               $(B)/bind/impl/permissions.o $(B)/bind/impl/host.o $(B)/impl/test_runner.o
 
 MAIN_OBJS := $(MAIN_SUITES:%=$(B)/suite/%.o) $(IMPLS) $(MAIN_SRCS:%.c=$(B)/obj/%.o)
@@ -100,7 +101,7 @@ $(B)/impl/brotli_dict.o: $(B)/impl/brotli_dict.c
 	$(call COMPILE,)
 
 # Suites that link the real browser bindings get their own binary
-$(B)/bind/impl/bindings.o: $(BROWSER)/js/bindings.c
+$(BINDINGS_PARTS:%=$(B)/bind/impl/%.o): $(B)/bind/impl/%.o: $(BROWSER)/js/%.c
 	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
 $(B)/bind/impl/jar.o: $(BROWSER)/features/jar/jar.c
 	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
