@@ -1,5 +1,17 @@
 #include "html_int.h"
 
+/* Unicode for a byte in 0x80-0xFF read as windows-1252 */
+int cp1252_high(unsigned char b)
+{
+  if (b >= 0xA0)
+    return b; /* Latin-1 == Unicode */
+  static const unsigned short m[32] = {0x20AC, 0x81,   0x201A, 0x192,  0x201E, 0x2026, 0x2020, 0x2021,
+                                       0x02C6, 0x2030, 0x160,  0x2039, 0x152,  0x8D,   0x17D,  0x8F,
+                                       0x90,   0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+                                       0x02DC, 0x2122, 0x161,  0x203A, 0x153,  0x9D,   0x17E,  0x178};
+  return m[b - 0x80];
+}
+
 /* decode_entity returns a real Unicode codepoint now (the renderer is UTF-8), or the sentinels */
 int decode_entity(const char *p, const char *end, int *adv)
 {

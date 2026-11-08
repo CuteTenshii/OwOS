@@ -37,7 +37,7 @@ MAIN_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/gf
   $(LIB)/font/font.c $(LIB)/font/woff.c $(LIB)/mediactl/session.c $(LIB)/mp4/mp4.c $(wildcard $(LIB)/rar/*.c) $(LIB)/brotli/decode.c \
   drivers/usb/hid_desc.c $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c
-BIND_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
+BIND_SRCS := $(COMMON_SRCS) $(BROWSER)/html_entities.c $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
   $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c $(LIB)/zlib/crc32.c $(LIB)/zlib/inflate.c $(LIB)/zlib/deflate.c
 
 MAIN_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^\#define OWOS_SUITE_TEST$$' tests/*_test.c)))

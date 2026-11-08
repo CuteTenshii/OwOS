@@ -34,11 +34,9 @@ static struct dom_node *mk(enum dom_type t, const char *s)
 {
   struct dom_node *n = calloc(1, sizeof *n);
   n->type = t;
-  if (t == DOM_ELEMENT) {
-    strncpy(n->tag, s, sizeof n->tag - 1);
-  } else {
+  n->tag = strdup(t == DOM_ELEMENT ? s : "");
+  if (t != DOM_ELEMENT)
     n->text = strdup(s);
-  }
   g_nodes[g_nn++] = n;
   return n;
 }

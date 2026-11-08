@@ -293,10 +293,10 @@ void serialize_node(struct dom_node *c, sbuf *sb, int depth)
   if (!frag) {
     struct dom_attr *a;
     sb_putc(sb, '<');
-    sb_puts(sb, c->tag);
+    sb_puts(sb, dom_qname(c));
     for (a = c->attrs; a; a = a->next) {
       sb_putc(sb, ' ');
-      sb_puts(sb, a->name);
+      sb_puts(sb, dom_attr_qname(c, a));
       sb_puts(sb, "=\"");
       sb_puts(sb, a->value ? a->value : "");
       sb_putc(sb, '"');
@@ -310,7 +310,7 @@ void serialize_node(struct dom_node *c, sbuf *sb, int depth)
       serialize_node(k, sb, depth + 1);
   if (!frag) {
     sb_puts(sb, "</");
-    sb_puts(sb, c->tag);
+    sb_puts(sb, dom_qname(c));
     sb_putc(sb, '>');
   }
 }
@@ -372,17 +372,25 @@ static void set_inner_html(struct dom_node *el, const char *html)
 static js_value el_tagName(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  char up[16];
-  int i = 0, html;
+  const char *name;
+  js_value r;
   (void)args;
   (void)argc;
   if (!n)
     return js_undef();
-  html = n->tag[0] == '#' || !strcmp(dom_ns(n), DOM_NS_HTML);
-  for (; n->tag[i] && i < 15; i++)
-    up[i] = html && n->tag[i] >= 'a' && n->tag[i] <= 'z' ? (char)(n->tag[i] - 32) : n->tag[i];
-  up[i] = '\0';
-  return js_mk_cstring(ctx, up);
+  name = dom_qname(n);
+  if (n->tag[0] != '#' && !strcmp(dom_ns(n), DOM_NS_HTML)) {
+    char *up = strdup(name);
+    if (!up)
+      return js_undef();
+    for (char *c = up; *c; c++)
+      if (*c >= 'a' && *c <= 'z')
+        *c = (char)(*c - 32);
+    r = js_mk_cstring(ctx, up);
+    free(up);
+    return r;
+  }
+  return js_mk_cstring(ctx, name);
 }
 static js_value el_nodeName(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1456,15 +1464,24 @@ static js_value domparser_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
   return js_obj_value(o);
 }
 
-/* text and attribute values are stored undecoded: keep valid references, escape the rest */
+/* Text and attribute values are stored undecoded. XML only knows five named entities, so other
+ * references become numeric ones and a bare & is escaped. */
 static void xml_escape(sbuf *sb, const char *s, bool attr)
 {
+  const char *end = s + strlen(s);
   for (; *s; s++) {
     if (*s == '&') {
-      const char *e = s + 1;
-      while ((*e >= '0' && *e <= '9') || (*e >= 'a' && *e <= 'z') || (*e >= 'A' && *e <= 'Z') || *e == '#')
-        e++;
-      sb_puts(sb, *e == ';' && e > s + 1 ? "&" : "&amp;");
+      int adv, c = decode_entity(s, end, &adv);
+      if (adv == 1)
+        sb_puts(sb, "&amp;");
+      else if (s[1] == '#' || c == '&' || c == '<' || c == '>' || c == '"' || c == '\'')
+        sb_putn(sb, s, adv);
+      else if (c != -2) {
+        char ref[16];
+        snprintf(ref, sizeof ref, "&#%d;", c == -1 ? 160 : c);
+        sb_puts(sb, ref);
+      }
+      s += adv - 1;
     } else if (*s == '<')
       sb_puts(sb, "&lt;");
     else if (*s == '>' && !attr)
@@ -1511,14 +1528,14 @@ static void xml_node(struct dom_node *e, sbuf *sb, int depth)
   pl = dom_prefix_len(e->tag);
   html = !strcmp(ns, DOM_NS_HTML);
   sb_putc(sb, '<');
-  sb_puts(sb, e->tag);
+  sb_puts(sb, dom_qname(e));
   if (*ns && strcmp(dom_scope_ns(e->parent, e->tag, pl), ns)) {
     bool own = false;
     for (a = e->attrs; a; a = a->next)
       own |= pl ? !memcmp(a->name, "xmlns:", 6) && (int)strlen(a->name + 6) == pl && !memcmp(a->name + 6, e->tag, pl)
                 : !strcmp(a->name, "xmlns");
     if (!own)
-      xml_decl(sb, e->tag, pl, ns);
+      xml_decl(sb, dom_qname(e), pl, ns);
   }
   for (a = e->attrs; a; a = a->next) {
     int apl = dom_prefix_len(a->name);
@@ -1530,13 +1547,13 @@ static void xml_node(struct dom_node *e, sbuf *sb, int depth)
         seen |= !memcmp(declared[i], a->name, apl) && declared[i][apl] == ':';
       if (!seen) {
         declared[nd++] = a->name; /* compared up to the colon */
-        xml_decl(sb, a->name, apl, ans);
+        xml_decl(sb, dom_attr_qname(e, a), apl, ans);
       }
     }
   }
   for (a = e->attrs; a; a = a->next) {
     sb_putc(sb, ' ');
-    sb_puts(sb, a->name);
+    sb_puts(sb, dom_attr_qname(e, a));
     sb_puts(sb, "=\"");
     xml_escape(sb, a->value ? a->value : "", true);
     sb_putc(sb, '"');
@@ -1548,7 +1565,7 @@ static void xml_node(struct dom_node *e, sbuf *sb, int depth)
       sb_puts(sb, " />");
     else {
       sb_puts(sb, "></");
-      sb_puts(sb, e->tag);
+      sb_puts(sb, dom_qname(e));
       sb_putc(sb, '>');
     }
     return;
@@ -1558,7 +1575,7 @@ static void xml_node(struct dom_node *e, sbuf *sb, int depth)
     for (k = e->first_child; k; k = k->next)
       xml_node(k, sb, depth + 1);
   sb_puts(sb, "</");
-  sb_puts(sb, e->tag);
+  sb_puts(sb, dom_qname(e));
   sb_putc(sb, '>');
 }
 static js_value xmlser_serialize(js_ctx *ctx, js_value t, js_value *args, int argc)

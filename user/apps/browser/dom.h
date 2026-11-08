@@ -10,15 +10,17 @@ enum dom_type { DOM_ELEMENT, DOM_TEXT };
 struct dom_attr {
   char *name;  /* lowercased                           */
   char *value; /* raw (entities not decoded), "" if none */
+  char *qname; /* original-case name when it differs from name, else NULL */
   char *ns;    /* explicit namespace URI ("" = none), NULL = derived from the prefix */
   struct dom_attr *next;
 };
 
 struct dom_node {
   enum dom_type type;
-  char tag[16]; /* lowercased tag name (element)        */
-  char *text;   /* character data (text node)           */
-  char *ns;     /* explicit namespace URI ("" = none), NULL = derived; see dom_ns() */
+  char *tag;   /* lowercased tag name (element), "" for text   */
+  char *qname; /* original-case name when it differs from tag, else NULL */
+  char *text;  /* character data (text node)           */
+  char *ns;    /* explicit namespace URI ("" = none), NULL = derived; see dom_ns() */
   struct dom_attr *attrs;
   struct dom_attr *last_attr; /* tail of attrs, for O(1) append       */
   struct dom_attr *attr_cache[8];
@@ -59,6 +61,8 @@ const char *dom_get_attr(const struct dom_node *node, const char *name);
 #define DOM_NS_XML "http://www.w3.org/XML/1998/namespace"
 #define DOM_NS_XMLNS "http://www.w3.org/2000/xmlns/"
 #define DOM_NS_XLINK "http://www.w3.org/1999/xlink"
+const char *dom_qname(const struct dom_node *el); /* name to show: tag for HTML, original case otherwise */
+const char *dom_attr_qname(const struct dom_node *el, const struct dom_attr *a);
 const char *dom_ns(const struct dom_node *el);
 const char *dom_attr_ns(const struct dom_attr *a);
 const char *dom_local_name(const char *qname); /* part after the prefix */

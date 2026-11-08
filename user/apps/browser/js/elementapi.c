@@ -443,7 +443,7 @@ js_value el_attr_names(js_ctx *ctx, js_value t, js_value *args, int argc)
   gc_push_scope();
   arr = (js_object *)gc_keep(js_new_array(ctx, 0));
   for (a = n ? n->attrs : 0; a; a = a->next)
-    js_array_push(ctx, arr, js_mk_cstring(ctx, a->name));
+    js_array_push(ctx, arr, js_mk_cstring(ctx, dom_attr_qname(n, a)));
   gc_pop_scope();
   return js_obj_value(arr);
 }
@@ -458,12 +458,13 @@ js_value el_attributes(js_ctx *ctx, js_value t, js_value *args, int argc)
   arr = (js_object *)gc_keep(js_new_array(ctx, 0));
   for (a = n ? n->attrs : 0; a; a = a->next) {
     js_object *o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-    js_def(o, "name", js_mk_cstring(ctx, a->name), P_ENUMERABLE);
+    js_def(o, "name", js_mk_cstring(ctx, dom_attr_qname(n, a)), P_ENUMERABLE);
     js_def(o, "value", js_mk_cstring(ctx, a->value ? a->value : ""), P_ENUMERABLE | P_WRITABLE);
     js_def(o, "namespaceURI", dom_attr_ns(a)[0] ? js_mk_cstring(ctx, dom_attr_ns(a)) : js_null(), P_ENUMERABLE);
-    js_def(o, "prefix", dom_prefix_len(a->name) ? js_mk_string(ctx, a->name, dom_prefix_len(a->name)) : js_null(),
+    js_def(o, "prefix",
+           dom_prefix_len(a->name) ? js_mk_string(ctx, dom_attr_qname(n, a), dom_prefix_len(a->name)) : js_null(),
            P_ENUMERABLE);
-    js_def(o, "localName", js_mk_cstring(ctx, dom_local_name(a->name)), P_ENUMERABLE);
+    js_def(o, "localName", js_mk_cstring(ctx, dom_local_name(dom_attr_qname(n, a))), P_ENUMERABLE);
     js_array_push(ctx, arr, js_obj_value(o));
   }
   gc_pop_scope();

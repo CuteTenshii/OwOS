@@ -75,10 +75,13 @@ struct parser {
   bool oom;
 };
 
+static const char empty_tag[] = "";
+
 static void node_init(struct dom_node *n, enum dom_type type)
 {
   n->type = type;
-  n->tag[0] = '\0';
+  n->tag = (char *)empty_tag;
+  n->qname = 0;
   n->text = 0;
   n->ns = 0;
   n->attrs = 0;
@@ -135,6 +138,7 @@ static bool attr_append(struct dom_node *el, char *name, char *value)
   a->name = name;
   a->value = value;
   a->ns = 0;
+  a->qname = 0;
   a->next = 0;
   if (el->last_attr)
     el->last_attr->next = a;
@@ -297,21 +301,23 @@ static void handle_tag(struct parser *ps)
     return;
   }
 
-  char name[16];
-  int nl = 0;
-  while (q < end && is_name_char(*q)) {
-    if (nl < 15)
-      name[nl++] = lower(*q);
+  const char *name_start = q;
+  while (q < end && is_name_char(*q))
     q++;
-  }
-  name[nl] = '\0';
+  int nl = (int)(q - name_start);
 
   if (closing) {
     while (q < end && *q != '>')
       q++;
     ps->p = (q < end) ? q + 1 : end;
-    const char *t[2] = {name, 0};
+    char *lname = dupn_lower(name_start, nl);
+    const char *t[2] = {lname, 0};
+    if (!lname) {
+      ps->oom = true;
+      return;
+    }
     close_to(ps, t, 0);
+    free(lname);
     return;
   }
 
@@ -322,11 +328,10 @@ static void handle_tag(struct parser *ps)
     ps->p = (q < end) ? q + 1 : end;
     return;
   }
-  {
-    int i = 0;
-    for (; name[i]; i++)
-      el->tag[i] = name[i];
-    el->tag[i] = '\0';
+  if (!set_tag(el, name_start, nl)) {
+    ps->oom = true;
+    free(el);
+    return;
   }
 
   bool self_close = false;
@@ -373,9 +378,10 @@ static void handle_tag(struct parser *ps)
       aval = dupn("", 0);
     }
 
-    if (aname && aval)
-      attr_append(el, aname, aval);
-    else {
+    if (aname && aval) {
+      if (attr_append(el, aname, aval) && memcmp(aname, ns, (unsigned)anl))
+        el->last_attr->qname = dupn(ns, anl);
+    } else {
       if (aname)
         free(aname);
       if (aval)
@@ -449,12 +455,9 @@ struct dom_node *dom_parse(const char *html, int len)
   if (!ps.root)
     return 0;
   node_init(ps.root, DOM_ELEMENT);
-  {
-    const char *r = "#document";
-    int i = 0;
-    for (; r[i] && i < 15; i++)
-      ps.root->tag[i] = r[i];
-    ps.root->tag[i] = '\0';
+  if (!set_tag(ps.root, "#document", 9)) {
+    free(ps.root);
+    return 0;
   }
   ps.cur = ps.root;
 
@@ -519,10 +522,14 @@ static void node_free_one(struct dom_node *n)
     free(a->name);
     free(a->value);
     ns_free(a->ns);
+    free(a->qname);
     free(a);
     a = nx;
   }
   ns_free(n->ns);
+  if (n->tag != empty_tag)
+    free(n->tag);
+  free(n->qname);
   if (n->text)
     free(n->text);
   free(n);
@@ -620,11 +627,9 @@ struct dom_node *dom_new_element(const char *tag)
   if (!n)
     return 0;
   node_init(n, DOM_ELEMENT);
-  {
-    int i = 0;
-    for (; tag && tag[i] && i < 15; i++)
-      n->tag[i] = lower(tag[i]);
-    n->tag[i] = '\0';
+  if (!set_tag(n, tag ? tag : "", tag ? (int)strlen(tag) : 0)) {
+    free(n);
+    return 0;
   }
   return n;
 }
@@ -677,7 +682,14 @@ static struct dom_node *clone_one(const struct dom_node *src)
   if (!n)
     return 0;
   node_init(n, src->type);
-  memcpy(n->tag, src->tag, sizeof n->tag);
+  if (src->tag != empty_tag && !set_tag(n, src->tag, (int)strlen(src->tag))) {
+    free(n);
+    return 0;
+  }
+  if (src->qname && !(n->qname = dupn(src->qname, (int)strlen(src->qname)))) {
+    dom_free(n);
+    return 0;
+  }
   n->ns = src->ns == xml_doc_mark ? 0 : ns_dup(src->ns);
   if (src->text && !(n->text = dupn(src->text, (int)strlen(src->text)))) {
     free(n);
@@ -697,6 +709,8 @@ static struct dom_node *clone_one(const struct dom_node *src)
       return 0;
     }
     n->last_attr->ns = ns_dup(a->ns);
+    if (a->qname)
+      n->last_attr->qname = dupn(a->qname, (int)strlen(a->qname));
     n->attr_seq++;
   }
   return n;
@@ -797,8 +811,11 @@ void dom_set_attr(struct dom_node *el, const char *name, const char *value)
     char *nn = dupn_lower(name, (int)strlen(name));
     char *nv = dupn(value ? value : "", value ? (int)strlen(value) : 0);
     if (nn && nv) {
-      if (attr_append(el, nn, nv))
+      if (attr_append(el, nn, nv)) {
+        if (memcmp(nn, name, strlen(name)) && strcmp(dom_ns(el), DOM_NS_HTML))
+          el->last_attr->qname = dupn(name, (int)strlen(name));
         el->attr_seq++;
+      }
     } else {
       if (nn)
         free(nn);
@@ -857,6 +874,15 @@ void dom_clear_children(struct dom_node *el)
 }
 
 /* ------------------------------------------------------- namespaces ------- */
+
+const char *dom_qname(const struct dom_node *n)
+{
+  return n->qname && strcmp(dom_ns(n), DOM_NS_HTML) ? n->qname : n->tag;
+}
+const char *dom_attr_qname(const struct dom_node *el, const struct dom_attr *a)
+{
+  return a->qname && strcmp(dom_ns(el), DOM_NS_HTML) ? a->qname : a->name;
+}
 
 int dom_prefix_len(const char *q)
 {
@@ -924,8 +950,8 @@ const char *dom_ns(const struct dom_node *n)
         return u;
     }
     p = p->parent;
-    if (!p || p->tag[0] == '#' || !strcmp(p->tag, "foreignobject"))
-      return DOM_NS_HTML;
+    if (!p || p->tag[0] == '#' || (!xml && !strcmp(p->tag, "foreignobject")))
+      return xml ? "" : DOM_NS_HTML;
   }
 }
 
@@ -984,6 +1010,8 @@ void dom_set_attr_ns(struct dom_node *el, const char *ns, const char *qname, con
     dom_set_attr(el, qname, value);
     for (a = el->attrs; a && !streq_ci(a->name, qname); a = a->next)
       ;
+    if (a && !a->qname && memcmp(a->name, qname, strlen(qname)))
+      a->qname = dupn(qname, (int)strlen(qname));
   } else {
     dom_set_attr(el, a->name, value);
   }

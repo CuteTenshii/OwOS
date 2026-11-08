@@ -23,14 +23,14 @@ js_value el_prefix(js_ctx *ctx, js_value t, js_value *args, int argc)
   int pl = is_el(n) ? dom_prefix_len(n->tag) : 0;
   (void)args;
   (void)argc;
-  return pl ? js_mk_string(ctx, n->tag, pl) : js_null();
+  return pl ? js_mk_string(ctx, dom_qname(n), pl) : js_null();
 }
 js_value el_local_name(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
   (void)args;
   (void)argc;
-  return is_el(n) ? js_mk_cstring(ctx, dom_local_name(n->tag)) : js_null();
+  return is_el(n) ? js_mk_cstring(ctx, dom_local_name(dom_qname(n))) : js_null();
 }
 
 static js_value ns_error(js_ctx *ctx, const char *msg)
@@ -207,10 +207,10 @@ js_value node_lookup_prefix(js_ctx *ctx, js_value t, js_value *args, int argc)
   for (const struct dom_node *e = lookup_start(t); is_el(e); e = e->parent) {
     int pl = dom_prefix_len(e->tag);
     if (pl && !strcmp(dom_ns(e), ns))
-      return js_mk_string(ctx, e->tag, pl);
+      return js_mk_string(ctx, dom_qname(e), pl);
     for (const struct dom_attr *a = e->attrs; a; a = a->next)
       if (!memcmp(a->name, "xmlns:", 6) && a->value && !strcmp(a->value, ns))
-        return js_mk_cstring(ctx, a->name + 6);
+        return js_mk_cstring(ctx, dom_attr_qname(e, a) + 6);
   }
   return js_null();
 }

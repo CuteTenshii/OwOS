@@ -416,6 +416,33 @@ static void test_namespaces(void)
       "expect(re===1, 'reentrant evaluation from a resolver');\n");
 }
 
+static void test_names_keep_case_and_length(void)
+{
+  run_script(
+      "var SVG='http://www.w3.org/2000/svg', d=document, ser=new XMLSerializer();\n"
+      "var g=d.createElementNS(SVG,'linearGradient'); g.setAttribute('gradientUnits','userSpaceOnUse');\n"
+      "expect(g.tagName==='linearGradient' && g.localName==='linearGradient', 'foreign tag keeps case: '+g.tagName);\n"
+      "expect(g.getAttribute('gradientunits')==='userSpaceOnUse' && g.attributes[0].name==='gradientUnits', 'attribute "
+      "case');\n"
+      "expect(ser.serializeToString(g)==='<linearGradient xmlns=\"'+SVG+'\" gradientUnits=\"userSpaceOnUse\"/>', 'case "
+      "in output: '+ser.serializeToString(g));\n"
+      "var h=d.createElement('DIV'); expect(h.tagName==='DIV' && h.localName==='div', 'HTML tags stay "
+      "uppercase/lowercase');\n"
+      "var long='x-'+'very-long-custom-element-name'; var a=d.createElement(long+'-a'), b=d.createElement(long+'-b');\n"
+      "expect(a.localName===long+'-a' && b.localName===long+'-b' && a.cloneNode(false).localName===long+'-a', 'long "
+      "names are not truncated');\n"
+      "var x=new DOMParser().parseFromString('<Feed><Entry id=\"1\"/></Feed>','text/xml');\n"
+      "expect(x.documentElement.tagName==='Feed' && x.documentElement.firstChild.tagName==='Entry', 'xml doc keeps "
+      "case');\n"
+      "expect(x.evaluate('count(/Feed/Entry)',x,null,XPathResult.NUMBER_TYPE,null).numberValue===1, 'xpath is "
+      "case-sensitive in xml');\n"
+      "expect(x.evaluate('count(/feed/entry)',x,null,XPathResult.NUMBER_TYPE,null).numberValue===0, 'xpath wrong case "
+      "does not match');\n"
+      "var s=d.createElement('span'); s.innerHTML='a&nbsp;b &amp; c &copy; d &bogus; e';\n"
+      "var out=ser.serializeToString(s);\n"
+      "expect(out.indexOf('a&#160;b &amp; c &#169; d &amp;bogus; e')>0, 'entities become numeric refs: '+out);\n");
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -438,6 +465,7 @@ int main(void)
   test("XPath: evaluate, XPathEvaluator and XPathResult", test_xpath);
   test("EventTarget: construction, subclassing, dispatch and isolation", test_event_target);
   test("namespaces: DOM, XMLSerializer and XPath", test_namespaces);
+  test("names: case and length are preserved, entities serialize as XML", test_names_keep_case_and_length);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 
   return 0;

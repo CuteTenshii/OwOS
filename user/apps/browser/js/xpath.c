@@ -202,11 +202,11 @@ static int read_name(char *out, int cap)
   if (!is_ns(*X.p))
     return 0;
   while (is_nc(*X.p) && n < cap - 1)
-    out[n++] = lower(*X.p++);
+    out[n++] = *X.p++;
   if (*X.p == ':' && X.p[1] != ':' && (is_ns(X.p[1]) || X.p[1] == '*') && n < cap - 1) {
     out[n++] = *X.p++;
     while ((is_nc(*X.p) || *X.p == '*') && n < cap - 1)
-      out[n++] = lower(*X.p++);
+      out[n++] = *X.p++;
   }
   out[n] = 0;
   return n;
@@ -921,8 +921,8 @@ static int is_xmlns_attr(const struct dom_attr *a) { return !strcmp(a->name, "xm
 
 static int name_matches(xn x, const struct xstep *st, int attr_axis)
 {
-  const char *qname, *ns;
-  int pl, tl;
+  const char *qname, *shown, *ns;
+  int pl, tl, html;
   if (attr_axis != (x.a != 0) && st->test != T_NODE)
     return 0;
   if (x.a && is_xmlns_attr(x.a))
@@ -940,7 +940,9 @@ static int name_matches(xn x, const struct xstep *st, int attr_axis)
   if (!x.a && !is_element(x.n))
     return 0;
   qname = x.a ? x.a->name : x.n->tag;
+  shown = x.a ? dom_attr_qname(x.n, x.a) : dom_qname(x.n);
   ns = x.a ? dom_attr_ns(x.a) : dom_ns(x.n);
+  html = !strcmp(dom_ns(x.n), DOM_NS_HTML);
   tl = (int)strlen(st->name);
   pl = st->test == T_ANY ? (tl ? tl - 2 : 0) : dom_prefix_len(st->name);
   if (st->test == T_ANY && !tl)
@@ -949,12 +951,15 @@ static int name_matches(xn x, const struct xstep *st, int attr_axis)
     const char *uri = resolve_prefix(st->name, pl);
     if (strcmp(ns, uri))
       return 0;
-    return st->test == T_ANY || !strcmp(dom_local_name(qname), dom_local_name(st->name));
+    if (st->test == T_ANY)
+      return 1;
+    return html ? streq_ci(dom_local_name(qname), dom_local_name(st->name))
+                : !strcmp(dom_local_name(shown), dom_local_name(st->name));
   }
   /* unprefixed: no namespace for attributes; HTML (or none) for elements */
   if (x.a ? *ns : strcmp(ns, DOM_NS_HTML) && *ns)
     return 0;
-  return !strcmp(qname, st->name);
+  return html ? streq_ci(qname, st->name) : !strcmp(shown, st->name);
 }
 
 static void push_subtree(struct dom_node *root, xl *out, int include_root)
@@ -1139,7 +1144,7 @@ static double xround(double d)
   return floor(d + 0.5);
 }
 static xn first_or(xv v, xn c) { return v.ns.n ? v.ns.v[0] : c; }
-static const char *node_name(xn x) { return x.a ? x.a->name : (is_element(x.n) ? x.n->tag : ""); }
+static const char *node_name(xn x) { return x.a ? dom_attr_qname(x.n, x.a) : (is_element(x.n) ? dom_qname(x.n) : ""); }
 
 static xv call_function(struct xe *e, xn c, int pos, int size)
 {

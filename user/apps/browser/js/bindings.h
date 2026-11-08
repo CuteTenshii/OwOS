@@ -233,6 +233,7 @@ struct dom_node *doc_root_of(js_value t);
 js_value wrap_document(js_ctx *ctx, struct dom_node *root);
 void xpath_install(js_ctx *ctx, js_object *win);
 void namespace_install(void);
+int decode_entity(const char *p, const char *end, int *adv); /* html_entities.c */
 
 js_value crypto_getrandomvalues(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value crypto_randomuuid(js_ctx *ctx, js_value t, js_value *args, int argc);
