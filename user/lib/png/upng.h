@@ -11,12 +11,12 @@
  *
  * Scope: all five colour types — grayscale(0), RGB(2), palette(3), gray+alpha
  * (4), RGBA(6) — at bit depths 1/2/4/8/16, interlaced or not. Transparency is
- * preserved (alpha channel, palette tRNS, or colour-key) and the row is RGBA;
- * interlaced images are the one exception (emitted opaque). Non-interlaced
- * images stream with the ~2-scanline working
- * set above, whatever the height; interlaced (Adam7) images need a full RGB
- * frame buffer, so they are capped at 512x512 px and otherwise return
- * UPNG_EUNSUP. Built on the streaming inflate library.
+ * preserved (alpha channel, palette tRNS, or colour-key) and the row is RGBA.
+ * Non-interlaced images stream with the ~2-scanline working set above,
+ * whatever the height; interlaced (Adam7) images need a full RGBA frame buffer
+ * (768 KiB), so they are capped at 196608 px (512x384) and otherwise return
+ * UPNG_EUNSUP. Widths over 4096 are also UPNG_EUNSUP. CRCs are not verified.
+ * Built on the streaming inflate library.
  */
 #ifndef OWOS_UPNG_H
 #define OWOS_UPNG_H
@@ -34,7 +34,7 @@ enum {
   UPNG_OK = 0,
   UPNG_EBADSIG = -1,  /* not a PNG                                         */
   UPNG_EBADHDR = -2,  /* missing/zero IHDR                                 */
-  UPNG_EUNSUP = -3,   /* valid PNG, unsupported form (palette/16-bit/…)    */
+  UPNG_EUNSUP = -3,   /* valid PNG, unsupported form (too wide/large)       */
   UPNG_EINFLATE = -4, /* corrupt IDAT / bad filter                         */
   UPNG_ETRUNC = -5,   /* stream ended early                                */
 };

@@ -3,15 +3,16 @@
  * Flow: verify signature -> read IHDR (+ PLTE) -> stream the concatenated IDAT
  * data (spanning chunks, skipping their length/CRC framing) through the
  * streaming inflater -> reassemble each filtered scanline as inflate output
- * arrives -> reverse the PNG filter -> expand samples to 8-bit RGB -> hand the
+ * arrives -> reverse the PNG filter -> expand samples to 8-bit RGBA -> hand the
  * row to the caller.
  *
  * Supported: all five colour types — grayscale(0), RGB(2), palette(3),
- * gray+alpha(4), RGBA(6) — at bit depths 1/2/4/8/16, interlaced or not. Alpha
- * is dropped (the row callback is RGB). Non-interlaced images stream with a
- * working set of ~2 scanlines whatever the height; interlaced images need a
- * full RGB frame buffer (Adam7 passes deposit pixels across the whole image),
- * so they are capped at IL_MAXPX pixels and otherwise return UPNG_EUNSUP.
+ * gray+alpha(4), RGBA(6) — at bit depths 1/2/4/8/16, interlaced or not. Rows
+ * are RGBA: alpha comes from the alpha channel, palette tRNS or a colour-key.
+ * CRCs are not verified. Non-interlaced images stream with a working set of ~2
+ * scanlines whatever the height; interlaced images need a full RGBA frame
+ * buffer (Adam7 passes deposit pixels across the whole image), so they are
+ * capped at IL_MAXPX pixels and otherwise return UPNG_EUNSUP.
  */
 #include "upng.h"
 #include "inflate.h"
@@ -19,7 +20,7 @@
 
 #define MAXW 4096              /* widest image we'll decode (bounds buffers)   */
 #define ROWBYTES (MAXW * 8)    /* max stride: 16-bit RGBA = w*4*2 bytes        */
-#define IL_MAXPX (512u * 512u) /* interlaced frame budget (RGB): 512x512=768KiB*/
+#define IL_MAXPX (512u * 384u) /* interlaced frame budget (RGBA): 768 KiB      */
 
 struct dec {
   upng_reader rd;
@@ -34,6 +35,7 @@ struct dec {
   unsigned col;   /* bytes filled in cur[] (incl filter byte)*/
   int prev_valid; /* prev[] holds a real previous row        */
   int rowstop;    /* the row callback asked to stop          */
+  int badfilt;    /* a scanline had an invalid filter byte   */
   /* interlace pass state */
   int interlaced;
   int pass; /* current Adam7 pass 0..6, 7 = done       */
@@ -56,7 +58,7 @@ struct dec {
 };
 
 static struct dec D;
-static uint8_t il_frame[IL_MAXPX * 3]; /* interlaced de-interlace buffer   */
+static uint8_t il_frame[IL_MAXPX * 4]; /* interlaced de-interlace buffer   */
 
 /* Adam7 interlace pass geometry. */
 static const unsigned IL_XSTART[7] = {0, 4, 0, 2, 0, 1, 0};
@@ -273,8 +275,10 @@ static void row_to_rgba(struct dec *d, const uint8_t *row, uint8_t *dst, unsigne
 
 static int emit_scanline(struct dec *d)
 {
-  if (unfilter(d, d->stride) < 0)
+  if (unfilter(d, d->stride) < 0) {
+    d->badfilt = 1;
     return -1;
+  }
   row_to_rgba(d, d->cur + 1, d->rgba, d->w);
   return d->row(d->row_ctx, d->cur_y, d->rgba, d->w);
 }
@@ -342,13 +346,14 @@ static int sink_interlaced(struct dec *d, const unsigned char *buf, unsigned n)
       row_to_rgba(d, d->cur + 1, d->rgba, d->pass_w);
       unsigned fy = IL_YSTART[d->pass] + d->pass_row * IL_YSTEP[d->pass];
       unsigned xs = IL_XSTART[d->pass], xst = IL_XSTEP[d->pass];
-      uint8_t *base = il_frame + (unsigned long)fy * d->w * 3;
+      uint8_t *base = il_frame + (unsigned long)fy * d->w * 4;
       for (unsigned x = 0; x < d->pass_w; x++) {
-        uint8_t *o = base + (unsigned long)(xs + x * xst) * 3;
-        const uint8_t *s = d->rgba + x * 4; /* alpha dropped here  */
+        uint8_t *o = base + (unsigned long)(xs + x * xst) * 4;
+        const uint8_t *s = d->rgba + x * 4;
         o[0] = s[0];
         o[1] = s[1];
         o[2] = s[2];
+        o[3] = s[3];
       }
       d->col = 0;
       if (++d->pass_row >= d->pass_h) {
@@ -1020,6 +1025,7 @@ int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx, unsigne
   d->col = 0;
   d->prev_valid = 0;
   d->rowstop = 0;
+  d->badfilt = 0;
   d->chunk_left = 0;
   d->in_chunk = 0;
   d->idat_eof = 0;
@@ -1091,7 +1097,7 @@ int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx, unsigne
         d->trns_n = n;
       } else if (d->color == 0 && len >= 2) { /* gray colour-key    */
         uint8_t b0 = (uint8_t)rb(d), b1 = (uint8_t)rb(d);
-        d->ck_r = d->ck_g = d->ck_b = (d->depth == 16) ? b0 : b1;
+        d->ck_r = d->ck_g = d->ck_b = (d->depth == 16) ? b0 : d->depth == 8 ? b1 : b1 * 255u / ((1u << d->depth) - 1);
         d->has_ckey = 1;
         if (skip(d, len - 2 + 4) < 0)
           return UPNG_ETRUNC;
@@ -1152,20 +1158,14 @@ int upng_decode(upng_reader rd, void *rctx, upng_row row, void *row_ctx, unsigne
     if (d->pass < 7)
       return UPNG_EINFLATE;               /* didn't finish passes   */
     for (unsigned y = 0; y < d->h; y++) { /* emit the assembled rows*/
-      const uint8_t *src = il_frame + (unsigned long)y * d->w * 3;
-      for (unsigned x = 0; x < d->w; x++) { /* RGB frame -> RGBA, opaque */
-        d->rgba[x * 4] = src[x * 3];
-        d->rgba[x * 4 + 1] = src[x * 3 + 1];
-        d->rgba[x * 4 + 2] = src[x * 3 + 2];
-        d->rgba[x * 4 + 3] = 255;
-      }
-      int r = d->row(d->row_ctx, y, d->rgba, d->w);
-      if (r < 0)
+      if (d->row(d->row_ctx, y, il_frame + (unsigned long)y * d->w * 4, d->w) < 0)
         return UPNG_OK; /* caller stopped: fine   */
     }
     return UPNG_OK;
   }
 
+  if (d->badfilt)
+    return UPNG_EINFLATE;
   if (d->rowstop)
     return UPNG_OK; /* caller stopped: fine      */
   if (d->cur_y < d->h)
