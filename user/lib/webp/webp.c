@@ -1,4 +1,5 @@
-/* webp.c — WebP lossless (VP8L) decoder + encoder. See webp.h.
+/* webp.c — WebP container, lossless (VP8L) decoder + encoder, and the ALPH alpha plane for
+ * lossy files (the VP8 key frame itself is decoded by vp8.c). See webp.h.
  *
  * Decoder: full VP8L — the four transforms (predictor, colour, subtract-green,
  * colour-indexing), the colour cache, LZ77 backward references, and
@@ -14,6 +15,7 @@
  */
 #include "webp.h"
 #include "owos.h"
+#include "vp8.h"
 #include <stdint.h>
 
 /* ====================================================================== *
@@ -796,6 +798,7 @@ static int tag_is(const unsigned char *p, const char *s)
 struct scan {
   int has_vp8x, has_anim, has_alph, has_vp8, has_vp8l;
   int vp8x_off;
+  int alph_off, alph_size;
   int vp8_off, vp8_size;
   int vp8l_off, vp8l_size;
 };
@@ -820,9 +823,11 @@ static int scan_container(const unsigned char *buf, int len, struct scan *s)
       s->vp8x_off = (int)payload;
     } else if (tag_is(c, "ANIM") || tag_is(c, "ANMF"))
       s->has_anim = 1;
-    else if (tag_is(c, "ALPH"))
+    else if (tag_is(c, "ALPH")) {
       s->has_alph = 1;
-    else if (tag_is(c, "VP8 ")) {
+      s->alph_off = (int)payload;
+      s->alph_size = psize;
+    } else if (tag_is(c, "VP8 ")) {
       s->has_vp8 = 1;
       s->vp8_off = (int)payload;
       s->vp8_size = psize;
@@ -892,6 +897,84 @@ int webp_dimensions(const unsigned char *buf, int len, unsigned *w, unsigned *h)
   return WEBP_OK;
 }
 
+/* Undo the ALPH chunk's spatial prediction filter in place (0 none, 1 horizontal, 2 vertical, 3 gradient). */
+static void alpha_unfilter(unsigned char *a, int w, int h, int method)
+{
+  if (method == 0)
+    return;
+  for (int y = 0; y < h; y++) {
+    unsigned char *row = a + (unsigned)y * w;
+    const unsigned char *up = y ? row - w : 0;
+    for (int x = 0; x < w; x++) {
+      int pred;
+      if (!y && !x)
+        pred = 0;
+      else if (!y)
+        pred = row[x - 1];
+      else if (!x)
+        pred = up[0];
+      else if (method == 1)
+        pred = row[x - 1];
+      else if (method == 2)
+        pred = up[x];
+      else {
+        pred = row[x - 1] + up[x] - up[x - 1];
+        pred = pred < 0 ? 0 : pred > 255 ? 255 : pred;
+      }
+      row[x] = (unsigned char)(row[x] + pred);
+    }
+  }
+}
+
+/* Decode the ALPH chunk into the A bytes of an RGBA buffer. A bad chunk leaves the image opaque. */
+static void apply_alpha(const unsigned char *alph, int size, unsigned char *rgba, int w, int h)
+{
+  if (size < 1)
+    return;
+  unsigned n = (unsigned)w * h;
+  int method = alph[0] & 3, filter = (alph[0] >> 2) & 3;
+  unsigned char *plane = malloc(n);
+  if (!plane)
+    return;
+  if (method == 0) {
+    if ((unsigned)size - 1 < n) {
+      free(plane);
+      return;
+    }
+    memcpy(plane, alph + 1, n);
+  } else if (method == 1) {
+    struct br b;
+    br_init(&b, alph + 1, size - 1);
+    int err = 0;
+    unsigned *argb = decode_stream(&b, w, h, 1, &err);
+    if (!argb || b.eos) {
+      free(argb);
+      free(plane);
+      return;
+    }
+    for (unsigned i = 0; i < n; i++)
+      plane[i] = (unsigned char)(argb[i] >> 8);
+    free(argb);
+  } else {
+    free(plane);
+    return;
+  }
+  alpha_unfilter(plane, w, h, filter);
+  for (unsigned i = 0; i < n; i++)
+    rgba[i * 4 + 3] = plane[i];
+  free(plane);
+}
+
+static int decode_lossy(const unsigned char *buf, const struct scan *s, unsigned char **out, unsigned *w, unsigned *h)
+{
+  int rc = vp8_decode(buf + s->vp8_off, s->vp8_size, out, w, h);
+  if (rc != VP8_OK)
+    return rc == VP8_ENOMEM ? WEBP_ENOMEM : WEBP_EFORMAT;
+  if (s->has_alph)
+    apply_alpha(buf + s->alph_off, s->alph_size, *out, (int)*w, (int)*h);
+  return WEBP_OK;
+}
+
 int webp_decode(const unsigned char *buf, int len, unsigned char **out, unsigned *w, unsigned *h)
 {
   *out = 0;
@@ -902,7 +985,7 @@ int webp_decode(const unsigned char *buf, int len, unsigned char **out, unsigned
   if (s.has_anim)
     return WEBP_EUNSUP;
   if (!s.has_vp8l)
-    return s.has_vp8 ? WEBP_EUNSUP : WEBP_EFORMAT;
+    return s.has_vp8 ? decode_lossy(buf, &s, out, w, h) : WEBP_EFORMAT;
 
   struct br b;
   br_init(&b, buf + s.vp8l_off, s.vp8l_size);
