@@ -21,6 +21,7 @@
 #include "irqflags.h"
 #include "iso9660.h"
 #include "keyboard.h"
+#include "kstring.h"
 #include "loader.h"
 #include "log.h"
 #include "mouse.h"
@@ -96,6 +97,27 @@ static void mkdir_mode(const char *path, uint32_t mode)
 {
   if (fs_mkdir(path) == 0)
     fs_chmod(path, mode);
+}
+
+/* Add a daemon line to an inittab that predates it (seed_file only writes a missing file). */
+static void inittab_ensure(const char *daemon)
+{
+  char buf[256];
+  int n = fs_read("/etc/inittab", buf, sizeof buf - 1);
+  uint32_t dl = (uint32_t)strlen(daemon);
+  if (n < 0 || (uint32_t)n + dl + 2 > sizeof buf)
+    return;
+  buf[n] = '\0';
+  for (const char *p = buf; *p; p++)
+    if ((p == buf || p[-1] == '\n') && memcmp(p, daemon, dl) == 0 && (p[dl] == '\n' || p[dl] == '\0'))
+      return;
+  if (n > 0 && buf[n - 1] != '\n')
+    buf[n++] = '\n';
+  memcpy(buf + n, daemon, dl);
+  buf[n + (int)dl] = '\n';
+  fs_delete("/etc/inittab");
+  fs_create("/etc/inittab", buf, (uint32_t)n + dl + 1);
+  fs_chmod("/etc/inittab", 0644);
 }
 
 static void seed_file(const char *path, const char *data, uint32_t len, uint32_t mode)
@@ -376,6 +398,8 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     seed_file("/etc/mdns.conf", "_ssh._tcp 22\n_smb._tcp 445\n", 26, 0644);
     /* init's service table, one /bin daemon per line; compositor first. */
     seed_file("/etc/inittab", "compositor\ndhcpcd\nmdnsd\nsshd\nntpd\nmediad\n", 41, 0644);
+    inittab_ensure("ntpd");
+    inittab_ensure("mediad");
     users_init();
     INSTALL_APP(edit);
     INSTALL_APP(curl);

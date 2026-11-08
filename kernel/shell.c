@@ -790,6 +790,12 @@ static void bi_ps(const char *a)
 }
 static void bi_ls(const char *a)
 {
+  while (a[0] == '-') { /* the listing is always long; accept and ignore flags such as -l */
+    while (*a && *a != ' ')
+      a++;
+    while (*a == ' ')
+      a++;
+  }
   if (a[0] == '\0') {
     fs_list(cwd);
     return;
