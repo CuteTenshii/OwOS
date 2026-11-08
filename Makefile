@@ -20,7 +20,7 @@
 .PHONY: all test format format-check tidy install-hooks run debug iso run-iso run-iso-uefi usb clean distclean
 
 FORMAT_FILES := $(shell find boot drivers kernel user -type f \( -name '*.c' -o -name '*.h' \) \
-	! -path 'kernel/font*.h' ! -path 'user/lib/gfx/font*.h' \
+	! -path 'kernel/font*.h' ! -path kernel/fontstore.c ! -path 'user/lib/gfx/font*.h' \
 	! -path 'user/lib/mp3/minimp3.h' ! -path 'user/lib/tz/zones.h')
 CLANG_FORMAT ?= clang-format
 CLANG_TIDY ?= clang-tidy

@@ -21,3 +21,4 @@ isodir/
 
 # Host test objects (scripts/run-tests.sh)
 build/
+kernel/fontstore.c

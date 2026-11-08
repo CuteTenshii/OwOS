@@ -83,6 +83,13 @@ static void install_blob(const char *path, const unsigned char *start, const uns
   fs_chmod(path, mode);
 }
 
+/* Fonts embedded from the fonts dir (generated kernel/fontstore.c). */
+extern const struct font_blob {
+  const char *name;
+  const unsigned char *start, *end;
+} fontstore[];
+extern const unsigned fontstore_count;
+
 /* Install an embedded blob given its disk path and objcopy symbol base; INSTALL_APP is the /bin form. */
 #define INSTALL_FILE(diskpath, symbase, mode)                                                                          \
   do {                                                                                                                 \
@@ -385,8 +392,11 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     /* Seed passwd (name:pwhash:uid:gid:home) and group if absent. */
     mkdir_mode("/etc", 0755);
     mkdir_mode("/etc/fonts", 0755);
-    INSTALL_FILE("/etc/fonts/LiberationSans-Regular.ttf", _binary_fonts_LiberationSans_Regular_ttf, 0644);
-    INSTALL_FILE("/etc/fonts/LiberationMono-Regular.ttf", _binary_fonts_LiberationMono_Regular_ttf, 0644);
+    for (unsigned i = 0; i < fontstore_count; i++) {
+      char path[96];
+      ksnprintf(path, sizeof path, "/etc/fonts/%s", fontstore[i].name);
+      install_blob(path, fontstore[i].start, fontstore[i].end, 0644);
+    }
     mkdir_mode("/usr", 0755);
     mkdir_mode("/usr/share", 0755);
     mkdir_mode("/usr/share/applications", 0755);

@@ -57,7 +57,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/dhcpcd_blob.o kernel/ntpd_blob.o kernel/mdnsd_blob.o kernel/mediad_blob.o kernel/mediactl_blob.o \
         kernel/cast_blob.o kernel/chmod_blob.o kernel/chown_blob.o kernel/unrar_blob.o \
         kernel/init_blob.o kernel/sudo_blob.o kernel/sh_blob.o $(foreach a,$(DESKTOP_APPS),kernel/$(a)_desktop_blob.o) \
-        kernel/uifont_blob.o kernel/monofont_blob.o kernel/appsyms.o \
+        kernel/fontstore.o kernel/appsyms.o \
         $(foreach i,$(ICON_NAMES),kernel/icon_$(subst -,_,$(i))_blob.o)
 
 $(KERNEL): $(OBJS) $(LINKER)
