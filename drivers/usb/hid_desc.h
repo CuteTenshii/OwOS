@@ -97,8 +97,9 @@ struct hid_decoded {
   int32_t dx, dy, wheel, pan;
   int32_t ax, ay;
   int32_t ax_min, ax_max, ay_min, ay_max;
-  bool tip; /* digitizer contact (tip switch, or touch) */
+  bool tip; /* digitizer contact (tip switch, eraser, or touch) */
   bool in_range;
+  bool has_range; /* the report carries an In Range bit */
   uint32_t pad_buttons;
   int32_t axes[HID_PAD_AXES];
   int32_t axes_min[HID_PAD_AXES], axes_max[HID_PAD_AXES];

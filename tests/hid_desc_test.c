@@ -60,6 +60,13 @@ static const uint8_t touch2[] = {
     0x30, 0x26, 0xff, 0x0f, 0x75, 0x10, 0x81, 0x02, 0x09, 0x31, 0x81, 0x02, 0x05, 0x0d, 0xc0, 0xc0,
 };
 
+/* Pen digitizer: tip, barrel, eraser, secondary barrel and In Range bits, then 16-bit X and Y. */
+static const uint8_t pen[] = {
+    0x05, 0x0d, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x20, 0xa1, 0x00, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95,
+    0x05, 0x09, 0x42, 0x09, 0x44, 0x09, 0x45, 0x09, 0x5a, 0x09, 0x32, 0x81, 0x02, 0x95, 0x03, 0x81, 0x03,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x26, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xc0, 0xc0,
+};
+
 /* Wheel mouse with a horizontal wheel as AC Pan (Consumer 0x238), as Microsoft and Logitech mice declare it. */
 static const uint8_t pan_mouse[] = {
     0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
@@ -194,6 +201,30 @@ static void tablet_abs_axes(void)
   expect(dec.has_abs && dec.ax == 0x4000 && dec.ay == 0x2000 && dec.ax_max == 0x7FFF && dec.ay_max == 0x7FFF);
   expect(dec.buttons == 1 && dec.wheel == 1 && dec.ax_min == 0);
   expect(hid_roles(&d) == HID_ROLE_TABLET);
+  hid_decoded_free(&dec);
+  hid_desc_free(&d);
+}
+
+static void pen_range_and_buttons(void)
+{
+  expect(hid_parse(pen, sizeof pen, &d) == 0);
+  expect(hid_roles(&d) == HID_ROLE_TABLET);
+  expect(hid_decoded_init(&dec, &d) == 0);
+  uint8_t hover[5] = {0x10, 0x00, 0x10, 0x00, 0x20};
+  hid_decode(&d, hover, sizeof hover, &dec);
+  expect(dec.has_range && dec.in_range && !dec.tip && dec.buttons == 0 && dec.ax == 0x1000 && dec.ay == 0x2000);
+  uint8_t away[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
+  hid_decode(&d, away, sizeof away, &dec);
+  expect(dec.has_range && !dec.in_range);
+  uint8_t barrel[5] = {0x13, 0x00, 0x10, 0x00, 0x20};
+  hid_decode(&d, barrel, sizeof barrel, &dec);
+  expect(dec.tip && dec.buttons == 2);
+  uint8_t eraser[5] = {0x14, 0x00, 0x10, 0x00, 0x20};
+  hid_decode(&d, eraser, sizeof eraser, &dec);
+  expect(dec.tip && dec.buttons == 0);
+  uint8_t second[5] = {0x18, 0x00, 0x10, 0x00, 0x20};
+  hid_decode(&d, second, sizeof second, &dec);
+  expect(!dec.tip && dec.buttons == 4);
   hid_decoded_free(&dec);
   hid_desc_free(&d);
 }
@@ -590,6 +621,7 @@ int main(void)
   test("rollover error is phantom and carries no keys", rollover_phantom);
   test("boot mouse and wheel mouse", boot_and_wheel_mouse);
   test("tablet absolute axes", tablet_abs_axes);
+  test("pen range and buttons", pen_range_and_buttons);
   test("absolute axis scaling", abs_axis_scaling);
   test("consumer and system controls with report IDs", consumer_report_ids);
   test("consumer keys as individual bits", consumer_bits_keys);

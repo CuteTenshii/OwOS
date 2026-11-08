@@ -596,15 +596,17 @@ static void decode_var(struct hid_decoded *d, const struct hid_field *f, const u
       add_cons(d, f->usage);
     break;
   case HID_PAGE_DIGITIZER:
-    if (id == 0x42) {
+    if (id == 0x42 || id == 0x45) {
       d->has_touch = true;
-      d->tip = v != 0;
+      if (v)
+        d->tip = true;
     } else if (id == 0x32) {
+      d->has_range = true;
       d->in_range = v != 0;
-    } else if (id == 0x44) {
+    } else if (id == 0x44 || id == 0x5A) {
       d->has_buttons = true;
       if (v)
-        d->buttons |= 2;
+        d->buttons |= id == 0x44 ? 2 : 4;
     }
     break;
   }
@@ -614,7 +616,7 @@ void hid_decode(const struct hid_desc *desc, const uint8_t *data, size_t len, st
 {
   d->valid = false;
   d->has_kbd = d->has_cons = d->has_rel = d->has_abs = d->has_buttons = d->has_touch = d->has_pad = false;
-  d->phantom = d->tip = d->in_range = false;
+  d->phantom = d->tip = d->in_range = d->has_range = false;
   d->mods = 0;
   d->nkeys = d->ncons = 0;
   d->buttons = d->pad_buttons = 0;

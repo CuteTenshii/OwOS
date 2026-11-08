@@ -36,6 +36,8 @@ struct hid_dev {
   uint16_t *cons_prev, *cons_cur;
   uint32_t ncons;
   uint32_t buttons;
+  bool abs_valid;
+  int abs_x, abs_y;
   /* LED output report. */
   bool has_led;
   uint8_t led_id;
@@ -127,17 +129,28 @@ static uint32_t total_buttons(void)
 static void pointer_report(struct hid_dev *h, const struct hid_decoded *d)
 {
   uint32_t btn = d->buttons | (d->tip ? 1u : 0);
-  bool abs = d->has_abs;
-  if (!abs && !d->dx && !d->dy && !d->wheel && !d->pan && btn == h->buttons)
+  bool moved = d->dx || d->dy || d->wheel || d->pan;
+  if (d->has_abs) {
+    int x = h->abs_x, y = h->abs_y;
+    if (!d->has_range || d->in_range) {
+      x = hid_scale_abs(d->ax, d->ax_min, d->ax_max, mouse_bound_x());
+      y = hid_scale_abs(d->ay, d->ay_min, d->ay_max, mouse_bound_y());
+    } else if (!h->abs_valid) {
+      return;
+    }
+    if (h->abs_valid && x == h->abs_x && y == h->abs_y && !moved && btn == h->buttons)
+      return;
+    h->abs_valid = true;
+    h->abs_x = x;
+    h->abs_y = y;
+    h->buttons = btn;
+    mouse_inject_abs(x, y, d->wheel, d->pan, (int)total_buttons());
+    return;
+  }
+  if (!moved && btn == h->buttons)
     return;
   h->buttons = btn;
-  if (abs) {
-    int x = hid_scale_abs(d->ax, d->ax_min, d->ax_max, mouse_bound_x());
-    int y = hid_scale_abs(d->ay, d->ay_min, d->ay_max, mouse_bound_y());
-    mouse_inject_abs(x, y, d->wheel, d->pan, (int)total_buttons());
-  } else {
-    mouse_inject_rel(d->dx, d->dy, d->wheel, d->pan, (int)total_buttons());
-  }
+  mouse_inject_rel(d->dx, d->dy, d->wheel, d->pan, (int)total_buttons());
 }
 
 static void pad_report(const struct hid_decoded *d)
