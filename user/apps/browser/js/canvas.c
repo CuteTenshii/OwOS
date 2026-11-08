@@ -1173,6 +1173,9 @@ static js_value canvas_get_context(js_ctx *ctx, js_value t, js_value *args, int 
 {
   if (!streq(arg_str(ctx, A(0)), "2d"))
     return js_null();
+  if (js_get(ctx, t, "@transferred").type != JV_UNDEF)
+    return js_throw_error(ctx, ctx->error_proto, "InvalidStateError",
+                          "Cannot get context from a canvas that has transferred its control to offscreen");
   struct canvas_rec *r = canvas_rec_of(ctx, t, true);
   if (!r)
     return js_undef();
@@ -1214,9 +1217,12 @@ static js_value canvas_set_dim(js_ctx *ctx, js_value t, js_value v, bool height)
 {
   double d = js_to_number(ctx, v);
   struct chost *oc = host_of(t, HK_OFFSCREEN);
-  struct dom_node *n = oc ? 0 : node_of(t);
+  struct dom_node *n = oc ? ((struct canvas_rec *)oc->p)->el : node_of(t);
   if (!oc && (!n || !streq(n->tag, "canvas")))
     return js_throw_type(ctx, "Illegal invocation");
+  if (!oc && js_get(ctx, t, "@transferred").type != JV_UNDEF)
+    return js_throw_error(ctx, ctx->error_proto, "InvalidStateError",
+                          "Cannot resize canvas after call to transferControlToOffscreen()");
   long dim = finite(d) && d >= 0 ? (long)d : 0;
   if (dim > 16384)
     dim = 16384;
@@ -1333,6 +1339,45 @@ static js_value offscreen_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
   if (!r)
     return js_throw_range(ctx, "OffscreenCanvas allocation failed");
   return make_host(ctx, g_offscreen_proto, HK_OFFSCREEN, r, 0, 0);
+}
+
+static js_value offscreen_transfer_to_bitmap(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args, (void)argc;
+  struct chost *oc = host_of(t, HK_OFFSCREEN);
+  if (!oc)
+    return js_throw_type(ctx, "Illegal invocation");
+  struct canvas_rec *r = oc->p;
+  if (r->el)
+    return js_throw_error(ctx, ctx->error_proto, "InvalidStateError",
+                          "Cannot transfer an ImageBitmap from a placeholder OffscreenCanvas");
+  unsigned long bytes = (unsigned long)r->c->w * r->c->h * 4;
+  unsigned char *px = malloc(bytes);
+  if (!px)
+    return js_throw_range(ctx, "out of memory");
+  memcpy(px, r->c->px, bytes);
+  memset(r->c->px, 0, bytes);
+  r->pending = 1;
+  return make_bitmap(ctx, px, r->c->w, r->c->h);
+}
+
+static js_value canvas_transfer_control(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args, (void)argc;
+  if (js_get(ctx, t, "@transferred").type != JV_UNDEF || js_get(ctx, t, "@ctx2d").type == JV_OBJ)
+    return js_throw_error(ctx, ctx->error_proto, "InvalidStateError",
+                          "Cannot transfer control from a canvas for which a rendering context has been created");
+  struct canvas_rec *r = canvas_rec_of(ctx, t, true);
+  if (!r)
+    return js_undef();
+  gc_push_scope();
+  js_value off = make_host(ctx, g_offscreen_proto, HK_OFFSCREEN, r, 0, 0);
+  if (off.type == JV_OBJ && t.type == JV_OBJ) {
+    gc_keep(off.u.obj);
+    js_def(t.u.obj, "@transferred", js_bool(1), P_WRITABLE);
+  }
+  gc_pop_scope();
+  return off;
 }
 
 /* ------------------------------------------------------------ pixel sources */
@@ -1511,6 +1556,7 @@ void canvas_js_setup(js_ctx *ctx, js_object *win)
 
   def_method(g_offscreen_proto, "getContext", canvas_get_context, 1);
   def_method(g_offscreen_proto, "convertToBlob", offscreen_convert_to_blob, 0);
+  def_method(g_offscreen_proto, "transferToImageBitmap", offscreen_transfer_to_bitmap, 0);
   def_acc(g_offscreen_proto, "width", canvas_get_width, canvas_set_width);
   def_acc(g_offscreen_proto, "height", canvas_get_height, canvas_set_height);
 
@@ -1519,6 +1565,7 @@ void canvas_js_setup(js_ctx *ctx, js_object *win)
     def_method(ep, "getContext", canvas_get_context, 2);
     def_method(ep, "toDataURL", canvas_to_data_url, 1);
     def_method(ep, "toBlob", canvas_to_blob, 1);
+    def_method(ep, "transferControlToOffscreen", canvas_transfer_control, 0);
     def_acc(ep, "width", canvas_get_width, canvas_set_width);
     def_acc(ep, "height", canvas_get_height, canvas_set_height);
   }

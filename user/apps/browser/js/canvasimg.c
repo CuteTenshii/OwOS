@@ -260,15 +260,32 @@ static js_value bitmap_close(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
+/* Wraps `px` (w*h RGBA, ownership passes on success; freed on failure) as an ImageBitmap */
+js_value make_bitmap(js_ctx *ctx, unsigned char *px, int w, int h)
+{
+  gc_push_scope();
+  js_value bm = make_host(ctx, g_bitmap_proto, HK_BITMAP, px, w, h);
+  if (bm.type != JV_OBJ) {
+    free(px);
+    gc_pop_scope();
+    return bm;
+  }
+  gc_keep(bm.u.obj);
+  js_def(bm.u.obj, "width", js_number(w), P_ENUMERABLE);
+  js_def(bm.u.obj, "height", js_number(h), P_ENUMERABLE);
+  gc_pop_scope();
+  return bm;
+}
+
 static js_value create_image_bitmap(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct pixsrc src;
   (void)t;
   int rc = source_pixels(ctx, A(0), &src);
   if (rc == SRC_BAD_TYPE)
-    return js_promise_rejected(
-        ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError",
-                           "The provided value is not of type '(HTMLImageElement or HTMLCanvasElement or ImageData)'"));
+    return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError",
+                                                  "The provided value is not of type '(HTMLImageElement or "
+                                                  "HTMLCanvasElement or OffscreenCanvas or ImageData)'"));
   if (rc == SRC_NOT_READY)
     return js_promise_rejected(
         ctx, js_make_error(ctx, ctx->error_proto, "InvalidStateError", "The source image is not ready"));
@@ -295,16 +312,10 @@ static js_value create_image_bitmap(js_ctx *ctx, js_value t, js_value *args, int
              (unsigned long)(x1 - x0) * 4);
   }
   gc_push_scope();
-  js_value bm = make_host(ctx, g_bitmap_proto, HK_BITMAP, px, sw, sh);
-  if (bm.type != JV_OBJ) {
-    free(px);
-    gc_pop_scope();
-    return js_promise_rejected(ctx, bm);
-  }
-  gc_keep(bm.u.obj);
-  js_def(bm.u.obj, "width", js_number(sw), P_ENUMERABLE);
-  js_def(bm.u.obj, "height", js_number(sh), P_ENUMERABLE);
-  js_value p = js_promise_resolved(ctx, bm);
+  js_value bm = make_bitmap(ctx, px, sw, sh);
+  if (bm.type == JV_OBJ)
+    gc_keep(bm.u.obj);
+  js_value p = bm.type == JV_OBJ ? js_promise_resolved(ctx, bm) : js_promise_rejected(ctx, bm);
   gc_pop_scope();
   return p;
 }

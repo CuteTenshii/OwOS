@@ -11,6 +11,7 @@
 
 extern long long fake_now_ms;
 int js_timers_pump(void);
+int js_workers_pump(void);
 
 static void con_print(js_ctx *ctx, int level, const char *s, int len)
 {
@@ -239,6 +240,48 @@ static void test_draw_image_sources(void)
   expect(pixel("c", 34, 0)[0] == 255 && pixel("c", 34, 0)[1] == 255 && pixel("c", 35, 1)[3] == 255);
 }
 
+static void test_offscreen_transfer(void)
+{
+  run_script(
+      "var off=new OffscreenCanvas(4,3), oc=off.getContext('2d'); oc.fillStyle='#f00'; oc.fillRect(0,0,4,3);\n"
+      "var bm=off.transferToImageBitmap();\n"
+      "expect(bm instanceof ImageBitmap && bm.width===4 && bm.height===3, 'bitmap size');\n"
+      "expect(oc.getImageData(1,1,1,1).data[3]===0, 'source is cleared after transfer');\n"
+      "var dst=new OffscreenCanvas(4,3).getContext('2d'); dst.drawImage(bm,0,0);\n"
+      "expect(dst.getImageData(2,2,1,1).data[0]===255, 'bitmap carries the pixels');\n"
+      "var cv=document.createElement('canvas'); cv.id='xfer'; cv.width=6; cv.height=2; document.body.appendChild(cv);\n"
+      "var ctrl=cv.transferControlToOffscreen(), name='';\n"
+      "expect(ctrl instanceof OffscreenCanvas && ctrl.width===6 && ctrl.height===2, 'placeholder size');\n"
+      "var x=ctrl.getContext('2d'); x.fillStyle='#00f'; x.fillRect(0,0,6,2);\n"
+      "try{ cv.getContext('2d') }catch(e){ name=e.name } expect(name==='InvalidStateError', 'getContext after "
+      "transfer');\n"
+      "name=''; try{ cv.width=9 }catch(e){ name=e.name } expect(name==='InvalidStateError', 'resize after transfer');\n"
+      "name=''; try{ ctrl.transferToImageBitmap() }catch(e){ name=e.name } expect(name==='InvalidStateError', "
+      "'placeholder');\n"
+      "var used=document.createElement('canvas'); used.getContext('2d'); name='';\n"
+      "try{ used.transferControlToOffscreen() }catch(e){ name=e.name } expect(name==='InvalidStateError', 'context "
+      "exists');\n"
+      "window.ctrl=ctrl;\n");
+  expect(pixel("xfer", 0, 0)[2] == 255);
+  run_script("ctrl.width=8; expect(document.getElementById('xfer').getAttribute('width')==='8', 'resize reflects');\n");
+  expect(canvas_by_id("xfer")->c->w == 8);
+}
+
+static void test_offscreen_in_worker(void)
+{
+  run_script(
+      "var cv=document.createElement('canvas'); cv.id='wk'; cv.width=5; cv.height=2; document.body.appendChild(cv);\n"
+      "var w=new Worker('data:text/javascript,onmessage=function(e){ var c=e.data.canvas.getContext(\"2d\"); "
+      "c.fillStyle=\"#0f0\"; c.fillRect(0,0,5,2); var o=new OffscreenCanvas(2,2); "
+      "postMessage(o.width+\"x\"+e.data.canvas.height); };'); window.reply=null;\n"
+      "w.onmessage=function(e){ window.reply=e.data };\n"
+      "var off=cv.transferControlToOffscreen(); w.postMessage({canvas:off},[off]);\n");
+  for (int i = 0; i < 20; i++)
+    js_workers_pump();
+  run_script("expect(window.reply==='2x2', 'worker reply: '+window.reply);\n");
+  expect(pixel("wk", 4, 1)[1] == 255);
+}
+
 static void test_composite_shadow_clip(void)
 {
   run_script(
@@ -348,6 +391,8 @@ int main(void)
   test("gradients and patterns", test_gradients_and_patterns);
   test("ImageData round trips", test_image_data);
   test("drawImage from canvas sources", test_draw_image_sources);
+  test("OffscreenCanvas transfer to bitmap and from element", test_offscreen_transfer);
+  test("OffscreenCanvas inside a worker", test_offscreen_in_worker);
   test("composite operations, clip and shadows", test_composite_shadow_clip);
   test("toDataURL, toBlob and convertToBlob", test_export);
   test("img loading, load events and ImageBitmap", test_image_loading);

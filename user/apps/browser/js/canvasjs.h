@@ -34,6 +34,7 @@ void canvas_path_setup(js_ctx *ctx, js_object *win);
 
 /* Image element loading and ImageBitmap (canvasimg.c). */
 const unsigned char *js_image_pixels(struct dom_node *img, int *w, int *h);
+js_value make_bitmap(js_ctx *ctx, unsigned char *px, int w, int h);
 void canvas_img_setup(js_ctx *ctx, js_object *win);
 void canvas_img_teardown(void);
 
