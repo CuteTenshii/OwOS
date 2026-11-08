@@ -3,6 +3,7 @@
 #define OWOS_USER_H
 
 #include "ascii.h"
+#include "syscall_nr.h"
 #include "timeval64.h"
 #include <stdarg.h>
 
@@ -92,6 +93,7 @@ int adjtime(const struct timeval64 *delta, struct timeval64 *old);
 int strlen(const char *s);
 int strcmp(const char *a, const char *b); /* <0 / 0 / >0 */
 void strcpy(char *d, const char *s);      /* caller sizes d */
+char *strchr(const char *s, int c);       /* first c in s (c == 0 finds the terminator), or 0 */
 void strcat(char *d, const char *s);      /* caller sizes d */
 /* BSD strlcpy: truncates, always NUL-terminates */
 void strlcpy(char *dst, const char *src, int size);
@@ -323,14 +325,33 @@ int spawn(const char *path, const char *arg);
 int spawn_cap(const char *path, char *const argv[], int argc, int *rfd);
 /* Like spawn_cap, but also gives the child a stdin pipe: *wfd is the write end */
 int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *wfd);
-/* Like spawn_cap_io, but also sets the child's uid/gid and cwd */
-int spawn_cap_io_as(const char *path, char *const argv[], int argc, int uid, int gid, const char *cwd, int *rfd,
-                    int *wfd);
-/* Child fds 0-2 are copies of the caller's fds in/out/err (-1: left as the default console) */
-int spawn_stdio(const char *path, char *const argv[], int argc, int in, int out, int err);
-/* Child fds 0-2 are a new pty's slave side; *master is our end (read its output, write its input) */
-int spawn_pty(const char *path, char *const argv[], int argc, int *master);
-int isatty(int fd);                         /* 1 for the console or a pty slave/master */
+/* Everything a spawn can set. Unnamed fields are 0. Child stdio is, by flags:
+ *   none         fd 1 is a pipe read through *rfd; with wfd, fd 0 is a pipe written through *wfd
+ *   SPAWN_STDIO  fds 0-2 are copies of the caller's fds stdio[0..2] (-1: left as the default console)
+ *   SPAWN_PTY    fds 0-2 are a new pty's slave side; *rfd is the master (read its output, write its input)
+ * SPAWN_CREDS applies uid/gid; cwd 0 inherits; env is a block of "NAME=VALUE" strings ended by an empty string
+ * (see env_block_add), 0 gives the child a copy of our environment. */
+struct spawn_opts {
+  const char *path;
+  char *const *argv;
+  int argc;
+  unsigned flags;
+  int uid, gid;
+  const char *cwd;
+  const char *env;
+  int stdio[3];
+  int *rfd, *wfd;
+};
+int spawn_ex(const struct spawn_opts *o);
+
+/* Environment, inherited by every process we spawn */
+char *getenv(const char *name); /* valid until the next getenv call; 0 if unset */
+int setenv(const char *name, const char *value, int overwrite);
+int unsetenv(const char *name);
+int clearenv(void);
+int env_entry(unsigned index, char *buf, unsigned buf_len); /* "NAME=VALUE" number index; its length, -1 past the end */
+int env_block_add(char **block, const char *name, const char *value); /* grow a malloc'd env block for spawn_* */
+int isatty(int fd);                                                   /* 1 for the console or a pty slave/master */
 int tty_size(int fd, int *cols, int *rows); /* window size of a pty (80x24 until the master sets it) */
 int tty_set_size(int master, int cols, int rows);
 int tty_set_fg(int fd, int pid); /* the shell records which job owns the terminal; 0 = the shell */

@@ -43,6 +43,7 @@
 #include "smbios.h"
 #include "syscall_audio.h"
 #include "syscall_entropy.h"
+#include "syscall_env.h"
 #include "syscall_exec.h"
 #include "syscall_fs.h"
 #include "syscall_graphics.h"
@@ -181,7 +182,7 @@ void syscall_init(void)
 
 typedef void (*syscall_handler_t)(struct registers *r);
 
-static const syscall_handler_t syscall_handlers[SYS_TTY + 1] = {
+static const syscall_handler_t syscall_handlers[SYS_ENV + 1] = {
     [SYS_WRITE] = syscall_io_write,
     [SYS_EXIT] = syscall_process_exit,
     [SYS_READ] = syscall_io_read,
@@ -273,12 +274,13 @@ static const syscall_handler_t syscall_handlers[SYS_TTY + 1] = {
     [SYS_UMASK] = syscall_fs_umask,
     [SYS_ACCESS] = syscall_fs_access,
     [SYS_TTY] = syscall_io_tty,
+    [SYS_ENV] = syscall_env,
 };
 
 void syscall_dispatch(struct registers *r)
 {
   uint32_t number = r->eax;
-  if (number > SYS_TTY || !syscall_handlers[number]) {
+  if (number > SYS_ENV || !syscall_handlers[number]) {
     r->eax = (uint32_t)-1;
     return;
   }

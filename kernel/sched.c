@@ -2,6 +2,7 @@
 
 #include "sched.h"
 #include "console.h"
+#include "env.h"
 #include "file.h"
 #include "gdt.h"
 #include "heap.h"
@@ -73,6 +74,7 @@ typedef struct task {
   uint32_t uid;           /* owning user id (credentials; inherited like cwd) */
   uint32_t gid;           /* owning primary group id */
   uint32_t umask;
+  struct env env;               /* process environment; threads use their leader's */
   bool fpu_valid;               /* fpu[] holds a saved x87 image (else the task still has the init state) */
   uint8_t fpu[FPU_IMAGE_BYTES]; /* x87 state saved while the task is switched out */
   struct task *next;
@@ -373,6 +375,23 @@ void sched_create_thread(const char *name, void (*entry)(void))
   enqueue(t);
 }
 
+static task_t *find_task(uint32_t id);
+
+/* The environment of the running process (threads share their leader's) */
+static struct env *proc_env(void) { return &(current->process ? current->process : current)->env; }
+
+struct env *sched_env(void) { return proc_env(); }
+
+/* Replace a not-yet-running child's environment with a NAME=VALUE block (see env_from_block) */
+void sched_set_env_block(int pid, const char *block, uint32_t len)
+{
+  task_t *t = find_task((uint32_t)pid);
+  if (!t)
+    return;
+  env_free(&t->env);
+  env_from_block(&t->env, block, len);
+}
+
 int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32_t user_esp, uint32_t brk)
 {
   task_t *t = alloc_task();
@@ -416,6 +435,12 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
   }
   t->kstack = kstack;
   t->kstack_top = (uintptr_t)(kstack + UKSTACK_SIZE);
+  if (env_copy(&t->env, proc_env()) != 0) {
+    address_space_put(as);
+    kfree(kstack);
+    kfree(t);
+    return -1;
+  }
 
   /* Craft the kernel stack so the first schedule rets into enter_user_task and irets to `entry`. */
 #ifdef __x86_64__
@@ -586,6 +611,13 @@ int sched_fork(struct registers *r)
   t->parent = current->id;
   t->kstack = kstack;
   t->kstack_top = (uintptr_t)(kstack + UKSTACK_SIZE);
+  if (env_copy(&t->env, proc_env()) != 0) {
+    paging_free_process_dir(child_dir);
+    kfree(t->as);
+    kfree(kstack);
+    kfree(t);
+    return -1;
+  }
   t->state = TASK_RUNNABLE;
   sig_init(t);
   /* fork inherits dispositions and blocked mask; pending signals are not inherited. */
@@ -703,10 +735,12 @@ static void reap_task_locked(task_t *t)
       if (th->self_reap && th->state == TASK_ZOMBIE && detached_zombies > 0)
         detached_zombies--;
       address_space_put(th->as);
+      env_free(&th->env);
       kfree(th);
     }
   }
   address_space_put(t->as);
+  env_free(&t->env);
   if (t->kstack)
     kfree(t->kstack);
   kfree(t);

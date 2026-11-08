@@ -249,44 +249,110 @@ struct spawn_req {
   const char *cwd;
   unsigned flags;
   int stdio[3];
+  const char *env;
+  unsigned env_len;
 };
 
-static int spawn_req(const struct spawn_req *req) { return syscall(SYS_SPAWN_CAP, (int)req, 0, 0); }
+int spawn_ex(const struct spawn_opts *o)
+{
+  struct spawn_req req = {o->path,
+                          o->argv,
+                          o->argc,
+                          o->rfd,
+                          o->wfd,
+                          o->flags & SPAWN_CREDS ? o->uid : -1,
+                          o->flags & SPAWN_CREDS ? o->gid : -1,
+                          o->cwd,
+                          o->flags & (SPAWN_PTY | SPAWN_STDIO),
+                          {o->stdio[0], o->stdio[1], o->stdio[2]},
+                          0,
+                          0};
+  if (o->wfd)
+    *o->wfd = -1;
+  if (o->env) { /* a block of NAME=VALUE strings ended by an empty string */
+    unsigned n = 0;
+    while (o->env[n] || o->env[n + 1])
+      n++;
+    req.env = o->env;
+    req.env_len = n ? n + 1 : 0;
+    req.flags |= SPAWN_ENV;
+  }
+  return syscall(SYS_SPAWN_CAP, (int)&req, 0, 0);
+}
 
 /* spawn_cap with a full argv; the kernel uses `path` for the image */
 int spawn_cap(const char *path, char *const argv[], int argc, int *rfd)
 {
-  struct spawn_req req = {path, argv, argc, rfd, 0, -1, -1, 0, 0, {-1, -1, -1}};
-  return spawn_req(&req);
+  struct spawn_opts o = {.path = path, .argv = argv, .argc = argc, .rfd = rfd};
+  return spawn_ex(&o);
 }
 
 /* Like spawn_cap, plus a stdin pipe whose write end is stored in *wfd */
 int spawn_cap_io(const char *path, char *const argv[], int argc, int *rfd, int *wfd)
 {
-  return spawn_cap_io_as(path, argv, argc, -1, -1, 0, rfd, wfd);
+  struct spawn_opts o = {.path = path, .argv = argv, .argc = argc, .rfd = rfd, .wfd = wfd};
+  return spawn_ex(&o);
 }
 
-/* Like spawn_cap_io, plus uid/gid and cwd (uid/gid < 0 or cwd == 0 inherit) */
-int spawn_cap_io_as(const char *path, char *const argv[], int argc, int uid, int gid, const char *cwd, int *rfd,
-                    int *wfd)
+/* environment */
+
+static int env_call(unsigned cmd, const char *name, const char *value, char *buf, unsigned buf_len, unsigned index)
 {
-  struct spawn_req req = {path, argv, argc, rfd, wfd, uid, gid, cwd, 0, {-1, -1, -1}};
-  *wfd = -1;
-  return spawn_req(&req);
+  struct env_req q = {cmd,
+                      (unsigned)name,
+                      name ? (unsigned)strlen(name) : 0,
+                      (unsigned)value,
+                      value ? (unsigned)strlen(value) : 0,
+                      (unsigned)buf,
+                      buf_len,
+                      index};
+  return syscall(SYS_ENV, (int)&q, 0, 0);
 }
 
-/* Child fds 0-2 are copies of the caller's fds in/out/err (-1: the default) */
-int spawn_stdio(const char *path, char *const argv[], int argc, int in, int out, int err)
+/* The value stays valid until the next getenv call */
+char *getenv(const char *name)
 {
-  struct spawn_req req = {path, argv, argc, 0, 0, -1, -1, 0, SPAWN_STDIO, {in, out, err}};
-  return spawn_req(&req);
+  static char *value;
+  int len = env_call(ENV_GET, name, 0, 0, 0, 0);
+  if (len < 0)
+    return 0;
+  char *grown = realloc(value, (unsigned)len + 1);
+  if (!grown)
+    return 0;
+  value = grown;
+  env_call(ENV_GET, name, 0, value, (unsigned)len + 1, 0);
+  return value;
 }
 
-/* Child fds 0-2 are a new pty's slave side; *master is our end */
-int spawn_pty(const char *path, char *const argv[], int argc, int *master)
+int setenv(const char *name, const char *value, int overwrite)
 {
-  struct spawn_req req = {path, argv, argc, master, 0, -1, -1, 0, SPAWN_PTY, {-1, -1, -1}};
-  return spawn_req(&req);
+  return env_call(ENV_SET, name, value, 0, 0, overwrite != 0);
+}
+
+int unsetenv(const char *name) { return env_call(ENV_UNSET, name, 0, 0, 0, 0); }
+
+int clearenv(void) { return env_call(ENV_CLEAR, 0, 0, 0, 0, 0); }
+
+/* Entry `index` ("NAME=VALUE") into buf; its full length, or -1 past the end */
+int env_entry(unsigned index, char *buf, unsigned buf_len) { return env_call(ENV_ENTRY, 0, 0, buf, buf_len, index); }
+
+/* Append NAME=VALUE to a block for the env argument of the spawn calls; *block is malloc'd, 0 to start */
+int env_block_add(char **block, const char *name, const char *value)
+{
+  unsigned used = 0;
+  if (*block)
+    while ((*block)[used])
+      used += (unsigned)strlen(*block + used) + 1;
+  unsigned add = (unsigned)strlen(name) + 1 + (unsigned)strlen(value) + 1;
+  char *grown = realloc(*block, used + add + 1);
+  if (!grown)
+    return -1;
+  strcpy(grown + used, name);
+  strcat(grown + used, "=");
+  strcat(grown + used, value);
+  grown[used + add] = '\0';
+  *block = grown;
+  return 0;
 }
 
 int isatty(int fd) { return syscall(SYS_TTY, fd, TTY_ISATTY, 0) == 1; }
@@ -728,6 +794,16 @@ int strcmp(const char *a, const char *b)
     b++;
   }
   return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+char *strchr(const char *s, int c)
+{
+  for (;; s++) {
+    if (*s == (char)c)
+      return (char *)s;
+    if (!*s)
+      return 0;
+  }
 }
 
 void strcpy(char *d, const char *s)

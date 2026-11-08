@@ -56,6 +56,9 @@ uint32_t *sched_current_dir(void); /* current task's page dir (windowing layer) 
 uint32_t sched_current_id(void);   /* current task's pid */
 uint32_t sched_current_process_id(void);
 const char *sched_current_name(void); /* current task's name (crash reporter) */
+struct env;
+struct env *sched_env(void);                                        /* the running process's environment */
+void sched_set_env_block(int pid, const char *block, uint32_t len); /* give a new child exactly this environment */
 void sched_set_pipe_fd(int pid, int fd, int writer, int pipe_id);
 void sched_set_fd(int pid, int fd, const struct fd *f); /* install a copy of an open file in a new child */
 void fd_ref(const struct fd *f);                        /* take a reference for a new copy of an open file */

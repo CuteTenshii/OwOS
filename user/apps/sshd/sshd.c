@@ -670,7 +670,25 @@ static void ssh_session(void)
   const char *fail = "no shell available\r\n";
   char *argv[2] = {"term", "-stdio"};
   int rfd = -1, wfd = -1;
-  int pid = spawn_cap_io_as("/bin/term", argv, 2, S.uid, S.gid, S.home[0] ? S.home : "/", &rfd, &wfd);
+  char *env = 0;
+  env_block_add(&env, "PATH", "/bin");
+  env_block_add(&env, "TERM", "xterm");
+  env_block_add(&env, "USER", S.user);
+  env_block_add(&env, "LOGNAME", S.user);
+  env_block_add(&env, "HOME", S.home[0] ? S.home : "/");
+  env_block_add(&env, "SHELL", "/bin/sh");
+  struct spawn_opts o = {.path = "/bin/term",
+                         .argv = argv,
+                         .argc = 2,
+                         .flags = SPAWN_CREDS,
+                         .uid = S.uid,
+                         .gid = S.gid,
+                         .cwd = S.home[0] ? S.home : "/",
+                         .env = env,
+                         .rfd = &rfd,
+                         .wfd = &wfd};
+  int pid = spawn_ex(&o);
+  free(env);
   if (pid < 0 || rfd < 0 || wfd < 0) {
     if (pid >= 0) {
       kill(pid, SIGKILL);

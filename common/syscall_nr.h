@@ -92,10 +92,28 @@
 #define SYS_UMASK 89
 #define SYS_ACCESS 90
 #define SYS_TTY 91
+#define SYS_ENV 92
+
+/* SYS_ENV commands (ebx points at a struct env_req: cmd, name, name_len, value, value_len, buf, buf_len, index) */
+#define ENV_GET 0   /* copy the value of name into buf (if buf_len > 0); returns its length, -1 if unset */
+#define ENV_SET 1   /* set name to value; index != 0 overwrites an existing one */
+#define ENV_UNSET 2 /* remove name */
+#define ENV_ENTRY 3 /* copy the index-th "NAME=VALUE" into buf; returns its length, -1 past the end */
+#define ENV_CLEAR 4 /* remove everything */
+
+struct env_req {
+  unsigned cmd;
+  unsigned name, name_len;
+  unsigned value, value_len;
+  unsigned buf, buf_len;
+  unsigned index;
+};
 
 /* SYS_SPAWN_CAP request flags */
 #define SPAWN_PTY 1   /* give the child a pty as fds 0-2 and return the master fd in *rfd */
 #define SPAWN_STDIO 2 /* child fds 0-2 are copies of the caller's fds named in stdio[] (-1: left as the default) */
+#define SPAWN_CREDS 8 /* user library only: apply spawn_opts.uid/gid */
+#define SPAWN_ENV 4   /* the child gets the NAME=VALUE block at env (env_len bytes) instead of a copy of ours */
 
 /* SYS_TTY commands (fd in ebx, command in ecx, argument in edx) */
 #define TTY_ISATTY 0   /* 1 if fd is a terminal */

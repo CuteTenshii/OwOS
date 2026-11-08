@@ -20,6 +20,7 @@
 static char username[32] = "root";
 static char home[256] = "/home/root";
 static char hostnm[64] = "owos";
+static int last_status; /* exit status of the last program, for $? */
 
 /* Refresh `username`/`home` for the calling process */
 static void reload_identity(void) { user_ident(username, sizeof username, home, sizeof home); }
@@ -189,6 +190,48 @@ static void prompt(void)
     tputs_c(cwd, FG_PROMPT);
   /* '#' for root, '$' for everyone else, the classic privilege cue */
   tputs_c(strcmp(username, "root") == 0 ? "# " : "$ ", FG_PROMPT);
+}
+
+/* Keep USER, LOGNAME, HOME, SHELL and PWD in step with the shell's identity and directory */
+static void sync_env(void)
+{
+  setenv("USER", username, 1);
+  setenv("LOGNAME", username, 1);
+  setenv("HOME", home, 1);
+  setenv("SHELL", "/bin/sh", 1);
+  setenv("PWD", cwd, 1);
+  setenv("PATH", "/bin", 0);
+}
+
+static bool valid_var_name(const char *s, int len)
+{
+  if (len <= 0 || (s[0] >= '0' && s[0] <= '9'))
+    return false;
+  for (int i = 0; i < len; i++)
+    if (!((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= '0' && s[i] <= '9') || s[i] == '_'))
+      return false;
+  return true;
+}
+
+/* "NAME=value" with a valid NAME */
+static bool is_assignment(const char *w)
+{
+  int n = 0;
+  while (w[n] && w[n] != '=')
+    n++;
+  return w[n] == '=' && valid_var_name(w, n);
+}
+
+static void set_assignment(const char *w)
+{
+  char name[128];
+  int n = 0;
+  while (w[n] != '=' && n < (int)sizeof name - 1) {
+    name[n] = w[n];
+    n++;
+  }
+  name[n] = '\0';
+  setenv(name, w + n + 1, 1);
 }
 
 static void err(const char *a, const char *b)
@@ -499,34 +542,54 @@ static void bi_uptime(void)
   tputs("s\n");
 }
 
+/* Find an executable: a name with a '/' is taken as given, anything else is searched for along PATH. */
+static bool find_command(const char *name, char *out, int cap)
+{
+  struct statinfo st;
+  if (strchr(name, '/')) {
+    abspath(name, out);
+    return stat(out, &st) == 0 && !st.is_dir;
+  }
+  const char *path = getenv("PATH");
+  char *dirs = malloc(strlen(path ? path : "/bin") + 1);
+  if (!dirs)
+    return false;
+  strcpy(dirs, path ? path : "/bin");
+  bool found = false;
+  for (char *dir = dirs; dir && !found;) {
+    char *colon = strchr(dir, ':');
+    if (colon)
+      *colon = '\0';
+    if (strlen(dir) + strlen(name) + 2 <= (unsigned)cap) {
+      strcpy(out, dir);
+      strcat(out, "/");
+      strcat(out, name);
+      found = stat(out, &st) == 0 && !st.is_dir;
+    }
+    dir = colon ? colon + 1 : 0;
+  }
+  free(dirs);
+  return found;
+}
+
+static bool is_builtin(const char *name);
+
 static void bi_which(int argc, char **argv)
 {
-  static const char *const ring3[] = {
-      "help",   "clear",   "echo",     "pwd",      "cd",      "ls",     "cat",      "cp",      "mv",
-      "stat",   "mkdir",   "rmdir",    "rm",       "exit",    "uptime", "hostname", "whoami",  "which",
-      "umask",  "cpuinfo", "meminfo",  "date",     "storage", "sleep",  "id",       "useradd", "userdel",
-      "passwd", "usermod", "groupadd", "groupdel", "users",   "groups", "su",       "login",   "logout",
-  };
   if (argc < 2) {
     tputs("usage: which <name>\n");
     return;
   }
-  for (unsigned i = 0; i < sizeof ring3 / sizeof ring3[0]; i++)
-    if (!strcmp(argv[1], ring3[i])) {
-      tputs(argv[1]);
-      tputs(": shell builtin\n");
-      return;
-    }
   char path[256];
-  strcpy(path, "/bin/");
-  strcat(path, argv[1]);
-  struct statinfo st;
-  if (stat(path, &st) == 0 && !st.is_dir) {
+  if (is_builtin(argv[1])) {
+    tputs(argv[1]);
+    tputs(": shell builtin\n");
+  } else if (find_command(argv[1], path, sizeof path)) {
     tputs(path);
     tputc('\n');
-    return;
+  } else {
+    err(argv[1], " not found");
   }
-  err(argv[1], " not found");
 }
 
 /* control builtins: act via /proc + /sys, no kernel-shell bridge */
@@ -1522,6 +1585,8 @@ static void do_login(const char *name, const char *pass)
   }
   reload_identity();
   strcpy(cwd, home);
+  chdir(cwd);
+  sync_env();
   tputs("now logged in as ");
   tputs_c(username, FG_PROMPT);
   tputc('\n');
@@ -1570,14 +1635,15 @@ static void bi_hostname(int argc, char **argv)
 static void run_program(const char *path, char **argv, int argc)
 {
   oflush();
-  int pid = spawn_stdio(path, argv, argc, 0, 1, 2);
+  struct spawn_opts o = {.path = path, .argv = argv, .argc = argc, .flags = SPAWN_STDIO, .stdio = {0, 1, 2}};
+  int pid = spawn_ex(&o);
   if (pid < 0) {
     err(pid == -EACCES ? "permission denied: " : "failed to launch ", path);
     return;
   }
   tty_set_fg(1, pid);
   for (;;) {
-    if (waitpid_nb(pid, 0)) {
+    if (waitpid_nb(pid, &last_status)) {
       break;
     }
     if (win_owned(pid)) {
@@ -1592,18 +1658,59 @@ static void run_program(const char *path, char **argv, int argc)
 static void run_other(int argc, char **argv)
 {
   char path[256];
-  if (argv[0][0] == '/')
-    strcpy(path, argv[0]);
-  else {
-    strcpy(path, "/bin/");
-    strcat(path, argv[0]);
-  }
-
-  struct statinfo st;
-  if (stat(path, &st) == 0 && !st.is_dir)
+  if (find_command(argv[0], path, sizeof path))
     run_program(path, argv, argc);
   else
     err(argv[0], ": command not found");
+}
+
+static void bi_export(int argc, char **argv)
+{
+  for (int i = 1; i < argc; i++) {
+    if (is_assignment(argv[i]))
+      set_assignment(argv[i]);
+    else if (!valid_var_name(argv[i], (int)strlen(argv[i])))
+      err("export: not a valid name: ", argv[i]);
+  }
+}
+
+static void bi_unset(int argc, char **argv)
+{
+  for (int i = 1; i < argc; i++)
+    unsetenv(argv[i]);
+}
+
+/* env lists every variable; printenv NAME prints one value */
+static void bi_env(int argc, char **argv)
+{
+  if (argc > 1) {
+    const char *v = getenv(argv[1]);
+    if (v) {
+      tputs(v);
+      tputc('\n');
+    }
+    return;
+  }
+  char entry[1024];
+  for (unsigned i = 0; env_entry(i, entry, sizeof entry) >= 0; i++) {
+    tputs(entry);
+    tputc('\n');
+  }
+}
+
+static const char *const builtin_names[] = {
+    "help",     "clear", "echo",    "pwd",   "cd",     "ls",       "cat",     "cp",     "mv",      "stat",
+    "mkdir",    "rmdir", "rm",      "exit",  "uptime", "hostname", "whoami",  "which",  "umask",   "cpuinfo",
+    "meminfo",  "date",  "storage", "sleep", "id",     "useradd",  "userdel", "passwd", "usermod", "groupadd",
+    "groupdel", "users", "groups",  "su",    "login",  "logout",   "export",  "unset",  "env",     "printenv",
+};
+
+static bool is_builtin(const char *name)
+{
+  for (unsigned i = 0; i < sizeof builtin_names / sizeof *builtin_names; i++)
+    if (streq(name, builtin_names[i]))
+      return true;
+  return false;
 }
 
 static void run_argv(int argc, char **argv)
@@ -1625,17 +1732,19 @@ static void run_argv(int argc, char **argv)
     tputs(cwd);
     tputc('\n');
   } else if (!strcmp(c, "cd")) {
-    if (argc < 2) {
-      strcpy(cwd, home);
+    const char *target = argc < 2 ? getenv("HOME") : streq(argv[1], "-") ? getenv("OLDPWD") : argv[1];
+    char p[256], previous[256];
+    strcpy(previous, cwd);
+    abspath(target ? target : home, p);
+    struct statinfo st;
+    int rc = stat(p, &st);
+    if (rc == 0 && st.is_dir && (rc = path_access(p, X_OK)) == 0) {
+      strcpy(cwd, p);
+      chdir(cwd); /* programs we start inherit it */
+      setenv("OLDPWD", previous, 1);
+      setenv("PWD", cwd, 1);
     } else {
-      char p[256];
-      abspath(argv[1], p);
-      struct statinfo st;
-      int rc = stat(p, &st);
-      if (rc == 0 && st.is_dir && (rc = path_access(p, X_OK)) == 0)
-        strcpy(cwd, p);
-      else
-        errc(rc, "cd", "not a directory: ", argv[1]);
+      errc(rc, "cd", "not a directory: ", target ? target : home);
     }
   } else if (!strcmp(c, "ls"))
     bi_ls(argc, argv);
@@ -1717,6 +1826,12 @@ static void run_argv(int argc, char **argv)
     do_login("root", 0);
   else if (!strcmp(c, "which"))
     bi_which(argc, argv);
+  else if (!strcmp(c, "export"))
+    bi_export(argc, argv);
+  else if (!strcmp(c, "unset"))
+    bi_unset(argc, argv);
+  else if (!strcmp(c, "env") || !strcmp(c, "printenv"))
+    bi_env(argc, argv);
   else if (!strcmp(c, "meminfo"))
     cat_proc("meminfo");
   else if (!strcmp(c, "cpuinfo"))
@@ -1763,46 +1878,135 @@ static void run_argv(int argc, char **argv)
     run_other(argc, argv);
 }
 
-/* Split a command line on whitespace, keeping double-quoted runs whole, and run it */
+static char *strdup_empty(void)
+{
+  char *e = malloc(1);
+  if (e)
+    *e = '\0';
+  return e;
+}
+
+/* Append to a growing string */
+struct word {
+  char *s;
+  unsigned len, cap;
+};
+
+static bool word_put(struct word *w, const char *p, unsigned n)
+{
+  if (w->len + n + 1 > w->cap) {
+    unsigned cap = (w->len + n + 1) * 2;
+    char *grown = realloc(w->s, cap);
+    if (!grown)
+      return false;
+    w->s = grown;
+    w->cap = cap;
+  }
+  memcpy(w->s + w->len, p, n);
+  w->len += n;
+  w->s[w->len] = '\0';
+  return true;
+}
+
+/* Expand the variable named at text[*i] (just past a '$') into w */
+static bool expand_var(struct word *w, const char *text, int *i)
+{
+  const char *name = text + *i;
+  int n = 0;
+  if (*name == '?') {
+    char num[12];
+    int digits = 0;
+    unsigned v = (unsigned)last_status;
+    do {
+      num[digits++] = (char)('0' + v % 10);
+      v /= 10;
+    } while (v);
+    for (int k = 0; k < digits; k++)
+      if (!word_put(w, &num[digits - 1 - k], 1))
+        return false;
+    (*i)++;
+    return true;
+  }
+  bool braced = *name == '{';
+  if (braced)
+    name++;
+  while (name[n] && ((name[n] >= 'a' && name[n] <= 'z') || (name[n] >= 'A' && name[n] <= 'Z') ||
+                     (name[n] >= '0' && name[n] <= '9') || name[n] == '_'))
+    n++;
+  if (!valid_var_name(name, n) || (braced && name[n] != '}'))
+    return word_put(w, "$", 1); /* not a variable: keep the '$' */
+  char key[128];
+  if (n >= (int)sizeof key)
+    return true;
+  memcpy(key, name, (unsigned)n);
+  key[n] = '\0';
+  *i += (int)(name - (text + *i)) + n + (braced ? 1 : 0);
+  const char *value = getenv(key);
+  return !value || word_put(w, value, (unsigned)strlen(value));
+}
+
+/* Split a command line into words (whitespace-separated; '', "" and \ quote; $NAME, ${NAME} and $? expand
+ * outside single quotes) and run it. A line of NAME=value words only sets environment variables. */
 static void run_line(const char *text)
 {
   unsigned len = (unsigned)strlen(text);
-  char *buf = malloc(len + 1);
   char **argv = malloc((len / 2 + 2) * sizeof *argv);
-  if (!buf || !argv) {
-    free(buf);
-    free(argv);
+  int argc = 0;
+  if (!argv)
     return;
-  }
-  strcpy(buf, text);
-  int argc = 0, i = 0;
-  while (buf[i]) {
-    while (buf[i] == ' ')
-      i++;
-    if (!buf[i])
-      break;
-    char *w = &buf[i];
-    argv[argc++] = w;
-    while (buf[i] && buf[i] != ' ') {
-      if (buf[i] == '"') {
-        i++;
-        while (buf[i] && buf[i] != '"')
-          *w++ = buf[i++];
-        if (buf[i] == '"')
-          i++;
-      } else {
-        *w++ = buf[i++];
+  struct word w = {0, 0, 0};
+  bool in_word = false, ok = true;
+  char quote = 0;
+  for (int i = 0; text[i] && ok;) {
+    char c = text[i++];
+    if (quote == '\'') {
+      if (c == '\'')
+        quote = 0;
+      else
+        ok = word_put(&w, &c, 1);
+    } else if (c == '\\' && text[i]) {
+      in_word = true;
+      ok = word_put(&w, &text[i++], 1);
+    } else if (c == '\'' || c == '"') {
+      in_word = true;
+      if (!quote)
+        quote = c;
+      else if (quote == c)
+        quote = 0;
+      else
+        ok = word_put(&w, &c, 1);
+    } else if (c == '$') {
+      in_word = true;
+      ok = expand_var(&w, text, &i);
+    } else if ((c == ' ' || c == '\t') && !quote) {
+      if (in_word) {
+        argv[argc++] = w.s ? w.s : strdup_empty();
+        w.s = 0;
+        w.len = w.cap = 0;
+        in_word = false;
       }
+    } else {
+      in_word = true;
+      ok = word_put(&w, &c, 1);
     }
-    if (buf[i])
-      i++;
-    *w = '\0';
   }
+  if (in_word && ok)
+    argv[argc++] = w.s ? w.s : strdup_empty();
+  else
+    free(w.s);
   argv[argc] = 0;
-  if (argc)
+  bool assignments = argc > 0;
+  for (int i = 0; i < argc; i++)
+    assignments = assignments && is_assignment(argv[i]);
+  if (assignments) {
+    for (int i = 0; i < argc; i++)
+      set_assignment(argv[i]);
+  } else if (argc && ok) {
     run_argv(argc, argv);
+  }
+  for (int i = 0; i < argc; i++)
+    free(argv[i]);
   free(argv);
-  free(buf);
 }
 
 /* line editor */
@@ -2009,6 +2213,8 @@ int main(int argc, char **argv)
   reload_identity();
   gethostname(hostnm, sizeof hostnm);
   strcpy(cwd, home);
+  chdir(cwd);
+  sync_env();
 
   if (argc >= 3 && streq(argv[1], "-c")) {
     run_line(argv[2]);

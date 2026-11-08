@@ -126,6 +126,8 @@ void syscall_exec_spawn_cap(struct registers *r)
     uint32_t cwd;
     uint32_t flags;
     int stdio[3];
+    uint32_t env;
+    uint32_t env_len;
   };
   if (!user_range(r->ebx, sizeof(struct cap_req))) {
     r->eax = (uint32_t)-1;
@@ -136,7 +138,7 @@ void syscall_exec_spawn_cap(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  bool pty = req.flags & SPAWN_PTY, dup_stdio = req.flags & SPAWN_STDIO;
+  bool pty = req.flags & SPAWN_PTY, dup_stdio = req.flags & SPAWN_STDIO, set_env = req.flags & SPAWN_ENV;
   bool want_rfd = !dup_stdio; /* the capture pipe, or the pty master */
   if (!user_range(req.path, 1) || (want_rfd && !user_out_range(req.rfd, 4)) || (pty && dup_stdio)) {
     r->eax = (uint32_t)-1;
@@ -144,6 +146,10 @@ void syscall_exec_spawn_cap(struct registers *r)
   }
   int want_stdin = !pty && !dup_stdio && req.wfd != 0;
   if (want_stdin && !user_out_range(req.wfd, 4)) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  if (set_env && !user_range(req.env, req.env_len)) {
     r->eax = (uint32_t)-1;
     return;
   }
@@ -291,6 +297,12 @@ void syscall_exec_spawn_cap(struct registers *r)
   if (set_uid || set_gid)
     sched_set_creds(pid, set_uid ? (uint32_t)req.uid : sched_uid(), set_gid ? (uint32_t)req.gid : sched_gid());
   sched_set_cwd(pid, req.cwd ? cwdbuf : sched_cwd()); /* explicit cwd, else inherit */
+  if (set_env) {
+    char *block = kmalloc(req.env_len ? req.env_len : 1);
+    if (block && copyin(block, req.env, req.env_len) == 0)
+      sched_set_env_block(pid, block, req.env_len);
+    kfree(block);
+  }
   if (want_rfd && copyout(req.rfd, &rfd, sizeof rfd) != 0) {
     r->eax = (uint32_t)-1;
     return;
