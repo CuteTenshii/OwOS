@@ -74,6 +74,7 @@ const unsigned g_nhtml_ifaces = sizeof g_html_ifaces / sizeof g_html_ifaces[0];
 js_object *g_custom_elements;       /* registry: tag name -> class constructor */
 js_object *g_module_cache;          /* ES module registry: abs URL -> namespace */
 js_object *g_module_src;            /* prefetched module sources: abs URL -> text */
+js_object *g_importmap;             /* import map: bare specifier -> URL string */
 js_object *g_document_proto;        /* shared by the live doc + DOMParser docs */
 js_object *g_response_proto;        /* fetch() Response.prototype */
 js_object *g_ws_proto;              /* WebSocket.prototype */
@@ -1543,6 +1544,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   g_custom_elements = js_new_object(ctx, ctx->object_proto);
   g_module_cache = js_new_object(ctx, ctx->object_proto);
   g_module_src = js_new_object(ctx, ctx->object_proto);
+  g_importmap = js_new_object(ctx, ctx->object_proto);
   g_document_proto = js_new_object(ctx, g_node_proto);
   g_response_proto = js_new_object(ctx, ctx->object_proto);
   g_ws_proto = js_new_object(ctx, ctx->object_proto);
@@ -1578,6 +1580,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   gc_add_root((void **)&g_custom_elements);
   gc_add_root((void **)&g_module_cache);
   gc_add_root((void **)&g_module_src);
+  gc_add_root((void **)&g_importmap);
   gc_add_root((void **)&g_document_proto);
   gc_add_root((void **)&g_response_proto);
   gc_add_root((void **)&g_ws_proto);

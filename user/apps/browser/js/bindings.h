@@ -152,6 +152,7 @@ extern js_object *g_formdata_proto;
 extern bool g_has_listeners;
 extern js_object *g_module_cache;
 extern js_object *g_module_src;
+extern js_object *g_importmap;
 extern int g_ntimers;
 extern js_object *g_rtc_proto;
 extern js_object *g_sp_proto;

@@ -386,6 +386,33 @@ static bool script_deferred(struct dom_node *s)
   return false;
 }
 
+static void load_importmaps(struct dom_node *n)
+{
+  for (struct dom_node *c = n->first_child; c; c = c->next) {
+    const char *type = c->type == DOM_ELEMENT && streq(c->tag, "script") ? dom_get_attr(c, "type") : 0;
+    if (type && contains_ci(type, "importmap")) {
+      char *text = script_text(c);
+      js_value json = js_get(g_ctx, js_obj_value(g_ctx->global), "JSON");
+      js_value parse = js_get(g_ctx, json, "parse");
+      if (text && js_is_callable(parse)) {
+        js_value arg = js_mk_cstring(g_ctx, text);
+        js_value map = js_call(g_ctx, parse, json, &arg, 1);
+        js_value imports = g_ctx->has_exc ? js_undef() : js_get(g_ctx, map, "imports");
+        if (g_ctx->has_exc)
+          g_ctx->has_exc = 0;
+        if (imports.type == JV_OBJ)
+          for (int i = 0; i < imports.u.obj->props.n; i++) {
+            pentry *pe = &imports.u.obj->props.e[i];
+            if (pe->value.type == JV_STR && !js_has_own(g_importmap, pe->key))
+              js_def(g_importmap, pe->key, pe->value, 0);
+          }
+      }
+      free(text);
+    }
+    load_importmaps(c);
+  }
+}
+
 void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn fetch)
 {
   struct dom_node **scripts;
@@ -470,6 +497,7 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
   g_fetch = fetch; /* the loader uses it for modules */
   strlcpy(g_page_url_buf, page_url ? page_url : "", URL_MAX);
   g_page_live = 1;
+  load_importmaps(root);
 
   /* CSP: without 'unsafe-eval', neutralise the dynamic-code globals so the page's own scripts can't */
   if (B->pg->csp && !csp_allows_eval(B->pg->csp)) {
@@ -637,6 +665,7 @@ void js_page_end(void)
   gc_remove_root((void **)&g_custom_elements);
   gc_remove_root((void **)&g_module_cache);
   gc_remove_root((void **)&g_module_src);
+  gc_remove_root((void **)&g_importmap);
   gc_remove_root((void **)&g_document_proto);
   gc_remove_root((void **)&g_response_proto);
   gc_remove_root((void **)&g_ws_proto);
@@ -685,6 +714,7 @@ void js_page_end(void)
   g_event_proto = g_html_proto = g_custom_elements = g_document = g_live_wrappers = 0;
   g_module_cache = g_document_proto = g_response_proto = 0;
   g_module_src = 0;
+  g_importmap = 0;
   g_ws_proto = g_websockets = 0;
   g_bchannel_proto = g_bchannels = 0;
   g_xhr_proto = 0;

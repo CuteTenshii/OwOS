@@ -383,6 +383,32 @@ static bool mod_word_before(const char *src, const char *q, const char *w)
   return true;
 }
 
+/* Resolve a module specifier: import map first (exact key, then "prefix/" keys), else relative to the referrer */
+static void module_resolve(const char *referrer, const char *spec, char *out, int cap)
+{
+  if (spec[0] != '.' && spec[0] != '/') {
+    pentry *pe = pmap_find_pub(g_importmap, spec);
+    if (pe && pe->value.type == JV_STR) {
+      resolve_url(g_page_url_buf, pe->value.u.str->data, out, cap);
+      return;
+    }
+    int sl = (int)strlen(spec);
+    for (int i = 0; i < g_importmap->props.n; i++) {
+      pentry *pf = &g_importmap->props.e[i];
+      int kl = (int)strlen(pf->key);
+      if (kl > 0 && pf->key[kl - 1] == '/' && sl > kl && memcmp(spec, pf->key, (unsigned)kl) == 0) {
+        char joined[URL_MAX];
+        int vl = pf->value.u.str->len < URL_MAX - 1 ? pf->value.u.str->len : URL_MAX - 1;
+        memcpy(joined, pf->value.u.str->data, (unsigned)vl);
+        strlcpy(joined + vl, spec + kl, sizeof joined - (unsigned)vl);
+        resolve_url(g_page_url_buf, joined, out, cap);
+        return;
+      }
+    }
+  }
+  resolve_url(referrer, spec, out, cap);
+}
+
 /* Scan a module's source for its static import specifiers and batch-fetch the uncached ones in ONE */
 #define MODULE_PREFETCH_MAX 192
 static void module_prefetch_deps(const char *base, const char *src)
@@ -401,14 +427,15 @@ static void module_prefetch_deps(const char *base, const char *src)
       e++;
     if (*e != qc)
       break; /* unterminated: stop scanning */
-    if (e > s && (*s == '.' || *s == '/') && (mod_word_before(src, p, "from") || mod_word_before(src, p, "import"))) {
-      char spec[URL_MAX];
-      int k = 0;
-      for (const char *c = s; c < e && k < URL_MAX - 1; c++)
-        spec[k++] = *c;
-      spec[k] = 0;
+    char spec[URL_MAX];
+    int k = 0;
+    for (const char *c = s; c < e && k < URL_MAX - 1; c++)
+      spec[k++] = *c;
+    spec[k] = 0;
+    if (e > s && (*s == '.' || *s == '/' || pmap_find_pub(g_importmap, spec)) &&
+        (mod_word_before(src, p, "from") || mod_word_before(src, p, "import"))) {
       char abs[URL_MAX];
-      resolve_url(base, spec, abs, sizeof abs);
+      module_resolve(base, spec, abs, sizeof abs);
       if (!pmap_find_pub(g_module_src, abs) && !pmap_find_pub(g_module_cache, abs)) {
         bool dup = false;
         for (int i = 0; i < n; i++)
@@ -459,7 +486,7 @@ js_object *browser_load_module(js_ctx *ctx, const char *spec, void *ud)
   js_object *exports;
   char *code = 0;
   (void)ud;
-  resolve_url(referrer, spec, abs, sizeof abs);
+  module_resolve(referrer, spec, abs, sizeof abs);
   cached = pmap_find_pub(g_module_cache, abs);
   if (cached && cached->value.type == JV_OBJ)
     return cached->value.u.obj;
