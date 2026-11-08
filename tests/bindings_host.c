@@ -53,6 +53,46 @@ unsigned char *browser_cors_fetch(const char *page, int cred, const struct http_
   (void)rs;
   return 0;
 }
+/* Image fixtures: a data: URL carries its bytes verbatim after the comma; "RAW" w h then w*h*4 RGBA decodes to itself
+ */
+unsigned char *decode_data_url(const char *url, int *outlen, char *ctype, int cap)
+{
+  const char *comma = strchr(url, ',');
+  if (!comma)
+    return 0;
+  int n = (int)strlen(comma + 1);
+  unsigned char *out = malloc((size_t)n + 1);
+  memcpy(out, comma + 1, (size_t)n + 1);
+  *outlen = n;
+  snprintf(ctype, (size_t)cap, "image/x-raw");
+  return out;
+}
+unsigned char *image_decode_rgba(const unsigned char *data, int len, unsigned current_color, int max_edge, unsigned *w,
+                                 unsigned *h)
+{
+  (void)current_color;
+  (void)max_edge;
+  if (len < 5 || memcmp(data, "RAW", 3) != 0 || len < 5 + data[3] * data[4] * 4)
+    return 0;
+  *w = data[3];
+  *h = data[4];
+  unsigned char *out = malloc((size_t)*w * *h * 4);
+  memcpy(out, data + 5, (size_t)*w * *h * 4);
+  return out;
+}
+int woff_is_woff(const unsigned char *d, int n)
+{
+  (void)d;
+  (void)n;
+  return 0;
+}
+unsigned char *woff_to_sfnt(const unsigned char *d, int n, int *out)
+{
+  (void)d;
+  (void)n;
+  (void)out;
+  return 0;
+}
 unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
 {
   (void)rq;

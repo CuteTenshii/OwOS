@@ -243,6 +243,10 @@ static void walk_element_inner(struct dom_node *el)
     handle_img(el, &cs);
     return;
   }
+  if (streq(name, "canvas")) {
+    handle_canvas(el, &cs);
+    return;
+  }
   if (streq(name, "audio") || streq(name, "video")) {
     handle_media(el);
     return;

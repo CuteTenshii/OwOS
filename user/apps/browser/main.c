@@ -1,4 +1,5 @@
 /* main.c , the browser's windowed UI and event loop. Owns the one `struct browser` instance */
+#include "features/canvas/canvas.h"
 #include "main_int.h"
 
 static struct browser binst;
@@ -251,6 +252,7 @@ int main(int argc, char **argv)
     }
 
     animimg_tick();
+    canvas_tick();
     image_anim_tick();
 
     int due = !B->loading || (frame - last_paint_frame) >= LOAD_REDRAW_FRAMES;

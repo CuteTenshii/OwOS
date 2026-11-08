@@ -1,6 +1,7 @@
 /* Page lifecycle: script discovery, execution and teardown. */
 
 #include "bindings.h"
+#include "canvasjs.h"
 #include "features/mediasession/mediasession.h"
 #include "features/notification/notification.h"
 #include "websocket.h"
@@ -641,6 +642,7 @@ void js_page_end(void)
   gc_remove_root((void **)&g_ws_proto);
   gc_remove_root((void **)&g_xhr_proto);
   gc_remove_root((void **)&g_blob_proto);
+  canvas_js_teardown();
   gc_remove_root((void **)&g_remote_proto);
   gc_remove_root((void **)&g_remotes);
   gc_remove_root((void **)&g_clipitem_proto);

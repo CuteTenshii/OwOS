@@ -292,6 +292,8 @@ static void trace(void *obj, int kind)
   }
 }
 
+void (*js_host_finalizer)(js_object *o);
+
 static void finalize(void *obj, int kind)
 {
   if (kind == GCK_STRING) {
@@ -324,6 +326,8 @@ static void finalize(void *obj, int kind)
     }
     if (o->kind == OBJ_TYPEDARRAY && o->host)
       free(o->host); /* the view; its buffer is GC'd separately */
+    if (o->kind == OBJ_HOST && o->host && js_host_finalizer)
+      js_host_finalizer(o);
   }
 }
 

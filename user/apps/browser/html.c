@@ -353,6 +353,7 @@ static void layout_dom(void)
 void html_page_teardown(void)
 {
   js_page_end();
+  canvas_page_end(g_live_dom);
   media_page_teardown(); /* stop playback + free this page's media */
   if (g_live_dom) {
     dom_free(g_live_dom);

@@ -47,7 +47,8 @@ enum {
   OBJ_ARRAYBUFFER,
   OBJ_TYPEDARRAY,
   OBJ_BIGINT,
-  OBJ_PROXY
+  OBJ_PROXY,
+  OBJ_HOST /* embedder object: `host` is freed through js_host_finalizer */
 };
 
 /* typed-array element kinds (index into ta_elem_size). DataView uses type -1.
@@ -66,6 +67,9 @@ typedef struct {
   js_object *buffer;
   int type, offset, length;
 } js_typedarray;
+
+/* Called when an OBJ_HOST object is collected; release o->host here. */
+extern void (*js_host_finalizer)(js_object *o);
 
 /* property entry flags */
 enum { P_ENUMERABLE = 1, P_WRITABLE = 2, P_CONFIGURABLE = 4, P_ACCESSOR = 8 };

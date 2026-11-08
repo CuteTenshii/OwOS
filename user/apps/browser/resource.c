@@ -1867,6 +1867,34 @@ void resource_commit_inline(int idx, const unsigned char *body, int len, unsigne
   commit_image(idx, body, len, current_color);
 }
 
+/* Commit raw RGBA pixels (a canvas bitmap) into slot `idx` as an unfetched image. Returns its uid, 0 if the pool is
+ * full. */
+int resource_commit_rgba(int idx, const unsigned char *rgba, unsigned w, unsigned h)
+{
+  struct inl_img *im = &B->pg->imgs[idx];
+  long long bytes = (long long)w * h * 4;
+  int off = -1, uid = 0;
+  mutex_lock(&g_img_lock);
+  if (w && h && bytes <= (long long)(IMG_POOL - B->img_pool_len)) {
+    off = B->img_pool_len;
+    B->img_pool_len += (int)bytes;
+    uid = ++B->pg->img_uid_next;
+  }
+  mutex_unlock(&g_img_lock);
+  if (off < 0)
+    return 0;
+  memcpy(B->img_pool + off, rgba, (unsigned)bytes);
+  im->coff = off;
+  im->clen = (int)bytes;
+  im->iw = w;
+  im->ih = h;
+  im->is_argb = 1;
+  im->uid = uid;
+  im->ok = 1; /* set last: the UI draws once ok is seen */
+  B->seq++;
+  return uid;
+}
+
 /* Fetch inline image `i` over its own HTTP/1.1 socket and commit it; thread-safe. */
 static void fetch_image(int i, const char *page_url)
 {

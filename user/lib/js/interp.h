@@ -154,6 +154,8 @@ int js_run_module(js_ctx *ctx, struct js_node *program, js_object *exports, cons
  * ctx->has_exc set; callers in native code must check and propagate. */
 js_value js_call(js_ctx *ctx, js_value fn, js_value thisv, js_value *args, int argc);
 js_value js_construct(js_ctx *ctx, js_value fn, js_value *args, int argc);
+/* A zeroed typed array (TA_* element kind) of `length` elements over a fresh ArrayBuffer. */
+js_value js_new_typedarray(js_ctx *ctx, int type, int length);
 
 /* Async stack chaining, for embedders that defer a callback (a timer job, a
  * queued event) past the call that scheduled it. js_async_capture() snapshots

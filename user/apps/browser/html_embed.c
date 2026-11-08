@@ -215,6 +215,54 @@ void handle_img(struct dom_node *el, const struct css_style *cs)
   W_run_nl = 1;
 }
 
+/* <canvas>: its bitmap is committed into the image pool like an inline <img>; canvas_tick keeps it current. */
+void handle_canvas(struct dom_node *el, const struct css_style *cs)
+{
+  if (!browser_ensure_imgs(B->pg->n_imgs + 1))
+    return;
+  struct canvas_rec *r = canvas_open(el, g_live_dom);
+  if (!r)
+    return;
+  int aw, ah;
+  canvas_attr_size(el, &aw, &ah);
+  if ((aw != r->c->w || ah != r->c->h) && canvas_resize(r, aw, ah))
+    r->uid = 0;
+  char key[48];
+  int k = 0;
+  sapp(key, &k, sizeof key, "canvas:");
+  uapp(key, &k, sizeof key, (unsigned)r->id);
+  sapp(key, &k, sizeof key, ":");
+  uapp(key, &k, sizeof key, (unsigned)r->c->w);
+  sapp(key, &k, sizeof key, "x");
+  uapp(key, &k, sizeof key, (unsigned)r->c->h);
+
+  if (W_run_nl < 1 && W_n > 0)
+    W_n = text_put(W_n, '\n', 0);
+  int idx = B->pg->n_imgs;
+  struct inl_img *im = &B->pg->imgs[idx];
+  if (!img_carry_take(&g_carry, im, key, idx, true, B->pg->imgs)) {
+    img_clear(im);
+    mutex_lock(&r->lock);
+    r->uid = resource_commit_rgba(idx, r->c->px, (unsigned)r->c->w, (unsigned)r->c->h);
+    mutex_unlock(&r->lock);
+  } else {
+    r->uid = im->uid;
+  }
+  strlcpy(im->href, key, (int)sizeof im->href);
+  strlcpy(im->alt, "[canvas]", (int)sizeof im->alt);
+  im->lazy = 0;
+  im->cw = (cs->width >= 0) ? cs->width : 0;
+  im->ch = (cs->height >= 0) ? cs->height : 0;
+  im->text_pos = W_n;
+  im->rows = 0;
+  im->start_row = -1;
+  im->want = 0;
+  im->fetched = 1; /* nothing to fetch */
+  B->pg->n_imgs++;
+  W_n = text_put(W_n, '\n', 0);
+  W_run_nl = 1;
+}
+
 /* <audio>/<video>: register the media element and, when it has a visible widget (any <video> */
 void handle_media(struct dom_node *el)
 {

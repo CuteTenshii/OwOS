@@ -1,3 +1,4 @@
+#include "features/canvas/canvas.h"
 #include "features/mediasession/mediasession.h"
 #include "main_int.h"
 
@@ -322,6 +323,7 @@ void worker_fn(void)
         B->seq++;
       }
     }
+    canvas_flush();
     mediasession_tick(B->pg->doc_title, B->pg->cur_url);
 
     /* Drive CSS animations/transitions */

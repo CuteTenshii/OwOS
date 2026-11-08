@@ -2,6 +2,7 @@
  * Scripts run before layout. DOM nodes are wrapper objects whose `host` slot is the dom_node. */
 
 #include "bindings.h"
+#include "canvasjs.h"
 #include "classlist.h"
 #include "dom_query.h"
 #include "features/clienthints/clienthints.h"
@@ -168,7 +169,7 @@ bool node_is_comment(const struct dom_node *n) { return n->type == DOM_ELEMENT &
 
 struct dom_node *node_of(js_value v)
 {
-  if (v.type != JV_OBJ)
+  if (v.type != JV_OBJ || v.u.obj->kind == OBJ_HOST)
     return 0;
   return (struct dom_node *)v.u.obj->host;
 }
@@ -2228,6 +2229,8 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "Blob", js_obj_value(bc), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
+
+  canvas_js_setup(ctx, win);
 
   /* AbortController / AbortSignal (used by fetch() and event listeners). */
   def_method(g_abortsignal_proto, "addEventListener", el_add_listener, 3);

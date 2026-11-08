@@ -8,7 +8,7 @@ RUN     := $(abspath $(B))/run
 
 INCLUDES := -Iscripts -Itests -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc -Iuser/lib/base64 \
             -Iuser/lib/curl -Iuser/lib/crypto -Iuser/lib/resolve -Iuser/lib/zlib -Iuser/lib/stun \
-            -Iuser/lib/mp4 -Iuser/lib/sqlite -Iuser/lib/gfx -Iuser/lib/png -Iuser/lib/webp -Iuser/lib/gif -Iuser/lib/imganim -Iuser/lib/tz -Iuser/lib/desktop \
+            -Iuser/lib/mp4 -Iuser/lib/sqlite -Iuser/lib/gfx -Iuser/lib/png -Iuser/lib/webp -Iuser/lib/gif -Iuser/lib/imganim -Iuser/lib/canvas2d -Iuser/lib/font -Iuser/lib/tz -Iuser/lib/desktop \
             -Iuser/lib/ntp -Iuser/lib/netconn -Iuser/lib/notify -Iuser/lib/mediactl -Iuser/apps/browser \
             -Iuser/apps/browser/js -Iuser/lib/cast -Iuser/lib/clipboard -Iuser/lib/websocket \
             -Iuser/lib/brotli -Iuser/lib/rar -Iuser/lib/mime -Iuser/lib/font
@@ -35,8 +35,10 @@ COMMON_SRCS := $(BROWSER)/css/engine.c $(BROWSER)/css/engine_values.c $(BROWSER)
   $(LIB)/gc/gc.c scripts/host_math.c $(LIB)/opt.c $(LIB)/mutex.c
 MAIN_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(LIB)/gfx/scrollview.c $(LIB)/zlib/crc32.c kernel/crc32c.c $(LIB)/stun/stun.c $(LIB)/ntp/ntp.c \
   $(LIB)/font/font.c $(LIB)/font/woff.c $(LIB)/mediactl/session.c $(LIB)/mp4/mp4.c $(wildcard $(LIB)/rar/*.c) $(LIB)/brotli/decode.c \
-  drivers/usb/hid_desc.c $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c
-BIND_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/blobstore.c
+  drivers/usb/hid_desc.c $(LIB)/png/png.c $(LIB)/zlib/inflate.c $(LIB)/webp/webp.c $(LIB)/webp/vp8.c $(LIB)/gif/gif.c $(LIB)/imganim/imganim.c \
+  $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c
+BIND_SRCS := $(COMMON_SRCS) $(LIB)/mime/mime.c $(BROWSER)/js/dom_query.c $(BROWSER)/blobstore.c $(BROWSER)/features/canvas/canvas.c \
+  $(wildcard $(LIB)/canvas2d/*.c) $(LIB)/font/font.c $(LIB)/zlib/crc32.c
 
 MAIN_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^\#define OWOS_SUITE_TEST$$' tests/*_test.c)))
 BIND_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^\#define OWOS_SUITE_BINDINGS$$' tests/*_test.c)))
@@ -50,7 +52,7 @@ EXTRA_btrfs       := $(HOST_DEFS)
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
 IMPLS := $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o
-BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob xhr realtime timers webcomponents dialog forms url fetchapi navigation elementapi documentapi
+BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webcomponents dialog forms url fetchapi navigation elementapi documentapi
 BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/clienthints.o \
               $(B)/bind/impl/permissions.o $(B)/bind/impl/host.o $(B)/impl/test_runner.o
 

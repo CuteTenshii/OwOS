@@ -6,7 +6,8 @@
 
 #include "browser.h"
 #include "css.h"
-#include "features/anim/anim.h"    /* CSS @keyframes / transition engine */
+#include "features/anim/anim.h" /* CSS @keyframes / transition engine */
+#include "features/canvas/canvas.h"
 #include "features/media/bmedia.h" /* <audio>/<video> element registration */
 #include "features/svg/svg.h"
 #include "font.h"
@@ -104,6 +105,7 @@ int open_link(struct dom_node *el);
 void close_link(void);
 void handle_svg(struct dom_node *el, const struct css_style *cs);
 void handle_img(struct dom_node *el, const struct css_style *cs);
+void handle_canvas(struct dom_node *el, const struct css_style *cs);
 void handle_media(struct dom_node *el);
 void handle_favicon(struct dom_node *el);
 void emit_lit(const char *s, unsigned char a);

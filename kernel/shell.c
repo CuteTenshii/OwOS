@@ -35,8 +35,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LINE_MAX 128
-#define HIST_MAX 16
+#define LINE_MAX 16384
+#define HIST_MAX 64
 
 static char line[LINE_MAX];
 static size_t line_len;     /* characters currently in line */
@@ -466,7 +466,7 @@ static void grep_emit(const char *pattern, char *buf)
 /* "grep <pattern> [file]": plain substring match on a file, or on piped input when no file. */
 static void cmd_grep(const char *arg)
 {
-  char pattern[LINE_MAX];
+  char pattern[256];
   int i = 0;
   while (arg[i] && arg[i] != ' ' && i < (int)sizeof(pattern) - 1) {
     pattern[i] = arg[i];

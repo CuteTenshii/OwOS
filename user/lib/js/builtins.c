@@ -7278,6 +7278,16 @@ static js_value new_view(js_ctx *ctx, int type, js_object *buf, int offset, int 
   gc_pop_scope();
   return v;
 }
+js_value js_new_typedarray(js_ctx *ctx, int type, int length)
+{
+  js_object *buf;
+  js_value v;
+  gc_push_scope();
+  buf = (js_object *)gc_keep(new_arraybuffer(ctx, mul_sat(length, ta_elem_size(type))));
+  v = new_view(ctx, type, buf, 0, length);
+  gc_pop_scope();
+  return v;
+}
 static js_typedarray *as_ta(js_value t)
 {
   return (t.type == JV_OBJ && t.u.obj->kind == OBJ_TYPEDARRAY) ? (js_typedarray *)t.u.obj->host : 0;

@@ -505,5 +505,6 @@ void html_iframe_resolve(const char *url, const char *parent, int verdict, const
 void fetch_iframes(void); /* resource.c: drain + fetch the pending set */
 /* Commit in-memory image bytes into slot idx; SVG is rasterized with `current_color` (0xRRGGBB). */
 void resource_commit_inline(int idx, const unsigned char *body, int len, unsigned current_color);
+int resource_commit_rgba(int idx, const unsigned char *rgba, unsigned w, unsigned h);
 
 #endif /* OWOS_BROWSER_H */
