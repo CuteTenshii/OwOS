@@ -76,6 +76,8 @@ struct ssh {
   char user[64];
   int uid, gid;
   char home[192];
+  char term[32]; /* the client's $TERM and window size from its pty-req */
+  unsigned cols, rows;
 };
 
 static struct ssh S;
@@ -668,39 +670,36 @@ static int top_up_window(void)
 static void ssh_session(void)
 {
   const char *fail = "no shell available\r\n";
-  char *argv[2] = {"term", "-stdio"};
-  int rfd = -1, wfd = -1;
+  char *argv[1] = {"sh"};
+  int master = -1;
   char *env = 0;
   env_block_add(&env, "PATH", "/bin");
-  env_block_add(&env, "TERM", "xterm");
+  env_block_add(&env, "TERM", S.term[0] ? S.term : "xterm");
   env_block_add(&env, "USER", S.user);
   env_block_add(&env, "LOGNAME", S.user);
   env_block_add(&env, "HOME", S.home[0] ? S.home : "/");
   env_block_add(&env, "SHELL", "/bin/sh");
-  struct spawn_opts o = {.path = "/bin/term",
+  struct spawn_opts o = {.path = "/bin/sh",
                          .argv = argv,
-                         .argc = 2,
-                         .flags = SPAWN_CREDS,
+                         .argc = 1,
+                         .flags = SPAWN_PTY | SPAWN_CREDS,
                          .uid = S.uid,
                          .gid = S.gid,
                          .cwd = S.home[0] ? S.home : "/",
                          .env = env,
-                         .rfd = &rfd,
-                         .wfd = &wfd};
+                         .rfd = &master};
   int pid = spawn_ex(&o);
   free(env);
-  if (pid < 0 || rfd < 0 || wfd < 0) {
+  if (pid < 0 || master < 0) {
     if (pid >= 0) {
       kill(pid, SIGKILL);
       waitpid(pid);
     }
-    if (rfd >= 0)
-      close(rfd);
-    if (wfd >= 0)
-      close(wfd);
     send_data((const unsigned char *)fail, (int)strlen(fail));
     return;
   }
+  if (S.cols && S.rows)
+    tty_set_size(master, (int)S.cols, (int)S.rows);
 
   unsigned char buf[1024];
   bool done = false;
@@ -708,13 +707,13 @@ static void ssh_session(void)
   while (!done) {
     bool progressed = false;
 
-    int rn = read_nb(rfd, buf, (int)sizeof buf);
+    int rn = read_nb(master, buf, (int)sizeof buf);
     if (rn > 0) {
       if (send_data(buf, rn) < 0)
         break;
       progressed = true;
     } else if (rn < 0)
-      break; /* shell exited: its stdout end closed */
+      break; /* the shell exited */
 
     if (rx_pump() < 0)
       break;
@@ -727,17 +726,33 @@ static void ssh_session(void)
         r32(S.payload, &p);
         unsigned dn = r32(S.payload, &p);
         if (dn <= (unsigned)(plen - p) && !stdin_closed) {
-          write(wfd, S.payload + p, (int)dn);
+          for (unsigned i = 0; i < dn; i++) {
+            int fg = S.payload[p + i] == 0x03 ? tty_fg(master) : 0;
+            if (fg > 0)
+              kill(fg, SIGINT); /* Ctrl+C interrupts the running program rather than the shell's line */
+            else
+              write(master, S.payload + p + i, 1);
+          }
           S.local_window = S.local_window > dn ? S.local_window - dn : 0;
         }
       } else if (t == MSG_CHANNEL_WINDOW_ADJUST) {
         int p = 1;
         r32(S.payload, &p);
         S.peer_window += r32(S.payload, &p);
+      } else if (t == MSG_CHANNEL_REQUEST) {
+        int p = 1;
+        char req[32];
+        r32(S.payload, &p);
+        get_str(&p, plen, req, sizeof req);
+        p++; /* want_reply */
+        if (streq(req, "window-change")) {
+          unsigned cols = r32(S.payload, &p), rows = r32(S.payload, &p);
+          tty_set_size(master, (int)cols, (int)rows);
+        }
       } else if (t == MSG_CHANNEL_EOF) {
-        /* client won't send more stdin: close the shell's stdin so it sees EOF */
+        /* the client won't send more input: end of file for the shell, as Ctrl+D does at its prompt */
         if (!stdin_closed) {
-          close(wfd);
+          write(master, "\x04", 1);
           stdin_closed = true;
         }
       } else if (t == MSG_CHANNEL_CLOSE || t == MSG_DISCONNECT) {
@@ -755,10 +770,8 @@ static void ssh_session(void)
       msleep(4);
   }
 
-  if (!stdin_closed)
-    close(wfd);       /* drop our stdin writer -> shell sees EOF */
-  close(rfd);         /* drop our stdout reader */
-  kill(pid, SIGKILL); /* stop the shell if still running */
+  close(master);      /* the shell sees end of file */
+  kill(pid, SIGKILL); /* stop it if still running */
   waitpid(pid);       /* reap it */
 }
 
@@ -816,6 +829,12 @@ static int do_channel(void)
     int want_reply = (rp < plen) ? S.payload[rp] : 0;
 
     if (streq(req, "pty-req") || streq(req, "env")) {
+      if (streq(req, "pty-req")) {
+        rp++; /* want_reply */
+        get_str(&rp, plen, S.term, sizeof S.term);
+        S.cols = r32(S.payload, &rp);
+        S.rows = r32(S.payload, &rp);
+      }
       if (want_reply) {
         unsigned char r[5];
         int z = 0;
