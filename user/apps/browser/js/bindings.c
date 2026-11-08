@@ -1998,6 +1998,14 @@ static js_value el_append_multi(js_ctx *ctx, js_value t, js_value *args, int arg
   insert_args(ctx, node_of(t), 0, args, argc);
   return js_undef();
 }
+static js_value el_replace_children(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  while (n && n->first_child)
+    remove_node(n, n->first_child);
+  insert_args(ctx, n, 0, args, argc);
+  return js_undef();
+}
 static js_value el_prepend(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
@@ -6644,6 +6652,7 @@ static void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_element_proto, "appendChild", el_append, 1);
   def_method(g_element_proto, "append", el_append_multi, 1);
   def_method(g_element_proto, "prepend", el_prepend, 1);
+  def_method(g_element_proto, "replaceChildren", el_replace_children, 0);
   def_method(g_element_proto, "before", el_before, 1);
   def_method(g_element_proto, "after", el_after, 1);
   def_method(g_element_proto, "replaceWith", el_replace_with, 1);

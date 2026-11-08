@@ -130,6 +130,17 @@ static void test_cyclic_insertion_is_rejected(void)
              "expect(p.outerHTML.length>0, 'tree still serializes');\n");
 }
 
+static void test_replace_children(void)
+{
+  run_script("var d=document, h=d.createElement('div'); h.innerHTML='<a></a><b></b><i></i>';\n"
+             "var b=h.querySelector('b'), s=d.createElement('span');\n"
+             "h.replaceChildren(b, s, 'txt');\n"
+             "expect(h.childNodes.length===3 && h.firstChild===b && h.childNodes[1]===s && "
+             "h.lastChild.nodeValue==='txt', 'new children in order');\n"
+             "expect(h.querySelector('a')===null && h.querySelector('i')===null, 'old children removed');\n"
+             "h.replaceChildren(); expect(h.childNodes.length===0, 'no arguments empties');\n");
+}
+
 static void test_dialog_open_state_returnvalue(void)
 {
   run_script(
@@ -222,6 +233,7 @@ int main(void)
   test("document node properties", test_document_node_properties);
   test("fragments, cloning and tree editing", test_fragments_cloning_and_tree);
   test("cyclic insertion is rejected", test_cyclic_insertion_is_rejected);
+  test("replaceChildren keeps nodes passed back in", test_replace_children);
   test("dialog open state, returnValue and events", test_dialog_open_state_returnvalue);
   test("popover API: show, hide, toggle, events and light dismiss", test_popover_api_show_hide);
   test("custom elements: lifecycle and registry validation", test_custom_elements_lifecycle_and);
