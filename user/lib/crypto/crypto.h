@@ -103,4 +103,28 @@ void aes128_ctr(const uint8_t key[16], const uint8_t ctr[16], const uint8_t *in,
  * derive our own public key). RFC 7748. */
 void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]);
 
+/* -------------------------------------------------------------------- HPKE */
+
+/* RFC 9180 sender, base mode, one suite: DHKEM(X25519, HKDF-SHA256) + HKDF-SHA256 + AES-128-GCM
+ * (the suite TLS Encrypted Client Hello uses). */
+
+#define HPKE_ENC_LEN 32
+#define HPKE_TAG_LEN 16
+
+struct hpke_ctx {
+  uint8_t key[16];
+  uint8_t base_nonce[12];
+  uint64_t seq;
+};
+
+/* Encapsulate to the recipient key `pkR` with a caller-supplied random ephemeral private key `skE`.
+ * Writes the encapsulated key to `enc`. Returns 0, or -1 on a low-order `pkR` or an oversized `info`. */
+int hpke_setup_base_s(struct hpke_ctx *ctx, uint8_t enc[HPKE_ENC_LEN], const uint8_t pkR[32], const uint8_t *info,
+                      uint32_t infolen, const uint8_t skE[32]);
+
+/* Seal `len` bytes of `pt` into out[0..len+HPKE_TAG_LEN) (ciphertext then tag); pt/out may alias. Advances the
+ * sequence number, so successive calls match successive HPKE messages. */
+void hpke_seal(struct hpke_ctx *ctx, const uint8_t *aad, uint32_t aadlen, const uint8_t *pt, uint32_t len,
+               uint8_t *out);
+
 #endif /* OWOS_USER_CRYPTO_H */

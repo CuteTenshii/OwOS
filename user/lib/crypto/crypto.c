@@ -866,3 +866,102 @@ void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32])
   fmul(a, a, c);
   pack25519(out, a);
 }
+
+/* ------------------------------------------------------------------ HPKE */
+
+#define HPKE_LABEL_MAX 1024
+
+/* LabeledExtract / LabeledExpand over a contiguous buffer: (prefix || label || data). */
+static int hpke_labeled(const uint8_t *suite, uint32_t suitelen, const char *label, const uint8_t *data,
+                        uint32_t datalen, uint8_t *buf)
+{
+  uint32_t ll = 0;
+  while (label[ll])
+    ll++;
+  if (7 + suitelen + ll + datalen > HPKE_LABEL_MAX - 2)
+    return -1;
+  uint8_t *p = buf;
+  memcpy(p, "HPKE-v1", 7);
+  p += 7;
+  memcpy(p, suite, suitelen);
+  p += suitelen;
+  memcpy(p, label, ll);
+  p += ll;
+  if (datalen)
+    memcpy(p, data, datalen);
+  return (int)(7 + suitelen + ll + datalen);
+}
+
+static int hpke_extract(const uint8_t *suite, uint32_t suitelen, const uint8_t *salt, uint32_t saltlen,
+                        const char *label, const uint8_t *ikm, uint32_t ikmlen, uint8_t prk[SHA256_DIGEST])
+{
+  uint8_t buf[HPKE_LABEL_MAX];
+  int n = hpke_labeled(suite, suitelen, label, ikm, ikmlen, buf);
+  if (n < 0)
+    return -1;
+  hkdf_extract(salt, saltlen, buf, (uint32_t)n, prk);
+  return 0;
+}
+
+static int hpke_expand(const uint8_t *suite, uint32_t suitelen, const uint8_t prk[SHA256_DIGEST], const char *label,
+                       const uint8_t *info, uint32_t infolen, uint8_t *out, uint16_t outlen)
+{
+  uint8_t buf[HPKE_LABEL_MAX];
+  buf[0] = (uint8_t)(outlen >> 8);
+  buf[1] = (uint8_t)outlen;
+  int n = hpke_labeled(suite, suitelen, label, info, infolen, buf + 2);
+  if (n < 0)
+    return -1;
+  hkdf_expand(prk, buf, (uint32_t)n + 2, out, outlen);
+  return 0;
+}
+
+int hpke_setup_base_s(struct hpke_ctx *ctx, uint8_t enc[HPKE_ENC_LEN], const uint8_t pkR[32], const uint8_t *info,
+                      uint32_t infolen, const uint8_t skE[32])
+{
+  static const uint8_t base[32] = {9};
+  static const uint8_t kem_suite[5] = {'K', 'E', 'M', 0x00, 0x20};
+  static const uint8_t hpke_suite[10] = {'H', 'P', 'K', 'E', 0x00, 0x20, 0x00, 0x01, 0x00, 0x01};
+  uint8_t dh[32], kem_ctx[64], prk[SHA256_DIGEST], shared[32], secret[SHA256_DIGEST], ks[1 + 2 * SHA256_DIGEST];
+  uint8_t zero = 0;
+  int rc = -1;
+
+  x25519(enc, skE, base);
+  x25519(dh, skE, pkR);
+  for (int i = 0; i < 32; i++)
+    zero |= dh[i];
+  if (!zero) /* low-order peer key */
+    return -1;
+
+  memcpy(kem_ctx, enc, 32);
+  memcpy(kem_ctx + 32, pkR, 32);
+  if (hpke_extract(kem_suite, 5, 0, 0, "eae_prk", dh, 32, prk) ||
+      hpke_expand(kem_suite, 5, prk, "shared_secret", kem_ctx, 64, shared, 32))
+    goto out;
+
+  ks[0] = 0; /* mode_base */
+  if (hpke_extract(hpke_suite, 10, 0, 0, "psk_id_hash", 0, 0, ks + 1) ||
+      hpke_extract(hpke_suite, 10, 0, 0, "info_hash", info, infolen, ks + 1 + SHA256_DIGEST) ||
+      hpke_extract(hpke_suite, 10, shared, 32, "secret", 0, 0, secret) ||
+      hpke_expand(hpke_suite, 10, secret, "key", ks, sizeof ks, ctx->key, 16) ||
+      hpke_expand(hpke_suite, 10, secret, "base_nonce", ks, sizeof ks, ctx->base_nonce, 12))
+    goto out;
+  ctx->seq = 0;
+  rc = 0;
+out:
+  memset(dh, 0, sizeof dh);
+  memset(prk, 0, sizeof prk);
+  memset(shared, 0, sizeof shared);
+  memset(secret, 0, sizeof secret);
+  return rc;
+}
+
+void hpke_seal(struct hpke_ctx *ctx, const uint8_t *aad, uint32_t aadlen, const uint8_t *pt, uint32_t len, uint8_t *out)
+{
+  uint8_t nonce[12];
+  memcpy(nonce, ctx->base_nonce, 12);
+  for (int i = 0; i < 8; i++)
+    nonce[11 - i] ^= (uint8_t)(ctx->seq >> (8 * i));
+  aes128_gcm_seal(ctx->key, nonce, aad, aadlen, pt, len, out, out + len);
+  ctx->seq++;
+}

@@ -136,6 +136,38 @@ static void check_aes_ctr(void)
   expect(memcmp(cout, cct, 20) == 0);
 }
 
+/* --- HPKE, RFC 9180 Appendix A.1 (X25519/HKDF-SHA256/AES-128-GCM, base mode) --- */
+static void check_hpke(void)
+{
+  uint8_t skE[32], pkR[32], info[32], enc[HPKE_ENC_LEN], pkE[32], key[16], nonce[12], pt[64], aad[16], ct[80], want[80];
+  hex("52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736", skE, 32);
+  hex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d", pkR, 32);
+  hex("37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431", pkE, 32);
+  hex("4f6465206f6e2061204772656369616e2055726e", info, 32);
+  hex("4531685d41d65f03dc48f6b8302c05b0", key, 16);
+  hex("56d890e5accaaf011cff4b7d", nonce, 12);
+  int ptlen = hex("4265617574792069732074727574682c20747275746820626561757479", pt, 64);
+
+  struct hpke_ctx ctx;
+  expect(hpke_setup_base_s(&ctx, enc, pkR, info, 20, skE) == 0);
+  expect(memcmp(enc, pkE, 32) == 0);
+  expect(memcmp(ctx.key, key, 16) == 0);
+  expect(memcmp(ctx.base_nonce, nonce, 12) == 0);
+
+  int al = hex("436f756e742d30", aad, 16);
+  hex("f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a", want, 80);
+  hpke_seal(&ctx, aad, (uint32_t)al, pt, (uint32_t)ptlen, ct);
+  expect(memcmp(ct, want, ptlen + HPKE_TAG_LEN) == 0);
+
+  al = hex("436f756e742d31", aad, 16);
+  hex("af2d7e9ac9ae7e270f46ba1f975be53c09f8d875bdc8535458c2494e8a6eab251c03d0c22a56b8ca42c2063b84", want, 80);
+  hpke_seal(&ctx, aad, (uint32_t)al, pt, (uint32_t)ptlen, ct);
+  expect(memcmp(ct, want, ptlen + HPKE_TAG_LEN) == 0);
+
+  uint8_t low[32] = {0};
+  expect(hpke_setup_base_s(&ctx, enc, low, info, 20, skE) != 0);
+}
+
 int main(void)
 {
   test("AES-128-GCM seal and open", check_gcm);
@@ -143,5 +175,6 @@ int main(void)
   test("TLS 1.2 PRF", check_tls12_prf);
   test("HMAC-SHA1", check_hmac_sha1);
   test("AES-128-CTR", check_aes_ctr);
+  test("HPKE base mode", check_hpke);
   return 0;
 }
