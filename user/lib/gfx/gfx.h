@@ -259,6 +259,31 @@ void button_draw(int x, int y, int w, int h, const char *label, int state);
  * app gates on its own disabled state before treating a hit as a press). */
 int button_hit(int x, int y, int w, int h, int mx, int my);
 
+/* --------------------------------------------------------------- checkbox, radio, switch */
+/*
+ * Two-state controls with an optional trailing label (NULL or "" for none).
+ * Stateless like the button: the app keeps `checked` / `on`, draws each frame
+ * with the BTN_* visual state it tracks (hover, pressed, disabled), and
+ * flips its value when control_hit() reports a click on an enabled control.
+ * A radio group is the app's business: set the clicked one, clear the rest.
+ * `focused` draws a focus ring for keyboard operation (Space toggles).
+ * The control occupies [x, x + control_width()) by GUI_CTRL_H from y.
+ */
+#define GUI_CTRL_H 18     /* row height, label included */
+#define GUI_CHECK_SIZE 14 /* checkbox and radio box */
+#define GUI_SWITCH_W 28
+#define GUI_SWITCH_H 16
+
+enum { GFX_CTRL_CHECKBOX = 0, GFX_CTRL_RADIO, GFX_CTRL_SWITCH };
+
+void checkbox_draw(int x, int y, const char *label, int checked, int state, int focused);
+void radio_draw(int x, int y, const char *label, int checked, int state, int focused);
+void switch_draw(int x, int y, const char *label, int on, int state, int focused);
+/* Total width of a GFX_CTRL_* kind with its label. */
+int control_width(int kind, const char *label);
+/* 1 if (mx,my) is on the box or its label (geometry only, like button_hit). */
+int control_hit(int kind, int x, int y, const char *label, int mx, int my);
+
 /* --------------------------------------------------------------- progress bar
  */
 /*
