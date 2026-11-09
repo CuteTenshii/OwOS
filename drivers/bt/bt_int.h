@@ -33,6 +33,7 @@ void bt_irq_restore(uintptr_t flags);
 #define BT_MAX_CONN 4
 #define BT_MAX_DEV 24
 #define BT_NAME_LEN 32
+#define BT_DEV_UUIDS 4
 #define BT_RX_MAX 1030 /* largest reassembled L2CAP frame */
 
 #define BT_ADDR_BR 0xFF /* addr_type of a BR/EDR device; LE uses the HCI types 0 (public) and 1 (random) */
@@ -60,6 +61,11 @@ struct bt_dev {
   int8_t rssi;
   uint32_t cod;
   char name[BT_NAME_LEN];
+  uint8_t nuuid;
+  struct {
+    uint8_t len; /* 2 or 16 */
+    uint8_t v[16];
+  } uuids[BT_DEV_UUIDS]; /* advertised service UUIDs */
 };
 
 struct bt_conn {
@@ -120,9 +126,10 @@ void l2cap_close(struct l2cap_chan *ch);
 void gatt_conn_up(struct bt_conn *c);
 void gatt_conn_down(struct bt_conn *c);
 void gatt_poll(void);
+void bt_uuid_text(char *out, int max, const uint8_t *v, int len);
 void gatt_secured(struct bt_conn *c,
                   bool ok); /* pairing or re-encryption finished; retries a request refused for security */
-int gatt_command(const char *args);
+int gatt_command(const char *args, bool ev);
 
 /* ---- aes */
 void bt_aes128(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);

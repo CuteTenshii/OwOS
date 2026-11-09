@@ -74,8 +74,8 @@
 #define ACL_PAYLOAD_MAX 1024
 #define CMD_TIMEOUT_MS 3000
 #define MAX_KEYS 8
-#define USERQ 4
-#define USERQ_LINE 64
+#define USERQ 8
+#define USERQ_LINE 800
 
 struct cmd {
   uint16_t op;
@@ -301,7 +301,19 @@ static void dev_set_name(struct bt_dev *d, const uint8_t *s, int len)
   d->name[n] = 0;
 }
 
-/* Local name (0x09 complete, 0x08 shortened) out of EIR or advertising data. */
+static void dev_add_uuid(struct bt_dev *d, const uint8_t *v, int len)
+{
+  for (int i = 0; i < d->nuuid; i++)
+    if (d->uuids[i].len == len && !memcmp(d->uuids[i].v, v, (uint32_t)len))
+      return;
+  if (d->nuuid < BT_DEV_UUIDS) {
+    d->uuids[d->nuuid].len = (uint8_t)len;
+    memcpy(d->uuids[d->nuuid++].v, v, (uint32_t)len);
+  }
+}
+
+/* Local name (0x09 complete, 0x08 shortened) and service UUIDs (0x02/0x03 16-bit, 0x06/0x07 128-bit) out of EIR or
+ * advertising data. */
 static void parse_ad(struct bt_dev *d, const uint8_t *ad, int len)
 {
   for (int i = 0; i + 1 < len && ad[i];) {
@@ -310,6 +322,12 @@ static void parse_ad(struct bt_dev *d, const uint8_t *ad, int len)
       break;
     if ((ad[i + 1] == 0x09 || (ad[i + 1] == 0x08 && !d->name[0])) && l > 1)
       dev_set_name(d, ad + i + 2, l - 1);
+    else if (ad[i + 1] == 0x02 || ad[i + 1] == 0x03)
+      for (int k = 0; k + 2 <= l - 1; k += 2)
+        dev_add_uuid(d, ad + i + 2 + k, 2);
+    else if (ad[i + 1] == 0x06 || ad[i + 1] == 0x07)
+      for (int k = 0; k + 16 <= l - 1; k += 16)
+        dev_add_uuid(d, ad + i + 2 + k, 16);
     i += 1 + l;
   }
 }
@@ -984,7 +1002,9 @@ static int run_command(const char *line)
     return 0;
   }
   if (bt_has(line, "gatt "))
-    return gatt_command(line + 5);
+    return gatt_command(line + 5, false);
+  if (bt_has(line, "att "))
+    return gatt_command(line + 4, true);
   if (bt_has(line, "unpair ")) {
     uint8_t a[6];
     if (!addr_parse(line + 7, a))
@@ -1163,6 +1183,27 @@ int bt_devices_text(char *buf, int max)
                                                        : "input ";
     n += bt_snprintf(buf + n, (uint32_t)(max - n), "%s %s %d %s%s\n", addr_str(d->addr, a), d->le ? "le" : "br",
                      d->rssi, kind, d->name);
+  }
+  return n < max ? n : max;
+}
+
+/* LE devices, one per line: "<addr> <addr type> <rssi> <service uuids, comma separated or -> <name>". */
+int bt_le_devices_text(char *buf, int max)
+{
+  int n = 0;
+  for (int i = 0; i < BT_MAX_DEV && n < max; i++) {
+    const struct bt_dev *d = &h.devs[i];
+    char a[18], u[40];
+    if (!d->used || !d->le)
+      continue;
+    n += bt_snprintf(buf + n, (uint32_t)(max - n), "%s %u %d ", addr_str(d->addr, a), d->addr_type, d->rssi);
+    for (int k = 0; k < d->nuuid && n < max; k++) {
+      bt_uuid_text(u, sizeof u, d->uuids[k].v, d->uuids[k].len);
+      n += bt_snprintf(buf + n, (uint32_t)(max - n), "%s%s", k ? "," : "", u);
+    }
+    if (!d->nuuid && n < max)
+      buf[n++] = '-';
+    n += bt_snprintf(buf + n, (uint32_t)(max - n), " %s\n", d->name);
   }
   return n < max ? n : max;
 }

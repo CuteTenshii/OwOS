@@ -34,4 +34,9 @@ int dialog_choose(int parent, const char *title, const char *message, const char
 /* Modal single-line text-input dialog: an optional message, an input pre-filled with `initial` */
 int dialog_prompt(int parent, const char *title, const char *message, const char *initial, char *out, int outsz);
 
+/* Modal pick-one list with a message above it and Cancel / `ok_label` buttons. Returns the chosen row, or -1 if
+ * cancelled. */
+int dialog_list(int parent, const char *title, const char *message, const char *const *items, int nitems,
+                const char *ok_label);
+
 #endif /* OWOS_DIALOG_H */

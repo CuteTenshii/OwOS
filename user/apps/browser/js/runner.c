@@ -2,6 +2,7 @@
 
 #include "bindings.h"
 #include "canvasjs.h"
+#include "features/bluetooth/bluetooth.h"
 #include "features/gamepad/gamepad.h"
 #include "features/mediasession/mediasession.h"
 #include "features/notification/notification.h"
@@ -751,6 +752,7 @@ void js_page_end(void)
   js_notification_teardown();
   mediasession_teardown();
   gamepad_teardown();
+  bluetooth_teardown();
   gc_remove_root((void **)&g_timers);
   js_idb_teardown();
   js_webapi_teardown();

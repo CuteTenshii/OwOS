@@ -27,7 +27,9 @@ bool bt_present(void);
 /* Text views for sysfs; each returns the byte count. */
 int bt_status_text(char *buf, int max);
 int bt_devices_text(char *buf, int max);
+int bt_le_devices_text(char *buf, int max);
 int bt_gatt_text(char *buf, int max);
+int bt_gatt_events_text(char *buf, int max);
 
 /* Run one control line: "scan on|off", "connect <addr>", "disconnect", "gatt read <handle>", "gatt write <handle>
  * <hex>", "gatt notify <handle> on|off", "pair" (LE link), "unpair <addr>" (drop the bond or link key, disconnect).

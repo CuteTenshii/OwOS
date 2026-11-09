@@ -1547,6 +1547,177 @@ static void pairing_times_out(void)
   stop();
 }
 
+static void le_adv_with_services(void)
+{
+  start();
+  bt_command("scan on");
+  tick(5);
+  uint8_t data[] = {3, 0x03, 0x0F, 0x18, 5, 0x09, 'B', 'a', 't', 't'};
+  uint8_t adv[12 + sizeof data] = {2, 1, 0, 1, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, sizeof data};
+  memcpy(adv + 11, data, sizeof data);
+  adv[11 + sizeof data] = (uint8_t)-40;
+  evt(0x3E, adv, (int)sizeof adv);
+  uint8_t adv2[] = {2, 1, 0, 1, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 4, 3, 0x03, 0x0F, 0x18, (uint8_t)-40};
+  evt(0x3E, adv2, (int)sizeof adv2);
+  tick(5);
+  char text[256];
+  int n = bt_le_devices_text(text, sizeof text - 1);
+  text[n] = 0;
+  expect_string(text, "a6:a5:a4:a3:a2:a1 1 -40 180f Batt\n");
+  stop();
+}
+
+/* A connected LE device with one battery-like service: 0x12 (read, write, notify) and 0x15 (indicate only). */
+static void le_gatt_ready(void)
+{
+  uint8_t pdu[64];
+  int len;
+  le_connect();
+  expect(take_att(pdu, &len));
+  att_in((uint8_t[]){0x03, 185, 0}, 3);
+  tick(5);
+  expect(take_att(pdu, &len));
+  att_in((uint8_t[]){0x11, 6, 0x10, 0x00, 0x16, 0x00, 0x0F, 0x18}, 8);
+  tick(5);
+  expect(take_att(pdu, &len));
+  att_in((uint8_t[]){0x01, 0x10, 0x17, 0x00, 0x0A}, 5);
+  tick(5);
+  expect(take_att(pdu, &len));
+  att_in((uint8_t[]){0x09, 7, 0x11, 0x00, 0x1A, 0x12, 0x00, 0x19, 0x2A, 0x14, 0x00, 0x20, 0x15, 0x00, 0x1C, 0x2A}, 16);
+  tick(5);
+  expect(take_att(pdu, &len));
+  att_in((uint8_t[]){0x01, 0x08, 0x15, 0x00, 0x0A}, 5);
+  tick(5);
+}
+
+static const char *events(void)
+{
+  static char text[2048];
+  int n = bt_gatt_events_text(text, sizeof text - 1);
+  text[n] = 0;
+  return text;
+}
+
+static void gatt_events_long_read_and_acks(void)
+{
+  uint8_t pdu[300];
+  int len;
+  le_gatt_ready();
+  char t[2048];
+  int n = bt_gatt_text(t, sizeof t - 1);
+  t[n] = 0;
+  expect(strstr(t, "state ready") != NULL);
+  expect_string(events(), "");
+
+  expect_eq(bt_command("att 5 read 12"), 0);
+  tick(5);
+  expect(take_att(pdu, &len));
+  expect_eq(pdu[0], 0x0A);
+  uint8_t first[185] = {0x0B};
+  memset(first + 1, 0xAB, 184);
+  att_in(first, 185);
+  tick(5);
+  expect(take_att(pdu, &len));
+  expect_eq(pdu[0], 0x0C);
+  expect_eq(bt_get16(pdu + 1), 0x12);
+  expect_eq(bt_get16(pdu + 3), 184);
+  att_in((uint8_t[]){0x0D, 1, 2, 3}, 4);
+  tick(5);
+  char want[1024] = "1 5 read 0012 ";
+  for (int i = 0; i < 184; i++)
+    strcat(want, "ab");
+  strcat(want, "010203\n");
+  expect_string(events(), want);
+  expect_string(events(), want);
+
+  expect_eq(bt_command("att ack 1"), 0);
+  tick(5);
+  expect_string(events(), "");
+  stop();
+}
+
+static void gatt_events_write_notify_and_errors(void)
+{
+  uint8_t pdu[300];
+  int len;
+  le_gatt_ready();
+
+  expect_eq(bt_command("att 6 write 12 0102ab"), 0);
+  tick(5);
+  expect(take_att(pdu, &len));
+  expect_eq(pdu[0], 0x12);
+  expect_eq(bt_get16(pdu + 1), 0x12);
+  expect_eq(len, 6);
+  expect(!memcmp(pdu + 3, "\x01\x02\xab", 3));
+  att_in((uint8_t[]){0x13}, 1);
+  tick(5);
+  expect(strstr(events(), "1 6 write 0012 \n") != NULL);
+
+  expect_eq(bt_command("att 7 writecmd 12 ff"), 0);
+  tick(5);
+  expect(take_att(pdu, &len));
+  expect_eq(pdu[0], 0x52);
+  expect(strstr(events(), "2 7 write 0012 \n") != NULL);
+
+  expect_eq(bt_command("att 8 notify 15 on"), 0);
+  tick(5);
+  expect(take_att(pdu, &len));
+  expect_eq(pdu[0], 0x04);
+  att_in((uint8_t[]){0x05, 1, 0x16, 0x00, 0x02, 0x29}, 6);
+  tick(5);
+  expect(take_att(pdu, &len));
+  expect_eq(pdu[0], 0x12);
+  expect_eq(bt_get16(pdu + 1), 0x16);
+  expect_eq(pdu[3], 2); /* indications only */
+  att_in((uint8_t[]){0x13}, 1);
+  tick(5);
+  expect(strstr(events(), "3 8 write 0016 \n") != NULL);
+
+  att_in((uint8_t[]){0x1B, 0x15, 0x00, 0x64, 0x65}, 5);
+  att_in((uint8_t[]){0x1D, 0x15, 0x00, 0x66}, 4);
+  tick(5);
+  expect(strstr(events(), "4 0 notify 0015 6465\n") != NULL);
+  expect(strstr(events(), "5 0 notify 0015 66\n") != NULL);
+  expect(take_att(pdu, &len));
+  expect_eq(pdu[0], 0x1E);
+
+  expect_eq(bt_command("att 9 read 99"), 0);
+  tick(5);
+  expect(take_att(pdu, &len));
+  att_in((uint8_t[]){0x01, 0x0A, 0x99, 0x00, 0x0A}, 5);
+  tick(5);
+  expect(strstr(events(), "6 9 err 0099 0a\n") != NULL);
+
+  char big[700] = "att 10 write 12 ";
+  for (int i = 0; i < 183; i++)
+    strcat(big, "00");
+  expect_eq(bt_command(big), 0);
+  tick(5);
+  expect(strstr(events(), "7 10 err 0012 0d\n") != NULL);
+  expect(!take_att(pdu, &len));
+
+  expect_eq(bt_command("att ack 7"), 0);
+  tick(5);
+  expect_string(events(), "");
+  stop();
+}
+
+static void gatt_events_reject_bad_commands(void)
+{
+  uint8_t pdu[64];
+  int len;
+  le_gatt_ready();
+  const char *bad[] = {"att x read 12",      "att 1 read",        "att 1 write 12", "att 1 write 12 zz",
+                       "att 1 write 12 abc", "att 1 notify 12 x", "att 1 poke 12",  "att ack x"};
+  for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
+    expect_eq(bt_command(bad[i]), 0);
+    tick(5);
+  }
+  expect(!take_att(pdu, &len));
+  expect_string(events(), "");
+  stop();
+}
+
 int main(void)
 {
   test("bringup", bringup);
@@ -1578,5 +1749,9 @@ int main(void)
   test("peripheral_security_request_starts_pairing", peripheral_security_request_starts_pairing);
   test("peripheral_refusal_and_stray_requests", peripheral_refusal_and_stray_requests);
   test("pairing_times_out", pairing_times_out);
+  test("le_adv_with_services", le_adv_with_services);
+  test("gatt_events_long_read_and_acks", gatt_events_long_read_and_acks);
+  test("gatt_events_write_notify_and_errors", gatt_events_write_notify_and_errors);
+  test("gatt_events_reject_bad_commands", gatt_events_reject_bad_commands);
   return 0;
 }

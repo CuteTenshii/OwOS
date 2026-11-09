@@ -5,6 +5,7 @@
 #include "canvasjs.h"
 #include "classlist.h"
 #include "dom_query.h"
+#include "features/bluetooth/bluetooth.h"
 #include "features/clienthints/clienthints.h"
 #include "features/gamepad/gamepad.h"
 #include "features/jar/jar.h"
@@ -1062,11 +1063,11 @@ static void dlg_scopy(char *d, const char *s, int cap)
 int worker_dialog(int kind, const char *msg, const char *deflt, char *out, int outsz)
 {
   if (B->win_id < 0)
-    return 0;
+    return kind == 5 ? -1 : 0;
   B->dlg_title[0] = 0;
   dlg_scopy(B->dlg_msg, msg, sizeof B->dlg_msg);
   dlg_scopy(B->dlg_text, deflt ? deflt : "", sizeof B->dlg_text);
-  B->dlg_ok = 0;
+  B->dlg_ok = kind == 5 ? -1 : 0;
   B->dlg_done = 0;
   B->dlg_req = kind; /* publish last: main sees a complete request */
   while (!B->dlg_done)
@@ -2309,6 +2310,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     }
     mediasession_install(ctx, nav, page_url);
     gamepad_install(ctx, nav);
+    bluetooth_install(ctx, nav, page_url);
     js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }

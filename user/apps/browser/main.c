@@ -228,8 +228,19 @@ int main(int argc, char **argv)
         static const char *const perm_btns[3] = {"Refuse", "Allow once", "Allow always"};
         /* A locked modal (no close/min/max, not draggable) */
         int r = dialog_choose(id, B->dlg_title, B->dlg_msg, perm_btns, 3, DLG_ICON_QUESTION);
-        ok = r; /* -1 = dismissed via Esc (worker: ask again later) */
-      } else {  /* prompt */
+        ok = r;              /* -1 = dismissed via Esc (worker: ask again later) */
+      } else if (req == 5) { /* list: one device per line in dlg_text */
+        const char *items[16];
+        int n = 0;
+        for (char *p = B->dlg_text; *p && n < 16;) {
+          items[n++] = p;
+          while (*p && *p != '\n')
+            p++;
+          if (*p)
+            *p++ = 0;
+        }
+        ok = dialog_list(id, B->dlg_title, B->dlg_msg, items, n, "Pair");
+      } else { /* prompt */
         ok = dialog_prompt(id, B->dlg_title, B->dlg_msg, B->dlg_text, B->dlg_text, sizeof B->dlg_text);
       }
       gfx_init(browser_surface(), BW, BH); /* dialog borrowed the surface */

@@ -555,3 +555,114 @@ int dialog_prompt(int parent, const char *title, const char *message, const char
   }
   return 0;
 }
+
+/* ------------------------------------------------------------- pick-one list */
+
+#define LIST_W 420
+#define LIST_ROW_H 24
+#define LIST_ROWS 8
+#define LIST_BG 0x0d1420
+#define LIST_SEL 0x2f6fb0
+
+int dialog_list(int parent, const char *title, const char *message, const char *const *items, int nitems,
+                const char *ok_label)
+{
+  struct dbtn b[2] = {{"Cancel", DLG_R_CANCEL}, {ok_label ? ok_label : "OK", DLG_R_OK}};
+  int W = LIST_W;
+  char lines[MAXLINES][LINEBUF];
+  int nl = (message && message[0]) ? wrap(message, W - 2 * PAD, lines, MAXLINES) : 0;
+  int rows = nitems < LIST_ROWS ? nitems : LIST_ROWS;
+  if (rows < 1)
+    rows = 1;
+  int listy = PAD + nl * LINE_H + (nl ? 6 : 0);
+  int H = listy + rows * LIST_ROW_H + PAD + BTN_H + PAD;
+
+  unsigned *save_fb;
+  int save_w, save_h;
+  gfx_get(&save_fb, &save_w, &save_h);
+  int id = win_create(W, H, title ? title : "");
+  if (id < 0)
+    return -1;
+  unsigned *fb = win_fb_of(id);
+  if (!fb) {
+    win_close(id);
+    gfx_init(save_fb, save_w, save_h);
+    return -1;
+  }
+  gfx_init(fb, W, H);
+  win_resizable(id, 0);
+  if (parent >= 0)
+    win_set_parent(id, parent, 1);
+
+  int sel = nitems > 0 ? 0 : -1, top = 0, hot = -1, need = 1, result = -2;
+  while (result == -2) {
+    struct win_event ev;
+    while (win_poll(id, &ev)) {
+      need = 1;
+      if (ev.type == WEV_CLOSE) {
+        result = -1;
+        break;
+      } else if (ev.type == WEV_KEY) {
+        if (ev.a == '\n')
+          result = sel;
+        else if (ev.a == 27)
+          result = -1;
+        else if (ev.a == KEY_UP && sel > 0)
+          sel--;
+        else if (ev.a == KEY_DOWN && sel + 1 < nitems)
+          sel++;
+      } else if (ev.type == WEV_SCROLL) {
+        top -= ev.a > 0 ? 1 : -1;
+      } else if (ev.type == WEV_MOUSE || ev.type == WEV_DBLCLICK) {
+        int i = button_at(b, 2, W, H, ev.a, ev.b);
+        int row = (ev.b - listy) / LIST_ROW_H;
+        if (i >= 0)
+          result = i == 0 ? -1 : sel;
+        else if (ev.b >= listy && row < rows && top + row < nitems) {
+          sel = top + row;
+          if (ev.type == WEV_DBLCLICK)
+            result = sel;
+        }
+      } else if (ev.type == WEV_MOVE) {
+        int i = ev.a < 0 ? -1 : button_at(b, 2, W, H, ev.a, ev.b);
+        if (i != hot)
+          hot = i;
+      }
+    }
+    if (sel >= 0 && sel < top)
+      top = sel;
+    if (sel >= top + rows)
+      top = sel - rows + 1;
+    if (top > nitems - rows)
+      top = nitems - rows;
+    if (top < 0)
+      top = 0;
+    if (result != -2)
+      break;
+    if (need) {
+      gfx_clear(DLG_BG);
+      for (int i = 0; i < nl; i++)
+        gfx_ui_text(PAD, PAD + i * LINE_H + (LINE_H - UIFONT_H) / 2, lines[i], DLG_TEXT);
+      gfx_fill_rect(PAD, listy, W - 2 * PAD, rows * LIST_ROW_H, LIST_BG);
+      gfx_rect(PAD, listy, W - 2 * PAD, rows * LIST_ROW_H, 0x3a4658);
+      for (int r = 0; r < rows && top + r < nitems; r++) {
+        int y = listy + r * LIST_ROW_H;
+        if (top + r == sel)
+          gfx_fill_rect(PAD + 1, y, W - 2 * PAD - 2, LIST_ROW_H, LIST_SEL);
+        gfx_set_clip(PAD + 6, y, W - 2 * PAD - 12, LIST_ROW_H);
+        gfx_ui_text(PAD + 8, y + (LIST_ROW_H - UIFONT_H) / 2, items[top + r], top + r == sel ? 0xffffff : DLG_TEXT);
+        gfx_clip_none();
+      }
+      int bx[2], bw[2], by;
+      layout_buttons(b, 2, W, H, bx, bw, &by);
+      for (int i = 0; i < 2; i++)
+        draw_button(bx[i], by, bw[i], b[i].label, i == 1, i == hot);
+      win_present(id);
+      need = 0;
+    }
+    win_wait(id);
+  }
+  win_close(id);
+  gfx_init(save_fb, save_w, save_h);
+  return result;
+}

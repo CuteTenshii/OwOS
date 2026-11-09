@@ -383,7 +383,8 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
       if (n == 4 && eq(seg[2], "hci0")) {
         if (eq(seg[3], "control"))
           return S_FILE_RW;
-        if (eq(seg[3], "status") || eq(seg[3], "devices") || eq(seg[3], "gatt"))
+        if (eq(seg[3], "status") || eq(seg[3], "devices") || eq(seg[3], "le_devices") || eq(seg[3], "gatt") ||
+            eq(seg[3], "gatt_events"))
           return S_FILE_RO;
       }
       return S_NONE;
@@ -636,8 +637,12 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         b->p += bt_status_text(b->p, room);
       else if (eq(seg[3], "devices"))
         b->p += bt_devices_text(b->p, room);
+      else if (eq(seg[3], "le_devices"))
+        b->p += bt_le_devices_text(b->p, room);
       else if (eq(seg[3], "gatt"))
         b->p += bt_gatt_text(b->p, room);
+      else if (eq(seg[3], "gatt_events"))
+        b->p += bt_gatt_events_text(b->p, room);
       return;
     }
     if (eq(seg[1], "sound")) {
@@ -945,8 +950,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     return 1;
   }
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "bluetooth") && eq(seg[2], "hci0")) {
-    static const char *const k[] = {"status", "devices", "gatt", "control"};
-    hit = from_list(idx, name, max, k, 4);
+    static const char *const k[] = {"status", "devices", "le_devices", "gatt", "gatt_events", "control"};
+    hit = from_list(idx, name, max, k, 6);
     if (hit && is_dir)
       *is_dir = 0;
     return hit;
@@ -1111,7 +1116,7 @@ int sysfs_write(const char *sub, const char *buf, int len)
   if (classify(seg, n) != S_FILE_RW)
     return -1;
 
-  char arg[64];
+  char arg[800];
   int m = len;
   if (m > (int)sizeof arg - 1)
     m = (int)sizeof arg - 1;

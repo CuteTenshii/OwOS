@@ -398,3 +398,11 @@ void gamepad_install(js_ctx *ctx, js_object *navigator)
 }
 
 void gamepad_teardown(void) {}
+
+void bluetooth_install(js_ctx *ctx, js_object *navigator, const char *page_url)
+{
+  (void)ctx;
+  (void)navigator;
+  (void)page_url;
+}
+void bluetooth_teardown(void) {}

@@ -272,13 +272,13 @@ struct browser {
 
   /* window.alert/confirm/prompt: the worker posts dlg_req and waits on dlg_done; main runs the dialog. */
   volatile int dlg_req;  /* worker -> main: 0 none, 1 alert, 2 confirm, 3 prompt,
-                            4 permission */
+                            4 permission, 5 list (dlg_text: one item per line) */
   volatile int dlg_done; /* main -> worker: the dialog closed */
   int dlg_ok;            /* main -> worker: confirm/prompt accepted (OK/Yes); permission:
-                            chosen button index (0=Refuse,1=Once,2=Always) */
+                            chosen button index (0=Refuse,1=Once,2=Always); list: chosen row, -1 if cancelled */
   char dlg_title[64];
   char dlg_msg[512];
-  char dlg_text[512]; /* prompt: default text in, entered text out            */
+  char dlg_text[1024]; /* prompt: default text in, entered text out; list: the items */
 
   int win_id; /* the window handle (for title updates) */
 
