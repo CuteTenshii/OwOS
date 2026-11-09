@@ -5,21 +5,11 @@
 static js_object *g_port_proto;    /* MessagePort.prototype */
 static js_object *g_channel_proto; /* MessageChannel.prototype */
 
-static js_value clone_message(js_ctx *ctx, js_value v)
-{
-  js_value f = js_get(ctx, js_obj_value(ctx->global), "structuredClone"), r;
-  if (v.type != JV_OBJ || !js_is_callable(f))
-    return v;
-  r = js_call(ctx, f, js_undef(), &v, 1);
-  return ctx->has_exc ? v : r;
-}
-
 int js_is_port(js_value v) { return v.type == JV_OBJ && v.u.obj->proto == g_port_proto; }
 
 static js_value port_post(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value peer;
-  (void)argc;
+  js_value peer, data, ports;
   if (t.type != JV_OBJ || js_to_boolean(js_get(ctx, t, "@closed")))
     return js_undef();
   if (js_get(ctx, t, "@remote").type == JV_NUM) { /* the other end lives in a worker */
@@ -27,8 +17,15 @@ static js_value port_post(js_ctx *ctx, js_value t, js_value *args, int argc)
     return js_undef();
   }
   peer = js_get(ctx, t, "@peer");
-  if (peer.type == JV_OBJ && !js_to_boolean(js_get(ctx, peer, "@closed")))
-    js_port_enqueue(peer, clone_message(ctx, A(0)));
+  if (peer.type == JV_OBJ && !js_to_boolean(js_get(ctx, peer, "@closed")) &&
+      js_local_clone(ctx, A(0), A(1), &data, &ports)) {
+    gc_push_scope();
+    if (data.type == JV_OBJ)
+      gc_keep(data.u.obj);
+    gc_keep(ports.u.obj);
+    js_port_enqueue(peer, data, ports);
+    gc_pop_scope();
+  }
   return js_undef();
 }
 

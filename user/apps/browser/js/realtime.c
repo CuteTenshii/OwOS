@@ -315,7 +315,7 @@ int js_websockets_pump(void)
 /* ------------------------------------------------------- BroadcastChannel - */
 
 /* A MessageEvent over the shared Event.prototype (so preventDefault/stopPropagation exist) */
-js_value make_message_event(js_value data)
+js_value make_message_event(js_value data, js_value ports)
 {
   js_object *e;
   js_value loc, org;
@@ -332,6 +332,7 @@ js_value make_message_event(js_value data)
   js_def(e, "origin", js_mk_cstring(g_ctx, origin), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "lastEventId", js_mk_cstring(g_ctx, ""), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "source", js_null(), P_WRITABLE | P_ENUMERABLE);
+  js_def(e, "ports", ports.type == JV_OBJ ? ports : js_obj_value(js_new_array(g_ctx, 0)), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "bubbles", js_bool(0), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "cancelable", js_bool(0), P_WRITABLE | P_ENUMERABLE);
   js_def(e, "defaultPrevented", js_bool(0), P_WRITABLE | P_ENUMERABLE);
@@ -352,7 +353,7 @@ static void bc_deliver(js_object *w, js_value data)
   gc_keep(w);
   if (data.type == JV_OBJ)
     gc_keep(data.u.obj);
-  ev = make_message_event(data);
+  ev = make_message_event(data, js_undef());
   if (ev.type == JV_OBJ) {
     gc_keep(ev.u.obj);
     js_set(g_ctx, ev, "target", js_obj_value(w));

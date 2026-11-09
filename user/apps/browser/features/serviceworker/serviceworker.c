@@ -654,7 +654,7 @@ static void sw_deliver_message(js_ctx *ctx, js_object *target, js_value data, js
     gc_keep(data.u.obj);
   if (source.type == JV_OBJ)
     gc_keep(source.u.obj);
-  ev = make_message_event(data);
+  ev = make_message_event(data, js_undef());
   if (ev.type == JV_OBJ) {
     gc_keep(ev.u.obj);
     js_set(ctx, ev, "source", source);

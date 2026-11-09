@@ -9383,6 +9383,7 @@ struct js_clone {
   int nsabs;
   clone_sab *moved; /* transferred ArrayBuffers: their bytes now belong to the message */
   int nmoved;
+  int nextra; /* transferred embedder objects written ahead of the value, in transfer-list order */
 };
 typedef struct {
   js_ctx *ctx;
@@ -9468,6 +9469,32 @@ static int clone_transferred(const clone_w *w, const js_object *o)
   return 0;
 }
 
+/* An embedder object (a Blob, a MessagePort, ...) the context's write hook knows how to carry: written as CL_EXT */
+static int clone_try_ext(clone_w *w, js_value v)
+{
+  js_ctx *ctx = w->ctx;
+  js_object *o = v.u.obj;
+  char kind[16] = "", *meta = 0;
+  unsigned char *bytes = 0;
+  int len = 0;
+  if (!ctx->clone_write_ext || (o->kind != OBJ_PLAIN && o->kind != OBJ_HOST))
+    return 0;
+  if (!ctx->clone_write_ext(ctx, v, kind, &bytes, &len, &meta))
+    return 0;
+  if (!clone_note(w, o)) {
+    free(bytes);
+    free(meta);
+    return 1;
+  }
+  clone_tag(w, CL_EXT);
+  clone_str(w, kind, (int)strlen(kind));
+  clone_str(w, meta ? meta : "", meta ? (int)strlen(meta) : 0);
+  clone_str(w, (const char *)bytes, len);
+  free(bytes);
+  free(meta);
+  return 1;
+}
+
 static void clone_value(clone_w *w, js_value v, int depth)
 {
   js_ctx *ctx = w->ctx;
@@ -9515,25 +9542,8 @@ static void clone_value(clone_w *w, js_value v, int depth)
     clone_u32(w, (unsigned)idx);
     return;
   }
-  if (ctx->clone_write_ext && (o->kind == OBJ_PLAIN || o->kind == OBJ_HOST)) {
-    char kind[16] = "", *meta = 0;
-    unsigned char *bytes = 0;
-    int len = 0;
-    if (ctx->clone_write_ext(ctx, v, kind, &bytes, &len, &meta)) {
-      if (!clone_note(w, o)) {
-        free(bytes);
-        free(meta);
-        return;
-      }
-      clone_tag(w, CL_EXT);
-      clone_str(w, kind, (int)strlen(kind));
-      clone_str(w, meta ? meta : "", meta ? (int)strlen(meta) : 0);
-      clone_str(w, (const char *)bytes, len);
-      free(bytes);
-      free(meta);
-      return;
-    }
-  }
+  if (clone_try_ext(w, v))
+    return;
   if (o->kind == OBJ_WASM && js_wasm_clone_write) {
     void *ptr;
     void (*release)(void *);
@@ -9684,6 +9694,13 @@ js_clone *js_clone_write(js_ctx *ctx, js_value v, js_value transfer)
       if (item.type == JV_OBJ && item.u.obj->kind == OBJ_ARRAYBUFFER && !((js_arraybuffer *)item.u.obj->host)->shared &&
           !((js_arraybuffer *)item.u.obj->host)->owner)
         w.xfer[w.nxfer++] = item.u.obj;
+    }
+    for (i = 0; i < n && !w.failed;
+         i++) { /* ports and the like in the list travel even when the value does not hold them */
+      js_value item = transfer.u.obj->elems[i];
+      if (item.type == JV_OBJ && item.u.obj->kind != OBJ_ARRAYBUFFER && clone_seen(&w, item.u.obj) < 0 &&
+          clone_try_ext(&w, item))
+        w.c->nextra++;
     }
   }
   clone_value(&w, v, 0);
@@ -10077,7 +10094,10 @@ js_value js_clone_read(js_ctx *ctx, const js_clone *c)
 {
   clone_r r = {ctx, c, 0, 0, 0, 0, 0};
   js_value v;
+  int i;
   gc_push_scope();
+  for (i = 0; i < c->nextra && !r.failed; i++)
+    clone_read_value(&r, 0);
   v = clone_read_value(&r, 0);
   if (v.type == JV_OBJ)
     gc_keep(v.u.obj);

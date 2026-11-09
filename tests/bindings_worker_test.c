@@ -404,6 +404,30 @@ static void test_ports_cross(void)
       "ch.port1.close();\n");
 }
 
+static void test_event_ports(void)
+{
+  run_script(
+      "var c1=new MessageChannel(), c2=new MessageChannel(), epp=null, plain=null, moved=[];\n"
+      "c1.port2.onmessage=function(e){ if (e.data==='plain') plain=e; else epp=e; };\n"
+      "c1.port1.postMessage('plain'); c1.port1.postMessage({p:c2.port2},[c2.port2]);\n"
+      "var pw=new Worker('data:text/javascript,var mc=new MessageChannel(), got=[]; mc.port2.onmessage=function(e){ "
+      "got.push(e.ports.length+e.data); if (got.length===2) postMessage(got.join()); }; "
+      "mc.port1.postMessage(\"a\",[]); var cc=new MessageChannel(); mc.port1.postMessage(\"b\",[cc.port2]); "
+      "onmessage=function(e){ postMessage({n:e.ports.length, same:e.ports[0]===e.data.p, back:cc.port1}, [cc.port1]); "
+      "};'), wres=null;\n"
+      "pw.onmessage=function(e){ if (typeof e.data==='string') wres=e.data; else moved.push(e); };\n"
+      "var mine=new MessageChannel(); pw.postMessage({p:mine.port2},[mine.port2]);\n");
+  expect(wait_for("epp!==null && plain!==null && moved.length>=1 && wres!==null"));
+  run_script("expect(plain.ports.length===0, 'a message without transferred ports has an empty ports array');\n"
+             "expect(epp.ports.length===1 && epp.ports[0]===c2.port2 && epp.data.p===c2.port2, 'a transferred page "
+             "port arrives in event.ports by identity');\n"
+             "expect(wres==='0a,1b', 'ports transferred inside a worker show up in event.ports: '+wres);\n"
+             "var m=moved[0]; expect(m.data.n===1 && m.data.same===true, 'the worker saw the page port in event.ports: "
+             "'+JSON.stringify(m.data));\n"
+             "expect(m.ports.length===1 && m.ports[0]===m.data.back, 'a port sent out of a worker arrives in "
+             "event.ports');\n");
+}
+
 static void test_worker_url_edges(void)
 {
   run_script("var ue=null, uw=new Worker('data:text/javascript,var r=[]; function U(a,b){ try { return new "
@@ -622,6 +646,7 @@ int main(void)
   worker_test("transferred buffers and collections", test_transfer_and_collections);
   worker_test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);
   worker_test("MessageChannel and MessagePort", test_message_channel);
+  worker_test("MessageEvent.ports", test_event_ports);
   worker_test("ErrorEvent and MessageEvent", test_event_interfaces);
   worker_test("script and construction errors", test_errors);
 

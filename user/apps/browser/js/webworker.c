@@ -70,7 +70,7 @@ struct wthread {
 };
 
 static js_object *g_worker_proto; /* Worker.prototype */
-static js_object *g_wq;           /* MessagePort traffic: flat (port, data) pairs, drained by the pump */
+static js_object *g_wq;           /* MessagePort traffic: flat (port, data, ports) triples, drained by the pump */
 static int g_next_wid;
 
 /* Live workers and their page-side objects, index for index; the objects are GC roots */
@@ -90,6 +90,91 @@ static unsigned g_next_port_id;
 
 /* The worker a message is being cloned for (or from), so a MessagePort inside it can be tied to that worker */
 static __thread struct wthread *clone_peer;
+
+/* The MessagePorts that structured clones made while being read, in order: the event.ports of the message being
+ * delivered. Readers clear the list first and take it afterwards. */
+static void ports_clear(js_ctx *ctx) { js_def(ctx->global, "@rports", js_obj_value(js_new_array(ctx, 0)), P_WRITABLE); }
+
+static void ports_note(js_ctx *ctx, js_value port)
+{
+  js_value a = js_get(ctx, js_obj_value(ctx->global), "@rports");
+  if (a.type == JV_OBJ)
+    js_array_push(ctx, a.u.obj, port);
+}
+
+static js_value ports_take(js_ctx *ctx)
+{
+  js_value a = js_get(ctx, js_obj_value(ctx->global), "@rports");
+  js_object *r;
+  unsigned i;
+  gc_push_scope();
+  if (a.type == JV_OBJ)
+    gc_keep(a.u.obj);
+  r = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; a.type == JV_OBJ && i < js_array_len(a.u.obj); i++)
+    js_array_push(ctx, r, a.u.obj->elems[i]);
+  ports_clear(ctx);
+  gc_pop_scope();
+  return js_obj_value(r);
+}
+
+/* A local clone moves the MessagePorts inside it by identity: the clone carries each port's slot in "@lports" */
+static __thread int g_local_clone;
+
+static int ports_local_write(js_ctx *ctx, js_value port, char kind[16], unsigned char **bytes, int *len)
+{
+  js_value t = js_get(ctx, js_obj_value(ctx->global), "@lports");
+  int idx;
+  if (t.type != JV_OBJ)
+    return 0;
+  idx = (int)js_array_len(t.u.obj);
+  *bytes = (unsigned char *)malloc(sizeof idx);
+  if (!*bytes)
+    return 0;
+  memcpy(*bytes, &idx, sizeof idx);
+  *len = (int)sizeof idx;
+  strcpy(kind, "lport");
+  js_array_push(ctx, t.u.obj, port);
+  return 1;
+}
+
+static js_value ports_local_read(js_ctx *ctx, const unsigned char *bytes, int len)
+{
+  js_value t = js_get(ctx, js_obj_value(ctx->global), "@lports"), port;
+  int idx;
+  if (t.type != JV_OBJ || len != (int)sizeof idx)
+    return js_undef();
+  memcpy(&idx, bytes, sizeof idx);
+  port = js_get_index(ctx, t, (unsigned)idx);
+  ports_note(ctx, port);
+  return port;
+}
+
+/* Clones `v` within this context, ports moving by identity; the clone's value and the ports it carries.
+ * 0 with the exception pending. */
+int js_local_clone(js_ctx *ctx, js_value v, js_value transfer, js_value *data, js_value *ports)
+{
+  js_clone *c;
+  int ok = 0;
+  gc_push_scope();
+  js_def(ctx->global, "@lports", js_obj_value(js_new_array(ctx, 0)), P_WRITABLE);
+  ports_clear(ctx);
+  g_local_clone = 1;
+  c = js_clone_write(ctx, v, transfer);
+  if (c) {
+    *data = js_clone_read(ctx, c);
+    js_clone_free(c);
+    ok = !ctx->has_exc;
+  }
+  g_local_clone = 0;
+  if (ok) {
+    if (data->type == JV_OBJ)
+      gc_keep(data->u.obj);
+    *ports = ports_take(ctx);
+  }
+  gc_pop_scope();
+  return ok;
+}
 
 /* Page ports whose other end moved into a worker (or that arrived from one): id, owner, local port */
 #define RPORT_MAX 64
@@ -598,6 +683,8 @@ static int wt_clone_write_port(js_ctx *ctx, js_value v, char kind[16], unsigned 
   for (p = v.u.obj->proto; p && p != proto.u.obj; p = p->proto)
     ;
   fn = js_get(ctx, n, "portTransfer");
+  if (p && g_local_clone)
+    return ports_local_write(ctx, v, kind, bytes, len);
   if (!p || !js_is_callable(fn))
     return 0;
   r = js_call(ctx, fn, n, &v, 1);
@@ -625,8 +712,10 @@ static js_value wt_clone_read(js_ctx *ctx, const char *kind, const unsigned char
   js_object *opts;
   if (streq(kind, "ocanvas"))
     return canvas_clone_read(ctx, kind, bytes, len);
+  if (streq(kind, "lport"))
+    return ports_local_read(ctx, bytes, len);
   if (streq(kind, "port")) { /* a port arrives: the script side builds it */
-    js_value n, fn, id;
+    js_value n, fn, id, port;
     if (!wt_load_parts(ctx, PART_NET))
       return js_undef();
     n = js_get(ctx, js_obj_value(ctx->global), "@N");
@@ -635,7 +724,10 @@ static js_value wt_clone_read(js_ctx *ctx, const char *kind, const unsigned char
       return js_undef();
     memcpy(&len, bytes, sizeof len);
     id = js_number(len);
-    return js_call(ctx, fn, n, &id, 1);
+    port = js_call(ctx, fn, n, &id, 1);
+    if (!ctx->has_exc && port.type == JV_OBJ)
+      ports_note(ctx, port);
+    return port;
   }
   if (!streq(kind, "blob") || !js_is_callable(ctor))
     return js_undef();
@@ -1056,16 +1148,20 @@ static bool wt_pump_ws(js_ctx *ctx)
 /* A message for a port that lives here arrives from the page */
 static void wt_dispatch_port(js_ctx *ctx, int rid, js_clone *c)
 {
-  js_value args[2];
+  js_value args[3];
   gc_push_scope();
   args[0] = js_number(rid);
+  ports_clear(ctx);
   args[1] = js_clone_read(ctx, c);
   if (args[1].type == JV_OBJ)
     gc_keep(args[1].u.obj);
   if (ctx->has_exc)
     wt_report(ctx);
-  else
-    wt_hook(ctx, "onport", args, 2);
+  else {
+    args[2] = ports_take(ctx);
+    gc_keep(args[2].u.obj);
+    wt_hook(ctx, "onport", args, 3);
+  }
   gc_pop_scope();
 }
 
@@ -1115,6 +1211,25 @@ static js_value wt_n_port_post(js_ctx *ctx, js_value t, js_value *args, int argc
   if (c)
     wmsg_post(cur_wt, &cur_wt->out, WM_PORT, (int)js_to_number(ctx, A(0)), c, 0);
   return js_undef();
+}
+
+/* N.cloneLocal(value, transfer) -> {data, ports}: a structured clone inside this worker, ports moving by identity */
+static js_value wt_n_clone_local(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value data = js_undef(), ports = js_undef();
+  js_object *r;
+  (void)t;
+  if (!js_local_clone(ctx, A(0), A(1), &data, &ports))
+    return js_undef();
+  gc_push_scope();
+  if (data.type == JV_OBJ)
+    gc_keep(data.u.obj);
+  gc_keep(ports.u.obj);
+  r = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(r, "data", data, P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+  js_def(r, "ports", ports, P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE);
+  gc_pop_scope();
+  return js_obj_value(r);
 }
 
 static js_value wt_n_port_close(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -1178,6 +1293,7 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "newPortId", wt_n_new_port_id, 0);
   js_def_native(ctx, n, "portPost", wt_n_port_post, 3);
   js_def_native(ctx, n, "portClose", wt_n_port_close, 1);
+  js_def_native(ctx, n, "cloneLocal", wt_n_clone_local, 2);
   js_def_native(ctx, n, "waitReply", wt_n_wait_reply, 1);
   js_def_native(ctx, n, "wsOpen", wt_n_ws_open, 2);
   js_def_native(ctx, n, "wsProtocol", wt_n_ws_protocol, 1);
@@ -1234,7 +1350,7 @@ static void wt_call_handler(js_ctx *ctx, js_value fn, js_value ev)
 
 /* A MessageEvent for `data`, built here instead of by the script-side constructor, then handed to onmessage and to
  * the listeners the prelude recorded under "@listeners" (the same order dispatchEvent would use) */
-static void wt_fire_message(js_ctx *ctx, js_value data)
+static void wt_fire_message(js_ctx *ctx, js_value data, js_value ports)
 {
   js_value g = js_obj_value(ctx->global), ctor = js_get(ctx, g, "MessageEvent"), proto, ls, list;
   js_object *ev;
@@ -1259,7 +1375,7 @@ static void wt_fire_message(js_ctx *ctx, js_value data)
   js_def(ev, "origin", js_mk_cstring(ctx, ""), flags);
   js_def(ev, "lastEventId", js_mk_cstring(ctx, ""), flags);
   js_def(ev, "source", js_null(), flags);
-  js_def(ev, "ports", js_obj_value(js_new_array(ctx, 0)), flags);
+  js_def(ev, "ports", ports, flags);
   js_def(ev, "@stop", js_bool(0), P_WRITABLE | P_CONFIGURABLE);
   wt_call_handler(ctx, js_get(ctx, g, "onmessage"), js_obj_value(ev));
   ls = js_get(ctx, g, "@listeners");
@@ -1286,14 +1402,18 @@ static void wt_fire_message(js_ctx *ctx, js_value data)
 
 static void wt_deliver(js_ctx *ctx, js_clone *c)
 {
-  js_value data = js_clone_read(ctx, c);
+  js_value data;
+  ports_clear(ctx);
+  data = js_clone_read(ctx, c);
   gc_push_scope();
   if (data.type == JV_OBJ)
     gc_keep(data.u.obj);
   if (ctx->has_exc)
     wt_report(ctx);
   else {
-    wt_fire_message(ctx, data);
+    js_value ports = ports_take(ctx);
+    gc_keep(ports.u.obj);
+    wt_fire_message(ctx, data, ports);
     wt_run_microtasks(ctx);
   }
   gc_pop_scope();
@@ -1804,6 +1924,8 @@ int worker_port_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **by
 {
   js_value peer;
   int rid;
+  if (g_local_clone && js_is_port(v))
+    return ports_local_write(ctx, v, kind, bytes, len);
   if (!clone_peer || !js_is_port(v) || g_nrports == RPORT_MAX)
     return 0;
   peer = js_get(ctx, v, "@peer");
@@ -1830,6 +1952,8 @@ js_value worker_port_read(js_ctx *ctx, const char *kind, const unsigned char *by
 {
   js_object *port;
   int rid;
+  if (streq(kind, "lport"))
+    return ports_local_read(ctx, bytes, len);
   if (!clone_peer || !streq(kind, "port") || len != (int)sizeof rid || g_nrports == RPORT_MAX)
     return js_undef();
   memcpy(&rid, bytes, sizeof rid);
@@ -1840,6 +1964,7 @@ js_value worker_port_read(js_ctx *ctx, const char *kind, const unsigned char *by
   g_rport_ids[g_nrports] = rid;
   g_rport_wt[g_nrports] = clone_peer;
   g_rport_objs[g_nrports++] = port;
+  ports_note(ctx, js_obj_value(port));
   gc_pop_scope();
   return js_obj_value(port);
 }
@@ -1883,8 +2008,9 @@ static void worker_fire(struct wthread *wt, js_value w, struct wmsg *m)
       js_def(ev.u.obj, "error", js_null(), P_WRITABLE | P_ENUMERABLE);
     }
   } else {
-    js_value data;
+    js_value data, ports;
     clone_peer = wt;
+    ports_clear(g_ctx);
     data = js_clone_read(g_ctx, m->clone);
     clone_peer = 0;
     if (g_ctx->has_exc) {
@@ -1895,7 +2021,9 @@ static void worker_fire(struct wthread *wt, js_value w, struct wmsg *m)
     }
     if (data.type == JV_OBJ)
       gc_keep(data.u.obj);
-    ev = make_message_event(data);
+    ports = ports_take(g_ctx);
+    gc_keep(ports.u.obj);
+    ev = make_message_event(data, ports);
   }
   if (ev.type == JV_OBJ) {
     gc_keep(ev.u.obj);
@@ -1928,7 +2056,7 @@ static bool worker_reap(int i)
   return true;
 }
 
-static void wq_deliver_port(js_value port, js_value data)
+static void wq_deliver_port(js_value port, js_value data, js_value ports)
 {
   js_value ev;
   if (port.type != JV_OBJ || js_to_boolean(js_get(g_ctx, port, "@dead")) ||
@@ -1938,7 +2066,9 @@ static void wq_deliver_port(js_value port, js_value data)
   gc_keep(port.u.obj);
   if (data.type == JV_OBJ)
     gc_keep(data.u.obj);
-  ev = make_message_event(data);
+  if (ports.type == JV_OBJ)
+    gc_keep(ports.u.obj);
+  ev = make_message_event(data, ports);
   if (ev.type == JV_OBJ) {
     gc_keep(ev.u.obj);
     js_set(g_ctx, ev, "target", port);
@@ -1959,10 +2089,11 @@ int js_workers_pump(void)
     old = (js_object *)gc_keep(g_wq);
     g_wq = js_new_array(g_ctx, 0);
     n = js_array_len(old);
-    for (k = 0; k + 1 < n; k += 2)
-      wq_deliver_port(js_get_index(g_ctx, js_obj_value(old), k), js_get_index(g_ctx, js_obj_value(old), k + 1));
+    for (k = 0; k + 2 < n; k += 3)
+      wq_deliver_port(js_get_index(g_ctx, js_obj_value(old), k), js_get_index(g_ctx, js_obj_value(old), k + 1),
+                      js_get_index(g_ctx, js_obj_value(old), k + 2));
     gc_pop_scope();
-    delivered += (int)(n / 2);
+    delivered += (int)(n / 3);
   }
   for (i = 0; i < g_nworkers; i++) {
     struct wthread *wt = g_workers[i];
@@ -1977,13 +2108,19 @@ int js_workers_pump(void)
         if (pi >= 0 && g_rport_wt[pi] == wt && m->kind == WM_PORT) {
           js_value port = js_obj_value(g_rport_objs[pi]), data;
           clone_peer = wt;
+          ports_clear(g_ctx);
           data = js_clone_read(g_ctx, m->clone);
           clone_peer = 0;
           if (g_ctx->has_exc) {
             g_ctx->has_exc = 0;
             g_ctx->exc_root = 0;
-          } else
-            js_port_enqueue(port, data);
+          } else {
+            gc_push_scope();
+            if (data.type == JV_OBJ)
+              gc_keep(data.u.obj);
+            js_port_enqueue(port, data, ports_take(g_ctx));
+            gc_pop_scope();
+          }
         } else if (pi >= 0 && g_rport_wt[pi] == wt) {
           js_set(g_ctx, js_obj_value(g_rport_objs[pi]), "@closed", js_bool(1));
           rport_drop(pi);
@@ -2007,14 +2144,16 @@ int js_workers_pump(void)
   return delivered;
 }
 
-void js_port_enqueue(js_value port, js_value data)
+void js_port_enqueue(js_value port, js_value data, js_value ports)
 {
   gc_push_scope();
   gc_keep(port.u.obj);
   if (data.type == JV_OBJ)
     gc_keep(data.u.obj);
+  gc_keep(ports.u.obj);
   js_array_push(g_ctx, g_wq, port);
   js_array_push(g_ctx, g_wq, data);
+  js_array_push(g_ctx, g_wq, ports);
   gc_pop_scope();
 }
 

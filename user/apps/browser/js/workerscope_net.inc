@@ -407,7 +407,8 @@ JS(
   function flush(p) {
     p["@scheduled"] = false;
     while (p["@started"] && p["@queue"].length) {
-      p.dispatchEvent(new g.MessageEvent("message", { data: p["@queue"].shift(), target: p }));
+      var m = p["@queue"].shift();
+      p.dispatchEvent(new g.MessageEvent("message", { data: m.data, ports: m.ports, target: p }));
     }
   }
   function schedule(p) {
@@ -420,7 +421,8 @@ JS(
     var peer = this["@peer"];
     if (this["@remote"] !== undefined) { if (!this["@closed"]) { N.portPost(this["@remote"], data, transfer); } return; }
     if (!peer) { return; }
-    peer["@queue"].push(structuredClone(data));
+    var m = N.cloneLocal(data, transfer);
+    peer["@queue"].push(m);
     schedule(peer);
   });
   method(MessagePort.prototype, "start", function () { this["@started"] = true; schedule(this); });
@@ -460,9 +462,9 @@ JS(
     remote[rid] = p;
     return p;
   };
-  N.onport = function (rid, data) {
+  N.onport = function (rid, data, ports) {
     var p = remote[rid];
-    if (p && !p["@closed"]) { p["@queue"].push(data); schedule(p); }
+    if (p && !p["@closed"]) { p["@queue"].push({ data: data, ports: ports }); schedule(p); }
   };
   N.onportclose = function (rid) {
     var p = remote[rid];

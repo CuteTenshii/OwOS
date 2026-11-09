@@ -68,7 +68,7 @@ js_value el_noop(js_ctx *ctx, js_value t, js_value *args, int argc); /* no-op na
 js_value hdr_get(js_ctx *ctx, js_value t, js_value *args, int argc); /* Headers.get   */
 js_value hdr_has(js_ctx *ctx, js_value t, js_value *args, int argc); /* Headers.has   */
 void js_set_cur_script(const char *label);                           /* current script name for exc attribution */
-js_value make_message_event(js_value data);                          /* a MessageEvent carrying `data` */
+js_value make_message_event(js_value data, js_value ports); /* a MessageEvent carrying `data` and the array `ports` */
 js_object *make_response(js_ctx *ctx, const char *url, int status, const char *statustext, const char *ctype,
                          const char *body, int len); /* fetch Response */
 void notif_app_name(char *buf, int cap);             /* the app name for a Notification  */
@@ -111,7 +111,9 @@ int sw_intercept_fetch(js_ctx *ctx, const char *url, const char *method, js_valu
 /* Dedicated workers (js/webworker.c) */
 void js_worker_setup(js_ctx *ctx, js_object *win);
 void js_worker_teardown(void);
-void js_port_enqueue(js_value port, js_value data); /* async message delivery to a MessagePort */
+void js_port_enqueue(js_value port, js_value data, js_value ports); /* async message delivery to a MessagePort */
+int js_local_clone(js_ctx *ctx, js_value v, js_value transfer, js_value *data,
+                   js_value *ports); /* a clone inside this context */
 void js_msgchannel_setup(js_ctx *ctx, js_object *win);
 int js_is_port(js_value v);          /* a MessagePort of the page */
 js_object *js_new_port(js_ctx *ctx); /* an unattached MessagePort */
