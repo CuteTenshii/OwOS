@@ -117,6 +117,45 @@ static void check_json_stringify(void)
       0));
 }
 
+static void check_atomics(void)
+{
+  expect(
+      run("var sab=new SharedArrayBuffer(16), i=new Int32Array(sab), u8=new Uint8Array(sab), t=function(f){ try{ f() "
+          "}catch(e){ return e.constructor.name } };\n"
+          "expect(sab.byteLength===16 && Object.prototype.toString.call(sab)==='[object SharedArrayBuffer]' && !(sab "
+          "instanceof ArrayBuffer), 'SharedArrayBuffer');\n"
+          "var s2=sab.slice(4,8); expect(s2 instanceof SharedArrayBuffer && s2.byteLength===4, 'slice stays shared');\n"
+          "expect(Atomics.store(i,0,5)===5 && Atomics.load(i,0)===5, 'store, load');\n"
+          "expect(Atomics.add(i,0,3)===5 && i[0]===8, 'add returns the old value');\n"
+          "expect(Atomics.sub(i,0,10)===8 && i[0]===-2, 'sub');\n"
+          "i[1]=12; expect(Atomics.and(i,1,10)===12 && i[1]===8 && Atomics.or(i,1,3)===8 && i[1]===11 && "
+          "Atomics.xor(i,1,1)===11 && i[1]===10, 'and, or, xor');\n"
+          "expect(Atomics.exchange(i,1,7)===10 && i[1]===7, 'exchange');\n"
+          "expect(Atomics.compareExchange(i,1,7,9)===7 && i[1]===9 && Atomics.compareExchange(i,1,7,1)===9 && "
+          "i[1]===9, 'compareExchange');\n"
+          "u8[8]=250; expect(Atomics.add(u8,8,10)===250 && u8[8]===4, 'wraps to the element width');\n"
+          "var i8=new Int8Array(new ArrayBuffer(2)); expect(Atomics.compareExchange(i8,0,-1,3)===0 && "
+          "Atomics.store(i8,0,255)===255 && Atomics.load(i8,0)===-1 && Atomics.compareExchange(i8,0,255,2)===-1 && "
+          "i8[0]===2, 'expected value is narrowed');\n"
+          "var b=new BigInt64Array(new SharedArrayBuffer(16)); Atomics.store(b,0,-1n);\n"
+          "expect(Atomics.add(b,0,3n)===-1n && b[0]===2n && Atomics.sub(b,0,3n)===2n && b[0]===-1n, '64-bit add and "
+          "sub');\n"
+          "expect(Atomics.compareExchange(b,0,-1n,7n)===-1n && b[0]===7n && t(function(){ Atomics.add(b,0,1) "
+          "})==='TypeError', '64-bit needs BigInt');\n"
+          "expect(t(function(){ Atomics.add(new Float64Array(1),0,1) })==='TypeError' && t(function(){ "
+          "Atomics.load(new Uint8ClampedArray(1),0) })==='TypeError' && t(function(){ Atomics.load([1],0) "
+          "})==='TypeError', 'integer typed arrays only');\n"
+          "expect(t(function(){ Atomics.load(i,4) })==='RangeError' && t(function(){ Atomics.load(i,-1) "
+          "})==='RangeError', 'index bounds');\n"
+          "i[2]=1; expect(Atomics.wait(i,2,0,0)==='not-equal' && Atomics.wait(i,2,1,0)==='timed-out' && "
+          "Atomics.notify(i,2,1)===0, 'wait, notify');\n"
+          "expect(t(function(){ Atomics.wait(new Int32Array(4),0,0,0) })==='TypeError' && t(function(){ "
+          "Atomics.wait(u8,0,0,0) })==='TypeError', 'wait needs a shared Int32Array');\n"
+          "expect(Atomics.isLockFree(4)===true && Atomics.isLockFree(3)===false && String(Atomics)==='[object "
+          "Atomics]', 'isLockFree, tag');\n",
+          0));
+}
+
 static void check_json_parse(void)
 {
   expect(
@@ -359,6 +398,7 @@ int main(void)
   test("JSON.stringify", check_json_stringify);
   test("DataView BigInt64 and Float16", check_dataview);
   test("BigInt64Array, BigUint64Array and Float16Array", check_wide_typed_arrays);
+  test("SharedArrayBuffer and Atomics", check_atomics);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);

@@ -59,7 +59,7 @@ struct js_ctx {
                                 * detached, e.g. `var f = Symbol.for; f(x)`)     */
   /* typed arrays: the shared %TypedArray%.prototype, the per-view prototypes
    * (indexed by TA_*), plus ArrayBuffer/DataView prototypes. */
-  js_object *typedarray_proto, *arraybuffer_proto, *dataview_proto;
+  js_object *typedarray_proto, *arraybuffer_proto, *sharedarraybuffer_proto, *dataview_proto;
   js_object *typed_protos[TA_NKINDS];
   /* error subclass prototypes (TypeError, RangeError, ...) chain to error_proto
    */

@@ -64,6 +64,7 @@ enum { TA_I8, TA_U8, TA_U8C, TA_I16, TA_U16, TA_I32, TA_U32, TA_F32, TA_F64, TA_
 typedef struct {
   unsigned char *data;
   int byteLength;
+  int shared; /* SharedArrayBuffer */
 } js_arraybuffer;
 typedef struct {
   js_object *buffer;

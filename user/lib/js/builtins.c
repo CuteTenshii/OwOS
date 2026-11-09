@@ -7391,12 +7391,20 @@ static js_object *new_arraybuffer(js_ctx *ctx, int n)
     gc_oom();
   ab->data = (unsigned char *)calloc((unsigned)(n > 0 ? n : 1), 1);
   ab->byteLength = n;
+  ab->shared = 0;
   if (!ab->data) { /* too big for the heap: an empty buffer and a RangeError */
     ab->byteLength = 0;
     js_throw_range(ctx, "Array buffer allocation failed");
   }
   o->host = ab;
   gc_pop_scope();
+  return o;
+}
+static js_object *new_sharedbuffer(js_ctx *ctx, int n)
+{
+  js_object *o = new_arraybuffer(ctx, n);
+  o->proto = ctx->sharedarraybuffer_proto;
+  ((js_arraybuffer *)o->host)->shared = 1;
   return o;
 }
 static js_value new_view(js_ctx *ctx, int type, js_object *buf, int offset, int length)
@@ -8173,7 +8181,7 @@ static js_value ab_slice(js_ctx *ctx, js_value t, js_value *a, int n)
   m = e - b;
   if (m < 0)
     m = 0;
-  o = new_arraybuffer(ctx, m);
+  o = ((js_arraybuffer *)t.u.obj->host)->shared ? new_sharedbuffer(ctx, m) : new_arraybuffer(ctx, m);
   if (o->host)
     memcpy(((js_arraybuffer *)o->host)->data, ab->data + b, (unsigned)m);
   return js_obj_value(o);
@@ -8185,6 +8193,212 @@ static js_value arraybuffer_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
   if (len < 0)
     return js_throw_range(ctx, "Invalid array buffer length");
   return js_obj_value(new_arraybuffer(ctx, len));
+}
+
+static js_value sab_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  int len = n > 0 ? js_to_int_sat(ctx, a[0]) : 0;
+  (void)t;
+  if (len < 0)
+    return js_throw_range(ctx, "Invalid array buffer length");
+  return js_obj_value(new_sharedbuffer(ctx, len));
+}
+
+/* ------------------------------------------------------- Atomics --------- *
+ * Contexts are single-threaded, so every operation is trivially atomic: the
+ * read-modify-write runs on the backing bytes directly. 64-bit element kinds
+ * go through unsigned long long, the rest through the low 32 bits. */
+static int atomics_is64(int type) { return type == TA_I64 || type == TA_U64; }
+static js_object *atomics_target(js_ctx *ctx, js_value *a, int n, int wait, unsigned *idx)
+{
+  js_typedarray *ta = n > 0 ? as_ta(a[0]) : 0;
+  double d = n > 1 ? js_to_number(ctx, a[1]) : 0;
+  if (!ta || ta->type < 0 || ta->type == TA_U8C || ta->type == TA_F32 || ta->type == TA_F64 || ta->type == TA_F16 ||
+      (wait && ta->type != TA_I32 && ta->type != TA_I64)) {
+    js_throw_type(ctx, "Atomics operation on an invalid typed array");
+    return 0;
+  }
+  if (wait && !((js_arraybuffer *)ta->buffer->host)->shared) {
+    js_throw_type(ctx, "Atomics.wait requires a shared typed array");
+    return 0;
+  }
+  if (d != d)
+    d = 0;
+  if (d < 0 || d >= ta->length) {
+    js_throw_range(ctx, "Atomics index out of range");
+    return 0;
+  }
+  *idx = (unsigned)d;
+  return a[0].u.obj;
+}
+/* the operand as raw bits, truncated to the element width; 0 with an exception pending on failure */
+static int atomics_operand(js_ctx *ctx, int type, js_value v, unsigned long long *out)
+{
+  if (atomics_is64(type)) {
+    unsigned lo, hi;
+    if (!js_bigint_to_u64(ctx, v, &lo, &hi))
+      return 0;
+    *out = ((unsigned long long)hi << 32) | lo;
+  } else {
+    unsigned x = js_to_uint32(ctx, v);
+    int es = ta_elem_size(type);
+    *out = es < 4 ? x & ((1u << (8 * es)) - 1) : x;
+  }
+  return 1;
+}
+static unsigned long long atomics_bits(js_ctx *ctx, int type, js_value v)
+{
+  unsigned long long r = 0;
+  if (atomics_is64(type)) {
+    unsigned lo = 0, hi = 0;
+    js_bigint_to_u64(ctx, v, &lo, &hi);
+    return ((unsigned long long)hi << 32) | lo;
+  }
+  r = (unsigned)(long long)js_to_number(ctx, v);
+  return ta_elem_size(type) < 4 ? r & ((1u << (8 * ta_elem_size(type))) - 1) : r;
+}
+static void atomics_put(js_ctx *ctx, js_object *view, unsigned idx, int type, unsigned long long bits)
+{
+  if (atomics_is64(type))
+    ta_set(ctx, view, idx, js_bigint_from_u64(ctx, (unsigned)bits, (unsigned)(bits >> 32), type == TA_I64));
+  else
+    ta_set(ctx, view, idx, js_number((double)(unsigned)bits));
+}
+enum { AT_ADD, AT_SUB, AT_AND, AT_OR, AT_XOR, AT_XCHG };
+static js_value atomics_rmw(js_ctx *ctx, js_value *a, int n, int op)
+{
+  unsigned idx;
+  js_object *view = atomics_target(ctx, a, n, 0, &idx);
+  unsigned long long v, cur, res;
+  js_value old;
+  int type;
+  if (!view)
+    return js_undef();
+  type = ((js_typedarray *)view->host)->type;
+  if (!atomics_operand(ctx, type, n > 2 ? a[2] : js_undef(), &v))
+    return js_undef();
+  old = ta_get(ctx, view, idx);
+  cur = atomics_bits(ctx, type, old);
+  switch (op) {
+  case AT_ADD:
+    res = cur + v;
+    break;
+  case AT_SUB:
+    res = cur - v;
+    break;
+  case AT_AND:
+    res = cur & v;
+    break;
+  case AT_OR:
+    res = cur | v;
+    break;
+  case AT_XOR:
+    res = cur ^ v;
+    break;
+  default:
+    res = v;
+    break;
+  }
+  atomics_put(ctx, view, idx, type, res);
+  return old;
+}
+#define AT_RMW(fn, OP)                                                                                                 \
+  static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n)                                                      \
+  {                                                                                                                    \
+    (void)t;                                                                                                           \
+    return atomics_rmw(ctx, a, n, OP);                                                                                 \
+  }
+AT_RMW(atomics_add, AT_ADD)
+AT_RMW(atomics_sub, AT_SUB)
+AT_RMW(atomics_and, AT_AND)
+AT_RMW(atomics_or, AT_OR)
+AT_RMW(atomics_xor, AT_XOR)
+AT_RMW(atomics_exchange, AT_XCHG)
+#undef AT_RMW
+static js_value atomics_load(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  unsigned idx;
+  js_object *view = atomics_target(ctx, a, n, 0, &idx);
+  (void)t;
+  return view ? ta_get(ctx, view, idx) : js_undef();
+}
+static js_value atomics_store(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  unsigned idx;
+  js_object *view = atomics_target(ctx, a, n, 0, &idx);
+  unsigned long long bits;
+  js_value v = n > 2 ? a[2] : js_undef();
+  int type;
+  (void)t;
+  if (!view)
+    return js_undef();
+  type = ((js_typedarray *)view->host)->type;
+  if (atomics_is64(type)) {
+    if (!atomics_operand(ctx, type, v, &bits))
+      return js_undef();
+    atomics_put(ctx, view, idx, type, bits);
+    return v;
+  }
+  {
+    double d = js_to_number(ctx, v);
+    d = d != d ? 0 : (d < 0 ? -floor(-d) : floor(d));
+    ta_set(ctx, view, idx, js_number(d));
+    return js_number(d);
+  }
+}
+static js_value atomics_cmpxchg(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  unsigned idx;
+  js_object *view = atomics_target(ctx, a, n, 0, &idx);
+  unsigned long long expected, repl;
+  js_value old;
+  int type;
+  (void)t;
+  if (!view)
+    return js_undef();
+  type = ((js_typedarray *)view->host)->type;
+  if (!atomics_operand(ctx, type, n > 2 ? a[2] : js_undef(), &expected) ||
+      !atomics_operand(ctx, type, n > 3 ? a[3] : js_undef(), &repl))
+    return js_undef();
+  old = ta_get(ctx, view, idx);
+  if (atomics_bits(ctx, type, old) == expected)
+    atomics_put(ctx, view, idx, type, repl);
+  return old;
+}
+static js_value atomics_islockfree(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  double d = n > 0 ? js_to_number(ctx, a[0]) : 0;
+  (void)t;
+  return js_bool(d == 1 || d == 2 || d == 4 || d == 8);
+}
+/* No other agent can ever notify, so a matching wait can only time out. */
+static js_value atomics_wait(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  unsigned idx;
+  js_object *view = atomics_target(ctx, a, n, 1, &idx);
+  unsigned long long expected;
+  int type;
+  (void)t;
+  if (!view)
+    return js_undef();
+  type = ((js_typedarray *)view->host)->type;
+  if (!atomics_operand(ctx, type, n > 2 ? a[2] : js_undef(), &expected))
+    return js_undef();
+  if (n > 3)
+    js_to_number(ctx, a[3]);
+  return js_mk_cstring(ctx, atomics_bits(ctx, type, ta_get(ctx, view, idx)) == expected ? "timed-out" : "not-equal");
+}
+static js_value atomics_notify(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  unsigned idx;
+  js_object *view = atomics_target(ctx, a, n, 0, &idx);
+  (void)t;
+  if (view) {
+    int type = ((js_typedarray *)view->host)->type;
+    if (type != TA_I32 && type != TA_I64)
+      return js_throw_type(ctx, "Atomics.notify requires an Int32Array or BigInt64Array");
+  }
+  return js_number(0);
 }
 
 /* DataView: type TA_DATAVIEW, host->length = byteLength */
@@ -8417,6 +8631,35 @@ static void setup_typed_arrays(js_ctx *ctx)
   {
     js_object *c = make_ctor(ctx, "ArrayBuffer", arraybuffer_ctor, ctx->arraybuffer_proto);
     js_def_native(ctx, c, "isView", ab_isview, 1);
+  }
+
+  /* SharedArrayBuffer + Atomics */
+  ta_def_acc(ctx, ctx->sharedarraybuffer_proto, "byteLength", ab_bytelength);
+  js_def_native(ctx, ctx->sharedarraybuffer_proto, "slice", ab_slice, 2);
+  make_ctor(ctx, "SharedArrayBuffer", sab_ctor, ctx->sharedarraybuffer_proto);
+  if (ctx->sym_tostringtag.type == JV_SYMBOL)
+    js_def(ctx->sharedarraybuffer_proto, js_symbol_key(ctx->sym_tostringtag), js_mk_cstring(ctx, "SharedArrayBuffer"),
+           P_CONFIGURABLE);
+  {
+    js_object *at = js_new_object(ctx, ctx->object_proto);
+    gc_push_scope();
+    gc_keep(at);
+    js_def(ctx->global, "Atomics", js_obj_value(at), P_WRITABLE | P_CONFIGURABLE);
+    if (ctx->sym_tostringtag.type == JV_SYMBOL)
+      js_def(at, js_symbol_key(ctx->sym_tostringtag), js_mk_cstring(ctx, "Atomics"), P_CONFIGURABLE);
+    js_def_native(ctx, at, "add", atomics_add, 3);
+    js_def_native(ctx, at, "sub", atomics_sub, 3);
+    js_def_native(ctx, at, "and", atomics_and, 3);
+    js_def_native(ctx, at, "or", atomics_or, 3);
+    js_def_native(ctx, at, "xor", atomics_xor, 3);
+    js_def_native(ctx, at, "exchange", atomics_exchange, 3);
+    js_def_native(ctx, at, "compareExchange", atomics_cmpxchg, 4);
+    js_def_native(ctx, at, "load", atomics_load, 2);
+    js_def_native(ctx, at, "store", atomics_store, 3);
+    js_def_native(ctx, at, "isLockFree", atomics_islockfree, 1);
+    js_def_native(ctx, at, "wait", atomics_wait, 4);
+    js_def_native(ctx, at, "notify", atomics_notify, 3);
+    gc_pop_scope();
   }
 
   /* %TypedArray%.prototype: shared accessors + methods */
