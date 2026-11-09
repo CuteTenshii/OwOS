@@ -1,13 +1,12 @@
-/* resolve.c — hostname -> IPv4 in user space. See resolve.h. */
+/* resolve.c — hostname -> IPv4/IPv6 in user space. See resolve.h. */
 
 #include "resolve.h"
 #include "mdns.h"
 #include "owos.h"
 #include "svcb.h"
 
-/* Fallback nameserver when /etc/resolv.conf is absent/unreadable (SLIRP's DNS).
- */
-static const unsigned char DNS_DEFAULT[4] = {10, 0, 2, 3};
+/* Fallback nameserver when /etc/resolv.conf is absent/unreadable (SLIRP's DNS). */
+static const char DNS_DEFAULT[] = "10.0.2.3";
 
 static int is_digit(char c) { return c >= '0' && c <= '9'; }
 
@@ -46,21 +45,86 @@ static int is_local(const char *host)
          (s[5] | 32) == 'l';
 }
 
-/* Read the first "nameserver A.B.C.D" line of /etc/resolv.conf into ns. Falls
- * back to DNS_DEFAULT when the file is missing/unreadable or has no directive.
- */
-static void read_nameserver(unsigned char ns[4])
+/* Parse an IPv6 literal (optional "%zone" suffix, ignored) into out. 1 on success, 0 otherwise. */
+static int parse_ipv6(const char *s, unsigned char out[16])
 {
-  for (int i = 0; i < 4; i++)
-    ns[i] = DNS_DEFAULT[i];
+  unsigned short head[8], tail[8];
+  int nh = 0, nt = 0, gap = 0;
+  if (s[0] == ':') {
+    if (s[1] != ':')
+      return 0;
+    gap = 1;
+    s += 2;
+  }
+  while (*s && *s != '%') {
+    unsigned v = 0;
+    int digits = 0;
+    for (;; s++, digits++) {
+      int d = (*s >= '0' && *s <= '9') ? *s - '0' : ((*s | 32) >= 'a' && (*s | 32) <= 'f') ? (*s | 32) - 'a' + 10 : -1;
+      if (d < 0)
+        break;
+      v = v * 16 + (unsigned)d;
+      if (digits >= 4)
+        return 0;
+    }
+    if (!digits || nh + nt >= 8)
+      return 0;
+    if (gap)
+      tail[nt++] = (unsigned short)v;
+    else
+      head[nh++] = (unsigned short)v;
+    if (*s == ':') {
+      s++;
+      if (*s == ':') {
+        if (gap)
+          return 0;
+        gap = 1;
+        s++;
+      } else if (!*s || *s == '%') {
+        return 0;
+      }
+    } else if (*s && *s != '%') {
+      return 0;
+    }
+  }
+  if (gap ? nh + nt > 7 : nh != 8)
+    return 0;
+  memset(out, 0, 16);
+  for (int i = 0; i < nh; i++) {
+    out[2 * i] = (unsigned char)(head[i] >> 8);
+    out[2 * i + 1] = (unsigned char)head[i];
+  }
+  for (int i = 0; i < nt; i++) {
+    out[16 - 2 * (nt - i)] = (unsigned char)(tail[i] >> 8);
+    out[16 - 2 * (nt - i) + 1] = (unsigned char)tail[i];
+  }
+  return 1;
+}
 
+/* True if the kernel holds a global IPv6 address, i.e. a v6 destination can be reached beyond the link. */
+static int have_global_v6(void)
+{
+  char b[48];
+  int n = readfile("/sys/class/net/eth0/ip6addr", b, (int)sizeof b - 1);
+  return n > 1; /* just "\n" means none */
+}
+
+#define NS_MAX 3
+#define NS_LEN 40
+
+/* Collect up to NS_MAX nameservers into list: "nameserver ADDR" lines of /etc/resolv.conf (IPv4 or IPv6),
+ * then the router-advertised DNS server. IPv6 servers are skipped without a global address. Falls back to
+ * DNS_DEFAULT when none is found. Returns the count. */
+static int read_nameservers(char list[NS_MAX][NS_LEN])
+{
+  int count = 0, v6 = have_global_v6();
   char buf[512];
   int n = readfile("/etc/resolv.conf", buf, (int)sizeof buf - 1);
-  if (n <= 0)
-    return;
+  if (n < 0)
+    n = 0;
   buf[n] = '\0';
 
-  for (const char *p = buf; *p;) {
+  for (const char *p = buf; *p && count < NS_MAX;) {
     const char *line = p;
     while (*p && *p != '\n')
       p++;
@@ -74,45 +138,40 @@ static void read_nameserver(unsigned char ns[4])
     const char *a = line + 11;
     while (*a == ' ' || *a == '\t')
       a++;
-    char ips[24];
+    char tok[NS_LEN];
     int k = 0;
-    while (k < (int)sizeof ips - 1 && (is_digit(a[k]) || a[k] == '.'))
-      ips[k] = a[k], k++;
-    ips[k] = '\0';
-    unsigned char got[4];
-    if (parse_ipv4(ips, got)) {
-      for (int i = 0; i < 4; i++)
-        ns[i] = got[i];
-      return;
-    }
+    while (k < NS_LEN - 1 && a[k] && a[k] != ' ' && a[k] != '\t' && a[k] != '\r' && a[k] != '\n')
+      tok[k] = a[k], k++;
+    tok[k] = '\0';
+    unsigned char got[16];
+    if (parse_ipv4(tok, got) || (v6 && parse_ipv6(tok, got)))
+      memcpy(list[count++], tok, k + 1);
   }
+
+  if (count == 0) {
+    memcpy(list[0], DNS_DEFAULT, sizeof DNS_DEFAULT);
+    count = 1;
+  }
+  char ra[48];
+  n = v6 ? readfile("/sys/class/net/eth0/dns6", ra, (int)sizeof ra - 1) : 0;
+  if (n > 1 && count < NS_MAX) {
+    ra[n] = '\0';
+    for (int i = 0; i < n; i++)
+      if (ra[i] == '\n')
+        ra[i] = '\0';
+    unsigned char got[16];
+    if (parse_ipv6(ra, got))
+      memcpy(list[count++], ra, strlen(ra) + 1);
+  }
+  return count;
 }
 
 static unsigned be16(const unsigned char *p) { return ((unsigned)p[0] << 8) | p[1]; }
 
-/* Send a `qtype` query for `host` to `ns`:53. Returns the reply length in r (>= 12), 0 on
- * miss/timeout, or NET_EINTR on Ctrl+C. */
-static int dns_exchange(const char *host, int qtype, const unsigned char ns[4], unsigned char *r, int rmax)
+/* Send a `qtype` query for `host` to each nameserver in turn (port 53). Returns the first reply length in r
+ * (>= 12), 0 on miss/timeout, or NET_EINTR on Ctrl+C. */
+static int dns_exchange(const char *host, int qtype, unsigned char *r, int rmax)
 {
-  char server[16];
-  int si = 0;
-  for (int i = 0; i < 4; i++) {
-    unsigned v = ns[i], d = 100;
-    int started = 0;
-    while (d) {
-      unsigned q = v / d;
-      if (q || started || d == 1) {
-        server[si++] = (char)('0' + q);
-        started = 1;
-      }
-      v %= d;
-      d /= 10;
-    }
-    if (i < 3)
-      server[si++] = '.';
-  }
-  server[si] = '\0';
-
   /* Build the query. */
   unsigned char q[512];
   int n = 0;
@@ -148,30 +207,41 @@ static int dns_exchange(const char *host, int qtype, const unsigned char ns[4], 
   q[n++] = 0;
   q[n++] = 1; /* QCLASS=IN                           */
 
-  for (int tries = 0; tries < 2; tries++) {
-    int h = net_connect(server, 53, SK_UDP);
-    if (h < 0)
-      return h == NET_EINTR ? NET_EINTR : 0;
-    if (net_send(h, q, n) < 0) {
-      net_close(h);
-      continue;
-    }
+  char servers[NS_MAX][NS_LEN];
+  int ns = read_nameservers(servers);
+  for (int i = 0; i < ns; i++) {
+    for (int tries = 0; tries < (ns == 1 ? 2 : 1); tries++) {
+      int h = net_connect(servers[i], 53, SK_UDP);
+      if (h < 0) {
+        if (h == NET_EINTR)
+          return NET_EINTR;
+        break;
+      }
+      if (net_send(h, q, n) < 0) {
+        net_close(h);
+        continue;
+      }
 
-    int rn = net_recv(h, r, rmax); /* ~2 s socket timeout, then 0 */
-    net_close(h);
-    if (rn == NET_EINTR)
-      return NET_EINTR;
-    if (rn >= 12)
-      return rn;
+      int rn = net_recv(h, r, rmax); /* ~2 s socket timeout, then 0 */
+      net_close(h);
+      if (rn == NET_EINTR)
+        return NET_EINTR;
+      if (rn >= 12)
+        return rn;
+    }
   }
   return 0;
 }
 
-/* First A address of `host` via `ns`. 1 = resolved, 0 = miss/timeout, NET_EINTR on Ctrl+C. */
-static int dns_lookup(const char *host, const unsigned char ns[4], unsigned char ip[4])
+#define DNS_TYPE_A 1
+#define DNS_TYPE_AAAA 28
+
+/* First A (4 bytes) or AAAA (16 bytes) address of `host`. 1 = resolved, 0 = miss/timeout, NET_EINTR on Ctrl+C. */
+static int dns_lookup(const char *host, int qtype, unsigned char *ip)
 {
+  int alen = qtype == DNS_TYPE_A ? 4 : 16;
   unsigned char r[1500];
-  int rn = dns_exchange(host, 1, ns, r, (int)sizeof r);
+  int rn = dns_exchange(host, qtype, r, (int)sizeof r);
   if (rn <= 0)
     return rn;
 
@@ -197,14 +267,14 @@ static int dns_lookup(const char *host, const unsigned char ns[4], unsigned char
     pos += 10;
     if (pos + rdlen > rn)
       break;
-    if (type == 1 && rdlen == 4) { /* first A record             */
-      for (int k = 0; k < 4; k++)
+    if (type == qtype && rdlen == alen) { /* first matching record     */
+      for (int k = 0; k < alen; k++)
         ip[k] = r[pos + k];
       return 1;
     }
     pos += rdlen; /* CNAME etc.: keep scanning  */
   }
-  return 0; /* answered, but no A          */
+  return 0; /* answered, but no such record */
 }
 
 int resolve(const char *host, unsigned char ip[4])
@@ -217,39 +287,90 @@ int resolve(const char *host, unsigned char ip[4])
     int r = mdns_resolve(host, ip); /* 1 ok, 0 miss, <0 err/intr  */
     return r == NET_EINTR ? NET_EINTR : (r > 0 ? 1 : 0);
   }
-  unsigned char ns[4];
-  read_nameserver(ns);
-  return dns_lookup(host, ns, ip);
+  return dns_lookup(host, DNS_TYPE_A, ip);
 }
 
-int net_dial(const char *host, int port, int proto)
+int resolve6(const char *host, unsigned char ip[16])
 {
-  unsigned char ip[4];
-  int r = resolve(host, ip);
+  unsigned char v4[4];
+  if (!host || !*host)
+    return 0;
+  if (parse_ipv6(host, ip))
+    return 1;
+  if (parse_ipv4(host, v4) || is_local(host)) /* no AAAA for v4 literals or mDNS names */
+    return 0;
+  return dns_lookup(host, DNS_TYPE_AAAA, ip);
+}
+
+/* Write a dotted quad (v4) or 8 colon-separated hex groups (v6) into out (>= 40 bytes). */
+static void format_ip(const unsigned char *a, int v6, char *out)
+{
+  int n = 0;
+  for (int i = 0; i < (v6 ? 8 : 4); i++) {
+    unsigned v = v6 ? ((unsigned)a[2 * i] << 8) | a[2 * i + 1] : a[i];
+    unsigned base = v6 ? 16 : 10;
+    char t[4];
+    int k = 0;
+    do {
+      t[k++] = "0123456789abcdef"[v % base];
+      v /= base;
+    } while (v);
+    while (k)
+      out[n++] = t[--k];
+    out[n++] = v6 ? ':' : '.';
+  }
+  out[n - 1] = '\0';
+}
+
+static int dial_ip(const unsigned char *ip, int v6, int port, int proto, int *fam)
+{
+  char s[40];
+  format_ip(ip, v6, s);
+  if (fam)
+    *fam = v6 ? 6 : 4;
+  return net_connect(s, port, proto);
+}
+
+/* Names: TCP tries IPv6 first when a global address is held, then falls back to IPv4. Datagram
+ * sockets have no connect failure to fall back on, so they use IPv6 only for names with no A record.
+ * *fam (if given) restricts the family on entry (4 or 6; 0 = either) and reports the one used. */
+int net_dial_fam(const char *host, int port, int proto, int *fam)
+{
+  int want = fam ? *fam : 0;
+  unsigned char ip[16], ip4[4];
+  if (parse_ipv6(host, ip))
+    return want == 4 ? -2 : dial_ip(ip, 1, port, proto, fam);
+
+  int global = want == 0 && have_global_v6();
+  int first6 = want == 6 || (global && proto == SK_TCP);
+  if (first6) {
+    int r = resolve6(host, ip);
+    if (r == NET_EINTR)
+      return NET_EINTR;
+    if (r == 1) {
+      int h = dial_ip(ip, 1, port, proto, fam);
+      if (h >= 0 || h == NET_EINTR || want == 6)
+        return h;
+    } else if (want == 6) {
+      return -2;
+    }
+  }
+  int r = resolve(host, ip4);
   if (r == NET_EINTR)
     return NET_EINTR;
-  if (r != 1)
-    return -2;
-  char dotted[16];
-  int di = 0;
-  for (int i = 0; i < 4; i++) {
-    unsigned v = ip[i], d = 100;
-    int started = 0;
-    while (d) {
-      unsigned q = v / d;
-      if (q || started || d == 1) {
-        dotted[di++] = (char)('0' + q);
-        started = 1;
-      }
-      v %= d;
-      d /= 10;
-    }
-    if (i < 3)
-      dotted[di++] = '.';
+  if (r == 1)
+    return dial_ip(ip4, 0, port, proto, fam);
+  if (global && !first6) {
+    r = resolve6(host, ip);
+    if (r == NET_EINTR)
+      return NET_EINTR;
+    if (r == 1)
+      return dial_ip(ip, 1, port, proto, fam);
   }
-  dotted[di] = '\0';
-  return net_connect(dotted, port, proto);
+  return -2;
 }
+
+int net_dial(const char *host, int port, int proto) { return net_dial_fam(host, port, proto, 0); }
 
 int resolve_ech(const char *host, int port, unsigned char *out, int max)
 {
@@ -275,8 +396,7 @@ int resolve_ech(const char *host, int port, unsigned char *out, int max)
     return 0;
   memcpy(name + n, host, hl + 1);
 
-  unsigned char ns[4], r[1500];
-  read_nameserver(ns);
-  int rn = dns_exchange(name, DNS_TYPE_HTTPS, ns, r, (int)sizeof r);
+  unsigned char r[1500];
+  int rn = dns_exchange(name, DNS_TYPE_HTTPS, r, (int)sizeof r);
   return rn > 0 ? svcb_find_ech(r, rn, out, max) : 0;
 }

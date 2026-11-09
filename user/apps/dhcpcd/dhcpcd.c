@@ -1,7 +1,8 @@
 /* dhcpcd.c: the user-space DHCP client, autostarted as root at boot.
  *
  * One-shot DISCOVER/OFFER/REQUEST/ACK over a raw Ethernet socket (net_raw_open), building the
- * L2/IPv4/UDP frame itself. On ACK it applies the lease with ifconfig() and writes /etc/resolv.conf. */
+ * L2/IPv4/UDP frame itself. On ACK it applies the lease with ifconfig() and writes /etc/resolv.conf, then asks
+ * for IPv6 DNS servers with a stateless DHCPv6 Information-Request (addresses come from SLAAC). */
 
 #include "owos.h"
 #include <stdbool.h>
@@ -231,6 +232,68 @@ static bool exchange(int fd, const unsigned char *frame, int flen, unsigned char
   return false;
 }
 
+/* --- DHCPv6, stateless (RFC 8415 section 18.2.6) -------------------------- */
+#define DHCP6_INFO_REQUEST 11
+#define DHCP6_REPLY 7
+#define DHCP6_OPT_CLIENTID 1
+#define DHCP6_OPT_ORO 6
+#define DHCP6_OPT_ELAPSED 8
+#define DHCP6_OPT_DNS 23
+
+/* Ask the DHCPv6 servers on the link (ff02::1:2) for DNS servers; fills dns6, returns how many. */
+static int dhcp6_dns(unsigned char dns6[][16], int max)
+{
+  static const unsigned char all_servers[16] = {0xff, 0x02, [13] = 1, [15] = 2};
+  int fd = net_bind(546);
+  if (fd < 0)
+    return 0;
+
+  unsigned char tid[3] = {xid[2], xid[3], 'v'};
+  unsigned char m[32];
+  int n = 0;
+  m[n++] = DHCP6_INFO_REQUEST;
+  memcpy(m + n, tid, 3);
+  n += 3;
+  put16(m + n, DHCP6_OPT_CLIENTID);
+  put16(m + n + 2, 10);
+  put16(m + n + 4, 3); /* DUID-LL */
+  put16(m + n + 6, 1); /* ethernet */
+  memcpy(m + n + 8, our_mac, 6);
+  n += 14;
+  put16(m + n, DHCP6_OPT_ELAPSED);
+  put16(m + n + 2, 2);
+  put16(m + n + 4, 0);
+  n += 6;
+  put16(m + n, DHCP6_OPT_ORO);
+  put16(m + n + 2, 2);
+  put16(m + n + 4, DHCP6_OPT_DNS);
+  n += 6;
+
+  int count = 0;
+  for (int t = 0; t < 3 && !count; t++) {
+    if (net_sendto(fd, all_servers, 547, m, n) < 0)
+      break;
+    unsigned char rx[512], src[16];
+    int sport = 0;
+    int r = net_recvfrom(fd, rx, sizeof rx, src, &sport);
+    if (r == NET_EINTR)
+      break;
+    if (r < 4 || rx[0] != DHCP6_REPLY || memcmp(rx + 1, tid, 3) != 0)
+      continue;
+    for (int i = 4; i + 4 <= r;) {
+      unsigned code = get16(rx + i), len = get16(rx + i + 2);
+      i += 4;
+      if (i + (int)len > r)
+        break;
+      for (unsigned k = 0; code == DHCP6_OPT_DNS && k + 16 <= len && count < max; k += 16)
+        memcpy(dns6[count++], rx + i + k, 16);
+      i += (int)len;
+    }
+  }
+  net_close(fd);
+  return count;
+}
+
 static void log_ip(const char *label, const unsigned char ip[4])
 {
   printf("%s%u.%u.%u.%u", label, ip[0], ip[1], ip[2], ip[3]);
@@ -285,7 +348,7 @@ int main(void)
   }
 
   /* Publish the resolver. */
-  char resolv[64];
+  char resolv[256];
   int rl = snprintf(resolv, sizeof resolv, "nameserver %u.%u.%u.%u\n", dns[0], dns[1], dns[2], dns[3]);
   writefile("/etc/resolv.conf", resolv, rl);
 
@@ -293,5 +356,17 @@ int main(void)
   log_ip(" gw ", gw);
   log_ip(" dns ", dns);
   printf("\n");
+
+  unsigned char dns6[2][16];
+  int nd6 = dhcp6_dns(dns6, 2);
+  for (int i = 0; i < nd6; i++) {
+    const unsigned char *a = dns6[i];
+    rl += snprintf(resolv + rl, sizeof resolv - (unsigned)rl, "nameserver %x:%x:%x:%x:%x:%x:%x:%x\n", get16(a),
+                   get16(a + 2), get16(a + 4), get16(a + 6), get16(a + 8), get16(a + 10), get16(a + 12), get16(a + 14));
+  }
+  if (nd6) {
+    writefile("/etc/resolv.conf", resolv, rl);
+    printf("dhcpcd: %d IPv6 dns server(s)\n", nd6);
+  }
   return 0;
 }

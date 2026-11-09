@@ -30,11 +30,14 @@ int main(int argc, char **argv)
 {
   int count = 0; /* 0 = continuous */
   const char *host = 0;
+  int fam = 0; /* 4 / 6 restrict the address family */
 
   signal(SIGINT, on_sigint);
 
   static const struct opt opts[] = {
       {'c', "count", OPT_ARG, 'c', "N", "stop after N replies (default: until Ctrl+C)"},
+      {'4', 0, OPT_FLAG, '4', 0, "use IPv4 only"},
+      {'6', 0, OPT_FLAG, '6', 0, "use IPv6 only"},
       {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
   };
   struct optstate st;
@@ -46,6 +49,8 @@ int main(int argc, char **argv)
       return 0;
     } else if (o == 'c' && opt_uint(st.arg, &n) == 0) {
       count = (int)n;
+    } else if (o == '4' || o == '6') {
+      fam = o - '0';
     } else if (o == OPT_POS) {
       host = st.arg;
     } else {
@@ -58,7 +63,8 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  int h = net_dial(host, 0, SK_ICMP); /* resolve in user space, then connect */
+  int h = net_dial_fam(host, 0, SK_ICMP, &fam); /* resolve in user space, then connect */
+  int v6 = fam == 6;
   if (h < 0) {
     if (h == -2) {
       printf("ping: cannot resolve %s\n", host);
@@ -75,7 +81,7 @@ int main(int argc, char **argv)
 
   for (int seq = 1; count == 0 || seq <= count; seq++) {
     unsigned char pkt[8 + 56];
-    pkt[0] = 8;
+    pkt[0] = v6 ? 128 : 8; /* echo request; the kernel fills in the ICMPv6 checksum */
     pkt[1] = 0;
     pkt[2] = 0;
     pkt[3] = 0; /* type/code/csum */
@@ -85,9 +91,11 @@ int main(int argc, char **argv)
     pkt[7] = (unsigned char)seq;
     for (int i = 0; i < 56; i++)
       pkt[8 + i] = (unsigned char)('a' + (i % 26));
-    unsigned short c = icmp_csum(pkt, (int)sizeof pkt);
-    pkt[2] = (unsigned char)(c >> 8);
-    pkt[3] = (unsigned char)c;
+    if (!v6) {
+      unsigned short c = icmp_csum(pkt, (int)sizeof pkt);
+      pkt[2] = (unsigned char)(c >> 8);
+      pkt[3] = (unsigned char)c;
+    }
 
     unsigned t0 = msec();
     if (net_send(h, pkt, (int)sizeof pkt) < 0) {
@@ -106,7 +114,7 @@ int main(int argc, char **argv)
       }
       if (n <= 0)
         break; /* timeout */
-      if (n >= 8 && rb[0] == 0 && (((int)rb[4] << 8) | rb[5]) == id) {
+      if (n >= 8 && rb[0] == (v6 ? 129 : 0) && (((int)rb[4] << 8) | rb[5]) == id) {
         got = true;
         break;
       }
