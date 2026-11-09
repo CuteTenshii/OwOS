@@ -40,7 +40,10 @@ typedef void (*h3_push_fn)(void *ctx, const char *conn_authority, const char *sc
                            const char *path, const char *hdr, const unsigned char *body, int blen);
 void h3_set_push_handler(h3_push_fn fn, void *ctx);
 
-/* Connect (QUIC handshake + HTTP/3 setup); 0 or a negative HTTP_E*. */
+/* Connect (QUIC handshake + HTTP/3 setup); 0 or a negative HTTP_E*. When a resumption ticket for the host exists the
+ * call returns after the first flight, before the handshake is done, and a plain GET is sent as 0-RTT data (marked
+ * "Early-Data: 1"; a 425 answer is sent again after the handshake). Other requests wait for the handshake. If the
+ * handshake then fails, the request fails with it and the origin is best left to another protocol. */
 int h3_session_open(h3_session **out, const char *host, int port);
 
 /* An idle session for host:port, or NULL. It may have been closed by the peer meanwhile: when h3_session_used()

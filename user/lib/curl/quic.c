@@ -10,6 +10,7 @@
 #include "quic.h"
 #include "certs.h"
 #include "crypto.h"
+#include "mutex.h"
 #include "owos.h"
 #include "resolve.h"
 
@@ -67,6 +68,8 @@ static int varsize(uint64_t v) { return v < 0x40 ? 1 : v < 0x4000 ? 2 : v < 0x40
 
 /* ClientHello.random, the ephemeral x25519 key and the connection IDs come from
  * the shared userspace CSPRNG (rng_bytes: RDRAND-backed). */
+static unsigned qnow(void) { return msec(); }
+
 /* ------------------------------------------------------- connection state */
 
 enum { S_INIT = 0, S_HS = 1, S_APP = 2 }; /* packet-number spaces */
@@ -81,6 +84,7 @@ struct sent_pkt {
   unsigned t; /* msec() when sent */
   uint32_t len;
   uint8_t *frames;
+  int early; /* sent as 0-RTT: sent again if the server turns the early data down */
 };
 
 struct range {
@@ -144,8 +148,19 @@ struct quic {
   uint8_t pending_fin[40];
   int pending_fin_len;
 
-  uint8_t chello[1024];
+  uint8_t chello[1400];
   uint32_t chello_len; /* kept for retransmit */
+
+  /* 0-RTT (RFC 8446 §2.3, RFC 9001 §4.6): a resumption ticket's PSK, the early keys and what the server made of them.
+   */
+  int psk_offered, psk_accepted;
+  uint8_t psk[32], early_secret[32];
+  uint8_t e_ck[16], e_ci[12], e_ch[16];
+  int early_keys;     /* 0-RTT packets can be sent */
+  int early_sent;     /* some were */
+  int early_accepted; /* the server took them */
+  uint8_t res_master[32];
+  int have_res;
 
   /* Round-trip estimate (RFC 9002 §5) and probe backoff. */
   unsigned srtt, rttvar, latest_rtt;
@@ -240,11 +255,101 @@ static void th_snapshot(struct quic *Q, uint8_t out[32])
   sha256_final(&c, out);
 }
 
+/* The PSK a ticket stands for: the connection's resumption secret expanded with the ticket's nonce (RFC 8446 §4.6.1).
+ */
+static void psk_from_ticket(const uint8_t res_master[32], const uint8_t *nonce, uint8_t nlen, uint8_t psk[32])
+{
+  expand_label(res_master, "resumption", nonce, nlen, psk, 32);
+}
+
+/* The early secret of a PSK, and the binder proving we hold it: an HMAC over the hash of the ClientHello up to its
+ * binders (RFC 8446 §4.2.11.2). */
+static void compute_binder(const uint8_t psk[32], const uint8_t th_trunc[32], uint8_t early[32], uint8_t binder[32])
+{
+  uint8_t zero[32] = {0}, empty[32], bk[32], fk[32];
+  sha256("", 0, empty);
+  hkdf_extract(zero, 32, psk, 32, early);
+  derive_secret(early, "res binder", empty, bk);
+  expand_label(bk, "finished", 0, 0, fk, 32);
+  hmac_sha256(fk, 32, th_trunc, 32, binder);
+}
+
+/* 0-RTT packet protection keys: from the client early traffic secret, over the hash of the whole ClientHello. */
+static void install_early(struct quic *Q, const uint8_t early[32], const uint8_t th_ch[32])
+{
+  uint8_t c_e[32];
+  derive_secret(early, "c e traffic", th_ch, c_e);
+  expand_label(c_e, "quic key", 0, 0, Q->e_ck, 16);
+  expand_label(c_e, "quic iv", 0, 0, Q->e_ci, 12);
+  expand_label(c_e, "quic hp", 0, 0, Q->e_ch, 16);
+  Q->early_keys = 1;
+}
+
 /* ------------------------------------------------------------- ClientHello */
 
 static const uint8_t sigalgs[] = {0x08, 0x04, 0x08, 0x05, 0x08, 0x06,  /* rsa_pss_rsae_sha256/384/512 */
                                   0x04, 0x01, 0x05, 0x01, 0x06, 0x01,  /* rsa_pkcs1_sha256/384/512    */
                                   0x04, 0x03, 0x05, 0x03, 0x06, 0x03}; /* ecdsa_secp256r1/384/521     */
+
+/* ------------------------------------------------------- session tickets */
+
+#define TICKET_MAX 8
+#define TICKET_BYTES 400
+
+/* What a server's NewSessionTicket gives us to resume with: kept in memory, used once. */
+struct ticket {
+  int used;
+  char host[256];
+  uint8_t data[TICKET_BYTES];
+  uint32_t len, age_add;
+  uint8_t psk[32];
+  unsigned lifetime_ms, issued;
+  int early_ok;
+  uint64_t max_data, stream_data, max_bidi; /* the limits to respect when sending early */
+};
+
+static struct ticket g_tickets[TICKET_MAX];
+static mutex_t g_ticket_lock = MUTEX_INIT;
+
+static void ticket_put(const struct ticket *t)
+{
+  mutex_lock(&g_ticket_lock);
+  struct ticket *slot = 0;
+  for (int i = 0; i < TICKET_MAX; i++)
+    if (g_tickets[i].used && streq(g_tickets[i].host, t->host))
+      slot = &g_tickets[i];
+  for (int i = 0; i < TICKET_MAX && !slot; i++)
+    if (!g_tickets[i].used)
+      slot = &g_tickets[i];
+  if (!slot) { /* full: replace the oldest */
+    slot = &g_tickets[0];
+    for (int i = 1; i < TICKET_MAX; i++)
+      if ((int)(g_tickets[i].issued - slot->issued) < 0)
+        slot = &g_tickets[i];
+  }
+  *slot = *t;
+  slot->used = 1;
+  mutex_unlock(&g_ticket_lock);
+}
+
+/* Remove and return the unexpired ticket for `host`, if any. */
+static int ticket_take(const char *host, struct ticket *out)
+{
+  int found = 0;
+  mutex_lock(&g_ticket_lock);
+  for (int i = 0; i < TICKET_MAX; i++) {
+    struct ticket *t = &g_tickets[i];
+    if (!t->used || !streq(t->host, host))
+      continue;
+    if (qnow() - t->issued < t->lifetime_ms) {
+      *out = *t;
+      found = 1;
+    }
+    t->used = 0;
+  }
+  mutex_unlock(&g_ticket_lock);
+  return found;
+}
 
 /* QUIC transport parameters (TLS extension 0x39). */
 static uint32_t build_tp(struct quic *Q, uint8_t *b)
@@ -278,7 +383,8 @@ static uint32_t build_tp(struct quic *Q, uint8_t *b)
 
 /* Build a TLS 1.3 ClientHello (4-byte HS header included) for QUIC: x25519 key
  * share, SNI, ALPN, and the QUIC transport-parameters extension. */
-static uint32_t build_client_hello(struct quic *Q, uint8_t *out, const char *sni, const char *alpn)
+static uint32_t build_client_hello(struct quic *Q, uint8_t *out, const char *sni, const char *alpn,
+                                   const struct ticket *t)
 {
   uint32_t namelen = sni ? (uint32_t)strlen(sni) : 0;
   uint32_t alpnlen = (uint32_t)strlen(alpn);
@@ -368,6 +474,43 @@ static uint32_t build_client_hello(struct quic *Q, uint8_t *out, const char *sni
   p += tpn;
   put16(tplen, (uint16_t)tpn);
 
+  uint8_t *binders = 0, *binder = 0;
+  if (t) { /* resume: early_data, psk_key_exchange_modes, and pre_shared_key — which must come last */
+    if (t->early_ok) {
+      put16(p, 0x002A);
+      p += 2;
+      put16(p, 0);
+      p += 2;
+    }
+    put16(p, 0x002D);
+    p += 2;
+    put16(p, 2);
+    p += 2;
+    *p++ = 1;
+    *p++ = 1; /* psk_dhe_ke */
+    uint16_t idl = (uint16_t)(2 + t->len + 4);
+    put16(p, 0x0029);
+    p += 2;
+    put16(p, (uint16_t)(2 + idl + 2 + 33));
+    p += 2;
+    put16(p, idl);
+    p += 2;
+    put16(p, (uint16_t)t->len);
+    p += 2;
+    memcpy(p, t->data, t->len);
+    p += t->len;
+    uint32_t age = qnow() - t->issued + t->age_add;
+    for (int i = 0; i < 4; i++)
+      *p++ = (uint8_t)(age >> (24 - 8 * i));
+    binders = p; /* binders<33>: one 32-byte binder, filled in below */
+    put16(p, 33);
+    p += 2;
+    *p++ = 32;
+    binder = p;
+    memset(p, 0, 32);
+    p += 32;
+  }
+
   put16(extlen, (uint16_t)(p - exts));
 
   uint32_t body = (uint32_t)(p - (out + 4));
@@ -375,12 +518,20 @@ static uint32_t build_client_hello(struct quic *Q, uint8_t *out, const char *sni
   out[1] = (uint8_t)(body >> 16);
   out[2] = (uint8_t)(body >> 8);
   out[3] = (uint8_t)body;
+  if (t) {
+    uint8_t th[32];
+    sha256(out, (uint32_t)(binders - out), th); /* the hello without its binders */
+    memcpy(Q->psk, t->psk, 32);
+    compute_binder(Q->psk, th, Q->early_secret, binder);
+    Q->psk_offered = 1;
+  }
   return body + 4;
 }
 
 /* Pull the server's x25519 share out of a ServerHello body. */
-static int parse_server_hello(const uint8_t *body, uint32_t bl, uint8_t server_pub[32])
+static int parse_server_hello(const uint8_t *body, uint32_t bl, uint8_t server_pub[32], int *psk_sel)
 {
+  *psk_sel = 0;
   if (bl < 38)
     return -1;
   uint32_t off = 34;
@@ -404,6 +555,8 @@ static int parse_server_hello(const uint8_t *body, uint32_t bl, uint8_t server_p
     off += 4;
     if (off + el > end)
       break;
+    if (et == 0x0029 && el == 2) /* pre_shared_key: the identity picked (we offered one, number 0) */
+      *psk_sel = body[off] == 0 && body[off + 1] == 0;
     if (et == 0x0033 && el >= 4) {
       uint16_t grp = ((uint16_t)body[off] << 8) | body[off + 1];
       uint16_t kl = ((uint16_t)body[off + 2] << 8) | body[off + 3];
@@ -423,14 +576,16 @@ static int parse_server_hello(const uint8_t *body, uint32_t bl, uint8_t server_p
 static int on_server_hello(struct quic *Q, const uint8_t *body, uint32_t bl)
 {
   uint8_t server_pub[32];
-  if (parse_server_hello(body, bl, server_pub) < 0)
+  int psk_sel;
+  if (parse_server_hello(body, bl, server_pub, &psk_sel) < 0)
     return -1;
+  Q->psk_accepted = Q->psk_offered && psk_sel; /* else a full handshake */
 
   uint8_t zero[32] = {0}, empty_hash[32];
   sha256("", 0, empty_hash);
 
   uint8_t early[32], derived[32], shared[32], hs_secret[32];
-  hkdf_extract(zero, 32, zero, 32, early);
+  hkdf_extract(zero, 32, Q->psk_accepted ? Q->psk : zero, 32, early);
   expand_label(early, "derived", empty_hash, 32, derived, 32);
   x25519(shared, Q->our_priv, server_pub);
   hkdf_extract(derived, 32, shared, 32, hs_secret);
@@ -448,6 +603,8 @@ static int on_server_hello(struct quic *Q, const uint8_t *body, uint32_t bl)
   return 0;
 }
 
+static void reject_early(struct quic *Q);
+
 /* Server Finished received (th_pre = transcript through CertificateVerify):
  * check the certificate verdict and the Finished, derive + install 1-RTT keys, and stage the client Finished. */
 static int on_server_finished(struct quic *Q, const uint8_t *body, uint32_t bl, const uint8_t th_pre[32])
@@ -456,8 +613,8 @@ static int on_server_finished(struct quic *Q, const uint8_t *body, uint32_t bl, 
     return -1;
   /* The connection goes ahead only with a certificate that checks out for this host (or when there is no root
    * bundle to check against, as for TLS over TCP). */
-  if (Q->certs.verify != X509_OK && Q->certs.verify != X509_E_NO_STORE) {
-    Q->cert_fail = 1;
+  if (!Q->psk_accepted && Q->certs.verify != X509_OK && Q->certs.verify != X509_E_NO_STORE) {
+    Q->cert_fail = 1; /* (a resumed handshake has no certificate: the ticket came from a verified one) */
     return -1;
   }
   uint8_t fk[32], expect[32];
@@ -480,11 +637,23 @@ static int on_server_finished(struct quic *Q, const uint8_t *body, uint32_t bl, 
   memcpy(Q->pending_fin + 4, verify, 32);
   Q->pending_fin_len = 36;
 
+  struct sha256 through_cf = Q->transcript; /* ..client Finished: what the resumption secret is bound to */
+  uint8_t th_cf[32];
+  sha256_update(&through_cf, Q->pending_fin, 36);
+  sha256_final(&through_cf, th_cf);
+  derive_secret(Q->master, "res master", th_cf, Q->res_master);
+  Q->have_res = 1;
+
   uint8_t c_ap[32], s_ap[32];
   derive_secret(Q->master, "c ap traffic", th_sf, c_ap);
   derive_secret(Q->master, "s ap traffic", th_sf, s_ap);
   install_space(Q, S_APP, c_ap, s_ap);
   Q->app_done = 1;
+  if (Q->early_sent &&
+      !Q->early_accepted) { /* the server turned the early data down: send it again, protected normally */
+    Q->early_keys = 0;
+    reject_early(Q);
+  }
   return 0;
 }
 
@@ -524,6 +693,64 @@ static void parse_server_tp(struct quic *Q, const uint8_t *b, uint32_t len)
   }
 }
 
+/* Is extension `type` in a message whose body is a 2-byte-length extension list? */
+static int ext_present(const uint8_t *b, uint32_t len, uint16_t type)
+{
+  if (len < 2)
+    return 0;
+  uint32_t o = 2, end = 2 + (((uint32_t)b[0] << 8) | b[1]);
+  if (end > len)
+    end = len;
+  while (o + 4 <= end) {
+    uint16_t et = (uint16_t)((b[o] << 8) | b[o + 1]), el = (uint16_t)((b[o + 2] << 8) | b[o + 3]);
+    if (et == type)
+      return 1;
+    o += 4u + el;
+  }
+  return 0;
+}
+
+static uint32_t be32(const uint8_t *p)
+{
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* NewSessionTicket (RFC 8446 §4.6.1): keep what is needed to resume this connection later, with the server limits
+ * that early data must respect. */
+static void on_new_session_ticket(struct quic *Q, const uint8_t *b, uint32_t l)
+{
+  if (!Q->have_res || l < 13)
+    return;
+  uint32_t lifetime = be32(b), nl = b[8], o = 9;
+  if (o + nl + 2 > l)
+    return;
+  const uint8_t *nonce = b + o;
+  o += nl;
+  uint32_t tl = ((uint32_t)b[o] << 8) | b[o + 1];
+  o += 2;
+  if (!tl || tl > TICKET_BYTES || o + tl + 2 > l)
+    return;
+  struct ticket t;
+  memset(&t, 0, sizeof t);
+  memcpy(t.data, b + o, tl);
+  t.len = tl;
+  o += tl;
+  t.age_add = be32(b + 4);
+  t.early_ok = ext_present(b + o, l - o, 0x002A);
+  psk_from_ticket(Q->res_master, nonce, (uint8_t)nl, t.psk);
+  t.lifetime_ms = (lifetime > 604800 ? 604800 : lifetime) * 1000; /* at most a week */
+  t.issued = qnow();
+  t.max_data = Q->peer_max_data;
+  t.stream_data = Q->peer_stream_data;
+  t.max_bidi = Q->peer_max_bidi;
+  int k = 0;
+  for (; Q->host[k] && k < (int)sizeof t.host - 1; k++)
+    t.host[k] = Q->host[k];
+  t.host[k] = '\0';
+  if (t.lifetime_ms)
+    ticket_put(&t);
+}
+
 /* Extract complete TLS handshake messages from a space's CRYPTO buffer,
  * feeding each into the transcript hash and dispatching it. */
 static void extract_tls(struct quic *Q, int space)
@@ -542,15 +769,20 @@ static void extract_tls(struct quic *Q, int space)
     uint8_t th_pre[32];
     if (mt == 20 || mt == 15) /* Finished, CertificateVerify: hash BEFORE update */
       th_snapshot(Q, th_pre);
-    sha256_update(&Q->transcript, msg, total);
+    if (space != S_APP) /* messages after the handshake (tickets) are not part of the transcript */
+      sha256_update(&Q->transcript, msg, total);
 
+    if (mt == 4 && space == S_APP) /* NewSessionTicket */
+      on_new_session_ticket(Q, msg + 4, l);
     if (mt == 11) /* Certificate */
       certs_take(&Q->certs, Q->host, msg + 4, l, 1);
     if (mt == 15) /* CertificateVerify */
       certs_check_cv(&Q->certs, th_pre, msg + 4, l);
 
-    if (mt == 8) /* EncryptedExtensions */
+    if (mt == 8) { /* EncryptedExtensions */
       parse_server_tp(Q, msg + 4, l);
+      Q->early_accepted = Q->early_sent && Q->psk_accepted && ext_present(msg + 4, l, 0x002A);
+    }
     if (mt == 2) /* ServerHello */
       on_server_hello(Q, msg + 4, l);
     else if (mt == 20) /* Finished */
@@ -661,8 +893,6 @@ static void stream_recv(struct quic *Q, uint64_t id, uint64_t off, const uint8_t
 static int emit(struct quic *Q, int space, const uint8_t *frames, uint32_t flen, int track);
 static int poll_once(struct quic *Q);
 
-static unsigned qnow(void) { return msec(); }
-
 static int rr_has(const struct space *s, uint64_t pn)
 {
   for (int i = 0; i < s->nrr; i++)
@@ -739,6 +969,15 @@ static void retransmit(struct quic *Q, int space, struct sent_pkt *p)
   p->frames = 0;
   emit(Q, space, frames, len, 1);
   free(frames);
+}
+
+/* The server did not take our 0-RTT data: send what was in those packets again under the normal keys. */
+static void reject_early(struct quic *Q)
+{
+  struct space *s = &Q->sp[S_APP];
+  for (int i = 0; i < SENT_MAX; i++)
+    if (s->sent[i].frames && s->sent[i].early)
+      retransmit(Q, S_APP, &s->sent[i]);
 }
 
 /* Declare lost every packet below the largest acknowledged one that is three packets or a round trip (+1/8) old,
@@ -1198,6 +1437,8 @@ static int decrypt_pkt(struct quic *Q, int space, uint8_t *d, uint32_t pkt0, uin
   return 0;
 }
 
+static int send_crypto(struct quic *Q, int space, const uint8_t *data, uint32_t len);
+
 static void handle_retry(struct quic *Q, const uint8_t *retry_scid, int sl, const uint8_t *p, uint32_t plen)
 {
   if (Q->did_retry)
@@ -1219,6 +1460,7 @@ static void handle_retry(struct quic *Q, const uint8_t *retry_scid, int sl, cons
   derive_initial_keys(Q, Q->dcid, Q->dcid_len); /* new DCID => new Initial keys */
   sent_clear(&Q->sp[S_INIT]);
   Q->sp[S_INIT].nrr = 0;
+  send_crypto(Q, S_INIT, Q->chello, Q->chello_len); /* the same hello, now with the token */
 }
 
 /* --------------------------------------------------------- packet send */
@@ -1228,16 +1470,18 @@ static void handle_retry(struct quic *Q, const uint8_t *retry_scid, int sl, cons
 static int emit_packet(struct quic *Q, int space, const uint8_t *frames, uint32_t flen, uint64_t *pn_out)
 {
   struct space *s = &Q->sp[space];
-  if (!s->hk)
+  int early = space == S_APP && !s->hk && Q->early_keys; /* 0-RTT: Application packets under the early keys */
+  if (!s->hk && !early)
     return -1;
+  const uint8_t *key = early ? Q->e_ck : s->ck, *iv = early ? Q->e_ci : s->ci, *hp = early ? Q->e_ch : s->ch;
   uint8_t *out = Q->tx_out; /* packet scratch lives in the connection, off the small user stack */
   uint8_t *pt = Q->tx_pt;
   uint32_t p = 0;
-  int is_long = (space != S_APP);
+  int is_long = (space != S_APP) || early;
   uint32_t pn_off;
 
   if (is_long) {
-    int type = (space == S_INIT) ? 0 : 2;
+    int type = (space == S_INIT) ? 0 : early ? 1 : 2;
     out[p++] = (uint8_t)(0xC0 | (type << 4) | 0x03);
     out[p++] = 0;
     out[p++] = 0;
@@ -1279,16 +1523,16 @@ static int emit_packet(struct quic *Q, int space, const uint8_t *frames, uint32_
     out[len_idx + 1] = (uint8_t)lenval;
 
     uint8_t nonce[12];
-    memcpy(nonce, s->ci, 12);
+    memcpy(nonce, iv, 12);
     for (int i = 0; i < 8; i++)
       nonce[11 - i] ^= (uint8_t)(pn >> (8 * i));
     uint8_t tag[16];
-    aes128_gcm_seal(s->ck, nonce, out, pn_off + 4, pt, ptl, out + pn_off + 4, tag);
+    aes128_gcm_seal(key, nonce, out, pn_off + 4, pt, ptl, out + pn_off + 4, tag);
     memcpy(out + pn_off + 4 + ptl, tag, 16);
     uint32_t dglen = pn_off + 4 + ptl + 16;
 
     uint8_t mask[16];
-    hp_compute(s->ch, out + pn_off + 4, mask);
+    hp_compute(hp, out + pn_off + 4, mask);
     out[0] ^= mask[0] & 0x0f;
     for (int i = 0; i < 4; i++)
       out[pn_off + i] ^= mask[1 + i];
@@ -1309,16 +1553,16 @@ static int emit_packet(struct quic *Q, int space, const uint8_t *frames, uint32_
   uint32_t ptl = flen;
   memcpy(pt, frames, flen);
   uint8_t nonce[12];
-  memcpy(nonce, s->ci, 12);
+  memcpy(nonce, iv, 12);
   for (int i = 0; i < 8; i++)
     nonce[11 - i] ^= (uint8_t)(pn >> (8 * i));
   uint8_t tag[16];
-  aes128_gcm_seal(s->ck, nonce, out, pn_off + 4, pt, ptl, out + pn_off + 4, tag);
+  aes128_gcm_seal(key, nonce, out, pn_off + 4, pt, ptl, out + pn_off + 4, tag);
   memcpy(out + pn_off + 4 + ptl, tag, 16);
   uint32_t dglen = pn_off + 4 + ptl + 16;
 
   uint8_t mask[16];
-  hp_compute(s->ch, out + pn_off + 4, mask);
+  hp_compute(hp, out + pn_off + 4, mask);
   out[0] ^= mask[0] & 0x1f;
   for (int i = 0; i < 4; i++)
     out[pn_off + i] ^= mask[1 + i];
@@ -1332,6 +1576,9 @@ static int emit(struct quic *Q, int space, const uint8_t *frames, uint32_t flen,
   if (track && !sent_slot(s) && !wait_slot(Q, space))
     return -1;
   uint64_t pn = 0;
+  int early = space == S_APP && !s->hk && Q->early_keys;
+  if (early)
+    Q->early_sent = 1;
   int rc = emit_packet(Q, space, frames, flen, &pn);
   if (rc == 0 && space == S_HS && !Q->init_dropped) { /* Handshake packets flow: the Initial keys are retired */
     Q->init_dropped = 1;
@@ -1344,6 +1591,7 @@ static int emit(struct quic *Q, int space, const uint8_t *frames, uint32_t flen,
     if (rec->frames) {
       memcpy(rec->frames, frames, flen);
       rec->pn = pn;
+      rec->early = early;
       rec->len = flen;
       rec->t = qnow();
     }
@@ -1501,6 +1749,10 @@ static int poll_once(struct quic *Q)
         return 0;
     }
     int r = process_datagram(Q, dg, (uint32_t)n);
+    if (Q->app_done && !Q->hs_sent_fin) { /* the server's Finished checked out: send ours */
+      send_crypto(Q, S_HS, Q->pending_fin, (uint32_t)Q->pending_fin_len);
+      Q->hs_sent_fin = 1;
+    }
     send_pending_acks(Q);
     grant_flow(Q);
     if (r < 0 || Q->closed || Q->cert_fail)
@@ -1511,7 +1763,15 @@ static int poll_once(struct quic *Q)
 
 /* ---------------------------------------------------------- public API */
 
-int quic_connect(quic **out, const char *host, uint16_t port, const char *alpn)
+static void destroy(struct quic *Q)
+{
+  net_close(Q->sock);
+  for (int i = 0; i < 3; i++)
+    sent_clear(&Q->sp[i]);
+  free(Q);
+}
+
+int quic_connect_early(quic **out, const char *host, uint16_t port, const char *alpn, int *early)
 {
   struct quic *Q = calloc(1, sizeof *Q);
   if (!Q)
@@ -1538,55 +1798,58 @@ int quic_connect(quic **out, const char *host, uint16_t port, const char *alpn)
   rng_bytes(Q->our_priv, 32);
   x25519(Q->our_pub, Q->our_priv, x25519_base);
 
-  Q->chello_len = build_client_hello(Q, Q->chello, host, alpn);
+  struct ticket t;
+  int resume = ticket_take(host, &t);
+  Q->chello_len = build_client_hello(Q, Q->chello, host, alpn, resume ? &t : 0);
   sha256_update(&Q->transcript, Q->chello, Q->chello_len);
-  int err = QUIC_ESOCK;
-  if (send_crypto(Q, S_INIT, Q->chello, Q->chello_len) < 0)
-    goto fail;
-
-  int tries = 0, last_retry = Q->did_retry;
-  while (!(Q->app_done && Q->hs_sent_fin)) {
-    int r = poll_once(Q);
-    if (Q->cert_fail) {
-      err = QUIC_ECERT;
-      goto fail;
-    }
-    if (r == QUIC_EINTR) {
-      err = QUIC_EINTR;
-      goto fail;
-    }
-    if (r == QUIC_ECLOSED) {
-      err = QUIC_EHANDSHAKE;
-      goto fail;
-    }
-    if (Q->did_retry != last_retry) { /* Retry: resend Initial CH */
-      last_retry = Q->did_retry;
-      tries = 0;
-      send_crypto(Q, S_INIT, Q->chello, Q->chello_len);
-      continue;
-    }
-    if (r == 0) { /* quiet; lost handshake packets are resent by the loss timers */
-      if (++tries > 8) {
-        err = QUIC_EHANDSHAKE;
-        goto fail;
-      }
-      continue;
-    }
-    tries = 0;
-    if (Q->app_done && !Q->hs_sent_fin) { /* send client Finished */
-      send_crypto(Q, S_HS, Q->pending_fin, (uint32_t)Q->pending_fin_len);
-      Q->hs_sent_fin = 1;
-    }
+  if (resume && t.early_ok) { /* 0-RTT: keys from the PSK and the hello, limits from the last connection */
+    uint8_t th_ch[32];
+    sha256(Q->chello, Q->chello_len, th_ch);
+    install_early(Q, Q->early_secret, th_ch);
+    Q->peer_max_data = t.max_data;
+    Q->peer_stream_data = t.stream_data;
+    Q->peer_max_bidi = t.max_bidi;
+  }
+  if (send_crypto(Q, S_INIT, Q->chello, Q->chello_len) < 0) {
+    destroy(Q);
+    return QUIC_ESOCK;
   }
   *out = Q;
+  *early = Q->early_keys;
   return QUIC_OK;
+}
 
-fail:
-  net_close(Q->sock);
-  for (int i = 0; i < 3; i++)
-    sent_clear(&Q->sp[i]);
-  free(Q);
-  return err;
+int quic_handshake_done(const quic *Q) { return Q->app_done && Q->hs_sent_fin; }
+
+int quic_finish_handshake(quic *Q)
+{
+  int tries = 0;
+  while (!quic_handshake_done(Q)) {
+    int r = poll_once(Q);
+    if (Q->cert_fail)
+      return QUIC_ECERT;
+    if (r == QUIC_EINTR)
+      return QUIC_EINTR;
+    if (r == QUIC_ECLOSED)
+      return QUIC_EHANDSHAKE;
+    if (r == 0 && ++tries > 8) /* quiet; lost handshake packets are resent by the loss timers */
+      return QUIC_EHANDSHAKE;
+    if (r > 0)
+      tries = 0;
+  }
+  return QUIC_OK;
+}
+
+int quic_connect(quic **out, const char *host, uint16_t port, const char *alpn)
+{
+  int early;
+  int rc = quic_connect_early(out, host, port, alpn, &early);
+  if (rc != QUIC_OK)
+    return rc;
+  rc = quic_finish_handshake(*out);
+  if (rc != QUIC_OK)
+    destroy(*out);
+  return rc;
 }
 
 int quic_open(quic *Q, uint64_t *sid)
@@ -1600,7 +1863,7 @@ int quic_open(quic *Q, uint64_t *sid)
 int quic_send(quic *Q, uint64_t sid, const void *data, uint32_t len, int fin)
 {
   struct qstream *q = get_stream(Q, sid);
-  if (!q || !Q->sp[S_APP].hk)
+  if (!q || (!Q->sp[S_APP].hk && !Q->early_keys))
     return -1;
   if (Q->tx_total + len > Q->peer_max_data || (!(sid & 2) && q->send_off + len > Q->peer_stream_data))
     return -2; /* over what the server lets us send */
@@ -1702,8 +1965,5 @@ void quic_close(quic *Q)
     p += putvar(f + p, 0); /* reason length */
     emit(Q, S_APP, f, p, 0);
   }
-  net_close(Q->sock);
-  for (int i = 0; i < 3; i++)
-    sent_clear(&Q->sp[i]);
-  free(Q);
+  destroy(Q);
 }

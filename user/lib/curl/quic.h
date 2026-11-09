@@ -10,7 +10,9 @@
  * Scope, on purpose (matching the rest of OwOS's pragmatic net stack): each
  * connection is a heap object, so several can run at once and one can carry
  * many requests. TLS_AES_128_GCM_SHA256 + x25519 only. The server certificate
- * is verified for the host before the handshake completes. Lost packets are
+ * is verified for the host before the handshake completes. Session tickets from
+ * NewSessionTicket are kept in memory (one use each) so a later connection to
+ * the host can resume with a PSK and send its first flight as 0-RTT data. Lost packets are
  * found by ACK ranges and timers and sent again; the receiver acknowledges
  * what it accepted and drops data past a gap so the peer resends it. There is
  * no congestion controller: at most 32 packets per space are in flight.
@@ -40,6 +42,18 @@ typedef struct quic quic;
  * offering ALPN `alpn` (e.g. "h3"). On QUIC_OK *out is the connection;
  * otherwise a negative QUIC_E*. */
 int quic_connect(quic **out, const char *host, uint16_t port, const char *alpn);
+
+/* The first flight only: send the ClientHello and return. With a resumption ticket for `host` that allows it,
+ * *early is 1 and requests can be sent at once as 0-RTT data; the handshake is then finished by quic_poll (or
+ * quic_finish_handshake). Otherwise nothing can be sent until quic_finish_handshake succeeds. */
+int quic_connect_early(quic **out, const char *host, uint16_t port, const char *alpn, int *early);
+
+/* Pump the handshake to its end: QUIC_OK, QUIC_ECERT for a bad certificate, or another negative QUIC_E*. On an
+ * error the connection is still to be released with quic_close. */
+int quic_finish_handshake(quic *q);
+
+/* 1 once the handshake is complete. Until then only early data may be sent. */
+int quic_handshake_done(const quic *q);
 
 /* The next client-initiated bidirectional stream id, or -1 if the server's
  * stream limit is used up. */

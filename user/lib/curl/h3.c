@@ -397,10 +397,12 @@ struct h3stream {
   struct h3 *H;
   struct promise *pr; /* decoding a PUSH_PROMISE's request: its pseudo-headers go here */
   uint64_t sid;
-  int refused; /* the server's GOAWAY says it never processed this request */
-  int done;    /* the response ended (FIN reached and drained)   */
-  int aborted; /* a sink asked to stop                           */
-  int bad;     /* the stream could not be decoded                */
+  int refused;   /* the server's GOAWAY says it never processed this request */
+  int early;     /* the request went out as 0-RTT data */
+  int too_early; /* ... and the server answered 425 Too Early: send it again once the handshake is done */
+  int done;      /* the response ended (FIN reached and drained)   */
+  int aborted;   /* a sink asked to stop                           */
+  int bad;       /* the stream could not be decoded                */
   int headers_done;
   int state; /* 0 = expect frame header, 1 = in payload */
   uint64_t ftype, frem;
@@ -568,6 +570,11 @@ static void headers_frame(struct h3stream *st)
     return;
   }
   st->headers_done = 1;
+  if (st->early && st->status == 425) { /* RFC 8470: the server won't act on early data; the caller never sees this */
+    st->too_early = 1;
+    st->body = 0;
+    return;
+  }
   if (st->opts && st->opts->on_headers && st->hbuf != st->scratch &&
       st->opts->on_headers(st->opts->ctx, st->hbuf, st->hlen))
     st->aborted = 1;
@@ -771,10 +778,10 @@ static int h3_send_all(quic *q, uint64_t sid, const uint8_t *p, uint32_t n, int 
 
 /* HEADERS (and a DATA frame for the body) of one request on stream `sid`. */
 static int send_request(struct h3 *H, uint64_t sid, const char *method, const char *authority, const char *path,
-                        const char *extra, const unsigned char *body, int blen)
+                        const char *extra, const unsigned char *body, int blen, int early)
 {
   int extra_len = extra ? (int)strlen(extra) : 0;
-  char *xh = malloc((unsigned)extra_len + 48);
+  char *xh = malloc((unsigned)extra_len + 80);
   uint8_t *qbuf = malloc(8192);
   uint8_t *frame = malloc(8192 + 16);
   if (!xh || !qbuf || !frame) {
@@ -785,6 +792,10 @@ static int send_request(struct h3 *H, uint64_t sid, const char *method, const ch
   if (extra_len) {
     memcpy(xh, extra, (unsigned)extra_len);
     n = extra_len;
+  }
+  if (early) { /* RFC 8470: tell the server (and anything in front of it) this may be replayed */
+    memcpy(xh + n, "early-data: 1\r\n", 15);
+    n += 15;
   }
   if (blen > 0) { /* the body's length rides in the header block */
     memcpy(xh + n, "content-length: ", 16);
@@ -1091,7 +1102,13 @@ int h3_session_open(h3_session **out, const char *host, int port)
   struct h3 *H = calloc(1, sizeof *H);
   if (!H)
     return HTTP_ESEND;
-  int rc = quic_connect(&H->q, host, (uint16_t)port, "h3");
+  int early;
+  int rc = quic_connect_early(&H->q, host, (uint16_t)port, "h3", &early);
+  if (rc == QUIC_OK && !early) { /* no ticket to resume with: wait out the handshake */
+    rc = quic_finish_handshake(H->q);
+    if (rc != QUIC_OK)
+      quic_close(H->q);
+  }
   if (rc != QUIC_OK) {
     free(H);
     return rc == QUIC_EINTR ? HTTP_EINTR : rc == QUIC_ERESOLVE ? HTTP_ERESOLVE : HTTP_ECONNECT;
@@ -1130,12 +1147,18 @@ void h3_session_close(h3_session *H)
 
 int h3_session_used(const h3_session *H) { return H->served > 0; }
 
-int h3_session_run(h3_session *H, const char *authority, const char *method, const char *path,
-                   const char *extra_headers, const unsigned char *reqbody, int reqlen, const struct h3_opts *opts,
-                   char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx)
+/* One attempt. *again is set when the server asked for the request to be repeated after the handshake. */
+static int run_once(h3_session *H, const char *authority, const char *method, const char *path,
+                    const char *extra_headers, const unsigned char *reqbody, int reqlen, const struct h3_opts *opts,
+                    char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx, int *again)
 {
-  if (!method)
-    method = "GET";
+  *again = 0;
+  /* Only a plain GET may ride in 0-RTT data, which an attacker can replay; anything else waits for the handshake. */
+  if (!quic_handshake_done(H->q) && (!streq(method, "GET") || reqlen > 0) && quic_finish_handshake(H->q) != QUIC_OK) {
+    H->broken = 1;
+    return HTTP_ESEND;
+  }
+  int early = !quic_handshake_done(H->q);
   uint64_t sid;
   if (H->broken || quic_open(H->q, &sid) < 0 || (H->goaway && sid >= H->goaway_id)) {
     H->broken = 1;
@@ -1149,15 +1172,18 @@ int h3_session_run(h3_session *H, const char *authority, const char *method, con
   }
   stream_setup(st, sid, hdr, hdr ? hdrcap : 0);
   st->H = H;
+  st->early = early;
   st->body = body;
   st->bctx = ctx;
   st->opts = opts;
   int rc;
-  if (st->bad || send_request(H, sid, method, authority, path, extra_headers, reqbody, reqlen) < 0)
+  if (st->bad || send_request(H, sid, method, authority, path, extra_headers, reqbody, reqlen, early) < 0)
     rc = HTTP_ESEND;
   else
     rc = pump(H, &st, 1, 0, 0);
   push_flush(H);
+  if (st->too_early && rc == 0 && st->done)
+    *again = 1;
   if (st->refused)
     rc = HTTP_ESEND; /* the server's GOAWAY: this request was never processed */
   else if (rc == 0 && st->aborted)
@@ -1186,6 +1212,21 @@ int h3_session_run(h3_session *H, const char *authority, const char *method, con
   if ((rc == HTTP_ENORESP) && status > 0)
     rc = status;
   return rc == 0 ? status : rc;
+}
+
+int h3_session_run(h3_session *H, const char *authority, const char *method, const char *path,
+                   const char *extra_headers, const unsigned char *reqbody, int reqlen, const struct h3_opts *opts,
+                   char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx)
+{
+  if (!method)
+    method = "GET";
+  int again;
+  int rc = run_once(H, authority, method, path, extra_headers, reqbody, reqlen, opts, hdr, hdrcap, hdrlen, body, ctx,
+                    &again);
+  if (again && quic_finish_handshake(H->q) == QUIC_OK) /* 425: once more, now that nothing can be replayed */
+    rc = run_once(H, authority, method, path, extra_headers, reqbody, reqlen, opts, hdr, hdrcap, hdrlen, body, ctx,
+                  &again);
+  return rc;
 }
 
 /* Several GETs at once, one stream each, like h2_fetch_many. */
@@ -1272,7 +1313,8 @@ int h3_session_fetch_many(h3_session *H, const char *authority, const char *extr
     sinks[i].i = i;
     m->st[i]->body = mx_body;
     m->st[i]->bctx = &sinks[i];
-    if (m->st[i]->bad || send_request(H, sid, "GET", authority, reqs[i].path, extra_headers, 0, 0) < 0) {
+    if (m->st[i]->bad ||
+        send_request(H, sid, "GET", authority, reqs[i].path, extra_headers, 0, 0, !quic_handshake_done(H->q)) < 0) {
       m->st[i]->bad = 1;
       H->broken = 1;
       rc = HTTP_ESEND;

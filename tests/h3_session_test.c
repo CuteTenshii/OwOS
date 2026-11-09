@@ -25,11 +25,14 @@ struct fstream {
 };
 static struct fstream g_str[32];
 
-enum { MODE_PLAIN, MODE_INTERIM, MODE_LONG, MODE_PUSH };
+enum { MODE_PLAIN, MODE_INTERIM, MODE_LONG, MODE_PUSH, MODE_TOO_EARLY };
+static int g_early, g_hs_done, g_finishes, g_finish_rc;
 static int g_mode, g_connects, g_closes, g_dead, g_send_rc, g_peer_closed, g_streams;
 static uint64_t g_next;
 static int g_done_calls, g_pushes;
 static char g_push_conn[64], g_push_auth[64], g_push_path[64], g_push_body[64];
+
+static int contains(const uint8_t *hay, int hl, const char *needle);
 
 static struct fstream *fs_get(uint64_t sid)
 {
@@ -51,6 +54,8 @@ static void reset(void)
   memset(g_str, 0, sizeof g_str);
   g_pushes = 0;
   h3_set_push_handler(0, 0);
+  g_early = g_finishes = g_finish_rc = 0;
+  g_hs_done = 1;
   g_mode = g_connects = g_closes = g_dead = g_send_rc = g_peer_closed = g_done_calls = 0;
   g_streams = 100;
   g_next = 0;
@@ -80,7 +85,12 @@ static void frame(struct fstream *fs, int type, const uint8_t *pay, int len)
 static int lit(uint8_t *p, const char *name, const char *val, int vlen)
 {
   int n = 0, nl = (int)strlen(name);
-  p[n++] = (uint8_t)(0x20 | nl);
+  if (nl < 7) {
+    p[n++] = (uint8_t)(0x20 | nl);
+  } else { /* the 3-bit length prefix overflows into a continuation byte */
+    p[n++] = 0x27;
+    p[n++] = (uint8_t)(nl - 7);
+  }
   memcpy(p + n, name, (size_t)nl);
   n += nl;
   if (vlen < 127)
@@ -102,6 +112,14 @@ static void respond(struct fstream *fs)
 {
   uint8_t hb[4096];
   int n;
+  if (g_mode == MODE_TOO_EARLY && contains(fs->req, fs->req_len, "early-data")) {
+    n = 0;
+    hb[n++] = 0, hb[n++] = 0;
+    n += lit(hb + n, ":status", "425", 3);
+    frame(fs, 1, hb, n);
+    fs->fin = 1;
+    return;
+  }
   if (g_mode == MODE_PUSH) { /* PUSH_PROMISE 0 for GET https://example.com/app.css, ahead of the page */
     static const uint8_t pp[] = {0x00, 0x00, 0x00, 0xd1, 0xd7, 0x50, 11,  'e', 'x', 'a', 'm', 'p', 'l', 'e',
                                  '.',  'c',  'o',  'm',  0x51, 8,    '/', 'a', 'p', 'p', '.', 'c', 's', 's'};
@@ -143,15 +161,28 @@ static void uni_write(uint64_t sid, const void *data, int len, int fin)
   fs->fin |= fin;
 }
 
-int h3t_connect(quic **out, const char *host, uint16_t port, const char *alpn)
+int h3t_connect_early(quic **out, const char *host, uint16_t port, const char *alpn, int *early)
 {
   (void)host, (void)port, (void)alpn;
   g_connects++;
   *out = &g_q;
+  *early = g_early;
+  g_hs_done = !g_early;                                 /* with a ticket the handshake is still to run */
   static const uint8_t control[3] = {0x00, 0x04, 0x00}; /* the server's control stream: type, empty SETTINGS */
   uni_write(3, control, 3, 0);
   return QUIC_OK;
 }
+
+int h3t_finish(quic *q)
+{
+  (void)q;
+  g_finishes++;
+  if (g_finish_rc == QUIC_OK)
+    g_hs_done = 1;
+  return g_finish_rc;
+}
+
+int h3t_hs_done(const quic *q) { return (void)q, g_hs_done; }
 
 int h3t_open(quic *q, uint64_t *sid)
 {
@@ -179,6 +210,7 @@ int h3t_send(quic *q, uint64_t sid, const void *data, uint32_t len, int fin)
 int h3t_poll(quic *q)
 {
   (void)q;
+  g_hs_done = 1; /* the handshake finishes underneath a request sent as 0-RTT */
   if (g_dead)
     return QUIC_ECLOSED;
   for (int i = 0; i < 32; i++) {
@@ -633,6 +665,75 @@ static void pushes_are_not_invited_without_a_handler(void)
   h3_session_close(s);
 }
 
+static void a_ticket_sends_the_first_request_before_the_handshake_ends(void)
+{
+  reset();
+  g_early = 1;
+  h3_session *s;
+  expect_eq(h3_session_open(&s, "example.com", 443), 0);
+  expect_eq(g_finishes, 0);         /* not waited for */
+  expect_eq(fs_get(2)->req_len, 3); /* the control stream already went out */
+  struct sink k;
+  char hdr[256];
+  expect_eq(get(s, "/a", &k, hdr, sizeof hdr), 200);
+  expect_string(k.buf, "body0");
+  struct fstream *fs = fs_get(0);
+  expect(contains(fs->req, fs->req_len, "early-data")); /* RFC 8470: it may be replayed */
+  expect_eq(g_finishes, 0);
+  h3_session_close(s);
+}
+
+static void without_a_ticket_the_handshake_comes_first(void)
+{
+  reset();
+  h3_session *s;
+  expect_eq(h3_session_open(&s, "example.com", 443), 0);
+  expect_eq(g_finishes, 1);
+  struct sink k;
+  char hdr[256];
+  expect_eq(get(s, "/a", &k, hdr, sizeof hdr), 200);
+  expect(!contains(fs_get(0)->req, fs_get(0)->req_len, "early-data"));
+  h3_session_close(s);
+
+  reset();
+  g_finish_rc = QUIC_ECERT;
+  expect_eq(h3_session_open(&s, "example.com", 443), HTTP_ECONNECT);
+}
+
+static void only_a_plain_get_goes_out_early(void)
+{
+  reset();
+  g_early = 1;
+  h3_session *s;
+  expect_eq(h3_session_open(&s, "example.com", 443), 0);
+  struct sink k = {0};
+  char hdr[256];
+  int hl = 0;
+  expect_eq(h3_session_run(s, "example.com", "POST", "/form", 0, (const unsigned char *)"a=1", 3, 0, hdr, sizeof hdr,
+                           &hl, sink_cb, &k),
+            200);
+  expect_eq(g_finishes, 1); /* a replayable POST would be harmful: the handshake was finished first */
+  expect(!contains(fs_get(0)->req, fs_get(0)->req_len, "early-data"));
+  h3_session_close(s);
+}
+
+static void too_early_is_retried_after_the_handshake(void)
+{
+  reset();
+  g_early = 1;
+  g_mode = MODE_TOO_EARLY;
+  h3_session *s;
+  expect_eq(h3_session_open(&s, "example.com", 443), 0);
+  struct sink k;
+  char hdr[256];
+  expect_eq(get(s, "/a", &k, hdr, sizeof hdr), 200); /* the caller never sees the 425 */
+  expect_string(k.buf, "body4");                     /* the second request, on stream 4 */
+  expect(strstr(hdr, "HTTP/3 200") == hdr);
+  expect(!contains(fs_get(4)->req, fs_get(4)->req_len, "early-data"));
+  expect_eq(g_finishes, 1);
+  h3_session_close(s);
+}
+
 int main(void)
 {
   test("reuse_keeps_the_connection", reuse_keeps_the_connection);
@@ -649,5 +750,10 @@ int main(void)
   test("a_goaway_with_room_lets_earlier_requests_finish", a_goaway_with_room_lets_earlier_requests_finish);
   test("promised_pushes_reach_the_handler", promised_pushes_reach_the_handler);
   test("pushes_are_not_invited_without_a_handler", pushes_are_not_invited_without_a_handler);
+  test("a_ticket_sends_the_first_request_before_the_handshake_ends",
+       a_ticket_sends_the_first_request_before_the_handshake_ends);
+  test("without_a_ticket_the_handshake_comes_first", without_a_ticket_the_handshake_comes_first);
+  test("only_a_plain_get_goes_out_early", only_a_plain_get_goes_out_early);
+  test("too_early_is_retried_after_the_handshake", too_early_is_retried_after_the_handshake);
   return 0;
 }
