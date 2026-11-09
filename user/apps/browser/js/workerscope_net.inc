@@ -415,8 +415,10 @@ JS(
     p["@scheduled"] = true;
     g.setTimeout(function () { flush(p); }, 0);
   }
-  method(MessagePort.prototype, "postMessage", function (data) {
+  var remote = {};
+  method(MessagePort.prototype, "postMessage", function (data, transfer) {
     var peer = this["@peer"];
+    if (this["@remote"] !== undefined) { if (!this["@closed"]) { N.portPost(this["@remote"], data, transfer); } return; }
     if (!peer) { return; }
     peer["@queue"].push(structuredClone(data));
     schedule(peer);
@@ -424,6 +426,12 @@ JS(
   method(MessagePort.prototype, "start", function () { this["@started"] = true; schedule(this); });
   method(MessagePort.prototype, "close", function () {
     var peer = this["@peer"];
+    if (this["@remote"] !== undefined) {
+      if (!this["@closed"]) { N.portClose(this["@remote"]); }
+      delete remote[this["@remote"]];
+      this["@closed"] = true;
+      return;
+    }
     this["@peer"] = null;
     if (peer) { peer["@peer"] = null; }
   });
@@ -434,6 +442,32 @@ JS(
     this.port1 = a;
     this.port2 = b;
   }
+  /* a port end moves to or from the page: the peer left behind forwards everything across */
+  N.portTransfer = function (p) {
+    var peer = p["@peer"], rid;
+    if (!peer || p["@remote"] !== undefined) { return 0; }
+    rid = N.newPortId();
+    hide(peer, "@remote", rid);
+    peer["@peer"] = null;
+    p["@peer"] = null;
+    p["@closed"] = true;
+    remote[rid] = peer;
+    return rid;
+  };
+  N.portReceive = function (rid) {
+    var p = newPort();
+    hide(p, "@remote", rid);
+    remote[rid] = p;
+    return p;
+  };
+  N.onport = function (rid, data) {
+    var p = remote[rid];
+    if (p && !p["@closed"]) { p["@queue"].push(data); schedule(p); }
+  };
+  N.onportclose = function (rid) {
+    var p = remote[rid];
+    if (p) { delete remote[rid]; p["@closed"] = true; }
+  };
   hide(g, "MessagePort", MessagePort);
   hide(g, "MessageChannel", MessageChannel);
   /* assigning onmessage starts a port, as in browsers */

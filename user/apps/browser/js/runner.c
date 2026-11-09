@@ -11,13 +11,17 @@
 /* What structured clone carries across threads besides plain data: Blobs and OffscreenCanvases */
 static int page_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
 {
-  return blob_clone_write(ctx, v, kind, bytes, len, meta) || canvas_clone_write(ctx, v, kind, bytes, len, meta);
+  return blob_clone_write(ctx, v, kind, bytes, len, meta) || canvas_clone_write(ctx, v, kind, bytes, len, meta) ||
+         worker_port_write(ctx, v, kind, bytes, len);
 }
 
 static js_value page_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta)
 {
   js_value v = blob_clone_read(ctx, kind, bytes, len, meta);
-  return v.type == JV_OBJ ? v : canvas_clone_read(ctx, kind, bytes, len);
+  if (v.type == JV_OBJ)
+    return v;
+  v = canvas_clone_read(ctx, kind, bytes, len);
+  return v.type == JV_OBJ ? v : worker_port_read(ctx, kind, bytes, len);
 }
 
 /* console.* output goes to the devtools Console, the canonical sink, as in a real browser */

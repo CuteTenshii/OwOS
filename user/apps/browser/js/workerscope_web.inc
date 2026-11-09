@@ -330,6 +330,67 @@ JS(
   hide(File.prototype, "constructor", File);
   hide(g, "File", File);
 
+  /* ---- FileReader ---- */
+  function FileReader() {
+    L.EventTarget.call(this);
+    this.readyState = 0;
+    this.result = null;
+    this.error = null;
+    this.onload = null;
+    this.onerror = null;
+    this.onloadend = null;
+    this.onloadstart = null;
+    this.onabort = null;
+    this.onprogress = null;
+    hide(this, "@token", 0);
+  }
+  FileReader.prototype = Object.create(L.EventTarget.prototype);
+  hide(FileReader.prototype, "constructor", FileReader);
+  [["EMPTY", 0], ["LOADING", 1], ["DONE", 2]].forEach(function (p) { hide(FileReader, p[0], p[1]); hide(FileReader.prototype, p[0], p[1]); });
+  function frFire(r, type) {
+    var e = new L.Event(type);
+    e.loaded = r.result ? (r.result.byteLength !== undefined ? r.result.byteLength : r.result.length) : 0;
+    e.total = e.loaded;
+    r.dispatchEvent(e);
+  }
+  function frRead(r, blob, convert) {
+    if (!(blob instanceof Blob)) { throw typeError("Failed to execute read on FileReader: parameter 1 is not of type Blob"); }
+    if (r.readyState === 1) { throw new L.DOMException("The object is already busy reading Blobs.", "InvalidStateError"); }
+    var token = ++r["@token"];
+    r.readyState = 1;
+    r.result = null;
+    frFire(r, "loadstart");
+    g.setTimeout(function () {
+      if (r["@token"] !== token) { return; }
+      r.result = convert(blob["@bytes"]);
+      r.readyState = 2;
+      frFire(r, "progress");
+      frFire(r, "load");
+      frFire(r, "loadend");
+    }, 0);
+  }
+  method(FileReader.prototype, "readAsText", function (blob, enc) { frRead(this, blob, function (b) { return N.decode(b, enc === undefined ? "utf-8" : String(enc), false, false); }); });
+  method(FileReader.prototype, "readAsArrayBuffer", function (blob) { frRead(this, blob, function (b) { return b.slice().buffer; }); });
+  method(FileReader.prototype, "readAsBinaryString", function (blob) {
+    frRead(this, blob, function (b) { var s = "", i; for (i = 0; i < b.length; i++) { s += String.fromCharCode(b[i]); } return s; });
+  });
+  method(FileReader.prototype, "readAsDataURL", function (blob) {
+    frRead(this, blob, function (b) {
+      var s = "", i;
+      for (i = 0; i < b.length; i++) { s += String.fromCharCode(b[i]); }
+      return "data:" + (blob.type || "application/octet-stream") + ";base64," + btoa(s);
+    });
+  });
+  method(FileReader.prototype, "abort", function () {
+    if (this.readyState !== 1) { return; }
+    this["@token"]++;
+    this.readyState = 2;
+    this.result = null;
+    frFire(this, "abort");
+    frFire(this, "loadend");
+  });
+  hide(g, "FileReader", FileReader);
+
   /* ---- FormData ---- */
   function FormData() { hide(this, "@list", []); }
   function fdValue(v, filename) {

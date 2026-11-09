@@ -358,6 +358,49 @@ static void test_worker_streams(void)
              "expect(st.stream==='function', 'the stream classes are globals');\n");
 }
 
+static void test_worker_misc_apis(void)
+{
+  run_script("var mi=null, mw=new Worker('data:text/javascript,var out={}; "
+             "performance.mark(\"a\"); var m=performance.measure(\"m\",\"a\"); "
+             "out.perf=m.entryType+\":\"+(m.duration>=0)+\":\"+performance.getEntriesByName(\"a\").length+\":\"+("
+             "performance.timeOrigin>0); "
+             "var errs=[]; self.addEventListener(\"error\",function(e){ errs.push(\"listener:\"+e.message); });"
+             "self.onerror=function(msg){ errs.push(\"onerror:\"+msg); return true; };"
+             "setTimeout(function(){ throw new Error(\"boom\"); },1);"
+             "var fr=new FileReader(), seq=[]; fr.onloadend=function(){ out.fr=fr.result+\"|\"+seq.join(); };"
+             "fr.onload=function(){ seq.push(\"load\"); }; fr.onloadstart=function(){ seq.push(\"start\"); }; "
+             "fr.readAsText(new Blob([\"fr text\"]));"
+             "var fr2=new FileReader(); fr2.onload=function(){ out.url=fr2.result; }; fr2.readAsDataURL(new "
+             "Blob([\"hi\"],{type:\"text/plain\"}));"
+             "setTimeout(function(){ out.errs=errs.join(); postMessage(out); },40);');\n"
+             "var seenErr=0; mw.onmessage=function(e){ mi=e.data; }; mw.onerror=function(e){ seenErr++; };\n");
+  expect(wait_for("mi!==null"));
+  run_script(
+      "expect(mi.perf==='measure:true:1:true', 'performance marks and measures: '+mi.perf);\n"
+      "expect(mi.errs==='onerror:boom,listener:boom', 'uncaught errors reach self.onerror and listeners: '+mi.errs);\n"
+      "expect(seenErr===0, 'a handled error does not reach the page: '+seenErr);\n"
+      "expect(mi.fr==='fr text|start,load', 'FileReader readAsText and its events: '+mi.fr);\n"
+      "expect(mi.url==='data:text/plain;base64,aGk=', 'FileReader readAsDataURL: '+mi.url);\n");
+}
+
+static void test_ports_cross(void)
+{
+  run_script(
+      "var got1=[], got2=[], pw=new Worker('data:text/javascript,onmessage=function(e){ if (e.data.port) { var "
+      "p=e.data.port; p.onmessage=function(m){ p.postMessage(\"echo:\"+m.data); }; "
+      "var mc=new MessageChannel(); mc.port1.onmessage=function(m){ mc.port1.postMessage(m.data+\"!\"); }; "
+      "postMessage({back:mc.port2}); } };');\n"
+      "var ch=new MessageChannel(); ch.port1.onmessage=function(m){ got1.push(m.data); };\n"
+      "pw.onmessage=function(e){ var bp=e.data.back; bp.onmessage=function(m){ got2.push(m.data); }; "
+      "bp.postMessage(\"ping\"); };\n"
+      "pw.postMessage({port:ch.port2},[ch.port2]); ch.port1.postMessage(\"hi\"); ch.port1.postMessage(\"there\");\n");
+  expect(wait_for("got1.length>=2 && got2.length>=1"));
+  run_script(
+      "expect(got1.join()==='echo:hi,echo:there', 'a port moved into the worker answers the page: '+got1.join());\n"
+      "expect(got2.join()==='ping!', 'a port moved out of the worker answers the worker: '+got2.join());\n"
+      "ch.port1.close();\n");
+}
+
 static void test_blob_crosses(void)
 {
   run_script("var bl=null, bw=new Worker('data:text/javascript,onmessage=function(e){ var b=e.data; "
@@ -506,6 +549,8 @@ int main(void)
   worker_test("worker web APIs: URL, Blob, FormData, Headers", test_worker_web_apis);
   worker_test("worker network: fetch, XMLHttpRequest, WebSocket, MessageChannel", test_worker_network);
   worker_test("worker streams", test_worker_streams);
+  worker_test("performance marks, error events, FileReader", test_worker_misc_apis);
+  worker_test("MessagePorts move between page and worker", test_ports_cross);
   worker_test("Blobs cross between page and worker", test_blob_crosses);
   worker_test("transferred buffers and collections", test_transfer_and_collections);
   worker_test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);

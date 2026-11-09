@@ -14,12 +14,18 @@ static js_value clone_message(js_ctx *ctx, js_value v)
   return ctx->has_exc ? v : r;
 }
 
+int js_is_port(js_value v) { return v.type == JV_OBJ && v.u.obj->proto == g_port_proto; }
+
 static js_value port_post(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_value peer;
   (void)argc;
   if (t.type != JV_OBJ || js_to_boolean(js_get(ctx, t, "@closed")))
     return js_undef();
+  if (js_get(ctx, t, "@remote").type == JV_NUM) { /* the other end lives in a worker */
+    js_port_remote_post(ctx, t, A(0), A(1));
+    return js_undef();
+  }
   peer = js_get(ctx, t, "@peer");
   if (peer.type == JV_OBJ && !js_to_boolean(js_get(ctx, peer, "@closed")))
     js_port_enqueue(peer, clone_message(ctx, A(0)));
@@ -34,6 +40,10 @@ static js_value port_close(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (t.type != JV_OBJ)
     return js_undef();
   js_set(ctx, t, "@closed", js_bool(1));
+  if (js_get(ctx, t, "@remote").type == JV_NUM) {
+    js_port_remote_close(ctx, t);
+    return js_undef();
+  }
   peer = js_get(ctx, t, "@peer");
   if (peer.type == JV_OBJ)
     js_set(ctx, peer, "@closed", js_bool(1));
@@ -48,7 +58,7 @@ static js_value port_illegal(js_ctx *ctx, js_value thisv, js_value *args, int ar
   return js_throw_type(ctx, "Illegal constructor");
 }
 
-static js_object *new_port(js_ctx *ctx)
+js_object *js_new_port(js_ctx *ctx)
 {
   js_object *p = js_new_object(ctx, g_port_proto);
   js_def(p, "onmessage", js_null(), P_WRITABLE | P_ENUMERABLE);
@@ -66,8 +76,8 @@ static js_value channel_ctor(js_ctx *ctx, js_value thisv, js_value *args, int ar
   (void)argc;
   gc_push_scope();
   ch = (js_object *)gc_keep(js_new_object(ctx, g_channel_proto));
-  p1 = (js_object *)gc_keep(new_port(ctx));
-  p2 = (js_object *)gc_keep(new_port(ctx));
+  p1 = (js_object *)gc_keep(js_new_port(ctx));
+  p2 = (js_object *)gc_keep(js_new_port(ctx));
   js_def(p1, "@peer", js_obj_value(p2), P_WRITABLE);
   js_def(p2, "@peer", js_obj_value(p1), P_WRITABLE);
   js_def(ch, "port1", js_obj_value(p1), P_ENUMERABLE);

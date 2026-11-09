@@ -108,6 +108,13 @@ void js_worker_setup(js_ctx *ctx, js_object *win);
 void js_worker_teardown(void);
 void js_port_enqueue(js_value port, js_value data); /* async message delivery to a MessagePort */
 void js_msgchannel_setup(js_ctx *ctx, js_object *win);
+int js_is_port(js_value v);          /* a MessagePort of the page */
+js_object *js_new_port(js_ctx *ctx); /* an unattached MessagePort */
+/* Ports whose other end is in a worker (js/webworker.c): posting and closing go across the thread boundary */
+void js_port_remote_post(js_ctx *ctx, js_value port, js_value data, js_value transfer);
+void js_port_remote_close(js_ctx *ctx, js_value port);
+int worker_port_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len);
+js_value worker_port_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len);
 void js_msgchannel_teardown(void);
 
 #endif /* BROWSER_JSINT_H */

@@ -27,7 +27,8 @@ static const char k_net_js[] =
 static const char *const k_parts[] = {k_events_js, k_web_js, k_net_js};
 
 /* WM_REQUEST: a worker asks the page thread to do something; WM_REPLY (level = request id) answers it */
-enum { WM_DATA, WM_ERROR, WM_LOG, WM_REQUEST, WM_REPLY };
+/* WM_PORT / WM_PORT_CLOSE: traffic for a MessagePort one of whose ends moved to the other thread (level = port id) */
+enum { WM_DATA, WM_ERROR, WM_LOG, WM_REQUEST, WM_REPLY, WM_PORT, WM_PORT_CLOSE };
 
 struct wmsg {
   struct wmsg *next;
@@ -77,6 +78,19 @@ static js_object *g_wobjs[WORKER_MAX];
 static int g_nworkers;
 
 static __thread struct wthread *cur_wt;
+
+/* Port ids are unique across the page and every worker */
+static unsigned g_next_port_id;
+
+/* The worker a message is being cloned for (or from), so a MessagePort inside it can be tied to that worker */
+static __thread struct wthread *clone_peer;
+
+/* Page ports whose other end moved into a worker (or that arrived from one): id, owner, local port */
+#define RPORT_MAX 64
+static js_object *g_rport_objs[RPORT_MAX];
+static int g_rport_ids[RPORT_MAX];
+static struct wthread *g_rport_wt[RPORT_MAX];
+static int g_nrports;
 
 static js_value throw_err(js_ctx *ctx, const char *name, const char *msg)
 {
@@ -211,8 +225,24 @@ static void wt_report(js_ctx *ctx)
   if (ctx->has_exc) {
     ctx->has_exc = 0;
     ctx->exc_root = 0;
-  } else if (text.type == JV_STR)
-    wmsg_post(cur_wt, &cur_wt->out, WM_ERROR, 0, 0, text.u.str->data);
+  } else if (text.type == JV_STR) {
+    static __thread bool reporting;
+    bool handled = false;
+    js_value n = js_get(ctx, js_obj_value(ctx->global), "@N"),
+             hook = n.type == JV_OBJ ? js_get(ctx, n, "onerror") : js_undef();
+    gc_keep(text.u.str);
+    if (!reporting && js_is_callable(hook)) { /* self.onerror and error listeners may swallow it */
+      js_value r;
+      reporting = true;
+      r = js_call(ctx, hook, n, &text, 1);
+      handled = !ctx->has_exc && js_to_boolean(r);
+      ctx->has_exc = 0;
+      ctx->exc_root = 0;
+      reporting = false;
+    }
+    if (!handled)
+      wmsg_post(cur_wt, &cur_wt->out, WM_ERROR, 0, 0, text.u.str->data);
+  }
   gc_pop_scope();
 }
 
@@ -555,9 +585,38 @@ static int wt_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char 
   return 1;
 }
 
+/* A MessagePort of this worker moving to the page: N.portTransfer tells the script side to route its peer */
+static int wt_clone_write_port(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len)
+{
+  js_value n = js_get(ctx, js_obj_value(ctx->global), "@N"),
+           ctor = js_get(ctx, js_obj_value(ctx->global), "MessagePort"),
+           proto = ctor.type == JV_OBJ ? js_get(ctx, ctor, "prototype") : js_undef(), fn, r;
+  js_object *p;
+  int rid;
+  if (proto.type != JV_OBJ || n.type != JV_OBJ)
+    return 0;
+  for (p = v.u.obj->proto; p && p != proto.u.obj; p = p->proto)
+    ;
+  fn = js_get(ctx, n, "portTransfer");
+  if (!p || !js_is_callable(fn))
+    return 0;
+  r = js_call(ctx, fn, n, &v, 1);
+  rid = r.type == JV_NUM ? (int)r.u.num : 0;
+  if (ctx->has_exc || rid <= 0)
+    return 0;
+  *bytes = (unsigned char *)malloc(sizeof rid);
+  if (!*bytes)
+    return 0;
+  memcpy(*bytes, &rid, sizeof rid);
+  *len = (int)sizeof rid;
+  strcpy(kind, "port");
+  return 1;
+}
+
 static int wt_clone_write_any(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
 {
-  return wt_clone_write(ctx, v, kind, bytes, len, meta) || canvas_clone_write(ctx, v, kind, bytes, len, meta);
+  return wt_clone_write(ctx, v, kind, bytes, len, meta) || canvas_clone_write(ctx, v, kind, bytes, len, meta) ||
+         wt_clone_write_port(ctx, v, kind, bytes, len);
 }
 
 static js_value wt_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta)
@@ -566,6 +625,15 @@ static js_value wt_clone_read(js_ctx *ctx, const char *kind, const unsigned char
   js_object *opts;
   if (streq(kind, "ocanvas"))
     return canvas_clone_read(ctx, kind, bytes, len);
+  if (streq(kind, "port")) { /* a port arrives: the script side builds it */
+    js_value n = js_get(ctx, js_obj_value(ctx->global), "@N"),
+             fn = n.type == JV_OBJ ? js_get(ctx, n, "portReceive") : js_undef(), id;
+    if (!js_is_callable(fn) || len != (int)sizeof(int))
+      return js_undef();
+    memcpy(&len, bytes, sizeof len);
+    id = js_number(len);
+    return js_call(ctx, fn, n, &id, 1);
+  }
   if (!streq(kind, "blob") || !js_is_callable(ctor))
     return js_undef();
   gc_push_scope();
@@ -851,6 +919,22 @@ static bool wt_pump_ws(js_ctx *ctx)
   return fired;
 }
 
+/* A message for a port that lives here arrives from the page */
+static void wt_dispatch_port(js_ctx *ctx, int rid, js_clone *c)
+{
+  js_value args[2];
+  gc_push_scope();
+  args[0] = js_number(rid);
+  args[1] = js_clone_read(ctx, c);
+  if (args[1].type == JV_OBJ)
+    gc_keep(args[1].u.obj);
+  if (ctx->has_exc)
+    wt_report(ctx);
+  else
+    wt_hook(ctx, "onport", args, 2);
+  gc_pop_scope();
+}
+
 /* A page reply arrives: N.onreply(data) settles whatever was waiting for it */
 static void wt_dispatch_reply(js_ctx *ctx, js_clone *c)
 {
@@ -880,6 +964,32 @@ static js_value wt_n_streams(js_ctx *ctx, js_value t, js_value *args, int argc)
   return exports;
 }
 
+static js_value wt_n_new_port_id(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)ctx;
+  (void)t;
+  (void)args;
+  (void)argc;
+  return js_number((double)__atomic_add_fetch(&g_next_port_id, 1, __ATOMIC_RELAXED));
+}
+
+/* N.portPost(id, data, transfer): a message for the far end of a port that lives on the page */
+static js_value wt_n_port_post(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_clone *c = js_clone_write(ctx, A(1), A(2));
+  (void)t;
+  if (c)
+    wmsg_post(cur_wt, &cur_wt->out, WM_PORT, (int)js_to_number(ctx, A(0)), c, 0);
+  return js_undef();
+}
+
+static js_value wt_n_port_close(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)t;
+  wmsg_post(cur_wt, &cur_wt->out, WM_PORT_CLOSE, (int)js_to_number(ctx, A(0)), 0, 0);
+  return js_undef();
+}
+
 /* Run the JavaScript parts of the global scope; false (exception pending) if one fails */
 static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
 {
@@ -895,6 +1005,9 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "randomFill", wt_n_random_fill, 1);
   js_def_native(ctx, n, "request", wt_n_request, 1);
   js_def_native(ctx, n, "streams", wt_n_streams, 0);
+  js_def_native(ctx, n, "newPortId", wt_n_new_port_id, 0);
+  js_def_native(ctx, n, "portPost", wt_n_port_post, 3);
+  js_def_native(ctx, n, "portClose", wt_n_port_close, 1);
   js_def_native(ctx, n, "waitReply", wt_n_wait_reply, 1);
   js_def_native(ctx, n, "wsOpen", wt_n_ws_open, 2);
   js_def_native(ctx, n, "wsProtocol", wt_n_ws_protocol, 1);
@@ -973,7 +1086,12 @@ static void wt_loop(js_ctx *ctx, struct wthread *wt)
     if (m) {
       if (m->kind == WM_REPLY)
         wt_dispatch_reply(ctx, m->clone);
-      else if (m->clone)
+      else if (m->kind == WM_PORT)
+        wt_dispatch_port(ctx, m->level, m->clone);
+      else if (m->kind == WM_PORT_CLOSE) {
+        js_value id = js_number(m->level);
+        wt_hook(ctx, "onportclose", &id, 1);
+      } else if (m->clone)
         wt_deliver(ctx, m->clone);
       wmsg_free(m);
       continue;
@@ -1431,7 +1549,102 @@ static struct wthread *worker_of(js_ctx *ctx, js_value w)
   return 0;
 }
 
-static void worker_fire(js_value w, struct wmsg *m)
+static int rport_find(int rid)
+{
+  int i;
+  for (i = 0; i < g_nrports; i++)
+    if (g_rport_ids[i] == rid)
+      return i;
+  return -1;
+}
+
+static void rport_drop(int i)
+{
+  g_nrports--;
+  g_rport_objs[i] = g_rport_objs[g_nrports];
+  g_rport_ids[i] = g_rport_ids[g_nrports];
+  g_rport_wt[i] = g_rport_wt[g_nrports];
+  g_rport_objs[g_nrports] = 0;
+}
+
+static void rport_drop_worker(struct wthread *wt)
+{
+  int i;
+  for (i = 0; i < g_nrports;)
+    if (g_rport_wt[i] == wt)
+      rport_drop(i);
+    else
+      i++;
+}
+
+/* The page end of a channel is being posted to a worker: its peer becomes the local stand-in for the far end */
+int worker_port_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len)
+{
+  js_value peer;
+  int rid;
+  if (!clone_peer || !js_is_port(v) || g_nrports == RPORT_MAX)
+    return 0;
+  peer = js_get(ctx, v, "@peer");
+  if (peer.type != JV_OBJ || js_get(ctx, v, "@remote").type == JV_NUM)
+    return 0;
+  *bytes = (unsigned char *)malloc(sizeof rid);
+  if (!*bytes)
+    return 0;
+  rid = (int)__atomic_add_fetch(&g_next_port_id, 1, __ATOMIC_RELAXED);
+  memcpy(*bytes, &rid, sizeof rid);
+  *len = (int)sizeof rid;
+  strcpy(kind, "port");
+  js_set(ctx, peer, "@remote", js_number(rid));
+  js_set(ctx, peer, "@peer", js_undef());
+  js_set(ctx, v, "@closed", js_bool(1));
+  g_rport_ids[g_nrports] = rid;
+  g_rport_wt[g_nrports] = clone_peer;
+  g_rport_objs[g_nrports++] = peer.u.obj;
+  return 1;
+}
+
+/* A port arrives from a worker: a page port that forwards everything to the far end */
+js_value worker_port_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len)
+{
+  js_object *port;
+  int rid;
+  if (!clone_peer || !streq(kind, "port") || len != (int)sizeof rid || g_nrports == RPORT_MAX)
+    return js_undef();
+  memcpy(&rid, bytes, sizeof rid);
+  port = js_new_port(ctx);
+  gc_push_scope();
+  gc_keep(port);
+  js_def(port, "@remote", js_number(rid), P_WRITABLE);
+  g_rport_ids[g_nrports] = rid;
+  g_rport_wt[g_nrports] = clone_peer;
+  g_rport_objs[g_nrports++] = port;
+  gc_pop_scope();
+  return js_obj_value(port);
+}
+
+void js_port_remote_post(js_ctx *ctx, js_value port, js_value data, js_value transfer)
+{
+  int i = rport_find((int)js_to_number(ctx, js_get(ctx, port, "@remote")));
+  js_clone *c;
+  if (i < 0)
+    return;
+  clone_peer = g_rport_wt[i];
+  c = js_clone_write(ctx, data, transfer);
+  clone_peer = 0;
+  if (c)
+    wmsg_post(g_rport_wt[i], &g_rport_wt[i]->in, WM_PORT, g_rport_ids[i], c, 0);
+}
+
+void js_port_remote_close(js_ctx *ctx, js_value port)
+{
+  int i = rport_find((int)js_to_number(ctx, js_get(ctx, port, "@remote")));
+  if (i < 0)
+    return;
+  wmsg_post(g_rport_wt[i], &g_rport_wt[i]->in, WM_PORT_CLOSE, g_rport_ids[i], 0, 0);
+  rport_drop(i);
+}
+
+static void worker_fire(struct wthread *wt, js_value w, struct wmsg *m)
 {
   js_value ev;
   gc_push_scope();
@@ -1448,7 +1661,10 @@ static void worker_fire(js_value w, struct wmsg *m)
       js_def(ev.u.obj, "error", js_null(), P_WRITABLE | P_ENUMERABLE);
     }
   } else {
-    js_value data = js_clone_read(g_ctx, m->clone);
+    js_value data;
+    clone_peer = wt;
+    data = js_clone_read(g_ctx, m->clone);
+    clone_peer = 0;
     if (g_ctx->has_exc) {
       g_ctx->has_exc = 0;
       g_ctx->exc_root = 0;
@@ -1474,6 +1690,7 @@ static bool worker_reap(int i)
   int status;
   if (!__atomic_load_n(&wt->done, __ATOMIC_ACQUIRE) || !waitpid_nb(wt->tid, &status))
     return false;
+  rport_drop_worker(wt);
   thread_stack_free(wt->stack);
   while (wt->in.head) {
     struct wmsg *m = wt->in.head;
@@ -1533,7 +1750,23 @@ int js_workers_pump(void)
       serve_rpc(wt);
     for (m = wq_take_all(wt, &wt->out); m; m = next) {
       next = m->next;
-      if (m->kind == WM_REQUEST)
+      if (m->kind == WM_PORT || m->kind == WM_PORT_CLOSE) {
+        int pi = rport_find(m->level);
+        if (pi >= 0 && g_rport_wt[pi] == wt && m->kind == WM_PORT) {
+          js_value port = js_obj_value(g_rport_objs[pi]), data;
+          clone_peer = wt;
+          data = js_clone_read(g_ctx, m->clone);
+          clone_peer = 0;
+          if (g_ctx->has_exc) {
+            g_ctx->has_exc = 0;
+            g_ctx->exc_root = 0;
+          } else
+            js_port_enqueue(port, data);
+        } else if (pi >= 0 && g_rport_wt[pi] == wt) {
+          js_set(g_ctx, js_obj_value(g_rport_objs[pi]), "@closed", js_bool(1));
+          rport_drop(pi);
+        }
+      } else if (m->kind == WM_REQUEST)
         serve_request(wt, m);
       else if (m->kind == WM_LOG)
         devtools_console_append(m->level == JS_LOG_ERROR  ? DT_ERROR
@@ -1541,7 +1774,7 @@ int js_workers_pump(void)
                                                           : DT_LOG,
                                 m->text ? m->text : "", m->text ? (int)strlen(m->text) : 0);
       else if (!js_to_boolean(js_get(g_ctx, w, "@dead")))
-        worker_fire(w, m);
+        worker_fire(wt, w, m);
       delivered++;
       wmsg_free(m);
     }
@@ -1569,7 +1802,9 @@ static js_value worker_post(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_clone *c;
   if (!wt || __atomic_load_n(&wt->irq.stop, __ATOMIC_ACQUIRE) || __atomic_load_n(&wt->closing, __ATOMIC_ACQUIRE))
     return js_undef();
+  clone_peer = wt;
   c = js_clone_write(ctx, A(0), A(1));
+  clone_peer = 0;
   if (c)
     wmsg_post(wt, &wt->in, WM_DATA, 0, c, 0);
   return js_undef();
@@ -1659,6 +1894,8 @@ void js_worker_setup(js_ctx *ctx, js_object *win)
   gc_add_root((void **)&g_wq);
   g_nworkers = 0;
   gc_add_root_range((void **)g_wobjs, &g_nworkers);
+  g_nrports = 0;
+  gc_add_root_range((void **)g_rport_objs, &g_nrports);
   js_msgchannel_setup(ctx, win);
   def_method(g_worker_proto, "postMessage", worker_post, 1);
   def_method(g_worker_proto, "terminate", worker_terminate, 0);
@@ -1692,5 +1929,7 @@ void js_worker_teardown(void)
   gc_remove_root((void **)&g_worker_proto);
   gc_remove_root((void **)&g_wq);
   gc_remove_root_range((void **)g_wobjs);
+  gc_remove_root_range((void **)g_rport_objs);
+  g_nrports = 0;
   g_worker_proto = g_wq = 0;
 }

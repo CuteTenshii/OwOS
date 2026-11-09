@@ -79,19 +79,23 @@ JS(
     if (!a) { return; }
     for (var i = 0; i < a.length; i++) { if (a[i].fn === fn) { a.splice(i, 1); return; } }
   });
-  method(EventTarget.prototype, "dispatchEvent", function (ev) {
-    var h = this["on" + ev.type], a = listeners(this)[ev.type], i, rec;
-    ev.target = this;
-    ev.currentTarget = this;
-    if (typeof h === "function") { h.call(this, ev); }
+  function runListeners(target, ev) {
+    var a = listeners(target)[ev.type], i, rec;
     if (a) {
       a = a.slice();
       for (i = 0; i < a.length && !ev["@stop"]; i++) {
         rec = a[i];
-        if (rec.once) { this.removeEventListener(ev.type, rec.fn); }
-        if (typeof rec.fn === "function") { rec.fn.call(this, ev); } else { rec.fn.handleEvent(ev); }
+        if (rec.once) { target.removeEventListener(ev.type, rec.fn); }
+        if (typeof rec.fn === "function") { rec.fn.call(target, ev); } else { rec.fn.handleEvent(ev); }
       }
     }
+  }
+  method(EventTarget.prototype, "dispatchEvent", function (ev) {
+    var h = this["on" + ev.type];
+    ev.target = this;
+    ev.currentTarget = this;
+    if (typeof h === "function") { h.call(this, ev); }
+    runListeners(this, ev);
     ev.currentTarget = null;
     return !ev.defaultPrevented;
   });
@@ -102,6 +106,15 @@ JS(
   g.onmessageerror = null;
   g.onerror = null;
   hide(g, "@deliver", function (data) { g.dispatchEvent(new g.MessageEvent("message", { data: data })); });
+  /* An uncaught error is offered to self.onerror (legacy signature) and error listeners before it reaches the page */
+  N.onerror = function (message) {
+    var handled = false, ev, h = g.onerror;
+    if (typeof h === "function") { handled = h.call(g, message, g.location.href, 0, 0, null) === true; }
+    ev = new g.ErrorEvent("error", { message: message, filename: g.location.href, cancelable: true });
+    ev.target = g;
+    runListeners(g, ev);
+    return handled || ev.defaultPrevented;
+  };
 
   /* ---- AbortController ---- */
   function AbortSignal() { throw typeError("Illegal constructor"); }
@@ -227,6 +240,36 @@ JS(
     return h;
   };
   hide(g, "crypto", crypto);
+
+  /* ---- performance marks and measures ---- */
+  var perf = g.performance, entries = [];
+  perf.timeOrigin = Date.now() - perf.now();
+  function entryTime(v, def) {
+    if (v === undefined) { return def; }
+    if (typeof v === "number") { return v; }
+    for (var i = entries.length - 1; i >= 0; i--) { if (entries[i].entryType === "mark" && entries[i].name === v) { return entries[i].startTime; } }
+    throw new DOMException("The mark " + QUOTE + v + QUOTE + " does not exist", "SyntaxError");
+  }
+  var QUOTE = String.fromCharCode(34);
+  perf.mark = function (name, opts) {
+    var e = { name: String(name), entryType: "mark", startTime: opts && opts.startTime !== undefined ? opts.startTime : perf.now(), duration: 0, detail: opts && opts.detail !== undefined ? opts.detail : null };
+    entries.push(e);
+    return e;
+  };
+  perf.measure = function (name, a, b) {
+    var start, end, detail = null;
+    if (a && typeof a === "object") { start = entryTime(a.start, 0); end = entryTime(a.end, a.duration !== undefined ? start + a.duration : perf.now()); detail = a.detail !== undefined ? a.detail : null; }
+    else { start = entryTime(a, 0); end = entryTime(b, perf.now()); }
+    var e = { name: String(name), entryType: "measure", startTime: start, duration: end - start, detail: detail };
+    entries.push(e);
+    return e;
+  };
+  perf.getEntries = function () { return entries.slice(); };
+  perf.getEntriesByName = function (n, t) { return entries.filter(function (e) { return e.name === n && (t === undefined || e.entryType === t); }); };
+  perf.getEntriesByType = function (t) { return entries.filter(function (e) { return e.entryType === t; }); };
+  perf.clearMarks = function (n) { entries = entries.filter(function (e) { return e.entryType !== "mark" || (n !== undefined && e.name !== n); }); };
+  perf.clearMeasures = function (n) { entries = entries.filter(function (e) { return e.entryType !== "measure" || (n !== undefined && e.name !== n); }); };
+  perf.toJSON = function () { return { timeOrigin: perf.timeOrigin }; };
 
   hide(g, "navigator", { hardwareConcurrency: 4, onLine: true, language: "en-US", languages: ["en-US"], userAgent: "OwOS", platform: "OwOS" });
   L.hide = hide;
