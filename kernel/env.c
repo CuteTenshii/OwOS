@@ -41,10 +41,14 @@ static bool splice(struct env *e, uint32_t off, uint32_t drop, const char *inser
   char *data = len ? kmalloc(len) : 0;
   if (len && !data)
     return false;
+  /* Empty ranges are skipped: e->data and insert may be NULL, and memcpy from NULL is undefined even for 0 bytes */
   if (data) {
-    memcpy(data, e->data, off);
-    memcpy(data + off, insert, insert_len);
-    memcpy(data + off + insert_len, e->data + off + drop, e->len - off - drop);
+    if (off)
+      memcpy(data, e->data, off);
+    if (insert_len)
+      memcpy(data + off, insert, insert_len);
+    if (e->len - off - drop)
+      memcpy(data + off + insert_len, e->data + off + drop, e->len - off - drop);
   }
   kfree(e->data);
   e->data = data;
