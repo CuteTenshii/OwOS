@@ -130,8 +130,7 @@ isr_common_stub:
 	mov $0x10, %ax                 /* switch to the kernel data segment       */
 	mov %ax, %ds
 	mov %ax, %es
-	mov %ax, %fs
-	mov %ax, %gs
+	mov %ax, %fs                   /* %gs stays: it is the user's TLS segment */
 
 	push %esp                      /* arg: pointer to struct registers        */
 	call isr_handler
@@ -141,7 +140,6 @@ isr_common_stub:
 	mov %ax, %ds
 	mov %ax, %es
 	mov %ax, %fs
-	mov %ax, %gs
 
 	popa
 	add $8, %esp                   /* drop int_no and err_code                */

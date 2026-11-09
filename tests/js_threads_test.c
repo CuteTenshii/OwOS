@@ -39,14 +39,13 @@ struct job {
 static void *worker(void *arg)
 {
   struct job *job = arg;
-  char stack_probe;
   gc_heap *heap = gc_heap_new();
   js_arena arena;
   js_parse_error error = {0, 0};
   js_node *program;
   js_value value;
   js_ctx *ctx;
-  gc_heap_attach(heap, &stack_probe - (1 << 20), &stack_probe + 4096);
+  gc_heap_attach(heap);
   ctx = js_ctx_new(con_print);
   gc_set_threshold(2048);
   js_def(ctx->global, "id", js_number(job->id), 0);

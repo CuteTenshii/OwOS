@@ -57,7 +57,21 @@ void syscall_process_thread(struct registers *r)
     r->eax = (uint32_t)-1;
     return;
   }
-  r->eax = (uint32_t)sched_create_user_thread(r->ebx, r->ecx);
+  if (r->edx && !user_range(r->edx, 4)) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  r->eax = (uint32_t)sched_create_user_thread(r->ebx, r->ecx, r->edx);
+}
+
+void syscall_process_set_tls(struct registers *r)
+{
+  if (r->ebx && !user_range(r->ebx, 4)) {
+    r->eax = (uint32_t)-1;
+    return;
+  }
+  sched_set_tls(r->ebx);
+  r->eax = 0;
 }
 
 void syscall_process_sleep(struct registers *r)

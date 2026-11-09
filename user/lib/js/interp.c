@@ -3043,10 +3043,12 @@ static void *coro_prepare(char *stack, void (*entry)(void))
   return sp;
 }
 
+static __thread js_generator *gen_boot;
+
 /* The first switch into a generator lands here; it never returns. */
 static void gen_entry(void)
 {
-  js_generator *g = gc_heap_slots()[JS_SLOT_GEN_BOOT];
+  js_generator *g = gen_boot;
   js_ctx *ctx = g->ctx;
   js_node *body = g->node->u.func.body;
   js_value result = js_undef();
@@ -3122,7 +3124,7 @@ static js_value gen_resume(js_ctx *ctx, js_generator *g, int mode, js_value v, i
   ctx->cur_gen = g;
   js_set_stack_limit(ctx, g->stack + GEN_STACK_HEADROOM);
   g->state = GEN_RUNNING;
-  gc_heap_slots()[JS_SLOT_GEN_BOOT] = g;
+  gen_boot = g;
   coro_switch(&g->caller_sp, g->sp);
   js_set_stack_limit(ctx, saved_limit);
   ctx->cur_gen = prev;

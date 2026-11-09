@@ -89,84 +89,21 @@ struct gc_heap {
   /* old objects of the rescan kind, scanned wholesale each minor. */
   gc_obj **rescan;
   int rescan_n, rescan_cap;
-  void *slots[GC_HEAP_SLOTS];
 };
 
 static inline gc_obj *hdr(void *payload) { return (gc_obj *)payload - 1; }
 static inline void *body(gc_obj *o) { return (void *)(o + 1); }
 
 /* The heap of the calling thread. A thread that never attaches one uses main_heap, so single-threaded
- * embedders see the old global collector. Hosted test builds use real TLS; OwOS has none, so an attached
- * heap is found by the stack range of the calling thread. */
+ * embedders see the old global collector. */
 static gc_heap main_heap = {.threshold = MIN_THRESHOLD, .major_threshold = MIN_MAJOR, .rescan_kind = -1};
-
-#ifdef OWOS_HOST_TEST_SHIM_H
 static __thread gc_heap *thread_heap;
 
 static inline gc_heap *cur_heap(void) { return thread_heap ? thread_heap : &main_heap; }
 
-int gc_heap_attach(gc_heap *h, void *stack_lo, void *stack_hi)
-{
-  (void)stack_lo;
-  (void)stack_hi;
-  thread_heap = h;
-  return 0;
-}
+void gc_heap_attach(gc_heap *h) { thread_heap = h; }
 
 void gc_heap_detach(void) { thread_heap = 0; }
-#else
-#include "mutex.h"
-
-#define MAX_ATTACHED 32
-static struct {
-  char *lo, *hi;
-  gc_heap *heap;
-} attached[MAX_ATTACHED];
-static int nslots; /* slots in use or once used; 0 until the first attach */
-static mutex_t attach_lock = MUTEX_INIT;
-
-static gc_heap *cur_heap(void)
-{
-  int n = __atomic_load_n(&nslots, __ATOMIC_ACQUIRE);
-  if (n) {
-    char *sp = __builtin_frame_address(0);
-    for (int i = 0; i < n; i++) {
-      gc_heap *h = __atomic_load_n(&attached[i].heap, __ATOMIC_ACQUIRE);
-      if (h && sp >= attached[i].lo && sp < attached[i].hi)
-        return h;
-    }
-  }
-  return &main_heap;
-}
-
-int gc_heap_attach(gc_heap *h, void *stack_lo, void *stack_hi)
-{
-  int slot = -1;
-  mutex_lock(&attach_lock);
-  for (int i = 0; i < MAX_ATTACHED && slot < 0; i++)
-    if (!attached[i].heap)
-      slot = i;
-  if (slot >= 0) {
-    attached[slot].lo = stack_lo;
-    attached[slot].hi = stack_hi;
-    __atomic_store_n(&attached[slot].heap, h, __ATOMIC_RELEASE);
-    if (slot >= nslots)
-      __atomic_store_n(&nslots, slot + 1, __ATOMIC_RELEASE);
-  }
-  mutex_unlock(&attach_lock);
-  return slot < 0 ? -1 : 0;
-}
-
-void gc_heap_detach(void)
-{
-  char *sp = __builtin_frame_address(0);
-  mutex_lock(&attach_lock);
-  for (int i = 0; i < nslots; i++)
-    if (attached[i].heap && sp >= attached[i].lo && sp < attached[i].hi)
-      __atomic_store_n(&attached[i].heap, 0, __ATOMIC_RELEASE);
-  mutex_unlock(&attach_lock);
-}
-#endif
 
 gc_heap *gc_heap_new(void)
 {
@@ -207,8 +144,6 @@ void gc_heap_free(gc_heap *h)
 }
 
 int gc_ready(void) { return cur_heap()->tracer != 0; }
-
-void **gc_heap_slots(void) { return cur_heap()->slots; }
 
 /* Grow a void* array to hold one more; returns 0 on OOM (caller copes). */
 static int grow(void ***a, int *cap, int need)

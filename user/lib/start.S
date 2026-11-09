@@ -5,6 +5,7 @@
 .section .text.start
 .global _start
 _start:
+	call tls_init                  /* %gs segment for __thread data           */
 	mov (%esp), %eax               /* argc (the kernel left it at the top)    */
 	lea 4(%esp), %edx              /* argv = esp + 4                          */
 	push %edx                      /* main(argc, argv)                        */

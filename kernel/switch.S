@@ -51,7 +51,6 @@ enter_user_task:
 	mov %ax, %ds
 	mov %ax, %es
 	mov %ax, %fs
-	mov %ax, %gs
 	iretq
 .size enter_user_task, . - enter_user_task
 
@@ -134,7 +133,6 @@ enter_user_task:
 	mov %ax, %ds
 	mov %ax, %es
 	mov %ax, %fs
-	mov %ax, %gs
 	iret
 .size enter_user_task, . - enter_user_task
 
@@ -149,7 +147,6 @@ fork_child_entry:
 	mov %ax, %ds
 	mov %ax, %es
 	mov %ax, %fs
-	mov %ax, %gs
 	popa
 	add $8, %esp                   /* drop int_no + err_code                   */
 	iret

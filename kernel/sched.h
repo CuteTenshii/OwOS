@@ -21,8 +21,11 @@ int sched_create_process(const char *name, uint32_t entry, uint32_t *dir, uint32
 uint32_t sched_sbrk(int inc);
 void sched_set_brk(uint32_t brk);
 
-/* Spawn a thread in the current process running `entry` on `user_esp`; tid or -1. */
-int sched_create_user_thread(uint32_t entry, uint32_t user_esp);
+/* Spawn a thread in the current process running `entry` on `user_esp` with %gs based at `tls_base`; tid or -1. */
+int sched_create_user_thread(uint32_t entry, uint32_t user_esp, uint32_t tls_base);
+
+/* Point the caller's %gs segment at `base` (0 = flat). Each user thread has its own. */
+void sched_set_tls(uint32_t base);
 
 /* fork from the syscall trap frame; child pid to the parent, 0 in the child. */
 int sched_fork(struct registers *r);

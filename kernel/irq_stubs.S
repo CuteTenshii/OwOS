@@ -104,7 +104,6 @@ irq_common_stub:
 	mov %ax, %ds
 	mov %ax, %es
 	mov %ax, %fs
-	mov %ax, %gs
 
 	push %esp                      /* arg: pointer to struct registers        */
 	call irq_handler
@@ -114,7 +113,6 @@ irq_common_stub:
 	mov %ax, %ds
 	mov %ax, %es
 	mov %ax, %fs
-	mov %ax, %gs
 
 	popa
 	add $8, %esp                   /* drop int_no and err_code                */

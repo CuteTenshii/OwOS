@@ -74,6 +74,7 @@ typedef struct task {
   uint32_t uid;           /* owning user id (credentials; inherited like cwd) */
   uint32_t gid;           /* owning primary group id */
   uint32_t umask;
+  uint32_t tls_base;            /* user %gs segment base (0 = flat) */
   struct env env;               /* process environment; threads use their leader's */
   bool fpu_valid;               /* fpu[] holds a saved x87 image (else the task still has the init state) */
   uint8_t fpu[FPU_IMAGE_BYTES]; /* x87 state saved while the task is switched out */
@@ -512,8 +513,16 @@ void sched_set_brk(uint32_t brk)
     current->as->brk = current->as->brk_base = brk;
 }
 
+void sched_set_tls(uint32_t base)
+{
+  uintptr_t flags = irq_save();
+  current->tls_base = base;
+  gdt_set_tls(base);
+  irq_restore(flags);
+}
+
 /* Spawn a thread sharing the caller's address space; the caller must waitpid() it before exiting. */
-int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
+int sched_create_user_thread(uint32_t entry, uint32_t user_esp, uint32_t tls_base)
 {
   task_t *t = alloc_task();
   if (!t)
@@ -533,6 +542,7 @@ int sched_create_user_thread(uint32_t entry, uint32_t user_esp)
   t->uid = current->uid;
   t->gid = current->gid;
   t->umask = current->umask;
+  t->tls_base = tls_base;
 
   uint8_t *kstack = kmalloc(UKSTACK_SIZE);
   if (!kstack) {
@@ -609,6 +619,7 @@ int sched_fork(struct registers *r)
   t->as_owner = true;
   t->process = t;
   t->parent = current->id;
+  t->tls_base = current->tls_base;
   t->kstack = kstack;
   t->kstack_top = (uintptr_t)(kstack + UKSTACK_SIZE);
   if (env_copy(&t->env, proc_env()) != 0) {
@@ -1343,6 +1354,7 @@ void schedule(void)
     current->runs++;
     if (current->kstack_top)
       tss_set_kernel_stack(current->kstack_top);
+    gdt_set_tls(current->tls_base);
     if (task_cr3(current) != task_cr3(prev))
       paging_load((uint32_t *)(uintptr_t)task_cr3(current));
     fpu_switch(prev, current);

@@ -20,6 +20,10 @@
 
 void gdt_init(void);
 
+/* Make the calling CPU's user TLS segment start at `base` and load it into %gs (0: the flat user data
+ * segment). The scheduler calls this on every switch, as the segment is per CPU. */
+void gdt_set_tls(uint32_t base);
+
 /* Set the kernel stack the CPU loads on a ring3 -> ring0 trap (for the calling
  * CPU's own TSS). */
 void tss_set_kernel_stack(uintptr_t stack_top);

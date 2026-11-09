@@ -8,7 +8,7 @@
  *
  * Precise, not conservative: roots are registered explicitly rather than found
  * by scanning the C stack. That is deterministic and safe under this OS's
- * cooperative scheduler and user threads, where a stack base cannot be assumed.
+ * scheduler and user threads, where a stack base cannot be assumed.
  * Three ways to keep something alive:
  *   - gc_add_root(&slot)            a long-lived pointer variable (a global)
  *   - gc_add_root_range(base,&n)    a live array of pointer slots (a VM stack)
@@ -31,19 +31,15 @@ typedef void (*gc_tracer)(void *obj, int kind);
 typedef void (*gc_finalizer)(void *obj, int kind);
 
 /* Collector instances. Without any call below, every thread shares one global heap. A thread that runs
- * contexts of its own makes a heap, attaches it with the bounds of its own stack (the heap is then found
- * from the stack pointer, as OwOS has no TLS), runs gc_init on it, and detaches before it exits. A heap
- * and everything allocated from it belong to that one thread. */
+ * contexts of its own makes a heap, attaches it to itself, runs gc_init on it, and detaches before it
+ * exits. A heap and everything allocated from it belong to that one thread. */
 typedef struct gc_heap gc_heap;
 gc_heap *gc_heap_new(void);
-int gc_heap_attach(gc_heap *h, void *stack_lo, void *stack_hi); /* 0, or -1 if too many are attached */
+void gc_heap_attach(gc_heap *h);
 void gc_heap_detach(void);
 void gc_heap_free(gc_heap *h); /* finalizes and frees every object left in h; detach it first */
 int gc_ready(void);
-/* Pointer slots private to the calling thread's heap, zeroed at creation: per-thread state for the
- * embedder (a stack floor, a hand-off across a coroutine switch) in lieu of TLS. */
-#define GC_HEAP_SLOTS 4
-void **gc_heap_slots(void); /* gc_init has already run on the calling thread's heap */
+/* gc_init has already run on the calling thread's heap */
 
 /* Reset to an empty heap and install the callbacks (finalize may be NULL).
  * Call once before any gc_alloc(). */

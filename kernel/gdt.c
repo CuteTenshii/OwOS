@@ -65,8 +65,10 @@ struct tss_desc {
 /* Each TSS descriptor is 16 bytes = 2 GDT entries; TSS i starts at GDT entry
  * 5 + 2*i, selector TSS_SEL(i). TSS_SEL(0) == GDT_TSS (0x28). */
 #define TSS_SEL(cpu) ((uint16_t)((5 + 2 * (cpu)) << 3))
+/* Per-CPU user TLS data segment, after the TSS descriptors. */
+#define TLS_IDX(cpu) (5 + 2 * SMP_MAX_CPUS + (cpu))
 
-static struct gdt_entry gdt[5 + 2 * SMP_MAX_CPUS];
+static struct gdt_entry gdt[5 + 2 * SMP_MAX_CPUS + SMP_MAX_CPUS];
 static struct gdt_ptr gdt_ptr;
 static struct tss_entry tss[SMP_MAX_CPUS];
 
@@ -127,8 +129,10 @@ struct tss_entry {
  * and GDT descriptor. The fixed 5 descriptors (null + kernel/user code/data)
  * are shared; TSS i sits at descriptor 5+i, selector TSS_SEL(i). */
 #define TSS_SEL(cpu) ((uint16_t)((5 + (cpu)) << 3))
+/* Per-CPU user TLS data segment, after the TSS descriptors. */
+#define TLS_IDX(cpu) (5 + SMP_MAX_CPUS + (cpu))
 
-static struct gdt_entry gdt[5 + SMP_MAX_CPUS];
+static struct gdt_entry gdt[5 + SMP_MAX_CPUS + SMP_MAX_CPUS];
 static struct gdt_ptr gdt_ptr;
 static struct tss_entry tss[SMP_MAX_CPUS];
 
@@ -165,6 +169,17 @@ void gdt_init(void)
   __asm__ volatile("ltr %0" : : "r"((uint16_t)GDT_TSS)); /* BSP = TSS_SEL(0) */
 }
 #endif
+
+void gdt_set_tls(uint32_t base)
+{
+  uint16_t sel = GDT_USER_DATA | 3;
+  if (base) {
+    int cpu = smp_this_cpu();
+    gdt_set_entry(&gdt[TLS_IDX(cpu)], base, 0xFFFFF, 0xF2, 0xC0);
+    sel = (uint16_t)(TLS_IDX(cpu) << 3 | 3);
+  }
+  __asm__ volatile("mov %0, %%gs" : : "r"(sel));
+}
 
 /* An AP arrives on the trampoline's minimal GDT; switch it to the real kernel
  * GDT (which carries the per-CPU TSS descriptors) before it can ltr its own

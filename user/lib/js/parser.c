@@ -40,12 +40,8 @@ typedef struct {
 #define JS_MAX_DEPTH 700
 
 /* Lowest native SP the parser may recurse to (js_set_stack_limit); NULL = depth cap only. */
-void js_parser_set_stack_floor(const void *low) { gc_heap_slots()[JS_SLOT_PARSE_FLOOR] = (void *)low; }
-static int below_floor(const char *sp)
-{
-  const char *floor = gc_heap_slots()[JS_SLOT_PARSE_FLOOR];
-  return floor && sp < floor;
-}
+static __thread const char *g_parse_floor;
+void js_parser_set_stack_floor(const void *low) { g_parse_floor = (const char *)low; }
 
 /* ------------------------------------------------------- token stream ----- */
 
@@ -519,7 +515,7 @@ static js_node *parse_new(js_parser *p)
 {
   js_node *r;
   char probe;
-  if (++p->sdepth > 4 * JS_MAX_DEPTH || below_floor(&probe)) {
+  if (++p->sdepth > 4 * JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
     --p->sdepth;
     return perr(p, "expression nesting too deep");
   }
@@ -569,7 +565,7 @@ static js_node *parse_unary(js_parser *p)
 {
   js_node *r;
   char probe;
-  if (++p->sdepth > 4 * JS_MAX_DEPTH || below_floor(&probe)) {
+  if (++p->sdepth > 4 * JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
     --p->sdepth;
     return perr(p, "expression nesting too deep");
   }
@@ -623,7 +619,7 @@ static js_node *parse_binary(js_parser *p, int min_prec, int no_in)
 {
   js_node *r;
   char probe;
-  if (++p->sdepth > 4 * JS_MAX_DEPTH || below_floor(&probe)) {
+  if (++p->sdepth > 4 * JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
     --p->sdepth;
     return perr(p, "expression nesting too deep");
   }
@@ -707,7 +703,7 @@ static js_node *parse_assignment(js_parser *p, int no_in)
 {
   js_node *r;
   char probe;
-  if (++p->depth > JS_MAX_DEPTH || below_floor(&probe)) {
+  if (++p->depth > JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
     --p->depth;
     return perr(p, "expression nesting too deep");
   }
@@ -1862,7 +1858,7 @@ static js_node *parse_statement(js_parser *p)
 {
   js_node *r;
   char probe;
-  if (++p->depth > JS_MAX_DEPTH || below_floor(&probe)) {
+  if (++p->depth > JS_MAX_DEPTH || (g_parse_floor && &probe < g_parse_floor)) {
     --p->depth;
     return perr(p, "statement nesting too deep");
   }

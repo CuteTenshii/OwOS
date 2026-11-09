@@ -3166,11 +3166,11 @@ static int re_word(int c)
 }
 
 /* Lowest native SP the regex compiler/matcher may recurse to; set per call from the context. */
+static __thread const char *re_floor;
 static int re_deep(void)
 {
   char probe;
-  const char *floor = gc_heap_slots()[JS_SLOT_REGEX_FLOOR];
-  return floor && &probe < floor;
+  return re_floor && &probe < re_floor;
 }
 
 /* Add the code points lo..hi to a class: below 128 as bits, the rest as a range */
@@ -4247,7 +4247,7 @@ static reprog *re_compile_obj(js_ctx *ctx, js_value rx, int *caps_n)
   const char *s = src.type == JV_STR ? src.u.str->data : "";
   int len = src.type == JV_STR ? src.u.str->len : 0, i;
   re_cache_t *cache;
-  gc_heap_slots()[JS_SLOT_REGEX_FLOOR] = ctx->stack_limit;
+  re_floor = ctx->stack_limit;
   if (!ctx->re_cache)
     ctx->re_cache = calloc(1, sizeof(re_cache_t));
   cache = ctx->re_cache;

@@ -431,7 +431,46 @@ int audio_close(void) { return syscall(SYS_AUDIO_CLOSE, 0, 0, 0); }
 
 void msleep(unsigned ms) { syscall(SYS_SLEEP, (int)ms, 0, 0); }
 
-int thread_create(void (*fn)(void), void *stack_top) { return syscall(SYS_THREAD, (int)fn, (int)stack_top, 0); }
+/* __thread storage. user.ld lays out the .tdata image and .tbss; each thread gets a block holding both,
+ * then a thread pointer that stores its own address (%gs:0, as the i386 ABI wants). The kernel makes %gs
+ * a segment based at that pointer, so a variable lives at a fixed negative offset from it. */
+extern char __tdata_start[], __tdata_end[], __tls_main[], __tls_memsz[], __tls_align[];
+
+static unsigned tls_data_size(void)
+{
+  unsigned align = (unsigned)__tls_align;
+  return ((unsigned)__tls_memsz + align - 1) & ~(align - 1);
+}
+
+/* Fill the block at `block` (16-aligned, tls_data_size() + 16 bytes) and return its thread pointer. */
+static void *tls_fill(char *block)
+{
+  unsigned image = (unsigned)(__tdata_end - __tdata_start);
+  void **tp = (void **)(block + tls_data_size());
+  memcpy(block, __tdata_start, image);
+  memset(block + image, 0, tls_data_size() - image);
+  *tp = tp;
+  return tp;
+}
+
+/* Called by _start for the first thread, before main. */
+void tls_init(void)
+{
+  if ((unsigned)__tls_memsz)
+    syscall(SYS_SET_TLS, (int)tls_fill(__tls_main), 0, 0);
+}
+
+/* The new thread's TLS block is carved from the top of its stack. */
+int thread_create(void (*fn)(void), void *stack_top)
+{
+  void *tp = 0;
+  if ((unsigned)__tls_memsz) {
+    char *block = (char *)(((unsigned)stack_top - tls_data_size() - 16) & ~15u);
+    tp = tls_fill(block);
+    stack_top = block;
+  }
+  return syscall(SYS_THREAD, (int)fn, (int)stack_top, (int)tp);
+}
 
 /* Stack with an unmapped guard page below, so overflow faults */
 void *thread_stack_alloc(int bytes)

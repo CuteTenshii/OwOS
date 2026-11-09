@@ -58,9 +58,6 @@ enum {
 enum { TA_I8, TA_U8, TA_U8C, TA_I16, TA_U16, TA_I32, TA_U32, TA_F32, TA_F64, TA_I64, TA_U64, TA_F16, TA_NKINDS };
 #define TA_DATAVIEW (-1)
 
-/* gc_heap_slots() indices: state that belongs to the running thread */
-enum { JS_SLOT_PARSE_FLOOR, JS_SLOT_REGEX_FLOOR, JS_SLOT_GEN_BOOT };
-
 /* OBJ_ARRAYBUFFER host: the raw backing bytes. OBJ_TYPEDARRAY host: a view onto
  * an ArrayBuffer (DataView is a view with type == TA_DATAVIEW; `length` is its
  * element count, or byteLength for a DataView). */
