@@ -4637,20 +4637,27 @@ js_value js_make_regexp(js_ctx *ctx, const char *source, const char *flags)
 static js_value regexp_ctor(js_ctx *ctx, js_value thisv, js_value *a, int n)
 {
   const char *src = "", *fl = "";
-  js_value sv, fv;
+  js_value sv, fv, r;
   (void)thisv;
+  /* src and fl point into these strings, which later allocations could otherwise collect */
+  gc_push_scope();
   if (n > 0 && re_is_regexp(ctx, a[0])) {
     sv = js_get(ctx, a[0], "source");
+    KEEP(sv);
     fv = (n > 1 && a[1].type != JV_UNDEF) ? js_to_string(ctx, a[1]) : js_get(ctx, a[0], "flags");
   } else {
     sv = (n > 0 && a[0].type != JV_UNDEF) ? js_to_string(ctx, a[0]) : js_mk_cstring(ctx, "");
+    KEEP(sv);
     fv = (n > 1 && a[1].type != JV_UNDEF) ? js_to_string(ctx, a[1]) : js_mk_cstring(ctx, "");
   }
+  KEEP(fv);
   if (sv.type == JV_STR)
     src = sv.u.str->data;
   if (fv.type == JV_STR)
     fl = fv.u.str->data;
-  return js_make_regexp(ctx, src, fl);
+  r = js_make_regexp(ctx, src, fl);
+  gc_pop_scope();
+  return r;
 }
 
 static js_value str_match(js_ctx *ctx, js_value t, js_value *a, int n)
@@ -10386,6 +10393,7 @@ static js_object *intl_new(js_ctx *ctx, js_value *a, int n)
   gc_push_scope();
   o = (js_object *)gc_keep(js_new_object(ctx, intl_proto_of(ctx)));
   loc = js_mk_cstring(ctx, "en-US");
+  KEEP(loc); /* the options allocation below can collect it */
   if (n > 0) {
     if (a[0].type == JV_STR)
       loc = a[0];
@@ -10394,6 +10402,7 @@ static js_object *intl_new(js_ctx *ctx, js_value *a, int n)
       loc = a[0].u.obj->elems[0];
   }
   opts = (n > 1 && a[1].type == JV_OBJ) ? a[1] : js_obj_value(js_new_object(ctx, ctx->object_proto));
+  KEEP(opts);
   js_def(o, "@loc", loc, 0);
   js_def(o, "@opts", opts, 0);
   gc_pop_scope();
