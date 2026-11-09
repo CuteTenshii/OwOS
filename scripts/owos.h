@@ -8,6 +8,7 @@
 #define OWOS_HOST_TEST_SHIM_H
 
 #include "../user/lib/ascii.h"
+#include <errno.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <stdbool.h>
@@ -84,9 +85,10 @@ static inline int stat(const char *path, struct statinfo *out)
   FILE *f = fopen(path, "rb");
   if (!f)
     return -1;
+  /* Linux opens a directory for reading but refuses the read itself */
+  out->is_dir = fgetc(f) == EOF && ferror(f) && errno == EISDIR;
   fseek(f, 0, SEEK_END);
-  out->size = (unsigned)ftell(f);
-  out->is_dir = 0;
+  out->size = out->is_dir ? 0 : (unsigned)ftell(f);
   out->mtime = 0;
   out->mode = 0644;
   out->uid = out->gid = 0;

@@ -66,6 +66,11 @@ int archive_entry(struct archive *a, int idx, struct arcent *out);
  * parent directories are created on demand). Returns 0 / -1. */
 int archive_extract(struct archive *a, int idx, const char *dest_path);
 
+/* Extract entry `idx` beneath the directory `dest_dir` at its path inside the
+ * archive, creating parent directories. Names that are absolute or contain a
+ * ".." component are refused. Returns 0 / -1. */
+int archive_extract_into(struct archive *a, int idx, const char *dest_dir);
+
 /* Extract every entry into the directory `dest_dir` (created if absent),
  * preserving the archive's internal directory structure. Returns 0 / -1. */
 int archive_extract_all(struct archive *a, const char *dest_dir);

@@ -585,7 +585,9 @@ static const struct {
   const char *ext;
   const char *prog;
 } assoc[] = {
-    {"png", "imgview"}, {"webp", "imgview"}, {"wav", "player"}, {"mp3", "player"}, {"caf", "player"},
+    {"png", "imgview"}, {"webp", "imgview"}, {"wav", "player"},  {"mp3", "player"},
+    {"caf", "player"},  {"zip", "archive"},  {"tar", "archive"}, {"tgz", "archive"},
+    {"gz", "archive"},  {"zst", "archive"},  {"br", "archive"},
 };
 
 /* Case-insensitive compare of `a` against the lowercase literal `b` */

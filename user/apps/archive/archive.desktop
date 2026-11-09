@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Archive
+GenericName=Archive Manager
+Comment=Browse and extract ZIP and TAR archives
+Exec=archive %f
+Icon=utilities-file-archiver
+Terminal=false
+Categories=Utility;Archiving;
+X-OwOS-Order=25
+MimeType=application/zip;application/x-tar;application/gzip;application/x-compressed-tar;application/zstd;

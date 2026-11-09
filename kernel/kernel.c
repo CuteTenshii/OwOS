@@ -407,6 +407,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     mkdir_mode("/usr/share/icons", 0755);
     INSTALL_ICON("utilities-terminal", utilities_terminal);
     INSTALL_ICON("system-file-manager", system_file_manager);
+    INSTALL_ICON("utilities-file-archiver", utilities_file_archiver);
     INSTALL_ICON("accessories-text-editor", accessories_text_editor);
     INSTALL_ICON("web-browser", web_browser);
     INSTALL_ICON("multimedia-player", multimedia_player);
@@ -427,6 +428,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_ICON("network-ethernet-disconnected", network_ethernet_disconnected);
     INSTALL_DESKTOP(term);
     INSTALL_DESKTOP(files);
+    INSTALL_DESKTOP(archive);
     INSTALL_DESKTOP(editor);
     INSTALL_DESKTOP(browser);
     INSTALL_DESKTOP(player);
@@ -486,6 +488,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(cast);
     INSTALL_APP(chmod);
     INSTALL_APP(unrar);
+    INSTALL_APP(archive);
     INSTALL_APP(chown);
     INSTALL_APP(init);
     INSTALL_APP(sh);

@@ -5,7 +5,6 @@
 #include "archive.h"
 #include "archive_fs.h"
 #include "test.h"
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +12,8 @@
 
 static FILE *out_file;
 
-int archive_test_mkdir(const char *path) { return (mkdir(path, 0755) == 0 || errno == EEXIST) ? 0 : -1; }
+/* Like the guest's, this fails on an existing directory. */
+int archive_test_mkdir(const char *path) { return mkdir(path, 0755) == 0 ? 0 : -1; }
 int archive_test_stream_begin(const char *path)
 {
   out_file = fopen(path, "wb");
@@ -262,6 +262,44 @@ static void check_traversal(void)
   archive_close(a);
 }
 
+/* Entries listed before their directories (as many writers emit them) must still extract, since the guest mkdir
+ * fails on a directory that an earlier entry's parents already created. */
+static void check_nested_and_into(void)
+{
+  static unsigned char tar[8192];
+  char p[600], probe[700], longdir[600];
+  size_t pos = 0;
+  memset(tar, 0, sizeof tar);
+  tar_add(tar, &pos, "deep/a/b.txt", "nested", 6, '0');
+  tar_add(tar, &pos, "deep/", "", 0, '5');
+  tar_add(tar, &pos, "deep/a/", "", 0, '5');
+  tar_add(tar, &pos, "../up.txt", "x", 1, '0');
+  path_in(p, sizeof p, "nested.tar");
+  put(p, tar, pos + 1024);
+  struct archive *a = archive_open(p);
+  expect(a != 0 && archive_count(a) == 4);
+
+  path_in(p, sizeof p, "nested-all");
+  expect(a && archive_extract_all(a, p) == 0);
+  struct stat st;
+  snprintf(probe, sizeof probe, "%s/nested-all/deep/a/b.txt", dir);
+  expect(stat(probe, &st) == 0 && st.st_size == 6);
+
+  path_in(p, sizeof p, "nested-one");
+  archive_test_mkdir(p);
+  expect(a && archive_extract_into(a, 0, p) == 0);
+  snprintf(probe, sizeof probe, "%s/nested-one/deep/a/b.txt", dir);
+  expect(stat(probe, &st) == 0 && st.st_size == 6);
+  expect(a && archive_extract_into(a, 1, p) == 0); /* the directory now exists */
+  expect(a && archive_extract_into(a, 3, p) < 0);  /* "../up.txt" */
+  expect(a && archive_extract_into(a, 4, p) < 0);  /* out of range */
+
+  memset(longdir, 'd', sizeof longdir - 1);
+  longdir[sizeof longdir - 1] = 0;
+  expect(a && archive_extract_into(a, 0, longdir) < 0);
+  archive_close(a);
+}
+
 /* A ZIP whose method is neither store nor deflate is listed, but extracting it must fail. */
 static void check_unsupported_zip_method(void)
 {
@@ -314,6 +352,7 @@ int main(void)
   test("host-built archives", check_host_archives);
   test("GNU long name overflow", check_long_name);
   test("path traversal", check_traversal);
+  test("nested entries and extract_into", check_nested_and_into);
   test("unsupported ZIP method", check_unsupported_zip_method);
   test("garbage input", check_rejects_garbage);
 

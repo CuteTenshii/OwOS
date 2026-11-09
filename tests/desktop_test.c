@@ -420,8 +420,9 @@ static void check_shipped(void)
   expect(apps != NULL);
   if (!apps)
     return;
-  const char *expect_names[] = {"term",  "files", "editor",  "browser",  "player",
+  const char *expect_names[] = {"term",  "files", "archive", "editor",   "browser", "player",
                                 "clock", "calc",  "notifyd", "settings", "about"};
+  const int nexpect = (int)(sizeof expect_names / sizeof expect_names[0]);
   struct desktop_list l = {0};
   int found = 0;
   for (struct dirent *d; (d = readdir(apps));) {
@@ -453,9 +454,9 @@ static void check_shipped(void)
     l.v[l.n++] = e;
   }
   closedir(apps);
-  expect(found == 10);
+  expect_eq(found, nexpect);
   desktop_sort(&l);
-  for (int i = 0; i < l.n && i < 10; i++)
+  for (int i = 0; i < l.n && i < nexpect; i++)
     expect_string(l.v[i]->id, expect_names[i]);
   for (int i = 0; i < l.n; i++) {
     if (!strcmp(l.v[i]->id, "browser")) {

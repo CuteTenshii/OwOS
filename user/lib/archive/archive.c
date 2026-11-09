@@ -601,8 +601,11 @@ int archive_extract(struct archive *a, int idx, const char *dest_path)
   if (!a || idx < 0 || idx >= a->nents)
     return -1;
   struct arcent *e = &a->ents[idx];
-  if (e->is_dir)
-    return mkdir(dest_path);
+  if (e->is_dir) {
+    struct statinfo st;
+    /* mkdir fails on an existing directory, which an earlier entry's parents may have created */
+    return (mkdir(dest_path) == 0 || (stat(dest_path, &st) == 0 && st.is_dir)) ? 0 : -1;
+  }
   /* Only store and deflate are decodable; copying other methods would write compressed bytes. */
   if (a->fmt == ARC_FMT_ZIP && e->method != 0 && e->method != 8)
     return -1;
@@ -699,58 +702,38 @@ static int name_is_safe(const char *name)
   return 1;
 }
 
+int archive_extract_into(struct archive *a, int idx, const char *dest_dir)
+{
+  if (!a || idx < 0 || idx >= a->nents || !name_is_safe(a->ents[idx].name))
+    return -1;
+  const char *name = a->ents[idx].name;
+  char dest[512];
+  int dl = (int)strlen(dest_dir), nl = (int)strlen(name);
+  if (dl + 1 + nl >= (int)sizeof dest)
+    return -1;
+  memcpy(dest, dest_dir, (unsigned)dl);
+  dest[dl] = '/';
+  memcpy(dest + dl + 1, name, (unsigned)nl + 1);
+
+  /* Parents outermost first; mkdir's failure on an existing one is expected */
+  for (int ci = dl + 1; dest[ci]; ci++) {
+    if (dest[ci] == '/') {
+      dest[ci] = 0;
+      mkdir(dest);
+      dest[ci] = '/';
+    }
+  }
+  return archive_extract(a, idx, dest);
+}
+
 int archive_extract_all(struct archive *a, const char *dest_dir)
 {
   if (!a)
     return -1;
-
-  /* Ensure the destination directory exists. */
   mkdir(dest_dir);
-
-  for (int i = 0; i < a->nents; i++) {
-    struct arcent *e = &a->ents[i];
-
-    /* Reject path traversal. */
-    if (!name_is_safe(e->name))
-      continue;
-
-    if (e->is_dir) {
-      char sub[512];
-      int dl = 0;
-      while (dest_dir[dl])
-        dl++;
-      memcpy(sub, dest_dir, dl);
-      sub[dl++] = '/';
-      int ni = 0;
-      while (e->name[ni] && dl < 500)
-        sub[dl++] = e->name[ni++];
-      sub[dl] = 0;
-      mkdir(sub);
-      continue;
-    }
-
-    char dest[512];
-    int dl = 0;
-    while (dest_dir[dl])
-      dl++;
-    memcpy(dest, dest_dir, dl);
-    dest[dl++] = '/';
-    int ni = 0;
-    while (e->name[ni] && dl < 500)
-      dest[dl++] = e->name[ni++];
-    dest[dl] = 0;
-
-    for (int ci = dl - 1; ci > 0; ci--) {
-      if (dest[ci] == '/') {
-        dest[ci] = 0;
-        mkdir(dest);
-        dest[ci] = '/';
-      }
-    }
-
-    if (archive_extract(a, i, dest) < 0)
+  for (int i = 0; i < a->nents; i++)
+    if (name_is_safe(a->ents[i].name) && archive_extract_into(a, i, dest_dir) < 0)
       return -1;
-  }
   return 0;
 }
 

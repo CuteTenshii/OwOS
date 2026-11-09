@@ -90,6 +90,17 @@ def scene_files():
             (rrect(6, 12, 26, 25, 1.5), (250, 208, 100))]
 
 
+def scene_archiver():
+    out = [tile((214, 160, 90), (156, 106, 52)), (rrect(6, 10, 26, 27, 1.5), (246, 218, 166)),
+           (rrect(5, 6.5, 27, 11.5, 1.2), (232, 192, 124)), (rect(14.6, 6.5, 17.4, 27), (96, 72, 50))]
+    for i in range(5):
+        x0 = 13.2 if i % 2 == 0 else 17.4
+        out.append((rect(x0, 8 + i * 3.6, x0 + 1.4, 9.4 + i * 3.6), (96, 72, 50)))
+    out.append((rrect(13.4, 18.5, 18.6, 23.5, 1.2), (205, 210, 222)))
+    out.append((rect(15.2, 20, 16.8, 22), (96, 72, 50)))
+    return out
+
+
 def scene_editor():
     out = [tile((110, 120, 140), (70, 78, 98)), (rrect(8, 5, 24, 27, 1.5), (250, 250, 252))]
     for i in range(5):
@@ -216,7 +227,8 @@ def scene_net_disconnected():
 
 
 ICONS = {
-    'utilities-terminal': scene_term, 'system-file-manager': scene_files, 'accessories-text-editor': scene_editor,
+    'utilities-terminal': scene_term, 'system-file-manager': scene_files,
+    'utilities-file-archiver': scene_archiver, 'accessories-text-editor': scene_editor,
     'web-browser': scene_browser, 'multimedia-player': scene_player, 'preferences-system-time': scene_clock,
     'accessories-calculator': scene_calc, 'preferences-system-notifications': scene_notify,
     'preferences-system': scene_settings, 'help-about': scene_about, 'application-default': scene_default,
