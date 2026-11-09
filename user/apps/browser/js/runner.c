@@ -8,6 +8,18 @@
 
 /* ------------------------------------------------------- runner ----------- */
 
+/* What structured clone carries across threads besides plain data: Blobs and OffscreenCanvases */
+static int page_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
+{
+  return blob_clone_write(ctx, v, kind, bytes, len, meta) || canvas_clone_write(ctx, v, kind, bytes, len, meta);
+}
+
+static js_value page_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta)
+{
+  js_value v = blob_clone_read(ctx, kind, bytes, len, meta);
+  return v.type == JV_OBJ ? v : canvas_clone_read(ctx, kind, bytes, len);
+}
+
 /* console.* output goes to the devtools Console, the canonical sink, as in a real browser */
 static void js_print(js_ctx *ctx, int level, const char *s, int len)
 {
@@ -495,8 +507,8 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
     return;
   }
   g_ctx->now_ms = now_ms;
-  g_ctx->clone_write_ext = blob_clone_write;
-  g_ctx->clone_read_ext = blob_clone_read;
+  g_ctx->clone_write_ext = page_clone_write;
+  g_ctx->clone_read_ext = page_clone_read;
   js_set_stack_limit(g_ctx, browser_js_stack_floor()); /* bound recursion to the worker stack */
   js_set_script(g_ctx, g_cur_script);                  /* origin frame for captured stacks */
   g_has_listeners = false;

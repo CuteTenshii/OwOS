@@ -12,6 +12,7 @@
 extern long long fake_now_ms;
 int js_timers_pump(void);
 int js_workers_pump(void);
+void msleep(unsigned ms);
 
 static void con_print(js_ctx *ctx, int level, const char *s, int len)
 {
@@ -267,17 +268,42 @@ static void test_offscreen_transfer(void)
   expect(canvas_by_id("xfer")->c->w == 8);
 }
 
-/* Workers run on their own threads and heaps, and a canvas lives in the page's, so it cannot be transferred
- * yet: posting one fails cleanly instead of handing the worker a dead object. */
+/* A transferred canvas is drawn on by the worker thread: it shares the page's surface, not its heap */
 static void test_offscreen_in_worker(void)
 {
   run_script(
       "var cv=document.createElement('canvas'); cv.id='wk'; cv.width=5; cv.height=2; document.body.appendChild(cv);\n"
-      "var w=new Worker('data:text/javascript,onmessage=function(e){ postMessage(1); };');\n"
-      "var off=cv.transferControlToOffscreen(), err='';\n"
-      "try{ w.postMessage({canvas:off},[off]); }catch(e){ err=e.name; }\n"
-      "expect(err==='DataCloneError', 'an OffscreenCanvas cannot be posted to a worker thread: '+err);\n"
-      "w.terminate();\n");
+      "var w=new Worker('data:text/javascript,onmessage=function(e){ var c=e.data.canvas.getContext(\"2d\"); "
+      "c.fillStyle=\"#0f0\"; c.fillRect(0,0,5,2); var o=new OffscreenCanvas(2,2); var d=c.getImageData(4,1,1,1).data; "
+      "postMessage(o.width+\"x\"+e.data.canvas.height+\":\"+d[1]); };'); window.reply=null;\n"
+      "w.onmessage=function(e){ window.reply=e.data };\n"
+      "var off=cv.transferControlToOffscreen(); w.postMessage({canvas:off},[off]);\n");
+  for (int i = 0; i < 600; i++) {
+    js_workers_pump();
+    js_value reply = js_get(g_ctx, js_obj_value(g_ctx->global), "reply");
+    if (reply.type == JV_STR)
+      break;
+    msleep(5);
+  }
+  run_script("expect(window.reply==='2x2:255', 'worker reply: '+window.reply);\n"
+             "w.terminate();\n");
+  expect(pixel("wk", 4, 1)[1] == 255);
+  /* a canvas the worker made itself: drawn on, read back, and turned into a Blob in the worker */
+  run_script("window.own=null; var w2=new Worker('data:text/javascript,var o=new OffscreenCanvas(3,3), "
+             "c=o.getContext(\"2d\"); "
+             "c.fillStyle=\"#f00\"; c.fillRect(0,0,3,3); var px=c.getImageData(1,1,1,1).data; "
+             "o.convertToBlob().then(function(b){ postMessage({px:px[0]+\",\"+px[3], big:b.size>8, type:b.type, blob:b "
+             "instanceof Blob}); });');\n"
+             "w2.onmessage=function(e){ window.own=e.data };\n");
+  for (int i = 0; i < 600; i++) {
+    js_workers_pump();
+    if (js_get(g_ctx, js_obj_value(g_ctx->global), "own").type == JV_OBJ)
+      break;
+    msleep(5);
+  }
+  run_script("expect(own && own.px==='255,255' && own.big && own.type==='image/png' && own.blob, 'worker-owned canvas: "
+             "'+JSON.stringify(own));\n"
+             "w2.terminate();\n");
 }
 
 static void test_composite_shadow_clip(void)

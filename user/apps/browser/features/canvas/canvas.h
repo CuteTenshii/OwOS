@@ -29,6 +29,8 @@ struct canvas_rec {
 struct canvas_rec *canvas_open(struct dom_node *el, void *owner);
 struct canvas_rec *canvas_find(const struct dom_node *el);
 struct canvas_rec *canvas_open_offscreen(int w, int h, void *owner);
+/* The record with this id, or NULL once it is gone */
+struct canvas_rec *canvas_find_id(int id);
 
 /* Width/height attributes of `el`, falling back to 300x150. */
 void canvas_attr_size(const struct dom_node *el, int *w, int *h);

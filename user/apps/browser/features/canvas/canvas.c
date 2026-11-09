@@ -57,17 +57,25 @@ void canvas_attr_size(const struct dom_node *el, int *w, int *h)
 
 struct canvas_rec *canvas_find(const struct dom_node *el)
 {
-  for (struct canvas_rec *r = g_recs; r; r = r->next)
+  struct canvas_rec *found = 0;
+  mutex_lock(&g_list_lock);
+  for (struct canvas_rec *r = g_recs; r && !found; r = r->next)
     if (r->el == el)
-      return r;
-  return 0;
+      found = r;
+  mutex_unlock(&g_list_lock);
+  return found;
 }
 
 static struct canvas_rec *add_rec(struct dom_node *el, int w, int h, void *owner)
 {
-  if (g_nrecs >= MAX_RECS)
+  struct canvas_rec *r;
+  mutex_lock(&g_list_lock);
+  if (g_nrecs >= MAX_RECS) {
+    mutex_unlock(&g_list_lock);
     return 0;
-  struct canvas_rec *r = calloc(1, sizeof *r);
+  }
+  mutex_unlock(&g_list_lock);
+  r = calloc(1, sizeof *r);
   if (!r)
     return 0;
   r->c = c2d_new(w, h);
@@ -78,8 +86,8 @@ static struct canvas_rec *add_rec(struct dom_node *el, int w, int h, void *owner
   attach_fonts(r->c);
   r->owner = owner;
   r->el = el;
-  r->id = ++g_next_id;
   mutex_lock(&g_list_lock);
+  r->id = ++g_next_id;
   r->next = g_recs;
   g_recs = r;
   g_nrecs++;
@@ -98,6 +106,17 @@ struct canvas_rec *canvas_open(struct dom_node *el, void *owner)
 }
 
 struct canvas_rec *canvas_open_offscreen(int w, int h, void *owner) { return add_rec(0, w, h, owner); }
+
+struct canvas_rec *canvas_find_id(int id)
+{
+  struct canvas_rec *found = 0;
+  mutex_lock(&g_list_lock);
+  for (struct canvas_rec *r = g_recs; r && !found; r = r->next)
+    if (r->id == id)
+      found = r;
+  mutex_unlock(&g_list_lock);
+  return found;
+}
 
 bool canvas_resize(struct canvas_rec *r, int w, int h)
 {

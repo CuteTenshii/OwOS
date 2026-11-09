@@ -6,6 +6,7 @@
  * waits for the answer. */
 
 #include "bindings.h"
+#include "canvasjs.h"
 #include "features/cors/cors.h"
 #include "fetchint.h"
 #include "mutex.h"
@@ -554,10 +555,17 @@ static int wt_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char 
   return 1;
 }
 
+static int wt_clone_write_any(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
+{
+  return wt_clone_write(ctx, v, kind, bytes, len, meta) || canvas_clone_write(ctx, v, kind, bytes, len, meta);
+}
+
 static js_value wt_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta)
 {
   js_value ctor = js_get(ctx, js_obj_value(ctx->global), "Blob"), args[2], parts, r;
   js_object *opts;
+  if (streq(kind, "ocanvas"))
+    return canvas_clone_read(ctx, kind, bytes, len);
   if (!streq(kind, "blob") || !js_is_callable(ctor))
     return js_undef();
   gc_push_scope();
@@ -978,10 +986,11 @@ static void wt_run(js_ctx *ctx, struct wthread *wt)
   ctx->now_ms = now_ms;
   ctx->can_block = 1;
   ctx->irq = &wt->irq;
-  ctx->clone_write_ext = wt_clone_write;
+  ctx->clone_write_ext = wt_clone_write_any;
   ctx->clone_read_ext = wt_clone_read;
   js_set_stack_limit(ctx, wt->stack_lo + WORKER_HEADROOM);
   wt_setup(ctx, wt);
+  canvas_js_setup_worker(ctx, ctx->global);
   if (!wt_run_parts(ctx, wt)) {
     wt_report(ctx);
     return;
@@ -1035,6 +1044,7 @@ static void worker_main(void *arg)
         free(ctx);
       }
     }
+    canvas_page_end(ctx);
     gc_heap_detach();
     gc_heap_free(heap);
   }

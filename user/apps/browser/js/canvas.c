@@ -7,7 +7,10 @@
 #include "font.h"
 #include "math.h"
 
-js_object *g_ctx2d_proto, *g_gradient_proto, *g_pattern_proto, *g_imagedata_proto, *g_offscreen_proto;
+__thread js_object *g_ctx2d_proto, *g_gradient_proto, *g_pattern_proto, *g_imagedata_proto, *g_offscreen_proto;
+
+/* Who owns the surfaces this thread creates: the page's document, or a worker's context */
+static __thread void *canvas_owner;
 
 #define MAX_IMAGEDATA_PIXELS (16 * 1024 * 1024)
 
@@ -1162,7 +1165,7 @@ static struct canvas_rec *canvas_rec_of(js_ctx *ctx, js_value t, bool create)
   }
   struct canvas_rec *r = canvas_find(n);
   if (!r && create) {
-    r = canvas_open(n, g_doc_root);
+    r = canvas_open(n, canvas_owner);
     if (!r)
       js_throw_range(ctx, "out of memory");
   }
@@ -1290,7 +1293,7 @@ static js_value png_blob(js_ctx *ctx, struct canvas_rec *r)
   unsigned char *png = c2d_encode_png(r->c, &len);
   if (!png)
     return js_null();
-  js_value b = make_blob(ctx, (const char *)png, len, "image/png");
+  js_value b = ctx->clone_read_ext ? ctx->clone_read_ext(ctx, "blob", png, len, "image/png") : js_null();
   free(png);
   return b;
 }
@@ -1335,7 +1338,7 @@ static js_value offscreen_ctor(js_ctx *ctx, js_value thisv, js_value *args, int 
   int w = js_to_int_sat(ctx, A(0)), h = js_to_int_sat(ctx, A(1));
   if (argc < 2 || w <= 0 || h <= 0)
     return js_throw_type(ctx, "Failed to construct 'OffscreenCanvas': width and height must be positive");
-  struct canvas_rec *r = canvas_open_offscreen(w, h, g_doc_root);
+  struct canvas_rec *r = canvas_open_offscreen(w, h, canvas_owner);
   if (!r)
     return js_throw_range(ctx, "OffscreenCanvas allocation failed");
   return make_host(ctx, g_offscreen_proto, HK_OFFSCREEN, r, 0, 0);
@@ -1410,7 +1413,7 @@ int source_pixels(js_ctx *ctx, js_value v, struct pixsrc *out)
   if (!n)
     return SRC_BAD_TYPE;
   if (streq(n->tag, "canvas")) {
-    struct canvas_rec *r = canvas_open(n, g_doc_root);
+    struct canvas_rec *r = canvas_open(n, canvas_owner);
     if (!r)
       return SRC_NOT_READY;
     out->rgba = r->c->px;
@@ -1459,9 +1462,8 @@ static js_object *canvas_element_proto(void)
   return 0;
 }
 
-void canvas_js_setup(js_ctx *ctx, js_object *win)
+static void canvas_setup_core(js_ctx *ctx, js_object *win)
 {
-  js_host_finalizer = host_finalize;
   js_object *cp = root_proto(ctx, &g_ctx2d_proto);
   root_proto(ctx, &g_gradient_proto);
   root_proto(ctx, &g_pattern_proto);
@@ -1559,7 +1561,13 @@ void canvas_js_setup(js_ctx *ctx, js_object *win)
   def_method(g_offscreen_proto, "transferToImageBitmap", offscreen_transfer_to_bitmap, 0);
   def_acc(g_offscreen_proto, "width", canvas_get_width, canvas_set_width);
   def_acc(g_offscreen_proto, "height", canvas_get_height, canvas_set_height);
+}
 
+void canvas_js_setup(js_ctx *ctx, js_object *win)
+{
+  js_host_finalizer = host_finalize;
+  canvas_owner = g_doc_root;
+  canvas_setup_core(ctx, win);
   js_object *ep = canvas_element_proto();
   if (ep) {
     def_method(ep, "getContext", canvas_get_context, 2);
@@ -1571,6 +1579,42 @@ void canvas_js_setup(js_ctx *ctx, js_object *win)
   }
   canvas_path_setup(ctx, win);
   canvas_img_setup(ctx, win);
+}
+
+void canvas_js_setup_worker(js_ctx *ctx, js_object *win)
+{
+  canvas_owner = ctx;
+  canvas_setup_core(ctx, win);
+  canvas_path_setup(ctx, win);
+}
+
+int canvas_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
+{
+  struct chost *oc = host_of(v, HK_OFFSCREEN);
+  struct canvas_rec *r;
+  (void)ctx;
+  (void)meta;
+  if (!oc)
+    return 0;
+  r = oc->p;
+  *bytes = malloc(sizeof r->id);
+  if (!*bytes)
+    return 0;
+  memcpy(*bytes, &r->id, sizeof r->id);
+  *len = (int)sizeof r->id;
+  strcpy(kind, "ocanvas");
+  return 1;
+}
+
+js_value canvas_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len)
+{
+  int id = 0;
+  struct canvas_rec *r;
+  if (!streq(kind, "ocanvas") || len != (int)sizeof id)
+    return js_undef();
+  memcpy(&id, bytes, sizeof id);
+  r = canvas_find_id(id);
+  return r ? make_host(ctx, g_offscreen_proto, HK_OFFSCREEN, r, 0, 0) : js_undef();
 }
 
 void canvas_js_teardown(void)

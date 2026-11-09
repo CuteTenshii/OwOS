@@ -13,7 +13,8 @@ struct chost {
   int w, h; /* HK_BITMAP: p is w*h*4 RGBA bytes */
 };
 
-extern js_object *g_path2d_proto, *g_imagedata_proto;
+/* The prototypes are per thread: the page and each worker that draws set up their own */
+extern __thread js_object *g_path2d_proto, *g_imagedata_proto;
 
 int js_nums(js_ctx *ctx, js_value *args, int argc, int n, float *out, const char *iface, const char *what);
 
@@ -44,6 +45,11 @@ void queue_native(js_ctx *ctx, js_native fn, js_value data);
 js_value js_illegal_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 
 void canvas_js_setup(js_ctx *ctx, js_object *win);
+/* The part of the canvas API a worker has: OffscreenCanvas, CanvasRenderingContext2D, ImageData, Path2D, ... */
+void canvas_js_setup_worker(js_ctx *ctx, js_object *win);
+/* Structured clone of an OffscreenCanvas: it travels as the id of its surface, which both threads then draw on */
+int canvas_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta);
+js_value canvas_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len);
 void canvas_js_teardown(void);
 
 #endif /* BROWSER_JS_CANVASJS_H */

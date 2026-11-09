@@ -4,7 +4,7 @@
 #include "canvasjs.h"
 #include "math.h"
 
-js_object *g_path2d_proto;
+__thread js_object *g_path2d_proto;
 
 #define PI_F 3.14159265f
 
