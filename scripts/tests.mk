@@ -60,7 +60,7 @@ EXTRA_net6        := -Idrivers/net
 IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams streamscore
-BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/storage.o $(B)/bind/impl/clienthints.o \
+BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/storage.o $(B)/bind/impl/indexeddb.o $(B)/bind/impl/persist.o $(B)/bind/impl/clienthints.o \
               $(B)/bind/impl/permissions.o $(B)/bind/impl/host.o $(B)/impl/test_runner.o
 
 MAIN_OBJS := $(MAIN_SUITES:%=$(B)/suite/%.o) $(IMPLS) $(MAIN_SRCS:%.c=$(B)/obj/%.o)
@@ -128,6 +128,10 @@ $(B)/bind/impl/jar.o: $(BROWSER)/features/jar/jar.c
 	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
 $(B)/bind/impl/storage.o: $(BROWSER)/features/storage/storage.c
 	$(call COMPILE,-include tests/bindings_host.h -DSTORAGE_DB='"$(RUN)/bind-localstorage.db"')
+$(B)/bind/impl/indexeddb.o: $(BROWSER)/features/indexeddb/indexeddb.c
+	$(call COMPILE,-include tests/bindings_host.h)
+$(B)/bind/impl/persist.o: $(BROWSER)/features/persist/persist.c
+	$(call COMPILE,-include tests/bindings_host.h -DPERSIST_PREFIX='"$(RUN)/bind-"')
 $(B)/bind/impl/clienthints.o: $(BROWSER)/features/clienthints/clienthints.c
 	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
 $(B)/bind/impl/permissions.o: $(BROWSER)/features/permissions/permissions.c

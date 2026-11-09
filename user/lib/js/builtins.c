@@ -9727,6 +9727,38 @@ js_clone *js_clone_write(js_ctx *ctx, js_value v, js_value transfer)
   return w.c;
 }
 
+/* A message that carries only bytes as a flat byte string, and back: for storing values on disk. Messages that
+ * hold SharedArrayBuffer stores, wasm objects, transferred buffers or transferred ports cannot be flattened. */
+int js_clone_serialize(const js_clone *c, unsigned char **out, int *len)
+{
+  if (!c || c->nsabs || c->nrefs || c->nmoved || c->nextra)
+    return -1;
+  *out = (unsigned char *)malloc((unsigned)(c->len ? c->len : 1));
+  if (!*out)
+    return -1;
+  memcpy(*out, c->buf, (unsigned)c->len);
+  *len = c->len;
+  return 0;
+}
+
+js_clone *js_clone_deserialize(const unsigned char *bytes, int len)
+{
+  js_clone *c;
+  if (len < 0 || (len && !bytes))
+    return NULL;
+  c = (js_clone *)calloc(1, sizeof *c);
+  if (!c)
+    return NULL;
+  c->buf = (unsigned char *)malloc((unsigned)(len ? len : 1));
+  if (!c->buf) {
+    free(c);
+    return NULL;
+  }
+  memcpy(c->buf, bytes, (unsigned)len);
+  c->len = c->cap = len;
+  return c;
+}
+
 /* Another copy of a message that carries only bytes and SharedArrayBuffer stores (no transferred buffers, no
  * wasm objects), so several threads can each read and free their own */
 js_clone *js_clone_dup(const js_clone *c)

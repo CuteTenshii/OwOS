@@ -169,8 +169,12 @@ typedef struct js_clone js_clone;
 js_clone *js_clone_write(js_ctx *ctx, js_value v, js_value transfer);
 js_value js_clone_read(js_ctx *ctx, const js_clone *c);
 void js_clone_free(js_clone *c);
-js_clone *
-js_clone_dup(const js_clone *c); /* a second copy, NULL when the message holds transferred buffers or wasm objects */
+/* a second copy, NULL when the message holds transferred buffers or wasm objects */
+js_clone *js_clone_dup(const js_clone *c);
+/* A message that holds only bytes as a flat byte string, and back, for keeping values on disk (-1: it holds more,
+ * such as SharedArrayBuffer stores or transferred objects). js_clone_read rejects malformed bytes. */
+int js_clone_serialize(const js_clone *c, unsigned char **out, int *len);
+js_clone *js_clone_deserialize(const unsigned char *bytes, int len);
 
 /* A fresh ArrayBuffer holding a copy of `data` (zeroed when NULL) */
 js_value js_new_arraybuffer(js_ctx *ctx, const void *data, int byte_length);

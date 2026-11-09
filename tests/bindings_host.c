@@ -276,12 +276,6 @@ int html_node_span(struct dom_node *n, int *s, int *e)
   return test_box_w > 0;
 }
 void js_cast_page_end(void) {}
-void js_idb_setup(js_ctx *c, js_object *w)
-{
-  (void)c;
-  (void)w;
-}
-void js_idb_teardown(void) {}
 unsigned msec(void)
 {
   static unsigned clock = 1000;

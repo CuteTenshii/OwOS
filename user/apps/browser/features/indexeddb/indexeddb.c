@@ -1,6 +1,7 @@
 /* js_indexeddb.c: in-memory, per-page IndexedDB driven cooperatively by js_idb_pump. */
 #include <stdbool.h>
 
+#include "features/persist/persist.h"
 #include "jsint.h"
 
 /* Records live in a per-store array sorted by key (number < date < string < binary < array).
@@ -23,6 +24,13 @@ static js_object *g_idb_proto[IDBP_N];
 static js_object *g_idb_dbs;     /* name -> dbrec (the page's databases; null-proto map) */
 static js_object *g_idb_pending; /* IDBRequests awaiting event delivery */
 static js_object *g_idb_txns;    /* live transactions, scanned for auto-commit/abort      */
+static char g_idb_path[160];     /* the origin's file; empty for an opaque origin or before the first use */
+static bool g_idb_loaded, g_idb_dirty;
+static unsigned g_idb_last_save;
+#define IDB_SAVE_MS 500 /* least gap between two writes of the file */
+
+static js_value idb_new_entry(js_value key, js_value value);
+static bool idb_txn_active(js_value txn);
 
 #define IDB_ISNAN(x) ((x) != (x))
 
@@ -324,11 +332,201 @@ static void idb_inject_key(js_ctx *ctx, js_value value, const char *path, js_val
   }
 }
 
-/* ---- database / store record access (the persistent-for-the-page store) ---
+/* ---- persistence: the origin's databases are one file, written after write transactions commit ---- */
+
+#define IDB_ALL (P_ENUMERABLE | P_WRITABLE | P_CONFIGURABLE)
+
+static void idb_clear_exc(void)
+{
+  g_ctx->has_exc = 0;
+  g_ctx->exc_root = 0;
+}
+
+/* The databases as plain objects and arrays, which structured clone can flatten */
+static js_value idb_export(void)
+{
+  js_object *root, *dbs;
+  int i;
+  gc_push_scope();
+  root = (js_object *)gc_keep(js_new_object(g_ctx, g_ctx->object_proto));
+  dbs = (js_object *)gc_keep(js_new_array(g_ctx, 0));
+  for (i = 0; g_idb_dbs && i < g_idb_dbs->props.n; i++) {
+    js_value dbrec, stores;
+    js_object *d, *sa;
+    int j;
+    if (!(g_idb_dbs->props.e[i].flags & P_ENUMERABLE))
+      continue;
+    dbrec = g_idb_dbs->props.e[i].value;
+    d = (js_object *)gc_keep(js_new_object(g_ctx, g_ctx->object_proto));
+    sa = (js_object *)gc_keep(js_new_array(g_ctx, 0));
+    js_def(d, "name", js_get(g_ctx, dbrec, "name"), IDB_ALL);
+    js_def(d, "version", js_get(g_ctx, dbrec, "version"), IDB_ALL);
+    stores = js_get(g_ctx, dbrec, "stores");
+    for (j = 0; stores.type == JV_OBJ && j < stores.u.obj->props.n; j++) {
+      js_value sr, recs, ixm;
+      js_object *so, *ra, *ia;
+      unsigned k, rn;
+      int m;
+      if (!(stores.u.obj->props.e[j].flags & P_ENUMERABLE))
+        continue;
+      sr = stores.u.obj->props.e[j].value;
+      so = (js_object *)gc_keep(js_new_object(g_ctx, g_ctx->object_proto));
+      ra = (js_object *)gc_keep(js_new_array(g_ctx, 0));
+      ia = (js_object *)gc_keep(js_new_array(g_ctx, 0));
+      js_def(so, "name", js_get(g_ctx, sr, "name"), IDB_ALL);
+      js_def(so, "keyPath", js_get(g_ctx, sr, "keyPath"), IDB_ALL);
+      js_def(so, "autoIncrement", js_get(g_ctx, sr, "autoIncrement"), IDB_ALL);
+      js_def(so, "keyGen", js_get(g_ctx, sr, "keyGen"), IDB_ALL);
+      recs = js_get(g_ctx, sr, "records");
+      rn = recs.type == JV_OBJ ? js_array_len(recs.u.obj) : 0;
+      for (k = 0; k < rn; k++) {
+        js_value e = js_get_index(g_ctx, recs, k);
+        js_array_push(g_ctx, ra, js_get(g_ctx, e, "key"));
+        js_array_push(g_ctx, ra, js_get(g_ctx, e, "value"));
+      }
+      js_def(so, "records", js_obj_value(ra), IDB_ALL);
+      ixm = js_get(g_ctx, sr, "indexes");
+      for (m = 0; ixm.type == JV_OBJ && m < ixm.u.obj->props.n; m++) {
+        js_value ir;
+        js_object *io;
+        if (!(ixm.u.obj->props.e[m].flags & P_ENUMERABLE))
+          continue;
+        ir = ixm.u.obj->props.e[m].value;
+        io = (js_object *)gc_keep(js_new_object(g_ctx, g_ctx->object_proto));
+        js_def(io, "name", js_get(g_ctx, ir, "name"), IDB_ALL);
+        js_def(io, "keyPath", js_get(g_ctx, ir, "keyPath"), IDB_ALL);
+        js_def(io, "unique", js_get(g_ctx, ir, "unique"), IDB_ALL);
+        js_def(io, "multiEntry", js_get(g_ctx, ir, "multiEntry"), IDB_ALL);
+        js_array_push(g_ctx, ia, js_obj_value(io));
+      }
+      js_def(so, "indexes", js_obj_value(ia), IDB_ALL);
+      js_array_push(g_ctx, sa, js_obj_value(so));
+    }
+    js_def(d, "stores", js_obj_value(sa), IDB_ALL);
+    js_array_push(g_ctx, dbs, js_obj_value(d));
+  }
+  js_def(root, "dbs", js_obj_value(dbs), IDB_ALL);
+  gc_pop_scope();
+  return js_obj_value(root);
+}
+
+/* Rebuilds the in-memory databases from what idb_export wrote */
+static void idb_import(js_value root)
+{
+  js_value dbs = root.type == JV_OBJ ? js_get(g_ctx, root, "dbs") : js_undef();
+  unsigned i, nd = dbs.type == JV_OBJ ? js_array_len(dbs.u.obj) : 0;
+  gc_push_scope();
+  for (i = 0; i < nd; i++) {
+    js_value d = js_get_index(g_ctx, dbs, i), name = js_get(g_ctx, d, "name"), sa = js_get(g_ctx, d, "stores");
+    js_object *dbrec, *stores;
+    unsigned j, ns = sa.type == JV_OBJ ? js_array_len(sa.u.obj) : 0;
+    if (name.type != JV_STR)
+      continue;
+    dbrec = (js_object *)gc_keep(js_new_object(g_ctx, 0));
+    stores = (js_object *)gc_keep(js_new_object(g_ctx, 0));
+    js_def(dbrec, "name", name, P_WRITABLE | P_ENUMERABLE);
+    js_def(dbrec, "version", js_get(g_ctx, d, "version"), P_WRITABLE | P_ENUMERABLE);
+    js_def(dbrec, "stores", js_obj_value(stores), P_WRITABLE | P_ENUMERABLE);
+    for (j = 0; j < ns; j++) {
+      js_value so = js_get_index(g_ctx, sa, j), sname = js_get(g_ctx, so, "name"), ra = js_get(g_ctx, so, "records");
+      js_value ia = js_get(g_ctx, so, "indexes");
+      js_object *sr, *recs, *imap;
+      unsigned k, nr = ra.type == JV_OBJ ? js_array_len(ra.u.obj) : 0,
+                  ni = ia.type == JV_OBJ ? js_array_len(ia.u.obj) : 0;
+      if (sname.type != JV_STR)
+        continue;
+      sr = (js_object *)gc_keep(js_new_object(g_ctx, 0));
+      recs = (js_object *)gc_keep(js_new_array(g_ctx, 0));
+      imap = (js_object *)gc_keep(js_new_object(g_ctx, 0));
+      js_def(sr, "name", sname, P_WRITABLE);
+      js_def(sr, "keyPath", js_get(g_ctx, so, "keyPath"), P_WRITABLE);
+      js_def(sr, "autoIncrement", js_get(g_ctx, so, "autoIncrement"), P_WRITABLE);
+      js_def(sr, "keyGen", js_get(g_ctx, so, "keyGen"), P_WRITABLE);
+      for (k = 0; k + 1 < nr; k += 2)
+        js_array_push(g_ctx, recs, idb_new_entry(js_get_index(g_ctx, ra, k), js_get_index(g_ctx, ra, k + 1)));
+      js_def(sr, "records", js_obj_value(recs), P_WRITABLE);
+      for (k = 0; k < ni; k++) {
+        js_value ix = js_get_index(g_ctx, ia, k), iname = js_get(g_ctx, ix, "name");
+        js_object *ir;
+        if (iname.type != JV_STR)
+          continue;
+        ir = (js_object *)gc_keep(js_new_object(g_ctx, 0));
+        js_def(ir, "name", iname, P_WRITABLE);
+        js_def(ir, "keyPath", js_get(g_ctx, ix, "keyPath"), P_WRITABLE);
+        js_def(ir, "unique", js_get(g_ctx, ix, "unique"), P_WRITABLE);
+        js_def(ir, "multiEntry", js_get(g_ctx, ix, "multiEntry"), P_WRITABLE);
+        js_set(g_ctx, js_obj_value(imap), iname.u.str->data, js_obj_value(ir));
+      }
+      js_def(sr, "indexes", js_obj_value(imap), P_WRITABLE);
+      js_set(g_ctx, js_obj_value(stores), sname.u.str->data, js_obj_value(sr));
+    }
+    js_set(g_ctx, js_obj_value(g_idb_dbs), name.u.str->data, js_obj_value(dbrec));
+  }
+  gc_pop_scope();
+}
+
+/* Reads the origin's file the first time the databases are touched */
+static void idb_ensure_loaded(void)
+{
+  unsigned char *bytes;
+  int n = 0;
+  if (g_idb_loaded || !g_idb_dbs)
+    return;
+  g_idb_loaded = true;
+  if (persist_path("idb", g_page_url_buf, g_idb_path, sizeof g_idb_path) != 0) {
+    g_idb_path[0] = 0;
+    return;
+  }
+  bytes = persist_read(g_idb_path, &n);
+  if (bytes) {
+    js_clone *c = js_clone_deserialize(bytes, n);
+    free(bytes);
+    if (c) {
+      gc_push_scope();
+      idb_import(js_clone_read(g_ctx, c));
+      js_clone_free(c);
+      gc_pop_scope();
+      idb_clear_exc();
+    }
+  }
+}
+
+static bool idb_any_active(void)
+{
+  unsigned i, n = g_idb_txns ? js_array_len(g_idb_txns) : 0;
+  for (i = 0; i < n; i++)
+    if (idb_txn_active(js_get_index(g_ctx, js_obj_value(g_idb_txns), i)))
+      return true;
+  return false;
+}
+
+/* Writes the databases when a write transaction changed them */
+static void idb_save(void)
+{
+  js_clone *c;
+  unsigned char *bytes;
+  int n;
+  if (!g_idb_dirty || !g_idb_path[0])
+    return;
+  gc_push_scope();
+  c = js_clone_write(g_ctx, idb_export(), js_undef());
+  gc_pop_scope();
+  idb_clear_exc();
+  g_idb_dirty = false;
+  g_idb_last_save = msec();
+  if (c && js_clone_serialize(c, &bytes, &n) == 0) {
+    persist_write(g_idb_path, bytes, n);
+    free(bytes);
+  }
+  js_clone_free(c);
+}
+
+/* ---- database / store record access ---
  */
 
 static js_value idb_dbrec(const char *name)
 {
+  idb_ensure_loaded();
   return g_idb_dbs ? js_get(g_ctx, js_obj_value(g_idb_dbs), name) : js_undef();
 }
 static js_value idb_storerec(js_value dbrec, const char *sname)
@@ -2025,8 +2223,9 @@ static js_value idb_factory_delete(js_ctx *ctx, js_value t, js_value *args, int 
   req = idb_make_request(js_null(), js_null(), 1);
   gc_push_scope();
   gc_keep(req);
-  if (g_idb_dbs)
-    js_delete(g_idb_dbs, name);
+  idb_ensure_loaded();
+  if (g_idb_dbs && js_delete(g_idb_dbs, name))
+    g_idb_dirty = true;
   js_set(ctx, js_obj_value(req), "@result", js_undef());
   js_set(ctx, js_obj_value(req), "@event", js_mk_cstring(ctx, "success"));
   idb_enqueue(req);
@@ -2042,6 +2241,7 @@ static js_value idb_factory_databases(js_ctx *ctx, js_value t, js_value *args, i
   (void)argc;
   gc_push_scope();
   arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  idb_ensure_loaded();
   if (g_idb_dbs) {
     int i;
     for (i = 0; i < g_idb_dbs->props.n; i++) {
@@ -2096,6 +2296,8 @@ int js_idb_pump(void)
   bool progress;
   if (!g_page_live || !g_ctx || !g_idb_pending)
     return 0;
+  if (g_idb_dirty && msec() - g_idb_last_save >= IDB_SAVE_MS && !idb_any_active())
+    idb_save();
   do {
     progress = false;
     while (js_array_len(g_idb_pending) > 0) { /* deliver requests, oldest first */
@@ -2179,6 +2381,8 @@ int js_idb_pump(void)
             if (db.type == JV_OBJ)
               js_set(g_ctx, db, "@vtxn", js_null());
           }
+          if (idb_txn_write(txn))
+            g_idb_dirty = true;
           ev = make_event("complete", 0, 0, js_undef());
           idb_fire(txn.u.obj, 0, 0, ev);
           fired++;
@@ -2319,6 +2523,17 @@ void js_idb_setup(js_ctx *ctx, js_object *win)
 void js_idb_teardown(void)
 {
   int i;
+  if (g_idb_dbs && g_ctx) { /* a page that goes away aborts what is still running, then keeps what committed */
+    unsigned k, n = g_idb_txns ? js_array_len(g_idb_txns) : 0;
+    for (k = 0; k < n; k++) {
+      js_value txn = js_get_index(g_ctx, js_obj_value(g_idb_txns), k);
+      if (idb_txn_active(txn))
+        idb_abort_txn(txn, js_undef());
+    }
+    idb_save();
+  }
+  g_idb_loaded = g_idb_dirty = false;
+  g_idb_path[0] = 0;
   for (i = 0; i < IDBP_N; i++) {
     gc_remove_root((void **)&g_idb_proto[i]);
     g_idb_proto[i] = 0;
