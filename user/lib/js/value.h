@@ -130,9 +130,16 @@ typedef struct {
 } pmap;
 
 struct js_string {
-  char *data; /* UTF-8 bytes, NUL-terminated, stored right after this header in the same collector cell */
-  int len;    /* byte length                                   */
+  char *data;     /* UTF-8 bytes, NUL-terminated, stored right after this header in the same collector cell */
+  int len;        /* byte length                                   */
+  unsigned flags; /* JS_STR_* */
 };
+
+/* A SHARED string's bytes live in a refcounted malloc buffer so `s += x` can
+ * grow it in place. Only the LIVE cell (held by one variable slot alone) may
+ * write past its end. */
+#define JS_STR_SHARED 1u
+#define JS_STR_LIVE 2u
 
 /* C function backing a native callable */
 typedef js_value (*js_native)(js_ctx *ctx, js_value thisv, js_value *args, int argc);
@@ -303,6 +310,7 @@ int js_same_string(js_string *a, js_string *b);
 
 /* small helpers shared with the interpreter / builtins */
 js_string *js_str_concat(js_ctx *ctx, js_string *a, js_string *b);
+js_string *js_str_append(js_ctx *ctx, js_string *a, js_string *b);
 double js_str_to_num(const char *s, int len);
 unsigned js_str_hash(const char *s, int len);
 

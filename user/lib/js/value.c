@@ -262,6 +262,18 @@ static void mark_pmap(pmap *m)
   }
 }
 
+typedef struct {
+  int refs;
+  int cap;
+} strbuf;
+
+static void strbuf_release(char *data)
+{
+  strbuf *b = (strbuf *)data - 1;
+  if (--b->refs == 0)
+    free(b);
+}
+
 static void trace(void *obj, int kind)
 {
   if (kind == GCK_STRING)
@@ -308,8 +320,12 @@ void (*js_wasm_finalizer)(js_object *o);
 
 static void finalize(void *obj, int kind)
 {
-  if (kind == GCK_STRING)
-    return; /* the bytes are part of the cell */
+  if (kind == GCK_STRING) {
+    js_string *s = (js_string *)obj;
+    if (s->flags & JS_STR_SHARED)
+      strbuf_release(s->data);
+    return;
+  }
   if (kind == GCK_ENV) {
     js_env *e = (js_env *)obj;
     pmap_free(&e->vars);
@@ -400,6 +416,7 @@ js_value js_mk_string(js_ctx *ctx, const char *s, int len)
   if (len > 0)
     memcpy(str->data, s ? s : "", (unsigned)len);
   str->len = len;
+  str->flags = 0;
   v.type = JV_STR;
   v.u.str = str;
   return v;
@@ -1328,9 +1345,62 @@ js_string *js_str_concat(js_ctx *ctx, js_string *a, js_string *b)
   memcpy(s->data + a->len, b->data, (unsigned)b->len);
   s->data[n] = 0;
   s->len = n;
+  s->flags = 0;
   gc_pop_scope();
   (void)ctx;
   return s;
+}
+
+/* a + b for a variable that holds `a` alone: grows a's buffer in place when
+ * possible. The result is LIVE, `a` is no longer. */
+js_string *js_str_append(js_ctx *ctx, js_string *a, js_string *b)
+{
+  int n = a->len + b->len;
+  js_string *s;
+  strbuf *buf;
+  if (b->len == 0)
+    return a;
+  if ((a->flags & (JS_STR_SHARED | JS_STR_LIVE)) == (JS_STR_SHARED | JS_STR_LIVE) && n < ((strbuf *)a->data - 1)->cap) {
+    buf = (strbuf *)a->data - 1;
+    gc_push_scope();
+    gc_keep(a);
+    gc_keep(b);
+    s = (js_string *)gc_alloc(sizeof(js_string), GCK_STRING);
+    gc_pop_scope();
+    memcpy(a->data + a->len, b->data, (unsigned)b->len);
+    a->data[n] = 0;
+    a->flags &= ~JS_STR_LIVE;
+    buf->refs++;
+    s->data = a->data;
+    s->len = n;
+    s->flags = JS_STR_SHARED | JS_STR_LIVE;
+    return s;
+  }
+  if (n < 256)
+    return js_str_concat(ctx, a, b);
+  {
+    int cap = n * 2 + 1;
+    gc_push_scope();
+    gc_keep(a);
+    gc_keep(b);
+    buf = (strbuf *)malloc(sizeof(strbuf) + (unsigned)cap);
+    if (!buf) {
+      gc_pop_scope();
+      return js_str_concat(ctx, a, b);
+    }
+    buf->refs = 1;
+    buf->cap = cap;
+    s = (js_string *)gc_alloc(sizeof(js_string), GCK_STRING);
+    gc_pop_scope();
+    s->data = (char *)(buf + 1);
+    memcpy(s->data, a->data, (unsigned)a->len);
+    memcpy(s->data + a->len, b->data, (unsigned)b->len);
+    s->data[n] = 0;
+    s->len = n;
+    s->flags = JS_STR_SHARED | JS_STR_LIVE;
+    gc_set_external(s, (unsigned)cap);
+    return s;
+  }
 }
 
 /* ------------------------------------------------------- coercions -------- */

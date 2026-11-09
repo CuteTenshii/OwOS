@@ -300,6 +300,36 @@ static void check_string_append(void)
              0));
 }
 
+static void check_string_append_aliasing(void)
+{
+  expect(
+      run("(function(){ var pad='', k; for (k=0;k<300;k++) pad+='p';\n"
+          "var sp=''; for (k=0;k<300;k++) sp+=' ';\n"
+          "var n=sp; n+='5'; var nt=n; n+='6'; var o0={}; o0[nt]=1; expect(Object.keys(o0)[0]===nt && nt.length===301, "
+          "'an aliased string stays NUL terminated: '+Object.keys(o0)[0].length);\n"
+          "var s=pad, t, u, w;\n"
+          "s+='a'; t=s; s+='b'; u=s; s+='c'; w=s;\n"
+          "expect(t===pad+'a' && u===pad+'ab' && w===pad+'abc', 'aliases keep their value: '+t.length+' '+u.length);\n"
+          "t+='X'; s+='d';\n"
+          "expect(t===pad+'aX' && s===pad+'abcd' && u===pad+'ab', 'diverging appends do not clobber each other');\n"
+          "var z=pad; z+='1'; z+=z; z+=2; z+=null; z=z+undefined; z+=true;\n"
+          "expect(z===pad+'1'+pad+'1'+'2nullundefinedtrue', 'self append and non-string operands');\n"
+          "var g=pad; g+='x'; var cap=function(){ return g; }; var got=cap(); g+='y';\n"
+          "expect(got===pad+'x' && g===pad+'xy' && cap()===pad+'xy', 'a closure read is not disturbed');\n"
+          "var o={v:pad}; var r=pad; r+='q'; o.v=r; r+='q'; expect(o.v===pad+'q' && r===pad+'qq', 'a stored value is "
+          "not disturbed');\n"
+          "function f(){ var a=pad; for (var i=0;i<5;i++) a+=i; a=a+'e'; return a; }\n"
+          "expect(f()===pad+'01234e' && f()===pad+'01234e', 'function locals');\n"
+          "var e=pad; e+='a'; var ev=eval('e+=\"b\"'); e+='c';\n"
+          "expect(ev===pad+'ab' && e===pad+'abc', 'a completion value is not disturbed');\n"
+          "const cc=pad; var threw=false; try { cc+='x'; } catch (x) { threw=true; } expect(threw && cc===pad, 'const "
+          "is not appended');\n"
+          "var h=pad; h+='a'; try { h+=(function(){ throw 1; })(); } catch (x) {} h+='b'; expect(h===pad+'ab', "
+          "'throwing operand');\n"
+          "var m=pad; m+='a'; m+=(m='Z'); expect(m===pad+'aZ', 'reassigned during operand'); })();\n",
+          0));
+}
+
 static void check_promise_chain_depth(void)
 {
   expect(run(
@@ -617,6 +647,7 @@ int main(void)
   test("Promise.all, allSettled, race and any with pending promises", check_promise_combinators);
   test("typed array set, slice and copy construction", check_typed_array_copy);
   test("long string appends and buffer garbage", check_string_append);
+  test("string appends in place keep aliases intact", check_string_append_aliasing);
   test("long promise chains do not recurse without bound", check_promise_chain_depth);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);

@@ -385,12 +385,20 @@ static pentry *resolve_ident(js_ctx *ctx, js_node *node, js_env **owner)
   return NULL;
 }
 
+/* A value leaving its variable slot can no longer be grown in place. */
+static js_value unlive(js_value v)
+{
+  if (v.type == JV_STR)
+    v.u.str->flags &= ~JS_STR_LIVE;
+  return v;
+}
+
 static js_value read_ident(js_ctx *ctx, js_node *node)
 {
   const char *name = node->u.str.s;
   pentry *pe = resolve_ident(ctx, node, NULL);
   if (pe)
-    return pe->value;
+    return unlive(pe->value);
   if (has_global(ctx, name))
     return js_get(ctx, js_obj_value(ctx->global), name);
   {
@@ -403,6 +411,8 @@ static js_value read_ident(js_ctx *ctx, js_node *node)
     return throw_ref(ctx, buf);
   }
 }
+
+static js_value apply_binop(js_ctx *ctx, int op, js_value l, js_value r);
 
 static void assign_ident(js_ctx *ctx, js_node *node, js_value val)
 {
@@ -2352,6 +2362,61 @@ static completion exec_var_decl(js_ctx *ctx, js_node *n)
   return cnorm();
 }
 
+/* `s += x` and `s = s + x` as a statement grow the variable's string in place.
+ * Returns 0 when the statement is not of that shape. */
+static int append_stmt(js_ctx *ctx, js_node *n, js_value *out)
+{
+  js_node *id, *rn;
+  js_env *owner = NULL;
+  pentry *pe;
+  js_string *old;
+  js_value rhs, res;
+  if (n->type != JS_ASSIGN)
+    return 0;
+  id = n->u.bin.left;
+  if (id->type != JS_IDENT)
+    return 0;
+  if (n->op == T_PLUS_EQ)
+    rn = n->u.bin.right;
+  else if (n->op == T_EQ && n->u.bin.right->type == JS_BINARY && n->u.bin.right->op == T_PLUS &&
+           n->u.bin.right->u.bin.left->type == JS_IDENT &&
+           strcmp(n->u.bin.right->u.bin.left->u.str.s, id->u.str.s) == 0)
+    rn = n->u.bin.right->u.bin.right;
+  else
+    return 0;
+  pe = resolve_ident(ctx, id, NULL);
+  if (!pe || !(pe->flags & P_WRITABLE) || pe->value.type != JV_STR)
+    return 0;
+  old = pe->value.u.str;
+  gc_push_scope();
+  gc_keep(old);
+  rhs = evaluate(ctx, rn);
+  if (ctx->has_exc) {
+    gc_pop_scope();
+    return 1;
+  }
+  KEEP(rhs);
+  if (rhs.type == JV_NUM || rhs.type == JV_BOOL || rhs.type == JV_UNDEF || rhs.type == JV_NULL)
+    rhs = js_to_string(ctx, rhs);
+  pe = resolve_ident(ctx, id, &owner);
+  if (rhs.type == JV_STR && pe && (pe->flags & P_WRITABLE) && pe->value.type == JV_STR && pe->value.u.str == old) {
+    res.type = JV_STR;
+    res.u.str = js_str_append(ctx, old, rhs.u.str);
+    pe->value = res;
+    gc_write_barrier(owner);
+  } else {
+    js_value ov;
+    ov.type = JV_STR;
+    ov.u.str = old;
+    res = unlive(apply_binop(ctx, T_PLUS, ov, rhs));
+    if (!ctx->has_exc)
+      assign_ident(ctx, id, res);
+  }
+  gc_pop_scope();
+  *out = res;
+  return 1;
+}
+
 static completion exec_block(js_ctx *ctx, js_node **items, int count)
 {
   js_env *saved = ctx->cur_env;
@@ -2414,8 +2479,11 @@ static completion exec_for(js_ctx *ctx, js_node *n, const char *label)
     c = exec_loop_body(ctx, n->u.forc.body, label, &brk);
     if (ctx->has_exc || c.kind != C_NORMAL || brk)
       break;
-    if (n->u.forc.update)
-      evaluate(ctx, n->u.forc.update);
+    if (n->u.forc.update) {
+      js_value ignored;
+      if (!append_stmt(ctx, n->u.forc.update, &ignored))
+        evaluate(ctx, n->u.forc.update);
+    }
   }
   ctx->cur_env = saved;
   gc_pop_scope();
@@ -2762,17 +2830,17 @@ static void export_decl_names(js_ctx *ctx, js_node *decl, js_object *exports)
       if (id->type == JS_IDENT) {
         pentry *pe = js_env_lookup(ctx->cur_env, id->u.str.s);
         if (pe)
-          js_def(exports, id->u.str.s, pe->value, P_ENUMERABLE | P_WRITABLE);
+          js_def(exports, id->u.str.s, unlive(pe->value), P_ENUMERABLE | P_WRITABLE);
       }
     }
   } else if (decl->type == JS_FUNC && decl->u.func.name) {
     pentry *pe = js_env_lookup(ctx->cur_env, decl->u.func.name);
     if (pe)
-      js_def(exports, decl->u.func.name, pe->value, P_ENUMERABLE | P_WRITABLE);
+      js_def(exports, decl->u.func.name, unlive(pe->value), P_ENUMERABLE | P_WRITABLE);
   } else if (decl->type == JS_CLASS && decl->u.cls.id) {
     pentry *pe = js_env_lookup(ctx->cur_env, decl->u.cls.id->u.str.s);
     if (pe)
-      js_def(exports, decl->u.cls.id->u.str.s, pe->value, P_ENUMERABLE | P_WRITABLE);
+      js_def(exports, decl->u.cls.id->u.str.s, unlive(pe->value), P_ENUMERABLE | P_WRITABLE);
   }
 }
 
@@ -2788,7 +2856,8 @@ static completion exec_stmt(js_ctx *ctx, js_node *n, const char *label)
   switch (n->type) {
   case JS_EXPR_STMT: {
     completion c = cnorm();
-    c.value = evaluate(ctx, n->u.one.arg);
+    if (!append_stmt(ctx, n->u.one.arg, &c.value))
+      c.value = evaluate(ctx, n->u.one.arg);
     return ctx->has_exc ? cnorm() : c;
   }
   case JS_VAR_DECL:
@@ -2809,7 +2878,7 @@ static completion exec_stmt(js_ctx *ctx, js_node *n, const char *label)
       if (fe && pmap_find_in_env(fe, n->u.func.name)) {
         pentry *bpe = js_env_lookup(ctx->cur_env, n->u.func.name);
         if (bpe)
-          js_env_define(fe, n->u.func.name, bpe->value, P_WRITABLE | P_ENUMERABLE);
+          js_env_define(fe, n->u.func.name, unlive(bpe->value), P_WRITABLE | P_ENUMERABLE);
       }
     }
     return cnorm();
@@ -2980,7 +3049,7 @@ static completion exec_stmt(js_ctx *ctx, js_node *n, const char *label)
       for (i = 0; i < n->u.exp.nnames; i++) {
         pentry *pe = js_env_lookup(ctx->cur_env, n->u.exp.names[i].imported);
         if (pe)
-          js_def(exp, n->u.exp.names[i].local, pe->value, P_ENUMERABLE | P_WRITABLE);
+          js_def(exp, n->u.exp.names[i].local, unlive(pe->value), P_ENUMERABLE | P_WRITABLE);
       }
     }
     return cnorm();
@@ -3692,7 +3761,7 @@ js_value js_builtin_eval(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   }
   hoist_functions(ctx, prog->u.list.items, prog->u.list.count);
   c = exec_list(ctx, prog->u.list.items, prog->u.list.count);
-  return ctx->has_exc ? js_undef() : c.value;
+  return ctx->has_exc ? js_undef() : unlive(c.value);
 }
 
 /* grow buffer used only to assemble the Function-constructor source */
@@ -3772,7 +3841,7 @@ js_value js_builtin_function(js_ctx *ctx, js_value thisv, js_value *args, int ar
   ctx->cur_env = ctx->global_env;
   {
     completion c = exec_list(ctx, prog->u.list.items, prog->u.list.count);
-    r = c.value;
+    r = unlive(c.value);
   }
   ctx->cur_env = saved;
   return ctx->has_exc ? js_undef() : r;
@@ -3796,7 +3865,7 @@ int js_run(js_ctx *ctx, js_node *program, js_value *result)
   if (ctx->has_exc)
     return -1;
   if (result)
-    *result = c.value;
+    *result = unlive(c.value);
   return 0;
 }
 
