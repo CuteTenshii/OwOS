@@ -92,7 +92,7 @@ $(B)/impl/netconn.o: $(LIB)/netconn/netconn.c
 	  -Dtls_verify_message=ncp_tls_verify_message -Dtls_close=ncp_tls_close -Dtls_peer_closed=ncp_tls_peer_closed)
 $(B)/impl/h3.o: $(LIB)/curl/h3.c
 	$(call COMPILE,-Dquic_connect=h3t_connect -Dquic_open=h3t_open -Dquic_send=h3t_send -Dquic_read=h3t_read \
-	  -Dquic_stream_done=h3t_done -Dquic_poll=h3t_poll -Dquic_peer_closed=h3t_peer_closed \
+	  -Dquic_stream_done=h3t_done -Dquic_next_uni=h3t_next_uni -Dquic_poll=h3t_poll -Dquic_peer_closed=h3t_peer_closed \
 	  -Dquic_streams_left=h3t_left -Dquic_idle_ms=h3t_idle -Dquic_close=h3t_close \
 	  -Dnc_idle_put=h3t_idle_put -Dnc_idle_take=h3t_idle_take)
 $(B)/impl/h2.o: $(LIB)/curl/h2.c

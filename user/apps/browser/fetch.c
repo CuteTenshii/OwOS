@@ -932,6 +932,7 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc
   B->cdisp_attach = 0;
   B->pg->raw_len = 0;
 
+  h3_push_init();
   h3_session *s = fresh ? 0 : h3_session_acquire(u->host, u->port);
   bool reused = s != 0;
   if (!s && h3_session_open(&s, u->host, u->port) != 0) {

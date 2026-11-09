@@ -1,4 +1,4 @@
-/* quic.h — a minimal QUIC v1 client (RFC 9000/9001) for libcurl's HTTP/3.
+/* quic.h — a minimal QUIC v1 client (RFC 9000/9001/9002) for libcurl's HTTP/3.
  *
  * Runs entirely in user space over a SK_UDP socket
  * (net_connect/net_send/net_recv): QUIC packet protection (AES-128-GCM payload
@@ -9,13 +9,15 @@
  *
  * Scope, on purpose (matching the rest of OwOS's pragmatic net stack): each
  * connection is a heap object, so several can run at once and one can carry
- * many requests. TLS_AES_128_GCM_SHA256 + x25519 only, the server certificate
- * is NOT verified, in-order/lossless delivery is assumed (true over SLIRP/QEMU;
- * a real packet gap truncates rather than retransmits), and only
- * client-initiated bidirectional streams are buffered for reading — server uni
- * streams (HTTP/3 control + QPACK) are consumed and discarded. Flow control: we
- * keep the server's connection window topped up; what we send obeys the limits
- * from its transport parameters.
+ * many requests. TLS_AES_128_GCM_SHA256 + x25519 only. The server certificate
+ * is verified for the host before the handshake completes. Lost packets are
+ * found by ACK ranges and timers and sent again; the receiver acknowledges
+ * what it accepted and drops data past a gap so the peer resends it. There is
+ * no congestion controller: at most 32 packets per space are in flight.
+ * Client-initiated bidirectional streams and server-initiated unidirectional
+ * ones (HTTP/3 control, QPACK and push streams) are buffered for reading.
+ * Flow control: we keep the server's connection window topped up; what we
+ * send obeys the limits from its transport parameters.
  *
  * The HTTP/3 + QPACK layer (h3.c) sits on top and drives this API. */
 #ifndef OWOS_LIBQUIC_H
@@ -53,6 +55,10 @@ int quic_send(quic *q, uint64_t sid, const void *data, uint32_t len, int fin);
  * *fin is non-NULL it is set to 1 once the peer's FIN for this stream has been
  * reached and all data drained. */
 int quic_read(quic *q, uint64_t sid, void *buf, uint32_t max, int *fin);
+
+/* A stream the server opened (HTTP/3 control and push streams) that has bytes to read or has ended; 0 if none.
+ * Read it with quic_read. */
+int quic_next_uni(quic *q, uint64_t *sid);
 
 /* Forget a finished stream so its slot can be reused. */
 void quic_stream_done(quic *q, uint64_t sid);

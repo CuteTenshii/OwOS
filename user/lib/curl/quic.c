@@ -107,7 +107,7 @@ struct space {
   uint32_t crd;   /* TLS-message read cursor              */
 };
 
-#define QS_MAX 24
+#define QS_MAX 28
 #define QS_BUF 4096
 struct qstream {
   int used;
@@ -165,6 +165,7 @@ struct quic {
   uint64_t peer_max_bidi;
   uint64_t peer_idle_ms;
   uint64_t next_bidi; /* index of the next client bidi stream to open */
+  uint16_t uni_seen;  /* server unidirectional streams (by index) that have been opened */
 
   uint8_t tx_out[2048], tx_pt[1600], tx_cf[1200], tx_sf[1200];
   uint8_t rx_dg[2048], rx_pt[2048];
@@ -259,7 +260,7 @@ static uint32_t build_tp(struct quic *Q, uint8_t *b)
       {0x06, 0x100000},  /* initial_max_stream_data_bidi_remote   */
       {0x07, 0x100000},  /* initial_max_stream_data_uni           */
       {0x08, 0},         /* initial_max_streams_bidi              */
-      {0x09, 3},         /* initial_max_streams_uni               */
+      {0x09, 16},        /* initial_max_streams_uni               */
       {0x0e, 3},         /* active_connection_id_limit            */
   };
   for (unsigned i = 0; i < sizeof ints / sizeof ints[0]; i++) {
@@ -582,6 +583,21 @@ static struct qstream *find_stream(struct quic *Q, uint64_t id)
   return 0;
 }
 
+static struct qstream *get_stream(struct quic *Q, uint64_t id);
+
+/* The slot of a stream the server opened (3, 7, 11, …), made on its first data; NULL once it was finished with. */
+static struct qstream *uni_stream(struct quic *Q, uint64_t id, int create)
+{
+  struct qstream *q = find_stream(Q, id);
+  uint64_t idx = (id - 3) / 4;
+  if (q || !create || idx >= 16 || (Q->uni_seen >> idx & 1))
+    return q;
+  q = get_stream(Q, id);
+  if (q)
+    Q->uni_seen = (uint16_t)(Q->uni_seen | 1u << idx);
+  return q;
+}
+
 static struct qstream *get_stream(struct quic *Q, uint64_t id)
 {
   for (int i = 0; i < QS_MAX; i++)
@@ -599,9 +615,13 @@ static struct qstream *get_stream(struct quic *Q, uint64_t id)
 
 static void stream_recv(struct quic *Q, uint64_t id, uint64_t off, const uint8_t *data, uint32_t n, int fin)
 {
-  if ((id & 0x03) != 0) /* not client-bidi: discard */
-    return;
-  struct qstream *q = find_stream(Q, id); /* a finished stream's late retransmission finds nothing: ignored */
+  struct qstream *q; /* a finished stream's late retransmission finds nothing: ignored */
+  if ((id & 0x03) == 0)
+    q = find_stream(Q, id);
+  else if ((id & 0x03) == 3)
+    q = uni_stream(Q, id, 1);
+  else
+    return; /* a stream we never open */
   if (!q)
     return;
   if (fin) {
@@ -989,7 +1009,14 @@ static int process_frames(struct quic *Q, int space, const uint8_t *p, uint32_t 
       if (o + slen > len)
         goto done;
       if (dry) {
-        struct qstream *q = (sid & 3) == 0 ? find_stream(Q, sid) : 0;
+        struct qstream *q = (sid & 3) == 0 ? find_stream(Q, sid) : (sid & 3) == 3 ? uni_stream(Q, sid, 0) : 0;
+        if (!q && (sid & 3) == 3 && sid < 3 + 4 * 16 && !(Q->uni_seen >> ((sid - 3) / 4) & 1)) {
+          int room = 0; /* a stream the server opens now: it starts at 0 and needs a slot */
+          for (int i = 0; i < QS_MAX; i++)
+            room |= !Q->qs[i].used;
+          if (soff > 0 || !room)
+            return 0;
+        }
         if (q) {
           if (soff > q->recv_off)
             return 0;
@@ -1620,6 +1647,18 @@ int quic_read(quic *Q, uint64_t sid, void *buf, uint32_t max, int *fin)
   if (fin)
     *fin = (q->fin && q->recv_off >= q->fin_off && q->r_pos == q->r_len) ? 1 : 0;
   return (int)n;
+}
+
+int quic_next_uni(quic *Q, uint64_t *sid)
+{
+  for (int i = 0; i < QS_MAX; i++) {
+    struct qstream *q = &Q->qs[i];
+    if (q->used && (q->id & 3) == 3 && (q->r_len > q->r_pos || (q->fin && q->recv_off >= q->fin_off))) {
+      *sid = q->id;
+      return 1;
+    }
+  }
+  return 0;
 }
 
 void quic_stream_done(quic *Q, uint64_t sid)

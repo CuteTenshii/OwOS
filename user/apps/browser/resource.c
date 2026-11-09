@@ -628,6 +628,34 @@ void h3_forget(const char *host)
   mutex_unlock(&g_h3_lock);
 }
 
+/* A response the server pushed over h3, kept in the HTTP cache for the fetch that will ask for it. Only a GET of
+ * the connection's own origin, with a 200, is taken. */
+static void on_h3_push(void *ctx, const char *conn_authority, const char *scheme, const char *authority,
+                       const char *path, const char *hdr, const unsigned char *body, int blen)
+{
+  (void)ctx;
+  if (!streq_ci(scheme, "https") || !streq_ci(authority, conn_authority) || path[0] != '/')
+    return;
+  char url[URL_MAX];
+  int n = 0;
+  sapp(url, &n, sizeof url, "https://");
+  sapp(url, &n, sizeof url, authority);
+  sapp(url, &n, sizeof url, path);
+  struct http_headers H;
+  http_headers_parse(&H, hdr);
+  const char *ct = http_headers_get(&H, "content-type");
+  if (H.status == 200 && blen > 0) {
+    char vh[VARY_HDRS_MAX];
+    vary_req_hdrs(url, ct && starts_ci(ct, "image/") ? IMG_ACCEPT : SUBRES_ACCEPT, 0, true, vh);
+    cache_store("GET", url, vh, 200, (long)rtc_epoch(), hdr, ct ? ct : "", body, blen);
+    struct net_log e = {"GET", url, 200, ct ? ct : "", blen, 0, hdr};
+    devtools_net_add(&e);
+  }
+  http_headers_free(&H);
+}
+
+void h3_push_init(void) { h3_set_push_handler(on_h3_push, 0); }
+
 /* Remember an origin whose response carries Alt-Svc: h3. */
 static void note_alt_svc(const char *host, const char *hdr)
 {
@@ -711,6 +739,7 @@ static unsigned char *h3_exchange(const struct purl *u, const char *method, cons
                                   bool fresh, bool *stale, bool *fallback)
 {
   *fallback = false;
+  h3_push_init();
   h3_session *s = fresh ? 0 : h3_session_acquire(u->host, u->port);
   bool reused = s != 0;
   if (!s && h3_session_open(&s, u->host, u->port) != 0) {
@@ -1804,6 +1833,7 @@ static bool h3_many(const struct purl *u, const char *accept, struct h2_fetch *r
   authority_of(u, auth, sizeof auth);
   xh[0] = '\0';
   req_hdrs(u, accept, &none, true, xh, sizeof xh);
+  h3_push_init();
   for (int attempt = 0;; attempt++) {
     h3_session *s = attempt ? 0 : h3_session_acquire(u->host, u->port);
     bool reused = s != 0;

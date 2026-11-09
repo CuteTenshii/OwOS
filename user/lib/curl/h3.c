@@ -383,9 +383,21 @@ static void enc_str(uint8_t *b, uint32_t *p, const char *s, int n)
 #define H3_ACC 4096 /* inbound bytes carried between reads: a partial frame header */
 #define H3_HB_MAX 16384
 
+struct h3;
+
+/* The request a server announced with PUSH_PROMISE. */
+struct promise {
+  int used;
+  uint64_t push_id;
+  char scheme[8], authority[256], path[1024];
+};
+
 /* One request stream's parser state and sinks. */
 struct h3stream {
+  struct h3 *H;
+  struct promise *pr; /* decoding a PUSH_PROMISE's request: its pseudo-headers go here */
   uint64_t sid;
+  int refused; /* the server's GOAWAY says it never processed this request */
   int done;    /* the response ended (FIN reached and drained)   */
   int aborted; /* a sink asked to stop                           */
   int bad;     /* the stream could not be decoded                */
@@ -404,12 +416,48 @@ struct h3stream {
   const struct h3_opts *opts;
 };
 
+#define H3_UNI_MAX 12
+#define H3_PUSH_MAX 8 /* push ids 0..7: the MAX_PUSH_ID we grant is 7 */
+#define H3_PUSH_BODY_MAX (1u << 20)
+
+/* A stream the server opened: its control stream (GOAWAY), QPACK streams (ignored) or a push. */
+struct h3uni {
+  uint64_t sid;
+  int type; /* -1 until the stream type is read; 0 control, 1 push, else ignored */
+  uint8_t acc[16];
+  int acclen; /* a varint being read */
+  int cstate; /* control: 0 frame type, 1 frame length, 2 payload */
+  uint64_t cftype, cfrem;
+  uint8_t pay[8];
+  int paylen;
+  int pushed; /* push: the push id has been read */
+  uint64_t push_id;
+  struct h3stream *ps; /* push: parser of the response */
+  char *phdr;
+  unsigned char *pbody;
+  int pblen, pbcap, too_big, complete;
+};
+
 struct h3 {
   quic *q;
   int broken; /* not safe for another request */
   int served;
+  int goaway;
+  uint64_t goaway_id;  /* requests on streams from here up were not processed */
+  char authority[264]; /* host[:port] this session is connected to */
+  struct promise prom[H3_PUSH_MAX];
+  struct h3uni *uni[H3_UNI_MAX];
   uint8_t rx[H3_ACC]; /* read buffer, off the small stack */
 };
+
+static h3_push_fn g_push_fn;
+static void *g_push_ctx;
+
+void h3_set_push_handler(h3_push_fn fn, void *ctx)
+{
+  g_push_ctx = ctx;
+  g_push_fn = fn;
+}
 
 static void hs_raw(struct h3stream *st, const char *p, int n)
 {
@@ -417,8 +465,26 @@ static void hs_raw(struct h3stream *st, const char *p, int n)
     st->hbuf[st->hlen++] = p[i];
 }
 
+static void copy_field(char *dst, int cap, const uint8_t *v, int vl)
+{
+  int n = vl < cap - 1 ? vl : cap - 1;
+  memcpy(dst, v, (unsigned)n);
+  dst[n] = '\0';
+}
+
 static void emit_field(struct h3stream *st, const uint8_t *name, int nl, const uint8_t *val, int vl)
 {
+  if (st->pr) { /* a PUSH_PROMISE: only the request's address matters */
+    if (nl == 10 && eq_ci_n(":authority", (const char *)name, 10))
+      copy_field(st->pr->authority, sizeof st->pr->authority, val, vl);
+    else if (nl == 5 && eq_ci_n(":path", (const char *)name, 5))
+      copy_field(st->pr->path, sizeof st->pr->path, val, vl);
+    else if (nl == 7 && eq_ci_n(":scheme", (const char *)name, 7))
+      copy_field(st->pr->scheme, sizeof st->pr->scheme, val, vl);
+    else if (nl == 7 && eq_ci_n(":method", (const char *)name, 7) && !(vl == 3 && memcmp(val, "GET", 3) == 0))
+      st->pr->used = -1; /* only GET may be pushed */
+    return;
+  }
   if (st->headers_done)
     return; /* trailers: not kept */
   if (nl == 7 && eq_ci_n(":status", (const char *)name, 7)) {
@@ -507,6 +573,33 @@ static void headers_frame(struct h3stream *st)
     st->aborted = 1;
 }
 
+/* A PUSH_PROMISE arrived: note which push id will carry which request. */
+static void promise_frame(struct h3stream *st)
+{
+  uint32_t o = 0;
+  uint64_t id;
+  if (!st->H || !g_push_fn || st->hblen < 1)
+    return; /* nobody asked for pushes */
+  int l = 1 << (st->hb[0] >> 6);
+  if ((uint32_t)l > st->hblen)
+    return;
+  id = st->hb[0] & 0x3f;
+  for (int i = 1; i < l; i++)
+    id = (id << 8) | st->hb[i];
+  o = (uint32_t)l;
+  if (id >= H3_PUSH_MAX)
+    return; /* beyond the MAX_PUSH_ID we granted */
+  struct promise p;
+  memset(&p, 0, sizeof p);
+  p.used = 1;
+  p.push_id = id;
+  st->pr = &p;
+  int rc = qpack_decode(st, st->hb + o, st->hblen - o);
+  st->pr = 0;
+  if (rc == 0 && p.used == 1 && p.authority[0] && p.path[0])
+    st->H->prom[id] = p;
+}
+
 /* ----------------------------------------------- response frame parser */
 
 static void acc_consume(struct h3stream *st, uint32_t k)
@@ -542,8 +635,8 @@ static void feed(struct h3stream *st, const uint8_t *data, uint32_t n)
       st->ftype = ty;
       st->frem = ln;
       st->state = 1;
-      if (ty == 0x01)
-        st->hblen = 0; /* HEADERS: start accumulating */
+      if (ty == 0x01 || ty == 0x05)
+        st->hblen = 0; /* HEADERS, PUSH_PROMISE: start accumulating */
       if (ln == 0 && ty == 0x01) {
         headers_frame(st);
         st->state = 0;
@@ -559,7 +652,7 @@ static void feed(struct h3stream *st, const uint8_t *data, uint32_t n)
       if (st->ftype == 0x00) { /* DATA -> body sink */
         if (st->body && take && st->body(st->bctx, st->acc, (int)take) != 0)
           st->aborted = 1;
-      } else if (st->ftype == 0x01) { /* HEADERS -> accumulate */
+      } else if (st->ftype == 0x01 || st->ftype == 0x05) { /* HEADERS, PUSH_PROMISE -> accumulate */
         uint32_t room = H3_HB_MAX - st->hblen;
         uint32_t cp = take < room ? take : room;
         memcpy(st->hb + st->hblen, st->acc, cp);
@@ -572,6 +665,8 @@ static void feed(struct h3stream *st, const uint8_t *data, uint32_t n)
       if (st->frem == 0) {
         if (st->ftype == 0x01 && !st->bad)
           headers_frame(st);
+        else if (st->ftype == 0x05 && !st->bad)
+          promise_frame(st);
         st->state = 0;
       }
     }
@@ -724,10 +819,222 @@ static int send_request(struct h3 *H, uint64_t sid, const char *method, const ch
   return rc;
 }
 
+/* ------------------------------------------------------- server streams */
+
+static void stream_setup(struct h3stream *st, uint64_t sid, char *hbuf, int hcap);
+
+static int uni_body(void *ctx, const unsigned char *p, int n)
+{
+  struct h3uni *u = ctx;
+  if (u->too_big)
+    return 0;
+  if ((unsigned)u->pblen + (unsigned)n > H3_PUSH_BODY_MAX) {
+    u->too_big = 1;
+    return 0;
+  }
+  if (u->pblen + n > u->pbcap) {
+    int nc = u->pbcap ? u->pbcap * 2 : 8192;
+    while (nc < u->pblen + n)
+      nc *= 2;
+    unsigned char *nb = realloc(u->pbody, (unsigned)nc);
+    if (!nb) {
+      u->too_big = 1;
+      return 0;
+    }
+    u->pbody = nb;
+    u->pbcap = nc;
+  }
+  memcpy(u->pbody + u->pblen, p, (unsigned)n);
+  u->pblen += n;
+  return 0;
+}
+
+static void uni_free(struct h3uni *u)
+{
+  if (u->ps) {
+    free(u->ps->hb);
+    free(u->ps);
+  }
+  free(u->phdr);
+  free(u->pbody);
+  free(u);
+}
+
+/* Read a varint from u->acc one byte at a time; 1 once it is complete (value in *v). */
+static int uni_varint(struct h3uni *u, uint8_t b, uint64_t *v)
+{
+  u->acc[u->acclen++] = b;
+  int need = 1 << (u->acc[0] >> 6);
+  if (u->acclen < need)
+    return 0;
+  uint64_t x = u->acc[0] & 0x3f;
+  for (int i = 1; i < need; i++)
+    x = (x << 8) | u->acc[i];
+  *v = x;
+  u->acclen = 0;
+  return 1;
+}
+
+static uint64_t varint_of(const uint8_t *p, int len)
+{
+  if (len < 1 || len < (1 << (p[0] >> 6)))
+    return 0;
+  uint64_t x = p[0] & 0x3f;
+  for (int i = 1; i < (1 << (p[0] >> 6)); i++)
+    x = (x << 8) | p[i];
+  return x;
+}
+
+/* Bytes of a server stream: the control stream's GOAWAY, or a pushed response. */
+static void uni_feed(struct h3 *H, struct h3uni *u, const uint8_t *d, uint32_t n)
+{
+  for (uint32_t i = 0; i < n; i++) {
+    uint64_t v;
+    if (u->type < 0) {
+      if (uni_varint(u, d[i], &v))
+        u->type = (int)v == 1 && !g_push_fn ? 99 : (int)v;
+    } else if (u->type == 0) { /* control: frames, of which only GOAWAY matters */
+      if (u->cstate == 0) {
+        if (uni_varint(u, d[i], &v)) {
+          u->cftype = v;
+          u->cstate = 1;
+        }
+      } else if (u->cstate == 1) {
+        if (uni_varint(u, d[i], &v)) {
+          u->cfrem = v;
+          u->paylen = 0;
+          u->cstate = u->cfrem ? 2 : 0;
+        }
+      } else {
+        if (u->cftype == 0x07 && u->paylen < (int)sizeof u->pay)
+          u->pay[u->paylen++] = d[i];
+        if (--u->cfrem == 0) {
+          if (u->cftype == 0x07) {
+            uint64_t id = varint_of(u->pay, u->paylen);
+            if (!H->goaway || id < H->goaway_id)
+              H->goaway_id = id;
+            H->goaway = 1;
+          }
+          u->cstate = 0;
+        }
+      }
+    } else if (u->type == 1) { /* push: the push id, then the response like any other */
+      if (!u->pushed) {
+        if (uni_varint(u, d[i], &v)) {
+          u->push_id = v;
+          u->pushed = 1;
+          u->ps = malloc(sizeof *u->ps);
+          u->phdr = malloc(8192);
+          if (!u->ps || !u->phdr) {
+            u->too_big = 1;
+            return;
+          }
+          stream_setup(u->ps, u->sid, u->phdr, 8192);
+          u->ps->body = uni_body;
+          u->ps->bctx = u;
+        }
+      } else {
+        feed(u->ps, d + i, n - i);
+        return;
+      }
+    } else {
+      return; /* QPACK streams: nothing we use */
+    }
+  }
+}
+
+/* A finished push that matches a promise goes to the handler. */
+static void push_deliver(struct h3 *H, struct h3uni *u)
+{
+  struct h3stream *ps = u->ps;
+  if (!ps || !u->complete || u->push_id >= H3_PUSH_MAX)
+    return;
+  struct promise *p = &H->prom[u->push_id];
+  if (!p->used || u->too_big || ps->bad || !ps->headers_done)
+    return;
+  if (g_push_fn)
+    g_push_fn(g_push_ctx, H->authority, p->scheme, p->authority, p->path, u->phdr, (const unsigned char *)u->pbody,
+              u->pblen);
+  p->used = 0;
+  u->ps->done = 2; /* delivered */
+}
+
+/* Pushes whose promise arrived after the push itself, and the ones that are complete: hand them over. */
+static void push_flush(struct h3 *H)
+{
+  for (int i = 0; i < H3_UNI_MAX; i++) {
+    struct h3uni *u = H->uni[i];
+    if (!u || u->type != 1 || !u->complete)
+      continue;
+    push_deliver(H, u);
+    if (u->ps && (u->ps->done == 2 || u->too_big || u->ps->bad)) {
+      uni_free(u);
+      H->uni[i] = 0;
+    }
+  }
+}
+
+/* Read what the server has sent on the streams it opened. */
+static void drain_uni(struct h3 *H)
+{
+  uint64_t sid;
+  while (quic_next_uni(H->q, &sid)) {
+    struct h3uni *u = 0;
+    int slot = -1;
+    for (int i = 0; i < H3_UNI_MAX; i++) {
+      if (H->uni[i] && H->uni[i]->sid == sid)
+        u = H->uni[i];
+      if (!H->uni[i] && slot < 0)
+        slot = i;
+    }
+    if (!u && slot >= 0) {
+      u = calloc(1, sizeof *u);
+      if (u) {
+        u->sid = sid;
+        u->type = -1;
+        H->uni[slot] = u;
+      }
+    }
+    int got, fin = 0;
+    while ((got = quic_read(H->q, sid, H->rx, H3_ACC, &fin)) > 0)
+      if (u)
+        uni_feed(H, u, H->rx, (uint32_t)got);
+    if (fin) {
+      if (u && u->type == 1 && u->pushed)
+        u->complete = 1;
+      quic_stream_done(H->q, sid);
+      if (u && u->type != 1) {
+        free(u);
+        for (int i = 0; i < H3_UNI_MAX; i++)
+          if (H->uni[i] == u)
+            H->uni[i] = 0;
+      }
+    } else if (got <= 0) {
+      break; /* nothing more to read right now */
+    }
+  }
+}
+
+/* Streams the server's GOAWAY left unprocessed will never be answered. */
+static void apply_goaway(struct h3 *H, struct h3stream **sts, int n)
+{
+  if (!H->goaway)
+    return;
+  for (int i = 0; i < n; i++) {
+    struct h3stream *st = sts[i];
+    if (st && !st->done && !st->bad && !st->aborted && st->sid >= H->goaway_id) {
+      st->refused = 1;
+      st->bad = 1;
+    }
+  }
+}
+
 /* Read what has arrived on every unfinished stream. */
 static void drain(struct h3 *H, struct h3stream **sts, int n)
 {
   uint8_t *tmp = H->rx;
+  drain_uni(H);
+  apply_goaway(H, sts, n);
   for (int i = 0; i < n; i++) {
     struct h3stream *st = sts[i];
     if (!st || st->done || st->aborted || st->bad)
@@ -789,9 +1096,23 @@ int h3_session_open(h3_session **out, const char *host, int port)
     free(H);
     return rc == QUIC_EINTR ? HTTP_EINTR : rc == QUIC_ERESOLVE ? HTTP_ERESOLVE : HTTP_ECONNECT;
   }
-  uint8_t ctrl[3] = {0x00, 0x04, 0x00};
+  int an = 0;
+  for (const char *c = host; *c && an < 250; c++)
+    H->authority[an++] = *c;
+  if (port != 443) {
+    char num[8];
+    int k = 0;
+    for (unsigned v = (unsigned)port; v; v /= 10)
+      num[k++] = (char)('0' + v % 10);
+    H->authority[an++] = ':';
+    while (k)
+      H->authority[an++] = num[--k];
+  }
+  H->authority[an] = '\0';
+  /* Control stream: type 0, empty SETTINGS, and (only when a handler wants them) MAX_PUSH_ID allowing 8 pushes. */
+  uint8_t ctrl[6] = {0x00, 0x04, 0x00, 0x0d, 0x01, H3_PUSH_MAX - 1};
   uint8_t enc[1] = {0x02}, dec[1] = {0x03};
-  quic_send(H->q, 2, ctrl, 3, 0);
+  quic_send(H->q, 2, ctrl, g_push_fn ? 6 : 3, 0);
   quic_send(H->q, 6, enc, 1, 0);
   quic_send(H->q, 10, dec, 1, 0);
   *out = H;
@@ -800,6 +1121,9 @@ int h3_session_open(h3_session **out, const char *host, int port)
 
 void h3_session_close(h3_session *H)
 {
+  for (int i = 0; i < H3_UNI_MAX; i++)
+    if (H->uni[i])
+      uni_free(H->uni[i]);
   quic_close(H->q);
   free(H);
 }
@@ -813,7 +1137,7 @@ int h3_session_run(h3_session *H, const char *authority, const char *method, con
   if (!method)
     method = "GET";
   uint64_t sid;
-  if (H->broken || quic_open(H->q, &sid) < 0) {
+  if (H->broken || quic_open(H->q, &sid) < 0 || (H->goaway && sid >= H->goaway_id)) {
     H->broken = 1;
     return HTTP_ESEND;
   }
@@ -824,6 +1148,7 @@ int h3_session_run(h3_session *H, const char *authority, const char *method, con
     return HTTP_ESEND;
   }
   stream_setup(st, sid, hdr, hdr ? hdrcap : 0);
+  st->H = H;
   st->body = body;
   st->bctx = ctx;
   st->opts = opts;
@@ -832,7 +1157,10 @@ int h3_session_run(h3_session *H, const char *authority, const char *method, con
     rc = HTTP_ESEND;
   else
     rc = pump(H, &st, 1, 0, 0);
-  if (rc == 0 && st->aborted)
+  push_flush(H);
+  if (st->refused)
+    rc = HTTP_ESEND; /* the server's GOAWAY: this request was never processed */
+  else if (rc == 0 && st->aborted)
     rc = HTTP_EABORT;
   else if (rc == 0 && st->bad)
     rc = HTTP_ENORESP;
@@ -935,6 +1263,11 @@ int h3_session_fetch_many(h3_session *H, const char *authority, const char *extr
       continue; /* no stream for this one: the caller retries it elsewhere */
     }
     stream_setup(m->st[i], sid, reqs[i].hdr, reqs[i].hdr ? reqs[i].hdrcap : 0);
+    m->st[i]->H = H;
+    if (H->goaway && sid >= H->goaway_id) { /* refused up front */
+      m->st[i]->refused = m->st[i]->bad = 1;
+      continue;
+    }
     sinks[i].m = m;
     sinks[i].i = i;
     m->st[i]->body = mx_body;
@@ -949,6 +1282,7 @@ int h3_session_fetch_many(h3_session *H, const char *authority, const char *extr
   }
   if (sent && rc == 0)
     rc = pump(H, m->st, nreq, mx_finished, m);
+  push_flush(H);
   for (int i = 0; i < nreq; i++) {
     struct h3stream *st = m->st[i];
     int ok = st && st->done && !st->bad && !st->aborted;
@@ -989,7 +1323,7 @@ int h3_session_fetch_many(h3_session *H, const char *authority, const char *extr
 int h3_session_reusable(const h3_session *H)
 {
   unsigned idle = quic_idle_ms(H->q);
-  return !H->broken && quic_streams_left(H->q) > 1 && (idle == 0 || idle >= 20000);
+  return !H->broken && !H->goaway && quic_streams_left(H->q) > 1 && (idle == 0 || idle >= 20000);
 }
 
 static void h3_session_destroy(void *s) { h3_session_close(s); }

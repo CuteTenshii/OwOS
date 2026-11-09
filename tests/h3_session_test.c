@@ -21,14 +21,15 @@ struct fstream {
   uint8_t req[8192];
   int req_len;
   uint8_t resp[16384];
-  int resp_len, vis, rd;
+  int resp_len, vis, rd, fin;
 };
 static struct fstream g_str[32];
 
-enum { MODE_PLAIN, MODE_INTERIM, MODE_LONG };
+enum { MODE_PLAIN, MODE_INTERIM, MODE_LONG, MODE_PUSH };
 static int g_mode, g_connects, g_closes, g_dead, g_send_rc, g_peer_closed, g_streams;
 static uint64_t g_next;
-static int g_done_calls;
+static int g_done_calls, g_pushes;
+static char g_push_conn[64], g_push_auth[64], g_push_path[64], g_push_body[64];
 
 static struct fstream *fs_get(uint64_t sid)
 {
@@ -48,6 +49,8 @@ static struct fstream *fs_get(uint64_t sid)
 static void reset(void)
 {
   memset(g_str, 0, sizeof g_str);
+  g_pushes = 0;
+  h3_set_push_handler(0, 0);
   g_mode = g_connects = g_closes = g_dead = g_send_rc = g_peer_closed = g_done_calls = 0;
   g_streams = 100;
   g_next = 0;
@@ -99,6 +102,11 @@ static void respond(struct fstream *fs)
 {
   uint8_t hb[4096];
   int n;
+  if (g_mode == MODE_PUSH) { /* PUSH_PROMISE 0 for GET https://example.com/app.css, ahead of the page */
+    static const uint8_t pp[] = {0x00, 0x00, 0x00, 0xd1, 0xd7, 0x50, 11,  'e', 'x', 'a', 'm', 'p', 'l', 'e',
+                                 '.',  'c',  'o',  'm',  0x51, 8,    '/', 'a', 'p', 'p', '.', 'c', 's', 's'};
+    frame(fs, 5, pp, sizeof pp);
+  }
   if (g_mode == MODE_INTERIM) {
     n = 0;
     hb[n++] = 0, hb[n++] = 0;
@@ -123,6 +131,16 @@ static void respond(struct fstream *fs)
   char body[16];
   int bl = snprintf(body, sizeof body, "body%llu", (unsigned long long)fs->sid);
   frame(fs, 0, (const uint8_t *)body, bl);
+  fs->fin = 1;
+}
+
+/* Bytes the server writes on a stream it opened. */
+static void uni_write(uint64_t sid, const void *data, int len, int fin)
+{
+  struct fstream *fs = fs_get(sid);
+  memcpy(fs->resp + fs->resp_len, data, (size_t)len);
+  fs->resp_len += len;
+  fs->fin |= fin;
 }
 
 int h3t_connect(quic **out, const char *host, uint16_t port, const char *alpn)
@@ -130,6 +148,8 @@ int h3t_connect(quic **out, const char *host, uint16_t port, const char *alpn)
   (void)host, (void)port, (void)alpn;
   g_connects++;
   *out = &g_q;
+  static const uint8_t control[3] = {0x00, 0x04, 0x00}; /* the server's control stream: type, empty SETTINGS */
+  uni_write(3, control, 3, 0);
   return QUIC_OK;
 }
 
@@ -163,6 +183,13 @@ int h3t_poll(quic *q)
     return QUIC_ECLOSED;
   for (int i = 0; i < 32; i++) {
     struct fstream *fs = &g_str[i];
+    if (fs->used && (fs->sid & 3) == 3 && fs->vis < fs->resp_len) {
+      fs->vis = fs->resp_len; /* the server's own streams arrive whole */
+      return 1;
+    }
+  }
+  for (int i = 0; i < 32; i++) {
+    struct fstream *fs = &g_str[i];
     if (fs->used && fs->vis < fs->resp_len) {
       fs->vis += fs->resp_len - fs->vis < 7 ? fs->resp_len - fs->vis : 7; /* dribble: frames straddle reads */
       return 1;
@@ -181,14 +208,34 @@ int h3t_read(quic *q, uint64_t sid, void *buf, uint32_t max, int *fin)
   memcpy(buf, fs->resp + fs->rd, (size_t)n);
   fs->rd += n;
   if (fin)
-    *fin = fs->resp_len > 0 && fs->rd == fs->resp_len;
+    *fin = fs->fin && fs->rd == fs->resp_len;
   return n;
+}
+
+int h3t_next_uni(quic *q, uint64_t *sid)
+{
+  (void)q;
+  for (int i = 0; i < 32; i++) {
+    struct fstream *fs = &g_str[i];
+    if (fs->used && (fs->sid & 3) == 3 && fs->vis > fs->rd) {
+      *sid = fs->sid;
+      return 1;
+    }
+    if (fs->used && (fs->sid & 3) == 3 && fs->fin && fs->vis == fs->resp_len && fs->rd == fs->resp_len &&
+        fs->resp_len > 0) {
+      *sid = fs->sid;
+      return 1;
+    }
+  }
+  return 0;
 }
 
 void h3t_done(quic *q, uint64_t sid)
 {
-  (void)q, (void)sid;
+  (void)q;
   g_done_calls++;
+  if ((sid & 3) == 3) /* a finished server stream's slot is gone */
+    fs_get(sid)->used = 0;
 }
 
 int h3t_peer_closed(quic *q) { return (void)q, g_peer_closed; }
@@ -448,6 +495,144 @@ static void parked_session_reports_a_hung_up_peer(void)
   h3_session_close(s);
 }
 
+static int put_frame(uint8_t *p, int type, const uint8_t *pay, int len)
+{
+  p[0] = (uint8_t)type;
+  p[1] = (uint8_t)len;
+  memcpy(p + 2, pay, (size_t)len);
+  return 2 + len;
+}
+
+static void goaway_stops_the_session_and_refuses_unprocessed_requests(void)
+{
+  reset();
+  h3_session *s;
+  expect_eq(h3_session_open(&s, "example.com", 443), 0);
+  struct sink k;
+  char hdr[256];
+  expect_eq(get(s, "/a", &k, hdr, sizeof hdr), 200); /* stream 0, before any GOAWAY */
+  const uint8_t goaway4[3] = {0x07, 0x01, 0x04};     /* streams from 4 up are not processed */
+  uni_write(3, goaway4, 3, 0);
+  g_idle_obj = 0;
+  h3_session_release(s, "example.com", 443); /* this one still served its request, but is not worth keeping */
+  expect_eq(g_closes, 0);                    /* the GOAWAY has not been read yet: parked */
+  expect(g_idle_obj == s);
+
+  s = h3_session_acquire("example.com", 443);
+  expect_eq(get(s, "/b", &k, hdr, sizeof hdr), HTTP_ESEND); /* stream 4: the GOAWAY arrives, it is refused */
+  g_idle_obj = 0;
+  h3_session_release(s, "example.com", 443);
+  expect(g_idle_obj == 0); /* closed, not parked */
+  expect_eq(g_closes, 1);
+}
+
+static void a_goaway_with_room_lets_earlier_requests_finish(void)
+{
+  reset();
+  h3_session *s;
+  expect_eq(h3_session_open(&s, "example.com", 443), 0);
+  const uint8_t goaway8[3] = {0x07, 0x01, 0x08};
+  uni_write(3, goaway8, 3, 0);
+  struct sink k;
+  char hdr[256];
+  expect_eq(get(s, "/a", &k, hdr, sizeof hdr), 200); /* stream 0 < 8: served */
+  expect_string(k.buf, "body0");
+  g_idle_obj = 0;
+  h3_session_release(s, "example.com", 443);
+  expect(g_idle_obj == 0); /* but the session takes no more */
+  expect_eq(g_closes, 1);
+}
+
+static void on_push(void *ctx, const char *conn, const char *scheme, const char *authority, const char *path,
+                    const char *hdr, const unsigned char *body, int blen)
+{
+  (void)ctx, (void)scheme, (void)hdr;
+  g_pushes++;
+  snprintf(g_push_conn, sizeof g_push_conn, "%s", conn);
+  snprintf(g_push_auth, sizeof g_push_auth, "%s", authority);
+  snprintf(g_push_path, sizeof g_push_path, "%s", path);
+  snprintf(g_push_body, sizeof g_push_body, "%.*s", blen, (const char *)body);
+}
+
+/* PUSH_PROMISE payload for push id `id`: GET https://example.com<path>. */
+static int promise(uint8_t *out, uint8_t id, const char *path)
+{
+  uint8_t pay[128];
+  int n = 0;
+  pay[n++] = id;
+  pay[n++] = 0, pay[n++] = 0; /* QPACK prefix */
+  pay[n++] = 0xc0 | 17;       /* :method GET */
+  pay[n++] = 0xc0 | 23;       /* :scheme https */
+  pay[n++] = 0x50;            /* :authority, literal value */
+  pay[n++] = 11;
+  memcpy(pay + n, "example.com", 11);
+  n += 11;
+  pay[n++] = 0x51; /* :path */
+  pay[n++] = (uint8_t)strlen(path);
+  memcpy(pay + n, path, strlen(path));
+  n += (int)strlen(path);
+  return put_frame(out, 0x05, pay, n);
+}
+
+/* A push stream: type 1, push id, a 200 response with `body`. */
+static int push_stream(uint8_t *out, uint8_t id, const char *body)
+{
+  uint8_t hb[16], n = 0;
+  hb[n++] = 0, hb[n++] = 0, hb[n++] = 0xc0 | 25;
+  int o = 0;
+  out[o++] = 0x01;
+  out[o++] = id;
+  o += put_frame(out + o, 0x01, hb, n);
+  o += put_frame(out + o, 0x00, (const uint8_t *)body, (int)strlen(body));
+  return o;
+}
+
+static void promised_pushes_reach_the_handler(void)
+{
+  reset();
+  h3_set_push_handler(on_push, 0);
+  g_mode = MODE_PUSH;
+  h3_session *s;
+  expect_eq(h3_session_open(&s, "example.com", 443), 0);
+  struct fstream *ctrl = fs_get(2);
+  expect_eq(ctrl->req_len, 6); /* MAX_PUSH_ID follows SETTINGS */
+  expect_eq(ctrl->req[3], 0x0d);
+  expect_eq(ctrl->req[5], 7);
+
+  uint8_t buf[256];
+  int n = push_stream(buf, 0, "pushed-css");
+  uni_write(7, buf, n, 1);
+  n = push_stream(buf, 1, "never promised"); /* push 1 has no promise */
+  uni_write(11, buf, n, 1);
+  struct sink k;
+  char hdr[256];
+  expect_eq(get(s, "/", &k, hdr, sizeof hdr), 200);
+  expect_string(k.buf, "body0");
+  expect_eq(g_pushes, 1);
+  expect_string(g_push_conn, "example.com");
+  expect_string(g_push_auth, "example.com");
+  expect_string(g_push_path, "/app.css");
+  expect_string(g_push_body, "pushed-css");
+  h3_session_close(s);
+}
+
+static void pushes_are_not_invited_without_a_handler(void)
+{
+  reset();
+  g_mode = MODE_PUSH;
+  h3_session *s;
+  expect_eq(h3_session_open(&s, "example.com", 443), 0);
+  expect_eq(fs_get(2)->req_len, 3);
+  uint8_t buf[256];
+  int n = push_stream(buf, 0, "unasked");
+  uni_write(7, buf, n, 1);
+  struct sink k;
+  char hdr[256];
+  expect_eq(get(s, "/", &k, hdr, sizeof hdr), 200);
+  expect_eq(g_pushes, 0);
+  h3_session_close(s);
+}
+
 int main(void)
 {
   test("reuse_keeps_the_connection", reuse_keeps_the_connection);
@@ -459,5 +644,10 @@ int main(void)
   test("stream_limit_retires_the_session", stream_limit_retires_the_session);
   test("a_body_over_the_server_limit_fails_to_send", a_body_over_the_server_limit_fails_to_send);
   test("parked_session_reports_a_hung_up_peer", parked_session_reports_a_hung_up_peer);
+  test("goaway_stops_the_session_and_refuses_unprocessed_requests",
+       goaway_stops_the_session_and_refuses_unprocessed_requests);
+  test("a_goaway_with_room_lets_earlier_requests_finish", a_goaway_with_room_lets_earlier_requests_finish);
+  test("promised_pushes_reach_the_handler", promised_pushes_reach_the_handler);
+  test("pushes_are_not_invited_without_a_handler", pushes_are_not_invited_without_a_handler);
   return 0;
 }

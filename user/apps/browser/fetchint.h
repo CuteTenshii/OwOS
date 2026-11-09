@@ -23,6 +23,8 @@ void css_batch(char *const *urls, int n, unsigned char **bodies, int *lens);
 bool h3_known(const char *host);
 void h3_remember(const char *host);
 void h3_forget(const char *host);
+/* Keep what a server pushes over h3 in the HTTP cache; call before opening an h3 session. */
+void h3_push_init(void);
 
 /* An h2 session to u (idle, or a new connection whose ALPN selected h2); else NULL with the HTTP/1.1 connection in
  * *plain, or NULL there too if the connection failed. `fresh` skips the idle pool. */
