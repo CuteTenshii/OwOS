@@ -496,7 +496,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_FILE("/bin/notify-send", _binary_app_notifysend, 0755);
     INSTALL_APP(trayd);
   }
-  con_write("usermode: ready ('run curl <url>').\n");
+  con_write("usermode: ready ('curl <url>').\n");
 
   timer_init();
   wallclock_init();

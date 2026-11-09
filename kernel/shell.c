@@ -382,59 +382,38 @@ static void wait_reap(int pid)
   con_printf("[pid %u exited, status %u]\n", (uint32_t)pid, (uint32_t)status);
 }
 
-static void cmd_run(char *args)
+/* Run the pipeline "a | b" (bar points at the '|' in cmd): a's stdout feeds b's stdin through a kernel pipe. */
+static void run_pipeline(char *cmd, char *bar)
 {
-  /* A pipeline "a | b" wires a's stdout to b's stdin through a kernel pipe. */
-  char *bar = args;
-  while (*bar && *bar != '|')
-    bar++;
-
-  if (*bar == '|') {
-    *bar = '\0';
-    char *lhs = args, *rhs = bar + 1;
-    char *av1[8], *av2[8];
-    int ac1 = tokenize(lhs, av1, 8);
-    int ac2 = tokenize(rhs, av2, 8);
-    if (ac1 == 0 || ac2 == 0) {
-      con_write("usage: run <a> | <b>\n");
-      return;
-    }
-    int id = pipe_alloc();
-    if (id < 0) {
-      con_write("out of pipes\n");
-      return;
-    }
-    /* Set both up before either can be scheduled. */
-    __asm__ volatile("cli");
-    int p1 = spawn(ac1, av1);
-    int p2 = spawn(ac2, av2);
-    if (p1 >= 0)
-      sched_set_pipe_fd(p1, 1, 1, id); /* a's stdout -> pipe write */
-    if (p2 >= 0)
-      sched_set_pipe_fd(p2, 0, 0, id); /* b's stdin -> pipe read */
-    __asm__ volatile("sti");
-
-    if (p1 < 0 || p2 < 0) {
-      con_write("pipeline: bad program\n");
-      return;
-    }
-    wait_reap(p1);
-    wait_reap(p2);
+  char *av1[8], *av2[8];
+  *bar = '\0';
+  int ac1 = tokenize(cmd, av1, 8);
+  int ac2 = tokenize(bar + 1, av2, 8);
+  if (ac1 == 0 || ac2 == 0) {
+    con_write("usage: <a> | <b>\n");
     return;
   }
+  int id = pipe_alloc();
+  if (id < 0) {
+    con_write("out of pipes\n");
+    return;
+  }
+  /* Set both up before either can be scheduled. */
+  __asm__ volatile("cli");
+  int p1 = spawn(ac1, av1);
+  int p2 = spawn(ac2, av2);
+  if (p1 >= 0)
+    sched_set_pipe_fd(p1, 1, 1, id); /* a's stdout -> pipe write */
+  if (p2 >= 0)
+    sched_set_pipe_fd(p2, 0, 0, id); /* b's stdin -> pipe read */
+  __asm__ volatile("sti");
 
-  char *argv[8];
-  int argc = tokenize(args, argv, 8);
-  if (argc == 0) {
-    con_write("usage: run <file> [args]\n");
+  if (p1 < 0 || p2 < 0) {
+    con_write("pipeline: bad program\n");
     return;
   }
-  int pid = spawn(argc, argv);
-  if (pid < 0) {
-    con_write("no such file / not a valid program\n");
-    return;
-  }
-  wait_reap(pid);
+  wait_reap(p1);
+  wait_reap(p2);
 }
 
 /* Options given to the running built-in, one bit per letter (see flag()). */
@@ -1161,7 +1140,7 @@ static void run(char *cmd)
       }
       rname[rn] = '\0';
       if (!builtin_find(rname)) { /* B is a program: real pipe */
-        cmd_run(cmd);             /* splits on '|', spawns both */
+        run_pipeline(cmd, bar);
         return;
       }
       *bar = '\0';
