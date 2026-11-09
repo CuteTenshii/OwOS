@@ -201,9 +201,9 @@ js_value ce_define(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (!js_is_callable(cls))
     return js_throw_type(ctx, "customElements.define: the constructor is not a function");
   if (!ce_valid_name(name))
-    return js_throw_error(ctx, ctx->error_proto, "SyntaxError", "customElements.define: invalid custom element name");
+    return dom_throw(ctx, "SyntaxError", "customElements.define: invalid custom element name");
   if (pmap_find_pub(g_custom_elements, name))
-    return js_throw_error(ctx, ctx->error_proto, "NotSupportedError", "customElements.define: name already defined");
+    return dom_throw(ctx, "NotSupportedError", "customElements.define: name already defined");
   js_def(g_custom_elements, name, cls, 0);
   if (g_doc_root)
     ce_upgrade_tree(g_doc_root, name, cls);
@@ -253,7 +253,7 @@ js_value ce_when_defined(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (pe)
     return js_promise_resolved(ctx, pe->value);
   if (!ce_valid_name(name))
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "SyntaxError", "invalid custom element name"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "SyntaxError", "invalid custom element name"));
   snprintf(key, sizeof key, "@wait:%s", name);
   pe = pmap_find_pub(g_custom_elements, key);
   gc_push_scope();

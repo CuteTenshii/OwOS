@@ -392,7 +392,7 @@ static js_value rp_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
     }
   }
   if (!have)
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotFoundError", "No available Cast devices"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "NotFoundError", "No available Cast devices"));
 
   if (g_cast) {
     cast_session *d = g_cast;
@@ -406,8 +406,7 @@ static js_value rp_prompt(js_ctx *ctx, js_value t, js_value *args, int argc)
   {
     cast_session *s = cast_connect(&dev, 10000);
     if (!s)
-      return js_promise_rejected(
-          ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Could not connect to the Cast device"));
+      return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Could not connect to the Cast device"));
     g_cast = s;
     g_cast_remote = t.u.obj;
     g_cast_conn_seen = CAST_CONNECTED;

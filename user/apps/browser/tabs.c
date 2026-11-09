@@ -34,6 +34,7 @@ static void page_free(struct page *p)
   if (p->csp)
     csp_free(p->csp);
   free(p->perm_policy_hdr);
+  storage_drop_session(p->sid);
   memset(p, 0, sizeof *p);
 }
 

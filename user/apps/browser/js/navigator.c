@@ -127,17 +127,17 @@ js_value md_get_user_media(js_ctx *ctx, js_value t, js_value *args, int argc)
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError",
                                                   "At least one of audio and video must be requested"));
   if (want_video && worker_permission(PERM_CAMERA) != PERM_GRANTED)
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Permission denied"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Permission denied"));
   if (want_audio && worker_permission(PERM_MICROPHONE) != PERM_GRANTED)
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Permission denied"));
-  return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotFoundError", "Requested device not found"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Permission denied"));
+  return js_promise_rejected(ctx, dom_exception(ctx, "NotFoundError", "Requested device not found"));
 }
 js_value md_get_display_media(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
   (void)args;
   (void)argc;
-  return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Permission denied"));
+  return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Permission denied"));
 }
 js_value md_enumerate(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -189,12 +189,10 @@ js_value crypto_getrandomvalues(js_ctx *ctx, js_value t, js_value *args, int arg
                               "integer-typed TypedArray");
   ta = (js_typedarray *)v.u.obj->host;
   if (!ta || ta->type < 0 || ta->type == TA_F32 || ta->type == TA_F64 || ta->type == TA_F16)
-    return js_make_error(ctx, ctx->type_error_proto, "TypeMismatchError",
-                         "getRandomValues requires an integer-typed TypedArray");
+    return dom_throw(ctx, "TypeMismatchError", "getRandomValues requires an integer-typed TypedArray");
   nbytes = ta_length(ta) * ta_elem_size(ta->type);
   if (nbytes > 65536)
-    return js_make_error(ctx, ctx->error_proto, "QuotaExceededError",
-                         "getRandomValues can only generate a maximum of 65536 bytes");
+    return dom_throw(ctx, "QuotaExceededError", "getRandomValues can only generate a maximum of 65536 bytes");
   ab = (js_arraybuffer *)ta->buffer->host;
   if (ab && nbytes > 0)
     rng_bytes(ab->data + ta->offset, nbytes);

@@ -267,7 +267,7 @@ static js_value path_bezier_to(js_ctx *ctx, js_value t, js_value *args, int argc
 
 static js_value negative_radius(js_ctx *ctx)
 {
-  return js_throw_error(ctx, ctx->error_proto, "IndexSizeError", "The radius provided is negative.");
+  return dom_throw(ctx, "IndexSizeError", "The radius provided is negative.");
 }
 
 static js_value path_arc(js_ctx *ctx, js_value t, js_value *args, int argc)

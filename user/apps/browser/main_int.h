@@ -12,6 +12,7 @@
 #include "features/anim/anim.h"
 #include "features/bookmarks/bookmarks.h" /* persistent (url,title) bookmarks store */
 #include "features/cache/cache.h"         /* persistent HTTP response cache: load at startup */
+#include "features/storage/storage.h"       /* localStorage: load at startup */
 #include "features/media/bmedia.h"        /* <audio>/<video> controls widget + playback state */
 #include "font.h"                         /* custom @font-face faces (user/lib/font) */
 #include "layout.h"                       /* the CSS box tree (backgrounds/borders behind the text) */

@@ -342,12 +342,12 @@ js_value eventtarget_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 
 /* The init-dict fields carried by the Event subclasses */
 static const char *const k_event_init_keys[] = {
-    "view",      "detail",      "clientX",       "clientY",   "screenX",     "screenY", "pageX",
-    "pageY",     "movementX",   "movementY",     "button",    "buttons",     "ctrlKey", "shiftKey",
-    "altKey",    "metaKey",     "relatedTarget", "key",       "code",        "keyCode", "which",
-    "charCode",  "repeat",      "location",      "deltaX",    "deltaY",      "deltaZ",  "deltaMode",
-    "pointerId", "pointerType", "pressure",      "isPrimary", "data",        "message", "filename",
-    "lineno",    "colno",       "error",         "origin",    "lastEventId", "source",  "ports",
+    "view",          "detail",    "clientX",  "clientY",   "screenX",   "screenY",     "pageX",    "pageY",
+    "movementX",     "movementY", "button",   "buttons",   "ctrlKey",   "shiftKey",    "altKey",   "metaKey",
+    "relatedTarget", "key",       "code",     "keyCode",   "which",     "charCode",    "repeat",   "location",
+    "deltaX",        "deltaY",    "deltaZ",   "deltaMode", "pointerId", "pointerType", "pressure", "isPrimary",
+    "data",          "message",   "filename", "lineno",    "colno",     "error",       "origin",   "lastEventId",
+    "source",        "ports",     "oldValue", "newValue",  "url",       "storageArea",
 };
 
 /* Constructor shared by every Event subclass */

@@ -10,6 +10,7 @@ Status audited against the code on 2026-07-04. `[x]` = done, `[~]` = partial.
 - [x] brotli compression format — user/lib/brotli decoder + encoder, RFC 7932 dictionary
 - [ ] programs: archive tool program to view archives (zip, tar, tar.gz, ...) — only single-file zip/gzip stream compress in term.c; no tar, no member listing
 - [x] support brotli for browser [de]compression — advertises `br`, decodes via ENC_BR (h1 path; h2 intentionally sends bodies plain)
+- [ ] browser: JS contexts for background tabs and real iframe documents - only the active tab has a live JS context (g_ctx) and iframe contentWindow is a thin stub, so there is no other same-origin document to notify: the `storage` event (StorageEvent exists, never fired), BroadcastChannel and cross-tab localStorage listeners can't be delivered
 - [ ] Samba client — only smbd (server) exists; no outbound SMB client
 - [ ] "Network" places in Files app — sidebar has Places + Devices only
 - [ ] Phones MTP shown in Files app — `mtp` is a kernel recovery-console builtin only, not in the GUI

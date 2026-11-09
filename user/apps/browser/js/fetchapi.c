@@ -195,7 +195,7 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     if (sig.type == JV_OBJ && js_to_boolean(js_get(ctx, sig, "aborted"))) {
       js_value reason = js_get(ctx, sig, "reason");
       if (reason.type == JV_UNDEF)
-        reason = js_make_error(ctx, ctx->error_proto, "AbortError", "The operation was aborted");
+        reason = dom_exception(ctx, "AbortError", "The operation was aborted");
       return js_promise_rejected(ctx, reason);
     }
     /* Body last, just before the request: body_bytes may hand back a pointer into a transient string */

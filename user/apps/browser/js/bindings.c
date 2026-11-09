@@ -9,6 +9,7 @@
 #include "features/jar/jar.h"
 #include "features/mediasession/mediasession.h"
 #include "features/notification/notification.h"
+#include "features/storage/storage.h"
 #include "websocket.h"
 
 js_ctx *g_ctx;
@@ -515,12 +516,12 @@ static void cl_write_remove(struct dom_node *n, const char *attr, const char *to
 static bool cl_token_invalid(js_ctx *ctx, const char *tok)
 {
   if (!*tok) {
-    js_throw_error(ctx, ctx->error_proto, "SyntaxError", "the token must not be empty");
+    dom_throw(ctx, "SyntaxError", "the token must not be empty");
     return true;
   }
   for (; *tok; tok++)
     if (*tok == ' ' || *tok == '\t' || *tok == '\n' || *tok == '\r' || *tok == '\f') {
-      js_throw_error(ctx, ctx->error_proto, "InvalidCharacterError", "the token must not contain whitespace");
+      dom_throw(ctx, "InvalidCharacterError", "the token must not contain whitespace");
       return true;
     }
   return false;
@@ -961,7 +962,7 @@ void remove_node(struct dom_node *parent, struct dom_node *c)
 bool insert_node(js_ctx *ctx, struct dom_node *parent, struct dom_node *c, struct dom_node *ref)
 {
   if (dom_is_ancestor(c, parent) || parent->type == DOM_TEXT) {
-    js_throw_error(ctx, ctx->error_proto, "HierarchyRequestError", "the new child contains the parent");
+    dom_throw(ctx, "HierarchyRequestError", "the new child contains the parent");
     return false;
   }
   if (node_is_frag(c)) {
@@ -1717,51 +1718,188 @@ void def_acc(js_object *proto, const char *name, js_native get, js_native set)
   gc_pop_scope();
 }
 
-/* Web Storage (localStorage/sessionStorage): in-memory only, not persisted across reloads */
+/* DOMException: an Error subclass whose `code` is the legacy numeric code of a known name (0 otherwise) */
+static const struct {
+  const char *name;
+  int code;
+} k_domexc[] = {
+    {"IndexSizeError", 1},
+    {"HierarchyRequestError", 3},
+    {"WrongDocumentError", 4},
+    {"InvalidCharacterError", 5},
+    {"NoModificationAllowedError", 7},
+    {"NotFoundError", 8},
+    {"NotSupportedError", 9},
+    {"InUseAttributeError", 10},
+    {"InvalidStateError", 11},
+    {"SyntaxError", 12},
+    {"InvalidModificationError", 13},
+    {"NamespaceError", 14},
+    {"InvalidAccessError", 15},
+    {"TypeMismatchError", 17},
+    {"SecurityError", 18},
+    {"NetworkError", 19},
+    {"AbortError", 20},
+    {"URLMismatchError", 21},
+    {"QuotaExceededError", 22},
+    {"TimeoutError", 23},
+    {"InvalidNodeTypeError", 24},
+    {"DataCloneError", 25},
+};
+js_value dom_exception(js_ctx *ctx, const char *name, const char *msg)
+{
+  js_value ctor = js_get(ctx, js_obj_value(ctx->global), "DOMException"), proto = js_undef(), e;
+  int code = 0;
+  if (ctor.type == JV_OBJ)
+    proto = js_get(ctx, ctor, "prototype");
+  for (unsigned i = 0; i < sizeof k_domexc / sizeof k_domexc[0]; i++)
+    if (!strcmp(k_domexc[i].name, name))
+      code = k_domexc[i].code;
+  e = js_make_error(ctx, proto.type == JV_OBJ ? proto.u.obj : ctx->error_proto, name, msg);
+  js_def(e.u.obj, "code", js_number(code), P_WRITABLE | P_CONFIGURABLE);
+  return e;
+}
+js_value dom_throw(js_ctx *ctx, const char *name, const char *msg)
+{
+  js_throw(ctx, dom_exception(ctx, name, msg));
+  return js_undef();
+}
+static js_value domexception_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  (void)thisv;
+  return dom_exception(ctx, argc > 1 && A(1).type != JV_UNDEF ? arg_str(ctx, A(1)) : "Error",
+                       argc > 0 && A(0).type != JV_UNDEF ? arg_str(ctx, A(0)) : "");
+}
+static void domexception_install(js_ctx *ctx, js_object *win)
+{
+  js_object *proto = js_new_object(ctx, ctx->error_proto), *ctor;
+  gc_push_scope();
+  gc_keep(proto);
+  ctor = (js_object *)gc_keep(js_new_native(ctx, domexception_ctor, "DOMException", 0));
+  js_def(ctor, "prototype", js_obj_value(proto), 0);
+  js_def(proto, "constructor", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
+  js_def(proto, "name", js_mk_cstring(ctx, "Error"), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "DOMException", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
+  gc_pop_scope();
+}
+
+/* Web Storage: localStorage persists per origin, sessionStorage lasts as long as the tab. Each area is a Proxy
+ * over an object holding the methods; the handler's "\1session" flag picks the area. */
+#define STORAGE_SESSION_KEY "\1session"
+static int storage_session(js_ctx *ctx, js_value t) { return js_to_boolean(js_get(ctx, t, STORAGE_SESSION_KEY)); }
 static js_value storage_getitem(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value items = js_get(ctx, t, "@items"), v;
+  const char *v = storage_get(g_page_url_buf, storage_session(ctx, t), arg_str(ctx, A(0)));
   (void)argc;
-  if (items.type != JV_OBJ)
-    return js_null();
-  v = js_get(ctx, items, arg_str(ctx, A(0)));
-  return v.type == JV_UNDEF ? js_null() : js_to_string(ctx, v);
+  return v ? js_mk_cstring(ctx, v) : js_null();
+}
+static js_value storage_quota_error(js_ctx *ctx)
+{
+  return dom_throw(ctx, "QuotaExceededError", "The storage quota has been exceeded");
 }
 static js_value storage_setitem(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value items = js_get(ctx, t, "@items");
+  char key[1024];
   (void)argc;
-  if (items.type == JV_OBJ)
-    js_set(ctx, items, arg_str(ctx, A(0)), js_to_string(ctx, A(1)));
+  strlcpy(key, arg_str(ctx, A(0)), sizeof key);
+  if (storage_set(g_page_url_buf, storage_session(ctx, t), key, arg_str(ctx, js_to_string(ctx, A(1)))) < 0)
+    return storage_quota_error(ctx);
   return js_undef();
 }
 static js_value storage_removeitem(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value items = js_get(ctx, t, "@items");
   (void)argc;
-  if (items.type == JV_OBJ)
-    js_set(ctx, items, arg_str(ctx, A(0)), js_undef());
+  storage_remove(g_page_url_buf, storage_session(ctx, t), arg_str(ctx, A(0)));
   return js_undef();
 }
-static js_value storage_clear(js_ctx *ctx, js_value t, js_value *args, int argc)
+static js_value storage_clear_all(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)args;
   (void)argc;
-  js_set(ctx, t, "@items", js_obj_value(js_new_object(ctx, ctx->object_proto)));
+  storage_clear(g_page_url_buf, storage_session(ctx, t));
   return js_undef();
 }
-static js_value make_storage(js_ctx *ctx)
+static js_value storage_key_at(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_object *s = js_new_object(ctx, ctx->object_proto);
+  double n = js_to_number(ctx, A(0));
+  const char *k = n >= 0 && n < 2147483647.0 ? storage_key(g_page_url_buf, storage_session(ctx, t), (int)n) : 0;
+  return k ? js_mk_cstring(ctx, k) : js_null();
+}
+
+/* Proxy traps: `this` is the handler. Names on the target (methods, Object.prototype) win over stored keys. */
+static int storage_reserved(js_ctx *ctx, js_value target, const char *key)
+{
+  return !strcmp(key, "length") || key[0] == '\1' || js_get(ctx, target, key).type != JV_UNDEF;
+}
+static js_value storage_trap_get(js_ctx *ctx, js_value h, js_value *args, int argc)
+{
+  const char *key = arg_str(ctx, A(1)), *v;
+  int session = storage_session(ctx, h);
+  if (!strcmp(key, STORAGE_SESSION_KEY))
+    return js_bool(session);
+  if (!strcmp(key, "length"))
+    return js_number(storage_length(g_page_url_buf, session));
+  if (js_get(ctx, A(0), key).type != JV_UNDEF)
+    return js_get(ctx, A(0), key);
+  v = key[0] == '\1' ? 0 : storage_get(g_page_url_buf, session, key);
+  return v ? js_mk_cstring(ctx, v) : js_undef();
+}
+static js_value storage_trap_set(js_ctx *ctx, js_value h, js_value *args, int argc)
+{
+  char key[1024];
+  strlcpy(key, arg_str(ctx, A(1)), sizeof key);
+  if (!storage_reserved(ctx, A(0), key) &&
+      storage_set(g_page_url_buf, storage_session(ctx, h), key, arg_str(ctx, js_to_string(ctx, A(2)))) < 0)
+    return storage_quota_error(ctx);
+  return js_bool(1);
+}
+static js_value storage_trap_has(js_ctx *ctx, js_value h, js_value *args, int argc)
+{
+  const char *key = arg_str(ctx, A(1));
+  return js_bool(storage_reserved(ctx, A(0), key) || storage_get(g_page_url_buf, storage_session(ctx, h), key) != 0);
+}
+static js_value storage_trap_delete(js_ctx *ctx, js_value h, js_value *args, int argc)
+{
+  const char *key = arg_str(ctx, A(1));
+  if (!storage_reserved(ctx, A(0), key))
+    storage_remove(g_page_url_buf, storage_session(ctx, h), key);
+  return js_bool(1);
+}
+static js_value storage_trap_ownkeys(js_ctx *ctx, js_value h, js_value *args, int argc)
+{
+  js_object *arr;
+  int session = storage_session(ctx, h);
+  const char *k;
   gc_push_scope();
-  gc_keep(s);
-  js_def(s, "@items", js_obj_value(js_new_object(ctx, ctx->object_proto)), P_WRITABLE);
-  def_method(s, "getItem", storage_getitem, 1);
-  def_method(s, "setItem", storage_setitem, 2);
-  def_method(s, "removeItem", storage_removeitem, 1);
-  def_method(s, "clear", storage_clear, 0);
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (int i = 0; (k = storage_key(g_page_url_buf, session, i)) != 0; i++)
+    js_array_push(ctx, arr, js_mk_cstring(ctx, k));
   gc_pop_scope();
-  return js_obj_value(s);
+  return js_obj_value(arr);
+}
+static js_value make_storage(js_ctx *ctx, int session)
+{
+  js_object *target = js_new_object(ctx, ctx->object_proto), *handler;
+  js_value proxy_ctor = js_get(ctx, js_obj_value(ctx->global), "Proxy"), pargs[2], p;
+  gc_push_scope();
+  gc_keep(target);
+  handler = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  def_method(target, "getItem", storage_getitem, 1);
+  def_method(target, "setItem", storage_setitem, 2);
+  def_method(target, "removeItem", storage_removeitem, 1);
+  def_method(target, "clear", storage_clear_all, 0);
+  def_method(target, "key", storage_key_at, 1);
+  js_def(handler, STORAGE_SESSION_KEY, js_bool(session), 0);
+  def_method(handler, "get", storage_trap_get, 3);
+  def_method(handler, "set", storage_trap_set, 4);
+  def_method(handler, "has", storage_trap_has, 2);
+  def_method(handler, "deleteProperty", storage_trap_delete, 2);
+  def_method(handler, "ownKeys", storage_trap_ownkeys, 1);
+  pargs[0] = js_obj_value(target);
+  pargs[1] = js_obj_value(handler);
+  p = js_construct(ctx, proxy_ctor, pargs, 2);
+  gc_pop_scope();
+  return p;
 }
 
 /* Expose a DOM interface constructor `name` on the global, wired to `proto` */
@@ -2320,9 +2458,10 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     } subs[] = {
         {"UIEvent", -1},   /* -> Event.prototype */
         {"MouseEvent", 0}, /* -> UIEvent.prototype */
-        {"KeyboardEvent", 0}, {"FocusEvent", 0}, {"InputEvent", 0},  {"CompositionEvent", 0},
-        {"PointerEvent", 1}, /* -> MouseEvent.prototype */
-        {"WheelEvent", 1},    {"DragEvent", 1},  {"ErrorEvent", -1}, {"MessageEvent", -1},
+        {"KeyboardEvent", 0},    {"FocusEvent", 0},    {"InputEvent", 0},
+        {"CompositionEvent", 0}, {"PointerEvent", 1}, /* -> MouseEvent.prototype */
+        {"WheelEvent", 1},       {"DragEvent", 1},     {"ErrorEvent", -1},
+        {"MessageEvent", -1},    {"StorageEvent", -1},
     };
     js_object *protos[sizeof subs / sizeof subs[0]];
     unsigned i;
@@ -2598,9 +2737,10 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   }
   /* matchMedia + queueMicrotask: present but inert */
   def_method(win, "matchMedia", win_matchmedia, 1);
-  js_def(win, "localStorage", make_storage(ctx), P_WRITABLE | P_CONFIGURABLE);
+  domexception_install(ctx, win);
+  js_def(win, "localStorage", make_storage(ctx, 0), P_WRITABLE | P_CONFIGURABLE);
   js_idb_setup(ctx, win);
-  js_def(win, "sessionStorage", make_storage(ctx), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "sessionStorage", make_storage(ctx, 1), P_WRITABLE | P_CONFIGURABLE);
   { /* CSS.supports() */
     js_object *css = js_new_object(ctx, ctx->object_proto);
     gc_push_scope();

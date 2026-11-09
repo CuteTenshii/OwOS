@@ -33,10 +33,7 @@ js_value el_local_name(js_ctx *ctx, js_value t, js_value *args, int argc)
   return is_el(n) ? js_mk_cstring(ctx, dom_local_name(dom_qname(n))) : js_null();
 }
 
-static js_value ns_error(js_ctx *ctx, const char *msg)
-{
-  return js_throw_error(ctx, ctx->error_proto, "NamespaceError", msg);
-}
+static js_value ns_error(js_ctx *ctx, const char *msg) { return dom_throw(ctx, "NamespaceError", msg); }
 /* the qualified-name rules of createElementNS / setAttributeNS */
 static const char *check_qname(const char *ns, const char *qname)
 {

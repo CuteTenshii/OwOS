@@ -4,6 +4,7 @@
 #include "canvasjs.h"
 #include "features/mediasession/mediasession.h"
 #include "features/notification/notification.h"
+#include "features/storage/storage.h"
 #include "websocket.h"
 
 /* ------------------------------------------------------- runner ----------- */
@@ -775,4 +776,5 @@ void js_page_end(void)
   g_has_listeners = false;
   g_page_live = 0;
   g_doc_root = 0;
+  storage_flush();
 }

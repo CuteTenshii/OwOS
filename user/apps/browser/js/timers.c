@@ -158,7 +158,7 @@ static void signal_abort(js_ctx *ctx, js_object *signal, js_value reason)
   gc_push_scope();
   gc_keep(signal);
   if (reason.type == JV_UNDEF)
-    reason = js_make_error(ctx, ctx->error_proto, "AbortError", "signal is aborted without reason");
+    reason = dom_exception(ctx, "AbortError", "signal is aborted without reason");
   if (reason.type == JV_OBJ)
     gc_keep(reason.u.obj);
   js_set(ctx, js_obj_value(signal), "aborted", js_bool(1));

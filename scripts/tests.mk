@@ -46,6 +46,7 @@ BIND_SUITES := $(sort $(patsubst tests/%_test.c,%,$(shell grep -l '^\#define OWO
 # Per-suite compile flags
 EXTRA_permissions := -DPERM_DB='"$(RUN)/permissions.db"'
 EXTRA_tz          := -DTZ_CONFIG_PATH='"$(RUN)/timezone"'
+EXTRA_bindings_dom := -DSTORAGE_DB='"$(RUN)/bind-localstorage.db"'
 EXTRA_vary        := -DCACHE_DIR='"$(RUN)/vary-cache"'
 EXTRA_btrfs       := $(HOST_DEFS)
 EXTRA_tls_idle    := -Iuser/lib/tls -Iuser/lib/pki
@@ -58,7 +59,7 @@ EXTRA_net6        := -Idrivers/net
 IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams
-BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/clienthints.o \
+BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/storage.o $(B)/bind/impl/clienthints.o \
               $(B)/bind/impl/permissions.o $(B)/bind/impl/host.o $(B)/impl/test_runner.o
 
 MAIN_OBJS := $(MAIN_SUITES:%=$(B)/suite/%.o) $(IMPLS) $(MAIN_SRCS:%.c=$(B)/obj/%.o)
@@ -83,7 +84,7 @@ $(B)/obj/%.o: %.c
 $(B)/suite/%.o: tests/%_test.c
 	$(call COMPILE,$(SUITE_FLAGS) $(EXTRA_$*))
 $(B)/bind/suite/%.o: tests/%_test.c
-	$(call COMPILE,$(SUITE_FLAGS))
+	$(call COMPILE,$(SUITE_FLAGS) $(EXTRA_$*))
 
 $(B)/impl/netconn.o: $(LIB)/netconn/netconn.c
 	$(call COMPILE,-I$(LIB)/tls -Dmsec=ncp_msec -Dnet_dial=ncp_dial -Dnet_close=ncp_close -Dnet_recv_nb=ncp_recv_nb \
@@ -124,6 +125,8 @@ $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o): $(B)/bind/impl/%.o: $(BROWSER)/js/%.c
 	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
 $(B)/bind/impl/jar.o: $(BROWSER)/features/jar/jar.c
 	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
+$(B)/bind/impl/storage.o: $(BROWSER)/features/storage/storage.c
+	$(call COMPILE,-include tests/bindings_host.h -DSTORAGE_DB='"$(RUN)/bind-localstorage.db"')
 $(B)/bind/impl/clienthints.o: $(BROWSER)/features/clienthints/clienthints.c
 	$(call COMPILE,-include tests/bindings_host.h -Drealloc=poison_realloc)
 $(B)/bind/impl/permissions.o: $(BROWSER)/features/permissions/permissions.c

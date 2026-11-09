@@ -96,6 +96,7 @@ int main(int argc, char **argv)
   perm_load();      /* restore "Allow always" permission grants */
   cache_load();     /* restore the persistent HTTP response cache from disk */
   bookmarks_load(); /* restore the bookmarks tree from disk */
+  storage_load();   /* restore localStorage from disk */
 
   int wtid = thread_create(worker_fn, &worker_stack[sizeof worker_stack]);
 
@@ -118,6 +119,7 @@ int main(int argc, char **argv)
         B->dlg_done = 1; /* release the worker if it's blocked in a dialog */
         if (wtid >= 0)
           thread_join(wtid); /* let the worker exit first */
+        storage_flush();
         win_close(id);
         return 0;
       } else if (ev.type == WEV_KEY) {

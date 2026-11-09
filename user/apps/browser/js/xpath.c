@@ -1543,7 +1543,7 @@ static js_value xpath_error(js_ctx *ctx, int kind, const char *msg)
   if (kind == ERR_THROWN)
     return js_undef();
   snprintf(buf, sizeof buf, kind == ERR_NAMESPACE ? "%s" : "invalid XPath expression: %s", msg);
-  return js_throw_error(ctx, ctx->error_proto, kind == ERR_NAMESPACE ? "NamespaceError" : "SyntaxError", buf);
+  return dom_throw(ctx, kind == ERR_NAMESPACE ? "NamespaceError" : "SyntaxError", buf);
 }
 /* a resolver callback may evaluate again, so each evaluation keeps its own state */
 static js_value evaluate_on(js_ctx *ctx, const char *expr, struct dom_node *ctxnode, js_value resolver,

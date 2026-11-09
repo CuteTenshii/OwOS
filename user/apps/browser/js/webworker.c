@@ -100,7 +100,8 @@ static int g_nrports;
 
 static js_value throw_err(js_ctx *ctx, const char *name, const char *msg)
 {
-  js_throw(ctx, js_make_error(ctx, ctx->type_error_proto, name, msg));
+  js_throw(ctx, strcmp(name, "TypeError") ? dom_exception(ctx, name, msg)
+                                          : js_make_error(ctx, ctx->type_error_proto, name, msg));
   return js_undef();
 }
 

@@ -26,14 +26,8 @@ static js_object *g_idb_txns;    /* live transactions, scanned for auto-commit/a
 
 #define IDB_ISNAN(x) ((x) != (x))
 
-static js_value idb_gerr(const char *name, const char *msg)
-{
-  return js_make_error(g_ctx, g_ctx->error_proto, name, msg);
-}
-static js_value idb_throw(js_ctx *ctx, const char *name, const char *msg)
-{
-  return js_throw_error(ctx, ctx->error_proto, name, msg);
-}
+static js_value idb_gerr(const char *name, const char *msg) { return dom_exception(g_ctx, name, msg); }
+static js_value idb_throw(js_ctx *ctx, const char *name, const char *msg) { return dom_throw(ctx, name, msg); }
 
 /* ---- keys: validity, type rank and comparison (spec key ordering) -------- */
 

@@ -56,12 +56,12 @@ js_value clipitem_gettype(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_value data = js_get(ctx, t, "@data"), e, settled;
   const char *m = arg_str(ctx, A(0));
   if (data.type != JV_OBJ)
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotFoundError", "The type was not found"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "NotFoundError", "The type was not found"));
   e = js_get(ctx, data, m);
   if (e.type == JV_OBJ && js_promise_inspect(ctx, e, &settled) == 1)
     e = settled;
   if (e.type == JV_UNDEF || e.type == JV_NULL)
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotFoundError", "The type was not found"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "NotFoundError", "The type was not found"));
   if (e.type == JV_OBJ && e.u.obj->proto == g_blob_proto)
     return js_promise_resolved(ctx, e);
   {
@@ -87,7 +87,7 @@ js_value clip_writetext(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (s.type != JV_STR)
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "writeText: invalid text"));
   if (clip_put_text(s.u.str->data, s.u.str->len) != 0)
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Clipboard write failed"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Clipboard write failed"));
   return js_promise_resolved(ctx, js_undef());
 }
 
@@ -153,7 +153,7 @@ js_value clip_write(js_ctx *ctx, js_value t, js_value *args, int argc)
   rc = bytes ? clip_put(mime, bytes->data, bytes->len) : clip_put(mime, "", 0);
   gc_pop_scope();
   if (rc != 0)
-    return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "NotAllowedError", "Clipboard write failed"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "NotAllowedError", "Clipboard write failed"));
   return js_promise_resolved(ctx, js_undef());
 }
 

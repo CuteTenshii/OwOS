@@ -32,15 +32,13 @@ static js_value el_attach_shadow(js_ctx *ctx, js_value t, js_value *args, int ar
   if (!host)
     return js_throw_type(ctx, "attachShadow: not an element");
   if (!can_attach_shadow(host->tag))
-    return js_throw_error(ctx, ctx->error_proto, "NotSupportedError",
-                          "attachShadow: this element cannot host a shadow root");
+    return dom_throw(ctx, "NotSupportedError", "attachShadow: this element cannot host a shadow root");
   mode = A(0).type == JV_OBJ ? js_get(ctx, A(0), "mode") : js_undef();
   if (mode.type != JV_STR || (!streq(mode.u.str->data, "open") && !streq(mode.u.str->data, "closed")))
     return js_throw_type(ctx, "attachShadow: mode must be \"open\" or \"closed\"");
   open = streq(mode.u.str->data, "open");
   if (host->shadow)
-    return js_throw_error(ctx, ctx->error_proto, "NotSupportedError",
-                          "attachShadow: the element already has a shadow root");
+    return dom_throw(ctx, "NotSupportedError", "attachShadow: the element already has a shadow root");
   if (!dom_new_shadow_root(host, open))
     return js_throw_range(ctx, "attachShadow: out of memory");
   return wrap_node(host->shadow);
@@ -472,9 +470,9 @@ static js_value el_attach_internals(js_ctx *ctx, js_value t, js_value *args, int
   (void)args;
   (void)argc;
   if (!n || !strchr(n->tag, '-'))
-    return js_throw_error(ctx, ctx->error_proto, "NotSupportedError", "attachInternals: not a custom element");
+    return dom_throw(ctx, "NotSupportedError", "attachInternals: not a custom element");
   if (js_has_own(t.u.obj, "@internals"))
-    return js_throw_error(ctx, ctx->error_proto, "NotSupportedError", "attachInternals: already attached");
+    return dom_throw(ctx, "NotSupportedError", "attachInternals: already attached");
   gc_push_scope();
   ei = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   validity = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));

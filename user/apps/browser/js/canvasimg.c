@@ -242,8 +242,7 @@ static js_value img_decode(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)args, (void)argc;
   if (n && js_image_pixels(n, &w, &h))
     return js_promise_resolved(ctx, js_undef());
-  return js_promise_rejected(
-      ctx, js_make_error(ctx, ctx->error_proto, "EncodingError", "The source image cannot be decoded"));
+  return js_promise_rejected(ctx, dom_exception(ctx, "EncodingError", "The source image cannot be decoded"));
 }
 
 /* --------------------------------------------------------------- ImageBitmap */
@@ -265,7 +264,7 @@ js_value make_bitmap(js_ctx *ctx, unsigned char *px, int w, int h)
 {
   if (!g_bitmap_proto) {
     free(px);
-    return js_throw_error(ctx, ctx->error_proto, "NotSupportedError", "ImageBitmap is not available here");
+    return dom_throw(ctx, "NotSupportedError", "ImageBitmap is not available here");
   }
   gc_push_scope();
   js_value bm = make_host(ctx, g_bitmap_proto, HK_BITMAP, px, w, h);
@@ -291,8 +290,7 @@ static js_value create_image_bitmap(js_ctx *ctx, js_value t, js_value *args, int
                                                   "The provided value is not of type '(HTMLImageElement or "
                                                   "HTMLCanvasElement or OffscreenCanvas or ImageData)'"));
   if (rc == SRC_NOT_READY)
-    return js_promise_rejected(
-        ctx, js_make_error(ctx, ctx->error_proto, "InvalidStateError", "The source image is not ready"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "InvalidStateError", "The source image is not ready"));
   int sx = 0, sy = 0, sw = src.w, sh = src.h;
   if (argc >= 5) {
     sx = js_to_int_sat(ctx, args[1]);

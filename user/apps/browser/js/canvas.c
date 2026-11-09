@@ -632,10 +632,7 @@ static js_value ctx_bezier_to(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-static js_value index_size_error(js_ctx *ctx, const char *msg)
-{
-  return js_throw_error(ctx, ctx->error_proto, "IndexSizeError", msg);
-}
+static js_value index_size_error(js_ctx *ctx, const char *msg) { return dom_throw(ctx, "IndexSizeError", msg); }
 
 static js_value ctx_arc(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -923,7 +920,7 @@ static js_value gradient_add_stop(js_ctx *ctx, js_value t, js_value *args, int a
   if (!finite(off) || off < 0 || off > 1)
     return index_size_error(ctx, "The provided value is outside the range (0.0 - 1.0)");
   if (!parse_css_color(arg_str(ctx, A(1)), col))
-    return js_throw_error(ctx, ctx->error_proto, "SyntaxError", "The value provided could not be parsed as a color");
+    return dom_throw(ctx, "SyntaxError", "The value provided could not be parsed as a color");
   c2d_gradient_add_stop(g->p, (float)off, col[0], col[1], col[2], col[3]);
   return js_undef();
 }
@@ -935,7 +932,7 @@ static js_value ctx_create_pattern(js_ctx *ctx, js_value t, js_value *args, int 
   const char *rep = A(1).type == JV_NULL || A(1).type == JV_UNDEF ? "repeat" : arg_str(ctx, A(1));
   bool rx = streq(rep, "repeat") || streq(rep, "repeat-x"), ry = streq(rep, "repeat") || streq(rep, "repeat-y");
   if (!rx && !ry && !streq(rep, "no-repeat") && !streq(rep, ""))
-    return js_throw_error(ctx, ctx->error_proto, "SyntaxError", "The provided type is not a valid repetition");
+    return dom_throw(ctx, "SyntaxError", "The provided type is not a valid repetition");
   int rc = source_pixels(ctx, A(0), &src);
   if (rc == SRC_BAD_TYPE)
     return js_throw_type(ctx, "The image argument is not a drawable image type");
@@ -1177,8 +1174,8 @@ static js_value canvas_get_context(js_ctx *ctx, js_value t, js_value *args, int 
   if (!streq(arg_str(ctx, A(0)), "2d"))
     return js_null();
   if (js_get(ctx, t, "@transferred").type != JV_UNDEF)
-    return js_throw_error(ctx, ctx->error_proto, "InvalidStateError",
-                          "Cannot get context from a canvas that has transferred its control to offscreen");
+    return dom_throw(ctx, "InvalidStateError",
+                     "Cannot get context from a canvas that has transferred its control to offscreen");
   struct canvas_rec *r = canvas_rec_of(ctx, t, true);
   if (!r)
     return js_undef();
@@ -1224,8 +1221,7 @@ static js_value canvas_set_dim(js_ctx *ctx, js_value t, js_value v, bool height)
   if (!oc && (!n || !streq(n->tag, "canvas")))
     return js_throw_type(ctx, "Illegal invocation");
   if (!oc && js_get(ctx, t, "@transferred").type != JV_UNDEF)
-    return js_throw_error(ctx, ctx->error_proto, "InvalidStateError",
-                          "Cannot resize canvas after call to transferControlToOffscreen()");
+    return dom_throw(ctx, "InvalidStateError", "Cannot resize canvas after call to transferControlToOffscreen()");
   long dim = finite(d) && d >= 0 ? (long)d : 0;
   if (dim > 16384)
     dim = 16384;
@@ -1352,8 +1348,7 @@ static js_value offscreen_transfer_to_bitmap(js_ctx *ctx, js_value t, js_value *
     return js_throw_type(ctx, "Illegal invocation");
   struct canvas_rec *r = oc->p;
   if (r->el)
-    return js_throw_error(ctx, ctx->error_proto, "InvalidStateError",
-                          "Cannot transfer an ImageBitmap from a placeholder OffscreenCanvas");
+    return dom_throw(ctx, "InvalidStateError", "Cannot transfer an ImageBitmap from a placeholder OffscreenCanvas");
   unsigned long bytes = (unsigned long)r->c->w * r->c->h * 4;
   unsigned char *px = malloc(bytes);
   if (!px)
@@ -1368,8 +1363,8 @@ static js_value canvas_transfer_control(js_ctx *ctx, js_value t, js_value *args,
 {
   (void)args, (void)argc;
   if (js_get(ctx, t, "@transferred").type != JV_UNDEF || js_get(ctx, t, "@ctx2d").type == JV_OBJ)
-    return js_throw_error(ctx, ctx->error_proto, "InvalidStateError",
-                          "Cannot transfer control from a canvas for which a rendering context has been created");
+    return dom_throw(ctx, "InvalidStateError",
+                     "Cannot transfer control from a canvas for which a rendering context has been created");
   struct canvas_rec *r = canvas_rec_of(ctx, t, true);
   if (!r)
     return js_undef();

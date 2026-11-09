@@ -2,7 +2,9 @@
 #define OWOS_SUITE_BINDINGS
 #include "dom.h"
 #include "features/jar/jar.h"
+#include "features/storage/storage.h"
 #include "jsint.h"
+#include "sqlite.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -804,6 +806,64 @@ static void test_rellist(void)
       "'other rel owners');\n");
 }
 
+static void test_web_storage(void)
+{
+  run_script(
+      "localStorage.setItem('k', 1); sessionStorage.setItem('s', 'tab');\n"
+      "expect(localStorage.getItem('k') === '1', 'value is stringified');\n"
+      "expect(localStorage.getItem('s') === null && sessionStorage.getItem('k') === null, 'areas are separate');\n"
+      "localStorage.setItem('gone', 'x'); localStorage.removeItem('gone');\n"
+      "expect(localStorage.getItem('gone') === null, 'removeItem');\n"
+      "localStorage.setItem('k2', 'v2'); localStorage.k3 = 3;\n"
+      "expect(localStorage.length === 3 && localStorage.key(0) === 'k' && localStorage.key(2) === 'k3', 'length and "
+      "key');\n"
+      "expect(localStorage.key(3) === null && localStorage.key(-1) === null, 'key out of range');\n"
+      "expect(localStorage.k2 === 'v2' && localStorage.k3 === '3' && localStorage.nope === undefined, 'property "
+      "get');\n"
+      "expect('k2' in localStorage && !('nope' in localStorage), 'in operator');\n"
+      "expect(Object.keys(localStorage).join() === 'k,k2,k3', 'Object.keys: ' + Object.keys(localStorage));\n"
+      "localStorage.setItem('getItem', 'shadow');\n"
+      "expect(typeof localStorage.getItem === 'function', 'methods are not shadowed');\n"
+      "delete localStorage.k2; localStorage.removeItem('k3'); localStorage.removeItem('getItem');\n"
+      "expect(localStorage.length === 1 && localStorage.k2 === undefined, 'delete');\n"
+      "var big = 'x'.repeat(1 << 20), threw = '';\n"
+      "try { for (var i = 0; i < 6; i++) localStorage.setItem('big' + i, big); } catch (e) { threw = e.name; }\n"
+      "expect(threw === 'QuotaExceededError' && localStorage.length === 5, 'quota: ' + threw + localStorage.length);\n"
+      "try { localStorage.setItem('big9', big.repeat(6)); } catch (e) { threw = e; }\n"
+      "expect(threw instanceof DOMException && threw instanceof Error && threw.code === 22, 'DOMException');\n"
+      "var de = new DOMException('m', 'AbortError');\n"
+      "expect(de.name === 'AbortError' && de.message === 'm' && de.code === 20 && new DOMException().name === 'Error', "
+      "'ctor');\n"
+      "var se = new StorageEvent('storage', { key: 'a', oldValue: null, newValue: 'b', url: 'u' });\n"
+      "expect(se instanceof Event && se.key === 'a' && se.newValue === 'b' && se.type === 'storage', 'StorageEvent');\n"
+      "for (var i = 0; i < 5; i++) localStorage.removeItem('big' + i);\n");
+  storage_flush();
+  {
+    struct sql_db *db = sql_open(STORAGE_DB);
+    struct sql_table *t = db ? sql_table_find(db, "storage") : 0;
+    int rows = 0, found = 0;
+    for (struct sql_row *r = t ? t->rows : 0; r; r = r->next, rows++)
+      found += !strcmp(r->col[0].text, "https://example.com:443") && !strcmp(r->col[1].text, "k") &&
+               !strcmp(r->col[2].text, "1");
+    expect(found == 1 && rows == 1);
+    if (db)
+      sql_close(db);
+  }
+  B->pg->sid = 0x7000; /* another tab */
+  run_script("expect(sessionStorage.getItem('s') === null, 'sessionStorage is per tab');\n"
+             "expect(localStorage.getItem('k') === '1', 'localStorage is shared');\n"
+             "localStorage.clear();\n"
+             "expect(localStorage.getItem('k') === null, 'clear');\n");
+  storage_flush();
+  {
+    struct sql_db *db = sql_open(STORAGE_DB);
+    struct sql_table *t = db ? sql_table_find(db, "storage") : 0;
+    expect(t && !t->rows);
+    if (db)
+      sql_close(db);
+  }
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -837,6 +897,7 @@ int main(void)
   test("IntersectionObserver", test_intersection_observer);
   test("PerformanceObserver", test_performance_observer);
   test("relList reflects the rel attribute", test_rellist);
+  test("Web Storage: localStorage persists, sessionStorage is per tab", test_web_storage);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 
   return 0;

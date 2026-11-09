@@ -1247,8 +1247,7 @@ static js_value swc_register(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (!scope[0])
     sw_default_scope(script, scope, sizeof scope);
   if (!cors_same_origin(g_page_url_buf, script))
-    return js_promise_rejected(
-        ctx, js_make_error(ctx, ctx->type_error_proto, "SecurityError", "ServiceWorker script must be same-origin"));
+    return js_promise_rejected(ctx, dom_exception(ctx, "SecurityError", "ServiceWorker script must be same-origin"));
   cors_origin(g_page_url_buf, org, sizeof org);
   rq.url = script;
   rq.method = "GET";
