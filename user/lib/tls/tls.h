@@ -45,6 +45,10 @@ int tls_alpn(tls_conn *c);
 int tls_verify(tls_conn *c);
 const char *tls_verify_message(tls_conn *c);
 
+/* 1 if an idle connection can no longer be used: the peer sent close_notify or an alert, closed or reset the
+ * socket, or sent data (unless allow_data, which keeps one record for tls_read). Never blocks. */
+int tls_peer_closed(tls_conn *c, int allow_data);
+
 void tls_close(tls_conn *c);
 
 #endif /* OWOS_USER_TLS_H */

@@ -32,14 +32,21 @@ netconn *nc_acquire(const char *host, int port, int tls);
  * left the connection open, with nothing buffered. The pool owns `c` afterwards. */
 void nc_release(netconn *c, const char *host, int port, int tls);
 
-/* 1 if `c` came out of the idle pool: the peer may have closed it meanwhile, so a failure before any response
- * byte is worth one retry on nc_open_fresh. */
+/* 1 if `c` came out of the idle pool: the peer may have closed it without our noticing, so a failure before any
+ * response byte is worth one retry on nc_open_fresh. */
 int nc_pooled(netconn *c);
 
+/* 1 if the peer has closed `c` or it can't be reused: close_notify, FIN or reset, or unexpected data. With
+ * allow_data (a protocol where the peer may speak first, like h2) one received TLS record is kept for nc_read.
+ * Never blocks. */
+int nc_peer_closed(netconn *c, int allow_data);
+
 /* Generic idle entries for state wrapped around a connection (the h2 session): destroy(obj) frees it when it
- * expires or is evicted. nc_idle_take hands out one entry of that kind, or NULL. */
+ * expires or is evicted, closed(obj) (optional) says the peer has hung up. nc_idle_take hands out one live entry
+ * of that kind, or NULL. */
 enum { NC_IDLE_FRESH = 1, NC_IDLE_H1 = 2, NC_IDLE_H2 = 3 };
-void nc_idle_put(const char *host, int port, int tls, int kind, void *obj, void (*destroy)(void *));
+void nc_idle_put(const char *host, int port, int tls, int kind, void *obj, void (*destroy)(void *),
+                 int (*closed)(void *));
 void *nc_idle_take(const char *host, int port, int tls, int kind);
 
 int nc_last_error(void);

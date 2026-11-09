@@ -48,6 +48,7 @@ EXTRA_permissions := -DPERM_DB='"$(RUN)/permissions.db"'
 EXTRA_tz          := -DTZ_CONFIG_PATH='"$(RUN)/timezone"'
 EXTRA_vary        := -DCACHE_DIR='"$(RUN)/vary-cache"'
 EXTRA_btrfs       := $(HOST_DEFS)
+EXTRA_tls_idle    := -Iuser/lib/tls -Iuser/lib/pki
 
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
 IMPLS := $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
@@ -84,9 +85,9 @@ $(B)/impl/netconn.o: $(LIB)/netconn/netconn.c
 	$(call COMPILE,-I$(LIB)/tls -Dmsec=ncp_msec -Dnet_dial=ncp_dial -Dnet_close=ncp_close -Dnet_recv_nb=ncp_recv_nb \
 	  -Dnet_recv=ncp_recv -Dnet_send=ncp_send -Dtls_client=ncp_tls_client -Dtls_last_error=ncp_tls_last_error \
 	  -Dtls_read=ncp_tls_read -Dtls_write=ncp_tls_write -Dtls_alpn=ncp_tls_alpn \
-	  -Dtls_verify_message=ncp_tls_verify_message -Dtls_close=ncp_tls_close)
+	  -Dtls_verify_message=ncp_tls_verify_message -Dtls_close=ncp_tls_close -Dtls_peer_closed=ncp_tls_peer_closed)
 $(B)/impl/h2.o: $(LIB)/curl/h2.c
-	$(call COMPILE,-Dnc_read=h2t_read -Dnc_write=h2t_write -Dnc_close=h2t_close -Dnc_idle_put=h2t_idle_put -Dnc_idle_take=h2t_idle_take)
+	$(call COMPILE,-Dnc_read=h2t_read -Dnc_write=h2t_write -Dnc_close=h2t_close -Dnc_peer_closed=h2t_peer_closed -Dnc_idle_put=h2t_idle_put -Dnc_idle_take=h2t_idle_take)
 $(B)/impl/permissions.o: $(BROWSER)/features/permissions/permissions.c
 	$(call COMPILE,-DPERM_DB='"$(RUN)/permissions.db"')
 $(B)/impl/cache.o: $(BROWSER)/features/cache/cache.c

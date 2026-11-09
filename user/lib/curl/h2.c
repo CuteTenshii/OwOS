@@ -1436,6 +1436,7 @@ void h2_session_close(h2_session *s)
 }
 
 static void h2_session_destroy(void *s) { h2_session_close(s); }
+static int h2_session_dead(void *s) { return nc_peer_closed(((h2_session *)s)->conn, 1); }
 
 h2_session *h2_session_acquire(const char *host, int port) { return nc_idle_take(host, port, 1, NC_IDLE_H2); }
 
@@ -1444,5 +1445,5 @@ void h2_session_release(h2_session *s, const char *host, int port)
   if (s->broken)
     h2_session_close(s);
   else
-    nc_idle_put(host, port, 1, NC_IDLE_H2, s, h2_session_destroy);
+    nc_idle_put(host, port, 1, NC_IDLE_H2, s, h2_session_destroy, h2_session_dead);
 }

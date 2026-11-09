@@ -45,24 +45,38 @@ int ncp_send(int fd, const void *buf, int len)
 }
 
 typedef struct tls_conn tls_conn;
+static int g_tls_obj, g_tls_closed, g_tls_allow_data, g_tls_closes;
+
 tls_conn *ncp_tls_client(const char *host, int port, int offer_h2)
 {
   (void)host, (void)port, (void)offer_h2;
-  return 0;
+  g_dials++;
+  return (tls_conn *)&g_tls_obj;
+}
+int ncp_tls_peer_closed(tls_conn *c, int allow_data)
+{
+  (void)c;
+  g_tls_allow_data = allow_data;
+  return g_tls_closed;
 }
 int ncp_tls_last_error(void) { return 0; }
 int ncp_tls_read(tls_conn *c, void *buf, int max) { return (void)c, (void)buf, (void)max, 0; }
 int ncp_tls_write(tls_conn *c, const void *buf, int len) { return (void)c, (void)buf, len; }
 int ncp_tls_alpn(tls_conn *c) { return (void)c, 0; }
 const char *ncp_tls_verify_message(tls_conn *c) { return (void)c, (const char *)0; }
-void ncp_tls_close(tls_conn *c) { (void)c; }
+void ncp_tls_close(tls_conn *c)
+{
+  (void)c;
+  g_tls_closes++;
+}
 
 static void reset(void)
 {
   g_now += 100000; /* expires anything a previous test left parked */
   nc_idle_take("never", 1, 0, NC_IDLE_H1);
-  g_dials = g_nclosed = 0;
+  g_dials = g_nclosed = g_tls_closes = 0;
   g_dead_fd = -1;
+  g_tls_closed = 0;
 }
 
 static int was_closed(int fd)
@@ -144,11 +158,37 @@ static void hung_up_connection_is_discarded(void)
   nc_close(a);
 }
 
-static int g_destroyed;
+static void tls_connection_closed_by_the_peer_is_discarded(void)
+{
+  reset();
+  nc_preconnect("secure.example", 443, 1, 1);
+  netconn *a = nc_open("secure.example", 443, 1, 1);
+  expect(nc_pooled(a));
+  nc_release(a, "secure.example", 443, 1);
+
+  g_tls_closed = 1; /* close_notify arrived while it sat idle */
+  netconn *b = nc_acquire("secure.example", 443, 1);
+  expect(!nc_pooled(b));
+  expect_eq(g_tls_closes, 1);
+  expect_eq(g_tls_allow_data, 0); /* an HTTP/1.1 peer must stay silent between requests */
+
+  g_tls_closed = 0;
+  nc_release(b, "secure.example", 443, 1);
+  netconn *c = nc_acquire("secure.example", 443, 1);
+  expect(nc_pooled(c));
+  nc_close(c);
+}
+
+static int g_destroyed, g_obj_closed;
 static void destroy_obj(void *o)
 {
   (void)o;
   g_destroyed++;
+}
+static int obj_closed(void *o)
+{
+  (void)o;
+  return g_obj_closed;
 }
 
 static void generic_entries_are_taken_by_kind_and_destroyed_on_expiry(void)
@@ -156,15 +196,30 @@ static void generic_entries_are_taken_by_kind_and_destroyed_on_expiry(void)
   reset();
   g_destroyed = 0;
   int obj;
-  nc_idle_put("example.com", 443, 1, NC_IDLE_H2, &obj, destroy_obj);
+  nc_idle_put("example.com", 443, 1, NC_IDLE_H2, &obj, destroy_obj, 0);
   expect(nc_idle_take("example.com", 443, 1, NC_IDLE_H1) == 0);
   expect(nc_idle_take("example.com", 443, 1, NC_IDLE_H2) == &obj);
   expect(nc_idle_take("example.com", 443, 1, NC_IDLE_H2) == 0);
   expect_eq(g_destroyed, 0);
 
-  nc_idle_put("example.com", 443, 1, NC_IDLE_H2, &obj, destroy_obj);
+  nc_idle_put("example.com", 443, 1, NC_IDLE_H2, &obj, destroy_obj, 0);
   g_now += 31000;
   expect(nc_idle_take("example.com", 443, 1, NC_IDLE_H2) == 0);
+  expect_eq(g_destroyed, 1);
+}
+
+static void idle_entry_with_a_hung_up_peer_is_destroyed(void)
+{
+  reset();
+  g_destroyed = g_obj_closed = 0;
+  int obj;
+  nc_idle_put("example.com", 443, 1, NC_IDLE_H2, &obj, destroy_obj, obj_closed);
+  g_obj_closed = 1;
+  expect(nc_idle_take("example.com", 443, 1, NC_IDLE_H2) == 0);
+  expect_eq(g_destroyed, 1);
+  g_obj_closed = 0;
+  nc_idle_put("example.com", 443, 1, NC_IDLE_H2, &obj, destroy_obj, obj_closed);
+  expect(nc_idle_take("example.com", 443, 1, NC_IDLE_H2) == &obj);
   expect_eq(g_destroyed, 1);
 }
 
@@ -197,6 +252,8 @@ int main(void)
   test("hung_up_connection_is_discarded", hung_up_connection_is_discarded);
   test("generic_entries_are_taken_by_kind_and_destroyed_on_expiry",
        generic_entries_are_taken_by_kind_and_destroyed_on_expiry);
+  test("tls_connection_closed_by_the_peer_is_discarded", tls_connection_closed_by_the_peer_is_discarded);
+  test("idle_entry_with_a_hung_up_peer_is_destroyed", idle_entry_with_a_hung_up_peer_is_destroyed);
   test("a_full_pool_drops_the_oldest", a_full_pool_drops_the_oldest);
   return 0;
 }

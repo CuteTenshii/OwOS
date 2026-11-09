@@ -1349,6 +1349,50 @@ int tls_read(tls_conn *c, void *buf, int max)
   }
 }
 
+int tls_peer_closed(tls_conn *c, int allow_data)
+{
+  if (!c || !c->established)
+    return 1;
+  if (c->apppos < c->applen)
+    return !allow_data;
+  for (;;) {
+    if (c->rxpos > 0) {
+      memmove(c->rxraw, c->rxraw + c->rxpos, c->rxlen - c->rxpos);
+      c->rxlen -= c->rxpos;
+      c->rxpos = 0;
+    }
+    if (c->rxlen < sizeof c->rxraw) {
+      int n = net_recv_nb(c->tcp, c->rxraw + c->rxlen, (int)(sizeof c->rxraw - c->rxlen));
+      if (n > 0)
+        c->rxlen += (uint32_t)n;
+      else if (n < 0 && n != NET_EINTR)
+        return 1; /* FIN or reset */
+    }
+    if (c->rxlen < 5)
+      return 0;
+    uint32_t len = ((uint32_t)c->rxraw[3] << 8) | c->rxraw[4];
+    if (len > TLS_RECMAX)
+      return 1;
+    if (c->rxlen < 5 + len)
+      return 0; /* the rest of the record is still in flight */
+    uint8_t t;
+    uint32_t l;
+    if (recv_record(c, &t, c->recpt, &l) < 0)
+      return 1;
+    if (t == REC_ALERT)
+      return 1;
+    if (t == REC_APP && l > 0) {
+      if (!allow_data)
+        return 1;
+      memcpy(c->appbuf, c->recpt, l); /* tls_read hands it out next */
+      c->applen = l;
+      c->apppos = 0;
+      return 0;
+    }
+    /* A session ticket or empty record: consumed, look at the next one. */
+  }
+}
+
 void tls_close(tls_conn *c)
 {
   if (!c)

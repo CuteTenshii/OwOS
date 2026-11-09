@@ -137,11 +137,23 @@ void h2t_close(netconn *c)
 static void *g_idle_obj;
 static void (*g_idle_destroy)(void *);
 
-void h2t_idle_put(const char *host, int port, int tls, int kind, void *obj, void (*destroy)(void *))
+static int (*g_idle_closed)(void *);
+static int g_peer_closed, g_peer_allow_data;
+
+int h2t_peer_closed(netconn *c, int allow_data)
+{
+  (void)c;
+  g_peer_allow_data = allow_data;
+  return g_peer_closed;
+}
+
+void h2t_idle_put(const char *host, int port, int tls, int kind, void *obj, void (*destroy)(void *),
+                  int (*closed)(void *))
 {
   (void)host, (void)port, (void)tls, (void)kind;
   g_idle_obj = obj;
   g_idle_destroy = destroy;
+  g_idle_closed = closed;
 }
 
 void *h2t_idle_take(const char *host, int port, int tls, int kind)
@@ -200,6 +212,25 @@ static void reuse_keeps_connection_state(void)
   expect_eq(g_nsids, 2);
   expect_eq(g_sids[0], 1);
   expect_eq(g_sids[1], 3);
+  h2_session_close(h2_session_acquire("example.com", 443));
+}
+
+static void parked_session_reports_a_hung_up_peer(void)
+{
+  srv_reset();
+  g_idle_obj = 0;
+  h2_session *s = h2_session_wrap(&g_conn);
+  struct sink k;
+  char hdr[256];
+  expect_eq(get(s, "/a", &k, hdr, sizeof hdr), 200);
+  h2_session_release(s, "example.com", 443);
+  expect(g_idle_closed != 0);
+  g_peer_closed = 0;
+  expect_eq(g_idle_closed(s), 0);
+  expect_eq(g_peer_allow_data, 1); /* the peer may legitimately send h2 frames while idle */
+  g_peer_closed = 1;
+  expect_eq(g_idle_closed(s), 1);
+  g_peer_closed = 0;
   h2_session_close(h2_session_acquire("example.com", 443));
 }
 
@@ -262,6 +293,7 @@ static void batches_continue_stream_ids(void)
 int main(void)
 {
   test("reuse_keeps_connection_state", reuse_keeps_connection_state);
+  test("parked_session_reports_a_hung_up_peer", parked_session_reports_a_hung_up_peer);
   test("aborted_response_is_not_reused", aborted_response_is_not_reused);
   test("dead_connection_fails_and_is_dropped", dead_connection_fails_and_is_dropped);
   test("batches_continue_stream_ids", batches_continue_stream_ids);

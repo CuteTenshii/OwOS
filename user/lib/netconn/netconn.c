@@ -51,6 +51,7 @@ static netconn *nc_dial(const char *host, int port, int tls, int offer_h2)
 struct idle {
   void *obj;
   void (*destroy)(void *);
+  int (*closed)(void *);
   char host[POOL_HOST_MAX];
   int port, tls, kind, h2;
   unsigned t;
@@ -62,6 +63,7 @@ static mutex_t g_idle_lock = MUTEX_INIT;
 static unsigned idle_ttl(int kind) { return kind == NC_IDLE_H2 ? 30000 : kind == NC_IDLE_H1 ? 5000 : 10000; }
 
 static void nc_destroy(void *c) { nc_close(c); }
+static int nc_conn_closed(void *c) { return nc_peer_closed(c, 0); }
 
 static int idle_match(const struct idle *p, const char *host, int port, int tls, int kind, int h2)
 {
@@ -80,7 +82,8 @@ static int idle_sweep(struct idle *dead, unsigned now)
   return nd;
 }
 
-static void idle_put(const char *host, int port, int tls, int kind, int h2, void *obj, void (*destroy)(void *))
+static void idle_put(const char *host, int port, int tls, int kind, int h2, void *obj, void (*destroy)(void *),
+                     int (*closed)(void *))
 {
   if (strlen(host) >= POOL_HOST_MAX) {
     destroy(obj);
@@ -105,6 +108,7 @@ static void idle_put(const char *host, int port, int tls, int kind, int h2, void
   }
   slot->obj = obj;
   slot->destroy = destroy;
+  slot->closed = closed;
   strcpy(slot->host, host);
   slot->port = port;
   slot->tls = tls;
@@ -116,8 +120,7 @@ static void idle_put(const char *host, int port, int tls, int kind, int h2, void
     dead[i].destroy(dead[i].obj);
 }
 
-/* Remove and return a matching entry, or NULL. A plain TCP connection the server already closed reads EOF and is
- * dropped; a TLS one has no such check, so callers retry a pooled connection that fails before any response. */
+/* Remove and return a matching entry, or NULL. An entry whose peer has hung up is dropped. */
 static void *idle_take(const char *host, int port, int tls, int kind, int h2)
 {
   struct idle dead[POOL_MAX];
@@ -134,19 +137,17 @@ static void *idle_take(const char *host, int port, int tls, int kind, int h2)
   mutex_unlock(&g_idle_lock);
   for (int i = 0; i < nd; i++)
     dead[i].destroy(dead[i].obj);
-  if (got.obj && kind != NC_IDLE_H2 && !((netconn *)got.obj)->tls) {
-    char b;
-    if (net_recv_nb(((netconn *)got.obj)->fd, &b, 1) != 0) {
-      got.destroy(got.obj);
-      return 0;
-    }
+  if (got.obj && got.closed && got.closed(got.obj)) {
+    got.destroy(got.obj);
+    return 0;
   }
   return got.obj;
 }
 
-void nc_idle_put(const char *host, int port, int tls, int kind, void *obj, void (*destroy)(void *))
+void nc_idle_put(const char *host, int port, int tls, int kind, void *obj, void (*destroy)(void *),
+                 int (*closed)(void *))
 {
-  idle_put(host, port, tls, kind, 0, obj, destroy);
+  idle_put(host, port, tls, kind, 0, obj, destroy, closed);
 }
 
 void *nc_idle_take(const char *host, int port, int tls, int kind) { return idle_take(host, port, tls, kind, 0); }
@@ -175,7 +176,7 @@ netconn *nc_acquire(const char *host, int port, int tls)
 
 void nc_release(netconn *c, const char *host, int port, int tls)
 {
-  idle_put(host, port, tls, NC_IDLE_H1, 0, c, nc_destroy);
+  idle_put(host, port, tls, NC_IDLE_H1, 0, c, nc_destroy, nc_conn_closed);
 }
 
 int nc_pooled(netconn *c) { return c && c->pooled; }
@@ -191,7 +192,7 @@ void nc_preconnect(const char *host, int port, int tls, int offer_h2)
     return;
   netconn *c = nc_dial(host, port, tls, offer_h2);
   if (c)
-    idle_put(host, port, tls, NC_IDLE_FRESH, offer_h2, c, nc_destroy);
+    idle_put(host, port, tls, NC_IDLE_FRESH, offer_h2, c, nc_destroy, nc_conn_closed);
 }
 
 netconn *nc_from_fd(int fd)
@@ -219,6 +220,15 @@ int nc_read_nb(netconn *c, void *buf, int max)
   if (c->tls)
     return -1; /* no non-blocking TLS read (as SK_TLS never had) */
   return net_recv_nb(c->fd, buf, max);
+}
+
+int nc_peer_closed(netconn *c, int allow_data)
+{
+  if (c->tls)
+    return tls_peer_closed(c->tls, allow_data);
+  char b;
+  int n = net_recv_nb(c->fd, &b, 1); /* data on an idle connection means it can't be reused either */
+  return n > 0 || (n < 0 && n != NET_EINTR);
 }
 
 int nc_write(netconn *c, const void *buf, int len)
