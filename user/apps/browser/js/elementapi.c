@@ -424,8 +424,8 @@ js_value el_click(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)ctx;
   (void)args;
   (void)argc;
-  if (n)
-    js_dispatch_dom_event(n, "click", 0, 0);
+  if (n && !js_dispatch_dom_event(n, "click", 0, 0) && html_control_kind(n) == CTRL_FILE)
+    browser_file_input_activate(n);
   return js_undef();
 }
 js_value el_attr_names(js_ctx *ctx, js_value t, js_value *args, int argc)

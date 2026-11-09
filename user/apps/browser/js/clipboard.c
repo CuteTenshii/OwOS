@@ -12,7 +12,7 @@ static js_string *clip_entry_bytes(js_ctx *ctx, js_value v, char *type, int tcap
   js_value settled;
   if (v.type == JV_OBJ && js_promise_inspect(ctx, v, &settled) == 1)
     v = settled;
-  if (v.type == JV_OBJ && v.u.obj->proto == g_blob_proto) {
+  if (v.type == JV_OBJ && is_blob(v.u.obj)) {
     js_value b = js_get(ctx, v, "@bytes"), tp = js_get(ctx, v, "type");
     if (type && tp.type == JV_STR && tp.u.str->len)
       strlcpy(type, tp.u.str->data, tcap);
@@ -62,7 +62,7 @@ js_value clipitem_gettype(js_ctx *ctx, js_value t, js_value *args, int argc)
     e = settled;
   if (e.type == JV_UNDEF || e.type == JV_NULL)
     return js_promise_rejected(ctx, dom_exception(ctx, "NotFoundError", "The type was not found"));
-  if (e.type == JV_OBJ && e.u.obj->proto == g_blob_proto)
+  if (e.type == JV_OBJ && is_blob(e.u.obj))
     return js_promise_resolved(ctx, e);
   {
     js_value s = js_to_string(ctx, e);

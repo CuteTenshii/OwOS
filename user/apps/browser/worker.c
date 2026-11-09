@@ -67,26 +67,21 @@ static void worker_navigate(const char *url)
   B->req_url[k] = '\0';
   B->req_method[0] = '\0'; /* GET: clear any prior POST */
   B->req_body_len = 0;
-  B->req_body[0] = '\0';
   B->req_ctype[0] = '\0';
   B->req_pending = 1;
   B->seq++;
 }
 
-/* Queue a POST navigation (a form submission) */
-static void worker_navigate_post(const char *url, const char *body, int blen, const char *ctype)
+/* Queue a POST navigation (a form submission); takes ownership of the malloc'd body */
+static void worker_navigate_post(const char *url, char *body, int blen, const char *ctype)
 {
   int k = 0;
   for (; url[k] && k < URL_MAX - 1; k++)
     B->req_url[k] = url[k];
   B->req_url[k] = '\0';
   strcpy(B->req_method, "POST");
-  if (blen > (int)sizeof B->req_body - 1)
-    blen = (int)sizeof B->req_body - 1;
-  if (blen < 0)
-    blen = 0;
-  memcpy(B->req_body, body, (unsigned)blen);
-  B->req_body[blen] = '\0';
+  free(B->req_body);
+  B->req_body = body;
   B->req_body_len = blen;
   strcpy(B->req_ctype, ctype ? ctype : "application/x-www-form-urlencoded");
   B->req_pending = 1;
@@ -112,11 +107,22 @@ int browser_form_submit(struct dom_node *node, int fire_event)
       worker_navigate_post(fs.url, fs.body, fs.body_len, fs.ctype);
     else
       worker_navigate(fs.url);
+  } else {
+    free(fs.body);
   }
   return 1;
 }
 
 static int worker_submit(struct dom_node *from) { return browser_form_submit(from, 1); }
+
+void browser_file_input_activate(struct dom_node *input)
+{
+  if (!html_file_choose(input))
+    return;
+  js_files_changed(input);
+  js_dispatch_dom_event(input, "input", 0, 0);
+  js_dispatch_dom_event(input, "change", 0, 0);
+}
 
 /* Perform a clicked control's default action */
 static bool activate_control(struct dom_node *c, int kind)
@@ -131,6 +137,10 @@ static bool activate_control(struct dom_node *c, int kind)
     html_radio_select(c);
     js_dispatch_dom_event(c, "change", 0, 0);
     html_set_focus(0);
+    return true;
+  case CTRL_FILE:
+    html_set_focus(0);
+    browser_file_input_activate(c);
     return true;
   case CTRL_SELECT:
     html_select_cycle(c);

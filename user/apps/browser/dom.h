@@ -15,6 +15,14 @@ struct dom_attr {
   struct dom_attr *next;
 };
 
+/* An <input type=file> selection: absolute paths, and each file's webkitRelativePath ("" outside a folder pick) */
+struct dom_files {
+  int n;
+  char **path;
+  char **rel;
+};
+void dom_files_free(struct dom_files *f);
+
 struct dom_node {
   enum dom_type type;
   char *tag;   /* lowercased tag name (element), "" for text   */
@@ -45,6 +53,7 @@ struct dom_node {
   void *anim_rec;        /* animation/transition record (features/anim), or NULL */
   unsigned anc_bloom[4]; /* hashes of the ancestors' tag/id/classes (css/engine.c) */
   unsigned anc_bloom_seq;
+  struct dom_files *files; /* <input type=file>: the chosen files, or NULL */
   void *wrapper;           /* cached JS wrapper (browser/js/bindings.c); NULL until exposed to script */
   void *tokenlist[2];      /* cached classList / relList objects (browser/js/bindings.c) */
   struct dom_node *shadow; /* element: its attached shadow root (detached tree, tag "#shadow-root") */

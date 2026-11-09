@@ -213,7 +213,7 @@ struct browser {
   char req_url[URL_MAX];
   /* Queued navigation method/body; empty req_method means GET. Worker-owned, no lock. */
   char req_method[8];
-  char req_body[POST_BODY_MAX];
+  char *req_body; /* malloc'd request body, replaced (and freed) by the next POST */
   int req_body_len;
   char req_ctype[80];
   int req_pending;
@@ -272,13 +272,16 @@ struct browser {
 
   /* window.alert/confirm/prompt: the worker posts dlg_req and waits on dlg_done; main runs the dialog. */
   volatile int dlg_req;  /* worker -> main: 0 none, 1 alert, 2 confirm, 3 prompt,
-                            4 permission, 5 list (dlg_text: one item per line) */
+                            4 permission, 5 list (dlg_text: one item per line),
+                            6 file picker (dlg_pick flags, dlg_msg = accept, answer in dlg_paths) */
   volatile int dlg_done; /* main -> worker: the dialog closed */
   int dlg_ok;            /* main -> worker: confirm/prompt accepted (OK/Yes); permission:
                             chosen button index (0=Refuse,1=Once,2=Always); list: chosen row, -1 if cancelled */
   char dlg_title[64];
   char dlg_msg[512];
-  char dlg_text[1024]; /* prompt: default text in, entered text out; list: the items */
+  char dlg_text[1024];   /* prompt: default text in, entered text out; list: the items */
+  int dlg_pick;          /* file picker: PICK_MULTIPLE | PICK_DIRECTORY */
+  char dlg_paths[16384]; /* file picker answer: NUL-terminated paths, ended by an empty string; dlg_ok = count */
 
   int win_id; /* the window handle (for title updates) */
 
@@ -392,8 +395,14 @@ enum ctrl_kind {
   CTRL_RADIO,
   CTRL_SELECT,
   CTRL_SUBMIT,
-  CTRL_BUTTON
+  CTRL_BUTTON,
+  CTRL_FILE
 };
+#define PICK_MULTIPLE 1
+#define PICK_DIRECTORY 2
+/* Ask the main thread for files (blocks like alert); out gets NUL-terminated paths ended by an empty string.
+ * Returns the count, 0 if cancelled. */
+int worker_pick(int flags, const char *accept, char *out, int outsz);
 int html_control_kind(struct dom_node *node);
 void html_set_focus(struct dom_node *node); /* NULL clears focus */
 struct dom_node *html_focus(void);
@@ -409,12 +418,18 @@ int html_focus_command(int cmd);          /* EDIT_SELECT_ALL or KEY_INTR (copy);
 /* A resolved form submission; a GET folds the fields into url's query and leaves body empty. */
 struct form_submission {
   char url[URL_MAX];
-  char method[8];           /* "GET" or "POST" */
-  char body[POST_BODY_MAX]; /* request body for POST (empty for GET) */
+  char method[8]; /* "GET" or "POST" */
+  char *body;     /* malloc'd request body for POST (NULL for GET); the caller frees or hands it on */
   int body_len;
   char ctype[80]; /* Content-Type for the POST body */
 };
 int html_form_build(struct dom_node *control, struct form_submission *fs);
+/* Pick files for an <input type=file> (honouring multiple/webkitdirectory/accept) and store the selection;
+ * 1 if the selection changed. Worker only. */
+int html_file_choose(struct dom_node *input);
+void js_files_changed(struct dom_node *input); /* drop the cached input.files */
+/* Pick files for the input, then fire input and change on it. Worker only. */
+void browser_file_input_activate(struct dom_node *input);
 /* Submit the form enclosing `node`, optionally firing 'submit' first. Returns 1 if found. Worker only. */
 int browser_form_submit(struct dom_node *node, int fire_event);
 

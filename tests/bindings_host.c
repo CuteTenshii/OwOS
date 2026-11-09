@@ -235,6 +235,12 @@ void browser_viewport_px(int *w, int *h)
   *w = BW;
   *h = BH;
 }
+int html_control_kind(struct dom_node *n)
+{
+  return n && streq(n->tag, "input") && dom_get_attr(n, "type") && streq(dom_get_attr(n, "type"), "file") ? CTRL_FILE
+                                                                                                          : CTRL_NONE;
+}
+void browser_file_input_activate(struct dom_node *n) { (void)n; }
 int browser_form_submit(struct dom_node *n, int fire)
 {
   (void)n;

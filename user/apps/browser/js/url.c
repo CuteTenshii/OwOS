@@ -434,13 +434,27 @@ js_value sp_has(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_value v = sp_get(ctx, t, args, argc);
   return js_bool(v.type != JV_NULL);
 }
+/* The value a FormData stores: a Blob becomes a File (named by the filename argument, or "blob"); anything else
+ * is stringified. A URLSearchParams always stringifies. */
+static js_value form_value(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value v = A(1);
+  if (t.u.obj->proto != g_formdata_proto || v.type != JV_OBJ || !is_blob(v.u.obj))
+    return js_to_string(ctx, v);
+  if (argc < 3 && v.u.obj->proto == g_file_proto)
+    return v;
+  js_value b = js_get(ctx, v, "@bytes"), tp = js_get(ctx, v, "type");
+  return make_file(ctx, b.type == JV_STR ? b.u.str->data : "", b.type == JV_STR ? b.u.str->len : 0,
+                   tp.type == JV_STR ? tp.u.str->data : "", argc > 2 ? arg_str(ctx, A(2)) : "blob", "",
+                   (double)now_ms());
+}
 js_value sp_append(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_object *ka = sp_arr(ctx, t, "@k"), *va = sp_arr(ctx, t, "@v");
   if (ka && va) {
     gc_push_scope();
     js_array_push(ctx, ka, js_to_string(ctx, A(0)));
-    js_array_push(ctx, va, js_to_string(ctx, A(1)));
+    js_array_push(ctx, va, form_value(ctx, t, args, argc));
     gc_pop_scope();
   }
   return js_undef();
@@ -483,9 +497,11 @@ js_value sp_set(js_ctx *ctx, js_value t, js_value *args, int argc)
   js_value repl;
   strlcpy(name, arg_str(ctx, A(0)), sizeof name);
   gc_push_scope();
-  repl = js_to_string(ctx, A(1));
+  repl = form_value(ctx, t, args, argc);
   if (repl.type == JV_STR)
     gc_keep(repl.u.str);
+  else if (repl.type == JV_OBJ)
+    gc_keep(repl.u.obj);
   sp_rebuild(ctx, t, name, 1, repl);
   gc_pop_scope();
   return js_undef();
@@ -560,9 +576,15 @@ static void fd_collect(js_ctx *ctx, struct dom_node *n, js_object *ka, js_object
       const char *tag = c->tag, *name = dom_get_attr(c, "name");
       const char *type = dom_get_attr(c, "type");
       if (name && name[0] && (streq(tag, "input") || streq(tag, "select") || streq(tag, "textarea"))) {
-        bool skip = type && (streq(type, "submit") || streq(type, "button") || streq(type, "reset") ||
-                             streq(type, "file") || streq(type, "image"));
-        if (!skip) {
+        bool skip =
+            type && (streq(type, "submit") || streq(type, "button") || streq(type, "reset") || streq(type, "image"));
+        if (type && streq(type, "file")) {
+          int nf = c->files ? c->files->n : 0;
+          for (int i = 0; i < (nf ? nf : 1); i++) { /* no file chosen: one empty File */
+            js_array_push(ctx, ka, js_mk_cstring(ctx, name));
+            js_array_push(ctx, va, dom_file_value(ctx, nf ? c->files : 0, i));
+          }
+        } else if (!skip) {
           if (type && (streq(type, "checkbox") || streq(type, "radio"))) {
             if (dom_get_attr(c, "checked")) {
               const char *v = dom_get_attr(c, "value");

@@ -1,6 +1,7 @@
 /* Blob, blob: object URLs and navigator.sendBeacon. */
 
 #include "bindings.h"
+#include "mime.h"
 
 /* ------------------------------------------------------- Blob + sendBeacon */
 
@@ -13,7 +14,7 @@ static void blob_append_part(js_ctx *ctx, sbuf *sb, js_value v)
   }
   if (v.type == JV_OBJ) {
     js_object *o = v.u.obj;
-    if (o->proto == g_blob_proto) {
+    if (is_blob(o)) {
       js_value b = js_get(ctx, v, "@bytes");
       if (b.type == JV_STR)
         sb_putn(sb, b.u.str->data, b.u.str->len);
@@ -42,7 +43,7 @@ static void blob_append_part(js_ctx *ctx, sbuf *sb, js_value v)
 int blob_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
 {
   js_value b, type;
-  if (v.u.obj->proto != g_blob_proto)
+  if (!is_blob(v.u.obj))
     return 0;
   b = js_get(ctx, v, "@bytes");
   type = js_get(ctx, v, "type");
@@ -107,6 +108,122 @@ js_value blob_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   gc_pop_scope();
   return rv;
 }
+bool is_blob(const js_object *o) { return o->proto == g_blob_proto || o->proto == g_file_proto; }
+
+/* A File: a Blob with a name, a modification time and the path inside a picked folder */
+js_value make_file(js_ctx *ctx, const char *data, int len, const char *type, const char *name, const char *rel,
+                   double modified)
+{
+  js_value b = make_blob(ctx, data, len, type);
+  gc_push_scope();
+  gc_keep(b.u.obj);
+  b.u.obj->proto = g_file_proto;
+  js_def(b.u.obj, "name", js_mk_cstring(ctx, name), P_ENUMERABLE);
+  js_def(b.u.obj, "lastModified", js_number(modified), P_ENUMERABLE);
+  js_def(b.u.obj, "webkitRelativePath", js_mk_cstring(ctx, rel), P_ENUMERABLE);
+  gc_pop_scope();
+  return b;
+}
+
+/* new File(parts, name, {type}) */
+js_value file_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  js_value blobargs[2] = {A(0), argc > 2 ? A(2) : js_undef()};
+  js_value b = blob_ctor(ctx, thisv, blobargs, argc > 2 ? 2 : 1), bytes, type, f;
+  char name[256];
+  double modified;
+  strlcpy(name, arg_str(ctx, A(1)), sizeof name);
+  modified = (double)now_ms();
+  if (argc > 2 && A(2).type == JV_OBJ) {
+    js_value lm = js_get(ctx, A(2), "lastModified");
+    if (lm.type == JV_NUM)
+      modified = js_to_number(ctx, lm);
+  }
+  gc_push_scope();
+  gc_keep(b.u.obj);
+  bytes = js_get(ctx, b, "@bytes");
+  type = js_get(ctx, b, "type");
+  f = make_file(ctx, bytes.u.str->data, bytes.u.str->len, type.type == JV_STR ? type.u.str->data : "", name, "",
+                modified);
+  gc_pop_scope();
+  return f;
+}
+
+js_value filelist_item(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  unsigned i = js_to_uint32(ctx, A(0));
+  js_object *o = t.type == JV_OBJ ? t.u.obj : 0;
+  return o && i < js_array_len(o) ? js_get_index(ctx, t, i) : js_null();
+}
+
+#define FILE_READ_MAX (32 << 20)
+
+/* owofs packs a UTC stamp as year-2000:6 month:4 day:5 hour:5 min:6 sec:6; 0 means unknown */
+static double mtime_ms(unsigned m)
+{
+  if (!m)
+    return 0;
+  int y = 2000 + (int)(m >> 26), mo = (int)((m >> 22) & 0xF), d = (int)((m >> 17) & 0x1F);
+  y -= mo <= 2;
+  int era = y / 400, yoe = y - era * 400;
+  int doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  long long days = (long long)era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+  long long secs = days * 86400 + (long long)((m >> 12) & 0x1F) * 3600 + (long long)((m >> 6) & 0x3F) * 60 + (m & 0x3F);
+  return (double)secs * 1000;
+}
+
+js_value dom_file_value(js_ctx *ctx, const struct dom_files *f, int i)
+{
+  struct statinfo st = {0};
+  char *data = 0;
+  int len = 0;
+  js_value r;
+  if (!f)
+    return make_file(ctx, "", 0, "application/octet-stream", "", "", (double)now_ms());
+  if (stat(f->path[i], &st) == 0 && !st.is_dir && st.size <= FILE_READ_MAX && (data = malloc(st.size + 1))) {
+    len = readfile_at(f->path[i], 0, data, st.size);
+    if (len < 0)
+      len = 0;
+  }
+  const char *name = f->path[i];
+  for (const char *q = name; *q; q++)
+    if (*q == '/')
+      name = q + 1;
+  r = make_file(ctx, data ? data : "", len, mime_from_ext(f->path[i]), name, f->rel[i], mtime_ms(st.mtime));
+  free(data);
+  return r;
+}
+
+void js_files_changed(struct dom_node *input)
+{
+  if (input->wrapper)
+    js_def((js_object *)input->wrapper, "@files", js_undef(), 0);
+}
+
+/* input.files: the same FileList until the selection changes */
+js_value input_get_files(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct dom_node *n = node_of(t);
+  js_value cached, list;
+  const char *type;
+  (void)args;
+  (void)argc;
+  type = n ? dom_get_attr(n, "type") : 0;
+  if (!n || !type || !streq_ci(type, "file"))
+    return js_null();
+  cached = js_get(ctx, t, "@files");
+  if (cached.type == JV_OBJ)
+    return cached;
+  gc_push_scope();
+  list = js_obj_value((js_object *)gc_keep(js_new_array(ctx, 0)));
+  list.u.obj->proto = g_filelist_proto;
+  for (int i = 0; n->files && i < n->files->n; i++)
+    js_array_push(ctx, list.u.obj, dom_file_value(ctx, n->files, i));
+  js_def(t.u.obj, "@files", list, 0);
+  gc_pop_scope();
+  return list;
+}
+
 js_value blob_text(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)args;
@@ -173,7 +290,7 @@ js_value url_create_object_url(js_ctx *ctx, js_value t, js_value *args, int argc
   unsigned char b[16];
   int i, p = 0, n = 0;
   (void)t;
-  if (argc < 1 || A(0).type != JV_OBJ || A(0).u.obj->proto != g_blob_proto)
+  if (argc < 1 || A(0).type != JV_OBJ || !is_blob(A(0).u.obj))
     return js_throw_type(ctx, "URL.createObjectURL: argument must be a Blob");
   rng_bytes(b, 16);
   b[6] = (unsigned char)((b[6] & 0x0f) | 0x40);
@@ -208,6 +325,81 @@ js_value url_revoke_object_url(js_ctx *ctx, js_value t, js_value *args, int argc
   return js_undef();
 }
 
+static bool formdata_has_blob(js_ctx *ctx, js_value fd)
+{
+  js_value va = js_get(ctx, fd, "@v");
+  if (va.type != JV_OBJ)
+    return false;
+  for (unsigned i = 0, n = js_array_len(va.u.obj); i < n; i++) {
+    js_value v = js_get_index(ctx, va, i);
+    if (v.type == JV_OBJ)
+      return true;
+  }
+  return false;
+}
+
+static void put_quoted(sbuf *sb, const char *s)
+{
+  sb_putc(sb, '"');
+  for (; *s; s++) {
+    if (*s == '"')
+      sb_puts(sb, "%22");
+    else if (*s == '\r')
+      sb_puts(sb, "%0D");
+    else if (*s == '\n')
+      sb_puts(sb, "%0A");
+    else
+      sb_putc(sb, *s);
+  }
+  sb_putc(sb, '"');
+}
+
+/* The multipart/form-data body of a FormData holding files. It is kept on the FormData ("@mp") so the bytes
+ * outlive the call, with its Content-Type in "@ct". */
+static js_value formdata_multipart(js_ctx *ctx, js_value fd)
+{
+  js_value ka = js_get(ctx, fd, "@k"), va = js_get(ctx, fd, "@v"), mp;
+  char boundary[48], ct[96];
+  unsigned r[2];
+  sbuf sb = {0, 0, 0};
+  rng_bytes(r, sizeof r);
+  snprintf(boundary, sizeof boundary, "----OwOSFormBoundary%08x%08x", r[0], r[1]);
+  for (unsigned i = 0, n = js_array_len(ka.u.obj); i < n; i++) {
+    js_value k = js_get_index(ctx, ka, i), v = js_get_index(ctx, va, i);
+    sb_puts(&sb, "--");
+    sb_puts(&sb, boundary);
+    sb_puts(&sb, "\r\nContent-Disposition: form-data; name=");
+    put_quoted(&sb, k.type == JV_STR ? k.u.str->data : "");
+    if (v.type == JV_OBJ && is_blob(v.u.obj)) {
+      js_value nm = js_get(ctx, v, "name"), tp = js_get(ctx, v, "type"), b = js_get(ctx, v, "@bytes");
+      sb_puts(&sb, "; filename=");
+      put_quoted(&sb, nm.type == JV_STR ? nm.u.str->data : "blob");
+      sb_puts(&sb, "\r\nContent-Type: ");
+      sb_puts(&sb, tp.type == JV_STR && tp.u.str->len ? tp.u.str->data : "application/octet-stream");
+      sb_puts(&sb, "\r\n\r\n");
+      if (b.type == JV_STR)
+        sb_putn(&sb, b.u.str->data, b.u.str->len);
+    } else {
+      js_value s = js_to_string(ctx, v);
+      sb_puts(&sb, "\r\n\r\n");
+      sb_puts(&sb, s.type == JV_STR ? s.u.str->data : "");
+    }
+    sb_puts(&sb, "\r\n");
+  }
+  sb_puts(&sb, "--");
+  sb_puts(&sb, boundary);
+  sb_puts(&sb, "--\r\n");
+  snprintf(ct, sizeof ct, "multipart/form-data; boundary=%s", boundary);
+  gc_push_scope();
+  mp = js_mk_string(ctx, sb.b ? sb.b : "", sb.n);
+  gc_keep(mp.u.str);
+  js_def(fd.u.obj, "@mp", mp, 0);
+  js_def(fd.u.obj, "@ct", js_mk_cstring(ctx, ct), 0);
+  gc_pop_scope();
+  free(sb.b);
+  return mp;
+}
+
 /* Extract the request bytes + a default content-type from a body value */
 const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap)
 {
@@ -219,7 +411,7 @@ const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap
   }
   if (v.type == JV_OBJ) {
     js_object *o = v.u.obj;
-    if (o->proto == g_blob_proto) {
+    if (is_blob(o)) {
       js_value b = js_get(ctx, v, "@bytes"), tp = js_get(ctx, v, "type");
       if (ctype && !ctype[0] && tp.type == JV_STR && tp.u.str->len)
         strlcpy(ctype, tp.u.str->data, ctcap);
@@ -244,7 +436,14 @@ const char *body_bytes(js_ctx *ctx, js_value v, int *len, char *ctype, int ctcap
       *len = s.type == JV_STR ? s.u.str->len : 0;
       return s.type == JV_STR ? s.u.str->data : "";
     }
-    /* FormData: no file input here, so serialize as urlencoded rather than multipart */
+    if (o->proto == g_formdata_proto && formdata_has_blob(ctx, v)) {
+      js_value mp = formdata_multipart(ctx, v);
+      js_value ct = js_get(ctx, v, "@ct");
+      if (ctype && !ctype[0] && ct.type == JV_STR)
+        strlcpy(ctype, ct.u.str->data, ctcap);
+      *len = mp.type == JV_STR ? mp.u.str->len : 0;
+      return mp.type == JV_STR ? mp.u.str->data : "";
+    }
     if (o->proto == g_formdata_proto) {
       js_value s = sp_tostring(ctx, v, 0, 0);
       if (ctype && !ctype[0])

@@ -735,6 +735,8 @@ void js_page_end(void)
   gc_remove_root((void **)&g_ws_proto);
   gc_remove_root((void **)&g_xhr_proto);
   gc_remove_root((void **)&g_blob_proto);
+  gc_remove_root((void **)&g_file_proto);
+  gc_remove_root((void **)&g_filelist_proto);
   canvas_js_teardown();
   gc_remove_root((void **)&g_remote_proto);
   gc_remove_root((void **)&g_remotes);
@@ -786,7 +788,7 @@ void js_page_end(void)
   g_ws_proto = g_websockets = 0;
   g_bchannel_proto = g_bchannels = 0;
   g_xhr_proto = 0;
-  g_blob_proto = 0;
+  g_blob_proto = g_file_proto = g_filelist_proto = 0;
   g_abortsignal_proto = g_abortcontroller_proto = 0;
   g_rtc_proto = 0;
   js_worker_teardown();

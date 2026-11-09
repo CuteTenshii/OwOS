@@ -1,5 +1,6 @@
 #include "clipboard.h"
 #include "html_int.h"
+#include "mime.h"
 
 /* The focused form control (a text input or textarea), or NULL */
 struct dom_node *g_focus;
@@ -41,6 +42,8 @@ int html_control_kind(struct dom_node *n)
       return CTRL_SUBMIT;
     if (t && streq(t, "hidden"))
       return CTRL_NONE;
+    if (t && streq(t, "file"))
+      return CTRL_FILE;
     return CTRL_TEXT;
   }
   return CTRL_NONE;
@@ -52,6 +55,106 @@ void html_set_focus(struct dom_node *n)
   g_focus = (k == CTRL_TEXT || k == CTRL_TEXTAREA) ? n : 0;
   g_sel_all = false;
   B->focus_kind = (k == CTRL_TEXT) ? 1 : (k == CTRL_TEXTAREA) ? 2 : 0;
+}
+
+/* --- file inputs --- */
+
+static const char *base_name(const char *path)
+{
+  const char *b = path;
+  for (const char *q = path; *q; q++)
+    if (*q == '/')
+      b = q + 1;
+  return b;
+}
+
+struct file_list {
+  struct dom_files *f;
+  int cap;
+};
+
+#define PICK_FILES_MAX 5000
+
+static void fl_add(struct file_list *l, const char *path, const char *rel)
+{
+  struct dom_files *f = l->f;
+  if (f->n >= PICK_FILES_MAX)
+    return;
+  if (f->n == l->cap) {
+    int cap = l->cap ? 2 * l->cap : 32;
+    char **p = realloc(f->path, (unsigned)cap * sizeof *p);
+    if (!p)
+      return;
+    f->path = p;
+    char **r = realloc(f->rel, (unsigned)cap * sizeof *r);
+    if (!r)
+      return;
+    f->rel = r;
+    l->cap = cap;
+  }
+  f->path[f->n] = strdup(path);
+  f->rel[f->n] = strdup(rel);
+  f->n++;
+}
+
+/* Every file under dir; rel is dir's path relative to the picked folder's parent */
+static void walk_dir(struct file_list *l, const char *dir, const char *rel)
+{
+  struct dirent_u d;
+  for (int i = 0; readdir(dir, i, &d) == 1; i++) {
+    char path[512], r[512];
+    snprintf(path, sizeof path, "%s/%s", dir, d.name);
+    snprintf(r, sizeof r, rel[0] ? "%s/%s" : "%s%s", rel, d.name);
+    if (d.is_dir)
+      walk_dir(l, path, r);
+    else
+      fl_add(l, path, r);
+  }
+}
+
+int html_file_choose(struct dom_node *in)
+{
+  int flags = 0;
+  if (dom_get_attr(in, "webkitdirectory") || dom_get_attr(in, "directory"))
+    flags = PICK_DIRECTORY;
+  else if (dom_get_attr(in, "multiple"))
+    flags = PICK_MULTIPLE;
+  char *paths = malloc(sizeof B->dlg_paths);
+  struct dom_files *sel = calloc(1, sizeof *sel);
+  int n = paths && sel ? worker_pick(flags, dom_get_attr(in, "accept"), paths, sizeof B->dlg_paths) : 0;
+  if (n <= 0) {
+    free(paths);
+    free(sel);
+    return 0;
+  }
+  struct file_list l = {sel, 0};
+  if (flags & PICK_DIRECTORY) {
+    char *dir = paths;
+    for (int k = (int)strlen(dir); k > 1 && dir[k - 1] == '/'; k--)
+      dir[k - 1] = 0;
+    bool root = streq(dir, "/");
+    walk_dir(&l, root ? "" : dir, root ? "" : base_name(dir));
+  } else {
+    for (const char *p = paths; *p && sel->n < n; p += strlen(p) + 1)
+      fl_add(&l, p, "");
+  }
+  free(paths);
+  dom_files_free(in->files);
+  in->files = sel;
+  dom_mutation_seq++;
+  return 1;
+}
+
+/* What the control shows next to its button */
+static void file_label(const struct dom_node *in, char *out, int cap)
+{
+  const struct dom_files *f = in->files;
+  if (!f || !f->n)
+    snprintf(out, cap, "No file chosen");
+  else if (f->n == 1 && !f->rel[0][0])
+    snprintf(out, cap, "%s", base_name(f->path[0]));
+  else
+    snprintf(out, cap, "%d files", f->n);
 }
 
 /* --- control default actions (worker-side */
@@ -175,54 +278,154 @@ int html_focus_command(int cmd)
   return 0;
 }
 
+/* Growable byte buffer for an encoded field set */
+struct fbuf {
+  char *p;
+  int n, cap;
+  bool oom;
+};
+
+static void fb_put(struct fbuf *b, const char *s, int n)
+{
+  if (b->oom || n <= 0)
+    return;
+  if (b->n + n + 1 > b->cap) {
+    int cap = b->cap ? b->cap : 256;
+    while (cap < b->n + n + 1)
+      cap *= 2;
+    char *g = realloc(b->p, (unsigned)cap);
+    if (!g) {
+      b->oom = true;
+      return;
+    }
+    b->p = g;
+    b->cap = cap;
+  }
+  memcpy(b->p + b->n, s, (unsigned)n);
+  b->n += n;
+  b->p[b->n] = '\0';
+}
+static void fb_str(struct fbuf *b, const char *s) { fb_put(b, s, (int)strlen(s)); }
+
 /* application/x-www-form-urlencoded component encoding */
 static bool form_unreserved(unsigned char c)
 {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
          c == '.' || c == '*';
 }
-static void enc_field(char *q, int *qn, int cap, const char *s)
+static void enc_field(struct fbuf *b, const char *s)
 {
   static const char hex[] = "0123456789ABCDEF";
   for (; s && *s; s++) {
     unsigned char c = (unsigned char)*s;
-    if (c == ' ') {
-      if (*qn < cap - 1)
-        q[(*qn)++] = '+';
-    } else if (form_unreserved(c)) {
-      if (*qn < cap - 1)
-        q[(*qn)++] = (char)c;
-    } else if (*qn < cap - 4) {
-      q[(*qn)++] = '%';
-      q[(*qn)++] = hex[c >> 4];
-      q[(*qn)++] = hex[c & 15];
+    if (c == ' ')
+      fb_put(b, "+", 1);
+    else if (form_unreserved(c))
+      fb_put(b, (const char *)&c, 1);
+    else {
+      char e[3] = {'%', hex[c >> 4], hex[c & 15]};
+      fb_put(b, e, 3);
     }
   }
-  q[*qn] = '\0';
 }
 
-/* Append one "name=value" pair to the encoded field set */
-enum { FE_URLENC, FE_PLAIN };
-static void q_field(char *q, int *qn, int cap, const char *name, const char *val, int enc)
+/* A multipart header parameter: the value quoted, with quotes and line breaks percent-escaped */
+static void fb_quoted(struct fbuf *b, const char *s)
 {
-  if (*qn && *qn < cap - 1)
-    q[(*qn)++] = (enc == FE_PLAIN) ? '\n' : '&';
-  if (enc == FE_PLAIN) {
-    sapp(q, qn, cap, name);
-    if (*qn < cap - 1)
-      q[(*qn)++] = '=';
-    sapp(q, qn, cap, val ? val : "");
-    q[*qn] = '\0';
+  fb_put(b, "\"", 1);
+  for (; s && *s; s++) {
+    if (*s == '"')
+      fb_str(b, "%22");
+    else if (*s == '\r')
+      fb_str(b, "%0D");
+    else if (*s == '\n')
+      fb_str(b, "%0A");
+    else
+      fb_put(b, s, 1);
+  }
+  fb_put(b, "\"", 1);
+}
+
+/* Append one "name=value" pair to the field set */
+enum { FE_URLENC, FE_PLAIN, FE_MULTI };
+struct fenc {
+  struct fbuf b;
+  int kind;
+  char boundary[48];
+};
+
+static void part_head(struct fenc *f, const char *name)
+{
+  fb_str(&f->b, "--");
+  fb_str(&f->b, f->boundary);
+  fb_str(&f->b, "\r\nContent-Disposition: form-data; name=");
+  fb_quoted(&f->b, name);
+}
+
+static void q_field(struct fenc *f, const char *name, const char *val)
+{
+  if (f->kind == FE_MULTI) {
+    part_head(f, name);
+    fb_str(&f->b, "\r\n\r\n");
+    fb_str(&f->b, val ? val : "");
+    fb_str(&f->b, "\r\n");
+    return;
+  }
+  if (f->b.n)
+    fb_put(&f->b, f->kind == FE_PLAIN ? "\n" : "&", 1);
+  if (f->kind == FE_PLAIN) {
+    fb_str(&f->b, name);
+    fb_put(&f->b, "=", 1);
+    fb_str(&f->b, val ? val : "");
   } else {
-    enc_field(q, qn, cap, name);
-    if (*qn < cap - 1)
-      q[(*qn)++] = '=';
-    enc_field(q, qn, cap, val ? val : "");
+    enc_field(&f->b, name);
+    fb_put(&f->b, "=", 1);
+    enc_field(&f->b, val ? val : "");
+  }
+}
+
+#define FILE_MAX (32 << 20) /* the largest file a submission carries */
+
+/* The fields of an <input type=file>: one part per file (an empty one when nothing is chosen) */
+static void file_fields(struct fenc *f, const char *name, const struct dom_node *in)
+{
+  const struct dom_files *fl = in->files;
+  if (f->kind != FE_MULTI) {
+    if (!fl || !fl->n)
+      q_field(f, name, "");
+    for (int i = 0; fl && i < fl->n; i++)
+      q_field(f, name, base_name(fl->path[i]));
+    return;
+  }
+  if (!fl || !fl->n) {
+    part_head(f, name);
+    fb_str(&f->b, "; filename=\"\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n");
+    return;
+  }
+  for (int i = 0; i < fl->n; i++) {
+    struct statinfo st;
+    char *data = 0;
+    int len = 0;
+    if (stat(fl->path[i], &st) == 0 && !st.is_dir && st.size <= FILE_MAX) {
+      data = malloc(st.size + 1);
+      len = data ? readfile_at(fl->path[i], 0, data, st.size) : 0;
+    }
+    if (len < 0)
+      len = 0;
+    part_head(f, name);
+    fb_str(&f->b, "; filename=");
+    fb_quoted(&f->b, fl->rel[i][0] ? fl->rel[i] : base_name(fl->path[i]));
+    fb_str(&f->b, "\r\nContent-Type: ");
+    fb_str(&f->b, mime_from_ext(fl->path[i]));
+    fb_str(&f->b, "\r\n\r\n");
+    fb_put(&f->b, data, len);
+    fb_str(&f->b, "\r\n");
+    free(data);
   }
 }
 
 /* Collect the successful controls of a form into an encoded field set */
-static void form_fields(struct dom_node *n, char *q, int *qn, int cap, struct dom_node *clicked, int enc)
+static void form_fields(struct dom_node *n, struct fenc *f, struct dom_node *clicked)
 {
   for (struct dom_node *c = n->first_child; c; c = c->next) {
     if (c->type != DOM_ELEMENT)
@@ -237,17 +440,19 @@ static void form_fields(struct dom_node *n, char *q, int *qn, int cap, struct do
       if (is_btn) {
         /* Only the activated submit control is a successful field. */
         if (c == clicked && !(type && (streq(type, "button") || streq(type, "reset"))))
-          q_field(q, qn, cap, name, dom_get_attr(c, "value"), enc);
+          q_field(f, name, dom_get_attr(c, "value"));
       } else if (type && (streq(type, "checkbox") || streq(type, "radio"))) {
         if (dom_get_attr(c, "checked")) {
           const char *v = dom_get_attr(c, "value");
-          q_field(q, qn, cap, name, v ? v : "on", enc);
+          q_field(f, name, v ? v : "on");
         }
+      } else if (type && streq(type, "file")) {
+        file_fields(f, name, c);
       } else {
-        q_field(q, qn, cap, name, dom_get_attr(c, "value"), enc);
+        q_field(f, name, dom_get_attr(c, "value"));
       }
     }
-    form_fields(c, q, qn, cap, clicked, enc);
+    form_fields(c, f, clicked);
   }
 }
 
@@ -255,14 +460,13 @@ int html_form_build(struct dom_node *control, struct form_submission *fs)
 {
   struct dom_node *form = form_of(control);
   const char *action, *method, *enctype;
-  char q[POST_BODY_MAX];
-  int qn = 0, on = 0;
+  int on = 0;
   bool is_post;
-  int enc;
+  struct fenc f = {.kind = FE_URLENC};
   if (!form)
     return 0;
   fs->url[0] = '\0';
-  fs->body[0] = '\0';
+  fs->body = 0;
   fs->body_len = 0;
   fs->ctype[0] = '\0';
   strcpy(fs->method, "GET");
@@ -301,24 +505,39 @@ int html_form_build(struct dom_node *control, struct form_submission *fs)
   }
 
   is_post = method && streq_ci(method, "post");
-  /* multipart/form-data needs file uploads (no file picker here) */
-  enc = (enctype && streq_ci(enctype, "text/plain")) ? FE_PLAIN : FE_URLENC;
+  if (enctype && streq_ci(enctype, "text/plain"))
+    f.kind = FE_PLAIN;
+  else if (is_post && enctype && streq_ci(enctype, "multipart/form-data")) {
+    unsigned r[2];
+    rng_bytes(r, sizeof r);
+    snprintf(f.boundary, sizeof f.boundary, "----OwOSFormBoundary%08x%08x", r[0], r[1]);
+    f.kind = FE_MULTI;
+  }
 
-  q[0] = '\0';
-  form_fields(form, q, &qn, sizeof q, control, enc);
+  form_fields(form, &f, control);
+  if (f.kind == FE_MULTI) {
+    fb_str(&f.b, "--");
+    fb_str(&f.b, f.boundary);
+    fb_str(&f.b, "--\r\n");
+  }
 
   if (is_post) {
     strcpy(fs->method, "POST");
-    if (qn > (int)sizeof fs->body - 1)
-      qn = (int)sizeof fs->body - 1;
-    memcpy(fs->body, q, (unsigned)qn);
-    fs->body[qn] = '\0';
-    fs->body_len = qn;
-    strcpy(fs->ctype, enc == FE_PLAIN ? "text/plain;charset=UTF-8" : "application/x-www-form-urlencoded");
-  } else if (qn > 0) {
-    on = (int)strlen(fs->url);
-    sapp(fs->url, &on, sizeof fs->url, "?");
-    sapp(fs->url, &on, sizeof fs->url, q);
+    if (!f.b.p)
+      f.b.p = calloc(1, 1);
+    fs->body = f.b.p;
+    fs->body_len = f.b.n;
+    if (f.kind == FE_MULTI)
+      snprintf(fs->ctype, sizeof fs->ctype, "multipart/form-data; boundary=%s", f.boundary);
+    else
+      strcpy(fs->ctype, f.kind == FE_PLAIN ? "text/plain;charset=UTF-8" : "application/x-www-form-urlencoded");
+  } else {
+    if (f.b.n > 0) {
+      on = (int)strlen(fs->url);
+      sapp(fs->url, &on, sizeof fs->url, "?");
+      sapp(fs->url, &on, sizeof fs->url, f.b.p);
+    }
+    free(f.b.p);
   }
   return 1;
 }
@@ -343,6 +562,17 @@ void emit_input(struct dom_node *el)
       emit_lit(on ? "(o)" : "( )", ST_BOLD);
     else
       emit_lit(on ? "[x]" : "[ ]", ST_BOLD);
+    return;
+  }
+  if (type && streq(type, "file")) {
+    char label[96];
+    bool dir = dom_get_attr(el, "webkitdirectory") || dom_get_attr(el, "directory");
+    file_label(el, label, sizeof label);
+    emit_lit(dir                            ? "[ Choose Folder ] "
+             : dom_get_attr(el, "multiple") ? "[ Choose Files ] "
+                                            : "[ Choose File ] ",
+             ST_BOLD);
+    emit_lit(label, 0);
     return;
   }
   if (!input_is_text(type)) {

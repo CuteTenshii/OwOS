@@ -348,7 +348,7 @@ js_value response_init_body(js_ctx *ctx, js_value body, js_value *stream, char *
     return js_mk_cstring(ctx, "");
   if (body.type == JV_OBJ) {
     js_object *o = body.u.obj;
-    if (o->proto == g_blob_proto) {
+    if (is_blob(o)) {
       js_value type = js_get(ctx, body, "type");
       strlcpy(ctype, type.type == JV_STR ? type.u.str->data : "", (unsigned)ctcap);
       return js_get(ctx, body, "@bytes");

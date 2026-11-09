@@ -121,7 +121,7 @@ js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 
 js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  char url[URL_MAX], method[16], req_ctype[64], resp_ctype[160];
+  char url[URL_MAX], method[16], req_ctype[160], resp_ctype[160];
   char extra_hdrs[1024];
   const char *reqbody = 0;
   int reqlen = 0, status = 0, outlen = 0, eh = 0;

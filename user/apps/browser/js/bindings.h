@@ -147,6 +147,8 @@ extern int g_narenas, g_arenas_cap;
 extern js_object *g_bchannel_proto;
 extern js_object *g_bchannels;
 extern js_object *g_blob_proto;
+extern js_object *g_file_proto;     /* File.prototype (chains to Blob.prototype) */
+extern js_object *g_filelist_proto; /* FileList.prototype (chains to Array.prototype) */
 extern js_object *g_clipitem_proto;
 extern js_object *g_custom_elements;
 extern struct dom_node *g_doc_root;
@@ -183,6 +185,14 @@ js_value loc_reload(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value loc_tostring(js_ctx *ctx, js_value t, js_value *args, int argc);
 void lower_into(char *dst, int cap, const char *src);
 js_value make_blob(js_ctx *ctx, const char *data, int len, const char *type);
+bool is_blob(const js_object *o); /* a Blob or a File */
+js_value make_file(js_ctx *ctx, const char *data, int len, const char *type, const char *name, const char *rel,
+                   double modified);
+js_value file_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc);
+js_value filelist_item(js_ctx *ctx, js_value t, js_value *args, int argc);
+/* The File for entry i of an <input type=file> selection (an empty one named "" when `f` is NULL) */
+js_value dom_file_value(js_ctx *ctx, const struct dom_files *f, int i);
+js_value input_get_files(js_ctx *ctx, js_value t, js_value *args, int argc);
 
 /* The components of a URL, as the URL class of a worker keeps them */
 struct url_parts {

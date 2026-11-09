@@ -98,6 +98,7 @@ static void node_init(struct dom_node *n, enum dom_type type)
   n->computed_style_sheet = 0;
   n->computed_style_seq = 0;
   n->pseudo_style[0] = n->pseudo_style[1] = 0;
+  n->files = 0;
   n->pseudo_sheet = 0;
   n->pseudo_seq = DOM_STYLE_STALE;
   n->anim_rec = 0;
@@ -638,6 +639,7 @@ static void node_free_one(struct dom_node *n)
   }
   if (n->anim_rec && dom_on_free_anim)
     dom_on_free_anim(n);
+  dom_files_free(n->files);
   struct dom_attr *a = n->attrs;
   while (a) {
     struct dom_attr *nx = a->next;
@@ -658,6 +660,19 @@ static void node_free_one(struct dom_node *n)
 }
 
 /* Iterative post-order teardown (no recursion). */
+void dom_files_free(struct dom_files *f)
+{
+  if (!f)
+    return;
+  for (int i = 0; i < f->n; i++) {
+    free(f->path[i]);
+    free(f->rel[i]);
+  }
+  free(f->path);
+  free(f->rel);
+  free(f);
+}
+
 void dom_free(struct dom_node *root)
 {
   struct dom_node *n = root;

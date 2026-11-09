@@ -76,15 +76,17 @@ struct html_iface g_html_ifaces[] = {
     {"HTMLAudioElement", "audio", true, 0},
 };
 const unsigned g_nhtml_ifaces = sizeof g_html_ifaces / sizeof g_html_ifaces[0];
-js_object *g_custom_elements;       /* registry: tag name -> class constructor */
-js_object *g_module_cache;          /* ES module registry: abs URL -> namespace */
-js_object *g_module_src;            /* prefetched module sources: abs URL -> text */
-js_object *g_importmap;             /* import map: bare specifier -> URL string */
-js_object *g_document_proto;        /* shared by the live doc + DOMParser docs */
-js_object *g_response_proto;        /* fetch() Response.prototype */
-js_object *g_ws_proto;              /* WebSocket.prototype */
-js_object *g_xhr_proto;             /* XMLHttpRequest.prototype */
-js_object *g_blob_proto;            /* Blob.prototype */
+js_object *g_custom_elements; /* registry: tag name -> class constructor */
+js_object *g_module_cache;    /* ES module registry: abs URL -> namespace */
+js_object *g_module_src;      /* prefetched module sources: abs URL -> text */
+js_object *g_importmap;       /* import map: bare specifier -> URL string */
+js_object *g_document_proto;  /* shared by the live doc + DOMParser docs */
+js_object *g_response_proto;  /* fetch() Response.prototype */
+js_object *g_ws_proto;        /* WebSocket.prototype */
+js_object *g_xhr_proto;       /* XMLHttpRequest.prototype */
+js_object *g_blob_proto;      /* Blob.prototype */
+js_object *g_file_proto;
+js_object *g_filelist_proto;
 js_object *g_clipitem_proto;        /* ClipboardItem.prototype */
 js_object *g_remote_proto;          /* RemotePlayback.prototype (media.remote) */
 js_object *g_remotes;               /* rooted array of live RemotePlayback wrappers */
@@ -1077,6 +1079,30 @@ int worker_dialog(int kind, const char *msg, const char *deflt, char *out, int o
     dlg_scopy(out, B->dlg_text, outsz);
   return B->dlg_ok;
 }
+int worker_pick(int flags, const char *accept, char *out, int outsz)
+{
+  if (B->win_id < 0)
+    return 0;
+  B->dlg_title[0] = 0;
+  dlg_scopy(B->dlg_msg, accept, sizeof B->dlg_msg);
+  B->dlg_pick = flags;
+  B->dlg_ok = 0;
+  B->dlg_done = 0;
+  B->dlg_req = 6; /* publish last */
+  while (!B->dlg_done)
+    msleep(10);
+  B->dlg_req = 0;
+  int n = B->dlg_ok, used = 0;
+  if (n > 0) {
+    for (const char *p = B->dlg_paths; *p; p += strlen(p) + 1)
+      used += (int)strlen(p) + 1;
+    if (used + 1 > outsz)
+      return 0;
+    memcpy(out, B->dlg_paths, (unsigned)used);
+    out[used] = 0;
+  }
+  return n;
+}
 static js_value win_alert(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)t;
@@ -1942,6 +1968,8 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   g_notification_proto = js_new_object(ctx, ctx->object_proto);
   g_xhr_proto = js_new_object(ctx, ctx->object_proto);
   g_blob_proto = js_new_object(ctx, ctx->object_proto);
+  g_file_proto = js_new_object(ctx, g_blob_proto);
+  g_filelist_proto = js_new_object(ctx, ctx->array_proto);
   g_remote_proto = js_new_object(ctx, ctx->object_proto); /* RemotePlayback.prototype */
   g_remotes = js_new_array(ctx, 0);
   g_abortsignal_proto = js_new_object(ctx, ctx->object_proto);
@@ -1978,6 +2006,8 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   gc_add_root((void **)&g_ws_proto);
   gc_add_root((void **)&g_xhr_proto);
   gc_add_root((void **)&g_blob_proto);
+  gc_add_root((void **)&g_file_proto);
+  gc_add_root((void **)&g_filelist_proto);
   gc_add_root((void **)&g_remote_proto);
   gc_add_root((void **)&g_remotes);
   gc_add_root((void **)&g_abortsignal_proto);
@@ -2538,6 +2568,9 @@ void setup_dom(js_ctx *ctx, const char *page_url)
       gc_pop_scope();
     }
     /* Image is a global alias constructing an <img> */
+    for (i = 0; i < sizeof g_html_ifaces / sizeof g_html_ifaces[0]; i++)
+      if (streq(g_html_ifaces[i].name, "HTMLInputElement"))
+        def_acc(g_html_ifaces[i].proto, "files", input_get_files, 0);
     for (i = 0; i < sizeof g_html_ifaces / sizeof g_html_ifaces[0]; i++) {
       if (!streq(g_html_ifaces[i].name, "HTMLImageElement"))
         continue;
@@ -2669,6 +2702,17 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     gc_pop_scope();
   }
 
+  /* File (a named Blob) and the FileList of <input type=file> */
+  def_method(g_filelist_proto, "item", filelist_item, 1);
+  {
+    js_object *fc = js_new_native(ctx, file_ctor, "File", 2);
+    gc_push_scope();
+    gc_keep(fc);
+    js_def(fc, "prototype", js_obj_value(g_file_proto), 0);
+    js_def(g_file_proto, "constructor", js_obj_value(fc), P_WRITABLE | P_CONFIGURABLE);
+    js_def(win, "File", js_obj_value(fc), P_WRITABLE | P_CONFIGURABLE);
+    gc_pop_scope();
+  }
   canvas_js_setup(ctx, win);
 
   /* AbortController / AbortSignal (used by fetch() and event listeners). */

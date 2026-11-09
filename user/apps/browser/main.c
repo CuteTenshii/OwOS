@@ -2,6 +2,73 @@
 #include "features/canvas/canvas.h"
 #include "main_int.h"
 
+/* Extensions an accept="" token list allows: ".ext" tokens and the image/audio/video wildcards */
+static int accept_exts(const char *accept, char *buf, int cap, const char **exts, int max)
+{
+  static const struct {
+    const char *token, *list;
+  } wild[] = {{"image/*", ".png .jpg .jpeg .gif .webp .bmp .svg .ico"},
+              {"audio/*", ".wav .mp3 .mp2 .aac .m4a .ogg .opus .flac"},
+              {"video/*", ".mp4 .mov .m4v .264 .h264 .webm"}};
+  int n = 0, used = 0;
+  for (const char *p = accept ? accept : ""; *p && n < max;) {
+    while (*p == ' ' || *p == ',')
+      p++;
+    const char *t = p;
+    while (*p && *p != ',' && *p != ' ')
+      p++;
+    int tl = (int)(p - t);
+    for (int w = 0; w < (int)(sizeof wild / sizeof wild[0]); w++) {
+      if (tl != (int)strlen(wild[w].token) || !eq_ci_n(t, wild[w].token, tl))
+        continue;
+      for (const char *e = wild[w].list; *e && n < max;) {
+        int el = 0;
+        while (e[el] && e[el] != ' ')
+          el++;
+        if (used + el + 1 > cap)
+          return n;
+        memcpy(buf + used, e, (unsigned)el);
+        buf[used + el] = 0;
+        exts[n++] = buf + used;
+        used += el + 1;
+        e += el;
+        while (*e == ' ')
+          e++;
+      }
+    }
+    if (*t == '.' && tl > 1 && used + tl + 1 <= cap && n < max) {
+      memcpy(buf + used, t, (unsigned)tl);
+      buf[used + tl] = 0;
+      exts[n++] = buf + used;
+      used += tl + 1;
+    }
+  }
+  return n;
+}
+
+/* Run the file picker a page's <input type=file> asked for; the paths land in B->dlg_paths */
+static int pick_files(int parent)
+{
+  char buf[512];
+  const char *exts[65];
+  int dir = (B->dlg_pick & PICK_DIRECTORY) != 0;
+  int n = dir ? 0 : accept_exts(B->dlg_msg, buf, sizeof buf, exts, 64);
+  exts[n] = NULL;
+  struct filepicker_opts o = {.title = dir                             ? "Select Folder"
+                                       : (B->dlg_pick & PICK_MULTIPLE) ? "Select Files"
+                                                                       : "Select File",
+                              .mode = dir ? FILEPICK_FOLDER : FILEPICK_OPEN,
+                              .multiple = (B->dlg_pick & PICK_MULTIPLE) != 0,
+                              .filter_label = "Accepted files",
+                              .exts = n ? exts : NULL};
+  int r = filepicker(parent, &o, B->dlg_paths, sizeof B->dlg_paths);
+  if (r && dir) { /* a single path: end the list */
+    int l = (int)strlen(B->dlg_paths);
+    B->dlg_paths[l + 1] = 0;
+  }
+  return r;
+}
+
 static struct browser binst;
 struct browser *B = &binst;
 
@@ -240,6 +307,8 @@ int main(int argc, char **argv)
             *p++ = 0;
         }
         ok = dialog_list(id, B->dlg_title, B->dlg_msg, items, n, "Pair");
+      } else if (req == 6) { /* file picker */
+        ok = pick_files(id);
       } else { /* prompt */
         ok = dialog_prompt(id, B->dlg_title, B->dlg_msg, B->dlg_text, B->dlg_text, sizeof B->dlg_text);
       }
