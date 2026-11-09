@@ -124,6 +124,8 @@ static void test_id_parsing(void)
   expect_eq(id.kind, GP_SWITCH_PRO);
   expect_eq(id.vid, 0);
   expect(gp_parse_id("generic 0000 0000 Gamepad\n", &id) && id.kind == GP_GENERIC);
+  expect(gp_parse_id("ds5 054c 0ce6 DualSense Wireless Controller\n", &id) && id.kind == GP_DS5);
+  expect(gp_parse_id("xbox 045e 0b12 Xbox Wireless Controller\n", &id) && id.kind == GP_XBOX);
   expect(!gp_parse_id("ps5 054c 0ce6 DualSense\n", &id));
   expect(!gp_parse_id("ds4 zz 09cc X\n", &id));
   expect(!gp_parse_id("", &id));
@@ -157,6 +159,22 @@ static void test_standard_mappings(void)
   expect(gp_button(GP_DS4, &ds4, 6) > 0.999);
   expect(gp_button(GP_DS4, &ds4, 7) == 0);
   expect(gp_axis(GP_DS4, &ds4, 0) == -1 && gp_axis(GP_DS4, &ds4, 2) == 0.5 && gp_axis(GP_DS4, &ds4, 3) == -0.5);
+
+  /* DualSense shares the DualShock layout */
+  expect_eq(gp_button(GP_DS5, &ds4, 0), 1);
+  expect_eq(gp_button(GP_DS5, &ds4, 2), 1);
+  expect(gp_button(GP_DS5, &ds4, 6) > 0.999);
+
+  /* Xbox: A 0, B 1, X 2, Y 3, LB 4, RB 5, View 6, Menu 7, L3 8, R3 9, Guide 10; triggers on Rx and Ry */
+  struct gp_state xbox = {1, 1u << 0 | 1u << 3 | 1u << 6 | 1u << 8 | 1u << 10, 0, {0, 0, 0, 32767, -32768, 0, 0, 0}};
+  expect_eq(gp_button(GP_XBOX, &xbox, 0), 1);
+  expect_eq(gp_button(GP_XBOX, &xbox, 3), 1);
+  expect_eq(gp_button(GP_XBOX, &xbox, 1), 0);
+  expect_eq(gp_button(GP_XBOX, &xbox, 8), 1); /* View is Back */
+  expect_eq(gp_button(GP_XBOX, &xbox, 9), 0);
+  expect_eq(gp_button(GP_XBOX, &xbox, 10), 1);
+  expect_eq(gp_button(GP_XBOX, &xbox, 16), 1);
+  expect(gp_button(GP_XBOX, &xbox, 6) > 0.999 && gp_button(GP_XBOX, &xbox, 7) == 0);
 
   /* Switch Pro: B 0, A 1, Y 2, X 3 sit bottom, right, left, top; ZL is a button, Home 12 */
   struct gp_state pro = {1, 1u << 0 | 1u << 3 | 1u << 6 | 1u << 12, 0, {0}};

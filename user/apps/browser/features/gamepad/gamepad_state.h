@@ -4,7 +4,7 @@
 #include <stdbool.h>
 
 /* How a controller's buttons and axes map onto the W3C "standard" layout; generic pads are exposed as they are. */
-enum gp_kind { GP_GENERIC, GP_DS4, GP_SWITCH_PRO };
+enum gp_kind { GP_GENERIC, GP_DS4, GP_DS5, GP_SWITCH_PRO, GP_XBOX };
 
 #define GP_STD_BUTTONS 17
 #define GP_STD_AXES 4

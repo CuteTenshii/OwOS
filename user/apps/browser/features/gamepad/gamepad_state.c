@@ -56,9 +56,10 @@ bool gp_parse_id(const char *line, struct gp_id *id)
   static const struct {
     const char *token;
     enum gp_kind kind;
-  } kinds[] = {{"generic", GP_GENERIC}, {"ds4", GP_DS4}, {"switchpro", GP_SWITCH_PRO}};
+  } kinds[] = {
+      {"generic", GP_GENERIC}, {"ds4", GP_DS4}, {"ds5", GP_DS5}, {"switchpro", GP_SWITCH_PRO}, {"xbox", GP_XBOX}};
   int k;
-  for (k = 0; k < 3; k++) {
+  for (k = 0; k < (int)(sizeof kinds / sizeof kinds[0]); k++) {
     int n = 0;
     while (kinds[k].token[n] && line[n] == kinds[k].token[n])
       n++;
@@ -68,7 +69,8 @@ bool gp_parse_id(const char *line, struct gp_id *id)
       break;
     }
   }
-  if (k == 3 || !(line = next_hex(line, &id->vid)) || !(line = next_hex(line, &id->pid)))
+  if (k == (int)(sizeof kinds / sizeof kinds[0]) || !(line = next_hex(line, &id->vid)) ||
+      !(line = next_hex(line, &id->pid)))
     return false;
   while (*line == ' ')
     line++;
@@ -113,6 +115,7 @@ static bool hat_button(const struct gp_state *st, int dir)
 /* Raw button bit behind each standard button, -1 where the layout has none at that spot. */
 static const signed char ds4_bits[GP_STD_BUTTONS] = {1, 2, 0, 3, 4, 5, -1, -1, 8, 9, 10, 11, -1, -1, -1, -1, 12};
 static const signed char switch_bits[GP_STD_BUTTONS] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1, -1, -1, 12};
+static const signed char xbox_bits[GP_STD_BUTTONS] = {0, 1, 2, 3, 4, 5, -1, -1, 6, 7, 8, 9, -1, -1, -1, -1, 10};
 
 double gp_button(enum gp_kind kind, const struct gp_state *st, int i)
 {
@@ -123,9 +126,9 @@ double gp_button(enum gp_kind kind, const struct gp_state *st, int i)
   }
   if (i >= 12 && i <= 15)
     return hat_button(st, i - 12);
-  if (kind == GP_DS4 && (i == 6 || i == 7))
-    return (st->axes[i - 3] + 32768) / 65535.0; /* L2 and R2 are the Rx and Ry axes */
-  int bit = (kind == GP_DS4 ? ds4_bits : switch_bits)[i];
+  if (kind != GP_SWITCH_PRO && (i == 6 || i == 7))
+    return (st->axes[i - 3] + 32768) / 65535.0; /* the triggers are the Rx and Ry axes */
+  int bit = (kind == GP_XBOX ? xbox_bits : kind == GP_SWITCH_PRO ? switch_bits : ds4_bits)[i];
   return bit >= 0 && (st->buttons >> bit & 1);
 }
 

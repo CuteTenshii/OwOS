@@ -2233,6 +2233,7 @@ static void pipes_recover(void)
 }
 
 #define EP_TYPE_BULK_OUT 2
+#define EP_TYPE_INTR_OUT 3
 #define EP_TYPE_BULK_IN 6
 #define EP_TYPE_INTR_IN 7
 
@@ -2241,7 +2242,7 @@ static struct usbh_pipe *open_pipe(int slot, uint8_t ep_addr, uint16_t mps, int 
 {
   struct xdev *x = slot > 0 && slot < XHCI_MAX_SLOTS ? devs[slot] : NULL;
   bool out = !(ep_addr & 0x80);
-  if (!x || mps == 0 || mps > 1024 || out != (ep_type == EP_TYPE_BULK_OUT))
+  if (!x || mps == 0 || mps > 1024 || out != (ep_type == EP_TYPE_BULK_OUT || ep_type == EP_TYPE_INTR_OUT))
     return NULL;
   struct usbh_pipe *p = kmalloc(sizeof *p);
   if (!p)
@@ -2266,7 +2267,7 @@ static struct usbh_pipe *open_pipe(int slot, uint8_t ep_addr, uint16_t mps, int 
   p->ctx = ctx;
 
   uint32_t ep[5] = {0};
-  if (ep_type == EP_TYPE_INTR_IN) {
+  if (ep_type == EP_TYPE_INTR_IN || ep_type == EP_TYPE_INTR_OUT) {
     ep[0] = usbh_intr_exponent(x->pub.speed, interval) << 16;
     ep[4] = mps | ((uint32_t)mps << 16);
   } else {
@@ -2290,6 +2291,11 @@ static struct usbh_pipe *open_pipe(int slot, uint8_t ep_addr, uint16_t mps, int 
 struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval, usbh_pipe_cb cb, void *ctx)
 {
   return open_pipe(slot, ep_addr, mps, EP_TYPE_INTR_IN, interval, cb, ctx);
+}
+
+struct usbh_pipe *usbh_open_intr_out(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval)
+{
+  return open_pipe(slot, ep_addr, mps, EP_TYPE_INTR_OUT, interval, NULL, NULL);
 }
 
 struct usbh_pipe *usbh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usbh_pipe_cb cb, void *ctx)
@@ -2358,6 +2364,7 @@ static void remove_device(int slot)
   con_printf("usb: slot %d detached\n", slot);
   hub_unbind(slot);
   hid_unbind(slot);
+  xbox_unbind(slot);
   btusb_unbind(slot);
   if (x->pub.is_msc && slot == msc_slot)
     msc_ready = 0;
@@ -2493,6 +2500,7 @@ static int enumerate_device(int parent_slot, int parent_port, uint32_t root_port
   if (d->cfg_len) {
     hub_bind(d);
     hid_bind(d);
+    xbox_bind(d);
     btusb_bind(d);
   }
   return slot_id;

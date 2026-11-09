@@ -781,7 +781,7 @@ void hid_bt_report(struct hid_dev *h, const uint8_t *data, int len)
   memcpy(hid_last_report, data, (size_t)len);
 }
 
-void hid_bt_remove(struct hid_dev *h)
+void hid_dev_remove(struct hid_dev *h)
 {
   expect(h == &fake_hid);
   hid_removes++;

@@ -62,6 +62,9 @@ struct usbh_pipe;
 typedef void (*usbh_pipe_cb)(void *ctx, const uint8_t *data, int len);
 struct usbh_pipe *usbh_open_intr(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval, usbh_pipe_cb cb, void *ctx);
 
+/* An interrupt OUT endpoint; send with usbh_pipe_send (below). */
+struct usbh_pipe *usbh_open_intr_out(int slot, uint8_t ep_addr, uint16_t mps, uint8_t interval);
+
 /* Bulk endpoints on a configured slot. IN: cb runs per completed transfer (at most mps bytes, a short one ends a
  * packet). OUT: usbh_pipe_send blocks until the controller completes it; poll thread only. */
 struct usbh_pipe *usbh_open_bulk_in(int slot, uint8_t ep_addr, uint16_t mps, usbh_pipe_cb cb, void *ctx);
@@ -105,6 +108,8 @@ void hid_bind(struct usbdev *d);
 void hid_unbind(int slot);
 void hid_tick(void);
 void hid_print(int slot, bool detail);
+void xbox_bind(struct usbdev *d);
+void xbox_unbind(int slot);
 void btusb_bind(struct usbdev *d);
 void btusb_unbind(int slot);
 void btusb_tick(void);

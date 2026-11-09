@@ -83,7 +83,7 @@ static void pad_fail(struct pad *p, const char *why)
     return;
   bt_log("hid: %s", why);
   if (p->hid) {
-    hid_bt_remove(p->hid);
+    hid_dev_remove(p->hid);
     p->hid = NULL;
   }
   pad_free_buffers(p);
@@ -320,7 +320,7 @@ void bthid_conn_down(struct bt_conn *c)
     if (p->conn != c)
       continue;
     if (p->hid)
-      hid_bt_remove(p->hid);
+      hid_dev_remove(p->hid);
     pad_free_buffers(p);
     memset(p, 0, sizeof *p);
   }

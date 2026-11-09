@@ -24,7 +24,7 @@ struct hid_dev {
   struct hid_dev *next;
   int slot, iface;
   int (*send)(struct hid_dev *h, uint8_t id, const uint8_t *buf, int n); /* output report, ID byte first if id != 0 */
-  int (*bt_send)(void *ctx, uint8_t id, const uint8_t *buf, int n);
+  int (*ext_send)(void *ctx, uint8_t id, const uint8_t *buf, int n);
   void *link;
   uint8_t subclass, protocol;
   bool boot;
@@ -49,6 +49,8 @@ struct hid_dev {
   uint32_t led_seq;
   enum pad_kind kind;
   bool bt;
+  uint8_t out_seq;
+  bool guide;
   uint16_t vid, pid;
   /* Dual-rumble output report. */
   bool has_rumble;
@@ -66,6 +68,11 @@ static struct hid_dev *pad_cur; /* the pad that last reported or attached, named
 static int pad_devices;
 static uint32_t rumble_until;
 static bool rumble_on;
+static volatile struct {
+  uint16_t strong, weak;
+  uint32_t ms;
+  bool pending;
+} rumble_req; /* queued by hid_gamepad_rumble, sent from hid_tick on the poll thread */
 
 static uint32_t now_ms(void) { return timer_ticks() * (1000 / TIMER_HZ); }
 
@@ -190,11 +197,12 @@ static void hid_report(void *ctx, const uint8_t *data, int len)
   struct hid_dev *h = ctx;
   if (len <= 0)
     return;
-  if (h->kind == PAD_DS4) {
+  if (h->kind == PAD_DS4 || h->kind == PAD_DS5) {
     uint32_t buttons;
     uint8_t hat;
     int32_t axes[HID_PAD_AXES] = {0};
-    if (ds4_decode_bt(data, len, &buttons, &hat, axes)) {
+    if (h->kind == PAD_DS4 ? ds4_decode_bt(data, len, &buttons, &hat, axes)
+                           : ds5_decode_bt(data, len, &buttons, &hat, axes)) {
       pad_set(h, buttons, hat, axes);
       return;
     }
@@ -218,7 +226,10 @@ static int usb_send(struct hid_dev *h, uint8_t id, const uint8_t *buf, int n)
   return usbh_control_out(h->slot, 0x21, HID_REQ_SET_REPORT, (uint16_t)((2u << 8) | id), (uint16_t)h->iface, buf, n);
 }
 
-static int bt_out(struct hid_dev *h, uint8_t id, const uint8_t *buf, int n) { return h->bt_send(h->link, id, buf, n); }
+static int ext_out(struct hid_dev *h, uint8_t id, const uint8_t *buf, int n)
+{
+  return h->ext_send(h->link, id, buf, n);
+}
 
 /* Zeroed output report buffer for a payload of len bytes, with room for the ID byte when id != 0. */
 static uint8_t *report_buf(uint8_t id, uint32_t len, uint32_t *n, uint8_t **payload)
@@ -248,14 +259,21 @@ static void send_leds(struct hid_dev *h)
 
 static bool can_rumble(const struct hid_dev *h)
 {
-  return (h->roles & HID_ROLE_GAMEPAD) && (h->has_rumble || h->kind == PAD_DS4);
+  return (h->roles & HID_ROLE_GAMEPAD) &&
+         (h->has_rumble || h->kind == PAD_DS4 || h->kind == PAD_DS5 || h->kind == PAD_XBOX);
 }
 
 static void send_rumble(struct hid_dev *h, uint16_t strong, uint16_t weak, uint32_t ms)
 {
-  if (h->kind == PAD_DS4) {
-    uint8_t out[DS4_BT_OUT_LEN];
-    int n = ds4_pack_rumble(h->bt, strong, weak, out);
+  if (h->kind == PAD_DS4 || h->kind == PAD_DS5 || h->kind == PAD_XBOX) {
+    uint8_t out[DS5_BT_OUT_LEN];
+    int n;
+    if (h->kind == PAD_DS4)
+      n = ds4_pack_rumble(h->bt, strong, weak, out);
+    else if (h->kind == PAD_DS5)
+      n = ds5_pack_rumble(h->bt, h->out_seq++ & 15, strong, weak, out);
+    else
+      n = xbox_pack_rumble(h->out_seq++, strong, weak, out);
     h->send(h, out[0], out, n);
     return;
   }
@@ -285,12 +303,13 @@ int hid_gamepad_rumble(uint16_t strong, uint16_t weak, uint32_t ms)
   if (!strong && !weak)
     ms = 0;
   for (struct hid_dev *h = hids; h; h = h->next)
-    if (can_rumble(h)) {
-      send_rumble(h, strong, weak, ms);
-      n++;
-    }
-  rumble_on = n && ms;
-  rumble_until = now_ms() + ms;
+    n += can_rumble(h);
+  if (n) {
+    rumble_req.strong = strong;
+    rumble_req.weak = weak;
+    rumble_req.ms = ms;
+    rumble_req.pending = true;
+  }
   return n;
 }
 
@@ -299,8 +318,21 @@ void hid_tick(void)
   uint16_t key;
   if (hid_tm_due(&typematic, now_ms(), &key))
     emit_key(key, true);
-  if (rumble_on && (int32_t)(now_ms() - rumble_until) >= 0)
-    hid_gamepad_rumble(0, 0, 0);
+  if (rumble_on && (int32_t)(now_ms() - rumble_until) >= 0) {
+    rumble_req.strong = rumble_req.weak = 0;
+    rumble_req.ms = 0;
+    rumble_req.pending = true;
+  }
+  if (rumble_req.pending) {
+    uint16_t strong = rumble_req.strong, weak = rumble_req.weak;
+    uint32_t ms = rumble_req.ms;
+    rumble_req.pending = false;
+    for (struct hid_dev *h = hids; h; h = h->next)
+      if (can_rumble(h))
+        send_rumble(h, strong, weak, ms);
+    rumble_on = ms != 0;
+    rumble_until = now_ms() + ms;
+  }
   uint32_t seq = keyboard_led_seq();
   for (struct hid_dev *h = hids; h; h = h->next) {
     if (h->has_led && h->led_seq != seq) {
@@ -376,7 +408,7 @@ static void register_dev(struct hid_dev *h, const char *how)
 {
   con_write("hid: ");
   print_roles(h->roles);
-  con_printf(" %s (%s protocol)\n", how, h->boot ? "boot" : "report");
+  con_printf(" %s\n", how);
   h->next = hids;
   hids = h;
   if (h->roles & HID_ROLE_GAMEPAD) {
@@ -446,8 +478,8 @@ static void bind_iface(struct usbdev *d, int iface, uint8_t subclass, uint8_t pr
     int n = switch_usb_step(step, out);
     usb_send(h, out[0], out, n);
   }
-  char how[32];
-  ksnprintf(how, sizeof how, "on slot %d if %d", d->slot, iface);
+  char how[64];
+  ksnprintf(how, sizeof how, "on slot %d if %d (%s protocol)", d->slot, iface, h->boot ? "boot" : "report");
   register_dev(h, how);
   d->bound |= USBH_BOUND_HID;
 }
@@ -533,8 +565,8 @@ struct hid_dev *hid_bt_add(const uint8_t *rd, int len, int (*send)(void *ctx, ui
     return 0;
   memset(h, 0, sizeof *h);
   h->link = ctx;
-  h->bt_send = send;
-  h->send = bt_out;
+  h->ext_send = send;
+  h->send = ext_out;
   h->bt = true;
   h->kind = pad_kind_name(name);
   if (len <= 0 || hid_parse(rd, (size_t)len, &h->desc) != 0 || !(h->roles = hid_roles(&h->desc))) {
@@ -547,13 +579,39 @@ struct hid_dev *hid_bt_add(const uint8_t *rd, int len, int (*send)(void *ctx, ui
     return 0;
   }
   scan_outputs(h);
-  register_dev(h, "over bluetooth");
+  register_dev(h, "over bluetooth (report protocol)");
   return h;
 }
 
 void hid_bt_report(struct hid_dev *h, const uint8_t *data, int len) { hid_report(h, data, len); }
 
-void hid_bt_remove(struct hid_dev *h)
+struct hid_dev *hid_pad_add(enum pad_kind kind, uint16_t vid, uint16_t pid,
+                            int (*send)(void *ctx, uint8_t id, const uint8_t *buf, int n), void *ctx)
+{
+  struct hid_dev *h = kmalloc(sizeof *h);
+  if (!h)
+    return 0;
+  memset(h, 0, sizeof *h);
+  h->ext_send = send;
+  h->link = ctx;
+  h->send = ext_out;
+  h->kind = kind;
+  h->vid = vid;
+  h->pid = pid;
+  h->roles = HID_ROLE_GAMEPAD;
+  register_dev(h, "over USB (vendor protocol)");
+  return h;
+}
+
+void hid_pad_report(struct hid_dev *h, uint32_t buttons, uint8_t hat, const int32_t axes[6])
+{
+  int32_t all[HID_PAD_AXES] = {0};
+  for (int i = 0; i < 6; i++)
+    all[i] = axes[i];
+  pad_set(h, buttons, hat, all);
+}
+
+void hid_dev_remove(struct hid_dev *h)
 {
   for (struct hid_dev **pp = &hids; *pp; pp = &(*pp)->next)
     if (*pp == h) {

@@ -2,6 +2,7 @@
 #ifndef OWOS_HID_H
 #define OWOS_HID_H
 
+#include "hid_pad.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -30,6 +31,12 @@ struct hid_dev;
 struct hid_dev *hid_bt_add(const uint8_t *rd, int len, int (*send)(void *ctx, uint8_t id, const uint8_t *buf, int n),
                            void *ctx, const char *name);
 void hid_bt_report(struct hid_dev *h, const uint8_t *data, int len);
-void hid_bt_remove(struct hid_dev *h);
+void hid_dev_remove(struct hid_dev *h);
+
+/* A game controller on a vendor protocol (no HID descriptor): the driver decodes its own reports and hands over the
+ * canonical state (see hid_pad.h); send writes one output report. Remove with hid_dev_remove. */
+struct hid_dev *hid_pad_add(enum pad_kind kind, uint16_t vid, uint16_t pid,
+                            int (*send)(void *ctx, uint8_t id, const uint8_t *buf, int n), void *ctx);
+void hid_pad_report(struct hid_dev *h, uint32_t buttons, uint8_t hat, const int32_t axes[6]);
 
 #endif /* OWOS_HID_H */
