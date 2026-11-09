@@ -5,9 +5,6 @@
 #include "owos.h"
 #include "svcb.h"
 
-/* Fallback nameserver when /etc/resolv.conf is absent/unreadable (SLIRP's DNS). */
-static const char DNS_DEFAULT[] = "10.0.2.3";
-
 static int is_digit(char c) { return c >= '0' && c <= '9'; }
 
 /* Parse a dotted-quad IP literal into out. 1 on success, 0 otherwise. */
@@ -113,8 +110,8 @@ static int have_global_v6(void)
 #define NS_LEN 40
 
 /* Collect up to NS_MAX nameservers into list: "nameserver ADDR" lines of /etc/resolv.conf (IPv4 or IPv6),
- * then the router-advertised DNS server. IPv6 servers are skipped without a global address. Falls back to
- * DNS_DEFAULT when none is found. Returns the count. */
+ * then the router-advertised DNS server. IPv6 servers are skipped without a global address. Returns the count
+ * (0 if none is configured). */
 static int read_nameservers(char list[NS_MAX][NS_LEN])
 {
   int count = 0, v6 = have_global_v6();
@@ -148,10 +145,6 @@ static int read_nameservers(char list[NS_MAX][NS_LEN])
       memcpy(list[count++], tok, k + 1);
   }
 
-  if (count == 0) {
-    memcpy(list[0], DNS_DEFAULT, sizeof DNS_DEFAULT);
-    count = 1;
-  }
   char ra[48];
   n = v6 ? readfile("/sys/class/net/eth0/dns6", ra, (int)sizeof ra - 1) : 0;
   if (n > 1 && count < NS_MAX) {
@@ -164,6 +157,15 @@ static int read_nameservers(char list[NS_MAX][NS_LEN])
       memcpy(list[count++], ra, strlen(ra) + 1);
   }
   return count;
+}
+
+int resolve_nameserver(char *out, int cap)
+{
+  char list[NS_MAX][NS_LEN];
+  if (read_nameservers(list) == 0 || (int)strlen(list[0]) >= cap)
+    return 0;
+  memcpy(out, list[0], strlen(list[0]) + 1);
+  return 1;
 }
 
 static unsigned be16(const unsigned char *p) { return ((unsigned)p[0] << 8) | p[1]; }

@@ -1,8 +1,9 @@
 /* dig.c - a DNS lookup tool over a UDP socket; builds the query and parses the response itself.
  *
- * Resolver defaults to 8.8.8.8; override with @server. Interruptible (net_recv -> NET_EINTR).
+ * The resolver defaults to the first configured DNS server (an error if none); override with @server.
+ * Interruptible (net_recv -> NET_EINTR).
  *
- *   dig example.com            A record via 8.8.8.8
+ *   dig example.com            A record via the configured server
  *   dig example.com MX
  *   dig @10.0.2.3 example.com  use a specific resolver
  */
@@ -158,7 +159,9 @@ static void put_rdata(const unsigned char *msg, int end, int type, int rd, int r
 
 int main(int argc, char **argv)
 {
-  const char *server = "8.8.8.8", *host = 0, *typestr = 0;
+  char configured[40];
+  const char *server = resolve_nameserver(configured, sizeof configured) ? configured : 0;
+  const char *host = 0, *typestr = 0;
   static const struct opt opts[] = {{'h', "help", OPT_FLAG, 'h', 0, "show this help"}};
   struct optstate st;
   opt_init(&st, argc, argv);
@@ -181,6 +184,10 @@ int main(int argc, char **argv)
   }
   if (!host) {
     opt_print_usage("dig", "[@SERVER] HOST [TYPE]", opts, OPT_N(opts));
+    return 1;
+  }
+  if (!server) {
+    puts("dig: no DNS server configured (use @server)\n");
     return 1;
   }
   int qtype = 1;

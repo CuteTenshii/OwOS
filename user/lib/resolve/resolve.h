@@ -5,7 +5,7 @@
  *   - an IP literal (dotted quad or IPv6) is parsed directly,
  *   - a ".local" name is delegated to user/lib/mdns (mdns_resolve),
  *   - anything else is a unicast DNS query (A, or AAAA for resolve6) to the nameservers in
- *     /etc/resolv.conf, plus the router-advertised one (a sane default if none).
+ *     /etc/resolv.conf, plus the router-advertised one (no built-in fallback: the lookup fails if none).
  * The DNS wire build/parse mirrors dig.c (name-compression aware). Links with
  * $(RESOLVE), which pulls in $(MDNS). Interruptible: NET_EINTR (-4) on Ctrl+C.
  */
@@ -20,6 +20,10 @@ int resolve(const char *host, unsigned char ip[4]);
  * resolv.conf / router-advertised servers. Returns 1 on success (ip filled), 0 on failure/timeout or for IPv4 literals
  * and ".local" names, or NET_EINTR. */
 int resolve6(const char *host, unsigned char ip[16]);
+
+/* Copy the first configured DNS server (resolv.conf, else router-advertised) as text into out[cap]. Returns 1,
+ * or 0 if none is configured or it does not fit. */
+int resolve_nameserver(char *out, int cap);
 
 /* Look up the HTTPS RR (RFC 9460) for host:port and copy its ECHConfigList (the `ech` SvcParam) into
  * out. Returns the list length, or 0 if there is none, it does not fit in `max`, or the query failed.

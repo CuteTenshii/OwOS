@@ -10,6 +10,7 @@
 #define resolve rt_resolve
 #define resolve6 rt_resolve6
 #define resolve_ech rt_resolve_ech
+#define resolve_nameserver rt_resolve_nameserver
 #define net_connect rt_net_connect
 #define net_send rt_net_send
 #define net_recv rt_net_recv
@@ -131,7 +132,7 @@ static void reset(void)
   g_nconnect = g_nquery_a = g_nquery_aaaa = 0;
   g_has_a = g_has_aaaa = g_v6_connect_fails = 0;
   g_ip6addr = "\n";
-  g_resolv = NULL;
+  g_resolv = "nameserver 10.0.2.3\n";
   g_dns6 = "\n";
   g_silent = NULL;
   g_ntried = 0;
@@ -326,6 +327,32 @@ static void test_nameserver_list(void)
   expect(g_ntried >= 2 && !strcmp(g_tried[g_ntried - 1], "fec0::3"));
 }
 
+static void test_no_nameserver_no_lookup(void)
+{
+  unsigned char ip[4];
+  reset();
+  g_resolv = NULL;
+  g_has_a = 1;
+  expect(resolve("example.com", ip) == 0);
+  expect_eq(g_nconnect, 0); /* nothing is sent anywhere */
+  int fam = 0;
+  expect(net_dial_fam("example.com", 80, SK_TCP, &fam) == -2);
+  expect_eq(g_nconnect, 0);
+}
+
+static void test_first_configured_nameserver(void)
+{
+  char ns[40];
+  reset();
+  g_resolv = NULL;
+  expect(!resolve_nameserver(ns, sizeof ns)); /* none configured */
+
+  g_resolv = "# comment\nnameserver 192.0.2.53\nnameserver 192.0.2.54\n";
+  expect(resolve_nameserver(ns, sizeof ns));
+  expect_string(ns, "192.0.2.53");
+  expect(!resolve_nameserver(ns, 5));
+}
+
 int main(void)
 {
   test("IPv6 literal parsing", test_literals);
@@ -339,5 +366,7 @@ int main(void)
   test("forced address family", test_dial_forced_family);
   test("dial of an unresolvable name", test_dial_unresolvable);
   test("nameserver list: resolv.conf, IPv6, router-advertised", test_nameserver_list);
+  test("no nameserver, no lookup", test_no_nameserver_no_lookup);
+  test("first configured nameserver", test_first_configured_nameserver);
   return 0;
 }
