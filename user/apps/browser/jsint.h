@@ -92,6 +92,9 @@ js_value response_consume(js_ctx *ctx, js_value resp, int kind);
 js_value response_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc); /* new Response(body, init) */
 void js_webapi_teardown(void);                                                 /* unroot the Encoding-API prototypes  */
 
+/* A global observer class: ctor native plus its prototype (rooted), from js/webapi.c */
+js_object *observer_class(js_ctx *ctx, js_object *win, const char *name, js_native ctor, js_object **proto);
+
 /* HTMLMediaElement + Remote Playback + new Image()/Audio() (js_media.c) */
 void setup_media_proto(js_ctx *ctx);
 void setup_remote_proto(js_ctx *ctx);

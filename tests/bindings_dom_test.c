@@ -670,7 +670,90 @@ static void test_resize_observer(void)
   run_script("obs.disconnect();\n");
   test_box_w = 20;
   expect(js_resize_pump() == 0);
+  test_box_w = 30;
+  run_script("window.ro=[]; obs.observe(el, {box:'border-box'});\n"
+             "var bad=false; try { obs.observe(el, {box:'nope'}); } catch (e) { bad=e instanceof TypeError; }\n"
+             "expect(bad, 'invalid box option');\n");
+  expect(js_resize_pump() == 1);
   test_box_w = test_box_h = 0;
+  expect(js_resize_pump() == 1);
+  run_script("expect(ro.join()==='30x50/30,0x0/0', 'a target without a box reports 0x0 once: '+ro);\n"
+             "obs.disconnect();\n");
+}
+
+static void test_intersection_observer(void)
+{
+  extern int test_box_x, test_box_y, test_box_w, test_box_h, test_scroll;
+  test_box_x = 10;
+  test_box_y = 2000;
+  test_box_w = 100;
+  test_box_h = 100;
+  run_script(
+      "window.io=[]; window.el=document.createElement('div'); document.body.appendChild(el);\n"
+      "window.obs=new IntersectionObserver(function(entries, o){ entries.forEach(function(e){ io.push("
+      "(e.target===el)+':'+e.isIntersecting+':'+e.intersectionRatio.toFixed(2)+':'+e.boundingClientRect.top+':'+"
+      "e.intersectionRect.height+':'+e.rootBounds.height); }); }, {threshold:[0, 0.5, 1]});\n"
+      "expect(obs.thresholds.join()==='0,0.5,1' && obs.rootMargin==='0px' && obs.root===null, 'observer fields');\n"
+      "obs.observe(el); obs.observe(el);\n"
+      "var bad=0; try { new IntersectionObserver(function(){}, {threshold:2}); } catch (e) { bad+=e instanceof "
+      "RangeError; }\n"
+      "try { new IntersectionObserver(function(){}, {rootMargin:'bogus'}); } catch (e) { bad+=e.name==='SyntaxError'; "
+      "}\n"
+      "try { new IntersectionObserver(1); } catch (e) { bad+=e instanceof TypeError; }\n"
+      "expect(bad===3, 'constructor validation: '+bad);\n");
+  expect(js_intersection_pump() == 1);
+  expect(js_intersection_pump() == 0);
+  test_scroll = 1280;
+  expect(js_intersection_pump() == 1);
+  test_scroll = 1290;
+  expect(js_intersection_pump() == 1);
+  test_scroll = 1500;
+  expect(js_intersection_pump() == 1);
+  test_scroll = 2200;
+  expect(js_intersection_pump() == 1);
+  run_script(
+      "expect(io.join()==="
+      "'true:false:0.00:2000:0:768,true:true:0.48:720:48:768,true:true:0.58:710:58:768,true:true:1.00:500:100:768,true:"
+      "false:0.00:-200:0:768', "
+      "'crossing thresholds in and out: '+io);\n"
+      "window.io=[]; obs.disconnect();\n"
+      "window.mg=new IntersectionObserver(function(es){ io.push(es[0].isIntersecting+':'+es[0].rootBounds.top+':'+"
+      "es[0].rootBounds.height); }, {rootMargin:'100px 0px'}); mg.observe(el);\n");
+  test_scroll = 1000;
+  test_box_y = 1950;
+  expect(js_intersection_pump() == 1);
+  run_script("expect(io.join()==='false:-100:968', 'rootMargin grows the root: '+io);\n"
+             "mg.disconnect();\n");
+  test_box_x = test_box_y = test_box_w = test_box_h = test_scroll = 0;
+}
+
+static void test_performance_observer(void)
+{
+  run_script(
+      "window.plog=[]; performance.mark('before');\n"
+      "window.po=new PerformanceObserver(function(list, o, opts){ plog.push(list.getEntries().map(function(e){ return "
+      "e.entryType+':'+e.name; }).join('|')+'/'+list.getEntriesByType('mark').length+'/'+(o===po)+'/'+"
+      "opts.droppedEntriesCount); });\n"
+      "po.observe({entryTypes:['mark','measure','bogus']});\n"
+      "performance.mark('a'); performance.measure('m','before','a');\n"
+      "expect(plog.length===0, 'delivery is asynchronous');\n"
+      "expect(PerformanceObserver.supportedEntryTypes.join()==='mark,measure', 'supportedEntryTypes');\n");
+  js_timers_pump();
+  run_script("expect(plog.join()==='mark:a|measure:m/1/true/0', 'batched entries: '+plog);\n"
+             "window.plog=[]; po.disconnect(); performance.mark('c');\n"
+             "expect(po.takeRecords().length===0, 'disconnect stops delivery');\n"
+             "po.observe({type:'mark', buffered:true});\n");
+  js_timers_pump();
+  run_script(
+      "expect(plog.length===1 && plog[0].indexOf('mark:before|mark:a|mark:c')===0, 'buffered replay: '+plog);\n"
+      "window.plog=[]; performance.measure('x'); performance.mark('d');\n"
+      "var taken=po.takeRecords(); expect(taken.length===1 && taken[0].name==='d', 'takeRecords: '+taken.length);\n"
+      "var bad=0; try { po.observe({}); } catch (e) { bad+=e instanceof TypeError; }\n"
+      "try { po.observe({type:'mark', entryTypes:['mark']}); } catch (e) { bad+=e instanceof TypeError; }\n"
+      "try { new PerformanceObserver(1); } catch (e) { bad+=e instanceof TypeError; }\n"
+      "expect(bad===3, 'validation: '+bad);\n");
+  js_timers_pump();
+  run_script("expect(plog.length===0, 'taken records are not redelivered');\n");
 }
 
 static void test_rellist(void)
@@ -751,6 +834,8 @@ int main(void)
   test("TreeWalker, NodeIterator and NodeFilter", test_tree_walker_and_node_iterator);
   test("MutationObserver", test_mutation_observer);
   test("ResizeObserver", test_resize_observer);
+  test("IntersectionObserver", test_intersection_observer);
+  test("PerformanceObserver", test_performance_observer);
   test("relList reflects the rel attribute", test_rellist);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 

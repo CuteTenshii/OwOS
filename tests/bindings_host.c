@@ -215,17 +215,18 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
   return 0;
 }
 /* Box every node reports; tests set it to fake a laid-out page (0 = no layout) */
-int test_box_w, test_box_h;
+int test_box_x, test_box_y, test_box_w, test_box_h, test_scroll;
 int browser_range_box(int s, int e, int *x, int *y, int *w, int *h)
 {
   (void)s;
   (void)e;
-  *x = *y = 0;
+  *x = test_box_x;
+  *y = test_box_y;
   *w = test_box_w;
   *h = test_box_h;
   return test_box_w > 0;
 }
-int browser_scroll_px(void) { return 0; }
+int browser_scroll_px(void) { return test_scroll; }
 const char *browser_ua_version(void) { return "5.0 (OwOS)"; }
 const char *browser_ua(void) { return "Mozilla/5.0 (OwOS)"; }
 void browser_viewport_px(int *w, int *h)

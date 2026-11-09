@@ -345,6 +345,7 @@ int js_has_listeners(void); /* any listener registered */
 bool js_escape_key(void);   /* Escape: close the topmost modal dialog or auto popover */
 bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter); /* method=dialog: close its dialog */
 int js_resize_pump(void);        /* report ResizeObserver size changes; -> # callbacks fired */
+int js_intersection_pump(void);  /* report IntersectionObserver changes; -> # callbacks fired */
 int js_timers_pump(void);        /* fire due setTimeout/Interval/rAF; -> # callbacks fired */
 int js_workers_pump(void);       /* deliver queued Worker postMessage traffic */
 int js_websockets_pump(void);    /* drain live WebSockets -> open/message/close/error events */

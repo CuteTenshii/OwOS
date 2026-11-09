@@ -814,11 +814,115 @@ static js_value mo_disconnect(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* ------------------------------------------------------- ResizeObserver --- *
- * Sizes are polled from the worker tick (js_resize_pump); an observer reports a target whose box differs from
- * the size it last reported (initially 0x0). @targets holds {node, w, h} entries. */
+/* ------------------------------------------- ResizeObserver, IntersectionObserver -- *
+ * Both are polled from the worker tick (js_resize_pump, js_intersection_pump) and deliver synchronously. An
+ * observer holds @cb and @targets, one {node, ...state} entry per target; g_ro_all / g_io_all list the observers
+ * that have targets. A ResizeObserver entry remembers the last reported w/h (initially 0x0); an
+ * IntersectionObserver entry remembers its previous threshold index (initially -1) and isIntersecting. */
 
-static js_object *g_ro_proto, *g_ro_all;
+static js_object *g_ro_proto, *g_ro_all, *g_io_proto, *g_io_all;
+
+static int obs_index(js_ctx *ctx, js_value targets, js_value node)
+{
+  unsigned i;
+  for (i = 0; i < js_array_len(targets.u.obj); i++)
+    if (js_get(ctx, js_get_index(ctx, targets, i), "node").u.obj == node.u.obj)
+      return (int)i;
+  return -1;
+}
+
+static void obs_forget(js_ctx *ctx, js_object **all, js_value observer)
+{
+  js_object *kept;
+  unsigned i;
+  gc_push_scope();
+  kept = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; i < js_array_len(*all); i++) {
+    js_value o = js_get_index(ctx, js_obj_value(*all), i);
+    if (o.u.obj != observer.u.obj)
+      js_array_push(ctx, kept, o);
+  }
+  *all = kept;
+  gc_pop_scope();
+}
+
+/* Register @entry (holding .node) unless the node is already a target */
+static void obs_add(js_ctx *ctx, js_object **all, js_value t, js_object *entry)
+{
+  js_value targets = js_get(ctx, t, "@targets");
+  if (!js_is_array(targets) || obs_index(ctx, targets, js_get(ctx, js_obj_value(entry), "node")) >= 0)
+    return;
+  if (js_array_len(targets.u.obj) == 0)
+    js_array_push(ctx, *all, t);
+  js_array_push(ctx, targets.u.obj, js_obj_value(entry));
+}
+
+static js_value obs_unobserve(js_ctx *ctx, js_object **all, js_value t, js_value node)
+{
+  js_value targets = js_get(ctx, t, "@targets");
+  int at;
+  js_object *kept;
+  unsigned i;
+  if (!js_is_array(targets) || node.type != JV_OBJ || (at = obs_index(ctx, targets, node)) < 0)
+    return js_undef();
+  gc_push_scope();
+  kept = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; i < js_array_len(targets.u.obj); i++)
+    if ((int)i != at)
+      js_array_push(ctx, kept, js_get_index(ctx, targets, i));
+  js_def(t.u.obj, "@targets", js_obj_value(kept), 0);
+  if (js_array_len(kept) == 0)
+    obs_forget(ctx, all, t);
+  gc_pop_scope();
+  return js_undef();
+}
+
+static js_value obs_disconnect(js_ctx *ctx, js_object **all, js_value t)
+{
+  if (t.type != JV_OBJ)
+    return js_undef();
+  gc_push_scope();
+  js_def(t.u.obj, "@targets", js_obj_value(js_new_array(ctx, 0)), 0);
+  obs_forget(ctx, all, t);
+  gc_pop_scope();
+  return js_undef();
+}
+
+/* Copy of the observer list, so callbacks may observe/disconnect while the pump walks it */
+static js_object *obs_snapshot(js_ctx *ctx, js_object *all)
+{
+  js_object *copy = (js_object *)gc_keep(js_new_array(ctx, 0));
+  unsigned i;
+  for (i = 0; i < js_array_len(all); i++)
+    js_array_push(ctx, copy, js_get_index(ctx, js_obj_value(all), i));
+  return copy;
+}
+
+static void obs_deliver(js_ctx *ctx, js_value observer, js_object *entries)
+{
+  js_value argv[2];
+  argv[0] = js_obj_value(entries);
+  argv[1] = observer;
+  js_call(ctx, js_get(ctx, observer, "@cb"), observer, argv, 2);
+  if (ctx->has_exc)
+    report_exc_v(ctx);
+}
+
+static js_value make_rect(js_ctx *ctx, int x, int y, int w, int h)
+{
+  js_object *r = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(r, "x", js_number(x), P_ENUMERABLE);
+  js_def(r, "y", js_number(y), P_ENUMERABLE);
+  js_def(r, "width", js_number(w), P_ENUMERABLE);
+  js_def(r, "height", js_number(h), P_ENUMERABLE);
+  js_def(r, "top", js_number(y), P_ENUMERABLE);
+  js_def(r, "left", js_number(x), P_ENUMERABLE);
+  js_def(r, "right", js_number(x + w), P_ENUMERABLE);
+  js_def(r, "bottom", js_number(y + h), P_ENUMERABLE);
+  return js_obj_value(r);
+}
+
+/* ---- ResizeObserver ---- */
 
 static js_value ro_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
 {
@@ -834,82 +938,37 @@ static js_value ro_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   return js_obj_value(o);
 }
 
-static int ro_index(js_ctx *ctx, js_value targets, js_value node)
-{
-  unsigned i;
-  for (i = 0; i < js_array_len(targets.u.obj); i++)
-    if (js_get(ctx, js_get_index(ctx, targets, i), "node").u.obj == node.u.obj)
-      return (int)i;
-  return -1;
-}
-
 static js_value ro_observe(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value targets = js_get(ctx, t, "@targets");
   js_object *entry;
+  js_value box = A(1).type == JV_OBJ ? js_get(ctx, A(1), "box") : js_undef();
   if (!node_of(A(0)))
     return js_throw_type(ctx, "ResizeObserver.observe: target must be an Element");
-  if (!js_is_array(targets) || ro_index(ctx, targets, A(0)) >= 0)
-    return js_undef();
+  if (box.type != JV_UNDEF) {
+    const char *b = arg_str(ctx, box);
+    if (!streq(b, "content-box") && !streq(b, "border-box") && !streq(b, "device-pixel-content-box"))
+      return js_throw_type(ctx, "ResizeObserver.observe: invalid box option");
+  }
   gc_push_scope();
-  gc_keep(targets.u.obj);
   entry = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   js_def(entry, "node", A(0), 0);
   js_def(entry, "w", js_number(0), P_WRITABLE);
   js_def(entry, "h", js_number(0), P_WRITABLE);
-  if (js_array_len(targets.u.obj) == 0)
-    js_array_push(ctx, g_ro_all, t);
-  js_array_push(ctx, targets.u.obj, js_obj_value(entry));
+  obs_add(ctx, &g_ro_all, t, entry);
   gc_pop_scope();
   return js_undef();
-}
-
-static void ro_forget(js_ctx *ctx, js_value observer)
-{
-  js_object *kept;
-  unsigned i;
-  gc_push_scope();
-  kept = (js_object *)gc_keep(js_new_array(ctx, 0));
-  for (i = 0; i < js_array_len(g_ro_all); i++) {
-    js_value o = js_get_index(ctx, js_obj_value(g_ro_all), i);
-    if (o.u.obj != observer.u.obj)
-      js_array_push(ctx, kept, o);
-  }
-  g_ro_all = kept;
-  gc_pop_scope();
 }
 
 static js_value ro_unobserve(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value targets = js_get(ctx, t, "@targets");
-  int at;
-  js_object *kept;
-  unsigned i;
-  if (!js_is_array(targets) || A(0).type != JV_OBJ || (at = ro_index(ctx, targets, A(0))) < 0)
-    return js_undef();
-  gc_push_scope();
-  kept = (js_object *)gc_keep(js_new_array(ctx, 0));
-  for (i = 0; i < js_array_len(targets.u.obj); i++)
-    if ((int)i != at)
-      js_array_push(ctx, kept, js_get_index(ctx, targets, i));
-  js_def(t.u.obj, "@targets", js_obj_value(kept), 0);
-  if (js_array_len(kept) == 0)
-    ro_forget(ctx, t);
-  gc_pop_scope();
-  return js_undef();
+  return obs_unobserve(ctx, &g_ro_all, t, A(0));
 }
 
 static js_value ro_disconnect(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)args;
   (void)argc;
-  if (t.type != JV_OBJ)
-    return js_undef();
-  gc_push_scope();
-  js_def(t.u.obj, "@targets", js_obj_value(js_new_array(ctx, 0)), 0);
-  ro_forget(ctx, t);
-  gc_pop_scope();
-  return js_undef();
+  return obs_disconnect(ctx, &g_ro_all, t);
 }
 
 static js_value ro_size_list(js_ctx *ctx, int w, int h)
@@ -924,25 +983,17 @@ static js_value ro_size_list(js_ctx *ctx, int w, int h)
 
 static js_value ro_make_entry(js_ctx *ctx, js_value target, int w, int h)
 {
-  js_object *e = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto)),
-            *r = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  js_def(r, "x", js_number(0), P_ENUMERABLE);
-  js_def(r, "y", js_number(0), P_ENUMERABLE);
-  js_def(r, "width", js_number(w), P_ENUMERABLE);
-  js_def(r, "height", js_number(h), P_ENUMERABLE);
-  js_def(r, "top", js_number(0), P_ENUMERABLE);
-  js_def(r, "left", js_number(0), P_ENUMERABLE);
-  js_def(r, "right", js_number(w), P_ENUMERABLE);
-  js_def(r, "bottom", js_number(h), P_ENUMERABLE);
+  js_object *e = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
   js_def(e, "target", target, P_ENUMERABLE);
-  js_def(e, "contentRect", js_obj_value(r), P_ENUMERABLE);
+  js_def(e, "contentRect", make_rect(ctx, 0, 0, w, h), P_ENUMERABLE);
   js_def(e, "contentBoxSize", ro_size_list(ctx, w, h), P_ENUMERABLE);
   js_def(e, "borderBoxSize", ro_size_list(ctx, w, h), P_ENUMERABLE);
   js_def(e, "devicePixelContentBoxSize", ro_size_list(ctx, w, h), P_ENUMERABLE);
   return js_obj_value(e);
 }
 
-/* Deliver size changes to every ResizeObserver; returns the number of callbacks run */
+/* Deliver size changes to every ResizeObserver; returns the number of callbacks run. A target without a box
+ * (not laid out, or removed) reports 0x0 once. */
 int js_resize_pump(void)
 {
   js_ctx *ctx = g_ctx;
@@ -952,9 +1003,7 @@ int js_resize_pump(void)
     return 0;
   gc_push_scope();
   {
-    js_object *observers = (js_object *)gc_keep(js_new_array(ctx, 0));
-    for (i = 0; i < js_array_len(g_ro_all); i++)
-      js_array_push(ctx, observers, js_get_index(ctx, js_obj_value(g_ro_all), i));
+    js_object *observers = obs_snapshot(ctx, g_ro_all);
     for (i = 0; i < js_array_len(observers); i++) {
       js_value ov = js_get_index(ctx, js_obj_value(observers), i), targets = js_get(ctx, ov, "@targets");
       js_object *entries;
@@ -966,7 +1015,7 @@ int js_resize_pump(void)
         js_value en = js_get_index(ctx, targets, j), node = js_get(ctx, en, "node");
         int x, y, w, h;
         if (!node_of(node) || !node_box(node, &x, &y, &w, &h))
-          continue;
+          w = h = 0;
         if (w == (int)js_to_number(ctx, js_get(ctx, en, "w")) && h == (int)js_to_number(ctx, js_get(ctx, en, "h")))
           continue;
         js_set(ctx, en, "w", js_number(w));
@@ -974,12 +1023,7 @@ int js_resize_pump(void)
         js_array_push(ctx, entries, ro_make_entry(ctx, node, w, h));
       }
       if (js_array_len(entries) > 0) {
-        js_value argv[2];
-        argv[0] = js_obj_value(entries);
-        argv[1] = ov;
-        js_call(ctx, js_get(ctx, ov, "@cb"), ov, argv, 2);
-        if (ctx->has_exc)
-          report_exc_v(ctx);
+        obs_deliver(ctx, ov, entries);
         fired++;
       }
       gc_pop_scope();
@@ -989,20 +1033,263 @@ int js_resize_pump(void)
   return fired;
 }
 
-static js_object *observer_class(js_ctx *ctx, js_object *win, const char *name, js_native ctor, js_object **proto)
+/* ---- IntersectionObserver ---- */
+
+/* "10px 5%" -> top/right/bottom/left in @v, @pct marking percentages; 0 on a syntax error */
+static int io_parse_margin(const char *s, double v[4], int pct[4])
 {
-  js_object *c;
-  *proto = js_new_object(ctx, ctx->object_proto);
-  gc_add_root((void **)proto);
+  double t[4], f;
+  int tp[4], n = 0, i;
+  while (*s) {
+    int neg = 0, digits = 0;
+    double val = 0;
+    while (*s == ' ' || *s == '\t')
+      s++;
+    if (!*s)
+      break;
+    if (n == 4)
+      return 0;
+    if (*s == '-' || *s == '+')
+      neg = *s++ == '-';
+    for (; *s >= '0' && *s <= '9'; s++, digits++)
+      val = val * 10 + (*s - '0');
+    if (*s == '.')
+      for (s++, f = 0.1; *s >= '0' && *s <= '9'; s++, digits++, f /= 10)
+        val += (*s - '0') * f;
+    if (!digits)
+      return 0;
+    tp[n] = *s == '%';
+    if (*s == '%')
+      s++;
+    else if (s[0] == 'p' && s[1] == 'x')
+      s += 2;
+    else if (val != 0)
+      return 0;
+    if (*s && *s != ' ' && *s != '\t')
+      return 0;
+    t[n++] = neg ? -val : val;
+  }
+  if (!n)
+    return 0;
+  for (i = 0; i < 4; i++) {
+    int src = n == 1 ? 0 : n == 2 ? i % 2 : n == 3 ? (i == 3 ? 1 : i) : i;
+    v[i] = t[src];
+    pct[i] = tp[src];
+  }
+  return 1;
+}
+
+static js_value io_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  js_object *o, *thr, *margin;
+  js_value opts = A(1), root = js_null(), rm = js_undef(), th = js_undef();
+  const char *rms = "0px";
+  double mv[4], tv[64];
+  int mp[4], nt = 0, i;
+  (void)thisv;
+  if (!js_is_callable(A(0)))
+    return js_throw_type(ctx, "IntersectionObserver: callback must be a function");
+  if (opts.type == JV_OBJ) {
+    root = js_get(ctx, opts, "root");
+    rm = js_get(ctx, opts, "rootMargin");
+    th = js_get(ctx, opts, "threshold");
+  }
+  if (root.type == JV_UNDEF)
+    root = js_null();
+  if (root.type != JV_NULL && !node_of(root))
+    return js_throw_type(ctx, "IntersectionObserver: root must be an Element or Document");
+  if (rm.type != JV_UNDEF)
+    rms = arg_str(ctx, rm);
+  if (!io_parse_margin(rms, mv, mp))
+    return dom_throw(ctx, "SyntaxError", "IntersectionObserver: invalid rootMargin");
+  if (js_is_array(th)) {
+    for (i = 0; i < (int)js_array_len(th.u.obj) && nt < 64; i++)
+      tv[nt++] = js_to_number(ctx, js_get_index(ctx, th, (unsigned)i));
+  } else if (th.type != JV_UNDEF) {
+    tv[nt++] = js_to_number(ctx, th);
+  }
+  if (!nt)
+    tv[nt++] = 0;
+  for (i = 0; i < nt; i++)
+    if (!(tv[i] >= 0 && tv[i] <= 1))
+      return js_throw_range(ctx, "IntersectionObserver: thresholds must be numbers between 0 and 1");
+  for (i = 1; i < nt; i++) {
+    double v = tv[i];
+    int k = i;
+    for (; k > 0 && tv[k - 1] > v; k--)
+      tv[k] = tv[k - 1];
+    tv[k] = v;
+  }
   gc_push_scope();
-  c = (js_object *)gc_keep(js_new_native(ctx, ctor, name, 1));
-  c->fn->data = js_obj_value(*proto);
-  gc_write_barrier(c);
-  js_def(c, "prototype", js_obj_value(*proto), 0);
-  js_def(*proto, "constructor", js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
-  js_def(win, name, js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+  o = (js_object *)gc_keep(js_new_object(ctx, g_io_proto));
+  thr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  margin = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; i < nt; i++)
+    js_array_push(ctx, thr, js_number(tv[i]));
+  for (i = 0; i < 4; i++) {
+    js_array_push(ctx, margin, js_number(mv[i]));
+    js_array_push(ctx, margin, js_number(mp[i]));
+  }
+  js_def(o, "@cb", A(0), 0);
+  js_def(o, "@targets", js_obj_value(js_new_array(ctx, 0)), 0);
+  js_def(o, "@margin", js_obj_value(margin), 0);
+  js_def(o, "root", root, P_ENUMERABLE | P_CONFIGURABLE);
+  js_def(o, "rootMargin", js_mk_cstring(ctx, rms), P_ENUMERABLE | P_CONFIGURABLE);
+  js_def(o, "thresholds", js_obj_value(thr), P_ENUMERABLE | P_CONFIGURABLE);
   gc_pop_scope();
-  return c;
+  return js_obj_value(o);
+}
+
+static js_value io_observe(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *entry;
+  if (!node_of(A(0)))
+    return js_throw_type(ctx, "IntersectionObserver.observe: target must be an Element");
+  gc_push_scope();
+  entry = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(entry, "node", A(0), 0);
+  js_def(entry, "idx", js_number(-1), P_WRITABLE);
+  js_def(entry, "in", js_number(0), P_WRITABLE);
+  obs_add(ctx, &g_io_all, t, entry);
+  gc_pop_scope();
+  return js_undef();
+}
+
+static js_value io_unobserve(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  return obs_unobserve(ctx, &g_io_all, t, A(0));
+}
+
+static js_value io_disconnect(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  return obs_disconnect(ctx, &g_io_all, t);
+}
+
+/* Records are delivered as soon as the pump sees them, so nothing is ever pending */
+static js_value io_take_records(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)t;
+  (void)args;
+  (void)argc;
+  return js_obj_value(js_new_array(ctx, 0));
+}
+
+/* The observer's root box (client px), margins applied; 0 when a given root element has no box */
+static int io_root_rect(js_ctx *ctx, js_value ov, int scroll, int *l, int *t, int *r, int *b)
+{
+  js_value root = js_get(ctx, ov, "root"), margin = js_get(ctx, ov, "@margin");
+  int x = 0, y = 0, w, h, vw, vh, i, m[4];
+  browser_viewport_px(&vw, &vh);
+  w = vw;
+  h = vh;
+  if (root.type == JV_OBJ) {
+    if (!node_box(root, &x, &y, &w, &h))
+      return 0;
+    y -= scroll;
+  }
+  for (i = 0; i < 4; i++) {
+    double v = js_to_number(ctx, js_get_index(ctx, margin, (unsigned)i * 2));
+    int pct = (int)js_to_number(ctx, js_get_index(ctx, margin, (unsigned)i * 2 + 1));
+    m[i] = (int)(pct ? v * (i % 2 ? w : h) / 100 : v);
+  }
+  *l = x - m[3];
+  *t = y - m[0];
+  *r = x + w + m[1];
+  *b = y + h + m[2];
+  return 1;
+}
+
+static double io_now(js_ctx *ctx)
+{
+  js_value perf = js_get(ctx, js_obj_value(ctx->global), "performance");
+  js_value now = js_get(ctx, perf, "now");
+  return js_is_callable(now) ? js_to_number(ctx, js_call(ctx, now, perf, 0, 0)) : 0;
+}
+
+static js_value io_make_entry(js_ctx *ctx, js_value target, double ratio, int in, const int box[4], const int ix[4],
+                              const int root[4], int has_root)
+{
+  js_object *e = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(e, "time", js_number(io_now(ctx)), P_ENUMERABLE);
+  js_def(e, "rootBounds", has_root ? make_rect(ctx, root[0], root[1], root[2] - root[0], root[3] - root[1]) : js_null(),
+         P_ENUMERABLE);
+  js_def(e, "boundingClientRect", make_rect(ctx, box[0], box[1], box[2], box[3]), P_ENUMERABLE);
+  js_def(e, "intersectionRect", make_rect(ctx, ix[0], ix[1], ix[2], ix[3]), P_ENUMERABLE);
+  js_def(e, "isIntersecting", js_bool(in), P_ENUMERABLE);
+  js_def(e, "intersectionRatio", js_number(ratio), P_ENUMERABLE);
+  js_def(e, "target", target, P_ENUMERABLE);
+  return js_obj_value(e);
+}
+
+/* Deliver intersection changes to every IntersectionObserver; returns the number of callbacks run. Layout here
+ * knows no scroll containers or clipping, so only the root box and the target box take part. */
+int js_intersection_pump(void)
+{
+  js_ctx *ctx = g_ctx;
+  unsigned i, j;
+  int fired = 0;
+  if (!ctx || !g_page_live || !g_io_all || js_array_len(g_io_all) == 0)
+    return 0;
+  gc_push_scope();
+  {
+    int scroll = browser_scroll_px();
+    js_object *observers = obs_snapshot(ctx, g_io_all);
+    for (i = 0; i < js_array_len(observers); i++) {
+      js_value ov = js_get_index(ctx, js_obj_value(observers), i), targets = js_get(ctx, ov, "@targets"),
+               thr = js_get(ctx, ov, "thresholds");
+      int root[4], has_root;
+      js_object *entries;
+      if (ov.type != JV_OBJ || !js_is_array(targets) || !js_is_array(thr))
+        continue;
+      gc_push_scope();
+      has_root = io_root_rect(ctx, ov, scroll, &root[0], &root[1], &root[2], &root[3]);
+      entries = (js_object *)gc_keep(js_new_array(ctx, 0));
+      for (j = 0; j < js_array_len(targets.u.obj); j++) {
+        js_value en = js_get_index(ctx, targets, j), node = js_get(ctx, en, "node");
+        int x = 0, y = 0, w = 0, h = 0, laid, in, idx = 0, box[4], ix[4] = {0, 0, 0, 0};
+        double ratio = 0;
+        unsigned k;
+        laid = node_of(node) && node_box(node, &x, &y, &w, &h);
+        y -= scroll;
+        box[0] = x;
+        box[1] = y;
+        box[2] = w;
+        box[3] = h;
+        in = 0;
+        if (laid && has_root) {
+          int l = x > root[0] ? x : root[0], t = y > root[1] ? y : root[1];
+          int r = x + w < root[2] ? x + w : root[2], b = y + h < root[3] ? y + h : root[3];
+          if (l <= r && t <= b) {
+            in = 1;
+            ix[0] = l;
+            ix[1] = t;
+            ix[2] = r - l;
+            ix[3] = b - t;
+            ratio = w && h ? (double)(r - l) * (b - t) / ((double)w * h) : 1;
+          }
+        }
+        if (in)
+          for (k = 0; k < js_array_len(thr.u.obj); k++)
+            if (js_to_number(ctx, js_get_index(ctx, thr, k)) <= ratio)
+              idx++;
+        if (idx == (int)js_to_number(ctx, js_get(ctx, en, "idx")) &&
+            in == (int)js_to_number(ctx, js_get(ctx, en, "in")))
+          continue;
+        js_set(ctx, en, "idx", js_number(idx));
+        js_set(ctx, en, "in", js_number(in));
+        js_array_push(ctx, entries, io_make_entry(ctx, node, ratio, in, box, ix, root, has_root));
+      }
+      if (js_array_len(entries) > 0) {
+        obs_deliver(ctx, ov, entries);
+        fired++;
+      }
+      gc_pop_scope();
+    }
+  }
+  gc_pop_scope();
+  return fired;
 }
 
 void observers_install(js_ctx *ctx, js_object *win)
@@ -1022,6 +1309,13 @@ void observers_install(js_ctx *ctx, js_object *win)
   def_method(g_ro_proto, "disconnect", ro_disconnect, 0);
   g_ro_all = js_new_array(ctx, 0);
   gc_add_root((void **)&g_ro_all);
+  observer_class(ctx, win, "IntersectionObserver", io_ctor, &g_io_proto);
+  def_method(g_io_proto, "observe", io_observe, 1);
+  def_method(g_io_proto, "unobserve", io_unobserve, 1);
+  def_method(g_io_proto, "disconnect", io_disconnect, 0);
+  def_method(g_io_proto, "takeRecords", io_take_records, 0);
+  g_io_all = js_new_array(ctx, 0);
+  gc_add_root((void **)&g_io_all);
 }
 
 void documentapi_teardown(void)
@@ -1034,4 +1328,6 @@ void documentapi_teardown(void)
   gc_remove_root((void **)&g_mo_pending);
   gc_remove_root((void **)&g_ro_proto);
   gc_remove_root((void **)&g_ro_all);
+  gc_remove_root((void **)&g_io_proto);
+  gc_remove_root((void **)&g_io_all);
 }

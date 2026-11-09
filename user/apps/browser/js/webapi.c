@@ -305,6 +305,7 @@ static double perf_resolve(js_ctx *ctx, js_value entries, js_value v)
   }
   return js_to_number(ctx, v);
 }
+static void po_notify(js_ctx *ctx, js_value entry);
 static js_value perf_add_entry(js_ctx *ctx, js_value entries, const char *name, const char *type, double start,
                                double dur)
 {
@@ -319,6 +320,7 @@ static js_value perf_add_entry(js_ctx *ctx, js_value entries, const char *name, 
   e = js_obj_value(o);
   if (entries.type == JV_OBJ && entries.u.obj->kind == OBJ_ARRAY)
     js_array_push(ctx, entries.u.obj, e);
+  po_notify(ctx, e);
   gc_pop_scope();
   return e;
 }
@@ -465,6 +467,247 @@ static js_value perf_tojson(js_ctx *ctx, js_value t, js_value *a, int n)
   return r;
 }
 
+js_object *observer_class(js_ctx *ctx, js_object *win, const char *name, js_native ctor, js_object **proto)
+{
+  js_object *c;
+  *proto = js_new_object(ctx, ctx->object_proto);
+  gc_add_root((void **)proto);
+  gc_push_scope();
+  c = (js_object *)gc_keep(js_new_native(ctx, ctor, name, 1));
+  c->fn->data = js_obj_value(*proto);
+  gc_write_barrier(c);
+  js_def(c, "prototype", js_obj_value(*proto), 0);
+  js_def(*proto, "constructor", js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, name, js_obj_value(c), P_WRITABLE | P_CONFIGURABLE);
+  gc_pop_scope();
+  return c;
+}
+
+/* --- PerformanceObserver ---
+ * An observer holds @cb, @types (the entry types it watches) and @queue. Entries are queued as they are created
+ * and delivered from a 0ms timer. Only the types performance.mark/measure produce are supported. */
+static js_object *g_po_proto, *g_po_all, *g_pel_proto;
+static int g_po_flush_pending;
+
+static int po_supported(const char *type) { return streq(type, "mark") || streq(type, "measure"); }
+
+static int po_wants(js_ctx *ctx, js_value observer, const char *type)
+{
+  js_value types = js_get(ctx, observer, "@types");
+  unsigned i;
+  if (!js_is_array(types))
+    return 0;
+  for (i = 0; i < js_array_len(types.u.obj); i++) {
+    js_value t = js_get_index(ctx, types, i);
+    if (t.type == JV_STR && streq(t.u.str->data, type))
+      return 1;
+  }
+  return 0;
+}
+
+static js_value po_flush(js_ctx *ctx, js_value thisv, js_value *args, int argc);
+
+static void po_schedule_flush(js_ctx *ctx)
+{
+  js_value set_timeout = js_get(ctx, js_obj_value(ctx->global), "setTimeout"), argv[2];
+  if (g_po_flush_pending || !js_is_callable(set_timeout))
+    return;
+  g_po_flush_pending = 1;
+  gc_push_scope();
+  argv[0] = js_obj_value((js_object *)gc_keep(js_new_native(ctx, po_flush, "performanceobserver", 0)));
+  argv[1] = js_number(0);
+  js_call(ctx, set_timeout, js_obj_value(ctx->global), argv, 2);
+  gc_pop_scope();
+}
+
+static void po_notify(js_ctx *ctx, js_value entry)
+{
+  js_value type = js_get(ctx, entry, "entryType");
+  unsigned i;
+  if (!g_po_all || type.type != JV_STR)
+    return;
+  for (i = 0; i < js_array_len(g_po_all); i++) {
+    js_value ov = js_get_index(ctx, js_obj_value(g_po_all), i), queue = js_get(ctx, ov, "@queue");
+    if (js_is_array(queue) && po_wants(ctx, ov, type.u.str->data)) {
+      js_array_push(ctx, queue.u.obj, entry);
+      po_schedule_flush(ctx);
+    }
+  }
+}
+
+static js_value po_flush(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  js_object *observers;
+  unsigned i;
+  (void)thisv;
+  (void)args;
+  (void)argc;
+  g_po_flush_pending = 0;
+  if (!g_po_all)
+    return js_undef();
+  gc_push_scope();
+  observers = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; i < js_array_len(g_po_all); i++)
+    js_array_push(ctx, observers, js_get_index(ctx, js_obj_value(g_po_all), i));
+  for (i = 0; i < js_array_len(observers); i++) {
+    js_value ov = js_get_index(ctx, js_obj_value(observers), i), queue = js_get(ctx, ov, "@queue");
+    js_object *list, *opts;
+    js_value argv[3];
+    if (!js_is_array(queue) || js_array_len(queue.u.obj) == 0)
+      continue;
+    gc_push_scope();
+    gc_keep(queue.u.obj);
+    js_def(ov.u.obj, "@queue", js_obj_value(js_new_array(ctx, 0)), 0);
+    list = (js_object *)gc_keep(js_new_object(ctx, g_pel_proto));
+    js_def(list, "@entries", queue, 0);
+    opts = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_def(opts, "droppedEntriesCount", js_number(0), P_ENUMERABLE);
+    argv[0] = js_obj_value(list);
+    argv[1] = ov;
+    argv[2] = js_obj_value(opts);
+    js_call(ctx, js_get(ctx, ov, "@cb"), ov, argv, 3);
+    if (ctx->has_exc)
+      report_exc(ctx);
+    gc_pop_scope();
+  }
+  gc_pop_scope();
+  return js_undef();
+}
+
+static js_value po_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  js_object *o;
+  (void)thisv;
+  if (!js_is_callable(A(0)))
+    return js_throw_type(ctx, "PerformanceObserver: callback must be a function");
+  gc_push_scope();
+  o = (js_object *)gc_keep(js_new_object(ctx, g_po_proto));
+  js_def(o, "@cb", A(0), 0);
+  js_def(o, "@types", js_obj_value(js_new_array(ctx, 0)), 0);
+  js_def(o, "@queue", js_obj_value(js_new_array(ctx, 0)), 0);
+  gc_pop_scope();
+  return js_obj_value(o);
+}
+
+static void po_register(js_ctx *ctx, js_value t)
+{
+  unsigned i;
+  for (i = 0; i < js_array_len(g_po_all); i++)
+    if (js_get_index(ctx, js_obj_value(g_po_all), i).u.obj == t.u.obj)
+      return;
+  js_array_push(ctx, g_po_all, t);
+}
+
+static js_value po_observe(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value opts = A(0), et, ty, types = js_get(ctx, t, "@types");
+  unsigned i;
+  if (opts.type != JV_OBJ)
+    return js_throw_type(ctx, "PerformanceObserver.observe: options must be an object");
+  if (!js_is_array(types))
+    return js_undef();
+  et = js_get(ctx, opts, "entryTypes");
+  ty = js_get(ctx, opts, "type");
+  if (et.type == JV_UNDEF && ty.type == JV_UNDEF)
+    return js_throw_type(ctx, "PerformanceObserver.observe: entryTypes or type is required");
+  if (et.type != JV_UNDEF && ty.type != JV_UNDEF)
+    return js_throw_type(ctx, "PerformanceObserver.observe: entryTypes and type are mutually exclusive");
+  gc_push_scope();
+  if (et.type != JV_UNDEF) {
+    js_object *kept;
+    if (!js_is_array(et)) {
+      gc_pop_scope();
+      return js_throw_type(ctx, "PerformanceObserver.observe: entryTypes must be a sequence");
+    }
+    kept = (js_object *)gc_keep(js_new_array(ctx, 0));
+    for (i = 0; i < js_array_len(et.u.obj); i++) {
+      js_value s = js_to_string(ctx, js_get_index(ctx, et, i));
+      if (s.type == JV_STR && po_supported(s.u.str->data))
+        js_array_push(ctx, kept, s);
+    }
+    js_def(t.u.obj, "@types", js_obj_value(kept), 0);
+    if (js_array_len(kept) > 0)
+      po_register(ctx, t);
+  } else {
+    js_value s = js_to_string(ctx, ty);
+    if (s.type == JV_STR && po_supported(s.u.str->data)) {
+      if (!po_wants(ctx, t, s.u.str->data))
+        js_array_push(ctx, types.u.obj, s);
+      po_register(ctx, t);
+      if (js_to_boolean(js_get(ctx, opts, "buffered"))) {
+        js_value perf = js_get(ctx, js_obj_value(ctx->global), "performance");
+        js_value past = js_get(ctx, perf, "@entries"), queue = js_get(ctx, t, "@queue");
+        if (js_is_array(past) && js_is_array(queue))
+          for (i = 0; i < js_array_len(past.u.obj); i++) {
+            js_value e = js_get_index(ctx, past, i), et2 = js_get(ctx, e, "entryType");
+            if (et2.type == JV_STR && streq(et2.u.str->data, s.u.str->data))
+              js_array_push(ctx, queue.u.obj, e);
+          }
+        if (js_is_array(queue) && js_array_len(queue.u.obj) > 0)
+          po_schedule_flush(ctx);
+      }
+    }
+  }
+  gc_pop_scope();
+  return js_undef();
+}
+
+static js_value po_disconnect(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *kept;
+  unsigned i;
+  (void)args;
+  (void)argc;
+  if (t.type != JV_OBJ || !g_po_all)
+    return js_undef();
+  gc_push_scope();
+  js_def(t.u.obj, "@types", js_obj_value(js_new_array(ctx, 0)), 0);
+  js_def(t.u.obj, "@queue", js_obj_value(js_new_array(ctx, 0)), 0);
+  kept = (js_object *)gc_keep(js_new_array(ctx, 0));
+  for (i = 0; i < js_array_len(g_po_all); i++) {
+    js_value o = js_get_index(ctx, js_obj_value(g_po_all), i);
+    if (o.u.obj != t.u.obj)
+      js_array_push(ctx, kept, o);
+  }
+  g_po_all = kept;
+  gc_pop_scope();
+  return js_undef();
+}
+
+static js_value po_take_records(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value queue = js_get(ctx, t, "@queue");
+  (void)args;
+  (void)argc;
+  if (!js_is_array(queue) || t.type != JV_OBJ)
+    return js_obj_value(js_new_array(ctx, 0));
+  js_def(t.u.obj, "@queue", js_obj_value(js_new_array(ctx, 0)), 0);
+  return queue;
+}
+
+static void po_setup(js_ctx *ctx, js_object *win)
+{
+  js_object *ctor, *supported;
+  gc_push_scope();
+  ctor = observer_class(ctx, win, "PerformanceObserver", po_ctor, &g_po_proto);
+  def_method(g_po_proto, "observe", po_observe, 1);
+  def_method(g_po_proto, "disconnect", po_disconnect, 0);
+  def_method(g_po_proto, "takeRecords", po_take_records, 0);
+  supported = (js_object *)gc_keep(js_new_array(ctx, 0));
+  js_array_push(ctx, supported, js_mk_cstring(ctx, "mark"));
+  js_array_push(ctx, supported, js_mk_cstring(ctx, "measure"));
+  js_def(ctor, "supportedEntryTypes", js_obj_value(supported), P_ENUMERABLE);
+  g_pel_proto = js_new_object(ctx, ctx->object_proto);
+  gc_add_root((void **)&g_pel_proto);
+  def_method(g_pel_proto, "getEntries", perf_getentries, 0);
+  def_method(g_pel_proto, "getEntriesByType", perf_getbytype, 1);
+  def_method(g_pel_proto, "getEntriesByName", perf_getbyname, 2);
+  g_po_all = js_new_array(ctx, 0);
+  gc_add_root((void **)&g_po_all);
+  g_po_flush_pending = 0;
+  gc_pop_scope();
+}
+
 void js_webapi_setup(js_ctx *ctx, js_object *win)
 {
   g_textencoder_proto = js_new_object(ctx, ctx->object_proto);
@@ -544,6 +787,7 @@ void js_webapi_setup(js_ctx *ctx, js_object *win)
     js_def(win, "performance", js_obj_value(perf), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
+  po_setup(ctx, win);
   /* TextEncoder / TextDecoder (WHATWG Encoding API) */
   def_method(g_textencoder_proto, "encode", textenc_encode, 1);
   def_method(g_textencoder_proto, "encodeInto", textenc_encodeinto, 2);
@@ -571,4 +815,8 @@ void js_webapi_teardown(void)
   gc_remove_root((void **)&g_textencoder_proto);
   gc_remove_root((void **)&g_textdecoder_proto);
   g_textencoder_proto = g_textdecoder_proto = 0;
+  gc_remove_root((void **)&g_po_proto);
+  gc_remove_root((void **)&g_pel_proto);
+  gc_remove_root((void **)&g_po_all);
+  g_po_proto = g_pel_proto = g_po_all = 0;
 }

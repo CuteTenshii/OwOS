@@ -1172,22 +1172,6 @@ int worker_permission(int feature)
   return state;
 }
 
-/* The Observer family (Mutation/Intersection/Resize/Performance) */
-static js_value observer_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
-{
-  js_object *o;
-  (void)thisv;
-  (void)args;
-  (void)argc;
-  gc_push_scope();
-  o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-  js_def_native(ctx, o, "observe", el_noop, 2);
-  js_def_native(ctx, o, "unobserve", el_noop, 1);
-  js_def_native(ctx, o, "disconnect", el_noop, 0);
-  js_def_native(ctx, o, "takeRecords", el_empty_array, 0);
-  gc_pop_scope();
-  return js_obj_value(o);
-}
 static js_value win_matchmedia(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   js_object *o;
@@ -2612,17 +2596,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "history", js_obj_value(hist), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
-  /* IntersectionObserver, PerformanceObserver + matchMedia + queueMicrotask: present but inert */
-  {
-    js_object *io = js_new_native(ctx, observer_ctor, "IntersectionObserver", 1);
-    js_object *po = js_new_native(ctx, observer_ctor, "PerformanceObserver", 1);
-    gc_push_scope();
-    gc_keep(io);
-    gc_keep(po);
-    js_def(win, "IntersectionObserver", js_obj_value(io), P_WRITABLE | P_CONFIGURABLE);
-    js_def(win, "PerformanceObserver", js_obj_value(po), P_WRITABLE | P_CONFIGURABLE);
-    gc_pop_scope();
-  }
+  /* matchMedia + queueMicrotask: present but inert */
   def_method(win, "matchMedia", win_matchmedia, 1);
   js_def(win, "localStorage", make_storage(ctx), P_WRITABLE | P_CONFIGURABLE);
   js_idb_setup(ctx, win);
