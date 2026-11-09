@@ -2385,6 +2385,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   }
   js_webapi_setup(ctx, win);
   js_streams_setup(ctx, win);
+  js_webaudio_setup(ctx, win);
   /* URL + URLSearchParams (WHATWG Web APIs over curl/url.h) */
   def_method(g_url_proto, "toString", url_tostring, 0);
   def_method(g_url_proto, "toJSON", url_tostring, 0);

@@ -80,10 +80,20 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc); /* window
 void emit_event(js_object *w, const char *type, js_value data);        /* fire a plain Event on w */
 
 /* ---- subsystem setup entry points --------------------------------------- */
-void js_idb_setup(js_ctx *ctx, js_object *win);         /* IndexedDB (js_indexeddb.c) */
-void js_idb_teardown(void);                             /* unroot the page's IDB state  */
-void js_webapi_setup(js_ctx *ctx, js_object *win);      /* performance + Encoding (js_webapi.c) */
-void js_streams_setup(js_ctx *ctx, js_object *win);     /* Streams API, lazily compiled (js/streams.c) */
+void js_idb_setup(js_ctx *ctx, js_object *win);     /* IndexedDB (js_indexeddb.c) */
+void js_idb_teardown(void);                         /* unroot the page's IDB state  */
+void js_webapi_setup(js_ctx *ctx, js_object *win);  /* performance + Encoding (js_webapi.c) */
+void js_streams_setup(js_ctx *ctx, js_object *win); /* Streams API, lazily compiled (js/streams.c) */
+void js_webaudio_setup(js_ctx *ctx,
+                       js_object *win); /* AudioContext + AudioWorkletNode, lazily compiled (js/webaudio.c) */
+js_value js_audio_thread(js_ctx *ctx);  /* a hidden worker running an AudioWorkletGlobalScope */
+/* the AudioWorkletGlobalScope on its worker thread (js/audioworklet.c, hooks in js/webworker.c) */
+void js_worklet_install(js_ctx *ctx);
+bool js_worklet_render(js_ctx *ctx);
+void js_worklet_end(void);
+
+void js_worklet_post(js_ctx *ctx, js_value v);
+int js_worklet_add_module(js_ctx *ctx, const char *spec);
 js_value js_streams_run(js_ctx *ctx, js_arena **arena); /* the Streams classes as an exports object, for any context */
 enum { CONSUME_BUFFER, CONSUME_TEXT, CONSUME_BLOB, CONSUME_JSON };
 /* A Response body init as raw bytes in a string. A ReadableStream is returned through *stream instead; ctype is

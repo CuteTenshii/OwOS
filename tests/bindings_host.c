@@ -412,3 +412,43 @@ void bluetooth_install(js_ctx *ctx, js_object *navigator, const char *page_url)
   (void)page_url;
 }
 void bluetooth_teardown(void) {}
+
+/* PCM sink for the audio worklet: counts the frames it was given and keeps the loudest sample (the worklet runs on
+ * its own thread, so everything the tests read is atomic) */
+int host_audio_available = 1;
+int host_audio_opens;
+long host_audio_frames;
+int host_audio_peak;
+static int audio_is_open;
+
+int audio_open(void)
+{
+  if (!__atomic_load_n(&host_audio_available, __ATOMIC_RELAXED) || audio_is_open)
+    return -1;
+  audio_is_open = 1;
+  __atomic_add_fetch(&host_audio_opens, 1, __ATOMIC_RELAXED);
+  return 0;
+}
+
+int audio_write(const void *pcm, int len)
+{
+  const short *s = pcm;
+  int i, peak = __atomic_load_n(&host_audio_peak, __ATOMIC_RELAXED);
+  if (!audio_is_open)
+    return -1;
+  for (i = 0; i < len / 2; i++) {
+    int v = s[i] < 0 ? -s[i] : s[i];
+    if (v > peak)
+      peak = v;
+  }
+  __atomic_store_n(&host_audio_peak, peak, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&host_audio_frames, len / 4, __ATOMIC_RELAXED);
+  msleep((unsigned)(len / 4 * 1000 / 48000));
+  return len;
+}
+
+int audio_close(void)
+{
+  audio_is_open = 0;
+  return 0;
+}

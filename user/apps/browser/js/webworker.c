@@ -66,6 +66,7 @@ struct wthread {
   int id;
   struct wthread *parent; /* the worker that started this one, or NULL for a page worker */
   int shared;             /* a SharedWorker: pages with the same URL and name connect to it */
+  int worklet;            /* the AudioWorkletGlobalScope of a context: no script of its own, it renders audio */
   int tid;
   void *stack;
   char *stack_lo;
@@ -1383,6 +1384,45 @@ static js_value wt_n_port_close(js_ctx *ctx, js_value t, js_value *args, int arg
 }
 
 /* Run parts up to and including `upto`; false (exception pending) if one fails */
+/* ---- the audio worklet (audioworklet.c) ---- */
+
+void js_worklet_post(js_ctx *ctx, js_value v)
+{
+  js_clone *c = js_clone_write(ctx, v, js_undef());
+  if (c)
+    wmsg_post(cur_wt, &cur_wt->out, WM_DATA, 0, c, 0);
+}
+
+/* Run a module script in the worklet scope: 0, or -1 with the exception left pending */
+int js_worklet_add_module(js_ctx *ctx, const char *spec)
+{
+  js_object *exports;
+  char *src = 0, url[URL_MAX];
+  bool ok;
+  if (wt_fetch(cur_wt, cur_wt->url, spec, &src)) {
+    free(src);
+    throw_err(ctx, "AbortError", "Unable to load the worklet module");
+    return -1;
+  }
+  snprintf(url, sizeof url, "%s", cur_wt->rpc_url);
+  gc_push_scope();
+  exports = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  ok = wt_eval(ctx, cur_wt, src, url, exports, NULL);
+  gc_pop_scope();
+  free(src);
+  return ok ? 0 : -1;
+}
+
+/* One quantum of the graph; true if one was rendered */
+static bool worklet_render(js_ctx *ctx)
+{
+  bool rendered = js_worklet_render(ctx);
+  if (ctx->has_exc)
+    wt_report(ctx);
+  wt_run_microtasks(ctx);
+  return rendered;
+}
+
 static bool wt_load_parts(js_ctx *ctx, unsigned upto)
 {
   js_value n = js_get(ctx, js_obj_value(ctx->global), "@N"), l = js_get(ctx, js_obj_value(ctx->global), "@L");
@@ -1597,6 +1637,8 @@ static void wt_loop(js_ctx *ctx, struct wthread *wt)
       continue;
     if (fire_due_timer(ctx))
       continue;
+    if (wt->worklet && worklet_render(ctx))
+      continue;
     if (ntimers) { /* sleep until the nearest timer; futex time 0 means forever */
       unsigned now = msec();
       int best = (int)(timers[0].due - now);
@@ -1624,6 +1666,14 @@ static void wt_run(js_ctx *ctx, struct wthread *wt)
   canvas_js_setup_worker(ctx, ctx->global);
   if (!wt_run_parts(ctx, wt)) {
     wt_report(ctx);
+    return;
+  }
+  if (wt->worklet) {
+    if (wt_load_parts(ctx, PART_NET)) {
+      js_worklet_install(ctx);
+      wt_loop(ctx, wt);
+    } else
+      wt_report(ctx);
     return;
   }
   if (!wt->src) {
@@ -1685,6 +1735,8 @@ static void worker_main(void *arg)
   }
   for (i = 0; i < WS_MAX; i++)
     ws_free(wsconns[i]);
+  if (wt->worklet)
+    js_worklet_end();
   free(wt->arenas);
   wt->arenas = 0;
   free(wt->src);
@@ -2461,9 +2513,12 @@ static struct wthread *worker_create(js_ctx *ctx, int id, const char *url, const
   wt->stack_lo = (char *)wt->stack - WORKER_STACK;
   wt->id = id;
   wt->parent = parent;
-  snprintf(wt->url, sizeof wt->url, "%s", url);
   snprintf(wt->name, sizeof wt->name, "%s", name);
   wt->module = module;
+  wt->worklet = url == 0;
+  if (!url)
+    url = g_page_url_buf;
+  snprintf(wt->url, sizeof wt->url, "%s", url);
   inl = starts_ci(url, "blob:") || starts_ci(url, "data:");
   cors_origin(g_page_url_buf, wt->origin, sizeof wt->origin);
   pu.host[0] = 0;
@@ -2473,7 +2528,7 @@ static struct wthread *worker_create(js_ctx *ctx, int id, const char *url, const
   snprintf(wt->pathname, sizeof wt->pathname, "%s", pu.path);
   snprintf(wt->host, sizeof wt->host, "%s", pu.host);
   wt->tls = pu.tls;
-  wt->src = fetch_source(url);
+  wt->src = wt->worklet ? 0 : fetch_source(url);
   gc_push_scope();
   w = (js_object *)gc_keep(js_new_object(ctx, g_worker_proto));
   js_def(w, "onmessage", js_null(), P_WRITABLE | P_ENUMERABLE);
@@ -2497,6 +2552,16 @@ static struct wthread *worker_create(js_ctx *ctx, int id, const char *url, const
   *out = w;
   gc_pop_scope();
   return wt;
+}
+
+/* A hidden worker running the AudioWorkletGlobalScope of one context; the page talks to it through the object */
+js_value js_audio_thread(js_ctx *ctx)
+{
+  js_object *w = 0;
+  const char *ename, *emsg;
+  if (!worker_create(ctx, __atomic_add_fetch(&g_next_wid, 1, __ATOMIC_RELAXED), 0, "", 0, 0, &w, &ename, &emsg))
+    return throw_err(ctx, ename, emsg);
+  return js_obj_value(w);
 }
 
 static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
