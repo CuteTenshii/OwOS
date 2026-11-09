@@ -748,6 +748,8 @@ static js_value wt_n_url_parse(js_ctx *ctx, js_value t, js_value *args, int argc
   js_def(o, "search", js_mk_cstring(ctx, u.search), P_ENUMERABLE | P_WRITABLE);
   js_def(o, "hash", js_mk_cstring(ctx, u.hash), P_ENUMERABLE | P_WRITABLE);
   js_def(o, "opaque", js_bool(u.opaque), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "hasSearch", js_bool(u.has_search), P_ENUMERABLE | P_WRITABLE);
+  js_def(o, "hasHash", js_bool(u.has_hash), P_ENUMERABLE | P_WRITABLE);
   v = js_obj_value(o);
   gc_pop_scope();
   return v;

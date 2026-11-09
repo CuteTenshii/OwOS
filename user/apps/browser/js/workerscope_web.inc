@@ -85,7 +85,7 @@ JS(
       if (r.username || r.password) { s += r.username + (r.password ? ":" + r.password : "") + "@"; }
       s += r.hostname + (r.port ? ":" + r.port : "");
     }
-    return s + r.pathname + r.search + r.hash;
+    return s + r.pathname + (r.search || (r.hasSearch ? "?" : "")) + (r.hash || (r.hasHash ? "#" : ""));
   }
   function URL(url, base) {
     if (arguments.length === 0) { throw typeError("Failed to construct URL: 1 argument required"); }
@@ -127,11 +127,13 @@ JS(
   });
   urlProp("search", function () { return this["@r"].search; }, function (v) {
     v = String(v);
+    this["@r"].hasSearch = v !== "";
     this["@r"].search = v === "" || v === "?" ? "" : N.urlEscape(v.charAt(0) === "?" ? v : "?" + v, 1);
     if (this["@sp"]) { this["@sp"]["@list"].splice(0, this["@sp"]["@list"].length, ...N.queryParse(this["@r"].search)); }
   });
   urlProp("hash", function () { return this["@r"].hash; }, function (v) {
     v = String(v);
+    this["@r"].hasHash = v !== "";
     this["@r"].hash = v === "" || v === "#" ? "" : N.urlEscape(v.charAt(0) === "#" ? v : "#" + v, 2);
   });
   urlProp("href", function () { return serialize(this["@r"]); }, function (v) {
@@ -151,7 +153,7 @@ JS(
     }
     return this["@sp"];
   }, undefined);
-  hide(URL.prototype, "@sync", function (q) { this["@r"].search = q ? "?" + q : ""; });
+  hide(URL.prototype, "@sync", function (q) { this["@r"].search = q ? "?" + q : ""; this["@r"].hasSearch = !!q; });
   method(URL.prototype, "toString", function () { return this.href; });
   method(URL.prototype, "toJSON", function () { return this.href; });
   hide(g, "URL", URL);

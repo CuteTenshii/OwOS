@@ -412,9 +412,12 @@ static void test_worker_url_edges(void)
              "U(\"mailto:a@b.c?subject=hi\"), U(\"data:text/plain,hi\"),"
              "U(\"https://h\"), U(\"/a/../b/./c/..\",\"http://h/x/y\"), U(\"../../..\",\"http://h/a/b/c/d\"), "
              "U(\"x\"), U(\"\"), "
+             "U(\"?\",\"http://h/p?q\"), U(\"#\",\"http://h/p#a\"), U(\"\",\"http://h/p?\"), U(\"http://h/p?#\"), "
              "U(\"//h2/p\",\"https://h/\"), U(\"file:///etc/passwd\"), U(\"http://u:p@h/\"), U(\"  "
              "http://trim.example/ \"), U(\"y\",\"data:text/plain,hi\"));"
-             "var u=new URL(\"https://e.com/p\"); u.port=\"8443\"; u.hash=\"x\"; u.search=\"a=b\"; u.pathname=\"/q "
+             "var e1=new URL(\"http://h/p?q#f\"); e1.search=\"\"; r.push(e1.href); var e2=new URL(\"http://h/p\"); "
+             "e2.hash=\"#\"; r.push(e2.href); var u=new URL(\"https://e.com/p\"); u.port=\"8443\"; u.hash=\"x\"; "
+             "u.search=\"a=b\"; u.pathname=\"/q "
              "r\"; u.hostname=\"Z.com\"; r.push(u.href);"
              "postMessage(r);');\n"
              "uw.onmessage=function(e){ ue=e.data; };\n");
@@ -423,9 +426,10 @@ static void test_worker_url_edges(void)
       "var "
       "want=['http://[::1]:8080/p','http://example.com/A%20b/"
       "%41?q=%C3%A9%20x#f%20g','mailto:a@b.c?subject=hi','data:text/plain,hi','https://h/',"
-      "'http://h/b/','http://h/','ERR','ERR','https://h2/p','file:///etc/passwd','http://u:p@h/','http://trim.example/"
+      "'http://h/b/','http://h/','ERR','ERR','http://h/p?','http://h/p#','http://h/p?','http://h/p?#','https://h2/"
+      "p','file:///etc/passwd','http://u:p@h/','http://trim.example/"
       "','ERR',"
-      "'https://z.com:8443/q%20r?a=b#x'];\n"
+      "'http://h/p#f','http://h/p#','https://z.com:8443/q%20r?a=b#x'];\n"
       "for (var i=0;i<want.length;i++) expect(ue[i]===want[i], 'URL case '+i+': got '+ue[i]+' want '+want[i]);\n");
 }
 

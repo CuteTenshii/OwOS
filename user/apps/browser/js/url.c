@@ -154,6 +154,9 @@ static void url_lower(char *s)
       *s = (char)(*s + 32);
 }
 
+/* the query as it is written: an empty one that was present still shows its "?" */
+static const char *url_search_of(const struct url_parts *u) { return u->has_search && !u->search[0] ? "?" : u->search; }
+
 static bool url_parse_absolute(const char *input, struct url_parts *r)
 {
   char buf[URL_MAX], *rest, *hash, *query, *colon, *slash, *auth, *at;
@@ -168,6 +171,7 @@ static bool url_parse_absolute(const char *input, struct url_parts *r)
     char tmp[URL_MAX];
     url_escape(tmp, sizeof tmp, hash, "\"<>`");
     snprintf(r->hash, sizeof r->hash, "%s", strcmp(tmp, "#") ? tmp : "");
+    r->has_hash = true;
     *hash = 0;
   }
   query = strchr(buf, '?');
@@ -175,6 +179,7 @@ static bool url_parse_absolute(const char *input, struct url_parts *r)
     char tmp[URL_MAX];
     url_escape(tmp, sizeof tmp, query, "\"<>#'");
     snprintf(r->search, sizeof r->search, "%s", strcmp(tmp, "?") ? tmp : "");
+    r->has_search = true;
     *query = 0;
   }
   colon = strchr(buf, ':');
@@ -319,7 +324,7 @@ bool url_parse(const char *input, const char *base_href, struct url_parts *out)
         *hash = saved;
       if (!ok)
         return false;
-      snprintf(abs, sizeof abs, "%s%s%s%s", base.protocol, base.pathname, base.search, tail);
+      snprintf(abs, sizeof abs, "%s%s%s%s", base.protocol, base.pathname, url_search_of(&base), tail);
       return url_parse_absolute(abs, out);
     }
     {
@@ -328,7 +333,8 @@ bool url_parse(const char *input, const char *base_href, struct url_parts *out)
                base.password, base.username[0] || base.password[0] ? "@" : "", base.hostname, base.port[0] ? ":" : "",
                base.port);
       if (!path[0]) {
-        snprintf(abs, sizeof abs, "%s%s%s%s", root, base.pathname, !query[0] && !cut[0] ? base.search : query, tail);
+        snprintf(abs, sizeof abs, "%s%s%s%s", root, base.pathname, !query[0] && !cut[0] ? url_search_of(&base) : query,
+                 tail);
       } else {
         if (path[0] != '/') {
           char merged[URL_MAX];

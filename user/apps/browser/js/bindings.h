@@ -190,7 +190,8 @@ struct url_parts {
   char hostname[512];
   char port[8]; /* "" for the scheme default */
   char pathname[URL_MAX], search[URL_MAX], hash[URL_MAX];
-  bool opaque; /* mailto:, data:, ... */
+  bool opaque;               /* mailto:, data:, ... */
+  bool has_search, has_hash; /* a "?" or "#" was present, even if nothing follows it */
 };
 bool url_parse(const char *input, const char *base_href, struct url_parts *out);
 void url_escape_kind(char *dst, int cap, const char *src, int kind); /* 0 pathname, 1 query, 2 fragment */
