@@ -257,6 +257,7 @@ void worker_fn(void)
       B->events_live = 0;
       /* This frees the DEPARTING tab's live DOM, but B->pg already points at the tab we switched */
       worker_tab = B->drop_dom_tab;
+      js_page_hide();
       html_page_teardown();
     }
     if (B->recascade) {
@@ -276,6 +277,7 @@ void worker_fn(void)
       B->seq++;
     } else if (B->req_pending) {
       B->req_pending = 0;
+      js_page_hide();
       B->abort_load = 0; /* a fresh navigation clears any pending Stop */
       B->pg->doc_title[0] = '\0';
       tabs[worker_tab].crashed = 0; /* reloading/navigating clears the crash page */

@@ -99,3 +99,24 @@ js_value loc_tostring(js_ctx *ctx, js_value t, js_value *args, int argc)
   (void)argc;
   return js_get(ctx, t, "href");
 }
+
+/* Worker thread: the page is going away (navigation or tab switch), so it becomes hidden */
+void js_page_hide(void)
+{
+  js_value doc, ev;
+  if (!g_page_live || !g_ctx || js_irq_stopped(g_ctx->irq))
+    return;
+  doc = js_obj_value(g_document);
+  if (js_to_boolean(js_get(g_ctx, doc, "hidden")))
+    return;
+  js_set(g_ctx, doc, "visibilityState", js_mk_cstring(g_ctx, "hidden"));
+  js_set(g_ctx, doc, "hidden", js_bool(1));
+  gc_push_scope();
+  ev = make_event("visibilitychange", 0, 0, js_undef());
+  if (ev.type == JV_OBJ) {
+    gc_keep(ev.u.obj);
+    js_set(g_ctx, ev, "cancelable", js_bool(0));
+    dispatch_from(g_document, ev);
+  }
+  gc_pop_scope();
+}

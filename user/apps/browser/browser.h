@@ -355,6 +355,7 @@ void js_page_interrupt(void); /* any thread: unwind the running page script (cle
 int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int y);
 int js_has_listeners(void); /* any listener registered */
 int js_before_unload(void); /* worker: fire beforeunload; 0 if the user chose to stay */
+void js_page_hide(void);    /* worker: page is going away; fire visibilitychange (hidden) */
 bool js_escape_key(void);   /* Escape: close the topmost modal dialog or auto popover */
 bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter); /* method=dialog: close its dialog */
 int js_resize_pump(void);        /* report ResizeObserver size changes; -> # callbacks fired */
