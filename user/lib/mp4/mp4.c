@@ -36,6 +36,7 @@ typedef struct {
   mp4_codec codec;
   unsigned timescale;
   unsigned long long duration;
+  long long edit_start; /* first non-empty edit's media_time */
   unsigned width, height;
   unsigned channels, samplerate, bits;
   const unsigned char *extradata;
@@ -430,13 +431,40 @@ static void parse_mdia(trackbuild *tb, const box *mdia)
   }
 }
 
+/* edts/elst: the first edit that plays media (media_time >= 0) says how many
+ * leading samples (encoder priming) are not part of the presentation. */
+static void parse_edts(trackbuild *tb, const box *edts)
+{
+  boxiter it = {edts->body, edts->bend};
+  box b;
+  while (box_next(&it, &b)) {
+    unsigned version, flags, n, esz;
+    const unsigned char *e;
+    if (!tag4(b.type, "elst") || !fullbox(&b, &version, &flags) || b.body + 8 > b.bend)
+      continue;
+    n = r32(b.body + 4);
+    esz = version == 1 ? 20 : 12;
+    e = b.body + 8;
+    for (; n && e + esz <= b.bend; n--, e += esz) {
+      long long mt = version == 1 ? (long long)r64(e + 8) : (long long)(int)r32(e + 4);
+      if (mt >= 0) {
+        tb->edit_start = mt;
+        return;
+      }
+    }
+  }
+}
+
 static void parse_trak(trackbuild *tb, const box *trak)
 {
   boxiter it = {trak->body, trak->bend};
   box b;
-  while (box_next(&it, &b))
+  while (box_next(&it, &b)) {
     if (tag4(b.type, "mdia"))
       parse_mdia(tb, &b);
+    else if (tag4(b.type, "edts"))
+      parse_edts(tb, &b);
+  }
 }
 
 /* ---- flat sample table --------------------------------------------------- */
@@ -623,6 +651,7 @@ int mp4_open(const unsigned char *buf, unsigned len, mp4 **out)
     t->codec = tb->codec;
     t->timescale = tb->timescale ? tb->timescale : 1;
     t->duration = tb->duration;
+    t->edit_start = tb->edit_start;
     t->width = tb->width;
     t->height = tb->height;
     t->channels = tb->channels;

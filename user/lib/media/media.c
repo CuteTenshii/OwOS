@@ -19,11 +19,7 @@
 
 /* ---- small spinlock (mirrors the user malloc/blk_lock pattern) ------------
  */
-static inline int xchg32(volatile int *p, int v)
-{
-  __asm__ volatile("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
-  return v;
-}
+static inline int xchg32(volatile int *p, int v) { return __sync_lock_test_and_set(p, v); }
 
 static volatile int g_lock;
 static void mlock(void)
@@ -61,6 +57,12 @@ struct media_decoder {
   mp4 *mp4h;
   const mp4_track *aac_trk;
   unsigned aac_samp, aac_nsamp;
+  unsigned aac_prime;   /* MP4: leading frames the edit list drops (encoder priming) */
+  unsigned aac_skip;    /* frames to drop after a seek, to land on the target   */
+  int aac_preroll;      /* AUs to decode and drop to refill the overlap window  */
+  unsigned aac_avg_len; /* ADTS: average frame bytes, estimate when there is no index */
+  unsigned *aac_idx;    /* ADTS: file offset of every 32nd frame                 */
+  unsigned aac_nidx;
 
   /* WAV cursor (PCM s8/s16, mono/stereo) */
   unsigned w_data_off, w_data_len, w_bits, w_channels, w_frame;
@@ -152,6 +154,85 @@ static void aac_refill_adts(media_decoder *d)
   }
 }
 
+/* Fresh decoder state, so a seek doesn't overlap-add the old position's tail. */
+static int aac_reset(media_decoder *d)
+{
+  aac_close(d->aac);
+  d->aac = d->aac_is_mp4 ? aac_open(d->aac_trk->extradata, d->aac_trk->extradata_len, 0) : aac_open_adts();
+  return d->aac != 0;
+}
+
+#define ADTS_IDX_STEP 32
+#define ADTS_SCAN_MAX (16u << 20)
+
+/* Walk the frame headers of a whole ADTS file: exact frame count, plus the offset
+ * of every ADTS_IDX_STEP-th frame for seeking. Leaves d->aac_idx NULL on failure
+ * or for files too large to scan at open. Returns the frame count. */
+static unsigned adts_index(media_decoder *d, unsigned size)
+{
+  unsigned char *b;
+  unsigned off = 0, frames = 0, cap = 0;
+  if (size > ADTS_SCAN_MAX || !(b = malloc(65536)))
+    return 0;
+  for (;;) {
+    int n = readfile_at(d->path, off, b, 65536);
+    unsigned p = 0;
+    if (n < 7)
+      break;
+    while (p + 7 <= (unsigned)n) {
+      unsigned flen = ((unsigned)(b[p + 3] & 3) << 11) | ((unsigned)b[p + 4] << 3) | (b[p + 5] >> 5);
+      if (b[p] != 0xFF || (b[p + 1] & 0xF6) != 0xF0 || flen < 7) {
+        p++;
+        continue;
+      }
+      if (p + flen > (unsigned)n && off + (unsigned)n < size)
+        break; /* frame straddles the chunk: re-read from its start */
+      if (p + flen > (unsigned)n)
+        goto done;
+      if (frames % ADTS_IDX_STEP == 0) {
+        if (d->aac_nidx == cap) {
+          unsigned *ni = realloc(d->aac_idx, (cap ? cap * 2 : 256) * sizeof *ni);
+          if (!ni)
+            goto fail;
+          d->aac_idx = ni;
+          cap = cap ? cap * 2 : 256;
+        }
+        d->aac_idx[d->aac_nidx++] = off + p;
+      }
+      frames++;
+      p += flen;
+    }
+    if (p == 0)
+      p = (unsigned)n;
+    off += p;
+  }
+done:
+  free(b);
+  return frames;
+fail:
+  free(b);
+  free(d->aac_idx);
+  d->aac_idx = 0;
+  d->aac_nidx = 0;
+  return 0;
+}
+
+/* Offset of the first ADTS frame at or after `off` that is followed by another. */
+static unsigned adts_find(const media_decoder *d, unsigned off)
+{
+  unsigned char b[2048];
+  int n = readfile_at(d->path, off, b, sizeof b);
+  for (int i = 0; i + 7 <= n; i++) {
+    if (b[i] != 0xFF || (b[i + 1] & 0xF6) != 0xF0)
+      continue;
+    unsigned flen = ((unsigned)(b[i + 3] & 3) << 11) | ((unsigned)b[i + 4] << 3) | (b[i + 5] >> 5);
+    if (flen < 7 || (i + flen + 2 <= (unsigned)n && (b[i + flen] != 0xFF || (b[i + flen + 1] & 0xF6) != 0xF0)))
+      continue;
+    return off + (unsigned)i;
+  }
+  return off;
+}
+
 /* Decode the next access unit into d->aac_pcm; returns 1 on success, 0 at EOS.
  */
 static int aac_next_au(media_decoder *d)
@@ -161,14 +242,16 @@ static int aac_next_au(media_decoder *d)
   if (d->aac_is_mp4) {
     const unsigned char *data;
     unsigned sz = 0;
-    if (d->aac_samp >= d->aac_nsamp)
-      return 0;
-    data = mp4_sample_data(d->mp4h, d->aac_trk, d->aac_samp, &sz);
-    d->aac_samp++;
-    if (!data || sz == 0)
-      return 0;
-    if (aac_decode(d->aac, data, sz, d->aac_pcm, &ns, &nc) != AAC_OK || ns == 0)
-      return 0;
+    do {
+      if (d->aac_samp >= d->aac_nsamp)
+        return 0;
+      data = mp4_sample_data(d->mp4h, d->aac_trk, d->aac_samp, &sz);
+      d->aac_samp++;
+      if (!data || sz == 0)
+        return 0;
+      if (aac_decode(d->aac, data, sz, d->aac_pcm, &ns, &nc) != AAC_OK || ns == 0)
+        return 0;
+    } while (d->aac_preroll > 0 && d->aac_preroll--);
     d->aac_have = ns;
     d->aac_pos = 0;
     d->aac_channels = nc;
@@ -211,7 +294,7 @@ static int aac_next_au(media_decoder *d)
       continue;
     }
     d->aac_bufpos += consumed;
-    if (ns == 0)
+    if (ns == 0 || (d->aac_preroll > 0 && d->aac_preroll--))
       continue;
     d->aac_have = ns;
     d->aac_pos = 0;
@@ -278,11 +361,21 @@ static void decode_next(media_decoder *d)
   }
 
   if (d->is_aac) {
-    if (d->aac_pos >= d->aac_have) { /* decode the next AU */
+    if (d->aac_is_mp4 && d->total_frames && d->pos_frames >= d->total_frames) { /* trailing padding */
+      d->eof = 1;
+      d->curL = d->curR = 0;
+      return;
+    }
+    while (d->aac_pos >= d->aac_have) { /* decode the next AU */
       if (!aac_next_au(d)) {
         d->eof = 1;
         d->curL = d->curR = 0;
         return;
+      }
+      if (d->aac_skip) {
+        unsigned k = d->aac_skip < d->aac_have ? d->aac_skip : d->aac_have;
+        d->aac_pos = k;
+        d->aac_skip -= k;
       }
     }
     {
@@ -428,21 +521,42 @@ void media_seek_ms(media_decoder *d, unsigned ms)
   unsigned tgt = (unsigned)((unsigned long long)ms * d->rate / 1000ull); /* native frame */
 
   if (d->is_aac) {
+    if (!aac_reset(d)) {
+      d->eof = 1;
+      return;
+    }
+    d->aac_skip = 0;
+    d->aac_preroll = 0;
     if (d->aac_is_mp4) {
       unsigned ts = d->aac_trk->timescale ? d->aac_trk->timescale : d->rate;
-      long long pts = (long long)((unsigned long long)tgt * ts / (d->rate ? d->rate : 1));
-      unsigned si = mp4_seek_sample(d->aac_trk, pts);
-      d->aac_samp = si;
-      d->pos_frames = si * 1024; /* ~1024 samples per AU        */
+      unsigned dec = tgt + d->aac_prime; /* position in the decoder's own timeline */
+      unsigned si = mp4_seek_sample(d->aac_trk, (long long)((unsigned long long)dec * ts / d->rate));
+      unsigned start = (unsigned)((unsigned long long)d->aac_trk->samples[si].pts * d->rate / ts);
+      d->aac_skip = dec > start ? dec - start : 0;
+      d->pos_frames = tgt;
+      d->aac_preroll = si > 0;
+      d->aac_samp = si > 0 ? si - 1 : 0;
     } else {
-      unsigned dur = media_duration_ms(d); /* 0 for raw ADTS -> to start */
-      unsigned off = dur ? (unsigned)((unsigned long long)d->size * ms / dur) : 0;
-      if (off > d->size)
-        off = d->size;
+      unsigned off = 0;
+      d->pos_frames = 0;
+      if (d->aac_nidx && tgt >= 1024) {
+        unsigned e = (tgt / 1024 - 1) / ADTS_IDX_STEP;
+        if (e >= d->aac_nidx)
+          e = d->aac_nidx - 1;
+        off = d->aac_idx[e];
+        d->pos_frames = (e * ADTS_IDX_STEP + 1) * 1024;
+        d->aac_skip = tgt > d->pos_frames ? tgt - d->pos_frames : 0;
+        d->pos_frames += d->aac_skip;
+        d->aac_preroll = 1;
+      } else if (d->aac_avg_len && tgt >= 1024) {
+        unsigned long long o = (unsigned long long)(tgt / 1024) * d->aac_avg_len;
+        off = adts_find(d, o > d->size ? d->size : (unsigned)o);
+        d->pos_frames = (unsigned)((unsigned long long)off / d->aac_avg_len) * 1024;
+        d->aac_preroll = 1;
+      }
       d->aac_fileoff = off;
       d->aac_buflen = d->aac_bufpos = 0;
       d->aac_src_eof = 0;
-      d->pos_frames = tgt;
     }
     d->aac_have = d->aac_pos = 0;
   } else if (d->is_alac) {
@@ -712,6 +826,7 @@ fail:
 static int load_aac_adts(media_decoder *d, unsigned size)
 {
   aac_info info;
+  unsigned nframes;
   d->aac = aac_open_adts();
   if (!d->aac)
     return -1;
@@ -724,12 +839,29 @@ static int load_aac_adts(media_decoder *d, unsigned size)
   d->aac_fileoff = d->aac_buflen = d->aac_bufpos = 0;
   d->aac_src_eof = 0;
   aac_refill_adts(d);
+  {
+    unsigned n = 0, sum = 0, p = 0;
+    while (p + 7 <= d->aac_buflen && d->aac_buf[p] == 0xFF && (d->aac_buf[p + 1] & 0xF6) == 0xF0) {
+      unsigned flen =
+          ((unsigned)(d->aac_buf[p + 3] & 3) << 11) | ((unsigned)d->aac_buf[p + 4] << 3) | (d->aac_buf[p + 5] >> 5);
+      if (flen < 7)
+        break;
+      n++;
+      sum += flen;
+      p += flen;
+    }
+    d->aac_avg_len = n >= 3 ? sum / n : 0;
+  }
+  nframes = adts_index(d, size);
   if (!aac_next_au(d))
     goto fail; /* prime + learn the format    */
   aac_get_info(d->aac, &info);
   d->rate = info.sample_rate;
   d->size = size;
-  d->total_frames = 0; /* raw ADTS has no duration    */
+  /* raw ADTS has no duration: exact from the index, else the leading frames' average length */
+  d->total_frames = nframes          ? nframes * 1024
+                    : d->aac_avg_len ? (unsigned)((unsigned long long)size / d->aac_avg_len * 1024)
+                                     : 0;
   d->is_aac = 1;
   return 0;
 fail:
@@ -737,6 +869,8 @@ fail:
     aac_close(d->aac);
   free(d->aac_buf);
   free(d->aac_pcm);
+  free(d->aac_idx);
+  d->aac_idx = 0;
   d->aac = 0;
   d->aac_buf = 0;
   d->aac_pcm = 0;
@@ -771,10 +905,14 @@ static int load_aac_mp4(media_decoder *d, unsigned size)
   d->aac_channels = info.channels;
   d->rate = info.sample_rate ? info.sample_rate : (t->samplerate ? t->samplerate : 44100);
   d->size = size;
-  if (t->timescale)
+  if (t->timescale) {
+    d->aac_prime = (unsigned)((unsigned long long)t->edit_start * d->rate / t->timescale);
     d->total_frames = (unsigned)((unsigned long long)t->duration * d->rate / t->timescale);
-  else
+  } else {
     d->total_frames = t->n_samples * 1024;
+  }
+  d->total_frames = d->total_frames > d->aac_prime ? d->total_frames - d->aac_prime : 0;
+  d->aac_skip = d->aac_prime;
   d->is_aac = 1;
   return 0;
 fail:
@@ -853,12 +991,14 @@ void media_close(media_decoder *d)
     free(d->a_pcm);
   }
   if (d->is_aac) {
-    aac_close(d->aac);
+    if (d->aac)
+      aac_close(d->aac);
     if (d->mp4h)
       mp4_close(d->mp4h);
     free(d->mp4_data);
     free(d->aac_buf);
     free(d->aac_pcm);
+    free(d->aac_idx);
   }
   free(d);
 }

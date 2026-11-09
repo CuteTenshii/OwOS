@@ -62,6 +62,7 @@ typedef struct {
   mp4_codec codec;
   unsigned timescale;          /* timescale units per second               */
   unsigned long long duration; /* track duration, timescale units          */
+  long long edit_start;        /* leading media (priming) the edit list skips, timescale units */
 
   /* Video: coded picture dimensions (from the sample entry). */
   unsigned width, height;
