@@ -371,6 +371,9 @@ int js_cast_pump(void);          /* deliver Remote Playback availability + conne
 int js_idb_pump(void);           /* deliver IndexedDB request events + commit/abort transactions */
 /* Run one devtools-console REPL command against the live page. Worker-thread only. */
 void js_repl_run(const char *src);
+/* Evaluate src in the live page context, without echoing to the console: the result as a malloc'd string,
+ * or the exception's "Name: message" with *threw set. NULL when no page script context exists. */
+char *js_page_eval(const char *src, int *threw);
 
 /* html.c: tear down the live page, re-flatten the live DOM, map a text offset to a DOM node. */
 void html_page_teardown(void);

@@ -1,3 +1,4 @@
+#include "features/cdp/cdp.h"
 #include "main_int.h"
 
 /* Run item `item` of leaf menu `m` */
@@ -571,6 +572,13 @@ void handle_click(int mx, int my)
       devtools_pick_commit(off);
       return;
     }
+    if (cdp_picking()) { /* a remote DevTools armed Overlay.setInspectMode */
+      int off;
+      char res[URL_MAX];
+      pane_hit(mx, my, &off, res, sizeof res, 0);
+      cdp_pick_commit_offset(off);
+      return;
+    }
     /* A click on an <audio>/<video> controls widget is consumed by it (play/pause, seek, mute) */
     {
       int sc = B->pg->scroll;
@@ -809,6 +817,10 @@ void handle_key(char c, int mods)
   /* Esc cancels an active pick before it would close the panel. */
   if ((unsigned char)c == 27 && devtools_picking()) {
     devtools_pick_toggle();
+    return;
+  }
+  if ((unsigned char)c == 27 && cdp_picking()) {
+    cdp_pick_cancel();
     return;
   }
   if ((unsigned char)c == 27 && devtools_visible()) {

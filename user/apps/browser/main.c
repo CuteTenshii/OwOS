@@ -1,6 +1,8 @@
 /* main.c , the browser's windowed UI and event loop. Owns the one `struct browser` instance */
 #include "features/canvas/canvas.h"
+#include "features/cdp/cdp.h"
 #include "main_int.h"
+#include "opt.h"
 
 /* Extensions an accept="" token list allows: ".ext" tokens and the image/audio/video wildcards */
 static int accept_exts(const char *accept, char *buf, int cap, const char **exts, int max)
@@ -141,7 +143,29 @@ void update_title(int id)
 
 int main(int argc, char **argv)
 {
-  const char *start = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : 0;
+  static const struct opt opts[] = {
+      {0, "remote-debugging", OPT_FLAG, 'r', 0, "serve the Chrome DevTools Protocol on port 9222"},
+      {'h', "help", OPT_FLAG, 'h', 0, "show this help"},
+  };
+  const char *start = 0;
+  int remote_debugging = 0;
+  struct optstate st;
+  opt_init(&st, argc, argv);
+  for (int o; (o = opt_next(&st, opts, OPT_N(opts))) != OPT_DONE;) {
+    if (o == 'r') {
+      remote_debugging = 1;
+    } else if (o == 'h') {
+      opt_print_help("browser", "[URL]", "Open the web browser, optionally on URL.", opts, OPT_N(opts));
+      return 0;
+    } else if (o == OPT_POS) {
+      if (!start && st.arg[0])
+        start = st.arg;
+    } else {
+      printf("browser: unknown option %s\n", st.bad);
+      opt_print_usage("browser", "[URL]", opts, OPT_N(opts));
+      return 1;
+    }
+  }
   B->pg = &tabs[active_tab].page; /* point at the first tab's page */
   int id = win_create(BW, BH, "Browser");
   if (id < 0) {
@@ -164,6 +188,9 @@ int main(int argc, char **argv)
   cache_load();     /* restore the persistent HTTP response cache from disk */
   bookmarks_load(); /* restore the bookmarks tree from disk */
   storage_load();   /* restore localStorage from disk */
+  /* Opt-in like Chrome's --remote-debugging-port: whoever reaches port 9222 can run script in the page */
+  if (remote_debugging)
+    cdp_init();
 
   int wtid = thread_create(worker_fn, &worker_stack[sizeof worker_stack]);
 

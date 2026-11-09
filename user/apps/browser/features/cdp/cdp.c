@@ -1,0 +1,1889 @@
+/* cdp.c: Chrome DevTools Protocol endpoint (see cdp.h for the model).
+ *
+ * The browser is the CDP *target*. An I/O thread owns one TCP listener on port
+ * 9222: it answers the HTTP `/json*` discovery probes a client uses to find the
+ * page, and upgrades `/devtools/page/...` to a WebSocket that carries JSON-RPC.
+ * Client frames are masked; server frames are not (RFC 6455). Every protocol
+ * command is parsed + dispatched on the browser's WORKER thread (cdp_worker_tick)
+ * because it touches the worker-owned DOM/JS; the I/O thread only does WS framing
+ * and shuttles two byte queues. Events are formatted wherever they arise and
+ * enqueued: heap JSON only, no engine access, so thread-agnostic. */
+#include "cdp.h"
+#include "base64.h"
+#include "browser.h"
+#include "crypto.h"
+#include "css.h" /* struct css_match/css_style: CSS.getMatchedStylesForNode */
+#include "dom.h"
+#include "features/storage/storage.h"
+#include "json.h"
+#include "layout.h" /* struct lbox / layout_pool: DOM.getBoxModel */
+#include "mutex.h"
+
+double strtod(const char *s, char **end); /* $(MATH), for a numeric eval result */
+
+#define CDP_PORT 9222
+#define TARGET_ID "owos-page-1"
+#define FRAME_ID "owos-frame-1"
+#define LOADER_ID "owos-loader-1"
+#define WS_PATH "/devtools/page/" TARGET_ID
+#define CDP_WS_MAX (8u << 20) /* reject a single WS message larger than this */
+
+/* --- sessions (one WebSocket client = one session) ------------------------- *
+ * DevTools opens a browser- and a page-level socket at once, and several clients
+ * (a DevTools window plus Puppeteer) may attach together, so each connection owns
+ * its inbound/outbound queues and its own set of enabled domains. Command replies
+ * go back to the originating session; async events (console, network, navigation)
+ * broadcast to every session that enabled the relevant domain. One mutex guards the
+ * whole table and all queues; critical sections are tiny (a pointer move). */
+#define CDP_MAX_SESSIONS 4
+#define INQ_MAX 128   /* client commands awaiting dispatch, per session */
+#define OUTQ_MAX 1024 /* responses + events awaiting the wire, per session */
+
+struct cdp_session {
+  volatile int used;
+  volatile int rt_enabled, page_enabled, dom_enabled, net_enabled, log_enabled, css_enabled;
+  char *inq[INQ_MAX];
+  int in_head, in_count;
+  char *outq[OUTQ_MAX];
+  int out_head, out_count;
+};
+static struct cdp_session sessions[CDP_MAX_SESSIONS];
+static mutex_t sess_lk = MUTEX_INIT;
+static volatile int cdp_nsessions; /* # attached sessions (event hooks fast-skip on 0) */
+
+/* Inspect-element picker arm (Overlay.setInspectMode), per-session. The main thread
+ * feeds the pane offset (cdp_pick_commit); the worker resolves it to a DOM node and
+ * emits Overlay.inspectNodeRequested. Only one session can pick at a time. */
+static volatile int cdp_pick_sess = -1;   /* session index that armed the picker, -1 = none */
+static volatile int cdp_pick_commit = -1; /* main->worker: pane offset clicked */
+
+int cdp_connected(void) { return cdp_nsessions > 0; }
+int cdp_picking(void) { return cdp_pick_sess >= 0; }
+void cdp_pick_commit_offset(int off)
+{
+  if (cdp_pick_sess >= 0 && off >= 0)
+    cdp_pick_commit = off;
+}
+void cdp_pick_cancel(void)
+{
+  cdp_pick_sess = -1;
+  cdp_pick_commit = -1;
+}
+
+/* Async-event gating domains for a broadcast. */
+enum { EV_RUNTIME, EV_PAGE, EV_DOM, EV_NETWORK, EV_LOG, EV_ALWAYS };
+static int sess_wants(const struct cdp_session *s, int dom)
+{
+  switch (dom) {
+  case EV_RUNTIME:
+    return s->rt_enabled;
+  case EV_PAGE:
+    return s->page_enabled;
+  case EV_DOM:
+    return s->dom_enabled;
+  case EV_NETWORK:
+    return s->net_enabled;
+  case EV_LOG:
+    return s->log_enabled;
+  default:
+    return 1;
+  }
+}
+
+static char *cdp_sdup(const char *s)
+{
+  if (!s)
+    return 0;
+  int n = (int)strlen(s);
+  char *d = malloc((unsigned)n + 1);
+  if (d)
+    memcpy(d, s, (unsigned)n + 1);
+  return d;
+}
+
+/* Queue ops. The _l variants require sess_lk held. */
+static void sess_in_push_l(struct cdp_session *s, char *m)
+{
+  if (!m)
+    return;
+  if (s->in_count >= INQ_MAX) {
+    free(s->inq[s->in_head]);
+    s->in_head = (s->in_head + 1) % INQ_MAX;
+    s->in_count--;
+  }
+  s->inq[(s->in_head + s->in_count) % INQ_MAX] = m;
+  s->in_count++;
+}
+static void sess_out_push_l(struct cdp_session *s, char *m)
+{
+  if (!m)
+    return;
+  if (s->out_count >= OUTQ_MAX) {
+    free(s->outq[s->out_head]);
+    s->out_head = (s->out_head + 1) % OUTQ_MAX;
+    s->out_count--;
+  }
+  s->outq[(s->out_head + s->out_count) % OUTQ_MAX] = m;
+  s->out_count++;
+}
+static void sess_in_push(struct cdp_session *s, char *m)
+{
+  mutex_lock(&sess_lk);
+  sess_in_push_l(s, m);
+  mutex_unlock(&sess_lk);
+}
+static char *sess_in_pop(struct cdp_session *s)
+{
+  char *m = 0;
+  mutex_lock(&sess_lk);
+  if (s->in_count) {
+    m = s->inq[s->in_head];
+    s->in_head = (s->in_head + 1) % INQ_MAX;
+    s->in_count--;
+  }
+  mutex_unlock(&sess_lk);
+  return m;
+}
+static char *sess_out_pop(struct cdp_session *s)
+{
+  char *m = 0;
+  mutex_lock(&sess_lk);
+  if (s->out_count) {
+    m = s->outq[s->out_head];
+    s->out_head = (s->out_head + 1) % OUTQ_MAX;
+    s->out_count--;
+  }
+  mutex_unlock(&sess_lk);
+  return m;
+}
+static void sess_drain_l(struct cdp_session *s)
+{
+  while (s->in_count) {
+    free(s->inq[s->in_head]);
+    s->in_head = (s->in_head + 1) % INQ_MAX;
+    s->in_count--;
+  }
+  while (s->out_count) {
+    free(s->outq[s->out_head]);
+    s->out_head = (s->out_head + 1) % OUTQ_MAX;
+    s->out_count--;
+  }
+  s->in_head = s->out_head = 0;
+}
+static struct cdp_session *sess_alloc(void)
+{
+  struct cdp_session *s = 0;
+  mutex_lock(&sess_lk);
+  for (int i = 0; i < CDP_MAX_SESSIONS; i++)
+    if (!sessions[i].used) {
+      s = &sessions[i];
+      s->in_head = s->in_count = s->out_head = s->out_count = 0;
+      s->rt_enabled = s->page_enabled = s->dom_enabled = s->net_enabled = s->log_enabled = s->css_enabled = 0;
+      s->used = 1;
+      cdp_nsessions++;
+      break;
+    }
+  mutex_unlock(&sess_lk);
+  return s;
+}
+static void sess_free(struct cdp_session *s)
+{
+  mutex_lock(&sess_lk);
+  sess_drain_l(s);
+  s->rt_enabled = s->page_enabled = s->dom_enabled = s->net_enabled = s->log_enabled = s->css_enabled = 0;
+  s->used = 0;
+  if (cdp_nsessions > 0)
+    cdp_nsessions--;
+  {
+    int idx = (int)(s - sessions);
+    if (cdp_pick_sess == idx)
+      cdp_pick_sess = -1;
+  }
+  mutex_unlock(&sess_lk);
+}
+
+/* --- small JSON builders --------------------------------------------------- */
+static json_value *jstr(const char *s) { return json_new_string(s ? s : ""); }
+static json_value *jnum(double n) { return json_new_number(n); }
+static json_value *jbool(int b) { return json_new_bool(b); }
+static void oset(json_value *o, const char *k, json_value *v)
+{
+  if (o && v)
+    json_object_set(o, k, v);
+}
+
+/* Reply `{"id":id,"result":result}` to the originating session (takes result). */
+static void reply_result(struct cdp_session *s, double id, json_value *result)
+{
+  json_value *msg = json_new_object();
+  if (!msg) {
+    json_free(result);
+    return;
+  }
+  oset(msg, "id", jnum(id));
+  oset(msg, "result", result ? result : json_new_object());
+  char *str = json_encode(msg, 0, 0);
+  json_free(msg);
+  if (str) {
+    mutex_lock(&sess_lk);
+    sess_out_push_l(s, str);
+    mutex_unlock(&sess_lk);
+  }
+}
+/* Send a `{"method":..,"params":..}` event to ONE session (takes params). Used for
+ * command-triggered events like Runtime.enable's executionContextCreated. */
+static void emit_to_session(struct cdp_session *s, const char *method, json_value *params)
+{
+  json_value *msg = json_new_object();
+  if (!msg) {
+    json_free(params);
+    return;
+  }
+  oset(msg, "method", jstr(method));
+  oset(msg, "params", params ? params : json_new_object());
+  char *str = json_encode(msg, 0, 0);
+  json_free(msg);
+  if (str) {
+    mutex_lock(&sess_lk);
+    sess_out_push_l(s, str);
+    mutex_unlock(&sess_lk);
+  }
+}
+/* Broadcast an async event to every session that enabled domain `dom` (takes
+ * params). Encoded once; a private copy is queued per target session. */
+static void broadcast_event(int dom, const char *method, json_value *params)
+{
+  if (!cdp_nsessions) {
+    json_free(params);
+    return;
+  }
+  json_value *msg = json_new_object();
+  if (!msg) {
+    json_free(params);
+    return;
+  }
+  oset(msg, "method", jstr(method));
+  oset(msg, "params", params ? params : json_new_object());
+  char *str = json_encode(msg, 0, 0);
+  json_free(msg);
+  if (!str)
+    return;
+  mutex_lock(&sess_lk);
+  for (int i = 0; i < CDP_MAX_SESSIONS; i++)
+    if (sessions[i].used && sess_wants(&sessions[i], dom))
+      sess_out_push_l(&sessions[i], cdp_sdup(str));
+  mutex_unlock(&sess_lk);
+  free(str);
+}
+
+/* --- WebSocket server framing ---------------------------------------------- */
+static int send_all(int fd, const void *buf, int len)
+{
+  const char *p = (const char *)buf;
+  int off = 0;
+  while (off < len) {
+    int w = net_send(fd, p + off, len - off);
+    if (w <= 0)
+      return -1;
+    off += w;
+  }
+  return 0;
+}
+/* One unmasked server frame (opcode `op`, payload data[len]), FIN set. */
+static int ws_send_frame(int fd, int op, const void *data, int len)
+{
+  unsigned char h[10];
+  int hn = 0;
+  h[0] = (unsigned char)(0x80 | (op & 0x0f));
+  if (len < 126) {
+    h[1] = (unsigned char)len;
+    hn = 2;
+  } else if (len < 65536) {
+    h[1] = 126;
+    h[2] = (unsigned char)(len >> 8);
+    h[3] = (unsigned char)(len & 0xff);
+    hn = 4;
+  } else {
+    h[1] = 127;
+    for (int i = 0; i < 8; i++)
+      h[2 + i] = (unsigned char)(((unsigned long long)len >> (56 - 8 * i)) & 0xff);
+    hn = 10;
+  }
+  if (send_all(fd, h, hn) < 0)
+    return -1;
+  if (len && send_all(fd, data, len) < 0)
+    return -1;
+  return 0;
+}
+static int ws_send_text(int fd, const char *s) { return ws_send_frame(fd, 0x1, s, (int)strlen(s)); }
+
+/* Append `n` bytes to a growable byte buffer. Returns 0 on OOM. */
+static int buf_append(unsigned char **buf, int *len, int *cap, const unsigned char *src, int n)
+{
+  if (*len + n > *cap) {
+    int nc = *cap ? *cap : 4096;
+    while (nc < *len + n)
+      nc *= 2;
+    unsigned char *p = realloc(*buf, (unsigned)nc);
+    if (!p)
+      return 0;
+    *buf = p;
+    *cap = nc;
+  }
+  memcpy(*buf + *len, src, (unsigned)n);
+  *len += n;
+  return 1;
+}
+
+/* Parse every complete frame at the front of rx (masked client frames), acting on
+ * each. A finished text message is NUL-terminated and pushed to the inbound queue.
+ * Returns 0 to keep going, -1 to close the connection (Close frame / protocol
+ * error). `msg`/`msgop` accumulate a possibly-fragmented message across calls. */
+static int ws_parse(struct cdp_session *sess, int fd, unsigned char **rxp, int *rxlenp, unsigned char **msg,
+                    int *msglen, int *msgcap, int *msgop)
+{
+  unsigned char *rx = *rxp;
+  int rxlen = *rxlenp;
+  int consumed_total = 0;
+  int rc = 0;
+
+  while (rxlen - consumed_total >= 2) {
+    unsigned char *f = rx + consumed_total;
+    int avail = rxlen - consumed_total;
+    int fin = f[0] & 0x80, op = f[0] & 0x0f;
+    int masked = f[1] & 0x80, l = f[1] & 0x7f;
+    int hn = 2;
+    unsigned long long plen;
+    if (l < 126)
+      plen = (unsigned)l;
+    else if (l == 126) {
+      if (avail < 4)
+        break;
+      plen = ((unsigned)f[2] << 8) | f[3];
+      hn = 4;
+    } else {
+      if (avail < 10)
+        break;
+      plen = 0;
+      for (int i = 0; i < 8; i++)
+        plen = (plen << 8) | f[2 + i];
+      hn = 10;
+    }
+    if (plen > CDP_WS_MAX) {
+      rc = -1;
+      break;
+    }
+    unsigned char *mask = 0;
+    if (masked) {
+      if (avail < hn + 4)
+        break;
+      mask = f + hn;
+      hn += 4;
+    }
+    if ((unsigned long long)(avail - hn) < plen)
+      break; /* await full payload */
+
+    unsigned char *payload = f + hn;
+    if (masked)
+      for (unsigned long long i = 0; i < plen; i++)
+        payload[i] ^= mask[i & 3];
+
+    if (op == 0x8) {
+      rc = -1;
+      break;
+    } /* close */
+    else if (op == 0x9) {
+      if (ws_send_frame(fd, 0xA, payload, (int)plen) < 0) {
+        rc = -1;
+        break;
+      }
+    } else if (op == 0xA) {                           /* pong: ignore */
+    } else if (op == 0x1 || op == 0x2 || op == 0x0) { /* text/binary/continuation */
+      if (op != 0x0)
+        *msgop = op;
+      if (!buf_append(msg, msglen, msgcap, payload, (int)plen)) {
+        rc = -1;
+        break;
+      }
+      if (fin) {
+        if (*msgop == 0x1 && *msglen >= 0) { /* a complete text message */
+          char *s = malloc((unsigned)*msglen + 1);
+          if (s) {
+            memcpy(s, *msg, (unsigned)*msglen);
+            s[*msglen] = '\0';
+            sess_in_push(sess, s);
+          }
+        }
+        *msglen = 0;
+        *msgop = 0;
+      }
+    }
+    consumed_total += hn + (int)plen;
+  }
+
+  if (consumed_total > 0) {
+    memmove(rx, rx + consumed_total, (unsigned)(rxlen - consumed_total));
+    *rxlenp = rxlen - consumed_total;
+  }
+  return rc;
+}
+
+/* Full-duplex WS session on `sess`: pump inbound frames -> its queue, drain its
+ * outbound queue -> frames, until the peer closes or errors. Blocks the calling
+ * pool worker for the session's lifetime. */
+static void serve_ws(struct cdp_session *sess, int fd)
+{
+  unsigned char *rx = 0;
+  int rxlen = 0, rxcap = 0;
+  unsigned char *msg = 0;
+  int msglen = 0, msgcap = 0, msgop = 0;
+  unsigned char tmp[4096];
+
+  for (;;) {
+    int n = net_recv_nb(fd, tmp, sizeof tmp);
+    if (n < 0)
+      break; /* EOF / error */
+    if (n > 0) {
+      if (!buf_append(&rx, &rxlen, &rxcap, tmp, n))
+        break;
+      if (ws_parse(sess, fd, &rx, &rxlen, &msg, &msglen, &msgcap, &msgop) < 0)
+        break;
+    }
+    char *o;
+    int sent_err = 0;
+    while ((o = sess_out_pop(sess))) {
+      int r = ws_send_text(fd, o);
+      free(o);
+      if (r < 0) {
+        sent_err = 1;
+        break;
+      }
+    }
+    if (sent_err)
+      break;
+    if (n == 0)
+      msleep(4);
+  }
+
+  free(rx);
+  free(msg);
+}
+
+/* --- HTTP discovery + WS handshake ----------------------------------------- */
+
+/* Case-insensitive lookup of header `name` in a raw request buffer; copies its
+ * value (trimmed) into out. Returns 1 if found. */
+static int http_header(const char *req, const char *name, char *out, int cap)
+{
+  int nl = (int)strlen(name);
+  out[0] = '\0';
+  for (const char *p = req; *p;) {
+    const char *e = p;
+    while (*e && *e != '\n')
+      e++;
+    int match = 1;
+    for (int i = 0; i < nl; i++)
+      if (lower(p[i]) != lower(name[i])) {
+        match = 0;
+        break;
+      }
+    if (match && p[nl] == ':') {
+      const char *v = p + nl + 1;
+      while (*v == ' ' || *v == '\t')
+        v++;
+      const char *t = e;
+      if (t > v && t[-1] == '\r')
+        t--;
+      int k = 0;
+      while (v < t && k < cap - 1)
+        out[k++] = *v++;
+      out[k] = '\0';
+      return 1;
+    }
+    p = *e ? e + 1 : e;
+  }
+  return 0;
+}
+
+static void http_send(int fd, const char *status, const char *ctype, const char *body)
+{
+  char hdr[256];
+  int n = 0;
+  int blen = body ? (int)strlen(body) : 0;
+  sapp(hdr, &n, sizeof hdr, "HTTP/1.1 ");
+  sapp(hdr, &n, sizeof hdr, status);
+  sapp(hdr, &n, sizeof hdr, "\r\nContent-Type: ");
+  sapp(hdr, &n, sizeof hdr, ctype);
+  sapp(hdr, &n, sizeof hdr, "\r\nContent-Length: ");
+  uapp(hdr, &n, sizeof hdr, (unsigned)blen);
+  sapp(hdr, &n, sizeof hdr, "\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+  send_all(fd, hdr, n);
+  if (blen)
+    send_all(fd, body, blen);
+  /* The connection worker net_close()s next; the kernel's graceful FIN handshake
+   * (tcp.c) flushes the response before the socket goes away, so no drain here. */
+}
+
+/* Build one CDP target-info object for the single page. `host` is the client's
+ * Host: header, so the ws/frontend URLs point back at wherever it connected. */
+static json_value *target_json(const char *host)
+{
+  char ws[URL_MAX], fe[URL_MAX];
+  int n;
+  n = 0;
+  sapp(ws, &n, sizeof ws, "ws://");
+  sapp(ws, &n, sizeof ws, host);
+  sapp(ws, &n, sizeof ws, WS_PATH);
+  n = 0;
+  sapp(fe, &n, sizeof fe, host);
+  sapp(fe, &n, sizeof fe, WS_PATH);
+
+  json_value *o = json_new_object();
+  oset(o, "id", jstr(TARGET_ID));
+  oset(o, "type", jstr("page"));
+  oset(o, "title", jstr(B->pg->doc_title[0] ? B->pg->doc_title : "OwOS"));
+  oset(o, "url", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+  oset(o, "description", jstr(""));
+  oset(o, "webSocketDebuggerUrl", jstr(ws));
+  {
+    char d[URL_MAX + 64];
+    int k = 0;
+    sapp(d, &k, sizeof d, "/devtools/inspector.html?ws=");
+    sapp(d, &k, sizeof d, fe);
+    oset(o, "devtoolsFrontendUrl", jstr(d));
+  }
+  return o;
+}
+
+static void serve_http(int fd, const char *req)
+{
+  /* Request line: METHOD SP PATH SP HTTP/x */
+  char path[256];
+  int pn = 0;
+  const char *p = req;
+  while (*p && *p != ' ')
+    p++; /* skip method */
+  if (*p == ' ')
+    p++;
+  while (*p && *p != ' ' && *p != '\r' && *p != '\n' && pn < (int)sizeof path - 1)
+    path[pn++] = *p++;
+  path[pn] = '\0';
+
+  char host[128];
+  if (!http_header(req, "Host", host, sizeof host) || !host[0]) {
+    int k = 0;
+    sapp(host, &k, sizeof host, "localhost:9222");
+  }
+
+  /* WebSocket upgrade on any /devtools/ path (page- or browser-level endpoint). */
+  char upg[64], key[128];
+  int is_ws = http_header(req, "Upgrade", upg, sizeof upg) && contains_ci(upg, "websocket") &&
+              http_header(req, "Sec-WebSocket-Key", key, sizeof key) && key[0];
+  if (is_ws && starts_ci(path, "/devtools/")) { /* page- or browser-level endpoint */
+    struct cdp_session *s = sess_alloc();
+    if (!s) {
+      http_send(fd, "503 Service Unavailable", "text/plain", "cdp: too many sessions\n");
+      return;
+    }
+
+    char cat[192];
+    int k = 0;
+    sapp(cat, &k, sizeof cat, key);
+    sapp(cat, &k, sizeof cat, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"); /* RFC 6455 GUID */
+    unsigned char dg[SHA1_DIGEST];
+    sha1(cat, (unsigned)strlen(cat), dg);
+    char accept[64];
+    base64_encode(dg, SHA1_DIGEST, accept);
+
+    char resp[256];
+    int n = 0;
+    sapp(resp, &n, sizeof resp,
+         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+    sapp(resp, &n, sizeof resp, accept);
+    sapp(resp, &n, sizeof resp, "\r\n\r\n");
+    if (send_all(fd, resp, n) == 0)
+      serve_ws(s, fd);
+    sess_free(s);
+    return;
+  }
+
+  if (starts_ci(path, "/json/version")) {
+    json_value *o = json_new_object();
+    oset(o, "Browser", jstr("OwOS-Browser/" OWOS_VERSION));
+    oset(o, "Protocol-Version", jstr("1.3"));
+    oset(o, "User-Agent", jstr(browser_ua()));
+    oset(o, "V8-Version", jstr("0"));
+    oset(o, "WebKit-Version", jstr("0"));
+    char wsurl[URL_MAX];
+    int k = 0;
+    sapp(wsurl, &k, sizeof wsurl, "ws://");
+    sapp(wsurl, &k, sizeof wsurl, host);
+    sapp(wsurl, &k, sizeof wsurl, "/devtools/browser/" TARGET_ID);
+    oset(o, "webSocketDebuggerUrl", jstr(wsurl));
+    char *body = json_encode(o, 0, 0);
+    json_free(o);
+    http_send(fd, "200 OK", "application/json; charset=UTF-8", body ? body : "{}");
+    free(body);
+    return;
+  }
+  if (starts_ci(path, "/json")) { /* /json and /json/list both list targets */
+    json_value *arr = json_new_array();
+    json_array_push(arr, target_json(host));
+    char *body = json_encode(arr, 0, 0);
+    json_free(arr);
+    http_send(fd, "200 OK", "application/json; charset=UTF-8", body ? body : "[]");
+    free(body);
+    return;
+  }
+  http_send(fd, "404 Not Found", "text/plain", "Not Found\n");
+}
+
+/* --- listener + connection thread pool -------------------------------------- *
+ * The acceptor thread only accepts and hands each connection to a free pool
+ * worker, so a long-lived WebSocket session never blocks HTTP discovery and slow
+ * clients can't stall the accept loop. Only the acceptor writes a non-(-1) fd into
+ * a slot and only that slot's worker clears it, so the handoff needs no lock. */
+#define CDP_NWORKERS 4
+#define CDP_WSTACK 16384
+static unsigned char cdp_wstack[CDP_NWORKERS][CDP_WSTACK] __attribute__((aligned(16)));
+static volatile int cdp_wfd[CDP_NWORKERS]; /* fd handed to worker i, -1 = idle */
+static int cdp_wnext;                      /* worker startup index claim        */
+
+/* 1 once the request head's blank line (CRLF CRLF) has arrived */
+static int head_complete(const char *req, int n)
+{
+  for (int i = 3; i < n; i++)
+    if (req[i - 3] == '\r' && req[i - 2] == '\n' && req[i - 1] == '\r' && req[i] == '\n')
+      return 1;
+  return 0;
+}
+
+static void cdp_conn_worker(void)
+{
+  int me;
+  mutex_lock(&sess_lk);
+  me = cdp_wnext++;
+  mutex_unlock(&sess_lk);
+  for (;;) {
+    int fd = cdp_wfd[me];
+    if (fd < 0) {
+      msleep(5);
+      continue;
+    }
+    /* Read the request head (blocking) up to the blank line, then serve it. */
+    char req[8192];
+    int rn = 0;
+    while (rn < (int)sizeof req - 1) {
+      int r = net_recv(fd, req + rn, (int)sizeof req - 1 - rn);
+      if (r <= 0)
+        break;
+      rn += r;
+      req[rn] = '\0';
+      if (head_complete(req, rn))
+        break;
+    }
+    req[rn] = '\0';
+    if (rn > 0)
+      serve_http(fd, req); /* HTTP response, or blocks in serve_ws */
+    net_close(fd);
+    cdp_wfd[me] = -1; /* free the slot for the next connection */
+  }
+}
+
+static void cdp_io_fn(void)
+{
+  int lfd = net_listen(CDP_PORT);
+  if (lfd < 0) {
+    printf("browser: remote debugging unavailable, port %d is in use\n", CDP_PORT);
+    return;
+  }
+  printf("browser: remote debugging listening on port %d\n", CDP_PORT);
+  for (int i = 0; i < CDP_NWORKERS; i++) {
+    cdp_wfd[i] = -1;
+    thread_create(cdp_conn_worker, &cdp_wstack[i][CDP_WSTACK]);
+  }
+  for (;;) {
+    int fd = net_accept(lfd);
+    if (fd < 0) {
+      msleep(50);
+      continue;
+    }
+    int placed = 0;
+    for (int tries = 0; tries < 100 && !placed; tries++) {
+      for (int i = 0; i < CDP_NWORKERS; i++)
+        if (cdp_wfd[i] == -1) {
+          cdp_wfd[i] = fd;
+          placed = 1;
+          break;
+        }
+      if (!placed)
+        msleep(5);
+    }
+    if (!placed)
+      net_close(fd); /* every worker busy: reject the connection */
+  }
+}
+
+/* --- protocol command dispatch (worker thread) ----------------------------- */
+
+/* scheme://host portion of `url` (no path), or the url unchanged if it has none. */
+static void origin_of(const char *url, char *out, int cap)
+{
+  out[0] = '\0';
+  if (!url || !url[0])
+    return;
+  const char *s = url;
+  const char *sep = 0;
+  for (const char *p = url; p[0] && p[1] && p[2]; p++)
+    if (p[0] == ':' && p[1] == '/' && p[2] == '/') {
+      sep = p + 3;
+      break;
+    }
+  int k = 0;
+  if (!sep) {
+    while (s[k] && k < cap - 1) {
+      out[k] = s[k];
+      k++;
+    }
+    out[k] = '\0';
+    return;
+  }
+  const char *e = sep;
+  while (*e && *e != '/')
+    e++; /* host ends at path */
+  while (s < e && k < cap - 1)
+    out[k++] = *s++;
+  out[k] = '\0';
+}
+
+static json_value *build_frame(void)
+{
+  json_value *f = json_new_object();
+  char origin[URL_MAX];
+  origin_of(B->pg->cur_url, origin, sizeof origin);
+  oset(f, "id", jstr(FRAME_ID));
+  oset(f, "loaderId", jstr(LOADER_ID));
+  oset(f, "url", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+  oset(f, "securityOrigin", jstr(origin));
+  oset(f, "mimeType", jstr("text/html"));
+  return f;
+}
+static json_value *build_context(void)
+{
+  json_value *c = json_new_object();
+  char origin[URL_MAX];
+  origin_of(B->pg->cur_url, origin, sizeof origin);
+  oset(c, "id", jnum(1));
+  oset(c, "origin", jstr(origin));
+  oset(c, "name", jstr(""));
+  oset(c, "uniqueId", jstr("owos-ctx-1"));
+  json_value *aux = json_new_object();
+  oset(aux, "isDefault", jbool(1));
+  oset(aux, "type", jstr("default"));
+  oset(aux, "frameId", jstr(FRAME_ID));
+  oset(c, "auxData", aux);
+  return c;
+}
+/* Emit Runtime.executionContextCreated. `s` non-NULL -> just that session (a
+ * Runtime.enable reply); NULL -> broadcast to every Runtime-enabled session (a
+ * navigation created a fresh context). */
+static void emit_context_created(struct cdp_session *s)
+{
+  json_value *p = json_new_object();
+  oset(p, "context", build_context());
+  if (s)
+    emit_to_session(s, "Runtime.executionContextCreated", p);
+  else
+    broadcast_event(EV_RUNTIME, "Runtime.executionContextCreated", p);
+}
+
+/* Classify a Runtime.evaluate string result into a CDP RemoteObject so the console
+ * renders numbers/booleans/null natively (not quoted strings). */
+static int looks_numeric(const char *s)
+{
+  if (!s || !*s)
+    return 0;
+  int i = 0, dig = 0, dot = 0, e = 0;
+  if (s[i] == '-' || s[i] == '+')
+    i++;
+  for (; s[i]; i++) {
+    char c = s[i];
+    if (c >= '0' && c <= '9')
+      dig = 1;
+    else if (c == '.') {
+      if (dot || e)
+        return 0;
+      dot = 1;
+    } else if (c == 'e' || c == 'E') {
+      if (e || !dig)
+        return 0;
+      e = 1;
+      if (s[i + 1] == '+' || s[i + 1] == '-')
+        i++;
+    } else
+      return 0;
+  }
+  return dig;
+}
+static json_value *remote_object(const char *val)
+{
+  json_value *o = json_new_object();
+  if (!val) {
+    oset(o, "type", jstr("undefined"));
+    return o;
+  }
+  if (streq(val, "undefined")) {
+    oset(o, "type", jstr("undefined"));
+    return o;
+  }
+  if (streq(val, "null")) {
+    oset(o, "type", jstr("object"));
+    oset(o, "subtype", jstr("null"));
+    oset(o, "value", json_new_null());
+    return o;
+  }
+  if (streq(val, "true") || streq(val, "false")) {
+    oset(o, "type", jstr("boolean"));
+    oset(o, "value", jbool(streq(val, "true")));
+    return o;
+  }
+  if (looks_numeric(val)) {
+    oset(o, "type", jstr("number"));
+    oset(o, "value", jnum(strtod(val, 0)));
+    oset(o, "description", jstr(val));
+    return o;
+  }
+  oset(o, "type", jstr("string"));
+  oset(o, "value", jstr(val));
+  return o;
+}
+
+/* --- DOM tree serialization (nodeId registry) ------------------------------ */
+static struct dom_node **cdp_nodes;
+static int cdp_nnodes, cdp_nodes_cap;
+static int node_register(struct dom_node *n)
+{
+  if (cdp_nnodes >= cdp_nodes_cap) {
+    int nc = cdp_nodes_cap ? cdp_nodes_cap * 2 : 256;
+    struct dom_node **p = realloc(cdp_nodes, (unsigned)nc * sizeof *p);
+    if (!p)
+      return cdp_nnodes; /* reuse the last id on OOM */
+    cdp_nodes = p;
+    cdp_nodes_cap = nc;
+  }
+  cdp_nodes[cdp_nnodes++] = n;
+  return cdp_nnodes; /* id = 1-based index */
+}
+/* Resolve a CDP nodeId back to its DOM node (registry filled by DOM.getDocument). */
+static struct dom_node *node_by_id(int id) { return (id >= 1 && id <= cdp_nnodes) ? cdp_nodes[id - 1] : 0; }
+/* Next element after `n` in document order, within `root`'s subtree (excluding
+ * root itself, as querySelector does), that matches `l`; NULL when exhausted. */
+static struct dom_node *next_match(const struct sel_list *l, struct dom_node *n, struct dom_node *root)
+{
+  for (;;) {
+    if (n->first_child) {
+      n = n->first_child;
+    } else {
+      while (n != root && !n->next)
+        n = n->parent;
+      if (n == root)
+        return 0;
+      n = n->next;
+    }
+    if (n->type == DOM_ELEMENT && css_sel_match(l, n))
+      return n;
+  }
+}
+static int text_is_ws(const struct dom_node *n)
+{
+  const char *s = n->text;
+  if (!s)
+    return 1;
+  for (; *s; s++)
+    if (*s != ' ' && *s != '\t' && *s != '\n' && *s != '\r')
+      return 0;
+  return 1;
+}
+static int child_shown(const struct dom_node *c)
+{
+  return c->type == DOM_ELEMENT || (c->type == DOM_TEXT && !text_is_ws(c));
+}
+static void upper_tag(const char *tag, char *out, int cap)
+{
+  int k = 0;
+  for (; tag[k] && k < cap - 1; k++) {
+    char c = tag[k];
+    out[k] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+  }
+  out[k] = '\0';
+}
+static json_value *dom_serialize(struct dom_node *n, int depth, int maxdepth, int *budget)
+{
+  if (*budget <= 0)
+    return 0;
+  (*budget)--;
+  int id = node_register(n);
+  int is_doc = n->type == DOM_ELEMENT && n->tag[0] == '#'; /* the "#document" root */
+  json_value *o = json_new_object();
+  oset(o, "nodeId", jnum(id));
+  oset(o, "backendNodeId", jnum(id));
+  oset(o, "nodeType", jnum(is_doc ? 9 : (n->type == DOM_TEXT ? 3 : 1)));
+  if (is_doc) {
+    oset(o, "nodeName", jstr("#document"));
+    oset(o, "localName", jstr(""));
+    oset(o, "nodeValue", jstr(""));
+  } else if (n->type == DOM_TEXT) {
+    oset(o, "nodeName", jstr("#text"));
+    oset(o, "localName", jstr(""));
+    oset(o, "nodeValue", jstr(n->text ? n->text : ""));
+  } else {
+    char up[24];
+    upper_tag(n->tag, up, sizeof up);
+    oset(o, "nodeName", jstr(up));
+    oset(o, "localName", jstr(n->tag));
+    oset(o, "nodeValue", jstr(""));
+    json_value *attrs = json_new_array();
+    for (struct dom_attr *a = n->attrs; a; a = a->next) {
+      json_array_push(attrs, jstr(a->name));
+      json_array_push(attrs, jstr(a->value ? a->value : ""));
+    }
+    oset(o, "attributes", attrs);
+  }
+
+  int nch = 0;
+  for (struct dom_node *c = n->first_child; c; c = c->next)
+    if (child_shown(c))
+      nch++;
+  oset(o, "childNodeCount", jnum(nch));
+
+  if (nch && depth < maxdepth) {
+    json_value *kids = json_new_array();
+    for (struct dom_node *c = n->first_child; c; c = c->next) {
+      if (!child_shown(c))
+        continue;
+      json_value *kv = dom_serialize(c, depth + 1, maxdepth, budget);
+      if (kv)
+        json_array_push(kids, kv);
+      else
+        break;
+    }
+    oset(o, "children", kids);
+  }
+  return o;
+}
+
+/* Navigate the page: worker->main handoff, same as JS location.assign so history
+ * and the address bar update. */
+static void cdp_navigate(const char *url)
+{
+  if (!url || !url[0])
+    return;
+  strlcpy(B->req_url, url, sizeof B->req_url);
+  B->req_method[0] = '\0';
+  B->req_body_len = 0;
+  B->req_pending = 1;
+  B->seq++;
+}
+
+/* Parse a "prop: value; prop: value" declaration block into a CDP CSSStyle
+ * (cssProperties [{name,value}] + cssText), the shape the Styles pane renders. */
+static json_value *cssstyle_from_text(const char *raw)
+{
+  json_value *st = json_new_object();
+  json_value *props = json_new_array();
+  for (const char *seg = raw ? raw : ""; *seg;) {
+    const char *e = seg;
+    while (*e && *e != ';')
+      e++;
+    const char *c = seg;
+    while (c < e && *c != ':')
+      c++;
+    if (c < e) {
+      const char *ns = seg;
+      while (ns < c && (*ns == ' ' || *ns == '\t' || *ns == '\n'))
+        ns++;
+      const char *ne = c;
+      while (ne > ns && (ne[-1] == ' ' || ne[-1] == '\t'))
+        ne--;
+      const char *vs = c + 1;
+      while (vs < e && (*vs == ' ' || *vs == '\t'))
+        vs++;
+      const char *ve = e;
+      while (ve > vs && (ve[-1] == ' ' || ve[-1] == '\t' || ve[-1] == '\n'))
+        ve--;
+      if (ne > ns && ve > vs) {
+        char nm[96], vl[256];
+        int nl = (int)(ne - ns);
+        if (nl > 95)
+          nl = 95;
+        memcpy(nm, ns, (unsigned)nl);
+        nm[nl] = '\0';
+        int vln = (int)(ve - vs);
+        if (vln > 255)
+          vln = 255;
+        memcpy(vl, vs, (unsigned)vln);
+        vl[vln] = '\0';
+        json_value *pr = json_new_object();
+        oset(pr, "name", jstr(nm));
+        oset(pr, "value", jstr(vl));
+        json_array_push(props, pr);
+      }
+    }
+    seg = *e ? e + 1 : e;
+  }
+  oset(st, "cssProperties", props);
+  oset(st, "shorthandEntries", json_new_array());
+  oset(st, "cssText", jstr(raw ? raw : ""));
+  return st;
+}
+
+/* Append one {name,value} entry to a computed-style array. */
+static void cs_add(json_value *arr, const char *name, const char *value)
+{
+  json_value *p = json_new_object();
+  oset(p, "name", jstr(name));
+  oset(p, "value", jstr(value));
+  json_array_push(arr, p);
+}
+static void cs_px(json_value *arr, const char *name, int v)
+{
+  if (v < 0)
+    return;
+  char b[32];
+  int n = 0;
+  uapp(b, &n, sizeof b, (unsigned)v);
+  sapp(b, &n, sizeof b, "px");
+  cs_add(arr, name, b);
+}
+static void cs_color(json_value *arr, const char *name, int c)
+{
+  if (c < 0 || (unsigned)c == BG_NONE)
+    return;
+  static const char hx[] = "0123456789abcdef";
+  char b[8];
+  int k = 0;
+  b[k++] = '#';
+  for (int sh = 20; sh >= 0; sh -= 4)
+    b[k++] = hx[(c >> sh) & 15];
+  b[k] = '\0';
+  cs_add(arr, name, b);
+}
+
+/* CSS.getComputedStyleForNode: a flat computed list from html_compute_style: the
+ * subset the engine models, enough to populate DevTools' Computed pane. */
+static json_value *computed_style(struct dom_node *n)
+{
+  json_value *arr = json_new_array();
+  if (!n || n->type != DOM_ELEMENT)
+    return arr;
+  struct css_style s;
+  html_compute_style(n, &s);
+  cs_add(arr, "display",
+         s.grid == 1                 ? "grid"
+         : s.flex == 1               ? "flex"
+         : s.disp == CSS_DISP_INLINE ? "inline"
+         : s.disp == CSS_DISP_NONE   ? "none"
+                                     : "block");
+  if (s.fam[0])
+    cs_add(arr, "font-family", s.fam);
+  cs_px(arr, "font-size", s.font_px);
+  cs_color(arr, "color", s.color);
+  cs_color(arr, "background-color", s.bg);
+  if (s.bold == 1)
+    cs_add(arr, "font-weight", "bold");
+  if (s.under == 1)
+    cs_add(arr, "text-decoration", "underline");
+  if (s.center == 1)
+    cs_add(arr, "text-align", "center");
+  cs_px(arr, "width", s.width);
+  cs_px(arr, "height", s.height);
+  cs_px(arr, "border-radius", s.radius);
+  return arr;
+}
+
+/* --- response-body cache (for Network.getResponseBody) --------------------- *
+ * A small round-robin cache of recent response bodies keyed by request id, filled
+ * from the fetch completion paths only while a client is attached (so it costs
+ * nothing otherwise). Bodies over the per-entry cap are truncated. */
+#define CDP_BODY_SLOTS 16
+#define CDP_BODY_CAP (512 * 1024)
+struct cdp_body {
+  int id;
+  unsigned char *data;
+  int len;
+};
+static struct cdp_body cdp_bodies[CDP_BODY_SLOTS];
+static int cdp_body_next;
+static mutex_t body_lk = MUTEX_INIT;
+
+void cdp_net_body(int id, const void *data, int len, const char *ctype)
+{
+  (void)ctype;
+  if (!cdp_nsessions || !data || len <= 0)
+    return;
+  int cap = len > CDP_BODY_CAP ? CDP_BODY_CAP : len;
+  unsigned char *copy = malloc((unsigned)cap);
+  if (!copy)
+    return;
+  memcpy(copy, data, (unsigned)cap);
+  mutex_lock(&body_lk);
+  int slot = -1;
+  for (int i = 0; i < CDP_BODY_SLOTS; i++)
+    if (cdp_bodies[i].data && cdp_bodies[i].id == id) {
+      slot = i;
+      break;
+    }
+  if (slot < 0) {
+    slot = cdp_body_next;
+    cdp_body_next = (cdp_body_next + 1) % CDP_BODY_SLOTS;
+  }
+  free(cdp_bodies[slot].data);
+  cdp_bodies[slot].id = id;
+  cdp_bodies[slot].data = copy;
+  cdp_bodies[slot].len = cap;
+  mutex_unlock(&body_lk);
+}
+void cdp_net_reset(void)
+{
+  mutex_lock(&body_lk);
+  for (int i = 0; i < CDP_BODY_SLOTS; i++) {
+    free(cdp_bodies[i].data);
+    cdp_bodies[i].data = 0;
+    cdp_bodies[i].id = 0;
+    cdp_bodies[i].len = 0;
+  }
+  cdp_body_next = 0;
+  mutex_unlock(&body_lk);
+}
+/* Copy out the cached body for `id` (caller frees *out); returns its length or -1. */
+static int cdp_body_dup(int id, unsigned char **out)
+{
+  int n = -1;
+  mutex_lock(&body_lk);
+  for (int i = 0; i < CDP_BODY_SLOTS; i++)
+    if (cdp_bodies[i].data && cdp_bodies[i].id == id) {
+      unsigned char *c = malloc((unsigned)cdp_bodies[i].len);
+      if (c) {
+        memcpy(c, cdp_bodies[i].data, (unsigned)cdp_bodies[i].len);
+        *out = c;
+        n = cdp_bodies[i].len;
+      }
+      break;
+    }
+  mutex_unlock(&body_lk);
+  return n;
+}
+
+static const char *res_type(const char *ct);
+
+/* Four corners of a rectangle as a CDP quad array: [x1,y1, x2,y2, x3,y3, x4,y4]. */
+static json_value *quad(int x, int y, int w, int h)
+{
+  json_value *q = json_new_array();
+  json_array_push(q, jnum(x));
+  json_array_push(q, jnum(y));
+  json_array_push(q, jnum(x + w));
+  json_array_push(q, jnum(y));
+  json_array_push(q, jnum(x + w));
+  json_array_push(q, jnum(y + h));
+  json_array_push(q, jnum(x));
+  json_array_push(q, jnum(y + h));
+  return q;
+}
+
+/* Dispatch one method; returns the `result` object to wrap (never NULL; an empty
+ * object is the permissive answer for anything we don't specifically model, so a
+ * DevTools frontend keeps initializing instead of stalling on an error). */
+static json_value *handle_method(struct cdp_session *sess, const char *m, json_value *params)
+{
+  json_value *r = json_new_object();
+
+  if (streq(m, "Runtime.enable")) {
+    sess->rt_enabled = 1;
+    emit_context_created(sess);
+    return r;
+  }
+  if (streq(m, "Log.enable")) {
+    sess->log_enabled = 1;
+    return r;
+  }
+  if (streq(m, "Page.enable")) {
+    sess->page_enabled = 1;
+    return r;
+  }
+  if (streq(m, "DOM.enable")) {
+    sess->dom_enabled = 1;
+    return r;
+  }
+  if (streq(m, "Network.enable")) {
+    sess->net_enabled = 1;
+    return r;
+  }
+  if (streq(m, "CSS.enable")) {
+    sess->css_enabled = 1;
+    return r;
+  }
+
+  if (streq(m, "Runtime.evaluate") || streq(m, "Runtime.callFunctionOn")) {
+    const char *expr = json_as_string(json_object_get(params, "expression"));
+    const char *fn = json_as_string(json_object_get(params, "functionDeclaration"));
+    char *call = 0;
+    if (!expr && fn) { /* call it with no arguments; `arguments`/objectId aren't modelled */
+      int n = 0, cap = (int)strlen(fn) + 8;
+      call = malloc((unsigned)cap);
+      if (call) {
+        sapp(call, &n, cap, "(");
+        sapp(call, &n, cap, fn);
+        sapp(call, &n, cap, ")()");
+      }
+      expr = call;
+    }
+    int is_exc = 0;
+    char *val = expr ? js_page_eval(expr, &is_exc) : 0;
+    free(call);
+    if (!is_exc)
+      oset(r, "result", remote_object(val ? val : "undefined"));
+    if (is_exc) {
+      json_value *err = json_new_object();
+      oset(err, "type", jstr("object"));
+      oset(err, "subtype", jstr("error"));
+      oset(err, "className", jstr("Error"));
+      oset(err, "description", jstr(val ? val : "error"));
+      oset(r, "result", err);
+      json_value *ed = json_new_object();
+      oset(ed, "exceptionId", jnum(1));
+      oset(ed, "text", jstr("Uncaught"));
+      oset(ed, "lineNumber", jnum(0));
+      oset(ed, "columnNumber", jnum(0));
+      json_value *ex = json_new_object();
+      oset(ex, "type", jstr("object"));
+      oset(ex, "subtype", jstr("error"));
+      oset(ex, "className", jstr("Error"));
+      oset(ex, "description", jstr(val ? val : "error"));
+      oset(ed, "exception", ex);
+      oset(r, "exceptionDetails", ed);
+    }
+    free(val);
+    return r;
+  }
+  if (streq(m, "Runtime.getProperties")) {
+    oset(r, "result", json_new_array());
+    return r;
+  }
+
+  if (streq(m, "Page.navigate")) {
+    const char *url = json_as_string(json_object_get(params, "url"));
+    cdp_navigate(url);
+    oset(r, "frameId", jstr(FRAME_ID));
+    oset(r, "loaderId", jstr(LOADER_ID));
+    return r;
+  }
+  if (streq(m, "Page.reload")) {
+    cdp_navigate(B->pg->cur_url);
+    return r;
+  }
+  if (streq(m, "Page.getFrameTree") || streq(m, "Page.getResourceTree")) {
+    json_value *tree = json_new_object();
+    oset(tree, "frame", build_frame());
+    oset(tree, "childFrames", json_new_array());
+    if (streq(m, "Page.getResourceTree")) {
+      oset(tree, "resources", json_new_array()); /* the browser keeps no subresource registry */
+    }
+    oset(r, "frameTree", tree);
+    return r;
+  }
+  if (streq(m, "Page.getNavigationHistory")) {
+    oset(r, "currentIndex", jnum(0));
+    json_value *entries = json_new_array();
+    json_value *e = json_new_object();
+    oset(e, "id", jnum(0));
+    oset(e, "url", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+    oset(e, "userTypedURL", jstr(B->pg->cur_url));
+    oset(e, "title", jstr(B->pg->doc_title));
+    oset(e, "transitionType", jstr("typed"));
+    json_array_push(entries, e);
+    oset(r, "entries", entries);
+    return r;
+  }
+  if (streq(m, "Page.createIsolatedWorld")) {
+    oset(r, "executionContextId", jnum(1));
+    return r;
+  }
+  if (streq(m, "Page.getLayoutMetrics")) {
+    json_value *cs = json_new_object();
+    oset(cs, "pageX", jnum(0));
+    oset(cs, "pageY", jnum(0));
+    oset(cs, "clientWidth", jnum(1024));
+    oset(cs, "clientHeight", jnum(768));
+    oset(r, "layoutViewport", cs);
+    return r;
+  }
+
+  if (streq(m, "DOM.getDocument")) {
+    struct dom_node *root = html_dom_root();
+    cdp_nnodes = 0;
+    int budget = 4000;
+    json_value *node = root ? dom_serialize(root, 0, 40, &budget) : 0;
+    if (!node) { /* no page yet: a bare document node */
+      node = json_new_object();
+      oset(node, "nodeId", jnum(1));
+      oset(node, "backendNodeId", jnum(1));
+      oset(node, "nodeType", jnum(9));
+      oset(node, "nodeName", jstr("#document"));
+      oset(node, "localName", jstr(""));
+      oset(node, "nodeValue", jstr(""));
+      oset(node, "childNodeCount", jnum(0));
+    }
+    oset(r, "root", node);
+    return r;
+  }
+  if (streq(m, "DOM.querySelector")) {
+    struct dom_node *n = node_by_id((int)json_as_number(json_object_get(params, "nodeId"), -1));
+    const char *sel = json_as_string(json_object_get(params, "selector"));
+    struct sel_list *l = (n && sel && sel[0]) ? css_sel_parse(sel) : 0;
+    struct dom_node *found = l ? next_match(l, n, n) : 0;
+    css_sel_free(l);
+    oset(r, "nodeId", jnum(found ? node_register(found) : 0));
+    return r;
+  }
+  if (streq(m, "DOM.querySelectorAll")) {
+    struct dom_node *n = node_by_id((int)json_as_number(json_object_get(params, "nodeId"), -1));
+    const char *sel = json_as_string(json_object_get(params, "selector"));
+    json_value *ids = json_new_array();
+    struct sel_list *l = (n && sel && sel[0]) ? css_sel_parse(sel) : 0;
+    for (struct dom_node *c = l ? next_match(l, n, n) : 0; c; c = next_match(l, c, n))
+      json_array_push(ids, jnum(node_register(c)));
+    css_sel_free(l);
+    oset(r, "nodeIds", ids);
+    return r;
+  }
+  if (streq(m, "DOM.resolveNode")) {
+    int nid = (int)json_as_number(json_object_get(params, "nodeId"), -1);
+    if (nid < 0)
+      nid = (int)json_as_number(json_object_get(params, "backendNodeId"), -1);
+    struct dom_node *n = node_by_id(nid);
+    json_value *obj = json_new_object();
+    oset(obj, "type", jstr("object"));
+    oset(obj, "subtype", jstr("node"));
+    {
+      char oid[32];
+      int k = 0;
+      sapp(oid, &k, sizeof oid, "node-");
+      uapp(oid, &k, sizeof oid, (unsigned)nid);
+      oset(obj, "objectId", jstr(oid));
+    }
+    if (n && n->type == DOM_ELEMENT) {
+      char desc[128];
+      int k = 0;
+      sapp(desc, &k, sizeof desc, n->tag[0] ? n->tag : "?");
+      const char *id = dom_get_attr(n, "id");
+      if (id && id[0]) {
+        sapp(desc, &k, sizeof desc, "#");
+        sapp(desc, &k, sizeof desc, id);
+      }
+      oset(obj, "description", jstr(desc));
+    }
+    oset(r, "object", obj);
+    return r;
+  }
+  if (streq(m, "DOM.getBoxModel")) {
+    struct dom_node *n = node_by_id((int)json_as_number(json_object_get(params, "nodeId"), -1));
+    if (n) {
+      int nb = 0;
+      struct lbox *pool = layout_pool(&nb);
+      struct lbox *lb = 0;
+      for (int i = 0; i < nb; i++)
+        if (pool[i].node == n) {
+          lb = &pool[i];
+          break;
+        }
+      if (lb && lb->x >= 0 && lb->w > 0 && lb->h > 0) {
+        int mx = lb->x, my = lb->y, mw = lb->w, mh = lb->h; /* margin box */
+        int bx = mx + lb->margin.l, by = my + lb->margin.t;
+        int bw = mw - lb->margin.l - lb->margin.r, bh = mh - lb->margin.t - lb->margin.b;
+        int sx = bx + lb->border.l, sy = by + lb->border.t;
+        int sw = bw - lb->border.l - lb->border.r, sh = bh - lb->border.t - lb->border.b;
+        /* Content box: use cx/cy/cw/ch from the layout pass. */
+        int cx = lb->cx, cy = lb->cy, cw = lb->cw, ch = lb->ch;
+        json_value *model = json_new_object();
+        oset(model, "content", quad(cx, cy, cw, ch));
+        oset(model, "padding", quad(sx, sy, sw, sh));
+        oset(model, "border", quad(bx, by, bw, bh));
+        oset(model, "margin", quad(mx, my, mw, mh));
+        oset(model, "width", jnum(cw));
+        oset(model, "height", jnum(ch));
+        oset(r, "model", model);
+      }
+    }
+    return r;
+  }
+  if (streq(m, "DOM.describeNode")) {
+    /* Minimal: enough shape to not error the frontend. */
+    return r;
+  }
+
+  if (streq(m, "Overlay.setInspectMode")) {
+    const char *mode = json_as_string(json_object_get(params, "mode"));
+    int idx = (int)(sess - sessions);
+    if (mode && (streq(mode, "searchForNode") || streq(mode, "searchForUAShadowDOM")))
+      cdp_pick_sess = idx;
+    else if (cdp_pick_sess == idx)
+      cdp_pick_sess = -1;
+    return r;
+  }
+
+  if (streq(m, "CSS.getMatchedStylesForNode")) {
+    struct dom_node *n = node_by_id((int)json_as_number(json_object_get(params, "nodeId"), -1));
+    if (n) {
+      const char *inl = dom_get_attr(n, "style");
+      if (inl && inl[0])
+        oset(r, "inlineStyle", cssstyle_from_text(inl));
+    }
+    /* Rules carry no stylesheet origin in this engine, so none gets a styleSheetId or source range. */
+    json_value *rules = json_new_array();
+    if (n && n->type == DOM_ELEMENT) {
+      struct css_match mm[64];
+      int nm = html_match_styles(n, mm, 64);
+      for (int i = 0; i < nm; i++) {
+        json_value *rule = json_new_object();
+        json_value *sl = json_new_object();
+        json_value *sels = json_new_array();
+        json_value *s1 = json_new_object();
+        oset(s1, "text", jstr(mm[i].selector));
+        json_array_push(sels, s1);
+        oset(sl, "selectors", sels);
+        oset(sl, "text", jstr(mm[i].selector));
+        oset(rule, "selectorList", sl);
+        oset(rule, "origin", jstr("regular"));
+        oset(rule, "style", cssstyle_from_text(mm[i].raw && mm[i].raw[0] ? mm[i].raw : ""));
+        json_value *mcr = json_new_object();
+        oset(mcr, "rule", rule);
+        json_value *msel = json_new_array();
+        json_array_push(msel, jnum(0));
+        oset(mcr, "matchingSelectors", msel);
+        json_array_push(rules, mcr);
+      }
+    }
+    oset(r, "matchedCSSRules", rules);
+    oset(r, "pseudoElements", json_new_array());
+    oset(r, "inherited", json_new_array());
+    oset(r, "cssKeyframesRules", json_new_array());
+    return r;
+  }
+  if (streq(m, "CSS.getInlineStylesForNode")) {
+    struct dom_node *n = node_by_id((int)json_as_number(json_object_get(params, "nodeId"), -1));
+    const char *inl = n ? dom_get_attr(n, "style") : 0;
+    oset(r, "inlineStyle", cssstyle_from_text(inl && inl[0] ? inl : ""));
+    return r;
+  }
+  if (streq(m, "CSS.getComputedStyleForNode")) {
+    struct dom_node *n = node_by_id((int)json_as_number(json_object_get(params, "nodeId"), -1));
+    oset(r, "computedStyle", computed_style(n));
+    return r;
+  }
+  if (streq(m, "Network.getCookies") || streq(m, "Storage.getCookies")) {
+    json_value *arr = json_new_array();
+    for (struct cookie *c = B->cookies; c; c = c->next) {
+      json_value *ck = json_new_object();
+      int vlen = (c->name ? (int)strlen(c->name) : 0) + (c->val ? (int)strlen(c->val) : 0);
+      oset(ck, "name", jstr(c->name));
+      oset(ck, "value", jstr(c->val));
+      oset(ck, "domain", jstr(c->host));
+      oset(ck, "path", jstr("/"));
+      oset(ck, "expires", jnum(-1));
+      oset(ck, "size", jnum(vlen));
+      oset(ck, "httpOnly", jbool(0));
+      oset(ck, "secure", jbool(0));
+      oset(ck, "session", jbool(1));
+      oset(ck, "sameSite", jstr("Lax"));
+      json_array_push(arr, ck);
+    }
+    oset(r, "cookies", arr);
+    return r;
+  }
+  if (streq(m, "DOMStorage.getDOMStorageItems")) {
+    int is_local = json_as_bool(json_object_get(json_object_get(params, "storageId"), "isLocalStorage"), 1);
+    json_value *entries = json_new_array();
+    const char *k;
+    for (int i = 0; (k = storage_key(B->pg->cur_url, !is_local, i)); i++) {
+      const char *v = storage_get(B->pg->cur_url, !is_local, k);
+      json_value *pair = json_new_array();
+      json_array_push(pair, jstr(k));
+      json_array_push(pair, jstr(v ? v : ""));
+      json_array_push(entries, pair);
+    }
+    oset(r, "entries", entries);
+    return r;
+  }
+
+  if (streq(m, "Network.getResponseBody")) {
+    const char *rid = json_as_string(json_object_get(params, "requestId"));
+    int id = 0;
+    if (rid) {
+      const char *p = rid;
+      while (*p && (*p < '0' || *p > '9'))
+        p++;
+      while (*p >= '0' && *p <= '9')
+        id = id * 10 + (*p++ - '0');
+    }
+    unsigned char *body = 0;
+    int n = cdp_body_dup(id, &body);
+    if (n >= 0 && body) {
+      char *b64 = malloc((unsigned)base64_encoded_len(n) + 1);
+      if (b64) {
+        base64_encode(body, n, b64);
+        oset(r, "body", jstr(b64));
+        free(b64);
+      } else
+        oset(r, "body", jstr(""));
+    } else {
+      oset(r, "body", jstr(""));
+    }
+    oset(r, "base64Encoded", jbool(1));
+    free(body);
+    return r;
+  }
+
+  if (streq(m, "Target.getTargetInfo") || streq(m, "Target.getTargets")) {
+    json_value *ti = json_new_object();
+    oset(ti, "targetId", jstr(TARGET_ID));
+    oset(ti, "type", jstr("page"));
+    oset(ti, "title", jstr(B->pg->doc_title[0] ? B->pg->doc_title : "OwOS"));
+    oset(ti, "url", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+    oset(ti, "attached", jbool(1));
+    oset(ti, "browserContextId", jstr("owos-ctx"));
+    if (streq(m, "Target.getTargets")) {
+      json_value *a = json_new_array();
+      json_array_push(a, ti);
+      oset(r, "targetInfos", a);
+    } else
+      oset(r, "targetInfo", ti);
+    return r;
+  }
+  if (streq(m, "Target.getBrowserContexts")) {
+    oset(r, "browserContextIds", json_new_array());
+    return r;
+  }
+
+  if (streq(m, "Browser.getVersion")) {
+    oset(r, "protocolVersion", jstr("1.3"));
+    oset(r, "product", jstr("OwOS-Browser/" OWOS_VERSION));
+    oset(r, "revision", jstr(OWOS_VERSION));
+    oset(r, "userAgent", jstr(browser_ua()));
+    oset(r, "jsVersion", jstr("0"));
+    return r;
+  }
+  if (streq(m, "Debugger.enable")) {
+    oset(r, "debuggerId", jstr("owos-dbg-1"));
+    return r;
+  }
+
+  return r; /* permissive default: empty result */
+}
+
+static void dispatch_one(struct cdp_session *sess, const char *text)
+{
+  json_error err;
+  json_value *req = json_parse(text, -1, &err);
+  if (!req)
+    return;
+  json_value *jid = json_object_get(req, "id");
+  const char *method = json_as_string(json_object_get(req, "method"));
+  json_value *params = json_object_get(req, "params");
+  int has_id = jid && json_typeof(jid) == JSON_NUMBER;
+  double id = json_as_number(jid, -1);
+  if (method) {
+    json_value *result = handle_method(sess, method, params);
+    if (has_id)
+      reply_result(sess, id, result);
+    else
+      json_free(result);
+  }
+  json_free(req);
+}
+
+/* --- navigation-lifecycle detection (worker) ------------------------------- *
+ * The page state is global, so a change broadcasts to every session that enabled
+ * the matching domain (not per-session). */
+static char lc_url[URL_MAX];
+static int lc_loading = -1, lc_inited;
+static void lifecycle_tick(void)
+{
+  const char *url = B->pg->cur_url;
+  if (!lc_inited) {
+    strlcpy(lc_url, url, sizeof lc_url);
+    lc_loading = B->loading;
+    lc_inited = 1;
+    return;
+  }
+
+  if (!streq(url, lc_url)) {
+    strlcpy(lc_url, url, sizeof lc_url);
+    broadcast_event(EV_RUNTIME, "Runtime.executionContextsCleared", json_new_object());
+    {
+      json_value *p = json_new_object();
+      oset(p, "frame", build_frame());
+      broadcast_event(EV_PAGE, "Page.frameNavigated", p);
+    }
+    emit_context_created(0); /* 0 -> broadcast to Runtime-enabled sessions */
+    broadcast_event(EV_DOM, "DOM.documentUpdated", json_new_object());
+  }
+  if (B->loading != lc_loading) {
+    if (lc_loading == 1 && B->loading == 0) {
+      {
+        json_value *p = json_new_object();
+        oset(p, "timestamp", jnum(0));
+        broadcast_event(EV_PAGE, "Page.loadEventFired", p);
+      }
+      broadcast_event(EV_DOM, "DOM.documentUpdated", json_new_object());
+    }
+    lc_loading = B->loading;
+  }
+}
+
+void cdp_worker_tick(void)
+{
+  if (!cdp_nsessions && cdp_pick_sess < 0)
+    return;
+  lifecycle_tick();
+
+  /* Resolve a CDP inspect-mode pick: the main thread set cdp_pick_commit with the
+   * pane offset; resolve it to a DOM node and emit Overlay.inspectNodeRequested.
+   * Mirror of devtools_pick_tick, same worker-thread DOM resolver. */
+  if (cdp_pick_commit >= 0 && cdp_pick_sess >= 0 && cdp_pick_sess < CDP_MAX_SESSIONS) {
+    int off = cdp_pick_commit;
+    cdp_pick_commit = -1;
+    struct dom_node *n = html_node_at_offset(off);
+    if (n && n->type == DOM_TEXT && n->parent)
+      n = n->parent;
+    if (n) {
+      int nid = node_register(n);
+      json_value *p = json_new_object();
+      oset(p, "backendNodeId", jnum(nid));
+      oset(p, "nodeId", jnum(nid));
+      emit_to_session(&sessions[cdp_pick_sess], "Overlay.inspectNodeRequested", p);
+    }
+    cdp_pick_sess = -1;
+  }
+
+  for (int i = 0; i < CDP_MAX_SESSIONS; i++) {
+    struct cdp_session *s = &sessions[i];
+    if (!s->used)
+      continue;
+    char *msg;
+    int budget = 16;
+    while (budget-- > 0 && (msg = sess_in_pop(s))) {
+      dispatch_one(s, msg);
+      free(msg);
+    }
+  }
+}
+
+/* --- event hooks (any thread) ---------------------------------------------- */
+void cdp_console_line(int level, const char *text)
+{
+  if (!cdp_nsessions || !text)
+    return;
+  const char *type = level >= 2 ? "error" : (level == 1 ? "warning" : "log");
+  json_value *p = json_new_object();
+  oset(p, "type", jstr(type));
+  json_value *args = json_new_array();
+  json_value *a0 = json_new_object();
+  oset(a0, "type", jstr("string"));
+  oset(a0, "value", jstr(text));
+  json_array_push(args, a0);
+  oset(p, "args", args);
+  oset(p, "executionContextId", jnum(1));
+  oset(p, "timestamp", jnum(0));
+  broadcast_event(EV_RUNTIME, "Runtime.consoleAPICalled", p);
+}
+
+static void reqid_str(int id, char *out, int cap)
+{
+  int n = 0;
+  sapp(out, &n, cap, "req-");
+  uapp(out, &n, cap, (unsigned)id);
+}
+
+/* Parse a raw response-header block into a CDP headers object (status line, which
+ * has no ':', is naturally skipped). */
+static json_value *headers_obj(const char *raw)
+{
+  json_value *o = json_new_object();
+  if (!raw)
+    return o;
+  for (const char *p = raw; *p;) {
+    const char *e = p;
+    while (*e && *e != '\n')
+      e++;
+    const char *t = e;
+    if (t > p && t[-1] == '\r')
+      t--;
+    const char *c = p;
+    while (c < t && *c != ':')
+      c++;
+    if (c < t && c > p) {
+      char key[128];
+      int kl = (int)(c - p);
+      if (kl > 127)
+        kl = 127;
+      memcpy(key, p, (unsigned)kl);
+      key[kl] = '\0';
+      const char *v = c + 1;
+      while (v < t && (*v == ' ' || *v == '\t'))
+        v++;
+      char val[1024];
+      int vl = (int)(t - v);
+      if (vl < 0)
+        vl = 0;
+      if (vl > 1023)
+        vl = 1023;
+      memcpy(val, v, (unsigned)vl);
+      val[vl] = '\0';
+      json_object_set(o, key, jstr(val));
+    }
+    p = *e ? e + 1 : e;
+  }
+  return o;
+}
+static const char *res_type(const char *ct)
+{
+  if (!ct || !ct[0])
+    return "Other";
+  if (contains_ci(ct, "html"))
+    return "Document";
+  if (contains_ci(ct, "css"))
+    return "Stylesheet";
+  if (contains_ci(ct, "javascript") || contains_ci(ct, "ecmascript"))
+    return "Script";
+  if (starts_ci(ct, "image/"))
+    return "Image";
+  if (contains_ci(ct, "font"))
+    return "Font";
+  return "Other";
+}
+
+/* CDP timestamps are monotonic seconds (a double). DevTools renders "Pending" in
+ * the Time column for any request whose duration (loadingFinished − requestWillBeSent)
+ * is <= 0, so the begin/finish stamps must be real and strictly increasing. */
+static double cdp_now(void) { return (double)msec() / 1000.0; }
+
+/* Remember each request's start stamp so cdp_net_finish can report a positive
+ * duration even for the one-shot begin->finish path (which has no elapsed wall
+ * time of its own; it carries the measured duration in net_log.ms instead). */
+#define CDP_TS_MAX 64
+static struct {
+  int id;
+  double t0;
+} cdp_ts[CDP_TS_MAX];
+static int cdp_ts_head;
+static void cdp_ts_set(int id, double t)
+{
+  for (int i = 0; i < CDP_TS_MAX; i++)
+    if (cdp_ts[i].id == id) {
+      cdp_ts[i].t0 = t;
+      return;
+    }
+  cdp_ts[cdp_ts_head].id = id;
+  cdp_ts[cdp_ts_head].t0 = t;
+  cdp_ts_head = (cdp_ts_head + 1) % CDP_TS_MAX;
+}
+static double cdp_ts_get(int id) /* -1 if unknown (row evicted from the ring) */
+{
+  for (int i = 0; i < CDP_TS_MAX; i++)
+    if (cdp_ts[i].id == id)
+      return cdp_ts[i].t0;
+  return -1;
+}
+
+void cdp_net_begin(int id, const char *method, const char *url, const char *ctype)
+{
+  if (!cdp_nsessions)
+    return;
+  char rid[24];
+  reqid_str(id, rid, sizeof rid);
+  double t0 = cdp_now();
+  cdp_ts_set(id, t0);
+  json_value *p = json_new_object();
+  oset(p, "requestId", jstr(rid));
+  oset(p, "loaderId", jstr(LOADER_ID));
+  oset(p, "documentURL", jstr(B->pg->cur_url[0] ? B->pg->cur_url : "about:blank"));
+  json_value *rq = json_new_object();
+  oset(rq, "url", jstr(url ? url : ""));
+  oset(rq, "method", jstr(method ? method : "GET"));
+  oset(rq, "headers", json_new_object());
+  oset(p, "request", rq);
+  oset(p, "timestamp", jnum(t0));
+  oset(p, "wallTime", jnum((double)now_ms() / 1000.0));
+  json_value *ini = json_new_object();
+  oset(ini, "type", jstr("other"));
+  oset(p, "initiator", ini);
+  oset(p, "type", jstr(res_type(ctype)));
+  broadcast_event(EV_NETWORK, "Network.requestWillBeSent", p);
+}
+
+void cdp_net_finish(int id, const struct net_log *e)
+{
+  if (!cdp_nsessions || !e)
+    return;
+  char rid[24];
+  reqid_str(id, rid, sizeof rid);
+
+  /* End stamp = start + a strictly-positive elapsed: the real wall time if it's
+   * measurable, else the net_log-reported duration, floored so DevTools never sees
+   * a zero (which it draws as "Pending"). */
+  double t0 = cdp_ts_get(id);
+  if (t0 < 0)
+    t0 = cdp_now();
+  double elapsed = cdp_now() - t0;
+  double reported = e->ms > 0 ? (double)e->ms / 1000.0 : 0;
+  if (reported > elapsed)
+    elapsed = reported;
+  if (elapsed < 0.001)
+    elapsed = 0.001;
+  double tend = t0 + elapsed;
+
+  if (e->state == NET_FAILED || e->state == NET_CANCELLED) {
+    json_value *p = json_new_object();
+    oset(p, "requestId", jstr(rid));
+    oset(p, "timestamp", jnum(tend));
+    oset(p, "type", jstr(res_type(e->ctype)));
+    oset(p, "errorText",
+         jstr(e->reason ? e->reason : (e->state == NET_CANCELLED ? "net::ERR_ABORTED" : "net::ERR_FAILED")));
+    oset(p, "canceled", jbool(e->state == NET_CANCELLED));
+    broadcast_event(EV_NETWORK, "Network.loadingFailed", p);
+    return;
+  }
+
+  json_value *p = json_new_object();
+  oset(p, "requestId", jstr(rid));
+  oset(p, "loaderId", jstr(LOADER_ID));
+  oset(p, "timestamp", jnum(tend));
+  oset(p, "type", jstr(res_type(e->ctype)));
+  json_value *resp = json_new_object();
+  oset(resp, "url", jstr(e->url ? e->url : ""));
+  oset(resp, "status", jnum(e->status));
+  oset(resp, "statusText", jstr(""));
+  oset(resp, "mimeType", jstr(e->ctype ? e->ctype : ""));
+  oset(resp, "headers", headers_obj(e->resp_hdr));
+  oset(resp, "encodedDataLength", jnum(e->size));
+  oset(p, "response", resp);
+  broadcast_event(EV_NETWORK, "Network.responseReceived", p);
+
+  json_value *fin = json_new_object();
+  oset(fin, "requestId", jstr(rid));
+  oset(fin, "timestamp", jnum(tend));
+  oset(fin, "encodedDataLength", jnum(e->size));
+  broadcast_event(EV_NETWORK, "Network.loadingFinished", fin);
+}
+
+/* --- startup --------------------------------------------------------------- */
+static unsigned char cdp_stack[32768] __attribute__((aligned(16)));
+static int cdp_started;
+void cdp_init(void)
+{
+  if (cdp_started)
+    return;
+  cdp_started = 1;
+  thread_create(cdp_io_fn, &cdp_stack[sizeof cdp_stack]);
+}

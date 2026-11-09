@@ -1,4 +1,5 @@
 #include "devtools_int.h"
+#include "features/cdp/cdp.h"
 
 /* In-band `%c` style markers; keep in sync with JS_STYLE_ON/OFF in user/lib/js/interp.h. */
 #define CON_STYLE_ON 0x01
@@ -254,6 +255,10 @@ void devtools_console_append(int level, const char *s, int len)
     char c = s[i];
     if (c == '\n') {
       con_push(dt_con_pend_level, dt_con_pend ? dt_con_pend : "", dt_con_pend_len);
+      if (cdp_connected() && dt_con_pend) {
+        dt_con_pend[dt_con_pend_len] = '\0'; /* the growth check keeps a byte free */
+        cdp_console_line(dt_con_pend_level, dt_con_pend);
+      }
       dt_con_pend_len = 0;
     } else {
       if (dt_con_pend_len + 1 >= dt_con_pend_cap) {
@@ -305,6 +310,7 @@ void devtools_nav_reset(void)
   dt_net_count = 0;
   dt_net_sel = -1;
   mutex_unlock(&dt_lk);
+  cdp_net_reset();
   dt_con_clear();
   if (dt_open)
     B->seq++;
@@ -475,8 +481,10 @@ static void net_repaint(void)
 void devtools_net_add(const struct net_log *e)
 {
   mutex_lock(&dt_lk);
-  net_push_e(e);
+  int id = net_push_e(e);
   mutex_unlock(&dt_lk);
+  cdp_net_begin(id, e->method, e->url, e->ctype);
+  cdp_net_finish(id, e);
   net_repaint();
 }
 
@@ -486,6 +494,7 @@ int devtools_net_begin(const char *method, const char *url)
   mutex_lock(&dt_lk);
   int id = net_push_e(&e);
   mutex_unlock(&dt_lk);
+  cdp_net_begin(id, method, url, 0);
   net_repaint();
   return id;
 }
@@ -507,6 +516,7 @@ void devtools_net_update(int id, const struct net_log *e)
   else
     net_push_e(e);
   mutex_unlock(&dt_lk);
+  cdp_net_finish(id, e);
   net_repaint();
 }
 

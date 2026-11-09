@@ -132,6 +132,76 @@ js_value report_exc_v(js_ctx *ctx)
   return js_undef();
 }
 
+/* "Name: message" for the pending exception (clearing it), malloc'd */
+static char *exc_text(js_ctx *ctx)
+{
+  js_value e = ctx->exc;
+  sbuf sb;
+  sb.b = 0;
+  sb.n = 0;
+  sb.cap = 0;
+  ctx->has_exc = 0;
+  if (e.type == JV_OBJ) {
+    js_value nm = js_get(ctx, e, "name"), msg = js_get(ctx, e, "message");
+    sb_puts(&sb, nm.type == JV_STR ? nm.u.str->data : "Error");
+    if (msg.type == JV_STR && msg.u.str->len) {
+      sb_puts(&sb, ": ");
+      sb_puts(&sb, msg.u.str->data);
+    }
+  } else if (e.type == JV_STR) {
+    sb_puts(&sb, e.u.str->data);
+  } else {
+    sb_puts(&sb, "exception");
+  }
+  sb_putc(&sb, '\0');
+  return sb.b;
+}
+
+char *js_page_eval(const char *src, int *threw)
+{
+  js_arena *ar;
+  js_node *prog;
+  js_parse_error pe;
+  js_value res, s;
+
+  *threw = 0;
+  if (!src || !*src || !g_page_live || !g_ctx)
+    return 0;
+  ar = (js_arena *)malloc(sizeof *ar);
+  if (!ar)
+    return 0;
+  js_arena_init(ar);
+  prog = js_parse(src, ar, &pe);
+  if (!prog) {
+    sbuf sb;
+    sb.b = 0;
+    sb.n = 0;
+    sb.cap = 0;
+    sb_puts(&sb, "SyntaxError: ");
+    sb_puts(&sb, pe.msg ? pe.msg : "parse error");
+    sb_putc(&sb, '\0');
+    js_arena_free(ar);
+    free(ar);
+    *threw = 1;
+    return sb.b;
+  }
+  if (!arenas_push(ar)) {
+    js_arena_free(ar);
+    free(ar);
+    return 0;
+  }
+  if (js_run(g_ctx, prog, &res) != 0) {
+    *threw = 1;
+    return exc_text(g_ctx);
+  }
+  s = js_to_string(g_ctx, res);
+  if (g_ctx->has_exc) {
+    *threw = 1;
+    return exc_text(g_ctx);
+  }
+  return strdup(s.type == JV_STR && s.u.str ? s.u.str->data : "");
+}
+
 /* Devtools console REPL: parse and run one expression/statement against the live page context */
 void js_repl_run(const char *src)
 {

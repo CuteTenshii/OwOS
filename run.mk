@@ -149,7 +149,7 @@ endif
 
 run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 $(STORAGE) -serial stdio \
-		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22 -device $(NIC),netdev=net0 \
+		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22,hostfwd=tcp:127.0.0.1:9222-:9222 -device $(NIC),netdev=net0 \
 		-audiodev $(QEMU_AUDIODEV),id=snd0 -machine pcspk-audiodev=snd0,accel=$(ACCEL) \
 		-device sb16,audiodev=snd0 \
 		-device intel-hda -device hda-output,audiodev=snd0 \
@@ -160,7 +160,7 @@ run: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 debug: $(BOOTDEP) $(DISK) $(SATADISK) $(NVMEDISK) $(USBDISK) $(SDDISK) $(CDISK)
 	$(QEMU) $(BOOTARG) -smp $(SMP) -m 1024 -display none $(STORAGE) -serial stdio \
 		-machine accel=$(ACCEL) \
-		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22 -device $(NIC),netdev=net0 \
+		-netdev user,id=net0,hostfwd=tcp::1445-:445,hostfwd=tcp::2222-:22,hostfwd=tcp:127.0.0.1:9222-:9222 -device $(NIC),netdev=net0 \
 		-usb -device usb-tablet \
 		$(VDAGENT)
 

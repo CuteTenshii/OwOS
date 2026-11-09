@@ -1,5 +1,6 @@
 #include "features/bluetooth/bluetooth.h"
 #include "features/canvas/canvas.h"
+#include "features/cdp/cdp.h"
 #include "features/gamepad/gamepad.h"
 #include "features/mediasession/mediasession.h"
 #include "main_int.h"
@@ -376,6 +377,7 @@ void worker_fn(void)
 
     /* Rebuild the devtools DOM/Styles snapshot from the live tree (this thread owns it) */
     devtools_worker_tick();
+    cdp_worker_tick(); /* CDP commands touch the DOM and JS, which this thread owns */
 
     /* Flow the line table on THIS thread, not in render() */
     if (B->want_paw > 0 && (B->layout_dirty || B->wrap_cols != B->want_paw)) {
