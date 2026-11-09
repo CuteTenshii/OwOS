@@ -1027,12 +1027,26 @@ static void vfmt(void (*sink)(char, void *), void *ctx, const char *fmt, va_list
       width = width * 10 + (*fmt - '0');
       fmt++;
     }
+    int prec = -1;
+    if (*fmt == '.') {
+      fmt++;
+      prec = 0;
+      if (*fmt == '*') {
+        prec = va_arg(ap, int);
+        fmt++;
+      } else {
+        while (*fmt >= '0' && *fmt <= '9') {
+          prec = prec * 10 + (*fmt - '0');
+          fmt++;
+        }
+      }
+    }
     switch (*fmt) {
     case 's': {
       const char *s = va_arg(ap, const char *);
       if (!s)
         s = "(null)";
-      while (*s)
+      while (*s && prec--)
         sink(*s++, ctx);
       break;
     }
