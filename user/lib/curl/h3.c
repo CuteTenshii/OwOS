@@ -1,11 +1,13 @@
 /* h3.c — HTTP/3 (RFC 9114) framing + QPACK (RFC 9204) over the QUIC
- * transport (quic.c). See h3.h. One request on stream 0; QPACK uses the static
+ * transport (quic.c). See h3.h. A session is one QUIC connection carrying
+ * request streams one after another (or a batch at once); QPACK uses the static
  * table only (we advertise a zero-capacity dynamic table via empty SETTINGS),
  * so the request encodes with static indices/literals and the response decodes
  * without any dynamic-table state. HPACK's Huffman code (shared by QPACK) is
  * reused here for literal-string decoding. */
 
 #include "h3.h"
+#include "netconn.h"
 #include "owos.h"
 #include "quic.h"
 
@@ -342,7 +344,7 @@ static int dec_str(const uint8_t *p, uint32_t *o, uint32_t len, int prefix, uint
     return -1;
   if (H) {
     if (huff_decode(p + *o, (int)slen, out, outcap, outlen) < 0)
-      return -1;
+      *outlen = 0; /* too big for the buffer: skip the value, keep decoding the block */
   } else {
     uint32_t cp = slen < (uint64_t)outcap ? (uint32_t)slen : (uint32_t)outcap;
     memcpy(out, p + *o, cp);
@@ -378,151 +380,199 @@ static void enc_str(uint8_t *b, uint32_t *p, const char *s, int n)
 
 /* --------------------------------------------------- response header sink */
 
-static int h3_status;
-static char h3_lines[16384]; /* decoded "name: value\r\n" block */
-static int h3_lines_len;
-static http_body_fn h3_body;
-static void *h3_ctx;
-static int h3_abort;
+#define H3_ACC 4096 /* inbound bytes carried between reads: a partial frame header */
+#define H3_HB_MAX 16384
 
-static void emit_field(const uint8_t *name, int nl, const uint8_t *val, int vl)
+/* One request stream's parser state and sinks. */
+struct h3stream {
+  uint64_t sid;
+  int done;    /* the response ended (FIN reached and drained)   */
+  int aborted; /* a sink asked to stop                           */
+  int bad;     /* the stream could not be decoded                */
+  int headers_done;
+  int state; /* 0 = expect frame header, 1 = in payload */
+  uint64_t ftype, frem;
+  uint8_t acc[H3_ACC + 32];
+  uint32_t acclen;
+  uint8_t *hb; /* HEADERS payload accumulator */
+  uint32_t hblen;
+  char *hbuf; /* decoded header block ("HTTP/3 NNN\r\nname: value\r\n…") */
+  int hcap, hlen, status;
+  char scratch[64]; /* header sink when the caller wants no header text */
+  http_body_fn body;
+  void *bctx;
+  const struct h3_opts *opts;
+};
+
+struct h3 {
+  quic *q;
+  int broken; /* not safe for another request */
+  int served;
+  uint8_t rx[H3_ACC]; /* read buffer, off the small stack */
+};
+
+static void hs_raw(struct h3stream *st, const char *p, int n)
 {
+  for (int i = 0; i < n && st->hlen < st->hcap - 1; i++)
+    st->hbuf[st->hlen++] = p[i];
+}
+
+static void emit_field(struct h3stream *st, const uint8_t *name, int nl, const uint8_t *val, int vl)
+{
+  if (st->headers_done)
+    return; /* trailers: not kept */
   if (nl == 7 && eq_ci_n(":status", (const char *)name, 7)) {
     int s = 0;
     for (int i = 0; i < vl && val[i] >= '0' && val[i] <= '9'; i++)
       s = s * 10 + (val[i] - '0');
-    h3_status = s;
+    st->status = s;
+    hs_raw(st, "HTTP/3 ", 7);
+    hs_raw(st, (const char *)val, vl);
+    hs_raw(st, "\r\n", 2);
     return;
   }
   if (nl > 0 && name[0] == ':') /* skip other pseudo-headers */
     return;
-  int need = nl + 2 + vl + 2;
-  if (h3_lines_len + need > (int)sizeof h3_lines)
-    return;
-  memcpy(h3_lines + h3_lines_len, name, nl);
-  h3_lines_len += nl;
-  h3_lines[h3_lines_len++] = ':';
-  h3_lines[h3_lines_len++] = ' ';
-  memcpy(h3_lines + h3_lines_len, val, vl);
-  h3_lines_len += vl;
-  h3_lines[h3_lines_len++] = '\r';
-  h3_lines[h3_lines_len++] = '\n';
+  hs_raw(st, (const char *)name, nl);
+  hs_raw(st, ": ", 2);
+  hs_raw(st, (const char *)val, vl);
+  hs_raw(st, "\r\n", 2);
 }
 
-/* Decode a QPACK encoded field section (response HEADERS payload). */
-static void qpack_decode(const uint8_t *b, uint32_t len)
+/* Decode a QPACK encoded field section (response HEADERS payload). 0, or -1 if it is malformed or needs the dynamic
+ * table. */
+static int qpack_decode(struct h3stream *st, const uint8_t *b, uint32_t len)
 {
   uint32_t o = 0;
   uint64_t ric, base;
-  if (!dec_int(b, &o, len, 8, &ric) || !dec_int(b, &o, len, 7, &base))
-    return;                         /* prefix: insert count + base */
-  static char val[sizeof h3_lines]; /* a decoded value larger than this aborts the rest of the block */
-  while (o < len) {
+  if (!dec_int(b, &o, len, 8, &ric) || !dec_int(b, &o, len, 7, &base) || ric != 0)
+    return -1; /* prefix: insert count + base */
+  char *val = malloc(H3_HB_MAX);
+  if (!val)
+    return -1;
+  int rc = 0;
+  while (o < len && rc == 0) {
     uint8_t c = b[o];
     int vl = 0;
     if (c & 0x80) { /* Indexed Field Line */
       int T = c & 0x40;
       uint64_t idx;
-      if (!dec_int(b, &o, len, 6, &idx))
-        return;
-      if (T && idx < QP_N)
-        emit_field((const uint8_t *)QPN[idx], (int)strlen(QPN[idx]), (const uint8_t *)QPV[idx], (int)strlen(QPV[idx]));
+      if (!dec_int(b, &o, len, 6, &idx) || !T || idx >= QP_N)
+        rc = -1;
+      else
+        emit_field(st, (const uint8_t *)QPN[idx], (int)strlen(QPN[idx]), (const uint8_t *)QPV[idx],
+                   (int)strlen(QPV[idx]));
     } else if (c & 0x40) { /* Literal w/ Name Reference */
       int T = c & 0x10;
       uint64_t idx;
-      if (!dec_int(b, &o, len, 4, &idx))
-        return;
-      if (dec_str(b, &o, len, 7, 0x80, val, sizeof val, &vl) < 0)
-        return;
-      if (T && idx < QP_N)
-        emit_field((const uint8_t *)QPN[idx], (int)strlen(QPN[idx]), (const uint8_t *)val, vl);
+      if (!dec_int(b, &o, len, 4, &idx) || !T || idx >= QP_N || dec_str(b, &o, len, 7, 0x80, val, H3_HB_MAX, &vl) < 0)
+        rc = -1;
+      else
+        emit_field(st, (const uint8_t *)QPN[idx], (int)strlen(QPN[idx]), (const uint8_t *)val, vl);
     } else if (c & 0x20) { /* Literal w/ Literal Name */
       char nm[256];
       int nl = 0;
-      if (dec_str(b, &o, len, 3, 0x08, nm, sizeof nm, &nl) < 0)
-        return;
-      if (dec_str(b, &o, len, 7, 0x80, val, sizeof val, &vl) < 0)
-        return;
-      emit_field((const uint8_t *)nm, nl, (const uint8_t *)val, vl);
+      if (dec_str(b, &o, len, 3, 0x08, nm, sizeof nm, &nl) < 0 || dec_str(b, &o, len, 7, 0x80, val, H3_HB_MAX, &vl) < 0)
+        rc = -1;
+      else
+        emit_field(st, (const uint8_t *)nm, nl, (const uint8_t *)val, vl);
     } else {
-      return; /* post-base forms unsupported */
+      rc = -1; /* post-base forms unsupported */
     }
   }
+  free(val);
+  return rc;
 }
 
-/* ----------------------------------------------- stream-0 frame parser */
-
-static uint8_t h3_acc[16384];
-static uint32_t h3_acclen;
-static int h3_state; /* 0 = expect frame header, 1 = in payload */
-static uint64_t h3_ftype, h3_frem;
-static uint8_t h3_hb[16384]; /* HEADERS payload accumulator */
-static uint32_t h3_hblen;
-
-static void acc_consume(uint32_t k)
+/* A complete HEADERS frame of this stream has arrived. */
+static void headers_frame(struct h3stream *st)
 {
-  memmove(h3_acc, h3_acc + k, h3_acclen - k);
-  h3_acclen -= k;
+  if (st->headers_done) /* trailers: not kept */
+    return;
+  if (qpack_decode(st, st->hb, st->hblen) < 0) {
+    st->bad = 1;
+    return;
+  }
+  st->hbuf[st->hlen < st->hcap ? st->hlen : st->hcap - 1] = '\0';
+  if (st->status >= 100 && st->status < 200) { /* interim, e.g. 103 Early Hints: hand over, then start again */
+    if (st->opts && st->opts->on_headers && st->hbuf != st->scratch)
+      st->opts->on_headers(st->opts->ctx, st->hbuf, st->hlen);
+    st->hlen = 0;
+    st->status = 0;
+    return;
+  }
+  st->headers_done = 1;
+  if (st->opts && st->opts->on_headers && st->hbuf != st->scratch &&
+      st->opts->on_headers(st->opts->ctx, st->hbuf, st->hlen))
+    st->aborted = 1;
 }
 
-static void feed_stream0(const uint8_t *data, uint32_t n)
-{
-  if (h3_acclen + n > sizeof h3_acc)
-    n = sizeof h3_acc - h3_acclen;
-  memcpy(h3_acc + h3_acclen, data, n);
-  h3_acclen += n;
+/* ----------------------------------------------- response frame parser */
 
-  for (;;) {
-    if (h3_state == 0) { /* parse type + length varints */
-      if (h3_acclen < 1)
+static void acc_consume(struct h3stream *st, uint32_t k)
+{
+  memmove(st->acc, st->acc + k, st->acclen - k);
+  st->acclen -= k;
+}
+
+static void feed(struct h3stream *st, const uint8_t *data, uint32_t n)
+{
+  if (st->acclen + n > sizeof st->acc)
+    n = (uint32_t)sizeof st->acc - st->acclen;
+  memcpy(st->acc + st->acclen, data, n);
+  st->acclen += n;
+
+  while (!st->aborted && !st->bad) {
+    if (st->state == 0) { /* parse type + length varints */
+      if (st->acclen < 1)
         break;
-      int tl = 1 << (h3_acc[0] >> 6);
-      if ((uint32_t)tl > h3_acclen)
+      int tl = 1 << (st->acc[0] >> 6);
+      if ((uint32_t)tl >= st->acclen)
         break;
-      uint64_t ty = h3_acc[0] & 0x3f;
+      int ll = 1 << (st->acc[tl] >> 6);
+      if ((uint32_t)(tl + ll) > st->acclen)
+        break;
+      uint64_t ty = st->acc[0] & 0x3f;
       for (int i = 1; i < tl; i++)
-        ty = (ty << 8) | h3_acc[i];
-      if ((uint32_t)tl >= h3_acclen)
-        break;
-      int ll = 1 << (h3_acc[tl] >> 6);
-      if ((uint32_t)(tl + ll) > h3_acclen)
-        break;
-      uint64_t ln = h3_acc[tl] & 0x3f;
+        ty = (ty << 8) | st->acc[i];
+      uint64_t ln = st->acc[tl] & 0x3f;
       for (int i = 1; i < ll; i++)
-        ln = (ln << 8) | h3_acc[tl + i];
-      acc_consume(tl + ll);
-      h3_ftype = ty;
-      h3_frem = ln;
-      h3_state = 1;
-      if (ty == 0x01) {
-        h3_hblen = 0; /* HEADERS: start accumulating */
-        if (h3_status >= 100 && h3_status < 200) {
-          h3_status = 0; /* the final response replaces an interim one */
-          h3_lines_len = 0;
-        }
+        ln = (ln << 8) | st->acc[tl + i];
+      acc_consume(st, (uint32_t)(tl + ll));
+      st->ftype = ty;
+      st->frem = ln;
+      st->state = 1;
+      if (ty == 0x01)
+        st->hblen = 0; /* HEADERS: start accumulating */
+      if (ln == 0 && ty == 0x01) {
+        headers_frame(st);
+        st->state = 0;
+      } else if (ln == 0) {
+        st->state = 0;
       }
     } else {
-      if (h3_acclen == 0)
+      if (st->acclen == 0)
         break;
-      uint32_t take = h3_acclen;
-      if (take > h3_frem)
-        take = (uint32_t)h3_frem;
-      if (h3_ftype == 0x00) { /* DATA -> body sink */
-        if (h3_body && !h3_abort && take)
-          if (h3_body(h3_ctx, h3_acc, (int)take) != 0)
-            h3_abort = 1;
-      } else if (h3_ftype == 0x01) { /* HEADERS -> accumulate */
-        uint32_t room = sizeof h3_hb - h3_hblen;
+      uint32_t take = st->acclen;
+      if (take > st->frem)
+        take = (uint32_t)st->frem;
+      if (st->ftype == 0x00) { /* DATA -> body sink */
+        if (st->body && take && st->body(st->bctx, st->acc, (int)take) != 0)
+          st->aborted = 1;
+      } else if (st->ftype == 0x01) { /* HEADERS -> accumulate */
+        uint32_t room = H3_HB_MAX - st->hblen;
         uint32_t cp = take < room ? take : room;
-        memcpy(h3_hb + h3_hblen, h3_acc, cp);
-        h3_hblen += cp;
+        memcpy(st->hb + st->hblen, st->acc, cp);
+        st->hblen += cp;
+        if (cp < take)
+          st->bad = 1; /* a header block bigger than we keep */
       }
-      acc_consume(take);
-      h3_frem -= take;
-      if (h3_frem == 0) {
-        if (h3_ftype == 0x01)
-          qpack_decode(h3_hb, h3_hblen);
-        h3_state = 0;
+      acc_consume(st, take);
+      st->frem -= take;
+      if (st->frem == 0) {
+        if (st->ftype == 0x01 && !st->bad)
+          headers_frame(st);
+        st->state = 0;
       }
     }
   }
@@ -531,7 +581,7 @@ static void feed_stream0(const uint8_t *data, uint32_t n)
 /* ----------------------------------------------------- request encoding */
 
 /* QPACK-encode the request field section into b; returns its length. */
-static uint32_t build_request(uint8_t *b, const char *method, const char *path, const char *authority,
+static uint32_t build_request(uint8_t *b, uint32_t cap, const char *method, const char *path, const char *authority,
                               const char *extra)
 {
   uint32_t p = 0;
@@ -573,7 +623,7 @@ static uint32_t build_request(uint8_t *b, const char *method, const char *path, 
       int vl = (int)(eol - v);
       while (vl > 0 && (v[vl - 1] == '\r'))
         vl--;
-      if (nl > 0 && nl < 200) {
+      if (nl > 0 && nl < 200 && p + (uint32_t)nl + (uint32_t)vl + 16 < cap) {
         char lname[200];
         for (int i = 0; i < nl; i++)
           lname[i] = lower(s[i]);
@@ -606,118 +656,365 @@ static uint32_t put_qvar(uint8_t *p, uint64_t v)
   return 4;
 }
 
-/* ------------------------------------------------------------- public */
+/* ------------------------------------------------------------- sessions */
+
+static void stream_setup(struct h3stream *st, uint64_t sid, char *hbuf, int hcap)
+{
+  memset(st, 0, sizeof *st);
+  st->sid = sid;
+  st->hbuf = hbuf && hcap > 0 ? hbuf : st->scratch;
+  st->hcap = hbuf && hcap > 0 ? hcap : (int)sizeof st->scratch;
+  st->hb = malloc(H3_HB_MAX);
+  if (!st->hb)
+    st->bad = 1;
+}
+
+static int h3_send_all(quic *q, uint64_t sid, const uint8_t *p, uint32_t n, int fin)
+{
+  return quic_send(q, sid, p, n, fin) < 0 ? -1 : 0;
+}
+
+/* HEADERS (and a DATA frame for the body) of one request on stream `sid`. */
+static int send_request(struct h3 *H, uint64_t sid, const char *method, const char *authority, const char *path,
+                        const char *extra, const unsigned char *body, int blen)
+{
+  int extra_len = extra ? (int)strlen(extra) : 0;
+  char *xh = malloc((unsigned)extra_len + 48);
+  uint8_t *qbuf = malloc(8192);
+  uint8_t *frame = malloc(8192 + 16);
+  if (!xh || !qbuf || !frame) {
+    free(xh), free(qbuf), free(frame);
+    return -1;
+  }
+  int n = 0;
+  if (extra_len) {
+    memcpy(xh, extra, (unsigned)extra_len);
+    n = extra_len;
+  }
+  if (blen > 0) { /* the body's length rides in the header block */
+    memcpy(xh + n, "content-length: ", 16);
+    n += 16;
+    char num[12];
+    int k = 0;
+    for (unsigned v = (unsigned)blen; v; v /= 10)
+      num[k++] = (char)('0' + v % 10);
+    while (k)
+      xh[n++] = num[--k];
+    xh[n++] = '\r';
+    xh[n++] = '\n';
+  }
+  xh[n] = '\0';
+  uint32_t qlen = build_request(qbuf, 8192, method, path, authority, xh);
+  uint32_t fp = 0;
+  frame[fp++] = 0x01; /* HEADERS frame type */
+  fp += put_qvar(frame + fp, qlen);
+  memcpy(frame + fp, qbuf, qlen);
+  fp += qlen;
+  int rc = h3_send_all(H->q, sid, frame, fp, blen <= 0);
+  if (rc == 0 && blen > 0) {
+    uint8_t dh[5];
+    uint32_t dl = 0;
+    dh[dl++] = 0x00; /* DATA frame type */
+    dl += put_qvar(dh + dl, (uint64_t)blen);
+    rc = h3_send_all(H->q, sid, dh, dl, 0);
+    if (rc == 0)
+      rc = h3_send_all(H->q, sid, body, (uint32_t)blen, 1);
+  }
+  free(xh), free(qbuf), free(frame);
+  return rc;
+}
+
+/* Read what has arrived on every unfinished stream. */
+static void drain(struct h3 *H, struct h3stream **sts, int n)
+{
+  uint8_t *tmp = H->rx;
+  for (int i = 0; i < n; i++) {
+    struct h3stream *st = sts[i];
+    if (!st || st->done || st->aborted || st->bad)
+      continue;
+    int got, fin = 0;
+    while (!st->aborted && !st->bad && (got = quic_read(H->q, st->sid, tmp, H3_ACC, &fin)) > 0)
+      feed(st, tmp, (uint32_t)got);
+    if (!st->aborted && !st->bad && fin)
+      st->done = 1;
+  }
+}
+
+static int streams_open(struct h3stream **sts, int n)
+{
+  int open = 0;
+  for (int i = 0; i < n; i++)
+    if (sts[i] && !sts[i]->done && !sts[i]->aborted && !sts[i]->bad)
+      open++;
+  return open;
+}
+
+/* Drive the connection until every stream has ended or the server goes quiet. Returns 0, HTTP_EINTR or
+ * HTTP_ENORESP; `finished(ctx, i)` runs the moment stream i ends. */
+static int pump(struct h3 *H, struct h3stream **sts, int n, void (*finished)(void *ctx, int i), void *ctx)
+{
+  int idle = 0, was_done[H2_FETCH_MAX] = {0};
+  for (;;) {
+    drain(H, sts, n);
+    for (int i = 0; i < n && finished; i++)
+      if (sts[i] && sts[i]->done && !was_done[i]) {
+        was_done[i] = 1;
+        finished(ctx, i);
+      }
+    if (!streams_open(sts, n))
+      return 0;
+    int r = quic_poll(H->q);
+    if (r == QUIC_EINTR)
+      return HTTP_EINTR;
+    if (r == QUIC_ECLOSED) {
+      drain(H, sts, n); /* bytes that arrived with the close */
+      return HTTP_ENORESP;
+    }
+    if (r == 0 && ++idle > 5)
+      return HTTP_ENORESP;
+    if (r > 0)
+      idle = 0;
+  }
+}
+
+/* Open a connection: QUIC handshake, then the HTTP/3 control stream (empty SETTINGS) and the QPACK encoder and
+ * decoder streams (type byte only: we never use the dynamic table). */
+int h3_session_open(h3_session **out, const char *host, int port)
+{
+  struct h3 *H = calloc(1, sizeof *H);
+  if (!H)
+    return HTTP_ESEND;
+  int rc = quic_connect(&H->q, host, (uint16_t)port, "h3");
+  if (rc != QUIC_OK) {
+    free(H);
+    return rc == QUIC_EINTR ? HTTP_EINTR : rc == QUIC_ERESOLVE ? HTTP_ERESOLVE : HTTP_ECONNECT;
+  }
+  uint8_t ctrl[3] = {0x00, 0x04, 0x00};
+  uint8_t enc[1] = {0x02}, dec[1] = {0x03};
+  quic_send(H->q, 2, ctrl, 3, 0);
+  quic_send(H->q, 6, enc, 1, 0);
+  quic_send(H->q, 10, dec, 1, 0);
+  *out = H;
+  return 0;
+}
+
+void h3_session_close(h3_session *H)
+{
+  quic_close(H->q);
+  free(H);
+}
+
+int h3_session_used(const h3_session *H) { return H->served > 0; }
+
+int h3_session_run(h3_session *H, const char *authority, const char *method, const char *path,
+                   const char *extra_headers, const unsigned char *reqbody, int reqlen, const struct h3_opts *opts,
+                   char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx)
+{
+  if (!method)
+    method = "GET";
+  uint64_t sid;
+  if (H->broken || quic_open(H->q, &sid) < 0) {
+    H->broken = 1;
+    return HTTP_ESEND;
+  }
+  H->served++;
+  struct h3stream *st = malloc(sizeof *st);
+  if (!st) {
+    H->broken = 1;
+    return HTTP_ESEND;
+  }
+  stream_setup(st, sid, hdr, hdr ? hdrcap : 0);
+  st->body = body;
+  st->bctx = ctx;
+  st->opts = opts;
+  int rc;
+  if (st->bad || send_request(H, sid, method, authority, path, extra_headers, reqbody, reqlen) < 0)
+    rc = HTTP_ESEND;
+  else
+    rc = pump(H, &st, 1, 0, 0);
+  if (rc == 0 && st->aborted)
+    rc = HTTP_EABORT;
+  else if (rc == 0 && st->bad)
+    rc = HTTP_ENORESP;
+  else if (rc == 0 && !st->done)
+    rc = HTTP_ENORESP;
+  int status = st->headers_done ? st->status : 0;
+  if (!(rc == 0 && st->done) || st->bad)
+    H->broken = 1;
+  else
+    quic_stream_done(H->q, sid);
+  if (hdr && hdrcap > 0) {
+    if (st->hlen + 2 < hdrcap) { /* room for the blank line *and* the NUL */
+      hdr[st->hlen++] = '\r';
+      hdr[st->hlen++] = '\n';
+    }
+    hdr[st->hlen] = '\0';
+    if (hdrlen)
+      *hdrlen = st->hlen;
+  }
+  free(st->hb);
+  free(st);
+  /* A response that began is still a response when the connection drops after it. */
+  if ((rc == HTTP_ENORESP) && status > 0)
+    rc = status;
+  return rc == 0 ? status : rc;
+}
+
+/* Several GETs at once, one stream each, like h2_fetch_many. */
+struct h3mx {
+  struct h3stream *st[H2_FETCH_MAX];
+  unsigned char *body[H2_FETCH_MAX];
+  int blen[H2_FETCH_MAX], bcap[H2_FETCH_MAX], oversize[H2_FETCH_MAX];
+  struct h2_fetch *reqs;
+  void (*on_done)(void *ctx, int i, const unsigned char *body, int blen);
+  void *cb_ctx;
+};
+
+struct mxsink {
+  struct h3mx *m;
+  int i;
+};
+
+static int mx_body(void *ctx, const unsigned char *p, int n)
+{
+  struct mxsink *k = ctx;
+  struct h3mx *m = k->m;
+  int i = k->i;
+  if (m->blen[i] + n > m->bcap[i]) {
+    int nc = m->bcap[i] ? m->bcap[i] : 8192;
+    while (nc < m->blen[i] + n)
+      nc += nc / 2 + 1;
+    unsigned char *nb = nc > 16 * 1024 * 1024 ? 0 : realloc(m->body[i], (unsigned)nc);
+    if (!nb) {
+      m->oversize[i] = 1;
+      return 1;
+    }
+    m->body[i] = nb;
+    m->bcap[i] = nc;
+  }
+  memcpy(m->body[i] + m->blen[i], p, (unsigned)n);
+  m->blen[i] += n;
+  return 0;
+}
+
+static void mx_finished(void *ctx, int i)
+{
+  struct h3mx *m = ctx;
+  struct h3stream *st = m->st[i];
+  if (m->on_done && st->headers_done && st->status == 200 && m->body[i] && m->blen[i] > 0)
+    m->on_done(m->cb_ctx, i, m->body[i], m->blen[i]);
+}
+
+int h3_session_fetch_many(h3_session *H, const char *authority, const char *extra_headers, struct h2_fetch *reqs,
+                          int nreq, void (*on_done)(void *ctx, int i, const unsigned char *body, int blen),
+                          void *cb_ctx)
+{
+  if (nreq <= 0 || nreq > H2_FETCH_MAX)
+    return HTTP_ENORESP;
+  if (H->broken)
+    return HTTP_ESEND;
+  struct h3mx *m = calloc(1, sizeof *m);
+  struct mxsink sinks[H2_FETCH_MAX];
+  if (!m)
+    return HTTP_ESEND;
+  m->reqs = reqs;
+  m->on_done = on_done;
+  m->cb_ctx = cb_ctx;
+  H->served++;
+  int rc = 0, sent = 0;
+  for (int i = 0; i < nreq; i++) {
+    uint64_t sid;
+    reqs[i].status = 0;
+    reqs[i].body = 0;
+    reqs[i].blen = 0;
+    reqs[i].hdrlen = 0;
+    m->st[i] = malloc(sizeof **m->st);
+    if (!m->st[i] || quic_open(H->q, &sid) < 0) {
+      free(m->st[i]);
+      m->st[i] = 0;
+      continue; /* no stream for this one: the caller retries it elsewhere */
+    }
+    stream_setup(m->st[i], sid, reqs[i].hdr, reqs[i].hdr ? reqs[i].hdrcap : 0);
+    sinks[i].m = m;
+    sinks[i].i = i;
+    m->st[i]->body = mx_body;
+    m->st[i]->bctx = &sinks[i];
+    if (m->st[i]->bad || send_request(H, sid, "GET", authority, reqs[i].path, extra_headers, 0, 0) < 0) {
+      m->st[i]->bad = 1;
+      H->broken = 1;
+      rc = HTTP_ESEND;
+      break;
+    }
+    sent++;
+  }
+  if (sent && rc == 0)
+    rc = pump(H, m->st, nreq, mx_finished, m);
+  for (int i = 0; i < nreq; i++) {
+    struct h3stream *st = m->st[i];
+    int ok = st && st->done && !st->bad && !st->aborted;
+    if (st && !ok)
+      H->broken = 1;
+    if (st && ok)
+      quic_stream_done(H->q, st->sid);
+    reqs[i].status = st && st->headers_done ? st->status : 0;
+    if (st && reqs[i].hdr && reqs[i].hdrcap > 0) {
+      if (st->hlen + 2 < reqs[i].hdrcap) {
+        reqs[i].hdr[st->hlen++] = '\r';
+        reqs[i].hdr[st->hlen++] = '\n';
+      }
+      reqs[i].hdr[st->hlen] = '\0';
+      reqs[i].hdrlen = st->hlen;
+    }
+    if (on_done) {
+      free(m->body[i]);
+      reqs[i].body = 0;
+      reqs[i].blen = 0;
+    } else {
+      reqs[i].body = m->body[i];
+      reqs[i].blen = m->blen[i];
+    }
+    reqs[i].failed = !ok || m->oversize[i] || reqs[i].status != 200;
+    if (st) {
+      free(st->hb);
+      free(st);
+    }
+  }
+  free(m);
+  if (rc != 0)
+    H->broken = 1;
+  return rc;
+}
+
+/* A session is worth keeping only while the server still lets us open streams and will not time it out first. */
+int h3_session_reusable(const h3_session *H)
+{
+  unsigned idle = quic_idle_ms(H->q);
+  return !H->broken && quic_streams_left(H->q) > 1 && (idle == 0 || idle >= 20000);
+}
+
+static void h3_session_destroy(void *s) { h3_session_close(s); }
+static int h3_session_dead(void *s) { return ((h3_session *)s)->broken || quic_peer_closed(((h3_session *)s)->q); }
+
+h3_session *h3_session_acquire(const char *host, int port) { return nc_idle_take(host, port, 1, NC_IDLE_H3); }
+
+void h3_session_release(h3_session *s, const char *host, int port)
+{
+  if (h3_session_reusable(s))
+    nc_idle_put(host, port, 1, NC_IDLE_H3, s, h3_session_destroy, h3_session_dead);
+  else
+    h3_session_close(s);
+}
+
+/* ----------------------------------------------------------- one-shot */
 
 int h3_run(const char *host, int port, const char *authority, const char *method, const char *path,
            const char *extra_headers, char *hdr, int hdrcap, int *hdrlen, http_body_fn body, void *ctx)
 {
-  h3_status = 0;
-  h3_lines_len = 0;
-  h3_abort = 0;
-  h3_acclen = 0;
-  h3_state = 0;
-  h3_hblen = 0;
-  h3_body = body;
-  h3_ctx = ctx;
-  if (!method)
-    method = "GET";
-
-  int rc = quic_connect(host, (uint16_t)port, "h3");
-  if (rc != QUIC_OK)
-    return rc == QUIC_EINTR ? HTTP_EINTR : rc == QUIC_ERESOLVE ? HTTP_ERESOLVE : HTTP_ECONNECT;
-
-  /* Client control stream (2) + empty SETTINGS, then the QPACK encoder (6)
-   * and decoder (10) streams (type byte only — we never use the dynamic table).
-   */
-  uint8_t ctrl[3] = {0x00, 0x04, 0x00};
-  uint8_t enc[1] = {0x02}, dec[1] = {0x03};
-  quic_send(2, ctrl, 3, 0);
-  quic_send(6, enc, 1, 0);
-  quic_send(10, dec, 1, 0);
-
-  /* Request: HEADERS frame on stream 0, with FIN (no request body). */
-  static uint8_t qbuf[4096];
-  uint32_t qlen = build_request(qbuf, method, path, authority, extra_headers ? extra_headers : "");
-  static uint8_t reqf[4200];
-  uint32_t fp = 0;
-  reqf[fp++] = 0x01; /* HEADERS frame type */
-  fp += put_qvar(reqf + fp, qlen);
-  memcpy(reqf + fp, qbuf, qlen);
-  fp += qlen;
-  if (quic_send(0, reqf, fp, 1) < 0) {
-    quic_close();
-    return HTTP_ESEND;
-  }
-
-  int idle = 0, fin = 0, done = 0;
-  while (!done) {
-    int r = quic_poll();
-    if (r == QUIC_EINTR) {
-      quic_close();
-      return HTTP_EINTR;
-    }
-    if (r == QUIC_ECLOSED)
-      break;
-    if (r == 0) {
-      if (++idle > 5)
-        break;
-      continue;
-    }
-    idle = 0;
-    uint8_t tmp[4096];
-    int got;
-    while ((got = quic_read(0, tmp, sizeof tmp, &fin)) > 0) {
-      feed_stream0(tmp, (uint32_t)got);
-      if (h3_abort)
-        break;
-    }
-    if (h3_abort) {
-      quic_close();
-      return HTTP_EABORT;
-    }
-    if (fin)
-      done = 1;
-  }
-  quic_close();
-
-  if (hdr && hdrcap > 0) {
-    int n = 0;
-    const char *pre = "HTTP/3 ";
-    for (const char *q = pre; *q && n < hdrcap - 1; q++)
-      hdr[n++] = *q;
-    int s = h3_status;
-    char num[8];
-    int k = 0;
-    if (s <= 0)
-      s = 0;
-    if (s == 0)
-      num[k++] = '0';
-    else {
-      char t[8];
-      int j = 0;
-      while (s) {
-        t[j++] = (char)('0' + s % 10);
-        s /= 10;
-      }
-      while (j)
-        num[k++] = t[--j];
-    }
-    for (int i = 0; i < k && n < hdrcap - 1; i++)
-      hdr[n++] = num[i];
-    if (n < hdrcap - 1)
-      hdr[n++] = '\r';
-    if (n < hdrcap - 1)
-      hdr[n++] = '\n';
-    for (int i = 0; i < h3_lines_len && n < hdrcap - 1; i++)
-      hdr[n++] = h3_lines[i];
-    if (n < hdrcap - 1)
-      hdr[n++] = '\r';
-    if (n < hdrcap - 1)
-      hdr[n++] = '\n';
-    hdr[n] = '\0';
-    if (hdrlen)
-      *hdrlen = n;
-  }
-
-  return h3_status > 0 ? h3_status : HTTP_ENORESP;
+  h3_session *s;
+  int rc = h3_session_open(&s, host, port);
+  if (rc != 0)
+    return rc;
+  rc = h3_session_run(s, authority, method, path, extra_headers, 0, 0, 0, hdr, hdrcap, hdrlen, body, ctx);
+  h3_session_close(s);
+  return rc;
 }

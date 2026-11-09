@@ -7,6 +7,7 @@
 #include "features/cors/cors.h"               /* CORS request orchestration + CORP sub-resource guard  */
 #include "features/svg/svg.h"                 /* SVG -> ARGB rasterizer (favicon path) */
 #include "fetchint.h"
+#include "h3.h"
 #include "headers.h" /* HTTP response headers (iframe X-Frame-Options / CSP)  */
 #include "imgdec.h"  /* shared image decoder (SVG/WebP/GIF/PNG) for <img> */
 #include "mutex.h"
@@ -573,6 +574,113 @@ static int h2buf_cb(void *ctx, const unsigned char *p, int n)
   return 0;
 }
 
+/* Origins that advertised HTTP/3 via Alt-Svc. One that failed over QUIC is benched for a few minutes. */
+#define H3_HOSTS_MAX 32
+#define H3_BENCH_MS 300000
+static struct h3_host {
+  char host[URL_HOST_MAX];
+  bool benched;
+  unsigned until;
+} g_h3_hosts[H3_HOSTS_MAX];
+static int g_nh3_hosts;
+static mutex_t g_h3_lock = MUTEX_INIT;
+
+static struct h3_host *h3_find(const char *host)
+{
+  for (int i = 0; i < g_nh3_hosts; i++)
+    if (streq(g_h3_hosts[i].host, host))
+      return &g_h3_hosts[i];
+  return 0;
+}
+
+bool h3_known(const char *host)
+{
+  mutex_lock(&g_h3_lock);
+  struct h3_host *e = h3_find(host);
+  bool known = e && (!e->benched || (int)(msec() - e->until) >= 0);
+  mutex_unlock(&g_h3_lock);
+  return known;
+}
+
+void h3_remember(const char *host)
+{
+  mutex_lock(&g_h3_lock);
+  if (!h3_find(host) && g_nh3_hosts < H3_HOSTS_MAX) {
+    struct h3_host *e = &g_h3_hosts[g_nh3_hosts++];
+    int k = 0;
+    sapp(e->host, &k, sizeof e->host, host);
+    e->benched = false;
+  }
+  mutex_unlock(&g_h3_lock);
+}
+
+void h3_forget(const char *host)
+{
+  mutex_lock(&g_h3_lock);
+  struct h3_host *e = h3_find(host);
+  if (e) {
+    e->benched = true;
+    e->until = msec() + H3_BENCH_MS;
+  }
+  mutex_unlock(&g_h3_lock);
+}
+
+/* Remember an origin whose response carries Alt-Svc: h3. */
+static void note_alt_svc(const char *host, const char *hdr)
+{
+  struct http_headers H;
+  http_headers_parse(&H, hdr);
+  const char *as = http_headers_get(&H, "alt-svc");
+  for (const char *p = as; p && *p; p++)
+    if ((p[0] == 'h' || p[0] == 'H') && p[1] == '3' && (p[2] == '=' || p[2] == '-')) {
+      h3_remember(host);
+      break;
+    }
+  http_headers_free(&H);
+}
+
+/* The request headers an h2 or h3 sub-resource GET carries beyond the :-pseudo ones, lowercased: user-agent (h3 only,
+ * h2 takes it as an option), cookies, accept, client hints, content-type and the caller's extras. */
+static void req_hdrs(const struct purl *u, const char *accept, const struct http_req *rq, bool with_ua, char *xh,
+                     int cap)
+{
+  int xn = 0;
+  if (with_ua) {
+    sapp(xh, &xn, cap, "user-agent: ");
+    sapp(xh, &xn, cap, browser_ua());
+    sapp(xh, &xn, cap, "\r\n");
+  }
+  char ck[1024];
+  if (!rq->no_cookies && cookie_header(u->host, ck, sizeof ck) > 0) {
+    sapp(xh, &xn, cap, "cookie: ");
+    sapp(xh, &xn, cap, ck);
+    sapp(xh, &xn, cap, "\r\n");
+  }
+  sapp(xh, &xn, cap, "accept: ");
+  sapp(xh, &xn, cap, accept);
+  sapp(xh, &xn, cap, "\r\n");
+  char ch[512];
+  if (ch_headers_for(u, true, ch, sizeof ch) > 0)
+    sapp(xh, &xn, cap, ch);
+  if (rq->ctype && rq->ctype[0]) {
+    sapp(xh, &xn, cap, "content-type: ");
+    sapp(xh, &xn, cap, rq->ctype);
+    sapp(xh, &xn, cap, "\r\n");
+  }
+  if (rq->extra_hdrs && rq->extra_hdrs[0])
+    h2_append_headers(xh, &xn, cap, rq->extra_hdrs);
+}
+
+static void authority_of(const struct purl *u, char *auth, int cap)
+{
+  int an = 0;
+  sapp(auth, &an, cap, u->host);
+  if (u->port != 443) {
+    sapp(auth, &an, cap, ":");
+    uapp(auth, &an, cap, (unsigned)u->port);
+  }
+}
+
 /* An h2 session to u: an idle one, else a new connection when ALPN selects h2. Otherwise NULL, with the HTTP/1.1
  * connection in *plain (NULL if the connection failed). `fresh` skips the idle pool. */
 h2_session *h2_open(const struct purl *u, bool fresh, netconn **plain)
@@ -592,48 +700,76 @@ h2_session *h2_open(const struct purl *u, bool fresh, netconn **plain)
   return 0;
 }
 
-/* One request and response on an idle or new connection (h2 session or HTTP/1.1); the body, or NULL on failure.
- * *stale is set when a reused connection failed before any response, so retrying on a new one is safe. */
+/* The HTTP/3 half of http_exchange. *fallback is set when h3 can't carry the request (QUIC unreachable, or a body the
+ * server won't take), so the caller goes on over h2 or HTTP/1.1; *stale as in http_exchange. */
+static unsigned char *h3_exchange(const struct purl *u, const char *method, const char *accept,
+                                  const struct http_req *rq, struct resp_meta *meta, char *rawhdr, int *blen,
+                                  bool fresh, bool *stale, bool *fallback)
+{
+  *fallback = false;
+  h3_session *s = fresh ? 0 : h3_session_acquire(u->host, u->port);
+  bool reused = s != 0;
+  if (!s && h3_session_open(&s, u->host, u->port) != 0) {
+    h3_forget(u->host);
+    *fallback = true;
+    return 0;
+  }
+  char auth[URL_HOST_MAX + 8], xh[1536];
+  authority_of(u, auth, sizeof auth);
+  xh[0] = '\0';
+  req_hdrs(u, accept, rq, true, xh, sizeof xh);
+  struct h2buf hb = {malloc(65536), 65536, 0};
+  if (!hb.body) {
+    h3_session_release(s, u->host, u->port);
+    return 0;
+  }
+  int hlen = 0;
+  int rc = h3_session_run(s, auth, method, u->path, xh, rq->body, rq->body_len, 0, rawhdr, RESP_HDR_MAX, &hlen,
+                          h2buf_cb, &hb);
+  h3_session_release(s, u->host, u->port);
+  if (rc < 0) {
+    free(hb.body);
+    bool has_body = rq->body && rq->body_len > 0;
+    *stale = reused && !has_body && (rc == HTTP_ESEND || rc == HTTP_ENORESP);
+    if (!*stale) {
+      if (!reused)
+        h3_forget(u->host);
+      *fallback = !has_body || rc == HTTP_ESEND;
+    }
+    return 0;
+  }
+  bool chunked;
+  long clen;
+  parse_resp_headers(rawhdr, meta, &chunked, &clen);
+  *blen = hb.blen;
+  return hb.body;
+}
+
+/* One request and response on an idle or new connection (h3 or h2 session, or HTTP/1.1); the body, or NULL on
+ * failure. *stale is set when a reused connection failed before any response, so retrying on a new one is safe. */
 static unsigned char *http_exchange(const struct purl *u, const char *method, const char *accept,
                                     const struct http_req *rq, struct resp_meta *meta, char *rawhdr, int *blen,
                                     bool fresh, bool *stale)
 {
   *stale = false;
   *blen = 0;
+  if (u->tls && h3_known(u->host)) {
+    bool fallback;
+    unsigned char *b = h3_exchange(u, method, accept, rq, meta, rawhdr, blen, fresh, stale, &fallback);
+    if (b)
+      note_alt_svc(u->host, rawhdr);
+    if (b || !fallback)
+      return b;
+    *stale = false;
+  }
   netconn *conn;
   h2_session *hs = h2_open(u, fresh, &conn);
   if (hs) {
     /* HTTP/2: :authority + lowercased headers; no accept-encoding, so the body is plain. */
-    char auth[URL_HOST_MAX + 8];
-    int an = 0;
-    sapp(auth, &an, sizeof auth, u->host);
-    if (u->port != 443) {
-      sapp(auth, &an, sizeof auth, ":");
-      uapp(auth, &an, sizeof auth, (unsigned)u->port);
-    }
-    char xh[1408];
-    int xn = 0;
-    char ck[1024];
-    if (!rq->no_cookies && cookie_header(u->host, ck, sizeof ck) > 0) {
-      sapp(xh, &xn, sizeof xh, "cookie: ");
-      sapp(xh, &xn, sizeof xh, ck);
-      sapp(xh, &xn, sizeof xh, "\r\n");
-    }
-    sapp(xh, &xn, sizeof xh, "accept: ");
-    sapp(xh, &xn, sizeof xh, accept);
-    sapp(xh, &xn, sizeof xh, "\r\n");
-    {
-      char ch[512];
-      if (ch_headers_for(u, true, ch, sizeof ch) > 0)
-        sapp(xh, &xn, sizeof xh, ch);
-    }
-    if (rq->ctype && rq->ctype[0]) {
-      sapp(xh, &xn, sizeof xh, "content-type: ");
-      sapp(xh, &xn, sizeof xh, rq->ctype);
-      sapp(xh, &xn, sizeof xh, "\r\n");
-    }
-    if (rq->extra_hdrs && rq->extra_hdrs[0])
-      h2_append_headers(xh, &xn, sizeof xh, rq->extra_hdrs);
+    char auth[URL_HOST_MAX + 8], xh[1408];
+    authority_of(u, auth, sizeof auth);
+    xh[0] = '\0';
+    req_hdrs(u, accept, rq, false, xh, sizeof xh);
     struct h2_opts opts = {browser_ua(), xh, 0};
     struct h2buf hb;
     hb.cap = 65536;
@@ -656,6 +792,7 @@ static unsigned char *http_exchange(const struct purl *u, const char *method, co
     bool dchunk;
     long dclen;
     parse_resp_headers(rawhdr, meta, &dchunk, &dclen);
+    note_alt_svc(u->host, rawhdr);
     *blen = hb.blen;
     return hb.body;
   }
@@ -680,6 +817,8 @@ static unsigned char *http_exchange(const struct purl *u, const char *method, co
   else
     nc_close(conn);
   *stale = !body && pooled;
+  if (body)
+    note_alt_svc(u->host, rawhdr);
   return body;
 }
 
@@ -1652,6 +1791,79 @@ void fetch_iframes(void)
   free(res);
 }
 
+/* Over h3: the batch on one QUIC connection. False if QUIC could not carry it, leaving the requests untouched. */
+static bool h3_many(const struct purl *u, const char *accept, struct h2_fetch *reqs, int n,
+                    void (*on_done)(void *ctx, int i, const unsigned char *body, int blen), void *cb_ctx)
+{
+  char auth[URL_HOST_MAX + 8], xh[1280];
+  struct http_req none = {0};
+  authority_of(u, auth, sizeof auth);
+  xh[0] = '\0';
+  req_hdrs(u, accept, &none, true, xh, sizeof xh);
+  for (int attempt = 0;; attempt++) {
+    h3_session *s = attempt ? 0 : h3_session_acquire(u->host, u->port);
+    bool reused = s != 0;
+    if (!s && h3_session_open(&s, u->host, u->port) != 0) {
+      h3_forget(u->host);
+      return false;
+    }
+    int rc = h3_session_fetch_many(s, auth, xh, reqs, n, on_done, cb_ctx);
+    h3_session_release(s, u->host, u->port);
+    bool answered = false;
+    for (int g = 0; g < n; g++)
+      answered |= reqs[g].status > 0;
+    if (rc >= 0 || answered)
+      return true;
+    for (int g = 0; g < n; g++) {
+      free(reqs[g].body);
+      reqs[g].body = 0;
+      reqs[g].blen = reqs[g].hdrlen = reqs[g].failed = 0;
+    }
+    if (!reused || attempt) {
+      h3_forget(u->host);
+      return false;
+    }
+  }
+}
+
+/* GET reqs[0..n) of one HTTPS origin, multiplexed on one connection: over h3 when the origin advertised it, else h2.
+ * If neither carries them (HTTP/1.1 only, unreachable) the requests stay untouched, and *plain holds the HTTP/1.1
+ * connection opened on the way, for the caller to park. */
+static void origin_fetch_many(const struct purl *u, const char *accept, struct h2_fetch *reqs, int n,
+                              void (*on_done)(void *ctx, int i, const unsigned char *body, int blen), void *cb_ctx,
+                              netconn **plain)
+{
+  *plain = 0;
+  if (h3_known(u->host) && h3_many(u, accept, reqs, n, on_done, cb_ctx))
+    return;
+  h2_session *hs = h2_open(u, false, plain);
+  if (!hs)
+    return;
+  char auth[URL_HOST_MAX + 8], xh[1280];
+  struct http_req none = {0};
+  authority_of(u, auth, sizeof auth);
+  xh[0] = '\0';
+  req_hdrs(u, accept, &none, false, xh, sizeof xh);
+  struct h2_opts o = {browser_ua(), xh, 0};
+  for (int attempt = 0; hs; attempt++) {
+    bool reused = h2_session_used(hs), answered = false;
+    int rc = h2_session_fetch_many(hs, 1, auth, &o, reqs, n, on_done, cb_ctx);
+    h2_session_release(hs, u->host, u->port);
+    hs = 0;
+    for (int g = 0; g < n; g++)
+      answered |= reqs[g].status > 0;
+    if (rc >= 0 || !reused || answered || attempt)
+      break;
+    /* An idle session the peer had closed: redo the batch on a new connection. */
+    for (int g = 0; g < n; g++) {
+      free(reqs[g].body);
+      reqs[g].body = 0;
+      reqs[g].blen = reqs[g].hdrlen = reqs[g].failed = 0;
+    }
+    hs = h2_open(u, true, plain);
+  }
+}
+
 /* Shared state for a parallel subres batch: URLs, outputs, claim bitmap and its lock. */
 struct subres_batch {
   char *const *urls;
@@ -1734,50 +1946,7 @@ static void subres_job(void *vctx, int i)
   }
 
   netconn *plain;
-  h2_session *hs = h2_open(&u, false, &plain);
-  if (hs) {
-    char auth[URL_HOST_MAX + 8];
-    int an = 0;
-    sapp(auth, &an, sizeof auth, u.host);
-    if (u.port != 443) {
-      sapp(auth, &an, sizeof auth, ":");
-      uapp(auth, &an, sizeof auth, (unsigned)u.port);
-    }
-    char xh[1280];
-    int xn = 0;
-    char ck[1024];
-    if (cookie_header(u.host, ck, sizeof ck) > 0) {
-      sapp(xh, &xn, sizeof xh, "cookie: ");
-      sapp(xh, &xn, sizeof xh, ck);
-      sapp(xh, &xn, sizeof xh, "\r\n");
-    }
-    sapp(xh, &xn, sizeof xh, "accept: ");
-    sapp(xh, &xn, sizeof xh, c->accept);
-    sapp(xh, &xn, sizeof xh, "\r\n");
-    {
-      char ch[512];
-      if (ch_headers_for(&u, true, ch, sizeof ch) > 0)
-        sapp(xh, &xn, sizeof xh, ch);
-    }
-    struct h2_opts o = {browser_ua(), xh, 0};
-    for (int attempt = 0; hs; attempt++) {
-      bool reused = h2_session_used(hs), answered = false;
-      int rc = h2_session_fetch_many(hs, 1, auth, &o, reqs, ng, 0, 0); /* accumulate */
-      h2_session_release(hs, u.host, u.port);
-      hs = 0;
-      for (int g = 0; g < ng; g++)
-        answered |= reqs[g].status > 0;
-      if (rc >= 0 || !reused || answered || attempt)
-        break;
-      /* An idle session the peer had closed: redo the batch on a new connection. */
-      for (int g = 0; g < ng; g++) {
-        free(reqs[g].body);
-        reqs[g].body = 0;
-        reqs[g].blen = reqs[g].hdrlen = reqs[g].failed = 0;
-      }
-      hs = h2_open(&u, true, &plain);
-    }
-  }
+  origin_fetch_many(&u, c->accept, reqs, ng, 0, 0, &plain);
   if (plain)
     nc_release(plain, u.host, u.port, 1); /* HTTP/1.1 only: park it for the fetches below */
   for (int g = 0; g < ng; g++) {
@@ -2135,53 +2304,10 @@ static void h2_prefetch(const char *page_url)
     return;
   }
 
-  netconn *plain;
-  h2_session *hs = h2_open(&pu, false, &plain);
-  if (!hs) { /* HTTP/1.1 only, or unreachable: the h1.1 pool fetches these */
-    if (plain)
-      nc_release(plain, pu.host, pu.port, 1);
-    free(paths);
-    free(hdrs);
-    return;
-  }
-
-  char auth[URL_HOST_MAX + 8];
-  int an = 0;
-  sapp(auth, &an, sizeof auth, pu.host);
-  if (pu.port != 443) {
-    sapp(auth, &an, sizeof auth, ":");
-    uapp(auth, &an, sizeof auth, (unsigned)pu.port);
-  }
-
-  char xh[1280];
-  int xn = 0;
-  char ck[1024];
-  if (cookie_header(pu.host, ck, sizeof ck) > 0) {
-    sapp(xh, &xn, sizeof xh, "cookie: ");
-    sapp(xh, &xn, sizeof xh, ck);
-    sapp(xh, &xn, sizeof xh, "\r\n");
-  }
-  sapp(xh, &xn, sizeof xh, "accept: " IMG_ACCEPT "\r\n");
-  {
-    char ch[512];
-    if (ch_headers_for(&pu, true, ch, sizeof ch) > 0)
-      sapp(xh, &xn, sizeof xh, ch);
-  }
-  struct h2_opts opts = {browser_ua(), xh, 0};
-
   /* Commit each image as its stream finishes; a failed stream leaves ok=0 for the h1.1 pool. */
   struct h2img_ctx hc = {idxs, reqs, now};
-  for (int attempt = 0; hs; attempt++) {
-    bool reused = h2_session_used(hs), answered = false;
-    int rc = h2_session_fetch_many(hs, 1, auth, &opts, reqs, nb, h2img_commit, &hc);
-    h2_session_release(hs, pu.host, pu.port);
-    hs = 0;
-    for (int g = 0; g < nb; g++)
-      answered |= reqs[g].status > 0;
-    if (rc >= 0 || !reused || answered || attempt)
-      break;
-    hs = h2_open(&pu, true, &plain); /* the idle session had been closed by the peer */
-  }
+  netconn *plain;
+  origin_fetch_many(&pu, IMG_ACCEPT, reqs, nb, h2img_commit, &hc, &plain);
   if (plain)
     nc_release(plain, pu.host, pu.port, 1);
   free(paths);

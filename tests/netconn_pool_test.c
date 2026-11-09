@@ -208,6 +208,20 @@ static void generic_entries_are_taken_by_kind_and_destroyed_on_expiry(void)
   expect_eq(g_destroyed, 1);
 }
 
+static void h3_entries_expire_after_15_seconds(void)
+{
+  reset();
+  g_destroyed = 0;
+  int obj;
+  nc_idle_put("example.com", 443, 1, NC_IDLE_H3, &obj, destroy_obj, 0);
+  g_now += 14000;
+  expect(nc_idle_take("example.com", 443, 1, NC_IDLE_H3) == &obj);
+  nc_idle_put("example.com", 443, 1, NC_IDLE_H3, &obj, destroy_obj, 0);
+  g_now += 16000;
+  expect(nc_idle_take("example.com", 443, 1, NC_IDLE_H3) == 0);
+  expect_eq(g_destroyed, 1);
+}
+
 static void idle_entry_with_a_hung_up_peer_is_destroyed(void)
 {
   reset();
@@ -253,6 +267,7 @@ int main(void)
   test("generic_entries_are_taken_by_kind_and_destroyed_on_expiry",
        generic_entries_are_taken_by_kind_and_destroyed_on_expiry);
   test("tls_connection_closed_by_the_peer_is_discarded", tls_connection_closed_by_the_peer_is_discarded);
+  test("h3_entries_expire_after_15_seconds", h3_entries_expire_after_15_seconds);
   test("idle_entry_with_a_hung_up_peer_is_destroyed", idle_entry_with_a_hung_up_peer_is_destroyed);
   test("a_full_pool_drops_the_oldest", a_full_pool_drops_the_oldest);
   return 0;

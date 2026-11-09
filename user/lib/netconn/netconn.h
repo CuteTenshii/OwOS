@@ -44,7 +44,7 @@ int nc_peer_closed(netconn *c, int allow_data);
 /* Generic idle entries for state wrapped around a connection (the h2 session): destroy(obj) frees it when it
  * expires or is evicted, closed(obj) (optional) says the peer has hung up. nc_idle_take hands out one live entry
  * of that kind, or NULL. */
-enum { NC_IDLE_FRESH = 1, NC_IDLE_H1 = 2, NC_IDLE_H2 = 3 };
+enum { NC_IDLE_FRESH = 1, NC_IDLE_H1 = 2, NC_IDLE_H2 = 3, NC_IDLE_H3 = 4 };
 void nc_idle_put(const char *host, int port, int tls, int kind, void *obj, void (*destroy)(void *),
                  int (*closed)(void *));
 void *nc_idle_take(const char *host, int port, int tls, int kind);

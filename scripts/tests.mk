@@ -49,9 +49,10 @@ EXTRA_tz          := -DTZ_CONFIG_PATH='"$(RUN)/timezone"'
 EXTRA_vary        := -DCACHE_DIR='"$(RUN)/vary-cache"'
 EXTRA_btrfs       := $(HOST_DEFS)
 EXTRA_tls_idle    := -Iuser/lib/tls -Iuser/lib/pki
+EXTRA_resolve     := -Iuser/lib/mdns
 
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
-IMPLS := $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
+IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams
 BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/clienthints.o \
@@ -86,6 +87,11 @@ $(B)/impl/netconn.o: $(LIB)/netconn/netconn.c
 	  -Dnet_recv=ncp_recv -Dnet_send=ncp_send -Dtls_client=ncp_tls_client -Dtls_last_error=ncp_tls_last_error \
 	  -Dtls_read=ncp_tls_read -Dtls_write=ncp_tls_write -Dtls_alpn=ncp_tls_alpn \
 	  -Dtls_verify_message=ncp_tls_verify_message -Dtls_close=ncp_tls_close -Dtls_peer_closed=ncp_tls_peer_closed)
+$(B)/impl/h3.o: $(LIB)/curl/h3.c
+	$(call COMPILE,-Dquic_connect=h3t_connect -Dquic_open=h3t_open -Dquic_send=h3t_send -Dquic_read=h3t_read \
+	  -Dquic_stream_done=h3t_done -Dquic_poll=h3t_poll -Dquic_peer_closed=h3t_peer_closed \
+	  -Dquic_streams_left=h3t_left -Dquic_idle_ms=h3t_idle -Dquic_close=h3t_close \
+	  -Dnc_idle_put=h3t_idle_put -Dnc_idle_take=h3t_idle_take)
 $(B)/impl/h2.o: $(LIB)/curl/h2.c
 	$(call COMPILE,-Dnc_read=h2t_read -Dnc_write=h2t_write -Dnc_close=h2t_close -Dnc_peer_closed=h2t_peer_closed -Dnc_idle_put=h2t_idle_put -Dnc_idle_take=h2t_idle_take)
 $(B)/impl/permissions.o: $(BROWSER)/features/permissions/permissions.c

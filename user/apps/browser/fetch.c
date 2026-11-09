@@ -56,28 +56,6 @@ enum { ENC_NONE = 0, ENC_ZLIB = 1, ENC_BR = 2 };
 /* Ceiling on a decompressed body (decompression-bomb guard); RAW_MAX bounds the compressed body. */
 #define DECOMP_MAX (RAW_MAX * 2) /* 64 MiB */
 
-/* Origins that advertised HTTP/3 via Alt-Svc; tried over h3 first. */
-#define H3_HOSTS_MAX 32
-static char h3_hosts[H3_HOSTS_MAX][URL_HOST_MAX];
-static int h3_nhosts;
-static bool h3_known(const char *host)
-{
-  for (int i = 0; i < h3_nhosts; i++)
-    if (streq(h3_hosts[i], host))
-      return true;
-  return false;
-}
-static void h3_remember(const char *host)
-{
-  if (h3_known(host) || h3_nhosts >= H3_HOSTS_MAX)
-    return;
-  int j = 0;
-  for (; host[j] && j < URL_HOST_MAX - 1; j++)
-    h3_hosts[h3_nhosts][j] = host[j];
-  h3_hosts[h3_nhosts][j] = '\0';
-  h3_nhosts++;
-}
-
 /* Decompress an in-memory body per ENC_BR / ENC_ZLIB; returns a malloc'd buffer (caller frees) or NULL. */
 struct memrd {
   const unsigned char *p;
@@ -941,27 +919,25 @@ static int h2_txn(h2_session *hs, const struct purl *u, const char *full_url, ch
 
 /* ---- HTTP/3 transaction (QUIC; used for Alt-Svc-advertised origins) ---- */
 
-/* Body sink: append to B->pg->raw. */
-static int h3_body_cb(void *ctx, const unsigned char *p, int n)
+/* Run the request over HTTP/3 on an idle or new QUIC connection. Returns the status; 0 when HTTP/3 can't be used and
+ * the caller should fall back; -5 when a request with a body went out and no response came back. *stale is set when
+ * a reused connection failed before any response, so retrying on a new one is safe. */
+static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl, const char *method,
+                  const unsigned char *body, int blen, const char *bctype, bool fresh, bool *stale)
 {
-  (void)ctx;
-  if (B->abort_load)
-    return 1; /* Stop: tell h3_run to bail */
-  if (!browser_ensure_raw(B->pg->raw_len + n))
-    return 1;
-  for (int i = 0; i < n; i++)
-    B->pg->raw[B->pg->raw_len++] = (char)p[i];
-  return 0;
-}
-
-/* Run the request over HTTP/3; returns the status or a negative HTTP_E* (caller falls back). */
-static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl)
-{
+  *stale = false;
   loc[0] = '\0';
   B->pg->ctype[0] = '\0';
   B->dl_name[0] = '\0';
   B->cdisp_attach = 0;
   B->pg->raw_len = 0;
+
+  h3_session *s = fresh ? 0 : h3_session_acquire(u->host, u->port);
+  bool reused = s != 0;
+  if (!s && h3_session_open(&s, u->host, u->port) != 0) {
+    h3_forget(u->host);
+    return 0;
+  }
 
   char auth[URL_HOST_MAX + 8];
   int an = 0;
@@ -977,21 +953,34 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc
   sapp(xh, &xn, sizeof xh, browser_ua());
   sapp(xh, &xn, sizeof xh, "\r\n");
   doc_req_hdrs(xh, &xn, sizeof xh, u);
+  if (body && blen > 0) {
+    sapp(xh, &xn, sizeof xh, "content-type: ");
+    sapp(xh, &xn, sizeof xh, bctype ? bctype : "application/x-www-form-urlencoded");
+    sapp(xh, &xn, sizeof xh, "\r\n");
+  }
   if (g_doc_cond[0])
     sapp(xh, &xn, sizeof xh, g_doc_cond); /* revalidation */
 
+  struct h2tx h = {full_url, u->host, loc, loc_cap, 0, 0};
+  struct h3_opts opts = {h2_headers_cb, &h};
   char hdrbuf[RESP_HDR_MAX];
   int hlen = 0;
-  int st = h3_run(u->host, u->port, auth, "GET", u->path, xh, hdrbuf, sizeof hdrbuf, &hlen, h3_body_cb, 0);
-  if (st <= 0)
-    return st; /* QUIC failed -> caller falls back */
+  int rc =
+      h3_session_run(s, auth, method, u->path, xh, body, blen, &opts, hdrbuf, sizeof hdrbuf, &hlen, h2_body_cb, &h);
+  h3_session_release(s, u->host, u->port);
 
-  bool chunked, have_len;
-  int enc;
-  unsigned clen;
-  int status = parse_response(hdrbuf, u->host, full_url, loc, loc_cap, &chunked, &have_len, &clen, &enc);
-  raw_decode(enc);
-  return route_body(full_url, status, allow_dl);
+  if (h.status == 0) { /* no response */
+    bool has_body = body && blen > 0;
+    *stale = reused && !has_body && (rc == HTTP_ESEND || rc == HTTP_ENORESP);
+    if (*stale)
+      return 0;
+    if (!reused)
+      h3_forget(u->host);
+    return has_body && rc != HTTP_ESEND ? -5 : 0;
+  }
+  early_apply(full_url); /* merge any 103 Early-Hints stylesheets into ext_css */
+  raw_decode(h.enc);
+  return route_body(full_url, h.status, allow_dl);
 }
 
 #define DOC_VARY_HDRS_MAX 2560
@@ -1220,11 +1209,16 @@ static int http_txn(const struct purl *u, const char *full_url, char *loc, int l
     revalidating = (cv == CACHE_REVALIDATE);
   }
 
-  /* If this origin advertised HTTP/3, try QUIC first (GET only), else fall through to TLS h2/h1.1. */
-  if (is_get && u->tls && u->port == 443 && h3_known(u->host)) {
-    int st = h3_txn(u, full_url, loc, loc_cap, allow_dl);
+  /* If this origin advertised HTTP/3, try QUIC first, else fall through to TLS h2/h1.1. */
+  if (u->tls && u->port == 443 && h3_known(u->host)) {
+    bool h3_stale;
+    int st = h3_txn(u, full_url, loc, loc_cap, allow_dl, method, body, blen, bctype, false, &h3_stale);
+    if (h3_stale)
+      st = h3_txn(u, full_url, loc, loc_cap, allow_dl, method, body, blen, bctype, true, &h3_stale);
     if (st > 0)
       return doc_cache_finish(u, full_url, now, revalidating, st);
+    if (st < 0)
+      return st;
     loc[0] = '\0';
     B->pg->ctype[0] = '\0';
     B->dl_name[0] = '\0';

@@ -84,8 +84,8 @@ struct space {
   uint32_t crd;   /* TLS-message read cursor              */
 };
 
-#define QS_MAX 8
-#define QS_BUF 8192
+#define QS_MAX 24
+#define QS_BUF 4096
 struct qstream {
   int used;
   uint64_t id;
@@ -97,30 +97,45 @@ struct qstream {
   uint32_t r_pos, r_len;
 };
 
-static int sock;
-static int closed;
-static struct space sp[3];
-static struct qstream qs[QS_MAX];
+/* One connection: everything the packet, TLS and stream layers share. Heap-allocated, so any number of
+ * connections can run at once; the packet scratch buffers live here too (they are too big for a small stack). */
+struct quic {
+  int sock;
+  int closed;
+  struct space sp[3];
+  struct qstream qs[QS_MAX];
 
-static uint8_t scid[8];
-static int scid_len; /* our source CID      */
-static uint8_t dcid[20];
-static int dcid_len; /* peer (server) CID   */
-static int server_cid_set;
-static uint8_t retry_token[256];
-static int retry_token_len;
-static int did_retry;
+  uint8_t scid[8];
+  int scid_len; /* our source CID      */
+  uint8_t dcid[20];
+  int dcid_len; /* peer (server) CID   */
+  int server_cid_set;
+  uint8_t retry_token[256];
+  int retry_token_len;
+  int did_retry;
 
-/* TLS 1.3 handshake state (one connection, like kernel tls.c). */
-static struct sha256 transcript;
-static uint8_t our_priv[32], our_pub[32];
-static uint8_t c_hs[32], s_hs[32], master[32];
-static int got_sh, app_done, hs_sent_fin, hs_confirmed;
-static uint8_t pending_fin[40];
-static int pending_fin_len;
+  struct sha256 transcript;
+  uint8_t our_priv[32], our_pub[32];
+  uint8_t c_hs[32], s_hs[32], master[32];
+  int got_sh, app_done, hs_sent_fin, hs_confirmed;
+  uint8_t pending_fin[40];
+  int pending_fin_len;
 
-static uint8_t chello[1024];
-static uint32_t chello_len; /* kept for retransmit */
+  uint8_t chello[1024];
+  uint32_t chello_len; /* kept for retransmit */
+
+  /* Flow control and limits. rx_* is what we grant the server; peer_* what it grants us (server transport
+   * parameters, raised by MAX_DATA / MAX_STREAMS frames). */
+  uint64_t rx_total, rx_limit;
+  uint64_t tx_total, peer_max_data;
+  uint64_t peer_stream_data;
+  uint64_t peer_max_bidi;
+  uint64_t peer_idle_ms;
+  uint64_t next_bidi; /* index of the next client bidi stream to open */
+
+  uint8_t tx_out[2048], tx_pt[1600], tx_cf[1200], tx_sf[1200];
+  uint8_t rx_dg[2048], rx_pt[2048];
+};
 
 static const uint8_t x25519_base[32] = {9};
 
@@ -154,9 +169,9 @@ static void derive_secret(const uint8_t secret[32], const char *label, const uin
 }
 
 /* Install one space's packet-protection keys from its client/server secrets. */
-static void install_space(int space, const uint8_t cli[32], const uint8_t srv[32])
+static void install_space(struct quic *Q, int space, const uint8_t cli[32], const uint8_t srv[32])
 {
-  struct space *s = &sp[space];
+  struct space *s = &Q->sp[space];
   expand_label(cli, "quic key", 0, 0, s->ck, 16);
   expand_label(cli, "quic iv", 0, 0, s->ci, 12);
   expand_label(cli, "quic hp", 0, 0, s->ch, 16);
@@ -169,7 +184,7 @@ static void install_space(int space, const uint8_t cli[32], const uint8_t srv[32
 /* Initial secrets (RFC 9001 §5.2): HKDF-Extract(v1 salt, DCID) then "client in"
  * / "server in" expand. Reset the Initial space's counters too (used on Retry).
  */
-static void derive_initial_keys(const uint8_t *cid, int cidlen)
+static void derive_initial_keys(struct quic *Q, const uint8_t *cid, int cidlen)
 {
   static const uint8_t salt[20] = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
                                    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a};
@@ -177,17 +192,17 @@ static void derive_initial_keys(const uint8_t *cid, int cidlen)
   hkdf_extract(salt, 20, cid, (uint32_t)cidlen, isecret);
   expand_label(isecret, "client in", 0, 0, cs, 32);
   expand_label(isecret, "server in", 0, 0, ss, 32);
-  sp[S_INIT].spn = 0;
-  sp[S_INIT].lrec = 0;
-  sp[S_INIT].hrec = 0;
-  sp[S_INIT].ackp = 0;
-  sp[S_INIT].chave = sp[S_INIT].crd = 0;
-  install_space(S_INIT, cs, ss);
+  Q->sp[S_INIT].spn = 0;
+  Q->sp[S_INIT].lrec = 0;
+  Q->sp[S_INIT].hrec = 0;
+  Q->sp[S_INIT].ackp = 0;
+  Q->sp[S_INIT].chave = Q->sp[S_INIT].crd = 0;
+  install_space(Q, S_INIT, cs, ss);
 }
 
-static void th_snapshot(uint8_t out[32])
+static void th_snapshot(struct quic *Q, uint8_t out[32])
 {
-  struct sha256 c = transcript;
+  struct sha256 c = Q->transcript;
   sha256_final(&c, out);
 }
 
@@ -198,7 +213,7 @@ static const uint8_t sigalgs[] = {0x08, 0x04, 0x08, 0x05, 0x08, 0x06,  /* rsa_ps
                                   0x04, 0x03, 0x05, 0x03, 0x06, 0x03}; /* ecdsa_secp256r1/384/521     */
 
 /* QUIC transport parameters (TLS extension 0x39). */
-static uint32_t build_tp(uint8_t *b)
+static uint32_t build_tp(struct quic *Q, uint8_t *b)
 {
   uint32_t p = 0;
   struct {
@@ -221,15 +236,15 @@ static uint32_t build_tp(uint8_t *b)
   }
   /* initial_source_connection_id (0x0f): raw CID bytes */
   p += putvar(b + p, 0x0f);
-  p += putvar(b + p, (uint64_t)scid_len);
-  memcpy(b + p, scid, scid_len);
-  p += scid_len;
+  p += putvar(b + p, (uint64_t)Q->scid_len);
+  memcpy(b + p, Q->scid, Q->scid_len);
+  p += Q->scid_len;
   return p;
 }
 
 /* Build a TLS 1.3 ClientHello (4-byte HS header included) for QUIC: x25519 key
  * share, SNI, ALPN, and the QUIC transport-parameters extension. */
-static uint32_t build_client_hello(uint8_t *out, const char *sni, const char *alpn)
+static uint32_t build_client_hello(struct quic *Q, uint8_t *out, const char *sni, const char *alpn)
 {
   uint32_t namelen = sni ? (uint32_t)strlen(sni) : 0;
   uint32_t alpnlen = (uint32_t)strlen(alpn);
@@ -300,7 +315,7 @@ static uint32_t build_client_hello(uint8_t *out, const char *sni, const char *al
   p += 2;
   put16(p, 32);
   p += 2;
-  memcpy(p, our_pub, 32);
+  memcpy(p, Q->our_pub, 32);
   p += 32;
   put16(p, 0x0010);
   p += 2; /* ALPN */
@@ -315,7 +330,7 @@ static uint32_t build_client_hello(uint8_t *out, const char *sni, const char *al
   p += 2; /* quic_transport_parameters */
   uint8_t *tplen = p;
   p += 2;
-  uint32_t tpn = build_tp(p);
+  uint32_t tpn = build_tp(Q, p);
   p += tpn;
   put16(tplen, (uint16_t)tpn);
 
@@ -371,7 +386,7 @@ static int parse_server_hello(const uint8_t *body, uint32_t bl, uint8_t server_p
 /* --------------------------------------------------- TLS message dispatch */
 
 /* ServerHello processed: derive handshake + master secrets, install hs keys. */
-static int on_server_hello(const uint8_t *body, uint32_t bl)
+static int on_server_hello(struct quic *Q, const uint8_t *body, uint32_t bl)
 {
   uint8_t server_pub[32];
   if (parse_server_hello(body, bl, server_pub) < 0)
@@ -383,61 +398,97 @@ static int on_server_hello(const uint8_t *body, uint32_t bl)
   uint8_t early[32], derived[32], shared[32], hs_secret[32];
   hkdf_extract(zero, 32, zero, 32, early);
   expand_label(early, "derived", empty_hash, 32, derived, 32);
-  x25519(shared, our_priv, server_pub);
+  x25519(shared, Q->our_priv, server_pub);
   hkdf_extract(derived, 32, shared, 32, hs_secret);
 
   uint8_t th[32];
-  th_snapshot(th); /* transcript ..ServerHello */
-  derive_secret(hs_secret, "c hs traffic", th, c_hs);
-  derive_secret(hs_secret, "s hs traffic", th, s_hs);
-  install_space(S_HS, c_hs, s_hs);
+  th_snapshot(Q, th); /* transcript ..ServerHello */
+  derive_secret(hs_secret, "c hs traffic", th, Q->c_hs);
+  derive_secret(hs_secret, "s hs traffic", th, Q->s_hs);
+  install_space(Q, S_HS, Q->c_hs, Q->s_hs);
 
   uint8_t derived2[32];
   expand_label(hs_secret, "derived", empty_hash, 32, derived2, 32);
-  hkdf_extract(derived2, 32, zero, 32, master);
-  got_sh = 1;
+  hkdf_extract(derived2, 32, zero, 32, Q->master);
+  Q->got_sh = 1;
   return 0;
 }
 
 /* Server Finished received (th_pre = transcript through CertificateVerify):
  * verify it, derive + install 1-RTT keys, and stage the client Finished. */
-static int on_server_finished(const uint8_t *body, uint32_t bl, const uint8_t th_pre[32])
+static int on_server_finished(struct quic *Q, const uint8_t *body, uint32_t bl, const uint8_t th_pre[32])
 {
   if (bl != 32)
     return -1;
   uint8_t fk[32], expect[32];
-  expand_label(s_hs, "finished", 0, 0, fk, 32);
+  expand_label(Q->s_hs, "finished", 0, 0, fk, 32);
   hmac_sha256(fk, 32, th_pre, 32, expect);
   for (int i = 0; i < 32; i++)
     if (body[i] != expect[i])
       return -1;
 
   uint8_t th_sf[32];
-  th_snapshot(th_sf); /* transcript ..server Finished */
+  th_snapshot(Q, th_sf); /* transcript ..server Finished */
 
   uint8_t fkc[32], verify[32];
-  expand_label(c_hs, "finished", 0, 0, fkc, 32);
+  expand_label(Q->c_hs, "finished", 0, 0, fkc, 32);
   hmac_sha256(fkc, 32, th_sf, 32, verify);
-  pending_fin[0] = 20;
-  pending_fin[1] = 0;
-  pending_fin[2] = 0;
-  pending_fin[3] = 32;
-  memcpy(pending_fin + 4, verify, 32);
-  pending_fin_len = 36;
+  Q->pending_fin[0] = 20;
+  Q->pending_fin[1] = 0;
+  Q->pending_fin[2] = 0;
+  Q->pending_fin[3] = 32;
+  memcpy(Q->pending_fin + 4, verify, 32);
+  Q->pending_fin_len = 36;
 
   uint8_t c_ap[32], s_ap[32];
-  derive_secret(master, "c ap traffic", th_sf, c_ap);
-  derive_secret(master, "s ap traffic", th_sf, s_ap);
-  install_space(S_APP, c_ap, s_ap);
-  app_done = 1;
+  derive_secret(Q->master, "c ap traffic", th_sf, c_ap);
+  derive_secret(Q->master, "s ap traffic", th_sf, s_ap);
+  install_space(Q, S_APP, c_ap, s_ap);
+  Q->app_done = 1;
   return 0;
+}
+
+/* EncryptedExtensions: read the limits the server grants us out of its QUIC transport parameters (extension
+ * 0x39); a parameter it leaves out is 0. */
+static void parse_server_tp(struct quic *Q, const uint8_t *b, uint32_t len)
+{
+  if (len < 2)
+    return;
+  uint32_t o = 2, end = 2 + (((uint32_t)b[0] << 8) | b[1]);
+  if (end > len)
+    end = len;
+  while (o + 4 <= end) {
+    uint16_t et = (uint16_t)((b[o] << 8) | b[o + 1]), el = (uint16_t)((b[o + 2] << 8) | b[o + 3]);
+    o += 4;
+    if (o + el > end)
+      return;
+    if (et == 0x0039) {
+      uint32_t p = o, pe = o + el;
+      uint64_t id, vl, v;
+      while (getvar(b, &p, pe, &id) && getvar(b, &p, pe, &vl) && p + vl <= pe) {
+        uint32_t vo = p;
+        if (vl && getvar(b, &vo, p + (uint32_t)vl, &v)) {
+          if (id == 0x01)
+            Q->peer_idle_ms = v;
+          else if (id == 0x04)
+            Q->peer_max_data = v;
+          else if (id == 0x06)
+            Q->peer_stream_data = v;
+          else if (id == 0x08)
+            Q->peer_max_bidi = v;
+        }
+        p += (uint32_t)vl;
+      }
+    }
+    o += el;
+  }
 }
 
 /* Extract complete TLS handshake messages from a space's CRYPTO buffer,
  * feeding each into the transcript hash and dispatching it. */
-static void extract_tls(int space)
+static void extract_tls(struct quic *Q, int space)
 {
-  struct space *s = &sp[space];
+  struct space *s = &Q->sp[space];
   for (;;) {
     if (s->crd + 4 > s->chave)
       return;
@@ -450,22 +501,24 @@ static void extract_tls(int space)
 
     uint8_t th_pre[32];
     if (mt == 20) /* Finished: hash BEFORE update */
-      th_snapshot(th_pre);
-    sha256_update(&transcript, msg, total);
+      th_snapshot(Q, th_pre);
+    sha256_update(&Q->transcript, msg, total);
 
+    if (mt == 8) /* EncryptedExtensions */
+      parse_server_tp(Q, msg + 4, l);
     if (mt == 2) /* ServerHello */
-      on_server_hello(msg + 4, l);
+      on_server_hello(Q, msg + 4, l);
     else if (mt == 20) /* Finished */
-      on_server_finished(msg + 4, l, th_pre);
+      on_server_finished(Q, msg + 4, l, th_pre);
     /* EncryptedExtensions/Certificate/CertificateVerify: not verified */
 
     s->crd += total;
   }
 }
 
-static void crypto_recv(int space, uint64_t off, const uint8_t *data, uint32_t n)
+static void crypto_recv(struct quic *Q, int space, uint64_t off, const uint8_t *data, uint32_t n)
 {
-  struct space *s = &sp[space];
+  struct space *s = &Q->sp[space];
   if (off > s->chave) /* gap (assume in-order): hold */
     return;
   if (off + n > sizeof s->cbuf)
@@ -473,31 +526,31 @@ static void crypto_recv(int space, uint64_t off, const uint8_t *data, uint32_t n
   memcpy(s->cbuf + off, data, n);
   if (off + n > s->chave)
     s->chave = (uint32_t)(off + n);
-  extract_tls(space);
+  extract_tls(Q, space);
 }
 
 /* ------------------------------------------------------------- streams */
 
-static struct qstream *get_stream(uint64_t id)
+static struct qstream *get_stream(struct quic *Q, uint64_t id)
 {
   for (int i = 0; i < QS_MAX; i++)
-    if (qs[i].used && qs[i].id == id)
-      return &qs[i];
+    if (Q->qs[i].used && Q->qs[i].id == id)
+      return &Q->qs[i];
   for (int i = 0; i < QS_MAX; i++)
-    if (!qs[i].used) {
-      memset(&qs[i], 0, sizeof qs[i]);
-      qs[i].used = 1;
-      qs[i].id = id;
-      return &qs[i];
+    if (!Q->qs[i].used) {
+      memset(&Q->qs[i], 0, sizeof Q->qs[i]);
+      Q->qs[i].used = 1;
+      Q->qs[i].id = id;
+      return &Q->qs[i];
     }
   return 0;
 }
 
-static void stream_recv(uint64_t id, uint64_t off, const uint8_t *data, uint32_t n, int fin)
+static void stream_recv(struct quic *Q, uint64_t id, uint64_t off, const uint8_t *data, uint32_t n, int fin)
 {
   if ((id & 0x03) != 0) /* not client-bidi: discard */
     return;
-  struct qstream *q = get_stream(id);
+  struct qstream *q = get_stream(Q, id);
   if (!q)
     return;
   if (fin) {
@@ -523,11 +576,12 @@ static void stream_recv(uint64_t id, uint64_t off, const uint8_t *data, uint32_t
   memcpy(q->buf + q->r_len, src, cnt);
   q->r_len += cnt;
   q->recv_off += cnt;
+  Q->rx_total += cnt;
 }
 
 /* ------------------------------------------------------ frame processing */
 
-static void process_frames(int space, const uint8_t *p, uint32_t len)
+static void process_frames(struct quic *Q, int space, const uint8_t *p, uint32_t len)
 {
   uint32_t o = 0;
   int ackel = 0;
@@ -571,7 +625,7 @@ static void process_frames(int space, const uint8_t *p, uint32_t len)
         return;
       if (o + clen > len)
         return;
-      crypto_recv(space, off, p + o, (uint32_t)clen);
+      crypto_recv(Q, space, off, p + o, (uint32_t)clen);
       o += (uint32_t)clen;
       ackel = 1;
       break;
@@ -602,16 +656,16 @@ static void process_frames(int space, const uint8_t *p, uint32_t len)
         slen = len - o;
       if (o + slen > len)
         return;
-      stream_recv(sid, soff, p + o, (uint32_t)slen, (int)(t & 0x01));
+      stream_recv(Q, sid, soff, p + o, (uint32_t)slen, (int)(t & 0x01));
       o += (uint32_t)slen;
       ackel = 1;
       break;
     }
     case 0x10: /* MAX_DATA */
-    {
       if (!getvar(p, &o, len, &a))
         return;
-    }
+      if (a > Q->peer_max_data)
+        Q->peer_max_data = a;
       ackel = 1;
       break;
     case 0x11: /* MAX_STREAM_DATA */
@@ -621,10 +675,10 @@ static void process_frames(int space, const uint8_t *p, uint32_t len)
       break;
     case 0x12:
     case 0x13: /* MAX_STREAMS */
-    {
       if (!getvar(p, &o, len, &a))
         return;
-    }
+      if (t == 0x12 && a > Q->peer_max_bidi)
+        Q->peer_max_bidi = a;
       ackel = 1;
       break;
     case 0x14: /* DATA_BLOCKED */
@@ -675,24 +729,24 @@ static void process_frames(int space, const uint8_t *p, uint32_t len)
       if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b) || !getvar(p, &o, len, &c))
         return;
       o += (uint32_t)c;
-      closed = 1;
+      Q->closed = 1;
       return;
     case 0x1d: /* CONNECTION_CLOSE (app) */
       if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b))
         return;
       o += (uint32_t)b;
-      closed = 1;
+      Q->closed = 1;
       return;
     case 0x1e:
       ackel = 1;
-      hs_confirmed = 1;
+      Q->hs_confirmed = 1;
       break; /* HANDSHAKE_DONE */
     default:
       return; /* unknown: stop */
     }
   }
   if (ackel)
-    sp[space].ackp = 1;
+    Q->sp[space].ackp = 1;
 }
 
 /* -------------------------------------------------- packet protection */
@@ -724,9 +778,10 @@ static uint64_t decode_pn(uint64_t trunc, int pnlen, uint64_t largest, int have)
 /* Decrypt one received packet in `space`. `pkt0` is the offset of the first
  * header byte in d; `pn_off` the packet-number field offset; `plen` the bytes
  * from pn_off to the packet end (pn + payload + tag). */
-static int decrypt_pkt(int space, uint8_t *d, uint32_t pkt0, uint32_t pn_off, uint32_t plen, int is_long)
+static int decrypt_pkt(struct quic *Q, int space, uint8_t *d, uint32_t pkt0, uint32_t pn_off, uint32_t plen,
+                       int is_long)
 {
-  struct space *s = &sp[space];
+  struct space *s = &Q->sp[space];
   if (!s->hk || plen < 4 + 16)
     return -1;
   uint8_t mask[16];
@@ -755,8 +810,8 @@ static int decrypt_pkt(int space, uint8_t *d, uint32_t pkt0, uint32_t pn_off, ui
   for (int i = 0; i < 8; i++)
     nonce[11 - i] ^= (uint8_t)(pn >> (8 * i));
 
-  static uint8_t pt[2048];
-  if (ct_len > sizeof pt)
+  uint8_t *pt = Q->rx_pt;
+  if (ct_len > sizeof Q->rx_pt)
     return -1;
   if (aes128_gcm_open(s->sk, nonce, aad, al, d + ct_off, ct_len, pt, tag) != 0)
     return -1;
@@ -764,44 +819,41 @@ static int decrypt_pkt(int space, uint8_t *d, uint32_t pkt0, uint32_t pn_off, ui
   if (!s->hrec || pn > s->lrec)
     s->lrec = pn;
   s->hrec = 1;
-  process_frames(space, pt, ct_len);
+  process_frames(Q, space, pt, ct_len);
   return 0;
 }
 
-static void handle_retry(const uint8_t *retry_scid, int sl, const uint8_t *p, uint32_t plen)
+static void handle_retry(struct quic *Q, const uint8_t *retry_scid, int sl, const uint8_t *p, uint32_t plen)
 {
-  if (did_retry)
+  if (Q->did_retry)
     return;
-  did_retry = 1;
+  Q->did_retry = 1;
   /* Retry layout after the SCID: Retry Token .. then 16-byte integrity tag. */
   if (plen < 16)
     return;
   uint32_t tl = plen - 16;
-  if (tl > sizeof retry_token)
-    tl = sizeof retry_token;
-  memcpy(retry_token, p, tl);
-  retry_token_len = (int)tl;
-  if (sl > (int)sizeof dcid)
-    sl = sizeof dcid;
-  memcpy(dcid, retry_scid, sl);
-  dcid_len = sl;
-  server_cid_set = 0;                  /* adopt the real Initial's SCID next */
-  derive_initial_keys(dcid, dcid_len); /* new DCID => new Initial keys */
+  if (tl > sizeof Q->retry_token)
+    tl = sizeof Q->retry_token;
+  memcpy(Q->retry_token, p, tl);
+  Q->retry_token_len = (int)tl;
+  if (sl > (int)sizeof Q->dcid)
+    sl = sizeof Q->dcid;
+  memcpy(Q->dcid, retry_scid, sl);
+  Q->dcid_len = sl;
+  Q->server_cid_set = 0;                        /* adopt the real Initial's SCID next */
+  derive_initial_keys(Q, Q->dcid, Q->dcid_len); /* new DCID => new Initial keys */
 }
 
 /* --------------------------------------------------------- packet send */
 
 /* Encrypt+send `frames` as a single packet (its own datagram) in `space`. */
-static int emit(int space, const uint8_t *frames, uint32_t flen)
+static int emit(struct quic *Q, int space, const uint8_t *frames, uint32_t flen)
 {
-  struct space *s = &sp[space];
+  struct space *s = &Q->sp[space];
   if (!s->hk)
     return -1;
-  /* static (the connection is single-flow): keeps emit's ~5 KB of packet
-   * scratch off the 16 KiB user stack, which -O0 + deep call chains overflow.
-   */
-  static uint8_t out[2048];
-  static uint8_t pt[1600];
+  uint8_t *out = Q->tx_out; /* packet scratch lives in the connection, off the small user stack */
+  uint8_t *pt = Q->tx_pt;
   uint32_t p = 0;
   int is_long = (space != S_APP);
   uint32_t pn_off;
@@ -813,17 +865,17 @@ static int emit(int space, const uint8_t *frames, uint32_t flen)
     out[p++] = 0;
     out[p++] = 0;
     out[p++] = 1; /* version 1 */
-    out[p++] = (uint8_t)dcid_len;
-    memcpy(out + p, dcid, dcid_len);
-    p += dcid_len;
-    out[p++] = (uint8_t)scid_len;
-    memcpy(out + p, scid, scid_len);
-    p += scid_len;
+    out[p++] = (uint8_t)Q->dcid_len;
+    memcpy(out + p, Q->dcid, Q->dcid_len);
+    p += Q->dcid_len;
+    out[p++] = (uint8_t)Q->scid_len;
+    memcpy(out + p, Q->scid, Q->scid_len);
+    p += Q->scid_len;
     if (space == S_INIT) {
-      p += putvar(out + p, (uint64_t)retry_token_len);
-      if (retry_token_len) {
-        memcpy(out + p, retry_token, retry_token_len);
-        p += retry_token_len;
+      p += putvar(out + p, (uint64_t)Q->retry_token_len);
+      if (Q->retry_token_len) {
+        memcpy(out + p, Q->retry_token, Q->retry_token_len);
+        p += Q->retry_token_len;
       }
     }
     uint32_t len_idx = p;
@@ -839,7 +891,7 @@ static int emit(int space, const uint8_t *frames, uint32_t flen)
     memcpy(pt, frames, flen);
     if (space == S_INIT) { /* pad datagram to 1200 */
       uint32_t projected = pn_off + 4 + ptl + 16;
-      while (projected < 1200 && ptl < sizeof pt) {
+      while (projected < 1200 && ptl < sizeof Q->tx_pt) {
         pt[ptl++] = 0x00;
         projected++;
       }
@@ -863,12 +915,12 @@ static int emit(int space, const uint8_t *frames, uint32_t flen)
     for (int i = 0; i < 4; i++)
       out[pn_off + i] ^= mask[1 + i];
     s->spn++;
-    return net_send(sock, out, (int)dglen) < 0 ? -1 : 0;
+    return net_send(Q->sock, out, (int)dglen) < 0 ? -1 : 0;
   }
 
   out[p++] = 0x43; /* short header, pnlen 4 */
-  memcpy(out + p, dcid, dcid_len);
-  p += dcid_len;
+  memcpy(out + p, Q->dcid, Q->dcid_len);
+  p += Q->dcid_len;
   pn_off = p;
   uint64_t pn = s->spn;
   out[p++] = (uint8_t)(pn >> 24);
@@ -893,47 +945,47 @@ static int emit(int space, const uint8_t *frames, uint32_t flen)
   for (int i = 0; i < 4; i++)
     out[pn_off + i] ^= mask[1 + i];
   s->spn++;
-  return net_send(sock, out, (int)dglen) < 0 ? -1 : 0;
+  return net_send(Q->sock, out, (int)dglen) < 0 ? -1 : 0;
 }
 
-static void send_ack(int space)
+static void send_ack(struct quic *Q, int space)
 {
-  if (!sp[space].hk || !sp[space].hrec)
+  if (!Q->sp[space].hk || !Q->sp[space].hrec)
     return;
   uint8_t f[24];
   uint32_t p = 0;
   f[p++] = 0x02;
-  p += putvar(f + p, sp[space].lrec); /* Largest Acknowledged */
-  p += putvar(f + p, 0);              /* ACK Delay */
-  p += putvar(f + p, 0);              /* ACK Range Count */
-  p += putvar(f + p, sp[space].lrec); /* First ACK Range = [0..largest] */
-  emit(space, f, p);
-  sp[space].ackp = 0;
+  p += putvar(f + p, Q->sp[space].lrec); /* Largest Acknowledged */
+  p += putvar(f + p, 0);                 /* ACK Delay */
+  p += putvar(f + p, 0);                 /* ACK Range Count */
+  p += putvar(f + p, Q->sp[space].lrec); /* First ACK Range = [0..largest] */
+  emit(Q, space, f, p);
+  Q->sp[space].ackp = 0;
 }
 
-static void send_pending_acks(void)
+static void send_pending_acks(struct quic *Q)
 {
   for (int s = 0; s < 3; s++)
-    if (sp[s].ackp)
-      send_ack(s);
+    if (Q->sp[s].ackp)
+      send_ack(Q, s);
 }
 
 /* Send a CRYPTO frame carrying `data` at offset 0 in `space`. */
-static int send_crypto(int space, const uint8_t *data, uint32_t len)
+static int send_crypto(struct quic *Q, int space, const uint8_t *data, uint32_t len)
 {
-  static uint8_t f[1200];
+  uint8_t *f = Q->tx_cf;
   uint32_t p = 0;
   f[p++] = 0x06;
   p += putvar(f + p, 0);
   p += putvar(f + p, len);
   memcpy(f + p, data, len);
   p += len;
-  return emit(space, f, p);
+  return emit(Q, space, f, p);
 }
 
 /* --------------------------------------------------- datagram processing */
 
-static int process_datagram(uint8_t *d, uint32_t dlen)
+static int process_datagram(struct quic *Q, uint8_t *d, uint32_t dlen)
 {
   uint32_t off = 0;
   while (off < dlen) {
@@ -958,17 +1010,17 @@ static int process_datagram(uint8_t *d, uint32_t dlen)
         break;
       if (ver == 0) /* Version Negotiation */
       {
-        closed = 1;
+        Q->closed = 1;
         return -1;
       }
       if (type == 3) { /* Retry */
-        handle_retry(scid_p, sl, d + q, dlen - q);
+        handle_retry(Q, scid_p, sl, d + q, dlen - q);
         return 1;
       }
-      if (!server_cid_set && sl <= sizeof dcid) {
-        memcpy(dcid, scid_p, sl);
-        dcid_len = sl;
-        server_cid_set = 1;
+      if (!Q->server_cid_set && sl <= sizeof Q->dcid) {
+        memcpy(Q->dcid, scid_p, sl);
+        Q->dcid_len = sl;
+        Q->server_cid_set = 1;
       }
       if (type == 0) { /* Initial: skip token */
         uint64_t tl;
@@ -985,120 +1037,151 @@ static int process_datagram(uint8_t *d, uint32_t dlen)
       if (pn_off + length > dlen)
         break;
       int space = (type == 0) ? S_INIT : S_HS;
-      decrypt_pkt(space, d, off, pn_off, (uint32_t)length, 1);
+      decrypt_pkt(Q, space, d, off, pn_off, (uint32_t)length, 1);
       off = pn_off + (uint32_t)length;
     } else { /* short header (1-RTT) */
-      uint32_t pn_off = off + 1 + scid_len;
+      uint32_t pn_off = off + 1 + Q->scid_len;
       if (pn_off + 4 + 16 > dlen)
         break;
-      decrypt_pkt(S_APP, d, off, pn_off, dlen - pn_off, 0);
+      decrypt_pkt(Q, S_APP, d, off, pn_off, dlen - pn_off, 0);
       off = dlen;
     }
   }
-  return closed ? -1 : 0;
+  return Q->closed ? -1 : 0;
+}
+
+/* Raise the server's connection-level send limit once less than half of it is left, so a connection that stays
+ * open across many responses never stalls. */
+static void grant_flow(struct quic *Q)
+{
+  if (!Q->sp[S_APP].hk || Q->rx_total + 0x800000 <= Q->rx_limit)
+    return;
+  Q->rx_limit = Q->rx_total + 0x1000000;
+  uint8_t f[10];
+  uint32_t p = 0;
+  f[p++] = 0x10; /* MAX_DATA */
+  p += putvar(f + p, Q->rx_limit);
+  emit(Q, S_APP, f, p);
 }
 
 /* Read one datagram, process it, and flush owed ACKs. 1 processed / 0 idle /
  * QUIC_EINTR / QUIC_ECLOSED. */
-static int poll_once(void)
+static int poll_once(struct quic *Q)
 {
-  static uint8_t dg[2048];
-  int n = net_recv(sock, dg, (int)sizeof dg);
+  uint8_t *dg = Q->rx_dg;
+  int n = net_recv(Q->sock, dg, (int)sizeof Q->rx_dg);
   if (n == NET_EINTR)
     return QUIC_EINTR;
   if (n <= 0)
     return 0;
-  int r = process_datagram(dg, (uint32_t)n);
-  send_pending_acks();
-  if (r < 0 || closed)
+  int r = process_datagram(Q, dg, (uint32_t)n);
+  send_pending_acks(Q);
+  grant_flow(Q);
+  if (r < 0 || Q->closed)
     return QUIC_ECLOSED;
   return 1;
 }
 
 /* ---------------------------------------------------------- public API */
 
-int quic_connect(const char *host, uint16_t port, const char *alpn)
+int quic_connect(quic **out, const char *host, uint16_t port, const char *alpn)
 {
-  memset(sp, 0, sizeof sp);
-  memset(qs, 0, sizeof qs);
-  closed = server_cid_set = did_retry = 0;
-  got_sh = app_done = hs_sent_fin = hs_confirmed = 0;
-  retry_token_len = 0;
-  pending_fin_len = 0;
-
-  sock = net_dial(host, port, SK_UDP); /* resolve to IP; SNI stays `host` below */
-  if (sock < 0)
-    return sock == NET_EINTR ? QUIC_EINTR : sock == -2 ? QUIC_ERESOLVE : QUIC_ESOCK;
-
-  scid_len = 8;
-  rng_bytes(scid, 8);
-  dcid_len = 8;
-  rng_bytes(dcid, 8);
-  derive_initial_keys(dcid, dcid_len);
-
-  sha256_init(&transcript);
-  rng_bytes(our_priv, 32);
-  x25519(our_pub, our_priv, x25519_base);
-
-  chello_len = build_client_hello(chello, host, alpn);
-  sha256_update(&transcript, chello, chello_len);
-  if (send_crypto(S_INIT, chello, chello_len) < 0) {
-    net_close(sock);
+  struct quic *Q = calloc(1, sizeof *Q);
+  if (!Q)
     return QUIC_ESOCK;
+  Q->rx_limit = 0x1000000; /* initial_max_data we advertise */
+
+  Q->sock = net_dial(host, port, SK_UDP); /* resolve to IP; SNI stays `host` below */
+  if (Q->sock < 0) {
+    int e = Q->sock;
+    free(Q);
+    return e == NET_EINTR ? QUIC_EINTR : e == -2 ? QUIC_ERESOLVE : QUIC_ESOCK;
   }
 
-  int tries = 0, last_retry = did_retry;
-  while (!(app_done && hs_sent_fin)) {
-    int r = poll_once();
+  Q->scid_len = 8;
+  rng_bytes(Q->scid, 8);
+  Q->dcid_len = 8;
+  rng_bytes(Q->dcid, 8);
+  derive_initial_keys(Q, Q->dcid, Q->dcid_len);
+
+  sha256_init(&Q->transcript);
+  rng_bytes(Q->our_priv, 32);
+  x25519(Q->our_pub, Q->our_priv, x25519_base);
+
+  Q->chello_len = build_client_hello(Q, Q->chello, host, alpn);
+  sha256_update(&Q->transcript, Q->chello, Q->chello_len);
+  int err = QUIC_ESOCK;
+  if (send_crypto(Q, S_INIT, Q->chello, Q->chello_len) < 0)
+    goto fail;
+
+  int tries = 0, last_retry = Q->did_retry;
+  while (!(Q->app_done && Q->hs_sent_fin)) {
+    int r = poll_once(Q);
     if (r == QUIC_EINTR) {
-      net_close(sock);
-      return QUIC_EINTR;
+      err = QUIC_EINTR;
+      goto fail;
     }
     if (r == QUIC_ECLOSED) {
-      net_close(sock);
-      return QUIC_EHANDSHAKE;
+      err = QUIC_EHANDSHAKE;
+      goto fail;
     }
-    if (did_retry != last_retry) { /* Retry: resend Initial CH */
-      last_retry = did_retry;
+    if (Q->did_retry != last_retry) { /* Retry: resend Initial CH */
+      last_retry = Q->did_retry;
       tries = 0;
-      send_crypto(S_INIT, chello, chello_len);
+      send_crypto(Q, S_INIT, Q->chello, Q->chello_len);
       continue;
     }
     if (r == 0) { /* idle: retransmit / nudge */
       if (++tries > 8) {
-        net_close(sock);
-        return QUIC_EHANDSHAKE;
+        err = QUIC_EHANDSHAKE;
+        goto fail;
       }
-      if (!got_sh)
-        send_crypto(S_INIT, chello, chello_len);
+      if (!Q->got_sh)
+        send_crypto(Q, S_INIT, Q->chello, Q->chello_len);
       else {
-        sp[S_INIT].ackp = sp[S_INIT].hrec;
-        sp[S_HS].ackp = sp[S_HS].hrec;
-        send_pending_acks();
+        Q->sp[S_INIT].ackp = Q->sp[S_INIT].hrec;
+        Q->sp[S_HS].ackp = Q->sp[S_HS].hrec;
+        send_pending_acks(Q);
       }
       continue;
     }
     tries = 0;
-    if (app_done && !hs_sent_fin) { /* send client Finished */
-      send_crypto(S_HS, pending_fin, (uint32_t)pending_fin_len);
-      hs_sent_fin = 1;
+    if (Q->app_done && !Q->hs_sent_fin) { /* send client Finished */
+      send_crypto(Q, S_HS, Q->pending_fin, (uint32_t)Q->pending_fin_len);
+      Q->hs_sent_fin = 1;
     }
   }
+  *out = Q;
   return QUIC_OK;
+
+fail:
+  net_close(Q->sock);
+  free(Q);
+  return err;
 }
 
-int quic_send(uint64_t sid, const void *data, uint32_t len, int fin)
+int quic_open(quic *Q, uint64_t *sid)
 {
-  struct qstream *q = get_stream(sid);
-  if (!q || !sp[S_APP].hk)
+  if (Q->next_bidi >= Q->peer_max_bidi)
     return -1;
+  *sid = 4 * Q->next_bidi++;
+  return 0;
+}
+
+int quic_send(quic *Q, uint64_t sid, const void *data, uint32_t len, int fin)
+{
+  struct qstream *q = get_stream(Q, sid);
+  if (!q || !Q->sp[S_APP].hk)
+    return -1;
+  if (Q->tx_total + len > Q->peer_max_data || (!(sid & 2) && q->send_off + len > Q->peer_stream_data))
+    return -2; /* over what the server lets us send */
   const uint8_t *p = data;
   uint32_t done = 0;
   do {
     uint32_t chunk = len - done;
     if (chunk > 1100)
       chunk = 1100;
-    static uint8_t f[1200];
+    uint8_t *f = Q->tx_sf;
     uint32_t fp = 0;
     uint8_t type = 0x08 | 0x04 | 0x02; /* OFF + LEN */
     if (fin && done + chunk == len)
@@ -1109,17 +1192,18 @@ int quic_send(uint64_t sid, const void *data, uint32_t len, int fin)
     fp += putvar(f + fp, chunk);
     memcpy(f + fp, p + done, chunk);
     fp += chunk;
-    if (emit(S_APP, f, fp) < 0)
+    if (emit(Q, S_APP, f, fp) < 0)
       return -1;
     done += chunk;
   } while (done < len);
   q->send_off += len;
+  Q->tx_total += len;
   return 0;
 }
 
-int quic_read(uint64_t sid, void *buf, uint32_t max, int *fin)
+int quic_read(quic *Q, uint64_t sid, void *buf, uint32_t max, int *fin)
 {
-  struct qstream *q = get_stream(sid);
+  struct qstream *q = get_stream(Q, sid);
   if (!q) {
     if (fin)
       *fin = 0;
@@ -1136,18 +1220,47 @@ int quic_read(uint64_t sid, void *buf, uint32_t max, int *fin)
   return (int)n;
 }
 
-int quic_poll(void) { return poll_once(); }
-
-void quic_close(void)
+void quic_stream_done(quic *Q, uint64_t sid)
 {
-  if (sp[S_APP].hk && !closed) {
+  for (int i = 0; i < QS_MAX; i++)
+    if (Q->qs[i].used && Q->qs[i].id == sid)
+      Q->qs[i].used = 0;
+}
+
+int quic_poll(quic *Q) { return poll_once(Q); }
+
+int quic_peer_closed(quic *Q)
+{
+  for (; !Q->closed;) {
+    int n = net_recv_nb(Q->sock, Q->rx_dg, (int)sizeof Q->rx_dg);
+    if (n < 0 && n != NET_EINTR)
+      return 1;
+    if (n <= 0)
+      break;
+    process_datagram(Q, Q->rx_dg, (uint32_t)n);
+  }
+  send_pending_acks(Q);
+  return Q->closed;
+}
+
+unsigned quic_idle_ms(const quic *Q) { return (unsigned)Q->peer_idle_ms; }
+
+int quic_streams_left(const quic *Q)
+{
+  return Q->peer_max_bidi > Q->next_bidi ? (int)(Q->peer_max_bidi - Q->next_bidi) : 0;
+}
+
+void quic_close(quic *Q)
+{
+  if (Q->sp[S_APP].hk && !Q->closed) {
     uint8_t f[4];
     uint32_t p = 0;
     f[p++] = 0x1c;         /* CONNECTION_CLOSE (transport) */
     p += putvar(f + p, 0); /* error = NO_ERROR */
     p += putvar(f + p, 0); /* frame type */
     p += putvar(f + p, 0); /* reason length */
-    emit(S_APP, f, p);
+    emit(Q, S_APP, f, p);
   }
-  net_close(sock);
+  net_close(Q->sock);
+  free(Q);
 }

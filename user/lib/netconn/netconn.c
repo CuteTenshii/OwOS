@@ -59,8 +59,11 @@ struct idle {
 static struct idle g_idle[POOL_MAX];
 static mutex_t g_idle_lock = MUTEX_INIT;
 
-/* Servers drop idle HTTP/1.1 connections within seconds; h2 peers keep them far longer. */
-static unsigned idle_ttl(int kind) { return kind == NC_IDLE_H2 ? 30000 : kind == NC_IDLE_H1 ? 5000 : 10000; }
+/* Servers drop idle HTTP/1.1 connections within seconds; h2 peers keep them far longer, QUIC ones less so. */
+static unsigned idle_ttl(int kind)
+{
+  return kind == NC_IDLE_H2 ? 30000 : kind == NC_IDLE_H3 ? 15000 : kind == NC_IDLE_H1 ? 5000 : 10000;
+}
 
 static void nc_destroy(void *c) { nc_close(c); }
 static int nc_conn_closed(void *c) { return nc_peer_closed(c, 0); }

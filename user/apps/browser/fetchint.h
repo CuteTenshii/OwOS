@@ -18,6 +18,12 @@ void fetch_favicon(const char *page_url);       /* page favicon -> B->favicon   
 /* Batch-fetch external stylesheets (html.c hook); bodies[i] malloc'd, caller frees. */
 void css_batch(char *const *urls, int n, unsigned char **bodies, int *lens);
 
+/* Origins that advertised HTTP/3 through Alt-Svc, tried over h3 first. h3_forget benches an origin for a few minutes
+ * after QUIC failed, so a network that drops UDP is not retried on every request. */
+bool h3_known(const char *host);
+void h3_remember(const char *host);
+void h3_forget(const char *host);
+
 /* An h2 session to u (idle, or a new connection whose ALPN selected h2); else NULL with the HTTP/1.1 connection in
  * *plain, or NULL there too if the connection failed. `fresh` skips the idle pool. */
 h2_session *h2_open(const struct purl *u, bool fresh, netconn **plain);
