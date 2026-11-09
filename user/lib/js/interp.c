@@ -671,9 +671,9 @@ static js_value apply_binop(js_ctx *ctx, int op, js_value l, js_value r)
     gc_push_scope();
     KEEP(l);
     KEEP(r);
-    lp = js_to_primitive(ctx, l, 1);
+    lp = js_to_primitive(ctx, l, JS_HINT_DEFAULT);
     KEEP(lp);
-    rp = js_to_primitive(ctx, r, 1);
+    rp = js_to_primitive(ctx, r, JS_HINT_DEFAULT);
     KEEP(rp);
     if (ctx->has_exc) {
       gc_pop_scope();
@@ -3490,6 +3490,7 @@ static js_value call_function(js_ctx *ctx, js_value fnval, js_value thisv, js_va
   if (f->native) {
     js_value r;
     ctx->native_data = f->data;
+    ctx->native_construct = 0;
     r = f->native(ctx, thisv, args, argc);
     if (pushed)
       ctx->nframes--;
@@ -3671,6 +3672,7 @@ js_value js_construct(js_ctx *ctx, js_value fnval, js_value *args, int argc)
   }
   if (fn->fn->native) {
     ctx->native_data = fn->fn->data;
+    ctx->native_construct = 1;
     return fn->fn->native(ctx, js_undef(), args, argc);
   } /* native ctors build their own object */
   if (fn->fn->is_arrow)

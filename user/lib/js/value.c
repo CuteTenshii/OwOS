@@ -1566,10 +1566,11 @@ js_value js_to_string(js_ctx *ctx, js_value v)
   }
 }
 
-js_value js_to_primitive(js_ctx *ctx, js_value v, int number_hint)
+js_value js_ordinary_to_primitive(js_ctx *ctx, js_value v, int hint)
 {
-  const char *first = number_hint ? "valueOf" : "toString";
-  const char *second = number_hint ? "toString" : "valueOf";
+  /* "default" behaves as "number" */
+  const char *first = hint == JS_HINT_STRING ? "toString" : "valueOf";
+  const char *second = hint == JS_HINT_STRING ? "valueOf" : "toString";
   int i;
   if (v.type != JV_OBJ)
     return v;
@@ -1588,6 +1589,37 @@ js_value js_to_primitive(js_ctx *ctx, js_value v, int number_hint)
   }
   js_throw_type(ctx, "cannot convert object to primitive value");
   return js_undef();
+}
+
+js_value js_to_primitive(js_ctx *ctx, js_value v, int hint)
+{
+  static const char *const hint_names[] = {"string", "number", "default"};
+  js_value exotic, name, r;
+  if (v.type != JV_OBJ)
+    return v;
+  if (ctx->sym_toprimitive.type != JV_SYMBOL)
+    return js_ordinary_to_primitive(ctx, v, hint);
+  exotic = js_get(ctx, v, js_symbol_key(ctx->sym_toprimitive));
+  if (ctx->has_exc)
+    return js_undef();
+  if (exotic.type == JV_UNDEF || exotic.type == JV_NULL)
+    return js_ordinary_to_primitive(ctx, v, hint);
+  if (!js_is_callable(exotic)) {
+    js_throw_type(ctx, "Symbol.toPrimitive is not a function");
+    return js_undef();
+  }
+  gc_push_scope();
+  name = js_mk_cstring(ctx, hint_names[hint]);
+  gc_keep(name.u.str);
+  r = js_call(ctx, exotic, v, &name, 1);
+  gc_pop_scope();
+  if (ctx->has_exc)
+    return js_undef();
+  if (r.type == JV_OBJ) {
+    js_throw_type(ctx, "Symbol.toPrimitive returned an object");
+    return js_undef();
+  }
+  return r;
 }
 
 int js_to_int_sat(js_ctx *ctx, js_value v)
@@ -1784,8 +1816,8 @@ int js_loose_eq(js_ctx *ctx, js_value a, js_value b)
     return js_loose_eq(ctx, a, nb);
   }
   if ((a.type == JV_NUM || a.type == JV_STR || a.type == JV_BIGINT) && b.type == JV_OBJ)
-    return js_loose_eq(ctx, a, js_to_primitive(ctx, b, 0));
+    return js_loose_eq(ctx, a, js_to_primitive(ctx, b, JS_HINT_DEFAULT));
   if (a.type == JV_OBJ && (b.type == JV_NUM || b.type == JV_STR || b.type == JV_BIGINT))
-    return js_loose_eq(ctx, js_to_primitive(ctx, a, 0), b);
+    return js_loose_eq(ctx, js_to_primitive(ctx, a, JS_HINT_DEFAULT), b);
   return 0;
 }

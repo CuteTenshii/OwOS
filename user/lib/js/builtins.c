@@ -1870,6 +1870,8 @@ static js_value op_tostring(js_ctx *ctx, js_value t, js_value *a, int n)
       tag = "Function";
     else if (o->kind == OBJ_ERROR)
       tag = "Error";
+    else if (js_has_own(o, "@t"))
+      tag = "Date";
     if (ctx->sym_tostringtag.type == JV_SYMBOL) {
       js_value tt = js_get(ctx, t, js_symbol_key(ctx->sym_tostringtag));
       if (tt.type == JV_STR)
@@ -7184,7 +7186,7 @@ static void date_civil(double ms, int *Y, int *Mo, int *D, int *h, int *mi, int 
 {
   long long t;
   long long secs;
-  if (!(ms > -8.64e15 && ms < 8.64e15))
+  if (!(ms >= -8.64e15 && ms <= 8.64e15))
     ms = 0;
   t = (long long)ms;
   secs = t / 1000;
@@ -7548,11 +7550,14 @@ static js_value date_parse(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)t;
   return js_number(str.type == JV_STR ? date_parse_str(str.u.str->data) : DATE_NAN);
 }
+static js_value date_format_ms(js_ctx *ctx, double tv, int style); /* fwd */
 static js_value date_ctor(js_ctx *ctx, js_value thisv, js_value *a, int n)
 {
   double ms;
   js_object *o;
   (void)thisv;
+  if (!ctx->native_construct) /* Date() without new ignores its arguments */
+    return date_format_ms(ctx, ctx->now_ms ? (double)ctx->now_ms() : 0, 0);
   if (n == 0) {
     ms = ctx->now_ms ? (double)ctx->now_ms() : 0;
   } else if (n == 1) {
@@ -7573,6 +7578,18 @@ static js_value date_ctor(js_ctx *ctx, js_value thisv, js_value *a, int n)
   js_def(o, "@t", js_number(ms), 0);
   gc_pop_scope();
   return js_obj_value(o);
+}
+/* Date.prototype[Symbol.toPrimitive]: unlike ordinary objects, a Date reads the "default" hint as "string" */
+static js_value date_toprimitive(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  const char *hint = n && a[0].type == JV_STR ? a[0].u.str->data : "";
+  if (t.type != JV_OBJ)
+    return js_throw_type(ctx, "Date.prototype[Symbol.toPrimitive] called on a non-object");
+  if (streq(hint, "string") || streq(hint, "default"))
+    return js_ordinary_to_primitive(ctx, t, JS_HINT_STRING);
+  if (streq(hint, "number"))
+    return js_ordinary_to_primitive(ctx, t, JS_HINT_NUMBER);
+  return js_throw_type(ctx, "invalid Symbol.toPrimitive hint");
 }
 static js_value date_getTime(js_ctx *ctx, js_value t, js_value *a, int n)
 {
@@ -7650,10 +7667,9 @@ static js_value date_tojson(js_ctx *ctx, js_value t, js_value *a, int n)
 
 /* style 0: "Tue Jan 02 2024 15:04:05 GMT+0000 (Coordinated Universal Time)", 1: date part, 2: time part,
  * 3: "Tue, 02 Jan 2024 15:04:05 GMT" */
-static js_value date_format(js_ctx *ctx, js_value t, int style)
+static js_value date_format_ms(js_ctx *ctx, double tv, int style)
 {
   int Y, Mo, D, h, mi, s, ms, dw, i = 0;
-  double tv = date_t(ctx, t);
   char b[96];
   if (tv != tv)
     return js_mk_cstring(ctx, "Invalid Date");
@@ -7700,6 +7716,7 @@ static js_value date_format(js_ctx *ctx, js_value t, int style)
   }
   return js_mk_string(ctx, b, i);
 }
+static js_value date_format(js_ctx *ctx, js_value t, int style) { return date_format_ms(ctx, date_t(ctx, t), style); }
 #define DATE_FORMAT(fn, style)                                                                                         \
   static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n)                                                      \
   {                                                                                                                    \
@@ -10601,14 +10618,25 @@ static js_value dtf_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)t;
   return js_obj_value(intl_new(ctx, a, n));
 }
+/* The time value to format; per ECMA-402 an Invalid Date throws RangeError (pending exception, NaN returned) */
+static double dtf_time(js_ctx *ctx, js_value v)
+{
+  double ms = intl_arg_ms(ctx, v);
+  if (!ctx->has_exc && ms != ms)
+    js_throw_range(ctx, "Invalid time value");
+  return ms;
+}
 static js_value dtf_format(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   sbuf sb;
   js_value r;
+  double ms = dtf_time(ctx, ARG(0));
+  if (ctx->has_exc)
+    return js_undef();
   sb.b = 0;
   sb.n = 0;
   sb.cap = 0;
-  dtf_build(ctx, t, intl_arg_ms(ctx, ARG(0)), &sb);
+  dtf_build(ctx, t, ms, &sb);
   r = str_of(ctx, sb.b ? sb.b : "", sb.n);
   if (sb.b)
     free(sb.b);
@@ -10616,7 +10644,8 @@ static js_value dtf_format(js_ctx *ctx, js_value t, js_value *a, int n)
 }
 static js_value dtf_ftp(js_ctx *ctx, js_value t, js_value *a, int n)
 {
-  return intl_one_part(ctx, dtf_format(ctx, t, a, n));
+  js_value s = dtf_format(ctx, t, a, n);
+  return ctx->has_exc ? js_undef() : intl_one_part(ctx, s);
 }
 static js_value dtf_range(js_ctx *ctx, js_value t, js_value *a, int n)
 {
@@ -10625,9 +10654,12 @@ static js_value dtf_range(js_ctx *ctx, js_value t, js_value *a, int n)
   sb.b = 0;
   sb.n = 0;
   sb.cap = 0;
-  dtf_build(ctx, t, intl_arg_ms(ctx, ARG(0)), &sb);
+  double from = dtf_time(ctx, ARG(0)), to = ctx->has_exc ? 0 : dtf_time(ctx, ARG(1));
+  if (ctx->has_exc)
+    return js_undef();
+  dtf_build(ctx, t, from, &sb);
   intl_puts(&sb, " – ");
-  dtf_build(ctx, t, intl_arg_ms(ctx, ARG(1)), &sb);
+  dtf_build(ctx, t, to, &sb);
   r = str_of(ctx, sb.b ? sb.b : "", sb.n);
   if (sb.b)
     free(sb.b);
@@ -11575,7 +11607,8 @@ void js_setup_builtins(js_ctx *ctx)
     ctx->sym_async_iterator = js_mk_symbol(ctx, "Symbol.asyncIterator");
     js_def(sctor, "asyncIterator", ctx->sym_async_iterator, 0);
     js_def(sctor, "hasInstance", js_mk_symbol(ctx, "Symbol.hasInstance"), 0);
-    js_def(sctor, "toPrimitive", js_mk_symbol(ctx, "Symbol.toPrimitive"), 0);
+    ctx->sym_toprimitive = js_mk_symbol(ctx, "Symbol.toPrimitive");
+    js_def(sctor, "toPrimitive", ctx->sym_toprimitive, 0);
     ctx->sym_tostringtag = js_mk_symbol(ctx, "Symbol.toStringTag");
     js_def(sctor, "toStringTag", ctx->sym_tostringtag, 0);
     gc_pop_scope();
@@ -11708,6 +11741,9 @@ void js_setup_builtins(js_ctx *ctx)
   }
   {
     js_object *dc = make_ctor(ctx, "Date", date_ctor, ctx->date_proto);
+    js_def(dc, "length", js_number(7), P_CONFIGURABLE);
+    js_object *tp = js_new_native(ctx, date_toprimitive, "[Symbol.toPrimitive]", 1);
+    js_def(ctx->date_proto, js_symbol_key(ctx->sym_toprimitive), js_obj_value(tp), P_CONFIGURABLE);
     js_def_native(ctx, dc, "now", date_now, 0);
     js_def_native(ctx, dc, "parse", date_parse, 1);
     js_def_native(ctx, dc, "UTC", date_utc, 7);

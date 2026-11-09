@@ -49,6 +49,7 @@ struct js_ctx {
       *regexp_proto, *generator_proto, *async_generator_proto;
   js_value sym_iterator;       /* the well-known Symbol.iterator                 */
   js_value sym_tostringtag;    /* the well-known Symbol.toStringTag              */
+  js_value sym_toprimitive;    /* the well-known Symbol.toPrimitive              */
   js_value sym_async_iterator; /* the well-known Symbol.asyncIterator          */
   js_object *sym_registry;     /* array of every Symbol created, so
                                 * Object.getOwnPropertySymbols can recover the
@@ -121,6 +122,8 @@ struct js_ctx {
                              * existing scope and so invalidate cached slots     */
   js_value native_data;     /* the called native's fn->data (bound closure);
                              * a native reads it at entry before any sub-call */
+  int native_construct;     /* nonzero when that native was invoked by `new`;
+                             * likewise read at entry before any sub-call     */
 
   /* arenas for code compiled at runtime (eval, the Function constructor); kept
    * for the context's lifetime since functions defined there outlive the call.

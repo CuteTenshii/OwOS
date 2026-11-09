@@ -640,6 +640,26 @@ static void check_generator_stack_guard(void)
              0));
 }
 
+static void check_to_primitive(void)
+{
+  expect(
+      run("var hints=[], o={}; o[Symbol.toPrimitive]=function(h){ hints.push(h); return h==='number' ? 42 : 'str'; };\n"
+          "expect(+o===42 && `${o}`==='str' && o+''==='str' && (o==='str')===false && o=='str', 'hint results');\n"
+          "expect(hints.join()==='number,string,default,default', 'hints passed: '+hints.join());\n"
+          "var v={ valueOf(){ return 2; }, toString(){ return '1'; } };\n"
+          "expect(v==2 && v+''==='2' && String(v)==='1', 'ordinary objects read default as number');\n"
+          "var bad={}; bad[Symbol.toPrimitive]=function(){ return {}; }; var t1=false, t2=false;\n"
+          "try { bad+1; } catch (e) { t1=e instanceof TypeError; }\n"
+          "var nf={}; nf[Symbol.toPrimitive]=5; try { nf+1; } catch (e) { t2=e instanceof TypeError; }\n"
+          "expect(t1 && t2, 'an object result or a non-callable method throws TypeError');\n"
+          "var d=new Date(0);\n"
+          "expect(d+''===String(d) && d-0===0 && d==String(d), 'Date reads default as string');\n"
+          "expect(typeof Date()==='string' && typeof Date(0)==='string' && typeof new Date()==='object', 'Date() vs "
+          "new');\n"
+          "expect(Date.prototype[Symbol.toPrimitive].call(d,'number')===0, 'Date toPrimitive number hint');\n",
+          0));
+}
+
 static void check_date(void)
 {
   expect(run(
@@ -720,6 +740,7 @@ int main(void)
   test("async generators and for await", check_async_generators);
   test("generator state survives collection", check_generator_gc);
   test("generator bodies are stack-guarded", check_generator_stack_guard);
+  test("Symbol.toPrimitive and ToPrimitive hints", check_to_primitive);
   test("Date parsing, UTC, setters and string forms", check_date);
   test("Intl supportedLocalesOf", check_intl_supported_locales);
   return 0;

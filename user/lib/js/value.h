@@ -318,7 +318,12 @@ double js_f16_decode(unsigned h);
 int js_to_boolean(js_value v);
 double js_to_number(js_ctx *ctx, js_value v);
 js_value js_to_string(js_ctx *ctx, js_value v); /* -> JV_STR                  */
-js_value js_to_primitive(js_ctx *ctx, js_value v, int number_hint);
+/* ToPrimitive hints. DEFAULT is what `+` and `==` request: ordinary objects treat it as NUMBER, while an object's
+ * Symbol.toPrimitive method (Date's prefers strings) sees "default". */
+enum { JS_HINT_STRING = 0, JS_HINT_NUMBER = 1, JS_HINT_DEFAULT = 2 };
+js_value js_to_primitive(js_ctx *ctx, js_value v, int hint);
+/* The fallback without Symbol.toPrimitive: valueOf/toString in hint order (Date's @@toPrimitive uses it). */
+js_value js_ordinary_to_primitive(js_ctx *ctx, js_value v, int hint);
 int js_to_int32(js_ctx *ctx, js_value v);
 int js_to_int_sat(js_ctx *ctx, js_value v); /* ToNumber then saturate to int; NaN -> 0 */
 unsigned js_to_uint32(js_ctx *ctx, js_value v);
