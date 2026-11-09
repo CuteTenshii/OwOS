@@ -2,16 +2,18 @@
  * I2C-over-AUX, including DEFER replies, short reads and NACKs. Run through scripts/run-tests.sh dpaux. */
 #define OWOS_SUITE_TEST
 #include "../drivers/video/dpaux.h"
+#include "../drivers/video/edidparse.h"
 #include "test.h"
 #include <string.h>
 
 struct sink {
   uint8_t dpcd[0x100];
-  uint8_t edid[DP_EDID_LEN];
+  uint8_t edid[EDID_MAX_BLOCKS * DP_EDID_LEN];
   int defer;      /* DEFER this many requests before answering */
   int max_reply;  /* cap data bytes per reply (short reads), 0 = no cap */
   int nack_i2c;   /* answer I2C requests with an I2C NACK */
   int offset;     /* EDID read pointer */
+  int segment;    /* E-DDC segment pointer */
   int open;       /* I2C transaction held open (MOT) */
   int stops;      /* address-only writes seen */
   int bad_header; /* count of malformed headers */
@@ -41,6 +43,11 @@ static int fake_xfer(void *ctx, const uint8_t *tx, int txlen, uint8_t *rx, int r
     memcpy(rx + 1, s->dpcd + addr, (size_t)n);
     return 1 + n;
   }
+  if (addr == 0x30) {
+    s->segment = tx[4];
+    rx[0] = 0;
+    return 1;
+  }
   if (addr != 0x50) {
     rx[0] = 1 << 6;
     return 1;
@@ -60,6 +67,8 @@ static int fake_xfer(void *ctx, const uint8_t *tx, int txlen, uint8_t *rx, int r
     } else {
       s->offset = tx[4];
       s->open = mot;
+      if (!mot)
+        s->segment = 0;
     }
     rx[0] = 0;
     return 1;
@@ -70,9 +79,11 @@ static int fake_xfer(void *ctx, const uint8_t *tx, int txlen, uint8_t *rx, int r
       return 1;
     }
     int n = s->max_reply && s->max_reply < len ? s->max_reply : len;
-    memcpy(rx + 1, s->edid + s->offset, (size_t)n);
+    memcpy(rx + 1, s->edid + s->segment * 256 + s->offset, (size_t)n);
     s->offset += n;
     s->open = mot;
+    if (!mot)
+      s->segment = 0;
     rx[0] = 0;
     return 1 + n;
   }
@@ -140,7 +151,7 @@ static void short_reads_continue(void)
   init_sink(&s);
   s.max_reply = 5;
   uint8_t e[DP_EDID_LEN];
-  expect_eq(dp_read_edid(fake_xfer, &s, e), 0);
+  expect_eq(dp_read_edid(fake_xfer, &s, 0, e), 0);
   expect(memcmp(e, s.edid, DP_EDID_LEN) == 0);
   expect_eq(s.bad_header, 0);
 }
@@ -150,9 +161,23 @@ static void edid_read(void)
   struct sink s;
   init_sink(&s);
   uint8_t e[DP_EDID_LEN];
-  expect_eq(dp_read_edid(fake_xfer, &s, e), 0);
+  expect_eq(dp_read_edid(fake_xfer, &s, 0, e), 0);
   expect(memcmp(e, s.edid, DP_EDID_LEN) == 0);
   expect_eq(s.open, 0);
+  expect_eq(s.bad_header, 0);
+}
+
+static void edid_extension_blocks(void)
+{
+  struct sink s;
+  init_sink(&s);
+  for (int i = 0; i < EDID_MAX_BLOCKS * DP_EDID_LEN; i++)
+    s.edid[i] = (uint8_t)(i / DP_EDID_LEN * 50 + i % 97);
+  uint8_t e[DP_EDID_LEN];
+  for (int block = 0; block < EDID_MAX_BLOCKS; block++) {
+    expect_eq(dp_read_edid(fake_xfer, &s, block, e), 0);
+    expect(memcmp(e, s.edid + block * DP_EDID_LEN, DP_EDID_LEN) == 0);
+  }
   expect_eq(s.bad_header, 0);
 }
 
@@ -162,7 +187,7 @@ static void edid_nack_releases_bus(void)
   init_sink(&s);
   s.nack_i2c = 1;
   uint8_t e[DP_EDID_LEN];
-  expect(dp_read_edid(fake_xfer, &s, e) < 0);
+  expect(dp_read_edid(fake_xfer, &s, 0, e) < 0);
   expect_eq(s.stops, 1);
 }
 
@@ -173,6 +198,7 @@ int owos_main_dpaux(void)
   test("DEFER replies are retried then give up", defer_retried);
   test("short AUX replies continue until the EDID is complete", short_reads_continue);
   test("EDID over I2C-over-AUX ends the I2C transaction", edid_read);
+  test("EDID extension blocks, including past the E-DDC segment boundary", edid_extension_blocks);
   test("EDID NACK releases the I2C bus", edid_nack_releases_bus);
   return 0;
 }

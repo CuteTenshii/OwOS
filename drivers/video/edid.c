@@ -2,6 +2,7 @@
 
 #include "edid.h"
 #include "dpaux.h"
+#include "edidparse.h"
 #include "paging.h"
 #include "pci.h"
 #include "timer.h"
@@ -25,7 +26,6 @@
 #define GMBUS_SATOER (1u << 10) /* slave NAK / no monitor on pin   */
 
 #define EDID_ADDR 0x50 /* DDC EEPROM I2C slave address                      */
-#define EDID_LEN 128   /* one EDID block                                    */
 
 /* DDI AUX channels A-F: control register at 0x64010 + 0x100 * n, then five data dwords (Gen9+ layout). */
 #define AUX_CTL_BASE 0x64010
@@ -54,7 +54,8 @@ static const uint8_t gmbus_pins[] = {2, 4, 5, 6, 3, 1};
 static volatile uint8_t *mmio; /* mapped GPU BAR0                         */
 static uint32_t base;          /* current GMBUS block offset             */
 
-static bool probed; /* one-shot guard                         */
+static uint8_t edid[EDID_MAX_BLOCKS * EDID_BLOCK]; /* base block + extensions */
+static bool probed;                                /* one-shot guard                         */
 static int cached_hz, cached_w, cached_h, cached_dpi;
 static char cached_mfg[4];   /* 3-letter PNP manufacturer id           */
 static char cached_name[16]; /* monitor-name descriptor (0xFC), if any */
@@ -187,42 +188,22 @@ static bool edid_valid(const uint8_t *e)
   for (int i = 0; i < 8; i++)
     if (e[i] != hdr[i])
       return false;
-  uint8_t sum = 0;
-  for (int i = 0; i < EDID_LEN; i++)
-    sum += e[i];
-  return sum == 0;
+  return edid_checksum_ok(e);
 }
 
-/* Width/height/refresh from the preferred detailed timing descriptor at offset 54. */
-static int parse_preferred(const uint8_t *e)
+/* Width/height/refresh/DPI from the preferred timing across the base block and its extensions. */
+static int parse_preferred(const uint8_t *e, int nblocks)
 {
-  const uint8_t *d = e + 54;
-  uint32_t pclk = d[0] | ((uint32_t)d[1] << 8); /* 10 kHz units           */
-  if (pclk == 0) {
-    seterr("no preferred DTD");
+  struct edid_timing t;
+  if (edid_preferred_timing(e, nblocks, &t) != 0) {
+    seterr("no preferred timing");
     return -1;
   }
-  uint32_t hact = d[2] | (((uint32_t)d[4] >> 4) << 8);
-  uint32_t hbl = d[3] | (((uint32_t)d[4] & 0x0F) << 8);
-  uint32_t vact = d[5] | (((uint32_t)d[7] >> 4) << 8);
-  uint32_t vbl = d[6] | (((uint32_t)d[7] & 0x0F) << 8);
-
-  uint32_t htotal = hact + hbl;
-  uint32_t vtotal = vact + vbl;
-  if (htotal == 0 || vtotal == 0) {
-    seterr("bad DTD totals");
-    return -1;
-  }
-  uint32_t total = htotal * vtotal;
-  cached_hz = (int)((pclk * 10000u + total / 2) / total);
-  cached_w = (int)hact;
-  cached_h = (int)vact;
-
-  uint32_t mm = d[12] | (((uint32_t)d[14] >> 4) << 8);
-  if (mm == 0)
-    mm = (uint32_t)e[21] * 10; /* base block: max image width in cm */
-  if (mm)
-    cached_dpi = (int)((hact * 254u + mm * 5u) / (mm * 10u));
+  cached_hz = t.hz;
+  cached_w = t.w;
+  cached_h = t.h;
+  if (t.mm)
+    cached_dpi = (int)(((uint32_t)t.w * 254u + (uint32_t)t.mm * 5u) / ((uint32_t)t.mm * 10u));
   return 0;
 }
 
@@ -280,13 +261,12 @@ static void parse_identity(const uint8_t *e)
 /* Try each DDI AUX channel for a DisplayPort/eDP sink; the first one with a valid EDID wins. */
 static bool probe_dp_aux(void)
 {
-  uint8_t edid[EDID_LEN];
   for (uint32_t port = 0; port < AUX_PORTS; port++) {
     base = AUX_CTL_BASE + port * AUX_CTL_STRIDE;
     uint8_t caps[3];
     if (dp_read_dpcd(aux_xfer, 0, 0, caps, sizeof caps) != 0 || !dp_dpcd_valid(caps))
       continue;
-    if (dp_read_edid(aux_xfer, 0, edid) != 0) {
+    if (dp_read_edid(aux_xfer, 0, 0, edid) != 0) {
       seterr("DP AUX EDID read failed");
       continue;
     }
@@ -294,7 +274,13 @@ static bool probe_dp_aux(void)
       seterr("bad checksum");
       continue;
     }
-    if (parse_preferred(edid) == 0) {
+    int nblocks = 1 + (edid[126] < EDID_MAX_BLOCKS - 1 ? edid[126] : EDID_MAX_BLOCKS - 1);
+    for (int i = 1; i < nblocks; i++)
+      if (dp_read_edid(aux_xfer, 0, i, edid + i * EDID_BLOCK) != 0) {
+        nblocks = i;
+        break;
+      }
+    if (parse_preferred(edid, nblocks) == 0) {
       parse_identity(edid);
       return true;
     }
@@ -319,17 +305,22 @@ static void probe(void)
   paging_mark_uc(bar, 0x100000);
   mmio = (volatile uint8_t *)(uintptr_t)bar;
 
-  uint8_t edid[EDID_LEN];
   for (uint32_t bi = 0; bi < sizeof(gmbus_bases) / sizeof(gmbus_bases[0]); bi++) {
     base = gmbus_bases[bi];
     for (uint32_t pi = 0; pi < sizeof(gmbus_pins); pi++) {
-      if (gmbus_read(gmbus_pins[pi], EDID_ADDR, edid, EDID_LEN) != 0)
+      if (gmbus_read(gmbus_pins[pi], EDID_ADDR, edid, EDID_BLOCK) != 0)
         continue;
       if (!edid_valid(edid)) {
         seterr("bad checksum");
         continue;
       }
-      if (parse_preferred(edid) == 0) {
+      /* The sink's read pointer continues past block 0; only block 1 is reachable without the
+       * E-DDC segment pointer. A sink that wraps to block 0 has no extension. */
+      int nblocks = 1;
+      if (edid[126] > 0 && gmbus_read(gmbus_pins[pi], EDID_ADDR, edid + EDID_BLOCK, EDID_BLOCK) == 0 &&
+          !edid_valid(edid + EDID_BLOCK))
+        nblocks = 2;
+      if (parse_preferred(edid, nblocks) == 0) {
         parse_identity(edid);
         return;
       }

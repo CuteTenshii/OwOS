@@ -15,7 +15,8 @@ int dp_read_dpcd(dp_aux_fn xfer, void *ctx, uint32_t addr, uint8_t *buf, int len
 /* True if the DPCD receiver capabilities (revision, max lane count) describe a real sink. */
 int dp_dpcd_valid(const uint8_t caps[3]);
 
-/* Read the 128-byte base EDID from the sink's DDC at I2C 0x50, tunneled over AUX. 0 on success, < 0 on failure. */
-int dp_read_edid(dp_aux_fn xfer, void *ctx, uint8_t *edid);
+/* Read EDID block number block (128 bytes) from the sink's DDC at I2C 0x50, tunneled over AUX. Blocks 2 and up are
+ * reached through the E-DDC segment pointer. 0 on success, < 0 on failure. */
+int dp_read_edid(dp_aux_fn xfer, void *ctx, int block, uint8_t *edid);
 
 #endif /* OWOS_DPAUX_H */

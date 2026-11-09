@@ -10,6 +10,7 @@
 #define AUX_CHUNK 16 /* the sink must support at least 16 data bytes per request */
 #define AUX_RETRIES 7
 #define EDID_ADDR 0x50
+#define EDID_SEGMENT_ADDR 0x30
 
 #define REPLY_NATIVE(r) ((r) >> 6)
 #define REPLY_I2C(r) (((r) >> 4) & 3)
@@ -76,12 +77,17 @@ static void i2c_stop(dp_aux_fn xfer, void *ctx)
   request(xfer, ctx, AUX_I2C_WRITE, EDID_ADDR, 0, 0, rx, sizeof rx);
 }
 
-int dp_read_edid(dp_aux_fn xfer, void *ctx, uint8_t *edid)
+int dp_read_edid(dp_aux_fn xfer, void *ctx, int block, uint8_t *edid)
 {
   uint8_t rx[1 + AUX_CHUNK];
-  uint8_t zero = 0;
+  uint8_t segment = (uint8_t)(block / 2);
+  uint8_t offset = (uint8_t)((block % 2) * DP_EDID_LEN);
 
-  if (request(xfer, ctx, AUX_I2C_WRITE | AUX_I2C_MOT, EDID_ADDR, &zero, 1, rx, sizeof rx) < 0) {
+  if (segment && request(xfer, ctx, AUX_I2C_WRITE | AUX_I2C_MOT, EDID_SEGMENT_ADDR, &segment, 1, rx, sizeof rx) < 0) {
+    i2c_stop(xfer, ctx);
+    return -1;
+  }
+  if (request(xfer, ctx, AUX_I2C_WRITE | AUX_I2C_MOT, EDID_ADDR, &offset, 1, rx, sizeof rx) < 0) {
     i2c_stop(xfer, ctx);
     return -1;
   }
