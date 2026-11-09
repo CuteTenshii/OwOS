@@ -196,6 +196,11 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->outline_color = d->outline_color;
   if (d->z_index != CSS_Z_AUTO)
     out->z_index = d->z_index;
+  if (d->svg_decl[0]) {
+    int ol = (int)strlen(out->svg_decl), dl = (int)strlen(d->svg_decl);
+    if (ol + dl < CSS_SVG_DECL)
+      memcpy(out->svg_decl + ol, d->svg_decl, (unsigned)dl + 1);
+  }
   if (d->fill != -1)
     out->fill = d->fill;
   if (d->stroke != -1)
@@ -259,12 +264,7 @@ static void fold(struct css_style *out, const struct css_style *d)
   if (d->fam[0]) {
     int i = 0;
     for (; d->fam[i] && i < CSS_FAM_STACK - 1; i++)
-      if (d->svg_decl[0]) {
-        int ol = (int)strlen(out->svg_decl), dl = (int)strlen(d->svg_decl);
-        if (ol + dl < CSS_SVG_DECL)
-          memcpy(out->svg_decl + ol, d->svg_decl, (unsigned)dl + 1);
-      }
-    out->fam[i] = d->fam[i];
+      out->fam[i] = d->fam[i];
     out->fam[i] = '\0';
   }
 }
