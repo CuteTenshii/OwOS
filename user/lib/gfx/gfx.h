@@ -517,4 +517,50 @@ int gfx_sel_range(const struct gfx_sel *s, int *l0, int *c0, int *l1, int *c1);
 /* 1 if (line,col) lies within the selection (half-open at the end). */
 int gfx_sel_contains(const struct gfx_sel *s, int line, int col);
 
+/* --------------------------------------------------------------- file list + picker */
+/*
+ * filelist_*: the directory model behind the picker. filelist_read lists `dir` into a malloc'd array
+ * (free it), directories first and each group sorted by name without regard to case; files are kept only
+ * when they end in one of `exts` (NULL-terminated, e.g. ".mp3"; NULL = all) and dropped when dirs_only.
+ * Returns the entry count, or -1 when out of memory.
+ */
+#define FILELIST_MAX 1024
+
+struct filelist_entry {
+  char name[64];
+  int is_dir;
+  unsigned size;
+};
+
+int filelist_read(const char *dir, const char *const *exts, int dirs_only, struct filelist_entry **out);
+int filelist_match(const char *name, const char *const *exts);
+/* dir + "/" + name into out; an absolute `name` replaces dir */
+void filelist_join(char *out, int outsz, const char *dir, const char *name);
+/* Cut the last path component in place ("/a/b" -> "/a", "/a" -> "/"); 0 at the root */
+int filelist_parent(char *path);
+
+/*
+ * filepicker: a modal file/folder chooser, a transient child of window `parent` (or -1). Browses from
+ * o->start (a directory; "/" when NULL or not one). FILEPICK_OPEN returns an existing file, FILEPICK_SAVE
+ * any file name (o->name pre-fills it) and FILEPICK_FOLDER a directory. With o->exts set, a dropdown
+ * toggles between o->filter_label (only those extensions) and all files. Returns 1 with the absolute path
+ * in out, 0 if cancelled. With o->multiple (FILEPICK_OPEN only) files get a checkbox column (click it or press
+ * Space; Ctrl+A ticks all) and `out` receives the chosen absolute paths, each NUL-terminated and the list ended
+ * by an empty string; the return value is how many fit in outsz. It borrows gfx for its own window and restores the
+ * caller's surface.
+ */
+enum { FILEPICK_OPEN = 0, FILEPICK_SAVE, FILEPICK_FOLDER };
+
+struct filepicker_opts {
+  const char *title;
+  int mode;
+  const char *start;
+  const char *name;
+  int multiple;
+  const char *filter_label;
+  const char *const *exts;
+};
+
+int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz);
+
 #endif /* OWOS_GFX_H */

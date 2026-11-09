@@ -13,9 +13,7 @@ static int W = 560, H = 360; /* client size; grows/shrinks on resize */
 #define STATUS_H 18
 #define ROW_H 16
 #define COL_W 8
-#define FNAME_MAX 64
-
-enum { PROMPT_NONE, PROMPT_OPEN, PROMPT_SAVEAS };
+#define FNAME_MAX 256
 
 static char lines[MAXLINES][MAXCOLS];
 static int linelen[MAXLINES];
@@ -23,10 +21,6 @@ static int nlines = 1;
 static int curx, cury, top_line;
 static char fname[FNAME_MAX];
 static bool has_name, modified;
-
-static int prompt_mode;
-static char prompt_buf[FNAME_MAX];
-static int prompt_len;
 
 static char io_buf[MAXLINES * (MAXCOLS + 1)];
 static char clip_buf[8192]; /* scratch for Cut/Copy (text staged for clip_put) */
@@ -307,14 +301,28 @@ static void ed_save(const char *name)
 
 /* menu */
 
-static void start_prompt(int mode)
-{
-  prompt_mode = mode;
-  prompt_len = 0;
-  prompt_buf[0] = 0;
-}
-
 static int g_win = -1; /* the editor's window id, for parenting modal dialogs */
+
+/* Browse for a file to open or save; 1 if one was chosen */
+static int pick_file(int mode, char *path, int n)
+{
+  char dir[FNAME_MAX];
+  const char *base = "";
+  scopy(dir, "/", sizeof dir);
+  if (has_name) {
+    scopy(dir, fname, sizeof dir);
+    filelist_parent(dir);
+    base = fname;
+    for (const char *q = fname; *q; q++)
+      if (*q == '/')
+        base = q + 1;
+  }
+  struct filepicker_opts o = {.title = mode == FILEPICK_OPEN ? "Open" : "Save As",
+                              .mode = mode,
+                              .start = dir,
+                              .name = mode == FILEPICK_SAVE ? base : NULL};
+  return filepicker(g_win, &o, path, n);
+}
 
 /* 1 if it's safe to throw away the current buffer */
 static int confirm_discard(void)
@@ -326,6 +334,7 @@ static int confirm_discard(void)
 
 static void file_action(int item)
 {
+  char path[FNAME_MAX];
   switch (item) {
   case 0:
     if (!confirm_discard())
@@ -338,16 +347,18 @@ static void file_action(int item)
   case 1:
     if (!confirm_discard())
       break;
-    start_prompt(PROMPT_OPEN);
+    if (pick_file(FILEPICK_OPEN, path, sizeof path))
+      ed_load(path);
     break;
   case 2:
     if (has_name)
       ed_save(fname);
-    else
-      start_prompt(PROMPT_SAVEAS);
+    else if (pick_file(FILEPICK_SAVE, path, sizeof path))
+      ed_save(path);
     break;
   case 3:
-    start_prompt(PROMPT_SAVEAS);
+    if (pick_file(FILEPICK_SAVE, path, sizeof path))
+      ed_save(path);
     break;
   }
 }
@@ -451,19 +462,6 @@ static void menu_action(struct menu *leaf, int item)
     file_action(item);
 }
 
-static void confirm_prompt(void)
-{
-  prompt_buf[prompt_len] = 0;
-  if (prompt_len == 0) {
-    set_status("canceled");
-    return;
-  }
-  if (prompt_mode == PROMPT_OPEN)
-    ed_load(prompt_buf);
-  else
-    ed_save(prompt_buf);
-}
-
 /* input */
 
 /* Caret moves, shared by the plain and Shift navigation keys */
@@ -509,20 +507,6 @@ static void sync_edit_flags(void)
 
 static void key(int id, char c)
 {
-  if (prompt_mode) {
-    if (c == '\n') {
-      confirm_prompt();
-      prompt_mode = PROMPT_NONE;
-    } else if (c == 27) {
-      prompt_mode = PROMPT_NONE;
-      set_status("canceled");
-    } else if (c == '\b') {
-      if (prompt_len > 0)
-        prompt_buf[--prompt_len] = 0;
-    } else if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7F && prompt_len < (int)sizeof(prompt_buf) - 1)
-      prompt_buf[prompt_len++] = c;
-    return;
-  }
   /* Menu accelerators (Ctrl+N/O/S/A/X, and Ctrl+C as Copy): fire the item directly, like a click */
   sync_edit_flags();
   struct menu *leaf;
@@ -626,8 +610,6 @@ rescroll:;
 
 static void click(int mx, int my)
 {
-  if (prompt_mode)
-    return;
   if (my < MENU_H || filemenu.open || editmenu.open) { /* bar or open dropdown */
     struct menu *leaf;
     int item;
@@ -723,42 +705,34 @@ static void render(void)
     gfx_fill_rect(2 + cc * COL_W, ty0 + (cury - top_line) * ROW_H, 2, ROW_H, 0x66ddff);
   }
 
-  /* Status / prompt bar, rendered with the gfx status_bar widget */
+  /* Status bar, rendered with the gfx status_bar widget */
   int sy = H - STATUS_H;
   struct status_bar bar;
   char line[64];
   int p = 0;
   line[0] = 0;
-  if (prompt_mode) {
-    apnd(line, &p, sizeof line, prompt_mode == PROMPT_OPEN ? "Open: " : "Save as: ");
-    apnd(line, &p, sizeof line, prompt_buf);
-    apnd(line, &p, sizeof line, "_");
-    status_set(&bar, line);
-    status_draw(&bar, 0, sy, W, 0xffe08a, 0x161d28);
-  } else {
-    apnd(line, &p, sizeof line, has_name ? fname : "[no name]");
-    if (modified)
-      apnd(line, &p, sizeof line, " *");
-    apnd(line, &p, sizeof line, "  -  ");
-    apnd(line, &p, sizeof line, sbar.msg);
-    status_set(&bar, line);
-    status_draw(&bar, 0, sy, W, 0x9fb0c4, 0x161d28);
+  apnd(line, &p, sizeof line, has_name ? fname : "[no name]");
+  if (modified)
+    apnd(line, &p, sizeof line, " *");
+  apnd(line, &p, sizeof line, "  -  ");
+  apnd(line, &p, sizeof line, sbar.msg);
+  status_set(&bar, line);
+  status_draw(&bar, 0, sy, W, 0x9fb0c4, 0x161d28);
 
-    /* Cursor position + encoding, right-aligned over the bar the widget just drew */
-    char rstat[40];
-    int rp = 0;
-    rstat[0] = 0;
-    apnd(rstat, &rp, sizeof rstat, "Ln ");
-    apnd_uint(rstat, &rp, sizeof rstat, (unsigned)(cury + 1));
-    apnd(rstat, &rp, sizeof rstat, ", Col ");
-    apnd_uint(rstat, &rp, sizeof rstat, (unsigned)(curx + 1));
-    apnd(rstat, &rp, sizeof rstat, has_high ? "  UTF-8" : "  ASCII");
-    (void)rp;
-    int rx = W - 6 - gfx_ui_width(rstat);
-    if (rx < 6)
-      rx = 6;
-    gfx_ui_text(rx, sy + (GUI_BAR_H - UIFONT_H) / 2, rstat, 0x9fb0c4);
-  }
+  /* Cursor position + encoding, right-aligned over the bar the widget just drew */
+  char rstat[40];
+  int rp = 0;
+  rstat[0] = 0;
+  apnd(rstat, &rp, sizeof rstat, "Ln ");
+  apnd_uint(rstat, &rp, sizeof rstat, (unsigned)(cury + 1));
+  apnd(rstat, &rp, sizeof rstat, ", Col ");
+  apnd_uint(rstat, &rp, sizeof rstat, (unsigned)(curx + 1));
+  apnd(rstat, &rp, sizeof rstat, has_high ? "  UTF-8" : "  ASCII");
+  (void)rp;
+  int rx = W - 6 - gfx_ui_width(rstat);
+  if (rx < 6)
+    rx = 6;
+  gfx_ui_text(rx, sy + (GUI_BAR_H - UIFONT_H) / 2, rstat, 0x9fb0c4);
 
   /* The menu bar, drawn last so an open dropdown overlays the text */
   sync_edit_flags();

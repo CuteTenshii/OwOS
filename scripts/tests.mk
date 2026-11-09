@@ -57,7 +57,7 @@ EXTRA_resolve     := -Iuser/lib/mdns
 EXTRA_net6        := -Idrivers/net
 
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
-IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \
+IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o $(B)/impl/filelist.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams streamscore
 BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/storage.o $(B)/bind/impl/indexeddb.o $(B)/bind/impl/serviceworker.o $(B)/bind/impl/persist.o $(B)/bind/impl/clienthints.o \
@@ -109,6 +109,8 @@ $(B)/impl/tz.o: $(LIB)/tz/tz.c
 	$(call COMPILE,-DTZ_CONFIG_PATH='"$(RUN)/timezone"')
 $(B)/impl/desktop.o: $(LIB)/desktop/desktop.c
 	$(call COMPILE,-Dreaddir=desktop_test_readdir -include tests/desktop_fs.h)
+$(B)/impl/filelist.o: $(LIB)/gfx/filelist.c
+	$(call COMPILE,-Dreaddir=filelist_test_readdir -include tests/filelist_fs.h)
 $(B)/impl/browser_js_host.o: tests/browser_js_host.c
 	$(call COMPILE,)
 $(B)/impl/test_runner.o: tests/test_runner.c

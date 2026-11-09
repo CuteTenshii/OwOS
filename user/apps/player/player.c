@@ -31,12 +31,14 @@ static int g_ext;
 enum { ST_EMPTY = 0, ST_STOPPED, ST_PLAYING, ST_PAUSED };
 static int g_state = ST_EMPTY;
 static int g_win;
+static int g_quit;             /* leave the main loop: closed, or handed off to a new instance */
 static int g_W = CW, g_H = CH; /* actual window client size */
 static bool g_is_video;
 
 static int g_press = -1, g_press_ticks;
-static int g_bx[3], g_bw[3];
-static const char *g_blabel[3];
+#define NBTN 4 /* Open, Restart, Play/Pause, Stop */
+static int g_bx[NBTN], g_bw[NBTN];
+static const char *g_blabel[NBTN];
 
 static char g_fn[256];
 static struct media_tags g_tags;
@@ -516,20 +518,21 @@ static void session_sync(void)
 
 static void layout_buttons(void)
 {
-  g_blabel[0] = "Restart";
-  g_blabel[1] = (g_state == ST_PLAYING) ? "Pause" : "Play";
-  g_blabel[2] = "Stop";
+  g_blabel[0] = "Open";
+  g_blabel[1] = "Restart";
+  g_blabel[2] = (g_state == ST_PLAYING) ? "Pause" : "Play";
+  g_blabel[3] = "Stop";
   int total = 0;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NBTN; i++) {
     int w = gfx_ui_width(g_blabel[i]) + 28;
     if (w < 78)
       w = 78;
     g_bw[i] = w;
     total += w;
   }
-  total += 12 * 2;
+  total += 12 * (NBTN - 1);
   int x = (g_W - total) / 2;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NBTN; i++) {
     g_bx[i] = x;
     x += g_bw[i] + 12;
   }
@@ -559,7 +562,7 @@ static void draw_controls(int top, unsigned bg, unsigned pos_ms, unsigned dur_ms
   gfx_ui_text(g_W - BAR_X - gfx_ui_width(tt), time_y, tt, COL_DIM);
 
   layout_buttons();
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NBTN; i++) {
     int st = (g_press == i && g_press_ticks > 0) ? BTN_PRESSED : BTN_NORMAL;
     button_draw(g_bx[i], btn_y, g_bw[i], GUI_BTN_H, g_blabel[i], st);
   }
@@ -578,13 +581,13 @@ static void render_audio(void)
                    COL_TITLE, tw);
 
   if (!have) {
-    const char *h1 = "Open a song or video from the terminal:";
-    const char *h2 = "player <file.wav | file.mp4>";
+    const char *h1 = "Open a song or video, or run from the terminal:";
+    const char *h2 = "player <file.mp3 | file.mp4>";
     gfx_ui_text((g_W - gfx_ui_width(h1)) / 2, 78, h1, COL_DIM);
     gfx_ui_text((g_W - gfx_ui_width(h2)) / 2, 78 + UIFONT_H + 4, h2, COL_TITLE);
     layout_buttons();
-    for (int i = 0; i < 3; i++)
-      button_draw(g_bx[i], BTN_Y, g_bw[i], GUI_BTN_H, g_blabel[i], BTN_DISABLED);
+    for (int i = 0; i < NBTN; i++)
+      button_draw(g_bx[i], BTN_Y, g_bw[i], GUI_BTN_H, g_blabel[i], i == 0 ? BTN_NORMAL : BTN_DISABLED);
     return;
   }
   unsigned pos = media_position_ms(g_dec), dur = media_duration_ms(g_dec);
@@ -625,7 +628,7 @@ static void render_audio(void)
   }
   gfx_ui_text(g_W - BAR_X - gfx_ui_width(tt), TIME_Y, tt, COL_DIM);
   layout_buttons();
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NBTN; i++) {
     int st = (g_press == i && g_press_ticks > 0) ? BTN_PRESSED : BTN_NORMAL;
     button_draw(g_bx[i], BTN_Y, g_bw[i], GUI_BTN_H, g_blabel[i], st);
   }
@@ -640,9 +643,25 @@ static void render_video_controls(void)
 }
 
 /* input */
+static const char *const k_media_exts[] = {".wav", ".mp3", ".mp2", ".mp1", ".aac",  ".m4a",
+                                           ".mp4", ".mov", ".m4v", ".264", ".h264", NULL};
+
+/* Ask for a file and replace this window with a player on it (the window size follows the media);
+ * 1 if one was launched */
+static int open_file(void)
+{
+  char dir[sizeof g_fn] = "/", path[256];
+  if (g_state != ST_EMPTY) {
+    strlcpy(dir, g_fn, sizeof dir);
+    filelist_parent(dir);
+  }
+  struct filepicker_opts o = {.title = "Open Media", .start = dir, .filter_label = "Media files", .exts = k_media_exts};
+  return filepicker(g_win, &o, path, sizeof path) && spawn("/bin/player", path) >= 0;
+}
+
 static void on_click(int mx, int my)
 {
-  if (g_state == ST_EMPTY)
+  if (g_state == ST_EMPTY && !button_hit(g_bx[0], BTN_Y, g_bw[0], GUI_BTN_H, mx, my))
     return;
 
   if (!g_is_video && mx >= BAR_X && mx < g_W - BAR_X && my >= BAR_Y - 4 && my < BAR_Y + GUI_PROGRESS_H + 4) {
@@ -651,13 +670,15 @@ static void on_click(int mx, int my)
   }
 
   int btn_y = g_is_video ? g_H - GUI_BTN_H - 14 : BTN_Y;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NBTN; i++) {
     if (button_hit(g_bx[i], btn_y, g_bw[i], GUI_BTN_H, mx, my)) {
       g_press = i;
       g_press_ticks = 4;
       if (i == 0)
-        transport_restart();
+        g_quit = open_file();
       else if (i == 1)
+        transport_restart();
+      else if (i == 2)
         transport_toggle();
       else
         transport_stop();
@@ -699,6 +720,24 @@ static int video_step(void)
   return blitted;
 }
 
+static void player_quit(void)
+{
+  if (g_sid >= 0) {
+    mediactl_close(g_sid);
+    tray_remove("player");
+  }
+  if (audio_live)
+    audio_close();
+  if (g_asrc)
+    media_source_free(g_asrc); /* mixer frees its decoder */
+  if (g_dec)
+    media_close(g_dec);
+  if (g_vid)
+    media_video_close(g_vid);
+  free(g_rgb);
+  win_close(g_win);
+}
+
 int main(int argc, char **argv)
 {
   if (argc >= 2 && is_video_name(argv[1]) && load_video(argv[1]) == 0) {
@@ -733,30 +772,23 @@ int main(int argc, char **argv)
     session_sync();
     while (win_poll(g_win, &ev)) {
       if (ev.type == WEV_CLOSE) {
-        if (g_sid >= 0) {
-          mediactl_close(g_sid);
-          tray_remove("player");
-        }
-        if (audio_live)
-          audio_close();
-        if (g_asrc)
-          media_source_free(g_asrc); /* mixer frees its decoder */
-        if (g_dec)
-          media_close(g_dec);
-        if (g_vid)
-          media_video_close(g_vid);
-        free(g_rgb);
-        win_close(g_win);
-        return 0;
+        g_quit = 1;
+        break;
       }
       if (ev.type == WEV_MOUSE)
         on_click(ev.a, ev.b);
+      else if (ev.type == WEV_KEY && ev.a == KEY_OPEN)
+        g_quit = open_file();
       else if (ev.type == WEV_KEY && (ev.a == ' ' || ev.a == KEY_MEDIA_PLAY))
         transport_toggle();
       else if (ev.type == WEV_KEY && (ev.a == KEY_MEDIA_STOP || ev.a == KEY_MEDIA_NEXT))
         transport_stop(); /* no playlist: next ends the track */
       else if (ev.type == WEV_KEY && ev.a == KEY_MEDIA_PREV)
         transport_restart();
+    }
+    if (g_quit) {
+      player_quit();
+      return 0;
     }
 
     if (g_is_video) {

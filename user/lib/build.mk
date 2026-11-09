@@ -28,6 +28,7 @@ endif
 FONT    := user/lib/font/font.o user/lib/font/fontstore.o   # TrueType/OpenType(glyf) parser + AA glyph rasterizer
 ULIB    := user/lib/start.o user/lib/lib.o user/lib/opt.o user/lib/mutex.o
 GUILIB  := user/lib/gfx/gfx.o user/lib/gfx/selection.o user/lib/gfx/textfield.o user/lib/gfx/sidebar.o user/lib/gfx/select.o user/lib/gfx/tabbar.o user/lib/gfx/scrollview.o user/lib/gfx/toggle.o $(FONT)
+FILEPICK := user/lib/gfx/filelist.o user/lib/gfx/filepicker.o   # modal file/folder picker (uses gfx widgets)
 DIALOG  := user/lib/dialog/dialog.o   # reusable modal message-box + property-sheet dialogs (uses gfx)
 
 # Optional libs, linked only into the programs that use them (so a tiny program
