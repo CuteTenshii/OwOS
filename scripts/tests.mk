@@ -11,7 +11,7 @@ INCLUDES := -Iscripts -Itests -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/li
             -Iuser/lib/mp4 -Iuser/lib/jpeg -Iuser/lib/media -Iuser/lib/sqlite -Iuser/lib/gfx -Iuser/lib/png -Iuser/lib/webp -Iuser/lib/gif -Iuser/lib/imganim -Iuser/lib/canvas2d -Iuser/lib/font -Iuser/lib/tz -Iuser/lib/desktop \
             -Iuser/lib/ntp -Iuser/lib/netconn -Iuser/lib/notify -Iuser/lib/mediactl -Iuser/apps/browser \
             -Iuser/apps/browser/js -Iuser/lib/cast -Iuser/lib/clipboard -Iuser/lib/websocket \
-            -Iuser/lib/brotli -Iuser/lib/rar -Iuser/lib/mime -Iuser/lib/font -Iuser/lib/wasm -Iuser/lib/zstd
+            -Iuser/lib/brotli -Iuser/lib/rar -Iuser/lib/mime -Iuser/lib/font -Iuser/lib/wasm -Iuser/lib/zstd -Iuser/lib/archive
 CFLAGS_T := -std=gnu11 -O2 $(INCLUDES) -MMD -MP
 
 # Host compressors the btrfs test cross-checks against; each is used only when pkg-config finds it.
@@ -58,12 +58,14 @@ EXTRA_resolve     := -Iuser/lib/mdns
 EXTRA_net6        := -Idrivers/net
 # kernel/zstd.c (pulled in by the btrfs suite) also defines zstd_decompress; the user-space codec is renamed here
 ZSTD_RENAME       := -Dzstd_decompress=user_zstd_decompress
+ARCHIVE_HOST_FS   := -Dmkdir=archive_test_mkdir -Dstream_begin=archive_test_stream_begin \
+                     -Dstream_write=archive_test_stream_write -Dstream_end=archive_test_stream_end -include tests/archive_fs.h
 EXTRA_zstd        := $(ZSTD_RENAME)
 
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
 IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o $(B)/impl/filelist.o \
          $(B)/impl/browser_js_host.o $(B)/impl/test_runner.o $(B)/impl/brotli_dict.o \
-         $(B)/impl/zstd_dec.o
+         $(B)/impl/zstd_dec.o $(B)/impl/archive.o $(B)/impl/zip.o
 BINDINGS_PARTS := bindings events navigator cssom runner clipboard blob canvas canvaspath canvasimg xhr realtime timers webworker messagechannel webcomponents dialog forms url fetchapi navigation elementapi documentapi xpath namespace shadow streams streamscore filedata webaudio audioworklet
 BIND_IMPLS := $(BINDINGS_PARTS:%=$(B)/bind/impl/%.o) $(B)/bind/impl/jar.o $(B)/bind/impl/storage.o $(B)/bind/impl/indexeddb.o $(B)/bind/impl/serviceworker.o $(B)/bind/impl/persist.o $(B)/bind/impl/clienthints.o \
               $(B)/bind/impl/permissions.o $(B)/bind/impl/host.o $(B)/impl/test_runner.o
@@ -118,6 +120,10 @@ $(B)/impl/filelist.o: $(LIB)/gfx/filelist.c
 	$(call COMPILE,-Dreaddir=filelist_test_readdir -include tests/filelist_fs.h)
 $(B)/impl/zstd_dec.o: $(LIB)/zstd/zstd_dec.c
 	$(call COMPILE,$(ZSTD_RENAME))
+$(B)/impl/archive.o: $(LIB)/archive/archive.c
+	$(call COMPILE,$(ZSTD_RENAME) $(ARCHIVE_HOST_FS))
+$(B)/impl/zip.o: $(LIB)/archive/zip.c
+	$(call COMPILE,$(ARCHIVE_HOST_FS))
 $(B)/impl/browser_js_host.o: tests/browser_js_host.c
 	$(call COMPILE,)
 $(B)/impl/test_runner.o: tests/test_runner.c
