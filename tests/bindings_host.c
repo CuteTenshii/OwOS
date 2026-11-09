@@ -410,3 +410,11 @@ void mediasession_install(js_ctx *ctx, js_object *navigator, const char *page_ur
 }
 
 void mediasession_teardown(void) {}
+
+void gamepad_install(js_ctx *ctx, js_object *navigator)
+{
+  (void)ctx;
+  (void)navigator;
+}
+
+void gamepad_teardown(void) {}

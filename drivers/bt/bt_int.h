@@ -77,6 +77,7 @@ bool hci_acl_room(const struct bt_conn *c, int frags);
 int hci_acl_send(struct bt_conn *c, const uint8_t *data, int len);
 void hci_disconnect(struct bt_conn *c);
 bool hci_find_key(const uint8_t *addr, uint8_t key[16]);
+uint32_t hci_dev_cod(const uint8_t *addr); /* class of device from inquiry, 0 if unknown */
 
 /* ---- l2cap */
 #define L2CAP_CID_SIGNALING 1
@@ -116,5 +117,11 @@ void avdtp_conn_ready(struct bt_conn *c);
 void avdtp_conn_down(struct bt_conn *c);
 void avdtp_poll(uint32_t now_ms);
 int avdtp_status_text(char *buf, int max);
+
+/* ---- hid (BR/EDR input devices) */
+void bthid_conn_ready(struct bt_conn *c);
+void bthid_conn_down(struct bt_conn *c);
+void bthid_poll(uint32_t now_ms);
+int bthid_status_text(char *buf, int max);
 
 #endif

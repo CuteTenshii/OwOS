@@ -670,3 +670,55 @@ int hid_pack_leds(const struct hid_desc *desc, uint8_t leds, uint8_t *buf, size_
     *id_out = (uint8_t)id;
   return id;
 }
+
+static void set_scaled(uint8_t *buf, size_t len, const struct hid_field *f, uint32_t v, uint32_t max)
+{
+  int32_t hi = f->lmax > f->lmin ? f->lmax : (int32_t)((1u << f->size) - 1);
+  hid_set_bits(buf, len, f->bit_off, f->size, (uint32_t)(((uint64_t)v * (uint32_t)hi) / max));
+}
+
+int hid_pack_rumble(const struct hid_desc *desc, uint16_t strong, uint16_t weak, uint32_t ms, uint8_t *buf, size_t len,
+                    uint8_t *id_out)
+{
+  int id = -1;
+  size_t nmag = 0, seen = 0;
+  for (size_t i = 0; i < desc->nfields; i++) {
+    const struct hid_field *f = &desc->fields[i];
+    if (f->kind == HID_OUTPUT && f->usage == HID_USAGE(HID_PAGE_PID, 0x70) && (f->flags & HID_F_VAR)) {
+      if (id < 0) {
+        id = f->report_id;
+        memset(buf, 0, len);
+      }
+      if (f->report_id == id)
+        nmag++;
+    }
+  }
+  if (id < 0)
+    return -1;
+  for (size_t i = 0; i < desc->nfields; i++) {
+    const struct hid_field *f = &desc->fields[i];
+    if (f->kind != HID_OUTPUT || f->report_id != id || (f->usage >> 16) != HID_PAGE_PID || !(f->flags & HID_F_VAR))
+      continue;
+    switch (f->usage & 0xFFFF) {
+    case 0x97:
+      hid_set_bits(buf, len, f->bit_off, f->size, (1u << f->size) - 1);
+      break;
+    case 0x70:
+      seen++;
+      if (nmag == 1)
+        set_scaled(buf, len, f, strong > weak ? strong : weak, 65535);
+      else if (seen == nmag - 1)
+        set_scaled(buf, len, f, strong, 65535);
+      else if (seen == nmag)
+        set_scaled(buf, len, f, weak, 65535);
+      break;
+    case 0x50:
+      hid_set_bits(buf, len, f->bit_off, f->size,
+                   f->lmax > 0 && ms / 10 > (uint32_t)f->lmax ? (uint32_t)f->lmax : ms / 10);
+      break;
+    }
+  }
+  if (id_out)
+    *id_out = (uint8_t)id;
+  return id;
+}

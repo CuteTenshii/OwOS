@@ -6,6 +6,7 @@
 #include "classlist.h"
 #include "dom_query.h"
 #include "features/clienthints/clienthints.h"
+#include "features/gamepad/gamepad.h"
 #include "features/jar/jar.h"
 #include "features/mediasession/mediasession.h"
 #include "features/notification/notification.h"
@@ -2307,6 +2308,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
       js_def(nav, "userAgentData", js_obj_value(uad), P_ENUMERABLE);
     }
     mediasession_install(ctx, nav, page_url);
+    gamepad_install(ctx, nav);
     js_def(win, "navigator", js_obj_value(nav), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }

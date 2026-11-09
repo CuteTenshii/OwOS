@@ -22,6 +22,9 @@
 struct hid_dev {
   struct hid_dev *next;
   int slot, iface;
+  int (*send)(struct hid_dev *h, uint8_t id, const uint8_t *buf, int n); /* output report, ID byte first if id != 0 */
+  int (*bt_send)(void *ctx, uint8_t id, const uint8_t *buf, int n);
+  void *link;
   uint8_t subclass, protocol;
   bool boot;
   uint32_t roles;
@@ -43,6 +46,10 @@ struct hid_dev {
   uint8_t led_id;
   uint32_t led_len;
   uint32_t led_seq;
+  /* Dual-rumble output report. */
+  bool has_rumble;
+  uint8_t rumble_id;
+  uint32_t rumble_len;
 };
 
 static struct hid_dev *hids;
@@ -52,6 +59,8 @@ static uint32_t pad_buttons;
 static int32_t pad_axes[HID_PAD_AXES];
 static uint8_t pad_hat;
 static int pad_devices;
+static uint32_t rumble_until;
+static bool rumble_on;
 
 static uint32_t now_ms(void) { return timer_ticks() * (1000 / TIMER_HZ); }
 
@@ -181,23 +190,74 @@ static void hid_report(void *ctx, const uint8_t *data, int len)
     pad_report(d);
 }
 
-/* Push the Num/Caps state to a keyboard's LED output report over EP0. */
+static int usb_send(struct hid_dev *h, uint8_t id, const uint8_t *buf, int n)
+{
+  return usbh_control_out(h->slot, 0x21, HID_REQ_SET_REPORT, (uint16_t)((2u << 8) | id), (uint16_t)h->iface, buf, n);
+}
+
+static int bt_out(struct hid_dev *h, uint8_t id, const uint8_t *buf, int n) { return h->bt_send(h->link, id, buf, n); }
+
+/* Zeroed output report buffer for a payload of len bytes, with room for the ID byte when id != 0. */
+static uint8_t *report_buf(uint8_t id, uint32_t len, uint32_t *n, uint8_t **payload)
+{
+  *n = len + (id ? 1 : 0);
+  uint8_t *buf = kmalloc(*n);
+  if (!buf)
+    return 0;
+  memset(buf, 0, *n);
+  buf[0] = id;
+  *payload = buf + (id ? 1 : 0);
+  return buf;
+}
+
+/* Push the Num/Caps state to a keyboard's LED output report. */
 static void send_leds(struct hid_dev *h)
 {
-  uint32_t n = h->led_len + (h->led_id ? 1 : 0);
-  uint8_t *buf = kmalloc(n);
+  uint32_t n;
+  uint8_t *payload, *buf = report_buf(h->led_id, h->led_len, &n, &payload);
+  uint8_t id;
   if (!buf)
     return;
-  memset(buf, 0, n);
-  uint8_t id;
-  uint8_t *payload = buf + (h->led_id ? 1 : 0);
-  if (hid_pack_leds(&h->desc, keyboard_leds(), payload, h->led_len, &id) >= 0) {
-    if (h->led_id)
-      buf[0] = h->led_id;
-    usbh_control_out(h->slot, 0x21, HID_REQ_SET_REPORT, (uint16_t)((2u << 8) | h->led_id), (uint16_t)h->iface, buf,
-                     (int)n);
-  }
+  if (hid_pack_leds(&h->desc, keyboard_leds(), payload, h->led_len, &id) >= 0)
+    h->send(h, h->led_id, buf, (int)n);
   kfree(buf);
+}
+
+static void send_rumble(struct hid_dev *h, uint16_t strong, uint16_t weak, uint32_t ms)
+{
+  uint32_t n;
+  uint8_t *payload, *buf = report_buf(h->rumble_id, h->rumble_len, &n, &payload);
+  uint8_t id;
+  if (!buf)
+    return;
+  if (hid_pack_rumble(&h->desc, strong, weak, ms, payload, h->rumble_len, &id) >= 0)
+    h->send(h, h->rumble_id, buf, (int)n);
+  kfree(buf);
+}
+
+bool hid_gamepad_can_rumble(void)
+{
+  for (struct hid_dev *h = hids; h; h = h->next)
+    if (h->has_rumble && (h->roles & HID_ROLE_GAMEPAD))
+      return true;
+  return false;
+}
+
+int hid_gamepad_rumble(uint16_t strong, uint16_t weak, uint32_t ms)
+{
+  int n = 0;
+  if (ms > HID_RUMBLE_MAX_MS)
+    ms = HID_RUMBLE_MAX_MS;
+  if (!strong && !weak)
+    ms = 0;
+  for (struct hid_dev *h = hids; h; h = h->next)
+    if (h->has_rumble && (h->roles & HID_ROLE_GAMEPAD)) {
+      send_rumble(h, strong, weak, ms);
+      n++;
+    }
+  rumble_on = n && ms;
+  rumble_until = now_ms() + ms;
+  return n;
 }
 
 void hid_tick(void)
@@ -205,6 +265,8 @@ void hid_tick(void)
   uint16_t key;
   if (hid_tm_due(&typematic, now_ms(), &key))
     emit_key(key, true);
+  if (rumble_on && (int32_t)(now_ms() - rumble_until) >= 0)
+    hid_gamepad_rumble(0, 0, 0);
   uint32_t seq = keyboard_led_seq();
   for (struct hid_dev *h = hids; h; h = h->next) {
     if (h->has_led && h->led_seq != seq) {
@@ -256,6 +318,39 @@ static void print_roles(uint32_t roles)
     }
 }
 
+static void scan_outputs(struct hid_dev *h)
+{
+  for (size_t i = 0; i < h->desc.nfields; i++) {
+    const struct hid_field *f = &h->desc.fields[i];
+    uint32_t n = f->usage & 0xFFFF;
+    if (f->kind != HID_OUTPUT)
+      continue;
+    if (!h->has_led && (f->usage >> 16) == HID_PAGE_LED && n >= 1 && n <= 8) {
+      h->has_led = true;
+      h->led_id = f->report_id;
+      h->led_len = hid_report_bytes(&h->desc, HID_OUTPUT, f->report_id);
+    } else if (!h->has_rumble && f->usage == HID_USAGE(HID_PAGE_PID, 0x70)) {
+      h->has_rumble = true;
+      h->rumble_id = f->report_id;
+      h->rumble_len = hid_report_bytes(&h->desc, HID_OUTPUT, f->report_id);
+    }
+  }
+}
+
+/* Link a bound device into the list and announce it. */
+static void register_dev(struct hid_dev *h, const char *how)
+{
+  con_write("hid: ");
+  print_roles(h->roles);
+  con_printf(" %s (%s protocol)\n", how, h->boot ? "boot" : "report");
+  h->next = hids;
+  hids = h;
+  if (h->roles & HID_ROLE_GAMEPAD)
+    pad_devices++;
+  if (h->has_led)
+    h->led_seq = keyboard_led_seq() - 1;
+}
+
 /* Bind one interface: fetch and parse its report descriptor (boot descriptor as fallback), start its interrupt pipe. */
 static void bind_iface(struct usbdev *d, int iface, uint8_t subclass, uint8_t protocol, int rd_len, uint8_t ep,
                        uint16_t mps, uint8_t interval)
@@ -266,6 +361,7 @@ static void bind_iface(struct usbdev *d, int iface, uint8_t subclass, uint8_t pr
   memset(h, 0, sizeof *h);
   h->slot = d->slot;
   h->iface = iface;
+  h->send = usb_send;
   h->subclass = subclass;
   h->protocol = protocol;
 
@@ -299,31 +395,17 @@ static void bind_iface(struct usbdev *d, int iface, uint8_t subclass, uint8_t pr
     return;
   }
 
-  for (size_t i = 0; i < h->desc.nfields && !h->has_led; i++) {
-    const struct hid_field *f = &h->desc.fields[i];
-    uint32_t n = f->usage & 0xFFFF;
-    if (f->kind == HID_OUTPUT && (f->usage >> 16) == HID_PAGE_LED && n >= 1 && n <= 8) {
-      h->has_led = true;
-      h->led_id = f->report_id;
-      h->led_len = hid_report_bytes(&h->desc, HID_OUTPUT, f->report_id);
-    }
-  }
+  scan_outputs(h);
 
   usbh_control_nodata(d->slot, 0x21, HID_REQ_SET_IDLE, 0, (uint16_t)iface);
   if (!usbh_open_intr(d->slot, ep, mps, interval, hid_report, h)) {
     free_hid(h);
     return;
   }
-  con_write("hid: ");
-  print_roles(h->roles);
-  con_printf(" on slot %d if %d (%s protocol)\n", d->slot, iface, h->boot ? "boot" : "report");
-  h->next = hids;
-  hids = h;
+  char how[32];
+  ksnprintf(how, sizeof how, "on slot %d if %d", d->slot, iface);
+  register_dev(h, how);
   d->bound |= USBH_BOUND_HID;
-  if (h->roles & HID_ROLE_GAMEPAD)
-    pad_devices++;
-  if (h->has_led)
-    h->led_seq = keyboard_led_seq() - 1;
 }
 
 void hid_bind(struct usbdev *d)
@@ -366,32 +448,71 @@ void hid_bind(struct usbdev *d)
   }
 }
 
+static void drop_dev(struct hid_dev *h)
+{
+  hid_kbd_diff(h->mods, 0, h->keys, h->nkeys, 0, 0, key_event, h);
+  hid_kbd_diff(0, 0, h->cons_prev, h->ncons, 0, 0, key_event, h);
+  if (h->buttons) {
+    h->buttons = 0;
+    mouse_inject_rel(0, 0, 0, 0, (int)total_buttons());
+  }
+  if ((h->roles & HID_ROLE_GAMEPAD) && --pad_devices == 0) {
+    pad_buttons = 0;
+    pad_hat = 0;
+    for (int i = 0; i < HID_PAD_AXES; i++)
+      pad_axes[i] = 0;
+    pad_seq++;
+  }
+  free_hid(h);
+}
+
 void hid_unbind(int slot)
 {
   for (struct hid_dev **pp = &hids; *pp;) {
     struct hid_dev *h = *pp;
-    if (h->slot != slot) {
+    if (h->send != usb_send || h->slot != slot) {
       pp = &h->next;
       continue;
     }
     *pp = h->next;
-    hid_kbd_diff(h->mods, 0, h->keys, h->nkeys, 0, 0, key_event, h);
-    hid_kbd_diff(0, 0, h->cons_prev, h->ncons, 0, 0, key_event, h);
-    if (h->buttons) {
-      h->buttons = 0;
-      mouse_inject_rel(0, 0, 0, 0, (int)total_buttons());
-    }
-    if (h->roles & HID_ROLE_GAMEPAD) {
-      if (--pad_devices == 0) {
-        pad_buttons = 0;
-        pad_hat = 0;
-        for (int i = 0; i < HID_PAD_AXES; i++)
-          pad_axes[i] = 0;
-        pad_seq++;
-      }
-    }
-    free_hid(h);
+    drop_dev(h);
   }
+}
+
+struct hid_dev *hid_bt_add(const uint8_t *rd, int len, int (*send)(void *ctx, uint8_t id, const uint8_t *buf, int n),
+                           void *ctx)
+{
+  struct hid_dev *h = kmalloc(sizeof *h);
+  if (!h)
+    return 0;
+  memset(h, 0, sizeof *h);
+  h->link = ctx;
+  h->bt_send = send;
+  h->send = bt_out;
+  if (len <= 0 || hid_parse(rd, (size_t)len, &h->desc) != 0 || !(h->roles = hid_roles(&h->desc))) {
+    hid_desc_free(&h->desc);
+    kfree(h);
+    return 0;
+  }
+  if (!alloc_state(h)) {
+    free_hid(h);
+    return 0;
+  }
+  scan_outputs(h);
+  register_dev(h, "over bluetooth");
+  return h;
+}
+
+void hid_bt_report(struct hid_dev *h, const uint8_t *data, int len) { hid_report(h, data, len); }
+
+void hid_bt_remove(struct hid_dev *h)
+{
+  for (struct hid_dev **pp = &hids; *pp; pp = &(*pp)->next)
+    if (*pp == h) {
+      *pp = h->next;
+      drop_dev(h);
+      return;
+    }
 }
 
 int hid_gamepad_state(char *buf, int max)

@@ -1,4 +1,5 @@
 #include "features/canvas/canvas.h"
+#include "features/gamepad/gamepad.h"
 #include "features/mediasession/mediasession.h"
 #include "main_int.h"
 
@@ -339,6 +340,7 @@ void worker_fn(void)
     }
     canvas_flush();
     mediasession_tick(B->pg->doc_title, B->pg->cur_url);
+    gamepad_tick();
 
     /* Drive CSS animations/transitions */
     if (!B->loading && anim_active()) {

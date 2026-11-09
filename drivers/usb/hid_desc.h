@@ -117,6 +117,14 @@ void hid_decode(const struct hid_desc *desc, const uint8_t *data, size_t len, st
  * descriptor has no LED output. buf must be hid_report_bytes(OUTPUT, id) bytes (payload only). */
 int hid_pack_leds(const struct hid_desc *desc, uint8_t leds, uint8_t *buf, size_t len, uint8_t *id_out);
 
+/* Physical Interface Device page: the haptics output report of Xbox-style pads. */
+#define HID_PAGE_PID 0x0F
+
+/* Fill the dual-rumble output report (motor strengths 0..65535, duration in ms) into buf; returns the report ID or -1
+ * if the descriptor has no haptics output. buf must be hid_report_bytes(OUTPUT, id) bytes (payload only). */
+int hid_pack_rumble(const struct hid_desc *desc, uint16_t strong, uint16_t weak, uint32_t ms, uint8_t *buf, size_t len,
+                    uint8_t *id_out);
+
 /* Map [lo, hi] onto [0, bound], clamped; a degenerate range maps to 0. */
 static inline int32_t hid_scale_abs(int32_t v, int32_t lo, int32_t hi, int32_t bound)
 {

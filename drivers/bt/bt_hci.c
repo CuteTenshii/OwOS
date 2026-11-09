@@ -63,6 +63,8 @@
 #define LE_ADV_REPORT 0x02
 #define LE_ENH_CONN_COMPLETE 0x0A
 
+#define COD_MAJOR_PERIPHERAL 5
+
 #define CMDQ 16
 #define RXQ 16
 #define TXQ 32
@@ -409,6 +411,14 @@ bool hci_find_key(const uint8_t *addr, uint8_t key[16])
   return false;
 }
 
+uint32_t hci_dev_cod(const uint8_t *addr)
+{
+  for (int i = 0; i < BT_MAX_DEV; i++)
+    if (h.devs[i].used && !h.devs[i].le && !memcmp(h.devs[i].addr, addr, 6))
+      return h.devs[i].cod;
+  return 0;
+}
+
 static void key_store(const uint8_t *addr, const uint8_t *key)
 {
   int slot = -1;
@@ -446,6 +456,7 @@ static void conn_up(struct bt_conn *c)
 static void conn_down(struct bt_conn *c)
 {
   avdtp_conn_down(c);
+  bthid_conn_down(c);
   gatt_conn_down(c);
   l2cap_conn_down(c);
   c->used = false;
@@ -777,8 +788,12 @@ static void on_event(const uint8_t *p, int len)
       struct bt_conn *c = hci_conn_by_handle(bt_get16(q + 1));
       if (c && !q[0] && q[3] && !c->secure) {
         c->secure = true;
-        if (!c->le)
-          avdtp_conn_ready(c);
+        if (!c->le) {
+          if (((hci_dev_cod(c->addr) >> 8) & 0x1F) == COD_MAJOR_PERIPHERAL)
+            bthid_conn_ready(c);
+          else
+            avdtp_conn_ready(c);
+        }
       } else if (c && q[0]) {
         hci_disconnect(c);
       }
@@ -1045,6 +1060,7 @@ void bt_poll(uint32_t now)
     name_pump();
     gatt_poll();
     avdtp_poll(now);
+    bthid_poll(now);
     tx_pump();
   }
   cmd_pump();
@@ -1069,6 +1085,7 @@ int bt_status_text(char *buf, int max)
                        c->secure ? " encrypted" : "");
   }
   n += avdtp_status_text(buf + n, n < max ? max - n : 0);
+  n += bthid_status_text(buf + n, n < max ? max - n : 0);
   return n < max ? n : max;
 }
 
@@ -1080,8 +1097,13 @@ int bt_devices_text(char *buf, int max)
     char a[18];
     if (!d->used)
       continue;
+    uint32_t major = d->le ? 0 : (d->cod >> 8) & 0x1F, minor = (d->cod >> 2) & 0xF;
+    const char *kind = major == 4                      ? "audio "
+                       : major != COD_MAJOR_PERIPHERAL ? ""
+                       : minor == 1 || minor == 2      ? "gamepad "
+                                                       : "input ";
     n += bt_snprintf(buf + n, (uint32_t)(max - n), "%s %s %d %s%s\n", addr_str(d->addr, a), d->le ? "le" : "br",
-                     d->rssi, d->le || ((d->cod >> 8) & 0x1F) != 4 ? "" : "audio ", d->name);
+                     d->rssi, kind, d->name);
   }
   return n < max ? n : max;
 }

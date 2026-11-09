@@ -328,6 +328,8 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
         return S_FILE_RW;
       if (n == 4 && eq(seg[2], "js0") && eq(seg[3], "state") && gamepad_present())
         return S_FILE_RO;
+      if (n == 4 && eq(seg[2], "js0") && eq(seg[3], "rumble") && gamepad_present())
+        return S_FILE_RW;
       return S_NONE;
     }
     if (eq(seg[1], "net")) {
@@ -446,7 +448,11 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
         pc(b, '\n');
         return;
       }
-      if (eq(seg[2], "js0")) {
+      if (eq(seg[2], "js0") && eq(seg[3], "rumble")) {
+        ps(b, hid_gamepad_can_rumble() ? "1\n" : "0\n");
+        return;
+      }
+      if (eq(seg[2], "js0") && eq(seg[3], "state")) {
         char st[96];
         if (hid_gamepad_state(st, sizeof st) >= 0)
           ps(b, st);
@@ -727,6 +733,20 @@ static int apply(char seg[MAXSEG][SEGLEN], int n, const char *arg)
       return 0;
     }
   }
+  if (n == 4 && eq(seg[0], "class") && eq(seg[1], "input") && eq(seg[2], "js0") && eq(seg[3], "rumble")) {
+    uint32_t v[3] = {0, 0, 0};
+    const char *p = arg;
+    for (int i = 0; i < 3; i++) {
+      while (*p == ' ')
+        p++;
+      if (*p < '0' || *p > '9')
+        return -1;
+      for (; *p >= '0' && *p <= '9'; p++)
+        v[i] = v[i] > 0xFFFFFF ? v[i] : v[i] * 10 + (uint32_t)(*p - '0');
+    }
+    return hid_gamepad_rumble(v[0] > 65535 ? 65535 : (uint16_t)v[0], v[1] > 65535 ? 65535 : (uint16_t)v[1], v[2]) ? 0
+                                                                                                                  : -1;
+  }
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "bluetooth") && eq(seg[2], "hci0") && eq(seg[3], "control"))
     return bt_command(arg) == 0 ? 0 : -1;
   if (n == 4 && eq(seg[0], "class") && eq(seg[1], "sound") && eq(seg[2], "card0") && eq(seg[3], "output")) {
@@ -965,6 +985,13 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "input") && eq(seg[2], "kbd0")) {
     static const char *const k[] = {"layout"};
     hit = from_list(idx, name, max, k, 1);
+    if (hit && is_dir)
+      *is_dir = 0;
+    return hit;
+  }
+  if (n == 3 && eq(seg[0], "class") && eq(seg[1], "input") && eq(seg[2], "js0") && gamepad_present()) {
+    static const char *const k[] = {"state", "rumble"};
+    hit = from_list(idx, name, max, k, 2);
     if (hit && is_dir)
       *is_dir = 0;
     return hit;

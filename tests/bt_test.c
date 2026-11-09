@@ -3,6 +3,7 @@
 #define OWOS_SUITE_TEST
 #include "../drivers/bt/bt_int.h"
 #include "../drivers/bt/sbc.h"
+#include "../drivers/usb/hid.h"
 #include "test.h"
 #include <stdio.h>
 #include <string.h>
@@ -336,6 +337,8 @@ static uint16_t sig_scid, media_scid;
 #define SIG_REMOTE 0x0040
 #define MEDIA_REMOTE 0x0041
 
+static uint8_t peer_cod[3] = {0x04, 0x24, 0x00}; /* audio by default */
+
 static void secure_link(void)
 {
   expect_eq(bt_command("scan on"), 0);
@@ -343,8 +346,7 @@ static void secure_link(void)
   uint8_t r[1 + 14] = {1};
   memcpy(r + 1, peer, 6);
   r[7] = 1;
-  r[10] = 0x04;
-  r[11] = 0x24;
+  memcpy(r + 10, peer_cod, 3);
   evt(0x22, r, 1 + 14);
   evt(0x01, (uint8_t[]){0}, 1);
   tick(5);
@@ -749,6 +751,221 @@ static void l2cap_reassembly_and_garbage(void)
   stop();
 }
 
+/* The HID layer as the stack sees it. */
+static struct hid_dev {
+  int unused;
+} fake_hid;
+static uint8_t hid_desc_seen[1024];
+static int hid_desc_len, hid_adds, hid_removes, hid_reports, hid_last_len;
+static uint8_t hid_last_report[64];
+static int (*hid_send_fn)(void *ctx, uint8_t id, const uint8_t *buf, int n);
+static void *hid_send_ctx;
+
+struct hid_dev *hid_bt_add(const uint8_t *rd, int len, int (*send)(void *ctx, uint8_t id, const uint8_t *buf, int n),
+                           void *ctx)
+{
+  hid_adds++;
+  hid_desc_len = len;
+  memcpy(hid_desc_seen, rd, (size_t)len);
+  hid_send_fn = send;
+  hid_send_ctx = ctx;
+  return &fake_hid;
+}
+
+void hid_bt_report(struct hid_dev *h, const uint8_t *data, int len)
+{
+  expect(h == &fake_hid);
+  hid_reports++;
+  hid_last_len = len;
+  memcpy(hid_last_report, data, (size_t)len);
+}
+
+void hid_bt_remove(struct hid_dev *h)
+{
+  expect(h == &fake_hid);
+  hid_removes++;
+}
+
+static const uint8_t gamepad_cod[3] = {0x08, 0x25, 0x00};
+#define SDP_REMOTE 0x0050
+#define HID_CTL_REMOTE 0x0052
+#define HID_INTR_REMOTE 0x0053
+
+/* SDP sequence with a 16-bit length around body; returns the total size. */
+static int sdp_seq(uint8_t *out, const uint8_t *body, int len)
+{
+  memmove(out + 3, body, (size_t)len);
+  out[0] = 0x36;
+  out[1] = (uint8_t)(len >> 8);
+  out[2] = (uint8_t)len;
+  return len + 3;
+}
+
+/* Attribute lists of an SDP record whose HIDDescriptorList holds one report descriptor. */
+static int hid_attr_lists(uint8_t *out, const uint8_t *desc, int dlen)
+{
+  uint8_t b[1000];
+  int n = 0;
+  b[n++] = 0x08;
+  b[n++] = 0x22;
+  b[n++] = 0x26;
+  b[n++] = (uint8_t)(dlen >> 8);
+  b[n++] = (uint8_t)dlen;
+  memcpy(b + n, desc, (size_t)dlen);
+  n = sdp_seq(b, b, n + dlen);
+  n = sdp_seq(b, b, n);
+  memmove(b + 3, b, (size_t)n);
+  b[0] = 0x09;
+  b[1] = 0x02;
+  b[2] = 0x06;
+  n = sdp_seq(b, b, n + 3);
+  n = sdp_seq(out, b, n);
+  return n;
+}
+
+/* One ServiceSearchAttribute response carrying attribute-list bytes, with a continuation state. */
+static void sdp_rsp(uint16_t scid, uint16_t tid, const uint8_t *attrs, int alen, const uint8_t *cont, int clen)
+{
+  uint8_t b[700];
+  int plen = 2 + alen + 1 + clen;
+  b[0] = 0x07;
+  b[1] = (uint8_t)(tid >> 8);
+  b[2] = (uint8_t)tid;
+  b[3] = (uint8_t)(plen >> 8);
+  b[4] = (uint8_t)plen;
+  b[5] = (uint8_t)(alen >> 8);
+  b[6] = (uint8_t)alen;
+  memcpy(b + 7, attrs, (size_t)alen);
+  b[7 + alen] = (uint8_t)clen;
+  memcpy(b + 8 + alen, cont, (size_t)clen);
+  acl_in(HANDLE, scid, b, 8 + alen + clen, 1000);
+}
+
+static void hid_start_sdp(uint16_t *sdp_scid)
+{
+  start();
+  memcpy(peer_cod, gamepad_cod, 3);
+  secure_link();
+  open_channel(SDP_REMOTE, 0x0001, sdp_scid);
+  tick(5);
+}
+
+static void hid_pad_connects(void)
+{
+  uint8_t desc[300], attrs[1000];
+  for (int i = 0; i < 300; i++)
+    desc[i] = (uint8_t)(i % 4 == 0 ? 0x22 : i % 4 == 1 ? 0x35 : i);
+  int alen = hid_attr_lists(attrs, desc, 300);
+  uint16_t sdp_scid, ctl_scid, intr_scid;
+  struct l2 f;
+  hid_adds = hid_removes = hid_reports = 0;
+  hid_start_sdp(&sdp_scid);
+
+  expect(take_l2(&f));
+  expect_eq(f.cid, SDP_REMOTE);
+  expect_eq(f.d[0], 0x06);
+  expect(!memcmp(f.d + 5, (uint8_t[]){0x35, 0x03, 0x19, 0x11, 0x24}, 5));
+  expect(!memcmp(f.d + 12, (uint8_t[]){0x35, 0x03, 0x09, 0x02, 0x06}, 5));
+  expect_eq(f.d[17], 0);
+  uint16_t tid = (uint16_t)(f.d[1] << 8 | f.d[2]);
+
+  const uint8_t cont[2] = {0xAB, 0xCD};
+  sdp_rsp(sdp_scid, tid, attrs, 100, cont, 2);
+  tick(5);
+  expect(take_l2(&f));
+  expect_eq(f.d[0], 0x06);
+  expect_eq(f.d[17], 2);
+  expect(!memcmp(f.d + 18, cont, 2));
+  expect(status_have("hid sdp"));
+  sdp_rsp(sdp_scid, tid + 1, attrs + 100, alen - 100, NULL, 0);
+  tick(5);
+
+  expect_sig(&f, 1, 0x06); /* SDP channel is done with */
+  uint8_t dr[4];
+  memcpy(dr, f.d + 4, 4);
+  sig_in(HANDLE, 1, 0x07, f.d[1], dr, 4);
+  open_channel(HID_CTL_REMOTE, 0x0011, &ctl_scid);
+  tick(5);
+  expect(status_have("hid interrupt"));
+  expect_eq(hid_adds, 0);
+  open_channel(HID_INTR_REMOTE, 0x0013, &intr_scid);
+  tick(5);
+  expect_eq(hid_adds, 1);
+  expect_eq(hid_desc_len, 300);
+  expect(!memcmp(hid_desc_seen, desc, 300));
+  expect(status_have("hid up"));
+
+  const uint8_t input[] = {0xA1, 0x01, 0x80, 0x7F, 0x03};
+  acl_in(HANDLE, intr_scid, input, sizeof input, 1000);
+  tick(5);
+  expect_eq(hid_reports, 1);
+  expect_eq(hid_last_len, 4);
+  expect(!memcmp(hid_last_report, input + 1, 4));
+  const uint8_t not_input[] = {0xA3, 0x01, 0x02};
+  acl_in(HANDLE, intr_scid, not_input, sizeof not_input, 1000);
+  tick(5);
+  expect_eq(hid_reports, 1);
+
+  rd = nsent;
+  const uint8_t rumble[] = {0x03, 0x0F, 0x00, 0x00, 0x64, 0x32, 0x19};
+  expect(hid_send_fn != NULL);
+  if (!hid_send_fn)
+    return;
+  expect_eq(hid_send_fn(hid_send_ctx, 3, rumble, sizeof rumble), 0);
+  tick(5);
+  expect(take_l2(&f));
+  expect_eq(f.cid, HID_INTR_REMOTE);
+  expect_eq(f.len, 1 + (int)sizeof rumble);
+  expect_eq(f.d[0], 0xA2);
+  expect(!memcmp(f.d + 1, rumble, sizeof rumble));
+
+  uint8_t dc[4] = {0};
+  bt_put16(dc + 1, HANDLE);
+  dc[3] = 0x13;
+  evt(0x05, dc, 4);
+  tick(5);
+  expect_eq(hid_removes, 1);
+  expect(!status_have("hid"));
+  stop();
+}
+
+static void hid_sdp_without_descriptor_fails(void)
+{
+  uint16_t sdp_scid;
+  struct l2 f;
+  hid_adds = 0;
+  hid_start_sdp(&sdp_scid);
+  expect(take_l2(&f));
+  uint8_t empty[] = {0x35, 0x00};
+  sdp_rsp(sdp_scid, 1, empty, sizeof empty, NULL, 0);
+  tick(5);
+  expect(status_have("hid failed"));
+  expect_eq(hid_adds, 0);
+  stop();
+}
+
+static void hid_setup_times_out(void)
+{
+  uint16_t sdp_scid;
+  hid_start_sdp(&sdp_scid);
+  expect(status_have("hid sdp"));
+  tick(9000);
+  expect(status_have("hid failed"));
+  stop();
+}
+
+static void headset_still_gets_a2dp(void)
+{
+  memcpy(peer_cod, (uint8_t[]){0x04, 0x24, 0x00}, 3);
+  start();
+  secure_link();
+  struct l2 f;
+  expect_sig(&f, 1, 0x02);
+  expect_eq(bt_get16(f.d + 4), 0x19);
+  expect(!status_have("hid"));
+  stop();
+}
+
 int main(void)
 {
   test("bringup", bringup);
@@ -760,5 +977,9 @@ int main(void)
   test("gatt_discovers_and_reads", gatt_discovers_and_reads);
   test("acl_flow_control", acl_flow_control);
   test("l2cap_reassembly_and_garbage", l2cap_reassembly_and_garbage);
+  test("hid_pad_connects", hid_pad_connects);
+  test("hid_sdp_without_descriptor_fails", hid_sdp_without_descriptor_fails);
+  test("hid_setup_times_out", hid_setup_times_out);
+  test("headset_still_gets_a2dp", headset_still_gets_a2dp);
   return 0;
 }

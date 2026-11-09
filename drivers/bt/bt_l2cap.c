@@ -55,9 +55,9 @@ static struct l2cap_chan *chan_by_scid(const struct bt_conn *c, uint16_t scid)
 
 static void chan_release(struct l2cap_chan *ch)
 {
+  ch->open = false;
   if (ch->on_state)
     ch->on_state(ch);
-  ch->open = false;
   ch->used = false;
 }
 
