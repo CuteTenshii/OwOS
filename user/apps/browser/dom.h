@@ -46,6 +46,7 @@ struct dom_node {
   unsigned anc_bloom[4]; /* hashes of the ancestors' tag/id/classes (css/engine.c) */
   unsigned anc_bloom_seq;
   void *wrapper;           /* cached JS wrapper (browser/js/bindings.c); NULL until exposed to script */
+  void *tokenlist[2];      /* cached classList / relList objects (browser/js/bindings.c) */
   struct dom_node *shadow; /* element: its attached shadow root (detached tree, tag "#shadow-root") */
   struct dom_node *host;   /* shadow root: the element it is attached to */
   void *shadow_sheet;      /* shadow root: the rules of its <style> elements (css_sheet *) */

@@ -103,6 +103,7 @@ static void node_init(struct dom_node *n, enum dom_type type)
   n->anim_rec = 0;
   n->anc_bloom_seq = 0;
   n->wrapper = 0;
+  n->tokenlist[0] = n->tokenlist[1] = 0;
   n->shadow = n->host = 0;
   n->shadow_sheet = 0;
   n->shadow_sheet_key = 0;
