@@ -455,6 +455,29 @@ static void test_nested_workers(void)
   expect(check("Atomics.load(ctr,0)===after1"));
 }
 
+static void test_broadcast_channel(void)
+{
+  run_script(
+      "var pgot=[], wgot=null, ctl=new BroadcastChannel('ch'), other=new BroadcastChannel('other'), self2=new "
+      "BroadcastChannel('ch');\n"
+      "ctl.onmessage=function(e){ pgot.push(e.data); }; other.onmessage=function(){ pgot.push('wrong'); };\n"
+      "var src='var a=new BroadcastChannel(\"ch\"), b=new BroadcastChannel(\"ch\"), n=0; "
+      "a.onmessage=function(e){ postMessage({from:\"page\", v:e.data.v}); }; "
+      "b.onmessage=function(e){ postMessage({from:\"sibling\", v:e.data.v}); }; "
+      "onmessage=function(e){ if (e.data==\"go\") a.postMessage({v:\"fromworker\"}); }; postMessage(\"ready\");';\n"
+      "var w=new Worker(URL.createObjectURL(new Blob([src]))), wmsgs=[]; w.onmessage=function(e){ wmsgs.push(e.data); "
+      "};\n");
+  expect(wait_for("wmsgs.length>=1"));
+  run_script("var obj={v:'frompage'}; self2.postMessage(obj); obj.v='changed'; w.postMessage('go');\n");
+  expect(wait_for("wmsgs.length>=4 && pgot.length>=2"));
+  run_script("expect(pgot.length===2 && pgot[0].v==='frompage' && pgot[1].v==='fromworker', 'the page hears its own "
+             "other channel and a worker channel, other names stay quiet: '+JSON.stringify(pgot));\n"
+             "var got=wmsgs.slice(1).map(function(m){ return m.from+':'+m.v; }).sort().join();\n"
+             "expect(got==='page:frompage,sibling:frompage,sibling:fromworker', 'workers hear the page and each other, "
+             "not themselves: '+got);\n"
+             "expect(got.indexOf('changed')<0, 'a message is copied when it is posted');\n");
+}
+
 static void test_worker_url_edges(void)
 {
   run_script("var ue=null, uw=new Worker('data:text/javascript,var r=[]; function U(a,b){ try { return new "
@@ -675,6 +698,7 @@ int main(void)
   worker_test("MessageChannel and MessagePort", test_message_channel);
   worker_test("MessageEvent.ports", test_event_ports);
   worker_test("nested workers", test_nested_workers);
+  worker_test("BroadcastChannel across the page and workers", test_broadcast_channel);
   worker_test("ErrorEvent and MessageEvent", test_event_interfaces);
   worker_test("script and construction errors", test_errors);
 

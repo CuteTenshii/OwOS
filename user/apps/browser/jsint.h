@@ -112,6 +112,9 @@ int sw_intercept_fetch(js_ctx *ctx, const char *url, const char *method, js_valu
 void js_worker_setup(js_ctx *ctx, js_object *win);
 void js_worker_teardown(void);
 void js_port_enqueue(js_value port, js_value data, js_value ports); /* async message delivery to a MessagePort */
+struct wthread;
+void js_bc_dispatch(const char *name, js_clone *c, js_object *sender,
+                    struct wthread *from); /* BroadcastChannel fan-out */
 int js_local_clone(js_ctx *ctx, js_value v, js_value transfer, js_value *data,
                    js_value *ports); /* a clone inside this context */
 void js_msgchannel_setup(js_ctx *ctx, js_object *win);

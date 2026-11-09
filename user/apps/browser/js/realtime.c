@@ -345,59 +345,19 @@ js_value make_message_event(js_value data, js_value ports)
   return js_obj_value(e);
 }
 
-/* Deliver a fresh message event to one receiving channel */
-static void bc_deliver(js_object *w, js_value data)
-{
-  js_value ev;
-  gc_push_scope();
-  gc_keep(w);
-  if (data.type == JV_OBJ)
-    gc_keep(data.u.obj);
-  ev = make_message_event(data, js_undef());
-  if (ev.type == JV_OBJ) {
-    gc_keep(ev.u.obj);
-    js_set(g_ctx, ev, "target", js_obj_value(w));
-    js_set(g_ctx, ev, "currentTarget", js_obj_value(w));
-    ev_fire_on(w, ev, 0);
-  }
-  gc_pop_scope();
-}
-
-/* postMessage(msg): fan out to every other open same-named channel */
+/* postMessage(msg): a clone for every other open same-named channel, in this page and in its workers */
 js_value bc_post_m(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  js_value data = A(0), namev;
-  const char *name;
-  unsigned i, n;
-  (void)argc;
-  if (t.type != JV_OBJ || !g_bchannels)
-    return js_undef();
-  if (js_to_boolean(js_get(ctx, t, "@closed")))
+  js_value namev;
+  js_clone *c;
+  if (t.type != JV_OBJ || !g_bchannels || js_to_boolean(js_get(ctx, t, "@closed")))
     return js_undef(); /* no-op after close */
+  c = js_clone_write(ctx, A(0), js_undef());
+  if (!c)
+    return js_undef();
   namev = js_get(ctx, t, "name");
-  name = namev.type == JV_STR ? namev.u.str->data : "";
-  gc_push_scope();
-  gc_keep(t.u.obj);
-  if (data.type == JV_OBJ)
-    gc_keep(data.u.obj);
-  n = js_array_len(g_bchannels);
-  for (i = 0; i < n; i++) {
-    js_value cv = js_get_index(ctx, js_obj_value(g_bchannels), i);
-    js_value wn;
-    js_object *w;
-    if (cv.type != JV_OBJ)
-      continue;
-    w = cv.u.obj;
-    if (w == t.u.obj)
-      continue; /* never self */
-    if (js_to_boolean(js_get(ctx, cv, "@closed")))
-      continue;
-    wn = js_get(ctx, cv, "name");
-    if (!(wn.type == JV_STR && streq(wn.u.str->data, name)))
-      continue;
-    bc_deliver(w, data);
-  }
-  gc_pop_scope();
+  js_bc_dispatch(namev.type == JV_STR ? namev.u.str->data : "", c, t.u.obj, 0);
+  js_clone_free(c);
   return js_undef();
 }
 

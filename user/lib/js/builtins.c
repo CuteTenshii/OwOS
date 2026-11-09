@@ -9727,6 +9727,36 @@ js_clone *js_clone_write(js_ctx *ctx, js_value v, js_value transfer)
   return w.c;
 }
 
+/* Another copy of a message that carries only bytes and SharedArrayBuffer stores (no transferred buffers, no
+ * wasm objects), so several threads can each read and free their own */
+js_clone *js_clone_dup(const js_clone *c)
+{
+  js_clone *d;
+  int i;
+  if (!c || c->nrefs || c->nmoved)
+    return NULL;
+  d = (js_clone *)calloc(1, sizeof *d);
+  if (!d)
+    return NULL;
+  d->buf = (unsigned char *)malloc((unsigned)(c->len ? c->len : 1));
+  d->sabs = (clone_sab *)malloc((unsigned)(c->nsabs ? c->nsabs : 1) * sizeof *d->sabs);
+  if (!d->buf || !d->sabs) {
+    free(d->buf);
+    free(d->sabs);
+    free(d);
+    return NULL;
+  }
+  memcpy(d->buf, c->buf, (unsigned)c->len);
+  d->len = d->cap = c->len;
+  for (i = 0; i < c->nsabs; i++) {
+    d->sabs[i] = c->sabs[i];
+    js_sab_retain(d->sabs[i].data);
+  }
+  d->nsabs = c->nsabs;
+  d->nextra = c->nextra;
+  return d;
+}
+
 void js_clone_free(js_clone *c)
 {
   int i;

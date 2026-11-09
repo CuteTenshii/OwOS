@@ -425,6 +425,45 @@ JS(
   };
   hide(g, "Worker", Worker);
 
+  /* ---- BroadcastChannel: same-named channels in this worker, the page and the other workers ---- */
+  var channels = [];
+  function BroadcastChannel(name) {
+    if (arguments.length === 0) { throw typeError("Failed to construct BroadcastChannel: 1 argument required, but only 0 present."); }
+    EventTarget.call(this);
+    def(this, "name", { value: String(name), enumerable: true });
+    this.onmessage = null;
+    this.onmessageerror = null;
+    hide(this, "@closed", false);
+    channels.push(this);
+  }
+  BroadcastChannel.prototype = Object.create(EventTarget.prototype);
+  hide(BroadcastChannel.prototype, "constructor", BroadcastChannel);
+  function bcDeliver(ch, data) {
+    if (!ch["@closed"]) { ch.dispatchEvent(new g.MessageEvent("message", { data: data, target: ch })); }
+  }
+  method(BroadcastChannel.prototype, "postMessage", function (data) {
+    var self = this;
+    if (this["@closed"]) { return; }
+    N.bcPost(this.name, data);
+    channels.slice().forEach(function (ch) {
+      if (ch !== self && ch.name === self.name) {
+        var copy = N.cloneLocal(data).data;
+        g.setTimeout(function () { bcDeliver(ch, copy); }, 0);
+      }
+    });
+  });
+  method(BroadcastChannel.prototype, "close", function () {
+    var i = channels.indexOf(this);
+    this["@closed"] = true;
+    if (i >= 0) { channels.splice(i, 1); }
+  });
+  N.onbc = function (name, data) {
+    channels.slice().forEach(function (ch) {
+      if (ch.name === name) { bcDeliver(ch, N.cloneLocal(data).data); }
+    });
+  };
+  hide(g, "BroadcastChannel", BroadcastChannel);
+
   /* ---- MessageChannel: ports in this worker only ---- */
   function MessagePort() { throw typeError("Illegal constructor"); }
   MessagePort.prototype = Object.create(EventTarget.prototype);

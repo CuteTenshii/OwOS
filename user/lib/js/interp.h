@@ -169,6 +169,8 @@ typedef struct js_clone js_clone;
 js_clone *js_clone_write(js_ctx *ctx, js_value v, js_value transfer);
 js_value js_clone_read(js_ctx *ctx, const js_clone *c);
 void js_clone_free(js_clone *c);
+js_clone *
+js_clone_dup(const js_clone *c); /* a second copy, NULL when the message holds transferred buffers or wasm objects */
 
 /* A fresh ArrayBuffer holding a copy of `data` (zeroed when NULL) */
 js_value js_new_arraybuffer(js_ctx *ctx, const void *data, int byte_length);

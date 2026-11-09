@@ -42,7 +42,8 @@ enum {
   WM_CHILD_POST,
   WM_CHILD_TERM,
   WM_CHILD_DATA,
-  WM_CHILD_ERROR
+  WM_CHILD_ERROR,
+  WM_BCAST /* a BroadcastChannel message (text = channel name), in either direction */
 };
 
 struct wmsg {
@@ -1161,6 +1162,23 @@ static bool wt_pump_ws(js_ctx *ctx)
 }
 
 /* A message for a port that lives here arrives from the page */
+/* A BroadcastChannel message from the page */
+static void wt_dispatch_bc(js_ctx *ctx, struct wmsg *m)
+{
+  js_value args[2];
+  gc_push_scope();
+  args[0] = js_mk_cstring(ctx, m->text);
+  gc_keep(args[0].u.str);
+  args[1] = js_clone_read(ctx, m->clone);
+  if (args[1].type == JV_OBJ)
+    gc_keep(args[1].u.obj);
+  if (ctx->has_exc)
+    wt_report(ctx);
+  else
+    wt_hook(ctx, "onbc", args, 2);
+  gc_pop_scope();
+}
+
 /* A message or an error from a worker this one started */
 static void wt_dispatch_child(js_ctx *ctx, struct wmsg *m)
 {
@@ -1255,6 +1273,16 @@ static js_value wt_n_port_post(js_ctx *ctx, js_value t, js_value *args, int argc
   (void)t;
   if (c)
     wmsg_post(cur_wt, &cur_wt->out, WM_PORT, (int)js_to_number(ctx, A(0)), c, 0);
+  return js_undef();
+}
+
+/* N.bcPost(name, data): to the page, which hands it to the other channels of that name */
+static js_value wt_n_bc_post(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_clone *c = js_clone_write(ctx, A(1), js_undef());
+  (void)t;
+  if (c)
+    wmsg_post(cur_wt, &cur_wt->out, WM_BCAST, 0, c, arg_str(ctx, A(0)));
   return js_undef();
 }
 
@@ -1387,6 +1415,7 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "portPost", wt_n_port_post, 3);
   js_def_native(ctx, n, "portClose", wt_n_port_close, 1);
   js_def_native(ctx, n, "cloneLocal", wt_n_clone_local, 2);
+  js_def_native(ctx, n, "bcPost", wt_n_bc_post, 2);
   js_def_native(ctx, n, "spawn", wt_n_spawn, 3);
   js_def_native(ctx, n, "childPost", wt_n_child_post, 3);
   js_def_native(ctx, n, "childTerminate", wt_n_child_terminate, 1);
@@ -1529,6 +1558,9 @@ static void wt_loop(js_ctx *ctx, struct wthread *wt)
       else if (m->kind == WM_PORT_CLOSE) {
         js_value id = js_number(m->level);
         wt_hook(ctx, "onportclose", &id, 1);
+      } else if (m->kind == WM_BCAST) {
+        if (m->clone && m->text && parts_loaded > PART_NET)
+          wt_dispatch_bc(ctx, m);
       } else if (m->kind == WM_CHILD_DATA || m->kind == WM_CHILD_ERROR)
         wt_dispatch_child(ctx, m);
       else if (m->clone)
@@ -2000,6 +2032,39 @@ static struct wthread *worker_of(js_ctx *ctx, js_value w)
   return 0;
 }
 
+/* A BroadcastChannel message to every channel of that name except the sender's own: the page's channels (each gets
+ * its own clone, delivered later like any message) and every worker's. `sender` is the posting page channel and
+ * `from` the posting worker, if any. */
+void js_bc_dispatch(const char *name, js_clone *c, js_object *sender, struct wthread *from)
+{
+  int i;
+  unsigned k, n = g_bchannels ? js_array_len(g_bchannels) : 0;
+  for (k = 0; k < n; k++) {
+    js_value cv = js_get_index(g_ctx, js_obj_value(g_bchannels), k), nm, data;
+    if (cv.type != JV_OBJ || cv.u.obj == sender || js_to_boolean(js_get(g_ctx, cv, "@closed")))
+      continue;
+    nm = js_get(g_ctx, cv, "name");
+    if (nm.type != JV_STR || !streq(nm.u.str->data, name))
+      continue;
+    gc_push_scope();
+    gc_keep(cv.u.obj);
+    ports_clear(g_ctx);
+    data = js_clone_read(g_ctx, c);
+    if (g_ctx->has_exc) {
+      g_ctx->has_exc = 0;
+      g_ctx->exc_root = 0;
+    } else {
+      if (data.type == JV_OBJ)
+        gc_keep(data.u.obj);
+      js_port_enqueue(cv, data, ports_take(g_ctx));
+    }
+    gc_pop_scope();
+  }
+  for (i = 0; i < g_nworkers; i++)
+    if (g_workers[i] != from && !__atomic_load_n(&g_workers[i]->irq.stop, __ATOMIC_ACQUIRE))
+      wmsg_post(g_workers[i], &g_workers[i]->in, WM_BCAST, 0, js_clone_dup(c), name);
+}
+
 /* The worker `parent` started with this id, or NULL */
 static struct wthread *child_of(struct wthread *parent, int id)
 {
@@ -2229,7 +2294,10 @@ int js_workers_pump(void)
       wthread_stop(wt); /* a worker does not outlive the one that started it */
     for (m = wq_take_all(wt, &wt->out); m; m = next) {
       next = m->next;
-      if (m->kind == WM_CHILD_POST || m->kind == WM_CHILD_TERM) {
+      if (m->kind == WM_BCAST) {
+        if (m->clone && m->text)
+          js_bc_dispatch(m->text, m->clone, 0, wt);
+      } else if (m->kind == WM_CHILD_POST || m->kind == WM_CHILD_TERM) {
         struct wthread *child = child_of(wt, m->level);
         if (child && m->kind == WM_CHILD_TERM)
           wthread_stop(child);
