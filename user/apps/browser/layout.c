@@ -175,6 +175,7 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
   b->mr_auto = (unsigned char)(cs->margin[1] == -2);
   b->vcenter = (unsigned char)(cs->pos == CSS_POS_FIXED && cs->top < 0 && cs->bottom < 0 && cs->margin[0] == -2 &&
                                cs->margin[2] == -2);
+  b->border_color = cs->border_color >= 0 ? (unsigned)cs->border_color : BG_NONE;
   short border_w[4];
   for (int i = 0; i < 4; i++) {
     b->border_style[i] = cs->border_style[i];
@@ -183,7 +184,6 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
   }
   b->border = edge4(border_w);
   b->padding = edge4(cs->padding);
-  b->border_color = cs->border_color >= 0 ? (unsigned)cs->border_color : BG_NONE;
   b->bg = cs->bg >= 0 ? (unsigned)cs->bg : BG_NONE;
   b->bgi = cs->bgi;
   b->border_box = (unsigned char)(cs->box_sizing == 1);
