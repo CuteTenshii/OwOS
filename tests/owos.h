@@ -1,4 +1,4 @@
-/* owos.h — host test shim (scripts/). NOT the real kernel/user owos.h.
+/* owos.h: host test shim (tests/), NOT the real kernel/user owos.h.
  *
  * The real user/lib/owos.h is a freestanding libc for the -m32 guest and can't
  * compile on the host. httpcache.c and headers.c pull only a handful of decls

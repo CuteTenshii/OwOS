@@ -9,7 +9,7 @@
  *     is implemented here.
  *   - The Vorbis I decoder (Xiph "Vorbis I specification"): codebooks, floor 1,
  *     residue 0/1/2, channel coupling and an FFT-based IMDCT, turning audio
- *     packets into interleaved int16. Output matches libvorbis (scripts/ogg_gen.sh).
+ *     packets into interleaved int16. Output matches libvorbis (tests/ogg_gen.sh).
  *
  * All DSP is float/double over x87 (safe under the user-space -mno-sse build).
  * A malformed or hostile stream can only fault this process, never the kernel.

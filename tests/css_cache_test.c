@@ -1,7 +1,7 @@
 /* Host unit test for the CSS engine's memoised and unbounded paths: var() cache, ancestor bloom,
  * selector/media/keyframe limits, style invalidation, anim store.
  *
- * Build + run: scripts/run-tests.sh (or `make test`). */
+ * Build + run: tests/run-tests.sh (or `make test`). */
 #include <stdarg.h>
 #include <stdio.h>
 #define OWOS_SUITE_TEST

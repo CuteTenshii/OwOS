@@ -5,7 +5,7 @@
  * module through every operator, comparing a hash of the outputs with V8's. A collection is forced around each check so
  * a missing GC root shows up as a wrong answer or a crash.
  *
- *   scripts/run-tests.sh wasm
+ *   tests/run-tests.sh wasm
  */
 #include <pthread.h>
 #include <stdio.h>

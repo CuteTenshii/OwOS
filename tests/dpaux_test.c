@@ -1,5 +1,5 @@
 /* dpaux_test.c: DisplayPort AUX protocol (drivers/video/dpaux.c) against a fake sink serving DPCD and an EDID over
- * I2C-over-AUX, including DEFER replies, short reads and NACKs. Run through scripts/run-tests.sh dpaux. */
+ * I2C-over-AUX, including DEFER replies, short reads and NACKs. Run through tests/run-tests.sh dpaux. */
 #define OWOS_SUITE_TEST
 #include "../drivers/video/dpaux.h"
 #include "../drivers/video/edidparse.h"

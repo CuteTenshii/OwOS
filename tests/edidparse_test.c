@@ -1,5 +1,5 @@
 /* edidparse_test.c: preferred-timing extraction from EDID base, CTA-861 and DisplayID 1.x blocks
- * (drivers/video/edidparse.c). Run through scripts/run-tests.sh edidparse. */
+ * (drivers/video/edidparse.c). Run through tests/run-tests.sh edidparse. */
 #define OWOS_SUITE_TEST
 #include "../drivers/video/edidparse.h"
 #include "test.h"

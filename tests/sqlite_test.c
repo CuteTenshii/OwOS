@@ -6,7 +6,7 @@
  * also checks save/open is a fixpoint (a reloaded db re-saves identically) and,
  * if a host `sqlite3` binary is present, that the emitted file opens there.
  *
- *   cc -std=c11 -Iscripts -Iuser/lib/sqlite \
+ *   cc -std=c11 -Itests -Iuser/lib/sqlite \
  *      tests/sqlite_test.c user/lib/sqlite/sqlite.c \
  *      -o /tmp/sqlite_test && /tmp/sqlite_test
  */

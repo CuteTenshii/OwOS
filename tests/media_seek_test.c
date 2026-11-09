@@ -7,8 +7,8 @@
  * check is that seeks land cleanly, and the reported position is compared with
  * where the audio really is.
  *
- * Build + run (scripts/aac_seek_gen.sh generates the vectors):
- *   cc -std=gnu11 -Iscripts ... tests/media_seek_test.c -o /tmp/media_seek_test
+ * Build + run (tests/aac_seek_gen.sh generates the vectors):
+ *   cc -std=gnu11 -Itests ... tests/media_seek_test.c -o /tmp/media_seek_test
  *   /tmp/media_seek_test in.{aac,m4a} ref.s16 max-drift-frames
  */
 #include "media.h"

@@ -6,8 +6,8 @@
  * streams align frame-for-frame with no relative delay; a high PSNR confirms the
  * whole pipeline (Huffman, dequant, stereo tools, TNS, IMDCT filterbank).
  *
- * Build + run (see scripts/aac_gen.sh which generates the vectors):
- *   cc -std=c11 -Iscripts -Iuser/lib/math -Iuser/lib/aac \
+ * Build + run (see tests/aac_gen.sh which generates the vectors):
+ *   cc -std=c11 -Itests -Iuser/lib/math -Iuser/lib/aac \
  *      tests/aac_test.c user/lib/aac/aac.c -lm -o /tmp/aac_test
  *   /tmp/aac_test in.aac ref.s16
  */

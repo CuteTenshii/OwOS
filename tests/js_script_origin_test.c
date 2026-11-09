@@ -7,7 +7,7 @@
  * bottoms out at its script even with zero function frames — and each async hop is
  * labelled with the script that scheduled it.
  *
- *   cc -std=gnu11 -Iscripts -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc \
+ *   cc -std=gnu11 -Itests -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc \
  *      tests/js_script_origin_test.c user/lib/js/lexer.c user/lib/js/parser.c \
  *      user/lib/js/ast.c user/lib/js/value.c user/lib/js/interp.c \
  *      user/lib/js/builtins.c user/lib/js/bigint.c user/lib/math/math.c \

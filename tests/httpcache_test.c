@@ -5,11 +5,11 @@
  * on the host with the real source - no QEMU, no network (the guest can't reach
  * one here anyway). Build + run:
  *
- *     cc -std=c11 -Iscripts -Iuser/lib/curl \
+ *     cc -std=c11 -Itests -Iuser/lib/curl \
  *        tests/httpcache_test.c user/lib/curl/httpcache.c user/lib/curl/headers.c \
  *        -o /tmp/httpcache_test && /tmp/httpcache_test
  *
- * scripts/ carries a tiny shim owos.h giving httpcache.c/headers.c the few libc
+ * tests/ carries a tiny shim owos.h giving httpcache.c/headers.c the few libc
  * decls they pull from the real one (strlen, memset, malloc, lower, starts_ci). */
 #include <stdio.h>
 #define OWOS_SUITE_TEST

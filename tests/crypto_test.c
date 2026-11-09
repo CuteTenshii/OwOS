@@ -1,7 +1,7 @@
 /* crypto_test.c — host KAT for the crypto.c paths touched by the audit fixes:
  * AES-128-GCM (constant-time gcm_mul rewrite) and HKDF-SHA256 / TLS1.2 PRF
  * (streamed-HMAC rewrite). Build:
- *   cc -std=c11 -Iscripts -Iuser/lib/crypto tests/crypto_test.c \
+ *   cc -std=c11 -Itests -Iuser/lib/crypto tests/crypto_test.c \
  *      user/lib/crypto/crypto.c -o /tmp/crypto_test && /tmp/crypto_test
  */
 #include <stdio.h>

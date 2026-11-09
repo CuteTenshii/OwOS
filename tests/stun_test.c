@@ -6,7 +6,7 @@
  * spec-compliant sender (and stun.c) zero-pads, so a whole-message compare of a
  * *built* request is only exact up to the first odd-length attribute's padding;
  * that structural prefix is checked explicitly.  Build:
- *   cc -std=c11 -Iscripts -Iuser/lib/stun -Iuser/lib/crypto -Iuser/lib/resolve \
+ *   cc -std=c11 -Itests -Iuser/lib/stun -Iuser/lib/crypto -Iuser/lib/resolve \
  *      -Iuser/lib/zlib tests/stun_test.c user/lib/stun/stun.c \
  *      user/lib/crypto/crypto.c user/lib/zlib/crc32.c \
  *      -o /tmp/stun_test && /tmp/stun_test

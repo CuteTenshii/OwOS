@@ -36,7 +36,7 @@ include run.mk
 all: $(KERNEL)
 
 test:
-	./scripts/run-tests.sh $(T)
+	./tests/run-tests.sh $(T)
 
 format:
 	@command -v $(CLANG_FORMAT) >/dev/null 2>&1 || { echo "error: $(CLANG_FORMAT) not found" >&2; exit 1; }

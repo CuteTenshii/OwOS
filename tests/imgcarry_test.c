@@ -1,6 +1,6 @@
 /* Host unit test for imgcarry.h: inline images keep their landed state across layout walks.
  *
- * Build + run: scripts/run-tests.sh (or `make test`). */
+ * Build + run: tests/run-tests.sh (or `make test`). */
 #include <stdio.h>
 #define OWOS_SUITE_TEST
 #include "imgcarry.h"

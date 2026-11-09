@@ -62,7 +62,7 @@ MPEG    := user/lib/mpeg/decode.o user/lib/mpeg/encode.o
 # h264: from-scratch H.264/AVC Constrained Baseline decoder (CAVLC) - NAL/RBSP,
 # SPS/PPS/slice parsing, I/P slices, intra + inter (quarter-pel) prediction, the
 # 4x4 integer transform, and the in-loop deblocking filter. Verified bit-exact
-# against ffmpeg/libx264 (scripts/h264_test.c). Consumes an Annex-B stream or an
+# against ffmpeg/libx264 (tests/h264_test.c). Consumes an Annex-B stream or an
 # MP4 track's avcC + access units (user/lib/mp4). Pure integer computation,
 # libc-only (needs $(LIBGCC) for the container path's 64-bit ops).
 H264    := user/lib/h264/nal.o user/lib/h264/cavlc.o user/lib/h264/transform.o \
@@ -74,11 +74,11 @@ H264    := user/lib/h264/nal.o user/lib/h264/cavlc.o user/lib/h264/transform.o \
 ALAC    := user/lib/alac/alac.o
 # aac: from-scratch MPEG-2/4 AAC Low Complexity decoder - the audio of .m4a/.mp4
 # and ADTS .aac. Full LC tool set (M/S, intensity, PNS, TNS, long/short IMDCT),
-# verified bit-exact against ffmpeg (scripts/aac_test.c). Pure computation, needs
+# verified bit-exact against ffmpeg (tests/aac_test.c). Pure computation, needs
 # $(MATH) (pow/sqrt/trig for dequant + windows) + $(LIBGCC).
 AAC     := user/lib/aac/aac.o
 # ogg: Ogg container + from-scratch Vorbis I decoder (FFT IMDCT), checked against
-# libvorbis (scripts/ogg_gen.sh); oggplay.o is the streaming file reader the media
+# libvorbis (tests/ogg_gen.sh); oggplay.o is the streaming file reader the media
 # engine drives. Needs $(MATH) (windows, codebook and floor tables).
 OGG     := user/lib/ogg/ogg.o user/lib/ogg/vorbis.o user/lib/ogg/oggplay.o
 # media: file decoder (WAV/MPEG/ALAC/AAC/Vorbis -> 48 kHz/S16/stereo, seekable) + a

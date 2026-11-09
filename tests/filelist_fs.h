@@ -1,4 +1,4 @@
-/* Host stand-in for the guest readdir filelist.c calls; force-included by scripts/tests.mk. */
+/* Host stand-in for the guest readdir filelist.c calls; force-included by tests/tests.mk. */
 #ifndef OWOS_TEST_FILELIST_FS_H
 #define OWOS_TEST_FILELIST_FS_H
 

@@ -1,7 +1,7 @@
 /* Host unit test for CSP external <script src> nonce / 'strict-dynamic' admission.
  * Build+run:
  *
- *   cc -std=c11 -Iscripts -Iuser/lib/curl -Iuser/apps/browser -Iuser/lib/crypto \
+ *   cc -std=c11 -Itests -Iuser/lib/curl -Iuser/apps/browser -Iuser/lib/crypto \
  *      -Iuser/lib/base64 tests/csp_test.c user/apps/browser/features/csp/csp.c \
  *      user/lib/curl/url.c user/lib/crypto/crypto.c user/lib/base64/base64.c \
  *      -o /tmp/csp_test && /tmp/csp_test

@@ -2,7 +2,7 @@
  * (user/apps/browser/features/permissions/permissions.c), incl. a SQLite round-trip.
  * PERM_DB is redirected to a temp file via -DPERM_DB.
  *
- *   cc -std=gnu11 -Iscripts -Iuser/lib/sqlite -Iuser/apps/browser \
+ *   cc -std=gnu11 -Itests -Iuser/lib/sqlite -Iuser/apps/browser \
  *      -DPERM_DB='"/tmp/owos_perms_test.db"' \
  *      tests/permissions_test.c user/apps/browser/features/permissions/permissions.c \
  *      user/lib/sqlite/sqlite.c -o /tmp/permissions_test && /tmp/permissions_test

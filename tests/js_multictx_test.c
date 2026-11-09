@@ -3,7 +3,7 @@
  * and a collection driven by one must keep the other's world alive. This is the
  * invariant the browser's per-tab live JS relies on.
  *
- *   cc -std=gnu11 -Iscripts -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc \
+ *   cc -std=gnu11 -Itests -Iuser/lib -Iuser/lib/js -Iuser/lib/math -Iuser/lib/gc \
  *      tests/js_multictx_test.c user/lib/js/lexer.c user/lib/js/parser.c \
  *      user/lib/js/ast.c user/lib/js/value.c user/lib/js/interp.c \
  *      user/lib/js/builtins.c user/lib/js/bigint.c user/lib/math/math.c \

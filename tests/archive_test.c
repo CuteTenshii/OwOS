@@ -1,6 +1,6 @@
 /* Host test for the archive reader (user/lib/archive): archives built by the host tar/gzip/zstd/brotli/zip are
  * opened, listed and extracted through the real API, plus hand-built hostile TARs and ZIPs. The library's guest
- * file calls (mkdir, stream_*) are renamed onto the host stand-ins below by scripts/tests.mk. */
+ * file calls (mkdir, stream_*) are renamed onto the host stand-ins below by tests/tests.mk. */
 #define OWOS_SUITE_TEST
 #include "archive.h"
 #include "archive_fs.h"

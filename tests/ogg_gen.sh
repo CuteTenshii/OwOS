@@ -10,7 +10,7 @@ DIR="${TMPDIR:-/tmp}/oggtest"
 mkdir -p "$DIR"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-cc -std=gnu11 -fsanitize=address -Wno-comment -I"$ROOT/scripts" -I"$ROOT/user/lib/ogg" -I"$ROOT/user/lib/math" \
+cc -std=gnu11 -fsanitize=address -Wno-comment -I"$ROOT/tests" -I"$ROOT/user/lib/ogg" -I"$ROOT/user/lib/math" \
    "$ROOT/tests/oggplay_test.c" "$ROOT/user/lib/ogg/ogg.c" "$ROOT/user/lib/ogg/vorbis.c" \
    "$ROOT/user/lib/ogg/oggplay.c" -lm -o "$DIR/oggplay_test"
 

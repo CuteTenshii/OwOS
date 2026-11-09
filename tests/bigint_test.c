@@ -4,7 +4,7 @@
  * natively (no QEMU boot). Moderate values are cross-checked against the host's
  * __int128; large values against known decimal strings.
  *
- *   cc -std=c11 -Iscripts -Iuser/lib -Iuser/lib/math \
+ *   cc -std=c11 -Itests -Iuser/lib -Iuser/lib/math \
  *      tests/bigint_test.c user/lib/js/bigint.c -lm \
  *      -o /tmp/bigint_test && /tmp/bigint_test
  */

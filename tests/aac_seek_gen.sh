@@ -8,7 +8,7 @@ mkdir -p "$DIR"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 L="$ROOT/user/lib"
 
-cc -std=gnu11 -fsanitize=address -Wno-comment -include "$ROOT/tests/media_host.h" -I"$ROOT/scripts" -I$L/media -I$L/mp3 -I$L/aac -I$L/alac -I$L/mp4 \
+cc -std=gnu11 -fsanitize=address -Wno-comment -include "$ROOT/tests/media_host.h" -I"$ROOT/tests" -I$L/media -I$L/mp3 -I$L/aac -I$L/alac -I$L/mp4 \
    -I$L/ogg -I$L/math "$ROOT/tests/media_seek_test.c" $L/media/media.c $L/mp3/mp3.c $L/aac/aac.c $L/alac/alac.c \
    $L/mp4/mp4.c $L/ogg/ogg.c $L/ogg/vorbis.c $L/ogg/oggplay.c -lm -o "$DIR/media_seek_test"
 

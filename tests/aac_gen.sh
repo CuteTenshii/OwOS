@@ -1,5 +1,5 @@
 #!/bin/sh
-# aac_gen.sh — generate AAC-LC test vectors with ffmpeg and run scripts/aac_test.
+# aac_gen.sh — generate AAC-LC test vectors with ffmpeg and run tests/aac_test.
 # Encodes synthetic signals to ADTS AAC, decodes a reference with ffmpeg, then
 # compares our decoder against it. Needs ffmpeg on PATH.
 set -e
@@ -7,7 +7,7 @@ DIR="${TMPDIR:-/tmp}/aactest"
 mkdir -p "$DIR"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-cc -std=c11 -Iscripts -Iuser/lib/math -Iuser/lib/aac \
+cc -std=c11 -Itests -Iuser/lib/math -Iuser/lib/aac \
    "$ROOT/tests/aac_test.c" "$ROOT/user/lib/aac/aac.c" -lm -o "$DIR/aac_test"
 
 # -aac_pns 0 keeps the comparison deterministic: perceptual noise substitution

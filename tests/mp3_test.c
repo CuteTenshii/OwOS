@@ -5,8 +5,8 @@
  * equals the reference), sample accuracy (PSNR), the reported length, and that
  * mp3_seek lands near the requested frame with a clean, warmed-up decode.
  *
- * Build + run (scripts/mp3_gen.sh generates the vectors):
- *   cc -std=gnu11 -fsanitize=address -Iscripts -Iuser/lib/mp3 \
+ * Build + run (tests/mp3_gen.sh generates the vectors):
+ *   cc -std=gnu11 -fsanitize=address -Itests -Iuser/lib/mp3 \
  *      tests/mp3_test.c user/lib/mp3/mp3.c -lm -o /tmp/mp3_test
  *   /tmp/mp3_test in.mp3 ref.s16 [exact-length 0|1]
  */

@@ -1,13 +1,13 @@
 /* oggplay_test.c, host test for user/lib/ogg/oggplay.c (streaming Ogg Vorbis).
  *
  * Decodes an .ogg through oggplay and compares against a libvorbis decode of the
- * same file (native rate, stereo s16le; scripts/ogg_gen.sh uses VLC, since
+ * same file (native rate, stereo s16le; tests/ogg_gen.sh uses VLC, since
  * ffmpeg's own Vorbis decoder disagrees with libvorbis): length from the last
  * granule position, sample accuracy (PSNR) over the reference's span, and that
  * oggplay_seek lands a clean decode near the target.
  *
- * Build + run (scripts/ogg_gen.sh generates the vectors):
- *   cc -std=gnu11 -fsanitize=address -Iscripts -Iuser/lib/ogg -Iuser/lib/math \
+ * Build + run (tests/ogg_gen.sh generates the vectors):
+ *   cc -std=gnu11 -fsanitize=address -Itests -Iuser/lib/ogg -Iuser/lib/math \
  *      tests/oggplay_test.c user/lib/ogg/ogg.c user/lib/ogg/vorbis.c \
  *      user/lib/ogg/oggplay.c -lm -o /tmp/oggplay_test
  *   /tmp/oggplay_test in.ogg ref.s16

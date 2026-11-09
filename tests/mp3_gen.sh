@@ -6,7 +6,7 @@ DIR="${TMPDIR:-/tmp}/mp3test"
 mkdir -p "$DIR"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-cc -std=gnu11 -fsanitize=address -I"$ROOT/scripts" -I"$ROOT/user/lib/mp3" \
+cc -std=gnu11 -fsanitize=address -I"$ROOT/tests" -I"$ROOT/user/lib/mp3" \
    "$ROOT/tests/mp3_test.c" "$ROOT/user/lib/mp3/mp3.c" -lm -o "$DIR/mp3_test"
 
 # gen name exact lame-args... : encode a synthetic source, decode the reference.

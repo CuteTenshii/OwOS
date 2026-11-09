@@ -5,10 +5,10 @@
  * a minimal but structurally real MP4 (ftyp + moov with one H.264 video track +
  * mdat) and asserts the demuxer reads back every field it is meant to. Build:
  *
- *     cc -std=c11 -Iscripts -Iuser/lib/mp4 \
+ *     cc -std=c11 -Itests -Iuser/lib/mp4 \
  *        tests/mp4_test.c user/lib/mp4/mp4.c -o /tmp/mp4_test && /tmp/mp4_test
  *
- * scripts/owos.h supplies the libc decls (memset/malloc/...) the freestanding
+ * tests/owos.h supplies the libc decls (memset/malloc/...) the freestanding
  * source pulls, over the host libc. */
 #include <stdio.h>
 #define OWOS_SUITE_TEST
@@ -112,7 +112,7 @@ static void test_mp4_box_and_sample(void)
   {
     unsigned char r6[6] = {0};
     bytes(r6, 6);
-  }       /* reserved */
+  } /* reserved */
   u16(1); /* data_reference_index */
   u16(0);
   u16(0); /* pre_defined, reserved */
@@ -128,7 +128,7 @@ static void test_mp4_box_and_sample(void)
   {
     unsigned char cn[32] = {0};
     bytes(cn, 32);
-  }            /* compressorname */
+  } /* compressorname */
   u16(24);     /* depth */
   u16(0xFFFF); /* pre_defined */
   unsigned avcc = box_open("avcC");

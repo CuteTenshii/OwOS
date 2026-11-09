@@ -1,6 +1,6 @@
 /* Host unit test for HTTP Vary support (RFC 9111 4.1): the secondary-key helpers in
  * user/lib/curl/httpcache.c and the variant-aware cache in
- * user/apps/browser/features/cache/cache.c. Run through scripts/run-tests.sh, which builds cache.c
+ * user/apps/browser/features/cache/cache.c. Run through tests/run-tests.sh, which builds cache.c
  * against tests/vary_fs.c (a host stand-in for the owofs calls) with CACHE_DIR in a temp dir. */
 #include <dirent.h>
 #include <stdio.h>

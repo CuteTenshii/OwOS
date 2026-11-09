@@ -1,6 +1,6 @@
 /* Host unit test for CSS list-style-type/-position parsing and cascade merge (css.c).
  *
- *   cc -std=c11 -Iscripts -Iuser/apps/browser \
+ *   cc -std=c11 -Itests -Iuser/apps/browser \
  *      tests/css_list_test.c user/apps/browser/css/engine.c user/apps/browser/css/engine_values.c
  * user/apps/browser/css/engine_props.c user/apps/browser/css/engine_decl.c user/apps/browser/css/engine_sel.c
  * user/apps/browser/css/engine_sheet.c user/apps/browser/css/sibling.c \

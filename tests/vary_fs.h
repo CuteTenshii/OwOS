@@ -1,4 +1,4 @@
-/* Host stand-ins for the guest file calls cache.c makes; force-included into cache.c by scripts/run-tests.sh. */
+/* Host stand-ins for the guest file calls cache.c makes; force-included into cache.c by tests/run-tests.sh. */
 #ifndef OWOS_TEST_VARY_FS_H
 #define OWOS_TEST_VARY_FS_H
 

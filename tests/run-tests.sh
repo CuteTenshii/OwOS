@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Build (incrementally, in parallel) and run the host tests.
-#   scripts/run-tests.sh [-v] [-l] [-jN] [suite...]
+#   tests/run-tests.sh [-v] [-l] [-jN] [suite...]
 # Objects are cached in build/tests; JOBS overrides the compile parallelism.
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT" || exit 1
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
-make -s -f scripts/tests.mk -j"$JOBS" build || exit 1
+make -s -f tests/tests.mk -j"$JOBS" build || exit 1
 
 # Suites write their databases under build/tests/run; start every run from an empty one
 rm -rf build/tests/run && mkdir -p build/tests/run

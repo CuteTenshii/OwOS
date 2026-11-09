@@ -1,6 +1,6 @@
 /* Host unit test for HTTP Client Hints (user/apps/browser/features/clienthints/clienthints.c).
  *
- *   cc -std=gnu11 -Iscripts -Iuser/lib -Iuser/lib/curl -Iuser/apps/browser \
+ *   cc -std=gnu11 -Itests -Iuser/lib -Iuser/lib/curl -Iuser/apps/browser \
  *      tests/clienthints_test.c user/lib/curl/url.c user/lib/mutex.c -lpthread \
  *      -o /tmp/clienthints_test && /tmp/clienthints_test
  */

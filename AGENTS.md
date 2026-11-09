@@ -11,7 +11,8 @@ boot and low-level CPU code.
 - `drivers/` contains hardware drivers grouped by device area.
 - `user/lib/` contains user-space libraries, and `user/apps/<name>/` contains one directory per program,
   embedded into the kernel image.
-- `scripts/` contains host-side unit tests and the scripted QEMU test harness.
+- `tests/` contains the host unit-test suites and their harness (`tests.mk`, `run-tests.sh`, the `owos.h`
+  host shim); `scripts/` holds dev tools such as the scripted QEMU test harness.
 - `fonts/`, `hostinc/`, `tools/`, linker scripts, and `*.img` files provide assets.
 
 ## Build, Run, and Test Commands

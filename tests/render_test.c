@@ -2,7 +2,7 @@
  * layout_box_sig): each is checked against the plain per-pixel / linear-scan
  * computation it replaced.
  * Standalone: cc -std=gnu11 -Iuser/apps/browser -Iuser/lib -Itests -include tests/test.h \
- *   -DOWOS_TEST_NAME=render -Dmain=owos_main_render -c tests/render_test.c; see scripts/run-tests.sh */
+ *   -DOWOS_TEST_NAME=render -Dmain=owos_main_render -c tests/render_test.c; see tests/run-tests.sh */
 #define OWOS_SUITE_TEST
 #include "layout.h"
 #include "render_util.h"

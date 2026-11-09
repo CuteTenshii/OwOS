@@ -1,4 +1,4 @@
-/* OS declarations the freestanding browser sources use that scripts/owos.h lacks. */
+/* OS declarations the freestanding browser sources use that tests/owos.h lacks. */
 void msleep(unsigned ms);
 void rng_bytes(void *buf, unsigned long n);
 unsigned long rtc_epoch(void);
