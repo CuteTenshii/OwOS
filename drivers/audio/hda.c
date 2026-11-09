@@ -2,6 +2,7 @@
 
 #include "hda.h"
 #include "console.h"
+#include "edid.h"
 #include "fs.h"
 #include "irqflags.h"
 #include "keyboard.h"
@@ -72,6 +73,8 @@
 #define PINCAP_TRIG (1u << 1) /* sense needs a trigger first     */
 #define PINCAP_PRES (1u << 2) /* presence detect                 */
 #define PINCAP_HDMI (1u << 7)
+#define PINCAP_DP (1u << 24)
+#define PINCAP_DIGITAL (PINCAP_HDMI | PINCAP_DP)
 #define DIP_XMIT_OFF 0x00
 #define DIP_XMIT_BEST 0xC0 /* every frame, best effort        */
 
@@ -284,10 +287,22 @@ static struct out_ep outs[MAX_OUTPUTS];
 static int n_outs;
 static int cur_out = -1; /* active index into outs[] (-1 = none)           */
 
+enum { KIND_ANALOG, KIND_HDMI, KIND_DP };
+
+/* A pin capable of both (DP++ ports) follows the attached sink's EDID. */
+static int out_kind(const struct out_ep *e)
+{
+  if (!(e->pincap & PINCAP_DIGITAL))
+    return KIND_ANALOG;
+  if ((e->pincap & PINCAP_HDMI) && (!(e->pincap & PINCAP_DP) || edid_hdmi()))
+    return KIND_HDMI;
+  return KIND_DP;
+}
+
 /* Default-device code -> rank (lower wins) and a human name. */
 static int out_rank(const struct out_ep *e)
 {
-  if (e->pincap & PINCAP_HDMI)
+  if (e->pincap & PINCAP_DIGITAL)
     return 4;
   switch (e->dev) {
   case 0x1:
@@ -314,10 +329,10 @@ static const char *dev_name(int dev)
   }
 }
 
-/* HDMI sinks come and go; analog endpoints always count as present. */
+/* HDMI and DisplayPort sinks come and go; analog endpoints always count as present. */
 static bool out_present(const struct out_ep *e)
 {
-  if (!(e->pincap & PINCAP_HDMI) || !(e->pincap & PINCAP_PRES))
+  if (!(e->pincap & PINCAP_DIGITAL) || !(e->pincap & PINCAP_PRES))
     return true;
   uintptr_t fl = irq_save();
   uint8_t saved = codec;
@@ -330,17 +345,25 @@ static bool out_present(const struct out_ep *e)
   return sense != 0xFFFFFFFFu && (sense >> 31);
 }
 
-/* Audio InfoFrame: 2-channel LPCM, speaker allocation FL/FR. */
-static void hdmi_send_audio_infoframe(uint16_t pin)
+/* Audio InfoFrame (HDMI) or audio SDP (DisplayPort): 2-channel LPCM, speaker allocation FL/FR. */
+static void send_audio_infoframe(uint16_t pin, int kind)
 {
   uint8_t f[14] = {0x84, 0x01, 0x0A, 0, 0x01};
-  uint8_t sum = 0;
-  for (int i = 0; i < 14; i++)
-    sum += f[i];
-  f[3] = (uint8_t)-sum;
+  int len = 14;
+  if (kind == KIND_DP) {
+    static const uint8_t dp[] = {0x84, 0x1B, 0x44, 0x01, 0, 0, 0, 0};
+    len = sizeof dp;
+    for (int i = 0; i < len; i++)
+      f[i] = dp[i];
+  } else {
+    uint8_t sum = 0;
+    for (int i = 0; i < len; i++)
+      sum += f[i];
+    f[3] = (uint8_t)-sum;
+  }
   codec_cmd(pin, V_SET_DIP_XMIT | DIP_XMIT_OFF);
   codec_cmd(pin, V_SET_DIP_INDEX);
-  for (int i = 0; i < 14; i++)
+  for (int i = 0; i < len; i++)
     codec_cmd(pin, V_SET_DIP_DATA | f[i]);
   codec_cmd(pin, V_SET_DIP_XMIT | DIP_XMIT_BEST);
 }
@@ -405,7 +428,7 @@ static void collect_outputs(uint16_t w_start, int w_count)
         path_mix = save_mix;
         continue;
       }
-      if (pincap & PINCAP_HDMI)
+      if (pincap & PINCAP_DIGITAL)
         codec_cmd(w, V_SET_POWER | 0x00); /* presence sense needs D0 */
       struct out_ep *e = &outs[n_outs++];
       e->codec = codec;
@@ -672,11 +695,11 @@ static void configure_path(void)
   codec_cmd(pin_nid, V_SET_EAPD | 0x02);
   amp_out_max(pin_nid);
 
-  if (outs[cur_out].pincap & PINCAP_HDMI) {
+  if (outs[cur_out].pincap & PINCAP_DIGITAL) {
     codec_cmd(pin_nid, V_SET_CONNSEL | (uint32_t)pin_sel_idx);
     codec_cmd(dac_nid, V_SET_CVT_CHANS | 1);
     codec_cmd(dac_nid, V_SET_DIGCONV | 0x01);
-    hdmi_send_audio_infoframe(pin_nid);
+    send_audio_infoframe(pin_nid, out_kind(&outs[cur_out]));
   }
 
   /* Override the volume widget's amp with the current level. */
@@ -685,7 +708,11 @@ static void configure_path(void)
 
 /* Streaming PCM sink (48 kHz/S16/stereo) fed from /bin/play; the producer fills behind the play head (SDnLPIB), paced
  * by timer_sleep, one stream at a time. */
+#define HOTPLUG_POLL_US 500000u /* how often a playing stream checks its sink is still attached */
+static uint32_t last_hotplug_poll;
 #define STREAM_GUARD 256u /* bytes kept clear ahead of the play head  */
+
+static void reroute_if_unplugged(void);
 
 static bool s_active;   /* a stream is open                         */
 static bool s_started;  /* RUN asserted (buffer pre-rolled)         */
@@ -729,6 +756,7 @@ int hda_stream_open(void)
 {
   if (!present)
     return -1;
+  reroute_if_unplugged();
   configure_path();
   stream_program_sd();
   for (uint32_t i = 0; i < AUDIO_BYTES; i++)
@@ -752,6 +780,11 @@ int hda_stream_write(const void *pcm, uint32_t bytes)
   while (off < bytes) {
     if (keyboard_take_interrupt())
       return -2;
+    uint32_t now = timer_us();
+    if (now - last_hotplug_poll > HOTPLUG_POLL_US) {
+      last_hotplug_poll = now;
+      reroute_if_unplugged();
+    }
 
     if (!s_started) {
       /* Pre-roll: fill linearly, start RUN once full; shorter clips start in close(). */
@@ -864,6 +897,23 @@ void hda_stream_close(void)
   s_started = false;
 }
 
+/* Move off an HDMI/DisplayPort output whose sink was unplugged, onto the best endpoint still present. */
+static void reroute_if_unplugged(void)
+{
+  if (!present || out_present(&outs[cur_out]))
+    return;
+  for (int i = 0; i < n_outs; i++) {
+    if (i == cur_out || !out_present(&outs[i]))
+      continue;
+    cur_out = i;
+    if (s_active)
+      configure_path();
+    else
+      apply_active_globals();
+    return;
+  }
+}
+
 /* Output endpoint switching for the Sound panel and /sys; degrade to empty/-1 with no codec. Indices count the
  * endpoints a user can pick: analog ones always, HDMI only while a sink is attached. */
 static int visible_to_real(int v)
@@ -876,6 +926,7 @@ static int visible_to_real(int v)
 
 int hda_output_count(void)
 {
+  reroute_if_unplugged();
   int n = 0;
   for (int i = 0; present && i < n_outs; i++)
     n += out_present(&outs[i]);
@@ -887,13 +938,15 @@ int hda_output_name(int i, char *out, int max)
   int r = present ? visible_to_real(i) : -1;
   if (r < 0 || max <= 0)
     return 0;
-  static const char *const hdmi[] = {"HDMI", "HDMI 2", "HDMI 3", "HDMI 4"};
+  static const char *const names[3][4] = {
+      {0}, {"HDMI", "HDMI 2", "HDMI 3", "HDMI 4"}, {"DisplayPort", "DisplayPort 2", "DisplayPort 3", "DisplayPort 4"}};
   const char *s = dev_name(outs[r].dev);
-  if (outs[r].pincap & PINCAP_HDMI) {
+  int kind = out_kind(&outs[r]);
+  if (kind != KIND_ANALOG) {
     int ord = 0;
     for (int k = 0; k < r; k++)
-      ord += (outs[k].pincap & PINCAP_HDMI) != 0;
-    s = hdmi[ord < 4 ? ord : 3];
+      ord += out_kind(&outs[k]) == kind;
+    s = names[kind][ord < 4 ? ord : 3];
   }
   int k = 0;
   for (; s[k] && k < max - 1; k++)
@@ -904,6 +957,7 @@ int hda_output_name(int i, char *out, int max)
 
 int hda_output_active(void)
 {
+  reroute_if_unplugged();
   if (!present || !out_present(&outs[cur_out]))
     return -1;
   int v = 0;
@@ -914,6 +968,7 @@ int hda_output_active(void)
 
 int hda_output_select(int i)
 {
+  reroute_if_unplugged();
   int r = present ? visible_to_real(i) : -1;
   if (r < 0)
     return -1;
