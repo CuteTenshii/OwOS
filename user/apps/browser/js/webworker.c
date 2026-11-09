@@ -16,7 +16,10 @@
 static const char k_events_js[] =
 #include "workerscope_prelude.inc"
     ;
-static const char *const k_parts[] = {k_events_js};
+static const char k_web_js[] =
+#include "workerscope_web.inc"
+    ;
+static const char *const k_parts[] = {k_events_js, k_web_js};
 
 enum { WM_DATA, WM_ERROR, WM_LOG };
 
@@ -568,6 +571,52 @@ static js_value wt_n_random_fill(js_ctx *ctx, js_value t, js_value *args, int ar
   return js_undef();
 }
 
+/* N.createObjectURL(bytes, type, origin): a blob: URL for the page-wide blob store, which fetch() can read */
+static js_value wt_n_create_object_url(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  static const char hx[] = "0123456789abcdef";
+  js_value type = js_to_string(ctx, A(1)), origin;
+  unsigned char b[16];
+  char url[URL_MAX], id[37];
+  const unsigned char *p;
+  int len = 0, i, k = 0, n = 0;
+  (void)t;
+  p = view_bytes(A(0), &len);
+  if (!p || type.type != JV_STR)
+    return js_throw_type(ctx, "URL.createObjectURL: argument must be a Blob");
+  gc_push_scope();
+  gc_keep(type.u.str);
+  origin = js_to_string(ctx, A(2));
+  rng_bytes(b, 16);
+  b[6] = (unsigned char)((b[6] & 0x0f) | 0x40);
+  b[8] = (unsigned char)((b[8] & 0x3f) | 0x80);
+  for (i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10)
+      id[k++] = '-';
+    id[k++] = hx[b[i] >> 4];
+    id[k++] = hx[b[i] & 15];
+  }
+  id[k] = 0;
+  sapp(url, &n, sizeof url, "blob:");
+  if (origin.type == JV_STR && !streq(origin.u.str->data, "null"))
+    sapp(url, &n, sizeof url, origin.u.str->data);
+  sapp(url, &n, sizeof url, "/");
+  sapp(url, &n, sizeof url, id);
+  gc_pop_scope();
+  if (!blobstore_put(url, p, len, type.u.str->data))
+    return js_throw_type(ctx, "URL.createObjectURL: out of memory");
+  return js_mk_cstring(ctx, url);
+}
+
+static js_value wt_n_revoke_object_url(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value url = js_to_string(ctx, A(0));
+  (void)t;
+  if (url.type == JV_STR)
+    blobstore_del(url.u.str->data);
+  return js_undef();
+}
+
 /* Run the JavaScript parts of the global scope; false (exception pending) if one fails */
 static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
 {
@@ -581,6 +630,8 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "encodingName", wt_n_encoding_name, 1);
   js_def_native(ctx, n, "decode", wt_n_decode, 4);
   js_def_native(ctx, n, "randomFill", wt_n_random_fill, 1);
+  js_def_native(ctx, n, "createObjectURL", wt_n_create_object_url, 3);
+  js_def_native(ctx, n, "revokeObjectURL", wt_n_revoke_object_url, 1);
   for (i = 0; ok && i < sizeof k_parts / sizeof *k_parts; i++) {
     js_value fn = js_undef(), args[3];
     ok = wt_eval(ctx, wt, k_parts[i], wt->url, 0, &fn) && js_is_callable(fn);

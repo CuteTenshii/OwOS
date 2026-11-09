@@ -213,6 +213,50 @@ static void test_worker_globals(void)
       "expect(gl.inst[0] && gl.inst[1] && gl.inst[2], 'instanceof and self');\n");
 }
 
+static void test_worker_web_apis(void)
+{
+  run_script(
+      "var wa=null, werr=null, ww2=new Worker('data:text/javascript,"
+      "var u=new URL(\"../a/b.html?x=1&y=%20z#frag\",\"https://User:pw@Example.com:8443/dir/p.html\");"
+      "var u2=new URL(\"https://example.com:443/\"); u.searchParams.append(\"q\",\"a b&c\"); "
+      "var sp=new URLSearchParams(\"a=1&b=2&a=3\"); sp.set(\"b\",\"x y\"); sp.sort();"
+      "var bad=false; try{ new URL(\"nonsense\"); }catch(e){ bad=e instanceof TypeError; }"
+      "var b=new Blob([\"ab\",new Uint8Array([99,100]),new Blob([\"e\"])],{type:\"Text/Plain\"}), "
+      "sl=b.slice(1,4,\"x/y\"), "
+      "fd=new FormData(); fd.append(\"k\",\"v\"); fd.append(\"f\",b,\"n.txt\");"
+      "var h=new Headers({\"Content-Type\":\"a/b\"}); h.append(\"X-A\",\"1\"); h.append(\"x-a\",\"2\");"
+      "var rel=[new URL(\"../x\",\"http://a/b/c/d\").href, new URL(\"?z\",\"http://a/b?y\").href, "
+      "new URL(\"#h\",\"http://a/b?y\").href, new URL(\"//e/f\",\"https://a/b\").href, "
+      "new URL(\"./g/./h/../i\",\"http://a/b/c\").href, new URL(\"/r\",\"http://a/b/c\").href].join(\" \");"
+      "var burl=URL.createObjectURL(b); "
+      "Promise.all([b.text(), sl.text(), b.arrayBuffer()]).then(function(r){ postMessage({href:u.href, "
+      "origin:u.origin, "
+      "host:u.host, user:u.username, path:u.pathname, search:u.search, hash:u.hash, port2:u2.port, href2:u2.href, "
+      "sp:sp.toString(), spn:sp.size, bad:bad, text:r[0], slice:r[1], ab:r[2].byteLength, size:b.size, type:b.type, "
+      "rel:rel, slt:sl.type, fdk:fd.get(\"k\"), fdf:fd.get(\"f\").name, hct:h.get(\"content-type\"), "
+      "hx:h.get(\"X-A\"), "
+      "hkeys:Array.from(h.keys()).join(), burl:burl.indexOf(\"blob:\")===0}); });');\n"
+      "ww2.onmessage=function(e){ wa=e.data; }; ww2.onerror=function(e){ werr=e.message; };\n");
+  expect(wait_for("wa!==null || werr!==null"));
+  run_script(
+      "expect(werr===null, 'no worker error: '+werr);\n"
+      "expect(wa.href==='https://User:pw@example.com:8443/a/b.html?x=1&y=+z&q=a+b%26c#frag', 'URL resolves against its "
+      "base: '+wa.href);\n"
+      "expect(wa.origin==='https://example.com:8443' && wa.host==='example.com:8443' && wa.user==='User', 'origin, "
+      "host, userinfo');\n"
+      "expect(wa.path==='/a/b.html' && wa.search.indexOf('q=a+b%26c')>0 && wa.hash==='#frag', 'searchParams update the "
+      "URL: '+wa.search);\n"
+      "expect(wa.port2==='' && wa.href2==='https://example.com/', 'default port is dropped: '+wa.href2);\n"
+      "expect(wa.sp==='a=1&a=3&b=x+y' && wa.spn===3 && wa.bad===true, 'URLSearchParams and invalid URLs: '+wa.sp);\n"
+      "expect(wa.text==='abcde' && wa.slice==='bcd' && wa.ab===5 && wa.size===5, 'Blob parts, slice, arrayBuffer');\n"
+      "expect(wa.type==='text/plain' && wa.slt==='x/y', 'Blob types');\n"
+      "expect(wa.fdk==='v' && wa.fdf==='n.txt', 'FormData wraps a Blob as a File');\n"
+      "expect(wa.hct==='a/b' && wa.hx==='1, 2' && wa.hkeys==='content-type,x-a', 'Headers: '+wa.hkeys);\n"
+      "expect(wa.burl===true, 'object URLs');\n"
+      "expect(wa.rel==='http://a/b/x http://a/b?z http://a/b?y#h https://e/f http://a/b/g/i http://a/r', 'relative "
+      "references: '+wa.rel);\n");
+}
+
 static void test_transfer_and_collections(void)
 {
   run_script("var tr=null, tbuf=new ArrayBuffer(16), tv=new Uint8Array(tbuf); tv[3]=5;\n"
@@ -327,6 +371,7 @@ int main(void)
   test("module workers", test_module_worker);
   test("worker timers", test_worker_timers);
   test("worker globals: text coding, events, aborts, crypto", test_worker_globals);
+  test("worker web APIs: URL, Blob, FormData, Headers", test_worker_web_apis);
   test("transferred buffers and collections", test_transfer_and_collections);
   test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);
   test("MessageChannel and MessagePort", test_message_channel);
