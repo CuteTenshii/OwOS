@@ -111,6 +111,22 @@ static int tageq(const unsigned char *p, const char *s)
   return p[0] == s[0] && p[1] == s[1] && p[2] == s[2] && p[3] == s[3];
 }
 
+/* 16.16 input-frames per output-frame at the device's 48 kHz. */
+static unsigned rate_step(unsigned rate)
+{
+  return ((rate / MEDIA_RATE) << 16) + (((rate % MEDIA_RATE) << 16) / MEDIA_RATE);
+}
+
+/* The MPEG stream changed sample rate mid-file: re-pitch the resampler and
+ * rescale the clock so position stays continuous. */
+static void mp3_follow_rate(media_decoder *d)
+{
+  unsigned r = d->m3.rate < 4000 ? 4000 : d->m3.rate > 192000 ? 192000 : d->m3.rate;
+  d->pos_frames = (unsigned)((unsigned long long)d->pos_frames * r / d->rate);
+  d->rate = r;
+  d->step = rate_step(r);
+}
+
 /* Slide unconsumed ADTS bytes to the front of the window and top it up from the
  * file. Bounds the largest peekable frame to the window capacity. */
 static void aac_refill_adts(media_decoder *d)
@@ -283,6 +299,8 @@ static void decode_next(media_decoder *d)
       d->curL = d->curR = 0;
       return;
     }
+    if (d->m3.rate != d->rate)
+      mp3_follow_rate(d);
     d->curL = f[0];
     d->curR = f[1];
     d->pos_frames++;
@@ -358,11 +376,13 @@ static unsigned est_total_frames(const media_decoder *d)
 {
   if (!d->is_mp3)
     return d->total_frames;
+  if (mp3_total_exact(&d->m3))
+    return mp3_total_frames(&d->m3);
   if (d->pos_frames == 0 || d->m3.file_off == 0 || d->size == 0)
     return 0;
   unsigned elapsed = d->pos_frames / (d->rate ? d->rate : 1);
   if (elapsed == 0)
-    return 0;
+    return mp3_total_frames(&d->m3);
   unsigned bps = d->m3.file_off / elapsed; /* source bytes per second */
   if (bps == 0)
     return 0;
@@ -422,15 +442,7 @@ void media_seek_ms(media_decoder *d, unsigned ms)
     d->a_have = d->a_pos = 0;
     d->pos_frames = pkt * fl;
   } else if (d->is_mp3) {
-    unsigned dur = media_duration_ms(d);
-    unsigned off = dur ? (unsigned)((unsigned long long)d->size * ms / dur) : 0;
-    if (off > d->size)
-      off = d->size;
-    d->m3.file_off = off;
-    d->m3.in_len = 0;
-    d->m3.out_pos = d->m3.out_frames; /* force a refill on the next read */
-    d->m3.src_eof = 0;
-    d->pos_frames = tgt;
+    d->pos_frames = mp3_seek(&d->m3, tgt);
   } else {
     if (d->total_frames && tgt > d->total_frames)
       tgt = d->total_frames;
@@ -499,7 +511,6 @@ static int load_mp3(media_decoder *d, unsigned size)
   d->is_mp3 = 1;
   d->size = size;
   d->rate = mp3_rate(&d->m3);
-  d->total_frames = 0; /* unknown for MPEG */
   return 0;
 }
 
@@ -787,7 +798,7 @@ media_decoder *media_open(const char *path)
   if (d->rate > 192000)
     d->rate = 192000;
   /* 16.16 input-frames per output-frame at the device's 48 kHz. */
-  d->step = ((d->rate / MEDIA_RATE) << 16) + (((d->rate % MEDIA_RATE) << 16) / MEDIA_RATE);
+  d->step = rate_step(d->rate);
   d->pos_frames = 0;
   d->eof = 0;
   d->primed = 0;
