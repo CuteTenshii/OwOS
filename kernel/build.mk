@@ -52,7 +52,7 @@ OBJS := boot/boot.o kernel/kernel.o kernel/console.o kernel/gdt.o kernel/gdt_flu
         kernel/ping_blob.o kernel/dig_blob.o kernel/stun_blob.o kernel/torrent_blob.o \
         kernel/player_blob.o kernel/settings_blob.o kernel/ssh_blob.o kernel/sshd_blob.o \
         kernel/clipd_blob.o kernel/cliphist_blob.o kernel/vmclipd_blob.o \
-        kernel/notifyd_blob.o kernel/notifysend_blob.o \
+        kernel/notifyd_blob.o kernel/notifysend_blob.o kernel/trayd_blob.o \
         kernel/webp_blob.o kernel/json_blob.o kernel/base64_blob.o kernel/alac_blob.o kernel/aac_blob.o kernel/mpeg_blob.o kernel/h264_blob.o kernel/smbd_blob.o \
         kernel/dhcpcd_blob.o kernel/ntpd_blob.o kernel/mdnsd_blob.o kernel/mediad_blob.o kernel/mediactl_blob.o \
         kernel/cast_blob.o kernel/chmod_blob.o kernel/chown_blob.o kernel/unrar_blob.o \

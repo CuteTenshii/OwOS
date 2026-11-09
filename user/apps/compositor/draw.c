@@ -223,7 +223,8 @@ static void draw_taskbar(void)
   int clock_x = screen_w - gfx_ui_width(s) - 12;
   gfx_ui_text(clock_x, uy, s, 0xc8d0dc);
 
-  draw_taskbar_windows(y, uy, clock_x - 10);
+  int tray_left = tray_draw(clock_x - 6, y);
+  draw_taskbar_windows(y, uy, tray_left - 4);
 }
 
 static void draw_start_menu(void)

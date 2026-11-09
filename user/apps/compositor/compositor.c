@@ -102,12 +102,15 @@ int main(void)
   kid_track(spawn("/bin/clipd", 0));
   kid_track(spawn("/bin/vmclipd", 0)); /* VMware host clipboard bridge; self-exits off VMware */
   kid_track(spawn("/bin/notifyd", 0));
+  tray_start();
+  kid_track(spawn("/bin/trayd", 0));
 
   int prev_mx = -9999, prev_my = -9999, prev_cur = -1;
   bool prev_start = false, prev_tb_menu = false, prev_at_active = false, prev_pw_open = false;
   int prev_pw_sel = -1;
   int prev_at_sel = -1;
   int prev_focus = -1, last_sec = -1;
+  unsigned last_tray = 0;
   bool inited = false;
 
   /* Restore saved tunables, then adopt the live refresh rate as the pacing target */
@@ -156,6 +159,7 @@ int main(void)
     unsigned nowms = msec();
     if ((int)(nowms - conf_poll_at) >= 0) {
       conf_poll_at = nowms + 1000;
+      tray_prune();
       scale_stale = scale_now() != ui_scale;
       if (tun_poll()) {
         conf_save();
@@ -242,7 +246,7 @@ int main(void)
       }
       /* clock tick */
       int sec = (int)(frame_clock & 0xFF);
-      if (sec != last_sec)
+      if (sec != last_sec || tray_gen != last_tray)
         damage_add(0, screen_h - WM_BAR_H, screen_w, WM_BAR_H);
       if (osd)
         damage_add(osd_x(), osd_y(), OSD_W, OSD_H);
@@ -292,6 +296,7 @@ int main(void)
     prev_pw_open = pw_open;
     prev_pw_sel = pw_sel;
     last_sec = (int)(frame_clock & 0xFF);
+    last_tray = tray_gen;
     inited = true;
     cursor_frame++;
 

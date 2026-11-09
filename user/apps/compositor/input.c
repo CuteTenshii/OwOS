@@ -59,7 +59,9 @@ void handle_input(int mx, int my, int buttons, int dz)
   if (rdown && !prev_rdown) {
     int bar_y = screen_h - WM_BAR_H;
     int tbw = (my >= bar_y) ? taskbar_hit(mx, my) : -1;
-    if (tbw >= 0) {
+    if (my >= bar_y && tray_click(mx, my, true)) {
+      tb_menu_open = false;
+    } else if (tbw >= 0) {
       tb_menu_open = true;
       tb_menu_win = cur[tbw].id;
       start_open = false;
@@ -127,6 +129,11 @@ void handle_input(int mx, int my, int buttons, int dz)
     int bar_y = screen_h - WM_BAR_H;
     if (my >= bar_y && mx >= 0 && mx < START_W) { /* Start button */
       start_open = !start_open;
+      prev_down = down;
+      return;
+    }
+    if (tray_click(mx, my, false)) {
+      start_open = false;
       prev_down = down;
       return;
     }

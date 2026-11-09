@@ -279,7 +279,15 @@ void damage_add(int x, int y, int w, int h);
 void damage_add_union(int x0, int y0, int w0, int h0, int x1, int y1, int w1, int h1);
 
 /* icon.c */
+const unsigned *icon_lookup(const char *name);
 const unsigned *app_icon(int app);
 const unsigned *window_icon(const struct winrec *w);
+
+/* tray.c */
+extern volatile unsigned tray_gen;
+void tray_start(void);
+void tray_prune(void);
+int tray_draw(int right, int y);
+bool tray_click(int mx, int my, bool right);
 
 #endif /* OWOS_COMP_H */

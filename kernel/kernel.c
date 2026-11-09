@@ -416,6 +416,15 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_ICON("preferences-system", preferences_system);
     INSTALL_ICON("help-about", help_about);
     INSTALL_ICON("application-default", application_default);
+    INSTALL_ICON("audio-volume-muted", audio_volume_muted);
+    INSTALL_ICON("audio-volume-low", audio_volume_low);
+    INSTALL_ICON("audio-volume-high", audio_volume_high);
+    INSTALL_ICON("battery-low", battery_low);
+    INSTALL_ICON("battery-medium", battery_medium);
+    INSTALL_ICON("battery-full", battery_full);
+    INSTALL_ICON("battery-charging", battery_charging);
+    INSTALL_ICON("network-ethernet", network_ethernet);
+    INSTALL_ICON("network-ethernet-disconnected", network_ethernet_disconnected);
     INSTALL_DESKTOP(term);
     INSTALL_DESKTOP(files);
     INSTALL_DESKTOP(editor);
@@ -482,6 +491,7 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi)
     INSTALL_APP(sh);
     INSTALL_APP(sudo);
     INSTALL_FILE("/bin/notify-send", _binary_app_notifysend, 0755);
+    INSTALL_APP(trayd);
   }
   con_write("usermode: ready ('run curl <url>').\n");
 

@@ -155,11 +155,75 @@ def scene_default():
             (rect(6, 7, 26, 11.5), (90, 100, 125)), (rect(9, 14.5, 23, 22), (205, 210, 222))]
 
 
+def arc(cx, cy, r0, r1):
+    rg = ring(cx, cy, r0, r1)
+    return lambda x, y: rg(x, y) and x > cx and abs(y - cy) <= x - cx
+
+
+def speaker():
+    return [(rect(5, 12, 11, 20), W), (poly([(11, 12), (18, 6.5), (18, 25.5), (11, 20)]), W)]
+
+
+def scene_vol_muted():
+    return speaker() + [(line(21, 12, 28, 20, 2.4), (230, 90, 80)), (line(28, 12, 21, 20, 2.4), (230, 90, 80))]
+
+
+def scene_vol_low():
+    return speaker() + [(arc(18, 16, 4, 6.4), W)]
+
+
+def scene_vol_high():
+    return speaker() + [(arc(18, 16, 4, 6.4), W), (arc(18, 16, 8.4, 10.8), W)]
+
+
+def battery(level, color):
+    body = sub(rrect(2, 9, 27, 23, 2), rrect(4, 11, 25, 21, 1))
+    out = [(body, W), (rect(27, 13, 30, 19), W)]
+    if level:
+        out.append((rect(5.5, 12.5, 5.5 + 18 * level, 19.5), color))
+    return out
+
+
+def scene_bat_low():
+    return battery(0.2, (230, 90, 80))
+
+
+def scene_bat_medium():
+    return battery(0.55, (240, 190, 70))
+
+
+def scene_bat_full():
+    return battery(1, (110, 210, 120))
+
+
+def scene_bat_charging():
+    bolt = poly([(17.5, 5), (9.5, 17), (15, 17), (13.5, 27), (22.5, 14), (17, 14)])
+    return battery(1, (110, 210, 120)) + [(bolt, W)]
+
+
+def port(color):
+    shell = sub(rrect(4, 7, 28, 24, 2), rect(9, 7, 23, 14))
+    pins = [rect(8 + i * 3.4, 17, 9.4 + i * 3.4, 22) for i in range(5)]
+    return [(shell, color)] + [(p, (30, 34, 44)) for p in pins]
+
+
+def scene_net_ethernet():
+    return port(W)
+
+
+def scene_net_disconnected():
+    return port((130, 138, 154)) + [(line(5, 27, 27, 5, 2.4), (230, 90, 80))]
+
+
 ICONS = {
     'utilities-terminal': scene_term, 'system-file-manager': scene_files, 'accessories-text-editor': scene_editor,
     'web-browser': scene_browser, 'multimedia-player': scene_player, 'preferences-system-time': scene_clock,
     'accessories-calculator': scene_calc, 'preferences-system-notifications': scene_notify,
     'preferences-system': scene_settings, 'help-about': scene_about, 'application-default': scene_default,
+    'audio-volume-muted': scene_vol_muted, 'audio-volume-low': scene_vol_low, 'audio-volume-high': scene_vol_high,
+    'battery-low': scene_bat_low, 'battery-medium': scene_bat_medium, 'battery-full': scene_bat_full,
+    'battery-charging': scene_bat_charging, 'network-ethernet': scene_net_ethernet,
+    'network-ethernet-disconnected': scene_net_disconnected,
 }
 
 

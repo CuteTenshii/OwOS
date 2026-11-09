@@ -97,7 +97,7 @@ static bool load_png(const char *path, unsigned *out)
 
 /* The cached ICON_PX x ICON_PX ARGB bitmap for an Icon= value (a name under /usr/share/icons, or an absolute
  * path), or NULL if it has no usable image */
-static const unsigned *icon_lookup(const char *name)
+const unsigned *icon_lookup(const char *name)
 {
   for (int i = 0; i < ncache; i++)
     if (streq(cache[i].name, name))
