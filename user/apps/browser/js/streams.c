@@ -1,13 +1,15 @@
 /* Streams API: ReadableStream, WritableStream, TransformStream, the queuing strategies, CompressionStream,
  * DecompressionStream, TextEncoderStream and TextDecoderStream, plus Blob.stream() and Response.body.
  *
- * The stream classes are JavaScript (k_streams_js), compiled the first time a script touches one of the globals.
- * Only the DEFLATE codec is native. */
+ * The stream state machines are native (streamscore.c). What is left is JavaScript (k_streams_js), compiled with
+ * them the first time a script touches one of the globals: the strategies, tee, async iteration, the text and
+ * compression streams and the body helpers. The DEFLATE codec is native too. */
 
 #include "bindings.h"
 #include "crc32.h"
 #include "deflate.h"
 #include "inflate.h"
+#include "streamscore.h"
 
 #define JS(...) #__VA_ARGS__
 #define STREAMS_MAX_BYTES (64u << 20)
@@ -222,7 +224,7 @@ js_value js_streams_run(js_ctx *ctx, js_arena **arena)
 {
   js_node *prog;
   js_parse_error pe;
-  js_value fn, codec, exports = js_undef();
+  js_value fn, args[2], exports = js_undef();
   *arena = malloc(sizeof **arena);
   if (!*arena)
     return js_undef();
@@ -238,9 +240,11 @@ js_value js_streams_run(js_ctx *ctx, js_arena **arena)
   if (js_run(ctx, prog, &fn) == 0) {
     if (fn.type == JV_OBJ)
       gc_keep(fn.u.obj);
-    codec = js_obj_value(js_new_native(ctx, streams_codec, "codec", 3));
-    gc_keep(codec.u.obj);
-    exports = js_call(ctx, fn, js_undef(), &codec, 1);
+    args[0] = js_obj_value(js_new_native(ctx, streams_codec, "codec", 3));
+    gc_keep(args[0].u.obj);
+    args[1] = js_obj_value(streams_core_install(ctx));
+    gc_keep(args[1].u.obj);
+    exports = js_call(ctx, fn, js_undef(), args, 2);
   }
   gc_pop_scope();
   return ctx->has_exc ? js_undef() : exports;

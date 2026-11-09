@@ -6,6 +6,7 @@
 #include "color.h"
 #include "font.h"
 #include "math.h"
+#include "streamscore.h"
 
 __thread js_object *g_ctx2d_proto, *g_gradient_proto, *g_pattern_proto, *g_imagedata_proto, *g_offscreen_proto;
 
@@ -65,6 +66,10 @@ struct chost *host_of(js_value v, int tag)
 static void host_finalize(js_object *o)
 {
   struct chost *ch = o->host;
+  if (ch->tag >= HK_STREAM) {
+    streams_core_free(o);
+    return;
+  }
   switch (ch->tag) {
   case HK_GRADIENT:
     c2d_gradient_unref(ch->p);

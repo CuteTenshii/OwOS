@@ -241,6 +241,11 @@ js_value js_builtin_eval(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 js_value js_builtin_function(js_ctx *ctx, js_value thisv, js_value *args, int argc);
 
 /* Promise plumbing exposed to the interpreter for async/await (builtins.c). */
+js_object *js_promise_new(js_ctx *ctx); /* a pending promise */
+void js_promise_settle(js_ctx *ctx, js_object *p, int rejected,
+                       js_value v);                                  /* fulfil or reject, once; no thenable adoption */
+void js_promise_resolve_with(js_ctx *ctx, js_object *p, js_value v); /* the promise's resolve function */
+void js_promise_react(js_ctx *ctx, js_object *p, js_value on_fulfilled, js_value on_rejected);
 js_value js_promise_resolved(js_ctx *ctx, js_value v); /* a fulfilled promise of v */
 js_value js_promise_rejected(js_ctx *ctx, js_value v); /* a rejected promise of v  */
 /* -1 = not a promise; 0 pending, 1 fulfilled, 2 rejected. *out = settled value.

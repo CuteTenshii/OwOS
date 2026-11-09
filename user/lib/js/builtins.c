@@ -6327,11 +6327,14 @@ static void run_reaction(js_ctx *ctx, int state, js_value value, js_value reacti
     if (ctx->has_exc) {
       js_value e = ctx->exc;
       ctx->has_exc = 0;
-      js_call(ctx, crej, js_undef(), &e, 1);
-    } else
+      if (js_is_callable(crej))
+        js_call(ctx, crej, js_undef(), &e, 1);
+    } else if (js_is_callable(cres))
       js_call(ctx, cres, js_undef(), &out, 1);
   } else {
-    js_call(ctx, state == 1 ? cres : crej, js_undef(), &value, 1); /* pass through */
+    js_value next = state == 1 ? cres : crej;
+    if (js_is_callable(next))
+      js_call(ctx, next, js_undef(), &value, 1); /* pass through */
   }
   gc_pop_scope();
 }
@@ -6691,6 +6694,34 @@ PROMISE_COMBINATOR(promise_any_s, PC_ANY)
 PROMISE_COMBINATOR(promise_race_s, PC_RACE)
 #undef PROMISE_COMBINATOR
 
+js_object *js_promise_new(js_ctx *ctx) { return new_promise(ctx); }
+void js_promise_settle(js_ctx *ctx, js_object *p, int rejected, js_value v)
+{
+  prom_settle(ctx, p, rejected ? 2 : 1, v);
+}
+void js_promise_resolve_with(js_ctx *ctx, js_object *p, js_value v) { prom_resolve(ctx, p, v); }
+/* p.then(onF, onR) for a pending or settled promise p, without the derived promise */
+void js_promise_react(js_ctx *ctx, js_object *p, js_value onF, js_value onR)
+{
+  js_object *reaction;
+  int st = prom_state(p);
+  gc_push_scope();
+  gc_keep(p);
+  KEEP(onF);
+  KEEP(onR);
+  reaction = (js_object *)gc_keep(js_new_array(ctx, 0));
+  js_array_push(ctx, reaction, onF);
+  js_array_push(ctx, reaction, onR);
+  js_array_push(ctx, reaction, js_undef());
+  js_array_push(ctx, reaction, js_undef());
+  if (st == 0) {
+    js_value rs = js_get(ctx, js_obj_value(p), "@r");
+    if (rs.type == JV_OBJ)
+      js_array_push(ctx, rs.u.obj, js_obj_value(reaction));
+  } else
+    react(ctx, st, prom_value(p), js_obj_value(reaction));
+  gc_pop_scope();
+}
 js_value js_promise_resolved(js_ctx *ctx, js_value v) { return promise_resolve_s(ctx, js_undef(), &v, 1); }
 js_value js_promise_rejected(js_ctx *ctx, js_value v) { return promise_reject_s(ctx, js_undef(), &v, 1); }
 int js_promise_inspect(js_ctx *ctx, js_value v, js_value *out)
