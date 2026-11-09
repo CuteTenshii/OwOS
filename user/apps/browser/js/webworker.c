@@ -96,6 +96,8 @@ static int g_nworkers;
 
 static __thread struct wthread *cur_wt;
 
+int js_on_worker_thread(void) { return cur_wt != 0; }
+
 /* The parts of the JavaScript scope run so far: the core always, URL/Blob/... and fetch/WebSocket/... on first use */
 static __thread unsigned parts_loaded;
 enum { PART_WEB = 1, PART_NET = 2 };
@@ -726,7 +728,7 @@ static js_value wt_clone_read(js_ctx *ctx, const char *kind, const unsigned char
 {
   js_value ctor = js_get(ctx, js_obj_value(ctx->global), "Blob"), args[2], parts, r;
   js_object *opts;
-  if (streq(kind, "ocanvas"))
+  if (streq(kind, "ocanvas") || streq(kind, "bitmap"))
     return canvas_clone_read(ctx, kind, bytes, len);
   if (streq(kind, "lport"))
     return ports_local_read(ctx, bytes, len);

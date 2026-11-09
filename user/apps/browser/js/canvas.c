@@ -1598,14 +1598,27 @@ void canvas_js_setup_worker(js_ctx *ctx, js_object *win)
   canvas_owner = ctx;
   canvas_setup_core(ctx, win);
   canvas_path_setup(ctx, win);
+  canvas_img_setup_worker(ctx, win);
 }
 
 int canvas_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
 {
-  struct chost *oc = host_of(v, HK_OFFSCREEN);
+  struct chost *oc = host_of(v, HK_OFFSCREEN), *bm = host_of(v, HK_BITMAP);
   struct canvas_rec *r;
   (void)ctx;
   (void)meta;
+  if (bm && bm->p) { /* an ImageBitmap crosses as its pixels */
+    unsigned n = (unsigned)bm->w * (unsigned)bm->h * 4;
+    *bytes = malloc(8 + n);
+    if (!*bytes)
+      return 0;
+    memcpy(*bytes, &bm->w, 4);
+    memcpy(*bytes + 4, &bm->h, 4);
+    memcpy(*bytes + 8, bm->p, n);
+    *len = (int)(8 + n);
+    strcpy(kind, "bitmap");
+    return 1;
+  }
   if (!oc)
     return 0;
   r = oc->p;
@@ -1622,6 +1635,21 @@ js_value canvas_clone_read(js_ctx *ctx, const char *kind, const unsigned char *b
 {
   int id = 0;
   struct canvas_rec *r;
+  if (streq(kind, "bitmap")) {
+    int w, h;
+    unsigned char *px;
+    if (len < 8)
+      return js_undef();
+    memcpy(&w, bytes, 4);
+    memcpy(&h, bytes + 4, 4);
+    if (w <= 0 || h <= 0 || len != 8 + w * h * 4)
+      return js_undef();
+    px = malloc((unsigned)w * (unsigned)h * 4);
+    if (!px)
+      return js_undef();
+    memcpy(px, bytes + 8, (unsigned)w * (unsigned)h * 4);
+    return make_bitmap(ctx, px, w, h);
+  }
   if (!streq(kind, "ocanvas") || len != (int)sizeof id)
     return js_undef();
   memcpy(&id, bytes, sizeof id);

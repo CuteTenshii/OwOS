@@ -182,6 +182,7 @@ unsigned char *decode_data_url(const char *url, int *outlen, char *ctype, int ca
   snprintf(ctype, (size_t)cap, "image/x-raw");
   return out;
 }
+int image_sniff(const unsigned char *data, int len) { return len >= 3 && memcmp(data, "RAW", 3) == 0 ? 3 : 0; }
 unsigned char *image_decode_rgba(const unsigned char *data, int len, unsigned current_color, int max_edge, unsigned *w,
                                  unsigned *h)
 {

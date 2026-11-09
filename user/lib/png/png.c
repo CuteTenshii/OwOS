@@ -16,6 +16,7 @@
  */
 #include "png.h"
 #include "inflate.h"
+#include "owos.h"
 #include <stdint.h>
 
 #define MAXW 4096              /* widest image we'll decode (bounds buffers)   */
@@ -55,10 +56,8 @@ struct dec {
   uint8_t cur[1 + ROWBYTES]; /* current scanline: filter byte + samples */
   uint8_t prev[ROWBYTES];    /* previous reconstructed samples          */
   uint8_t rgba[MAXW * 4];    /* one RGBA row handed to the callback     */
+  uint8_t *il_frame;         /* interlaced de-interlace buffer (RGBA), allocated when needed */
 };
-
-static struct dec D;
-static uint8_t il_frame[IL_MAXPX * 4]; /* interlaced de-interlace buffer   */
 
 /* Adam7 interlace pass geometry. */
 static const unsigned IL_XSTART[7] = {0, 4, 0, 2, 0, 1, 0};
@@ -346,7 +345,7 @@ static int sink_interlaced(struct dec *d, const unsigned char *buf, unsigned n)
       row_to_rgba(d, d->cur + 1, d->rgba, d->pass_w);
       unsigned fy = IL_YSTART[d->pass] + d->pass_row * IL_YSTEP[d->pass];
       unsigned xs = IL_XSTART[d->pass], xst = IL_XSTEP[d->pass];
-      uint8_t *base = il_frame + (unsigned long)fy * d->w * 4;
+      uint8_t *base = d->il_frame + (unsigned long)fy * d->w * 4;
       for (unsigned x = 0; x < d->pass_w; x++) {
         uint8_t *o = base + (unsigned long)(xs + x * xst) * 4;
         const uint8_t *s = d->rgba + x * 4;
@@ -1014,9 +1013,9 @@ static int set_format(struct dec *d)
   return 0;
 }
 
-int png_decode(png_reader rd, void *rctx, png_row row, void *row_ctx, unsigned *out_w, unsigned *out_h)
+static int decode_with(struct dec *d, png_reader rd, void *rctx, png_row row, void *row_ctx, unsigned *out_w,
+                       unsigned *out_h)
 {
-  struct dec *d = &D;
   d->rd = rd;
   d->rctx = rctx;
   d->row = row;
@@ -1142,6 +1141,9 @@ int png_decode(png_reader rd, void *rctx, png_row row, void *row_ctx, unsigned *
   if (d->interlaced) {
     if ((unsigned long)d->w * d->h > IL_MAXPX)
       return PNG_EUNSUP;
+    d->il_frame = (uint8_t *)calloc(d->w * d->h, 4);
+    if (!d->il_frame)
+      return PNG_EUNSUP;
     il_next_pass(d); /* prime the first pass   */
   }
 
@@ -1158,7 +1160,7 @@ int png_decode(png_reader rd, void *rctx, png_row row, void *row_ctx, unsigned *
     if (d->pass < 7)
       return PNG_EINFLATE;                /* didn't finish passes   */
     for (unsigned y = 0; y < d->h; y++) { /* emit the assembled rows*/
-      if (d->row(d->row_ctx, y, il_frame + (unsigned long)y * d->w * 4, d->w) < 0)
+      if (d->row(d->row_ctx, y, d->il_frame + (unsigned long)y * d->w * 4, d->w) < 0)
         return PNG_OK; /* caller stopped: fine   */
     }
     return PNG_OK;
@@ -1171,4 +1173,16 @@ int png_decode(png_reader rd, void *rctx, png_row row, void *row_ctx, unsigned *
   if (d->cur_y < d->h)
     return PNG_EINFLATE; /* didn't get every row      */
   return PNG_OK;
+}
+
+int png_decode(png_reader rd, void *rctx, png_row row, void *row_ctx, unsigned *out_w, unsigned *out_h)
+{
+  struct dec *d = (struct dec *)calloc(1, sizeof *d);
+  int rc;
+  if (!d)
+    return PNG_EUNSUP;
+  rc = decode_with(d, rd, rctx, row, row_ctx, out_w, out_h);
+  free(d->il_frame);
+  free(d);
+  return rc;
 }

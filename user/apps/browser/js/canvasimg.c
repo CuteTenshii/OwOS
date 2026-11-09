@@ -280,31 +280,68 @@ js_value make_bitmap(js_ctx *ctx, unsigned char *px, int w, int h)
   return bm;
 }
 
+/* The bytes of a Blob or File, a page one (a byte string) or a worker one (a Uint8Array); NULL for anything else */
+static const unsigned char *blob_bytes(js_ctx *ctx, js_value v, int *len)
+{
+  js_value b;
+  if (v.type != JV_OBJ || !js_has_own(v.u.obj, "@bytes"))
+    return 0;
+  b = js_get(ctx, v, "@bytes");
+  if (b.type == JV_STR) {
+    *len = b.u.str->len;
+    return (const unsigned char *)b.u.str->data;
+  }
+  return view_bytes(b, len);
+}
+
 static js_value create_image_bitmap(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct pixsrc src;
+  unsigned char *decoded = 0, *px;
+  const unsigned char *bytes;
+  int blen = 0, rc, sx = 0, sy = 0, sw, sh, y;
+  js_value bm, p;
   (void)t;
-  int rc = source_pixels(ctx, A(0), &src);
+  bytes = blob_bytes(ctx, A(0), &blen);
+  if (bytes) {
+    unsigned w, h;
+    /* a worker thread leaves SVG to the page: its rasteriser shares font state */
+    int fmt = image_sniff(bytes, blen);
+    if (fmt != IMG_FMT_NONE && (fmt != IMG_FMT_SVG || !js_on_worker_thread()))
+      decoded = image_decode_rgba(bytes, blen, 0, MAX_IMAGE_SIDE, &w, &h);
+    if (!decoded)
+      return js_promise_rejected(ctx, dom_exception(ctx, "InvalidStateError", "The source image could not be decoded"));
+    src.rgba = decoded;
+    src.w = (int)w;
+    src.h = (int)h;
+    rc = SRC_OK;
+  } else
+    rc = source_pixels(ctx, A(0), &src);
   if (rc == SRC_BAD_TYPE)
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError",
                                                   "The provided value is not of type '(HTMLImageElement or "
-                                                  "HTMLCanvasElement or OffscreenCanvas or ImageData)'"));
+                                                  "HTMLCanvasElement or OffscreenCanvas or ImageData or Blob)'"));
   if (rc == SRC_NOT_READY)
     return js_promise_rejected(ctx, dom_exception(ctx, "InvalidStateError", "The source image is not ready"));
-  int sx = 0, sy = 0, sw = src.w, sh = src.h;
+  sw = src.w;
+  sh = src.h;
   if (argc >= 5) {
     sx = js_to_int_sat(ctx, args[1]);
     sy = js_to_int_sat(ctx, args[2]);
     sw = js_to_int_sat(ctx, args[3]);
     sh = js_to_int_sat(ctx, args[4]);
   }
-  if (sw <= 0 || sh <= 0 || (long long)sw * sh > 16 * 1024 * 1024)
+  if (sw <= 0 || sh <= 0 || (long long)sw * sh > 16 * 1024 * 1024) {
+    free(decoded);
     return js_promise_rejected(
         ctx, js_make_error(ctx, ctx->error_proto, "RangeError", "The crop rectangle is empty or too large"));
-  unsigned char *px = calloc((unsigned)sw * (unsigned)sh, 4);
-  if (!px)
+  }
+  px = calloc((unsigned)sw * (unsigned)sh, 4);
+  if (!px) {
+    free(decoded);
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->error_proto, "RangeError", "out of memory"));
-  for (int y = 0; y < sh; y++) {
+  }
+  for (y = 0; y < sh; y++) {
     int yy = sy + y;
     if (yy < 0 || yy >= src.h)
       continue;
@@ -313,28 +350,38 @@ static js_value create_image_bitmap(js_ctx *ctx, js_value t, js_value *args, int
       memcpy(px + ((unsigned long)y * sw + x0) * 4, src.rgba + ((unsigned long)yy * src.w + sx + x0) * 4,
              (unsigned long)(x1 - x0) * 4);
   }
+  free(decoded);
   gc_push_scope();
-  js_value bm = make_bitmap(ctx, px, sw, sh);
+  bm = make_bitmap(ctx, px, sw, sh);
   if (bm.type == JV_OBJ)
     gc_keep(bm.u.obj);
-  js_value p = bm.type == JV_OBJ ? js_promise_resolved(ctx, bm) : js_promise_rejected(ctx, bm);
+  p = bm.type == JV_OBJ ? js_promise_resolved(ctx, bm) : js_promise_rejected(ctx, bm);
   gc_pop_scope();
   return p;
 }
 
-void canvas_img_setup(js_ctx *ctx, js_object *win)
+/* ImageBitmap and createImageBitmap, for the page and for a worker */
+static void bitmap_setup(js_ctx *ctx, js_object *win)
 {
+  js_object *ic;
   g_bitmap_proto = js_new_object(ctx, ctx->object_proto);
   gc_add_root((void **)&g_bitmap_proto);
-  def_method(g_bitmap_proto, "close", bitmap_close, 0);
-  def_method(win, "createImageBitmap", create_image_bitmap, 1);
-  js_object *ic = js_new_native(ctx, js_illegal_ctor, "ImageBitmap", 0);
+  js_def_native(ctx, g_bitmap_proto, "close", bitmap_close, 0);
+  js_def_native(ctx, win, "createImageBitmap", create_image_bitmap, 1);
+  ic = js_new_native(ctx, js_illegal_ctor, "ImageBitmap", 0);
   gc_push_scope();
   gc_keep(ic);
   js_def(ic, "prototype", js_obj_value(g_bitmap_proto), 0);
   js_def(g_bitmap_proto, "constructor", js_obj_value(ic), P_WRITABLE | P_CONFIGURABLE);
   js_def(win, "ImageBitmap", js_obj_value(ic), P_WRITABLE | P_CONFIGURABLE);
   gc_pop_scope();
+}
+
+void canvas_img_setup_worker(js_ctx *ctx, js_object *win) { bitmap_setup(ctx, win); }
+
+void canvas_img_setup(js_ctx *ctx, js_object *win)
+{
+  bitmap_setup(ctx, win);
 
   for (unsigned i = 0; i < g_nhtml_ifaces; i++) {
     if (!streq(g_html_ifaces[i].name, "HTMLImageElement"))

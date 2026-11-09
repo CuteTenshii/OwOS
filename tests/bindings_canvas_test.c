@@ -241,6 +241,25 @@ static void test_draw_image_sources(void)
   expect(pixel("c", 34, 0)[0] == 255 && pixel("c", 34, 0)[1] == 255 && pixel("c", 35, 1)[3] == 255);
 }
 
+static void test_bitmap_from_blob(void)
+{
+  /* "RAW" 2 1 then a red and a blue pixel; the host build decodes that in place of PNG/WebP/GIF */
+  run_script(
+      "var raw=new Uint8Array([82,65,87,2,1,255,0,0,255,0,0,255,255]), bm=null, part=null, bad=null, wrong=null;\n"
+      "createImageBitmap(new Blob([raw])).then(function(b){ bm=b; });\n"
+      "createImageBitmap(new Blob([raw]),1,0,1,1).then(function(b){ part=b; });\n"
+      "createImageBitmap(new Blob([new Uint8Array([1,2,3,4,5])])).then(null,function(e){ bad=e.name; });\n"
+      "createImageBitmap(5).then(null,function(e){ wrong=e.name; });\n"
+      "expect(bm instanceof ImageBitmap && bm.width===2 && bm.height===1, 'a Blob decodes to an ImageBitmap');\n"
+      "expect(part && part.width===1 && part.height===1, 'a crop rectangle applies to a Blob');\n"
+      "expect(bad==='InvalidStateError' && wrong==='TypeError', 'bad blobs and bad sources reject: '+bad+' '+wrong);\n"
+      "var dst=new OffscreenCanvas(2,1).getContext('2d'); dst.drawImage(bm,0,0);\n"
+      "expect(dst.getImageData(0,0,1,1).data[0]===255 && dst.getImageData(1,0,1,1).data[2]===255, 'the decoded pixels "
+      "draw');\n"
+      "var d2=new OffscreenCanvas(1,1).getContext('2d'); d2.drawImage(part,0,0);\n"
+      "expect(d2.getImageData(0,0,1,1).data[2]===255, 'the cropped bitmap holds the second pixel');\n");
+}
+
 static void test_offscreen_transfer(void)
 {
   run_script(
@@ -305,6 +324,27 @@ static void test_offscreen_in_worker(void)
   run_script("expect(own && own.px==='255,255' && own.big && own.type==='image/png' && own.blob, 'worker-owned canvas: "
              "'+JSON.stringify(own));\n"
              "w2.terminate();\n");
+  /* createImageBitmap in a worker, and an ImageBitmap crossing to the page */
+  run_script(
+      "window.bmr=null; var w3=new Worker('data:text/javascript,var raw=new "
+      "Uint8Array([82,65,87,2,1,255,0,0,255,0,0,255,255]); "
+      "createImageBitmap(new Blob([raw])).then(function(b){ var o=new OffscreenCanvas(2,1), c=o.getContext(\"2d\"); "
+      "c.drawImage(b,0,0); var px=c.getImageData(1,0,1,1).data; "
+      "postMessage({bm:b, blue:px[2], is:b instanceof ImageBitmap, w:b.width}); });');\n"
+      "w3.onmessage=function(e){ window.bmr=e.data };\n");
+  for (int i = 0; i < 600; i++) {
+    js_workers_pump();
+    if (js_get(g_ctx, js_obj_value(g_ctx->global), "bmr").type == JV_OBJ)
+      break;
+    msleep(5);
+  }
+  run_script(
+      "expect(bmr && bmr.blue===255 && bmr.is===true && bmr.w===2, 'worker createImageBitmap: '+JSON.stringify(bmr));\n"
+      "expect(bmr.bm instanceof ImageBitmap && bmr.bm.width===2 && bmr.bm.height===1, 'an ImageBitmap crosses from a "
+      "worker');\n"
+      "var back=new OffscreenCanvas(2,1).getContext('2d'); back.drawImage(bmr.bm,0,0);\n"
+      "expect(back.getImageData(0,0,1,1).data[0]===255, 'and keeps its pixels');\n"
+      "w3.terminate();\n");
 }
 
 static void test_composite_shadow_clip(void)
@@ -416,6 +456,7 @@ int main(void)
   test("gradients and patterns", test_gradients_and_patterns);
   test("ImageData round trips", test_image_data);
   test("drawImage from canvas sources", test_draw_image_sources);
+  test("createImageBitmap from a Blob", test_bitmap_from_blob);
   test("OffscreenCanvas transfer to bitmap and from element", test_offscreen_transfer);
   test("OffscreenCanvas inside a worker", test_offscreen_in_worker);
   test("composite operations, clip and shadows", test_composite_shadow_clip);

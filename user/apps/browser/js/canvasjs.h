@@ -37,6 +37,7 @@ void canvas_path_setup(js_ctx *ctx, js_object *win);
 const unsigned char *js_image_pixels(struct dom_node *img, int *w, int *h);
 js_value make_bitmap(js_ctx *ctx, unsigned char *px, int w, int h);
 void canvas_img_setup(js_ctx *ctx, js_object *win);
+void canvas_img_setup_worker(js_ctx *ctx, js_object *win); /* ImageBitmap and createImageBitmap only */
 void canvas_img_teardown(void);
 
 /* Run `fn` once from the timer queue with `data` readable as ctx->native_data on entry. */
