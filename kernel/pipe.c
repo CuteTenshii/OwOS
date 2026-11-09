@@ -55,7 +55,9 @@ int pipe_read(int id, char *buf, int len)
   struct pipe *p = &pipes[id];
   while (p->count == 0) {
     if (p->writers <= 0)
-      return 0;    /* EOF: drained and no writers left */
+      return 0; /* EOF: drained and no writers left */
+    if (sched_intr_pending())
+      return -1;   /* EINTR: let the signal (SIGKILL included) be delivered */
     sched_yield(); /* let a writer run */
   }
   int n = 0;
@@ -89,7 +91,9 @@ int pipe_write(int id, const char *buf, int len)
   while (n < len) {
     while (p->count == PIPE_SIZE) {
       if (p->readers <= 0)
-        return n;    /* nobody reading; stop */
+        return n; /* nobody reading; stop */
+      if (sched_intr_pending())
+        return n ? n : -1;
       sched_yield(); /* let the reader drain it */
     }
     p->buf[p->head] = buf[n++];
