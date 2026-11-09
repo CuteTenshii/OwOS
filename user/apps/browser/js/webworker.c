@@ -9,6 +9,7 @@
 #include "features/cors/cors.h"
 #include "fetchint.h"
 #include "mutex.h"
+#include "websocket.h"
 
 #define JS(...) #__VA_ARGS__
 
@@ -19,14 +20,18 @@ static const char k_events_js[] =
 static const char k_web_js[] =
 #include "workerscope_web.inc"
     ;
-static const char *const k_parts[] = {k_events_js, k_web_js};
+static const char k_net_js[] =
+#include "workerscope_net.inc"
+    ;
+static const char *const k_parts[] = {k_events_js, k_web_js, k_net_js};
 
-enum { WM_DATA, WM_ERROR, WM_LOG };
+/* WM_REQUEST: a worker asks the page thread to do something; WM_REPLY (level = request id) answers it */
+enum { WM_DATA, WM_ERROR, WM_LOG, WM_REQUEST, WM_REPLY };
 
 struct wmsg {
   struct wmsg *next;
   int kind;
-  int level; /* WM_LOG: JS_LOG_* */
+  int level; /* WM_LOG: JS_LOG_*; WM_REPLY: the request id */
   js_clone *clone;
   char *text;
 };
@@ -275,6 +280,19 @@ static js_value wt_post(js_ctx *ctx, js_value t, js_value *args, int argc)
   if (c)
     wmsg_post(cur_wt, &cur_wt->out, WM_DATA, 0, c, 0);
   return js_undef();
+}
+
+/* structuredClone(value, {transfer}): the full algorithm, the same one postMessage uses */
+static js_value wt_structured_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_clone *c = js_clone_write(ctx, A(0), A(1));
+  js_value v;
+  (void)t;
+  if (!c)
+    return js_undef();
+  v = js_clone_read(ctx, c);
+  js_clone_free(c);
+  return v;
 }
 
 static js_value wt_close(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -617,6 +635,180 @@ static js_value wt_n_revoke_object_url(js_ctx *ctx, js_value t, js_value *args, 
   return js_undef();
 }
 
+/* N.request(payload): hand a request ({op, id, ...}) to the page thread; its answer comes back as a reply */
+static js_value wt_n_request(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_clone *c = js_clone_write(ctx, A(0), js_undef());
+  (void)t;
+  if (c)
+    wmsg_post(cur_wt, &cur_wt->out, WM_REQUEST, 0, c, 0);
+  return js_undef();
+}
+
+/* The first queued reply to request `id`, or NULL; *seq as for wq_take_one */
+static struct wmsg *wq_take_reply(struct wthread *wt, int id, unsigned *seq)
+{
+  struct wmsg *m, *prev = 0;
+  mutex_lock(&wt->lock);
+  for (m = wt->in.head; m; prev = m, m = m->next)
+    if (m->kind == WM_REPLY && m->level == id) {
+      if (prev)
+        prev->next = m->next;
+      else
+        wt->in.head = m->next;
+      if (wt->in.tail == m)
+        wt->in.tail = prev;
+      break;
+    }
+  *seq = __atomic_load_n(&wt->seq, __ATOMIC_ACQUIRE);
+  mutex_unlock(&wt->lock);
+  return m;
+}
+
+/* N.waitReply(id): block for the answer to request `id` (synchronous XMLHttpRequest, permission checks) */
+static js_value wt_n_wait_reply(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int id = (int)js_to_number(ctx, A(0));
+  (void)t;
+  for (;;) {
+    unsigned seen;
+    struct wmsg *m = wq_take_reply(cur_wt, id, &seen);
+    if (m) {
+      js_value data = js_clone_read(ctx, m->clone);
+      wmsg_free(m);
+      return data;
+    }
+    if (js_irq_stopped(ctx->irq))
+      return js_undef();
+    futex_wait(&cur_wt->seq, seen, 50);
+  }
+}
+
+/* WebSockets live on the worker thread: the connect blocks it, as the page blocks on its own */
+#define WS_MAX 16
+static __thread ws_conn *wsconns[WS_MAX];
+static __thread int nwsconns;
+
+static js_value wt_n_ws_open(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value url = js_to_string(ctx, A(0)), protos = js_to_string(ctx, A(1));
+  char u[URL_MAX], p[256];
+  ws_conn *c;
+  int i;
+  (void)t;
+  if (url.type != JV_STR || protos.type != JV_STR)
+    return js_number(-1);
+  snprintf(u, sizeof u, "%s", url.u.str->data);
+  snprintf(p, sizeof p, "%s", protos.u.str->data);
+  for (i = 0; i < WS_MAX && wsconns[i]; i++)
+    ;
+  if (i == WS_MAX || !(c = ws_open(u, p[0] ? p : 0)))
+    return js_number(-1);
+  wsconns[i] = c;
+  nwsconns++;
+  return js_number(i);
+}
+
+static ws_conn *ws_slot(js_ctx *ctx, js_value v)
+{
+  double d = js_to_number(ctx, v);
+  return d >= 0 && d < WS_MAX ? wsconns[(int)d] : 0;
+}
+
+static js_value wt_n_ws_protocol(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  ws_conn *c = ws_slot(ctx, A(0));
+  (void)t;
+  return js_mk_cstring(ctx, c ? ws_protocol(c) : "");
+}
+
+static js_value wt_n_ws_send(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  ws_conn *c = ws_slot(ctx, A(0));
+  int len = 0;
+  const unsigned char *bytes;
+  (void)t;
+  if (!c || ws_state(c) != WS_OPEN)
+    return js_bool(0);
+  if (A(1).type == JV_STR)
+    return js_bool(ws_send(c, A(1).u.str->data, A(1).u.str->len, 1) == 0);
+  bytes = view_bytes(A(1), &len);
+  return js_bool(bytes && ws_send(c, bytes, len, 0) == 0);
+}
+
+static js_value wt_n_ws_close(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  ws_conn *c = ws_slot(ctx, A(0));
+  js_value reason = js_to_string(ctx, A(2));
+  (void)t;
+  if (c && ws_state(c) != WS_CLOSED)
+    ws_close(c, (int)js_to_number(ctx, A(1)), reason.type == JV_STR ? reason.u.str->data : "");
+  return js_undef();
+}
+
+/* Call N.<name>(...) in the worker, reporting a throw */
+static void wt_hook(js_ctx *ctx, const char *name, js_value *args, int argc)
+{
+  js_value n = js_get(ctx, js_obj_value(ctx->global), "@N"), fn = n.type == JV_OBJ ? js_get(ctx, n, name) : js_undef();
+  if (!js_is_callable(fn))
+    return;
+  js_call(ctx, fn, n, args, argc);
+  if (ctx->has_exc)
+    wt_report(ctx);
+  wt_run_microtasks(ctx);
+}
+
+/* Drain every open socket; true if anything was delivered */
+static bool wt_pump_ws(js_ctx *ctx)
+{
+  bool fired = false;
+  int i;
+  for (i = 0; i < WS_MAX; i++) {
+    ws_conn *c = wsconns[i];
+    while (c) {
+      const uint8_t *data = 0;
+      int len = 0, is_text = 0, ev = ws_poll(c, &data, &len, &is_text);
+      js_value args[3];
+      if (ev == WS_EV_NONE)
+        break;
+      gc_push_scope();
+      args[0] = js_number(i);
+      args[1] = js_mk_cstring(ctx, ev == WS_EV_MESSAGE ? "message" : ev == WS_EV_CLOSE ? "close" : "error");
+      gc_keep(args[1].u.str);
+      args[2] = js_undef();
+      if (ev == WS_EV_MESSAGE) {
+        args[2] = is_text ? js_mk_string(ctx, (const char *)data, len) : js_new_arraybuffer(ctx, data, len);
+        gc_keep(args[2].type == JV_STR ? (void *)args[2].u.str : (void *)args[2].u.obj);
+      } else {
+        ws_free(c);
+        wsconns[i] = 0;
+        nwsconns--;
+        c = 0;
+      }
+      wt_hook(ctx, "onws", args, 3);
+      gc_pop_scope();
+      fired = true;
+      if (ev != WS_EV_MESSAGE)
+        break;
+    }
+  }
+  return fired;
+}
+
+/* A page reply arrives: N.onreply(data) settles whatever was waiting for it */
+static void wt_dispatch_reply(js_ctx *ctx, js_clone *c)
+{
+  js_value data = js_clone_read(ctx, c);
+  gc_push_scope();
+  if (data.type == JV_OBJ)
+    gc_keep(data.u.obj);
+  if (ctx->has_exc)
+    wt_report(ctx);
+  else
+    wt_hook(ctx, "onreply", &data, 1);
+  gc_pop_scope();
+}
+
 /* Run the JavaScript parts of the global scope; false (exception pending) if one fails */
 static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
 {
@@ -630,6 +822,13 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "encodingName", wt_n_encoding_name, 1);
   js_def_native(ctx, n, "decode", wt_n_decode, 4);
   js_def_native(ctx, n, "randomFill", wt_n_random_fill, 1);
+  js_def_native(ctx, n, "request", wt_n_request, 1);
+  js_def_native(ctx, n, "waitReply", wt_n_wait_reply, 1);
+  js_def_native(ctx, n, "wsOpen", wt_n_ws_open, 2);
+  js_def_native(ctx, n, "wsProtocol", wt_n_ws_protocol, 1);
+  js_def_native(ctx, n, "wsSend", wt_n_ws_send, 2);
+  js_def_native(ctx, n, "wsClose", wt_n_ws_close, 3);
+  js_def(ctx->global, "@N", js_obj_value(n), 0);
   js_def_native(ctx, n, "createObjectURL", wt_n_create_object_url, 3);
   js_def_native(ctx, n, "revokeObjectURL", wt_n_revoke_object_url, 1);
   for (i = 0; ok && i < sizeof k_parts / sizeof *k_parts; i++) {
@@ -653,6 +852,7 @@ static void wt_setup(js_ctx *ctx, struct wthread *wt)
   gc_push_scope();
   js_def_native(ctx, g, "postMessage", wt_post, 1);
   js_def_native(ctx, g, "close", wt_close, 0);
+  js_def_native(ctx, g, "structuredClone", wt_structured_clone, 1);
   js_def_native(ctx, g, "importScripts", wt_import_scripts, 1);
   js_def_native(ctx, g, "setTimeout", wt_set_timeout, 2);
   js_def_native(ctx, g, "setInterval", wt_set_interval, 2);
@@ -699,11 +899,15 @@ static void wt_loop(js_ctx *ctx, struct wthread *wt)
     struct wmsg *m = wq_take_one(wt, &wt->in, &seen);
     int i;
     if (m) {
-      if (m->clone)
+      if (m->kind == WM_REPLY)
+        wt_dispatch_reply(ctx, m->clone);
+      else if (m->clone)
         wt_deliver(ctx, m->clone);
       wmsg_free(m);
       continue;
     }
+    if (nwsconns && wt_pump_ws(ctx))
+      continue;
     if (fire_due_timer(ctx))
       continue;
     if (ntimers) { /* sleep until the nearest timer; futex time 0 means forever */
@@ -714,6 +918,8 @@ static void wt_loop(js_ctx *ctx, struct wthread *wt)
           best = (int)(timers[i].due - now);
       wait = best < 1 ? 1 : (unsigned)best;
     }
+    if (nwsconns && (wait == 0 || wait > 10))
+      wait = 10; /* sockets have no wake-up of their own: look again soon */
     futex_wait(&wt->seq, seen, wait);
   }
 }
@@ -786,6 +992,8 @@ static void worker_main(void *arg)
     js_arena_free(wt->arenas[i]);
     free(wt->arenas[i]);
   }
+  for (i = 0; i < WS_MAX; i++)
+    ws_free(wsconns[i]);
   free(wt->arenas);
   wt->arenas = 0;
   free(wt->src);
@@ -808,6 +1016,9 @@ static char *fetch_source(const char *url)
   if (starts_ci(url, "data:")) {
     char ctype[64];
     body = decode_data_url(url, &len, ctype, sizeof ctype);
+  } else if (starts_ci(url, "blob:")) {
+    char ctype[64];
+    body = blobstore_get(url, &len, ctype, sizeof ctype);
   } else {
     struct http_req rq = {0};
     struct http_resp rs = {0};
@@ -846,6 +1057,288 @@ static void serve_rpc(struct wthread *wt)
   wt->rpc_err = err;
   __atomic_store_n(&wt->rpc, 2, __ATOMIC_RELEASE);
   futex_wake(&wt->rpc, 1);
+}
+
+static js_value reply_error(js_ctx *ctx, int id, const char *message)
+{
+  js_object *o = js_new_object(ctx, ctx->object_proto);
+  js_value ov = js_obj_value(o);
+  gc_push_scope();
+  gc_keep(o);
+  js_def(o, "id", js_number(id), P_ENUMERABLE);
+  js_def(o, "ok", js_bool(0), P_ENUMERABLE);
+  js_def(o, "error", js_mk_cstring(ctx, message), P_ENUMERABLE);
+  gc_pop_scope();
+  return ov;
+}
+
+static const char *status_text(int status)
+{
+  switch (status) {
+  case 200:
+    return "OK";
+  case 201:
+    return "Created";
+  case 202:
+    return "Accepted";
+  case 204:
+    return "No Content";
+  case 206:
+    return "Partial Content";
+  case 301:
+    return "Moved Permanently";
+  case 302:
+    return "Found";
+  case 303:
+    return "See Other";
+  case 304:
+    return "Not Modified";
+  case 307:
+    return "Temporary Redirect";
+  case 308:
+    return "Permanent Redirect";
+  case 400:
+    return "Bad Request";
+  case 401:
+    return "Unauthorized";
+  case 403:
+    return "Forbidden";
+  case 404:
+    return "Not Found";
+  case 405:
+    return "Method Not Allowed";
+  case 409:
+    return "Conflict";
+  case 410:
+    return "Gone";
+  case 429:
+    return "Too Many Requests";
+  case 500:
+    return "Internal Server Error";
+  case 502:
+    return "Bad Gateway";
+  case 503:
+    return "Service Unavailable";
+  case 504:
+    return "Gateway Timeout";
+  default:
+    return "";
+  }
+}
+
+/* Header block ("HTTP/1.1 200 OK" line first) -> [[name, value], ...], set-cookie left out */
+static js_value parse_header_block(js_ctx *ctx, const char *hdr)
+{
+  js_object *list = js_new_array(ctx, 0);
+  const char *p = hdr, *eol;
+  gc_push_scope();
+  gc_keep(list);
+  while (*p && (eol = strchr(p, '\n'))) {
+    const char *colon = memchr(p, ':', (size_t)(eol - p)), *vs, *ve = eol;
+    if (colon && p != hdr && colon > p && p[0] != '\r') {
+      char name[128];
+      int nl = (int)(colon - p);
+      js_object *pair;
+      if (nl < (int)sizeof name) {
+        memcpy(name, p, (unsigned)nl);
+        name[nl] = 0;
+        vs = colon + 1;
+        while (vs < ve && (*vs == ' ' || *vs == '\t'))
+          vs++;
+        while (ve > vs && (ve[-1] == '\r' || ve[-1] == ' '))
+          ve--;
+        if (!streq_ci(name, "set-cookie") && !streq_ci(name, "set-cookie2")) {
+          pair = js_new_array(ctx, 0);
+          gc_push_scope();
+          gc_keep(pair);
+          js_array_push(ctx, pair, js_mk_cstring(ctx, name));
+          js_array_push(ctx, pair, js_mk_string(ctx, vs, (int)(ve - vs)));
+          js_array_push(ctx, list, js_obj_value(pair));
+          gc_pop_scope();
+        }
+      }
+    }
+    p = eol + 1;
+  }
+  gc_pop_scope();
+  return js_obj_value(list);
+}
+
+/* A worker's fetch(): {url, method, headers:[[k,v]], body:ArrayBuffer|null, credentials} -> the response */
+static js_value request_fetch(js_ctx *ctx, int id, js_value req)
+{
+  char url[URL_MAX], use[URL_MAX], reason[64], method[16] = "GET", ctype[160] = "", final_url[URL_MAX], hdr[16384];
+  js_value v, headers, body;
+  struct http_req rq = {0};
+  struct http_resp rs = {0};
+  char *extra = 0;
+  int extra_len = 0, extra_cap = 0, with_creds = 0, status, blen = 0;
+  const unsigned char *breq = 0;
+  unsigned char *out;
+  unsigned i, n;
+  js_object *reply;
+  js_value rv;
+  v = js_get(ctx, req, "url");
+  snprintf(url, sizeof url, "%s", v.type == JV_STR ? v.u.str->data : "");
+  v = js_get(ctx, req, "method");
+  if (v.type == JV_STR)
+    snprintf(method, sizeof method, "%s", v.u.str->data);
+  v = js_get(ctx, req, "credentials");
+  with_creds = v.type == JV_STR && streq(v.u.str->data, "include");
+  if (!url[0])
+    return reply_error(ctx, id, "Failed to parse URL");
+  if (B->pg->csp) {
+    if (!csp_check_url(B->pg->csp, CSP_CONNECT, url, g_page_url_buf, use, sizeof use, reason, sizeof reason)) {
+      js_csp_log("connection to", url, reason);
+      return reply_error(ctx, id, "Refused to connect (Content-Security-Policy)");
+    }
+    snprintf(url, sizeof url, "%s", use);
+  }
+  headers = js_get(ctx, req, "headers");
+  n = headers.type == JV_OBJ ? js_array_len(headers.u.obj) : 0;
+  for (i = 0; i < n; i++) {
+    js_value pair = js_get_index(ctx, headers, i), k = js_to_string(ctx, js_get_index(ctx, pair, 0)),
+             val = js_to_string(ctx, js_get_index(ctx, pair, 1));
+    int need;
+    if (k.type != JV_STR || val.type != JV_STR)
+      continue;
+    if (streq_ci(k.u.str->data, "content-type")) {
+      snprintf(ctype, sizeof ctype, "%s", val.u.str->data);
+      continue;
+    }
+    need = k.u.str->len + val.u.str->len + 5;
+    if (extra_len + need + 1 > extra_cap) {
+      char *ne = (char *)realloc(extra, (unsigned)(extra_cap = (extra_len + need + 1) * 2));
+      if (!ne) {
+        free(extra);
+        return reply_error(ctx, id, "Out of memory");
+      }
+      extra = ne;
+    }
+    extra_len +=
+        snprintf(extra + extra_len, (unsigned)(extra_cap - extra_len), "%s: %s\r\n", k.u.str->data, val.u.str->data);
+  }
+  body = js_get(ctx, req, "body");
+  if (body.type == JV_OBJ)
+    breq = view_bytes(body, &blen);
+  rq.url = url;
+  rq.method = method;
+  rq.body = breq;
+  rq.body_len = blen;
+  rq.ctype = ctype[0] ? ctype : 0;
+  rq.extra_hdrs = extra;
+  rs.final_url = final_url;
+  rs.final_cap = sizeof final_url;
+  rs.hdr = hdr;
+  rs.hdr_cap = sizeof hdr;
+  final_url[0] = 0;
+  hdr[0] = 0;
+  if (starts_ci(url, "data:")) {
+    int dl = 0;
+    out = decode_data_url(url, &dl, rs.ctype, sizeof rs.ctype);
+    rs.len = dl;
+    rs.status = out ? 200 : 0;
+    snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n\r\n", rs.ctype);
+  } else
+    out = starts_ci(url, "blob:") ? browser_fetch(&rq, &rs) : browser_cors_fetch(g_page_url_buf, with_creds, &rq, &rs);
+  free(extra);
+  status = rs.status;
+  if (!out)
+    return reply_error(ctx, id, "Failed to fetch");
+  gc_push_scope();
+  reply = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(reply, "id", js_number(id), P_ENUMERABLE);
+  js_def(reply, "ok", js_bool(1), P_ENUMERABLE);
+  js_def(reply, "status", js_number(status), P_ENUMERABLE);
+  {
+    const char *sp = strchr(hdr, ' '), *eol = strchr(hdr, '\n');
+    const char *text = status_text(status);
+    char st[64];
+    st[0] = 0;
+    if (sp && eol && sp < eol && (sp = strchr(sp + 1, ' ')) && sp < eol) { /* "HTTP/1.1 200 OK": the reason phrase */
+      int l = (int)(eol - sp - 1);
+      while (l > 0 && (sp[l] == '\r' || sp[l] == ' '))
+        l--;
+      if (l > 0 && l < (int)sizeof st) {
+        memcpy(st, sp + 1, (unsigned)l);
+        st[l] = 0;
+      }
+    }
+    js_def(reply, "statusText", js_mk_cstring(ctx, st[0] ? st : text), P_ENUMERABLE);
+  }
+  js_def(reply, "url", js_mk_cstring(ctx, final_url[0] ? final_url : url), P_ENUMERABLE);
+  js_def(reply, "headers", parse_header_block(ctx, hdr), P_ENUMERABLE);
+  js_def(reply, "body", js_new_arraybuffer(ctx, out, rs.len), P_ENUMERABLE);
+  free(out);
+  rv = js_obj_value(reply);
+  gc_pop_scope();
+  return rv;
+}
+
+/* Answer one WM_REQUEST from a worker on the page thread */
+static void serve_request(struct wthread *wt, struct wmsg *m)
+{
+  js_value req = js_clone_read(g_ctx, m->clone), reply = js_undef(), op;
+  js_clone *c;
+  int id = 0;
+  gc_push_scope();
+  if (g_ctx->has_exc) {
+    g_ctx->has_exc = 0;
+    g_ctx->exc_root = 0;
+  } else if (req.type == JV_OBJ) {
+    gc_keep(req.u.obj);
+    id = js_to_int_sat(g_ctx, js_get(g_ctx, req, "id"));
+    op = js_get(g_ctx, req, "op");
+    if (op.type == JV_STR && streq(op.u.str->data, "fetch"))
+      reply = request_fetch(g_ctx, id, req);
+    else if (op.type == JV_STR && streq(op.u.str->data, "connect")) { /* may a socket be opened to this URL? */
+      js_value u = js_get(g_ctx, req, "url");
+      char norm[URL_MAX], use[URL_MAX], reason[64];
+      int ok = 1;
+      if (B->pg->csp && u.type == JV_STR) {
+        const char *url = u.u.str->data;
+        int k = 0;
+        norm[0] = 0;
+        if (starts_ci(url, "wss://")) {
+          sapp(norm, &k, sizeof norm, "https://");
+          sapp(norm, &k, sizeof norm, url + 6);
+        } else if (starts_ci(url, "ws://")) {
+          sapp(norm, &k, sizeof norm, "http://");
+          sapp(norm, &k, sizeof norm, url + 5);
+        } else
+          sapp(norm, &k, sizeof norm, url);
+        ok = csp_check_url(B->pg->csp, CSP_CONNECT, norm, g_page_url_buf, use, sizeof use, reason, sizeof reason);
+        if (!ok)
+          js_csp_log("WebSocket to", url, reason);
+      }
+      if (ok) {
+        js_object *o = js_new_object(g_ctx, g_ctx->object_proto);
+        gc_keep(o);
+        js_def(o, "id", js_number(id), P_ENUMERABLE);
+        js_def(o, "ok", js_bool(1), P_ENUMERABLE);
+        reply = js_obj_value(o);
+      } else
+        reply = reply_error(g_ctx, id, "Refused to connect (Content-Security-Policy)");
+    } else
+      reply = reply_error(g_ctx, id, "Unknown request");
+  }
+  if (reply.type == JV_OBJ) {
+    js_value body = js_get(g_ctx, reply, "body"), list = js_undef();
+    gc_keep(reply.u.obj);
+    if (body.type == JV_OBJ) { /* move the response bytes instead of copying them */
+      list = js_obj_value(js_new_array(g_ctx, 0));
+      gc_keep(list.u.obj);
+      js_array_push(g_ctx, list.u.obj, body);
+    }
+    c = js_clone_write(g_ctx, reply, list);
+    if (c)
+      wmsg_post(wt, &wt->in, WM_REPLY, id, c, 0);
+    else if (g_ctx->has_exc) {
+      g_ctx->has_exc = 0;
+      g_ctx->exc_root = 0;
+    }
+  }
+  gc_pop_scope();
 }
 
 static struct wthread *worker_of(js_ctx *ctx, js_value w)
@@ -962,7 +1455,9 @@ int js_workers_pump(void)
       serve_rpc(wt);
     for (m = wq_take_all(wt, &wt->out); m; m = next) {
       next = m->next;
-      if (m->kind == WM_LOG)
+      if (m->kind == WM_REQUEST)
+        serve_request(wt, m);
+      else if (m->kind == WM_LOG)
         devtools_console_append(m->level == JS_LOG_ERROR  ? DT_ERROR
                                 : m->level == JS_LOG_WARN ? DT_WARN
                                                           : DT_LOG,

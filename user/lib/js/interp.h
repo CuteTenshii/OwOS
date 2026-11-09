@@ -163,6 +163,9 @@ js_clone *js_clone_write(js_ctx *ctx, js_value v, js_value transfer);
 js_value js_clone_read(js_ctx *ctx, const js_clone *c);
 void js_clone_free(js_clone *c);
 
+/* A fresh ArrayBuffer holding a copy of `data` (zeroed when NULL) */
+js_value js_new_arraybuffer(js_ctx *ctx, const void *data, int byte_length);
+
 /* A SharedArrayBuffer object in ctx over an existing store, which it retains. Lets one thread hand a buffer to
  * another thread's context: retain on the sending side, wrap in the receiver, then release. */
 js_value js_sab_wrap(js_ctx *ctx, unsigned char *data, int byte_length);

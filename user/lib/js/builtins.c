@@ -6497,97 +6497,141 @@ static js_value promise_reject_s(js_ctx *ctx, js_value t, js_value *a, int n)
   gc_pop_scope();
   return js_obj_value(p);
 }
-static js_value promise_all_s(js_ctx *ctx, js_value t, js_value *a, int n)
+/* Promise.all / allSettled / any / race. Each element is subscribed to with a pair of reactions whose closure data
+ * is [result, values, remaining, index, mode, fulfilled]; a promise that is still pending settles the result later. */
+enum { PC_ALL, PC_SETTLED, PC_ANY, PC_RACE };
+
+static js_value aggregate_error(js_ctx *ctx, js_object *errors)
 {
-  js_value it = ARG(0);
-  js_object *result, *vals;
-  int rejected = 0;
+  js_value e = js_make_error(ctx, ctx->error_proto, "AggregateError", "All promises were rejected");
+  if (e.type == JV_OBJ) {
+    gc_push_scope();
+    gc_keep(e.u.obj);
+    js_def(e.u.obj, "errors", js_obj_value(errors), P_WRITABLE | P_CONFIGURABLE);
+    gc_pop_scope();
+  }
+  return e;
+}
+
+static js_value comb_reaction(js_ctx *ctx, js_value t, js_value *a, int n)
+{
+  js_object *d = ctx->native_data.u.obj, *result = d->elems[0].u.obj, *vals = d->elems[1].u.obj,
+            *rem = d->elems[2].u.obj;
+  unsigned index = (unsigned)d->elems[3].u.num;
+  int mode = (int)d->elems[4].u.num, fulfilled = (int)d->elems[5].u.num;
+  js_value v = ARG(0);
   (void)t;
+  gc_push_scope();
+  KEEP(v);
+  switch (mode) {
+  case PC_RACE:
+    prom_settle(ctx, result, fulfilled ? 1 : 2, v);
+    break;
+  case PC_ANY:
+    if (fulfilled) {
+      prom_settle(ctx, result, 1, v);
+      break;
+    }
+    vals->elems[index] = v;
+    gc_write_barrier(vals);
+    if (--rem->elems[0].u.num == 0)
+      prom_settle(ctx, result, 2, aggregate_error(ctx, vals));
+    break;
+  case PC_ALL:
+    if (!fulfilled) {
+      prom_settle(ctx, result, 2, v);
+      break;
+    }
+    vals->elems[index] = v;
+    gc_write_barrier(vals);
+    if (--rem->elems[0].u.num == 0)
+      prom_settle(ctx, result, 1, js_obj_value(vals));
+    break;
+  default: {
+    js_object *o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    unsigned char pf = P_WRITABLE | P_ENUMERABLE | P_CONFIGURABLE;
+    js_def(o, "status", js_mk_cstring(ctx, fulfilled ? "fulfilled" : "rejected"), pf);
+    js_def(o, fulfilled ? "value" : "reason", v, pf);
+    vals->elems[index] = js_obj_value(o);
+    gc_write_barrier(vals);
+    if (--rem->elems[0].u.num == 0)
+      prom_settle(ctx, result, 1, js_obj_value(vals));
+  }
+  }
+  gc_pop_scope();
+  return js_undef();
+}
+
+static js_object *comb_handler(js_ctx *ctx, js_object *result, js_object *vals, js_object *rem, unsigned index,
+                               int mode, int fulfilled)
+{
+  js_object *data = js_new_array(ctx, 0), *f;
+  gc_push_scope();
+  gc_keep(data);
+  js_array_push(ctx, data, js_obj_value(result));
+  js_array_push(ctx, data, js_obj_value(vals));
+  js_array_push(ctx, data, js_obj_value(rem));
+  js_array_push(ctx, data, js_number(index));
+  js_array_push(ctx, data, js_number(mode));
+  js_array_push(ctx, data, js_number(fulfilled));
+  f = js_new_native(ctx, comb_reaction, "", 1);
+  f->fn->data = js_obj_value(data);
+  gc_write_barrier(f);
+  gc_pop_scope();
+  return f;
+}
+
+static js_value promise_combinator(js_ctx *ctx, js_value it, int mode)
+{
+  js_object *result, *vals, *rem;
+  unsigned i, count;
   gc_push_scope();
   result = (js_object *)gc_keep(new_promise(ctx));
   vals = (js_object *)gc_keep(js_new_array(ctx, 0));
-  if (it.type == JV_OBJ && it.u.obj->kind == OBJ_ARRAY) {
-    unsigned i;
-    for (i = 0; i < it.u.obj->elen; i++) {
-      js_value e = it.u.obj->elems[i];
-      if (is_promise(e)) {
-        int st = prom_state(e.u.obj);
-        if (st == 2) {
-          prom_settle(ctx, result, 2, prom_value(e.u.obj));
-          rejected = 1;
-          break;
-        }
-        js_array_push(ctx, vals, st == 1 ? prom_value(e.u.obj) : js_undef());
-      } else
-        js_array_push(ctx, vals, e);
-    }
+  rem = (js_object *)gc_keep(js_new_array(ctx, 0));
+  if (!(it.type == JV_OBJ && it.u.obj->kind == OBJ_ARRAY)) {
+    prom_settle(ctx, result, 2, js_make_error(ctx, ctx->type_error_proto, "TypeError", "object is not iterable"));
+    gc_pop_scope();
+    return js_obj_value(result);
   }
-  if (!rejected)
-    prom_settle(ctx, result, 1, js_obj_value(vals));
+  KEEP(it);
+  count = it.u.obj->elen;
+  for (i = 0; i < count; i++)
+    js_array_push(ctx, vals, js_undef());
+  js_array_push(ctx, rem, js_number(count));
+  if (count == 0 && mode != PC_RACE) {
+    if (mode == PC_ANY)
+      prom_settle(ctx, result, 2, aggregate_error(ctx, vals));
+    else
+      prom_settle(ctx, result, 1, js_obj_value(vals));
+  }
+  for (i = 0; i < count && i < it.u.obj->elen; i++) {
+    js_value e = it.u.obj->elems[i], handlers[2];
+    gc_push_scope();
+    KEEP(e);
+    if (!is_promise(e))
+      e = promise_resolve_s(ctx, js_undef(), &e, 1);
+    KEEP(e);
+    handlers[0] = js_obj_value(gc_keep(comb_handler(ctx, result, vals, rem, i, mode, 1)));
+    handlers[1] = js_obj_value(gc_keep(comb_handler(ctx, result, vals, rem, i, mode, 0)));
+    promise_then(ctx, e, handlers, 2);
+    gc_pop_scope();
+  }
   gc_pop_scope();
   return js_obj_value(result);
 }
-static js_value promise_allsettled_s(js_ctx *ctx, js_value t, js_value *a, int n)
-{
-  js_value it = ARG(0);
-  js_object *result, *vals;
-  unsigned char pf = P_WRITABLE | P_ENUMERABLE | P_CONFIGURABLE;
-  (void)t;
-  (void)n;
-  gc_push_scope();
-  result = (js_object *)gc_keep(new_promise(ctx));
-  vals = (js_object *)gc_keep(js_new_array(ctx, 0));
-  if (it.type == JV_OBJ && it.u.obj->kind == OBJ_ARRAY) {
-    unsigned i;
-    for (i = 0; i < it.u.obj->elen; i++) {
-      js_value e = it.u.obj->elems[i];
-      js_object *o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
-      if (is_promise(e) && prom_state(e.u.obj) == 2) {
-        js_def(o, "status", js_mk_cstring(ctx, "rejected"), pf);
-        js_def(o, "reason", prom_value(e.u.obj), pf);
-      } else {
-        js_def(o, "status", js_mk_cstring(ctx, "fulfilled"), pf);
-        js_def(o, "value", is_promise(e) ? (prom_state(e.u.obj) == 1 ? prom_value(e.u.obj) : js_undef()) : e, pf);
-      }
-      js_array_push(ctx, vals, js_obj_value(o));
-    }
+
+#define PROMISE_COMBINATOR(fn, MODE)                                                                                   \
+  static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n)                                                      \
+  {                                                                                                                    \
+    (void)t;                                                                                                           \
+    return promise_combinator(ctx, ARG(0), MODE);                                                                      \
   }
-  prom_settle(ctx, result, 1, js_obj_value(vals));
-  gc_pop_scope();
-  return js_obj_value(result);
-}
-static js_value promise_any_s(js_ctx *ctx, js_value t, js_value *a, int n)
-{
-  js_value it = ARG(0);
-  js_object *result;
-  int found = 0;
-  (void)t;
-  (void)n;
-  gc_push_scope();
-  result = (js_object *)gc_keep(new_promise(ctx));
-  if (it.type == JV_OBJ && it.u.obj->kind == OBJ_ARRAY) {
-    unsigned i;
-    for (i = 0; i < it.u.obj->elen; i++) {
-      js_value e = it.u.obj->elems[i];
-      if (is_promise(e)) {
-        if (prom_state(e.u.obj) == 1) {
-          prom_settle(ctx, result, 1, prom_value(e.u.obj));
-          found = 1;
-          break;
-        }
-      } else {
-        prom_settle(ctx, result, 1, e);
-        found = 1;
-        break;
-      }
-    }
-  }
-  if (!found)
-    prom_settle(ctx, result, 2,
-                js_make_error(ctx, ctx->type_error_proto, "AggregateError", "All promises were rejected"));
-  gc_pop_scope();
-  return js_obj_value(result);
-}
+PROMISE_COMBINATOR(promise_all_s, PC_ALL)
+PROMISE_COMBINATOR(promise_allsettled_s, PC_SETTLED)
+PROMISE_COMBINATOR(promise_any_s, PC_ANY)
+PROMISE_COMBINATOR(promise_race_s, PC_RACE)
+#undef PROMISE_COMBINATOR
 
 js_value js_promise_resolved(js_ctx *ctx, js_value v) { return promise_resolve_s(ctx, js_undef(), &v, 1); }
 js_value js_promise_rejected(js_ctx *ctx, js_value v) { return promise_reject_s(ctx, js_undef(), &v, 1); }
@@ -7869,6 +7913,13 @@ static js_object *new_sharedbuffer(js_ctx *ctx, int n)
   if (n < 0)
     n = 0;
   return buffer_object(ctx, ctx->sharedarraybuffer_proto, js_sab_alloc(n), n, 1);
+}
+js_value js_new_arraybuffer(js_ctx *ctx, const void *data, int byte_length)
+{
+  js_object *o = new_arraybuffer(ctx, byte_length);
+  if (o->host && data && byte_length > 0)
+    memcpy(((js_arraybuffer *)o->host)->data, data, (unsigned)byte_length);
+  return js_obj_value(o);
 }
 js_value js_sab_wrap(js_ctx *ctx, unsigned char *data, int byte_length)
 {
@@ -11210,7 +11261,7 @@ void js_setup_builtins(js_ctx *ctx)
     js_def_native(ctx, pctor, "resolve", promise_resolve_s, 1);
     js_def_native(ctx, pctor, "reject", promise_reject_s, 1);
     js_def_native(ctx, pctor, "all", promise_all_s, 1);
-    js_def_native(ctx, pctor, "race", promise_all_s, 1); /* simplified: first-settled-ish */
+    js_def_native(ctx, pctor, "race", promise_race_s, 1);
     js_def_native(ctx, pctor, "allSettled", promise_allsettled_s, 1);
     js_def_native(ctx, pctor, "any", promise_any_s, 1);
   }

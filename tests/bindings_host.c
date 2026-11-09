@@ -142,13 +142,31 @@ int waitpid_nb(int pid, int *status)
 long long fake_now_ms;
 
 void *browser_js_stack_floor(void) { return 0; }
+/* A fixture server: /echo answers with the method, URL, content type and body it was sent; /missing is a 404 */
 unsigned char *browser_cors_fetch(const char *page, int cred, const struct http_req *rq, struct http_resp *rs)
 {
+  char text[1024];
+  int n;
+  unsigned char *out;
   (void)page;
-  (void)cred;
-  (void)rq;
-  (void)rs;
-  return 0;
+  if (!strstr(rq->url, "/echo") && !strstr(rq->url, "/missing"))
+    return 0;
+  n = strstr(rq->url, "/missing")
+          ? snprintf(text, sizeof text, "nope")
+          : snprintf(text, sizeof text, "%s %s %s cred=%d [%.*s] %s", rq->method, rq->url, rq->ctype ? rq->ctype : "-",
+                     cred, rq->body_len, rq->body ? (const char *)rq->body : "", rq->extra_hdrs ? rq->extra_hdrs : "");
+  rs->status = strstr(rq->url, "/missing") ? 404 : 200;
+  rs->len = n;
+  snprintf(rs->ctype, sizeof rs->ctype, "text/plain");
+  if (rs->final_url)
+    snprintf(rs->final_url, (size_t)rs->final_cap, "%s", rq->url);
+  if (rs->hdr)
+    snprintf(rs->hdr, (size_t)rs->hdr_cap,
+             "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nX-Fixture: yes\r\nSet-Cookie: a=b\r\n\r\n", rs->status,
+             rs->status == 404 ? "Not Found" : "OK");
+  out = malloc((size_t)n + 1);
+  memcpy(out, text, (size_t)n + 1);
+  return out;
 }
 /* Image fixtures: a data: URL carries its bytes verbatim after the comma; "RAW" w h then w*h*4 RGBA decodes to itself
  */
@@ -310,45 +328,78 @@ int sw_intercept_fetch(js_ctx *c, const char *u, const char *m, js_value *o)
   (void)o;
   return 0;
 }
+/* An echo server: ws://.../echo answers every message with itself, close ends the connection */
+struct ws_conn {
+  unsigned char *msg[16];
+  int len[16], text[16], n, state, closing;
+  unsigned char *current;
+};
 void ws_close(ws_conn *c, int code, const char *r)
 {
-  (void)c;
   (void)code;
   (void)r;
+  c->state = 2;
+  c->closing = 1;
 }
-void ws_free(ws_conn *c) { (void)c; }
+void ws_free(ws_conn *c)
+{
+  int i;
+  if (!c)
+    return;
+  for (i = 0; i < c->n; i++)
+    free(c->msg[i]);
+  free(c->current);
+  free(c);
+}
 ws_conn *ws_open(const char *u, const char *p)
 {
-  (void)u;
+  ws_conn *c;
   (void)p;
-  return 0;
+  if (!strstr(u, "/echo"))
+    return 0;
+  c = calloc(1, sizeof *c);
+  c->state = 1;
+  return c;
 }
 int ws_poll(ws_conn *c, const uint8_t **o, int *l, int *t)
 {
-  (void)c;
-  (void)o;
-  (void)l;
-  (void)t;
-  return -1;
+  int i;
+  if (c->n) {
+    free(c->current);
+    c->current = c->msg[0];
+    *o = c->current;
+    *l = c->len[0];
+    *t = c->text[0];
+    for (i = 1; i < c->n; i++) {
+      c->msg[i - 1] = c->msg[i];
+      c->len[i - 1] = c->len[i];
+      c->text[i - 1] = c->text[i];
+    }
+    c->n--;
+    return 1;
+  }
+  if (c->closing) {
+    c->state = 3;
+    return 2;
+  }
+  return 0;
 }
 const char *ws_protocol(const ws_conn *c)
 {
   (void)c;
-  return "";
+  return "echo.v1";
 }
 int ws_send(ws_conn *c, const void *d, int l, int t)
 {
-  (void)c;
-  (void)d;
-  (void)l;
-  (void)t;
-  return -1;
+  if (c->n == 16)
+    return -1;
+  c->msg[c->n] = malloc((size_t)l + 1);
+  memcpy(c->msg[c->n], d, (size_t)l);
+  c->len[c->n] = l;
+  c->text[c->n++] = t;
+  return 0;
 }
-int ws_state(const ws_conn *c)
-{
-  (void)c;
-  return 3;
-}
+int ws_state(const ws_conn *c) { return c->state; }
 
 void mediasession_install(js_ctx *ctx, js_object *navigator, const char *page_url)
 {

@@ -241,6 +241,33 @@ static void check_structured_clone(void)
       0));
 }
 
+static void check_promise_combinators(void)
+{
+  expect(run("var out=[], r1, r2;\n"
+             "var p1=new Promise(function(a){ r1=a }), p2=new Promise(function(a,b){ r2=b });\n"
+             "Promise.all([p1,3]).then(function(v){ out.push('all:'+v) });\n"
+             "Promise.all([p1,p2]).then(0,function(e){ out.push('allrej:'+e) });\n"
+             "Promise.allSettled([p1,p2]).then(function(v){ out.push('settled:'+v.map(function(x){ return x.status "
+             "}).join()) });\n"
+             "Promise.race([p2,p1]).then(function(v){ out.push('race:'+v) },function(e){ out.push('racerej:'+e) });\n"
+             "Promise.any([p2,p1]).then(function(v){ out.push('any:'+v) });\n"
+             "Promise.any([p2]).then(0,function(e){ out.push('anyfail:'+e.errors.length+e.name) });\n"
+             "Promise.all([]).then(function(v){ out.push('empty:'+v.length) });\n"
+             "expect(out.join()==='empty:0', 'nothing settles before the promises do: '+out.join());\n"
+             "r2('x'); r1(5);\n"
+             "expect(out.indexOf('allrej:x')>=0 && out.indexOf('racerej:x')>=0, 'rejections reach all and race: "
+             "'+out.join());\n"
+             "expect(out.indexOf('all:5,3')>=0, 'all fulfils with the values in order');\n"
+             "expect(out.indexOf('settled:fulfilled,rejected')>=0 && out.indexOf('any:5')>=0 && "
+             "out.indexOf('anyfail:1AggregateError')>=0, "
+             "'allSettled and any: '+out.join());\n"
+             "var late=[], s1; var q1=new Promise(function(a){ s1=a });\n"
+             "Promise.all([q1,Promise.resolve(2)]).then(function(v){ late.push(v.join()) });\n"
+             "expect(late.length===0, 'all waits for a pending promise'); s1(1); expect(late.join()==='1,2', 'and "
+             "settles when it does');\n",
+             0));
+}
+
 static void check_json_parse(void)
 {
   expect(
@@ -538,6 +565,7 @@ int main(void)
   test("BigInt64Array, BigUint64Array and Float16Array", check_wide_typed_arrays);
   test("SharedArrayBuffer and Atomics", check_atomics);
   test("structured clone across heaps", check_structured_clone);
+  test("Promise.all, allSettled, race and any with pending promises", check_promise_combinators);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);

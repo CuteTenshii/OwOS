@@ -257,6 +257,83 @@ static void test_worker_web_apis(void)
       "references: '+wa.rel);\n");
 }
 
+/* Worker sources too long for a data: URL come from here, through a Blob */
+static const char net_worker[] =
+    "var out={}, ctl=new AbortController()\n"
+    "var "
+    "A=fetch(\"https://example.com/echo?x=1\",{method:\"POST\",headers:{\"X-T\":\"1\",\"Content-Type\":\"text/"
+    "x\"},body:\"hello\"}).then(function(r){ out.status=r.status; out.ok=r.ok; out.ct=r.headers.get(\"content-type\"); "
+    "out.xf=r.headers.get(\"x-fixture\"); out.cookie=r.headers.get(\"set-cookie\"); out.url=r.url; "
+    "out.st=r.statusText; return r.text(); }).then(function(t){ out.text=t; })\n"
+    "var B=fetch(\"https://example.com/missing\").then(function(r){ out.m=r.status+\"/\"+r.ok+\"/\"+r.statusText; "
+    "return r.text(); }).then(function(t){ out.mt=t; })\n"
+    "var C=fetch(\"https://example.com/other\").then(function(){ out.bad=\"resolved\"; },function(e){ out.bad=e.name; "
+    "})\n"
+    "var D=fetch(\"https://example.com/echo\",{signal:ctl.signal}).then(function(){ out.ab=\"resolved\"; "
+    "},function(e){ out.ab=e.name; }); ctl.abort()\n"
+    "var E=fetch(\"data:text/plain,inline\").then(function(r){ return r.text(); }).then(function(t){ out.data=t; })\n"
+    "var F=new Response(JSON.stringify({k:[1,2]}),{status:201,statusText:\"Made\",headers:{\"X-R\":\"1\"}}), "
+    "cl=F.clone()\n"
+    "var G=F.json().then(function(j){ out.json=j.k.join(); return cl.text(); }).then(function(t){ out.clone=t.length; "
+    "out.used=F.bodyUsed; })\n"
+    "var H=Response.json({a:1}).text().then(function(t){ out.rj=t; })\n"
+    "var rq=new Request(\"https://example.com/echo\",{method:\"put\",body:new URLSearchParams({a:\"b c\"})}); "
+    "out.rm=rq.method; out.rct=rq.headers.get(\"content-type\")\n"
+    "var x=new XMLHttpRequest(), states=[]; x.onreadystatechange=function(){ states.push(x.readyState); }\n"
+    "var I=new Promise(function(res){ x.onload=function(){ "
+    "out.xhr=x.status+\":\"+x.responseText.indexOf(\"GET\")+\":\"+x.getResponseHeader(\"X-Fixture\"); res(); "
+    "};x.open(\"GET\",\"https://example.com/echo\"); x.send(); })\n"
+    "var sx=new XMLHttpRequest(); sx.open(\"GET\",\"https://example.com/missing\",false); sx.send(); "
+    "out.sync=sx.status+sx.responseText\n"
+    "var J=new Promise(function(res){ var ws=new WebSocket(\"ws://example.com/echo\"), got=[]; "
+    "ws.binaryType=\"arraybuffer\";ws.onopen=function(){ out.wsp=ws.protocol; ws.send(\"hi\"); ws.send(new "
+    "Uint8Array([7,8])); };ws.onmessage=function(e){ got.push(typeof e.data===\"string\" ? e.data : (e.data instanceof "
+    "ArrayBuffer ? new Uint8Array(e.data).join() : \"?\")); if(got.length===2) ws.close(1000); "
+    "};ws.onclose=function(e){ out.ws=got.join(\"|\"); out.wsc=e.code+\"/\"+ws.readyState; res(); }; })\n"
+    "var K=new Promise(function(res){ var w2=new WebSocket(\"ws://example.com/nothing\"), ev=[]; "
+    "w2.onerror=function(){ ev.push(\"e\"); }; w2.onclose=function(){ ev.push(\"c\"); out.wsbad=ev.join(); res(); }; "
+    "})\n"
+    "var mc=new MessageChannel(), L=new Promise(function(res){ mc.port1.onmessage=function(e){ "
+    "out.mc=e.data.n+\":\"+e.data.m.size; res(); }; mc.port2.postMessage({n:1,m:new Map([[1,2]])}); })\n"
+    "Promise.all([A,B,C,D,E,G,H,I,J,K,L]).then(function(){ out.states=states.join(); postMessage(out); },function(e){ "
+    "postMessage({fail:String(e)}); });\n";
+
+static js_value test_fixture(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  (void)thisv;
+  (void)args;
+  (void)argc;
+  return js_mk_cstring(ctx, net_worker);
+}
+
+static void test_worker_network(void)
+{
+  run_script("var net=null, nerr=null, nw=new Worker(URL.createObjectURL(new Blob([fixture()])));\n"
+             "nw.onmessage=function(e){ net=e.data; }; nw.onerror=function(e){ nerr=e.message; };\n");
+  expect(wait_for("net!==null || nerr!==null"));
+  run_script(
+      "expect(nerr===null && net.fail===undefined, 'no failure: '+nerr+' '+(net&&net.fail));\n"
+      "expect(net.status===200 && net.ok===true && net.st==='OK' && net.ct==='text/plain' && net.xf==='yes', 'fetch "
+      "response: '+JSON.stringify(net));\n"
+      "expect(net.cookie===null, 'Set-Cookie is hidden from scripts');\n"
+      "expect(net.text.indexOf('POST https://example.com/echo?x=1 text/x')===0 && net.text.indexOf('[hello]')>0 && "
+      "net.text.indexOf('x-t: 1')>0, 'fetch sends method, headers and body: '+net.text);\n"
+      "expect(net.url==='https://example.com/echo?x=1', 'response url');\n"
+      "expect(net.m==='404/false/Not Found' && net.mt==='nope', 'error statuses resolve: '+net.m);\n"
+      "expect(net.bad==='TypeError', 'network failures reject with TypeError: '+net.bad);\n"
+      "expect(net.ab==='AbortError', 'abort rejects with AbortError: '+net.ab);\n"
+      "expect(net.data==='inline', 'data: URLs');\n"
+      "expect(net.json==='1,2' && net.clone===11 && net.used===true, 'Response json, clone, bodyUsed: "
+      "'+JSON.stringify([net.json,net.clone,net.used]));\n"
+      "expect(net.rj==='{\"a\":1}' && net.rm==='PUT' && net.rct.indexOf('application/x-www-form-urlencoded')===0, "
+      "'Response.json and Request');\n"
+      "expect(net.xhr==='200:0:yes' && net.states==='1,2,3,4', 'XMLHttpRequest: '+net.xhr+' '+net.states);\n"
+      "expect(net.sync==='404nope', 'synchronous XMLHttpRequest: '+net.sync);\n"
+      "expect(net.wsp==='echo.v1' && net.ws==='hi|7,8' && net.wsc==='1005/3', 'WebSocket echo: '+net.ws+' '+net.wsc);\n"
+      "expect(net.wsbad==='e,c', 'a failed WebSocket fires error then close: '+net.wsbad);\n"
+      "expect(net.mc==='1:1', 'MessageChannel inside a worker: '+net.mc);\n");
+}
+
 static void test_transfer_and_collections(void)
 {
   run_script("var tr=null, tbuf=new ArrayBuffer(16), tv=new Uint8Array(tbuf); tv[3]=5;\n"
@@ -363,6 +440,7 @@ int main(void)
   struct dom_node *root = dom_parse(page, (int)strlen(page));
   js_run_document(root, "https://example.com/dir/p.html", fetch_none);
   js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
+  js_def_native(g_ctx, g_ctx->global, "fixture", test_fixture, 0);
 
   test("postMessage round trip and ordering", test_round_trip);
   test("self.addEventListener and structured clone", test_self_listeners_and_clone);
@@ -372,6 +450,7 @@ int main(void)
   test("worker timers", test_worker_timers);
   test("worker globals: text coding, events, aborts, crypto", test_worker_globals);
   test("worker web APIs: URL, Blob, FormData, Headers", test_worker_web_apis);
+  test("worker network: fetch, XMLHttpRequest, WebSocket, MessageChannel", test_worker_network);
   test("transferred buffers and collections", test_transfer_and_collections);
   test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);
   test("MessageChannel and MessagePort", test_message_channel);
