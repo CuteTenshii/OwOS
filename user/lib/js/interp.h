@@ -106,6 +106,7 @@ struct js_ctx {
                              * names the script that armed it. Not owned; the
                              * embedder keeps the storage valid (js_set_script). */
   unsigned rng;             /* Math.random state                             */
+  int can_block;            /* Atomics.wait may block this context's thread */
   void *re_cache;           /* compiled-RegExp cache (builtins.c)         */
   unsigned ident_cache_gen; /* generation for the JS_IDENT inline cache; bumped
                              * by direct eval, which can inject a binding into an
@@ -142,6 +143,9 @@ void js_ctx_free(js_ctx *ctx);
  * script overflows the stack into neighbouring memory. NULL disables the check.
  */
 void js_set_stack_limit(js_ctx *ctx, void *low_limit);
+/* A SharedArrayBuffer object in ctx over an existing store, which it retains. Lets one thread hand a buffer to
+ * another thread's context: retain on the sending side, wrap in the receiver, then release. */
+js_value js_sab_wrap(js_ctx *ctx, unsigned char *data, int byte_length);
 void js_regex_cache_free(js_ctx *ctx); /* drop the context's compiled-RegExp cache */
 
 /* Run a parsed program. Returns 0 on normal completion (the last expression

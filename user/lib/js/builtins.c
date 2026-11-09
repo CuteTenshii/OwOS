@@ -10,6 +10,7 @@
 #include "gc.h"
 #include "interp.h"
 #include "math.h"
+#include "mutex.h"
 #include "owos.h"
 #include "value.h"
 
@@ -7836,35 +7837,43 @@ static int mul_sat(int a, int b)
     return 0;
   return b && a > 2147483647 / b ? 2147483647 : a * b;
 }
-static js_object *new_arraybuffer(js_ctx *ctx, int n)
+/* An ArrayBuffer or SharedArrayBuffer object owning `data` (freed with it); an empty one with a RangeError
+ * pending when `data` is NULL. */
+static js_object *buffer_object(js_ctx *ctx, js_object *proto, unsigned char *data, int n, int shared)
 {
   js_object *o;
   js_arraybuffer *ab;
-  if (n < 0)
-    n = 0;
   gc_push_scope();
-  o = (js_object *)gc_keep(js_new_object(ctx, ctx->arraybuffer_proto));
+  o = (js_object *)gc_keep(js_new_object(ctx, proto));
   o->kind = OBJ_ARRAYBUFFER;
   ab = (js_arraybuffer *)malloc(sizeof *ab);
   if (!ab)
     gc_oom();
-  ab->data = (unsigned char *)calloc((unsigned)(n > 0 ? n : 1), 1);
-  ab->byteLength = n;
-  ab->shared = 0;
-  if (!ab->data) { /* too big for the heap: an empty buffer and a RangeError */
-    ab->byteLength = 0;
+  ab->data = data;
+  ab->byteLength = data ? n : 0;
+  ab->shared = shared;
+  if (!data) /* too big for the heap */
     js_throw_range(ctx, "Array buffer allocation failed");
-  }
   o->host = ab;
   gc_pop_scope();
   return o;
 }
+static js_object *new_arraybuffer(js_ctx *ctx, int n)
+{
+  if (n < 0)
+    n = 0;
+  return buffer_object(ctx, ctx->arraybuffer_proto, (unsigned char *)calloc((unsigned)(n > 0 ? n : 1), 1), n, 0);
+}
 static js_object *new_sharedbuffer(js_ctx *ctx, int n)
 {
-  js_object *o = new_arraybuffer(ctx, n);
-  o->proto = ctx->sharedarraybuffer_proto;
-  ((js_arraybuffer *)o->host)->shared = 1;
-  return o;
+  if (n < 0)
+    n = 0;
+  return buffer_object(ctx, ctx->sharedarraybuffer_proto, js_sab_alloc(n), n, 1);
+}
+js_value js_sab_wrap(js_ctx *ctx, unsigned char *data, int byte_length)
+{
+  js_sab_retain(data);
+  return js_obj_value(buffer_object(ctx, ctx->sharedarraybuffer_proto, data, byte_length, 1));
 }
 static js_value new_view(js_ctx *ctx, int type, js_object *buf, int offset, int length)
 {
@@ -8664,9 +8673,9 @@ static js_value sab_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
 }
 
 /* ------------------------------------------------------- Atomics --------- *
- * Contexts are single-threaded, so every operation is trivially atomic: the
- * read-modify-write runs on the backing bytes directly. 64-bit element kinds
- * go through unsigned long long, the rest through the low 32 bits. */
+ * Operations run on the backing bytes with sequentially consistent __atomic builtins, so they are atomic
+ * against other threads sharing a SharedArrayBuffer. Values travel as raw bits truncated to the element
+ * width; 64-bit kinds use unsigned long long. */
 static int atomics_is64(int type) { return type == TA_I64 || type == TA_U64; }
 static js_object *atomics_target(js_ctx *ctx, js_value *a, int n, int wait, unsigned *idx)
 {
@@ -8690,6 +8699,11 @@ static js_object *atomics_target(js_ctx *ctx, js_value *a, int n, int wait, unsi
   *idx = (unsigned)d;
   return a[0].u.obj;
 }
+static unsigned char *atomics_addr(js_object *view, unsigned idx)
+{
+  js_typedarray *ta = (js_typedarray *)view->host;
+  return ((js_arraybuffer *)ta->buffer->host)->data + ta->offset + idx * (unsigned)ta_elem_size(ta->type);
+}
 /* the operand as raw bits, truncated to the element width; 0 with an exception pending on failure */
 static int atomics_operand(js_ctx *ctx, int type, js_value v, unsigned long long *out)
 {
@@ -8705,61 +8719,122 @@ static int atomics_operand(js_ctx *ctx, int type, js_value v, unsigned long long
   }
   return 1;
 }
-static unsigned long long atomics_bits(js_ctx *ctx, int type, js_value v)
+static js_value atomics_value(js_ctx *ctx, int type, unsigned long long bits)
 {
-  unsigned long long r = 0;
-  if (atomics_is64(type)) {
-    unsigned lo = 0, hi = 0;
-    js_bigint_to_u64(ctx, v, &lo, &hi);
-    return ((unsigned long long)hi << 32) | lo;
+  switch (type) {
+  case TA_I8:
+    return js_number((signed char)bits);
+  case TA_I16:
+    return js_number((short)bits);
+  case TA_I32:
+    return js_number((int)bits);
+  case TA_I64:
+  case TA_U64:
+    return js_bigint_from_u64(ctx, (unsigned)bits, (unsigned)(bits >> 32), type == TA_I64);
+  default:
+    return js_number((double)(unsigned)bits);
   }
-  r = (unsigned)(long long)js_to_number(ctx, v);
-  return ta_elem_size(type) < 4 ? r & ((1u << (8 * ta_elem_size(type))) - 1) : r;
-}
-static void atomics_put(js_ctx *ctx, js_object *view, unsigned idx, int type, unsigned long long bits)
-{
-  if (atomics_is64(type))
-    ta_set(ctx, view, idx, js_bigint_from_u64(ctx, (unsigned)bits, (unsigned)(bits >> 32), type == TA_I64));
-  else
-    ta_set(ctx, view, idx, js_number((double)(unsigned)bits));
 }
 enum { AT_ADD, AT_SUB, AT_AND, AT_OR, AT_XOR, AT_XCHG };
+#define AT_RMW_CASES(T)                                                                                                \
+  {                                                                                                                    \
+    T *q = (T *)p;                                                                                                     \
+    switch (op) {                                                                                                      \
+    case AT_ADD:                                                                                                       \
+      return __atomic_fetch_add(q, (T)v, __ATOMIC_SEQ_CST);                                                            \
+    case AT_SUB:                                                                                                       \
+      return __atomic_fetch_sub(q, (T)v, __ATOMIC_SEQ_CST);                                                            \
+    case AT_AND:                                                                                                       \
+      return __atomic_fetch_and(q, (T)v, __ATOMIC_SEQ_CST);                                                            \
+    case AT_OR:                                                                                                        \
+      return __atomic_fetch_or(q, (T)v, __ATOMIC_SEQ_CST);                                                             \
+    case AT_XOR:                                                                                                       \
+      return __atomic_fetch_xor(q, (T)v, __ATOMIC_SEQ_CST);                                                            \
+    default:                                                                                                           \
+      return __atomic_exchange_n(q, (T)v, __ATOMIC_SEQ_CST);                                                           \
+    }                                                                                                                  \
+  }
+static unsigned long long atomics_rmw_bits(void *p, int es, int op, unsigned long long v)
+{
+  switch (es) {
+  case 1:
+    AT_RMW_CASES(unsigned char)
+  case 2:
+    AT_RMW_CASES(unsigned short)
+  case 4:
+    AT_RMW_CASES(unsigned)
+  default:
+    AT_RMW_CASES(unsigned long long)
+  }
+}
+#undef AT_RMW_CASES
+static unsigned long long atomics_load_bits(void *p, int es)
+{
+  switch (es) {
+  case 1:
+    return __atomic_load_n((unsigned char *)p, __ATOMIC_SEQ_CST);
+  case 2:
+    return __atomic_load_n((unsigned short *)p, __ATOMIC_SEQ_CST);
+  case 4:
+    return __atomic_load_n((unsigned *)p, __ATOMIC_SEQ_CST);
+  default:
+    return __atomic_load_n((unsigned long long *)p, __ATOMIC_SEQ_CST);
+  }
+}
+static void atomics_store_bits(void *p, int es, unsigned long long v)
+{
+  switch (es) {
+  case 1:
+    __atomic_store_n((unsigned char *)p, (unsigned char)v, __ATOMIC_SEQ_CST);
+    break;
+  case 2:
+    __atomic_store_n((unsigned short *)p, (unsigned short)v, __ATOMIC_SEQ_CST);
+    break;
+  case 4:
+    __atomic_store_n((unsigned *)p, (unsigned)v, __ATOMIC_SEQ_CST);
+    break;
+  default:
+    __atomic_store_n((unsigned long long *)p, v, __ATOMIC_SEQ_CST);
+    break;
+  }
+}
+static unsigned long long atomics_cas_bits(void *p, int es, unsigned long long expected, unsigned long long repl)
+{
+  switch (es) {
+  case 1: {
+    unsigned char e = (unsigned char)expected;
+    __atomic_compare_exchange_n((unsigned char *)p, &e, (unsigned char)repl, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return e;
+  }
+  case 2: {
+    unsigned short e = (unsigned short)expected;
+    __atomic_compare_exchange_n((unsigned short *)p, &e, (unsigned short)repl, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return e;
+  }
+  case 4: {
+    unsigned e = (unsigned)expected;
+    __atomic_compare_exchange_n((unsigned *)p, &e, (unsigned)repl, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return e;
+  }
+  default: {
+    unsigned long long e = expected;
+    __atomic_compare_exchange_n((unsigned long long *)p, &e, repl, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return e;
+  }
+  }
+}
 static js_value atomics_rmw(js_ctx *ctx, js_value *a, int n, int op)
 {
   unsigned idx;
   js_object *view = atomics_target(ctx, a, n, 0, &idx);
-  unsigned long long v, cur, res;
-  js_value old;
+  unsigned long long v;
   int type;
   if (!view)
     return js_undef();
   type = ((js_typedarray *)view->host)->type;
   if (!atomics_operand(ctx, type, n > 2 ? a[2] : js_undef(), &v))
     return js_undef();
-  old = ta_get(ctx, view, idx);
-  cur = atomics_bits(ctx, type, old);
-  switch (op) {
-  case AT_ADD:
-    res = cur + v;
-    break;
-  case AT_SUB:
-    res = cur - v;
-    break;
-  case AT_AND:
-    res = cur & v;
-    break;
-  case AT_OR:
-    res = cur | v;
-    break;
-  case AT_XOR:
-    res = cur ^ v;
-    break;
-  default:
-    res = v;
-    break;
-  }
-  atomics_put(ctx, view, idx, type, res);
-  return old;
+  return atomics_value(ctx, type, atomics_rmw_bits(atomics_addr(view, idx), ta_elem_size(type), op, v));
 }
 #define AT_RMW(fn, OP)                                                                                                 \
   static js_value fn(js_ctx *ctx, js_value t, js_value *a, int n)                                                      \
@@ -8778,8 +8853,12 @@ static js_value atomics_load(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   unsigned idx;
   js_object *view = atomics_target(ctx, a, n, 0, &idx);
+  int type;
   (void)t;
-  return view ? ta_get(ctx, view, idx) : js_undef();
+  if (!view)
+    return js_undef();
+  type = ((js_typedarray *)view->host)->type;
+  return atomics_value(ctx, type, atomics_load_bits(atomics_addr(view, idx), ta_elem_size(type)));
 }
 static js_value atomics_store(js_ctx *ctx, js_value t, js_value *a, int n)
 {
@@ -8795,13 +8874,14 @@ static js_value atomics_store(js_ctx *ctx, js_value t, js_value *a, int n)
   if (atomics_is64(type)) {
     if (!atomics_operand(ctx, type, v, &bits))
       return js_undef();
-    atomics_put(ctx, view, idx, type, bits);
+    atomics_store_bits(atomics_addr(view, idx), 8, bits);
     return v;
   }
   {
     double d = js_to_number(ctx, v);
     d = d != d ? 0 : (d < 0 ? -floor(-d) : floor(d));
-    ta_set(ctx, view, idx, js_number(d));
+    atomics_operand(ctx, type, js_number(d), &bits);
+    atomics_store_bits(atomics_addr(view, idx), ta_elem_size(type), bits);
     return js_number(d);
   }
 }
@@ -8810,7 +8890,6 @@ static js_value atomics_cmpxchg(js_ctx *ctx, js_value t, js_value *a, int n)
   unsigned idx;
   js_object *view = atomics_target(ctx, a, n, 0, &idx);
   unsigned long long expected, repl;
-  js_value old;
   int type;
   (void)t;
   if (!view)
@@ -8819,10 +8898,7 @@ static js_value atomics_cmpxchg(js_ctx *ctx, js_value t, js_value *a, int n)
   if (!atomics_operand(ctx, type, n > 2 ? a[2] : js_undef(), &expected) ||
       !atomics_operand(ctx, type, n > 3 ? a[3] : js_undef(), &repl))
     return js_undef();
-  old = ta_get(ctx, view, idx);
-  if (atomics_bits(ctx, type, old) == expected)
-    atomics_put(ctx, view, idx, type, repl);
-  return old;
+  return atomics_value(ctx, type, atomics_cas_bits(atomics_addr(view, idx), ta_elem_size(type), expected, repl));
 }
 static js_value atomics_islockfree(js_ctx *ctx, js_value t, js_value *a, int n)
 {
@@ -8830,34 +8906,61 @@ static js_value atomics_islockfree(js_ctx *ctx, js_value t, js_value *a, int n)
   (void)t;
   return js_bool(d == 1 || d == 2 || d == 4 || d == 8);
 }
-/* No other agent can ever notify, so a matching wait can only time out. */
+/* Sleeps on the futex at the element's address (its low word for BigInt64Array). */
 static js_value atomics_wait(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   unsigned idx;
   js_object *view = atomics_target(ctx, a, n, 1, &idx);
   unsigned long long expected;
-  int type;
+  double timeout = INFINITY;
+  unsigned char *p;
+  int type, es;
   (void)t;
   if (!view)
     return js_undef();
+  if (!ctx->can_block)
+    return js_throw_type(ctx, "Atomics.wait cannot block this thread");
   type = ((js_typedarray *)view->host)->type;
+  es = ta_elem_size(type);
   if (!atomics_operand(ctx, type, n > 2 ? a[2] : js_undef(), &expected))
     return js_undef();
-  if (n > 3)
-    js_to_number(ctx, a[3]);
-  return js_mk_cstring(ctx, atomics_bits(ctx, type, ta_get(ctx, view, idx)) == expected ? "timed-out" : "not-equal");
+  if (n > 3) {
+    timeout = js_to_number(ctx, a[3]);
+    if (timeout != timeout)
+      timeout = INFINITY;
+    else if (timeout < 0)
+      timeout = 0;
+  }
+  p = atomics_addr(view, idx);
+  if (atomics_load_bits(p, es) != expected)
+    return js_mk_cstring(ctx, "not-equal");
+  if (timeout == 0)
+    return js_mk_cstring(ctx, "timed-out");
+  {
+    unsigned ms = timeout >= 4294967295.0 ? 0 : (unsigned)timeout < 1 ? 1 : (unsigned)timeout; /* 0 = forever */
+    return js_mk_cstring(ctx, futex_wait((unsigned *)p, (unsigned)expected, ms) ? "timed-out" : "ok");
+  }
 }
 static js_value atomics_notify(js_ctx *ctx, js_value t, js_value *a, int n)
 {
   unsigned idx;
   js_object *view = atomics_target(ctx, a, n, 0, &idx);
+  double count = 2147483647.0;
+  js_typedarray *ta;
   (void)t;
-  if (view) {
-    int type = ((js_typedarray *)view->host)->type;
-    if (type != TA_I32 && type != TA_I64)
-      return js_throw_type(ctx, "Atomics.notify requires an Int32Array or BigInt64Array");
+  if (!view)
+    return js_undef();
+  ta = (js_typedarray *)view->host;
+  if (ta->type != TA_I32 && ta->type != TA_I64)
+    return js_throw_type(ctx, "Atomics.notify requires an Int32Array or BigInt64Array");
+  if (n > 2 && a[2].type != JV_UNDEF) {
+    count = js_to_number(ctx, a[2]);
+    if (count != count || count < 0)
+      count = 0;
   }
-  return js_number(0);
+  if (!((js_arraybuffer *)ta->buffer->host)->shared || count == 0)
+    return js_number(0);
+  return js_number(futex_wake((unsigned *)atomics_addr(view, idx), count > 2147483647.0 ? 2147483647 : (int)count));
 }
 
 /* DataView: type TA_DATAVIEW, host->length = byteLength */

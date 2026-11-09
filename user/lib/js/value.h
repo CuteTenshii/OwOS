@@ -66,6 +66,12 @@ typedef struct {
   int byteLength;
   int shared; /* SharedArrayBuffer */
 } js_arraybuffer;
+
+/* SharedArrayBuffer bytes are refcounted so several heaps (threads) can hold the same store. The count lives
+ * in a header just before `data`; a store is freed when its last holder releases it. */
+unsigned char *js_sab_alloc(int n); /* zeroed, one reference; NULL when out of memory */
+void js_sab_retain(unsigned char *data);
+void js_sab_release(unsigned char *data);
 typedef struct {
   js_object *buffer;
   int type, offset, length;

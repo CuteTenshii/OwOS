@@ -27,6 +27,8 @@ static js_value test_expect(js_ctx *ctx, js_value thisv, js_value *args, int arg
   return js_undef();
 }
 
+static int can_block; /* run() lets Atomics.wait block */
+
 /* Run `source` in a fresh context; returns nonzero when it ran to completion. */
 static int run(const char *source, char *stack_floor)
 {
@@ -36,6 +38,7 @@ static int run(const char *source, char *stack_floor)
   js_value result;
   int ok = 0;
   js_ctx *ctx = js_ctx_new(con_print);
+  ctx->can_block = can_block;
   js_def_native(ctx, ctx->global, "expect", test_expect, 2);
   if (stack_floor) {
     js_set_stack_limit(ctx, stack_floor);
@@ -96,6 +99,17 @@ static void check_define_property(void)
              "expect(0 in [undefined] && !(1 in [undefined]), 'undefined elements are present');\n"
              "var c=Array.prototype.concat.call(['x'],[1,2]); expect(c.length===3 && c[0]==='x', 'concat');\n",
              0));
+  can_block = 1;
+  expect(run(
+      "var sab=new SharedArrayBuffer(16), i=new Int32Array(sab), b=new BigInt64Array(sab), u8=new Uint8Array(sab);\n"
+      "var t=function(f){ try{ f() }catch(e){ return e.constructor.name } };\n"
+      "i[2]=1; expect(Atomics.wait(i,2,0,0)==='not-equal' && Atomics.wait(i,2,1,0)==='timed-out', 'wait, no sleep');\n"
+      "expect(Atomics.wait(i,2,1,10)==='timed-out', 'wait times out');\n"
+      "expect(Atomics.wait(b,0,5n,10)==='not-equal' && Atomics.wait(b,0,0n,10)==='timed-out', 'BigInt64Array wait');\n"
+      "expect(t(function(){ Atomics.wait(new Int32Array(4),0,0,0) })==='TypeError' && t(function(){ "
+      "Atomics.wait(u8,0,0,0) })==='TypeError', 'wait needs a shared Int32Array');\n",
+      0));
+  can_block = 0;
 }
 
 static void check_json_stringify(void)
@@ -147,10 +161,8 @@ static void check_atomics(void)
           "})==='TypeError', 'integer typed arrays only');\n"
           "expect(t(function(){ Atomics.load(i,4) })==='RangeError' && t(function(){ Atomics.load(i,-1) "
           "})==='RangeError', 'index bounds');\n"
-          "i[2]=1; expect(Atomics.wait(i,2,0,0)==='not-equal' && Atomics.wait(i,2,1,0)==='timed-out' && "
-          "Atomics.notify(i,2,1)===0, 'wait, notify');\n"
-          "expect(t(function(){ Atomics.wait(new Int32Array(4),0,0,0) })==='TypeError' && t(function(){ "
-          "Atomics.wait(u8,0,0,0) })==='TypeError', 'wait needs a shared Int32Array');\n"
+          "i[2]=1; expect(t(function(){ Atomics.wait(i,2,1,0) })==='TypeError', 'wait throws where blocking is off');\n"
+          "expect(Atomics.notify(i,2,1)===0, 'notify with no waiters');\n"
           "expect(Atomics.isLockFree(4)===true && Atomics.isLockFree(3)===false && String(Atomics)==='[object "
           "Atomics]', 'isLockFree, tag');\n",
           0));

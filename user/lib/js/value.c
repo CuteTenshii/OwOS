@@ -326,8 +326,12 @@ static void finalize(void *obj, int kind)
       bi_free((bigint *)o->host);
     if (o->kind == OBJ_ARRAYBUFFER && o->host) {
       js_arraybuffer *ab = (js_arraybuffer *)o->host;
-      if (ab->data)
-        free(ab->data);
+      if (ab->data) {
+        if (ab->shared)
+          js_sab_release(ab->data);
+        else
+          free(ab->data);
+      }
       free(ab);
     }
     if (o->kind == OBJ_TYPEDARRAY && o->host)
@@ -344,6 +348,29 @@ static void finalize(void *obj, int kind)
     if (o->kind == OBJ_HOST && o->host && js_host_finalizer)
       js_host_finalizer(o);
   }
+}
+
+typedef struct {
+  unsigned refs;
+  unsigned pad[3]; /* keeps the bytes 16-aligned */
+} sab_header;
+
+unsigned char *js_sab_alloc(int n)
+{
+  sab_header *h = (sab_header *)calloc(1, sizeof *h + (unsigned)(n > 0 ? n : 1));
+  if (!h)
+    return NULL;
+  h->refs = 1;
+  return (unsigned char *)(h + 1);
+}
+
+void js_sab_retain(unsigned char *data) { __atomic_fetch_add(&((sab_header *)data - 1)->refs, 1, __ATOMIC_RELAXED); }
+
+void js_sab_release(unsigned char *data)
+{
+  sab_header *h = (sab_header *)data - 1;
+  if (__atomic_fetch_sub(&h->refs, 1, __ATOMIC_ACQ_REL) == 1)
+    free(h);
 }
 
 void js_gc_setup(void)
