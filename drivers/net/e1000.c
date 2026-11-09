@@ -139,6 +139,7 @@ static void print_hex2(uint8_t v)
 
 /* RCTL bits; BSIZE=00 with BSEX=0 is a 2048-byte receive buffer. */
 #define RCTL_EN (1u << 1)
+#define RCTL_MPE (1u << 4) /* accept all multicast: IPv6 ND and mDNS need it, the MTA is empty */
 #define RCTL_BAM (1u << 15)
 #define RCTL_SECRC (1u << 26)
 
@@ -739,7 +740,7 @@ static int setup_rx(void)
   reg_write(E1000_RDH, 0);
   reg_write(E1000_RDT, RX_DESCS - 1);
   rx_cur = 0;
-  reg_write(E1000_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+  reg_write(E1000_RCTL, RCTL_EN | RCTL_MPE | RCTL_BAM | RCTL_SECRC);
   return 0;
 }
 

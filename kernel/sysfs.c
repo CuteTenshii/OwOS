@@ -6,7 +6,7 @@
  *
  *   /sys/class/input/kbd0/layout        keyboard layout       (rw)
  *   /sys/class/input/mouse0/speed       pointer speed 1..5    (rw)
- *   /sys/class/net/eth0/{address,carrier,ipaddr}              (ro)
+ *   /sys/class/net/eth0/{address,carrier,ipaddr,ip6addr,ip6ll,dns6} (ro)
  *   /sys/class/block/<dev>/{model,size}                       (ro)
  *   /sys/class/graphics/fb0/{width,height,refresh,monitor,internal}  (ro)
  *   /sys/class/graphics/fb0/{dpi,scale_active}  EDID DPI, applied UI scale (ro)
@@ -333,7 +333,9 @@ static int classify(char seg[MAXSEG][SEGLEN], int n)
         return S_NONE;
       if (n == 3)
         return eq(seg[2], NET_IFACE) ? S_DIR : S_NONE;
-      if (n == 4 && eq(seg[2], NET_IFACE) && (eq(seg[3], "address") || eq(seg[3], "carrier") || eq(seg[3], "ipaddr")))
+      if (n == 4 && eq(seg[2], NET_IFACE) &&
+          (eq(seg[3], "address") || eq(seg[3], "carrier") || eq(seg[3], "ipaddr") || eq(seg[3], "ip6addr") ||
+           eq(seg[3], "ip6ll") || eq(seg[3], "dns6")))
         return S_FILE_RO;
       return S_NONE;
     }
@@ -476,6 +478,16 @@ static void emit(char seg[MAXSEG][SEGLEN], struct pb *b)
           pu(b, ip[3]);
         } else
           ps(b, "0.0.0.0");
+        pc(b, '\n');
+        return;
+      }
+      if (eq(seg[3], "ip6addr") || eq(seg[3], "ip6ll") || eq(seg[3], "dns6")) {
+        const uint8_t *ip = eq(seg[3], "ip6ll") ? net_ll_ip6() : eq(seg[3], "dns6") ? net_dns6() : net_my_ip6();
+        char str[40];
+        if (ip) { /* a global address is empty until a router advertisement arrives */
+          net_addr_str(ip, str);
+          ps(b, str);
+        }
         pc(b, '\n');
         return;
       }
@@ -946,8 +958,8 @@ int sysfs_enum(const char *dirsub, int idx, char *name, int max, int *is_dir)
     return hit;
   }
   if (n == 3 && eq(seg[0], "class") && eq(seg[1], "net")) {
-    static const char *const k[] = {"address", "carrier", "ipaddr"};
-    hit = from_list(idx, name, max, k, 3);
+    static const char *const k[] = {"address", "carrier", "ipaddr", "ip6addr", "ip6ll", "dns6"};
+    hit = from_list(idx, name, max, k, 6);
     if (hit && is_dir)
       *is_dir = 0;
     return hit;

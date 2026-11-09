@@ -48,7 +48,7 @@ int stream_end(void);
 /* net_* return: a cooperative Ctrl+C arrived mid-call; tear down and exit */
 #define NET_EINTR (-4)
 
-/* net_connect: `host` is a dotted-quad (name resolution is user/lib/resolve), `proto` is SK_* */
+/* net_connect: `host` is an IPv4 dotted-quad or IPv6 literal (name resolution is user/lib/resolve), `proto` is SK_* */
 #define SK_TCP 0
 #define SK_UDP 2
 #define SK_ICMP 3
@@ -72,8 +72,9 @@ int net_set_ttl(int h, int ttl);
 int net_listen(int port);
 int net_accept(int listen_fd);
 int net_bind(int port);
-int net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[4], int *src_port);
-int net_sendto(int fd, const unsigned char ip[4], int port, const void *buf, int len);
+/* Peer addresses are 16 bytes; IPv4 is v4-mapped (::ffff:a.b.c.d). */
+int net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[16], int *src_port);
+int net_sendto(int fd, const unsigned char ip[16], int port, const void *buf, int len);
 
 /* Raw Ethernet socket (full L2 frames) + IPv4 config, for /bin/dhcpcd */
 int net_raw_open(void);

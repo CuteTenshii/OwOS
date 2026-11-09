@@ -20,8 +20,8 @@
 typedef struct tcp_conn tcp_conn_t;
 
 /* Inbound TCP segment from the IP layer (interrupt context). Demuxed to the
- * matching connection, if any. */
-void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len);
+ * matching connection, if any. Addresses are 16 bytes, IPv4 v4-mapped. */
+void tcp_input(const uint8_t src[16], const uint8_t dst[16], const uint8_t *seg, uint32_t len);
 
 /* tcp_read returns this when the caller's cooperative-interrupt latch is raised
  * (Ctrl+C), distinct from a reset (-1) or EOF (0). */
@@ -30,8 +30,8 @@ void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len);
 /* Blocking client API, driven from command context. A handle is valid from a
  * successful tcp_connect() until tcp_close(); the read/write/close calls take
  * the connection they operate on. */
-tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport); /* NULL = fail */
-int tcp_write(tcp_conn_t *c, const void *data, uint32_t len);     /* bytes, -1   */
+tcp_conn_t *tcp_connect(const uint8_t dst_ip[16], uint16_t dport); /* NULL = fail */
+int tcp_write(tcp_conn_t *c, const void *data, uint32_t len);      /* bytes, -1   */
 int tcp_read(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed);
 /* bytes; sets
  * *closed=EOF */

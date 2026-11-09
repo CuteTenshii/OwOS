@@ -36,7 +36,7 @@ struct tcp_hdr {
 #define TCP_ACK 0x10
 
 #define IP_PROTO_TCP 6
-#define TCP_MSS 1460
+#define TCP_MSS_MAX 1460 /* IPv4; IPv6 is 20 less */
 #define TCP_RXBUF 65536u
 #define TCP_MAX_CONNS 8
 #define TCP_MAX_LISTEN 4
@@ -47,7 +47,7 @@ enum { ST_CLOSED, ST_LISTEN, ST_SYN_SENT, ST_SYN_RCVD, ST_ESTAB, ST_CLOSE_WAIT, 
 /* One connection control block; a slot is free iff state == ST_CLOSED. */
 struct tcp_conn {
   volatile int state;
-  uint8_t peer_ip[4];
+  uint8_t peer_ip[16]; /* v4-mapped for IPv4 */
   uint16_t lport, rport;
 
   volatile uint32_t snd_nxt; /* written in command context */
@@ -96,27 +96,6 @@ static struct tcp_conn *tcb_alloc(int newstate, int need_rxbuf)
   return c;
 }
 
-/* TCP checksum over IPv4 pseudo-header + segment; returns host value, store with htons(). */
-static uint16_t tcp_checksum(const uint8_t src[4], const uint8_t dst[4], const uint8_t *seg, uint32_t len)
-{
-  uint32_t sum = 0;
-  sum += ((uint32_t)src[0] << 8) | src[1];
-  sum += ((uint32_t)src[2] << 8) | src[3];
-  sum += ((uint32_t)dst[0] << 8) | dst[1];
-  sum += ((uint32_t)dst[2] << 8) | dst[3];
-  sum += IP_PROTO_TCP;
-  sum += len;
-
-  for (uint32_t i = 0; i + 1 < len; i += 2)
-    sum += ((uint32_t)seg[i] << 8) | seg[i + 1];
-  if (len & 1)
-    sum += (uint32_t)seg[len - 1] << 8;
-
-  while (sum >> 16)
-    sum = (sum & 0xFFFF) + (sum >> 16);
-  return (uint16_t)~sum;
-}
-
 /* Fill header (data at seg+20), checksum, send via IP. */
 static void tcp_xmit(struct tcp_conn *c, uint8_t *seg, uint8_t flags, uint32_t seq, uint32_t dlen)
 {
@@ -134,7 +113,9 @@ static void tcp_xmit(struct tcp_conn *c, uint8_t *seg, uint8_t flags, uint32_t s
   c->adv_wnd = space;
   t->csum = 0;
   t->urg = 0;
-  t->csum = htons(tcp_checksum(net_my_ip(), c->peer_ip, seg, 20 + dlen));
+  uint8_t src[16];
+  net_src_addr(c->peer_ip, src);
+  t->csum = htons(net_l4_csum(src, c->peer_ip, IP_PROTO_TCP, seg, 20 + dlen));
   net_ip_send(c->peer_ip, IP_PROTO_TCP, seg, 20 + dlen);
 }
 
@@ -148,15 +129,15 @@ static void tcp_send_ctl(struct tcp_conn *c, uint8_t flags, uint32_t seq)
 /* Data segment; command context only. */
 static void tcp_send_data(struct tcp_conn *c, uint32_t seq, const uint8_t *data, uint32_t dlen)
 {
-  uint8_t seg[20 + TCP_MSS];
-  if (dlen > TCP_MSS)
-    dlen = TCP_MSS;
+  uint8_t seg[20 + TCP_MSS_MAX];
+  if (dlen > net_tcp_mss(c->peer_ip))
+    dlen = net_tcp_mss(c->peer_ip);
   memcpy(seg + 20, data, dlen);
   tcp_xmit(c, seg, TCP_PSH | TCP_ACK, seq, dlen);
 }
 
 /* Find the connection owning a segment from `src` with these ports, or NULL. */
-static struct tcp_conn *tcp_demux(const uint8_t src[4], uint16_t dport, uint16_t sport)
+static struct tcp_conn *tcp_demux(const uint8_t src[16], uint16_t dport, uint16_t sport)
 {
   for (int i = 0; i < TCP_MAX_CONNS; i++) {
     struct tcp_conn *c = &conns[i];
@@ -164,11 +145,7 @@ static struct tcp_conn *tcp_demux(const uint8_t src[4], uint16_t dport, uint16_t
       continue;
     if (c->lport != dport || c->rport != sport)
       continue;
-    bool ip_ok = true;
-    for (int j = 0; j < 4; j++)
-      if (src[j] != c->peer_ip[j])
-        ip_ok = false;
-    if (ip_ok)
+    if (memcmp(src, c->peer_ip, 16) == 0)
       return c;
   }
   return NULL;
@@ -183,14 +160,13 @@ static bool tcp_is_listening(uint16_t port)
 }
 
 /* Passive open on a SYN to a listening port: claim a buffered slot, reply SYN|ACK. IRQ context, no alloc. */
-static void tcp_accept_syn(const uint8_t src[4], const struct tcp_hdr *t)
+static void tcp_accept_syn(const uint8_t src[16], const struct tcp_hdr *t)
 {
   struct tcp_conn *c = tcb_alloc(ST_SYN_RCVD, /*need_rxbuf=*/1);
   if (!c)
     return;
 
-  for (int i = 0; i < 4; i++)
-    c->peer_ip[i] = src[i];
+  memcpy(c->peer_ip, src, 16);
   c->lport = ntohs(t->dport);
   c->rport = ntohs(t->sport);
   uint32_t isn;
@@ -216,13 +192,13 @@ static bool seq_in_rcv_window(const struct tcp_conn *c, uint32_t seq)
   return (int32_t)(seq - c->rcv_nxt) >= 0 && (int32_t)(seq - (c->rcv_nxt + wnd)) < 0;
 }
 
-void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len)
+void tcp_input(const uint8_t src[16], const uint8_t dst[16], const uint8_t *seg, uint32_t len)
 {
   if (len < 20)
     return;
 
   /* Drop segments with a bad checksum. */
-  if (tcp_checksum(src, net_my_ip(), seg, len) != 0)
+  if (net_l4_csum(src, dst, IP_PROTO_TCP, seg, len) != 0)
     return;
 
   const struct tcp_hdr *t = (const struct tcp_hdr *)seg;
@@ -309,7 +285,7 @@ void tcp_input(const uint8_t src[4], const uint8_t *seg, uint32_t len)
   }
 }
 
-tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport)
+tcp_conn_t *tcp_connect(const uint8_t dst_ip[16], uint16_t dport)
 {
   struct tcp_conn *c = tcb_alloc(ST_SYN_SENT, 0);
   if (!c)
@@ -324,8 +300,7 @@ tcp_conn_t *tcp_connect(const uint8_t dst_ip[4], uint16_t dport)
     }
   }
 
-  for (int i = 0; i < 4; i++)
-    c->peer_ip[i] = dst_ip[i];
+  memcpy(c->peer_ip, dst_ip, 16);
   c->rport = dport;
   /* Each slot owns a distinct 0x400-wide local-port band. */
   c->lport = (uint16_t)(0xC000 + slot * 0x400 + (lport_seq++ & 0x3FF));
@@ -373,8 +348,8 @@ int tcp_write(tcp_conn_t *c, const void *data, uint32_t len)
   uint32_t sent = 0;
   while (sent < len) {
     uint32_t chunk = len - sent;
-    if (chunk > TCP_MSS)
-      chunk = TCP_MSS;
+    if (chunk > net_tcp_mss(c->peer_ip))
+      chunk = net_tcp_mss(c->peer_ip);
     tcp_send_data(c, c->snd_nxt, p + sent, chunk);
     c->snd_nxt += chunk;
     sent += chunk;
@@ -406,7 +381,7 @@ int tcp_read_nb(tcp_conn_t *c, uint8_t *buf, uint32_t max, int *closed)
     /* RFC 1122 SWS: ACK once freed space exceeds the last advertised window by an MSS. */
     if (c->state == ST_ESTAB || c->state == ST_CLOSE_WAIT) {
       uint32_t freespace = TCP_RXBUF - (c->wlen - c->rlen);
-      if (freespace >= c->adv_wnd + TCP_MSS)
+      if (freespace >= c->adv_wnd + net_tcp_mss(c->peer_ip))
         tcp_send_ctl(c, TCP_ACK, c->snd_nxt);
     }
 

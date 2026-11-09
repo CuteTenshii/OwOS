@@ -129,9 +129,12 @@ struct ip6_hdr {
 #define IP_UDP 17
 #define IP_ICMP6 58
 #define IP6_HBH 0
+#define IP6_FRAG 44
 #define IP6_DSTOPTS 60
 
 #define ICMP6_ECHO_REPLY 129
+#define MLD_QUERY 130
+#define MLD_V2_REPORT 143
 #define ICMP6_RS 133
 #define ICMP6_RA 134
 #define ICMP6_NS 135
@@ -139,6 +142,7 @@ struct ip6_hdr {
 #define ND_OPT_SLLA 1
 #define ND_OPT_TLLA 2
 #define ND_OPT_PREFIX 3
+#define ND_OPT_RDNSS 25
 
 /* Unconfigured (0.0.0.0) until /bin/dhcpcd applies a lease via net_ifconfig(); /24 keeps same_subnet() defined. */
 static uint8_t my_ip[4] = {0, 0, 0, 0};
@@ -146,12 +150,32 @@ static uint8_t gw_ip[4] = {0, 0, 0, 0};
 static uint8_t dns_ip[4] = {0, 0, 0, 0}; /* leased DNS server; no in-kernel reader */
 static uint8_t netmask[4] = {255, 255, 255, 0};
 
-/* IPv6: link-local from the MAC at net_init, a global address and default router from router advertisements. */
-static uint8_t ll6[16];
-static uint8_t gua6[16];
-static uint8_t prefix6[8];
-static uint8_t gw6[16];
-static bool have_gua6, have_gw6;
+/* IPv6: link-local from the MAC at net_init; global address, default router and DNS server from router
+ * advertisements. Addresses pass duplicate address detection (tentative) before they are used. */
+enum { AS_NONE, AS_NEW, AS_TENTATIVE, AS_PREFERRED, AS_DUP };
+static uint8_t ll6[16], gua6[16], prefix6[8], gw6[16], dns6[16];
+static uint8_t ll6_state, gua6_state;
+static uint32_t ll6_dad_end, gua6_dad_end;            /* tick a tentative address becomes preferred */
+static uint32_t gua6_expire, gw6_expire, dns6_expire; /* tick the RA-learned item lapses; 0 = never */
+static bool have_gw6, have_dns6;
+
+static bool ll6_ok(void) { return ll6_state == AS_PREFERRED; }
+
+static bool gua6_ok(void) { return gua6_state == AS_PREFERRED; }
+
+static bool tick_passed(uint32_t t) { return (int32_t)(timer_ticks() - t) >= 0; }
+
+/* Tick `sec` seconds from now (capped; never 0, which means no expiry). */
+static uint32_t tick_after(uint32_t sec)
+{
+  uint32_t t = timer_ticks() + (sec > 1000000 ? 1000000 : sec) * TIMER_HZ;
+  return t ? t : 1;
+}
+
+static uint32_t be32(const uint8_t *p)
+{
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
 
 /* Neighbor cache for both families (ARP for v4, NDP for v6); keys are 16-byte addresses. */
 #define NBR_CACHE 16
@@ -319,7 +343,7 @@ void net_src_addr(const uint8_t dst[16], uint8_t out[16])
 {
   if (addr_is_v4(dst))
     addr_map_v4(out, my_ip);
-  else if (have_gua6 && !addr_is_link_local6(dst) && !addr_is_mcast6(dst))
+  else if (gua6_ok() && !addr_is_link_local6(dst) && !addr_is_mcast6(dst))
     memcpy(out, gua6, 16);
   else
     memcpy(out, ll6, 16);
@@ -372,6 +396,36 @@ static void rs_send(void)
   msg[9] = 1;
   memcpy(msg + 10, nic_mac(), 6);
   icmp6_send(ll6, all_routers, msg, sizeof msg, 255);
+}
+
+static const uint8_t unspec6[16];
+
+/* Duplicate address detection probe: a neighbor solicitation from :: for the tentative address. */
+static void dad_probe(const uint8_t addr[16])
+{
+  uint8_t dst[16], msg[24] = {0};
+  solicited_node(addr, dst);
+  msg[0] = ICMP6_NS;
+  memcpy(msg + 8, addr, 16);
+  icmp6_send(unspec6, dst, msg, sizeof msg, 255);
+}
+
+/* MLDv2 report (RFC 3810) for our solicited-node group, so snooping switches forward neighbor discovery to us.
+ * rtype: 4 = joined, 2 = answer to a query. Rides a hop-by-hop header carrying the router alert option. */
+static void mld_report(uint8_t rtype)
+{
+  static const uint8_t mld_routers[16] = {0xFF, 0x02, [15] = 0x16};
+  uint8_t pkt[8 + 28] = {IP_ICMP6, 0, 5, 2, 0, 0, 1, 0};
+  uint8_t *m = pkt + 8;
+  m[0] = MLD_V2_REPORT;
+  m[7] = 1; /* one group record */
+  m[8] = rtype;
+  solicited_node(ll6, m + 12);
+  const uint8_t *src = ll6_ok() ? ll6 : unspec6;
+  uint16_t c = net_l4_csum(src, mld_routers, IP_ICMP6, m, 28);
+  m[2] = (uint8_t)(c >> 8);
+  m[3] = (uint8_t)c;
+  ip6_send_from(src, mld_routers, IP6_HBH, pkt, sizeof pkt, 1);
 }
 
 static void nbr_request(const uint8_t ip[16])
@@ -439,7 +493,7 @@ static int next_hop_mac(const uint8_t dst[16], uint8_t out[6])
     memcpy(out + 2, dst + 12, 4);
     return 1;
   }
-  bool onlink = addr_is_link_local6(dst) || (have_gua6 && memcmp(dst, prefix6, 8) == 0);
+  bool onlink = addr_is_link_local6(dst) || (gua6_ok() && memcmp(dst, prefix6, 8) == 0);
   if (onlink)
     return nbr_resolve(dst, out);
   return have_gw6 && nbr_resolve(gw6, out);
@@ -520,7 +574,9 @@ const uint8_t *net_my_ip(void) { return my_ip; }
 /* True once a real IPv4 address is held (non-zero my_ip). */
 bool net_have_ip(void) { return my_ip[0] || my_ip[1] || my_ip[2] || my_ip[3]; }
 
-const uint8_t *net_my_ip6(void) { return have_gua6 ? gua6 : NULL; }
+const uint8_t *net_my_ip6(void) { return gua6_ok() ? gua6 : NULL; }
+
+const uint8_t *net_dns6(void) { return have_dns6 ? dns6 : NULL; }
 
 const uint8_t *net_ll_ip6(void) { return ll6; }
 
@@ -561,30 +617,68 @@ static const uint8_t *nd_option(const uint8_t *p, uint32_t len, uint8_t want)
   return NULL;
 }
 
+/* Prefix information body: plen, flags (A=0x40), valid(4), preferred(4), reserved(4), prefix(16). */
+static void prefix_opt(const uint8_t *pi)
+{
+  if (pi[0] != 64 || !(pi[1] & 0x40) || addr_is_link_local6(pi + 14))
+    return;
+  uint32_t valid = be32(pi + 2);
+  bool same = gua6_state != AS_NONE && memcmp(prefix6, pi + 14, 8) == 0;
+  if (!valid) {
+    if (same)
+      gua6_state = AS_NONE;
+    return;
+  }
+  if (!same) {
+    memcpy(prefix6, pi + 14, 8);
+    memcpy(gua6, pi + 14, 8);
+    memcpy(gua6 + 8, ll6 + 8, 8);
+    gua6_state = AS_NEW;
+  }
+  gua6_expire = valid == 0xFFFFFFFF ? 0 : tick_after(valid);
+}
+
 static void ra_recv(const uint8_t src[16], const uint8_t *p, uint32_t len)
 {
   if (len < 16 || !addr_is_link_local6(src))
     return;
-  const uint8_t *opts = p + 16;
-  uint32_t olen = len - 16;
   uint16_t lifetime = (uint16_t)((p[6] << 8) | p[7]);
   if (lifetime) {
     memcpy(gw6, src, 16);
     have_gw6 = true;
-    const uint8_t *mac = nd_option(opts, olen, ND_OPT_SLLA);
-    if (mac)
-      nbr_cache_put(src, mac);
+    gw6_expire = tick_after(lifetime);
   } else if (have_gw6 && memcmp(gw6, src, 16) == 0) {
     have_gw6 = false;
   }
-  const uint8_t *pi = nd_option(opts, olen, ND_OPT_PREFIX);
-  /* Prefix information body: plen, flags (A=0x40), valid(4), preferred(4), reserved(4), prefix(16). */
-  if (pi && pi[0] == 64 && (pi[1] & 0x40) && (pi[2] | pi[3] | pi[4] | pi[5]) && !addr_is_link_local6(pi + 14)) {
-    memcpy(prefix6, pi + 14, 8);
-    memcpy(gua6, pi + 14, 8);
-    memcpy(gua6 + 8, ll6 + 8, 8);
-    have_gua6 = true;
+  const uint8_t *o = p + 16;
+  for (uint32_t rem = len - 16; rem >= 8;) {
+    uint32_t olen = (uint32_t)o[1] * 8;
+    if (olen == 0 || olen > rem)
+      break;
+    if (o[0] == ND_OPT_SLLA)
+      nbr_cache_put(src, o + 2);
+    else if (o[0] == ND_OPT_PREFIX && olen >= 32)
+      prefix_opt(o + 2);
+    else if (o[0] == ND_OPT_RDNSS && olen >= 24) { /* reserved(2), lifetime(4), addresses */
+      uint32_t life = be32(o + 4);
+      have_dns6 = life != 0;
+      if (have_dns6) {
+        memcpy(dns6, o + 8, 16);
+        dns6_expire = tick_after(life);
+      }
+    }
+    o += olen;
+    rem -= olen;
   }
+}
+
+/* A tentative address that someone else defends or probes is a duplicate. */
+static void dad_conflict(const uint8_t target[16])
+{
+  if (ll6_state == AS_TENTATIVE && memcmp(target, ll6, 16) == 0)
+    ll6_state = AS_DUP;
+  else if (gua6_state == AS_TENTATIVE && memcmp(target, gua6, 16) == 0)
+    gua6_state = AS_DUP;
 }
 
 static void ns_recv(const uint8_t src[16], const uint8_t *p, uint32_t len)
@@ -592,8 +686,12 @@ static void ns_recv(const uint8_t src[16], const uint8_t *p, uint32_t len)
   if (len < 24)
     return;
   const uint8_t *target = p + 8;
-  bool ours = memcmp(target, ll6, 16) == 0 || (have_gua6 && memcmp(target, gua6, 16) == 0);
-  if (!ours || addr_is_unspec(src))
+  if (addr_is_unspec(src)) { /* another node's DAD probe */
+    dad_conflict(target);
+    return;
+  }
+  bool ours = (ll6_ok() && memcmp(target, ll6, 16) == 0) || (gua6_ok() && memcmp(target, gua6, 16) == 0);
+  if (!ours)
     return;
   const uint8_t *mac = nd_option(p + 24, len - 24, ND_OPT_SLLA);
   if (!mac)
@@ -613,6 +711,7 @@ static void na_recv(const uint8_t *p, uint32_t len)
 {
   if (len < 24)
     return;
+  dad_conflict(p + 8);
   const uint8_t *mac = nd_option(p + 24, len - 24, ND_OPT_TLLA);
   if (mac && nbr_pending_take(p + 8))
     nbr_cache_put(p + 8, mac);
@@ -641,6 +740,10 @@ static void icmp6_recv(const uint8_t src[16], const uint8_t dst[16], uint8_t hli
   case ICMP6_NA:
     if (hlim == 255)
       na_recv(p, len);
+    break;
+  case MLD_QUERY:
+    if (hlim == 1 && addr_is_link_local6(src) && (ll6_state == AS_TENTATIVE || ll6_ok()))
+      mld_report(2);
     break;
   }
 }
@@ -790,7 +893,94 @@ static void ip_recv(const uint8_t *p, uint32_t len)
 
 static bool ip6_dst_ok(const uint8_t dst[16])
 {
-  return addr_is_mcast6(dst) || memcmp(dst, ll6, 16) == 0 || (have_gua6 && memcmp(dst, gua6, 16) == 0);
+  return addr_is_mcast6(dst) || (ll6_ok() && memcmp(dst, ll6, 16) == 0) || (gua6_ok() && memcmp(dst, gua6, 16) == 0);
+}
+
+/* IPv6 reassembly (RFC 8200): a few datagrams at a time, in 8-byte blocks, overlaps dropped (RFC 5722). */
+#define FRAG_SLOTS 2
+#define FRAG_MAX 4096
+#define FRAG_TIMEOUT (5 * TIMER_HZ)
+static struct frag6 {
+  bool used, have_first;
+  uint8_t src[16], dst[16], nh;
+  uint32_t id, total, started; /* total is 0 until the last fragment arrives */
+  uint8_t seen[FRAG_MAX / 8 / 8];
+  uint8_t buf[FRAG_MAX];
+} frags[FRAG_SLOTS];
+
+static void ip6_dispatch(const uint8_t src[16], const uint8_t dst[16], uint8_t hlim, uint8_t nh, const uint8_t *payload,
+                         uint32_t plen);
+
+/* `fh` is the 8-byte fragment header, data/dlen the fragment's payload. */
+static void frag6_input(const uint8_t src[16], const uint8_t dst[16], uint8_t hlim, const uint8_t *fh,
+                        const uint8_t *data, uint32_t dlen)
+{
+  uint32_t off = (uint32_t)((fh[2] << 8) | (fh[3] & 0xF8));
+  bool more = fh[3] & 1;
+  uint32_t id = be32(fh + 4);
+  if (dlen == 0 || (more && (dlen & 7)) || off + dlen > FRAG_MAX)
+    return;
+
+  struct frag6 *f = NULL;
+  for (int i = 0; i < FRAG_SLOTS; i++)
+    if (frags[i].used && frags[i].id == id && memcmp(frags[i].src, src, 16) == 0 && memcmp(frags[i].dst, dst, 16) == 0)
+      f = &frags[i];
+  if (!f) { /* a free slot, else evict the oldest */
+    f = &frags[0];
+    for (int i = 0; i < FRAG_SLOTS; i++) {
+      if (!frags[i].used) {
+        f = &frags[i];
+        break;
+      }
+      if ((int32_t)(f->started - frags[i].started) > 0)
+        f = &frags[i];
+    }
+    memset(f->seen, 0, sizeof f->seen);
+    f->used = true;
+    f->have_first = false;
+    f->total = 0;
+    f->id = id;
+    f->started = timer_ticks();
+    memcpy(f->src, src, 16);
+    memcpy(f->dst, dst, 16);
+  }
+
+  uint32_t first = off / 8, last = (off + dlen + 7) / 8;
+  for (uint32_t b = first; b < last; b++)
+    if (f->seen[b / 8] & (1u << (b % 8))) {
+      f->used = false;
+      return;
+    }
+  for (uint32_t b = first; b < last; b++)
+    f->seen[b / 8] |= (uint8_t)(1u << (b % 8));
+  memcpy(f->buf + off, data, dlen);
+  if (off == 0) {
+    f->have_first = true;
+    f->nh = fh[0];
+  }
+  if (!more)
+    f->total = off + dlen;
+  if (!f->total || !f->have_first)
+    return;
+  for (uint32_t b = 0; b < (f->total + 7) / 8; b++)
+    if (!(f->seen[b / 8] & (1u << (b % 8))))
+      return;
+  f->used = false;
+  if (f->nh != IP6_FRAG)
+    ip6_dispatch(src, dst, hlim, f->nh, f->buf, f->total);
+}
+
+static void ip6_dispatch(const uint8_t src[16], const uint8_t dst[16], uint8_t hlim, uint8_t nh, const uint8_t *payload,
+                         uint32_t plen)
+{
+  if (nh == IP_ICMP6)
+    icmp6_recv(src, dst, hlim, payload, plen);
+  else if (nh == IP_UDP)
+    udp_recv(src, dst, payload, plen);
+  else if (nh == IP_TCP)
+    tcp_input(src, dst, payload, plen);
+  else if (nh == IP6_FRAG && plen > 8)
+    frag6_input(src, dst, hlim, payload, payload + 8, plen - 8);
 }
 
 static void ip6_recv(const uint8_t *p, uint32_t len)
@@ -806,7 +996,7 @@ static void ip6_recv(const uint8_t *p, uint32_t len)
 
   const uint8_t *payload = p + 40;
   uint8_t nh = ip->nh;
-  while (nh == IP6_HBH || nh == IP6_DSTOPTS) { /* skip option headers; fragments are dropped below */
+  while (nh == IP6_HBH || nh == IP6_DSTOPTS) { /* skip option headers */
     if (plen < 8)
       return;
     uint32_t hl = ((uint32_t)payload[1] + 1) * 8;
@@ -816,12 +1006,7 @@ static void ip6_recv(const uint8_t *p, uint32_t len)
     payload += hl;
     plen -= hl;
   }
-  if (nh == IP_ICMP6)
-    icmp6_recv(ip->src, ip->dst, ip->hlim, payload, plen);
-  else if (nh == IP_UDP)
-    udp_recv(ip->src, ip->dst, payload, plen);
-  else if (nh == IP_TCP)
-    tcp_input(ip->src, ip->dst, payload, plen);
+  ip6_dispatch(ip->src, ip->dst, ip->hlim, nh, payload, plen);
 }
 
 /* The NIC driver hands every inbound Ethernet frame (FCS stripped) here. */
@@ -1447,27 +1632,61 @@ void net_init(void)
   ll6[8] ^= 0x02; /* EUI-64: flip the universal/local bit, insert ff:fe */
   ll6[11] = 0xFF;
   ll6[12] = 0xFE;
+  ll6_state = AS_NEW;
   /* No IP is announced here: /bin/dhcpcd applies the lease after sti. */
   con_write("net: requesting address via DHCP\n");
 }
 
-/* Router solicitations every 4 s until a router answers (max 5). */
-static void rs_tick(void)
+/* Advance one address through duplicate address detection; true if its state changed. */
+static bool dad_step(uint8_t *state, uint32_t *end, const uint8_t addr[16])
 {
-  static uint32_t next;
-  static int sent;
-  if (have_gw6 || sent >= 5 || timer_ticks() < next)
-    return;
-  rs_send();
-  sent++;
-  next = timer_ticks() + 4 * TIMER_HZ;
+  if (*state == AS_NEW) {
+    *state = AS_TENTATIVE;
+    *end = timer_ticks() + TIMER_HZ;
+    dad_probe(addr);
+    return true;
+  }
+  if (*state == AS_TENTATIVE && tick_passed(*end)) {
+    *state = AS_PREFERRED;
+    return true;
+  }
+  return false;
+}
+
+/* Once a second or so from the receive thread: DAD, lifetimes, router solicitations, reassembly timeouts. */
+static void net_tick(void)
+{
+  static uint32_t rs_next;
+  static int rs_sent;
+  if (dad_step(&ll6_state, &ll6_dad_end, ll6))
+    mld_report(4);
+  dad_step(&gua6_state, &gua6_dad_end, gua6);
+
+  if (gua6_state != AS_NONE && gua6_expire && tick_passed(gua6_expire))
+    gua6_state = AS_NONE;
+  if (have_dns6 && tick_passed(dns6_expire))
+    have_dns6 = false;
+  if (have_gw6 && tick_passed(gw6_expire)) {
+    have_gw6 = false;
+    rs_sent = 0;
+  }
+  for (int i = 0; i < FRAG_SLOTS; i++)
+    if (frags[i].used && (int32_t)(timer_ticks() - frags[i].started) > FRAG_TIMEOUT)
+      frags[i].used = false;
+
+  /* Router solicitations every 4 s until a router answers (max 5). */
+  if (ll6_ok() && !have_gw6 && rs_sent < 5 && tick_passed(rs_next)) {
+    rs_send();
+    rs_sent++;
+    rs_next = timer_ticks() + 4 * TIMER_HZ;
+  }
 }
 
 static void net_poll_thread(void)
 {
   for (;;) {
     nic_poll();
-    rs_tick();
+    net_tick();
     timer_sleep(1);
   }
 }

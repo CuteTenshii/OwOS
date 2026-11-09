@@ -193,7 +193,7 @@ A from-scratch stack, strictly layered:
   default), the Intel e1000 (8254x/82574/I217-I219; `make run NIC=e1000`), and
   the Intel igb family (I210/I211/82576; `make run NIC=igb`), keeping whichever
   is present. The rest of the stack is driver-agnostic.
-- **IPv4** (`net.c`) - ARP, ICMP echo, UDP, DNS, and a DHCP client.
+- **IPv4 and IPv6** (`net.c`) - ARP, NDP with SLAAC, ICMP and ICMPv6 echo, UDP, TCP, DNS (A and AAAA), and a DHCP client.
 - **TCP** (`tcp.c`) - active **and** passive open, several concurrent
   connections, SYN-accepted-in-IRQ with a daemon thread taking the connection.
 - **TLS** (`tls.c` + `crypto.c`) - a client-only TLS 1.3 (1.2 fallback) with
@@ -336,7 +336,7 @@ kernel/hfs.c       HFS+ read-only driver
 kernel/ext.c       ext2/3/4 read-only driver
 kernel/iso9660.c   ISO 9660 + Joliet read-only CD/DVD driver
 
-kernel/net.c       IPv4: ARP, ICMP, UDP/DNS, DHCP
+kernel/net.c       IPv4/IPv6: ARP, NDP, ICMP, UDP/TCP, DHCP
 kernel/tcp.c       concurrent TCP: client (connect) + server (listen/accept)
 kernel/tls.c       client TLS 1.3/1.2 (for https)
 kernel/crypto.c    SHA-256/HMAC/HKDF, AES-128-GCM, X25519

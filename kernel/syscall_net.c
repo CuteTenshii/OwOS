@@ -32,12 +32,12 @@ void syscall_net_send(struct registers *r)
     return;
   }
   uint32_t fd = a[0], buf = a[1], len = a[2], ip_ptr = a[4], port = a[5];
-  if (len == 0 || !user_range(buf, len) || (ip_ptr && !user_range(ip_ptr, 4))) {
+  if (len == 0 || !user_range(buf, len) || (ip_ptr && !user_range(ip_ptr, 16))) {
     r->eax = (uint32_t)-1;
     return;
   }
   if (ip_ptr) {
-    uint8_t ip[4];
+    uint8_t ip[16];
     if (copyin(ip, ip_ptr, sizeof ip) != 0) {
       r->eax = (uint32_t)-1;
       return;
@@ -57,14 +57,14 @@ void syscall_net_recv(struct registers *r)
   }
   uint32_t fd = a[0], buf = a[1], max = a[2], flags = a[3];
   uint32_t ip_ptr = a[4], port_ptr = a[5];
-  if (max == 0 || !user_out_range(buf, max) || (ip_ptr && !user_out_range(ip_ptr, 4)) ||
+  if (max == 0 || !user_out_range(buf, max) || (ip_ptr && !user_out_range(ip_ptr, 16)) ||
       (port_ptr && !user_out_range(port_ptr, 4))) {
     r->eax = (uint32_t)-1;
     return;
   }
   int n;
   if (ip_ptr || port_ptr) {
-    uint8_t ip[4];
+    uint8_t ip[16];
     uint16_t port = 0;
     n = net_sock_recvfrom((int)fd, (void *)(uintptr_t)buf, max, ip_ptr ? ip : 0, &port);
     if (n > 0) {

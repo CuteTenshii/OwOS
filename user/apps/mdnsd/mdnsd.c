@@ -14,7 +14,7 @@ enum { MDNS_A = 1, MDNS_PTR = 12, MDNS_TXT = 16, MDNS_SRV = 33, MDNS_ANY = 255 }
 #define MDNS_TTL_SHARED 4500 /* PTR: shared, long-lived (RFC 6762 §10) */
 #define MDNS_PORT 5353
 
-static const unsigned char mdns_group[4] = {224, 0, 0, 251};
+static const unsigned char mdns_group[16] = {[10] = 0xFF, 0xFF, 224, 0, 0, 251}; /* v4-mapped */
 
 /* One published resource record */
 struct mdns_record {
@@ -526,7 +526,7 @@ int main(void)
   bool announced_once = false;
 
   for (;;) {
-    unsigned char src[4];
+    unsigned char src[16];
     int sport = 0;
     unsigned char q[1500];
     int n = net_recvfrom(fd, q, (int)sizeof q, src, &sport);

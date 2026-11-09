@@ -130,13 +130,13 @@ int net_accept(int listen_fd) { return syscall(SYS_NET_ACCEPT, listen_fd, 0, 0);
 
 int net_bind(int port) { return syscall(SYS_NET_BIND, port, 0, 0); }
 
-int net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[4], int *src_port)
+int net_recvfrom(int fd, void *buf, int max, unsigned char src_ip[16], int *src_port)
 {
   unsigned a[6] = {(unsigned)fd, (unsigned)buf, (unsigned)max, 0, (unsigned)src_ip, (unsigned)src_port};
   return syscall(SYS_NET_RECV, (int)a, 0, 0);
 }
 
-int net_sendto(int fd, const unsigned char ip[4], int port, const void *buf, int len)
+int net_sendto(int fd, const unsigned char ip[16], int port, const void *buf, int len)
 {
   unsigned a[6] = {(unsigned)fd, (unsigned)buf, (unsigned)len, 0, (unsigned)ip, (unsigned)port};
   return syscall(SYS_NET_SEND, (int)a, 0, 0);
