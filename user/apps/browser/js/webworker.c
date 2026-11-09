@@ -753,6 +753,18 @@ static js_value wt_n_url_parse(js_ctx *ctx, js_value t, js_value *args, int argc
   return v;
 }
 
+/* N.urlEscape(text, kind): percent-encode text as a pathname (0), query (1) or fragment (2) */
+static js_value wt_n_url_escape(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_value in = js_to_string(ctx, A(0));
+  char out[URL_MAX];
+  (void)t;
+  if (in.type != JV_STR)
+    return js_undef();
+  url_escape_kind(out, sizeof out, in.u.str->data, js_to_int_sat(ctx, A(1)));
+  return js_mk_cstring(ctx, out);
+}
+
 /* N.queryParse("a=1&b=2"): [[name, value], ...] */
 static js_value wt_n_query_parse(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1166,6 +1178,7 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "decode", wt_n_decode, 4);
   js_def_native(ctx, n, "randomFill", wt_n_random_fill, 1);
   js_def_native(ctx, n, "urlParse", wt_n_url_parse, 2);
+  js_def_native(ctx, n, "urlEscape", wt_n_url_escape, 2);
   js_def_native(ctx, n, "queryParse", wt_n_query_parse, 1);
   js_def_native(ctx, n, "queryString", wt_n_query_string, 1);
   js_def_native(ctx, n, "base64", wt_n_base64, 1);

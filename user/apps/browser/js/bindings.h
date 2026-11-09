@@ -193,8 +193,9 @@ struct url_parts {
   bool opaque; /* mailto:, data:, ... */
 };
 bool url_parse(const char *input, const char *base_href, struct url_parts *out);
-char *form_decode(const char *s, int len); /* percent-decode, '+' as space; malloc'd */
-void sb_put_form(sbuf *s, const char *t);  /* application/x-www-form-urlencoded component */
+void url_escape_kind(char *dst, int cap, const char *src, int kind); /* 0 pathname, 1 query, 2 fragment */
+char *form_decode(const char *s, int len);                           /* percent-decode, '+' as space; malloc'd */
+void sb_put_form(sbuf *s, const char *t);                            /* application/x-www-form-urlencoded component */
 int blob_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta);
 js_value blob_clone_read(js_ctx *ctx, const char *kind, const unsigned char *bytes, int len, const char *meta);
 js_value make_search_params(js_ctx *ctx, const char *query);

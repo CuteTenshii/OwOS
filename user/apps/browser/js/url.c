@@ -141,6 +141,12 @@ static void url_escape(char *dst, int cap, const char *src, const char *extra)
   dst[n] = 0;
 }
 
+/* Escape a pathname (0), query (1) or fragment (2) the way the URL parser does */
+void url_escape_kind(char *dst, int cap, const char *src, int kind)
+{
+  url_escape(dst, cap, src, kind == 0 ? "\"<>`{}?#" : kind == 1 ? "\"<>#'" : "\"<>`");
+}
+
 static void url_lower(char *s)
 {
   for (; *s; s++)

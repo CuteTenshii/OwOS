@@ -345,6 +345,8 @@ static void test_worker_streams(void)
              "var tr=new TransformStream({transform:function(chunk,c){ c.enqueue(chunk.toUpperCase()); }}), "
              "w=tr.writable.getWriter(); w.write(\"abc\"); w.close();"
              "done.push(tr.readable.getReader().read().then(function(r){ out.transform=r.value; }));"
+             "done.push(new Blob([new Uint8Array(200000)]).stream().getReader().read().then(function(r){ "
+             "out.chunk=r.value.length; }));"
              "done.push(fetch(\"data:text/plain,body\").then(function(r){ return r.body.getReader().read(); "
              "}).then(function(r){ out.body=new TextDecoder().decode(r.value); }));"
              "Promise.all(done).then(function(){ out.stream=typeof ReadableStream; postMessage(out); },function(e){ "
@@ -355,7 +357,8 @@ static void test_worker_streams(void)
              "expect(st.fromStream==='hi!', 'a Response built from a ReadableStream reads back: '+st.fromStream);\n"
              "expect(st.blob==='streamed' && st.transform==='ABC' && st.body==='body', 'Blob.stream, TransformStream, "
              "Response.body: '+JSON.stringify(st));\n"
-             "expect(st.stream==='function', 'the stream classes are globals');\n");
+             "expect(st.stream==='function', 'the stream classes are globals');\n"
+             "expect(st.chunk===200000, 'a stream over bytes in memory delivers them as one chunk: '+st.chunk);\n");
 }
 
 static void test_worker_misc_apis(void)
@@ -442,6 +445,20 @@ static void test_message_dispatch(void)
   expect(wait_for("md!==null"));
   run_script("expect(md==='on:1:truetrue0,a,once,obj,on:2:truetrue0,a,obj', 'handler, listeners, once, handleEvent, "
              "stopImmediatePropagation: '+md);\n");
+}
+
+static void test_headers_order(void)
+{
+  run_script("var hk=null, hw=new Worker('data:text/javascript,var h=new Headers({B:\"1\",a:\"2\"}); var "
+             "first=Array.from(h.keys()).join(); h.set(\"c\",\"3\"); h.delete(\"a\"); h.append(\"B\",\"x\");"
+             "var bad=[]; [\"\",\"a b\",\"x:y\"].forEach(function(n){ try { h.get(n); bad.push(\"no\"); } catch(e) { "
+             "bad.push(e.name); } });"
+             "postMessage([first, Array.from(h.keys()).join(), h.get(\"b\"), Array.from(h.entries()).join(\";\"), "
+             "bad.join()]);');\n"
+             "hw.onmessage=function(e){ hk=e.data; };\n");
+  expect(wait_for("hk!==null"));
+  run_script("expect(hk.join('|')==='a,b|b,c|1, x|b,1, x;c,3|TypeError,TypeError,TypeError', 'Headers stay sorted "
+             "after changes: '+hk.join('|'));\n");
 }
 
 static void test_blob_crosses(void)
@@ -596,6 +613,7 @@ int main(void)
   worker_test("MessagePorts move between page and worker", test_ports_cross);
   worker_test("URL edge cases", test_worker_url_edges);
   worker_test("message events reach onmessage and every listener in order", test_message_dispatch);
+  worker_test("Headers order and name checks", test_headers_order);
   worker_test("Blobs cross between page and worker", test_blob_crosses);
   worker_test("transferred buffers and collections", test_transfer_and_collections);
   worker_test("SharedArrayBuffer and Atomics with a worker", test_shared_memory);

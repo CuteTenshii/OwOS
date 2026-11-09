@@ -6,24 +6,6 @@ JS(
   var QUOTE = String.fromCharCode(39);
 
   /* ---- percent coding ---- */
-  function hex2(n) { return (n < 16 ? "0" : "") + n.toString(16).toUpperCase(); }
-  function escapeWith(s, isBad) {
-    var out = "", i, c, enc;
-    for (i = 0; i < s.length; i++) {
-      c = s.charCodeAt(i);
-      if (c > 126 || c < 33 || isBad(c)) {
-        if (c >= 55296 && c <= 56319 && i + 1 < s.length) { enc = encodeURIComponent(s.charAt(i) + s.charAt(i + 1)); i++; }
-        else if (c > 127) { enc = encodeURIComponent(s.charAt(i)); }
-        else { enc = "%" + hex2(c); }
-        out += enc;
-      } else { out += s.charAt(i); }
-    }
-    return out;
-  }
-  function badPath(c) { return c === 34 || c === 60 || c === 62 || c === 96 || c === 123 || c === 125 || c === 63 || c === 35; }
-  function badQuery(c) { return c === 34 || c === 60 || c === 62 || c === 35 || c === 39; }
-  function badFragment(c) { return c === 34 || c === 60 || c === 62 || c === 96; }
-
   /* ---- URLSearchParams ---- */
   function appendAll(list, pairs) {
     for (var i = 0; i < pairs.length; i++) { list.push(pairs[i]); }
@@ -141,16 +123,16 @@ JS(
   });
   urlProp("pathname", function () { return this["@r"].pathname; }, function (v) {
     v = String(v);
-    this["@r"].pathname = escapeWith(v.charAt(0) === "/" ? v : "/" + v, badPath);
+    this["@r"].pathname = N.urlEscape(v.charAt(0) === "/" ? v : "/" + v, 0);
   });
   urlProp("search", function () { return this["@r"].search; }, function (v) {
     v = String(v);
-    this["@r"].search = v === "" || v === "?" ? "" : escapeWith(v.charAt(0) === "?" ? v : "?" + v, badQuery);
+    this["@r"].search = v === "" || v === "?" ? "" : N.urlEscape(v.charAt(0) === "?" ? v : "?" + v, 1);
     if (this["@sp"]) { this["@sp"]["@list"].splice(0, this["@sp"]["@list"].length, ...N.queryParse(this["@r"].search)); }
   });
   urlProp("hash", function () { return this["@r"].hash; }, function (v) {
     v = String(v);
-    this["@r"].hash = v === "" || v === "#" ? "" : escapeWith(v.charAt(0) === "#" ? v : "#" + v, badFragment);
+    this["@r"].hash = v === "" || v === "#" ? "" : N.urlEscape(v.charAt(0) === "#" ? v : "#" + v, 2);
   });
   urlProp("href", function () { return serialize(this["@r"]); }, function (v) {
     var r = N.urlParse(String(v));
@@ -317,14 +299,25 @@ JS(
   hide(g, "FormData", FormData);
 
   /* ---- Headers ---- */
+  var goodNames = {}, goodCount = 0;
   function normName(n) {
     n = String(n);
+    var k = goodNames[n];
+    if (k !== undefined) { return k; }
     if (!n || n.search(/[^!#$%&*+.^_`|~0-9A-Za-z-]/) >= 0) { throw typeError("Invalid header name"); }
-    return n.toLowerCase();
+    k = n.toLowerCase();
+    if (goodCount < 512) { goodNames[n] = k; goodCount++; }
+    return k;
+  }
+  function sortedNames(h) {
+    var s = h["@sorted"];
+    if (!s) { s = h["@order"].slice().sort(); h["@sorted"] = s; }
+    return s;
   }
   function Headers(init) {
     hide(this, "@map", {});
     hide(this, "@order", []);
+    hide(this, "@sorted", null);
     if (init === undefined || init === null) { return; }
     if (init instanceof Headers) { init.forEach(function (v, k) { this.append(k, v); }, this); }
     else if (typeof init === "object" && typeof init[Symbol.iterator] === "function") {
@@ -339,31 +332,31 @@ JS(
   method(Headers.prototype, "append", function (n, v) {
     var k = normName(n), m = this["@map"];
     v = String(v).trim();
-    if (m[k] === undefined) { m[k] = v; this["@order"].push(k); } else { m[k] += ", " + v; }
+    if (m[k] === undefined) { m[k] = v; this["@order"].push(k); this["@sorted"] = null; } else { m[k] += ", " + v; }
   });
   method(Headers.prototype, "set", function (n, v) {
     var k = normName(n);
-    if (this["@map"][k] === undefined) { this["@order"].push(k); }
+    if (this["@map"][k] === undefined) { this["@order"].push(k); this["@sorted"] = null; }
     this["@map"][k] = String(v).trim();
   });
   method(Headers.prototype, "get", function (n) { var v = this["@map"][normName(n)]; return v === undefined ? null : v; });
   method(Headers.prototype, "has", function (n) { return this["@map"][normName(n)] !== undefined; });
   method(Headers.prototype, "delete", function (n) {
     var k = normName(n), i = this["@order"].indexOf(k);
-    if (i >= 0) { this["@order"].splice(i, 1); delete this["@map"][k]; }
+    if (i >= 0) { this["@order"].splice(i, 1); delete this["@map"][k]; this["@sorted"] = null; }
   });
   method(Headers.prototype, "forEach", function (fn, thisArg) {
     var self = this;
-    this["@order"].slice().sort().forEach(function (k) { fn.call(thisArg, self["@map"][k], k, self); });
+    sortedNames(this).slice().forEach(function (k) { fn.call(thisArg, self["@map"][k], k, self); });
   });
   method(Headers.prototype, "entries", function () {
     var self = this;
-    return this["@order"].slice().sort().map(function (k) { return [k, self["@map"][k]]; })[Symbol.iterator]();
+    return sortedNames(this).map(function (k) { return [k, self["@map"][k]]; })[Symbol.iterator]();
   });
-  method(Headers.prototype, "keys", function () { return this["@order"].slice().sort()[Symbol.iterator](); });
+  method(Headers.prototype, "keys", function () { return sortedNames(this).slice()[Symbol.iterator](); });
   method(Headers.prototype, "values", function () {
     var self = this;
-    return this["@order"].slice().sort().map(function (k) { return self["@map"][k]; })[Symbol.iterator]();
+    return sortedNames(this).map(function (k) { return self["@map"][k]; })[Symbol.iterator]();
   });
   hide(Headers.prototype, Symbol.iterator, Headers.prototype.entries);
   hide(g, "Headers", Headers);

@@ -870,16 +870,16 @@ JS(
     get writable() { return brand(this, "tds").ts.writable; }
   }
 
+  /* A stream over bytes already in memory: one chunk, so reading it costs the same whatever its size */
   function bytesStream(u8) {
-    var at = 0;
+    var sent = false;
     return new ReadableStream({
       pull: function (c) {
-        if (at < u8.length) {
-          var end = Math.min(at + 65536, u8.length);
-          c.enqueue(u8.slice(at, end));
-          at = end;
+        if (!sent) {
+          sent = true;
+          if (u8.length) c.enqueue(u8);
         }
-        if (at >= u8.length) c.close();
+        c.close();
       }
     });
   }
