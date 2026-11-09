@@ -500,6 +500,35 @@ static void test_shared_worker(void)
              "'another name is another worker: '+JSON.stringify(got.c));\n");
 }
 
+static void test_worker_cache(void)
+{
+  run_script("var wc=null, c1=null;\n"
+             "caches.open('shared').then(function(c){ c.put('https://example.com/from-page', new "
+             "Response('page',{status:200})); });\n"
+             "var src='var c; caches.open(\"shared\").then(function(cc){ c=cc; return "
+             "c.match(\"https://example.com/from-page\"); })"
+             ".then(function(r){ var st=r.status; return r.text().then(function(t){ return [st,t]; }); })"
+             ".then(function(a){ return c.put(\"https://example.com/from-worker\", new Response(\"worker says "
+             "\"+a[1],{status:201,statusText:\"Made\",headers:{\"content-type\":\"text/x-w\"}}))"
+             ".then(function(){ return a; }); })"
+             ".then(function(a){ return c.keys().then(function(ks){ return [a, ks.map(function(k){ return k.url; "
+             "}).join()]; }); })"
+             ".then(function(b){ return caches.keys().then(function(n){ postMessage({got:b[0][1], status:b[0][0], "
+             "keys:b[1], names:n.join()}); }); }).catch(function(e){ postMessage({err:String(e)}); });';\n"
+             "var w=new Worker(URL.createObjectURL(new Blob([src]))); w.onmessage=function(e){ wc=e.data; }; "
+             "w.onerror=function(e){ wc={err:e.message}; };\n");
+  expect(wait_for("wc!==null"));
+  run_script(
+      "expect(wc.got==='page' && wc.status===200, 'a worker reads what the page cached: '+JSON.stringify(wc));\n"
+      "expect(wc.names==='shared' && wc.keys.indexOf('https://example.com/from-page')>=0 && "
+      "wc.keys.indexOf('https://example.com/from-worker')>=0, 'and lists the same cache: '+JSON.stringify(wc));\n"
+      "var seen=null; caches.match('https://example.com/from-worker').then(function(r){ seen=[r.status, r.statusText, "
+      "r.headers.get('content-type')]; return r.text(); })"
+      ".then(function(t){ seen.push(t); });\n"
+      "expect(seen && seen.join()==='201,Made,text/x-w,worker says page', 'the page reads what the worker cached: "
+      "'+seen);\n");
+}
+
 static void test_worker_url_edges(void)
 {
   run_script("var ue=null, uw=new Worker('data:text/javascript,var r=[]; function U(a,b){ try { return new "
@@ -721,6 +750,7 @@ int main(void)
   worker_test("MessageEvent.ports", test_event_ports);
   worker_test("nested workers", test_nested_workers);
   worker_test("SharedWorker", test_shared_worker);
+  worker_test("Cache API shared with the page", test_worker_cache);
   worker_test("BroadcastChannel across the page and workers", test_broadcast_channel);
   worker_test("ErrorEvent and MessageEvent", test_event_interfaces);
   worker_test("script and construction errors", test_errors);

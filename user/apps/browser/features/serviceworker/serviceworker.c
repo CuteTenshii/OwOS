@@ -4,6 +4,7 @@
 #include "features/cors/cors.h" /* cors_origin / cors_same_origin: SW scope + cache keys */
 #include "features/persist/persist.h"
 #include "jsint.h"
+#include "mutex.h"
 #include "notify.h" /* notify_send: a service worker's showNotification()    */
 
 /* One cached request/response pair; body is raw bytes. */
@@ -22,6 +23,21 @@ struct sw_cache {
 static struct sw_cache **g_swc; /* every open Cache, all origins             */
 static int g_swc_n, g_swc_cap, g_swc_nextid = 1;
 static bool g_swc_loading; /* reading a file: the entries it holds are not changes */
+
+/* The caches are shared by the page and its workers; one lock covers the store and everything that holds a pointer
+ * into it. A thread may take it again while it holds it (a ToString hook can re-enter the Cache API). */
+static mutex_t g_swc_lock = MUTEX_INIT;
+static __thread int g_swc_depth;
+static void swc_lock(void)
+{
+  if (g_swc_depth++ == 0)
+    mutex_lock(&g_swc_lock);
+}
+static void swc_unlock(void)
+{
+  if (--g_swc_depth == 0)
+    mutex_unlock(&g_swc_lock);
+}
 static void sw_cache_dirty(const char *origin);
 
 /* A registration; src is kept so the worker can be re-run without a re-fetch. */
@@ -361,8 +377,11 @@ static void sw_caches_save(const char *origin)
 static void sw_caches_flush(bool force)
 {
   int i;
-  if (!g_swc_ndirty || (!force && msec() - g_swc_last_save < SWC_SAVE_MS))
+  swc_lock();
+  if (!g_swc_ndirty || (!force && msec() - g_swc_last_save < SWC_SAVE_MS)) {
+    swc_unlock();
     return;
+  }
   for (i = 0; i < g_swc_ndirty; i++) {
     sw_caches_save(g_swc_dirty[i]);
     free(g_swc_dirty[i]);
@@ -371,6 +390,7 @@ static void sw_caches_flush(bool force)
   g_swc_dirty = 0;
   g_swc_ndirty = 0;
   g_swc_last_save = msec();
+  swc_unlock();
 }
 
 /* The page is going away: what is on disk is the truth, so drop the caches that have a file. The ones of an origin
@@ -379,6 +399,7 @@ static void sw_caches_unload(void)
 {
   int i, k, keep = 0;
   char path[160];
+  swc_lock();
   for (i = 0; i < g_swc_n; i++) {
     struct sw_cache *c = g_swc[i];
     if (c && persist_path("cache", c->origin, path, sizeof path) != 0) {
@@ -400,6 +421,7 @@ static void sw_caches_unload(void)
   free(g_swc_loaded);
   g_swc_loaded = 0;
   g_swc_nloaded = 0;
+  swc_unlock();
 }
 
 int sw_cache_pump(void)
@@ -686,59 +708,70 @@ static js_value cache_put(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
   return sw_resolve(ctx, js_undef());
 }
-static js_value cache_add(js_ctx *ctx, js_value t, js_value *args, int argc)
+/* The network fetch of add/addAll runs without the lock: the cache is looked up again by id to store the result */
+static int cache_id_of(js_ctx *ctx, js_value t)
 {
-  struct sw_cache *c = cache_of(ctx, t);
-  char url[URL_MAX], method[16];
+  struct sw_cache *c;
+  int id = -1;
+  swc_lock();
+  c = cache_of(ctx, t);
+  if (c)
+    id = c->id;
+  swc_unlock();
+  return id;
+}
+static bool cache_fetch_store(int id, const char *method, const char *url)
+{
   struct http_req rq = {0};
   struct http_resp rs = {0};
   unsigned char *body;
-  (void)argc;
-  if (!c)
-    return sw_resolve(ctx, js_undef());
-  sw_input_url(ctx, A(0), url, sizeof url);
-  sw_input_method(ctx, A(0), method, sizeof method);
+  struct sw_cache *c;
   rq.url = url;
   rq.method = method[0] ? method : "GET";
   body = browser_cors_fetch(g_page_url_buf, 0, &rq, &rs);
   if (!body || rs.status < 200 || rs.status >= 300) {
-    if (body)
-      free(body);
+    free(body);
+    return false;
+  }
+  swc_lock();
+  c = sw_cache_by_id(id);
+  if (c)
+    sw_cache_store(c, method, url, rs.status, rs.status == 200 ? "OK" : "", rs.ctype, (const char *)body, rs.len);
+  swc_unlock();
+  free(body);
+  return true;
+}
+static js_value cache_add(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  char url[URL_MAX], method[16];
+  int id = cache_id_of(ctx, t);
+  (void)argc;
+  if (id < 0)
+    return sw_resolve(ctx, js_undef());
+  sw_input_url(ctx, A(0), url, sizeof url);
+  sw_input_method(ctx, A(0), method, sizeof method);
+  if (!cache_fetch_store(id, method, url))
     return js_promise_rejected(ctx,
                                js_make_error(ctx, ctx->type_error_proto, "TypeError", "Cache.add: request failed"));
-  }
-  sw_cache_store(c, method, url, rs.status, rs.status == 200 ? "OK" : "", rs.ctype, (const char *)body, rs.len);
-  free(body);
   return sw_resolve(ctx, js_undef());
 }
 static js_value cache_addall(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
-  struct sw_cache *c = cache_of(ctx, t);
   js_value list = A(0);
   unsigned n, i;
+  int id = cache_id_of(ctx, t);
   (void)argc;
-  if (!c || list.type != JV_OBJ)
+  if (id < 0 || list.type != JV_OBJ)
     return sw_resolve(ctx, js_undef());
   n = js_array_len(list.u.obj);
   for (i = 0; i < n; i++) {
     char url[URL_MAX], method[16];
     js_value it = js_get_index(ctx, list, i);
-    struct http_req rq = {0};
-    struct http_resp rs = {0};
-    unsigned char *body;
     sw_input_url(ctx, it, url, sizeof url);
     sw_input_method(ctx, it, method, sizeof method);
-    rq.url = url;
-    rq.method = method[0] ? method : "GET";
-    body = browser_cors_fetch(g_page_url_buf, 0, &rq, &rs);
-    if (!body || rs.status < 200 || rs.status >= 300) {
-      if (body)
-        free(body);
+    if (!cache_fetch_store(id, method, url))
       return js_promise_rejected(
           ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Cache.addAll: request failed"));
-    }
-    sw_cache_store(c, method, url, rs.status, rs.status == 200 ? "OK" : "", rs.ctype, (const char *)body, rs.len);
-    free(body);
   }
   return sw_resolve(ctx, js_undef());
 }
@@ -837,20 +870,13 @@ static js_value caches_has(js_ctx *ctx, js_value t, js_value *args, int argc)
   sw_caches_ensure(org);
   return sw_resolve(ctx, js_bool(sw_cache_find(org, arg_str(ctx, A(0)), false) != 0));
 }
-static js_value caches_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
+/* Removes the named cache of an origin; whether there was one */
+static bool sw_cache_drop(const char *org, const char *name)
 {
-  char org[URL_MAX];
-  const char *name;
-  int i;
-  (void)t;
-  (void)argc;
-  cors_origin(g_page_url_buf, org, sizeof org);
-  sw_caches_ensure(org);
-  name = arg_str(ctx, A(0));
+  int i, k;
   for (i = 0; i < g_swc_n; i++)
     if (g_swc[i] && streq(g_swc[i]->origin, org) && streq(g_swc[i]->name, name)) {
       struct sw_cache *c = g_swc[i];
-      int k;
       for (k = 0; k < c->n; k++)
         sw_entry_free(&c->e[k]);
       free(c->e);
@@ -859,9 +885,18 @@ static js_value caches_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
       free(c);
       g_swc[i] = g_swc[--g_swc_n];
       sw_cache_dirty(org);
-      return sw_resolve(ctx, js_bool(1));
+      return true;
     }
-  return sw_resolve(ctx, js_bool(0));
+  return false;
+}
+static js_value caches_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  char org[URL_MAX];
+  (void)t;
+  (void)argc;
+  cors_origin(g_page_url_buf, org, sizeof org);
+  sw_caches_ensure(org);
+  return sw_resolve(ctx, js_bool(sw_cache_drop(org, arg_str(ctx, A(0)))));
 }
 static js_value caches_keys(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
@@ -1639,6 +1674,201 @@ static js_value swc_ready_get(js_ctx *ctx, js_value t, js_value *args, int argc)
   }
 }
 
+#define LOCKED(fn)                                                                                                     \
+  static js_value fn##_locked(js_ctx *ctx, js_value t, js_value *args, int argc)                                       \
+  {                                                                                                                    \
+    js_value r;                                                                                                        \
+    swc_lock();                                                                                                        \
+    r = fn(ctx, t, args, argc);                                                                                        \
+    swc_unlock();                                                                                                      \
+    return r;                                                                                                          \
+  }
+LOCKED(caches_open)
+LOCKED(caches_match)
+LOCKED(caches_has)
+LOCKED(caches_delete)
+LOCKED(caches_keys)
+LOCKED(cache_match)
+LOCKED(cache_matchall)
+LOCKED(cache_put)
+LOCKED(cache_delete)
+LOCKED(cache_keys)
+#undef LOCKED
+
+/* ---- the Cache API inside a worker: natives the script side builds Cache and CacheStorage on ---- */
+
+static __thread char g_wc_origin[URL_MAX];
+
+static js_value wc_open(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct sw_cache *c;
+  const char *name = arg_str(ctx, A(0));
+  int id;
+  (void)t;
+  swc_lock();
+  sw_caches_ensure(g_wc_origin);
+  if (!sw_cache_find(g_wc_origin, name, false))
+    sw_cache_dirty(g_wc_origin);
+  c = sw_cache_find(g_wc_origin, name, true);
+  id = c ? c->id : -1;
+  swc_unlock();
+  return js_number(id);
+}
+
+static js_value wc_has(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int has;
+  (void)t;
+  swc_lock();
+  sw_caches_ensure(g_wc_origin);
+  has = sw_cache_find(g_wc_origin, arg_str(ctx, A(0)), false) != 0;
+  swc_unlock();
+  return js_bool(has);
+}
+
+static js_value wc_delete(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int gone;
+  (void)t;
+  swc_lock();
+  sw_caches_ensure(g_wc_origin);
+  gone = sw_cache_drop(g_wc_origin, arg_str(ctx, A(0)));
+  swc_unlock();
+  return js_bool(gone);
+}
+
+/* The names of this origin's caches */
+static js_value wc_names(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  js_object *arr;
+  int i;
+  (void)t;
+  (void)args;
+  (void)argc;
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  swc_lock();
+  sw_caches_ensure(g_wc_origin);
+  for (i = 0; i < g_swc_n; i++)
+    if (g_swc[i] && streq(g_swc[i]->origin, g_wc_origin))
+      js_array_push(ctx, arr, js_mk_cstring(ctx, g_swc[i]->name));
+  swc_unlock();
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+
+/* N.cachePut(id, method, url, status, statusText, contentType, bytes) */
+static js_value wc_put(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct sw_cache *c;
+  int n = 0;
+  const unsigned char *body = view_bytes(A(6), &n);
+  char method[16], url[URL_MAX];
+  (void)t;
+  strlcpy(method, arg_str(ctx, A(1)), sizeof method);
+  strlcpy(url, arg_str(ctx, A(2)), sizeof url);
+  swc_lock();
+  c = sw_cache_by_id((int)js_to_number(ctx, A(0)));
+  if (c)
+    sw_cache_store(c, method, url, (int)js_to_number(ctx, A(3)), arg_str(ctx, A(4)), arg_str(ctx, A(5)),
+                   body ? (const char *)body : "", body ? n : 0);
+  swc_unlock();
+  return js_undef();
+}
+
+static js_value wc_entry_object(js_ctx *ctx, struct sw_c_entry *e)
+{
+  js_object *o;
+  gc_push_scope();
+  o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(o, "url", js_mk_cstring(ctx, e->url), P_ENUMERABLE);
+  js_def(o, "method", js_mk_cstring(ctx, e->method), P_ENUMERABLE);
+  js_def(o, "status", js_number(e->status), P_ENUMERABLE);
+  js_def(o, "statusText", js_mk_cstring(ctx, e->statustext), P_ENUMERABLE);
+  js_def(o, "ctype", js_mk_cstring(ctx, e->ctype), P_ENUMERABLE);
+  js_def(o, "body", js_new_arraybuffer(ctx, e->body, e->blen), P_ENUMERABLE);
+  gc_pop_scope();
+  return js_obj_value(o);
+}
+
+/* N.cacheMatch(id, url): the stored response, from cache `id` or (id < 0) the first cache of the origin that has it */
+static js_value wc_match(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  int id = (int)js_to_number(ctx, A(0)), i, k;
+  char url[URL_MAX];
+  js_value r = js_undef();
+  (void)t;
+  strlcpy(url, arg_str(ctx, A(1)), sizeof url);
+  swc_lock();
+  if (id < 0)
+    sw_caches_ensure(g_wc_origin);
+  for (i = 0; i < g_swc_n && r.type == JV_UNDEF; i++) {
+    struct sw_cache *c = g_swc[i];
+    if (!c || (id < 0 ? !streq(c->origin, g_wc_origin) : c->id != id))
+      continue;
+    k = sw_cache_index(c, url);
+    if (k >= 0)
+      r = wc_entry_object(ctx, &c->e[k]);
+  }
+  swc_unlock();
+  return r;
+}
+
+static js_value wc_remove(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct sw_cache *c;
+  char url[URL_MAX];
+  int i, gone = 0;
+  (void)t;
+  strlcpy(url, arg_str(ctx, A(1)), sizeof url);
+  swc_lock();
+  c = sw_cache_by_id((int)js_to_number(ctx, A(0)));
+  i = c ? sw_cache_index(c, url) : -1;
+  if (i >= 0) {
+    sw_entry_free(&c->e[i]);
+    c->e[i] = c->e[--c->n];
+    sw_cache_dirty(c->origin);
+    gone = 1;
+  }
+  swc_unlock();
+  return js_bool(gone);
+}
+
+/* N.cacheEntries(id): [{url, method}] in the order stored */
+static js_value wc_entries(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  struct sw_cache *c;
+  js_object *arr;
+  int i;
+  (void)t;
+  gc_push_scope();
+  arr = (js_object *)gc_keep(js_new_array(ctx, 0));
+  swc_lock();
+  c = sw_cache_by_id((int)js_to_number(ctx, A(0)));
+  for (i = 0; c && i < c->n; i++) {
+    js_object *o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    js_def(o, "url", js_mk_cstring(ctx, c->e[i].url), P_ENUMERABLE);
+    js_def(o, "method", js_mk_cstring(ctx, c->e[i].method), P_ENUMERABLE);
+    js_array_push(ctx, arr, js_obj_value(o));
+  }
+  swc_unlock();
+  gc_pop_scope();
+  return js_obj_value(arr);
+}
+
+void sw_cache_worker_setup(js_ctx *ctx, js_object *n, const char *origin)
+{
+  strlcpy(g_wc_origin, origin, sizeof g_wc_origin);
+  js_def_native(ctx, n, "cacheOpen", wc_open, 1);
+  js_def_native(ctx, n, "cacheHas", wc_has, 1);
+  js_def_native(ctx, n, "cacheDelete", wc_delete, 1);
+  js_def_native(ctx, n, "cacheNames", wc_names, 0);
+  js_def_native(ctx, n, "cachePut", wc_put, 7);
+  js_def_native(ctx, n, "cacheMatch", wc_match, 2);
+  js_def_native(ctx, n, "cacheRemove", wc_remove, 2);
+  js_def_native(ctx, n, "cacheEntries", wc_entries, 1);
+}
+
 /* Installs navigator.serviceWorker + caches; restarts the controlling worker without re-firing install. */
 void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
 {
@@ -1695,19 +1925,19 @@ void sw_install(js_ctx *ctx, js_object *win, const char *page_url)
   def_method(g_swreg_proto, "removeEventListener", el_remove_listener, 3);
   def_method(g_swreg_proto, "dispatchEvent", el_dispatch, 1);
 
-  def_method(g_cachestorage_proto, "open", caches_open, 1);
-  def_method(g_cachestorage_proto, "match", caches_match, 1);
-  def_method(g_cachestorage_proto, "has", caches_has, 1);
-  def_method(g_cachestorage_proto, "delete", caches_delete, 1);
-  def_method(g_cachestorage_proto, "keys", caches_keys, 0);
+  def_method(g_cachestorage_proto, "open", caches_open_locked, 1);
+  def_method(g_cachestorage_proto, "match", caches_match_locked, 1);
+  def_method(g_cachestorage_proto, "has", caches_has_locked, 1);
+  def_method(g_cachestorage_proto, "delete", caches_delete_locked, 1);
+  def_method(g_cachestorage_proto, "keys", caches_keys_locked, 0);
 
-  def_method(g_cache_proto, "match", cache_match, 1);
-  def_method(g_cache_proto, "matchAll", cache_matchall, 1);
+  def_method(g_cache_proto, "match", cache_match_locked, 1);
+  def_method(g_cache_proto, "matchAll", cache_matchall_locked, 1);
   def_method(g_cache_proto, "add", cache_add, 1);
   def_method(g_cache_proto, "addAll", cache_addall, 1);
-  def_method(g_cache_proto, "put", cache_put, 2);
-  def_method(g_cache_proto, "delete", cache_delete, 1);
-  def_method(g_cache_proto, "keys", cache_keys, 0);
+  def_method(g_cache_proto, "put", cache_put_locked, 2);
+  def_method(g_cache_proto, "delete", cache_delete_locked, 1);
+  def_method(g_cache_proto, "keys", cache_keys_locked, 0);
 
   def_method(g_request_proto, "clone", req_clone, 0);
 

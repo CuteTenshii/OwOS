@@ -231,7 +231,7 @@ JS(
     });
   }
   lazyPart(1, ["URL", "URLSearchParams", "Blob", "File", "FormData", "FileReader", "Headers"]);
-  lazyPart(2, ["Request", "Response", "fetch", "XMLHttpRequest", "WebSocket", "MessagePort", "MessageChannel", "Worker", "BroadcastChannel"]);
+  lazyPart(2, ["Request", "Response", "fetch", "XMLHttpRequest", "WebSocket", "MessagePort", "MessageChannel", "Worker", "BroadcastChannel", "caches", "CacheStorage", "Cache"]);
 
   /* ---- crypto ---- */
   var crypto = {};

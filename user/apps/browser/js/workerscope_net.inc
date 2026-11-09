@@ -464,6 +464,60 @@ JS(
   };
   hide(g, "BroadcastChannel", BroadcastChannel);
 
+  /* ---- Cache API: the persistent store the page shares, reached through natives ---- */
+  function Cache() { throw typeError("Illegal constructor"); }
+  hide(Cache.prototype, "constructor", Cache);
+  function newCache(id) {
+    var c = Object.create(Cache.prototype);
+    hide(c, "@id", id);
+    return c;
+  }
+  function cacheUrl(r) { return new g.URL(r instanceof g.Request ? r.url : String(r), g.location.href).href; }
+  function cacheMethod(r) { return r instanceof g.Request ? r.method : "GET"; }
+  function cacheResponse(m) {
+    var h = {}, r;
+    if (!m) { return undefined; }
+    if (m.ctype) { h["content-type"] = m.ctype; }
+    r = new g.Response(m.body, { status: m.status, statusText: m.statusText, headers: h });
+    def(r, "url", { value: m.url, configurable: true });
+    return r;
+  }
+  function cacheStore(id, req, res) {
+    return res.arrayBuffer().then(function (buf) {
+      N.cachePut(id, cacheMethod(req), cacheUrl(req), res.status, res.statusText, res.headers.get("content-type") || "", buf);
+    });
+  }
+  method(Cache.prototype, "match", function (req) { return Promise.resolve(cacheResponse(N.cacheMatch(this["@id"], cacheUrl(req)))); });
+  method(Cache.prototype, "matchAll", function (req) {
+    var r = req === undefined ? undefined : cacheResponse(N.cacheMatch(this["@id"], cacheUrl(req)));
+    return Promise.resolve(r ? [r] : []);
+  });
+  method(Cache.prototype, "put", function (req, res) { return cacheStore(this["@id"], req, res); });
+  method(Cache.prototype, "add", function (req) { return this.addAll([req]); });
+  method(Cache.prototype, "addAll", function (reqs) {
+    var id = this["@id"];
+    return Promise.all(Array.prototype.map.call(reqs, function (req) {
+      return g.fetch(req).then(function (res) {
+        if (!res.ok) { throw typeError("Cache.addAll: request failed"); }
+        return cacheStore(id, req, res);
+      });
+    })).then(function () { return undefined; });
+  });
+  method(Cache.prototype, "delete", function (req) { return Promise.resolve(N.cacheRemove(this["@id"], cacheUrl(req))); });
+  method(Cache.prototype, "keys", function () {
+    return Promise.resolve(N.cacheEntries(this["@id"]).map(function (e) { return new g.Request(e.url, { method: e.method }); }));
+  });
+  function CacheStorage() { throw typeError("Illegal constructor"); }
+  hide(CacheStorage.prototype, "constructor", CacheStorage);
+  method(CacheStorage.prototype, "open", function (name) { return Promise.resolve(newCache(N.cacheOpen(String(name)))); });
+  method(CacheStorage.prototype, "has", function (name) { return Promise.resolve(N.cacheHas(String(name))); });
+  method(CacheStorage.prototype, "delete", function (name) { return Promise.resolve(N.cacheDelete(String(name))); });
+  method(CacheStorage.prototype, "keys", function () { return Promise.resolve(N.cacheNames()); });
+  method(CacheStorage.prototype, "match", function (req) { return Promise.resolve(cacheResponse(N.cacheMatch(-1, cacheUrl(req)))); });
+  hide(g, "Cache", Cache);
+  hide(g, "CacheStorage", CacheStorage);
+  hide(g, "caches", Object.create(CacheStorage.prototype));
+
   /* ---- MessageChannel: ports in this worker only ---- */
   function MessagePort() { throw typeError("Illegal constructor"); }
   MessagePort.prototype = Object.create(EventTarget.prototype);

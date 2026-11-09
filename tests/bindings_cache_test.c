@@ -148,8 +148,11 @@ static void test_damaged_file_is_ignored(void)
 
 int main(void)
 {
+  char path[160];
   B = calloc(1, sizeof *B);
   B->pg = calloc(1, 1 << 16);
+  if (persist_path("cache", PAGE_URL, path, sizeof path) == 0)
+    remove(path); /* a file left by an earlier run */
   js_run_document(dom_parse(page, (int)strlen(page)), PAGE_URL, fetch_none);
   js_def_native(g_ctx, g_ctx->global, "expect", test_expect, 1);
 

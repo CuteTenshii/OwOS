@@ -1437,6 +1437,7 @@ static bool wt_run_parts(js_ctx *ctx, struct wthread *wt)
   js_def_native(ctx, n, "portPost", wt_n_port_post, 3);
   js_def_native(ctx, n, "portClose", wt_n_port_close, 1);
   js_def_native(ctx, n, "cloneLocal", wt_n_clone_local, 2);
+  sw_cache_worker_setup(ctx, n, wt->origin);
   js_def_native(ctx, n, "bcPost", wt_n_bc_post, 2);
   js_def_native(ctx, n, "spawn", wt_n_spawn, 3);
   js_def_native(ctx, n, "childPost", wt_n_child_post, 3);
