@@ -17,11 +17,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define MDCT_SCALE 1.0f
-static double g_pcm_scale = 32768.0;
-#ifdef OGG_HOST_TEST
-void vorbis_set_scale(double s) { g_pcm_scale = s; }
-#endif
+#define PCM_SCALE 32768.0
 
 /* floor1 inverse-dB lookup: index (0..255) -> linear multiplier */
 static float inv_db[256];
@@ -29,7 +25,7 @@ static int inv_db_ready;
 static void inv_db_init(void)
 {
   double a = -6.9727444391292492; /* log10(1.0649863e-07) */
-  double b = -0.0820797818846034; /* log10(0.82788260) */
+  double b = 0.0;                 /* table ends at 1.0 */
   for (int i = 0; i < 256; i++)
     inv_db[i] = (float)pow(10.0, a + (b - a) * (i / 255.0));
   inv_db_ready = 1;
@@ -234,6 +230,16 @@ static int cb_decode(codebook *c, bitr *b)
   }
 }
 
+/* Each step rounds to float like libvorbis: a VQ entry meant to be exactly zero
+ * must be, since the sign of a coupled residue picks the decoupling branch. */
+static float vq_value(float mult, float delta, float minv, float last)
+{
+  volatile float t = mult * delta;
+  volatile float u = t + minv;
+  volatile float w = u + last;
+  return w;
+}
+
 static int cb_parse(codebook *c, bitr *b)
 {
   memset(c, 0, sizeof *c);
@@ -280,8 +286,8 @@ static int cb_parse(codebook *c, bitr *b)
 
   int lookup = br_bits(b, 4);
   if (lookup == 1 || lookup == 2) {
-    double minv = float32_unpack(br_bits(b, 32));
-    double delta = float32_unpack(br_bits(b, 32));
+    float minv = (float)float32_unpack(br_bits(b, 32));
+    float delta = (float)float32_unpack(br_bits(b, 32));
     int vbits = br_bits(b, 4) + 1;
     int seqp = br_bit(b);
     int lvals = (lookup == 1) ? lookup1_values(c->entries, c->dimensions) : c->entries * c->dimensions;
@@ -300,12 +306,12 @@ static int cb_parse(codebook *c, bitr *b)
     }
     if (lookup == 1) {
       for (int e = 0; e < c->entries; e++) {
-        double last = 0;
+        float last = 0;
         int idiv = 1;
         for (int j = 0; j < c->dimensions; j++) {
           int off = (e / idiv) % lvals;
-          double v = mult[off] * delta + minv + last;
-          c->value[e * c->dimensions + j] = (float)v;
+          float v = vq_value(mult[off], delta, minv, last);
+          c->value[e * c->dimensions + j] = v;
           if (seqp)
             last = v;
           idiv *= lvals;
@@ -313,11 +319,11 @@ static int cb_parse(codebook *c, bitr *b)
       }
     } else {
       for (int e = 0; e < c->entries; e++) {
-        double last = 0;
+        float last = 0;
         for (int j = 0; j < c->dimensions; j++) {
           int off = e * c->dimensions + j;
-          double v = mult[off] * delta + minv + last;
-          c->value[e * c->dimensions + j] = (float)v;
+          float v = vq_value(mult[off], delta, minv, last);
+          c->value[e * c->dimensions + j] = v;
           if (seqp)
             last = v;
         }
@@ -555,7 +561,7 @@ static int res_parse(residue *r, bitr *b)
 
 /* Decode `ch` residue vectors of `n` values each into `out[ch]` */
 static int res_decode(residue *r, codebook *books, int nbooks, bitr *b, int type, float **out, int ch, int n,
-                      const int *do_not, float *scratch /* type-2 aggregate, len ch*n */)
+                      const int *do_not, float *scratch /* type-2 aggregate, len ch*n */, int (*cls)[512])
 {
   int nn = (type == 2) ? n * ch : n;
   float *vec[VORBIS_MAX_CHANNELS];
@@ -585,9 +591,6 @@ static int res_decode(residue *r, codebook *books, int nbooks, bitr *b, int type
   int vch = (type == 2) ? 1 : ch;
 
   /* classifications[channel][partition] */
-  int (*cls)[512] = NULL;
-  static int clsbuf[VORBIS_MAX_CHANNELS][512];
-  cls = clsbuf;
   if (ptr > 512)
     return OGG_EFORMAT;
 
@@ -698,6 +701,12 @@ static int map_parse(mapping *m, bitr *b, int channels, int nfloors, int nresidu
   return OGG_OK;
 }
 
+typedef struct {
+  int n, L; /* L = n/4, the FFT size */
+  double *pre, *post, *tw;
+  int *rev;
+} imdct_plan;
+
 /* decoder */
 typedef struct {
   int blockflag, mapping;
@@ -721,38 +730,102 @@ struct vorbis_decoder {
   int nmodes;
 
   /* precomputed windows for the four long/short slope combinations */
-  float *win_long, *win_short;
+  float *win_long[4]; /* indexed by prev_short | next_short << 1 */
+  float *win_short;
 
   /* per-channel working + overlap state */
   float *pcmbuf[VORBIS_MAX_CHANNELS]; /* IMDCT time output, len n1 */
   float *residuebuf[VORBIS_MAX_CHANNELS];
   float *floorbuf[VORBIS_MAX_CHANNELS];
-  float *hold[VORBIS_MAX_CHANNELS]; /* previous block right half, len n1/2 */
-  int prev_n;                       /* previous block size, 0 if none */
-  float *res_scratch;               /* type-2 aggregate */
+  float *hold[VORBIS_MAX_CHANNELS];     /* previous block right half, len n1/2 */
+  int prev_n;                           /* previous block size, 0 if none */
+  float *res_scratch;                   /* type-2 aggregate */
+  int clsbuf[VORBIS_MAX_CHANNELS][512]; /* residue classifications */
   int first_frame;
 
-  /* imdct twiddles */
-  double *cos_long, *cos_short; /* unused in direct path */
+  imdct_plan plan_short, plan_long;
+  double *wre, *wim, *wu; /* IMDCT scratch */
 };
 
-/* direct inverse MDCT (O(n^2/4)); correct reference, tuned to libvorbis */
-#ifdef OGG_HOST_TEST
-double g_imdct_num = 2.0; /* tunable numerator; scale = g_imdct_num / n */
-void vorbis_set_imdct(double s) { g_imdct_num = s; }
-#else
-static const double g_imdct_num = 2.0;
-#endif
-static void imdct(const float *X, float *out, int n)
+/* Inverse MDCT of n/2 coefficients into n samples, via a DCT-IV computed with an
+ * n/4-point complex FFT. Unnormalized: y[i] = sum X[k] cos(pi/n (2i+1+n/2)(k+1/2)). */
+
+static int plan_init(imdct_plan *p, int n)
 {
-  int n2 = n / 2;
-  double scale = g_imdct_num / n;
-  for (int i = 0; i < n; i++) {
-    double sum = 0;
-    double a = (M_PI / n) * (2.0 * i + 1.0 + n2);
-    for (int k = 0; k < n2; k++)
-      sum += X[k] * cos(a * (k + 0.5));
-    out[i] = (float)(sum * scale);
+  int M = n / 2, L = M / 2, bits = 0;
+  p->n = n;
+  p->L = L;
+  p->pre = malloc(2 * L * sizeof(double));
+  p->post = malloc(2 * L * sizeof(double));
+  p->tw = malloc(L * sizeof(double));
+  p->rev = malloc(L * sizeof(int));
+  if (!p->pre || !p->post || !p->tw || !p->rev)
+    return OGG_ENOMEM;
+  for (int i = 0; i < L; i++) {
+    double a = -M_PI * (4 * i + 1) / (4.0 * M), b = -M_PI * i / M;
+    p->pre[2 * i] = cos(a);
+    p->pre[2 * i + 1] = sin(a);
+    p->post[2 * i] = cos(b);
+    p->post[2 * i + 1] = sin(b);
+  }
+  for (int k = 0; k < L / 2; k++) {
+    p->tw[2 * k] = cos(-2 * M_PI * k / L);
+    p->tw[2 * k + 1] = sin(-2 * M_PI * k / L);
+  }
+  while ((1 << bits) < L)
+    bits++;
+  for (int i = 0; i < L; i++) {
+    int r = 0;
+    for (int b = 0; b < bits; b++)
+      if (i & (1 << b))
+        r |= 1 << (bits - 1 - b);
+    p->rev[i] = r;
+  }
+  return OGG_OK;
+}
+
+static void plan_free(imdct_plan *p)
+{
+  free(p->pre);
+  free(p->post);
+  free(p->tw);
+  free(p->rev);
+}
+
+static void imdct(vorbis_decoder *v, const float *X, float *out, int n)
+{
+  const imdct_plan *p = n == v->n0 ? &v->plan_short : &v->plan_long;
+  int M = n / 2, L = p->L;
+  double *re = v->wre, *im = v->wim, *u = v->wu;
+
+  for (int i = 0; i < L; i++) { /* pre-twiddle, bit-reversed into the FFT buffer */
+    double xr = X[2 * i], xi = X[M - 1 - 2 * i];
+    int r = p->rev[i];
+    re[r] = xr * p->pre[2 * i] - xi * p->pre[2 * i + 1];
+    im[r] = xr * p->pre[2 * i + 1] + xi * p->pre[2 * i];
+  }
+  for (int len = 2; len <= L; len <<= 1) {
+    int half = len / 2, step = L / len;
+    for (int i = 0; i < L; i += len)
+      for (int j = 0; j < half; j++) {
+        double wr = p->tw[2 * j * step], wi = p->tw[2 * j * step + 1];
+        int a = i + j, b = a + half;
+        double tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - tr;
+        im[b] = im[a] - ti;
+        re[a] += tr;
+        im[a] += ti;
+      }
+  }
+  for (int k = 0; k < L; k++) { /* post-twiddle, de-interleave into the DCT-IV */
+    double yr = re[k] * p->post[2 * k] - im[k] * p->post[2 * k + 1];
+    double yi = re[k] * p->post[2 * k + 1] + im[k] * p->post[2 * k];
+    u[2 * k] = yr;
+    u[M - 1 - 2 * k] = -yi;
+  }
+  for (int i = 0; i < n; i++) { /* extend the DCT-IV kernel's symmetries over the window */
+    int j = i + M / 2;
+    out[i] = (float)(j < M ? u[j] : j < 2 * M ? -u[2 * M - 1 - j] : -u[j - 2 * M]);
   }
 }
 
@@ -795,12 +868,21 @@ static int alloc_buffers(vorbis_decoder *v)
       return OGG_ENOMEM;
   }
   v->res_scratch = malloc((unsigned long)(n1 / 2) * VORBIS_MAX_CHANNELS * sizeof(float));
-  v->win_long = malloc(n1 * sizeof(float));
   v->win_short = malloc(v->n0 * sizeof(float));
-  if (!v->res_scratch || !v->win_long || !v->win_short)
+  v->wre = malloc(n1 / 4 * sizeof(double));
+  v->wim = malloc(n1 / 4 * sizeof(double));
+  v->wu = malloc(n1 / 2 * sizeof(double));
+  if (!v->res_scratch || !v->win_short || !v->wre || !v->wim || !v->wu)
     return OGG_ENOMEM;
   build_window(v->win_short, v->n0, v->n0, 0, 0);
-  build_window(v->win_long, v->n1, v->n0, 0, 0); /* rebuilt per-packet when transitions occur */
+  for (int k = 0; k < 4; k++) {
+    v->win_long[k] = malloc(n1 * sizeof(float));
+    if (!v->win_long[k])
+      return OGG_ENOMEM;
+    build_window(v->win_long[k], n1, v->n0, k & 1, k >> 1);
+  }
+  if (plan_init(&v->plan_short, v->n0) != OGG_OK || plan_init(&v->plan_long, n1) != OGG_OK)
+    return OGG_ENOMEM;
   return OGG_OK;
 }
 
@@ -962,8 +1044,14 @@ void vorbis_decoder_close(vorbis_decoder *v)
     free(v->hold[c]);
   }
   free(v->res_scratch);
-  free(v->win_long);
+  for (int k = 0; k < 4; k++)
+    free(v->win_long[k]);
   free(v->win_short);
+  free(v->wre);
+  free(v->wim);
+  free(v->wu);
+  plan_free(&v->plan_short);
+  plan_free(&v->plan_long);
   free(v);
 }
 
@@ -1002,7 +1090,7 @@ int vorbis_decode(vorbis_decoder *v, const unsigned char *pkt, unsigned len, sho
 
   mapping *m = &v->maps[v->modes[mode].mapping];
   int ch = v->info.channels;
-  int zero[VORBIS_MAX_CHANNELS];
+  int zero[VORBIS_MAX_CHANNELS], nofloor[VORBIS_MAX_CHANNELS];
 
   /* floor decode per channel */
   for (int c = 0; c < ch; c++) {
@@ -1011,7 +1099,7 @@ int vorbis_decode(vorbis_decoder *v, const unsigned char *pkt, unsigned len, sho
     int r = f1_decode(&v->floors[fl], v->books, v->nbooks, &b, v->floorbuf[c], n2);
     if (r < 0)
       return r;
-    zero[c] = !r;
+    zero[c] = nofloor[c] = !r;
     memset(v->residuebuf[c], 0, n2 * sizeof(float));
   }
 
@@ -1036,8 +1124,8 @@ int vorbis_decode(vorbis_decoder *v, const unsigned char *pkt, unsigned len, sho
     if (!cnt)
       continue;
     int ri = m->submap_residue[s];
-    int rc =
-        res_decode(&v->residues[ri], v->books, v->nbooks, &b, v->residue_type[ri], rbuf, cnt, n2, dn, v->res_scratch);
+    int rc = res_decode(&v->residues[ri], v->books, v->nbooks, &b, v->residue_type[ri], rbuf, cnt, n2, dn,
+                        v->res_scratch, v->clsbuf);
     if (rc != OGG_OK)
       return rc;
   }
@@ -1070,43 +1158,18 @@ int vorbis_decode(vorbis_decoder *v, const unsigned char *pkt, unsigned len, sho
     }
   }
 
-#ifdef OGG_DBG
-  {
-    static int fc = 0;
-    if (fc < 6) {
-      double re = 0;
-      for (int j = 0; j < n2; j++)
-        re += v->residuebuf[0][j] * v->residuebuf[0][j];
-      double fe = 0;
-      for (int j = 0; j < n2; j++)
-        fe += v->floorbuf[0][j];
-      fprintf(stderr,
-              "frame %d: mode=%d bf=%d n=%d zero=[%d %d] resE=%.3g floorSum=%.3g "
-              "eop=%d\n",
-              fc, mode, blockflag, n, zero[0], zero[1], re, fe, b.eop);
-    }
-    fc++;
-  }
-#endif
   /* dot product (floor * residue) then IMDCT per channel */
-  int short_n = v->n0;
   for (int c = 0; c < ch; c++) {
-    if (zero[c]) {
+    if (nofloor[c]) { /* an unused floor silences the channel even when coupling kept its residue */
       memset(v->pcmbuf[c], 0, n * sizeof(float));
       continue;
     }
     for (int j = 0; j < n2; j++)
       v->residuebuf[c][j] *= v->floorbuf[c][j];
-    imdct(v->residuebuf[c], v->pcmbuf[c], n);
-    /* window */
-    if (blockflag) {
-      build_window(v->win_long, n, short_n, prev_short, next_short);
-      for (int i = 0; i < n; i++)
-        v->pcmbuf[c][i] *= v->win_long[i] * MDCT_SCALE;
-    } else {
-      for (int i = 0; i < n; i++)
-        v->pcmbuf[c][i] *= v->win_short[i] * MDCT_SCALE;
-    }
+    imdct(v, v->residuebuf[c], v->pcmbuf[c], n);
+    const float *win = blockflag ? v->win_long[(prev_short ? 1 : 0) | (next_short ? 2 : 0)] : v->win_short;
+    for (int i = 0; i < n; i++)
+      v->pcmbuf[c][i] *= win[i];
   }
 
   int out_frames = 0;
@@ -1128,7 +1191,7 @@ int vorbis_decode(vorbis_decoder *v, const unsigned char *pkt, unsigned len, sho
       double vi = (t < pn / 2) ? hd[t] : 0.0;
       int li = t + delta;
       double vj = (li >= 0 && li < n2) ? cur[li] : 0.0;
-      pcm[t * ch + c] = clamp16((vi + vj) * g_pcm_scale);
+      pcm[t * ch + c] = clamp16((vi + vj) * PCM_SCALE);
     }
     /* new hold = this block's right half */
     for (int i = 0; i < n2; i++)

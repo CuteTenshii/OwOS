@@ -9,7 +9,7 @@
 # convention keeps resolving (same trick as the kernel's DRVDIRS). libc
 # (start/lib.c/owos.h) is the base every program includes, so it stays at the
 # user/lib root.
-ULIBDIRS := curl torrent crypto pki tls netconn gfx zlib png webp gif imganim canvas2d mp3 sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar wasm tray
+ULIBDIRS := curl torrent crypto pki tls netconn gfx zlib png webp gif imganim canvas2d mp3 ogg sqlite clipboard mime font brotli math gc js websocket notify media json protobuf alac mdns resolve stun cast mp4 mpeg h264 aac dialog base64 ntp tz mediactl desktop rar wasm tray
 UCFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -O$(OPT_LEVEL) -Wall \
            -mno-sse -mno-mmx -mfpmath=387 $(VERSION_DEF) -MMD -MP \
            -Icommon -Iuser/lib $(addprefix -Iuser/lib/,$(ULIBDIRS))
@@ -75,14 +75,18 @@ ALAC    := user/lib/alac/alac.o
 # verified bit-exact against ffmpeg (scripts/aac_test.c). Pure computation, needs
 # $(MATH) (pow/sqrt/trig for dequant + windows) + $(LIBGCC).
 AAC     := user/lib/aac/aac.o
-# media: file decoder (WAV/MPEG/ALAC/AAC -> 48 kHz/S16/stereo, seekable) + a
+# ogg: Ogg container + from-scratch Vorbis I decoder (FFT IMDCT), checked against
+# libvorbis (scripts/ogg_gen.sh); oggplay.o is the streaming file reader the media
+# engine drives. Needs $(MATH) (windows, codebook and floor tables).
+OGG     := user/lib/ogg/ogg.o user/lib/ogg/vorbis.o user/lib/ogg/oggplay.o
+# media: file decoder (WAV/MPEG/ALAC/AAC/Vorbis -> 48 kHz/S16/stereo, seekable) + a
 # software mixer thread that blends several sources into the one kernel PCM
 # stream. Used by the media player and the browser's <audio>/<video>. Needs
-# $(MP3) + $(ALAC) + $(AAC) + $(LIBGCC), and $(MATH) (AAC's dequant/windows use
-# pow/sqrt/trig). Its .m4a/.mp4 path also calls the MP4 demuxer, so a consumer
+# $(MP3) + $(ALAC) + $(AAC) + $(OGG) + $(LIBGCC), and $(MATH) (AAC's dequant/windows
+# and Vorbis use pow/sqrt/trig). Its .m4a/.mp4 path also calls the MP4 demuxer, so a consumer
 # that plays AAC-in-MP4 must link $(MP4) + $(MATH) too (both media consumers
 # already do via $(VIDEO) / their own $(MATH)).
-MEDIA   := user/lib/media/media.o $(MP3) $(ALAC) $(AAC)
+MEDIA   := user/lib/media/media.o $(MP3) $(ALAC) $(AAC) $(OGG)
 # video: the media engine's H.264 picture path (media.h media_video_*). A thin
 # front end over $(H264) + $(MP4) that decodes a local .264/.mp4 to timed RGB
 # frames. Linked only by video consumers so audio-only programs skip the decoder.

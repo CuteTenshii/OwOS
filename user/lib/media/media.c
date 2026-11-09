@@ -14,6 +14,7 @@
 #include "alac.h"
 #include "mp3.h"
 #include "mp4.h"
+#include "oggplay.h"
 #include "owos.h"
 
 /* ---- small spinlock (mirrors the user malloc/blk_lock pattern) ------------
@@ -41,6 +42,7 @@ struct media_decoder {
   int is_mp3;
   int is_alac;
   int is_aac;
+  int is_ogg;
   char path[256];
   unsigned size; /* whole-file bytes                         */
   unsigned rate; /* native sample rate, Hz                   */
@@ -67,6 +69,8 @@ struct media_decoder {
   unsigned w_inlen, w_inpos;
 
   mp3_t m3; /* MPEG decoder state                       */
+
+  oggplay *og; /* Ogg Vorbis reader                        */
 
   /* ALAC (.caf) cursor: one packet decoded to native PCM at a time */
   alac_decoder *a_dec;
@@ -292,6 +296,19 @@ static void decode_next(media_decoder *d)
     return;
   }
 
+  if (d->is_ogg) {
+    short f[2];
+    if (oggplay_read(d->og, f, 1) <= 0) {
+      d->eof = 1;
+      d->curL = d->curR = 0;
+      return;
+    }
+    d->curL = f[0];
+    d->curR = f[1];
+    d->pos_frames++;
+    return;
+  }
+
   if (d->is_mp3) {
     short f[2];
     if (mp3_read(&d->m3, f, 1) <= 0) {
@@ -441,6 +458,8 @@ void media_seek_ms(media_decoder *d, unsigned ms)
     d->a_pkt_off = off;
     d->a_have = d->a_pos = 0;
     d->pos_frames = pkt * fl;
+  } else if (d->is_ogg) {
+    d->pos_frames = oggplay_seek(d->og, tgt);
   } else if (d->is_mp3) {
     d->pos_frames = mp3_seek(&d->m3, tgt);
   } else {
@@ -501,6 +520,18 @@ static int load_wav(media_decoder *d, unsigned size)
   d->w_frame = channels * (bits / 8);
   d->w_inlen = d->w_inpos = 0;
   d->total_frames = d->w_frame ? d->w_data_len / d->w_frame : 0;
+  return 0;
+}
+
+static int load_ogg(media_decoder *d, unsigned size)
+{
+  d->og = oggplay_open(d->path, size);
+  if (!d->og)
+    return -1;
+  d->is_ogg = 1;
+  d->size = size;
+  d->rate = oggplay_rate(d->og);
+  d->total_frames = oggplay_total_frames(d->og);
   return 0;
 }
 
@@ -782,6 +813,8 @@ media_decoder *media_open(const char *path)
     rc = load_wav(d, st.size);
   else if (g >= 8 && tageq(sn, "caff"))
     rc = load_alac(d, st.size);
+  else if (g >= 4 && tageq(sn, "OggS"))
+    rc = load_ogg(d, st.size);
   else if (g >= 8 && tageq(sn + 4, "ftyp")) /* .m4a / .mp4 (AAC)   */
     rc = load_aac_mp4(d, st.size);
   else if (g >= 2 && sn[0] == 0xFF && (sn[1] & 0xF6) == 0xF0) /* ADTS .aac    */
@@ -811,6 +844,8 @@ void media_close(media_decoder *d)
     return;
   if (d->is_mp3)
     mp3_close(&d->m3);
+  if (d->is_ogg)
+    oggplay_close(d->og);
   if (d->is_alac) {
     alac_decoder_close(d->a_dec);
     free(d->a_pkt_size);

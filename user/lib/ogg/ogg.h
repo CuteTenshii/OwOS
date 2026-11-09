@@ -1,29 +1,19 @@
-/* ogg.h — Ogg bitstream container + Ogg Vorbis I audio codec.
+/* ogg.h, Ogg bitstream container + Ogg Vorbis I decoder.
  *
- * Two independent layers, mirroring the split in the other codecs of this tree
- * (the container knows nothing about the payload, the codec knows nothing about
- * files):
+ * Two independent layers (the container knows nothing about the payload, the
+ * codec knows nothing about files):
  *
  *   - The Ogg container (RFC 3533). A push demuxer reassembles the logical
  *     bitstreams' packets from the physical page stream, and a mux packs a
  *     stream of packets back into pages. Both are payload-agnostic; the Ogg CRC
  *     is implemented here.
- *   - The Vorbis I codec (Xiph "Vorbis I specification"). A from-scratch
- * decoder (codebooks, floor 1, residue 0/1/2, channel coupling, the windowed
- * IMDCT filterbank) turns audio packets into interleaved int16, and a
- * from-scratch VBR encoder turns interleaved int16 back into a spec-conformant
- * stream — it emits its own codebooks in the setup header, so it needs none of
- *     libvorbis's built-in tables. Decoded output interoperates with libvorbis;
- *     encoded output decodes on libvorbis (verified via ffmpeg,
- * scripts/ogg_test).
+ *   - The Vorbis I decoder (Xiph "Vorbis I specification"): codebooks, floor 1,
+ *     residue 0/1/2, channel coupling and an FFT-based IMDCT, turning audio
+ *     packets into interleaved int16. Output matches libvorbis (scripts/ogg_gen.sh).
  *
- * All DSP is float/double over x87 (safe under the user-space -mno-sse build;
- * no SSE float->int conversion is emitted with -mfpmath=387). A malformed or
- * hostile stream can only fault this process, never the kernel.
- *
- * The convenience one-shot helpers at the bottom (whole file in memory <-> PCM)
- * are what the `ogg` CLI and simple callers use; the streaming decoder is what
- * the media engine drives so a long song never sits in memory whole.
+ * All DSP is float/double over x87 (safe under the user-space -mno-sse build).
+ * A malformed or hostile stream can only fault this process, never the kernel.
+ * oggplay.h is the streaming file reader the media engine drives.
  */
 #ifndef OWOS_OGG_H
 #define OWOS_OGG_H
@@ -59,8 +49,8 @@ void ogg_demux_free(ogg_demux *d);
 /* Append input. Returns OGG_OK or OGG_ENOMEM (the internal buffer grows). */
 int ogg_demux_feed(ogg_demux *d, const void *data, unsigned len);
 
-/* Pull the next complete packet. On a packet returns OGG_OK and sets *pkt/*len
- * (pointer valid until the next feed/packet call), plus the owning stream's
+/* Pull the next complete packet. On a packet returns OGG_OK and sets
+ * *pkt and *len (pointer valid until the next feed/packet call), plus the owning stream's
  * *serial, the page's *granulepos (-1 mid-page), and the *bos / *eos flags (the
  * packet is the first/last of its logical stream). Returns OGG_NEED when the
  * fed input holds no further complete packet. Any out param may be NULL. */
@@ -87,7 +77,7 @@ int ogg_mux_packet(ogg_mux *m, const void *pkt, unsigned len, int64_t granulepos
 int ogg_mux_flush(ogg_mux *m);
 
 /* Pull the next ready page's bytes (valid until the next mux call). Returns
- * OGG_OK with *page/*len, or OGG_NEED when nothing is ready. */
+ * OGG_OK with *page and *len, or OGG_NEED when nothing is ready. */
 int ogg_mux_pull(ogg_mux *m, const unsigned char **page, unsigned *len);
 
 /* Raw CRC over an assembled page (checksum field must be zeroed), exposed for
@@ -126,44 +116,11 @@ int vorbis_max_frames(const vorbis_decoder *v);
  * code. A header packet (high bit of byte 0 set) is skipped and returns 0. */
 int vorbis_decode(vorbis_decoder *v, const unsigned char *pkt, unsigned len, short *pcm);
 
-/* ---- encoder ------------------------------------------------------------- *
- * A VBR encoder. Open with the target format and a quality in [-0.1, 1.0]
- * (libvorbis's `-q` scale; higher is better/larger). Pull the three header
- * packets first, then push PCM and pull audio packets, then finish. */
-typedef struct vorbis_encoder vorbis_encoder;
-
-vorbis_encoder *vorbis_encoder_open(uint32_t sample_rate, int channels, float quality);
-void vorbis_encoder_close(vorbis_encoder *e);
-
-/* Copy the three Vorbis header packets (id, comment, setup) out. Each call
- * fills *pkt/*len with the next header (valid until the next encoder call) and
- * returns OGG_OK; after the third it returns OGG_NEED. Do this before any PCM.
- */
-int vorbis_encoder_header(vorbis_encoder *e, const unsigned char **pkt, unsigned *len);
-
-/* Submit `frames` interleaved int16 frames (channels shorts each). Buffered
- * into analysis blocks. Returns OGG_OK or OGG_ENOMEM. */
-int vorbis_encoder_write(vorbis_encoder *e, const short *pcm, int frames);
-
-/* Signal end of input, so the tail block is emitted. */
-int vorbis_encoder_finish(vorbis_encoder *e);
-
-/* Pull the next ready audio packet with its absolute granulepos (total PCM
- * samples decodable after it). Returns OGG_OK with *pkt / *len / *granulepos,
- * or OGG_NEED when none is ready (write more, or finish). */
-int vorbis_encoder_packet(vorbis_encoder *e, const unsigned char **pkt, unsigned *len, int64_t *granulepos);
-
 /* ======================= convenience one-shots ========================== */
 
 /* Decode a whole in-memory .ogg (Vorbis) to interleaved int16. Allocates *out
  * (malloc; caller frees) and fills *frames / *channels / *rate. Returns OGG_OK
  * or a negative code. */
 int ogg_vorbis_decode_mem(const void *ogg, unsigned len, short **out, int *frames, int *channels, int *rate);
-
-/* Encode interleaved int16 PCM to a whole in-memory .ogg. Allocates *out
- * (malloc; caller frees) and sets *out_len. Returns OGG_OK or a negative code.
- */
-int ogg_vorbis_encode_mem(const short *pcm, int frames, int channels, int rate, float quality, void **out,
-                          unsigned *out_len);
 
 #endif /* OWOS_OGG_H */
