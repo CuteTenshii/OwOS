@@ -4,6 +4,11 @@
 
 #define EXT_CTA 0x02
 #define EXT_DISPLAYID 0x70
+#define CTA_MIN_REV 3 /* data blocks exist from revision 3 */
+#define CTA_AUDIO_FLAG 0x40
+#define CTA_TAG_VENDOR 3
+#define OUI_HDMI 0x000C03u
+#define OUI_HDMI_FORUM 0xC45DD8u
 #define DID_TYPE1_TIMING 0x03
 #define DID_TYPE1_LEN 20
 #define DID_HEADER 5 /* tag, version, section size, product type, extension count */
@@ -116,4 +121,32 @@ int edid_preferred_timing(const uint8_t *edid, int nblocks, struct edid_timing *
   found.mm = (int)mm;
   *t = found;
   return 0;
+}
+
+void edid_cta_info(const uint8_t *edid, int nblocks, struct edid_cta *c)
+{
+  *c = (struct edid_cta){0};
+  for (int i = 1; i < nblocks; i++) {
+    const uint8_t *b = edid + i * EDID_BLOCK;
+    if (b[0] != EXT_CTA || b[1] < CTA_MIN_REV || !edid_checksum_ok(b))
+      continue;
+    if (b[3] & CTA_AUDIO_FLAG)
+      c->audio = 1;
+    int end = b[2] < EDID_BLOCK - 1 ? b[2] : EDID_BLOCK - 1;
+    for (int p = 4; p < end;) {
+      int tag = b[p] >> 5, len = b[p] & 0x1F;
+      const uint8_t *d = b + p + 1;
+      if (p + 1 + len > end)
+        break;
+      uint32_t oui = len >= 3 ? d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) : 0;
+      if (tag == CTA_TAG_VENDOR && oui == OUI_HDMI) {
+        c->hdmi = 1;
+        if (len >= 7 && d[6] * 5 > c->max_tmds_mhz)
+          c->max_tmds_mhz = d[6] * 5;
+      } else if (tag == CTA_TAG_VENDOR && oui == OUI_HDMI_FORUM && len >= 5 && d[4] * 5 > c->max_tmds_mhz) {
+        c->max_tmds_mhz = d[4] * 5;
+      }
+      p += 1 + len;
+    }
+  }
 }

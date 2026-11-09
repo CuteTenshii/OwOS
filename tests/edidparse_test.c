@@ -192,6 +192,103 @@ static void malformed_displayid_lengths(void)
   expect(edid_preferred_timing(e, 2, &t) < 0);
 }
 
+/* CTA-861 block (revision 3) holding the given data blocks back to back, DTDs starting right after them. */
+static void cta_block(uint8_t *b, int flags, const uint8_t *blocks, int len)
+{
+  memset(b, 0, EDID_BLOCK);
+  b[0] = 0x02;
+  b[1] = 3;
+  b[2] = (uint8_t)(4 + len);
+  b[3] = (uint8_t)flags;
+  memcpy(b + 4, blocks, (size_t)len);
+  seal(b);
+}
+
+static const uint8_t vsdb_hdmi[] = {0x67, 0x03, 0x0C, 0x00, 0x10, 0x00, 0x00, 0x2F}; /* 47 * 5 = 235 MHz */
+static const uint8_t vsdb_forum[] = {0x65, 0xD8, 0x5D, 0xC4, 0x01, 0x78};            /* 120 * 5 = 600 MHz */
+
+static void cta_hdmi_sink(void)
+{
+  uint8_t e[2 * EDID_BLOCK];
+  struct edid_cta c;
+  base_block(e, 0);
+  cta_block(e + EDID_BLOCK, 0x40, vsdb_hdmi, sizeof vsdb_hdmi);
+  edid_cta_info(e, 2, &c);
+  expect_eq(c.hdmi, 1);
+  expect_eq(c.audio, 1);
+  expect_eq(c.max_tmds_mhz, 235);
+}
+
+static void cta_forum_rate_wins(void)
+{
+  uint8_t e[2 * EDID_BLOCK], blocks[sizeof vsdb_hdmi + sizeof vsdb_forum];
+  struct edid_cta c;
+  memcpy(blocks, vsdb_hdmi, sizeof vsdb_hdmi);
+  memcpy(blocks + sizeof vsdb_hdmi, vsdb_forum, sizeof vsdb_forum);
+  base_block(e, 0);
+  cta_block(e + EDID_BLOCK, 0, blocks, sizeof blocks);
+  edid_cta_info(e, 2, &c);
+  expect_eq(c.hdmi, 1);
+  expect_eq(c.audio, 0);
+  expect_eq(c.max_tmds_mhz, 600);
+}
+
+static void cta_dvi_sink(void)
+{
+  uint8_t e[2 * EDID_BLOCK];
+  struct edid_cta c;
+  const uint8_t video_block[] = {0x42, 16, 4}; /* a video data block, not the vendor one */
+  base_block(e, 0);
+  cta_block(e + EDID_BLOCK, 0, video_block, sizeof video_block);
+  edid_cta_info(e, 2, &c);
+  expect_eq(c.hdmi, 0);
+  expect_eq(c.max_tmds_mhz, 0);
+
+  edid_cta_info(e, 1, &c); /* no extension counted */
+  expect_eq(c.hdmi, 0);
+}
+
+static void cta_ignores_bad_blocks(void)
+{
+  uint8_t e[2 * EDID_BLOCK];
+  struct edid_cta c;
+  base_block(e, 0);
+  cta_block(e + EDID_BLOCK, 0x40, vsdb_hdmi, sizeof vsdb_hdmi);
+  e[EDID_BLOCK + 3] ^= 0x01; /* checksum broken */
+  edid_cta_info(e, 2, &c);
+  expect_eq(c.hdmi, 0);
+  expect_eq(c.audio, 0);
+
+  cta_block(e + EDID_BLOCK, 0x40, vsdb_hdmi, sizeof vsdb_hdmi);
+  e[EDID_BLOCK + 1] = 1; /* revision 1 has no data blocks */
+  seal(e + EDID_BLOCK);
+  edid_cta_info(e, 2, &c);
+  expect_eq(c.hdmi, 0);
+}
+
+static void cta_stays_in_bounds(void)
+{
+  uint8_t e[2 * EDID_BLOCK];
+  struct edid_cta c;
+  uint8_t overrun[] = {0x6F, 0x03, 0x0C, 0x00}; /* claims 15 bytes, only 3 follow before the DTD offset */
+  base_block(e, 0);
+  cta_block(e + EDID_BLOCK, 0, overrun, sizeof overrun);
+  edid_cta_info(e, 2, &c);
+  expect_eq(c.hdmi, 0);
+
+  uint8_t shortvs[] = {0x63, 0x03, 0x0C, 0x00}; /* HDMI OUI but too short for a TMDS byte */
+  cta_block(e + EDID_BLOCK, 0, shortvs, sizeof shortvs);
+  edid_cta_info(e, 2, &c);
+  expect_eq(c.hdmi, 1);
+  expect_eq(c.max_tmds_mhz, 0);
+
+  cta_block(e + EDID_BLOCK, 0, vsdb_hdmi, sizeof vsdb_hdmi);
+  e[EDID_BLOCK + 2] = 0xFF; /* DTD offset past the block */
+  seal(e + EDID_BLOCK);
+  edid_cta_info(e, 2, &c);
+  expect_eq(c.hdmi, 1);
+}
+
 int owos_main_edidparse(void)
 {
   test("base block detailed timing", base_dtd);
@@ -201,5 +298,10 @@ int owos_main_edidparse(void)
   test("CTA-861 detailed timing as last resort", cta_fallback);
   test("bad checksum, DisplayID 2.0 and uncounted blocks are ignored", bad_extensions_ignored);
   test("malformed DisplayID lengths stay in bounds", malformed_displayid_lengths);
+  test("CTA HDMI vendor block, audio flag and TMDS clock", cta_hdmi_sink);
+  test("HDMI Forum block raises the TMDS rate", cta_forum_rate_wins);
+  test("CTA block without a vendor block is a DVI-style sink", cta_dvi_sink);
+  test("CTA blocks with bad checksum or old revision are ignored", cta_ignores_bad_blocks);
+  test("CTA data block lengths stay in bounds", cta_stays_in_bounds);
   return 0;
 }

@@ -38,6 +38,16 @@ void edid_model(char *out, int len);
  * EDID has no explicit internal/external bit. */
 int edid_internal(void);
 
+/* 1 if the sink's EDID carries an HDMI vendor block; edid_hdmi_audio() also needs the CTA basic-audio flag. Both
+ * share the one-shot probe and are 0 for a DVI/VGA/DP sink or with no EDID. */
+int edid_hdmi(void);
+int edid_hdmi_audio(void);
+
+/* 1 if a monitor's EDID was read by the last probe (hotplug detect). edid_rescan() re-probes now, so a monitor plugged
+ * in or pulled since the last probe shows up in every accessor above. */
+int edid_connected(void);
+void edid_rescan(void);
+
 /* Why EDID couldn't be read (e.g. "no Intel GPU", "GMBUS NAK", "bad checksum"),
  * for real-hardware diagnostics. Empty string after a successful read. */
 const char *edid_error(void);

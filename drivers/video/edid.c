@@ -60,6 +60,7 @@ static int cached_hz, cached_w, cached_h, cached_dpi;
 static char cached_mfg[4];   /* 3-letter PNP manufacturer id           */
 static char cached_name[16]; /* monitor-name descriptor (0xFC), if any */
 static bool cached_internal; /* PNP id is a known laptop-panel vendor  */
+static struct edid_cta cached_cta;
 static char err[48];
 
 static void seterr(const char *s)
@@ -282,6 +283,7 @@ static bool probe_dp_aux(void)
       }
     if (parse_preferred(edid, nblocks) == 0) {
       parse_identity(edid);
+      edid_cta_info(edid, nblocks, &cached_cta);
       return true;
     }
   }
@@ -292,18 +294,24 @@ static void probe(void)
 {
   probed = true;
   err[0] = '\0';
+  cached_hz = cached_w = cached_h = cached_dpi = 0;
+  cached_mfg[0] = cached_name[0] = '\0';
+  cached_internal = false;
+  cached_cta = (struct edid_cta){0};
 
-  uint32_t bar;
-  if (find_intel_gpu(&bar) != 0)
-    return;
+  if (!mmio) {
+    uint32_t bar;
+    if (find_intel_gpu(&bar) != 0)
+      return;
 
-  /* Map the first ~1 MiB of BAR0 uncached (one-shot, not reclaimed). */
-  if (paging_identity_map(bar, 0x100000) != 0) {
-    seterr("BAR map failed");
-    return;
+    /* Map the first ~1 MiB of BAR0 uncached (one-shot, not reclaimed). */
+    if (paging_identity_map(bar, 0x100000) != 0) {
+      seterr("BAR map failed");
+      return;
+    }
+    paging_mark_uc(bar, 0x100000);
+    mmio = (volatile uint8_t *)(uintptr_t)bar;
   }
-  paging_mark_uc(bar, 0x100000);
-  mmio = (volatile uint8_t *)(uintptr_t)bar;
 
   for (uint32_t bi = 0; bi < sizeof(gmbus_bases) / sizeof(gmbus_bases[0]); bi++) {
     base = gmbus_bases[bi];
@@ -322,6 +330,7 @@ static void probe(void)
         nblocks = 2;
       if (parse_preferred(edid, nblocks) == 0) {
         parse_identity(edid);
+        edid_cta_info(edid, nblocks, &cached_cta);
         return;
       }
     }
@@ -365,6 +374,22 @@ int edid_internal(void)
   ensure();
   return cached_internal;
 }
+int edid_hdmi(void)
+{
+  ensure();
+  return cached_cta.hdmi;
+}
+int edid_hdmi_audio(void)
+{
+  ensure();
+  return cached_cta.hdmi && cached_cta.audio;
+}
+int edid_connected(void)
+{
+  ensure();
+  return cached_mfg[0] != '\0';
+}
+void edid_rescan(void) { probe(); }
 
 /* Friendly brand for common PNP ids, else the raw 3-letter code. */
 static const char *brand_name(const char *mfg)
