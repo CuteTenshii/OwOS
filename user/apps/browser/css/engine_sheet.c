@@ -453,6 +453,7 @@ css_sheet *css_new(void)
   s->has_pseudo_el = false;
   s->has_selection = false;
   s->has_marker = false;
+  s->has_scrollbar = false;
   s->cur_base = 0;
   for (int i = 0; i < CSS_NBUCK; i++) {
     s->id_b[i] = s->cls_b[i] = s->tag_b[i] = 0;
@@ -786,6 +787,8 @@ static void sheet_push(css_sheet *sh, struct selector *sel, const struct css_sty
     sh->has_selection = true;
   if (sel->step[sel->n - 1].pseudo_el == PE_MARKER)
     sh->has_marker = true;
+  if (sel->step[sel->n - 1].pseudo_el >= PE_SCROLLBAR && sel->step[sel->n - 1].pseudo_el <= PE_SB_TRACK)
+    sh->has_scrollbar = true;
   r->visit = 0; /* the index (ensure_index) files it by key */
   r->vc = 0;
   r->vc_serial = 0;

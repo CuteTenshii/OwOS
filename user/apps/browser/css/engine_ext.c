@@ -1,4 +1,5 @@
 #include "engine_int.h"
+#include "math.h"
 
 /* Declarations for grid placement and areas, alignment, aspect-ratio, text, transform, filter and clip-path. */
 
@@ -102,71 +103,206 @@ static short clamp16(int v) { return (short)(v > 32767 ? 32767 : (v < -32767 ? -
 
 /* ---- transform ---- */
 
-static void tr_translate(struct css_style *o, const char *arg, int axis)
+/* An affine map under construction: linear part [a c; b d] and a translation whose x and y are each px plus percent of
+ * the border box. */
+struct xf {
+  double a, b, c, d;
+  double tx, ty, txp, typ;
+};
+
+/* m = m * n (n is applied to a point first). */
+static void xf_mul(struct xf *m, const struct xf *n)
 {
-  int px = 0, pct = 0;
-  if (!parse_slen(arg, &px, &pct))
-    return;
-  if (axis == 0) {
-    o->tr_x = clamp16(o->tr_x + px);
-    o->tr_xp = clamp16(o->tr_xp + pct);
-  } else {
-    o->tr_y = clamp16(o->tr_y + px);
-    o->tr_yp = clamp16(o->tr_yp + pct);
-  }
+  struct xf r;
+  r.a = m->a * n->a + m->c * n->b;
+  r.b = m->b * n->a + m->d * n->b;
+  r.c = m->a * n->c + m->c * n->d;
+  r.d = m->b * n->c + m->d * n->d;
+  r.tx = m->a * n->tx + m->c * n->ty + m->tx;
+  r.ty = m->b * n->tx + m->d * n->ty + m->ty;
+  r.txp = m->a * n->txp + m->c * n->typ + m->txp;
+  r.typ = m->b * n->txp + m->d * n->typ + m->typ;
+  *m = r;
 }
 
-/* `transform`: translate functions apply, other functions (scale, rotate, matrix) leave the element untransformed. */
+static void xf_identity(struct xf *x)
+{
+  x->a = x->d = 1;
+  x->b = x->c = x->tx = x->ty = x->txp = x->typ = 0;
+}
+
+static int q12(double v) { return (int)(v * 4096.0 + (v < 0 ? -0.5 : 0.5)); }
+
+/* Store `x` in the style: translation always, the linear part when it is not the identity. */
+static void xf_store(struct css_style *o, const struct xf *x)
+{
+  int m[4] = {q12(x->a), q12(x->b), q12(x->c), q12(x->d)};
+  memcpy(o->tr_m, m, sizeof m);
+  o->tr_mat = m[0] != 4096 || m[1] || m[2] || m[3] != 4096;
+  o->tr_x = clamp16((int)(x->tx + (x->tx < 0 ? -0.5 : 0.5)));
+  o->tr_y = clamp16((int)(x->ty + (x->ty < 0 ? -0.5 : 0.5)));
+  o->tr_xp = clamp16((int)(x->txp + (x->txp < 0 ? -0.5 : 0.5)));
+  o->tr_yp = clamp16((int)(x->typ + (x->typ < 0 ? -0.5 : 0.5)));
+  o->has_tr = o->tr_mat || o->tr_x || o->tr_y || o->tr_xp || o->tr_yp;
+}
+
+/* Load the style's current transform into `x`. */
+static void xf_load(const struct css_style *o, struct xf *x)
+{
+  x->a = o->tr_m[0] / 4096.0;
+  x->b = o->tr_m[1] / 4096.0;
+  x->c = o->tr_m[2] / 4096.0;
+  x->d = o->tr_m[3] / 4096.0;
+  x->tx = o->tr_x;
+  x->ty = o->tr_y;
+  x->txp = o->tr_xp;
+  x->typ = o->tr_yp;
+}
+
+/* One transform function by name with its arguments, as an affine map; false for functions this does not support. */
+static bool xf_func(const char *name, char arg[][40], int n, struct xf *x)
+{
+  int px, pct, deg;
+  xf_identity(x);
+  if (!strcmp(name, "translate") || !strcmp(name, "translate3d") || !strcmp(name, "translatex") ||
+      !strcmp(name, "translatey")) {
+    int axis = !strcmp(name, "translatey") ? 1 : 0;
+    for (int i = 0; i < n && i < 2; i++) {
+      if (!parse_slen(arg[i], &px, &pct))
+        return false;
+      if (axis + i == 0) {
+        x->tx = px;
+        x->txp = pct;
+      } else {
+        x->ty = px;
+        x->typ = pct;
+      }
+    }
+    return n > 0;
+  }
+  if (starts_ci(name, "scale")) {
+    int kx = 1000, ky = 1000;
+    if (n > 0 && parse_num_pct(arg[0], &kx))
+      ky = kx;
+    if (n > 1)
+      parse_num_pct(arg[1], &ky);
+    if (!strcmp(name, "scalex"))
+      ky = 1000;
+    else if (!strcmp(name, "scaley")) {
+      ky = kx;
+      kx = 1000;
+    }
+    x->a = kx / 1000.0;
+    x->d = ky / 1000.0;
+    return n > 0;
+  }
+  if ((!strcmp(name, "rotate") || !strcmp(name, "rotatez")) && n > 0 && parse_angle(arg[0], &deg)) {
+    double r = deg * 0.017453292519943295;
+    x->a = x->d = cos(r);
+    x->b = sin(r);
+    x->c = -sin(r);
+    return true;
+  }
+  if (starts_ci(name, "skew")) {
+    int ax = 0, ay = 0;
+    if (n > 0)
+      parse_angle(arg[0], strcmp(name, "skewy") ? &ax : &ay);
+    if (n > 1)
+      parse_angle(arg[1], &ay);
+    x->c = ax ? sin(ax * 0.017453292519943295) / cos(ax * 0.017453292519943295) : 0;
+    x->b = ay ? sin(ay * 0.017453292519943295) / cos(ay * 0.017453292519943295) : 0;
+    return true;
+  }
+  if (!strcmp(name, "matrix") && n >= 6) {
+    int m[6] = {0};
+    for (int i = 0; i < 6; i++) {
+      const char *p = arg[i];
+      double v;
+      if (!calc_number(&p, &v))
+        return false;
+      m[i] = (int)(v * 4096.0 + (v < 0 ? -0.5 : 0.5));
+    }
+    x->a = m[0] / 4096.0;
+    x->b = m[1] / 4096.0;
+    x->c = m[2] / 4096.0;
+    x->d = m[3] / 4096.0;
+    x->tx = m[4] / 4096.0;
+    x->ty = m[5] / 4096.0;
+    return true;
+  }
+  return false;
+}
+
+/* `transform` list (or one of translate/rotate/scale, which compose onto what is already set when `reset` is false). */
 static void parse_transform(const char *v, struct css_style *o, bool reset)
 {
-  if (reset) {
-    o->tr_x = o->tr_y = o->tr_xp = o->tr_yp = 0;
-    o->tr_flip = 0;
-  }
-  o->has_tr = 0;
-  for (const char *s = v; *s;) {
-    s = skip_ws(s);
-    char name[16];
-    int nl = fn_name(s, name, sizeof name);
-    if (!nl)
-      break;
-    const char *as = s + nl + 1, *ae = fn_args_end(as);
-    char arg[3][40];
-    int n = 0;
-    for (const char *q = as; n < 3 && (q = next_arg(q, ae, arg[n], sizeof arg[n])); n++)
-      ;
-    if (!strcmp(name, "translate") || !strcmp(name, "translate3d")) {
-      if (n > 0)
-        tr_translate(o, arg[0], 0);
-      if (n > 1)
-        tr_translate(o, arg[1], 1);
-      o->has_tr = 1;
-    } else if (!strcmp(name, "translatex") && n > 0) {
-      tr_translate(o, arg[0], 0);
-      o->has_tr = 1;
-    } else if (!strcmp(name, "translatey") && n > 0) {
-      tr_translate(o, arg[0], 1);
-      o->has_tr = 1;
-    } else if (!strcmp(name, "rotate") || !strcmp(name, "rotatez")) {
-      int deg;
-      if (n > 0 && parse_angle(arg[0], &deg) && ((deg % 360) + 360) % 360 == 180)
-        o->tr_flip ^= 3;
-    } else if (starts_ci(name, "scale")) {
-      int kx = 1000, ky = 1000;
-      if (n > 0 && parse_num_pct(arg[0], &kx))
-        ky = kx;
-      if (n > 1)
-        parse_num_pct(arg[1], &ky);
-      if (!strcmp(name, "scalex"))
-        ky = 1000;
-      else if (!strcmp(name, "scaley")) {
-        ky = kx;
-        kx = 1000;
-      }
-      o->tr_flip ^= (signed char)((kx < 0 ? 1 : 0) | (ky < 0 ? 2 : 0));
+  struct xf m;
+  if (reset)
+    xf_identity(&m);
+  else
+    xf_load(o, &m);
+  if (!starts_ci(skip_ws(v), "none"))
+    for (const char *s = v; *s;) {
+      s = skip_ws(s);
+      char name[16];
+      int nl = fn_name(s, name, sizeof name);
+      if (!nl)
+        break;
+      const char *as = s + nl + 1, *ae = fn_args_end(as);
+      char arg[6][40];
+      int n = 0;
+      for (const char *q = as; n < 6 && (q = next_arg(q, ae, arg[n], sizeof arg[n])); n++)
+        ;
+      struct xf f;
+      if (xf_func(name, arg, n, &f))
+        xf_mul(&m, &f);
+      s = *ae ? ae + 1 : ae;
     }
-    s = *ae ? ae + 1 : ae;
+  xf_store(o, &m);
+}
+
+/* transform-origin: `x [y]`, each a keyword, length or percentage. */
+static void parse_origin(const char *v, struct css_style *o)
+{
+  char tok[2][40];
+  int n = 0;
+  for (const char *q = v; n < 2 && (q = next_arg(q, q + strlen(q), tok[n], sizeof tok[n])); n++)
+    ;
+  if (n == 0)
+    return;
+  short px[2] = {0, 0}, pct[2] = {50, 50};
+  bool xy_known[2] = {false, false};
+  for (int i = 0; i < n; i++) {
+    int slot = i; /* the first value is the horizontal one unless it names the vertical axis */
+    bool vert_kw = starts_ci(tok[i], "top") || starts_ci(tok[i], "bottom");
+    bool horz_kw = starts_ci(tok[i], "left") || starts_ci(tok[i], "right");
+    if (vert_kw)
+      slot = 1;
+    else if (horz_kw)
+      slot = 0;
+    else if (i == 1 && xy_known[0] == false)
+      slot = 0;
+    short p = 0, c = 50;
+    int a, b;
+    if (starts_ci(tok[i], "left") || starts_ci(tok[i], "top"))
+      c = 0;
+    else if (starts_ci(tok[i], "right") || starts_ci(tok[i], "bottom"))
+      c = 100;
+    else if (starts_ci(tok[i], "center"))
+      c = 50;
+    else if (parse_slen(tok[i], &a, &b)) {
+      p = clamp16(a);
+      c = clamp16(b);
+    }
+    px[slot] = p;
+    pct[slot] = c;
+    xy_known[slot] = true;
   }
+  o->tr_ox = px[0];
+  o->tr_oy = px[1];
+  o->tr_oxp = pct[0];
+  o->tr_oyp = pct[1];
+  o->tr_org = 1;
 }
 
 /* ---- filter ---- */
@@ -650,7 +786,19 @@ bool parse_ext_decl(const char *p, const char *pe, const char *val, struct css_s
       out->va_len = clamp16(px);
     }
   } else if (span_is(p, pe, "scrollbar-width")) {
-    out->sb_none = has_ci(val, "none") ? 1 : 0;
+    out->sb_w = has_ci(val, "none") ? 0 : has_ci(val, "thin") ? 6 : -2;
+  } else if (span_is(p, pe, "scrollbar-color")) {
+    char tok[2][40];
+    int n = 0;
+    for (const char *q = val; n < 2 && (q = next_arg(q, q + strlen(q), tok[n], sizeof tok[n])); n++)
+      ;
+    int thumb = n > 0 ? parse_color(tok[0]) : -1, track = n > 1 ? parse_color(tok[1]) : -1;
+    if (n == 2 && thumb >= 0 && track >= 0) {
+      out->sb_thumb = thumb;
+      out->sb_track = track;
+    } else if (has_ci(val, "auto")) {
+      out->sb_thumb = out->sb_track = -2;
+    }
   } else if (span_is(p, pe, "tab-size") || span_is(p, pe, "-moz-tab-size")) {
     const char *f = val;
     double n;
@@ -704,6 +852,8 @@ bool parse_ext_decl(const char *p, const char *pe, const char *val, struct css_s
     }
   } else if (span_is(p, pe, "transform") || span_is(p, pe, "-webkit-transform")) {
     parse_transform(val, out, true);
+  } else if (span_is(p, pe, "transform-origin")) {
+    parse_origin(val, out);
   } else if (span_is(p, pe, "translate")) {
     char buf[96];
     snprintf(buf, sizeof buf, "translate(%s)", val);

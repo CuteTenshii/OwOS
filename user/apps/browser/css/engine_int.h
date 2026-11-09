@@ -85,7 +85,10 @@ enum {
   PE_PART = 5,
   PE_SELECTION = 6,
   PE_BACKDROP = 7,
-  PE_MARKER = 8
+  PE_MARKER = 8,
+  PE_SCROLLBAR = 9,
+  PE_SB_THUMB = 10,
+  PE_SB_TRACK = 11
 };
 
 struct selector {
@@ -192,6 +195,7 @@ struct css_sheet {
   struct media_query *medias;      /* every @media query parsed for this sheet */
   bool has_pseudo_el;              /* set once any ::before/::after rule is pushed */
   bool has_selection;              /* set once any ::selection rule is pushed */
+  bool has_scrollbar;              /* set once any ::-webkit-scrollbar* rule is pushed */
   bool has_marker;                 /* set once any ::marker / ::-webkit-details-marker rule is pushed */
   const char *cur_base;            /* base URL for faces added by the in-progress css_add */
   /* Rule index, rebuilt lazily when `gen` changes; each entry lives in exactly one bucket. */

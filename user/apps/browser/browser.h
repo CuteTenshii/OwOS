@@ -25,7 +25,8 @@ extern int BW, BH; /* client size (mutable: the window is resizable)    */
 #define ADDR_H 26  /* address-bar height                               */
 #define GLYPH_W 8
 #define GLYPH_H 16
-#define SCROLL_W 10 /* right-edge scrollbar width                       */
+#define SCROLL_W 10                 /* right-edge scrollbar width                       */
+#define PAGE_SCROLL_W (B->pg->sb_w) /* the page pane's scrollbar: SCROLL_W unless the page restyles it */
 
 /* Initial heap sizes of the growable buffers (grow ~1.5x, never shrink). */
 #define RAW_INIT (256 * 1024)  /* captured response body / one image     */
@@ -105,23 +106,28 @@ typedef void (*res_batch_fn)(char *const *urls, int n, unsigned char **bodies, i
 
 /* An inline <img>, anchored at a text offset and blitted decode-on-scroll. */
 struct inl_img {
-  char href[URL_MAX];         /* src, resolved against the page URL            */
-  char alt[48];               /* alt text, shown when the image can't be drawn */
-  int text_pos;               /* offset into B->text where it is anchored      */
-  int start_row;              /* first display row (set by rewrap)             */
-  int rows;                   /* reserved display rows (set by rewrap)         */
-  int ok;                     /* 1 = img_pool holds a decodable PNG            */
-  unsigned iw, ih;            /* natural pixel dimensions                      */
-  int coff, clen;             /* its PNG bytes within img_pool                 */
-  int lazy;                   /* 1 = loading="lazy": fetch only when in view   */
-  int want;                   /* UI flag: a lazy image is now scrolled in      */
-  int fetched;                /* 1 = a fetch has been attempted (ok = result)  */
-  int cw, ch;                 /* width/height from the attr or CSS, px (0=auto) */
-  int is_argb;                /* 1 = img_pool holds raw RGBA (SVG), not PNG    */
-  int uid;                    /* session-unique id once landed (0 = none), keys the pixel cache */
-  int fit;                    /* object-fit: enum css_objfit */
-  int hidden;                 /* visibility:hidden: reserve the space, draw nothing */
-  int flip;                   /* transform: 1 mirror horizontally, 2 vertically */
+  char href[URL_MAX]; /* src, resolved against the page URL            */
+  char alt[48];       /* alt text, shown when the image can't be drawn */
+  int text_pos;       /* offset into B->text where it is anchored      */
+  int start_row;      /* first display row (set by rewrap)             */
+  int rows;           /* reserved display rows (set by rewrap)         */
+  int ok;             /* 1 = img_pool holds a decodable PNG            */
+  unsigned iw, ih;    /* natural pixel dimensions                      */
+  int coff, clen;     /* its PNG bytes within img_pool                 */
+  int lazy;           /* 1 = loading="lazy": fetch only when in view   */
+  int want;           /* UI flag: a lazy image is now scrolled in      */
+  int fetched;        /* 1 = a fetch has been attempted (ok = result)  */
+  int cw, ch;         /* width/height from the attr or CSS, px (0=auto) */
+  int is_argb;        /* 1 = img_pool holds raw RGBA (SVG), not PNG    */
+  int uid;            /* session-unique id once landed (0 = none), keys the pixel cache */
+  int fit;            /* object-fit: enum css_objfit */
+  int hidden;         /* visibility:hidden: reserve the space, draw nothing */
+  struct {            /* transform on the element: the map is drawn after the image is painted */
+    bool on;
+    int m[4];               /* Q12 a b c d */
+    short tx, ty, txp, typ; /* translation: px and percent of the image box */
+    short ox, oy, oxp, oyp; /* transform-origin: px and percent of the image box */
+  } xf;
   short fbright;              /* filter brightness permille, 1000 = none */
   signed char fgray, finvert; /* filter grayscale / invert percent */
 };
@@ -140,14 +146,15 @@ struct page {
   unsigned char *attr;
   int text_len, text_cap;
   unsigned char *bp;
-  unsigned char *align; /* per-glyph text alignment: 0 left, 1 center, 2 right, 3 justify */
-  unsigned char *fsz;   /* per-glyph CSS font-size px (0 = default body font) */
-  unsigned char *lh;    /* per-glyph CSS line-height px (0 = font-derived default) */
-  signed char *ls;      /* per-glyph letter-spacing px */
-  signed char *va;      /* per-glyph vertical-align shift, px down */
-  unsigned sid;         /* sessionStorage scope: assigned on first use, dies with the tab */
-  bool sb_none;         /* the page sets scrollbar-width:none on its root */
-  bool has_ls;          /* some glyph has letter-spacing (the layout signature must see it) */
+  unsigned char *align;         /* per-glyph text alignment: 0 left, 1 center, 2 right, 3 justify */
+  unsigned char *fsz;           /* per-glyph CSS font-size px (0 = default body font) */
+  unsigned char *lh;            /* per-glyph CSS line-height px (0 = font-derived default) */
+  signed char *ls;              /* per-glyph letter-spacing px */
+  signed char *va;              /* per-glyph vertical-align shift, px down */
+  unsigned sid;                 /* sessionStorage scope: assigned on first use, dies with the tab */
+  int sb_w;                     /* page scrollbar width, px (0 = hidden); SCROLL_W unless the page restyles it */
+  struct scrollbar_style sb_st; /* its colours, thumb radius and arrows */
+  bool has_ls;                  /* some glyph has letter-spacing (the layout signature must see it) */
   unsigned *fg;
   unsigned *bg;
   /* Page canvas colours from the <html>/<body> cascade. */
@@ -321,6 +328,8 @@ int browser_ensure_links(int need);
 int browser_ensure_regs(int need);
 int browser_ensure_imgs(int need);
 unsigned *browser_surface(void);
+void browser_surface_redirect(
+    unsigned *to); /* paint into `to` (BW x BH) instead of the window surface; NULL undoes it */
 int browser_surface_ready(void);
 void browser_present(int id);
 void browser_blit_rect(int x, int y, int w, int h);
@@ -346,10 +355,10 @@ int js_has_listeners(void); /* any listener registered */
 bool js_escape_key(void);   /* Escape: close the topmost modal dialog or auto popover */
 bool js_dialog_form_submit(struct dom_node *form, struct dom_node *submitter); /* method=dialog: close its dialog */
 int js_resize_pump(void);        /* report ResizeObserver size changes; -> # callbacks fired */
+int js_intersection_pump(void);  /* report IntersectionObserver changes; -> # callbacks fired */
 int js_timers_pump(void);        /* fire due setTimeout/Interval/rAF; -> # callbacks fired */
 int js_workers_pump(void);       /* deliver queued Worker postMessage traffic */
 int js_websockets_pump(void);    /* drain live WebSockets -> open/message/close/error events */
-int js_intersection_pump(void);  /* report IntersectionObserver changes; -> # callbacks fired */
 int js_notifications_pump(void); /* deliver deferred Notification show/close events */
 int js_cast_pump(void);          /* deliver Remote Playback availability + connect/disconnect */
 int js_idb_pump(void);           /* deliver IndexedDB request events + commit/abort transactions */

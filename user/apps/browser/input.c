@@ -193,7 +193,7 @@ static void pane_hit(int mx, int my, int *off, char *url, int cap, int *newtab)
   int py, phh, rows;
   pane_metrics(&py, &phh, &rows);
   int right = devtools_visible() ? devtools_left() : BW;
-  if (my < py || my >= py + phh || mx < 0 || mx >= right - SCROLL_W)
+  if (my < py || my >= py + phh || mx < 0 || mx >= right - PAGE_SCROLL_W)
     return; /* outside the content pane: skip the lock */
   browser_buf_lock();
   bool ov_hit = overlay_hit(mx, my, py, phh, off);
@@ -543,7 +543,7 @@ void handle_click(int mx, int my)
   int py, phh, rows;
   pane_metrics(&py, &phh, &rows);
   int right = devtools_visible() ? devtools_left() : BW;
-  int sbpart = B->pg->sb_none ? SCROLLBAR_NONE : scrollbar_hit(right - SCROLL_W, py, SCROLL_W, phh, mx, my);
+  int sbpart = scrollbar_hit_ex(right - PAGE_SCROLL_W, py, PAGE_SCROLL_W, phh, mx, my, &B->pg->sb_st);
   if (sbpart != SCROLLBAR_NONE) { /* scrollbar */
     int target;
     if (sbpart == SCROLLBAR_UP)
@@ -551,7 +551,8 @@ void handle_click(int mx, int my)
     else if (sbpart == SCROLLBAR_DOWN)
       target = B->pg->scroll + 3 * LINE_H;
     else
-      target = scrollbar_pos(right - SCROLL_W, py, SCROLL_W, phh, mx, my, B->pg->scroll, g_fr->doc_h, phh);
+      target = scrollbar_pos_ex(right - PAGE_SCROLL_W, py, PAGE_SCROLL_W, phh, mx, my, B->pg->scroll, g_fr->doc_h, phh,
+                                &B->pg->sb_st);
     scroll_set(target);
     return;
   }
@@ -574,7 +575,7 @@ void handle_click(int mx, int my)
     {
       int sc = B->pg->scroll;
       int right = devtools_visible() ? devtools_left() : BW;
-      int paw = (right - SCROLL_W) - 8;
+      int paw = (right - PAGE_SCROLL_W) - 8;
       if (paw < 8)
         paw = 8;
       for (struct media_el *me = media_doc_first(); me; me = media_doc_next(me)) {
@@ -651,7 +652,7 @@ static int cursor_for(int mx, int my, const char *link)
   if (bm_panel_open && mx < BM_PANEL_W && my >= MENU_H + TAB_H + ADDR_H)
     return WIN_CURSOR_HAND;
   /* Content pane */
-  if (mx >= (devtools_visible() ? devtools_left() : BW) - SCROLL_W)
+  if (mx >= (devtools_visible() ? devtools_left() : BW) - PAGE_SCROLL_W)
     return WIN_CURSOR_ARROW;
   /* Crashed tab */
   if (tabs[active_tab].crashed)

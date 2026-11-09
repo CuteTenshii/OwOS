@@ -6,6 +6,7 @@
 static struct lbox *g_pool;
 static int g_n, g_cap;
 static int g_cur = -1; /* index of the currently open box, -1 = none */
+static bool g_has_rot; /* some box has a transform with a linear part */
 
 static void exts_free(void)
 {
@@ -21,7 +22,20 @@ void layout_reset(void)
   exts_free();
   g_n = 0;
   g_cur = -1;
+  g_has_rot = false;
   browser_buf_unlock();
+}
+
+int layout_rot_boxes(int *out, int max)
+{
+  int n = 0, next = 0;
+  for (int i = 0; g_has_rot && i < g_n && n < max; i++) {
+    if (i < next || !g_pool[i].ext || !g_pool[i].ext->mat)
+      continue;
+    out[n++] = i;
+    next = g_pool[i].end; /* a transformed box inside another is painted with it */
+  }
+  return n;
 }
 
 void layout_free(void)
@@ -72,7 +86,7 @@ static struct ledge edge4(const short v[4])
 /* The rarely-set properties of `cs`, or NULL when it sets none of them. */
 static struct lext *ext_new(const struct css_style *cs)
 {
-  bool tr = cs->has_tr == 1, flt = cs->flt_bright >= 0, clip = cs->clip_kind > CSS_CLIP_NONE;
+  bool tr = cs->has_tr == 1, mat = cs->tr_mat == 1, flt = cs->flt_bright >= 0, clip = cs->clip_kind > CSS_CLIP_NONE;
   if (cs->n_areas <= 0 && !cs->area[0] && !tr && !flt && !clip && !cs->backdrop_set)
     return 0;
   struct lext *x = calloc(1, sizeof *x);
@@ -86,7 +100,18 @@ static struct lext *ext_new(const struct css_style *cs)
     x->area[i] = cs->area[i];
   x->backdrop = cs->backdrop;
   x->backdrop_set = (unsigned char)cs->backdrop_set;
-  if (tr) {
+  if (mat) {
+    x->mat = 1;
+    memcpy(x->m, cs->tr_m, sizeof x->m);
+    x->tr_x = cs->tr_x;
+    x->tr_y = cs->tr_y;
+    x->tr_xp = cs->tr_xp;
+    x->tr_yp = cs->tr_yp;
+    x->ox = cs->tr_ox;
+    x->oy = cs->tr_oy;
+    x->oxp = cs->tr_oxp;
+    x->oyp = cs->tr_oyp;
+  } else if (tr) {
     x->tr_x = cs->tr_x;
     x->tr_y = cs->tr_y;
     x->tr_xp = cs->tr_xp;
@@ -130,6 +155,7 @@ void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0)
   b->hidden = (unsigned char)(cs->visibility == 0);
   b->bg_clip = (unsigned char)(cs->bg_clip > 0 ? cs->bg_clip : 0);
   b->ext = ext_new(cs);
+  g_has_rot |= b->ext && b->ext->mat;
   if (cs->n_cols > 0)
     for (int i = 0; i < cs->n_cols && i < CSS_GRID_MAX; i++)
       b->cols_t[i] = cs->grid_cols[i];

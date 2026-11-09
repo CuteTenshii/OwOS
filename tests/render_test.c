@@ -804,24 +804,74 @@ static void grid_cells_follow_areas_lines_and_auto_flow(void)
   expect(place(3, 2, c3, r3, one, one, col, row) == 2 && col[0] == 100 && col[1] == 101 && row[1] == 101);
 }
 
-static void flip_rect_mirrors_in_place(void)
+static void affine_draw_places_pixels_through_the_map(void)
 {
-  unsigned px[3 * 4]; /* a 3x2 block inside a stride-4 buffer */
-  for (int i = 0; i < 12; i++)
-    px[i] = (unsigned)i;
-  ru_flip_rect(px, 4, 3, 2, true, false);
-  expect(px[0] == 2 && px[1] == 1 && px[2] == 0 && px[4] == 6 && px[6] == 4);
-  expect(px[3] == 3 && px[7] == 7); /* outside the block: untouched */
-  for (int i = 0; i < 12; i++)
-    px[i] = (unsigned)i;
-  ru_flip_rect(px, 4, 3, 2, false, true);
-  expect(px[0] == 4 && px[1] == 5 && px[4] == 0 && px[6] == 2);
-  ru_flip_rect(px, 4, 3, 2, false, true);
-  expect(px[0] == 0 && px[6] == 6); /* twice is the identity */
-  for (int i = 0; i < 12; i++)
-    px[i] = (unsigned)i;
-  ru_flip_rect(px, 4, 3, 2, true, true);
-  expect(px[0] == 6 && px[2] == 4 && px[4] == 2 && px[6] == 0);
+  enum { W = 12, H = 12 };
+  unsigned screen[W * H], src[W * H], bg[4 * 4];
+  memset(bg, 0, sizeof bg);
+  memset(src, 0, sizeof src);
+  /* a 4x4 block at (4,4) with a diagonal of colour */
+  for (int i = 0; i < 4; i++)
+    src[(4 + i) * W + 4 + i] = 0x00ff00;
+  /* identity: pixels land where they were */
+  memset(screen, 0, sizeof screen);
+  struct ru_xf id = {1, 0, 0, 1, 6, 6, 0, 0};
+  ru_affine_draw(screen, W, 0, 0, W, H, src, W, bg, 4, 4, 4, 4, &id);
+  for (int i = 0; i < 4; i++)
+    expect(screen[(4 + i) * W + 4 + i] == 0x00ff00);
+  expect(screen[4 * W + 5] == 0);
+  /* translation by (2,1) */
+  memset(screen, 0, sizeof screen);
+  struct ru_xf tr = {1, 0, 0, 1, 6, 6, 2, 1};
+  ru_affine_draw(screen, W, 0, 0, W, H, src, W, bg, 4, 4, 4, 4, &tr);
+  expect(screen[5 * W + 6] == 0x00ff00 && screen[8 * W + 9] == 0x00ff00 && screen[4 * W + 4] == 0);
+  /* rotate 90 degrees clockwise about the block's centre: the diagonal runs the other way */
+  memset(screen, 0, sizeof screen);
+  struct ru_xf r90 = {0, 1, -1, 0, 6, 6, 0, 0};
+  ru_affine_draw(screen, W, 0, 0, W, H, src, W, bg, 4, 4, 4, 4, &r90);
+  expect(screen[4 * W + 7] == 0x00ff00 && screen[7 * W + 4] == 0x00ff00 && screen[5 * W + 6] == 0x00ff00);
+  expect(screen[4 * W + 4] == 0);
+  /* scale by 2 about the centre: one source pixel covers a 2x2 block */
+  memset(screen, 0, sizeof screen);
+  struct ru_xf sc = {2, 0, 0, 2, 6, 6, 0, 0};
+  ru_affine_draw(screen, W, 0, 0, W, H, src, W, bg, 4, 4, 4, 4, &sc);
+  expect(screen[2 * W + 2] == 0x00ff00 && screen[3 * W + 3] == 0x00ff00 && screen[2 * W + 3] == 0x00ff00 &&
+         screen[3 * W + 2] == 0x00ff00);
+  /* pixels equal to the backdrop are transparent: the destination keeps its colour */
+  memset(screen, 0x55, sizeof screen);
+  ru_affine_draw(screen, W, 0, 0, W, H, src, W, bg, 4, 4, 4, 4, &id);
+  expect(screen[4 * W + 5] == 0x55555555 && screen[4 * W + 4] == 0x00ff00);
+  /* the clip rectangle bounds the writes */
+  memset(screen, 0, sizeof screen);
+  ru_affine_draw(screen, W, 0, 0, 6, 6, src, W, bg, 4, 4, 4, 4, &id);
+  expect(screen[4 * W + 4] == 0x00ff00 && screen[6 * W + 6] == 0);
+  /* a singular map draws nothing */
+  memset(screen, 0, sizeof screen);
+  struct ru_xf zero = {0, 0, 0, 0, 6, 6, 0, 0};
+  ru_affine_draw(screen, W, 0, 0, W, H, src, W, bg, 4, 4, 4, 4, &zero);
+  expect(screen[4 * W + 4] == 0);
+}
+
+static void affine_draw_argb_blends_by_alpha(void)
+{
+  enum { W = 8, H = 8 };
+  unsigned screen[W * H], px[4] = {0xff00ff00, 0xff00ff00, 0x80ff0000, 0x00ffffff};
+  struct ru_xf id = {1, 0, 0, 1, 3, 3, 0, 0};
+  for (int i = 0; i < W * H; i++)
+    screen[i] = 0x000000;
+  /* a 2x2 block at (2,2): opaque green, opaque green, half-transparent red, fully transparent */
+  ru_affine_draw_argb(screen, W, 0, 0, W, H, px, 2, 2, 2, 2, &id);
+  expect(screen[2 * W + 2] == 0x00ff00 && screen[2 * W + 3] == 0x00ff00);
+  expect(((screen[3 * W + 2] >> 16) & 0xff) > 120 &&
+         ((screen[3 * W + 2] >> 16) & 0xff) < 136); /* red at half strength */
+  expect(screen[3 * W + 3] == 0 && screen[0] == 0);
+  /* rotating 180 degrees about the block's centre swaps the diagonal corners */
+  for (int i = 0; i < W * H; i++)
+    screen[i] = 0;
+  struct ru_xf r180 = {-1, 0, 0, -1, 3, 3, 0, 0};
+  ru_affine_draw_argb(screen, W, 0, 0, W, H, px, 2, 2, 2, 2, &r180);
+  expect(screen[3 * W + 3] == 0x00ff00 && screen[3 * W + 2] == 0x00ff00 && screen[2 * W + 3] != 0);
+  expect(screen[2 * W + 2] == 0);
 }
 
 int main(void)
@@ -849,7 +899,8 @@ int main(void)
   test("layout signatures react to wrapping inputs only", layout_signatures_react_to_wrapping_inputs_only);
   test("clip-path shapes cover their own geometry", clip_shapes_cover_their_own_geometry);
   test("grid cells follow areas, lines and auto flow", grid_cells_follow_areas_lines_and_auto_flow);
-  test("flip rect mirrors in place", flip_rect_mirrors_in_place);
+  test("affine draw places pixels through the map", affine_draw_places_pixels_through_the_map);
+  test("affine draw of ARGB blends by alpha", affine_draw_argb_blends_by_alpha);
   test("object-fit places the image in its box", object_fit_places_the_image_in_its_box);
   test("filter colours follow the CSS functions", filter_colours_follow_the_css_functions);
   return 0;

@@ -205,20 +205,25 @@ struct css_style {
   signed char va_kind;        /* vertical-align: enum css_valign, -1 unset */
   short va_len;               /* CSS_VA_LEN: px raised (negative lowers) */
   signed char bg_clip;        /* background-clip: 0 border-box, 1 padding-box, 2 content-box, -1 unset */
-  signed char sb_none;        /* scrollbar-width: 1 none, 0 auto/thin, -1 unset */
+  short sb_w;                 /* scrollbar-width: px (0 none, 6 thin), -2 auto, -1 unset */
+  int sb_thumb, sb_track;     /* scrollbar-color 0xRRGGBB, -2 auto, -1 unset */
   signed char tab_size;       /* tab-size in spaces (1..16), -1 unset (inherited) */
   signed char user_select;    /* 1 auto/text, 0 none, -1 unset (inherited) */
   signed char cursor;         /* enum css_cursor, -1 unset (inherited) */
   /* transform: only translate renders; scale and rotate parse to nothing */
-  signed char has_tr;      /* 1 when a translate is set, 0 none, -1 unset */
-  short tr_x, tr_y;        /* px */
-  short tr_xp, tr_yp;      /* percent of the border box width/height */
-  signed char tr_flip;     /* replaced elements: 1 mirror horizontally, 2 vertically (rotate(180deg), scale(-1)) */
-  short flt_bright;        /* filter brightness permille (1000 identity), -1 unset */
-  signed char flt_gray;    /* filter grayscale 0..100 percent, -1 unset */
-  signed char flt_invert;  /* filter invert 0..100 percent, -1 unset */
-  signed char flt_opacity; /* filter opacity 0..100 percent, -1 unset */
-  signed char clip_kind;   /* enum css_clip, -1 unset */
+  signed char has_tr;             /* 1 when a translate is set, 0 none, -1 unset */
+  short tr_x, tr_y;               /* px */
+  short tr_xp, tr_yp;             /* percent of the border box width/height */
+  int tr_m[4];                    /* transform linear part a b c d, Q12: x' = a*x + c*y, y' = b*x + d*y */
+  signed char tr_mat;             /* 1 when the linear part is not the identity (rotate, scale, skew, matrix) */
+  short tr_ox, tr_oy;             /* transform-origin: px ... */
+  short tr_oxp, tr_oyp;           /* ... plus percent of the border box (default 50%) */
+  signed char tr_org;             /* 1 when transform-origin is set, -1 unset */
+  short flt_bright;               /* filter brightness permille (1000 identity), -1 unset */
+  signed char flt_gray;           /* filter grayscale 0..100 percent, -1 unset */
+  signed char flt_invert;         /* filter invert 0..100 percent, -1 unset */
+  signed char flt_opacity;        /* filter opacity 0..100 percent, -1 unset */
+  signed char clip_kind;          /* enum css_clip, -1 unset */
   short clip_v[CSS_CLIP_PTS * 2]; /* inset: t r b l round | circle: r cx cy | ellipse: rx ry cx cy | polygon x y pairs;
                                      percent*10 or px */
   signed char clip_unit[CSS_CLIP_PTS * 2]; /* 0 px, 1 percent for each clip_v */
@@ -324,6 +329,14 @@ int css_sheet_has_pseudo(const css_sheet *sheet);
 /* ::selection: 1 if the sheet has such a rule; css_selection_color gives the background `el`'s selected text gets. */
 int css_sheet_has_selection(const css_sheet *sheet);
 int css_selection_color(css_sheet *sheet, const struct dom_node *el, unsigned *rgb);
+
+/* ::-webkit-scrollbar, -thumb and -track rules on `el` (the root scroller): width, colours (0xRRGGBB) and the thumb's
+ * corner radius, each -1 where unset; returns 1 if any rule applies. */
+struct css_sbparts {
+  int width, track, thumb, radius;
+  bool hidden; /* display:none on ::-webkit-scrollbar */
+};
+int css_scrollbar_parts(css_sheet *sheet, const struct dom_node *el, struct css_sbparts *out);
 
 /* 1 if a ::marker or ::-webkit-details-marker rule hides the list or disclosure marker of `el` (display:none). */
 int css_marker_hidden(css_sheet *sheet, const struct dom_node *el);

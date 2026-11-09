@@ -25,6 +25,10 @@ struct lext {
   signed char clip_kind, clip_n;
   short clip_v[CSS_CLIP_PTS * 2];
   signed char clip_unit[CSS_CLIP_PTS * 2];
+  /* a transform with a linear part (rotate, scale, skew): painted after the fact, so layout never sees it */
+  unsigned char mat;
+  int m[4];               /* Q12 a b c d */
+  short ox, oy, oxp, oyp; /* transform-origin: px and percent of the border box */
 };
 
 struct lbox {
@@ -88,8 +92,9 @@ struct lbox {
   int cx, cy, cw, ch; /* content box (inside border + padding) */
 };
 
-void layout_reset(void); /* start a fresh tree for a new walk */
-void layout_free(void);  /* drop the tree (page teardown) */
+void layout_reset(void);                 /* start a fresh tree for a new walk */
+int layout_rot_boxes(int *out, int max); /* outermost boxes with a rotate/scale/skew transform, in tree order */
+void layout_free(void);                  /* drop the tree (page teardown) */
 /* HTML-walk hooks */
 void layout_box_open(struct dom_node *el, const struct css_style *cs, int t0);
 void layout_box_close(int t1);

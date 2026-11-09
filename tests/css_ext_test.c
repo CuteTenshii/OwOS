@@ -76,8 +76,13 @@ static void check_text(void)
   struct css_style s = parse("visibility: hidden; text-overflow: ellipsis; object-fit: cover; pointer-events: none");
   expect(s.visibility == 0 && s.text_ovf == 1 && s.obj_fit == CSS_OF_COVER && s.pointer_events == 0);
   expect_eq(parse("tab-size: 2").tab_size, 2);
-  expect_eq(parse("scrollbar-width: none").sb_none, 1);
-  expect_eq(parse("scrollbar-width: thin").sb_none, 0);
+  expect_eq(parse("scrollbar-width: none").sb_w, 0);
+  expect_eq(parse("scrollbar-width: thin").sb_w, 6);
+  expect_eq(parse("scrollbar-width: auto").sb_w, -2);
+  expect_eq(parse("scrollbar-color: #102030 #405060").sb_thumb, 0x102030);
+  expect_eq(parse("scrollbar-color: #102030 #405060").sb_track, 0x405060);
+  expect_eq(parse("scrollbar-color: auto").sb_thumb, -2);
+  expect_eq(parse("scrollbar-color: red").sb_thumb, -1);
   expect_eq(parse("tab-size: 0").tab_size, 0);
   s = parse("user-select: none");
   expect(s.user_select == 0);
@@ -105,14 +110,34 @@ static void check_transform(void)
   s = parse("transform: translate(5px); transform: none");
   expect(s.has_tr == 0 && s.tr_x == 0);
   s = parse("transform: rotate(180deg)");
-  expect(s.has_tr == 0 && s.tr_flip == 3);
-  expect_eq(parse("transform: scaleX(-1)").tr_flip, 1);
-  expect_eq(parse("transform: scale(1, -1)").tr_flip, 2);
-  expect_eq(parse("transform: scale(-1)").tr_flip, 3);
-  expect_eq(parse("transform: rotate(180deg) scaleX(-1)").tr_flip, 2);
-  expect_eq(parse("transform: rotate(90deg)").tr_flip, 0);
-  expect_eq(parse("transform: scale(2)").tr_flip, 0);
-  expect_eq(parse("rotate: 0.5turn").tr_flip, 3);
+  expect(s.has_tr == 1 && s.tr_mat == 1 && s.tr_m[0] == -4096 && s.tr_m[3] == -4096);
+  s = parse("transform: rotate(90deg)");
+  expect(s.tr_mat && s.tr_m[0] == 0 && s.tr_m[1] == 4096 && s.tr_m[2] == -4096 && s.tr_m[3] == 0);
+  s = parse("transform: scale(2, 0.5)");
+  expect(s.tr_mat && s.tr_m[0] == 8192 && s.tr_m[3] == 2048 && s.tr_m[1] == 0);
+  s = parse("transform: translate(10px, 20px) rotate(180deg)"); /* the rotation acts on the point first */
+  expect(s.tr_x == 10 && s.tr_y == 20 && s.tr_m[0] == -4096);
+  s = parse("transform: scale(2) translate(10px, 5px)"); /* a scaled translation */
+  expect(s.tr_x == 20 && s.tr_y == 10 && s.tr_m[0] == 8192);
+  s = parse("transform: translate(-50%, -50%) scale(2)");
+  expect(s.tr_xp == -50 && s.tr_yp == -50);
+  s = parse("transform: skewX(45deg)");
+  expect(s.tr_m[2] == 4096 && s.tr_m[1] == 0);
+  s = parse("transform: matrix(1, 0, 0, 1, 7, 9)");
+  expect(!s.tr_mat && s.tr_x == 7 && s.tr_y == 9);
+  expect_eq(parse("rotate: 0.5turn").tr_m[0], -4096);
+  s = parse("scale: -1 1");
+  expect(s.tr_m[0] == -4096 && s.tr_m[3] == 4096);
+  s = parse("transform: rotate(45deg)");
+  expect(s.tr_m[0] == 2896 && s.tr_m[1] == 2896 && s.tr_m[2] == -2896);
+  s = parse("transform-origin: left top");
+  expect(s.tr_org == 1 && s.tr_oxp == 0 && s.tr_oyp == 0);
+  s = parse("transform-origin: 10px 25%");
+  expect(s.tr_ox == 10 && s.tr_oxp == 0 && s.tr_oyp == 25);
+  s = parse("transform-origin: bottom");
+  expect(s.tr_oyp == 100 && s.tr_oxp == 50);
+  s = parse("transform-origin: right center");
+  expect(s.tr_oxp == 100 && s.tr_oyp == 50);
 }
 
 static void check_filter(void)
@@ -299,6 +324,33 @@ static void check_marker_and_clip(void)
   expect_eq(parse("background-clip: text").bg_clip, -1);
 }
 
+static void check_scrollbar_rules(void)
+{
+  const char *html = "<html><body><p>x</p></body></html>";
+  struct dom_node *doc = dom_parse(html, (int)strlen(html));
+  struct dom_node *body = doc->first_child->first_child;
+  while (body && strcmp(body->tag, "body"))
+    body = body->next;
+  css_sheet *sh = css_new();
+  const char *css = "::-webkit-scrollbar{width:7px;background:#112233} ::-webkit-scrollbar-thumb{background:#445566;"
+                    "border-radius:3px} ::-webkit-scrollbar-track{background:#778899}";
+  css_add(sh, css, (int)strlen(css), "http://t/");
+  struct css_sbparts p;
+  expect(css_scrollbar_parts(sh, body, &p));
+  expect(p.width == 7 && p.thumb == 0x445566 && p.radius == 3 && p.track == 0x778899 && !p.hidden);
+  css_free(sh);
+  sh = css_new();
+  css = "body::-webkit-scrollbar{display:none}";
+  css_add(sh, css, (int)strlen(css), "http://t/");
+  expect(css_scrollbar_parts(sh, body, &p) && p.hidden);
+  css_free(sh);
+  sh = css_new();
+  css_add(sh, "p{color:red}", 12, "http://t/");
+  expect(!css_scrollbar_parts(sh, body, &p));
+  css_free(sh);
+  dom_free(doc);
+}
+
 int main(void)
 {
   test("grid-template areas", check_areas);
@@ -318,6 +370,7 @@ int main(void)
   test("hover, pointer and motion media features", check_media_features);
   test("@supports", check_supports);
   test("::selection", check_selection);
+  test("::-webkit-scrollbar rules", check_scrollbar_rules);
   test("::marker and background-clip", check_marker_and_clip);
   test("letter-spacing and vertical-align", check_spacing);
   test("content strings and attr()", check_content);

@@ -5,8 +5,14 @@ extern int BW, BH;
 static unsigned *g_surface;
 static int g_surface_px;
 
+static unsigned *g_redirect;
+
+void browser_surface_redirect(unsigned *to) { g_redirect = to; }
+
 unsigned *browser_surface(void)
 {
+  if (g_redirect)
+    return g_redirect;
   int need = BW * BH;
   if (need > g_surface_px) {
     unsigned *n = realloc(g_surface, (unsigned)need * 4);

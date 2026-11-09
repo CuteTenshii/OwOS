@@ -205,7 +205,18 @@ static void img_box_style(struct inl_img *im, const struct css_style *cs)
     im->ch = (int)((long)im->cw * 1000 / cs->aspect);
   im->fit = cs->obj_fit > 0 ? cs->obj_fit : 0;
   im->hidden = sty_cur.hidden;
-  im->flip = cs->tr_flip;
+  im->xf.on = cs->has_tr == 1;
+  if (im->xf.on) {
+    memcpy(im->xf.m, cs->tr_m, sizeof im->xf.m);
+    im->xf.tx = cs->tr_x;
+    im->xf.ty = cs->tr_y;
+    im->xf.txp = cs->tr_xp;
+    im->xf.typ = cs->tr_yp;
+    im->xf.ox = cs->tr_ox;
+    im->xf.oy = cs->tr_oy;
+    im->xf.oxp = cs->tr_oxp;
+    im->xf.oyp = cs->tr_oyp;
+  }
   im->fbright = cs->flt_bright >= 0 ? cs->flt_bright : 1000;
   im->fgray = cs->flt_gray >= 0 ? cs->flt_gray : 0;
   im->finvert = cs->flt_invert >= 0 ? cs->flt_invert : 0;

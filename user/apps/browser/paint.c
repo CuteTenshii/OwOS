@@ -643,6 +643,28 @@ void paint_overlay_boxes(const struct lovl *ov, int py, int pw, int ct, int cb, 
   }
 }
 
+struct paint_gate g_gate = {0, -1, {{0}}};
+
+static bool gate_in(int k, int v, bool box)
+{
+  return box ? v >= g_gate.r[k].box0 && v < g_gate.r[k].box1 : v >= g_gate.r[k].t0 && v < g_gate.r[k].t1;
+}
+
+/* False for what the current pass must not paint: transformed subtrees on the page pass, everything else on
+ * a subtree's own pass. */
+static bool gate_pass(int v, bool box)
+{
+  if (g_gate.only >= 0)
+    return gate_in(g_gate.only, v, box);
+  for (int k = 0; k < g_gate.n; k++)
+    if (gate_in(k, v, box))
+      return false;
+  return true;
+}
+
+bool gate_box(int i) { return gate_pass(i, true); }
+bool gate_text(int off) { return gate_pass(off, false); }
+
 /* Paint every box that touches the band [ct,cb) */
 void paint_boxes(int py, int pw, int ct, int cb)
 {
@@ -658,7 +680,7 @@ void paint_boxes(int py, int pw, int ct, int cb)
     ru_bands_span(&o->bands, band, vtop, vbot, &lo, &hi);
     for (int p = lo; p < hi; p++) {
       int i = o->bands.idx[p];
-      if (o->n_ov && in_overlay(o, bx, i))
+      if ((o->n_ov && in_overlay(o, bx, i)) || !gate_box(i))
         continue;
       int top, bot;
       box_extent(&bx[i], &o->geo[i], &top, &bot);

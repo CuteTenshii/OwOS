@@ -931,23 +931,121 @@ static inline int ru_grid_place(int ncols, int nit, int *col, int *row, int *cs,
   return nrows;
 }
 
-/* Mirror a w x h block of pixels in place: fx left-right, fy top-bottom. */
-static inline void ru_flip_rect(unsigned *px, int stride, int w, int h, bool fx, bool fy)
+/* ---- affine transforms of rendered blocks ---- */
+
+/* x' = C + T + L (x - C): linear part [a c; b d] about the absolute point (cx,cy), then translated by (tx,ty). */
+struct ru_xf {
+  double a, b, c, d;
+  double cx, cy, tx, ty;
+};
+
+static inline int ru_ifloor(double v)
 {
-  if (fy)
-    for (int y = 0; y < h / 2; y++)
-      for (int x = 0; x < w; x++) {
-        unsigned t = px[(long)y * stride + x];
-        px[(long)y * stride + x] = px[(long)(h - 1 - y) * stride + x];
-        px[(long)(h - 1 - y) * stride + x] = t;
+  int i = (int)v;
+  return v < (double)i ? i - 1 : i;
+}
+
+/* Pixel bounds [*x0,*x1) x [*y0,*y1) of the w x h block at (bx,by) after the map. */
+static inline void ru_xf_bounds(const struct ru_xf *xf, int bx, int by, int w, int h, int *x0, int *y0, int *x1,
+                                int *y1)
+{
+  double minx = 1e18, miny = 1e18, maxx = -1e18, maxy = -1e18;
+  for (int k = 0; k < 4; k++) {
+    double px = bx + (k & 1 ? w : 0) - xf->cx, py = by + (k & 2 ? h : 0) - xf->cy;
+    double x = xf->cx + xf->tx + xf->a * px + xf->c * py, y = xf->cy + xf->ty + xf->b * px + xf->d * py;
+    minx = x < minx ? x : minx;
+    maxx = x > maxx ? x : maxx;
+    miny = y < miny ? y : miny;
+    maxy = y > maxy ? y : maxy;
+  }
+  *x0 = ru_ifloor(minx);
+  *x1 = ru_ifloor(maxx) + 1;
+  *y0 = ru_ifloor(miny);
+  *y1 = ru_ifloor(maxy) + 1;
+}
+
+/* Draw a w x h block through `xf`. The block's pixel (x,y) is src[(by + y) * sstride + bx + x]; it counts as drawn
+ * only where it differs from bg[y * w + x] (the backdrop it was painted over), so transparent areas stay untouched.
+ * Pixel (x,y) of the block sits at absolute (bx + x, by + y), the coordinates `xf` is expressed in. Destination
+ * pixels are clipped to [cx0,cx1) x [cy0,cy1); each is supersampled 2x2 and blended by coverage. */
+static inline void ru_affine_draw(unsigned *dst, int dstride, int cx0, int cy0, int cx1, int cy1, const unsigned *src,
+                                  int sstride, const unsigned *bg, int bx, int by, int w, int h, const struct ru_xf *xf)
+{
+  double det = xf->a * xf->d - xf->b * xf->c;
+  if ((det < 1e-9 && det > -1e-9) || w <= 0 || h <= 0)
+    return;
+  double ia = xf->d / det, ib = -xf->b / det, ic = -xf->c / det, id = xf->a / det;
+  int x0, y0, x1, y1;
+  ru_xf_bounds(xf, bx, by, w, h, &x0, &y0, &x1, &y1);
+  x0 = x0 < cx0 ? cx0 : x0;
+  x1 = x1 > cx1 ? cx1 : x1;
+  y0 = y0 < cy0 ? cy0 : y0;
+  y1 = y1 > cy1 ? cy1 : y1;
+  for (int y = y0; y < y1; y++)
+    for (int x = x0; x < x1; x++) {
+      int n = 0;
+      unsigned sr = 0, sg = 0, sb = 0;
+      for (int s = 0; s < 4; s++) {
+        double dx = x + (s & 1 ? 0.75 : 0.25) - xf->cx - xf->tx, dy = y + (s & 2 ? 0.75 : 0.25) - xf->cy - xf->ty;
+        int u = ru_ifloor(xf->cx + ia * dx + ic * dy) - bx, v = ru_ifloor(xf->cy + ib * dx + id * dy) - by;
+        if (u < 0 || u >= w || v < 0 || v >= h)
+          continue;
+        unsigned p = src[(long)(by + v) * sstride + bx + u];
+        if (p == bg[(long)v * w + u])
+          continue;
+        sr += (p >> 16) & 0xff;
+        sg += (p >> 8) & 0xff;
+        sb += p & 0xff;
+        n++;
       }
-  if (fx)
-    for (int y = 0; y < h; y++)
-      for (int x = 0; x < w / 2; x++) {
-        unsigned t = px[(long)y * stride + x];
-        px[(long)y * stride + x] = px[(long)y * stride + w - 1 - x];
-        px[(long)y * stride + w - 1 - x] = t;
+      if (!n)
+        continue;
+      unsigned *d = dst + (long)y * dstride + x;
+      unsigned dr = (*d >> 16) & 0xff, dg = (*d >> 8) & 0xff, db = *d & 0xff;
+      unsigned er = (sr / n * n + dr * (4 - n)) / 4, eg = (sg / n * n + dg * (4 - n)) / 4,
+               eb = (sb / n * n + db * (4 - n)) / 4;
+      *d = (er << 16) | (eg << 8) | eb;
+    }
+}
+
+/* Draw the w x h block of 0xAARRGGBB pixels (straight alpha, stride w) placed at absolute (bx,by) through `xf`,
+ * 2x2 supersampled and blended onto dst within [cx0,cx1) x [cy0,cy1). */
+static inline void ru_affine_draw_argb(unsigned *dst, int dstride, int cx0, int cy0, int cx1, int cy1,
+                                       const unsigned *argb, int w, int h, int bx, int by, const struct ru_xf *xf)
+{
+  double det = xf->a * xf->d - xf->b * xf->c;
+  if ((det < 1e-9 && det > -1e-9) || w <= 0 || h <= 0)
+    return;
+  double ia = xf->d / det, ib = -xf->b / det, ic = -xf->c / det, id = xf->a / det;
+  int x0, y0, x1, y1;
+  ru_xf_bounds(xf, bx, by, w, h, &x0, &y0, &x1, &y1);
+  x0 = x0 < cx0 ? cx0 : x0;
+  x1 = x1 > cx1 ? cx1 : x1;
+  y0 = y0 < cy0 ? cy0 : y0;
+  y1 = y1 > cy1 ? cy1 : y1;
+  for (int y = y0; y < y1; y++)
+    for (int x = x0; x < x1; x++) {
+      unsigned asum = 0, rs = 0, gs = 0, bs = 0;
+      for (int s = 0; s < 4; s++) {
+        double dx = x + (s & 1 ? 0.75 : 0.25) - xf->cx - xf->tx, dy = y + (s & 2 ? 0.75 : 0.25) - xf->cy - xf->ty;
+        int u = ru_ifloor(xf->cx + ia * dx + ic * dy) - bx, v = ru_ifloor(xf->cy + ib * dx + id * dy) - by;
+        if (u < 0 || u >= w || v < 0 || v >= h)
+          continue;
+        unsigned p = argb[(long)v * w + u], a = p >> 24;
+        asum += a;
+        rs += ((p >> 16) & 0xff) * a;
+        gs += ((p >> 8) & 0xff) * a;
+        bs += (p & 0xff) * a;
       }
+      if (!asum)
+        continue;
+      unsigned *d = dst + (long)y * dstride + x;
+      unsigned cov = asum / 4; /* 0..255: mean alpha over the four samples */
+      unsigned sr = rs / asum, sg = gs / asum, sb = bs / asum;
+      unsigned dr = (*d >> 16) & 0xff, dg = (*d >> 8) & 0xff, db = *d & 0xff;
+      *d = (((sr * cov + dr * (255 - cov)) / 255) << 16) | (((sg * cov + dg * (255 - cov)) / 255) << 8) |
+           ((sb * cov + db * (255 - cov)) / 255);
+    }
 }
 
 #endif /* OWOS_RENDER_UTIL_H */

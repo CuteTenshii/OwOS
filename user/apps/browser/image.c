@@ -357,8 +357,8 @@ static const struct ru_img *imgc_get(struct inl_img *im, unsigned dw, unsigned d
 
 /* The plain blit of the fitted image (fw x fh at ox,oy in a dw x dh box at x0,y0) into rows [ry0,ry1), columns [lo,hi).
  */
-static void blit_image(struct inl_img *im, unsigned *fb, int x0, int y0, int dw, int dh, int fw, int fh, int ox, int oy,
-                       int ry0, int ry1, unsigned lo, unsigned hi, int ct, int cb)
+static bool blit_image(struct inl_img *im, unsigned *fb, int stride, int x0, int y0, int dw, int dh, int fw, int fh,
+                       int ox, int oy, int ry0, int ry1, unsigned lo, unsigned hi, int ct, int cb)
 {
   /* SVGs and animated frames live raw in img_pool */
   if (im->is_argb) {
@@ -368,26 +368,83 @@ static void blit_image(struct inl_img *im, unsigned *fb, int x0, int y0, int dw,
     const unsigned *xm = xmap_get((unsigned)fw, im->iw);
     for (int ry = ry0; ry < ry1; ry++) {
       const unsigned char *srow = src + (unsigned long)((unsigned)(ry - oy) * im->ih / (unsigned)fh) * im->iw * 4;
-      ru_blit_row_rgba(fb + (long)(y0 + ry) * BW + x0 + ox, srow, xm, (unsigned)fw, im->iw, lo, hi);
+      ru_blit_row_rgba(fb + (long)(y0 + ry) * stride + x0 + ox, srow, xm, (unsigned)fw, im->iw, lo, hi);
     }
-    return;
+    return true;
   }
   const struct ru_img *c = imgc_get(im, (unsigned)fw, (unsigned)fh);
   if (c) {
     const unsigned *xm = c->cw == (unsigned)fw ? 0 : xmap_get((unsigned)fw, c->cw);
     for (int ry = ry0; ry < ry1; ry++) {
       const unsigned *srow = c->px + (unsigned long)((unsigned)(ry - oy) * c->ch / (unsigned)fh) * c->cw;
-      ru_blit_row_words(fb + (long)(y0 + ry) * BW + x0 + ox, srow, xm, (unsigned)fw, c->cw, c->opaque, lo, hi);
+      ru_blit_row_words(fb + (long)(y0 + ry) * stride + x0 + ox, srow, xm, (unsigned)fw, c->cw, c->opaque, lo, hi);
     }
-    return;
+    return true;
   }
-  /* Fallback (too large to hold / decode failed): stream it once, filling the box. */
+  /* Fallback (too large to hold / decode failed): stream it once to the window, filling the box. */
+  if (fb != browser_surface())
+    return false;
   unsigned flo, fhi;
   if (!clip_cols(x0, (unsigned)dw, &flo, &fhi))
-    return;
+    return true;
   struct inlblit v = {x0, y0, dw, dh, ct, cb, im->iw, im->ih, 0, xmap_get((unsigned)dw, im->iw), flo, fhi};
   struct poolrd r = {0, im->coff, im->clen};
   png_decode(poolrd_get, &r, inl_row, &v, 0, 0);
+  return true;
+}
+
+/* An image under a transform: painted over black and over white to recover each pixel's alpha, then drawn through the
+ * map. False when the image cannot be painted off-screen, so the caller draws it plainly. */
+static bool draw_transformed(struct inl_img *im, int x, int y, int fw, int fh, int ct, int cb)
+{
+  unsigned long n = (unsigned long)fw * (unsigned long)fh;
+  unsigned *over_black = malloc(n * 4 * 2);
+  if (!over_black)
+    return false;
+  unsigned *over_white = over_black + n;
+  for (unsigned long i = 0; i < n; i++) {
+    over_black[i] = 0;
+    over_white[i] = 0xffffff;
+  }
+  if (!blit_image(im, over_black, fw, 0, 0, fw, fh, fw, fh, 0, 0, 0, fh, 0, (unsigned)fw, 0, fh) ||
+      !blit_image(im, over_white, fw, 0, 0, fw, fh, fw, fh, 0, 0, 0, fh, 0, (unsigned)fw, 0, fh)) {
+    free(over_black);
+    return false;
+  }
+  struct lext fe;
+  memset(&fe, 0, sizeof fe);
+  fe.flt_bright = im->fbright;
+  fe.flt_gray = im->fgray;
+  fe.flt_invert = im->finvert;
+  bool filt = im->fbright != 1000 || im->fgray || im->finvert;
+  for (unsigned long i = 0; i < n; i++) { /* black: c*a, white: c*a + 255*(1-a) */
+    unsigned b = over_black[i], w = over_white[i], d = 0;
+    for (int sh = 0; sh < 24; sh += 8) {
+      unsigned dc = ((w >> sh) & 0xff) - ((b >> sh) & 0xff);
+      d = dc > d ? dc : d;
+    }
+    unsigned a = 255 - d, c = 0;
+    if (a) {
+      for (int sh = 0; sh < 24; sh += 8) {
+        unsigned v = ((b >> sh) & 0xff) * 255 / a;
+        c |= (v > 255 ? 255 : v) << sh;
+      }
+      if (filt)
+        c = ru_filter_rgb(&fe, c);
+    }
+    over_black[i] = (a << 24) | c;
+  }
+  struct ru_xf xf = {im->xf.m[0] / 4096.0,
+                     im->xf.m[1] / 4096.0,
+                     im->xf.m[2] / 4096.0,
+                     im->xf.m[3] / 4096.0,
+                     x + im->xf.ox + im->xf.oxp * fw / 100.0,
+                     y + im->xf.oy + im->xf.oyp * fh / 100.0,
+                     im->xf.tx + im->xf.txp * fw / 100.0,
+                     im->xf.ty + im->xf.typ * fh / 100.0};
+  ru_affine_draw_argb(browser_surface(), BW, 0, ct, BW, cb, over_black, fw, fh, x, y, &xf);
+  free(over_black);
+  return true;
 }
 
 void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
@@ -426,8 +483,8 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
   if (ry1 > oy + fh)
     ry1 = oy + fh;
 
-  bool fx = im->flip & 1, fy = im->flip & 2;
-  bool flip = (fx || fy) && lo == 0 && hi == (unsigned)fw && ry0 == oy && ry1 == oy + fh; /* whole image on screen */
+  if (im->xf.on && draw_transformed(im, x0 + ox, y0 + oy, fw, fh, ct, cb))
+    return;
   bool filt = im->fbright != 1000 || im->fgray || im->finvert;
   int vw = (int)(hi - lo), vh = ry1 - ry0;
   unsigned *base = fb + (long)(y0 + ry0) * BW + x0 + ox + lo;
@@ -435,12 +492,7 @@ void draw_inline_image(struct inl_img *im, int py, int ct, int cb, int paw)
   if (save)
     for (int r = 0; r < vh; r++)
       memcpy(save + (long)r * vw, base + (long)r * BW, (unsigned long)vw * 4);
-  /* Mirroring the backdrop first and the result after puts the image mirrored over an unmirrored backdrop. */
-  if (flip)
-    ru_flip_rect(fb + (long)(y0 + oy) * BW + x0 + ox, BW, fw, fh, fx, fy);
-  blit_image(im, fb, x0, y0, dw, dh, fw, fh, ox, oy, ry0, ry1, lo, hi, ct, cb);
-  if (flip)
-    ru_flip_rect(fb + (long)(y0 + oy) * BW + x0 + ox, BW, fw, fh, fx, fy);
+  blit_image(im, fb, BW, x0, y0, dw, dh, fw, fh, ox, oy, ry0, ry1, lo, hi, ct, cb);
   if (save) { /* pixels the blit changed are the image's; filter those and leave the backdrop alone */
     struct lext fe;
     memset(&fe, 0, sizeof fe);

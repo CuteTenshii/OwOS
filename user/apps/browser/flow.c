@@ -6,7 +6,7 @@ int browser_range_box(int start, int end, int *ox, int *oy, int *ow, int *oh)
   *ox = *oy = *ow = *oh = 0;
   if (end <= start)
     end = start + 1; /* zero-width span: one anchor cell */
-  int paw = (BW - SCROLL_W) - 8;
+  int paw = (BW - PAGE_SCROLL_W) - 8;
   if (paw < 8)
     paw = 8;
 
@@ -105,7 +105,7 @@ void browser_viewport_px(int *w, int *h)
   int py, phh, rows;
   pane_metrics(&py, &phh, &rows);
   if (w) {
-    int vw = BW - SCROLL_W;
+    int vw = BW - PAGE_SCROLL_W;
     *w = vw > 0 ? vw : 0;
   }
   if (h)
@@ -844,7 +844,7 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
       dy = -b->off_b;
   }
 
-  if (b->ext) /* transform: translate; the vertical part moves the box at the end, like top: */
+  if (b->ext && !b->ext->mat) /* translate; the vertical part moves the box at the end, like top: */
     box_x += b->ext->tr_x + b->ext->tr_xp * box_w / 100;
 
   int content_x = box_x + b->border.l + b->padding.l;
@@ -899,7 +899,7 @@ static void flow_box(struct lbox *bx, int idx, int x, int avail_w)
   int box_bot_y = lt_doc_px(&g_bk->lt);
   add_blank_px(max0(b->margin.b), b->t1, box_x, box_w);
 
-  if (b->ext)
+  if (b->ext && !b->ext->mat)
     dy += b->ext->tr_y + b->ext->tr_yp * (box_bot_y - box_top_y) / 100;
   g->y = box_top_y + dy;
   g->h = box_bot_y - box_top_y;

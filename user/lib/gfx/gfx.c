@@ -925,11 +925,13 @@ int slider_value(int x, int w, int mx, int max)
 #define SCROLL_ARROW_FG 0x4a5564u /* arrowhead */
 #define SCROLL_MIN_THUMB 12       /* keep the thumb grabbable */
 
+const struct scrollbar_style SCROLLBAR_DEFAULT = {-1, -1, 0, 1};
+
 /* Square arrow-button height for a w-wide, h-tall bar */
-static int scrollbar_arrow_h(int w, int h)
+static int scrollbar_arrow_h(int w, int h, const struct scrollbar_style *st)
 {
   int a = w;
-  if (a < 4 || h < 2 * a + SCROLL_MIN_THUMB)
+  if (!st->arrows || a < 4 || h < 2 * a + SCROLL_MIN_THUMB)
     return 0;
   return a;
 }
@@ -970,12 +972,14 @@ static void scrollbar_tri(int bx, int by, int w, int a, int up, unsigned color)
   }
 }
 
-void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible)
+void scrollbar_draw_ex(int x, int y, int w, int h, int scroll, int total, int visible, const struct scrollbar_style *st)
 {
-  int a = scrollbar_arrow_h(w, h);
+  int a = scrollbar_arrow_h(w, h, st);
   int tr = h - 2 * a; /* track region height */
+  unsigned track = st->track >= 0 ? (unsigned)st->track : SCROLL_TRACK;
+  unsigned thumb = st->thumb >= 0 ? (unsigned)st->thumb : SCROLL_THUMB;
 
-  gfx_fill_rect(x, y, w, h, SCROLL_TRACK);
+  gfx_fill_rect(x, y, w, h, track);
   if (a > 0) {
     gfx_fill_rect(x, y, w, a, SCROLL_ARROW_BG);         /* up box */
     gfx_fill_rect(x, y + h - a, w, a, SCROLL_ARROW_BG); /* down box */
@@ -985,15 +989,30 @@ void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visib
   if (total > visible && visible > 0 && tr > 0 && w > 2) {
     int th, ty;
     scrollbar_thumb(tr, scroll, total, visible, &th, &ty);
-    gfx_fill_rect(x + 1, y + a + ty, w - 2, th, SCROLL_THUMB);
+    int inset = st->arrows || st->thumb >= 0 ? 1 : 0, tw = w - 2 * inset, r = st->radius;
+    if (r * 2 > tw)
+      r = tw / 2;
+    if (r * 2 > th)
+      r = th / 2;
+    for (int row = 0; row < th; row++) { /* a rounded thumb trims each end row by the corner arc */
+      int d = row < r ? r - row : row >= th - r ? row - (th - 1 - r) : 0, cut = 0;
+      for (; d > 0 && (r - cut - 1) * (r - cut - 1) + d * d > r * r; cut++)
+        ;
+      gfx_fill_rect(x + inset + cut, y + a + ty + row, tw - 2 * cut, 1, thumb);
+    }
   }
 }
 
-int scrollbar_hit(int x, int y, int w, int h, int mx, int my)
+void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible)
+{
+  scrollbar_draw_ex(x, y, w, h, scroll, total, visible, &SCROLLBAR_DEFAULT);
+}
+
+int scrollbar_hit_ex(int x, int y, int w, int h, int mx, int my, const struct scrollbar_style *st)
 {
   if (mx < x || mx >= x + w || my < y || my >= y + h)
     return SCROLLBAR_NONE;
-  int a = scrollbar_arrow_h(w, h);
+  int a = scrollbar_arrow_h(w, h, st);
   if (a > 0) {
     if (my < y + a)
       return SCROLLBAR_UP;
@@ -1003,14 +1022,20 @@ int scrollbar_hit(int x, int y, int w, int h, int mx, int my)
   return SCROLLBAR_TRACK;
 }
 
-int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible)
+int scrollbar_hit(int x, int y, int w, int h, int mx, int my)
 {
-  if (scrollbar_hit(x, y, w, h, mx, my) != SCROLLBAR_TRACK)
+  return scrollbar_hit_ex(x, y, w, h, mx, my, &SCROLLBAR_DEFAULT);
+}
+
+int scrollbar_pos_ex(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible,
+                     const struct scrollbar_style *st)
+{
+  if (scrollbar_hit_ex(x, y, w, h, mx, my, st) != SCROLLBAR_TRACK)
     return scroll;
   int maxs = total - visible;
   if (maxs <= 0)
     return 0;
-  int a = scrollbar_arrow_h(w, h);
+  int a = scrollbar_arrow_h(w, h, st);
   int tr = h - 2 * a; /* track region height */
   if (tr <= 0)
     return scroll;
@@ -1024,6 +1049,11 @@ int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int to
   if (s > maxs)
     s = maxs;
   return s;
+}
+
+int scrollbar_pos(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible)
+{
+  return scrollbar_pos_ex(x, y, w, h, mx, my, scroll, total, visible, &SCROLLBAR_DEFAULT);
 }
 
 void gfx_get_clip(int *x, int *y, int *w, int *h)

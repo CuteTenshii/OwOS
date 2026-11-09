@@ -339,6 +339,21 @@ int slider_value(int x, int w, int mx, int max);
  * a track grab. */
 enum { SCROLLBAR_NONE = 0, SCROLLBAR_UP, SCROLLBAR_DOWN, SCROLLBAR_TRACK };
 
+/* Look of a scrollbar: track and thumb colours (0xRRGGBB, -1 = the default), thumb corner radius, and whether the
+ * arrow buttons are shown. The plain functions below use SCROLLBAR_DEFAULT; the _ex forms take a style and must be
+ * given the same one for drawing and hit-testing. */
+struct scrollbar_style {
+  int track, thumb;
+  int radius;
+  int arrows;
+};
+extern const struct scrollbar_style SCROLLBAR_DEFAULT;
+void scrollbar_draw_ex(int x, int y, int w, int h, int scroll, int total, int visible,
+                       const struct scrollbar_style *st);
+int scrollbar_hit_ex(int x, int y, int w, int h, int mx, int my, const struct scrollbar_style *st);
+int scrollbar_pos_ex(int x, int y, int w, int h, int mx, int my, int scroll, int total, int visible,
+                     const struct scrollbar_style *st);
+
 /* Draw the scrollbar filling [x,y,w,h]: arrows top/bottom, then the track and a
  * thumb reflecting scroll/total/visible (no thumb when everything fits). */
 void scrollbar_draw(int x, int y, int w, int h, int scroll, int total, int visible);

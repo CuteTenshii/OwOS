@@ -249,7 +249,7 @@ int main(int argc, char **argv)
     /* Publish the content-pane pixel width for the worker's line-table flow (must match render */
     {
       int right = devtools_visible() ? devtools_left() : BW;
-      int wpaw = right - SCROLL_W - 8;
+      int wpaw = right - PAGE_SCROLL_W - 8;
       if (wpaw < 8)
         wpaw = 8;
       B->want_paw = wpaw;

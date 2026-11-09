@@ -215,8 +215,12 @@ static void fold(struct css_style *out, const struct css_style *d)
   }
   if (d->bg_clip >= 0)
     out->bg_clip = d->bg_clip;
-  if (d->sb_none >= 0)
-    out->sb_none = d->sb_none;
+  if (d->sb_w != -1)
+    out->sb_w = d->sb_w;
+  if (d->sb_thumb != -1)
+    out->sb_thumb = d->sb_thumb;
+  if (d->sb_track != -1)
+    out->sb_track = d->sb_track;
   if (d->tab_size >= 0)
     out->tab_size = d->tab_size;
   if (d->cursor >= 0)
@@ -227,7 +231,15 @@ static void fold(struct css_style *out, const struct css_style *d)
     out->tr_y = d->tr_y;
     out->tr_xp = d->tr_xp;
     out->tr_yp = d->tr_yp;
-    out->tr_flip = d->tr_flip;
+    out->tr_mat = d->tr_mat;
+    memcpy(out->tr_m, d->tr_m, sizeof out->tr_m);
+  }
+  if (d->tr_org >= 0) {
+    out->tr_org = d->tr_org;
+    out->tr_ox = d->tr_ox;
+    out->tr_oy = d->tr_oy;
+    out->tr_oxp = d->tr_oxp;
+    out->tr_oyp = d->tr_oyp;
   }
   if (d->flt_bright >= 0)
     out->flt_bright = d->flt_bright;
@@ -1016,6 +1028,34 @@ int css_bg_argb(css_sheet *sh, const struct dom_node *el, unsigned *out)
     }
   }
   return 0;
+}
+
+/* Fold the rules of one scrollbar part for `el` into a style. */
+static void sb_fold(css_sheet *sh, const struct dom_node *el, int part, struct css_style *st)
+{
+  css_style_reset(st);
+  int nm = collect_matches(sh, el, part);
+  for (int i = 0; i < nm; i++)
+    fold(st, rule_decl(sh->match[i]));
+}
+
+int css_scrollbar_parts(css_sheet *sh, const struct dom_node *el, struct css_sbparts *out)
+{
+  out->width = out->track = out->thumb = out->radius = -1;
+  out->hidden = false;
+  if (!sh || !sh->has_scrollbar || !el || el->type != DOM_ELEMENT)
+    return 0;
+  ensure_vars(sh);
+  struct css_style bar, thumb, track;
+  sb_fold(sh, el, PE_SCROLLBAR, &bar);
+  sb_fold(sh, el, PE_SB_THUMB, &thumb);
+  sb_fold(sh, el, PE_SB_TRACK, &track);
+  out->hidden = bar.disp == CSS_DISP_NONE;
+  out->width = bar.width;
+  out->track = track.bg >= 0 ? track.bg : bar.bg;
+  out->thumb = thumb.bg;
+  out->radius = thumb.radius;
+  return out->hidden || out->width >= 0 || out->track >= 0 || out->thumb >= 0;
 }
 
 int css_marker_hidden(css_sheet *sh, const struct dom_node *el)

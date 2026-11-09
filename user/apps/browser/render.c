@@ -49,13 +49,11 @@ static void dim_rect(int x, int y, int w, int h, int ct, int cb, unsigned argb)
     }
 }
 
-/* The page scrollbar; with scrollbar-width:none its strip shows the canvas instead. */
-static void draw_page_scrollbar(int pw, int py, int phh)
+/* The page scrollbar (an empty one when total <= visible), unless the page hides it. */
+static void draw_page_scrollbar(int pw, int py, int phh, int scroll, int total, int visible)
 {
-  if (B->pg->sb_none)
-    gfx_fill_rect(pw, py, SCROLL_W, phh, B->pg->page_bg);
-  else
-    scrollbar_draw(pw, py, SCROLL_W, phh, B->pg->scroll, g_fr->doc_h, phh);
+  if (PAGE_SCROLL_W > 0)
+    scrollbar_draw_ex(pw, py, PAGE_SCROLL_W, phh, scroll, total, visible, &B->pg->sb_st);
 }
 
 /* Paint the position:fixed / top-layer boxes over the page, bottom to top */
@@ -98,20 +96,17 @@ static void paint_overlays(int py, int pw, int ct, int cb)
   }
 }
 
-/* Paint the page (box backgrounds, text, images, media) for the content-pane rows [ct,cb) */
-static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
+/* The page's box backgrounds, text, images and media for the rows [ct,cb) of the surface, through g_gate; `fill` first
+ * paints the canvas colour. */
+static void paint_page_core(int py, int pw, int ct, int cb, unsigned bg, bool fill)
 {
   const struct ltab *t = &g_fr->lt;
   int paw = pw - 8; /* content width, px */
   int sc = B->pg->scroll, vt = sc + (ct - py), vb = sc + (cb - py), over = g_fr->over;
   gfx_set_clip(0, ct, pw, cb - ct);
-  gfx_fill_rect(0, ct, pw, cb - ct, bg);
+  if (fill)
+    gfx_fill_rect(0, ct, pw, cb - ct, bg);
 
-  /* The worker owns the line-table flow (see worker_fn) */
-  if (!B->pg->text) {
-    g_fr->lt.n = 0;
-    B->layout_dirty = 1;
-  }
   paint_boxes(py, pw, ct, cb); /* block backgrounds behind the text */
   if (B->loading && t->n == 0) {
     gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
@@ -124,7 +119,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
     int sy = py + t->y[i] - sc;
     if (sy >= cb)
       break; /* below the band: done */
-    if (sy + t->h[i] + over <= ct || t->off[i] + t->len[i] > B->pg->text_len)
+    if (sy + t->h[i] + over <= ct || t->off[i] + t->len[i] > B->pg->text_len || !gate_text(t->off[i]))
       continue;
     draw_styled_line(t->x[i], sy, i, t->w[i], ct, cb);
   }
@@ -132,7 +127,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
   /* flex-row item text, drawn over the reserved band at each item's column */
   for (int q = 0; q < g_fr->n_fs; q++) {
     const struct fslice *f = &g_fr->fs[q];
-    if (f->row < 0 || f->row >= t->n || f->off + f->len > B->pg->text_len)
+    if (f->row < 0 || f->row >= t->n || f->off + f->len > B->pg->text_len || !gate_text(f->off))
       continue;
     int sy = py + t->y[f->row] - sc;
     if (sy + t->h[f->row] + over <= ct || sy >= cb)
@@ -143,7 +138,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
   /* inline images, over their reserved (blank) rows */
   for (int q = 0; q < B->pg->n_imgs; q++) {
     struct inl_img *im = &B->pg->imgs[q];
-    if (im->start_row < 0 || im->start_row >= t->n)
+    if (im->start_row < 0 || im->start_row >= t->n || !gate_text(im->text_pos))
       continue;
     int r1 = im->start_row + (im->rows > 0 ? im->rows : 1);
     if (r1 > t->n)
@@ -163,7 +158,7 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
   /* <audio>/<video> control widgets, over their reserved rows */
   for (struct media_el *me = media_doc_first(); me; me = media_doc_next(me)) {
     int sr = media_el_start_row(me);
-    if (sr < 0 || sr >= t->n)
+    if (sr < 0 || sr >= t->n || g_gate.only >= 0)
       continue;
     int r1 = sr + media_el_rows(me);
     if (r1 > t->n)
@@ -173,6 +168,96 @@ static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
       continue; /* off-screen */
     media_el_draw(me, 4, py + t->y[sr] - sc, paw, ct, cb);
   }
+}
+
+static unsigned *g_rot_buf; /* scratch surface a transformed subtree is painted into */
+static long g_rot_px;
+
+/* Paint each transformed box (rotate, scale, skew) apart from the page and draw it through its transform onto the
+ * rows [ct,cb) of the page just painted without it. */
+static void paint_rotated(int py, int pw, int ct, int cb, unsigned bg)
+{
+  int n;
+  const struct lbox *bx = layout_pool(&n);
+  if (!g_gate.n || n != g_fr->n_geo)
+    return;
+  int pane_y, phh, rows, sc = B->pg->scroll;
+  pane_metrics(&pane_y, &phh, &rows);
+  if ((long)BW * BH > g_rot_px) {
+    unsigned *nb = realloc(g_rot_buf, (unsigned long)BW * BH * 4);
+    if (!nb)
+      return;
+    g_rot_buf = nb;
+    g_rot_px = (long)BW * BH;
+  }
+  unsigned *real = browser_surface();
+  int count = g_gate.n;
+  for (int k = 0; k < count; k++) {
+    const struct lbox *b = &bx[g_gate.r[k].box0];
+    const struct lgeom *g = &g_fr->geo[g_gate.r[k].box0];
+    int sx0 = g->x, sy0 = py + g->y - sc;
+    int ex0 = sx0 < 0 ? 0 : sx0, ex1 = sx0 + g->w > pw ? pw : sx0 + g->w;
+    int er0 = sy0 < py ? py : sy0, er1 = sy0 + g->h > py + phh ? py + phh : sy0 + g->h;
+    if (ex1 <= ex0 || er1 <= er0)
+      continue;
+    const struct lext *x = b->ext;
+    struct ru_xf xf = {x->m[0] / 4096.0,
+                       x->m[1] / 4096.0,
+                       x->m[2] / 4096.0,
+                       x->m[3] / 4096.0,
+                       sx0 + x->ox + x->oxp * g->w / 100.0,
+                       sy0 + x->oy + x->oyp * g->h / 100.0,
+                       x->tr_x + x->tr_xp * g->w / 100.0,
+                       x->tr_y + x->tr_yp * g->h / 100.0};
+    int dx0, dy0, dx1, dy1;
+    ru_xf_bounds(&xf, ex0, er0, ex1 - ex0, er1 - er0, &dx0, &dy0, &dx1, &dy1);
+    if (dx1 <= 0 || dx0 >= pw || dy1 <= ct || dy0 >= cb)
+      continue;
+    unsigned *back = malloc((unsigned long)(ex1 - ex0) * (unsigned long)(er1 - er0) * 4);
+    if (!back)
+      continue;
+    /* the page without the box, then the box over it: what differs is the box */
+    browser_surface_redirect(g_rot_buf);
+    gfx_init(g_rot_buf, BW, BH);
+    g_gate.only = -1;
+    paint_page_core(py, pw, er0, er1, bg, true);
+    for (int r = er0; r < er1; r++)
+      memcpy(back + (unsigned long)(r - er0) * (ex1 - ex0), g_rot_buf + (unsigned long)r * BW + ex0,
+             (unsigned long)(ex1 - ex0) * 4);
+    g_gate.only = k;
+    paint_page_core(py, pw, er0, er1, bg, false);
+    g_gate.only = -1;
+    browser_surface_redirect(0);
+    gfx_init(real, BW, BH);
+    ru_affine_draw(real, BW, 0, ct, pw, cb, g_rot_buf, BW, back, ex0, er0, ex1 - ex0, er1 - er0, &xf);
+    free(back);
+  }
+}
+
+/* Paint the page (box backgrounds, text, images, media) for the content-pane rows [ct,cb) */
+static void paint_page_band(int py, int pw, int ct, int cb, unsigned bg)
+{
+  /* The worker owns the line-table flow (see worker_fn) */
+  if (!B->pg->text) {
+    g_fr->lt.n = 0;
+    B->layout_dirty = 1;
+  }
+  int rot[GATE_MAX], n, nb = 0;
+  const struct lbox *bx = layout_pool(&n);
+  if (n == g_fr->n_geo)
+    nb = layout_rot_boxes(rot, GATE_MAX);
+  g_gate.n = nb;
+  g_gate.only = -1;
+  for (int k = 0; k < nb; k++) {
+    g_gate.r[k].box0 = rot[k];
+    g_gate.r[k].box1 = bx[rot[k]].end;
+    g_gate.r[k].t0 = bx[rot[k]].t0;
+    g_gate.r[k].t1 = bx[rot[k]].t1;
+  }
+  paint_page_core(py, pw, ct, cb, bg, true);
+  paint_rotated(py, pw, ct, cb, bg);
+  g_gate.n = 0;
+  gfx_set_clip(0, ct, pw, cb - ct);
   paint_overlays(py, pw, ct, cb);
   gfx_clip_none();
 }
@@ -239,7 +324,7 @@ void render(void)
 
   /* content pane , shrinks to the left of the devtools dock when it is open */
   int right = devtools_visible() ? devtools_left() : BW;
-  int py = MENU_H + TAB_H + ADDR_H, pw = right - SCROLL_W;
+  int py = MENU_H + TAB_H + ADDR_H, pw = right - PAGE_SCROLL_W;
   int phh = BH - MENU_H - TAB_H - ADDR_H;
   if (phh < 0)
     phh = 0;
@@ -247,18 +332,18 @@ void render(void)
   if (tabs[active_tab].crashed) {
     gfx_fill_rect(0, py, pw, phh, bg);
     draw_crash_page(py, pw, phh);
-    scrollbar_draw(pw, py, SCROLL_W, phh, 0, 0, 0); /* inert scrollbar */
+    draw_page_scrollbar(pw, py, phh, 0, 0, 0); /* inert scrollbar */
   } else if (B->pg->mode == MODE_IMAGE) {
     gfx_fill_rect(0, py, pw, phh, bg);
     if (B->loading)
       gfx_ui_text(8, py + 8, "Loading ...", 0x4060a0);
     else
       draw_image(0, py, pw, phh, bg);
-    scrollbar_draw(pw, py, SCROLL_W, phh, 0, 0, 0); /* inert scrollbar */
+    draw_page_scrollbar(pw, py, phh, 0, 0, 0); /* inert scrollbar */
   } else {
     paint_page_band(py, pw, py, py + phh, bg);
     /* scrollbar (units are document pixels) */
-    draw_page_scrollbar(pw, py, phh);
+    draw_page_scrollbar(pw, py, phh, B->pg->scroll, g_fr->doc_h, phh);
   }
 
   if (hover_url[0])
@@ -377,7 +462,7 @@ bool render_incremental(unsigned seq_delta, int id)
     return false;
   int py, phh, rows;
   pane_metrics(&py, &phh, &rows);
-  int pw = BW - SCROLL_W;
+  int pw = BW - PAGE_SCROLL_W;
   bool scrolled = B->pg->scroll != g_painted.scroll;
   struct ru_scroll_plan plan = {0};
   if (scrolled &&
@@ -399,7 +484,7 @@ bool render_incremental(unsigned seq_delta, int id)
   if (cb > ct)
     paint_page_band(py, pw, ct, cb, B->pg->page_bg);
   if (scrolled || cb > ct) {
-    draw_page_scrollbar(pw, py, phh);
+    draw_page_scrollbar(pw, py, phh, B->pg->scroll, g_fr->doc_h, phh);
     if (hover_url[0])
       draw_hover_status();
   }
@@ -410,7 +495,7 @@ bool render_incremental(unsigned seq_delta, int id)
     browser_blit_rect(0, py, BW, phh);
   else if (cb > ct) {
     browser_blit_rect(0, ct, BW, cb - ct);
-    browser_blit_rect(pw, py, SCROLL_W, phh);
+    browser_blit_rect(pw, py, PAGE_SCROLL_W, phh);
   }
   if (scrolled || cb > ct)
     win_present(id);

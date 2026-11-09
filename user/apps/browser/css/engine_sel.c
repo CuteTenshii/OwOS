@@ -461,6 +461,12 @@ static void parse_compound(const char *s, const char *e, struct sel_step *st)
         st->pseudo_el = PE_BACKDROP;
       else if (span_is(ns, ne, "marker") || span_is(ns, ne, "-webkit-details-marker"))
         st->pseudo_el = PE_MARKER;
+      else if (span_is(ns, ne, "-webkit-scrollbar"))
+        st->pseudo_el = PE_SCROLLBAR;
+      else if (span_is(ns, ne, "-webkit-scrollbar-thumb"))
+        st->pseudo_el = PE_SB_THUMB;
+      else if (span_is(ns, ne, "-webkit-scrollbar-track"))
+        st->pseudo_el = PE_SB_TRACK;
       else if (dbl && span_is(ns, ne, "slotted") && as) {
         st->pseudo_el = PE_SLOTTED;
         st->pe_list = parse_sel_list(as, ae);
