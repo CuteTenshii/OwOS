@@ -369,6 +369,27 @@ static void check_promise_objects(void)
              0));
 }
 
+static void check_structured_clone_global(void)
+{
+  expect(run(
+      "function T(f) { try { f(); return 'none'; } catch (e) { return e.name; } }\n"
+      "var m = new Map([[1, { a: 1 }]]), o = { m: m, s: new Set([1]), d: new Date(5), r: /a+/gi, u: new Uint8Array([1, "
+      "2]), big: 10n };\n"
+      "o.self = o; var c = structuredClone(o);\n"
+      "expect(c !== o && c.self === c && c.m instanceof Map && c.m.get(1).a === 1 && c.m.get(1) !== m.get(1), 'maps "
+      "and cycles are copied');\n"
+      "expect(c.s.has(1) && c.d.getTime() === 5 && c.r.source === 'a+' && c.r.flags === 'gi' && c.u.join() === '1,2' "
+      "&& c.u.buffer !== o.u.buffer && c.big === 10n, 'sets, dates, regexps, typed arrays and bigints are copied');\n"
+      "expect(T(function () { structuredClone(function () {}); }) === 'DataCloneError' && T(function () { "
+      "structuredClone({ f: function () {} }); }) === 'DataCloneError', 'functions cannot be cloned');\n"
+      "var buf = new ArrayBuffer(8), moved = structuredClone(buf, { transfer: [buf] });\n"
+      "expect(buf.byteLength === 0 && moved.byteLength === 8, 'transferred buffers are detached');\n"
+      "class K { constructor() { this.x = 1; } get y() { return 2; } }\n"
+      "var k = structuredClone(new K()); expect(k.x === 1 && k.y === undefined, 'class instances become plain "
+      "objects');\n",
+      0));
+}
+
 static void check_promise_chain_depth(void)
 {
   expect(run(
@@ -689,6 +710,7 @@ int main(void)
   test("string appends in place keep aliases intact", check_string_append_aliasing);
   test("a computed member's object survives its key being evaluated", check_computed_member_gc);
   test("promise objects: subclasses, reactions and adoption", check_promise_objects);
+  test("structuredClone is the structured clone algorithm", check_structured_clone_global);
   test("long promise chains do not recurse without bound", check_promise_chain_depth);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);

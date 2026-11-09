@@ -635,78 +635,17 @@ static js_value object_entries(js_ctx *ctx, js_value t, js_value *a, int n)
   return obj_keys_impl(ctx, ARG(0), 2);
 }
 
-/* structuredClone: deep-copy of plain objects/arrays with cycle preservation
- * (seen[] maps each source object to its clone). Functions and exotic hosts are
- * shared by reference — pragmatic vs the spec's DataCloneError. */
-#define SCLONE_MAX 2048
-static js_value sclone(js_ctx *ctx, js_value v, js_object **ss, js_object **sd, int *ns, int depth)
-{
-  js_object *o;
-  int i;
-  if (v.type != JV_OBJ)
-    return v;
-  o = v.u.obj;
-  for (i = 0; i < *ns; i++)
-    if (ss[i] == o)
-      return js_obj_value(sd[i]);
-  if (o->kind == OBJ_WASM) {
-    void *ptr;
-    void (*release)(void *);
-    int kind;
-    if (js_wasm_clone_write && js_wasm_clone_write(ctx, o, &ptr, &release, &kind)) {
-      js_value r = js_wasm_clone_read(ctx, kind, ptr);
-      release(ptr);
-      return r;
-    }
-    js_throw_error(ctx, ctx->error_proto, "DataCloneError", "The value could not be cloned");
-    return js_undef();
-  }
-  if (depth > 200 || o->kind == OBJ_FUNCTION)
-    return v;
-  if (o->kind == OBJ_ARRAY || o->kind == OBJ_PLAIN) {
-    js_object *na;
-    gc_push_scope();
-    KEEP(v);
-    na = (js_object *)gc_keep(o->kind == OBJ_ARRAY ? js_new_array(ctx, 0) : js_new_object(ctx, ctx->object_proto));
-    if (*ns < SCLONE_MAX) {
-      ss[*ns] = o;
-      sd[*ns] = na;
-      (*ns)++;
-    }
-    if (o->kind == OBJ_ARRAY) {
-      unsigned e;
-      for (e = 0; e < o->elen; e++)
-        js_array_push(ctx, na, sclone(ctx, o->elems[e], ss, sd, ns, depth + 1));
-    }
-    for (i = 0; i < o->props.n; i++) {
-      pentry *pe = &o->props.e[i];
-      if (!(pe->flags & P_ENUMERABLE) || (pe->flags & P_ACCESSOR))
-        continue;
-      js_def(na, pe->key, sclone(ctx, pe->value, ss, sd, ns, depth + 1), P_WRITABLE | P_ENUMERABLE | P_CONFIGURABLE);
-    }
-    gc_pop_scope();
-    return js_obj_value(na);
-  }
-  return v; /* symbols, typed arrays, errors, … : shared */
-}
+/* structuredClone(value, {transfer}): the algorithm postMessage uses (js_clone_write/read) */
 static js_value g_structured_clone(js_ctx *ctx, js_value t, js_value *a, int n)
 {
-  js_object **ss, **sd;
-  int ns = 0;
-  js_value r;
+  js_clone *c = js_clone_write(ctx, ARG(0), ARG(1));
+  js_value v;
   (void)t;
-  (void)n;
-  ss = (js_object **)malloc(SCLONE_MAX * sizeof *ss);
-  sd = (js_object **)malloc(SCLONE_MAX * sizeof *sd);
-  if (!ss || !sd) {
-    free(ss);
-    free(sd);
-    return ARG(0);
-  }
-  r = sclone(ctx, ARG(0), ss, sd, &ns, 0);
-  free(ss);
-  free(sd);
-  return r;
+  if (!c)
+    return js_undef();
+  v = js_clone_read(ctx, c);
+  js_clone_free(c);
+  return v;
 }
 
 static js_value object_assign(js_ctx *ctx, js_value t, js_value *a, int n)

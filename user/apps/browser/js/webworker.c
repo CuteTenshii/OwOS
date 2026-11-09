@@ -320,19 +320,6 @@ static js_value wt_post(js_ctx *ctx, js_value t, js_value *args, int argc)
   return js_undef();
 }
 
-/* structuredClone(value, {transfer}): the full algorithm, the same one postMessage uses */
-static js_value wt_structured_clone(js_ctx *ctx, js_value t, js_value *args, int argc)
-{
-  js_clone *c = js_clone_write(ctx, A(0), A(1));
-  js_value v;
-  (void)t;
-  if (!c)
-    return js_undef();
-  v = js_clone_read(ctx, c);
-  js_clone_free(c);
-  return v;
-}
-
 static js_value wt_close(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   (void)ctx;
@@ -1210,7 +1197,6 @@ static void wt_setup(js_ctx *ctx, struct wthread *wt)
   gc_push_scope();
   js_def_native(ctx, g, "postMessage", wt_post, 1);
   js_def_native(ctx, g, "close", wt_close, 0);
-  js_def_native(ctx, g, "structuredClone", wt_structured_clone, 1);
   js_def_native(ctx, g, "importScripts", wt_import_scripts, 1);
   js_def_native(ctx, g, "setTimeout", wt_set_timeout, 2);
   js_def_native(ctx, g, "setInterval", wt_set_interval, 2);
