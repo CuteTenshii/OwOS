@@ -16,7 +16,7 @@ static struct cached_image {
 } g_cache[CACHE_SLOTS];
 static unsigned g_age;
 
-static js_object *g_bitmap_proto;
+static __thread js_object *g_bitmap_proto; /* per thread: a worker has none yet */
 
 void queue_native(js_ctx *ctx, js_native fn, js_value data)
 {
@@ -263,6 +263,10 @@ static js_value bitmap_close(js_ctx *ctx, js_value t, js_value *args, int argc)
 /* Wraps `px` (w*h RGBA, ownership passes on success; freed on failure) as an ImageBitmap */
 js_value make_bitmap(js_ctx *ctx, unsigned char *px, int w, int h)
 {
+  if (!g_bitmap_proto) {
+    free(px);
+    return js_throw_error(ctx, ctx->error_proto, "NotSupportedError", "ImageBitmap is not available here");
+  }
   gc_push_scope();
   js_value bm = make_host(ctx, g_bitmap_proto, HK_BITMAP, px, w, h);
   if (bm.type != JV_OBJ) {

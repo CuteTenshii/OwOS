@@ -1430,6 +1430,18 @@ int source_pixels(js_ctx *ctx, js_value v, struct pixsrc *out)
 
 /* --------------------------------------------------------------------- setup */
 
+/* A getter/setter pair on `proto`, built in ctx: a worker's natives must not take their prototype from the page */
+static void canvas_def_acc(js_ctx *ctx, js_object *proto, const char *name, js_native get, js_native set)
+{
+  gc_push_scope();
+  {
+    js_object *g = get ? (js_object *)gc_keep(js_new_native(ctx, get, name, 0)) : 0;
+    js_object *st = set ? (js_object *)gc_keep(js_new_native(ctx, set, name, 1)) : 0;
+    js_def_accessor(proto, name, g, st, P_CONFIGURABLE | P_ENUMERABLE);
+  }
+  gc_pop_scope();
+}
+
 static js_object *root_proto(js_ctx *ctx, js_object **slot)
 {
   *slot = js_new_object(ctx, ctx->object_proto);
@@ -1520,7 +1532,7 @@ static void canvas_setup_core(js_ctx *ctx, js_object *win)
       {"getContextAttributes", ctx_get_attributes, 0},
   };
   for (unsigned i = 0; i < sizeof methods / sizeof *methods; i++)
-    def_method(cp, methods[i].name, methods[i].fn, methods[i].arity);
+    js_def_native(ctx, cp, methods[i].name, methods[i].fn, methods[i].arity);
 
   static const struct {
     const char *name;
@@ -1545,10 +1557,10 @@ static void canvas_setup_core(js_ctx *ctx, js_object *win)
       {"imageSmoothingEnabled", get_smoothing, set_smoothing},
   };
   for (unsigned i = 0; i < sizeof props / sizeof *props; i++)
-    def_acc(cp, props[i].name, props[i].get, props[i].set);
+    canvas_def_acc(ctx, cp, props[i].name, props[i].get, props[i].set);
 
-  def_method(g_gradient_proto, "addColorStop", gradient_add_stop, 2);
-  def_method(g_pattern_proto, "setTransform", pattern_set_transform, 1);
+  js_def_native(ctx, g_gradient_proto, "addColorStop", gradient_add_stop, 2);
+  js_def_native(ctx, g_pattern_proto, "setTransform", pattern_set_transform, 1);
 
   define_ctor(ctx, win, "CanvasRenderingContext2D", js_illegal_ctor, 0, cp);
   define_ctor(ctx, win, "CanvasGradient", js_illegal_ctor, 0, g_gradient_proto);
@@ -1556,11 +1568,11 @@ static void canvas_setup_core(js_ctx *ctx, js_object *win)
   define_ctor(ctx, win, "ImageData", imagedata_ctor, 2, g_imagedata_proto);
   define_ctor(ctx, win, "OffscreenCanvas", offscreen_ctor, 2, g_offscreen_proto);
 
-  def_method(g_offscreen_proto, "getContext", canvas_get_context, 1);
-  def_method(g_offscreen_proto, "convertToBlob", offscreen_convert_to_blob, 0);
-  def_method(g_offscreen_proto, "transferToImageBitmap", offscreen_transfer_to_bitmap, 0);
-  def_acc(g_offscreen_proto, "width", canvas_get_width, canvas_set_width);
-  def_acc(g_offscreen_proto, "height", canvas_get_height, canvas_set_height);
+  js_def_native(ctx, g_offscreen_proto, "getContext", canvas_get_context, 1);
+  js_def_native(ctx, g_offscreen_proto, "convertToBlob", offscreen_convert_to_blob, 0);
+  js_def_native(ctx, g_offscreen_proto, "transferToImageBitmap", offscreen_transfer_to_bitmap, 0);
+  canvas_def_acc(ctx, g_offscreen_proto, "width", canvas_get_width, canvas_set_width);
+  canvas_def_acc(ctx, g_offscreen_proto, "height", canvas_get_height, canvas_set_height);
 }
 
 void canvas_js_setup(js_ctx *ctx, js_object *win)
@@ -1570,12 +1582,12 @@ void canvas_js_setup(js_ctx *ctx, js_object *win)
   canvas_setup_core(ctx, win);
   js_object *ep = canvas_element_proto();
   if (ep) {
-    def_method(ep, "getContext", canvas_get_context, 2);
-    def_method(ep, "toDataURL", canvas_to_data_url, 1);
-    def_method(ep, "toBlob", canvas_to_blob, 1);
-    def_method(ep, "transferControlToOffscreen", canvas_transfer_control, 0);
-    def_acc(ep, "width", canvas_get_width, canvas_set_width);
-    def_acc(ep, "height", canvas_get_height, canvas_set_height);
+    js_def_native(ctx, ep, "getContext", canvas_get_context, 2);
+    js_def_native(ctx, ep, "toDataURL", canvas_to_data_url, 1);
+    js_def_native(ctx, ep, "toBlob", canvas_to_blob, 1);
+    js_def_native(ctx, ep, "transferControlToOffscreen", canvas_transfer_control, 0);
+    canvas_def_acc(ctx, ep, "width", canvas_get_width, canvas_set_width);
+    canvas_def_acc(ctx, ep, "height", canvas_get_height, canvas_set_height);
   }
   canvas_path_setup(ctx, win);
   canvas_img_setup(ctx, win);

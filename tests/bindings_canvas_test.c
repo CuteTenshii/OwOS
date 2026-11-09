@@ -291,9 +291,10 @@ static void test_offscreen_in_worker(void)
   /* a canvas the worker made itself: drawn on, read back, and turned into a Blob in the worker */
   run_script("window.own=null; var w2=new Worker('data:text/javascript,var o=new OffscreenCanvas(3,3), "
              "c=o.getContext(\"2d\"); "
-             "c.fillStyle=\"#f00\"; c.fillRect(0,0,3,3); var px=c.getImageData(1,1,1,1).data; "
+             "c.fillStyle=\"#f00\"; c.fillRect(0,0,3,3); var px=c.getImageData(1,1,1,1).data; var tb=\"\"; "
+             "try { o.transferToImageBitmap(); } catch(e) { tb=e.name; } "
              "o.convertToBlob().then(function(b){ postMessage({px:px[0]+\",\"+px[3], big:b.size>8, type:b.type, blob:b "
-             "instanceof Blob}); });');\n"
+             "instanceof Blob, tb:tb}); });');\n"
              "w2.onmessage=function(e){ window.own=e.data };\n");
   for (int i = 0; i < 600; i++) {
     js_workers_pump();

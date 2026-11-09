@@ -362,7 +362,7 @@ void canvas_path_setup(js_ctx *ctx, js_object *win)
       {"closePath", path_close, 0},         {"addPath", path_add_path, 1},
   };
   for (unsigned i = 0; i < sizeof methods / sizeof *methods; i++)
-    def_method(g_path2d_proto, methods[i].name, methods[i].fn, methods[i].arity);
+    js_def_native(ctx, g_path2d_proto, methods[i].name, methods[i].fn, methods[i].arity);
   js_object *ctor = js_new_native(ctx, path2d_ctor, "Path2D", 1);
   gc_push_scope();
   gc_keep(ctor);
