@@ -1370,6 +1370,7 @@ static js_object *wr_new(js_ctx *ctx, js_value thisv, js_value streamv)
   wr = WR(wro);
   wr->stream = wo;
   wr->ready = prom(ctx);
+  wb(wro);
   wr->closed = prom(ctx);
   w->writer = wro;
   wb(wo);
