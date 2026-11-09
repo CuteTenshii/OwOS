@@ -103,6 +103,9 @@ JS(
   g.onmessage = null;
   g.onmessageerror = null;
   g.onerror = null;
+  g.onconnect = null;
+  /* a page connected to this shared worker */
+  N.onconnect = function (ports) { g.dispatchEvent(new g.MessageEvent("connect", { data: "", ports: ports })); };
   /* An uncaught error is offered to self.onerror (legacy signature) and error listeners before it reaches the page */
   N.onerror = function (message) {
     var handled = false, ev, h = g.onerror;

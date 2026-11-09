@@ -478,6 +478,28 @@ static void test_broadcast_channel(void)
              "expect(got.indexOf('changed')<0, 'a message is copied when it is posted');\n");
 }
 
+static void test_shared_worker(void)
+{
+  run_script(
+      "var src='var n=0; onconnect=function(e){ var id=++n, port=e.ports[0]; port.onmessage=function(m){ "
+      "port.postMessage({id:id, echo:m.data, name:self.name, ev:e instanceof MessageEvent && "
+      "e.type===String.fromCharCode(99,111,110,110,101,99,116)}); }; "
+      "port.postMessage({hello:id}); };';\n"
+      "var url=URL.createObjectURL(new Blob([src])), got={a:[],b:[],c:[]};\n"
+      "var a=new SharedWorker(url,'one'), b=new SharedWorker(url,{name:'one'}), c=new SharedWorker(url,'two');\n"
+      "expect(a instanceof SharedWorker && a.port instanceof MessagePort, 'SharedWorker has a port');\n"
+      "a.port.onmessage=function(e){ got.a.push(e.data); }; b.port.onmessage=function(e){ got.b.push(e.data); };\n"
+      "c.port.onmessage=function(e){ got.c.push(e.data); };\n"
+      "a.port.postMessage('x'); b.port.postMessage('y'); c.port.postMessage('z');\n");
+  expect(wait_for("got.a.length>=2 && got.b.length>=2 && got.c.length>=2"));
+  run_script("expect(JSON.stringify(got.a)==='[{\"hello\":1},{\"id\":1,\"echo\":\"x\",\"name\":\"one\",\"ev\":true}]', "
+             "'first connection: '+JSON.stringify(got.a));\n"
+             "expect(JSON.stringify(got.b)==='[{\"hello\":2},{\"id\":2,\"echo\":\"y\",\"name\":\"one\",\"ev\":true}]', "
+             "'same URL and name share the worker: '+JSON.stringify(got.b));\n"
+             "expect(JSON.stringify(got.c)==='[{\"hello\":1},{\"id\":1,\"echo\":\"z\",\"name\":\"two\",\"ev\":true}]', "
+             "'another name is another worker: '+JSON.stringify(got.c));\n");
+}
+
 static void test_worker_url_edges(void)
 {
   run_script("var ue=null, uw=new Worker('data:text/javascript,var r=[]; function U(a,b){ try { return new "
@@ -698,6 +720,7 @@ int main(void)
   worker_test("MessageChannel and MessagePort", test_message_channel);
   worker_test("MessageEvent.ports", test_event_ports);
   worker_test("nested workers", test_nested_workers);
+  worker_test("SharedWorker", test_shared_worker);
   worker_test("BroadcastChannel across the page and workers", test_broadcast_channel);
   worker_test("ErrorEvent and MessageEvent", test_event_interfaces);
   worker_test("script and construction errors", test_errors);

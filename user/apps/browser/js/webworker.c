@@ -43,7 +43,8 @@ enum {
   WM_CHILD_TERM,
   WM_CHILD_DATA,
   WM_CHILD_ERROR,
-  WM_BCAST /* a BroadcastChannel message (text = channel name), in either direction */
+  WM_BCAST,  /* a BroadcastChannel message (text = channel name), in either direction */
+  WM_CONNECT /* a page connects to a shared worker: the clone carries the port for it */
 };
 
 struct wmsg {
@@ -64,6 +65,7 @@ struct wq {
 struct wthread {
   int id;
   struct wthread *parent; /* the worker that started this one, or NULL for a page worker */
+  int shared;             /* a SharedWorker: pages with the same URL and name connect to it */
   int tid;
   void *stack;
   char *stack_lo;
@@ -85,9 +87,10 @@ struct wthread {
   int narenas;
 };
 
-static js_object *g_worker_proto; /* Worker.prototype */
-static js_object *g_wq;           /* MessagePort traffic: flat (port, data, ports) triples, drained by the pump */
-static int g_next_wid;            /* worker ids, unique across the page and every worker (atomic) */
+static js_object *g_worker_proto;  /* Worker.prototype */
+static js_object *g_sworker_proto; /* SharedWorker.prototype */
+static js_object *g_wq;            /* MessagePort traffic: flat (port, data, ports) triples, drained by the pump */
+static int g_next_wid;             /* worker ids, unique across the page and every worker (atomic) */
 
 /* Live workers and their page-side objects, index for index; the objects are GC roots */
 static struct wthread *g_workers[WORKER_MAX];
@@ -1164,6 +1167,23 @@ static bool wt_pump_ws(js_ctx *ctx)
 }
 
 /* A message for a port that lives here arrives from the page */
+/* A page connected to this shared worker: its port arrives, and onconnect hears about it */
+static void wt_dispatch_connect(js_ctx *ctx, struct wmsg *m)
+{
+  js_value ports;
+  gc_push_scope();
+  ports_clear(ctx);
+  js_clone_read(ctx, m->clone);
+  if (ctx->has_exc)
+    wt_report(ctx);
+  else {
+    ports = ports_take(ctx);
+    gc_keep(ports.u.obj);
+    wt_hook(ctx, "onconnect", &ports, 1);
+  }
+  gc_pop_scope();
+}
+
 /* A BroadcastChannel message from the page */
 static void wt_dispatch_bc(js_ctx *ctx, struct wmsg *m)
 {
@@ -1560,6 +1580,8 @@ static void wt_loop(js_ctx *ctx, struct wthread *wt)
       else if (m->kind == WM_PORT_CLOSE) {
         js_value id = js_number(m->level);
         wt_hook(ctx, "onportclose", &id, 1);
+      } else if (m->kind == WM_CONNECT) {
+        wt_dispatch_connect(ctx, m);
       } else if (m->kind == WM_BCAST) {
         if (m->clone && m->text && parts_loaded > PART_NET)
           wt_dispatch_bc(ctx, m);
@@ -2179,9 +2201,20 @@ void js_port_remote_close(js_ctx *ctx, js_value port)
 
 static void worker_fire(struct wthread *wt, js_value w, struct wmsg *m)
 {
-  js_value ev;
+  js_value ev, clients = js_undef();
+  unsigned nc = 1, ci;
   gc_push_scope();
   gc_keep(w.u.obj);
+  if (wt->shared) { /* a shared worker's trouble goes to every page object connected to it, and it has no one to talk to
+                       otherwise */
+    clients = js_get(g_ctx, w, "@clients");
+    if (m->kind != WM_ERROR || clients.type != JV_OBJ) {
+      gc_pop_scope();
+      return;
+    }
+    gc_keep(clients.u.obj);
+    nc = js_array_len(clients.u.obj);
+  }
   if (m->kind == WM_ERROR) {
     ev = make_event("error", 0, 0, js_undef());
     if (ev.type == JV_OBJ) {
@@ -2213,8 +2246,13 @@ static void worker_fire(struct wthread *wt, js_value w, struct wmsg *m)
   }
   if (ev.type == JV_OBJ) {
     gc_keep(ev.u.obj);
-    js_set(g_ctx, ev, "target", w);
-    ev_fire_on(w.u.obj, ev, 0);
+    for (ci = 0; ci < nc; ci++) {
+      js_value target = wt->shared ? js_get_index(g_ctx, clients, ci) : w;
+      if (target.type != JV_OBJ)
+        continue;
+      js_set(g_ctx, ev, "target", target);
+      ev_fire_on(target.u.obj, ev, 0);
+    }
   }
   gc_pop_scope();
 }
@@ -2479,6 +2517,77 @@ static js_value worker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int arg
   return js_obj_value(w);
 }
 
+/* new SharedWorker(url, name | {name, type}): the worker for that URL and name, started on the first connection;
+ * each connection gets a MessageChannel whose far port goes to the worker in a connect event */
+static js_value sworker_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  char url[URL_MAX];
+  js_value opts = A(1), nm, mc, p1, p2, msg, list;
+  const char *name = "", *ename, *emsg;
+  struct wthread *wt = 0;
+  js_object *hub = 0, *sw, *o, *clients;
+  js_clone *c;
+  int i, module = 0;
+  (void)thisv;
+  script_url(g_page_url_buf, arg_str(ctx, A(0)), url, sizeof url);
+  if (!starts_ci(url, "blob:") && !starts_ci(url, "data:") && !cors_same_origin(g_page_url_buf, url))
+    return throw_err(ctx, "SecurityError", "SharedWorker script must be same-origin");
+  if (opts.type == JV_STR)
+    name = opts.u.str->data;
+  else if (opts.type == JV_OBJ) {
+    nm = js_get(ctx, opts, "name");
+    if (nm.type == JV_STR)
+      name = nm.u.str->data;
+    nm = js_get(ctx, opts, "type");
+    module = nm.type == JV_STR && streq(nm.u.str->data, "module");
+  }
+  for (i = 0; i < g_nworkers; i++)
+    if (g_workers[i]->shared && !g_workers[i]->parent && streq(g_workers[i]->url, url) &&
+        streq(g_workers[i]->name, name) && !__atomic_load_n(&g_workers[i]->irq.stop, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&g_workers[i]->closing, __ATOMIC_ACQUIRE)) {
+      wt = g_workers[i];
+      hub = g_wobjs[i];
+    }
+  gc_push_scope();
+  if (!wt) {
+    wt = worker_create(ctx, __atomic_add_fetch(&g_next_wid, 1, __ATOMIC_RELAXED), url, name, module, 0, &hub, &ename,
+                       &emsg);
+    if (!wt) {
+      gc_pop_scope();
+      return throw_err(ctx, ename, emsg);
+    }
+    wt->shared = 1;
+    gc_keep(hub);
+    js_def(hub, "@clients", js_obj_value(js_new_array(ctx, 0)), 0);
+  }
+  gc_keep(hub);
+  mc = js_construct(ctx, js_get(ctx, js_obj_value(ctx->global), "MessageChannel"), 0, 0);
+  if (ctx->has_exc) {
+    gc_pop_scope();
+    return js_undef();
+  }
+  gc_keep(mc.u.obj);
+  p1 = js_get(ctx, mc, "port1");
+  p2 = js_get(ctx, mc, "port2");
+  sw = (js_object *)gc_keep(js_new_object(ctx, g_sworker_proto));
+  js_def(sw, "port", p1, P_ENUMERABLE);
+  js_def(sw, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
+  clients = js_get(ctx, js_obj_value(hub), "@clients").u.obj;
+  js_array_push(ctx, clients, js_obj_value(sw));
+  o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+  js_def(o, "port", p2, P_ENUMERABLE);
+  list = js_obj_value(gc_keep(js_new_array(ctx, 0)));
+  js_array_push(ctx, list.u.obj, p2);
+  msg = js_obj_value(o);
+  clone_peer = wt;
+  c = js_clone_write(ctx, msg, list);
+  clone_peer = 0;
+  if (c)
+    wmsg_post(wt, &wt->in, WM_CONNECT, 0, c, 0);
+  gc_pop_scope();
+  return ctx->has_exc ? js_undef() : js_obj_value(sw);
+}
+
 void js_worker_setup(js_ctx *ctx, js_object *win)
 {
   js_object *ctor;
@@ -2503,6 +2612,18 @@ void js_worker_setup(js_ctx *ctx, js_object *win)
   js_def(g_worker_proto, "constructor", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
   js_def(win, "Worker", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
   gc_pop_scope();
+  g_sworker_proto = js_new_object(ctx, ctx->object_proto);
+  gc_add_root((void **)&g_sworker_proto);
+  def_method(g_sworker_proto, "addEventListener", el_add_listener, 3);
+  def_method(g_sworker_proto, "removeEventListener", el_remove_listener, 3);
+  def_method(g_sworker_proto, "dispatchEvent", el_dispatch, 1);
+  ctor = js_new_native(ctx, sworker_ctor, "SharedWorker", 1);
+  gc_push_scope();
+  gc_keep(ctor);
+  js_def(ctor, "prototype", js_obj_value(g_sworker_proto), 0);
+  js_def(g_sworker_proto, "constructor", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
+  js_def(win, "SharedWorker", js_obj_value(ctor), P_WRITABLE | P_CONFIGURABLE);
+  gc_pop_scope();
 }
 
 /* Stop every worker and join what finishes in time. A thread stuck in a long script is left behind. */
@@ -2521,9 +2642,10 @@ void js_worker_teardown(void)
   g_nworkers = 0;
   js_msgchannel_teardown();
   gc_remove_root((void **)&g_worker_proto);
+  gc_remove_root((void **)&g_sworker_proto);
   gc_remove_root((void **)&g_wq);
   gc_remove_root_range((void **)g_wobjs);
   gc_remove_root_range((void **)g_rport_objs);
   g_nrports = 0;
-  g_worker_proto = g_wq = 0;
+  g_worker_proto = g_sworker_proto = g_wq = 0;
 }
