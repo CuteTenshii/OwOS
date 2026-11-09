@@ -50,7 +50,9 @@ EXTRA_vary        := -DCACHE_DIR='"$(RUN)/vary-cache"'
 EXTRA_btrfs       := $(HOST_DEFS)
 EXTRA_tls_idle    := -Iuser/lib/tls -Iuser/lib/pki
 EXTRA_pki         := -Iuser/lib/tls -Iuser/lib/pki
+EXTRA_quic_conn   := -Iuser/lib/tls -Iuser/lib/pki
 EXTRA_resolve     := -Iuser/lib/mdns
+EXTRA_net6        := -Idrivers/net
 
 # Objects whose sources are rebuilt with test-specific defines or a fake system layer
 IMPLS := $(B)/impl/h3.o $(B)/impl/h2.o $(B)/impl/netconn.o $(B)/impl/permissions.o $(B)/impl/cache.o $(B)/impl/vary_fs.o $(B)/impl/tz.o $(B)/impl/desktop.o \

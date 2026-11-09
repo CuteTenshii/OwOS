@@ -30,6 +30,7 @@
 #define QUIC_EHANDSHAKE (-3) /* QUIC/TLS handshake failed                */
 #define QUIC_EINTR (-4)      /* Ctrl+C arrived mid-transfer              */
 #define QUIC_ECLOSED (-5)    /* peer closed the connection / fatal error */
+#define QUIC_ECERT (-6)      /* the server certificate did not check out  */
 
 typedef struct quic quic;
 

@@ -8,6 +8,7 @@
  * carried in CRYPTO frames; and the public connect/send/read/poll/close API. */
 
 #include "quic.h"
+#include "certs.h"
 #include "crypto.h"
 #include "owos.h"
 #include "resolve.h"
@@ -70,6 +71,22 @@ static int varsize(uint64_t v) { return v < 0x40 ? 1 : v < 0x4000 ? 2 : v < 0x40
 
 enum { S_INIT = 0, S_HS = 1, S_APP = 2 }; /* packet-number spaces */
 
+#define SENT_MAX 32 /* ack-eliciting packets in flight per space */
+#define RR_MAX 16   /* received packet-number ranges we report */
+#define PTO_MAX 8   /* probe timeouts in a row before the connection is given up */
+
+/* An ack-eliciting packet awaiting its ACK; `frames` (a copy) is NULL in a free slot. */
+struct sent_pkt {
+  uint64_t pn;
+  unsigned t; /* msec() when sent */
+  uint32_t len;
+  uint8_t *frames;
+};
+
+struct range {
+  uint64_t lo, hi;
+};
+
 struct space {
   int hk;                         /* keys installed                       */
   uint8_t ck[16], ci[12], ch[16]; /* our (client) key / iv / hp    */
@@ -78,6 +95,12 @@ struct space {
   uint64_t lrec;                  /* largest packet number received       */
   int hrec;                       /* received any packet                   */
   int ackp;                       /* an ACK is owed in this space          */
+  struct range rr[RR_MAX];        /* packet numbers accepted, highest range first */
+  int nrr;
+  struct sent_pkt sent[SENT_MAX];
+  int has_acked;
+  uint64_t largest_acked;
+  unsigned loss_time; /* when the youngest packet below the largest ACKed would count as lost; 0 = none */
   /* CRYPTO-stream reassembly (in-order; offset 0 based) */
   uint8_t cbuf[16384];
   uint32_t chave; /* contiguous bytes available           */
@@ -123,6 +146,16 @@ struct quic {
 
   uint8_t chello[1024];
   uint32_t chello_len; /* kept for retransmit */
+
+  /* Round-trip estimate (RFC 9002 §5) and probe backoff. */
+  unsigned srtt, rttvar, latest_rtt;
+  int rtt_init, pto_count;
+  int init_dropped; /* the Initial space is retired once Handshake packets flow */
+
+  /* The server's certificate, checked against `host` while the handshake runs. */
+  char host[256];
+  struct certs certs;
+  int cert_fail;
 
   /* Flow control and limits. rx_* is what we grant the server; peer_* what it grants us (server transport
    * parameters, raised by MAX_DATA / MAX_STREAMS frames). */
@@ -415,11 +448,17 @@ static int on_server_hello(struct quic *Q, const uint8_t *body, uint32_t bl)
 }
 
 /* Server Finished received (th_pre = transcript through CertificateVerify):
- * verify it, derive + install 1-RTT keys, and stage the client Finished. */
+ * check the certificate verdict and the Finished, derive + install 1-RTT keys, and stage the client Finished. */
 static int on_server_finished(struct quic *Q, const uint8_t *body, uint32_t bl, const uint8_t th_pre[32])
 {
   if (bl != 32)
     return -1;
+  /* The connection goes ahead only with a certificate that checks out for this host (or when there is no root
+   * bundle to check against, as for TLS over TCP). */
+  if (Q->certs.verify != X509_OK && Q->certs.verify != X509_E_NO_STORE) {
+    Q->cert_fail = 1;
+    return -1;
+  }
   uint8_t fk[32], expect[32];
   expand_label(Q->s_hs, "finished", 0, 0, fk, 32);
   hmac_sha256(fk, 32, th_pre, 32, expect);
@@ -500,9 +539,14 @@ static void extract_tls(struct quic *Q, int space)
     const uint8_t *msg = s->cbuf + s->crd;
 
     uint8_t th_pre[32];
-    if (mt == 20) /* Finished: hash BEFORE update */
+    if (mt == 20 || mt == 15) /* Finished, CertificateVerify: hash BEFORE update */
       th_snapshot(Q, th_pre);
     sha256_update(&Q->transcript, msg, total);
+
+    if (mt == 11) /* Certificate */
+      certs_take(&Q->certs, Q->host, msg + 4, l, 1);
+    if (mt == 15) /* CertificateVerify */
+      certs_check_cv(&Q->certs, th_pre, msg + 4, l);
 
     if (mt == 8) /* EncryptedExtensions */
       parse_server_tp(Q, msg + 4, l);
@@ -510,7 +554,6 @@ static void extract_tls(struct quic *Q, int space)
       on_server_hello(Q, msg + 4, l);
     else if (mt == 20) /* Finished */
       on_server_finished(Q, msg + 4, l, th_pre);
-    /* EncryptedExtensions/Certificate/CertificateVerify: not verified */
 
     s->crd += total;
   }
@@ -531,6 +574,14 @@ static void crypto_recv(struct quic *Q, int space, uint64_t off, const uint8_t *
 
 /* ------------------------------------------------------------- streams */
 
+static struct qstream *find_stream(struct quic *Q, uint64_t id)
+{
+  for (int i = 0; i < QS_MAX; i++)
+    if (Q->qs[i].used && Q->qs[i].id == id)
+      return &Q->qs[i];
+  return 0;
+}
+
 static struct qstream *get_stream(struct quic *Q, uint64_t id)
 {
   for (int i = 0; i < QS_MAX; i++)
@@ -550,7 +601,7 @@ static void stream_recv(struct quic *Q, uint64_t id, uint64_t off, const uint8_t
 {
   if ((id & 0x03) != 0) /* not client-bidi: discard */
     return;
-  struct qstream *q = get_stream(Q, id);
+  struct qstream *q = find_stream(Q, id); /* a finished stream's late retransmission finds nothing: ignored */
   if (!q)
     return;
   if (fin) {
@@ -579,17 +630,297 @@ static void stream_recv(struct quic *Q, uint64_t id, uint64_t off, const uint8_t
   Q->rx_total += cnt;
 }
 
+/* ------------------------------------------------------ loss recovery */
+
+/* RFC 9002 in small: every ack-eliciting packet is kept until acknowledged; one the peer's ACKs skip past (three
+ * packets, or a time threshold) or that no ACK covers within the probe timeout is sent again under a new packet
+ * number. There is no congestion controller: the number of packets in flight is capped at SENT_MAX per space instead.
+ * The receive side acknowledges exactly the packet numbers it accepted, and drops (without acknowledging) a packet
+ * whose stream or CRYPTO data lies beyond a gap, so the peer resends it. */
+
+static int emit(struct quic *Q, int space, const uint8_t *frames, uint32_t flen, int track);
+static int poll_once(struct quic *Q);
+
+static unsigned qnow(void) { return msec(); }
+
+static int rr_has(const struct space *s, uint64_t pn)
+{
+  for (int i = 0; i < s->nrr; i++)
+    if (pn >= s->rr[i].lo && pn <= s->rr[i].hi)
+      return 1;
+  return 0;
+}
+
+static void rr_remove(struct space *s, int i)
+{
+  memmove(&s->rr[i], &s->rr[i + 1], (unsigned)(s->nrr - i - 1) * sizeof s->rr[0]);
+  s->nrr--;
+}
+
+/* Note packet number `pn` as received: ranges stay disjoint, non-adjacent, highest first. */
+static void rr_add(struct space *s, uint64_t pn)
+{
+  int i;
+  for (i = 0; i < s->nrr; i++) {
+    struct range *r = &s->rr[i];
+    if (pn >= r->lo && pn <= r->hi)
+      return;
+    if (pn == r->hi + 1) { /* extends this range upwards, maybe reaching the one above */
+      r->hi = pn;
+      if (i > 0 && s->rr[i - 1].lo == pn + 1) {
+        r->hi = s->rr[i - 1].hi;
+        rr_remove(s, i - 1);
+      }
+      return;
+    }
+    if (r->lo > 0 && pn == r->lo - 1) { /* downwards, maybe reaching the one below */
+      r->lo = pn;
+      if (i + 1 < s->nrr && s->rr[i + 1].hi + 1 == pn) {
+        r->lo = s->rr[i + 1].lo;
+        rr_remove(s, i + 1);
+      }
+      return;
+    }
+    if (pn > r->hi)
+      break;
+  }
+  if (s->nrr == RR_MAX) {
+    if (i == RR_MAX)
+      return; /* older than everything we still track */
+    s->nrr--; /* forget the oldest range */
+  }
+  memmove(&s->rr[i + 1], &s->rr[i], (unsigned)(s->nrr - i) * sizeof s->rr[0]);
+  s->rr[i].lo = s->rr[i].hi = pn;
+  s->nrr++;
+}
+
+static struct sent_pkt *sent_slot(struct space *s)
+{
+  for (int i = 0; i < SENT_MAX; i++)
+    if (!s->sent[i].frames)
+      return &s->sent[i];
+  return 0;
+}
+
+static void sent_clear(struct space *s)
+{
+  for (int i = 0; i < SENT_MAX; i++) {
+    free(s->sent[i].frames);
+    s->sent[i].frames = 0;
+  }
+  s->loss_time = 0;
+}
+
+/* A packet's frames sent again in a new packet; the old record is dropped either way. */
+static void retransmit(struct quic *Q, int space, struct sent_pkt *p)
+{
+  uint8_t *frames = p->frames;
+  uint32_t len = p->len;
+  p->frames = 0;
+  emit(Q, space, frames, len, 1);
+  free(frames);
+}
+
+/* Declare lost every packet below the largest acknowledged one that is three packets or a round trip (+1/8) old,
+ * resend them, and note when the youngest of the rest would become lost. */
+static void detect_lost(struct quic *Q, int space)
+{
+  struct space *s = &Q->sp[space];
+  s->loss_time = 0;
+  if (!s->has_acked)
+    return;
+  unsigned now = qnow(), rtt = Q->latest_rtt > Q->srtt ? Q->latest_rtt : Q->srtt;
+  unsigned delay = rtt + rtt / 8;
+  if (delay < 2)
+    delay = 2;
+  for (int i = 0; i < SENT_MAX; i++) {
+    struct sent_pkt *p = &s->sent[i];
+    if (!p->frames || p->pn >= s->largest_acked)
+      continue;
+    if (p->pn + 3 <= s->largest_acked || now - p->t >= delay) {
+      retransmit(Q, space, p);
+    } else {
+      unsigned due = p->t + delay;
+      if (!s->loss_time || (int)(due - s->loss_time) < 0)
+        s->loss_time = due;
+    }
+  }
+}
+
+struct ackinfo {
+  uint64_t largest;
+  struct range r[32];
+  int n;
+};
+
+/* Read the body of an ACK frame (after its type); 0 if malformed. Ranges beyond the 32 we keep are skipped. */
+static int read_ack(const uint8_t *p, uint32_t *o, uint32_t len, int ecn, struct ackinfo *ai)
+{
+  uint64_t delay, count, first, gap, rlen, x;
+  if (!getvar(p, o, len, &ai->largest) || !getvar(p, o, len, &delay) || !getvar(p, o, len, &count) ||
+      !getvar(p, o, len, &first) || first > ai->largest)
+    return 0;
+  uint64_t lo = ai->largest - first;
+  ai->r[0].hi = ai->largest;
+  ai->r[0].lo = lo;
+  ai->n = 1;
+  for (uint64_t i = 0; i < count; i++) {
+    if (!getvar(p, o, len, &gap) || !getvar(p, o, len, &rlen) || lo < gap + 2)
+      return 0;
+    uint64_t hi = lo - gap - 2;
+    if (rlen > hi)
+      return 0;
+    lo = hi - rlen;
+    if (ai->n < 32) {
+      ai->r[ai->n].hi = hi;
+      ai->r[ai->n].lo = lo;
+      ai->n++;
+    }
+  }
+  if (ecn && (!getvar(p, o, len, &x) || !getvar(p, o, len, &x) || !getvar(p, o, len, &x)))
+    return 0;
+  return 1;
+}
+
+static void rtt_sample(struct quic *Q, unsigned rtt)
+{
+  Q->latest_rtt = rtt;
+  if (!Q->rtt_init) {
+    Q->rtt_init = 1;
+    Q->srtt = rtt;
+    Q->rttvar = rtt / 2;
+    return;
+  }
+  unsigned diff = Q->srtt > rtt ? Q->srtt - rtt : rtt - Q->srtt;
+  Q->rttvar = (3 * Q->rttvar + diff) / 4;
+  Q->srtt = (7 * Q->srtt + rtt) / 8;
+}
+
+/* An ACK arrived in `space`: retire what it covers, take an RTT sample from the largest, then look for losses. */
+static void apply_ack(struct quic *Q, int space, const struct ackinfo *ai)
+{
+  struct space *s = &Q->sp[space];
+  int newly = 0;
+  for (int i = 0; i < SENT_MAX; i++) {
+    struct sent_pkt *p = &s->sent[i];
+    if (!p->frames)
+      continue;
+    for (int k = 0; k < ai->n; k++)
+      if (p->pn >= ai->r[k].lo && p->pn <= ai->r[k].hi) {
+        if (p->pn == ai->largest)
+          rtt_sample(Q, qnow() - p->t);
+        free(p->frames);
+        p->frames = 0;
+        newly = 1;
+        break;
+      }
+  }
+  if (!s->has_acked || ai->largest > s->largest_acked) {
+    s->largest_acked = ai->largest;
+    s->has_acked = 1;
+  }
+  if (newly)
+    Q->pto_count = 0;
+  detect_lost(Q, space);
+}
+
+/* How long to wait for an ACK before sending a probe. */
+static unsigned pto_interval(const struct quic *Q)
+{
+  unsigned srtt = Q->rtt_init ? Q->srtt : 333, var = Q->rtt_init ? Q->rttvar : 166;
+  unsigned base = srtt + (4 * var > 1 ? 4 * var : 1) + 25;
+  return base << (Q->pto_count < 6 ? Q->pto_count : 6);
+}
+
+/* The next time something needs doing in a space: a packet turning lost, else a probe timeout. 0 = nothing pending.
+ */
+static unsigned next_deadline(struct quic *Q, int *space, int *probe)
+{
+  unsigned best = 0;
+  *probe = 0;
+  for (int sp = 0; sp < 3; sp++) {
+    struct space *s = &Q->sp[sp];
+    if (s->loss_time && (!best || (int)(s->loss_time - best) < 0)) {
+      best = s->loss_time;
+      *space = sp;
+      *probe = 0;
+    }
+  }
+  if (best)
+    return best;
+  for (int sp = 0; sp < 3; sp++) {
+    struct space *s = &Q->sp[sp];
+    unsigned last = 0;
+    int any = 0;
+    for (int i = 0; i < SENT_MAX; i++)
+      if (s->sent[i].frames && (!any || (int)(s->sent[i].t - last) > 0)) {
+        last = s->sent[i].t;
+        any = 1;
+      }
+    if (!any)
+      continue;
+    unsigned due = last + pto_interval(Q);
+    if (!best || (int)(due - best) < 0) {
+      best = due;
+      *space = sp;
+      *probe = 1;
+    }
+  }
+  return best;
+}
+
+/* Fire whatever is due. After too many probes in a row the connection is given up. */
+static void run_timers(struct quic *Q)
+{
+  int space = 0, probe;
+  unsigned due = next_deadline(Q, &space, &probe);
+  if (!due || (int)(qnow() - due) < 0)
+    return;
+  if (!probe) {
+    detect_lost(Q, space);
+    return;
+  }
+  if (++Q->pto_count > PTO_MAX) {
+    Q->closed = 1;
+    return;
+  }
+  struct space *s = &Q->sp[space];
+  struct sent_pkt *oldest = 0;
+  for (int i = 0; i < SENT_MAX; i++)
+    if (s->sent[i].frames && (!oldest || s->sent[i].pn < oldest->pn))
+      oldest = &s->sent[i];
+  if (oldest)
+    retransmit(Q, space, oldest);
+}
+
+/* Wait (pumping the connection) until a packet slot is free in `space`; 0 if the connection died or went quiet. */
+static int wait_slot(struct quic *Q, int space)
+{
+  for (int idle = 0; idle < 6; idle++) {
+    if (sent_slot(&Q->sp[space]))
+      return 1;
+    int r = poll_once(Q);
+    if (r < 0)
+      return 0;
+    if (r > 0)
+      idle = 0;
+  }
+  return sent_slot(&Q->sp[space]) != 0;
+}
+
 /* ------------------------------------------------------ frame processing */
 
-static void process_frames(struct quic *Q, int space, const uint8_t *p, uint32_t len)
+/* Walk the frames of one decrypted packet. With `dry` nothing changes: it only reports (return 0) whether the
+ * packet carries CRYPTO or stream data past a gap, or more than a stream can buffer. */
+static int process_frames(struct quic *Q, int space, const uint8_t *p, uint32_t len, int dry)
 {
   uint32_t o = 0;
   int ackel = 0;
   while (o < len) {
     uint64_t t;
     if (!getvar(p, &o, len, &t))
-      return;
-    uint64_t a, b, c, rc;
+      break;
+    uint64_t a, b, c;
     switch (t) {
     case 0x00: /* PADDING */
       while (o < len && p[o] == 0x00)
@@ -599,40 +930,41 @@ static void process_frames(struct quic *Q, int space, const uint8_t *p, uint32_t
       ackel = 1;
       break; /* PING */
     case 0x02:
-    case 0x03: /* ACK */
-      if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b) || !getvar(p, &o, len, &rc) || !getvar(p, &o, len, &c))
-        return;
-      for (uint64_t i = 0; i < rc; i++)
-        if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b))
-          return;
-      if (t == 0x03)
-        if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b) || !getvar(p, &o, len, &c))
-          return;
+    case 0x03: { /* ACK */
+      struct ackinfo ai;
+      if (!read_ack(p, &o, len, t == 0x03, &ai))
+        goto done;
+      if (!dry)
+        apply_ack(Q, space, &ai);
       break;
+    }
     case 0x04: /* RESET_STREAM */
       if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b) || !getvar(p, &o, len, &c))
-        return;
+        goto done;
       ackel = 1;
       break;
     case 0x05: /* STOP_SENDING */
       if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b))
-        return;
+        goto done;
       ackel = 1;
       break;
     case 0x06: { /* CRYPTO */
       uint64_t off, clen;
-      if (!getvar(p, &o, len, &off) || !getvar(p, &o, len, &clen))
-        return;
-      if (o + clen > len)
-        return;
-      crypto_recv(Q, space, off, p + o, (uint32_t)clen);
+      if (!getvar(p, &o, len, &off) || !getvar(p, &o, len, &clen) || o + clen > len)
+        goto done;
+      if (dry) {
+        if (off > Q->sp[space].chave || off + clen > sizeof Q->sp[space].cbuf)
+          return 0;
+      } else {
+        crypto_recv(Q, space, off, p + o, (uint32_t)clen);
+      }
       o += (uint32_t)clen;
       ackel = 1;
       break;
     }
     case 0x07: /* NEW_TOKEN */
       if (!getvar(p, &o, len, &a))
-        return;
+        goto done;
       o += (uint32_t)a;
       ackel = 1;
       break;
@@ -646,75 +978,78 @@ static void process_frames(struct quic *Q, int space, const uint8_t *p, uint32_t
     case 0x0f: {
       uint64_t sid, soff = 0, slen;
       if (!getvar(p, &o, len, &sid))
-        return;
+        goto done;
       if ((t & 0x04) && !getvar(p, &o, len, &soff))
-        return;
+        goto done;
       if (t & 0x02) {
         if (!getvar(p, &o, len, &slen))
-          return;
+          goto done;
       } else
         slen = len - o;
       if (o + slen > len)
-        return;
-      stream_recv(Q, sid, soff, p + o, (uint32_t)slen, (int)(t & 0x01));
+        goto done;
+      if (dry) {
+        struct qstream *q = (sid & 3) == 0 ? find_stream(Q, sid) : 0;
+        if (q) {
+          if (soff > q->recv_off)
+            return 0;
+          uint64_t fresh = soff + slen > q->recv_off ? soff + slen - q->recv_off : 0;
+          if (fresh > QS_BUF - (q->r_len - q->r_pos))
+            return 0;
+        }
+      } else {
+        stream_recv(Q, sid, soff, p + o, (uint32_t)slen, (int)(t & 0x01));
+      }
       o += (uint32_t)slen;
       ackel = 1;
       break;
     }
     case 0x10: /* MAX_DATA */
       if (!getvar(p, &o, len, &a))
-        return;
-      if (a > Q->peer_max_data)
+        goto done;
+      if (!dry && a > Q->peer_max_data)
         Q->peer_max_data = a;
       ackel = 1;
       break;
     case 0x11: /* MAX_STREAM_DATA */
       if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b))
-        return;
+        goto done;
       ackel = 1;
       break;
     case 0x12:
     case 0x13: /* MAX_STREAMS */
       if (!getvar(p, &o, len, &a))
-        return;
-      if (t == 0x12 && a > Q->peer_max_bidi)
+        goto done;
+      if (!dry && t == 0x12 && a > Q->peer_max_bidi)
         Q->peer_max_bidi = a;
       ackel = 1;
       break;
     case 0x14: /* DATA_BLOCKED */
-    {
       if (!getvar(p, &o, len, &a))
-        return;
-    }
+        goto done;
       ackel = 1;
       break;
     case 0x15: /* STREAM_DATA_BLOCKED */
       if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b))
-        return;
+        goto done;
       ackel = 1;
       break;
     case 0x16:
     case 0x17: /* STREAMS_BLOCKED */
-    {
       if (!getvar(p, &o, len, &a))
-        return;
-    }
+        goto done;
       ackel = 1;
       break;
     case 0x18: /* NEW_CONNECTION_ID */
-      if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b))
-        return;
-      if (o >= len)
-        return;
+      if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b) || o >= len)
+        goto done;
       o += 1 + p[o]; /* len byte + CID */
       o += 16;       /* stateless reset token */
       ackel = 1;
       break;
     case 0x19: /* RETIRE_CONNECTION_ID */
-    {
       if (!getvar(p, &o, len, &a))
-        return;
-    }
+        goto done;
       ackel = 1;
       break;
     case 0x1a:
@@ -727,26 +1062,32 @@ static void process_frames(struct quic *Q, int space, const uint8_t *p, uint32_t
       break;   /* PATH_RESPONSE */
     case 0x1c: /* CONNECTION_CLOSE (transport) */
       if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b) || !getvar(p, &o, len, &c))
-        return;
-      o += (uint32_t)c;
-      Q->closed = 1;
-      return;
+        goto done;
+      if (!dry)
+        Q->closed = 1;
+      goto done;
     case 0x1d: /* CONNECTION_CLOSE (app) */
       if (!getvar(p, &o, len, &a) || !getvar(p, &o, len, &b))
-        return;
-      o += (uint32_t)b;
-      Q->closed = 1;
-      return;
-    case 0x1e:
+        goto done;
+      if (!dry)
+        Q->closed = 1;
+      goto done;
+    case 0x1e: /* HANDSHAKE_DONE */
       ackel = 1;
-      Q->hs_confirmed = 1;
-      break; /* HANDSHAKE_DONE */
+      if (!dry) {
+        Q->hs_confirmed = 1;
+        sent_clear(&Q->sp[S_HS]); /* the Handshake keys are retired */
+        Q->sp[S_HS].ackp = 0;
+      }
+      break;
     default:
-      return; /* unknown: stop */
+      goto done; /* unknown: stop */
     }
   }
-  if (ackel)
+done:
+  if (!dry && ackel)
     Q->sp[space].ackp = 1;
+  return 1;
 }
 
 /* -------------------------------------------------- packet protection */
@@ -816,10 +1157,17 @@ static int decrypt_pkt(struct quic *Q, int space, uint8_t *d, uint32_t pkt0, uin
   if (aes128_gcm_open(s->sk, nonce, aad, al, d + ct_off, ct_len, pt, tag) != 0)
     return -1;
 
+  if (rr_has(s, pn)) { /* a duplicate: acknowledge again, nothing else */
+    s->ackp = 1;
+    return 0;
+  }
+  if (!process_frames(Q, space, pt, ct_len, 1))
+    return 0; /* data past a gap: dropped unacknowledged, so the server sends it again */
+  rr_add(s, pn);
   if (!s->hrec || pn > s->lrec)
     s->lrec = pn;
   s->hrec = 1;
-  process_frames(Q, space, pt, ct_len);
+  process_frames(Q, space, pt, ct_len, 0);
   return 0;
 }
 
@@ -842,12 +1190,15 @@ static void handle_retry(struct quic *Q, const uint8_t *retry_scid, int sl, cons
   Q->dcid_len = sl;
   Q->server_cid_set = 0;                        /* adopt the real Initial's SCID next */
   derive_initial_keys(Q, Q->dcid, Q->dcid_len); /* new DCID => new Initial keys */
+  sent_clear(&Q->sp[S_INIT]);
+  Q->sp[S_INIT].nrr = 0;
 }
 
 /* --------------------------------------------------------- packet send */
 
-/* Encrypt+send `frames` as a single packet (its own datagram) in `space`. */
-static int emit(struct quic *Q, int space, const uint8_t *frames, uint32_t flen)
+/* Encrypt+send `frames` as a single packet (its own datagram) in `space`. With `track` the frames are kept until
+ * the packet is acknowledged, so they can be sent again if it is lost. */
+static int emit_packet(struct quic *Q, int space, const uint8_t *frames, uint32_t flen, uint64_t *pn_out)
 {
   struct space *s = &Q->sp[space];
   if (!s->hk)
@@ -914,7 +1265,7 @@ static int emit(struct quic *Q, int space, const uint8_t *frames, uint32_t flen)
     out[0] ^= mask[0] & 0x0f;
     for (int i = 0; i < 4; i++)
       out[pn_off + i] ^= mask[1 + i];
-    s->spn++;
+    *pn_out = s->spn++;
     return net_send(Q->sock, out, (int)dglen) < 0 ? -1 : 0;
   }
 
@@ -944,23 +1295,53 @@ static int emit(struct quic *Q, int space, const uint8_t *frames, uint32_t flen)
   out[0] ^= mask[0] & 0x1f;
   for (int i = 0; i < 4; i++)
     out[pn_off + i] ^= mask[1 + i];
-  s->spn++;
+  *pn_out = s->spn++;
   return net_send(Q->sock, out, (int)dglen) < 0 ? -1 : 0;
+}
+
+static int emit(struct quic *Q, int space, const uint8_t *frames, uint32_t flen, int track)
+{
+  struct space *s = &Q->sp[space];
+  if (track && !sent_slot(s) && !wait_slot(Q, space))
+    return -1;
+  uint64_t pn = 0;
+  int rc = emit_packet(Q, space, frames, flen, &pn);
+  if (rc == 0 && space == S_HS && !Q->init_dropped) { /* Handshake packets flow: the Initial keys are retired */
+    Q->init_dropped = 1;
+    sent_clear(&Q->sp[S_INIT]);
+    Q->sp[S_INIT].ackp = 0;
+  }
+  struct sent_pkt *rec = track && rc == 0 ? sent_slot(s) : 0;
+  if (rec) {
+    rec->frames = malloc(flen);
+    if (rec->frames) {
+      memcpy(rec->frames, frames, flen);
+      rec->pn = pn;
+      rec->len = flen;
+      rec->t = qnow();
+    }
+  }
+  return rc;
 }
 
 static void send_ack(struct quic *Q, int space)
 {
-  if (!Q->sp[space].hk || !Q->sp[space].hrec)
+  struct space *s = &Q->sp[space];
+  if (!s->hk || !s->nrr)
     return;
-  uint8_t f[24];
+  uint8_t f[RR_MAX * 16 + 32];
   uint32_t p = 0;
   f[p++] = 0x02;
-  p += putvar(f + p, Q->sp[space].lrec); /* Largest Acknowledged */
-  p += putvar(f + p, 0);                 /* ACK Delay */
-  p += putvar(f + p, 0);                 /* ACK Range Count */
-  p += putvar(f + p, Q->sp[space].lrec); /* First ACK Range = [0..largest] */
-  emit(Q, space, f, p);
-  Q->sp[space].ackp = 0;
+  p += putvar(f + p, s->rr[0].hi);               /* Largest Acknowledged */
+  p += putvar(f + p, 0);                         /* ACK Delay */
+  p += putvar(f + p, (uint64_t)(s->nrr - 1));    /* ACK Range Count */
+  p += putvar(f + p, s->rr[0].hi - s->rr[0].lo); /* First ACK Range */
+  for (int i = 1; i < s->nrr; i++) {
+    p += putvar(f + p, s->rr[i - 1].lo - s->rr[i].hi - 2); /* Gap */
+    p += putvar(f + p, s->rr[i].hi - s->rr[i].lo);         /* ACK Range Length */
+  }
+  emit(Q, space, f, p, 0);
+  s->ackp = 0;
 }
 
 static void send_pending_acks(struct quic *Q)
@@ -980,7 +1361,7 @@ static int send_crypto(struct quic *Q, int space, const uint8_t *data, uint32_t 
   p += putvar(f + p, len);
   memcpy(f + p, data, len);
   p += len;
-  return emit(Q, space, f, p);
+  return emit(Q, space, f, p, 1);
 }
 
 /* --------------------------------------------------- datagram processing */
@@ -1061,25 +1442,44 @@ static void grant_flow(struct quic *Q)
   uint32_t p = 0;
   f[p++] = 0x10; /* MAX_DATA */
   p += putvar(f + p, Q->rx_limit);
-  emit(Q, S_APP, f, p);
+  emit(Q, S_APP, f, p, 1);
 }
 
-/* Read one datagram, process it, and flush owed ACKs. 1 processed / 0 idle /
- * QUIC_EINTR / QUIC_ECLOSED. */
+/* Read one datagram, process it, and flush owed ACKs, running loss and probe timers meanwhile. 1 processed / 0 idle
+ * (about 2 s without a datagram) / QUIC_EINTR / QUIC_ECLOSED. */
 static int poll_once(struct quic *Q)
 {
   uint8_t *dg = Q->rx_dg;
-  int n = net_recv(Q->sock, dg, (int)sizeof Q->rx_dg);
-  if (n == NET_EINTR)
-    return QUIC_EINTR;
-  if (n <= 0)
-    return 0;
-  int r = process_datagram(Q, dg, (uint32_t)n);
-  send_pending_acks(Q);
-  grant_flow(Q);
-  if (r < 0 || Q->closed)
-    return QUIC_ECLOSED;
-  return 1;
+  unsigned start = qnow();
+  for (;;) {
+    run_timers(Q);
+    if (Q->closed)
+      return QUIC_ECLOSED;
+    int space, probe, n;
+    if (next_deadline(Q, &space, &probe)) { /* a timer is running: look at the socket without blocking */
+      n = net_recv_nb(Q->sock, dg, (int)sizeof Q->rx_dg);
+      if (n == NET_EINTR)
+        return QUIC_EINTR;
+      if (n <= 0) {
+        if (qnow() - start >= 2000)
+          return 0;
+        msleep(2);
+        continue;
+      }
+    } else {
+      n = net_recv(Q->sock, dg, (int)sizeof Q->rx_dg);
+      if (n == NET_EINTR)
+        return QUIC_EINTR;
+      if (n <= 0)
+        return 0;
+    }
+    int r = process_datagram(Q, dg, (uint32_t)n);
+    send_pending_acks(Q);
+    grant_flow(Q);
+    if (r < 0 || Q->closed || Q->cert_fail)
+      return QUIC_ECLOSED;
+    return 1;
+  }
 }
 
 /* ---------------------------------------------------------- public API */
@@ -1090,6 +1490,9 @@ int quic_connect(quic **out, const char *host, uint16_t port, const char *alpn)
   if (!Q)
     return QUIC_ESOCK;
   Q->rx_limit = 0x1000000; /* initial_max_data we advertise */
+  certs_init(&Q->certs);
+  for (int i = 0; host[i] && i < (int)sizeof Q->host - 1; i++)
+    Q->host[i] = host[i];
 
   Q->sock = net_dial(host, port, SK_UDP); /* resolve to IP; SNI stays `host` below */
   if (Q->sock < 0) {
@@ -1117,6 +1520,10 @@ int quic_connect(quic **out, const char *host, uint16_t port, const char *alpn)
   int tries = 0, last_retry = Q->did_retry;
   while (!(Q->app_done && Q->hs_sent_fin)) {
     int r = poll_once(Q);
+    if (Q->cert_fail) {
+      err = QUIC_ECERT;
+      goto fail;
+    }
     if (r == QUIC_EINTR) {
       err = QUIC_EINTR;
       goto fail;
@@ -1131,17 +1538,10 @@ int quic_connect(quic **out, const char *host, uint16_t port, const char *alpn)
       send_crypto(Q, S_INIT, Q->chello, Q->chello_len);
       continue;
     }
-    if (r == 0) { /* idle: retransmit / nudge */
+    if (r == 0) { /* quiet; lost handshake packets are resent by the loss timers */
       if (++tries > 8) {
         err = QUIC_EHANDSHAKE;
         goto fail;
-      }
-      if (!Q->got_sh)
-        send_crypto(Q, S_INIT, Q->chello, Q->chello_len);
-      else {
-        Q->sp[S_INIT].ackp = Q->sp[S_INIT].hrec;
-        Q->sp[S_HS].ackp = Q->sp[S_HS].hrec;
-        send_pending_acks(Q);
       }
       continue;
     }
@@ -1156,6 +1556,8 @@ int quic_connect(quic **out, const char *host, uint16_t port, const char *alpn)
 
 fail:
   net_close(Q->sock);
+  for (int i = 0; i < 3; i++)
+    sent_clear(&Q->sp[i]);
   free(Q);
   return err;
 }
@@ -1192,7 +1594,7 @@ int quic_send(quic *Q, uint64_t sid, const void *data, uint32_t len, int fin)
     fp += putvar(f + fp, chunk);
     memcpy(f + fp, p + done, chunk);
     fp += chunk;
-    if (emit(Q, S_APP, f, fp) < 0)
+    if (emit(Q, S_APP, f, fp, 1) < 0)
       return -1;
     done += chunk;
   } while (done < len);
@@ -1203,7 +1605,7 @@ int quic_send(quic *Q, uint64_t sid, const void *data, uint32_t len, int fin)
 
 int quic_read(quic *Q, uint64_t sid, void *buf, uint32_t max, int *fin)
 {
-  struct qstream *q = get_stream(Q, sid);
+  struct qstream *q = find_stream(Q, sid);
   if (!q) {
     if (fin)
       *fin = 0;
@@ -1259,8 +1661,10 @@ void quic_close(quic *Q)
     p += putvar(f + p, 0); /* error = NO_ERROR */
     p += putvar(f + p, 0); /* frame type */
     p += putvar(f + p, 0); /* reason length */
-    emit(Q, S_APP, f, p);
+    emit(Q, S_APP, f, p, 0);
   }
   net_close(Q->sock);
+  for (int i = 0; i < 3; i++)
+    sent_clear(&Q->sp[i]);
   free(Q);
 }
