@@ -49,18 +49,31 @@
 #define P_OUTAMPCAP 0x12   /* output amp capabilities         */
 #define P_GPIOCNT 0x11     /* GPIO count (bidir/out/in fields)*/
 
-#define V_GET_CONN 0xF0200u    /* get connection list entry       */
-#define V_GET_CFGDEF 0xF1C00u  /* get configuration default       */
-#define V_SET_POWER 0x70500u   /* + state (D0 = 0)                 */
-#define V_SET_FORMAT 0x20000u  /* + 16-bit format                 */
-#define V_SET_STREAM 0x70600u  /* + (tag<<4)|channel              */
-#define V_SET_CONNSEL 0x70100u /* + index (selector)              */
-#define V_SET_PINCTL 0x70700u  /* + control bits                  */
-#define V_SET_EAPD 0x70C00u    /* + bit1 EAPD enable              */
-#define V_SET_AMP 0x30000u     /* + 16-bit amp gain/mute payload  */
-#define V_SET_GPIODAT 0x71500u /* + 8-bit GPIO data               */
-#define V_SET_GPIOMSK 0x71600u /* + 8-bit GPIO enable mask        */
-#define V_SET_GPIODIR 0x71700u /* + 8-bit GPIO direction (1=out)  */
+#define V_GET_CONN 0xF0200u     /* get connection list entry       */
+#define V_GET_CFGDEF 0xF1C00u   /* get configuration default       */
+#define V_SET_POWER 0x70500u    /* + state (D0 = 0)                 */
+#define V_SET_FORMAT 0x20000u   /* + 16-bit format                 */
+#define V_SET_STREAM 0x70600u   /* + (tag<<4)|channel              */
+#define V_SET_CONNSEL 0x70100u  /* + index (selector)              */
+#define V_SET_PINCTL 0x70700u   /* + control bits                  */
+#define V_SET_EAPD 0x70C00u     /* + bit1 EAPD enable              */
+#define V_SET_AMP 0x30000u      /* + 16-bit amp gain/mute payload  */
+#define V_SET_GPIODAT 0x71500u  /* + 8-bit GPIO data               */
+#define V_SET_GPIOMSK 0x71600u  /* + 8-bit GPIO enable mask        */
+#define V_SET_GPIODIR 0x71700u  /* + 8-bit GPIO direction (1=out)  */
+#define V_GET_PINSENSE 0xF0900u /* bit31 presence, bit30 ELD valid */
+#define V_TRIG_PINSENSE 0x70900u
+#define V_SET_CVT_CHANS 0x72D00u /* + channel count - 1             */
+#define V_SET_DIGCONV 0x70D00u   /* + digital converter control 1   */
+#define V_SET_DIP_INDEX 0x73000u /* + (packet << 6) | byte index    */
+#define V_SET_DIP_DATA 0x73100u  /* + infoframe byte                */
+#define V_SET_DIP_XMIT 0x73200u  /* + transmit mode                 */
+
+#define PINCAP_TRIG (1u << 1) /* sense needs a trigger first     */
+#define PINCAP_PRES (1u << 2) /* presence detect                 */
+#define PINCAP_HDMI (1u << 7)
+#define DIP_XMIT_OFF 0x00
+#define DIP_XMIT_BEST 0xC0 /* every frame, best effort        */
 
 #define WT_DAC 0   /* audio output converter        */
 #define WT_MIXER 2 /* mixer                         */
@@ -256,6 +269,8 @@ static void enable_codec_gpios(uint16_t afg)
 /* All output pins (speaker, headphone, line-out) are kept so the active one can switch at runtime. */
 #define MAX_OUTPUTS 6
 struct out_ep {
+  uint8_t codec;   /* codec address the widgets belong to            */
+  uint32_t pincap; /* pin capabilities                               */
   uint16_t pin;    /* the output pin widget                          */
   uint16_t dac;    /* DAC reached from it                            */
   uint16_t mix;    /* mixer/selector hop, 0 = direct                 */
@@ -270,9 +285,11 @@ static int n_outs;
 static int cur_out = -1; /* active index into outs[] (-1 = none)           */
 
 /* Default-device code -> rank (lower wins) and a human name. */
-static int dev_rank(int dev)
+static int out_rank(const struct out_ep *e)
 {
-  switch (dev) {
+  if (e->pincap & PINCAP_HDMI)
+    return 4;
+  switch (e->dev) {
   case 0x1:
     return 0; /* Speaker  */
   case 0x0:
@@ -295,6 +312,37 @@ static const char *dev_name(int dev)
   default:
     return "Digital Out";
   }
+}
+
+/* HDMI sinks come and go; analog endpoints always count as present. */
+static bool out_present(const struct out_ep *e)
+{
+  if (!(e->pincap & PINCAP_HDMI) || !(e->pincap & PINCAP_PRES))
+    return true;
+  uintptr_t fl = irq_save();
+  uint8_t saved = codec;
+  codec = e->codec;
+  if (e->pincap & PINCAP_TRIG)
+    codec_cmd(e->pin, V_TRIG_PINSENSE);
+  uint32_t sense = codec_cmd(e->pin, V_GET_PINSENSE);
+  codec = saved;
+  irq_restore(fl);
+  return sense != 0xFFFFFFFFu && (sense >> 31);
+}
+
+/* Audio InfoFrame: 2-channel LPCM, speaker allocation FL/FR. */
+static void hdmi_send_audio_infoframe(uint16_t pin)
+{
+  uint8_t f[14] = {0x84, 0x01, 0x0A, 0, 0x01};
+  uint8_t sum = 0;
+  for (int i = 0; i < 14; i++)
+    sum += f[i];
+  f[3] = (uint8_t)-sum;
+  codec_cmd(pin, V_SET_DIP_XMIT | DIP_XMIT_OFF);
+  codec_cmd(pin, V_SET_DIP_INDEX);
+  for (int i = 0; i < 14; i++)
+    codec_cmd(pin, V_SET_DIP_DATA | f[i]);
+  codec_cmd(pin, V_SET_DIP_XMIT | DIP_XMIT_BEST);
 }
 
 /* Pick the widget the volume keys drive for the active path (pin > DAC > mixer). */
@@ -322,6 +370,7 @@ static void pick_vol_widget(void)
 static void apply_active_globals(void)
 {
   struct out_ep *e = &outs[cur_out];
+  codec = e->codec;
   dac_nid = e->dac;
   pin_nid = e->pin;
   path_mix = e->mix;
@@ -334,15 +383,16 @@ static void apply_active_globals(void)
 
 /* Collect output pins that reach a DAC, ranked speaker > line-out > headphone; a fallback pass trusts mislabeled pins.
  */
-static int collect_outputs(uint16_t w_start, int w_count)
+static void collect_outputs(uint16_t w_start, int w_count)
 {
-  n_outs = 0;
-  for (int pass = 0; pass < 2 && n_outs == 0; pass++) {
+  int first = n_outs;
+  for (int pass = 0; pass < 2 && n_outs == first; pass++) {
     for (int i = 0; i < w_count && n_outs < MAX_OUTPUTS; i++) {
       uint16_t w = (uint16_t)(w_start + i);
       if (widget_type(w) != WT_PIN)
         continue;
-      if (!((get_param(w, P_PINCAP) >> 4) & 1)) /* output-capable?  */
+      uint32_t pincap = get_param(w, P_PINCAP);
+      if (!((pincap >> 4) & 1)) /* output-capable?  */
         continue;
       uint32_t cfg = codec_cmd(w, V_GET_CFGDEF);
       int conn = (int)((cfg >> 30) & 0x3); /* 1 = no phys conn */
@@ -355,7 +405,11 @@ static int collect_outputs(uint16_t w_start, int w_count)
         path_mix = save_mix;
         continue;
       }
+      if (pincap & PINCAP_HDMI)
+        codec_cmd(w, V_SET_POWER | 0x00); /* presence sense needs D0 */
       struct out_ep *e = &outs[n_outs++];
+      e->codec = codec;
+      e->pincap = pincap;
       e->pin = w;
       e->dac = dac_nid;
       e->mix = path_mix;
@@ -366,21 +420,10 @@ static int collect_outputs(uint16_t w_start, int w_count)
       e->dev = dev;
     }
   }
-  /* Insertion-sort by rank so the speaker is the default active output. */
-  for (int i = 1; i < n_outs; i++) {
-    struct out_ep tmp = outs[i];
-    int j = i - 1;
-    while (j >= 0 && dev_rank(outs[j].dev) > dev_rank(tmp.dev)) {
-      outs[j + 1] = outs[j];
-      j--;
-    }
-    outs[j + 1] = tmp;
-  }
-  return n_outs;
 }
 
-/* Collect output pins and pick the best one that reaches a DAC. */
-static bool enumerate_codec(void)
+/* Collect the output pins of the current codec's audio function group. */
+static void enumerate_codec(void)
 {
   uint32_t sub = get_param(0, P_SUBNODE); /* root's function groups   */
   uint16_t fg_start = (uint16_t)((sub >> 16) & 0xFF);
@@ -395,7 +438,7 @@ static bool enumerate_codec(void)
     }
   }
   if (!afg)
-    return false;
+    return;
   codec_cmd(afg, V_SET_POWER | 0x00); /* power the AFG to D0      */
   enable_codec_gpios(afg);            /* unmute a GPIO-gated amp  */
 
@@ -403,12 +446,7 @@ static bool enumerate_codec(void)
   uint16_t w_start = (uint16_t)((wsub >> 16) & 0xFF);
   int w_count = (int)(wsub & 0xFF);
 
-  /* Make the best-ranked pin active so volume keys and the first play route correctly. */
-  if (!collect_outputs(w_start, w_count))
-    return false;
-  cur_out = 0;
-  apply_active_globals();
-  return true;
+  collect_outputs(w_start, w_count);
 }
 
 static bool find_controller(uint8_t *bus, uint8_t *slot, uint8_t *func)
@@ -527,19 +565,31 @@ void hda_init(void)
     con_write("hda: controller up but no codec responded\n");
     return;
   }
-  for (codec = 0; codec < 15; codec++)
-    if (sts & (1u << codec))
-      break;
-
   if (!ring_setup()) {
     con_write("hda: ring buffer alloc failed\n");
     return;
   }
 
-  if (!enumerate_codec()) {
+  for (codec = 0; codec < 15; codec++)
+    if (sts & (1u << codec))
+      enumerate_codec();
+  if (!n_outs) {
     con_write("hda: no usable output path on codec\n");
     return;
   }
+
+  /* Insertion-sort by rank so the speaker is the default active output. */
+  for (int i = 1; i < n_outs; i++) {
+    struct out_ep tmp = outs[i];
+    int j = i - 1;
+    while (j >= 0 && out_rank(&outs[j]) > out_rank(&tmp)) {
+      outs[j + 1] = outs[j];
+      j--;
+    }
+    outs[j + 1] = tmp;
+  }
+  cur_out = 0;
+  apply_active_globals();
 
   /* The first output stream descriptor sits after the input descriptors. */
   uint16_t gcap = rd16(R_GCAP);
@@ -547,7 +597,7 @@ void hda_init(void)
   sd_off = SD_BASE + (uint32_t)num_iss * SD_STRIDE;
 
   present = true;
-  con_printf("hda: HD Audio ready (codec %u, dac nid %u, pin nid %u)\n", codec, dac_nid, pin_nid);
+  con_printf("hda: HD Audio ready (%d outputs, codec %u, dac nid %u, pin nid %u)\n", n_outs, codec, dac_nid, pin_nid);
 }
 
 int hda_present(void) { return present; }
@@ -605,18 +655,29 @@ static void configure_path(void)
   }
 
   /* Disable other output pins: speaker and headphone often share a DAC, so both would sound. */
+  uintptr_t fl = irq_save(); /* the volume IRQ must not see another codec's address */
   for (int i = 0; i < n_outs; i++) {
     if (i == cur_out)
       continue;
+    codec = outs[i].codec;
     codec_cmd(outs[i].pin, V_SET_PINCTL | 0x00); /* output disable */
     set_out_amp(outs[i].pin, 0, true);           /* mute its amp   */
   }
+  codec = outs[cur_out].codec;
+  irq_restore(fl);
 
   /* Active pin: power, output enable (+ HP amp), EAPD, amp. */
   codec_cmd(pin_nid, V_SET_POWER | 0x00);
   codec_cmd(pin_nid, V_SET_PINCTL | (pin_is_hp ? 0xC0 : 0x40));
   codec_cmd(pin_nid, V_SET_EAPD | 0x02);
   amp_out_max(pin_nid);
+
+  if (outs[cur_out].pincap & PINCAP_HDMI) {
+    codec_cmd(pin_nid, V_SET_CONNSEL | (uint32_t)pin_sel_idx);
+    codec_cmd(dac_nid, V_SET_CVT_CHANS | 1);
+    codec_cmd(dac_nid, V_SET_DIGCONV | 0x01);
+    hdmi_send_audio_infoframe(pin_nid);
+  }
 
   /* Override the volume widget's amp with the current level. */
   hda_apply_volume();
@@ -803,14 +864,37 @@ void hda_stream_close(void)
   s_started = false;
 }
 
-/* Output endpoint switching for the Sound panel and /sys; degrade to empty/-1 with no codec. */
-int hda_output_count(void) { return present ? n_outs : 0; }
+/* Output endpoint switching for the Sound panel and /sys; degrade to empty/-1 with no codec. Indices count the
+ * endpoints a user can pick: analog ones always, HDMI only while a sink is attached. */
+static int visible_to_real(int v)
+{
+  for (int i = 0; i < n_outs; i++)
+    if (out_present(&outs[i]) && v-- == 0)
+      return i;
+  return -1;
+}
+
+int hda_output_count(void)
+{
+  int n = 0;
+  for (int i = 0; present && i < n_outs; i++)
+    n += out_present(&outs[i]);
+  return n;
+}
 
 int hda_output_name(int i, char *out, int max)
 {
-  if (!present || i < 0 || i >= n_outs || max <= 0)
+  int r = present ? visible_to_real(i) : -1;
+  if (r < 0 || max <= 0)
     return 0;
-  const char *s = dev_name(outs[i].dev);
+  static const char *const hdmi[] = {"HDMI", "HDMI 2", "HDMI 3", "HDMI 4"};
+  const char *s = dev_name(outs[r].dev);
+  if (outs[r].pincap & PINCAP_HDMI) {
+    int ord = 0;
+    for (int k = 0; k < r; k++)
+      ord += (outs[k].pincap & PINCAP_HDMI) != 0;
+    s = hdmi[ord < 4 ? ord : 3];
+  }
   int k = 0;
   for (; s[k] && k < max - 1; k++)
     out[k] = s[k];
@@ -818,13 +902,22 @@ int hda_output_name(int i, char *out, int max)
   return 1;
 }
 
-int hda_output_active(void) { return present ? cur_out : -1; }
+int hda_output_active(void)
+{
+  if (!present || !out_present(&outs[cur_out]))
+    return -1;
+  int v = 0;
+  for (int i = 0; i < cur_out; i++)
+    v += out_present(&outs[i]);
+  return v;
+}
 
 int hda_output_select(int i)
 {
-  if (!present || i < 0 || i >= n_outs)
+  int r = present ? visible_to_real(i) : -1;
+  if (r < 0)
     return -1;
-  cur_out = i;
+  cur_out = r;
   /* Re-route a live stream now; otherwise record the choice for the next play. */
   if (s_active)
     configure_path();
