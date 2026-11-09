@@ -349,7 +349,8 @@ void html_set_charset(const char *content_type); /* charset from HTTP CT */
 
 /* js.c: run every inline <script> in `root` against a fresh JS context. */
 void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn fetch);
-void js_page_end(void); /* reclaim the page ctx  */
+void js_page_end(void);       /* reclaim the page ctx  */
+void js_page_interrupt(void); /* any thread: unwind the running page script (cleared when the next ctx starts) */
 int js_dispatch_dom_event(struct dom_node *target, const char *type, int x, int y);
 int js_has_listeners(void); /* any listener registered */
 bool js_escape_key(void);   /* Escape: close the topmost modal dialog or auto popover */
@@ -471,7 +472,7 @@ struct net_log {
 int devtools_net_begin(const char *method, const char *url);
 void devtools_net_update(int id, const struct net_log *e);
 void devtools_net_add(const struct net_log *e);
-void devtools_net_reset(void);
+void devtools_nav_reset(void); /* new top-level navigation: clear the net log and the console */
 
 /* Per-tab devtools view state; `cap` is an opaque capture handle owned by devtools.c. */
 #define DT_PANELS 5

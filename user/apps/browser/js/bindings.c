@@ -2624,7 +2624,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
   def_method(g_xhr_proto, "open", xhr_open, 2);
   def_method(g_xhr_proto, "setRequestHeader", xhr_setheader, 2);
   def_method(g_xhr_proto, "send", xhr_send, 1);
-  def_method(g_xhr_proto, "abort", el_noop, 0);
+  def_method(g_xhr_proto, "abort", xhr_abort, 0);
   def_method(g_xhr_proto, "overrideMimeType", el_noop, 1);
   def_method(g_xhr_proto, "getResponseHeader", xhr_getheader, 1);
   def_method(g_xhr_proto, "getAllResponseHeaders", xhr_getallheaders, 0);

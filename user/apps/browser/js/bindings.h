@@ -247,6 +247,10 @@ js_value xhr_getallheaders(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value xhr_getheader(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value xhr_open(js_ctx *ctx, js_value t, js_value *args, int argc);
 js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc);
+js_value xhr_abort(js_ctx *ctx, js_value t, js_value *args, int argc);
+
+/* A script-issued request that returned nothing because the user stopped or navigated away, not a network failure */
+static inline int net_aborted(void) { return B->abort_load || js_irq_stopped(g_ctx->irq); }
 js_value xhr_setheader(js_ctx *ctx, js_value t, js_value *args, int argc);
 
 void ce_connect(struct dom_node *n);

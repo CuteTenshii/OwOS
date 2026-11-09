@@ -9,6 +9,8 @@
 
 /* ------------------------------------------------------- runner ----------- */
 
+static js_irq g_page_irq; /* lets the main thread stop a running page script on navigation */
+
 /* What structured clone carries across threads besides plain data: Blobs and OffscreenCanvases */
 static int page_clone_write(js_ctx *ctx, js_value v, char kind[16], unsigned char **bytes, int *len, char **meta)
 {
@@ -496,6 +498,9 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
 
   g_doc_root = root;
   g_ctx = js_ctx_new(js_print);
+  __atomic_store_n(&g_page_irq.stop, 0, __ATOMIC_RELEASE);
+  if (g_ctx)
+    g_ctx->irq = &g_page_irq;
   if (!g_ctx) {
     for (i = 0; i < nurls; i++) {
       if (urls[i])
@@ -659,6 +664,8 @@ void js_run_document(struct dom_node *root, const char *page_url, res_batch_fn f
 
   fire_lifecycle();
 }
+
+void js_page_interrupt(void) { __atomic_store_n(&g_page_irq.stop, 1, __ATOMIC_RELEASE); }
 
 /* Reclaim the page's JS context: drop roots, free the heap, free the script ASTs */
 void js_page_end(void)

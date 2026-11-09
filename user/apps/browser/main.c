@@ -224,8 +224,11 @@ int main(int argc, char **argv)
     }
     B->hist_len = tabs[active_tab].hist_n;
 
-    if (B->loading && !prev_loading)   /* fetch started */
+    if (B->loading && !prev_loading) { /* fetch started */
       gfx_cursor(id, WIN_CURSOR_BUSY); /* spinner while loading */
+      tab_sync_active();               /* title was cleared: label falls back to the host */
+      update_title(id);
+    }
     if (prev_loading && !B->loading) { /* fetch finished */
       gfx_cursor(id, WIN_CURSOR_ARROW);
       imgc_clear();      /* drop the old page's decoded images */

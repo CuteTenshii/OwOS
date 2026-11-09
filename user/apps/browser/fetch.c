@@ -1365,7 +1365,7 @@ void do_fetch(void)
   B->pg->perm_policy = 0; /* drop the old Permissions-Policy; parse_response rebuilds it */
   free(B->pg->perm_policy_hdr);
   B->pg->perm_policy_hdr = 0;
-  devtools_net_reset(); /* a new top-level navigation starts a fresh net log */
+  devtools_nav_reset(); /* a new top-level navigation starts a fresh net log + console */
   sapp(url, &n, sizeof url, B->req_url);
   B->dl_saved = 0;
   B->scripts_pending = 0; /* only an HTML render (html_to_text) re-arms it */

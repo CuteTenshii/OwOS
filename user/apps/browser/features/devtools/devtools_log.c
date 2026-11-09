@@ -274,7 +274,7 @@ void devtools_console_append(int level, const char *s, int len)
     dt_paint_only = true; /* repaint only if visible */
 }
 
-/* Network ring: one preformatted line per HTTP response, reset on navigation (devtools_net_reset). */
+/* Network ring: one preformatted line per HTTP response, reset on navigation (devtools_nav_reset). */
 struct conline dt_net[NET_MAX];
 int dt_net_start, dt_net_count;
 /* Structured request fields parallel to dt_net[], backing the detail view; url is heap. */
@@ -292,7 +292,7 @@ void dt_netinfo_clear(struct netinfo *ni)
   ni->method[0] = ni->ctype[0] = ni->err[0] = '\0';
 }
 
-void devtools_net_reset(void)
+void devtools_nav_reset(void)
 {
   mutex_lock(&dt_lk);
   for (int i = 0; i < dt_net_count; i++) {
@@ -305,6 +305,7 @@ void devtools_net_reset(void)
   dt_net_count = 0;
   dt_net_sel = -1;
   mutex_unlock(&dt_lk);
+  dt_con_clear();
   if (dt_open)
     B->seq++;
 }

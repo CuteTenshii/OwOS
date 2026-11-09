@@ -225,6 +225,8 @@ js_value win_fetch(js_ctx *ctx, js_value t, js_value *args, int argc)
     outlen = rs.len;
     strlcpy(resp_ctype, rs.ctype, sizeof resp_ctype);
   }
+  if (!body && net_aborted())
+    return js_promise_rejected(ctx, dom_exception(ctx, "AbortError", "The user aborted a request."));
   if (!body)
     return js_promise_rejected(ctx, js_make_error(ctx, ctx->type_error_proto, "TypeError", "Failed to fetch"));
   gc_push_scope();

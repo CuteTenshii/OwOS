@@ -204,6 +204,9 @@ void submit(void)
   B->req_url[i] = '\0';
   B->req_method[0] = '\0';
   B->req_body_len = 0; /* GET */
+  if (B->loading || B->in_scripts)
+    B->abort_load = 1; /* the new page supersedes the in-flight load; set before req_pending */
+  js_page_interrupt();
   B->req_pending = 1;
   B->seq++;
 }

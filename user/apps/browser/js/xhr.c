@@ -110,11 +110,14 @@ js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc)
   gc_keep(t.u.obj);
   js_def(t.u.obj, "@respctype", js_mk_cstring(ctx, resp_ctype), 0);
   js_set(ctx, t, "responseURL", js_mk_cstring(ctx, url));
-  if (!body) { /* network error */
+  if (!body) {
+    bool aborted = net_aborted();
     js_set(ctx, t, "status", js_number(0));
     xhr_setrt(ctx, t, 4);
-    emit_event(t.u.obj, "error", js_undef());
+    emit_event(t.u.obj, aborted ? "abort" : "error", js_undef());
     emit_event(t.u.obj, "loadend", js_undef());
+    if (aborted)
+      js_set(ctx, t, "readyState", js_number(0));
     gc_pop_scope();
     return js_undef();
   }
@@ -148,6 +151,14 @@ js_value xhr_send(js_ctx *ctx, js_value t, js_value *args, int argc)
     emit_event(t.u.obj, "loadend", js_undef());
   }
   gc_pop_scope();
+  return js_undef();
+}
+js_value xhr_abort(js_ctx *ctx, js_value t, js_value *args, int argc)
+{
+  (void)args;
+  (void)argc;
+  if (t.type == JV_OBJ && js_to_number(ctx, js_get(ctx, t, "readyState")) == 4) /* DONE: back to UNSENT, no events */
+    js_set(ctx, t, "readyState", js_number(0));
   return js_undef();
 }
 js_value xhr_getheader(js_ctx *ctx, js_value t, js_value *args, int argc)
@@ -202,6 +213,7 @@ js_value xhr_ctor(js_ctx *ctx, js_value thisv, js_value *args, int argc)
   js_def(o, "onreadystatechange", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(o, "onload", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(o, "onerror", js_null(), P_WRITABLE | P_ENUMERABLE);
+  js_def(o, "onabort", js_null(), P_WRITABLE | P_ENUMERABLE);
   js_def(o, "onloadend", js_null(), P_WRITABLE | P_ENUMERABLE);
   ov = js_obj_value(o);
   gc_pop_scope();

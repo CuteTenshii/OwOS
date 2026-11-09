@@ -272,7 +272,8 @@ void worker_fn(void)
     }
     if (B->req_pending) {
       B->req_pending = 0;
-      B->abort_load = 0;            /* a fresh navigation clears any pending Stop */
+      B->abort_load = 0; /* a fresh navigation clears any pending Stop */
+      B->pg->doc_title[0] = '\0';
       tabs[worker_tab].crashed = 0; /* reloading/navigating clears the crash page */
       B->loading = 1;
       B->seq++;
