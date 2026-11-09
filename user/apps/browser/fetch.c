@@ -880,9 +880,9 @@ static void doc_req_hdrs(char *xh, int *xn, int cap, const struct purl *u)
 static int h2_txn(h2_session *hs, const struct purl *u, const char *full_url, char *loc, int loc_cap, int allow_dl,
                   const char *method, const unsigned char *body, int blen, const char *bctype, bool *stale)
 {
-  char auth[URL_HOST_MAX + 8];
+  char auth[URL_HOST_MAX + 8], hb[URL_HOST_MAX + 3];
   int an = 0; /* :authority = host[:port] */
-  sapp(auth, &an, sizeof auth, u->host);
+  sapp(auth, &an, sizeof auth, url_bracket_host(u->host, hb, sizeof hb));
   if (u->port != 443) {
     sapp(auth, &an, sizeof auth, ":");
     uapp(auth, &an, sizeof auth, (unsigned)u->port);
@@ -939,9 +939,9 @@ static int h3_txn(const struct purl *u, const char *full_url, char *loc, int loc
     return 0;
   }
 
-  char auth[URL_HOST_MAX + 8];
+  char auth[URL_HOST_MAX + 8], hb[URL_HOST_MAX + 3];
   int an = 0;
-  sapp(auth, &an, sizeof auth, u->host);
+  sapp(auth, &an, sizeof auth, url_bracket_host(u->host, hb, sizeof hb));
   if (u->port != 443) {
     sapp(auth, &an, sizeof auth, ":");
     uapp(auth, &an, sizeof auth, (unsigned)u->port);
@@ -1056,7 +1056,10 @@ static int http_txn_conn(const struct purl *u, const char *full_url, char *loc, 
   sapp(req, &n, sizeof req, " ");
   sapp(req, &n, sizeof req, u->path);
   sapp(req, &n, sizeof req, " HTTP/1.1\r\nHost: ");
-  sapp(req, &n, sizeof req, u->host);
+  {
+    char hb[URL_HOST_MAX + 3];
+    sapp(req, &n, sizeof req, url_bracket_host(u->host, hb, sizeof hb));
+  }
   if (!((u->tls && u->port == 443) || (!u->tls && u->port == 80))) {
     sapp(req, &n, sizeof req, ":");
     uapp(req, &n, sizeof req, (unsigned)u->port);

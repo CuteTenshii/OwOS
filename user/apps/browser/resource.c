@@ -24,10 +24,10 @@ void resource_set_page(const char *page_url)
 
 int ch_headers_for(const struct purl *u, bool subresource, char *out, int cap)
 {
-  char url[URL_HOST_MAX + 16];
+  char url[URL_HOST_MAX + 16], hb[URL_HOST_MAX + 3];
   int n = 0;
   sapp(url, &n, sizeof url, u->tls ? "https://" : "http://");
-  sapp(url, &n, sizeof url, u->host);
+  sapp(url, &n, sizeof url, url_bracket_host(u->host, hb, sizeof hb));
   sapp(url, &n, sizeof url, ":");
   uapp(url, &n, sizeof url, (unsigned)u->port);
   if (!subresource)
@@ -525,7 +525,10 @@ static void build_request(char *req, int *n, int cap, const struct purl *u, cons
   sapp(req, n, cap, " ");
   sapp(req, n, cap, u->path);
   sapp(req, n, cap, " HTTP/1.1\r\nHost: ");
-  sapp(req, n, cap, u->host);
+  {
+    char hb[URL_HOST_MAX + 3];
+    sapp(req, n, cap, url_bracket_host(u->host, hb, sizeof hb));
+  }
   if (!((u->tls && u->port == 443) || (!u->tls && u->port == 80))) {
     sapp(req, n, cap, ":");
     uapp(req, n, cap, (unsigned)u->port);
@@ -674,7 +677,8 @@ static void req_hdrs(const struct purl *u, const char *accept, const struct http
 static void authority_of(const struct purl *u, char *auth, int cap)
 {
   int an = 0;
-  sapp(auth, &an, cap, u->host);
+  char hb[URL_HOST_MAX + 3];
+  sapp(auth, &an, cap, url_bracket_host(u->host, hb, sizeof hb));
   if (u->port != 443) {
     sapp(auth, &an, cap, ":");
     uapp(auth, &an, cap, (unsigned)u->port);

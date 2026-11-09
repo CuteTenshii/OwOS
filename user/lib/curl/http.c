@@ -92,7 +92,8 @@ static int http1_exchange(netconn *conn, const char *method, const struct purl *
   sapp(req, &n, (int)sizeof req, " ");
   sapp(req, &n, (int)sizeof req, u->path);
   sapp(req, &n, (int)sizeof req, " HTTP/1.1\r\nHost: ");
-  sapp(req, &n, (int)sizeof req, u->host);
+  char hb[URL_HOST_MAX + 3];
+  sapp(req, &n, (int)sizeof req, url_bracket_host(u->host, hb, sizeof hb));
   sapp(req, &n, (int)sizeof req, "\r\nConnection: close\r\n");
   if (extra_headers) /* curl -H lines, incl. User-Agent */
     sapp(req, &n, (int)sizeof req, extra_headers);

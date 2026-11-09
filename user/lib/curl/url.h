@@ -15,9 +15,12 @@ struct purl {
 };
 
 /* Split "scheme://host[:port][/path]". Lenient: a missing scheme means http;
- * the port defaults to 443 (https) / 80 (http). No IPv6-bracket support.
+ * the port defaults to 443 (https) / 80 (http). "[v6]" hosts are stored without brackets.
  * Returns 1 on success, 0 if the host is empty. */
 int parse_url(const char *url, struct purl *u);
+
+/* host for use in a URL or Host header: "[host]" when it is an IPv6 literal (written to buf[cap]), else host itself. */
+const char *url_bracket_host(const char *host, char *buf, int cap);
 
 /* Resolve `loc` against `base` into out[cap] as an absolute URL. `loc` may be a
  * full URL (returned as-is), "//host/path" (inherits the scheme), "/abs/path"

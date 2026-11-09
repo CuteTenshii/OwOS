@@ -28,6 +28,25 @@ static void uapp(char *d, int *n, int cap, unsigned v)
   d[*n] = '\0';
 }
 
+static int has_colon(const char *s)
+{
+  while (*s)
+    if (*s++ == ':')
+      return 1;
+  return 0;
+}
+
+const char *url_bracket_host(const char *host, char *buf, int cap)
+{
+  if (!has_colon(host))
+    return host;
+  int n = 0;
+  sapp(buf, &n, cap, "[");
+  sapp(buf, &n, cap, host);
+  sapp(buf, &n, cap, "]");
+  return buf;
+}
+
 int parse_url(const char *url, struct purl *u)
 {
   const char *p = url;
@@ -41,8 +60,16 @@ int parse_url(const char *url, struct purl *u)
   }
 
   int i = 0;
-  while (*p && *p != '/' && *p != ':' && i < (int)sizeof(u->host) - 1)
-    u->host[i++] = *p++;
+  if (*p == '[') { /* IPv6 literal: host is kept without the brackets */
+    p++;
+    while (*p && *p != ']' && i < (int)sizeof(u->host) - 1)
+      u->host[i++] = *p++;
+    if (*p == ']')
+      p++;
+  } else {
+    while (*p && *p != '/' && *p != ':' && i < (int)sizeof(u->host) - 1)
+      u->host[i++] = *p++;
+  }
   u->host[i] = '\0';
   if (i == 0)
     return 0;
@@ -131,7 +158,8 @@ void resolve_url(const char *base, const char *loc, char *out, int cap)
    * references, or a :8000-style origin would resolve back to :80. */
   char hostport[URL_HOST_MAX + 8];
   int hp = 0;
-  sapp(hostport, &hp, sizeof hostport, b.host);
+  char hb[URL_HOST_MAX + 3];
+  sapp(hostport, &hp, sizeof hostport, url_bracket_host(b.host, hb, sizeof hb));
   if (b.port != (b.tls ? 443 : 80)) {
     sapp(hostport, &hp, sizeof hostport, ":");
     uapp(hostport, &hp, sizeof hostport, (unsigned)b.port);
