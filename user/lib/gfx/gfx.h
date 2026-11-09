@@ -561,6 +561,8 @@ struct filepicker_opts {
   const char *const *exts;
 };
 
+/* The 14x12 folder or file glyph the picker draws beside a name */
+void filepicker_icon(int x, int y, int is_dir);
 int filepicker(int parent, const struct filepicker_opts *o, char *out, int outsz);
 
 #endif /* OWOS_GFX_H */

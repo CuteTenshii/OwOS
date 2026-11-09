@@ -215,17 +215,16 @@ static void fmt_size(char *buf, int n, unsigned size)
     snprintf(buf, n, "%u MB", size >> 20);
 }
 
-static void draw_folder(int x, int y)
+void filepicker_icon(int x, int y, int is_dir)
 {
-  gfx_fill_rect(x, y, 6, 3, COL_DIR);
-  gfx_fill_rect(x, y + 2, 14, 10, COL_DIR);
-}
-
-static void draw_file(int x, int y)
-{
-  gfx_fill_rect(x + 2, y, 10, 12, COL_DIM);
-  gfx_fill_rect(x + 4, y + 3, 6, 1, COL_LIST);
-  gfx_fill_rect(x + 4, y + 6, 6, 1, COL_LIST);
+  if (is_dir) {
+    gfx_fill_rect(x, y, 6, 3, COL_DIR);
+    gfx_fill_rect(x, y + 2, 14, 10, COL_DIR);
+  } else {
+    gfx_fill_rect(x + 2, y, 10, 12, COL_DIM);
+    gfx_fill_rect(x + 4, y + 3, 6, 1, COL_LIST);
+    gfx_fill_rect(x + 4, y + 6, 6, 1, COL_LIST);
+  }
 }
 
 static void draw_row(const struct picker *p, int row, int x, int y, int w)
@@ -239,10 +238,7 @@ static void draw_row(const struct picker *p, int row, int x, int y, int w)
     if (p->chk[row - p->up])
       gfx_fill_rect(x + GAP + 3, y + (ROW_H - 12) / 2 + 3, 6, 6, COL_TEXT);
   }
-  if (!e || e->is_dir)
-    draw_folder(ix, y + (ROW_H - 12) / 2);
-  else
-    draw_file(ix, y + (ROW_H - 12) / 2);
+  filepicker_icon(ix, y + (ROW_H - 12) / 2, !e || e->is_dir);
   int tx = ix + 14 + GAP, right = x + w - GAP;
   if (e && !e->is_dir) {
     char sz[16];
