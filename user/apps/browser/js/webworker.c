@@ -2293,6 +2293,8 @@ static void worker_fire(struct wthread *wt, js_value w, struct wmsg *m)
     }
     if (data.type == JV_OBJ)
       gc_keep(data.u.obj);
+    else if (data.type == JV_STR)
+      gc_keep(data.u.str);
     ports = ports_take(g_ctx);
     gc_keep(ports.u.obj);
     ev = make_message_event(data, ports);
