@@ -607,6 +607,72 @@ static void test_tree_walker_and_node_iterator(void)
       "expect(bad, 'root must be a node');\n");
 }
 
+static void test_mutation_observer(void)
+{
+  run_script(
+      "window.mlog=[]; window.host=document.createElement('div'); host.innerHTML='<p id=p>a</p><b></b>';\n"
+      "document.body.appendChild(host);\n"
+      "var p=host.firstChild, text=p.firstChild;\n"
+      "window.mo=new MutationObserver(function(recs, obs){ mlog.push(recs.map(function(r){ return r.type+':'+"
+      "(r.attributeName||'')+':'+(r.oldValue===null?'-':r.oldValue)+':'+r.addedNodes.length+r.removedNodes.length; })"
+      ".join('|')); window.lastObs=obs; });\n"
+      "mo.observe(host, {attributes:true, attributeOldValue:true, childList:true, subtree:true, "
+      "characterData:true, characterDataOldValue:true});\n"
+      "p.setAttribute('class','x'); p.setAttribute('class','y'); p.removeAttribute('class');\n"
+      "text.data='b'; host.appendChild(document.createElement('i')); host.removeChild(host.lastChild);\n"
+      "expect(mlog.length===0, 'delivery is asynchronous');\n");
+  js_timers_pump();
+  run_script(
+      "expect(mlog.length===1 && lastObs===mo, 'one batched callback: '+mlog.length);\n"
+      "expect(mlog[0]==='attributes:class:-:00|attributes:class:x:00|attributes:class:y:00|characterData::a:00|"
+      "childList::-:10|childList::-:01', 'records: '+mlog[0]);\n"
+      "mo.observe(host, {attributeFilter:['id'], subtree:true}); p.setAttribute('class','z'); p.id='q';\n"
+      "var taken=mo.takeRecords(); expect(taken.length===1 && taken[0].attributeName==='id' && taken[0].target===p, "
+      "'takeRecords and attributeFilter');\n"
+      "mo.disconnect(); p.id='r'; expect(mo.takeRecords().length===0, 'disconnect stops delivery');\n"
+      "var narrow=new MutationObserver(function(r){ mlog.push('narrow'+r.length); });\n"
+      "narrow.observe(host, {childList:true}); p.setAttribute('k','v'); p.appendChild(document.createElement('u'));\n"
+      "host.appendChild(document.createElement('s'));\n");
+  js_timers_pump();
+  run_script("expect(mlog[1]==='narrow1', 'childList without subtree ignores deeper changes: '+mlog.slice(1));\n"
+             "host.innerHTML='';\n"
+             "var late=new MutationObserver(function(r){ mlog.push('clear'+r[0].removedNodes.length); });\n"
+             "late.observe(host,{childList:true}); host.innerHTML='<i></i><i></i>'; host.innerHTML='';\n");
+  js_timers_pump();
+  run_script("expect(mlog[2]==='clear2' || mlog.slice(2).join().indexOf('clear')>=0, 'innerHTML reports removals: "
+             "'+mlog.slice(2));\n"
+             "var bad=false; try { new MutationObserver(1); } catch (e) { bad=e instanceof TypeError; }\n"
+             "try { mo.observe(host, {}); bad=bad&&false; } catch (e) { bad=bad&&e instanceof TypeError; }\n"
+             "expect(bad, 'constructor and options validation');\n");
+}
+
+static void test_resize_observer(void)
+{
+  extern int test_box_w, test_box_h;
+  test_box_w = 100;
+  test_box_h = 50;
+  run_script(
+      "window.ro=[]; window.el=document.createElement('div'); document.body.appendChild(el);\n"
+      "window.obs=new ResizeObserver(function(entries, o){ entries.forEach(function(e){ ro.push(e.target===el && "
+      "e.contentRect.width+'x'+e.contentRect.height+'/'+e.borderBoxSize[0].inlineSize); }); "
+      "expect(o===obs, 'observer argument'); });\n"
+      "obs.observe(el); obs.observe(el);\n");
+  expect(js_resize_pump() == 1);
+  expect(js_resize_pump() == 0);
+  test_box_w = 80;
+  expect(js_resize_pump() == 1);
+  run_script("expect(ro.join()==='100x50/100,80x50/80', 'reports initial and changed sizes: '+ro);\n"
+             "obs.unobserve(el);\n");
+  test_box_w = 10;
+  expect(js_resize_pump() == 0);
+  run_script("obs.observe(el);\n");
+  expect(js_resize_pump() == 1);
+  run_script("obs.disconnect();\n");
+  test_box_w = 20;
+  expect(js_resize_pump() == 0);
+  test_box_w = test_box_h = 0;
+}
+
 int main(void)
 {
   B = calloc(1, sizeof *B);
@@ -635,6 +701,8 @@ int main(void)
   test("slotchange fires asynchronously for the affected slots", test_slotchange);
   test("template.content and declarative shadow roots", test_template_content_and_declarative_shadow);
   test("TreeWalker, NodeIterator and NodeFilter", test_tree_walker_and_node_iterator);
+  test("MutationObserver", test_mutation_observer);
+  test("ResizeObserver", test_resize_observer);
   test("timers: unused slots hold no stale pointers at teardown", test_timers_unused_slots_hold);
 
   return 0;

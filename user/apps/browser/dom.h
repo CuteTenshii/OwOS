@@ -113,6 +113,19 @@ struct dom_node *dom_assigned_slot(const struct dom_node *c); /* slot `c` is ass
 /* Turn every <template shadowrootmode="open|closed"> under `root` into a shadow root on its parent. */
 void dom_attach_declarative_shadows(struct dom_node *root);
 
+/* Tree mutation report for MutationObserver; the hook stays NULL until script observes something.
+ * CHILDREN: `added` or `removed` sits between `prev` and `next`. CLEAR: every child of `target` is
+ * about to be freed, `removed` is the first of them. ATTR: `old` is NULL for a new attribute.
+ * TEXT: `old` is the previous data of the text node `target`. */
+enum dom_mut { DOM_MUT_ATTR, DOM_MUT_CHILDREN, DOM_MUT_CLEAR, DOM_MUT_TEXT };
+struct dom_mutation {
+  enum dom_mut kind;
+  struct dom_node *target, *added, *removed, *prev, *next;
+  const char *name, *old;
+};
+extern void (*dom_on_mutate)(const struct dom_mutation *m);
+void dom_set_text(struct dom_node *n, const char *text);
+
 /* Hook the JS layer installs so a freed node detaches its wrapper. */
 extern void (*dom_on_free_wrapper)(void *wrapper);
 extern void (*dom_on_free_style_cache)(void *cache);

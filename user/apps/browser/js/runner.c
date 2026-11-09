@@ -657,6 +657,7 @@ void js_page_end(void)
       }
     }
   }
+  documentapi_teardown();
   gc_remove_root((void **)&g_node_proto);
   gc_remove_root((void **)&g_element_proto);
   gc_remove_root((void **)&g_style_proto);

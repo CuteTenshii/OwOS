@@ -1132,7 +1132,7 @@ js_value dyncode_blocked(js_ctx *ctx, js_value t, js_value *a, int n)
 }
 
 /* ------------------------------------------------------- geometry natives - */
-static int node_box(js_value t, int *x, int *y, int *w, int *h)
+int node_box(js_value t, int *x, int *y, int *w, int *h)
 {
   struct dom_node *n = node_of(t);
   int s, e;
@@ -2262,6 +2262,7 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     gc_pop_scope();
   }
   treewalker_install(ctx, win);
+  observers_install(ctx, win);
   {
     js_object *he = js_new_native(ctx, htmlelement_ctor, "HTMLElement", 0);
     js_object *ce = js_new_object(ctx, ctx->object_proto);
@@ -2499,20 +2500,14 @@ void setup_dom(js_ctx *ctx, const char *page_url)
     js_def(win, "history", js_obj_value(hist), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }
-  /* the Observer family + matchMedia + queueMicrotask: present but inert */
+  /* IntersectionObserver, PerformanceObserver + matchMedia + queueMicrotask: present but inert */
   {
-    js_object *mo = js_new_native(ctx, observer_ctor, "MutationObserver", 1);
     js_object *io = js_new_native(ctx, observer_ctor, "IntersectionObserver", 1);
-    js_object *ro = js_new_native(ctx, observer_ctor, "ResizeObserver", 1);
     js_object *po = js_new_native(ctx, observer_ctor, "PerformanceObserver", 1);
     gc_push_scope();
-    gc_keep(mo);
     gc_keep(io);
-    gc_keep(ro);
     gc_keep(po);
-    js_def(win, "MutationObserver", js_obj_value(mo), P_WRITABLE | P_CONFIGURABLE);
     js_def(win, "IntersectionObserver", js_obj_value(io), P_WRITABLE | P_CONFIGURABLE);
-    js_def(win, "ResizeObserver", js_obj_value(ro), P_WRITABLE | P_CONFIGURABLE);
     js_def(win, "PerformanceObserver", js_obj_value(po), P_WRITABLE | P_CONFIGURABLE);
     gc_pop_scope();
   }

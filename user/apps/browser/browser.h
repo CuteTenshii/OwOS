@@ -337,6 +337,7 @@ int html_node_span(struct dom_node *node, int *start, int *end);
 /* Approximate document-relative px box of a text range (0 if empty); takes browser_buf_lock. */
 int browser_range_box(int start, int end, int *x, int *y, int *w, int *h);
 int browser_scroll_px(void);              /* page vertical scroll, px (window.scrollY) */
+int js_resize_pump(void);                 /* report ResizeObserver size changes; -> # callbacks fired */
 void browser_viewport_px(int *w, int *h); /* content viewport size (innerWidth/Height) */
 
 /* Form controls; the worker performs a clicked control's default action. */

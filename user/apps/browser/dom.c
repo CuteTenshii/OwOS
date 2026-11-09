@@ -493,6 +493,7 @@ struct dom_node *dom_parse(const char *html, int len)
 void (*dom_on_free_wrapper)(void *wrapper);
 void (*dom_on_free_style_cache)(void *cache);
 void (*dom_on_free_anim)(struct dom_node *n);
+void (*dom_on_mutate)(const struct dom_mutation *m);
 bool dom_structural_styles;
 
 /* Bumped by every tree-mutating API; the browser re-flattens only when it changes. */
@@ -764,12 +765,43 @@ struct dom_node *dom_new_text(const char *text)
   return n;
 }
 
+static struct dom_node *sib_before(const struct dom_node *c)
+{
+  struct dom_node *p = c->parent ? c->parent->first_child : 0;
+  while (p && p->next != c)
+    p = p->next;
+  return p;
+}
+
+static void report_children(struct dom_node *parent, struct dom_node *added, struct dom_node *removed,
+                            struct dom_node *prev, struct dom_node *next)
+{
+  struct dom_mutation m = {DOM_MUT_CHILDREN, parent, added, removed, prev, next, 0, 0};
+  dom_on_mutate(&m);
+}
+
+void dom_set_text(struct dom_node *n, const char *text)
+{
+  char *nt = dupn(text ? text : "", text ? (int)strlen(text) : 0);
+  if (!n || !nt) {
+    free(nt);
+    return;
+  }
+  if (dom_on_mutate) {
+    struct dom_mutation m = {DOM_MUT_TEXT, n, 0, 0, 0, 0, 0, n->text};
+    dom_on_mutate(&m);
+  }
+  free(n->text);
+  n->text = nt;
+  dom_mutation_seq++;
+}
+
 void dom_remove_child(struct dom_node *parent, struct dom_node *child)
 {
   if (!parent || !child)
     return;
   dom_mutation_seq++;
-  struct dom_node *prev = 0, *c = parent->first_child;
+  struct dom_node *prev = 0, *c = parent->first_child, *after;
   while (c && c != child) {
     prev = c;
     c = c->next;
@@ -782,8 +814,11 @@ void dom_remove_child(struct dom_node *parent, struct dom_node *child)
     parent->first_child = c->next;
   if (parent->last_child == c)
     parent->last_child = prev;
+  after = c->next;
   c->next = 0;
   c->parent = 0;
+  if (dom_on_mutate)
+    report_children(parent, 0, c, prev, after);
   if (dom_structural_styles)
     style_stale_subtree(parent);
 }
@@ -875,6 +910,8 @@ void dom_append_child(struct dom_node *parent, struct dom_node *child)
   if (child->parent)
     dom_remove_child(child->parent, child);
   node_append(parent, child);
+  if (dom_on_mutate)
+    report_children(parent, child, 0, sib_before(child), 0);
   style_stale_subtree(child);
   if (dom_structural_styles)
     style_stale_subtree(parent);
@@ -905,6 +942,8 @@ void dom_insert_before(struct dom_node *parent, struct dom_node *child, struct d
     else
       parent->first_child = child;
   }
+  if (dom_on_mutate)
+    report_children(parent, child, 0, sib_before(child), ref);
   style_stale_subtree(child);
   if (dom_structural_styles)
     style_stale_subtree(parent);
@@ -915,6 +954,10 @@ void dom_set_attr(struct dom_node *el, const char *name, const char *value)
   if (!el || el->type != DOM_ELEMENT || !name)
     return;
   dom_mutation_seq++;
+  if (dom_on_mutate) {
+    struct dom_mutation m = {DOM_MUT_ATTR, el, 0, 0, 0, 0, name, dom_get_attr(el, name)};
+    dom_on_mutate(&m);
+  }
   if (style_attr(name))
     style_stale_subtree(el);
   for (struct dom_attr *a = el->attrs; a; a = a->next)
@@ -950,6 +993,10 @@ void dom_remove_attr(struct dom_node *el, const char *name)
   if (!el)
     return;
   dom_mutation_seq++;
+  if (dom_on_mutate && dom_get_attr(el, name)) {
+    struct dom_mutation m = {DOM_MUT_ATTR, el, 0, 0, 0, 0, name, dom_get_attr(el, name)};
+    dom_on_mutate(&m);
+  }
   if (style_attr(name))
     style_stale_subtree(el);
   struct dom_attr *prev = 0, *a = el->attrs;
@@ -978,6 +1025,10 @@ void dom_clear_children(struct dom_node *el)
   if (!el)
     return;
   dom_mutation_seq++;
+  if (dom_on_mutate && el->first_child) {
+    struct dom_mutation m = {DOM_MUT_CLEAR, el, 0, el->first_child, 0, 0, 0, 0};
+    dom_on_mutate(&m);
+  }
   if (dom_structural_styles) {
     el->computed_style_seq = DOM_STYLE_STALE;
     el->pseudo_seq = DOM_STYLE_STALE;

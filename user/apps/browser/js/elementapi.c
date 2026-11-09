@@ -197,14 +197,9 @@ js_value el_node_value(js_ctx *ctx, js_value t, js_value *args, int argc)
 js_value el_set_node_value(js_ctx *ctx, js_value t, js_value *args, int argc)
 {
   struct dom_node *n = node_of(t);
-  if (n && n->type == DOM_TEXT) {
-    char *nt = strdup(arg_str(ctx, A(0)));
-    if (nt) {
-      free(n->text);
-      n->text = nt;
-      dom_mutation_seq++;
-    }
-  } else if (n && node_is_comment(n))
+  if (n && n->type == DOM_TEXT)
+    dom_set_text(n, arg_str(ctx, A(0)));
+  else if (n && node_is_comment(n))
     dom_set_attr(n, "data", arg_str(ctx, A(0)));
   return js_undef();
 }

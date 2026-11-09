@@ -99,15 +99,16 @@ unsigned char *browser_fetch(const struct http_req *rq, struct http_resp *rs)
   (void)rs;
   return 0;
 }
+/* Box every node reports; tests set it to fake a laid-out page (0 = no layout) */
+int test_box_w, test_box_h;
 int browser_range_box(int s, int e, int *x, int *y, int *w, int *h)
 {
   (void)s;
   (void)e;
-  (void)x;
-  (void)y;
-  (void)w;
-  (void)h;
-  return 0;
+  *x = *y = 0;
+  *w = test_box_w;
+  *h = test_box_h;
+  return test_box_w > 0;
 }
 int browser_scroll_px(void) { return 0; }
 const char *browser_ua_version(void) { return "5.0 (OwOS)"; }
@@ -154,9 +155,8 @@ void devtools_console_append(int level, const char *s, int len)
 int html_node_span(struct dom_node *n, int *s, int *e)
 {
   (void)n;
-  (void)s;
-  (void)e;
-  return 0;
+  *s = *e = 0;
+  return test_box_w > 0;
 }
 void js_cast_page_end(void) {}
 void js_idb_setup(js_ctx *c, js_object *w)
