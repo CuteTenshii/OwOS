@@ -143,6 +143,14 @@ void js_ctx_free(js_ctx *ctx);
  * script overflows the stack into neighbouring memory. NULL disables the check.
  */
 void js_set_stack_limit(js_ctx *ctx, void *low_limit);
+/* Structured clone across heaps: js_clone_write flattens a value into pointer-free bytes (a SharedArrayBuffer
+ * store is retained, not copied), js_clone_read rebuilds it in any context, js_clone_free drops the bytes and
+ * the store references. Write returns NULL with a DataCloneError pending for functions and host objects. */
+typedef struct js_clone js_clone;
+js_clone *js_clone_write(js_ctx *ctx, js_value v);
+js_value js_clone_read(js_ctx *ctx, const js_clone *c);
+void js_clone_free(js_clone *c);
+
 /* A SharedArrayBuffer object in ctx over an existing store, which it retains. Lets one thread hand a buffer to
  * another thread's context: retain on the sending side, wrap in the receiver, then release. */
 js_value js_sab_wrap(js_ctx *ctx, unsigned char *data, int byte_length);

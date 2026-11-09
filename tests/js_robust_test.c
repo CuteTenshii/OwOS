@@ -29,6 +29,19 @@ static js_value test_expect(js_ctx *ctx, js_value thisv, js_value *args, int arg
 
 static int can_block; /* run() lets Atomics.wait block */
 
+/* clone(v): v through js_clone_write and js_clone_read, as a message between two threads would be */
+static js_value test_clone(js_ctx *ctx, js_value thisv, js_value *args, int argc)
+{
+  js_clone *c = argc > 0 ? js_clone_write(ctx, args[0]) : NULL;
+  js_value v;
+  (void)thisv;
+  if (!c)
+    return js_undef();
+  v = js_clone_read(ctx, c);
+  js_clone_free(c);
+  return v;
+}
+
 /* Run `source` in a fresh context; returns nonzero when it ran to completion. */
 static int run(const char *source, char *stack_floor)
 {
@@ -40,6 +53,7 @@ static int run(const char *source, char *stack_floor)
   js_ctx *ctx = js_ctx_new(con_print);
   ctx->can_block = can_block;
   js_def_native(ctx, ctx->global, "expect", test_expect, 2);
+  js_def_native(ctx, ctx->global, "clone", test_clone, 1);
   if (stack_floor) {
     js_set_stack_limit(ctx, stack_floor);
     js_parser_set_stack_floor(stack_floor);
@@ -166,6 +180,42 @@ static void check_atomics(void)
           "expect(Atomics.isLockFree(4)===true && Atomics.isLockFree(3)===false && String(Atomics)==='[object "
           "Atomics]', 'isLockFree, tag');\n",
           0));
+}
+
+static void check_structured_clone(void)
+{
+  expect(run(
+      "var t=function(f){ try{ f() }catch(e){ return e.name } };\n"
+      "expect(clone(1.5)===1.5 && clone('hi\\u00e9')==='hi\\u00e9' && clone(true)===true && clone(null)===null && "
+      "clone(undefined)===undefined && clone(-0)===0 && 1/clone(-0)===-Infinity, 'primitives');\n"
+      "expect(clone(2n**70n)===2n**70n && clone(-5n)===-5n, 'BigInt');\n"
+      "var o={a:1,b:[1,2,{c:'x'}],d:{e:null}}, c=clone(o);\n"
+      "expect(c!==o && c.b!==o.b && JSON.stringify(c)===JSON.stringify(o), 'plain objects and arrays are copied');\n"
+      "var cyc={n:1}; cyc.self=cyc; cyc.list=[cyc]; var cc=clone(cyc);\n"
+      "expect(cc.self===cc && cc.list[0]===cc && cc!==cyc, 'cycles');\n"
+      "var shared={z:1}, two=clone({x:shared,y:shared}); expect(two.x===two.y, 'shared structure stays shared');\n"
+      "var d=new Date(1234567890123), dc=clone(d); expect(dc instanceof Date && dc.getTime()===1234567890123 && "
+      "dc!==d, 'Date');\n"
+      "var ec=clone(new TypeError('boom')); expect(ec instanceof TypeError && ec.message==='boom', 'Error');\n"
+      "var u=new Uint8Array([1,2,3,4,5]), uc=clone(u.subarray(1,4));\n"
+      "expect(uc instanceof Uint8Array && uc.length===3 && uc[0]===2 && uc.byteOffset===1 && uc.buffer.byteLength===5 "
+      "&& "
+      "uc.buffer!==u.buffer, 'typed array views keep offset and length');\n"
+      "var ab=new ArrayBuffer(8), pair=clone({a:new Int32Array(ab),b:new Uint8Array(ab)}); pair.a[0]=0x01020304;\n"
+      "expect(pair.b[0]===4 && pair.a.buffer===pair.b.buffer, 'views of one buffer still share it');\n"
+      "var f64=clone(new Float64Array([1.5,-2])); expect(f64[0]===1.5 && f64[1]===-2, 'Float64Array');\n"
+      "var dv=clone(new DataView(new ArrayBuffer(4),1,2)); expect(dv.byteLength===2 && dv.byteOffset===1, "
+      "'DataView');\n"
+      "var sab=new SharedArrayBuffer(8), s1=new Int32Array(sab), sc=clone({m:s1}).m; Atomics.store(s1,0,7);\n"
+      "expect(sc.buffer instanceof SharedArrayBuffer && Atomics.load(sc,0)===7 && sc.buffer!==sab, 'SharedArrayBuffer "
+      "is shared, not copied');\n"
+      "Atomics.store(sc,1,9); expect(Atomics.load(s1,1)===9, 'writes cross both ways');\n"
+      "expect(t(function(){ clone(function(){}) })==='DataCloneError' && t(function(){ clone({f:Symbol()}) "
+      "})==='DataCloneError', "
+      "'functions and symbols throw DataCloneError');\n"
+      "var big=[]; for (var i=0;i<1000;i++) big.push({i:i,s:'v'+i}); var bc=clone(big);\n"
+      "expect(bc.length===1000 && bc[999].s==='v999', 'large arrays');\n",
+      0));
 }
 
 static void check_json_parse(void)
@@ -464,6 +514,7 @@ int main(void)
   test("DataView BigInt64 and Float16", check_dataview);
   test("BigInt64Array, BigUint64Array and Float16Array", check_wide_typed_arrays);
   test("SharedArrayBuffer and Atomics", check_atomics);
+  test("structured clone across heaps", check_structured_clone);
   test("JSON.parse", check_json_parse);
   test("String.fromCodePoint and surrogate pairs", check_from_code_point);
   test("deep recursion throws instead of overflowing the native stack", check_deep_recursion);

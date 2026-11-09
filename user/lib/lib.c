@@ -460,8 +460,9 @@ void tls_init(void)
     syscall(SYS_SET_TLS, (int)tls_fill(__tls_main), 0, 0);
 }
 
-/* The new thread's TLS block is carved from the top of its stack. */
-int thread_create(void (*fn)(void), void *stack_top)
+/* The new thread's TLS block is carved from the top of its stack; with an argument, the entry then sees an
+ * ordinary cdecl frame (a null return address, then `arg`). */
+static int thread_spawn(void *fn, void *stack_top, int has_arg, void *arg)
 {
   void *tp = 0;
   if ((unsigned)__tls_memsz) {
@@ -469,7 +470,20 @@ int thread_create(void (*fn)(void), void *stack_top)
     tp = tls_fill(block);
     stack_top = block;
   }
+  if (has_arg) {
+    void **sp = (void **)((char *)stack_top - 20); /* esp + 4 is 16-aligned at entry */
+    sp[0] = 0;
+    sp[1] = arg;
+    stack_top = sp;
+  }
   return syscall(SYS_THREAD, (int)fn, (int)stack_top, (int)tp);
+}
+
+int thread_create(void (*fn)(void), void *stack_top) { return thread_spawn((void *)fn, stack_top, 0, 0); }
+
+int thread_create_arg(void (*fn)(void *), void *arg, void *stack_top)
+{
+  return thread_spawn((void *)fn, stack_top, 1, arg);
 }
 
 /* Stack with an unmapped guard page below, so overflow faults */

@@ -270,6 +270,7 @@ void msleep(unsigned ms);
 
 /* Threads share the address space */
 int thread_create(void (*fn)(void), void *stack_top);
+int thread_create_arg(void (*fn)(void *), void *arg, void *stack_top); /* fn(arg); it must end in exit() */
 void *thread_stack_alloc(int bytes); /* guarded thread stack (unmapped guard page below); 0 on fail */
 void thread_stack_free(void *top);
 static inline int thread_join(int tid) { return waitpid(tid); }

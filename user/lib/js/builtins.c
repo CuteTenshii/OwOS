@@ -9156,6 +9156,527 @@ static js_value dataview_ctor(js_ctx *ctx, js_value t, js_value *a, int n)
   return new_view(ctx, TA_DATAVIEW, a[0].u.obj, off, len);
 }
 
+/* ------------------------------------------------------- structured clone across heaps -- *
+ * js_clone_write flattens a value into bytes that hold no pointers into the sender's heap, so a message can
+ * be read back (js_clone_read) in another thread's context. Plain objects, arrays, primitives, BigInts,
+ * Dates, Errors, ArrayBuffers and typed-array views are copied; a SharedArrayBuffer store is shared. Objects
+ * get back-references, so cycles and shared structure survive. Functions, symbols and host objects throw
+ * DataCloneError. */
+enum {
+  CL_UNDEF,
+  CL_NULL,
+  CL_FALSE,
+  CL_TRUE,
+  CL_NUM,
+  CL_STR,
+  CL_BIGINT,
+  CL_REF,
+  CL_ARRAY,
+  CL_OBJECT,
+  CL_DATE,
+  CL_ERROR,
+  CL_ABUF,
+  CL_SAB,
+  CL_VIEW
+};
+#define CLONE_DEPTH 200
+
+typedef struct {
+  unsigned char *data;
+  int len;
+} clone_sab;
+struct js_clone {
+  unsigned char *buf;
+  int len, cap;
+  clone_sab *sabs;
+  int nsabs;
+};
+typedef struct {
+  js_ctx *ctx;
+  js_clone *c;
+  js_object **seen;
+  int nseen, capseen;
+  int failed;
+} clone_w;
+
+static int clone_put(clone_w *w, const void *p, int n)
+{
+  js_clone *c = w->c;
+  if (c->len + n > c->cap) {
+    int nc = c->cap ? c->cap * 2 : 256;
+    unsigned char *nb;
+    while (nc < c->len + n)
+      nc *= 2;
+    nb = (unsigned char *)realloc(c->buf, (unsigned)nc);
+    if (!nb) {
+      w->failed = 1;
+      return 0;
+    }
+    c->buf = nb;
+    c->cap = nc;
+  }
+  memcpy(c->buf + c->len, p, (unsigned)n);
+  c->len += n;
+  return 1;
+}
+static void clone_tag(clone_w *w, int tag)
+{
+  unsigned char b = (unsigned char)tag;
+  clone_put(w, &b, 1);
+}
+static void clone_u32(clone_w *w, unsigned v) { clone_put(w, &v, 4); }
+static void clone_str(clone_w *w, const char *s, int len)
+{
+  clone_u32(w, (unsigned)len);
+  clone_put(w, s, len);
+}
+static void clone_fail(clone_w *w, const char *msg)
+{
+  if (!w->ctx->has_exc)
+    js_throw_error(w->ctx, w->ctx->error_proto, "DataCloneError", msg);
+  w->failed = 1;
+}
+/* index of `o` among the objects written so far, or -1 */
+static int clone_seen(clone_w *w, js_object *o)
+{
+  int i;
+  for (i = 0; i < w->nseen; i++)
+    if (w->seen[i] == o)
+      return i;
+  return -1;
+}
+static int clone_note(clone_w *w, js_object *o)
+{
+  if (w->nseen == w->capseen) {
+    int nc = w->capseen ? w->capseen * 2 : 64;
+    js_object **ns = (js_object **)realloc(w->seen, (unsigned)nc * sizeof *ns);
+    if (!ns) {
+      w->failed = 1;
+      return 0;
+    }
+    w->seen = ns;
+    w->capseen = nc;
+  }
+  w->seen[w->nseen++] = o;
+  return 1;
+}
+static int clone_key_ok(const pentry *pe) { return (pe->flags & P_ENUMERABLE) && pe->key[0] != '\x01'; }
+
+static void clone_value(clone_w *w, js_value v, int depth)
+{
+  js_ctx *ctx = w->ctx;
+  js_object *o;
+  int idx;
+  if (w->failed)
+    return;
+  if (depth > CLONE_DEPTH) {
+    clone_fail(w, "Value is nested too deeply");
+    return;
+  }
+  switch (v.type) {
+  case JV_UNDEF:
+    clone_tag(w, CL_UNDEF);
+    return;
+  case JV_NULL:
+    clone_tag(w, CL_NULL);
+    return;
+  case JV_BOOL:
+    clone_tag(w, v.u.boolean ? CL_TRUE : CL_FALSE);
+    return;
+  case JV_NUM:
+    clone_tag(w, CL_NUM);
+    clone_put(w, &v.u.num, 8);
+    return;
+  case JV_STR:
+    clone_tag(w, CL_STR);
+    clone_str(w, v.u.str->data, v.u.str->len);
+    return;
+  case JV_BIGINT: {
+    js_value s = js_to_string(ctx, v);
+    clone_tag(w, CL_BIGINT);
+    clone_str(w, s.u.str->data, s.u.str->len);
+    return;
+  }
+  case JV_OBJ:
+    break;
+  default:
+    clone_fail(w, "A Symbol could not be cloned");
+    return;
+  }
+  o = v.u.obj;
+  if ((idx = clone_seen(w, o)) >= 0) {
+    clone_tag(w, CL_REF);
+    clone_u32(w, (unsigned)idx);
+    return;
+  }
+  if (o->kind == OBJ_FUNCTION || o->kind == OBJ_HOST || o->kind == OBJ_PROXY || o->kind == OBJ_GENERATOR ||
+      o->kind == OBJ_SYMBOL) {
+    clone_fail(w, "The value could not be cloned");
+    return;
+  }
+  if (!clone_note(w, o))
+    return;
+  if (o->kind == OBJ_ARRAYBUFFER) {
+    js_arraybuffer *ab = (js_arraybuffer *)o->host;
+    if (ab->shared) {
+      clone_sab *ns = (clone_sab *)realloc(w->c->sabs, (unsigned)(w->c->nsabs + 1) * sizeof *ns);
+      if (!ns) {
+        w->failed = 1;
+        return;
+      }
+      w->c->sabs = ns;
+      js_sab_retain(ab->data);
+      ns[w->c->nsabs].data = ab->data;
+      ns[w->c->nsabs].len = ab->byteLength;
+      clone_tag(w, CL_SAB);
+      clone_u32(w, (unsigned)w->c->nsabs++);
+    } else {
+      clone_tag(w, CL_ABUF);
+      clone_str(w, (const char *)ab->data, ab->byteLength);
+    }
+    return;
+  }
+  if (o->kind == OBJ_TYPEDARRAY) {
+    js_typedarray *ta = (js_typedarray *)o->host;
+    clone_tag(w, CL_VIEW);
+    clone_u32(w, (unsigned)ta->type);
+    clone_u32(w, (unsigned)ta->offset);
+    clone_u32(w, (unsigned)ta->length);
+    clone_value(w, js_obj_value(ta->buffer), depth + 1);
+    return;
+  }
+  if (o->proto == ctx->date_proto) {
+    js_value t = js_get(ctx, v, "@t");
+    clone_tag(w, CL_DATE);
+    clone_put(w, &t.u.num, 8);
+    return;
+  }
+  if (o->kind == OBJ_ERROR) {
+    js_value name = js_to_string(ctx, js_get(ctx, v, "name")), msg = js_to_string(ctx, js_get(ctx, v, "message"));
+    clone_tag(w, CL_ERROR);
+    clone_str(w, name.u.str->data, name.u.str->len);
+    clone_str(w, msg.u.str->data, msg.u.str->len);
+    return;
+  }
+  gc_push_scope();
+  gc_keep(o);
+  if (o->kind == OBJ_ARRAY) {
+    unsigned e, n = o->elen;
+    clone_tag(w, CL_ARRAY);
+    clone_u32(w, n);
+    for (e = 0; e < n && !w->failed; e++)
+      clone_value(w, e < o->elen ? o->elems[e] : js_undef(), depth + 1);
+  } else {
+    int i, count = 0;
+    for (i = 0; i < o->props.n; i++)
+      count += clone_key_ok(&o->props.e[i]);
+    clone_tag(w, CL_OBJECT);
+    clone_u32(w, (unsigned)count);
+    for (i = 0; i < o->props.n && count > 0 && !w->failed; i++) {
+      pentry *pe = &o->props.e[i];
+      char key[256];
+      int kl;
+      if (!clone_key_ok(pe))
+        continue;
+      kl = (int)strlen(pe->key);
+      if (kl >= (int)sizeof key)
+        kl = (int)sizeof key - 1;
+      memcpy(key, pe->key, (unsigned)kl);
+      clone_str(w, key, kl);
+      clone_value(w, (pe->flags & P_ACCESSOR) ? js_get(ctx, v, key) : pe->value, depth + 1);
+      count--;
+    }
+  }
+  gc_pop_scope();
+}
+
+js_clone *js_clone_write(js_ctx *ctx, js_value v)
+{
+  clone_w w = {ctx, 0, 0, 0, 0, 0};
+  w.c = (js_clone *)calloc(1, sizeof *w.c);
+  if (!w.c)
+    return NULL;
+  clone_value(&w, v, 0);
+  free(w.seen);
+  if (w.failed) {
+    js_clone_free(w.c);
+    return NULL;
+  }
+  return w.c;
+}
+
+void js_clone_free(js_clone *c)
+{
+  int i;
+  if (!c)
+    return;
+  for (i = 0; i < c->nsabs; i++)
+    js_sab_release(c->sabs[i].data);
+  free(c->sabs);
+  free(c->buf);
+  free(c);
+}
+
+typedef struct {
+  js_ctx *ctx;
+  const js_clone *c;
+  int pos;
+  js_object **made;
+  int nmade, capmade;
+  int failed;
+} clone_r;
+
+static int clone_get(clone_r *r, void *out, int n)
+{
+  if (r->failed || r->pos + n > r->c->len) {
+    r->failed = 1;
+    return 0;
+  }
+  memcpy(out, r->c->buf + r->pos, (unsigned)n);
+  r->pos += n;
+  return 1;
+}
+static unsigned clone_get_u32(clone_r *r)
+{
+  unsigned v = 0;
+  clone_get(r, &v, 4);
+  return v;
+}
+/* a length-prefixed byte run, still inside the buffer; NULL on corruption */
+static const unsigned char *clone_get_bytes(clone_r *r, int *len)
+{
+  const unsigned char *p;
+  *len = (int)clone_get_u32(r);
+  if (r->failed || *len < 0 || r->pos + *len > r->c->len) {
+    r->failed = 1;
+    return NULL;
+  }
+  p = r->c->buf + r->pos;
+  r->pos += *len;
+  return p;
+}
+static js_value clone_get_string(clone_r *r)
+{
+  int len;
+  const unsigned char *p = clone_get_bytes(r, &len);
+  return p ? js_mk_string(r->ctx, (const char *)p, len) : js_undef();
+}
+static void clone_made(clone_r *r, js_object *o)
+{
+  if (r->nmade == r->capmade) {
+    int nc = r->capmade ? r->capmade * 2 : 64;
+    js_object **nm = (js_object **)realloc(r->made, (unsigned)nc * sizeof *nm);
+    if (!nm) {
+      r->failed = 1;
+      return;
+    }
+    r->made = nm;
+    r->capmade = nc;
+  }
+  r->made[r->nmade++] = o;
+}
+
+static js_value clone_read_value(clone_r *r, int depth)
+{
+  js_ctx *ctx = r->ctx;
+  unsigned char tag = 0;
+  js_value v;
+  if (!clone_get(r, &tag, 1) || depth > CLONE_DEPTH) {
+    r->failed = 1;
+    return js_undef();
+  }
+  switch (tag) {
+  case CL_UNDEF:
+    return js_undef();
+  case CL_NULL:
+    return js_null();
+  case CL_FALSE:
+    return js_bool(0);
+  case CL_TRUE:
+    return js_bool(1);
+  case CL_NUM: {
+    double d = 0;
+    clone_get(r, &d, 8);
+    return js_number(d);
+  }
+  case CL_STR:
+    return clone_get_string(r);
+  case CL_BIGINT: {
+    js_value fn = js_get(ctx, js_obj_value(ctx->global), "BigInt"), s = clone_get_string(r);
+    gc_push_scope();
+    if (s.type == JV_STR)
+      gc_keep(s.u.str);
+    v = js_is_callable(fn) && s.type == JV_STR ? js_call(ctx, fn, js_undef(), &s, 1) : js_undef();
+    gc_pop_scope();
+    return v;
+  }
+  case CL_REF: {
+    unsigned i = clone_get_u32(r);
+    if (i >= (unsigned)r->nmade) {
+      r->failed = 1;
+      return js_undef();
+    }
+    return js_obj_value(r->made[i]);
+  }
+  case CL_ARRAY: {
+    unsigned n = clone_get_u32(r), e;
+    js_object *a;
+    gc_push_scope();
+    a = (js_object *)gc_keep(js_new_array(ctx, 0));
+    clone_made(r, a);
+    for (e = 0; e < n && !r->failed; e++) {
+      js_value item = clone_read_value(r, depth + 1);
+      gc_push_scope();
+      if (item.type == JV_OBJ)
+        gc_keep(item.u.obj);
+      js_array_push(ctx, a, item);
+      gc_pop_scope();
+    }
+    gc_pop_scope();
+    return js_obj_value(a);
+  }
+  case CL_OBJECT: {
+    unsigned n = clone_get_u32(r), e;
+    js_object *o;
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, ctx->object_proto));
+    clone_made(r, o);
+    for (e = 0; e < n && !r->failed; e++) {
+      int kl;
+      const unsigned char *kp = clone_get_bytes(r, &kl);
+      char key[256];
+      js_value item;
+      if (!kp || kl >= (int)sizeof key) {
+        r->failed = 1;
+        break;
+      }
+      memcpy(key, kp, (unsigned)kl);
+      key[kl] = 0;
+      item = clone_read_value(r, depth + 1);
+      gc_push_scope();
+      if (item.type == JV_OBJ)
+        gc_keep(item.u.obj);
+      js_def(o, key, item, P_WRITABLE | P_ENUMERABLE | P_CONFIGURABLE);
+      gc_pop_scope();
+    }
+    gc_pop_scope();
+    return js_obj_value(o);
+  }
+  case CL_DATE: {
+    double ms = 0;
+    js_object *o;
+    clone_get(r, &ms, 8);
+    gc_push_scope();
+    o = (js_object *)gc_keep(js_new_object(ctx, ctx->date_proto));
+    js_def(o, "@t", js_number(ms), 0);
+    clone_made(r, o);
+    gc_pop_scope();
+    return js_obj_value(o);
+  }
+  case CL_ERROR: {
+    js_value name, msg;
+    int nl, ml;
+    const unsigned char *np = clone_get_bytes(r, &nl), *mp = clone_get_bytes(r, &ml);
+    char nbuf[64];
+    js_object *proto = ctx->error_proto;
+    if (!np || !mp) {
+      r->failed = 1;
+      return js_undef();
+    }
+    if (nl >= (int)sizeof nbuf)
+      nl = (int)sizeof nbuf - 1;
+    memcpy(nbuf, np, (unsigned)nl);
+    nbuf[nl] = 0;
+    if (!strcmp(nbuf, "TypeError"))
+      proto = ctx->type_error_proto;
+    else if (!strcmp(nbuf, "RangeError"))
+      proto = ctx->range_error_proto;
+    else if (!strcmp(nbuf, "SyntaxError"))
+      proto = ctx->syntax_error_proto;
+    else if (!strcmp(nbuf, "ReferenceError"))
+      proto = ctx->ref_error_proto;
+    gc_push_scope();
+    msg = js_mk_string(ctx, (const char *)mp, ml);
+    gc_keep(msg.u.str);
+    name = js_make_error(ctx, proto, nbuf, msg.u.str->data);
+    if (name.type == JV_OBJ) {
+      gc_keep(name.u.obj);
+      clone_made(r, name.u.obj);
+    }
+    gc_pop_scope();
+    return name;
+  }
+  case CL_ABUF: {
+    int len;
+    const unsigned char *p = clone_get_bytes(r, &len);
+    js_object *o;
+    if (!p)
+      return js_undef();
+    gc_push_scope();
+    o = (js_object *)gc_keep(new_arraybuffer(ctx, len));
+    if (o->host)
+      memcpy(((js_arraybuffer *)o->host)->data, p, (unsigned)len);
+    clone_made(r, o);
+    gc_pop_scope();
+    return js_obj_value(o);
+  }
+  case CL_SAB: {
+    unsigned i = clone_get_u32(r);
+    if (i >= (unsigned)r->c->nsabs) {
+      r->failed = 1;
+      return js_undef();
+    }
+    v = js_sab_wrap(ctx, r->c->sabs[i].data, r->c->sabs[i].len);
+    clone_made(r, v.u.obj);
+    return v;
+  }
+  case CL_VIEW: {
+    int type = (int)clone_get_u32(r), offset = (int)clone_get_u32(r), length = (int)clone_get_u32(r);
+    js_value buf;
+    int slot;
+    if (type < -1 || type >= TA_NKINDS) {
+      r->failed = 1;
+      return js_undef();
+    }
+    slot = r->nmade;
+    clone_made(r, NULL); /* the view takes its slot before its buffer, as on the writing side */
+    buf = clone_read_value(r, depth + 1);
+    if (r->failed || buf.type != JV_OBJ || buf.u.obj->kind != OBJ_ARRAYBUFFER) {
+      r->failed = 1;
+      return js_undef();
+    }
+    gc_push_scope();
+    gc_keep(buf.u.obj);
+    v = new_view(ctx, type, buf.u.obj, offset, length);
+    if (v.type == JV_OBJ)
+      r->made[slot] = v.u.obj;
+    gc_pop_scope();
+    return v;
+  }
+  default:
+    r->failed = 1;
+    return js_undef();
+  }
+}
+
+js_value js_clone_read(js_ctx *ctx, const js_clone *c)
+{
+  clone_r r = {ctx, c, 0, 0, 0, 0, 0};
+  js_value v;
+  gc_push_scope();
+  v = clone_read_value(&r, 0);
+  if (v.type == JV_OBJ)
+    gc_keep(v.u.obj);
+  free(r.made);
+  gc_pop_scope();
+  if (r.failed) {
+    if (!ctx->has_exc)
+      js_throw_error(ctx, ctx->error_proto, "DataCloneError", "The message could not be deserialized");
+    return js_undef();
+  }
+  return v;
+}
+
 /* a configurable+enumerable accessor (get only) on `proto` */
 static void ta_def_acc(js_ctx *ctx, js_object *proto, const char *name, js_native get)
 {
