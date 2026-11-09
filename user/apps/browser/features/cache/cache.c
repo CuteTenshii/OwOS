@@ -660,14 +660,23 @@ void cache_load(void)
   }
   g_disk_ok = true;
 
+  /* readdir walks by index, so deleting mid-walk would shift the next file under an index already passed */
   struct dirent_u de;
+  char (*bad)[sizeof de.name] = 0;
+  int nbad = 0;
   for (int i = 0; readdir(CACHE_DIR, i, &de) == 1; i++) {
-    if (de.is_dir || !de.name[0])
+    if (de.is_dir || !de.name[0] || load_file(de.name))
       continue;
-    if (!load_file(de.name)) {
-      char path[128];
-      disk_path(de.name, path, sizeof path);
-      unlink(path);
-    }
+    void *grown = realloc(bad, (unsigned)(nbad + 1) * sizeof *bad);
+    if (!grown)
+      continue;
+    bad = grown;
+    memcpy(bad[nbad++], de.name, sizeof de.name);
   }
+  for (int i = 0; i < nbad; i++) {
+    char path[128];
+    disk_path(bad[i], path, sizeof path);
+    unlink(path);
+  }
+  free(bad);
 }
